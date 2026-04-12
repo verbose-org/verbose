@@ -25,6 +25,7 @@ pub fn emit_rust(program: &Program) -> String {
     }
     out.push('\n');
 
+    out.push_str("#![allow(unused_variables)]\n\n");
     out.push_str("use std::collections::HashMap;\n");
     out.push_str("use std::env;\n");
     out.push_str("use std::fs;\n\n");
@@ -138,6 +139,8 @@ fn emit_expr(expr: &Expr, input_name: &str) -> String {
                 BinOp::Lt => "<",
                 BinOp::GtEq => ">=",
                 BinOp::LtEq => "<=",
+                BinOp::And => "&&",
+                BinOp::Or => "||",
             };
             format!(
                 "{} {} {}",

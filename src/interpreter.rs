@@ -161,6 +161,8 @@ fn eval_expr(expr: &Expr, env: &HashMap<String, Value>) -> Result<Value, Runtime
                 (BinOp::Lt, Value::Number(a), Value::Number(b)) => Ok(Value::Bool(a < b)),
                 (BinOp::GtEq, Value::Number(a), Value::Number(b)) => Ok(Value::Bool(a >= b)),
                 (BinOp::LtEq, Value::Number(a), Value::Number(b)) => Ok(Value::Bool(a <= b)),
+                (BinOp::And, Value::Bool(a), Value::Bool(b)) => Ok(Value::Bool(*a && *b)),
+                (BinOp::Or, Value::Bool(a), Value::Bool(b)) => Ok(Value::Bool(*a || *b)),
                 _ => Err(RuntimeError {
                     message: format!("cannot apply {:?} to {} and {}", op, l, r),
                 }),

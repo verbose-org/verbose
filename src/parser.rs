@@ -256,7 +256,37 @@ impl Parser {
         Ok(LogicStmt { target, value })
     }
 
+    /// Expression grammar with precedence (lowest to highest):
+    ///   expr       = or_expr
+    ///   or_expr    = and_expr ('or' and_expr)*
+    ///   and_expr   = cmp_expr ('and' cmp_expr)*
+    ///   cmp_expr   = primary (('>' | '<' | '>=' | '<=') primary)?
+    ///   primary    = NUMBER | IDENT ('.' IDENT)*
     fn parse_expr(&mut self) -> Result<Expr, ParseError> {
+        self.parse_or_expr()
+    }
+
+    fn parse_or_expr(&mut self) -> Result<Expr, ParseError> {
+        let mut left = self.parse_and_expr()?;
+        while self.check_ident("or") {
+            self.advance();
+            let right = self.parse_and_expr()?;
+            left = Expr::Binary(BinOp::Or, Box::new(left), Box::new(right));
+        }
+        Ok(left)
+    }
+
+    fn parse_and_expr(&mut self) -> Result<Expr, ParseError> {
+        let mut left = self.parse_cmp_expr()?;
+        while self.check_ident("and") {
+            self.advance();
+            let right = self.parse_cmp_expr()?;
+            left = Expr::Binary(BinOp::And, Box::new(left), Box::new(right));
+        }
+        Ok(left)
+    }
+
+    fn parse_cmp_expr(&mut self) -> Result<Expr, ParseError> {
         let left = self.parse_primary()?;
         let op = match self.peek_kind() {
             Some(TokenKind::Gt) => Some(BinOp::Gt),
