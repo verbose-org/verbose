@@ -328,6 +328,7 @@ mod tests {
                             form: DeterminismForm::Total,
                         },
                     },
+                    hints: None,
                 }),
             ],
         };

@@ -57,6 +57,14 @@ pub struct Rule {
     pub output_ty: Type,
     pub logic: LogicStmt,
     pub proofs: Proofs,
+    pub hints: Option<Hints>,
+}
+
+#[derive(Debug)]
+pub struct Hints {
+    pub vectorizable: Option<bool>,
+    pub parallel: Option<bool>,
+    pub cache_result: Option<bool>,
 }
 
 #[derive(Debug)]

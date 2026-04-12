@@ -118,6 +118,36 @@ fn verify_rule(
     check_purity(rule, &facts, errors);
     check_termination(rule, errors);
     check_determinism(rule, &facts, errors);
+
+    if let Some(hints) = &rule.hints {
+        check_hints(rule, hints, &facts, errors);
+    }
+}
+
+fn check_hints(rule: &Rule, hints: &Hints, facts: &LogicFacts, errors: &mut Vec<VerifyError>) {
+    if hints.vectorizable == Some(true) {
+        if !facts.calls.is_empty() {
+            errors.push(VerifyError {
+                context: format!("rule '{}' / hints.vectorizable", rule.name),
+                message: "vectorizable requires no calls (element must be independent)".into(),
+            });
+        }
+        if !matches!(rule.proofs.purity.verdict, PurityVerdict::Pure) {
+            errors.push(VerifyError {
+                context: format!("rule '{}' / hints.vectorizable", rule.name),
+                message: "vectorizable requires pure verdict".into(),
+            });
+        }
+    }
+
+    if hints.parallel == Some(true) {
+        if !matches!(rule.proofs.purity.verdict, PurityVerdict::Pure) {
+            errors.push(VerifyError {
+                context: format!("rule '{}' / hints.parallel", rule.name),
+                message: "parallel requires pure verdict (no side effects between elements)".into(),
+            });
+        }
+    }
 }
 
 fn verify_source_ref(sref: &SourceRef, base_dir: &StdPath) -> Result<(), String> {

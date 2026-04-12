@@ -37,3 +37,6 @@ rule important_invoice
 
     determinism:
       form : total
+
+  hints:
+    vectorizable : yes

@@ -97,6 +97,23 @@ fn main() {
             Ok(()) => {
                 let size = std::fs::metadata(&output).map(|m| m.len()).unwrap_or(0);
                 println!("native: {} -> {} ({} bytes, rule '{}')", path, output, size, native_rule);
+                // Report exploited hints
+                if let Some(rule) = program.items.iter().find_map(|i| match i {
+                    ast::Item::Rule(r) if r.name == native_rule => Some(r),
+                    _ => None,
+                }) {
+                    if let Some(hints) = &rule.hints {
+                        if hints.vectorizable == Some(true) {
+                            println!("  hint: vectorizable — SIMD-eligible (SSE4.2 pcmpgtq)");
+                        }
+                        if hints.parallel == Some(true) {
+                            println!("  hint: parallel — multi-thread eligible");
+                        }
+                        if hints.cache_result == Some(true) {
+                            println!("  hint: cache_result — memoization eligible");
+                        }
+                    }
+                }
             }
             Err(e) => {
                 eprintln!("{}", e);

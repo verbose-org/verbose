@@ -172,6 +172,7 @@ impl Parser {
         let mut output: Option<(String, Type)> = None;
         let mut logic = None;
         let mut proofs = None;
+        let mut hints = None;
 
         while !self.check_kind(&TokenKind::Dedent) && !self.at_eof() {
             if let Some(attr) = self.peek_attribute_name() {
@@ -203,9 +204,11 @@ impl Parser {
                 logic = Some(self.parse_logic_block()?);
             } else if self.check_ident("proofs") {
                 proofs = Some(self.parse_proofs_block()?);
+            } else if self.check_ident("hints") {
+                hints = Some(self.parse_hints_block()?);
             } else {
                 return Err(self.error(
-                    "expected attribute or section ('input', 'output', 'logic', 'proofs') in rule body",
+                    "expected attribute or section in rule body",
                 ));
             }
         }
@@ -234,6 +237,7 @@ impl Parser {
             output_ty,
             logic,
             proofs,
+            hints,
         })
     }
 
@@ -637,6 +641,51 @@ impl Parser {
 
         let form = form.ok_or_else(|| self.error("determinism missing 'form'"))?;
         Ok(Determinism { form })
+    }
+
+    fn parse_hints_block(&mut self) -> Result<Hints, ParseError> {
+        self.expect_ident("hints")?;
+        self.expect_kind(TokenKind::Colon)?;
+        self.expect_kind(TokenKind::Newline)?;
+        self.expect_kind(TokenKind::Indent)?;
+
+        let mut vectorizable = None;
+        let mut parallel = None;
+        let mut cache_result = None;
+
+        while !self.check_kind(&TokenKind::Dedent) && !self.at_eof() {
+            let key = self.expect_ident_any()?;
+            self.expect_kind(TokenKind::Colon)?;
+            let val = self.expect_ident_any()?;
+            let b = match val.as_str() {
+                "yes" => true,
+                "no" => false,
+                _ => {
+                    return Err(
+                        self.error(&format!("expected 'yes' or 'no' for hint '{}', got '{}'", key, val)),
+                    )
+                }
+            };
+            match key.as_str() {
+                "vectorizable" => vectorizable = Some(b),
+                "parallel" => parallel = Some(b),
+                "cache_result" => cache_result = Some(b),
+                _ => {
+                    return Err(self.error(&format!(
+                        "unknown hint '{}' (allowed: vectorizable, parallel, cache_result)",
+                        key
+                    )))
+                }
+            }
+            self.expect_kind(TokenKind::Newline)?;
+        }
+        self.expect_kind(TokenKind::Dedent)?;
+
+        Ok(Hints {
+            vectorizable,
+            parallel,
+            cache_result,
+        })
     }
 
     // --- cursor helpers ---
