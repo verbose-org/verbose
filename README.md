@@ -1,129 +1,165 @@
 # Verbose
 
-**A new language for AI, pushed by humans.**
+**A language designed for AI, verified by compiler, pushed by humans.**
 
-Verbose is not a language that asks the compiler to be intelligent. It's a language that asks the author to be explicit. And the author is an AI.
+> *Verbose is not a language that asks the compiler to be intelligent.*
+> *It's a language that asks the author to be explicit.*
+> *And the author is an AI.*
 
-## The Problem
+---
 
-Traditional languages compress intention. The programmer thinks "filter overdue invoices", writes `invoices.filter(|i| i.days > 30)`, and the compiler reverse-engineers what it can — guessing at purity, parallelism, memory layout, and termination. Most of the time it guesses right. Sometimes it doesn't.
+## The Question
 
-AI-generated code makes this worse. The AI generates plausible-looking code, but nobody verifies whether it's actually correct, safe, or optimal. We trust and hope.
+AI writes code now. It writes Python, Rust, JavaScript — languages designed for **humans** to read and write concisely.
+
+But if the AI is the author, why constrain it to a human format? Why force concision when the AI can be exhaustive? Why compress intention when it could be preserved?
+
+And most importantly: **who verifies that the AI's code is correct?**
+
+Right now, nobody. We trust and hope. Verbose exists because that's not good enough.
 
 ## The Idea
 
-What if the AI could be *exhaustive* instead of concise?
+Let the AI express itself **fully** — not in 25 lines of elegant Python, but in 200 lines that carry:
 
-A human would never write 200 lines for a 25-line function. But an AI generates them in seconds. And those extra 175 lines can carry **proofs** (purity, termination, determinism), **optimization hints** (vectorizable, parallelizable, memory layout), and **traceability** (every line traces back to a human intention).
+- **Proofs** — purity, termination, determinism — declared and verified
+- **Optimization hints** — vectorizable, parallelizable, memory layout — exploited by the compiler
+- **Traceability** — every line traces back to a human intention
 
-The compiler doesn't guess. It **verifies** the proofs, **exploits** the hints, and **rejects** anything unproven.
-
-## The Pipeline
-
-```
-human intention (.intent)     "An invoice is overdue when it has more than 30 days"
-        |
-AI generates IR (.verbose)    rule + fields + proofs + hints
-        |
-compiler verifies proofs      purity? termination? determinism? field access?
-        |
-compiler produces binary      interpreter, Rust transpiler, or native x86-64
-```
-
-## Three Axioms
-
-1. **Nothing is implicit.** Every block carries all information needed for its verification and optimization. No inter-block analysis required.
-2. **Intention survives.** Every element traces back to its human origin. The reverse path (binary -> IR -> intention) is always navigable.
-3. **The compiler never guesses.** Every optimization decision is backed by a verifiable proof or explicit declaration in the IR.
-
-## Design Priorities
+A human would never write this. An AI generates it in seconds. And the compiler doesn't guess — it **verifies** the proofs, **exploits** the hints, and **rejects** anything unproven.
 
 ```
-1. Verifiability     — every declaration is mechanically verifiable
-2. Exploitability    — every declaration is USED by the compiler (optimization, codegen, analysis)
-3. Safety            — unproven code is rejected
-4. Traceability      — the path intention -> IR -> binary is always navigable
-5. Readability       — auditable without blind spots
+Traditional code:    intention → compress → code → compiler guesses → binary
+Verbose:             intention → AI expands → IR + proofs → compiler verifies → binary
 ```
 
-If a declaration serves neither verification nor optimization, it doesn't belong in the IR. This is the filter against *false explicitation* — verbose for the sake of verbose.
+## Live Example
 
-## What It Looks Like
+Human writes this (`invoices.intent`):
+```
+1. A client has a name and a list of invoices.
+2. An invoice is overdue when it has more than 30 days overdue.
+3. A client is blocked when all their invoices are overdue.
+```
 
+AI generates this (`collections.verbose`):
 ```verbose
-@verbose 0.1.0
+rule client_blocked
+  @intention: "A client is blocked when all their invoices are overdue"
+  @source: collections.intent:3
 
-concept Invoice
-  @intention: "An invoice has an amount and a number of days overdue"
-  @source: invoices.intent:1
-  fields:
-    amount       : number
-    days_overdue : number
-
-rule invoice_overdue
-  @intention: "An invoice is overdue when it has more than 30 days overdue"
-  @source: invoices.intent:2
   input:
-    inv : Invoice
+    c : Client
   output:
-    overdue : bool
+    blocked : bool
   logic:
-    overdue = inv.days_overdue > 30
+    blocked = all(c.invoices, inv => invoice_overdue(inv))
+
   proofs:
     purity:
-      reads   : [inv.days_overdue]
+      reads   : [c.invoices]
       writes  : []
-      calls   : []
+      calls   : [invoice_overdue]
       verdict : pure
     termination:
       form  : constant_bound
-      bound : 1
+      bound : 2
     determinism:
       form : total
 ```
 
-The proofs are not comments. They are structured declarations that the compiler verifies against the actual logic AST. If the AI claims `reads: []` but the code reads `inv.days_overdue`, the compiler rejects it.
+Compiler verifies and runs:
+```
+$ verbosec collections.verbose --run client_blocked --input data.json
 
-## What It Can Do (POC)
+verified: 2 concept(s), 3 rule(s); all proofs check out
+
+executing rule 'client_blocked' on 4 record(s):
+  [0] blocked = true     ← Dupont: all invoices overdue
+  [1] blocked = false    ← Martin: no invoices overdue
+  [2] blocked = false    ← Durand: only 1 of 2 overdue
+  [3] blocked = true     ← Lefevre: empty collection (⚠ edge case flagged by spec)
+```
+
+If the AI lies in its proofs — says `reads: []` when the code reads a field — the compiler catches it:
+```
+verify error [rule 'client_blocked' / purity.reads] declared reads do not match logic; missing: [c.invoices]
+```
+
+## Numbers
+
+| | |
+|---|---|
+| Lines of Rust | ~3500, zero external dependencies |
+| Tests | 37, all passing |
+| Native binary size | **542 bytes** for arithmetic + boolean + rule composition |
+| Rust transpiler output | 441 KB for the same logic (832x larger) |
+| Proof checks | 8 zero-trust verifications against the AST |
+| Time to build | One session, from spec to working compiler |
+
+The 542-byte native binary has **zero runtime dependencies** — no libc, no allocator, no runtime. It talks directly to the Linux kernel via syscalls.
+
+## Three Axioms
+
+1. **Nothing is implicit.** Every block carries all information needed for verification and optimization.
+2. **Intention survives.** Every element traces back to its human origin. The reverse path (binary → IR → intention) is always navigable.
+3. **The compiler never guesses.** Every decision is backed by a verifiable proof or explicit declaration.
+
+## Design Priorities
+
+```
+1. Verifiability     every declaration is mechanically verifiable
+2. Exploitability    every declaration is USED by the compiler
+3. Safety            unproven code is rejected
+4. Traceability      intention → IR → binary always navigable
+5. Readability       auditable without blind spots
+```
+
+If a declaration serves neither verification nor optimization, it doesn't belong in the IR. Verbose without purpose is just noise.
+
+## What Works Today
 
 | Feature | Example |
 |---|---|
-| Concepts with typed fields | `number`, `bool`, `text`, `collection(Type)` |
-| Arithmetic expressions | `i.amount + i.amount * i.tax_rate / 100` |
-| Comparisons | `>`, `<`, `>=`, `<=`, `==`, `!=` |
+| Typed concepts | `number`, `bool`, `text`, `collection(Type)` |
+| Arithmetic | `amount + amount * tax_rate / 100` |
+| Comparisons & equality | `>`, `<`, `>=`, `<=`, `==`, `!=` |
 | Boolean logic | `and`, `or` |
-| String comparison | `c.status == "active"` |
-| Rule composition | `critical = important_invoice(i) and overdue_invoice(i)` |
-| Collection quantifiers | `all(c.invoices, inv => invoice_overdue(inv))` |
-| Lambda syntax | `any(c.invoices, inv => inv.days_overdue > 30)` |
-| Zero-trust proof verification | 8 checks against the AST |
-| Three backends | interpreter (JSON), Rust transpiler, native x86-64 ELF |
+| String comparison | `status == "active"` |
+| Rule composition | `important(i) and overdue(i)` |
+| Collection quantifiers | `all(invoices, inv => inv.days > 30)` |
+| Zero-trust proof verification | purity, termination, determinism |
+| Three backends | interpreter, Rust transpiler, native x86-64 |
 
-The native backend produces a 542-byte standalone binary with zero dependencies — 832x smaller than the Rust transpiler output for the same logic.
-
-## Running
+## Getting Started
 
 ```bash
-# Verify a .verbose file (checks all proofs)
-cargo run -- examples/collections.verbose
-
-# Verify and execute a rule on JSON data
+git clone https://github.com/verbose-org/verbose.git
+cd verbose
+cargo test                    # 37 tests, should all pass
+cargo run -- examples/collections.verbose   # verify proofs
 cargo run -- examples/collections.verbose --run client_blocked --input examples/collections.json
-
-# Compile to standalone binary via Rust transpiler
-cargo run -- examples/business.verbose --compile output_binary
-
-# Compile to native x86-64 ELF (zero dependencies, ~500 bytes)
-cargo run -- examples/business.verbose --native output_binary --run total_with_tax
-
-# Run tests
-cargo test
 ```
 
-## Project Status
+Other backends:
+```bash
+# Compile to standalone Rust binary
+cargo run -- examples/business.verbose --compile /tmp/business
 
-This is a **POC / R&D project**. The language works, the compiler verifies proofs, and three backends produce correct results. The vision is validated. What remains is expanding the language (more types, more proof forms, optimization hints exploitation) and hardening the compiler.
+# Compile to native x86-64 ELF (~500 bytes, zero dependencies)
+cargo run -- examples/business.verbose --native /tmp/biz --run critical_invoice
+```
+
+## Status
+
+**POC / R&D.** The language works, the compiler verifies proofs, three backends produce correct results. The concept is validated.
+
+What comes next: optimization hints exploitation in the native backend (SIMD, memory layout, parallelism), richer type system, and the moment where Verbose-compiled code outperforms `gcc -O3` on the same algorithm — because the IR carries information that C source code cannot express.
 
 ## License
 
 Apache 2.0
+
+## Author
+
+Created by Yoan Roblet ([@Arcker](https://github.com/Arcker)) — built with AI, verified by compiler.
