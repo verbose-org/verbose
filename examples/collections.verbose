@@ -1,0 +1,99 @@
+@verbose 0.1.0
+
+-- The flagship example: collections with all/any quantifiers.
+-- This is the core of what Verbose IR was designed for.
+
+concept Invoice
+  @intention: "An invoice has an amount and a number of days overdue"
+  @source: collections.intent:1
+
+  fields:
+    amount       : number
+    days_overdue : number
+
+
+concept Client
+  @intention: "A client has a name and a list of invoices"
+  @source: collections.intent:2
+
+  fields:
+    name     : text
+    invoices : collection(Invoice)
+
+
+rule invoice_overdue
+  @intention: "An invoice is overdue when it has more than 30 days overdue"
+  @source: collections.intent:3
+
+  input:
+    inv : Invoice
+
+  output:
+    overdue : bool
+
+  logic:
+    overdue = inv.days_overdue > 30
+
+  proofs:
+    purity:
+      reads   : [inv.days_overdue]
+      writes  : []
+      calls   : []
+      verdict : pure
+    termination:
+      form  : constant_bound
+      bound : 1
+    determinism:
+      form : total
+
+
+rule client_blocked
+  @intention: "A client is blocked when all their invoices are overdue"
+  @source: collections.intent:4
+
+  input:
+    c : Client
+
+  output:
+    blocked : bool
+
+  logic:
+    blocked = all(c.invoices, inv => invoice_overdue(inv))
+
+  proofs:
+    purity:
+      reads   : [c.invoices]
+      writes  : []
+      calls   : [invoice_overdue]
+      verdict : pure
+    termination:
+      form  : constant_bound
+      bound : 2
+    determinism:
+      form : total
+
+
+rule client_at_risk
+  @intention: "A client is at risk when any of their invoices are overdue"
+  @source: collections.intent:5
+
+  input:
+    c : Client
+
+  output:
+    at_risk : bool
+
+  logic:
+    at_risk = any(c.invoices, inv => invoice_overdue(inv))
+
+  proofs:
+    purity:
+      reads   : [c.invoices]
+      writes  : []
+      calls   : [invoice_overdue]
+      verdict : pure
+    termination:
+      form  : constant_bound
+      bound : 2
+    determinism:
+      form : total

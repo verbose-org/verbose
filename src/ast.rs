@@ -36,6 +36,7 @@ pub enum Type {
     Number,
     Bool,
     Text,
+    Collection(String),
     Named(String),
 }
 
@@ -64,6 +65,12 @@ pub struct LogicStmt {
     pub value: Expr,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuantifierKind {
+    All,
+    Any,
+}
+
 #[derive(Debug, Clone)]
 pub enum Expr {
     Number(i64),
@@ -72,6 +79,7 @@ pub enum Expr {
     Field(Box<Expr>, String),
     Binary(BinOp, Box<Expr>, Box<Expr>),
     Call(String, Vec<Expr>),
+    Quantifier(QuantifierKind, Box<Expr>, String, Box<Expr>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

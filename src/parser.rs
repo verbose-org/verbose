@@ -136,6 +136,12 @@ impl Parser {
             "number" => Type::Number,
             "bool" => Type::Bool,
             "text" => Type::Text,
+            "collection" => {
+                self.expect_kind(TokenKind::LParen)?;
+                let inner = self.expect_ident_any()?;
+                self.expect_kind(TokenKind::RParen)?;
+                Type::Collection(inner)
+            }
             _ => Type::Named(name),
         })
     }
@@ -358,7 +364,21 @@ impl Parser {
             Ok(Expr::Number(n))
         } else if is_ident {
             let name = self.expect_ident_any()?;
-            if self.check_kind(&TokenKind::LParen) {
+            if (name == "all" || name == "any") && self.check_kind(&TokenKind::LParen) {
+                let kind = if name == "all" {
+                    QuantifierKind::All
+                } else {
+                    QuantifierKind::Any
+                };
+                self.advance();
+                let collection = self.parse_expr()?;
+                self.expect_kind(TokenKind::Comma)?;
+                let var = self.expect_ident_any()?;
+                self.expect_kind(TokenKind::FatArrow)?;
+                let predicate = self.parse_expr()?;
+                self.expect_kind(TokenKind::RParen)?;
+                Ok(Expr::Quantifier(kind, Box::new(collection), var, Box::new(predicate)))
+            } else if self.check_kind(&TokenKind::LParen) {
                 self.advance();
                 let mut args = Vec::new();
                 if !self.check_kind(&TokenKind::RParen) {

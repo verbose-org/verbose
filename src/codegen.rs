@@ -156,6 +156,9 @@ fn emit_expr(expr: &Expr, input_name: &str, concept: Option<&Concept>) -> String
                 emit_expr(r, input_name, concept)
             )
         }
+        Expr::Quantifier(_, _, _, _) => {
+            "(/* quantifier: use --run interpreter */false)".to_string()
+        }
         Expr::Call(name, _args) => {
             if let Some(c) = concept {
                 let fields: Vec<&str> = c.fields.iter().map(|f| f.name.as_str()).collect();
@@ -172,6 +175,7 @@ fn rust_type(ty: &Type) -> &str {
         Type::Number => "i64",
         Type::Bool => "bool",
         Type::Text => "&str",
+        Type::Collection(_) => "Vec<i64>",
         Type::Named(_) => "i64",
     }
 }
@@ -181,6 +185,7 @@ fn type_label(ty: &Type) -> &str {
         Type::Number => "number",
         Type::Bool => "bool",
         Type::Text => "text",
+        Type::Collection(inner) => return format!("collection({})", inner).leak(),
         Type::Named(n) => n.as_str(),
     }
 }

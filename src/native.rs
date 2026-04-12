@@ -327,6 +327,10 @@ fn emit_eval_expr(
                 all_rules,
             )
         }
+        Expr::Quantifier(_, _, _, _) => Err(NativeError {
+            message: "quantifiers (all/any) not supported in native backend (use --run interpreter)"
+                .into(),
+        }),
         Expr::Ident(name) if name == input_name => Err(NativeError {
             message: "bare input binding not supported in expressions".into(),
         }),

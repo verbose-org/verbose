@@ -15,6 +15,7 @@ pub enum TokenKind {
     RParen,
     Equal,
     EqualEqual,
+    FatArrow,
     NotEqual,
     Gt,
     Lt,
@@ -55,6 +56,7 @@ impl fmt::Display for TokenKind {
             TokenKind::RParen => write!(f, "')'"),
             TokenKind::Equal => write!(f, "'='"),
             TokenKind::EqualEqual => write!(f, "'=='"),
+            TokenKind::FatArrow => write!(f, "'=>'"),
             TokenKind::NotEqual => write!(f, "'!='"),
             TokenKind::Gt => write!(f, "'>'"),
             TokenKind::Lt => write!(f, "'<'"),
@@ -365,6 +367,12 @@ impl<'a> Lexer<'a> {
                     self.advance();
                     self.advance();
                     self.emit_token(TokenKind::EqualEqual, start_line, start_col);
+                    return Ok(());
+                }
+                if self.peek(1) == Some(b'>') {
+                    self.advance();
+                    self.advance();
+                    self.emit_token(TokenKind::FatArrow, start_line, start_col);
                     return Ok(());
                 }
                 self.advance();

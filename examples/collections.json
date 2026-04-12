@@ -1,0 +1,27 @@
+[
+  {
+    "name": "Dupont",
+    "invoices": [
+      {"amount": 15000, "days_overdue": 45},
+      {"amount": 500,   "days_overdue": 60}
+    ]
+  },
+  {
+    "name": "Martin",
+    "invoices": [
+      {"amount": 8000, "days_overdue": 10},
+      {"amount": 3000, "days_overdue": 5}
+    ]
+  },
+  {
+    "name": "Durand",
+    "invoices": [
+      {"amount": 12000, "days_overdue": 90},
+      {"amount": 7000,  "days_overdue": 15}
+    ]
+  },
+  {
+    "name": "Lefevre",
+    "invoices": []
+  }
+]

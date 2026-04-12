@@ -1,0 +1,5 @@
+1. An invoice has an amount and a number of days overdue.
+2. A client has a name and a list of invoices.
+3. An invoice is overdue when it has more than 30 days overdue.
+4. A client is blocked when all their invoices are overdue.
+5. A client is at risk when any of their invoices are overdue.

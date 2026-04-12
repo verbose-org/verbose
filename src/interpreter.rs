@@ -10,6 +10,7 @@ pub enum Value {
     Number(i64),
     Bool(bool),
     Text(String),
+    List(Vec<Value>),
     Record(HashMap<String, Value>),
 }
 
@@ -19,6 +20,14 @@ impl fmt::Display for Value {
             Value::Number(n) => write!(f, "{}", n),
             Value::Bool(b) => write!(f, "{}", b),
             Value::Text(s) => write!(f, "{}", s),
+            Value::List(items) => {
+                write!(f, "[")?;
+                for (i, v) in items.iter().enumerate() {
+                    if i > 0 { write!(f, ", ")?; }
+                    write!(f, "{}", v)?;
+                }
+                write!(f, "]")
+            }
             Value::Record(fields) => {
                 write!(f, "{{")?;
                 let mut first = true;
@@ -94,7 +103,7 @@ fn parse_json_object(src: &str) -> Result<HashMap<String, Value>, RuntimeError> 
     }
     let inner = &trimmed[1..trimmed.len() - 1];
     let mut fields = HashMap::new();
-    for pair in inner.split(',') {
+    for pair in split_json_top_level(inner) {
         let pair = pair.trim();
         if pair.is_empty() {
             continue;
@@ -121,12 +130,48 @@ fn parse_json_value(s: &str) -> Result<Value, RuntimeError> {
     if s.starts_with('"') && s.ends_with('"') && s.len() >= 2 {
         return Ok(Value::Text(s[1..s.len() - 1].to_string()));
     }
+    if s.starts_with('[') && s.ends_with(']') {
+        let inner = &s[1..s.len() - 1];
+        let mut items = Vec::new();
+        for chunk in split_json_top_level(inner) {
+            let chunk = chunk.trim();
+            if !chunk.is_empty() {
+                items.push(parse_json_value(chunk)?);
+            }
+        }
+        return Ok(Value::List(items));
+    }
+    if s.starts_with('{') && s.ends_with('}') {
+        return Ok(Value::Record(parse_json_object(s)?));
+    }
     if let Ok(n) = s.parse::<i64>() {
         return Ok(Value::Number(n));
     }
     Err(RuntimeError {
         message: format!("unsupported JSON value: {}", s),
     })
+}
+
+fn split_json_top_level(s: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut depth = 0i32;
+    let mut start = 0;
+    for (i, c) in s.char_indices() {
+        match c {
+            '{' | '[' => depth += 1,
+            '}' | ']' => depth -= 1,
+            ',' if depth == 0 => {
+                parts.push(&s[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    let last = &s[start..];
+    if !last.trim().is_empty() {
+        parts.push(last);
+    }
+    parts
 }
 
 pub fn eval_rule(
@@ -191,6 +236,62 @@ fn eval_expr(
                     message: format!("cannot apply {:?} to {} and {}", op, l, r),
                 }),
             }
+        }
+        Expr::Quantifier(kind, collection, var_name, predicate) => {
+            let coll_val = eval_expr(collection, env, all_rules)?;
+            let items = match coll_val {
+                Value::List(items) => items,
+                _ => {
+                    return Err(RuntimeError {
+                        message: "expected a collection for all/any".into(),
+                    })
+                }
+            };
+            let result = match kind {
+                QuantifierKind::All => {
+                    let mut ok = true;
+                    for item in &items {
+                        let mut inner_env = env.clone();
+                        inner_env.insert(var_name.clone(), item.clone());
+                        match eval_expr(predicate, &inner_env, all_rules)? {
+                            Value::Bool(b) => {
+                                if !b {
+                                    ok = false;
+                                    break;
+                                }
+                            }
+                            _ => {
+                                return Err(RuntimeError {
+                                    message: "quantifier predicate must return bool".into(),
+                                })
+                            }
+                        }
+                    }
+                    ok
+                }
+                QuantifierKind::Any => {
+                    let mut ok = false;
+                    for item in &items {
+                        let mut inner_env = env.clone();
+                        inner_env.insert(var_name.clone(), item.clone());
+                        match eval_expr(predicate, &inner_env, all_rules)? {
+                            Value::Bool(b) => {
+                                if b {
+                                    ok = true;
+                                    break;
+                                }
+                            }
+                            _ => {
+                                return Err(RuntimeError {
+                                    message: "quantifier predicate must return bool".into(),
+                                })
+                            }
+                        }
+                    }
+                    ok
+                }
+            };
+            Ok(Value::Bool(result))
         }
         Expr::Call(name, args) => {
             let called = all_rules
