@@ -1,0 +1,9 @@
+[package]
+name = "verbosec"
+version = "0.1.0"
+edition = "2021"
+description = "Verbose IR compiler (POC)"
+
+[[bin]]
+name = "verbosec"
+path = "src/main.rs"

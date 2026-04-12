@@ -1,0 +1,738 @@
+use std::fmt;
+
+use crate::ast::*;
+use crate::lexer::{Token, TokenKind};
+
+#[derive(Debug)]
+pub struct ParseError {
+    pub line: usize,
+    pub col: usize,
+    pub message: String,
+}
+
+impl fmt::Display for ParseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "parse error at {}:{}: {}", self.line, self.col, self.message)
+    }
+}
+
+pub struct Parser {
+    tokens: Vec<Token>,
+    pos: usize,
+}
+
+impl Parser {
+    pub fn new(tokens: Vec<Token>) -> Self {
+        Self { tokens, pos: 0 }
+    }
+
+    pub fn parse_program(&mut self) -> Result<Program, ParseError> {
+        let version = self.parse_version_directive()?;
+        let mut items = Vec::new();
+        while !self.at_eof() {
+            if self.check_ident("concept") {
+                items.push(Item::Concept(self.parse_concept()?));
+            } else if self.check_ident("rule") {
+                items.push(Item::Rule(self.parse_rule()?));
+            } else {
+                return Err(self.error("expected 'concept' or 'rule' at top level"));
+            }
+        }
+        Ok(Program { version, items })
+    }
+
+    fn parse_version_directive(&mut self) -> Result<Version, ParseError> {
+        self.expect_attribute("verbose")?;
+        let major = self.expect_number()?;
+        self.expect_kind(TokenKind::Dot)?;
+        let minor = self.expect_number()?;
+        self.expect_kind(TokenKind::Dot)?;
+        let patch = self.expect_number()?;
+        self.expect_kind(TokenKind::Newline)?;
+        Ok(Version {
+            major: major as u32,
+            minor: minor as u32,
+            patch: patch as u32,
+        })
+    }
+
+    fn parse_concept(&mut self) -> Result<Concept, ParseError> {
+        self.expect_ident("concept")?;
+        let name = self.expect_ident_any()?;
+        self.expect_kind(TokenKind::Newline)?;
+        self.expect_kind(TokenKind::Indent)?;
+
+        let mut intention = None;
+        let mut source = None;
+        let mut fields = None;
+
+        while !self.check_kind(&TokenKind::Dedent) && !self.at_eof() {
+            if let Some(attr) = self.peek_attribute_name() {
+                match attr.as_str() {
+                    "intention" => {
+                        self.advance();
+                        self.expect_kind(TokenKind::Colon)?;
+                        intention = Some(self.expect_string()?);
+                        self.expect_kind(TokenKind::Newline)?;
+                    }
+                    "source" => {
+                        self.advance();
+                        self.expect_kind(TokenKind::Colon)?;
+                        source = Some(self.parse_source_ref()?);
+                        self.expect_kind(TokenKind::Newline)?;
+                    }
+                    other => {
+                        return Err(self.error(&format!(
+                            "unknown attribute '@{}' in concept (allowed: @intention, @source)",
+                            other
+                        )));
+                    }
+                }
+            } else if self.check_ident("fields") {
+                fields = Some(self.parse_fields_block()?);
+            } else {
+                return Err(self.error(
+                    "expected attribute or 'fields:' in concept body",
+                ));
+            }
+        }
+        self.expect_kind(TokenKind::Dedent)?;
+
+        let intention = intention
+            .ok_or_else(|| self.error(&format!("concept '{}' missing @intention", name)))?;
+        let source = source
+            .ok_or_else(|| self.error(&format!("concept '{}' missing @source", name)))?;
+        let fields = fields
+            .ok_or_else(|| self.error(&format!("concept '{}' missing 'fields:' block", name)))?;
+
+        Ok(Concept {
+            name,
+            intention,
+            source,
+            fields,
+        })
+    }
+
+    fn parse_fields_block(&mut self) -> Result<Vec<Field>, ParseError> {
+        self.expect_ident("fields")?;
+        self.expect_kind(TokenKind::Colon)?;
+        self.expect_kind(TokenKind::Newline)?;
+        self.expect_kind(TokenKind::Indent)?;
+        let mut fields = Vec::new();
+        while !self.check_kind(&TokenKind::Dedent) && !self.at_eof() {
+            let name = self.expect_ident_any()?;
+            self.expect_kind(TokenKind::Colon)?;
+            let ty = self.parse_type()?;
+            self.expect_kind(TokenKind::Newline)?;
+            fields.push(Field { name, ty });
+        }
+        self.expect_kind(TokenKind::Dedent)?;
+        Ok(fields)
+    }
+
+    fn parse_type(&mut self) -> Result<Type, ParseError> {
+        let name = self.expect_ident_any()?;
+        Ok(match name.as_str() {
+            "number" => Type::Number,
+            "bool" => Type::Bool,
+            _ => Type::Named(name),
+        })
+    }
+
+    fn parse_source_ref(&mut self) -> Result<SourceRef, ParseError> {
+        let mut parts = vec![self.expect_ident_any()?];
+        while self.check_kind(&TokenKind::Dot) {
+            self.advance();
+            parts.push(self.expect_ident_any()?);
+        }
+        self.expect_kind(TokenKind::Colon)?;
+        let line = self.expect_number()? as u32;
+        Ok(SourceRef {
+            file: parts.join("."),
+            line,
+        })
+    }
+
+    fn parse_rule(&mut self) -> Result<Rule, ParseError> {
+        self.expect_ident("rule")?;
+        let name = self.expect_ident_any()?;
+        self.expect_kind(TokenKind::Newline)?;
+        self.expect_kind(TokenKind::Indent)?;
+
+        let mut intention = None;
+        let mut source = None;
+        let mut input: Option<(String, Type)> = None;
+        let mut output: Option<(String, Type)> = None;
+        let mut logic = None;
+        let mut proofs = None;
+
+        while !self.check_kind(&TokenKind::Dedent) && !self.at_eof() {
+            if let Some(attr) = self.peek_attribute_name() {
+                match attr.as_str() {
+                    "intention" => {
+                        self.advance();
+                        self.expect_kind(TokenKind::Colon)?;
+                        intention = Some(self.expect_string()?);
+                        self.expect_kind(TokenKind::Newline)?;
+                    }
+                    "source" => {
+                        self.advance();
+                        self.expect_kind(TokenKind::Colon)?;
+                        source = Some(self.parse_source_ref()?);
+                        self.expect_kind(TokenKind::Newline)?;
+                    }
+                    other => {
+                        return Err(self.error(&format!(
+                            "unknown attribute '@{}' in rule (allowed: @intention, @source)",
+                            other
+                        )));
+                    }
+                }
+            } else if self.check_ident("input") {
+                input = Some(self.parse_binding_block("input")?);
+            } else if self.check_ident("output") {
+                output = Some(self.parse_binding_block("output")?);
+            } else if self.check_ident("logic") {
+                logic = Some(self.parse_logic_block()?);
+            } else if self.check_ident("proofs") {
+                proofs = Some(self.parse_proofs_block()?);
+            } else {
+                return Err(self.error(
+                    "expected attribute or section ('input', 'output', 'logic', 'proofs') in rule body",
+                ));
+            }
+        }
+        self.expect_kind(TokenKind::Dedent)?;
+
+        let intention = intention
+            .ok_or_else(|| self.error(&format!("rule '{}' missing @intention", name)))?;
+        let source =
+            source.ok_or_else(|| self.error(&format!("rule '{}' missing @source", name)))?;
+        let (input_name, input_ty) =
+            input.ok_or_else(|| self.error(&format!("rule '{}' missing 'input' block", name)))?;
+        let (output_name, output_ty) = output
+            .ok_or_else(|| self.error(&format!("rule '{}' missing 'output' block", name)))?;
+        let logic =
+            logic.ok_or_else(|| self.error(&format!("rule '{}' missing 'logic' block", name)))?;
+        let proofs =
+            proofs.ok_or_else(|| self.error(&format!("rule '{}' missing 'proofs' block", name)))?;
+
+        Ok(Rule {
+            name,
+            intention,
+            source,
+            input_name,
+            input_ty,
+            output_name,
+            output_ty,
+            logic,
+            proofs,
+        })
+    }
+
+    fn parse_binding_block(&mut self, keyword: &str) -> Result<(String, Type), ParseError> {
+        self.expect_ident(keyword)?;
+        self.expect_kind(TokenKind::Colon)?;
+        self.expect_kind(TokenKind::Newline)?;
+        self.expect_kind(TokenKind::Indent)?;
+        let name = self.expect_ident_any()?;
+        self.expect_kind(TokenKind::Colon)?;
+        let ty = self.parse_type()?;
+        self.expect_kind(TokenKind::Newline)?;
+        self.expect_kind(TokenKind::Dedent)?;
+        Ok((name, ty))
+    }
+
+    fn parse_logic_block(&mut self) -> Result<LogicStmt, ParseError> {
+        self.expect_ident("logic")?;
+        self.expect_kind(TokenKind::Colon)?;
+        self.expect_kind(TokenKind::Newline)?;
+        self.expect_kind(TokenKind::Indent)?;
+        let target = self.expect_ident_any()?;
+        self.expect_kind(TokenKind::Equal)?;
+        let value = self.parse_expr()?;
+        self.expect_kind(TokenKind::Newline)?;
+        self.expect_kind(TokenKind::Dedent)?;
+        Ok(LogicStmt { target, value })
+    }
+
+    fn parse_expr(&mut self) -> Result<Expr, ParseError> {
+        let left = self.parse_primary()?;
+        let op = match self.peek_kind() {
+            Some(TokenKind::Gt) => Some(BinOp::Gt),
+            Some(TokenKind::Lt) => Some(BinOp::Lt),
+            Some(TokenKind::GtEq) => Some(BinOp::GtEq),
+            Some(TokenKind::LtEq) => Some(BinOp::LtEq),
+            _ => None,
+        };
+        if let Some(op) = op {
+            self.advance();
+            let right = self.parse_primary()?;
+            return Ok(Expr::Binary(op, Box::new(left), Box::new(right)));
+        }
+        Ok(left)
+    }
+
+    fn parse_primary(&mut self) -> Result<Expr, ParseError> {
+        let is_number = matches!(self.peek_kind(), Some(TokenKind::Number(_)));
+        let is_ident = matches!(self.peek_kind(), Some(TokenKind::Ident(_)));
+        if is_number {
+            let n = self.expect_number()?;
+            Ok(Expr::Number(n))
+        } else if is_ident {
+            let name = self.expect_ident_any()?;
+            let mut expr = Expr::Ident(name);
+            while self.check_kind(&TokenKind::Dot) {
+                self.advance();
+                let field = self.expect_ident_any()?;
+                expr = Expr::Field(Box::new(expr), field);
+            }
+            Ok(expr)
+        } else {
+            Err(self.error("expected expression (number or identifier)"))
+        }
+    }
+
+    fn parse_proofs_block(&mut self) -> Result<Proofs, ParseError> {
+        self.expect_ident("proofs")?;
+        self.expect_kind(TokenKind::Colon)?;
+        self.expect_kind(TokenKind::Newline)?;
+        self.expect_kind(TokenKind::Indent)?;
+
+        let mut purity = None;
+        let mut termination = None;
+        let mut determinism = None;
+
+        while !self.check_kind(&TokenKind::Dedent) && !self.at_eof() {
+            if self.check_ident("purity") {
+                purity = Some(self.parse_purity_block()?);
+            } else if self.check_ident("termination") {
+                termination = Some(self.parse_termination_block()?);
+            } else if self.check_ident("determinism") {
+                determinism = Some(self.parse_determinism_block()?);
+            } else {
+                return Err(self.error(
+                    "expected 'purity', 'termination', or 'determinism' in proofs block",
+                ));
+            }
+        }
+        self.expect_kind(TokenKind::Dedent)?;
+
+        let purity = purity.ok_or_else(|| self.error("proofs missing 'purity'"))?;
+        let termination = termination.ok_or_else(|| self.error("proofs missing 'termination'"))?;
+        let determinism = determinism.ok_or_else(|| self.error("proofs missing 'determinism'"))?;
+
+        Ok(Proofs {
+            purity,
+            termination,
+            determinism,
+        })
+    }
+
+    fn parse_purity_block(&mut self) -> Result<Purity, ParseError> {
+        self.expect_ident("purity")?;
+        self.expect_kind(TokenKind::Colon)?;
+        self.expect_kind(TokenKind::Newline)?;
+        self.expect_kind(TokenKind::Indent)?;
+
+        let mut reads = None;
+        let mut writes = None;
+        let mut calls = None;
+        let mut verdict = None;
+
+        while !self.check_kind(&TokenKind::Dedent) && !self.at_eof() {
+            let key = self.expect_ident_any()?;
+            self.expect_kind(TokenKind::Colon)?;
+            match key.as_str() {
+                "reads" => reads = Some(self.parse_path_list()?),
+                "writes" => writes = Some(self.parse_path_list()?),
+                "calls" => calls = Some(self.parse_path_list()?),
+                "verdict" => verdict = Some(self.parse_purity_verdict()?),
+                _ => {
+                    return Err(self.error(&format!(
+                        "unknown key '{}' in purity block (allowed: reads, writes, calls, verdict)",
+                        key
+                    )));
+                }
+            }
+            self.expect_kind(TokenKind::Newline)?;
+        }
+        self.expect_kind(TokenKind::Dedent)?;
+
+        let reads = reads.ok_or_else(|| self.error("purity missing 'reads'"))?;
+        let writes = writes.ok_or_else(|| self.error("purity missing 'writes'"))?;
+        let calls = calls.ok_or_else(|| self.error("purity missing 'calls'"))?;
+        let verdict = verdict.ok_or_else(|| self.error("purity missing 'verdict'"))?;
+
+        Ok(Purity {
+            reads,
+            writes,
+            calls,
+            verdict,
+        })
+    }
+
+    fn parse_path_list(&mut self) -> Result<Vec<Path>, ParseError> {
+        self.expect_kind(TokenKind::LBracket)?;
+        let mut out = Vec::new();
+        if !self.check_kind(&TokenKind::RBracket) {
+            out.push(self.parse_path()?);
+            while self.check_kind(&TokenKind::Comma) {
+                self.advance();
+                out.push(self.parse_path()?);
+            }
+        }
+        self.expect_kind(TokenKind::RBracket)?;
+        Ok(out)
+    }
+
+    fn parse_path(&mut self) -> Result<Path, ParseError> {
+        let mut segments = vec![self.expect_ident_any()?];
+        loop {
+            if self.check_kind(&TokenKind::Dot) || self.check_kind(&TokenKind::DoubleColon) {
+                self.advance();
+                segments.push(self.expect_ident_any()?);
+            } else {
+                break;
+            }
+        }
+        Ok(Path { segments })
+    }
+
+    fn parse_purity_verdict(&mut self) -> Result<PurityVerdict, ParseError> {
+        let name = self.expect_ident_any()?;
+        match name.as_str() {
+            "pure" => Ok(PurityVerdict::Pure),
+            "impure" => Ok(PurityVerdict::Impure),
+            "pure_except" => {
+                self.expect_kind(TokenKind::LParen)?;
+                let mut items = Vec::new();
+                if !self.check_kind(&TokenKind::RParen) {
+                    items.push(self.parse_path()?);
+                    while self.check_kind(&TokenKind::Comma) {
+                        self.advance();
+                        items.push(self.parse_path()?);
+                    }
+                }
+                self.expect_kind(TokenKind::RParen)?;
+                Ok(PurityVerdict::PureExcept(items))
+            }
+            _ => Err(self.error(&format!(
+                "unknown purity verdict '{}' (allowed: pure, pure_except(...), impure)",
+                name
+            ))),
+        }
+    }
+
+    fn parse_termination_block(&mut self) -> Result<Termination, ParseError> {
+        self.expect_ident("termination")?;
+        self.expect_kind(TokenKind::Colon)?;
+        self.expect_kind(TokenKind::Newline)?;
+        self.expect_kind(TokenKind::Indent)?;
+
+        let mut form = None;
+        let mut bound = None;
+
+        while !self.check_kind(&TokenKind::Dedent) && !self.at_eof() {
+            let key = self.expect_ident_any()?;
+            self.expect_kind(TokenKind::Colon)?;
+            match key.as_str() {
+                "form" => {
+                    let n = self.expect_ident_any()?;
+                    form = Some(match n.as_str() {
+                        "constant_bound" => TerminationForm::ConstantBound,
+                        "variable_bound" => TerminationForm::VariableBound,
+                        "decreasing_recursion" => TerminationForm::DecreasingRecursion,
+                        "unproven" => TerminationForm::Unproven,
+                        _ => return Err(self.error(&format!(
+                            "unknown termination form '{}' (allowed: constant_bound, variable_bound, decreasing_recursion, unproven)",
+                            n
+                        ))),
+                    });
+                }
+                "bound" => {
+                    bound = Some(self.expect_number()?);
+                }
+                _ => {
+                    return Err(self.error(&format!(
+                        "unknown key '{}' in termination block (allowed: form, bound)",
+                        key
+                    )));
+                }
+            }
+            self.expect_kind(TokenKind::Newline)?;
+        }
+        self.expect_kind(TokenKind::Dedent)?;
+
+        let form = form.ok_or_else(|| self.error("termination missing 'form'"))?;
+        Ok(Termination { form, bound })
+    }
+
+    fn parse_determinism_block(&mut self) -> Result<Determinism, ParseError> {
+        self.expect_ident("determinism")?;
+        self.expect_kind(TokenKind::Colon)?;
+        self.expect_kind(TokenKind::Newline)?;
+        self.expect_kind(TokenKind::Indent)?;
+
+        let mut form = None;
+
+        while !self.check_kind(&TokenKind::Dedent) && !self.at_eof() {
+            let key = self.expect_ident_any()?;
+            self.expect_kind(TokenKind::Colon)?;
+            match key.as_str() {
+                "form" => {
+                    let n = self.expect_ident_any()?;
+                    form = Some(match n.as_str() {
+                        "total" => DeterminismForm::Total,
+                        "conditional" => DeterminismForm::Conditional,
+                        "nondeterministic" => DeterminismForm::Nondeterministic,
+                        _ => return Err(self.error(&format!(
+                            "unknown determinism form '{}' (allowed: total, conditional, nondeterministic)",
+                            n
+                        ))),
+                    });
+                }
+                _ => {
+                    return Err(self.error(&format!(
+                        "unknown key '{}' in determinism block (allowed: form)",
+                        key
+                    )));
+                }
+            }
+            self.expect_kind(TokenKind::Newline)?;
+        }
+        self.expect_kind(TokenKind::Dedent)?;
+
+        let form = form.ok_or_else(|| self.error("determinism missing 'form'"))?;
+        Ok(Determinism { form })
+    }
+
+    // --- cursor helpers ---
+
+    fn peek(&self) -> &Token {
+        &self.tokens[self.pos]
+    }
+
+    fn peek_kind(&self) -> Option<&TokenKind> {
+        self.tokens.get(self.pos).map(|t| &t.kind)
+    }
+
+    fn advance(&mut self) {
+        if self.pos < self.tokens.len() - 1 {
+            self.pos += 1;
+        }
+    }
+
+    fn at_eof(&self) -> bool {
+        matches!(self.peek_kind(), Some(TokenKind::Eof))
+    }
+
+    fn check_kind(&self, kind: &TokenKind) -> bool {
+        self.peek_kind() == Some(kind)
+    }
+
+    fn check_ident(&self, name: &str) -> bool {
+        matches!(self.peek_kind(), Some(TokenKind::Ident(n)) if n.as_str() == name)
+    }
+
+    fn peek_attribute_name(&self) -> Option<String> {
+        if let Some(TokenKind::Attribute(n)) = self.peek_kind() {
+            Some(n.clone())
+        } else {
+            None
+        }
+    }
+
+    fn expect_kind(&mut self, kind: TokenKind) -> Result<(), ParseError> {
+        if self.check_kind(&kind) {
+            self.advance();
+            Ok(())
+        } else {
+            let got = self.peek().kind.clone();
+            Err(self.error(&format!("expected {}, got {}", kind, got)))
+        }
+    }
+
+    fn expect_ident(&mut self, name: &str) -> Result<(), ParseError> {
+        if self.check_ident(name) {
+            self.advance();
+            Ok(())
+        } else {
+            let got = self.peek().kind.clone();
+            Err(self.error(&format!("expected '{}', got {}", name, got)))
+        }
+    }
+
+    fn expect_ident_any(&mut self) -> Result<String, ParseError> {
+        if let Some(TokenKind::Ident(n)) = self.peek_kind() {
+            let n = n.clone();
+            self.advance();
+            Ok(n)
+        } else {
+            let got = self.peek().kind.clone();
+            Err(self.error(&format!("expected identifier, got {}", got)))
+        }
+    }
+
+    fn expect_number(&mut self) -> Result<i64, ParseError> {
+        if let Some(TokenKind::Number(n)) = self.peek_kind() {
+            let n = *n;
+            self.advance();
+            Ok(n)
+        } else {
+            let got = self.peek().kind.clone();
+            Err(self.error(&format!("expected number, got {}", got)))
+        }
+    }
+
+    fn expect_string(&mut self) -> Result<String, ParseError> {
+        if let Some(TokenKind::StringLit(s)) = self.peek_kind() {
+            let s = s.clone();
+            self.advance();
+            Ok(s)
+        } else {
+            let got = self.peek().kind.clone();
+            Err(self.error(&format!("expected string literal, got {}", got)))
+        }
+    }
+
+    fn expect_attribute(&mut self, name: &str) -> Result<(), ParseError> {
+        if matches!(self.peek_kind(), Some(TokenKind::Attribute(n)) if n.as_str() == name) {
+            self.advance();
+            Ok(())
+        } else {
+            let got = self.peek().kind.clone();
+            Err(self.error(&format!("expected '@{}', got {}", name, got)))
+        }
+    }
+
+    fn error(&self, message: &str) -> ParseError {
+        let t = self.peek();
+        ParseError {
+            line: t.line,
+            col: t.col,
+            message: message.into(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lexer::Lexer;
+
+    fn parse(src: &str) -> Result<Program, ParseError> {
+        let tokens = Lexer::new(src).tokenize().map_err(|e| ParseError {
+            line: e.line,
+            col: e.col,
+            message: e.message,
+        })?;
+        Parser::new(tokens).parse_program()
+    }
+
+    #[test]
+    fn minimal_concept() {
+        let src = "@verbose 0.1.0\n\nconcept Foo\n  @intention: \"a foo\"\n  @source: foo.intent:1\n  fields:\n    x : number\n";
+        let p = parse(src).unwrap();
+        assert_eq!(
+            p.version,
+            Version {
+                major: 0,
+                minor: 1,
+                patch: 0,
+            }
+        );
+        assert_eq!(p.items.len(), 1);
+        match &p.items[0] {
+            Item::Concept(c) => {
+                assert_eq!(c.name, "Foo");
+                assert_eq!(c.intention, "a foo");
+                assert_eq!(c.source.file, "foo.intent");
+                assert_eq!(c.source.line, 1);
+                assert_eq!(c.fields.len(), 1);
+                assert_eq!(c.fields[0].name, "x");
+                assert_eq!(c.fields[0].ty, Type::Number);
+            }
+            _ => panic!("expected concept"),
+        }
+    }
+
+    #[test]
+    fn unknown_attribute_rejected() {
+        let src = "@verbose 0.1.0\n\nconcept Foo\n  @intention: \"x\"\n  @source: f.intent:1\n  @bogus: \"nope\"\n  fields:\n    x : number\n";
+        let err = parse(src).unwrap_err();
+        assert!(err.message.contains("@bogus"), "got: {}", err.message);
+    }
+
+    #[test]
+    fn missing_required_attribute() {
+        let src = "@verbose 0.1.0\n\nconcept Foo\n  @intention: \"x\"\n  fields:\n    x : number\n";
+        let err = parse(src).unwrap_err();
+        assert!(err.message.contains("@source"), "got: {}", err.message);
+    }
+
+    #[test]
+    fn full_pure_rule() {
+        let src = r#"@verbose 0.1.0
+
+concept Invoice
+  @intention: "invoice"
+  @source: i.intent:1
+  fields:
+    amount : number
+
+rule important_invoice
+  @intention: "important"
+  @source: i.intent:2
+  input:
+    i : Invoice
+  output:
+    important : bool
+  logic:
+    important = i.amount > 10000
+  proofs:
+    purity:
+      reads   : [i.amount]
+      writes  : []
+      calls   : []
+      verdict : pure
+    termination:
+      form  : constant_bound
+      bound : 1
+    determinism:
+      form : total
+"#;
+        let p = parse(src).unwrap();
+        assert_eq!(p.items.len(), 2);
+        match &p.items[1] {
+            Item::Rule(r) => {
+                assert_eq!(r.name, "important_invoice");
+                assert_eq!(r.input_name, "i");
+                assert_eq!(r.input_ty, Type::Named("Invoice".into()));
+                assert_eq!(r.output_name, "important");
+                assert_eq!(r.output_ty, Type::Bool);
+                assert_eq!(r.logic.target, "important");
+                match &r.logic.value {
+                    Expr::Binary(BinOp::Gt, left, right) => {
+                        match left.as_ref() {
+                            Expr::Field(base, f) => {
+                                assert!(matches!(base.as_ref(), Expr::Ident(n) if n == "i"));
+                                assert_eq!(f, "amount");
+                            }
+                            _ => panic!("expected field access"),
+                        }
+                        assert!(matches!(right.as_ref(), Expr::Number(10000)));
+                    }
+                    _ => panic!("expected Gt comparison"),
+                }
+                assert!(matches!(r.proofs.purity.verdict, PurityVerdict::Pure));
+                assert_eq!(r.proofs.purity.reads.len(), 1);
+                assert_eq!(r.proofs.purity.reads[0].segments, vec!["i", "amount"]);
+                assert_eq!(r.proofs.termination.form, TerminationForm::ConstantBound);
+                assert_eq!(r.proofs.termination.bound, Some(1));
+                assert_eq!(r.proofs.determinism.form, DeterminismForm::Total);
+            }
+            _ => panic!("expected rule"),
+        }
+    }
+}

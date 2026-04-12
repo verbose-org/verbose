@@ -1,0 +1,2 @@
+1. An invoice has an amount.
+2. An invoice is important when its amount exceeds 10000.

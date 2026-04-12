@@ -1,0 +1,39 @@
+@verbose 0.1.0
+
+-- POC minimal program: one concept, one pure rule, three structured proofs.
+-- Goal: exercise parse -> verify -> execute on the smallest viable example.
+
+concept Invoice
+  @intention: "An invoice has an amount"
+  @source: invoices.intent:1
+
+  fields:
+    amount : number
+
+
+rule important_invoice
+  @intention: "An invoice is important when its amount exceeds 10000"
+  @source: invoices.intent:2
+
+  input:
+    i : Invoice
+
+  output:
+    important : bool
+
+  logic:
+    important = i.amount > 10000
+
+  proofs:
+    purity:
+      reads   : [i.amount]
+      writes  : []
+      calls   : []
+      verdict : pure
+
+    termination:
+      form  : constant_bound
+      bound : 1
+
+    determinism:
+      form : total
