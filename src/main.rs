@@ -82,11 +82,21 @@ fn main() {
     let input_path = find_flag(&args, "--input");
 
     if let Some(output) = native_output {
-        let (concept, rule) = find_first_concept_rule(&program);
-        match native::compile_native(rule, concept, &output) {
+        let native_rule = find_flag(&args, "--run").unwrap_or_else(|| {
+            program
+                .items
+                .iter()
+                .rev()
+                .find_map(|i| match i {
+                    ast::Item::Rule(r) => Some(r.name.clone()),
+                    _ => None,
+                })
+                .unwrap_or_default()
+        });
+        match native::compile_native(&program, &native_rule, &output) {
             Ok(()) => {
                 let size = std::fs::metadata(&output).map(|m| m.len()).unwrap_or(0);
-                println!("native: {} -> {} ({} bytes)", path, output, size);
+                println!("native: {} -> {} ({} bytes, rule '{}')", path, output, size, native_rule);
             }
             Err(e) => {
                 eprintln!("{}", e);

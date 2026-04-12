@@ -1,23 +1,16 @@
-/// Native x86-64 code generation — produces ELF binaries directly, no intermediate compiler.
+/// Native x86-64 code generation — produces ELF binaries directly.
 ///
-/// How this works (for someone who hasn't done this before):
+/// General-purpose expression compiler: supports arithmetic (+, -, *, /),
+/// comparisons (>, <, >=, <=), boolean logic (and, or), field access,
+/// and rule calls (inlined). Multi-field concepts are supported.
 ///
-/// A compiled program is just a file full of bytes that the operating system knows how to run.
-/// On Linux, that format is called ELF (Executable and Linkable Format). An ELF file has:
-///   1. A header that says "I'm an ELF file, here's where the code starts"
-///   2. The actual machine instructions (bytes that the CPU executes)
-///   3. Some metadata about memory layout
-///
-/// Machine instructions are just numbers. For example, on x86-64:
-///   - `cmp rdi, 10000` (compare a register to 10000) is the bytes: 48 81 FF 10 27 00 00
-///   - `setg al` (set al=1 if greater) is the bytes: 0F 9F C0
-///   - `ret` (return to caller) is the byte: C3
-///
-/// We emit these bytes directly. No assembler, no linker, no external tool.
-/// The result is a tiny binary that does exactly what the Verbose rule says.
+/// The generated binary reads groups of N numbers from command-line arguments
+/// (one group per record, N = number of fields) and prints the result.
+
+use std::collections::HashMap;
+use std::io::Write;
 
 use crate::ast::*;
-use std::io::Write;
 
 #[derive(Debug)]
 pub struct NativeError {
@@ -30,20 +23,47 @@ impl std::fmt::Display for NativeError {
     }
 }
 
-/// Compile a rule to a standalone x86-64 Linux ELF binary.
-///
-/// For the POC, this produces a minimal program that:
-///   1. Reads numbers from command-line arguments
-///   2. Evaluates the rule on each number
-///   3. Prints "true" or "false" for each
-///
-/// The binary has ZERO runtime dependencies (no libc) — it uses Linux syscalls directly.
 pub fn compile_native(
-    rule: &Rule,
-    concept: &Concept,
+    program: &Program,
+    rule_name: &str,
     output_path: &str,
 ) -> Result<(), NativeError> {
-    let code = emit_program(rule, concept)?;
+    let concepts: Vec<&Concept> = program
+        .items
+        .iter()
+        .filter_map(|i| match i {
+            Item::Concept(c) => Some(c),
+            _ => None,
+        })
+        .collect();
+    let rules: HashMap<&str, &Rule> = program
+        .items
+        .iter()
+        .filter_map(|i| match i {
+            Item::Rule(r) => Some((r.name.as_str(), r)),
+            _ => None,
+        })
+        .collect();
+
+    let rule = rules.get(rule_name).ok_or_else(|| NativeError {
+        message: format!("no rule named '{}'", rule_name),
+    })?;
+
+    let concept = match &rule.input_ty {
+        Type::Named(n) => concepts
+            .iter()
+            .find(|c| c.name == *n)
+            .ok_or_else(|| NativeError {
+                message: format!("unknown concept '{}'", n),
+            })?,
+        _ => {
+            return Err(NativeError {
+                message: "rule input must be a named concept".into(),
+            })
+        }
+    };
+
+    let code = emit_full_program(rule, concept, &rules)?;
     let elf = build_elf(&code);
 
     let mut file = std::fs::File::create(output_path).map_err(|e| NativeError {
@@ -53,172 +73,117 @@ pub fn compile_native(
         message: format!("cannot write '{}': {}", output_path, e),
     })?;
 
-    // Make executable (chmod +x)
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let perms = std::fs::Permissions::from_mode(0o755);
-        std::fs::set_permissions(output_path, perms).map_err(|e| NativeError {
-            message: format!("cannot set permissions: {}", e),
-        })?;
+        std::fs::set_permissions(output_path, std::fs::Permissions::from_mode(0o755))
+            .map_err(|e| NativeError {
+                message: format!("cannot set permissions: {}", e),
+            })?;
     }
 
     Ok(())
 }
 
-/// The full program as machine code.
-///
-/// Structure:
-///   _start:
-///     - for each argv[1..], parse number, evaluate rule, print result
-///     - exit
-///
-/// We keep things simple: one field (number), one comparison, print "true\n" or "false\n".
-fn emit_program(rule: &Rule, concept: &Concept) -> Result<Vec<u8>, NativeError> {
-    if concept.fields.len() != 1 {
-        return Err(NativeError {
-            message: "native backend only supports single-field concepts for now".into(),
-        });
-    }
-    let field = &concept.fields[0];
-    if field.ty != Type::Number {
-        return Err(NativeError {
-            message: "native backend only supports 'number' fields for now".into(),
-        });
-    }
+/// Build field name → rbp offset mapping.
+/// Fields are stored at [rbp-8], [rbp-16], etc.
+fn field_offsets(concept: &Concept) -> HashMap<&str, i32> {
+    concept
+        .fields
+        .iter()
+        .enumerate()
+        .map(|(i, f)| (f.name.as_str(), -((i as i32 + 1) * 8)))
+        .collect()
+}
 
-    let (op, threshold) = extract_comparison(&rule.logic.value, &rule.input_name)?;
-
+fn emit_full_program(
+    rule: &Rule,
+    concept: &Concept,
+    all_rules: &HashMap<&str, &Rule>,
+) -> Result<Vec<u8>, NativeError> {
+    let nfields = concept.fields.len();
+    let offsets = field_offsets(concept);
+    let is_bool = rule.output_ty == Type::Bool;
     let mut code = Vec::new();
 
     // === _start ===
-    // On Linux, when a static ELF starts:
-    //   [rsp]     = argc
-    //   [rsp+8]   = argv[0] (program name)
-    //   [rsp+16]  = argv[1] (first arg)
-    //   [rsp+24]  = argv[2] (second arg)
-    //   ...
-
-    // mov r12, [rsp]       — argc
+    // Stack at entry: [rsp]=argc, [rsp+8]=argv[0], [rsp+16]=argv[1], ...
+    // mov r12, [rsp]           — argc
     code.extend_from_slice(&[0x4C, 0x8B, 0x24, 0x24]);
-    // lea r13, [rsp+8]     — argv pointer
+    // lea r13, [rsp+8]         — argv base
     code.extend_from_slice(&[0x4C, 0x8D, 0x6C, 0x24, 0x08]);
-    // mov r14, 1           — index (start at 1 to skip argv[0])
+
+    // Setup rbp frame for field storage
+    // push rbp
+    code.push(0x55);
+    // mov rbp, rsp
+    code.extend_from_slice(&[0x48, 0x89, 0xE5]);
+    // sub rsp, nfields*8 (reserve field slots)
+    let frame_size = (nfields * 8) as i32;
+    code.extend_from_slice(&[0x48, 0x81, 0xEC]);
+    code.extend_from_slice(&frame_size.to_le_bytes());
+
+    // r14 = arg index (starts at 1, skip argv[0])
     code.extend_from_slice(&[0x49, 0xC7, 0xC6, 0x01, 0x00, 0x00, 0x00]);
-    // mov r15, 0           — record counter for display
-    code.extend_from_slice(&[0x49, 0xC7, 0xC7, 0x00, 0x00, 0x00, 0x00]);
 
     let loop_top = code.len();
 
-    // cmp r14, r12         — if index >= argc, done
+    // cmp r14, r12 — if index >= argc, done
     code.extend_from_slice(&[0x4D, 0x39, 0xE6]);
-    // jge exit (placeholder, patch later)
+    // jge exit (placeholder)
     code.push(0x0F);
     code.push(0x8D);
     let exit_patch = code.len();
-    code.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // 32-bit relative offset
+    code.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
 
-    // mov rdi, [r13 + r14*8]  — argv[index]
-    // REX = 0x4B: W=1 (64-bit), R=0 (rdi fits in 3 bits), X=1 (r14 index), B=1 (r13 base)
-    code.extend_from_slice(&[0x4B, 0x8B, 0x7C, 0xF5, 0x00]);
+    // Parse N fields from argv into rbp-relative slots
+    for (i, field) in concept.fields.iter().enumerate() {
+        let offset = offsets[field.name.as_str()];
 
-    // --- inline atoi: parse decimal string at rdi into rax ---
-    // xor rax, rax          — result = 0
-    code.extend_from_slice(&[0x48, 0x31, 0xC0]);
-    // xor rcx, rcx          — negative flag
-    code.extend_from_slice(&[0x48, 0x31, 0xC9]);
+        // mov rdi, [r13 + r14*8] — argv[index]
+        code.extend_from_slice(&[0x4B, 0x8B, 0x7C, 0xF5, 0x00]);
 
-    // Check for '-' sign
-    // movzx rdx, byte [rdi]
-    code.extend_from_slice(&[0x48, 0x0F, 0xB6, 0x17]);
-    // cmp dl, '-'
-    code.extend_from_slice(&[0x80, 0xFA, 0x2D]);
-    // jne .parse_digits
-    code.extend_from_slice(&[0x75, 0x05]);
-    // mov rcx, 1
-    code.extend_from_slice(&[0xB1, 0x01]);
-    // inc rdi
-    code.extend_from_slice(&[0x48, 0xFF, 0xC7]);
+        // inline atoi: rdi string → rax number
+        emit_atoi_inline(&mut code);
 
-    let parse_digits = code.len();
-    // movzx rdx, byte [rdi]
-    code.extend_from_slice(&[0x48, 0x0F, 0xB6, 0x17]);
-    // test dl, dl           — null terminator?
-    code.extend_from_slice(&[0x84, 0xD2]);
-    // jz .done_parsing
-    code.push(0x74);
-    let done_parsing_patch = code.len();
-    code.push(0x00); // 8-bit relative offset
+        // mov [rbp + offset], rax — store parsed field
+        if offset >= -128 {
+            code.extend_from_slice(&[0x48, 0x89, 0x45]);
+            code.push(offset as u8);
+        } else {
+            code.extend_from_slice(&[0x48, 0x89, 0x85]);
+            code.extend_from_slice(&offset.to_le_bytes());
+        }
 
-    // sub dl, '0'
-    code.extend_from_slice(&[0x80, 0xEA, 0x30]);
-    // imul rax, 10
-    code.extend_from_slice(&[0x48, 0x6B, 0xC0, 0x0A]);
-    // add rax, rdx (zero-extended from dl)
-    code.extend_from_slice(&[0x48, 0x0F, 0xB6, 0xD2]); // movzx rdx, dl
-    code.extend_from_slice(&[0x48, 0x01, 0xD0]); // add rax, rdx
-    // inc rdi
-    code.extend_from_slice(&[0x48, 0xFF, 0xC7]);
-    // jmp .parse_digits
-    let jmp_back = code.len();
-    code.push(0xEB);
-    let offset = parse_digits as i8 - (code.len() + 1) as i8;
-    code.push(offset as u8);
+        // inc r14
+        code.extend_from_slice(&[0x49, 0xFF, 0xC6]);
+    }
 
-    // .done_parsing:
-    let done_parsing = code.len();
-    code[done_parsing_patch] = (done_parsing - done_parsing_patch - 1) as u8;
+    // Evaluate expression — result in rax
+    emit_eval_expr(&mut code, &rule.logic.value, &rule.input_name, &offsets, all_rules)?;
 
-    // if negative, negate
-    // test cl, cl
-    code.extend_from_slice(&[0x84, 0xC9]);
-    // jz .not_neg
-    code.extend_from_slice(&[0x74, 0x03]);
-    // neg rax
-    code.extend_from_slice(&[0x48, 0xF7, 0xD8]);
-    // .not_neg:
-
-    // --- evaluate rule: cmp rax, threshold ---
-    // rax = parsed number (the field value)
-    emit_cmp_imm(&mut code, threshold);
-    // set result based on comparison
-    emit_setcc(&mut code, &op);
-    // al = 0 or 1 now
-
-    // --- print "[N] output_name = true/false\n" ---
-    // We use a simplified approach: just print "true\n" or "false\n"
-    // Save result in rbx
-    // movzx rbx, al
-    code.extend_from_slice(&[0x48, 0x0F, 0xB6, 0xD8]);
-
-    // Print "true\n" or "false\n" using write syscall
-    // test bl, bl
-    code.extend_from_slice(&[0x84, 0xDB]);
-    // jz .print_false
-    code.push(0x74);
-    let print_false_patch = code.len();
-    code.push(0x00);
-
-    // .print_true: write(1, "true\n", 5)
-    emit_write_string(&mut code, b"true\n");
-    // jmp .after_print
-    code.push(0xEB);
-    let after_print_patch = code.len();
-    code.push(0x00);
-
-    // .print_false:
-    let print_false = code.len();
-    code[print_false_patch] = (print_false - print_false_patch - 1) as u8;
-    emit_write_string(&mut code, b"false\n");
-
-    // .after_print:
-    let after_print = code.len();
-    code[after_print_patch] = (after_print - after_print_patch - 1) as u8;
-
-    // inc r14 (index++)
-    code.extend_from_slice(&[0x49, 0xFF, 0xC6]);
-    // inc r15 (counter++)
-    code.extend_from_slice(&[0x49, 0xFF, 0xC7]);
+    // Print result
+    if is_bool {
+        // rax = 0 or 1
+        // test al, al
+        code.extend_from_slice(&[0x84, 0xC0]);
+        // jz .print_false
+        code.push(0x74);
+        let pf_patch = code.len();
+        code.push(0x00);
+        emit_write_string(&mut code, b"true\n");
+        code.push(0xEB);
+        let ap_patch = code.len();
+        code.push(0x00);
+        let pf_pos = code.len();
+        code[pf_patch] = (pf_pos - pf_patch - 1) as u8;
+        emit_write_string(&mut code, b"false\n");
+        let ap_pos = code.len();
+        code[ap_patch] = (ap_pos - ap_patch - 1) as u8;
+    } else {
+        // rax = number, print it
+        emit_itoa_inline(&mut code);
+    }
 
     // jmp loop_top
     code.push(0xE9);
@@ -230,7 +195,6 @@ fn emit_program(rule: &Rule, concept: &Concept) -> Result<Vec<u8>, NativeError> 
     let exit_offset = exit_pos as i32 - (exit_patch as i32 + 4);
     code[exit_patch..exit_patch + 4].copy_from_slice(&exit_offset.to_le_bytes());
 
-    // exit(0)
     // mov rax, 60 (sys_exit)
     code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x3C, 0x00, 0x00, 0x00]);
     // xor rdi, rdi (exit code 0)
@@ -241,155 +205,352 @@ fn emit_program(rule: &Rule, concept: &Concept) -> Result<Vec<u8>, NativeError> 
     Ok(code)
 }
 
-/// Extract the comparison operator and threshold from the rule's logic.
-/// For now, only supports `field > N`, `field < N`, `field >= N`, `field <= N`.
-fn extract_comparison(
+/// Compile an expression to machine code. Result left in rax.
+fn emit_eval_expr(
+    code: &mut Vec<u8>,
     expr: &Expr,
     input_name: &str,
-) -> Result<(BinOp, i64), NativeError> {
+    offsets: &HashMap<&str, i32>,
+    all_rules: &HashMap<&str, &Rule>,
+) -> Result<(), NativeError> {
     match expr {
-        Expr::Binary(op, left, right) => {
-            // left should be a field access, right should be a number
-            match (left.as_ref(), right.as_ref()) {
-                (Expr::Field(base, _field), Expr::Number(n)) => {
-                    if !matches!(base.as_ref(), Expr::Ident(name) if name == input_name) {
-                        return Err(NativeError {
-                            message: "expected field access on input binding".into(),
-                        });
-                    }
-                    Ok((*op, *n))
-                }
-                _ => Err(NativeError {
-                    message: "native backend requires pattern: field <op> number".into(),
-                }),
-            }
+        Expr::Number(n) => {
+            emit_mov_rax_imm(code, *n);
+            Ok(())
         }
-        _ => Err(NativeError {
-            message: "native backend requires a comparison expression".into(),
+        Expr::Field(base, field_name) => {
+            if !matches!(base.as_ref(), Expr::Ident(n) if n == input_name) {
+                return Err(NativeError {
+                    message: "nested field access not supported in native backend".into(),
+                });
+            }
+            let offset = offsets.get(field_name.as_str()).ok_or_else(|| NativeError {
+                message: format!("unknown field '{}' in native codegen", field_name),
+            })?;
+            // mov rax, [rbp + offset]
+            if *offset >= -128 {
+                code.extend_from_slice(&[0x48, 0x8B, 0x45]);
+                code.push(*offset as u8);
+            } else {
+                code.extend_from_slice(&[0x48, 0x8B, 0x85]);
+                code.extend_from_slice(&offset.to_le_bytes());
+            }
+            Ok(())
+        }
+        Expr::Binary(op, left, right) => {
+            // Evaluate left → rax, push, evaluate right → rax, pop left → rcx
+            emit_eval_expr(code, left, input_name, offsets, all_rules)?;
+            code.push(0x50); // push rax
+            emit_eval_expr(code, right, input_name, offsets, all_rules)?;
+            code.push(0x59); // pop rcx — now rcx=left, rax=right
+
+            match op {
+                BinOp::Add => {
+                    // rax = left + right = rcx + rax
+                    code.extend_from_slice(&[0x48, 0x01, 0xC8]); // add rax, rcx
+                }
+                BinOp::Sub => {
+                    // result = left - right = rcx - rax
+                    code.extend_from_slice(&[0x48, 0x29, 0xC1]); // sub rcx, rax
+                    code.extend_from_slice(&[0x48, 0x89, 0xC8]); // mov rax, rcx
+                }
+                BinOp::Mul => {
+                    // rax = left * right = rcx * rax
+                    code.extend_from_slice(&[0x48, 0x0F, 0xAF, 0xC1]); // imul rax, rcx
+                }
+                BinOp::Div => {
+                    // result = left / right = rcx / rax
+                    code.extend_from_slice(&[0x49, 0x89, 0xC0]); // mov r8, rax (save right)
+                    code.extend_from_slice(&[0x48, 0x89, 0xC8]); // mov rax, rcx (left → rax)
+                    code.extend_from_slice(&[0x48, 0x99]); // cqo (sign-extend rax → rdx:rax)
+                    code.extend_from_slice(&[0x49, 0xF7, 0xF8]); // idiv r8
+                }
+                BinOp::Gt => {
+                    code.extend_from_slice(&[0x48, 0x39, 0xC1]); // cmp rcx, rax
+                    code.extend_from_slice(&[0x0F, 0x9F, 0xC0]); // setg al
+                    code.extend_from_slice(&[0x48, 0x0F, 0xB6, 0xC0]); // movzx rax, al
+                }
+                BinOp::Lt => {
+                    code.extend_from_slice(&[0x48, 0x39, 0xC1]); // cmp rcx, rax
+                    code.extend_from_slice(&[0x0F, 0x9C, 0xC0]); // setl al
+                    code.extend_from_slice(&[0x48, 0x0F, 0xB6, 0xC0]); // movzx rax, al
+                }
+                BinOp::GtEq => {
+                    code.extend_from_slice(&[0x48, 0x39, 0xC1]); // cmp rcx, rax
+                    code.extend_from_slice(&[0x0F, 0x9D, 0xC0]); // setge al
+                    code.extend_from_slice(&[0x48, 0x0F, 0xB6, 0xC0]); // movzx rax, al
+                }
+                BinOp::LtEq => {
+                    code.extend_from_slice(&[0x48, 0x39, 0xC1]); // cmp rcx, rax
+                    code.extend_from_slice(&[0x0F, 0x9E, 0xC0]); // setle al
+                    code.extend_from_slice(&[0x48, 0x0F, 0xB6, 0xC0]); // movzx rax, al
+                }
+                BinOp::And => {
+                    code.extend_from_slice(&[0x48, 0x21, 0xC8]); // and rax, rcx
+                }
+                BinOp::Or => {
+                    code.extend_from_slice(&[0x48, 0x09, 0xC8]); // or rax, rcx
+                }
+            }
+            Ok(())
+        }
+        Expr::Call(name, args) => {
+            if args.len() != 1 {
+                return Err(NativeError {
+                    message: "native call requires exactly 1 argument".into(),
+                });
+            }
+            let called = all_rules.get(name.as_str()).ok_or_else(|| NativeError {
+                message: format!("unknown rule '{}' for native inlining", name),
+            })?;
+            // Inline: emit the called rule's logic with the same field layout
+            emit_eval_expr(
+                code,
+                &called.logic.value,
+                &called.input_name,
+                offsets,
+                all_rules,
+            )
+        }
+        Expr::Ident(name) if name == input_name => Err(NativeError {
+            message: "bare input binding not supported in expressions".into(),
+        }),
+        Expr::Ident(_) => Err(NativeError {
+            message: "unresolved identifier in native codegen".into(),
         }),
     }
 }
 
-/// Emit `cmp rax, imm32` or `cmp rax, imm8` depending on value size.
-fn emit_cmp_imm(code: &mut Vec<u8>, value: i64) {
-    if value >= -128 && value <= 127 {
-        // cmp rax, imm8
-        code.extend_from_slice(&[0x48, 0x83, 0xF8]);
-        code.push(value as u8);
-    } else {
-        // cmp rax, imm32
-        code.extend_from_slice(&[0x48, 0x3D]);
-        code.extend_from_slice(&(value as i32).to_le_bytes());
-    }
-}
+/// Inline atoi: parse null-terminated decimal string at rdi into rax.
+fn emit_atoi_inline(code: &mut Vec<u8>) {
+    // xor rax, rax
+    code.extend_from_slice(&[0x48, 0x31, 0xC0]);
+    // xor rcx, rcx (negative flag)
+    code.extend_from_slice(&[0x48, 0x31, 0xC9]);
 
-/// Emit the appropriate SETcc instruction into al.
-fn emit_setcc(code: &mut Vec<u8>, op: &BinOp) {
-    match op {
-        BinOp::Gt => code.extend_from_slice(&[0x0F, 0x9F, 0xC0]),   // setg al
-        BinOp::Lt => code.extend_from_slice(&[0x0F, 0x9C, 0xC0]),   // setl al
-        BinOp::GtEq => code.extend_from_slice(&[0x0F, 0x9D, 0xC0]), // setge al
-        BinOp::LtEq => code.extend_from_slice(&[0x0F, 0x9E, 0xC0]), // setle al
-        _ => {} // And, Or, Add, Sub, Mul, Div — not reachable, extract_comparison filters these
-    }
-}
+    // Check for '-'
+    // movzx rdx, byte [rdi]
+    code.extend_from_slice(&[0x48, 0x0F, 0xB6, 0x17]);
+    // cmp dl, '-'
+    code.extend_from_slice(&[0x80, 0xFA, 0x2D]);
+    // jne +5
+    code.extend_from_slice(&[0x75, 0x05]);
+    // mov cl, 1
+    code.extend_from_slice(&[0xB1, 0x01]);
+    // inc rdi
+    code.extend_from_slice(&[0x48, 0xFF, 0xC7]);
 
-/// Emit write(1, string, len) using Linux syscall.
-/// The string is embedded inline in the code using a rip-relative lea.
-fn emit_write_string(code: &mut Vec<u8>, s: &[u8]) {
-    // We use a trick: jmp over the string data, then reference it with rip-relative addressing.
-    //
-    // Layout:
-    //   jmp .after_data       (2 bytes: EB xx)
-    //   .data: "true\n"       (N bytes)
-    //   .after_data:
-    //   lea rsi, [rip - N - 7]  (7 bytes, points back to .data)
-    //   mov rdx, N            (7 bytes)
-    //   mov rdi, 1            (7 bytes)
-    //   mov rax, 1            (7 bytes, sys_write)
-    //   syscall               (2 bytes)
+    let parse_top = code.len();
+    // movzx rdx, byte [rdi]
+    code.extend_from_slice(&[0x48, 0x0F, 0xB6, 0x17]);
+    // test dl, dl
+    code.extend_from_slice(&[0x84, 0xD2]);
+    // jz done
+    code.push(0x74);
+    let done_patch = code.len();
+    code.push(0x00);
 
-    let len = s.len();
-
-    // jmp over data
+    // sub dl, '0'
+    code.extend_from_slice(&[0x80, 0xEA, 0x30]);
+    // imul rax, 10
+    code.extend_from_slice(&[0x48, 0x6B, 0xC0, 0x0A]);
+    // movzx rdx, dl
+    code.extend_from_slice(&[0x48, 0x0F, 0xB6, 0xD2]);
+    // add rax, rdx
+    code.extend_from_slice(&[0x48, 0x01, 0xD0]);
+    // inc rdi
+    code.extend_from_slice(&[0x48, 0xFF, 0xC7]);
+    // jmp parse_top
     code.push(0xEB);
-    code.push(len as u8);
+    let jmp_offset = (parse_top as isize).wrapping_sub(code.len() as isize + 1) as i8;
+    code.push(jmp_offset as u8);
 
-    // inline string data
-    let data_offset = code.len();
-    code.extend_from_slice(s);
+    // done:
+    let done_pos = code.len();
+    code[done_patch] = (done_pos - done_patch - 1) as u8;
 
-    // lea rsi, [rip - offset_to_data]
-    let after_lea = code.len() + 7; // lea is 7 bytes
-    let rip_offset = data_offset as i32 - after_lea as i32;
-    code.extend_from_slice(&[0x48, 0x8D, 0x35]);
-    code.extend_from_slice(&rip_offset.to_le_bytes());
+    // if negative, negate
+    // test cl, cl
+    code.extend_from_slice(&[0x84, 0xC9]);
+    // jz +3
+    code.extend_from_slice(&[0x74, 0x03]);
+    // neg rax
+    code.extend_from_slice(&[0x48, 0xF7, 0xD8]);
+}
 
-    // mov rdx, len
-    code.extend_from_slice(&[0x48, 0xC7, 0xC2]);
-    code.extend_from_slice(&(len as i32).to_le_bytes());
+/// Inline itoa: print rax as decimal string + newline to stdout.
+fn emit_itoa_inline(code: &mut Vec<u8>) {
+    // sub rsp, 24 — buffer on stack
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x18]);
+
+    // lea rsi, [rsp + 22] — point to end of buffer
+    code.extend_from_slice(&[0x48, 0x8D, 0x74, 0x24, 0x16]);
+    // mov byte [rsi], 10 — newline
+    code.extend_from_slice(&[0xC6, 0x06, 0x0A]);
+    // dec rsi
+    code.extend_from_slice(&[0x48, 0xFF, 0xCE]);
+
+    // Handle negative
+    // test rax, rax
+    code.extend_from_slice(&[0x48, 0x85, 0xC0]);
+    // jns .not_neg
+    code.push(0x79);
+    let not_neg_patch = code.len();
+    code.push(0x00);
+    // neg rax
+    code.extend_from_slice(&[0x48, 0xF7, 0xD8]);
+    // Store '-' flag: push 1
+    // mov byte [rsp+23], 1 — flag byte (we have space)
+    code.extend_from_slice(&[0xC6, 0x44, 0x24, 0x17, 0x01]);
+    code.push(0xEB); // jmp .after_neg
+    let after_neg_patch = code.len();
+    code.push(0x00);
+
+    let not_neg_pos = code.len();
+    code[not_neg_patch] = (not_neg_pos - not_neg_patch - 1) as u8;
+    // mov byte [rsp+23], 0 — no negative flag
+    code.extend_from_slice(&[0xC6, 0x44, 0x24, 0x17, 0x00]);
+
+    let after_neg_pos = code.len();
+    code[after_neg_patch] = (after_neg_pos - after_neg_patch - 1) as u8;
+
+    // mov r8, 10
+    code.extend_from_slice(&[0x49, 0xC7, 0xC0, 0x0A, 0x00, 0x00, 0x00]);
+
+    // Handle zero
+    // test rax, rax
+    code.extend_from_slice(&[0x48, 0x85, 0xC0]);
+    // jnz .div_loop
+    code.push(0x75);
+    let div_loop_patch = code.len();
+    code.push(0x00);
+    // mov byte [rsi], '0'
+    code.extend_from_slice(&[0xC6, 0x06, 0x30]);
+    // dec rsi
+    code.extend_from_slice(&[0x48, 0xFF, 0xCE]);
+    // jmp .write
+    code.push(0xEB);
+    let write_patch = code.len();
+    code.push(0x00);
+
+    // .div_loop:
+    let div_loop_pos = code.len();
+    code[div_loop_patch] = (div_loop_pos - div_loop_patch - 1) as u8;
+
+    // xor rdx, rdx
+    code.extend_from_slice(&[0x48, 0x31, 0xD2]);
+    // div r8 — rax=quotient, rdx=remainder
+    code.extend_from_slice(&[0x49, 0xF7, 0xF0]);
+    // add dl, '0'
+    code.extend_from_slice(&[0x80, 0xC2, 0x30]);
+    // mov [rsi], dl
+    code.extend_from_slice(&[0x88, 0x16]);
+    // dec rsi
+    code.extend_from_slice(&[0x48, 0xFF, 0xCE]);
+    // test rax, rax
+    code.extend_from_slice(&[0x48, 0x85, 0xC0]);
+    // jnz .div_loop
+    let jmp_back = div_loop_pos as i8 - (code.len() + 2) as i8;
+    code.extend_from_slice(&[0x75, jmp_back as u8]);
+
+    // .write:
+    let write_pos = code.len();
+    code[write_patch] = (write_pos - write_patch - 1) as u8;
+
+    // Check negative flag
+    // cmp byte [rsp+23], 0
+    code.extend_from_slice(&[0x80, 0x7C, 0x24, 0x17, 0x00]);
+    // je .no_minus
+    code.push(0x74);
+    let no_minus_patch = code.len();
+    code.push(0x00);
+    // mov byte [rsi], '-'
+    code.extend_from_slice(&[0xC6, 0x06, 0x2D]);
+    // dec rsi
+    code.extend_from_slice(&[0x48, 0xFF, 0xCE]);
+    let no_minus_pos = code.len();
+    code[no_minus_patch] = (no_minus_pos - no_minus_patch - 1) as u8;
+
+    // inc rsi — points to first char
+    code.extend_from_slice(&[0x48, 0xFF, 0xC6]);
+
+    // rdx = length = (rsp + 23) - rsi
+    code.extend_from_slice(&[0x48, 0x8D, 0x54, 0x24, 0x17]); // lea rdx, [rsp+23]
+    code.extend_from_slice(&[0x48, 0x29, 0xF2]); // sub rdx, rsi
 
     // mov rdi, 1 (stdout)
     code.extend_from_slice(&[0x48, 0xC7, 0xC7, 0x01, 0x00, 0x00, 0x00]);
-
     // mov rax, 1 (sys_write)
     code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x01, 0x00, 0x00, 0x00]);
-
     // syscall
+    code.extend_from_slice(&[0x0F, 0x05]);
+
+    // add rsp, 24
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x18]);
+}
+
+fn emit_mov_rax_imm(code: &mut Vec<u8>, value: i64) {
+    if value >= i32::MIN as i64 && value <= i32::MAX as i64 {
+        // mov rax, imm32 (sign-extended)
+        code.extend_from_slice(&[0x48, 0xC7, 0xC0]);
+        code.extend_from_slice(&(value as i32).to_le_bytes());
+    } else {
+        // movabs rax, imm64
+        code.extend_from_slice(&[0x48, 0xB8]);
+        code.extend_from_slice(&value.to_le_bytes());
+    }
+}
+
+fn emit_write_string(code: &mut Vec<u8>, s: &[u8]) {
+    let len = s.len();
+    code.push(0xEB);
+    code.push(len as u8);
+    let data_offset = code.len();
+    code.extend_from_slice(s);
+    let after_lea = code.len() + 7;
+    let rip_offset = data_offset as i32 - after_lea as i32;
+    code.extend_from_slice(&[0x48, 0x8D, 0x35]);
+    code.extend_from_slice(&rip_offset.to_le_bytes());
+    code.extend_from_slice(&[0x48, 0xC7, 0xC2]);
+    code.extend_from_slice(&(len as i32).to_le_bytes());
+    code.extend_from_slice(&[0x48, 0xC7, 0xC7, 0x01, 0x00, 0x00, 0x00]);
+    code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x01, 0x00, 0x00, 0x00]);
     code.extend_from_slice(&[0x0F, 0x05]);
 }
 
-/// Build a minimal ELF64 executable from raw machine code.
-///
-/// This creates the smallest valid ELF that Linux will run:
-///   - ELF header (64 bytes)
-///   - One program header (56 bytes)
-///   - The code itself
-///
-/// Total overhead: 120 bytes. The rest is pure machine instructions.
 fn build_elf(code: &[u8]) -> Vec<u8> {
-    let entry_addr: u64 = 0x400000 + 120; // code starts right after headers
+    let entry_addr: u64 = 0x400000 + 120;
     let file_size = 120 + code.len();
-
     let mut elf = Vec::with_capacity(file_size);
 
-    // --- ELF header (64 bytes) ---
-    // e_ident: magic, class=64, data=LE, version=1, OS=Linux
     elf.extend_from_slice(&[
-        0x7F, b'E', b'L', b'F', // magic
-        0x02, // 64-bit
-        0x01, // little-endian
-        0x01, // ELF version 1
-        0x03, // OS/ABI = Linux
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // padding
+        0x7F, b'E', b'L', b'F', 0x02, 0x01, 0x01, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00,
     ]);
-    elf.extend_from_slice(&2u16.to_le_bytes()); // e_type = ET_EXEC
-    elf.extend_from_slice(&0x3Eu16.to_le_bytes()); // e_machine = x86-64
-    elf.extend_from_slice(&1u32.to_le_bytes()); // e_version
-    elf.extend_from_slice(&entry_addr.to_le_bytes()); // e_entry
-    elf.extend_from_slice(&64u64.to_le_bytes()); // e_phoff (program header offset)
-    elf.extend_from_slice(&0u64.to_le_bytes()); // e_shoff (no section headers)
-    elf.extend_from_slice(&0u32.to_le_bytes()); // e_flags
-    elf.extend_from_slice(&64u16.to_le_bytes()); // e_ehsize
-    elf.extend_from_slice(&56u16.to_le_bytes()); // e_phentsize
-    elf.extend_from_slice(&1u16.to_le_bytes()); // e_phnum
-    elf.extend_from_slice(&0u16.to_le_bytes()); // e_shentsize
-    elf.extend_from_slice(&0u16.to_le_bytes()); // e_shnum
-    elf.extend_from_slice(&0u16.to_le_bytes()); // e_shstrndx
+    elf.extend_from_slice(&2u16.to_le_bytes());
+    elf.extend_from_slice(&0x3Eu16.to_le_bytes());
+    elf.extend_from_slice(&1u32.to_le_bytes());
+    elf.extend_from_slice(&entry_addr.to_le_bytes());
+    elf.extend_from_slice(&64u64.to_le_bytes());
+    elf.extend_from_slice(&0u64.to_le_bytes());
+    elf.extend_from_slice(&0u32.to_le_bytes());
+    elf.extend_from_slice(&64u16.to_le_bytes());
+    elf.extend_from_slice(&56u16.to_le_bytes());
+    elf.extend_from_slice(&1u16.to_le_bytes());
+    elf.extend_from_slice(&0u16.to_le_bytes());
+    elf.extend_from_slice(&0u16.to_le_bytes());
+    elf.extend_from_slice(&0u16.to_le_bytes());
 
-    // --- Program header (56 bytes) ---
-    elf.extend_from_slice(&1u32.to_le_bytes()); // p_type = PT_LOAD
-    elf.extend_from_slice(&5u32.to_le_bytes()); // p_flags = PF_R | PF_X
-    elf.extend_from_slice(&0u64.to_le_bytes()); // p_offset
-    elf.extend_from_slice(&0x400000u64.to_le_bytes()); // p_vaddr
-    elf.extend_from_slice(&0x400000u64.to_le_bytes()); // p_paddr
-    elf.extend_from_slice(&(file_size as u64).to_le_bytes()); // p_filesz
-    elf.extend_from_slice(&(file_size as u64).to_le_bytes()); // p_memsz
-    elf.extend_from_slice(&0x1000u64.to_le_bytes()); // p_align
+    elf.extend_from_slice(&1u32.to_le_bytes());
+    elf.extend_from_slice(&5u32.to_le_bytes());
+    elf.extend_from_slice(&0u64.to_le_bytes());
+    elf.extend_from_slice(&0x400000u64.to_le_bytes());
+    elf.extend_from_slice(&0x400000u64.to_le_bytes());
+    elf.extend_from_slice(&(file_size as u64).to_le_bytes());
+    elf.extend_from_slice(&(file_size as u64).to_le_bytes());
+    elf.extend_from_slice(&0x1000u64.to_le_bytes());
 
-    // --- Code ---
     elf.extend_from_slice(code);
-
     elf
 }
 
@@ -398,45 +559,47 @@ mod tests {
     use super::*;
 
     #[test]
-    fn extract_gt_comparison() {
-        let expr = Expr::Binary(
-            BinOp::Gt,
-            Box::new(Expr::Field(
-                Box::new(Expr::Ident("i".into())),
-                "amount".into(),
-            )),
-            Box::new(Expr::Number(10000)),
-        );
-        let (op, val) = extract_comparison(&expr, "i").unwrap();
-        assert_eq!(op, BinOp::Gt);
-        assert_eq!(val, 10000);
-    }
-
-    #[test]
     fn elf_header_valid() {
-        let code = vec![
-            0x48, 0xC7, 0xC0, 0x3C, 0x00, 0x00, 0x00, // mov rax, 60
-            0x48, 0x31, 0xFF, // xor rdi, rdi
-            0x0F, 0x05, // syscall
-        ];
+        let code = vec![0x48, 0xC7, 0xC0, 0x3C, 0x00, 0x00, 0x00, 0x48, 0x31, 0xFF, 0x0F, 0x05];
         let elf = build_elf(&code);
         assert_eq!(&elf[0..4], &[0x7F, b'E', b'L', b'F']);
         assert_eq!(elf.len(), 120 + code.len());
     }
 
     #[test]
-    fn cmp_small_value() {
+    fn mov_rax_small() {
         let mut code = Vec::new();
-        emit_cmp_imm(&mut code, 42);
-        // cmp rax, 42 → 48 83 F8 2A
-        assert_eq!(code, vec![0x48, 0x83, 0xF8, 0x2A]);
+        emit_mov_rax_imm(&mut code, 42);
+        assert_eq!(&code[0..3], &[0x48, 0xC7, 0xC0]);
+        assert_eq!(i32::from_le_bytes([code[3], code[4], code[5], code[6]]), 42);
     }
 
     #[test]
-    fn cmp_large_value() {
+    fn mov_rax_large() {
         let mut code = Vec::new();
-        emit_cmp_imm(&mut code, 10000);
-        // cmp rax, 10000 → 48 3D 10 27 00 00
-        assert_eq!(code, vec![0x48, 0x3D, 0x10, 0x27, 0x00, 0x00]);
+        emit_mov_rax_imm(&mut code, 0x1_0000_0000);
+        assert_eq!(&code[0..2], &[0x48, 0xB8]);
+        assert_eq!(code.len(), 10);
+    }
+
+    #[test]
+    fn field_offset_mapping() {
+        let concept = Concept {
+            name: "Test".into(),
+            intention: "t".into(),
+            source: SourceRef {
+                file: "t.intent".into(),
+                line: 1,
+            },
+            fields: vec![
+                Field { name: "a".into(), ty: Type::Number },
+                Field { name: "b".into(), ty: Type::Number },
+                Field { name: "c".into(), ty: Type::Number },
+            ],
+        };
+        let offsets = field_offsets(&concept);
+        assert_eq!(offsets["a"], -8);
+        assert_eq!(offsets["b"], -16);
+        assert_eq!(offsets["c"], -24);
     }
 }
