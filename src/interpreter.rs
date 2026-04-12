@@ -237,6 +237,22 @@ fn eval_expr(
                 }),
             }
         }
+        Expr::Not(inner) => {
+            match eval_expr(inner, env, all_rules)? {
+                Value::Bool(b) => Ok(Value::Bool(!b)),
+                other => Err(RuntimeError {
+                    message: format!("'not' requires bool, got {}", other),
+                }),
+            }
+        }
+        Expr::Neg(inner) => {
+            match eval_expr(inner, env, all_rules)? {
+                Value::Number(n) => Ok(Value::Number(-n)),
+                other => Err(RuntimeError {
+                    message: format!("'-' requires number, got {}", other),
+                }),
+            }
+        }
         Expr::Quantifier(kind, collection, var_name, predicate) => {
             let coll_val = eval_expr(collection, env, all_rules)?;
             let items = match coll_val {

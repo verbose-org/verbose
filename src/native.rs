@@ -327,6 +327,17 @@ fn emit_eval_expr(
                 all_rules,
             )
         }
+        Expr::Not(inner) => {
+            emit_eval_expr(code, inner, input_name, offsets, all_rules)?;
+            // rax is 0 or 1; flip it
+            code.extend_from_slice(&[0x48, 0x83, 0xF0, 0x01]); // xor rax, 1
+            Ok(())
+        }
+        Expr::Neg(inner) => {
+            emit_eval_expr(code, inner, input_name, offsets, all_rules)?;
+            code.extend_from_slice(&[0x48, 0xF7, 0xD8]); // neg rax
+            Ok(())
+        }
         Expr::Quantifier(_, _, _, _) => Err(NativeError {
             message: "quantifiers (all/any) not supported in native backend (use --run interpreter)"
                 .into(),

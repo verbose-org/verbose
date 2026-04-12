@@ -269,8 +269,9 @@ impl Parser {
     ///   and_expr   = cmp_expr ('and' cmp_expr)*
     ///   cmp_expr   = add_expr (('>' | '<' | '>=' | '<=') add_expr)?
     ///   add_expr   = mul_expr (('+' | '-') mul_expr)*
-    ///   mul_expr   = primary (('*' | '/') primary)*
-    ///   primary    = NUMBER | IDENT '(' args ')' | IDENT ('.' IDENT)*
+    ///   mul_expr   = unary (('*' | '/') unary)*
+    ///   unary      = 'not' unary | '-' unary | primary
+    ///   primary    = '(' expr ')' | NUMBER | STRING | IDENT '(' args ')' | IDENT ('.' IDENT)*
     fn parse_expr(&mut self) -> Result<Expr, ParseError> {
         self.parse_or_expr()
     }
@@ -334,7 +335,7 @@ impl Parser {
     }
 
     fn parse_mul_expr(&mut self) -> Result<Expr, ParseError> {
-        let mut left = self.parse_primary()?;
+        let mut left = self.parse_unary()?;
         loop {
             let op = match self.peek_kind() {
                 Some(TokenKind::Star) => Some(BinOp::Mul),
@@ -343,7 +344,7 @@ impl Parser {
             };
             if let Some(op) = op {
                 self.advance();
-                let right = self.parse_primary()?;
+                let right = self.parse_unary()?;
                 left = Expr::Binary(op, Box::new(left), Box::new(right));
             } else {
                 break;
@@ -352,7 +353,27 @@ impl Parser {
         Ok(left)
     }
 
+    fn parse_unary(&mut self) -> Result<Expr, ParseError> {
+        if self.check_ident("not") {
+            self.advance();
+            let inner = self.parse_unary()?;
+            return Ok(Expr::Not(Box::new(inner)));
+        }
+        if matches!(self.peek_kind(), Some(TokenKind::Minus)) {
+            self.advance();
+            let inner = self.parse_unary()?;
+            return Ok(Expr::Neg(Box::new(inner)));
+        }
+        self.parse_primary()
+    }
+
     fn parse_primary(&mut self) -> Result<Expr, ParseError> {
+        if matches!(self.peek_kind(), Some(TokenKind::LParen)) {
+            self.advance();
+            let expr = self.parse_expr()?;
+            self.expect_kind(TokenKind::RParen)?;
+            return Ok(expr);
+        }
         let is_number = matches!(self.peek_kind(), Some(TokenKind::Number(_)));
         let is_string = matches!(self.peek_kind(), Some(TokenKind::StringLit(_)));
         let is_ident = matches!(self.peek_kind(), Some(TokenKind::Ident(_)));
