@@ -173,9 +173,8 @@ fn check_hints(
                 if let Some(concept) = concepts.get(concept_name) {
                     for field in &concept.fields {
                         if field.ty == Type::Number {
-                            // Conservative: assume fields can be any non-negative i32 value
-                            // In a real system, field bounds would be declared on the concept
-                            field_ranges.insert(field.name.as_str(), (0, i32::MAX as i64));
+                            let range = field.range.unwrap_or((0, i32::MAX as i64));
+                            field_ranges.insert(field.name.as_str(), range);
                         }
                     }
                 }
@@ -474,7 +473,7 @@ fn check_determinism(rule: &Rule, _facts: &LogicFacts, errors: &mut Vec<VerifyEr
 ///
 /// This is the key innovation: the compiler COMPUTES whether overflow is possible
 /// instead of trusting the AI or inserting runtime checks unconditionally.
-fn compute_range(
+pub fn compute_range(
     expr: &Expr,
     field_ranges: &HashMap<&str, (i64, i64)>,
     input_name: &str,

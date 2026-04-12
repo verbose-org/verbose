@@ -1,0 +1,2 @@
+1. A sensor has a temperature value between 0 and 50 degrees.
+2. The alert level is: 2 if above 100 (impossible), 1 if above 40, otherwise 0.

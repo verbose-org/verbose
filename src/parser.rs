@@ -123,8 +123,18 @@ impl Parser {
             let name = self.expect_ident_any()?;
             self.expect_kind(TokenKind::Colon)?;
             let ty = self.parse_type()?;
+            let range = if self.check_kind(&TokenKind::LBracket) {
+                self.advance();
+                let min = self.parse_signed_number()?;
+                self.expect_kind(TokenKind::Comma)?;
+                let max = self.parse_signed_number()?;
+                self.expect_kind(TokenKind::RBracket)?;
+                Some((min, max))
+            } else {
+                None
+            };
             self.expect_kind(TokenKind::Newline)?;
-            fields.push(Field { name, ty });
+            fields.push(Field { name, ty, range });
         }
         self.expect_kind(TokenKind::Dedent)?;
         Ok(fields)

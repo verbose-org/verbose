@@ -293,6 +293,7 @@ mod tests {
                     fields: vec![Field {
                         name: "x".into(),
                         ty: Type::Number,
+                    range: None,
                     }],
                 }),
                 Item::Rule(Rule {

@@ -179,7 +179,8 @@ fn emit_full_program(
     }
 
     // Evaluate expression — result in rax
-    emit_eval_expr(&mut code, &rule.logic.value, &rule.input_name, &offsets, all_rules)?;
+    let field_ranges = build_field_ranges(concept);
+    emit_eval_expr(&mut code, &rule.logic.value, &rule.input_name, &offsets, all_rules, &field_ranges)?;
 
     // Print result
     if is_bool {
@@ -224,6 +225,75 @@ fn emit_full_program(
     Ok(code)
 }
 
+/// Build field ranges from concept for static analysis.
+fn build_field_ranges(concept: &Concept) -> HashMap<&str, (i64, i64)> {
+    concept
+        .fields
+        .iter()
+        .filter(|f| f.ty == Type::Number)
+        .map(|f| {
+            let range = f.range.unwrap_or((0, i32::MAX as i64));
+            (f.name.as_str(), range)
+        })
+        .collect()
+}
+
+/// Try to statically determine if a comparison is always true or false.
+/// Uses interval arithmetic on declared field ranges.
+fn try_static_condition(
+    expr: &Expr,
+    field_ranges: &HashMap<&str, (i64, i64)>,
+    input_name: &str,
+) -> Option<bool> {
+    use crate::verifier::compute_range;
+    match expr {
+        Expr::Binary(op, left, right) => {
+            let (l_min, l_max) = compute_range(left, field_ranges, input_name)?;
+            let (r_min, r_max) = compute_range(right, field_ranges, input_name)?;
+            match op {
+                BinOp::Gt => {
+                    if l_min > r_max {
+                        Some(true)
+                    } else if l_max <= r_min {
+                        Some(false)
+                    } else {
+                        None
+                    }
+                }
+                BinOp::Lt => {
+                    if l_max < r_min {
+                        Some(true)
+                    } else if l_min >= r_max {
+                        Some(false)
+                    } else {
+                        None
+                    }
+                }
+                BinOp::GtEq => {
+                    if l_min >= r_max {
+                        Some(true)
+                    } else if l_max < r_min {
+                        Some(false)
+                    } else {
+                        None
+                    }
+                }
+                BinOp::LtEq => {
+                    if l_max <= r_min {
+                        Some(true)
+                    } else if l_min > r_max {
+                        Some(false)
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
 /// Compile an expression to machine code. Result left in rax.
 fn emit_eval_expr(
     code: &mut Vec<u8>,
@@ -231,6 +301,7 @@ fn emit_eval_expr(
     input_name: &str,
     offsets: &HashMap<&str, i32>,
     all_rules: &HashMap<&str, &Rule>,
+    field_ranges: &HashMap<&str, (i64, i64)>,
 ) -> Result<(), NativeError> {
     match expr {
         Expr::Number(n) => {
@@ -263,9 +334,9 @@ fn emit_eval_expr(
         }
         Expr::Binary(op, left, right) => {
             // Evaluate left → rax, push, evaluate right → rax, pop left → rcx
-            emit_eval_expr(code, left, input_name, offsets, all_rules)?;
+            emit_eval_expr(code, left, input_name, offsets, all_rules, field_ranges)?;
             code.push(0x50); // push rax
-            emit_eval_expr(code, right, input_name, offsets, all_rules)?;
+            emit_eval_expr(code, right, input_name, offsets, all_rules, field_ranges)?;
             code.push(0x59); // pop rcx — now rcx=left, rax=right
 
             match op {
@@ -344,10 +415,22 @@ fn emit_eval_expr(
                 &called.input_name,
                 offsets,
                 all_rules,
+                field_ranges,
             )
         }
         Expr::If(cond, then_e, else_e) => {
-            emit_eval_expr(code, cond, input_name, offsets, all_rules)?;
+            // Try static branch elimination via interval arithmetic
+            if let Some(always) = try_static_condition(cond, field_ranges, input_name) {
+                if always {
+                    // Condition always true — emit only then branch, skip comparison
+                    return emit_eval_expr(code, then_e, input_name, offsets, all_rules, field_ranges);
+                } else {
+                    // Condition always false — emit only else branch, skip comparison
+                    return emit_eval_expr(code, else_e, input_name, offsets, all_rules, field_ranges);
+                }
+            }
+            // Dynamic: emit both branches with runtime check
+            emit_eval_expr(code, cond, input_name, offsets, all_rules, field_ranges)?;
             // test al, al
             code.extend_from_slice(&[0x84, 0xC0]);
             // jz .else_branch
@@ -356,7 +439,7 @@ fn emit_eval_expr(
             let else_patch = code.len();
             code.extend_from_slice(&[0x00; 4]);
             // then branch → rax
-            emit_eval_expr(code, then_e, input_name, offsets, all_rules)?;
+            emit_eval_expr(code, then_e, input_name, offsets, all_rules, field_ranges)?;
             // jmp .end
             code.push(0xE9);
             let end_patch = code.len();
@@ -365,7 +448,7 @@ fn emit_eval_expr(
             let else_pos = code.len();
             let eo = else_pos as i32 - (else_patch as i32 + 4);
             code[else_patch..else_patch + 4].copy_from_slice(&eo.to_le_bytes());
-            emit_eval_expr(code, else_e, input_name, offsets, all_rules)?;
+            emit_eval_expr(code, else_e, input_name, offsets, all_rules, field_ranges)?;
             // .end:
             let end_pos = code.len();
             let ep = end_pos as i32 - (end_patch as i32 + 4);
@@ -373,13 +456,13 @@ fn emit_eval_expr(
             Ok(())
         }
         Expr::Not(inner) => {
-            emit_eval_expr(code, inner, input_name, offsets, all_rules)?;
+            emit_eval_expr(code, inner, input_name, offsets, all_rules, field_ranges)?;
             // rax is 0 or 1; flip it
             code.extend_from_slice(&[0x48, 0x83, 0xF0, 0x01]); // xor rax, 1
             Ok(())
         }
         Expr::Neg(inner) => {
-            emit_eval_expr(code, inner, input_name, offsets, all_rules)?;
+            emit_eval_expr(code, inner, input_name, offsets, all_rules, field_ranges)?;
             code.extend_from_slice(&[0x48, 0xF7, 0xD8]); // neg rax
             Ok(())
         }
@@ -740,12 +823,14 @@ fn emit_parallel_program(
     }
 
     // Evaluate expression (result in rax)
+    let field_ranges = build_field_ranges(concept);
     emit_eval_expr(
         &mut code,
         &rule.logic.value,
         &rule.input_name,
         &offsets,
         all_rules,
+        &field_ranges,
     )?;
 
     // Print result
@@ -1050,9 +1135,9 @@ mod tests {
                 line: 1,
             },
             fields: vec![
-                Field { name: "a".into(), ty: Type::Number },
-                Field { name: "b".into(), ty: Type::Number },
-                Field { name: "c".into(), ty: Type::Number },
+                Field { name: "a".into(), ty: Type::Number, range: None },
+                Field { name: "b".into(), ty: Type::Number, range: None },
+                Field { name: "c".into(), ty: Type::Number, range: None },
             ],
         };
         let offsets = field_offsets(&concept);

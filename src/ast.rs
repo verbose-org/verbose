@@ -29,6 +29,7 @@ pub struct Concept {
 pub struct Field {
     pub name: String,
     pub ty: Type,
+    pub range: Option<(i64, i64)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

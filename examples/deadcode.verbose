@@ -1,0 +1,40 @@
+@verbose 0.1.0
+
+-- Dead code elimination demo: field ranges let the compiler
+-- remove branches that can never be taken.
+
+concept Sensor
+  @intention: "A sensor has a temperature value between 0 and 50 degrees"
+  @source: deadcode.intent:1
+
+  fields:
+    temperature : number [0, 50]
+
+
+rule alert_level
+  @intention: "The alert level is: 2 if above 100 (impossible), 1 if above 40, otherwise 0"
+  @source: deadcode.intent:2
+
+  input:
+    s : Sensor
+
+  output:
+    level : number
+
+  logic:
+    level = if s.temperature > 100 then 2 else if s.temperature > 40 then 1 else 0
+
+  proofs:
+    purity:
+      reads   : [s.temperature]
+      writes  : []
+      calls   : []
+      verdict : pure
+    termination:
+      form  : constant_bound
+      bound : 5
+    determinism:
+      form : total
+
+  hints:
+    overflow : [0, 2]
