@@ -39,6 +39,9 @@ rule total_with_tax
     determinism:
       form : total
 
+  hints:
+    parallel : yes
+
 
 rule important_invoice
   @intention: "An invoice is important when its total exceeds 10000"

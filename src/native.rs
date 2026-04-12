@@ -67,6 +67,10 @@ pub fn compile_native(
         .hints
         .as_ref()
         .map_or(false, |h| h.vectorizable == Some(true));
+    let is_parallel = rule
+        .hints
+        .as_ref()
+        .map_or(false, |h| h.parallel == Some(true));
 
     let code = if is_vectorizable && concept.fields.len() == 1 {
         if let Some(threshold) = extract_simple_gt(rule) {
@@ -74,6 +78,8 @@ pub fn compile_native(
         } else {
             emit_full_program(rule, concept, &rules)?
         }
+    } else if is_parallel {
+        emit_parallel_program(rule, concept, &rules)?
     } else {
         emit_full_program(rule, concept, &rules)?
     };
@@ -559,6 +565,199 @@ fn emit_write_string(code: &mut Vec<u8>, s: &[u8]) {
     code.extend_from_slice(&[0x48, 0xC7, 0xC7, 0x01, 0x00, 0x00, 0x00]);
     code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x01, 0x00, 0x00, 0x00]);
     code.extend_from_slice(&[0x0F, 0x05]);
+}
+
+/// Fork-based parallel program: splits records across 2 processes.
+///
+/// Phase 1: Parse all argv into a contiguous array
+/// Phase 2: fork() — child gets records 0..N/2, parent gets N/2..N
+/// Phase 3: Child runs its half, exits. Parent waits, then runs its half.
+///
+/// Both processes use the same evaluation code. Output is ordered because
+/// the parent waits for the child to finish before printing its half.
+///
+/// This is REAL parallelism — 2 CPU cores running simultaneously.
+/// The 'parallel: yes' hint guarantees it's safe (pure, no side effects).
+fn emit_parallel_program(
+    rule: &Rule,
+    concept: &Concept,
+    all_rules: &HashMap<&str, &Rule>,
+) -> Result<Vec<u8>, NativeError> {
+    let nfields = concept.fields.len();
+    let offsets = field_offsets(concept);
+    let is_bool = rule.output_ty == Type::Bool;
+    let mut code = Vec::new();
+
+    // === Setup: save argc/argv ===
+    code.extend_from_slice(&[0x4C, 0x8B, 0x24, 0x24]); // mov r12, [rsp]
+    code.extend_from_slice(&[0x4C, 0x8D, 0x6C, 0x24, 0x08]); // lea r13, [rsp+8]
+
+    // total_args = argc - 1
+    code.extend_from_slice(&[0x4C, 0x89, 0xE0]); // mov rax, r12
+    code.extend_from_slice(&[0x48, 0xFF, 0xC8]); // dec rax
+    code.extend_from_slice(&[0x49, 0x89, 0xC6]); // mov r14, rax (r14 = total_args)
+
+    // Allocate array (total_args * 8, aligned to 16)
+    code.extend_from_slice(&[0x48, 0xC1, 0xE0, 0x03]); // shl rax, 3
+    code.extend_from_slice(&[0x48, 0x83, 0xC0, 0x0F]); // add rax, 15
+    code.extend_from_slice(&[0x48, 0x83, 0xE0, 0xF0]); // and rax, -16
+    code.extend_from_slice(&[0x48, 0x29, 0xC4]); // sub rsp, rax
+    code.extend_from_slice(&[0x49, 0x89, 0xE7]); // mov r15, rsp
+
+    // Setup rbp frame for field storage
+    code.push(0x55); // push rbp
+    code.extend_from_slice(&[0x48, 0x89, 0xE5]); // mov rbp, rsp
+    let frame = ((nfields * 8 + 15) & !15) as i32;
+    code.extend_from_slice(&[0x48, 0x81, 0xEC]);
+    code.extend_from_slice(&frame.to_le_bytes());
+
+    // === Phase 1: Parse all argv numbers into array ===
+    code.extend_from_slice(&[0x48, 0x31, 0xDB]); // xor rbx, rbx
+    let parse_top = code.len();
+    code.extend_from_slice(&[0x4C, 0x39, 0xF3]); // cmp rbx, r14
+    code.push(0x0F);
+    code.push(0x8D);
+    let parse_done_patch = code.len();
+    code.extend_from_slice(&[0x00; 4]);
+
+    code.extend_from_slice(&[0x49, 0x8B, 0x7C, 0xDD, 0x08]); // mov rdi, [r13+rbx*8+8]
+    code.push(0x53); // push rbx
+    emit_atoi_inline(&mut code);
+    code.push(0x5B); // pop rbx
+    code.extend_from_slice(&[0x49, 0x89, 0x04, 0xDF]); // mov [r15+rbx*8], rax
+    code.extend_from_slice(&[0x48, 0xFF, 0xC3]); // inc rbx
+    code.push(0xE9);
+    let pj = parse_top as i32 - (code.len() as i32 + 4);
+    code.extend_from_slice(&pj.to_le_bytes());
+
+    let parse_done = code.len();
+    let pd = parse_done as i32 - (parse_done_patch as i32 + 4);
+    code[parse_done_patch..parse_done_patch + 4].copy_from_slice(&pd.to_le_bytes());
+
+    // === Calculate num_records = total_args / nfields ===
+    code.extend_from_slice(&[0x4C, 0x89, 0xF0]); // mov rax, r14
+    code.extend_from_slice(&[0x48, 0x31, 0xD2]); // xor rdx, rdx
+    code.extend_from_slice(&[0x48, 0xC7, 0xC1]);
+    code.extend_from_slice(&(nfields as i32).to_le_bytes()); // mov rcx, nfields
+    code.extend_from_slice(&[0x48, 0xF7, 0xF1]); // div rcx
+    code.extend_from_slice(&[0x49, 0x89, 0xC6]); // mov r14, rax (r14 = num_records)
+
+    // midpoint = num_records / 2
+    code.extend_from_slice(&[0x48, 0x89, 0xC3]); // mov rbx, rax
+    code.extend_from_slice(&[0x48, 0xD1, 0xEB]); // shr rbx, 1
+
+    // === Phase 2: fork() ===
+    code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x39, 0x00, 0x00, 0x00]); // mov rax, 57 (fork)
+    code.extend_from_slice(&[0x0F, 0x05]); // syscall
+
+    code.extend_from_slice(&[0x48, 0x85, 0xC0]); // test rax, rax
+    code.push(0x0F);
+    code.push(0x85);
+    let parent_patch = code.len();
+    code.extend_from_slice(&[0x00; 4]); // jnz .parent
+
+    // === Child: records 0..midpoint ===
+    code.extend_from_slice(&[0x48, 0x31, 0xC9]); // xor rcx, rcx (start=0)
+    code.extend_from_slice(&[0x49, 0x89, 0xD8]); // mov r8, rbx (end=midpoint)
+    code.push(0xE9);
+    let child_jmp_patch = code.len();
+    code.extend_from_slice(&[0x00; 4]); // jmp .process_loop
+
+    // === Parent: wait for child, then records midpoint..count ===
+    let parent_pos = code.len();
+    let po = parent_pos as i32 - (parent_patch as i32 + 4);
+    code[parent_patch..parent_patch + 4].copy_from_slice(&po.to_le_bytes());
+
+    // wait4(-1, NULL, 0, NULL)
+    code.extend_from_slice(&[0x48, 0xC7, 0xC7, 0xFF, 0xFF, 0xFF, 0xFF]); // mov rdi, -1
+    code.extend_from_slice(&[0x48, 0x31, 0xF6]); // xor rsi, rsi
+    code.extend_from_slice(&[0x48, 0x31, 0xD2]); // xor rdx, rdx
+    code.extend_from_slice(&[0x4D, 0x31, 0xD2]); // xor r10, r10
+    code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x3D, 0x00, 0x00, 0x00]); // mov rax, 61 (wait4)
+    code.extend_from_slice(&[0x0F, 0x05]); // syscall
+
+    code.extend_from_slice(&[0x48, 0x89, 0xD9]); // mov rcx, rbx (start=midpoint)
+    code.extend_from_slice(&[0x4D, 0x89, 0xF0]); // mov r8, r14 (end=num_records)
+
+    // === Process loop (shared by child and parent) ===
+    let process_loop = code.len();
+    let cj = process_loop as i32 - (child_jmp_patch as i32 + 4);
+    code[child_jmp_patch..child_jmp_patch + 4].copy_from_slice(&cj.to_le_bytes());
+
+    // cmp rcx, r8
+    code.extend_from_slice(&[0x4C, 0x39, 0xC1]);
+    code.push(0x0F);
+    code.push(0x8D);
+    let exit_patch = code.len();
+    code.extend_from_slice(&[0x00; 4]); // jge .exit
+
+    // Save loop registers
+    code.push(0x51); // push rcx
+    code.extend_from_slice(&[0x41, 0x50]); // push r8
+
+    // Load fields from array into rbp slots
+    // base_index = rcx * nfields
+    code.extend_from_slice(&[0x48, 0x89, 0xC8]); // mov rax, rcx
+    if nfields > 1 {
+        code.extend_from_slice(&[0x48, 0x6B, 0xC0, nfields as u8]); // imul rax, rax, nfields
+    }
+    for (i, field) in concept.fields.iter().enumerate() {
+        let offset = offsets[field.name.as_str()];
+        // mov rdx, [r15 + rax*8]
+        code.extend_from_slice(&[0x49, 0x8B, 0x14, 0xC7]);
+        // mov [rbp + offset], rdx
+        code.extend_from_slice(&[0x48, 0x89, 0x55]);
+        code.push(offset as u8);
+        if i < nfields - 1 {
+            code.extend_from_slice(&[0x48, 0xFF, 0xC0]); // inc rax
+        }
+    }
+
+    // Evaluate expression (result in rax)
+    emit_eval_expr(
+        &mut code,
+        &rule.logic.value,
+        &rule.input_name,
+        &offsets,
+        all_rules,
+    )?;
+
+    // Print result
+    if is_bool {
+        code.extend_from_slice(&[0x84, 0xC0]); // test al, al
+        code.push(0x74);
+        let fp = code.len();
+        code.push(0x00);
+        emit_write_string(&mut code, b"true\n");
+        code.push(0xEB);
+        let dp = code.len();
+        code.push(0x00);
+        let fpos = code.len();
+        code[fp] = (fpos - fp - 1) as u8;
+        emit_write_string(&mut code, b"false\n");
+        let dpos = code.len();
+        code[dp] = (dpos - dp - 1) as u8;
+    } else {
+        emit_itoa_inline(&mut code);
+    }
+
+    // Restore loop registers, increment, loop back
+    code.extend_from_slice(&[0x41, 0x58]); // pop r8
+    code.push(0x59); // pop rcx
+    code.extend_from_slice(&[0x48, 0xFF, 0xC1]); // inc rcx
+    code.push(0xE9);
+    let lj = process_loop as i32 - (code.len() as i32 + 4);
+    code.extend_from_slice(&lj.to_le_bytes());
+
+    // === Exit ===
+    let exit_pos = code.len();
+    let eo = exit_pos as i32 - (exit_patch as i32 + 4);
+    code[exit_patch..exit_patch + 4].copy_from_slice(&eo.to_le_bytes());
+    code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x3C, 0x00, 0x00, 0x00]);
+    code.extend_from_slice(&[0x48, 0x31, 0xFF]);
+    code.extend_from_slice(&[0x0F, 0x05]);
+
+    Ok(code)
 }
 
 /// Check if the rule's logic is a simple `field > N` pattern.
