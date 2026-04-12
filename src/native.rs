@@ -346,6 +346,32 @@ fn emit_eval_expr(
                 all_rules,
             )
         }
+        Expr::If(cond, then_e, else_e) => {
+            emit_eval_expr(code, cond, input_name, offsets, all_rules)?;
+            // test al, al
+            code.extend_from_slice(&[0x84, 0xC0]);
+            // jz .else_branch
+            code.push(0x0F);
+            code.push(0x84);
+            let else_patch = code.len();
+            code.extend_from_slice(&[0x00; 4]);
+            // then branch → rax
+            emit_eval_expr(code, then_e, input_name, offsets, all_rules)?;
+            // jmp .end
+            code.push(0xE9);
+            let end_patch = code.len();
+            code.extend_from_slice(&[0x00; 4]);
+            // .else_branch:
+            let else_pos = code.len();
+            let eo = else_pos as i32 - (else_patch as i32 + 4);
+            code[else_patch..else_patch + 4].copy_from_slice(&eo.to_le_bytes());
+            emit_eval_expr(code, else_e, input_name, offsets, all_rules)?;
+            // .end:
+            let end_pos = code.len();
+            let ep = end_pos as i32 - (end_patch as i32 + 4);
+            code[end_patch..end_patch + 4].copy_from_slice(&ep.to_le_bytes());
+            Ok(())
+        }
         Expr::Not(inner) => {
             emit_eval_expr(code, inner, input_name, offsets, all_rules)?;
             // rax is 0 or 1; flip it

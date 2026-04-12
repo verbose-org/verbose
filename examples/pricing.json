@@ -1,0 +1,7 @@
+[
+  {"amount": 10000, "tax_rate": 20, "days_overdue": 0},
+  {"amount": 10000, "tax_rate": 20, "days_overdue": 45},
+  {"amount": 10000, "tax_rate": 20, "days_overdue": 100},
+  {"amount": 5000,  "tax_rate": 10, "days_overdue": 91},
+  {"amount": 8000,  "tax_rate": 0,  "days_overdue": 15}
+]

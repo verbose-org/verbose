@@ -184,6 +184,11 @@ fn collect_expr_facts(
 ) {
     match expr {
         Expr::Number(_) | Expr::Text(_) => {}
+        Expr::If(cond, then_e, else_e) => {
+            collect_expr_facts(cond, reads, calls);
+            collect_expr_facts(then_e, reads, calls);
+            collect_expr_facts(else_e, reads, calls);
+        }
         Expr::Not(inner) | Expr::Neg(inner) => {
             collect_expr_facts(inner, reads, calls);
         }
@@ -387,6 +392,7 @@ fn check_termination(rule: &Rule, errors: &mut Vec<VerifyError>) {
 fn count_operations(expr: &Expr) -> usize {
     match expr {
         Expr::Number(_) | Expr::Text(_) | Expr::Ident(_) => 0,
+        Expr::If(c, t, e) => 1 + count_operations(c) + count_operations(t) + count_operations(e),
         Expr::Not(inner) | Expr::Neg(inner) => 1 + count_operations(inner),
         Expr::Field(base, _) => count_operations(base),
         Expr::Binary(_, l, r) => 1 + count_operations(l) + count_operations(r),

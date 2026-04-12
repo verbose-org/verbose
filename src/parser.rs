@@ -372,6 +372,19 @@ impl Parser {
     }
 
     fn parse_primary(&mut self) -> Result<Expr, ParseError> {
+        if self.check_ident("if") {
+            self.advance();
+            let condition = self.parse_expr()?;
+            self.expect_ident("then")?;
+            let then_expr = self.parse_expr()?;
+            self.expect_ident("else")?;
+            let else_expr = self.parse_expr()?;
+            return Ok(Expr::If(
+                Box::new(condition),
+                Box::new(then_expr),
+                Box::new(else_expr),
+            ));
+        }
         if matches!(self.peek_kind(), Some(TokenKind::LParen)) {
             self.advance();
             let expr = self.parse_expr()?;

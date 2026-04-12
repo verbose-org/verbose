@@ -156,6 +156,12 @@ fn emit_expr(expr: &Expr, input_name: &str, concept: Option<&Concept>) -> String
                 emit_expr(r, input_name, concept)
             )
         }
+        Expr::If(cond, then_e, else_e) => format!(
+            "if {} {{ {} }} else {{ {} }}",
+            emit_expr(cond, input_name, concept),
+            emit_expr(then_e, input_name, concept),
+            emit_expr(else_e, input_name, concept),
+        ),
         Expr::Not(inner) => format!("!{}", emit_expr(inner, input_name, concept)),
         Expr::Neg(inner) => format!("-{}", emit_expr(inner, input_name, concept)),
         Expr::Quantifier(_, _, _, _) => {

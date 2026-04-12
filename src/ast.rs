@@ -87,6 +87,7 @@ pub enum Expr {
     Field(Box<Expr>, String),
     Binary(BinOp, Box<Expr>, Box<Expr>),
     Call(String, Vec<Expr>),
+    If(Box<Expr>, Box<Expr>, Box<Expr>),
     Not(Box<Expr>),
     Neg(Box<Expr>),
     Quantifier(QuantifierKind, Box<Expr>, String, Box<Expr>),

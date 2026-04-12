@@ -237,6 +237,15 @@ fn eval_expr(
                 }),
             }
         }
+        Expr::If(cond, then_expr, else_expr) => {
+            match eval_expr(cond, env, all_rules)? {
+                Value::Bool(true) => eval_expr(then_expr, env, all_rules),
+                Value::Bool(false) => eval_expr(else_expr, env, all_rules),
+                other => Err(RuntimeError {
+                    message: format!("'if' condition must be bool, got {}", other),
+                }),
+            }
+        }
         Expr::Not(inner) => {
             match eval_expr(inner, env, all_rules)? {
                 Value::Bool(b) => Ok(Value::Bool(!b)),
