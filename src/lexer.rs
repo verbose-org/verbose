@@ -19,7 +19,10 @@ pub enum TokenKind {
     GtEq,
     LtEq,
     Dot,
+    Plus,
     Minus,
+    Star,
+    Slash,
     DoubleColon,
 
     Indent,
@@ -54,7 +57,10 @@ impl fmt::Display for TokenKind {
             TokenKind::GtEq => write!(f, "'>='"),
             TokenKind::LtEq => write!(f, "'<='"),
             TokenKind::Dot => write!(f, "'.'"),
+            TokenKind::Plus => write!(f, "'+'"),
             TokenKind::Minus => write!(f, "'-'"),
+            TokenKind::Star => write!(f, "'*'"),
+            TokenKind::Slash => write!(f, "'/'"),
             TokenKind::DoubleColon => write!(f, "'::'"),
             TokenKind::Indent => write!(f, "INDENT"),
             TokenKind::Dedent => write!(f, "DEDENT"),
@@ -378,9 +384,21 @@ impl<'a> Lexer<'a> {
                 self.advance();
                 TokenKind::Dot
             }
+            b'+' => {
+                self.advance();
+                TokenKind::Plus
+            }
             b'-' => {
                 self.advance();
                 TokenKind::Minus
+            }
+            b'*' => {
+                self.advance();
+                TokenKind::Star
+            }
+            b'/' => {
+                self.advance();
+                TokenKind::Slash
             }
             _ => {
                 return Err(LexError {

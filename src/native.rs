@@ -290,7 +290,7 @@ fn emit_setcc(code: &mut Vec<u8>, op: &BinOp) {
         BinOp::Lt => code.extend_from_slice(&[0x0F, 0x9C, 0xC0]),   // setl al
         BinOp::GtEq => code.extend_from_slice(&[0x0F, 0x9D, 0xC0]), // setge al
         BinOp::LtEq => code.extend_from_slice(&[0x0F, 0x9E, 0xC0]), // setle al
-        BinOp::And | BinOp::Or => {} // not reachable — extract_comparison filters these
+        _ => {} // And, Or, Add, Sub, Mul, Div — not reachable, extract_comparison filters these
     }
 }
 

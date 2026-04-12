@@ -260,8 +260,10 @@ impl Parser {
     ///   expr       = or_expr
     ///   or_expr    = and_expr ('or' and_expr)*
     ///   and_expr   = cmp_expr ('and' cmp_expr)*
-    ///   cmp_expr   = primary (('>' | '<' | '>=' | '<=') primary)?
-    ///   primary    = NUMBER | IDENT ('.' IDENT)*
+    ///   cmp_expr   = add_expr (('>' | '<' | '>=' | '<=') add_expr)?
+    ///   add_expr   = mul_expr (('+' | '-') mul_expr)*
+    ///   mul_expr   = primary (('*' | '/') primary)*
+    ///   primary    = NUMBER | IDENT '(' args ')' | IDENT ('.' IDENT)*
     fn parse_expr(&mut self) -> Result<Expr, ParseError> {
         self.parse_or_expr()
     }
@@ -287,7 +289,7 @@ impl Parser {
     }
 
     fn parse_cmp_expr(&mut self) -> Result<Expr, ParseError> {
-        let left = self.parse_primary()?;
+        let left = self.parse_add_expr()?;
         let op = match self.peek_kind() {
             Some(TokenKind::Gt) => Some(BinOp::Gt),
             Some(TokenKind::Lt) => Some(BinOp::Lt),
@@ -297,8 +299,46 @@ impl Parser {
         };
         if let Some(op) = op {
             self.advance();
-            let right = self.parse_primary()?;
+            let right = self.parse_add_expr()?;
             return Ok(Expr::Binary(op, Box::new(left), Box::new(right)));
+        }
+        Ok(left)
+    }
+
+    fn parse_add_expr(&mut self) -> Result<Expr, ParseError> {
+        let mut left = self.parse_mul_expr()?;
+        loop {
+            let op = match self.peek_kind() {
+                Some(TokenKind::Plus) => Some(BinOp::Add),
+                Some(TokenKind::Minus) => Some(BinOp::Sub),
+                _ => None,
+            };
+            if let Some(op) = op {
+                self.advance();
+                let right = self.parse_mul_expr()?;
+                left = Expr::Binary(op, Box::new(left), Box::new(right));
+            } else {
+                break;
+            }
+        }
+        Ok(left)
+    }
+
+    fn parse_mul_expr(&mut self) -> Result<Expr, ParseError> {
+        let mut left = self.parse_primary()?;
+        loop {
+            let op = match self.peek_kind() {
+                Some(TokenKind::Star) => Some(BinOp::Mul),
+                Some(TokenKind::Slash) => Some(BinOp::Div),
+                _ => None,
+            };
+            if let Some(op) = op {
+                self.advance();
+                let right = self.parse_primary()?;
+                left = Expr::Binary(op, Box::new(left), Box::new(right));
+            } else {
+                break;
+            }
         }
         Ok(left)
     }

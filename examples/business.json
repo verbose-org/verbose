@@ -1,7 +1,7 @@
 [
-  {"amount": 15000, "days_overdue": 45},
-  {"amount": 500,   "days_overdue": 60},
-  {"amount": 15000, "days_overdue": 10},
-  {"amount": 8000,  "days_overdue": 45},
-  {"amount": 20000, "days_overdue": 31}
+  {"amount": 9000,  "tax_rate": 20, "days_overdue": 45},
+  {"amount": 9000,  "tax_rate": 5,  "days_overdue": 60},
+  {"amount": 15000, "tax_rate": 0,  "days_overdue": 10},
+  {"amount": 5000,  "tax_rate": 20, "days_overdue": 45},
+  {"amount": 8000,  "tax_rate": 30, "days_overdue": 31}
 ]

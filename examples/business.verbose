@@ -1,20 +1,48 @@
 @verbose 0.1.0
 
--- A richer example: multiple fields, multiple rules, boolean logic.
--- Shows that Verbose can express real business rules, not just single comparisons.
+-- Business rules with arithmetic, boolean logic, and rule composition.
 
 concept Invoice
-  @intention: "An invoice has an amount and a number of days overdue"
+  @intention: "An invoice has an amount, a tax rate, and a number of days overdue"
   @source: business.intent:1
 
   fields:
     amount       : number
+    tax_rate     : number
     days_overdue : number
 
 
-rule important_invoice
-  @intention: "An invoice is important when its amount exceeds 10000"
+-- This rule computes a value (number), not just true/false.
+-- It uses arithmetic: amount + amount * tax_rate / 100
+rule total_with_tax
+  @intention: "The total with tax is amount plus amount times the tax rate divided by 100"
   @source: business.intent:2
+
+  input:
+    i : Invoice
+
+  output:
+    total : number
+
+  logic:
+    total = i.amount + i.amount * i.tax_rate / 100
+
+  proofs:
+    purity:
+      reads   : [i.amount, i.tax_rate]
+      writes  : []
+      calls   : []
+      verdict : pure
+    termination:
+      form  : constant_bound
+      bound : 3
+    determinism:
+      form : total
+
+
+rule important_invoice
+  @intention: "An invoice is important when its total exceeds 10000"
+  @source: business.intent:3
 
   input:
     i : Invoice
@@ -23,24 +51,24 @@ rule important_invoice
     important : bool
 
   logic:
-    important = i.amount > 10000
+    important = total_with_tax(i) > 10000
 
   proofs:
     purity:
-      reads   : [i.amount]
+      reads   : [i]
       writes  : []
-      calls   : []
+      calls   : [total_with_tax]
       verdict : pure
     termination:
       form  : constant_bound
-      bound : 1
+      bound : 2
     determinism:
       form : total
 
 
 rule overdue_invoice
   @intention: "An invoice is overdue when it has more than 30 days overdue"
-  @source: business.intent:3
+  @source: business.intent:4
 
   input:
     i : Invoice
@@ -64,11 +92,10 @@ rule overdue_invoice
       form : total
 
 
--- This rule CALLS the two rules above instead of reimplementing the logic.
--- The verifier checks that the declared calls match the actual calls in the AST.
+-- Composed rule: calls important + overdue, combines with 'and'.
 rule critical_invoice
-  @intention: "An invoice is critical when it is both important and overdue (using the rules above)"
-  @source: business.intent:4
+  @intention: "An invoice is critical when it is both important and overdue"
+  @source: business.intent:5
 
   input:
     i : Invoice

@@ -135,6 +135,10 @@ fn emit_expr(expr: &Expr, input_name: &str, concept: Option<&Concept>) -> String
         }
         Expr::Binary(op, l, r) => {
             let op_str = match op {
+                BinOp::Add => "+",
+                BinOp::Sub => "-",
+                BinOp::Mul => "*",
+                BinOp::Div => "/",
                 BinOp::Gt => ">",
                 BinOp::Lt => "<",
                 BinOp::GtEq => ">=",

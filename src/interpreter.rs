@@ -161,6 +161,16 @@ fn eval_expr(
             let l = eval_expr(left, env, all_rules)?;
             let r = eval_expr(right, env, all_rules)?;
             match (op, &l, &r) {
+                (BinOp::Add, Value::Number(a), Value::Number(b)) => Ok(Value::Number(a + b)),
+                (BinOp::Sub, Value::Number(a), Value::Number(b)) => Ok(Value::Number(a - b)),
+                (BinOp::Mul, Value::Number(a), Value::Number(b)) => Ok(Value::Number(a * b)),
+                (BinOp::Div, Value::Number(a), Value::Number(b)) => {
+                    if *b == 0 {
+                        Err(RuntimeError { message: "division by zero".into() })
+                    } else {
+                        Ok(Value::Number(a / b))
+                    }
+                }
                 (BinOp::Gt, Value::Number(a), Value::Number(b)) => Ok(Value::Bool(a > b)),
                 (BinOp::Lt, Value::Number(a), Value::Number(b)) => Ok(Value::Bool(a < b)),
                 (BinOp::GtEq, Value::Number(a), Value::Number(b)) => Ok(Value::Bool(a >= b)),
