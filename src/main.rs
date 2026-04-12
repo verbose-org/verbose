@@ -7,6 +7,7 @@ mod ast;
 mod codegen;
 mod interpreter;
 mod lexer;
+mod native;
 mod parser;
 mod verifier;
 
@@ -20,6 +21,7 @@ fn main() {
         eprintln!("  --run <rule> --input <data.json>   Interpret a rule on JSON data");
         eprintln!("  --emit-rust                        Print generated Rust source to stdout");
         eprintln!("  --compile <output>                 Compile to a standalone binary via rustc");
+        eprintln!("  --native <output>                  Compile to native x86-64 ELF (no dependencies)");
         process::exit(2);
     }
     let path = &args[1];
@@ -75,10 +77,23 @@ fn main() {
 
     let emit_rust = args.iter().any(|a| a == "--emit-rust");
     let compile_output = find_flag(&args, "--compile");
+    let native_output = find_flag(&args, "--native");
     let run_rule = find_flag(&args, "--run");
     let input_path = find_flag(&args, "--input");
 
-    if emit_rust {
+    if let Some(output) = native_output {
+        let (concept, rule) = find_first_concept_rule(&program);
+        match native::compile_native(rule, concept, &output) {
+            Ok(()) => {
+                let size = std::fs::metadata(&output).map(|m| m.len()).unwrap_or(0);
+                println!("native: {} -> {} ({} bytes)", path, output, size);
+            }
+            Err(e) => {
+                eprintln!("{}", e);
+                process::exit(1);
+            }
+        }
+    } else if emit_rust {
         println!();
         print!("{}", codegen::emit_rust(&program));
     } else if let Some(output) = compile_output {
@@ -147,4 +162,30 @@ fn find_flag(args: &[String], flag: &str) -> Option<String> {
         .position(|a| a == flag)
         .and_then(|i| args.get(i + 1))
         .cloned()
+}
+
+fn find_first_concept_rule(program: &ast::Program) -> (&ast::Concept, &ast::Rule) {
+    let concept = program
+        .items
+        .iter()
+        .find_map(|i| match i {
+            ast::Item::Concept(c) => Some(c),
+            _ => None,
+        })
+        .unwrap_or_else(|| {
+            eprintln!("no concept found in program");
+            std::process::exit(1);
+        });
+    let rule = program
+        .items
+        .iter()
+        .find_map(|i| match i {
+            ast::Item::Rule(r) => Some(r),
+            _ => None,
+        })
+        .unwrap_or_else(|| {
+            eprintln!("no rule found in program");
+            std::process::exit(1);
+        });
+    (concept, rule)
 }
