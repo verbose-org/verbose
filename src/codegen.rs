@@ -75,7 +75,7 @@ fn emit_rule_fn(out: &mut String, rule: &Rule, concept: Option<&Concept>) {
     out.push_str(&format!(") -> {} {{\n", rust_type(&rule.output_ty)));
     out.push_str(&format!(
         "    {}\n",
-        emit_expr(&rule.logic.value, &rule.input_name)
+        emit_expr(&rule.logic.value, &rule.input_name, concept)
     ));
     out.push_str("}\n\n");
 }
@@ -122,7 +122,7 @@ fn emit_main(out: &mut String, program: &Program, concepts: &[&Concept]) {
     out.push_str("}\n\n");
 }
 
-fn emit_expr(expr: &Expr, input_name: &str) -> String {
+fn emit_expr(expr: &Expr, input_name: &str, concept: Option<&Concept>) -> String {
     match expr {
         Expr::Number(n) => format!("{}", n),
         Expr::Ident(name) => name.clone(),
@@ -130,7 +130,7 @@ fn emit_expr(expr: &Expr, input_name: &str) -> String {
             if matches!(base.as_ref(), Expr::Ident(n) if n == input_name) {
                 field.clone()
             } else {
-                format!("{}.{}", emit_expr(base, input_name), field)
+                format!("{}.{}", emit_expr(base, input_name, concept), field)
             }
         }
         Expr::Binary(op, l, r) => {
@@ -144,10 +144,18 @@ fn emit_expr(expr: &Expr, input_name: &str) -> String {
             };
             format!(
                 "{} {} {}",
-                emit_expr(l, input_name),
+                emit_expr(l, input_name, concept),
                 op_str,
-                emit_expr(r, input_name)
+                emit_expr(r, input_name, concept)
             )
+        }
+        Expr::Call(name, _args) => {
+            if let Some(c) = concept {
+                let fields: Vec<&str> = c.fields.iter().map(|f| f.name.as_str()).collect();
+                format!("{}({})", name, fields.join(", "))
+            } else {
+                format!("{}()", name)
+            }
         }
     }
 }
@@ -222,13 +230,13 @@ mod tests {
 
     #[test]
     fn emit_number() {
-        assert_eq!(emit_expr(&Expr::Number(42), "i"), "42");
+        assert_eq!(emit_expr(&Expr::Number(42), "i", None), "42");
     }
 
     #[test]
     fn emit_field_access() {
         let expr = Expr::Field(Box::new(Expr::Ident("i".into())), "amount".into());
-        assert_eq!(emit_expr(&expr, "i"), "amount");
+        assert_eq!(emit_expr(&expr, "i", None), "amount");
     }
 
     #[test]
@@ -241,7 +249,7 @@ mod tests {
             )),
             Box::new(Expr::Number(10000)),
         );
-        assert_eq!(emit_expr(&expr, "i"), "amount > 10000");
+        assert_eq!(emit_expr(&expr, "i", None), "amount > 10000");
     }
 
     #[test]

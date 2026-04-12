@@ -64,8 +64,10 @@ rule overdue_invoice
       form : total
 
 
+-- This rule CALLS the two rules above instead of reimplementing the logic.
+-- The verifier checks that the declared calls match the actual calls in the AST.
 rule critical_invoice
-  @intention: "An invoice is critical when it is both important and overdue"
+  @intention: "An invoice is critical when it is both important and overdue (using the rules above)"
   @source: business.intent:4
 
   input:
@@ -75,13 +77,13 @@ rule critical_invoice
     critical : bool
 
   logic:
-    critical = i.amount > 10000 and i.days_overdue > 30
+    critical = important_invoice(i) and overdue_invoice(i)
 
   proofs:
     purity:
-      reads   : [i.amount, i.days_overdue]
+      reads   : [i]
       writes  : []
-      calls   : []
+      calls   : [important_invoice, overdue_invoice]
       verdict : pure
     termination:
       form  : constant_bound

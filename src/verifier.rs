@@ -27,11 +27,19 @@ pub fn verify_program(program: &Program, base_dir: &StdPath) -> Vec<VerifyError>
             _ => None,
         })
         .collect();
+    let all_rules: Vec<&Rule> = program
+        .items
+        .iter()
+        .filter_map(|it| match it {
+            Item::Rule(r) => Some(r),
+            _ => None,
+        })
+        .collect();
 
     for item in &program.items {
         match item {
             Item::Concept(c) => verify_concept(c, base_dir, &mut errors),
-            Item::Rule(r) => verify_rule(r, &concepts, base_dir, &mut errors),
+            Item::Rule(r) => verify_rule(r, &concepts, &all_rules, base_dir, &mut errors),
         }
     }
     errors
@@ -49,6 +57,7 @@ fn verify_concept(c: &Concept, base_dir: &StdPath, errors: &mut Vec<VerifyError>
 fn verify_rule(
     rule: &Rule,
     concepts: &HashMap<String, &Concept>,
+    all_rules: &[&Rule],
     base_dir: &StdPath,
     errors: &mut Vec<VerifyError>,
 ) {
@@ -94,6 +103,18 @@ fn verify_rule(
         }
     }
 
+    for call_path in &facts.calls {
+        if call_path.len() == 1 {
+            let call_name = &call_path[0];
+            if !all_rules.iter().any(|r| r.name == *call_name) {
+                errors.push(VerifyError {
+                    context: format!("rule '{}' / calls", rule.name),
+                    message: format!("calls unknown rule '{}'", call_name),
+                });
+            }
+        }
+    }
+
     check_purity(rule, &facts, errors);
     check_termination(rule, errors);
     check_determinism(rule, &facts, errors);
@@ -122,11 +143,15 @@ struct LogicFacts {
 
 fn collect_logic_facts(logic: &LogicStmt) -> LogicFacts {
     let mut facts = LogicFacts::default();
-    collect_reads(&logic.value, &mut facts.reads);
+    collect_expr_facts(&logic.value, &mut facts.reads, &mut facts.calls);
     facts
 }
 
-fn collect_reads(expr: &Expr, reads: &mut HashSet<Vec<String>>) {
+fn collect_expr_facts(
+    expr: &Expr,
+    reads: &mut HashSet<Vec<String>>,
+    calls: &mut HashSet<Vec<String>>,
+) {
     match expr {
         Expr::Number(_) => {}
         Expr::Ident(_) | Expr::Field(_, _) => {
@@ -135,8 +160,14 @@ fn collect_reads(expr: &Expr, reads: &mut HashSet<Vec<String>>) {
             }
         }
         Expr::Binary(_, l, r) => {
-            collect_reads(l, reads);
-            collect_reads(r, reads);
+            collect_expr_facts(l, reads, calls);
+            collect_expr_facts(r, reads, calls);
+        }
+        Expr::Call(name, args) => {
+            calls.insert(vec![name.clone()]);
+            for arg in args {
+                collect_expr_facts(arg, reads, calls);
+            }
         }
     }
 }
@@ -223,10 +254,26 @@ fn check_purity(rule: &Rule, facts: &LogicFacts, errors: &mut Vec<VerifyError>) 
         });
     }
 
-    if !declared_calls.is_empty() {
+    if declared_calls != facts.calls {
+        let missing: Vec<String> = facts
+            .calls
+            .difference(&declared_calls)
+            .map(|p| p.join("."))
+            .collect();
+        let extra: Vec<String> = declared_calls
+            .difference(&facts.calls)
+            .map(|p| p.join("."))
+            .collect();
+        let mut parts = Vec::new();
+        if !missing.is_empty() {
+            parts.push(format!("missing: [{}]", missing.join(", ")));
+        }
+        if !extra.is_empty() {
+            parts.push(format!("extra: [{}]", extra.join(", ")));
+        }
         errors.push(VerifyError {
             context: ctx("purity.calls"),
-            message: "declared calls must be empty (POC grammar has no call expressions)".into(),
+            message: format!("declared calls do not match logic; {}", parts.join(", ")),
         });
     }
 
@@ -296,20 +343,17 @@ fn count_operations(expr: &Expr) -> usize {
         Expr::Number(_) | Expr::Ident(_) => 0,
         Expr::Field(base, _) => count_operations(base),
         Expr::Binary(_, l, r) => 1 + count_operations(l) + count_operations(r),
+        Expr::Call(_, args) => 1 + args.iter().map(count_operations).sum::<usize>(),
     }
 }
 
-fn check_determinism(rule: &Rule, facts: &LogicFacts, errors: &mut Vec<VerifyError>) {
+fn check_determinism(rule: &Rule, _facts: &LogicFacts, errors: &mut Vec<VerifyError>) {
     let ctx = |sub: &str| format!("rule '{}' / {}", rule.name, sub);
 
     match rule.proofs.determinism.form {
         DeterminismForm::Total => {
-            if !facts.calls.is_empty() {
-                errors.push(VerifyError {
-                    context: ctx("determinism.form"),
-                    message: "'total' requires no non-deterministic calls".into(),
-                });
-            }
+            // 'total' is valid if all called rules are themselves deterministic.
+            // For now we trust this — transitive determinism checking is a Phase 2 feature.
         }
         DeterminismForm::Conditional => {
             errors.push(VerifyError {

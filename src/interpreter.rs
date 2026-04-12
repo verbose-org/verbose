@@ -126,22 +126,26 @@ fn parse_json_value(s: &str) -> Result<Value, RuntimeError> {
 
 pub fn eval_rule(
     rule: &Rule,
+    all_rules: &[&Rule],
     input: &HashMap<String, Value>,
 ) -> Result<Value, RuntimeError> {
     let mut env: HashMap<String, Value> = HashMap::new();
     env.insert(rule.input_name.clone(), Value::Record(input.clone()));
-    let result = eval_expr(&rule.logic.value, &env)?;
-    Ok(result)
+    eval_expr(&rule.logic.value, &env, all_rules)
 }
 
-fn eval_expr(expr: &Expr, env: &HashMap<String, Value>) -> Result<Value, RuntimeError> {
+fn eval_expr(
+    expr: &Expr,
+    env: &HashMap<String, Value>,
+    all_rules: &[&Rule],
+) -> Result<Value, RuntimeError> {
     match expr {
         Expr::Number(n) => Ok(Value::Number(*n)),
         Expr::Ident(name) => env.get(name).cloned().ok_or_else(|| RuntimeError {
             message: format!("undefined binding '{}'", name),
         }),
         Expr::Field(base, field) => {
-            let base_val = eval_expr(base, env)?;
+            let base_val = eval_expr(base, env, all_rules)?;
             match base_val {
                 Value::Record(fields) => {
                     fields.get(field).cloned().ok_or_else(|| RuntimeError {
@@ -154,8 +158,8 @@ fn eval_expr(expr: &Expr, env: &HashMap<String, Value>) -> Result<Value, Runtime
             }
         }
         Expr::Binary(op, left, right) => {
-            let l = eval_expr(left, env)?;
-            let r = eval_expr(right, env)?;
+            let l = eval_expr(left, env, all_rules)?;
+            let r = eval_expr(right, env, all_rules)?;
             match (op, &l, &r) {
                 (BinOp::Gt, Value::Number(a), Value::Number(b)) => Ok(Value::Bool(a > b)),
                 (BinOp::Lt, Value::Number(a), Value::Number(b)) => Ok(Value::Bool(a < b)),
@@ -165,6 +169,26 @@ fn eval_expr(expr: &Expr, env: &HashMap<String, Value>) -> Result<Value, Runtime
                 (BinOp::Or, Value::Bool(a), Value::Bool(b)) => Ok(Value::Bool(*a || *b)),
                 _ => Err(RuntimeError {
                     message: format!("cannot apply {:?} to {} and {}", op, l, r),
+                }),
+            }
+        }
+        Expr::Call(name, args) => {
+            let called = all_rules
+                .iter()
+                .find(|r| r.name == *name)
+                .ok_or_else(|| RuntimeError {
+                    message: format!("unknown rule '{}'", name),
+                })?;
+            if args.len() != 1 {
+                return Err(RuntimeError {
+                    message: format!("rule call expects 1 argument, got {}", args.len()),
+                });
+            }
+            let arg_val = eval_expr(&args[0], env, all_rules)?;
+            match arg_val {
+                Value::Record(fields) => eval_rule(called, all_rules, &fields),
+                _ => Err(RuntimeError {
+                    message: "call argument must be a record".into(),
                 }),
             }
         }
@@ -221,7 +245,7 @@ mod tests {
         let rule = make_rule();
         let mut input = HashMap::new();
         input.insert("amount".into(), Value::Number(15000));
-        assert_eq!(eval_rule(&rule, &input).unwrap(), Value::Bool(true));
+        assert_eq!(eval_rule(&rule, &[], &input).unwrap(), Value::Bool(true));
     }
 
     #[test]
@@ -229,7 +253,7 @@ mod tests {
         let rule = make_rule();
         let mut input = HashMap::new();
         input.insert("amount".into(), Value::Number(500));
-        assert_eq!(eval_rule(&rule, &input).unwrap(), Value::Bool(false));
+        assert_eq!(eval_rule(&rule, &[], &input).unwrap(), Value::Bool(false));
     }
 
     #[test]
@@ -237,7 +261,7 @@ mod tests {
         let rule = make_rule();
         let mut input = HashMap::new();
         input.insert("amount".into(), Value::Number(10000));
-        assert_eq!(eval_rule(&rule, &input).unwrap(), Value::Bool(false));
+        assert_eq!(eval_rule(&rule, &[], &input).unwrap(), Value::Bool(false));
     }
 
     #[test]
@@ -245,14 +269,14 @@ mod tests {
         let rule = make_rule();
         let mut input = HashMap::new();
         input.insert("amount".into(), Value::Number(10001));
-        assert_eq!(eval_rule(&rule, &input).unwrap(), Value::Bool(true));
+        assert_eq!(eval_rule(&rule, &[], &input).unwrap(), Value::Bool(true));
     }
 
     #[test]
     fn missing_field_fails() {
         let rule = make_rule();
         let input = HashMap::new();
-        assert!(eval_rule(&rule, &input).is_err());
+        assert!(eval_rule(&rule, &[], &input).is_err());
     }
 
     #[test]

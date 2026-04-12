@@ -69,6 +69,7 @@ pub enum Expr {
     Ident(String),
     Field(Box<Expr>, String),
     Binary(BinOp, Box<Expr>, Box<Expr>),
+    Call(String, Vec<Expr>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -117,13 +117,17 @@ fn main() {
         }
         println!("compiled: {} -> {}", path, output);
     } else if let (Some(rule_name), Some(json_path)) = (run_rule, input_path) {
-        let rule = program
+        let all_rules: Vec<&ast::Rule> = program
             .items
             .iter()
-            .find_map(|it| match it {
-                ast::Item::Rule(r) if r.name == rule_name => Some(r),
+            .filter_map(|i| match i {
+                ast::Item::Rule(r) => Some(r),
                 _ => None,
             })
+            .collect();
+        let rule = all_rules
+            .iter()
+            .find(|r| r.name == rule_name)
             .unwrap_or_else(|| {
                 eprintln!("no rule named '{}'", rule_name);
                 process::exit(1);
@@ -144,7 +148,7 @@ fn main() {
             records.len()
         );
         for (idx, record) in records.iter().enumerate() {
-            match interpreter::eval_rule(rule, record) {
+            match interpreter::eval_rule(rule, &all_rules, record) {
                 Ok(val) => {
                     println!("  [{}] {} = {}", idx, rule.output_name, val);
                 }

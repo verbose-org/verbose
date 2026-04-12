@@ -311,13 +311,27 @@ impl Parser {
             Ok(Expr::Number(n))
         } else if is_ident {
             let name = self.expect_ident_any()?;
-            let mut expr = Expr::Ident(name);
-            while self.check_kind(&TokenKind::Dot) {
+            if self.check_kind(&TokenKind::LParen) {
                 self.advance();
-                let field = self.expect_ident_any()?;
-                expr = Expr::Field(Box::new(expr), field);
+                let mut args = Vec::new();
+                if !self.check_kind(&TokenKind::RParen) {
+                    args.push(self.parse_expr()?);
+                    while self.check_kind(&TokenKind::Comma) {
+                        self.advance();
+                        args.push(self.parse_expr()?);
+                    }
+                }
+                self.expect_kind(TokenKind::RParen)?;
+                Ok(Expr::Call(name, args))
+            } else {
+                let mut expr = Expr::Ident(name);
+                while self.check_kind(&TokenKind::Dot) {
+                    self.advance();
+                    let field = self.expect_ident_any()?;
+                    expr = Expr::Field(Box::new(expr), field);
+                }
+                Ok(expr)
             }
-            Ok(expr)
         } else {
             Err(self.error("expected expression (number or identifier)"))
         }
