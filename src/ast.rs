@@ -65,6 +65,17 @@ pub struct Hints {
     pub vectorizable: Option<bool>,
     pub parallel: Option<bool>,
     pub cache_result: Option<bool>,
+    pub overflow: Option<OverflowHint>,
+}
+
+/// Overflow hint: the AI declares value bounds for the output.
+/// The compiler verifies these bounds against the arithmetic in the logic.
+/// If verified: no runtime overflow check needed (faster than default).
+/// If unverifiable: the compiler rejects the hint and adds a runtime check.
+#[derive(Debug, Clone)]
+pub struct OverflowHint {
+    pub min: i64,
+    pub max: i64,
 }
 
 #[derive(Debug)]

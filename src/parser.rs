@@ -665,29 +665,44 @@ impl Parser {
         let mut vectorizable = None;
         let mut parallel = None;
         let mut cache_result = None;
+        let mut overflow = None;
 
         while !self.check_kind(&TokenKind::Dedent) && !self.at_eof() {
             let key = self.expect_ident_any()?;
             self.expect_kind(TokenKind::Colon)?;
-            let val = self.expect_ident_any()?;
-            let b = match val.as_str() {
-                "yes" => true,
-                "no" => false,
-                _ => {
-                    return Err(
-                        self.error(&format!("expected 'yes' or 'no' for hint '{}', got '{}'", key, val)),
-                    )
-                }
-            };
             match key.as_str() {
-                "vectorizable" => vectorizable = Some(b),
-                "parallel" => parallel = Some(b),
-                "cache_result" => cache_result = Some(b),
+                "overflow" => {
+                    // overflow : [min, max]
+                    self.expect_kind(TokenKind::LBracket)?;
+                    let min = self.parse_signed_number()?;
+                    self.expect_kind(TokenKind::Comma)?;
+                    let max = self.parse_signed_number()?;
+                    self.expect_kind(TokenKind::RBracket)?;
+                    overflow = Some(OverflowHint { min, max });
+                }
                 _ => {
-                    return Err(self.error(&format!(
-                        "unknown hint '{}' (allowed: vectorizable, parallel, cache_result)",
-                        key
-                    )))
+                    let val = self.expect_ident_any()?;
+                    let b = match val.as_str() {
+                        "yes" => true,
+                        "no" => false,
+                        _ => {
+                            return Err(self.error(&format!(
+                                "expected 'yes' or 'no' for hint '{}', got '{}'",
+                                key, val
+                            )))
+                        }
+                    };
+                    match key.as_str() {
+                        "vectorizable" => vectorizable = Some(b),
+                        "parallel" => parallel = Some(b),
+                        "cache_result" => cache_result = Some(b),
+                        _ => {
+                            return Err(self.error(&format!(
+                                "unknown hint '{}' (allowed: vectorizable, parallel, cache_result, overflow)",
+                                key
+                            )))
+                        }
+                    }
                 }
             }
             self.expect_kind(TokenKind::Newline)?;
@@ -698,7 +713,18 @@ impl Parser {
             vectorizable,
             parallel,
             cache_result,
+            overflow,
         })
+    }
+
+    fn parse_signed_number(&mut self) -> Result<i64, ParseError> {
+        if matches!(self.peek_kind(), Some(TokenKind::Minus)) {
+            self.advance();
+            let n = self.expect_number()?;
+            Ok(-n)
+        } else {
+            self.expect_number()
+        }
     }
 
     // --- cursor helpers ---

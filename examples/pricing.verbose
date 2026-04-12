@@ -37,6 +37,9 @@ rule penalty_rate
     determinism:
       form : total
 
+  hints:
+    overflow : [0, 100]
+
 
 rule final_amount
   @intention: "The final amount is the base amount plus tax plus the penalty applied on the base amount"

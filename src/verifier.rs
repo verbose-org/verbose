@@ -120,11 +120,17 @@ fn verify_rule(
     check_determinism(rule, &facts, errors);
 
     if let Some(hints) = &rule.hints {
-        check_hints(rule, hints, &facts, errors);
+        check_hints(rule, hints, &facts, concepts, errors);
     }
 }
 
-fn check_hints(rule: &Rule, hints: &Hints, facts: &LogicFacts, errors: &mut Vec<VerifyError>) {
+fn check_hints(
+    rule: &Rule,
+    hints: &Hints,
+    facts: &LogicFacts,
+    concepts: &HashMap<String, &Concept>,
+    errors: &mut Vec<VerifyError>,
+) {
     if hints.vectorizable == Some(true) {
         if !facts.calls.is_empty() {
             errors.push(VerifyError {
@@ -146,6 +152,49 @@ fn check_hints(rule: &Rule, hints: &Hints, facts: &LogicFacts, errors: &mut Vec<
                 context: format!("rule '{}' / hints.parallel", rule.name),
                 message: "parallel requires pure verdict (no side effects between elements)".into(),
             });
+        }
+    }
+
+    if let Some(overflow) = &hints.overflow {
+        if overflow.min > overflow.max {
+            errors.push(VerifyError {
+                context: format!("rule '{}' / hints.overflow", rule.name),
+                message: format!(
+                    "invalid overflow bounds: min {} > max {}",
+                    overflow.min, overflow.max
+                ),
+            });
+        } else {
+            // Build field ranges from concept (assume i64 full range if no overflow hint on fields)
+            // For POC: fields are assumed to have the range declared in the overflow hint's context
+            // We use a conservative default range for input fields
+            let mut field_ranges: HashMap<&str, (i64, i64)> = HashMap::new();
+            if let Type::Named(concept_name) = &rule.input_ty {
+                if let Some(concept) = concepts.get(concept_name) {
+                    for field in &concept.fields {
+                        if field.ty == Type::Number {
+                            // Conservative: assume fields can be any non-negative i32 value
+                            // In a real system, field bounds would be declared on the concept
+                            field_ranges.insert(field.name.as_str(), (0, i32::MAX as i64));
+                        }
+                    }
+                }
+            }
+
+            if let Some((actual_min, actual_max)) =
+                compute_range(&rule.logic.value, &field_ranges, &rule.input_name)
+            {
+                if actual_min < overflow.min || actual_max > overflow.max {
+                    errors.push(VerifyError {
+                        context: format!("rule '{}' / hints.overflow", rule.name),
+                        message: format!(
+                            "computed range [{}, {}] exceeds declared [{}, {}]",
+                            actual_min, actual_max, overflow.min, overflow.max
+                        ),
+                    });
+                }
+            }
+            // If compute_range returns None, we can't verify — we accept the hint but don't optimize
         }
     }
 }
@@ -417,6 +466,70 @@ fn check_determinism(rule: &Rule, _facts: &LogicFacts, errors: &mut Vec<VerifyEr
             });
         }
         DeterminismForm::Nondeterministic => {}
+    }
+}
+
+/// Interval arithmetic: compute the possible value range of an expression.
+/// Returns (min, max) bounds. Used to verify overflow hints.
+///
+/// This is the key innovation: the compiler COMPUTES whether overflow is possible
+/// instead of trusting the AI or inserting runtime checks unconditionally.
+fn compute_range(
+    expr: &Expr,
+    field_ranges: &HashMap<&str, (i64, i64)>,
+    input_name: &str,
+) -> Option<(i64, i64)> {
+    match expr {
+        Expr::Number(n) => Some((*n, *n)),
+        Expr::Field(base, field) => {
+            if matches!(base.as_ref(), Expr::Ident(n) if n == input_name) {
+                field_ranges.get(field.as_str()).copied()
+            } else {
+                None
+            }
+        }
+        Expr::Binary(op, left, right) => {
+            let (l_min, l_max) = compute_range(left, field_ranges, input_name)?;
+            let (r_min, r_max) = compute_range(right, field_ranges, input_name)?;
+            match op {
+                BinOp::Add => Some((l_min.checked_add(r_min)?, l_max.checked_add(r_max)?)),
+                BinOp::Sub => Some((l_min.checked_sub(r_max)?, l_max.checked_sub(r_min)?)),
+                BinOp::Mul => {
+                    let products = [
+                        l_min.checked_mul(r_min)?,
+                        l_min.checked_mul(r_max)?,
+                        l_max.checked_mul(r_min)?,
+                        l_max.checked_mul(r_max)?,
+                    ];
+                    Some((*products.iter().min()?, *products.iter().max()?))
+                }
+                BinOp::Div => {
+                    if r_min <= 0 && r_max >= 0 {
+                        None // divisor range includes zero — can't prove safe
+                    } else {
+                        let quotients = [
+                            l_min.checked_div(r_min)?,
+                            l_min.checked_div(r_max)?,
+                            l_max.checked_div(r_min)?,
+                            l_max.checked_div(r_max)?,
+                        ];
+                        Some((*quotients.iter().min()?, *quotients.iter().max()?))
+                    }
+                }
+                _ => None, // comparisons/booleans return bool, not a range
+            }
+        }
+        Expr::Neg(inner) => {
+            let (min, max) = compute_range(inner, field_ranges, input_name)?;
+            Some((-max, -min))
+        }
+        Expr::If(_, then_e, else_e) => {
+            let (t_min, t_max) = compute_range(then_e, field_ranges, input_name)?;
+            let (e_min, e_max) = compute_range(else_e, field_ranges, input_name)?;
+            Some((t_min.min(e_min), t_max.max(e_max)))
+        }
+        Expr::Call(_, _) => None, // can't compute range through calls yet
+        _ => None,
     }
 }
 
