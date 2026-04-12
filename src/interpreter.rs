@@ -9,6 +9,7 @@ use crate::ast::*;
 pub enum Value {
     Number(i64),
     Bool(bool),
+    Text(String),
     Record(HashMap<String, Value>),
 }
 
@@ -17,6 +18,7 @@ impl fmt::Display for Value {
         match self {
             Value::Number(n) => write!(f, "{}", n),
             Value::Bool(b) => write!(f, "{}", b),
+            Value::Text(s) => write!(f, "{}", s),
             Value::Record(fields) => {
                 write!(f, "{{")?;
                 let mut first = true;
@@ -116,6 +118,9 @@ fn parse_json_value(s: &str) -> Result<Value, RuntimeError> {
     if s == "false" {
         return Ok(Value::Bool(false));
     }
+    if s.starts_with('"') && s.ends_with('"') && s.len() >= 2 {
+        return Ok(Value::Text(s[1..s.len() - 1].to_string()));
+    }
     if let Ok(n) = s.parse::<i64>() {
         return Ok(Value::Number(n));
     }
@@ -141,6 +146,7 @@ fn eval_expr(
 ) -> Result<Value, RuntimeError> {
     match expr {
         Expr::Number(n) => Ok(Value::Number(*n)),
+        Expr::Text(s) => Ok(Value::Text(s.clone())),
         Expr::Ident(name) => env.get(name).cloned().ok_or_else(|| RuntimeError {
             message: format!("undefined binding '{}'", name),
         }),
@@ -161,6 +167,10 @@ fn eval_expr(
             let l = eval_expr(left, env, all_rules)?;
             let r = eval_expr(right, env, all_rules)?;
             match (op, &l, &r) {
+                (BinOp::Eq, Value::Number(a), Value::Number(b)) => Ok(Value::Bool(a == b)),
+                (BinOp::Eq, Value::Text(a), Value::Text(b)) => Ok(Value::Bool(a == b)),
+                (BinOp::NotEq, Value::Number(a), Value::Number(b)) => Ok(Value::Bool(a != b)),
+                (BinOp::NotEq, Value::Text(a), Value::Text(b)) => Ok(Value::Bool(a != b)),
                 (BinOp::Add, Value::Number(a), Value::Number(b)) => Ok(Value::Number(a + b)),
                 (BinOp::Sub, Value::Number(a), Value::Number(b)) => Ok(Value::Number(a - b)),
                 (BinOp::Mul, Value::Number(a), Value::Number(b)) => Ok(Value::Number(a * b)),

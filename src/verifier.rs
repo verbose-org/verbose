@@ -153,7 +153,7 @@ fn collect_expr_facts(
     calls: &mut HashSet<Vec<String>>,
 ) {
     match expr {
-        Expr::Number(_) => {}
+        Expr::Number(_) | Expr::Text(_) => {}
         Expr::Ident(_) | Expr::Field(_, _) => {
             if let Some(path) = expr_to_path(expr) {
                 reads.insert(path);
@@ -340,7 +340,7 @@ fn check_termination(rule: &Rule, errors: &mut Vec<VerifyError>) {
 
 fn count_operations(expr: &Expr) -> usize {
     match expr {
-        Expr::Number(_) | Expr::Ident(_) => 0,
+        Expr::Number(_) | Expr::Text(_) | Expr::Ident(_) => 0,
         Expr::Field(base, _) => count_operations(base),
         Expr::Binary(_, l, r) => 1 + count_operations(l) + count_operations(r),
         Expr::Call(_, args) => 1 + args.iter().map(count_operations).sum::<usize>(),

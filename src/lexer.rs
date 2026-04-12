@@ -14,6 +14,8 @@ pub enum TokenKind {
     LParen,
     RParen,
     Equal,
+    EqualEqual,
+    NotEqual,
     Gt,
     Lt,
     GtEq,
@@ -52,6 +54,8 @@ impl fmt::Display for TokenKind {
             TokenKind::LParen => write!(f, "'('"),
             TokenKind::RParen => write!(f, "')'"),
             TokenKind::Equal => write!(f, "'='"),
+            TokenKind::EqualEqual => write!(f, "'=='"),
+            TokenKind::NotEqual => write!(f, "'!='"),
             TokenKind::Gt => write!(f, "'>'"),
             TokenKind::Lt => write!(f, "'<'"),
             TokenKind::GtEq => write!(f, "'>='"),
@@ -357,8 +361,27 @@ impl<'a> Lexer<'a> {
                 TokenKind::RParen
             }
             b'=' => {
+                if self.peek(1) == Some(b'=') {
+                    self.advance();
+                    self.advance();
+                    self.emit_token(TokenKind::EqualEqual, start_line, start_col);
+                    return Ok(());
+                }
                 self.advance();
                 TokenKind::Equal
+            }
+            b'!' => {
+                if self.peek(1) == Some(b'=') {
+                    self.advance();
+                    self.advance();
+                    self.emit_token(TokenKind::NotEqual, start_line, start_col);
+                    return Ok(());
+                }
+                return Err(LexError {
+                    line: start_line,
+                    col: start_col,
+                    message: "unexpected '!' (did you mean '!='?)".into(),
+                });
             }
             b'>' => {
                 if self.peek(1) == Some(b'=') {

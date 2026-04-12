@@ -1,0 +1,64 @@
+@verbose 0.1.0
+
+-- Text type example: string comparison with ==
+
+concept Client
+  @intention: "A client has a name, a status, and a balance"
+  @source: clients.intent:1
+
+  fields:
+    name    : text
+    status  : text
+    balance : number
+
+
+rule active_client
+  @intention: "A client is active when their status is active"
+  @source: clients.intent:2
+
+  input:
+    c : Client
+
+  output:
+    active : bool
+
+  logic:
+    active = c.status == "active"
+
+  proofs:
+    purity:
+      reads   : [c.status]
+      writes  : []
+      calls   : []
+      verdict : pure
+    termination:
+      form  : constant_bound
+      bound : 1
+    determinism:
+      form : total
+
+
+rule vip_client
+  @intention: "A client is vip when they are active and their balance exceeds 50000"
+  @source: clients.intent:3
+
+  input:
+    c : Client
+
+  output:
+    vip : bool
+
+  logic:
+    vip = active_client(c) and c.balance > 50000
+
+  proofs:
+    purity:
+      reads   : [c, c.balance]
+      writes  : []
+      calls   : [active_client]
+      verdict : pure
+    termination:
+      form  : constant_bound
+      bound : 3
+    determinism:
+      form : total

@@ -135,6 +135,7 @@ impl Parser {
         Ok(match name.as_str() {
             "number" => Type::Number,
             "bool" => Type::Bool,
+            "text" => Type::Text,
             _ => Type::Named(name),
         })
     }
@@ -291,6 +292,8 @@ impl Parser {
     fn parse_cmp_expr(&mut self) -> Result<Expr, ParseError> {
         let left = self.parse_add_expr()?;
         let op = match self.peek_kind() {
+            Some(TokenKind::EqualEqual) => Some(BinOp::Eq),
+            Some(TokenKind::NotEqual) => Some(BinOp::NotEq),
             Some(TokenKind::Gt) => Some(BinOp::Gt),
             Some(TokenKind::Lt) => Some(BinOp::Lt),
             Some(TokenKind::GtEq) => Some(BinOp::GtEq),
@@ -345,8 +348,12 @@ impl Parser {
 
     fn parse_primary(&mut self) -> Result<Expr, ParseError> {
         let is_number = matches!(self.peek_kind(), Some(TokenKind::Number(_)));
+        let is_string = matches!(self.peek_kind(), Some(TokenKind::StringLit(_)));
         let is_ident = matches!(self.peek_kind(), Some(TokenKind::Ident(_)));
-        if is_number {
+        if is_string {
+            let s = self.expect_string()?;
+            Ok(Expr::Text(s))
+        } else if is_number {
             let n = self.expect_number()?;
             Ok(Expr::Number(n))
         } else if is_ident {

@@ -1,0 +1,7 @@
+[
+  {"name": "Dupont",  "status": "active",   "balance": 75000},
+  {"name": "Martin",  "status": "inactive", "balance": 90000},
+  {"name": "Durand",  "status": "active",   "balance": 30000},
+  {"name": "Lefevre", "status": "active",   "balance": 60000},
+  {"name": "Moreau",  "status": "blocked",  "balance": 100000}
+]

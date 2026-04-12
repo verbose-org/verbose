@@ -218,6 +218,11 @@ fn emit_eval_expr(
             emit_mov_rax_imm(code, *n);
             Ok(())
         }
+        Expr::Text(_) => {
+            Err(NativeError {
+                message: "text literals not supported in native backend (use --compile for Rust transpiler)".into(),
+            })
+        }
         Expr::Field(base, field_name) => {
             if !matches!(base.as_ref(), Expr::Ident(n) if n == input_name) {
                 return Err(NativeError {
@@ -264,6 +269,16 @@ fn emit_eval_expr(
                     code.extend_from_slice(&[0x48, 0x89, 0xC8]); // mov rax, rcx (left → rax)
                     code.extend_from_slice(&[0x48, 0x99]); // cqo (sign-extend rax → rdx:rax)
                     code.extend_from_slice(&[0x49, 0xF7, 0xF8]); // idiv r8
+                }
+                BinOp::Eq => {
+                    code.extend_from_slice(&[0x48, 0x39, 0xC1]); // cmp rcx, rax
+                    code.extend_from_slice(&[0x0F, 0x94, 0xC0]); // sete al
+                    code.extend_from_slice(&[0x48, 0x0F, 0xB6, 0xC0]); // movzx rax, al
+                }
+                BinOp::NotEq => {
+                    code.extend_from_slice(&[0x48, 0x39, 0xC1]); // cmp rcx, rax
+                    code.extend_from_slice(&[0x0F, 0x95, 0xC0]); // setne al
+                    code.extend_from_slice(&[0x48, 0x0F, 0xB6, 0xC0]); // movzx rax, al
                 }
                 BinOp::Gt => {
                     code.extend_from_slice(&[0x48, 0x39, 0xC1]); // cmp rcx, rax

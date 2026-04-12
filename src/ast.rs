@@ -35,6 +35,7 @@ pub struct Field {
 pub enum Type {
     Number,
     Bool,
+    Text,
     Named(String),
 }
 
@@ -66,6 +67,7 @@ pub struct LogicStmt {
 #[derive(Debug, Clone)]
 pub enum Expr {
     Number(i64),
+    Text(String),
     Ident(String),
     Field(Box<Expr>, String),
     Binary(BinOp, Box<Expr>, Box<Expr>),
@@ -78,6 +80,8 @@ pub enum BinOp {
     Sub,
     Mul,
     Div,
+    Eq,
+    NotEq,
     Gt,
     Lt,
     GtEq,

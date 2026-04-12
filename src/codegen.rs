@@ -125,6 +125,7 @@ fn emit_main(out: &mut String, program: &Program, concepts: &[&Concept]) {
 fn emit_expr(expr: &Expr, input_name: &str, concept: Option<&Concept>) -> String {
     match expr {
         Expr::Number(n) => format!("{}", n),
+        Expr::Text(s) => format!("{:?}", s),
         Expr::Ident(name) => name.clone(),
         Expr::Field(base, field) => {
             if matches!(base.as_ref(), Expr::Ident(n) if n == input_name) {
@@ -139,6 +140,8 @@ fn emit_expr(expr: &Expr, input_name: &str, concept: Option<&Concept>) -> String
                 BinOp::Sub => "-",
                 BinOp::Mul => "*",
                 BinOp::Div => "/",
+                BinOp::Eq => "==",
+                BinOp::NotEq => "!=",
                 BinOp::Gt => ">",
                 BinOp::Lt => "<",
                 BinOp::GtEq => ">=",
@@ -168,6 +171,7 @@ fn rust_type(ty: &Type) -> &str {
     match ty {
         Type::Number => "i64",
         Type::Bool => "bool",
+        Type::Text => "&str",
         Type::Named(_) => "i64",
     }
 }
@@ -176,6 +180,7 @@ fn type_label(ty: &Type) -> &str {
     match ty {
         Type::Number => "number",
         Type::Bool => "bool",
+        Type::Text => "text",
         Type::Named(n) => n.as_str(),
     }
 }
