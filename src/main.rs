@@ -4,6 +4,7 @@ use std::path::Path;
 use std::process;
 
 mod ast;
+mod codegen;
 mod interpreter;
 mod lexer;
 mod parser;
@@ -13,7 +14,12 @@ fn main() {
     let args: Vec<String> = env::args().collect();
 
     if args.len() < 2 {
-        eprintln!("usage: verbosec <file.verbose> [--run <rule> --input <data.json>]");
+        eprintln!("usage: verbosec <file.verbose> [options]");
+        eprintln!();
+        eprintln!("options:");
+        eprintln!("  --run <rule> --input <data.json>   Interpret a rule on JSON data");
+        eprintln!("  --emit-rust                        Print generated Rust source to stdout");
+        eprintln!("  --compile <output>                 Compile to a standalone binary via rustc");
         process::exit(2);
     }
     let path = &args[1];
@@ -67,10 +73,35 @@ fn main() {
         n_concepts, n_rules
     );
 
+    let emit_rust = args.iter().any(|a| a == "--emit-rust");
+    let compile_output = find_flag(&args, "--compile");
     let run_rule = find_flag(&args, "--run");
     let input_path = find_flag(&args, "--input");
 
-    if let (Some(rule_name), Some(json_path)) = (run_rule, input_path) {
+    if emit_rust {
+        println!();
+        print!("{}", codegen::emit_rust(&program));
+    } else if let Some(output) = compile_output {
+        let rust_source = codegen::emit_rust(&program);
+        let tmp = format!("{}.rs", output);
+        fs::write(&tmp, &rust_source).unwrap_or_else(|e| {
+            eprintln!("cannot write temp file '{}': {}", tmp, e);
+            process::exit(1);
+        });
+        let status = process::Command::new("rustc")
+            .args([&tmp, "-o", &output])
+            .status()
+            .unwrap_or_else(|e| {
+                eprintln!("failed to run rustc: {}", e);
+                process::exit(1);
+            });
+        let _ = fs::remove_file(&tmp);
+        if !status.success() {
+            eprintln!("rustc compilation failed");
+            process::exit(1);
+        }
+        println!("compiled: {} -> {}", path, output);
+    } else if let (Some(rule_name), Some(json_path)) = (run_rule, input_path) {
         let rule = program
             .items
             .iter()
@@ -83,14 +114,13 @@ fn main() {
                 process::exit(1);
             });
 
-        let records =
-            match interpreter::load_json_input(Path::new(&json_path)) {
-                Ok(r) => r,
-                Err(e) => {
-                    eprintln!("{}", e);
-                    process::exit(1);
-                }
-            };
+        let records = match interpreter::load_json_input(Path::new(&json_path)) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("{}", e);
+                process::exit(1);
+            }
+        };
 
         println!();
         println!(
