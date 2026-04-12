@@ -63,7 +63,20 @@ pub fn compile_native(
         }
     };
 
-    let code = emit_full_program(rule, concept, &rules)?;
+    let is_vectorizable = rule
+        .hints
+        .as_ref()
+        .map_or(false, |h| h.vectorizable == Some(true));
+
+    let code = if is_vectorizable && concept.fields.len() == 1 {
+        if let Some(threshold) = extract_simple_gt(rule) {
+            emit_vectorized_program(threshold)?
+        } else {
+            emit_full_program(rule, concept, &rules)?
+        }
+    } else {
+        emit_full_program(rule, concept, &rules)?
+    };
     let elf = build_elf(&code);
 
     let mut file = std::fs::File::create(output_path).map_err(|e| NativeError {
@@ -546,6 +559,196 @@ fn emit_write_string(code: &mut Vec<u8>, s: &[u8]) {
     code.extend_from_slice(&[0x48, 0xC7, 0xC7, 0x01, 0x00, 0x00, 0x00]);
     code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x01, 0x00, 0x00, 0x00]);
     code.extend_from_slice(&[0x0F, 0x05]);
+}
+
+/// Check if the rule's logic is a simple `field > N` pattern.
+fn extract_simple_gt(rule: &Rule) -> Option<i64> {
+    if let Expr::Binary(BinOp::Gt, left, right) = &rule.logic.value {
+        if let Expr::Number(n) = right.as_ref() {
+            if let Expr::Field(base, _) = left.as_ref() {
+                if matches!(base.as_ref(), Expr::Ident(name) if name == &rule.input_name) {
+                    return Some(*n);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn emit_cmp_rax_imm(code: &mut Vec<u8>, value: i64) {
+    if value >= i32::MIN as i64 && value <= i32::MAX as i64 {
+        code.extend_from_slice(&[0x48, 0x3D]);
+        code.extend_from_slice(&(value as i32).to_le_bytes());
+    } else {
+        // mov rcx, imm64; cmp rax, rcx
+        code.extend_from_slice(&[0x48, 0xB9]);
+        code.extend_from_slice(&value.to_le_bytes());
+        code.extend_from_slice(&[0x48, 0x39, 0xC8]);
+    }
+}
+
+/// SIMD-optimized program for single-field `> threshold` comparisons.
+/// Uses SSE4.2 `pcmpgtq` to compare 2 i64 values simultaneously.
+///
+/// Phase 1: Parse all argv numbers into a contiguous, 16-byte-aligned array
+/// Phase 2: Process pairs with SIMD (pcmpgtq compares 2 values per instruction)
+/// Phase 3: Scalar fallback for the remainder (if odd count)
+fn emit_vectorized_program(threshold: i64) -> Result<Vec<u8>, NativeError> {
+    let mut code = Vec::new();
+
+    // === Setup ===
+    // mov r12, [rsp]
+    code.extend_from_slice(&[0x4C, 0x8B, 0x24, 0x24]);
+    // lea r13, [rsp+8]
+    code.extend_from_slice(&[0x4C, 0x8D, 0x6C, 0x24, 0x08]);
+
+    // r14 = count = argc - 1
+    code.extend_from_slice(&[0x4D, 0x89, 0xE6]); // mov r14, r12
+    code.extend_from_slice(&[0x49, 0xFF, 0xCE]); // dec r14
+
+    // Allocate 16-byte-aligned array on stack
+    code.extend_from_slice(&[0x4C, 0x89, 0xF0]); // mov rax, r14
+    code.extend_from_slice(&[0x48, 0xC1, 0xE0, 0x03]); // shl rax, 3
+    code.extend_from_slice(&[0x48, 0x83, 0xC0, 0x0F]); // add rax, 15
+    code.extend_from_slice(&[0x48, 0x83, 0xE0, 0xF0]); // and rax, -16
+    code.extend_from_slice(&[0x48, 0x29, 0xC4]); // sub rsp, rax
+    code.extend_from_slice(&[0x49, 0x89, 0xE7]); // mov r15, rsp
+
+    // === Phase 1: Parse all argv into array ===
+    code.extend_from_slice(&[0x48, 0x31, 0xDB]); // xor rbx, rbx
+
+    let parse_top = code.len();
+    code.extend_from_slice(&[0x4C, 0x39, 0xF3]); // cmp rbx, r14
+    code.push(0x0F);
+    code.push(0x8D);
+    let parse_done_patch = code.len();
+    code.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+
+    // mov rdi, [r13 + rbx*8 + 8]
+    code.extend_from_slice(&[0x49, 0x8B, 0x7C, 0xDD, 0x08]);
+
+    // Save rbx (atoi clobbers nothing we use, but be safe)
+    code.push(0x53); // push rbx
+    emit_atoi_inline(&mut code);
+    code.push(0x5B); // pop rbx
+
+    // mov [r15 + rbx*8], rax
+    code.extend_from_slice(&[0x49, 0x89, 0x04, 0xDF]);
+
+    code.extend_from_slice(&[0x48, 0xFF, 0xC3]); // inc rbx
+    code.push(0xE9);
+    let parse_jmp = parse_top as i32 - (code.len() as i32 + 4);
+    code.extend_from_slice(&parse_jmp.to_le_bytes());
+
+    let parse_done = code.len();
+    let pd_offset = parse_done as i32 - (parse_done_patch as i32 + 4);
+    code[parse_done_patch..parse_done_patch + 4].copy_from_slice(&pd_offset.to_le_bytes());
+
+    // === Phase 2: Broadcast threshold → xmm1 ===
+    emit_mov_rax_imm(&mut code, threshold);
+    code.extend_from_slice(&[0x66, 0x48, 0x0F, 0x6E, 0xC8]); // movq xmm1, rax
+    code.extend_from_slice(&[0x66, 0x0F, 0x6C, 0xC9]); // punpcklqdq xmm1, xmm1
+
+    // === Phase 3: SIMD loop — 2 elements per iteration ===
+    code.extend_from_slice(&[0x48, 0x31, 0xDB]); // xor rbx, rbx
+
+    let simd_top = code.len();
+    code.extend_from_slice(&[0x48, 0x8D, 0x43, 0x02]); // lea rax, [rbx+2]
+    code.extend_from_slice(&[0x4C, 0x39, 0xF0]); // cmp rax, r14
+    code.push(0x0F);
+    code.push(0x8F);
+    let remainder_patch = code.len();
+    code.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+
+    // movdqu xmm0, [r15 + rbx*8]
+    code.extend_from_slice(&[0xF3, 0x41, 0x0F, 0x6F, 0x04, 0xDF]);
+    // pcmpgtq xmm0, xmm1 (SSE4.2: compare 2 i64s simultaneously)
+    code.extend_from_slice(&[0x66, 0x0F, 0x38, 0x37, 0xC1]);
+    // movmskpd eax, xmm0 (extract 2 result bits)
+    code.extend_from_slice(&[0x66, 0x0F, 0x50, 0xC0]);
+    // Save mask in r8d
+    code.extend_from_slice(&[0x41, 0x89, 0xC0]); // mov r8d, eax
+
+    // Print result for element [rbx]
+    code.extend_from_slice(&[0x41, 0xF6, 0xC0, 0x01]); // test r8b, 1
+    code.push(0x74);
+    let f0_patch = code.len();
+    code.push(0x00);
+    emit_write_string(&mut code, b"true\n");
+    code.push(0xEB);
+    let d0_patch = code.len();
+    code.push(0x00);
+    let f0_pos = code.len();
+    code[f0_patch] = (f0_pos - f0_patch - 1) as u8;
+    emit_write_string(&mut code, b"false\n");
+    let d0_pos = code.len();
+    code[d0_patch] = (d0_pos - d0_patch - 1) as u8;
+
+    // Print result for element [rbx+1]
+    code.extend_from_slice(&[0x41, 0xF6, 0xC0, 0x02]); // test r8b, 2
+    code.push(0x74);
+    let f1_patch = code.len();
+    code.push(0x00);
+    emit_write_string(&mut code, b"true\n");
+    code.push(0xEB);
+    let d1_patch = code.len();
+    code.push(0x00);
+    let f1_pos = code.len();
+    code[f1_patch] = (f1_pos - f1_patch - 1) as u8;
+    emit_write_string(&mut code, b"false\n");
+    let d1_pos = code.len();
+    code[d1_patch] = (d1_pos - d1_patch - 1) as u8;
+
+    code.extend_from_slice(&[0x48, 0x83, 0xC3, 0x02]); // add rbx, 2
+    code.push(0xE9);
+    let simd_jmp = simd_top as i32 - (code.len() as i32 + 4);
+    code.extend_from_slice(&simd_jmp.to_le_bytes());
+
+    // === Phase 4: Scalar remainder ===
+    let remainder_pos = code.len();
+    let rem_offset = remainder_pos as i32 - (remainder_patch as i32 + 4);
+    code[remainder_patch..remainder_patch + 4].copy_from_slice(&rem_offset.to_le_bytes());
+
+    let scalar_top = code.len();
+    code.extend_from_slice(&[0x4C, 0x39, 0xF3]); // cmp rbx, r14
+    code.push(0x0F);
+    code.push(0x8D);
+    let exit_patch = code.len();
+    code.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+
+    // mov rax, [r15 + rbx*8]
+    code.extend_from_slice(&[0x49, 0x8B, 0x04, 0xDF]);
+    emit_cmp_rax_imm(&mut code, threshold);
+    code.extend_from_slice(&[0x0F, 0x9F, 0xC0]); // setg al
+    code.extend_from_slice(&[0x84, 0xC0]); // test al, al
+    code.push(0x74);
+    let sf_patch = code.len();
+    code.push(0x00);
+    emit_write_string(&mut code, b"true\n");
+    code.push(0xEB);
+    let sd_patch = code.len();
+    code.push(0x00);
+    let sf_pos = code.len();
+    code[sf_patch] = (sf_pos - sf_patch - 1) as u8;
+    emit_write_string(&mut code, b"false\n");
+    let sd_pos = code.len();
+    code[sd_patch] = (sd_pos - sd_patch - 1) as u8;
+
+    code.extend_from_slice(&[0x48, 0xFF, 0xC3]); // inc rbx
+    code.push(0xE9);
+    let scalar_jmp = scalar_top as i32 - (code.len() as i32 + 4);
+    code.extend_from_slice(&scalar_jmp.to_le_bytes());
+
+    // === Exit ===
+    let exit_pos = code.len();
+    let exit_offset = exit_pos as i32 - (exit_patch as i32 + 4);
+    code[exit_patch..exit_patch + 4].copy_from_slice(&exit_offset.to_le_bytes());
+
+    code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x3C, 0x00, 0x00, 0x00]);
+    code.extend_from_slice(&[0x48, 0x31, 0xFF]);
+    code.extend_from_slice(&[0x0F, 0x05]);
+
+    Ok(code)
 }
 
 fn build_elf(code: &[u8]) -> Vec<u8> {
