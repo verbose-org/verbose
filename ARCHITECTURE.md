@@ -1,35 +1,35 @@
-# Verbose — Architecture Complète
+# Verbose — Complete Architecture
 
-Ce document explique **tout** ce que le compilateur fait, comment, et pourquoi.
-Écrit pour quelqu'un qui découvre le projet (y compris le créateur après un doliprane).
+This document explains **everything** the compiler does, how, and why.
+Written for someone discovering the project from scratch.
 
 ---
 
-## La Vue d'Ensemble
+## The Big Picture
 
-```
-                    CE QUE L'HUMAIN ÉCRIT
+```text
+                    WHAT THE HUMAN WRITES
                     ─────────────────────
-                    factures.intent
-                    "Une facture est importante
-                     quand son montant dépasse 10000"
+                    invoices.intent
+                    "An invoice is important
+                     when its amount exceeds 10000"
                               │
                               ▼
-                    CE QUE L'IA GÉNÈRE
-                    ──────────────────
-                    factures.verbose
+                    WHAT THE AI GENERATES
+                    ────────────────────
+                    invoices.verbose
                     concept + rule + proofs + hints
                               │
                               ▼
               ┌───────────────────────────────┐
-              │        VERBOSEC (le compilo)  │
+              │       VERBOSEC (compiler)     │
               │                               │
-              │  1. LEXER     texte → tokens  │
+              │  1. LEXER     text → tokens   │
               │  2. PARSER    tokens → AST    │
-              │  3. RESOLVER  imports fusionnés│
-              │  4. VERIFIER  preuves checkées│
-              │  5. OPTIMIZER AST simplifié   │
-              │  6. BACKEND   code final      │
+              │  3. RESOLVER  imports merged  │
+              │  4. VERIFIER  proofs checked  │
+              │  5. OPTIMIZER AST simplified  │
+              │  6. BACKEND   final output    │
               │                               │
               └───────┬───┬───┬───┬───────────┘
                       │   │   │   │
@@ -40,199 +40,203 @@ Ce document explique **tout** ce que le compilateur fait, comment, et pourquoi.
 
 ---
 
-## Les 6 Étapes du Compilateur
+## The 6 Compiler Stages
 
-### Étape 1 : LEXER (src/lexer.rs)
+### Stage 1: LEXER (src/lexer.rs)
 
-**Rôle :** Transformer du texte en "tokens" (mots reconnus).
+**Role:** Turn raw text into recognized tokens.
 
-```
-Entrée:  "rule important\n  logic:\n    x = i.amount > 10000\n"
-Sortie:  [Ident("rule"), Ident("important"), NEWLINE, INDENT,
+```text
+Input:   "rule important\n  logic:\n    x = i.amount > 10000\n"
+Output:  [Ident("rule"), Ident("important"), NEWLINE, INDENT,
           Ident("logic"), Colon, NEWLINE, INDENT,
           Ident("x"), Equal, Ident("i"), Dot, Ident("amount"),
           Gt, Number(10000), NEWLINE, DEDENT, DEDENT, EOF]
 ```
 
-**Point clé :** L'indentation est significative (comme Python). Le lexer émet
-des tokens `INDENT` et `DEDENT` pour marquer les blocs. Pas de `{` `}`.
+**Key point:** Indentation is significant (like Python). The lexer emits
+`INDENT` and `DEDENT` tokens to mark blocks. No `{` `}`.
 
-### Étape 2 : PARSER (src/parser.rs)
+### Stage 2: PARSER (src/parser.rs)
 
-**Rôle :** Transformer les tokens en un arbre (AST = Abstract Syntax Tree).
+**Role:** Turn tokens into a tree (AST = Abstract Syntax Tree).
 
-```
+```text
 Tokens:  Ident("i") Dot Ident("amount") Gt Number(10000)
 AST:     Binary(Gt,
            Field(Ident("i"), "amount"),
            Number(10000))
 ```
 
-L'AST est un arbre typé : chaque nœud sait ce qu'il est (nombre, champ,
-comparaison, appel de règle, if/else, quantificateur...).
+The AST is a typed tree: each node knows what it is (number, field access,
+comparison, rule call, if/else, quantifier...).
 
-**Priorité des opérateurs (du plus faible au plus fort) :**
+**Operator precedence (weakest to strongest):**
+
+```text
+or → and → comparisons (> < >= <= == !=) → add/sub (+, -) → mul/div/mod (*, /, %) → unary (not, -) → primary (number, field, call, parens)
 ```
-or → and → comparaisons (> < >= <= == !=) → add/sub (+, -) → mul/div/mod (*, /, %) → unary (not, -) → primary (nombre, champ, appel, parenthèses)
-```
 
-### Étape 3 : RESOLVER (dans src/main.rs)
+### Stage 3: RESOLVER (in src/main.rs)
 
-**Rôle :** Charger les fichiers importés (`use "stdlib/finance.verbose"`)
-et fusionner tous les concepts/règles en un seul programme.
+**Role:** Load imported files (`use "stdlib/finance.verbose"`)
+and merge all concepts/rules into a single program.
 
-```
+```text
 app.verbose:               stdlib/finance.verbose:
   use "stdlib/finance"       concept Invoice { ... }
   rule my_rule { ... }       rule standard_tax { ... }
          │                            │
          └────────────┬───────────────┘
                       ▼
-              Programme unifié:
+              Unified program:
                 concept Invoice
                 rule standard_tax
                 rule my_rule
 ```
 
-Gestion des imports circulaires : un fichier déjà chargé est ignoré.
+Circular imports are detected and skipped.
 
-### Étape 4 : VERIFIER (src/verifier.rs)
+### Stage 4: VERIFIER (src/verifier.rs)
 
-**Rôle :** Vérifier que les preuves de l'IA sont vraies. **ZERO TRUST.**
+**Role:** Check that the AI's proofs are true. **ZERO TRUST.**
 
-```
-L'IA déclare:          Le vérificateur vérifie:
-  reads: [i.amount]  →  parcourt l'AST, liste tous les accès → [i.amount] ✓
-  writes: []         →  aucune mutation dans le code → [] ✓
-  calls: []          →  aucun appel de fonction → [] ✓
-  verdict: pure      →  writes=[] ET calls=[] → pure ✓
-  bound: 1           →  compte les opérations: 1 (Gt) → 1 ≤ 1 ✓
+```text
+AI declares:             Verifier checks:
+  reads: [i.amount]  →  walks AST, lists all accesses → [i.amount] ✓
+  writes: []         →  no mutations in code → [] ✓
+  calls: []          →  no function calls → [] ✓
+  verdict: pure      →  writes=[] AND calls=[] → pure ✓
+  bound: 1           →  counts operations: 1 (Gt) → 1 ≤ 1 ✓
   overflow: [0, 100] →  interval arithmetic: [0, 100] ⊆ [0, 100] ✓
 ```
 
-**Les 10+ vérifications :**
+**All verification checks:**
 
-| Check | Ce qu'il vérifie |
-|-------|-----------------|
-| reads match | Les champs déclarés = les champs réellement lus dans l'AST |
-| writes match | Les mutations déclarées = les mutations réelles (doit être vide pour pure) |
-| calls match | Les appels déclarés = les appels réels dans l'AST |
-| verdict coherent | pure ↔ writes=[] et calls=[] |
-| termination bound | Le nombre déclaré ≥ le nombre réel d'opérations |
-| determinism | total ↔ pas d'appels non-déterministes |
-| source exists | @source: file:line → le fichier et la ligne existent |
-| field exists | Chaque champ accédé (i.amount) existe sur le concept |
-| target matches | Le target de logic = le nom déclaré dans output |
-| called rules exist | Chaque règle appelée existe dans le programme |
-| hint valid | vectorizable ↔ pure et pas d'appels |
-| overflow bounds | Interval arithmetic prouve que les bornes sont respectées |
+| Check | What it verifies |
+|---|---|
+| reads match | Declared fields = actual field accesses in AST |
+| writes match | Declared mutations = actual mutations (empty for pure) |
+| calls match | Declared calls = actual rule invocations in AST |
+| verdict coherent | pure ↔ writes=[] and calls=[] |
+| termination bound | Declared bound ≥ actual operation count |
+| determinism | total ↔ no non-deterministic calls |
+| source exists | @source: file:line → file and line exist |
+| field exists | Every accessed field (i.amount) exists on the concept |
+| target matches | Logic target = declared output name |
+| called rules exist | Every called rule exists in the program |
+| hint valid | vectorizable ↔ pure with no calls |
+| overflow bounds | Interval arithmetic proves bounds are respected |
 
-**Interval arithmetic (pour overflow et dead code) :**
-```
+**Interval arithmetic (for overflow and dead code):**
+
+```text
 Expression: i.amount * i.tax_rate / 100
 Field ranges: amount ∈ [0, 10000000], tax_rate ∈ [0, 100]
 
-Calcul:
+Computation:
   amount * tax_rate → [0*0, 10000000*100] = [0, 1000000000]
   / 100             → [0/100, 1000000000/100] = [0, 10000000]
 
-Résultat: [0, 10000000]
-Si l'IA déclare overflow: [0, 10000000] → ✓ accepté
-Si l'IA déclare overflow: [0, 1000]     → ✗ rejeté (computed > declared)
+Result: [0, 10000000]
+If AI declares overflow: [0, 10000000] → ✓ accepted
+If AI declares overflow: [0, 1000]     → ✗ rejected (computed > declared)
 ```
 
-### Étape 5 : OPTIMIZER (src/optimizer.rs)
+### Stage 5: OPTIMIZER (src/optimizer.rs)
 
-**Rôle :** Simplifier l'AST. **Indépendant de la plateforme** — bénéficie
-à TOUS les backends (x86, WASM, Rust, futur ARM).
+**Role:** Simplify the AST. **Platform-independent** — benefits
+ALL backends (x86, WASM, Rust, future ARM).
 
+```text
+Before:  Binary(Add, Number(100), Number(20))     → After: Number(120)
+Before:  Binary(Mul, Field(i, x), Number(0))       → After: Number(0)
+Before:  Binary(Mul, Field(i, x), Number(1))       → After: Field(i, x)
+Before:  Not(Not(expr))                             → After: expr
+Before:  If(always_false_cond, then, else)          → After: else
 ```
-Avant:   Binary(Add, Number(100), Number(20))     → Après: Number(120)
-Avant:   Binary(Mul, Field(i, x), Number(0))       → Après: Number(0)
-Avant:   Binary(Mul, Field(i, x), Number(1))       → Après: Field(i, x)
-Avant:   Not(Not(expr))                             → Après: expr
-Avant:   If(always_false_cond, then, else)          → Après: else
-```
 
-**Optimisations universelles :**
-- Constant folding : 100 + 20 → 120
-- Identités algébriques : x*0→0, x*1→x, x+0→x
-- Double négation : not not x → x
-- Dead code : if(impossible) then A else B → B
+**Universal optimizations:**
 
-### Étape 6 : BACKENDS (4 options)
+- Constant folding: 100 + 20 → 120
+- Algebraic identities: x*0→0, x*1→x, x+0→x
+- Double negation: not not x → x
+- Dead code: if(impossible condition) then A else B → B
 
-```
-                        AST optimisé
+### Stage 6: BACKENDS (4 options)
+
+```text
+                        Optimized AST
                              │
               ┌──────┬───────┼────────┬─────────┐
               ▼      ▼       ▼        ▼         ▼
-          Interpréteur  Rust    x86-64    WASM    (futur ARM)
-          src/         src/    src/      src/
-          interpreter  codegen native    wasm
-          .rs          .rs     .rs       .rs
+          Interpreter Rust    x86-64    WASM    (future ARM)
+          src/        src/    src/      src/
+          interpreter codegen native    wasm
+          .rs         .rs     .rs       .rs
 ```
 
-#### Backend Interpréteur (src/interpreter.rs)
-- Lit du JSON, évalue les expressions directement
-- Le plus simple, le plus flexible
-- Supporte TOUT (collections, quantificateurs, réactions)
+#### Interpreter (src/interpreter.rs)
 
-#### Backend Rust (src/codegen.rs)
-- Génère du code source Rust, appelle `rustc`
-- Binaire ~441 KB (inclut la libc Rust)
-- Supporte tout sauf les quantificateurs
+- Reads JSON, evaluates expressions directly
+- Simplest, most flexible
+- Supports EVERYTHING (collections, quantifiers, reactions)
 
-#### Backend Natif x86-64 (src/native.rs)
-- Émet des octets machine DIRECTEMENT dans un ELF
-- Binaire ~400-700 bytes, zéro dépendances
-- Optimisations platform-specific :
+#### Rust Transpiler (src/codegen.rs)
 
-```
-Optimisation          │ Instruction émise      │ Gain
-──────────────────────┼────────────────────────┼──────────────
-SIMD (vectorizable)   │ pcmpgtq (SSE4.2)      │ 2 valeurs/cycle
-Fork (parallel)       │ syscall 57 (fork)      │ 2 cœurs CPU
-Magic division (/ N)  │ mul + shr              │ 4 cycles vs 40
-Shift (* 2^n)         │ shl                    │ 1 cycle vs 3
-Dead branch           │ (supprimé)             │ 0 instruction
-Constant              │ mov rax, valeur        │ 0 calcul
-```
+- Generates Rust source code, calls `rustc`
+- Binary ~441 KB (includes Rust libc)
+- Supports everything except quantifiers
 
-#### Backend WASM (src/wasm.rs)
-- Émet un module WebAssembly binaire
-- ~60 bytes, tourne dans les navigateurs
-- Machine à pile (pas de registres, plus simple que x86)
+#### Native x86-64 (src/native.rs)
+
+- Emits machine code bytes DIRECTLY into an ELF binary
+- Binary ~400-700 bytes, zero dependencies
+- Platform-specific optimizations:
+
+| Optimization | Instruction emitted | Gain |
+|---|---|---|
+| SIMD (vectorizable) | pcmpgtq (SSE4.2) | 2 values/cycle |
+| Fork (parallel) | syscall 57 (fork) | 2 CPU cores |
+| Magic division (/ N) | mul + shr | 4 cycles vs 40 |
+| Shift (* 2^n) | shl | 1 cycle vs 3 |
+| Dead branch | (removed) | 0 instructions |
+| Constant | mov rax, value | 0 computation |
+
+#### WASM (src/wasm.rs)
+
+- Emits a WebAssembly binary module
+- ~60 bytes, runs in browsers (Chrome, Firefox, Safari, Node.js)
+- Stack-based VM (no registers, simpler than x86)
 
 ---
 
-## Les Deux Types de Blocs
+## Two Types of Blocks
 
-```
+```text
 ┌─────────────────────────────────────┐
-│  RULE (pur)                         │
+│  RULE (pure)                        │
 │                                     │
-│  Entrée → Calcul → Sortie          │
-│  Pas d'effets de bord              │
-│  Le compilateur optimise            │
-│  SIMD, fork, dead code, tout       │
+│  Input → Computation → Output       │
+│  No side effects                    │
+│  Compiler optimizes aggressively    │
+│  SIMD, fork, dead code, everything  │
 │                                     │
-│  Exemple:                           │
+│  Example:                           │
 │    important = i.amount > 10000     │
 └─────────────────────────────────────┘
             │
             │ trigger
             ▼
 ┌─────────────────────────────────────┐
-│  REACTION (effets déclarés)         │
+│  REACTION (declared effects)        │
 │                                     │
-│  Écoute un trigger (rule)           │
-│  Si vrai → exécute les effets       │
-│  Effets listés explicitement        │
-│  Le compilateur vérifie, pas        │
-│  d'effet caché                      │
+│  Listens to a trigger (rule)        │
+│  If true → executes declared effects│
+│  Effects listed explicitly          │
+│  No hidden side effects             │
 │                                     │
-│  Exemple:                           │
+│  Example:                           │
 │    trigger: important_invoice       │
 │    effects:                         │
 │      print "ALERT: Important!"      │
@@ -241,92 +245,92 @@ Constant              │ mov rax, valeur        │ 0 calcul
 
 ---
 
-## Les Fichiers du Projet
+## Project Files
 
-```
+```text
 src/
-  main.rs          Point d'entrée CLI, résolution des imports, dispatch
-  lexer.rs         Texte → Tokens (avec INDENT/DEDENT)
+  main.rs          CLI entry point, import resolution, dispatch
+  lexer.rs         Text → Tokens (with INDENT/DEDENT)
   parser.rs        Tokens → AST (recursive descent)
-  ast.rs           Tous les types de l'AST (Expr, Rule, Concept, Reaction...)
-  verifier.rs      Vérification zero-trust + interval arithmetic
-  optimizer.rs     Optimisations universelles (constant fold, dead code...)
-  interpreter.rs   Évaluation directe sur JSON
-  codegen.rs       Génération de code Rust
-  native.rs        Émission de code machine x86-64 + ELF builder
-  wasm.rs          Émission de modules WebAssembly
-  validate_x86.rs  Auto-vérification du code machine émis
+  ast.rs           All AST types (Expr, Rule, Concept, Reaction...)
+  verifier.rs      Zero-trust verification + interval arithmetic
+  optimizer.rs     Universal optimizations (constant fold, dead code...)
+  interpreter.rs   Direct evaluation on JSON
+  codegen.rs       Rust source code generation
+  native.rs        x86-64 machine code emission + ELF builder
+  wasm.rs          WebAssembly module emission
+  validate_x86.rs  Self-verification of emitted machine code
 
 examples/
-  invoices.*       Exemple minimal (1 concept, 1 rule)
-  business.*       Arithmétique + composition (4 rules, let bindings)
-  clients.*        Type text + comparaison de chaînes
-  collections.*    Quantificateurs all/any avec lambdas
-  pricing.*        If/else imbriqués + let bindings
-  deadcode.*       Démonstration d'élimination de branches mortes
-  showcase.*       TOUTES les features en un scénario cohérent
-  reactions.*      Première réaction (effets de bord déclarés)
-  app.* + stdlib/  Système de modules (use + import)
-  demo.html        Démo navigateur (WASM)
+  invoices.*       Minimal example (1 concept, 1 rule)
+  business.*       Arithmetic + composition (4 rules, let bindings)
+  clients.*        Text type + string comparison
+  collections.*    all/any quantifiers with lambdas
+  pricing.*        Nested if/else + let bindings
+  deadcode.*       Dead branch elimination demo
+  showcase.*       ALL features in one coherent scenario
+  reactions.*      First reaction (declared side effects)
+  app.* + stdlib/  Module system (use + import)
+  demo.html        Browser demo (WASM)
 ```
 
 ---
 
-## Le Pipeline Complet en Un Schéma
+## The Complete Pipeline
 
-```
-HUMAIN                    IA                      COMPILATEUR
-──────                    ──                      ───────────
+```text
+HUMAN                    AI                      COMPILER
+─────                    ──                      ────────
 
-"Une facture est    →   concept Invoice         →  LEXER
- importante quand       rule important_invoice      ↓
- son montant            proofs: pure, bound=1    PARSER
- dépasse 10000"         hints: vectorizable         ↓
-                                                 RESOLVER (imports)
- factures.intent        factures.verbose            ↓
-                                                 VERIFIER
-                                                   reads ✓
-                                                   purity ✓
-                                                   bound ✓
-                                                   overflow ✓
-                                                    ↓
-                                                 OPTIMIZER
-                                                   constant fold
-                                                   dead code
-                                                    ↓
-                                                 BACKEND
-                                               ┌────┼────┐
-                                               ▼    ▼    ▼
-                                             x86  WASM  Rust
-                                             570B  60B  441KB
+"An invoice is      →  concept Invoice         → LEXER
+ important when        rule important_invoice      ↓
+ its amount            proofs: pure, bound=1    PARSER
+ exceeds 10000"        hints: vectorizable         ↓
+                                                RESOLVER (imports)
+ invoices.intent       invoices.verbose            ↓
+                                                VERIFIER
+                                                  reads ✓
+                                                  purity ✓
+                                                  bound ✓
+                                                  overflow ✓
+                                                   ↓
+                                                OPTIMIZER
+                                                  constant fold
+                                                  dead code
+                                                   ↓
+                                                BACKEND
+                                              ┌────┼────┐
+                                              ▼    ▼    ▼
+                                            x86  WASM  Rust
+                                            570B  60B  441KB
 ```
 
 ---
 
-## Glossaire
+## Glossary
 
-| Terme | Signification |
-|-------|---------------|
-| AST | Abstract Syntax Tree — l'arbre qui représente le code en mémoire |
-| Token | Un mot reconnu par le lexer (nombre, identifiant, opérateur) |
-| INDENT/DEDENT | Tokens émis quand l'indentation augmente/diminue |
-| Recursive descent | Technique de parsing : chaque règle de grammaire = une fonction |
-| Zero trust | Le compilateur ne fait jamais confiance — il vérifie tout |
-| Interval arithmetic | Calcul de bornes : [min, max] pour chaque sous-expression |
-| Constant folding | Calculer 100+20=120 à la compilation, pas à l'exécution |
-| Dead code | Code qui ne sera jamais exécuté (branche impossible) |
-| Strength reduction | Remplacer une opération lente par une rapide (×4 → shift) |
-| Magic division | Remplacer ÷100 par ×magic_number>>shift (4 cycles vs 40) |
-| SIMD | Single Instruction Multiple Data — traiter 2+ valeurs en un coup |
-| ELF | Format de binaire Linux (Executable and Linkable Format) |
-| WASM | WebAssembly — bytecode qui tourne dans les navigateurs |
-| Peephole | Optimisation locale : scanner le code émis pour des patterns inutiles |
-| CSE | Common Subexpression Elimination — calculer une fois, réutiliser |
-| Pureté | Pas d'effets de bord — le résultat dépend uniquement des entrées |
-| Réaction | Bloc avec effets de bord déclarés (print, write, send) |
-| Trigger | La règle pure qui déclenche une réaction |
-| LEB128 | Encodage d'entiers à taille variable (utilisé dans WASM) |
+| Term | Meaning |
+|---|---|
+| AST | Abstract Syntax Tree — the tree representing code in memory |
+| Token | A word recognized by the lexer (number, identifier, operator) |
+| INDENT/DEDENT | Tokens emitted when indentation increases/decreases |
+| Recursive descent | Parsing technique: each grammar rule = one function |
+| Zero trust | The compiler never trusts — it verifies everything |
+| Interval arithmetic | Computing bounds: [min, max] for each sub-expression |
+| Constant folding | Computing 100+20=120 at compile time, not at runtime |
+| Dead code | Code that will never execute (impossible branch) |
+| Strength reduction | Replacing a slow operation with a faster one (×4 → shift) |
+| Magic division | Replacing ÷100 with ×magic_number>>shift (4 cycles vs 40) |
+| SIMD | Single Instruction Multiple Data — processing 2+ values at once |
+| ELF | Linux binary format (Executable and Linkable Format) |
+| WASM | WebAssembly — bytecode that runs in browsers |
+| Peephole | Local optimization: scanning emitted code for useless patterns |
+| CSE | Common Subexpression Elimination — compute once, reuse |
+| Purity | No side effects — result depends only on inputs |
+| Reaction | Block with declared side effects (print, write, send) |
+| Trigger | The pure rule that activates a reaction |
+| LEB128 | Variable-length integer encoding (used in WASM) |
 
 ---
 
-*Ce document est généré pour le projet Verbose v0.1.0 — 42 commits, ~7000 lignes, 72 tests, 4 backends.*
+*This document covers Verbose v0.1.0 — 43 commits, ~7000 lines, 72 tests, 4 backends.*
