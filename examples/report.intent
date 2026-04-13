@@ -1,0 +1,6 @@
+1. An invoice has an amount and a number of days overdue.
+2. A company has a name and a list of invoices.
+3. The total revenue is the sum of all invoice amounts.
+4. The overdue count is the number of invoices with more than 30 days overdue.
+5. The overdue amount is the sum of amounts of invoices with more than 30 days overdue.
+6. The risk score is: 2 if all invoices are overdue, 1 if any are overdue, otherwise 0.

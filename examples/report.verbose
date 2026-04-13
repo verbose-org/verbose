@@ -1,0 +1,107 @@
+@verbose 0.1.0
+
+-- Business report: aggregation, counting, conditional sums, risk scoring.
+-- Uses fold, all, any, if/else, rule composition, let bindings.
+
+concept Invoice
+  @intention: "An invoice has an amount and a number of days overdue"
+  @source: report.intent:1
+  fields:
+    amount       : number [0, 10000000]
+    days_overdue : number [0, 3650]
+
+
+concept Company
+  @intention: "A company has a name and a list of invoices"
+  @source: report.intent:2
+  fields:
+    name     : text
+    invoices : collection(Invoice)
+
+
+rule total_revenue
+  @intention: "The total revenue is the sum of all invoice amounts"
+  @source: report.intent:3
+  input:
+    c : Company
+  output:
+    revenue : number
+  logic:
+    revenue = fold(c.invoices, 0, acc, inv => acc + inv.amount)
+  proofs:
+    purity:
+      reads   : [c.invoices]
+      writes  : []
+      calls   : []
+      verdict : pure
+    termination:
+      form  : constant_bound
+      bound : 2
+    determinism:
+      form : total
+
+
+rule overdue_count
+  @intention: "The overdue count is the number of invoices with more than 30 days overdue"
+  @source: report.intent:4
+  input:
+    c : Company
+  output:
+    count : number
+  logic:
+    count = fold(c.invoices, 0, acc, inv => acc + if inv.days_overdue > 30 then 1 else 0)
+  proofs:
+    purity:
+      reads   : [c.invoices]
+      writes  : []
+      calls   : []
+      verdict : pure
+    termination:
+      form  : constant_bound
+      bound : 4
+    determinism:
+      form : total
+
+
+rule overdue_amount
+  @intention: "The overdue amount is the sum of amounts of invoices with more than 30 days overdue"
+  @source: report.intent:5
+  input:
+    c : Company
+  output:
+    amount : number
+  logic:
+    amount = fold(c.invoices, 0, acc, inv => acc + if inv.days_overdue > 30 then inv.amount else 0)
+  proofs:
+    purity:
+      reads   : [c.invoices]
+      writes  : []
+      calls   : []
+      verdict : pure
+    termination:
+      form  : constant_bound
+      bound : 4
+    determinism:
+      form : total
+
+
+rule risk_score
+  @intention: "The risk score is: 2 if all invoices are overdue, 1 if any are overdue, otherwise 0"
+  @source: report.intent:6
+  input:
+    c : Company
+  output:
+    risk : number
+  logic:
+    risk = if all(c.invoices, inv => inv.days_overdue > 30) then 2 else if any(c.invoices, inv => inv.days_overdue > 30) then 1 else 0
+  proofs:
+    purity:
+      reads   : [c.invoices]
+      writes  : []
+      calls   : []
+      verdict : pure
+    termination:
+      form  : constant_bound
+      bound : 6
+    determinism:
+      form : total

@@ -1,0 +1,26 @@
+[
+  {
+    "name": "Acme Corp",
+    "invoices": [
+      {"amount": 15000, "days_overdue": 45},
+      {"amount": 8000,  "days_overdue": 60},
+      {"amount": 3000,  "days_overdue": 10},
+      {"amount": 12000, "days_overdue": 90}
+    ]
+  },
+  {
+    "name": "SafeCo",
+    "invoices": [
+      {"amount": 25000, "days_overdue": 5},
+      {"amount": 10000, "days_overdue": 0},
+      {"amount": 7000,  "days_overdue": 15}
+    ]
+  },
+  {
+    "name": "DebtInc",
+    "invoices": [
+      {"amount": 5000,  "days_overdue": 120},
+      {"amount": 20000, "days_overdue": 45}
+    ]
+  }
+]
