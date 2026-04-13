@@ -264,6 +264,14 @@ verbosec (deterministic)      verifies and compiles — never trusts, never gues
 
 The compiler will never generate code. It will never "help" the AI by inferring missing proofs. It verifies, or it rejects. Like a financial auditor: if the accountant and the auditor are the same person, the audit is worthless.
 
+A generation tool is included (`tools/generate.sh`) — it calls the Claude API to produce `.verbose` files from `.intent` files. It is deliberately separate from the compiler:
+
+```bash
+export ANTHROPIC_API_KEY=sk-ant-...
+./tools/generate.sh examples/invoices.intent > generated.verbose
+cargo run -- generated.verbose   # compiler verifies independently
+```
+
 ## Why Not LLVM?
 
 LLVM loses the information that makes Verbose unique. When translating to LLVM IR, domain knowledge is stripped: field ranges, optimization hints, purity proofs, overflow bounds — all gone. LLVM then spends dozens of analysis passes trying to re-discover what Verbose already knew.
