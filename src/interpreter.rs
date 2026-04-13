@@ -656,4 +656,132 @@ mod tests {
         input.insert("s".into(), Value::Text("blocked".into()));
         assert_eq!(eval_rule(&rule, &[], &input).unwrap(), Value::Bool(false));
     }
+
+    #[test]
+    fn negative_numbers() {
+        use crate::ast::*;
+        let rule = Rule {
+            name: "neg_test".into(),
+            intention: "t".into(),
+            source: SourceRef { file: "t.intent".into(), line: 1 },
+            input_name: "i".into(),
+            input_ty: Type::Named("T".into()),
+            output_name: "r".into(),
+            output_ty: Type::Number,
+            logic: LogicStmt {
+                bindings: vec![],
+                target: "r".into(),
+                value: Expr::Neg(Box::new(Expr::Field(
+                    Box::new(Expr::Ident("i".into())),
+                    "x".into(),
+                ))),
+            },
+            proofs: Proofs {
+                purity: Purity {
+                    reads: vec![Path { segments: vec!["i".into(), "x".into()] }],
+                    writes: vec![], calls: vec![], verdict: PurityVerdict::Pure,
+                },
+                termination: Termination { form: TerminationForm::ConstantBound, bound: Some(1) },
+                determinism: Determinism { form: DeterminismForm::Total },
+            },
+            hints: None,
+        };
+        let mut input = HashMap::new();
+        input.insert("x".into(), Value::Number(42));
+        assert_eq!(eval_rule(&rule, &[], &input).unwrap(), Value::Number(-42));
+
+        input.insert("x".into(), Value::Number(-10));
+        assert_eq!(eval_rule(&rule, &[], &input).unwrap(), Value::Number(10));
+
+        input.insert("x".into(), Value::Number(0));
+        assert_eq!(eval_rule(&rule, &[], &input).unwrap(), Value::Number(0));
+    }
+
+    #[test]
+    fn not_boolean() {
+        use crate::ast::*;
+        let rule = Rule {
+            name: "not_test".into(),
+            intention: "t".into(),
+            source: SourceRef { file: "t.intent".into(), line: 1 },
+            input_name: "i".into(),
+            input_ty: Type::Named("T".into()),
+            output_name: "r".into(),
+            output_ty: Type::Bool,
+            logic: LogicStmt {
+                bindings: vec![],
+                target: "r".into(),
+                value: Expr::Not(Box::new(Expr::Binary(
+                    BinOp::Gt,
+                    Box::new(Expr::Field(Box::new(Expr::Ident("i".into())), "x".into())),
+                    Box::new(Expr::Number(10)),
+                ))),
+            },
+            proofs: Proofs {
+                purity: Purity {
+                    reads: vec![Path { segments: vec!["i".into(), "x".into()] }],
+                    writes: vec![], calls: vec![], verdict: PurityVerdict::Pure,
+                },
+                termination: Termination { form: TerminationForm::ConstantBound, bound: Some(2) },
+                determinism: Determinism { form: DeterminismForm::Total },
+            },
+            hints: None,
+        };
+        let mut input = HashMap::new();
+        input.insert("x".into(), Value::Number(15));
+        assert_eq!(eval_rule(&rule, &[], &input).unwrap(), Value::Bool(false)); // not (15 > 10) = not true = false
+
+        input.insert("x".into(), Value::Number(5));
+        assert_eq!(eval_rule(&rule, &[], &input).unwrap(), Value::Bool(true)); // not (5 > 10) = not false = true
+    }
+
+    #[test]
+    fn modulo_by_zero_caught() {
+        use crate::ast::*;
+        let rule = Rule {
+            name: "mod0_test".into(),
+            intention: "t".into(),
+            source: SourceRef { file: "t.intent".into(), line: 1 },
+            input_name: "i".into(),
+            input_ty: Type::Named("T".into()),
+            output_name: "r".into(),
+            output_ty: Type::Number,
+            logic: LogicStmt {
+                bindings: vec![],
+                target: "r".into(),
+                value: Expr::Binary(
+                    BinOp::Mod,
+                    Box::new(Expr::Field(Box::new(Expr::Ident("i".into())), "x".into())),
+                    Box::new(Expr::Number(0)),
+                ),
+            },
+            proofs: Proofs {
+                purity: Purity {
+                    reads: vec![Path { segments: vec!["i".into(), "x".into()] }],
+                    writes: vec![], calls: vec![], verdict: PurityVerdict::Pure,
+                },
+                termination: Termination { form: TerminationForm::ConstantBound, bound: Some(1) },
+                determinism: Determinism { form: DeterminismForm::Total },
+            },
+            hints: None,
+        };
+        let mut input = HashMap::new();
+        input.insert("x".into(), Value::Number(42));
+        assert!(eval_rule(&rule, &[], &input).is_err());
+    }
+
+    #[test]
+    fn empty_json_array() {
+        let json = "[]";
+        let records = parse_json_array(json).unwrap();
+        assert_eq!(records.len(), 0);
+    }
+
+    #[test]
+    fn json_boolean_values() {
+        let json = r#"[{"active": true, "deleted": false}]"#;
+        let records = parse_json_array(json).unwrap();
+        assert_eq!(records[0]["active"], Value::Bool(true));
+        assert_eq!(records[0]["deleted"], Value::Bool(false));
+    }
 }
