@@ -1031,6 +1031,135 @@ fn extract_simple_gt(rule: &Rule) -> Option<i64> {
 ///
 /// where mulhi is the high 64 bits of the 128-bit product x * magic.
 /// This replaces a 20-40 cycle `idiv` with a 3-cycle `mul` + 1-cycle `shr`.
+/// Generate a minimal HTTP server binary — proof that the native backend
+/// can produce real networked applications, not just rule evaluators.
+///
+/// The binary: socket → bind(8080) → listen → accept loop → write response → close
+/// ~800 bytes, zero dependencies, pure syscalls. No libc, no framework.
+pub fn emit_http_demo(output_path: &str) -> Result<(), NativeError> {
+    let mut code = Vec::new();
+
+    // HTTP response (hardcoded)
+    let response = b"HTTP/1.1 200 OK\r\nContent-Length: 20\r\nConnection: close\r\n\r\nHello from Verbose!";
+
+    // === socket(AF_INET=2, SOCK_STREAM=1, 0) → fd in rax ===
+    code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x29, 0x00, 0x00, 0x00]); // mov rax, 41 (socket)
+    code.extend_from_slice(&[0x48, 0xC7, 0xC7, 0x02, 0x00, 0x00, 0x00]); // mov rdi, 2 (AF_INET)
+    code.extend_from_slice(&[0x48, 0xC7, 0xC6, 0x01, 0x00, 0x00, 0x00]); // mov rsi, 1 (SOCK_STREAM)
+    code.extend_from_slice(&[0x48, 0x31, 0xD2]); // xor rdx, rdx (protocol 0)
+    code.extend_from_slice(&[0x0F, 0x05]); // syscall
+    code.extend_from_slice(&[0x49, 0x89, 0xC4]); // mov r12, rax (save server fd)
+
+    // === setsockopt(fd, SOL_SOCKET=1, SO_REUSEADDR=2, &1, 4) ===
+    code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x36, 0x00, 0x00, 0x00]); // mov rax, 54 (setsockopt)
+    code.extend_from_slice(&[0x4C, 0x89, 0xE7]); // mov rdi, r12 (fd)
+    code.extend_from_slice(&[0x48, 0xC7, 0xC6, 0x01, 0x00, 0x00, 0x00]); // mov rsi, 1 (SOL_SOCKET)
+    code.extend_from_slice(&[0x48, 0xC7, 0xC2, 0x02, 0x00, 0x00, 0x00]); // mov rdx, 2 (SO_REUSEADDR)
+    // Push 1 onto stack as the optval
+    code.extend_from_slice(&[0x6A, 0x01]); // push 1
+    code.extend_from_slice(&[0x49, 0x89, 0xE2]); // mov r10, rsp (optval pointer)
+    code.extend_from_slice(&[0x49, 0xC7, 0xC0, 0x04, 0x00, 0x00, 0x00]); // mov r8, 4 (optlen)
+    code.extend_from_slice(&[0x0F, 0x05]); // syscall
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x08]); // add rsp, 8 (pop optval)
+
+    // === Build sockaddr_in on stack ===
+    // struct sockaddr_in { sin_family=2, sin_port=htons(8080)=0x1F90, sin_addr=0, pad=0 }
+    // As 16 bytes: 02 00 1F 90 00 00 00 00 00 00 00 00 00 00 00 00
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x10]); // sub rsp, 16
+    // mov dword [rsp], 0x0F270002 (family=2, port=0x270F big-endian for 9999)
+    code.extend_from_slice(&[0xC7, 0x04, 0x24, 0x02, 0x00, 0x27, 0x0F]);
+    // mov qword [rsp+4], 0 (sin_addr + padding)
+    code.extend_from_slice(&[0x48, 0xC7, 0x44, 0x24, 0x04, 0x00, 0x00, 0x00, 0x00]);
+    // Clear last 4 bytes
+    code.extend_from_slice(&[0xC7, 0x44, 0x24, 0x0C, 0x00, 0x00, 0x00, 0x00]);
+
+    // === bind(fd, &sockaddr, 16) ===
+    code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x31, 0x00, 0x00, 0x00]); // mov rax, 49 (bind)
+    code.extend_from_slice(&[0x4C, 0x89, 0xE7]); // mov rdi, r12
+    code.extend_from_slice(&[0x48, 0x89, 0xE6]); // mov rsi, rsp (sockaddr pointer)
+    code.extend_from_slice(&[0x48, 0xC7, 0xC2, 0x10, 0x00, 0x00, 0x00]); // mov rdx, 16
+    code.extend_from_slice(&[0x0F, 0x05]); // syscall
+
+    // === listen(fd, 128) ===
+    code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x32, 0x00, 0x00, 0x00]); // mov rax, 50 (listen)
+    code.extend_from_slice(&[0x4C, 0x89, 0xE7]); // mov rdi, r12
+    code.extend_from_slice(&[0x48, 0xC7, 0xC6, 0x80, 0x00, 0x00, 0x00]); // mov rsi, 128
+    code.extend_from_slice(&[0x0F, 0x05]); // syscall
+
+    // Print listening message
+    emit_write_string(&mut code, b"Verbose HTTP server on port 9999\n");
+
+    // === Accept loop ===
+    let accept_top = code.len();
+
+    // accept(fd, NULL, NULL) → client fd in rax
+    code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x2B, 0x00, 0x00, 0x00]); // mov rax, 43 (accept)
+    code.extend_from_slice(&[0x4C, 0x89, 0xE7]); // mov rdi, r12 (server fd)
+    code.extend_from_slice(&[0x48, 0x31, 0xF6]); // xor rsi, rsi (NULL)
+    code.extend_from_slice(&[0x48, 0x31, 0xD2]); // xor rdx, rdx (NULL)
+    code.extend_from_slice(&[0x0F, 0x05]); // syscall
+    code.extend_from_slice(&[0x49, 0x89, 0xC5]); // mov r13, rax (client fd)
+
+    // Read request (consume it, don't parse — just drain the socket)
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x10]); // sub rsp, 16 (tiny read buffer)
+    code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x00, 0x00, 0x00, 0x00]); // mov rax, 0 (read)
+    code.extend_from_slice(&[0x4C, 0x89, 0xEF]); // mov rdi, r13 (client fd)
+    code.extend_from_slice(&[0x48, 0x89, 0xE6]); // mov rsi, rsp (buffer)
+    code.extend_from_slice(&[0x48, 0xC7, 0xC2, 0x10, 0x00, 0x00, 0x00]); // mov rdx, 16
+    code.extend_from_slice(&[0x0F, 0x05]); // syscall
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x10]); // add rsp, 16
+
+    // Write HTTP response — inline the string data
+    // jmp over data
+    code.push(0xEB);
+    code.push(response.len() as u8);
+    let resp_offset = code.len();
+    code.extend_from_slice(response);
+
+    // lea rsi, [rip - offset]
+    let after_lea = code.len() + 7;
+    let rip_delta = resp_offset as i32 - after_lea as i32;
+    code.extend_from_slice(&[0x48, 0x8D, 0x35]);
+    code.extend_from_slice(&rip_delta.to_le_bytes());
+
+    // write(client_fd, response, len)
+    code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x01, 0x00, 0x00, 0x00]); // mov rax, 1 (write)
+    code.extend_from_slice(&[0x4C, 0x89, 0xEF]); // mov rdi, r13 (client fd)
+    code.extend_from_slice(&[0x48, 0xC7, 0xC2]);
+    code.extend_from_slice(&(response.len() as i32).to_le_bytes()); // mov rdx, len
+    code.extend_from_slice(&[0x0F, 0x05]); // syscall
+
+    // close(client_fd)
+    code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x03, 0x00, 0x00, 0x00]); // mov rax, 3 (close)
+    code.extend_from_slice(&[0x4C, 0x89, 0xEF]); // mov rdi, r13
+    code.extend_from_slice(&[0x0F, 0x05]); // syscall
+
+    // jmp accept_top
+    code.push(0xE9);
+    let jmp_offset = accept_top as i32 - (code.len() as i32 + 4);
+    code.extend_from_slice(&jmp_offset.to_le_bytes());
+
+    let elf = build_elf(&code);
+
+    let mut file = std::fs::File::create(output_path).map_err(|e| NativeError {
+        message: format!("cannot create '{}': {}", output_path, e),
+    })?;
+    file.write_all(&elf).map_err(|e| NativeError {
+        message: format!("cannot write '{}': {}", output_path, e),
+    })?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(output_path, std::fs::Permissions::from_mode(0o755))
+            .map_err(|e| NativeError {
+                message: format!("cannot set permissions: {}", e),
+            })?;
+    }
+
+    Ok(())
+}
+
 /// Compute magic number for unsigned division by constant d.
 /// Based on Hacker's Delight (Warren, 2002) and libdivide.
 ///

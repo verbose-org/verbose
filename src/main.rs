@@ -15,6 +15,24 @@ mod verifier;
 fn main() {
     let args: Vec<String> = env::args().collect();
 
+    // Special demo mode: HTTP server
+    if args.iter().any(|a| a == "--demo-http") {
+        let output = find_flag(&args, "--demo-http").unwrap_or_else(|| "/tmp/verbose-http".into());
+        match native::emit_http_demo(&output) {
+            Ok(()) => {
+                let size = std::fs::metadata(&output).map(|m| m.len()).unwrap_or(0);
+                println!("HTTP demo server: {} ({} bytes)", output, size);
+                println!("Run it: ./{}", output);
+                println!("Test:   curl http://localhost:9999");
+            }
+            Err(e) => {
+                eprintln!("{}", e);
+                process::exit(1);
+            }
+        }
+        return;
+    }
+
     if args.len() < 2 {
         eprintln!("usage: verbosec <file.verbose> [options]");
         eprintln!();
