@@ -5,6 +5,8 @@
 > *Verbose is not a language that asks the compiler to be intelligent.*
 > *It's a language that asks the author to be explicit.*
 > *And the author is an AI.*
+>
+> *Making exhaustiveness a compilable material.*
 
 ---
 
