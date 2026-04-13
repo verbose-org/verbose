@@ -2,45 +2,62 @@
 
 [![CI](https://github.com/verbose-org/verbose/actions/workflows/ci.yml/badge.svg)](https://github.com/verbose-org/verbose/actions/workflows/ci.yml)
 
-**A language designed for AI, verified by compiler, pushed by humans.**
+Verbose is an experimental AI-native intermediate representation designed to sit between human intention and machine execution.
 
-> *Verbose is not a language that asks the compiler to be intelligent.*
-> *It's a language that asks the author to be explicit.*
-> *And the author is an AI.*
->
+It is based on a simple idea: modern AI systems can generate far more detail than traditional human-oriented programming languages can naturally carry — but that extra expressive power must remain **explicit**, **verifiable**, **auditable**, and **compilable**.
+
+Verbose explores that space.
+
 > *Making exhaustiveness a compilable material.*
+
+Instead of asking the compiler to guess, Verbose asks the authoring system to declare:
+- what the program means
+- what it reads and writes
+- what properties are expected to hold
+- what optimization intentions are desired
+- where the intent came from
+
+Then the compiler verifies those claims under a zero-trust model and lowers the result to executable targets: native x86-64, WebAssembly, or Rust.
 
 ---
 
-## The Question
+## Why Verbose Exists
 
-AI writes code now. It writes Python, Rust, JavaScript — languages designed for **humans** to read and write concisely.
+Traditional languages were designed primarily for human authors.
 
-But if the AI is the author, why constrain it to a human format? Why force concision when the AI can be exhaustive? Why compress intention when it could be preserved?
+AI-generated software changes the situation: an AI system can expand an intent into a much richer representation than most conventional languages are built to hold.
 
-And most importantly: **who verifies that the AI's code is correct?**
+Verbose is an attempt to answer this question: **can we give AI a more explicit and more machine-relevant form of expression, while keeping strict control through verification, traceability, and compilation?**
 
-Right now, nobody. We trust and hope. Verbose exists because that's not good enough.
+## Roles
 
-## The Idea
+- **Human:** states the intention, constraints, and acceptance criteria
+- **AI:** expands that intention into a highly explicit Verbose program
+- **Verbose IR:** carries logic, proofs, optimization hints, and provenance
+- **Compiler:** verifies everything, rejects false claims, and lowers to executable code
 
-Let the AI express itself **fully** — not in 25 lines of elegant Python, but in 200 lines that carry:
-
-- **Proofs** — purity, termination, determinism — declared and verified
-- **Optimization hints** — vectorizable, parallelizable, cache-friendly — exploited by the compiler
-- **Traceability** — every line traces back to a human intention
-
-A human would never write this. An AI generates it in seconds. And the compiler doesn't guess — it **verifies** the proofs, **exploits** the hints, and **rejects** anything unproven.
-
+```text
+human intention (.intent)     "An invoice is overdue when it has more than 30 days"
+        │
+AI generates IR (.verbose)    rule + fields + proofs + hints
+        │
+compiler verifies proofs      purity? termination? determinism? field access?
+        │
+compiler produces binary      interpreter, Rust transpiler, native x86-64, or WASM
 ```
-Traditional code:    intention → compress → code → compiler guesses → binary
-Verbose:             intention → AI expands → IR + proofs → compiler verifies → binary
-```
+
+## What Verbose Is Not
+
+Verbose is not trying to replace mainstream languages.
+
+It is not a general-purpose language optimized for human ergonomics.
+
+It is an **explicit, specialized representation** meant for auditable, optimizable, and verifiable program generation.
 
 ## Live Example
 
 Human writes this (`collections.intent`):
-```
+```text
 1. A client has a name and a list of invoices.
 2. An invoice is overdue when it has more than 30 days overdue.
 3. A client is blocked when all their invoices are overdue.
@@ -73,7 +90,7 @@ rule client_blocked
 ```
 
 Compiler verifies and runs:
-```
+```text
 $ verbosec collections.verbose --run client_blocked --input data.json
 
 verified: 2 concept(s), 3 rule(s); all proofs check out
@@ -82,11 +99,11 @@ executing rule 'client_blocked' on 4 record(s):
   [0] blocked = true     ← Dupont: all invoices overdue
   [1] blocked = false    ← Martin: no invoices overdue
   [2] blocked = false    ← Durand: only 1 of 2 overdue
-  [3] blocked = true     ← Lefevre: empty collection (⚠ edge case flagged by spec)
+  [3] blocked = true     ← Lefevre: empty collection (⚠ edge case flagged)
 ```
 
 If the AI lies in its proofs — the compiler catches it:
-```
+```text
 verify error [rule 'client_blocked' / purity.reads] declared reads do not match logic; missing: [c.invoices]
 ```
 
@@ -97,9 +114,9 @@ verify error [rule 'client_blocked' / purity.reads] declared reads do not match 
 | Lines of Rust | ~7200, zero external dependencies |
 | Tests | 84, all passing |
 | Native binary size | **407–676 bytes** for business logic, **498 bytes** for HTTP server |
-| Rust transpiler output | 441 KB for the same logic (832x larger) |
-| Proof checks | 8 zero-trust verifications against the AST |
-| Examples | 10 (invoices, business, clients, collections, pricing, deadcode, showcase, reactions, app+stdlib, HTML demo) |
+| WASM module size | **58–73 bytes** for browser execution |
+| Proof checks | 10+ zero-trust verifications against the AST |
+| Examples | 10 across business, finance, collections, pricing, and more |
 
 ## Verbose vs gcc -O3
 
@@ -108,14 +125,13 @@ Same logic (`amount > 10000`), same input, same output:
 | | gcc -O3 -s (production, stripped) | Verbose native |
 |---|---|---|
 | Binary size | 14,472 bytes | **589 bytes** (24x smaller) |
-| gcc -Os -s (size-optimized) | 14,472 bytes (same) | **589 bytes** |
 | Dependencies | 3 shared libraries (libc) | **Zero** |
 | Proofs | None | Purity, termination, determinism |
 | Overflow safety | Undefined behavior | Proven via interval arithmetic |
 | SIMD | Must analyze (may miss) | Declared + verified (`pcmpgtq`) |
 | Traceability | None | Every instruction → source intention |
 
-gcc has 20 years of register allocation and instruction scheduling that we don't have yet. But Verbose has domain knowledge that gcc will never have.
+gcc has 20 years of register allocation and instruction scheduling. Verbose has domain knowledge that gcc will never have.
 
 ## Three Axioms
 
@@ -123,9 +139,17 @@ gcc has 20 years of register allocation and instruction scheduling that we don't
 2. **Intention survives.** Every element traces back to its human origin. The reverse path (binary → IR → intention) is always navigable.
 3. **The compiler never guesses.** Every decision is backed by a verifiable proof or explicit declaration.
 
+## Optimization Philosophy
+
+Verbose does not treat optimization as a hidden compiler trick.
+
+Optimization intent should be declared explicitly whenever possible. The compiler's role is to verify, reorganize, and materialize those decisions safely across targets.
+
+The long-term direction is to let the representation carry not only semantic intent, but also execution intent: vectorization, parallelism, resource sensitivity, and potentially architecture-aware preferences.
+
 ## Design Priorities
 
-```
+```text
 1. Verifiability     every declaration is mechanically verifiable
 2. Exploitability    every declaration is USED by the compiler
 3. Safety            unproven code is rejected
@@ -133,7 +157,7 @@ gcc has 20 years of register allocation and instruction scheduling that we don't
 5. Readability       auditable without blind spots
 ```
 
-If a declaration serves neither verification nor optimization, it doesn't belong in the IR. Verbose without purpose is just noise.
+If a declaration serves neither verification nor optimization, it doesn't belong in the IR.
 
 ## What Works Today
 
@@ -146,14 +170,14 @@ If a declaration serves neither verification nor optimization, it doesn't belong
 | Arithmetic | `amount + amount * tax_rate / 100` |
 | Comparisons & equality | `>`, `<`, `>=`, `<=`, `==`, `!=` |
 | Boolean logic | `and`, `or`, `not` |
-| Parentheses | `(a + b) * c` |
-| Unary negation | `-amount` |
+| Parentheses & negation | `(a + b) * c`, `-amount` |
 | If/then/else | `if days > 90 then 20 else if days > 30 then 10 else 0` |
 | Let bindings (CSE) | `let tax = amount * rate / 100` |
 | String comparison | `status == "active"` |
 | Rule composition | `important(i) and overdue(i)` |
 | Collection quantifiers | `all(invoices, inv => inv.days > 30)` |
-| Lambda syntax | `any(list, item => predicate)` |
+| Module system | `use "stdlib/finance.verbose"` |
+| Reactions | Declared side effects triggered from verified rules |
 
 ### Proof Verification (Zero-Trust)
 
@@ -169,6 +193,8 @@ If a declaration serves neither verification nor optimization, it doesn't belong
 | Field existence | Accessed fields exist on the input concept |
 | Logic/output coherence | Logic target matches declared output name |
 | Called rules exist | All called rules are defined in the program |
+| Overflow bounds | Interval arithmetic proves declared range |
+| Stack depth | Expression nesting within safety limits |
 
 ### Optimization Hints (Exploited by Compiler)
 
@@ -179,24 +205,24 @@ If a declaration serves neither verification nor optimization, it doesn't belong
 | `overflow: [min, max]` | Proves safe via interval arithmetic — no runtime check | C = undefined behavior, Rust = runtime panic |
 | `field [min, max]` | Eliminates impossible branches from binary | Doesn't know value bounds |
 
-### Compile-Time Optimizations (Native Backend)
+### Compile-Time Optimizations
 
-| Optimization | Example | Machine code impact |
+| Optimization | Example | Impact |
 |---|---|---|
-| Constant folding | `100 / 2` → `50` at compile time | Zero runtime instructions |
-| Strength reduction | `x * 4` → `shl rax, 2` | 1 cycle instead of 3 (imul) |
-| Multiply by 0/1 | `x * 0` → `xor rax, rax` | No computation |
-| Add/sub 0 | `x + 0` → identity | No instruction emitted |
-| Dead branch elimination | `if temp > 100` with range [0,50] → branch removed | Fewer jumps, smaller binary |
+| Constant folding | `100 / 2` → `50` at compile time | Zero runtime cost |
+| Strength reduction | `x * 4` → `shl rax, 2` | 1 cycle instead of 3 |
+| Magic division | `x / 100` → `mul + shr` | 4 cycles instead of 40 |
+| Dead branch elimination | `if temp > 100` with range [0,50] → removed | Fewer instructions |
 | SIMD vectorization | Comparison → `pcmpgtq` | 2 results per instruction |
-| Let binding CSE | `let tax = expr` → compute once, load N times | No redundant evaluation |
+| Let binding CSE | `let tax = expr` → compute once, load N times | No redundant work |
+| Peephole optimization | Redundant push/pop eliminated | Smaller binary |
 
-### Three Backends
+### Four Backends
 
 | Backend | Command | Output |
 |---|---|---|
 | Interpreter | `--run rule --input data.json` | Executes directly on JSON data |
-| Rust transpiler | `--compile output` | Standalone binary via `rustc` (~441 KB) |
+| Rust transpiler | `--compile output` | Standalone binary via `rustc` |
 | Native x86-64 | `--native output --run rule` | ELF binary, zero dependencies (~400-700 bytes) |
 | WebAssembly | `--wasm output.wasm --run rule` | WASM module for browsers (~60 bytes) |
 
@@ -205,27 +231,20 @@ If a declaration serves neither verification nor optimization, it doesn't belong
 ```bash
 git clone https://github.com/verbose-org/verbose.git
 cd verbose
-cargo test                    # 51 tests, should all pass
-cargo run -- examples/collections.verbose   # verify proofs
-cargo run -- examples/collections.verbose --run client_blocked --input examples/collections.json
+cargo test                    # 84 tests
+cargo run -- examples/showcase.verbose   # verify all proofs
+cargo run -- examples/showcase.verbose --run bonus_rate --input examples/showcase.json
 ```
 
-Other backends:
+All backends:
 ```bash
-# Compile to standalone Rust binary
-cargo run -- examples/business.verbose --compile /tmp/business
-
-# Compile to native x86-64 ELF (zero dependencies)
-cargo run -- examples/business.verbose --native /tmp/biz --run total_with_tax
-
-# Compile to WebAssembly (runs in browsers)
-cargo run -- examples/business.verbose --wasm /tmp/rule.wasm --run total_with_tax
-
-# Show generated Rust source
-cargo run -- examples/pricing.verbose --emit-rust
+cargo run -- examples/business.verbose --compile /tmp/business          # Rust
+cargo run -- examples/business.verbose --native /tmp/biz --run total_with_tax  # x86-64
+cargo run -- examples/business.verbose --wasm /tmp/rule.wasm --run total_with_tax  # WASM
+cargo run -- examples/invoices.verbose --benchmark --run important_invoice  # compare all
 ```
 
-Try it in a browser:
+Browser demo:
 ```bash
 cargo run -- examples/business.verbose --wasm examples/demo.wasm --run total_with_tax
 cd examples && python3 -m http.server 8000
@@ -236,87 +255,44 @@ cd examples && python3 -m http.server 8000
 
 Who writes the `.verbose` files?
 
-**An AI does.** Not the compiler — a separate AI (Claude, GPT, or any future model). The human writes the `.intent` file (plain language), the AI generates the `.verbose` IR with all its proofs and hints, and the compiler verifies everything. If the AI gets something wrong — a proof that doesn't hold, a bound that's too tight, a missing read — the compiler rejects it. No exceptions.
+**An AI does.** Not the compiler — a separate AI (Claude, GPT, or any future model). The human writes the `.intent` file (plain language), the AI generates the `.verbose` IR with all its proofs and hints, and the compiler verifies everything.
 
-```
+```text
 AI (non-deterministic)        generates .verbose — may hallucinate, may be wrong
 verbosec (deterministic)      verifies and compiles — never trusts, never guesses
 ```
 
 The compiler will never generate code. It will never "help" the AI by inferring missing proofs. It verifies, or it rejects. Like a financial auditor: if the accountant and the auditor are the same person, the audit is worthless.
 
-As AI models grow more capable (larger context, better reasoning), they'll generate more complex and correct Verbose IR. The compiler doesn't need to change — it just verifies whatever the AI produces. A dedicated generation tool (separate from the compiler) is planned for the future.
-
 ## Why Not LLVM?
 
-LLVM is a powerful general-purpose compiler backend used by Rust, Clang, and Swift. Verbose doesn't use it for the primary path. Here's why:
+LLVM loses the information that makes Verbose unique. When translating to LLVM IR, domain knowledge is stripped: field ranges, optimization hints, purity proofs, overflow bounds — all gone. LLVM then spends dozens of analysis passes trying to re-discover what Verbose already knew.
 
-**LLVM loses the information that makes Verbose unique.**
+Verbose native binaries are 400-700 bytes. LLVM would produce 10-50 KB minimum (function prologues, stack protectors, alignment padding, exception handling).
 
-When translating Verbose IR to LLVM IR, domain knowledge is stripped:
+LLVM may become an optional backend for platforms we don't support natively. But the primary path stays direct — that's where the advantage lives.
 
-```
-Verbose IR:                          LLVM IR:
-  field: amount [0, 1000000]    →    %amount = i64       (no bounds known)
-  hints: vectorizable: yes      →    (lost — LLVM must re-discover)
-  proofs: pure                  →    (lost — LLVM must re-analyze)
-  overflow: [0, 100]            →    (lost — LLVM doesn't know)
-```
+## Long-Term Direction
 
-LLVM then spends dozens of analysis passes trying to re-discover what Verbose already knew. Sometimes it succeeds. Often it can't — because the information was never expressible in LLVM IR to begin with.
+Verbose explores a future where AI-generated programs carry enough explicit information to inform not only correctness and optimization, but also execution strategy and target preference.
 
-**What LLVM adds that we don't need:**
+In that future, a program description may express:
+- semantic logic
+- proofs and invariants
+- optimization intent
+- side effects
+- preferred execution properties
+- target-aware compilation hints
 
-| Overhead | Why LLVM adds it | Why Verbose skips it |
-|---|---|---|
-| Function prologues/epilogues | Standard calling convention | We emit only the instructions needed |
-| Stack protectors | Buffer overflow defense | Proven safe via interval arithmetic |
-| Alignment padding | Cache line optimization | We control layout directly |
-| Exception handling tables | Unwinding support | Pure functions can't throw |
-
-Result: Verbose native binaries are 400-700 bytes. LLVM would produce 10-50 KB minimum.
-
-**Where LLVM wins:** complex programs with hundreds of functions. LLVM has 20 years of register allocation, instruction scheduling, and loop optimization. For large codebases, LLVM would produce faster code than our handwritten emitter.
-
-**Where Verbose wins:** domain-aware optimization. Division-by-constant with field-range safety. Dead branch elimination with declared bounds. SIMD guided by hints. These are impossible in LLVM because the information doesn't exist in LLVM IR.
-
-## What Else Can It Build?
-
-The native backend isn't limited to rule evaluation. As a proof of concept:
-
-```bash
-$ verbosec --demo-http /tmp/server
-HTTP demo server: /tmp/server (498 bytes)
-
-$ ./server &
-Verbose HTTP server on port 9999
-
-$ curl http://localhost:9999
-Hello from Verbose!
-```
-
-A fully functional HTTP server in **498 bytes**. Zero dependencies. 7 Linux syscalls in a loop. For context: Nginx is 1.5 MB. Caddy is 40 MB. Node.js runtime alone is 50 MB.
-
-This is not a language feature yet (Verbose doesn't have I/O primitives). It proves the infrastructure can produce real networked applications. The path to a Verbose HTTP server is: add reaction blocks (declared side effects) and I/O primitives to the language.
-
-**Our strategy:**
-
-```
-Primary path:     direct machine code (maximum control, minimum size)
-Fallback path:    Rust transpiler (for complex cases and portability)
-Future option:    LLVM backend (for platforms we don't support natively)
-```
-
-LLVM may become an optional backend for platforms where we don't have a native emitter. But the primary path stays direct — that's where Verbose's advantage lives.
+The compiler remains the final arbiter.
 
 ## Status
 
-**POC / R&D.** 50 commits, ~7200 lines, 84 tests, 0 dependencies, 4 backends.
+**POC / R&D.** 52 commits, ~7200 lines, 84 tests, 0 dependencies, 4 backends.
 
-One command to see it all:
 ```bash
 cargo run -- examples/invoices.verbose --benchmark --run important_invoice
-``` The language works, the compiler verifies proofs, three backends produce correct results. The concept is validated.
+```
 
 ## License
 
