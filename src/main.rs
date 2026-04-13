@@ -17,6 +17,17 @@ mod wasm;
 fn main() {
     let args: Vec<String> = env::args().collect();
 
+    if args.iter().any(|a| a == "--version" || a == "-v") {
+        println!("verbosec 0.1.0");
+        println!("A language designed for AI, verified by compiler, pushed by humans.");
+        println!();
+        println!("Backends: interpreter, Rust transpiler, native x86-64, WebAssembly");
+        println!("Features: 15 language features, 10+ proof checks, 11 optimizations");
+        println!("License:  Apache 2.0");
+        println!("Repo:     https://github.com/verbose-org/verbose");
+        return;
+    }
+
     // Special demo mode: HTTP server
     if args.iter().any(|a| a == "--demo-http") {
         let output = find_flag(&args, "--demo-http").unwrap_or_else(|| "/tmp/verbose-http".into());

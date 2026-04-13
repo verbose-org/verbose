@@ -74,7 +74,7 @@ pub fn compile_native(
         .as_ref()
         .map_or(false, |h| h.parallel == Some(true));
 
-    let code = if is_vectorizable && concept.fields.len() == 1 {
+    let mut code = if is_vectorizable && concept.fields.len() == 1 {
         if let Some(threshold) = extract_simple_gt(rule) {
             emit_vectorized_program(threshold)?
         } else {
@@ -89,6 +89,14 @@ pub fn compile_native(
     // Self-verification: validate emitted machine code (best-effort).
     // The x86-64 decoder doesn't cover all instructions yet (itoa, complex addressing).
     // Validation errors are warnings, not hard failures, until the decoder is complete.
+    // Peephole optimization: eliminate redundant push/pop patterns
+    let before_size = code.len();
+    peephole_optimize(&mut code);
+    let saved = before_size - code.len();
+    if saved > 0 {
+        eprintln!("peephole: {} bytes eliminated", saved);
+    }
+
     if let Err(e) = crate::validate_x86::validate_code(&code) {
         eprintln!("warning: x86-64 validation: {} (decoder incomplete, may be false positive)", e);
     }
@@ -253,6 +261,50 @@ fn emit_full_program(
     code.extend_from_slice(&[0x0F, 0x05]);
 
     Ok(code)
+}
+
+/// Peephole optimizer: scan emitted machine code for redundant patterns.
+///
+/// Pattern 1: push Rx; pop Rx → remove both (dead save/restore)
+///   50-57 followed by 58-5F where register matches
+///   Example: push rax (50); pop rax (58) → nothing
+///
+/// Pattern 2: push Rx; pop Ry → mov Ry, Rx (avoid stack round-trip)
+///   Only when registers are base (rax-rdi, not r8-r15)
+///   50 59 → 48 89 C1 (push rax; pop rcx → mov rcx, rax)
+///   Note: this makes code 1 byte larger but faster (no memory access)
+///   We only apply pattern 1 (size reduction) for now.
+fn peephole_optimize(code: &mut Vec<u8>) {
+    let mut i = 0;
+    let mut out = Vec::with_capacity(code.len());
+
+    while i < code.len() {
+        // Pattern: push Rx; pop Rx (same register) → eliminate both
+        if i + 1 < code.len() {
+            let a = code[i];
+            let b = code[i + 1];
+            if (0x50..=0x57).contains(&a) && b == a + 8 {
+                // push Rx (0x50+r) followed by pop Rx (0x58+r) — same register
+                i += 2;
+                continue;
+            }
+        }
+
+        // Pattern: REX push Rx; REX pop Rx (r8-r15) → eliminate both
+        if i + 3 < code.len() {
+            if code[i] == 0x41 && (0x50..=0x57).contains(&code[i + 1])
+                && code[i + 2] == 0x41 && code[i + 3] == code[i + 1] + 8
+            {
+                i += 4;
+                continue;
+            }
+        }
+
+        out.push(code[i]);
+        i += 1;
+    }
+
+    *code = out;
 }
 
 /// Build field ranges from concept for static analysis.
