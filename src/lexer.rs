@@ -647,4 +647,56 @@ mod tests {
         let result = Lexer::new("a\n\tb\n").tokenize();
         assert!(result.is_err());
     }
+
+    #[test]
+    fn equality_operators() {
+        assert_eq!(
+            kinds("a == b != c\n"),
+            vec![
+                TokenKind::Ident("a".into()),
+                TokenKind::EqualEqual,
+                TokenKind::Ident("b".into()),
+                TokenKind::NotEqual,
+                TokenKind::Ident("c".into()),
+                TokenKind::Newline,
+                TokenKind::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn fat_arrow() {
+        assert_eq!(
+            kinds("x => y\n"),
+            vec![
+                TokenKind::Ident("x".into()),
+                TokenKind::FatArrow,
+                TokenKind::Ident("y".into()),
+                TokenKind::Newline,
+                TokenKind::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn arithmetic_operators() {
+        assert_eq!(
+            kinds("a + b * c / d % e - f\n"),
+            vec![
+                TokenKind::Ident("a".into()),
+                TokenKind::Plus,
+                TokenKind::Ident("b".into()),
+                TokenKind::Star,
+                TokenKind::Ident("c".into()),
+                TokenKind::Slash,
+                TokenKind::Ident("d".into()),
+                TokenKind::Percent,
+                TokenKind::Ident("e".into()),
+                TokenKind::Minus,
+                TokenKind::Ident("f".into()),
+                TokenKind::Newline,
+                TokenKind::Eof,
+            ]
+        );
+    }
 }

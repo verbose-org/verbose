@@ -1279,6 +1279,31 @@ rule important_invoice
     }
 
     #[test]
+    fn fold_parsed() {
+        let src = "@verbose 0.1.0\n\nconcept T\n  @intention: \"t\"\n  @source: f.intent:1\n  fields:\n    items : collection(X)\n\nrule test\n  @intention: \"t\"\n  @source: f.intent:1\n  input:\n    t : T\n  output:\n    r : number\n  logic:\n    r = fold(t.items, 0, acc, x => acc + 1)\n  proofs:\n    purity:\n      reads: [t.items]\n      writes: []\n      calls: []\n      verdict: pure\n    termination:\n      form: constant_bound\n      bound: 2\n    determinism:\n      form: total\n";
+        let p = parse(src).unwrap();
+        match &p.items[1] {
+            Item::Rule(r) => {
+                assert!(matches!(&r.logic.value, Expr::Fold(_, _, _, _, _)));
+            }
+            _ => panic!("expected rule"),
+        }
+    }
+
+    #[test]
+    fn sum_desugars_to_fold() {
+        let src = "@verbose 0.1.0\n\nconcept T\n  @intention: \"t\"\n  @source: f.intent:1\n  fields:\n    items : collection(X)\n\nrule test\n  @intention: \"t\"\n  @source: f.intent:1\n  input:\n    t : T\n  output:\n    r : number\n  logic:\n    r = sum(t.items, x => x)\n  proofs:\n    purity:\n      reads: [t.items]\n      writes: []\n      calls: []\n      verdict: pure\n    termination:\n      form: constant_bound\n      bound: 2\n    determinism:\n      form: total\n";
+        let p = parse(src).unwrap();
+        match &p.items[1] {
+            Item::Rule(r) => {
+                // sum desugars to fold
+                assert!(matches!(&r.logic.value, Expr::Fold(_, _, _, _, _)));
+            }
+            _ => panic!("expected rule"),
+        }
+    }
+
+    #[test]
     fn string_comparison_parsed() {
         let src = "@verbose 0.1.0\n\nconcept T\n  @intention: \"t\"\n  @source: f.intent:1\n  fields:\n    s : text\n\nrule test\n  @intention: \"t\"\n  @source: f.intent:1\n  input:\n    t : T\n  output:\n    r : bool\n  logic:\n    r = t.s == \"active\"\n  proofs:\n    purity:\n      reads: [t.s]\n      writes: []\n      calls: []\n      verdict: pure\n    termination:\n      form: constant_bound\n      bound: 1\n    determinism:\n      form: total\n";
         let p = parse(src).unwrap();
