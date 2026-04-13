@@ -174,6 +174,18 @@ fn split_json_top_level(s: &str) -> Vec<&str> {
     parts
 }
 
+/// Evaluate a single expression in the context of a rule and input record.
+pub fn eval_rule_expr(
+    expr: &Expr,
+    rule: &Rule,
+    all_rules: &[&Rule],
+    input: &HashMap<String, Value>,
+) -> Result<Value, RuntimeError> {
+    let mut env: HashMap<String, Value> = HashMap::new();
+    env.insert(rule.input_name.clone(), Value::Record(input.clone()));
+    eval_expr(expr, &env, all_rules)
+}
+
 pub fn eval_rule(
     rule: &Rule,
     all_rules: &[&Rule],

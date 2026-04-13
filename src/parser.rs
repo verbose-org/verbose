@@ -44,8 +44,10 @@ impl Parser {
                 items.push(Item::Concept(self.parse_concept()?));
             } else if self.check_ident("rule") {
                 items.push(Item::Rule(self.parse_rule()?));
+            } else if self.check_ident("reaction") {
+                items.push(Item::Reaction(self.parse_reaction()?));
             } else {
-                return Err(self.error("expected 'concept' or 'rule' at top level"));
+                return Err(self.error("expected 'concept', 'rule', or 'reaction' at top level"));
             }
         }
         Ok(Program { version, uses, items })
@@ -697,6 +699,84 @@ impl Parser {
 
         let form = form.ok_or_else(|| self.error("determinism missing 'form'"))?;
         Ok(Determinism { form })
+    }
+
+    fn parse_reaction(&mut self) -> Result<Reaction, ParseError> {
+        self.expect_ident("reaction")?;
+        let name = self.expect_ident_any()?;
+        self.expect_kind(TokenKind::Newline)?;
+        self.expect_kind(TokenKind::Indent)?;
+
+        let mut intention = None;
+        let mut source = None;
+        let mut trigger = None;
+        let mut effects = Vec::new();
+
+        while !self.check_kind(&TokenKind::Dedent) && !self.at_eof() {
+            if let Some(attr) = self.peek_attribute_name() {
+                match attr.as_str() {
+                    "intention" => {
+                        self.advance();
+                        self.expect_kind(TokenKind::Colon)?;
+                        intention = Some(self.expect_string()?);
+                        self.expect_kind(TokenKind::Newline)?;
+                    }
+                    "source" => {
+                        self.advance();
+                        self.expect_kind(TokenKind::Colon)?;
+                        source = Some(self.parse_source_ref()?);
+                        self.expect_kind(TokenKind::Newline)?;
+                    }
+                    other => {
+                        return Err(self.error(&format!(
+                            "unknown attribute '@{}' in reaction",
+                            other
+                        )));
+                    }
+                }
+            } else if self.check_ident("trigger") {
+                self.advance();
+                self.expect_kind(TokenKind::Colon)?;
+                trigger = Some(self.expect_ident_any()?);
+                self.expect_kind(TokenKind::Newline)?;
+            } else if self.check_ident("effects") {
+                self.advance();
+                self.expect_kind(TokenKind::Colon)?;
+                self.expect_kind(TokenKind::Newline)?;
+                self.expect_kind(TokenKind::Indent)?;
+                while !self.check_kind(&TokenKind::Dedent) && !self.at_eof() {
+                    let kind_name = self.expect_ident_any()?;
+                    let kind = match kind_name.as_str() {
+                        "print" => EffectKind::Print,
+                        _ => {
+                            return Err(self.error(&format!(
+                                "unknown effect '{}' (allowed: print)",
+                                kind_name
+                            )))
+                        }
+                    };
+                    let mut args = Vec::new();
+                    // Parse effect arguments until newline
+                    while !self.check_kind(&TokenKind::Newline) && !self.at_eof() {
+                        args.push(self.parse_expr()?);
+                    }
+                    self.expect_kind(TokenKind::Newline)?;
+                    effects.push(Effect { kind, args });
+                }
+                self.expect_kind(TokenKind::Dedent)?;
+            } else {
+                return Err(self.error("expected attribute, 'trigger:', or 'effects:' in reaction"));
+            }
+        }
+        self.expect_kind(TokenKind::Dedent)?;
+
+        Ok(Reaction {
+            name,
+            intention: intention.ok_or_else(|| self.error("reaction missing @intention"))?,
+            source: source.ok_or_else(|| self.error("reaction missing @source"))?,
+            trigger: trigger.ok_or_else(|| self.error("reaction missing 'trigger'"))?,
+            effects,
+        })
     }
 
     fn parse_hints_block(&mut self) -> Result<Hints, ParseError> {

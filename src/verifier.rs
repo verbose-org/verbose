@@ -40,6 +40,22 @@ pub fn verify_program(program: &Program, base_dir: &StdPath) -> Vec<VerifyError>
         match item {
             Item::Concept(c) => verify_concept(c, base_dir, &mut errors),
             Item::Rule(r) => verify_rule(r, &concepts, &all_rules, base_dir, &mut errors),
+            Item::Reaction(rx) => {
+                // Verify source ref exists
+                if let Err(msg) = verify_source_ref(&rx.source, base_dir) {
+                    errors.push(VerifyError {
+                        context: format!("reaction '{}' / @source", rx.name),
+                        message: msg,
+                    });
+                }
+                // Verify trigger rule exists
+                if !all_rules.iter().any(|r| r.name == rx.trigger) {
+                    errors.push(VerifyError {
+                        context: format!("reaction '{}' / trigger", rx.name),
+                        message: format!("trigger references unknown rule '{}'", rx.trigger),
+                    });
+                }
+            }
         }
     }
     errors

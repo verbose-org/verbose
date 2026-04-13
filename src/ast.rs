@@ -16,6 +16,30 @@ pub struct Version {
 pub enum Item {
     Concept(Concept),
     Rule(Rule),
+    Reaction(Reaction),
+}
+
+/// A reaction is a block with declared side effects.
+/// Unlike rules (pure computation), reactions DO things: print, write, send.
+/// But every effect must be declared — no hidden side effects.
+#[derive(Debug, Clone)]
+pub struct Reaction {
+    pub name: String,
+    pub intention: String,
+    pub source: SourceRef,
+    pub trigger: String,
+    pub effects: Vec<Effect>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Effect {
+    pub kind: EffectKind,
+    pub args: Vec<Expr>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum EffectKind {
+    Print,
 }
 
 #[derive(Debug, Clone)]

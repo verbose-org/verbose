@@ -1,0 +1,46 @@
+@verbose 0.1.0
+
+-- First reaction example: declared side effects triggered by rules.
+
+concept Invoice
+  @intention: "An invoice has an amount"
+  @source: reactions.intent:1
+
+  fields:
+    amount : number
+
+
+rule important_invoice
+  @intention: "An invoice is important when its amount exceeds 10000"
+  @source: reactions.intent:2
+
+  input:
+    i : Invoice
+
+  output:
+    important : bool
+
+  logic:
+    important = i.amount > 10000
+
+  proofs:
+    purity:
+      reads   : [i.amount]
+      writes  : []
+      calls   : []
+      verdict : pure
+    termination:
+      form  : constant_bound
+      bound : 1
+    determinism:
+      form : total
+
+
+-- This is NOT a rule (pure computation). It's a REACTION (side effect).
+-- The effect (print) is declared explicitly. No hidden side effects.
+reaction notify_important
+  @intention: "When an invoice is important, print a notification"
+  @source: reactions.intent:3
+  trigger: important_invoice
+  effects:
+    print "ALERT: Important invoice detected"

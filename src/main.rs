@@ -213,11 +213,68 @@ fn main() {
                 _ => None,
             })
             .collect();
+
+        // Check if it's a reaction
+        let reaction = program.items.iter().find_map(|i| match i {
+            ast::Item::Reaction(rx) if rx.name == rule_name => Some(rx),
+            _ => None,
+        });
+
+        if let Some(rx) = reaction {
+            let trigger_rule = all_rules
+                .iter()
+                .find(|r| r.name == rx.trigger)
+                .unwrap_or_else(|| {
+                    eprintln!("trigger rule '{}' not found", rx.trigger);
+                    process::exit(1);
+                });
+
+            let records = match interpreter::load_json_input(Path::new(&json_path)) {
+                Ok(r) => r,
+                Err(e) => { eprintln!("{}", e); process::exit(1); }
+            };
+
+            println!();
+            println!("executing reaction '{}' (trigger: {}) on {} record(s):",
+                rule_name, rx.trigger, records.len());
+
+            for (idx, record) in records.iter().enumerate() {
+                match interpreter::eval_rule(trigger_rule, &all_rules, record) {
+                    Ok(val) => {
+                        let should_fire = match &val {
+                            interpreter::Value::Bool(true) => true,
+                            interpreter::Value::Number(n) if *n != 0 => true,
+                            _ => false,
+                        };
+                        if should_fire {
+                            for effect in &rx.effects {
+                                match &effect.kind {
+                                    ast::EffectKind::Print => {
+                                        let args: Vec<String> = effect.args.iter().map(|arg| {
+                                            match interpreter::eval_rule_expr(arg, trigger_rule, &all_rules, record) {
+                                                Ok(v) => format!("{}", v),
+                                                Err(_) => format!("{:?}", arg),
+                                            }
+                                        }).collect();
+                                        println!("  [{}] EFFECT print: {}", idx, args.join(" "));
+                                    }
+                                }
+                            }
+                        } else {
+                            println!("  [{}] (trigger = {} — no effects)", idx, val);
+                        }
+                    }
+                    Err(e) => { eprintln!("  [{}] {}", idx, e); process::exit(1); }
+                }
+            }
+            return;
+        }
+
         let rule = all_rules
             .iter()
             .find(|r| r.name == rule_name)
             .unwrap_or_else(|| {
-                eprintln!("no rule named '{}'", rule_name);
+                eprintln!("no rule or reaction named '{}'", rule_name);
                 process::exit(1);
             });
 

@@ -21,6 +21,9 @@ pub fn emit_rust(program: &Program) -> String {
             Item::Rule(r) => {
                 out.push_str(&format!("// Rule: {} — \"{}\"\n", r.name, r.intention));
             }
+            Item::Reaction(rx) => {
+                out.push_str(&format!("// Reaction: {} — \"{}\"\n", rx.name, rx.intention));
+            }
         }
     }
     out.push('\n');

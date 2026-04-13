@@ -84,6 +84,7 @@ pub fn optimize_program(program: &Program) -> (Program, OptStats) {
                     let field_ranges = concept_field_ranges(r, &concepts);
                     Item::Rule(optimize_rule(r, &field_ranges))
                 }
+                Item::Reaction(rx) => Item::Reaction(rx.clone()),
             })
             .collect(),
     };
