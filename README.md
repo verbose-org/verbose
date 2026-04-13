@@ -294,10 +294,20 @@ The compiler remains the final arbiter.
 cargo run -- examples/invoices.verbose --benchmark --run important_invoice
 ```
 
+## Origin
+
+This project started as an open question: *"If AI writes code now, do we still need languages designed for humans?"*
+
+A few hours later, the question had become a working compiler with verified proofs, four backends, SIMD optimization, and a 498-byte HTTP server.
+
+No spec committee. No funding. No team. One human with a vision, one AI that codes, and a question that turned out to have a very concrete answer.
+
 ## License
 
 Apache 2.0
 
 ## Author
 
-Created by Yoan Roblet ([@Arcker](https://github.com/Arcker)) — built with AI, verified by compiler.
+Created by Yoan Roblet ([@Arcker](https://github.com/Arcker)).
+
+The vision, the architecture decisions, and every "no" that kept the project on track came from a human. The Rust code came from an AI. The compiler trusts neither.
