@@ -412,4 +412,80 @@ mod tests {
         let result = optimize_expr(&expr, "i", &HashMap::new());
         assert!(matches!(result, Expr::Number(90)));
     }
+
+    #[test]
+    fn dead_branch_always_true() {
+        // if temp > 0 then 1 else 2, with temp ∈ [10, 50]
+        // 10 > 0 always → returns then branch (1)
+        let expr = Expr::If(
+            Box::new(Expr::Binary(
+                BinOp::Gt,
+                Box::new(Expr::Field(Box::new(Expr::Ident("i".into())), "temp".into())),
+                Box::new(Expr::Number(0)),
+            )),
+            Box::new(Expr::Number(1)),
+            Box::new(Expr::Number(2)),
+        );
+        let ranges = fr(&[("temp", 10, 50)]);
+        let result = optimize_expr(&expr, "i", &ranges);
+        assert!(matches!(result, Expr::Number(1)));
+    }
+
+    #[test]
+    fn no_dead_branch_when_range_overlaps() {
+        // if temp > 30 then 1 else 0, with temp ∈ [0, 50]
+        // Could be true or false → both branches kept
+        let expr = Expr::If(
+            Box::new(Expr::Binary(
+                BinOp::Gt,
+                Box::new(Expr::Field(Box::new(Expr::Ident("i".into())), "temp".into())),
+                Box::new(Expr::Number(30)),
+            )),
+            Box::new(Expr::Number(1)),
+            Box::new(Expr::Number(0)),
+        );
+        let ranges = fr(&[("temp", 0, 50)]);
+        let result = optimize_expr(&expr, "i", &ranges);
+        assert!(matches!(result, Expr::If(_, _, _))); // NOT eliminated
+    }
+
+    #[test]
+    fn multiply_by_one_eliminated() {
+        let expr = Expr::Binary(
+            BinOp::Mul,
+            Box::new(Expr::Number(1)),
+            Box::new(Expr::Ident("x".into())),
+        );
+        let result = optimize_expr(&expr, "i", &HashMap::new());
+        assert!(matches!(result, Expr::Ident(_)));
+    }
+
+    #[test]
+    fn divide_by_one_eliminated() {
+        let expr = Expr::Binary(
+            BinOp::Div,
+            Box::new(Expr::Ident("x".into())),
+            Box::new(Expr::Number(1)),
+        );
+        let result = optimize_expr(&expr, "i", &HashMap::new());
+        assert!(matches!(result, Expr::Ident(_)));
+    }
+
+    #[test]
+    fn subtract_zero_eliminated() {
+        let expr = Expr::Binary(
+            BinOp::Sub,
+            Box::new(Expr::Ident("x".into())),
+            Box::new(Expr::Number(0)),
+        );
+        let result = optimize_expr(&expr, "i", &HashMap::new());
+        assert!(matches!(result, Expr::Ident(_)));
+    }
+
+    #[test]
+    fn neg_literal_folded() {
+        let expr = Expr::Neg(Box::new(Expr::Number(42)));
+        let result = optimize_expr(&expr, "i", &HashMap::new());
+        assert!(matches!(result, Expr::Number(-42)));
+    }
 }
