@@ -8,6 +8,8 @@
 /// (one group per record, N = number of fields) and prints the result.
 
 use std::collections::HashMap;
+
+use crate::verifier::compute_range;
 use std::io::Write;
 
 use crate::ast::*;
@@ -382,7 +384,7 @@ fn emit_eval_expr(
                 }
             }
 
-            // Strength reduction: divide by power of 2 → shift right (unsigned)
+            // Strength reduction: divide by power of 2 → shift right
             if *op == BinOp::Div {
                 if let Expr::Number(n) = right.as_ref() {
                     if *n > 0 && (*n as u64).is_power_of_two() {
@@ -390,6 +392,36 @@ fn emit_eval_expr(
                         let shift = (*n as u64).trailing_zeros() as u8;
                         code.extend_from_slice(&[0x48, 0xC1, 0xE8, shift]); // shr rax, shift
                         return Ok(());
+                    }
+                }
+            }
+
+            // Strength reduction: divide by constant → multiply-shift trick
+            // x / d = mulhi(x, magic) >> shift — 4 cycles instead of 20-40 for idiv
+            // Only safe for non-negative dividends (verified via field ranges)
+            if *op == BinOp::Div {
+                if let Expr::Number(d) = right.as_ref() {
+                    if *d > 1 {
+                        if let Some((magic, shift)) = magic_div_constant(*d as u64) {
+                            // Check that the dividend is non-negative via field ranges
+                            let dividend_non_negative = compute_range(left, field_ranges, input_name)
+                                .map_or(false, |(min, _)| min >= 0);
+                            if dividend_non_negative {
+                                emit_eval_expr(code, left, input_name, offsets, all_rules, field_ranges)?;
+                                // mov rcx, magic
+                                code.extend_from_slice(&[0x48, 0xB9]);
+                                code.extend_from_slice(&magic.to_le_bytes());
+                                // mul rcx (unsigned: rdx:rax = rax * rcx)
+                                code.extend_from_slice(&[0x48, 0xF7, 0xE1]);
+                                // shr rdx, shift (high half >> shift = result)
+                                if shift > 0 {
+                                    code.extend_from_slice(&[0x48, 0xC1, 0xEA, shift]);
+                                }
+                                // mov rax, rdx
+                                code.extend_from_slice(&[0x48, 0x89, 0xD0]);
+                                return Ok(());
+                            }
+                        }
                     }
                 }
             }
@@ -983,6 +1015,63 @@ fn extract_simple_gt(rule: &Rule) -> Option<i64> {
     None
 }
 
+/// Compute magic number and shift for unsigned division by constant.
+/// Uses the algorithm from Hacker's Delight (Warren, 2002).
+///
+/// For a 64-bit unsigned dividend and constant divisor d:
+///   x / d = mulhi(x, magic) >> shift
+///
+/// where mulhi is the high 64 bits of the 128-bit product x * magic.
+/// This replaces a 20-40 cycle `idiv` with a 3-cycle `mul` + 1-cycle `shr`.
+/// Compute magic number for unsigned division by constant d.
+/// Based on Hacker's Delight (Warren, 2002) and libdivide.
+///
+/// Formula: x / d = mulhi(x, magic) >> p
+/// where p = floor(log2(d)), magic = ceil(2^(64+p) / d)
+///
+/// This works because mulhi gives the high 64 bits of the 128-bit product,
+/// which approximates x * (2^64/d) — effectively computing x/d scaled by 2^64.
+fn magic_div_constant(d: u64) -> Option<(u64, u8)> {
+    if d <= 1 {
+        return None;
+    }
+    // p = floor(log2(d))
+    let p = 63u32 - d.leading_zeros();
+    let shift_amount = 64u32 + p;
+    if shift_amount > 127 {
+        return None;
+    }
+
+    // magic = ceil(2^(64+p) / d) using 128-bit arithmetic
+    let numerator: u128 = 1u128 << shift_amount;
+    let magic128 = (numerator + d as u128 - 1) / d as u128;
+
+    if magic128 > u64::MAX as u128 {
+        return None; // Needs "add" variant — fall back to idiv
+    }
+
+    let magic = magic128 as u64;
+
+    // Verify correctness on boundary values
+    let verify = |x: u64| -> bool {
+        let hi = ((x as u128 * magic as u128) >> 64) as u64;
+        (hi >> p) == x / d
+    };
+
+    if !verify(0)
+        || !verify(1)
+        || !verify(d - 1)
+        || !verify(d)
+        || !verify(d + 1)
+        || !verify(d * 100)
+        || !verify(u32::MAX as u64)
+    {
+        return None;
+    }
+
+    Some((magic, p as u8))
+}
+
 fn emit_cmp_rax_imm(code: &mut Vec<u8>, value: i64) {
     if value >= i32::MIN as i64 && value <= i32::MAX as i64 {
         code.extend_from_slice(&[0x48, 0x3D]);
@@ -1242,5 +1331,27 @@ mod tests {
         assert_eq!(offsets["a"], -8);
         assert_eq!(offsets["b"], -16);
         assert_eq!(offsets["c"], -24);
+    }
+
+    #[test]
+    fn magic_div_100() {
+        let (magic, shift) = magic_div_constant(100).unwrap();
+        for x in [0u64, 1, 99, 100, 101, 999, 1000, 10000, 100000, 1000000, u32::MAX as u64] {
+            let hi = ((x as u128 * magic as u128) >> 64) as u64;
+            let result = hi >> shift;
+            assert_eq!(result, x / 100, "failed for x={}: got {} expected {}", x, result, x / 100);
+        }
+    }
+
+    #[test]
+    fn magic_div_various() {
+        for d in [3, 7, 10, 12, 25, 50, 100, 1000, 365] {
+            let (magic, shift) = magic_div_constant(d).expect(&format!("no magic for {}", d));
+            for x in [0u64, 1, d - 1, d, d + 1, d * 10, d * 100, 1000000] {
+                let hi = ((x as u128 * magic as u128) >> 64) as u64;
+                let result = hi >> shift;
+                assert_eq!(result, x / d, "failed for x={} / {}: got {} expected {}", x, d, result, x / d);
+            }
+        }
     }
 }
