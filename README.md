@@ -97,6 +97,21 @@ verify error [rule 'client_blocked' / purity.reads] declared reads do not match 
 | Proof checks | 8 zero-trust verifications against the AST |
 | Examples | 8 (invoices, business, clients, collections, pricing, deadcode, app+stdlib, HTTP demo) |
 
+## Verbose vs gcc -O3
+
+Same logic (`amount > 10000`), same input, same output:
+
+| | gcc -O3 (stripped) | Verbose native |
+|---|---|---|
+| Binary size | 14,472 bytes | **589 bytes** (24x smaller) |
+| Dependencies | 3 shared libraries (libc) | **Zero** |
+| Proofs | None | Purity, termination, determinism |
+| Overflow safety | Undefined behavior | Proven via interval arithmetic |
+| SIMD | Must analyze (may miss) | Declared + verified (`pcmpgtq`) |
+| Traceability | None | Every instruction → source intention |
+
+gcc has 20 years of register allocation and instruction scheduling that we don't have yet. But Verbose has domain knowledge that gcc will never have.
+
 ## Three Axioms
 
 1. **Nothing is implicit.** Every block carries all information needed for verification and optimization.
