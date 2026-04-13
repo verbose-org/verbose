@@ -23,7 +23,7 @@ Right now, nobody. We trust and hope. Verbose exists because that's not good eno
 Let the AI express itself **fully** — not in 25 lines of elegant Python, but in 200 lines that carry:
 
 - **Proofs** — purity, termination, determinism — declared and verified
-- **Optimization hints** — vectorizable, parallelizable, memory layout — exploited by the compiler
+- **Optimization hints** — vectorizable, parallelizable, cache-friendly — exploited by the compiler
 - **Traceability** — every line traces back to a human intention
 
 A human would never write this. An AI generates it in seconds. And the compiler doesn't guess — it **verifies** the proofs, **exploits** the hints, and **rejects** anything unproven.
@@ -35,7 +35,7 @@ Verbose:             intention → AI expands → IR + proofs → compiler verif
 
 ## Live Example
 
-Human writes this (`invoices.intent`):
+Human writes this (`collections.intent`):
 ```
 1. A client has a name and a list of invoices.
 2. An invoice is overdue when it has more than 30 days overdue.
@@ -81,7 +81,7 @@ executing rule 'client_blocked' on 4 record(s):
   [3] blocked = true     ← Lefevre: empty collection (⚠ edge case flagged by spec)
 ```
 
-If the AI lies in its proofs — says `reads: []` when the code reads a field — the compiler catches it:
+If the AI lies in its proofs — the compiler catches it:
 ```
 verify error [rule 'client_blocked' / purity.reads] declared reads do not match logic; missing: [c.invoices]
 ```
@@ -90,14 +90,12 @@ verify error [rule 'client_blocked' / purity.reads] declared reads do not match 
 
 | | |
 |---|---|
-| Lines of Rust | ~3500, zero external dependencies |
-| Tests | 37, all passing |
-| Native binary size | **542 bytes** for arithmetic + boolean + rule composition |
+| Lines of Rust | ~5300, zero external dependencies |
+| Tests | 51, all passing |
+| Native binary size | **407–676 bytes** depending on rule complexity |
 | Rust transpiler output | 441 KB for the same logic (832x larger) |
 | Proof checks | 8 zero-trust verifications against the AST |
-| Time to build | One session, from spec to working compiler |
-
-The 542-byte native binary has **zero runtime dependencies** — no libc, no allocator, no runtime. It talks directly to the Linux kernel via syscalls.
+| Examples | 7 (invoices, business, clients, collections, pricing, deadcode, sensors) |
 
 ## Three Axioms
 
@@ -119,24 +117,74 @@ If a declaration serves neither verification nor optimization, it doesn't belong
 
 ## What Works Today
 
+### Language Features
+
 | Feature | Example |
 |---|---|
 | Typed concepts | `number`, `bool`, `text`, `collection(Type)` |
+| Field value ranges | `temperature : number [0, 50]` |
 | Arithmetic | `amount + amount * tax_rate / 100` |
 | Comparisons & equality | `>`, `<`, `>=`, `<=`, `==`, `!=` |
-| Boolean logic | `and`, `or` |
+| Boolean logic | `and`, `or`, `not` |
+| Parentheses | `(a + b) * c` |
+| Unary negation | `-amount` |
+| If/then/else | `if days > 90 then 20 else if days > 30 then 10 else 0` |
+| Let bindings (CSE) | `let tax = amount * rate / 100` |
 | String comparison | `status == "active"` |
 | Rule composition | `important(i) and overdue(i)` |
 | Collection quantifiers | `all(invoices, inv => inv.days > 30)` |
-| Zero-trust proof verification | purity, termination, determinism |
-| Three backends | interpreter, Rust transpiler, native x86-64 |
+| Lambda syntax | `any(list, item => predicate)` |
+
+### Proof Verification (Zero-Trust)
+
+| Check | What it verifies |
+|---|---|
+| Purity reads | Declared reads == actual field accesses in AST |
+| Purity writes | Declared writes == actual mutations (must be empty for pure) |
+| Purity calls | Declared calls == actual rule invocations in AST |
+| Purity verdict | `pure` consistent with empty writes/calls |
+| Termination bound | Declared bound ≥ actual operation count |
+| Determinism | `total` consistent with call purity |
+| Source traceability | `@source: file:line` points to existing line |
+| Field existence | Accessed fields exist on the input concept |
+| Logic/output coherence | Logic target matches declared output name |
+| Called rules exist | All called rules are defined in the program |
+
+### Optimization Hints (Exploited by Compiler)
+
+| Hint | What the compiler does | Why gcc can't |
+|---|---|---|
+| `vectorizable: yes` | Emits SSE4.2 `pcmpgtq` — 2 values per CPU cycle | Requires costly loop analysis |
+| `parallel: yes` | Uses `fork()` — real multi-core parallelism | Developer must do it manually |
+| `overflow: [min, max]` | Proves safe via interval arithmetic — no runtime check | C = undefined behavior, Rust = runtime panic |
+| `field [min, max]` | Eliminates impossible branches from binary | Doesn't know value bounds |
+
+### Compile-Time Optimizations (Native Backend)
+
+| Optimization | Example | Machine code impact |
+|---|---|---|
+| Constant folding | `100 / 2` → `50` at compile time | Zero runtime instructions |
+| Strength reduction | `x * 4` → `shl rax, 2` | 1 cycle instead of 3 (imul) |
+| Multiply by 0/1 | `x * 0` → `xor rax, rax` | No computation |
+| Add/sub 0 | `x + 0` → identity | No instruction emitted |
+| Dead branch elimination | `if temp > 100` with range [0,50] → branch removed | Fewer jumps, smaller binary |
+| SIMD vectorization | Comparison → `pcmpgtq` | 2 results per instruction |
+| Let binding CSE | `let tax = expr` → compute once, load N times | No redundant evaluation |
+
+### Three Backends
+
+| Backend | Command | Output |
+|---|---|---|
+| Interpreter | `--run rule --input data.json` | Executes directly on JSON data |
+| Rust transpiler | `--compile output` | Standalone binary via `rustc` (~441 KB) |
+| Native x86-64 | `--native output --run rule` | ELF binary, zero dependencies (~400-700 bytes) |
 
 ## Getting Started
 
 ```bash
 git clone https://github.com/verbose-org/verbose.git
 cd verbose
-cargo test                    # 37 tests, should all pass
+cargo test                    # 51 tests, should all pass
 cargo run -- examples/collections.verbose   # verify proofs
 cargo run -- examples/collections.verbose --run client_blocked --input examples/collections.json
 ```
@@ -146,8 +194,11 @@ Other backends:
 # Compile to standalone Rust binary
 cargo run -- examples/business.verbose --compile /tmp/business
 
-# Compile to native x86-64 ELF (~500 bytes, zero dependencies)
-cargo run -- examples/business.verbose --native /tmp/biz --run critical_invoice
+# Compile to native x86-64 ELF (zero dependencies)
+cargo run -- examples/business.verbose --native /tmp/biz --run total_with_tax
+
+# Show generated Rust source
+cargo run -- examples/pricing.verbose --emit-rust
 ```
 
 ## The Generation Question
@@ -156,8 +207,6 @@ Who writes the `.verbose` files?
 
 **An AI does.** Not the compiler — a separate AI (Claude, GPT, or any future model). The human writes the `.intent` file (plain language), the AI generates the `.verbose` IR with all its proofs and hints, and the compiler verifies everything. If the AI gets something wrong — a proof that doesn't hold, a bound that's too tight, a missing read — the compiler rejects it. No exceptions.
 
-This separation is fundamental:
-
 ```
 AI (non-deterministic)        generates .verbose — may hallucinate, may be wrong
 verbosec (deterministic)      verifies and compiles — never trusts, never guesses
@@ -165,22 +214,11 @@ verbosec (deterministic)      verifies and compiles — never trusts, never gues
 
 The compiler will never generate code. It will never "help" the AI by inferring missing proofs. It verifies, or it rejects. Like a financial auditor: if the accountant and the auditor are the same person, the audit is worthless.
 
-As AI models grow more capable (larger context, better reasoning), they'll generate more complex and correct Verbose IR. The compiler doesn't need to change — it just verifies whatever the AI produces. The bottleneck shifts from "can the compiler handle it" to "can the AI express it correctly." And when it can't, the compiler catches it.
-
-A dedicated generation tool (separate from the compiler) is planned for the future.
+As AI models grow more capable (larger context, better reasoning), they'll generate more complex and correct Verbose IR. The compiler doesn't need to change — it just verifies whatever the AI produces. A dedicated generation tool (separate from the compiler) is planned for the future.
 
 ## Status
 
-**POC / R&D.** The language works, the compiler verifies proofs, three backends produce correct results. The concept is validated.
-
-What the compiler does today that general-purpose compilers cannot:
-
-| Optimization | How | Why gcc/rustc can't |
-|---|---|---|
-| SIMD vectorization | `vectorizable: yes` hint → SSE4.2 `pcmpgtq` | Requires costly loop analysis |
-| Multi-core parallelism | `parallel: yes` hint → `fork()` | Developer must do it manually |
-| Overflow elimination | `overflow: [min, max]` → interval arithmetic proof | C = undefined behavior, Rust = runtime panic |
-| Dead code elimination | Field ranges `[0, 50]` → branch pruning | Doesn't know value bounds |
+**POC / R&D.** 24 commits, ~5300 lines, 51 tests, 0 dependencies. The language works, the compiler verifies proofs, three backends produce correct results. The concept is validated.
 
 ## License
 
