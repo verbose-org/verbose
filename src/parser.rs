@@ -447,7 +447,7 @@ impl Parser {
             Ok(Expr::Number(n))
         } else if is_ident {
             let name = self.expect_ident_any()?;
-            if (name == "sum" || name == "count") && self.check_kind(&TokenKind::LParen) {
+            if (name == "sum" || name == "count" || name == "min" || name == "max") && self.check_kind(&TokenKind::LParen) {
                 // Sugar: sum(coll, var => expr) → fold(coll, 0, __acc, var => __acc + expr)
                 //        count(coll, var => pred) → fold(coll, 0, __acc, var => __acc + if pred then 1 else 0)
                 self.advance(); // (
@@ -459,29 +459,48 @@ impl Parser {
                 self.expect_kind(TokenKind::RParen)?;
 
                 let acc = "__acc".to_string();
-                let fold_body = if name == "sum" {
-                    // __acc + expr
-                    Expr::Binary(
-                        BinOp::Add,
-                        Box::new(Expr::Ident(acc.clone())),
-                        Box::new(body),
-                    )
-                } else {
-                    // __acc + if pred then 1 else 0
-                    Expr::Binary(
-                        BinOp::Add,
-                        Box::new(Expr::Ident(acc.clone())),
-                        Box::new(Expr::If(
+                let fold_body = match name.as_str() {
+                    "sum" => {
+                        // __acc + expr
+                        Expr::Binary(BinOp::Add, Box::new(Expr::Ident(acc.clone())), Box::new(body))
+                    }
+                    "count" => {
+                        // __acc + if pred then 1 else 0
+                        Expr::Binary(
+                            BinOp::Add,
+                            Box::new(Expr::Ident(acc.clone())),
+                            Box::new(Expr::If(Box::new(body), Box::new(Expr::Number(1)), Box::new(Expr::Number(0)))),
+                        )
+                    }
+                    "min" => {
+                        // if expr < __acc then expr else __acc
+                        Expr::If(
+                            Box::new(Expr::Binary(BinOp::Lt, Box::new(body.clone()), Box::new(Expr::Ident(acc.clone())))),
                             Box::new(body),
-                            Box::new(Expr::Number(1)),
-                            Box::new(Expr::Number(0)),
-                        )),
-                    )
+                            Box::new(Expr::Ident(acc.clone())),
+                        )
+                    }
+                    "max" => {
+                        // if expr > __acc then expr else __acc
+                        Expr::If(
+                            Box::new(Expr::Binary(BinOp::Gt, Box::new(body.clone()), Box::new(Expr::Ident(acc.clone())))),
+                            Box::new(body),
+                            Box::new(Expr::Ident(acc.clone())),
+                        )
+                    }
+                    _ => unreachable!(),
+                };
+
+                // Initial value: 0 for sum/count, MAX for min, MIN for max
+                let initial = match name.as_str() {
+                    "min" => Expr::Number(i64::MAX),
+                    "max" => Expr::Number(i64::MIN),
+                    _ => Expr::Number(0),
                 };
 
                 Ok(Expr::Fold(
                     Box::new(collection),
-                    Box::new(Expr::Number(0)),
+                    Box::new(initial),
                     acc,
                     var,
                     Box::new(fold_body),
