@@ -101,9 +101,10 @@ verify error [rule 'client_blocked' / purity.reads] declared reads do not match 
 
 Same logic (`amount > 10000`), same input, same output:
 
-| | gcc -O3 (stripped) | Verbose native |
+| | gcc -O3 -s (production, stripped) | Verbose native |
 |---|---|---|
 | Binary size | 14,472 bytes | **589 bytes** (24x smaller) |
+| gcc -Os -s (size-optimized) | 14,472 bytes (same) | **589 bytes** |
 | Dependencies | 3 shared libraries (libc) | **Zero** |
 | Proofs | None | Purity, termination, determinism |
 | Overflow safety | Undefined behavior | Proven via interval arithmetic |
