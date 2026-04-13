@@ -216,6 +216,49 @@ The compiler will never generate code. It will never "help" the AI by inferring 
 
 As AI models grow more capable (larger context, better reasoning), they'll generate more complex and correct Verbose IR. The compiler doesn't need to change — it just verifies whatever the AI produces. A dedicated generation tool (separate from the compiler) is planned for the future.
 
+## Why Not LLVM?
+
+LLVM is a powerful general-purpose compiler backend used by Rust, Clang, and Swift. Verbose doesn't use it for the primary path. Here's why:
+
+**LLVM loses the information that makes Verbose unique.**
+
+When translating Verbose IR to LLVM IR, domain knowledge is stripped:
+
+```
+Verbose IR:                          LLVM IR:
+  field: amount [0, 1000000]    →    %amount = i64       (no bounds known)
+  hints: vectorizable: yes      →    (lost — LLVM must re-discover)
+  proofs: pure                  →    (lost — LLVM must re-analyze)
+  overflow: [0, 100]            →    (lost — LLVM doesn't know)
+```
+
+LLVM then spends dozens of analysis passes trying to re-discover what Verbose already knew. Sometimes it succeeds. Often it can't — because the information was never expressible in LLVM IR to begin with.
+
+**What LLVM adds that we don't need:**
+
+| Overhead | Why LLVM adds it | Why Verbose skips it |
+|---|---|---|
+| Function prologues/epilogues | Standard calling convention | We emit only the instructions needed |
+| Stack protectors | Buffer overflow defense | Proven safe via interval arithmetic |
+| Alignment padding | Cache line optimization | We control layout directly |
+| Exception handling tables | Unwinding support | Pure functions can't throw |
+
+Result: Verbose native binaries are 400-700 bytes. LLVM would produce 10-50 KB minimum.
+
+**Where LLVM wins:** complex programs with hundreds of functions. LLVM has 20 years of register allocation, instruction scheduling, and loop optimization. For large codebases, LLVM would produce faster code than our handwritten emitter.
+
+**Where Verbose wins:** domain-aware optimization. Division-by-constant with field-range safety. Dead branch elimination with declared bounds. SIMD guided by hints. These are impossible in LLVM because the information doesn't exist in LLVM IR.
+
+**Our strategy:**
+
+```
+Primary path:     direct machine code (maximum control, minimum size)
+Fallback path:    Rust transpiler (for complex cases and portability)
+Future option:    LLVM backend (for platforms we don't support natively)
+```
+
+LLVM may become an optional backend for platforms where we don't have a native emitter. But the primary path stays direct — that's where Verbose's advantage lives.
+
 ## Status
 
 **POC / R&D.** 24 commits, ~5300 lines, 51 tests, 0 dependencies. The language works, the compiler verifies proofs, three backends produce correct results. The concept is validated.

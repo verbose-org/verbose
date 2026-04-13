@@ -63,6 +63,15 @@ If they're mixed, the verification loses its value. The compiler's credibility c
 
 A dedicated intent-to-verbose generation tool is planned as a separate project/script.
 
+## LLVM Strategy
+
+LLVM is NOT the primary backend. Verbose emits machine code directly because:
+1. LLVM IR can't express field ranges, overflow bounds, or optimization hints
+2. The translation to LLVM IR loses the domain knowledge that makes Verbose unique
+3. LLVM adds overhead (prologues, stack protectors, alignment) that Verbose proves unnecessary
+
+LLVM may become an OPTIONAL fallback backend for platforms without a native emitter. But all architecture decisions must keep the direct-emission path viable and primary.
+
 ## Development Rules
 
 - **Always explain what you're doing and why.** The creators are learning alongside the AI. Every change must be explained clearly.
