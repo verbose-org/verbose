@@ -90,12 +90,12 @@ verify error [rule 'client_blocked' / purity.reads] declared reads do not match 
 
 | | |
 |---|---|
-| Lines of Rust | ~5300, zero external dependencies |
-| Tests | 51, all passing |
-| Native binary size | **407–676 bytes** depending on rule complexity |
+| Lines of Rust | ~6000, zero external dependencies |
+| Tests | 59, all passing |
+| Native binary size | **407–676 bytes** for business logic, **498 bytes** for HTTP server |
 | Rust transpiler output | 441 KB for the same logic (832x larger) |
 | Proof checks | 8 zero-trust verifications against the AST |
-| Examples | 7 (invoices, business, clients, collections, pricing, deadcode, sensors) |
+| Examples | 8 (invoices, business, clients, collections, pricing, deadcode, app+stdlib, HTTP demo) |
 
 ## Three Axioms
 
@@ -249,6 +249,25 @@ Result: Verbose native binaries are 400-700 bytes. LLVM would produce 10-50 KB m
 
 **Where Verbose wins:** domain-aware optimization. Division-by-constant with field-range safety. Dead branch elimination with declared bounds. SIMD guided by hints. These are impossible in LLVM because the information doesn't exist in LLVM IR.
 
+## What Else Can It Build?
+
+The native backend isn't limited to rule evaluation. As a proof of concept:
+
+```bash
+$ verbosec --demo-http /tmp/server
+HTTP demo server: /tmp/server (498 bytes)
+
+$ ./server &
+Verbose HTTP server on port 9999
+
+$ curl http://localhost:9999
+Hello from Verbose!
+```
+
+A fully functional HTTP server in **498 bytes**. Zero dependencies. 7 Linux syscalls in a loop. For context: Nginx is 1.5 MB. Caddy is 40 MB. Node.js runtime alone is 50 MB.
+
+This is not a language feature yet (Verbose doesn't have I/O primitives). It proves the infrastructure can produce real networked applications. The path to a Verbose HTTP server is: add reaction blocks (declared side effects) and I/O primitives to the language.
+
 **Our strategy:**
 
 ```
@@ -261,7 +280,7 @@ LLVM may become an optional backend for platforms where we don't have a native e
 
 ## Status
 
-**POC / R&D.** 24 commits, ~5300 lines, 51 tests, 0 dependencies. The language works, the compiler verifies proofs, three backends produce correct results. The concept is validated.
+**POC / R&D.** 32 commits, ~6000 lines, 59 tests, 0 dependencies. The language works, the compiler verifies proofs, three backends produce correct results. The concept is validated.
 
 ## License
 
