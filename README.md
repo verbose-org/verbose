@@ -9,6 +9,8 @@ It is based on a simple idea: modern AI systems can generate far more detail tha
 Verbose explores that space.
 
 > *Making exhaustiveness a compilable material.*
+>
+> *"I created this not so the machine replaces us, but so the machine is held accountable to us."*
 
 Instead of asking the compiler to guess, Verbose asks the authoring system to declare:
 - what the program means
