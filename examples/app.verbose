@@ -1,0 +1,57 @@
+@verbose 0.1.0
+
+use "stdlib/finance.verbose"
+
+-- This file ONLY contains app-specific rules.
+-- Invoice concept, standard_tax, and invoice_overdue are imported.
+
+rule total_due
+  @intention: "The total due is the invoice amount plus the standard tax"
+  @source: app.intent:1
+
+  input:
+    i : Invoice
+
+  output:
+    total : number
+
+  logic:
+    total = i.amount + standard_tax(i)
+
+  proofs:
+    purity:
+      reads   : [i, i.amount]
+      writes  : []
+      calls   : [standard_tax]
+      verdict : pure
+    termination:
+      form  : constant_bound
+      bound : 2
+    determinism:
+      form : total
+
+
+rule urgent_invoice
+  @intention: "An invoice is urgent when it is overdue and the total exceeds 5000"
+  @source: app.intent:2
+
+  input:
+    i : Invoice
+
+  output:
+    urgent : bool
+
+  logic:
+    urgent = invoice_overdue(i) and total_due(i) > 5000
+
+  proofs:
+    purity:
+      reads   : [i]
+      writes  : []
+      calls   : [invoice_overdue, total_due]
+      verdict : pure
+    termination:
+      form  : constant_bound
+      bound : 4
+    determinism:
+      form : total

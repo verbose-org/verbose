@@ -1,0 +1,68 @@
+@verbose 0.1.0
+
+-- Standard finance module: reusable Invoice concept and common rules.
+-- Import with: use "stdlib/finance.verbose"
+
+concept Invoice
+  @intention: "An invoice has an amount, a tax rate, and a number of days overdue"
+  @source: "stdlib/finance.intent":1
+
+  fields:
+    amount       : number [0, 10000000]
+    tax_rate     : number [0, 100]
+    days_overdue : number [0, 3650]
+
+
+rule standard_tax
+  @intention: "Standard tax is amount times tax rate divided by 100"
+  @source: "stdlib/finance.intent":2
+
+  input:
+    i : Invoice
+
+  output:
+    tax : number
+
+  logic:
+    tax = i.amount * i.tax_rate / 100
+
+  proofs:
+    purity:
+      reads   : [i.amount, i.tax_rate]
+      writes  : []
+      calls   : []
+      verdict : pure
+    termination:
+      form  : constant_bound
+      bound : 2
+    determinism:
+      form : total
+
+
+rule invoice_overdue
+  @intention: "An invoice is overdue when it has more than 30 days"
+  @source: "stdlib/finance.intent":3
+
+  input:
+    i : Invoice
+
+  output:
+    overdue : bool
+
+  logic:
+    overdue = i.days_overdue > 30
+
+  proofs:
+    purity:
+      reads   : [i.days_overdue]
+      writes  : []
+      calls   : []
+      verdict : pure
+    termination:
+      form  : constant_bound
+      bound : 1
+    determinism:
+      form : total
+
+  hints:
+    vectorizable : yes

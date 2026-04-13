@@ -28,6 +28,7 @@ pub fn optimize_program(program: &Program) -> Program {
 
     Program {
         version: program.version.clone(),
+        uses: vec![],
         items: program
             .items
             .iter()

@@ -1,0 +1,2 @@
+1. The total due is the invoice amount plus the standard tax.
+2. An invoice is urgent when it is overdue and the total exceeds 5000.

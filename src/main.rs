@@ -51,6 +51,10 @@ fn main() {
     };
 
     let base_dir = Path::new(path).parent().unwrap_or_else(|| Path::new("."));
+
+    // Resolve imports: load and merge items from 'use' declarations
+    let program = resolve_imports(program, base_dir);
+
     let errors = verifier::verify_program(&program, base_dir);
     if !errors.is_empty() {
         for e in &errors {
@@ -223,4 +227,56 @@ fn find_first_concept_rule(program: &ast::Program) -> (&ast::Concept, &ast::Rule
             std::process::exit(1);
         });
     (concept, rule)
+}
+
+/// Resolve `use "file.verbose"` imports: load, parse, and merge items.
+/// Handles circular imports via a "seen files" set.
+fn resolve_imports(mut program: ast::Program, base_dir: &Path) -> ast::Program {
+    let mut seen = std::collections::HashSet::new();
+    let mut pending = program.uses.clone();
+
+    while let Some(use_path) = pending.pop() {
+        let resolved = base_dir.join(&use_path);
+        let canonical = resolved.to_string_lossy().to_string();
+        if seen.contains(&canonical) {
+            continue; // already loaded — skip circular import
+        }
+        seen.insert(canonical);
+
+        let use_source = match fs::read_to_string(&resolved) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("error loading '{}': {}", use_path, e);
+                process::exit(1);
+            }
+        };
+        let use_tokens = match lexer::Lexer::new(&use_source).tokenize() {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("in '{}': {}", use_path, e);
+                process::exit(1);
+            }
+        };
+        let use_program = match parser::Parser::new(use_tokens).parse_program() {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("in '{}': {}", use_path, e);
+                process::exit(1);
+            }
+        };
+
+        // Queue any nested imports from the loaded module
+        for nested_use in &use_program.uses {
+            pending.push(nested_use.clone());
+        }
+
+        // Merge items (concepts + rules) into the main program
+        // Imported items go BEFORE existing items so they're available
+        let mut merged = use_program.items;
+        merged.append(&mut program.items);
+        program.items = merged;
+    }
+
+    program.uses.clear(); // imports resolved
+    program
 }

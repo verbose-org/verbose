@@ -346,6 +346,7 @@ mod tests {
                     hints: None,
                 }),
             ],
+                uses: vec![],
         };
         let rust = emit_rust(&program);
         assert!(rust.contains("fn check_foo(x: i64) -> bool"));

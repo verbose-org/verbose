@@ -1,6 +1,7 @@
 #[derive(Debug, Clone)]
 pub struct Program {
     pub version: Version,
+    pub uses: Vec<String>,
     pub items: Vec<Item>,
 }
 

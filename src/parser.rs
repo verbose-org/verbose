@@ -28,6 +28,16 @@ impl Parser {
 
     pub fn parse_program(&mut self) -> Result<Program, ParseError> {
         let version = self.parse_version_directive()?;
+
+        // Parse optional 'use' declarations
+        let mut uses = Vec::new();
+        while self.check_ident("use") {
+            self.advance();
+            let path = self.expect_string()?;
+            self.expect_kind(TokenKind::Newline)?;
+            uses.push(path);
+        }
+
         let mut items = Vec::new();
         while !self.at_eof() {
             if self.check_ident("concept") {
@@ -38,7 +48,7 @@ impl Parser {
                 return Err(self.error("expected 'concept' or 'rule' at top level"));
             }
         }
-        Ok(Program { version, items })
+        Ok(Program { version, uses, items })
     }
 
     fn parse_version_directive(&mut self) -> Result<Version, ParseError> {
@@ -157,17 +167,21 @@ impl Parser {
     }
 
     fn parse_source_ref(&mut self) -> Result<SourceRef, ParseError> {
-        let mut parts = vec![self.expect_ident_any()?];
-        while self.check_kind(&TokenKind::Dot) {
-            self.advance();
-            parts.push(self.expect_ident_any()?);
-        }
+        // Accept both: "path/to/file.intent":line  OR  file.intent:line
+        let is_string = matches!(self.peek_kind(), Some(TokenKind::StringLit(_)));
+        let file = if is_string {
+            self.expect_string()?
+        } else {
+            let mut parts = vec![self.expect_ident_any()?];
+            while self.check_kind(&TokenKind::Dot) {
+                self.advance();
+                parts.push(self.expect_ident_any()?);
+            }
+            parts.join(".")
+        };
         self.expect_kind(TokenKind::Colon)?;
         let line = self.expect_number()? as u32;
-        Ok(SourceRef {
-            file: parts.join("."),
-            line,
-        })
+        Ok(SourceRef { file, line })
     }
 
     fn parse_rule(&mut self) -> Result<Rule, ParseError> {
