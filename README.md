@@ -233,7 +233,7 @@ If a declaration serves neither verification nor optimization, it doesn't belong
 ```bash
 git clone https://github.com/verbose-org/verbose.git
 cd verbose
-cargo test                    # 84 tests
+cargo test
 cargo run -- examples/showcase.verbose   # verify all proofs
 cargo run -- examples/showcase.verbose --run bonus_rate --input examples/showcase.json
 ```
@@ -298,7 +298,7 @@ The compiler remains the final arbiter.
 
 ## Status
 
-**POC / R&D.** 52 commits, ~7200 lines, 84 tests, 0 dependencies, 4 backends.
+**POC / R&D.** 0 dependencies, 4 backends, 84+ tests. All claims backed by code.
 
 ```bash
 cargo run -- examples/invoices.verbose --benchmark --run important_invoice

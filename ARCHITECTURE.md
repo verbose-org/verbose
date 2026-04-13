@@ -333,4 +333,4 @@ HUMAN                    AI                      COMPILER
 
 ---
 
-*This document covers Verbose v0.1.0 — 43 commits, ~7000 lines, 72 tests, 4 backends.*
+*This document covers Verbose v0.1.0 — 4 backends, 84+ tests, 0 dependencies.*
