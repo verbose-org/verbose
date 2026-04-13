@@ -52,6 +52,17 @@ examples/
 - Traceability: `@intention` (string), `@source` (file:line)
 - Three backends: interpreter (--run), Rust transpiler (--compile), native x86-64 (--native)
 
+## Separation of Concerns
+
+The compiler (verbosec) NEVER generates code. It verifies and compiles. Code generation is the AI's job, done through a separate tool (not part of the compiler). This boundary is non-negotiable:
+
+- **AI** (external, non-deterministic): reads .intent, generates .verbose with proofs and hints
+- **verbosec** (internal, deterministic): verifies proofs against AST, compiles to binary
+
+If they're mixed, the verification loses its value. The compiler's credibility comes from being independent of the generation process.
+
+A dedicated intent-to-verbose generation tool is planned as a separate project/script.
+
 ## Development Rules
 
 - **Always explain what you're doing and why.** The creators are learning alongside the AI. Every change must be explained clearly.

@@ -150,11 +150,37 @@ cargo run -- examples/business.verbose --compile /tmp/business
 cargo run -- examples/business.verbose --native /tmp/biz --run critical_invoice
 ```
 
+## The Generation Question
+
+Who writes the `.verbose` files?
+
+**An AI does.** Not the compiler — a separate AI (Claude, GPT, or any future model). The human writes the `.intent` file (plain language), the AI generates the `.verbose` IR with all its proofs and hints, and the compiler verifies everything. If the AI gets something wrong — a proof that doesn't hold, a bound that's too tight, a missing read — the compiler rejects it. No exceptions.
+
+This separation is fundamental:
+
+```
+AI (non-deterministic)        generates .verbose — may hallucinate, may be wrong
+verbosec (deterministic)      verifies and compiles — never trusts, never guesses
+```
+
+The compiler will never generate code. It will never "help" the AI by inferring missing proofs. It verifies, or it rejects. Like a financial auditor: if the accountant and the auditor are the same person, the audit is worthless.
+
+As AI models grow more capable (larger context, better reasoning), they'll generate more complex and correct Verbose IR. The compiler doesn't need to change — it just verifies whatever the AI produces. The bottleneck shifts from "can the compiler handle it" to "can the AI express it correctly." And when it can't, the compiler catches it.
+
+A dedicated generation tool (separate from the compiler) is planned for the future.
+
 ## Status
 
 **POC / R&D.** The language works, the compiler verifies proofs, three backends produce correct results. The concept is validated.
 
-What comes next: optimization hints exploitation in the native backend (SIMD, memory layout, parallelism), richer type system, and the moment where Verbose-compiled code outperforms `gcc -O3` on the same algorithm — because the IR carries information that C source code cannot express.
+What the compiler does today that general-purpose compilers cannot:
+
+| Optimization | How | Why gcc/rustc can't |
+|---|---|---|
+| SIMD vectorization | `vectorizable: yes` hint → SSE4.2 `pcmpgtq` | Requires costly loop analysis |
+| Multi-core parallelism | `parallel: yes` hint → `fork()` | Developer must do it manually |
+| Overflow elimination | `overflow: [min, max]` → interval arithmetic proof | C = undefined behavior, Rust = runtime panic |
+| Dead code elimination | Field ranges `[0, 50]` → branch pruning | Doesn't know value bounds |
 
 ## License
 
