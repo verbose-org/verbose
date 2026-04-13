@@ -111,10 +111,13 @@ fn main() {
         .iter()
         .filter(|i| matches!(i, ast::Item::Rule(_)))
         .count();
-    println!(
-        "verified: {} concept(s), {} rule(s); all proofs check out",
-        n_concepts, n_rules
-    );
+    let json_output = args.iter().any(|a| a == "--json");
+    if !json_output {
+        println!(
+            "verified: {} concept(s), {} rule(s); all proofs check out",
+            n_concepts, n_rules
+        );
+    }
     if show_stats {
         println!("optimizations:\n{}", opt_stats);
     }
@@ -360,20 +363,48 @@ fn main() {
             }
         };
 
-        println!();
-        println!(
-            "executing rule '{}' on {} record(s):",
-            rule_name,
-            records.len()
-        );
-        for (idx, record) in records.iter().enumerate() {
-            match interpreter::eval_rule(rule, &all_rules, record) {
-                Ok(val) => {
-                    println!("  [{}] {} = {}", idx, rule.output_name, val);
+        let json_output = args.iter().any(|a| a == "--json");
+
+        if json_output {
+            // Machine-readable JSON output
+            let mut results = Vec::new();
+            for record in records.iter() {
+                match interpreter::eval_rule(rule, &all_rules, record) {
+                    Ok(val) => {
+                        let json_val = match &val {
+                            interpreter::Value::Number(n) => format!("{}", n),
+                            interpreter::Value::Bool(b) => format!("{}", b),
+                            interpreter::Value::Text(s) => format!("\"{}\"", s),
+                            _ => format!("\"{}\"", val),
+                        };
+                        results.push(format!(
+                            "{{\"{}\":{}}}",
+                            rule.output_name, json_val
+                        ));
+                    }
+                    Err(e) => {
+                        eprintln!("{}", e);
+                        process::exit(1);
+                    }
                 }
-                Err(e) => {
-                    eprintln!("  [{}] {}", idx, e);
-                    process::exit(1);
+            }
+            println!("[{}]", results.join(","));
+        } else {
+            println!();
+            println!(
+                "executing rule '{}' on {} record(s):",
+                rule_name,
+                records.len()
+            );
+            for (idx, record) in records.iter().enumerate() {
+                match interpreter::eval_rule(rule, &all_rules, record) {
+                    Ok(val) => {
+                        println!("  [{}] {} = {}", idx, rule.output_name, val);
+                    }
+                    Err(e) => {
+                        eprintln!("  [{}] {}", idx, e);
+                        process::exit(1);
+                    }
                 }
             }
         }
