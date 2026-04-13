@@ -1,0 +1,7 @@
+[
+  {"name": "Widget A",    "price": 150, "quantity": 5},
+  {"name": "Widget B",    "price": 30,  "quantity": 3},
+  {"name": "Gadget Pro",  "price": 500, "quantity": 200},
+  {"name": "Micro Chip",  "price": 80,  "quantity": 8},
+  {"name": "Nano Bolt",   "price": 10,  "quantity": 2}
+]

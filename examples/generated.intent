@@ -1,0 +1,4 @@
+1. A product has a name, a price, and a quantity in stock.
+2. The stock value is the price times the quantity.
+3. A product is low stock when its quantity is less than 10.
+4. A product needs reorder when it is low stock and its stock value exceeds 500.
