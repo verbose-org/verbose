@@ -1,0 +1,40 @@
+@verbose 0.1.0
+
+-- Dynamic reactions: print with values from the trigger context.
+
+concept Invoice
+  @intention: "An invoice has an amount and a client name"
+  @source: alerts.intent:1
+  fields:
+    amount : number
+    client : text
+
+
+rule high_value
+  @intention: "An invoice is high value when its amount exceeds 50000"
+  @source: alerts.intent:2
+  input:
+    i : Invoice
+  output:
+    is_high : bool
+  logic:
+    is_high = i.amount > 50000
+  proofs:
+    purity:
+      reads   : [i.amount]
+      writes  : []
+      calls   : []
+      verdict : pure
+    termination:
+      form  : constant_bound
+      bound : 1
+    determinism:
+      form : total
+
+
+reaction alert_high_value
+  @intention: "When an invoice is high value, alert with the client name and amount"
+  @source: alerts.intent:3
+  trigger: high_value
+  effects:
+    print "ALERT: High value invoice from" i.client "for amount" i.amount

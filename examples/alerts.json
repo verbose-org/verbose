@@ -1,0 +1,6 @@
+[
+  {"amount": 75000, "client": "Acme Corp"},
+  {"amount": 12000, "client": "SmallCo"},
+  {"amount": 150000, "client": "MegaInc"},
+  {"amount": 3000, "client": "TinyCo"}
+]

@@ -1,0 +1,3 @@
+1. An invoice has an amount and a client name.
+2. An invoice is high value when its amount exceeds 50000.
+3. When an invoice is high value, alert with the client name and amount.
