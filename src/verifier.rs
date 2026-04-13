@@ -839,6 +839,28 @@ rule test
     }
 
     #[test]
+    fn reaction_unknown_trigger_rejected() {
+        let src = r#"@verbose 0.1.0
+concept T
+  @intention: "t"
+  @source: invoices.intent:1
+  fields:
+    x : number
+reaction bad
+  @intention: "t"
+  @source: invoices.intent:1
+  trigger: nonexistent_rule
+  effects:
+    print "oops"
+"#;
+        let errs = verify_str(src);
+        assert!(
+            errs.iter().any(|e| e.context.contains("trigger") && e.message.contains("nonexistent")),
+            "got: {:#?}", errs
+        );
+    }
+
+    #[test]
     fn let_bindings_reads_correct() {
         let src = r#"@verbose 0.1.0
 concept T

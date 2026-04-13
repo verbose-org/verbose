@@ -1551,4 +1551,18 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn peephole_eliminates_push_pop_same_reg() {
+        let mut code = vec![0x50, 0x58, 0x90]; // push rax; pop rax; nop
+        peephole_optimize(&mut code);
+        assert_eq!(code, vec![0x90]); // only nop remains
+    }
+
+    #[test]
+    fn peephole_keeps_push_pop_different_reg() {
+        let mut code = vec![0x50, 0x59]; // push rax; pop rcx
+        peephole_optimize(&mut code);
+        assert_eq!(code, vec![0x50, 0x59]); // unchanged — different registers
+    }
 }

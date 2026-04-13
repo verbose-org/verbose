@@ -1186,6 +1186,22 @@ rule important_invoice
     }
 
     #[test]
+    fn reaction_parsed() {
+        let src = "@verbose 0.1.0\n\nconcept T\n  @intention: \"t\"\n  @source: f.intent:1\n  fields:\n    x : number\n\nrule r\n  @intention: \"t\"\n  @source: f.intent:1\n  input:\n    t : T\n  output:\n    y : bool\n  logic:\n    y = t.x > 0\n  proofs:\n    purity:\n      reads: [t.x]\n      writes: []\n      calls: []\n      verdict: pure\n    termination:\n      form: constant_bound\n      bound: 1\n    determinism:\n      form: total\n\nreaction notify\n  @intention: \"notify when triggered\"\n  @source: f.intent:1\n  trigger: r\n  effects:\n    print \"hello\"\n";
+        let p = parse(src).unwrap();
+        assert_eq!(p.items.len(), 3); // concept + rule + reaction
+        match &p.items[2] {
+            Item::Reaction(rx) => {
+                assert_eq!(rx.name, "notify");
+                assert_eq!(rx.trigger, "r");
+                assert_eq!(rx.effects.len(), 1);
+                assert_eq!(rx.effects[0].kind, EffectKind::Print);
+            }
+            _ => panic!("expected reaction"),
+        }
+    }
+
+    #[test]
     fn string_comparison_parsed() {
         let src = "@verbose 0.1.0\n\nconcept T\n  @intention: \"t\"\n  @source: f.intent:1\n  fields:\n    s : text\n\nrule test\n  @intention: \"t\"\n  @source: f.intent:1\n  input:\n    t : T\n  output:\n    r : bool\n  logic:\n    r = t.s == \"active\"\n  proofs:\n    purity:\n      reads: [t.s]\n      writes: []\n      calls: []\n      verdict: pure\n    termination:\n      form: constant_bound\n      bound: 1\n    determinism:\n      form: total\n";
         let p = parse(src).unwrap();
