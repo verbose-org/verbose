@@ -12,6 +12,7 @@ mod optimizer;
 mod parser;
 mod validate_x86;
 mod verifier;
+mod wasm;
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -42,6 +43,7 @@ fn main() {
         eprintln!("  --emit-rust                        Print generated Rust source to stdout");
         eprintln!("  --compile <output>                 Compile to a standalone binary via rustc");
         eprintln!("  --native <output>                  Compile to native x86-64 ELF (no dependencies)");
+        eprintln!("  --wasm <output>                    Compile to WebAssembly module (.wasm)");
         process::exit(2);
     }
     let path = &args[1];
@@ -145,6 +147,23 @@ fn main() {
                         }
                     }
                 }
+            }
+            Err(e) => {
+                eprintln!("{}", e);
+                process::exit(1);
+            }
+        }
+    } else if let Some(output) = find_flag(&args, "--wasm") {
+        let wasm_rule = find_flag(&args, "--run").unwrap_or_else(|| {
+            program.items.iter().rev().find_map(|i| match i {
+                ast::Item::Rule(r) => Some(r.name.clone()),
+                _ => None,
+            }).unwrap_or_default()
+        });
+        match wasm::compile_wasm(&program, &wasm_rule, &output) {
+            Ok(()) => {
+                let size = std::fs::metadata(&output).map(|m| m.len()).unwrap_or(0);
+                println!("wasm: {} -> {} ({} bytes, rule '{}')", path, output, size, wasm_rule);
             }
             Err(e) => {
                 eprintln!("{}", e);
