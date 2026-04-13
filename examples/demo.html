@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Verbose — Live Demo</title>
+    <style>
+        body { font-family: monospace; max-width: 700px; margin: 40px auto; background: #1a1a2e; color: #e0e0e0; }
+        h1 { color: #00d4ff; }
+        .desc { color: #888; margin-bottom: 20px; }
+        input { background: #16213e; color: #e0e0e0; border: 1px solid #444; padding: 8px; width: 120px; font-size: 16px; }
+        button { background: #00d4ff; color: #000; border: none; padding: 8px 16px; cursor: pointer; font-weight: bold; }
+        #result { margin-top: 20px; font-size: 18px; color: #0f0; }
+        #info { margin-top: 10px; color: #666; font-size: 12px; }
+        pre { background: #16213e; padding: 12px; border-radius: 4px; overflow-x: auto; }
+    </style>
+</head>
+<body>
+    <h1>Verbose — Live Demo</h1>
+    <p class="desc">A 60-byte WASM module compiled from Verbose IR. Running in your browser right now.</p>
+
+    <pre>rule total_with_tax
+  logic:
+    total = amount + amount * tax_rate / 100</pre>
+
+    <p>
+        Amount: <input type="number" id="amount" value="10000">
+        Tax rate: <input type="number" id="tax" value="20">
+        <button onclick="compute()">Compute</button>
+    </p>
+    <div id="result"></div>
+    <div id="info"></div>
+
+    <h3>How to generate the WASM module:</h3>
+    <pre>cargo run -- examples/business.verbose --wasm examples/demo.wasm --run total_with_tax</pre>
+
+    <script>
+    let wasmFunc = null;
+
+    async function init() {
+        try {
+            const response = await fetch('demo.wasm');
+            const buf = await response.arrayBuffer();
+            const {instance} = await WebAssembly.instantiate(buf);
+            wasmFunc = instance.exports.total_with_tax;
+            document.getElementById('info').textContent =
+                'WASM module loaded (' + buf.byteLength + ' bytes). Zero dependencies.';
+            compute();
+        } catch(e) {
+            document.getElementById('info').textContent =
+                'Generate demo.wasm first: cargo run -- examples/business.verbose --wasm examples/demo.wasm --run total_with_tax';
+        }
+    }
+
+    function compute() {
+        if (!wasmFunc) return;
+        const amount = BigInt(document.getElementById('amount').value || 0);
+        const tax = BigInt(document.getElementById('tax').value || 0);
+        const result = wasmFunc(amount, tax, BigInt(0)); // 3rd param = days_overdue (unused)
+        document.getElementById('result').textContent = 'Total: ' + result.toString();
+    }
+
+    init();
+    </script>
+</body>
+</html>

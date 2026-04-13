@@ -194,6 +194,7 @@ If a declaration serves neither verification nor optimization, it doesn't belong
 | Interpreter | `--run rule --input data.json` | Executes directly on JSON data |
 | Rust transpiler | `--compile output` | Standalone binary via `rustc` (~441 KB) |
 | Native x86-64 | `--native output --run rule` | ELF binary, zero dependencies (~400-700 bytes) |
+| WebAssembly | `--wasm output.wasm --run rule` | WASM module for browsers (~60 bytes) |
 
 ## Getting Started
 
@@ -213,8 +214,18 @@ cargo run -- examples/business.verbose --compile /tmp/business
 # Compile to native x86-64 ELF (zero dependencies)
 cargo run -- examples/business.verbose --native /tmp/biz --run total_with_tax
 
+# Compile to WebAssembly (runs in browsers)
+cargo run -- examples/business.verbose --wasm /tmp/rule.wasm --run total_with_tax
+
 # Show generated Rust source
 cargo run -- examples/pricing.verbose --emit-rust
+```
+
+Try it in a browser:
+```bash
+cargo run -- examples/business.verbose --wasm examples/demo.wasm --run total_with_tax
+cd examples && python3 -m http.server 8000
+# Open http://localhost:8000/demo.html
 ```
 
 ## The Generation Question
@@ -296,7 +307,7 @@ LLVM may become an optional backend for platforms where we don't have a native e
 
 ## Status
 
-**POC / R&D.** 32 commits, ~6000 lines, 59 tests, 0 dependencies. The language works, the compiler verifies proofs, three backends produce correct results. The concept is validated.
+**POC / R&D.** 40 commits, ~7000 lines, 72 tests, 0 dependencies, 4 backends. The language works, the compiler verifies proofs, three backends produce correct results. The concept is validated.
 
 ## License
 
