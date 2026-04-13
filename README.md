@@ -1,5 +1,7 @@
 # Verbose
 
+[![CI](https://github.com/verbose-org/verbose/actions/workflows/ci.yml/badge.svg)](https://github.com/verbose-org/verbose/actions/workflows/ci.yml)
+
 **A language designed for AI, verified by compiler, pushed by humans.**
 
 > *Verbose is not a language that asks the compiler to be intelligent.*
