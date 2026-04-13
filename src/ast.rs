@@ -93,7 +93,7 @@ pub enum QuantifierKind {
     Any,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
     Number(i64),
     Text(String),

@@ -15,8 +15,54 @@ use std::collections::HashMap;
 use crate::ast::*;
 use crate::verifier::compute_range;
 
-/// Optimize all rules in a program. Non-destructive: returns a new program.
-pub fn optimize_program(program: &Program) -> Program {
+#[derive(Debug, Default)]
+pub struct OptStats {
+    pub nodes_before: usize,
+    pub nodes_after: usize,
+}
+
+impl std::fmt::Display for OptStats {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let eliminated = self.nodes_before.saturating_sub(self.nodes_after);
+        if eliminated == 0 {
+            write!(f, "  (no AST nodes eliminated)")
+        } else {
+            write!(
+                f,
+                "  {} AST node(s) eliminated ({} → {})",
+                eliminated, self.nodes_before, self.nodes_after
+            )
+        }
+    }
+}
+
+fn count_nodes(expr: &Expr) -> usize {
+    match expr {
+        Expr::Number(_) | Expr::Text(_) | Expr::Ident(_) => 1,
+        Expr::Field(base, _) => 1 + count_nodes(base),
+        Expr::Binary(_, l, r) => 1 + count_nodes(l) + count_nodes(r),
+        Expr::Not(i) | Expr::Neg(i) => 1 + count_nodes(i),
+        Expr::If(c, t, e) => 1 + count_nodes(c) + count_nodes(t) + count_nodes(e),
+        Expr::Call(_, args) => 1 + args.iter().map(count_nodes).sum::<usize>(),
+        Expr::Quantifier(_, c, _, p) => 1 + count_nodes(c) + count_nodes(p),
+    }
+}
+
+/// Optimize all rules in a program. Non-destructive: returns a new program + stats.
+pub fn optimize_program(program: &Program) -> (Program, OptStats) {
+    // Count nodes before optimization
+    let nodes_before: usize = program
+        .items
+        .iter()
+        .map(|i| match i {
+            Item::Rule(r) => {
+                let binding_nodes: usize = r.logic.bindings.iter().map(|(_, e)| count_nodes(e)).sum();
+                binding_nodes + count_nodes(&r.logic.value)
+            }
+            _ => 0,
+        })
+        .sum();
+
     let concepts: HashMap<&str, &Concept> = program
         .items
         .iter()
@@ -26,7 +72,7 @@ pub fn optimize_program(program: &Program) -> Program {
         })
         .collect();
 
-    Program {
+    let optimized = Program {
         version: program.version.clone(),
         uses: vec![],
         items: program
@@ -40,7 +86,27 @@ pub fn optimize_program(program: &Program) -> Program {
                 }
             })
             .collect(),
-    }
+    };
+    // Count nodes after optimization
+    let nodes_after: usize = optimized
+        .items
+        .iter()
+        .map(|i| match i {
+            Item::Rule(r) => {
+                let binding_nodes: usize = r.logic.bindings.iter().map(|(_, e)| count_nodes(e)).sum();
+                binding_nodes + count_nodes(&r.logic.value)
+            }
+            _ => 0,
+        })
+        .sum();
+
+    (
+        optimized,
+        OptStats {
+            nodes_before,
+            nodes_after,
+        },
+    )
 }
 
 fn concept_field_ranges<'a>(

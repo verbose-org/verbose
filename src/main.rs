@@ -85,7 +85,8 @@ fn main() {
     }
 
     // Optimize AST (platform-independent transformations)
-    let program = optimizer::optimize_program(&program);
+    let show_stats = args.iter().any(|a| a == "--stats");
+    let (program, opt_stats) = optimizer::optimize_program(&program);
 
     let n_concepts = program
         .items
@@ -101,6 +102,9 @@ fn main() {
         "verified: {} concept(s), {} rule(s); all proofs check out",
         n_concepts, n_rules
     );
+    if show_stats {
+        println!("optimizations:\n{}", opt_stats);
+    }
 
     let emit_rust = args.iter().any(|a| a == "--emit-rust");
     let compile_output = find_flag(&args, "--compile");
