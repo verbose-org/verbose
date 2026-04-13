@@ -333,7 +333,71 @@ fn emit_eval_expr(
             Ok(())
         }
         Expr::Binary(op, left, right) => {
-            // Evaluate left → rax, push, evaluate right → rax, pop left → rcx
+            // === Compile-time optimizations ===
+
+            // Constant folding: both operands are literals → compute at compile time
+            if let (Expr::Number(l), Expr::Number(r)) = (left.as_ref(), right.as_ref()) {
+                let result = match op {
+                    BinOp::Add => Some(l.wrapping_add(*r)),
+                    BinOp::Sub => Some(l.wrapping_sub(*r)),
+                    BinOp::Mul => Some(l.wrapping_mul(*r)),
+                    BinOp::Div if *r != 0 => Some(l.wrapping_div(*r)),
+                    _ => None,
+                };
+                if let Some(val) = result {
+                    emit_mov_rax_imm(code, val);
+                    return Ok(());
+                }
+            }
+
+            // Strength reduction: multiply by power of 2 → shift left
+            if *op == BinOp::Mul {
+                if let Expr::Number(n) = right.as_ref() {
+                    if *n > 0 && (*n as u64).is_power_of_two() {
+                        emit_eval_expr(code, left, input_name, offsets, all_rules, field_ranges)?;
+                        let shift = (*n as u64).trailing_zeros() as u8;
+                        code.extend_from_slice(&[0x48, 0xC1, 0xE0, shift]); // shl rax, shift
+                        return Ok(());
+                    }
+                }
+            }
+
+            // Strength reduction: divide by power of 2 → shift right (unsigned)
+            if *op == BinOp::Div {
+                if let Expr::Number(n) = right.as_ref() {
+                    if *n > 0 && (*n as u64).is_power_of_two() {
+                        emit_eval_expr(code, left, input_name, offsets, all_rules, field_ranges)?;
+                        let shift = (*n as u64).trailing_zeros() as u8;
+                        code.extend_from_slice(&[0x48, 0xC1, 0xE8, shift]); // shr rax, shift
+                        return Ok(());
+                    }
+                }
+            }
+
+            // Strength reduction: multiply by 0 → 0
+            if *op == BinOp::Mul {
+                if matches!(right.as_ref(), Expr::Number(0)) || matches!(left.as_ref(), Expr::Number(0)) {
+                    code.extend_from_slice(&[0x48, 0x31, 0xC0]); // xor rax, rax
+                    return Ok(());
+                }
+            }
+
+            // Strength reduction: multiply by 1 → identity
+            if *op == BinOp::Mul {
+                if matches!(right.as_ref(), Expr::Number(1)) {
+                    return emit_eval_expr(code, left, input_name, offsets, all_rules, field_ranges);
+                }
+                if matches!(left.as_ref(), Expr::Number(1)) {
+                    return emit_eval_expr(code, right, input_name, offsets, all_rules, field_ranges);
+                }
+            }
+
+            // Strength reduction: add/sub 0 → identity
+            if (*op == BinOp::Add || *op == BinOp::Sub) && matches!(right.as_ref(), Expr::Number(0)) {
+                return emit_eval_expr(code, left, input_name, offsets, all_rules, field_ranges);
+            }
+
+            // === General case: evaluate both sides, apply operator ===
             emit_eval_expr(code, left, input_name, offsets, all_rules, field_ranges)?;
             code.push(0x50); // push rax
             emit_eval_expr(code, right, input_name, offsets, all_rules, field_ranges)?;
