@@ -92,12 +92,12 @@ verify error [rule 'client_blocked' / purity.reads] declared reads do not match 
 
 | | |
 |---|---|
-| Lines of Rust | ~6000, zero external dependencies |
-| Tests | 59, all passing |
+| Lines of Rust | ~7200, zero external dependencies |
+| Tests | 84, all passing |
 | Native binary size | **407–676 bytes** for business logic, **498 bytes** for HTTP server |
 | Rust transpiler output | 441 KB for the same logic (832x larger) |
 | Proof checks | 8 zero-trust verifications against the AST |
-| Examples | 8 (invoices, business, clients, collections, pricing, deadcode, app+stdlib, HTTP demo) |
+| Examples | 10 (invoices, business, clients, collections, pricing, deadcode, showcase, reactions, app+stdlib, HTML demo) |
 
 ## Verbose vs gcc -O3
 
@@ -309,7 +309,12 @@ LLVM may become an optional backend for platforms where we don't have a native e
 
 ## Status
 
-**POC / R&D.** 40 commits, ~7000 lines, 72 tests, 0 dependencies, 4 backends. The language works, the compiler verifies proofs, three backends produce correct results. The concept is validated.
+**POC / R&D.** 50 commits, ~7200 lines, 84 tests, 0 dependencies, 4 backends.
+
+One command to see it all:
+```bash
+cargo run -- examples/invoices.verbose --benchmark --run important_invoice
+``` The language works, the compiler verifies proofs, three backends produce correct results. The concept is validated.
 
 ## License
 
