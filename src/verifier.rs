@@ -510,6 +510,14 @@ pub fn compute_range(
                     ];
                     Some((*products.iter().min()?, *products.iter().max()?))
                 }
+                BinOp::Mod => {
+                    if r_min <= 0 && r_max >= 0 {
+                        None
+                    } else {
+                        // x % d is in [0, d-1] for positive d, regardless of x
+                        Some((0, r_max.abs() - 1))
+                    }
+                }
                 BinOp::Div => {
                     if r_min <= 0 && r_max >= 0 {
                         None // divisor range includes zero — can't prove safe

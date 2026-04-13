@@ -230,6 +230,13 @@ fn eval_expr(
                         Ok(Value::Number(a / b))
                     }
                 }
+                (BinOp::Mod, Value::Number(a), Value::Number(b)) => {
+                    if *b == 0 {
+                        Err(RuntimeError { message: "modulo by zero".into() })
+                    } else {
+                        Ok(Value::Number(a % b))
+                    }
+                }
                 (BinOp::Gt, Value::Number(a), Value::Number(b)) => Ok(Value::Bool(a > b)),
                 (BinOp::Lt, Value::Number(a), Value::Number(b)) => Ok(Value::Bool(a < b)),
                 (BinOp::GtEq, Value::Number(a), Value::Number(b)) => Ok(Value::Bool(a >= b)),

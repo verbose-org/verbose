@@ -137,6 +137,7 @@ pub fn optimize_expr(
                     BinOp::Sub => Some(l.wrapping_sub(*r)),
                     BinOp::Mul => Some(l.wrapping_mul(*r)),
                     BinOp::Div if *r != 0 => Some(l / r),
+                    BinOp::Mod if *r != 0 => Some(l % r),
                     BinOp::Gt => return Expr::Number(if l > r { 1 } else { 0 }),
                     BinOp::Lt => return Expr::Number(if l < r { 1 } else { 0 }),
                     BinOp::GtEq => return Expr::Number(if l >= r { 1 } else { 0 }),

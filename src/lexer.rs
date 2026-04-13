@@ -26,6 +26,7 @@ pub enum TokenKind {
     Minus,
     Star,
     Slash,
+    Percent,
     DoubleColon,
 
     Indent,
@@ -67,6 +68,7 @@ impl fmt::Display for TokenKind {
             TokenKind::Minus => write!(f, "'-'"),
             TokenKind::Star => write!(f, "'*'"),
             TokenKind::Slash => write!(f, "'/'"),
+            TokenKind::Percent => write!(f, "'%'"),
             TokenKind::DoubleColon => write!(f, "'::'"),
             TokenKind::Indent => write!(f, "INDENT"),
             TokenKind::Dedent => write!(f, "DEDENT"),
@@ -430,6 +432,10 @@ impl<'a> Lexer<'a> {
             b'/' => {
                 self.advance();
                 TokenKind::Slash
+            }
+            b'%' => {
+                self.advance();
+                TokenKind::Percent
             }
             _ => {
                 return Err(LexError {

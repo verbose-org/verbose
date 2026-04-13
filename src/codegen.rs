@@ -147,6 +147,7 @@ fn emit_expr(expr: &Expr, input_name: &str, concept: Option<&Concept>) -> String
                 BinOp::Sub => "-",
                 BinOp::Mul => "*",
                 BinOp::Div => "/",
+                BinOp::Mod => "%",
                 BinOp::Eq => "==",
                 BinOp::NotEq => "!=",
                 BinOp::Gt => ">",

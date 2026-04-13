@@ -386,6 +386,7 @@ impl Parser {
             let op = match self.peek_kind() {
                 Some(TokenKind::Star) => Some(BinOp::Mul),
                 Some(TokenKind::Slash) => Some(BinOp::Div),
+                Some(TokenKind::Percent) => Some(BinOp::Mod),
                 _ => None,
             };
             if let Some(op) = op {

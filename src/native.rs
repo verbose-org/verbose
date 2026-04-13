@@ -470,11 +470,19 @@ fn emit_eval_expr(
                     code.extend_from_slice(&[0x48, 0x0F, 0xAF, 0xC1]); // imul rax, rcx
                 }
                 BinOp::Div => {
-                    // result = left / right = rcx / rax
+                    // result = left / right = rcx / rax → quotient in rax
                     code.extend_from_slice(&[0x49, 0x89, 0xC0]); // mov r8, rax (save right)
                     code.extend_from_slice(&[0x48, 0x89, 0xC8]); // mov rax, rcx (left → rax)
                     code.extend_from_slice(&[0x48, 0x99]); // cqo (sign-extend rax → rdx:rax)
                     code.extend_from_slice(&[0x49, 0xF7, 0xF8]); // idiv r8
+                }
+                BinOp::Mod => {
+                    // result = left % right = rcx % rax → remainder in rdx
+                    code.extend_from_slice(&[0x49, 0x89, 0xC0]); // mov r8, rax
+                    code.extend_from_slice(&[0x48, 0x89, 0xC8]); // mov rax, rcx
+                    code.extend_from_slice(&[0x48, 0x99]); // cqo
+                    code.extend_from_slice(&[0x49, 0xF7, 0xF8]); // idiv r8
+                    code.extend_from_slice(&[0x48, 0x89, 0xD0]); // mov rax, rdx (remainder → result)
                 }
                 BinOp::Eq => {
                     code.extend_from_slice(&[0x48, 0x39, 0xC1]); // cmp rcx, rax

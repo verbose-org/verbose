@@ -113,6 +113,7 @@ pub enum BinOp {
     Sub,
     Mul,
     Div,
+    Mod,
     Eq,
     NotEq,
     Gt,
