@@ -52,7 +52,9 @@ rule final_amount
     total : number
 
   logic:
-    total = i.amount + i.amount * i.tax_rate / 100 + i.amount * penalty_rate(i) / 100
+    let tax = i.amount * i.tax_rate / 100
+    let penalty = i.amount * penalty_rate(i) / 100
+    total = i.amount + tax + penalty
 
   proofs:
     purity:

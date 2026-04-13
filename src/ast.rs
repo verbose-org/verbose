@@ -81,6 +81,7 @@ pub struct OverflowHint {
 
 #[derive(Debug)]
 pub struct LogicStmt {
+    pub bindings: Vec<(String, Expr)>,
     pub target: String,
     pub value: Expr,
 }

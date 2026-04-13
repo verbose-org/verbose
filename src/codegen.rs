@@ -73,6 +73,13 @@ fn emit_rule_fn(out: &mut String, rule: &Rule, concept: Option<&Concept>) {
     }
 
     out.push_str(&format!(") -> {} {{\n", rust_type(&rule.output_ty)));
+    for (name, expr) in &rule.logic.bindings {
+        out.push_str(&format!(
+            "    let {} = {};\n",
+            name,
+            emit_expr(expr, &rule.input_name, concept)
+        ));
+    }
     out.push_str(&format!(
         "    {}\n",
         emit_expr(&rule.logic.value, &rule.input_name, concept)
@@ -308,6 +315,7 @@ mod tests {
                     output_name: "ok".into(),
                     output_ty: Type::Bool,
                     logic: LogicStmt {
+                        bindings: vec![],
                         target: "ok".into(),
                         value: Expr::Binary(
                             BinOp::Gt,

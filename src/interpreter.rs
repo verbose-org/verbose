@@ -181,6 +181,10 @@ pub fn eval_rule(
 ) -> Result<Value, RuntimeError> {
     let mut env: HashMap<String, Value> = HashMap::new();
     env.insert(rule.input_name.clone(), Value::Record(input.clone()));
+    for (name, expr) in &rule.logic.bindings {
+        let val = eval_expr(expr, &env, all_rules)?;
+        env.insert(name.clone(), val);
+    }
     eval_expr(&rule.logic.value, &env, all_rules)
 }
 
@@ -359,6 +363,7 @@ mod tests {
             output_name: "important".into(),
             output_ty: Type::Bool,
             logic: LogicStmt {
+                bindings: vec![],
                 target: "important".into(),
                 value: Expr::Binary(
                     BinOp::Gt,

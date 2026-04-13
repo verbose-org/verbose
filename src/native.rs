@@ -137,8 +137,9 @@ fn emit_full_program(
     code.push(0x55);
     // mov rbp, rsp
     code.extend_from_slice(&[0x48, 0x89, 0xE5]);
-    // sub rsp, nfields*8 (reserve field slots)
-    let frame_size = (nfields * 8) as i32;
+    // sub rsp, (nfields + n_bindings)*8 (reserve field + let binding slots)
+    let n_bindings = rule.logic.bindings.len();
+    let frame_size = ((nfields + n_bindings) * 8) as i32;
     code.extend_from_slice(&[0x48, 0x81, 0xEC]);
     code.extend_from_slice(&frame_size.to_le_bytes());
 
@@ -178,9 +179,28 @@ fn emit_full_program(
         code.extend_from_slice(&[0x49, 0xFF, 0xC6]);
     }
 
-    // Evaluate expression — result in rax
+    // Evaluate let bindings — each gets its own rbp slot
+    let mut offsets = offsets; // shadow with mutable version
+    let mut binding_offsets = offsets.clone();
+    let mut next_slot = -((nfields as i32 + 1) * 8);
+    for (name, expr) in &rule.logic.bindings {
+        let field_ranges = build_field_ranges(concept);
+        emit_eval_expr(&mut code, expr, &rule.input_name, &binding_offsets, all_rules, &field_ranges)?;
+        // Store result at next rbp slot
+        if next_slot >= -128 {
+            code.extend_from_slice(&[0x48, 0x89, 0x45]);
+            code.push(next_slot as u8);
+        } else {
+            code.extend_from_slice(&[0x48, 0x89, 0x85]);
+            code.extend_from_slice(&next_slot.to_le_bytes());
+        }
+        binding_offsets.insert(name.as_str(), next_slot);
+        next_slot -= 8;
+    }
+
+    // Evaluate final expression — result in rax
     let field_ranges = build_field_ranges(concept);
-    emit_eval_expr(&mut code, &rule.logic.value, &rule.input_name, &offsets, all_rules, &field_ranges)?;
+    emit_eval_expr(&mut code, &rule.logic.value, &rule.input_name, &binding_offsets, all_rules, &field_ranges)?;
 
     // Print result
     if is_bool {
@@ -537,9 +557,23 @@ fn emit_eval_expr(
         Expr::Ident(name) if name == input_name => Err(NativeError {
             message: "bare input binding not supported in expressions".into(),
         }),
-        Expr::Ident(_) => Err(NativeError {
-            message: "unresolved identifier in native codegen".into(),
-        }),
+        Expr::Ident(name) => {
+            // Let-bound variable — load from rbp-relative slot
+            if let Some(offset) = offsets.get(name.as_str()) {
+                if *offset >= -128 {
+                    code.extend_from_slice(&[0x48, 0x8B, 0x45]);
+                    code.push(*offset as u8);
+                } else {
+                    code.extend_from_slice(&[0x48, 0x8B, 0x85]);
+                    code.extend_from_slice(&offset.to_le_bytes());
+                }
+                Ok(())
+            } else {
+                Err(NativeError {
+                    message: format!("unresolved identifier '{}' in native codegen", name),
+                })
+            }
+        }
     }
 }
 

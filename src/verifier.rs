@@ -221,7 +221,15 @@ struct LogicFacts {
 
 fn collect_logic_facts(logic: &LogicStmt) -> LogicFacts {
     let mut facts = LogicFacts::default();
+    let binding_names: HashSet<String> = logic.bindings.iter().map(|(n, _)| n.clone()).collect();
+    for (_, expr) in &logic.bindings {
+        collect_expr_facts(expr, &mut facts.reads, &mut facts.calls);
+    }
     collect_expr_facts(&logic.value, &mut facts.reads, &mut facts.calls);
+    // Remove reads that reference let-bound names (they're local, not field reads)
+    facts.reads.retain(|path| {
+        path.first().map_or(true, |name| !binding_names.contains(name))
+    });
     facts
 }
 

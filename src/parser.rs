@@ -269,12 +269,30 @@ impl Parser {
         self.expect_kind(TokenKind::Colon)?;
         self.expect_kind(TokenKind::Newline)?;
         self.expect_kind(TokenKind::Indent)?;
+
+        let mut bindings = Vec::new();
+
+        // Parse optional let bindings
+        while self.check_ident("let") {
+            self.advance();
+            let name = self.expect_ident_any()?;
+            self.expect_kind(TokenKind::Equal)?;
+            let value = self.parse_expr()?;
+            self.expect_kind(TokenKind::Newline)?;
+            bindings.push((name, value));
+        }
+
+        // Parse final assignment: target = expr
         let target = self.expect_ident_any()?;
         self.expect_kind(TokenKind::Equal)?;
         let value = self.parse_expr()?;
         self.expect_kind(TokenKind::Newline)?;
         self.expect_kind(TokenKind::Dedent)?;
-        Ok(LogicStmt { target, value })
+        Ok(LogicStmt {
+            bindings,
+            target,
+            value,
+        })
     }
 
     /// Expression grammar with precedence (lowest to highest):
