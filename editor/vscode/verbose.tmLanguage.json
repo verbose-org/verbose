@@ -1,0 +1,60 @@
+{
+  "name": "Verbose IR",
+  "scopeName": "source.verbose",
+  "fileTypes": ["verbose"],
+  "patterns": [
+    { "include": "#comment" },
+    { "include": "#attribute" },
+    { "include": "#string" },
+    { "include": "#number" },
+    { "include": "#keyword" },
+    { "include": "#type" },
+    { "include": "#proof" },
+    { "include": "#hint" },
+    { "include": "#operator" },
+    { "include": "#builtin" }
+  ],
+  "repository": {
+    "comment": {
+      "match": "--.*$",
+      "name": "comment.line.verbose"
+    },
+    "attribute": {
+      "match": "@(verbose|intention|source)\\b",
+      "name": "entity.other.attribute-name.verbose"
+    },
+    "string": {
+      "begin": "\"",
+      "end": "\"",
+      "name": "string.quoted.double.verbose"
+    },
+    "number": {
+      "match": "\\b[0-9]+\\b",
+      "name": "constant.numeric.verbose"
+    },
+    "keyword": {
+      "match": "\\b(concept|rule|reaction|fields|input|output|logic|proofs|hints|effects|trigger|use|let|if|then|else|and|or|not)\\b",
+      "name": "keyword.control.verbose"
+    },
+    "type": {
+      "match": "\\b(number|bool|text|collection)\\b",
+      "name": "support.type.verbose"
+    },
+    "proof": {
+      "match": "\\b(purity|termination|determinism|reads|writes|calls|verdict|pure|impure|form|bound|constant_bound|total|conditional)\\b",
+      "name": "support.function.verbose"
+    },
+    "hint": {
+      "match": "\\b(vectorizable|parallel|cache_result|overflow)\\b",
+      "name": "variable.parameter.verbose"
+    },
+    "operator": {
+      "match": "(==|!=|>=|<=|=>|>|<|\\+|-|\\*|/|%|=)",
+      "name": "keyword.operator.verbose"
+    },
+    "builtin": {
+      "match": "\\b(all|any|fold|sum|count|min|max)\\b",
+      "name": "entity.name.function.verbose"
+    }
+  }
+}
