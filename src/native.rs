@@ -298,6 +298,11 @@ fn max_stack_depth(expr: &Expr) -> usize {
         Expr::Quantifier(_, coll, _, pred) => {
             max_stack_depth(coll).max(max_stack_depth(pred))
         }
+        Expr::Fold(coll, init, _, _, body) => {
+            max_stack_depth(coll)
+                .max(max_stack_depth(init))
+                .max(max_stack_depth(body))
+        }
     }
 }
 
@@ -688,8 +693,8 @@ fn emit_eval_expr(
             code.extend_from_slice(&[0x48, 0xF7, 0xD8]); // neg rax
             Ok(())
         }
-        Expr::Quantifier(_, _, _, _) => Err(NativeError {
-            message: "quantifiers (all/any) not supported in native backend (use --run interpreter)"
+        Expr::Fold(_, _, _, _, _) | Expr::Quantifier(_, _, _, _) => Err(NativeError {
+            message: "fold/quantifiers not supported in native backend (use --run interpreter)"
                 .into(),
         }),
         Expr::Ident(name) if name == input_name => Err(NativeError {

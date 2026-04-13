@@ -279,6 +279,21 @@ fn collect_expr_facts(
                 collect_expr_facts(arg, reads, calls);
             }
         }
+        Expr::Fold(collection, initial, acc_name, item_name, body) => {
+            collect_expr_facts(collection, reads, calls);
+            collect_expr_facts(initial, reads, calls);
+            let mut inner_reads = HashSet::new();
+            let mut inner_calls = HashSet::new();
+            collect_expr_facts(body, &mut inner_reads, &mut inner_calls);
+            calls.extend(inner_calls);
+            for path in inner_reads {
+                if path.first().map(|s| s.as_str()) != Some(acc_name.as_str())
+                    && path.first().map(|s| s.as_str()) != Some(item_name.as_str())
+                {
+                    reads.insert(path);
+                }
+            }
+        }
         Expr::Quantifier(_, collection, var_name, predicate) => {
             collect_expr_facts(collection, reads, calls);
             // Predicate reads are scoped to the lambda variable — filter them out
@@ -470,6 +485,7 @@ fn count_operations(expr: &Expr) -> usize {
         Expr::Binary(_, l, r) => 1 + count_operations(l) + count_operations(r),
         Expr::Call(_, args) => 1 + args.iter().map(count_operations).sum::<usize>(),
         Expr::Quantifier(_, coll, _, pred) => 1 + count_operations(coll) + count_operations(pred),
+        Expr::Fold(coll, init, _, _, body) => 1 + count_operations(coll) + count_operations(init) + count_operations(body),
     }
 }
 

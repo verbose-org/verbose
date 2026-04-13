@@ -341,6 +341,21 @@ fn eval_expr(
             };
             Ok(Value::Bool(result))
         }
+        Expr::Fold(collection, initial, acc_name, item_name, body) => {
+            let coll_val = eval_expr(collection, env, all_rules)?;
+            let items = match coll_val {
+                Value::List(items) => items,
+                _ => return Err(RuntimeError { message: "fold requires a collection".into() }),
+            };
+            let mut acc = eval_expr(initial, env, all_rules)?;
+            for item in &items {
+                let mut inner_env = env.clone();
+                inner_env.insert(acc_name.clone(), acc);
+                inner_env.insert(item_name.clone(), item.clone());
+                acc = eval_expr(body, &inner_env, all_rules)?;
+            }
+            Ok(acc)
+        }
         Expr::Call(name, args) => {
             let called = all_rules
                 .iter()

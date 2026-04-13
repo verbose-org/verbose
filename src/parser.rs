@@ -447,7 +447,26 @@ impl Parser {
             Ok(Expr::Number(n))
         } else if is_ident {
             let name = self.expect_ident_any()?;
-            if (name == "all" || name == "any") && self.check_kind(&TokenKind::LParen) {
+            if name == "fold" && self.check_kind(&TokenKind::LParen) {
+                self.advance(); // (
+                let collection = self.parse_expr()?;
+                self.expect_kind(TokenKind::Comma)?;
+                let initial = self.parse_expr()?;
+                self.expect_kind(TokenKind::Comma)?;
+                let acc = self.expect_ident_any()?;
+                self.expect_kind(TokenKind::Comma)?;
+                let item = self.expect_ident_any()?;
+                self.expect_kind(TokenKind::FatArrow)?;
+                let body = self.parse_expr()?;
+                self.expect_kind(TokenKind::RParen)?;
+                Ok(Expr::Fold(
+                    Box::new(collection),
+                    Box::new(initial),
+                    acc,
+                    item,
+                    Box::new(body),
+                ))
+            } else if (name == "all" || name == "any") && self.check_kind(&TokenKind::LParen) {
                 let kind = if name == "all" {
                     QuantifierKind::All
                 } else {

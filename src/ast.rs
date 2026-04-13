@@ -129,6 +129,9 @@ pub enum Expr {
     Not(Box<Expr>),
     Neg(Box<Expr>),
     Quantifier(QuantifierKind, Box<Expr>, String, Box<Expr>),
+    /// fold(collection, initial, acc_name, item_name => body)
+    /// Functional reduction: accumulates a value over a collection.
+    Fold(Box<Expr>, Box<Expr>, String, String, Box<Expr>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
