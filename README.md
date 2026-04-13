@@ -324,6 +324,19 @@ The compiler remains the final arbiter.
 cargo run -- examples/invoices.verbose --benchmark --run important_invoice
 ```
 
+## Learn How Machines Think
+
+Verbose is also a bridge between human intention and CPU instructions. Write a business rule, run `--disasm`, and see exactly what the processor does. No 800-page textbook needed.
+
+```text
+Your rule:        important = i.amount > 10000
+The CPU does:     cmp rax, 0x2710    (compare register to 10000)
+                  setg al            (store 1 if greater)
+                  syscall            (tell the kernel to print)
+```
+
+If you've never seen assembly before, you just learned three instructions. That's how every program on earth works — registers, comparisons, and syscalls. Verbose makes it visible.
+
 ## Origin
 
 This project started as an open question: *"If AI writes code now, do we still need languages designed for humans?"*
