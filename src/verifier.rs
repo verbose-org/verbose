@@ -669,4 +669,183 @@ rule important_invoice
             errs
         );
     }
+
+    #[test]
+    fn vectorizable_with_calls_rejected() {
+        let src = r#"@verbose 0.1.0
+concept T
+  @intention: "t"
+  @source: invoices.intent:1
+  fields:
+    x : number
+rule helper
+  @intention: "t"
+  @source: invoices.intent:1
+  input:
+    t : T
+  output:
+    r : bool
+  logic:
+    r = t.x > 0
+  proofs:
+    purity:
+      reads: [t.x]
+      writes: []
+      calls: []
+      verdict: pure
+    termination:
+      form: constant_bound
+      bound: 1
+    determinism:
+      form: total
+rule test_bad
+  @intention: "t"
+  @source: invoices.intent:1
+  input:
+    t : T
+  output:
+    r : bool
+  logic:
+    r = helper(t)
+  proofs:
+    purity:
+      reads: [t]
+      writes: []
+      calls: [helper]
+      verdict: pure
+    termination:
+      form: constant_bound
+      bound: 1
+    determinism:
+      form: total
+  hints:
+    vectorizable: yes
+"#;
+        let errs = verify_str(src);
+        assert!(
+            errs.iter().any(|e| e.context.contains("vectorizable")),
+            "got: {:#?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn overflow_hint_accepted_when_valid() {
+        let src = r#"@verbose 0.1.0
+concept T
+  @intention: "t"
+  @source: invoices.intent:1
+  fields:
+    x : number [0, 100]
+rule test
+  @intention: "t"
+  @source: invoices.intent:1
+  input:
+    t : T
+  output:
+    r : number
+  logic:
+    r = t.x + 10
+  proofs:
+    purity:
+      reads: [t.x]
+      writes: []
+      calls: []
+      verdict: pure
+    termination:
+      form: constant_bound
+      bound: 1
+    determinism:
+      form: total
+  hints:
+    overflow: [10, 110]
+"#;
+        let errs = verify_str(src);
+        assert!(errs.is_empty(), "expected no errors, got: {:#?}", errs);
+    }
+
+    #[test]
+    fn overflow_hint_rejected_when_too_tight() {
+        let src = r#"@verbose 0.1.0
+concept T
+  @intention: "t"
+  @source: invoices.intent:1
+  fields:
+    x : number [0, 100]
+rule test
+  @intention: "t"
+  @source: invoices.intent:1
+  input:
+    t : T
+  output:
+    r : number
+  logic:
+    r = t.x + 10
+  proofs:
+    purity:
+      reads: [t.x]
+      writes: []
+      calls: []
+      verdict: pure
+    termination:
+      form: constant_bound
+      bound: 1
+    determinism:
+      form: total
+  hints:
+    overflow: [10, 100]
+"#;
+        let errs = verify_str(src);
+        assert!(
+            errs.iter().any(|e| e.context.contains("overflow") && e.message.contains("exceeds")),
+            "got: {:#?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn calls_mismatch_detected() {
+        let bad = VALID.replace("calls   : []", "calls   : [nonexistent]");
+        let errs = verify_str(&bad);
+        assert!(
+            errs.iter().any(|e| e.message.contains("calls") || e.message.contains("nonexistent")),
+            "got: {:#?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn let_bindings_reads_correct() {
+        let src = r#"@verbose 0.1.0
+concept T
+  @intention: "t"
+  @source: invoices.intent:1
+  fields:
+    a : number
+    b : number
+rule test
+  @intention: "t"
+  @source: invoices.intent:1
+  input:
+    t : T
+  output:
+    r : number
+  logic:
+    let sum = t.a + t.b
+    r = sum * 2
+  proofs:
+    purity:
+      reads: [t.a, t.b]
+      writes: []
+      calls: []
+      verdict: pure
+    termination:
+      form: constant_bound
+      bound: 2
+    determinism:
+      form: total
+"#;
+        let errs = verify_str(src);
+        assert!(errs.is_empty(), "expected no errors, got: {:#?}", errs);
+    }
 }

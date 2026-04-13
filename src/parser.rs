@@ -983,4 +983,122 @@ rule important_invoice
             _ => panic!("expected rule"),
         }
     }
+
+    #[test]
+    fn if_then_else_parsed() {
+        let src = "@verbose 0.1.0\n\nconcept T\n  @intention: \"t\"\n  @source: f.intent:1\n  fields:\n    x : number\n\nrule test\n  @intention: \"t\"\n  @source: f.intent:1\n  input:\n    t : T\n  output:\n    r : number\n  logic:\n    r = if t.x > 10 then 1 else 0\n  proofs:\n    purity:\n      reads: [t.x]\n      writes: []\n      calls: []\n      verdict: pure\n    termination:\n      form: constant_bound\n      bound: 3\n    determinism:\n      form: total\n";
+        let p = parse(src).unwrap();
+        match &p.items[1] {
+            Item::Rule(r) => {
+                assert!(matches!(&r.logic.value, Expr::If(_, _, _)));
+            }
+            _ => panic!("expected rule"),
+        }
+    }
+
+    #[test]
+    fn let_bindings_parsed() {
+        let src = "@verbose 0.1.0\n\nconcept T\n  @intention: \"t\"\n  @source: f.intent:1\n  fields:\n    x : number\n\nrule test\n  @intention: \"t\"\n  @source: f.intent:1\n  input:\n    t : T\n  output:\n    r : number\n  logic:\n    let y = t.x * 2\n    r = y + 1\n  proofs:\n    purity:\n      reads: [t.x]\n      writes: []\n      calls: []\n      verdict: pure\n    termination:\n      form: constant_bound\n      bound: 2\n    determinism:\n      form: total\n";
+        let p = parse(src).unwrap();
+        match &p.items[1] {
+            Item::Rule(r) => {
+                assert_eq!(r.logic.bindings.len(), 1);
+                assert_eq!(r.logic.bindings[0].0, "y");
+                assert_eq!(r.logic.target, "r");
+            }
+            _ => panic!("expected rule"),
+        }
+    }
+
+    #[test]
+    fn field_ranges_parsed() {
+        let src = "@verbose 0.1.0\n\nconcept T\n  @intention: \"t\"\n  @source: f.intent:1\n  fields:\n    x : number [0, 100]\n    y : number [-50, 50]\n";
+        let p = parse(src).unwrap();
+        match &p.items[0] {
+            Item::Concept(c) => {
+                assert_eq!(c.fields[0].range, Some((0, 100)));
+                assert_eq!(c.fields[1].range, Some((-50, 50)));
+            }
+            _ => panic!("expected concept"),
+        }
+    }
+
+    #[test]
+    fn collection_type_parsed() {
+        let src = "@verbose 0.1.0\n\nconcept Item\n  @intention: \"t\"\n  @source: f.intent:1\n  fields:\n    x : number\n\nconcept Box\n  @intention: \"t\"\n  @source: f.intent:1\n  fields:\n    items : collection(Item)\n";
+        let p = parse(src).unwrap();
+        match &p.items[1] {
+            Item::Concept(c) => {
+                assert_eq!(c.fields[0].ty, Type::Collection("Item".into()));
+            }
+            _ => panic!("expected concept"),
+        }
+    }
+
+    #[test]
+    fn quantifier_parsed() {
+        let src = "@verbose 0.1.0\n\nconcept T\n  @intention: \"t\"\n  @source: f.intent:1\n  fields:\n    xs : collection(X)\n\nrule test\n  @intention: \"t\"\n  @source: f.intent:1\n  input:\n    t : T\n  output:\n    r : bool\n  logic:\n    r = all(t.xs, x => x > 0)\n  proofs:\n    purity:\n      reads: [t.xs]\n      writes: []\n      calls: []\n      verdict: pure\n    termination:\n      form: constant_bound\n      bound: 2\n    determinism:\n      form: total\n";
+        let p = parse(src).unwrap();
+        match &p.items[1] {
+            Item::Rule(r) => {
+                assert!(matches!(&r.logic.value, Expr::Quantifier(QuantifierKind::All, _, _, _)));
+            }
+            _ => panic!("expected rule"),
+        }
+    }
+
+    #[test]
+    fn hints_parsed() {
+        let src = "@verbose 0.1.0\n\nconcept T\n  @intention: \"t\"\n  @source: f.intent:1\n  fields:\n    x : number\n\nrule test\n  @intention: \"t\"\n  @source: f.intent:1\n  input:\n    t : T\n  output:\n    r : bool\n  logic:\n    r = t.x > 0\n  proofs:\n    purity:\n      reads: [t.x]\n      writes: []\n      calls: []\n      verdict: pure\n    termination:\n      form: constant_bound\n      bound: 1\n    determinism:\n      form: total\n  hints:\n    vectorizable: yes\n    parallel: no\n    overflow: [0, 1]\n";
+        let p = parse(src).unwrap();
+        match &p.items[1] {
+            Item::Rule(r) => {
+                let h = r.hints.as_ref().unwrap();
+                assert_eq!(h.vectorizable, Some(true));
+                assert_eq!(h.parallel, Some(false));
+                assert!(h.overflow.is_some());
+                let ov = h.overflow.as_ref().unwrap();
+                assert_eq!(ov.min, 0);
+                assert_eq!(ov.max, 1);
+            }
+            _ => panic!("expected rule"),
+        }
+    }
+
+    #[test]
+    fn precedence_correct() {
+        let src = "@verbose 0.1.0\n\nconcept T\n  @intention: \"t\"\n  @source: f.intent:1\n  fields:\n    a : number\n    b : number\n\nrule test\n  @intention: \"t\"\n  @source: f.intent:1\n  input:\n    t : T\n  output:\n    r : bool\n  logic:\n    r = t.a + 1 > t.b * 2 and t.a < 100\n  proofs:\n    purity:\n      reads: [t.a, t.b]\n      writes: []\n      calls: []\n      verdict: pure\n    termination:\n      form: constant_bound\n      bound: 5\n    determinism:\n      form: total\n";
+        let p = parse(src).unwrap();
+        match &p.items[1] {
+            Item::Rule(r) => {
+                // Should be: And(Gt(Add(a,1), Mul(b,2)), Lt(a, 100))
+                assert!(matches!(&r.logic.value, Expr::Binary(BinOp::And, _, _)));
+            }
+            _ => panic!("expected rule"),
+        }
+    }
+
+    #[test]
+    fn not_and_neg_parsed() {
+        let src = "@verbose 0.1.0\n\nconcept T\n  @intention: \"t\"\n  @source: f.intent:1\n  fields:\n    x : number\n\nrule test\n  @intention: \"t\"\n  @source: f.intent:1\n  input:\n    t : T\n  output:\n    r : bool\n  logic:\n    r = not (t.x > 0)\n  proofs:\n    purity:\n      reads: [t.x]\n      writes: []\n      calls: []\n      verdict: pure\n    termination:\n      form: constant_bound\n      bound: 2\n    determinism:\n      form: total\n";
+        let p = parse(src).unwrap();
+        match &p.items[1] {
+            Item::Rule(r) => {
+                assert!(matches!(&r.logic.value, Expr::Not(_)));
+            }
+            _ => panic!("expected rule"),
+        }
+    }
+
+    #[test]
+    fn string_comparison_parsed() {
+        let src = "@verbose 0.1.0\n\nconcept T\n  @intention: \"t\"\n  @source: f.intent:1\n  fields:\n    s : text\n\nrule test\n  @intention: \"t\"\n  @source: f.intent:1\n  input:\n    t : T\n  output:\n    r : bool\n  logic:\n    r = t.s == \"active\"\n  proofs:\n    purity:\n      reads: [t.s]\n      writes: []\n      calls: []\n      verdict: pure\n    termination:\n      form: constant_bound\n      bound: 1\n    determinism:\n      form: total\n";
+        let p = parse(src).unwrap();
+        match &p.items[1] {
+            Item::Rule(r) => {
+                assert!(matches!(&r.logic.value, Expr::Binary(BinOp::Eq, _, _)));
+            }
+            _ => panic!("expected rule"),
+        }
+    }
 }
