@@ -85,6 +85,14 @@ pub fn compile_native(
     } else {
         emit_full_program(rule, concept, &rules)?
     };
+
+    // Self-verification: validate emitted machine code (best-effort).
+    // The x86-64 decoder doesn't cover all instructions yet (itoa, complex addressing).
+    // Validation errors are warnings, not hard failures, until the decoder is complete.
+    if let Err(e) = crate::validate_x86::validate_code(&code) {
+        eprintln!("warning: x86-64 validation: {} (decoder incomplete, may be false positive)", e);
+    }
+
     let elf = build_elf(&code);
 
     let mut file = std::fs::File::create(output_path).map_err(|e| NativeError {

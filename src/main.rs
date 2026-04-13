@@ -10,6 +10,7 @@ mod lexer;
 mod native;
 mod optimizer;
 mod parser;
+mod validate_x86;
 mod verifier;
 
 fn main() {
