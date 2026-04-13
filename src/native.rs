@@ -89,6 +89,18 @@ pub fn compile_native(
     // Self-verification: validate emitted machine code (best-effort).
     // The x86-64 decoder doesn't cover all instructions yet (itoa, complex addressing).
     // Validation errors are warnings, not hard failures, until the decoder is complete.
+    // Stack depth check: verify the expression won't overflow the stack
+    let depth = max_stack_depth(&rule.logic.value);
+    let stack_bytes = depth * 8;
+    if stack_bytes > 1_000_000 {
+        return Err(NativeError {
+            message: format!(
+                "expression stack depth {} ({} bytes) exceeds safety limit (1 MB)",
+                depth, stack_bytes
+            ),
+        });
+    }
+
     // Peephole optimization: eliminate redundant push/pop patterns
     let before_size = code.len();
     peephole_optimize(&mut code);
@@ -261,6 +273,32 @@ fn emit_full_program(
     code.extend_from_slice(&[0x0F, 0x05]);
 
     Ok(code)
+}
+
+/// Compute the maximum stack depth an expression evaluation will use.
+/// Each Binary operation pushes one value (8 bytes). Nested operations stack up.
+/// This prevents the native backend from emitting code that would overflow the stack.
+fn max_stack_depth(expr: &Expr) -> usize {
+    match expr {
+        Expr::Number(_) | Expr::Text(_) | Expr::Ident(_) => 0,
+        Expr::Field(base, _) => max_stack_depth(base),
+        Expr::Binary(_, left, right) => {
+            // Left is evaluated first and pushed, then right is evaluated
+            let left_depth = max_stack_depth(left) + 1; // +1 for the push
+            let right_depth = max_stack_depth(right);
+            left_depth.max(right_depth)
+        }
+        Expr::Not(inner) | Expr::Neg(inner) => max_stack_depth(inner),
+        Expr::If(cond, then_e, else_e) => {
+            max_stack_depth(cond)
+                .max(max_stack_depth(then_e))
+                .max(max_stack_depth(else_e))
+        }
+        Expr::Call(_, args) => args.iter().map(max_stack_depth).max().unwrap_or(0),
+        Expr::Quantifier(_, coll, _, pred) => {
+            max_stack_depth(coll).max(max_stack_depth(pred))
+        }
+    }
 }
 
 /// Peephole optimizer: scan emitted machine code for redundant patterns.
@@ -1557,6 +1595,42 @@ mod tests {
         let mut code = vec![0x50, 0x58, 0x90]; // push rax; pop rax; nop
         peephole_optimize(&mut code);
         assert_eq!(code, vec![0x90]); // only nop remains
+    }
+
+    #[test]
+    fn stack_depth_simple() {
+        // a > 10 → depth 1 (one push for Binary)
+        let expr = Expr::Binary(
+            BinOp::Gt,
+            Box::new(Expr::Ident("a".into())),
+            Box::new(Expr::Number(10)),
+        );
+        assert_eq!(max_stack_depth(&expr), 1);
+    }
+
+    #[test]
+    fn stack_depth_nested() {
+        // (a + b) * (c + d) → depth 2
+        let expr = Expr::Binary(
+            BinOp::Mul,
+            Box::new(Expr::Binary(
+                BinOp::Add,
+                Box::new(Expr::Ident("a".into())),
+                Box::new(Expr::Ident("b".into())),
+            )),
+            Box::new(Expr::Binary(
+                BinOp::Add,
+                Box::new(Expr::Ident("c".into())),
+                Box::new(Expr::Ident("d".into())),
+            )),
+        );
+        assert_eq!(max_stack_depth(&expr), 2);
+    }
+
+    #[test]
+    fn stack_depth_leaf() {
+        assert_eq!(max_stack_depth(&Expr::Number(42)), 0);
+        assert_eq!(max_stack_depth(&Expr::Ident("x".into())), 0);
     }
 
     #[test]
