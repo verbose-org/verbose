@@ -1,4 +1,4 @@
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Program {
     pub version: Version,
     pub items: Vec<Item>,
@@ -11,13 +11,13 @@ pub struct Version {
     pub patch: u32,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Item {
     Concept(Concept),
     Rule(Rule),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Concept {
     pub name: String,
     pub intention: String,
@@ -25,7 +25,7 @@ pub struct Concept {
     pub fields: Vec<Field>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Field {
     pub name: String,
     pub ty: Type,
@@ -47,7 +47,7 @@ pub struct SourceRef {
     pub line: u32,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Rule {
     pub name: String,
     pub intention: String,
@@ -61,7 +61,7 @@ pub struct Rule {
     pub hints: Option<Hints>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Hints {
     pub vectorizable: Option<bool>,
     pub parallel: Option<bool>,
@@ -79,7 +79,7 @@ pub struct OverflowHint {
     pub max: i64,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LogicStmt {
     pub bindings: Vec<(String, Expr)>,
     pub target: String,
@@ -122,14 +122,14 @@ pub enum BinOp {
     Or,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Proofs {
     pub purity: Purity,
     pub termination: Termination,
     pub determinism: Determinism,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Purity {
     pub reads: Vec<Path>,
     pub writes: Vec<Path>,
@@ -149,7 +149,7 @@ pub enum PurityVerdict {
     Impure,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Termination {
     pub form: TerminationForm,
     pub bound: Option<i64>,
@@ -163,7 +163,7 @@ pub enum TerminationForm {
     Unproven,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Determinism {
     pub form: DeterminismForm,
 }

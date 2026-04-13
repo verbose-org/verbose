@@ -8,6 +8,7 @@ mod codegen;
 mod interpreter;
 mod lexer;
 mod native;
+mod optimizer;
 mod parser;
 mod verifier;
 
@@ -59,6 +60,9 @@ fn main() {
         eprintln!("verification failed: {} error(s)", errors.len());
         process::exit(1);
     }
+
+    // Optimize AST (platform-independent transformations)
+    let program = optimizer::optimize_program(&program);
 
     let n_concepts = program
         .items
