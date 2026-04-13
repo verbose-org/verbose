@@ -446,4 +446,187 @@ mod tests {
         assert_eq!(records[0]["amount"], Value::Number(100));
         assert_eq!(records[1]["amount"], Value::Number(200));
     }
+
+    #[test]
+    fn json_nested_arrays() {
+        let json = r#"[{"name": "A", "items": [{"x": 1}, {"x": 2}]}]"#;
+        let records = parse_json_array(json).unwrap();
+        assert_eq!(records.len(), 1);
+        assert!(matches!(&records[0]["items"], Value::List(v) if v.len() == 2));
+    }
+
+    #[test]
+    fn json_string_values() {
+        let json = r#"[{"status": "active", "count": 5}]"#;
+        let records = parse_json_array(json).unwrap();
+        assert_eq!(records[0]["status"], Value::Text("active".into()));
+        assert_eq!(records[0]["count"], Value::Number(5));
+    }
+
+    #[test]
+    fn arithmetic_operations() {
+        let rule = make_rule();
+        let mut input = HashMap::new();
+        input.insert("amount".into(), Value::Number(100));
+        // The rule tests > 10000, so with 100 it's false
+        assert_eq!(eval_rule(&rule, &[], &input).unwrap(), Value::Bool(false));
+    }
+
+    #[test]
+    fn division_by_zero_caught() {
+        use crate::ast::*;
+        let rule = Rule {
+            name: "div_test".into(),
+            intention: "t".into(),
+            source: SourceRef { file: "t.intent".into(), line: 1 },
+            input_name: "i".into(),
+            input_ty: Type::Named("T".into()),
+            output_name: "r".into(),
+            output_ty: Type::Number,
+            logic: LogicStmt {
+                bindings: vec![],
+                target: "r".into(),
+                value: Expr::Binary(
+                    BinOp::Div,
+                    Box::new(Expr::Field(Box::new(Expr::Ident("i".into())), "x".into())),
+                    Box::new(Expr::Number(0)),
+                ),
+            },
+            proofs: Proofs {
+                purity: Purity {
+                    reads: vec![Path { segments: vec!["i".into(), "x".into()] }],
+                    writes: vec![],
+                    calls: vec![],
+                    verdict: PurityVerdict::Pure,
+                },
+                termination: Termination { form: TerminationForm::ConstantBound, bound: Some(1) },
+                determinism: Determinism { form: DeterminismForm::Total },
+            },
+            hints: None,
+        };
+        let mut input = HashMap::new();
+        input.insert("x".into(), Value::Number(42));
+        assert!(eval_rule(&rule, &[], &input).is_err());
+    }
+
+    #[test]
+    fn modulo_operation() {
+        use crate::ast::*;
+        let rule = Rule {
+            name: "mod_test".into(),
+            intention: "t".into(),
+            source: SourceRef { file: "t.intent".into(), line: 1 },
+            input_name: "i".into(),
+            input_ty: Type::Named("T".into()),
+            output_name: "r".into(),
+            output_ty: Type::Number,
+            logic: LogicStmt {
+                bindings: vec![],
+                target: "r".into(),
+                value: Expr::Binary(
+                    BinOp::Mod,
+                    Box::new(Expr::Field(Box::new(Expr::Ident("i".into())), "x".into())),
+                    Box::new(Expr::Number(3)),
+                ),
+            },
+            proofs: Proofs {
+                purity: Purity {
+                    reads: vec![Path { segments: vec!["i".into(), "x".into()] }],
+                    writes: vec![],
+                    calls: vec![],
+                    verdict: PurityVerdict::Pure,
+                },
+                termination: Termination { form: TerminationForm::ConstantBound, bound: Some(1) },
+                determinism: Determinism { form: DeterminismForm::Total },
+            },
+            hints: None,
+        };
+        let mut input = HashMap::new();
+        input.insert("x".into(), Value::Number(10));
+        assert_eq!(eval_rule(&rule, &[], &input).unwrap(), Value::Number(1)); // 10 % 3 = 1
+    }
+
+    #[test]
+    fn if_else_evaluation() {
+        use crate::ast::*;
+        let rule = Rule {
+            name: "if_test".into(),
+            intention: "t".into(),
+            source: SourceRef { file: "t.intent".into(), line: 1 },
+            input_name: "i".into(),
+            input_ty: Type::Named("T".into()),
+            output_name: "r".into(),
+            output_ty: Type::Number,
+            logic: LogicStmt {
+                bindings: vec![],
+                target: "r".into(),
+                value: Expr::If(
+                    Box::new(Expr::Binary(
+                        BinOp::Gt,
+                        Box::new(Expr::Field(Box::new(Expr::Ident("i".into())), "x".into())),
+                        Box::new(Expr::Number(10)),
+                    )),
+                    Box::new(Expr::Number(1)),
+                    Box::new(Expr::Number(0)),
+                ),
+            },
+            proofs: Proofs {
+                purity: Purity {
+                    reads: vec![Path { segments: vec!["i".into(), "x".into()] }],
+                    writes: vec![],
+                    calls: vec![],
+                    verdict: PurityVerdict::Pure,
+                },
+                termination: Termination { form: TerminationForm::ConstantBound, bound: Some(3) },
+                determinism: Determinism { form: DeterminismForm::Total },
+            },
+            hints: None,
+        };
+        let mut input = HashMap::new();
+        input.insert("x".into(), Value::Number(15));
+        assert_eq!(eval_rule(&rule, &[], &input).unwrap(), Value::Number(1));
+
+        input.insert("x".into(), Value::Number(5));
+        assert_eq!(eval_rule(&rule, &[], &input).unwrap(), Value::Number(0));
+    }
+
+    #[test]
+    fn string_equality() {
+        use crate::ast::*;
+        let rule = Rule {
+            name: "str_test".into(),
+            intention: "t".into(),
+            source: SourceRef { file: "t.intent".into(), line: 1 },
+            input_name: "i".into(),
+            input_ty: Type::Named("T".into()),
+            output_name: "r".into(),
+            output_ty: Type::Bool,
+            logic: LogicStmt {
+                bindings: vec![],
+                target: "r".into(),
+                value: Expr::Binary(
+                    BinOp::Eq,
+                    Box::new(Expr::Field(Box::new(Expr::Ident("i".into())), "s".into())),
+                    Box::new(Expr::Text("active".into())),
+                ),
+            },
+            proofs: Proofs {
+                purity: Purity {
+                    reads: vec![Path { segments: vec!["i".into(), "s".into()] }],
+                    writes: vec![],
+                    calls: vec![],
+                    verdict: PurityVerdict::Pure,
+                },
+                termination: Termination { form: TerminationForm::ConstantBound, bound: Some(1) },
+                determinism: Determinism { form: DeterminismForm::Total },
+            },
+            hints: None,
+        };
+        let mut input = HashMap::new();
+        input.insert("s".into(), Value::Text("active".into()));
+        assert_eq!(eval_rule(&rule, &[], &input).unwrap(), Value::Bool(true));
+
+        input.insert("s".into(), Value::Text("blocked".into()));
+        assert_eq!(eval_rule(&rule, &[], &input).unwrap(), Value::Bool(false));
+    }
 }
