@@ -1,0 +1,204 @@
+@verbose 0.1.0
+
+-- ╔══════════════════════════════════════════════════════════════╗
+-- ║  SHOWCASE: every Verbose feature in one business scenario   ║
+-- ╚══════════════════════════════════════════════════════════════╝
+--
+-- Features demonstrated:
+--   Types:        number [ranges], bool, text, collection(Type)
+--   Expressions:  arithmetic (+ - * / %), comparisons, equality, and/or/not
+--   Control:      if/then/else (nested), parentheses
+--   Composition:  rule calls (3 levels deep), let bindings
+--   Collections:  all() and any() with lambda predicates
+--   Proofs:       purity, termination, determinism
+--   Hints:        overflow bounds, vectorizable
+
+
+concept Employee
+  @intention: "An employee has a name, a department, a salary, and years of experience"
+  @source: showcase.intent:1
+
+  fields:
+    name       : text
+    department : text
+    salary     : number [20000, 200000]
+    experience : number [0, 45]
+
+
+concept Company
+  @intention: "A company has a name and a list of employees"
+  @source: showcase.intent:2
+
+  fields:
+    name      : text
+    employees : collection(Employee)
+
+
+-- Rule 1: nested if/then/else + field ranges + overflow hint
+rule bonus_rate
+  @intention: "The bonus rate is: 15 if experience above 10, 10 if above 5, otherwise 5"
+  @source: showcase.intent:3
+
+  input:
+    e : Employee
+
+  output:
+    rate : number
+
+  logic:
+    rate = if e.experience > 10 then 15 else if e.experience > 5 then 10 else 5
+
+  proofs:
+    purity:
+      reads   : [e.experience]
+      writes  : []
+      calls   : []
+      verdict : pure
+    termination:
+      form  : constant_bound
+      bound : 5
+    determinism:
+      form : total
+
+  hints:
+    vectorizable : yes
+    overflow     : [5, 15]
+
+
+-- Rule 2: arithmetic + let binding + rule composition + magic division
+rule bonus_amount
+  @intention: "The bonus amount is the salary times the bonus rate divided by 100"
+  @source: showcase.intent:4
+
+  input:
+    e : Employee
+
+  output:
+    bonus : number
+
+  logic:
+    let rate = bonus_rate(e)
+    bonus = e.salary * rate / 100
+
+  proofs:
+    purity:
+      reads   : [e, e.salary]
+      writes  : []
+      calls   : [bonus_rate]
+      verdict : pure
+    termination:
+      form  : constant_bound
+      bound : 3
+    determinism:
+      form : total
+
+
+-- Rule 3: simple comparison + vectorizable hint
+rule is_senior
+  @intention: "An employee is senior when they have more than 10 years of experience"
+  @source: showcase.intent:5
+
+  input:
+    e : Employee
+
+  output:
+    senior : bool
+
+  logic:
+    senior = e.experience > 10
+
+  proofs:
+    purity:
+      reads   : [e.experience]
+      writes  : []
+      calls   : []
+      verdict : pure
+    termination:
+      form  : constant_bound
+      bound : 1
+    determinism:
+      form : total
+
+  hints:
+    vectorizable : yes
+
+
+-- Rule 4: composed rule + string equality + boolean logic (and)
+rule eligible_for_promotion
+  @intention: "An employee is eligible for promotion when they are senior and in the engineering department"
+  @source: showcase.intent:6
+
+  input:
+    e : Employee
+
+  output:
+    eligible : bool
+
+  logic:
+    eligible = is_senior(e) and e.department == "engineering"
+
+  proofs:
+    purity:
+      reads   : [e, e.department]
+      writes  : []
+      calls   : [is_senior]
+      verdict : pure
+    termination:
+      form  : constant_bound
+      bound : 3
+    determinism:
+      form : total
+
+
+-- Rule 5: collection quantifier (any) + lambda + rule call inside lambda
+rule has_senior_talent
+  @intention: "A company has senior talent when any of its employees are senior"
+  @source: showcase.intent:7
+
+  input:
+    c : Company
+
+  output:
+    has_talent : bool
+
+  logic:
+    has_talent = any(c.employees, emp => is_senior(emp))
+
+  proofs:
+    purity:
+      reads   : [c.employees]
+      writes  : []
+      calls   : [is_senior]
+      verdict : pure
+    termination:
+      form  : constant_bound
+      bound : 2
+    determinism:
+      form : total
+
+
+-- Rule 6: collection quantifier (all) — different semantics than any
+rule fully_senior
+  @intention: "A company is fully senior when all of its employees are senior"
+  @source: showcase.intent:8
+
+  input:
+    c : Company
+
+  output:
+    all_senior : bool
+
+  logic:
+    all_senior = all(c.employees, emp => is_senior(emp))
+
+  proofs:
+    purity:
+      reads   : [c.employees]
+      writes  : []
+      calls   : [is_senior]
+      verdict : pure
+    termination:
+      form  : constant_bound
+      bound : 2
+    determinism:
+      form : total

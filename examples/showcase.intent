@@ -1,0 +1,8 @@
+1. An employee has a name, a department, a salary, and years of experience.
+2. A company has a name and a list of employees.
+3. The bonus rate is: 15 if experience above 10, 10 if above 5, otherwise 5.
+4. The bonus amount is the salary times the bonus rate divided by 100.
+5. An employee is senior when they have more than 10 years of experience.
+6. An employee is eligible for promotion when they are senior and in the engineering department.
+7. A company has senior talent when any of its employees are senior.
+8. A company is fully senior when all of its employees are senior.

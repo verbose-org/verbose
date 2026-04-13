@@ -1,0 +1,25 @@
+[
+  {
+    "name": "Acme Corp",
+    "employees": [
+      {"name": "Alice",   "department": "engineering", "salary": 85000,  "experience": 12},
+      {"name": "Bob",     "department": "sales",       "salary": 60000,  "experience": 3},
+      {"name": "Charlie", "department": "engineering", "salary": 95000,  "experience": 8},
+      {"name": "Diana",   "department": "engineering", "salary": 120000, "experience": 15}
+    ]
+  },
+  {
+    "name": "StartupCo",
+    "employees": [
+      {"name": "Eve",     "department": "engineering", "salary": 70000,  "experience": 2},
+      {"name": "Frank",   "department": "marketing",   "salary": 55000,  "experience": 1}
+    ]
+  },
+  {
+    "name": "VeteranLtd",
+    "employees": [
+      {"name": "Grace",   "department": "engineering", "salary": 150000, "experience": 20},
+      {"name": "Hank",    "department": "management",  "salary": 130000, "experience": 18}
+    ]
+  }
+]
