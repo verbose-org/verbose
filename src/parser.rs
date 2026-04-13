@@ -447,7 +447,46 @@ impl Parser {
             Ok(Expr::Number(n))
         } else if is_ident {
             let name = self.expect_ident_any()?;
-            if name == "fold" && self.check_kind(&TokenKind::LParen) {
+            if (name == "sum" || name == "count") && self.check_kind(&TokenKind::LParen) {
+                // Sugar: sum(coll, var => expr) → fold(coll, 0, __acc, var => __acc + expr)
+                //        count(coll, var => pred) → fold(coll, 0, __acc, var => __acc + if pred then 1 else 0)
+                self.advance(); // (
+                let collection = self.parse_expr()?;
+                self.expect_kind(TokenKind::Comma)?;
+                let var = self.expect_ident_any()?;
+                self.expect_kind(TokenKind::FatArrow)?;
+                let body = self.parse_expr()?;
+                self.expect_kind(TokenKind::RParen)?;
+
+                let acc = "__acc".to_string();
+                let fold_body = if name == "sum" {
+                    // __acc + expr
+                    Expr::Binary(
+                        BinOp::Add,
+                        Box::new(Expr::Ident(acc.clone())),
+                        Box::new(body),
+                    )
+                } else {
+                    // __acc + if pred then 1 else 0
+                    Expr::Binary(
+                        BinOp::Add,
+                        Box::new(Expr::Ident(acc.clone())),
+                        Box::new(Expr::If(
+                            Box::new(body),
+                            Box::new(Expr::Number(1)),
+                            Box::new(Expr::Number(0)),
+                        )),
+                    )
+                };
+
+                Ok(Expr::Fold(
+                    Box::new(collection),
+                    Box::new(Expr::Number(0)),
+                    acc,
+                    var,
+                    Box::new(fold_body),
+                ))
+            } else if name == "fold" && self.check_kind(&TokenKind::LParen) {
                 self.advance(); // (
                 let collection = self.parse_expr()?;
                 self.expect_kind(TokenKind::Comma)?;
