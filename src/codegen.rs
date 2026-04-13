@@ -358,4 +358,44 @@ mod tests {
         assert!(rust.contains("fn main()"));
         assert!(rust.contains("parse_json_array"));
     }
+
+    #[test]
+    fn emit_if_else() {
+        let expr = Expr::If(
+            Box::new(Expr::Binary(
+                BinOp::Gt,
+                Box::new(Expr::Field(Box::new(Expr::Ident("i".into())), "x".into())),
+                Box::new(Expr::Number(10)),
+            )),
+            Box::new(Expr::Number(1)),
+            Box::new(Expr::Number(0)),
+        );
+        let result = emit_expr(&expr, "i", None);
+        assert!(result.contains("if"), "got: {}", result);
+        assert!(result.contains("else"), "got: {}", result);
+    }
+
+    #[test]
+    fn emit_not() {
+        let expr = Expr::Not(Box::new(Expr::Ident("x".into())));
+        let result = emit_expr(&expr, "i", None);
+        assert_eq!(result, "!x");
+    }
+
+    #[test]
+    fn emit_call() {
+        let fields = vec![
+            Field { name: "a".into(), ty: Type::Number, range: None },
+            Field { name: "b".into(), ty: Type::Number, range: None },
+        ];
+        let concept = Concept {
+            name: "T".into(),
+            intention: "t".into(),
+            source: SourceRef { file: "t".into(), line: 1 },
+            fields,
+        };
+        let expr = Expr::Call("other_rule".into(), vec![Expr::Ident("i".into())]);
+        let result = emit_expr(&expr, "i", Some(&concept));
+        assert_eq!(result, "other_rule(a, b)");
+    }
 }

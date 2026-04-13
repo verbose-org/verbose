@@ -302,4 +302,92 @@ mod tests {
         // 10000 = 0x2710 → LEB128: 0x90 0xCE 0x00
         assert_eq!(buf, vec![0x90, 0xCE, 0x00]);
     }
+
+    #[test]
+    fn wasm_module_has_valid_header() {
+        use crate::lexer::Lexer;
+        use crate::parser::Parser;
+        let src = r#"@verbose 0.1.0
+concept T
+  @intention: "t"
+  @source: invoices.intent:1
+  fields:
+    x : number
+rule test_rule
+  @intention: "t"
+  @source: invoices.intent:1
+  input:
+    t : T
+  output:
+    r : bool
+  logic:
+    r = t.x > 10
+  proofs:
+    purity:
+      reads: [t.x]
+      writes: []
+      calls: []
+      verdict: pure
+    termination:
+      form: constant_bound
+      bound: 1
+    determinism:
+      form: total
+"#;
+        let tokens = Lexer::new(src).tokenize().unwrap();
+        let program = Parser::new(tokens).parse_program().unwrap();
+        let path = "/tmp/test_wasm_header.wasm";
+        compile_wasm(&program, "test_rule", path).unwrap();
+        let bytes = std::fs::read(path).unwrap();
+        std::fs::remove_file(path).ok();
+        // WASM magic: \0asm
+        assert_eq!(&bytes[0..4], b"\0asm");
+        // Version 1
+        assert_eq!(&bytes[4..8], &[1, 0, 0, 0]);
+        // Module should be small (< 200 bytes)
+        assert!(bytes.len() < 200, "module too large: {} bytes", bytes.len());
+    }
+
+    #[test]
+    fn wasm_arithmetic_module() {
+        use crate::lexer::Lexer;
+        use crate::parser::Parser;
+        let src = r#"@verbose 0.1.0
+concept T
+  @intention: "t"
+  @source: invoices.intent:1
+  fields:
+    a : number
+    b : number
+rule add_them
+  @intention: "t"
+  @source: invoices.intent:1
+  input:
+    t : T
+  output:
+    r : number
+  logic:
+    r = t.a + t.b * 2
+  proofs:
+    purity:
+      reads: [t.a, t.b]
+      writes: []
+      calls: []
+      verdict: pure
+    termination:
+      form: constant_bound
+      bound: 2
+    determinism:
+      form: total
+"#;
+        let tokens = Lexer::new(src).tokenize().unwrap();
+        let program = Parser::new(tokens).parse_program().unwrap();
+        let path = "/tmp/test_wasm_arith.wasm";
+        compile_wasm(&program, "add_them", path).unwrap();
+        let bytes = std::fs::read(path).unwrap();
+        std::fs::remove_file(path).ok();
+        assert_eq!(&bytes[0..4], b"\0asm");
+        // Should export "add_them"
+        assert!(bytes.windows(8).any(|w| w == b"add_them"));
+    }
 }
