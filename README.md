@@ -228,6 +228,26 @@ If a declaration serves neither verification nor optimization, it doesn't belong
 | Native x86-64 | `--native output --run rule` | ELF binary, zero dependencies (~400-700 bytes) |
 | WebAssembly | `--wasm output.wasm --run rule` | WASM module for browsers (~60 bytes) |
 
+## Inspect the Machine Code
+
+No black box. The `--disasm` flag shows the exact x86-64 assembly the compiler produces:
+
+```bash
+$ verbosec examples/invoices.verbose --disasm --run important_invoice
+```
+
+```asm
+cmp    rax, 0x2710        ; compare amount to 10000
+setg   al                 ; al = 1 if greater
+test   al, al             ; check boolean result
+je     0x213              ; if false → print "false\n"
+mov    rdx, 0x5           ; length of "true\n"
+mov    rax, 0x1           ; sys_write
+syscall                   ; write to stdout
+```
+
+Every instruction traces back to a Verbose expression. The compiler's work is fully auditable — not just the proofs, but the machine code itself. Trust nothing, inspect everything.
+
 ## Getting Started
 
 ```bash
