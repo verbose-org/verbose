@@ -27,7 +27,7 @@ rule total_revenue
   output:
     revenue : number
   logic:
-    revenue = fold(c.invoices, 0, acc, inv => acc + inv.amount)
+    revenue = sum(c.invoices, inv => inv.amount)
   proofs:
     purity:
       reads   : [c.invoices]
@@ -49,7 +49,7 @@ rule overdue_count
   output:
     count : number
   logic:
-    count = fold(c.invoices, 0, acc, inv => acc + if inv.days_overdue > 30 then 1 else 0)
+    count = count(c.invoices, inv => inv.days_overdue > 30)
   proofs:
     purity:
       reads   : [c.invoices]
@@ -71,7 +71,7 @@ rule overdue_amount
   output:
     amount : number
   logic:
-    amount = fold(c.invoices, 0, acc, inv => acc + if inv.days_overdue > 30 then inv.amount else 0)
+    amount = fold(c.invoices, 0, acc, inv => if inv.days_overdue > 30 then acc + inv.amount else acc)
   proofs:
     purity:
       reads   : [c.invoices]
