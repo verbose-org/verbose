@@ -1,0 +1,48 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Run tests
+        run: cargo test
+
+      - name: Package binary
+        run: |
+          cp target/release/verbosec verbosec-linux-x86_64
+          chmod +x verbosec-linux-x86_64
+          tar czf verbosec-linux-x86_64.tar.gz verbosec-linux-x86_64
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            verbosec-linux-x86_64.tar.gz
+          body: |
+            ## Verbose ${{ github.ref_name }}
+
+            Download `verbosec-linux-x86_64.tar.gz`, extract, and run:
+
+            ```bash
+            tar xzf verbosec-linux-x86_64.tar.gz
+            ./verbosec-linux-x86_64 --version
+            ```
+
+            No Rust installation needed. Zero dependencies.
+
+            See [README](https://github.com/verbose-org/verbose#getting-started) for usage.
