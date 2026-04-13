@@ -33,6 +33,9 @@ src/
   interpreter.rs   Expression evaluator on JSON data
   codegen.rs       Rust source code generation (transpiler backend)
   native.rs        Direct x86-64 machine code generation (native backend)
+  wasm.rs          WebAssembly module generation (browser backend)
+  optimizer.rs     Platform-independent AST optimizations
+  validate_x86.rs  Self-verification of emitted machine code
   main.rs          CLI entry point
 
 examples/
@@ -40,17 +43,37 @@ examples/
   business.*       Arithmetic + rule composition (4 rules, 3 fields)
   clients.*        Text type + string comparison
   collections.*    Nested data with all/any quantifiers
+  pricing.*        Nested if/else + let bindings
+  deadcode.*       Dead branch elimination demo
+  showcase.*       ALL features in one scenario (6 rules)
+  report.*         Business report with fold/sum/count (4 rules)
+  reactions.*      Basic reaction (print on trigger)
+  alerts.*         Dynamic reactions with interpolated values
+  app.* + stdlib/  Module system demo (use + import)
+  demo.html        Browser demo (WASM)
+
+tools/
+  generate.sh      Intent -> Verbose via Claude API
+  benchmark.sh     Reproducible comparison vs gcc
 ```
 
 ## Language Features (current)
 
 - Types: `number`, `bool`, `text`, `collection(Type)`, named types
-- Expressions: arithmetic (+, -, *, /), comparisons (>, <, >=, <=, ==, !=), boolean (and, or)
+- Field ranges: `amount : number [0, 1000000]`
+- Expressions: arithmetic (+, -, *, /, %), comparisons (>, <, >=, <=, ==, !=), boolean (and, or, not)
+- Control flow: `if condition then expr else expr` (nestable)
+- Let bindings: `let tax = amount * rate / 100` (CSE)
 - Rule calls: `important_invoice(i)` — rules can compose
 - Quantifiers: `all(collection, var => predicate)`, `any(...)`
+- Aggregation: `sum(coll, var => expr)`, `count(coll, var => pred)`, `min(...)`, `max(...)`
+- General reduction: `fold(collection, initial, acc, var => body)`
 - Proofs: purity (reads/writes/calls/verdict), termination (form/bound), determinism (form)
+- Hints: `vectorizable`, `parallel`, `cache_result`, `overflow: [min, max]`
 - Traceability: `@intention` (string), `@source` (file:line)
-- Three backends: interpreter (--run), Rust transpiler (--compile), native x86-64 (--native)
+- Modules: `use "stdlib/finance.verbose"`
+- Reactions: declared side effects with trigger rules and dynamic print
+- Three backends: interpreter (--run), Rust transpiler (--compile), native x86-64 (--native), WASM (--wasm)
 
 ## Separation of Concerns
 
@@ -83,15 +106,22 @@ LLVM may become an OPTIONAL fallback backend for platforms without a native emit
 - **Closed attributes** — unknown `@attributes` are rejected, not silently ignored.
 - **No false explicitation** — every declaration must be mechanically verified or exploited. If it's just decoration, remove it.
 - **The native backend is the destination** — the Rust transpiler is a fallback. Architectural decisions should keep the native path open.
+- **Every feature must serve security, performance, or unique machine code.** No ergonomic sugar without optimization value.
+- **All documentation in English.** The repo is international.
 
 ## Running
 
 ```bash
 cargo run -- examples/collections.verbose                                           # verify
 cargo run -- examples/collections.verbose --run client_blocked --input examples/collections.json  # interpret
+cargo run -- examples/report.verbose --run total_revenue --input examples/report.json --json  # JSON output
 cargo run -- examples/business.verbose --compile /tmp/business                      # transpile to Rust
 cargo run -- examples/business.verbose --native /tmp/biz --run critical_invoice     # native x86-64
-cargo test                                                                          # 37 tests
+cargo run -- examples/invoices.verbose --wasm /tmp/rule.wasm --run important_invoice # WASM
+cargo run -- examples/invoices.verbose --benchmark --run important_invoice          # compare all backends
+cargo run -- --demo-http /tmp/server                                                 # HTTP server demo
+cargo test                                                                          # 84 tests
+make demo                                                                           # full demo
 ```
 
 ## License
