@@ -325,7 +325,29 @@ fn main() {
             process::exit(1);
         }
         println!("compiled: {} -> {}", path, output);
-    } else if let (Some(rule_name), Some(json_path)) = (run_rule, input_path) {
+    } else if let (Some(rule_name), json_path) = (run_rule, input_path) {
+        // Support --stdin as alternative to --input file
+        let stdin_mode = args.iter().any(|a| a == "--stdin");
+        let json_path = if stdin_mode {
+            use std::io::Read;
+            let mut buf = String::new();
+            std::io::stdin().read_to_string(&mut buf).unwrap_or_else(|e| {
+                eprintln!("cannot read stdin: {}", e);
+                process::exit(1);
+            });
+            let tmp = "/tmp/verbose_stdin.json";
+            fs::write(tmp, &buf).unwrap();
+            Some(tmp.to_string())
+        } else {
+            json_path
+        };
+        let json_path = match json_path {
+            Some(p) => p,
+            None => {
+                eprintln!("--run requires --input <file> or --stdin");
+                process::exit(2);
+            }
+        };
         let all_rules: Vec<&ast::Rule> = program
             .items
             .iter()
