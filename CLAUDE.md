@@ -120,7 +120,8 @@ LLVM may become an OPTIONAL fallback backend for platforms without a native emit
 
 Security is pillar #1. Each feature is judged by what attack surface it adds, not by whether it is "useful". Under that frame, the compiler exposes two execution modes — not one primary and one fallback, but **two modes with deliberately different surfaces**:
 
-- **Native / WASM (small, auditable surface)**: machine code emitted directly. No libc, no allocator, no tagged values held across non-local control flow, no dynamic dispatch. Grows phase by phase as new constructs land, each extension reviewed against this list. Binaries stay small (500 B–2 KB) and auditable line by line.
+- **Native (small, auditable surface, actively growing)**: x86-64 machine code emitted directly. No libc, no allocator, no tagged values held across non-local control flow, no dynamic dispatch. Grows phase by phase as new constructs land, each extension reviewed against this list. Binaries stay small (500 B–2 KB) and auditable line by line. As of this writing the native path covers scalar rules, reactions with `append_file`, `Result(number|text, text)`, record outputs, text-typed input fields, and `match_result` in the pass-through shape (see the phase table below).
+- **WASM (small, scalar-only)**: same principles as native but has not been grown alongside the recent native phases. WASM today handles scalar rules only (Phase 0). Bringing WASM up to parity is mechanical — the AST supports the constructs, the emitter just hasn't been written. This asymmetry is known and deliberate: the security-sensitive target is the native ELF, and WASM's growth follows native once we have a stable convention to mirror.
 - **Interpreter (rich surface)**: the full language — collections, `map`/`filter`/`fold`, all `Result` / `Record` / `match_result` compositions, `@layer`. Runs in a Rust binary that parses JSON and evaluates expressions. Wider surface than native (JSON parser, allocator) but **every expression is still verified by the same compiler** against the same proofs.
 
 Both modes verify the same AST with the same proofs. A rule accepted by the compiler is safe under both modes; only the execution profile differs. Native's trustworthiness comes from careful accumulation — adding a construct is a deliberate commit, never a drive-by "it's missing". Forcing native to grow to "completeness" (full heap, tagged unions, etc.) would add a C-sized attack surface and defeat the point. When native rejects an expression today, the answer is either "add a phase for it under the evolution rules below" or "run it in the interpreter" — never "silently upgrade native to handle it".
@@ -166,13 +167,25 @@ Emitters that span multiple syscalls or phases share a register layout. Adding a
 | `r10` | concat buffer base for later length calculation | Phase 1B |
 | `rbx` | concat write pointer (advances as args are written) | Phase 1B |
 
+Dedicated rbp-relative slots:
+
+| Slot | Used by | Introduced |
+|---|---|---|
+| field slots (`rbp - 8*(i+1)`) | input concept fields — Number via atoi, Text stores argv pointer | Phase 0 / Phase 2E |
+| let-binding slots (`rbp - 8*(nfields + k + 1)`) | `let` bindings evaluated in source order | Phase 0 |
+| `match_slot` at the bottom of the frame | `match_result`'s inlined-callee Ok-value binding (reserved unconditionally in `emit_result_program`) | Phase 2D |
+
 Registers *not* in this table (`r8`, `r9`, `r11`, `rcx`, `rdx`, `rsi`, `rdi`, `rax`) are ephemeral — emitters may clobber them freely within a single expression. Note that Linux syscalls clobber `rax`/`rcx`/`r11`; any state that must survive a syscall belongs in `r10` or `r12`–`r15`.
 
 ### Continuation-passing emission for branching results
 
-When a rule produces a discriminated output (today `Result`, tomorrow `match_result`), each leaf is emitted as a tail-call: it writes its own output and `jmp`s back to the iteration top. **No intermediate tagged value materializes in registers or memory.**
+When a rule produces a discriminated output, each leaf is emitted as a tail-call: it writes its own output and `jmp`s back to the iteration top. **No intermediate tagged value materializes in registers or memory.** The pattern is now used in three emitters:
 
-Why chose this over the standard "materialize tag + payload, dispatch at a common exit":
+- `emit_eval_result_expr` — `Result(T, E)` outputs. Each Ok/Err leaf streams to stdout/stderr and jumps.
+- `emit_eval_record_expr` — record outputs. Each Record leaf serializes to JSON and jumps.
+- `emit_redirect_callee_leaves` — `match_result` inlining. The inlined callee's Ok/Err leaves are redirected: Ok values bind to `match_slot` and invoke the outer Ok arm's recursion (itself tail-terminating); Err values write directly to stderr.
+
+Why this over the standard "materialize tag + payload, dispatch at a common exit":
 
 1. **Lifetime simplicity.** Any leaf that allocates temporaries (e.g. a concat buffer for an Err message) keeps its allocation local to the leaf. No tracking of "does this exit path need to free a concat buffer?" across the dispatch.
 2. **No calling-convention ambiguity.** `Ok(number)` and `Ok(text)` would need different payload registers; the leaf knows its declared shape and emits the right write directly.
@@ -180,7 +193,7 @@ Why chose this over the standard "materialize tag + payload, dispatch at a commo
 
 Cost: each leaf carries ~30 bytes of trailing write + `jmp loop_top`. For rules with <10 leaves (the overwhelming majority), this is negligible vs. the machinery a tagged-dispatch approach would need.
 
-This choice will be revisited when `match_result` in expression position lands — that construct genuinely requires consuming a tagged value, so some form of tag+payload convention becomes unavoidable for *consumers*. But *producers* (rule outputs) will remain continuation-passing as long as the native binary's role is "print results per record, then exit".
+The choice is *producer-side*: every emitter above is for a rule that PRODUCES the discriminated value. Phase 2D's `match_result` is a *consumer* in the outer rule, but it too avoids a tagged calling convention — instead it inlines the called rule and redirects ITS leaves to the outer match arms. That works because both producer and consumer are compiled together; it would stop working across separately-compiled units. When/if Verbose gains separately-compiled modules with Result-valued exports, a real tag+payload convention becomes unavoidable for consumers. Until then, inlining-plus-continuation-passing is both simpler and smaller.
 
 ### Stream semantics for Result-output native rules
 
