@@ -1,0 +1,4 @@
+1. An employee has a name and a salary.
+2. A workforce is a collection of employees.
+3. A bonus is a name with a bonus amount.
+4. For each employee in the workforce, compute a bonus: same name, 10% of salary.

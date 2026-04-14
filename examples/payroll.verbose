@@ -1,0 +1,58 @@
+@verbose 0.1.0
+
+-- Phase 3: a rule that returns a collection compiles to a native binary.
+-- The binary reads N employees from argv (count-prefixed), runs the map
+-- body per element, emits one JSON object per employee to stdout.
+-- No heap, no arena, no intermediate collection materialized.
+
+
+concept Employee
+  @intention: "An employee has a name and a salary"
+  @source: payroll.intent:1
+
+  fields:
+    name   : text
+    salary : number [0, 1000000]
+
+
+concept Workforce
+  @intention: "A workforce is a collection of employees"
+  @source: payroll.intent:2
+
+  fields:
+    employees : collection(Employee)
+
+
+concept Bonus
+  @intention: "A bonus is a name with a bonus amount"
+  @source: payroll.intent:3
+
+  fields:
+    name  : text
+    bonus : number
+
+
+rule compute_bonuses
+  @intention: "For each employee, produce a Bonus with name and 10% salary"
+  @source: payroll.intent:4
+
+  input:
+    w : Workforce
+
+  output:
+    r : collection(Bonus)
+
+  logic:
+    r = map(w.employees, e => Bonus { name: e.name, bonus: e.salary * 10 / 100 })
+
+  proofs:
+    purity:
+      reads   : [w.employees]
+      writes  : []
+      calls   : []
+      verdict : pure
+    termination:
+      form  : constant_bound
+      bound : 5
+    determinism:
+      form : total

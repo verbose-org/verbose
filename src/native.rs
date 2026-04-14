@@ -106,6 +106,7 @@ pub fn compile_native(
         .map_or(false, |h| h.parallel.is_some());
 
     let is_result_output = matches!(&rule.output_ty, Type::Result(_, _));
+    let is_collection_output = matches!(&rule.output_ty, Type::Collection(_));
 
     // Record output: rule.output_ty is Named(concept_name) and the name
     // resolves to a concept declared in the program. Routes to
@@ -123,6 +124,10 @@ pub fn compile_native(
         // self-terminates (continuation-passing), no tagged value lives in
         // registers across the top-level dispatch.
         emit_result_program(rule, concept, &rules)?
+    } else if is_collection_output {
+        // Phase 3: rules returning collection(T). map/filter over an input
+        // collection field, emit one JSON line per produced element.
+        emit_collection_program(rule, concept, &concepts, &rules)?
     } else if let Some(rec_concept) = record_output_concept {
         // Record-output rules: each leaf emits a JSON object to stdout + \n.
         // Same continuation-passing convention as Result.
@@ -545,7 +550,7 @@ fn emit_itoa_to_buffer(code: &mut Vec<u8>) {
 fn emit_concat_to_buffer(
     code: &mut Vec<u8>,
     args: &[Expr],
-    rule: &Rule,
+    input_name: &str,
     concept: &Concept,
     all_rules: &HashMap<&str, &Rule>,
     offsets: &HashMap<&str, i32>,
@@ -555,7 +560,7 @@ fn emit_concat_to_buffer(
     let mut kinds: Vec<ConcatArgKind> = Vec::with_capacity(args.len());
     let mut total: i32 = 0;
     for arg in args {
-        let kind = classify_concat_arg(arg, concept, &rule.input_name).ok_or_else(|| {
+        let kind = classify_concat_arg(arg, concept, input_name).ok_or_else(|| {
             NativeError {
                 message: "concat argument type not yet supported in native (text + number scalars only for now; bool and others stay interpreter-only)".into(),
             }
@@ -636,7 +641,7 @@ fn emit_concat_to_buffer(
             ConcatArgKind::Number => {
                 // push rbx — save write pointer (emit_eval_expr may clobber it via Binary op push/pop)
                 code.push(0x53);
-                emit_eval_expr(code, arg, &rule.input_name, offsets, all_rules, field_ranges)?;
+                emit_eval_expr(code, arg, input_name, offsets, all_rules, field_ranges)?;
                 // pop rbx
                 code.push(0x5B);
                 // itoa into buffer (rax → decimal digits at [rbx], rbx advanced)
@@ -727,7 +732,7 @@ fn emit_append_file_call(
             // (rax=buf_ptr, rdx=len) to the fd. After the syscall, free the
             // buffer with add rsp, buf_size.
             let buf_size = emit_concat_to_buffer(
-                code, args, rule, concept, all_rules, offsets, field_ranges,
+                code, args, &rule.input_name, concept, all_rules, offsets, field_ranges,
             )?;
             // At this point: rax = buf ptr, rdx = length, fd still in r15.
             // mov rsi, rax — write syscall wants source in rsi
@@ -969,7 +974,7 @@ fn emit_text_write_to_fd(
     code: &mut Vec<u8>,
     text_expr: &Expr,
     fd: i32,
-    rule: &Rule,
+    input_name: &str,
     concept: &Concept,
     all_rules: &HashMap<&str, &Rule>,
     offsets: &HashMap<&str, i32>,
@@ -979,7 +984,7 @@ fn emit_text_write_to_fd(
     // is in the rbp slot (stored at field-loading time). Length is recovered
     // via emit_strlen — argv strings are NUL-terminated so this is exact.
     if let Expr::Field(base, field_name) = text_expr {
-        if matches!(base.as_ref(), Expr::Ident(n) if n == &rule.input_name) {
+        if matches!(base.as_ref(), Expr::Ident(n) if n == input_name) {
             let f = concept
                 .fields
                 .iter()
@@ -1040,7 +1045,7 @@ fn emit_text_write_to_fd(
         }
         Expr::Concat(args) => {
             let buf_size = emit_concat_to_buffer(
-                code, args, rule, concept, all_rules, offsets, field_ranges,
+                code, args, input_name, concept, all_rules, offsets, field_ranges,
             )?;
             // rax = buf ptr, rdx = length.
             // mov rsi, rax
@@ -1193,7 +1198,7 @@ fn emit_eval_result_expr(
                     // Text Ok: write the bytes (literal or concat buffer) to
                     // stdout (fd 1), then append a newline symmetric to itoa.
                     emit_text_write_to_fd(
-                        code, inner, 1, rule, concept, all_rules, offsets, field_ranges,
+                        code, inner, 1, &rule.input_name, concept, all_rules, offsets, field_ranges,
                     )?;
                     emit_write_newline(code, 1);
                 }
@@ -1216,7 +1221,7 @@ fn emit_eval_result_expr(
             // Err is always text in the shapes we accept. Write to stderr
             // (fd 2), then a newline so multi-record runs separate cleanly.
             emit_text_write_to_fd(
-                code, inner, 2, rule, concept, all_rules, offsets, field_ranges,
+                code, inner, 2, &rule.input_name, concept, all_rules, offsets, field_ranges,
             )?;
             emit_write_newline(code, 2);
             // jmp loop_top
@@ -1446,7 +1451,7 @@ fn emit_redirect_callee_leaves(
             // Pass-through to outer Err: write the inner text directly to
             // stderr, append newline, jmp loop_top. No binding needed.
             emit_text_write_to_fd(
-                code, inner, 2, outer_rule, concept, all_rules, offsets, field_ranges,
+                code, inner, 2, &outer_rule.input_name, concept, all_rules, offsets, field_ranges,
             )?;
             emit_write_newline(code, 2);
             // jmp loop_top
@@ -1542,6 +1547,303 @@ fn emit_record_program(
     Ok(code)
 }
 
+/// Emit a standalone binary for a rule whose output is `collection(T)` (Phase 3).
+///
+/// Scope locked in CLAUDE.md "Phase 3 design": streaming emission (one JSON
+/// object per element, no wrapper), count-prefixed argv (`<N> <element × N>`
+/// trailing any scalar input fields), `map` or `filter` at the top of the
+/// logic, output element is a declared Record with number/text fields.
+///
+/// Memory: no arena, no heap. Each element parses its fields into reused
+/// rbp slots, evaluates the map body (or filter predicate + body), writes
+/// one line, moves to the next. The only state crossing iterations is the
+/// argv index (r14) and the inner loop counter (r15).
+fn emit_collection_program(
+    rule: &Rule,
+    input_concept: &Concept,
+    all_concepts: &[&Concept],
+    all_rules: &HashMap<&str, &Rule>,
+) -> Result<Vec<u8>, NativeError> {
+    // ===== Scope validation =====
+    let elem_type_name = match &rule.output_ty {
+        Type::Collection(n) => n.clone(),
+        _ => return Err(NativeError {
+            message: "emit_collection_program called on non-collection output".into(),
+        }),
+    };
+
+    // Output element: Phase 3 v1 supports Record elements only.
+    let output_elem_concept = all_concepts
+        .iter()
+        .find(|c| c.name == elem_type_name)
+        .copied()
+        .ok_or_else(|| NativeError {
+            message: format!(
+                "collection element type '{}' must be a declared concept \
+                 (scalar collection elements come in Phase 3.1)",
+                elem_type_name
+            ),
+        })?;
+    for f in &output_elem_concept.fields {
+        if !matches!(f.ty, Type::Number | Type::Text) {
+            return Err(NativeError {
+                message: format!(
+                    "collection element field '{}' has unsupported type (only number/text today)",
+                    f.name
+                ),
+            });
+        }
+    }
+
+    // Input concept shape: scalars* + one trailing collection field.
+    let mut scalar_fields: Vec<&Field> = Vec::new();
+    let mut coll_field: Option<&Field> = None;
+    let mut elem_field_concept_name: Option<String> = None;
+    for (i, f) in input_concept.fields.iter().enumerate() {
+        let is_last = i == input_concept.fields.len() - 1;
+        match (&f.ty, is_last) {
+            (Type::Number, false) | (Type::Text, false) => scalar_fields.push(f),
+            (Type::Collection(elem), true) => {
+                coll_field = Some(f);
+                elem_field_concept_name = Some(elem.clone());
+            }
+            _ => {
+                return Err(NativeError {
+                    message: format!(
+                        "input concept '{}' must have scalar fields followed by ONE trailing collection field; \
+                         field '{}' at position {} violates this",
+                        input_concept.name, f.name, i
+                    ),
+                });
+            }
+        }
+    }
+    let coll_field = coll_field.ok_or_else(|| NativeError {
+        message: format!(
+            "input concept '{}' must have a trailing collection field",
+            input_concept.name
+        ),
+    })?;
+    let elem_field_concept_name = elem_field_concept_name.unwrap();
+    let input_elem_concept = all_concepts
+        .iter()
+        .find(|c| c.name == elem_field_concept_name)
+        .copied()
+        .ok_or_else(|| NativeError {
+            message: format!(
+                "unknown concept '{}' for input collection element",
+                elem_field_concept_name
+            ),
+        })?;
+    for f in &input_elem_concept.fields {
+        if !matches!(f.ty, Type::Number | Type::Text) {
+            return Err(NativeError {
+                message: format!(
+                    "input collection element field '{}' has unsupported type (only number/text today)",
+                    f.name
+                ),
+            });
+        }
+    }
+
+    // Logic shape: Map or Filter on input.<coll_field>.
+    let (is_filter, lambda_var, body) = match &rule.logic.value {
+        Expr::Map(c, v, b) => (false, v.as_str(), b.as_ref()),
+        Expr::Filter(c, _v, _b) => {
+            let _ = c;
+            return Err(NativeError {
+                message: "filter in native collection output is deferred to Phase 3.1 — starting with map only".into(),
+            });
+            // (unreachable — leaving the destructure for future reference)
+            #[allow(unreachable_code)]
+            (true, "", &rule.logic.value)
+        }
+        _ => return Err(NativeError {
+            message: "collection-output rule logic must be map(...) at top level (filter comes in 3.1)".into(),
+        }),
+    };
+    let _ = is_filter;
+    // Verify map target is `input.<coll_field>`.
+    let coll_expr = match &rule.logic.value {
+        Expr::Map(c, _, _) => c.as_ref(),
+        _ => unreachable!(),
+    };
+    match coll_expr {
+        Expr::Field(base, name)
+            if matches!(base.as_ref(), Expr::Ident(n) if n == &rule.input_name)
+                && name == &coll_field.name => {}
+        _ => {
+            return Err(NativeError {
+                message: format!(
+                    "map target must be `{}.{}`",
+                    rule.input_name, coll_field.name
+                ),
+            });
+        }
+    }
+
+    // Body must be a Record constructor of the output element type.
+    let (body_concept_name, body_fields) = match body {
+        Expr::Record(name, fields) => (name.as_str(), fields.as_slice()),
+        _ => {
+            return Err(NativeError {
+                message: "map body must be a Record constructor in Phase 3 v1".into(),
+            });
+        }
+    };
+    if body_concept_name != output_elem_concept.name.as_str() {
+        return Err(NativeError {
+            message: format!(
+                "map body produces '{}' but output collection element is '{}'",
+                body_concept_name, output_elem_concept.name
+            ),
+        });
+    }
+
+    // ===== Emission =====
+    let n_scalar = scalar_fields.len();
+    let n_elem_fields = input_elem_concept.fields.len();
+    let frame_slots = n_scalar + n_elem_fields;
+    let frame_size = (frame_slots as i32) * 8;
+
+    let mut code = Vec::new();
+
+    // _start — argv/rbp frame setup.
+    code.extend_from_slice(&[0x4C, 0x8B, 0x24, 0x24]); // mov r12, [rsp]
+    code.extend_from_slice(&[0x4C, 0x8D, 0x6C, 0x24, 0x08]); // lea r13, [rsp+8]
+    code.push(0x55); // push rbp
+    code.extend_from_slice(&[0x48, 0x89, 0xE5]); // mov rbp, rsp
+    code.extend_from_slice(&[0x48, 0x81, 0xEC]);
+    code.extend_from_slice(&frame_size.to_le_bytes());
+    code.extend_from_slice(&[0x49, 0xC7, 0xC6, 0x01, 0x00, 0x00, 0x00]); // mov r14, 1
+
+    // Outer loop: each iteration processes one input record (scalars + count + elements).
+    let outer_loop_top = code.len();
+    code.extend_from_slice(&[0x4D, 0x39, 0xE6]); // cmp r14, r12
+    code.push(0x0F);
+    code.push(0x8D);
+    let exit_patch = code.len();
+    code.extend_from_slice(&[0, 0, 0, 0]);
+
+    // Offsets: scalar fields go at -8, -16, ...; element fields go after them.
+    let mut scalar_offsets: HashMap<&str, i32> = HashMap::new();
+    for (i, f) in scalar_fields.iter().enumerate() {
+        scalar_offsets.insert(f.name.as_str(), -((i as i32 + 1) * 8));
+    }
+    let mut elem_offsets: HashMap<&str, i32> = HashMap::new();
+    for (i, f) in input_elem_concept.fields.iter().enumerate() {
+        elem_offsets.insert(f.name.as_str(), -(((n_scalar + i) as i32 + 1) * 8));
+    }
+
+    // Parse scalar input fields.
+    for f in &scalar_fields {
+        let offset = scalar_offsets[f.name.as_str()];
+        code.extend_from_slice(&[0x4B, 0x8B, 0x7C, 0xF5, 0x00]); // mov rdi, [r13+r14*8]
+        match f.ty {
+            Type::Number => {
+                emit_atoi_inline(&mut code);
+                store_rax_at_rbp(&mut code, offset);
+            }
+            Type::Text => store_rdi_at_rbp(&mut code, offset),
+            _ => unreachable!(),
+        }
+        code.extend_from_slice(&[0x49, 0xFF, 0xC6]); // inc r14
+    }
+
+    // Parse collection count into r15.
+    code.extend_from_slice(&[0x4B, 0x8B, 0x7C, 0xF5, 0x00]); // mov rdi, [r13+r14*8]
+    emit_atoi_inline(&mut code);
+    code.extend_from_slice(&[0x49, 0x89, 0xC7]); // mov r15, rax
+    code.extend_from_slice(&[0x49, 0xFF, 0xC6]); // inc r14
+
+    // Inner loop: for each element, parse its fields, emit one JSON line.
+    let inner_loop_top = code.len();
+    // test r15, r15 ; jz inner_done (rel32)
+    code.extend_from_slice(&[0x4D, 0x85, 0xFF]);
+    code.push(0x0F);
+    code.push(0x84);
+    let inner_done_patch = code.len();
+    code.extend_from_slice(&[0, 0, 0, 0]);
+
+    // Parse element fields into rbp slots (reused each iteration).
+    for f in &input_elem_concept.fields {
+        let offset = elem_offsets[f.name.as_str()];
+        code.extend_from_slice(&[0x4B, 0x8B, 0x7C, 0xF5, 0x00]); // mov rdi, [r13+r14*8]
+        match f.ty {
+            Type::Number => {
+                emit_atoi_inline(&mut code);
+                store_rax_at_rbp(&mut code, offset);
+            }
+            Type::Text => store_rdi_at_rbp(&mut code, offset),
+            _ => unreachable!(),
+        }
+        code.extend_from_slice(&[0x49, 0xFF, 0xC6]); // inc r14
+    }
+
+    // Evaluate the map body: emit the Record as JSON + newline.
+    // Lambda var is the "input name" for field resolution (e.g. e.name → offsets[name]).
+    let field_ranges = build_field_ranges(input_elem_concept);
+    emit_record_as_json(
+        &mut code,
+        body_fields,
+        output_elem_concept,
+        lambda_var,
+        input_elem_concept,
+        all_rules,
+        &elem_offsets,
+        &field_ranges,
+    )?;
+    // emit_record_as_json emits the trailing "}\n" itself — no extra newline here.
+
+    // dec r15 ; jmp inner_loop_top (rel32).
+    code.extend_from_slice(&[0x49, 0xFF, 0xCF]); // dec r15
+    code.push(0xE9);
+    let back_off = inner_loop_top as i32 - (code.len() + 4) as i32;
+    code.extend_from_slice(&back_off.to_le_bytes());
+
+    // inner_done:
+    let inner_done_pos = code.len();
+    let inner_done_off = inner_done_pos as i32 - (inner_done_patch as i32 + 4);
+    code[inner_done_patch..inner_done_patch + 4].copy_from_slice(&inner_done_off.to_le_bytes());
+
+    // jmp outer_loop_top (rel32).
+    code.push(0xE9);
+    let outer_off = outer_loop_top as i32 - (code.len() + 4) as i32;
+    code.extend_from_slice(&outer_off.to_le_bytes());
+
+    // exit: sys_exit(0)
+    let exit_pos = code.len();
+    let exit_off = exit_pos as i32 - (exit_patch as i32 + 4);
+    code[exit_patch..exit_patch + 4].copy_from_slice(&exit_off.to_le_bytes());
+    code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x3C, 0x00, 0x00, 0x00]); // mov rax, 60
+    code.extend_from_slice(&[0x48, 0x31, 0xFF]); // xor rdi, rdi
+    code.extend_from_slice(&[0x0F, 0x05]); // syscall
+
+    Ok(code)
+}
+
+/// Emit `mov [rbp+offset], rax` with short/long encoding depending on offset.
+fn store_rax_at_rbp(code: &mut Vec<u8>, offset: i32) {
+    if offset >= -128 {
+        code.extend_from_slice(&[0x48, 0x89, 0x45]);
+        code.push(offset as u8);
+    } else {
+        code.extend_from_slice(&[0x48, 0x89, 0x85]);
+        code.extend_from_slice(&offset.to_le_bytes());
+    }
+}
+
+/// Emit `mov [rbp+offset], rdi` — used to stash an argv pointer for a text field.
+fn store_rdi_at_rbp(code: &mut Vec<u8>, offset: i32) {
+    if offset >= -128 {
+        code.extend_from_slice(&[0x48, 0x89, 0x7D]);
+        code.push(offset as u8);
+    } else {
+        code.extend_from_slice(&[0x48, 0x89, 0xBD]);
+        code.extend_from_slice(&offset.to_le_bytes());
+    }
+}
+
 /// Walk an expression in record context. Each leaf is a Record constructor
 /// that emits its own JSON line + jmp loop_top. Structural If/else branches
 /// recurse; each arm plants its own terminator.
@@ -1574,7 +1876,7 @@ fn emit_eval_record_expr(
                 code,
                 fields,
                 output_concept,
-                rule,
+                &rule.input_name,
                 input_concept,
                 all_rules,
                 offsets,
@@ -1625,8 +1927,8 @@ fn emit_record_as_json(
     code: &mut Vec<u8>,
     fields: &[(String, Expr)],
     output_concept: &Concept,
-    rule: &Rule,
-    _input_concept: &Concept,
+    input_name: &str,
+    input_concept: &Concept,
     all_rules: &HashMap<&str, &Rule>,
     offsets: &HashMap<&str, i32>,
     field_ranges: &HashMap<&str, (i64, i64)>,
@@ -1654,7 +1956,7 @@ fn emit_record_as_json(
         match decl.ty {
             Type::Number => {
                 // Evaluate → rax, write digits to stdout, no newline.
-                emit_eval_expr(code, value_expr, &rule.input_name, offsets, all_rules, field_ranges)?;
+                emit_eval_expr(code, value_expr, input_name, offsets, all_rules, field_ranges)?;
                 emit_itoa_to_stdout_no_newline(code);
             }
             Type::Text => {
@@ -1663,8 +1965,8 @@ fn emit_record_as_json(
                     code,
                     value_expr,
                     1,
-                    rule,
-                    _input_concept,
+                    input_name,
+                    input_concept,
                     all_rules,
                     offsets,
                     field_ranges,
@@ -3071,6 +3373,26 @@ mod tests {
             .expect("native compile of discounted_purchase should succeed");
         let size = fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
         assert!(size > 500 && size < 2_500, "unexpected binary size: {}", size);
+        let _ = fs::remove_file(out);
+    }
+
+    #[test]
+    fn native_compiles_collection_output_rule() {
+        // payroll.verbose's compute_bonuses returns collection(Bonus).
+        // Phase 3 v1: map over a collection input field, streaming JSON Lines
+        // output. Each element parses its fields, evaluates the map body,
+        // emits one JSON object per line. No arena, no heap.
+        use std::fs;
+        let src = fs::read_to_string("examples/payroll.verbose")
+            .expect("examples/payroll.verbose is expected to exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let out = std::env::temp_dir().join("verbosec_test_payroll");
+        compile_native(&program, "compute_bonuses", out.to_str().unwrap())
+            .expect("native compile of collection-output rule should succeed");
+        let size = fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
+        assert!(size > 400 && size < 2_500, "unexpected binary size: {}", size);
         let _ = fs::remove_file(out);
     }
 
