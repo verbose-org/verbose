@@ -12,6 +12,18 @@
 /// If any instruction doesn't decode properly, it reports the byte offset and the
 /// invalid bytes. This catches encoding bugs (like the REX.X incident) at compile
 /// time instead of at runtime (crash or silent corruption).
+///
+/// Known false positives (decoder incomplete):
+/// - Emitters that use `EB rel8` jmp-over-data with string content are handled
+///   via a pattern match at decode time, but long emitters with multiple inline
+///   static-write syscalls in sequence can leave the decoder one byte off
+///   (classic out-of-sync-after-a-conditional-branch issue). Affected examples
+///   today: `classify.verbose`, `greeting.verbose`. The warning is cosmetic —
+///   the emitted binaries run correctly and are verified end-to-end in tests.
+/// - Full opcode coverage is a longer project. Adding the specific opcodes we
+///   emit (as we find them) chips away at false positives over time; we log
+///   the warning with an "(decoder incomplete, may be false positive)" suffix
+///   so users know not to treat it as a hard error.
 
 #[derive(Debug)]
 pub struct ValidationError {
@@ -176,6 +188,36 @@ fn decode_instruction_length(code: &[u8], pos: usize) -> Option<usize> {
     match opcode {
         // NOP
         0x90 => Some(i - pos),
+
+        // ADD r/m8, r8 (00 /r) + r/m, r (01 /r)
+        0x00 => {
+            i += modrm_length(code, i)?;
+            Some(i - pos)
+        }
+        // ADD *AX, imm32 (05 id) — with REX.W this is ADD RAX, imm32 sign-extended
+        0x05 => {
+            if i + 4 > code.len() { return None; }
+            Some(i + 4 - pos)
+        }
+        // String instructions (usually preceded by F3/F2 prefix for rep/repne):
+        // MOVSB (A4), MOVSD (A5), CMPSB (A6), CMPSD (A7),
+        // STOSB (AA), STOSD (AB), LODSB (AC), LODSD (AD),
+        // SCASB (AE), SCASD (AF) — all are 1-byte opcodes with no operands
+        // (they implicitly use RDI/RSI/RCX/RAX).
+        0xA4 | 0xA5 | 0xA6 | 0xA7 | 0xAA | 0xAB | 0xAC | 0xAD | 0xAE => Some(i - pos),
+        // CLD (FC) / STD (FD) — 1-byte, no operands
+        0xFC | 0xFD => Some(i - pos),
+        // Shift r/m8, imm8 (C0 /r ib)
+        0xC0 => {
+            i += modrm_length(code, i)?;
+            if i >= code.len() { return None; }
+            Some(i + 1 - pos)
+        }
+        // Shift r/m, CL (D3 /r)
+        0xD3 => {
+            i += modrm_length(code, i)?;
+            Some(i - pos)
+        }
 
         // PUSH r64 (50+r)
         0x50..=0x57 => Some(i - pos),
