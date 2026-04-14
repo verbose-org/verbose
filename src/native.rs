@@ -676,19 +676,21 @@ fn emit_append_file_call(
     Ok(())
 }
 
-/// Append a single newline byte to stderr (fd 2). Used after Err writes in
-/// Result-emitting rules so multi-record runs produce readable per-record
-/// lines on stderr, matching the newline itoa adds to stdout for Ok values.
-fn emit_write_newline_stderr(code: &mut Vec<u8>) {
-    // jmp +1, <0x0A>, lea rsi, [rip - 5]
+/// Append a single newline byte to the given file descriptor. Used for
+/// per-record line separation: stdout (fd=1) for Ok-text output, stderr
+/// (fd=2) for Err messages. Symmetric to the newline itoa adds to stdout
+/// for Ok-number output.
+fn emit_write_newline(code: &mut Vec<u8>, fd: i32) {
+    // jmp +1, <0x0A>
     code.push(0xEB);
     code.push(0x01);
     let data_addr = code.len();
     code.push(0x0A); // '\n'
-    // mov rax, 1
+    // mov rax, 1 (sys_write)
     code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x01, 0x00, 0x00, 0x00]);
-    // mov rdi, 2
-    code.extend_from_slice(&[0x48, 0xC7, 0xC7, 0x02, 0x00, 0x00, 0x00]);
+    // mov rdi, fd
+    code.extend_from_slice(&[0x48, 0xC7, 0xC7]);
+    code.extend_from_slice(&fd.to_le_bytes());
     // lea rsi, [rip + rel32]
     let end = code.len() + 7;
     let rel32 = data_addr as i32 - end as i32;
@@ -698,6 +700,86 @@ fn emit_write_newline_stderr(code: &mut Vec<u8>) {
     code.extend_from_slice(&[0x48, 0xC7, 0xC2, 0x01, 0x00, 0x00, 0x00]);
     // syscall
     code.extend_from_slice(&[0x0F, 0x05]);
+}
+
+/// Emit code that writes the given text expression to the given fd. Shared
+/// between Ok(text) → stdout and Err(text) → stderr. Handles two shapes:
+///
+/// - `Expr::Text(literal)` — inline the bytes via `jmp over data`, then
+///   `lea rsi` + `mov rdx, len` + `mov rdi, fd` + `mov rax, 1` + `syscall`.
+/// - `Expr::Concat(args)` — build into a stack buffer via
+///   `emit_concat_to_buffer` (rax = buf, rdx = len), move to rsi, write,
+///   then `add rsp, buf_size` to free before the next iteration.
+///
+/// On return, the write has happened but NO trailing newline has been emitted.
+/// The caller is responsible for `emit_write_newline(fd)` if it wants
+/// per-record separation.
+fn emit_text_write_to_fd(
+    code: &mut Vec<u8>,
+    text_expr: &Expr,
+    fd: i32,
+    rule: &Rule,
+    concept: &Concept,
+    all_rules: &HashMap<&str, &Rule>,
+    offsets: &HashMap<&str, i32>,
+    field_ranges: &HashMap<&str, (i64, i64)>,
+) -> Result<(), NativeError> {
+    match text_expr {
+        Expr::Text(s) => {
+            let bytes = s.as_bytes();
+            let n = bytes.len();
+            if n <= 127 {
+                code.push(0xEB);
+                code.push(n as u8);
+            } else {
+                code.push(0xE9);
+                code.extend_from_slice(&(n as i32).to_le_bytes());
+            }
+            let addr = code.len();
+            code.extend_from_slice(bytes);
+            // mov rax, 1 (sys_write)
+            code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x01, 0x00, 0x00, 0x00]);
+            // mov rdi, fd
+            code.extend_from_slice(&[0x48, 0xC7, 0xC7]);
+            code.extend_from_slice(&fd.to_le_bytes());
+            // lea rsi, [rip + rel32]
+            let end = code.len() + 7;
+            let rel32 = addr as i32 - end as i32;
+            code.extend_from_slice(&[0x48, 0x8D, 0x35]);
+            code.extend_from_slice(&rel32.to_le_bytes());
+            // mov rdx, n
+            code.extend_from_slice(&[0x48, 0xC7, 0xC2]);
+            code.extend_from_slice(&(n as i32).to_le_bytes());
+            // syscall
+            code.extend_from_slice(&[0x0F, 0x05]);
+            Ok(())
+        }
+        Expr::Concat(args) => {
+            let buf_size = emit_concat_to_buffer(
+                code, args, rule, concept, all_rules, offsets, field_ranges,
+            )?;
+            // rax = buf ptr, rdx = length.
+            // mov rsi, rax
+            code.extend_from_slice(&[0x48, 0x89, 0xC6]);
+            // mov rdi, fd
+            code.extend_from_slice(&[0x48, 0xC7, 0xC7]);
+            code.extend_from_slice(&fd.to_le_bytes());
+            // mov rax, 1 (sys_write)
+            code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x01, 0x00, 0x00, 0x00]);
+            // syscall
+            code.extend_from_slice(&[0x0F, 0x05]);
+            // add rsp, buf_size — free the buffer before the next iteration
+            code.extend_from_slice(&[0x48, 0x81, 0xC4]);
+            code.extend_from_slice(&buf_size.to_le_bytes());
+            Ok(())
+        }
+        other => Err(NativeError {
+            message: format!(
+                "text-producing expression not yet supported in native: {:?}",
+                other
+            ),
+        }),
+    }
 }
 
 /// Emit just the open(path, O_WRONLY|O_APPEND|O_CREAT, 0644) syscall with the
@@ -761,9 +843,12 @@ fn emit_result_program(
             })
         }
     };
-    if !matches!(t_ok, Type::Number) || !matches!(t_err, Type::Text) {
+    // Accept Result(Number, Text) and Result(Text, Text). Other shapes
+    // (Result(Record, _), Result(collection, _), etc.) need their own
+    // calling convention design and stay interpreter-only.
+    if !matches!(t_ok, Type::Number | Type::Text) || !matches!(t_err, Type::Text) {
         return Err(NativeError {
-            message: "native today supports Result(number, text) only — other shapes are interpreter-only".into(),
+            message: "native Result rules today support Ok = number|text and Err = text; other shapes are interpreter-only".into(),
         });
     }
 
@@ -863,12 +948,40 @@ fn emit_eval_result_expr(
     offsets: &HashMap<&str, i32>,
     field_ranges: &HashMap<&str, (i64, i64)>,
 ) -> Result<(), NativeError> {
+    // Extract the declared (T, E) from the rule's Result(T, E) output so the
+    // Ok arm emits the right write for its declared type.
+    let t_ok = match &rule.output_ty {
+        Type::Result(t, _) => t.as_ref(),
+        _ => return Err(NativeError {
+            message: "emit_eval_result_expr called on a rule whose output is not Result".into(),
+        }),
+    };
+
     match expr {
         Expr::Ok(inner) => {
-            // The Ok arm produces a number. Evaluate → rax, then emit_itoa_inline
-            // writes it (with a trailing newline) to stdout.
-            emit_eval_expr(code, inner, &rule.input_name, offsets, all_rules, field_ranges)?;
-            emit_itoa_inline(code);
+            match t_ok {
+                Type::Number => {
+                    // Number Ok: evaluate → rax, itoa writes decimal + \n to stdout.
+                    emit_eval_expr(code, inner, &rule.input_name, offsets, all_rules, field_ranges)?;
+                    emit_itoa_inline(code);
+                }
+                Type::Text => {
+                    // Text Ok: write the bytes (literal or concat buffer) to
+                    // stdout (fd 1), then append a newline symmetric to itoa.
+                    emit_text_write_to_fd(
+                        code, inner, 1, rule, concept, all_rules, offsets, field_ranges,
+                    )?;
+                    emit_write_newline(code, 1);
+                }
+                other => {
+                    return Err(NativeError {
+                        message: format!(
+                            "Ok arm type '{:?}' not yet supported in native — only number and text",
+                            other
+                        ),
+                    });
+                }
+            }
             // jmp loop_top (rel32, backward)
             code.push(0xE9);
             let off = loop_top as i32 - (code.len() + 4) as i32;
@@ -876,69 +989,12 @@ fn emit_eval_result_expr(
             Ok(())
         }
         Expr::Err(inner) => {
-            // The Err arm produces text. Write it to stderr (fd 2) — one
-            // line per record, a record-separator newline appended by the
-            // native emitter so multi-record runs don't run together on
-            // stderr. (The Ok arm gets its newline for free from itoa;
-            // this newline on Err is the symmetric counterpart.)
-            match inner.as_ref() {
-                Expr::Text(s) => {
-                    // Literal content: inline the bytes and write directly.
-                    let bytes = s.as_bytes();
-                    let n = bytes.len();
-                    if n <= 127 {
-                        code.push(0xEB);
-                        code.push(n as u8);
-                    } else {
-                        code.push(0xE9);
-                        code.extend_from_slice(&(n as i32).to_le_bytes());
-                    }
-                    let addr = code.len();
-                    code.extend_from_slice(bytes);
-                    // mov rax, 1 (sys_write)
-                    code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x01, 0x00, 0x00, 0x00]);
-                    // mov rdi, 2 (stderr)
-                    code.extend_from_slice(&[0x48, 0xC7, 0xC7, 0x02, 0x00, 0x00, 0x00]);
-                    // lea rsi, [rip + rel32]
-                    let end = code.len() + 7;
-                    let rel32 = addr as i32 - end as i32;
-                    code.extend_from_slice(&[0x48, 0x8D, 0x35]);
-                    code.extend_from_slice(&rel32.to_le_bytes());
-                    // mov rdx, n
-                    code.extend_from_slice(&[0x48, 0xC7, 0xC2]);
-                    code.extend_from_slice(&(n as i32).to_le_bytes());
-                    // syscall
-                    code.extend_from_slice(&[0x0F, 0x05]);
-                }
-                Expr::Concat(args) => {
-                    // Build into a stack buffer, write to stderr, then free.
-                    let buf_size = emit_concat_to_buffer(
-                        code, args, rule, concept, all_rules, offsets, field_ranges,
-                    )?;
-                    // rax = buf ptr, rdx = length.
-                    // mov rsi, rax
-                    code.extend_from_slice(&[0x48, 0x89, 0xC6]);
-                    // mov rdi, 2 (stderr)
-                    code.extend_from_slice(&[0x48, 0xC7, 0xC7, 0x02, 0x00, 0x00, 0x00]);
-                    // mov rax, 1 (sys_write)
-                    code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x01, 0x00, 0x00, 0x00]);
-                    // syscall
-                    code.extend_from_slice(&[0x0F, 0x05]);
-                    // add rsp, buf_size  — free the buffer before the next iteration
-                    code.extend_from_slice(&[0x48, 0x81, 0xC4]);
-                    code.extend_from_slice(&buf_size.to_le_bytes());
-                }
-                other => {
-                    return Err(NativeError {
-                        message: format!(
-                            "Err content must be a text literal or concat(...) in native; got {:?}",
-                            other
-                        ),
-                    });
-                }
-            }
-            // Append a trailing newline to stderr so records don't run together.
-            emit_write_newline_stderr(code);
+            // Err is always text in the shapes we accept. Write to stderr
+            // (fd 2), then a newline so multi-record runs separate cleanly.
+            emit_text_write_to_fd(
+                code, inner, 2, rule, concept, all_rules, offsets, field_ranges,
+            )?;
+            emit_write_newline(code, 2);
             // jmp loop_top
             code.push(0xE9);
             let off = loop_top as i32 - (code.len() + 4) as i32;
@@ -2406,6 +2462,26 @@ mod tests {
             code.windows(7).any(|w| w == open_pattern),
             "expected `mov rax, 2` (sys_open) in emitted code"
         );
+    }
+
+    #[test]
+    fn native_compiles_result_text_text_rule() {
+        // tier.verbose returns Result(text, text). After Phase 2B the
+        // native backend handles Ok(text) by writing the bytes to stdout
+        // + newline, sharing the emit_text_write_to_fd helper with the
+        // Err arm.
+        use std::fs;
+        let src = fs::read_to_string("examples/tier.verbose")
+            .expect("examples/tier.verbose is expected to exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let out = std::env::temp_dir().join("verbosec_test_classify_tier");
+        compile_native(&program, "classify_tier", out.to_str().unwrap())
+            .expect("native compile of Result(text, text) rule should succeed");
+        let size = fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
+        assert!(size > 300 && size < 2_000, "unexpected binary size: {}", size);
+        let _ = fs::remove_file(out);
     }
 
     #[test]

@@ -57,6 +57,7 @@ examples/
   audit_log.*      append_file reaction with dynamic concat content — compiles to a 724-byte native binary
   audit_simple.*   append_file with static content — compiles to a 462-byte native binary
   purchase.*       Result(number, text) validator — validate_purchase compiles to a 705-byte native binary (Ok -> stdout, Err -> stderr)
+  tier.*           Result(text, text) classifier — classify_tier compiles to a 602-byte native binary
   demo.html        Browser demo (WASM)
 
 tools/
@@ -133,10 +134,11 @@ Tracking what native emits today, what it still rejects, and the design rules th
 | 1A | Reaction with `append_file "literal_path" "literal_content"` | ~460 B | `audit_simple.verbose` |
 | 1B | Reaction with `append_file "literal_path" concat(...)` — dynamic text via inline itoa + stack buffer | ~720 B | `audit_log.verbose` |
 | 2A | Rule with `output: Result(number, text)` — Ok→stdout, Err→stderr, continuation-passing leaves | ~700 B | `purchase.verbose::validate_purchase` |
+| 2B | Rule with `output: Result(text, text)` — Ok(text) writes to stdout (literal or concat); shared `emit_text_write_to_fd` helper | ~600 B | `tier.verbose::classify_tier` |
 
 ### What native still rejects, and in which priority
 
-- **Result(text, text) and Result(T, E) with non-scalar T** — each shape needs its own calling convention. Decide shape by shape, never fabricate a "universal Result" that carries unnecessary machinery. (Phase 2B.)
+- **Result(T, E) with non-scalar T** (e.g. `Result(Record, text)`, `Result(collection, _)`) — each shape needs its own calling convention. Decide shape by shape, never fabricate a "universal Result" that carries unnecessary machinery.
 - **`output: Record { ... }`** — needs a serialization format (likely JSON) at the output boundary and a stack layout for record fields. Doable without heap. (Phase 2C.)
 - **`output: collection(T)`** — the only case that genuinely needs heap (map/filter produce collections with runtime-determined sizes). Behind a bump-allocator design we have not committed to yet. (Phase 3.)
 - **`match_result` in expression position** — needs a tagged-union calling convention plus branch dispatch. Avoided so far because continuation-passing covers the producer side. Will become necessary when rules need to *consume* another rule's Result inline. (Phase 2D.)

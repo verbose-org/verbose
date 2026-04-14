@@ -1,0 +1,2 @@
+1. A customer has a balance.
+2. Classify a customer's tier from their balance: "premium" if the balance is at least 100000, otherwise reject with a reason mentioning the balance and the threshold.

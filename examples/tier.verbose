@@ -1,0 +1,40 @@
+@verbose 0.1.0
+
+-- Demonstrates Result(text, text) in native: the Ok arm carries a tier
+-- name (text), the Err arm carries a dynamic rejection reason. Compiles
+-- to a standalone binary where the tier prints to stdout and the reason
+-- prints to stderr, one line per record.
+
+
+concept Customer
+  @intention: "A customer has a balance"
+  @source: tier.intent:1
+
+  fields:
+    balance : number [0, 10000000]
+
+
+rule classify_tier
+  @intention: "Classify the customer's tier: premium if balance >= 100000, else Err with a reason"
+  @source: tier.intent:2
+
+  input:
+    c : Customer
+
+  output:
+    r : Result(text, text)
+
+  logic:
+    r = if c.balance >= 100000 then Ok("premium") else Err(concat("balance ", c.balance, " is below the 100000 threshold"))
+
+  proofs:
+    purity:
+      reads   : [c.balance]
+      writes  : []
+      calls   : []
+      verdict : pure
+    termination:
+      form  : constant_bound
+      bound : 6
+    determinism:
+      form : total
