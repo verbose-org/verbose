@@ -60,6 +60,7 @@ examples/
   tier.*           Result(text, text) classifier — classify_tier compiles to a 602-byte native binary
   classify.*       Record-output rule — classify_invoice compiles to a ~970-byte native binary that emits one JSON object per record
   greeting.*       Text input field flowing into JSON output — make_report compiles to a ~590-byte native binary
+                   (purchase.verbose::discounted_purchase compiles to ~750 bytes via Phase 2D match_result inlining)
   demo.html        Browser demo (WASM)
 
 tools/
@@ -139,13 +140,17 @@ Tracking what native emits today, what it still rejects, and the design rules th
 | 2B | Rule with `output: Result(text, text)` — Ok(text) writes to stdout (literal or concat); shared `emit_text_write_to_fd` helper | ~600 B | `tier.verbose::classify_tier` |
 | 2C | Rule with `output: Named(concept)` (record) — JSON serialization to stdout, one object per record. Streaming emission (no on-stack record). Number/text fields supported; `if/else` between two record arms via continuation-passing. | ~1 KB | `classify.verbose::classify_invoice` |
 | 2E | Text-typed input fields readable in record outputs — argv pointer stored at the rbp slot, length recovered via `repne scasb` (`emit_strlen`) at each read site. | ~600 B | `greeting.verbose::make_report` |
+| 2D | `match_result(callee(input), v => Ok(<arith using v>), e => Err(e))` — inlined-callee form. Callee's logic is walked and its Ok/Err leaves are redirected: Ok values bind to a reserved `match_slot` then evaluate the outer Ok arm; Err values write directly to stderr (Err pass-through). Restricted to same-input-concept callees and `Err(<err_var>)` pass-through outer arm. | ~750 B | `purchase.verbose::discounted_purchase` |
 
 ### What native still rejects, and in which priority
 
 - **Result(T, E) with non-scalar T** (e.g. `Result(Record, text)`, `Result(collection, _)`) — each shape needs its own calling convention. Decide shape by shape, never fabricate a "universal Result" that carries unnecessary machinery.
 - **Text-field access in `Result(text, text)` Ok arm or in concat arguments** — Phase 2E added text-field reads only inside record-output rules (`emit_record_program`'s argv loop and `emit_text_write_to_fd`'s special case). Other emitters (`emit_full_program`, `emit_reaction_program`, `emit_result_program`) still call `atoi` on every field. Generalizing requires teaching each emitter the same field-loading dispatch — purely mechanical, not gated by design questions.
 - **`output: collection(T)`** — the only case that genuinely needs heap (map/filter produce collections with runtime-determined sizes). Behind a bump-allocator design we have not committed to yet. (Phase 3.)
-- **`match_result` in expression position** — needs a tagged-union calling convention plus branch dispatch. Avoided so far because continuation-passing covers the producer side. Will become necessary when rules need to *consume* another rule's Result inline. (Phase 2D.)
+- **`match_result` with non-pass-through Err arm** — Phase 2D handles `Err(<err_var>)` pass-through (the value flows directly to stderr without being bound). Richer Err arms (using err_var inside concat, or transforming it) need a real text-binding mechanism — two rbp slots per text bound var (ptr + len) since Err values from concat aren't NUL-terminated.
+- **`match_result` with cross-concept callees** — Phase 2D requires callee.input_concept == outer.input_concept (so the rbp slots are reused as-is). Cross-concept calls need argument-passing through additional slots or a real callee frame.
+- **Nested `match_result`** — Phase 2D reserves a single `match_slot` in the prologue; nested match_results would collide. Either reserve N slots based on a static walk or switch to a stack-based binding scheme.
+- **Record fields with text-typed value coming from concat or rule call** — Phase 2C/2E support text fields whose value is a literal or an input-field access. Other text expressions (e.g. `Concept { name: concat(...), ... }`) need the buffer allocated in the JSON streaming path.
 
 ### Register conventions across emitters
 

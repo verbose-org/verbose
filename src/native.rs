@@ -1071,7 +1071,14 @@ fn emit_result_program(
     code.push(0x55); // push rbp
     code.extend_from_slice(&[0x48, 0x89, 0xE5]); // mov rbp, rsp
     let n_bindings = rule.logic.bindings.len();
-    let frame_size = ((nfields + n_bindings) * 8) as i32;
+    // Frame layout: N field slots + N binding slots + 1 match_slot for
+    // match_result's bound number variable. The match_slot sits at the
+    // bottom of the frame and is used by emit_eval_result_expr's
+    // MatchResult handling (Phase 2D). Reserved unconditionally — 8 bytes
+    // of waste when a rule doesn't use match_result, acceptable.
+    let frame_slots = nfields + n_bindings + 1;
+    let frame_size = (frame_slots * 8) as i32;
+    let match_slot: i32 = -((frame_slots as i32) * 8);
     code.extend_from_slice(&[0x48, 0x81, 0xEC]);
     code.extend_from_slice(&frame_size.to_le_bytes());
     code.extend_from_slice(&[0x49, 0xC7, 0xC6, 0x01, 0x00, 0x00, 0x00]); // mov r14, 1
@@ -1129,6 +1136,7 @@ fn emit_result_program(
         all_rules,
         &binding_offsets,
         &field_ranges,
+        match_slot,
     )?;
 
     // exit:
@@ -1156,6 +1164,7 @@ fn emit_eval_result_expr(
     all_rules: &HashMap<&str, &Rule>,
     offsets: &HashMap<&str, i32>,
     field_ranges: &HashMap<&str, (i64, i64)>,
+    match_slot: i32,
 ) -> Result<(), NativeError> {
     // Extract the declared (T, E) from the rule's Result(T, E) output so the
     // Ok arm emits the right write for its declared type.
@@ -1222,7 +1231,7 @@ fn emit_eval_result_expr(
 
             // .then — each leaf self-terminates with jmp loop_top.
             emit_eval_result_expr(
-                code, then_e, loop_top, rule, concept, all_rules, offsets, field_ranges,
+                code, then_e, loop_top, rule, concept, all_rules, offsets, field_ranges, match_slot,
             )?;
 
             // .else:
@@ -1230,13 +1239,241 @@ fn emit_eval_result_expr(
             let else_off = else_pos as i32 - (else_patch as i32 + 4);
             code[else_patch..else_patch + 4].copy_from_slice(&else_off.to_le_bytes());
             emit_eval_result_expr(
-                code, else_e, loop_top, rule, concept, all_rules, offsets, field_ranges,
+                code, else_e, loop_top, rule, concept, all_rules, offsets, field_ranges, match_slot,
+            )?;
+            Ok(())
+        }
+        Expr::MatchResult(target, ok_var, ok_body, err_var, err_body) => {
+            // Phase 2D scope (narrow): support only the discounted_purchase
+            // shape — target is a rule call on the outer rule's input,
+            // ok_arm is `Ok(<expr using ok_var>)`, err_arm is `Err(Ident(err_var))`
+            // (pure pass-through of the inner Err's text).
+            //
+            // Why narrow: a fully general match_result in native needs either
+            // a tagged Result calling convention for callees or fully general
+            // bound-var slot management for arbitrary text values. Both are
+            // significantly more design surface; the narrow form here covers
+            // the common compose-validators-then-transform pattern without
+            // committing to either.
+            emit_match_result_inlined(
+                code,
+                target,
+                ok_var,
+                ok_body,
+                err_var,
+                err_body,
+                loop_top,
+                rule,
+                concept,
+                all_rules,
+                offsets,
+                field_ranges,
+                match_slot,
+            )
+        }
+        other => Err(NativeError {
+            message: format!(
+                "Result-context expression not yet supported in native: {:?}",
+                other
+            ),
+        }),
+    }
+}
+
+/// Emit code for `match_result(callee(input), ok_var => Ok(...), err_var => Err(err_var))`.
+///
+/// Strategy: inline the callee's logic, redirecting its Ok/Err leaves to the
+/// outer match arms instead of the standalone "write + jmp" they would emit.
+///
+/// - For each Ok leaf in the callee: evaluate the leaf's inner expression
+///   (a number) into rax, store at match_slot, then emit the outer Ok arm
+///   with `ok_var → match_slot` added to offsets. The outer Ok arm's body
+///   self-terminates (jmp loop_top) — same continuation-passing as elsewhere.
+///
+/// - For each Err leaf in the callee: evaluate the leaf's inner expression
+///   (text) and write directly to stderr (Err pass-through optimisation —
+///   we detect that the outer Err arm is `Err(Ident(err_var))` so the value
+///   simply forwards). Append a newline + jmp loop_top.
+///
+/// Restrictions enforced here (rejected with clear messages):
+/// - Target must be `Call(callee_name, [Ident(input_name)])` where
+///   input_name == outer rule's input.
+/// - Callee's input concept must equal outer rule's input concept (so the
+///   rbp slots already loaded by the prologue work as-is for callee).
+/// - Outer Err arm must be `Err(Ident(err_var))` — the pass-through case.
+/// - Callee's logic must be a tree of If / Ok / Err — no nested
+///   match_result / no rule calls inside callee.
+fn emit_match_result_inlined(
+    code: &mut Vec<u8>,
+    target: &Expr,
+    ok_var: &str,
+    ok_body: &Expr,
+    err_var: &str,
+    err_body: &Expr,
+    loop_top: usize,
+    rule: &Rule,
+    concept: &Concept,
+    all_rules: &HashMap<&str, &Rule>,
+    offsets: &HashMap<&str, i32>,
+    field_ranges: &HashMap<&str, (i64, i64)>,
+    match_slot: i32,
+) -> Result<(), NativeError> {
+    // Validate the outer Err arm is the pass-through shape.
+    let err_passthrough = match err_body {
+        Expr::Err(inner) => matches!(inner.as_ref(), Expr::Ident(n) if n == err_var),
+        _ => false,
+    };
+    if !err_passthrough {
+        return Err(NativeError {
+            message: "match_result Err arm in native today must be the pass-through `Err(<err_var>)`; richer Err transforms are deferred".into(),
+        });
+    }
+
+    // Validate target is Call(callee, [Ident(input)]).
+    let (callee_name, _arg) = match target {
+        Expr::Call(name, args) if args.len() == 1 => {
+            if !matches!(&args[0], Expr::Ident(n) if n == &rule.input_name) {
+                return Err(NativeError {
+                    message: "match_result target call must pass the outer rule's input identifier".into(),
+                });
+            }
+            (name.as_str(), &args[0])
+        }
+        _ => {
+            return Err(NativeError {
+                message: "match_result target must be a rule call (literal Result targets not yet supported in native)".into(),
+            });
+        }
+    };
+
+    let callee = all_rules.get(callee_name).ok_or_else(|| NativeError {
+        message: format!("match_result calls unknown rule '{}'", callee_name),
+    })?;
+
+    // Validate callee's input concept matches outer rule's. Same-concept
+    // means the rbp slots already populated by the prologue are reusable.
+    let callee_input = match &callee.input_ty {
+        Type::Named(n) => n.as_str(),
+        _ => return Err(NativeError { message: "callee input must be a named concept".into() }),
+    };
+    if callee_input != concept.name.as_str() {
+        return Err(NativeError {
+            message: format!(
+                "match_result callee '{}' takes input concept '{}' but caller takes '{}' — same-concept required for native",
+                callee_name, callee_input, concept.name
+            ),
+        });
+    }
+
+    // Walk callee's logic, redirecting leaves.
+    emit_redirect_callee_leaves(
+        code,
+        &callee.logic.value,
+        callee,
+        ok_var,
+        ok_body,
+        loop_top,
+        rule,
+        concept,
+        all_rules,
+        offsets,
+        field_ranges,
+        match_slot,
+    )
+}
+
+fn emit_redirect_callee_leaves(
+    code: &mut Vec<u8>,
+    expr: &Expr,
+    callee: &Rule,
+    ok_var: &str,
+    ok_body: &Expr,
+    loop_top: usize,
+    outer_rule: &Rule,
+    concept: &Concept,
+    all_rules: &HashMap<&str, &Rule>,
+    offsets: &HashMap<&str, i32>,
+    field_ranges: &HashMap<&str, (i64, i64)>,
+    match_slot: i32,
+) -> Result<(), NativeError> {
+    match expr {
+        Expr::Ok(inner) => {
+            // Evaluate inner using callee's input_name (typically same as outer's
+            // since concepts match, but the names could differ syntactically).
+            // For simplicity we currently require the names to also match —
+            // otherwise the inner expression's Ident lookups would miss.
+            if callee.input_name != outer_rule.input_name {
+                return Err(NativeError {
+                    message: format!(
+                        "match_result callee uses input name '{}' but outer rule uses '{}' — same input name required for native today",
+                        callee.input_name, outer_rule.input_name
+                    ),
+                });
+            }
+            // Evaluate Ok's inner (a number) → rax.
+            emit_eval_expr(code, inner, &outer_rule.input_name, offsets, all_rules, field_ranges)?;
+            // Store at match_slot.
+            if match_slot >= -128 {
+                code.extend_from_slice(&[0x48, 0x89, 0x45]);
+                code.push(match_slot as u8);
+            } else {
+                code.extend_from_slice(&[0x48, 0x89, 0x85]);
+                code.extend_from_slice(&match_slot.to_le_bytes());
+            }
+            // Augment offsets with ok_var → match_slot, then emit outer ok_body
+            // in result context. The outer arm self-terminates.
+            let mut augmented = offsets.clone();
+            augmented.insert(ok_var, match_slot);
+            emit_eval_result_expr(
+                code,
+                ok_body,
+                loop_top,
+                outer_rule,
+                concept,
+                all_rules,
+                &augmented,
+                field_ranges,
+                match_slot,
+            )
+        }
+        Expr::Err(inner) => {
+            // Pass-through to outer Err: write the inner text directly to
+            // stderr, append newline, jmp loop_top. No binding needed.
+            emit_text_write_to_fd(
+                code, inner, 2, outer_rule, concept, all_rules, offsets, field_ranges,
+            )?;
+            emit_write_newline(code, 2);
+            // jmp loop_top
+            code.push(0xE9);
+            let off = loop_top as i32 - (code.len() + 4) as i32;
+            code.extend_from_slice(&off.to_le_bytes());
+            Ok(())
+        }
+        Expr::If(cond, then_e, else_e) => {
+            emit_eval_expr(code, cond, &outer_rule.input_name, offsets, all_rules, field_ranges)?;
+            code.extend_from_slice(&[0x48, 0x85, 0xC0]); // test rax, rax
+            code.push(0x0F);
+            code.push(0x84);
+            let else_patch = code.len();
+            code.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+
+            emit_redirect_callee_leaves(
+                code, then_e, callee, ok_var, ok_body, loop_top,
+                outer_rule, concept, all_rules, offsets, field_ranges, match_slot,
+            )?;
+
+            let else_pos = code.len();
+            let else_off = else_pos as i32 - (else_patch as i32 + 4);
+            code[else_patch..else_patch + 4].copy_from_slice(&else_off.to_le_bytes());
+            emit_redirect_callee_leaves(
+                code, else_e, callee, ok_var, ok_body, loop_top,
+                outer_rule, concept, all_rules, offsets, field_ranges, match_slot,
             )?;
             Ok(())
         }
         other => Err(NativeError {
             message: format!(
-                "Result-context expression not yet supported in native: {:?}",
+                "match_result callee body has expression not yet supported for inlining: {:?}",
                 other
             ),
         }),
@@ -2960,6 +3197,28 @@ mod tests {
             code.windows(7).any(|w| w == open_pattern),
             "expected `mov rax, 2` (sys_open) in emitted code"
         );
+    }
+
+    #[test]
+    fn native_compiles_discounted_purchase_match_result() {
+        // discounted_purchase = match_result(validate_purchase(p),
+        //   amount => Ok(amount * 90 / 100),
+        //   reason => Err(reason))
+        // Phase 2D narrow form: target is a rule call on outer's input,
+        // Ok arm uses the bound number var, Err arm passes through.
+        // Native inlines validate_purchase, redirecting its leaves.
+        use std::fs;
+        let src = fs::read_to_string("examples/purchase.verbose")
+            .expect("examples/purchase.verbose is expected to exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let out = std::env::temp_dir().join("verbosec_test_discounted");
+        compile_native(&program, "discounted_purchase", out.to_str().unwrap())
+            .expect("native compile of discounted_purchase should succeed");
+        let size = fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
+        assert!(size > 500 && size < 2_500, "unexpected binary size: {}", size);
+        let _ = fs::remove_file(out);
     }
 
     #[test]
