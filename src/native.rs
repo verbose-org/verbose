@@ -308,6 +308,256 @@ fn emit_full_program(
     Ok(code)
 }
 
+/// Classify a concat argument's runtime type — native supports Text (bytes
+/// copied from inline literals) and Number (evaluated to rax then itoa'd into
+/// the buffer). Bool and other types are refused with a clear message; they
+/// stay interpreter-only for now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConcatArgKind {
+    Text,
+    Number,
+}
+
+fn classify_concat_arg(
+    expr: &Expr,
+    concept: &Concept,
+    input_name: &str,
+) -> Option<ConcatArgKind> {
+    match expr {
+        Expr::Text(_) => Some(ConcatArgKind::Text),
+        Expr::Number(_) | Expr::Neg(_) => Some(ConcatArgKind::Number),
+        Expr::Field(base, field_name) => {
+            if matches!(base.as_ref(), Expr::Ident(n) if n == input_name) {
+                let f = concept.fields.iter().find(|f| &f.name == field_name)?;
+                match &f.ty {
+                    Type::Number => Some(ConcatArgKind::Number),
+                    Type::Text => Some(ConcatArgKind::Text),
+                    _ => None,
+                }
+            } else {
+                None
+            }
+        }
+        Expr::Binary(op, _, _) => match op {
+            BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod => {
+                Some(ConcatArgKind::Number)
+            }
+            _ => None, // Bool-producing — not yet supported in native concat
+        },
+        _ => None,
+    }
+}
+
+/// Emit code that writes decimal digits of rax into [rbx], advancing rbx.
+/// Handles negative numbers (emits '-' first) and zero. Uses a 24-byte scratch
+/// area on the stack for digit staging, then copies the digit run to [rbx]
+/// via rep movsb. Scratch is freed before return.
+///
+/// Inputs:  rax = signed i64 value to print.
+///          rbx = write pointer (the function updates it in place).
+/// Clobbers: rax, rcx, rdx, rdi, rsi, r8. Preserves rbx (updated), r12-r15.
+fn emit_itoa_to_buffer(code: &mut Vec<u8>) {
+    // Handle negative: if rax < 0, emit '-' then negate.
+    // test rax, rax
+    code.extend_from_slice(&[0x48, 0x85, 0xC0]);
+    // jns .positive (rel8)
+    code.push(0x79);
+    let not_neg_patch = code.len();
+    code.push(0x00);
+    // mov byte [rbx], '-'  (encoding: C6 03 2D)
+    code.extend_from_slice(&[0xC6, 0x03, 0x2D]);
+    // inc rbx
+    code.extend_from_slice(&[0x48, 0xFF, 0xC3]);
+    // neg rax
+    code.extend_from_slice(&[0x48, 0xF7, 0xD8]);
+    // .positive:
+    let not_neg_pos = code.len();
+    code[not_neg_patch] = (not_neg_pos - not_neg_patch - 1) as u8;
+
+    // sub rsp, 24 — scratch buffer
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x18]);
+    // lea rsi, [rsp + 23] — rightmost byte
+    code.extend_from_slice(&[0x48, 0x8D, 0x74, 0x24, 0x17]);
+    // mov r8, 10
+    code.extend_from_slice(&[0x49, 0xC7, 0xC0, 0x0A, 0x00, 0x00, 0x00]);
+
+    // Handle zero specially.
+    // test rax, rax
+    code.extend_from_slice(&[0x48, 0x85, 0xC0]);
+    // jnz .div_loop (rel8)
+    code.push(0x75);
+    let nonzero_patch = code.len();
+    code.push(0x00);
+    // mov byte [rsi], '0'
+    code.extend_from_slice(&[0xC6, 0x06, 0x30]);
+    // jmp .done_digits (rel8)
+    code.push(0xEB);
+    let zero_done_patch = code.len();
+    code.push(0x00);
+
+    // .div_loop:
+    let div_loop_pos = code.len();
+    code[nonzero_patch] = (div_loop_pos - nonzero_patch - 1) as u8;
+    // xor rdx, rdx
+    code.extend_from_slice(&[0x48, 0x31, 0xD2]);
+    // div r8  (rax = quotient, rdx = remainder)
+    code.extend_from_slice(&[0x49, 0xF7, 0xF0]);
+    // add dl, '0'
+    code.extend_from_slice(&[0x80, 0xC2, 0x30]);
+    // mov [rsi], dl
+    code.extend_from_slice(&[0x88, 0x16]);
+    // test rax, rax
+    code.extend_from_slice(&[0x48, 0x85, 0xC0]);
+    // jz .done_digits (rel8) — leave rsi pointing at the first digit
+    code.push(0x74);
+    let done_patch = code.len();
+    code.push(0x00);
+    // dec rsi
+    code.extend_from_slice(&[0x48, 0xFF, 0xCE]);
+    // jmp .div_loop (rel8, backward)
+    let jmp_back = div_loop_pos as i32 - (code.len() + 2) as i32;
+    code.extend_from_slice(&[0xEB, jmp_back as u8]);
+
+    // .done_digits: rsi points at first digit.
+    let done_pos = code.len();
+    code[done_patch] = (done_pos - done_patch - 1) as u8;
+    code[zero_done_patch] = (done_pos - zero_done_patch - 1) as u8;
+
+    // Compute length = (rsp + 24) - rsi   (one past the last digit at rsp+23, minus start)
+    // lea rcx, [rsp + 24]
+    code.extend_from_slice(&[0x48, 0x8D, 0x4C, 0x24, 0x18]);
+    // sub rcx, rsi
+    code.extend_from_slice(&[0x48, 0x29, 0xF1]);
+
+    // Copy [rsi..rsi+rcx] to [rbx..rbx+rcx] via rep movsb.
+    // mov rdi, rbx
+    code.extend_from_slice(&[0x48, 0x89, 0xDF]);
+    // rep movsb (F3 A4)
+    code.extend_from_slice(&[0xF3, 0xA4]);
+    // mov rbx, rdi  (new write pointer = rbx + length)
+    code.extend_from_slice(&[0x48, 0x89, 0xFB]);
+
+    // add rsp, 24 — free scratch
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x18]);
+}
+
+/// Emit code that, when executed, builds the concat(arg1, arg2, ...) result
+/// in a stack-allocated buffer and leaves (buffer_ptr, length) in (rax, rdx).
+/// The CALLER must `add rsp, max_total_len` after consuming the buffer.
+///
+/// The buffer is sized for the worst case: Text args are known-length, Number
+/// args get 21 bytes (i64 max digits + sign). No heap allocation.
+fn emit_concat_to_buffer(
+    code: &mut Vec<u8>,
+    args: &[Expr],
+    rule: &Rule,
+    concept: &Concept,
+    all_rules: &HashMap<&str, &Rule>,
+    offsets: &HashMap<&str, i32>,
+    field_ranges: &HashMap<&str, (i64, i64)>,
+) -> Result<i32, NativeError> {
+    // Compute buffer size = sum of per-arg worst case.
+    let mut kinds: Vec<ConcatArgKind> = Vec::with_capacity(args.len());
+    let mut total: i32 = 0;
+    for arg in args {
+        let kind = classify_concat_arg(arg, concept, &rule.input_name).ok_or_else(|| {
+            NativeError {
+                message: "concat argument type not yet supported in native (text + number scalars only for now; bool and others stay interpreter-only)".into(),
+            }
+        })?;
+        kinds.push(kind);
+        match kind {
+            ConcatArgKind::Text => {
+                if let Expr::Text(s) = arg {
+                    total += s.as_bytes().len() as i32;
+                } else if let Expr::Field(_, field_name) = arg {
+                    // Text field — we copy what's there at runtime. We don't
+                    // know its runtime length at compile time, so we reject
+                    // for now. Text-typed fields in concat come later.
+                    let _ = field_name;
+                    return Err(NativeError {
+                        message: "text-typed field in concat not yet supported in native; only text literals are".into(),
+                    });
+                }
+            }
+            ConcatArgKind::Number => {
+                total += 21; // i64 max 20 digits + sign
+            }
+        }
+    }
+    if total == 0 {
+        // Shouldn't happen (parser requires at least one arg), but guard.
+        return Err(NativeError { message: "concat with zero total size".into() });
+    }
+    // Round up to 8 for stack alignment.
+    let buf_size = ((total + 7) / 8) * 8;
+
+    // sub rsp, buf_size
+    code.extend_from_slice(&[0x48, 0x81, 0xEC]);
+    code.extend_from_slice(&buf_size.to_le_bytes());
+    // mov rbx, rsp  — rbx = write pointer into the buffer
+    code.extend_from_slice(&[0x48, 0x89, 0xE3]);
+    // Save the buffer base in r10 for later length calculation. r10 is
+    // preserved by Linux syscalls (which only clobber rax/rcx/r11) and is
+    // not touched by emit_eval_expr. Critically, it is NOT r15, which the
+    // surrounding emit_append_file_call uses to hold the file descriptor.
+    code.extend_from_slice(&[0x49, 0x89, 0xDA]); // mov r10, rbx
+
+    for (i, arg) in args.iter().enumerate() {
+        match kinds[i] {
+            ConcatArgKind::Text => {
+                if let Expr::Text(s) = arg {
+                    let bytes = s.as_bytes();
+                    let n = bytes.len();
+                    if n == 0 {
+                        continue;
+                    }
+                    // jmp over <n> data bytes (rel8 if n <= 127, else rel32)
+                    if n <= 127 {
+                        code.push(0xEB);
+                        code.push(n as u8);
+                    } else {
+                        code.push(0xE9);
+                        code.extend_from_slice(&(n as i32).to_le_bytes());
+                    }
+                    let data_addr = code.len();
+                    code.extend_from_slice(bytes);
+                    // mov rdi, rbx  (dest)
+                    code.extend_from_slice(&[0x48, 0x89, 0xDF]);
+                    // lea rsi, [rip + rel32]  (source)
+                    let end = code.len() + 7;
+                    let rel32 = data_addr as i32 - end as i32;
+                    code.extend_from_slice(&[0x48, 0x8D, 0x35]);
+                    code.extend_from_slice(&rel32.to_le_bytes());
+                    // mov rcx, n
+                    code.extend_from_slice(&[0x48, 0xC7, 0xC1]);
+                    code.extend_from_slice(&(n as i32).to_le_bytes());
+                    // rep movsb
+                    code.extend_from_slice(&[0xF3, 0xA4]);
+                    // mov rbx, rdi  (advanced pointer)
+                    code.extend_from_slice(&[0x48, 0x89, 0xFB]);
+                }
+            }
+            ConcatArgKind::Number => {
+                // push rbx — save write pointer (emit_eval_expr may clobber it via Binary op push/pop)
+                code.push(0x53);
+                emit_eval_expr(code, arg, &rule.input_name, offsets, all_rules, field_ranges)?;
+                // pop rbx
+                code.push(0x5B);
+                // itoa into buffer (rax → decimal digits at [rbx], rbx advanced)
+                emit_itoa_to_buffer(code);
+            }
+        }
+    }
+
+    // rax = buffer base (r10), rdx = length (rbx - r10)
+    code.extend_from_slice(&[0x4C, 0x89, 0xD0]); // mov rax, r10
+    code.extend_from_slice(&[0x48, 0x89, 0xDA]); // mov rdx, rbx
+    code.extend_from_slice(&[0x4C, 0x29, 0xD2]); // sub rdx, r10
+
+    Ok(buf_size)
+}
+
 /// Emit the machine-code sequence for a single `append_file "path" "content"`
 /// reaction effect. Both `path` (NUL-terminated for open()) and `content` are
 /// embedded inline in the code section via a `jmp` over the bytes, then the
@@ -323,33 +573,122 @@ fn emit_full_program(
 /// No error handling on syscall failure: if open() returns negative, write()
 /// will also fail silently. Good enough for a POC; proper error propagation
 /// to exit codes is a future commit.
-fn emit_append_file_call(code: &mut Vec<u8>, path: &str, content: &str) {
-    let path_bytes = path.as_bytes();
-    let content_bytes = content.as_bytes();
-    let path_with_nul_len = path_bytes.len() + 1;
-    let content_len = content_bytes.len();
-    let data_len = path_with_nul_len + content_len;
+/// Emit the open/write/close sequence for an append_file effect.
+/// `content` is the declared content expression — can be a Text literal
+/// (fast path: bytes embedded inline) or a Concat (slow path: stack buffer
+/// built at runtime from scalar args).
+fn emit_append_file_call(
+    code: &mut Vec<u8>,
+    path: &str,
+    content: &Expr,
+    rule: &Rule,
+    concept: &Concept,
+    all_rules: &HashMap<&str, &Rule>,
+    offsets: &HashMap<&str, i32>,
+    field_ranges: &HashMap<&str, (i64, i64)>,
+) -> Result<(), NativeError> {
+    // First, emit the open() call. The path is always a compile-time literal,
+    // so we embed it inline and point rdi at it.
+    emit_open_append(code, path);
+    // rax = fd; save in r15.
+    // mov r15, rax  (49 89 C7)
+    code.extend_from_slice(&[0x49, 0x89, 0xC7]);
 
-    // jmp over the embedded data.
-    if data_len <= 127 {
-        code.push(0xEB);
-        code.push(data_len as u8);
-    } else {
-        code.push(0xE9);
-        code.extend_from_slice(&(data_len as i32).to_le_bytes());
+    // Now the write(). Two paths depending on content shape.
+    match content {
+        Expr::Text(s) => {
+            // Fast path: fixed-length static content. Embed inline and
+            // point rsi at it.
+            let bytes = s.as_bytes();
+            let n = bytes.len();
+            // jmp over data
+            if n <= 127 {
+                code.push(0xEB);
+                code.push(n as u8);
+            } else {
+                code.push(0xE9);
+                code.extend_from_slice(&(n as i32).to_le_bytes());
+            }
+            let content_addr = code.len();
+            code.extend_from_slice(bytes);
+
+            // mov rax, 1 (sys_write)
+            code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x01, 0x00, 0x00, 0x00]);
+            // mov rdi, r15 (fd)
+            code.extend_from_slice(&[0x4C, 0x89, 0xFF]);
+            // lea rsi, [rip + rel32] → content
+            let end = code.len() + 7;
+            let rel32 = content_addr as i32 - end as i32;
+            code.extend_from_slice(&[0x48, 0x8D, 0x35]);
+            code.extend_from_slice(&rel32.to_le_bytes());
+            // mov rdx, n
+            code.extend_from_slice(&[0x48, 0xC7, 0xC2]);
+            code.extend_from_slice(&(n as i32).to_le_bytes());
+            // syscall
+            code.extend_from_slice(&[0x0F, 0x05]);
+        }
+        Expr::Concat(args) => {
+            // Dynamic path: build the content in a stack buffer, then write
+            // (rax=buf_ptr, rdx=len) to the fd. After the syscall, free the
+            // buffer with add rsp, buf_size.
+            let buf_size = emit_concat_to_buffer(
+                code, args, rule, concept, all_rules, offsets, field_ranges,
+            )?;
+            // At this point: rax = buf ptr, rdx = length, fd still in r15.
+            // mov rsi, rax — write syscall wants source in rsi
+            code.extend_from_slice(&[0x48, 0x89, 0xC6]);
+            // mov rdi, r15 (fd)
+            code.extend_from_slice(&[0x4C, 0x89, 0xFF]);
+            // mov rax, 1 (sys_write)
+            code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x01, 0x00, 0x00, 0x00]);
+            // syscall
+            code.extend_from_slice(&[0x0F, 0x05]);
+            // Free the buffer: add rsp, buf_size
+            code.extend_from_slice(&[0x48, 0x81, 0xC4]);
+            code.extend_from_slice(&buf_size.to_le_bytes());
+        }
+        other => {
+            return Err(NativeError {
+                message: format!(
+                    "append_file content must be a string literal or concat(...) in native; got {:?}",
+                    other
+                ),
+            });
+        }
     }
 
+    // === close(fd) ===
+    // mov rax, 3 (sys_close)
+    code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x03, 0x00, 0x00, 0x00]);
+    // mov rdi, r15
+    code.extend_from_slice(&[0x4C, 0x89, 0xFF]);
+    // syscall
+    code.extend_from_slice(&[0x0F, 0x05]);
+
+    Ok(())
+}
+
+/// Emit just the open(path, O_WRONLY|O_APPEND|O_CREAT, 0644) syscall with the
+/// path embedded inline (NUL-terminated). On return, rax holds the fd.
+fn emit_open_append(code: &mut Vec<u8>, path: &str) {
+    let path_bytes = path.as_bytes();
+    let path_with_nul_len = path_bytes.len() + 1;
+
+    // jmp over path bytes
+    if path_with_nul_len <= 127 {
+        code.push(0xEB);
+        code.push(path_with_nul_len as u8);
+    } else {
+        code.push(0xE9);
+        code.extend_from_slice(&(path_with_nul_len as i32).to_le_bytes());
+    }
     let path_addr = code.len();
     code.extend_from_slice(path_bytes);
-    code.push(0); // NUL terminator for open()
+    code.push(0);
 
-    let content_addr = code.len();
-    code.extend_from_slice(content_bytes);
-
-    // === open(path, O_WRONLY|O_APPEND|O_CREAT, 0644) ===
     // mov rax, 2 (sys_open)
     code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x02, 0x00, 0x00, 0x00]);
-    // lea rdi, [rip + rel32]  → path
+    // lea rdi, [rip + rel32] → path
     let end = code.len() + 7;
     let rel32 = path_addr as i32 - end as i32;
     code.extend_from_slice(&[0x48, 0x8D, 0x3D]);
@@ -358,33 +697,6 @@ fn emit_append_file_call(code: &mut Vec<u8>, path: &str, content: &str) {
     code.extend_from_slice(&[0x48, 0xC7, 0xC6, 0x41, 0x04, 0x00, 0x00]);
     // mov rdx, 0x1A4 (mode 0644)
     code.extend_from_slice(&[0x48, 0xC7, 0xC2, 0xA4, 0x01, 0x00, 0x00]);
-    // syscall → rax = fd
-    code.extend_from_slice(&[0x0F, 0x05]);
-
-    // mov r15, rax  (save fd; r15 survives the next two syscalls)
-    code.extend_from_slice(&[0x49, 0x89, 0xC7]);
-
-    // === write(fd, content, content_len) ===
-    // mov rax, 1 (sys_write)
-    code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x01, 0x00, 0x00, 0x00]);
-    // mov rdi, r15 (fd)
-    code.extend_from_slice(&[0x4C, 0x89, 0xFF]);
-    // lea rsi, [rip + rel32]  → content
-    let end = code.len() + 7;
-    let rel32 = content_addr as i32 - end as i32;
-    code.extend_from_slice(&[0x48, 0x8D, 0x35]);
-    code.extend_from_slice(&rel32.to_le_bytes());
-    // mov rdx, content_len (imm32)
-    code.extend_from_slice(&[0x48, 0xC7, 0xC2]);
-    code.extend_from_slice(&(content_len as i32).to_le_bytes());
-    // syscall
-    code.extend_from_slice(&[0x0F, 0x05]);
-
-    // === close(fd) ===
-    // mov rax, 3 (sys_close)
-    code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x03, 0x00, 0x00, 0x00]);
-    // mov rdi, r15
-    code.extend_from_slice(&[0x4C, 0x89, 0xFF]);
     // syscall
     code.extend_from_slice(&[0x0F, 0x05]);
 }
@@ -402,21 +714,14 @@ fn emit_reaction_program(
     concept: &Concept,
     all_rules: &HashMap<&str, &Rule>,
 ) -> Result<Vec<u8>, NativeError> {
-    // Pre-check: every effect must be representable in native today.
+    // Pre-check: print effect is not yet wired in native reactions. Every
+    // append_file is handled by emit_append_file_call which now accepts both
+    // Text literals and Concat expressions.
     for effect in &reaction.effects {
-        match effect {
-            Effect::AppendFile { content, .. } => {
-                if !matches!(content, Expr::Text(_)) {
-                    return Err(NativeError {
-                        message: "append_file content must be a string literal in native today (concat comes next commit)".into(),
-                    });
-                }
-            }
-            Effect::Print(_) => {
-                return Err(NativeError {
-                    message: "print effect not yet wired in native reactions (use the interpreter or append_file)".into(),
-                });
-            }
+        if let Effect::Print(_) = effect {
+            return Err(NativeError {
+                message: "print effect not yet wired in native reactions (use the interpreter or append_file)".into(),
+            });
         }
     }
 
@@ -500,9 +805,16 @@ fn emit_reaction_program(
     // with literal content; panic path is compile-time, not runtime.)
     for effect in &reaction.effects {
         if let Effect::AppendFile { path, content } = effect {
-            if let Expr::Text(s) = content {
-                emit_append_file_call(&mut code, path, s);
-            }
+            emit_append_file_call(
+                &mut code,
+                path,
+                content,
+                trigger_rule,
+                concept,
+                all_rules,
+                &binding_offsets,
+                &field_ranges,
+            )?;
         }
     }
 
@@ -1800,35 +2112,46 @@ mod tests {
     use super::*;
 
     #[test]
-    fn emit_append_file_call_embeds_path_and_content() {
-        // Smoke test: append_file emission produces non-empty bytes that
-        // include the path (NUL-terminated) and the content bytes, and emits
-        // the three syscall numbers 2/1/3 (open/write/close).
+    fn emit_open_append_embeds_path_and_syscall() {
+        // Smoke test: emit_open_append produces non-empty bytes including the
+        // NUL-terminated path and the sys_open immediate.
         let mut code = Vec::new();
-        emit_append_file_call(&mut code, "/tmp/x.log", "hi\n");
+        emit_open_append(&mut code, "/tmp/x.log");
 
-        // Path + NUL must be present in the code bytes.
         let marker = b"/tmp/x.log\0";
         assert!(
             code.windows(marker.len()).any(|w| w == marker),
             "path bytes + NUL not found in emitted code"
         );
-        // Content must be present.
+        // mov rax, 2 (sys_open) somewhere in the block.
+        let open_pattern = [0x48, 0xC7, 0xC0, 0x02, 0x00, 0x00, 0x00];
         assert!(
-            code.windows(3).any(|w| w == b"hi\n"),
-            "content bytes not found in emitted code"
+            code.windows(7).any(|w| w == open_pattern),
+            "expected `mov rax, 2` (sys_open) in emitted code"
         );
-        // The three sys_* immediates: 2 (open), 1 (write), 3 (close) —
-        // encoded as `mov rax, imm32` with the low byte being the syscall
-        // number. We expect at least one occurrence of each.
-        for (num, name) in [(0x02u8, "open"), (0x01u8, "write"), (0x03u8, "close")] {
-            let pattern = [0x48, 0xC7, 0xC0, num, 0x00, 0x00, 0x00];
-            assert!(
-                code.windows(7).any(|w| w == pattern),
-                "expected `mov rax, {}` (sys_{}) in emitted code",
-                num, name
-            );
-        }
+    }
+
+    #[test]
+    fn native_compiles_reaction_with_dynamic_concat() {
+        // audit_log.verbose has append_file whose content is a concat(...)
+        // of text literals and number fields. Before Phase 1 Commit B this
+        // was interpreter-only; the native backend now handles it by
+        // building the line in a stack buffer and writing it to the fd.
+        use std::fs;
+        let src = fs::read_to_string("examples/audit_log.verbose")
+            .expect("examples/audit_log.verbose is expected to exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let out = std::env::temp_dir().join("verbosec_test_audit_dynamic");
+        compile_native(&program, "audit_suspicious", out.to_str().unwrap())
+            .expect("native compile of dynamic-content reaction should succeed");
+        let size = fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
+        // Slightly larger than the static version due to the concat machinery
+        // (buffer reservation, itoa inline per number arg).
+        assert!(size > 400, "expected > 400 bytes, got {}", size);
+        assert!(size < 3_000, "expected < 3000 bytes, got {}", size);
+        let _ = fs::remove_file(out);
     }
 
     #[test]
