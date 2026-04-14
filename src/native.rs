@@ -107,6 +107,14 @@ pub fn compile_native(
 
     let is_result_output = matches!(&rule.output_ty, Type::Result(_, _));
 
+    // Record output: rule.output_ty is Named(concept_name) and the name
+    // resolves to a concept declared in the program. Routes to
+    // emit_record_program which emits JSON per record.
+    let record_output_concept: Option<&Concept> = match &rule.output_ty {
+        Type::Named(n) => concepts.iter().find(|c| c.name == *n).copied(),
+        _ => None,
+    };
+
     let mut code = if let Some(rx) = reaction {
         emit_reaction_program(rx, rule, concept, &rules)?
     } else if is_result_output {
@@ -115,6 +123,10 @@ pub fn compile_native(
         // self-terminates (continuation-passing), no tagged value lives in
         // registers across the top-level dispatch.
         emit_result_program(rule, concept, &rules)?
+    } else if let Some(rec_concept) = record_output_concept {
+        // Record-output rules: each leaf emits a JSON object to stdout + \n.
+        // Same continuation-passing convention as Result.
+        emit_record_program(rule, rec_concept, concept, &concepts, &rules)?
     } else if is_vectorizable && concept.fields.len() == 1 {
         if let Some(threshold) = extract_simple_gt(rule) {
             emit_vectorized_program(threshold)?
@@ -676,6 +688,141 @@ fn emit_append_file_call(
     Ok(())
 }
 
+/// Emit a write syscall for a fixed byte string to the given fd. The bytes
+/// are embedded inline in the code section via a jmp-over-data pattern.
+/// Used as a building block for JSON streaming (static key prefixes like
+/// `{"priority":"` between field values).
+fn emit_write_static_to_fd(code: &mut Vec<u8>, bytes: &[u8], fd: i32) {
+    let n = bytes.len();
+    if n == 0 {
+        return;
+    }
+    if n <= 127 {
+        code.push(0xEB);
+        code.push(n as u8);
+    } else {
+        code.push(0xE9);
+        code.extend_from_slice(&(n as i32).to_le_bytes());
+    }
+    let addr = code.len();
+    code.extend_from_slice(bytes);
+    // mov rax, 1 (sys_write)
+    code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x01, 0x00, 0x00, 0x00]);
+    // mov rdi, fd
+    code.extend_from_slice(&[0x48, 0xC7, 0xC7]);
+    code.extend_from_slice(&fd.to_le_bytes());
+    // lea rsi, [rip + rel32]
+    let end = code.len() + 7;
+    let rel32 = addr as i32 - end as i32;
+    code.extend_from_slice(&[0x48, 0x8D, 0x35]);
+    code.extend_from_slice(&rel32.to_le_bytes());
+    // mov rdx, n
+    code.extend_from_slice(&[0x48, 0xC7, 0xC2]);
+    code.extend_from_slice(&(n as i32).to_le_bytes());
+    // syscall
+    code.extend_from_slice(&[0x0F, 0x05]);
+}
+
+/// Convert rax (signed i64) to decimal digits and write them to stdout,
+/// WITHOUT a trailing newline. Used inside JSON record emission where a
+/// number value goes between a `"key":` prefix and a `,` or `}` suffix.
+/// For the stand-alone `Ok(number)` path that wants a per-record newline,
+/// use emit_itoa_inline (which appends \n).
+fn emit_itoa_to_stdout_no_newline(code: &mut Vec<u8>) {
+    // sub rsp, 24 — scratch
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x18]);
+    // lea rsi, [rsp + 23]
+    code.extend_from_slice(&[0x48, 0x8D, 0x74, 0x24, 0x17]);
+    // mov r8, 10
+    code.extend_from_slice(&[0x49, 0xC7, 0xC0, 0x0A, 0x00, 0x00, 0x00]);
+
+    // Handle negative: reserve a flag byte at [rsp+23] was the last digit;
+    // we'll use [rsp] as a minus-flag scratch slot.
+    // Store negative flag: rsp+23 is used for digits, so we pick rsp+0 for flag.
+    // mov byte [rsp], 0
+    code.extend_from_slice(&[0xC6, 0x04, 0x24, 0x00]);
+    // test rax, rax
+    code.extend_from_slice(&[0x48, 0x85, 0xC0]);
+    // jns .not_neg (rel8)
+    code.push(0x79);
+    let not_neg_patch = code.len();
+    code.push(0x00);
+    // mov byte [rsp], 1
+    code.extend_from_slice(&[0xC6, 0x04, 0x24, 0x01]);
+    // neg rax
+    code.extend_from_slice(&[0x48, 0xF7, 0xD8]);
+    let not_neg_pos = code.len();
+    code[not_neg_patch] = (not_neg_pos - not_neg_patch - 1) as u8;
+
+    // Zero case
+    // test rax, rax
+    code.extend_from_slice(&[0x48, 0x85, 0xC0]);
+    // jnz .div_loop (rel8)
+    code.push(0x75);
+    let nz_patch = code.len();
+    code.push(0x00);
+    // mov byte [rsi], '0'
+    code.extend_from_slice(&[0xC6, 0x06, 0x30]);
+    // dec rsi
+    code.extend_from_slice(&[0x48, 0xFF, 0xCE]);
+    // jmp .after_loop (rel8)
+    code.push(0xEB);
+    let after_patch = code.len();
+    code.push(0x00);
+
+    // .div_loop:
+    let div_loop_pos = code.len();
+    code[nz_patch] = (div_loop_pos - nz_patch - 1) as u8;
+    // xor rdx, rdx
+    code.extend_from_slice(&[0x48, 0x31, 0xD2]);
+    // div r8
+    code.extend_from_slice(&[0x49, 0xF7, 0xF0]);
+    // add dl, '0'
+    code.extend_from_slice(&[0x80, 0xC2, 0x30]);
+    // mov [rsi], dl
+    code.extend_from_slice(&[0x88, 0x16]);
+    // dec rsi
+    code.extend_from_slice(&[0x48, 0xFF, 0xCE]);
+    // test rax, rax
+    code.extend_from_slice(&[0x48, 0x85, 0xC0]);
+    // jnz .div_loop (rel8 backward)
+    let jmp_back = div_loop_pos as i32 - (code.len() + 2) as i32;
+    code.extend_from_slice(&[0x75, jmp_back as u8]);
+
+    // .after_loop:
+    let after_pos = code.len();
+    code[after_patch] = (after_pos - after_patch - 1) as u8;
+
+    // Prepend '-' if flag was set.
+    // cmp byte [rsp], 0
+    code.extend_from_slice(&[0x80, 0x3C, 0x24, 0x00]);
+    // je .no_minus (rel8)
+    code.push(0x74);
+    let no_minus_patch = code.len();
+    code.push(0x00);
+    // mov byte [rsi], '-'
+    code.extend_from_slice(&[0xC6, 0x06, 0x2D]);
+    // dec rsi
+    code.extend_from_slice(&[0x48, 0xFF, 0xCE]);
+    let no_minus_pos = code.len();
+    code[no_minus_patch] = (no_minus_pos - no_minus_patch - 1) as u8;
+
+    // inc rsi — points at first digit
+    code.extend_from_slice(&[0x48, 0xFF, 0xC6]);
+
+    // length = (rsp + 24) - rsi
+    code.extend_from_slice(&[0x48, 0x8D, 0x54, 0x24, 0x18]); // lea rdx, [rsp+24]
+    code.extend_from_slice(&[0x48, 0x29, 0xF2]); // sub rdx, rsi
+
+    // write(1, rsi, rdx)
+    code.extend_from_slice(&[0x48, 0xC7, 0xC7, 0x01, 0x00, 0x00, 0x00]); // mov rdi, 1
+    code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x01, 0x00, 0x00, 0x00]); // mov rax, 1
+    code.extend_from_slice(&[0x0F, 0x05]); // syscall
+
+    // add rsp, 24
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x18]);
+}
+
 /// Append a single newline byte to the given file descriptor. Used for
 /// per-record line separation: stdout (fd=1) for Ok-text output, stderr
 /// (fd=2) for Err messages. Symmetric to the newline itoa adds to stdout
@@ -1032,6 +1179,267 @@ fn emit_eval_result_expr(
             ),
         }),
     }
+}
+
+/// Emit a standalone binary for a rule whose output is a user-declared
+/// concept (record type). For each record parsed from argv, the binary
+/// writes the output record as a single-line JSON object to stdout:
+///     {"field1":value1,"field2":value2}\n
+///
+/// Scope for Phase 2C: the output record's fields must be `number` or
+/// `text`. Number fields compile through the normal emit_eval_expr path
+/// then itoa. Text fields must be compile-time literals today (or
+/// `concat(...)` of scalars) — general text-field-as-field access from
+/// the input is deferred to Phase 2E (needs argv-as-text support).
+///
+/// Continuation-passing: a structural `If` between two record-producing
+/// branches recurses on each arm, and each arm emits its own JSON line +
+/// jmp loop_top. Same leaf-terminates-itself convention as Result.
+fn emit_record_program(
+    rule: &Rule,
+    output_concept: &Concept,
+    input_concept: &Concept,
+    all_concepts: &[&Concept],
+    all_rules: &HashMap<&str, &Rule>,
+) -> Result<Vec<u8>, NativeError> {
+    // Validate output concept's fields — native today handles number + text only.
+    for f in &output_concept.fields {
+        match f.ty {
+            Type::Number | Type::Text => {}
+            _ => {
+                return Err(NativeError {
+                    message: format!(
+                        "native record output: field '{}' has unsupported type (only number/text today)",
+                        f.name
+                    ),
+                });
+            }
+        }
+    }
+
+    let nfields = input_concept.fields.len();
+    let offsets = field_offsets(input_concept);
+    let mut code = Vec::new();
+
+    // === _start === (record-loop skeleton)
+    code.extend_from_slice(&[0x4C, 0x8B, 0x24, 0x24]); // mov r12, [rsp]
+    code.extend_from_slice(&[0x4C, 0x8D, 0x6C, 0x24, 0x08]); // lea r13, [rsp+8]
+    code.push(0x55); // push rbp
+    code.extend_from_slice(&[0x48, 0x89, 0xE5]); // mov rbp, rsp
+    let n_bindings = rule.logic.bindings.len();
+    let frame_size = ((nfields + n_bindings) * 8) as i32;
+    code.extend_from_slice(&[0x48, 0x81, 0xEC]);
+    code.extend_from_slice(&frame_size.to_le_bytes());
+    code.extend_from_slice(&[0x49, 0xC7, 0xC6, 0x01, 0x00, 0x00, 0x00]); // mov r14, 1
+
+    let loop_top = code.len();
+
+    code.extend_from_slice(&[0x4D, 0x39, 0xE6]); // cmp r14, r12
+    code.push(0x0F);
+    code.push(0x8D);
+    let exit_patch = code.len();
+    code.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+
+    // Parse N fields from argv (all assumed number for now).
+    for field in &input_concept.fields {
+        let offset = offsets[field.name.as_str()];
+        code.extend_from_slice(&[0x4B, 0x8B, 0x7C, 0xF5, 0x00]); // mov rdi, [r13 + r14*8]
+        emit_atoi_inline(&mut code);
+        if offset >= -128 {
+            code.extend_from_slice(&[0x48, 0x89, 0x45]);
+            code.push(offset as u8);
+        } else {
+            code.extend_from_slice(&[0x48, 0x89, 0x85]);
+            code.extend_from_slice(&offset.to_le_bytes());
+        }
+        code.extend_from_slice(&[0x49, 0xFF, 0xC6]); // inc r14
+    }
+
+    // Let bindings.
+    let mut binding_offsets = offsets.clone();
+    let mut next_slot = -((nfields as i32 + 1) * 8);
+    for (name, expr) in &rule.logic.bindings {
+        let field_ranges = build_field_ranges(input_concept);
+        emit_eval_expr(&mut code, expr, &rule.input_name, &binding_offsets, all_rules, &field_ranges)?;
+        if next_slot >= -128 {
+            code.extend_from_slice(&[0x48, 0x89, 0x45]);
+            code.push(next_slot as u8);
+        } else {
+            code.extend_from_slice(&[0x48, 0x89, 0x85]);
+            code.extend_from_slice(&next_slot.to_le_bytes());
+        }
+        binding_offsets.insert(name.as_str(), next_slot);
+        next_slot -= 8;
+    }
+
+    let field_ranges = build_field_ranges(input_concept);
+    emit_eval_record_expr(
+        &mut code,
+        &rule.logic.value,
+        loop_top,
+        output_concept,
+        all_concepts,
+        rule,
+        input_concept,
+        all_rules,
+        &binding_offsets,
+        &field_ranges,
+    )?;
+
+    // exit:
+    let exit_pos = code.len();
+    let exit_offset = exit_pos as i32 - (exit_patch as i32 + 4);
+    code[exit_patch..exit_patch + 4].copy_from_slice(&exit_offset.to_le_bytes());
+    code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x3C, 0x00, 0x00, 0x00]); // mov rax, 60
+    code.extend_from_slice(&[0x48, 0x31, 0xFF]); // xor rdi, rdi
+    code.extend_from_slice(&[0x0F, 0x05]); // syscall
+
+    Ok(code)
+}
+
+/// Walk an expression in record context. Each leaf is a Record constructor
+/// that emits its own JSON line + jmp loop_top. Structural If/else branches
+/// recurse; each arm plants its own terminator.
+fn emit_eval_record_expr(
+    code: &mut Vec<u8>,
+    expr: &Expr,
+    loop_top: usize,
+    output_concept: &Concept,
+    all_concepts: &[&Concept],
+    rule: &Rule,
+    input_concept: &Concept,
+    all_rules: &HashMap<&str, &Rule>,
+    offsets: &HashMap<&str, i32>,
+    field_ranges: &HashMap<&str, (i64, i64)>,
+) -> Result<(), NativeError> {
+    match expr {
+        Expr::Record(name, fields) => {
+            // Defensive check: the constructor's concept name should match the
+            // declared output concept. The verifier already enforced this, but
+            // a mismatch here would silently produce wrong-shape JSON.
+            if name != &output_concept.name {
+                return Err(NativeError {
+                    message: format!(
+                        "record constructor '{}' does not match declared output concept '{}'",
+                        name, output_concept.name
+                    ),
+                });
+            }
+            emit_record_as_json(
+                code,
+                fields,
+                output_concept,
+                rule,
+                input_concept,
+                all_rules,
+                offsets,
+                field_ranges,
+            )?;
+            // jmp loop_top
+            code.push(0xE9);
+            let off = loop_top as i32 - (code.len() + 4) as i32;
+            code.extend_from_slice(&off.to_le_bytes());
+            Ok(())
+        }
+        Expr::If(cond, then_e, else_e) => {
+            emit_eval_expr(code, cond, &rule.input_name, offsets, all_rules, field_ranges)?;
+            code.extend_from_slice(&[0x48, 0x85, 0xC0]); // test rax, rax
+            code.push(0x0F);
+            code.push(0x84); // je rel32
+            let else_patch = code.len();
+            code.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+
+            emit_eval_record_expr(
+                code, then_e, loop_top, output_concept, all_concepts, rule,
+                input_concept, all_rules, offsets, field_ranges,
+            )?;
+
+            let else_pos = code.len();
+            let else_off = else_pos as i32 - (else_patch as i32 + 4);
+            code[else_patch..else_patch + 4].copy_from_slice(&else_off.to_le_bytes());
+            emit_eval_record_expr(
+                code, else_e, loop_top, output_concept, all_concepts, rule,
+                input_concept, all_rules, offsets, field_ranges,
+            )?;
+            Ok(())
+        }
+        other => Err(NativeError {
+            message: format!(
+                "record-context expression not yet supported in native: {:?}",
+                other
+            ),
+        }),
+    }
+}
+
+/// Serialize a record as a single-line JSON object to stdout. The field
+/// ordering follows the concept's declaration (stable across runs), not the
+/// source order in the constructor. Fields must all be declared (the verifier
+/// has already enforced this).
+fn emit_record_as_json(
+    code: &mut Vec<u8>,
+    fields: &[(String, Expr)],
+    output_concept: &Concept,
+    rule: &Rule,
+    _input_concept: &Concept,
+    all_rules: &HashMap<&str, &Rule>,
+    offsets: &HashMap<&str, i32>,
+    field_ranges: &HashMap<&str, (i64, i64)>,
+) -> Result<(), NativeError> {
+    let provided: HashMap<&str, &Expr> = fields.iter().map(|(n, e)| (n.as_str(), e)).collect();
+
+    for (i, decl) in output_concept.fields.iter().enumerate() {
+        // Static prefix: `{"name":` for the first field, `,"name":` for the rest.
+        // For text values we also append the opening quote.
+        let mut prefix = String::new();
+        prefix.push(if i == 0 { '{' } else { ',' });
+        prefix.push('"');
+        prefix.push_str(&decl.name);
+        prefix.push('"');
+        prefix.push(':');
+        if matches!(decl.ty, Type::Text) {
+            prefix.push('"');
+        }
+        emit_write_static_to_fd(code, prefix.as_bytes(), 1);
+
+        let value_expr = provided.get(decl.name.as_str()).ok_or_else(|| NativeError {
+            message: format!("record is missing field '{}'", decl.name),
+        })?;
+
+        match decl.ty {
+            Type::Number => {
+                // Evaluate → rax, write digits to stdout, no newline.
+                emit_eval_expr(code, value_expr, &rule.input_name, offsets, all_rules, field_ranges)?;
+                emit_itoa_to_stdout_no_newline(code);
+            }
+            Type::Text => {
+                // Write the text bytes then the closing quote.
+                emit_text_write_to_fd(
+                    code,
+                    value_expr,
+                    1,
+                    rule,
+                    _input_concept,
+                    all_rules,
+                    offsets,
+                    field_ranges,
+                )?;
+                emit_write_static_to_fd(code, b"\"", 1);
+            }
+            _ => {
+                return Err(NativeError {
+                    message: format!(
+                        "native record field '{}' has unsupported type",
+                        decl.name
+                    ),
+                });
+            }
+        }
+    }
+
+    // Closing "}\n"
+    emit_write_static_to_fd(code, b"}\n", 1);
+    Ok(())
 }
 
 /// Emit a standalone binary for a reaction. Reads N-field records from argv
@@ -2462,6 +2870,25 @@ mod tests {
             code.windows(7).any(|w| w == open_pattern),
             "expected `mov rax, 2` (sys_open) in emitted code"
         );
+    }
+
+    #[test]
+    fn native_compiles_record_output_rule() {
+        // classify_invoice returns a Classification record. Native emits one
+        // JSON line per record to stdout, with concept-declared field order.
+        use std::fs;
+        let src = fs::read_to_string("examples/classify.verbose")
+            .expect("examples/classify.verbose is expected to exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let out = std::env::temp_dir().join("verbosec_test_classify_invoice");
+        compile_native(&program, "classify_invoice", out.to_str().unwrap())
+            .expect("native compile of record-output rule should succeed");
+        let size = fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
+        // Two record arms + itoa + multiple static-write syscalls — ~1 KB.
+        assert!(size > 500 && size < 3_000, "unexpected binary size: {}", size);
+        let _ = fs::remove_file(out);
     }
 
     #[test]

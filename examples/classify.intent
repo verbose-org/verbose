@@ -1,0 +1,3 @@
+1. An invoice has an amount and a number of days overdue.
+2. A classification has a priority tier and an escalation window (in days).
+3. Classify an invoice: if it has been overdue for more than 30 days, priority is "high" and the escalation window is twice the overdue days; otherwise priority is "normal" and the escalation window is 0.

@@ -1,0 +1,52 @@
+@verbose 0.1.0
+
+-- Demonstrates a rule whose output is a user-declared concept (record).
+-- The native backend emits one JSON line per record to stdout:
+--     {"priority":"high","escalation_days":60}
+-- Structural if/else between two record-producing branches is compiled
+-- via continuation-passing: each arm emits its own JSON + jmp loop_top,
+-- no intermediate record value materialized in registers.
+
+
+concept Invoice
+  @intention: "An invoice has an amount and a number of days overdue"
+  @source: classify.intent:1
+
+  fields:
+    amount       : number [0, 10000000]
+    days_overdue : number [0, 10000]
+
+
+concept Classification
+  @intention: "A classification has a priority tier and an escalation window in days"
+  @source: classify.intent:2
+
+  fields:
+    priority         : text
+    escalation_days  : number
+
+
+rule classify_invoice
+  @intention: "High priority + 2x escalation when overdue, else normal + 0"
+  @source: classify.intent:3
+
+  input:
+    i : Invoice
+
+  output:
+    c : Classification
+
+  logic:
+    c = if i.days_overdue > 30 then Classification { priority: "high", escalation_days: i.days_overdue * 2 } else Classification { priority: "normal", escalation_days: 0 }
+
+  proofs:
+    purity:
+      reads   : [i.days_overdue]
+      writes  : []
+      calls   : []
+      verdict : pure
+    termination:
+      form  : constant_bound
+      bound : 5
+    determinism:
+      form : total

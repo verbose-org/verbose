@@ -1,0 +1,6 @@
+[
+  {"amount": 15000, "days_overdue": 45},
+  {"amount":   500, "days_overdue": 10},
+  {"amount":  8000, "days_overdue": 31},
+  {"amount":  3000, "days_overdue":  0}
+]
