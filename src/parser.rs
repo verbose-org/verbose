@@ -538,6 +538,21 @@ impl Parser {
                 let predicate = self.parse_expr()?;
                 self.expect_kind(TokenKind::RParen)?;
                 Ok(Expr::Quantifier(kind, Box::new(collection), var, Box::new(predicate)))
+            } else if (name == "map" || name == "filter") && self.check_kind(&TokenKind::LParen) {
+                // map(coll, var => body)    returns collection(T)
+                // filter(coll, var => pred) returns collection of same element type
+                self.advance(); // (
+                let collection = self.parse_expr()?;
+                self.expect_kind(TokenKind::Comma)?;
+                let var = self.expect_ident_any()?;
+                self.expect_kind(TokenKind::FatArrow)?;
+                let body = self.parse_expr()?;
+                self.expect_kind(TokenKind::RParen)?;
+                if name == "map" {
+                    Ok(Expr::Map(Box::new(collection), var, Box::new(body)))
+                } else {
+                    Ok(Expr::Filter(Box::new(collection), var, Box::new(body)))
+                }
             } else if self.check_kind(&TokenKind::LParen) {
                 self.advance();
                 let mut args = Vec::new();
@@ -1285,6 +1300,30 @@ rule important_invoice
         match &p.items[1] {
             Item::Rule(r) => {
                 assert!(matches!(&r.logic.value, Expr::Fold(_, _, _, _, _)));
+            }
+            _ => panic!("expected rule"),
+        }
+    }
+
+    #[test]
+    fn map_parsed() {
+        let src = "@verbose 0.1.0\n\nconcept T\n  @intention: \"t\"\n  @source: f.intent:1\n  fields:\n    items : collection(X)\n\nrule test\n  @intention: \"t\"\n  @source: f.intent:1\n  input:\n    t : T\n  output:\n    r : collection(number)\n  logic:\n    r = map(t.items, x => x + 1)\n  proofs:\n    purity:\n      reads: [t.items]\n      writes: []\n      calls: []\n      verdict: pure\n    termination:\n      form: constant_bound\n      bound: 2\n    determinism:\n      form: total\n";
+        let p = parse(src).unwrap();
+        match &p.items[1] {
+            Item::Rule(r) => {
+                assert!(matches!(&r.logic.value, Expr::Map(_, _, _)));
+            }
+            _ => panic!("expected rule"),
+        }
+    }
+
+    #[test]
+    fn filter_parsed() {
+        let src = "@verbose 0.1.0\n\nconcept T\n  @intention: \"t\"\n  @source: f.intent:1\n  fields:\n    items : collection(X)\n\nrule test\n  @intention: \"t\"\n  @source: f.intent:1\n  input:\n    t : T\n  output:\n    r : collection(X)\n  logic:\n    r = filter(t.items, x => x > 0)\n  proofs:\n    purity:\n      reads: [t.items]\n      writes: []\n      calls: []\n      verdict: pure\n    termination:\n      form: constant_bound\n      bound: 2\n    determinism:\n      form: total\n";
+        let p = parse(src).unwrap();
+        match &p.items[1] {
+            Item::Rule(r) => {
+                assert!(matches!(&r.logic.value, Expr::Filter(_, _, _)));
             }
             _ => panic!("expected rule"),
         }

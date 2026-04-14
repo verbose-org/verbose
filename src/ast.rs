@@ -132,6 +132,15 @@ pub enum Expr {
     /// fold(collection, initial, acc_name, item_name => body)
     /// Functional reduction: accumulates a value over a collection.
     Fold(Box<Expr>, Box<Expr>, String, String, Box<Expr>),
+    /// map(collection, var => body)
+    /// Transforms each element through a pure expression, returning collection(T).
+    /// Same proof structure as Quantifier: reads/writes/calls from the body are
+    /// checked with the lambda variable scoped out.
+    Map(Box<Expr>, String, Box<Expr>),
+    /// filter(collection, var => pred)
+    /// Keeps elements for which pred is true, returning a collection of the same
+    /// element type. Same proof structure as Quantifier.
+    Filter(Box<Expr>, String, Box<Expr>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

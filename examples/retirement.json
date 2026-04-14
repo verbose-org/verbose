@@ -1,0 +1,12 @@
+[
+  {
+    "employees": [
+      {"name": "Alice",  "age": 34},
+      {"name": "Bob",    "age": 67},
+      {"name": "Carol",  "age": 58},
+      {"name": "Dmitri", "age": 71},
+      {"name": "Eve",    "age": 22},
+      {"name": "Farid",  "age": 65}
+    ]
+  }
+]

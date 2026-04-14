@@ -50,6 +50,7 @@ examples/
   reactions.*      Basic reaction (print on trigger)
   alerts.*         Dynamic reactions with interpolated values
   app.* + stdlib/  Module system demo (use + import)
+  retirement.*     map + filter on a collection of employees
   demo.html        Browser demo (WASM)
 
 tools/
@@ -67,6 +68,7 @@ tools/
 - Rule calls: `important_invoice(i)` — rules can compose
 - Quantifiers: `all(collection, var => predicate)`, `any(...)`
 - Aggregation: `sum(coll, var => expr)`, `count(coll, var => pred)`, `min(...)`, `max(...)`
+- Per-element: `map(coll, var => expr)` → collection(T), `filter(coll, var => pred)` → collection of same element type
 - General reduction: `fold(collection, initial, acc, var => body)`
 - Proofs: purity (reads/writes/calls/verdict), termination (form/bound), determinism (form)
 - Hints: `vectorizable`, `parallel`, `cache_result`, `overflow: [min, max]`
@@ -94,6 +96,19 @@ LLVM is NOT the primary backend. Verbose emits machine code directly because:
 3. LLVM adds overhead (prologues, stack protectors, alignment) that Verbose proves unnecessary
 
 LLVM may become an OPTIONAL fallback backend for platforms without a native emitter. But all architecture decisions must keep the direct-emission path viable and primary.
+
+## Transpilation Strategy (rejected direction)
+
+Rust/Go/other source → Verbose transpilation is **rejected** for the same reason as LLVM: the source does not contain Verbose's declarations (reads/writes, overflow bounds, termination form, verdict, intention). Any transpiler must either emit trivial proofs (losing all verification value and all hint-driven optimizations) or infer them (violating the zero-trust rule that proofs are declared, never guessed).
+
+The healthier answers to "don't isolate from existing ecosystems" are:
+1. **Binary interop** — Verbose emits ELF; other languages link via FFI.
+2. **Assisted generation** — tooling that suggests a Verbose equivalent from foreign source, with proof slots filled by a human or AI (not by the compiler).
+3. **Manual module bindings** — external functions imported through an explicit Verbose declaration stating the proofs on our side.
+
+Rule: **if the proof is not declared, it does not exist**. No pipeline fabricates proofs.
+
+Full rationale: README.md → "Why Not Transpile Rust/Go → Verbose?".
 
 ## Development Rules
 

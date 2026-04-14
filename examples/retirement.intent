@@ -1,0 +1,5 @@
+1. An employee has a name and an age.
+2. A workforce is a collection of employees.
+3. An employee is of retirement age when they are 65 or older.
+4. For each employee in the workforce, compute whether they are of retirement age.
+5. The retirees are the subset of employees who are of retirement age.

@@ -307,6 +307,21 @@ fn collect_expr_facts(
                 }
             }
         }
+        Expr::Map(collection, var_name, body)
+        | Expr::Filter(collection, var_name, body) => {
+            // Same purity structure as Quantifier: the lambda variable shadows
+            // any reads scoped to it. Reads outside the lambda scope propagate.
+            collect_expr_facts(collection, reads, calls);
+            let mut inner_reads = HashSet::new();
+            let mut inner_calls = HashSet::new();
+            collect_expr_facts(body, &mut inner_reads, &mut inner_calls);
+            calls.extend(inner_calls);
+            for path in inner_reads {
+                if path.first().map(|s| s.as_str()) != Some(var_name.as_str()) {
+                    reads.insert(path);
+                }
+            }
+        }
     }
 }
 
@@ -486,6 +501,7 @@ fn count_operations(expr: &Expr) -> usize {
         Expr::Call(_, args) => 1 + args.iter().map(count_operations).sum::<usize>(),
         Expr::Quantifier(_, coll, _, pred) => 1 + count_operations(coll) + count_operations(pred),
         Expr::Fold(coll, init, _, _, body) => 1 + count_operations(coll) + count_operations(init) + count_operations(body),
+        Expr::Map(coll, _, body) | Expr::Filter(coll, _, body) => 1 + count_operations(coll) + count_operations(body),
     }
 }
 
@@ -631,6 +647,83 @@ rule important_invoice
     fn happy_path() {
         let errs = verify_str(VALID);
         assert!(errs.is_empty(), "expected no errors, got {:#?}", errs);
+    }
+
+    #[test]
+    fn map_reads_propagate_correctly() {
+        // Verifier treats Map like Quantifier: the collection read is declared,
+        // but the lambda variable's uses are scoped out.
+        let src = r#"@verbose 0.1.0
+
+concept Bag
+  @intention: "a bag of numbers"
+  @source: collections.intent:1
+  fields:
+    items : collection(number)
+
+rule incremented
+  @intention: "add one to each element"
+  @source: collections.intent:2
+  input:
+    b : Bag
+  output:
+    r : collection(number)
+  logic:
+    r = map(b.items, x => x + 1)
+  proofs:
+    purity:
+      reads   : [b.items]
+      writes  : []
+      calls   : []
+      verdict : pure
+    termination:
+      form  : constant_bound
+      bound : 2
+    determinism:
+      form : total
+"#;
+        let errs = verify_str(src);
+        assert!(errs.is_empty(), "expected no errors, got {:#?}", errs);
+    }
+
+    #[test]
+    fn filter_missing_collection_read_rejected() {
+        // If the reads declaration omits the collection being filtered,
+        // the verifier must catch it — same rule as Quantifier.
+        let src = r#"@verbose 0.1.0
+
+concept Bag
+  @intention: "a bag of numbers"
+  @source: collections.intent:1
+  fields:
+    items : collection(number)
+
+rule positives
+  @intention: "keep positives"
+  @source: collections.intent:2
+  input:
+    b : Bag
+  output:
+    r : collection(number)
+  logic:
+    r = filter(b.items, x => x > 0)
+  proofs:
+    purity:
+      reads   : []
+      writes  : []
+      calls   : []
+      verdict : pure
+    termination:
+      form  : variable_bound
+    determinism:
+      form : total
+"#;
+        let errs = verify_str(src);
+        assert!(
+            errs.iter().any(|e| e.context.contains("purity.reads")),
+            "expected a purity.reads error, got {:#?}",
+            errs
+        );
     }
 
     #[test]

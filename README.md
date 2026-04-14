@@ -302,6 +302,92 @@ Verbose native binaries are 400-700 bytes. LLVM would produce 10-50 KB minimum (
 
 LLVM may become an optional backend for platforms we don't support natively. But the primary path stays direct — that's where the advantage lives.
 
+## Why Not Transpile Rust/Go → Verbose?
+
+A natural question: could we accept programs written in Rust, Go, or another existing language, transpile them into Verbose, and then compile? The appeal is clear — existing users keep their language, and gain Verbose's verification and codegen "for free".
+
+We reject this path for the same reason we reject LLVM: **the source does not contain the information Verbose needs**, and inventing it breaks the model.
+
+| Verbose requires (declared) | Source program provides |
+|---|---|
+| `reads: [amount]` verified against the AST | No notion of "field read" — any memory access counts |
+| `overflow: [0, 1000000]` | At best inferred from type width |
+| `termination: structural` with bound | Unannotated loops and recursion |
+| `verdict: "critical"` with rationale | Nothing |
+| `@intention "..."` tied to a numbered line | Unstructured comments |
+
+A Rust→Verbose transpiler has two options, both bad:
+
+- **Trivial proofs** — emit Verbose with `reads: [*]`, no bounds, no hints. The compiler verifies nothing of value, and the hint-driven optimizations (SIMD from `vectorizable`, parallel fork from `parallel`, constant folding from bounded intervals) never trigger. Verbose becomes a slower path to the same binary.
+- **Inferred proofs** — try to deduce the declarations from the source. This is exactly what Verbose refuses by design: *the compiler verifies, it does not guess*. Inference is a trust boundary we explicitly chose not to cross.
+
+There is also a paradigm gap. Verbose is declarative, organized around rules that compose over concepts. Most Rust/Go code is imperative, with ownership, traits, goroutines — constructs that do not map to rules. A transpiler would either restrict to a trivial subset (pure functions over structs, which interests no one) or emit non-idiomatic Verbose that benefits from none of its specific optimizations.
+
+### The "don't upset existing users" concern
+
+The concern is real: a language isolated from every existing ecosystem is hard to adopt. But automatic transpilation does not address it well. A Rust developer happy with Rust will not migrate for a slower, less complete pipeline — they will reasonably ask "why not just `rustc`?" and they will be right.
+
+The healthier answers to the same concern:
+
+- **Binary interop** — Verbose already emits ELF. Verbose binaries can be linked from Rust/Go via FFI. Users keep their language and call Verbose code for the parts where verification matters (business rules, critical paths).
+- **Assisted generation, not automatic translation** — a tool that reads a function in another language and *suggests* a Verbose equivalent with proof slots to be completed by a human or an AI. The proofs remain declared and verified, not inferred.
+- **Manual module bindings** — importing external functions through an explicit Verbose declaration that states the proofs on our side. The declaration is human-audited, not machine-derived.
+
+The rule stays the same across both questions (LLVM and transpilation from existing languages): **if the proof is not declared, it does not exist**. Anything that fabricates proofs to make the pipeline work is a fiction that corrupts the model.
+
+## On Drawing Lines
+
+Rejecting LLVM and rejecting source-language ingestion will read as arrogant to some — *who are you to decide this?* We decide it, for this POC, because every line a language does **not** draw is a contract it will later be asked to honor. Scoping early is cheaper than retracting scope after users have built expectations on it. Anticipating the question "but why not also…?" before it is asked is the point, not the refusal. These are declarations of responsibility, not superiority.
+
+## On Human Readers
+
+Verbose is designed **by and for** AI. That reorders the human role — it does not remove it. Humans sit second in the *writing* seat, and first in the *auditing* seat.
+
+A language built purely for machines could have been opaque: bytecode, s-expressions, a dense IR with no concession to legibility. Verbose is none of those. The syntax is indented and named, every block carries an `@intention`, every declaration traces back to a numbered line of a plain-language `.intent` file. That readable surface is deliberate — it is where the human disagrees when they should.
+
+Will humans write Verbose directly tomorrow? Probably yes. Not because it is natural, but because it is learnable — the way reading JSON, regex, or unified diffs became learnable for a generation of developers who had never seen them before. The shift required is in how we *think* about code (declaring proofs, bounds, and effects), not in how we *read* it. Verbose does not ask humans to disappear; it asks them to move from authors to auditors, and it makes that move legible on purpose.
+
+## On Evolving the Language
+
+A language evolves. People will ask for shorter forms, friendlier syntax, method chaining, type inference, default hints, macros. Some of these are healthy; some would silently undo what Verbose stands for. We need one test, applied the same way every time.
+
+> A new construct (syntax, builtin, shortcut) is **admitted** if and only if every piece of information that was previously declared explicitly remains declared explicitly afterward. If the novelty shortens the code by *hiding* a declaration, it is refused — even if it is pleasant.
+
+The criterion is not "fewer characters" but "zero declarations lost". Comfort never buys implicitness.
+
+**`.intent` and `.verbose` follow this rule differently:**
+
+- `.intent` is prose. The compiler never verifies it directly — the AI does the translation job. So `.intent` can evolve freely: richer phrasings, recognized patterns, section headers, cross-references. More expressive prose gives the AI more signal without touching the verification model. "Pleasant" is the only criterion that applies here.
+
+- `.verbose` is the verified layer. Every addition must pass the test above. A construct that collapses intermediate `@intention` markers, elides `input:`/`output:` through inference, hides a purity proof behind method chaining, or supplies default hints without declaration — rejected.
+
+### Admitted
+
+- **`map(coll, var => expr)` and `filter(coll, var => pred)`** — same proof structure as the existing `sum`/`count`/`all`/`any` (reads, writes, calls, termination all declared). Fills a real expressive gap ("for each X, compute Y", "keep X where Y") without hiding anything.
+- **Justified hints.** `vectorizable: "no cross-element dependency"` instead of bare `vectorizable`. Adds a declaration (the reason), does not remove one. The *why* becomes part of the audit surface.
+- **Stratified rule layers.** `rule foo : layer(domain)` adds a declaration and a verified constraint (a domain rule cannot call an io rule). More explicit, more checked.
+- **Typed results.** `Result(T, E)` makes the failure path a declared part of the output instead of an implicit panic. Adds a declaration of what can go wrong.
+- **Source traceability at field level.** `amount : number [0, 1000000] @source "business_rules.intent:7"` extends existing `@source` from rules down to fields. More traceability, nothing lost.
+- **Stronger verifier with no new syntax.** Verifying that `amount mod 100` stays within `[0, 99]` given `amount : [0, 10000]` — pure compiler improvement, no language change.
+- **Richer `.intent` prose patterns.** Section headers, cross-references, domain templates, documented natural-language patterns the AI maps reliably. `.intent` is never verified directly, so evolution there is unrestricted.
+
+### Refused (and why)
+
+Each of these is useful. None of them preserves the declared chain. Documented here so future contributors (and future sessions) inherit the same answer.
+
+- **Proof inference from the rule body.** The compiler would deduce `reads` / `writes` / `calls` instead of checking them. Violates zero-trust: the proof becomes a fact the compiler itself invents, so "the compiler verifies the compiler". The moment a proof is derived rather than stated, the audit chain breaks.
+- **Type inference that elides `input:` / `output:`.** The shape of data becomes a fact derived from usage. An AI hallucination about field names or types would no longer be caught by the type declaration — it would be silently absorbed.
+- **Method chaining** (`users.filter(p).map(f).sum()`). Collapses multiple logical steps into one anonymous expression. Intermediate `@intention` markers disappear. The auditor can no longer review each step, only the endpoint.
+- **Implicit numeric promotion** (narrow → wide, int → float). Hides a change of overflow domain. The declared range on one side no longer constrains the range on the other side.
+- **Default hints** (assume `vectorizable` when no `call` is present, etc.). Hides the optimization decision. The human reading the code can no longer tell what the compiler was authorized to do.
+- **Macros / metaprogramming.** Move verification to a layer where "what is being checked" is itself derived from code. The thing the auditor reads stops being the thing the compiler verifies.
+- **Operator overloading.** Hides the purity of arithmetic. `a + b` could become a function call with unknown `reads` / `writes` / `calls`.
+- **Destructuring that deduces shape** (`let {name, age} = user`). Same category as type inference: the expected shape becomes a fact derived from the pattern instead of from a declaration.
+- **Implicit null / optional propagation** (monadic `?` operator, silent `None` → skip). Hides a failure path behind a punctuation mark. Use a typed `Result` / `Optional` where the failure path is declared.
+- **Global configuration that changes semantics** (compiler flags that turn features on/off for a file). The meaning of the code starts depending on something outside the code. Unacceptable for audit.
+
+The bar is not "is this useful" — every item above is useful. The bar is "does it preserve the declared chain". When in doubt, the answer is no.
+
 ## Long-Term Direction
 
 Verbose explores a future where AI-generated programs carry enough explicit information to inform not only correctness and optimization, but also execution strategy and target preference.

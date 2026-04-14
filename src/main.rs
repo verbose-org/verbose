@@ -437,12 +437,7 @@ fn main() {
             for record in records.iter() {
                 match interpreter::eval_rule(rule, &all_rules, record) {
                     Ok(val) => {
-                        let json_val = match &val {
-                            interpreter::Value::Number(n) => format!("{}", n),
-                            interpreter::Value::Bool(b) => format!("{}", b),
-                            interpreter::Value::Text(s) => format!("\"{}\"", s),
-                            _ => format!("\"{}\"", val),
-                        };
+                        let json_val = value_to_json(&val);
                         results.push(format!(
                             "{{\"{}\":{}}}",
                             rule.output_name, json_val
@@ -473,6 +468,33 @@ fn main() {
                     }
                 }
             }
+        }
+    }
+}
+
+/// Serialize a runtime value as a JSON literal.
+/// Collections (Value::List) emit as real JSON arrays so map/filter outputs
+/// round-trip correctly; records emit as JSON objects. Text strings escape " and \.
+fn value_to_json(val: &interpreter::Value) -> String {
+    match val {
+        interpreter::Value::Number(n) => n.to_string(),
+        interpreter::Value::Bool(b) => b.to_string(),
+        interpreter::Value::Text(s) => {
+            let escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
+            format!("\"{}\"", escaped)
+        }
+        interpreter::Value::List(items) => {
+            let parts: Vec<String> = items.iter().map(value_to_json).collect();
+            format!("[{}]", parts.join(","))
+        }
+        interpreter::Value::Record(fields) => {
+            let mut keys: Vec<&String> = fields.keys().collect();
+            keys.sort();
+            let parts: Vec<String> = keys
+                .into_iter()
+                .map(|k| format!("\"{}\":{}", k, value_to_json(&fields[k])))
+                .collect();
+            format!("{{{}}}", parts.join(","))
         }
     }
 }

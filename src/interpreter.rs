@@ -356,6 +356,40 @@ fn eval_expr(
             }
             Ok(acc)
         }
+        Expr::Map(collection, var_name, body) => {
+            let coll_val = eval_expr(collection, env, all_rules)?;
+            let items = match coll_val {
+                Value::List(items) => items,
+                _ => return Err(RuntimeError { message: "map requires a collection".into() }),
+            };
+            let mut out = Vec::with_capacity(items.len());
+            for item in &items {
+                let mut inner_env = env.clone();
+                inner_env.insert(var_name.clone(), item.clone());
+                out.push(eval_expr(body, &inner_env, all_rules)?);
+            }
+            Ok(Value::List(out))
+        }
+        Expr::Filter(collection, var_name, predicate) => {
+            let coll_val = eval_expr(collection, env, all_rules)?;
+            let items = match coll_val {
+                Value::List(items) => items,
+                _ => return Err(RuntimeError { message: "filter requires a collection".into() }),
+            };
+            let mut out = Vec::new();
+            for item in &items {
+                let mut inner_env = env.clone();
+                inner_env.insert(var_name.clone(), item.clone());
+                match eval_expr(predicate, &inner_env, all_rules)? {
+                    Value::Bool(true) => out.push(item.clone()),
+                    Value::Bool(false) => {}
+                    _ => return Err(RuntimeError {
+                        message: "filter predicate must return bool".into(),
+                    }),
+                }
+            }
+            Ok(Value::List(out))
+        }
         Expr::Call(name, args) => {
             let called = all_rules
                 .iter()
@@ -768,6 +802,103 @@ mod tests {
         let mut input = HashMap::new();
         input.insert("x".into(), Value::Number(42));
         assert!(eval_rule(&rule, &[], &input).is_err());
+    }
+
+    #[test]
+    fn map_doubles_each_element() {
+        use crate::ast::*;
+        let rule = Rule {
+            name: "m".into(),
+            intention: "t".into(),
+            source: SourceRef { file: "t.intent".into(), line: 1 },
+            input_name: "i".into(),
+            input_ty: Type::Named("T".into()),
+            output_name: "r".into(),
+            output_ty: Type::Collection("number".into()),
+            logic: LogicStmt {
+                bindings: vec![],
+                target: "r".into(),
+                value: Expr::Map(
+                    Box::new(Expr::Field(Box::new(Expr::Ident("i".into())), "items".into())),
+                    "x".into(),
+                    Box::new(Expr::Binary(
+                        BinOp::Mul,
+                        Box::new(Expr::Ident("x".into())),
+                        Box::new(Expr::Number(2)),
+                    )),
+                ),
+            },
+            proofs: Proofs {
+                purity: Purity {
+                    reads: vec![Path { segments: vec!["i".into(), "items".into()] }],
+                    writes: vec![], calls: vec![], verdict: PurityVerdict::Pure,
+                },
+                termination: Termination { form: TerminationForm::VariableBound, bound: None },
+                determinism: Determinism { form: DeterminismForm::Total },
+            },
+            hints: None,
+        };
+        let mut input = HashMap::new();
+        input.insert(
+            "items".into(),
+            Value::List(vec![Value::Number(1), Value::Number(2), Value::Number(3)]),
+        );
+        let result = eval_rule(&rule, &[], &input).unwrap();
+        assert_eq!(
+            result,
+            Value::List(vec![Value::Number(2), Value::Number(4), Value::Number(6)])
+        );
+    }
+
+    #[test]
+    fn filter_keeps_matching_elements() {
+        use crate::ast::*;
+        let rule = Rule {
+            name: "f".into(),
+            intention: "t".into(),
+            source: SourceRef { file: "t.intent".into(), line: 1 },
+            input_name: "i".into(),
+            input_ty: Type::Named("T".into()),
+            output_name: "r".into(),
+            output_ty: Type::Collection("number".into()),
+            logic: LogicStmt {
+                bindings: vec![],
+                target: "r".into(),
+                value: Expr::Filter(
+                    Box::new(Expr::Field(Box::new(Expr::Ident("i".into())), "items".into())),
+                    "x".into(),
+                    Box::new(Expr::Binary(
+                        BinOp::Gt,
+                        Box::new(Expr::Ident("x".into())),
+                        Box::new(Expr::Number(10)),
+                    )),
+                ),
+            },
+            proofs: Proofs {
+                purity: Purity {
+                    reads: vec![Path { segments: vec!["i".into(), "items".into()] }],
+                    writes: vec![], calls: vec![], verdict: PurityVerdict::Pure,
+                },
+                termination: Termination { form: TerminationForm::VariableBound, bound: None },
+                determinism: Determinism { form: DeterminismForm::Total },
+            },
+            hints: None,
+        };
+        let mut input = HashMap::new();
+        input.insert(
+            "items".into(),
+            Value::List(vec![
+                Value::Number(5),
+                Value::Number(15),
+                Value::Number(8),
+                Value::Number(42),
+            ]),
+        );
+        let result = eval_rule(&rule, &[], &input).unwrap();
+        assert_eq!(
+            result,
+            Value::List(vec![Value::Number(15), Value::Number(42)])
+        );
     }
 
     #[test]

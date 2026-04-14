@@ -1,0 +1,75 @@
+@verbose 0.1.0
+
+-- Demonstrates map and filter: per-element computation and selection.
+-- The user's original phrasing: "for each user, check whether they are retired".
+-- map  returns a collection(bool) — the retirement status of each employee.
+-- filter returns a collection(Employee) — only those of retirement age.
+
+
+concept Employee
+  @intention: "An employee has a name and an age"
+  @source: retirement.intent:1
+
+  fields:
+    name : text
+    age  : number [0, 150]
+
+
+concept Workforce
+  @intention: "A workforce is a collection of employees"
+  @source: retirement.intent:2
+
+  fields:
+    employees : collection(Employee)
+
+
+rule retirement_status
+  @intention: "For each employee, true when they are of retirement age"
+  @source: retirement.intent:4
+
+  input:
+    w : Workforce
+
+  output:
+    status : collection(bool)
+
+  logic:
+    status = map(w.employees, e => e.age >= 65)
+
+  proofs:
+    purity:
+      reads   : [w.employees]
+      writes  : []
+      calls   : []
+      verdict : pure
+    termination:
+      form  : constant_bound
+      bound : 2
+    determinism:
+      form : total
+
+
+rule retirees
+  @intention: "The subset of employees who are of retirement age"
+  @source: retirement.intent:5
+
+  input:
+    w : Workforce
+
+  output:
+    subset : collection(Employee)
+
+  logic:
+    subset = filter(w.employees, e => e.age >= 65)
+
+  proofs:
+    purity:
+      reads   : [w.employees]
+      writes  : []
+      calls   : []
+      verdict : pure
+    termination:
+      form  : constant_bound
+      bound : 2
+    determinism:
+      form : total

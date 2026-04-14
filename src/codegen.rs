@@ -175,8 +175,11 @@ fn emit_expr(expr: &Expr, input_name: &str, concept: Option<&Concept>) -> String
         ),
         Expr::Not(inner) => format!("!{}", emit_expr(inner, input_name, concept)),
         Expr::Neg(inner) => format!("-{}", emit_expr(inner, input_name, concept)),
-        Expr::Fold(_, _, _, _, _) | Expr::Quantifier(_, _, _, _) => {
-            "(/* quantifier: use --run interpreter */false)".to_string()
+        Expr::Fold(_, _, _, _, _)
+        | Expr::Quantifier(_, _, _, _)
+        | Expr::Map(_, _, _)
+        | Expr::Filter(_, _, _) => {
+            "(/* collection op: use --run interpreter */false)".to_string()
         }
         Expr::Call(name, _args) => {
             if let Some(c) = concept {
