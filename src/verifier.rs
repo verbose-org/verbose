@@ -142,6 +142,140 @@ fn verify_rule(
     if let Some(caller_layer) = rule.layer {
         check_layer_discipline(rule, caller_layer, &facts, all_rules, errors);
     }
+
+    // Type-shape check: the logic expression must be compatible with the
+    // declared output_ty. We do bidirectional checking from the top down —
+    // Ok/Err can only appear where a Result is expected, branches of if/else
+    // and match_result inherit the expected type, and inferable leaf types
+    // (literals, arithmetic, comparisons, rule calls, input fields) are
+    // compared exactly. When inference is not possible (let-bound vars,
+    // lambda-bound vars, Map/Filter/Fold bodies), we stay silent rather than
+    // false-positive — the evolution rule says we never fabricate proofs we
+    // cannot verify.
+    check_expr_against(
+        &rule.logic.value,
+        &rule.output_ty,
+        rule,
+        all_rules,
+        input_concept,
+        errors,
+    );
+}
+
+/// Bidirectional type check. `expected` is the type the surrounding context
+/// expects this expression to produce. Errors are emitted for:
+///   - Ok/Err constructors where the expected type is not a Result,
+///   - Ok(x) where x's inferable type != T (in Result(T, _)),
+///   - Err(e) where e's inferable type != E (in Result(_, E)),
+///   - Any inferable expression whose type != expected.
+fn check_expr_against(
+    expr: &Expr,
+    expected: &Type,
+    rule: &Rule,
+    all_rules: &[&Rule],
+    concept: Option<&Concept>,
+    errors: &mut Vec<VerifyError>,
+) {
+    match (expr, expected) {
+        (Expr::Ok(inner), Type::Result(t, _)) => {
+            check_expr_against(inner, t, rule, all_rules, concept, errors);
+        }
+        (Expr::Err(inner), Type::Result(_, e)) => {
+            check_expr_against(inner, e, rule, all_rules, concept, errors);
+        }
+        (Expr::Ok(_), other) | (Expr::Err(_), other) => {
+            errors.push(VerifyError {
+                context: format!("rule '{}' / logic", rule.name),
+                message: format!(
+                    "Result constructor (Ok/Err) used where the expected type is '{}'; only allowed when output is a Result type",
+                    type_display(other),
+                ),
+            });
+        }
+        (Expr::If(cond, then_e, else_e), _) => {
+            check_expr_against(cond, &Type::Bool, rule, all_rules, concept, errors);
+            check_expr_against(then_e, expected, rule, all_rules, concept, errors);
+            check_expr_against(else_e, expected, rule, all_rules, concept, errors);
+        }
+        (Expr::MatchResult(_target, _, ok_body, _, err_body), _) => {
+            // Both arms must produce `expected`. The target should be a Result —
+            // checking that requires inferring through lambda bindings, which
+            // this pass does not track. Skipped, not fabricated.
+            check_expr_against(ok_body, expected, rule, all_rules, concept, errors);
+            check_expr_against(err_body, expected, rule, all_rules, concept, errors);
+        }
+        _ => {
+            if let Some(inferred) = infer_expr_type(expr, rule, all_rules, concept) {
+                if &inferred != expected {
+                    errors.push(VerifyError {
+                        context: format!("rule '{}' / logic", rule.name),
+                        message: format!(
+                            "expression has type '{}' but context expects '{}'",
+                            type_display(&inferred),
+                            type_display(expected),
+                        ),
+                    });
+                }
+            }
+            // Else: inference not possible here — stay silent.
+        }
+    }
+}
+
+/// Best-effort type inference. Returns None when the expression's type cannot
+/// be determined without tracking let/lambda bindings or deep semantic info.
+fn infer_expr_type(
+    expr: &Expr,
+    rule: &Rule,
+    all_rules: &[&Rule],
+    concept: Option<&Concept>,
+) -> Option<Type> {
+    match expr {
+        Expr::Number(_) => Some(Type::Number),
+        Expr::Text(_) => Some(Type::Text),
+        Expr::Ident(name) if name == &rule.input_name => Some(rule.input_ty.clone()),
+        Expr::Ident(_) => None, // let/lambda-bound — not tracked in this pass
+        Expr::Field(base, field_name) => {
+            if let (Expr::Ident(n), Some(c)) = (base.as_ref(), concept) {
+                if n == &rule.input_name {
+                    return c
+                        .fields
+                        .iter()
+                        .find(|f| &f.name == field_name)
+                        .map(|f| f.ty.clone());
+                }
+            }
+            None
+        }
+        Expr::Binary(op, _, _) => match op {
+            BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod => Some(Type::Number),
+            BinOp::Gt | BinOp::Lt | BinOp::GtEq | BinOp::LtEq | BinOp::Eq | BinOp::NotEq
+            | BinOp::And | BinOp::Or => Some(Type::Bool),
+        },
+        Expr::Not(_) => Some(Type::Bool),
+        Expr::Neg(_) => Some(Type::Number),
+        Expr::Call(name, _) => all_rules
+            .iter()
+            .find(|r| r.name == *name)
+            .map(|r| r.output_ty.clone()),
+        Expr::If(_, then_e, _) => infer_expr_type(then_e, rule, all_rules, concept),
+        Expr::Quantifier(_, _, _, _) => Some(Type::Bool),
+        // Map/Filter/Fold/Ok/Err/MatchResult: deferred until lambda binding
+        // tracking lands. Returning None means we do not check; we also do not
+        // falsely accept.
+        _ => None,
+    }
+}
+
+fn type_display(ty: &Type) -> String {
+    match ty {
+        Type::Number => "number".to_string(),
+        Type::Bool => "bool".to_string(),
+        Type::Text => "text".to_string(),
+        Type::Collection(inner) => format!("collection({})", inner),
+        Type::Named(n) => n.clone(),
+        Type::Result(t, e) => format!("Result({}, {})", type_display(t), type_display(e)),
+    }
 }
 
 /// Enforce the sealed-subgraph layer discipline: a rule that declares a layer
@@ -728,6 +862,134 @@ rule important_invoice
     fn happy_path() {
         let errs = verify_str(VALID);
         assert!(errs.is_empty(), "expected no errors, got {:#?}", errs);
+    }
+
+    #[test]
+    fn ok_in_non_result_rule_rejected() {
+        // Using Ok/Err in a rule whose output is bool (not Result) — the
+        // type-shape check must flag this.
+        let src = r#"@verbose 0.1.0
+
+concept T
+  @intention: "x"
+  @source: invoices.intent:1
+  fields:
+    amount : number
+
+rule bad
+  @intention: "y"
+  @source: invoices.intent:2
+  input:
+    t : T
+  output:
+    r : bool
+  logic:
+    r = Ok(t.amount)
+  proofs:
+    purity:
+      reads   : [t.amount]
+      writes  : []
+      calls   : []
+      verdict : pure
+    termination:
+      form  : constant_bound
+      bound : 1
+    determinism:
+      form : total
+"#;
+        let errs = verify_str(src);
+        assert!(
+            errs.iter().any(|e| e.context.contains("logic")
+                && e.message.contains("Result constructor")),
+            "expected a Result-constructor-in-non-Result-rule error, got {:#?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn ok_content_wrong_type_rejected() {
+        // Declared output is Result(number, text), but the Ok arm contains a
+        // text literal. The bidirectional check must catch this.
+        let src = r#"@verbose 0.1.0
+
+concept T
+  @intention: "x"
+  @source: invoices.intent:1
+  fields:
+    amount : number
+
+rule bad
+  @intention: "y"
+  @source: invoices.intent:2
+  input:
+    t : T
+  output:
+    r : Result(number, text)
+  logic:
+    r = if t.amount > 0 then Ok("oops") else Err("no")
+  proofs:
+    purity:
+      reads   : [t.amount]
+      writes  : []
+      calls   : []
+      verdict : pure
+    termination:
+      form  : constant_bound
+      bound : 3
+    determinism:
+      form : total
+"#;
+        let errs = verify_str(src);
+        assert!(
+            errs.iter().any(|e| e.context.contains("logic")
+                && e.message.contains("text")
+                && e.message.contains("number")),
+            "expected a text/number mismatch error inside Ok, got {:#?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn top_level_output_type_mismatch_rejected() {
+        // Declared output is number, but the logic produces a bool
+        // (a comparison). Catches the coarse shape error.
+        let src = r#"@verbose 0.1.0
+
+concept T
+  @intention: "x"
+  @source: invoices.intent:1
+  fields:
+    amount : number
+
+rule bad
+  @intention: "y"
+  @source: invoices.intent:2
+  input:
+    t : T
+  output:
+    r : number
+  logic:
+    r = t.amount > 0
+  proofs:
+    purity:
+      reads   : [t.amount]
+      writes  : []
+      calls   : []
+      verdict : pure
+    termination:
+      form  : constant_bound
+      bound : 1
+    determinism:
+      form : total
+"#;
+        let errs = verify_str(src);
+        assert!(
+            errs.iter().any(|e| e.context.contains("logic")
+                && e.message.contains("bool")
+                && e.message.contains("number")),
+            "expected a bool/number mismatch error at the top level, got {:#?}",
+            errs
+        );
     }
 
     #[test]

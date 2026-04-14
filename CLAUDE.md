@@ -72,6 +72,7 @@ tools/
 - Aggregation: `sum(coll, var => expr)`, `count(coll, var => pred)`, `min(...)`, `max(...)`
 - Per-element: `map(coll, var => expr)` → collection(T), `filter(coll, var => pred)` → collection of same element type
 - Result: `Ok(v)` / `Err(e)` constructors; `match_result(r, v => ok_body, e => err_body)` consumer with both arms explicit
+- Verifier type check: bidirectional shape check on logic — `Ok`/`Err` rejected outside `Result(...)` context; `Ok(x)`/`Err(e)` content checked against declared arms when inferable; top-level output type checked against declared; conservative on lambda/let-bound vars to avoid false positives
 - General reduction: `fold(collection, initial, acc, var => body)`
 - Proofs: purity (reads/writes/calls/verdict), termination (form/bound), determinism (form)
 - Hints: `vectorizable: "reason"`, `parallel: "reason"`, `cache_result: "reason"` (justification required, parser rejects bare form), `overflow: [min, max]` (bounds mechanically verified against interval arithmetic)
