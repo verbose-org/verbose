@@ -107,6 +107,17 @@ LLVM is NOT the primary backend. Verbose emits machine code directly because:
 
 LLVM may become an OPTIONAL fallback backend for platforms without a native emitter. But all architecture decisions must keep the direct-emission path viable and primary.
 
+## Two Execution Modes, Two Security Profiles
+
+Security is pillar #1. Each feature is judged by what attack surface it adds, not by whether it is "useful". Under that frame, the compiler exposes two execution modes — not one primary and one fallback, but **two modes with deliberately different surfaces**:
+
+- **Native / WASM (minimal surface)**: scalar rules, arithmetic, comparisons, field-range exploitation, overflow-proved code. No heap, no allocation, no tagged values, no dynamic dispatch. The binary is ~700 bytes, auditable line by line, free of libc/GC/syscall machinery beyond what each rule explicitly needs. Used when the rule must survive in a hostile or constrained environment (embedded, signing, critical gate).
+- **Interpreter (rich surface)**: the full language — collections, `map`/`filter`/`fold`, `Result`, `Record`, `match_result`, `@layer`. Runs in a Rust binary that parses JSON and evaluates expressions. Wider surface than native (it has a JSON parser, allocator, etc.) but **every expression is still verified by the same compiler** against the same proofs. Used when the rule needs to express structured domain logic.
+
+This asymmetry is intentional. The native backend's trustworthiness comes **from what it refuses** — forcing it to grow to "completeness" would add an allocator and tagged layouts and turn it into a 50 KB binary with the same attack surface as any C program, which defeats the point. The right move when the native backend rejects an expression is **not** "add support", it is "choose the interpreter if the rule needs that expression".
+
+Both modes verify the same AST with the same proofs. A rule accepted by the compiler is safe under both modes; only the execution profile differs. Future contributors adding a feature should ask "does this belong in native, or only in the interpreter?" — and if the answer is "only interpreter", the rejection in native.rs is **correct**, not a TODO.
+
 ## Transpilation Strategy (rejected direction)
 
 Rust/Go/other source → Verbose transpilation is **rejected** for the same reason as LLVM: the source does not contain Verbose's declarations (reads/writes, overflow bounds, termination form, verdict, intention). Any transpiler must either emit trivial proofs (losing all verification value and all hint-driven optimizations) or infer them (violating the zero-trust rule that proofs are declared, never guessed).
