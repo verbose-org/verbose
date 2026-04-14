@@ -265,17 +265,52 @@ impl<'a> Lexer<'a> {
         }
 
         if c == b'"' {
+            // String literal with a small, closed set of escape sequences:
+            // \n, \t, \\, \". Anything else after a backslash is a lex error —
+            // we do not silently pass "\q" through as two characters, because
+            // that would let typos slip into string content without warning.
             self.advance();
-            let start = self.pos;
+            let mut s = String::new();
             while self.pos < self.src.len() && self.src[self.pos] != b'"' {
-                if self.src[self.pos] == b'\n' {
+                let ch = self.src[self.pos];
+                if ch == b'\n' {
                     return Err(LexError {
                         line: start_line,
                         col: start_col,
                         message: "unterminated string literal".into(),
                     });
                 }
-                self.advance();
+                if ch == b'\\' {
+                    self.advance();
+                    if self.pos >= self.src.len() {
+                        return Err(LexError {
+                            line: start_line,
+                            col: start_col,
+                            message: "unterminated string literal after '\\'".into(),
+                        });
+                    }
+                    let esc = self.src[self.pos];
+                    match esc {
+                        b'n' => s.push('\n'),
+                        b't' => s.push('\t'),
+                        b'\\' => s.push('\\'),
+                        b'"' => s.push('"'),
+                        other => {
+                            return Err(LexError {
+                                line: self.line,
+                                col: self.col,
+                                message: format!(
+                                    "unknown escape '\\{}' (supported: \\n, \\t, \\\\, \\\")",
+                                    other as char
+                                ),
+                            });
+                        }
+                    }
+                    self.advance();
+                } else {
+                    s.push(ch as char);
+                    self.advance();
+                }
             }
             if self.pos >= self.src.len() {
                 return Err(LexError {
@@ -284,9 +319,6 @@ impl<'a> Lexer<'a> {
                     message: "unterminated string literal".into(),
                 });
             }
-            let s = std::str::from_utf8(&self.src[start..self.pos])
-                .unwrap()
-                .to_string();
             self.advance();
             self.emit_token(TokenKind::StringLit(s), start_line, start_col);
             return Ok(());
@@ -626,6 +658,32 @@ mod tests {
                 TokenKind::Newline,
                 TokenKind::Eof,
             ]
+        );
+    }
+
+    #[test]
+    fn string_escape_sequences() {
+        // \n, \t, \\, \" are the only supported escapes — anything else is
+        // a lex error, not a silent pass-through. That means a typo in a
+        // string literal surfaces at compile time instead of being written
+        // to a file as literal backslash + letter.
+        let src = "\"line1\\nline2\\ttabbed\\\\slash\\\"quote\"\n";
+        let tokens = Lexer::new(src).tokenize().unwrap();
+        let s = tokens.iter().find_map(|t| match &t.kind {
+            TokenKind::StringLit(s) => Some(s.clone()),
+            _ => None,
+        }).expect("no StringLit token produced");
+        assert_eq!(s, "line1\nline2\ttabbed\\slash\"quote");
+    }
+
+    #[test]
+    fn unknown_escape_rejected() {
+        let src = "\"oops\\q\"\n";
+        let err = Lexer::new(src).tokenize().err();
+        assert!(err.is_some(), "expected lex error on \\q escape");
+        assert!(
+            format!("{}", err.unwrap()).contains("unknown escape"),
+            "expected 'unknown escape' message",
         );
     }
 

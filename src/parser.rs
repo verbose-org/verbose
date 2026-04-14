@@ -949,22 +949,35 @@ impl Parser {
                 self.expect_kind(TokenKind::Indent)?;
                 while !self.check_kind(&TokenKind::Dedent) && !self.at_eof() {
                     let kind_name = self.expect_ident_any()?;
-                    let kind = match kind_name.as_str() {
-                        "print" => EffectKind::Print,
+                    let effect = match kind_name.as_str() {
+                        "print" => {
+                            // print e1 e2 ... — positional args printed space-separated.
+                            let mut args = Vec::new();
+                            while !self.check_kind(&TokenKind::Newline) && !self.at_eof() {
+                                args.push(self.parse_expr()?);
+                            }
+                            Effect::Print(args)
+                        }
+                        "append_file" => {
+                            // append_file "path" content_expr
+                            // Path MUST be a string literal at the source level —
+                            // the auditor must be able to read every file path
+                            // this program can touch. No dynamic paths.
+                            let path = self.expect_string().map_err(|_| {
+                                self.error("append_file requires a string literal path — dynamic paths are refused so the auditor can see every file this program can write")
+                            })?;
+                            let content = self.parse_expr()?;
+                            Effect::AppendFile { path, content }
+                        }
                         _ => {
                             return Err(self.error(&format!(
-                                "unknown effect '{}' (allowed: print)",
+                                "unknown effect '{}' (allowed: print, append_file)",
                                 kind_name
                             )))
                         }
                     };
-                    let mut args = Vec::new();
-                    // Parse effect arguments until newline
-                    while !self.check_kind(&TokenKind::Newline) && !self.at_eof() {
-                        args.push(self.parse_expr()?);
-                    }
                     self.expect_kind(TokenKind::Newline)?;
-                    effects.push(Effect { kind, args });
+                    effects.push(effect);
                 }
                 self.expect_kind(TokenKind::Dedent)?;
             } else {
@@ -1433,7 +1446,7 @@ rule important_invoice
                 assert_eq!(rx.name, "notify");
                 assert_eq!(rx.trigger, "r");
                 assert_eq!(rx.effects.len(), 1);
-                assert_eq!(rx.effects[0].kind, EffectKind::Print);
+                assert!(matches!(rx.effects[0], Effect::Print(_)));
             }
             _ => panic!("expected reaction"),
         }
@@ -1482,6 +1495,34 @@ rule important_invoice
             }
             _ => panic!("expected rule"),
         }
+    }
+
+    #[test]
+    fn append_file_with_literal_path_parsed() {
+        let src = "@verbose 0.1.0\n\nconcept T\n  @intention: \"t\"\n  @source: f.intent:1\n  fields:\n    x : number\n\nrule trig\n  @intention: \"t\"\n  @source: f.intent:1\n  input:\n    t : T\n  output:\n    b : bool\n  logic:\n    b = t.x > 0\n  proofs:\n    purity:\n      reads: [t.x]\n      writes: []\n      calls: []\n      verdict: pure\n    termination:\n      form: constant_bound\n      bound: 1\n    determinism:\n      form : total\n\nreaction log\n  @intention: \"log\"\n  @source: f.intent:1\n  trigger: trig\n  effects:\n    append_file \"/tmp/x.log\" \"hi\\n\"\n";
+        let p = parse(src).unwrap();
+        match &p.items[2] {
+            Item::Reaction(rx) => match &rx.effects[0] {
+                Effect::AppendFile { path, .. } => assert_eq!(path, "/tmp/x.log"),
+                other => panic!("expected AppendFile, got {:?}", other),
+            },
+            _ => panic!("expected reaction"),
+        }
+    }
+
+    #[test]
+    fn append_file_with_non_literal_path_rejected() {
+        // The path MUST be a string literal at the source level. Using a
+        // field or a concat() expression is refused so the auditor can see
+        // every file this program could ever touch.
+        let src = "@verbose 0.1.0\n\nconcept T\n  @intention: \"t\"\n  @source: f.intent:1\n  fields:\n    x : number\n\nrule trig\n  @intention: \"t\"\n  @source: f.intent:1\n  input:\n    t : T\n  output:\n    b : bool\n  logic:\n    b = t.x > 0\n  proofs:\n    purity:\n      reads: [t.x]\n      writes: []\n      calls: []\n      verdict: pure\n    termination:\n      form: constant_bound\n      bound: 1\n    determinism:\n      form : total\n\nreaction log\n  @intention: \"log\"\n  @source: f.intent:1\n  trigger: trig\n  effects:\n    append_file t.x \"hi\\n\"\n";
+        let err = parse(src).err().expect("non-literal path should be rejected");
+        let msg = format!("{:?}", err);
+        assert!(
+            msg.contains("string literal") || msg.contains("dynamic"),
+            "expected error about literal path, got {}",
+            msg
+        );
     }
 
     #[test]

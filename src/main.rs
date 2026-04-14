@@ -394,15 +394,46 @@ fn main() {
                         };
                         if should_fire {
                             for effect in &rx.effects {
-                                match &effect.kind {
-                                    ast::EffectKind::Print => {
-                                        let args: Vec<String> = effect.args.iter().map(|arg| {
+                                match effect {
+                                    ast::Effect::Print(args) => {
+                                        let parts: Vec<String> = args.iter().map(|arg| {
                                             match interpreter::eval_rule_expr(arg, trigger_rule, &all_rules, record) {
                                                 Ok(v) => format!("{}", v),
                                                 Err(_) => format!("{:?}", arg),
                                             }
                                         }).collect();
-                                        println!("  [{}] EFFECT print: {}", idx, args.join(" "));
+                                        println!("  [{}] EFFECT print: {}", idx, parts.join(" "));
+                                    }
+                                    ast::Effect::AppendFile { path, content } => {
+                                        // Evaluate the content expression, coerce to text,
+                                        // append to the declared path. The path is a
+                                        // literal at parse time, so this is the only
+                                        // file this effect can ever touch.
+                                        let text = match interpreter::eval_rule_expr(content, trigger_rule, &all_rules, record) {
+                                            Ok(interpreter::Value::Text(s)) => s,
+                                            Ok(interpreter::Value::Number(n)) => n.to_string(),
+                                            Ok(interpreter::Value::Bool(b)) => b.to_string(),
+                                            Ok(other) => {
+                                                eprintln!("  [{}] EFFECT append_file: content must be scalar, got {}", idx, other);
+                                                process::exit(1);
+                                            }
+                                            Err(e) => {
+                                                eprintln!("  [{}] EFFECT append_file: {}", idx, e);
+                                                process::exit(1);
+                                            }
+                                        };
+                                        use std::fs::OpenOptions;
+                                        use std::io::Write;
+                                        let res = OpenOptions::new()
+                                            .create(true)
+                                            .append(true)
+                                            .open(path)
+                                            .and_then(|mut f| f.write_all(text.as_bytes()));
+                                        if let Err(e) = res {
+                                            eprintln!("  [{}] EFFECT append_file '{}': {}", idx, path, e);
+                                            process::exit(1);
+                                        }
+                                        println!("  [{}] EFFECT append_file '{}': {} bytes", idx, path, text.len());
                                     }
                                 }
                             }

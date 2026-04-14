@@ -1,0 +1,50 @@
+@verbose 0.1.0
+
+-- Demonstrates append_file: classify records, persist findings to a file.
+-- The path "/tmp/audit.log" is a LITERAL — the auditor reading this source
+-- can see every file this program is allowed to touch, with no ambiguity
+-- from runtime data. No dynamic paths are accepted by the parser.
+
+
+concept Purchase
+  @intention: "A purchase has an amount and the customer's age"
+  @source: audit_log.intent:1
+
+  fields:
+    amount        : number [0, 1000000]
+    customer_age  : number [0, 150]
+
+
+rule is_suspicious
+  @intention: "A purchase is suspicious when the customer is under 18"
+  @source: audit_log.intent:2
+
+  input:
+    p : Purchase
+
+  output:
+    suspicious : bool
+
+  logic:
+    suspicious = p.customer_age < 18
+
+  proofs:
+    purity:
+      reads   : [p.customer_age]
+      writes  : []
+      calls   : []
+      verdict : pure
+    termination:
+      form  : constant_bound
+      bound : 1
+    determinism:
+      form : total
+
+
+reaction audit_suspicious
+  @intention: "Append a line to the audit log for every suspicious purchase"
+  @source: audit_log.intent:3
+
+  trigger: is_suspicious
+  effects:
+    append_file "/tmp/audit.log" concat("suspicious purchase: amount=", p.amount, " age=", p.customer_age, "\n")

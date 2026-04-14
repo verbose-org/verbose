@@ -130,8 +130,9 @@ This document catalogs the prose patterns the generation tool maps reliably to s
 | Prose pattern | Verbose construct |
 |---|---|
 | *"When X happens, do Y"* | `reaction` with a `trigger:` naming the rule that fires it |
-| *"Log the critical invoices"* | reaction with a `print` effect and a trigger |
+| *"Log / print the critical invoices"* | reaction with a `print` effect and a trigger |
 | *"Notify the admin when ..."* | reaction whose `trigger` is a bool rule and whose effect prints an interpolated message |
+| *"Append a line to a log file when X happens"* | reaction with an `append_file "/path"` effect; path must be a string literal, content is a text expression (use `concat(...)` for dynamic content) |
 
 ### Example
 

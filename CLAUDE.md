@@ -54,6 +54,7 @@ examples/
   purchase.*       Result(T, E) — declared failure path (Ok/Err)
   layers.*         @layer stratification — architectural discipline verified
   bonus.*          record construction — map produces collection(BonusReport)
+  audit_log.*      append_file reaction — classify then log to /tmp/audit.log
   demo.html        Browser demo (WASM)
 
 tools/
@@ -81,7 +82,8 @@ tools/
 - Hints: `vectorizable: "reason"`, `parallel: "reason"`, `cache_result: "reason"` (justification required, parser rejects bare form), `overflow: [min, max]` (bounds mechanically verified against interval arithmetic)
 - Traceability: `@intention` (string), `@source` (file:line), `@layer: domain|application|interface` (optional, sealed-subgraph discipline)
 - Modules: `use "stdlib/finance.verbose"`
-- Reactions: declared side effects with trigger rules and dynamic print
+- Reactions: declared side effects with trigger rules; effects today are `print` (to stdout) and `append_file "path" content` (to a file). Path is a string literal at parse time — dynamic paths are refused so the auditor reads every file the program can ever touch.
+- String escapes: `\n`, `\t`, `\\`, `\"` — closed set, unknown escape is a lex error (no silent pass-through for typos).
 - Three backends: interpreter (--run), Rust transpiler (--compile), native x86-64 (--native), WASM (--wasm)
 
 ## Writing .intent Prose

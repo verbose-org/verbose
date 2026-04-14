@@ -48,12 +48,37 @@ pub fn verify_program(program: &Program, base_dir: &StdPath) -> Vec<VerifyError>
                         message: msg,
                     });
                 }
-                // Verify trigger rule exists
-                if !all_rules.iter().any(|r| r.name == rx.trigger) {
+                // Verify trigger rule exists + find it for context-typed
+                // checks on effect expressions.
+                let trigger_rule = all_rules.iter().find(|r| r.name == rx.trigger).copied();
+                if trigger_rule.is_none() {
                     errors.push(VerifyError {
                         context: format!("reaction '{}' / trigger", rx.name),
                         message: format!("trigger references unknown rule '{}'", rx.trigger),
                     });
+                }
+                if let Some(rule) = trigger_rule {
+                    // The concept in scope inside effects is the input concept
+                    // of the triggering rule.
+                    let input_concept = match &rule.input_ty {
+                        Type::Named(n) => concepts.get(n).copied(),
+                        _ => None,
+                    };
+                    for effect in &rx.effects {
+                        if let Effect::AppendFile { content, .. } = effect {
+                            // content must produce text at runtime — the
+                            // interpreter writes bytes from a text value.
+                            check_expr_against(
+                                content,
+                                &Type::Text,
+                                rule,
+                                &all_rules,
+                                input_concept,
+                                &concepts,
+                                &mut errors,
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -1005,6 +1030,55 @@ rule important_invoice
     fn happy_path() {
         let errs = verify_str(VALID);
         assert!(errs.is_empty(), "expected no errors, got {:#?}", errs);
+    }
+
+    #[test]
+    fn append_file_non_text_content_rejected() {
+        // The content expression of append_file must produce text at runtime.
+        // Passing a bare number is a type error caught at compile time.
+        let src = r#"@verbose 0.1.0
+
+concept T
+  @intention: "x"
+  @source: invoices.intent:1
+  fields:
+    x : number
+
+rule trig
+  @intention: "y"
+  @source: invoices.intent:2
+  input:
+    t : T
+  output:
+    b : bool
+  logic:
+    b = t.x > 0
+  proofs:
+    purity:
+      reads   : [t.x]
+      writes  : []
+      calls   : []
+      verdict : pure
+    termination:
+      form  : constant_bound
+      bound : 1
+    determinism:
+      form : total
+
+reaction bad
+  @intention: "z"
+  @source: invoices.intent:2
+  trigger: trig
+  effects:
+    append_file "/tmp/x.log" t.x
+"#;
+        let errs = verify_str(src);
+        assert!(
+            errs.iter().any(|e| e.message.contains("type 'number'")
+                && e.message.contains("expects 'text'")),
+            "expected number/text mismatch on append_file content, got {:#?}",
+            errs
+        );
     }
 
     #[test]

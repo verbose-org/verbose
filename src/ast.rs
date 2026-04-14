@@ -31,15 +31,19 @@ pub struct Reaction {
     pub effects: Vec<Effect>,
 }
 
+/// A declared reaction effect. Each variant carries exactly the fields its
+/// kind needs; there is no generic "args bag". Adding a new effect is a new
+/// variant with typed fields, so the pattern cannot degrade into "untagged
+/// stringly-typed args".
 #[derive(Debug, Clone)]
-pub struct Effect {
-    pub kind: EffectKind,
-    pub args: Vec<Expr>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum EffectKind {
-    Print,
+pub enum Effect {
+    /// print expr... — write to stdout. Arguments are printed space-separated.
+    Print(Vec<Expr>),
+    /// append_file "path" content — append the content text to the file.
+    /// The path is a string LITERAL (not an expression), so the auditor can
+    /// read the source and see every file path this program can touch.
+    /// No implicit newline: the content is exactly what is written.
+    AppendFile { path: String, content: Expr },
 }
 
 #[derive(Debug, Clone)]
