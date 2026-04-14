@@ -138,6 +138,60 @@ fn verify_rule(
     if let Some(hints) = &rule.hints {
         check_hints(rule, hints, &facts, concepts, errors);
     }
+
+    if let Some(caller_layer) = rule.layer {
+        check_layer_discipline(rule, caller_layer, &facts, all_rules, errors);
+    }
+}
+
+/// Enforce the sealed-subgraph layer discipline: a rule that declares a layer
+/// may only call rules that ALSO declare a layer, and only layers that its
+/// own layer is allowed to call (domain->domain, application->domain|application,
+/// interface->any). Crossing into unlayered code is forbidden — that would let
+/// a layered rule transitively touch anything and defeat the point.
+fn check_layer_discipline(
+    rule: &Rule,
+    caller_layer: Layer,
+    facts: &LogicFacts,
+    all_rules: &[&Rule],
+    errors: &mut Vec<VerifyError>,
+) {
+    for call_path in &facts.calls {
+        if call_path.len() != 1 {
+            continue;
+        }
+        let call_name = &call_path[0];
+        let callee = match all_rules.iter().find(|r| r.name == *call_name) {
+            Some(r) => *r,
+            None => continue, // unknown-call error is reported separately above
+        };
+        match callee.layer {
+            None => {
+                errors.push(VerifyError {
+                    context: format!("rule '{}' / @layer", rule.name),
+                    message: format!(
+                        "rule declares layer '{}' but calls unlayered rule '{}'; a layered rule may only call other layered rules",
+                        caller_layer.as_str(),
+                        call_name
+                    ),
+                });
+            }
+            Some(target) if !caller_layer.can_call(target) => {
+                errors.push(VerifyError {
+                    context: format!("rule '{}' / @layer", rule.name),
+                    message: format!(
+                        "rule at layer '{}' calls '{}' at layer '{}'; '{}' rules may not call '{}' rules",
+                        caller_layer.as_str(),
+                        call_name,
+                        target.as_str(),
+                        caller_layer.as_str(),
+                        target.as_str()
+                    ),
+                });
+            }
+            Some(_) => {} // allowed
+        }
+    }
 }
 
 fn check_hints(
@@ -674,6 +728,196 @@ rule important_invoice
     fn happy_path() {
         let errs = verify_str(VALID);
         assert!(errs.is_empty(), "expected no errors, got {:#?}", errs);
+    }
+
+    #[test]
+    fn layer_application_calls_domain_accepted() {
+        // Positive: an application rule calls a domain rule. Allowed by the
+        // stratification (application can call domain or application).
+        let src = r#"@verbose 0.1.0
+
+concept Invoice
+  @intention: "x"
+  @source: invoices.intent:1
+  fields:
+    amount : number
+
+rule is_large
+  @intention: "y"
+  @source: invoices.intent:2
+  @layer: domain
+  input:
+    i : Invoice
+  output:
+    large : bool
+  logic:
+    large = i.amount > 10000
+  proofs:
+    purity:
+      reads   : [i.amount]
+      writes  : []
+      calls   : []
+      verdict : pure
+    termination:
+      form  : constant_bound
+      bound : 1
+    determinism:
+      form : total
+
+rule flag_critical
+  @intention: "y"
+  @source: invoices.intent:2
+  @layer: application
+  input:
+    i : Invoice
+  output:
+    flag : bool
+  logic:
+    flag = is_large(i)
+  proofs:
+    purity:
+      reads   : [i]
+      writes  : []
+      calls   : [is_large]
+      verdict : pure
+    termination:
+      form  : constant_bound
+      bound : 1
+    determinism:
+      form : total
+"#;
+        let errs = verify_str(src);
+        assert!(errs.is_empty(), "expected no errors, got {:#?}", errs);
+    }
+
+    #[test]
+    fn layer_domain_calls_application_rejected() {
+        // Negative: a domain rule tries to call an application rule.
+        // The sealed-subgraph discipline forbids the reverse direction.
+        let src = r#"@verbose 0.1.0
+
+concept Invoice
+  @intention: "x"
+  @source: invoices.intent:1
+  fields:
+    amount : number
+
+rule upper_orchestration
+  @intention: "y"
+  @source: invoices.intent:2
+  @layer: application
+  input:
+    i : Invoice
+  output:
+    big : bool
+  logic:
+    big = i.amount > 10000
+  proofs:
+    purity:
+      reads   : [i.amount]
+      writes  : []
+      calls   : []
+      verdict : pure
+    termination:
+      form  : constant_bound
+      bound : 1
+    determinism:
+      form : total
+
+rule lower_domain
+  @intention: "y"
+  @source: invoices.intent:2
+  @layer: domain
+  input:
+    i : Invoice
+  output:
+    flag : bool
+  logic:
+    flag = upper_orchestration(i)
+  proofs:
+    purity:
+      reads   : [i]
+      writes  : []
+      calls   : [upper_orchestration]
+      verdict : pure
+    termination:
+      form  : constant_bound
+      bound : 1
+    determinism:
+      form : total
+"#;
+        let errs = verify_str(src);
+        assert!(
+            errs.iter().any(|e| e.context.contains("@layer")
+                && e.message.contains("domain")
+                && e.message.contains("application")),
+            "expected a layer violation error, got {:#?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn layer_calls_unlayered_rejected() {
+        // Negative: a layered rule calls an unlayered rule. The sealed-subgraph
+        // rule forbids this — otherwise the layer discipline escapes transitively.
+        let src = r#"@verbose 0.1.0
+
+concept Invoice
+  @intention: "x"
+  @source: invoices.intent:1
+  fields:
+    amount : number
+
+rule unlayered_helper
+  @intention: "y"
+  @source: invoices.intent:2
+  input:
+    i : Invoice
+  output:
+    big : bool
+  logic:
+    big = i.amount > 10000
+  proofs:
+    purity:
+      reads   : [i.amount]
+      writes  : []
+      calls   : []
+      verdict : pure
+    termination:
+      form  : constant_bound
+      bound : 1
+    determinism:
+      form : total
+
+rule layered_caller
+  @intention: "y"
+  @source: invoices.intent:2
+  @layer: application
+  input:
+    i : Invoice
+  output:
+    flag : bool
+  logic:
+    flag = unlayered_helper(i)
+  proofs:
+    purity:
+      reads   : [i]
+      writes  : []
+      calls   : [unlayered_helper]
+      verdict : pure
+    termination:
+      form  : constant_bound
+      bound : 1
+    determinism:
+      form : total
+"#;
+        let errs = verify_str(src);
+        assert!(
+            errs.iter().any(|e| e.context.contains("@layer")
+                && e.message.contains("unlayered")),
+            "expected an unlayered-call error, got {:#?}",
+            errs
+        );
     }
 
     #[test]

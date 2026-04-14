@@ -1,0 +1,70 @@
+@verbose 0.1.0
+
+-- Demonstrates @layer: architectural stratification verified at compile time.
+-- is_bulk is a domain rule — a core business concept computed from raw fields.
+-- is_priority is an application rule — orchestrates is_bulk with additional
+-- domain-level logic. The verifier enforces that is_bulk (domain) cannot
+-- call is_priority (application), only the other way around.
+
+
+concept Order
+  @intention: "An order has an amount and a customer tier"
+  @source: layers.intent:1
+
+  fields:
+    amount : number [0, 1000000]
+    tier   : text
+
+
+rule is_bulk
+  @intention: "An order is bulk when its amount exceeds 1000"
+  @source: layers.intent:2
+  @layer: domain
+
+  input:
+    o : Order
+
+  output:
+    bulk : bool
+
+  logic:
+    bulk = o.amount > 1000
+
+  proofs:
+    purity:
+      reads   : [o.amount]
+      writes  : []
+      calls   : []
+      verdict : pure
+    termination:
+      form  : constant_bound
+      bound : 1
+    determinism:
+      form : total
+
+
+rule is_priority
+  @intention: "An order is priority when it is bulk and the customer tier is gold"
+  @source: layers.intent:3
+  @layer: application
+
+  input:
+    o : Order
+
+  output:
+    priority : bool
+
+  logic:
+    priority = is_bulk(o) and o.tier == "gold"
+
+  proofs:
+    purity:
+      reads   : [o, o.tier]
+      writes  : []
+      calls   : [is_bulk]
+      verdict : pure
+    termination:
+      form  : constant_bound
+      bound : 3
+    determinism:
+      form : total

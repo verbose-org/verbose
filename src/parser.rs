@@ -208,6 +208,7 @@ impl Parser {
         let mut logic = None;
         let mut proofs = None;
         let mut hints = None;
+        let mut layer: Option<Layer> = None;
 
         while !self.check_kind(&TokenKind::Dedent) && !self.at_eof() {
             if let Some(attr) = self.peek_attribute_name() {
@@ -224,9 +225,30 @@ impl Parser {
                         source = Some(self.parse_source_ref()?);
                         self.expect_kind(TokenKind::Newline)?;
                     }
+                    "layer" => {
+                        // @layer: domain | application | interface
+                        // Optional. When present, the verifier enforces that this
+                        // rule only calls other layered rules, and only those
+                        // of layers this one is allowed to call.
+                        self.advance();
+                        self.expect_kind(TokenKind::Colon)?;
+                        let name_ident = self.expect_ident_any()?;
+                        layer = Some(match name_ident.as_str() {
+                            "domain" => Layer::Domain,
+                            "application" => Layer::Application,
+                            "interface" => Layer::Interface,
+                            other => {
+                                return Err(self.error(&format!(
+                                    "unknown layer '{}' (allowed: domain, application, interface)",
+                                    other
+                                )));
+                            }
+                        });
+                        self.expect_kind(TokenKind::Newline)?;
+                    }
                     other => {
                         return Err(self.error(&format!(
-                            "unknown attribute '@{}' in rule (allowed: @intention, @source)",
+                            "unknown attribute '@{}' in rule (allowed: @intention, @source, @layer)",
                             other
                         )));
                     }
@@ -273,6 +295,7 @@ impl Parser {
             logic,
             proofs,
             hints,
+            layer,
         })
     }
 

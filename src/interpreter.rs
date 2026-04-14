@@ -495,6 +495,7 @@ mod tests {
                 },
             },
             hints: None,
+            layer: None,
         }
     }
 
@@ -602,6 +603,7 @@ mod tests {
                 determinism: Determinism { form: DeterminismForm::Total },
             },
             hints: None,
+            layer: None,
         };
         let mut input = HashMap::new();
         input.insert("x".into(), Value::Number(42));
@@ -639,6 +641,7 @@ mod tests {
                 determinism: Determinism { form: DeterminismForm::Total },
             },
             hints: None,
+            layer: None,
         };
         let mut input = HashMap::new();
         input.insert("x".into(), Value::Number(10));
@@ -680,6 +683,7 @@ mod tests {
                 determinism: Determinism { form: DeterminismForm::Total },
             },
             hints: None,
+            layer: None,
         };
         let mut input = HashMap::new();
         input.insert("x".into(), Value::Number(15));
@@ -720,6 +724,7 @@ mod tests {
                 determinism: Determinism { form: DeterminismForm::Total },
             },
             hints: None,
+            layer: None,
         };
         let mut input = HashMap::new();
         input.insert("s".into(), Value::Text("active".into()));
@@ -757,6 +762,7 @@ mod tests {
                 determinism: Determinism { form: DeterminismForm::Total },
             },
             hints: None,
+            layer: None,
         };
         let mut input = HashMap::new();
         input.insert("x".into(), Value::Number(42));
@@ -798,6 +804,7 @@ mod tests {
                 determinism: Determinism { form: DeterminismForm::Total },
             },
             hints: None,
+            layer: None,
         };
         let mut input = HashMap::new();
         input.insert("x".into(), Value::Number(15));
@@ -836,6 +843,7 @@ mod tests {
                 determinism: Determinism { form: DeterminismForm::Total },
             },
             hints: None,
+            layer: None,
         };
         let mut input = HashMap::new();
         input.insert("x".into(), Value::Number(42));
@@ -875,6 +883,7 @@ mod tests {
                 determinism: Determinism { form: DeterminismForm::Total },
             },
             hints: None,
+            layer: None,
         };
         let mut input = HashMap::new();
         input.insert(
@@ -921,6 +930,7 @@ mod tests {
                 determinism: Determinism { form: DeterminismForm::Total },
             },
             hints: None,
+            layer: None,
         };
         let mut input = HashMap::new();
         input.insert(
@@ -975,6 +985,7 @@ mod tests {
                 determinism: Determinism { form: DeterminismForm::Total },
             },
             hints: None,
+            layer: None,
         };
         let mut input = HashMap::new();
         input.insert("age".into(), Value::Number(25));
@@ -1045,6 +1056,7 @@ mod tests {
                 determinism: Determinism { form: DeterminismForm::Total },
             },
             hints: None,
+            layer: None,
         };
 
         // Ok path: i.x = 5 → Ok(5*2) → match binds v=10 → Ok(v+1) = Ok(11)

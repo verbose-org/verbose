@@ -136,6 +136,39 @@ This document catalogs the prose patterns the generation tool maps reliably to s
               print "critical invoice amount: {inv.amount}"
 ```
 
+## Architectural layers (optional)
+
+If the prose distinguishes between *core* concepts and *use cases that compose them*, the rule can declare an architectural layer:
+
+| Prose pattern | Verbose attribute |
+|---|---|
+| *"A core / fundamental / domain concept"* | `@layer: domain` |
+| *"An orchestration / use case / workflow combining domain rules"* | `@layer: application` |
+| *"A boundary / interface rule dispatching between layers"* | `@layer: interface` |
+
+The verifier then enforces a sealed-subgraph discipline: a domain rule can only call domain rules; an application rule can call domain or application; an interface rule can call any layered rule. Layered rules may not call unlayered ones, so the discipline cannot be transitively escaped.
+
+The declaration is optional — rules without `@layer` are unchecked. Opt in per rule as the architecture calls for it.
+
+### Example
+
+```
+.intent:  2. An order is bulk when its amount exceeds 1000 (domain rule).
+          3. An order is priority when it is bulk and the tier is gold
+             (application rule composing is_bulk).
+
+.verbose: rule is_bulk
+            @layer: domain
+            ...
+            logic:
+              bulk = o.amount > 1000
+          rule is_priority
+            @layer: application
+            ...
+            logic:
+              priority = is_bulk(o) and o.tier == "gold"
+```
+
 ## Structure conventions
 
 - **Number every line** of prose. The `@source` declaration in `.verbose` points back to a line number, so numbers are the anchor of traceability.

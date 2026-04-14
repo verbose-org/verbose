@@ -88,6 +88,43 @@ pub struct Rule {
     pub logic: LogicStmt,
     pub proofs: Proofs,
     pub hints: Option<Hints>,
+    /// Architectural layer (optional).
+    /// When declared, the verifier enforces that this rule only calls other
+    /// layered rules, and only those of layers this layer is allowed to call.
+    /// Rules without a declared layer are unchecked (backward-compatible),
+    /// but a layered rule may NOT call an unlayered one — layered code is a
+    /// sealed subgraph.
+    pub layer: Option<Layer>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Layer {
+    /// Core business concepts. Can only call other domain rules.
+    Domain,
+    /// Use cases and orchestrations. Can call domain or application rules.
+    Application,
+    /// Boundary-facing rules. Can call any layered rule.
+    Interface,
+}
+
+impl Layer {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Layer::Domain => "domain",
+            Layer::Application => "application",
+            Layer::Interface => "interface",
+        }
+    }
+
+    /// Returns true if a rule at `self` is allowed to call a rule at `target`.
+    /// Captures the stratification: domain < application < interface.
+    pub fn can_call(&self, target: Layer) -> bool {
+        match self {
+            Layer::Domain => target == Layer::Domain,
+            Layer::Application => matches!(target, Layer::Domain | Layer::Application),
+            Layer::Interface => true,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

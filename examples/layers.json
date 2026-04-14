@@ -1,0 +1,6 @@
+[
+  {"amount": 1500, "tier": "gold"},
+  {"amount":  800, "tier": "gold"},
+  {"amount": 2000, "tier": "silver"},
+  {"amount": 5000, "tier": "gold"}
+]

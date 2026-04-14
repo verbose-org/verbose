@@ -52,6 +52,7 @@ examples/
   app.* + stdlib/  Module system demo (use + import)
   retirement.*     map + filter on a collection of employees
   purchase.*       Result(T, E) — declared failure path (Ok/Err)
+  layers.*         @layer stratification — architectural discipline verified
   demo.html        Browser demo (WASM)
 
 tools/
@@ -74,7 +75,7 @@ tools/
 - General reduction: `fold(collection, initial, acc, var => body)`
 - Proofs: purity (reads/writes/calls/verdict), termination (form/bound), determinism (form)
 - Hints: `vectorizable: "reason"`, `parallel: "reason"`, `cache_result: "reason"` (justification required, parser rejects bare form), `overflow: [min, max]` (bounds mechanically verified against interval arithmetic)
-- Traceability: `@intention` (string), `@source` (file:line)
+- Traceability: `@intention` (string), `@source` (file:line), `@layer: domain|application|interface` (optional, sealed-subgraph discipline)
 - Modules: `use "stdlib/finance.verbose"`
 - Reactions: declared side effects with trigger rules and dynamic print
 - Three backends: interpreter (--run), Rust transpiler (--compile), native x86-64 (--native), WASM (--wasm)
