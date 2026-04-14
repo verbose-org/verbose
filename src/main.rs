@@ -177,8 +177,8 @@ fn main() {
         });
         let mut hints_list = Vec::new();
         if let Some(h) = rule.and_then(|r| r.hints.as_ref()) {
-            if h.vectorizable == Some(true) { hints_list.push("SIMD"); }
-            if h.parallel == Some(true) { hints_list.push("parallel"); }
+            if h.vectorizable.is_some() { hints_list.push("SIMD"); }
+            if h.parallel.is_some() { hints_list.push("parallel"); }
             if h.overflow.is_some() { hints_list.push("overflow-safe"); }
         }
 
@@ -224,14 +224,17 @@ fn main() {
                     _ => None,
                 }) {
                     if let Some(hints) = &rule.hints {
-                        if hints.vectorizable == Some(true) {
+                        if let Some(reason) = &hints.vectorizable {
                             println!("  hint: vectorizable — SIMD-eligible (SSE4.2 pcmpgtq)");
+                            println!("        reason: {}", reason);
                         }
-                        if hints.parallel == Some(true) {
+                        if let Some(reason) = &hints.parallel {
                             println!("  hint: parallel — multi-thread eligible");
+                            println!("        reason: {}", reason);
                         }
-                        if hints.cache_result == Some(true) {
+                        if let Some(reason) = &hints.cache_result {
                             println!("  hint: cache_result — memoization eligible");
+                            println!("        reason: {}", reason);
                         }
                     }
                 }

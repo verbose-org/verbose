@@ -39,4 +39,4 @@ rule important_invoice
       form : total
 
   hints:
-    vectorizable : yes
+    vectorizable : "scalar threshold comparison on a single field; no calls and no cross-element dependency"

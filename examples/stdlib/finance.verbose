@@ -65,4 +65,4 @@ rule invoice_overdue
       form : total
 
   hints:
-    vectorizable : yes
+    vectorizable : "scalar comparison on a single field; no calls and no cross-element dependency"

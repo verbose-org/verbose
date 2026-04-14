@@ -61,7 +61,7 @@ rule bonus_rate
       form : total
 
   hints:
-    vectorizable : yes
+    vectorizable : "reads a single field per record with no calls and no cross-element state"
     overflow     : [5, 15]
 
 
@@ -120,7 +120,7 @@ rule is_senior
       form : total
 
   hints:
-    vectorizable : yes
+    vectorizable : "scalar threshold comparison per record; no calls, no cross-element dependency"
 
 
 -- Rule 4: composed rule + string equality + boolean logic (and)

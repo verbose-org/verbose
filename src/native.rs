@@ -68,11 +68,11 @@ pub fn compile_native(
     let is_vectorizable = rule
         .hints
         .as_ref()
-        .map_or(false, |h| h.vectorizable == Some(true));
+        .map_or(false, |h| h.vectorizable.is_some());
     let is_parallel = rule
         .hints
         .as_ref()
-        .map_or(false, |h| h.parallel == Some(true));
+        .map_or(false, |h| h.parallel.is_some());
 
     let mut code = if is_vectorizable && concept.fields.len() == 1 {
         if let Some(threshold) = extract_simple_gt(rule) {

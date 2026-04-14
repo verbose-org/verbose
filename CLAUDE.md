@@ -71,7 +71,7 @@ tools/
 - Per-element: `map(coll, var => expr)` → collection(T), `filter(coll, var => pred)` → collection of same element type
 - General reduction: `fold(collection, initial, acc, var => body)`
 - Proofs: purity (reads/writes/calls/verdict), termination (form/bound), determinism (form)
-- Hints: `vectorizable`, `parallel`, `cache_result`, `overflow: [min, max]`
+- Hints: `vectorizable: "reason"`, `parallel: "reason"`, `cache_result: "reason"` (justification required, parser rejects bare form), `overflow: [min, max]` (bounds mechanically verified against interval arithmetic)
 - Traceability: `@intention` (string), `@source` (file:line)
 - Modules: `use "stdlib/finance.verbose"`
 - Reactions: declared side effects with trigger rules and dynamic print

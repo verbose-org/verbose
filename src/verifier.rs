@@ -147,7 +147,7 @@ fn check_hints(
     concepts: &HashMap<String, &Concept>,
     errors: &mut Vec<VerifyError>,
 ) {
-    if hints.vectorizable == Some(true) {
+    if hints.vectorizable.is_some() {
         if !facts.calls.is_empty() {
             errors.push(VerifyError {
                 context: format!("rule '{}' / hints.vectorizable", rule.name),
@@ -162,7 +162,7 @@ fn check_hints(
         }
     }
 
-    if hints.parallel == Some(true) {
+    if hints.parallel.is_some() {
         if !matches!(rule.proofs.purity.verdict, PurityVerdict::Pure) {
             errors.push(VerifyError {
                 context: format!("rule '{}' / hints.parallel", rule.name),
@@ -852,7 +852,7 @@ rule test_bad
     determinism:
       form: total
   hints:
-    vectorizable: yes
+    vectorizable: "SIMD claim: no calls, no cross-element dependency"
 "#;
         let errs = verify_str(src);
         assert!(

@@ -88,9 +88,12 @@ pub struct Rule {
 
 #[derive(Debug, Clone)]
 pub struct Hints {
-    pub vectorizable: Option<bool>,
-    pub parallel: Option<bool>,
-    pub cache_result: Option<bool>,
+    /// Declared iff the AI believes SIMD is safe; the String is the justification.
+    /// Verifier then cross-checks the claim (no calls, pure verdict, etc.).
+    /// The justification is the audit surface: what makes the AI claim this is safe.
+    pub vectorizable: Option<String>,
+    pub parallel: Option<String>,
+    pub cache_result: Option<String>,
     pub overflow: Option<OverflowHint>,
 }
 

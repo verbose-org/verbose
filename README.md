@@ -202,8 +202,8 @@ If a declaration serves neither verification nor optimization, it doesn't belong
 
 | Hint | What the compiler does | Why gcc can't |
 |---|---|---|
-| `vectorizable: yes` | Emits SSE4.2 `pcmpgtq` — 2 values per CPU cycle | Requires costly loop analysis |
-| `parallel: yes` | Uses `fork()` — real multi-core parallelism | Developer must do it manually |
+| `vectorizable: "reason"` | Emits SSE4.2 `pcmpgtq` — 2 values per CPU cycle | Requires costly loop analysis |
+| `parallel: "reason"` | Uses `fork()` — real multi-core parallelism | Developer must do it manually |
 | `overflow: [min, max]` | Proves safe via interval arithmetic — no runtime check | C = undefined behavior, Rust = runtime panic |
 | `field [min, max]` | Eliminates impossible branches from binary | Doesn't know value bounds |
 
@@ -364,7 +364,7 @@ The criterion is not "fewer characters" but "zero declarations lost". Comfort ne
 ### Admitted
 
 - **`map(coll, var => expr)` and `filter(coll, var => pred)`** — same proof structure as the existing `sum`/`count`/`all`/`any` (reads, writes, calls, termination all declared). Fills a real expressive gap ("for each X, compute Y", "keep X where Y") without hiding anything.
-- **Justified hints.** `vectorizable: "no cross-element dependency"` instead of bare `vectorizable`. Adds a declaration (the reason), does not remove one. The *why* becomes part of the audit surface.
+- **Justified hints.** `vectorizable: "no cross-element dependency"` instead of bare `vectorizable: yes`. Adds a declaration (the reason), does not remove one. The *why* becomes part of the audit surface, printed next to the hint at compile time. Already enforced — a bare hint is now a parse error.
 - **Stratified rule layers.** `rule foo : layer(domain)` adds a declaration and a verified constraint (a domain rule cannot call an io rule). More explicit, more checked.
 - **Typed results.** `Result(T, E)` makes the failure path a declared part of the output instead of an implicit panic. Adds a declaration of what can go wrong.
 - **Source traceability at field level.** `amount : number [0, 1000000] @source "business_rules.intent:7"` extends existing `@source` from rules down to fields. More traceability, nothing lost.

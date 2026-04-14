@@ -40,7 +40,7 @@ rule total_with_tax
       form : total
 
   hints:
-    parallel : yes
+    parallel : "pure arithmetic over independent invoices; each iteration has no dependency on the others"
 
 
 rule important_invoice

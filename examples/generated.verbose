@@ -41,7 +41,7 @@ rule stock_value
       form : total
 
   hints:
-    vectorizable : yes
+    vectorizable : "pure arithmetic over two fields per record, no calls, no cross-element dependency"
     overflow     : [0, 1000000000]
 
 
@@ -71,7 +71,7 @@ rule low_stock
       form : total
 
   hints:
-    vectorizable : yes
+    vectorizable : "single-field threshold comparison; each record independent"
 
 
 rule needs_reorder

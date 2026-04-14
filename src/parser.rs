@@ -887,7 +887,8 @@ impl Parser {
             self.expect_kind(TokenKind::Colon)?;
             match key.as_str() {
                 "overflow" => {
-                    // overflow : [min, max]
+                    // overflow : [min, max] — bounds are the declaration,
+                    // mechanically verified against interval arithmetic.
                     self.expect_kind(TokenKind::LBracket)?;
                     let min = self.parse_signed_number()?;
                     self.expect_kind(TokenKind::Comma)?;
@@ -896,21 +897,26 @@ impl Parser {
                     overflow = Some(OverflowHint { min, max });
                 }
                 _ => {
-                    let val = self.expect_ident_any()?;
-                    let b = match val.as_str() {
-                        "yes" => true,
-                        "no" => false,
-                        _ => {
-                            return Err(self.error(&format!(
-                                "expected 'yes' or 'no' for hint '{}', got '{}'",
-                                key, val
-                            )))
-                        }
-                    };
+                    // Trust-based hints (vectorizable, parallel, cache_result) must
+                    // carry a string justification — the reason the AI claims the hint
+                    // applies. Absence of the hint means "not claimed"; presence always
+                    // includes the rationale the auditor can read.
+                    let reason = self.expect_string().map_err(|_| {
+                        self.error(&format!(
+                            "hint '{}' requires a string justification, e.g. '{}: \"why this applies\"'",
+                            key, key
+                        ))
+                    })?;
+                    if reason.trim().is_empty() {
+                        return Err(self.error(&format!(
+                            "hint '{}' justification must not be empty — state why the hint applies",
+                            key
+                        )));
+                    }
                     match key.as_str() {
-                        "vectorizable" => vectorizable = Some(b),
-                        "parallel" => parallel = Some(b),
-                        "cache_result" => cache_result = Some(b),
+                        "vectorizable" => vectorizable = Some(reason),
+                        "parallel" => parallel = Some(reason),
+                        "cache_result" => cache_result = Some(reason),
                         _ => {
                             return Err(self.error(&format!(
                                 "unknown hint '{}' (allowed: vectorizable, parallel, cache_result, overflow)",
@@ -1236,13 +1242,16 @@ rule important_invoice
 
     #[test]
     fn hints_parsed() {
-        let src = "@verbose 0.1.0\n\nconcept T\n  @intention: \"t\"\n  @source: f.intent:1\n  fields:\n    x : number\n\nrule test\n  @intention: \"t\"\n  @source: f.intent:1\n  input:\n    t : T\n  output:\n    r : bool\n  logic:\n    r = t.x > 0\n  proofs:\n    purity:\n      reads: [t.x]\n      writes: []\n      calls: []\n      verdict: pure\n    termination:\n      form: constant_bound\n      bound: 1\n    determinism:\n      form: total\n  hints:\n    vectorizable: yes\n    parallel: no\n    overflow: [0, 1]\n";
+        let src = "@verbose 0.1.0\n\nconcept T\n  @intention: \"t\"\n  @source: f.intent:1\n  fields:\n    x : number\n\nrule test\n  @intention: \"t\"\n  @source: f.intent:1\n  input:\n    t : T\n  output:\n    r : bool\n  logic:\n    r = t.x > 0\n  proofs:\n    purity:\n      reads: [t.x]\n      writes: []\n      calls: []\n      verdict: pure\n    termination:\n      form: constant_bound\n      bound: 1\n    determinism:\n      form: total\n  hints:\n    vectorizable: \"no cross-element dependency in the predicate\"\n    overflow: [0, 1]\n";
         let p = parse(src).unwrap();
         match &p.items[1] {
             Item::Rule(r) => {
                 let h = r.hints.as_ref().unwrap();
-                assert_eq!(h.vectorizable, Some(true));
-                assert_eq!(h.parallel, Some(false));
+                assert_eq!(
+                    h.vectorizable.as_deref(),
+                    Some("no cross-element dependency in the predicate")
+                );
+                assert!(h.parallel.is_none());
                 assert!(h.overflow.is_some());
                 let ov = h.overflow.as_ref().unwrap();
                 assert_eq!(ov.min, 0);
@@ -1250,6 +1259,32 @@ rule important_invoice
             }
             _ => panic!("expected rule"),
         }
+    }
+
+    #[test]
+    fn bare_hint_rejected() {
+        // The identity of the rule: a hint without justification is refused,
+        // because the auditor has no "why" to read.
+        let src = "@verbose 0.1.0\n\nconcept T\n  @intention: \"t\"\n  @source: f.intent:1\n  fields:\n    x : number\n\nrule test\n  @intention: \"t\"\n  @source: f.intent:1\n  input:\n    t : T\n  output:\n    r : bool\n  logic:\n    r = t.x > 0\n  proofs:\n    purity:\n      reads: [t.x]\n      writes: []\n      calls: []\n      verdict: pure\n    termination:\n      form: constant_bound\n      bound: 1\n    determinism:\n      form: total\n  hints:\n    vectorizable: yes\n";
+        let err = parse(src).err().expect("bare hint should be rejected");
+        let msg = format!("{:?}", err);
+        assert!(
+            msg.contains("justification") || msg.contains("string"),
+            "expected error about missing justification, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn empty_hint_justification_rejected() {
+        let src = "@verbose 0.1.0\n\nconcept T\n  @intention: \"t\"\n  @source: f.intent:1\n  fields:\n    x : number\n\nrule test\n  @intention: \"t\"\n  @source: f.intent:1\n  input:\n    t : T\n  output:\n    r : bool\n  logic:\n    r = t.x > 0\n  proofs:\n    purity:\n      reads: [t.x]\n      writes: []\n      calls: []\n      verdict: pure\n    termination:\n      form: constant_bound\n      bound: 1\n    determinism:\n      form: total\n  hints:\n    vectorizable: \"\"\n";
+        let err = parse(src).err().expect("empty justification should be rejected");
+        let msg = format!("{:?}", err);
+        assert!(
+            msg.contains("empty"),
+            "expected error about empty justification, got: {}",
+            msg
+        );
     }
 
     #[test]
