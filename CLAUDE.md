@@ -116,12 +116,78 @@ LLVM may become an OPTIONAL fallback backend for platforms without a native emit
 
 Security is pillar #1. Each feature is judged by what attack surface it adds, not by whether it is "useful". Under that frame, the compiler exposes two execution modes — not one primary and one fallback, but **two modes with deliberately different surfaces**:
 
-- **Native / WASM (minimal surface)**: scalar rules, arithmetic, comparisons, field-range exploitation, overflow-proved code. No heap, no allocation, no tagged values, no dynamic dispatch. The binary is ~700 bytes, auditable line by line, free of libc/GC/syscall machinery beyond what each rule explicitly needs. Used when the rule must survive in a hostile or constrained environment (embedded, signing, critical gate).
-- **Interpreter (rich surface)**: the full language — collections, `map`/`filter`/`fold`, `Result`, `Record`, `match_result`, `@layer`. Runs in a Rust binary that parses JSON and evaluates expressions. Wider surface than native (it has a JSON parser, allocator, etc.) but **every expression is still verified by the same compiler** against the same proofs. Used when the rule needs to express structured domain logic.
+- **Native / WASM (small, auditable surface)**: machine code emitted directly. No libc, no allocator, no tagged values held across non-local control flow, no dynamic dispatch. Grows phase by phase as new constructs land, each extension reviewed against this list. Binaries stay small (500 B–2 KB) and auditable line by line.
+- **Interpreter (rich surface)**: the full language — collections, `map`/`filter`/`fold`, all `Result` / `Record` / `match_result` compositions, `@layer`. Runs in a Rust binary that parses JSON and evaluates expressions. Wider surface than native (JSON parser, allocator) but **every expression is still verified by the same compiler** against the same proofs.
 
-This asymmetry is intentional. The native backend's trustworthiness comes **from what it refuses** — forcing it to grow to "completeness" would add an allocator and tagged layouts and turn it into a 50 KB binary with the same attack surface as any C program, which defeats the point. The right move when the native backend rejects an expression is **not** "add support", it is "choose the interpreter if the rule needs that expression".
+Both modes verify the same AST with the same proofs. A rule accepted by the compiler is safe under both modes; only the execution profile differs. Native's trustworthiness comes from careful accumulation — adding a construct is a deliberate commit, never a drive-by "it's missing". Forcing native to grow to "completeness" (full heap, tagged unions, etc.) would add a C-sized attack surface and defeat the point. When native rejects an expression today, the answer is either "add a phase for it under the evolution rules below" or "run it in the interpreter" — never "silently upgrade native to handle it".
 
-Both modes verify the same AST with the same proofs. A rule accepted by the compiler is safe under both modes; only the execution profile differs. Future contributors adding a feature should ask "does this belong in native, or only in the interpreter?" — and if the answer is "only interpreter", the rejection in native.rs is **correct**, not a TODO.
+## Native Backend Evolution
+
+Tracking what native emits today, what it still rejects, and the design rules that shape how it grows.
+
+### What native emits today
+
+| Phase | Shape | Typical binary | Milestone example |
+|---|---|---|---|
+| 0 | Scalar rule (`bool` / `number` output from arithmetic, comparisons, field reads) | ~500 B | `invoices.verbose` |
+| 1A | Reaction with `append_file "literal_path" "literal_content"` | ~460 B | `audit_simple.verbose` |
+| 1B | Reaction with `append_file "literal_path" concat(...)` — dynamic text via inline itoa + stack buffer | ~720 B | `audit_log.verbose` |
+| 2A | Rule with `output: Result(number, text)` — Ok→stdout, Err→stderr, continuation-passing leaves | ~700 B | `purchase.verbose::validate_purchase` |
+
+### What native still rejects, and in which priority
+
+- **Result(text, text) and Result(T, E) with non-scalar T** — each shape needs its own calling convention. Decide shape by shape, never fabricate a "universal Result" that carries unnecessary machinery. (Phase 2B.)
+- **`output: Record { ... }`** — needs a serialization format (likely JSON) at the output boundary and a stack layout for record fields. Doable without heap. (Phase 2C.)
+- **`output: collection(T)`** — the only case that genuinely needs heap (map/filter produce collections with runtime-determined sizes). Behind a bump-allocator design we have not committed to yet. (Phase 3.)
+- **`match_result` in expression position** — needs a tagged-union calling convention plus branch dispatch. Avoided so far because continuation-passing covers the producer side. Will become necessary when rules need to *consume* another rule's Result inline. (Phase 2D.)
+
+### Register conventions across emitters
+
+Emitters that span multiple syscalls or phases share a register layout. Adding a new cross-phase register use requires either claiming a currently-unused register or saving/restoring on the stack — do not casually reassign any of these without auditing every caller.
+
+| Register | Used by | Introduced |
+|---|---|---|
+| `r12` | argc (read at `_start`) | Phase 0 |
+| `r13` | argv base pointer | Phase 0 |
+| `r14` | current record index inside the main loop | Phase 0 |
+| `rbp` | field-slot frame base (fields + let bindings at `rbp - 8*(i+1)`) | Phase 0 |
+| `r15` | file descriptor returned by `open()` in `append_file` effects | Phase 1A |
+| `r10` | concat buffer base for later length calculation | Phase 1B |
+| `rbx` | concat write pointer (advances as args are written) | Phase 1B |
+
+Registers *not* in this table (`r8`, `r9`, `r11`, `rcx`, `rdx`, `rsi`, `rdi`, `rax`) are ephemeral — emitters may clobber them freely within a single expression. Note that Linux syscalls clobber `rax`/`rcx`/`r11`; any state that must survive a syscall belongs in `r10` or `r12`–`r15`.
+
+### Continuation-passing emission for branching results
+
+When a rule produces a discriminated output (today `Result`, tomorrow `match_result`), each leaf is emitted as a tail-call: it writes its own output and `jmp`s back to the iteration top. **No intermediate tagged value materializes in registers or memory.**
+
+Why chose this over the standard "materialize tag + payload, dispatch at a common exit":
+
+1. **Lifetime simplicity.** Any leaf that allocates temporaries (e.g. a concat buffer for an Err message) keeps its allocation local to the leaf. No tracking of "does this exit path need to free a concat buffer?" across the dispatch.
+2. **No calling-convention ambiguity.** `Ok(number)` and `Ok(text)` would need different payload registers; the leaf knows its declared shape and emits the right write directly.
+3. **Tree scales naturally.** Nested `If` inside a Result arm: each distant leaf plants its own terminator. No phi nodes, no fall-through, no common join point to engineer.
+
+Cost: each leaf carries ~30 bytes of trailing write + `jmp loop_top`. For rules with <10 leaves (the overwhelming majority), this is negligible vs. the machinery a tagged-dispatch approach would need.
+
+This choice will be revisited when `match_result` in expression position lands — that construct genuinely requires consuming a tagged value, so some form of tag+payload convention becomes unavoidable for *consumers*. But *producers* (rule outputs) will remain continuation-passing as long as the native binary's role is "print results per record, then exit".
+
+### Stream semantics for Result-output native rules
+
+A rule with `output: Result(number, text)` compiles to a binary where:
+
+- `Ok(n)` writes `n\n` to **stdout** (newline from `itoa`).
+- `Err(msg)` writes `msg\n` to **stderr** (newline appended by the emitter for symmetry).
+- Exit code is **always 0** after processing all records.
+
+The "always exit 0" choice is UNIX-idiomatic: failure on a single record is data, not a system error. The shell caller separates success from failure by stream, not by exit code:
+
+```
+./validate 200 17 | consume_valid           # pipe valids through
+./validate 200 17 2>errors.log              # capture errors to a file
+./validate 200 17 1>/dev/null               # keep errors only
+```
+
+If a binary wants "exit non-zero on any Err", that's a separate reaction layer (future, not shipped).
 
 ## Transpilation Strategy (rejected direction)
 
