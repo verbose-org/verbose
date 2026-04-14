@@ -294,6 +294,8 @@ export ANTHROPIC_API_KEY=sk-ant-...
 cargo run -- generated.verbose   # compiler verifies independently
 ```
 
+For how to write `.intent` prose that the AI maps reliably to Verbose constructs — which phrasings produce `all` / `any` / `map` / `filter` / `sum`, how to cross-reference rules, what the defaults are when the prose is silent — see [INTENT.md](INTENT.md).
+
 ## Why Not LLVM?
 
 LLVM loses the information that makes Verbose unique. When translating to LLVM IR, domain knowledge is stripped: field ranges, optimization hints, purity proofs, overflow bounds — all gone. LLVM then spends dozens of analysis passes trying to re-discover what Verbose already knew.
@@ -357,7 +359,7 @@ The criterion is not "fewer characters" but "zero declarations lost". Comfort ne
 
 **`.intent` and `.verbose` follow this rule differently:**
 
-- `.intent` is prose. The compiler never verifies it directly — the AI does the translation job. So `.intent` can evolve freely: richer phrasings, recognized patterns, section headers, cross-references. More expressive prose gives the AI more signal without touching the verification model. "Pleasant" is the only criterion that applies here.
+- `.intent` is prose. The compiler never verifies it directly — the AI does the translation job. So `.intent` can evolve freely: richer phrasings, recognized patterns, section headers, cross-references. More expressive prose gives the AI more signal without touching the verification model. "Pleasant" is the only criterion that applies here. The recognized prose patterns (what maps reliably to which Verbose construct) are listed in [INTENT.md](INTENT.md).
 
 - `.verbose` is the verified layer. Every addition must pass the test above. A construct that collapses intermediate `@intention` markers, elides `input:`/`output:` through inference, hides a purity proof behind method chaining, or supplies default hints without declaration — rejected.
 

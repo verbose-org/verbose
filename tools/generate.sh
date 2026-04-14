@@ -63,8 +63,10 @@ rule rule_name
     determinism:
       form : total                 -- or: conditional, nondeterministic
   hints:                           -- optional
-    vectorizable : yes             -- if pure and no calls
-    overflow : [min, max]          -- output value bounds
+    vectorizable : \"reason\"      -- if pure and no calls; the string explains WHY it is safe
+    parallel     : \"reason\"      -- if each iteration is independent; the string explains why
+    cache_result : \"reason\"      -- if memoization helps; the string explains why
+    overflow     : [min, max]      -- output value bounds (mechanically verified)
 
 reaction reaction_name             -- optional, for side effects
   @intention: \"description\"
@@ -74,7 +76,9 @@ reaction reaction_name             -- optional, for side effects
     print \"message\"
 \`\`\`
 
-EXPRESSIONS: arithmetic (+, -, *, /, %), comparisons (>, <, >=, <=, ==, !=), boolean (and, or, not), if COND then EXPR else EXPR, rule_call(var), all(collection, item => predicate), any(collection, item => predicate), let name = expr.
+EXPRESSIONS: arithmetic (+, -, *, /, %), comparisons (>, <, >=, <=, ==, !=), boolean (and, or, not), if COND then EXPR else EXPR, rule_call(var), let name = expr. Collection operations: all(coll, x => pred), any(coll, x => pred), map(coll, x => expr) returning collection, filter(coll, x => pred) returning collection, sum(coll, x => expr), count(coll, x => pred), min(coll, x => expr), max(coll, x => expr), fold(coll, initial, acc, x => body).
+
+PROSE PATTERNS: the recognized mappings from natural-language intent phrasings to Verbose constructs are listed in INTENT.md. Common ones: \"for each X, check Y\" → all, \"for each X, compute Y\" → map, \"keep X where Y\" → filter, \"total of Y over X\" → sum, \"count X where Y\" → count, \"when X happens, do Y\" → reaction.
 
 RULES:
 - Every @source must reference an actual line number from the intent file
@@ -82,6 +86,7 @@ RULES:
 - calls must list EXACTLY the rules called
 - bound must be >= the number of Binary/Call/If/Not/Neg operations
 - Use field ranges [min, max] when reasonable bounds are known
+- Every hint (vectorizable / parallel / cache_result) MUST carry a string justification; bare keywords are rejected by the parser
 
 INTENT FILE (${INTENT_BASENAME}):
 ${INTENT_CONTENT}
