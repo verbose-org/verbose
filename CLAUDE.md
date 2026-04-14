@@ -56,6 +56,7 @@ examples/
   bonus.*          record construction — map produces collection(BonusReport)
   audit_log.*      append_file reaction with dynamic concat content — compiles to a 724-byte native binary
   audit_simple.*   append_file with static content — compiles to a 462-byte native binary
+  purchase.*       Result(number, text) validator — validate_purchase compiles to a 705-byte native binary (Ok -> stdout, Err -> stderr)
   demo.html        Browser demo (WASM)
 
 tools/

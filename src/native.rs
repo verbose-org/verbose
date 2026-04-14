@@ -105,8 +105,16 @@ pub fn compile_native(
         .as_ref()
         .map_or(false, |h| h.parallel.is_some());
 
+    let is_result_output = matches!(&rule.output_ty, Type::Result(_, _));
+
     let mut code = if let Some(rx) = reaction {
         emit_reaction_program(rx, rule, concept, &rules)?
+    } else if is_result_output {
+        // Rules returning Result(T, E) get their own emitter: Ok-arm values
+        // stream to stdout, Err-arm text streams to stderr. Each leaf
+        // self-terminates (continuation-passing), no tagged value lives in
+        // registers across the top-level dispatch.
+        emit_result_program(rule, concept, &rules)?
     } else if is_vectorizable && concept.fields.len() == 1 {
         if let Some(threshold) = extract_simple_gt(rule) {
             emit_vectorized_program(threshold)?
@@ -668,6 +676,30 @@ fn emit_append_file_call(
     Ok(())
 }
 
+/// Append a single newline byte to stderr (fd 2). Used after Err writes in
+/// Result-emitting rules so multi-record runs produce readable per-record
+/// lines on stderr, matching the newline itoa adds to stdout for Ok values.
+fn emit_write_newline_stderr(code: &mut Vec<u8>) {
+    // jmp +1, <0x0A>, lea rsi, [rip - 5]
+    code.push(0xEB);
+    code.push(0x01);
+    let data_addr = code.len();
+    code.push(0x0A); // '\n'
+    // mov rax, 1
+    code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x01, 0x00, 0x00, 0x00]);
+    // mov rdi, 2
+    code.extend_from_slice(&[0x48, 0xC7, 0xC7, 0x02, 0x00, 0x00, 0x00]);
+    // lea rsi, [rip + rel32]
+    let end = code.len() + 7;
+    let rel32 = data_addr as i32 - end as i32;
+    code.extend_from_slice(&[0x48, 0x8D, 0x35]);
+    code.extend_from_slice(&rel32.to_le_bytes());
+    // mov rdx, 1
+    code.extend_from_slice(&[0x48, 0xC7, 0xC2, 0x01, 0x00, 0x00, 0x00]);
+    // syscall
+    code.extend_from_slice(&[0x0F, 0x05]);
+}
+
 /// Emit just the open(path, O_WRONLY|O_APPEND|O_CREAT, 0644) syscall with the
 /// path embedded inline (NUL-terminated). On return, rax holds the fd.
 fn emit_open_append(code: &mut Vec<u8>, path: &str) {
@@ -699,6 +731,251 @@ fn emit_open_append(code: &mut Vec<u8>, path: &str) {
     code.extend_from_slice(&[0x48, 0xC7, 0xC2, 0xA4, 0x01, 0x00, 0x00]);
     // syscall
     code.extend_from_slice(&[0x0F, 0x05]);
+}
+
+/// Emit a standalone binary for a rule whose output is Result(number, text).
+///
+/// Convention: the binary prints the Ok scalar to stdout (with a trailing
+/// newline from itoa) and the Err message to stderr. Exit is always 0 after
+/// all records process — the shell caller separates success from failure by
+/// stream (`./prog 200 17 | consume 2>errors.log`).
+///
+/// Each Ok/Err leaf is emitted in continuation-passing style: it writes its
+/// output and then jumps back to the top of the record loop. There is no
+/// intermediate tagged "Result value" materialized in registers or memory —
+/// avoids the register-lifetime / stack-cleanup complexity when a leaf
+/// allocates a concat buffer.
+fn emit_result_program(
+    rule: &Rule,
+    concept: &Concept,
+    all_rules: &HashMap<&str, &Rule>,
+) -> Result<Vec<u8>, NativeError> {
+    // Restrict to Result(number, text) for now — the calling convention is
+    // different for other Result shapes (e.g. text payload on Ok) and they
+    // need their own design pass.
+    let (t_ok, t_err) = match &rule.output_ty {
+        Type::Result(t, e) => (t.as_ref(), e.as_ref()),
+        _ => {
+            return Err(NativeError {
+                message: "emit_result_program called on non-Result rule".into(),
+            })
+        }
+    };
+    if !matches!(t_ok, Type::Number) || !matches!(t_err, Type::Text) {
+        return Err(NativeError {
+            message: "native today supports Result(number, text) only — other shapes are interpreter-only".into(),
+        });
+    }
+
+    let nfields = concept.fields.len();
+    let offsets = field_offsets(concept);
+    let mut code = Vec::new();
+
+    // === _start === (same record-iteration skeleton as emit_full_program)
+    code.extend_from_slice(&[0x4C, 0x8B, 0x24, 0x24]); // mov r12, [rsp]
+    code.extend_from_slice(&[0x4C, 0x8D, 0x6C, 0x24, 0x08]); // lea r13, [rsp+8]
+    code.push(0x55); // push rbp
+    code.extend_from_slice(&[0x48, 0x89, 0xE5]); // mov rbp, rsp
+    let n_bindings = rule.logic.bindings.len();
+    let frame_size = ((nfields + n_bindings) * 8) as i32;
+    code.extend_from_slice(&[0x48, 0x81, 0xEC]);
+    code.extend_from_slice(&frame_size.to_le_bytes());
+    code.extend_from_slice(&[0x49, 0xC7, 0xC6, 0x01, 0x00, 0x00, 0x00]); // mov r14, 1
+
+    let loop_top = code.len();
+
+    // cmp r14, r12 ; jge exit (rel32 patch)
+    code.extend_from_slice(&[0x4D, 0x39, 0xE6]);
+    code.push(0x0F);
+    code.push(0x8D);
+    let exit_patch = code.len();
+    code.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+
+    // Parse N fields from argv.
+    for field in &concept.fields {
+        let offset = offsets[field.name.as_str()];
+        code.extend_from_slice(&[0x4B, 0x8B, 0x7C, 0xF5, 0x00]); // mov rdi, [r13 + r14*8]
+        emit_atoi_inline(&mut code);
+        if offset >= -128 {
+            code.extend_from_slice(&[0x48, 0x89, 0x45]);
+            code.push(offset as u8);
+        } else {
+            code.extend_from_slice(&[0x48, 0x89, 0x85]);
+            code.extend_from_slice(&offset.to_le_bytes());
+        }
+        code.extend_from_slice(&[0x49, 0xFF, 0xC6]); // inc r14
+    }
+
+    // Let bindings → rbp slots.
+    let mut binding_offsets = offsets.clone();
+    let mut next_slot = -((nfields as i32 + 1) * 8);
+    for (name, expr) in &rule.logic.bindings {
+        let field_ranges = build_field_ranges(concept);
+        emit_eval_expr(&mut code, expr, &rule.input_name, &binding_offsets, all_rules, &field_ranges)?;
+        if next_slot >= -128 {
+            code.extend_from_slice(&[0x48, 0x89, 0x45]);
+            code.push(next_slot as u8);
+        } else {
+            code.extend_from_slice(&[0x48, 0x89, 0x85]);
+            code.extend_from_slice(&next_slot.to_le_bytes());
+        }
+        binding_offsets.insert(name.as_str(), next_slot);
+        next_slot -= 8;
+    }
+
+    // Evaluate the logic in Result context. Every Ok/Err leaf self-terminates
+    // with a jmp loop_top, so there is no fall-through to handle here.
+    let field_ranges = build_field_ranges(concept);
+    emit_eval_result_expr(
+        &mut code,
+        &rule.logic.value,
+        loop_top,
+        rule,
+        concept,
+        all_rules,
+        &binding_offsets,
+        &field_ranges,
+    )?;
+
+    // exit:
+    let exit_pos = code.len();
+    let exit_offset = exit_pos as i32 - (exit_patch as i32 + 4);
+    code[exit_patch..exit_patch + 4].copy_from_slice(&exit_offset.to_le_bytes());
+    // mov rax, 60 ; xor rdi, rdi ; syscall
+    code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x3C, 0x00, 0x00, 0x00]);
+    code.extend_from_slice(&[0x48, 0x31, 0xFF]);
+    code.extend_from_slice(&[0x0F, 0x05]);
+
+    Ok(code)
+}
+
+/// Emit code for an expression that produces a Result(number, text). Each
+/// Ok/Err leaf emits its own write + jmp loop_top (continuation-passing), so
+/// the caller does not deal with a tagged union value — it just appends this
+/// block and the leaves route themselves to the next iteration.
+fn emit_eval_result_expr(
+    code: &mut Vec<u8>,
+    expr: &Expr,
+    loop_top: usize,
+    rule: &Rule,
+    concept: &Concept,
+    all_rules: &HashMap<&str, &Rule>,
+    offsets: &HashMap<&str, i32>,
+    field_ranges: &HashMap<&str, (i64, i64)>,
+) -> Result<(), NativeError> {
+    match expr {
+        Expr::Ok(inner) => {
+            // The Ok arm produces a number. Evaluate → rax, then emit_itoa_inline
+            // writes it (with a trailing newline) to stdout.
+            emit_eval_expr(code, inner, &rule.input_name, offsets, all_rules, field_ranges)?;
+            emit_itoa_inline(code);
+            // jmp loop_top (rel32, backward)
+            code.push(0xE9);
+            let off = loop_top as i32 - (code.len() + 4) as i32;
+            code.extend_from_slice(&off.to_le_bytes());
+            Ok(())
+        }
+        Expr::Err(inner) => {
+            // The Err arm produces text. Write it to stderr (fd 2) — one
+            // line per record, a record-separator newline appended by the
+            // native emitter so multi-record runs don't run together on
+            // stderr. (The Ok arm gets its newline for free from itoa;
+            // this newline on Err is the symmetric counterpart.)
+            match inner.as_ref() {
+                Expr::Text(s) => {
+                    // Literal content: inline the bytes and write directly.
+                    let bytes = s.as_bytes();
+                    let n = bytes.len();
+                    if n <= 127 {
+                        code.push(0xEB);
+                        code.push(n as u8);
+                    } else {
+                        code.push(0xE9);
+                        code.extend_from_slice(&(n as i32).to_le_bytes());
+                    }
+                    let addr = code.len();
+                    code.extend_from_slice(bytes);
+                    // mov rax, 1 (sys_write)
+                    code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x01, 0x00, 0x00, 0x00]);
+                    // mov rdi, 2 (stderr)
+                    code.extend_from_slice(&[0x48, 0xC7, 0xC7, 0x02, 0x00, 0x00, 0x00]);
+                    // lea rsi, [rip + rel32]
+                    let end = code.len() + 7;
+                    let rel32 = addr as i32 - end as i32;
+                    code.extend_from_slice(&[0x48, 0x8D, 0x35]);
+                    code.extend_from_slice(&rel32.to_le_bytes());
+                    // mov rdx, n
+                    code.extend_from_slice(&[0x48, 0xC7, 0xC2]);
+                    code.extend_from_slice(&(n as i32).to_le_bytes());
+                    // syscall
+                    code.extend_from_slice(&[0x0F, 0x05]);
+                }
+                Expr::Concat(args) => {
+                    // Build into a stack buffer, write to stderr, then free.
+                    let buf_size = emit_concat_to_buffer(
+                        code, args, rule, concept, all_rules, offsets, field_ranges,
+                    )?;
+                    // rax = buf ptr, rdx = length.
+                    // mov rsi, rax
+                    code.extend_from_slice(&[0x48, 0x89, 0xC6]);
+                    // mov rdi, 2 (stderr)
+                    code.extend_from_slice(&[0x48, 0xC7, 0xC7, 0x02, 0x00, 0x00, 0x00]);
+                    // mov rax, 1 (sys_write)
+                    code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x01, 0x00, 0x00, 0x00]);
+                    // syscall
+                    code.extend_from_slice(&[0x0F, 0x05]);
+                    // add rsp, buf_size  — free the buffer before the next iteration
+                    code.extend_from_slice(&[0x48, 0x81, 0xC4]);
+                    code.extend_from_slice(&buf_size.to_le_bytes());
+                }
+                other => {
+                    return Err(NativeError {
+                        message: format!(
+                            "Err content must be a text literal or concat(...) in native; got {:?}",
+                            other
+                        ),
+                    });
+                }
+            }
+            // Append a trailing newline to stderr so records don't run together.
+            emit_write_newline_stderr(code);
+            // jmp loop_top
+            code.push(0xE9);
+            let off = loop_top as i32 - (code.len() + 4) as i32;
+            code.extend_from_slice(&off.to_le_bytes());
+            Ok(())
+        }
+        Expr::If(cond, then_e, else_e) => {
+            // Evaluate the condition as a normal scalar (bool: 0 or 1).
+            emit_eval_expr(code, cond, &rule.input_name, offsets, all_rules, field_ranges)?;
+            // test rax, rax ; jz .else (rel32 patch so arms can be large)
+            code.extend_from_slice(&[0x48, 0x85, 0xC0]);
+            code.push(0x0F);
+            code.push(0x84);
+            let else_patch = code.len();
+            code.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+
+            // .then — each leaf self-terminates with jmp loop_top.
+            emit_eval_result_expr(
+                code, then_e, loop_top, rule, concept, all_rules, offsets, field_ranges,
+            )?;
+
+            // .else:
+            let else_pos = code.len();
+            let else_off = else_pos as i32 - (else_patch as i32 + 4);
+            code[else_patch..else_patch + 4].copy_from_slice(&else_off.to_le_bytes());
+            emit_eval_result_expr(
+                code, else_e, loop_top, rule, concept, all_rules, offsets, field_ranges,
+            )?;
+            Ok(())
+        }
+        other => Err(NativeError {
+            message: format!(
+                "Result-context expression not yet supported in native: {:?}",
+                other
+            ),
+        }),
+    }
 }
 
 /// Emit a standalone binary for a reaction. Reads N-field records from argv
@@ -2129,6 +2406,26 @@ mod tests {
             code.windows(7).any(|w| w == open_pattern),
             "expected `mov rax, 2` (sys_open) in emitted code"
         );
+    }
+
+    #[test]
+    fn native_compiles_result_number_text_rule() {
+        // validate_purchase returns Result(number, text) with a dynamic
+        // Err via concat. After Phase 2A the native backend routes it
+        // through emit_result_program: Ok -> stdout, Err -> stderr.
+        use std::fs;
+        let src = fs::read_to_string("examples/purchase.verbose")
+            .expect("examples/purchase.verbose is expected to exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let out = std::env::temp_dir().join("verbosec_test_validate_purchase");
+        compile_native(&program, "validate_purchase", out.to_str().unwrap())
+            .expect("native compile of Result(number, text) rule should succeed");
+        let size = fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
+        // Ballpark — concat machinery + itoa + stderr newline = ~700 B.
+        assert!(size > 400 && size < 3_000, "unexpected binary size: {}", size);
+        let _ = fs::remove_file(out);
     }
 
     #[test]
