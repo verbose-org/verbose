@@ -921,6 +921,94 @@ rule layered_caller
     }
 
     #[test]
+    fn all_examples_with_json_run_without_panicking() {
+        // Integration guard: every .verbose file with a matching .json must
+        // execute without runtime panic. Value::Err (a declared failure path)
+        // is allowed — only eval_rule returning Err (missing field, type
+        // mismatch, etc.) counts as failure. Covers the "interpreter silently
+        // regressed on an example" class of bugs that parse+verify misses.
+        use crate::interpreter::{eval_rule, load_json_input};
+        use std::fs;
+
+        fn collect(dir: &StdPath, out: &mut Vec<std::path::PathBuf>) {
+            if let Ok(entries) = fs::read_dir(dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        collect(&path, out);
+                    } else if path.extension().and_then(|s| s.to_str()) == Some("verbose") {
+                        out.push(path);
+                    }
+                }
+            }
+        }
+
+        let mut files = Vec::new();
+        collect(StdPath::new("examples"), &mut files);
+
+        let mut tested = 0;
+        for path in &files {
+            let json_path = path.with_extension("json");
+            if !json_path.exists() {
+                continue;
+            }
+            let src = fs::read_to_string(path).unwrap();
+            let tokens = Lexer::new(&src).tokenize().unwrap();
+            let program = Parser::new(tokens).parse_program().unwrap();
+            // Files with imports need the CLI's import-resolution step;
+            // the parse+verify sibling test already covers that path.
+            if !program.uses.is_empty() {
+                continue;
+            }
+            let errs = verify_program(&program, StdPath::new("examples"));
+            assert!(
+                errs.is_empty(),
+                "verify errors in {}:\n{:#?}",
+                path.display(),
+                errs
+            );
+
+            // The last rule in the file is the conventional "primary" rule —
+            // the one a reader of the example is meant to exercise, and the one
+            // whose input type matches the records in the .json. Running it
+            // also indirectly exercises any rules it composes.
+            let all_rules: Vec<&Rule> = program
+                .items
+                .iter()
+                .filter_map(|i| match i {
+                    Item::Rule(r) => Some(r),
+                    _ => None,
+                })
+                .collect();
+            let rule = match all_rules.last() {
+                Some(r) => *r,
+                None => continue,
+            };
+            let records = load_json_input(&json_path).unwrap_or_else(|e| {
+                panic!("cannot load {}: {}", json_path.display(), e)
+            });
+            for (idx, record) in records.iter().enumerate() {
+                let result = eval_rule(rule, &all_rules, record);
+                assert!(
+                    result.is_ok(),
+                    "runtime error running rule '{}' in {} on record [{}]:\n  {}",
+                    rule.name,
+                    path.display(),
+                    idx,
+                    result.err().unwrap()
+                );
+                tested += 1;
+            }
+        }
+
+        assert!(
+            tested >= 20,
+            "expected at least 20 rule-on-record evaluations, tested {}; did a .json file go empty?",
+            tested
+        );
+    }
+
+    #[test]
     fn all_example_verbose_files_parse_and_verify() {
         // Integration guard: every file under examples/ that ends in .verbose
         // must parse cleanly and verify with zero errors. If this test goes
