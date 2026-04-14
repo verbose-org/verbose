@@ -198,78 +198,129 @@ fn field_offsets(concept: &Concept) -> HashMap<&str, i32> {
         .collect()
 }
 
-fn emit_full_program(
-    rule: &Rule,
-    concept: &Concept,
+/// Context returned by `emit_record_loop_prologue` — everything the body
+/// of an emitter needs after the shared setup, plus what
+/// `emit_record_loop_epilogue` needs to close the loop.
+///
+/// Lifetimes: the &str keys in the maps borrow from the input concept's
+/// field names and the rule's let-binding names, both of which live for
+/// the duration of the emitter call.
+struct RecordLoopCtx<'a> {
+    /// Code offset of the loop top — the `cmp r14, r12` that gates iteration.
+    loop_top: usize,
+    /// Code offset of the rel32 placeholder in the `jge exit` jump.
+    /// Epilogue fills this in once the exit label position is known.
+    exit_patch: usize,
+    /// Offsets for all bindings in scope: input fields + let bindings.
+    binding_offsets: HashMap<&'a str, i32>,
+    /// Field range map for overflow-proved arithmetic in emit_eval_expr.
+    field_ranges: HashMap<&'a str, (i64, i64)>,
+    /// Bottom-of-frame slot reserved for `match_result`'s Ok-value binding
+    /// (Phase 2D). Present regardless of whether the rule uses match_result;
+    /// a stable rbp offset is cheaper than a conditional frame layout.
+    /// Only meaningful when `reserve_match_slot = true`.
+    match_slot: i32,
+}
+
+/// Emit the shared prologue for any emitter that iterates over records
+/// parsed from argv:
+///   - stack frame setup (r12 = argc, r13 = argv base, rbp frame)
+///   - r14 = arg index (starts at 1, skipping argv[0])
+///   - loop_top label
+///   - `cmp r14, r12; jge exit` (epilogue patches the exit address)
+///   - field loading: Number via atoi, Text stores the argv pointer directly
+///     (length is recovered at read sites via `emit_strlen`)
+///   - let-binding evaluation into rbp slots
+///
+/// After this returns, the emitter's own logic can run with rax/rbx/… free,
+/// `binding_offsets` covers every name the logic can reference, and the
+/// `match_slot` is reserved at the bottom of the frame (used only by
+/// emit_result_program today, but reserving it unconditionally keeps the
+/// frame layout uniform across emitters — 8 bytes of waste when unused).
+fn emit_record_loop_prologue<'a>(
+    code: &mut Vec<u8>,
+    rule: &'a Rule,
+    input_concept: &'a Concept,
     all_rules: &HashMap<&str, &Rule>,
-) -> Result<Vec<u8>, NativeError> {
-    let nfields = concept.fields.len();
-    let offsets = field_offsets(concept);
-    let is_bool = rule.output_ty == Type::Bool;
-    let mut code = Vec::new();
-
-    // === _start ===
-    // Stack at entry: [rsp]=argc, [rsp+8]=argv[0], [rsp+16]=argv[1], ...
-    // mov r12, [rsp]           — argc
-    code.extend_from_slice(&[0x4C, 0x8B, 0x24, 0x24]);
-    // lea r13, [rsp+8]         — argv base
-    code.extend_from_slice(&[0x4C, 0x8D, 0x6C, 0x24, 0x08]);
-
-    // Setup rbp frame for field storage
-    // push rbp
-    code.push(0x55);
-    // mov rbp, rsp
-    code.extend_from_slice(&[0x48, 0x89, 0xE5]);
-    // sub rsp, (nfields + n_bindings)*8 (reserve field + let binding slots)
+) -> Result<RecordLoopCtx<'a>, NativeError> {
+    let nfields = input_concept.fields.len();
     let n_bindings = rule.logic.bindings.len();
-    let frame_size = ((nfields + n_bindings) * 8) as i32;
+    // +1 for match_slot at the bottom of the frame.
+    let frame_slots = nfields + n_bindings + 1;
+    let frame_size = (frame_slots * 8) as i32;
+    let match_slot: i32 = -((frame_slots as i32) * 8);
+
+    // mov r12, [rsp]            — argc
+    code.extend_from_slice(&[0x4C, 0x8B, 0x24, 0x24]);
+    // lea r13, [rsp+8]          — argv base
+    code.extend_from_slice(&[0x4C, 0x8D, 0x6C, 0x24, 0x08]);
+    // push rbp ; mov rbp, rsp
+    code.push(0x55);
+    code.extend_from_slice(&[0x48, 0x89, 0xE5]);
+    // sub rsp, frame_size
     code.extend_from_slice(&[0x48, 0x81, 0xEC]);
     code.extend_from_slice(&frame_size.to_le_bytes());
-
-    // r14 = arg index (starts at 1, skip argv[0])
+    // mov r14, 1                — arg index starts at 1 (skip argv[0])
     code.extend_from_slice(&[0x49, 0xC7, 0xC6, 0x01, 0x00, 0x00, 0x00]);
 
     let loop_top = code.len();
 
-    // cmp r14, r12 — if index >= argc, done
+    // cmp r14, r12 ; jge exit (rel32 placeholder)
     code.extend_from_slice(&[0x4D, 0x39, 0xE6]);
-    // jge exit (placeholder)
     code.push(0x0F);
     code.push(0x8D);
     let exit_patch = code.len();
     code.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
 
-    // Parse N fields from argv into rbp-relative slots
-    for (i, field) in concept.fields.iter().enumerate() {
+    let offsets = field_offsets(input_concept);
+
+    // Per-field dispatch: Number via atoi, Text stores the argv pointer.
+    for field in &input_concept.fields {
         let offset = offsets[field.name.as_str()];
-
-        // mov rdi, [r13 + r14*8] — argv[index]
+        // mov rdi, [r13 + r14*8]       — argv[r14]
         code.extend_from_slice(&[0x4B, 0x8B, 0x7C, 0xF5, 0x00]);
-
-        // inline atoi: rdi string → rax number
-        emit_atoi_inline(&mut code);
-
-        // mov [rbp + offset], rax — store parsed field
-        if offset >= -128 {
-            code.extend_from_slice(&[0x48, 0x89, 0x45]);
-            code.push(offset as u8);
-        } else {
-            code.extend_from_slice(&[0x48, 0x89, 0x85]);
-            code.extend_from_slice(&offset.to_le_bytes());
+        match field.ty {
+            Type::Number => {
+                emit_atoi_inline(code);
+                // mov [rbp + offset], rax
+                if offset >= -128 {
+                    code.extend_from_slice(&[0x48, 0x89, 0x45]);
+                    code.push(offset as u8);
+                } else {
+                    code.extend_from_slice(&[0x48, 0x89, 0x85]);
+                    code.extend_from_slice(&offset.to_le_bytes());
+                }
+            }
+            Type::Text => {
+                // The pointer is already in rdi — stash it directly.
+                // mov [rbp + offset], rdi
+                if offset >= -128 {
+                    code.extend_from_slice(&[0x48, 0x89, 0x7D]);
+                    code.push(offset as u8);
+                } else {
+                    code.extend_from_slice(&[0x48, 0x89, 0xBD]);
+                    code.extend_from_slice(&offset.to_le_bytes());
+                }
+            }
+            _ => {
+                return Err(NativeError {
+                    message: format!(
+                        "native input field '{}' has unsupported type (only number/text today)",
+                        field.name
+                    ),
+                });
+            }
         }
-
         // inc r14
         code.extend_from_slice(&[0x49, 0xFF, 0xC6]);
     }
 
-    // Evaluate let bindings — each gets its own rbp slot
-    let mut offsets = offsets; // shadow with mutable version
-    let mut binding_offsets = offsets.clone();
+    // Evaluate let bindings into successive rbp slots.
+    let mut binding_offsets = offsets;
+    let field_ranges = build_field_ranges(input_concept);
     let mut next_slot = -((nfields as i32 + 1) * 8);
     for (name, expr) in &rule.logic.bindings {
-        let field_ranges = build_field_ranges(concept);
-        emit_eval_expr(&mut code, expr, &rule.input_name, &binding_offsets, all_rules, &field_ranges)?;
-        // Store result at next rbp slot
+        emit_eval_expr(code, expr, &rule.input_name, &binding_offsets, all_rules, &field_ranges)?;
         if next_slot >= -128 {
             code.extend_from_slice(&[0x48, 0x89, 0x45]);
             code.push(next_slot as u8);
@@ -281,21 +332,57 @@ fn emit_full_program(
         next_slot -= 8;
     }
 
-    // Evaluate final expression — result in rax
-    let field_ranges = build_field_ranges(concept);
-    emit_eval_expr(&mut code, &rule.logic.value, &rule.input_name, &binding_offsets, all_rules, &field_ranges)?;
+    Ok(RecordLoopCtx {
+        loop_top,
+        exit_patch,
+        binding_offsets,
+        field_ranges,
+        match_slot,
+    })
+}
 
-    // Print result
+/// Emit the shared epilogue: back-patch the `jge exit` jump to point here,
+/// then emit `sys_exit(0)`. Callers must have emitted a `jmp loop_top` at
+/// the end of their per-record work before calling this (so control falls
+/// through to `exit` only when r14 >= r12).
+fn emit_record_loop_epilogue(code: &mut Vec<u8>, ctx: &RecordLoopCtx<'_>) {
+    let exit_pos = code.len();
+    let exit_offset = exit_pos as i32 - (ctx.exit_patch as i32 + 4);
+    code[ctx.exit_patch..ctx.exit_patch + 4].copy_from_slice(&exit_offset.to_le_bytes());
+    // mov rax, 60 (sys_exit) ; xor rdi, rdi ; syscall
+    code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x3C, 0x00, 0x00, 0x00]);
+    code.extend_from_slice(&[0x48, 0x31, 0xFF]);
+    code.extend_from_slice(&[0x0F, 0x05]);
+}
+
+fn emit_full_program(
+    rule: &Rule,
+    concept: &Concept,
+    all_rules: &HashMap<&str, &Rule>,
+) -> Result<Vec<u8>, NativeError> {
+    let is_bool = rule.output_ty == Type::Bool;
+    let mut code = Vec::new();
+    let ctx = emit_record_loop_prologue(&mut code, rule, concept, all_rules)?;
+
+    // Evaluate final expression — result in rax
+    emit_eval_expr(
+        &mut code,
+        &rule.logic.value,
+        &rule.input_name,
+        &ctx.binding_offsets,
+        all_rules,
+        &ctx.field_ranges,
+    )?;
+
+    // Print result per record
     if is_bool {
         // rax = 0 or 1
-        // test al, al
-        code.extend_from_slice(&[0x84, 0xC0]);
-        // jz .print_false
-        code.push(0x74);
+        code.extend_from_slice(&[0x84, 0xC0]); // test al, al
+        code.push(0x74); // jz .print_false
         let pf_patch = code.len();
         code.push(0x00);
         emit_write_string(&mut code, b"true\n");
-        code.push(0xEB);
+        code.push(0xEB); // jmp .after_print
         let ap_patch = code.len();
         code.push(0x00);
         let pf_pos = code.len();
@@ -304,27 +391,15 @@ fn emit_full_program(
         let ap_pos = code.len();
         code[ap_patch] = (ap_pos - ap_patch - 1) as u8;
     } else {
-        // rax = number, print it
         emit_itoa_inline(&mut code);
     }
 
-    // jmp loop_top
+    // jmp loop_top (next record) then fall through to shared exit.
     code.push(0xE9);
-    let loop_offset = loop_top as i32 - (code.len() + 4) as i32;
+    let loop_offset = ctx.loop_top as i32 - (code.len() + 4) as i32;
     code.extend_from_slice(&loop_offset.to_le_bytes());
 
-    // exit:
-    let exit_pos = code.len();
-    let exit_offset = exit_pos as i32 - (exit_patch as i32 + 4);
-    code[exit_patch..exit_patch + 4].copy_from_slice(&exit_offset.to_le_bytes());
-
-    // mov rax, 60 (sys_exit)
-    code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x3C, 0x00, 0x00, 0x00]);
-    // xor rdi, rdi (exit code 0)
-    code.extend_from_slice(&[0x48, 0x31, 0xFF]);
-    // syscall
-    code.extend_from_slice(&[0x0F, 0x05]);
-
+    emit_record_loop_epilogue(&mut code, &ctx);
     Ok(code)
 }
 
@@ -1061,93 +1136,24 @@ fn emit_result_program(
         });
     }
 
-    let nfields = concept.fields.len();
-    let offsets = field_offsets(concept);
     let mut code = Vec::new();
-
-    // === _start === (same record-iteration skeleton as emit_full_program)
-    code.extend_from_slice(&[0x4C, 0x8B, 0x24, 0x24]); // mov r12, [rsp]
-    code.extend_from_slice(&[0x4C, 0x8D, 0x6C, 0x24, 0x08]); // lea r13, [rsp+8]
-    code.push(0x55); // push rbp
-    code.extend_from_slice(&[0x48, 0x89, 0xE5]); // mov rbp, rsp
-    let n_bindings = rule.logic.bindings.len();
-    // Frame layout: N field slots + N binding slots + 1 match_slot for
-    // match_result's bound number variable. The match_slot sits at the
-    // bottom of the frame and is used by emit_eval_result_expr's
-    // MatchResult handling (Phase 2D). Reserved unconditionally — 8 bytes
-    // of waste when a rule doesn't use match_result, acceptable.
-    let frame_slots = nfields + n_bindings + 1;
-    let frame_size = (frame_slots * 8) as i32;
-    let match_slot: i32 = -((frame_slots as i32) * 8);
-    code.extend_from_slice(&[0x48, 0x81, 0xEC]);
-    code.extend_from_slice(&frame_size.to_le_bytes());
-    code.extend_from_slice(&[0x49, 0xC7, 0xC6, 0x01, 0x00, 0x00, 0x00]); // mov r14, 1
-
-    let loop_top = code.len();
-
-    // cmp r14, r12 ; jge exit (rel32 patch)
-    code.extend_from_slice(&[0x4D, 0x39, 0xE6]);
-    code.push(0x0F);
-    code.push(0x8D);
-    let exit_patch = code.len();
-    code.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
-
-    // Parse N fields from argv.
-    for field in &concept.fields {
-        let offset = offsets[field.name.as_str()];
-        code.extend_from_slice(&[0x4B, 0x8B, 0x7C, 0xF5, 0x00]); // mov rdi, [r13 + r14*8]
-        emit_atoi_inline(&mut code);
-        if offset >= -128 {
-            code.extend_from_slice(&[0x48, 0x89, 0x45]);
-            code.push(offset as u8);
-        } else {
-            code.extend_from_slice(&[0x48, 0x89, 0x85]);
-            code.extend_from_slice(&offset.to_le_bytes());
-        }
-        code.extend_from_slice(&[0x49, 0xFF, 0xC6]); // inc r14
-    }
-
-    // Let bindings → rbp slots.
-    let mut binding_offsets = offsets.clone();
-    let mut next_slot = -((nfields as i32 + 1) * 8);
-    for (name, expr) in &rule.logic.bindings {
-        let field_ranges = build_field_ranges(concept);
-        emit_eval_expr(&mut code, expr, &rule.input_name, &binding_offsets, all_rules, &field_ranges)?;
-        if next_slot >= -128 {
-            code.extend_from_slice(&[0x48, 0x89, 0x45]);
-            code.push(next_slot as u8);
-        } else {
-            code.extend_from_slice(&[0x48, 0x89, 0x85]);
-            code.extend_from_slice(&next_slot.to_le_bytes());
-        }
-        binding_offsets.insert(name.as_str(), next_slot);
-        next_slot -= 8;
-    }
+    let ctx = emit_record_loop_prologue(&mut code, rule, concept, all_rules)?;
 
     // Evaluate the logic in Result context. Every Ok/Err leaf self-terminates
     // with a jmp loop_top, so there is no fall-through to handle here.
-    let field_ranges = build_field_ranges(concept);
     emit_eval_result_expr(
         &mut code,
         &rule.logic.value,
-        loop_top,
+        ctx.loop_top,
         rule,
         concept,
         all_rules,
-        &binding_offsets,
-        &field_ranges,
-        match_slot,
+        &ctx.binding_offsets,
+        &ctx.field_ranges,
+        ctx.match_slot,
     )?;
 
-    // exit:
-    let exit_pos = code.len();
-    let exit_offset = exit_pos as i32 - (exit_patch as i32 + 4);
-    code[exit_patch..exit_patch + 4].copy_from_slice(&exit_offset.to_le_bytes());
-    // mov rax, 60 ; xor rdi, rdi ; syscall
-    code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x3C, 0x00, 0x00, 0x00]);
-    code.extend_from_slice(&[0x48, 0x31, 0xFF]);
-    code.extend_from_slice(&[0x0F, 0x05]);
-
+    emit_record_loop_epilogue(&mut code, &ctx);
     Ok(code)
 }
 
@@ -1516,111 +1522,23 @@ fn emit_record_program(
         }
     }
 
-    let nfields = input_concept.fields.len();
-    let offsets = field_offsets(input_concept);
     let mut code = Vec::new();
+    let ctx = emit_record_loop_prologue(&mut code, rule, input_concept, all_rules)?;
 
-    // === _start === (record-loop skeleton)
-    code.extend_from_slice(&[0x4C, 0x8B, 0x24, 0x24]); // mov r12, [rsp]
-    code.extend_from_slice(&[0x4C, 0x8D, 0x6C, 0x24, 0x08]); // lea r13, [rsp+8]
-    code.push(0x55); // push rbp
-    code.extend_from_slice(&[0x48, 0x89, 0xE5]); // mov rbp, rsp
-    let n_bindings = rule.logic.bindings.len();
-    let frame_size = ((nfields + n_bindings) * 8) as i32;
-    code.extend_from_slice(&[0x48, 0x81, 0xEC]);
-    code.extend_from_slice(&frame_size.to_le_bytes());
-    code.extend_from_slice(&[0x49, 0xC7, 0xC6, 0x01, 0x00, 0x00, 0x00]); // mov r14, 1
-
-    let loop_top = code.len();
-
-    code.extend_from_slice(&[0x4D, 0x39, 0xE6]); // cmp r14, r12
-    code.push(0x0F);
-    code.push(0x8D);
-    let exit_patch = code.len();
-    code.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
-
-    // Parse N fields from argv. Number fields go through atoi; text fields
-    // store the raw argv pointer at the rbp slot — length is recovered on
-    // demand via emit_strlen at each text-field read site (so the rbp slot
-    // layout stays uniform: one pointer-or-number per field).
-    for field in &input_concept.fields {
-        let offset = offsets[field.name.as_str()];
-        // mov rdi, [r13 + r14*8]   (argv[r14])
-        code.extend_from_slice(&[0x4B, 0x8B, 0x7C, 0xF5, 0x00]);
-        match field.ty {
-            Type::Number => {
-                emit_atoi_inline(&mut code);
-                // mov [rbp + offset], rax
-                if offset >= -128 {
-                    code.extend_from_slice(&[0x48, 0x89, 0x45]);
-                    code.push(offset as u8);
-                } else {
-                    code.extend_from_slice(&[0x48, 0x89, 0x85]);
-                    code.extend_from_slice(&offset.to_le_bytes());
-                }
-            }
-            Type::Text => {
-                // The pointer is already in rdi — stash it directly.
-                // mov [rbp + offset], rdi
-                if offset >= -128 {
-                    code.extend_from_slice(&[0x48, 0x89, 0x7D]);
-                    code.push(offset as u8);
-                } else {
-                    code.extend_from_slice(&[0x48, 0x89, 0xBD]);
-                    code.extend_from_slice(&offset.to_le_bytes());
-                }
-            }
-            _ => {
-                return Err(NativeError {
-                    message: format!(
-                        "native input field '{}' has unsupported type (only number/text today)",
-                        field.name
-                    ),
-                });
-            }
-        }
-        code.extend_from_slice(&[0x49, 0xFF, 0xC6]); // inc r14
-    }
-
-    // Let bindings.
-    let mut binding_offsets = offsets.clone();
-    let mut next_slot = -((nfields as i32 + 1) * 8);
-    for (name, expr) in &rule.logic.bindings {
-        let field_ranges = build_field_ranges(input_concept);
-        emit_eval_expr(&mut code, expr, &rule.input_name, &binding_offsets, all_rules, &field_ranges)?;
-        if next_slot >= -128 {
-            code.extend_from_slice(&[0x48, 0x89, 0x45]);
-            code.push(next_slot as u8);
-        } else {
-            code.extend_from_slice(&[0x48, 0x89, 0x85]);
-            code.extend_from_slice(&next_slot.to_le_bytes());
-        }
-        binding_offsets.insert(name.as_str(), next_slot);
-        next_slot -= 8;
-    }
-
-    let field_ranges = build_field_ranges(input_concept);
     emit_eval_record_expr(
         &mut code,
         &rule.logic.value,
-        loop_top,
+        ctx.loop_top,
         output_concept,
         all_concepts,
         rule,
         input_concept,
         all_rules,
-        &binding_offsets,
-        &field_ranges,
+        &ctx.binding_offsets,
+        &ctx.field_ranges,
     )?;
 
-    // exit:
-    let exit_pos = code.len();
-    let exit_offset = exit_pos as i32 - (exit_patch as i32 + 4);
-    code[exit_patch..exit_patch + 4].copy_from_slice(&exit_offset.to_le_bytes());
-    code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x3C, 0x00, 0x00, 0x00]); // mov rax, 60
-    code.extend_from_slice(&[0x48, 0x31, 0xFF]); // xor rdi, rdi
-    code.extend_from_slice(&[0x0F, 0x05]); // syscall
-
+    emit_record_loop_epilogue(&mut code, &ctx);
     Ok(code)
 }
 
@@ -1793,74 +1711,18 @@ fn emit_reaction_program(
         }
     }
 
-    let nfields = concept.fields.len();
-    let offsets = field_offsets(concept);
     let mut code = Vec::new();
-
-    // === _start === (same record-iteration skeleton as emit_full_program)
-    // mov r12, [rsp]              ; argc
-    code.extend_from_slice(&[0x4C, 0x8B, 0x24, 0x24]);
-    // lea r13, [rsp+8]            ; argv base
-    code.extend_from_slice(&[0x4C, 0x8D, 0x6C, 0x24, 0x08]);
-    // push rbp; mov rbp, rsp
-    code.push(0x55);
-    code.extend_from_slice(&[0x48, 0x89, 0xE5]);
-    // sub rsp, (nfields + n_bindings)*8
-    let n_bindings = trigger_rule.logic.bindings.len();
-    let frame_size = ((nfields + n_bindings) * 8) as i32;
-    code.extend_from_slice(&[0x48, 0x81, 0xEC]);
-    code.extend_from_slice(&frame_size.to_le_bytes());
-
-    // r14 = 1 (skip argv[0])
-    code.extend_from_slice(&[0x49, 0xC7, 0xC6, 0x01, 0x00, 0x00, 0x00]);
-
-    let loop_top = code.len();
-
-    // cmp r14, r12 ; jge exit (rel32 patch)
-    code.extend_from_slice(&[0x4D, 0x39, 0xE6]);
-    code.push(0x0F);
-    code.push(0x8D);
-    let exit_patch = code.len();
-    code.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
-
-    // Parse N fields from argv.
-    for field in &concept.fields {
-        let offset = offsets[field.name.as_str()];
-        // mov rdi, [r13 + r14*8]
-        code.extend_from_slice(&[0x4B, 0x8B, 0x7C, 0xF5, 0x00]);
-        emit_atoi_inline(&mut code);
-        // mov [rbp + offset], rax
-        if offset >= -128 {
-            code.extend_from_slice(&[0x48, 0x89, 0x45]);
-            code.push(offset as u8);
-        } else {
-            code.extend_from_slice(&[0x48, 0x89, 0x85]);
-            code.extend_from_slice(&offset.to_le_bytes());
-        }
-        // inc r14
-        code.extend_from_slice(&[0x49, 0xFF, 0xC6]);
-    }
-
-    // Evaluate let bindings into rbp slots.
-    let mut binding_offsets = offsets.clone();
-    let mut next_slot = -((nfields as i32 + 1) * 8);
-    for (name, expr) in &trigger_rule.logic.bindings {
-        let field_ranges = build_field_ranges(concept);
-        emit_eval_expr(&mut code, expr, &trigger_rule.input_name, &binding_offsets, all_rules, &field_ranges)?;
-        if next_slot >= -128 {
-            code.extend_from_slice(&[0x48, 0x89, 0x45]);
-            code.push(next_slot as u8);
-        } else {
-            code.extend_from_slice(&[0x48, 0x89, 0x85]);
-            code.extend_from_slice(&next_slot.to_le_bytes());
-        }
-        binding_offsets.insert(name.as_str(), next_slot);
-        next_slot -= 8;
-    }
+    let ctx = emit_record_loop_prologue(&mut code, trigger_rule, concept, all_rules)?;
 
     // Evaluate trigger rule's logic → rax (0 = no fire, nonzero = fire).
-    let field_ranges = build_field_ranges(concept);
-    emit_eval_expr(&mut code, &trigger_rule.logic.value, &trigger_rule.input_name, &binding_offsets, all_rules, &field_ranges)?;
+    emit_eval_expr(
+        &mut code,
+        &trigger_rule.logic.value,
+        &trigger_rule.input_name,
+        &ctx.binding_offsets,
+        all_rules,
+        &ctx.field_ranges,
+    )?;
 
     // cmp rax, 0 ; je skip_effects (rel32 so effect body can be large)
     code.extend_from_slice(&[0x48, 0x83, 0xF8, 0x00]);
@@ -1869,8 +1731,7 @@ fn emit_reaction_program(
     let skip_patch = code.len();
     code.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
 
-    // Emit each effect. (Pre-check above ensures they are all AppendFile
-    // with literal content; panic path is compile-time, not runtime.)
+    // Emit each effect. The pre-check above ensures they are all AppendFile.
     for effect in &reaction.effects {
         if let Effect::AppendFile { path, content } = effect {
             emit_append_file_call(
@@ -1880,8 +1741,8 @@ fn emit_reaction_program(
                 trigger_rule,
                 concept,
                 all_rules,
-                &binding_offsets,
-                &field_ranges,
+                &ctx.binding_offsets,
+                &ctx.field_ranges,
             )?;
         }
     }
@@ -1893,18 +1754,10 @@ fn emit_reaction_program(
 
     // jmp loop_top
     code.push(0xE9);
-    let loop_offset = loop_top as i32 - (code.len() + 4) as i32;
+    let loop_offset = ctx.loop_top as i32 - (code.len() + 4) as i32;
     code.extend_from_slice(&loop_offset.to_le_bytes());
 
-    // exit:
-    let exit_pos = code.len();
-    let exit_offset = exit_pos as i32 - (exit_patch as i32 + 4);
-    code[exit_patch..exit_patch + 4].copy_from_slice(&exit_offset.to_le_bytes());
-
-    // mov rax, 60 ; xor rdi, rdi ; syscall  (exit 0)
-    code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x3C, 0x00, 0x00, 0x00]);
-    code.extend_from_slice(&[0x48, 0x31, 0xFF]);
-    code.extend_from_slice(&[0x0F, 0x05]);
+    emit_record_loop_epilogue(&mut code, &ctx);
 
     Ok(code)
 }
