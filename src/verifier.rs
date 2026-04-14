@@ -158,6 +158,7 @@ fn verify_rule(
         rule,
         all_rules,
         input_concept,
+        concepts,
         errors,
     );
 }
@@ -167,21 +168,25 @@ fn verify_rule(
 ///   - Ok/Err constructors where the expected type is not a Result,
 ///   - Ok(x) where x's inferable type != T (in Result(T, _)),
 ///   - Err(e) where e's inferable type != E (in Result(_, E)),
-///   - Any inferable expression whose type != expected.
+///   - Map/Filter outside a Collection context,
+///   - Record(C) where C is unknown, or field set differs from C's declaration,
+///     or a field's inferable type differs from C's declared field type,
+///   - Any other inferable expression whose type != expected.
 fn check_expr_against(
     expr: &Expr,
     expected: &Type,
     rule: &Rule,
     all_rules: &[&Rule],
-    concept: Option<&Concept>,
+    input_concept: Option<&Concept>,
+    all_concepts: &HashMap<String, &Concept>,
     errors: &mut Vec<VerifyError>,
 ) {
     match (expr, expected) {
         (Expr::Ok(inner), Type::Result(t, _)) => {
-            check_expr_against(inner, t, rule, all_rules, concept, errors);
+            check_expr_against(inner, t, rule, all_rules, input_concept, all_concepts, errors);
         }
         (Expr::Err(inner), Type::Result(_, e)) => {
-            check_expr_against(inner, e, rule, all_rules, concept, errors);
+            check_expr_against(inner, e, rule, all_rules, input_concept, all_concepts, errors);
         }
         (Expr::Ok(_), other) | (Expr::Err(_), other) => {
             errors.push(VerifyError {
@@ -193,19 +198,101 @@ fn check_expr_against(
             });
         }
         (Expr::If(cond, then_e, else_e), _) => {
-            check_expr_against(cond, &Type::Bool, rule, all_rules, concept, errors);
-            check_expr_against(then_e, expected, rule, all_rules, concept, errors);
-            check_expr_against(else_e, expected, rule, all_rules, concept, errors);
+            check_expr_against(cond, &Type::Bool, rule, all_rules, input_concept, all_concepts, errors);
+            check_expr_against(then_e, expected, rule, all_rules, input_concept, all_concepts, errors);
+            check_expr_against(else_e, expected, rule, all_rules, input_concept, all_concepts, errors);
         }
         (Expr::MatchResult(_target, _, ok_body, _, err_body), _) => {
             // Both arms must produce `expected`. The target should be a Result —
             // checking that requires inferring through lambda bindings, which
             // this pass does not track. Skipped, not fabricated.
-            check_expr_against(ok_body, expected, rule, all_rules, concept, errors);
-            check_expr_against(err_body, expected, rule, all_rules, concept, errors);
+            check_expr_against(ok_body, expected, rule, all_rules, input_concept, all_concepts, errors);
+            check_expr_against(err_body, expected, rule, all_rules, input_concept, all_concepts, errors);
+        }
+        // Map and Filter only fit a Collection context. Their bodies depend
+        // on lambda-bound variables we do not yet track, so the body is left
+        // unchecked, but the SHAPE (collection-producing) is enforced.
+        (Expr::Map(_, _, _) | Expr::Filter(_, _, _), Type::Collection(_)) => {}
+        (Expr::Map(_, _, _), other) | (Expr::Filter(_, _, _), other) => {
+            errors.push(VerifyError {
+                context: format!("rule '{}' / logic", rule.name),
+                message: format!(
+                    "map/filter produces a collection but the expected type is '{}'",
+                    type_display(other),
+                ),
+            });
+        }
+        // Record(ConceptName) construction: cross-check field set + types.
+        (Expr::Record(name, fields), expected_ty) => {
+            let concept = match all_concepts.get(name) {
+                Some(c) => *c,
+                None => {
+                    errors.push(VerifyError {
+                        context: format!("rule '{}' / logic", rule.name),
+                        message: format!(
+                            "record constructor references unknown concept '{}'",
+                            name
+                        ),
+                    });
+                    return;
+                }
+            };
+            // Expected type, when known, should be the named concept.
+            let shape_matches = match expected_ty {
+                Type::Named(n) => n == name,
+                Type::Collection(elem) => elem == name, // for use inside a map body
+                _ => false, // Number/Bool/Text/Result don't match any record
+            };
+            if !shape_matches {
+                errors.push(VerifyError {
+                    context: format!("rule '{}' / logic", rule.name),
+                    message: format!(
+                        "record constructor '{}' produces type '{}' but context expects '{}'",
+                        name,
+                        name,
+                        type_display(expected_ty),
+                    ),
+                });
+            }
+            // Field set: every declared field must be provided, no extras.
+            let provided: HashSet<&str> = fields.iter().map(|(n, _)| n.as_str()).collect();
+            let declared: HashSet<&str> = concept.fields.iter().map(|f| f.name.as_str()).collect();
+            for missing in declared.difference(&provided) {
+                errors.push(VerifyError {
+                    context: format!("rule '{}' / logic", rule.name),
+                    message: format!(
+                        "record constructor '{}' is missing field '{}'",
+                        name, missing
+                    ),
+                });
+            }
+            for extra in provided.difference(&declared) {
+                errors.push(VerifyError {
+                    context: format!("rule '{}' / logic", rule.name),
+                    message: format!(
+                        "record constructor '{}' has unknown field '{}'",
+                        name, extra
+                    ),
+                });
+            }
+            // Per-field type check: each provided field's expression must
+            // match the declared field type (when inferable).
+            for (field_name, field_expr) in fields {
+                if let Some(decl) = concept.fields.iter().find(|f| &f.name == field_name) {
+                    check_expr_against(
+                        field_expr,
+                        &decl.ty,
+                        rule,
+                        all_rules,
+                        input_concept,
+                        all_concepts,
+                        errors,
+                    );
+                }
+            }
         }
         _ => {
-            if let Some(inferred) = infer_expr_type(expr, rule, all_rules, concept) {
+            if let Some(inferred) = infer_expr_type(expr, rule, all_rules, input_concept) {
                 if &inferred != expected {
                     errors.push(VerifyError {
                         context: format!("rule '{}' / logic", rule.name),
@@ -260,6 +347,7 @@ fn infer_expr_type(
             .map(|r| r.output_ty.clone()),
         Expr::If(_, then_e, _) => infer_expr_type(then_e, rule, all_rules, concept),
         Expr::Quantifier(_, _, _, _) => Some(Type::Bool),
+        Expr::Record(name, _) => Some(Type::Named(name.clone())),
         // Map/Filter/Fold/Ok/Err/MatchResult: deferred until lambda binding
         // tracking lands. Returning None means we do not check; we also do not
         // falsely accept.
@@ -532,6 +620,14 @@ fn collect_expr_facts(
                 }
             }
         }
+        Expr::Record(_, fields) => {
+            // Record construction is a pass-through for facts: each field's
+            // expression contributes its own reads and calls. The constructor
+            // itself adds nothing.
+            for (_, field_expr) in fields {
+                collect_expr_facts(field_expr, reads, calls);
+            }
+        }
     }
 }
 
@@ -717,6 +813,10 @@ fn count_operations(expr: &Expr) -> usize {
             // Dispatch costs 1; both arms contribute like if/then/else.
             1 + count_operations(target) + count_operations(ok_body) + count_operations(err_body)
         }
+        Expr::Record(_, fields) => {
+            // Construction itself is 1 op; each field expression contributes.
+            1 + fields.iter().map(|(_, e)| count_operations(e)).sum::<usize>()
+        }
     }
 }
 
@@ -862,6 +962,231 @@ rule important_invoice
     fn happy_path() {
         let errs = verify_str(VALID);
         assert!(errs.is_empty(), "expected no errors, got {:#?}", errs);
+    }
+
+    #[test]
+    fn record_unknown_concept_rejected() {
+        let src = r#"@verbose 0.1.0
+
+concept In
+  @intention: "x"
+  @source: invoices.intent:1
+  fields:
+    x : number
+
+rule make
+  @intention: "y"
+  @source: invoices.intent:2
+  input:
+    i : In
+  output:
+    p : Ghost
+  logic:
+    p = Ghost { x: i.x }
+  proofs:
+    purity:
+      reads   : [i.x]
+      writes  : []
+      calls   : []
+      verdict : pure
+    termination:
+      form  : constant_bound
+      bound : 1
+    determinism:
+      form : total
+"#;
+        let errs = verify_str(src);
+        // Two errors expected: unknown type 'Ghost' on output, and unknown
+        // concept 'Ghost' on the constructor. We only assert the constructor
+        // error is present and named.
+        assert!(
+            errs.iter().any(|e| e.message.contains("unknown concept 'Ghost'")),
+            "expected unknown-concept-on-constructor error, got {:#?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn record_missing_field_rejected() {
+        let src = r#"@verbose 0.1.0
+
+concept Pair
+  @intention: "t"
+  @source: invoices.intent:1
+  fields:
+    a : number
+    b : number
+
+concept In
+  @intention: "x"
+  @source: invoices.intent:1
+  fields:
+    x : number
+
+rule make
+  @intention: "y"
+  @source: invoices.intent:2
+  input:
+    i : In
+  output:
+    p : Pair
+  logic:
+    p = Pair { a: i.x }
+  proofs:
+    purity:
+      reads   : [i.x]
+      writes  : []
+      calls   : []
+      verdict : pure
+    termination:
+      form  : constant_bound
+      bound : 1
+    determinism:
+      form : total
+"#;
+        let errs = verify_str(src);
+        assert!(
+            errs.iter().any(|e| e.message.contains("missing field 'b'")),
+            "expected missing-field error, got {:#?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn record_extra_field_rejected() {
+        let src = r#"@verbose 0.1.0
+
+concept Pair
+  @intention: "t"
+  @source: invoices.intent:1
+  fields:
+    a : number
+    b : number
+
+concept In
+  @intention: "x"
+  @source: invoices.intent:1
+  fields:
+    x : number
+
+rule make
+  @intention: "y"
+  @source: invoices.intent:2
+  input:
+    i : In
+  output:
+    p : Pair
+  logic:
+    p = Pair { a: i.x, b: i.x, c: i.x }
+  proofs:
+    purity:
+      reads   : [i.x]
+      writes  : []
+      calls   : []
+      verdict : pure
+    termination:
+      form  : constant_bound
+      bound : 1
+    determinism:
+      form : total
+"#;
+        let errs = verify_str(src);
+        assert!(
+            errs.iter().any(|e| e.message.contains("unknown field 'c'")),
+            "expected unknown-field error, got {:#?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn record_field_wrong_type_rejected() {
+        let src = r#"@verbose 0.1.0
+
+concept Pair
+  @intention: "t"
+  @source: invoices.intent:1
+  fields:
+    a : number
+    b : number
+
+concept In
+  @intention: "x"
+  @source: invoices.intent:1
+  fields:
+    x : number
+
+rule make
+  @intention: "y"
+  @source: invoices.intent:2
+  input:
+    i : In
+  output:
+    p : Pair
+  logic:
+    p = Pair { a: i.x, b: i.x > 0 }
+  proofs:
+    purity:
+      reads   : [i.x]
+      writes  : []
+      calls   : []
+      verdict : pure
+    termination:
+      form  : constant_bound
+      bound : 2
+    determinism:
+      form : total
+"#;
+        let errs = verify_str(src);
+        // The b field is declared number but its expression is bool.
+        assert!(
+            errs.iter().any(|e| e.message.contains("type 'bool'")
+                && e.message.contains("expects 'number'")),
+            "expected bool-vs-number type-mismatch on field b, got {:#?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn map_outside_collection_rejected() {
+        // Closes the previously-silent hole: rule output is a number but logic
+        // uses map(...) which produces a collection. The shape check must catch
+        // this.
+        let src = r#"@verbose 0.1.0
+
+concept Bag
+  @intention: "x"
+  @source: collections.intent:1
+  fields:
+    items : collection(number)
+
+rule wrong
+  @intention: "y"
+  @source: collections.intent:2
+  input:
+    b : Bag
+  output:
+    r : number
+  logic:
+    r = map(b.items, x => x + 1)
+  proofs:
+    purity:
+      reads   : [b.items]
+      writes  : []
+      calls   : []
+      verdict : pure
+    termination:
+      form  : constant_bound
+      bound : 2
+    determinism:
+      form : total
+"#;
+        let errs = verify_str(src);
+        assert!(
+            errs.iter().any(|e| e.message.contains("map/filter")
+                && e.message.contains("number")),
+            "expected map-shape error, got {:#?}",
+            errs
+        );
     }
 
     #[test]

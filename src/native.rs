@@ -310,6 +310,7 @@ fn max_stack_depth(expr: &Expr) -> usize {
         Expr::MatchResult(t, _, ob, _, eb) => {
             max_stack_depth(t).max(max_stack_depth(ob)).max(max_stack_depth(eb))
         }
+        Expr::Record(_, fields) => fields.iter().map(|(_, e)| max_stack_depth(e)).max().unwrap_or(0),
     }
 }
 
@@ -706,8 +707,9 @@ fn emit_eval_expr(
         | Expr::Filter(_, _, _)
         | Expr::Ok(_)
         | Expr::Err(_)
-        | Expr::MatchResult(_, _, _, _, _) => Err(NativeError {
-            message: "collection/result operations (fold/quantifier/map/filter/Ok/Err/match_result) not supported in native backend (use --run interpreter)"
+        | Expr::MatchResult(_, _, _, _, _)
+        | Expr::Record(_, _) => Err(NativeError {
+            message: "collection/result/record operations not supported in native backend (use --run interpreter)"
                 .into(),
         }),
         Expr::Ident(name) if name == input_name => Err(NativeError {

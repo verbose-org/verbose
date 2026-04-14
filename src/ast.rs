@@ -201,6 +201,11 @@ pub enum Expr {
         String, Box<Expr>, // ok_var, ok_body
         String, Box<Expr>, // err_var, err_body
     ),
+    /// ConceptName { field: expr, field: expr, ... }
+    /// Constructs a record of the named concept. The verifier cross-checks
+    /// that the field set matches the concept's declaration exactly and
+    /// that each field's expression type matches the declared field type.
+    Record(String, Vec<(String, Expr)>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

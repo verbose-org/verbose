@@ -181,8 +181,9 @@ fn emit_expr(expr: &Expr, input_name: &str, concept: Option<&Concept>) -> String
         | Expr::Filter(_, _, _)
         | Expr::Ok(_)
         | Expr::Err(_)
-        | Expr::MatchResult(_, _, _, _, _) => {
-            "(/* collection/result op: use --run interpreter */false)".to_string()
+        | Expr::MatchResult(_, _, _, _, _)
+        | Expr::Record(_, _) => {
+            "(/* collection/result/record op: use --run interpreter */false)".to_string()
         }
         Expr::Call(name, _args) => {
             if let Some(c) = concept {

@@ -1,0 +1,6 @@
+1. An employee has a name, a salary, and a tenure in years.
+2. A workforce is a collection of employees.
+3. A bonus report has a name and a bonus amount.
+4. An employee is eligible for a bonus when their tenure is 2 years or more.
+5. The bonus amount is 10% of salary if the employee is eligible, otherwise 0.
+6. For each employee in the workforce, produce a bonus report containing their name and their bonus amount.

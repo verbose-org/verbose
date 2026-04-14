@@ -13,6 +13,8 @@ pub enum TokenKind {
     RBracket,
     LParen,
     RParen,
+    LBrace,
+    RBrace,
     Equal,
     EqualEqual,
     FatArrow,
@@ -55,6 +57,8 @@ impl fmt::Display for TokenKind {
             TokenKind::RBracket => write!(f, "']'"),
             TokenKind::LParen => write!(f, "'('"),
             TokenKind::RParen => write!(f, "')'"),
+            TokenKind::LBrace => write!(f, "'{{'"),
+            TokenKind::RBrace => write!(f, "'}}'"),
             TokenKind::Equal => write!(f, "'='"),
             TokenKind::EqualEqual => write!(f, "'=='"),
             TokenKind::FatArrow => write!(f, "'=>'"),
@@ -363,6 +367,23 @@ impl<'a> Lexer<'a> {
                     });
                 }
                 TokenKind::RParen
+            }
+            b'{' => {
+                self.advance();
+                self.paren_depth += 1;
+                TokenKind::LBrace
+            }
+            b'}' => {
+                self.advance();
+                self.paren_depth -= 1;
+                if self.paren_depth < 0 {
+                    return Err(LexError {
+                        line: start_line,
+                        col: start_col,
+                        message: "unexpected '}'".into(),
+                    });
+                }
+                TokenKind::RBrace
             }
             b'=' => {
                 if self.peek(1) == Some(b'=') {

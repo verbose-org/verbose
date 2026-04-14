@@ -405,6 +405,17 @@ fn eval_expr(
             let v = eval_expr(inner, env, all_rules)?;
             Ok(Value::Err(Box::new(v)))
         }
+        Expr::Record(_concept_name, fields) => {
+            // Evaluate each field expression and assemble a Value::Record.
+            // The verifier already cross-checked field set + types — at this
+            // point we trust the structure.
+            let mut map = HashMap::new();
+            for (name, expr) in fields {
+                let v = eval_expr(expr, env, all_rules)?;
+                map.insert(name.clone(), v);
+            }
+            Ok(Value::Record(map))
+        }
         Expr::MatchResult(target, ok_var, ok_body, err_var, err_body) => {
             // Evaluate the target, dispatch on its Ok/Err tag. Exactly one
             // arm runs; the chosen arm's lambda variable is bound to the

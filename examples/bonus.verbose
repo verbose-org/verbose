@@ -1,0 +1,111 @@
+@verbose 0.1.0
+
+-- Demonstrates record construction in expressions: map produces a
+-- collection(BonusReport) by building a fresh BonusReport per Employee.
+-- This is what unlocks "list of structured results" — the shape that
+-- 80% of business programs need to express.
+
+
+concept Employee
+  @intention: "An employee has a name, salary, and tenure (years)"
+  @source: bonus.intent:1
+
+  fields:
+    name   : text
+    salary : number [0, 1000000]
+    tenure : number [0, 50]
+
+
+concept Workforce
+  @intention: "A workforce is a collection of employees"
+  @source: bonus.intent:2
+
+  fields:
+    employees : collection(Employee)
+
+
+concept BonusReport
+  @intention: "A bonus report has a name and a bonus amount"
+  @source: bonus.intent:3
+
+  fields:
+    name  : text
+    bonus : number
+
+
+rule eligible
+  @intention: "An employee is eligible when their tenure is 2 years or more"
+  @source: bonus.intent:4
+
+  input:
+    e : Employee
+
+  output:
+    ok : bool
+
+  logic:
+    ok = e.tenure >= 2
+
+  proofs:
+    purity:
+      reads   : [e.tenure]
+      writes  : []
+      calls   : []
+      verdict : pure
+    termination:
+      form  : constant_bound
+      bound : 1
+    determinism:
+      form : total
+
+
+rule bonus_amount
+  @intention: "The bonus amount is 10% of salary if eligible, otherwise 0"
+  @source: bonus.intent:5
+
+  input:
+    e : Employee
+
+  output:
+    amount : number
+
+  logic:
+    amount = if eligible(e) then e.salary * 10 / 100 else 0
+
+  proofs:
+    purity:
+      reads   : [e, e.salary]
+      writes  : []
+      calls   : [eligible]
+      verdict : pure
+    termination:
+      form  : constant_bound
+      bound : 4
+    determinism:
+      form : total
+
+
+rule report
+  @intention: "For each employee, produce a bonus report with their name and bonus amount"
+  @source: bonus.intent:6
+
+  input:
+    w : Workforce
+
+  output:
+    reports : collection(BonusReport)
+
+  logic:
+    reports = map(w.employees, e => BonusReport { name: e.name, bonus: bonus_amount(e) })
+
+  proofs:
+    purity:
+      reads   : [w.employees]
+      writes  : []
+      calls   : [bonus_amount]
+      verdict : pure
+    termination:
+      form  : constant_bound
+      bound : 5
+    determinism:
+      form : total

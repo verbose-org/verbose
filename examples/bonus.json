@@ -1,0 +1,11 @@
+[
+  {
+    "employees": [
+      {"name": "Alice",  "salary":  60000, "tenure": 5},
+      {"name": "Bob",    "salary":  45000, "tenure": 1},
+      {"name": "Carol",  "salary":  90000, "tenure": 8},
+      {"name": "Dmitri", "salary":  30000, "tenure": 0},
+      {"name": "Eve",    "salary": 120000, "tenure": 3}
+    ]
+  }
+]

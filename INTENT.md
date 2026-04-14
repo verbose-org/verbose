@@ -39,6 +39,10 @@ This document catalogs the prose patterns the generation tool maps reliably to s
 
 .intent:  6. The total revenue is the sum of each order's amount.
 .verbose: total = sum(orders, o => o.amount)
+
+.intent:  7. For each employee, produce a bonus report with their name and
+              bonus amount.
+.verbose: reports = map(w.employees, e => BonusReport { name: e.name, bonus: bonus_amount(e) })
 ```
 
 ## Conditions and classification
@@ -54,6 +58,8 @@ This document catalogs the prose patterns the generation tool maps reliably to s
 | *"X is accepted with Y when P, rejected with reason R otherwise"* | output type `Result(T, E)` with `if P then Ok(Y) else Err(R)` |
 | *"Validate X, returning success or a reason for failure"* | rule with output `Result(T, text)` producing `Ok(...)` or `Err("reason")` |
 | *"Given a validated X, do Y on success, propagate the reason on failure"* | `match_result(validated_x, v => Ok(y(v)), reason => Err(reason))` |
+| *"For each X, produce a structured report containing field A, field B, ..."* | `map(xs, x => ConceptName { a: ..., b: ... })` (record constructor) |
+| *"Build a [concept] with these field values"* | `ConceptName { f1: e1, f2: e2, ... }` — every field of the concept must be provided, each with the right type |
 
 ### Examples
 

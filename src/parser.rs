@@ -597,6 +597,33 @@ impl Parser {
                 } else {
                     Ok(Expr::Err(Box::new(inner)))
                 }
+            } else if self.check_kind(&TokenKind::LBrace) {
+                // Record constructor: ConceptName { field: expr, field: expr, ... }
+                // Single-line by convention — the lexer's paren-depth tracking
+                // suppresses INDENT/DEDENT inside braces, but for clarity all
+                // examples and tests use a single line. The concept name is
+                // looked up by the verifier; the parser only ensures syntax.
+                self.advance(); // {
+                let mut fields = Vec::new();
+                if !self.check_kind(&TokenKind::RBrace) {
+                    loop {
+                        let field_name = self.expect_ident_any()?;
+                        self.expect_kind(TokenKind::Colon)?;
+                        let value = self.parse_expr()?;
+                        fields.push((field_name, value));
+                        if self.check_kind(&TokenKind::Comma) {
+                            self.advance();
+                            // Trailing comma allowed: stop if next is closing brace.
+                            if self.check_kind(&TokenKind::RBrace) {
+                                break;
+                            }
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                self.expect_kind(TokenKind::RBrace)?;
+                Ok(Expr::Record(name, fields))
             } else if name == "match_result" && self.check_kind(&TokenKind::LParen) {
                 // match_result(target, ok_var => ok_body, err_var => err_body)
                 // The Result consumer. Both arms are explicit — no implicit
@@ -1435,6 +1462,24 @@ rule important_invoice
                 // Logic uses Ok/Err under an if/else
                 assert!(matches!(&r.logic.value, Expr::If(_, _, _)));
             }
+            _ => panic!("expected rule"),
+        }
+    }
+
+    #[test]
+    fn record_constructor_parsed() {
+        let src = "@verbose 0.1.0\n\nconcept Pair\n  @intention: \"t\"\n  @source: f.intent:1\n  fields:\n    a : number\n    b : number\n\nconcept In\n  @intention: \"t\"\n  @source: f.intent:1\n  fields:\n    x : number\n\nrule make\n  @intention: \"t\"\n  @source: f.intent:1\n  input:\n    i : In\n  output:\n    p : Pair\n  logic:\n    p = Pair { a: i.x, b: i.x + 1 }\n  proofs:\n    purity:\n      reads: [i.x]\n      writes: []\n      calls: []\n      verdict: pure\n    termination:\n      form: constant_bound\n      bound: 3\n    determinism:\n      form: total\n";
+        let p = parse(src).unwrap();
+        match &p.items[2] {
+            Item::Rule(r) => match &r.logic.value {
+                Expr::Record(name, fields) => {
+                    assert_eq!(name, "Pair");
+                    assert_eq!(fields.len(), 2);
+                    assert_eq!(fields[0].0, "a");
+                    assert_eq!(fields[1].0, "b");
+                }
+                other => panic!("expected Record, got {:?}", other),
+            },
             _ => panic!("expected rule"),
         }
     }
