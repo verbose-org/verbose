@@ -164,6 +164,15 @@ impl Parser {
                 self.expect_kind(TokenKind::RParen)?;
                 Type::Collection(inner)
             }
+            "Result" => {
+                // Result(T, E) — a declared failure path. T and E are arbitrary types.
+                self.expect_kind(TokenKind::LParen)?;
+                let t = self.parse_type()?;
+                self.expect_kind(TokenKind::Comma)?;
+                let e = self.parse_type()?;
+                self.expect_kind(TokenKind::RParen)?;
+                Type::Result(Box::new(t), Box::new(e))
+            }
             _ => Type::Named(name),
         })
     }
@@ -552,6 +561,18 @@ impl Parser {
                     Ok(Expr::Map(Box::new(collection), var, Box::new(body)))
                 } else {
                     Ok(Expr::Filter(Box::new(collection), var, Box::new(body)))
+                }
+            } else if (name == "Ok" || name == "Err") && self.check_kind(&TokenKind::LParen) {
+                // Result constructors: Ok(expr) | Err(expr).
+                // Intercepted before the generic call branch so they are never
+                // treated as rule calls named "Ok" or "Err".
+                self.advance(); // (
+                let inner = self.parse_expr()?;
+                self.expect_kind(TokenKind::RParen)?;
+                if name == "Ok" {
+                    Ok(Expr::Ok(Box::new(inner)))
+                } else {
+                    Ok(Expr::Err(Box::new(inner)))
                 }
             } else if self.check_kind(&TokenKind::LParen) {
                 self.advance();
@@ -1347,6 +1368,27 @@ rule important_invoice
         match &p.items[1] {
             Item::Rule(r) => {
                 assert!(matches!(&r.logic.value, Expr::Map(_, _, _)));
+            }
+            _ => panic!("expected rule"),
+        }
+    }
+
+    #[test]
+    fn result_type_parsed() {
+        let src = "@verbose 0.1.0\n\nconcept T\n  @intention: \"t\"\n  @source: f.intent:1\n  fields:\n    x : number\n\nrule try_div\n  @intention: \"t\"\n  @source: f.intent:1\n  input:\n    t : T\n  output:\n    r : Result(number, text)\n  logic:\n    r = if t.x > 0 then Ok(t.x) else Err(\"negative\")\n  proofs:\n    purity:\n      reads: [t.x]\n      writes: []\n      calls: []\n      verdict: pure\n    termination:\n      form: constant_bound\n      bound: 3\n    determinism:\n      form: total\n";
+        let p = parse(src).unwrap();
+        match &p.items[1] {
+            Item::Rule(r) => {
+                // Output type is Result(number, text)
+                match &r.output_ty {
+                    Type::Result(t, e) => {
+                        assert_eq!(**t, Type::Number);
+                        assert_eq!(**e, Type::Text);
+                    }
+                    other => panic!("expected Result type, got {:?}", other),
+                }
+                // Logic uses Ok/Err under an if/else
+                assert!(matches!(&r.logic.value, Expr::If(_, _, _)));
             }
             _ => panic!("expected rule"),
         }

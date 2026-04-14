@@ -51,6 +51,7 @@ examples/
   alerts.*         Dynamic reactions with interpolated values
   app.* + stdlib/  Module system demo (use + import)
   retirement.*     map + filter on a collection of employees
+  purchase.*       Result(T, E) — declared failure path (Ok/Err)
   demo.html        Browser demo (WASM)
 
 tools/
@@ -60,7 +61,7 @@ tools/
 
 ## Language Features (current)
 
-- Types: `number`, `bool`, `text`, `collection(Type)`, named types
+- Types: `number`, `bool`, `text`, `collection(Type)`, `Result(T, E)` (declared failure path), named types
 - Field ranges: `amount : number [0, 1000000]`
 - Expressions: arithmetic (+, -, *, /, %), comparisons (>, <, >=, <=, ==, !=), boolean (and, or, not)
 - Control flow: `if condition then expr else expr` (nestable)

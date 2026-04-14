@@ -1,0 +1,41 @@
+@verbose 0.1.0
+
+-- Demonstrates Result(T, E): the failure path is a declared part of the
+-- output, not a silent panic. A purchase validator produces Ok(amount)
+-- when valid, or Err("reason") when not — both are legitimate outputs,
+-- both are visible to the caller, both are audited at the IR level.
+
+
+concept Purchase
+  @intention: "A purchase has an amount and the customer's age"
+  @source: purchase.intent:1
+
+  fields:
+    amount        : number [0, 1000000]
+    customer_age  : number [0, 150]
+
+
+rule validate_purchase
+  @intention: "Accept the purchase with its amount if the customer is 18 or older; reject with a reason otherwise"
+  @source: purchase.intent:2
+
+  input:
+    p : Purchase
+
+  output:
+    r : Result(number, text)
+
+  logic:
+    r = if p.customer_age >= 18 then Ok(p.amount) else Err("customer is under 18")
+
+  proofs:
+    purity:
+      reads   : [p.customer_age, p.amount]
+      writes  : []
+      calls   : []
+      verdict : pure
+    termination:
+      form  : constant_bound
+      bound : 4
+    determinism:
+      form : total

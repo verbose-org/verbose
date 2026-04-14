@@ -64,6 +64,10 @@ pub enum Type {
     Text,
     Collection(String),
     Named(String),
+    /// Result(T, E) — a declared failure path.
+    /// A rule returning Result(T, E) produces either Ok(t) or Err(e).
+    /// The failure path is part of the declared output, not an implicit panic.
+    Result(Box<Type>, Box<Type>),
 }
 
 #[derive(Debug, Clone)]
@@ -144,6 +148,12 @@ pub enum Expr {
     /// Keeps elements for which pred is true, returning a collection of the same
     /// element type. Same proof structure as Quantifier.
     Filter(Box<Expr>, String, Box<Expr>),
+    /// Ok(expr) — success constructor for a Result-typed output.
+    /// Pass-through for purity/termination: inherits from inner expr.
+    Ok(Box<Expr>),
+    /// Err(expr) — failure constructor for a Result-typed output.
+    /// The failure reason is a declared expression (typically text), not a panic.
+    Err(Box<Expr>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

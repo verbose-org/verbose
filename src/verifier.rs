@@ -322,6 +322,11 @@ fn collect_expr_facts(
                 }
             }
         }
+        Expr::Ok(inner) | Expr::Err(inner) => {
+            // Pure pass-through: the constructor adds no reads or calls of its
+            // own, so the inner expression's facts are the whole story.
+            collect_expr_facts(inner, reads, calls);
+        }
     }
 }
 
@@ -502,6 +507,7 @@ fn count_operations(expr: &Expr) -> usize {
         Expr::Quantifier(_, coll, _, pred) => 1 + count_operations(coll) + count_operations(pred),
         Expr::Fold(coll, init, _, _, body) => 1 + count_operations(coll) + count_operations(init) + count_operations(body),
         Expr::Map(coll, _, body) | Expr::Filter(coll, _, body) => 1 + count_operations(coll) + count_operations(body),
+        Expr::Ok(inner) | Expr::Err(inner) => 1 + count_operations(inner),
     }
 }
 

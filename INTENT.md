@@ -51,6 +51,8 @@ This document catalogs the prose patterns the generation tool maps reliably to s
 | *"X is greater than / less than / at least / at most N"* | `>`, `<`, `>=`, `<=` |
 | *"X equals Y"* / *"X is not Y"* | `==`, `!=` |
 | *"Both A and B"* / *"Either A or B"* / *"Not A"* | `and`, `or`, `not` |
+| *"X is accepted with Y when P, rejected with reason R otherwise"* | output type `Result(T, E)` with `if P then Ok(Y) else Err(R)` |
+| *"Validate X, returning success or a reason for failure"* | rule with output `Result(T, text)` producing `Ok(...)` or `Err("reason")` |
 
 ### Examples
 
@@ -61,6 +63,14 @@ This document catalogs the prose patterns the generation tool maps reliably to s
 .intent:  4. A client is a premium client if their balance exceeds 100000,
               otherwise a standard client.
 .verbose: tier = if c.balance > 100000 then "premium" else "standard"
+
+.intent:  5. Validate the purchase: accept it with its amount if the customer
+              is 18 or older, otherwise reject it with the reason
+              "customer is under 18".
+.verbose: output:
+            r : Result(number, text)
+          logic:
+            r = if p.customer_age >= 18 then Ok(p.amount) else Err("customer is under 18")
 ```
 
 ## Composition

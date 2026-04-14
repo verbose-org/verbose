@@ -306,6 +306,7 @@ fn max_stack_depth(expr: &Expr) -> usize {
         Expr::Map(coll, _, body) | Expr::Filter(coll, _, body) => {
             max_stack_depth(coll).max(max_stack_depth(body))
         }
+        Expr::Ok(inner) | Expr::Err(inner) => max_stack_depth(inner),
     }
 }
 
@@ -699,8 +700,10 @@ fn emit_eval_expr(
         Expr::Fold(_, _, _, _, _)
         | Expr::Quantifier(_, _, _, _)
         | Expr::Map(_, _, _)
-        | Expr::Filter(_, _, _) => Err(NativeError {
-            message: "collection operations (fold/quantifier/map/filter) not supported in native backend (use --run interpreter)"
+        | Expr::Filter(_, _, _)
+        | Expr::Ok(_)
+        | Expr::Err(_) => Err(NativeError {
+            message: "collection/result operations (fold/quantifier/map/filter/Ok/Err) not supported in native backend (use --run interpreter)"
                 .into(),
         }),
         Expr::Ident(name) if name == input_name => Err(NativeError {

@@ -1,0 +1,6 @@
+[
+  {"amount": 150, "customer_age": 25},
+  {"amount": 200, "customer_age": 17},
+  {"amount":  80, "customer_age": 18},
+  {"amount": 999, "customer_age": 14}
+]

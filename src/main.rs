@@ -499,6 +499,8 @@ fn value_to_json(val: &interpreter::Value) -> String {
                 .collect();
             format!("{{{}}}", parts.join(","))
         }
+        interpreter::Value::Ok(inner) => format!("{{\"ok\":{}}}", value_to_json(inner)),
+        interpreter::Value::Err(inner) => format!("{{\"err\":{}}}", value_to_json(inner)),
     }
 }
 

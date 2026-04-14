@@ -178,8 +178,10 @@ fn emit_expr(expr: &Expr, input_name: &str, concept: Option<&Concept>) -> String
         Expr::Fold(_, _, _, _, _)
         | Expr::Quantifier(_, _, _, _)
         | Expr::Map(_, _, _)
-        | Expr::Filter(_, _, _) => {
-            "(/* collection op: use --run interpreter */false)".to_string()
+        | Expr::Filter(_, _, _)
+        | Expr::Ok(_)
+        | Expr::Err(_) => {
+            "(/* collection/result op: use --run interpreter */false)".to_string()
         }
         Expr::Call(name, _args) => {
             if let Some(c) = concept {
@@ -199,6 +201,10 @@ fn rust_type(ty: &Type) -> &str {
         Type::Text => "&str",
         Type::Collection(_) => "Vec<i64>",
         Type::Named(_) => "i64",
+        // Result(T, E) isn't lowered by the transpiler yet — the interpreter
+        // is the current home. Surfaced as a placeholder so the transpiled
+        // Rust file compiles but obviously won't execute Result semantics.
+        Type::Result(_, _) => "i64 /* Result — use --run interpreter */",
     }
 }
 
@@ -209,6 +215,9 @@ fn type_label(ty: &Type) -> &str {
         Type::Text => "text",
         Type::Collection(inner) => return format!("collection({})", inner).leak(),
         Type::Named(n) => n.as_str(),
+        Type::Result(t, e) => {
+            return format!("Result({}, {})", type_label(t), type_label(e)).leak();
+        }
     }
 }
 

@@ -12,6 +12,10 @@ pub enum Value {
     Text(String),
     List(Vec<Value>),
     Record(HashMap<String, Value>),
+    /// Ok(inner) — the success arm of a Result-typed output.
+    Ok(Box<Value>),
+    /// Err(inner) — the declared failure arm of a Result-typed output.
+    Err(Box<Value>),
 }
 
 impl fmt::Display for Value {
@@ -40,6 +44,8 @@ impl fmt::Display for Value {
                 }
                 write!(f, "}}")
             }
+            Value::Ok(inner) => write!(f, "Ok({})", inner),
+            Value::Err(inner) => write!(f, "Err({})", inner),
         }
     }
 }
@@ -389,6 +395,15 @@ fn eval_expr(
                 }
             }
             Ok(Value::List(out))
+        }
+        Expr::Ok(inner) => {
+            // Pass-through: evaluate the inner expr and tag it as the success arm.
+            let v = eval_expr(inner, env, all_rules)?;
+            Ok(Value::Ok(Box::new(v)))
+        }
+        Expr::Err(inner) => {
+            let v = eval_expr(inner, env, all_rules)?;
+            Ok(Value::Err(Box::new(v)))
         }
         Expr::Call(name, args) => {
             let called = all_rules
@@ -898,6 +913,57 @@ mod tests {
         assert_eq!(
             result,
             Value::List(vec![Value::Number(15), Value::Number(42)])
+        );
+    }
+
+    #[test]
+    fn result_ok_value_returned() {
+        use crate::ast::*;
+        let rule = Rule {
+            name: "validate".into(),
+            intention: "t".into(),
+            source: SourceRef { file: "t.intent".into(), line: 1 },
+            input_name: "i".into(),
+            input_ty: Type::Named("T".into()),
+            output_name: "r".into(),
+            output_ty: Type::Result(Box::new(Type::Number), Box::new(Type::Text)),
+            logic: LogicStmt {
+                bindings: vec![],
+                target: "r".into(),
+                value: Expr::If(
+                    Box::new(Expr::Binary(
+                        BinOp::GtEq,
+                        Box::new(Expr::Field(Box::new(Expr::Ident("i".into())), "age".into())),
+                        Box::new(Expr::Number(18)),
+                    )),
+                    Box::new(Expr::Ok(Box::new(Expr::Field(
+                        Box::new(Expr::Ident("i".into())),
+                        "age".into(),
+                    )))),
+                    Box::new(Expr::Err(Box::new(Expr::Text("under 18".into())))),
+                ),
+            },
+            proofs: Proofs {
+                purity: Purity {
+                    reads: vec![Path { segments: vec!["i".into(), "age".into()] }],
+                    writes: vec![], calls: vec![], verdict: PurityVerdict::Pure,
+                },
+                termination: Termination { form: TerminationForm::ConstantBound, bound: Some(3) },
+                determinism: Determinism { form: DeterminismForm::Total },
+            },
+            hints: None,
+        };
+        let mut input = HashMap::new();
+        input.insert("age".into(), Value::Number(25));
+        assert_eq!(
+            eval_rule(&rule, &[], &input).unwrap(),
+            Value::Ok(Box::new(Value::Number(25)))
+        );
+
+        input.insert("age".into(), Value::Number(15));
+        assert_eq!(
+            eval_rule(&rule, &[], &input).unwrap(),
+            Value::Err(Box::new(Value::Text("under 18".into())))
         );
     }
 
