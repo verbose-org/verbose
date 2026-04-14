@@ -53,6 +53,7 @@ This document catalogs the prose patterns the generation tool maps reliably to s
 | *"Both A and B"* / *"Either A or B"* / *"Not A"* | `and`, `or`, `not` |
 | *"X is accepted with Y when P, rejected with reason R otherwise"* | output type `Result(T, E)` with `if P then Ok(Y) else Err(R)` |
 | *"Validate X, returning success or a reason for failure"* | rule with output `Result(T, text)` producing `Ok(...)` or `Err("reason")` |
+| *"Given a validated X, do Y on success, propagate the reason on failure"* | `match_result(validated_x, v => Ok(y(v)), reason => Err(reason))` |
 
 ### Examples
 
@@ -71,6 +72,16 @@ This document catalogs the prose patterns the generation tool maps reliably to s
             r : Result(number, text)
           logic:
             r = if p.customer_age >= 18 then Ok(p.amount) else Err("customer is under 18")
+
+.intent:  6. Apply a 10% discount to a validated purchase: if validation
+              succeeded, return the discounted amount; if it failed,
+              propagate the rejection reason unchanged.
+.verbose: output:
+            r : Result(number, text)
+          logic:
+            r = match_result(validate_purchase(p),
+                             amount => Ok(amount * 90 / 100),
+                             reason => Err(reason))
 ```
 
 ## Composition

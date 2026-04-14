@@ -48,6 +48,7 @@ fn count_nodes(expr: &Expr) -> usize {
         Expr::Fold(c, i, _, _, b) => 1 + count_nodes(c) + count_nodes(i) + count_nodes(b),
         Expr::Map(c, _, b) | Expr::Filter(c, _, b) => 1 + count_nodes(c) + count_nodes(b),
         Expr::Ok(inner) | Expr::Err(inner) => 1 + count_nodes(inner),
+        Expr::MatchResult(t, _, ob, _, eb) => 1 + count_nodes(t) + count_nodes(ob) + count_nodes(eb),
     }
 }
 
@@ -307,6 +308,14 @@ pub fn optimize_expr(
 
         Expr::Ok(inner) => Expr::Ok(Box::new(optimize_expr(inner, input_name, field_ranges))),
         Expr::Err(inner) => Expr::Err(Box::new(optimize_expr(inner, input_name, field_ranges))),
+
+        Expr::MatchResult(target, ok_var, ok_body, err_var, err_body) => Expr::MatchResult(
+            Box::new(optimize_expr(target, input_name, field_ranges)),
+            ok_var.clone(),
+            Box::new(optimize_expr(ok_body, input_name, field_ranges)),
+            err_var.clone(),
+            Box::new(optimize_expr(err_body, input_name, field_ranges)),
+        ),
     }
 }
 

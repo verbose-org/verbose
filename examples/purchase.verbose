@@ -39,3 +39,29 @@ rule validate_purchase
       bound : 4
     determinism:
       form : total
+
+
+rule discounted_purchase
+  @intention: "Apply a 10% discount if validation succeeded; propagate the reason otherwise"
+  @source: purchase.intent:3
+
+  input:
+    p : Purchase
+
+  output:
+    r : Result(number, text)
+
+  logic:
+    r = match_result(validate_purchase(p), amount => Ok(amount * 90 / 100), reason => Err(reason))
+
+  proofs:
+    purity:
+      reads   : [p]
+      writes  : []
+      calls   : [validate_purchase]
+      verdict : pure
+    termination:
+      form  : constant_bound
+      bound : 10
+    determinism:
+      form : total

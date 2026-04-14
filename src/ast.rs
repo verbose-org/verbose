@@ -154,6 +154,16 @@ pub enum Expr {
     /// Err(expr) — failure constructor for a Result-typed output.
     /// The failure reason is a declared expression (typically text), not a panic.
     Err(Box<Expr>),
+    /// match_result(target, ok_var => ok_body, err_var => err_body)
+    /// The minimal Result consumer: both arms named and explicit, no implicit
+    /// Err-propagation. If target is Ok(v), bind ok_var to v and evaluate
+    /// ok_body; if Err(e), bind err_var to e and evaluate err_body.
+    /// Same proof structure as Quantifier: lambda vars scoped out of reads.
+    MatchResult(
+        Box<Expr>,         // target
+        String, Box<Expr>, // ok_var, ok_body
+        String, Box<Expr>, // err_var, err_body
+    ),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

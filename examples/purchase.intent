@@ -1,2 +1,3 @@
 1. A purchase has an amount and the customer's age.
 2. Validate a purchase: if the customer is 18 or older, the purchase is accepted with its amount; otherwise the purchase is rejected with the reason "customer is under 18".
+3. Apply a 10% discount to a validated purchase: if validation succeeded, return the discounted amount; if it failed, propagate the rejection reason unchanged.

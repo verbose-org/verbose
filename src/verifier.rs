@@ -327,6 +327,23 @@ fn collect_expr_facts(
             // own, so the inner expression's facts are the whole story.
             collect_expr_facts(inner, reads, calls);
         }
+        Expr::MatchResult(target, ok_var, ok_body, err_var, err_body) => {
+            // Target reads propagate. Each arm's reads propagate with its
+            // bound variable scoped out — same machinery as Quantifier, applied
+            // twice (once per arm).
+            collect_expr_facts(target, reads, calls);
+            for (var_name, body) in [(ok_var, ok_body), (err_var, err_body)] {
+                let mut inner_reads = HashSet::new();
+                let mut inner_calls = HashSet::new();
+                collect_expr_facts(body, &mut inner_reads, &mut inner_calls);
+                calls.extend(inner_calls);
+                for path in inner_reads {
+                    if path.first().map(|s| s.as_str()) != Some(var_name.as_str()) {
+                        reads.insert(path);
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -508,6 +525,10 @@ fn count_operations(expr: &Expr) -> usize {
         Expr::Fold(coll, init, _, _, body) => 1 + count_operations(coll) + count_operations(init) + count_operations(body),
         Expr::Map(coll, _, body) | Expr::Filter(coll, _, body) => 1 + count_operations(coll) + count_operations(body),
         Expr::Ok(inner) | Expr::Err(inner) => 1 + count_operations(inner),
+        Expr::MatchResult(target, _, ok_body, _, err_body) => {
+            // Dispatch costs 1; both arms contribute like if/then/else.
+            1 + count_operations(target) + count_operations(ok_body) + count_operations(err_body)
+        }
     }
 }
 
@@ -653,6 +674,62 @@ rule important_invoice
     fn happy_path() {
         let errs = verify_str(VALID);
         assert!(errs.is_empty(), "expected no errors, got {:#?}", errs);
+    }
+
+    #[test]
+    fn all_example_verbose_files_parse_and_verify() {
+        // Integration guard: every file under examples/ that ends in .verbose
+        // must parse cleanly and verify with zero errors. If this test goes
+        // red, an example or the language has drifted — the failing file name
+        // and the verifier output point straight at the cause.
+        use std::fs;
+
+        fn collect(dir: &StdPath, out: &mut Vec<std::path::PathBuf>) {
+            if let Ok(entries) = fs::read_dir(dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        collect(&path, out);
+                    } else if path.extension().and_then(|s| s.to_str()) == Some("verbose") {
+                        out.push(path);
+                    }
+                }
+            }
+        }
+
+        let mut files = Vec::new();
+        collect(StdPath::new("examples"), &mut files);
+        assert!(
+            files.len() >= 10,
+            "expected at least 10 example .verbose files, found {}; did the test run from the wrong CWD?",
+            files.len()
+        );
+
+        for path in &files {
+            let src = fs::read_to_string(path)
+                .unwrap_or_else(|e| panic!("cannot read {}: {}", path.display(), e));
+            let tokens = Lexer::new(&src).tokenize().unwrap_or_else(|e| {
+                panic!("lex error in {}: {:?}", path.display(), e);
+            });
+            let program = Parser::new(tokens).parse_program().unwrap_or_else(|e| {
+                panic!("parse error in {}: {:?}", path.display(), e);
+            });
+            // Files with `use` imports (module system demo) need the CLI's
+            // import-resolution step before verification. The test runs
+            // verify_program directly, so it skips those files — parsing
+            // alone is still validated above. All other files must verify
+            // clean against an examples-rooted base_dir.
+            if !program.uses.is_empty() {
+                continue;
+            }
+            let errs = verify_program(&program, StdPath::new("examples"));
+            assert!(
+                errs.is_empty(),
+                "verify errors in {}:\n{:#?}",
+                path.display(),
+                errs
+            );
+        }
     }
 
     #[test]

@@ -574,6 +574,28 @@ impl Parser {
                 } else {
                     Ok(Expr::Err(Box::new(inner)))
                 }
+            } else if name == "match_result" && self.check_kind(&TokenKind::LParen) {
+                // match_result(target, ok_var => ok_body, err_var => err_body)
+                // The Result consumer. Both arms are explicit — no implicit
+                // Err-propagation — so the reader sees what happens on failure.
+                self.advance(); // (
+                let target = self.parse_expr()?;
+                self.expect_kind(TokenKind::Comma)?;
+                let ok_var = self.expect_ident_any()?;
+                self.expect_kind(TokenKind::FatArrow)?;
+                let ok_body = self.parse_expr()?;
+                self.expect_kind(TokenKind::Comma)?;
+                let err_var = self.expect_ident_any()?;
+                self.expect_kind(TokenKind::FatArrow)?;
+                let err_body = self.parse_expr()?;
+                self.expect_kind(TokenKind::RParen)?;
+                Ok(Expr::MatchResult(
+                    Box::new(target),
+                    ok_var,
+                    Box::new(ok_body),
+                    err_var,
+                    Box::new(err_body),
+                ))
             } else if self.check_kind(&TokenKind::LParen) {
                 self.advance();
                 let mut args = Vec::new();
@@ -1389,6 +1411,21 @@ rule important_invoice
                 }
                 // Logic uses Ok/Err under an if/else
                 assert!(matches!(&r.logic.value, Expr::If(_, _, _)));
+            }
+            _ => panic!("expected rule"),
+        }
+    }
+
+    #[test]
+    fn match_result_parsed() {
+        let src = "@verbose 0.1.0\n\nconcept T\n  @intention: \"t\"\n  @source: f.intent:1\n  fields:\n    x : number\n\nrule consume\n  @intention: \"t\"\n  @source: f.intent:1\n  input:\n    t : T\n  output:\n    r : Result(number, text)\n  logic:\n    r = match_result(Ok(t.x), v => Ok(v + 1), e => Err(e))\n  proofs:\n    purity:\n      reads: [t.x]\n      writes: []\n      calls: []\n      verdict: pure\n    termination:\n      form: constant_bound\n      bound: 10\n    determinism:\n      form: total\n";
+        let p = parse(src).unwrap();
+        match &p.items[1] {
+            Item::Rule(r) => {
+                assert!(matches!(
+                    &r.logic.value,
+                    Expr::MatchResult(_, _, _, _, _)
+                ));
             }
             _ => panic!("expected rule"),
         }

@@ -405,6 +405,29 @@ fn eval_expr(
             let v = eval_expr(inner, env, all_rules)?;
             Ok(Value::Err(Box::new(v)))
         }
+        Expr::MatchResult(target, ok_var, ok_body, err_var, err_body) => {
+            // Evaluate the target, dispatch on its Ok/Err tag. Exactly one
+            // arm runs; the chosen arm's lambda variable is bound to the
+            // inner value.
+            match eval_expr(target, env, all_rules)? {
+                Value::Ok(inner) => {
+                    let mut new_env = env.clone();
+                    new_env.insert(ok_var.clone(), *inner);
+                    eval_expr(ok_body, &new_env, all_rules)
+                }
+                Value::Err(inner) => {
+                    let mut new_env = env.clone();
+                    new_env.insert(err_var.clone(), *inner);
+                    eval_expr(err_body, &new_env, all_rules)
+                }
+                other => Err(RuntimeError {
+                    message: format!(
+                        "match_result requires a Result value, got {}",
+                        other
+                    ),
+                }),
+            }
+        }
         Expr::Call(name, args) => {
             let called = all_rules
                 .iter()
@@ -964,6 +987,79 @@ mod tests {
         assert_eq!(
             eval_rule(&rule, &[], &input).unwrap(),
             Value::Err(Box::new(Value::Text("under 18".into())))
+        );
+    }
+
+    #[test]
+    fn match_result_dispatches_on_tag() {
+        use crate::ast::*;
+        // A rule that takes an input.x and produces Ok(x*2) if x>0, else Err("negative"),
+        // then consumes that via match_result: Ok arm returns the doubled value + 1,
+        // Err arm propagates the error unchanged.
+        let rule = Rule {
+            name: "chain".into(),
+            intention: "t".into(),
+            source: SourceRef { file: "t.intent".into(), line: 1 },
+            input_name: "i".into(),
+            input_ty: Type::Named("T".into()),
+            output_name: "r".into(),
+            output_ty: Type::Result(Box::new(Type::Number), Box::new(Type::Text)),
+            logic: LogicStmt {
+                bindings: vec![],
+                target: "r".into(),
+                // match_result(
+                //   if i.x > 0 then Ok(i.x * 2) else Err("negative"),
+                //   v => Ok(v + 1),
+                //   e => Err(e)
+                // )
+                value: Expr::MatchResult(
+                    Box::new(Expr::If(
+                        Box::new(Expr::Binary(
+                            BinOp::Gt,
+                            Box::new(Expr::Field(Box::new(Expr::Ident("i".into())), "x".into())),
+                            Box::new(Expr::Number(0)),
+                        )),
+                        Box::new(Expr::Ok(Box::new(Expr::Binary(
+                            BinOp::Mul,
+                            Box::new(Expr::Field(Box::new(Expr::Ident("i".into())), "x".into())),
+                            Box::new(Expr::Number(2)),
+                        )))),
+                        Box::new(Expr::Err(Box::new(Expr::Text("negative".into())))),
+                    )),
+                    "v".into(),
+                    Box::new(Expr::Ok(Box::new(Expr::Binary(
+                        BinOp::Add,
+                        Box::new(Expr::Ident("v".into())),
+                        Box::new(Expr::Number(1)),
+                    )))),
+                    "e".into(),
+                    Box::new(Expr::Err(Box::new(Expr::Ident("e".into())))),
+                ),
+            },
+            proofs: Proofs {
+                purity: Purity {
+                    reads: vec![Path { segments: vec!["i".into(), "x".into()] }],
+                    writes: vec![], calls: vec![], verdict: PurityVerdict::Pure,
+                },
+                termination: Termination { form: TerminationForm::ConstantBound, bound: Some(20) },
+                determinism: Determinism { form: DeterminismForm::Total },
+            },
+            hints: None,
+        };
+
+        // Ok path: i.x = 5 → Ok(5*2) → match binds v=10 → Ok(v+1) = Ok(11)
+        let mut input = HashMap::new();
+        input.insert("x".into(), Value::Number(5));
+        assert_eq!(
+            eval_rule(&rule, &[], &input).unwrap(),
+            Value::Ok(Box::new(Value::Number(11)))
+        );
+
+        // Err path: i.x = -3 → Err("negative") → match binds e="negative" → Err(e) unchanged
+        input.insert("x".into(), Value::Number(-3));
+        assert_eq!(
+            eval_rule(&rule, &[], &input).unwrap(),
+            Value::Err(Box::new(Value::Text("negative".into())))
         );
     }
 
