@@ -624,6 +624,24 @@ impl Parser {
                 }
                 self.expect_kind(TokenKind::RBrace)?;
                 Ok(Expr::Record(name, fields))
+            } else if name == "concat" && self.check_kind(&TokenKind::LParen) {
+                // concat(e1, e2, ...) — variadic text builder. At least one arg.
+                // Each arg must be scalar (number/bool/text); the verifier
+                // rejects collection / Result / record arguments.
+                self.advance(); // (
+                let mut args = Vec::new();
+                if !self.check_kind(&TokenKind::RParen) {
+                    args.push(self.parse_expr()?);
+                    while self.check_kind(&TokenKind::Comma) {
+                        self.advance();
+                        args.push(self.parse_expr()?);
+                    }
+                }
+                self.expect_kind(TokenKind::RParen)?;
+                if args.is_empty() {
+                    return Err(self.error("concat() requires at least one argument"));
+                }
+                Ok(Expr::Concat(args))
             } else if name == "match_result" && self.check_kind(&TokenKind::LParen) {
                 // match_result(target, ok_var => ok_body, err_var => err_body)
                 // The Result consumer. Both arms are explicit — no implicit
@@ -1464,6 +1482,28 @@ rule important_invoice
             }
             _ => panic!("expected rule"),
         }
+    }
+
+    #[test]
+    fn concat_parsed() {
+        let src = "@verbose 0.1.0\n\nconcept T\n  @intention: \"t\"\n  @source: f.intent:1\n  fields:\n    x : number\n\nrule make\n  @intention: \"t\"\n  @source: f.intent:1\n  input:\n    i : T\n  output:\n    r : text\n  logic:\n    r = concat(\"age \", i.x, \" years\")\n  proofs:\n    purity:\n      reads: [i.x]\n      writes: []\n      calls: []\n      verdict: pure\n    termination:\n      form: constant_bound\n      bound: 4\n    determinism:\n      form: total\n";
+        let p = parse(src).unwrap();
+        match &p.items[1] {
+            Item::Rule(r) => match &r.logic.value {
+                Expr::Concat(args) => {
+                    assert_eq!(args.len(), 3);
+                    assert!(matches!(&args[0], Expr::Text(s) if s == "age "));
+                }
+                other => panic!("expected Concat, got {:?}", other),
+            },
+            _ => panic!("expected rule"),
+        }
+    }
+
+    #[test]
+    fn concat_empty_rejected() {
+        let src = "@verbose 0.1.0\n\nconcept T\n  @intention: \"t\"\n  @source: f.intent:1\n  fields:\n    x : number\n\nrule make\n  @intention: \"t\"\n  @source: f.intent:1\n  input:\n    i : T\n  output:\n    r : text\n  logic:\n    r = concat()\n  proofs:\n    purity:\n      reads: []\n      writes: []\n      calls: []\n      verdict: pure\n    termination:\n      form: constant_bound\n      bound: 1\n    determinism:\n      form: total\n";
+        assert!(parse(src).is_err(), "empty concat should be rejected");
     }
 
     #[test]

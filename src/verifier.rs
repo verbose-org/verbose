@@ -222,6 +222,38 @@ fn check_expr_against(
                 ),
             });
         }
+        // concat(e1, e2, ...) produces text. If the context expects text,
+        // verify each arg is scalar (number/bool/text); anything else
+        // (collection, Result, record) is a type error — concat only
+        // serializes scalar values.
+        (Expr::Concat(args), Type::Text) => {
+            for arg in args {
+                if let Some(inferred) = infer_expr_type(arg, rule, all_rules, input_concept) {
+                    match inferred {
+                        Type::Number | Type::Bool | Type::Text => {}
+                        other => {
+                            errors.push(VerifyError {
+                                context: format!("rule '{}' / logic", rule.name),
+                                message: format!(
+                                    "concat argument has type '{}'; concat only accepts scalar values (number, bool, text)",
+                                    type_display(&other),
+                                ),
+                            });
+                        }
+                    }
+                }
+                // Else: not inferable — conservative silence.
+            }
+        }
+        (Expr::Concat(_), other) => {
+            errors.push(VerifyError {
+                context: format!("rule '{}' / logic", rule.name),
+                message: format!(
+                    "concat produces text but the expected type is '{}'",
+                    type_display(other),
+                ),
+            });
+        }
         // Record(ConceptName) construction: cross-check field set + types.
         (Expr::Record(name, fields), expected_ty) => {
             let concept = match all_concepts.get(name) {
@@ -348,6 +380,7 @@ fn infer_expr_type(
         Expr::If(_, then_e, _) => infer_expr_type(then_e, rule, all_rules, concept),
         Expr::Quantifier(_, _, _, _) => Some(Type::Bool),
         Expr::Record(name, _) => Some(Type::Named(name.clone())),
+        Expr::Concat(_) => Some(Type::Text),
         // Map/Filter/Fold/Ok/Err/MatchResult: deferred until lambda binding
         // tracking lands. Returning None means we do not check; we also do not
         // falsely accept.
@@ -628,6 +661,12 @@ fn collect_expr_facts(
                 collect_expr_facts(field_expr, reads, calls);
             }
         }
+        Expr::Concat(args) => {
+            // Same pass-through: concat adds no reads/calls of its own.
+            for arg in args {
+                collect_expr_facts(arg, reads, calls);
+            }
+        }
     }
 }
 
@@ -817,6 +856,10 @@ fn count_operations(expr: &Expr) -> usize {
             // Construction itself is 1 op; each field expression contributes.
             1 + fields.iter().map(|(_, e)| count_operations(e)).sum::<usize>()
         }
+        Expr::Concat(args) => {
+            // 1 op for the concat call itself + each arg.
+            1 + args.iter().map(count_operations).sum::<usize>()
+        }
     }
 }
 
@@ -962,6 +1005,48 @@ rule important_invoice
     fn happy_path() {
         let errs = verify_str(VALID);
         assert!(errs.is_empty(), "expected no errors, got {:#?}", errs);
+    }
+
+    #[test]
+    fn concat_with_collection_arg_rejected() {
+        // concat only accepts scalar args (number/bool/text). Passing a
+        // collection is a type error caught at compile time.
+        let src = r#"@verbose 0.1.0
+
+concept Bag
+  @intention: "x"
+  @source: collections.intent:1
+  fields:
+    items : collection(number)
+
+rule bad
+  @intention: "y"
+  @source: collections.intent:2
+  input:
+    b : Bag
+  output:
+    r : text
+  logic:
+    r = concat("items are ", b.items)
+  proofs:
+    purity:
+      reads   : [b.items]
+      writes  : []
+      calls   : []
+      verdict : pure
+    termination:
+      form  : constant_bound
+      bound : 2
+    determinism:
+      form : total
+"#;
+        let errs = verify_str(src);
+        assert!(
+            errs.iter().any(|e| e.message.contains("concat argument")
+                && e.message.contains("scalar")),
+            "expected concat-scalar-args error, got {:#?}",
+            errs
+        );
     }
 
     #[test]

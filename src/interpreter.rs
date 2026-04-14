@@ -416,6 +416,29 @@ fn eval_expr(
             }
             Ok(Value::Record(map))
         }
+        Expr::Concat(args) => {
+            // Variadic text builder. Each argument is converted to its text
+            // form; non-scalar arguments trigger a runtime error (the verifier
+            // should have caught them at compile time, but the interpreter
+            // stays defensive — defence in depth).
+            let mut out = String::new();
+            for arg in args {
+                match eval_expr(arg, env, all_rules)? {
+                    Value::Text(s) => out.push_str(&s),
+                    Value::Number(n) => out.push_str(&n.to_string()),
+                    Value::Bool(b) => out.push_str(if b { "true" } else { "false" }),
+                    other => {
+                        return Err(RuntimeError {
+                            message: format!(
+                                "concat argument must be scalar (number/bool/text), got {}",
+                                other
+                            ),
+                        });
+                    }
+                }
+            }
+            Ok(Value::Text(out))
+        }
         Expr::MatchResult(target, ok_var, ok_body, err_var, err_body) => {
             // Evaluate the target, dispatch on its Ok/Err tag. Exactly one
             // arm runs; the chosen arm's lambda variable is bound to the
@@ -1083,6 +1106,53 @@ mod tests {
         assert_eq!(
             eval_rule(&rule, &[], &input).unwrap(),
             Value::Err(Box::new(Value::Text("negative".into())))
+        );
+    }
+
+    #[test]
+    fn concat_builds_dynamic_text() {
+        use crate::ast::*;
+        // logic: r = concat("age ", i.x, " years")
+        let rule = Rule {
+            name: "build".into(),
+            intention: "t".into(),
+            source: SourceRef { file: "t.intent".into(), line: 1 },
+            input_name: "i".into(),
+            input_ty: Type::Named("T".into()),
+            output_name: "r".into(),
+            output_ty: Type::Text,
+            logic: LogicStmt {
+                bindings: vec![],
+                target: "r".into(),
+                value: Expr::Concat(vec![
+                    Expr::Text("age ".into()),
+                    Expr::Field(Box::new(Expr::Ident("i".into())), "x".into()),
+                    Expr::Text(" years".into()),
+                ]),
+            },
+            proofs: Proofs {
+                purity: Purity {
+                    reads: vec![Path { segments: vec!["i".into(), "x".into()] }],
+                    writes: vec![], calls: vec![], verdict: PurityVerdict::Pure,
+                },
+                termination: Termination { form: TerminationForm::ConstantBound, bound: Some(4) },
+                determinism: Determinism { form: DeterminismForm::Total },
+            },
+            hints: None,
+            layer: None,
+        };
+
+        let mut input = HashMap::new();
+        input.insert("x".into(), Value::Number(42));
+        assert_eq!(
+            eval_rule(&rule, &[], &input).unwrap(),
+            Value::Text("age 42 years".into())
+        );
+
+        input.insert("x".into(), Value::Number(-3));
+        assert_eq!(
+            eval_rule(&rule, &[], &input).unwrap(),
+            Value::Text("age -3 years".into())
         );
     }
 

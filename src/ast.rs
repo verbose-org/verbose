@@ -206,6 +206,13 @@ pub enum Expr {
     /// that the field set matches the concept's declaration exactly and
     /// that each field's expression type matches the declared field type.
     Record(String, Vec<(String, Expr)>),
+    /// concat(e1, e2, ...) — variadic text builder.
+    /// Each argument is converted to its text form (Number -> decimal,
+    /// Bool -> "true"/"false", Text as-is); the result is text. Non-scalar
+    /// arguments (collection, Result, record) are rejected by the verifier.
+    /// Not an operator overload on `+` — we keep `+` strictly numeric and
+    /// make text composition an explicit, audit-visible call.
+    Concat(Vec<Expr>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

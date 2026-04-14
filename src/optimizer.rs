@@ -50,6 +50,7 @@ fn count_nodes(expr: &Expr) -> usize {
         Expr::Ok(inner) | Expr::Err(inner) => 1 + count_nodes(inner),
         Expr::MatchResult(t, _, ob, _, eb) => 1 + count_nodes(t) + count_nodes(ob) + count_nodes(eb),
         Expr::Record(_, fields) => 1 + fields.iter().map(|(_, e)| count_nodes(e)).sum::<usize>(),
+        Expr::Concat(args) => 1 + args.iter().map(count_nodes).sum::<usize>(),
     }
 }
 
@@ -324,6 +325,12 @@ pub fn optimize_expr(
             fields
                 .iter()
                 .map(|(n, e)| (n.clone(), optimize_expr(e, input_name, field_ranges)))
+                .collect(),
+        ),
+
+        Expr::Concat(args) => Expr::Concat(
+            args.iter()
+                .map(|e| optimize_expr(e, input_name, field_ranges))
                 .collect(),
         ),
     }

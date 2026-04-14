@@ -26,7 +26,7 @@ rule validate_purchase
     r : Result(number, text)
 
   logic:
-    r = if p.customer_age >= 18 then Ok(p.amount) else Err("customer is under 18")
+    r = if p.customer_age >= 18 then Ok(p.amount) else Err(concat("customer age ", p.customer_age, " is under 18"))
 
   proofs:
     purity:
@@ -36,7 +36,7 @@ rule validate_purchase
       verdict : pure
     termination:
       form  : constant_bound
-      bound : 4
+      bound : 7
     determinism:
       form : total
 

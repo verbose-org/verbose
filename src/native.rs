@@ -311,6 +311,7 @@ fn max_stack_depth(expr: &Expr) -> usize {
             max_stack_depth(t).max(max_stack_depth(ob)).max(max_stack_depth(eb))
         }
         Expr::Record(_, fields) => fields.iter().map(|(_, e)| max_stack_depth(e)).max().unwrap_or(0),
+        Expr::Concat(args) => args.iter().map(max_stack_depth).max().unwrap_or(0),
     }
 }
 
@@ -708,8 +709,9 @@ fn emit_eval_expr(
         | Expr::Ok(_)
         | Expr::Err(_)
         | Expr::MatchResult(_, _, _, _, _)
-        | Expr::Record(_, _) => Err(NativeError {
-            message: "collection/result/record operations not supported in native backend (use --run interpreter)"
+        | Expr::Record(_, _)
+        | Expr::Concat(_) => Err(NativeError {
+            message: "rich operations (collection/result/record/concat) not supported in native backend (use --run interpreter) — see CLAUDE.md, 'Two Execution Modes'"
                 .into(),
         }),
         Expr::Ident(name) if name == input_name => Err(NativeError {

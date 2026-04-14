@@ -43,6 +43,9 @@ This document catalogs the prose patterns the generation tool maps reliably to s
 .intent:  7. For each employee, produce a bonus report with their name and
               bonus amount.
 .verbose: reports = map(w.employees, e => BonusReport { name: e.name, bonus: bonus_amount(e) })
+
+.intent:  8. Reject the purchase with an error mentioning the customer's age.
+.verbose: r = Err(concat("customer age ", p.customer_age, " is under 18"))
 ```
 
 ## Conditions and classification
@@ -60,6 +63,7 @@ This document catalogs the prose patterns the generation tool maps reliably to s
 | *"Given a validated X, do Y on success, propagate the reason on failure"* | `match_result(validated_x, v => Ok(y(v)), reason => Err(reason))` |
 | *"For each X, produce a structured report containing field A, field B, ..."* | `map(xs, x => ConceptName { a: ..., b: ... })` (record constructor) |
 | *"Build a [concept] with these field values"* | `ConceptName { f1: e1, f2: e2, ... }` — every field of the concept must be provided, each with the right type |
+| *"A dynamic error / message mentioning [field X] and [value Y]"* | `concat("prefix ", x, " suffix ", y)` — variadic text builder; each arg must be scalar (number, bool, text) |
 
 ### Examples
 
