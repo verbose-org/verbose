@@ -1,0 +1,50 @@
+@verbose 0.1.0
+
+-- Demonstrates a text-typed input field flowing through to a record output
+-- in native: the employee's name comes from argv (stored as a pointer at
+-- field-loading time), survives the rule evaluation, and is written
+-- verbatim into the JSON output via the (rbp slot → strlen → write) path.
+
+
+concept Employee
+  @intention: "An employee has a name and a salary"
+  @source: greeting.intent:1
+
+  fields:
+    name   : text
+    salary : number [0, 1000000]
+
+
+concept BonusReport
+  @intention: "A bonus report has the employee's name and a bonus amount"
+  @source: greeting.intent:2
+
+  fields:
+    name  : text
+    bonus : number
+
+
+rule make_report
+  @intention: "Build a bonus report: same name, 10% of salary"
+  @source: greeting.intent:3
+
+  input:
+    e : Employee
+
+  output:
+    r : BonusReport
+
+  logic:
+    r = BonusReport { name: e.name, bonus: e.salary * 10 / 100 }
+
+  proofs:
+    purity:
+      reads   : [e.name, e.salary]
+      writes  : []
+      calls   : []
+      verdict : pure
+    termination:
+      form  : constant_bound
+      bound : 4
+    determinism:
+      form : total

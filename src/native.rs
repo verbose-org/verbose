@@ -823,6 +823,35 @@ fn emit_itoa_to_stdout_no_newline(code: &mut Vec<u8>) {
     code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x18]);
 }
 
+/// Compute the length of a NUL-terminated C string. Inputs: rsi = pointer
+/// to the first byte. Outputs: rdx = number of bytes before the NUL.
+/// Clobbers: rax, rcx, rdi.
+///
+/// Uses repne scasb: scan-byte while not-equal, decrementing rcx from -1.
+/// After repne returns, rdi points past the NUL, and rcx is -(length + 2).
+/// We compute length as `-(rcx) - 1`. This is the standard "fast strlen"
+/// pattern in raw x86-64.
+fn emit_strlen(code: &mut Vec<u8>) {
+    // mov rdi, rsi
+    code.extend_from_slice(&[0x48, 0x89, 0xF7]);
+    // xor eax, eax  (scan target = 0)
+    code.extend_from_slice(&[0x31, 0xC0]);
+    // mov rcx, -1
+    code.extend_from_slice(&[0x48, 0xC7, 0xC1, 0xFF, 0xFF, 0xFF, 0xFF]);
+    // cld  (clear DF so scasb increments rdi)
+    code.push(0xFC);
+    // repne scasb
+    code.extend_from_slice(&[0xF2, 0xAE]);
+    // length = -(rcx) - 1 = ~rcx - 0  → equivalent to: not rcx; dec rcx (from -1 base)
+    // Simpler: rdx = -rcx - 1
+    // mov rdx, rcx
+    code.extend_from_slice(&[0x48, 0x89, 0xCA]);
+    // not rdx
+    code.extend_from_slice(&[0x48, 0xF7, 0xD2]);
+    // dec rdx
+    code.extend_from_slice(&[0x48, 0xFF, 0xCA]);
+}
+
 /// Append a single newline byte to the given file descriptor. Used for
 /// per-record line separation: stdout (fd=1) for Ok-text output, stderr
 /// (fd=2) for Err messages. Symmetric to the newline itoa adds to stdout
@@ -871,6 +900,39 @@ fn emit_text_write_to_fd(
     offsets: &HashMap<&str, i32>,
     field_ranges: &HashMap<&str, (i64, i64)>,
 ) -> Result<(), NativeError> {
+    // Special case: a Field access on a text-typed input field. The pointer
+    // is in the rbp slot (stored at field-loading time). Length is recovered
+    // via emit_strlen — argv strings are NUL-terminated so this is exact.
+    if let Expr::Field(base, field_name) = text_expr {
+        if matches!(base.as_ref(), Expr::Ident(n) if n == &rule.input_name) {
+            let f = concept
+                .fields
+                .iter()
+                .find(|f| &f.name == field_name)
+                .ok_or_else(|| NativeError {
+                    message: format!("unknown field '{}' in native text-write", field_name),
+                })?;
+            if matches!(f.ty, Type::Text) {
+                let offset = offsets[field_name.as_str()];
+                // mov rsi, [rbp + offset]   (load the stored pointer)
+                if offset >= -128 {
+                    code.extend_from_slice(&[0x48, 0x8B, 0x75]);
+                    code.push(offset as u8);
+                } else {
+                    code.extend_from_slice(&[0x48, 0x8B, 0xB5]);
+                    code.extend_from_slice(&offset.to_le_bytes());
+                }
+                // strlen → rdx = length (rsi unchanged)
+                emit_strlen(code);
+                // write(fd, rsi, rdx)
+                code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x01, 0x00, 0x00, 0x00]); // mov rax, 1
+                code.extend_from_slice(&[0x48, 0xC7, 0xC7]);
+                code.extend_from_slice(&fd.to_le_bytes());
+                code.extend_from_slice(&[0x0F, 0x05]); // syscall
+                return Ok(());
+            }
+        }
+    }
     match text_expr {
         Expr::Text(s) => {
             let bytes = s.as_bytes();
@@ -1240,17 +1302,45 @@ fn emit_record_program(
     let exit_patch = code.len();
     code.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
 
-    // Parse N fields from argv (all assumed number for now).
+    // Parse N fields from argv. Number fields go through atoi; text fields
+    // store the raw argv pointer at the rbp slot — length is recovered on
+    // demand via emit_strlen at each text-field read site (so the rbp slot
+    // layout stays uniform: one pointer-or-number per field).
     for field in &input_concept.fields {
         let offset = offsets[field.name.as_str()];
-        code.extend_from_slice(&[0x4B, 0x8B, 0x7C, 0xF5, 0x00]); // mov rdi, [r13 + r14*8]
-        emit_atoi_inline(&mut code);
-        if offset >= -128 {
-            code.extend_from_slice(&[0x48, 0x89, 0x45]);
-            code.push(offset as u8);
-        } else {
-            code.extend_from_slice(&[0x48, 0x89, 0x85]);
-            code.extend_from_slice(&offset.to_le_bytes());
+        // mov rdi, [r13 + r14*8]   (argv[r14])
+        code.extend_from_slice(&[0x4B, 0x8B, 0x7C, 0xF5, 0x00]);
+        match field.ty {
+            Type::Number => {
+                emit_atoi_inline(&mut code);
+                // mov [rbp + offset], rax
+                if offset >= -128 {
+                    code.extend_from_slice(&[0x48, 0x89, 0x45]);
+                    code.push(offset as u8);
+                } else {
+                    code.extend_from_slice(&[0x48, 0x89, 0x85]);
+                    code.extend_from_slice(&offset.to_le_bytes());
+                }
+            }
+            Type::Text => {
+                // The pointer is already in rdi — stash it directly.
+                // mov [rbp + offset], rdi
+                if offset >= -128 {
+                    code.extend_from_slice(&[0x48, 0x89, 0x7D]);
+                    code.push(offset as u8);
+                } else {
+                    code.extend_from_slice(&[0x48, 0x89, 0xBD]);
+                    code.extend_from_slice(&offset.to_le_bytes());
+                }
+            }
+            _ => {
+                return Err(NativeError {
+                    message: format!(
+                        "native input field '{}' has unsupported type (only number/text today)",
+                        field.name
+                    ),
+                });
+            }
         }
         code.extend_from_slice(&[0x49, 0xFF, 0xC6]); // inc r14
     }
@@ -2870,6 +2960,28 @@ mod tests {
             code.windows(7).any(|w| w == open_pattern),
             "expected `mov rax, 2` (sys_open) in emitted code"
         );
+    }
+
+    #[test]
+    fn native_compiles_text_field_through_record_output() {
+        // greeting.verbose's make_report rule:
+        //   input has name: text, salary: number
+        //   output: BonusReport { name: e.name, bonus: e.salary * 10 / 100 }
+        // Phase 2E: text input fields flow through to JSON output. Native
+        // stores the argv pointer at the rbp slot, recovers length via
+        // emit_strlen at write time.
+        use std::fs;
+        let src = fs::read_to_string("examples/greeting.verbose")
+            .expect("examples/greeting.verbose is expected to exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let out = std::env::temp_dir().join("verbosec_test_make_report");
+        compile_native(&program, "make_report", out.to_str().unwrap())
+            .expect("native compile of text-field-through-record should succeed");
+        let size = fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
+        assert!(size > 300 && size < 2_500, "unexpected binary size: {}", size);
+        let _ = fs::remove_file(out);
     }
 
     #[test]
