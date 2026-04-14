@@ -1,0 +1,50 @@
+@verbose 0.1.0
+
+-- Minimal native-compilable audit reaction. Content is a string literal
+-- (no concat yet — that comes when native grows scalar-to-text conversion).
+-- Demonstrates that a reaction with append_file compiles to a standalone
+-- x86-64 binary with three syscalls (open, write, close) inlined.
+
+
+concept Purchase
+  @intention: "A purchase has an amount and the customer's age"
+  @source: audit_simple.intent:1
+
+  fields:
+    amount        : number [0, 1000000]
+    customer_age  : number [0, 150]
+
+
+rule is_suspicious
+  @intention: "A purchase is suspicious when the customer is under 18"
+  @source: audit_simple.intent:2
+
+  input:
+    p : Purchase
+
+  output:
+    suspicious : bool
+
+  logic:
+    suspicious = p.customer_age < 18
+
+  proofs:
+    purity:
+      reads   : [p.customer_age]
+      writes  : []
+      calls   : []
+      verdict : pure
+    termination:
+      form  : constant_bound
+      bound : 1
+    determinism:
+      form : total
+
+
+reaction audit_suspicious
+  @intention: "Append a line to the audit log for every suspicious purchase"
+  @source: audit_simple.intent:3
+
+  trigger: is_suspicious
+  effects:
+    append_file "/tmp/audit_simple.log" "suspicious purchase detected\n"

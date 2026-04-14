@@ -47,22 +47,53 @@ pub fn compile_native(
         })
         .collect();
 
-    let rule = rules.get(rule_name).ok_or_else(|| NativeError {
-        message: format!("no rule named '{}'", rule_name),
-    })?;
+    // The target name may be a rule OR a reaction. Dispatch accordingly.
+    let reaction = program.items.iter().find_map(|i| match i {
+        Item::Reaction(rx) if rx.name == rule_name => Some(rx),
+        _ => None,
+    });
 
-    let concept = match &rule.input_ty {
-        Type::Named(n) => concepts
-            .iter()
-            .find(|c| c.name == *n)
-            .ok_or_else(|| NativeError {
-                message: format!("unknown concept '{}'", n),
-            })?,
-        _ => {
-            return Err(NativeError {
-                message: "rule input must be a named concept".into(),
-            })
-        }
+    let (rule, concept) = if let Some(rx) = reaction {
+        // Compile a reaction: target is the reaction, but we still need its
+        // trigger rule and its input concept for field/arg wiring.
+        let trigger = rules.get(rx.trigger.as_str()).ok_or_else(|| NativeError {
+            message: format!(
+                "reaction '{}' triggers unknown rule '{}'",
+                rx.name, rx.trigger
+            ),
+        })?;
+        let concept = match &trigger.input_ty {
+            Type::Named(n) => concepts
+                .iter()
+                .find(|c| c.name == *n)
+                .ok_or_else(|| NativeError {
+                    message: format!("unknown concept '{}'", n),
+                })?,
+            _ => {
+                return Err(NativeError {
+                    message: "reaction trigger rule must take a named concept input".into(),
+                })
+            }
+        };
+        (*trigger, *concept)
+    } else {
+        let r = rules.get(rule_name).ok_or_else(|| NativeError {
+            message: format!("no rule or reaction named '{}'", rule_name),
+        })?;
+        let c = match &r.input_ty {
+            Type::Named(n) => concepts
+                .iter()
+                .find(|c| c.name == *n)
+                .ok_or_else(|| NativeError {
+                    message: format!("unknown concept '{}'", n),
+                })?,
+            _ => {
+                return Err(NativeError {
+                    message: "rule input must be a named concept".into(),
+                })
+            }
+        };
+        (*r, *c)
     };
 
     let is_vectorizable = rule
@@ -74,7 +105,9 @@ pub fn compile_native(
         .as_ref()
         .map_or(false, |h| h.parallel.is_some());
 
-    let mut code = if is_vectorizable && concept.fields.len() == 1 {
+    let mut code = if let Some(rx) = reaction {
+        emit_reaction_program(rx, rule, concept, &rules)?
+    } else if is_vectorizable && concept.fields.len() == 1 {
         if let Some(threshold) = extract_simple_gt(rule) {
             emit_vectorized_program(threshold)?
         } else {
@@ -270,6 +303,227 @@ fn emit_full_program(
     // xor rdi, rdi (exit code 0)
     code.extend_from_slice(&[0x48, 0x31, 0xFF]);
     // syscall
+    code.extend_from_slice(&[0x0F, 0x05]);
+
+    Ok(code)
+}
+
+/// Emit the machine-code sequence for a single `append_file "path" "content"`
+/// reaction effect. Both `path` (NUL-terminated for open()) and `content` are
+/// embedded inline in the code section via a `jmp` over the bytes, then the
+/// three syscalls (open, write, close) reference them by RIP-relative offsets.
+///
+/// Security notes:
+/// - The path is a source-level LITERAL: no dynamic path escapes. Reading
+///   the emitted bytes shows exactly which file this binary can touch.
+/// - Flags are O_WRONLY | O_APPEND | O_CREAT (0x441); we never truncate,
+///   never overwrite, never follow arbitrary pointers from the input.
+/// - Mode is 0644 (rw-r--r--) — group/other cannot write.
+///
+/// No error handling on syscall failure: if open() returns negative, write()
+/// will also fail silently. Good enough for a POC; proper error propagation
+/// to exit codes is a future commit.
+fn emit_append_file_call(code: &mut Vec<u8>, path: &str, content: &str) {
+    let path_bytes = path.as_bytes();
+    let content_bytes = content.as_bytes();
+    let path_with_nul_len = path_bytes.len() + 1;
+    let content_len = content_bytes.len();
+    let data_len = path_with_nul_len + content_len;
+
+    // jmp over the embedded data.
+    if data_len <= 127 {
+        code.push(0xEB);
+        code.push(data_len as u8);
+    } else {
+        code.push(0xE9);
+        code.extend_from_slice(&(data_len as i32).to_le_bytes());
+    }
+
+    let path_addr = code.len();
+    code.extend_from_slice(path_bytes);
+    code.push(0); // NUL terminator for open()
+
+    let content_addr = code.len();
+    code.extend_from_slice(content_bytes);
+
+    // === open(path, O_WRONLY|O_APPEND|O_CREAT, 0644) ===
+    // mov rax, 2 (sys_open)
+    code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x02, 0x00, 0x00, 0x00]);
+    // lea rdi, [rip + rel32]  → path
+    let end = code.len() + 7;
+    let rel32 = path_addr as i32 - end as i32;
+    code.extend_from_slice(&[0x48, 0x8D, 0x3D]);
+    code.extend_from_slice(&rel32.to_le_bytes());
+    // mov rsi, 0x441 (O_WRONLY | O_APPEND | O_CREAT)
+    code.extend_from_slice(&[0x48, 0xC7, 0xC6, 0x41, 0x04, 0x00, 0x00]);
+    // mov rdx, 0x1A4 (mode 0644)
+    code.extend_from_slice(&[0x48, 0xC7, 0xC2, 0xA4, 0x01, 0x00, 0x00]);
+    // syscall → rax = fd
+    code.extend_from_slice(&[0x0F, 0x05]);
+
+    // mov r15, rax  (save fd; r15 survives the next two syscalls)
+    code.extend_from_slice(&[0x49, 0x89, 0xC7]);
+
+    // === write(fd, content, content_len) ===
+    // mov rax, 1 (sys_write)
+    code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x01, 0x00, 0x00, 0x00]);
+    // mov rdi, r15 (fd)
+    code.extend_from_slice(&[0x4C, 0x89, 0xFF]);
+    // lea rsi, [rip + rel32]  → content
+    let end = code.len() + 7;
+    let rel32 = content_addr as i32 - end as i32;
+    code.extend_from_slice(&[0x48, 0x8D, 0x35]);
+    code.extend_from_slice(&rel32.to_le_bytes());
+    // mov rdx, content_len (imm32)
+    code.extend_from_slice(&[0x48, 0xC7, 0xC2]);
+    code.extend_from_slice(&(content_len as i32).to_le_bytes());
+    // syscall
+    code.extend_from_slice(&[0x0F, 0x05]);
+
+    // === close(fd) ===
+    // mov rax, 3 (sys_close)
+    code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x03, 0x00, 0x00, 0x00]);
+    // mov rdi, r15
+    code.extend_from_slice(&[0x4C, 0x89, 0xFF]);
+    // syscall
+    code.extend_from_slice(&[0x0F, 0x05]);
+}
+
+/// Emit a standalone binary for a reaction. Reads N-field records from argv
+/// just like `emit_full_program`, evaluates the trigger rule per record, and
+/// when the trigger fires emits each declared effect inline.
+///
+/// For this commit the only supported effect is `append_file "path" "content"`
+/// where the content is a STRING LITERAL. `concat(...)` content comes in the
+/// next commit (itoa + stack-buffer concat in machine code).
+fn emit_reaction_program(
+    reaction: &Reaction,
+    trigger_rule: &Rule,
+    concept: &Concept,
+    all_rules: &HashMap<&str, &Rule>,
+) -> Result<Vec<u8>, NativeError> {
+    // Pre-check: every effect must be representable in native today.
+    for effect in &reaction.effects {
+        match effect {
+            Effect::AppendFile { content, .. } => {
+                if !matches!(content, Expr::Text(_)) {
+                    return Err(NativeError {
+                        message: "append_file content must be a string literal in native today (concat comes next commit)".into(),
+                    });
+                }
+            }
+            Effect::Print(_) => {
+                return Err(NativeError {
+                    message: "print effect not yet wired in native reactions (use the interpreter or append_file)".into(),
+                });
+            }
+        }
+    }
+
+    let nfields = concept.fields.len();
+    let offsets = field_offsets(concept);
+    let mut code = Vec::new();
+
+    // === _start === (same record-iteration skeleton as emit_full_program)
+    // mov r12, [rsp]              ; argc
+    code.extend_from_slice(&[0x4C, 0x8B, 0x24, 0x24]);
+    // lea r13, [rsp+8]            ; argv base
+    code.extend_from_slice(&[0x4C, 0x8D, 0x6C, 0x24, 0x08]);
+    // push rbp; mov rbp, rsp
+    code.push(0x55);
+    code.extend_from_slice(&[0x48, 0x89, 0xE5]);
+    // sub rsp, (nfields + n_bindings)*8
+    let n_bindings = trigger_rule.logic.bindings.len();
+    let frame_size = ((nfields + n_bindings) * 8) as i32;
+    code.extend_from_slice(&[0x48, 0x81, 0xEC]);
+    code.extend_from_slice(&frame_size.to_le_bytes());
+
+    // r14 = 1 (skip argv[0])
+    code.extend_from_slice(&[0x49, 0xC7, 0xC6, 0x01, 0x00, 0x00, 0x00]);
+
+    let loop_top = code.len();
+
+    // cmp r14, r12 ; jge exit (rel32 patch)
+    code.extend_from_slice(&[0x4D, 0x39, 0xE6]);
+    code.push(0x0F);
+    code.push(0x8D);
+    let exit_patch = code.len();
+    code.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+
+    // Parse N fields from argv.
+    for field in &concept.fields {
+        let offset = offsets[field.name.as_str()];
+        // mov rdi, [r13 + r14*8]
+        code.extend_from_slice(&[0x4B, 0x8B, 0x7C, 0xF5, 0x00]);
+        emit_atoi_inline(&mut code);
+        // mov [rbp + offset], rax
+        if offset >= -128 {
+            code.extend_from_slice(&[0x48, 0x89, 0x45]);
+            code.push(offset as u8);
+        } else {
+            code.extend_from_slice(&[0x48, 0x89, 0x85]);
+            code.extend_from_slice(&offset.to_le_bytes());
+        }
+        // inc r14
+        code.extend_from_slice(&[0x49, 0xFF, 0xC6]);
+    }
+
+    // Evaluate let bindings into rbp slots.
+    let mut binding_offsets = offsets.clone();
+    let mut next_slot = -((nfields as i32 + 1) * 8);
+    for (name, expr) in &trigger_rule.logic.bindings {
+        let field_ranges = build_field_ranges(concept);
+        emit_eval_expr(&mut code, expr, &trigger_rule.input_name, &binding_offsets, all_rules, &field_ranges)?;
+        if next_slot >= -128 {
+            code.extend_from_slice(&[0x48, 0x89, 0x45]);
+            code.push(next_slot as u8);
+        } else {
+            code.extend_from_slice(&[0x48, 0x89, 0x85]);
+            code.extend_from_slice(&next_slot.to_le_bytes());
+        }
+        binding_offsets.insert(name.as_str(), next_slot);
+        next_slot -= 8;
+    }
+
+    // Evaluate trigger rule's logic → rax (0 = no fire, nonzero = fire).
+    let field_ranges = build_field_ranges(concept);
+    emit_eval_expr(&mut code, &trigger_rule.logic.value, &trigger_rule.input_name, &binding_offsets, all_rules, &field_ranges)?;
+
+    // cmp rax, 0 ; je skip_effects (rel32 so effect body can be large)
+    code.extend_from_slice(&[0x48, 0x83, 0xF8, 0x00]);
+    code.push(0x0F);
+    code.push(0x84);
+    let skip_patch = code.len();
+    code.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+
+    // Emit each effect. (Pre-check above ensures they are all AppendFile
+    // with literal content; panic path is compile-time, not runtime.)
+    for effect in &reaction.effects {
+        if let Effect::AppendFile { path, content } = effect {
+            if let Expr::Text(s) = content {
+                emit_append_file_call(&mut code, path, s);
+            }
+        }
+    }
+
+    // skip_effects:
+    let skip_pos = code.len();
+    let skip_off = skip_pos as i32 - (skip_patch as i32 + 4);
+    code[skip_patch..skip_patch + 4].copy_from_slice(&skip_off.to_le_bytes());
+
+    // jmp loop_top
+    code.push(0xE9);
+    let loop_offset = loop_top as i32 - (code.len() + 4) as i32;
+    code.extend_from_slice(&loop_offset.to_le_bytes());
+
+    // exit:
+    let exit_pos = code.len();
+    let exit_offset = exit_pos as i32 - (exit_patch as i32 + 4);
+    code[exit_patch..exit_patch + 4].copy_from_slice(&exit_offset.to_le_bytes());
+
+    // mov rax, 60 ; xor rdi, rdi ; syscall  (exit 0)
+    code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x3C, 0x00, 0x00, 0x00]);
+    code.extend_from_slice(&[0x48, 0x31, 0xFF]);
     code.extend_from_slice(&[0x0F, 0x05]);
 
     Ok(code)
@@ -1544,6 +1798,58 @@ fn build_elf(code: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn emit_append_file_call_embeds_path_and_content() {
+        // Smoke test: append_file emission produces non-empty bytes that
+        // include the path (NUL-terminated) and the content bytes, and emits
+        // the three syscall numbers 2/1/3 (open/write/close).
+        let mut code = Vec::new();
+        emit_append_file_call(&mut code, "/tmp/x.log", "hi\n");
+
+        // Path + NUL must be present in the code bytes.
+        let marker = b"/tmp/x.log\0";
+        assert!(
+            code.windows(marker.len()).any(|w| w == marker),
+            "path bytes + NUL not found in emitted code"
+        );
+        // Content must be present.
+        assert!(
+            code.windows(3).any(|w| w == b"hi\n"),
+            "content bytes not found in emitted code"
+        );
+        // The three sys_* immediates: 2 (open), 1 (write), 3 (close) —
+        // encoded as `mov rax, imm32` with the low byte being the syscall
+        // number. We expect at least one occurrence of each.
+        for (num, name) in [(0x02u8, "open"), (0x01u8, "write"), (0x03u8, "close")] {
+            let pattern = [0x48, 0xC7, 0xC0, num, 0x00, 0x00, 0x00];
+            assert!(
+                code.windows(7).any(|w| w == pattern),
+                "expected `mov rax, {}` (sys_{}) in emitted code",
+                num, name
+            );
+        }
+    }
+
+    #[test]
+    fn native_compiles_reaction_with_append_file() {
+        // End-to-end: the native backend accepts a reaction whose effect is
+        // append_file with a string literal, produces bytes, no error.
+        use std::fs;
+        let src = fs::read_to_string("examples/audit_simple.verbose")
+            .expect("examples/audit_simple.verbose is expected to exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        // Write the ELF to a temp path; assert the file is non-empty.
+        let out = std::env::temp_dir().join("verbosec_test_audit_simple");
+        compile_native(&program, "audit_suspicious", out.to_str().unwrap())
+            .expect("native compile of reaction should succeed");
+        let size = fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
+        assert!(size > 200, "expected a non-trivial ELF, got {} bytes", size);
+        assert!(size < 2_000, "expected a small ELF, got {} bytes", size);
+        let _ = fs::remove_file(out);
+    }
 
     #[test]
     fn elf_header_valid() {

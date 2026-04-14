@@ -1,0 +1,3 @@
+1. A purchase has an amount and the customer's age.
+2. A purchase is suspicious when the customer is under 18.
+3. When a purchase is suspicious, append the line "suspicious purchase detected\n" to "/tmp/audit_simple.log".

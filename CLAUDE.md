@@ -54,7 +54,8 @@ examples/
   purchase.*       Result(T, E) — declared failure path (Ok/Err)
   layers.*         @layer stratification — architectural discipline verified
   bonus.*          record construction — map produces collection(BonusReport)
-  audit_log.*      append_file reaction — classify then log to /tmp/audit.log
+  audit_log.*      append_file reaction — classify then log to /tmp/audit.log (interpreter: dynamic content via concat)
+  audit_simple.*   append_file with static content — compiles to a 462-byte standalone native binary
   demo.html        Browser demo (WASM)
 
 tools/
