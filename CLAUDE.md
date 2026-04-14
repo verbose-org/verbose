@@ -142,12 +142,48 @@ Tracking what native emits today, what it still rejects, and the design rules th
 | 2C | Rule with `output: Named(concept)` (record) — JSON serialization to stdout, one object per record. Streaming emission (no on-stack record). Number/text fields supported; `if/else` between two record arms via continuation-passing. | ~1 KB | `classify.verbose::classify_invoice` |
 | 2E | Text-typed input fields readable in record outputs — argv pointer stored at the rbp slot, length recovered via `repne scasb` (`emit_strlen`) at each read site. | ~600 B | `greeting.verbose::make_report` |
 | 2D | `match_result(callee(input), v => Ok(<arith using v>), e => Err(e))` — inlined-callee form. Callee's logic is walked and its Ok/Err leaves are redirected: Ok values bind to a reserved `match_slot` then evaluate the outer Ok arm; Err values write directly to stderr (Err pass-through). Restricted to same-input-concept callees and `Err(<err_var>)` pass-through outer arm. | ~750 B | `purchase.verbose::discounted_purchase` |
+| 3 | `output: collection(T)` with `map` / `filter` — streaming element emission, JSON Lines output, no arena. See "Phase 3 design (locked)" below. | targeted ~1 KB | (new example during implementation) |
+
+### Phase 3 design (locked before implementation)
+
+Four decisions locked before writing any `emit_collection_program` code, so the implementation has no surprises and philosophical drift is caught at this level, not in commit messages.
+
+**1. Memory model: no arena.** Streaming emission means each element produced by `map` / `filter` is evaluated, serialised to stdout, and discarded before the next iteration. No element ever persists across iterations. No bump allocator, no heap, no `mmap`. Same syscall surface as Phase 2 — only `read argv`, `write fd`, `exit`. This is why `fold` / `sum` / `count` / `min` / `max` on the output side are **not** part of Phase 3: they need an accumulator, which is arena territory; when we get there, the arena decision gets its own design pass.
+
+**2. Output format: JSON Lines, NOT a wrapping JSON array.** One JSON object (or scalar) per line, same convention as Phase 2C record output. Rationale:
+- Fewer syscalls per collection — no bracket/comma state machine, so no `[`, no `,`, no `]` static writes. A 1000-element collection is ~1000 syscalls in JSON Lines vs ~2000 with array wrapping.
+- Smaller binary — no bracket logic code.
+- Uniform format across Phase 2C and Phase 3 native outputs — one object per line, regardless of whether the rule produces one record or a collection of records. Downstream tooling (`jq -r`, `awk`, `grep`) handles both identically.
+- If a caller needs an array, `./bin args | jq -s` wraps at ~zero cost. Conversely, producing JSON Lines from a binary that emits arrays is harder. Pick the simpler side.
+
+Cost: per-input-record grouping is lost when the binary processes multiple input records. Acceptable — single-input invocations are the common case, and multi-input can be reconstructed by running the binary separately.
+
+**3. argv format: `<N> <element × N>` count-prefixed, trailing any scalar fields of the input concept.**
+```
+concept Workforce { employees: collection(Employee{name, salary}) }
+./bin <N> <emp1-name> <emp1-salary> ... <empN-name> <empN-salary>
+
+concept BigInput { tag: number, employees: collection(Employee{name, salary}) }
+./bin <tag> <N> <emp1-name> <emp1-salary> ... <empN-name> <empN-salary>
+```
+The count comes right before its elements. No terminator, no dynamic scanning. Predictable at every iteration. If the caller passes the wrong count, the binary reads past the end of argv and exits via the natural argv-bounds-check in the outer loop.
+
+**4. Scope v1 (restrictions rejected with clear messages):**
+- Top-level logic must be `map(input.<coll_field>, var => <body>)` or `filter(input.<coll_field>, var => <pred>)`.
+- Input concept: zero or more scalar fields + exactly one collection field, which must be the LAST field declared.
+- Output: `collection(Record)` or `collection(number | text)`.
+- Map/filter body references only the lambda variable, not the outer rule's input (simplifies `input_name` threading).
+- No nested collections, no collection-returning rule calls, no `fold`.
+
+**Register convention for collection emitter:** `r15` holds the inner loop counter (number of elements remaining). This role is distinct from its Phase 1A role as the file-descriptor returned by `open()` — the two emitters never coexist in the same binary (a reaction-producing binary and a collection-output binary are different entry points), so the register has a per-emitter role, not a global one. The register table in the "Register conventions" section names this explicitly.
+
+**Why this design holds security pillar #1:** identical attack surface to Phase 2. No new syscalls. No heap. No dynamic parsing. The binary is still a straight machine-code translation of the source: read argv, evaluate declared logic, write declared output, exit. An auditor reading the disassembled binary sees exactly one extra loop compared to Phase 2C, nothing else.
 
 ### What native still rejects, and in which priority
 
 - **Result(T, E) with non-scalar T** (e.g. `Result(Record, text)`, `Result(collection, _)`) — each shape needs its own calling convention. Decide shape by shape, never fabricate a "universal Result" that carries unnecessary machinery.
 - **Text-field access in `Result(text, text)` Ok arm or in concat arguments** — Phase 2E added text-field reads only inside record-output rules (`emit_record_program`'s argv loop and `emit_text_write_to_fd`'s special case). Other emitters (`emit_full_program`, `emit_reaction_program`, `emit_result_program`) still call `atoi` on every field. Generalizing requires teaching each emitter the same field-loading dispatch — purely mechanical, not gated by design questions.
-- **`output: collection(T)`** — the only case that genuinely needs heap (map/filter produce collections with runtime-determined sizes). Behind a bump-allocator design we have not committed to yet. (Phase 3.)
+- **`output: collection(T)` with fold/sum/count/min/max on the output side, or collection-returning rule calls** — these need an accumulator persisted across iterations (arena/heap territory). Phase 3 covers only streaming map/filter; cumulative forms are deferred.
 - **`match_result` with non-pass-through Err arm** — Phase 2D handles `Err(<err_var>)` pass-through (the value flows directly to stderr without being bound). Richer Err arms (using err_var inside concat, or transforming it) need a real text-binding mechanism — two rbp slots per text bound var (ptr + len) since Err values from concat aren't NUL-terminated.
 - **`match_result` with cross-concept callees** — Phase 2D requires callee.input_concept == outer.input_concept (so the rbp slots are reused as-is). Cross-concept calls need argument-passing through additional slots or a real callee frame.
 - **Nested `match_result`** — Phase 2D reserves a single `match_slot` in the prologue; nested match_results would collide. Either reserve N slots based on a static walk or switch to a stack-based binding scheme.
@@ -163,7 +199,7 @@ Emitters that span multiple syscalls or phases share a register layout. Adding a
 | `r13` | argv base pointer | Phase 0 |
 | `r14` | current record index inside the main loop | Phase 0 |
 | `rbp` | field-slot frame base (fields + let bindings at `rbp - 8*(i+1)`) | Phase 0 |
-| `r15` | file descriptor returned by `open()` in `append_file` effects | Phase 1A |
+| `r15` | (per-emitter role — one or the other, never both in the same binary): file descriptor from `open()` in reaction emitters (Phase 1A) / inner loop counter in collection emitters (Phase 3) | Phase 1A / 3 |
 | `r10` | concat buffer base for later length calculation | Phase 1B |
 | `rbx` | concat write pointer (advances as args are written) | Phase 1B |
 
