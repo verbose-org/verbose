@@ -82,3 +82,55 @@ rule high_earners
       bound : 2
     determinism:
       form : total
+
+
+rule salaries
+  @intention: "Project each employee's salary — scalar collection output"
+  @source: payroll.intent:4
+
+  input:
+    w : Workforce
+
+  output:
+    r : collection(number)
+
+  logic:
+    r = map(w.employees, e => e.salary)
+
+  proofs:
+    purity:
+      reads   : [w.employees]
+      writes  : []
+      calls   : []
+      verdict : pure
+    termination:
+      form  : constant_bound
+      bound : 2
+    determinism:
+      form : total
+
+
+rule names
+  @intention: "Project each employee's name — scalar text collection"
+  @source: payroll.intent:4
+
+  input:
+    w : Workforce
+
+  output:
+    r : collection(text)
+
+  logic:
+    r = map(w.employees, e => e.name)
+
+  proofs:
+    purity:
+      reads   : [w.employees]
+      writes  : []
+      calls   : []
+      verdict : pure
+    termination:
+      form  : constant_bound
+      bound : 2
+    determinism:
+      form : total

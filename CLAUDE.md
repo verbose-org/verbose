@@ -60,7 +60,7 @@ examples/
   tier.*           Result(text, text) classifier — classify_tier compiles to a 602-byte native binary
   classify.*       Record-output rule — classify_invoice compiles to a ~970-byte native binary that emits one JSON object per record
   greeting.*       Text input field flowing into JSON output — make_report compiles to a ~590-byte native binary
-  payroll.*        Phase 3: output collection(Bonus) via map — compute_bonuses compiles to a ~670-byte native binary
+  payroll.*        Phase 3: four rules on the same input — map to Record (~670 B), filter (~670 B), map to number (~455 B), map to text (~410 B)
                    (purchase.verbose::discounted_purchase compiles to ~750 bytes via Phase 2D match_result inlining)
   demo.html        Browser demo (WASM)
 
@@ -144,6 +144,7 @@ Tracking what native emits today, what it still rejects, and the design rules th
 | 2E | Text-typed input fields readable in record outputs — argv pointer stored at the rbp slot, length recovered via `repne scasb` (`emit_strlen`) at each read site. | ~600 B | `greeting.verbose::make_report` |
 | 2D | `match_result(callee(input), v => Ok(<arith using v>), e => Err(e))` — inlined-callee form. Callee's logic is walked and its Ok/Err leaves are redirected: Ok values bind to a reserved `match_slot` then evaluate the outer Ok arm; Err values write directly to stderr (Err pass-through). Restricted to same-input-concept callees and `Err(<err_var>)` pass-through outer arm. | ~750 B | `purchase.verbose::discounted_purchase` |
 | 3 | `output: collection(T)` with `map` or `filter` — streaming element emission (one JSON Lines per element), no arena, count-prefixed argv. `filter` uses identity pass-through: predicate false skips emission, predicate true emits the element as-is. See "Phase 3 design (locked)" below. | ~670 B | `payroll.verbose::compute_bonuses` (map) / `::high_earners` (filter) |
+| 3.2 | `output: collection(number)` / `collection(text)` — scalar element map. `map(w.employees, e => e.salary)` emits one number per line; text body emits one string per line. No JSON wrapping, so scalar-element binaries are smaller (~400-500 B). | ~455 B | `payroll.verbose::salaries` / `::names` |
 
 ### Phase 3 design (locked before implementation)
 
@@ -179,6 +180,10 @@ The count comes right before its elements. No terminator, no dynamic scanning. P
 **Register convention for collection emitter:** `r15` holds the inner loop counter (number of elements remaining). This role is distinct from its Phase 1A role as the file-descriptor returned by `open()` — the two emitters never coexist in the same binary (a reaction-producing binary and a collection-output binary are different entry points), so the register has a per-emitter role, not a global one. The register table in the "Register conventions" section names this explicitly.
 
 **Why this design holds security pillar #1:** identical attack surface to Phase 2. No new syscalls. No heap. No dynamic parsing. The binary is still a straight machine-code translation of the source: read argv, evaluate declared logic, write declared output, exit. An auditor reading the disassembled binary sees exactly one extra loop compared to Phase 2C, nothing else.
+
+**Filter implementation note — synthesised AST at emit time.** `filter(xs, e => pred)` does not construct a Record in the source; it keeps or drops each element verbatim. The emitter handles this by building a small Vec of synthetic `Field(Ident(<lambda>), <name>)` expressions — one per field of the input element concept — and passing them to the same `emit_record_as_json` the `map` path uses. The Vec exists only during emission, never reaches the verifier, never appears in error messages. The emitted machine code is byte-for-byte identical to what a user would get writing `map(xs, e => Employee { name: e.name, salary: e.salary })` by hand. Zero declaration added or removed at the source contract — pure emitter internals.
+
+**Known perf tradeoff (not yet addressed).** Each element emits N+K syscalls, where N is the field count and K is the number of static JSON skeleton fragments. For a 2-field record that's ~6 syscalls per element. On Linux, each syscall is ~1 µs, so a 1000-element collection takes ~6 ms to emit. At POC scale this is invisible; for 100K+ element collections, a batch-per-element optimisation (stack buffer, single `write` per element) would be ~10-20× faster. The Phase 1B `emit_concat_to_buffer` / `emit_append_file_call` pattern already shows the technique — generalising it to record emission is ~100 lines of plumbing, deferred until someone has an actual case. Documented so it is not forgotten.
 
 ### What native still rejects, and in which priority
 

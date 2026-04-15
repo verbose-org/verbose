@@ -1572,28 +1572,41 @@ fn emit_collection_program(
         }),
     };
 
-    // Output element: Phase 3 v1 supports Record elements only.
-    let output_elem_concept = all_concepts
-        .iter()
-        .find(|c| c.name == elem_type_name)
-        .copied()
-        .ok_or_else(|| NativeError {
-            message: format!(
-                "collection element type '{}' must be a declared concept \
-                 (scalar collection elements come in Phase 3.1)",
-                elem_type_name
-            ),
-        })?;
-    for f in &output_elem_concept.fields {
-        if !matches!(f.ty, Type::Number | Type::Text) {
-            return Err(NativeError {
-                message: format!(
-                    "collection element field '{}' has unsupported type (only number/text today)",
-                    f.name
-                ),
-            });
-        }
+    // Output element kind: Record (named concept), Number, or Text.
+    // Phase 3.0 shipped Record; Phase 3.2 adds Number / Text scalar elements
+    // so `r = map(w.employees, e => e.salary)` -> `collection(number)` compiles.
+    enum OutputElemKind<'a> {
+        Record(&'a Concept),
+        Number,
+        Text,
     }
+    let output_kind: OutputElemKind = match elem_type_name.as_str() {
+        "number" => OutputElemKind::Number,
+        "text" => OutputElemKind::Text,
+        name => {
+            let c = all_concepts
+                .iter()
+                .find(|c| c.name == name)
+                .copied()
+                .ok_or_else(|| NativeError {
+                    message: format!(
+                        "collection element type '{}' is neither a declared concept nor a scalar (number/text)",
+                        name
+                    ),
+                })?;
+            for f in &c.fields {
+                if !matches!(f.ty, Type::Number | Type::Text) {
+                    return Err(NativeError {
+                        message: format!(
+                            "collection element field '{}' has unsupported type (only number/text today)",
+                            f.name
+                        ),
+                    });
+                }
+            }
+            OutputElemKind::Record(c)
+        }
+    };
 
     // Input concept shape: scalars* + one trailing collection field.
     let mut scalar_fields: Vec<&Field> = Vec::new();
@@ -1646,41 +1659,60 @@ fn emit_collection_program(
         }
     }
 
-    // Logic shape: Map or Filter over input.<coll_field>.
+    // Logic shape: Map (producing Record or scalar) or Filter over input.<coll_field>.
     enum CollectionOp<'a> {
-        /// map(coll, var => Record { ... }) — record constructor body.
-        Map { lambda_var: &'a str, body_fields: &'a [(String, Expr)] },
+        /// map(coll, var => Record { ... }) — Record constructor body.
+        MapRecord { lambda_var: &'a str, body_fields: &'a [(String, Expr)] },
+        /// map(coll, var => <scalar>) — number or text body, one line per element.
+        MapScalar { lambda_var: &'a str, body: &'a Expr, is_text: bool },
         /// filter(coll, var => predicate) — element passes through if true.
         Filter { lambda_var: &'a str, predicate: &'a Expr },
     }
     let op: CollectionOp = match &rule.logic.value {
         Expr::Map(coll_expr, v, b) => {
             verify_collection_target(coll_expr, &rule.input_name, &coll_field.name)?;
-            let (body_concept_name, body_fields) = match b.as_ref() {
-                Expr::Record(name, fields) => (name.as_str(), fields.as_slice()),
-                _ => return Err(NativeError {
-                    message: "map body must be a Record constructor in Phase 3 v1".into(),
-                }),
-            };
-            if body_concept_name != output_elem_concept.name.as_str() {
-                return Err(NativeError {
-                    message: format!(
-                        "map body produces '{}' but output collection element is '{}'",
-                        body_concept_name, output_elem_concept.name
-                    ),
-                });
+            match &output_kind {
+                OutputElemKind::Record(oec) => {
+                    let (body_concept_name, body_fields) = match b.as_ref() {
+                        Expr::Record(name, fields) => (name.as_str(), fields.as_slice()),
+                        _ => return Err(NativeError {
+                            message: "map body must be a Record constructor when output element is a concept".into(),
+                        }),
+                    };
+                    if body_concept_name != oec.name.as_str() {
+                        return Err(NativeError {
+                            message: format!(
+                                "map body produces '{}' but output collection element is '{}'",
+                                body_concept_name, oec.name
+                            ),
+                        });
+                    }
+                    CollectionOp::MapRecord { lambda_var: v.as_str(), body_fields }
+                }
+                OutputElemKind::Number => {
+                    CollectionOp::MapScalar { lambda_var: v.as_str(), body: b.as_ref(), is_text: false }
+                }
+                OutputElemKind::Text => {
+                    CollectionOp::MapScalar { lambda_var: v.as_str(), body: b.as_ref(), is_text: true }
+                }
             }
-            CollectionOp::Map { lambda_var: v.as_str(), body_fields }
         }
         Expr::Filter(coll_expr, v, pred) => {
             verify_collection_target(coll_expr, &rule.input_name, &coll_field.name)?;
-            // Filter preserves element type — output element concept must match
-            // the input element concept.
-            if output_elem_concept.name != input_elem_concept.name {
+            // Filter preserves element type — output element must match input
+            // element. Phase 3.2 allows Record inputs only (argv shape); scalar
+            // input collections (collection(number)) stay interpreter-only.
+            let oec = match &output_kind {
+                OutputElemKind::Record(c) => *c,
+                _ => return Err(NativeError {
+                    message: "filter with scalar output element requires a scalar input collection, which is not yet supported in native".into(),
+                }),
+            };
+            if oec.name != input_elem_concept.name {
                 return Err(NativeError {
                     message: format!(
                         "filter output collection must match input element type: input is collection({}) but output is collection({})",
-                        input_elem_concept.name, output_elem_concept.name
+                        input_elem_concept.name, oec.name
                     ),
                 });
             }
@@ -1775,19 +1807,40 @@ fn emit_collection_program(
     // `e.salary` resolves to the element-field slot populated above.
     let field_ranges = build_field_ranges(input_elem_concept);
     match op {
-        CollectionOp::Map { lambda_var, body_fields } => {
+        CollectionOp::MapRecord { lambda_var, body_fields } => {
             // Emit the constructed Record as one JSON line. The record's
             // trailing "}\n" IS the per-element separator — no extra newline.
+            let output_concept = match &output_kind {
+                OutputElemKind::Record(c) => *c,
+                _ => unreachable!("MapRecord built only from Record output kind"),
+            };
             emit_record_as_json(
                 &mut code,
                 body_fields,
-                output_elem_concept,
+                output_concept,
                 lambda_var,
                 input_elem_concept,
                 all_rules,
                 &elem_offsets,
                 &field_ranges,
             )?;
+        }
+        CollectionOp::MapScalar { lambda_var, body, is_text } => {
+            // Scalar element output: evaluate the body to rax (number) or
+            // emit the text directly, then one newline per element.
+            if is_text {
+                emit_text_write_to_fd(
+                    &mut code, body, 1, lambda_var, input_elem_concept, all_rules,
+                    &elem_offsets, &field_ranges,
+                )?;
+                emit_write_newline(&mut code, 1);
+            } else {
+                emit_eval_expr(
+                    &mut code, body, lambda_var, &elem_offsets, all_rules, &field_ranges,
+                )?;
+                // emit_itoa_inline writes rax to stdout with trailing newline.
+                emit_itoa_inline(&mut code);
+            }
         }
         CollectionOp::Filter { lambda_var, predicate } => {
             // Evaluate the predicate → rax (0 = skip, non-zero = keep).
@@ -3438,6 +3491,29 @@ mod tests {
         let size = fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
         assert!(size > 500 && size < 2_500, "unexpected binary size: {}", size);
         let _ = fs::remove_file(out);
+    }
+
+    #[test]
+    fn native_compiles_collection_scalar_output() {
+        // payroll.verbose's `salaries` rule: output collection(number) via
+        // `map(w.employees, e => e.salary)`. Emits one number per line,
+        // no JSON wrapping. Also tests `names` (collection(text)).
+        use std::fs;
+        let src = fs::read_to_string("examples/payroll.verbose")
+            .expect("examples/payroll.verbose is expected to exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        for rule in ["salaries", "names"] {
+            let out = std::env::temp_dir().join(format!("verbosec_test_{}", rule));
+            compile_native(&program, rule, out.to_str().unwrap())
+                .unwrap_or_else(|e| panic!("native compile of {} failed: {:?}", rule, e));
+            let size = fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
+            // Scalar-element output is smaller than record output — no bracket
+            // machinery, no per-field prefixes.
+            assert!(size > 200 && size < 1_500, "unexpected size for {}: {}", rule, size);
+            let _ = fs::remove_file(out);
+        }
     }
 
     #[test]
