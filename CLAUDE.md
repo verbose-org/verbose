@@ -416,9 +416,32 @@ Before emission, always `mov [rbp+err_frame_save_slot], rsp` — harmless when n
 - Pass-through (`Err(Ident(err_var))`) still works — routes through the slot path OR a fast path; implementation choice.
 
 **What Phase 2F does NOT do** (deferred):
-- Callee Err that returns a rule call (text-returning rule calls are a separate phase — `emit_text_write_to_fd` falls back on `Call`).
 - Using `err_var` twice in the same outer arm — the slots are single-assignment, reading twice is fine but the design doesn't support "aliasing" where err_var appears in a sub-expression already using it indirectly.
 - Binding to anything other than a text var (Ok-bound numbers are already handled by `match_slot`; non-text non-number bindings aren't in the language).
+
+### Phase 2G design (locked before implementation)
+
+Phase 2G adds a single new arm to `emit_text_write_to_fd` that inlines a text-returning rule call. It unlocks every site that currently rejects `Expr::Call` in a text context: `output: text` with `body = Call`, Record field value = Call, `match_result` outer Err body = Call (direct or inside concat-arg-wise via BoundText-of-Call — but Call in concat args stays deferred for now), `Result(text, text)` arms = Call.
+
+**Core mechanism: inline-substitute.** When `emit_text_write_to_fd` sees `Expr::Call(callee_name, [Ident(caller_input)])`, it looks up the callee rule, validates the restrictions, and recurses on `callee.logic.value` using `callee.input_name`. Since the restrictions ensure the callee's input concept, input name, and offsets match the caller's, the recursion emits exactly the same bytes as if the callee's body had been written inline at the call site. No new calling convention, no new slot, no new register reserved.
+
+**Why this is honest inlining, not a hack.** The callee has no let bindings (restricted below), so there is nothing to evaluate that the caller's prologue didn't already set up. Field accesses in the callee body resolve through the caller's `offsets` map because the concepts and input names match. The callee's text-producing shapes (literal / field / concat) are exactly what `emit_text_write_to_fd` already handles for the caller's own body.
+
+**Scope v1 (refused with clear messages otherwise):**
+- Callee's `output_ty == Type::Text`.
+- Callee's input concept == caller's (mirror of Phase 2D's same-concept restriction — reuses caller's argv parsing and rbp slots).
+- Callee's `input_name == caller's input_name` (so `Ident(caller_input)` resolves correctly inside the callee body).
+- Callee's `logic.bindings.is_empty()` — the prologue already ran and the caller's lets are what's in scope.
+- Callee's `logic.value` is a text_expr `emit_text_write_to_fd` handles (literal, field, concat, or recursively another Call satisfying these same restrictions — natural recursion, no depth limit needed).
+- Call arg list is exactly `[Ident(caller_input)]`.
+
+**Why this design holds security pillar #1:** zero new syscalls, zero new registers, zero new stack slots. The emitted machine code is byte-for-byte what the user could have written by hand as `concat(...)` directly. Inlining happens only at emission; the callee rule itself is still verified independently by the verifier against its own proofs (purity, termination, determinism) — the caller inherits those properties through the `calls: [callee_name]` declaration.
+
+**What Phase 2G does NOT do** (deferred):
+- Cross-concept callees (mirror of the 2D restriction — needs real argument passing).
+- Callees with let bindings (would need to evaluate them at the call site, adding frame-layout complexity).
+- Rule calls inside `concat(...)` arguments (would need `ConcatArgKind::CallText` with runtime sizing — feasible but its own small phase).
+- Rule calls in `append_file` content (reaction emitter currently only dispatches Text / Concat).
 
 ### What native still rejects, and in which priority
 
