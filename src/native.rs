@@ -107,6 +107,10 @@ pub fn compile_native(
 
     let is_result_output = matches!(&rule.output_ty, Type::Result(_, _));
     let is_collection_output = matches!(&rule.output_ty, Type::Collection(_));
+    // Phase 4: number output whose top-level logic is `fold(...)` (or its
+    // sum/count/min/max desugarings). Routes to emit_fold_program.
+    let is_fold_number_output = matches!(&rule.output_ty, Type::Number)
+        && matches!(&rule.logic.value, Expr::Fold(_, _, _, _, _));
 
     // Record output: rule.output_ty is Named(concept_name) and the name
     // resolves to a concept declared in the program. Routes to
@@ -128,6 +132,11 @@ pub fn compile_native(
         // Phase 3: rules returning collection(T). map/filter over an input
         // collection field, emit one JSON line per produced element.
         emit_collection_program(rule, concept, &concepts, &rules)?
+    } else if is_fold_number_output {
+        // Phase 4: rules returning number via fold (incl. sum/count/min/max
+        // desugarings). Single 8-byte accumulator slot at the bottom of the
+        // rbp frame; one final `itoa + \n` per input record.
+        emit_fold_program(rule, concept, &concepts, &rules)?
     } else if let Some(rec_concept) = record_output_concept {
         // Record-output rules: each leaf emits a JSON object to stdout + \n.
         // Same continuation-passing convention as Result.
@@ -1916,6 +1925,227 @@ fn emit_collection_program(
     Ok(code)
 }
 
+/// Phase 4: `output: number` with top-level `fold` (or its sum/count/min/max
+/// desugarings). Inner loop accumulates into a single stack slot (`acc_slot`)
+/// at the bottom of the rbp frame. After the inner loop, the accumulator is
+/// serialized once per input record via emit_itoa_inline (which appends `\n`).
+///
+/// Shape accepted (everything else refused with a message):
+///   - rule.output_ty == Type::Number
+///   - rule.logic.value == Expr::Fold(Field(Ident(input), coll_field), Number(init), acc, item, body)
+///   - init is an Expr::Number literal (sum/count/min/max desugarings all produce literals)
+///   - input concept: scalars* + ONE trailing collection(Concept) field
+///   - body is a scalar expression reading acc and item.<field>
+///
+/// Syscall surface: identical to Phase 3 (`read argv`, `write fd 1`, `exit`).
+/// No new register reservation. One extra 8-byte slot in the rbp frame.
+fn emit_fold_program(
+    rule: &Rule,
+    input_concept: &Concept,
+    all_concepts: &[&Concept],
+    all_rules: &HashMap<&str, &Rule>,
+) -> Result<Vec<u8>, NativeError> {
+    // ===== Scope validation =====
+    if !matches!(rule.output_ty, Type::Number) {
+        return Err(NativeError {
+            message: "emit_fold_program called on non-number output".into(),
+        });
+    }
+    let (coll_expr, init_expr, acc_name, item_name, body) = match &rule.logic.value {
+        Expr::Fold(c, i, a, it, b) => (c.as_ref(), i.as_ref(), a.as_str(), it.as_str(), b.as_ref()),
+        _ => return Err(NativeError {
+            message: "number-output native rule with fold must have `fold(...)` at the top level".into(),
+        }),
+    };
+    let init_literal: i64 = match init_expr {
+        Expr::Number(n) => *n,
+        _ => return Err(NativeError {
+            message: "Phase 4: fold init must be a literal number (sum/count/min/max desugarings satisfy this automatically)".into(),
+        }),
+    };
+
+    // Input concept shape: scalars* + one trailing collection field.
+    let mut scalar_fields: Vec<&Field> = Vec::new();
+    let mut coll_field: Option<&Field> = None;
+    let mut elem_concept_name: Option<String> = None;
+    for (i, f) in input_concept.fields.iter().enumerate() {
+        let is_last = i == input_concept.fields.len() - 1;
+        match (&f.ty, is_last) {
+            (Type::Number, false) | (Type::Text, false) => scalar_fields.push(f),
+            (Type::Collection(elem), true) => {
+                coll_field = Some(f);
+                elem_concept_name = Some(elem.clone());
+            }
+            _ => {
+                return Err(NativeError {
+                    message: format!(
+                        "input concept '{}' must have scalar fields followed by ONE trailing collection field; \
+                         field '{}' at position {} violates this",
+                        input_concept.name, f.name, i
+                    ),
+                });
+            }
+        }
+    }
+    let coll_field = coll_field.ok_or_else(|| NativeError {
+        message: format!(
+            "input concept '{}' must have a trailing collection field",
+            input_concept.name
+        ),
+    })?;
+    let elem_concept_name = elem_concept_name.unwrap();
+    let elem_concept = all_concepts
+        .iter()
+        .find(|c| c.name == elem_concept_name)
+        .copied()
+        .ok_or_else(|| NativeError {
+            message: format!("unknown concept '{}' for input collection element", elem_concept_name),
+        })?;
+    for f in &elem_concept.fields {
+        if !matches!(f.ty, Type::Number | Type::Text) {
+            return Err(NativeError {
+                message: format!(
+                    "input collection element field '{}' has unsupported type (only number/text today)",
+                    f.name
+                ),
+            });
+        }
+    }
+
+    // Fold target must be `input.<coll_field>`. Shared verifier with map/filter.
+    verify_collection_target(coll_expr, &rule.input_name, &coll_field.name)?;
+
+    // ===== Emission =====
+    let n_scalar = scalar_fields.len();
+    let n_elem_fields = elem_concept.fields.len();
+    // +1 slot for acc at the bottom of the frame.
+    let frame_slots = n_scalar + n_elem_fields + 1;
+    let frame_size = (frame_slots as i32) * 8;
+    let acc_offset: i32 = -((frame_slots as i32) * 8);
+
+    let mut code = Vec::new();
+
+    // _start — argv/rbp frame setup (identical to Phase 3).
+    code.extend_from_slice(&[0x4C, 0x8B, 0x24, 0x24]); // mov r12, [rsp]
+    code.extend_from_slice(&[0x4C, 0x8D, 0x6C, 0x24, 0x08]); // lea r13, [rsp+8]
+    code.push(0x55); // push rbp
+    code.extend_from_slice(&[0x48, 0x89, 0xE5]); // mov rbp, rsp
+    code.extend_from_slice(&[0x48, 0x81, 0xEC]);
+    code.extend_from_slice(&frame_size.to_le_bytes());
+    code.extend_from_slice(&[0x49, 0xC7, 0xC6, 0x01, 0x00, 0x00, 0x00]); // mov r14, 1
+
+    // Outer loop — one input record per iteration.
+    let outer_loop_top = code.len();
+    code.extend_from_slice(&[0x4D, 0x39, 0xE6]); // cmp r14, r12
+    code.push(0x0F);
+    code.push(0x8D);                              // jge exit (rel32)
+    let exit_patch = code.len();
+    code.extend_from_slice(&[0, 0, 0, 0]);
+
+    // Offsets: scalars at -8..; element fields after them; acc at the bottom.
+    let mut scalar_offsets: HashMap<&str, i32> = HashMap::new();
+    for (i, f) in scalar_fields.iter().enumerate() {
+        scalar_offsets.insert(f.name.as_str(), -((i as i32 + 1) * 8));
+    }
+    let mut body_offsets: HashMap<&str, i32> = HashMap::new();
+    for (i, f) in elem_concept.fields.iter().enumerate() {
+        body_offsets.insert(f.name.as_str(), -(((n_scalar + i) as i32 + 1) * 8));
+    }
+    // `acc_name` resolves to acc_slot inside the body.
+    body_offsets.insert(acc_name, acc_offset);
+
+    // Parse scalar input fields.
+    for f in &scalar_fields {
+        let offset = scalar_offsets[f.name.as_str()];
+        code.extend_from_slice(&[0x4B, 0x8B, 0x7C, 0xF5, 0x00]); // mov rdi, [r13+r14*8]
+        match f.ty {
+            Type::Number => {
+                emit_atoi_inline(&mut code);
+                store_rax_at_rbp(&mut code, offset);
+            }
+            Type::Text => store_rdi_at_rbp(&mut code, offset),
+            _ => unreachable!(),
+        }
+        code.extend_from_slice(&[0x49, 0xFF, 0xC6]); // inc r14
+    }
+
+    // Parse collection count into r15.
+    code.extend_from_slice(&[0x4B, 0x8B, 0x7C, 0xF5, 0x00]); // mov rdi, [r13+r14*8]
+    emit_atoi_inline(&mut code);
+    code.extend_from_slice(&[0x49, 0x89, 0xC7]); // mov r15, rax
+    code.extend_from_slice(&[0x49, 0xFF, 0xC6]); // inc r14
+
+    // Seed acc_slot with the literal init. mov rax, imm64 then store to rbp slot.
+    code.extend_from_slice(&[0x48, 0xB8]);
+    code.extend_from_slice(&init_literal.to_le_bytes());
+    store_rax_at_rbp(&mut code, acc_offset);
+
+    // Inner loop — per element, parse fields, fold into acc_slot.
+    let inner_loop_top = code.len();
+    code.extend_from_slice(&[0x4D, 0x85, 0xFF]); // test r15, r15
+    code.push(0x0F);
+    code.push(0x84);                              // jz inner_done (rel32)
+    let inner_done_patch = code.len();
+    code.extend_from_slice(&[0, 0, 0, 0]);
+
+    // Parse element fields into rbp slots (reused each iteration).
+    for f in &elem_concept.fields {
+        let offset = body_offsets[f.name.as_str()];
+        code.extend_from_slice(&[0x4B, 0x8B, 0x7C, 0xF5, 0x00]); // mov rdi, [r13+r14*8]
+        match f.ty {
+            Type::Number => {
+                emit_atoi_inline(&mut code);
+                store_rax_at_rbp(&mut code, offset);
+            }
+            Type::Text => store_rdi_at_rbp(&mut code, offset),
+            _ => unreachable!(),
+        }
+        code.extend_from_slice(&[0x49, 0xFF, 0xC6]); // inc r14
+    }
+
+    // Evaluate the fold body; result is the NEW accumulator value in rax.
+    // item_name is the "input" for field access resolution within the body.
+    let field_ranges = build_field_ranges(elem_concept);
+    emit_eval_expr(&mut code, body, item_name, &body_offsets, all_rules, &field_ranges)?;
+    store_rax_at_rbp(&mut code, acc_offset);
+
+    // dec r15 ; jmp inner_loop_top (rel32).
+    code.extend_from_slice(&[0x49, 0xFF, 0xCF]); // dec r15
+    code.push(0xE9);
+    let back_off = inner_loop_top as i32 - (code.len() + 4) as i32;
+    code.extend_from_slice(&back_off.to_le_bytes());
+
+    // inner_done:
+    let inner_done_pos = code.len();
+    let inner_done_off = inner_done_pos as i32 - (inner_done_patch as i32 + 4);
+    code[inner_done_patch..inner_done_patch + 4].copy_from_slice(&inner_done_off.to_le_bytes());
+
+    // Emit the final accumulator: load acc_slot -> rax -> itoa+newline to stdout.
+    if acc_offset >= -128 {
+        code.extend_from_slice(&[0x48, 0x8B, 0x45]);
+        code.push(acc_offset as u8);
+    } else {
+        code.extend_from_slice(&[0x48, 0x8B, 0x85]);
+        code.extend_from_slice(&acc_offset.to_le_bytes());
+    }
+    emit_itoa_inline(&mut code);
+
+    // jmp outer_loop_top.
+    code.push(0xE9);
+    let outer_off = outer_loop_top as i32 - (code.len() + 4) as i32;
+    code.extend_from_slice(&outer_off.to_le_bytes());
+
+    // exit: sys_exit(0)
+    let exit_pos = code.len();
+    let exit_off = exit_pos as i32 - (exit_patch as i32 + 4);
+    code[exit_patch..exit_patch + 4].copy_from_slice(&exit_off.to_le_bytes());
+    code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x3C, 0x00, 0x00, 0x00]); // mov rax, 60
+    code.extend_from_slice(&[0x48, 0x31, 0xFF]); // xor rdi, rdi
+    code.extend_from_slice(&[0x0F, 0x05]); // syscall
+
+    Ok(code)
+}
+
 /// Verify a collection-op (map/filter) target is `input.<coll_field>`.
 /// Used by both the Map and Filter branches of emit_collection_program.
 fn verify_collection_target(
@@ -3551,6 +3781,44 @@ mod tests {
             .expect("native compile of collection-output rule should succeed");
         let size = fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
         assert!(size > 400 && size < 2_500, "unexpected binary size: {}", size);
+        let _ = fs::remove_file(out);
+    }
+
+    #[test]
+    fn native_compiles_fold_sum_rule() {
+        // Phase 4: `output: number` with `sum(...)` desugars to Fold, routing
+        // to emit_fold_program. One 8-byte accumulator slot at the bottom of
+        // the rbp frame; one `itoa + \n` per input record.
+        use std::fs;
+        let src = fs::read_to_string("examples/payroll.verbose")
+            .expect("examples/payroll.verbose is expected to exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let out = std::env::temp_dir().join("verbosec_test_total_salaries");
+        compile_native(&program, "total_salaries", out.to_str().unwrap())
+            .expect("native compile of fold-sum rule should succeed");
+        let size = fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
+        assert!(size > 300 && size < 2_000, "unexpected binary size: {}", size);
+        let _ = fs::remove_file(out);
+    }
+
+    #[test]
+    fn native_compiles_fold_count_rule() {
+        // Phase 4: `count(...)` desugars to Fold with an `if pred then 1 else 0`
+        // body — exercises the full expression emitter from within the fold
+        // inner loop.
+        use std::fs;
+        let src = fs::read_to_string("examples/payroll.verbose")
+            .expect("examples/payroll.verbose is expected to exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let out = std::env::temp_dir().join("verbosec_test_high_earner_count");
+        compile_native(&program, "high_earner_count", out.to_str().unwrap())
+            .expect("native compile of fold-count rule should succeed");
+        let size = fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
+        assert!(size > 300 && size < 2_000, "unexpected binary size: {}", size);
         let _ = fs::remove_file(out);
     }
 

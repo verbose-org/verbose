@@ -134,3 +134,55 @@ rule names
       bound : 2
     determinism:
       form : total
+
+
+rule total_salaries
+  @intention: "Phase 4: sum all salaries — one i64 accumulator, one line out"
+  @source: payroll.intent:5
+
+  input:
+    w : Workforce
+
+  output:
+    t : number
+
+  logic:
+    t = sum(w.employees, e => e.salary)
+
+  proofs:
+    purity:
+      reads   : [w.employees]
+      writes  : []
+      calls   : []
+      verdict : pure
+    termination:
+      form  : constant_bound
+      bound : 2
+    determinism:
+      form : total
+
+
+rule high_earner_count
+  @intention: "Phase 4: count employees earning more than 50000"
+  @source: payroll.intent:5
+
+  input:
+    w : Workforce
+
+  output:
+    n : number
+
+  logic:
+    n = count(w.employees, e => e.salary > 50000)
+
+  proofs:
+    purity:
+      reads   : [w.employees]
+      writes  : []
+      calls   : []
+      verdict : pure
+    termination:
+      form  : constant_bound
+      bound : 5
+    determinism:
+      form : total

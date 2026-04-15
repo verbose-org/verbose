@@ -2,3 +2,4 @@
 2. A workforce is a collection of employees.
 3. A bonus is a name with a bonus amount.
 4. For each employee in the workforce, compute a bonus: same name, 10% of salary.
+5. Report the total of all salaries and count employees earning more than 50000.

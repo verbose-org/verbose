@@ -60,7 +60,8 @@ examples/
   tier.*           Result(text, text) classifier — classify_tier compiles to a 602-byte native binary
   classify.*       Record-output rule — classify_invoice compiles to a ~970-byte native binary that emits one JSON object per record
   greeting.*       Text input field flowing into JSON output — make_report compiles to a ~590-byte native binary
-  payroll.*        Phase 3: four rules on the same input — map to Record (~670 B), filter (~670 B), map to number (~455 B), map to text (~410 B)
+  payroll.*        Phase 3: four rules on the same input — map to Record (~670 B), filter (~670 B), map to number (~455 B), map to text (~410 B).
+                   Phase 4: two reductions on the same input — sum (~486 B), count (~532 B).
                    (purchase.verbose::discounted_purchase compiles to ~750 bytes via Phase 2D match_result inlining)
   demo.html        Browser demo (WASM)
 
@@ -145,6 +146,7 @@ Tracking what native emits today, what it still rejects, and the design rules th
 | 2D | `match_result(callee(input), v => Ok(<arith using v>), e => Err(e))` — inlined-callee form. Callee's logic is walked and its Ok/Err leaves are redirected: Ok values bind to a reserved `match_slot` then evaluate the outer Ok arm; Err values write directly to stderr (Err pass-through). Restricted to same-input-concept callees and `Err(<err_var>)` pass-through outer arm. | ~750 B | `purchase.verbose::discounted_purchase` |
 | 3 | `output: collection(T)` with `map` or `filter` — streaming element emission (one JSON Lines per element), no arena, count-prefixed argv. `filter` uses identity pass-through: predicate false skips emission, predicate true emits the element as-is. See "Phase 3 design (locked)" below. | ~670 B | `payroll.verbose::compute_bonuses` (map) / `::high_earners` (filter) |
 | 3.2 | `output: collection(number)` / `collection(text)` — scalar element map. `map(w.employees, e => e.salary)` emits one number per line; text body emits one string per line. No JSON wrapping, so scalar-element binaries are smaller (~400-500 B). | ~455 B | `payroll.verbose::salaries` / `::names` |
+| 4 | `output: number` with `fold`/`sum`/`count`/`min`/`max` at the top level — inner loop accumulates into a single stack slot, emits the final value on stdout once per input record. First emitter with cross-iteration state; no arena (the accumulator is one i64). See "Phase 4 design (locked)" below. | ~490–530 B | `payroll.verbose::total_salaries` (sum, 486 B) / `::high_earner_count` (count, 532 B) |
 
 ### Phase 3 design (locked before implementation)
 
@@ -185,11 +187,75 @@ The count comes right before its elements. No terminator, no dynamic scanning. P
 
 **Known perf tradeoff (not yet addressed).** Each element emits N+K syscalls, where N is the field count and K is the number of static JSON skeleton fragments. For a 2-field record that's ~6 syscalls per element. On Linux, each syscall is ~1 µs, so a 1000-element collection takes ~6 ms to emit. At POC scale this is invisible; for 100K+ element collections, a batch-per-element optimisation (stack buffer, single `write` per element) would be ~10-20× faster. The Phase 1B `emit_concat_to_buffer` / `emit_append_file_call` pattern already shows the technique — generalising it to record emission is ~100 lines of plumbing, deferred until someone has an actual case. Documented so it is not forgotten.
 
+### Phase 4 design (locked before implementation)
+
+Phase 4 introduces the first emitter with **cross-iteration state**: a reduction (`fold` / `sum` / `count` / `min` / `max`) over a collection, producing a single scalar number per input record. Four decisions are locked before writing `emit_fold_program`.
+
+**1. Memory model: one stack slot, no arena.** The accumulator lives in a single 8-byte slot at the bottom of the rbp frame (`acc_slot`), reserved unconditionally by the prologue — same discipline as Phase 2D's `match_slot`. The inner loop reads the slot, combines with the current element, writes the slot back. No heap, no growable buffer. State is exactly one i64 wide, for the entire lifetime of one input record, and discarded at outer-loop bottom. Syscall surface stays identical to Phase 3: `read argv`, `write fd 1`, `exit`. Adding "cross-iteration state" at the source level does not add "cross-iteration state" at the syscall level.
+
+**2. Output format: one number per input record on stdout, `\n`-terminated.** Uniform with scalar-output rules (Phase 0). `sum` returns the running total, `count` the number of elements where the predicate held, `min`/`max` the extremum (seeded with `i64::MAX` / `i64::MIN`), generic `fold` whatever the body computes. If the collection is empty, the init value is emitted verbatim — that's the well-defined answer (`sum` of empty = 0, `count` of empty = 0, `min` of empty = i64::MAX, `max` of empty = i64::MIN). The "min/max of empty" edge case is documented behaviour, not a silent bug; if a rule needs "empty is an error", it writes `Result(number, text)` with an explicit Err arm, which is Phase 2A territory, not Phase 4.
+
+**3. Init must be a Number literal at parse time.** All desugarings of `sum` / `count` / `min` / `max` produce literal inits (`0`, `0`, `i64::MAX`, `i64::MIN`), so the restriction is free in practice. A non-literal init would require pre-loop evaluation into acc_slot, which is a (small) separate extension — not in v1. Verified at emit time: if `logic.value` is `Fold(_, init, _, _, _)` and `init` is not `Expr::Number(_)`, the emitter refuses with a clear message ("Phase 4: fold init must be a literal number").
+
+**4. Scope v1 (everything else refused with a clear message):**
+- Rule `output_ty` is `Number`.
+- Top-level logic is `Fold(Field(Ident(input_name), coll_field_name), Number(init), acc_name, item_name, body)` — exactly the shape sum/count/min/max desugar to.
+- Input concept: zero or more scalar fields + exactly one collection field, which must be the LAST field declared (mirrors Phase 3).
+- Body is a scalar expression referencing `acc_name`, `item_name.<field>`, and any outer let/field bindings. No nested fold, no rule calls inside the body.
+- No side effects in the body (no concat-to-stdout, no append_file, no rule calls that react).
+
+**Frame layout.** Prologue extends Phase 3's layout by one slot:
+```
+rbp - 8*(nfields+1)             first field slot
+...
+rbp - 8*(nfields+nlets+1)       last let-binding slot
+rbp - 8*(nfields+nlets+2)       acc_slot                       ← Phase 4 addition
+```
+`acc_name` is treated by the expression emitter as a read/write to `acc_slot` — no distinct register role needed. Accessing `acc_name` from the body goes through the same rbp-slot lookup as a let binding (offset table), keeping the expression emitter uniform.
+
+**Register map: no new reservation.** The inner loop reuses `r15` (inner counter, role inherited from Phase 3) and `r13`/`r14` (argv base, current-record-start), same as Phase 3. No new entry in the register table. The "per-emitter role" policy for `r15` continues: a fold-output binary and a reaction-output binary never coexist, so the fd-vs-counter ambiguity stays resolved.
+
+**Emission flow.**
+```
+_start:
+  prologue (reserve field slots + let slots + acc_slot)
+outer_loop_top:
+  check r14 (record index) < argc - 1 else exit
+  parse scalar input fields (atoi / argv-ptr for text) into field slots
+  parse collection count N into r15
+  store init literal into acc_slot
+  set rcx = argv[ fields_base + 1 ]  (first element pointer)
+inner_loop_top:
+  test r15, r15; jz after_inner
+  parse element fields (atoi / argv-ptr) into item slots (reused across iterations)
+  evaluate body with acc=acc_slot, item=item_slots → rax
+  store rax back into acc_slot
+  advance argv ptr by element_field_count
+  dec r15
+  jmp inner_loop_top
+after_inner:
+  load acc_slot into rax
+  emit_itoa_inline → stdout
+  emit_write_newline(1)
+  advance r14 past this record
+  jmp outer_loop_top
+```
+
+**Why this design holds security pillar #1:** identical attack surface to Phase 3. Same three syscalls. One new stack slot — which is not an attack surface, it's a rbp offset. An auditor reading the disassembled binary sees one extra `mov [rbp-offset], rax` per iteration compared to Phase 3, and one final `itoa + write` at the bottom. Nothing else.
+
+**What Phase 4 does NOT do** (refused with clear messages, deferred to later phases):
+- `output: text` with fold producing a text (would need concat-into-buffer with growth — not one slot).
+- `output: Record` with fields computed by fold (would need multiple acc slots and a final record emission).
+- Body containing a nested `fold` (would need acc-slot stack discipline — the outer/inner slots would collide).
+- Generic `fold(coll, init_expr, ...)` with a non-literal init (pre-loop evaluation needed).
+- `fold` whose target is a rule call returning a collection (Phase 3 already refuses collection-returning rule calls as map/filter targets; Phase 4 inherits the refusal).
+
 ### What native still rejects, and in which priority
 
 - **Result(T, E) with non-scalar T** (e.g. `Result(Record, text)`, `Result(collection, _)`) — each shape needs its own calling convention. Decide shape by shape, never fabricate a "universal Result" that carries unnecessary machinery.
 - **Text-field access in `Result(text, text)` Ok arm or in concat arguments** — Phase 2E added text-field reads only inside record-output rules (`emit_record_program`'s argv loop and `emit_text_write_to_fd`'s special case). Other emitters (`emit_full_program`, `emit_reaction_program`, `emit_result_program`) still call `atoi` on every field. Generalizing requires teaching each emitter the same field-loading dispatch — purely mechanical, not gated by design questions.
-- **`output: collection(T)` with fold/sum/count/min/max on the output side, or collection-returning rule calls** — these need an accumulator persisted across iterations (arena/heap territory). Phase 3 covers only streaming map/filter; cumulative forms are deferred.
+- **Reductions with non-number output** — Phase 4 covers `output: number` with top-level `fold`/`sum`/`count`/`min`/`max`. `output: text` reduction (concat-fold), `output: Record` with fold-computed fields, and nested folds are still refused (each would need a different accumulator shape — text buffer with growth, multi-slot record, fold-slot stack — and each gets its own phase).
+- **Collection-returning rule calls or collection-valued reduction targets** — `map`/`filter` and Phase 4's `fold` target must be a direct `Field(Ident(input), coll_field)`. Composing through an intermediate rule that returns a collection is not supported; the caller has to inline the collection source.
 - **`match_result` with non-pass-through Err arm** — Phase 2D handles `Err(<err_var>)` pass-through (the value flows directly to stderr without being bound). Richer Err arms (using err_var inside concat, or transforming it) need a real text-binding mechanism — two rbp slots per text bound var (ptr + len) since Err values from concat aren't NUL-terminated.
 - **`match_result` with cross-concept callees** — Phase 2D requires callee.input_concept == outer.input_concept (so the rbp slots are reused as-is). Cross-concept calls need argument-passing through additional slots or a real callee frame.
 - **Nested `match_result`** — Phase 2D reserves a single `match_slot` in the prologue; nested match_results would collide. Either reserve N slots based on a static walk or switch to a stack-based binding scheme.
