@@ -51,14 +51,13 @@ examples/
   alerts.*         Dynamic reactions with interpolated values
   app.* + stdlib/  Module system demo (use + import)
   retirement.*     map + filter on a collection of employees
-  purchase.*       Result(T, E) — declared failure path (Ok/Err)
+  purchase.*       Result(number, text) validator — validate_purchase compiles to a 705-byte native binary (Ok -> stdout, Err -> stderr); discounted_purchase (Phase 2D match_result) at 763 B
   layers.*         @layer stratification — architectural discipline verified
   bonus.*          record construction — map produces collection(BonusReport)
   audit_log.*      append_file reaction with dynamic concat content — compiles to a 724-byte native binary
   audit_simple.*   append_file with static content — compiles to a 464-byte native binary
   audit_user.*     append_file reaction whose log line concatenates a text-typed input field;
                    buffer sized at runtime via per-field strlen, freed via saved-rsp r9 (~847 B)
-  purchase.*       Result(number, text) validator — validate_purchase compiles to a 705-byte native binary (Ok -> stdout, Err -> stderr)
   enrich.*         Phase 2F: match_result with an enriched Err arm — `enriched` compiles to a ~700-byte native binary
                    (outer Err captures callee's Err into (ptr,len) slots, then concats user context)
   tier.*           Result(text, text) classifier — classify_tier compiles to a 602-byte native binary
@@ -426,10 +425,9 @@ Before emission, always `mov [rbp+err_frame_save_slot], rsp` — harmless when n
 - **Result(T, E) with non-scalar T** (e.g. `Result(Record, text)`, `Result(collection, _)`) — each shape needs its own calling convention. Decide shape by shape, never fabricate a "universal Result" that carries unnecessary machinery.
 - **Reductions with non-number, non-text output** — Phase 4 covers `output: number` with top-level fold, Phase 5a covers `output: text` per-record, Phase 5b covers `output: text` via fold (append-only body, two-pass sizing). Still refused: `output: Record` with fold-computed fields (needs multi-slot record accumulator), nested folds (acc-slot stack discipline), and non-append-only text fold bodies like `concat(X, acc)` (would force O(N²) memory regardless of strategy — workaround: reorganize into append-only form).
 - **Collection-returning rule calls or collection-valued reduction targets** — `map`/`filter` and Phase 4's `fold` target must be a direct `Field(Ident(input), coll_field)`. Composing through an intermediate rule that returns a collection is not supported; the caller has to inline the collection source.
-- **`match_result` Err body using `err_var` in a rule call** — `emit_text_write_to_fd` still refuses `Expr::Call`. Any other text-expression shape (literal, field, Ident(err_var), or concat with any of those) works via the Phase 2F slot path.
+- **Text-returning rule calls in any text context** — `emit_text_write_to_fd` rejects `Expr::Call`. This manifests in two places: (a) a Record field value computed as `Call(...)` returning text (`fullname.verbose` works with concat but a rule call would be refused), and (b) a match_result Err arm that concats the result of a text-returning rule call. Same root cause in both. Unlocking it needs a text-return calling convention for native (pointer + length in two registers, or an outparam stack slot) — its own small phase.
 - **`match_result` with cross-concept callees** — Phase 2D requires callee.input_concept == outer.input_concept (so the rbp slots are reused as-is). Cross-concept calls need argument-passing through additional slots or a real callee frame.
 - **Nested `match_result`** — Phase 2D reserves a single `match_slot` in the prologue; nested match_results would collide. Either reserve N slots based on a static walk or switch to a stack-based binding scheme.
-- **Record fields with text-typed value coming from a text-returning rule call** — text literals, input-field texts, and `concat(...)` (including concat with text-field args via the dynamic buffer) all work as Record field values today (`fullname.verbose` exercises concat-in-Record-field). What's still refused is calling a rule that returns text and placing the result into a Record field — `emit_text_write_to_fd`'s fallback rejects `Call(...)`. Unlocking it needs a text-return calling convention for native (pointer + length in two registers, or an outparam stack slot), which is its own small phase.
 
 ### Register conventions across emitters
 

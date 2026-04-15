@@ -1855,13 +1855,7 @@ fn emit_redirect_callee_leaves(
                     }
                     let offset = offsets[field_name.as_str()];
                     // mov rax, [rbp+offset] — load ptr
-                    if offset >= -128 {
-                        code.extend_from_slice(&[0x48, 0x8B, 0x45]);
-                        code.push(offset as u8);
-                    } else {
-                        code.extend_from_slice(&[0x48, 0x8B, 0x85]);
-                        code.extend_from_slice(&offset.to_le_bytes());
-                    }
+                    load_rax_from_rbp(code, offset);
                     store_rax_at_rbp(code, slots.err_ptr_slot);
                     // mov rsi, rax ; emit_strlen → rdx = length
                     code.extend_from_slice(&[0x48, 0x89, 0xC6]);
@@ -1915,13 +1909,7 @@ fn emit_redirect_callee_leaves(
 
             // 4. Restore rsp to pre-capture — frees the callee's concat
             //    buffer (if any). Harmless when no concat happened.
-            if slots.err_frame_save_slot >= -128 {
-                code.extend_from_slice(&[0x48, 0x8B, 0x45]);
-                code.push(slots.err_frame_save_slot as u8);
-            } else {
-                code.extend_from_slice(&[0x48, 0x8B, 0x85]);
-                code.extend_from_slice(&slots.err_frame_save_slot.to_le_bytes());
-            }
+            load_rax_from_rbp(code, slots.err_frame_save_slot);
             // mov rsp, rax
             code.extend_from_slice(&[0x48, 0x89, 0xC4]);
 
@@ -2601,13 +2589,7 @@ fn emit_fold_program(
     code[inner_done_patch..inner_done_patch + 4].copy_from_slice(&inner_done_off.to_le_bytes());
 
     // Emit the final accumulator: load acc_slot -> rax -> itoa+newline to stdout.
-    if acc_offset >= -128 {
-        code.extend_from_slice(&[0x48, 0x8B, 0x45]);
-        code.push(acc_offset as u8);
-    } else {
-        code.extend_from_slice(&[0x48, 0x8B, 0x85]);
-        code.extend_from_slice(&acc_offset.to_le_bytes());
-    }
+    load_rax_from_rbp(&mut code, acc_offset);
     emit_itoa_inline(&mut code);
 
     // jmp outer_loop_top.
@@ -3155,6 +3137,18 @@ fn store_rdi_at_rbp(code: &mut Vec<u8>, offset: i32) {
     }
 }
 
+/// Emit `mov rax, [rbp+offset]` — symmetric to `store_rax_at_rbp`. Short form
+/// (disp8) when the offset fits in an i8; otherwise the disp32 encoding.
+fn load_rax_from_rbp(code: &mut Vec<u8>, offset: i32) {
+    if offset >= -128 {
+        code.extend_from_slice(&[0x48, 0x8B, 0x45]);
+        code.push(offset as u8);
+    } else {
+        code.extend_from_slice(&[0x48, 0x8B, 0x85]);
+        code.extend_from_slice(&offset.to_le_bytes());
+    }
+}
+
 /// Walk an expression in record context. Each leaf is a Record constructor
 /// that emits its own JSON line + jmp loop_top. Structural If/else branches
 /// recurse; each arm plants its own terminator.
@@ -3554,17 +3548,10 @@ fn emit_eval_expr(
                     message: "nested field access not supported in native backend".into(),
                 });
             }
-            let offset = offsets.get(field_name.as_str()).ok_or_else(|| NativeError {
+            let offset = *offsets.get(field_name.as_str()).ok_or_else(|| NativeError {
                 message: format!("unknown field '{}' in native codegen", field_name),
             })?;
-            // mov rax, [rbp + offset]
-            if *offset >= -128 {
-                code.extend_from_slice(&[0x48, 0x8B, 0x45]);
-                code.push(*offset as u8);
-            } else {
-                code.extend_from_slice(&[0x48, 0x8B, 0x85]);
-                code.extend_from_slice(&offset.to_le_bytes());
-            }
+            load_rax_from_rbp(code, offset);
             Ok(())
         }
         Expr::Binary(op, left, right) => {
@@ -3821,13 +3808,7 @@ fn emit_eval_expr(
         Expr::Ident(name) => {
             // Let-bound variable — load from rbp-relative slot
             if let Some(offset) = offsets.get(name.as_str()) {
-                if *offset >= -128 {
-                    code.extend_from_slice(&[0x48, 0x8B, 0x45]);
-                    code.push(*offset as u8);
-                } else {
-                    code.extend_from_slice(&[0x48, 0x8B, 0x85]);
-                    code.extend_from_slice(&offset.to_le_bytes());
-                }
+                load_rax_from_rbp(code, *offset);
                 Ok(())
             } else {
                 Err(NativeError {
@@ -4244,14 +4225,6 @@ fn extract_simple_gt(rule: &Rule) -> Option<i64> {
     None
 }
 
-/// Compute magic number and shift for unsigned division by constant.
-/// Uses the algorithm from Hacker's Delight (Warren, 2002).
-///
-/// For a 64-bit unsigned dividend and constant divisor d:
-///   x / d = mulhi(x, magic) >> shift
-///
-/// where mulhi is the high 64 bits of the 128-bit product x * magic.
-/// This replaces a 20-40 cycle `idiv` with a 3-cycle `mul` + 1-cycle `shr`.
 /// Generate a minimal HTTP server binary — proof that the native backend
 /// can produce real networked applications, not just rule evaluators.
 ///
