@@ -1,0 +1,72 @@
+@verbose 0.1.0
+
+-- Phase 2G: text-returning rule calls are inlined at the point of call.
+-- When a rule's text-output body IS a call to another text-returning rule,
+-- the native emitter recurses on the callee's body — byte-for-byte as if
+-- the caller had written the callee's expression directly.
+--
+-- Decomposition serves auditability: the verifier independently checks the
+-- helper's proofs (purity, termination, determinism); the caller just
+-- declares `calls: [display_name]` and inherits those properties.
+
+
+concept Person
+  @intention: "A person has a first name, a last name, and an age"
+  @source: compose.intent:1
+
+  fields:
+    first : text
+    last  : text
+    age   : number [0, 150]
+
+
+rule display_name
+  @intention: "The display name is the first and last name joined by a space"
+  @source: compose.intent:2
+
+  input:
+    p : Person
+
+  output:
+    n : text
+
+  logic:
+    n = concat(p.first, " ", p.last)
+
+  proofs:
+    purity:
+      reads   : [p.first, p.last]
+      writes  : []
+      calls   : []
+      verdict : pure
+    termination:
+      form  : constant_bound
+      bound : 3
+    determinism:
+      form : total
+
+
+rule name_line
+  @intention: "Emit the display name of each person (delegates to helper)"
+  @source: compose.intent:3
+
+  input:
+    p : Person
+
+  output:
+    line : text
+
+  logic:
+    line = display_name(p)
+
+  proofs:
+    purity:
+      reads   : [p]
+      writes  : []
+      calls   : [display_name]
+      verdict : pure
+    termination:
+      form  : constant_bound
+      bound : 3
+    determinism:
+      form : total

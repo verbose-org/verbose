@@ -1,0 +1,3 @@
+1. A person has a first name, a last name, and an age.
+2. The display name of a person is the concatenation of their first and last name.
+3. For each person, emit a greeting line that uses the display name helper.

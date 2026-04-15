@@ -1387,6 +1387,81 @@ fn emit_text_write_to_fd(
             emit_concat_buffer_free(code, buf);
             Ok(())
         }
+        Expr::Call(callee_name, args) => {
+            // Phase 2G: text-returning rule call inlined. Validate the
+            // same-concept / same-input-name / no-lets restrictions, then
+            // recurse on the callee's body. See "Phase 2G design (locked)"
+            // in CLAUDE.md.
+            let callee = all_rules.get(callee_name.as_str()).ok_or_else(|| NativeError {
+                message: format!(
+                    "Phase 2G: unknown rule '{}' called in text context",
+                    callee_name
+                ),
+            })?;
+            if !matches!(callee.output_ty, Type::Text) {
+                return Err(NativeError {
+                    message: format!(
+                        "Phase 2G: rule '{}' in text context must return `text`, not {:?}",
+                        callee_name, callee.output_ty
+                    ),
+                });
+            }
+            let callee_concept_name = match &callee.input_ty {
+                Type::Named(n) => n.as_str(),
+                _ => {
+                    return Err(NativeError {
+                        message: format!(
+                            "Phase 2G: rule '{}' input must be a named concept",
+                            callee_name
+                        ),
+                    });
+                }
+            };
+            if callee_concept_name != concept.name.as_str() {
+                return Err(NativeError {
+                    message: format!(
+                        "Phase 2G: callee '{}' takes concept '{}' but caller takes '{}' — same-concept required in native",
+                        callee_name, callee_concept_name, concept.name
+                    ),
+                });
+            }
+            if callee.input_name != input_name {
+                return Err(NativeError {
+                    message: format!(
+                        "Phase 2G: callee '{}' binds its input as '{}' but caller uses '{}' — same input name required",
+                        callee_name, callee.input_name, input_name
+                    ),
+                });
+            }
+            if !callee.logic.bindings.is_empty() {
+                return Err(NativeError {
+                    message: format!(
+                        "Phase 2G: callee '{}' has let bindings; not yet supported in native (would need caller-side evaluation)",
+                        callee_name
+                    ),
+                });
+            }
+            if args.len() != 1 || !matches!(&args[0], Expr::Ident(n) if n == input_name) {
+                return Err(NativeError {
+                    message: format!(
+                        "Phase 2G: rule '{}' must be called with exactly the caller's input identifier",
+                        callee_name
+                    ),
+                });
+            }
+            // Recurse: emit the callee's body as if it were inlined here.
+            emit_text_write_to_fd(
+                code,
+                &callee.logic.value,
+                fd,
+                input_name,
+                concept,
+                all_rules,
+                offsets,
+                field_ranges,
+                text_bindings,
+            )
+        }
         other => Err(NativeError {
             message: format!(
                 "text-producing expression not yet supported in native: {:?}",
@@ -4868,6 +4943,28 @@ mod tests {
         let out = std::env::temp_dir().join("verbosec_test_greeting_line");
         compile_native(&program, "greeting_line", out.to_str().unwrap())
             .expect("native compile of output-text rule should succeed");
+        let size = fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
+        assert!(size > 300 && size < 2_000, "unexpected binary size: {}", size);
+        let _ = fs::remove_file(out);
+    }
+
+    #[test]
+    fn native_compiles_text_returning_rule_call() {
+        // Phase 2G: `output: text` whose body is Call(helper, [Ident(input)]).
+        // compose.verbose's name_line delegates to display_name — the emitter
+        // inlines the helper's `concat(p.first, " ", p.last)` body at the
+        // call site. Same-concept / same-input-name / no-lets restrictions
+        // are enforced; violating any of them produces a clear Phase 2G
+        // error message.
+        use std::fs;
+        let src = fs::read_to_string("examples/compose.verbose")
+            .expect("examples/compose.verbose is expected to exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let out = std::env::temp_dir().join("verbosec_test_name_line");
+        compile_native(&program, "name_line", out.to_str().unwrap())
+            .expect("native compile of text-returning call should succeed");
         let size = fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
         assert!(size > 300 && size < 2_000, "unexpected binary size: {}", size);
         let _ = fs::remove_file(out);

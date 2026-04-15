@@ -26,6 +26,7 @@ ENTRIES=(
   "2D      |examples/purchase.verbose    |discounted_purchase|match_result pass-through"
   "2E      |examples/greeting.verbose    |make_report        |text input field → Record JSON"
   "2F      |examples/enrich.verbose      |enriched           |match_result enriched Err arm"
+  "2G      |examples/compose.verbose     |name_line          |text-returning rule call inlined"
   "3-map   |examples/payroll.verbose     |compute_bonuses    |collection(Record) via map"
   "3-filter|examples/payroll.verbose     |high_earners       |collection(Record) via filter"
   "3.2-n   |examples/payroll.verbose     |salaries           |collection(number) via map"
