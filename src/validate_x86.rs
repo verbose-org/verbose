@@ -13,17 +13,26 @@
 /// invalid bytes. This catches encoding bugs (like the REX.X incident) at compile
 /// time instead of at runtime (crash or silent corruption).
 ///
-/// Known false positives (decoder incomplete):
-/// - Emitters that use `EB rel8` jmp-over-data with string content are handled
-///   via a pattern match at decode time, but long emitters with multiple inline
-///   static-write syscalls in sequence can leave the decoder one byte off
-///   (classic out-of-sync-after-a-conditional-branch issue). Affected examples
-///   today: `classify.verbose`, `greeting.verbose`. The warning is cosmetic —
-///   the emitted binaries run correctly and are verified end-to-end in tests.
-/// - Full opcode coverage is a longer project. Adding the specific opcodes we
-///   emit (as we find them) chips away at false positives over time; we log
-///   the warning with an "(decoder incomplete, may be false positive)" suffix
-///   so users know not to treat it as a hard error.
+/// EB-rel8 handling:
+/// - The emitter uses `EB n` (forward) for two purposes: jmp-over-inline-data
+///   (the string literal embedded after the jmp) and jmp-over-code (e.g.
+///   skipping a "false" branch in bool output). For BOTH cases, advancing
+///   `2 + n` bytes lands on a real instruction boundary — the emitter's
+///   invariant is that every jmp targets the start of an instruction, so
+///   skipping is safe whether the skipped bytes are data or code.
+/// - The emitter also uses `EB n` for BACKWARD jumps (sign bit set in n,
+///   read as i8) inside tight loops like `emit_atoi_inline`'s digit-parse
+///   loop and `emit_itoa_inline`'s div loop. These must NOT be treated as
+///   data skips — the displacement is negative, the byte sequence after the
+///   jmp is real code, and unsigned-treating would skip 200+ bytes forward
+///   and land mid-instruction (the original false-positive root cause).
+///   Backward EB falls through to the general decoder, which handles it
+///   correctly as a 2-byte short jump.
+///
+/// Crédo: a false positive (rejecting valid code) damages the verifier's
+/// credibility. Any new opcode added to the decoder must be verified to
+/// correctly decode the actual emitted bytes; a partial decoder that drifts
+/// is worse than no decoder at all.
 
 #[derive(Debug)]
 pub struct ValidationError {
@@ -46,14 +55,24 @@ pub fn validate_code(code: &[u8]) -> Result<usize, ValidationError> {
     while pos < code.len() {
         let start = pos;
 
-        // Detect jmp-over-data pattern (EB xx): the bytes after the jmp are inline
-        // string data, not instructions. Skip them.
+        // Detect jmp-over-data pattern (EB xx): the bytes after the jmp may be
+        // inline string data, not instructions. Only applies to FORWARD jumps
+        // (positive i8 displacement). Backward EB jumps (xx >= 0x80 when read
+        // as i8) are real short jumps — e.g. the tight loops inside
+        // emit_atoi_inline and emit_itoa_*. Falling through to the general
+        // decoder treats those correctly as a 2-byte short jmp.
+        //
+        // For a forward EB, skipping `disp` bytes is safe even if the bytes
+        // happen to be real code (not data): the emitter's invariant is that
+        // every jmp targets the START of a real instruction, so the skip lands
+        // on an instruction boundary regardless of what the skipped bytes are.
         if code[pos] == 0xEB && pos + 1 < code.len() {
-            let data_len = code[pos + 1] as usize;
-            // The jmp itself is 2 bytes, then data_len bytes of data
-            pos += 2 + data_len;
-            count += 1; // count the jmp as one instruction
-            continue;
+            let disp = code[pos + 1] as i8;
+            if disp >= 0 {
+                pos += 2 + disp as usize;
+                count += 1;
+                continue;
+            }
         }
 
         match decode_instruction_length(code, pos) {
@@ -453,5 +472,43 @@ mod tests {
             0x66, 0x0F, 0x50, 0xC0,         // movmskpd eax, xmm0
         ];
         assert!(validate_code(&code).is_ok());
+    }
+
+    #[test]
+    fn backward_eb_is_a_real_jump_not_data_skip() {
+        // Regression: the EB-over-data heuristic used to treat the
+        // displacement byte as unsigned, so a backward jump like `EB E5`
+        // (used inside emit_atoi_inline's digit-parse loop) was decoded as
+        // "skip 229 bytes forward", landing mid-instruction much later and
+        // producing a phantom "cannot decode" error. Backward EB must fall
+        // through to the general decoder (2-byte short jump).
+        //
+        // Sequence: NOP (90) at offset 0, then `EB FE` at offset 1 — a tight
+        // jmp-to-self (an infinite loop, but the validator must accept it
+        // as valid code shape). Followed by another NOP so we have something
+        // after the loop to ensure linear walk reaches the end.
+        let code = vec![
+            0x90,             // nop
+            0xEB, 0xFE,       // jmp -2 (backward to self) — disp=-2 as i8
+            0x90,             // nop (validator must reach this)
+        ];
+        let count = validate_code(&code).expect("backward EB must validate");
+        assert_eq!(count, 3, "expected nop+jmp+nop, got {} instructions", count);
+    }
+
+    #[test]
+    fn forward_eb_skips_inline_data() {
+        // The classic jmp-over-data pattern: `EB 06`, then 6 bytes of
+        // string data, then a real instruction. The validator must skip
+        // the data (not try to decode "Hello!" as instructions).
+        let code = vec![
+            0xEB, 0x06,                                     // jmp +6
+            b'H', b'e', b'l', b'l', b'o', b'!',             // 6 bytes of data
+            0x48, 0xC7, 0xC0, 0x3C, 0x00, 0x00, 0x00,       // mov rax, 60
+            0x0F, 0x05,                                      // syscall
+        ];
+        let count = validate_code(&code).expect("forward EB-over-data must validate");
+        // jmp + mov + syscall = 3 instructions (data is not counted).
+        assert_eq!(count, 3, "expected 3 instructions counted, got {}", count);
     }
 }
