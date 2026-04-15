@@ -245,8 +245,19 @@ struct RecordLoopCtx<'a> {
     /// Bottom-of-frame slot reserved for `match_result`'s Ok-value binding
     /// (Phase 2D). Present regardless of whether the rule uses match_result;
     /// a stable rbp offset is cheaper than a conditional frame layout.
-    /// Only meaningful when `reserve_match_slot = true`.
     match_slot: i32,
+    /// Phase 2F: slot holding the pointer to the Err-bound text value.
+    /// Paired with `err_len_slot` below. Unused when the rule doesn't use
+    /// match_result with a non-pass-through Err arm.
+    err_ptr_slot: i32,
+    /// Phase 2F: slot holding the length of the Err-bound text value.
+    err_len_slot: i32,
+    /// Phase 2F: slot holding the rsp value captured BEFORE the inlined
+    /// callee's Err leaf allocates its concat buffer (if any). Restoring
+    /// rsp from this slot at the end of the outer Err arm frees whatever
+    /// the callee allocated. When the callee's Err doesn't use concat,
+    /// this slot just holds the unchanged rsp — restoring is a no-op.
+    err_frame_save_slot: i32,
 }
 
 /// Emit the shared prologue for any emitter that iterates over records
@@ -272,10 +283,19 @@ fn emit_record_loop_prologue<'a>(
 ) -> Result<RecordLoopCtx<'a>, NativeError> {
     let nfields = input_concept.fields.len();
     let n_bindings = rule.logic.bindings.len();
-    // +1 for match_slot at the bottom of the frame.
-    let frame_slots = nfields + n_bindings + 1;
+    // Bottom-of-frame reserved slots, in order:
+    //   base + 1: match_slot          (Phase 2D Ok-bound i64)
+    //   base + 2: err_ptr_slot        (Phase 2F Err-bound text ptr)
+    //   base + 3: err_len_slot        (Phase 2F Err-bound text length)
+    //   base + 4: err_frame_save_slot (Phase 2F rsp saved before callee Err concat)
+    let n_reserved = 4;
+    let frame_slots = nfields + n_bindings + n_reserved;
     let frame_size = (frame_slots * 8) as i32;
-    let match_slot: i32 = -((frame_slots as i32) * 8);
+    let base = (nfields + n_bindings) as i32;
+    let match_slot: i32 = -((base + 1) * 8);
+    let err_ptr_slot: i32 = -((base + 2) * 8);
+    let err_len_slot: i32 = -((base + 3) * 8);
+    let err_frame_save_slot: i32 = -((base + 4) * 8);
 
     // mov r12, [rsp]            — argc
     code.extend_from_slice(&[0x4C, 0x8B, 0x24, 0x24]);
@@ -365,6 +385,9 @@ fn emit_record_loop_prologue<'a>(
         binding_offsets,
         field_ranges,
         match_slot,
+        err_ptr_slot,
+        err_len_slot,
+        err_frame_save_slot,
     })
 }
 
@@ -458,6 +481,7 @@ fn emit_text_program(
         all_rules,
         &ctx.binding_offsets,
         &ctx.field_ranges,
+        &no_text_bindings(),
     )?;
     emit_write_newline(&mut code, 1);
 
@@ -478,16 +502,31 @@ fn emit_text_program(
 enum ConcatArgKind {
     Text,
     Number,
+    /// Phase 2F: an identifier bound to a text value via `match_result`'s
+    /// Err arm. The bound value is represented as (ptr, len) in two rbp
+    /// slots rather than as a NUL-terminated pointer.
+    BoundText,
 }
+
+/// Mapping `identifier → (ptr_slot, len_slot)` for text-typed values bound
+/// in the current emission scope (e.g. `err_var` from match_result's Err
+/// arm). Threaded through `classify_concat_arg`, `emit_concat_*`, and
+/// `emit_text_write_to_fd` so that an `Expr::Ident(name)` where `name` is
+/// bound resolves to a (ptr, len) load from the two slots.
+type TextBindings<'a> = HashMap<&'a str, (i32, i32)>;
 
 fn classify_concat_arg(
     expr: &Expr,
     concept: &Concept,
     input_name: &str,
+    text_bindings: &TextBindings<'_>,
 ) -> Option<ConcatArgKind> {
     match expr {
         Expr::Text(_) => Some(ConcatArgKind::Text),
         Expr::Number(_) | Expr::Neg(_) => Some(ConcatArgKind::Number),
+        Expr::Ident(name) if text_bindings.contains_key(name.as_str()) => {
+            Some(ConcatArgKind::BoundText)
+        }
         Expr::Field(base, field_name) => {
             if matches!(base.as_ref(), Expr::Ident(n) if n == input_name) {
                 let f = concept.fields.iter().find(|f| &f.name == field_name)?;
@@ -658,16 +697,17 @@ fn emit_concat_to_buffer(
     all_rules: &HashMap<&str, &Rule>,
     offsets: &HashMap<&str, i32>,
     field_ranges: &HashMap<&str, (i64, i64)>,
+    text_bindings: &TextBindings<'_>,
 ) -> Result<ConcatBufResult, NativeError> {
     // Classify every arg and tally the static worst case. A text-field arg
-    // means sizing must be runtime-dynamic.
+    // or a bound text var means sizing must be runtime-dynamic.
     let mut kinds: Vec<ConcatArgKind> = Vec::with_capacity(args.len());
     let mut static_total: i32 = 0;
-    let mut has_text_field: bool = false;
+    let mut has_dynamic: bool = false;
     for arg in args {
-        let kind = classify_concat_arg(arg, concept, input_name).ok_or_else(|| {
+        let kind = classify_concat_arg(arg, concept, input_name, text_bindings).ok_or_else(|| {
             NativeError {
-                message: "concat argument type not yet supported in native (text + number scalars only for now; bool and others stay interpreter-only)".into(),
+                message: "concat argument type not yet supported in native (text + number scalars or bound text var; bool and others stay interpreter-only)".into(),
             }
         })?;
         kinds.push(kind);
@@ -677,19 +717,23 @@ fn emit_concat_to_buffer(
                     static_total += s.as_bytes().len() as i32;
                 } else if let Expr::Field(_, _) = arg {
                     // Text field: length known only at runtime. Dynamic path.
-                    has_text_field = true;
+                    has_dynamic = true;
                 }
             }
             ConcatArgKind::Number => {
                 static_total += 21; // i64 max 20 digits + sign
             }
+            ConcatArgKind::BoundText => {
+                // Bound text var: length is in a rbp slot. Dynamic path.
+                has_dynamic = true;
+            }
         }
     }
-    if static_total == 0 && !has_text_field {
+    if static_total == 0 && !has_dynamic {
         return Err(NativeError { message: "concat with zero total size".into() });
     }
 
-    if !has_text_field {
+    if !has_dynamic {
         // Fast path — compile-time-sized buffer, unchanged from before.
         let buf_size = ((static_total + 7) / 8) * 8;
         // sub rsp, buf_size
@@ -699,7 +743,7 @@ fn emit_concat_to_buffer(
         code.extend_from_slice(&[0x48, 0x89, 0xE3]);
         // mov r10, rbx  — buffer base for final length calc
         code.extend_from_slice(&[0x49, 0x89, 0xDA]);
-        emit_concat_fill(code, args, &kinds, input_name, concept, all_rules, offsets, field_ranges)?;
+        emit_concat_fill(code, args, &kinds, input_name, concept, all_rules, offsets, field_ranges, text_bindings)?;
         // rax = buffer base, rdx = length (rbx - r10)
         code.extend_from_slice(&[0x4C, 0x89, 0xD0]); // mov rax, r10
         code.extend_from_slice(&[0x48, 0x89, 0xDA]); // mov rdx, rbx
@@ -714,33 +758,50 @@ fn emit_concat_to_buffer(
     code.extend_from_slice(&static_total.to_le_bytes());
     // For each text-field arg, strlen the pointer at its rbp slot and add
     // the length into rax. push/pop rax brackets each strlen since it
-    // clobbers rax.
+    // clobbers rax. For bound-text args, the length is already stored in a
+    // rbp slot — just add it directly.
     for (arg, kind) in args.iter().zip(kinds.iter()) {
-        if *kind == ConcatArgKind::Text {
-            if let Expr::Field(_, field_name) = arg {
-                let offset = *offsets.get(field_name.as_str()).ok_or_else(|| NativeError {
-                    message: format!(
-                        "text-field '{}' has no rbp slot in concat size calc — input parsing missed it",
-                        field_name
-                    ),
-                })?;
-                // push rax
-                code.push(0x50);
-                // mov rsi, [rbp + offset]
-                if offset >= -128 {
-                    code.extend_from_slice(&[0x48, 0x8B, 0x75]);
-                    code.push(offset as u8);
-                } else {
-                    code.extend_from_slice(&[0x48, 0x8B, 0xB5]);
-                    code.extend_from_slice(&offset.to_le_bytes());
+        match *kind {
+            ConcatArgKind::Text => {
+                if let Expr::Field(_, field_name) = arg {
+                    let offset = *offsets.get(field_name.as_str()).ok_or_else(|| NativeError {
+                        message: format!(
+                            "text-field '{}' has no rbp slot in concat size calc — input parsing missed it",
+                            field_name
+                        ),
+                    })?;
+                    // push rax
+                    code.push(0x50);
+                    // mov rsi, [rbp + offset]
+                    if offset >= -128 {
+                        code.extend_from_slice(&[0x48, 0x8B, 0x75]);
+                        code.push(offset as u8);
+                    } else {
+                        code.extend_from_slice(&[0x48, 0x8B, 0xB5]);
+                        code.extend_from_slice(&offset.to_le_bytes());
+                    }
+                    emit_strlen(code); // rdx = length, rsi unchanged
+                    // pop rcx  (restore accumulated total into rcx; rax clobbered by strlen)
+                    code.push(0x59);
+                    // add rcx, rdx ; mov rax, rcx
+                    code.extend_from_slice(&[0x48, 0x01, 0xD1]);
+                    code.extend_from_slice(&[0x48, 0x89, 0xC8]);
                 }
-                emit_strlen(code); // rdx = length, rsi unchanged
-                // pop rcx  (restore accumulated total into rcx; rax clobbered by strlen)
-                code.push(0x59);
-                // add rcx, rdx ; mov rax, rcx
-                code.extend_from_slice(&[0x48, 0x01, 0xD1]);
-                code.extend_from_slice(&[0x48, 0x89, 0xC8]);
             }
+            ConcatArgKind::BoundText => {
+                if let Expr::Ident(name) = arg {
+                    let (_, len_slot) = *text_bindings.get(name.as_str()).expect("classified as BoundText so present in bindings");
+                    // add rax, [rbp + len_slot]   (48 03 ModRM [disp])
+                    if len_slot >= -128 {
+                        code.extend_from_slice(&[0x48, 0x03, 0x45]);
+                        code.push(len_slot as u8);
+                    } else {
+                        code.extend_from_slice(&[0x48, 0x03, 0x85]);
+                        code.extend_from_slice(&len_slot.to_le_bytes());
+                    }
+                }
+            }
+            _ => {}
         }
     }
     // Round up to 8 for alignment: add rax, 7 ; and rax, ~7
@@ -755,7 +816,7 @@ fn emit_concat_to_buffer(
     code.extend_from_slice(&[0x48, 0x89, 0xE3]);
     code.extend_from_slice(&[0x49, 0x89, 0xDA]);
 
-    emit_concat_fill(code, args, &kinds, input_name, concept, all_rules, offsets, field_ranges)?;
+    emit_concat_fill(code, args, &kinds, input_name, concept, all_rules, offsets, field_ranges, text_bindings)?;
 
     // rax = buffer base, rdx = length
     code.extend_from_slice(&[0x4C, 0x89, 0xD0]); // mov rax, r10
@@ -779,6 +840,7 @@ fn emit_concat_fill(
     all_rules: &HashMap<&str, &Rule>,
     offsets: &HashMap<&str, i32>,
     field_ranges: &HashMap<&str, (i64, i64)>,
+    text_bindings: &TextBindings<'_>,
 ) -> Result<(), NativeError> {
 
     for (i, arg) in args.iter().enumerate() {
@@ -825,6 +887,35 @@ fn emit_concat_fill(
                 // itoa into buffer (rax → decimal digits at [rbx], rbx advanced)
                 emit_itoa_to_buffer(code);
             }
+            ConcatArgKind::BoundText => {
+                // Copy the bound (ptr, len) contents to the buffer.
+                // No strlen needed at fill time — length is already stored.
+                if let Expr::Ident(name) = arg {
+                    let (ptr_slot, len_slot) = *text_bindings
+                        .get(name.as_str())
+                        .expect("classified as BoundText so present in bindings");
+                    // mov rsi, [rbp + ptr_slot]
+                    if ptr_slot >= -128 {
+                        code.extend_from_slice(&[0x48, 0x8B, 0x75]);
+                        code.push(ptr_slot as u8);
+                    } else {
+                        code.extend_from_slice(&[0x48, 0x8B, 0xB5]);
+                        code.extend_from_slice(&ptr_slot.to_le_bytes());
+                    }
+                    // mov rcx, [rbp + len_slot]
+                    if len_slot >= -128 {
+                        code.extend_from_slice(&[0x48, 0x8B, 0x4D]);
+                        code.push(len_slot as u8);
+                    } else {
+                        code.extend_from_slice(&[0x48, 0x8B, 0x8D]);
+                        code.extend_from_slice(&len_slot.to_le_bytes());
+                    }
+                    // mov rdi, rbx ; rep movsb ; mov rbx, rdi
+                    code.extend_from_slice(&[0x48, 0x89, 0xDF]);
+                    code.extend_from_slice(&[0xF3, 0xA4]);
+                    code.extend_from_slice(&[0x48, 0x89, 0xFB]);
+                }
+            }
         }
         // If the arg is a Text FIELD (not a literal), emit strlen + rep movsb
         // at runtime. The field's value is a pointer stored at `offsets[field]`.
@@ -858,6 +949,12 @@ fn emit_concat_fill(
     }
 
     Ok(())
+}
+
+/// Empty text-bindings map for call sites that don't need text binding.
+/// HashMap::new() doesn't allocate until first insert, so this is cheap.
+fn no_text_bindings() -> TextBindings<'static> {
+    HashMap::new()
 }
 
 /// Emit the machine-code sequence for a single `append_file "path" "content"`
@@ -935,6 +1032,7 @@ fn emit_append_file_call(
             // reported by emit_concat_to_buffer.
             let buf = emit_concat_to_buffer(
                 code, args, &rule.input_name, concept, all_rules, offsets, field_ranges,
+                &no_text_bindings(),
             )?;
             // At this point: rax = buf ptr, rdx = length, fd still in r15.
             // mov rsi, rax — write syscall wants source in rsi
@@ -1179,7 +1277,36 @@ fn emit_text_write_to_fd(
     all_rules: &HashMap<&str, &Rule>,
     offsets: &HashMap<&str, i32>,
     field_ranges: &HashMap<&str, (i64, i64)>,
+    text_bindings: &TextBindings<'_>,
 ) -> Result<(), NativeError> {
+    // Phase 2F: bound text var — (ptr, len) already in two rbp slots.
+    // Write them directly to the fd; no strlen (length is stored).
+    if let Expr::Ident(name) = text_expr {
+        if let Some(&(ptr_slot, len_slot)) = text_bindings.get(name.as_str()) {
+            // mov rsi, [rbp + ptr_slot]
+            if ptr_slot >= -128 {
+                code.extend_from_slice(&[0x48, 0x8B, 0x75]);
+                code.push(ptr_slot as u8);
+            } else {
+                code.extend_from_slice(&[0x48, 0x8B, 0xB5]);
+                code.extend_from_slice(&ptr_slot.to_le_bytes());
+            }
+            // mov rdx, [rbp + len_slot]
+            if len_slot >= -128 {
+                code.extend_from_slice(&[0x48, 0x8B, 0x55]);
+                code.push(len_slot as u8);
+            } else {
+                code.extend_from_slice(&[0x48, 0x8B, 0x95]);
+                code.extend_from_slice(&len_slot.to_le_bytes());
+            }
+            // mov rax, 1 (sys_write) ; mov rdi, fd ; syscall
+            code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x01, 0x00, 0x00, 0x00]);
+            code.extend_from_slice(&[0x48, 0xC7, 0xC7]);
+            code.extend_from_slice(&fd.to_le_bytes());
+            code.extend_from_slice(&[0x0F, 0x05]);
+            return Ok(());
+        }
+    }
     // Special case: a Field access on a text-typed input field. The pointer
     // is in the rbp slot (stored at field-loading time). Length is recovered
     // via emit_strlen — argv strings are NUL-terminated so this is exact.
@@ -1245,7 +1372,7 @@ fn emit_text_write_to_fd(
         }
         Expr::Concat(args) => {
             let buf = emit_concat_to_buffer(
-                code, args, input_name, concept, all_rules, offsets, field_ranges,
+                code, args, input_name, concept, all_rules, offsets, field_ranges, text_bindings,
             )?;
             // rax = buf ptr, rdx = length.
             // mov rsi, rax
@@ -1344,6 +1471,12 @@ fn emit_result_program(
 
     // Evaluate the logic in Result context. Every Ok/Err leaf self-terminates
     // with a jmp loop_top, so there is no fall-through to handle here.
+    let slots = MatchSlots {
+        match_slot: ctx.match_slot,
+        err_ptr_slot: ctx.err_ptr_slot,
+        err_len_slot: ctx.err_len_slot,
+        err_frame_save_slot: ctx.err_frame_save_slot,
+    };
     emit_eval_result_expr(
         &mut code,
         &rule.logic.value,
@@ -1353,11 +1486,33 @@ fn emit_result_program(
         all_rules,
         &ctx.binding_offsets,
         &ctx.field_ranges,
-        ctx.match_slot,
+        slots,
     )?;
 
     emit_record_loop_epilogue(&mut code, &ctx);
     Ok(code)
+}
+
+/// Rbp slots reserved at the bottom of the frame for `match_result` state.
+/// Passed as a group through `emit_eval_result_expr` and
+/// `emit_match_result_inlined` / `emit_redirect_callee_leaves` so each
+/// helper knows where to read/write the Ok-bound value, the Err-bound
+/// text (ptr, len), and the saved rsp for buffer cleanup.
+#[derive(Debug, Clone, Copy)]
+struct MatchSlots {
+    /// Phase 2D: where the Ok-bound scalar value lands before the outer Ok
+    /// body runs. A single i64 slot.
+    match_slot: i32,
+    /// Phase 2F: pointer half of the Err-bound text (when the outer Err
+    /// arm captures the err value instead of passing it through).
+    err_ptr_slot: i32,
+    /// Phase 2F: length half of the Err-bound text.
+    err_len_slot: i32,
+    /// Phase 2F: rsp captured just before the inlined callee's Err leaf
+    /// runs; restoring rsp to this value at the end of the outer Err arm
+    /// frees any buffer the callee's Err concat allocated. A no-op when
+    /// the callee's Err was a literal or field access.
+    err_frame_save_slot: i32,
 }
 
 /// Emit code for an expression that produces a Result(number, text). Each
@@ -1373,7 +1528,7 @@ fn emit_eval_result_expr(
     all_rules: &HashMap<&str, &Rule>,
     offsets: &HashMap<&str, i32>,
     field_ranges: &HashMap<&str, (i64, i64)>,
-    match_slot: i32,
+    slots: MatchSlots,
 ) -> Result<(), NativeError> {
     // Extract the declared (T, E) from the rule's Result(T, E) output so the
     // Ok arm emits the right write for its declared type.
@@ -1397,6 +1552,7 @@ fn emit_eval_result_expr(
                     // stdout (fd 1), then append a newline symmetric to itoa.
                     emit_text_write_to_fd(
                         code, inner, 1, &rule.input_name, concept, all_rules, offsets, field_ranges,
+                        &no_text_bindings(),
                     )?;
                     emit_write_newline(code, 1);
                 }
@@ -1420,6 +1576,7 @@ fn emit_eval_result_expr(
             // (fd 2), then a newline so multi-record runs separate cleanly.
             emit_text_write_to_fd(
                 code, inner, 2, &rule.input_name, concept, all_rules, offsets, field_ranges,
+                &no_text_bindings(),
             )?;
             emit_write_newline(code, 2);
             // jmp loop_top
@@ -1440,7 +1597,7 @@ fn emit_eval_result_expr(
 
             // .then — each leaf self-terminates with jmp loop_top.
             emit_eval_result_expr(
-                code, then_e, loop_top, rule, concept, all_rules, offsets, field_ranges, match_slot,
+                code, then_e, loop_top, rule, concept, all_rules, offsets, field_ranges, slots,
             )?;
 
             // .else:
@@ -1448,22 +1605,16 @@ fn emit_eval_result_expr(
             let else_off = else_pos as i32 - (else_patch as i32 + 4);
             code[else_patch..else_patch + 4].copy_from_slice(&else_off.to_le_bytes());
             emit_eval_result_expr(
-                code, else_e, loop_top, rule, concept, all_rules, offsets, field_ranges, match_slot,
+                code, else_e, loop_top, rule, concept, all_rules, offsets, field_ranges, slots,
             )?;
             Ok(())
         }
         Expr::MatchResult(target, ok_var, ok_body, err_var, err_body) => {
-            // Phase 2D scope (narrow): support only the discounted_purchase
-            // shape — target is a rule call on the outer rule's input,
-            // ok_arm is `Ok(<expr using ok_var>)`, err_arm is `Err(Ident(err_var))`
-            // (pure pass-through of the inner Err's text).
-            //
-            // Why narrow: a fully general match_result in native needs either
-            // a tagged Result calling convention for callees or fully general
-            // bound-var slot management for arbitrary text values. Both are
-            // significantly more design surface; the narrow form here covers
-            // the common compose-validators-then-transform pattern without
-            // committing to either.
+            // Phase 2D + 2F: inline the callee's Result-producing logic,
+            // redirecting its Ok leaves into the outer Ok arm (Ok-bound value
+            // lands at match_slot) and its Err leaves into the outer Err arm
+            // (Err-bound text captured to err_ptr_slot/err_len_slot, then the
+            // outer Err body runs with `err_var → (ptr, len)` bound).
             emit_match_result_inlined(
                 code,
                 target,
@@ -1477,7 +1628,7 @@ fn emit_eval_result_expr(
                 all_rules,
                 offsets,
                 field_ranges,
-                match_slot,
+                slots,
             )
         }
         other => Err(NativeError {
@@ -1525,18 +1676,19 @@ fn emit_match_result_inlined(
     all_rules: &HashMap<&str, &Rule>,
     offsets: &HashMap<&str, i32>,
     field_ranges: &HashMap<&str, (i64, i64)>,
-    match_slot: i32,
+    slots: MatchSlots,
 ) -> Result<(), NativeError> {
-    // Validate the outer Err arm is the pass-through shape.
-    let err_passthrough = match err_body {
-        Expr::Err(inner) => matches!(inner.as_ref(), Expr::Ident(n) if n == err_var),
-        _ => false,
+    // The outer Err body must be `Err(<text_expr>)`. Phase 2F accepts any
+    // text_expr that emit_text_write_to_fd can handle — literal, input text
+    // field, Ident(err_var), or concat with any of those plus Ident(err_var).
+    let outer_err_inner = match err_body {
+        Expr::Err(inner) => inner.as_ref(),
+        _ => {
+            return Err(NativeError {
+                message: "match_result outer Err arm must be of the form `Err(<text_expr>)`".into(),
+            });
+        }
     };
-    if !err_passthrough {
-        return Err(NativeError {
-            message: "match_result Err arm in native today must be the pass-through `Err(<err_var>)`; richer Err transforms are deferred".into(),
-        });
-    }
 
     // Validate target is Call(callee, [Ident(input)]).
     let (callee_name, _arg) = match target {
@@ -1581,13 +1733,15 @@ fn emit_match_result_inlined(
         callee,
         ok_var,
         ok_body,
+        err_var,
+        outer_err_inner,
         loop_top,
         rule,
         concept,
         all_rules,
         offsets,
         field_ranges,
-        match_slot,
+        slots,
     )
 }
 
@@ -1597,13 +1751,15 @@ fn emit_redirect_callee_leaves(
     callee: &Rule,
     ok_var: &str,
     ok_body: &Expr,
+    err_var: &str,
+    outer_err_inner: &Expr,
     loop_top: usize,
     outer_rule: &Rule,
     concept: &Concept,
     all_rules: &HashMap<&str, &Rule>,
     offsets: &HashMap<&str, i32>,
     field_ranges: &HashMap<&str, (i64, i64)>,
-    match_slot: i32,
+    slots: MatchSlots,
 ) -> Result<(), NativeError> {
     match expr {
         Expr::Ok(inner) => {
@@ -1622,17 +1778,11 @@ fn emit_redirect_callee_leaves(
             // Evaluate Ok's inner (a number) → rax.
             emit_eval_expr(code, inner, &outer_rule.input_name, offsets, all_rules, field_ranges)?;
             // Store at match_slot.
-            if match_slot >= -128 {
-                code.extend_from_slice(&[0x48, 0x89, 0x45]);
-                code.push(match_slot as u8);
-            } else {
-                code.extend_from_slice(&[0x48, 0x89, 0x85]);
-                code.extend_from_slice(&match_slot.to_le_bytes());
-            }
+            store_rax_at_rbp(code, slots.match_slot);
             // Augment offsets with ok_var → match_slot, then emit outer ok_body
             // in result context. The outer arm self-terminates.
             let mut augmented = offsets.clone();
-            augmented.insert(ok_var, match_slot);
+            augmented.insert(ok_var, slots.match_slot);
             emit_eval_result_expr(
                 code,
                 ok_body,
@@ -1642,17 +1792,140 @@ fn emit_redirect_callee_leaves(
                 all_rules,
                 &augmented,
                 field_ranges,
-                match_slot,
+                slots,
             )
         }
         Expr::Err(inner) => {
-            // Pass-through to outer Err: write the inner text directly to
-            // stderr, append newline, jmp loop_top. No binding needed.
+            // Phase 2F: capture the callee's Err into (err_ptr_slot,
+            // err_len_slot). Save rsp first so the outer arm's cleanup can
+            // free whatever buffer the capture allocated (concat case only;
+            // literal/field cases don't allocate but the save is harmless).
+
+            // 1. mov [rbp + err_frame_save_slot], rsp
+            emit_mov_rbp_disp_from_reg(code, slots.err_frame_save_slot, /* r_is_rsp= */ true);
+
+            // 2. Capture the Err value per inner shape.
+            match &**inner {
+                Expr::Text(s) => {
+                    // Inline literal bytes; lea rax at them; store (ptr, len).
+                    let bytes = s.as_bytes();
+                    let n = bytes.len() as i32;
+                    if n <= 127 {
+                        code.push(0xEB);
+                        code.push(n as u8);
+                    } else {
+                        code.push(0xE9);
+                        code.extend_from_slice(&n.to_le_bytes());
+                    }
+                    let data_addr = code.len();
+                    code.extend_from_slice(bytes);
+                    // lea rax, [rip + rel32] — 48 8D 05 rel32
+                    let end = code.len() + 7;
+                    let rel32 = data_addr as i32 - end as i32;
+                    code.extend_from_slice(&[0x48, 0x8D, 0x05]);
+                    code.extend_from_slice(&rel32.to_le_bytes());
+                    store_rax_at_rbp(code, slots.err_ptr_slot);
+                    // mov qword [rbp + err_len_slot], n (imm32 sign-extended)
+                    if slots.err_len_slot >= -128 {
+                        code.extend_from_slice(&[0x48, 0xC7, 0x45]);
+                        code.push(slots.err_len_slot as u8);
+                    } else {
+                        code.extend_from_slice(&[0x48, 0xC7, 0x85]);
+                        code.extend_from_slice(&slots.err_len_slot.to_le_bytes());
+                    }
+                    code.extend_from_slice(&n.to_le_bytes());
+                }
+                Expr::Field(base, field_name)
+                    if matches!(base.as_ref(), Expr::Ident(n) if n == &outer_rule.input_name) =>
+                {
+                    let f = concept
+                        .fields
+                        .iter()
+                        .find(|f| &f.name == field_name)
+                        .ok_or_else(|| NativeError {
+                            message: format!("unknown field '{}' in match_result Err capture", field_name),
+                        })?;
+                    if !matches!(f.ty, Type::Text) {
+                        return Err(NativeError {
+                            message: format!(
+                                "match_result Err inner Field '{}' must be text-typed",
+                                field_name
+                            ),
+                        });
+                    }
+                    let offset = offsets[field_name.as_str()];
+                    // mov rax, [rbp+offset] — load ptr
+                    if offset >= -128 {
+                        code.extend_from_slice(&[0x48, 0x8B, 0x45]);
+                        code.push(offset as u8);
+                    } else {
+                        code.extend_from_slice(&[0x48, 0x8B, 0x85]);
+                        code.extend_from_slice(&offset.to_le_bytes());
+                    }
+                    store_rax_at_rbp(code, slots.err_ptr_slot);
+                    // mov rsi, rax ; emit_strlen → rdx = length
+                    code.extend_from_slice(&[0x48, 0x89, 0xC6]);
+                    emit_strlen(code);
+                    // mov [rbp + err_len_slot], rdx
+                    if slots.err_len_slot >= -128 {
+                        code.extend_from_slice(&[0x48, 0x89, 0x55]);
+                        code.push(slots.err_len_slot as u8);
+                    } else {
+                        code.extend_from_slice(&[0x48, 0x89, 0x95]);
+                        code.extend_from_slice(&slots.err_len_slot.to_le_bytes());
+                    }
+                }
+                Expr::Concat(args) => {
+                    // Build the concat buffer; get (rax=ptr, rdx=len).
+                    // The buffer stays alive across the outer arm; cleanup
+                    // via `mov rsp, [rbp+err_frame_save_slot]` at the end.
+                    let _buf = emit_concat_to_buffer(
+                        code, args, &outer_rule.input_name, concept, all_rules,
+                        offsets, field_ranges, &no_text_bindings(),
+                    )?;
+                    store_rax_at_rbp(code, slots.err_ptr_slot);
+                    // mov [rbp + err_len_slot], rdx
+                    if slots.err_len_slot >= -128 {
+                        code.extend_from_slice(&[0x48, 0x89, 0x55]);
+                        code.push(slots.err_len_slot as u8);
+                    } else {
+                        code.extend_from_slice(&[0x48, 0x89, 0x95]);
+                        code.extend_from_slice(&slots.err_len_slot.to_le_bytes());
+                    }
+                }
+                other => {
+                    return Err(NativeError {
+                        message: format!(
+                            "match_result callee Err inner must be a text literal, input text field, or concat; got {:?}",
+                            other
+                        ),
+                    });
+                }
+            }
+
+            // 3. Build bindings for err_var and emit the outer Err body's
+            //    text into stderr.
+            let mut bindings: TextBindings = HashMap::new();
+            bindings.insert(err_var, (slots.err_ptr_slot, slots.err_len_slot));
             emit_text_write_to_fd(
-                code, inner, 2, &outer_rule.input_name, concept, all_rules, offsets, field_ranges,
+                code, outer_err_inner, 2, &outer_rule.input_name, concept, all_rules,
+                offsets, field_ranges, &bindings,
             )?;
             emit_write_newline(code, 2);
-            // jmp loop_top
+
+            // 4. Restore rsp to pre-capture — frees the callee's concat
+            //    buffer (if any). Harmless when no concat happened.
+            if slots.err_frame_save_slot >= -128 {
+                code.extend_from_slice(&[0x48, 0x8B, 0x45]);
+                code.push(slots.err_frame_save_slot as u8);
+            } else {
+                code.extend_from_slice(&[0x48, 0x8B, 0x85]);
+                code.extend_from_slice(&slots.err_frame_save_slot.to_le_bytes());
+            }
+            // mov rsp, rax
+            code.extend_from_slice(&[0x48, 0x89, 0xC4]);
+
+            // 5. jmp loop_top
             code.push(0xE9);
             let off = loop_top as i32 - (code.len() + 4) as i32;
             code.extend_from_slice(&off.to_le_bytes());
@@ -1667,16 +1940,16 @@ fn emit_redirect_callee_leaves(
             code.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
 
             emit_redirect_callee_leaves(
-                code, then_e, callee, ok_var, ok_body, loop_top,
-                outer_rule, concept, all_rules, offsets, field_ranges, match_slot,
+                code, then_e, callee, ok_var, ok_body, err_var, outer_err_inner, loop_top,
+                outer_rule, concept, all_rules, offsets, field_ranges, slots,
             )?;
 
             let else_pos = code.len();
             let else_off = else_pos as i32 - (else_patch as i32 + 4);
             code[else_patch..else_patch + 4].copy_from_slice(&else_off.to_le_bytes());
             emit_redirect_callee_leaves(
-                code, else_e, callee, ok_var, ok_body, loop_top,
-                outer_rule, concept, all_rules, offsets, field_ranges, match_slot,
+                code, else_e, callee, ok_var, ok_body, err_var, outer_err_inner, loop_top,
+                outer_rule, concept, all_rules, offsets, field_ranges, slots,
             )?;
             Ok(())
         }
@@ -1686,6 +1959,23 @@ fn emit_redirect_callee_leaves(
                 other
             ),
         }),
+    }
+}
+
+/// Emit `mov [rbp + disp], rsp` (or `mov [rbp + disp], rax` if `!r_is_rsp`).
+/// Used by Phase 2F to save rsp into `err_frame_save_slot`.
+fn emit_mov_rbp_disp_from_reg(code: &mut Vec<u8>, disp: i32, r_is_rsp: bool) {
+    // REX.W + 0x89 + ModRM(reg=rsp(100) or rax(000), r/m=rbp(101), mod per disp)
+    let reg_field: u8 = if r_is_rsp { 0b100 } else { 0b000 };
+    if disp >= -128 {
+        // mod=01 disp8
+        let modrm = 0b01_000_000 | (reg_field << 3) | 0b101;
+        code.extend_from_slice(&[0x48, 0x89, modrm]);
+        code.push(disp as u8);
+    } else {
+        let modrm = 0b10_000_000 | (reg_field << 3) | 0b101;
+        code.extend_from_slice(&[0x48, 0x89, modrm]);
+        code.extend_from_slice(&disp.to_le_bytes());
     }
 }
 
@@ -2030,6 +2320,7 @@ fn emit_collection_program(
                 emit_text_write_to_fd(
                     &mut code, body, 1, lambda_var, input_elem_concept, all_rules,
                     &elem_offsets, &field_ranges,
+                    &no_text_bindings(),
                 )?;
                 emit_write_newline(&mut code, 1);
             } else {
@@ -2505,10 +2796,16 @@ fn emit_text_fold_program(
     // Classify rest args. The lambda var `item` is the "input" for field
     // accesses within them.
     let mut rest_kinds: Vec<ConcatArgKind> = Vec::with_capacity(rest_args.len());
+    let empty_bindings = no_text_bindings();
     for arg in rest_args {
-        let k = classify_concat_arg(arg, elem_concept, item_name).ok_or_else(|| NativeError {
+        let k = classify_concat_arg(arg, elem_concept, item_name, &empty_bindings).ok_or_else(|| NativeError {
             message: "Phase 5b: fold-body concat arg must be a text literal, number expression, or element text field".into(),
         })?;
+        if k == ConcatArgKind::BoundText {
+            return Err(NativeError {
+                message: "Phase 5b: fold body cannot reference bound text vars (no match_result inside fold bodies in native today)".into(),
+            });
+        }
         rest_kinds.push(k);
     }
 
@@ -2525,6 +2822,7 @@ fn emit_text_fold_program(
             ConcatArgKind::Number => {
                 static_per_element += 21;
             }
+            ConcatArgKind::BoundText => unreachable!("BoundText rejected above"),
         }
     }
 
@@ -2769,6 +3067,7 @@ fn emit_text_fold_program(
         all_rules,
         &elem_offsets,
         &field_ranges,
+        &empty_bindings,
     )?;
 
     // dec r15 ; jmp fill_loop_top
@@ -2982,6 +3281,7 @@ fn emit_record_as_json(
                     all_rules,
                     offsets,
                     field_ranges,
+                    &no_text_bindings(),
                 )?;
                 emit_write_static_to_fd(code, b"\"", 1);
             }
@@ -4506,6 +4806,31 @@ mod tests {
             .expect("native compile of text-field-through-record should succeed");
         let size = fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
         assert!(size > 300 && size < 2_500, "unexpected binary size: {}", size);
+        let _ = fs::remove_file(out);
+    }
+
+    #[test]
+    fn native_compiles_match_result_with_enriched_err() {
+        // Phase 2F: enrich.verbose's `enriched` rule wraps validate_amount
+        // with an outer match_result whose Err arm is:
+        //   Err(concat("[", p.user, "] ", e))
+        // Exercises the capture-then-bind flow: the inlined callee's Err
+        // leaf writes (ptr, len) to err_ptr_slot / err_len_slot, saves rsp
+        // to err_frame_save_slot, then the outer Err body evaluates with
+        // err_var bound — concat reads the text field AND the bound text
+        // in the same buffer build. At the end `mov rsp, [rbp+err_frame_save_slot]`
+        // frees whatever the callee's Err concat allocated.
+        use std::fs;
+        let src = fs::read_to_string("examples/enrich.verbose")
+            .expect("examples/enrich.verbose is expected to exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let out = std::env::temp_dir().join("verbosec_test_enrich");
+        compile_native(&program, "enriched", out.to_str().unwrap())
+            .expect("native compile of match_result enrich should succeed");
+        let size = fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
+        assert!(size > 500 && size < 2_500, "unexpected binary size: {}", size);
         let _ = fs::remove_file(out);
     }
 

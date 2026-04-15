@@ -1,0 +1,76 @@
+@verbose 0.1.0
+
+-- Phase 2F: match_result with a non-pass-through Err arm. The outer Err
+-- captures the inlined callee's Err value via two rbp slots (ptr, len),
+-- then builds an enriched error message using the captured value plus
+-- input context. Ok path unchanged — the Ok-bound scalar lands in
+-- match_slot and feeds the outer transformation.
+--
+-- Stream convention: Ok(number) writes the digits to stdout, Err(text)
+-- writes the message to stderr. Exit is always 0 — shell callers
+-- separate success from failure by stream, not by exit code.
+
+
+concept Purchase
+  @intention: "A purchase has a user and an amount"
+  @source: enrich.intent:1
+
+  fields:
+    user   : text
+    amount : number [0, 1000000]
+
+
+rule validate_amount
+  @intention: "A purchase is valid when the amount does not exceed 1000"
+  @source: enrich.intent:2
+
+  input:
+    p : Purchase
+
+  output:
+    r : Result(number, text)
+
+  logic:
+    r = if p.amount > 1000 then Err("too large") else Ok(p.amount)
+
+  proofs:
+    purity:
+      reads   : [p.amount]
+      writes  : []
+      calls   : []
+      verdict : pure
+    termination:
+      form  : constant_bound
+      bound : 5
+    determinism:
+      form : total
+
+
+rule enriched
+  @intention: "Wrap validate_amount: double on Ok, prefix the user on Err"
+  @source: enrich.intent:3
+
+  input:
+    p : Purchase
+
+  output:
+    out : Result(number, text)
+
+  logic:
+    out = match_result(
+      validate_amount(p),
+      v => Ok(v * 2),
+      e => Err(concat("[", p.user, "] ", e))
+    )
+
+  proofs:
+    purity:
+      reads   : [p, p.user]
+      writes  : []
+      calls   : [validate_amount]
+      verdict : pure
+    termination:
+      form  : constant_bound
+      bound : 10
+    determinism:
+      form : total
