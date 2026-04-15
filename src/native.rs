@@ -1646,59 +1646,50 @@ fn emit_collection_program(
         }
     }
 
-    // Logic shape: Map or Filter on input.<coll_field>.
-    let (is_filter, lambda_var, body) = match &rule.logic.value {
-        Expr::Map(c, v, b) => (false, v.as_str(), b.as_ref()),
-        Expr::Filter(c, _v, _b) => {
-            let _ = c;
-            return Err(NativeError {
-                message: "filter in native collection output is deferred to Phase 3.1 — starting with map only".into(),
-            });
-            // (unreachable — leaving the destructure for future reference)
-            #[allow(unreachable_code)]
-            (true, "", &rule.logic.value)
+    // Logic shape: Map or Filter over input.<coll_field>.
+    enum CollectionOp<'a> {
+        /// map(coll, var => Record { ... }) — record constructor body.
+        Map { lambda_var: &'a str, body_fields: &'a [(String, Expr)] },
+        /// filter(coll, var => predicate) — element passes through if true.
+        Filter { lambda_var: &'a str, predicate: &'a Expr },
+    }
+    let op: CollectionOp = match &rule.logic.value {
+        Expr::Map(coll_expr, v, b) => {
+            verify_collection_target(coll_expr, &rule.input_name, &coll_field.name)?;
+            let (body_concept_name, body_fields) = match b.as_ref() {
+                Expr::Record(name, fields) => (name.as_str(), fields.as_slice()),
+                _ => return Err(NativeError {
+                    message: "map body must be a Record constructor in Phase 3 v1".into(),
+                }),
+            };
+            if body_concept_name != output_elem_concept.name.as_str() {
+                return Err(NativeError {
+                    message: format!(
+                        "map body produces '{}' but output collection element is '{}'",
+                        body_concept_name, output_elem_concept.name
+                    ),
+                });
+            }
+            CollectionOp::Map { lambda_var: v.as_str(), body_fields }
+        }
+        Expr::Filter(coll_expr, v, pred) => {
+            verify_collection_target(coll_expr, &rule.input_name, &coll_field.name)?;
+            // Filter preserves element type — output element concept must match
+            // the input element concept.
+            if output_elem_concept.name != input_elem_concept.name {
+                return Err(NativeError {
+                    message: format!(
+                        "filter output collection must match input element type: input is collection({}) but output is collection({})",
+                        input_elem_concept.name, output_elem_concept.name
+                    ),
+                });
+            }
+            CollectionOp::Filter { lambda_var: v.as_str(), predicate: pred.as_ref() }
         }
         _ => return Err(NativeError {
-            message: "collection-output rule logic must be map(...) at top level (filter comes in 3.1)".into(),
+            message: "collection-output rule logic must be map(...) or filter(...) at top level".into(),
         }),
     };
-    let _ = is_filter;
-    // Verify map target is `input.<coll_field>`.
-    let coll_expr = match &rule.logic.value {
-        Expr::Map(c, _, _) => c.as_ref(),
-        _ => unreachable!(),
-    };
-    match coll_expr {
-        Expr::Field(base, name)
-            if matches!(base.as_ref(), Expr::Ident(n) if n == &rule.input_name)
-                && name == &coll_field.name => {}
-        _ => {
-            return Err(NativeError {
-                message: format!(
-                    "map target must be `{}.{}`",
-                    rule.input_name, coll_field.name
-                ),
-            });
-        }
-    }
-
-    // Body must be a Record constructor of the output element type.
-    let (body_concept_name, body_fields) = match body {
-        Expr::Record(name, fields) => (name.as_str(), fields.as_slice()),
-        _ => {
-            return Err(NativeError {
-                message: "map body must be a Record constructor in Phase 3 v1".into(),
-            });
-        }
-    };
-    if body_concept_name != output_elem_concept.name.as_str() {
-        return Err(NativeError {
-            message: format!(
-                "map body produces '{}' but output collection element is '{}'",
-                body_concept_name, output_elem_concept.name
-            ),
-        });
-    }
 
     // ===== Emission =====
     let n_scalar = scalar_fields.len();
@@ -1780,20 +1771,70 @@ fn emit_collection_program(
         code.extend_from_slice(&[0x49, 0xFF, 0xC6]); // inc r14
     }
 
-    // Evaluate the map body: emit the Record as JSON + newline.
-    // Lambda var is the "input name" for field resolution (e.g. e.name → offsets[name]).
+    // Evaluate the body or predicate. Lambda var is the "input name" so
+    // `e.salary` resolves to the element-field slot populated above.
     let field_ranges = build_field_ranges(input_elem_concept);
-    emit_record_as_json(
-        &mut code,
-        body_fields,
-        output_elem_concept,
-        lambda_var,
-        input_elem_concept,
-        all_rules,
-        &elem_offsets,
-        &field_ranges,
-    )?;
-    // emit_record_as_json emits the trailing "}\n" itself — no extra newline here.
+    match op {
+        CollectionOp::Map { lambda_var, body_fields } => {
+            // Emit the constructed Record as one JSON line. The record's
+            // trailing "}\n" IS the per-element separator — no extra newline.
+            emit_record_as_json(
+                &mut code,
+                body_fields,
+                output_elem_concept,
+                lambda_var,
+                input_elem_concept,
+                all_rules,
+                &elem_offsets,
+                &field_ranges,
+            )?;
+        }
+        CollectionOp::Filter { lambda_var, predicate } => {
+            // Evaluate the predicate → rax (0 = skip, non-zero = keep).
+            emit_eval_expr(
+                &mut code, predicate, lambda_var, &elem_offsets, all_rules, &field_ranges,
+            )?;
+            // test rax, rax ; je skip_emit (rel32, patched after the write block).
+            code.extend_from_slice(&[0x48, 0x85, 0xC0]);
+            code.push(0x0F);
+            code.push(0x84);
+            let skip_patch = code.len();
+            code.extend_from_slice(&[0, 0, 0, 0]);
+
+            // Emit the element as identity JSON: synthesize a Record whose
+            // fields are `e.<field>` Field accesses, reusing the same
+            // emit_record_as_json plumbing map uses. No runtime cost — the
+            // synthesis is compile-time.
+            let synthetic_fields: Vec<(String, Expr)> = input_elem_concept
+                .fields
+                .iter()
+                .map(|f| {
+                    (
+                        f.name.clone(),
+                        Expr::Field(
+                            Box::new(Expr::Ident(lambda_var.to_string())),
+                            f.name.clone(),
+                        ),
+                    )
+                })
+                .collect();
+            emit_record_as_json(
+                &mut code,
+                &synthetic_fields,
+                input_elem_concept, // output elem == input elem for filter
+                lambda_var,
+                input_elem_concept,
+                all_rules,
+                &elem_offsets,
+                &field_ranges,
+            )?;
+
+            // skip_emit:
+            let skip_pos = code.len();
+            let skip_off = skip_pos as i32 - (skip_patch as i32 + 4);
+            code[skip_patch..skip_patch + 4].copy_from_slice(&skip_off.to_le_bytes());
+        }
+    }
 
     // dec r15 ; jmp inner_loop_top (rel32).
     code.extend_from_slice(&[0x49, 0xFF, 0xCF]); // dec r15
@@ -1820,6 +1861,29 @@ fn emit_collection_program(
     code.extend_from_slice(&[0x0F, 0x05]); // syscall
 
     Ok(code)
+}
+
+/// Verify a collection-op (map/filter) target is `input.<coll_field>`.
+/// Used by both the Map and Filter branches of emit_collection_program.
+fn verify_collection_target(
+    expr: &Expr,
+    input_name: &str,
+    coll_field_name: &str,
+) -> Result<(), NativeError> {
+    match expr {
+        Expr::Field(base, name)
+            if matches!(base.as_ref(), Expr::Ident(n) if n == input_name)
+                && name == coll_field_name =>
+        {
+            Ok(())
+        }
+        _ => Err(NativeError {
+            message: format!(
+                "collection op target must be `{}.{}`",
+                input_name, coll_field_name
+            ),
+        }),
+    }
 }
 
 /// Emit `mov [rbp+offset], rax` with short/long encoding depending on offset.
@@ -3373,6 +3437,24 @@ mod tests {
             .expect("native compile of discounted_purchase should succeed");
         let size = fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
         assert!(size > 500 && size < 2_500, "unexpected binary size: {}", size);
+        let _ = fs::remove_file(out);
+    }
+
+    #[test]
+    fn native_compiles_collection_filter_rule() {
+        // payroll.verbose's high_earners uses `filter(...)` — predicate
+        // evaluated per element, passing elements emit identity JSON.
+        use std::fs;
+        let src = fs::read_to_string("examples/payroll.verbose")
+            .expect("examples/payroll.verbose is expected to exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let out = std::env::temp_dir().join("verbosec_test_high_earners");
+        compile_native(&program, "high_earners", out.to_str().unwrap())
+            .expect("native compile of filter rule should succeed");
+        let size = fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
+        assert!(size > 400 && size < 2_500, "unexpected binary size: {}", size);
         let _ = fs::remove_file(out);
     }
 

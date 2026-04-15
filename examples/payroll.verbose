@@ -56,3 +56,29 @@ rule compute_bonuses
       bound : 5
     determinism:
       form : total
+
+
+rule high_earners
+  @intention: "Select employees whose salary exceeds 50000 — identity pass-through"
+  @source: payroll.intent:4
+
+  input:
+    w : Workforce
+
+  output:
+    r : collection(Employee)
+
+  logic:
+    r = filter(w.employees, e => e.salary > 50000)
+
+  proofs:
+    purity:
+      reads   : [w.employees]
+      writes  : []
+      calls   : []
+      verdict : pure
+    termination:
+      form  : constant_bound
+      bound : 2
+    determinism:
+      form : total

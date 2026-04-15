@@ -143,7 +143,7 @@ Tracking what native emits today, what it still rejects, and the design rules th
 | 2C | Rule with `output: Named(concept)` (record) — JSON serialization to stdout, one object per record. Streaming emission (no on-stack record). Number/text fields supported; `if/else` between two record arms via continuation-passing. | ~1 KB | `classify.verbose::classify_invoice` |
 | 2E | Text-typed input fields readable in record outputs — argv pointer stored at the rbp slot, length recovered via `repne scasb` (`emit_strlen`) at each read site. | ~600 B | `greeting.verbose::make_report` |
 | 2D | `match_result(callee(input), v => Ok(<arith using v>), e => Err(e))` — inlined-callee form. Callee's logic is walked and its Ok/Err leaves are redirected: Ok values bind to a reserved `match_slot` then evaluate the outer Ok arm; Err values write directly to stderr (Err pass-through). Restricted to same-input-concept callees and `Err(<err_var>)` pass-through outer arm. | ~750 B | `purchase.verbose::discounted_purchase` |
-| 3 | `output: collection(T)` with `map` — streaming element emission (one JSON Lines per element), no arena, count-prefixed argv. `filter` deferred to 3.1. See "Phase 3 design (locked)" below. | ~670 B | `payroll.verbose::compute_bonuses` |
+| 3 | `output: collection(T)` with `map` or `filter` — streaming element emission (one JSON Lines per element), no arena, count-prefixed argv. `filter` uses identity pass-through: predicate false skips emission, predicate true emits the element as-is. See "Phase 3 design (locked)" below. | ~670 B | `payroll.verbose::compute_bonuses` (map) / `::high_earners` (filter) |
 
 ### Phase 3 design (locked before implementation)
 
