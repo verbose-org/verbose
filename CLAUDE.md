@@ -368,6 +368,56 @@ fill_done:
 - `fold` target that is a rule call returning a collection.
 - Bodies that are not a top-level `concat` (e.g. just `Ident(acc)` — a no-op fold producing the init unchanged; the verifier should probably reject this anyway).
 
+### Phase 2F design (locked before implementation)
+
+Phase 2F extends `match_result` to accept a non-pass-through Err arm. Until now, Phase 2D required the outer Err to be exactly `Err(Ident(err_var))` — the inlined callee's Err leaves wrote their text directly to stderr, no binding happened. Phase 2F lets the outer Err **transform** the callee's Err value:
+
+```verbose
+match_result(
+  validate(p),
+  v => Ok(v * 2),
+  e => Err(concat("[", p.id, "] validation failed: ", e))
+)
+```
+
+**Core design decision: two rbp slots represent the bound err_var as a (ptr, len) pair.** Any text value at runtime is two machine words — a pointer and a length. Unifying all text values under this representation avoids NUL-termination gymnastics (concat outputs aren't NUL-terminated; argv fields are; literals know their length at emit). The inlined callee's Err leaf captures whatever shape it produces into the slots; the outer arm reads from them.
+
+**Frame layout.** `emit_record_loop_prologue` reserves FOUR slots at the bottom of the frame, unconditionally:
+```
+rbp - 8*(nfields + nlets + 1)         match_slot            (Ok-bound i64, Phase 2D)
+rbp - 8*(nfields + nlets + 2)         err_ptr_slot          (Err-bound text ptr)          ← Phase 2F
+rbp - 8*(nfields + nlets + 3)         err_len_slot          (Err-bound text length)       ← Phase 2F
+rbp - 8*(nfields + nlets + 4)         err_frame_save_slot   (rsp before callee Err concat) ← Phase 2F
+```
+Uniform layout: 24 extra bytes per rule that uses the shared prologue, even when match_result isn't used. Acceptable noise in exchange for one emitter shape, no conditional layout.
+
+**Binding capture per callee Err leaf shape:**
+- `Err(Text(literal))`: `lea rax, [rip + literal_addr]; mov [rbp+err_ptr_slot], rax; mov qword [rbp+err_len_slot], literal_len`. No buffer.
+- `Err(Field(input, text_field))`: `mov rax, [rbp+field_slot]; mov [rbp+err_ptr_slot], rax`. Length: `emit_strlen` (argv strings are NUL-terminated) → `mov [rbp+err_len_slot], rdx`. No buffer.
+- `Err(Concat(args))`: call `emit_concat_to_buffer` (may be static or dynamic). On return rax=ptr, rdx=len. Store both. **The concat buffer stays on the stack until the whole match arm finishes.** Save the current rsp into `err_frame_save_slot` so the outer arm's final cleanup can free the callee's buffer (`mov rsp, [rbp+err_frame_save_slot]`).
+
+Before emission, always `mov [rbp+err_frame_save_slot], rsp` — harmless when no concat happens (save equals current), necessary when it does. Keeps emission uniform.
+
+**Outer Err arm.** A new `TextBindings = HashMap<&str, (ptr_slot, len_slot)>` is threaded to `emit_text_write_to_fd` / `emit_concat_to_buffer` / `classify_concat_arg` / `emit_concat_fill`. When any of these sees `Expr::Ident(name)` and `name` is in the bindings, the identifier resolves to `(ptr, len)` loaded from the two slots rather than failing. A new `ConcatArgKind::BoundText` variant covers this in concat sizing (`add rax, [rbp+len_slot]`) and filling (`mov rsi, [rbp+ptr_slot]; mov rcx, [rbp+len_slot]; mov rdi, rbx; rep movsb; mov rbx, rdi` — no strlen needed at fill time, length is already stored).
+
+**Cleanup sequence at the end of the outer Err arm:**
+1. Outer Err's own concat buffer (if any) is freed via the existing `emit_concat_buffer_free` (`mov rsp, r9` for dynamic, `add rsp, imm32` for static).
+2. `mov rax, [rbp+err_frame_save_slot]; mov rsp, rax` — frees the callee's Err concat buffer if one was allocated; no-op otherwise.
+3. `jmp loop_top`.
+
+**Why this design holds security pillar #1:** same syscall surface as Phase 2D (`read argv`, `write fd 1/2`, `exit`). Three new rbp slots — not attack surface, just offsets. No new registers reserved. Buffer lifetimes are stack-only, bounded by the outer match arm. The pass-through case from Phase 2D is a pure subset and continues to work; we can refactor it to use the new slot-based path or keep the fast path — decision at implementation time.
+
+**Scope v1 (everything else refused with a clear message):**
+- Outer Err arm body: `Err(Text(lit))`, `Err(Field(input, text_field))`, `Err(Ident(err_var))`, or `Err(Concat(args))` where args classify as text literal / number expression / input text field / `Ident(err_var)`.
+- Callee Err leaves: same four shapes as outer.
+- `err_var` only usable in text contexts (its value is text; using it in a number context is rejected by the verifier already).
+- Pass-through (`Err(Ident(err_var))`) still works — routes through the slot path OR a fast path; implementation choice.
+
+**What Phase 2F does NOT do** (deferred):
+- Callee Err that returns a rule call (text-returning rule calls are a separate phase — `emit_text_write_to_fd` falls back on `Call`).
+- Using `err_var` twice in the same outer arm — the slots are single-assignment, reading twice is fine but the design doesn't support "aliasing" where err_var appears in a sub-expression already using it indirectly.
+- Binding to anything other than a text var (Ok-bound numbers are already handled by `match_slot`; non-text non-number bindings aren't in the language).
+
 ### What native still rejects, and in which priority
 
 - **Result(T, E) with non-scalar T** (e.g. `Result(Record, text)`, `Result(collection, _)`) — each shape needs its own calling convention. Decide shape by shape, never fabricate a "universal Result" that carries unnecessary machinery.
