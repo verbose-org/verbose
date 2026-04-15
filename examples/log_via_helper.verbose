@@ -1,0 +1,78 @@
+@verbose 0.1.0
+
+-- Phase 2H-a: a reaction's `append_file` content can be a call to a
+-- text-returning helper rule. The native emitter inlines the helper's
+-- body — identical to writing the content expression inline, but
+-- factored through a helper with its own verified proofs.
+--
+-- Same-concept / same-input-name / no-lets restrictions mirror Phase 2G.
+
+
+concept Event
+  @intention: "An event has a user and a severity code"
+  @source: log_via_helper.intent:1
+
+  fields:
+    user : text
+    code : number [0, 9999]
+
+
+rule severity_line
+  @intention: "Format the log line for an event: user=... code=..."
+  @source: log_via_helper.intent:2
+
+  input:
+    e : Event
+
+  output:
+    s : text
+
+  logic:
+    s = concat("user=", e.user, " code=", e.code, "\n")
+
+  proofs:
+    purity:
+      reads   : [e.user, e.code]
+      writes  : []
+      calls   : []
+      verdict : pure
+    termination:
+      form  : constant_bound
+      bound : 5
+    determinism:
+      form : total
+
+
+rule is_alert
+  @intention: "An event is an alert when the code is >= 100"
+  @source: log_via_helper.intent:3
+
+  input:
+    e : Event
+
+  output:
+    a : bool
+
+  logic:
+    a = e.code >= 100
+
+  proofs:
+    purity:
+      reads   : [e.code]
+      writes  : []
+      calls   : []
+      verdict : pure
+    termination:
+      form  : constant_bound
+      bound : 1
+    determinism:
+      form : total
+
+
+reaction log_alert
+  @intention: "Append each alert's formatted line to the alerts log"
+  @source: log_via_helper.intent:4
+
+  trigger: is_alert
+  effects:
+    append_file "/tmp/verbose_alerts.log" severity_line(e)

@@ -1,0 +1,4 @@
+1. An event has a user and a numeric severity code.
+2. The log line for an event names the user and the code.
+3. An event is an alert when the code is at least 100.
+4. For every alert, append its log line to the alerts file via the helper rule.

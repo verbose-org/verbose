@@ -27,6 +27,7 @@ ENTRIES=(
   "2E      |examples/greeting.verbose    |make_report        |text input field → Record JSON"
   "2F      |examples/enrich.verbose      |enriched           |match_result enriched Err arm"
   "2G      |examples/compose.verbose     |name_line          |text-returning rule call inlined"
+  "2H-a    |examples/log_via_helper.verbose|log_alert        |reaction append_file content = Call"
   "3-map   |examples/payroll.verbose     |compute_bonuses    |collection(Record) via map"
   "3-filter|examples/payroll.verbose     |high_earners       |collection(Record) via filter"
   "3.2-n   |examples/payroll.verbose     |salaries           |collection(number) via map"

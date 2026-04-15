@@ -993,7 +993,38 @@ fn emit_append_file_call(
     // mov r15, rax  (49 89 C7)
     code.extend_from_slice(&[0x49, 0x89, 0xC7]);
 
-    // Now the write(). Two paths depending on content shape.
+    // Now the write() — dispatch on content shape. Factored into a helper
+    // so that the Call arm (Phase 2H-a) can recurse on callee.logic.value
+    // without re-opening the file or re-validating the path.
+    emit_append_write_to_r15(code, content, rule, concept, all_rules, offsets, field_ranges)?;
+
+    // === close(fd) ===
+    // mov rax, 3 (sys_close)
+    code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x03, 0x00, 0x00, 0x00]);
+    // mov rdi, r15
+    code.extend_from_slice(&[0x4C, 0x89, 0xFF]);
+    // syscall
+    code.extend_from_slice(&[0x0F, 0x05]);
+
+    Ok(())
+}
+
+/// Emit a write(fd-in-r15, content, ...) for a reaction `append_file`
+/// effect. Factored out of `emit_append_file_call` so the Call arm can
+/// recurse on `callee.logic.value` without re-opening the file.
+///
+/// Preconditions: `r15` already holds the open fd (from `emit_open_append`).
+/// Postconditions: one `write` syscall has been emitted; any scratch buffer
+/// allocated by a Concat content has been freed.
+fn emit_append_write_to_r15(
+    code: &mut Vec<u8>,
+    content: &Expr,
+    rule: &Rule,
+    concept: &Concept,
+    all_rules: &HashMap<&str, &Rule>,
+    offsets: &HashMap<&str, i32>,
+    field_ranges: &HashMap<&str, (i64, i64)>,
+) -> Result<(), NativeError> {
     match content {
         Expr::Text(s) => {
             // Fast path: fixed-length static content. Embed inline and
@@ -1025,6 +1056,7 @@ fn emit_append_file_call(
             code.extend_from_slice(&(n as i32).to_le_bytes());
             // syscall
             code.extend_from_slice(&[0x0F, 0x05]);
+            Ok(())
         }
         Expr::Concat(args) => {
             // Build the content in a stack buffer, then write (rax=buf_ptr,
@@ -1044,26 +1076,81 @@ fn emit_append_file_call(
             // syscall
             code.extend_from_slice(&[0x0F, 0x05]);
             emit_concat_buffer_free(code, buf);
+            Ok(())
         }
-        other => {
-            return Err(NativeError {
+        Expr::Call(callee_name, args) => {
+            // Phase 2H-a: text-returning rule call inlined as append_file
+            // content. Mirrors the Phase 2G restrictions in
+            // emit_text_write_to_fd.
+            let callee = all_rules.get(callee_name.as_str()).ok_or_else(|| NativeError {
                 message: format!(
-                    "append_file content must be a string literal or concat(...) in native; got {:?}",
-                    other
+                    "Phase 2H-a: unknown rule '{}' called as append_file content",
+                    callee_name
                 ),
-            });
+            })?;
+            if !matches!(callee.output_ty, Type::Text) {
+                return Err(NativeError {
+                    message: format!(
+                        "Phase 2H-a: rule '{}' as append_file content must return `text`, not {:?}",
+                        callee_name, callee.output_ty
+                    ),
+                });
+            }
+            let callee_concept_name = match &callee.input_ty {
+                Type::Named(n) => n.as_str(),
+                _ => {
+                    return Err(NativeError {
+                        message: format!(
+                            "Phase 2H-a: rule '{}' input must be a named concept",
+                            callee_name
+                        ),
+                    });
+                }
+            };
+            if callee_concept_name != concept.name.as_str() {
+                return Err(NativeError {
+                    message: format!(
+                        "Phase 2H-a: callee '{}' takes concept '{}' but caller takes '{}' — same-concept required",
+                        callee_name, callee_concept_name, concept.name
+                    ),
+                });
+            }
+            if callee.input_name != rule.input_name {
+                return Err(NativeError {
+                    message: format!(
+                        "Phase 2H-a: callee '{}' binds its input as '{}' but caller uses '{}' — same input name required",
+                        callee_name, callee.input_name, rule.input_name
+                    ),
+                });
+            }
+            if !callee.logic.bindings.is_empty() {
+                return Err(NativeError {
+                    message: format!(
+                        "Phase 2H-a: callee '{}' has let bindings; not yet supported in native",
+                        callee_name
+                    ),
+                });
+            }
+            if args.len() != 1 || !matches!(&args[0], Expr::Ident(n) if n == &rule.input_name) {
+                return Err(NativeError {
+                    message: format!(
+                        "Phase 2H-a: rule '{}' must be called with exactly the caller's input identifier",
+                        callee_name
+                    ),
+                });
+            }
+            // Recurse: treat the callee's body as the append_file content.
+            emit_append_write_to_r15(
+                code, &callee.logic.value, rule, concept, all_rules, offsets, field_ranges,
+            )
         }
+        other => Err(NativeError {
+            message: format!(
+                "append_file content must be a text literal, concat(...), or text-returning rule call; got {:?}",
+                other
+            ),
+        }),
     }
-
-    // === close(fd) ===
-    // mov rax, 3 (sys_close)
-    code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x03, 0x00, 0x00, 0x00]);
-    // mov rdi, r15
-    code.extend_from_slice(&[0x4C, 0x89, 0xFF]);
-    // syscall
-    code.extend_from_slice(&[0x0F, 0x05]);
-
-    Ok(())
 }
 
 /// Emit a write syscall for a fixed byte string to the given fd. The bytes
@@ -4945,6 +5032,26 @@ mod tests {
             .expect("native compile of output-text rule should succeed");
         let size = fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
         assert!(size > 300 && size < 2_000, "unexpected binary size: {}", size);
+        let _ = fs::remove_file(out);
+    }
+
+    #[test]
+    fn native_compiles_call_as_append_file_content() {
+        // Phase 2H-a: the reaction append_file content is a text-returning
+        // rule call. Mirror of Phase 2G in emit_append_file_call:
+        // validate same-concept / same-input-name / no-lets, then recurse
+        // on the callee's body via emit_append_write_to_r15.
+        use std::fs;
+        let src = fs::read_to_string("examples/log_via_helper.verbose")
+            .expect("examples/log_via_helper.verbose is expected to exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let out = std::env::temp_dir().join("verbosec_test_log_via_helper");
+        compile_native(&program, "log_alert", out.to_str().unwrap())
+            .expect("native compile of reaction with text-call content should succeed");
+        let size = fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
+        assert!(size > 400 && size < 2_000, "unexpected binary size: {}", size);
         let _ = fs::remove_file(out);
     }
 
