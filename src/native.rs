@@ -111,6 +111,10 @@ pub fn compile_native(
     // sum/count/min/max desugarings). Routes to emit_fold_program.
     let is_fold_number_output = matches!(&rule.output_ty, Type::Number)
         && matches!(&rule.logic.value, Expr::Fold(_, _, _, _, _));
+    // Phase 5b: text output whose top-level logic is `fold(...)` — appends
+    // into a growing text buffer. Routes to emit_text_fold_program.
+    let is_fold_text_output = matches!(&rule.output_ty, Type::Text)
+        && matches!(&rule.logic.value, Expr::Fold(_, _, _, _, _));
 
     // Record output: rule.output_ty is Named(concept_name) and the name
     // resolves to a concept declared in the program. Routes to
@@ -137,6 +141,10 @@ pub fn compile_native(
         // desugarings). Single 8-byte accumulator slot at the bottom of the
         // rbp frame; one final `itoa + \n` per input record.
         emit_fold_program(rule, concept, &concepts, &rules)?
+    } else if is_fold_text_output {
+        // Phase 5b: text output via top-level fold — append-only body,
+        // two-pass sizing, stack buffer freed via saved rsp in r9.
+        emit_text_fold_program(rule, concept, &concepts, &rules)?
     } else if matches!(&rule.output_ty, Type::Text) {
         // Phase 5a: rules returning `text` via a per-record body (literal,
         // input text field, or concat). One write to stdout + newline per
@@ -2327,6 +2335,482 @@ fn emit_fold_program(
     Ok(code)
 }
 
+/// Does `e` mention `Ident(name)` anywhere (recursively)? Used by Phase 5b
+/// to enforce the "append-only" invariant: the fold accumulator must not
+/// appear outside position 0 of the outer concat.
+fn expr_mentions_ident(e: &Expr, name: &str) -> bool {
+    match e {
+        Expr::Ident(n) => n == name,
+        Expr::Field(b, _) => expr_mentions_ident(b, name),
+        Expr::Binary(_, l, r) => expr_mentions_ident(l, name) || expr_mentions_ident(r, name),
+        Expr::Neg(i) | Expr::Not(i) => expr_mentions_ident(i, name),
+        Expr::If(c, t, el) => {
+            expr_mentions_ident(c, name)
+                || expr_mentions_ident(t, name)
+                || expr_mentions_ident(el, name)
+        }
+        Expr::Call(_, args) => args.iter().any(|a| expr_mentions_ident(a, name)),
+        Expr::Concat(args) => args.iter().any(|a| expr_mentions_ident(a, name)),
+        Expr::Ok(i) | Expr::Err(i) => expr_mentions_ident(i, name),
+        Expr::Quantifier(_, c, _, b) => expr_mentions_ident(c, name) || expr_mentions_ident(b, name),
+        Expr::Map(c, _, b) | Expr::Filter(c, _, b) => {
+            expr_mentions_ident(c, name) || expr_mentions_ident(b, name)
+        }
+        Expr::Fold(c, init, _, _, b) => {
+            expr_mentions_ident(c, name)
+                || expr_mentions_ident(init, name)
+                || expr_mentions_ident(b, name)
+        }
+        _ => false,
+    }
+}
+
+/// Phase 5b: `output: text` with a top-level `fold` that appends into a text
+/// accumulator over a collection. Two-pass emission:
+///
+/// 1. Size pass — walk the collection once computing total bytes into rax
+///    (init literal length + per-element contribution: static literals,
+///    21 bytes per number arg, runtime `strlen` per text-field arg).
+/// 2. Buffer allocation — `mov r9, rsp; sub rsp, rax; mov rbx, rsp; mov r10, rbx`.
+///    Copy init literal into the buffer via `rep movsb`.
+/// 3. Fill pass — rewind `r14` and `r15` from their rbp save slots, walk
+///    the collection again, emitting each element's contribution via the
+///    shared `emit_concat_fill`.
+/// 4. Emit the buffer to stdout (`write(1, r10, rbx - r10)`) + newline.
+/// 5. Free via `mov rsp, r9`. Loop to next input record.
+///
+/// Body shape (strictly append-only, refused otherwise):
+///   `Concat(Ident(acc), ...rest)` where `acc` appears NOWHERE in `rest`.
+fn emit_text_fold_program(
+    rule: &Rule,
+    input_concept: &Concept,
+    all_concepts: &[&Concept],
+    all_rules: &HashMap<&str, &Rule>,
+) -> Result<Vec<u8>, NativeError> {
+    // ===== Scope validation =====
+    if !matches!(rule.output_ty, Type::Text) {
+        return Err(NativeError {
+            message: "emit_text_fold_program called on non-text output".into(),
+        });
+    }
+    let (coll_expr, init_expr, acc_name, item_name, body) = match &rule.logic.value {
+        Expr::Fold(c, i, a, it, b) => {
+            (c.as_ref(), i.as_ref(), a.as_str(), it.as_str(), b.as_ref())
+        }
+        _ => {
+            return Err(NativeError {
+                message: "text-output native rule with fold must have `fold(...)` at the top level".into(),
+            })
+        }
+    };
+    let init_literal: &str = match init_expr {
+        Expr::Text(s) => s.as_str(),
+        _ => {
+            return Err(NativeError {
+                message: "Phase 5b: fold init must be a text literal".into(),
+            })
+        }
+    };
+
+    // Body must be Concat(Ident(acc), ...rest), with acc absent from rest.
+    let rest_args: &[Expr] = match body {
+        Expr::Concat(args) => {
+            if args.is_empty() {
+                return Err(NativeError {
+                    message: "Phase 5b: fold body must be `concat(acc, ...)`".into(),
+                });
+            }
+            match &args[0] {
+                Expr::Ident(n) if n == acc_name => {}
+                _ => {
+                    return Err(NativeError {
+                        message: format!(
+                            "Phase 5b: first arg of fold-body concat must be the accumulator '{}'",
+                            acc_name
+                        ),
+                    })
+                }
+            }
+            for a in &args[1..] {
+                if expr_mentions_ident(a, acc_name) {
+                    return Err(NativeError {
+                        message: format!(
+                            "Phase 5b: accumulator '{}' may only appear as the first arg of the fold-body concat",
+                            acc_name
+                        ),
+                    });
+                }
+            }
+            &args[1..]
+        }
+        _ => {
+            return Err(NativeError {
+                message: "Phase 5b: fold body must be a `concat(...)` expression".into(),
+            })
+        }
+    };
+
+    // Input concept shape: scalars* + ONE trailing collection(Concept) field.
+    let mut scalar_fields: Vec<&Field> = Vec::new();
+    let mut coll_field: Option<&Field> = None;
+    let mut elem_concept_name: Option<String> = None;
+    for (i, f) in input_concept.fields.iter().enumerate() {
+        let is_last = i == input_concept.fields.len() - 1;
+        match (&f.ty, is_last) {
+            (Type::Number, false) | (Type::Text, false) => scalar_fields.push(f),
+            (Type::Collection(elem), true) => {
+                coll_field = Some(f);
+                elem_concept_name = Some(elem.clone());
+            }
+            _ => {
+                return Err(NativeError {
+                    message: format!(
+                        "input concept '{}' must have scalar fields followed by ONE trailing collection field; \
+                         field '{}' at position {} violates this",
+                        input_concept.name, f.name, i
+                    ),
+                });
+            }
+        }
+    }
+    let coll_field = coll_field.ok_or_else(|| NativeError {
+        message: format!(
+            "input concept '{}' must have a trailing collection field",
+            input_concept.name
+        ),
+    })?;
+    let elem_concept_name = elem_concept_name.unwrap();
+    let elem_concept = all_concepts
+        .iter()
+        .find(|c| c.name == elem_concept_name)
+        .copied()
+        .ok_or_else(|| NativeError {
+            message: format!(
+                "unknown concept '{}' for input collection element",
+                elem_concept_name
+            ),
+        })?;
+    for f in &elem_concept.fields {
+        if !matches!(f.ty, Type::Number | Type::Text) {
+            return Err(NativeError {
+                message: format!(
+                    "input collection element field '{}' has unsupported type (only number/text today)",
+                    f.name
+                ),
+            });
+        }
+    }
+    verify_collection_target(coll_expr, &rule.input_name, &coll_field.name)?;
+
+    // Classify rest args. The lambda var `item` is the "input" for field
+    // accesses within them.
+    let mut rest_kinds: Vec<ConcatArgKind> = Vec::with_capacity(rest_args.len());
+    for arg in rest_args {
+        let k = classify_concat_arg(arg, elem_concept, item_name).ok_or_else(|| NativeError {
+            message: "Phase 5b: fold-body concat arg must be a text literal, number expression, or element text field".into(),
+        })?;
+        rest_kinds.push(k);
+    }
+
+    // Static per-element contribution (sum of literal lengths + 21 per number arg).
+    let mut static_per_element: i32 = 0;
+    for (arg, kind) in rest_args.iter().zip(rest_kinds.iter()) {
+        match kind {
+            ConcatArgKind::Text => {
+                if let Expr::Text(s) = arg {
+                    static_per_element += s.as_bytes().len() as i32;
+                }
+                // Text field: runtime strlen, contributes 0 to static.
+            }
+            ConcatArgKind::Number => {
+                static_per_element += 21;
+            }
+        }
+    }
+
+    // ===== Emission =====
+    let n_scalar = scalar_fields.len();
+    let n_elem_fields = elem_concept.fields.len();
+    // frame: n_scalar + n_elem + count_slot + argv_save_slot = n_scalar + n_elem + 2
+    let frame_slots = n_scalar + n_elem_fields + 2;
+    let frame_size = (frame_slots as i32) * 8;
+    let count_slot: i32 = -(((n_scalar + n_elem_fields + 1) as i32) * 8);
+    let argv_save_slot: i32 = -(((n_scalar + n_elem_fields + 2) as i32) * 8);
+
+    let mut code = Vec::new();
+
+    // _start — argv/rbp setup.
+    code.extend_from_slice(&[0x4C, 0x8B, 0x24, 0x24]);       // mov r12, [rsp]
+    code.extend_from_slice(&[0x4C, 0x8D, 0x6C, 0x24, 0x08]); // lea r13, [rsp+8]
+    code.push(0x55);                                         // push rbp
+    code.extend_from_slice(&[0x48, 0x89, 0xE5]);             // mov rbp, rsp
+    code.extend_from_slice(&[0x48, 0x81, 0xEC]);
+    code.extend_from_slice(&frame_size.to_le_bytes());       // sub rsp, frame_size
+    code.extend_from_slice(&[0x49, 0xC7, 0xC6, 0x01, 0x00, 0x00, 0x00]); // mov r14, 1
+
+    // Outer loop: one input record per iteration.
+    let outer_loop_top = code.len();
+    code.extend_from_slice(&[0x4D, 0x39, 0xE6]); // cmp r14, r12
+    code.push(0x0F);
+    code.push(0x8D);                             // jge exit (rel32)
+    let exit_patch = code.len();
+    code.extend_from_slice(&[0; 4]);
+
+    // Field offsets.
+    let mut scalar_offsets: HashMap<&str, i32> = HashMap::new();
+    for (i, f) in scalar_fields.iter().enumerate() {
+        scalar_offsets.insert(f.name.as_str(), -((i as i32 + 1) * 8));
+    }
+    let mut elem_offsets: HashMap<&str, i32> = HashMap::new();
+    for (i, f) in elem_concept.fields.iter().enumerate() {
+        elem_offsets.insert(f.name.as_str(), -(((n_scalar + i) as i32 + 1) * 8));
+    }
+
+    // Parse scalar input fields.
+    for f in &scalar_fields {
+        let offset = scalar_offsets[f.name.as_str()];
+        code.extend_from_slice(&[0x4B, 0x8B, 0x7C, 0xF5, 0x00]); // mov rdi, [r13+r14*8]
+        match f.ty {
+            Type::Number => {
+                emit_atoi_inline(&mut code);
+                store_rax_at_rbp(&mut code, offset);
+            }
+            Type::Text => store_rdi_at_rbp(&mut code, offset),
+            _ => unreachable!(),
+        }
+        code.extend_from_slice(&[0x49, 0xFF, 0xC6]); // inc r14
+    }
+
+    // Parse count into r15, save it at count_slot.
+    code.extend_from_slice(&[0x4B, 0x8B, 0x7C, 0xF5, 0x00]); // mov rdi, [r13+r14*8]
+    emit_atoi_inline(&mut code);
+    code.extend_from_slice(&[0x49, 0x89, 0xC7]); // mov r15, rax
+    // mov [rbp + count_slot], r15
+    if count_slot >= -128 {
+        code.extend_from_slice(&[0x4C, 0x89, 0x7D]);
+        code.push(count_slot as u8);
+    } else {
+        code.extend_from_slice(&[0x4C, 0x89, 0xBD]);
+        code.extend_from_slice(&count_slot.to_le_bytes());
+    }
+    code.extend_from_slice(&[0x49, 0xFF, 0xC6]); // inc r14
+
+    // Save r14 at argv_save_slot (this is the argv index of the first element).
+    if argv_save_slot >= -128 {
+        code.extend_from_slice(&[0x4C, 0x89, 0x75]);
+        code.push(argv_save_slot as u8);
+    } else {
+        code.extend_from_slice(&[0x4C, 0x89, 0xB5]);
+        code.extend_from_slice(&argv_save_slot.to_le_bytes());
+    }
+
+    // ===== Pass 1: compute total buffer size into rax =====
+    let init_size = init_literal.as_bytes().len() as i32;
+    // mov rax, init_size
+    code.extend_from_slice(&[0x48, 0xC7, 0xC0]);
+    code.extend_from_slice(&init_size.to_le_bytes());
+
+    let size_loop_top = code.len();
+    code.extend_from_slice(&[0x4D, 0x85, 0xFF]); // test r15, r15
+    code.push(0x0F);
+    code.push(0x84);                             // jz size_done (rel32)
+    let size_done_patch = code.len();
+    code.extend_from_slice(&[0; 4]);
+
+    // For each text-field arg in rest, strlen the pointer at its argv slot.
+    for (arg, kind) in rest_args.iter().zip(rest_kinds.iter()) {
+        if *kind == ConcatArgKind::Text {
+            if let Expr::Field(_, field_name) = arg {
+                let idx = elem_concept
+                    .fields
+                    .iter()
+                    .position(|f| &f.name == field_name)
+                    .ok_or_else(|| NativeError {
+                        message: format!(
+                            "unknown element field '{}' in fold body",
+                            field_name
+                        ),
+                    })?;
+                let disp = (idx * 8) as i32;
+                // mov rsi, [r13 + r14*8 + disp]
+                if disp == 0 {
+                    code.extend_from_slice(&[0x4B, 0x8B, 0x74, 0xF5, 0x00]);
+                } else if disp <= 127 {
+                    code.extend_from_slice(&[0x4B, 0x8B, 0x74, 0xF5]);
+                    code.push(disp as u8);
+                } else {
+                    code.extend_from_slice(&[0x4B, 0x8B, 0xB4, 0xF5]);
+                    code.extend_from_slice(&disp.to_le_bytes());
+                }
+                code.push(0x50);                                 // push rax
+                emit_strlen(&mut code);                          // rdx = length (clobbers rax/rcx/rdi)
+                code.push(0x59);                                 // pop rcx
+                code.extend_from_slice(&[0x48, 0x01, 0xD1]);     // add rcx, rdx
+                code.extend_from_slice(&[0x48, 0x89, 0xC8]);     // mov rax, rcx
+            }
+        }
+    }
+
+    // add rax, static_per_element
+    if static_per_element != 0 {
+        if static_per_element <= 127 {
+            code.extend_from_slice(&[0x48, 0x83, 0xC0, static_per_element as u8]);
+        } else {
+            code.extend_from_slice(&[0x48, 0x05]);
+            code.extend_from_slice(&static_per_element.to_le_bytes());
+        }
+    }
+
+    // Advance r14 past this element's argv slots: r14 += n_elem_fields.
+    let nef = n_elem_fields as i32;
+    if nef <= 127 {
+        code.extend_from_slice(&[0x49, 0x83, 0xC6, nef as u8]);
+    } else {
+        code.extend_from_slice(&[0x49, 0x81, 0xC6]);
+        code.extend_from_slice(&nef.to_le_bytes());
+    }
+    // dec r15 ; jmp size_loop_top
+    code.extend_from_slice(&[0x49, 0xFF, 0xCF]);
+    code.push(0xE9);
+    let back = size_loop_top as i32 - (code.len() + 4) as i32;
+    code.extend_from_slice(&back.to_le_bytes());
+
+    // size_done:
+    let size_done_pos = code.len();
+    let size_done_off = size_done_pos as i32 - (size_done_patch as i32 + 4);
+    code[size_done_patch..size_done_patch + 4].copy_from_slice(&size_done_off.to_le_bytes());
+
+    // Round up rax to 8: add rax, 7; and rax, ~7 (sign-extended imm8 = -8 = 0xF8).
+    code.extend_from_slice(&[0x48, 0x83, 0xC0, 0x07]);
+    code.extend_from_slice(&[0x48, 0x83, 0xE0, 0xF8]);
+
+    // mov r9, rsp ; sub rsp, rax ; mov rbx, rsp ; mov r10, rbx
+    code.extend_from_slice(&[0x49, 0x89, 0xE1]); // mov r9, rsp
+    code.extend_from_slice(&[0x48, 0x29, 0xC4]); // sub rsp, rax
+    code.extend_from_slice(&[0x48, 0x89, 0xE3]); // mov rbx, rsp
+    code.extend_from_slice(&[0x49, 0x89, 0xDA]); // mov r10, rbx
+
+    // Copy init literal into [rbx..]. Skip if empty.
+    if init_size > 0 {
+        let init_bytes = init_literal.as_bytes();
+        if init_size <= 127 {
+            code.push(0xEB);
+            code.push(init_size as u8);
+        } else {
+            code.push(0xE9);
+            code.extend_from_slice(&init_size.to_le_bytes());
+        }
+        let data_addr = code.len();
+        code.extend_from_slice(init_bytes);
+        // mov rdi, rbx
+        code.extend_from_slice(&[0x48, 0x89, 0xDF]);
+        // lea rsi, [rip + rel32]
+        let end = code.len() + 7;
+        let rel32 = data_addr as i32 - end as i32;
+        code.extend_from_slice(&[0x48, 0x8D, 0x35]);
+        code.extend_from_slice(&rel32.to_le_bytes());
+        // mov rcx, init_size
+        code.extend_from_slice(&[0x48, 0xC7, 0xC1]);
+        code.extend_from_slice(&init_size.to_le_bytes());
+        // rep movsb
+        code.extend_from_slice(&[0xF3, 0xA4]);
+        // mov rbx, rdi
+        code.extend_from_slice(&[0x48, 0x89, 0xFB]);
+    }
+
+    // Rewind r14 from argv_save_slot; reload r15 from count_slot.
+    if argv_save_slot >= -128 {
+        code.extend_from_slice(&[0x4C, 0x8B, 0x75]);
+        code.push(argv_save_slot as u8);
+    } else {
+        code.extend_from_slice(&[0x4C, 0x8B, 0xB5]);
+        code.extend_from_slice(&argv_save_slot.to_le_bytes());
+    }
+    if count_slot >= -128 {
+        code.extend_from_slice(&[0x4C, 0x8B, 0x7D]);
+        code.push(count_slot as u8);
+    } else {
+        code.extend_from_slice(&[0x4C, 0x8B, 0xBD]);
+        code.extend_from_slice(&count_slot.to_le_bytes());
+    }
+
+    // ===== Pass 2: fill the buffer =====
+    let fill_loop_top = code.len();
+    code.extend_from_slice(&[0x4D, 0x85, 0xFF]); // test r15, r15
+    code.push(0x0F);
+    code.push(0x84);                             // jz fill_done (rel32)
+    let fill_done_patch = code.len();
+    code.extend_from_slice(&[0; 4]);
+
+    // Parse element fields into rbp slots (reused across iterations).
+    for f in &elem_concept.fields {
+        let offset = elem_offsets[f.name.as_str()];
+        code.extend_from_slice(&[0x4B, 0x8B, 0x7C, 0xF5, 0x00]); // mov rdi, [r13+r14*8]
+        match f.ty {
+            Type::Number => {
+                emit_atoi_inline(&mut code);
+                store_rax_at_rbp(&mut code, offset);
+            }
+            Type::Text => store_rdi_at_rbp(&mut code, offset),
+            _ => unreachable!(),
+        }
+        code.extend_from_slice(&[0x49, 0xFF, 0xC6]); // inc r14
+    }
+
+    // Emit the rest args into the buffer via the shared fill helper.
+    // Lambda var is the "input" for field access; offsets resolve element fields.
+    let field_ranges = build_field_ranges(elem_concept);
+    emit_concat_fill(
+        &mut code,
+        rest_args,
+        &rest_kinds,
+        item_name,
+        elem_concept,
+        all_rules,
+        &elem_offsets,
+        &field_ranges,
+    )?;
+
+    // dec r15 ; jmp fill_loop_top
+    code.extend_from_slice(&[0x49, 0xFF, 0xCF]);
+    code.push(0xE9);
+    let fb = fill_loop_top as i32 - (code.len() + 4) as i32;
+    code.extend_from_slice(&fb.to_le_bytes());
+
+    // fill_done:
+    let fill_done_pos = code.len();
+    let fill_done_off = fill_done_pos as i32 - (fill_done_patch as i32 + 4);
+    code[fill_done_patch..fill_done_patch + 4].copy_from_slice(&fill_done_off.to_le_bytes());
+
+    // write(1, r10, rbx - r10)
+    code.extend_from_slice(&[0x4C, 0x89, 0xD6]);             // mov rsi, r10
+    code.extend_from_slice(&[0x48, 0x89, 0xDA]);             // mov rdx, rbx
+    code.extend_from_slice(&[0x4C, 0x29, 0xD2]);             // sub rdx, r10
+    code.extend_from_slice(&[0x48, 0xC7, 0xC7, 0x01, 0x00, 0x00, 0x00]); // mov rdi, 1
+    code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x01, 0x00, 0x00, 0x00]); // mov rax, 1
+    code.extend_from_slice(&[0x0F, 0x05]);                   // syscall
+
+    emit_write_newline(&mut code, 1);
+
+    // Free buffer: mov rsp, r9
+    code.extend_from_slice(&[0x4C, 0x89, 0xCC]);
+
+    // jmp outer_loop_top
+    code.push(0xE9);
+    let oo = outer_loop_top as i32 - (code.len() + 4) as i32;
+    code.extend_from_slice(&oo.to_le_bytes());
+
+    // exit: sys_exit(0)
+    let exit_pos = code.len();
+    let exit_off = exit_pos as i32 - (exit_patch as i32 + 4);
+    code[exit_patch..exit_patch + 4].copy_from_slice(&exit_off.to_le_bytes());
+    code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x3C, 0x00, 0x00, 0x00]); // mov rax, 60
+    code.extend_from_slice(&[0x48, 0x31, 0xFF]);                         // xor rdi, rdi
+    code.extend_from_slice(&[0x0F, 0x05]);                               // syscall
+
+    Ok(code)
+}
+
 /// Verify a collection-op (map/filter) target is `input.<coll_field>`.
 /// Used by both the Map and Filter branches of emit_collection_program.
 fn verify_collection_target(
@@ -4022,6 +4506,27 @@ mod tests {
             .expect("native compile of text-field-through-record should succeed");
         let size = fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
         assert!(size > 300 && size < 2_500, "unexpected binary size: {}", size);
+        let _ = fs::remove_file(out);
+    }
+
+    #[test]
+    fn native_compiles_text_fold_rule() {
+        // Phase 5b: text-valued fold. roster.verbose's rule produces
+        //   fold(w.employees, "roster: ", acc, e => concat(acc, e.name, "=", e.salary, "; "))
+        // Exercises two-pass emission: pass 1 accumulates sizes (strlen per
+        // text-field, +21 per number), pass 2 fills the buffer. One write
+        // per input record; `mov rsp, r9` to free.
+        use std::fs;
+        let src = fs::read_to_string("examples/roster.verbose")
+            .expect("examples/roster.verbose is expected to exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let out = std::env::temp_dir().join("verbosec_test_roster");
+        compile_native(&program, "roster_line", out.to_str().unwrap())
+            .expect("native compile of text-fold rule should succeed");
+        let size = fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
+        assert!(size > 500 && size < 2_500, "unexpected binary size: {}", size);
         let _ = fs::remove_file(out);
     }
 

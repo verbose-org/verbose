@@ -1,0 +1,54 @@
+@verbose 0.1.0
+
+-- Phase 5b: `output: text` via a top-level `fold` that APPENDS to a text
+-- accumulator over a collection. The body's first concat arg is the
+-- accumulator; the remaining args are per-element contributions (literals,
+-- numbers, and element text fields).
+--
+-- Emission: two passes over the collection per input record. Pass 1 computes
+-- the total buffer size (static init + per-element static + runtime strlen
+-- for each text-field arg). Pass 2 fills the buffer. One write syscall at
+-- the end, then `mov rsp, r9` to free. No heap.
+
+
+concept Employee
+  @intention: "An employee has a name and a salary"
+  @source: roster.intent:1
+
+  fields:
+    name   : text
+    salary : number [0, 1000000]
+
+
+concept Workforce
+  @intention: "A workforce is a collection of employees"
+  @source: roster.intent:2
+
+  fields:
+    employees : collection(Employee)
+
+
+rule roster_line
+  @intention: "Build one roster line: header followed by name=salary; per employee"
+  @source: roster.intent:3
+
+  input:
+    w : Workforce
+
+  output:
+    line : text
+
+  logic:
+    line = fold(w.employees, "roster: ", acc, e => concat(acc, e.name, "=", e.salary, "; "))
+
+  proofs:
+    purity:
+      reads   : [w.employees]
+      writes  : []
+      calls   : []
+      verdict : pure
+    termination:
+      form  : constant_bound
+      bound : 6
+    determinism:
+      form : total
