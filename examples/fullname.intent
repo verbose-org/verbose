@@ -1,0 +1,3 @@
+1. A person has a first name, a last name, and an age.
+2. A greeting has a composed full name and the age.
+3. For each person, build the greeting — its fullname is the concatenation of the two name parts.

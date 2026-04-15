@@ -4510,6 +4510,30 @@ mod tests {
     }
 
     #[test]
+    fn native_compiles_record_text_field_from_concat() {
+        // fullname.verbose: Greeting { fullname: concat(p.first, " ", p.last),
+        // age: p.age }. Exercises `emit_text_write_to_fd`'s Concat arm
+        // inside `emit_record_as_json` — the dynamic-sized concat buffer
+        // (with r9 = saved rsp, mov rsp, r9 to free) composes a text value
+        // that then flows through the JSON streaming path as a field value.
+        // Regression: the "Record fields with text-typed value coming from
+        // concat" claim in CLAUDE.md's rejection list was stale — this test
+        // locks the working behavior.
+        use std::fs;
+        let src = fs::read_to_string("examples/fullname.verbose")
+            .expect("examples/fullname.verbose is expected to exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let out = std::env::temp_dir().join("verbosec_test_fullname");
+        compile_native(&program, "compose_greeting", out.to_str().unwrap())
+            .expect("native compile of record-text-from-concat should succeed");
+        let size = fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
+        assert!(size > 500 && size < 2_500, "unexpected binary size: {}", size);
+        let _ = fs::remove_file(out);
+    }
+
+    #[test]
     fn native_compiles_text_fold_rule() {
         // Phase 5b: text-valued fold. roster.verbose's rule produces
         //   fold(w.employees, "roster: ", acc, e => concat(acc, e.name, "=", e.salary, "; "))

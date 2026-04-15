@@ -1,0 +1,51 @@
+@verbose 0.1.0
+
+-- Record output with a text field built via `concat(...)` of input fields.
+-- The JSON streaming path invokes `emit_text_write_to_fd` for each text
+-- field value; that helper handles the full shape (literal, input-field
+-- text, or concat with text-field args via the dynamic-sized buffer).
+
+
+concept Person
+  @intention: "A person has a first and last name and an age"
+  @source: fullname.intent:1
+
+  fields:
+    first : text
+    last  : text
+    age   : number [0, 150]
+
+
+concept Greeting
+  @intention: "A greeting has a composed full name and the age"
+  @source: fullname.intent:2
+
+  fields:
+    fullname : text
+    age      : number
+
+
+rule compose_greeting
+  @intention: "Build the greeting; fullname concatenates the two name parts"
+  @source: fullname.intent:3
+
+  input:
+    p : Person
+
+  output:
+    g : Greeting
+
+  logic:
+    g = Greeting { fullname: concat(p.first, " ", p.last), age: p.age }
+
+  proofs:
+    purity:
+      reads   : [p.first, p.last, p.age]
+      writes  : []
+      calls   : []
+      verdict : pure
+    termination:
+      form  : constant_bound
+      bound : 4
+    determinism:
+      form : total
