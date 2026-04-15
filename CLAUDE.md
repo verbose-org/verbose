@@ -248,11 +248,121 @@ after_inner:
 **Why this design holds security pillar #1:** identical attack surface to Phase 3. Same three syscalls. One new stack slot — which is not an attack surface, it's a rbp offset. An auditor reading the disassembled binary sees one extra `mov [rbp-offset], rax` per iteration compared to Phase 3, and one final `itoa + write` at the bottom. Nothing else.
 
 **What Phase 4 does NOT do** (refused with clear messages, deferred to later phases):
-- `output: text` with fold producing a text (would need concat-into-buffer with growth — not one slot).
+- `output: text` with fold producing a text (covered by Phase 5b — different accumulator shape).
 - `output: Record` with fields computed by fold (would need multiple acc slots and a final record emission).
 - Body containing a nested `fold` (would need acc-slot stack discipline — the outer/inner slots would collide).
 - Generic `fold(coll, init_expr, ...)` with a non-literal init (pre-loop evaluation needed).
 - `fold` whose target is a rule call returning a collection (Phase 3 already refuses collection-returning rule calls as map/filter targets; Phase 4 inherits the refusal).
+
+### Phase 5b design (locked before implementation)
+
+Phase 5b handles **text-valued folds**: `output: text` with a top-level `fold` that appends to a text accumulator over a collection. It's the first emitter where the accumulator SIZE grows across iterations — Phase 4's accumulator is one i64, Phase 5b's is a contiguous byte buffer whose final length is determined by the element data.
+
+**Core design decision: append-only body shape.** The fold body must be `concat(acc, ...rest)` where `acc` is the FIRST argument and does NOT appear anywhere in `...rest` (nor recursively inside nested expressions). This is a structural invariant the emitter checks at compile time — not a style preference.
+
+Why this restriction is load-bearing, not arbitrary:
+- "Append to accumulator" is the semantic of text-fold every realistic use case wants (CSV rows, joined lists, report lines, command builders). A body like `concat(e.name, acc)` or `concat(X, acc, Y)` would mean "rebuild acc each iteration with prefix/interleave" — that's O(N²) memory regardless of strategy, and we'd be paying cost for a shape no one actually needs.
+- With `acc` pinned to position 0, per-iteration byte growth = sum of sizes of `...rest` args, none of which reference the accumulator. That makes sizing statically decomposable into "per-element static bytes + per-element runtime-strlen bytes" — computable in one forward pass over the collection.
+- The restriction is easy to explain ("append-only"), easy to relax later if needed (add more shapes as distinct cases), and survives cleanly if a future `text [..N]` declaration lands — the append-only shape is still valid, it just becomes faster to size.
+
+**Sizing strategy: two passes over the collection.** The first pass walks argv to compute the total buffer size into rax (static per-element size + runtime strlen of each text-field arg in `...rest`, summed N times). After sizing, `mov r9, rsp; sub rsp, rax` reserves the buffer dynamically (same `r9`-saves-rsp trick as the Phase 1B text-field concat). The second pass walks argv again to actually fill the buffer. One `write(1, buffer, length)` + newline at the end, then `mov rsp, r9` to free.
+
+Two passes is fine: the first pass is pure size arithmetic (strlen + add, no data movement), the second pass is the actual fill. No iteration of user logic is duplicated — the sizing pass doesn't evaluate the fold body, it only asks "how many bytes does each arg contribute?" which is a per-arg-kind lookup plus one strlen call per text field.
+
+**Frame layout.** Phase 3's prologue extended by TWO slots:
+```
+rbp - 8*(nfields + 1)                 first scalar field
+...
+rbp - 8*(nfields + nlets + 1)         last let-binding slot
+rbp - 8*(nfields + nlets + 2)         count_slot            (N, stored after parsing)  ← Phase 5b addition
+rbp - 8*(nfields + nlets + 3)         argv_save_slot        (r14 at first element)     ← Phase 5b addition
+```
+Both slots are written at the top of the outer-loop body, before the sizing pass. They're read at the start of the fill pass to rewind r14 and r15 to their pre-pass-1 values. After the fill pass the slots are dead until the next outer iteration.
+
+**Register map: no new reservation.**
+- `r14` — argv index (walked forward twice, rewound from `argv_save_slot` between passes)
+- `r15` — inner counter per pass (reloaded from `count_slot` for pass 2)
+- `r10` — buffer base (for the final `write` syscall source)
+- `r9`  — saved pre-allocation rsp (for `mov rsp, r9` cleanup)
+- `rbx` — buffer write pointer during fill
+- `r8`, `rax`, `rcx`, `rdx`, `rsi`, `rdi`, `r11` — ephemeral
+
+No fresh register role, no collision with existing emitters.
+
+**Emission flow.**
+```
+outer_loop_top:
+  check r14 < argc - 1 else exit
+  parse scalar input fields into rbp slots
+  parse count N → r15 ; store r15 at count_slot ; inc r14
+  store r14 at argv_save_slot                    ; remember first-element index
+
+  ; --- pass 1: size ---
+  mov rax, static_init_size                      ; init literal's length
+size_loop_top:
+  test r15, r15 ; jz size_done
+  for each text-field arg in body's ...rest:
+    mov rsi, [rbp + <field_offset>]              ; field offset relative to element start
+    ; wait — we need to point rsi at argv[r14 + field_index]
+    mov rsi, [r13 + r14*8 + field_index*8]
+    push rax ; emit_strlen ; pop rcx ; add rcx, rdx ; mov rax, rcx
+  add rax, static_per_element                    ; literals + 21 × numbers
+  advance r14 by n_elem_fields
+  dec r15
+  jmp size_loop_top
+size_done:
+  add rax, 7 ; and rax, ~7                       ; round up to 8
+
+  ; --- buffer allocation ---
+  mov r9, rsp
+  sub rsp, rax
+  mov rbx, rsp                                   ; rbx = write ptr
+  mov r10, rbx                                   ; r10 = buffer base
+
+  ; --- copy init literal ---
+  inline jmp-over-data ; lea rsi, [rip + init] ; mov rcx, init_size ; rep movsb ; mov rbx, rdi
+
+  ; --- rewind r14 and r15 for pass 2 ---
+  mov r14, [rbp + argv_save_slot]
+  mov r15, [rbp + count_slot]
+
+  ; --- pass 2: fill ---
+fill_loop_top:
+  test r15, r15 ; jz fill_done
+  parse element fields into rbp element slots    ; same dispatch as Phase 3 (Number via atoi, Text stores ptr)
+  for each arg in body's ...rest:
+    evaluate/copy per kind (literal inline, number via itoa_to_buffer, text-field via strlen + rep movsb)
+  advance r14 by n_elem_fields (already done by the per-field "inc r14" in the parse step)
+  dec r15
+  jmp fill_loop_top
+fill_done:
+
+  ; --- write(1, r10, rbx - r10) + newline ---
+  mov rsi, r10 ; mov rax, 1 ; mov rdi, 1 ; mov rdx, rbx ; sub rdx, r10 ; syscall
+  emit_write_newline(1)
+
+  ; --- free ---
+  mov rsp, r9
+
+  jmp outer_loop_top
+```
+
+**Why this design holds security pillar #1:** identical syscall surface to Phase 4. Same three: read argv, write fd, exit. No heap. One additional `write` per input record (plus the newline), but that's a static property of the rule shape, not something that varies with input. Two new rbp slots (not an attack surface — just rbp offsets). Buffer size is a function of declared element data, not of arbitrary user input outside the concept's declared range.
+
+**Scope v1 (everything else refused with a clear message):**
+- `rule.output_ty == Type::Text`
+- Top-level logic: `Fold(Field(Ident(input), coll_field), Text(init_literal), acc, item, Concat(args))`
+- `args[0]` is `Expr::Ident(acc)`; `acc` does not appear anywhere in `args[1..]` (or nested within).
+- `init` is a `Text` literal (analogous to Phase 4's Number-literal init).
+- Input concept: scalars* + ONE trailing collection(Concept) field (same shape as Phase 3 / 4).
+- Element concept: number/text fields only.
+- Each arg in `args[1..]` classifies as either text literal, number expression, or text field (via the same `classify_concat_arg` Phase 1B uses).
+
+**What Phase 5b does NOT do** (refused with clear messages, deferred):
+- Non-append body shapes (`concat(X, acc)`, `concat(X, acc, Y)`, `if ... then concat(acc, ...)  else concat(acc, ...)`). Workaround: reorganize into append-only, use a trailing-separator pattern with an initial-empty init.
+- Nested `fold` inside the body.
+- `fold` target that is a rule call returning a collection.
+- Bodies that are not a top-level `concat` (e.g. just `Ident(acc)` — a no-op fold producing the init unchanged; the verifier should probably reject this anyway).
 
 ### What native still rejects, and in which priority
 
