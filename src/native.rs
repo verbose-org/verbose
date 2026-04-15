@@ -506,6 +506,12 @@ enum ConcatArgKind {
     /// Err arm. The bound value is represented as (ptr, len) in two rbp
     /// slots rather than as a NUL-terminated pointer.
     BoundText,
+    /// Phase 2H-b: text-returning rule call. Evaluated once in a pre-eval
+    /// pass; (ptr, len) stored at [r11 + 16*slot_idx + {0, 8}] where
+    /// slot_idx is the index of this Call among the concat's Call args.
+    /// The slot_idx is decoupled from the arg position so non-Call args
+    /// don't consume slots.
+    CallText,
 }
 
 /// Mapping `identifier → (ptr_slot, len_slot)` for text-typed values bound
@@ -527,6 +533,7 @@ fn classify_concat_arg(
         Expr::Ident(name) if text_bindings.contains_key(name.as_str()) => {
             Some(ConcatArgKind::BoundText)
         }
+        Expr::Call(_, _) => Some(ConcatArgKind::CallText),
         Expr::Field(base, field_name) => {
             if matches!(base.as_ref(), Expr::Ident(n) if n == input_name) {
                 let f = concept.fields.iter().find(|f| &f.name == field_name)?;
@@ -699,15 +706,38 @@ fn emit_concat_to_buffer(
     field_ranges: &HashMap<&str, (i64, i64)>,
     text_bindings: &TextBindings<'_>,
 ) -> Result<ConcatBufResult, NativeError> {
-    // Classify every arg and tally the static worst case. A text-field arg
-    // or a bound text var means sizing must be runtime-dynamic.
+    emit_concat_to_buffer_impl(
+        code, args, input_name, concept, all_rules, offsets, field_ranges, text_bindings,
+        /* is_nested= */ false,
+    )
+}
+
+/// Core concat-to-buffer emitter. When `is_nested`, skips the `mov r9, rsp`
+/// pre-alloc save (the outer's r9 survives), and rejects CallText args
+/// (Phase 2H-b scope restriction — one level of pre-eval).
+fn emit_concat_to_buffer_impl(
+    code: &mut Vec<u8>,
+    args: &[Expr],
+    input_name: &str,
+    concept: &Concept,
+    all_rules: &HashMap<&str, &Rule>,
+    offsets: &HashMap<&str, i32>,
+    field_ranges: &HashMap<&str, (i64, i64)>,
+    text_bindings: &TextBindings<'_>,
+    is_nested: bool,
+) -> Result<ConcatBufResult, NativeError> {
+    // Classify every arg and tally the static worst case. A text-field arg,
+    // a bound text var, or a Call arg means sizing must be runtime-dynamic.
     let mut kinds: Vec<ConcatArgKind> = Vec::with_capacity(args.len());
     let mut static_total: i32 = 0;
     let mut has_dynamic: bool = false;
+    let mut n_calls: i32 = 0;
+    // Map i-th arg → its CallText slot index in r11's array. -1 if not a Call.
+    let mut call_slot_idx: Vec<i32> = Vec::with_capacity(args.len());
     for arg in args {
         let kind = classify_concat_arg(arg, concept, input_name, text_bindings).ok_or_else(|| {
             NativeError {
-                message: "concat argument type not yet supported in native (text + number scalars or bound text var; bool and others stay interpreter-only)".into(),
+                message: "concat argument type not yet supported in native (text + number scalars, bound text var, or text-returning rule call; bool and others stay interpreter-only)".into(),
             }
         })?;
         kinds.push(kind);
@@ -716,16 +746,27 @@ fn emit_concat_to_buffer(
                 if let Expr::Text(s) = arg {
                     static_total += s.as_bytes().len() as i32;
                 } else if let Expr::Field(_, _) = arg {
-                    // Text field: length known only at runtime. Dynamic path.
                     has_dynamic = true;
                 }
+                call_slot_idx.push(-1);
             }
             ConcatArgKind::Number => {
-                static_total += 21; // i64 max 20 digits + sign
+                static_total += 21;
+                call_slot_idx.push(-1);
             }
             ConcatArgKind::BoundText => {
-                // Bound text var: length is in a rbp slot. Dynamic path.
                 has_dynamic = true;
+                call_slot_idx.push(-1);
+            }
+            ConcatArgKind::CallText => {
+                if is_nested {
+                    return Err(NativeError {
+                        message: "Phase 2H-b: nested concat (inside a text-returning callee's body) cannot have its own Call args — only one level of pre-eval supported".into(),
+                    });
+                }
+                has_dynamic = true;
+                call_slot_idx.push(n_calls);
+                n_calls += 1;
             }
         }
     }
@@ -743,7 +784,7 @@ fn emit_concat_to_buffer(
         code.extend_from_slice(&[0x48, 0x89, 0xE3]);
         // mov r10, rbx  — buffer base for final length calc
         code.extend_from_slice(&[0x49, 0x89, 0xDA]);
-        emit_concat_fill(code, args, &kinds, input_name, concept, all_rules, offsets, field_ranges, text_bindings)?;
+        emit_concat_fill(code, args, &kinds, &call_slot_idx, input_name, concept, all_rules, offsets, field_ranges, text_bindings)?;
         // rax = buffer base, rdx = length (rbx - r10)
         code.extend_from_slice(&[0x4C, 0x89, 0xD0]); // mov rax, r10
         code.extend_from_slice(&[0x48, 0x89, 0xDA]); // mov rdx, rbx
@@ -751,15 +792,55 @@ fn emit_concat_to_buffer(
         return Ok(ConcatBufResult::Static(buf_size));
     }
 
-    // Dynamic path: compute the total buffer size at runtime.
-    // rax = static_total
-    // mov rax, static_total (i32 imm sign-extended into rax)
+    // Dynamic path. Capture rsp in r9 (outermost only) so the eventual
+    // `mov rsp, r9` at cleanup frees the slot array, callee buffers, and
+    // the main buffer in one instruction. When nested, we skip this — the
+    // outer's r9 stays valid because nested concats never overwrite it
+    // (scope restriction: nested has no CallText, so no pre-eval, and we
+    // also skip the `mov r9, rsp` save entirely for nested).
+    if !is_nested {
+        // mov r9, rsp
+        code.extend_from_slice(&[0x49, 0x89, 0xE1]);
+    }
+
+    // Phase 2H-b: pre-evaluate Call args into an r11-indexed slot array.
+    // Only the outermost concat does pre-eval (nested is CallText-free).
+    if n_calls > 0 {
+        // sub rsp, 16*n_calls
+        let slots_bytes = 16 * n_calls;
+        code.extend_from_slice(&[0x48, 0x81, 0xEC]);
+        code.extend_from_slice(&slots_bytes.to_le_bytes());
+        // mov r11, rsp  — slot base
+        code.extend_from_slice(&[0x49, 0x89, 0xE3]);
+
+        // For each Call arg, emit callee into (rax, rdx) and store at the slot.
+        // The inner (nested) emit_concat_to_buffer skips the r9 save and
+        // refuses CallText args, so outer's r9 and r11 both survive as
+        // register values across the inner evaluation. No push/pop dance
+        // needed — the whole point of the is_nested flag.
+        for (arg, kind) in args.iter().zip(kinds.iter()) {
+            if *kind != ConcatArgKind::CallText {
+                continue;
+            }
+            let slot_idx = call_slot_idx[args.iter().position(|a| std::ptr::eq(a, arg)).unwrap()];
+            let disp_ptr = 16 * slot_idx;
+            let disp_len = disp_ptr + 8;
+
+            emit_text_produce_ptrlen(
+                code, arg, input_name, concept, all_rules, offsets, field_ranges, text_bindings,
+            )?;
+
+            // mov [r11 + disp_ptr], rax
+            emit_mov_r11_disp_from_reg(code, disp_ptr, /* is_rax= */ true);
+            // mov [r11 + disp_len], rdx
+            emit_mov_r11_disp_from_reg(code, disp_len, /* is_rax= */ false);
+        }
+    }
+
+    // Sizing pass. mov rax, static_total.
     code.extend_from_slice(&[0x48, 0xC7, 0xC0]);
     code.extend_from_slice(&static_total.to_le_bytes());
-    // For each text-field arg, strlen the pointer at its rbp slot and add
-    // the length into rax. push/pop rax brackets each strlen since it
-    // clobbers rax. For bound-text args, the length is already stored in a
-    // rbp slot — just add it directly.
+
     for (arg, kind) in args.iter().zip(kinds.iter()) {
         match *kind {
             ConcatArgKind::Text => {
@@ -770,9 +851,7 @@ fn emit_concat_to_buffer(
                             field_name
                         ),
                     })?;
-                    // push rax
-                    code.push(0x50);
-                    // mov rsi, [rbp + offset]
+                    code.push(0x50); // push rax
                     if offset >= -128 {
                         code.extend_from_slice(&[0x48, 0x8B, 0x75]);
                         code.push(offset as u8);
@@ -780,18 +859,15 @@ fn emit_concat_to_buffer(
                         code.extend_from_slice(&[0x48, 0x8B, 0xB5]);
                         code.extend_from_slice(&offset.to_le_bytes());
                     }
-                    emit_strlen(code); // rdx = length, rsi unchanged
-                    // pop rcx  (restore accumulated total into rcx; rax clobbered by strlen)
-                    code.push(0x59);
-                    // add rcx, rdx ; mov rax, rcx
-                    code.extend_from_slice(&[0x48, 0x01, 0xD1]);
-                    code.extend_from_slice(&[0x48, 0x89, 0xC8]);
+                    emit_strlen(code); // rdx = length
+                    code.push(0x59); // pop rcx
+                    code.extend_from_slice(&[0x48, 0x01, 0xD1]); // add rcx, rdx
+                    code.extend_from_slice(&[0x48, 0x89, 0xC8]); // mov rax, rcx
                 }
             }
             ConcatArgKind::BoundText => {
                 if let Expr::Ident(name) = arg {
                     let (_, len_slot) = *text_bindings.get(name.as_str()).expect("classified as BoundText so present in bindings");
-                    // add rax, [rbp + len_slot]   (48 03 ModRM [disp])
                     if len_slot >= -128 {
                         code.extend_from_slice(&[0x48, 0x03, 0x45]);
                         code.push(len_slot as u8);
@@ -801,29 +877,236 @@ fn emit_concat_to_buffer(
                     }
                 }
             }
+            ConcatArgKind::CallText => {
+                // add rax, [r11 + 16*slot_idx + 8]  (the len)
+                let slot_idx = call_slot_idx[args.iter().position(|a| std::ptr::eq(a, arg)).unwrap()];
+                let disp = 16 * slot_idx + 8;
+                // 49 03 ModRM(01 000 011 = 0x43) disp8  or  49 03 ModRM(10 000 011 = 0x83) disp32
+                if disp <= 127 {
+                    code.extend_from_slice(&[0x49, 0x03, 0x43]);
+                    code.push(disp as u8);
+                } else {
+                    code.extend_from_slice(&[0x49, 0x03, 0x83]);
+                    code.extend_from_slice(&disp.to_le_bytes());
+                }
+            }
             _ => {}
         }
     }
-    // Round up to 8 for alignment: add rax, 7 ; and rax, ~7
+
+    // Round up: add rax, 7 ; and rax, ~7
     code.extend_from_slice(&[0x48, 0x83, 0xC0, 0x07]);
     code.extend_from_slice(&[0x48, 0x83, 0xE0, 0xF8]);
-    // Save rsp in r9 (preserved across syscalls, not used by itoa/strlen).
-    // mov r9, rsp
-    code.extend_from_slice(&[0x49, 0x89, 0xE1]);
-    // sub rsp, rax  — dynamic allocation
+    // sub rsp, rax  — main buffer allocation
     code.extend_from_slice(&[0x48, 0x29, 0xC4]);
-    // mov rbx, rsp  ; mov r10, rbx
+    // mov rbx, rsp ; mov r10, rbx
     code.extend_from_slice(&[0x48, 0x89, 0xE3]);
     code.extend_from_slice(&[0x49, 0x89, 0xDA]);
 
-    emit_concat_fill(code, args, &kinds, input_name, concept, all_rules, offsets, field_ranges, text_bindings)?;
+    emit_concat_fill(code, args, &kinds, &call_slot_idx, input_name, concept, all_rules, offsets, field_ranges, text_bindings)?;
 
     // rax = buffer base, rdx = length
     code.extend_from_slice(&[0x4C, 0x89, 0xD0]); // mov rax, r10
     code.extend_from_slice(&[0x48, 0x89, 0xDA]); // mov rdx, rbx
     code.extend_from_slice(&[0x4C, 0x29, 0xD2]); // sub rdx, r10
 
+    // Note: we don't pop r11 here. The Dynamic cleanup path does `mov rsp, r9`
+    // which drops EVERYTHING below r9 — including the main buffer, the slot
+    // array, the pushed-r11-placeholder (if we pushed one), and any callee
+    // concat buffers. The saved r11 value on the stack is freed along with
+    // everything else; the outer scope doesn't need the restored r11 because
+    // its own ConcatBufResult::Dynamic cleanup will similarly reset rsp.
+    // (If we ever need to restore r11 for post-concat use, we'd lift the
+    // ordering to `pop r11 ; mov rsp, r9`, but no current caller needs it.)
+
     Ok(ConcatBufResult::Dynamic)
+}
+
+/// Emit `mov [r11 + disp], reg` where reg is rax (is_rax=true) or rdx.
+/// Used by Phase 2H-b to populate Call-arg slots in the pre-eval array.
+fn emit_mov_r11_disp_from_reg(code: &mut Vec<u8>, disp: i32, is_rax: bool) {
+    // REX.WB + 0x89 + ModRM(reg = rax(000) or rdx(010), r/m = r11 (011, with REX.B))
+    let reg_field: u8 = if is_rax { 0b000 } else { 0b010 };
+    if disp >= -128 && disp <= 127 {
+        let modrm = 0b01_000_000 | (reg_field << 3) | 0b011;
+        code.extend_from_slice(&[0x49, 0x89, modrm]);
+        code.push(disp as u8);
+    } else {
+        let modrm = 0b10_000_000 | (reg_field << 3) | 0b011;
+        code.extend_from_slice(&[0x49, 0x89, modrm]);
+        code.extend_from_slice(&disp.to_le_bytes());
+    }
+}
+
+/// Produce (rax = ptr, rdx = len) for a text-producing expression — used by
+/// the Phase 2H-b pre-eval pass when evaluating a Call arg's body.
+///
+/// Handles the same shapes as `emit_text_write_to_fd` but ends with the
+/// values in registers instead of a write syscall. Allocated buffers (for
+/// Concat callees) stay on the stack; the outer caller's final
+/// `mov rsp, r9` will free them.
+///
+/// Scope mirrors Phase 2G: callee's body can be Text, Field, Concat, or
+/// Call (recursively). The `Expr::Call` case validates the 2G restrictions
+/// and recurses on the callee's body.
+fn emit_text_produce_ptrlen(
+    code: &mut Vec<u8>,
+    text_expr: &Expr,
+    input_name: &str,
+    concept: &Concept,
+    all_rules: &HashMap<&str, &Rule>,
+    offsets: &HashMap<&str, i32>,
+    field_ranges: &HashMap<&str, (i64, i64)>,
+    text_bindings: &TextBindings<'_>,
+) -> Result<(), NativeError> {
+    match text_expr {
+        Expr::Call(callee_name, args) => {
+            // Validate the same Phase 2G restrictions.
+            let callee = all_rules.get(callee_name.as_str()).ok_or_else(|| NativeError {
+                message: format!(
+                    "Phase 2H-b: unknown rule '{}' called in concat",
+                    callee_name
+                ),
+            })?;
+            if !matches!(callee.output_ty, Type::Text) {
+                return Err(NativeError {
+                    message: format!(
+                        "Phase 2H-b: rule '{}' in concat must return `text`, not {:?}",
+                        callee_name, callee.output_ty
+                    ),
+                });
+            }
+            let callee_concept_name = match &callee.input_ty {
+                Type::Named(n) => n.as_str(),
+                _ => {
+                    return Err(NativeError {
+                        message: format!(
+                            "Phase 2H-b: rule '{}' input must be a named concept",
+                            callee_name
+                        ),
+                    });
+                }
+            };
+            if callee_concept_name != concept.name.as_str() {
+                return Err(NativeError {
+                    message: format!(
+                        "Phase 2H-b: callee '{}' takes concept '{}' but caller takes '{}' — same-concept required",
+                        callee_name, callee_concept_name, concept.name
+                    ),
+                });
+            }
+            if callee.input_name != input_name {
+                return Err(NativeError {
+                    message: format!(
+                        "Phase 2H-b: callee '{}' binds its input as '{}' but caller uses '{}' — same input name required",
+                        callee_name, callee.input_name, input_name
+                    ),
+                });
+            }
+            if !callee.logic.bindings.is_empty() {
+                return Err(NativeError {
+                    message: format!(
+                        "Phase 2H-b: callee '{}' has let bindings; not yet supported in native",
+                        callee_name
+                    ),
+                });
+            }
+            if args.len() != 1 || !matches!(&args[0], Expr::Ident(n) if n == input_name) {
+                return Err(NativeError {
+                    message: format!(
+                        "Phase 2H-b: rule '{}' must be called with exactly the caller's input identifier",
+                        callee_name
+                    ),
+                });
+            }
+            emit_text_produce_ptrlen(
+                code, &callee.logic.value, input_name, concept, all_rules,
+                offsets, field_ranges, text_bindings,
+            )
+        }
+        Expr::Text(s) => {
+            // jmp over inline bytes; lea rax, [rip+data]; mov rdx, n.
+            let bytes = s.as_bytes();
+            let n = bytes.len() as i32;
+            if n <= 127 {
+                code.push(0xEB);
+                code.push(n as u8);
+            } else {
+                code.push(0xE9);
+                code.extend_from_slice(&n.to_le_bytes());
+            }
+            let addr = code.len();
+            code.extend_from_slice(bytes);
+            // lea rax, [rip + rel32]
+            let end = code.len() + 7;
+            let rel32 = addr as i32 - end as i32;
+            code.extend_from_slice(&[0x48, 0x8D, 0x05]);
+            code.extend_from_slice(&rel32.to_le_bytes());
+            // mov rdx, n
+            code.extend_from_slice(&[0x48, 0xC7, 0xC2]);
+            code.extend_from_slice(&n.to_le_bytes());
+            Ok(())
+        }
+        Expr::Field(base, field_name)
+            if matches!(base.as_ref(), Expr::Ident(n) if n == input_name) =>
+        {
+            let f = concept
+                .fields
+                .iter()
+                .find(|f| &f.name == field_name)
+                .ok_or_else(|| NativeError {
+                    message: format!("unknown field '{}' in text-produce", field_name),
+                })?;
+            if !matches!(f.ty, Type::Text) {
+                return Err(NativeError {
+                    message: format!(
+                        "Phase 2H-b: field '{}' is not text",
+                        field_name
+                    ),
+                });
+            }
+            let offset = offsets[field_name.as_str()];
+            // mov rax, [rbp + offset]  (ptr)
+            load_rax_from_rbp(code, offset);
+            // mov rsi, rax ; emit_strlen -> rdx = len
+            code.extend_from_slice(&[0x48, 0x89, 0xC6]);
+            emit_strlen(code);
+            Ok(())
+        }
+        Expr::Ident(name) if text_bindings.contains_key(name.as_str()) => {
+            let (ptr_slot, len_slot) = text_bindings[name.as_str()];
+            // mov rax, [rbp + ptr_slot]
+            load_rax_from_rbp(code, ptr_slot);
+            // mov rdx, [rbp + len_slot]
+            if len_slot >= -128 {
+                code.extend_from_slice(&[0x48, 0x8B, 0x55]);
+                code.push(len_slot as u8);
+            } else {
+                code.extend_from_slice(&[0x48, 0x8B, 0x95]);
+                code.extend_from_slice(&len_slot.to_le_bytes());
+            }
+            Ok(())
+        }
+        Expr::Concat(inner_args) => {
+            // Recurse into a nested concat. is_nested=true so the inner
+            // skips `mov r9, rsp` (outer's r9 survives) and rejects CallText
+            // args (one-level-of-pre-eval scope restriction). Its (rax, rdx)
+            // point into its own stack buffer, which stays allocated until
+            // the outermost `mov rsp, r9` frees everything at once.
+            let _buf = emit_concat_to_buffer_impl(
+                code, inner_args, input_name, concept, all_rules, offsets, field_ranges,
+                text_bindings,
+                /* is_nested= */ true,
+            )?;
+            Ok(())
+        }
+        other => Err(NativeError {
+            message: format!(
+                "Phase 2H-b: callee body shape not supported: {:?}",
+                other
+            ),
+        }),
+    }
 }
 
 /// Shared fill loop for both static- and dynamic-sized concat buffers.
@@ -835,6 +1118,7 @@ fn emit_concat_fill(
     code: &mut Vec<u8>,
     args: &[Expr],
     kinds: &[ConcatArgKind],
+    call_slot_idx: &[i32],
     input_name: &str,
     concept: &Concept,
     all_rules: &HashMap<&str, &Rule>,
@@ -915,6 +1199,34 @@ fn emit_concat_fill(
                     code.extend_from_slice(&[0xF3, 0xA4]);
                     code.extend_from_slice(&[0x48, 0x89, 0xFB]);
                 }
+            }
+            ConcatArgKind::CallText => {
+                // Pre-eval has already stored (ptr, len) at [r11 + 16*idx + {0,8}].
+                // mov rsi, [r11 + disp_ptr]  ; mov rcx, [r11 + disp_len]
+                // mov rdi, rbx ; rep movsb ; mov rbx, rdi
+                let slot_idx = call_slot_idx[i];
+                let disp_ptr = 16 * slot_idx;
+                let disp_len = disp_ptr + 8;
+                // mov rsi, [r11 + disp_ptr]  (REX.B, ModRM reg=rsi(110) r/m=r11(011))
+                if disp_ptr <= 127 {
+                    code.extend_from_slice(&[0x49, 0x8B, 0x73]);
+                    code.push(disp_ptr as u8);
+                } else {
+                    code.extend_from_slice(&[0x49, 0x8B, 0xB3]);
+                    code.extend_from_slice(&disp_ptr.to_le_bytes());
+                }
+                // mov rcx, [r11 + disp_len]  (ModRM reg=rcx(001) r/m=r11(011))
+                if disp_len <= 127 {
+                    code.extend_from_slice(&[0x49, 0x8B, 0x4B]);
+                    code.push(disp_len as u8);
+                } else {
+                    code.extend_from_slice(&[0x49, 0x8B, 0x8B]);
+                    code.extend_from_slice(&disp_len.to_le_bytes());
+                }
+                // mov rdi, rbx ; rep movsb ; mov rbx, rdi
+                code.extend_from_slice(&[0x48, 0x89, 0xDF]);
+                code.extend_from_slice(&[0xF3, 0xA4]);
+                code.extend_from_slice(&[0x48, 0x89, 0xFB]);
             }
         }
         // If the arg is a Text FIELD (not a literal), emit strlen + rep movsb
@@ -2950,6 +3262,11 @@ fn emit_text_fold_program(
                 message: "Phase 5b: fold body cannot reference bound text vars (no match_result inside fold bodies in native today)".into(),
             });
         }
+        if k == ConcatArgKind::CallText {
+            return Err(NativeError {
+                message: "Phase 5b: fold body cannot call a text-returning rule (use concat literals/fields only)".into(),
+            });
+        }
         rest_kinds.push(k);
     }
 
@@ -2966,7 +3283,9 @@ fn emit_text_fold_program(
             ConcatArgKind::Number => {
                 static_per_element += 21;
             }
-            ConcatArgKind::BoundText => unreachable!("BoundText rejected above"),
+            ConcatArgKind::BoundText | ConcatArgKind::CallText => {
+                unreachable!("BoundText/CallText rejected above")
+            }
         }
     }
 
@@ -3202,10 +3521,15 @@ fn emit_text_fold_program(
     // Emit the rest args into the buffer via the shared fill helper.
     // Lambda var is the "input" for field access; offsets resolve element fields.
     let field_ranges = build_field_ranges(elem_concept);
+    // Phase 5b doesn't use CallText args (rejected above), so the slot-index
+    // vector is all -1 — emit_concat_fill won't consult it for any arg kind
+    // it actually handles here.
+    let no_call_slots: Vec<i32> = vec![-1; rest_args.len()];
     emit_concat_fill(
         &mut code,
         rest_args,
         &rest_kinds,
+        &no_call_slots,
         item_name,
         elem_concept,
         all_rules,
@@ -5032,6 +5356,28 @@ mod tests {
             .expect("native compile of output-text rule should succeed");
         let size = fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
         assert!(size > 300 && size < 2_000, "unexpected binary size: {}", size);
+        let _ = fs::remove_file(out);
+    }
+
+    #[test]
+    fn native_compiles_call_inside_concat_arg() {
+        // Phase 2H-b: compose.verbose::greeting concatenates a literal
+        // prefix, a helper rule call (display_name(p)), and a number field.
+        // Exercises the pre-eval loop: mov r9, rsp; sub rsp, 16;
+        // mov r11, rsp; emit display_name → (rax, rdx); mov [r11], rax;
+        // mov [r11+8], rdx; then sizing pass reads [r11+8], filling pass
+        // copies from (r11[0], r11[8]).
+        use std::fs;
+        let src = fs::read_to_string("examples/compose.verbose")
+            .expect("examples/compose.verbose is expected to exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let out = std::env::temp_dir().join("verbosec_test_greeting_2hb");
+        compile_native(&program, "greeting", out.to_str().unwrap())
+            .expect("native compile of Call-in-concat-arg should succeed");
+        let size = fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
+        assert!(size > 500 && size < 2_500, "unexpected binary size: {}", size);
         let _ = fs::remove_file(out);
     }
 

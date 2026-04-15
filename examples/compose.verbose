@@ -70,3 +70,29 @@ rule name_line
       bound : 3
     determinism:
       form : total
+
+
+rule greeting
+  @intention: "Phase 2H-b: helper call as a concat argument, not just top-level"
+  @source: compose.intent:3
+
+  input:
+    p : Person
+
+  output:
+    g : text
+
+  logic:
+    g = concat("Hello ", display_name(p), ", age ", p.age, "!")
+
+  proofs:
+    purity:
+      reads   : [p, p.age]
+      writes  : []
+      calls   : [display_name]
+      verdict : pure
+    termination:
+      form  : constant_bound
+      bound : 10
+    determinism:
+      form : total
