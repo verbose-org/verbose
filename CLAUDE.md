@@ -55,7 +55,9 @@ examples/
   layers.*         @layer stratification — architectural discipline verified
   bonus.*          record construction — map produces collection(BonusReport)
   audit_log.*      append_file reaction with dynamic concat content — compiles to a 724-byte native binary
-  audit_simple.*   append_file with static content — compiles to a 462-byte native binary
+  audit_simple.*   append_file with static content — compiles to a 464-byte native binary
+  audit_user.*     append_file reaction whose log line concatenates a text-typed input field;
+                   buffer sized at runtime via per-field strlen, freed via saved-rsp r9 (~847 B)
   purchase.*       Result(number, text) validator — validate_purchase compiles to a 705-byte native binary (Ok -> stdout, Err -> stderr)
   tier.*           Result(text, text) classifier — classify_tier compiles to a 602-byte native binary
   classify.*       Record-output rule — classify_invoice compiles to a ~970-byte native binary that emits one JSON object per record
@@ -138,7 +140,7 @@ Tracking what native emits today, what it still rejects, and the design rules th
 |---|---|---|---|
 | 0 | Scalar rule (`bool` / `number` output from arithmetic, comparisons, field reads) | ~500 B | `invoices.verbose` |
 | 1A | Reaction with `append_file "literal_path" "literal_content"` | ~460 B | `audit_simple.verbose` |
-| 1B | Reaction with `append_file "literal_path" concat(...)` — dynamic text via inline itoa + stack buffer | ~720 B | `audit_log.verbose` |
+| 1B | Reaction with `append_file "literal_path" concat(...)` — dynamic text via inline itoa + stack buffer. Text-field args (e.g. `concat("user=", p.user, ...)`) sized at runtime via per-field `strlen`; `r9` saves the pre-allocation `rsp` so the buffer is freed via `mov rsp, r9` (3 bytes) after the write. Same path also serves `Result(text, text)` Ok/Err arms that concat a text field. | ~720 B (numbers-only) / ~850 B (with text fields) | `audit_log.verbose` (numbers) / `audit_user.verbose` (text field) |
 | 2A | Rule with `output: Result(number, text)` — Ok→stdout, Err→stderr, continuation-passing leaves | ~700 B | `purchase.verbose::validate_purchase` |
 | 2B | Rule with `output: Result(text, text)` — Ok(text) writes to stdout (literal or concat); shared `emit_text_write_to_fd` helper | ~600 B | `tier.verbose::classify_tier` |
 | 2C | Rule with `output: Named(concept)` (record) — JSON serialization to stdout, one object per record. Streaming emission (no on-stack record). Number/text fields supported; `if/else` between two record arms via continuation-passing. | ~1 KB | `classify.verbose::classify_invoice` |
@@ -253,7 +255,6 @@ after_inner:
 ### What native still rejects, and in which priority
 
 - **Result(T, E) with non-scalar T** (e.g. `Result(Record, text)`, `Result(collection, _)`) — each shape needs its own calling convention. Decide shape by shape, never fabricate a "universal Result" that carries unnecessary machinery.
-- **Text-field access in `Result(text, text)` Ok arm or in concat arguments** — Phase 2E added text-field reads only inside record-output rules (`emit_record_program`'s argv loop and `emit_text_write_to_fd`'s special case). Other emitters (`emit_full_program`, `emit_reaction_program`, `emit_result_program`) still call `atoi` on every field. Generalizing requires teaching each emitter the same field-loading dispatch — purely mechanical, not gated by design questions.
 - **Reductions with non-number output** — Phase 4 covers `output: number` with top-level `fold`/`sum`/`count`/`min`/`max`. `output: text` reduction (concat-fold), `output: Record` with fold-computed fields, and nested folds are still refused (each would need a different accumulator shape — text buffer with growth, multi-slot record, fold-slot stack — and each gets its own phase).
 - **Collection-returning rule calls or collection-valued reduction targets** — `map`/`filter` and Phase 4's `fold` target must be a direct `Field(Ident(input), coll_field)`. Composing through an intermediate rule that returns a collection is not supported; the caller has to inline the collection source.
 - **`match_result` with non-pass-through Err arm** — Phase 2D handles `Err(<err_var>)` pass-through (the value flows directly to stderr without being bound). Richer Err arms (using err_var inside concat, or transforming it) need a real text-binding mechanism — two rbp slots per text bound var (ptr + len) since Err values from concat aren't NUL-terminated.
@@ -274,6 +275,7 @@ Emitters that span multiple syscalls or phases share a register layout. Adding a
 | `r15` | (per-emitter role — one or the other, never both in the same binary): file descriptor from `open()` in reaction emitters (Phase 1A) / inner loop counter in collection emitters (Phase 3) | Phase 1A / 3 |
 | `r10` | concat buffer base for later length calculation | Phase 1B |
 | `rbx` | concat write pointer (advances as args are written) | Phase 1B |
+| `r9`  | saved pre-allocation `rsp`, used by the dynamic-sized concat path to free the buffer via `mov rsp, r9` (Linux `write` takes only 3 args, so `r9` survives the syscall). Set only when at least one concat arg is a text field. | Phase 1B (text-field) |
 
 Dedicated rbp-relative slots:
 

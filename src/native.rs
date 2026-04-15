@@ -550,12 +550,53 @@ fn emit_itoa_to_buffer(code: &mut Vec<u8>) {
     code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x18]);
 }
 
+/// Result of `emit_concat_to_buffer` — tells the caller which epilogue to
+/// emit to free the scratch buffer.
+///
+/// - `Static(n)` — all args had compile-time-known sizes, buffer is exactly
+///   `n` bytes. Caller frees with `add rsp, n` (7 bytes).
+/// - `Dynamic` — at least one arg was a text field from argv (unknown length
+///   until runtime). `emit_concat_to_buffer` stashed the pre-allocation rsp
+///   in r9; caller frees with `mov rsp, r9` (3 bytes). r9 is preserved across
+///   `write` (syscall only takes 3 args) and not touched by itoa or strlen.
+enum ConcatBufResult {
+    Static(i32),
+    Dynamic,
+}
+
+/// Emit the free sequence matching a `ConcatBufResult`. Call this after the
+/// consumer has finished reading the buffer (i.e. after the `write` syscall).
+/// Static path: `add rsp, imm32` (7 bytes). Dynamic path: `mov rsp, r9`
+/// (3 bytes) — r9 was set by `emit_concat_to_buffer` to the pre-allocation rsp.
+fn emit_concat_buffer_free(code: &mut Vec<u8>, buf: ConcatBufResult) {
+    match buf {
+        ConcatBufResult::Static(n) => {
+            code.extend_from_slice(&[0x48, 0x81, 0xC4]);
+            code.extend_from_slice(&n.to_le_bytes());
+        }
+        ConcatBufResult::Dynamic => {
+            // mov rsp, r9
+            code.extend_from_slice(&[0x4C, 0x89, 0xCC]);
+        }
+    }
+}
+
 /// Emit code that, when executed, builds the concat(arg1, arg2, ...) result
 /// in a stack-allocated buffer and leaves (buffer_ptr, length) in (rax, rdx).
-/// The CALLER must `add rsp, max_total_len` after consuming the buffer.
+/// The caller frees the buffer according to the returned `ConcatBufResult`.
 ///
-/// The buffer is sized for the worst case: Text args are known-length, Number
-/// args get 21 bytes (i64 max digits + sign). No heap allocation.
+/// Sizing strategy:
+/// - If every arg has a compile-time size (literals, numbers), the buffer is
+///   sized exactly at emission time and `sub rsp, imm32` / `add rsp, imm32`
+///   bracket the buffer.
+/// - If any arg is a text field (from argv — length known only at runtime),
+///   the total is computed at runtime: static parts go into rax, then for
+///   each text field `strlen` is called and its length added. `sub rsp, rax`
+///   reserves the buffer; the pre-allocation rsp is saved in r9 so the caller
+///   can free via `mov rsp, r9` without knowing the size.
+///
+/// No heap allocation in either path. Text fields are copied via `rep movsb`
+/// (length from the same `strlen` call that sized the buffer).
 fn emit_concat_to_buffer(
     code: &mut Vec<u8>,
     args: &[Expr],
@@ -564,10 +605,12 @@ fn emit_concat_to_buffer(
     all_rules: &HashMap<&str, &Rule>,
     offsets: &HashMap<&str, i32>,
     field_ranges: &HashMap<&str, (i64, i64)>,
-) -> Result<i32, NativeError> {
-    // Compute buffer size = sum of per-arg worst case.
+) -> Result<ConcatBufResult, NativeError> {
+    // Classify every arg and tally the static worst case. A text-field arg
+    // means sizing must be runtime-dynamic.
     let mut kinds: Vec<ConcatArgKind> = Vec::with_capacity(args.len());
-    let mut total: i32 = 0;
+    let mut static_total: i32 = 0;
+    let mut has_text_field: bool = false;
     for arg in args {
         let kind = classify_concat_arg(arg, concept, input_name).ok_or_else(|| {
             NativeError {
@@ -578,39 +621,112 @@ fn emit_concat_to_buffer(
         match kind {
             ConcatArgKind::Text => {
                 if let Expr::Text(s) = arg {
-                    total += s.as_bytes().len() as i32;
-                } else if let Expr::Field(_, field_name) = arg {
-                    // Text field — we copy what's there at runtime. We don't
-                    // know its runtime length at compile time, so we reject
-                    // for now. Text-typed fields in concat come later.
-                    let _ = field_name;
-                    return Err(NativeError {
-                        message: "text-typed field in concat not yet supported in native; only text literals are".into(),
-                    });
+                    static_total += s.as_bytes().len() as i32;
+                } else if let Expr::Field(_, _) = arg {
+                    // Text field: length known only at runtime. Dynamic path.
+                    has_text_field = true;
                 }
             }
             ConcatArgKind::Number => {
-                total += 21; // i64 max 20 digits + sign
+                static_total += 21; // i64 max 20 digits + sign
             }
         }
     }
-    if total == 0 {
-        // Shouldn't happen (parser requires at least one arg), but guard.
+    if static_total == 0 && !has_text_field {
         return Err(NativeError { message: "concat with zero total size".into() });
     }
-    // Round up to 8 for stack alignment.
-    let buf_size = ((total + 7) / 8) * 8;
 
-    // sub rsp, buf_size
-    code.extend_from_slice(&[0x48, 0x81, 0xEC]);
-    code.extend_from_slice(&buf_size.to_le_bytes());
-    // mov rbx, rsp  — rbx = write pointer into the buffer
+    if !has_text_field {
+        // Fast path — compile-time-sized buffer, unchanged from before.
+        let buf_size = ((static_total + 7) / 8) * 8;
+        // sub rsp, buf_size
+        code.extend_from_slice(&[0x48, 0x81, 0xEC]);
+        code.extend_from_slice(&buf_size.to_le_bytes());
+        // mov rbx, rsp  — rbx = write pointer
+        code.extend_from_slice(&[0x48, 0x89, 0xE3]);
+        // mov r10, rbx  — buffer base for final length calc
+        code.extend_from_slice(&[0x49, 0x89, 0xDA]);
+        emit_concat_fill(code, args, &kinds, input_name, concept, all_rules, offsets, field_ranges)?;
+        // rax = buffer base, rdx = length (rbx - r10)
+        code.extend_from_slice(&[0x4C, 0x89, 0xD0]); // mov rax, r10
+        code.extend_from_slice(&[0x48, 0x89, 0xDA]); // mov rdx, rbx
+        code.extend_from_slice(&[0x4C, 0x29, 0xD2]); // sub rdx, r10
+        return Ok(ConcatBufResult::Static(buf_size));
+    }
+
+    // Dynamic path: compute the total buffer size at runtime.
+    // rax = static_total
+    // mov rax, static_total (i32 imm sign-extended into rax)
+    code.extend_from_slice(&[0x48, 0xC7, 0xC0]);
+    code.extend_from_slice(&static_total.to_le_bytes());
+    // For each text-field arg, strlen the pointer at its rbp slot and add
+    // the length into rax. push/pop rax brackets each strlen since it
+    // clobbers rax.
+    for (arg, kind) in args.iter().zip(kinds.iter()) {
+        if *kind == ConcatArgKind::Text {
+            if let Expr::Field(_, field_name) = arg {
+                let offset = *offsets.get(field_name.as_str()).ok_or_else(|| NativeError {
+                    message: format!(
+                        "text-field '{}' has no rbp slot in concat size calc — input parsing missed it",
+                        field_name
+                    ),
+                })?;
+                // push rax
+                code.push(0x50);
+                // mov rsi, [rbp + offset]
+                if offset >= -128 {
+                    code.extend_from_slice(&[0x48, 0x8B, 0x75]);
+                    code.push(offset as u8);
+                } else {
+                    code.extend_from_slice(&[0x48, 0x8B, 0xB5]);
+                    code.extend_from_slice(&offset.to_le_bytes());
+                }
+                emit_strlen(code); // rdx = length, rsi unchanged
+                // pop rcx  (restore accumulated total into rcx; rax clobbered by strlen)
+                code.push(0x59);
+                // add rcx, rdx ; mov rax, rcx
+                code.extend_from_slice(&[0x48, 0x01, 0xD1]);
+                code.extend_from_slice(&[0x48, 0x89, 0xC8]);
+            }
+        }
+    }
+    // Round up to 8 for alignment: add rax, 7 ; and rax, ~7
+    code.extend_from_slice(&[0x48, 0x83, 0xC0, 0x07]);
+    code.extend_from_slice(&[0x48, 0x83, 0xE0, 0xF8]);
+    // Save rsp in r9 (preserved across syscalls, not used by itoa/strlen).
+    // mov r9, rsp
+    code.extend_from_slice(&[0x49, 0x89, 0xE1]);
+    // sub rsp, rax  — dynamic allocation
+    code.extend_from_slice(&[0x48, 0x29, 0xC4]);
+    // mov rbx, rsp  ; mov r10, rbx
     code.extend_from_slice(&[0x48, 0x89, 0xE3]);
-    // Save the buffer base in r10 for later length calculation. r10 is
-    // preserved by Linux syscalls (which only clobber rax/rcx/r11) and is
-    // not touched by emit_eval_expr. Critically, it is NOT r15, which the
-    // surrounding emit_append_file_call uses to hold the file descriptor.
-    code.extend_from_slice(&[0x49, 0x89, 0xDA]); // mov r10, rbx
+    code.extend_from_slice(&[0x49, 0x89, 0xDA]);
+
+    emit_concat_fill(code, args, &kinds, input_name, concept, all_rules, offsets, field_ranges)?;
+
+    // rax = buffer base, rdx = length
+    code.extend_from_slice(&[0x4C, 0x89, 0xD0]); // mov rax, r10
+    code.extend_from_slice(&[0x48, 0x89, 0xDA]); // mov rdx, rbx
+    code.extend_from_slice(&[0x4C, 0x29, 0xD2]); // sub rdx, r10
+
+    Ok(ConcatBufResult::Dynamic)
+}
+
+/// Shared fill loop for both static- and dynamic-sized concat buffers.
+/// Preconditions: rbx = write pointer into the reserved buffer, r10 = buffer
+/// base. Postconditions: rbx advanced past the last byte written, r10
+/// unchanged. Text fields use `emit_strlen` + `rep movsb`; text literals are
+/// embedded inline; numbers go through `emit_itoa_to_buffer`.
+fn emit_concat_fill(
+    code: &mut Vec<u8>,
+    args: &[Expr],
+    kinds: &[ConcatArgKind],
+    input_name: &str,
+    concept: &Concept,
+    all_rules: &HashMap<&str, &Rule>,
+    offsets: &HashMap<&str, i32>,
+    field_ranges: &HashMap<&str, (i64, i64)>,
+) -> Result<(), NativeError> {
 
     for (i, arg) in args.iter().enumerate() {
         match kinds[i] {
@@ -657,14 +773,38 @@ fn emit_concat_to_buffer(
                 emit_itoa_to_buffer(code);
             }
         }
+        // If the arg is a Text FIELD (not a literal), emit strlen + rep movsb
+        // at runtime. The field's value is a pointer stored at `offsets[field]`.
+        if kinds[i] == ConcatArgKind::Text {
+            if let Expr::Field(_, field_name) = arg {
+                let offset = *offsets.get(field_name.as_str()).ok_or_else(|| NativeError {
+                    message: format!(
+                        "text-field '{}' has no rbp slot in concat fill — input parsing missed it",
+                        field_name
+                    ),
+                })?;
+                // mov rsi, [rbp + offset]
+                if offset >= -128 {
+                    code.extend_from_slice(&[0x48, 0x8B, 0x75]);
+                    code.push(offset as u8);
+                } else {
+                    code.extend_from_slice(&[0x48, 0x8B, 0xB5]);
+                    code.extend_from_slice(&offset.to_le_bytes());
+                }
+                emit_strlen(code); // rdx = length, rsi unchanged
+                // mov rdi, rbx        (dest)
+                code.extend_from_slice(&[0x48, 0x89, 0xDF]);
+                // mov rcx, rdx        (byte count)
+                code.extend_from_slice(&[0x48, 0x89, 0xD1]);
+                // rep movsb
+                code.extend_from_slice(&[0xF3, 0xA4]);
+                // mov rbx, rdi        (advanced write ptr)
+                code.extend_from_slice(&[0x48, 0x89, 0xFB]);
+            }
+        }
     }
 
-    // rax = buffer base (r10), rdx = length (rbx - r10)
-    code.extend_from_slice(&[0x4C, 0x89, 0xD0]); // mov rax, r10
-    code.extend_from_slice(&[0x48, 0x89, 0xDA]); // mov rdx, rbx
-    code.extend_from_slice(&[0x4C, 0x29, 0xD2]); // sub rdx, r10
-
-    Ok(buf_size)
+    Ok(())
 }
 
 /// Emit the machine-code sequence for a single `append_file "path" "content"`
@@ -737,10 +877,10 @@ fn emit_append_file_call(
             code.extend_from_slice(&[0x0F, 0x05]);
         }
         Expr::Concat(args) => {
-            // Dynamic path: build the content in a stack buffer, then write
-            // (rax=buf_ptr, rdx=len) to the fd. After the syscall, free the
-            // buffer with add rsp, buf_size.
-            let buf_size = emit_concat_to_buffer(
+            // Build the content in a stack buffer, then write (rax=buf_ptr,
+            // rdx=len) to the fd. Free according to the sizing strategy
+            // reported by emit_concat_to_buffer.
+            let buf = emit_concat_to_buffer(
                 code, args, &rule.input_name, concept, all_rules, offsets, field_ranges,
             )?;
             // At this point: rax = buf ptr, rdx = length, fd still in r15.
@@ -752,9 +892,7 @@ fn emit_append_file_call(
             code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x01, 0x00, 0x00, 0x00]);
             // syscall
             code.extend_from_slice(&[0x0F, 0x05]);
-            // Free the buffer: add rsp, buf_size
-            code.extend_from_slice(&[0x48, 0x81, 0xC4]);
-            code.extend_from_slice(&buf_size.to_le_bytes());
+            emit_concat_buffer_free(code, buf);
         }
         other => {
             return Err(NativeError {
@@ -1053,7 +1191,7 @@ fn emit_text_write_to_fd(
             Ok(())
         }
         Expr::Concat(args) => {
-            let buf_size = emit_concat_to_buffer(
+            let buf = emit_concat_to_buffer(
                 code, args, input_name, concept, all_rules, offsets, field_ranges,
             )?;
             // rax = buf ptr, rdx = length.
@@ -1066,9 +1204,7 @@ fn emit_text_write_to_fd(
             code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x01, 0x00, 0x00, 0x00]);
             // syscall
             code.extend_from_slice(&[0x0F, 0x05]);
-            // add rsp, buf_size — free the buffer before the next iteration
-            code.extend_from_slice(&[0x48, 0x81, 0xC4]);
-            code.extend_from_slice(&buf_size.to_le_bytes());
+            emit_concat_buffer_free(code, buf);
             Ok(())
         }
         other => Err(NativeError {
@@ -3841,6 +3977,27 @@ mod tests {
             .expect("native compile of text-field-through-record should succeed");
         let size = fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
         assert!(size > 300 && size < 2_500, "unexpected binary size: {}", size);
+        let _ = fs::remove_file(out);
+    }
+
+    #[test]
+    fn native_compiles_text_field_in_concat() {
+        // audit_user.verbose's reaction calls
+        //   append_file "/tmp/audit_user.log" concat("...", p.user, "...", p.amount, ...)
+        // p.user is a text field whose length is unknown until argv is read.
+        // Tests the dynamic-sized concat buffer: per-text-field strlen, dynamic
+        // sub rsp sized in rax, free via mov rsp, r9 (the saved pre-allocation rsp).
+        use std::fs;
+        let src = fs::read_to_string("examples/audit_user.verbose")
+            .expect("examples/audit_user.verbose is expected to exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let out = std::env::temp_dir().join("verbosec_test_audit_user");
+        compile_native(&program, "audit_suspicious", out.to_str().unwrap())
+            .expect("native compile of text-field-in-concat reaction should succeed");
+        let size = fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
+        assert!(size > 500 && size < 2_000, "unexpected binary size: {}", size);
         let _ = fs::remove_file(out);
     }
 
