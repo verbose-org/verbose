@@ -137,6 +137,11 @@ pub fn compile_native(
         // desugarings). Single 8-byte accumulator slot at the bottom of the
         // rbp frame; one final `itoa + \n` per input record.
         emit_fold_program(rule, concept, &concepts, &rules)?
+    } else if matches!(&rule.output_ty, Type::Text) {
+        // Phase 5a: rules returning `text` via a per-record body (literal,
+        // input text field, or concat). One write to stdout + newline per
+        // record. No accumulator — fold-over-collection to text stays Phase 5b.
+        emit_text_program(rule, concept, &rules)?
     } else if let Some(rec_concept) = record_output_concept {
         // Record-output rules: each leaf emits a JSON object to stdout + \n.
         // Same continuation-passing convention as Result.
@@ -409,6 +414,46 @@ fn emit_full_program(
     }
 
     // jmp loop_top (next record) then fall through to shared exit.
+    code.push(0xE9);
+    let loop_offset = ctx.loop_top as i32 - (code.len() + 4) as i32;
+    code.extend_from_slice(&loop_offset.to_le_bytes());
+
+    emit_record_loop_epilogue(&mut code, &ctx);
+    Ok(code)
+}
+
+/// Phase 5a: `output: text` with a per-record body. The body is a text
+/// expression (literal, input-field-text, or concat) — evaluated by
+/// `emit_text_write_to_fd` directly to stdout, followed by a newline for
+/// per-record separation. No accumulator, no new syscall surface compared
+/// to Phase 2B's `Result(text, text)` Ok arm — this is the same machinery,
+/// lifted out of the Result context to serve `output: text` directly.
+///
+/// Fold-over-collection to text is explicitly NOT handled here; that's Phase 5b.
+/// Rejection comes naturally: a `Fold(...)` expression at the top of a
+/// text-output rule would hit `emit_text_write_to_fd`'s fallback arm, which
+/// refuses anything that isn't Text / Field / Concat.
+fn emit_text_program(
+    rule: &Rule,
+    concept: &Concept,
+    all_rules: &HashMap<&str, &Rule>,
+) -> Result<Vec<u8>, NativeError> {
+    let mut code = Vec::new();
+    let ctx = emit_record_loop_prologue(&mut code, rule, concept, all_rules)?;
+
+    emit_text_write_to_fd(
+        &mut code,
+        &rule.logic.value,
+        1,
+        &rule.input_name,
+        concept,
+        all_rules,
+        &ctx.binding_offsets,
+        &ctx.field_ranges,
+    )?;
+    emit_write_newline(&mut code, 1);
+
+    // jmp loop_top
     code.push(0xE9);
     let loop_offset = ctx.loop_top as i32 - (code.len() + 4) as i32;
     code.extend_from_slice(&loop_offset.to_le_bytes());
@@ -3977,6 +4022,27 @@ mod tests {
             .expect("native compile of text-field-through-record should succeed");
         let size = fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
         assert!(size > 300 && size < 2_500, "unexpected binary size: {}", size);
+        let _ = fs::remove_file(out);
+    }
+
+    #[test]
+    fn native_compiles_output_text_rule() {
+        // Phase 5a: `output: text` with per-record body. greeting_line.verbose's
+        // rule produces `concat("Hello ", p.name, ", age ", p.age)` per record.
+        // Exercises emit_text_program: prologue, emit_text_write_to_fd with
+        // Concat (uses the dynamic-sized buffer because p.name is a text
+        // field), newline, loop-back.
+        use std::fs;
+        let src = fs::read_to_string("examples/greeting_line.verbose")
+            .expect("examples/greeting_line.verbose is expected to exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let out = std::env::temp_dir().join("verbosec_test_greeting_line");
+        compile_native(&program, "greeting_line", out.to_str().unwrap())
+            .expect("native compile of output-text rule should succeed");
+        let size = fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
+        assert!(size > 300 && size < 2_000, "unexpected binary size: {}", size);
         let _ = fs::remove_file(out);
     }
 

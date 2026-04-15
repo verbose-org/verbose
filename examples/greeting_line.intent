@@ -1,0 +1,2 @@
+1. A person has a name and an age.
+2. For each person, emit a greeting line that names them and states their age.

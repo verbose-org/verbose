@@ -62,6 +62,7 @@ examples/
   tier.*           Result(text, text) classifier — classify_tier compiles to a 602-byte native binary
   classify.*       Record-output rule — classify_invoice compiles to a ~970-byte native binary that emits one JSON object per record
   greeting.*       Text input field flowing into JSON output — make_report compiles to a ~590-byte native binary
+  greeting_line.*  Phase 5a: `output: text` per-record — greeting_line compiles to a ~564-byte native binary
   payroll.*        Phase 3: four rules on the same input — map to Record (~670 B), filter (~670 B), map to number (~455 B), map to text (~410 B).
                    Phase 4: two reductions on the same input — sum (~486 B), count (~532 B).
                    (purchase.verbose::discounted_purchase compiles to ~750 bytes via Phase 2D match_result inlining)
@@ -149,6 +150,7 @@ Tracking what native emits today, what it still rejects, and the design rules th
 | 3 | `output: collection(T)` with `map` or `filter` — streaming element emission (one JSON Lines per element), no arena, count-prefixed argv. `filter` uses identity pass-through: predicate false skips emission, predicate true emits the element as-is. See "Phase 3 design (locked)" below. | ~670 B | `payroll.verbose::compute_bonuses` (map) / `::high_earners` (filter) |
 | 3.2 | `output: collection(number)` / `collection(text)` — scalar element map. `map(w.employees, e => e.salary)` emits one number per line; text body emits one string per line. No JSON wrapping, so scalar-element binaries are smaller (~400-500 B). | ~455 B | `payroll.verbose::salaries` / `::names` |
 | 4 | `output: number` with `fold`/`sum`/`count`/`min`/`max` at the top level — inner loop accumulates into a single stack slot, emits the final value on stdout once per input record. First emitter with cross-iteration state; no arena (the accumulator is one i64). See "Phase 4 design (locked)" below. | ~490–530 B | `payroll.verbose::total_salaries` (sum, 486 B) / `::high_earner_count` (count, 532 B) |
+| 5a | `output: text` with a per-record body — literal, input text field, or `concat(...)`. One `write` to stdout + newline per input record; no accumulator, no state carried across iterations. Routes to `emit_text_program`, which reuses `emit_text_write_to_fd` (already serving Phase 2B's Ok-text arm). Fold-over-collection to text is Phase 5b. | ~320 B (literal) / ~330 B (field) / ~560 B (concat) | `greeting_line.verbose` (concat, 564 B) |
 
 ### Phase 3 design (locked before implementation)
 
@@ -255,7 +257,7 @@ after_inner:
 ### What native still rejects, and in which priority
 
 - **Result(T, E) with non-scalar T** (e.g. `Result(Record, text)`, `Result(collection, _)`) — each shape needs its own calling convention. Decide shape by shape, never fabricate a "universal Result" that carries unnecessary machinery.
-- **Reductions with non-number output** — Phase 4 covers `output: number` with top-level `fold`/`sum`/`count`/`min`/`max`. `output: text` reduction (concat-fold), `output: Record` with fold-computed fields, and nested folds are still refused (each would need a different accumulator shape — text buffer with growth, multi-slot record, fold-slot stack — and each gets its own phase).
+- **Reductions with non-number output** — Phase 4 covers `output: number` with top-level `fold`/`sum`/`count`/`min`/`max`. Phase 5a covers `output: text` with a per-record body (no fold). Phase 5b — `fold` over a collection producing text (concat-fold) — is still refused; it needs either a two-pass sizing strategy (strlen over elements, then fill) or a scope restriction (no text fields in the body). `output: Record` with fold-computed fields and nested folds also stay refused (each would need a different accumulator shape — multi-slot record, fold-slot stack).
 - **Collection-returning rule calls or collection-valued reduction targets** — `map`/`filter` and Phase 4's `fold` target must be a direct `Field(Ident(input), coll_field)`. Composing through an intermediate rule that returns a collection is not supported; the caller has to inline the collection source.
 - **`match_result` with non-pass-through Err arm** — Phase 2D handles `Err(<err_var>)` pass-through (the value flows directly to stderr without being bound). Richer Err arms (using err_var inside concat, or transforming it) need a real text-binding mechanism — two rbp slots per text bound var (ptr + len) since Err values from concat aren't NUL-terminated.
 - **`match_result` with cross-concept callees** — Phase 2D requires callee.input_concept == outer.input_concept (so the rbp slots are reused as-is). Cross-concept calls need argument-passing through additional slots or a real callee frame.

@@ -1,0 +1,41 @@
+@verbose 0.1.0
+
+-- Phase 5a: `output: text` with a per-record body. The rule evaluates a text
+-- expression (literal, input text field, or concat) and writes one line per
+-- input record to stdout. No accumulator, no buffer growth across iterations
+-- — each record produces exactly one write + newline.
+
+
+concept Person
+  @intention: "A person has a name and an age"
+  @source: greeting_line.intent:1
+
+  fields:
+    name : text
+    age  : number [0, 150]
+
+
+rule greeting_line
+  @intention: "Emit one greeting per person"
+  @source: greeting_line.intent:2
+
+  input:
+    p : Person
+
+  output:
+    line : text
+
+  logic:
+    line = concat("Hello ", p.name, ", age ", p.age)
+
+  proofs:
+    purity:
+      reads   : [p.name, p.age]
+      writes  : []
+      calls   : []
+      verdict : pure
+    termination:
+      form  : constant_bound
+      bound : 5
+    determinism:
+      form : total
