@@ -447,6 +447,66 @@ Phase 2G adds a single new arm to `emit_text_write_to_fd` that inlines a text-re
 - Rule calls inside `concat(...)` arguments (would need `ConcatArgKind::CallText` with runtime sizing — feasible but its own small phase).
 - Rule calls in `append_file` content (reaction emitter currently only dispatches Text / Concat).
 
+### Phase 2H-b design (locked before implementation)
+
+Phase 2H-b lets a text-returning rule call appear as an argument to `concat(...)`. Today `classify_concat_arg` rejects `Expr::Call`; the call is first-class as a top-level text expression (Phase 2G) but not as a fragment being concatenated with other text.
+
+**Core design decision: pre-evaluation into an ad-hoc slot array indexed by `r11`.** Each Call arg is evaluated ONCE, its result `(ptr, len)` stored in a 16-byte stack slot. Sizing and filling reference those slots instead of re-running the callee. The slot array is a `sub rsp, 16*N` region pointed to by `r11`; the concat's main buffer is allocated BELOW it; final cleanup via `mov rsp, r9` frees the main buffer, the slot array, and any concat buffers the callees allocated — all in one instruction.
+
+**Why pre-eval (not interleave)**: the main buffer's allocation needs the total size computed first (`sub rsp, rax`). After the allocation, rsp moves by an amount known only at runtime, so any rsp-relative addressing to the Call results becomes fragile. Copying the results into a register-pointed slot array gives us a stable addressing base (`[r11 + 16*i + {0,8}]`) that survives the subsequent `sub rsp, rax` unchanged.
+
+**Register choice: `r11`.** Linux syscalls clobber `rax`/`rcx`/`r11`, but no syscall happens between setting r11 (after pre-eval) and the final `write` (after fill). `r11` isn't used by `emit_eval_expr`, `emit_strlen`, `emit_itoa_to_buffer`, or any existing concat machinery. Picking a register already-clobbered-by-syscalls rather than saving `r12`–`r15` keeps the cross-phase register table unchanged.
+
+**Composability (nested Call-in-concat).** If a callee's body is itself a `concat(...)` with its own Call args, the inner `emit_concat_to_buffer` will also want `r11`. Solution: `emit_concat_to_buffer` saves and restores `r11` across each callee evaluation when the outer concat has Call args. Two extra `push r11 / pop r11` bytes per Call arg; no new machinery.
+
+**Emission flow (outer concat with N Call args):**
+```
+; classify args, compute static_total, has_text_field, has_call_text, n_calls
+
+if !has_text_field && !has_call_text:
+    (fast path, unchanged)
+
+mov r9, rsp                             ; capture rsp BEFORE any allocations
+
+if n_calls > 0:
+    sub rsp, 16*n_calls                 ; reserve slot array
+    mov r11, rsp                        ; r11 = slot base
+    let slot_idx = 0
+    for each arg in order:
+        if arg is Call:
+            push r11                     ; preserve in case callee nests
+            emit_callee(arg) -> rax, rdx ; validate + recurse on callee body
+            pop r11
+            mov [r11 + 16*slot_idx], rax        ; ptr
+            mov [r11 + 16*slot_idx + 8], rdx    ; len
+            slot_idx++
+
+mov rax, static_total
+; per arg: Text field -> strlen; CallText -> add rax, [r11+16*i+8]
+add rax, 7 ; and rax, -8
+sub rsp, rax                            ; main buffer
+mov rbx, rsp
+mov r10, rbx
+
+; fill pass: per arg -> (Text literal inline, Number itoa, text-field strlen+rep movsb,
+;                        CallText: mov rsi,[r11+16*i]; mov rcx,[r11+16*i+8]; rep movsb)
+
+mov rax, r10 ; mov rdx, rbx ; sub rdx, r10
+(caller: write + `mov rsp, r9` via ConcatBufResult::Dynamic)
+```
+
+**Callee evaluation in pre-eval**: recurse on `callee.logic.value` with the same Phase 2G restrictions (same-concept, same-input-name, no-lets, output_ty == Text). The callee's body can be a Text literal (→ inline lea + const len), Field access (→ load ptr + strlen), Concat (→ nested emit_concat_to_buffer, allocates its own buffer), or another Call (→ recurse). All four land in `(rax=ptr, rdx=len)`.
+
+**Security (pillar #1):** same three syscalls as before (`read argv`, `write fd`, `exit`). One new register convention (r11 as pre-eval slot base, per-concat, save/restore across nested Calls). No new rbp slots, no new static allocations. All buffer lifetimes are stack-bounded and freed together via `mov rsp, r9`. Slot array size = 16·N where N is compile-time known.
+
+**Scope v1** (refused otherwise with clear messages):
+- `emit_concat_to_buffer`-level: a Call arg passes the Phase 2G restrictions (output_ty == Text, same-concept, same-input-name, no lets, single arg = `Ident(caller_input)`).
+- Callee body shape: text literal, input text field, `concat(...)`, or `Call(...)` (recursively 2G-compliant).
+
+**What Phase 2H-b does NOT do** (deferred):
+- Call with non-input arg (cross-concept or with transformations on the arg) — inherits from 2D/2G scope.
+- Callees with let bindings — mirrored refusal.
+
 ### What native still rejects, and in which priority
 
 - **Result(T, E) with non-scalar T** (e.g. `Result(Record, text)`, `Result(collection, _)`) — each shape needs its own calling convention. Decide shape by shape, never fabricate a "universal Result" that carries unnecessary machinery.
