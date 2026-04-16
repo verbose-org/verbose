@@ -624,11 +624,29 @@ fn resolve_imports(mut program: ast::Program, base_dir: &Path) -> ast::Program {
             pending.push(nested_use.clone());
         }
 
+        // Rewrite @source paths of imported items so they resolve relative
+        // to the importing file's base_dir (not the imported module's dir).
+        // E.g., stdlib/finance.verbose has @source: finance.intent:1. After
+        // import into app.verbose (base_dir = examples/), the path becomes
+        // stdlib/finance.intent so the verifier finds examples/stdlib/finance.intent.
+        let import_dir = Path::new(&use_path).parent().unwrap_or(Path::new(""));
+        let mut rewritten_items = use_program.items;
+        for item in &mut rewritten_items {
+            let rewrite = |sref: &mut ast::SourceRef| {
+                let prefixed = import_dir.join(&sref.file);
+                sref.file = prefixed.to_string_lossy().to_string();
+            };
+            match item {
+                ast::Item::Concept(c) => rewrite(&mut c.source),
+                ast::Item::Rule(r) => rewrite(&mut r.source),
+                ast::Item::Reaction(rx) => rewrite(&mut rx.source),
+            }
+        }
+
         // Merge items (concepts + rules) into the main program
         // Imported items go BEFORE existing items so they're available
-        let mut merged = use_program.items;
-        merged.append(&mut program.items);
-        program.items = merged;
+        rewritten_items.append(&mut program.items);
+        program.items = rewritten_items;
     }
 
     program.uses.clear(); // imports resolved
