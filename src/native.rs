@@ -127,7 +127,35 @@ fn compile_native_code(
     let is_parallel = rule.hints.as_ref().map_or(false, |h| h.parallel.is_some());
     let is_result_output = matches!(&rule.output_ty, Type::Result(_, _));
     let is_collection_output = matches!(&rule.output_ty, Type::Collection(_));
-    let is_fold_number_output = matches!(&rule.output_ty, Type::Number) && matches!(&rule.logic.value, Expr::Fold(_, _, _, _, _));
+    // Quantifier(All/Any) desugar to Fold for native emission. The parser
+    // keeps the Quantifier AST node (the verifier + interpreter handle it
+    // natively), but the native emitter converts it to a Fold on the fly
+    // so emit_fold_program can handle it.
+    let desugared_fold: Option<Expr> = match &rule.logic.value {
+        Expr::Quantifier(QuantifierKind::All, coll, var, pred) => {
+            let acc = "__acc".to_string();
+            Some(Expr::Fold(
+                coll.clone(),
+                Box::new(Expr::Number(1)),
+                acc.clone(),
+                var.clone(),
+                Box::new(Expr::If(pred.clone(), Box::new(Expr::Ident(acc)), Box::new(Expr::Number(0)))),
+            ))
+        }
+        Expr::Quantifier(QuantifierKind::Any, coll, var, pred) => {
+            let acc = "__acc".to_string();
+            Some(Expr::Fold(
+                coll.clone(),
+                Box::new(Expr::Number(0)),
+                acc.clone(),
+                var.clone(),
+                Box::new(Expr::If(pred.clone(), Box::new(Expr::Number(1)), Box::new(Expr::Ident(acc)))),
+            ))
+        }
+        _ => None,
+    };
+    let effective_logic = desugared_fold.as_ref().unwrap_or(&rule.logic.value);
+    let is_fold_number_output = matches!(&rule.output_ty, Type::Number | Type::Bool) && matches!(effective_logic, Expr::Fold(_, _, _, _, _));
     let is_fold_text_output = matches!(&rule.output_ty, Type::Text) && matches!(&rule.logic.value, Expr::Fold(_, _, _, _, _));
     let record_output_concept: Option<&Concept> = match &rule.output_ty { Type::Named(n) => concepts.iter().find(|c| c.name == *n).copied(), _ => None };
 
@@ -138,7 +166,15 @@ fn compile_native_code(
     } else if is_collection_output {
         emit_collection_program(rule, concept, &concepts, &rules)?
     } else if is_fold_number_output {
-        emit_fold_program(rule, concept, &concepts, &rules)?
+        // If the logic was desugared from Quantifier→Fold, create a temp
+        // rule with the desugared logic so emit_fold_program sees a Fold.
+        if let Some(ref desugared) = desugared_fold {
+            let mut rule_copy = rule.clone();
+            rule_copy.logic.value = desugared.clone();
+            emit_fold_program(&rule_copy, concept, &concepts, &rules)?
+        } else {
+            emit_fold_program(rule, concept, &concepts, &rules)?
+        }
     } else if is_fold_text_output {
         emit_text_fold_program(rule, concept, &concepts, &rules)?
     } else if matches!(&rule.output_ty, Type::Text) {
@@ -2937,9 +2973,10 @@ fn emit_fold_program(
     all_rules: &HashMap<&str, &Rule>,
 ) -> Result<Vec<u8>, NativeError> {
     // ===== Scope validation =====
-    if !matches!(rule.output_ty, Type::Number) {
+    let is_bool_output = matches!(rule.output_ty, Type::Bool);
+    if !matches!(rule.output_ty, Type::Number | Type::Bool) {
         return Err(NativeError {
-            message: "emit_fold_program called on non-number output".into(),
+            message: "emit_fold_program called on non-number/non-bool output".into(),
         });
     }
     let (coll_expr, init_expr, acc_name, item_name, body) = match &rule.logic.value {
@@ -3129,9 +3166,26 @@ fn emit_fold_program(
     let inner_done_off = inner_done_pos as i32 - (inner_done_patch as i32 + 4);
     code[inner_done_patch..inner_done_patch + 4].copy_from_slice(&inner_done_off.to_le_bytes());
 
-    // Emit the final accumulator: load acc_slot -> rax -> itoa+newline to stdout.
+    // Emit the final accumulator.
     load_rax_from_rbp(&mut code, acc_offset);
-    emit_itoa_inline(&mut code);
+    if is_bool_output {
+        // Bool fold (all/any): rax is 0 or 1 → print "true"/"false" + newline.
+        code.extend_from_slice(&[0x84, 0xC0]); // test al, al
+        code.push(0x74); // jz .print_false
+        let pf_patch = code.len();
+        code.push(0x00);
+        emit_write_string(&mut code, b"true\n");
+        code.push(0xEB); // jmp .after_print
+        let ap_patch = code.len();
+        code.push(0x00);
+        let pf_pos = code.len();
+        code[pf_patch] = (pf_pos - pf_patch - 1) as u8;
+        emit_write_string(&mut code, b"false\n");
+        let ap_pos = code.len();
+        code[ap_patch] = (ap_pos - ap_patch - 1) as u8;
+    } else {
+        emit_itoa_inline(&mut code);
+    }
 
     // jmp outer_loop_top.
     code.push(0xE9);
