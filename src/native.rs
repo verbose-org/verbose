@@ -3849,16 +3849,7 @@ fn emit_reaction_program(
     concept: &Concept,
     all_rules: &HashMap<&str, &Rule>,
 ) -> Result<Vec<u8>, NativeError> {
-    // Pre-check: print effect is not yet wired in native reactions. Every
-    // append_file is handled by emit_append_file_call which now accepts both
-    // Text literals and Concat expressions.
-    for effect in &reaction.effects {
-        if let Effect::Print(_) = effect {
-            return Err(NativeError {
-                message: "print effect not yet wired in native reactions (use the interpreter or append_file)".into(),
-            });
-        }
-    }
+    // Both Print and AppendFile effects are handled below.
 
     let mut code = Vec::new();
     let ctx = emit_record_loop_prologue(&mut code, trigger_rule, concept, all_rules)?;
@@ -3880,19 +3871,60 @@ fn emit_reaction_program(
     let skip_patch = code.len();
     code.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
 
-    // Emit each effect. The pre-check above ensures they are all AppendFile.
+    // Emit each effect.
     for effect in &reaction.effects {
-        if let Effect::AppendFile { path, content } = effect {
-            emit_append_file_call(
-                &mut code,
-                path,
-                content,
-                trigger_rule,
-                concept,
-                all_rules,
-                &ctx.binding_offsets,
-                &ctx.field_ranges,
-            )?;
+        match effect {
+            Effect::AppendFile { path, content } => {
+                emit_append_file_call(
+                    &mut code,
+                    path,
+                    content,
+                    trigger_rule,
+                    concept,
+                    all_rules,
+                    &ctx.binding_offsets,
+                    &ctx.field_ranges,
+                )?;
+            }
+            Effect::Print(args) => {
+                // Print each arg to stdout with spaces between, newline at end.
+                // Each arg is a text expression or a number expression.
+                for (i, arg) in args.iter().enumerate() {
+                    if i > 0 {
+                        emit_write_static_to_fd(&mut code, b" ", 1);
+                    }
+                    // Determine if this arg is a number (needs itoa) or text.
+                    let is_number = match arg {
+                        Expr::Number(_) | Expr::Neg(_) => true,
+                        Expr::Binary(op, _, _) => matches!(op,
+                            BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod),
+                        Expr::Field(base, field_name) => {
+                            if matches!(base.as_ref(), Expr::Ident(n) if n == &trigger_rule.input_name) {
+                                concept.fields.iter()
+                                    .find(|f| &f.name == field_name)
+                                    .map_or(false, |f| matches!(f.ty, Type::Number))
+                            } else {
+                                false
+                            }
+                        }
+                        _ => false,
+                    };
+                    if is_number {
+                        emit_eval_expr(
+                            &mut code, arg, &trigger_rule.input_name,
+                            &ctx.binding_offsets, all_rules, &ctx.field_ranges,
+                        )?;
+                        emit_itoa_to_stdout_no_newline(&mut code);
+                    } else {
+                        emit_text_write_to_fd(
+                            &mut code, arg, 1, &trigger_rule.input_name,
+                            concept, all_rules, &ctx.binding_offsets,
+                            &ctx.field_ranges, &no_text_bindings(),
+                        )?;
+                    }
+                }
+                emit_write_newline(&mut code, 1);
+            }
         }
     }
 
