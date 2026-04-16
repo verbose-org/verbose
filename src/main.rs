@@ -264,28 +264,35 @@ fn main() {
             Ok(()) => {
                 let size = fs::metadata(tmp).map(|m| m.len()).unwrap_or(0);
                 println!("native: {} bytes, rule '{}'\n", size, disasm_rule);
-                // Disassemble using objdump on raw binary (skip ELF headers)
-                let output = process::Command::new("objdump")
-                    .args(["-D", "-b", "binary", "-m", "i386:x86-64", "-M", "intel", tmp])
-                    .output();
-                match output {
-                    Ok(out) if out.status.success() => {
-                        let text = String::from_utf8_lossy(&out.stdout);
-                        for line in text.lines().skip(7) {
-                            if !line.is_empty() {
-                                println!("{}", line);
-                            }
+                // Extract just the code section (skip 120-byte ELF header)
+                // and disassemble with objdump in raw mode starting at the
+                // right offset, or fall back to hex dump.
+                let code_tmp = format!("{}.code", tmp);
+                let disasm_ok = (|| -> Option<()> {
+                    let bytes = fs::read(tmp).ok()?;
+                    if bytes.len() <= 120 { return None; }
+                    fs::write(&code_tmp, &bytes[120..]).ok()?;
+                    let out = process::Command::new("objdump")
+                        .args(["-D", "-b", "binary", "-m", "i386:x86-64", "-M", "intel", &code_tmp])
+                        .output().ok()?;
+                    if !out.status.success() { return None; }
+                    let text = String::from_utf8_lossy(&out.stdout);
+                    for line in text.lines().skip(7) {
+                        if !line.is_empty() {
+                            println!("{}", line);
                         }
                     }
-                    _ => {
-                        // Fallback: hex dump
-                        eprintln!("(objdump unavailable, showing hex dump)");
-                        if let Ok(bytes) = fs::read(tmp) {
-                            for (i, chunk) in bytes[120..].chunks(16).enumerate() {
-                                print!("  {:04x}: ", i * 16);
-                                for b in chunk { print!("{:02x} ", b); }
-                                println!();
-                            }
+                    Some(())
+                })();
+                let _ = fs::remove_file(&code_tmp);
+                if disasm_ok.is_none() {
+                    // Fallback: hex dump of code section
+                    eprintln!("(objdump unavailable, showing hex dump)");
+                    if let Ok(bytes) = fs::read(tmp) {
+                        for (i, chunk) in bytes[120..].chunks(16).enumerate() {
+                            print!("  {:04x}: ", i * 16);
+                            for b in chunk { print!("{:02x} ", b); }
+                            println!();
                         }
                     }
                 }
