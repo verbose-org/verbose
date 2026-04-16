@@ -4370,6 +4370,62 @@ fn emit_eval_expr(
                 return emit_eval_expr(code, left, input_name, offsets, all_rules, field_ranges);
             }
 
+            // === Text comparison: field == "literal" or field != "literal" ===
+            // Detect a text field compared to a text literal (or vice versa).
+            // Uses repe cmpsb with the literal NUL-terminated inline.
+            if matches!(op, BinOp::Eq | BinOp::NotEq) {
+                let (field_offset, literal_bytes) =
+                    if let (Expr::Field(base, fname), Expr::Text(lit)) = (left.as_ref(), right.as_ref()) {
+                        if matches!(base.as_ref(), Expr::Ident(n) if n == input_name) {
+                            (offsets.get(fname.as_str()), Some(lit.as_bytes()))
+                        } else { (None, None) }
+                    } else if let (Expr::Text(lit), Expr::Field(base, fname)) = (left.as_ref(), right.as_ref()) {
+                        if matches!(base.as_ref(), Expr::Ident(n) if n == input_name) {
+                            (offsets.get(fname.as_str()), Some(lit.as_bytes()))
+                        } else { (None, None) }
+                    } else { (None, None) };
+
+                if let (Some(&foff), Some(lit)) = (field_offset, literal_bytes) {
+                    // mov rsi, [rbp + foff]  — field pointer (NUL-terminated from argv)
+                    if foff >= -128 {
+                        code.extend_from_slice(&[0x48, 0x8B, 0x75]);
+                        code.push(foff as u8);
+                    } else {
+                        code.extend_from_slice(&[0x48, 0x8B, 0xB5]);
+                        code.extend_from_slice(&foff.to_le_bytes());
+                    }
+                    // jmp over literal + NUL
+                    let n = lit.len() + 1; // literal bytes + NUL
+                    code.push(0xEB);
+                    code.push(n as u8);
+                    let data_addr = code.len();
+                    code.extend_from_slice(lit);
+                    code.push(0); // NUL terminator
+                    // lea rdi, [rip + rel32]
+                    let end = code.len() + 7;
+                    let rel32 = data_addr as i32 - end as i32;
+                    code.extend_from_slice(&[0x48, 0x8D, 0x3D]);
+                    code.extend_from_slice(&rel32.to_le_bytes());
+                    // mov rcx, n
+                    code.extend_from_slice(&[0x48, 0xC7, 0xC1]);
+                    code.extend_from_slice(&(n as i32).to_le_bytes());
+                    // cld ; repe cmpsb
+                    code.push(0xFC);
+                    code.extend_from_slice(&[0xF3, 0xA6]);
+                    // ZF=1 if all bytes matched (including trailing NUL).
+                    if *op == BinOp::Eq {
+                        // sete al ; movzx rax, al
+                        code.extend_from_slice(&[0x0F, 0x94, 0xC0]);
+                        code.extend_from_slice(&[0x48, 0x0F, 0xB6, 0xC0]);
+                    } else {
+                        // setne al ; movzx rax, al
+                        code.extend_from_slice(&[0x0F, 0x95, 0xC0]);
+                        code.extend_from_slice(&[0x48, 0x0F, 0xB6, 0xC0]);
+                    }
+                    return Ok(());
+                }
+            }
+
             // === General case: evaluate both sides, apply operator ===
             emit_eval_expr(code, left, input_name, offsets, all_rules, field_ranges)?;
             code.push(0x50); // push rax
