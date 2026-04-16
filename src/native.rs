@@ -2705,7 +2705,8 @@ fn emit_collection_program(
     // ===== Emission =====
     let n_scalar = scalar_fields.len();
     let n_elem_fields = input_elem_concept.fields.len();
-    let frame_slots = n_scalar + n_elem_fields;
+    let n_lets = rule.logic.bindings.len();
+    let frame_slots = n_scalar + n_elem_fields + n_lets;
     let frame_size = (frame_slots as i32) * 8;
 
     let mut code = Vec::new();
@@ -2750,6 +2751,25 @@ fn emit_collection_program(
             _ => unreachable!(),
         }
         code.extend_from_slice(&[0x49, 0xFF, 0xC6]); // inc r14
+    }
+
+    // Evaluate let bindings after scalar fields.
+    {
+        let field_ranges_for_lets = build_field_ranges(input_concept);
+        let mut let_offsets: HashMap<&str, i32> = scalar_offsets.clone();
+        let mut next_let_slot = -(((n_scalar + n_elem_fields) as i32 + 1) * 8);
+        for (name, expr) in &rule.logic.bindings {
+            emit_eval_expr(&mut code, expr, &rule.input_name, &let_offsets, all_rules, &field_ranges_for_lets)?;
+            store_rax_at_rbp(&mut code, next_let_slot);
+            let_offsets.insert(name.as_str(), next_let_slot);
+            next_let_slot -= 8;
+        }
+        // Let bindings visible to body: add to elem_offsets so the lambda body can see them.
+        for (name, &offset) in &let_offsets {
+            if !elem_offsets.contains_key(name) && !scalar_offsets.contains_key(name) {
+                elem_offsets.insert(name, offset);
+            }
+        }
     }
 
     // Parse collection count into r15.
@@ -2989,14 +3009,15 @@ fn emit_fold_program(
     // ===== Emission =====
     let n_scalar = scalar_fields.len();
     let n_elem_fields = elem_concept.fields.len();
-    // +1 slot for acc at the bottom of the frame.
-    let frame_slots = n_scalar + n_elem_fields + 1;
+    let n_lets = rule.logic.bindings.len();
+    // Frame: scalars + element fields + let bindings + acc slot.
+    let frame_slots = n_scalar + n_elem_fields + n_lets + 1;
     let frame_size = (frame_slots as i32) * 8;
     let acc_offset: i32 = -((frame_slots as i32) * 8);
 
     let mut code = Vec::new();
 
-    // _start — argv/rbp frame setup (identical to Phase 3).
+    // _start — argv/rbp frame setup.
     code.extend_from_slice(&[0x4C, 0x8B, 0x24, 0x24]); // mov r12, [rsp]
     code.extend_from_slice(&[0x4C, 0x8D, 0x6C, 0x24, 0x08]); // lea r13, [rsp+8]
     code.push(0x55); // push rbp
@@ -3038,6 +3059,23 @@ fn emit_fold_program(
             _ => unreachable!(),
         }
         code.extend_from_slice(&[0x49, 0xFF, 0xC6]); // inc r14
+    }
+
+    // Evaluate let bindings into rbp slots (after scalar fields, before element fields).
+    let field_ranges_for_lets = build_field_ranges(input_concept);
+    let mut let_offsets: HashMap<&str, i32> = scalar_offsets.clone();
+    let mut next_let_slot = -(((n_scalar + n_elem_fields) as i32 + 1) * 8);
+    for (name, expr) in &rule.logic.bindings {
+        emit_eval_expr(&mut code, expr, &rule.input_name, &let_offsets, all_rules, &field_ranges_for_lets)?;
+        store_rax_at_rbp(&mut code, next_let_slot);
+        let_offsets.insert(name.as_str(), next_let_slot);
+        next_let_slot -= 8;
+    }
+    // Make let bindings visible to the fold body.
+    for (name, &offset) in &let_offsets {
+        if !body_offsets.contains_key(name) && !scalar_offsets.contains_key(name) {
+            body_offsets.insert(name, offset);
+        }
     }
 
     // Parse collection count into r15.
@@ -3335,11 +3373,12 @@ fn emit_text_fold_program(
     // ===== Emission =====
     let n_scalar = scalar_fields.len();
     let n_elem_fields = elem_concept.fields.len();
-    // frame: n_scalar + n_elem + count_slot + argv_save_slot = n_scalar + n_elem + 2
-    let frame_slots = n_scalar + n_elem_fields + 2;
+    let n_lets = rule.logic.bindings.len();
+    // frame: n_scalar + n_elem + n_lets + count_slot + argv_save_slot
+    let frame_slots = n_scalar + n_elem_fields + n_lets + 2;
     let frame_size = (frame_slots as i32) * 8;
-    let count_slot: i32 = -(((n_scalar + n_elem_fields + 1) as i32) * 8);
-    let argv_save_slot: i32 = -(((n_scalar + n_elem_fields + 2) as i32) * 8);
+    let count_slot: i32 = -(((n_scalar + n_elem_fields + n_lets + 1) as i32) * 8);
+    let argv_save_slot: i32 = -(((n_scalar + n_elem_fields + n_lets + 2) as i32) * 8);
 
     let mut code = Vec::new();
 
@@ -3383,6 +3422,24 @@ fn emit_text_fold_program(
             _ => unreachable!(),
         }
         code.extend_from_slice(&[0x49, 0xFF, 0xC6]); // inc r14
+    }
+
+    // Evaluate let bindings after scalar fields.
+    {
+        let field_ranges_for_lets = build_field_ranges(input_concept);
+        let mut let_offsets: HashMap<&str, i32> = scalar_offsets.clone();
+        let mut next_let_slot = -(((n_scalar + n_elem_fields) as i32 + 1) * 8);
+        for (name, expr) in &rule.logic.bindings {
+            emit_eval_expr(&mut code, expr, &rule.input_name, &let_offsets, all_rules, &field_ranges_for_lets)?;
+            store_rax_at_rbp(&mut code, next_let_slot);
+            let_offsets.insert(name.as_str(), next_let_slot);
+            next_let_slot -= 8;
+        }
+        for (name, &offset) in &let_offsets {
+            if !elem_offsets.contains_key(name) && !scalar_offsets.contains_key(name) {
+                elem_offsets.insert(name, offset);
+            }
+        }
     }
 
     // Parse count into r15, save it at count_slot.
