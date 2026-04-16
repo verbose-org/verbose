@@ -745,8 +745,21 @@ fn emit_concat_to_buffer_impl(
             ConcatArgKind::Text => {
                 if let Expr::Text(s) = arg {
                     static_total += s.as_bytes().len() as i32;
-                } else if let Expr::Field(_, _) = arg {
-                    has_dynamic = true;
+                } else if let Expr::Field(_, field_name) = arg {
+                    // If the field has a [..N] bound, use N as the worst-case
+                    // static size — avoids the dynamic path (no runtime strlen
+                    // for sizing, no r9 save, static `add rsp` cleanup).
+                    let bounded = concept
+                        .fields
+                        .iter()
+                        .find(|f| &f.name == field_name)
+                        .and_then(|f| f.range)
+                        .map(|(_, max)| max as i32);
+                    if let Some(max_len) = bounded {
+                        static_total += max_len;
+                    } else {
+                        has_dynamic = true;
+                    }
                 }
                 call_slot_idx.push(-1);
             }
