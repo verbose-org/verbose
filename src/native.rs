@@ -3284,14 +3284,28 @@ fn emit_text_fold_program(
     }
 
     // Static per-element contribution (sum of literal lengths + 21 per number arg).
+    // If ALL text-field args are bounded ([..N]), their max length is included
+    // in static_per_element too — enabling single-pass fold sizing.
     let mut static_per_element: i32 = 0;
+    let mut all_text_fields_bounded: bool = true;
     for (arg, kind) in rest_args.iter().zip(rest_kinds.iter()) {
         match kind {
             ConcatArgKind::Text => {
                 if let Expr::Text(s) = arg {
                     static_per_element += s.as_bytes().len() as i32;
+                } else if let Expr::Field(_, field_name) = arg {
+                    let bounded = elem_concept
+                        .fields
+                        .iter()
+                        .find(|f| &f.name == field_name)
+                        .and_then(|f| f.range)
+                        .map(|(_, max)| max as i32);
+                    if let Some(max_len) = bounded {
+                        static_per_element += max_len;
+                    } else {
+                        all_text_fields_bounded = false;
+                    }
                 }
-                // Text field: runtime strlen, contributes 0 to static.
             }
             ConcatArgKind::Number => {
                 static_per_element += 21;
@@ -3380,81 +3394,109 @@ fn emit_text_fold_program(
 
     // ===== Pass 1: compute total buffer size into rax =====
     let init_size = init_literal.as_bytes().len() as i32;
-    // mov rax, init_size
-    code.extend_from_slice(&[0x48, 0xC7, 0xC0]);
-    code.extend_from_slice(&init_size.to_le_bytes());
 
-    let size_loop_top = code.len();
-    code.extend_from_slice(&[0x4D, 0x85, 0xFF]); // test r15, r15
-    code.push(0x0F);
-    code.push(0x84);                             // jz size_done (rel32)
-    let size_done_patch = code.len();
-    code.extend_from_slice(&[0; 4]);
-
-    // For each text-field arg in rest, strlen the pointer at its argv slot.
-    for (arg, kind) in rest_args.iter().zip(rest_kinds.iter()) {
-        if *kind == ConcatArgKind::Text {
-            if let Expr::Field(_, field_name) = arg {
-                let idx = elem_concept
-                    .fields
-                    .iter()
-                    .position(|f| &f.name == field_name)
-                    .ok_or_else(|| NativeError {
-                        message: format!(
-                            "unknown element field '{}' in fold body",
-                            field_name
-                        ),
-                    })?;
-                let disp = (idx * 8) as i32;
-                // mov rsi, [r13 + r14*8 + disp]
-                if disp == 0 {
-                    code.extend_from_slice(&[0x4B, 0x8B, 0x74, 0xF5, 0x00]);
-                } else if disp <= 127 {
-                    code.extend_from_slice(&[0x4B, 0x8B, 0x74, 0xF5]);
-                    code.push(disp as u8);
-                } else {
-                    code.extend_from_slice(&[0x4B, 0x8B, 0xB4, 0xF5]);
-                    code.extend_from_slice(&disp.to_le_bytes());
-                }
-                code.push(0x50);                                 // push rax
-                emit_strlen(&mut code);                          // rdx = length (clobbers rax/rcx/rdi)
-                code.push(0x59);                                 // pop rcx
-                code.extend_from_slice(&[0x48, 0x01, 0xD1]);     // add rcx, rdx
-                code.extend_from_slice(&[0x48, 0x89, 0xC8]);     // mov rax, rcx
+    if all_text_fields_bounded {
+        // Single-pass optimization: total = init_size + N * static_per_element.
+        // No strlen loop needed — all text-field args have [..N] bounds whose
+        // max is included in static_per_element. Compute via:
+        //   mov rax, static_per_element ; imul rax, r15 ; add rax, init_size
+        // Then round up and allocate statically.
+        // mov rax, static_per_element
+        code.extend_from_slice(&[0x48, 0xC7, 0xC0]);
+        code.extend_from_slice(&static_per_element.to_le_bytes());
+        // imul rax, r15  (rax = static_per_element * N)
+        // REX.WRB + 0F AF ModRM: reg=rax(000) r/m=r15(111) mod=11
+        code.extend_from_slice(&[0x49, 0x0F, 0xAF, 0xC7]);
+        // add rax, init_size
+        if init_size != 0 {
+            if init_size <= 127 {
+                code.extend_from_slice(&[0x48, 0x83, 0xC0, init_size as u8]);
+            } else {
+                code.extend_from_slice(&[0x48, 0x05]);
+                code.extend_from_slice(&init_size.to_le_bytes());
             }
         }
-    }
-
-    // add rax, static_per_element
-    if static_per_element != 0 {
-        if static_per_element <= 127 {
-            code.extend_from_slice(&[0x48, 0x83, 0xC0, static_per_element as u8]);
-        } else {
-            code.extend_from_slice(&[0x48, 0x05]);
-            code.extend_from_slice(&static_per_element.to_le_bytes());
-        }
-    }
-
-    // Advance r14 past this element's argv slots: r14 += n_elem_fields.
-    let nef = n_elem_fields as i32;
-    if nef <= 127 {
-        code.extend_from_slice(&[0x49, 0x83, 0xC6, nef as u8]);
     } else {
-        code.extend_from_slice(&[0x49, 0x81, 0xC6]);
-        code.extend_from_slice(&nef.to_le_bytes());
+        // Two-pass path: iterate the collection in pass 1 to strlen each
+        // unbounded text field.  Pass 2 (fill) follows below.
+
+        // mov rax, init_size
+        code.extend_from_slice(&[0x48, 0xC7, 0xC0]);
+        code.extend_from_slice(&init_size.to_le_bytes());
+
+        let size_loop_top = code.len();
+        code.extend_from_slice(&[0x4D, 0x85, 0xFF]); // test r15, r15
+        code.push(0x0F);
+        code.push(0x84);                             // jz size_done (rel32)
+        let size_done_patch = code.len();
+        code.extend_from_slice(&[0; 4]);
+
+        for (arg, kind) in rest_args.iter().zip(rest_kinds.iter()) {
+            if *kind == ConcatArgKind::Text {
+                if let Expr::Field(_, field_name) = arg {
+                    // Only strlen unbounded fields.
+                    let is_bounded = elem_concept
+                        .fields
+                        .iter()
+                        .find(|f| &f.name == field_name)
+                        .and_then(|f| f.range)
+                        .is_some();
+                    if is_bounded {
+                        continue; // already counted in static_per_element
+                    }
+                    let idx = elem_concept
+                        .fields
+                        .iter()
+                        .position(|f| &f.name == field_name)
+                        .ok_or_else(|| NativeError {
+                            message: format!("unknown element field '{}' in fold body", field_name),
+                        })?;
+                    let disp = (idx * 8) as i32;
+                    if disp == 0 {
+                        code.extend_from_slice(&[0x4B, 0x8B, 0x74, 0xF5, 0x00]);
+                    } else if disp <= 127 {
+                        code.extend_from_slice(&[0x4B, 0x8B, 0x74, 0xF5]);
+                        code.push(disp as u8);
+                    } else {
+                        code.extend_from_slice(&[0x4B, 0x8B, 0xB4, 0xF5]);
+                        code.extend_from_slice(&disp.to_le_bytes());
+                    }
+                    code.push(0x50);                                 // push rax
+                    emit_strlen(&mut code);                          // rdx = length
+                    code.push(0x59);                                 // pop rcx
+                    code.extend_from_slice(&[0x48, 0x01, 0xD1]);     // add rcx, rdx
+                    code.extend_from_slice(&[0x48, 0x89, 0xC8]);     // mov rax, rcx
+                }
+            }
+        }
+
+        if static_per_element != 0 {
+            if static_per_element <= 127 {
+                code.extend_from_slice(&[0x48, 0x83, 0xC0, static_per_element as u8]);
+            } else {
+                code.extend_from_slice(&[0x48, 0x05]);
+                code.extend_from_slice(&static_per_element.to_le_bytes());
+            }
+        }
+
+        let nef = n_elem_fields as i32;
+        if nef <= 127 {
+            code.extend_from_slice(&[0x49, 0x83, 0xC6, nef as u8]);
+        } else {
+            code.extend_from_slice(&[0x49, 0x81, 0xC6]);
+            code.extend_from_slice(&nef.to_le_bytes());
+        }
+        code.extend_from_slice(&[0x49, 0xFF, 0xCF]); // dec r15
+        code.push(0xE9);
+        let back = size_loop_top as i32 - (code.len() + 4) as i32;
+        code.extend_from_slice(&back.to_le_bytes());
+
+        let size_done_pos = code.len();
+        let size_done_off = size_done_pos as i32 - (size_done_patch as i32 + 4);
+        code[size_done_patch..size_done_patch + 4].copy_from_slice(&size_done_off.to_le_bytes());
     }
-    // dec r15 ; jmp size_loop_top
-    code.extend_from_slice(&[0x49, 0xFF, 0xCF]);
-    code.push(0xE9);
-    let back = size_loop_top as i32 - (code.len() + 4) as i32;
-    code.extend_from_slice(&back.to_le_bytes());
 
-    // size_done:
-    let size_done_pos = code.len();
-    let size_done_off = size_done_pos as i32 - (size_done_patch as i32 + 4);
-    code[size_done_patch..size_done_patch + 4].copy_from_slice(&size_done_off.to_le_bytes());
-
-    // Round up rax to 8: add rax, 7; and rax, ~7 (sign-extended imm8 = -8 = 0xF8).
+    // Round up rax to 8: add rax, 7; and rax, ~7.
     code.extend_from_slice(&[0x48, 0x83, 0xC0, 0x07]);
     code.extend_from_slice(&[0x48, 0x83, 0xE0, 0xF8]);
 
