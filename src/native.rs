@@ -1781,6 +1781,40 @@ fn emit_text_write_to_fd(
             emit_concat_buffer_free(code, buf);
             Ok(())
         }
+        Expr::If(cond, then_e, else_e) => {
+            // Conditional text: evaluate condition, branch, recurse on each
+            // arm. Each arm writes its own text to the fd; control joins
+            // after both branches.
+            emit_eval_expr(code, cond, input_name, offsets, all_rules, field_ranges)?;
+            // test rax, rax ; jz else (rel32)
+            code.extend_from_slice(&[0x48, 0x85, 0xC0]);
+            code.push(0x0F);
+            code.push(0x84);
+            let else_patch = code.len();
+            code.extend_from_slice(&[0; 4]);
+            // then arm
+            emit_text_write_to_fd(
+                code, then_e, fd, input_name, concept, all_rules,
+                offsets, field_ranges, text_bindings,
+            )?;
+            // jmp after (rel32)
+            code.push(0xE9);
+            let after_patch = code.len();
+            code.extend_from_slice(&[0; 4]);
+            // else:
+            let else_pos = code.len();
+            let else_off = else_pos as i32 - (else_patch as i32 + 4);
+            code[else_patch..else_patch + 4].copy_from_slice(&else_off.to_le_bytes());
+            emit_text_write_to_fd(
+                code, else_e, fd, input_name, concept, all_rules,
+                offsets, field_ranges, text_bindings,
+            )?;
+            // after:
+            let after_pos = code.len();
+            let after_off = after_pos as i32 - (after_patch as i32 + 4);
+            code[after_patch..after_patch + 4].copy_from_slice(&after_off.to_le_bytes());
+            Ok(())
+        }
         Expr::Call(callee_name, args) => {
             // Phase 2G: text-returning rule call inlined. Validate the
             // same-concept / same-input-name / no-lets restrictions, then

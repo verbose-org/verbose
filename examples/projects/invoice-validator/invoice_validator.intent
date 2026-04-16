@@ -1,0 +1,4 @@
+1. An invoice has a client name and an amount.
+2. An invoice is valid when the amount is between 1 and 100000.
+3. Apply validation; on error enrich with the client name.
+4. Classify the invoice as "small" (<=1000), "medium" (<=10000), or "large".

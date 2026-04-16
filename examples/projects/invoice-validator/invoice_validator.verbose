@@ -1,0 +1,105 @@
+@verbose 0.1.0
+
+-- Invoice Validator — second concrete project.
+--
+-- Exercises Result composition (Phase 2A + 2F), text-returning rule
+-- calls (Phase 2G), and multi-rule binary compilation.
+--
+-- Three rules compiled into ONE native binary:
+--   1. validate_invoice — Result(number, text): Ok(amount) or Err(reason)
+--   2. validated — match_result enriching Err with client name (Phase 2F)
+--   3. classify — text classification per invoice
+--
+-- The binary processes multiple invoices from argv (each = client + amount),
+-- streaming Ok values to stdout and enriched Err messages to stderr.
+
+
+concept Invoice
+  @intention: "An invoice has a client name and an amount"
+  @source: invoice_validator.intent:1
+
+  fields:
+    client : text [..64]
+    amount : number [0, 10000000]
+
+
+rule validate_amount
+  @intention: "Amount must be between 1 and 100000"
+  @source: invoice_validator.intent:2
+
+  input:
+    i : Invoice
+
+  output:
+    r : Result(number, text)
+
+  logic:
+    r = if i.amount < 1 then Err("amount too low") else if i.amount > 100000 then Err("amount too high") else Ok(i.amount)
+
+  proofs:
+    purity:
+      reads   : [i.amount]
+      writes  : []
+      calls   : []
+      verdict : pure
+    termination:
+      form  : constant_bound
+      bound : 8
+    determinism:
+      form : total
+
+
+rule validated
+  @intention: "Validate and enrich error with client context"
+  @source: invoice_validator.intent:3
+
+  input:
+    i : Invoice
+
+  output:
+    out : Result(number, text)
+
+  logic:
+    out = match_result(
+      validate_amount(i),
+      v => Ok(v),
+      e => Err(concat("[", i.client, "] ", e))
+    )
+
+  proofs:
+    purity:
+      reads   : [i, i.client]
+      writes  : []
+      calls   : [validate_amount]
+      verdict : pure
+    termination:
+      form  : constant_bound
+      bound : 10
+    determinism:
+      form : total
+
+
+rule classify
+  @intention: "Classify as small/medium/large"
+  @source: invoice_validator.intent:4
+
+  input:
+    i : Invoice
+
+  output:
+    c : text
+
+  logic:
+    c = if i.amount <= 1000 then concat(i.client, ": small") else if i.amount <= 10000 then concat(i.client, ": medium") else concat(i.client, ": large")
+
+  proofs:
+    purity:
+      reads   : [i.client, i.amount]
+      writes  : []
+      calls   : []
+      verdict : pure
+    termination:
+      form  : constant_bound
+      bound : 8
+    determinism:
+      form : total
