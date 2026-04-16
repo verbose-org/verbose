@@ -28,29 +28,29 @@ concept Workforce
     employees : collection(Employee)
 
 
--- Rule 1: per-employee bonus line (Phase 5a + 2G composition)
-rule bonus_line
-  @intention: "Format one bonus line per employee"
+-- Rule 1: all bonus lines via fold-to-text (Phase 5b)
+rule bonus_report
+  @intention: "Build all bonus lines: name: bonus_amount per employee"
   @source: payroll_report.intent:3
 
   input:
-    e : Employee
+    w : Workforce
 
   output:
-    line : text
+    report : text
 
   logic:
-    line = concat("  ", e.name, ": ", e.salary * 10 / 100)
+    report = fold(w.employees, "", acc, e => concat(acc, "  ", e.name, ": ", e.salary * 10 / 100, "\n"))
 
   proofs:
     purity:
-      reads   : [e.name, e.salary]
+      reads   : [w.employees]
       writes  : []
       calls   : []
       verdict : pure
     termination:
       form  : constant_bound
-      bound : 5
+      bound : 8
     determinism:
       form : total
 

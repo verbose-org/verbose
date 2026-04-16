@@ -1796,11 +1796,14 @@ rule layered_caller
             // import-resolution step before verification. The test runs
             // verify_program directly, so it skips those files — parsing
             // alone is still validated above. All other files must verify
-            // clean against an examples-rooted base_dir.
+            // clean against the file's own directory as base_dir (so
+            // @source paths resolve relative to the .verbose file, not
+            // hardcoded to "examples/").
             if !program.uses.is_empty() {
                 continue;
             }
-            let errs = verify_program(&program, StdPath::new("examples"));
+            let base = path.parent().unwrap_or(StdPath::new("examples"));
+            let errs = verify_program(&program, base);
             assert!(
                 errs.is_empty(),
                 "verify errors in {}:\n{:#?}",

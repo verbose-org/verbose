@@ -5,7 +5,7 @@
 
 concept Invoice
   @intention: "An invoice has an amount, a tax rate, and a number of days overdue"
-  @source: "stdlib/finance.intent":1
+  @source: finance.intent:1
 
   fields:
     amount       : number [0, 10000000]
@@ -15,7 +15,7 @@ concept Invoice
 
 rule standard_tax
   @intention: "Standard tax is amount times tax rate divided by 100"
-  @source: "stdlib/finance.intent":2
+  @source: finance.intent:2
 
   input:
     i : Invoice
@@ -41,7 +41,7 @@ rule standard_tax
 
 rule invoice_overdue
   @intention: "An invoice is overdue when it has more than 30 days"
-  @source: "stdlib/finance.intent":3
+  @source: finance.intent:3
 
   input:
     i : Invoice

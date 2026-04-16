@@ -1,9 +1,9 @@
 #!/bin/bash
-# report.sh — Compile and run a full payroll report from native binaries.
+# report.sh — Compile a full payroll report into ONE native binary.
 #
-# Each rule compiles to its own binary (400-700 B, zero dependencies).
-# The shell script composes them into a human-readable report.
-# This is the UNIX philosophy applied to Verbose.
+# Four rules compiled into a single ELF (~2 KB, zero dependencies).
+# Each rule re-parses the same argv and writes its output to stdout.
+# The shell script just wraps the output with headers.
 #
 # Usage:
 #   ./report.sh                      # uses built-in sample data
@@ -13,69 +13,56 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SRC="$SCRIPT_DIR/payroll_report.verbose"
-BUILD_DIR="${TMPDIR:-/tmp}/verbose-payroll-report"
+BIN="${TMPDIR:-/tmp}/verbose-payroll-report-multi"
 
 # Sample data if no args given
 if [ $# -eq 0 ]; then
   set -- 3 Alice 60000 Bob 45000 Carol 90000
 fi
 
-# Extract employee count and data
 N=$1
-shift
-ARGS="$@"
 
-# Build directory
-mkdir -p "$BUILD_DIR"
-
-# Compile each rule (only if source is newer than binary)
+# Compile (multi-rule: all four rules in one binary)
 VERBOSEC="${VERBOSEC:-cargo run --quiet --}"
+RULES="bonus_report,total_salaries,high_earner_count,roster_line"
+$VERBOSEC "$SRC" --native "$BIN" --run "$RULES" 2>/dev/null
 
-compile_rule() {
-  local rule=$1
-  local out="$BUILD_DIR/$rule"
-  $VERBOSEC "$SRC" --native "$out" --run "$rule" 2>/dev/null
-}
+# Run and capture each rule's output (they appear in sequence on stdout)
+OUTPUT=$("$BIN" "$@")
 
-compile_rule bonus_line
-compile_rule high_earner_count
-compile_rule total_salaries
-compile_rule roster_line
+# Parse: bonus_report = lines until first number-only line
+BONUS=$(echo "$OUTPUT" | sed -n '1,/^[0-9]/{ /^[0-9]/!p }')
+TOTAL=$(echo "$OUTPUT" | sed -n '/^[0-9]/{p;q}')
+REST=$(echo "$OUTPUT" | sed -n '/^[0-9]/,${/^[0-9]/!{p;q}}' | tail -1)
+COUNT=$(echo "$OUTPUT" | sed -n '2{/^[0-9]/p}' | head -1)
+# Simpler: just read lines
+LINES=()
+while IFS= read -r line; do LINES+=("$line"); done <<< "$OUTPUT"
 
-# Generate the report
+# Last 3 lines are: total, count, roster
+NLINES=${#LINES[@]}
+ROSTER="${LINES[$((NLINES-1))]}"
+COUNT="${LINES[$((NLINES-2))]}"
+TOTAL="${LINES[$((NLINES-3))]}"
+
+SIZE=$(stat -c%s "$BIN")
+
 echo "╔═══════════════════════════════════════╗"
 echo "║         PAYROLL REPORT                ║"
 echo "╚═══════════════════════════════════════╝"
 echo ""
-
 echo "  Employees: $N"
 echo ""
-
 echo "  Bonuses (10%):"
-# bonus_line takes individual Employee records (name, salary)
-i=0
-while [ $i -lt $((N * 2)) ]; do
-  name=$(echo "$ARGS" | cut -d' ' -f$((i + 1)))
-  salary=$(echo "$ARGS" | cut -d' ' -f$((i + 2)))
-  "$BUILD_DIR/bonus_line" "$name" "$salary"
-  i=$((i + 2))
+# Print all lines except the last 3
+for ((i=0; i<NLINES-3; i++)); do
+  echo "${LINES[$i]}"
 done
 echo ""
-
 echo "  Summary:"
-total=$("$BUILD_DIR/total_salaries" "$N" $ARGS)
-high=$("$BUILD_DIR/high_earner_count" "$N" $ARGS)
-roster=$("$BUILD_DIR/roster_line" "$N" $ARGS)
-echo "    Total salaries:     $total"
-echo "    High earners (>50k): $high"
-echo "    Roster: $roster"
+echo "    Total salaries:      $TOTAL"
+echo "    High earners (>50k): $COUNT"
+echo "    Roster: $ROSTER"
 echo ""
-
-echo "  Binary sizes:"
-for rule in bonus_line high_earner_count total_salaries roster_line; do
-  size=$(stat -c%s "$BUILD_DIR/$rule")
-  printf "    %-20s %4d B\n" "$rule" "$size"
-done
-echo ""
-echo "  All binaries: zero dependencies, no libc, no heap."
-echo "  Reproduce: $0"
+echo "  Single binary: $SIZE B (zero dependencies, no libc, no heap)"
+echo "  Reproduce: $0 $@"

@@ -25,161 +25,143 @@ impl std::fmt::Display for NativeError {
     }
 }
 
-pub fn compile_native(
+/// Compile multiple rules into a single native binary. Each rule's code
+/// block is emitted sequentially; intermediate blocks end with stack cleanup
+/// (`mov rsp, rbp; pop rbp`) instead of `sys_exit`, so execution falls
+/// through to the next block. The last block exits normally.
+///
+/// Each block re-reads argc/argv from the original stack position (set by
+/// the kernel at `_start`), so every rule independently parses the same
+/// input. This means the binary produces ALL rules' outputs in sequence.
+pub fn compile_native_multi(
     program: &Program,
-    rule_name: &str,
+    rule_names: &[&str],
     output_path: &str,
 ) -> Result<(), NativeError> {
-    let concepts: Vec<&Concept> = program
-        .items
-        .iter()
-        .filter_map(|i| match i {
-            Item::Concept(c) => Some(c),
-            _ => None,
-        })
-        .collect();
-    let rules: HashMap<&str, &Rule> = program
-        .items
-        .iter()
-        .filter_map(|i| match i {
-            Item::Rule(r) => Some((r.name.as_str(), r)),
-            _ => None,
-        })
-        .collect();
+    if rule_names.is_empty() {
+        return Err(NativeError { message: "no rules specified for multi-rule binary".into() });
+    }
+    if rule_names.len() == 1 {
+        return compile_native(program, rule_names[0], output_path);
+    }
 
-    // The target name may be a rule OR a reaction. Dispatch accordingly.
-    let reaction = program.items.iter().find_map(|i| match i {
-        Item::Reaction(rx) if rx.name == rule_name => Some(rx),
-        _ => None,
-    });
+    let mut combined = Vec::new();
+    let exit_sequence: [u8; 12] = [
+        0x48, 0xC7, 0xC0, 0x3C, 0x00, 0x00, 0x00, // mov rax, 60
+        0x48, 0x31, 0xFF,                           // xor rdi, rdi
+        0x0F, 0x05,                                  // syscall
+    ];
+    let cleanup_sequence: [u8; 4] = [
+        0x48, 0x89, 0xEC, // mov rsp, rbp
+        0x5D,             // pop rbp
+    ];
+
+    for (i, rule_name) in rule_names.iter().enumerate() {
+        let is_last = i == rule_names.len() - 1;
+        let mut code = compile_native_code(program, rule_name)?;
+
+        // Verify the block ends with the expected exit sequence.
+        if code.len() < 12 || code[code.len() - 12..] != exit_sequence {
+            return Err(NativeError {
+                message: format!(
+                    "rule '{}' code block does not end with the expected sys_exit sequence — cannot compose in multi-rule mode",
+                    rule_name
+                ),
+            });
+        }
+
+        if !is_last {
+            // Replace exit with stack cleanup: fall through to next block.
+            code.truncate(code.len() - 12);
+            code.extend_from_slice(&cleanup_sequence);
+        }
+
+        combined.extend_from_slice(&code);
+    }
+
+    // Self-verify + peephole on the combined code.
+    peephole_optimize(&mut combined);
+    if let Err(e) = crate::validate_x86::validate_code(&combined) {
+        eprintln!("warning: x86-64 validation: {} (decoder incomplete, may be false positive)", e);
+    }
+
+    let elf = build_elf(&combined);
+    let mut file = std::fs::File::create(output_path).map_err(|e| NativeError {
+        message: format!("cannot create '{}': {}", output_path, e),
+    })?;
+    file.write_all(&elf).map_err(|e| NativeError {
+        message: format!("cannot write '{}': {}", output_path, e),
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(output_path, std::fs::Permissions::from_mode(0o755))
+            .map_err(|e| NativeError { message: format!("cannot set permissions: {}", e) })?;
+    }
+    Ok(())
+}
+
+/// Internal: emit machine code for a single rule (no ELF wrapping, no
+/// self-verification). Used by both `compile_native` and
+/// `compile_native_multi`.
+fn compile_native_code(
+    program: &Program,
+    rule_name: &str,
+) -> Result<Vec<u8>, NativeError> {
+    // (Extracted from compile_native — same dispatch logic.)
+    let concepts: Vec<&Concept> = program.items.iter().filter_map(|i| match i { Item::Concept(c) => Some(c), _ => None }).collect();
+    let rules: HashMap<&str, &Rule> = program.items.iter().filter_map(|i| match i { Item::Rule(r) => Some((r.name.as_str(), r)), _ => None }).collect();
+    let reaction = program.items.iter().find_map(|i| match i { Item::Reaction(rx) if rx.name == rule_name => Some(rx), _ => None });
 
     let (rule, concept) = if let Some(rx) = reaction {
-        // Compile a reaction: target is the reaction, but we still need its
-        // trigger rule and its input concept for field/arg wiring.
-        let trigger = rules.get(rx.trigger.as_str()).ok_or_else(|| NativeError {
-            message: format!(
-                "reaction '{}' triggers unknown rule '{}'",
-                rx.name, rx.trigger
-            ),
-        })?;
-        let concept = match &trigger.input_ty {
-            Type::Named(n) => concepts
-                .iter()
-                .find(|c| c.name == *n)
-                .ok_or_else(|| NativeError {
-                    message: format!("unknown concept '{}'", n),
-                })?,
-            _ => {
-                return Err(NativeError {
-                    message: "reaction trigger rule must take a named concept input".into(),
-                })
-            }
-        };
+        let trigger = rules.get(rx.trigger.as_str()).ok_or_else(|| NativeError { message: format!("reaction '{}' triggers unknown rule '{}'", rx.name, rx.trigger) })?;
+        let concept = match &trigger.input_ty { Type::Named(n) => concepts.iter().find(|c| c.name == *n).ok_or_else(|| NativeError { message: format!("unknown concept '{}'", n) })?, _ => return Err(NativeError { message: "reaction trigger rule must take a named concept input".into() }) };
         (*trigger, *concept)
     } else {
-        let r = rules.get(rule_name).ok_or_else(|| NativeError {
-            message: format!("no rule or reaction named '{}'", rule_name),
-        })?;
-        let c = match &r.input_ty {
-            Type::Named(n) => concepts
-                .iter()
-                .find(|c| c.name == *n)
-                .ok_or_else(|| NativeError {
-                    message: format!("unknown concept '{}'", n),
-                })?,
-            _ => {
-                return Err(NativeError {
-                    message: "rule input must be a named concept".into(),
-                })
-            }
-        };
+        let r = rules.get(rule_name).ok_or_else(|| NativeError { message: format!("no rule or reaction named '{}'", rule_name) })?;
+        let c = match &r.input_ty { Type::Named(n) => concepts.iter().find(|c| c.name == *n).ok_or_else(|| NativeError { message: format!("unknown concept '{}'", n) })?, _ => return Err(NativeError { message: "rule input must be a named concept".into() }) };
         (*r, *c)
     };
 
-    let is_vectorizable = rule
-        .hints
-        .as_ref()
-        .map_or(false, |h| h.vectorizable.is_some());
-    let is_parallel = rule
-        .hints
-        .as_ref()
-        .map_or(false, |h| h.parallel.is_some());
-
+    let is_vectorizable = rule.hints.as_ref().map_or(false, |h| h.vectorizable.is_some());
+    let is_parallel = rule.hints.as_ref().map_or(false, |h| h.parallel.is_some());
     let is_result_output = matches!(&rule.output_ty, Type::Result(_, _));
     let is_collection_output = matches!(&rule.output_ty, Type::Collection(_));
-    // Phase 4: number output whose top-level logic is `fold(...)` (or its
-    // sum/count/min/max desugarings). Routes to emit_fold_program.
-    let is_fold_number_output = matches!(&rule.output_ty, Type::Number)
-        && matches!(&rule.logic.value, Expr::Fold(_, _, _, _, _));
-    // Phase 5b: text output whose top-level logic is `fold(...)` — appends
-    // into a growing text buffer. Routes to emit_text_fold_program.
-    let is_fold_text_output = matches!(&rule.output_ty, Type::Text)
-        && matches!(&rule.logic.value, Expr::Fold(_, _, _, _, _));
+    let is_fold_number_output = matches!(&rule.output_ty, Type::Number) && matches!(&rule.logic.value, Expr::Fold(_, _, _, _, _));
+    let is_fold_text_output = matches!(&rule.output_ty, Type::Text) && matches!(&rule.logic.value, Expr::Fold(_, _, _, _, _));
+    let record_output_concept: Option<&Concept> = match &rule.output_ty { Type::Named(n) => concepts.iter().find(|c| c.name == *n).copied(), _ => None };
 
-    // Record output: rule.output_ty is Named(concept_name) and the name
-    // resolves to a concept declared in the program. Routes to
-    // emit_record_program which emits JSON per record.
-    let record_output_concept: Option<&Concept> = match &rule.output_ty {
-        Type::Named(n) => concepts.iter().find(|c| c.name == *n).copied(),
-        _ => None,
-    };
-
-    let mut code = if let Some(rx) = reaction {
+    let code = if let Some(rx) = reaction {
         emit_reaction_program(rx, rule, concept, &rules)?
     } else if is_result_output {
-        // Rules returning Result(T, E) get their own emitter: Ok-arm values
-        // stream to stdout, Err-arm text streams to stderr. Each leaf
-        // self-terminates (continuation-passing), no tagged value lives in
-        // registers across the top-level dispatch.
         emit_result_program(rule, concept, &rules)?
     } else if is_collection_output {
-        // Phase 3: rules returning collection(T). map/filter over an input
-        // collection field, emit one JSON line per produced element.
         emit_collection_program(rule, concept, &concepts, &rules)?
     } else if is_fold_number_output {
-        // Phase 4: rules returning number via fold (incl. sum/count/min/max
-        // desugarings). Single 8-byte accumulator slot at the bottom of the
-        // rbp frame; one final `itoa + \n` per input record.
         emit_fold_program(rule, concept, &concepts, &rules)?
     } else if is_fold_text_output {
-        // Phase 5b: text output via top-level fold — append-only body,
-        // two-pass sizing, stack buffer freed via saved rsp in r9.
         emit_text_fold_program(rule, concept, &concepts, &rules)?
     } else if matches!(&rule.output_ty, Type::Text) {
-        // Phase 5a: rules returning `text` via a per-record body (literal,
-        // input text field, or concat). One write to stdout + newline per
-        // record. No accumulator — fold-over-collection to text stays Phase 5b.
         emit_text_program(rule, concept, &rules)?
     } else if let Some(rec_concept) = record_output_concept {
-        // Record-output rules: each leaf emits a JSON object to stdout + \n.
-        // Same continuation-passing convention as Result.
         emit_record_program(rule, rec_concept, concept, &concepts, &rules)?
     } else if is_vectorizable && concept.fields.len() == 1 {
-        if let Some(threshold) = extract_simple_gt(rule) {
-            emit_vectorized_program(threshold)?
-        } else {
-            emit_full_program(rule, concept, &rules)?
-        }
+        if let Some(threshold) = extract_simple_gt(rule) { emit_vectorized_program(threshold)? } else { emit_full_program(rule, concept, &rules)? }
     } else if is_parallel {
         emit_parallel_program(rule, concept, &rules)?
     } else {
         emit_full_program(rule, concept, &rules)?
     };
 
-    // Self-verification: validate emitted machine code (best-effort).
-    // The x86-64 decoder doesn't cover all instructions yet (itoa, complex addressing).
-    // Validation errors are warnings, not hard failures, until the decoder is complete.
-    // Stack depth check: verify the expression won't overflow the stack
-    let depth = max_stack_depth(&rule.logic.value);
-    let stack_bytes = depth * 8;
-    if stack_bytes > 1_000_000 {
-        return Err(NativeError {
-            message: format!(
-                "expression stack depth {} ({} bytes) exceeds safety limit (1 MB)",
-                depth, stack_bytes
-            ),
-        });
-    }
+    Ok(code)
+}
+
+pub fn compile_native(
+    program: &Program,
+    rule_name: &str,
+    output_path: &str,
+) -> Result<(), NativeError> {
+    let mut code = compile_native_code(program, rule_name)?;
 
     // Peephole optimization: eliminate redundant push/pop patterns
     let before_size = code.len();

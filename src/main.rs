@@ -203,7 +203,7 @@ fn main() {
         }
         println!("  Proofs verified:  purity, termination, determinism");
     } else if let Some(output) = native_output {
-        let native_rule = find_flag(&args, "--run").unwrap_or_else(|| {
+        let native_rule_str = find_flag(&args, "--run").unwrap_or_else(|| {
             program
                 .items
                 .iter()
@@ -214,13 +214,21 @@ fn main() {
                 })
                 .unwrap_or_default()
         });
-        match native::compile_native(&program, &native_rule, &output) {
+        // Multi-rule: "rule1,rule2,..." compiles all into one binary.
+        let rule_names: Vec<&str> = native_rule_str.split(',').collect();
+        let compile_result = if rule_names.len() > 1 {
+            native::compile_native_multi(&program, &rule_names, &output)
+        } else {
+            native::compile_native(&program, &rule_names[0], &output)
+        };
+        let native_rule = &native_rule_str; // for display
+        match compile_result {
             Ok(()) => {
                 let size = std::fs::metadata(&output).map(|m| m.len()).unwrap_or(0);
                 println!("native: {} -> {} ({} bytes, rule '{}')", path, output, size, native_rule);
                 // Report exploited hints
                 if let Some(rule) = program.items.iter().find_map(|i| match i {
-                    ast::Item::Rule(r) if r.name == native_rule => Some(r),
+                    ast::Item::Rule(r) if r.name == *native_rule => Some(r),
                     _ => None,
                 }) {
                     if let Some(hints) = &rule.hints {
