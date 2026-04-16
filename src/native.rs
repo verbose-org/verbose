@@ -2594,10 +2594,12 @@ fn emit_collection_program(
         Record(&'a Concept),
         Number,
         Text,
+        Bool,
     }
     let output_kind: OutputElemKind = match elem_type_name.as_str() {
         "number" => OutputElemKind::Number,
         "text" => OutputElemKind::Text,
+        "bool" => OutputElemKind::Bool,
         name => {
             let c = all_concepts
                 .iter()
@@ -2705,6 +2707,9 @@ fn emit_collection_program(
                     CollectionOp::MapRecord { lambda_var: v.as_str(), body_fields }
                 }
                 OutputElemKind::Number => {
+                    CollectionOp::MapScalar { lambda_var: v.as_str(), body: b.as_ref(), is_text: false }
+                }
+                OutputElemKind::Bool => {
                     CollectionOp::MapScalar { lambda_var: v.as_str(), body: b.as_ref(), is_text: false }
                 }
                 OutputElemKind::Text => {
@@ -2861,8 +2866,8 @@ fn emit_collection_program(
             )?;
         }
         CollectionOp::MapScalar { lambda_var, body, is_text } => {
-            // Scalar element output: evaluate the body to rax (number) or
-            // emit the text directly, then one newline per element.
+            // Scalar element output: evaluate the body to rax (number/bool)
+            // or emit the text directly, then one newline per element.
             if is_text {
                 emit_text_write_to_fd(
                     &mut code, body, 1, lambda_var, input_elem_concept, all_rules,
@@ -2874,8 +2879,24 @@ fn emit_collection_program(
                 emit_eval_expr(
                     &mut code, body, lambda_var, &elem_offsets, all_rules, &field_ranges,
                 )?;
-                // emit_itoa_inline writes rax to stdout with trailing newline.
-                emit_itoa_inline(&mut code);
+                if matches!(output_kind, OutputElemKind::Bool) {
+                    // Bool: rax = 0/1 → "true"/"false" + newline.
+                    code.extend_from_slice(&[0x84, 0xC0]); // test al, al
+                    code.push(0x74); // jz .print_false
+                    let pf_patch = code.len();
+                    code.push(0x00);
+                    emit_write_string(&mut code, b"true\n");
+                    code.push(0xEB); // jmp .after
+                    let ap_patch = code.len();
+                    code.push(0x00);
+                    let pf_pos = code.len();
+                    code[pf_patch] = (pf_pos - pf_patch - 1) as u8;
+                    emit_write_string(&mut code, b"false\n");
+                    let ap_pos = code.len();
+                    code[ap_patch] = (ap_pos - ap_patch - 1) as u8;
+                } else {
+                    emit_itoa_inline(&mut code);
+                }
             }
         }
         CollectionOp::Filter { lambda_var, predicate } => {
