@@ -1,5 +1,9 @@
 #!/bin/bash
-# validate.sh — Compile and run invoice validation from a single native binary.
+# validate.sh — Invoice validation from a single native binary.
+#
+# Two rules compiled into ONE ELF (~1.6 KB, zero dependencies):
+#   1. validated: Ok(amount) → stdout, Err("[client] reason") → stderr
+#   2. classify:  "client: small/medium/large" → stdout
 #
 # Usage:
 #   ./validate.sh                              # sample data
@@ -11,46 +15,43 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SRC="$SCRIPT_DIR/invoice_validator.verbose"
 BIN="${TMPDIR:-/tmp}/verbose-invoice-validator"
 
-# Sample data if no args
 if [ $# -eq 0 ]; then
   set -- Acme 5000 BadCo 0 BigCorp 200000 SmallShop 500
 fi
 
-# Compile
 VERBOSEC="${VERBOSEC:-cargo run --quiet --}"
+$VERBOSEC "$SRC" --native "$BIN" --run validated,classify 2>/dev/null
 
-echo "=== Compiling ==="
-# Individual binaries for the validation pipeline
-$VERBOSEC "$SRC" --native "$BIN-validated" --run validated
-$VERBOSEC "$SRC" --native "$BIN-classify" --run classify
+SIZE=$(stat -c%s "$BIN")
 
-SIZE_V=$(stat -c%s "$BIN-validated")
-SIZE_C=$(stat -c%s "$BIN-classify")
+# Run: stdout gets Ok values + classification, stderr gets enriched errors.
+STDOUT=$("$BIN" "$@" 2>/tmp/verbose-inv-err)
+ERRORS=$(cat /tmp/verbose-inv-err)
 
-echo ""
+# Split stdout: first N lines are validated Ok values, rest are classify labels.
+# Count: each invoice is 2 argv tokens (client + amount).
+N=$(( $# / 2 ))
+VALID_COUNT=$(echo "$STDOUT" | head -n "$N" | grep -c '^[0-9]' || true)
+CLASSIFY=$(echo "$STDOUT" | tail -n "$N")
+
 echo "╔═══════════════════════════════════════╗"
 echo "║      INVOICE VALIDATION REPORT        ║"
 echo "╚═══════════════════════════════════════╝"
 echo ""
-
-# Run validation: Ok → stdout, Err → stderr (captured separately)
+echo "  Invoices: $N"
+echo ""
 echo "  Validation (Ok → stdout, Err → stderr):"
-VALID=$("$BIN-validated" "$@" 2>/tmp/verbose-inv-err)
-ERRORS=$(cat /tmp/verbose-inv-err)
-if [ -n "$VALID" ]; then
+if [ -n "$(echo "$STDOUT" | head -n "$N" | grep '^[0-9]')" ]; then
   echo "    Valid amounts:"
-  echo "$VALID" | while read -r line; do echo "      $line"; done
+  echo "$STDOUT" | head -n "$N" | grep '^[0-9]' | while read -r line; do echo "      $line"; done
 fi
 if [ -n "$ERRORS" ]; then
   echo "    Errors:"
   echo "$ERRORS" | while read -r line; do echo "      $line"; done
 fi
 echo ""
-
 echo "  Classification:"
-"$BIN-classify" "$@" | while read -r line; do echo "    $line"; done
+echo "$CLASSIFY" | while read -r line; do echo "    $line"; done
 echo ""
-
-echo "  Binaries: validated=$SIZE_V B, classify=$SIZE_C B"
-echo "  Total: $((SIZE_V + SIZE_C)) B, zero dependencies"
+echo "  Single binary: $SIZE B (zero dependencies, no libc, no heap)"
 echo "  Reproduce: $0 $@"
