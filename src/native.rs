@@ -4648,7 +4648,7 @@ fn emit_itoa_inline(code: &mut Vec<u8>) {
     // test rax, rax
     code.extend_from_slice(&[0x48, 0x85, 0xC0]);
     // jnz .div_loop
-    let jmp_back = div_loop_pos as i8 - (code.len() + 2) as i8;
+    let jmp_back = div_loop_pos as i32 - (code.len() + 2) as i32;
     code.extend_from_slice(&[0x75, jmp_back as u8]);
 
     // .write:
