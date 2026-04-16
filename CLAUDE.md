@@ -82,7 +82,7 @@ tools/
 ## Language Features (current)
 
 - Types: `number`, `bool`, `text`, `collection(Type)`, `Result(T, E)` (declared failure path), named types
-- Field ranges: `amount : number [0, 1000000]`
+- Field ranges: `amount : number [0, 1000000]`, `name : text [..64]` (max byte length; verifier carries the bound, native can exploit for compile-time buffer sizing)
 - Expressions: arithmetic (+, -, *, /, %), comparisons (>, <, >=, <=, ==, !=), boolean (and, or, not)
 - Control flow: `if condition then expr else expr` (nestable)
 - Let bindings: `let tax = amount * rate / 100` (CSE)

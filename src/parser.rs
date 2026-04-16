@@ -137,11 +137,27 @@ impl Parser {
             let ty = self.parse_type()?;
             let range = if self.check_kind(&TokenKind::LBracket) {
                 self.advance();
-                let min = self.parse_signed_number()?;
-                self.expect_kind(TokenKind::Comma)?;
-                let max = self.parse_signed_number()?;
-                self.expect_kind(TokenKind::RBracket)?;
-                Some((min, max))
+                if self.check_kind(&TokenKind::Dot) {
+                    // text [..N] — max byte length bound
+                    self.advance(); // first dot
+                    self.expect_kind(TokenKind::Dot)?; // second dot
+                    let max = self.parse_signed_number()?;
+                    self.expect_kind(TokenKind::RBracket)?;
+                    if !matches!(ty, Type::Text) {
+                        return Err(self.error("[..N] bound syntax is only valid for text fields; use [min, max] for numbers"));
+                    }
+                    if max <= 0 {
+                        return Err(self.error("text max-length bound must be positive"));
+                    }
+                    Some((0, max))
+                } else {
+                    // number [min, max] — arithmetic range bound
+                    let min = self.parse_signed_number()?;
+                    self.expect_kind(TokenKind::Comma)?;
+                    let max = self.parse_signed_number()?;
+                    self.expect_kind(TokenKind::RBracket)?;
+                    Some((min, max))
+                }
             } else {
                 None
             };
@@ -1335,6 +1351,23 @@ rule important_invoice
             Item::Concept(c) => {
                 assert_eq!(c.fields[0].range, Some((0, 100)));
                 assert_eq!(c.fields[1].range, Some((-50, 50)));
+            }
+            _ => panic!("expected concept"),
+        }
+    }
+
+    #[test]
+    fn text_max_len_parsed() {
+        let src = "@verbose 0.1.0\n\nconcept T\n  @intention: \"t\"\n  @source: f.intent:1\n  fields:\n    name : text [..64]\n    bio  : text [..1024]\n    plain : text\n";
+        let p = parse(src).unwrap();
+        match &p.items[0] {
+            Item::Concept(c) => {
+                assert_eq!(c.fields[0].ty, Type::Text);
+                assert_eq!(c.fields[0].range, Some((0, 64)));
+                assert_eq!(c.fields[1].ty, Type::Text);
+                assert_eq!(c.fields[1].range, Some((0, 1024)));
+                assert_eq!(c.fields[2].ty, Type::Text);
+                assert_eq!(c.fields[2].range, None);
             }
             _ => panic!("expected concept"),
         }
