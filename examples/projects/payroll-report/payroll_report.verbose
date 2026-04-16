@@ -1,0 +1,136 @@
+@verbose 0.1.0
+
+-- Payroll Report — a REAL project exercising the full native stack.
+--
+-- Six rules on the same input, each compiled to its own native binary
+-- (400-700 B, zero dependencies). A shell script composes them into
+-- a human-readable report. This is the UNIX philosophy applied to
+-- Verbose: small, auditable, composable binaries.
+--
+-- Phases exercised: 3 (map), 4 (sum, count), 5a (per-record text),
+-- 5b (fold-to-text), 2G (rule call inlining).
+
+
+concept Employee
+  @intention: "An employee has a name and a salary"
+  @source: payroll_report.intent:1
+
+  fields:
+    name   : text [..64]
+    salary : number [0, 1000000]
+
+
+concept Workforce
+  @intention: "A workforce is a collection of employees"
+  @source: payroll_report.intent:2
+
+  fields:
+    employees : collection(Employee)
+
+
+-- Rule 1: per-employee bonus line (Phase 5a + 2G composition)
+rule bonus_line
+  @intention: "Format one bonus line per employee"
+  @source: payroll_report.intent:3
+
+  input:
+    e : Employee
+
+  output:
+    line : text
+
+  logic:
+    line = concat("  ", e.name, ": ", e.salary * 10 / 100)
+
+  proofs:
+    purity:
+      reads   : [e.name, e.salary]
+      writes  : []
+      calls   : []
+      verdict : pure
+    termination:
+      form  : constant_bound
+      bound : 5
+    determinism:
+      form : total
+
+
+-- Rule 2: count high earners (Phase 4)
+rule high_earner_count
+  @intention: "Count employees earning more than 50000"
+  @source: payroll_report.intent:4
+
+  input:
+    w : Workforce
+
+  output:
+    n : number
+
+  logic:
+    n = count(w.employees, e => e.salary > 50000)
+
+  proofs:
+    purity:
+      reads   : [w.employees]
+      writes  : []
+      calls   : []
+      verdict : pure
+    termination:
+      form  : constant_bound
+      bound : 5
+    determinism:
+      form : total
+
+
+-- Rule 3: total salaries (Phase 4)
+rule total_salaries
+  @intention: "Sum all salaries"
+  @source: payroll_report.intent:5
+
+  input:
+    w : Workforce
+
+  output:
+    t : number
+
+  logic:
+    t = sum(w.employees, e => e.salary)
+
+  proofs:
+    purity:
+      reads   : [w.employees]
+      writes  : []
+      calls   : []
+      verdict : pure
+    termination:
+      form  : constant_bound
+      bound : 2
+    determinism:
+      form : total
+
+
+-- Rule 4: roster line (Phase 5b fold-to-text)
+rule roster_line
+  @intention: "Build a roster: each employee as name=salary; "
+  @source: payroll_report.intent:6
+
+  input:
+    w : Workforce
+
+  output:
+    line : text
+
+  logic:
+    line = fold(w.employees, "", acc, e => concat(acc, e.name, "=", e.salary, "; "))
+
+  proofs:
+    purity:
+      reads   : [w.employees]
+      writes  : []
+      calls   : []
+      verdict : pure
+    termination:
+      form  : constant_bound
+      bound : 6
+    determinism:
+      form : total

@@ -1,0 +1,6 @@
+1. An employee has a name and a salary.
+2. A workforce is a collection of employees.
+3. For each employee, compute a 10% bonus line: "name: bonus_amount".
+4. Count how many employees earn more than 50000.
+5. Sum all salaries.
+6. Build a roster line listing each employee as "name=salary; ".
