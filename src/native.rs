@@ -6643,9 +6643,14 @@ pub fn compile_http_server(
 
     // ═══ SAVE NETWORK FDs ═══════════════════════════════════════
     // r12 (server_fd) and r13 (client_fd) will be clobbered by the rule code.
-    // Save them at [rbx+0] and [rbx+8] (in the buffer area, below the argv).
-    code.extend_from_slice(&[0x4C, 0x89, 0x23]);       // mov [rbx], r12
-    code.extend_from_slice(&[0x4C, 0x89, 0x6B, 0x08]); // mov [rbx+8], r13
+    // Save at [rbx+4080] and [rbx+4088] — top of the token array area,
+    // safely past any HTTP request data (max 4K at [rbx..rbx+4096]).
+    // MUST NOT save at [rbx+0] — that overlaps with the request buffer
+    // where tokenized path values live!
+    code.extend_from_slice(&[0x4C, 0x89, 0xA3]); // mov [rbx + 4080], r12
+    code.extend_from_slice(&4080i32.to_le_bytes());
+    code.extend_from_slice(&[0x4C, 0x89, 0xAB]); // mov [rbx + 4088], r13
+    code.extend_from_slice(&4088i32.to_le_bytes());
 
     // ═══ REDIRECT STDOUT/STDERR TO CLIENT SOCKET ══════════════
     // dup2(client_fd, 1) → syscall 33
@@ -6678,9 +6683,11 @@ pub fn compile_http_server(
 
     // Restore rsp from rbx
     code.extend_from_slice(&[0x48, 0x89, 0xDC]); // mov rsp, rbx
-    // Restore r12 (server_fd) and r13 (client_fd)
-    code.extend_from_slice(&[0x4C, 0x8B, 0x23]);       // mov r12, [rbx]
-    code.extend_from_slice(&[0x4C, 0x8B, 0x6B, 0x08]); // mov r13, [rbx+8]
+    // Restore r12 (server_fd) and r13 (client_fd) from [rbx+4080/4088]
+    code.extend_from_slice(&[0x4C, 0x8B, 0xA3]); // mov r12, [rbx + 4080]
+    code.extend_from_slice(&4080i32.to_le_bytes());
+    code.extend_from_slice(&[0x4C, 0x8B, 0xAB]); // mov r13, [rbx + 4088]
+    code.extend_from_slice(&4088i32.to_le_bytes());
 
     // close(client_fd)
     let close_client = code.len();
