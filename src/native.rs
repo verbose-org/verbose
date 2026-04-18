@@ -6484,7 +6484,7 @@ pub fn compile_http_server(
     code.extend_from_slice(&[0x48, 0x31, 0xC0]); // sys_read
     code.extend_from_slice(&[0x4C, 0x89, 0xEF]); // rdi = client_fd
     code.extend_from_slice(&[0x48, 0x89, 0xE6]); // rsi = rsp (buffer)
-    code.extend_from_slice(&[0x48, 0xC7, 0xC2, 0x00, 0x10, 0x00, 0x00]); // rdx = 4096
+    code.extend_from_slice(&[0x48, 0xC7, 0xC2, 0xFF, 0x0F, 0x00, 0x00]); // rdx = 4095 (1 byte for NUL)
     code.extend_from_slice(&[0x0F, 0x05]);
     // rax = bytes read. NUL-terminate.
     code.extend_from_slice(&[0x48, 0x85, 0xC0]); // test rax, rax
