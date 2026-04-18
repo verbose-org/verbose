@@ -6233,6 +6233,155 @@ fn emit_stream_prologue(code: &mut Vec<u8>) -> usize {
     stream_top
 }
 
+/// Emit a standalone TCP echo server binary. No rules, no concepts — just
+/// raw x86-64 machine code that listens on the given port, accepts connections,
+/// and echoes received data back until the client disconnects.
+///
+/// Syscalls used: socket(41), bind(49), listen(50), accept(43),
+///                read(0), write(1), close(3), exit(60).
+///
+/// Stack layout:
+///   [rsp .. rsp+16]    sockaddr_in struct (for bind)
+///   [rsp+16 .. rsp+4112] read buffer (4096 bytes)
+pub fn compile_echo_server(port: u16, output_path: &str) -> Result<(), NativeError> {
+    let mut code = Vec::new();
+    let port_be = port.to_be_bytes(); // network byte order
+
+    // ═══ SOCKET ════════════════════════════════════════════════
+    // socket(AF_INET=2, SOCK_STREAM=1, 0) → rax = server_fd
+    code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x29, 0x00, 0x00, 0x00]); // mov rax, 41
+    code.extend_from_slice(&[0x48, 0xC7, 0xC7, 0x02, 0x00, 0x00, 0x00]); // mov rdi, 2 (AF_INET)
+    code.extend_from_slice(&[0x48, 0xC7, 0xC6, 0x01, 0x00, 0x00, 0x00]); // mov rsi, 1 (SOCK_STREAM)
+    code.extend_from_slice(&[0x48, 0x31, 0xD2]);                         // xor rdx, rdx
+    code.extend_from_slice(&[0x0F, 0x05]);                               // syscall
+    // Save server_fd in r12
+    code.extend_from_slice(&[0x49, 0x89, 0xC4]);                         // mov r12, rax
+
+    // ═══ SETSOCKOPT (SO_REUSEADDR) ════════════════════════════
+    // Prevent "Address already in use" on rapid restart.
+    // setsockopt(fd, SOL_SOCKET=1, SO_REUSEADDR=2, &1, 4) → syscall 54
+    // Push the value 1 onto the stack for the optval pointer.
+    code.extend_from_slice(&[0x6A, 0x01]);                               // push 1
+    code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x36, 0x00, 0x00, 0x00]); // mov rax, 54
+    code.extend_from_slice(&[0x4C, 0x89, 0xE7]);                         // mov rdi, r12
+    code.extend_from_slice(&[0x48, 0xC7, 0xC6, 0x01, 0x00, 0x00, 0x00]); // mov rsi, 1 (SOL_SOCKET)
+    code.extend_from_slice(&[0x48, 0xC7, 0xC2, 0x02, 0x00, 0x00, 0x00]); // mov rdx, 2 (SO_REUSEADDR)
+    code.extend_from_slice(&[0x49, 0x89, 0xE2]);                         // mov r10, rsp (optval = &1)
+    code.extend_from_slice(&[0x49, 0xC7, 0xC0, 0x04, 0x00, 0x00, 0x00]); // mov r8, 4 (optlen)
+    code.extend_from_slice(&[0x0F, 0x05]);                               // syscall
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x08]);                   // add rsp, 8 (pop the 1)
+
+    // ═══ BIND ═════════════════════════════════════════════════
+    // Build sockaddr_in on the stack:
+    //   [rsp+0..2]  = AF_INET (2, little-endian u16)
+    //   [rsp+2..4]  = port (network byte order u16)
+    //   [rsp+4..8]  = INADDR_ANY (0)
+    //   [rsp+8..16] = padding (0)
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x10]);                   // sub rsp, 16
+    // mov word [rsp], 2 (AF_INET)
+    code.extend_from_slice(&[0x66, 0xC7, 0x04, 0x24, 0x02, 0x00]);
+    // mov word [rsp+2], port (network byte order)
+    code.extend_from_slice(&[0x66, 0xC7, 0x44, 0x24, 0x02]);
+    code.extend_from_slice(&port_be);
+    // mov qword [rsp+4], 0 (INADDR_ANY + padding)
+    code.extend_from_slice(&[0x48, 0xC7, 0x44, 0x24, 0x04, 0x00, 0x00, 0x00, 0x00]);
+    // Actually the above only writes 4 bytes at [rsp+4]. Let me also zero [rsp+8..16].
+    code.extend_from_slice(&[0x48, 0xC7, 0x44, 0x24, 0x08, 0x00, 0x00, 0x00, 0x00]);
+
+    // bind(r12, rsp, 16) → syscall 49
+    code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x31, 0x00, 0x00, 0x00]); // mov rax, 49
+    code.extend_from_slice(&[0x4C, 0x89, 0xE7]);                         // mov rdi, r12
+    code.extend_from_slice(&[0x48, 0x89, 0xE6]);                         // mov rsi, rsp
+    code.extend_from_slice(&[0x48, 0xC7, 0xC2, 0x10, 0x00, 0x00, 0x00]); // mov rdx, 16
+    code.extend_from_slice(&[0x0F, 0x05]);                               // syscall
+
+    // ═══ LISTEN ═══════════════════════════════════════════════
+    // listen(r12, 128) → syscall 50
+    code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x32, 0x00, 0x00, 0x00]); // mov rax, 50
+    code.extend_from_slice(&[0x4C, 0x89, 0xE7]);                         // mov rdi, r12
+    code.extend_from_slice(&[0x48, 0xC7, 0xC6, 0x80, 0x00, 0x00, 0x00]); // mov rsi, 128
+    code.extend_from_slice(&[0x0F, 0x05]);                               // syscall
+
+    // Allocate 4K read buffer on stack (below sockaddr_in)
+    code.extend_from_slice(&[0x48, 0x81, 0xEC, 0x00, 0x10, 0x00, 0x00]); // sub rsp, 4096
+
+    // ═══ ACCEPT LOOP ══════════════════════════════════════════
+    let accept_top = code.len();
+    // accept(r12, NULL, NULL) → rax = client_fd → syscall 43
+    code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x2B, 0x00, 0x00, 0x00]); // mov rax, 43
+    code.extend_from_slice(&[0x4C, 0x89, 0xE7]);                         // mov rdi, r12
+    code.extend_from_slice(&[0x48, 0x31, 0xF6]);                         // xor rsi, rsi
+    code.extend_from_slice(&[0x48, 0x31, 0xD2]);                         // xor rdx, rdx
+    code.extend_from_slice(&[0x0F, 0x05]);                               // syscall
+    // Save client_fd in r13
+    code.extend_from_slice(&[0x49, 0x89, 0xC5]);                         // mov r13, rax
+
+    // ═══ ECHO LOOP (per connection) ═══════════════════════════
+    let echo_top = code.len();
+    // read(client_fd, rsp, 4096) → rax = bytes_read → syscall 0
+    code.extend_from_slice(&[0x48, 0x31, 0xC0]);                         // xor rax, rax (sys_read=0)
+    code.extend_from_slice(&[0x4C, 0x89, 0xEF]);                         // mov rdi, r13
+    code.extend_from_slice(&[0x48, 0x89, 0xE6]);                         // mov rsi, rsp
+    code.extend_from_slice(&[0x48, 0xC7, 0xC2, 0x00, 0x10, 0x00, 0x00]); // mov rdx, 4096
+    code.extend_from_slice(&[0x0F, 0x05]);                               // syscall
+
+    // if bytes_read <= 0: close + accept next
+    code.extend_from_slice(&[0x48, 0x85, 0xC0]);                         // test rax, rax
+    code.push(0x7E);                                                     // jle close_client
+    let close_patch = code.len();
+    code.push(0x00);
+
+    // write(client_fd, rsp, bytes_read) → syscall 1
+    code.extend_from_slice(&[0x48, 0x89, 0xC2]);                         // mov rdx, rax (count)
+    code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x01, 0x00, 0x00, 0x00]); // mov rax, 1
+    code.extend_from_slice(&[0x4C, 0x89, 0xEF]);                         // mov rdi, r13
+    code.extend_from_slice(&[0x48, 0x89, 0xE6]);                         // mov rsi, rsp
+    code.extend_from_slice(&[0x0F, 0x05]);                               // syscall
+
+    // jmp echo_top
+    code.push(0xE9);
+    let echo_back = echo_top as i32 - (code.len() as i32 + 4);
+    code.extend_from_slice(&echo_back.to_le_bytes());
+
+    // close_client:
+    let close_pos = code.len();
+    code[close_patch] = (close_pos - close_patch - 1) as u8;
+    // close(client_fd) → syscall 3
+    code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x03, 0x00, 0x00, 0x00]); // mov rax, 3
+    code.extend_from_slice(&[0x4C, 0x89, 0xEF]);                         // mov rdi, r13
+    code.extend_from_slice(&[0x0F, 0x05]);                               // syscall
+
+    // jmp accept_top
+    code.push(0xE9);
+    let accept_back = accept_top as i32 - (code.len() as i32 + 4);
+    code.extend_from_slice(&accept_back.to_le_bytes());
+
+    // (Server never exits — kill with Ctrl-C / SIGTERM)
+
+    // Validate emitted code
+    if let Err(e) = crate::validate_x86::validate_code(&code) {
+        eprintln!("warning: x86-64 validation: {} (decoder incomplete, may be false positive)", e);
+    }
+
+    let elf = build_elf(&code);
+    let mut file = std::fs::File::create(output_path).map_err(|e| NativeError {
+        message: format!("cannot create '{}': {}", output_path, e),
+    })?;
+    file.write_all(&elf).map_err(|e| NativeError {
+        message: format!("cannot write '{}': {}", output_path, e),
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(output_path, std::fs::Permissions::from_mode(0o755))
+            .map_err(|e| NativeError { message: format!("cannot set permissions: {}", e) })?;
+    }
+
+    let size = std::fs::metadata(output_path).map(|m| m.len()).unwrap_or(0);
+    println!("echo-server: {} ({} bytes, port {})", output_path, size, port);
+    Ok(())
+}
+
 fn build_elf(code: &[u8]) -> Vec<u8> {
     let entry_addr: u64 = 0x400000 + 120;
     let file_size = 120 + code.len();

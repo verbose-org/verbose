@@ -110,9 +110,11 @@ fn decode_instruction_length(code: &[u8], pos: usize) -> Option<usize> {
     let mut i = pos;
 
     // Legacy prefixes (66, F2, F3, etc.)
+    let mut has_66 = false;
     while i < code.len() {
         match code[i] {
-            0x66 | 0xF2 | 0xF3 | 0x26 | 0x2E | 0x36 | 0x3E | 0x64 | 0x65 | 0xF0 => i += 1,
+            0x66 => { has_66 = true; i += 1; }
+            0xF2 | 0xF3 | 0x26 | 0x2E | 0x36 | 0x3E | 0x64 | 0x65 | 0xF0 => i += 1,
             _ => break,
         }
     }
@@ -272,11 +274,12 @@ fn decode_instruction_length(code: &[u8], pos: usize) -> Option<usize> {
             if i >= code.len() { return None; }
             Some(i + 1 - pos) // + imm8
         }
-        // MOV r/m, imm32 (C7 /0)
+        // MOV r/m, imm32 (C7 /0) — with 66h prefix, imm16
         0xC7 => {
             i += modrm_length(code, i)?;
-            if i + 4 > code.len() { return None; }
-            Some(i + 4 - pos)
+            let imm_size = if has_66 { 2 } else { 4 };
+            if i + imm_size > code.len() { return None; }
+            Some(i + imm_size - pos)
         }
 
         // ALU r/m, r (ADD=01, OR=09, AND=21, SUB=29, XOR=31, CMP=39)

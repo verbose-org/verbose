@@ -46,6 +46,21 @@ fn main() {
         return;
     }
 
+    // Standalone echo server — no .verbose file needed
+    if let Some(port_str) = find_flag(&args, "--echo-server") {
+        let port: u16 = port_str.parse().unwrap_or_else(|_| {
+            eprintln!("invalid port: {}", port_str);
+            process::exit(2);
+        });
+        let output = args.iter().skip_while(|a| *a != "--echo-server").nth(2)
+            .cloned().unwrap_or_else(|| format!("/tmp/echo_server_{}", port));
+        match native::compile_echo_server(port, &output) {
+            Ok(()) => {}
+            Err(e) => { eprintln!("{}", e); process::exit(1); }
+        }
+        return;
+    }
+
     if args.len() < 2 {
         eprintln!("usage: verbosec <file.verbose> [options]");
         eprintln!();
@@ -57,6 +72,7 @@ fn main() {
         eprintln!("  --native <output> --stdin           Native ELF that reads input from stdin");
         eprintln!("  --native <output> --stream          Streaming: reads stdin line by line (long-running)");
         eprintln!("  --wasm <output>                    Compile to WebAssembly module (.wasm)");
+        eprintln!("  --echo-server <port> <output>      TCP echo server (standalone, no .verbose needed)");
         process::exit(2);
     }
     let path = &args[1];
