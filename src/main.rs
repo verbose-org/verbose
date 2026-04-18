@@ -46,6 +46,50 @@ fn main() {
         return;
     }
 
+    // HTTP rule server: --http-server <port> <file.verbose> --run <rule> <output>
+    if args.iter().any(|a| a == "--http-server") {
+        let port_str = find_flag(&args, "--http-server").unwrap_or_else(|| "8080".into());
+        let port: u16 = port_str.parse().unwrap_or_else(|_| {
+            eprintln!("invalid port: {}", port_str);
+            process::exit(2);
+        });
+        // Find the .verbose file (first arg that ends with .verbose)
+        let verbose_file = args.iter().find(|a| a.ends_with(".verbose")).cloned().unwrap_or_else(|| {
+            eprintln!("--http-server requires a .verbose file");
+            process::exit(2);
+        });
+        let rule_name = find_flag(&args, "--run").unwrap_or_else(|| {
+            eprintln!("--http-server requires --run <rule>");
+            process::exit(2);
+        });
+        let output = find_flag(&args, "--output")
+            .unwrap_or_else(|| format!("/tmp/http_server_{}", port));
+
+        let source = fs::read_to_string(&verbose_file).unwrap_or_else(|e| {
+            eprintln!("error reading {}: {}", verbose_file, e);
+            process::exit(1);
+        });
+        let tokens = lexer::Lexer::new(&source).tokenize().unwrap_or_else(|e| {
+            eprintln!("lex error: {}", e);
+            process::exit(1);
+        });
+        let program = parser::Parser::new(tokens).parse_program().unwrap_or_else(|e| {
+            eprintln!("parse error: {}", e);
+            process::exit(1);
+        });
+        let base = std::path::Path::new(&verbose_file).parent().unwrap_or(std::path::Path::new("."));
+        let errors = verifier::verify_program(&program, base);
+        if !errors.is_empty() {
+            for e in &errors { eprintln!("verify error {}", e); }
+            process::exit(1);
+        }
+        match native::compile_http_server(&program, &rule_name, port, &output) {
+            Ok(()) => {}
+            Err(e) => { eprintln!("{}", e); process::exit(1); }
+        }
+        return;
+    }
+
     // Standalone echo server — no .verbose file needed
     if let Some(port_str) = find_flag(&args, "--echo-server") {
         let port: u16 = port_str.parse().unwrap_or_else(|_| {

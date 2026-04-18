@@ -6382,6 +6382,357 @@ pub fn compile_echo_server(port: u16, output_path: &str) -> Result<(), NativeErr
     Ok(())
 }
 
+/// Compile a rule into an HTTP server binary. Listens on the given port,
+/// parses GET request paths into rule arguments (split on '/'), evaluates
+/// the rule, and returns the result as an HTTP response.
+///
+/// Example: for a rule with 2 number fields,
+///   curl http://localhost:8080/500/25
+///   → HTTP/1.0 200 OK\r\n\r\ntrue\n
+///
+/// Security: max 4K request, GET-only, bounds-checked path parsing.
+pub fn compile_http_server(
+    program: &Program,
+    rule_name: &str,
+    port: u16,
+    output_path: &str,
+) -> Result<(), NativeError> {
+    // Compile the rule code (argv mode, no stdin/stream).
+    // The rule must use the standard push rbp/mov rbp, rsp prologue —
+    // vectorized and parallel programs have different stack layouts.
+    let concepts: Vec<&Concept> = program.items.iter().filter_map(|i| match i { Item::Concept(c) => Some(c), _ => None }).collect();
+    let rules: HashMap<&str, &Rule> = program.items.iter().filter_map(|i| match i { Item::Rule(r) => Some((r.name.as_str(), r)), _ => None }).collect();
+    if let Some(r) = rules.get(rule_name) {
+        let is_vec = r.hints.as_ref().map_or(false, |h| h.vectorizable.is_some());
+        let is_par = r.hints.as_ref().map_or(false, |h| h.parallel.is_some());
+        if let Type::Named(n) = &r.input_ty {
+            if let Some(c) = concepts.iter().find(|c| c.name == *n) {
+                if is_vec && c.fields.len() == 1 {
+                    return Err(NativeError { message: "HTTP server mode not supported with SIMD-vectorized rules".into() });
+                }
+            }
+        }
+        if is_par {
+            return Err(NativeError { message: "HTTP server mode not supported with parallel rules".into() });
+        }
+    }
+    let mut rule_code = compile_native_code(program, rule_name, false, false)?;
+
+    // Strip the sys_exit from the rule code — we'll return to the accept loop.
+    let mov_rax_60: [u8; 7] = [0x48, 0xC7, 0xC0, 0x3C, 0x00, 0x00, 0x00];
+    if let Some(pos) = rule_code.windows(7).rposition(|w| w == mov_rax_60) {
+        rule_code.truncate(pos);
+    }
+    // Add stack cleanup (same as streaming): mov rsp, rbp; pop rbp
+    rule_code.extend_from_slice(&[0x48, 0x89, 0xEC, 0x5D]);
+
+    let port_be = port.to_be_bytes();
+    let mut code = Vec::new();
+
+    // ═══ NETWORK SETUP (same as echo server) ══════════════════
+    // socket(AF_INET, SOCK_STREAM, 0) → r12
+    code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x29, 0x00, 0x00, 0x00]);
+    code.extend_from_slice(&[0x48, 0xC7, 0xC7, 0x02, 0x00, 0x00, 0x00]);
+    code.extend_from_slice(&[0x48, 0xC7, 0xC6, 0x01, 0x00, 0x00, 0x00]);
+    code.extend_from_slice(&[0x48, 0x31, 0xD2]);
+    code.extend_from_slice(&[0x0F, 0x05]);
+    code.extend_from_slice(&[0x49, 0x89, 0xC4]); // mov r12, rax
+
+    // setsockopt SO_REUSEADDR
+    code.extend_from_slice(&[0x6A, 0x01]); // push 1
+    code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x36, 0x00, 0x00, 0x00]);
+    code.extend_from_slice(&[0x4C, 0x89, 0xE7]);
+    code.extend_from_slice(&[0x48, 0xC7, 0xC6, 0x01, 0x00, 0x00, 0x00]);
+    code.extend_from_slice(&[0x48, 0xC7, 0xC2, 0x02, 0x00, 0x00, 0x00]);
+    code.extend_from_slice(&[0x49, 0x89, 0xE2]);
+    code.extend_from_slice(&[0x49, 0xC7, 0xC0, 0x04, 0x00, 0x00, 0x00]);
+    code.extend_from_slice(&[0x0F, 0x05]);
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x08]); // pop optval
+
+    // bind(r12, sockaddr_in, 16)
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x10]); // sub rsp, 16
+    code.extend_from_slice(&[0x66, 0xC7, 0x04, 0x24, 0x02, 0x00]); // AF_INET
+    code.extend_from_slice(&[0x66, 0xC7, 0x44, 0x24, 0x02]);
+    code.extend_from_slice(&port_be);
+    code.extend_from_slice(&[0x48, 0xC7, 0x44, 0x24, 0x04, 0x00, 0x00, 0x00, 0x00]);
+    code.extend_from_slice(&[0x48, 0xC7, 0x44, 0x24, 0x08, 0x00, 0x00, 0x00, 0x00]);
+    code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x31, 0x00, 0x00, 0x00]); // sys_bind
+    code.extend_from_slice(&[0x4C, 0x89, 0xE7]);
+    code.extend_from_slice(&[0x48, 0x89, 0xE6]);
+    code.extend_from_slice(&[0x48, 0xC7, 0xC2, 0x10, 0x00, 0x00, 0x00]);
+    code.extend_from_slice(&[0x0F, 0x05]);
+
+    // listen(r12, 128)
+    code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x32, 0x00, 0x00, 0x00]);
+    code.extend_from_slice(&[0x4C, 0x89, 0xE7]);
+    code.extend_from_slice(&[0x48, 0xC7, 0xC6, 0x80, 0x00, 0x00, 0x00]);
+    code.extend_from_slice(&[0x0F, 0x05]);
+
+    // Allocate 4K buffer + 4K for tokenized argv array
+    code.extend_from_slice(&[0x48, 0x81, 0xEC, 0x00, 0x20, 0x00, 0x00]); // sub rsp, 8192
+
+    // ═══ ACCEPT LOOP ══════════════════════════════════════════
+    let accept_top = code.len();
+    code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x2B, 0x00, 0x00, 0x00]); // sys_accept
+    code.extend_from_slice(&[0x4C, 0x89, 0xE7]);
+    code.extend_from_slice(&[0x48, 0x31, 0xF6]);
+    code.extend_from_slice(&[0x48, 0x31, 0xD2]);
+    code.extend_from_slice(&[0x0F, 0x05]);
+    code.extend_from_slice(&[0x49, 0x89, 0xC5]); // r13 = client_fd
+
+    // Read HTTP request into buffer at rsp (max 4K)
+    code.extend_from_slice(&[0x48, 0x31, 0xC0]); // sys_read
+    code.extend_from_slice(&[0x4C, 0x89, 0xEF]); // rdi = client_fd
+    code.extend_from_slice(&[0x48, 0x89, 0xE6]); // rsi = rsp (buffer)
+    code.extend_from_slice(&[0x48, 0xC7, 0xC2, 0x00, 0x10, 0x00, 0x00]); // rdx = 4096
+    code.extend_from_slice(&[0x0F, 0x05]);
+    // rax = bytes read. NUL-terminate.
+    code.extend_from_slice(&[0x48, 0x85, 0xC0]); // test rax, rax
+    code.extend_from_slice(&[0x0F, 0x8E]); // jle close_client (bad request)
+    let bad_req_patch = code.len();
+    code.extend_from_slice(&[0x00; 4]);
+    code.extend_from_slice(&[0xC6, 0x04, 0x04, 0x00]); // mov byte [rsp+rax], 0
+
+    // ═══ HTTP PARSE: find path in "GET /path HTTP/..." ════════
+    // Check first 4 bytes are "GET " (security: reject non-GET)
+    // cmp dword [rsp], "GET " = 0x20544547
+    code.extend_from_slice(&[0x81, 0x3C, 0x24, 0x47, 0x45, 0x54, 0x20]); // cmp dword [rsp], "GET "
+    code.extend_from_slice(&[0x0F, 0x85]); // jne close_client (not GET)
+    let not_get_patch = code.len();
+    code.extend_from_slice(&[0x00; 4]);
+
+    // Path starts at rsp+4 (after "GET "). Find the space before "HTTP/".
+    // rcx = scan pointer, starting at rsp+5 (skip the leading '/')
+    code.extend_from_slice(&[0x48, 0x8D, 0x4C, 0x24, 0x05]); // lea rcx, [rsp+5]
+
+    // Find end of path: scan for ' ' (0x20)
+    let scan_path = code.len();
+    code.extend_from_slice(&[0x80, 0x39, 0x20]); // cmp byte [rcx], 0x20
+    code.push(0x74); // je found_path_end
+    let path_end_patch = code.len();
+    code.push(0x00);
+    code.extend_from_slice(&[0x80, 0x39, 0x00]); // cmp byte [rcx], 0 (safety: NUL)
+    code.push(0x74); // je found_path_end
+    let path_nul_patch = code.len();
+    code.push(0x00);
+    code.extend_from_slice(&[0x48, 0xFF, 0xC1]); // inc rcx
+    code.push(0xEB); // jmp scan_path
+    code.push((scan_path as isize - code.len() as isize - 1) as u8);
+
+    // found_path_end: NUL-terminate path
+    let found_path_end = code.len();
+    code[path_end_patch] = (found_path_end - path_end_patch - 1) as u8;
+    code[path_nul_patch] = (found_path_end - path_nul_patch - 1) as u8;
+    code.extend_from_slice(&[0xC6, 0x01, 0x00]); // mov byte [rcx], 0
+
+    // ═══ TOKENIZE PATH: split on '/' ══════════════════════════
+    // rcx still points at path_end (where we just wrote NUL).
+    // Save it in rdx, then reset rcx to path start for the tokenizer.
+    code.extend_from_slice(&[0x48, 0x89, 0xCA]); // mov rdx, rcx (path end)
+    code.extend_from_slice(&[0x48, 0x8D, 0x4C, 0x24, 0x05]); // lea rcx, [rsp+5] (path start)
+    code.extend_from_slice(&[0x4C, 0x8D, 0x84, 0x24, 0x00, 0x10, 0x00, 0x00]); // lea r8, [rsp+4096]
+    code.extend_from_slice(&[0x45, 0x31, 0xC9]); // xor r9d, r9d
+
+    // ═══ PATH TOKENIZER (split on '/') ════════════════════════
+    let tok_top = code.len();
+    code.extend_from_slice(&[0x48, 0x39, 0xD1]); // cmp rcx, rdx
+    code.extend_from_slice(&[0x0F, 0x8D]); // jge tok_done
+    let tok_done_patch = code.len();
+    code.extend_from_slice(&[0x00; 4]);
+
+    code.extend_from_slice(&[0x8A, 0x01]); // mov al, [rcx]
+    code.extend_from_slice(&[0x3C, 0x2F]); // cmp al, '/'
+    code.push(0x74); // je tok_skip
+    let tok_skip_patch = code.len();
+    code.push(0x00);
+
+    // Non-slash: start of token
+    // Bounds check
+    code.extend_from_slice(&[0x41, 0x81, 0xF9, 0x00, 0x02, 0x00, 0x00]); // cmp r9d, 512
+    code.extend_from_slice(&[0x0F, 0x8D]); // jge tok_done
+    let tok_cap_patch = code.len();
+    code.extend_from_slice(&[0x00; 4]);
+
+    code.extend_from_slice(&[0x4B, 0x89, 0x0C, 0xC8]); // mov [r8+r9*8], rcx
+    code.extend_from_slice(&[0x49, 0xFF, 0xC1]); // inc r9
+
+    // Scan to next '/' or end
+    let tok_scan = code.len();
+    code.extend_from_slice(&[0x48, 0xFF, 0xC1]); // inc rcx
+    code.extend_from_slice(&[0x48, 0x39, 0xD1]); // cmp rcx, rdx
+    code.extend_from_slice(&[0x0F, 0x8D]); // jge tok_done
+    let tok_done_patch2 = code.len();
+    code.extend_from_slice(&[0x00; 4]);
+    code.extend_from_slice(&[0x8A, 0x01]); // mov al, [rcx]
+    code.extend_from_slice(&[0x3C, 0x2F]); // cmp al, '/'
+    code.push(0x74); // je tok_terminate
+    let tok_term_patch = code.len();
+    code.push(0x00);
+    code.push(0xEB); // jmp tok_scan
+    code.push((tok_scan as isize - code.len() as isize - 1) as u8);
+
+    // tok_terminate: NUL at '/' position, advance
+    let tok_term = code.len();
+    code[tok_term_patch] = (tok_term - tok_term_patch - 1) as u8;
+    code.extend_from_slice(&[0xC6, 0x01, 0x00]); // mov byte [rcx], 0
+    code.extend_from_slice(&[0x48, 0xFF, 0xC1]); // inc rcx
+    code.push(0xE9); // jmp tok_top
+    let tok_back = tok_top as i32 - (code.len() as i32 + 4);
+    code.extend_from_slice(&tok_back.to_le_bytes());
+
+    // tok_skip: advance past '/'
+    let tok_skip = code.len();
+    code[tok_skip_patch] = (tok_skip - tok_skip_patch - 1) as u8;
+    code.extend_from_slice(&[0x48, 0xFF, 0xC1]); // inc rcx
+    code.push(0xE9); // jmp tok_top
+    let tok_back2 = tok_top as i32 - (code.len() as i32 + 4);
+    code.extend_from_slice(&tok_back2.to_le_bytes());
+
+    // tok_done:
+    let tok_done = code.len();
+    code[tok_done_patch..tok_done_patch+4].copy_from_slice(&((tok_done as i32) - (tok_done_patch as i32 + 4)).to_le_bytes());
+    code[tok_done_patch2..tok_done_patch2+4].copy_from_slice(&((tok_done as i32) - (tok_done_patch2 as i32 + 4)).to_le_bytes());
+    code[tok_cap_patch..tok_cap_patch+4].copy_from_slice(&((tok_done as i32) - (tok_cap_patch as i32 + 4)).to_le_bytes());
+
+    // ═══ BUILD ARGC/ARGV FROM TOKENS ══════════════════════════
+    // We need to put argc/argv at a known [rsp] position for the rule code.
+    // The rule code reads [rsp] = argc and [rsp+8..] = argv.
+    // BUT rsp currently points to our buffer. We need a different area.
+    //
+    // Strategy: save rsp in rbx, set rsp to rsp+8192 (above our buffer),
+    // write argc/argv there, then the rule code's prologue will read it.
+    // After the rule runs, restore rsp.
+    //
+    // Actually, simpler: the rule code calls mov r12, [rsp]; lea r13, [rsp+8].
+    // I'll write argc at [rsp+8192+16] and argv starting at [rsp+8192+24].
+    // Then briefly set rsp to that area, let the rule run, restore.
+
+    // Use a region above our 8K buffer: rsp + 8192
+    // Save current rsp in rbx
+    code.extend_from_slice(&[0x48, 0x89, 0xE3]); // mov rbx, rsp
+
+    // Write argc/argv at [rbx + 8192]
+    // argc = r9 + 1
+    code.extend_from_slice(&[0x4C, 0x89, 0xC8]); // mov rax, r9
+    code.extend_from_slice(&[0x48, 0xFF, 0xC0]); // inc rax
+    code.extend_from_slice(&[0x48, 0x89, 0x83]); // mov [rbx + 8192], rax
+    code.extend_from_slice(&8192i32.to_le_bytes());
+    // argv[0] = 0 (dummy)
+    code.extend_from_slice(&[0x48, 0xC7, 0x83]); // mov qword [rbx + 8200], 0
+    code.extend_from_slice(&8200i32.to_le_bytes());
+    code.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+
+    // Copy token pointers: [rbx + 8208 + i*8] = [r8 + i*8]
+    code.extend_from_slice(&[0x31, 0xC9]); // xor ecx, ecx
+    let copy_loop = code.len();
+    code.extend_from_slice(&[0x4C, 0x39, 0xC9]); // cmp rcx, r9
+    code.push(0x7D); let copy_done_patch = code.len(); code.push(0);
+    code.extend_from_slice(&[0x49, 0x8B, 0x04, 0xC8]); // mov rax, [r8+rcx*8]
+    // mov [rbx + rcx*8 + 8208], rax
+    code.extend_from_slice(&[0x48, 0x89, 0x84, 0xCB]); // mov [rbx + rcx*8 + disp32], rax
+    code.extend_from_slice(&8208i32.to_le_bytes());
+    code.extend_from_slice(&[0x48, 0xFF, 0xC1]); // inc rcx
+    code.push(0xEB);
+    code.push((copy_loop as isize - code.len() as isize - 1) as u8);
+    let copy_done = code.len();
+    code[copy_done_patch] = (copy_done - copy_done_patch - 1) as u8;
+
+    // Set rsp to the argc/argv area so the rule code can read it
+    code.extend_from_slice(&[0x48, 0x8D, 0xA3]); // lea rsp, [rbx + 8192]
+    code.extend_from_slice(&8192i32.to_le_bytes());
+
+    // ═══ SAVE NETWORK FDs ═══════════════════════════════════════
+    // r12 (server_fd) and r13 (client_fd) will be clobbered by the rule code.
+    // Save them at [rbx+0] and [rbx+8] (in the buffer area, below the argv).
+    code.extend_from_slice(&[0x4C, 0x89, 0x23]);       // mov [rbx], r12
+    code.extend_from_slice(&[0x4C, 0x89, 0x6B, 0x08]); // mov [rbx+8], r13
+
+    // ═══ REDIRECT STDOUT/STDERR TO CLIENT SOCKET ══════════════
+    // dup2(client_fd, 1) → syscall 33
+    code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x21, 0x00, 0x00, 0x00]);
+    code.extend_from_slice(&[0x4C, 0x89, 0xEF]); // rdi = r13 (client_fd)
+    code.extend_from_slice(&[0x48, 0xC7, 0xC6, 0x01, 0x00, 0x00, 0x00]); // rsi = 1
+    code.extend_from_slice(&[0x0F, 0x05]);
+    // dup2(client_fd, 2)
+    code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x21, 0x00, 0x00, 0x00]);
+    code.extend_from_slice(&[0x4C, 0x89, 0xEF]);
+    code.extend_from_slice(&[0x48, 0xC7, 0xC6, 0x02, 0x00, 0x00, 0x00]);
+    code.extend_from_slice(&[0x0F, 0x05]);
+
+    // Write HTTP response header
+    let header = b"HTTP/1.0 200 OK\r\nConnection: close\r\n\r\n";
+    emit_write_static_to_fd(&mut code, header, 1);
+
+    // ═══ RULE CODE ════════════════════════════════════════════
+    code.extend_from_slice(&rule_code);
+
+    // ═══ RESTORE + CLOSE ═══════════════════════════════════════
+    // Close fd 1 (dup2'd to client socket — this sends FIN to client)
+    code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x03, 0x00, 0x00, 0x00]); // sys_close
+    code.extend_from_slice(&[0x48, 0xC7, 0xC7, 0x01, 0x00, 0x00, 0x00]); // rdi = 1
+    code.extend_from_slice(&[0x0F, 0x05]);
+    // Close fd 2
+    code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x03, 0x00, 0x00, 0x00]);
+    code.extend_from_slice(&[0x48, 0xC7, 0xC7, 0x02, 0x00, 0x00, 0x00]);
+    code.extend_from_slice(&[0x0F, 0x05]);
+
+    // Restore rsp from rbx
+    code.extend_from_slice(&[0x48, 0x89, 0xDC]); // mov rsp, rbx
+    // Restore r12 (server_fd) and r13 (client_fd)
+    code.extend_from_slice(&[0x4C, 0x8B, 0x23]);       // mov r12, [rbx]
+    code.extend_from_slice(&[0x4C, 0x8B, 0x6B, 0x08]); // mov r13, [rbx+8]
+
+    // close(client_fd)
+    let close_client = code.len();
+    code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x03, 0x00, 0x00, 0x00]);
+    code.extend_from_slice(&[0x4C, 0x89, 0xEF]); // rdi = r13
+    code.extend_from_slice(&[0x0F, 0x05]);
+
+    // Restore stdout (dup2(1, 1) won't work... we need to save original stdout)
+    // Actually, stdout was fd 1 pointing to terminal. After dup2(client_fd, 1),
+    // fd 1 now points to the socket. After close(client_fd), the socket is closed
+    // on the client's original fd but fd 1 still points to it (dangling).
+    //
+    // For a server that never writes to its own stdout, this is fine —
+    // each new connection dup2's a fresh client_fd onto fd 1.
+    // The only issue is if we want to log to the original stdout.
+    // For v1, we don't. Accept the trade-off.
+
+    // jmp accept_top
+    code.push(0xE9);
+    let accept_back = accept_top as i32 - (code.len() as i32 + 4);
+    code.extend_from_slice(&accept_back.to_le_bytes());
+
+    // Patch bad_req and not_get to close_client
+    let br_rel = close_client as i32 - (bad_req_patch as i32 + 4);
+    code[bad_req_patch..bad_req_patch+4].copy_from_slice(&br_rel.to_le_bytes());
+    let ng_rel = close_client as i32 - (not_get_patch as i32 + 4);
+    code[not_get_patch..not_get_patch+4].copy_from_slice(&ng_rel.to_le_bytes());
+
+    // Validate + write ELF
+    if let Err(e) = crate::validate_x86::validate_code(&code) {
+        eprintln!("warning: x86-64 validation: {} (decoder incomplete, may be false positive)", e);
+    }
+
+    let elf = build_elf(&code);
+    let mut file = std::fs::File::create(output_path).map_err(|e| NativeError {
+        message: format!("cannot create '{}': {}", output_path, e),
+    })?;
+    file.write_all(&elf).map_err(|e| NativeError {
+        message: format!("cannot write '{}': {}", output_path, e),
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(output_path, std::fs::Permissions::from_mode(0o755))
+            .map_err(|e| NativeError { message: format!("cannot set permissions: {}", e) })?;
+    }
+
+    let size = std::fs::metadata(output_path).map(|m| m.len()).unwrap_or(0);
+    println!("http-server: {} ({} bytes, rule '{}', port {})", output_path, size, rule_name, port);
+    Ok(())
+}
+
 fn build_elf(code: &[u8]) -> Vec<u8> {
     let entry_addr: u64 = 0x400000 + 120;
     let file_size = 120 + code.len();
