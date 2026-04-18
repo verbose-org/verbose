@@ -716,24 +716,36 @@ fn validate_read_path(
         return None;
     }
     let base = &path[0];
-    if base != &rule.input_name {
+    // Accept both input name and context name (if present).
+    let is_input = base == &rule.input_name;
+    let is_context = rule.context_name.as_ref().map_or(false, |cn| base == cn);
+    if !is_input && !is_context {
+        let scope = if let Some(cn) = &rule.context_name {
+            format!("'{}' and '{}'", rule.input_name, cn)
+        } else {
+            format!("'{}'", rule.input_name)
+        };
         return Some(format!(
-            "unknown binding '{}' in path '{}'; only '{}' is in scope",
+            "unknown binding '{}' in path '{}'; only {} in scope",
             base,
             path.join("."),
-            rule.input_name
+            scope
         ));
     }
     if path.len() >= 2 {
+        // For context fields, we don't have the concept here to validate field names,
+        // so skip field validation (the native backend will catch unknown fields).
         if let Some(c) = input_concept {
-            let field_name = &path[1];
-            if !c.fields.iter().any(|f| &f.name == field_name) {
-                return Some(format!(
-                    "concept '{}' has no field '{}' (accessed via '{}')",
-                    c.name,
-                    field_name,
-                    path.join(".")
-                ));
+            if is_input {
+                let field_name = &path[1];
+                if !c.fields.iter().any(|f| &f.name == field_name) {
+                    return Some(format!(
+                        "concept '{}' has no field '{}' (accessed via '{}')",
+                        c.name,
+                        field_name,
+                        path.join(".")
+                    ));
+                }
             }
         }
     }

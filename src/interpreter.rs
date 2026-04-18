@@ -530,6 +530,8 @@ mod tests {
             },
             hints: None,
             layer: None,
+            context_name: None,
+            context_ty: None,
         }
     }
 
@@ -638,6 +640,8 @@ mod tests {
             },
             hints: None,
             layer: None,
+            context_name: None,
+            context_ty: None,
         };
         let mut input = HashMap::new();
         input.insert("x".into(), Value::Number(42));
@@ -676,6 +680,8 @@ mod tests {
             },
             hints: None,
             layer: None,
+            context_name: None,
+            context_ty: None,
         };
         let mut input = HashMap::new();
         input.insert("x".into(), Value::Number(10));
@@ -718,6 +724,8 @@ mod tests {
             },
             hints: None,
             layer: None,
+            context_name: None,
+            context_ty: None,
         };
         let mut input = HashMap::new();
         input.insert("x".into(), Value::Number(15));
@@ -759,6 +767,8 @@ mod tests {
             },
             hints: None,
             layer: None,
+            context_name: None,
+            context_ty: None,
         };
         let mut input = HashMap::new();
         input.insert("s".into(), Value::Text("active".into()));
@@ -797,6 +807,8 @@ mod tests {
             },
             hints: None,
             layer: None,
+            context_name: None,
+            context_ty: None,
         };
         let mut input = HashMap::new();
         input.insert("x".into(), Value::Number(42));
@@ -839,6 +851,8 @@ mod tests {
             },
             hints: None,
             layer: None,
+            context_name: None,
+            context_ty: None,
         };
         let mut input = HashMap::new();
         input.insert("x".into(), Value::Number(15));
@@ -878,6 +892,8 @@ mod tests {
             },
             hints: None,
             layer: None,
+            context_name: None,
+            context_ty: None,
         };
         let mut input = HashMap::new();
         input.insert("x".into(), Value::Number(42));
@@ -918,6 +934,8 @@ mod tests {
             },
             hints: None,
             layer: None,
+            context_name: None,
+            context_ty: None,
         };
         let mut input = HashMap::new();
         input.insert(
@@ -965,6 +983,8 @@ mod tests {
             },
             hints: None,
             layer: None,
+            context_name: None,
+            context_ty: None,
         };
         let mut input = HashMap::new();
         input.insert(
@@ -1020,6 +1040,8 @@ mod tests {
             },
             hints: None,
             layer: None,
+            context_name: None,
+            context_ty: None,
         };
         let mut input = HashMap::new();
         input.insert("age".into(), Value::Number(25));
@@ -1091,6 +1113,8 @@ mod tests {
             },
             hints: None,
             layer: None,
+            context_name: None,
+            context_ty: None,
         };
 
         // Ok path: i.x = 5 → Ok(5*2) → match binds v=10 → Ok(v+1) = Ok(11)
@@ -1140,6 +1164,8 @@ mod tests {
             },
             hints: None,
             layer: None,
+            context_name: None,
+            context_ty: None,
         };
 
         let mut input = HashMap::new();

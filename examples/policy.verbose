@@ -1,0 +1,51 @@
+@verbose 0.1.0
+
+-- Policy checker: first multi-input rule. The policy (context) is read ONCE,
+-- requests (input) are validated per-record against the policy thresholds.
+-- Usage: ./policy_check max_amount min_age req1_amount req1_age req2_amount req2_age ...
+
+concept Policy
+  @intention: "A policy defines limits for request validation"
+  @source: policy.intent:1
+
+  fields:
+    max_amount : number [0, 10000000]
+    min_age    : number [0, 150]
+
+
+concept Request
+  @intention: "A request has an amount and a customer age"
+  @source: policy.intent:2
+
+  fields:
+    amount       : number [0, 10000000]
+    customer_age : number [0, 150]
+
+
+rule is_allowed
+  @intention: "A request is allowed when within policy limits"
+  @source: policy.intent:3
+
+  context:
+    p : Policy
+
+  input:
+    r : Request
+
+  output:
+    allowed : bool
+
+  logic:
+    allowed = r.amount <= p.max_amount and r.customer_age >= p.min_age
+
+  proofs:
+    purity:
+      reads   : [r.amount, r.customer_age, p.max_amount, p.min_age]
+      writes  : []
+      calls   : []
+      verdict : pure
+    termination:
+      form  : constant_bound
+      bound : 5
+    determinism:
+      form : total

@@ -99,6 +99,11 @@ pub struct Rule {
     /// but a layered rule may NOT call an unlayered one — layered code is a
     /// sealed subgraph.
     pub layer: Option<Layer>,
+    /// Optional context input: a second concept whose fields are read ONCE
+    /// (not per-record). Used for config/policy/threshold data that is
+    /// constant across all records. None for single-input rules.
+    pub context_name: Option<String>,
+    pub context_ty: Option<Type>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

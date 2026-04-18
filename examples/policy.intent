@@ -1,0 +1,5 @@
+Request Policy Checker — validates requests against a policy config
+
+1. A policy has a maximum amount and a minimum age.
+2. A request has an amount and a customer age.
+3. A request is allowed when its amount does not exceed the policy's max amount and the customer's age meets the policy's minimum age.

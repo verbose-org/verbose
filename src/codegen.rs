@@ -364,6 +364,8 @@ mod tests {
                     },
                     hints: None,
                     layer: None,
+                    context_name: None,
+                    context_ty: None,
                 }),
             ],
                 uses: vec![],

@@ -220,6 +220,7 @@ impl Parser {
         let mut intention = None;
         let mut source = None;
         let mut input: Option<(String, Type)> = None;
+        let mut context: Option<(String, Type)> = None;
         let mut output: Option<(String, Type)> = None;
         let mut logic = None;
         let mut proofs = None;
@@ -269,6 +270,8 @@ impl Parser {
                         )));
                     }
                 }
+            } else if self.check_ident("context") {
+                context = Some(self.parse_binding_block("context")?);
             } else if self.check_ident("input") {
                 input = Some(self.parse_binding_block("input")?);
             } else if self.check_ident("output") {
@@ -300,6 +303,11 @@ impl Parser {
         let proofs =
             proofs.ok_or_else(|| self.error(&format!("rule '{}' missing 'proofs' block", name)))?;
 
+        let (context_name, context_ty) = match context {
+            Some((n, t)) => (Some(n), Some(t)),
+            None => (None, None),
+        };
+
         Ok(Rule {
             name,
             intention,
@@ -312,6 +320,8 @@ impl Parser {
             proofs,
             hints,
             layer,
+            context_name,
+            context_ty,
         })
     }
 

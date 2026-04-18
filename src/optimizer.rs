@@ -161,6 +161,8 @@ fn optimize_rule(rule: &Rule, field_ranges: &HashMap<String, (i64, i64)>) -> Rul
         proofs: rule.proofs.clone(),
         hints: rule.hints.clone(),
         layer: rule.layer,
+        context_name: rule.context_name.clone(),
+        context_ty: rule.context_ty.clone(),
     }
 }
 

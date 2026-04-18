@@ -139,6 +139,16 @@ fn compile_native_code(
         (*r, *c)
     };
 
+    // Look up the context concept (if multi-input rule).
+    let context_concept: Option<&Concept> = match &rule.context_ty {
+        Some(Type::Named(n)) => Some(
+            concepts.iter().find(|c| c.name == *n).copied()
+                .ok_or_else(|| NativeError { message: format!("unknown context concept '{}'", n) })?
+        ),
+        Some(_) => return Err(NativeError { message: "context type must be a named concept".into() }),
+        None => None,
+    };
+
     let is_vectorizable = rule.hints.as_ref().map_or(false, |h| h.vectorizable.is_some());
     let is_parallel = rule.hints.as_ref().map_or(false, |h| h.parallel.is_some());
     let is_result_output = matches!(&rule.output_ty, Type::Result(_, _));
@@ -201,11 +211,11 @@ fn compile_native_code(
         // Phase 6: scalar output with embedded quantifiers (e.g. if all(...) then X else Y).
         emit_multi_fold_program(rule, concept, &concepts, &rules)?
     } else if is_vectorizable && concept.fields.len() == 1 {
-        if let Some(threshold) = extract_simple_gt(rule) { emit_vectorized_program(threshold)? } else { emit_full_program(rule, concept, &rules)? }
+        if let Some(threshold) = extract_simple_gt(rule) { emit_vectorized_program(threshold)? } else { emit_full_program(rule, concept, context_concept, &rules)? }
     } else if is_parallel {
         emit_parallel_program(rule, concept, &rules)?
     } else {
-        emit_full_program(rule, concept, &rules)?
+        emit_full_program(rule, concept, context_concept, &rules)?
     };
 
     if stream {
@@ -396,8 +406,10 @@ fn emit_record_loop_prologue<'a>(
     code: &mut Vec<u8>,
     rule: &'a Rule,
     input_concept: &'a Concept,
+    context_concept: Option<&'a Concept>,
     all_rules: &HashMap<&str, &Rule>,
 ) -> Result<RecordLoopCtx<'a>, NativeError> {
+    let n_ctx = context_concept.map_or(0, |c| c.fields.len());
     let nfields = input_concept.fields.len();
     let n_bindings = rule.logic.bindings.len();
     // Bottom-of-frame reserved slots, in order:
@@ -407,9 +419,9 @@ fn emit_record_loop_prologue<'a>(
     //   base + 4: err_frame_save_slot (Phase 2F rsp saved before callee Err concat)
     //   base + 5: exit_flag_slot      (exit code: 0=success, 1=failure)
     let n_reserved = 5;
-    let frame_slots = nfields + n_bindings + n_reserved;
+    let frame_slots = n_ctx + nfields + n_bindings + n_reserved;
     let frame_size = (frame_slots * 8) as i32;
-    let base = (nfields + n_bindings) as i32;
+    let base = (n_ctx + nfields + n_bindings) as i32;
     let match_slot: i32 = -((base + 1) * 8);
     let err_ptr_slot: i32 = -((base + 2) * 8);
     let err_len_slot: i32 = -((base + 3) * 8);
@@ -418,8 +430,8 @@ fn emit_record_loop_prologue<'a>(
 
     // mov r12, [rsp]            — argc
     code.extend_from_slice(&[0x4C, 0x8B, 0x24, 0x24]);
-    // Guard: need at least nfields + 1 args (argv[0] + one record).
-    emit_argc_guard(code, (nfields as i32) + 1);
+    // Guard: need at least n_ctx + nfields + 1 args (argv[0] + context + one record).
+    emit_argc_guard(code, (n_ctx as i32) + (nfields as i32) + 1);
     // lea r13, [rsp+8]          — argv base
     code.extend_from_slice(&[0x4C, 0x8D, 0x6C, 0x24, 0x08]);
     // push rbp ; mov rbp, rsp
@@ -435,6 +447,32 @@ fn emit_record_loop_prologue<'a>(
     code.extend_from_slice(&exit_flag_slot.to_le_bytes());
     code.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
 
+    // ─── Read context fields (if any) ONCE before the record loop ──
+    // Context fields go to rbp slots at the top of the frame (before input slots).
+    let mut ctx_offsets: HashMap<&str, i32> = HashMap::new();
+    if let Some(ctx) = context_concept {
+        for (i, f) in ctx.fields.iter().enumerate() {
+            let offset = -((i as i32 + 1) * 8);
+            // mov rdi, [r13 + r14*8]
+            code.extend_from_slice(&[0x4B, 0x8B, 0x7C, 0xF5, 0x00]);
+            match f.ty {
+                Type::Number => {
+                    emit_atoi_inline(code);
+                    store_rax_at_rbp(code, offset);
+                }
+                Type::Text => store_rdi_at_rbp(code, offset),
+                _ => {
+                    return Err(NativeError {
+                        message: format!("context field '{}' has unsupported type", f.name),
+                    });
+                }
+            }
+            // inc r14
+            code.extend_from_slice(&[0x49, 0xFF, 0xC6]);
+            ctx_offsets.insert(f.name.as_str(), offset);
+        }
+    }
+
     let loop_top = code.len();
 
     // cmp r14, r12 ; jge exit (rel32 placeholder)
@@ -444,7 +482,10 @@ fn emit_record_loop_prologue<'a>(
     let exit_patch = code.len();
     code.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
 
-    let offsets = field_offsets(input_concept);
+    // Input field offsets are shifted down by n_ctx to avoid colliding with context slots.
+    let offsets: HashMap<&str, i32> = input_concept.fields.iter().enumerate()
+        .map(|(i, f)| (f.name.as_str(), -(((n_ctx + i) as i32 + 1) * 8)))
+        .collect();
 
     // Per-field dispatch: Number via atoi, Text stores the argv pointer.
     for field in &input_concept.fields {
@@ -489,8 +530,12 @@ fn emit_record_loop_prologue<'a>(
 
     // Evaluate let bindings into successive rbp slots.
     let mut binding_offsets = offsets;
+    // Merge context fields so logic can access cfg.field_name
+    for (k, v) in &ctx_offsets {
+        binding_offsets.insert(k, *v);
+    }
     let field_ranges = build_field_ranges(input_concept);
-    let mut next_slot = -((nfields as i32 + 1) * 8);
+    let mut next_slot = -(((n_ctx + nfields) as i32 + 1) * 8);
     for (name, expr) in &rule.logic.bindings {
         emit_eval_expr(code, expr, &rule.input_name, &binding_offsets, all_rules, &field_ranges)?;
         if next_slot >= -128 {
@@ -542,11 +587,12 @@ fn emit_record_loop_epilogue(code: &mut Vec<u8>, ctx: &RecordLoopCtx<'_>) {
 fn emit_full_program(
     rule: &Rule,
     concept: &Concept,
+    context_concept: Option<&Concept>,
     all_rules: &HashMap<&str, &Rule>,
 ) -> Result<Vec<u8>, NativeError> {
     let is_bool = rule.output_ty == Type::Bool;
     let mut code = Vec::new();
-    let ctx = emit_record_loop_prologue(&mut code, rule, concept, all_rules)?;
+    let ctx = emit_record_loop_prologue(&mut code, rule, concept, context_concept, all_rules)?;
 
     // Evaluate final expression — result in rax
     emit_eval_expr(
@@ -608,7 +654,7 @@ fn emit_text_program(
     all_rules: &HashMap<&str, &Rule>,
 ) -> Result<Vec<u8>, NativeError> {
     let mut code = Vec::new();
-    let ctx = emit_record_loop_prologue(&mut code, rule, concept, all_rules)?;
+    let ctx = emit_record_loop_prologue(&mut code, rule, concept, None, all_rules)?;
 
     emit_text_write_to_fd(
         &mut code,
@@ -2126,7 +2172,7 @@ fn emit_result_program(
     }
 
     let mut code = Vec::new();
-    let ctx = emit_record_loop_prologue(&mut code, rule, concept, all_rules)?;
+    let ctx = emit_record_loop_prologue(&mut code, rule, concept, None, all_rules)?;
 
     // Evaluate the logic in Result context. Every Ok/Err leaf self-terminates
     // with a jmp loop_top, so there is no fall-through to handle here.
@@ -2670,7 +2716,7 @@ fn emit_record_program(
     }
 
     let mut code = Vec::new();
-    let ctx = emit_record_loop_prologue(&mut code, rule, input_concept, all_rules)?;
+    let ctx = emit_record_loop_prologue(&mut code, rule, input_concept, None, all_rules)?;
 
     emit_eval_record_expr(
         &mut code,
@@ -4455,7 +4501,7 @@ fn emit_reaction_program(
     // Both Print and AppendFile effects are handled below.
 
     let mut code = Vec::new();
-    let ctx = emit_record_loop_prologue(&mut code, trigger_rule, concept, all_rules)?;
+    let ctx = emit_record_loop_prologue(&mut code, trigger_rule, concept, None, all_rules)?;
 
     // Evaluate trigger rule's logic → rax (0 = no fire, nonzero = fire).
     emit_eval_expr(
@@ -4719,10 +4765,16 @@ fn emit_eval_expr(
             })
         }
         Expr::Field(base, field_name) => {
-            if !matches!(base.as_ref(), Expr::Ident(n) if n == input_name) {
-                return Err(NativeError {
-                    message: "nested field access not supported in native backend".into(),
-                });
+            // Accept field access on the input name or any other known binding
+            // (e.g. context name for multi-input rules). The offsets map is the
+            // source of truth — if the field is in the map, it's valid.
+            match base.as_ref() {
+                Expr::Ident(_) => {}
+                _ => {
+                    return Err(NativeError {
+                        message: "nested field access not supported in native backend".into(),
+                    });
+                }
             }
             let offset = *offsets.get(field_name.as_str()).ok_or_else(|| NativeError {
                 message: format!("unknown field '{}' in native codegen", field_name),
