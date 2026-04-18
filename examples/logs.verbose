@@ -1,0 +1,151 @@
+@verbose 0.1.0
+
+-- Log analyzer: filter by severity, count errors, sum durations, health scoring.
+-- Uses count, sum, fold, all, any, if/else — mirrors report.verbose on a new domain.
+
+concept Event
+  @intention: "An event has a severity level and a duration in milliseconds"
+  @source: logs.intent:1
+
+  fields:
+    severity : number [0, 4]
+    duration : number [0, 3600000]
+
+
+concept Application
+  @intention: "An application has a name and a list of events"
+  @source: logs.intent:2
+
+  fields:
+    name   : text [..64]
+    events : collection(Event)
+
+
+rule is_critical
+  @intention: "An event is critical when its severity is 3 or higher"
+  @source: logs.intent:3
+
+  input:
+    e : Event
+
+  output:
+    critical : bool
+
+  logic:
+    critical = e.severity >= 3
+
+  proofs:
+    purity:
+      reads   : [e.severity]
+      writes  : []
+      calls   : []
+      verdict : pure
+    termination:
+      form  : constant_bound
+      bound : 1
+    determinism:
+      form : total
+
+
+rule error_count
+  @intention: "The error count is the number of critical events"
+  @source: logs.intent:4
+
+  input:
+    app : Application
+
+  output:
+    errors : number
+
+  logic:
+    errors = count(app.events, e => e.severity >= 3)
+
+  proofs:
+    purity:
+      reads   : [app.events]
+      writes  : []
+      calls   : []
+      verdict : pure
+    termination:
+      form  : constant_bound
+      bound : 4
+    determinism:
+      form : total
+
+
+rule total_duration
+  @intention: "The total duration is the sum of all event durations"
+  @source: logs.intent:5
+
+  input:
+    app : Application
+
+  output:
+    total : number
+
+  logic:
+    total = sum(app.events, e => e.duration)
+
+  proofs:
+    purity:
+      reads   : [app.events]
+      writes  : []
+      calls   : []
+      verdict : pure
+    termination:
+      form  : constant_bound
+      bound : 2
+    determinism:
+      form : total
+
+
+rule error_duration
+  @intention: "The error duration is the sum of durations of critical events only"
+  @source: logs.intent:6
+
+  input:
+    app : Application
+
+  output:
+    total : number
+
+  logic:
+    total = fold(app.events, 0, acc, e => if e.severity >= 3 then acc + e.duration else acc)
+
+  proofs:
+    purity:
+      reads   : [app.events]
+      writes  : []
+      calls   : []
+      verdict : pure
+    termination:
+      form  : constant_bound
+      bound : 4
+    determinism:
+      form : total
+
+
+rule health_score
+  @intention: "The health score is: 0 if all events are critical, 1 if any are, 2 otherwise"
+  @source: logs.intent:7
+
+  input:
+    app : Application
+
+  output:
+    score : number
+
+  logic:
+    score = if all(app.events, e => e.severity >= 3) then 0 else if any(app.events, e => e.severity >= 3) then 1 else 2
+
+  proofs:
+    purity:
+      reads   : [app.events]
+      writes  : []
+      calls   : []
+      verdict : pure
+    termination:
+      form  : constant_bound
+      bound : 6
+    determinism:
+      form : total

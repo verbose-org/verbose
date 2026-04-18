@@ -1,0 +1,9 @@
+Log Analyzer — event stream analysis for an application
+
+1. An event has a severity level (0=debug, 1=info, 2=warn, 3=error, 4=fatal) and a duration in milliseconds.
+2. An application has a name and a list of events.
+3. An event is critical when its severity is 3 or higher.
+4. The error count is the number of critical events.
+5. The total duration is the sum of all event durations.
+6. The error duration is the sum of durations of critical events only.
+7. The health score is: 0 if all events are critical, 1 if any event is critical, 2 otherwise.

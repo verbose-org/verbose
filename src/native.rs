@@ -37,12 +37,18 @@ pub fn compile_native_multi(
     program: &Program,
     rule_names: &[&str],
     output_path: &str,
+    stdin: bool,
+    stream: bool,
 ) -> Result<(), NativeError> {
     if rule_names.is_empty() {
         return Err(NativeError { message: "no rules specified for multi-rule binary".into() });
     }
     if rule_names.len() == 1 {
-        return compile_native(program, rule_names[0], output_path);
+        return compile_native(program, rule_names[0], output_path, stdin, stream);
+    }
+
+    if stream {
+        return Err(NativeError { message: "--stream is not supported with multi-rule binaries".into() });
     }
 
     let mut combined = Vec::new();
@@ -58,7 +64,7 @@ pub fn compile_native_multi(
 
     for (i, rule_name) in rule_names.iter().enumerate() {
         let is_last = i == rule_names.len() - 1;
-        let mut code = compile_native_code(program, rule_name)?;
+        let mut code = compile_native_code(program, rule_name, false, false)?;
 
         // Verify the block ends with the expected exit sequence.
         if code.len() < 12 || code[code.len() - 12..] != exit_sequence {
@@ -77,6 +83,14 @@ pub fn compile_native_multi(
         }
 
         combined.extend_from_slice(&code);
+    }
+
+    // Stdin mode: prepend the shared stdin reader prologue once.
+    if stdin {
+        let mut full = Vec::new();
+        emit_stdin_prologue(&mut full);
+        full.extend_from_slice(&combined);
+        combined = full;
     }
 
     // Self-verify + peephole on the combined code.
@@ -107,6 +121,8 @@ pub fn compile_native_multi(
 fn compile_native_code(
     program: &Program,
     rule_name: &str,
+    stdin: bool,
+    stream: bool,
 ) -> Result<Vec<u8>, NativeError> {
     // (Extracted from compile_native — same dispatch logic.)
     let concepts: Vec<&Concept> = program.items.iter().filter_map(|i| match i { Item::Concept(c) => Some(c), _ => None }).collect();
@@ -159,7 +175,7 @@ fn compile_native_code(
     let is_fold_text_output = matches!(&rule.output_ty, Type::Text) && matches!(&rule.logic.value, Expr::Fold(_, _, _, _, _));
     let record_output_concept: Option<&Concept> = match &rule.output_ty { Type::Named(n) => concepts.iter().find(|c| c.name == *n).copied(), _ => None };
 
-    let code = if let Some(rx) = reaction {
+    let mut code = if let Some(rx) = reaction {
         emit_reaction_program(rx, rule, concept, &rules)?
     } else if is_result_output {
         emit_result_program(rule, concept, &rules)?
@@ -181,6 +197,9 @@ fn compile_native_code(
         emit_text_program(rule, concept, &rules)?
     } else if let Some(rec_concept) = record_output_concept {
         emit_record_program(rule, rec_concept, concept, &concepts, &rules)?
+    } else if matches!(&rule.output_ty, Type::Number | Type::Bool) && contains_quantifier(&rule.logic.value) {
+        // Phase 6: scalar output with embedded quantifiers (e.g. if all(...) then X else Y).
+        emit_multi_fold_program(rule, concept, &concepts, &rules)?
     } else if is_vectorizable && concept.fields.len() == 1 {
         if let Some(threshold) = extract_simple_gt(rule) { emit_vectorized_program(threshold)? } else { emit_full_program(rule, concept, &rules)? }
     } else if is_parallel {
@@ -189,6 +208,58 @@ fn compile_native_code(
         emit_full_program(rule, concept, &rules)?
     };
 
+    if stream {
+        // Streaming mode: wrap rule code in a line-by-line read loop.
+        // Requires the rule code to use the standard push rbp / mov rbp, rsp
+        // prologue so that `mov rsp, rbp; pop rbp` correctly restores the stack.
+        // Vectorized and parallel programs use different prologues — refuse them.
+        if is_vectorizable && concept.fields.len() == 1 && extract_simple_gt(rule).is_some() {
+            return Err(NativeError {
+                message: "streaming mode is not supported with SIMD-vectorized rules (use a non-vectorized rule)".into(),
+            });
+        }
+        if is_parallel {
+            return Err(NativeError {
+                message: "streaming mode is not supported with parallel rules".into(),
+            });
+        }
+
+        // Strip the exit sequence from the rule code. The exit now includes
+        // an exit-flag load before `mov rax, 60; syscall`, so we search backward
+        // for the `mov rax, 60` pattern (48 C7 C0 3C 00 00 00) and strip from there.
+        let mov_rax_60: [u8; 7] = [0x48, 0xC7, 0xC0, 0x3C, 0x00, 0x00, 0x00];
+        if let Some(pos) = code.windows(7).rposition(|w| w == mov_rax_60) {
+            code.truncate(pos);
+        }
+        // Add stack cleanup: mov rsp, rbp; pop rbp
+        code.extend_from_slice(&[0x48, 0x89, 0xEC, 0x5D]);
+        // Add jmp placeholder (rel32, patched after prepend)
+        code.push(0xE9);
+        let jmp_offset_in_rule = code.len(); // position of the rel32 within rule code
+        code.extend_from_slice(&[0x00; 4]);
+
+        // Emit the stream prologue
+        let mut full = Vec::new();
+        let stream_top = emit_stream_prologue(&mut full);
+        let prologue_size = full.len();
+
+        // Append rule code after prologue
+        full.extend_from_slice(&code);
+
+        // Patch jmp: target = stream_top, from = prologue_size + jmp_offset_in_rule + 4
+        let jmp_abs = prologue_size + jmp_offset_in_rule;
+        let jmp_target = stream_top as i32 - (jmp_abs as i32 + 4);
+        full[jmp_abs..jmp_abs + 4].copy_from_slice(&jmp_target.to_le_bytes());
+
+        code = full;
+    } else if stdin {
+        // One-shot stdin: read all, tokenize, process, exit.
+        let mut full = Vec::new();
+        emit_stdin_prologue(&mut full);
+        full.extend_from_slice(&code);
+        code = full;
+    }
+
     Ok(code)
 }
 
@@ -196,8 +267,10 @@ pub fn compile_native(
     program: &Program,
     rule_name: &str,
     output_path: &str,
+    stdin: bool,
+    stream: bool,
 ) -> Result<(), NativeError> {
-    let mut code = compile_native_code(program, rule_name)?;
+    let mut code = compile_native_code(program, rule_name, stdin, stream)?;
 
     // Peephole optimization: eliminate redundant push/pop patterns
     let before_size = code.len();
@@ -276,6 +349,32 @@ struct RecordLoopCtx<'a> {
     /// the callee allocated. When the callee's Err doesn't use concat,
     /// this slot just holds the unchanged rsp — restoring is a no-op.
     err_frame_save_slot: i32,
+    /// Exit code flag: 0 = all records succeeded, 1 = at least one failed.
+    /// Bool rules set this to 1 on false; Result rules set it on Err.
+    /// The epilogue loads this into rdi for sys_exit.
+    exit_flag_slot: i32,
+}
+
+/// Emit an argc guard: if r12 (argc) < min_argc, write an error message
+/// to stderr and exit(1). Prevents segfaults on wrong argument count.
+/// Must be emitted AFTER `mov r12, [rsp]`.
+fn emit_argc_guard(code: &mut Vec<u8>, min_argc: i32) {
+    // cmp r12d, min_argc (imm8 — min_argc always < 127 in practice)
+    code.extend_from_slice(&[0x41, 0x83, 0xFC]);
+    code.push(min_argc as u8);
+    // jge .ok (short forward jump, patched below)
+    code.push(0x7D);
+    let ok_patch = code.len();
+    code.push(0x00);
+    // Error path: write message to stderr, exit(1).
+    emit_write_static_to_fd(code, b"error: not enough arguments\n", 2);
+    // mov rax, 60 (sys_exit) ; mov edi, 1 ; syscall
+    code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x3C, 0x00, 0x00, 0x00]);
+    code.extend_from_slice(&[0x48, 0xC7, 0xC7, 0x01, 0x00, 0x00, 0x00]);
+    code.extend_from_slice(&[0x0F, 0x05]);
+    // .ok:
+    let ok_pos = code.len();
+    code[ok_patch] = (ok_pos - ok_patch - 1) as u8;
 }
 
 /// Emit the shared prologue for any emitter that iterates over records
@@ -306,7 +405,8 @@ fn emit_record_loop_prologue<'a>(
     //   base + 2: err_ptr_slot        (Phase 2F Err-bound text ptr)
     //   base + 3: err_len_slot        (Phase 2F Err-bound text length)
     //   base + 4: err_frame_save_slot (Phase 2F rsp saved before callee Err concat)
-    let n_reserved = 4;
+    //   base + 5: exit_flag_slot      (exit code: 0=success, 1=failure)
+    let n_reserved = 5;
     let frame_slots = nfields + n_bindings + n_reserved;
     let frame_size = (frame_slots * 8) as i32;
     let base = (nfields + n_bindings) as i32;
@@ -314,9 +414,12 @@ fn emit_record_loop_prologue<'a>(
     let err_ptr_slot: i32 = -((base + 2) * 8);
     let err_len_slot: i32 = -((base + 3) * 8);
     let err_frame_save_slot: i32 = -((base + 4) * 8);
+    let exit_flag_slot: i32 = -((base + 5) * 8);
 
     // mov r12, [rsp]            — argc
     code.extend_from_slice(&[0x4C, 0x8B, 0x24, 0x24]);
+    // Guard: need at least nfields + 1 args (argv[0] + one record).
+    emit_argc_guard(code, (nfields as i32) + 1);
     // lea r13, [rsp+8]          — argv base
     code.extend_from_slice(&[0x4C, 0x8D, 0x6C, 0x24, 0x08]);
     // push rbp ; mov rbp, rsp
@@ -327,6 +430,10 @@ fn emit_record_loop_prologue<'a>(
     code.extend_from_slice(&frame_size.to_le_bytes());
     // mov r14, 1                — arg index starts at 1 (skip argv[0])
     code.extend_from_slice(&[0x49, 0xC7, 0xC6, 0x01, 0x00, 0x00, 0x00]);
+    // Initialize exit flag to 0 (success)
+    code.extend_from_slice(&[0x48, 0xC7, 0x85]); // mov qword [rbp + exit_flag_slot], 0
+    code.extend_from_slice(&exit_flag_slot.to_le_bytes());
+    code.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
 
     let loop_top = code.len();
 
@@ -406,6 +513,7 @@ fn emit_record_loop_prologue<'a>(
         err_ptr_slot,
         err_len_slot,
         err_frame_save_slot,
+        exit_flag_slot,
     })
 }
 
@@ -417,9 +525,17 @@ fn emit_record_loop_epilogue(code: &mut Vec<u8>, ctx: &RecordLoopCtx<'_>) {
     let exit_pos = code.len();
     let exit_offset = exit_pos as i32 - (ctx.exit_patch as i32 + 4);
     code[ctx.exit_patch..ctx.exit_patch + 4].copy_from_slice(&exit_offset.to_le_bytes());
-    // mov rax, 60 (sys_exit) ; xor rdi, rdi ; syscall
+    // Load exit flag into rdi: mov rdi, [rbp + exit_flag_slot]
+    let efl = ctx.exit_flag_slot;
+    if efl >= -128 {
+        code.extend_from_slice(&[0x48, 0x8B, 0x7D]);
+        code.push(efl as u8);
+    } else {
+        code.extend_from_slice(&[0x48, 0x8B, 0xBD]);
+        code.extend_from_slice(&efl.to_le_bytes());
+    }
+    // mov rax, 60 (sys_exit) ; syscall
     code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x3C, 0x00, 0x00, 0x00]);
-    code.extend_from_slice(&[0x48, 0x31, 0xFF]);
     code.extend_from_slice(&[0x0F, 0x05]);
 }
 
@@ -456,6 +572,10 @@ fn emit_full_program(
         let pf_pos = code.len();
         code[pf_patch] = (pf_pos - pf_patch - 1) as u8;
         emit_write_string(&mut code, b"false\n");
+        // Set exit flag to 1 on false
+        code.extend_from_slice(&[0x48, 0xC7, 0x85]); // mov qword [rbp + exit_flag_slot], 1
+        code.extend_from_slice(&ctx.exit_flag_slot.to_le_bytes());
+        code.extend_from_slice(&[0x01, 0x00, 0x00, 0x00]);
         let ap_pos = code.len();
         code[ap_patch] = (ap_pos - ap_patch - 1) as u8;
     } else {
@@ -2015,6 +2135,7 @@ fn emit_result_program(
         err_ptr_slot: ctx.err_ptr_slot,
         err_len_slot: ctx.err_len_slot,
         err_frame_save_slot: ctx.err_frame_save_slot,
+        exit_flag_slot: ctx.exit_flag_slot,
     };
     emit_eval_result_expr(
         &mut code,
@@ -2052,6 +2173,8 @@ struct MatchSlots {
     /// frees any buffer the callee's Err concat allocated. A no-op when
     /// the callee's Err was a literal or field access.
     err_frame_save_slot: i32,
+    /// Exit code flag slot: set to 1 on Err to propagate failure.
+    exit_flag_slot: i32,
 }
 
 /// Emit code for an expression that produces a Result(number, text). Each
@@ -2118,6 +2241,10 @@ fn emit_eval_result_expr(
                 &no_text_bindings(),
             )?;
             emit_write_newline(code, 2);
+            // Set exit flag to 1 (failure)
+            code.extend_from_slice(&[0x48, 0xC7, 0x85]); // mov qword [rbp + exit_flag_slot], 1
+            code.extend_from_slice(&slots.exit_flag_slot.to_le_bytes());
+            code.extend_from_slice(&[0x01, 0x00, 0x00, 0x00]);
             // jmp loop_top
             code.push(0xE9);
             let off = loop_top as i32 - (code.len() + 4) as i32;
@@ -2754,6 +2881,7 @@ fn emit_collection_program(
 
     // _start — argv/rbp frame setup.
     code.extend_from_slice(&[0x4C, 0x8B, 0x24, 0x24]); // mov r12, [rsp]
+    emit_argc_guard(&mut code, (n_scalar as i32) + 2);
     code.extend_from_slice(&[0x4C, 0x8D, 0x6C, 0x24, 0x08]); // lea r13, [rsp+8]
     code.push(0x55); // push rbp
     code.extend_from_slice(&[0x48, 0x89, 0xE5]); // mov rbp, rsp
@@ -3077,6 +3205,7 @@ fn emit_fold_program(
 
     // _start — argv/rbp frame setup.
     code.extend_from_slice(&[0x4C, 0x8B, 0x24, 0x24]); // mov r12, [rsp]
+    emit_argc_guard(&mut code, (n_scalar as i32) + 2);
     code.extend_from_slice(&[0x4C, 0x8D, 0x6C, 0x24, 0x08]); // lea r13, [rsp+8]
     code.push(0x55); // push rbp
     code.extend_from_slice(&[0x48, 0x89, 0xE5]); // mov rbp, rsp
@@ -3222,6 +3351,331 @@ fn emit_fold_program(
     code.extend_from_slice(&[0x0F, 0x05]); // syscall
 
     Ok(code)
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Phase 6: scalar output with embedded quantifiers (multi-accumulator fold)
+// ═══════════════════════════════════════════════════════════════════════
+
+/// A quantifier extracted from a larger expression tree and desugared into
+/// a fold. After extraction, the original expression references the fold
+/// result via `Ident(name)`.
+struct ExtractedFold {
+    name: String,       // result name used in the outer expression (e.g. "__fold_0")
+    init: i64,          // literal initial accumulator value
+    acc_name: String,   // unique accumulator name (e.g. "__fold_0_acc")
+    item_name: String,  // element variable name from the quantifier (e.g. "e")
+    body: Expr,         // fold body referencing acc_name and item_name
+}
+
+/// Returns true if the expression tree contains any Quantifier node.
+fn contains_quantifier(expr: &Expr) -> bool {
+    match expr {
+        Expr::Quantifier(_, _, _, _) => true,
+        Expr::If(c, t, e) => contains_quantifier(c) || contains_quantifier(t) || contains_quantifier(e),
+        Expr::Binary(_, l, r) => contains_quantifier(l) || contains_quantifier(r),
+        Expr::Not(e) | Expr::Neg(e) => contains_quantifier(e),
+        _ => false,
+    }
+}
+
+/// Walk the expression tree, replace every Quantifier node with an Ident
+/// reference, and return the desugared fold parameters for each.
+fn extract_quantifiers(expr: &Expr, counter: &mut usize) -> (Expr, Vec<ExtractedFold>) {
+    match expr {
+        Expr::Quantifier(kind, _coll, var, pred) => {
+            let idx = *counter;
+            *counter += 1;
+            let name = format!("__fold_{}", idx);
+            let acc = format!("__fold_{}_acc", idx);
+            let (init, body) = match kind {
+                QuantifierKind::All => (
+                    1i64,
+                    Expr::If(pred.clone(), Box::new(Expr::Ident(acc.clone())), Box::new(Expr::Number(0))),
+                ),
+                QuantifierKind::Any => (
+                    0i64,
+                    Expr::If(pred.clone(), Box::new(Expr::Number(1)), Box::new(Expr::Ident(acc.clone()))),
+                ),
+            };
+            let fold = ExtractedFold { name: name.clone(), init, acc_name: acc, item_name: var.clone(), body };
+            (Expr::Ident(name), vec![fold])
+        }
+        Expr::If(c, t, e) => {
+            let (nc, mut fc) = extract_quantifiers(c, counter);
+            let (nt, ft) = extract_quantifiers(t, counter);
+            let (ne, fe) = extract_quantifiers(e, counter);
+            fc.extend(ft); fc.extend(fe);
+            (Expr::If(Box::new(nc), Box::new(nt), Box::new(ne)), fc)
+        }
+        Expr::Binary(op, l, r) => {
+            let (nl, mut fl) = extract_quantifiers(l, counter);
+            let (nr, fr) = extract_quantifiers(r, counter);
+            fl.extend(fr);
+            (Expr::Binary(*op, Box::new(nl), Box::new(nr)), fl)
+        }
+        Expr::Not(e) => {
+            let (ne, fe) = extract_quantifiers(e, counter);
+            (Expr::Not(Box::new(ne)), fe)
+        }
+        Expr::Neg(e) => {
+            let (ne, fe) = extract_quantifiers(e, counter);
+            (Expr::Neg(Box::new(ne)), fe)
+        }
+        other => (other.clone(), vec![]),
+    }
+}
+
+/// Phase 6 emitter: scalar output whose logic contains embedded quantifiers
+/// on the input concept's collection field. All quantifiers are extracted,
+/// desugared to folds, and computed in a single pass over the collection
+/// with one accumulator slot per fold. The remaining scalar expression is
+/// evaluated after the inner loop.
+///
+/// This handles patterns like:
+///   `if all(xs, p) then 0 else if any(xs, p) then 1 else 2`
+///
+/// Requirements:
+///   - Output: number or bool
+///   - Input concept: scalars* + ONE trailing collection(Concept) field
+///   - All quantifiers target the same collection field
+fn emit_multi_fold_program(
+    rule: &Rule,
+    input_concept: &Concept,
+    all_concepts: &[&Concept],
+    all_rules: &HashMap<&str, &Rule>,
+) -> Result<Vec<u8>, NativeError> {
+    let is_bool_output = matches!(rule.output_ty, Type::Bool);
+    if !matches!(rule.output_ty, Type::Number | Type::Bool) {
+        return Err(NativeError {
+            message: "emit_multi_fold_program: output must be number or bool".into(),
+        });
+    }
+
+    // Extract quantifiers from the expression tree.
+    let mut counter = 0usize;
+    let (scalar_expr, folds) = extract_quantifiers(&rule.logic.value, &mut counter);
+    if folds.is_empty() {
+        return Err(NativeError {
+            message: "emit_multi_fold_program: no quantifiers found in expression".into(),
+        });
+    }
+
+    // Validate input concept shape: scalars + trailing collection.
+    let mut scalar_fields: Vec<&Field> = Vec::new();
+    let mut elem_concept_name: Option<String> = None;
+    for (i, f) in input_concept.fields.iter().enumerate() {
+        let is_last = i == input_concept.fields.len() - 1;
+        match (&f.ty, is_last) {
+            (Type::Number, false) | (Type::Text, false) => scalar_fields.push(f),
+            (Type::Collection(elem), true) => { elem_concept_name = Some(elem.clone()); }
+            _ => return Err(NativeError {
+                message: format!(
+                    "Phase 6: input concept '{}' must have scalars + ONE trailing collection; field '{}' at {} violates this",
+                    input_concept.name, f.name, i
+                ),
+            }),
+        }
+    }
+    let elem_concept_name = elem_concept_name.ok_or_else(|| NativeError {
+        message: format!("Phase 6: input concept '{}' has no trailing collection field", input_concept.name),
+    })?;
+    let elem_concept = all_concepts.iter().find(|c| c.name == elem_concept_name).copied()
+        .ok_or_else(|| NativeError { message: format!("unknown concept '{}'", elem_concept_name) })?;
+    for f in &elem_concept.fields {
+        if !matches!(f.ty, Type::Number | Type::Text) {
+            return Err(NativeError {
+                message: format!("Phase 6: element field '{}' has unsupported type", f.name),
+            });
+        }
+    }
+
+    // ===== Frame layout =====
+    let n_scalar = scalar_fields.len();
+    let n_elem = elem_concept.fields.len();
+    let n_lets = rule.logic.bindings.len();
+    let n_folds = folds.len();
+    // Frame: scalars + element fields + let bindings + N accumulator slots
+    let frame_slots = n_scalar + n_elem + n_lets + n_folds;
+    let frame_size = (frame_slots as i32) * 8;
+
+    // Accumulator slot offsets (at the bottom of the frame).
+    let acc_offsets: Vec<i32> = (0..n_folds)
+        .map(|i| -(((n_scalar + n_elem + n_lets + i) as i32 + 1) * 8))
+        .collect();
+
+    let mut code = Vec::new();
+
+    // _start — argv/rbp frame setup.
+    code.extend_from_slice(&[0x4C, 0x8B, 0x24, 0x24]); // mov r12, [rsp]
+    emit_argc_guard(&mut code, (n_scalar as i32) + 2);
+    code.extend_from_slice(&[0x4C, 0x8D, 0x6C, 0x24, 0x08]); // lea r13, [rsp+8]
+    code.push(0x55); // push rbp
+    code.extend_from_slice(&[0x48, 0x89, 0xE5]); // mov rbp, rsp
+    code.extend_from_slice(&[0x48, 0x81, 0xEC]);
+    code.extend_from_slice(&frame_size.to_le_bytes());
+    code.extend_from_slice(&[0x49, 0xC7, 0xC6, 0x01, 0x00, 0x00, 0x00]); // mov r14, 1
+
+    // Outer loop — one record per iteration.
+    let outer_loop_top = code.len();
+    code.extend_from_slice(&[0x4D, 0x39, 0xE6]); // cmp r14, r12
+    code.extend_from_slice(&[0x0F, 0x8D]);
+    let exit_patch = code.len();
+    code.extend_from_slice(&[0; 4]);
+
+    // Offsets for scalar fields.
+    let mut scalar_offsets: HashMap<&str, i32> = HashMap::new();
+    for (i, f) in scalar_fields.iter().enumerate() {
+        scalar_offsets.insert(f.name.as_str(), -((i as i32 + 1) * 8));
+    }
+
+    // Offsets for element fields (shared across all fold body evaluations).
+    let mut body_offsets: HashMap<&str, i32> = HashMap::new();
+    for (i, f) in elem_concept.fields.iter().enumerate() {
+        body_offsets.insert(f.name.as_str(), -(((n_scalar + i) as i32 + 1) * 8));
+    }
+
+    // Add accumulator name → slot mappings (both __fold_N_acc for body, __fold_N for final expr).
+    for (i, fold) in folds.iter().enumerate() {
+        body_offsets.insert(leak_string(&fold.acc_name), acc_offsets[i]);
+    }
+
+    // Parse scalar input fields (skip in logic, but consume from argv).
+    for f in &scalar_fields {
+        let offset = scalar_offsets[f.name.as_str()];
+        code.extend_from_slice(&[0x4B, 0x8B, 0x7C, 0xF5, 0x00]); // mov rdi, [r13+r14*8]
+        match f.ty {
+            Type::Number => { emit_atoi_inline(&mut code); store_rax_at_rbp(&mut code, offset); }
+            Type::Text => store_rdi_at_rbp(&mut code, offset),
+            _ => unreachable!(),
+        }
+        code.extend_from_slice(&[0x49, 0xFF, 0xC6]); // inc r14
+    }
+
+    // Evaluate let bindings.
+    let field_ranges_for_lets = build_field_ranges(input_concept);
+    let mut let_offsets = scalar_offsets.clone();
+    let mut next_let_slot = -(((n_scalar + n_elem) as i32 + 1) * 8);
+    for (name, expr) in &rule.logic.bindings {
+        emit_eval_expr(&mut code, expr, &rule.input_name, &let_offsets, all_rules, &field_ranges_for_lets)?;
+        store_rax_at_rbp(&mut code, next_let_slot);
+        let_offsets.insert(name.as_str(), next_let_slot);
+        next_let_slot -= 8;
+    }
+    for (name, &offset) in &let_offsets {
+        if !body_offsets.contains_key(name) {
+            body_offsets.insert(name, offset);
+        }
+    }
+
+    // Parse collection count → r15.
+    code.extend_from_slice(&[0x4B, 0x8B, 0x7C, 0xF5, 0x00]); // mov rdi, [r13+r14*8]
+    emit_atoi_inline(&mut code);
+    code.extend_from_slice(&[0x49, 0x89, 0xC7]); // mov r15, rax
+    code.extend_from_slice(&[0x49, 0xFF, 0xC6]); // inc r14
+
+    // Seed all accumulators.
+    for (i, fold) in folds.iter().enumerate() {
+        code.extend_from_slice(&[0x48, 0xB8]);
+        code.extend_from_slice(&fold.init.to_le_bytes());
+        store_rax_at_rbp(&mut code, acc_offsets[i]);
+    }
+
+    // Inner loop — per element, update ALL accumulators.
+    let inner_loop_top = code.len();
+    code.extend_from_slice(&[0x4D, 0x85, 0xFF]); // test r15, r15
+    code.extend_from_slice(&[0x0F, 0x84]);
+    let inner_done_patch = code.len();
+    code.extend_from_slice(&[0; 4]);
+
+    // Parse element fields.
+    for f in &elem_concept.fields {
+        let offset = body_offsets[f.name.as_str()];
+        code.extend_from_slice(&[0x4B, 0x8B, 0x7C, 0xF5, 0x00]); // mov rdi, [r13+r14*8]
+        match f.ty {
+            Type::Number => { emit_atoi_inline(&mut code); store_rax_at_rbp(&mut code, offset); }
+            Type::Text => store_rdi_at_rbp(&mut code, offset),
+            _ => unreachable!(),
+        }
+        code.extend_from_slice(&[0x49, 0xFF, 0xC6]); // inc r14
+    }
+
+    // Evaluate each fold body and update its accumulator.
+    let field_ranges = build_field_ranges(elem_concept);
+    for (i, fold) in folds.iter().enumerate() {
+        emit_eval_expr(&mut code, &fold.body, &fold.item_name, &body_offsets, all_rules, &field_ranges)?;
+        store_rax_at_rbp(&mut code, acc_offsets[i]);
+    }
+
+    // dec r15 ; jmp inner_loop_top
+    code.extend_from_slice(&[0x49, 0xFF, 0xCF]); // dec r15
+    code.push(0xE9);
+    let back = inner_loop_top as i32 - (code.len() + 4) as i32;
+    code.extend_from_slice(&back.to_le_bytes());
+
+    // inner_done:
+    let inner_done = code.len();
+    let inner_off = inner_done as i32 - (inner_done_patch as i32 + 4);
+    code[inner_done_patch..inner_done_patch + 4].copy_from_slice(&inner_off.to_le_bytes());
+
+    // Build offset map for the final scalar expression: fold results.
+    let mut final_offsets: HashMap<&str, i32> = HashMap::new();
+    for (i, fold) in folds.iter().enumerate() {
+        final_offsets.insert(leak_string(&fold.name), acc_offsets[i]);
+    }
+    // Also include scalar fields and let bindings in case the expression references them.
+    for (name, &offset) in &scalar_offsets {
+        final_offsets.insert(name, offset);
+    }
+    for (name, &offset) in &let_offsets {
+        final_offsets.insert(name, offset);
+    }
+
+    // Evaluate the final scalar expression (quantifiers replaced by Ident refs).
+    // Use an empty input name — the expression should only reference __fold_N idents.
+    let empty_ranges: HashMap<&str, (i64, i64)> = HashMap::new();
+    emit_eval_expr(&mut code, &scalar_expr, "__phase6_none__", &final_offsets, all_rules, &empty_ranges)?;
+
+    // Print result.
+    if is_bool_output {
+        code.extend_from_slice(&[0x84, 0xC0]); // test al, al
+        code.push(0x74);
+        let pf_patch = code.len();
+        code.push(0x00);
+        emit_write_string(&mut code, b"true\n");
+        code.push(0xEB);
+        let ap_patch = code.len();
+        code.push(0x00);
+        let pf_pos = code.len();
+        code[pf_patch] = (pf_pos - pf_patch - 1) as u8;
+        emit_write_string(&mut code, b"false\n");
+        let ap_pos = code.len();
+        code[ap_patch] = (ap_pos - ap_patch - 1) as u8;
+    } else {
+        emit_itoa_inline(&mut code);
+    }
+
+    // jmp outer_loop_top
+    code.push(0xE9);
+    let outer_off = outer_loop_top as i32 - (code.len() + 4) as i32;
+    code.extend_from_slice(&outer_off.to_le_bytes());
+
+    // exit: sys_exit(0)
+    let exit_pos = code.len();
+    let exit_off = exit_pos as i32 - (exit_patch as i32 + 4);
+    code[exit_patch..exit_patch + 4].copy_from_slice(&exit_off.to_le_bytes());
+    code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x3C, 0x00, 0x00, 0x00]);
+    code.extend_from_slice(&[0x48, 0x31, 0xFF]);
+    code.extend_from_slice(&[0x0F, 0x05]);
+
+    Ok(code)
+}
+
+/// Leak a string to get a `&'static str` for use as HashMap key.
+/// Used when we need to insert dynamically-created names into offset maps
+/// that borrow `&str` from the AST (which outlives the emitter call).
+fn leak_string(s: &str) -> &'static str {
+    Box::leak(s.to_string().into_boxed_str())
 }
 
 /// Does `e` mention `Ident(name)` anywhere (recursively)? Used by Phase 5b
@@ -3459,6 +3913,7 @@ fn emit_text_fold_program(
 
     // _start — argv/rbp setup.
     code.extend_from_slice(&[0x4C, 0x8B, 0x24, 0x24]);       // mov r12, [rsp]
+    emit_argc_guard(&mut code, (n_scalar as i32) + 2);
     code.extend_from_slice(&[0x4C, 0x8D, 0x6C, 0x24, 0x08]); // lea r13, [rsp+8]
     code.push(0x55);                                         // push rbp
     code.extend_from_slice(&[0x48, 0x89, 0xE5]);             // mov rbp, rsp
@@ -4816,6 +5271,7 @@ fn emit_parallel_program(
 
     // === Setup: save argc/argv ===
     code.extend_from_slice(&[0x4C, 0x8B, 0x24, 0x24]); // mov r12, [rsp]
+    emit_argc_guard(&mut code, (nfields as i32) + 1);
     code.extend_from_slice(&[0x4C, 0x8D, 0x6C, 0x24, 0x08]); // lea r13, [rsp+8]
 
     // total_args = argc - 1
@@ -5204,6 +5660,7 @@ fn emit_vectorized_program(threshold: i64) -> Result<Vec<u8>, NativeError> {
     // === Setup ===
     // mov r12, [rsp]
     code.extend_from_slice(&[0x4C, 0x8B, 0x24, 0x24]);
+    emit_argc_guard(&mut code, 2); // vectorized: need at least 1 value
     // lea r13, [rsp+8]
     code.extend_from_slice(&[0x4C, 0x8D, 0x6C, 0x24, 0x08]);
 
@@ -5356,6 +5813,374 @@ fn emit_vectorized_program(threshold: i64) -> Result<Vec<u8>, NativeError> {
     Ok(code)
 }
 
+/// Emit a stdin reader prologue: reads whitespace-separated tokens from fd 0
+/// and builds an argc/argv layout on the stack so the existing rule prologue
+/// works unchanged.
+///
+/// Stack layout during the prologue (all below original rsp):
+///   [rsp .. rsp+65535]          64K read buffer (stdin data → NUL-terminated tokens)
+///   [rsp+65536 .. rsp+131071]   64K ptr array (up to 8192 token pointers)
+///
+/// After completion, rsp is restored and the layout at [rsp] is:
+///   [rsp]      = argc (token_count + 1)
+///   [rsp+8]    = 0 (dummy argv[0])
+///   [rsp+16]   = pointer to token[0]
+///   ...
+///
+/// Registers clobbered: rax, rbx, rcx, rdx, rdi, rsi, r8, r9.
+/// All are ephemeral — the rule prologue re-reads everything from [rsp].
+fn emit_stdin_prologue(code: &mut Vec<u8>) {
+    // ─── save original rsp & allocate 128K ─────────────────────
+    // mov rbx, rsp
+    code.extend_from_slice(&[0x48, 0x89, 0xE3]);
+    // sub rsp, 131072
+    code.extend_from_slice(&[0x48, 0x81, 0xEC, 0x00, 0x00, 0x02, 0x00]);
+
+    // ─── sys_read(0, rsp, 65535) ───────────────────────────────
+    // xor edi, edi           (fd = 0 = stdin)
+    code.extend_from_slice(&[0x31, 0xFF]);
+    // mov rsi, rsp           (buf = rsp)
+    code.extend_from_slice(&[0x48, 0x89, 0xE6]);
+    // mov edx, 65535         (count — leaves 1 byte for NUL sentinel)
+    code.extend_from_slice(&[0xBA, 0xFF, 0xFF, 0x00, 0x00]);
+    // xor eax, eax           (syscall nr 0 = read)
+    code.extend_from_slice(&[0x31, 0xC0]);
+    // syscall
+    code.extend_from_slice(&[0x0F, 0x05]);
+
+    // ─── error guard: negative rax → 0 bytes ──────────────────
+    // test rax, rax
+    code.extend_from_slice(&[0x48, 0x85, 0xC0]);
+    // jns +2                 (skip xor if non-negative)
+    code.extend_from_slice(&[0x79, 0x02]);
+    // xor eax, eax
+    code.extend_from_slice(&[0x31, 0xC0]);
+
+    // ─── NUL-terminate buffer ──────────────────────────────────
+    // mov byte [rsp + rax*1], 0
+    code.extend_from_slice(&[0xC6, 0x04, 0x04, 0x00]);
+
+    // ─── setup tokenizer state ─────────────────────────────────
+    // lea r8, [rsp + 65536]  (ptr array base)
+    code.extend_from_slice(&[0x4C, 0x8D, 0x84, 0x24, 0x00, 0x00, 0x01, 0x00]);
+    // xor r9d, r9d           (token count = 0)
+    code.extend_from_slice(&[0x45, 0x31, 0xC9]);
+    // mov rcx, rsp           (scan pointer = buffer start)
+    code.extend_from_slice(&[0x48, 0x89, 0xE1]);
+    // lea rdx, [rsp + rax]   (buffer end)
+    code.extend_from_slice(&[0x48, 0x8D, 0x14, 0x04]);
+
+    // ═══ TOKENIZER LOOP ═══════════════════════════════════════
+    // skip_ws:
+    let skip_ws = code.len();
+
+    //   cmp rcx, rdx
+    code.extend_from_slice(&[0x48, 0x39, 0xD1]);
+    //   jge done_tokenize (rel32, patched)
+    code.extend_from_slice(&[0x0F, 0x8D]);
+    let done_tok_patch1 = code.len();
+    code.extend_from_slice(&[0x00; 4]);
+
+    //   mov al, [rcx]
+    code.extend_from_slice(&[0x8A, 0x01]);
+    //   cmp al, ' '  ;  je next_ws
+    code.extend_from_slice(&[0x3C, 0x20]);
+    code.push(0x74); let nw1 = code.len(); code.push(0);
+    //   cmp al, '\t' ;  je next_ws
+    code.extend_from_slice(&[0x3C, 0x09]);
+    code.push(0x74); let nw2 = code.len(); code.push(0);
+    //   cmp al, '\n' ;  je next_ws
+    code.extend_from_slice(&[0x3C, 0x0A]);
+    code.push(0x74); let nw3 = code.len(); code.push(0);
+    //   cmp al, '\r' ;  je next_ws
+    code.extend_from_slice(&[0x3C, 0x0D]);
+    code.push(0x74); let nw4 = code.len(); code.push(0);
+
+    // ─── start of token: bounds-check + store pointer ────────────
+    // Guard: if r9 >= 8192 (ptr array full), stop tokenizing.
+    code.extend_from_slice(&[0x41, 0x81, 0xF9, 0x00, 0x20, 0x00, 0x00]); // cmp r9d, 8192
+    code.extend_from_slice(&[0x0F, 0x8D]); // jge done_tokenize (rel32, patched with done_tok)
+    let token_cap_patch = code.len();
+    code.extend_from_slice(&[0x00; 4]);
+    // mov [r8 + r9*8], rcx   (REX.WXB=0x4B)
+    code.extend_from_slice(&[0x4B, 0x89, 0x0C, 0xC8]);
+    // inc r9
+    code.extend_from_slice(&[0x49, 0xFF, 0xC1]);
+
+    // find_end: scan for next whitespace or end-of-buffer
+    let find_end = code.len();
+    //   inc rcx
+    code.extend_from_slice(&[0x48, 0xFF, 0xC1]);
+    //   cmp rcx, rdx
+    code.extend_from_slice(&[0x48, 0x39, 0xD1]);
+    //   jge done_tokenize (rel32, patched)
+    code.extend_from_slice(&[0x0F, 0x8D]);
+    let done_tok_patch2 = code.len();
+    code.extend_from_slice(&[0x00; 4]);
+
+    //   mov al, [rcx]
+    code.extend_from_slice(&[0x8A, 0x01]);
+    //   cmp al, ' '  ;  je terminate_token
+    code.extend_from_slice(&[0x3C, 0x20]);
+    code.push(0x74); let tt1 = code.len(); code.push(0);
+    //   cmp al, '\t' ;  je terminate_token
+    code.extend_from_slice(&[0x3C, 0x09]);
+    code.push(0x74); let tt2 = code.len(); code.push(0);
+    //   cmp al, '\n' ;  je terminate_token
+    code.extend_from_slice(&[0x3C, 0x0A]);
+    code.push(0x74); let tt3 = code.len(); code.push(0);
+    //   cmp al, '\r' ;  je terminate_token
+    code.extend_from_slice(&[0x3C, 0x0D]);
+    code.push(0x74); let tt4 = code.len(); code.push(0);
+    //   jmp find_end (backward short)
+    code.push(0xEB);
+    code.push((find_end as isize - code.len() as isize - 1) as u8);
+
+    // terminate_token: NUL-terminate and continue scanning
+    let terminate_token = code.len();
+    //   mov byte [rcx], 0
+    code.extend_from_slice(&[0xC6, 0x01, 0x00]);
+    //   inc rcx
+    code.extend_from_slice(&[0x48, 0xFF, 0xC1]);
+    //   jmp skip_ws (backward short)
+    code.push(0xEB);
+    code.push((skip_ws as isize - code.len() as isize - 1) as u8);
+
+    // next_ws: advance past whitespace and re-scan
+    let next_ws = code.len();
+    //   inc rcx
+    code.extend_from_slice(&[0x48, 0xFF, 0xC1]);
+    //   jmp skip_ws (backward short)
+    code.push(0xEB);
+    code.push((skip_ws as isize - code.len() as isize - 1) as u8);
+
+    // ─── patch forward jumps ───────────────────────────────────
+    for p in [nw1, nw2, nw3, nw4] {
+        code[p] = (next_ws - p - 1) as u8;
+    }
+    for p in [tt1, tt2, tt3, tt4] {
+        code[p] = (terminate_token - p - 1) as u8;
+    }
+
+    // done_tokenize:
+    let done_tok = code.len();
+    let r1 = done_tok as i32 - (done_tok_patch1 as i32 + 4);
+    code[done_tok_patch1..done_tok_patch1 + 4].copy_from_slice(&r1.to_le_bytes());
+    let r2 = done_tok as i32 - (done_tok_patch2 as i32 + 4);
+    code[done_tok_patch2..done_tok_patch2 + 4].copy_from_slice(&r2.to_le_bytes());
+    // Patch token capacity guard → done_tokenize
+    let r3 = done_tok as i32 - (token_cap_patch as i32 + 4);
+    code[token_cap_patch..token_cap_patch + 4].copy_from_slice(&r3.to_le_bytes());
+
+    // ═══ COPY TOKENS TO ARGC/ARGV LAYOUT AT RBX ═══════════════
+    // mov rax, r9             (token count)
+    code.extend_from_slice(&[0x4C, 0x89, 0xC8]);
+    // inc rax                 (argc = tokens + 1 for dummy argv[0])
+    code.extend_from_slice(&[0x48, 0xFF, 0xC0]);
+    // mov [rbx], rax
+    code.extend_from_slice(&[0x48, 0x89, 0x03]);
+    // mov qword [rbx+8], 0    (dummy argv[0])
+    code.extend_from_slice(&[0x48, 0xC7, 0x43, 0x08, 0x00, 0x00, 0x00, 0x00]);
+    // xor ecx, ecx            (i = 0)
+    code.extend_from_slice(&[0x31, 0xC9]);
+
+    // copy_loop:
+    let copy_loop = code.len();
+    // cmp rcx, r9
+    code.extend_from_slice(&[0x4C, 0x39, 0xC9]);
+    // jge copy_done (short)
+    code.push(0x7D);
+    let copy_done_patch = code.len();
+    code.push(0);
+    // mov rax, [r8 + rcx*8]
+    code.extend_from_slice(&[0x49, 0x8B, 0x04, 0xC8]);
+    // mov [rbx + rcx*8 + 16], rax
+    code.extend_from_slice(&[0x48, 0x89, 0x44, 0xCB, 0x10]);
+    // inc rcx
+    code.extend_from_slice(&[0x48, 0xFF, 0xC1]);
+    // jmp copy_loop (backward short)
+    code.push(0xEB);
+    code.push((copy_loop as isize - code.len() as isize - 1) as u8);
+
+    // copy_done:
+    let copy_done = code.len();
+    code[copy_done_patch] = (copy_done - copy_done_patch - 1) as u8;
+
+    // ─── restore rsp → rule prologue sees argc/argv layout ────
+    // mov rsp, rbx
+    code.extend_from_slice(&[0x48, 0x89, 0xDC]);
+}
+
+/// Emit a streaming line reader prologue. Returns the offset of `stream_top`
+/// within the emitted code (always 0 — the first instruction).
+///
+/// Structure:
+///   stream_top: save rsp, allocate 128K, read line byte-by-byte
+///   → on got_line: tokenize, copy argv, restore rsp, fall through to rule code
+///   → on EOF: sys_exit(0)
+///   → on empty line: restore rsp, jmp stream_top
+///
+/// The caller must:
+///   1. Append the rule code (with sys_exit stripped)
+///   2. Append `mov rsp, rbp; pop rbp; jmp stream_top`
+fn emit_stream_prologue(code: &mut Vec<u8>) -> usize {
+    let stream_top = code.len();
+
+    // ─── save & allocate ────────────────────────────────────────
+    code.extend_from_slice(&[0x48, 0x89, 0xE3]); // mov rbx, rsp
+    code.extend_from_slice(&[0x48, 0x81, 0xEC, 0x00, 0x00, 0x02, 0x00]); // sub rsp, 128K
+
+    // ─── line reader: byte-by-byte until \n or EOF ─────────────
+    code.extend_from_slice(&[0x49, 0x89, 0xE0]); // mov r8, rsp (buffer start)
+    code.extend_from_slice(&[0x45, 0x31, 0xC9]); // xor r9d, r9d (length = 0)
+
+    let read_byte = code.len();
+    code.extend_from_slice(&[0x31, 0xFF]); // xor edi, edi
+    code.extend_from_slice(&[0x4B, 0x8D, 0x34, 0x08]); // lea rsi, [r8+r9]
+    code.extend_from_slice(&[0xBA, 0x01, 0x00, 0x00, 0x00]); // mov edx, 1
+    code.extend_from_slice(&[0x31, 0xC0]); // xor eax, eax
+    code.extend_from_slice(&[0x0F, 0x05]); // syscall
+
+    // EOF/error → near jump to check_eof (patched later)
+    code.extend_from_slice(&[0x48, 0x85, 0xC0]); // test rax, rax
+    code.extend_from_slice(&[0x0F, 0x8E]); // jle check_eof (rel32)
+    let eof_patch = code.len();
+    code.extend_from_slice(&[0x00; 4]);
+
+    // Check newline
+    code.extend_from_slice(&[0x43, 0x80, 0x3C, 0x08, 0x0A]); // cmp byte [r8+r9], 0x0A
+    code.push(0x74); // je got_line (short, patched)
+    let got_line_patch = code.len();
+    code.push(0x00);
+
+    // Continue reading
+    code.extend_from_slice(&[0x49, 0xFF, 0xC1]); // inc r9
+    code.extend_from_slice(&[0x41, 0x81, 0xF9, 0xFE, 0xFF, 0x00, 0x00]); // cmp r9d, 65534
+    code.push(0x0F); code.push(0x8C); // jl read_byte (rel32)
+    let back = read_byte as i32 - (code.len() as i32 + 4);
+    code.extend_from_slice(&back.to_le_bytes());
+
+    // ─── got_line: NUL-terminate, check empty, then tokenize ───
+    let got_line = code.len();
+    code[got_line_patch] = (got_line - got_line_patch - 1) as u8;
+
+    code.extend_from_slice(&[0x43, 0xC6, 0x04, 0x08, 0x00]); // mov byte [r8+r9], 0
+    // Empty line? → jump to skip_empty (near, patched)
+    code.extend_from_slice(&[0x4D, 0x85, 0xC9]); // test r9, r9
+    code.extend_from_slice(&[0x0F, 0x84]); // jz skip_empty (rel32)
+    let skip_empty_patch = code.len();
+    code.extend_from_slice(&[0x00; 4]);
+
+    // rax = line length for tokenizer
+    code.extend_from_slice(&[0x4C, 0x89, 0xC8]); // mov rax, r9
+
+    // Jump over EOF/skip handlers to the tokenizer
+    code.push(0xE9); // jmp tokenize (rel32)
+    let tokenize_patch = code.len();
+    code.extend_from_slice(&[0x00; 4]);
+
+    // ─── check_eof handler ─────────────────────────────────────
+    let check_eof = code.len();
+    let eof_rel = check_eof as i32 - (eof_patch as i32 + 4);
+    code[eof_patch..eof_patch + 4].copy_from_slice(&eof_rel.to_le_bytes());
+
+    // If we have pending bytes, process them as last line
+    code.extend_from_slice(&[0x4D, 0x85, 0xC9]); // test r9, r9
+    code.extend_from_slice(&[0x0F, 0x85]); // jnz got_line (rel32)
+    let got_line_rel = got_line as i32 - (code.len() as i32 + 4);
+    code.extend_from_slice(&got_line_rel.to_le_bytes());
+    // True EOF: exit(0)
+    code.extend_from_slice(&[0x48, 0x89, 0xDC]); // mov rsp, rbx
+    code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x3C, 0x00, 0x00, 0x00]); // mov rax, 60
+    code.extend_from_slice(&[0x48, 0x31, 0xFF]); // xor rdi, rdi
+    code.extend_from_slice(&[0x0F, 0x05]); // syscall
+
+    // ─── skip_empty handler ────────────────────────────────────
+    let skip_empty = code.len();
+    let skip_rel = skip_empty as i32 - (skip_empty_patch as i32 + 4);
+    code[skip_empty_patch..skip_empty_patch + 4].copy_from_slice(&skip_rel.to_le_bytes());
+
+    code.extend_from_slice(&[0x48, 0x89, 0xDC]); // mov rsp, rbx
+    code.push(0xE9); // jmp stream_top (rel32)
+    let stream_back = stream_top as i32 - (code.len() as i32 + 4);
+    code.extend_from_slice(&stream_back.to_le_bytes());
+
+    // ─── tokenize: setup + tokenizer loop ──────────────────────
+    let tokenize = code.len();
+    let tok_rel = tokenize as i32 - (tokenize_patch as i32 + 4);
+    code[tokenize_patch..tokenize_patch + 4].copy_from_slice(&tok_rel.to_le_bytes());
+
+    // r8 = ptr array, r9 = 0, rcx = buffer, rdx = buffer end
+    code.extend_from_slice(&[0x4C, 0x8D, 0x84, 0x24, 0x00, 0x00, 0x01, 0x00]); // lea r8, [rsp+65536]
+    code.extend_from_slice(&[0x45, 0x31, 0xC9]); // xor r9d, r9d
+    code.extend_from_slice(&[0x48, 0x89, 0xE1]); // mov rcx, rsp
+    code.extend_from_slice(&[0x48, 0x8D, 0x14, 0x04]); // lea rdx, [rsp+rax]
+
+    // ═══ TOKENIZER (same as stdin prologue) ════════════════════
+    let skip_ws = code.len();
+    code.extend_from_slice(&[0x48, 0x39, 0xD1]);
+    code.extend_from_slice(&[0x0F, 0x8D]);
+    let dt1 = code.len(); code.extend_from_slice(&[0; 4]);
+    code.extend_from_slice(&[0x8A, 0x01]);
+    code.extend_from_slice(&[0x3C, 0x20]); code.push(0x74); let nw1 = code.len(); code.push(0);
+    code.extend_from_slice(&[0x3C, 0x09]); code.push(0x74); let nw2 = code.len(); code.push(0);
+    code.extend_from_slice(&[0x3C, 0x0A]); code.push(0x74); let nw3 = code.len(); code.push(0);
+    code.extend_from_slice(&[0x3C, 0x0D]); code.push(0x74); let nw4 = code.len(); code.push(0);
+    // Guard: token capacity check
+    code.extend_from_slice(&[0x41, 0x81, 0xF9, 0x00, 0x20, 0x00, 0x00]); // cmp r9d, 8192
+    code.extend_from_slice(&[0x0F, 0x8D]); // jge done_tokenize
+    let stream_cap_patch = code.len();
+    code.extend_from_slice(&[0x00; 4]);
+    code.extend_from_slice(&[0x4B, 0x89, 0x0C, 0xC8]);
+    code.extend_from_slice(&[0x49, 0xFF, 0xC1]);
+    let fe = code.len();
+    code.extend_from_slice(&[0x48, 0xFF, 0xC1]);
+    code.extend_from_slice(&[0x48, 0x39, 0xD1]);
+    code.extend_from_slice(&[0x0F, 0x8D]);
+    let dt2 = code.len(); code.extend_from_slice(&[0; 4]);
+    code.extend_from_slice(&[0x8A, 0x01]);
+    code.extend_from_slice(&[0x3C, 0x20]); code.push(0x74); let t1 = code.len(); code.push(0);
+    code.extend_from_slice(&[0x3C, 0x09]); code.push(0x74); let t2 = code.len(); code.push(0);
+    code.extend_from_slice(&[0x3C, 0x0A]); code.push(0x74); let t3 = code.len(); code.push(0);
+    code.extend_from_slice(&[0x3C, 0x0D]); code.push(0x74); let t4 = code.len(); code.push(0);
+    code.push(0xEB); code.push((fe as isize - code.len() as isize - 1) as u8);
+    let tt = code.len();
+    code.extend_from_slice(&[0xC6, 0x01, 0x00]);
+    code.extend_from_slice(&[0x48, 0xFF, 0xC1]);
+    code.push(0xEB); code.push((skip_ws as isize - code.len() as isize - 1) as u8);
+    let nw = code.len();
+    code.extend_from_slice(&[0x48, 0xFF, 0xC1]);
+    code.push(0xEB); code.push((skip_ws as isize - code.len() as isize - 1) as u8);
+    for p in [nw1,nw2,nw3,nw4] { code[p] = (nw - p - 1) as u8; }
+    for p in [t1,t2,t3,t4] { code[p] = (tt - p - 1) as u8; }
+    let dt = code.len();
+    code[dt1..dt1+4].copy_from_slice(&((dt as i32) - (dt1 as i32 + 4)).to_le_bytes());
+    code[dt2..dt2+4].copy_from_slice(&((dt as i32) - (dt2 as i32 + 4)).to_le_bytes());
+    // Patch token capacity guard
+    code[stream_cap_patch..stream_cap_patch+4].copy_from_slice(&((dt as i32) - (stream_cap_patch as i32 + 4)).to_le_bytes());
+
+    // ═══ COPY TOKENS TO ARGC/ARGV AT RBX ═══════════════════════
+    code.extend_from_slice(&[0x4C, 0x89, 0xC8]); // mov rax, r9
+    code.extend_from_slice(&[0x48, 0xFF, 0xC0]); // inc rax
+    code.extend_from_slice(&[0x48, 0x89, 0x03]); // mov [rbx], rax
+    code.extend_from_slice(&[0x48, 0xC7, 0x43, 0x08, 0x00, 0x00, 0x00, 0x00]);
+    code.extend_from_slice(&[0x31, 0xC9]); // xor ecx, ecx
+    let cl = code.len();
+    code.extend_from_slice(&[0x4C, 0x39, 0xC9]);
+    code.push(0x7D); let cdp = code.len(); code.push(0);
+    code.extend_from_slice(&[0x49, 0x8B, 0x04, 0xC8]);
+    code.extend_from_slice(&[0x48, 0x89, 0x44, 0xCB, 0x10]);
+    code.extend_from_slice(&[0x48, 0xFF, 0xC1]);
+    code.push(0xEB); code.push((cl as isize - code.len() as isize - 1) as u8);
+    let cd = code.len();
+    code[cdp] = (cd - cdp - 1) as u8;
+
+    // Restore rsp → rule code sees argc/argv
+    code.extend_from_slice(&[0x48, 0x89, 0xDC]); // mov rsp, rbx
+
+    stream_top
+}
+
 fn build_elf(code: &[u8]) -> Vec<u8> {
     let entry_addr: u64 = 0x400000 + 120;
     let file_size = 120 + code.len();
@@ -5431,7 +6256,7 @@ mod tests {
         let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
 
         let out = std::env::temp_dir().join("verbosec_test_discounted");
-        compile_native(&program, "discounted_purchase", out.to_str().unwrap())
+        compile_native(&program, "discounted_purchase", out.to_str().unwrap(), false, false)
             .expect("native compile of discounted_purchase should succeed");
         let size = fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
         assert!(size > 500 && size < 2_500, "unexpected binary size: {}", size);
@@ -5451,7 +6276,7 @@ mod tests {
 
         for rule in ["salaries", "names"] {
             let out = std::env::temp_dir().join(format!("verbosec_test_{}", rule));
-            compile_native(&program, rule, out.to_str().unwrap())
+            compile_native(&program, rule, out.to_str().unwrap(), false, false)
                 .unwrap_or_else(|e| panic!("native compile of {} failed: {:?}", rule, e));
             let size = fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
             // Scalar-element output is smaller than record output — no bracket
@@ -5472,7 +6297,7 @@ mod tests {
         let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
 
         let out = std::env::temp_dir().join("verbosec_test_high_earners");
-        compile_native(&program, "high_earners", out.to_str().unwrap())
+        compile_native(&program, "high_earners", out.to_str().unwrap(), false, false)
             .expect("native compile of filter rule should succeed");
         let size = fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
         assert!(size > 400 && size < 2_500, "unexpected binary size: {}", size);
@@ -5492,7 +6317,7 @@ mod tests {
         let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
 
         let out = std::env::temp_dir().join("verbosec_test_payroll");
-        compile_native(&program, "compute_bonuses", out.to_str().unwrap())
+        compile_native(&program, "compute_bonuses", out.to_str().unwrap(), false, false)
             .expect("native compile of collection-output rule should succeed");
         let size = fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
         assert!(size > 400 && size < 2_500, "unexpected binary size: {}", size);
@@ -5511,7 +6336,7 @@ mod tests {
         let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
 
         let out = std::env::temp_dir().join("verbosec_test_total_salaries");
-        compile_native(&program, "total_salaries", out.to_str().unwrap())
+        compile_native(&program, "total_salaries", out.to_str().unwrap(), false, false)
             .expect("native compile of fold-sum rule should succeed");
         let size = fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
         assert!(size > 300 && size < 2_000, "unexpected binary size: {}", size);
@@ -5530,7 +6355,7 @@ mod tests {
         let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
 
         let out = std::env::temp_dir().join("verbosec_test_high_earner_count");
-        compile_native(&program, "high_earner_count", out.to_str().unwrap())
+        compile_native(&program, "high_earner_count", out.to_str().unwrap(), false, false)
             .expect("native compile of fold-count rule should succeed");
         let size = fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
         assert!(size > 300 && size < 2_000, "unexpected binary size: {}", size);
@@ -5552,7 +6377,7 @@ mod tests {
         let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
 
         let out = std::env::temp_dir().join("verbosec_test_make_report");
-        compile_native(&program, "make_report", out.to_str().unwrap())
+        compile_native(&program, "make_report", out.to_str().unwrap(), false, false)
             .expect("native compile of text-field-through-record should succeed");
         let size = fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
         assert!(size > 300 && size < 2_500, "unexpected binary size: {}", size);
@@ -5577,7 +6402,7 @@ mod tests {
         let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
 
         let out = std::env::temp_dir().join("verbosec_test_enrich");
-        compile_native(&program, "enriched", out.to_str().unwrap())
+        compile_native(&program, "enriched", out.to_str().unwrap(), false, false)
             .expect("native compile of match_result enrich should succeed");
         let size = fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
         assert!(size > 500 && size < 2_500, "unexpected binary size: {}", size);
@@ -5601,7 +6426,7 @@ mod tests {
         let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
 
         let out = std::env::temp_dir().join("verbosec_test_fullname");
-        compile_native(&program, "compose_greeting", out.to_str().unwrap())
+        compile_native(&program, "compose_greeting", out.to_str().unwrap(), false, false)
             .expect("native compile of record-text-from-concat should succeed");
         let size = fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
         assert!(size > 500 && size < 2_500, "unexpected binary size: {}", size);
@@ -5622,7 +6447,7 @@ mod tests {
         let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
 
         let out = std::env::temp_dir().join("verbosec_test_roster");
-        compile_native(&program, "roster_line", out.to_str().unwrap())
+        compile_native(&program, "roster_line", out.to_str().unwrap(), false, false)
             .expect("native compile of text-fold rule should succeed");
         let size = fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
         assert!(size > 500 && size < 2_500, "unexpected binary size: {}", size);
@@ -5643,7 +6468,7 @@ mod tests {
         let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
 
         let out = std::env::temp_dir().join("verbosec_test_greeting_line");
-        compile_native(&program, "greeting_line", out.to_str().unwrap())
+        compile_native(&program, "greeting_line", out.to_str().unwrap(), false, false)
             .expect("native compile of output-text rule should succeed");
         let size = fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
         assert!(size > 300 && size < 2_000, "unexpected binary size: {}", size);
@@ -5665,7 +6490,7 @@ mod tests {
         let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
 
         let out = std::env::temp_dir().join("verbosec_test_greeting_2hb");
-        compile_native(&program, "greeting", out.to_str().unwrap())
+        compile_native(&program, "greeting", out.to_str().unwrap(), false, false)
             .expect("native compile of Call-in-concat-arg should succeed");
         let size = fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
         assert!(size > 500 && size < 2_500, "unexpected binary size: {}", size);
@@ -5685,7 +6510,7 @@ mod tests {
         let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
 
         let out = std::env::temp_dir().join("verbosec_test_log_via_helper");
-        compile_native(&program, "log_alert", out.to_str().unwrap())
+        compile_native(&program, "log_alert", out.to_str().unwrap(), false, false)
             .expect("native compile of reaction with text-call content should succeed");
         let size = fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
         assert!(size > 400 && size < 2_000, "unexpected binary size: {}", size);
@@ -5707,7 +6532,7 @@ mod tests {
         let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
 
         let out = std::env::temp_dir().join("verbosec_test_name_line");
-        compile_native(&program, "name_line", out.to_str().unwrap())
+        compile_native(&program, "name_line", out.to_str().unwrap(), false, false)
             .expect("native compile of text-returning call should succeed");
         let size = fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
         assert!(size > 300 && size < 2_000, "unexpected binary size: {}", size);
@@ -5728,7 +6553,7 @@ mod tests {
         let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
 
         let out = std::env::temp_dir().join("verbosec_test_audit_user");
-        compile_native(&program, "audit_suspicious", out.to_str().unwrap())
+        compile_native(&program, "audit_suspicious", out.to_str().unwrap(), false, false)
             .expect("native compile of text-field-in-concat reaction should succeed");
         let size = fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
         assert!(size > 500 && size < 2_000, "unexpected binary size: {}", size);
@@ -5746,7 +6571,7 @@ mod tests {
         let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
 
         let out = std::env::temp_dir().join("verbosec_test_classify_invoice");
-        compile_native(&program, "classify_invoice", out.to_str().unwrap())
+        compile_native(&program, "classify_invoice", out.to_str().unwrap(), false, false)
             .expect("native compile of record-output rule should succeed");
         let size = fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
         // Two record arms + itoa + multiple static-write syscalls — ~1 KB.
@@ -5767,7 +6592,7 @@ mod tests {
         let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
 
         let out = std::env::temp_dir().join("verbosec_test_classify_tier");
-        compile_native(&program, "classify_tier", out.to_str().unwrap())
+        compile_native(&program, "classify_tier", out.to_str().unwrap(), false, false)
             .expect("native compile of Result(text, text) rule should succeed");
         let size = fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
         assert!(size > 300 && size < 2_000, "unexpected binary size: {}", size);
@@ -5786,7 +6611,7 @@ mod tests {
         let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
 
         let out = std::env::temp_dir().join("verbosec_test_validate_purchase");
-        compile_native(&program, "validate_purchase", out.to_str().unwrap())
+        compile_native(&program, "validate_purchase", out.to_str().unwrap(), false, false)
             .expect("native compile of Result(number, text) rule should succeed");
         let size = fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
         // Ballpark — concat machinery + itoa + stderr newline = ~700 B.
@@ -5807,7 +6632,7 @@ mod tests {
         let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
 
         let out = std::env::temp_dir().join("verbosec_test_audit_dynamic");
-        compile_native(&program, "audit_suspicious", out.to_str().unwrap())
+        compile_native(&program, "audit_suspicious", out.to_str().unwrap(), false, false)
             .expect("native compile of dynamic-content reaction should succeed");
         let size = fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
         // Slightly larger than the static version due to the concat machinery
@@ -5829,7 +6654,7 @@ mod tests {
 
         // Write the ELF to a temp path; assert the file is non-empty.
         let out = std::env::temp_dir().join("verbosec_test_audit_simple");
-        compile_native(&program, "audit_suspicious", out.to_str().unwrap())
+        compile_native(&program, "audit_suspicious", out.to_str().unwrap(), false, false)
             .expect("native compile of reaction should succeed");
         let size = fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
         assert!(size > 200, "expected a non-trivial ELF, got {} bytes", size);
@@ -5952,5 +6777,47 @@ mod tests {
         let mut code = vec![0x50, 0x59]; // push rax; pop rcx
         peephole_optimize(&mut code);
         assert_eq!(code, vec![0x50, 0x59]); // unchanged — different registers
+    }
+
+    #[test]
+    fn stdin_prologue_validates_and_produces_correct_size() {
+        // The stdin prologue should emit well-formed x86-64 that passes
+        // the validator, and its size should be in the expected range
+        // (~170 bytes for the tokenizer + copy logic).
+        let mut code = Vec::new();
+        emit_stdin_prologue(&mut code);
+        assert!(code.len() > 100 && code.len() < 300,
+            "unexpected stdin prologue size: {} bytes", code.len());
+        crate::validate_x86::validate_code(&code)
+            .expect("stdin prologue should pass x86-64 validation");
+    }
+
+    #[test]
+    fn stdin_binary_compiles_with_larger_size() {
+        use std::fs;
+        // A rule compiled with stdin=true should produce a valid binary
+        // that is larger than the argv version by ~170 bytes (the prologue).
+        let src = std::fs::read_to_string("examples/invoices.verbose")
+            .expect("examples/invoices.verbose");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let out_argv = std::env::temp_dir().join("verbosec_test_stdin_argv");
+        let out_stdin = std::env::temp_dir().join("verbosec_test_stdin_stdin");
+
+        compile_native(&program, "important_invoice", out_argv.to_str().unwrap(), false, false)
+            .expect("argv compile");
+        compile_native(&program, "important_invoice", out_stdin.to_str().unwrap(), true, false)
+            .expect("stdin compile");
+
+        let size_argv = fs::metadata(&out_argv).map(|m| m.len()).unwrap_or(0);
+        let size_stdin = fs::metadata(&out_stdin).map(|m| m.len()).unwrap_or(0);
+        assert!(size_stdin > size_argv, "stdin binary should be larger");
+        let diff = size_stdin - size_argv;
+        assert!(diff > 100 && diff < 300,
+            "prologue overhead should be 100-300 bytes, got {}", diff);
+
+        let _ = fs::remove_file(out_argv);
+        let _ = fs::remove_file(out_stdin);
     }
 }

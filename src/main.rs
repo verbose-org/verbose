@@ -54,6 +54,8 @@ fn main() {
         eprintln!("  --emit-rust                        Print generated Rust source to stdout");
         eprintln!("  --compile <output>                 Compile to a standalone binary via rustc");
         eprintln!("  --native <output>                  Compile to native x86-64 ELF (no dependencies)");
+        eprintln!("  --native <output> --stdin           Native ELF that reads input from stdin");
+        eprintln!("  --native <output> --stream          Streaming: reads stdin line by line (long-running)");
         eprintln!("  --wasm <output>                    Compile to WebAssembly module (.wasm)");
         process::exit(2);
     }
@@ -148,7 +150,7 @@ fn main() {
         });
 
         let native_path = "/tmp/verbose_bench_native";
-        let native_size = native::compile_native(&program, &bench_rule, native_path).ok().and_then(|()| {
+        let native_size = native::compile_native(&program, &bench_rule, native_path, false, false).ok().and_then(|()| {
             let s = std::fs::metadata(native_path).map(|m| m.len()).ok();
             let _ = std::fs::remove_file(native_path);
             s
@@ -215,17 +217,20 @@ fn main() {
                 .unwrap_or_default()
         });
         // Multi-rule: "rule1,rule2,..." compiles all into one binary.
+        let native_stdin = args.iter().any(|a| a == "--stdin");
+        let native_stream = args.iter().any(|a| a == "--stream");
         let rule_names: Vec<&str> = native_rule_str.split(',').collect();
         let compile_result = if rule_names.len() > 1 {
-            native::compile_native_multi(&program, &rule_names, &output)
+            native::compile_native_multi(&program, &rule_names, &output, native_stdin, native_stream)
         } else {
-            native::compile_native(&program, &rule_names[0], &output)
+            native::compile_native(&program, &rule_names[0], &output, native_stdin || native_stream, native_stream)
         };
         let native_rule = &native_rule_str; // for display
         match compile_result {
             Ok(()) => {
                 let size = std::fs::metadata(&output).map(|m| m.len()).unwrap_or(0);
-                println!("native: {} -> {} ({} bytes, rule '{}')", path, output, size, native_rule);
+                let mode = if native_stream { "stream" } else if native_stdin { "stdin" } else { "argv" };
+                println!("native: {} -> {} ({} bytes, rule '{}', input: {})", path, output, size, native_rule, mode);
                 // Report exploited hints
                 if let Some(rule) = program.items.iter().find_map(|i| match i {
                     ast::Item::Rule(r) if r.name == *native_rule => Some(r),
@@ -260,7 +265,7 @@ fn main() {
             }).unwrap_or_default()
         });
         let tmp = "/tmp/verbose_disasm_tmp";
-        match native::compile_native(&program, &disasm_rule, tmp) {
+        match native::compile_native(&program, &disasm_rule, tmp, false, false) {
             Ok(()) => {
                 let size = fs::metadata(tmp).map(|m| m.len()).unwrap_or(0);
                 println!("native: {} bytes, rule '{}'\n", size, disasm_rule);

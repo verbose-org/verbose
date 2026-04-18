@@ -393,6 +393,16 @@ fn decode_instruction_length(code: &[u8], pos: usize) -> Option<usize> {
             i += modrm_length(code, i)?;
             Some(i - pos)
         }
+        // MOV r8, r/m8 (8A) — e.g. mov al, [rcx]
+        0x8A => {
+            i += modrm_length(code, i)?;
+            Some(i - pos)
+        }
+        // CMP AL, imm8 (3C) — e.g. cmp al, 0x20 (whitespace check)
+        0x3C => {
+            if i >= code.len() { return None; }
+            Some(i + 1 - pos)
+        }
 
         _ => None, // Unknown opcode
     }

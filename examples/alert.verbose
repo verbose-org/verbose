@@ -1,0 +1,91 @@
+@verbose 0.1.0
+
+-- Streaming alert filter: reads events line by line, outputs true/false.
+-- Designed for --stream mode: tail -f events.log | ./alert_filter
+-- Each input line: severity source (e.g. "3 auth" or "1 scheduler")
+
+concept Event
+  @intention: "An event has a severity level and a source name"
+  @source: alert.intent:1
+
+  fields:
+    severity : number [0, 4]
+    source   : text [..32]
+
+
+rule is_critical
+  @intention: "An event is critical when its severity is 3 or higher"
+  @source: alert.intent:2
+
+  input:
+    e : Event
+
+  output:
+    critical : bool
+
+  logic:
+    critical = e.severity >= 3
+
+  proofs:
+    purity:
+      reads   : [e.severity]
+      writes  : []
+      calls   : []
+      verdict : pure
+    termination:
+      form  : constant_bound
+      bound : 1
+    determinism:
+      form : total
+
+
+rule watched_source
+  @intention: "An event is from a watched source"
+  @source: alert.intent:3
+
+  input:
+    e : Event
+
+  output:
+    watched : bool
+
+  logic:
+    watched = e.source == "auth" or e.source == "payment"
+
+  proofs:
+    purity:
+      reads   : [e.source]
+      writes  : []
+      calls   : []
+      verdict : pure
+    termination:
+      form  : constant_bound
+      bound : 3
+    determinism:
+      form : total
+
+
+rule should_alert
+  @intention: "An alert is triggered when the event is critical and from a watched source"
+  @source: alert.intent:4
+
+  input:
+    e : Event
+
+  output:
+    alert : bool
+
+  logic:
+    alert = is_critical(e) and watched_source(e)
+
+  proofs:
+    purity:
+      reads   : [e]
+      writes  : []
+      calls   : [is_critical, watched_source]
+      verdict : pure
+    termination:
+      form  : constant_bound
+      bound : 5
+    determinism:
+      form : total

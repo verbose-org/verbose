@@ -1,4 +1,4 @@
-# Native stdin reader — design notes for next session
+# Native stdin reader — design notes (IMPLEMENTED)
 
 ## Goal
 `--stdin` flag produces a native binary that reads whitespace-separated tokens
@@ -50,7 +50,6 @@ Start with the SIMPLEST case: `echo "42" | ./bin` where bin is a scalar
 number-output rule. Verify the output matches `./bin 42`. Then escalate to
 multi-field, multi-record, text fields.
 
-## Prerequisite
-The x86 decoder (validate_x86) doesn't know about `cmp al, imm8` (0x3C) — it
-will warn on the tokenizer's whitespace checks. Add 0x3C to the decoder before
-the stdin prologue ships, to avoid false positives.
+## Prerequisite (DONE)
+The x86 decoder (validate_x86) now knows `cmp al, imm8` (0x3C) and
+`mov r8, r/m8` (0x8A). Added before the stdin prologue shipped.

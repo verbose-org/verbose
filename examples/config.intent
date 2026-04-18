@@ -1,0 +1,8 @@
+Server Configuration Validator
+
+1. A server config has a maximum connection count, a log level, a timeout in seconds, and a debug flag (0 or 1).
+2. The connection limit is valid when it is between 1 and 10000; accepted with the value, rejected with "max_conn out of range".
+3. The log level is valid when it is one of "debug", "info", "warn", or "error"; accepted with the level, rejected with "invalid log_level".
+4. The timeout is valid when it is between 1 and 86400; accepted with the value, rejected with "timeout out of range".
+5. A config is safe when the connection limit is at most 1000 and the timeout is at most 300.
+6. The adjusted timeout is the validated timeout with a 10% safety margin added; if the timeout is invalid, the rejection reason is propagated unchanged.

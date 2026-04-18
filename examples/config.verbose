@@ -1,0 +1,144 @@
+@verbose 0.1.0
+
+-- Config validator: Result types, text comparison, match_result composition.
+-- Validates a server configuration against declared constraints.
+
+concept ServerConfig
+  @intention: "A server config has connection limit, log level, timeout, and debug flag"
+  @source: config.intent:1
+
+  fields:
+    max_conn  : number [1, 100000]
+    log_level : text [..16]
+    timeout   : number [0, 86400]
+    debug     : number [0, 1]
+
+
+rule valid_connections
+  @intention: "Connection limit is valid between 1 and 10000"
+  @source: config.intent:2
+
+  input:
+    c : ServerConfig
+
+  output:
+    r : Result(number, text)
+
+  logic:
+    r = if c.max_conn >= 1 and c.max_conn <= 10000 then Ok(c.max_conn) else Err("max_conn out of range")
+
+  proofs:
+    purity:
+      reads   : [c.max_conn]
+      writes  : []
+      calls   : []
+      verdict : pure
+    termination:
+      form  : constant_bound
+      bound : 6
+    determinism:
+      form : total
+
+
+rule valid_log_level
+  @intention: "Log level must be debug, info, warn, or error"
+  @source: config.intent:3
+
+  input:
+    c : ServerConfig
+
+  output:
+    r : Result(text, text)
+
+  logic:
+    r = if c.log_level == "debug" or c.log_level == "info" or c.log_level == "warn" or c.log_level == "error" then Ok(c.log_level) else Err("invalid log_level")
+
+  proofs:
+    purity:
+      reads   : [c.log_level]
+      writes  : []
+      calls   : []
+      verdict : pure
+    termination:
+      form  : constant_bound
+      bound : 10
+    determinism:
+      form : total
+
+
+rule valid_timeout
+  @intention: "Timeout is valid between 1 and 86400"
+  @source: config.intent:4
+
+  input:
+    c : ServerConfig
+
+  output:
+    r : Result(number, text)
+
+  logic:
+    r = if c.timeout >= 1 and c.timeout <= 86400 then Ok(c.timeout) else Err("timeout out of range")
+
+  proofs:
+    purity:
+      reads   : [c.timeout]
+      writes  : []
+      calls   : []
+      verdict : pure
+    termination:
+      form  : constant_bound
+      bound : 6
+    determinism:
+      form : total
+
+
+rule safe_config
+  @intention: "A config is safe when max_conn <= 1000 and timeout <= 300"
+  @source: config.intent:5
+
+  input:
+    c : ServerConfig
+
+  output:
+    safe : bool
+
+  logic:
+    safe = c.max_conn <= 1000 and c.timeout <= 300
+
+  proofs:
+    purity:
+      reads   : [c.max_conn, c.timeout]
+      writes  : []
+      calls   : []
+      verdict : pure
+    termination:
+      form  : constant_bound
+      bound : 3
+    determinism:
+      form : total
+
+
+rule adjusted_timeout
+  @intention: "Validated timeout with 10% safety margin; rejects propagated"
+  @source: config.intent:6
+
+  input:
+    c : ServerConfig
+
+  output:
+    r : Result(number, text)
+
+  logic:
+    r = match_result(valid_timeout(c), t => Ok(t + t * 10 / 100), reason => Err(reason))
+
+  proofs:
+    purity:
+      reads   : [c]
+      writes  : []
+      calls   : [valid_timeout]
+      verdict : pure
+    termination:
+      form  : constant_bound
+      bound : 10
+    determinism:
+      form : total

@@ -1,0 +1,5 @@
+[
+  {"max_conn": 500, "log_level": "warn", "timeout": 60, "debug": 0},
+  {"max_conn": 50000, "log_level": "info", "timeout": 30, "debug": 1},
+  {"max_conn": 100, "log_level": "verbose", "timeout": 0, "debug": 0}
+]

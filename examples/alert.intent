@@ -1,0 +1,6 @@
+Streaming Event Alert Filter
+
+1. An event has a severity (0=debug, 1=info, 2=warn, 3=error, 4=fatal) and a source name.
+2. An event is critical when its severity is 3 or higher.
+3. An event is from a watched source when its source is "auth" or "payment".
+4. An alert is triggered when the event is critical and from a watched source.

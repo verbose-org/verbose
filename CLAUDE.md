@@ -72,6 +72,14 @@ examples/
   payroll.*        Phase 3: four rules on the same input — map to Record (~670 B), filter (~670 B), map to number (~455 B), map to text (~410 B).
                    Phase 4: two reductions on the same input — sum (~486 B), count (~532 B).
                    (purchase.verbose::discounted_purchase compiles to ~750 bytes via Phase 2D match_result inlining)
+  logs.*           Log analyzer — event stream analysis with count/sum/fold/all/any (5 rules, 5 compile natively);
+                   multi-rule stdin binary: 4 metrics in 2233 B. Phase 6 enabled health_score.
+  config.*         Config validator — Result(number,text), Result(text,text), text ==, match_result composition,
+                   cross-field bool constraint (5 rules, 5 compile natively);
+                   multi-rule stdin binary: 5 validations in 2929 B.
+  alert.*          Streaming event filter — --stream mode, reads events line by line,
+                   filters by severity + source. 772-byte long-running process.
+                   Usage: tail -f events.log | ./alert_filter
   demo.html        Browser demo (WASM)
 
 tools/
@@ -102,6 +110,7 @@ tools/
 - Reactions: declared side effects with trigger rules; effects today are `print` (to stdout) and `append_file "path" content` (to a file). Path is a string literal at parse time — dynamic paths are refused so the auditor reads every file the program can ever touch.
 - String escapes: `\n`, `\t`, `\\`, `\"` — closed set, unknown escape is a lex error (no silent pass-through for typos).
 - Three backends: interpreter (--run), Rust transpiler (--compile), native x86-64 (--native), WASM (--wasm)
+- Input modes: argv (default), one-shot stdin (--stdin), streaming line-by-line (--stream)
 
 ## Writing .intent Prose
 
@@ -162,6 +171,10 @@ Tracking what native emits today, what it still rejects, and the design rules th
 | 4 | `output: number` with `fold`/`sum`/`count`/`min`/`max` at the top level — inner loop accumulates into a single stack slot, emits the final value on stdout once per input record. First emitter with cross-iteration state; no arena (the accumulator is one i64). See "Phase 4 design (locked)" below. | ~490–530 B | `payroll.verbose::total_salaries` (sum, 486 B) / `::high_earner_count` (count, 532 B) |
 | 5a | `output: text` with a per-record body — literal, input text field, or `concat(...)`. One `write` to stdout + newline per input record; no accumulator, no state carried across iterations. Routes to `emit_text_program`, which reuses `emit_text_write_to_fd` (already serving Phase 2B's Ok-text arm). Fold-over-collection to text is Phase 5b. | ~320 B (literal) / ~330 B (field) / ~560 B (concat) | `greeting_line.verbose` (concat, 564 B) |
 | 5b | `output: text` via top-level `fold` — appends into a text accumulator over a collection. Body is strictly append-only: `Concat(Ident(acc), ...rest)` with `acc` absent from `rest`. Two-pass emission (pass 1 sums per-element static + `strlen` per text-field arg into rax; pass 2 fills the buffer). `mov r9, rsp; sub rsp, rax` reserves, `mov rsp, r9` frees. See "Phase 5b design (locked)" below. | ~700 B | `roster.verbose::roster_line` (708 B) |
+
+| 6 | Scalar output (`number`/`bool`) with embedded quantifiers — `if all(xs, p) then X else if any(xs, p) then Y else Z`. Quantifiers are extracted from the expression tree, desugared to folds, and computed in a **single pass** with one accumulator slot per fold. After the inner loop, the remaining scalar expression is evaluated against the fold results. Multi-accumulator design means N quantifiers = 1 pass, not N passes. | ~700 B | `logs.verbose::health_score` (702 B) / `report.verbose::risk_score` (702 B) |
+| stdin | `--stdin` flag prepends a stdin reader prologue (~173 B) that reads whitespace-separated tokens from fd 0, tokenizes, and builds an argc/argv layout on the stack so the rule prologue works unchanged. Enables `echo "data" \| ./binary` and `./binary < file.txt`. Adds ~173 B overhead to any phase's binary. Design in `docs/stdin-reader-design.md`. | +173 B | any example with `--stdin` |
+| stream | `--stream` flag wraps the rule code in a line-by-line read loop. Reads ONE line from stdin per iteration (byte-by-byte until `\n`), tokenizes, processes, loops. On EOF, exits cleanly. First long-running Verbose binary. Not supported with SIMD-vectorized or parallel rules. | ~770+ B | `alert.verbose::should_alert` (772 B) |
 
 *Locked designs for each phase (3, 4, 5b, 2F, 2G, 2H-b) are in [docs/native-designs.md](docs/native-designs.md). They're frozen after implementation — consult them for rationale, not for the current state.*
 
@@ -239,10 +252,14 @@ cargo run -- examples/collections.verbose --run client_blocked --input examples/
 cargo run -- examples/report.verbose --run total_revenue --input examples/report.json --json  # JSON output
 cargo run -- examples/business.verbose --compile /tmp/business                      # transpile to Rust
 cargo run -- examples/business.verbose --native /tmp/biz --run critical_invoice     # native x86-64
+cargo run -- examples/invoices.verbose --native /tmp/inv --run important_invoice --stdin  # native, reads stdin
+echo "15000" | /tmp/inv                                                            # → true
+cargo run -- examples/alert.verbose --native /tmp/alert --run should_alert --stream  # streaming
+printf "3 auth\n1 web\n" | /tmp/alert                                              # → true\nfalse
 cargo run -- examples/invoices.verbose --wasm /tmp/rule.wasm --run important_invoice # WASM
 cargo run -- examples/invoices.verbose --benchmark --run important_invoice          # compare all backends
 cargo run -- --demo-http /tmp/server                                                 # HTTP server demo
-cargo test                                                                          # 84 tests
+cargo test                                                                          # 161 tests
 make demo                                                                           # full demo
 ```
 
