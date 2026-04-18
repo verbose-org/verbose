@@ -351,10 +351,12 @@ fn decode_instruction_length(code: &[u8], pos: usize) -> Option<usize> {
             Some(i + 1 - pos)
         }
         // ALU r/m, imm32 (81 /r)
+        // ALU r/m, imm32 (81 /r) — with 66h prefix, imm16
         0x81 => {
             i += modrm_length(code, i)?;
-            if i + 4 > code.len() { return None; }
-            Some(i + 4 - pos)
+            let imm_size = if has_66 { 2 } else { 4 };
+            if i + imm_size > code.len() { return None; }
+            Some(i + imm_size - pos)
         }
         // Shift r/m, imm8 (C1 /r)
         0xC1 => {

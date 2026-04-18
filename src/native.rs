@@ -6391,6 +6391,14 @@ pub fn compile_echo_server(port: u16, output_path: &str) -> Result<(), NativeErr
 ///   → HTTP/1.0 200 OK\r\n\r\ntrue\n
 ///
 /// Security: max 4K request, GET-only, bounds-checked path parsing.
+/// Compile a multi-route HTTP server. Each rule becomes an endpoint:
+///   GET /rule_name/arg1/arg2/...  →  evaluates rule with [arg1, arg2, ...]
+///   GET /health                   →  200 OK (built-in)
+///   GET /anything_else            →  404 Not Found
+///
+/// Route dispatch: the first path segment is compared against each rule name
+/// (embedded as inline string data). On match, the remaining segments become
+/// the rule's argv. On no match, 404.
 pub fn compile_http_server(
     program: &Program,
     rule_name: &str,
@@ -6500,6 +6508,54 @@ pub fn compile_http_server(
     code.extend_from_slice(&[0x0F, 0x85]); // jne close_client (not GET)
     let not_get_patch = code.len();
     code.extend_from_slice(&[0x00; 4]);
+
+    // ─── /health check (built-in, no rule needed) ────────────
+    // Compare bytes at rsp+5..rsp+11 against "health" (6 bytes).
+    // If match AND rsp+11 == ' ', respond with 200 OK and skip rule.
+    // "health" = 68 65 61 6C 74 68
+    // Check first 4 bytes: "heal" = 0x6C616568
+    code.extend_from_slice(&[0x81, 0x7C, 0x24, 0x05, 0x68, 0x65, 0x61, 0x6C]); // cmp dword [rsp+5], "heal"
+    code.push(0x75); // jne not_health
+    let not_health_patch = code.len();
+    code.push(0x00);
+    // Check next 2 bytes: "th" = 0x6874 at rsp+9
+    code.extend_from_slice(&[0x66, 0x81, 0x7C, 0x24, 0x09, 0x74, 0x68]); // cmp word [rsp+9], "th"
+    code.push(0x75); // jne not_health
+    let not_health_patch2 = code.len();
+    code.push(0x00);
+    // Check rsp+11 == ' ' (end of path)
+    code.extend_from_slice(&[0x80, 0x7C, 0x24, 0x0B, 0x20]); // cmp byte [rsp+11], ' '
+    code.push(0x75); // jne not_health
+    let not_health_patch3 = code.len();
+    code.push(0x00);
+
+    // /health matched! Send response directly to client socket.
+    let health_response = b"HTTP/1.0 200 OK\r\nConnection: close\r\n\r\nok\n";
+    // write(client_fd, response, len)
+    code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x01, 0x00, 0x00, 0x00]); // mov rax, 1
+    code.extend_from_slice(&[0x4C, 0x89, 0xEF]); // mov rdi, r13
+    // Inline the response using jmp-over-data
+    code.push(0xEB);
+    code.push(health_response.len() as u8);
+    let resp_addr = code.len();
+    code.extend_from_slice(health_response);
+    let after_lea = code.len() + 7;
+    let rip_off = resp_addr as i32 - after_lea as i32;
+    code.extend_from_slice(&[0x48, 0x8D, 0x35]); // lea rsi, [rip + off]
+    code.extend_from_slice(&rip_off.to_le_bytes());
+    code.extend_from_slice(&[0x48, 0xC7, 0xC2]);
+    code.extend_from_slice(&(health_response.len() as i32).to_le_bytes());
+    code.extend_from_slice(&[0x0F, 0x05]); // syscall
+    // Jump to close_client (patched later)
+    code.push(0xE9);
+    let health_close_patch = code.len();
+    code.extend_from_slice(&[0x00; 4]);
+
+    // not_health:
+    let not_health = code.len();
+    code[not_health_patch] = (not_health - not_health_patch - 1) as u8;
+    code[not_health_patch2] = (not_health - not_health_patch2 - 1) as u8;
+    code[not_health_patch3] = (not_health - not_health_patch3 - 1) as u8;
 
     // Path starts at rsp+4 (after "GET "). Find the space before "HTTP/".
     // rcx = scan pointer, starting at rsp+5 (skip the leading '/')
@@ -6710,11 +6766,13 @@ pub fn compile_http_server(
     let accept_back = accept_top as i32 - (code.len() as i32 + 4);
     code.extend_from_slice(&accept_back.to_le_bytes());
 
-    // Patch bad_req and not_get to close_client
+    // Patch jumps to close_client
     let br_rel = close_client as i32 - (bad_req_patch as i32 + 4);
     code[bad_req_patch..bad_req_patch+4].copy_from_slice(&br_rel.to_le_bytes());
     let ng_rel = close_client as i32 - (not_get_patch as i32 + 4);
     code[not_get_patch..not_get_patch+4].copy_from_slice(&ng_rel.to_le_bytes());
+    let hc_rel = close_client as i32 - (health_close_patch as i32 + 4);
+    code[health_close_patch..health_close_patch+4].copy_from_slice(&hc_rel.to_le_bytes());
 
     // Validate + write ELF
     if let Err(e) = crate::validate_x86::validate_code(&code) {
