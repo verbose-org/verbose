@@ -6,6 +6,62 @@ Entries are shared authorship — the human leads, the AI documents what was sai
 
 ---
 
+## 2026-04-19 — Phase B framing: OS is the supervisor, Verbose ships no multiplexer
+
+### Context
+
+While planning Phase B (SIEM flagship demo), the AI proposed a "supervisor" process that would multiplex an event stream to N rule binaries — framed as a *moyen terme* between monolithic rule binaries and Falco-style "big daemon + rules.yaml". The creator pushed back with five words: *"sécurité first"*. That's the correct rejection and this entry locks the reasoning.
+
+### Why the supervisor proposal was wrong
+
+A Verbose-shipped supervisor would have:
+- Sat at the **attack-surface frontier** between event source and verified rules
+- Necessarily been non-Verbose code (Rust/C + libc) to handle IPC, process management, routing, buffering, and dynamic rule loading
+- Introduced: pipes, queues, signal handling, spawn/exec, queue overflow policies, discovery — each a C-sized attack surface
+- Made the verifier's guarantee partial: *"we verify each rule, but the thing orchestrating them is opaque"*
+
+CLAUDE.md already rules this out: *"forcing native to grow to 'completeness' would add a C-sized attack surface and defeat the point"*. The AI drifted because an adoption-friction concern was allowed to soften the security-first principle. Even surfacing the option was the drift — listing compromise options shifts the conversation's center of gravity.
+
+### The correct architecture
+
+Verbose ships **no supervisor**. Each rule is a standalone binary that reads `stdin` line-by-line and writes verdicts on `stdout` — already the shape of `alert.verbose --stream`, Phase 0 of the native backend. Orchestration is **delegated to the operator's audited tooling**:
+
+- `tail -f events.log | tee >(./rule_a.bin) >(./rule_b.bin) >(./rule_c.bin)` for demo
+- systemd services with `StandardInput=socket` for prod Unix
+- One-container-per-rule DaemonSets for Kubernetes
+- Each rule isolated by OS-provided primitives (seccomp, cgroups, namespaces)
+
+Bénéfices : zero new code in Verbose, zero new attack surface at the frontier, each rule independently auditable and independently compromis-able (no shared state), hot-swap via binary replacement (an audit-trail-generating event — feature, not friction).
+
+### Market corollary
+
+The "easy adoption" market (Falco-shaped: one big daemon, YAML rules hot-reloaded) is **not Verbose's market** — confirmed. That market already has good tools. Verbose targets users who value mechanical auditability enough to accept the operational friction of per-rule binaries: compliance-regulated environments, safety-critical detection, 10–50 rules that gate prod decisions rather than 3000 YAML rules consumed at scale. Narrower market, coherent with every other decision in the project.
+
+### Phase B, corrected shape
+
+Exactly as originally planned, stripped of the supervisor speculation:
+
+1. Pick **one** public Sigma rule (the first will be a basic login-failure detector for pedagogical clarity)
+2. Write the `.intent` (numbered sentences)
+3. Hand-write the `.verbose` (reads, calls, termination bound, overflow if applicable)
+4. Compile with `--native --stream`
+5. Pipe synthetic events: `cat events.log | ./rule.bin`
+6. Compare verdicts against what Sigma's spec says should match
+
+No multiplexer, no orchestration layer, no framework. One binary, one stream, one verdict per input line. If the pitch resonates after one rule, the next rules just reuse the same shape.
+
+### Decisions locked
+
+- Verbose will never ship a process that orchestrates rule binaries. Multiplexing is the OS's job.
+- When a future proposal involves "a Verbose process that manages other Verbose processes", refuse it at the pitch stage.
+- Adoption friction that can only be reduced by weakening audit guarantees is a friction we keep — it's consistent with Verbose's stated market.
+
+### Meta note for the AI
+
+The drift pattern here (proposing a compromised middle ground to address an adoption concern, rather than first checking whether the principle rules it out) is worth remembering for future exchanges. CLAUDE.md's filter — *"what attack surface does this add?"* — belongs **before** the ergonomics filter, not after. When a stated principle rules out a design, the right move is to skip that design entirely, not list it as an option.
+
+---
+
 ## 2026-04-19 — Code read, scope clarification, sanitization plan
 
 ### Context
