@@ -35,3 +35,45 @@ rule privileged_login_failure
       calls : []
     termination:
       bound : 7
+
+
+rule internal_source
+  @intention: "A source is internal when its IP is on the known-internal allowlist"
+  @source: priv_failure.intent:3
+
+  input:
+    e : WinSecurityEvent
+
+  output:
+    internal : bool
+
+  logic:
+    internal = e.source_ip == "192.168.1.1" or e.source_ip == "192.168.1.2"
+
+  proofs:
+    purity:
+      reads : [e.source_ip]
+      calls : []
+    termination:
+      bound : 3
+
+
+rule priv_failure_from_external
+  @intention: "An external privileged login failure combines a privileged failure with a source that is not internal"
+  @source: priv_failure.intent:4
+
+  input:
+    e : WinSecurityEvent
+
+  output:
+    alert : bool
+
+  logic:
+    alert = privileged_login_failure(e) and not internal_source(e)
+
+  proofs:
+    purity:
+      reads : [e]
+      calls : [privileged_login_failure, internal_source]
+    termination:
+      bound : 4

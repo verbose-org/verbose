@@ -1,2 +1,4 @@
 1. A Windows security event has an event ID, a target user name, and a source IP.
 2. A privileged login failure is a failed logon (event ID 4625) against a privileged account (Administrator, Guest, or krbtgt).
+3. A source is internal when its IP is on the known-internal allowlist (192.168.1.1 or 192.168.1.2).
+4. An external privileged login failure combines the two: a privileged login failure from a source that is not internal.
