@@ -806,25 +806,6 @@ fn check_purity(rule: &Rule, facts: &LogicFacts, errors: &mut Vec<VerifyError>) 
 
     match &rule.proofs.purity.verdict {
         PurityVerdict::Pure => {}
-        PurityVerdict::Impure => {
-            if declared_calls.is_empty() {
-                errors.push(VerifyError {
-                    context: ctx("purity.verdict"),
-                    message: "verdict 'impure' is inconsistent with empty calls".into(),
-                });
-            }
-        }
-        PurityVerdict::PureExcept(exceptions) => {
-            let exc_set = path_list_to_set(exceptions);
-            for c in &facts.calls {
-                if !exc_set.contains(c) {
-                    errors.push(VerifyError {
-                        context: ctx("purity.verdict"),
-                        message: format!("call '{}' not listed in pure_except(...)", c.join(".")),
-                    });
-                }
-            }
-        }
     }
 }
 
@@ -852,16 +833,6 @@ fn check_termination(rule: &Rule, errors: &mut Vec<VerifyError>) {
                 });
             }
         },
-        TerminationForm::VariableBound | TerminationForm::DecreasingRecursion => {
-            errors.push(VerifyError {
-                context: ctx("termination.form"),
-                message: format!(
-                    "termination form {:?} not supported by POC grammar",
-                    rule.proofs.termination.form
-                ),
-            });
-        }
-        TerminationForm::Unproven => {}
     }
 }
 
@@ -900,14 +871,6 @@ fn check_determinism(rule: &Rule, _facts: &LogicFacts, errors: &mut Vec<VerifyEr
             // 'total' is valid if all called rules are themselves deterministic.
             // For now we trust this — transitive determinism checking is a Phase 2 feature.
         }
-        DeterminismForm::Conditional => {
-            errors.push(VerifyError {
-                context: ctx("determinism.form"),
-                message: "'conditional' determinism requires 'hypotheses:' (not yet supported)"
-                    .into(),
-            });
-        }
-        DeterminismForm::Nondeterministic => {}
     }
 }
 
@@ -1863,7 +1826,8 @@ rule positives
       calls   : []
       verdict : pure
     termination:
-      form  : variable_bound
+      form  : constant_bound
+      bound : 3
     determinism:
       form : total
 "#;

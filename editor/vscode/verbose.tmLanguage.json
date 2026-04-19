@@ -41,7 +41,7 @@
       "name": "support.type.verbose"
     },
     "proof": {
-      "match": "\\b(purity|termination|determinism|reads|writes|calls|verdict|pure|impure|form|bound|constant_bound|total|conditional)\\b",
+      "match": "\\b(purity|termination|determinism|reads|calls|verdict|pure|form|bound|constant_bound|total)\\b",
       "name": "support.function.verbose"
     },
     "hint": {

@@ -55,12 +55,12 @@ rule rule_name
     purity:
       reads   : [var.field, ...]   -- every field accessed in logic
       calls   : [other_rule, ...]  -- every rule called in logic
-      verdict : pure               -- or: impure, pure_except(...)
+      verdict : pure               -- the only currently-supported verdict
     termination:
       form  : constant_bound
       bound : N                    -- count of operations in logic
     determinism:
-      form : total                 -- or: conditional, nondeterministic
+      form : total                 -- the only currently-supported determinism form
   hints:                           -- optional
     vectorizable : \"reason\"      -- if pure and no calls; the string explains WHY it is safe
     parallel     : \"reason\"      -- if each iteration is independent; the string explains why

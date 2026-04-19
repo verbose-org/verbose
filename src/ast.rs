@@ -263,8 +263,6 @@ pub struct Path {
 #[derive(Debug, Clone)]
 pub enum PurityVerdict {
     Pure,
-    PureExcept(Vec<Path>),
-    Impure,
 }
 
 #[derive(Debug, Clone)]
@@ -276,9 +274,6 @@ pub struct Termination {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TerminationForm {
     ConstantBound,
-    VariableBound,
-    DecreasingRecursion,
-    Unproven,
 }
 
 #[derive(Debug, Clone)]
@@ -289,6 +284,4 @@ pub struct Determinism {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeterminismForm {
     Total,
-    Conditional,
-    Nondeterministic,
 }

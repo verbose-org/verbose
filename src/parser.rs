@@ -822,22 +822,8 @@ impl Parser {
         let name = self.expect_ident_any()?;
         match name.as_str() {
             "pure" => Ok(PurityVerdict::Pure),
-            "impure" => Ok(PurityVerdict::Impure),
-            "pure_except" => {
-                self.expect_kind(TokenKind::LParen)?;
-                let mut items = Vec::new();
-                if !self.check_kind(&TokenKind::RParen) {
-                    items.push(self.parse_path()?);
-                    while self.check_kind(&TokenKind::Comma) {
-                        self.advance();
-                        items.push(self.parse_path()?);
-                    }
-                }
-                self.expect_kind(TokenKind::RParen)?;
-                Ok(PurityVerdict::PureExcept(items))
-            }
             _ => Err(self.error(&format!(
-                "unknown purity verdict '{}' (allowed: pure, pure_except(...), impure)",
+                "unknown purity verdict '{}' (allowed: pure)",
                 name
             ))),
         }
@@ -860,11 +846,8 @@ impl Parser {
                     let n = self.expect_ident_any()?;
                     form = Some(match n.as_str() {
                         "constant_bound" => TerminationForm::ConstantBound,
-                        "variable_bound" => TerminationForm::VariableBound,
-                        "decreasing_recursion" => TerminationForm::DecreasingRecursion,
-                        "unproven" => TerminationForm::Unproven,
                         _ => return Err(self.error(&format!(
-                            "unknown termination form '{}' (allowed: constant_bound, variable_bound, decreasing_recursion, unproven)",
+                            "unknown termination form '{}' (allowed: constant_bound)",
                             n
                         ))),
                     });
@@ -903,10 +886,8 @@ impl Parser {
                     let n = self.expect_ident_any()?;
                     form = Some(match n.as_str() {
                         "total" => DeterminismForm::Total,
-                        "conditional" => DeterminismForm::Conditional,
-                        "nondeterministic" => DeterminismForm::Nondeterministic,
                         _ => return Err(self.error(&format!(
-                            "unknown determinism form '{}' (allowed: total, conditional, nondeterministic)",
+                            "unknown determinism form '{}' (allowed: total)",
                             n
                         ))),
                     });
