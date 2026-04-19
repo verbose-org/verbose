@@ -427,7 +427,7 @@ If you've never seen assembly before, you just learned three instructions. That'
 
 This project started as an open question: *"If AI writes code now, do we still need languages designed for humans?"*
 
-A few hours later, the question had become a working compiler with verified proofs, four backends, SIMD optimization, and a 498-byte HTTP server.
+A few hours later, the question had become a working compiler with verified proofs, four backends, SIMD optimization, and a 498-byte HTTP server — the last item being a hand-emitted feasibility probe that proves the native backend *can* produce networked binaries at that size; describing network syscalls from within `.verbose` itself is a future phase (see `docs/known-gaps.md`).
 
 No spec committee. No funding. No team. One human with a vision, one AI that codes, and a question that turned out to have a very concrete answer.
 

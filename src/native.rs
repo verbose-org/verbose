@@ -5510,11 +5510,17 @@ fn extract_simple_gt(rule: &Rule) -> Option<i64> {
     None
 }
 
-/// Generate a minimal HTTP server binary — proof that the native backend
-/// can produce real networked applications, not just rule evaluators.
+/// Tier-3 native emitter feasibility probe (see docs/known-gaps.md).
+/// NO `.verbose` source is involved — the entire binary is hand-emitted by
+/// this Rust function writing x86-64 bytes directly. The output proves the
+/// native backend CAN produce a ~498-byte HTTP server with zero deps and
+/// pure syscalls; it does NOT prove that the language can yet describe one.
 ///
-/// The binary: socket → bind(8080) → listen → accept loop → write response → close
-/// ~800 bytes, zero dependencies, pure syscalls. No libc, no framework.
+/// The binary: socket → bind(9999) → listen → accept loop → write response → close
+/// ~498 bytes, no libc, no framework, hardcoded response body.
+///
+/// Long-term: collapse into tier 1 (described in `.verbose`) once Phase 7+
+/// introduces declarable network primitives.
 pub fn emit_http_demo(output_path: &str) -> Result<(), NativeError> {
     let mut code = Vec::new();
 
@@ -6233,9 +6239,14 @@ fn emit_stream_prologue(code: &mut Vec<u8>) -> usize {
     stream_top
 }
 
-/// Emit a standalone TCP echo server binary. No rules, no concepts — just
-/// raw x86-64 machine code that listens on the given port, accepts connections,
-/// and echoes received data back until the client disconnects.
+/// Tier-3 native emitter feasibility probe (see docs/known-gaps.md).
+/// NO `.verbose` source is involved — this Rust function writes x86-64 bytes
+/// directly, producing a ~358-byte standalone TCP echo server. Feasibility
+/// proof for socket/bind/accept/read/write syscalls; not a Verbose-described
+/// program.
+///
+/// Listens on the given port, accepts connections, echoes received data
+/// back until the client disconnects.
 ///
 /// Syscalls used: socket(41), bind(49), listen(50), accept(43),
 ///                read(0), write(1), close(3), exit(60).
@@ -6382,9 +6393,11 @@ pub fn compile_echo_server(port: u16, output_path: &str) -> Result<(), NativeErr
     Ok(())
 }
 
-/// Compile a rule into an HTTP server binary. Listens on the given port,
-/// parses GET request paths into rule arguments (split on '/'), evaluates
-/// the rule, and returns the result as an HTTP response.
+/// Tier-2 hybrid — rule from `.verbose`, network shell hardcoded
+/// (see docs/known-gaps.md). The rule logic is verified against its source;
+/// the HTTP plumbing around it (socket / bind / listen / accept / parse
+/// GET path / write response) is emitted by the hand-written Rust code
+/// below, NOT described in any `.verbose` file.
 ///
 /// Example: for a rule with 2 number fields,
 ///   curl http://localhost:8080/500/25

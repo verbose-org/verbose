@@ -258,7 +258,7 @@ cargo run -- examples/alert.verbose --native /tmp/alert --run should_alert --str
 printf "3 auth\n1 web\n" | /tmp/alert                                              # → true\nfalse
 cargo run -- examples/invoices.verbose --wasm /tmp/rule.wasm --run important_invoice # WASM
 cargo run -- examples/invoices.verbose --benchmark --run important_invoice          # compare all backends
-cargo run -- --demo-http /tmp/server                                                 # HTTP server demo
+cargo run -- --demo-http /tmp/server                                                 # HTTP server — tier-3 emitter probe, NOT in .verbose (see docs/known-gaps.md)
 cargo test                                                                          # 161 tests
 make demo                                                                           # full demo
 ```

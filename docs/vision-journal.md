@@ -6,6 +6,76 @@ The vision is the author's. These entries are written by the AI assistant under 
 
 ---
 
+## 2026-04-19 — Phase B kept; Phase 7+ (network-in-.verbose) locked as north star
+
+### Context
+
+While prepping Phase B's SIEM demo, the creator asked to verify whether
+Verbose already had a `.verbose` example for the HTTP server — he remembered
+having one, and the AI's two previous responses had drifted toward calling
+the existing 498-byte HTTP demo "proof that Verbose can describe anything".
+Verification revealed the existing `--demo-http` and `--echo-server` binaries
+are hand-emitted by Rust code in `src/native.rs` — they have **no `.verbose`
+source at all**. The `--http-server <file.verbose>` mode is hybrid: the rule
+logic is in `.verbose` and verified, but the network plumbing around it is
+hardcoded Rust emitting raw x86-64.
+
+### What this means
+
+The creator's vision is "everything the program does is declared in `.verbose`
+and mechanically verified". Network syscalls are the biggest remaining slice
+not yet describable. The existing probes prove the **native backend** can
+produce tiny network binaries (~500 B) — they don't prove the **language**
+can describe them. These are two different claims and the AI had been
+conflating them.
+
+### Decisions locked
+
+- **Phase B continues** (SIEM-style demo, SIEM rules compiled through the
+  regular tier-1 pipeline). Concrete, already shipping artifacts.
+- **Phase 7+ (declarable network primitives) is the north star.** Long-term
+  target: collapse tiers 2 and 3 into tier 1 so that `listen_tcp`, `accept`,
+  `read_until`, `write_bytes` are declared reactions with their own proofs,
+  and HTTP-server-in-.verbose stops being hardcoded Rust. Substantial scope:
+  new AST constructs, new verifier rules, new codegen paths, new test coverage.
+- **Not attacking Phase 7 now.** Phase B must deliver concrete proof-in-practice
+  before investing a month+ into the network-primitive design. Keeping the
+  compass visible without letting it divert current work.
+
+### Cleanup performed
+
+Three tiers of native output are now documented canonically in
+`docs/known-gaps.md` ("Three tiers of native output"). Every ambiguous mention
+across the repo has been updated to point there:
+
+- `src/native.rs`: doc comments on `emit_http_demo`, `compile_echo_server`,
+  and `compile_http_server` each state their tier and the scope boundary.
+- `src/main.rs`: flag handlers are labeled with their tier in inline comments;
+  the usage/help text now names each mode's tier so a first-time reader is
+  not misled.
+- `CLAUDE.md`: the `--demo-http` example in the "Running" section is tagged
+  as a tier-3 probe with a pointer to `known-gaps.md`.
+- `README.md`: the Origin section's "498-byte HTTP server" line is qualified
+  as a feasibility probe, not a Verbose-described program.
+- `Makefile`: the `http:` target prints a banner before running the probe so
+  anyone running `make http` sees the scope boundary immediately.
+
+No code was deleted — the probes are real capability proofs and should stay
+as they are, just labeled correctly. The goal is future sessions (AI or
+human) cannot accidentally read them as "HTTP server described in Verbose".
+
+### Meta note
+
+The drift pattern this exposes: when evidence is described ("498 B HTTP
+server") the AI tends to amplify the scope of what the evidence supports.
+The 498 B number is real; what it supports is "native emitter capability",
+not "language expressiveness". Future responses should separate "the backend
+can emit X" from "the `.verbose` language can describe X" — these are
+orthogonal claims and conflating them leads to overclaiming the scope Verbose
+has reached.
+
+---
+
 ## 2026-04-19 — Phase B framing: OS is the supervisor, Verbose ships no multiplexer
 
 ### Context

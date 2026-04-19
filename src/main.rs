@@ -28,7 +28,8 @@ fn main() {
         return;
     }
 
-    // Special demo mode: HTTP server
+    // Tier-3 native emitter probe: hardcoded HTTP server, no .verbose source.
+    // See docs/known-gaps.md "Three tiers of native output".
     if args.iter().any(|a| a == "--demo-http") {
         let output = find_flag(&args, "--demo-http").unwrap_or_else(|| "/tmp/verbose-http".into());
         match native::emit_http_demo(&output) {
@@ -46,7 +47,9 @@ fn main() {
         return;
     }
 
-    // HTTP rule server: --http-server <port> <file.verbose> --run <rule> <output>
+    // Tier-2 hybrid: .verbose rule wrapped in a hardcoded HTTP network shell.
+    // The rule is verified; the socket/bind/accept plumbing is emitted by
+    // hand-written Rust in native.rs (see docs/known-gaps.md).
     if args.iter().any(|a| a == "--http-server") {
         let port_str = find_flag(&args, "--http-server").unwrap_or_else(|| "8080".into());
         let port: u16 = port_str.parse().unwrap_or_else(|_| {
@@ -90,7 +93,8 @@ fn main() {
         return;
     }
 
-    // Standalone echo server — no .verbose file needed
+    // Tier-3 native emitter probe: standalone TCP echo server, no .verbose
+    // source (see docs/known-gaps.md).
     if let Some(port_str) = find_flag(&args, "--echo-server") {
         let port: u16 = port_str.parse().unwrap_or_else(|_| {
             eprintln!("invalid port: {}", port_str);
@@ -116,7 +120,9 @@ fn main() {
         eprintln!("  --native <output> --stdin           Native ELF that reads input from stdin");
         eprintln!("  --native <output> --stream          Streaming: reads stdin line by line (long-running)");
         eprintln!("  --wasm <output>                    Compile to WebAssembly module (.wasm)");
-        eprintln!("  --echo-server <port> <output>      TCP echo server (standalone, no .verbose needed)");
+        eprintln!("  --echo-server <port> <output>      TCP echo server — native emitter probe, NOT described in .verbose (see docs/known-gaps.md)");
+        eprintln!("  --demo-http <output>               HTTP server — native emitter probe, NOT described in .verbose (see docs/known-gaps.md)");
+        eprintln!("  --http-server <port> <.verbose> --run <rule>   HTTP server wrapping a verified rule (plumbing hardcoded; see docs/known-gaps.md)");
         process::exit(2);
     }
     let path = &args[1];

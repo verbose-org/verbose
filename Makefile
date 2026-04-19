@@ -42,6 +42,12 @@ report:
 	done
 
 http:
+	@echo "=== http target: tier-3 native emitter probe ==="
+	@echo "Note: the server below is HARDCODED in native.rs (Rust), NOT described"
+	@echo "      in any .verbose file. It proves the backend can emit tiny network"
+	@echo "      binaries; network-primitives-in-.verbose is a future phase."
+	@echo "      See docs/known-gaps.md 'Three tiers of native output'."
+	@echo ""
 	cargo run --quiet -- --demo-http /tmp/verbose-http
 	@echo "Starting server... Press Ctrl+C to stop."
 	/tmp/verbose-http
