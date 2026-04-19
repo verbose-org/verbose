@@ -2,7 +2,7 @@
 
 Chronological record of strategic thinking about what Verbose is for, who it's for, and why it might matter. Different from `design-lessons.md` (technical scars) and `known-gaps.md` (to-do): this is about *positioning, thesis, use cases, doubts*. Most recent entries on top.
 
-Entries are shared authorship — the human leads, the AI documents what was said and thought, both push back. The point is to keep the trail readable months later, including the wrong turns.
+The vision is the author's. These entries are written by the AI assistant under his direction — he leads the thinking, pushes back on drift, and holds the compass; the AI reformulates, explicates, and writes down what was said. When a reframing lands in these pages, it comes from his correction, not from AI synthesis. The point of the journal is to keep the trail readable months later, including the wrong turns the AI tried and he rejected.
 
 ---
 
