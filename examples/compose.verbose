@@ -6,7 +6,7 @@
 -- the caller had written the callee's expression directly.
 --
 -- Decomposition serves auditability: the verifier independently checks the
--- helper's proofs (purity, termination, determinism); the caller just
+-- helper's proofs (purity, termination); the caller just
 -- declares `calls: [display_name]` and inherits those properties.
 
 
@@ -37,12 +37,8 @@ rule display_name
     purity:
       reads   : [p.first, p.last]
       calls   : []
-      verdict : pure
     termination:
-      form  : constant_bound
       bound : 3
-    determinism:
-      form : total
 
 
 rule name_line
@@ -62,12 +58,8 @@ rule name_line
     purity:
       reads   : [p]
       calls   : [display_name]
-      verdict : pure
     termination:
-      form  : constant_bound
       bound : 3
-    determinism:
-      form : total
 
 
 rule greeting
@@ -87,9 +79,5 @@ rule greeting
     purity:
       reads   : [p, p.age]
       calls   : [display_name]
-      verdict : pure
     termination:
-      form  : constant_bound
       bound : 10
-    determinism:
-      form : total

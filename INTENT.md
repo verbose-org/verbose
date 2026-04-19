@@ -192,8 +192,7 @@ The declaration is optional — rules without `@layer` are unchecked. Opt in per
 When the prose does not fully specify a detail, the AI fills it in:
 
 - **Field ranges.** A sentence mentioning "amount" produces `amount : number` with a default range. If you care about the range, state it explicitly: *"amount, between 0 and 1 000 000"*.
-- **Termination.** The AI picks `constant_bound` with a guessed bound (the only currently-supported form). State *"bounded by at most N steps"* if the bound matters for your audit.
-- **Determinism.** Only `total` is currently supported — the AI emits it unconditionally.
+- **Termination.** The AI writes a `bound:` value (integer step count) the verifier checks against the logic's actual operation count. State *"bounded by at most N steps"* if the bound matters for your audit.
 - **Overflow.** The AI may add `overflow: [min, max]` when arithmetic justifies it. Read the generated `.verbose` if runtime overflow behavior matters to you.
 - **Hints.** The AI adds `vectorizable`, `parallel`, or `cache_result` when the logic shape supports them; each comes with a justification string the verifier cross-checks.
 

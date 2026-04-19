@@ -287,7 +287,7 @@ Phase 2G adds a single new arm to `emit_text_write_to_fd` that inlines a text-re
 - Callee's `logic.value` is a text_expr `emit_text_write_to_fd` handles (literal, field, concat, or recursively another Call satisfying these same restrictions — natural recursion, no depth limit needed).
 - Call arg list is exactly `[Ident(caller_input)]`.
 
-**Why this design holds security pillar #1:** zero new syscalls, zero new registers, zero new stack slots. The emitted machine code is byte-for-byte what the user could have written by hand as `concat(...)` directly. Inlining happens only at emission; the callee rule itself is still verified independently by the verifier against its own proofs (purity, termination, determinism) — the caller inherits those properties through the `calls: [callee_name]` declaration.
+**Why this design holds security pillar #1:** zero new syscalls, zero new registers, zero new stack slots. The emitted machine code is byte-for-byte what the user could have written by hand as `concat(...)` directly. Inlining happens only at emission; the callee rule itself is still verified independently by the verifier against its own proofs (purity, termination) — the caller inherits those properties through the `calls: [callee_name]` declaration.
 
 **What Phase 2G does NOT do** (deferred):
 - Cross-concept callees (mirror of the 2D restriction — needs real argument passing).

@@ -40,12 +40,8 @@ rule retirement_status
     purity:
       reads   : [w.employees]
       calls   : []
-      verdict : pure
     termination:
-      form  : constant_bound
       bound : 2
-    determinism:
-      form : total
 
 
 rule retirees
@@ -65,9 +61,5 @@ rule retirees
     purity:
       reads   : [w.employees]
       calls   : []
-      verdict : pure
     termination:
-      form  : constant_bound
       bound : 2
-    determinism:
-      form : total

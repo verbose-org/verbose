@@ -30,12 +30,8 @@ rule is_critical
     purity:
       reads   : [e.severity]
       calls   : []
-      verdict : pure
     termination:
-      form  : constant_bound
       bound : 1
-    determinism:
-      form : total
 
 
 rule watched_source
@@ -55,12 +51,8 @@ rule watched_source
     purity:
       reads   : [e.source]
       calls   : []
-      verdict : pure
     termination:
-      form  : constant_bound
       bound : 3
-    determinism:
-      form : total
 
 
 rule should_alert
@@ -80,9 +72,5 @@ rule should_alert
     purity:
       reads   : [e]
       calls   : [is_critical, watched_source]
-      verdict : pure
     termination:
-      form  : constant_bound
       bound : 5
-    determinism:
-      form : total

@@ -43,7 +43,7 @@ human intention (.intent)     "An invoice is overdue when it has more than 30 da
         │
 AI generates IR (.verbose)    rule + fields + proofs + hints
         │
-compiler verifies proofs      purity? termination? determinism? field access?
+compiler verifies proofs      purity? termination? field access?
         │
 compiler produces binary      interpreter, Rust transpiler, native x86-64, or WASM
 ```
@@ -82,12 +82,8 @@ rule client_blocked
     purity:
       reads   : [c.invoices]
       calls   : [invoice_overdue]
-      verdict : pure
     termination:
-      form  : constant_bound
       bound : 2
-    determinism:
-      form : total
 ```
 
 Compiler verifies and runs:
@@ -127,7 +123,7 @@ Same logic (`amount > 10000`), same input, same output:
 |---|---|---|
 | Binary size | 14,472 bytes | **589 bytes** (24x smaller) |
 | Dependencies | 3 shared libraries (libc) | **Zero** |
-| Proofs | None | Purity, termination, determinism |
+| Proofs | None | Purity, termination |
 | Overflow safety | Undefined behavior | Proven via interval arithmetic |
 | SIMD | Must analyze (may miss) | Declared + verified (`pcmpgtq`) |
 | Traceability | None | Every instruction → source intention |
@@ -187,9 +183,7 @@ If a declaration serves neither verification nor optimization, it doesn't belong
 | Purity reads | Declared reads == actual field accesses in AST |
 | Purity writes | Declared writes == actual mutations (must be empty for pure) |
 | Purity calls | Declared calls == actual rule invocations in AST |
-| Purity verdict | `pure` consistent with empty writes/calls |
 | Termination bound | Declared bound ≥ actual operation count |
-| Determinism | `total` consistent with call purity |
 | Source traceability | `@source: file:line` points to existing line |
 | Field existence | Accessed fields exist on the input concept |
 | Logic/output coherence | Logic target matches declared output name |

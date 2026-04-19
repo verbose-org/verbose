@@ -32,12 +32,8 @@ rule validate_purchase
     purity:
       reads   : [p.customer_age, p.amount]
       calls   : []
-      verdict : pure
     termination:
-      form  : constant_bound
       bound : 7
-    determinism:
-      form : total
 
 
 rule discounted_purchase
@@ -57,9 +53,5 @@ rule discounted_purchase
     purity:
       reads   : [p]
       calls   : [validate_purchase]
-      verdict : pure
     termination:
-      form  : constant_bound
       bound : 10
-    determinism:
-      form : total

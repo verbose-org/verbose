@@ -49,12 +49,8 @@ rule compute_bonuses
     purity:
       reads   : [w.employees]
       calls   : []
-      verdict : pure
     termination:
-      form  : constant_bound
       bound : 5
-    determinism:
-      form : total
 
 
 rule high_earners
@@ -74,12 +70,8 @@ rule high_earners
     purity:
       reads   : [w.employees]
       calls   : []
-      verdict : pure
     termination:
-      form  : constant_bound
       bound : 2
-    determinism:
-      form : total
 
 
 rule salaries
@@ -99,12 +91,8 @@ rule salaries
     purity:
       reads   : [w.employees]
       calls   : []
-      verdict : pure
     termination:
-      form  : constant_bound
       bound : 2
-    determinism:
-      form : total
 
 
 rule names
@@ -124,12 +112,8 @@ rule names
     purity:
       reads   : [w.employees]
       calls   : []
-      verdict : pure
     termination:
-      form  : constant_bound
       bound : 2
-    determinism:
-      form : total
 
 
 rule total_salaries
@@ -149,12 +133,8 @@ rule total_salaries
     purity:
       reads   : [w.employees]
       calls   : []
-      verdict : pure
     termination:
-      form  : constant_bound
       bound : 2
-    determinism:
-      form : total
 
 
 rule high_earner_count
@@ -174,9 +154,5 @@ rule high_earner_count
     purity:
       reads   : [w.employees]
       calls   : []
-      verdict : pure
     termination:
-      form  : constant_bound
       bound : 5
-    determinism:
-      form : total

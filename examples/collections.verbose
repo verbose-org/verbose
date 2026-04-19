@@ -38,12 +38,8 @@ rule invoice_overdue
     purity:
       reads   : [inv.days_overdue]
       calls   : []
-      verdict : pure
     termination:
-      form  : constant_bound
       bound : 1
-    determinism:
-      form : total
 
 
 rule client_blocked
@@ -63,12 +59,8 @@ rule client_blocked
     purity:
       reads   : [c.invoices]
       calls   : [invoice_overdue]
-      verdict : pure
     termination:
-      form  : constant_bound
       bound : 2
-    determinism:
-      form : total
 
 
 rule client_at_risk
@@ -88,9 +80,5 @@ rule client_at_risk
     purity:
       reads   : [c.invoices]
       calls   : [invoice_overdue]
-      verdict : pure
     termination:
-      form  : constant_bound
       bound : 2
-    determinism:
-      form : total

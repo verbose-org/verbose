@@ -29,12 +29,8 @@ rule active_client
     purity:
       reads   : [c.status]
       calls   : []
-      verdict : pure
     termination:
-      form  : constant_bound
       bound : 1
-    determinism:
-      form : total
 
 
 rule vip_client
@@ -54,9 +50,5 @@ rule vip_client
     purity:
       reads   : [c, c.balance]
       calls   : [active_client]
-      verdict : pure
     termination:
-      form  : constant_bound
       bound : 3
-    determinism:
-      form : total

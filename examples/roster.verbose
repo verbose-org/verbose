@@ -45,9 +45,5 @@ rule roster_line
     purity:
       reads   : [w.employees]
       calls   : []
-      verdict : pure
     termination:
-      form  : constant_bound
       bound : 6
-    determinism:
-      form : total

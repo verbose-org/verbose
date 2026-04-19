@@ -38,12 +38,8 @@ rule is_critical
     purity:
       reads   : [e.severity]
       calls   : []
-      verdict : pure
     termination:
-      form  : constant_bound
       bound : 1
-    determinism:
-      form : total
 
 
 rule error_count
@@ -63,12 +59,8 @@ rule error_count
     purity:
       reads   : [app.events]
       calls   : []
-      verdict : pure
     termination:
-      form  : constant_bound
       bound : 4
-    determinism:
-      form : total
 
 
 rule total_duration
@@ -88,12 +80,8 @@ rule total_duration
     purity:
       reads   : [app.events]
       calls   : []
-      verdict : pure
     termination:
-      form  : constant_bound
       bound : 2
-    determinism:
-      form : total
 
 
 rule error_duration
@@ -113,12 +101,8 @@ rule error_duration
     purity:
       reads   : [app.events]
       calls   : []
-      verdict : pure
     termination:
-      form  : constant_bound
       bound : 4
-    determinism:
-      form : total
 
 
 rule health_score
@@ -138,9 +122,5 @@ rule health_score
     purity:
       reads   : [app.events]
       calls   : []
-      verdict : pure
     termination:
-      form  : constant_bound
       bound : 6
-    determinism:
-      form : total

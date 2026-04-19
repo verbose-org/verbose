@@ -43,9 +43,5 @@ rule classify_invoice
     purity:
       reads   : [i.days_overdue]
       calls   : []
-      verdict : pure
     termination:
-      form  : constant_bound
       bound : 5
-    determinism:
-      form : total

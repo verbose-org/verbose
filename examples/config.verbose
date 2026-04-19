@@ -31,12 +31,8 @@ rule valid_connections
     purity:
       reads   : [c.max_conn]
       calls   : []
-      verdict : pure
     termination:
-      form  : constant_bound
       bound : 6
-    determinism:
-      form : total
 
 
 rule valid_log_level
@@ -56,12 +52,8 @@ rule valid_log_level
     purity:
       reads   : [c.log_level]
       calls   : []
-      verdict : pure
     termination:
-      form  : constant_bound
       bound : 10
-    determinism:
-      form : total
 
 
 rule valid_timeout
@@ -81,12 +73,8 @@ rule valid_timeout
     purity:
       reads   : [c.timeout]
       calls   : []
-      verdict : pure
     termination:
-      form  : constant_bound
       bound : 6
-    determinism:
-      form : total
 
 
 rule safe_config
@@ -106,12 +94,8 @@ rule safe_config
     purity:
       reads   : [c.max_conn, c.timeout]
       calls   : []
-      verdict : pure
     termination:
-      form  : constant_bound
       bound : 3
-    determinism:
-      form : total
 
 
 rule adjusted_timeout
@@ -131,9 +115,5 @@ rule adjusted_timeout
     purity:
       reads   : [c]
       calls   : [valid_timeout]
-      verdict : pure
     termination:
-      form  : constant_bound
       bound : 10
-    determinism:
-      form : total

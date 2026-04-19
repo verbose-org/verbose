@@ -40,12 +40,8 @@ rule validate_amount
     purity:
       reads   : [i.amount]
       calls   : []
-      verdict : pure
     termination:
-      form  : constant_bound
       bound : 8
-    determinism:
-      form : total
 
 
 rule validated
@@ -69,12 +65,8 @@ rule validated
     purity:
       reads   : [i, i.client]
       calls   : [validate_amount]
-      verdict : pure
     termination:
-      form  : constant_bound
       bound : 10
-    determinism:
-      form : total
 
 
 rule classify
@@ -94,9 +86,5 @@ rule classify
     purity:
       reads   : [i.client, i.amount]
       calls   : []
-      verdict : pure
     termination:
-      form  : constant_bound
       bound : 8
-    determinism:
-      form : total

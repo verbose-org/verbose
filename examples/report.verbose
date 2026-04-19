@@ -32,12 +32,8 @@ rule total_revenue
     purity:
       reads   : [c.invoices]
       calls   : []
-      verdict : pure
     termination:
-      form  : constant_bound
       bound : 2
-    determinism:
-      form : total
 
 
 rule overdue_count
@@ -53,12 +49,8 @@ rule overdue_count
     purity:
       reads   : [c.invoices]
       calls   : []
-      verdict : pure
     termination:
-      form  : constant_bound
       bound : 4
-    determinism:
-      form : total
 
 
 rule overdue_amount
@@ -74,12 +66,8 @@ rule overdue_amount
     purity:
       reads   : [c.invoices]
       calls   : []
-      verdict : pure
     termination:
-      form  : constant_bound
       bound : 4
-    determinism:
-      form : total
 
 
 rule risk_score
@@ -95,9 +83,5 @@ rule risk_score
     purity:
       reads   : [c.invoices]
       calls   : []
-      verdict : pure
     termination:
-      form  : constant_bound
       bound : 6
-    determinism:
-      form : total

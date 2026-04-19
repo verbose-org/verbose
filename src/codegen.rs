@@ -351,14 +351,9 @@ mod tests {
                                 segments: vec!["f".into(), "x".into()],
                             }],
                             calls: vec![],
-                            verdict: PurityVerdict::Pure,
                         },
                         termination: Termination {
-                            form: TerminationForm::ConstantBound,
                             bound: Some(1),
-                        },
-                        determinism: Determinism {
-                            form: DeterminismForm::Total,
                         },
                     },
                     hints: None,

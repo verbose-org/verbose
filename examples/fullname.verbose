@@ -42,9 +42,5 @@ rule compose_greeting
     purity:
       reads   : [p.first, p.last, p.age]
       calls   : []
-      verdict : pure
     termination:
-      form  : constant_bound
       bound : 4
-    determinism:
-      form : total

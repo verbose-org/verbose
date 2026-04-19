@@ -32,12 +32,8 @@ rule is_suspicious
     purity:
       reads   : [p.customer_age]
       calls   : []
-      verdict : pure
     termination:
-      form  : constant_bound
       bound : 1
-    determinism:
-      form : total
 
 
 reaction audit_suspicious

@@ -10,7 +10,7 @@
 --   Control:      if/then/else (nested), parentheses
 --   Composition:  rule calls (3 levels deep), let bindings
 --   Collections:  all() and any() with lambda predicates
---   Proofs:       purity, termination, determinism
+--   Proofs:       purity, termination
 --   Hints:        overflow bounds, vectorizable
 
 
@@ -52,12 +52,8 @@ rule bonus_rate
     purity:
       reads   : [e.experience]
       calls   : []
-      verdict : pure
     termination:
-      form  : constant_bound
       bound : 5
-    determinism:
-      form : total
 
   hints:
     vectorizable : "reads a single field per record with no calls and no cross-element state"
@@ -83,12 +79,8 @@ rule bonus_amount
     purity:
       reads   : [e, e.salary]
       calls   : [bonus_rate]
-      verdict : pure
     termination:
-      form  : constant_bound
       bound : 3
-    determinism:
-      form : total
 
 
 -- Rule 3: simple comparison + vectorizable hint
@@ -109,12 +101,8 @@ rule is_senior
     purity:
       reads   : [e.experience]
       calls   : []
-      verdict : pure
     termination:
-      form  : constant_bound
       bound : 1
-    determinism:
-      form : total
 
   hints:
     vectorizable : "scalar threshold comparison per record; no calls, no cross-element dependency"
@@ -138,12 +126,8 @@ rule eligible_for_promotion
     purity:
       reads   : [e, e.department]
       calls   : [is_senior]
-      verdict : pure
     termination:
-      form  : constant_bound
       bound : 3
-    determinism:
-      form : total
 
 
 -- Rule 5: collection quantifier (any) + lambda + rule call inside lambda
@@ -164,12 +148,8 @@ rule has_senior_talent
     purity:
       reads   : [c.employees]
       calls   : [is_senior]
-      verdict : pure
     termination:
-      form  : constant_bound
       bound : 2
-    determinism:
-      form : total
 
 
 -- Rule 6: collection quantifier (all) — different semantics than any
@@ -190,9 +170,5 @@ rule fully_senior
     purity:
       reads   : [c.employees]
       calls   : [is_senior]
-      verdict : pure
     termination:
-      form  : constant_bound
       bound : 2
-    determinism:
-      form : total

@@ -65,7 +65,7 @@ fi
 echo ""
 
 echo "  Verbose advantages:"
-echo "    ✓ Proofs verified (purity, termination, determinism)"
+echo "    ✓ Proofs verified (purity, termination)"
 echo "    ✓ Overflow bounds proven via interval arithmetic"
 echo "    ✓ SIMD-eligible (vectorizable hint verified)"
 echo "    ✓ Source traceability (every instruction → intention)"

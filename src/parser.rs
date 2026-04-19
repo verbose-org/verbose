@@ -724,18 +724,15 @@ impl Parser {
 
         let mut purity = None;
         let mut termination = None;
-        let mut determinism = None;
 
         while !self.check_kind(&TokenKind::Dedent) && !self.at_eof() {
             if self.check_ident("purity") {
                 purity = Some(self.parse_purity_block()?);
             } else if self.check_ident("termination") {
                 termination = Some(self.parse_termination_block()?);
-            } else if self.check_ident("determinism") {
-                determinism = Some(self.parse_determinism_block()?);
             } else {
                 return Err(self.error(
-                    "expected 'purity', 'termination', or 'determinism' in proofs block",
+                    "expected 'purity' or 'termination' in proofs block",
                 ));
             }
         }
@@ -743,12 +740,10 @@ impl Parser {
 
         let purity = purity.ok_or_else(|| self.error("proofs missing 'purity'"))?;
         let termination = termination.ok_or_else(|| self.error("proofs missing 'termination'"))?;
-        let determinism = determinism.ok_or_else(|| self.error("proofs missing 'determinism'"))?;
 
         Ok(Proofs {
             purity,
             termination,
-            determinism,
         })
     }
 
@@ -760,7 +755,6 @@ impl Parser {
 
         let mut reads = None;
         let mut calls = None;
-        let mut verdict = None;
 
         while !self.check_kind(&TokenKind::Dedent) && !self.at_eof() {
             let key = self.expect_ident_any()?;
@@ -768,10 +762,9 @@ impl Parser {
             match key.as_str() {
                 "reads" => reads = Some(self.parse_path_list()?),
                 "calls" => calls = Some(self.parse_path_list()?),
-                "verdict" => verdict = Some(self.parse_purity_verdict()?),
                 _ => {
                     return Err(self.error(&format!(
-                        "unknown key '{}' in purity block (allowed: reads, calls, verdict)",
+                        "unknown key '{}' in purity block (allowed: reads, calls)",
                         key
                     )));
                 }
@@ -782,12 +775,10 @@ impl Parser {
 
         let reads = reads.ok_or_else(|| self.error("purity missing 'reads'"))?;
         let calls = calls.ok_or_else(|| self.error("purity missing 'calls'"))?;
-        let verdict = verdict.ok_or_else(|| self.error("purity missing 'verdict'"))?;
 
         Ok(Purity {
             reads,
             calls,
-            verdict,
         })
     }
 
@@ -818,46 +809,24 @@ impl Parser {
         Ok(Path { segments })
     }
 
-    fn parse_purity_verdict(&mut self) -> Result<PurityVerdict, ParseError> {
-        let name = self.expect_ident_any()?;
-        match name.as_str() {
-            "pure" => Ok(PurityVerdict::Pure),
-            _ => Err(self.error(&format!(
-                "unknown purity verdict '{}' (allowed: pure)",
-                name
-            ))),
-        }
-    }
-
     fn parse_termination_block(&mut self) -> Result<Termination, ParseError> {
         self.expect_ident("termination")?;
         self.expect_kind(TokenKind::Colon)?;
         self.expect_kind(TokenKind::Newline)?;
         self.expect_kind(TokenKind::Indent)?;
 
-        let mut form = None;
         let mut bound = None;
 
         while !self.check_kind(&TokenKind::Dedent) && !self.at_eof() {
             let key = self.expect_ident_any()?;
             self.expect_kind(TokenKind::Colon)?;
             match key.as_str() {
-                "form" => {
-                    let n = self.expect_ident_any()?;
-                    form = Some(match n.as_str() {
-                        "constant_bound" => TerminationForm::ConstantBound,
-                        _ => return Err(self.error(&format!(
-                            "unknown termination form '{}' (allowed: constant_bound)",
-                            n
-                        ))),
-                    });
-                }
                 "bound" => {
                     bound = Some(self.expect_number()?);
                 }
                 _ => {
                     return Err(self.error(&format!(
-                        "unknown key '{}' in termination block (allowed: form, bound)",
+                        "unknown key '{}' in termination block (allowed: bound)",
                         key
                     )));
                 }
@@ -866,45 +835,7 @@ impl Parser {
         }
         self.expect_kind(TokenKind::Dedent)?;
 
-        let form = form.ok_or_else(|| self.error("termination missing 'form'"))?;
-        Ok(Termination { form, bound })
-    }
-
-    fn parse_determinism_block(&mut self) -> Result<Determinism, ParseError> {
-        self.expect_ident("determinism")?;
-        self.expect_kind(TokenKind::Colon)?;
-        self.expect_kind(TokenKind::Newline)?;
-        self.expect_kind(TokenKind::Indent)?;
-
-        let mut form = None;
-
-        while !self.check_kind(&TokenKind::Dedent) && !self.at_eof() {
-            let key = self.expect_ident_any()?;
-            self.expect_kind(TokenKind::Colon)?;
-            match key.as_str() {
-                "form" => {
-                    let n = self.expect_ident_any()?;
-                    form = Some(match n.as_str() {
-                        "total" => DeterminismForm::Total,
-                        _ => return Err(self.error(&format!(
-                            "unknown determinism form '{}' (allowed: total)",
-                            n
-                        ))),
-                    });
-                }
-                _ => {
-                    return Err(self.error(&format!(
-                        "unknown key '{}' in determinism block (allowed: form)",
-                        key
-                    )));
-                }
-            }
-            self.expect_kind(TokenKind::Newline)?;
-        }
-        self.expect_kind(TokenKind::Dedent)?;
-
-        let form = form.ok_or_else(|| self.error("determinism missing 'form'"))?;
-        Ok(Determinism { form })
+        Ok(Termination { bound })
     }
 
     fn parse_reaction(&mut self) -> Result<Reaction, ParseError> {
@@ -1262,12 +1193,8 @@ rule important_invoice
     purity:
       reads   : [i.amount]
       calls   : []
-      verdict : pure
     termination:
-      form  : constant_bound
       bound : 1
-    determinism:
-      form : total
 "#;
         let p = parse(src).unwrap();
         assert_eq!(p.items.len(), 2);
@@ -1292,12 +1219,9 @@ rule important_invoice
                     }
                     _ => panic!("expected Gt comparison"),
                 }
-                assert!(matches!(r.proofs.purity.verdict, PurityVerdict::Pure));
                 assert_eq!(r.proofs.purity.reads.len(), 1);
                 assert_eq!(r.proofs.purity.reads[0].segments, vec!["i", "amount"]);
-                assert_eq!(r.proofs.termination.form, TerminationForm::ConstantBound);
                 assert_eq!(r.proofs.termination.bound, Some(1));
-                assert_eq!(r.proofs.determinism.form, DeterminismForm::Total);
             }
             _ => panic!("expected rule"),
         }
@@ -1305,7 +1229,7 @@ rule important_invoice
 
     #[test]
     fn if_then_else_parsed() {
-        let src = "@verbose 0.1.0\n\nconcept T\n  @intention: \"t\"\n  @source: f.intent:1\n  fields:\n    x : number\n\nrule test\n  @intention: \"t\"\n  @source: f.intent:1\n  input:\n    t : T\n  output:\n    r : number\n  logic:\n    r = if t.x > 10 then 1 else 0\n  proofs:\n    purity:\n      reads: [t.x]\n      calls: []\n      verdict: pure\n    termination:\n      form: constant_bound\n      bound: 3\n    determinism:\n      form: total\n";
+        let src = "@verbose 0.1.0\n\nconcept T\n  @intention: \"t\"\n  @source: f.intent:1\n  fields:\n    x : number\n\nrule test\n  @intention: \"t\"\n  @source: f.intent:1\n  input:\n    t : T\n  output:\n    r : number\n  logic:\n    r = if t.x > 10 then 1 else 0\n  proofs:\n    purity:\n      reads: [t.x]\n      calls: []\n    termination:\n      bound: 3\n";
         let p = parse(src).unwrap();
         match &p.items[1] {
             Item::Rule(r) => {
@@ -1317,7 +1241,7 @@ rule important_invoice
 
     #[test]
     fn let_bindings_parsed() {
-        let src = "@verbose 0.1.0\n\nconcept T\n  @intention: \"t\"\n  @source: f.intent:1\n  fields:\n    x : number\n\nrule test\n  @intention: \"t\"\n  @source: f.intent:1\n  input:\n    t : T\n  output:\n    r : number\n  logic:\n    let y = t.x * 2\n    r = y + 1\n  proofs:\n    purity:\n      reads: [t.x]\n      calls: []\n      verdict: pure\n    termination:\n      form: constant_bound\n      bound: 2\n    determinism:\n      form: total\n";
+        let src = "@verbose 0.1.0\n\nconcept T\n  @intention: \"t\"\n  @source: f.intent:1\n  fields:\n    x : number\n\nrule test\n  @intention: \"t\"\n  @source: f.intent:1\n  input:\n    t : T\n  output:\n    r : number\n  logic:\n    let y = t.x * 2\n    r = y + 1\n  proofs:\n    purity:\n      reads: [t.x]\n      calls: []\n    termination:\n      bound: 2\n";
         let p = parse(src).unwrap();
         match &p.items[1] {
             Item::Rule(r) => {
@@ -1373,7 +1297,7 @@ rule important_invoice
 
     #[test]
     fn quantifier_parsed() {
-        let src = "@verbose 0.1.0\n\nconcept T\n  @intention: \"t\"\n  @source: f.intent:1\n  fields:\n    xs : collection(X)\n\nrule test\n  @intention: \"t\"\n  @source: f.intent:1\n  input:\n    t : T\n  output:\n    r : bool\n  logic:\n    r = all(t.xs, x => x > 0)\n  proofs:\n    purity:\n      reads: [t.xs]\n      calls: []\n      verdict: pure\n    termination:\n      form: constant_bound\n      bound: 2\n    determinism:\n      form: total\n";
+        let src = "@verbose 0.1.0\n\nconcept T\n  @intention: \"t\"\n  @source: f.intent:1\n  fields:\n    xs : collection(X)\n\nrule test\n  @intention: \"t\"\n  @source: f.intent:1\n  input:\n    t : T\n  output:\n    r : bool\n  logic:\n    r = all(t.xs, x => x > 0)\n  proofs:\n    purity:\n      reads: [t.xs]\n      calls: []\n    termination:\n      bound: 2\n";
         let p = parse(src).unwrap();
         match &p.items[1] {
             Item::Rule(r) => {
@@ -1385,7 +1309,7 @@ rule important_invoice
 
     #[test]
     fn hints_parsed() {
-        let src = "@verbose 0.1.0\n\nconcept T\n  @intention: \"t\"\n  @source: f.intent:1\n  fields:\n    x : number\n\nrule test\n  @intention: \"t\"\n  @source: f.intent:1\n  input:\n    t : T\n  output:\n    r : bool\n  logic:\n    r = t.x > 0\n  proofs:\n    purity:\n      reads: [t.x]\n      calls: []\n      verdict: pure\n    termination:\n      form: constant_bound\n      bound: 1\n    determinism:\n      form: total\n  hints:\n    vectorizable: \"no cross-element dependency in the predicate\"\n    overflow: [0, 1]\n";
+        let src = "@verbose 0.1.0\n\nconcept T\n  @intention: \"t\"\n  @source: f.intent:1\n  fields:\n    x : number\n\nrule test\n  @intention: \"t\"\n  @source: f.intent:1\n  input:\n    t : T\n  output:\n    r : bool\n  logic:\n    r = t.x > 0\n  proofs:\n    purity:\n      reads: [t.x]\n      calls: []\n    termination:\n      bound: 1\n  hints:\n    vectorizable: \"no cross-element dependency in the predicate\"\n    overflow: [0, 1]\n";
         let p = parse(src).unwrap();
         match &p.items[1] {
             Item::Rule(r) => {
@@ -1408,7 +1332,7 @@ rule important_invoice
     fn bare_hint_rejected() {
         // The identity of the rule: a hint without justification is refused,
         // because the auditor has no "why" to read.
-        let src = "@verbose 0.1.0\n\nconcept T\n  @intention: \"t\"\n  @source: f.intent:1\n  fields:\n    x : number\n\nrule test\n  @intention: \"t\"\n  @source: f.intent:1\n  input:\n    t : T\n  output:\n    r : bool\n  logic:\n    r = t.x > 0\n  proofs:\n    purity:\n      reads: [t.x]\n      calls: []\n      verdict: pure\n    termination:\n      form: constant_bound\n      bound: 1\n    determinism:\n      form: total\n  hints:\n    vectorizable: yes\n";
+        let src = "@verbose 0.1.0\n\nconcept T\n  @intention: \"t\"\n  @source: f.intent:1\n  fields:\n    x : number\n\nrule test\n  @intention: \"t\"\n  @source: f.intent:1\n  input:\n    t : T\n  output:\n    r : bool\n  logic:\n    r = t.x > 0\n  proofs:\n    purity:\n      reads: [t.x]\n      calls: []\n    termination:\n      bound: 1\n  hints:\n    vectorizable: yes\n";
         let err = parse(src).err().expect("bare hint should be rejected");
         let msg = format!("{:?}", err);
         assert!(
@@ -1420,7 +1344,7 @@ rule important_invoice
 
     #[test]
     fn empty_hint_justification_rejected() {
-        let src = "@verbose 0.1.0\n\nconcept T\n  @intention: \"t\"\n  @source: f.intent:1\n  fields:\n    x : number\n\nrule test\n  @intention: \"t\"\n  @source: f.intent:1\n  input:\n    t : T\n  output:\n    r : bool\n  logic:\n    r = t.x > 0\n  proofs:\n    purity:\n      reads: [t.x]\n      calls: []\n      verdict: pure\n    termination:\n      form: constant_bound\n      bound: 1\n    determinism:\n      form: total\n  hints:\n    vectorizable: \"\"\n";
+        let src = "@verbose 0.1.0\n\nconcept T\n  @intention: \"t\"\n  @source: f.intent:1\n  fields:\n    x : number\n\nrule test\n  @intention: \"t\"\n  @source: f.intent:1\n  input:\n    t : T\n  output:\n    r : bool\n  logic:\n    r = t.x > 0\n  proofs:\n    purity:\n      reads: [t.x]\n      calls: []\n    termination:\n      bound: 1\n  hints:\n    vectorizable: \"\"\n";
         let err = parse(src).err().expect("empty justification should be rejected");
         let msg = format!("{:?}", err);
         assert!(
@@ -1432,7 +1356,7 @@ rule important_invoice
 
     #[test]
     fn precedence_correct() {
-        let src = "@verbose 0.1.0\n\nconcept T\n  @intention: \"t\"\n  @source: f.intent:1\n  fields:\n    a : number\n    b : number\n\nrule test\n  @intention: \"t\"\n  @source: f.intent:1\n  input:\n    t : T\n  output:\n    r : bool\n  logic:\n    r = t.a + 1 > t.b * 2 and t.a < 100\n  proofs:\n    purity:\n      reads: [t.a, t.b]\n      calls: []\n      verdict: pure\n    termination:\n      form: constant_bound\n      bound: 5\n    determinism:\n      form: total\n";
+        let src = "@verbose 0.1.0\n\nconcept T\n  @intention: \"t\"\n  @source: f.intent:1\n  fields:\n    a : number\n    b : number\n\nrule test\n  @intention: \"t\"\n  @source: f.intent:1\n  input:\n    t : T\n  output:\n    r : bool\n  logic:\n    r = t.a + 1 > t.b * 2 and t.a < 100\n  proofs:\n    purity:\n      reads: [t.a, t.b]\n      calls: []\n    termination:\n      bound: 5\n";
         let p = parse(src).unwrap();
         match &p.items[1] {
             Item::Rule(r) => {
@@ -1445,7 +1369,7 @@ rule important_invoice
 
     #[test]
     fn not_and_neg_parsed() {
-        let src = "@verbose 0.1.0\n\nconcept T\n  @intention: \"t\"\n  @source: f.intent:1\n  fields:\n    x : number\n\nrule test\n  @intention: \"t\"\n  @source: f.intent:1\n  input:\n    t : T\n  output:\n    r : bool\n  logic:\n    r = not (t.x > 0)\n  proofs:\n    purity:\n      reads: [t.x]\n      calls: []\n      verdict: pure\n    termination:\n      form: constant_bound\n      bound: 2\n    determinism:\n      form: total\n";
+        let src = "@verbose 0.1.0\n\nconcept T\n  @intention: \"t\"\n  @source: f.intent:1\n  fields:\n    x : number\n\nrule test\n  @intention: \"t\"\n  @source: f.intent:1\n  input:\n    t : T\n  output:\n    r : bool\n  logic:\n    r = not (t.x > 0)\n  proofs:\n    purity:\n      reads: [t.x]\n      calls: []\n    termination:\n      bound: 2\n";
         let p = parse(src).unwrap();
         match &p.items[1] {
             Item::Rule(r) => {
@@ -1457,7 +1381,7 @@ rule important_invoice
 
     #[test]
     fn reaction_parsed() {
-        let src = "@verbose 0.1.0\n\nconcept T\n  @intention: \"t\"\n  @source: f.intent:1\n  fields:\n    x : number\n\nrule r\n  @intention: \"t\"\n  @source: f.intent:1\n  input:\n    t : T\n  output:\n    y : bool\n  logic:\n    y = t.x > 0\n  proofs:\n    purity:\n      reads: [t.x]\n      calls: []\n      verdict: pure\n    termination:\n      form: constant_bound\n      bound: 1\n    determinism:\n      form: total\n\nreaction notify\n  @intention: \"notify when triggered\"\n  @source: f.intent:1\n  trigger: r\n  effects:\n    print \"hello\"\n";
+        let src = "@verbose 0.1.0\n\nconcept T\n  @intention: \"t\"\n  @source: f.intent:1\n  fields:\n    x : number\n\nrule r\n  @intention: \"t\"\n  @source: f.intent:1\n  input:\n    t : T\n  output:\n    y : bool\n  logic:\n    y = t.x > 0\n  proofs:\n    purity:\n      reads: [t.x]\n      calls: []\n    termination:\n      bound: 1\n\nreaction notify\n  @intention: \"notify when triggered\"\n  @source: f.intent:1\n  trigger: r\n  effects:\n    print \"hello\"\n";
         let p = parse(src).unwrap();
         assert_eq!(p.items.len(), 3); // concept + rule + reaction
         match &p.items[2] {
@@ -1473,7 +1397,7 @@ rule important_invoice
 
     #[test]
     fn fold_parsed() {
-        let src = "@verbose 0.1.0\n\nconcept T\n  @intention: \"t\"\n  @source: f.intent:1\n  fields:\n    items : collection(X)\n\nrule test\n  @intention: \"t\"\n  @source: f.intent:1\n  input:\n    t : T\n  output:\n    r : number\n  logic:\n    r = fold(t.items, 0, acc, x => acc + 1)\n  proofs:\n    purity:\n      reads: [t.items]\n      calls: []\n      verdict: pure\n    termination:\n      form: constant_bound\n      bound: 2\n    determinism:\n      form: total\n";
+        let src = "@verbose 0.1.0\n\nconcept T\n  @intention: \"t\"\n  @source: f.intent:1\n  fields:\n    items : collection(X)\n\nrule test\n  @intention: \"t\"\n  @source: f.intent:1\n  input:\n    t : T\n  output:\n    r : number\n  logic:\n    r = fold(t.items, 0, acc, x => acc + 1)\n  proofs:\n    purity:\n      reads: [t.items]\n      calls: []\n    termination:\n      bound: 2\n";
         let p = parse(src).unwrap();
         match &p.items[1] {
             Item::Rule(r) => {
@@ -1485,7 +1409,7 @@ rule important_invoice
 
     #[test]
     fn map_parsed() {
-        let src = "@verbose 0.1.0\n\nconcept T\n  @intention: \"t\"\n  @source: f.intent:1\n  fields:\n    items : collection(X)\n\nrule test\n  @intention: \"t\"\n  @source: f.intent:1\n  input:\n    t : T\n  output:\n    r : collection(number)\n  logic:\n    r = map(t.items, x => x + 1)\n  proofs:\n    purity:\n      reads: [t.items]\n      calls: []\n      verdict: pure\n    termination:\n      form: constant_bound\n      bound: 2\n    determinism:\n      form: total\n";
+        let src = "@verbose 0.1.0\n\nconcept T\n  @intention: \"t\"\n  @source: f.intent:1\n  fields:\n    items : collection(X)\n\nrule test\n  @intention: \"t\"\n  @source: f.intent:1\n  input:\n    t : T\n  output:\n    r : collection(number)\n  logic:\n    r = map(t.items, x => x + 1)\n  proofs:\n    purity:\n      reads: [t.items]\n      calls: []\n    termination:\n      bound: 2\n";
         let p = parse(src).unwrap();
         match &p.items[1] {
             Item::Rule(r) => {
@@ -1497,7 +1421,7 @@ rule important_invoice
 
     #[test]
     fn result_type_parsed() {
-        let src = "@verbose 0.1.0\n\nconcept T\n  @intention: \"t\"\n  @source: f.intent:1\n  fields:\n    x : number\n\nrule try_div\n  @intention: \"t\"\n  @source: f.intent:1\n  input:\n    t : T\n  output:\n    r : Result(number, text)\n  logic:\n    r = if t.x > 0 then Ok(t.x) else Err(\"negative\")\n  proofs:\n    purity:\n      reads: [t.x]\n      calls: []\n      verdict: pure\n    termination:\n      form: constant_bound\n      bound: 3\n    determinism:\n      form: total\n";
+        let src = "@verbose 0.1.0\n\nconcept T\n  @intention: \"t\"\n  @source: f.intent:1\n  fields:\n    x : number\n\nrule try_div\n  @intention: \"t\"\n  @source: f.intent:1\n  input:\n    t : T\n  output:\n    r : Result(number, text)\n  logic:\n    r = if t.x > 0 then Ok(t.x) else Err(\"negative\")\n  proofs:\n    purity:\n      reads: [t.x]\n      calls: []\n    termination:\n      bound: 3\n";
         let p = parse(src).unwrap();
         match &p.items[1] {
             Item::Rule(r) => {
@@ -1518,7 +1442,7 @@ rule important_invoice
 
     #[test]
     fn append_file_with_literal_path_parsed() {
-        let src = "@verbose 0.1.0\n\nconcept T\n  @intention: \"t\"\n  @source: f.intent:1\n  fields:\n    x : number\n\nrule trig\n  @intention: \"t\"\n  @source: f.intent:1\n  input:\n    t : T\n  output:\n    b : bool\n  logic:\n    b = t.x > 0\n  proofs:\n    purity:\n      reads: [t.x]\n      calls: []\n      verdict: pure\n    termination:\n      form: constant_bound\n      bound: 1\n    determinism:\n      form : total\n\nreaction log\n  @intention: \"log\"\n  @source: f.intent:1\n  trigger: trig\n  effects:\n    append_file \"/tmp/x.log\" \"hi\\n\"\n";
+        let src = "@verbose 0.1.0\n\nconcept T\n  @intention: \"t\"\n  @source: f.intent:1\n  fields:\n    x : number\n\nrule trig\n  @intention: \"t\"\n  @source: f.intent:1\n  input:\n    t : T\n  output:\n    b : bool\n  logic:\n    b = t.x > 0\n  proofs:\n    purity:\n      reads: [t.x]\n      calls: []\n    termination:\n      bound: 1\n\nreaction log\n  @intention: \"log\"\n  @source: f.intent:1\n  trigger: trig\n  effects:\n    append_file \"/tmp/x.log\" \"hi\\n\"\n";
         let p = parse(src).unwrap();
         match &p.items[2] {
             Item::Reaction(rx) => match &rx.effects[0] {
@@ -1534,7 +1458,7 @@ rule important_invoice
         // The path MUST be a string literal at the source level. Using a
         // field or a concat() expression is refused so the auditor can see
         // every file this program could ever touch.
-        let src = "@verbose 0.1.0\n\nconcept T\n  @intention: \"t\"\n  @source: f.intent:1\n  fields:\n    x : number\n\nrule trig\n  @intention: \"t\"\n  @source: f.intent:1\n  input:\n    t : T\n  output:\n    b : bool\n  logic:\n    b = t.x > 0\n  proofs:\n    purity:\n      reads: [t.x]\n      calls: []\n      verdict: pure\n    termination:\n      form: constant_bound\n      bound: 1\n    determinism:\n      form : total\n\nreaction log\n  @intention: \"log\"\n  @source: f.intent:1\n  trigger: trig\n  effects:\n    append_file t.x \"hi\\n\"\n";
+        let src = "@verbose 0.1.0\n\nconcept T\n  @intention: \"t\"\n  @source: f.intent:1\n  fields:\n    x : number\n\nrule trig\n  @intention: \"t\"\n  @source: f.intent:1\n  input:\n    t : T\n  output:\n    b : bool\n  logic:\n    b = t.x > 0\n  proofs:\n    purity:\n      reads: [t.x]\n      calls: []\n    termination:\n      bound: 1\n\nreaction log\n  @intention: \"log\"\n  @source: f.intent:1\n  trigger: trig\n  effects:\n    append_file t.x \"hi\\n\"\n";
         let err = parse(src).err().expect("non-literal path should be rejected");
         let msg = format!("{:?}", err);
         assert!(
@@ -1546,7 +1470,7 @@ rule important_invoice
 
     #[test]
     fn concat_parsed() {
-        let src = "@verbose 0.1.0\n\nconcept T\n  @intention: \"t\"\n  @source: f.intent:1\n  fields:\n    x : number\n\nrule make\n  @intention: \"t\"\n  @source: f.intent:1\n  input:\n    i : T\n  output:\n    r : text\n  logic:\n    r = concat(\"age \", i.x, \" years\")\n  proofs:\n    purity:\n      reads: [i.x]\n      calls: []\n      verdict: pure\n    termination:\n      form: constant_bound\n      bound: 4\n    determinism:\n      form: total\n";
+        let src = "@verbose 0.1.0\n\nconcept T\n  @intention: \"t\"\n  @source: f.intent:1\n  fields:\n    x : number\n\nrule make\n  @intention: \"t\"\n  @source: f.intent:1\n  input:\n    i : T\n  output:\n    r : text\n  logic:\n    r = concat(\"age \", i.x, \" years\")\n  proofs:\n    purity:\n      reads: [i.x]\n      calls: []\n    termination:\n      bound: 4\n";
         let p = parse(src).unwrap();
         match &p.items[1] {
             Item::Rule(r) => match &r.logic.value {
@@ -1562,13 +1486,13 @@ rule important_invoice
 
     #[test]
     fn concat_empty_rejected() {
-        let src = "@verbose 0.1.0\n\nconcept T\n  @intention: \"t\"\n  @source: f.intent:1\n  fields:\n    x : number\n\nrule make\n  @intention: \"t\"\n  @source: f.intent:1\n  input:\n    i : T\n  output:\n    r : text\n  logic:\n    r = concat()\n  proofs:\n    purity:\n      reads: []\n      calls: []\n      verdict: pure\n    termination:\n      form: constant_bound\n      bound: 1\n    determinism:\n      form: total\n";
+        let src = "@verbose 0.1.0\n\nconcept T\n  @intention: \"t\"\n  @source: f.intent:1\n  fields:\n    x : number\n\nrule make\n  @intention: \"t\"\n  @source: f.intent:1\n  input:\n    i : T\n  output:\n    r : text\n  logic:\n    r = concat()\n  proofs:\n    purity:\n      reads: []\n      calls: []\n    termination:\n      bound: 1\n";
         assert!(parse(src).is_err(), "empty concat should be rejected");
     }
 
     #[test]
     fn record_constructor_parsed() {
-        let src = "@verbose 0.1.0\n\nconcept Pair\n  @intention: \"t\"\n  @source: f.intent:1\n  fields:\n    a : number\n    b : number\n\nconcept In\n  @intention: \"t\"\n  @source: f.intent:1\n  fields:\n    x : number\n\nrule make\n  @intention: \"t\"\n  @source: f.intent:1\n  input:\n    i : In\n  output:\n    p : Pair\n  logic:\n    p = Pair { a: i.x, b: i.x + 1 }\n  proofs:\n    purity:\n      reads: [i.x]\n      calls: []\n      verdict: pure\n    termination:\n      form: constant_bound\n      bound: 3\n    determinism:\n      form: total\n";
+        let src = "@verbose 0.1.0\n\nconcept Pair\n  @intention: \"t\"\n  @source: f.intent:1\n  fields:\n    a : number\n    b : number\n\nconcept In\n  @intention: \"t\"\n  @source: f.intent:1\n  fields:\n    x : number\n\nrule make\n  @intention: \"t\"\n  @source: f.intent:1\n  input:\n    i : In\n  output:\n    p : Pair\n  logic:\n    p = Pair { a: i.x, b: i.x + 1 }\n  proofs:\n    purity:\n      reads: [i.x]\n      calls: []\n    termination:\n      bound: 3\n";
         let p = parse(src).unwrap();
         match &p.items[2] {
             Item::Rule(r) => match &r.logic.value {
@@ -1586,7 +1510,7 @@ rule important_invoice
 
     #[test]
     fn match_result_parsed() {
-        let src = "@verbose 0.1.0\n\nconcept T\n  @intention: \"t\"\n  @source: f.intent:1\n  fields:\n    x : number\n\nrule consume\n  @intention: \"t\"\n  @source: f.intent:1\n  input:\n    t : T\n  output:\n    r : Result(number, text)\n  logic:\n    r = match_result(Ok(t.x), v => Ok(v + 1), e => Err(e))\n  proofs:\n    purity:\n      reads: [t.x]\n      calls: []\n      verdict: pure\n    termination:\n      form: constant_bound\n      bound: 10\n    determinism:\n      form: total\n";
+        let src = "@verbose 0.1.0\n\nconcept T\n  @intention: \"t\"\n  @source: f.intent:1\n  fields:\n    x : number\n\nrule consume\n  @intention: \"t\"\n  @source: f.intent:1\n  input:\n    t : T\n  output:\n    r : Result(number, text)\n  logic:\n    r = match_result(Ok(t.x), v => Ok(v + 1), e => Err(e))\n  proofs:\n    purity:\n      reads: [t.x]\n      calls: []\n    termination:\n      bound: 10\n";
         let p = parse(src).unwrap();
         match &p.items[1] {
             Item::Rule(r) => {
@@ -1601,7 +1525,7 @@ rule important_invoice
 
     #[test]
     fn filter_parsed() {
-        let src = "@verbose 0.1.0\n\nconcept T\n  @intention: \"t\"\n  @source: f.intent:1\n  fields:\n    items : collection(X)\n\nrule test\n  @intention: \"t\"\n  @source: f.intent:1\n  input:\n    t : T\n  output:\n    r : collection(X)\n  logic:\n    r = filter(t.items, x => x > 0)\n  proofs:\n    purity:\n      reads: [t.items]\n      calls: []\n      verdict: pure\n    termination:\n      form: constant_bound\n      bound: 2\n    determinism:\n      form: total\n";
+        let src = "@verbose 0.1.0\n\nconcept T\n  @intention: \"t\"\n  @source: f.intent:1\n  fields:\n    items : collection(X)\n\nrule test\n  @intention: \"t\"\n  @source: f.intent:1\n  input:\n    t : T\n  output:\n    r : collection(X)\n  logic:\n    r = filter(t.items, x => x > 0)\n  proofs:\n    purity:\n      reads: [t.items]\n      calls: []\n    termination:\n      bound: 2\n";
         let p = parse(src).unwrap();
         match &p.items[1] {
             Item::Rule(r) => {
@@ -1613,7 +1537,7 @@ rule important_invoice
 
     #[test]
     fn sum_desugars_to_fold() {
-        let src = "@verbose 0.1.0\n\nconcept T\n  @intention: \"t\"\n  @source: f.intent:1\n  fields:\n    items : collection(X)\n\nrule test\n  @intention: \"t\"\n  @source: f.intent:1\n  input:\n    t : T\n  output:\n    r : number\n  logic:\n    r = sum(t.items, x => x)\n  proofs:\n    purity:\n      reads: [t.items]\n      calls: []\n      verdict: pure\n    termination:\n      form: constant_bound\n      bound: 2\n    determinism:\n      form: total\n";
+        let src = "@verbose 0.1.0\n\nconcept T\n  @intention: \"t\"\n  @source: f.intent:1\n  fields:\n    items : collection(X)\n\nrule test\n  @intention: \"t\"\n  @source: f.intent:1\n  input:\n    t : T\n  output:\n    r : number\n  logic:\n    r = sum(t.items, x => x)\n  proofs:\n    purity:\n      reads: [t.items]\n      calls: []\n    termination:\n      bound: 2\n";
         let p = parse(src).unwrap();
         match &p.items[1] {
             Item::Rule(r) => {
@@ -1626,7 +1550,7 @@ rule important_invoice
 
     #[test]
     fn string_comparison_parsed() {
-        let src = "@verbose 0.1.0\n\nconcept T\n  @intention: \"t\"\n  @source: f.intent:1\n  fields:\n    s : text\n\nrule test\n  @intention: \"t\"\n  @source: f.intent:1\n  input:\n    t : T\n  output:\n    r : bool\n  logic:\n    r = t.s == \"active\"\n  proofs:\n    purity:\n      reads: [t.s]\n      calls: []\n      verdict: pure\n    termination:\n      form: constant_bound\n      bound: 1\n    determinism:\n      form: total\n";
+        let src = "@verbose 0.1.0\n\nconcept T\n  @intention: \"t\"\n  @source: f.intent:1\n  fields:\n    s : text\n\nrule test\n  @intention: \"t\"\n  @source: f.intent:1\n  input:\n    t : T\n  output:\n    r : bool\n  logic:\n    r = t.s == \"active\"\n  proofs:\n    purity:\n      reads: [t.s]\n      calls: []\n    termination:\n      bound: 1\n";
         let p = parse(src).unwrap();
         match &p.items[1] {
             Item::Rule(r) => {

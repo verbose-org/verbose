@@ -34,12 +34,8 @@ rule is_bulk
     purity:
       reads   : [o.amount]
       calls   : []
-      verdict : pure
     termination:
-      form  : constant_bound
       bound : 1
-    determinism:
-      form : total
 
 
 rule is_priority
@@ -60,9 +56,5 @@ rule is_priority
     purity:
       reads   : [o, o.tier]
       calls   : [is_bulk]
-      verdict : pure
     termination:
-      form  : constant_bound
       bound : 3
-    determinism:
-      form : total

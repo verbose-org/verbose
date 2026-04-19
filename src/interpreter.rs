@@ -517,14 +517,9 @@ mod tests {
                         segments: vec!["i".into(), "amount".into()],
                     }],
                     calls: vec![],
-                    verdict: PurityVerdict::Pure,
                 },
                 termination: Termination {
-                    form: TerminationForm::ConstantBound,
                     bound: Some(1),
-                },
-                determinism: Determinism {
-                    form: DeterminismForm::Total,
                 },
             },
             hints: None,
@@ -631,10 +626,8 @@ mod tests {
                 purity: Purity {
                     reads: vec![Path { segments: vec!["i".into(), "x".into()] }],
                     calls: vec![],
-                    verdict: PurityVerdict::Pure,
                 },
-                termination: Termination { form: TerminationForm::ConstantBound, bound: Some(1) },
-                determinism: Determinism { form: DeterminismForm::Total },
+                termination: Termination { bound: Some(1) },
             },
             hints: None,
             layer: None,
@@ -670,10 +663,8 @@ mod tests {
                 purity: Purity {
                     reads: vec![Path { segments: vec!["i".into(), "x".into()] }],
                     calls: vec![],
-                    verdict: PurityVerdict::Pure,
                 },
-                termination: Termination { form: TerminationForm::ConstantBound, bound: Some(1) },
-                determinism: Determinism { form: DeterminismForm::Total },
+                termination: Termination { bound: Some(1) },
             },
             hints: None,
             layer: None,
@@ -713,10 +704,8 @@ mod tests {
                 purity: Purity {
                     reads: vec![Path { segments: vec!["i".into(), "x".into()] }],
                     calls: vec![],
-                    verdict: PurityVerdict::Pure,
                 },
-                termination: Termination { form: TerminationForm::ConstantBound, bound: Some(3) },
-                determinism: Determinism { form: DeterminismForm::Total },
+                termination: Termination { bound: Some(3) },
             },
             hints: None,
             layer: None,
@@ -755,10 +744,8 @@ mod tests {
                 purity: Purity {
                     reads: vec![Path { segments: vec!["i".into(), "s".into()] }],
                     calls: vec![],
-                    verdict: PurityVerdict::Pure,
                 },
-                termination: Termination { form: TerminationForm::ConstantBound, bound: Some(1) },
-                determinism: Determinism { form: DeterminismForm::Total },
+                termination: Termination { bound: Some(1) },
             },
             hints: None,
             layer: None,
@@ -795,10 +782,9 @@ mod tests {
             proofs: Proofs {
                 purity: Purity {
                     reads: vec![Path { segments: vec!["i".into(), "x".into()] }],
-                    calls: vec![], verdict: PurityVerdict::Pure,
+                    calls: vec![],
                 },
-                termination: Termination { form: TerminationForm::ConstantBound, bound: Some(1) },
-                determinism: Determinism { form: DeterminismForm::Total },
+                termination: Termination { bound: Some(1) },
             },
             hints: None,
             layer: None,
@@ -839,10 +825,9 @@ mod tests {
             proofs: Proofs {
                 purity: Purity {
                     reads: vec![Path { segments: vec!["i".into(), "x".into()] }],
-                    calls: vec![], verdict: PurityVerdict::Pure,
+                    calls: vec![],
                 },
-                termination: Termination { form: TerminationForm::ConstantBound, bound: Some(2) },
-                determinism: Determinism { form: DeterminismForm::Total },
+                termination: Termination { bound: Some(2) },
             },
             hints: None,
             layer: None,
@@ -880,10 +865,9 @@ mod tests {
             proofs: Proofs {
                 purity: Purity {
                     reads: vec![Path { segments: vec!["i".into(), "x".into()] }],
-                    calls: vec![], verdict: PurityVerdict::Pure,
+                    calls: vec![],
                 },
-                termination: Termination { form: TerminationForm::ConstantBound, bound: Some(1) },
-                determinism: Determinism { form: DeterminismForm::Total },
+                termination: Termination { bound: Some(1) },
             },
             hints: None,
             layer: None,
@@ -922,10 +906,9 @@ mod tests {
             proofs: Proofs {
                 purity: Purity {
                     reads: vec![Path { segments: vec!["i".into(), "items".into()] }],
-                    calls: vec![], verdict: PurityVerdict::Pure,
+                    calls: vec![],
                 },
-                termination: Termination { form: TerminationForm::ConstantBound, bound: Some(10) },
-                determinism: Determinism { form: DeterminismForm::Total },
+                termination: Termination { bound: Some(10) },
             },
             hints: None,
             layer: None,
@@ -971,10 +954,9 @@ mod tests {
             proofs: Proofs {
                 purity: Purity {
                     reads: vec![Path { segments: vec!["i".into(), "items".into()] }],
-                    calls: vec![], verdict: PurityVerdict::Pure,
+                    calls: vec![],
                 },
-                termination: Termination { form: TerminationForm::ConstantBound, bound: Some(10) },
-                determinism: Determinism { form: DeterminismForm::Total },
+                termination: Termination { bound: Some(10) },
             },
             hints: None,
             layer: None,
@@ -1028,10 +1010,9 @@ mod tests {
             proofs: Proofs {
                 purity: Purity {
                     reads: vec![Path { segments: vec!["i".into(), "age".into()] }],
-                    calls: vec![], verdict: PurityVerdict::Pure,
+                    calls: vec![],
                 },
-                termination: Termination { form: TerminationForm::ConstantBound, bound: Some(3) },
-                determinism: Determinism { form: DeterminismForm::Total },
+                termination: Termination { bound: Some(3) },
             },
             hints: None,
             layer: None,
@@ -1101,10 +1082,9 @@ mod tests {
             proofs: Proofs {
                 purity: Purity {
                     reads: vec![Path { segments: vec!["i".into(), "x".into()] }],
-                    calls: vec![], verdict: PurityVerdict::Pure,
+                    calls: vec![],
                 },
-                termination: Termination { form: TerminationForm::ConstantBound, bound: Some(20) },
-                determinism: Determinism { form: DeterminismForm::Total },
+                termination: Termination { bound: Some(20) },
             },
             hints: None,
             layer: None,
@@ -1152,10 +1132,9 @@ mod tests {
             proofs: Proofs {
                 purity: Purity {
                     reads: vec![Path { segments: vec!["i".into(), "x".into()] }],
-                    calls: vec![], verdict: PurityVerdict::Pure,
+                    calls: vec![],
                 },
-                termination: Termination { form: TerminationForm::ConstantBound, bound: Some(4) },
-                determinism: Determinism { form: DeterminismForm::Total },
+                termination: Termination { bound: Some(4) },
             },
             hints: None,
             layer: None,

@@ -46,12 +46,8 @@ rule bonus_report
     purity:
       reads   : [w.employees]
       calls   : []
-      verdict : pure
     termination:
-      form  : constant_bound
       bound : 8
-    determinism:
-      form : total
 
 
 -- Rule 2: count high earners (Phase 4)
@@ -72,12 +68,8 @@ rule high_earner_count
     purity:
       reads   : [w.employees]
       calls   : []
-      verdict : pure
     termination:
-      form  : constant_bound
       bound : 5
-    determinism:
-      form : total
 
 
 -- Rule 3: total salaries (Phase 4)
@@ -98,12 +90,8 @@ rule total_salaries
     purity:
       reads   : [w.employees]
       calls   : []
-      verdict : pure
     termination:
-      form  : constant_bound
       bound : 2
-    determinism:
-      form : total
 
 
 -- Rule 4: roster line (Phase 5b fold-to-text)
@@ -124,9 +112,5 @@ rule roster_line
     purity:
       reads   : [w.employees]
       calls   : []
-      verdict : pure
     termination:
-      form  : constant_bound
       bound : 6
-    determinism:
-      form : total

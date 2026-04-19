@@ -41,9 +41,5 @@ rule make_report
     purity:
       reads   : [e.name, e.salary]
       calls   : []
-      verdict : pure
     termination:
-      form  : constant_bound
       bound : 4
-    determinism:
-      form : total

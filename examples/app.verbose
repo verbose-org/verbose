@@ -22,12 +22,8 @@ rule total_due
     purity:
       reads   : [i, i.amount]
       calls   : [standard_tax]
-      verdict : pure
     termination:
-      form  : constant_bound
       bound : 2
-    determinism:
-      form : total
 
 
 rule urgent_invoice
@@ -47,9 +43,5 @@ rule urgent_invoice
     purity:
       reads   : [i]
       calls   : [invoice_overdue, total_due]
-      verdict : pure
     termination:
-      form  : constant_bound
       bound : 4
-    determinism:
-      form : total

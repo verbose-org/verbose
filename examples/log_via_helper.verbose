@@ -34,12 +34,8 @@ rule severity_line
     purity:
       reads   : [e.user, e.code]
       calls   : []
-      verdict : pure
     termination:
-      form  : constant_bound
       bound : 5
-    determinism:
-      form : total
 
 
 rule is_alert
@@ -59,12 +55,8 @@ rule is_alert
     purity:
       reads   : [e.code]
       calls   : []
-      verdict : pure
     termination:
-      form  : constant_bound
       bound : 1
-    determinism:
-      form : total
 
 
 reaction log_alert

@@ -29,12 +29,8 @@ rule penalty_rate
     purity:
       reads   : [i.days_overdue]
       calls   : []
-      verdict : pure
     termination:
-      form  : constant_bound
       bound : 5
-    determinism:
-      form : total
 
   hints:
     overflow : [0, 100]
@@ -59,9 +55,5 @@ rule final_amount
     purity:
       reads   : [i, i.amount, i.tax_rate]
       calls   : [penalty_rate]
-      verdict : pure
     termination:
-      form  : constant_bound
       bound : 7
-    determinism:
-      form : total

@@ -1,6 +1,6 @@
 @verbose 0.1.0
 
--- POC minimal program: one concept, one pure rule, three structured proofs.
+-- POC minimal program: one concept, one pure rule, two structured proofs.
 -- Goal: exercise parse -> verify -> execute on the smallest viable example.
 
 concept Invoice
@@ -28,14 +28,10 @@ rule important_invoice
     purity:
       reads   : [i.amount]
       calls   : []
-      verdict : pure
 
     termination:
-      form  : constant_bound
       bound : 1
 
-    determinism:
-      form : total
 
   hints:
     vectorizable : "scalar threshold comparison on a single field; no calls and no cross-element dependency"

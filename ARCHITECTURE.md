@@ -105,7 +105,6 @@ Circular imports are detected and skipped.
 AI declares:             Verifier checks:
   reads: [i.amount]  →  walks AST, lists all accesses → [i.amount] ✓
   calls: []          →  no function calls → [] ✓
-  verdict: pure      →  calls=[] → pure ✓
   bound: 1           →  counts operations: 1 (Gt) → 1 ≤ 1 ✓
   overflow: [0, 100] →  interval arithmetic: [0, 100] ⊆ [0, 100] ✓
 ```
@@ -116,9 +115,7 @@ AI declares:             Verifier checks:
 |---|---|
 | reads match | Declared fields = actual field accesses in AST |
 | calls match | Declared calls = actual rule invocations in AST |
-| verdict coherent | pure ↔ calls=[] |
 | termination bound | Declared bound ≥ actual operation count |
-| determinism | total ↔ no non-deterministic calls |
 | source exists | @source: file:line → file and line exist |
 | field exists | Every accessed field (i.amount) exists on the concept |
 | target matches | Logic target = declared output name |

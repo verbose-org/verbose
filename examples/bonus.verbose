@@ -50,12 +50,8 @@ rule eligible
     purity:
       reads   : [e.tenure]
       calls   : []
-      verdict : pure
     termination:
-      form  : constant_bound
       bound : 1
-    determinism:
-      form : total
 
 
 rule bonus_amount
@@ -75,12 +71,8 @@ rule bonus_amount
     purity:
       reads   : [e, e.salary]
       calls   : [eligible]
-      verdict : pure
     termination:
-      form  : constant_bound
       bound : 4
-    determinism:
-      form : total
 
 
 rule report
@@ -100,9 +92,5 @@ rule report
     purity:
       reads   : [w.employees]
       calls   : [bonus_amount]
-      verdict : pure
     termination:
-      form  : constant_bound
       bound : 5
-    determinism:
-      form : total

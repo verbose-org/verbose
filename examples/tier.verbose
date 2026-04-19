@@ -31,9 +31,5 @@ rule classify_tier
     purity:
       reads   : [c.balance]
       calls   : []
-      verdict : pure
     termination:
-      form  : constant_bound
       bound : 6
-    determinism:
-      form : total

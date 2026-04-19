@@ -27,12 +27,8 @@ rule important_invoice
     purity:
       reads   : [i.amount]
       calls   : []
-      verdict : pure
     termination:
-      form  : constant_bound
       bound : 1
-    determinism:
-      form : total
 
 
 -- This is NOT a rule (pure computation). It's a REACTION (side effect).

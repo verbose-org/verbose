@@ -158,7 +158,6 @@ fn verify_rule(
 
     check_purity(rule, &facts, errors);
     check_termination(rule, errors);
-    check_determinism(rule, &facts, errors);
 
     if let Some(hints) = &rule.hints {
         check_hints(rule, hints, &facts, concepts, errors);
@@ -488,21 +487,6 @@ fn check_hints(
                 message: "vectorizable requires no calls (element must be independent)".into(),
             });
         }
-        if !matches!(rule.proofs.purity.verdict, PurityVerdict::Pure) {
-            errors.push(VerifyError {
-                context: format!("rule '{}' / hints.vectorizable", rule.name),
-                message: "vectorizable requires pure verdict".into(),
-            });
-        }
-    }
-
-    if hints.parallel.is_some() {
-        if !matches!(rule.proofs.purity.verdict, PurityVerdict::Pure) {
-            errors.push(VerifyError {
-                context: format!("rule '{}' / hints.parallel", rule.name),
-                message: "parallel requires pure verdict (no side effects between elements)".into(),
-            });
-        }
     }
 
     if let Some(overflow) = &hints.overflow {
@@ -804,35 +788,30 @@ fn check_purity(rule: &Rule, facts: &LogicFacts, errors: &mut Vec<VerifyError>) 
         });
     }
 
-    match &rule.proofs.purity.verdict {
-        PurityVerdict::Pure => {}
-    }
 }
 
 fn check_termination(rule: &Rule, errors: &mut Vec<VerifyError>) {
     let ctx = |sub: &str| format!("rule '{}' / {}", rule.name, sub);
 
-    match rule.proofs.termination.form {
-        TerminationForm::ConstantBound => match rule.proofs.termination.bound {
-            Some(declared) => {
-                let actual = count_operations(&rule.logic.value) as i64;
-                if declared < actual {
-                    errors.push(VerifyError {
-                        context: ctx("termination.bound"),
-                        message: format!(
-                            "declared bound {} is less than actual operation count {}",
-                            declared, actual
-                        ),
-                    });
-                }
-            }
-            None => {
+    match rule.proofs.termination.bound {
+        Some(declared) => {
+            let actual = count_operations(&rule.logic.value) as i64;
+            if declared < actual {
                 errors.push(VerifyError {
-                    context: ctx("termination"),
-                    message: "constant_bound requires a 'bound:' value".into(),
+                    context: ctx("termination.bound"),
+                    message: format!(
+                        "declared bound {} is less than actual operation count {}",
+                        declared, actual
+                    ),
                 });
             }
-        },
+        }
+        None => {
+            errors.push(VerifyError {
+                context: ctx("termination"),
+                message: "termination requires a 'bound:' value".into(),
+            });
+        }
     }
 }
 
@@ -859,17 +838,6 @@ fn count_operations(expr: &Expr) -> usize {
         Expr::Concat(args) => {
             // 1 op for the concat call itself + each arg.
             1 + args.iter().map(count_operations).sum::<usize>()
-        }
-    }
-}
-
-fn check_determinism(rule: &Rule, _facts: &LogicFacts, errors: &mut Vec<VerifyError>) {
-    let ctx = |sub: &str| format!("rule '{}' / {}", rule.name, sub);
-
-    match rule.proofs.determinism.form {
-        DeterminismForm::Total => {
-            // 'total' is valid if all called rules are themselves deterministic.
-            // For now we trust this — transitive determinism checking is a Phase 2 feature.
         }
     }
 }
@@ -978,12 +946,8 @@ rule important_invoice
     purity:
       reads   : [i.amount]
       calls   : []
-      verdict : pure
     termination:
-      form  : constant_bound
       bound : 1
-    determinism:
-      form : total
 "#;
 
     fn verify_str(src: &str) -> Vec<VerifyError> {
@@ -1023,12 +987,8 @@ rule trig
     purity:
       reads   : [t.x]
       calls   : []
-      verdict : pure
     termination:
-      form  : constant_bound
       bound : 1
-    determinism:
-      form : total
 
 reaction bad
   @intention: "z"
@@ -1071,12 +1031,8 @@ rule bad
     purity:
       reads   : [b.items]
       calls   : []
-      verdict : pure
     termination:
-      form  : constant_bound
       bound : 2
-    determinism:
-      form : total
 "#;
         let errs = verify_str(src);
         assert!(
@@ -1110,12 +1066,8 @@ rule make
     purity:
       reads   : [i.x]
       calls   : []
-      verdict : pure
     termination:
-      form  : constant_bound
       bound : 1
-    determinism:
-      form : total
 "#;
         let errs = verify_str(src);
         // Two errors expected: unknown type 'Ghost' on output, and unknown
@@ -1158,12 +1110,8 @@ rule make
     purity:
       reads   : [i.x]
       calls   : []
-      verdict : pure
     termination:
-      form  : constant_bound
       bound : 1
-    determinism:
-      form : total
 "#;
         let errs = verify_str(src);
         assert!(
@@ -1203,12 +1151,8 @@ rule make
     purity:
       reads   : [i.x]
       calls   : []
-      verdict : pure
     termination:
-      form  : constant_bound
       bound : 1
-    determinism:
-      form : total
 "#;
         let errs = verify_str(src);
         assert!(
@@ -1248,12 +1192,8 @@ rule make
     purity:
       reads   : [i.x]
       calls   : []
-      verdict : pure
     termination:
-      form  : constant_bound
       bound : 2
-    determinism:
-      form : total
 "#;
         let errs = verify_str(src);
         // The b field is declared number but its expression is bool.
@@ -1291,12 +1231,8 @@ rule wrong
     purity:
       reads   : [b.items]
       calls   : []
-      verdict : pure
     termination:
-      form  : constant_bound
       bound : 2
-    determinism:
-      form : total
 "#;
         let errs = verify_str(src);
         assert!(
@@ -1332,12 +1268,8 @@ rule bad
     purity:
       reads   : [t.amount]
       calls   : []
-      verdict : pure
     termination:
-      form  : constant_bound
       bound : 1
-    determinism:
-      form : total
 "#;
         let errs = verify_str(src);
         assert!(
@@ -1373,12 +1305,8 @@ rule bad
     purity:
       reads   : [t.amount]
       calls   : []
-      verdict : pure
     termination:
-      form  : constant_bound
       bound : 3
-    determinism:
-      form : total
 "#;
         let errs = verify_str(src);
         assert!(
@@ -1415,12 +1343,8 @@ rule bad
     purity:
       reads   : [t.amount]
       calls   : []
-      verdict : pure
     termination:
-      form  : constant_bound
       bound : 1
-    determinism:
-      form : total
 "#;
         let errs = verify_str(src);
         assert!(
@@ -1458,12 +1382,8 @@ rule is_large
     purity:
       reads   : [i.amount]
       calls   : []
-      verdict : pure
     termination:
-      form  : constant_bound
       bound : 1
-    determinism:
-      form : total
 
 rule flag_critical
   @intention: "y"
@@ -1479,12 +1399,8 @@ rule flag_critical
     purity:
       reads   : [i]
       calls   : [is_large]
-      verdict : pure
     termination:
-      form  : constant_bound
       bound : 1
-    determinism:
-      form : total
 "#;
         let errs = verify_str(src);
         assert!(errs.is_empty(), "expected no errors, got {:#?}", errs);
@@ -1516,12 +1432,8 @@ rule upper_orchestration
     purity:
       reads   : [i.amount]
       calls   : []
-      verdict : pure
     termination:
-      form  : constant_bound
       bound : 1
-    determinism:
-      form : total
 
 rule lower_domain
   @intention: "y"
@@ -1537,12 +1449,8 @@ rule lower_domain
     purity:
       reads   : [i]
       calls   : [upper_orchestration]
-      verdict : pure
     termination:
-      form  : constant_bound
       bound : 1
-    determinism:
-      form : total
 "#;
         let errs = verify_str(src);
         assert!(
@@ -1579,12 +1487,8 @@ rule unlayered_helper
     purity:
       reads   : [i.amount]
       calls   : []
-      verdict : pure
     termination:
-      form  : constant_bound
       bound : 1
-    determinism:
-      form : total
 
 rule layered_caller
   @intention: "y"
@@ -1600,12 +1504,8 @@ rule layered_caller
     purity:
       reads   : [i]
       calls   : [unlayered_helper]
-      verdict : pure
     termination:
-      form  : constant_bound
       bound : 1
-    determinism:
-      form : total
 "#;
         let errs = verify_str(src);
         assert!(
@@ -1788,12 +1688,8 @@ rule incremented
     purity:
       reads   : [b.items]
       calls   : []
-      verdict : pure
     termination:
-      form  : constant_bound
       bound : 2
-    determinism:
-      form : total
 "#;
         let errs = verify_str(src);
         assert!(errs.is_empty(), "expected no errors, got {:#?}", errs);
@@ -1824,12 +1720,8 @@ rule positives
     purity:
       reads   : []
       calls   : []
-      verdict : pure
     termination:
-      form  : constant_bound
       bound : 3
-    determinism:
-      form : total
 "#;
         let errs = verify_str(src);
         assert!(
@@ -1937,12 +1829,8 @@ rule helper
     purity:
       reads: [t.x]
       calls: []
-      verdict: pure
     termination:
-      form: constant_bound
       bound: 1
-    determinism:
-      form: total
 rule test_bad
   @intention: "t"
   @source: invoices.intent:1
@@ -1956,12 +1844,8 @@ rule test_bad
     purity:
       reads: [t]
       calls: [helper]
-      verdict: pure
     termination:
-      form: constant_bound
       bound: 1
-    determinism:
-      form: total
   hints:
     vectorizable: "SIMD claim: no calls, no cross-element dependency"
 "#;
@@ -1994,12 +1878,8 @@ rule test
     purity:
       reads: [t.x]
       calls: []
-      verdict: pure
     termination:
-      form: constant_bound
       bound: 1
-    determinism:
-      form: total
   hints:
     overflow: [10, 110]
 "#;
@@ -2028,12 +1908,8 @@ rule test
     purity:
       reads: [t.x]
       calls: []
-      verdict: pure
     termination:
-      form: constant_bound
       bound: 1
-    determinism:
-      form: total
   hints:
     overflow: [10, 100]
 "#;
@@ -2101,12 +1977,8 @@ rule test
     purity:
       reads: [t.a, t.b]
       calls: []
-      verdict: pure
     termination:
-      form: constant_bound
       bound: 2
-    determinism:
-      form: total
 "#;
         let errs = verify_str(src);
         assert!(errs.is_empty(), "expected no errors, got: {:#?}", errs);

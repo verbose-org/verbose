@@ -32,12 +32,8 @@ rule stock_value
     purity:
       reads   : [p.price, p.quantity]
       calls   : []
-      verdict : pure
     termination:
-      form  : constant_bound
       bound : 1
-    determinism:
-      form : total
 
   hints:
     vectorizable : "pure arithmetic over two fields per record, no calls, no cross-element dependency"
@@ -61,12 +57,8 @@ rule low_stock
     purity:
       reads   : [p.quantity]
       calls   : []
-      verdict : pure
     termination:
-      form  : constant_bound
       bound : 1
-    determinism:
-      form : total
 
   hints:
     vectorizable : "single-field threshold comparison; each record independent"
@@ -89,9 +81,5 @@ rule needs_reorder
     purity:
       reads   : [p]
       calls   : [low_stock, stock_value]
-      verdict : pure
     termination:
-      form  : constant_bound
       bound : 4
-    determinism:
-      form : total

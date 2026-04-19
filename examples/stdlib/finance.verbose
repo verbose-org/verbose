@@ -30,12 +30,8 @@ rule standard_tax
     purity:
       reads   : [i.amount, i.tax_rate]
       calls   : []
-      verdict : pure
     termination:
-      form  : constant_bound
       bound : 2
-    determinism:
-      form : total
 
 
 rule invoice_overdue
@@ -55,12 +51,8 @@ rule invoice_overdue
     purity:
       reads   : [i.days_overdue]
       calls   : []
-      verdict : pure
     termination:
-      form  : constant_bound
       bound : 1
-    determinism:
-      form : total
 
   hints:
     vectorizable : "scalar comparison on a single field; no calls and no cross-element dependency"

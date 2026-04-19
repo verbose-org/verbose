@@ -31,12 +31,8 @@ rule total_with_tax
     purity:
       reads   : [i.amount, i.tax_rate]
       calls   : []
-      verdict : pure
     termination:
-      form  : constant_bound
       bound : 3
-    determinism:
-      form : total
 
   hints:
     parallel : "pure arithmetic over independent invoices; each iteration has no dependency on the others"
@@ -59,12 +55,8 @@ rule important_invoice
     purity:
       reads   : [i]
       calls   : [total_with_tax]
-      verdict : pure
     termination:
-      form  : constant_bound
       bound : 2
-    determinism:
-      form : total
 
 
 rule overdue_invoice
@@ -84,12 +76,8 @@ rule overdue_invoice
     purity:
       reads   : [i.days_overdue]
       calls   : []
-      verdict : pure
     termination:
-      form  : constant_bound
       bound : 1
-    determinism:
-      form : total
 
 
 -- Composed rule: calls important + overdue, combines with 'and'.
@@ -110,9 +98,5 @@ rule critical_invoice
     purity:
       reads   : [i]
       calls   : [important_invoice, overdue_invoice]
-      verdict : pure
     termination:
-      form  : constant_bound
       bound : 3
-    determinism:
-      form : total

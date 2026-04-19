@@ -326,12 +326,8 @@ rule test_rule
     purity:
       reads: [t.x]
       calls: []
-      verdict: pure
     termination:
-      form: constant_bound
       bound: 1
-    determinism:
-      form: total
 "#;
         let tokens = Lexer::new(src).tokenize().unwrap();
         let program = Parser::new(tokens).parse_program().unwrap();
@@ -371,12 +367,8 @@ rule add_them
     purity:
       reads: [t.a, t.b]
       calls: []
-      verdict: pure
     termination:
-      form: constant_bound
       bound: 2
-    determinism:
-      form: total
 "#;
         let tokens = Lexer::new(src).tokenize().unwrap();
         let program = Parser::new(tokens).parse_program().unwrap();

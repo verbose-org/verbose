@@ -139,7 +139,7 @@ impl Layer {
 #[derive(Debug, Clone)]
 pub struct Hints {
     /// Declared iff the AI believes SIMD is safe; the String is the justification.
-    /// Verifier then cross-checks the claim (no calls, pure verdict, etc.).
+    /// Verifier then cross-checks the claim (no calls, etc.).
     /// The justification is the audit surface: what makes the AI claim this is safe.
     pub vectorizable: Option<String>,
     pub parallel: Option<String>,
@@ -245,14 +245,12 @@ pub enum BinOp {
 pub struct Proofs {
     pub purity: Purity,
     pub termination: Termination,
-    pub determinism: Determinism,
 }
 
 #[derive(Debug, Clone)]
 pub struct Purity {
     pub reads: Vec<Path>,
     pub calls: Vec<Path>,
-    pub verdict: PurityVerdict,
 }
 
 #[derive(Debug, Clone)]
@@ -261,27 +259,6 @@ pub struct Path {
 }
 
 #[derive(Debug, Clone)]
-pub enum PurityVerdict {
-    Pure,
-}
-
-#[derive(Debug, Clone)]
 pub struct Termination {
-    pub form: TerminationForm,
     pub bound: Option<i64>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TerminationForm {
-    ConstantBound,
-}
-
-#[derive(Debug, Clone)]
-pub struct Determinism {
-    pub form: DeterminismForm,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DeterminismForm {
-    Total,
 }

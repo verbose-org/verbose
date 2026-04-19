@@ -28,12 +28,8 @@ rule alert_level
     purity:
       reads   : [s.temperature]
       calls   : []
-      verdict : pure
     termination:
-      form  : constant_bound
       bound : 5
-    determinism:
-      form : total
 
   hints:
     overflow : [0, 2]

@@ -263,7 +263,7 @@ fn main() {
         if elim > 0 {
             println!("  Optimizations:    {} AST nodes eliminated", elim);
         }
-        println!("  Proofs verified:  purity, termination, determinism");
+        println!("  Proofs verified:  purity, termination");
     } else if let Some(output) = native_output {
         let native_rule_str = find_flag(&args, "--run").unwrap_or_else(|| {
             program

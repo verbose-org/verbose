@@ -42,9 +42,5 @@ rule is_allowed
     purity:
       reads   : [r.amount, r.customer_age, p.max_amount, p.min_age]
       calls   : []
-      verdict : pure
     termination:
-      form  : constant_bound
       bound : 5
-    determinism:
-      form : total

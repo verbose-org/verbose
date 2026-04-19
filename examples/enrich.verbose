@@ -37,12 +37,8 @@ rule validate_amount
     purity:
       reads   : [p.amount]
       calls   : []
-      verdict : pure
     termination:
-      form  : constant_bound
       bound : 5
-    determinism:
-      form : total
 
 
 rule enriched
@@ -66,9 +62,5 @@ rule enriched
     purity:
       reads   : [p, p.user]
       calls   : [validate_amount]
-      verdict : pure
     termination:
-      form  : constant_bound
       bound : 10
-    determinism:
-      form : total
