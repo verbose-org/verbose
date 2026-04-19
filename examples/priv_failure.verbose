@@ -1,0 +1,37 @@
+@verbose 0.1.0
+
+-- SIEM single-event predicate, inspired by the Sigma rule family that
+-- detects failed Windows logons (EventID 4625) against a named list of
+-- privileged accounts. Each event line produces a bool verdict; the
+-- binary is meant to run in --stream mode on a log feed.
+
+
+concept WinSecurityEvent
+  @intention: "A Windows security event has an event ID, a target user name, and a source IP"
+  @source: priv_failure.intent:1
+
+  fields:
+    event_id    : number [0, 65535]
+    target_user : text [..64]
+    source_ip   : text [..45]
+
+
+rule privileged_login_failure
+  @intention: "A privileged login failure is a failed logon (event ID 4625) against Administrator, Guest, or krbtgt"
+  @source: priv_failure.intent:2
+
+  input:
+    e : WinSecurityEvent
+
+  output:
+    privileged_failure : bool
+
+  logic:
+    privileged_failure = e.event_id == 4625 and (e.target_user == "Administrator" or e.target_user == "Guest" or e.target_user == "krbtgt")
+
+  proofs:
+    purity:
+      reads : [e.event_id, e.target_user]
+      calls : []
+    termination:
+      bound : 7

@@ -1,0 +1,2 @@
+1. A Windows security event has an event ID, a target user name, and a source IP.
+2. A privileged login failure is a failed logon (event ID 4625) against a privileged account (Administrator, Guest, or krbtgt).
