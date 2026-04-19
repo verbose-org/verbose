@@ -1,0 +1,4 @@
+1. A loan applicant has an annual income, a credit score, an employment duration in months, and a count of recent defaults.
+2. A loan application is approved when the applicant's income is at least 25000, their credit score is at least 600, their employment has lasted at least 6 months, and they have zero recent defaults.
+3. When approved, the authorized loan amount equals thirty percent of the applicant's annual income.
+4. When refused, the first failing criterion is reported verbatim as the explicit reason for the refusal.

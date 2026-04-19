@@ -1,0 +1,72 @@
+@verbose 0.1.0
+
+-- EU AI Act high-risk demo: automated loan decision.
+--
+-- Regulatory anchor: Annex III point 5(b) of Regulation (EU) 2024/1689
+-- explicitly classifies "AI systems intended to be used to evaluate the
+-- creditworthiness of natural persons or establish their credit score"
+-- as HIGH-RISK. That classification triggers the full obligations of
+-- Articles 12, 13, 17, and 86.
+--
+-- How each Verbose artefact contributes to compliance:
+--
+--   .intent (loan_decision.intent)
+--     Four numbered sentences in natural language stating what the rule
+--     does. This is the human-readable disclosure Article 13 (transparency)
+--     requires. A refused applicant, a regulator, or an internal auditor
+--     reads this first.
+--
+--   .verbose (this file)
+--     The formal specification. Declared reads / calls / termination bound
+--     give a mechanically-verified promise that the binary reads exactly
+--     these four fields and terminates in at most 15 operations. The logic
+--     expression is inspectable line-by-line and cross-checked by the
+--     verifier against the declarations.
+--
+--     Critically, each Err branch carries a plain-text rejection reason.
+--     That text IS the explanation Article 86 obliges the provider to
+--     produce for any refused applicant — generated mechanically by the
+--     binary, not reconstructed after-the-fact by a compliance team.
+--
+--   Compiled binary
+--     Executes exactly this .verbose, nothing else. Per-decision logging
+--     for Article 12 becomes a trivial wrapper around the process
+--     (timestamp + input + stdout/stderr verdict). Zero dependencies means
+--     no supply-chain surface to document or mitigate separately.
+--
+-- Audit chain, end to end: intent → verbose → binary → verdict. Every
+-- arrow is either human-readable prose or mechanically verified. A
+-- regulator or adversely-impacted applicant can reconstruct "why was
+-- application #17492 refused?" in minutes.
+
+
+concept LoanApplicant
+  @intention: "A loan applicant has income, credit score, employment duration in months, and a count of recent defaults"
+  @source: loan_decision.intent:1
+
+  fields:
+    income            : number [0, 10000000]
+    credit_score      : number [0, 1000]
+    employment_months : number [0, 600]
+    recent_defaults   : number [0, 100]
+
+
+rule loan_decision
+  @intention: "Approve with thirty percent of income when all four criteria are met; otherwise refuse with the first failing criterion as the stated reason"
+  @source: loan_decision.intent:2
+
+  input:
+    i : LoanApplicant
+
+  output:
+    decision : Result(number, text)
+
+  logic:
+    decision = if i.income < 25000 then Err("income below minimum required 25000") else if i.credit_score < 600 then Err("credit score below required 600") else if i.employment_months < 6 then Err("employment stability below required 6 months") else if i.recent_defaults > 0 then Err("recent defaults on record must be zero") else Ok(i.income * 3 / 10)
+
+  proofs:
+    purity:
+      reads : [i.income, i.credit_score, i.employment_months, i.recent_defaults]
+      calls : []
+    termination:
+      bound : 15
