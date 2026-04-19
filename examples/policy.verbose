@@ -41,7 +41,6 @@ rule is_allowed
   proofs:
     purity:
       reads   : [r.amount, r.customer_age, p.max_amount, p.min_age]
-      writes  : []
       calls   : []
       verdict : pure
     termination:

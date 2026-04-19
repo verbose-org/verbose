@@ -31,7 +31,6 @@ rule validate_purchase
   proofs:
     purity:
       reads   : [p.customer_age, p.amount]
-      writes  : []
       calls   : []
       verdict : pure
     termination:
@@ -57,7 +56,6 @@ rule discounted_purchase
   proofs:
     purity:
       reads   : [p]
-      writes  : []
       calls   : [validate_purchase]
       verdict : pure
     termination:

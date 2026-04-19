@@ -31,7 +31,6 @@ rule total_revenue
   proofs:
     purity:
       reads   : [c.invoices]
-      writes  : []
       calls   : []
       verdict : pure
     termination:
@@ -53,7 +52,6 @@ rule overdue_count
   proofs:
     purity:
       reads   : [c.invoices]
-      writes  : []
       calls   : []
       verdict : pure
     termination:
@@ -75,7 +73,6 @@ rule overdue_amount
   proofs:
     purity:
       reads   : [c.invoices]
-      writes  : []
       calls   : []
       verdict : pure
     termination:
@@ -97,7 +94,6 @@ rule risk_score
   proofs:
     purity:
       reads   : [c.invoices]
-      writes  : []
       calls   : []
       verdict : pure
     termination:

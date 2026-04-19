@@ -31,7 +31,6 @@ rule stock_value
   proofs:
     purity:
       reads   : [p.price, p.quantity]
-      writes  : []
       calls   : []
       verdict : pure
     termination:
@@ -61,7 +60,6 @@ rule low_stock
   proofs:
     purity:
       reads   : [p.quantity]
-      writes  : []
       calls   : []
       verdict : pure
     termination:
@@ -90,7 +88,6 @@ rule needs_reorder
   proofs:
     purity:
       reads   : [p]
-      writes  : []
       calls   : [low_stock, stock_value]
       verdict : pure
     termination:

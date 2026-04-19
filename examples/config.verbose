@@ -30,7 +30,6 @@ rule valid_connections
   proofs:
     purity:
       reads   : [c.max_conn]
-      writes  : []
       calls   : []
       verdict : pure
     termination:
@@ -56,7 +55,6 @@ rule valid_log_level
   proofs:
     purity:
       reads   : [c.log_level]
-      writes  : []
       calls   : []
       verdict : pure
     termination:
@@ -82,7 +80,6 @@ rule valid_timeout
   proofs:
     purity:
       reads   : [c.timeout]
-      writes  : []
       calls   : []
       verdict : pure
     termination:
@@ -108,7 +105,6 @@ rule safe_config
   proofs:
     purity:
       reads   : [c.max_conn, c.timeout]
-      writes  : []
       calls   : []
       verdict : pure
     termination:
@@ -134,7 +130,6 @@ rule adjusted_timeout
   proofs:
     purity:
       reads   : [c]
-      writes  : []
       calls   : [valid_timeout]
       verdict : pure
     termination:

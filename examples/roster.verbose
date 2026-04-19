@@ -44,7 +44,6 @@ rule roster_line
   proofs:
     purity:
       reads   : [w.employees]
-      writes  : []
       calls   : []
       verdict : pure
     termination:

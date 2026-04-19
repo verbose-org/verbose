@@ -22,7 +22,6 @@ rule high_value
   proofs:
     purity:
       reads   : [i.amount]
-      writes  : []
       calls   : []
       verdict : pure
     termination:

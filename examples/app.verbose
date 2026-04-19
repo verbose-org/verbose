@@ -21,7 +21,6 @@ rule total_due
   proofs:
     purity:
       reads   : [i, i.amount]
-      writes  : []
       calls   : [standard_tax]
       verdict : pure
     termination:
@@ -47,7 +46,6 @@ rule urgent_invoice
   proofs:
     purity:
       reads   : [i]
-      writes  : []
       calls   : [invoice_overdue, total_due]
       verdict : pure
     termination:

@@ -27,7 +27,6 @@ rule alert_level
   proofs:
     purity:
       reads   : [s.temperature]
-      writes  : []
       calls   : []
       verdict : pure
     termination:

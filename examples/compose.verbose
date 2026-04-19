@@ -36,7 +36,6 @@ rule display_name
   proofs:
     purity:
       reads   : [p.first, p.last]
-      writes  : []
       calls   : []
       verdict : pure
     termination:
@@ -62,7 +61,6 @@ rule name_line
   proofs:
     purity:
       reads   : [p]
-      writes  : []
       calls   : [display_name]
       verdict : pure
     termination:
@@ -88,7 +86,6 @@ rule greeting
   proofs:
     purity:
       reads   : [p, p.age]
-      writes  : []
       calls   : [display_name]
       verdict : pure
     termination:

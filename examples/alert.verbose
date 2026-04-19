@@ -29,7 +29,6 @@ rule is_critical
   proofs:
     purity:
       reads   : [e.severity]
-      writes  : []
       calls   : []
       verdict : pure
     termination:
@@ -55,7 +54,6 @@ rule watched_source
   proofs:
     purity:
       reads   : [e.source]
-      writes  : []
       calls   : []
       verdict : pure
     termination:
@@ -81,7 +79,6 @@ rule should_alert
   proofs:
     purity:
       reads   : [e]
-      writes  : []
       calls   : [is_critical, watched_source]
       verdict : pure
     termination:

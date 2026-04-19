@@ -350,7 +350,6 @@ mod tests {
                             reads: vec![Path {
                                 segments: vec!["f".into(), "x".into()],
                             }],
-                            writes: vec![],
                             calls: vec![],
                             verdict: PurityVerdict::Pure,
                         },

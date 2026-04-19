@@ -33,7 +33,6 @@ rule is_bulk
   proofs:
     purity:
       reads   : [o.amount]
-      writes  : []
       calls   : []
       verdict : pure
     termination:
@@ -60,7 +59,6 @@ rule is_priority
   proofs:
     purity:
       reads   : [o, o.tier]
-      writes  : []
       calls   : [is_bulk]
       verdict : pure
     termination:

@@ -31,7 +31,6 @@ rule is_suspicious
   proofs:
     purity:
       reads   : [p.customer_age]
-      writes  : []
       calls   : []
       verdict : pure
     termination:

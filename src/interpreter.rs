@@ -516,7 +516,6 @@ mod tests {
                     reads: vec![Path {
                         segments: vec!["i".into(), "amount".into()],
                     }],
-                    writes: vec![],
                     calls: vec![],
                     verdict: PurityVerdict::Pure,
                 },
@@ -631,7 +630,6 @@ mod tests {
             proofs: Proofs {
                 purity: Purity {
                     reads: vec![Path { segments: vec!["i".into(), "x".into()] }],
-                    writes: vec![],
                     calls: vec![],
                     verdict: PurityVerdict::Pure,
                 },
@@ -671,7 +669,6 @@ mod tests {
             proofs: Proofs {
                 purity: Purity {
                     reads: vec![Path { segments: vec!["i".into(), "x".into()] }],
-                    writes: vec![],
                     calls: vec![],
                     verdict: PurityVerdict::Pure,
                 },
@@ -715,7 +712,6 @@ mod tests {
             proofs: Proofs {
                 purity: Purity {
                     reads: vec![Path { segments: vec!["i".into(), "x".into()] }],
-                    writes: vec![],
                     calls: vec![],
                     verdict: PurityVerdict::Pure,
                 },
@@ -758,7 +754,6 @@ mod tests {
             proofs: Proofs {
                 purity: Purity {
                     reads: vec![Path { segments: vec!["i".into(), "s".into()] }],
-                    writes: vec![],
                     calls: vec![],
                     verdict: PurityVerdict::Pure,
                 },
@@ -800,7 +795,7 @@ mod tests {
             proofs: Proofs {
                 purity: Purity {
                     reads: vec![Path { segments: vec!["i".into(), "x".into()] }],
-                    writes: vec![], calls: vec![], verdict: PurityVerdict::Pure,
+                    calls: vec![], verdict: PurityVerdict::Pure,
                 },
                 termination: Termination { form: TerminationForm::ConstantBound, bound: Some(1) },
                 determinism: Determinism { form: DeterminismForm::Total },
@@ -844,7 +839,7 @@ mod tests {
             proofs: Proofs {
                 purity: Purity {
                     reads: vec![Path { segments: vec!["i".into(), "x".into()] }],
-                    writes: vec![], calls: vec![], verdict: PurityVerdict::Pure,
+                    calls: vec![], verdict: PurityVerdict::Pure,
                 },
                 termination: Termination { form: TerminationForm::ConstantBound, bound: Some(2) },
                 determinism: Determinism { form: DeterminismForm::Total },
@@ -885,7 +880,7 @@ mod tests {
             proofs: Proofs {
                 purity: Purity {
                     reads: vec![Path { segments: vec!["i".into(), "x".into()] }],
-                    writes: vec![], calls: vec![], verdict: PurityVerdict::Pure,
+                    calls: vec![], verdict: PurityVerdict::Pure,
                 },
                 termination: Termination { form: TerminationForm::ConstantBound, bound: Some(1) },
                 determinism: Determinism { form: DeterminismForm::Total },
@@ -927,7 +922,7 @@ mod tests {
             proofs: Proofs {
                 purity: Purity {
                     reads: vec![Path { segments: vec!["i".into(), "items".into()] }],
-                    writes: vec![], calls: vec![], verdict: PurityVerdict::Pure,
+                    calls: vec![], verdict: PurityVerdict::Pure,
                 },
                 termination: Termination { form: TerminationForm::VariableBound, bound: None },
                 determinism: Determinism { form: DeterminismForm::Total },
@@ -976,7 +971,7 @@ mod tests {
             proofs: Proofs {
                 purity: Purity {
                     reads: vec![Path { segments: vec!["i".into(), "items".into()] }],
-                    writes: vec![], calls: vec![], verdict: PurityVerdict::Pure,
+                    calls: vec![], verdict: PurityVerdict::Pure,
                 },
                 termination: Termination { form: TerminationForm::VariableBound, bound: None },
                 determinism: Determinism { form: DeterminismForm::Total },
@@ -1033,7 +1028,7 @@ mod tests {
             proofs: Proofs {
                 purity: Purity {
                     reads: vec![Path { segments: vec!["i".into(), "age".into()] }],
-                    writes: vec![], calls: vec![], verdict: PurityVerdict::Pure,
+                    calls: vec![], verdict: PurityVerdict::Pure,
                 },
                 termination: Termination { form: TerminationForm::ConstantBound, bound: Some(3) },
                 determinism: Determinism { form: DeterminismForm::Total },
@@ -1106,7 +1101,7 @@ mod tests {
             proofs: Proofs {
                 purity: Purity {
                     reads: vec![Path { segments: vec!["i".into(), "x".into()] }],
-                    writes: vec![], calls: vec![], verdict: PurityVerdict::Pure,
+                    calls: vec![], verdict: PurityVerdict::Pure,
                 },
                 termination: Termination { form: TerminationForm::ConstantBound, bound: Some(20) },
                 determinism: Determinism { form: DeterminismForm::Total },
@@ -1157,7 +1152,7 @@ mod tests {
             proofs: Proofs {
                 purity: Purity {
                     reads: vec![Path { segments: vec!["i".into(), "x".into()] }],
-                    writes: vec![], calls: vec![], verdict: PurityVerdict::Pure,
+                    calls: vec![], verdict: PurityVerdict::Pure,
                 },
                 termination: Termination { form: TerminationForm::ConstantBound, bound: Some(4) },
                 determinism: Determinism { form: DeterminismForm::Total },

@@ -39,7 +39,6 @@ rule retirement_status
   proofs:
     purity:
       reads   : [w.employees]
-      writes  : []
       calls   : []
       verdict : pure
     termination:
@@ -65,7 +64,6 @@ rule retirees
   proofs:
     purity:
       reads   : [w.employees]
-      writes  : []
       calls   : []
       verdict : pure
     termination:

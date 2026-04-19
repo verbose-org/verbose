@@ -54,7 +54,6 @@ rule rule_name
   proofs:
     purity:
       reads   : [var.field, ...]   -- every field accessed in logic
-      writes  : []                 -- must be empty for pure rules
       calls   : [other_rule, ...]  -- every rule called in logic
       verdict : pure               -- or: impure, pure_except(...)
     termination:

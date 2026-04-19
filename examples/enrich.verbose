@@ -36,7 +36,6 @@ rule validate_amount
   proofs:
     purity:
       reads   : [p.amount]
-      writes  : []
       calls   : []
       verdict : pure
     termination:
@@ -66,7 +65,6 @@ rule enriched
   proofs:
     purity:
       reads   : [p, p.user]
-      writes  : []
       calls   : [validate_amount]
       verdict : pure
     termination:

@@ -29,7 +29,6 @@ rule standard_tax
   proofs:
     purity:
       reads   : [i.amount, i.tax_rate]
-      writes  : []
       calls   : []
       verdict : pure
     termination:
@@ -55,7 +54,6 @@ rule invoice_overdue
   proofs:
     purity:
       reads   : [i.days_overdue]
-      writes  : []
       calls   : []
       verdict : pure
     termination:

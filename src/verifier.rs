@@ -756,7 +756,6 @@ fn check_purity(rule: &Rule, facts: &LogicFacts, errors: &mut Vec<VerifyError>) 
     let ctx = |sub: &str| format!("rule '{}' / {}", rule.name, sub);
 
     let declared_reads = path_list_to_set(&rule.proofs.purity.reads);
-    let declared_writes = path_list_to_set(&rule.proofs.purity.writes);
     let declared_calls = path_list_to_set(&rule.proofs.purity.calls);
 
     if declared_reads != facts.reads {
@@ -779,13 +778,6 @@ fn check_purity(rule: &Rule, facts: &LogicFacts, errors: &mut Vec<VerifyError>) 
         errors.push(VerifyError {
             context: ctx("purity.reads"),
             message: format!("declared reads do not match logic; {}", parts.join(", ")),
-        });
-    }
-
-    if !declared_writes.is_empty() {
-        errors.push(VerifyError {
-            context: ctx("purity.writes"),
-            message: "declared writes must be empty (POC grammar has no write operations)".into(),
         });
     }
 
@@ -815,10 +807,10 @@ fn check_purity(rule: &Rule, facts: &LogicFacts, errors: &mut Vec<VerifyError>) 
     match &rule.proofs.purity.verdict {
         PurityVerdict::Pure => {}
         PurityVerdict::Impure => {
-            if declared_writes.is_empty() && declared_calls.is_empty() {
+            if declared_calls.is_empty() {
                 errors.push(VerifyError {
                     context: ctx("purity.verdict"),
-                    message: "verdict 'impure' is inconsistent with empty writes and calls".into(),
+                    message: "verdict 'impure' is inconsistent with empty calls".into(),
                 });
             }
         }
@@ -1022,7 +1014,6 @@ rule important_invoice
   proofs:
     purity:
       reads   : [i.amount]
-      writes  : []
       calls   : []
       verdict : pure
     termination:
@@ -1068,7 +1059,6 @@ rule trig
   proofs:
     purity:
       reads   : [t.x]
-      writes  : []
       calls   : []
       verdict : pure
     termination:
@@ -1117,7 +1107,6 @@ rule bad
   proofs:
     purity:
       reads   : [b.items]
-      writes  : []
       calls   : []
       verdict : pure
     termination:
@@ -1157,7 +1146,6 @@ rule make
   proofs:
     purity:
       reads   : [i.x]
-      writes  : []
       calls   : []
       verdict : pure
     termination:
@@ -1206,7 +1194,6 @@ rule make
   proofs:
     purity:
       reads   : [i.x]
-      writes  : []
       calls   : []
       verdict : pure
     termination:
@@ -1252,7 +1239,6 @@ rule make
   proofs:
     purity:
       reads   : [i.x]
-      writes  : []
       calls   : []
       verdict : pure
     termination:
@@ -1298,7 +1284,6 @@ rule make
   proofs:
     purity:
       reads   : [i.x]
-      writes  : []
       calls   : []
       verdict : pure
     termination:
@@ -1342,7 +1327,6 @@ rule wrong
   proofs:
     purity:
       reads   : [b.items]
-      writes  : []
       calls   : []
       verdict : pure
     termination:
@@ -1384,7 +1368,6 @@ rule bad
   proofs:
     purity:
       reads   : [t.amount]
-      writes  : []
       calls   : []
       verdict : pure
     termination:
@@ -1426,7 +1409,6 @@ rule bad
   proofs:
     purity:
       reads   : [t.amount]
-      writes  : []
       calls   : []
       verdict : pure
     termination:
@@ -1469,7 +1451,6 @@ rule bad
   proofs:
     purity:
       reads   : [t.amount]
-      writes  : []
       calls   : []
       verdict : pure
     termination:
@@ -1513,7 +1494,6 @@ rule is_large
   proofs:
     purity:
       reads   : [i.amount]
-      writes  : []
       calls   : []
       verdict : pure
     termination:
@@ -1535,7 +1515,6 @@ rule flag_critical
   proofs:
     purity:
       reads   : [i]
-      writes  : []
       calls   : [is_large]
       verdict : pure
     termination:
@@ -1573,7 +1552,6 @@ rule upper_orchestration
   proofs:
     purity:
       reads   : [i.amount]
-      writes  : []
       calls   : []
       verdict : pure
     termination:
@@ -1595,7 +1573,6 @@ rule lower_domain
   proofs:
     purity:
       reads   : [i]
-      writes  : []
       calls   : [upper_orchestration]
       verdict : pure
     termination:
@@ -1638,7 +1615,6 @@ rule unlayered_helper
   proofs:
     purity:
       reads   : [i.amount]
-      writes  : []
       calls   : []
       verdict : pure
     termination:
@@ -1660,7 +1636,6 @@ rule layered_caller
   proofs:
     purity:
       reads   : [i]
-      writes  : []
       calls   : [unlayered_helper]
       verdict : pure
     termination:
@@ -1849,7 +1824,6 @@ rule incremented
   proofs:
     purity:
       reads   : [b.items]
-      writes  : []
       calls   : []
       verdict : pure
     termination:
@@ -1886,7 +1860,6 @@ rule positives
   proofs:
     purity:
       reads   : []
-      writes  : []
       calls   : []
       verdict : pure
     termination:
@@ -1999,7 +1972,6 @@ rule helper
   proofs:
     purity:
       reads: [t.x]
-      writes: []
       calls: []
       verdict: pure
     termination:
@@ -2019,7 +1991,6 @@ rule test_bad
   proofs:
     purity:
       reads: [t]
-      writes: []
       calls: [helper]
       verdict: pure
     termination:
@@ -2058,7 +2029,6 @@ rule test
   proofs:
     purity:
       reads: [t.x]
-      writes: []
       calls: []
       verdict: pure
     termination:
@@ -2093,7 +2063,6 @@ rule test
   proofs:
     purity:
       reads: [t.x]
-      writes: []
       calls: []
       verdict: pure
     termination:
@@ -2167,7 +2136,6 @@ rule test
   proofs:
     purity:
       reads: [t.a, t.b]
-      writes: []
       calls: []
       verdict: pure
     termination:

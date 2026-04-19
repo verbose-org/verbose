@@ -251,7 +251,6 @@ pub struct Proofs {
 #[derive(Debug, Clone)]
 pub struct Purity {
     pub reads: Vec<Path>,
-    pub writes: Vec<Path>,
     pub calls: Vec<Path>,
     pub verdict: PurityVerdict,
 }

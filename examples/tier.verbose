@@ -30,7 +30,6 @@ rule classify_tier
   proofs:
     purity:
       reads   : [c.balance]
-      writes  : []
       calls   : []
       verdict : pure
     termination:

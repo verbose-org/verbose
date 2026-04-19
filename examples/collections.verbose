@@ -37,7 +37,6 @@ rule invoice_overdue
   proofs:
     purity:
       reads   : [inv.days_overdue]
-      writes  : []
       calls   : []
       verdict : pure
     termination:
@@ -63,7 +62,6 @@ rule client_blocked
   proofs:
     purity:
       reads   : [c.invoices]
-      writes  : []
       calls   : [invoice_overdue]
       verdict : pure
     termination:
@@ -89,7 +87,6 @@ rule client_at_risk
   proofs:
     purity:
       reads   : [c.invoices]
-      writes  : []
       calls   : [invoice_overdue]
       verdict : pure
     termination:

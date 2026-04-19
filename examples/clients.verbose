@@ -28,7 +28,6 @@ rule active_client
   proofs:
     purity:
       reads   : [c.status]
-      writes  : []
       calls   : []
       verdict : pure
     termination:
@@ -54,7 +53,6 @@ rule vip_client
   proofs:
     purity:
       reads   : [c, c.balance]
-      writes  : []
       calls   : [active_client]
       verdict : pure
     termination:

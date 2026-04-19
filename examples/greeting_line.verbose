@@ -31,7 +31,6 @@ rule greeting_line
   proofs:
     purity:
       reads   : [p.name, p.age]
-      writes  : []
       calls   : []
       verdict : pure
     termination:

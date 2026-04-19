@@ -27,7 +27,6 @@ rule important_invoice
   proofs:
     purity:
       reads   : [i.amount]
-      writes  : []
       calls   : []
       verdict : pure
 

@@ -37,7 +37,6 @@ rule is_critical
   proofs:
     purity:
       reads   : [e.severity]
-      writes  : []
       calls   : []
       verdict : pure
     termination:
@@ -63,7 +62,6 @@ rule error_count
   proofs:
     purity:
       reads   : [app.events]
-      writes  : []
       calls   : []
       verdict : pure
     termination:
@@ -89,7 +87,6 @@ rule total_duration
   proofs:
     purity:
       reads   : [app.events]
-      writes  : []
       calls   : []
       verdict : pure
     termination:
@@ -115,7 +112,6 @@ rule error_duration
   proofs:
     purity:
       reads   : [app.events]
-      writes  : []
       calls   : []
       verdict : pure
     termination:
@@ -141,7 +137,6 @@ rule health_score
   proofs:
     purity:
       reads   : [app.events]
-      writes  : []
       calls   : []
       verdict : pure
     termination:

@@ -48,7 +48,6 @@ rule compute_bonuses
   proofs:
     purity:
       reads   : [w.employees]
-      writes  : []
       calls   : []
       verdict : pure
     termination:
@@ -74,7 +73,6 @@ rule high_earners
   proofs:
     purity:
       reads   : [w.employees]
-      writes  : []
       calls   : []
       verdict : pure
     termination:
@@ -100,7 +98,6 @@ rule salaries
   proofs:
     purity:
       reads   : [w.employees]
-      writes  : []
       calls   : []
       verdict : pure
     termination:
@@ -126,7 +123,6 @@ rule names
   proofs:
     purity:
       reads   : [w.employees]
-      writes  : []
       calls   : []
       verdict : pure
     termination:
@@ -152,7 +148,6 @@ rule total_salaries
   proofs:
     purity:
       reads   : [w.employees]
-      writes  : []
       calls   : []
       verdict : pure
     termination:
@@ -178,7 +173,6 @@ rule high_earner_count
   proofs:
     purity:
       reads   : [w.employees]
-      writes  : []
       calls   : []
       verdict : pure
     termination:

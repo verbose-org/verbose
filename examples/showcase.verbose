@@ -51,7 +51,6 @@ rule bonus_rate
   proofs:
     purity:
       reads   : [e.experience]
-      writes  : []
       calls   : []
       verdict : pure
     termination:
@@ -83,7 +82,6 @@ rule bonus_amount
   proofs:
     purity:
       reads   : [e, e.salary]
-      writes  : []
       calls   : [bonus_rate]
       verdict : pure
     termination:
@@ -110,7 +108,6 @@ rule is_senior
   proofs:
     purity:
       reads   : [e.experience]
-      writes  : []
       calls   : []
       verdict : pure
     termination:
@@ -140,7 +137,6 @@ rule eligible_for_promotion
   proofs:
     purity:
       reads   : [e, e.department]
-      writes  : []
       calls   : [is_senior]
       verdict : pure
     termination:
@@ -167,7 +163,6 @@ rule has_senior_talent
   proofs:
     purity:
       reads   : [c.employees]
-      writes  : []
       calls   : [is_senior]
       verdict : pure
     termination:
@@ -194,7 +189,6 @@ rule fully_senior
   proofs:
     purity:
       reads   : [c.employees]
-      writes  : []
       calls   : [is_senior]
       verdict : pure
     termination:

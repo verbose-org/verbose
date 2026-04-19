@@ -104,9 +104,8 @@ Circular imports are detected and skipped.
 ```text
 AI declares:             Verifier checks:
   reads: [i.amount]  →  walks AST, lists all accesses → [i.amount] ✓
-  writes: []         →  no mutations in code → [] ✓
   calls: []          →  no function calls → [] ✓
-  verdict: pure      →  writes=[] AND calls=[] → pure ✓
+  verdict: pure      →  calls=[] → pure ✓
   bound: 1           →  counts operations: 1 (Gt) → 1 ≤ 1 ✓
   overflow: [0, 100] →  interval arithmetic: [0, 100] ⊆ [0, 100] ✓
 ```
@@ -116,9 +115,8 @@ AI declares:             Verifier checks:
 | Check | What it verifies |
 |---|---|
 | reads match | Declared fields = actual field accesses in AST |
-| writes match | Declared mutations = actual mutations (empty for pure) |
 | calls match | Declared calls = actual rule invocations in AST |
-| verdict coherent | pure ↔ writes=[] and calls=[] |
+| verdict coherent | pure ↔ calls=[] |
 | termination bound | Declared bound ≥ actual operation count |
 | determinism | total ↔ no non-deterministic calls |
 | source exists | @source: file:line → file and line exist |

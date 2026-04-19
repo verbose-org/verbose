@@ -81,7 +81,6 @@ rule client_blocked
   proofs:
     purity:
       reads   : [c.invoices]
-      writes  : []
       calls   : [invoice_overdue]
       verdict : pure
     termination:

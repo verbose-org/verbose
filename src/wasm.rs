@@ -325,7 +325,6 @@ rule test_rule
   proofs:
     purity:
       reads: [t.x]
-      writes: []
       calls: []
       verdict: pure
     termination:
@@ -371,7 +370,6 @@ rule add_them
   proofs:
     purity:
       reads: [t.a, t.b]
-      writes: []
       calls: []
       verdict: pure
     termination:

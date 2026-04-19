@@ -39,7 +39,6 @@ rule validate_amount
   proofs:
     purity:
       reads   : [i.amount]
-      writes  : []
       calls   : []
       verdict : pure
     termination:
@@ -69,7 +68,6 @@ rule validated
   proofs:
     purity:
       reads   : [i, i.client]
-      writes  : []
       calls   : [validate_amount]
       verdict : pure
     termination:
@@ -95,7 +93,6 @@ rule classify
   proofs:
     purity:
       reads   : [i.client, i.amount]
-      writes  : []
       calls   : []
       verdict : pure
     termination:

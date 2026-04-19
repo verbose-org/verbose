@@ -40,7 +40,6 @@ rule make_report
   proofs:
     purity:
       reads   : [e.name, e.salary]
-      writes  : []
       calls   : []
       verdict : pure
     termination:

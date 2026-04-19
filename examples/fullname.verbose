@@ -41,7 +41,6 @@ rule compose_greeting
   proofs:
     purity:
       reads   : [p.first, p.last, p.age]
-      writes  : []
       calls   : []
       verdict : pure
     termination:

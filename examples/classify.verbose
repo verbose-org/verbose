@@ -42,7 +42,6 @@ rule classify_invoice
   proofs:
     purity:
       reads   : [i.days_overdue]
-      writes  : []
       calls   : []
       verdict : pure
     termination:
