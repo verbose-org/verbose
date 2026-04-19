@@ -2,59 +2,61 @@
 
 [![CI](https://github.com/verbose-org/verbose/actions/workflows/ci.yml/badge.svg)](https://github.com/verbose-org/verbose/actions/workflows/ci.yml)
 
-Verbose is an experimental AI-native intermediate representation designed to sit between human intention and machine execution.
-
-It is based on a simple idea: modern AI systems can generate far more detail than traditional human-oriented programming languages can naturally carry — but that extra expressive power must remain **explicit**, **verifiable**, **auditable**, and **compilable**.
-
-Verbose explores that space.
-
-> *Making exhaustiveness a compilable material.*
+> *Formalize intention. Verify mechanically. Compile to auditable native code.*
 >
 > *"I created this not so the machine replaces us, but so the machine is held accountable to us."*
 
-Instead of asking the compiler to guess, Verbose asks the authoring system to declare:
-- what the program means
-- what it reads and writes
-- what properties are expected to hold
-- what optimization intentions are desired
-- where the intent came from
+Verbose is an experimental language whose compiler holds a narrow, specific promise: whatever a `.verbose` file declares, the binary it produces will match exactly — with a 500-byte to 2 KB footprint, zero dependencies, and every declared proof mechanically verified against the code.
 
-Then the compiler verifies those claims under a zero-trust model and lowers the result to executable targets: native x86-64, WebAssembly, or Rust.
+## The architecture's bet
 
----
+The compiler is small and strict by design. Its scope is deliberately **not** the whole gap between "what a human meant" and "what the machine does" — it is the inner half of that chain: from a formalized `.verbose` program to a verified binary. The outer half (natural-language intention → `.verbose`) is left to humans, AI, or both working together.
 
-## Why Verbose Exists
+The bet is that the **floor matters, not the average**. Most AI-assisted tooling degrades gracefully as models hallucinate; here, a bad `.verbose` produces a *rejected* `.verbose`, never a wrong binary. Trust is anchored in the compiler's verification, not in whoever (or whatever) wrote the source. As AI generation quality rises over time, the same floor keeps holding — the architecture rides the curve without having to chase it.
 
-Traditional languages were designed primarily for human authors.
+## How people use it
 
-AI-generated software changes the situation: an AI system can expand an intent into a much richer representation than most conventional languages are built to hold.
+- **Writing `.verbose` directly** — always valid. Someone who wants the upfront discipline of declaring reads, termination bounds, overflow ranges, and architectural layer can skip the AI entirely. Hand-written and AI-generated `.verbose` files go through the exact same verifier; the compiler treats them identically.
+- **Writing `.intent` first, generating `.verbose`** — the `.intent` file is a human thinking artifact: numbered sentences, one per concept or rule. An AI assistant (or a patient human) turns it into `.verbose`. The AI produces input the compiler then audits; it does not touch the compiler itself.
 
-Verbose is an attempt to answer this question: **can we give AI a more explicit and more machine-relevant form of expression, while keeping strict control through verification, traceability, and compilation?**
+The `.intent → .verbose` step is **not** verified by the compiler. That bridge is the human's / AI's responsibility by design — asking a compiler to verify English against a formal spec would require solving NLP, and the mechanically-verified declarations could not stay mechanical under that demand. Instead, an auditor reads both files side by side, and the compiler guarantees the `.verbose` they see is exactly what the binary does.
 
-## Roles
-
-- **Human:** states the intention, constraints, and acceptance criteria
-- **AI:** expands that intention into a highly explicit Verbose program
-- **Verbose IR:** carries logic, proofs, optimization hints, and provenance
-- **Compiler:** verifies everything, rejects false claims, and lowers to executable code
+## Pipeline
 
 ```text
-human intention (.intent)     "An invoice is overdue when it has more than 30 days"
+.intent (optional)                   "An invoice is overdue when it has more than 30 days"
+        │                            (can also be hand-written in .verbose directly)
+.verbose program                     rule + fields + proofs + hints + @source
         │
-AI generates IR (.verbose)    rule + fields + proofs + hints
+compiler verifies                    reads / calls consistency, termination bound,
+                                     overflow bounds, @source exists, layer discipline
         │
-compiler verifies proofs      purity? termination? field access?
-        │
-compiler produces binary      interpreter, Rust transpiler, native x86-64, or WASM
+compiler emits a binary              interpreter, Rust transpiler, native x86-64, or WASM
 ```
 
-## What Verbose Is Not
+## What the compiler verifies (and what it does not)
 
-Verbose is not trying to replace mainstream languages.
+Verified mechanically, against the AST:
 
-It is not a general-purpose language optimized for human ergonomics.
+- Declared `reads` / `calls` match the actual field accesses and rule invocations
+- `termination.bound` is ≥ the actual operation count in the logic
+- `overflow: [min, max]` covers the computed range (interval arithmetic)
+- `@layer` discipline (sealed subgraph: `domain → domain` only, etc.)
+- `@source: file:line` references an existing line in the named file
+- Reaction `append_file` paths are string literals — the auditor can grep every file the program can touch
 
-It is an **explicit, specialized representation** meant for auditable, optimizable, and verifiable program generation.
+**Not verified** (out of scope, by design):
+
+- Whether the `.verbose` is a faithful translation of prose intent
+- Whether the intent itself is the right answer to the underlying problem
+
+See `docs/spec-proofs.md` for a field-by-field classification of *mechanical* (consistency-checked against the AST) vs *semantic* (carrying information the AST cannot encode) declarations. See `docs/vision-journal.md` for positioning rationale and decision trail.
+
+## What Verbose is not
+
+- Not a general-purpose language. No ergonomic sugar; every construct has to earn its place by serving verification or optimization.
+- Not an AI replacement for programmers. The human (or the AI) still has to think carefully enough to produce a clean intent. The compiler holds the floor, not the intent.
+- Not a transpilation target for existing code. Rust/Go/other source → Verbose is deliberately refused: the source has no proofs to translate, and inferring them would violate the zero-trust rule. See `CLAUDE.md` → "Transpilation Strategy".
 
 ## Live Example
 
@@ -108,12 +110,12 @@ verify error [rule 'client_blocked' / purity.reads] declared reads do not match 
 
 | | |
 |---|---|
-| Lines of Rust | ~7200, zero external dependencies |
-| Tests | 84, all passing |
-| Native binary size | **407–676 bytes** for business logic, **498 bytes** for HTTP server |
-| WASM module size | **58–73 bytes** for browser execution |
-| Proof checks | 10+ zero-trust verifications against the AST |
-| Examples | 10 across business, finance, collections, pricing, and more |
+| Lines of Rust | ~16,100, zero external dependencies |
+| Tests | 161, all passing |
+| Native binary size | **~500 B – ~2 KB** for business logic, TCP echo, HTTP rule server |
+| WASM module size | **58–73 bytes** for browser execution (scalar rules) |
+| Proof checks | Zero-trust verifications against the AST — see `docs/spec-proofs.md` |
+| Examples | 33 `.verbose` files spanning business, finance, collections, pricing, logs, streaming, reactions |
 
 ## Verbose vs gcc -O3
 
