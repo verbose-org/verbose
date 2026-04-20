@@ -1,0 +1,55 @@
+@verbose 0.1.0
+
+-- Phase 7 slice 3b: first .verbose file describing a complete HTTP/1.0
+-- service end to end. The tier-3 emit_http_demo probe in native.rs is
+-- now collapsed for this shape: the compiler reads the handler's logic
+-- (a constant HttpResponse record), precomputes the wire response from
+-- the status and body literals, and emits the socket / accept / read /
+-- write / close loop parametrised by the service's port and max_request.
+--
+-- Constraints in slice 3b (tightened deliberately, each one lifted by a
+-- later slice):
+--
+--   * handler logic must be literally `HttpResponse { status: N, body: "..." }`
+--     with number + text literals only — no req.method / req.path usage,
+--     no conditionals, no concat. Conditional HTTP responses land in 3c+.
+--   * reason phrase is always "OK" regardless of status. Real reason-phrase
+--     mapping (200 → OK, 404 → Not Found, …) also lands later; clients
+--     accept mismatched reason phrases, so "OK" is correct-enough.
+--
+-- Built-in concepts HttpRequest / HttpResponse are synthesised by the
+-- verifier when any Http10 service is present; the user does not declare
+-- them (see docs/phase-7-design.md).
+
+
+rule hello_handler
+  @intention: "Return HTTP 200 with a constant greeting for every request"
+  @source: hello_http.intent:2
+
+  input:
+    req : HttpRequest
+
+  output:
+    resp : HttpResponse
+
+  logic:
+    resp = HttpResponse { status: 200, body: "Hello from Verbose over HTTP!" }
+
+  proofs:
+    purity:
+      reads : []
+      calls : []
+    termination:
+      bound : 1
+
+
+service hello_server
+  @intention: "Listen on port 18888, respond to every request via hello_handler"
+  @source: hello_http.intent:3
+
+  listen:
+    protocol    : http_1_0
+    port        : 18888
+    max_request : 4096
+
+  handler: hello_handler

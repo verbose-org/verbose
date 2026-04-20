@@ -6461,23 +6461,15 @@ pub fn compile_service(
             message: format!("no service named '{}'", service_name),
         })?;
 
-    match service.protocol {
-        Protocol::RawTcp => {}
-        Protocol::Http10 => {
-            // Phase 7 slice 3a ships grammar + verification for Http10.
-            // The emitter (slice 3b) is where the built-in HTTP/1.0
-            // parser and response serialiser land. Until then, refuse
-            // cleanly rather than fall through to the RawTcp path,
-            // which would produce a binary whose behaviour does NOT
-            // match what the .verbose declares.
-            return Err(NativeError {
-                message: format!(
-                    "service '{}' uses protocol http_1_0; native emission for HTTP is Phase 7 slice 3b, not yet implemented. Use --run to test a raw_tcp service for now, or wait for slice 3b to land",
-                    service_name
-                ),
-            });
-        }
+    if let Protocol::Http10 = service.protocol {
+        // Phase 7 slice 3b: Http10 constant-response services are emittable.
+        // Non-constant handlers (conditional / req field usage) land in slice
+        // 3c+ — see compile_http10_constant_service for the shape check.
+        return compile_http10_constant_service(program, service, output_path);
     }
+
+    // From here on, protocol is RawTcp. The only other variant (Http10)
+    // returned above.
 
     let handler = program
         .items
@@ -6543,6 +6535,240 @@ pub fn compile_service(
 ///   → HTTP/1.0 200 OK\r\n\r\ntrue\n
 ///
 /// Security: max 4K request, GET-only, bounds-checked path parsing.
+
+/// Phase 7 slice 3b: compile an Http10 service whose handler returns a
+/// constant HttpResponse. The handler must be of the shape
+///
+///     resp = HttpResponse { status: <number-literal>, body: <text-literal> }
+///
+/// (fields may appear in either order). Non-constant handlers — those
+/// that branch on req.method / req.path or compute the body via concat —
+/// land in slice 3c+. This slice's job is to prove the full Http10 chain
+/// runs: grammar + verification (slice 3a) + emission (here) + running
+/// binary that responds correctly to a real curl.
+///
+/// Response shape emitted:
+///
+///     HTTP/1.0 <status> OK\r\n
+///     Content-Length: <body_len>\r\n
+///     \r\n
+///     <body>
+///
+/// The reason phrase is always "OK" in slice 3b. Slice 3c can add proper
+/// reason-phrase mapping (200 → "OK", 404 → "Not Found", …). Clients
+/// accept mismatched reason phrases (the protocol ignores them once the
+/// status code is parsed), so "OK" is correct-enough for this slice.
+fn compile_http10_constant_service(
+    program: &Program,
+    service: &Service,
+    output_path: &str,
+) -> Result<(), NativeError> {
+    let handler = program
+        .items
+        .iter()
+        .find_map(|i| match i {
+            Item::Rule(r) if r.name == service.handler => Some(r),
+            _ => None,
+        })
+        .ok_or_else(|| NativeError {
+            message: format!(
+                "service '{}' handler '{}' not found (verifier should have caught this)",
+                service.name, service.handler
+            ),
+        })?;
+
+    if !handler.logic.bindings.is_empty() {
+        return Err(NativeError {
+            message: format!(
+                "Phase 7 slice 3b: handler '{}' has let bindings; slice 3b supports only \
+                 constant-response handlers (HttpResponse {{ status: N, body: \"...\" }}). \
+                 Conditionals and req inspection land in slice 3c+",
+                handler.name
+            ),
+        });
+    }
+
+    // Match: Expr::Record("HttpResponse", [("status", Number(n)), ("body", Text(s))])
+    // Field order is preserved by the parser but may be written either way
+    // in source; we look up by name.
+    let (status, body) = match &handler.logic.value {
+        Expr::Record(name, fields) if name == "HttpResponse" => {
+            let mut status_value: Option<i64> = None;
+            let mut body_value: Option<String> = None;
+            for (f_name, f_expr) in fields {
+                match (f_name.as_str(), f_expr) {
+                    ("status", Expr::Number(n)) => status_value = Some(*n),
+                    ("body", Expr::Text(s)) => body_value = Some(s.clone()),
+                    (k, _) => {
+                        return Err(NativeError {
+                            message: format!(
+                                "Phase 7 slice 3b: handler '{}' field '{}' is not a literal; slice 3b supports only literal values in the HttpResponse record",
+                                handler.name, k
+                            ),
+                        });
+                    }
+                }
+            }
+            let status = status_value.ok_or_else(|| NativeError {
+                message: format!(
+                    "handler '{}' HttpResponse is missing literal 'status'",
+                    handler.name
+                ),
+            })?;
+            let body = body_value.ok_or_else(|| NativeError {
+                message: format!(
+                    "handler '{}' HttpResponse is missing literal 'body'",
+                    handler.name
+                ),
+            })?;
+            (status, body)
+        }
+        _ => {
+            return Err(NativeError {
+                message: format!(
+                    "Phase 7 slice 3b: handler '{}' logic is not a constant HttpResponse record; \
+                     expected `resp = HttpResponse {{ status: N, body: \"...\" }}`. \
+                     Conditional and request-inspecting handlers land in slice 3c+",
+                    handler.name
+                ),
+            });
+        }
+    };
+
+    // Range checks — the verifier already enforces the concept-declared
+    // ranges on HttpResponse, but keep this defensive in case a future
+    // refactor loosens the verifier path.
+    if !(100..=599).contains(&status) {
+        return Err(NativeError {
+            message: format!("status {} outside HTTP valid range [100, 599]", status),
+        });
+    }
+    if body.len() > 4096 {
+        return Err(NativeError {
+            message: format!(
+                "body length {} exceeds HttpResponse text bound [..4096]",
+                body.len()
+            ),
+        });
+    }
+
+    let response = format!(
+        "HTTP/1.0 {} OK\r\nContent-Length: {}\r\n\r\n{}",
+        status,
+        body.len(),
+        body
+    );
+    let code = emit_http10_constant_response_bytes(service.port, service.max_request, response.as_bytes());
+    write_server_elf(&code, output_path, "service", service.port)
+}
+
+/// Phase 7 slice 3b emission body: socket → bind → listen → accept loop
+/// where each connection reads up to max_request bytes (discarded), writes
+/// the precomputed response, closes. The tier-1 equivalent of
+/// emit_http_demo, but with port / max_request / response coming from the
+/// .verbose source rather than hardcoded Rust values.
+fn emit_http10_constant_response_bytes(port: u16, max_request: u32, response: &[u8]) -> Vec<u8> {
+    let mut code = Vec::new();
+    let port_be = port.to_be_bytes();
+    let buf_bytes = max_request.to_le_bytes();
+    let resp_len_bytes = (response.len() as i32).to_le_bytes();
+
+    // ═══ SOCKET ════════════════════════════════════════════════
+    code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x29, 0x00, 0x00, 0x00]); // mov rax, 41 (socket)
+    code.extend_from_slice(&[0x48, 0xC7, 0xC7, 0x02, 0x00, 0x00, 0x00]); // mov rdi, 2 (AF_INET)
+    code.extend_from_slice(&[0x48, 0xC7, 0xC6, 0x01, 0x00, 0x00, 0x00]); // mov rsi, 1 (SOCK_STREAM)
+    code.extend_from_slice(&[0x48, 0x31, 0xD2]);                         // xor rdx, rdx
+    code.extend_from_slice(&[0x0F, 0x05]);                               // syscall
+    code.extend_from_slice(&[0x49, 0x89, 0xC4]);                         // mov r12, rax
+
+    // ═══ SETSOCKOPT (SO_REUSEADDR) ════════════════════════════
+    code.extend_from_slice(&[0x6A, 0x01]);                               // push 1
+    code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x36, 0x00, 0x00, 0x00]); // mov rax, 54
+    code.extend_from_slice(&[0x4C, 0x89, 0xE7]);                         // mov rdi, r12
+    code.extend_from_slice(&[0x48, 0xC7, 0xC6, 0x01, 0x00, 0x00, 0x00]); // mov rsi, 1
+    code.extend_from_slice(&[0x48, 0xC7, 0xC2, 0x02, 0x00, 0x00, 0x00]); // mov rdx, 2
+    code.extend_from_slice(&[0x49, 0x89, 0xE2]);                         // mov r10, rsp
+    code.extend_from_slice(&[0x49, 0xC7, 0xC0, 0x04, 0x00, 0x00, 0x00]); // mov r8, 4
+    code.extend_from_slice(&[0x0F, 0x05]);                               // syscall
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x08]);                   // add rsp, 8
+
+    // ═══ BIND ═════════════════════════════════════════════════
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x10]);                   // sub rsp, 16
+    code.extend_from_slice(&[0x66, 0xC7, 0x04, 0x24, 0x02, 0x00]);       // mov word [rsp], 2
+    code.extend_from_slice(&[0x66, 0xC7, 0x44, 0x24, 0x02]);             // mov word [rsp+2], port
+    code.extend_from_slice(&port_be);
+    code.extend_from_slice(&[0x48, 0xC7, 0x44, 0x24, 0x04, 0x00, 0x00, 0x00, 0x00]); // mov qword [rsp+4], 0
+    code.extend_from_slice(&[0x48, 0xC7, 0x44, 0x24, 0x08, 0x00, 0x00, 0x00, 0x00]); // zero [rsp+8..16]
+
+    code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x31, 0x00, 0x00, 0x00]); // mov rax, 49 (bind)
+    code.extend_from_slice(&[0x4C, 0x89, 0xE7]);                         // mov rdi, r12
+    code.extend_from_slice(&[0x48, 0x89, 0xE6]);                         // mov rsi, rsp
+    code.extend_from_slice(&[0x48, 0xC7, 0xC2, 0x10, 0x00, 0x00, 0x00]); // mov rdx, 16
+    code.extend_from_slice(&[0x0F, 0x05]);                               // syscall
+
+    // ═══ LISTEN ═══════════════════════════════════════════════
+    code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x32, 0x00, 0x00, 0x00]); // mov rax, 50 (listen)
+    code.extend_from_slice(&[0x4C, 0x89, 0xE7]);                         // mov rdi, r12
+    code.extend_from_slice(&[0x48, 0xC7, 0xC6, 0x80, 0x00, 0x00, 0x00]); // mov rsi, 128
+    code.extend_from_slice(&[0x0F, 0x05]);                               // syscall
+
+    // Allocate the request-drain buffer on the stack — size from .verbose
+    code.extend_from_slice(&[0x48, 0x81, 0xEC]);                         // sub rsp, imm32
+    code.extend_from_slice(&buf_bytes);
+
+    // ═══ ACCEPT LOOP ══════════════════════════════════════════
+    let accept_top = code.len();
+    code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x2B, 0x00, 0x00, 0x00]); // mov rax, 43 (accept)
+    code.extend_from_slice(&[0x4C, 0x89, 0xE7]);                         // mov rdi, r12
+    code.extend_from_slice(&[0x48, 0x31, 0xF6]);                         // xor rsi, rsi
+    code.extend_from_slice(&[0x48, 0x31, 0xD2]);                         // xor rdx, rdx
+    code.extend_from_slice(&[0x0F, 0x05]);                               // syscall
+    code.extend_from_slice(&[0x49, 0x89, 0xC5]);                         // mov r13, rax
+
+    // Read request (drain the socket; contents ignored in slice 3b)
+    code.extend_from_slice(&[0x48, 0x31, 0xC0]);                         // xor rax, rax (read)
+    code.extend_from_slice(&[0x4C, 0x89, 0xEF]);                         // mov rdi, r13
+    code.extend_from_slice(&[0x48, 0x89, 0xE6]);                         // mov rsi, rsp
+    code.extend_from_slice(&[0x48, 0xC7, 0xC2]);                         // mov rdx, imm32
+    code.extend_from_slice(&buf_bytes);
+    code.extend_from_slice(&[0x0F, 0x05]);                               // syscall
+
+    // ═══ WRITE RESPONSE ═══════════════════════════════════════
+    // Jump over the inline response data; use rel32 to handle responses
+    // that exceed 127 bytes (which includes any realistic HTTP response
+    // with a non-trivial body).
+    code.push(0xE9);
+    let jmp_len = response.len() as i32;
+    code.extend_from_slice(&jmp_len.to_le_bytes());
+    let resp_offset = code.len();
+    code.extend_from_slice(response);
+
+    // lea rsi, [rip + disp32] — compute the address of the inlined data
+    let after_lea = code.len() + 7;
+    let rip_delta = resp_offset as i32 - after_lea as i32;
+    code.extend_from_slice(&[0x48, 0x8D, 0x35]);
+    code.extend_from_slice(&rip_delta.to_le_bytes());
+
+    // write(client_fd, &response, response.len())
+    code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x01, 0x00, 0x00, 0x00]); // mov rax, 1 (write)
+    code.extend_from_slice(&[0x4C, 0x89, 0xEF]);                         // mov rdi, r13
+    code.extend_from_slice(&[0x48, 0xC7, 0xC2]);                         // mov rdx, imm32
+    code.extend_from_slice(&resp_len_bytes);
+    code.extend_from_slice(&[0x0F, 0x05]);                               // syscall
+
+    // close(client_fd)
+    code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x03, 0x00, 0x00, 0x00]); // mov rax, 3 (close)
+    code.extend_from_slice(&[0x4C, 0x89, 0xEF]);                         // mov rdi, r13
+    code.extend_from_slice(&[0x0F, 0x05]);                               // syscall
+
+    // jmp accept_top
+    code.push(0xE9);
+    let accept_back = accept_top as i32 - (code.len() as i32 + 4);
+    code.extend_from_slice(&accept_back.to_le_bytes());
+
+    code
+}
+
 /// Compile a multi-route HTTP server. Each rule becomes an endpoint:
 ///   GET /rule_name/arg1/arg2/...  →  evaluates rule with [arg1, arg2, ...]
 ///   GET /health                   →  200 OK (built-in)
@@ -7588,6 +7814,48 @@ mod tests {
 
         let _ = fs::remove_file(out_argv);
         let _ = fs::remove_file(out_stdin);
+    }
+
+    /// Phase 7 slice 3b regression: compiling the shipped hello_http
+    /// example via the Service path must succeed, produce a binary
+    /// whose size is within the expected envelope, and emit the
+    /// response string from the handler's HttpResponse record body.
+    /// The last check prevents regressions where the AST-to-wire
+    /// extraction drops or mangles the body literal.
+    #[test]
+    fn phase7_http10_constant_service_emits_declared_body() {
+        use std::fs;
+        let src = fs::read_to_string("examples/hello_http.verbose")
+            .expect("examples/hello_http.verbose is expected to exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let out = std::env::temp_dir().join("verbosec_test_phase7_http");
+        compile_service(&program, "hello_server", out.to_str().unwrap())
+            .expect("Http10 constant-service compile");
+
+        let bytes = fs::read(&out).expect("read output");
+        let size = bytes.len();
+        assert!(
+            (350..1100).contains(&size),
+            "http constant service binary size {} outside expected [350, 1100] envelope", size
+        );
+
+        // The handler's body literal must appear verbatim in the emitted ELF
+        // (inlined in the .text section as part of the precomputed response).
+        let body = b"Hello from Verbose over HTTP!";
+        assert!(
+            bytes.windows(body.len()).any(|w| w == body),
+            "handler body literal not found in emitted binary"
+        );
+        // So should the Content-Length line for the computed body length (29).
+        let content_length = b"Content-Length: 29";
+        assert!(
+            bytes.windows(content_length.len()).any(|w| w == content_length),
+            "expected Content-Length: 29 header in emitted binary"
+        );
+
+        let _ = fs::remove_file(out);
     }
 
     /// Phase 7 slice 2b regression: compiling the shipped raw_tcp_echo
