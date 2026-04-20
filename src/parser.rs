@@ -960,6 +960,7 @@ impl Parser {
         let mut port = None;
         let mut max_request = None;
         let mut handler = None;
+        let mut log: Option<Effect> = None;
 
         while !self.check_kind(&TokenKind::Dedent) && !self.at_eof() {
             if let Some(attr) = self.peek_attribute_name() {
@@ -1044,8 +1045,30 @@ impl Parser {
                 self.expect_kind(TokenKind::Colon)?;
                 handler = Some(self.expect_ident_any()?);
                 self.expect_kind(TokenKind::Newline)?;
+            } else if self.check_ident("log") {
+                // Phase 8 slice 8a: optional single-effect log block. Only
+                // `append_file "path" <expr>` is accepted; multi-effect and
+                // other effect variants land in later slices.
+                self.advance();
+                self.expect_kind(TokenKind::Colon)?;
+                self.expect_kind(TokenKind::Newline)?;
+                self.expect_kind(TokenKind::Indent)?;
+                let kind_name = self.expect_ident_any()?;
+                if kind_name != "append_file" {
+                    return Err(self.error(&format!(
+                        "Phase 8 slice 8a: only 'append_file' is accepted in service log blocks; got '{}'",
+                        kind_name
+                    )));
+                }
+                let path = self.expect_string().map_err(|_| {
+                    self.error("append_file requires a string literal path — the auditor must see every file the service can touch")
+                })?;
+                let content = self.parse_expr()?;
+                self.expect_kind(TokenKind::Newline)?;
+                log = Some(Effect::AppendFile { path, content });
+                self.expect_kind(TokenKind::Dedent)?;
             } else {
-                return Err(self.error("expected attribute, 'listen:', or 'handler:' in service"));
+                return Err(self.error("expected attribute, 'listen:', 'handler:', or 'log:' in service"));
             }
         }
         self.expect_kind(TokenKind::Dedent)?;
@@ -1058,6 +1081,7 @@ impl Parser {
             port: port.ok_or_else(|| self.error("service missing 'listen.port'"))?,
             max_request: max_request.ok_or_else(|| self.error("service missing 'listen.max_request'"))?,
             handler: handler.ok_or_else(|| self.error("service missing 'handler'"))?,
+            log,
         })
     }
 

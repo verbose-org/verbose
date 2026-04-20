@@ -295,6 +295,50 @@ fn verify_service(
             }
         }
     }
+
+    // Phase 8 slice 8a: if a log effect is declared, type-check its content
+    // against Text using the handler's input concept as field scope. Only
+    // `AppendFile` is accepted (parser enforces this); double-check here.
+    if let Some(log_effect) = &s.log {
+        match log_effect {
+            Effect::AppendFile { content, .. } => {
+                // Slice 8a restricts log to Http10 services: the content
+                // expression resolves req.method / req.path via the synthesised
+                // HttpRequest concept, which only exists in an Http10 context.
+                if s.protocol != Protocol::Http10 {
+                    errors.push(VerifyError {
+                        context: format!("service '{}' / log", s.name),
+                        message: "Phase 8 slice 8a restricts log to http_1_0 services (raw_tcp log lands in a later slice)".into(),
+                    });
+                } else {
+                    // Handler's input concept (HttpRequest) carries method and
+                    // path; look it up from the concepts map (the built-in is
+                    // already injected above for Http10).
+                    let input_concept = match &handler.input_ty {
+                        Type::Named(n) => concepts.get(n).copied(),
+                        _ => None,
+                    };
+                    check_expr_against(
+                        content,
+                        &Type::Text,
+                        handler,
+                        all_rules,
+                        input_concept,
+                        concepts,
+                        errors,
+                    );
+                }
+            }
+            // Reactions today only define AppendFile and Print; parser
+            // rejects Print in the log block, so this arm is defensive.
+            Effect::Print(_) => {
+                errors.push(VerifyError {
+                    context: format!("service '{}' / log", s.name),
+                    message: "Phase 8 slice 8a: log blocks accept only 'append_file', not 'print'".into(),
+                });
+            }
+        }
+    }
 }
 
 /// Helper for verify_service: enforce that the handler's input or output

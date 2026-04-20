@@ -1,0 +1,51 @@
+@verbose 0.1.0
+
+-- Phase 8 slice 8a: HTTP router with a per-request audit log, entirely
+-- described in .verbose. Equivalent to wrapping hello_router with the
+-- docs/ai-act-usage.md audit-log.sh bash wrapper, but the append-file
+-- effect is now part of the binary itself — one less shim between the
+-- auditor and the program.
+--
+-- Slice 8a scope boundaries (each lifted by a later slice):
+--   * log content references request fields only (method, path);
+--     response-field access (resp.status, resp.body) lands in slice 8b
+--   * path is a compile-time string literal (permanent discipline)
+--   * open / write / close errors are silently ignored in 8a;
+--     explicit error policy lands in slice 8d
+--   * one log effect per service (8e for multi-effect)
+
+
+rule hello_handler
+  @intention: "Return 200 for GET /, 200 with pong for GET /ping, 404 otherwise"
+  @source: hello_router_logged.intent:2
+
+  input:
+    req : HttpRequest
+
+  output:
+    resp : HttpResponse
+
+  logic:
+    resp = if req.method == "GET" and req.path == "/" then HttpResponse { status: 200, body: "Hello, logged router!" } else if req.method == "GET" and req.path == "/ping" then HttpResponse { status: 200, body: "pong" } else HttpResponse { status: 404, body: "not found" }
+
+  proofs:
+    purity:
+      reads : [req.method, req.path]
+      calls : []
+    termination:
+      bound : 11
+
+
+service hello_server_logged
+  @intention: "Listen on port 18890, route via hello_handler, append an access line per request"
+  @source: hello_router_logged.intent:6
+
+  listen:
+    protocol    : http_1_0
+    port        : 18890
+    max_request : 4096
+
+  handler: hello_handler
+
+  log:
+    append_file "/tmp/verbose_router.log" concat(req.method, " ", req.path, "\n")

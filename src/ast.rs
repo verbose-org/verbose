@@ -37,6 +37,12 @@ pub struct Service {
     pub port: u16,
     pub max_request: u32,
     pub handler: String,
+    /// Phase 8 slice 8a: optional `log:` block. When present, the declared
+    /// effect fires once per service invocation, after the handler body
+    /// runs and before the response is written. Only `AppendFile` is
+    /// accepted by the parser (slice 8a scope); multi-effect logging and
+    /// other sinks land in later slices.
+    pub log: Option<Effect>,
 }
 
 /// Closed set of protocols a service may declare. Unknown names are rejected

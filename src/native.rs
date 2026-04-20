@@ -6480,11 +6480,16 @@ pub fn compile_service(
                     service.name, service.handler
                 ),
             })?;
+        // Phase 8 slice 8a: presence of a log forces the dynamic path,
+        // because the log content can reference request fields (method /
+        // path) which only exist once the HTTP parser has run — and the
+        // constant path does not emit the parser. The dynamic path handles
+        // pure-literal Record leaves correctly, so no expressive loss.
         return match analyze_http10_handler_shape(handler) {
-            Http10HandlerShape::Constant => {
+            Http10HandlerShape::Constant if service.log.is_none() => {
                 compile_http10_constant_service(program, service, output_path)
             }
-            Http10HandlerShape::Dynamic => {
+            Http10HandlerShape::Constant | Http10HandlerShape::Dynamic => {
                 compile_http10_dynamic_service(program, service, output_path)
             }
             Http10HandlerShape::Unsupported(reason) => Err(NativeError {
@@ -6793,6 +6798,31 @@ fn compile_http10_dynamic_service(
     write_server_elf(&code, output_path, "service", service.port)
 }
 
+/// Duplicated shape of the verifier's synthesised HttpRequest concept,
+/// kept in native.rs so the emitter does not have to cross-call into the
+/// verifier module. If the two ever drift, the phase7_http10 regression
+/// tests will catch it (they type-check the handler via the real verifier
+/// and then compile with this copy).
+fn http_request_builtin_concept_native() -> Concept {
+    Concept {
+        name: "HttpRequest".to_string(),
+        intention: "compiler built-in".to_string(),
+        source: SourceRef { file: "<builtin>".to_string(), line: 0 },
+        fields: vec![
+            Field {
+                name: "method".to_string(),
+                ty: Type::Text,
+                range: Some((0, 8)),
+            },
+            Field {
+                name: "path".to_string(),
+                ty: Type::Text,
+                range: Some((0, 256)),
+            },
+        ],
+    }
+}
+
 fn emit_http10_dynamic_bytes(
     service: &Service,
     handler: &Rule,
@@ -6889,6 +6919,28 @@ fn emit_http10_dynamic_bytes(
         all_rules,
         field_ranges,
     )?;
+
+    // ═══ LOG EFFECT (Phase 8 slice 8a) ═════════════════════════
+    // After the handler has populated the output slots and before the
+    // response is serialised, fire the optional log append_file effect.
+    // Fd lives in r15 across emit_append_file_call (its convention); we
+    // don't need to save/restore it because nothing above or below it
+    // in this path uses r15.
+    if let Some(log_effect) = &service.log {
+        if let Effect::AppendFile { path, content } = log_effect {
+            let req_concept = http_request_builtin_concept_native();
+            emit_append_file_call(
+                &mut code,
+                path,
+                content,
+                handler,
+                &req_concept,
+                all_rules,
+                offsets,
+                field_ranges,
+            )?;
+        }
+    }
 
     // ═══ HTTP SERIALIZE ════════════════════════════════════════
     emit_http_serialize(&mut code);
@@ -8536,6 +8588,53 @@ mod tests {
 
         let _ = fs::remove_file(out_argv);
         let _ = fs::remove_file(out_stdin);
+    }
+
+    /// Phase 8 slice 8a regression: the logged router compiles, all three
+    /// body strings and the declared log path appear inline in the binary,
+    /// and the binary is slightly larger than the unlogged hello_router
+    /// (the log effect adds an open/write/close sequence).
+    #[test]
+    fn phase8_http10_service_with_log_embeds_path_and_body() {
+        use std::fs;
+        let src = fs::read_to_string("examples/hello_router_logged.verbose")
+            .expect("examples/hello_router_logged.verbose is expected to exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let out = std::env::temp_dir().join("verbosec_test_phase8_logged_router");
+        compile_service(&program, "hello_server_logged", out.to_str().unwrap())
+            .expect("Http10 logged-service compile");
+
+        let bytes = fs::read(&out).expect("read output");
+        let size = bytes.len();
+        assert!(
+            (1000..1800).contains(&size),
+            "logged service binary size {} outside expected [1000, 1800] envelope", size
+        );
+
+        // Response bodies still inline
+        for body in [
+            &b"Hello, logged router!"[..],
+            &b"pong"[..],
+            &b"not found"[..],
+        ] {
+            assert!(
+                bytes.windows(body.len()).any(|w| w == body),
+                "body literal {:?} not found in logged binary",
+                std::str::from_utf8(body).unwrap()
+            );
+        }
+        // The declared log file path is a compile-time literal and must
+        // appear inline — the auditor reads the binary (or the source)
+        // and sees exactly every file the service can touch.
+        let log_path = b"/tmp/verbose_router.log";
+        assert!(
+            bytes.windows(log_path.len()).any(|w| w == log_path),
+            "log path literal not found in binary — string must be inlined"
+        );
+
+        let _ = fs::remove_file(out);
     }
 
     /// Phase 7 slice 3c regression: compiling the shipped hello_router
