@@ -46,7 +46,7 @@ service hello_server
   @source: hello.intent:4
 
   listen:
-    protocol    : http/1.0
+    protocol    : http_1_0
     port        : 9999
     max_request : 4096
 
@@ -85,7 +85,7 @@ When a `.verbose` file contains a `service` declaration, the verifier adds these
 - `port` is in `[1, 65535]`. Operators who want to bind to privileged ports get the system to decide that (via `setcap` or equivalent), not the language.
 - `max_request` is declared and numeric. No default — forcing the declaration makes the auditor see the bound.
 - The handler rule exists in the program.
-- The handler's `input` type matches the protocol's request concept (e.g., `HttpRequest` for `http/1.0`).
+- The handler's `input` type matches the protocol's request concept (e.g., `HttpRequest` for `http_1_0`).
 - The handler's `output` type matches the protocol's response concept.
 - The handler carries standard proofs (purity, termination bound) — the service inherits those properties for each request cycle.
 - The handler is pure: no reactions fire during request handling. Reactions that ARE declared at the service level (e.g., an Article 12 audit log append) fire around handler invocations, not inside them.
@@ -125,7 +125,7 @@ Putting the pieces together, a complete Phase 7 HTTP service in a single `.verbo
 ```verbose
 @verbose 0.1.0
 
--- Built-in concepts (provided by the compiler for http/1.0):
+-- Built-in concepts (provided by the compiler for http_1_0):
 --   HttpRequest  { method: text [..8], path: text [..256] }
 --   HttpResponse { status: number [100, 599], body: text [..4096] }
 
@@ -151,7 +151,7 @@ service hello_server
   @intention: "Listen on port 9999, dispatch every request to hello_handler"
   @source: hello.intent:2
   listen:
-    protocol    : http/1.0
+    protocol    : http_1_0
     port        : 9999
     max_request : 4096
   handler : hello_handler

@@ -49,6 +49,14 @@ pub enum Protocol {
     /// max_request) and returns bytes to send back. No structured request /
     /// response. Simplest first protocol; no built-in parser needed.
     RawTcp,
+    /// HTTP/1.0: the compiler parses one GET/POST/... request off the
+    /// wire (method + path only, headers discarded) into a built-in
+    /// `HttpRequest` concept; the handler returns a built-in
+    /// `HttpResponse` concept the compiler serialises as a minimal
+    /// HTTP/1.0 response (status + Content-Length + body). The built-in
+    /// concepts are synthesised by the verifier when any Http10 service
+    /// is declared; user concepts reusing those names are rejected.
+    Http10,
 }
 
 /// A reaction is a block with declared side effects.

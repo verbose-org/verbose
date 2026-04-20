@@ -6463,6 +6463,20 @@ pub fn compile_service(
 
     match service.protocol {
         Protocol::RawTcp => {}
+        Protocol::Http10 => {
+            // Phase 7 slice 3a ships grammar + verification for Http10.
+            // The emitter (slice 3b) is where the built-in HTTP/1.0
+            // parser and response serialiser land. Until then, refuse
+            // cleanly rather than fall through to the RawTcp path,
+            // which would produce a binary whose behaviour does NOT
+            // match what the .verbose declares.
+            return Err(NativeError {
+                message: format!(
+                    "service '{}' uses protocol http_1_0; native emission for HTTP is Phase 7 slice 3b, not yet implemented. Use --run to test a raw_tcp service for now, or wait for slice 3b to land",
+                    service_name
+                ),
+            });
+        }
     }
 
     let handler = program

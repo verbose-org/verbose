@@ -996,8 +996,9 @@ impl Parser {
                             let n = self.expect_ident_any()?;
                             protocol = Some(match n.as_str() {
                                 "raw_tcp" => Protocol::RawTcp,
+                                "http_1_0" => Protocol::Http10,
                                 _ => return Err(self.error(&format!(
-                                    "unknown protocol '{}' (allowed: raw_tcp)",
+                                    "unknown protocol '{}' (allowed: raw_tcp, http_1_0)",
                                     n
                                 ))),
                             });

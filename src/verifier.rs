@@ -19,7 +19,39 @@ impl fmt::Display for VerifyError {
 
 pub fn verify_program(program: &Program, base_dir: &StdPath) -> Vec<VerifyError> {
     let mut errors = Vec::new();
-    let concepts: HashMap<String, &Concept> = program
+
+    // Phase 7 slice 3a: if any service declares Protocol::Http10, the compiler
+    // owns the names `HttpRequest` and `HttpResponse`. Two consequences:
+    // (1) any user-declared concept with one of those names is rejected as a
+    // reserved-name conflict; (2) synthesised built-in concepts (below) are
+    // injected into the concepts map so handler rules can reference them.
+    let any_http10 = program.items.iter().any(|it| {
+        matches!(it, Item::Service(s) if s.protocol == Protocol::Http10)
+    });
+
+    if any_http10 {
+        for it in &program.items {
+            if let Item::Concept(c) = it {
+                if c.name == "HttpRequest" || c.name == "HttpResponse" {
+                    errors.push(VerifyError {
+                        context: format!("concept '{}'", c.name),
+                        message: format!(
+                            "'{}' is a reserved built-in concept for Protocol::Http10; remove the user declaration",
+                            c.name
+                        ),
+                    });
+                }
+            }
+        }
+    }
+
+    let synth_concepts: Vec<Concept> = if any_http10 {
+        vec![builtin_http_request(), builtin_http_response()]
+    } else {
+        Vec::new()
+    };
+
+    let mut concepts: HashMap<String, &Concept> = program
         .items
         .iter()
         .filter_map(|it| match it {
@@ -27,6 +59,13 @@ pub fn verify_program(program: &Program, base_dir: &StdPath) -> Vec<VerifyError>
             _ => None,
         })
         .collect();
+    for c in &synth_concepts {
+        // Built-ins override any user concept with the same name. A user
+        // conflict on these names was already flagged above; downstream
+        // verification should see the compiler's shape, not the user's.
+        concepts.insert(c.name.clone(), c);
+    }
+
     let all_rules: Vec<&Rule> = program
         .items
         .iter()
@@ -87,6 +126,62 @@ pub fn verify_program(program: &Program, base_dir: &StdPath) -> Vec<VerifyError>
     errors
 }
 
+/// Phase 7 slice 3a: synthesised `HttpRequest` concept injected into the
+/// program's concept scope when any Http10 service is present. The auditor
+/// does not see this declaration in any .verbose file; it lives in the
+/// compiler because the wire-format-to-concept bridge is a closed,
+/// compiler-owned translation. Fields:
+///   method : text [..8]   — GET / POST / DELETE / etc. (fits OPTIONS = 7)
+///   path   : text [..256] — URL path segment
+fn builtin_http_request() -> Concept {
+    Concept {
+        name: "HttpRequest".to_string(),
+        intention:
+            "A parsed HTTP/1.0 request: method and path (compiler built-in for Protocol::Http10)"
+                .to_string(),
+        source: SourceRef { file: "<builtin>".to_string(), line: 0 },
+        fields: vec![
+            Field {
+                name: "method".to_string(),
+                ty: Type::Text,
+                range: Some((0, 8)),
+            },
+            Field {
+                name: "path".to_string(),
+                ty: Type::Text,
+                range: Some((0, 256)),
+            },
+        ],
+    }
+}
+
+/// Phase 7 slice 3a: synthesised `HttpResponse` concept, counterpart of
+/// `HttpRequest`. Fields:
+///   status : number [100, 599] — valid HTTP status code range
+///   body   : text [..4096]     — response body (text only in slice 3;
+///                                binary bodies await bytes primitives)
+fn builtin_http_response() -> Concept {
+    Concept {
+        name: "HttpResponse".to_string(),
+        intention:
+            "An HTTP/1.0 response: status and body (compiler built-in for Protocol::Http10)"
+                .to_string(),
+        source: SourceRef { file: "<builtin>".to_string(), line: 0 },
+        fields: vec![
+            Field {
+                name: "status".to_string(),
+                ty: Type::Number,
+                range: Some((100, 599)),
+            },
+            Field {
+                name: "body".to_string(),
+                ty: Type::Text,
+                range: Some((0, 4096)),
+            },
+        ],
+    }
+}
+
 /// Phase 7 service verification.
 ///
 /// Checks:
@@ -138,30 +233,104 @@ fn verify_service(
         }
     };
 
-    // RawTcp handler shape: input and output must each be a Named concept
-    // whose single field is `bytes [..max_request]`. Enforced strictly so
-    // that what the service reads exactly matches what the handler expects,
-    // and what the handler returns exactly matches what the service writes.
-    if let Protocol::RawTcp = s.protocol {
-        let expected_bound = s.max_request as i64;
-        check_raw_tcp_binding(
-            &handler.input_ty,
-            handler.name.as_str(),
-            "input",
-            expected_bound,
-            concepts,
-            s,
-            errors,
-        );
-        check_raw_tcp_binding(
-            &handler.output_ty,
-            handler.name.as_str(),
-            "output",
-            expected_bound,
-            concepts,
-            s,
-            errors,
-        );
+    match s.protocol {
+        Protocol::RawTcp => {
+            // RawTcp handler shape: input and output must each be a Named
+            // concept whose single field is `bytes [..max_request]`. Enforced
+            // strictly so that what the service reads exactly matches what
+            // the handler expects, and what the handler returns exactly
+            // matches what the service writes.
+            let expected_bound = s.max_request as i64;
+            check_raw_tcp_binding(
+                &handler.input_ty,
+                handler.name.as_str(),
+                "input",
+                expected_bound,
+                concepts,
+                s,
+                errors,
+            );
+            check_raw_tcp_binding(
+                &handler.output_ty,
+                handler.name.as_str(),
+                "output",
+                expected_bound,
+                concepts,
+                s,
+                errors,
+            );
+        }
+        Protocol::Http10 => {
+            // Http10 handler shape: input is Named("HttpRequest"),
+            // output is Named("HttpResponse"). No field-level check —
+            // the built-in concepts have fixed shapes and are synthesised
+            // by the verifier (see builtin_http_request / _response).
+            // max_request must be >= 64 (HTTP/1.0 minimum well-formed
+            // request: "GET / HTTP/1.0\r\n\r\n" = 18 bytes; 64 gives
+            // room for the shortest realistic path + version).
+            check_http10_binding(
+                &handler.input_ty,
+                handler.name.as_str(),
+                "input",
+                "HttpRequest",
+                s,
+                errors,
+            );
+            check_http10_binding(
+                &handler.output_ty,
+                handler.name.as_str(),
+                "output",
+                "HttpResponse",
+                s,
+                errors,
+            );
+            if s.max_request < 64 {
+                errors.push(VerifyError {
+                    context: format!("service '{}' / listen.max_request", s.name),
+                    message: format!(
+                        "http_1_0 requires max_request >= 64 (minimum well-formed HTTP/1.0 request); got {}",
+                        s.max_request
+                    ),
+                });
+            }
+        }
+    }
+}
+
+/// Helper for verify_service: enforce that the handler's input or output
+/// (for an Http10 service) is exactly the expected compiler-provided
+/// concept (`HttpRequest` or `HttpResponse`). Any other type — including a
+/// user-declared concept with a different shape that happens to have the
+/// same fields — is rejected.
+fn check_http10_binding(
+    ty: &Type,
+    rule_name: &str,
+    position: &str,
+    expected_concept: &str,
+    s: &Service,
+    errors: &mut Vec<VerifyError>,
+) {
+    let ctx = || {
+        format!(
+            "service '{}' / handler '{}' / {}",
+            s.name, rule_name, position
+        )
+    };
+    match ty {
+        Type::Named(n) if n == expected_concept => {
+            // Correct — the built-in was already injected into concepts.
+        }
+        _ => {
+            errors.push(VerifyError {
+                context: ctx(),
+                message: format!(
+                    "http_1_0 handler {} must be the built-in concept '{}'; got {}",
+                    position,
+                    expected_concept,
+                    type_display(ty)
+                ),
+            });
+        }
     }
 }
 
@@ -2245,5 +2414,94 @@ rule test
             "expected missing-bound error, got: {:#?}",
             errs
         );
+    }
+
+    // ─── Phase 7 slice 3a: Http10 service tests ─────────────────────────
+
+    /// Build a .verbose source with an Http10 service and a handler whose
+    /// input/output types are supplied by the caller. Lets tests perturb
+    /// the handler shape and max_request to exercise each verifier check.
+    fn http10_src(
+        handler_input_ty: &str,
+        handler_output_ty: &str,
+        max_request: i64,
+    ) -> String {
+        format!(
+            "@verbose 0.1.0\n\nrule h\n  @intention: \"handle\"\n  @source: invoices.intent:1\n  input:\n    req : {}\n  output:\n    resp : {}\n  logic:\n    resp = {} {{ status: 200, body: \"ok\" }}\n  proofs:\n    purity:\n      reads: []\n      calls: []\n    termination:\n      bound: 1\n\nservice s\n  @intention: \"http service\"\n  @source: invoices.intent:1\n  listen:\n    protocol: http_1_0\n    port: 8080\n    max_request: {}\n  handler: h\n",
+            handler_input_ty, handler_output_ty, handler_output_ty, max_request
+        )
+    }
+
+    #[test]
+    fn http10_happy_path() {
+        let errs = verify_str(&http10_src("HttpRequest", "HttpResponse", 4096));
+        assert!(errs.is_empty(), "expected no errors, got: {:#?}", errs);
+    }
+
+    #[test]
+    fn http10_rejects_wrong_input_type() {
+        // Handler input is user concept `WrongInput` instead of HttpRequest.
+        let src = "@verbose 0.1.0\n\nconcept WrongInput\n  @intention: \"x\"\n  @source: invoices.intent:1\n  fields:\n    x : number\n\nrule h\n  @intention: \"x\"\n  @source: invoices.intent:1\n  input:\n    req : WrongInput\n  output:\n    resp : HttpResponse\n  logic:\n    resp = HttpResponse { status: 200, body: \"ok\" }\n  proofs:\n    purity:\n      reads: []\n      calls: []\n    termination:\n      bound: 1\n\nservice s\n  @intention: \"x\"\n  @source: invoices.intent:1\n  listen:\n    protocol: http_1_0\n    port: 8080\n    max_request: 4096\n  handler: h\n";
+        let errs = verify_str(src);
+        assert!(
+            errs.iter().any(|e| e.message.contains("must be the built-in concept 'HttpRequest'")),
+            "expected input-type rejection, got: {:#?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn http10_rejects_wrong_output_type() {
+        // Handler output is plain `text` rather than HttpResponse.
+        let src = "@verbose 0.1.0\n\nrule h\n  @intention: \"x\"\n  @source: invoices.intent:1\n  input:\n    req : HttpRequest\n  output:\n    resp : text\n  logic:\n    resp = \"hello\"\n  proofs:\n    purity:\n      reads: []\n      calls: []\n    termination:\n      bound: 0\n\nservice s\n  @intention: \"x\"\n  @source: invoices.intent:1\n  listen:\n    protocol: http_1_0\n    port: 8080\n    max_request: 4096\n  handler: h\n";
+        let errs = verify_str(src);
+        assert!(
+            errs.iter().any(|e| e.message.contains("must be the built-in concept 'HttpResponse'")),
+            "expected output-type rejection, got: {:#?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn http10_rejects_max_request_below_minimum() {
+        let errs = verify_str(&http10_src("HttpRequest", "HttpResponse", 32));
+        assert!(
+            errs.iter().any(|e| e.message.contains("requires max_request >= 64")),
+            "expected max_request-floor error, got: {:#?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn http10_rejects_user_concept_named_http_request() {
+        // User declares `concept HttpRequest` — reserved name, must be
+        // rejected when any Http10 service is present.
+        let src = "@verbose 0.1.0\n\nconcept HttpRequest\n  @intention: \"mine\"\n  @source: invoices.intent:1\n  fields:\n    custom : number\n\nrule h\n  @intention: \"x\"\n  @source: invoices.intent:1\n  input:\n    req : HttpRequest\n  output:\n    resp : HttpResponse\n  logic:\n    resp = HttpResponse { status: 200, body: \"ok\" }\n  proofs:\n    purity:\n      reads: []\n      calls: []\n    termination:\n      bound: 1\n\nservice s\n  @intention: \"x\"\n  @source: invoices.intent:1\n  listen:\n    protocol: http_1_0\n    port: 8080\n    max_request: 4096\n  handler: h\n";
+        let errs = verify_str(src);
+        assert!(
+            errs.iter().any(|e| e.context.contains("concept 'HttpRequest'") && e.message.contains("reserved")),
+            "expected reserved-name error, got: {:#?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn http10_rejects_user_concept_named_http_response() {
+        let src = "@verbose 0.1.0\n\nconcept HttpResponse\n  @intention: \"mine\"\n  @source: invoices.intent:1\n  fields:\n    custom : number\n\nrule h\n  @intention: \"x\"\n  @source: invoices.intent:1\n  input:\n    req : HttpRequest\n  output:\n    resp : HttpResponse\n  logic:\n    resp = HttpResponse { status: 200, body: \"ok\" }\n  proofs:\n    purity:\n      reads: []\n      calls: []\n    termination:\n      bound: 1\n\nservice s\n  @intention: \"x\"\n  @source: invoices.intent:1\n  listen:\n    protocol: http_1_0\n    port: 8080\n    max_request: 4096\n  handler: h\n";
+        let errs = verify_str(src);
+        assert!(
+            errs.iter().any(|e| e.context.contains("concept 'HttpResponse'") && e.message.contains("reserved")),
+            "expected reserved-name error, got: {:#?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn http10_allows_user_named_http_request_outside_http10_context() {
+        // Without any Http10 service, `HttpRequest` is NOT reserved.
+        // The user can declare their own concept with that name.
+        let src = "@verbose 0.1.0\n\nconcept HttpRequest\n  @intention: \"user domain\"\n  @source: invoices.intent:1\n  fields:\n    x : number\n";
+        let errs = verify_str(src);
+        assert!(errs.is_empty(), "expected no errors outside Http10 context, got: {:#?}", errs);
     }
 }
