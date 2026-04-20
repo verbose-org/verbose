@@ -282,6 +282,21 @@ fn main() {
                 })
                 .unwrap_or_default()
         });
+
+        // Phase 7: if the --run name is an Item::Service, dispatch to the
+        // service compiler. It handles its own output message (the service
+        // takes a port + max_request, not a rule shape), so we return early.
+        let is_service = program.items.iter().any(|i| {
+            matches!(i, ast::Item::Service(s) if s.name == native_rule_str)
+        });
+        if is_service {
+            if let Err(e) = native::compile_service(&program, &native_rule_str, &output) {
+                eprintln!("{}", e);
+                process::exit(1);
+            }
+            return;
+        }
+
         // Multi-rule: "rule1,rule2,..." compiles all into one binary.
         let native_stdin = args.iter().any(|a| a == "--stdin");
         let native_stream = args.iter().any(|a| a == "--stream");

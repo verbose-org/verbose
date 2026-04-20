@@ -1,0 +1,55 @@
+@verbose 0.1.0
+
+-- Phase 7 slice 2b: the first .verbose file that describes a complete
+-- TCP server end to end. Historically the only TCP echo server this
+-- project produced was the tier-3 probe emitted by --echo-server, which
+-- has no .verbose source at all (see docs/known-gaps.md). This file
+-- collapses that probe into tier 1: everything the binary does — from
+-- socket / bind / accept down to the read/write loop — is declared in
+-- the three items below and verified by the compiler.
+--
+-- The handler is a strict identity: `resp = Frame { data: req.data }`.
+-- Phase 7 slice 2b only supports identity handlers on raw_tcp; later
+-- slices will relax this as concrete operations (len, slicing, literals)
+-- earn their place in the language.
+
+
+concept Frame
+  @intention: "A TCP frame is up to 4096 bytes received on a connection"
+  @source: raw_tcp_echo.intent:1
+
+  fields:
+    data : bytes [..4096]
+
+
+rule echo_handler
+  @intention: "Return each received frame unchanged"
+  @source: raw_tcp_echo.intent:2
+
+  input:
+    req : Frame
+
+  output:
+    resp : Frame
+
+  logic:
+    resp = Frame { data: req.data }
+
+  proofs:
+    purity:
+      reads : [req.data]
+      calls : []
+    termination:
+      bound : 2
+
+
+service echo_server
+  @intention: "Listen on port 7777, read up to 4096 bytes per connection, echo via echo_handler"
+  @source: raw_tcp_echo.intent:3
+
+  listen:
+    protocol    : raw_tcp
+    port        : 7777
+    max_request : 4096
+
+  handler: echo_handler

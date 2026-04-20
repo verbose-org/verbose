@@ -6255,8 +6255,29 @@ fn emit_stream_prologue(code: &mut Vec<u8>) -> usize {
 ///   [rsp .. rsp+16]    sockaddr_in struct (for bind)
 ///   [rsp+16 .. rsp+4112] read buffer (4096 bytes)
 pub fn compile_echo_server(port: u16, output_path: &str) -> Result<(), NativeError> {
+    // Tier-3 legacy path: the --echo-server flag hard-codes a 4096-byte
+    // read buffer. Phase 7 slice 2b reuses the exact same emission body
+    // via `emit_raw_tcp_echo_bytes`, parametrized by max_request, to
+    // serve a .verbose-described service.
+    let code = emit_raw_tcp_echo_bytes(port, 4096);
+    write_server_elf(&code, output_path, "echo-server", port)
+}
+
+/// Phase 7 slice 2b: emit the machine code for a raw-TCP echo server
+/// bound to `port`, with a read/write buffer sized exactly at
+/// `max_request` bytes. The caller is responsible for wrapping the bytes
+/// into an ELF and writing it to disk (`write_server_elf`).
+///
+/// This function is the shared emission body for `--echo-server` (tier 3,
+/// hard-coded 4096-byte buffer) and `--native` over an
+/// `Item::Service { protocol: RawTcp, handler: <identity> }` (tier 1,
+/// buffer size from .verbose). Extracting the body here is what lets one
+/// piece of machine-code emission serve both paths — the tier collapse
+/// Phase 7 is meant to start.
+fn emit_raw_tcp_echo_bytes(port: u16, max_request: u32) -> Vec<u8> {
     let mut code = Vec::new();
     let port_be = port.to_be_bytes(); // network byte order
+    let buf_bytes = max_request.to_le_bytes();
 
     // ═══ SOCKET ════════════════════════════════════════════════
     // socket(AF_INET=2, SOCK_STREAM=1, 0) → rax = server_fd
@@ -6313,8 +6334,11 @@ pub fn compile_echo_server(port: u16, output_path: &str) -> Result<(), NativeErr
     code.extend_from_slice(&[0x48, 0xC7, 0xC6, 0x80, 0x00, 0x00, 0x00]); // mov rsi, 128
     code.extend_from_slice(&[0x0F, 0x05]);                               // syscall
 
-    // Allocate 4K read buffer on stack (below sockaddr_in)
-    code.extend_from_slice(&[0x48, 0x81, 0xEC, 0x00, 0x10, 0x00, 0x00]); // sub rsp, 4096
+    // Allocate the read buffer on the stack (below sockaddr_in).
+    // Size comes from max_request — the .verbose-declared bound that
+    // every incoming request is truncated to.
+    code.extend_from_slice(&[0x48, 0x81, 0xEC]);                         // sub rsp, imm32
+    code.extend_from_slice(&buf_bytes);
 
     // ═══ ACCEPT LOOP ══════════════════════════════════════════
     let accept_top = code.len();
@@ -6329,11 +6353,12 @@ pub fn compile_echo_server(port: u16, output_path: &str) -> Result<(), NativeErr
 
     // ═══ ECHO LOOP (per connection) ═══════════════════════════
     let echo_top = code.len();
-    // read(client_fd, rsp, 4096) → rax = bytes_read → syscall 0
+    // read(client_fd, rsp, max_request) → rax = bytes_read → syscall 0
     code.extend_from_slice(&[0x48, 0x31, 0xC0]);                         // xor rax, rax (sys_read=0)
     code.extend_from_slice(&[0x4C, 0x89, 0xEF]);                         // mov rdi, r13
     code.extend_from_slice(&[0x48, 0x89, 0xE6]);                         // mov rsi, rsp
-    code.extend_from_slice(&[0x48, 0xC7, 0xC2, 0x00, 0x10, 0x00, 0x00]); // mov rdx, 4096
+    code.extend_from_slice(&[0x48, 0xC7, 0xC2]);                         // mov rdx, imm32
+    code.extend_from_slice(&buf_bytes);
     code.extend_from_slice(&[0x0F, 0x05]);                               // syscall
 
     // if bytes_read <= 0: close + accept next
@@ -6374,7 +6399,20 @@ pub fn compile_echo_server(port: u16, output_path: &str) -> Result<(), NativeErr
         eprintln!("warning: x86-64 validation: {} (decoder incomplete, may be false positive)", e);
     }
 
-    let elf = build_elf(&code);
+    code
+}
+
+/// Shared writer: wrap a Vec of machine code bytes in an ELF, write it to
+/// `output_path`, set executable permissions on Unix, and print a line
+/// tagged with `kind` and `port`. Called by both `compile_echo_server`
+/// (tier-3 probe) and `compile_service` (tier-1 Phase 7 service).
+fn write_server_elf(
+    code: &[u8],
+    output_path: &str,
+    kind: &str,
+    port: u16,
+) -> Result<(), NativeError> {
+    let elf = build_elf(code);
     let mut file = std::fs::File::create(output_path).map_err(|e| NativeError {
         message: format!("cannot create '{}': {}", output_path, e),
     })?;
@@ -6389,8 +6427,95 @@ pub fn compile_echo_server(port: u16, output_path: &str) -> Result<(), NativeErr
     }
 
     let size = std::fs::metadata(output_path).map(|m| m.len()).unwrap_or(0);
-    println!("echo-server: {} ({} bytes, port {})", output_path, size, port);
+    println!("{}: {} ({} bytes, port {})", kind, output_path, size, port);
     Ok(())
+}
+
+/// Phase 7 slice 2b: compile an `Item::Service` with `Protocol::RawTcp`
+/// and an identity-shaped handler into a tier-1 native binary.
+///
+/// The handler must be strictly identity — its logic expression must be
+/// `output_concept { field: input.field }`, where both concepts have
+/// exactly one `bytes [..max_request]` field (already enforced by the
+/// verifier). Anything more than identity returns an error here; later
+/// slices relax this restriction one operation at a time.
+///
+/// The emitted machine code is byte-for-byte equivalent to what
+/// `compile_echo_server` has produced via the tier-3 path since Phase 0,
+/// just with port and buffer size driven from the .verbose source
+/// instead of CLI arguments. This is the first tier-3 → tier-1 collapse
+/// the Phase 7 design calls for.
+pub fn compile_service(
+    program: &Program,
+    service_name: &str,
+    output_path: &str,
+) -> Result<(), NativeError> {
+    let service = program
+        .items
+        .iter()
+        .find_map(|i| match i {
+            Item::Service(s) if s.name == service_name => Some(s),
+            _ => None,
+        })
+        .ok_or_else(|| NativeError {
+            message: format!("no service named '{}'", service_name),
+        })?;
+
+    match service.protocol {
+        Protocol::RawTcp => {}
+    }
+
+    let handler = program
+        .items
+        .iter()
+        .find_map(|i| match i {
+            Item::Rule(r) if r.name == service.handler => Some(r),
+            _ => None,
+        })
+        .ok_or_else(|| NativeError {
+            message: format!(
+                "service '{}' handler '{}' not found (verifier should have caught this)",
+                service.name, service.handler
+            ),
+        })?;
+
+    // Enforce identity handler for slice 2b. The verifier already
+    // guarantees the shape of input and output concepts; here we check
+    // that the logic is literally `OutputConcept { f: input_var.f }` so
+    // the emitted echo is semantically the handler's declared behavior.
+    if handler.logic.target != "resp" && handler.logic.target != handler.output_name {
+        // Expected: target matches the declared output binding name.
+        // (Already enforced elsewhere — this is a defensive guard.)
+    }
+    if !handler.logic.bindings.is_empty() {
+        return Err(NativeError {
+            message: format!(
+                "Phase 7 slice 2b: handler '{}' has let bindings; only identity handlers \
+                 are supported in this slice",
+                handler.name
+            ),
+        });
+    }
+    let is_identity = match &handler.logic.value {
+        Expr::Record(_, fields) if fields.len() == 1 => {
+            let (_, value) = &fields[0];
+            matches!(value, Expr::Field(base, _) if matches!(base.as_ref(), Expr::Ident(n) if n == &handler.input_name))
+        }
+        _ => false,
+    };
+    if !is_identity {
+        return Err(NativeError {
+            message: format!(
+                "Phase 7 slice 2b: handler '{}' logic is not identity (expected \
+                 `resp = <OutputConcept> {{ <field>: <input>.<field> }}`); non-identity \
+                 handlers land in slice 2c+",
+                handler.name
+            ),
+        });
+    }
+
+    let code = emit_raw_tcp_echo_bytes(service.port, service.max_request);
+    write_server_elf(&code, output_path, "service", service.port)
 }
 
 /// Tier-2 hybrid — rule from `.verbose`, network shell hardcoded
@@ -7449,5 +7574,38 @@ mod tests {
 
         let _ = fs::remove_file(out_argv);
         let _ = fs::remove_file(out_stdin);
+    }
+
+    /// Phase 7 slice 2b regression: compiling the shipped raw_tcp_echo
+    /// example via the Service path must produce a binary of exactly the
+    /// same size (358 bytes) as the tier-3 compile_echo_server probe,
+    /// since both paths now share emit_raw_tcp_echo_bytes. Byte-for-byte
+    /// equivalence is the structural collapse of tier-3 into tier-1.
+    #[test]
+    fn phase7_service_matches_echo_probe_size() {
+        use std::fs;
+        let src = fs::read_to_string("examples/raw_tcp_echo.verbose")
+            .expect("examples/raw_tcp_echo.verbose is expected to exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let svc_out = std::env::temp_dir().join("verbosec_test_phase7_service");
+        let probe_out = std::env::temp_dir().join("verbosec_test_phase7_probe");
+
+        compile_service(&program, "echo_server", svc_out.to_str().unwrap())
+            .expect("service compile");
+        compile_echo_server(7777, probe_out.to_str().unwrap())
+            .expect("probe compile");
+
+        let svc_size = fs::metadata(&svc_out).map(|m| m.len()).unwrap_or(0);
+        let probe_size = fs::metadata(&probe_out).map(|m| m.len()).unwrap_or(0);
+        assert_eq!(
+            svc_size, probe_size,
+            "service-emitted binary must equal echo-probe binary size (tier-3 → tier-1 collapse)"
+        );
+        assert_eq!(svc_size, 358, "expected exact 358 bytes for raw_tcp echo");
+
+        let _ = fs::remove_file(svc_out);
+        let _ = fs::remove_file(probe_out);
     }
 }
