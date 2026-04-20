@@ -106,6 +106,15 @@ If the AI lies in its proofs — the compiler catches it:
 verify error [rule 'client_blocked' / purity.reads] declared reads do not match logic; missing: [c.invoices]
 ```
 
+## Worked example: EU AI Act high-risk decisions
+
+A reusable compliance pattern is documented in [`docs/ai-act-usage.md`](docs/ai-act-usage.md) with two worked Annex III cases:
+
+- [`examples/loan_decision.verbose`](examples/loan_decision.verbose) — creditworthiness scoring (Annex III point 5(b)), ~1.5 KB binary
+- [`examples/cv_screening.verbose`](examples/cv_screening.verbose) — recruitment / candidate selection (Annex III point 4(a)), ~1.5 KB binary
+
+Both rules output `Result(number, text)` where each `Err` branch carries the plain-language rejection reason — which mechanically produces the explanation Article 86 (right to explanation) obliges providers to give to adversely-affected persons. The stdout/stderr split of the streaming binary makes the Article 12 audit trail a shell-wrapper away; the [`audit-log.sh`](docs/ai-act-usage.md#article-12--the-logging-wrapper) example in the doc is domain-agnostic and works on both binaries without modification. Applying the pattern to a third Annex III category is a ~30-minute exercise following the template.
+
 ## Numbers
 
 | | |

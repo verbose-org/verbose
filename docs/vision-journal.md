@@ -6,6 +6,87 @@ The vision is the author's. These entries are written by the AI assistant under 
 
 ---
 
+## 2026-04-20 — AI Act pattern validated at two instances; wrapper is domain-agnostic
+
+### Context
+
+First full session after the doc-and-demo sprint of 2026-04-19. Goal: turn the
+one-off `loan_decision` demo into a reusable pattern, then verify the pattern
+generalises by applying it to a second Annex III category.
+
+### What was built
+
+- `docs/ai-act-usage.md` — first user-facing doc in the repo. Five-point
+  pattern, per-article mapping table, ~20-line Article 12 shell wrapper
+  (`audit-log.sh`), explicit out-of-scope list (Article 10 data governance,
+  Article 14 human oversight, Article 72 drift detection, GDPR 22, conformity
+  assessment). Verified wrapper runs on the loan decision binary and produces
+  clean JSONL audit records.
+- `examples/cv_screening.verbose` — second AI Act case, Annex III point 4(a)
+  (recruitment / candidate selection). 4 criteria (experience, diploma,
+  skills match, language), Result(number, text) with priority score on the
+  Ok arm and one Err branch per failure mode. 1569 B native streaming binary,
+  6/6 verdicts correct on synthetic inputs.
+- README updated with a "Worked example: EU AI Act high-risk decisions"
+  section pointing to the doc and both examples. `ai-act-usage.md` now
+  discoverable from the entry page, not buried in `docs/`.
+
+### Concrete findings
+
+1. **Pattern duplication is a 30-minute exercise**, as claimed in the doc.
+   Writing `cv_screening` from scratch (intent + verbose + test + compile)
+   took about that long, following the template literally. The ~30-minute
+   claim in the doc is now verified empirically on one data point.
+
+2. **Binary size is predictable for four-criterion decisions.** `loan_decision`
+   compiled to 1554 B, `cv_screening` to 1569 B — within 15 bytes of each
+   other despite different domains. The enveloppe holds: a `Result(number, text)`
+   rule with four `Err` branches and a small arithmetic Ok lands in the
+   1.5 KB band.
+
+3. **The Article 12 wrapper is truly domain-agnostic.** `audit-log.sh`,
+   written for `loan_decision`, worked on `cv_screening` without a single
+   edit. The wrapper depends only on the `Result(T, text)` shape —
+   specifically on the stdout (approvals) / stderr (refusals+reasons)
+   split that every Verbose binary of this pattern produces. This is
+   stronger evidence than the 30-minute duplication: it means a compliance
+   officer monitoring many high-risk decisions gets one audit log schema
+   across all of them.
+
+4. **Homogeneous audit output matters for compliance ops.** A single JSONL
+   schema (`ts`, `input`, `verdict`, `value` | `reason`) covers finance and
+   hiring decisions identically. One parser, one retention policy, one set
+   of SIEM rules monitoring the audit trail — regardless of how many
+   high-risk decisions the organisation runs.
+
+### Decisions
+
+- Phase B is validated as a pattern, not just as a one-off demo. Two
+  instances across two domains, predictable size, reusable wrapper.
+  Further AI Act cases are mechanical replication — do them when a
+  specific operational need shows up, not to pad the demo count.
+- The doc (`ai-act-usage.md`) is the flagship user-facing artefact for
+  now. Future sessions should update it as the pattern evolves, not let
+  it diverge from what the examples actually do.
+
+### Open for next session
+
+Candidates, roughly ordered by strategic value:
+
+- Phase 7+ design sketch — what `listen_tcp`, `accept_connection`,
+  `read_until`, `append_log` would look like in `.verbose` grammar. Not
+  implementing, just producing a design doc that makes the north star
+  concrete enough to plan against.
+- Full-pipeline `make` targets or a `demo/` directory showing end-to-end
+  runs of the two AI Act examples side by side, as a reviewable artefact.
+- A third Annex III case (insurance scoring, public benefits, or similar)
+  — only if there is a concrete reason to add it beyond demo padding.
+- Native backend gap closure work (contains / starts_with primitives) —
+  useful for broadening SIEM reach but tangential to the AI Act angle
+  that is carrying the pitch today.
+
+---
+
 ## 2026-04-19 — Phase B kept; Phase 7+ (network-in-.verbose) locked as north star
 
 ### Context
