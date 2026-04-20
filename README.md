@@ -115,16 +115,32 @@ A reusable compliance pattern is documented in [`docs/ai-act-usage.md`](docs/ai-
 
 Both rules output `Result(number, text)` where each `Err` branch carries the plain-language rejection reason — which mechanically produces the explanation Article 86 (right to explanation) obliges providers to give to adversely-affected persons. The stdout/stderr split of the streaming binary makes the Article 12 audit trail a shell-wrapper away; the [`audit-log.sh`](docs/ai-act-usage.md#article-12--the-logging-wrapper) example in the doc is domain-agnostic and works on both binaries without modification. Applying the pattern to a third Annex III category is a ~30-minute exercise following the template.
 
+## Phase 7 + 8: network services described in `.verbose`
+
+The native backend can now emit complete long-running network services from a `.verbose` source. The `service` top-level construct binds a listener (protocol, port, bounded request size) to a handler rule, and optionally a `log:` effect that fires per request:
+
+| Example | Binary | What it does |
+|---|---|---|
+| [`examples/raw_tcp_echo.verbose`](examples/raw_tcp_echo.verbose) | 358 B | Raw TCP echo. Replaces the hand-emitted `--echo-server` probe with a tier-1 source (see [`docs/known-gaps.md`](docs/known-gaps.md)). |
+| [`examples/hello_http.verbose`](examples/hello_http.verbose) | 429 B | HTTP/1.0 constant-response server. |
+| [`examples/hello_router.verbose`](examples/hello_router.verbose) | 1056 B | HTTP router with if/else over `req.method` and `req.path`; 200 / 404 per route. |
+| [`examples/hello_router_logged.verbose`](examples/hello_router_logged.verbose) | 1294 B | Same router plus a per-request `append_file` audit log. |
+| [`examples/access_log_json.verbose`](examples/access_log_json.verbose) | 1072 B | HTTP service whose audit log is valid JSONL — one `{"method":"…","path":"…"}` line per request, parseable by `jq` or any SIEM. |
+
+Each binary is zero-dependency native x86-64 (`ldd` shows nothing), the `.verbose` source is the complete program including the socket / bind / accept / read / HTTP parse / handler dispatch / response / log / close loop. Design rationale and slice-by-slice rollout in [`docs/phase-7-design.md`](docs/phase-7-design.md) and the entries of [`docs/vision-journal.md`](docs/vision-journal.md) dated 2026-04-19 and 2026-04-20.
+
+Slice 8a (the `log:` block) is already enough to replace the `audit-log.sh` wrapper of the AI Act pattern for access-log-style output. Logging the decision *verdict* alongside the request (response-field access in `log:` content) is slice 8b; timestamps are slice 8c; strict error-on-write-failure is slice 8d. Together they close the full Article 12 gap.
+
 ## Numbers
 
 | | |
 |---|---|
-| Lines of Rust | ~16,100, zero external dependencies |
-| Tests | 161, all passing |
-| Native binary size | **~500 B – ~2 KB** for business logic, TCP echo, HTTP rule server |
+| Lines of Rust | ~17,500, zero external dependencies |
+| Tests | 183, all passing |
+| Native binary size | **~360 B – ~1.5 KB** for business logic, TCP echo, HTTP services |
 | WASM module size | **58–73 bytes** for browser execution (scalar rules) |
 | Proof checks | Zero-trust verifications against the AST — see `docs/spec-proofs.md` |
-| Examples | 33 `.verbose` files spanning business, finance, collections, pricing, logs, streaming, reactions |
+| `.verbose` examples | 40+ files spanning business rules, finance, collections, streaming detection, reactions, TCP & HTTP services with logging |
 
 ## Verbose vs gcc -O3
 

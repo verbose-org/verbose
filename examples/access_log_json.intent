@@ -1,0 +1,4 @@
+1. The access-log HTTP service accepts incoming requests on port 18891.
+2. For every request it returns HTTP 200 with the body "ok".
+3. For every request it appends one JSON line to /tmp/verbose_access.jsonl containing the request method and path.
+4. The JSON format is {"method":"...","path":"..."} followed by a newline; each request produces exactly one line.

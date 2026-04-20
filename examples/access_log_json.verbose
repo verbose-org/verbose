@@ -1,0 +1,53 @@
+@verbose 0.1.0
+
+-- Phase 7 + Phase 8 combined showcase: HTTP service whose audit log is
+-- in JSONL (one JSON object per line), the format typically consumed by
+-- SIEM pipelines (Splunk, Elastic, Loki) and Article 12 audit processors.
+--
+-- Pattern this unlocks in practice: the docs/ai-act-usage.md wrapper
+-- (audit-log.sh in bash) used to be required for JSONL output. With
+-- slice 8a the binary itself writes JSONL lines per request, reducing
+-- the trusted chain by one layer.
+--
+-- Known limitation (to be lifted by a later slice): the log content
+-- uses concat to assemble the JSON, which does NOT escape special
+-- characters in request fields. A path containing an unencoded double
+-- quote would produce broken JSON. Real production use would need a
+-- json_escape primitive — slice 8f or wherever we introduce structured
+-- text helpers.
+
+
+rule ok_handler
+  @intention: "Always return HTTP 200 with body 'ok'"
+  @source: access_log_json.intent:2
+
+  input:
+    req : HttpRequest
+
+  output:
+    resp : HttpResponse
+
+  logic:
+    resp = HttpResponse { status: 200, body: "ok" }
+
+  proofs:
+    purity:
+      reads : []
+      calls : []
+    termination:
+      bound : 1
+
+
+service access_logged_service
+  @intention: "Listen on port 18891, return 200 ok, log each request as JSON"
+  @source: access_log_json.intent:1
+
+  listen:
+    protocol    : http_1_0
+    port        : 18891
+    max_request : 4096
+
+  handler: ok_handler
+
+  log:
+    append_file "/tmp/verbose_access.jsonl" concat("{\"method\":\"", req.method, "\",\"path\":\"", req.path, "\"}\n")
