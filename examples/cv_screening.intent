@@ -1,0 +1,4 @@
+1. A job candidate has years of experience, a diploma level, a count of required skills they possess, and a language proficiency level.
+2. A candidate qualifies for an interview when they have at least three years of experience, at least a bachelor-equivalent diploma, at least six of the ten required skills, and a language proficiency of B2 or higher.
+3. When qualified, the candidate's priority score is computed from their profile so that approved candidates can be ranked.
+4. When refused, the first failing criterion is reported verbatim as the explicit reason for the refusal.

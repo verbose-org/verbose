@@ -1,0 +1,61 @@
+@verbose 0.1.0
+
+-- EU AI Act high-risk demo (second Annex III category): CV screening.
+--
+-- Regulatory anchor: Annex III point 4(a) of Regulation (EU) 2024/1689
+-- classifies "AI systems intended to be used for the recruitment or
+-- selection of natural persons, in particular to place targeted job
+-- advertisements, to analyse and filter job applications, and to
+-- evaluate candidates" as HIGH-RISK.
+--
+-- Hiring is the most politically-scrutinised use of automated decision
+-- systems under the Act. Article 86 (right to explanation) applies to
+-- refused candidates exactly as it applies to refused loan applicants:
+-- each rejection must carry a plain-language reason the affected person
+-- can read and, if they choose, contest.
+--
+-- This file is a second instance of the same pattern as
+-- examples/loan_decision.verbose — concept + rule returning
+-- Result(T, text) + one Err branch per distinct failure mode + ranking
+-- information in the Ok branch. Duplication here is the point: the
+-- pattern is meant to be applied per high-risk decision, not rewritten.
+-- See docs/ai-act-usage.md for the reusable template.
+--
+-- Field scales (simplified for demonstration):
+--   diploma_level:       0=none, 1=high school, 2=bachelor, 3=master, 4=doctorate
+--   language_proficiency: 0=none, 1=A1, 2=A2, 3=B1, 4=B2, 5=C1/C2 (CEFR approx)
+--   required_skills_match: how many of the 10 skills in the job spec the
+--                          candidate demonstrably has (source: assessment
+--                          or structured interview, documented separately)
+
+
+concept JobCandidate
+  @intention: "A job candidate has years of experience, a diploma level, a count of required skills matched, and a language proficiency level"
+  @source: cv_screening.intent:1
+
+  fields:
+    years_experience      : number [0, 70]
+    diploma_level         : number [0, 4]
+    required_skills_match : number [0, 10]
+    language_proficiency  : number [0, 5]
+
+
+rule cv_screening
+  @intention: "Qualify with a priority score when all four criteria are met; otherwise refuse with the first failing criterion as the stated reason"
+  @source: cv_screening.intent:2
+
+  input:
+    c : JobCandidate
+
+  output:
+    decision : Result(number, text)
+
+  logic:
+    decision = if c.years_experience < 3 then Err("experience below required 3 years") else if c.diploma_level < 2 then Err("diploma level below required bachelor") else if c.required_skills_match < 6 then Err("required skills match below required 6 of 10") else if c.language_proficiency < 4 then Err("language proficiency below required B2") else Ok(c.years_experience + c.diploma_level * 3 + c.required_skills_match * 2 + c.language_proficiency)
+
+  proofs:
+    purity:
+      reads : [c.years_experience, c.diploma_level, c.required_skills_match, c.language_proficiency]
+      calls : []
+    termination:
+      bound : 18
