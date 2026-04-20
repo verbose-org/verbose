@@ -25,11 +25,23 @@ The rule is trustworthy under the usual proofs; the shell around it is a
 non-Verbose artifact bolted on by the compiler driver.
 
 **Tier 3 — Native emitter feasibility probes.** `--demo-http`
-(`emit_http_demo`, ~498 B) and `--echo-server` (`compile_echo_server`,
-~358 B) are here. **No `.verbose` source is involved at all.** The entire
-binary is hand-emitted by Rust code in `native.rs` that writes x86-64 bytes
-directly. These prove the native backend *can* produce tiny network binaries;
-they do **not** prove that the language can describe them yet.
+(`emit_http_demo`, ~498 B) is here. **No `.verbose` source is involved at
+all.** The entire binary is hand-emitted by Rust code in `native.rs` that
+writes x86-64 bytes directly. These prove the native backend *can*
+produce tiny network binaries; they do **not** prove that the language
+can describe them yet.
+
+*Status update (Phase 7 slice 2b, 2026-04-20):* the TCP echo probe
+(`compile_echo_server`, 358 B) has been **collapsed into tier 1** — it
+is now also emittable from a `.verbose` file via the `service`
+construct with `Protocol::RawTcp` and an identity handler (see
+`examples/raw_tcp_echo.verbose`). Both paths share the same
+emission body (`emit_raw_tcp_echo_bytes`), so the tier-1 and tier-3
+binaries are bit-for-bit identical (asserted by a regression test).
+`--echo-server` remains available as a tier-3 shortcut but no longer
+represents a capability the language itself lacks. The HTTP demo
+(`--demo-http`) is still tier 3; it collapses under Phase 7 slice 3
+when HTTP/1.0 protocol support lands.
 
 The long-term target is to collapse tiers 3 and 2 into tier 1, one syscall
 family at a time, under a future Phase 7+ that introduces declarable network

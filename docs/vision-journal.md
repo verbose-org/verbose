@@ -6,6 +6,115 @@ The vision is the author's. These entries are written by the AI assistant under 
 
 ---
 
+## 2026-04-20 (afternoon) — Phase 7 slices 1 + 2a + 2b: first .verbose-described TCP server
+
+### Context
+
+Same day as the AI Act consolidation. Creator validated option B (add
+`bytes` as a first-class type) with Option 1 for service/handler bound
+matching (strict equality, no magic). Direction: take the time to do
+Phase 7 properly in small slices, each auditable independently.
+
+### What shipped
+
+Three commits, each one slice of Phase 7:
+
+1. **Slice 1** (70f616e): `service` top-level construct — AST, parser,
+   verifier (source ref exists, port in [1, 65535], max_request > 0,
+   handler rule exists). Closed protocol set with one variant: `raw_tcp`.
+   No emitter yet.
+
+2. **Slice 2a** (adfe648): `Type::Bytes` as first-class language type.
+   Type-isolated from Text by design (raw sockets carry NUL, binary
+   data, invalid UTF-8 — calling that "text" is a semantic lie the
+   auditor would pay for). Parser accepts `bytes [..N]` on concept
+   fields via the same mechanism as text. Service verifier enforces a
+   strict shape for RawTcp handlers: input and output each a Named
+   concept with exactly one bytes field whose bound equals the
+   service's `max_request`.
+
+3. **Slice 2b** (67cfbd9): RawTcp emitter. `compile_service` dispatches
+   on protocol; for RawTcp with an identity handler it calls
+   `emit_raw_tcp_echo_bytes(port, max_request)`, the shared emission
+   body now used by both `compile_echo_server` (tier 3) and the new
+   service path (tier 1). Wired into `--native --run <service_name>`
+   dispatch in main.rs.
+
+### Concrete result
+
+```
+$ cargo run -- examples/raw_tcp_echo.verbose --native /tmp/tcp_echo --run echo_server
+verified: 1 concept(s), 1 rule(s); all proofs check out
+service: /tmp/tcp_echo (358 bytes, port 7777)
+
+$ /tmp/tcp_echo &
+$ echo "Hello from Verbose!" | nc -N localhost 7777
+Hello from Verbose!
+```
+
+**358 bytes — exactly the size of the tier-3 probe.** A regression test
+asserts bit-for-bit equivalence between the two paths. The tier-3 → tier-1
+collapse that `docs/phase-7-design.md` promised, delivered.
+
+### Why this matters
+
+The binary is unchanged; what changed is the **source of authority**.
+Before: `compile_echo_server` in Rust was what made the echo work, and
+the auditor had to read Rust to understand the binary. Now: the
+`.verbose` source is what makes the echo work, verified mechanically by
+the compiler, and the auditor reads the `.verbose` file. The Rust code
+in native.rs is still the emitter implementation, but the emitter is
+trusted-once and the per-binary trust has moved to the source.
+
+This is the first proof that Phase 7 actually delivers on its promise.
+Future slices (HTTP/1.0, more handler operations) add mechanical
+expansion on top of the same pattern.
+
+### Scope discipline in evidence
+
+Every slice was deliberately narrow:
+- Slice 1 shipped grammar but no emission (testable alone).
+- Slice 2a shipped the type but no emitter for it (testable alone).
+- Slice 2b shipped the emitter only for identity handlers, with a
+  clear error message for anything else.
+
+Each slice added 5–10 tests and broke zero existing ones. 161 → 173
+across the three slices. The no-TODO discipline held.
+
+### Decisions locked
+
+- Bytes and Text are type-isolated, permanently. No implicit conversion
+  between them. An audit reviewing a handler declared on `bytes` knows
+  the code is not accidentally treating the data as a string.
+- Service/handler bound matching is strict equality, not subset.
+  Reasoning: any looser rule (handler bound > max_request) means the
+  handler expects bytes that will never arrive, which is false
+  explicitation. Symmetry is the simpler rule.
+- Identity-handler-only for slice 2b is an explicit restriction, not
+  an oversight. Non-identity handlers require byte operations (len,
+  concat, literal) that land one at a time in later slices, each with
+  its own proof obligations.
+
+### Open for next slice
+
+- **Slice 2c (incremental, bytes operations):** add bytes literals
+  (`b"..."` syntax), then `concat(bytes, bytes, ...) -> bytes` with
+  bound arithmetic (sum of input bounds ≤ max_request), then
+  equality `bytes == b"..."`. Each earns its place in the language
+  only if a concrete handler use case demands it.
+- **Slice 3 (strategic leap, HTTP/1.0):** introduce `Protocol::Http10`
+  with compiler-provided `HttpRequest` / `HttpResponse` concepts and
+  built-in parser + serializer in native.rs. This is the bigger leap —
+  it unlocks "Verbose-described HTTP service" which is the visible
+  demo target — but it depends on nothing from slice 2c (bytes stay
+  out of the HTTP handler's sight; the compiler parses bytes into
+  HttpRequest before the handler runs).
+
+Slice 3 is the more impactful next step, but it is also the bigger
+chunk. Slice 2c is the safer continuation.
+
+---
+
 ## 2026-04-20 — AI Act pattern validated at two instances; wrapper is domain-agnostic
 
 ### Context
