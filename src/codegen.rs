@@ -209,6 +209,9 @@ fn rust_type(ty: &Type) -> &str {
         Type::Number => "i64",
         Type::Bool => "bool",
         Type::Text => "&str",
+        // Bytes is introduced by Phase 7 for raw-TCP handlers; the Rust
+        // transpiler does not lower it today — native is the target.
+        Type::Bytes => "&[u8] /* Bytes — native backend target, not transpiled */",
         Type::Collection(_) => "Vec<i64>",
         Type::Named(_) => "i64",
         // Result(T, E) isn't lowered by the transpiler yet — the interpreter
@@ -223,6 +226,7 @@ fn type_label(ty: &Type) -> &str {
         Type::Number => "number",
         Type::Bool => "bool",
         Type::Text => "text",
+        Type::Bytes => "bytes",
         Type::Collection(inner) => return format!("collection({})", inner).leak(),
         Type::Named(n) => n.as_str(),
         Type::Result(t, e) => {

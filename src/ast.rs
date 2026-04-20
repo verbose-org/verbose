@@ -98,6 +98,14 @@ pub enum Type {
     Number,
     Bool,
     Text,
+    /// Raw bytes: the arbitrary-content counterpart to Text. Introduced in
+    /// Phase 7 slice 2a so that TCP socket input (which can contain NUL
+    /// bytes, binary data, or invalid UTF-8) has a honest type that does
+    /// not pretend to be text. The byte bound `[..N]` is declared on the
+    /// concept field, same mechanism as text. Bytes never implicitly
+    /// convert to or from Text — the isolation is the point. See
+    /// docs/phase-7-design.md for rationale.
+    Bytes,
     Collection(String),
     Named(String),
     /// Result(T, E) — a declared failure path.

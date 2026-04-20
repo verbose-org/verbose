@@ -81,7 +81,7 @@ pub fn verify_program(program: &Program, base_dir: &StdPath) -> Vec<VerifyError>
                     }
                 }
             }
-            Item::Service(s) => verify_service(s, &all_rules, base_dir, &mut errors),
+            Item::Service(s) => verify_service(s, &concepts, &all_rules, base_dir, &mut errors),
         }
     }
     errors
@@ -95,14 +95,13 @@ pub fn verify_program(program: &Program, base_dir: &StdPath) -> Vec<VerifyError>
 ///     port as u16, but we keep the check explicit for audit readability
 ///   - max_request > 0 (zero-byte read makes no sense for a listener)
 ///   - the handler rule exists in the program
-///
-/// Deliberately NOT checked yet (follow-up commits):
-///   - handler's input/output types matching the protocol's request /
-///     response shape. In the RawTcp-only first slice, there is no fixed
-///     request shape yet; HTTP/1.0 (which ships with HttpRequest /
-///     HttpResponse built-ins) will add that check when it lands.
+///   - for RawTcp: the handler's input and output are each a Named concept
+///     with exactly one `bytes [..max_request]` field. The bound MUST match
+///     the service's declared max_request exactly — a looser handler bound
+///     would leak unread bytes, a tighter one would truncate.
 fn verify_service(
     s: &Service,
+    concepts: &HashMap<String, &Concept>,
     all_rules: &[&Rule],
     base_dir: &StdPath,
     errors: &mut Vec<VerifyError>,
@@ -128,11 +127,135 @@ fn verify_service(
         });
     }
 
-    if !all_rules.iter().any(|r| r.name == s.handler) {
+    let handler = match all_rules.iter().find(|r| r.name == s.handler) {
+        Some(r) => *r,
+        None => {
+            errors.push(VerifyError {
+                context: format!("service '{}' / handler", s.name),
+                message: format!("handler references unknown rule '{}'", s.handler),
+            });
+            return;
+        }
+    };
+
+    // RawTcp handler shape: input and output must each be a Named concept
+    // whose single field is `bytes [..max_request]`. Enforced strictly so
+    // that what the service reads exactly matches what the handler expects,
+    // and what the handler returns exactly matches what the service writes.
+    if let Protocol::RawTcp = s.protocol {
+        let expected_bound = s.max_request as i64;
+        check_raw_tcp_binding(
+            &handler.input_ty,
+            handler.name.as_str(),
+            "input",
+            expected_bound,
+            concepts,
+            s,
+            errors,
+        );
+        check_raw_tcp_binding(
+            &handler.output_ty,
+            handler.name.as_str(),
+            "output",
+            expected_bound,
+            concepts,
+            s,
+            errors,
+        );
+    }
+}
+
+/// Helper for verify_service: enforce that a handler's input or output
+/// (for a RawTcp service) is a Named concept with exactly one `bytes[..N]`
+/// field where N equals the service's declared max_request. Any other shape
+/// is rejected with a specific error naming the offending position.
+fn check_raw_tcp_binding(
+    ty: &Type,
+    rule_name: &str,
+    position: &str,
+    expected_bound: i64,
+    concepts: &HashMap<String, &Concept>,
+    s: &Service,
+    errors: &mut Vec<VerifyError>,
+) {
+    let ctx = || {
+        format!(
+            "service '{}' / handler '{}' / {}",
+            s.name, rule_name, position
+        )
+    };
+    let concept_name = match ty {
+        Type::Named(n) => n,
+        _ => {
+            errors.push(VerifyError {
+                context: ctx(),
+                message: format!(
+                    "raw_tcp handler {} must be a Named concept with one bytes field; got {}",
+                    position,
+                    type_display(ty)
+                ),
+            });
+            return;
+        }
+    };
+    let concept = match concepts.get(concept_name.as_str()) {
+        Some(c) => *c,
+        None => {
+            errors.push(VerifyError {
+                context: ctx(),
+                message: format!("unknown concept '{}'", concept_name),
+            });
+            return;
+        }
+    };
+    if concept.fields.len() != 1 {
         errors.push(VerifyError {
-            context: format!("service '{}' / handler", s.name),
-            message: format!("handler references unknown rule '{}'", s.handler),
+            context: ctx(),
+            message: format!(
+                "raw_tcp handler {} concept '{}' must have exactly one field (has {})",
+                position,
+                concept_name,
+                concept.fields.len()
+            ),
         });
+        return;
+    }
+    let field = &concept.fields[0];
+    if !matches!(field.ty, Type::Bytes) {
+        errors.push(VerifyError {
+            context: ctx(),
+            message: format!(
+                "raw_tcp handler {} concept '{}' field '{}' must be bytes; got {}",
+                position,
+                concept_name,
+                field.name,
+                type_display(&field.ty)
+            ),
+        });
+        return;
+    }
+    match field.range {
+        Some((0, max)) if max == expected_bound => {
+            // matches exactly — good
+        }
+        Some((_, max)) => {
+            errors.push(VerifyError {
+                context: ctx(),
+                message: format!(
+                    "raw_tcp handler {} concept '{}' field '{}' bound is [..{}]; must equal service max_request {}",
+                    position, concept_name, field.name, max, expected_bound
+                ),
+            });
+        }
+        None => {
+            errors.push(VerifyError {
+                context: ctx(),
+                message: format!(
+                    "raw_tcp handler {} concept '{}' field '{}' must declare an explicit bytes bound [..{}]",
+                    position, concept_name, field.name, expected_bound
+                ),
+            });
+        }
     }
 }
 
@@ -467,6 +590,7 @@ fn type_display(ty: &Type) -> String {
         Type::Number => "number".to_string(),
         Type::Bool => "bool".to_string(),
         Type::Text => "text".to_string(),
+        Type::Bytes => "bytes".to_string(),
         Type::Collection(inner) => format!("collection({})", inner),
         Type::Named(n) => n.clone(),
         Type::Result(t, e) => format!("Result({}, {})", type_display(t), type_display(e)),
@@ -2036,22 +2160,41 @@ rule test
 
     // ─── Phase 7: service verifier tests ─────────────────────────────────
 
-    fn service_src(handler_name: &str) -> String {
+    /// Build a .verbose source for a RawTcp service with a bytes-echoing
+    /// handler. Parameters let individual tests perturb one axis at a time
+    /// (handler name, concept field type, concept field bound, service
+    /// max_request) to test each verifier check in isolation.
+    fn service_src(
+        handler_name: &str,
+        input_field_ty: &str,
+        input_bound: i64,
+        max_request: i64,
+    ) -> String {
+        let bound_str = if input_bound > 0 {
+            format!(" [..{}]", input_bound)
+        } else {
+            String::new()
+        };
         format!(
-            "@verbose 0.1.0\n\nconcept T\n  @intention: \"t\"\n  @source: invoices.intent:1\n  fields:\n    x : number\n\nrule h\n  @intention: \"t\"\n  @source: invoices.intent:1\n  input:\n    t : T\n  output:\n    r : bool\n  logic:\n    r = t.x > 0\n  proofs:\n    purity:\n      reads: [t.x]\n      calls: []\n    termination:\n      bound: 1\n\nservice s\n  @intention: \"a test service\"\n  @source: invoices.intent:1\n  listen:\n    protocol: raw_tcp\n    port: 9999\n    max_request: 4096\n  handler: {}\n",
-            handler_name
+            "@verbose 0.1.0\n\nconcept Frame\n  @intention: \"a tcp frame\"\n  @source: invoices.intent:1\n  fields:\n    data : {ty}{bound}\n\nrule h\n  @intention: \"echo\"\n  @source: invoices.intent:1\n  input:\n    req : Frame\n  output:\n    resp : Frame\n  logic:\n    resp = Frame {{ data: req.data }}\n  proofs:\n    purity:\n      reads: [req.data]\n      calls: []\n    termination:\n      bound: 2\n\nservice s\n  @intention: \"a test service\"\n  @source: invoices.intent:1\n  listen:\n    protocol: raw_tcp\n    port: 9999\n    max_request: {mr}\n  handler: {h}\n",
+            ty = input_field_ty,
+            bound = bound_str,
+            mr = max_request,
+            h = handler_name
         )
     }
 
     #[test]
-    fn service_happy_path() {
-        let errs = verify_str(&service_src("h"));
+    fn service_happy_path_bytes() {
+        // Matching pair: handler takes Frame { data: bytes [..4096] },
+        // service declares max_request: 4096.
+        let errs = verify_str(&service_src("h", "bytes", 4096, 4096));
         assert!(errs.is_empty(), "expected no errors, got: {:#?}", errs);
     }
 
     #[test]
     fn service_rejects_unknown_handler() {
-        let errs = verify_str(&service_src("nonexistent_handler"));
+        let errs = verify_str(&service_src("nonexistent_handler", "bytes", 4096, 4096));
         assert!(
             errs.iter().any(|e| e.context.contains("service 's' / handler")
                 && e.message.contains("unknown rule 'nonexistent_handler'")),
@@ -2062,12 +2205,44 @@ rule test
 
     #[test]
     fn service_rejects_bad_source_line() {
-        // Point @source at a line past the end of an existing intent file.
-        let src = "@verbose 0.1.0\n\nconcept T\n  @intention: \"t\"\n  @source: invoices.intent:1\n  fields:\n    x : number\n\nrule h\n  @intention: \"t\"\n  @source: invoices.intent:1\n  input:\n    t : T\n  output:\n    r : bool\n  logic:\n    r = t.x > 0\n  proofs:\n    purity:\n      reads: [t.x]\n      calls: []\n    termination:\n      bound: 1\n\nservice s\n  @intention: \"svc\"\n  @source: invoices.intent:999999\n  listen:\n    protocol: raw_tcp\n    port: 9999\n    max_request: 4096\n  handler: h\n";
+        let src = "@verbose 0.1.0\n\nconcept Frame\n  @intention: \"t\"\n  @source: invoices.intent:1\n  fields:\n    data : bytes [..4096]\n\nrule h\n  @intention: \"echo\"\n  @source: invoices.intent:1\n  input:\n    req : Frame\n  output:\n    resp : Frame\n  logic:\n    resp = Frame { data: req.data }\n  proofs:\n    purity:\n      reads: [req.data]\n      calls: []\n    termination:\n      bound: 2\n\nservice s\n  @intention: \"svc\"\n  @source: invoices.intent:999999\n  listen:\n    protocol: raw_tcp\n    port: 9999\n    max_request: 4096\n  handler: h\n";
         let errs = verify_str(src);
         assert!(
             errs.iter().any(|e| e.context.contains("service 's' / @source")),
             "expected service @source error, got: {:#?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn service_rejects_raw_tcp_handler_with_text_field() {
+        // text is not bytes — the types are deliberately isolated.
+        let errs = verify_str(&service_src("h", "text", 4096, 4096));
+        assert!(
+            errs.iter().any(|e| e.message.contains("must be bytes")),
+            "expected text-rejection error, got: {:#?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn service_rejects_raw_tcp_handler_with_bytes_bound_mismatch() {
+        // Handler declares [..4096] but service declares max_request: 1024.
+        let errs = verify_str(&service_src("h", "bytes", 4096, 1024));
+        assert!(
+            errs.iter().any(|e| e.message.contains("must equal service max_request")),
+            "expected bound-mismatch error, got: {:#?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn service_rejects_raw_tcp_handler_with_unbounded_bytes() {
+        // bytes without [..N] — explicit bound is mandatory.
+        let errs = verify_str(&service_src("h", "bytes", 0, 4096));
+        assert!(
+            errs.iter().any(|e| e.message.contains("must declare an explicit bytes bound")),
+            "expected missing-bound error, got: {:#?}",
             errs
         );
     }

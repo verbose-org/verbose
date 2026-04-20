@@ -140,16 +140,16 @@ impl Parser {
             let range = if self.check_kind(&TokenKind::LBracket) {
                 self.advance();
                 if self.check_kind(&TokenKind::Dot) {
-                    // text [..N] — max byte length bound
+                    // text/bytes [..N] — max byte length bound
                     self.advance(); // first dot
                     self.expect_kind(TokenKind::Dot)?; // second dot
                     let max = self.parse_signed_number()?;
                     self.expect_kind(TokenKind::RBracket)?;
-                    if !matches!(ty, Type::Text) {
-                        return Err(self.error("[..N] bound syntax is only valid for text fields; use [min, max] for numbers"));
+                    if !matches!(ty, Type::Text | Type::Bytes) {
+                        return Err(self.error("[..N] bound syntax is only valid for text or bytes fields; use [min, max] for numbers"));
                     }
                     if max <= 0 {
-                        return Err(self.error("text max-length bound must be positive"));
+                        return Err(self.error("max-length bound must be positive"));
                     }
                     Some((0, max))
                 } else {
@@ -176,6 +176,7 @@ impl Parser {
             "number" => Type::Number,
             "bool" => Type::Bool,
             "text" => Type::Text,
+            "bytes" => Type::Bytes,
             "collection" => {
                 self.expect_kind(TokenKind::LParen)?;
                 let inner = self.expect_ident_any()?;
