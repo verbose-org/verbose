@@ -1,0 +1,53 @@
+@verbose 0.1.0
+
+-- Phase 7 slice 3c: first .verbose file describing an HTTP service whose
+-- handler inspects the request and routes to different responses. The
+-- handler body is an if/else chain over req.method and req.path; each
+-- branch's HttpResponse has its own status and body literal.
+--
+-- This exercises the full Phase 7 chain end to end:
+--   * Http10 grammar + shape verification  (slice 3a)
+--   * service / handler dispatch            (slice 3b for Constant, 3c for If)
+--   * HTTP parser emitted inline            (new in 3c)
+--   * emit_eval_expr reused for conditions  (Phase 0-2 machinery)
+--   * record-to-slots handler emission      (new in 3c)
+--   * 6-syscall serialiser                  (new in 3c)
+--
+-- What is still NOT supported (explicit scope boundaries for slice 3c+):
+--   * concat in body                         → slice 3d
+--   * computed status                        → slice 3d
+--   * body content from parts of the request → slice 3e (after more
+--                                              HttpRequest fields land)
+
+
+rule hello_handler
+  @intention: "Return 200 for GET /, 200 with pong for GET /ping, 404 otherwise"
+  @source: hello_router.intent:2
+
+  input:
+    req : HttpRequest
+
+  output:
+    resp : HttpResponse
+
+  logic:
+    resp = if req.method == "GET" and req.path == "/" then HttpResponse { status: 200, body: "Hello from Verbose router!" } else if req.method == "GET" and req.path == "/ping" then HttpResponse { status: 200, body: "pong" } else HttpResponse { status: 404, body: "not found" }
+
+  proofs:
+    purity:
+      reads : [req.method, req.path]
+      calls : []
+    termination:
+      bound : 11
+
+
+service hello_server
+  @intention: "Listen on port 18889, route via hello_handler"
+  @source: hello_router.intent:5
+
+  listen:
+    protocol    : http_1_0
+    port        : 18889
+    max_request : 4096
+
+  handler: hello_handler

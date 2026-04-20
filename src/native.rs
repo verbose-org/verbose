@@ -6462,10 +6462,38 @@ pub fn compile_service(
         })?;
 
     if let Protocol::Http10 = service.protocol {
-        // Phase 7 slice 3b: Http10 constant-response services are emittable.
-        // Non-constant handlers (conditional / req field usage) land in slice
-        // 3c+ — see compile_http10_constant_service for the shape check.
-        return compile_http10_constant_service(program, service, output_path);
+        // Phase 7 Http10 dispatch: detect whether the handler is a constant
+        // HttpResponse (slice 3b, precomputed wire response) or a dynamic
+        // shape with if/else and req inspection (slice 3c), and route to
+        // the appropriate compiler. Unsupported shapes return a named error
+        // pointing at the slice where they land.
+        let handler = program
+            .items
+            .iter()
+            .find_map(|i| match i {
+                Item::Rule(r) if r.name == service.handler => Some(r),
+                _ => None,
+            })
+            .ok_or_else(|| NativeError {
+                message: format!(
+                    "service '{}' handler '{}' not found (verifier should have caught this)",
+                    service.name, service.handler
+                ),
+            })?;
+        return match analyze_http10_handler_shape(handler) {
+            Http10HandlerShape::Constant => {
+                compile_http10_constant_service(program, service, output_path)
+            }
+            Http10HandlerShape::Dynamic => {
+                compile_http10_dynamic_service(program, service, output_path)
+            }
+            Http10HandlerShape::Unsupported(reason) => Err(NativeError {
+                message: format!(
+                    "service '{}' handler '{}': {}",
+                    service.name, service.handler, reason
+                ),
+            }),
+        };
     }
 
     // From here on, protocol is RawTcp. The only other variant (Http10)
@@ -6558,6 +6586,700 @@ pub fn compile_service(
 /// reason-phrase mapping (200 → "OK", 404 → "Not Found", …). Clients
 /// accept mismatched reason phrases (the protocol ignores them once the
 /// status code is parsed), so "OK" is correct-enough for this slice.
+
+/// Shape classification for Http10 handler logic. Drives the compile_service
+/// Http10 dispatch between slice 3b (precomputed wire response) and slice 3c
+/// (if/else with runtime evaluation) paths.
+enum Http10HandlerShape {
+    /// Slice 3b: `logic = HttpResponse { status: N, body: "..." }`.
+    Constant,
+    /// Slice 3c: `logic = if <cond> then <arm> else <arm>` where each arm
+    /// recursively satisfies the shape, with leaves of the form
+    /// `HttpResponse { status: N, body: <text-literal | req.method | req.path> }`.
+    Dynamic,
+    /// Anything else: explicit error message naming the slice that would
+    /// lift the restriction (concat in body, let bindings, etc.).
+    Unsupported(String),
+}
+
+/// Walk the handler's logic expression and classify it. Pure analysis — no
+/// emission, no borrow of the program. Called once per service dispatch.
+fn analyze_http10_handler_shape(handler: &Rule) -> Http10HandlerShape {
+    if !handler.logic.bindings.is_empty() {
+        return Http10HandlerShape::Unsupported(
+            "let bindings in the handler body are not supported until slice 3d+".into(),
+        );
+    }
+    classify_http10_expr(&handler.logic.value, &handler.input_name)
+}
+
+fn classify_http10_expr(expr: &Expr, input_name: &str) -> Http10HandlerShape {
+    match expr {
+        Expr::Record(name, fields) if name == "HttpResponse" => {
+            classify_http_response_record(fields, input_name)
+        }
+        Expr::If(_cond, then_e, else_e) => {
+            // Both arms must recursively satisfy the shape. The condition
+            // itself is validated later at emit time (emit_eval_expr handles
+            // any boolean expression; the RawTcp-style strict shape check is
+            // unnecessary for conditions because the verifier already caught
+            // type errors).
+            match (
+                classify_http10_expr(then_e, input_name),
+                classify_http10_expr(else_e, input_name),
+            ) {
+                (Http10HandlerShape::Unsupported(why), _) => Http10HandlerShape::Unsupported(why),
+                (_, Http10HandlerShape::Unsupported(why)) => Http10HandlerShape::Unsupported(why),
+                // At least one side is non-constant (an If nesting) → Dynamic.
+                _ => Http10HandlerShape::Dynamic,
+            }
+        }
+        _ => Http10HandlerShape::Unsupported(format!(
+            "unexpected handler expression shape {:?}; slice 3c supports \
+             `HttpResponse {{ status: N, body: … }}` or `if … then … else …`",
+            expr_kind(expr)
+        )),
+    }
+}
+
+fn classify_http_response_record(
+    fields: &[(String, Expr)],
+    input_name: &str,
+) -> Http10HandlerShape {
+    let mut has_const_status = false;
+    let mut has_const_body = false;
+    let mut has_dynamic_field = false;
+    let mut seen_status = false;
+    let mut seen_body = false;
+
+    for (f_name, f_expr) in fields {
+        match f_name.as_str() {
+            "status" => {
+                seen_status = true;
+                match f_expr {
+                    Expr::Number(n) => {
+                        if (100..=599).contains(n) {
+                            has_const_status = true;
+                        } else {
+                            return Http10HandlerShape::Unsupported(format!(
+                                "status {} outside HTTP valid range [100, 599]", n
+                            ));
+                        }
+                    }
+                    _ => {
+                        return Http10HandlerShape::Unsupported(
+                            "slice 3c: status must be a number literal; computed status lands in slice 3d+".into(),
+                        );
+                    }
+                }
+            }
+            "body" => {
+                seen_body = true;
+                match f_expr {
+                    Expr::Text(_) => has_const_body = true,
+                    Expr::Field(base, fname)
+                        if matches!(base.as_ref(), Expr::Ident(n) if n == input_name)
+                            && (fname == "method" || fname == "path") =>
+                    {
+                        has_dynamic_field = true;
+                    }
+                    _ => {
+                        return Http10HandlerShape::Unsupported(format!(
+                            "slice 3c: body must be a text literal or req.method / req.path; \
+                             concat and other computed bodies land in slice 3d+ (got {:?})",
+                            expr_kind(f_expr)
+                        ));
+                    }
+                }
+            }
+            _ => {
+                return Http10HandlerShape::Unsupported(format!(
+                    "HttpResponse has no field '{}'; expected only 'status' and 'body'",
+                    f_name
+                ));
+            }
+        }
+    }
+    if !seen_status || !seen_body {
+        return Http10HandlerShape::Unsupported(
+            "HttpResponse must have both 'status' and 'body' fields".into(),
+        );
+    }
+    // Pure-literal (status Number + body Text) → Constant shape → slice 3b path.
+    // Any request-field reference in body → Dynamic → slice 3c path.
+    if has_const_status && has_const_body && !has_dynamic_field {
+        Http10HandlerShape::Constant
+    } else {
+        Http10HandlerShape::Dynamic
+    }
+}
+
+/// Short tag for Expr variants, for use in error messages. Avoids dumping
+/// the whole derived Debug of the expression tree at the user.
+fn expr_kind(e: &Expr) -> &'static str {
+    match e {
+        Expr::Number(_) => "Number",
+        Expr::Text(_) => "Text",
+        Expr::Ident(_) => "Ident",
+        Expr::Field(_, _) => "Field",
+        Expr::Binary(_, _, _) => "Binary",
+        Expr::Call(_, _) => "Call",
+        Expr::If(_, _, _) => "If",
+        Expr::Not(_) => "Not",
+        Expr::Neg(_) => "Neg",
+        Expr::Quantifier(_, _, _, _) => "Quantifier",
+        Expr::Fold(_, _, _, _, _) => "Fold",
+        Expr::Map(_, _, _) => "Map",
+        Expr::Filter(_, _, _) => "Filter",
+        Expr::Ok(_) => "Ok",
+        Expr::Err(_) => "Err",
+        Expr::MatchResult(_, _, _, _, _) => "MatchResult",
+        Expr::Record(_, _) => "Record",
+        Expr::Concat(_) => "Concat",
+    }
+}
+
+/// Phase 7 slice 3c: Http10 service whose handler contains one or more
+/// if/else branches producing different HttpResponse records. The handler's
+/// condition evaluation reuses emit_eval_expr (Phase 2's generic expression
+/// emitter, which already handles text-field-vs-literal equality via
+/// repe cmpsb on NUL-terminated strings — exactly what the HTTP parser
+/// produces). Only the orchestration (HTTP parse → handler → HTTP serialize)
+/// is new.
+///
+/// Emitted frame, per accept iteration, relative to rbp:
+///   [rbp -  8]  method pointer (set by HTTP parser, NUL-terminated)
+///   [rbp - 16]  path pointer   (set by HTTP parser, NUL-terminated)
+///   [rbp - 24]  output status code (set by handler)
+///   [rbp - 32]  output body pointer (set by handler)
+///   [rbp - 40]  output body length  (set by handler)
+///   [rbp - 48]  client file descriptor (saved after accept)
+///   [rbp - (48 + max_request) .. rbp - 48]  read buffer
+///
+/// Registers convention: r12 holds the server fd for the lifetime of the
+/// binary. emit_eval_expr clobbers rax, rcx, rdx, r8, rsi, rdi, flags; it
+/// does NOT touch rbp or r12. The client fd must therefore live in an rbp
+/// slot across the handler body invocation (hence [rbp - 48] above), not
+/// in a register.
+fn compile_http10_dynamic_service(
+    program: &Program,
+    service: &Service,
+    output_path: &str,
+) -> Result<(), NativeError> {
+    let handler = program
+        .items
+        .iter()
+        .find_map(|i| match i {
+            Item::Rule(r) if r.name == service.handler => Some(r),
+            _ => None,
+        })
+        .ok_or_else(|| NativeError {
+            message: format!(
+                "service '{}' handler '{}' not found (verifier should have caught this)",
+                service.name, service.handler
+            ),
+        })?;
+
+    // HttpRequest fields at fixed rbp slots — mirrors Phase 2E's text-input-
+    // field layout so emit_eval_expr can compare req.method / req.path
+    // against literals without modification.
+    let mut offsets: HashMap<&str, i32> = HashMap::new();
+    offsets.insert("method", -8);
+    offsets.insert("path", -16);
+    let no_rules: HashMap<&str, &Rule> = HashMap::new();
+    let no_ranges: HashMap<&str, (i64, i64)> = HashMap::new();
+
+    let code = emit_http10_dynamic_bytes(service, handler, &offsets, &no_rules, &no_ranges)?;
+    write_server_elf(&code, output_path, "service", service.port)
+}
+
+fn emit_http10_dynamic_bytes(
+    service: &Service,
+    handler: &Rule,
+    offsets: &HashMap<&str, i32>,
+    all_rules: &HashMap<&str, &Rule>,
+    field_ranges: &HashMap<&str, (i64, i64)>,
+) -> Result<Vec<u8>, NativeError> {
+    let mut code = Vec::new();
+    let port_be = service.port.to_be_bytes();
+    let max_request = service.max_request;
+    let buf_bytes = max_request.to_le_bytes();
+    let frame_size: u32 = 48 + max_request;
+    let buf_offset_from_rbp: i32 = -(48i32 + max_request as i32);
+
+    // ═══ PROLOGUE: rbp frame ═══════════════════════════════════
+    code.push(0x55);                                     // push rbp
+    code.extend_from_slice(&[0x48, 0x89, 0xE5]);         // mov rbp, rsp
+    code.extend_from_slice(&[0x48, 0x81, 0xEC]);         // sub rsp, imm32
+    code.extend_from_slice(&frame_size.to_le_bytes());
+
+    // ═══ SOCKET ════════════════════════════════════════════════
+    code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x29, 0x00, 0x00, 0x00]); // mov rax, 41
+    code.extend_from_slice(&[0x48, 0xC7, 0xC7, 0x02, 0x00, 0x00, 0x00]); // rdi=2 (AF_INET)
+    code.extend_from_slice(&[0x48, 0xC7, 0xC6, 0x01, 0x00, 0x00, 0x00]); // rsi=1 (STREAM)
+    code.extend_from_slice(&[0x48, 0x31, 0xD2]);                         // rdx=0
+    code.extend_from_slice(&[0x0F, 0x05]);                               // syscall
+    code.extend_from_slice(&[0x49, 0x89, 0xC4]);                         // mov r12, rax
+
+    // SETSOCKOPT SO_REUSEADDR
+    code.extend_from_slice(&[0x6A, 0x01]);                               // push 1
+    code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x36, 0x00, 0x00, 0x00]); // rax=54
+    code.extend_from_slice(&[0x4C, 0x89, 0xE7]);                         // rdi=r12
+    code.extend_from_slice(&[0x48, 0xC7, 0xC6, 0x01, 0x00, 0x00, 0x00]); // rsi=1
+    code.extend_from_slice(&[0x48, 0xC7, 0xC2, 0x02, 0x00, 0x00, 0x00]); // rdx=2
+    code.extend_from_slice(&[0x49, 0x89, 0xE2]);                         // r10=rsp
+    code.extend_from_slice(&[0x49, 0xC7, 0xC0, 0x04, 0x00, 0x00, 0x00]); // r8=4
+    code.extend_from_slice(&[0x0F, 0x05]);                               // syscall
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x08]);                   // add rsp, 8
+
+    // BIND
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x10]);                   // sub rsp, 16
+    code.extend_from_slice(&[0x66, 0xC7, 0x04, 0x24, 0x02, 0x00]);       // word [rsp]=2
+    code.extend_from_slice(&[0x66, 0xC7, 0x44, 0x24, 0x02]);             // word [rsp+2]=port
+    code.extend_from_slice(&port_be);
+    code.extend_from_slice(&[0x48, 0xC7, 0x44, 0x24, 0x04, 0x00, 0x00, 0x00, 0x00]);
+    code.extend_from_slice(&[0x48, 0xC7, 0x44, 0x24, 0x08, 0x00, 0x00, 0x00, 0x00]);
+    code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x31, 0x00, 0x00, 0x00]); // rax=49 bind
+    code.extend_from_slice(&[0x4C, 0x89, 0xE7]);                         // rdi=r12
+    code.extend_from_slice(&[0x48, 0x89, 0xE6]);                         // rsi=rsp
+    code.extend_from_slice(&[0x48, 0xC7, 0xC2, 0x10, 0x00, 0x00, 0x00]); // rdx=16
+    code.extend_from_slice(&[0x0F, 0x05]);                               // syscall
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x10]);                   // add rsp, 16
+
+    // LISTEN
+    code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x32, 0x00, 0x00, 0x00]); // rax=50
+    code.extend_from_slice(&[0x4C, 0x89, 0xE7]);                         // rdi=r12
+    code.extend_from_slice(&[0x48, 0xC7, 0xC6, 0x80, 0x00, 0x00, 0x00]); // rsi=128
+    code.extend_from_slice(&[0x0F, 0x05]);                               // syscall
+
+    // ═══ ACCEPT LOOP ═══════════════════════════════════════════
+    let accept_top = code.len();
+    code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x2B, 0x00, 0x00, 0x00]); // rax=43 accept
+    code.extend_from_slice(&[0x4C, 0x89, 0xE7]);                         // rdi=r12
+    code.extend_from_slice(&[0x48, 0x31, 0xF6]);                         // rsi=0
+    code.extend_from_slice(&[0x48, 0x31, 0xD2]);                         // rdx=0
+    code.extend_from_slice(&[0x0F, 0x05]);                               // syscall
+    // mov [rbp-48], rax  (save client_fd)
+    code.extend_from_slice(&[0x48, 0x89, 0x45, 0xD0]);                   // -48 = 0xD0 i8
+
+    // ═══ READ ══════════════════════════════════════════════════
+    code.extend_from_slice(&[0x48, 0x31, 0xC0]);                         // xor rax, rax
+    code.extend_from_slice(&[0x48, 0x8B, 0x7D, 0xD0]);                   // rdi = [rbp-48]
+    // rsi = rbp + buf_offset_from_rbp  (via lea)
+    code.extend_from_slice(&[0x48, 0x8D, 0xB5]);                         // lea rsi, [rbp + disp32]
+    code.extend_from_slice(&buf_offset_from_rbp.to_le_bytes());
+    code.extend_from_slice(&[0x48, 0xC7, 0xC2]);                         // mov rdx, max_request
+    code.extend_from_slice(&buf_bytes);
+    code.extend_from_slice(&[0x0F, 0x05]);                               // syscall
+    // rax = bytes_read
+
+    // ═══ HTTP PARSE (method, path) ═════════════════════════════
+    // On malformed input (no space found, no CR/LF found), jumps to
+    // the close/loop label via a pair of rel32 patch sites. We resolve
+    // those after emitting the close.
+    let parse_fail_patches = emit_http_parse_method_path(&mut code, buf_offset_from_rbp);
+
+    // ═══ HANDLER BODY ══════════════════════════════════════════
+    // Populates [rbp-24]=status, [rbp-32]=body_ptr, [rbp-40]=body_len.
+    emit_handler_to_slots(
+        &mut code,
+        &handler.logic.value,
+        &handler.input_name,
+        offsets,
+        all_rules,
+        field_ranges,
+    )?;
+
+    // ═══ HTTP SERIALIZE ════════════════════════════════════════
+    emit_http_serialize(&mut code);
+
+    // ═══ CLOSE + LOOP ══════════════════════════════════════════
+    let close_label = code.len();
+    // Patch parse_fail jumps to land here.
+    for patch in parse_fail_patches {
+        let rel = close_label as i32 - (patch as i32 + 4);
+        code[patch..patch + 4].copy_from_slice(&rel.to_le_bytes());
+    }
+    // close(client_fd): rax=3, rdi=[rbp-48]
+    code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x03, 0x00, 0x00, 0x00]);
+    code.extend_from_slice(&[0x48, 0x8B, 0x7D, 0xD0]);                   // rdi = [rbp-48]
+    code.extend_from_slice(&[0x0F, 0x05]);                               // syscall
+
+    // jmp accept_top
+    code.push(0xE9);
+    let back = accept_top as i32 - (code.len() as i32 + 4);
+    code.extend_from_slice(&back.to_le_bytes());
+
+    Ok(code)
+}
+
+/// Emit the HTTP/1.0 minimal parser: scan the read buffer for the first
+/// two space-delimited tokens (method, path), NUL-terminate each in place,
+/// and store the pointers at [rbp - 8] and [rbp - 16] respectively.
+///
+/// On entry: rax holds the number of bytes read. buf_offset_from_rbp is the
+/// signed rbp-relative offset of the buffer start.
+/// On exit (success): rbp[-8] and rbp[-16] are valid NUL-terminated ptrs.
+/// On exit (failure): execution jumps via one of the returned patch sites;
+/// the caller patches those to the close label so malformed input closes
+/// the connection without a response.
+///
+/// Registers used: rax (bytes remaining), rbx (scan pointer), al (byte reg).
+fn emit_http_parse_method_path(code: &mut Vec<u8>, buf_offset_from_rbp: i32) -> Vec<usize> {
+    let mut fail_patches = Vec::new();
+
+    // rbx = buf start = rbp + buf_offset
+    code.extend_from_slice(&[0x48, 0x8D, 0x9D]);                         // lea rbx, [rbp + disp32]
+    code.extend_from_slice(&buf_offset_from_rbp.to_le_bytes());
+    // mov [rbp-8], rbx    (method ptr)
+    code.extend_from_slice(&[0x48, 0x89, 0x5D, 0xF8]);
+
+    // scan_method:
+    let scan_method_top = code.len();
+    // test rax, rax  (bytes remaining)
+    code.extend_from_slice(&[0x48, 0x85, 0xC0]);
+    // jz parse_fail  (out of bytes without finding space)
+    code.push(0x0F);
+    code.push(0x84);
+    fail_patches.push(code.len());
+    code.extend_from_slice(&[0, 0, 0, 0]); // placeholder rel32
+    // cmp byte [rbx], ' '
+    code.extend_from_slice(&[0x80, 0x3B, 0x20]);
+    // je method_end (rel8 forward)
+    code.push(0x74);
+    let patch_method_end = code.len();
+    code.push(0);
+    // inc rbx; dec rax; jmp scan_method
+    code.extend_from_slice(&[0x48, 0xFF, 0xC3]);                          // inc rbx
+    code.extend_from_slice(&[0x48, 0xFF, 0xC8]);                          // dec rax
+    let back_dist = scan_method_top as i32 - (code.len() as i32 + 2);
+    code.push(0xEB);
+    code.push(back_dist as i8 as u8);
+
+    // method_end:
+    let method_end = code.len();
+    code[patch_method_end] = (method_end - patch_method_end - 1) as u8;
+    // mov byte [rbx], 0
+    code.extend_from_slice(&[0xC6, 0x03, 0x00]);
+    // inc rbx; dec rax
+    code.extend_from_slice(&[0x48, 0xFF, 0xC3]);
+    code.extend_from_slice(&[0x48, 0xFF, 0xC8]);
+    // mov [rbp-16], rbx    (path ptr)
+    code.extend_from_slice(&[0x48, 0x89, 0x5D, 0xF0]);
+
+    // scan_path:
+    let scan_path_top = code.len();
+    // test rax, rax
+    code.extend_from_slice(&[0x48, 0x85, 0xC0]);
+    // jz parse_fail
+    code.push(0x0F);
+    code.push(0x84);
+    fail_patches.push(code.len());
+    code.extend_from_slice(&[0, 0, 0, 0]);
+    // mov r8b, [rbx] (use r8b to avoid clobbering rax low byte)
+    code.extend_from_slice(&[0x44, 0x8A, 0x03]);
+    // cmp r8b, ' '
+    code.extend_from_slice(&[0x41, 0x80, 0xF8, 0x20]);
+    // je path_end
+    code.push(0x74);
+    let patch_path_end_space = code.len();
+    code.push(0);
+    // cmp r8b, '\r'
+    code.extend_from_slice(&[0x41, 0x80, 0xF8, 0x0D]);
+    code.push(0x74);
+    let patch_path_end_cr = code.len();
+    code.push(0);
+    // cmp r8b, '\n'
+    code.extend_from_slice(&[0x41, 0x80, 0xF8, 0x0A]);
+    code.push(0x74);
+    let patch_path_end_lf = code.len();
+    code.push(0);
+    // inc rbx; dec rax; jmp scan_path
+    code.extend_from_slice(&[0x48, 0xFF, 0xC3]);
+    code.extend_from_slice(&[0x48, 0xFF, 0xC8]);
+    let back_dist = scan_path_top as i32 - (code.len() as i32 + 2);
+    code.push(0xEB);
+    code.push(back_dist as i8 as u8);
+
+    // path_end:
+    let path_end = code.len();
+    for patch in &[patch_path_end_space, patch_path_end_cr, patch_path_end_lf] {
+        code[*patch] = (path_end - patch - 1) as u8;
+    }
+    // mov byte [rbx], 0
+    code.extend_from_slice(&[0xC6, 0x03, 0x00]);
+
+    fail_patches
+}
+
+/// Walk the handler's logic expression and emit code that, on exit, leaves:
+///   qword [rbp - 24] = status
+///   qword [rbp - 32] = body_ptr
+///   qword [rbp - 40] = body_len
+///
+/// Accepted shape (slice 3c, enforced by analyze_http10_handler_shape):
+///   If(cond, then_arm, else_arm)  — emit cond via emit_eval_expr, branch
+///   Record("HttpResponse", [status, body])  — emit literal stores
+/// Leaves beyond these shapes should already be Unsupported; if reached,
+/// an internal error is returned (belt-and-suspenders vs shape drift).
+fn emit_handler_to_slots(
+    code: &mut Vec<u8>,
+    expr: &Expr,
+    input_name: &str,
+    offsets: &HashMap<&str, i32>,
+    all_rules: &HashMap<&str, &Rule>,
+    field_ranges: &HashMap<&str, (i64, i64)>,
+) -> Result<(), NativeError> {
+    match expr {
+        Expr::Record(name, fields) if name == "HttpResponse" => {
+            // Store status (Number literal)
+            let mut status: Option<i64> = None;
+            let mut body_ref: Option<&Expr> = None;
+            for (fname, fexpr) in fields {
+                match fname.as_str() {
+                    "status" => {
+                        if let Expr::Number(n) = fexpr {
+                            status = Some(*n);
+                        } else {
+                            return Err(NativeError {
+                                message: "status must be a number literal (slice 3c)".into(),
+                            });
+                        }
+                    }
+                    "body" => body_ref = Some(fexpr),
+                    _ => {
+                        return Err(NativeError {
+                            message: format!("unexpected HttpResponse field '{}'", fname),
+                        })
+                    }
+                }
+            }
+            let status = status.ok_or_else(|| NativeError {
+                message: "HttpResponse missing status".into(),
+            })?;
+            let body_expr = body_ref.ok_or_else(|| NativeError {
+                message: "HttpResponse missing body".into(),
+            })?;
+
+            // mov qword [rbp-24], <status as i32, sign-extended>
+            code.extend_from_slice(&[0x48, 0xC7, 0x45, 0xE8]);           // -24 = 0xE8
+            code.extend_from_slice(&(status as i32).to_le_bytes());
+
+            // Body: literal Text OR Field(Ident(input), "method"|"path")
+            match body_expr {
+                Expr::Text(s) => {
+                    // Inline the bytes with jmp-over + lea-rip
+                    let bytes = s.as_bytes();
+                    // jmp rel32 over data
+                    code.push(0xE9);
+                    let jlen = bytes.len() as i32;
+                    code.extend_from_slice(&jlen.to_le_bytes());
+                    let data_addr = code.len();
+                    code.extend_from_slice(bytes);
+                    // lea rax, [rip + disp32]
+                    let after_lea = code.len() + 7;
+                    let rel = data_addr as i32 - after_lea as i32;
+                    code.extend_from_slice(&[0x48, 0x8D, 0x05]);
+                    code.extend_from_slice(&rel.to_le_bytes());
+                    // mov [rbp-32], rax  (body ptr)
+                    code.extend_from_slice(&[0x48, 0x89, 0x45, 0xE0]);    // -32 = 0xE0
+                    // mov qword [rbp-40], len (as i32)
+                    code.extend_from_slice(&[0x48, 0xC7, 0x45, 0xD8]);    // -40 = 0xD8
+                    code.extend_from_slice(&(bytes.len() as i32).to_le_bytes());
+                }
+                Expr::Field(base, fname)
+                    if matches!(base.as_ref(), Expr::Ident(n) if n == input_name) =>
+                {
+                    let foff = *offsets.get(fname.as_str()).ok_or_else(|| NativeError {
+                        message: format!("unknown field '{}'", fname),
+                    })?;
+                    // mov rax, [rbp + foff]  (text field pointer)
+                    code.extend_from_slice(&[0x48, 0x8B, 0x45]);
+                    code.push(foff as i8 as u8);
+                    // mov [rbp-32], rax
+                    code.extend_from_slice(&[0x48, 0x89, 0x45, 0xE0]);
+                    // strlen via repne scasb: rdi = rax, al=0, rcx=-1, repne scasb
+                    code.extend_from_slice(&[0x48, 0x89, 0xC7]);          // mov rdi, rax
+                    code.extend_from_slice(&[0x30, 0xC0]);                // xor al, al
+                    code.extend_from_slice(&[0x48, 0xC7, 0xC1, 0xFF, 0xFF, 0xFF, 0xFF]); // mov rcx, -1
+                    code.extend_from_slice(&[0xFC]);                      // cld
+                    code.extend_from_slice(&[0xF2, 0xAE]);                // repne scasb
+                    // After: rcx = -(len+2); len = -rcx - 2 = (not rcx) - 1
+                    code.extend_from_slice(&[0x48, 0xF7, 0xD1]);          // not rcx
+                    code.extend_from_slice(&[0x48, 0xFF, 0xC9]);          // dec rcx
+                    // mov [rbp-40], rcx
+                    code.extend_from_slice(&[0x48, 0x89, 0x4D, 0xD8]);
+                }
+                _ => {
+                    return Err(NativeError {
+                        message: "body shape not supported in slice 3c".into(),
+                    });
+                }
+            }
+            Ok(())
+        }
+        Expr::If(cond, then_e, else_e) => {
+            // Evaluate cond → rax (0 or 1)
+            emit_eval_expr(code, cond, input_name, offsets, all_rules, field_ranges)?;
+            // test rax, rax ; jz else_label
+            code.extend_from_slice(&[0x48, 0x85, 0xC0]);
+            code.push(0x0F);
+            code.push(0x84);
+            let patch_else = code.len();
+            code.extend_from_slice(&[0, 0, 0, 0]);
+
+            // then arm
+            emit_handler_to_slots(code, then_e, input_name, offsets, all_rules, field_ranges)?;
+            // jmp end_label
+            code.push(0xE9);
+            let patch_end = code.len();
+            code.extend_from_slice(&[0, 0, 0, 0]);
+
+            // else_label:
+            let else_pos = code.len();
+            let rel = else_pos as i32 - (patch_else as i32 + 4);
+            code[patch_else..patch_else + 4].copy_from_slice(&rel.to_le_bytes());
+
+            // else arm
+            emit_handler_to_slots(code, else_e, input_name, offsets, all_rules, field_ranges)?;
+
+            // end_label:
+            let end_pos = code.len();
+            let rel = end_pos as i32 - (patch_end as i32 + 4);
+            code[patch_end..patch_end + 4].copy_from_slice(&rel.to_le_bytes());
+
+            Ok(())
+        }
+        other => Err(NativeError {
+            message: format!(
+                "emit_handler_to_slots: unexpected shape {:?} (slice 3c shape drift)",
+                expr_kind(other)
+            ),
+        }),
+    }
+}
+
+/// Emit the HTTP/1.0 response serializer: six sequential write() syscalls
+/// that build the response line by line, reading status / body_ptr /
+/// body_len / client_fd from their respective rbp slots. Ugly by design —
+/// simple, auditable, no in-memory buffer. writev coalescing is a later
+/// optimisation gated on a concrete bench.
+fn emit_http_serialize(code: &mut Vec<u8>) {
+    // Status itoa buffer lives on the stack; allocate 10 bytes upfront for
+    // both status and body_len, re-used sequentially.
+    // Format: HTTP/1.0 <status> OK\r\nContent-Length: <body_len>\r\n\r\n<body>
+
+    emit_write_literal(code, b"HTTP/1.0 ");
+    emit_write_itoa_slot(code, -24);                                     // status at rbp-24
+    emit_write_literal(code, b" OK\r\nContent-Length: ");
+    emit_write_itoa_slot(code, -40);                                     // body_len at rbp-40
+    emit_write_literal(code, b"\r\n\r\n");
+    emit_write_body_ptr_len(code);                                        // body_ptr at rbp-32, len at rbp-40
+}
+
+/// Emit a write() syscall for a fixed byte literal, inlined with jmp-over
+/// + lea-rip-relative. Uses [rbp - 48] as the client_fd source.
+fn emit_write_literal(code: &mut Vec<u8>, literal: &[u8]) {
+    // jmp rel32 over data
+    code.push(0xE9);
+    let jlen = literal.len() as i32;
+    code.extend_from_slice(&jlen.to_le_bytes());
+    let data_addr = code.len();
+    code.extend_from_slice(literal);
+    // lea rsi, [rip + disp32]
+    let after_lea = code.len() + 7;
+    let rel = data_addr as i32 - after_lea as i32;
+    code.extend_from_slice(&[0x48, 0x8D, 0x35]);
+    code.extend_from_slice(&rel.to_le_bytes());
+    // mov rdi, [rbp-48]  (client_fd)
+    code.extend_from_slice(&[0x48, 0x8B, 0x7D, 0xD0]);
+    // mov rdx, imm32 (length)
+    code.extend_from_slice(&[0x48, 0xC7, 0xC2]);
+    code.extend_from_slice(&(literal.len() as i32).to_le_bytes());
+    // mov rax, 1 (write); syscall
+    code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x01, 0x00, 0x00, 0x00]);
+    code.extend_from_slice(&[0x0F, 0x05]);
+}
+
+/// Emit an itoa + write for a non-negative i64 stored at [rbp + slot_off].
+/// The decimal digits are built on the stack (growing down) then written
+/// via a single write() syscall. Uses rax/rcx/rdx/rsi/rdi/r8; caller
+/// assumes no cross-call invariants in these registers.
+fn emit_write_itoa_slot(code: &mut Vec<u8>, slot_off: i32) {
+    // mov rax, [rbp + slot_off]  (value to print)
+    code.extend_from_slice(&[0x48, 0x8B, 0x45]);
+    code.push(slot_off as i8 as u8);
+
+    // Allocate 24 bytes on stack for the digit buffer (enough for i64)
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x18]);                    // sub rsp, 24
+    // r8 = rsp + 24  (one-past-end cursor)
+    code.extend_from_slice(&[0x4C, 0x8D, 0x44, 0x24, 0x18]);              // lea r8, [rsp+24]
+
+    // Special case: value == 0 → emit single '0'
+    // test rax, rax ; jnz itoa_loop
+    code.extend_from_slice(&[0x48, 0x85, 0xC0]);
+    code.push(0x75);
+    let patch_nz = code.len();
+    code.push(0);
+    // Zero path: dec r8 ; mov byte [r8], '0'
+    code.extend_from_slice(&[0x49, 0xFF, 0xC8]);                          // dec r8
+    code.extend_from_slice(&[0x41, 0xC6, 0x00, 0x30]);                    // mov byte [r8], '0'
+    // jmp write_digits
+    code.push(0xEB);
+    let patch_skip_loop = code.len();
+    code.push(0);
+
+    // itoa_loop: (patch from "jnz")
+    let loop_top = code.len();
+    code[patch_nz] = (loop_top - patch_nz - 1) as u8;
+
+    // rcx = 10 ; xor rdx, rdx ; div rcx → rax = rax / 10, rdx = rax % 10
+    code.extend_from_slice(&[0x48, 0xC7, 0xC1, 0x0A, 0x00, 0x00, 0x00]); // mov rcx, 10
+    code.extend_from_slice(&[0x48, 0x31, 0xD2]);                         // xor rdx, rdx
+    code.extend_from_slice(&[0x48, 0xF7, 0xF1]);                         // div rcx
+    // dl += '0' ; dec r8 ; mov [r8], dl
+    code.extend_from_slice(&[0x80, 0xC2, 0x30]);                         // add dl, '0'
+    code.extend_from_slice(&[0x49, 0xFF, 0xC8]);                         // dec r8
+    code.extend_from_slice(&[0x41, 0x88, 0x10]);                         // mov [r8], dl
+    // test rax, rax ; jnz loop_top
+    code.extend_from_slice(&[0x48, 0x85, 0xC0]);
+    code.push(0x75);
+    let back = loop_top as i32 - (code.len() as i32 + 1);
+    code.push(back as i8 as u8);
+
+    // write_digits: (patch from "jmp skip_loop" in zero path)
+    let write_digits = code.len();
+    code[patch_skip_loop] = (write_digits - patch_skip_loop - 1) as u8;
+
+    // rdx (count) = (rsp + 24) - r8
+    code.extend_from_slice(&[0x48, 0x8D, 0x54, 0x24, 0x18]);              // lea rdx, [rsp+24]
+    code.extend_from_slice(&[0x4C, 0x29, 0xC2]);                          // sub rdx, r8
+    // rsi = r8 (start of digits)
+    code.extend_from_slice(&[0x4C, 0x89, 0xC6]);                          // mov rsi, r8
+    // rdi = [rbp-48] (client_fd)
+    code.extend_from_slice(&[0x48, 0x8B, 0x7D, 0xD0]);
+    // rax = 1 ; syscall
+    code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x01, 0x00, 0x00, 0x00]);
+    code.extend_from_slice(&[0x0F, 0x05]);
+
+    // Release the 24-byte digit buffer
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x18]);                    // add rsp, 24
+}
+
+/// Emit a write() syscall for the handler-produced body: pointer at
+/// [rbp - 32], length at [rbp - 40], fd at [rbp - 48].
+fn emit_write_body_ptr_len(code: &mut Vec<u8>) {
+    // rsi = [rbp-32]
+    code.extend_from_slice(&[0x48, 0x8B, 0x75, 0xE0]);
+    // rdx = [rbp-40]
+    code.extend_from_slice(&[0x48, 0x8B, 0x55, 0xD8]);
+    // rdi = [rbp-48]
+    code.extend_from_slice(&[0x48, 0x8B, 0x7D, 0xD0]);
+    // rax = 1 ; syscall
+    code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x01, 0x00, 0x00, 0x00]);
+    code.extend_from_slice(&[0x0F, 0x05]);
+}
+
 fn compile_http10_constant_service(
     program: &Program,
     service: &Service,
@@ -7814,6 +8536,55 @@ mod tests {
 
         let _ = fs::remove_file(out_argv);
         let _ = fs::remove_file(out_stdin);
+    }
+
+    /// Phase 7 slice 3c regression: compiling the shipped hello_router
+    /// example must produce a binary within the expected size envelope
+    /// and include all three declared body strings verbatim.
+    #[test]
+    fn phase7_http10_dynamic_service_emits_all_body_literals() {
+        use std::fs;
+        let src = fs::read_to_string("examples/hello_router.verbose")
+            .expect("examples/hello_router.verbose is expected to exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let out = std::env::temp_dir().join("verbosec_test_phase7_router");
+        compile_service(&program, "hello_server", out.to_str().unwrap())
+            .expect("Http10 dynamic-service compile");
+
+        let bytes = fs::read(&out).expect("read output");
+        let size = bytes.len();
+        assert!(
+            (800..1500).contains(&size),
+            "http dynamic service binary size {} outside expected [800, 1500] envelope", size
+        );
+
+        // All three handler body strings must appear verbatim in the emitted
+        // ELF — each is inlined in the .text section as part of the arm-
+        // specific slot write.
+        for body in [
+            &b"Hello from Verbose router!"[..],
+            &b"pong"[..],
+            &b"not found"[..],
+        ] {
+            assert!(
+                bytes.windows(body.len()).any(|w| w == body),
+                "body literal {:?} not found in emitted binary",
+                std::str::from_utf8(body).unwrap()
+            );
+        }
+        // Comparison literals should also appear inline (repe cmpsb needs
+        // them NUL-terminated and addressable via rip-relative lea).
+        for method_or_path in [&b"GET\0"[..], &b"/\0"[..], &b"/ping\0"[..]] {
+            assert!(
+                bytes.windows(method_or_path.len()).any(|w| w == method_or_path),
+                "comparison literal {:?} not found in emitted binary",
+                std::str::from_utf8(method_or_path).unwrap()
+            );
+        }
+
+        let _ = fs::remove_file(out);
     }
 
     /// Phase 7 slice 3b regression: compiling the shipped hello_http

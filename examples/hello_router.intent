@@ -1,0 +1,5 @@
+1. The hello router accepts HTTP/1.0 requests and returns different responses based on the request method and path.
+2. For a GET request to the root path, the router returns HTTP 200 with a greeting body.
+3. For a GET request to the /ping path, the router returns HTTP 200 with the body "pong".
+4. For any other request, the router returns HTTP 404 with the body "not found".
+5. The service listens on port 18889 and reads up to 4096 bytes per incoming request.
