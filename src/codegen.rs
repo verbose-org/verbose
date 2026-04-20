@@ -24,6 +24,13 @@ pub fn emit_rust(program: &Program) -> String {
             Item::Reaction(rx) => {
                 out.push_str(&format!("// Reaction: {} — \"{}\"\n", rx.name, rx.intention));
             }
+            Item::Service(s) => {
+                // Phase 7 services are declarative network listeners. The
+                // Rust transpiler does not emit servers today — it targets
+                // pure-rule transpilation. Skip with a comment so the output
+                // stays coherent.
+                out.push_str(&format!("// Service: {} — \"{}\" (not transpiled; Phase 7 native-only)\n", s.name, s.intention));
+            }
         }
     }
     out.push('\n');

@@ -91,6 +91,8 @@ pub fn optimize_program(program: &Program) -> (Program, OptStats) {
                     Item::Rule(optimize_rule(r, &field_ranges))
                 }
                 Item::Reaction(rx) => Item::Reaction(rx.clone()),
+                // Services carry no logic expression to optimise; pass through.
+                Item::Service(s) => Item::Service(s.clone()),
             })
             .collect(),
     };

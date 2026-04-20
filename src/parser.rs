@@ -46,8 +46,10 @@ impl Parser {
                 items.push(Item::Rule(self.parse_rule()?));
             } else if self.check_ident("reaction") {
                 items.push(Item::Reaction(self.parse_reaction()?));
+            } else if self.check_ident("service") {
+                items.push(Item::Service(self.parse_service()?));
             } else {
-                return Err(self.error("expected 'concept', 'rule', or 'reaction' at top level"));
+                return Err(self.error("expected 'concept', 'rule', 'reaction', or 'service' at top level"));
             }
         }
         Ok(Program { version, uses, items })
@@ -929,6 +931,134 @@ impl Parser {
         })
     }
 
+    /// Phase 7: parse a `service` top-level block. Grammar:
+    ///
+    ///     service <name>
+    ///       @intention: "..."
+    ///       @source: file.intent:N
+    ///       listen:
+    ///         protocol   : raw_tcp
+    ///         port       : 9999
+    ///         max_request: 4096
+    ///       handler: <rule_name>
+    ///
+    /// The `listen:` block carries the three properties that constrain what
+    /// the binary may do on the network: which wire protocol, which port,
+    /// and the maximum bytes read per request. All three are mandatory.
+    /// Protocol is drawn from a closed set (raw_tcp only in the first
+    /// slice); unknown names are rejected at parse time, not at verify time.
+    fn parse_service(&mut self) -> Result<Service, ParseError> {
+        self.expect_ident("service")?;
+        let name = self.expect_ident_any()?;
+        self.expect_kind(TokenKind::Newline)?;
+        self.expect_kind(TokenKind::Indent)?;
+
+        let mut intention = None;
+        let mut source = None;
+        let mut protocol = None;
+        let mut port = None;
+        let mut max_request = None;
+        let mut handler = None;
+
+        while !self.check_kind(&TokenKind::Dedent) && !self.at_eof() {
+            if let Some(attr) = self.peek_attribute_name() {
+                match attr.as_str() {
+                    "intention" => {
+                        self.advance();
+                        self.expect_kind(TokenKind::Colon)?;
+                        intention = Some(self.expect_string()?);
+                        self.expect_kind(TokenKind::Newline)?;
+                    }
+                    "source" => {
+                        self.advance();
+                        self.expect_kind(TokenKind::Colon)?;
+                        source = Some(self.parse_source_ref()?);
+                        self.expect_kind(TokenKind::Newline)?;
+                    }
+                    other => {
+                        return Err(self.error(&format!(
+                            "unknown attribute '@{}' in service",
+                            other
+                        )));
+                    }
+                }
+            } else if self.check_ident("listen") {
+                self.advance();
+                self.expect_kind(TokenKind::Colon)?;
+                self.expect_kind(TokenKind::Newline)?;
+                self.expect_kind(TokenKind::Indent)?;
+                while !self.check_kind(&TokenKind::Dedent) && !self.at_eof() {
+                    let key = self.expect_ident_any()?;
+                    self.expect_kind(TokenKind::Colon)?;
+                    match key.as_str() {
+                        "protocol" => {
+                            let n = self.expect_ident_any()?;
+                            protocol = Some(match n.as_str() {
+                                "raw_tcp" => Protocol::RawTcp,
+                                _ => return Err(self.error(&format!(
+                                    "unknown protocol '{}' (allowed: raw_tcp)",
+                                    n
+                                ))),
+                            });
+                        }
+                        "port" => {
+                            let n = self.expect_number()?;
+                            if !(1..=65535).contains(&n) {
+                                return Err(self.error(&format!(
+                                    "port {} out of range [1, 65535]",
+                                    n
+                                )));
+                            }
+                            port = Some(n as u16);
+                        }
+                        "max_request" => {
+                            let n = self.expect_number()?;
+                            if n <= 0 {
+                                return Err(self.error(&format!(
+                                    "max_request must be positive, got {}",
+                                    n
+                                )));
+                            }
+                            if n > u32::MAX as i64 {
+                                return Err(self.error(&format!(
+                                    "max_request {} exceeds u32 range",
+                                    n
+                                )));
+                            }
+                            max_request = Some(n as u32);
+                        }
+                        _ => {
+                            return Err(self.error(&format!(
+                                "unknown key '{}' in listen block (allowed: protocol, port, max_request)",
+                                key
+                            )));
+                        }
+                    }
+                    self.expect_kind(TokenKind::Newline)?;
+                }
+                self.expect_kind(TokenKind::Dedent)?;
+            } else if self.check_ident("handler") {
+                self.advance();
+                self.expect_kind(TokenKind::Colon)?;
+                handler = Some(self.expect_ident_any()?);
+                self.expect_kind(TokenKind::Newline)?;
+            } else {
+                return Err(self.error("expected attribute, 'listen:', or 'handler:' in service"));
+            }
+        }
+        self.expect_kind(TokenKind::Dedent)?;
+
+        Ok(Service {
+            name,
+            intention: intention.ok_or_else(|| self.error("service missing @intention"))?,
+            source: source.ok_or_else(|| self.error("service missing @source"))?,
+            protocol: protocol.ok_or_else(|| self.error("service missing 'listen.protocol'"))?,
+            port: port.ok_or_else(|| self.error("service missing 'listen.port'"))?,
+            max_request: max_request.ok_or_else(|| self.error("service missing 'listen.max_request'"))?,
+            handler: handler.ok_or_else(|| self.error("service missing 'handler'"))?,
+        })
+    }
+
     fn parse_hints_block(&mut self) -> Result<Hints, ParseError> {
         self.expect_ident("hints")?;
         self.expect_kind(TokenKind::Colon)?;
@@ -1558,5 +1688,90 @@ rule important_invoice
             }
             _ => panic!("expected rule"),
         }
+    }
+
+    // ─── Phase 7: service construct parser tests ─────────────────────────
+
+    fn service_src(listen_body: &str, handler_line: &str) -> String {
+        format!(
+            "@verbose 0.1.0\n\nconcept T\n  @intention: \"t\"\n  @source: f.intent:1\n  fields:\n    x : number\n\nrule h\n  @intention: \"t\"\n  @source: f.intent:1\n  input:\n    t : T\n  output:\n    r : bool\n  logic:\n    r = t.x > 0\n  proofs:\n    purity:\n      reads: [t.x]\n      calls: []\n    termination:\n      bound: 1\n\nservice s\n  @intention: \"a test service\"\n  @source: f.intent:1\n  listen:\n{}  {}\n",
+            listen_body, handler_line
+        )
+    }
+
+    #[test]
+    fn service_parsed_happy_path() {
+        let src = service_src(
+            "    protocol: raw_tcp\n    port: 9999\n    max_request: 4096\n",
+            "handler: h",
+        );
+        let p = parse(&src).unwrap();
+        match &p.items[2] {
+            Item::Service(s) => {
+                assert_eq!(s.name, "s");
+                assert_eq!(s.protocol, Protocol::RawTcp);
+                assert_eq!(s.port, 9999);
+                assert_eq!(s.max_request, 4096);
+                assert_eq!(s.handler, "h");
+            }
+            _ => panic!("expected service as third item"),
+        }
+    }
+
+    #[test]
+    fn service_rejects_unknown_protocol() {
+        let src = service_src(
+            "    protocol: quic\n    port: 443\n    max_request: 1024\n",
+            "handler: h",
+        );
+        let err = parse(&src).err().expect("unknown protocol should be rejected at parse time");
+        assert!(
+            format!("{:?}", err).contains("unknown protocol"),
+            "expected 'unknown protocol' error, got {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn service_rejects_out_of_range_port() {
+        let src = service_src(
+            "    protocol: raw_tcp\n    port: 70000\n    max_request: 1024\n",
+            "handler: h",
+        );
+        let err = parse(&src).err().expect("port above 65535 should be rejected");
+        assert!(
+            format!("{:?}", err).contains("out of range"),
+            "expected port range error, got {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn service_rejects_non_positive_max_request() {
+        let src = service_src(
+            "    protocol: raw_tcp\n    port: 9999\n    max_request: 0\n",
+            "handler: h",
+        );
+        let err = parse(&src).err().expect("max_request=0 should be rejected");
+        assert!(
+            format!("{:?}", err).contains("max_request must be positive"),
+            "expected max_request positivity error, got {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn service_rejects_missing_listen_key() {
+        // listen block without port
+        let src = service_src(
+            "    protocol: raw_tcp\n    max_request: 1024\n",
+            "handler: h",
+        );
+        let err = parse(&src).err().expect("missing port should be rejected");
+        assert!(
+            format!("{:?}", err).contains("listen.port"),
+            "expected listen.port missing error, got {:?}",
+            err
+        );
     }
 }

@@ -81,9 +81,59 @@ pub fn verify_program(program: &Program, base_dir: &StdPath) -> Vec<VerifyError>
                     }
                 }
             }
+            Item::Service(s) => verify_service(s, &all_rules, base_dir, &mut errors),
         }
     }
     errors
+}
+
+/// Phase 7 service verification.
+///
+/// Checks:
+///   - @source file:line exists (same discipline as concept / rule / reaction)
+///   - port is in [1, 65535] — statically guaranteed by the parser storing
+///     port as u16, but we keep the check explicit for audit readability
+///   - max_request > 0 (zero-byte read makes no sense for a listener)
+///   - the handler rule exists in the program
+///
+/// Deliberately NOT checked yet (follow-up commits):
+///   - handler's input/output types matching the protocol's request /
+///     response shape. In the RawTcp-only first slice, there is no fixed
+///     request shape yet; HTTP/1.0 (which ships with HttpRequest /
+///     HttpResponse built-ins) will add that check when it lands.
+fn verify_service(
+    s: &Service,
+    all_rules: &[&Rule],
+    base_dir: &StdPath,
+    errors: &mut Vec<VerifyError>,
+) {
+    if let Err(msg) = verify_source_ref(&s.source, base_dir) {
+        errors.push(VerifyError {
+            context: format!("service '{}' / @source", s.name),
+            message: msg,
+        });
+    }
+
+    if s.port == 0 {
+        errors.push(VerifyError {
+            context: format!("service '{}' / listen.port", s.name),
+            message: "port must be in [1, 65535]; 0 is not bindable".into(),
+        });
+    }
+
+    if s.max_request == 0 {
+        errors.push(VerifyError {
+            context: format!("service '{}' / listen.max_request", s.name),
+            message: "max_request must be greater than zero".into(),
+        });
+    }
+
+    if !all_rules.iter().any(|r| r.name == s.handler) {
+        errors.push(VerifyError {
+            context: format!("service '{}' / handler", s.name),
+            message: format!("handler references unknown rule '{}'", s.handler),
+        });
+    }
 }
 
 fn verify_concept(c: &Concept, base_dir: &StdPath, errors: &mut Vec<VerifyError>) {
@@ -1982,5 +2032,43 @@ rule test
 "#;
         let errs = verify_str(src);
         assert!(errs.is_empty(), "expected no errors, got: {:#?}", errs);
+    }
+
+    // ─── Phase 7: service verifier tests ─────────────────────────────────
+
+    fn service_src(handler_name: &str) -> String {
+        format!(
+            "@verbose 0.1.0\n\nconcept T\n  @intention: \"t\"\n  @source: invoices.intent:1\n  fields:\n    x : number\n\nrule h\n  @intention: \"t\"\n  @source: invoices.intent:1\n  input:\n    t : T\n  output:\n    r : bool\n  logic:\n    r = t.x > 0\n  proofs:\n    purity:\n      reads: [t.x]\n      calls: []\n    termination:\n      bound: 1\n\nservice s\n  @intention: \"a test service\"\n  @source: invoices.intent:1\n  listen:\n    protocol: raw_tcp\n    port: 9999\n    max_request: 4096\n  handler: {}\n",
+            handler_name
+        )
+    }
+
+    #[test]
+    fn service_happy_path() {
+        let errs = verify_str(&service_src("h"));
+        assert!(errs.is_empty(), "expected no errors, got: {:#?}", errs);
+    }
+
+    #[test]
+    fn service_rejects_unknown_handler() {
+        let errs = verify_str(&service_src("nonexistent_handler"));
+        assert!(
+            errs.iter().any(|e| e.context.contains("service 's' / handler")
+                && e.message.contains("unknown rule 'nonexistent_handler'")),
+            "expected unknown-handler error, got: {:#?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn service_rejects_bad_source_line() {
+        // Point @source at a line past the end of an existing intent file.
+        let src = "@verbose 0.1.0\n\nconcept T\n  @intention: \"t\"\n  @source: invoices.intent:1\n  fields:\n    x : number\n\nrule h\n  @intention: \"t\"\n  @source: invoices.intent:1\n  input:\n    t : T\n  output:\n    r : bool\n  logic:\n    r = t.x > 0\n  proofs:\n    purity:\n      reads: [t.x]\n      calls: []\n    termination:\n      bound: 1\n\nservice s\n  @intention: \"svc\"\n  @source: invoices.intent:999999\n  listen:\n    protocol: raw_tcp\n    port: 9999\n    max_request: 4096\n  handler: h\n";
+        let errs = verify_str(src);
+        assert!(
+            errs.iter().any(|e| e.context.contains("service 's' / @source")),
+            "expected service @source error, got: {:#?}",
+            errs
+        );
     }
 }

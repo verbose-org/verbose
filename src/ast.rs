@@ -17,6 +17,38 @@ pub enum Item {
     Concept(Concept),
     Rule(Rule),
     Reaction(Reaction),
+    Service(Service),
+}
+
+/// A service is a long-running program declaration. It binds a listener
+/// (protocol, port, bounded request size) to a handler rule that runs once
+/// per incoming request. See docs/phase-7-design.md for the rationale and
+/// the closed set of supported protocols.
+///
+/// First Phase 7 slice: AST + parser + verifier only. Native emission is a
+/// follow-up commit — trying to compile a program containing a Service with
+/// --native today returns a clear "not yet implemented" error.
+#[derive(Debug, Clone)]
+pub struct Service {
+    pub name: String,
+    pub intention: String,
+    pub source: SourceRef,
+    pub protocol: Protocol,
+    pub port: u16,
+    pub max_request: u32,
+    pub handler: String,
+}
+
+/// Closed set of protocols a service may declare. Unknown names are rejected
+/// by the parser — no open-ended strings, no user-written protocol parsers
+/// in Phase 7. Additional variants land one at a time in later phases, each
+/// with its own protocol parser + serializer in the native backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Protocol {
+    /// Raw TCP: the handler receives the received bytes (bounded by
+    /// max_request) and returns bytes to send back. No structured request /
+    /// response. Simplest first protocol; no built-in parser needed.
+    RawTcp,
 }
 
 /// A reaction is a block with declared side effects.
