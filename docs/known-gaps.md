@@ -64,6 +64,13 @@ automatically.
 verifier rules, new codegen paths, new test coverage). The project stays on
 SIEM-style demos (tier 1) while network primitives are designed.
 
+**Design sketch available**: see `docs/phase-7-design.md` for the proposed
+shape — a `service` top-level construct declaring protocol / port /
+max_request / handler, with a closed set of built-in protocols (HTTP/1.0
+and raw TCP) emitted by the compiler around a normal rule. That sketch is
+not an implementation commitment; it fixes the target shape so that when
+Phase 7 is built, the design is already decided.
+
 ## Text-valued let bindings
 
 **Symptom**: `let sep = " | "` followed by `concat(... sep ...)` fails:
