@@ -124,28 +124,32 @@ Still deferred:
   graphemes) is not in scope and is unlikely to ever be — Verbose
   stays at the byte level on purpose.
 
-## Text-valued let bindings
+## Text-valued let bindings (partial — literals only)
 
-**Symptom**: `let sep = " | "` followed by `concat(... sep ...)` fails:
+**What works (since 2026-04-23)**: `let sep = " | "` followed by
+`concat(..., sep, ...)` is now accepted. The optimiser inlines every
+reference to the let-name with the literal at AST level, runs once before
+any backend sees the rule, and respects lambda / fold / match-result
+scope shadowing. A `let a = "x"; let b = a` chain is also resolved (each
+binding is substituted in source order). Number lets are unchanged.
+
+**What still fails**: non-literal text bindings.
 ```
-native codegen error: text literals not supported in native backend
+let user_msg = concat("user=", p.user)
+let key      = req.method
 ```
+Both still hit `text literals not supported in native backend`. Inlining
+isn't valid here — the value is computed at runtime, not at compile time.
 
-**Root cause**: `emit_eval_expr` produces a scalar i64 in rax. Text values
-are (ptr, len) pairs — they don't fit the "everything is rax" model. A
-let binding evaluates its expression via emit_eval_expr and stores rax at
-a rbp slot. Text literals can't go through that path.
+**Workaround for the rejected cases**: inline the expression at each
+usage site, or factor it through a helper rule whose output is text and
+call that rule (see Phase 2G/2H-a/2H-b paths in `native.rs`).
 
-**Workaround**: inline the text literal at each usage site instead of
-binding it to a let. `concat(acc, " | ", e.name)` works; `let sep = " | "`
-then `concat(acc, sep, e.name)` doesn't.
-
-**Fix path**: Either (a) extend emit_eval_expr to handle text values by
-storing (ptr, len) in TWO consecutive rbp slots (similar to Phase 2F's
-err_ptr_slot/err_len_slot), or (b) detect text-typed let bindings at
-compilation time and inline them at each reference site (constant
-propagation). Option (b) is simpler for literals; option (a) is more
-general (handles computed text values).
+**Fix path for the rest**: extend `emit_eval_expr` to handle text values
+by storing (ptr, len) in TWO consecutive rbp slots (similar to Phase 2F's
+err_ptr_slot/err_len_slot) so that any text-typed expression can land in
+a binding. That's a real slice; it needs slot allocation, every emitter
+that walks bindings, and an extension of TextBindings.
 
 ## Nested concat with Call args at 2+ levels
 

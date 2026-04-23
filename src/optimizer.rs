@@ -142,6 +142,23 @@ fn optimize_rule(rule: &Rule, field_ranges: &HashMap<String, (i64, i64)>) -> Rul
         .map(|(k, v)| (k.as_str(), *v))
         .collect();
 
+    // Text-literal let inlining: `let sep = " | "` followed by
+    // `concat(..., sep, ...)` folds to `concat(..., " | ", ...)` at every
+    // reference site, and the binding drops out of the list. The native
+    // backend's `emit_eval_expr` produces a scalar i64 in rax; text values
+    // don't fit that shape and were rejected outright. Inlining at the
+    // optimiser level keeps every backend on the same semantics path
+    // (interpreter, transpiler, native, wasm) and removes the "text lets
+    // are rejected" asymmetry without threading a text-value calling
+    // convention through every emitter.
+    //
+    // Scope: only text *literals* (Expr::Text) are inlined. Non-literal
+    // text bindings (`let x = concat(...)`, `let x = req.field`) still
+    // fall through to the backend and may error — their fix needs real
+    // runtime slot allocation and is left to a future slice.
+    let (inlined_bindings, inlined_logic) =
+        inline_text_literal_lets(&rule.logic.bindings, &rule.logic.value);
+
     Rule {
         name: rule.name.clone(),
         intention: rule.intention.clone(),
@@ -151,20 +168,160 @@ fn optimize_rule(rule: &Rule, field_ranges: &HashMap<String, (i64, i64)>) -> Rul
         output_name: rule.output_name.clone(),
         output_ty: rule.output_ty.clone(),
         logic: LogicStmt {
-            bindings: rule
-                .logic
-                .bindings
+            bindings: inlined_bindings
                 .iter()
                 .map(|(name, expr)| (name.clone(), optimize_expr(expr, &rule.input_name, &fr)))
                 .collect(),
             target: rule.logic.target.clone(),
-            value: optimize_expr(&rule.logic.value, &rule.input_name, &fr),
+            value: optimize_expr(&inlined_logic, &rule.input_name, &fr),
         },
         proofs: rule.proofs.clone(),
         hints: rule.hints.clone(),
         layer: rule.layer,
         context_name: rule.context_name.clone(),
         context_ty: rule.context_ty.clone(),
+    }
+}
+
+/// Walk the let bindings in source order; each `let name = Text(literal)`
+/// is removed and every later reference to `name` (in subsequent bindings
+/// and in the final logic) is substituted with the literal. Bindings whose
+/// RHS is not a text literal after earlier substitutions are kept in
+/// place. Returns the kept bindings and the rewritten logic.
+fn inline_text_literal_lets(
+    bindings: &[(String, Expr)],
+    logic: &Expr,
+) -> (Vec<(String, Expr)>, Expr) {
+    let mut kept: Vec<(String, Expr)> = Vec::new();
+    let mut substitutions: Vec<(String, Expr)> = Vec::new();
+
+    for (name, expr) in bindings {
+        // Apply earlier text-literal substitutions to this binding's RHS
+        // first — a later binding can reference an earlier text let.
+        let substituted = substitutions
+            .iter()
+            .fold(expr.clone(), |acc, (n, r)| substitute_ident(&acc, n, r));
+        match &substituted {
+            Expr::Text(_) => {
+                substitutions.push((name.clone(), substituted));
+            }
+            _ => {
+                kept.push((name.clone(), substituted));
+            }
+        }
+    }
+
+    let rewritten_logic = substitutions
+        .iter()
+        .fold(logic.clone(), |acc, (n, r)| substitute_ident(&acc, n, r));
+
+    (kept, rewritten_logic)
+}
+
+/// Substitute every free occurrence of `Expr::Ident(name)` in `expr` with
+/// `replacement`, respecting lambda / fold / match-result scopes. When a
+/// sub-expression rebinds `name` as a lambda or match-arm variable, that
+/// sub-tree is left untouched so shadowing is preserved.
+fn substitute_ident(expr: &Expr, name: &str, replacement: &Expr) -> Expr {
+    match expr {
+        Expr::Ident(n) if n == name => replacement.clone(),
+        Expr::Ident(_) | Expr::Number(_) | Expr::Text(_) => expr.clone(),
+        Expr::Field(base, f) => Expr::Field(
+            Box::new(substitute_ident(base, name, replacement)),
+            f.clone(),
+        ),
+        Expr::Binary(op, l, r) => Expr::Binary(
+            *op,
+            Box::new(substitute_ident(l, name, replacement)),
+            Box::new(substitute_ident(r, name, replacement)),
+        ),
+        Expr::Not(e) => Expr::Not(Box::new(substitute_ident(e, name, replacement))),
+        Expr::Neg(e) => Expr::Neg(Box::new(substitute_ident(e, name, replacement))),
+        Expr::Call(f, args) => Expr::Call(
+            f.clone(),
+            args.iter().map(|a| substitute_ident(a, name, replacement)).collect(),
+        ),
+        Expr::If(c, t, e) => Expr::If(
+            Box::new(substitute_ident(c, name, replacement)),
+            Box::new(substitute_ident(t, name, replacement)),
+            Box::new(substitute_ident(e, name, replacement)),
+        ),
+        Expr::Quantifier(kind, target, var, body) => {
+            let new_target = substitute_ident(target, name, replacement);
+            let new_body = if var == name {
+                (**body).clone()
+            } else {
+                substitute_ident(body, name, replacement)
+            };
+            Expr::Quantifier(*kind, Box::new(new_target), var.clone(), Box::new(new_body))
+        }
+        Expr::Fold(target, init, acc, var, body) => {
+            let new_target = substitute_ident(target, name, replacement);
+            let new_init = substitute_ident(init, name, replacement);
+            let shadowed = acc == name || var == name;
+            let new_body = if shadowed {
+                (**body).clone()
+            } else {
+                substitute_ident(body, name, replacement)
+            };
+            Expr::Fold(
+                Box::new(new_target),
+                Box::new(new_init),
+                acc.clone(),
+                var.clone(),
+                Box::new(new_body),
+            )
+        }
+        Expr::Map(target, var, body) => {
+            let new_target = substitute_ident(target, name, replacement);
+            let new_body = if var == name {
+                (**body).clone()
+            } else {
+                substitute_ident(body, name, replacement)
+            };
+            Expr::Map(Box::new(new_target), var.clone(), Box::new(new_body))
+        }
+        Expr::Filter(target, var, body) => {
+            let new_target = substitute_ident(target, name, replacement);
+            let new_body = if var == name {
+                (**body).clone()
+            } else {
+                substitute_ident(body, name, replacement)
+            };
+            Expr::Filter(Box::new(new_target), var.clone(), Box::new(new_body))
+        }
+        Expr::Ok(e) => Expr::Ok(Box::new(substitute_ident(e, name, replacement))),
+        Expr::Err(e) => Expr::Err(Box::new(substitute_ident(e, name, replacement))),
+        Expr::MatchResult(target, ok_var, ok_body, err_var, err_body) => {
+            let new_target = substitute_ident(target, name, replacement);
+            let new_ok = if ok_var == name {
+                (**ok_body).clone()
+            } else {
+                substitute_ident(ok_body, name, replacement)
+            };
+            let new_err = if err_var == name {
+                (**err_body).clone()
+            } else {
+                substitute_ident(err_body, name, replacement)
+            };
+            Expr::MatchResult(
+                Box::new(new_target),
+                ok_var.clone(),
+                Box::new(new_ok),
+                err_var.clone(),
+                Box::new(new_err),
+            )
+        }
+        Expr::Record(name_c, fields) => Expr::Record(
+            name_c.clone(),
+            fields
+                .iter()
+                .map(|(n, v)| (n.clone(), substitute_ident(v, name, replacement)))
+                .collect(),
+        ),
+        Expr::Concat(args) => Expr::Concat(
+            args.iter().map(|a| substitute_ident(a, name, replacement)).collect(),
+        ),
     }
 }
 
@@ -534,5 +691,89 @@ mod tests {
         let expr = Expr::Neg(Box::new(Expr::Number(42)));
         let result = optimize_expr(&expr, "i", &HashMap::new());
         assert!(matches!(result, Expr::Number(-42)));
+    }
+
+    #[test]
+    fn text_literal_let_inlined_into_logic() {
+        // let sep = " | " ; concat("a", sep, "b")  →  concat("a", " | ", "b")
+        let bindings = vec![("sep".to_string(), Expr::Text(" | ".to_string()))];
+        let logic = Expr::Concat(vec![
+            Expr::Text("a".to_string()),
+            Expr::Ident("sep".to_string()),
+            Expr::Text("b".to_string()),
+        ]);
+        let (kept, rewritten) = inline_text_literal_lets(&bindings, &logic);
+        assert!(kept.is_empty(), "text-literal binding should be removed");
+        match rewritten {
+            Expr::Concat(args) => {
+                assert_eq!(args.len(), 3);
+                assert!(matches!(&args[1], Expr::Text(s) if s == " | "));
+            }
+            other => panic!("expected Concat, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn text_literal_let_inlined_through_chain() {
+        // let a = "x" ; let b = a ; concat(a, b)  →  concat("x", "x")
+        let bindings = vec![
+            ("a".to_string(), Expr::Text("x".to_string())),
+            ("b".to_string(), Expr::Ident("a".to_string())),
+        ];
+        let logic = Expr::Concat(vec![
+            Expr::Ident("a".to_string()),
+            Expr::Ident("b".to_string()),
+        ]);
+        let (kept, rewritten) = inline_text_literal_lets(&bindings, &logic);
+        assert!(kept.is_empty(), "both bindings should resolve to text literals");
+        match rewritten {
+            Expr::Concat(args) => {
+                assert!(matches!(&args[0], Expr::Text(s) if s == "x"));
+                assert!(matches!(&args[1], Expr::Text(s) if s == "x"));
+            }
+            other => panic!("expected Concat, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn non_text_let_not_inlined() {
+        // let n = 42 ; n + 1  → kept as-is (number lets ride the existing path)
+        let bindings = vec![("n".to_string(), Expr::Number(42))];
+        let logic = Expr::Binary(
+            BinOp::Add,
+            Box::new(Expr::Ident("n".to_string())),
+            Box::new(Expr::Number(1)),
+        );
+        let (kept, rewritten) = inline_text_literal_lets(&bindings, &logic);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].0, "n");
+        // Logic unchanged — still references `n`.
+        assert!(matches!(rewritten, Expr::Binary(BinOp::Add, _, _)));
+    }
+
+    #[test]
+    fn text_let_does_not_cross_lambda_shadow() {
+        // let sep = " | " ; map(xs, sep => sep)
+        // The lambda's `sep` shadows the let; the lambda body must not be
+        // rewritten to Text(" | ").
+        let bindings = vec![("sep".to_string(), Expr::Text(" | ".to_string()))];
+        let logic = Expr::Map(
+            Box::new(Expr::Field(
+                Box::new(Expr::Ident("input".to_string())),
+                "xs".to_string(),
+            )),
+            "sep".to_string(),
+            Box::new(Expr::Ident("sep".to_string())),
+        );
+        let (kept, rewritten) = inline_text_literal_lets(&bindings, &logic);
+        assert!(kept.is_empty());
+        match rewritten {
+            Expr::Map(_, var, body) => {
+                assert_eq!(var, "sep");
+                // Body still references the lambda's `sep`, not the literal.
+                assert!(matches!(*body, Expr::Ident(ref n) if n == "sep"));
+            }
+            other => panic!("expected Map, got {:?}", other),
+        }
     }
 }
