@@ -87,6 +87,10 @@ examples/
                    runtime via concat(req.method, req.path, ...). Three routes
                    (GET/POST/other-404) all emit a response body that echoes the
                    request slots. ~1263 B native binary on port 18893.
+  method_guard.*   Phase 7 slice 3e showcase: single HttpResponse record with a
+                   computed status (200 for GET, 405 otherwise) and a concat body
+                   echoing the path. Demonstrates 3d + 3e composing in one record
+                   without if/else record duplication. ~921 B on port 18894.
   demo.html        Browser demo (WASM)
 
 tools/
@@ -184,6 +188,7 @@ Tracking what native emits today, what it still rejects, and the design rules th
 | stream | `--stream` flag wraps the rule code in a line-by-line read loop. Reads ONE line from stdin per iteration (byte-by-byte until `\n`), tokenizes, processes, loops. On EOF, exits cleanly. First long-running Verbose binary. Not supported with SIMD-vectorized or parallel rules. | ~770+ B | `alert.verbose::should_alert` (772 B) |
 | 7 (3a–3c) | Top-level `service` construct with `Protocol::Http10` / `Protocol::RawTcp`. Slice 3a synthesises the built-in `HttpRequest` / `HttpResponse` concepts at verify time. Slice 3b emits a constant-response binary (handler logic = a literal `HttpResponse` record). Slice 3c emits the dynamic router: a per-accept loop with HTTP parse → handler → HTTP serialize, with the handler's if/else chain producing the response slots. Same shared register convention as the rest of native (r12=server fd, r14 unused here, rbp frame for handler I/O). | ~430 B (constant) / ~1 KB (router) | `hello_http.verbose` / `hello_router.verbose` |
 | 7 (3d) | Handler body assembled at runtime via `concat(...)` of literals, request text fields (`req.method`, `req.path`), and numbers. The concat runs through the existing `emit_concat_to_buffer` path (same code serving reaction logs and `Result(text, _)` arms), leaving `(rax=ptr, rdx=len)` which we store in the body slots `[rbp-32]`/`[rbp-40]`. Iteration epilogue frees the buffer — and any log buffer stacked above it — via `lea rsp, [rbp - frame_size]` (7 bytes) right before `jmp accept_top`. Works because nothing between `accept` and the handler touches `rsp`, so pre-handler `rsp` is always `rbp - frame_size`. | ~1.3 KB | `echo_path.verbose::echo_server` (1263 B) |
+| 7 (3e) | `status` field accepts any Number-typed expression inside one HttpResponse record (not just a literal). Slice 3c forced you to wrap in `if … then HttpResponse{200,…} else HttpResponse{404,…}` even when the body was identical; 3e lets `HttpResponse { status: if cond then 200 else 405, body: … }` stand alone. Native trusts the verifier's type-check against the declared `status: number [100, 599]` range and dispatches non-literal status through `emit_eval_expr` → `mov [rbp-24], rax`. Number-literal status keeps the 7-byte immediate-store fast path. | ~900 B | `method_guard.verbose::guard_endpoint` (921 B) |
 | 8 (8a–8c) | Per-request `log:` block on a service. Closed grammar: `text`/`number` literals, `concat(...)`, plus `req.method`, `req.path`, `req.timestamp`, `resp.status`, `resp.body`. Slice 8a wires the `append_file` between handler and serializer using shared `emit_append_file_call` (same path as reaction logs). Slice 8b enriches the log scope with `resp.status` (number, slot -24) and `resp.body` (text via BoundText, slots -32/-40) — handler-populated, no extra runtime cost. Slice 8c adds `req.timestamp` (number, slot -56) backed by one `clock_gettime(CLOCK_REALTIME)` after `accept` — frame grows by 8 only when timestamp is referenced. The handler never sees these names; the rewrite is local to the log scope so the response stays reproducible from `(method, path)`. | ~1.3 KB (no ts) / ~1.7 KB (with ts) | `hello_router_logged.verbose` (1294 B) / `audit_complete.verbose` (1735 B) |
 
 *Locked designs for each phase (3, 4, 5b, 2F, 2G, 2H-b) are in [docs/native-designs.md](docs/native-designs.md). They're frozen after implementation — consult them for rationale, not for the current state.*
@@ -269,7 +274,7 @@ printf "3 auth\n1 web\n" | /tmp/alert                                           
 cargo run -- examples/invoices.verbose --wasm /tmp/rule.wasm --run important_invoice # WASM
 cargo run -- examples/invoices.verbose --benchmark --run important_invoice          # compare all backends
 cargo run -- --demo-http /tmp/server                                                 # HTTP server — tier-3 emitter probe, NOT in .verbose (see docs/known-gaps.md)
-cargo test                                                                          # 195 tests
+cargo test                                                                          # 196 tests
 make demo                                                                           # full demo
 ```
 

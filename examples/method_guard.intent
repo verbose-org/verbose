@@ -1,0 +1,6 @@
+An HTTP/1.0 endpoint that always responds with a body that echoes the
+requested path (e.g. "checked: /api/users") but whose status varies with
+the request method: 200 for GET (read access), 405 for everything else
+(method not allowed). This pairs slice 3d (body computed via concat) with
+slice 3e (status computed via if/else) inside a single HttpResponse
+record — no record duplication.

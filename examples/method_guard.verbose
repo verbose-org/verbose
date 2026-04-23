@@ -1,0 +1,45 @@
+@verbose 0.1.0
+
+-- Phase 7 slice 3e: computed status inside one HttpResponse record.
+-- Slice 3c required status to be a number literal, which forced you to
+-- write two HttpResponse records behind an if/else even when body was
+-- the same on both branches. Slice 3e drops that restriction: status
+-- accepts any Number expression (verifier already type-checks it
+-- against the declared `status: number [100, 599]`).
+--
+-- This example also exercises slice 3d (body computed via concat),
+-- showing the two slices compose: a single HttpResponse record can mix
+-- a computed status and a runtime-built body.
+
+
+rule check_method
+  @intention: "Echo the path; respond 200 for GET, 405 for any other method"
+  @source: method_guard.intent:1
+
+  input:
+    req : HttpRequest
+
+  output:
+    resp : HttpResponse
+
+  logic:
+    resp = HttpResponse { status: if req.method == "GET" then 200 else 405, body: concat("checked: ", req.path) }
+
+  proofs:
+    purity:
+      reads : [req.method, req.path]
+      calls : []
+    termination:
+      bound : 6
+
+
+service guard_endpoint
+  @intention: "Listen on port 18894, allow GET, reject everything else"
+  @source: method_guard.intent:1
+
+  listen:
+    protocol    : http_1_0
+    port        : 18894
+    max_request : 4096
+
+  handler: check_method

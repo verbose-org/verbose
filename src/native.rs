@@ -6675,10 +6675,15 @@ fn classify_http_response_record(
                             ));
                         }
                     }
+                    // Slice 3e: status can be any Number-typed expression
+                    // (verifier already type-checks it against HttpResponse's
+                    // declared `status: number [100, 599]`). Non-literal
+                    // status forces the Dynamic shape so the emitter goes
+                    // through emit_eval_expr instead of the Constant fast
+                    // path. The bound check is the verifier's job; native
+                    // trusts the proof.
                     _ => {
-                        return Http10HandlerShape::Unsupported(
-                            "slice 3c: status must be a number literal; computed status lands in slice 3d+".into(),
-                        );
+                        has_dynamic_field = true;
                     }
                 }
             }
@@ -7244,20 +7249,13 @@ fn emit_handler_to_slots(
 ) -> Result<(), NativeError> {
     match expr {
         Expr::Record(name, fields) if name == "HttpResponse" => {
-            // Store status (Number literal)
-            let mut status: Option<i64> = None;
+            // Store status (Number literal — fast path — or any Number
+            // expression evaluated via emit_eval_expr, slice 3e).
+            let mut status_ref: Option<&Expr> = None;
             let mut body_ref: Option<&Expr> = None;
             for (fname, fexpr) in fields {
                 match fname.as_str() {
-                    "status" => {
-                        if let Expr::Number(n) = fexpr {
-                            status = Some(*n);
-                        } else {
-                            return Err(NativeError {
-                                message: "status must be a number literal (slice 3c)".into(),
-                            });
-                        }
-                    }
+                    "status" => status_ref = Some(fexpr),
                     "body" => body_ref = Some(fexpr),
                     _ => {
                         return Err(NativeError {
@@ -7266,16 +7264,31 @@ fn emit_handler_to_slots(
                     }
                 }
             }
-            let status = status.ok_or_else(|| NativeError {
+            let status_expr = status_ref.ok_or_else(|| NativeError {
                 message: "HttpResponse missing status".into(),
             })?;
             let body_expr = body_ref.ok_or_else(|| NativeError {
                 message: "HttpResponse missing body".into(),
             })?;
 
-            // mov qword [rbp-24], <status as i32, sign-extended>
-            code.extend_from_slice(&[0x48, 0xC7, 0x45, 0xE8]);           // -24 = 0xE8
-            code.extend_from_slice(&(status as i32).to_le_bytes());
+            match status_expr {
+                Expr::Number(n) => {
+                    // Slice 3b/3c fast path: literal → 7-byte immediate
+                    // store. mov qword [rbp-24], <status as i32 sign-ext>.
+                    code.extend_from_slice(&[0x48, 0xC7, 0x45, 0xE8]);   // -24 = 0xE8
+                    code.extend_from_slice(&(*n as i32).to_le_bytes());
+                }
+                _ => {
+                    // Slice 3e: any Number expression. The verifier has
+                    // already type-checked status against HttpResponse's
+                    // `status: number [100, 599]`; native trusts it and
+                    // dispatches to the generic evaluator, then stores
+                    // rax at the status slot.
+                    emit_eval_expr(code, status_expr, input_name, offsets, all_rules, field_ranges)?;
+                    // mov [rbp-24], rax
+                    code.extend_from_slice(&[0x48, 0x89, 0x45, 0xE8]);
+                }
+            }
 
             // Body: literal Text OR Field(Ident(input), "method"|"path")
             match body_expr {
@@ -8818,6 +8831,54 @@ mod tests {
         assert!(
             bytes.windows(log_path.len()).any(|w| w == log_path),
             "log path literal not found in binary — string must be inlined"
+        );
+
+        let _ = fs::remove_file(out);
+    }
+
+    /// Phase 7 slice 3e regression: status assembled from a Number-typed
+    /// expression (here `if req.method == "GET" then 200 else 405`)
+    /// inside a single HttpResponse record. Both possible status values
+    /// must appear inline as `mov rax, imm32` operands so the if-else
+    /// branches can land them in rax for the `mov [rbp-24], rax` store.
+    #[test]
+    fn phase7_slice3e_http10_computed_status_compiles() {
+        use std::fs;
+        let src = fs::read_to_string("examples/method_guard.verbose")
+            .expect("examples/method_guard.verbose is expected to exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let out = std::env::temp_dir().join("verbosec_test_phase7_slice3e_guard");
+        compile_service(&program, "guard_endpoint", out.to_str().unwrap())
+            .expect("Http10 slice-3e service compile");
+
+        let bytes = fs::read(&out).expect("read output");
+        let size = bytes.len();
+        assert!(
+            (700..1300).contains(&size),
+            "slice-3e guard service size {} outside expected [700, 1300] envelope", size
+        );
+
+        // 200 and 405 each appear as immediate operands of `mov rax, imm32`
+        // (encoding 0x48 0xC7 0xC0 + i32). 200 → 0xC8, 405 → 0x95 0x01.
+        let mov_rax_200 = [0x48, 0xC7, 0xC0, 0xC8, 0x00, 0x00, 0x00];
+        let mov_rax_405 = [0x48, 0xC7, 0xC0, 0x95, 0x01, 0x00, 0x00];
+        assert!(
+            bytes.windows(mov_rax_200.len()).any(|w| w == mov_rax_200),
+            "expected `mov rax, 200` immediate not found"
+        );
+        assert!(
+            bytes.windows(mov_rax_405.len()).any(|w| w == mov_rax_405),
+            "expected `mov rax, 405` immediate not found"
+        );
+
+        // After the if/else, rax is stored at the status slot via
+        // `mov [rbp-24], rax` = 0x48 0x89 0x45 0xE8.
+        let mov_status_slot = [0x48, 0x89, 0x45, 0xE8];
+        assert!(
+            bytes.windows(mov_status_slot.len()).any(|w| w == mov_status_slot),
+            "expected `mov [rbp-24], rax` status store not found — slice 3e not wired"
         );
 
         let _ = fs::remove_file(out);
