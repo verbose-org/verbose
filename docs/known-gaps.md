@@ -87,8 +87,9 @@ Phase 7 is built, the design is already decided.
 
 Phase 8 lets a `service` declare a per-request `log:` block that fires
 between the handler and the wire response. As of 2026-04-23, slices 8a,
-8b, and 8c have landed. The log scope sees a closed grammar: text/number
-literals, `concat(...)`, plus four field accesses backed by rbp slots:
+8b, 8c, and 8d have landed. The log scope sees a closed grammar:
+text/number literals, `concat(...)`, plus four field accesses backed
+by rbp slots:
 
   - `req.method`, `req.path`     — slice 8a, parsed from the request
   - `resp.status`, `resp.body`   — slice 8b, populated by the handler
@@ -99,13 +100,16 @@ The handler itself never sees `req.timestamp`; the rewrite is local to
 the log scope so the response stays reproducible from `(method, path)`
 alone. `audit_complete.verbose` exercises all four in one JSONL line.
 
+Slice 8d adds an opt-in `on_error: drop | abort` line to the log block.
+Drop is the default and matches slice 8a behaviour (silently ignore log
+syscall failures). Abort exits the process with status 1 on any open()
+or write() failure — the fail-closed posture an Article 12 audit chain
+needs. `audit_strict.verbose` shows the syntax; the abort path costs
+~16 bytes plus 8 bytes per checked syscall, zero when the policy is
+Drop.
+
 Still deferred:
 
-- **Slice 8d — explicit `write` error policy.** Today an `append_file`
-  whose write fails (disk full, permission revoked) is silently ignored
-  so a downed log surface never takes the service down. Acceptable for
-  demos; a real Article 12 audit chain wants the option to fail closed.
-  Fix path: a per-log declaration like `on_error: drop | abort`.
 - **Slice 8e — multiple log effects per service.** One `append_file`
   per service today. Two separate audit sinks (e.g. JSONL + a binary
   ring buffer) need either a list under `log:` or a parallel `audit:`

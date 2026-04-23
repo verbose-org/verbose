@@ -1,0 +1,49 @@
+@verbose 0.1.0
+
+-- Phase 8 slice 8d: opt-in fail-closed log policy. on_error: abort
+-- terminates the process on any open() or write() failure in the log
+-- effect. The default (and the slice 8a behaviour) is on_error: drop,
+-- which silently keeps serving even when the log surface is down —
+-- fine for demos, wrong for a real Article 12 audit chain.
+--
+-- Native cost: one `test rax, rax; js abort_label` (8 bytes) after
+-- each fallible syscall, plus a 17-byte sys_exit(1) sequence at the
+-- end of the binary. Zero cost when on_error is drop (no abort label,
+-- no checks emitted).
+
+
+rule ok_handler
+  @intention: "Always return HTTP 200 with body 'ok'"
+  @source: audit_strict.intent:1
+
+  input:
+    req : HttpRequest
+
+  output:
+    resp : HttpResponse
+
+  logic:
+    resp = HttpResponse { status: 200, body: "ok" }
+
+  proofs:
+    purity:
+      reads : []
+      calls : []
+    termination:
+      bound : 1
+
+
+service strict_endpoint
+  @intention: "Listen on port 18895, log JSONL, abort on log write failure"
+  @source: audit_strict.intent:1
+
+  listen:
+    protocol    : http_1_0
+    port        : 18895
+    max_request : 4096
+
+  handler: ok_handler
+
+  log:
+    append_file "/tmp/verbose_audit_strict.jsonl" concat("{\"method\":\"", req.method, "\",\"path\":\"", req.path, "\",\"status\":", resp.status, "}\n")
+    on_error: abort

@@ -43,6 +43,29 @@ pub struct Service {
     /// accepted by the parser (slice 8a scope); multi-effect logging and
     /// other sinks land in later slices.
     pub log: Option<Effect>,
+    /// Phase 8 slice 8d: error policy applied when the log effect's
+    /// underlying syscalls (open / write) fail. `Drop` (the default and
+    /// the slice-8a behaviour) silently ignores the error so a downed log
+    /// surface never takes the request path down. `Abort` exits the
+    /// process with status 1, which is what an Article 12 audit chain
+    /// needs: if the log line cannot be persisted, the service must not
+    /// claim to have served the request. Meaningless when `log` is None;
+    /// parser fills the default in that case.
+    pub log_on_error: ErrorPolicy,
+}
+
+/// Phase 8 slice 8d: how a service should react when its log effect
+/// fails to write. Closed set; new variants need to land one at a time
+/// with explicit emitter behaviour.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ErrorPolicy {
+    /// Default. Silently ignore syscall failures so the service keeps
+    /// serving requests even if the log target is unreachable.
+    Drop,
+    /// Exit the process with status 1 when any log syscall fails. Use
+    /// this when the audit trail is part of the service's contract: no
+    /// log = no claim to have processed the request.
+    Abort,
 }
 
 /// Closed set of protocols a service may declare. Unknown names are rejected

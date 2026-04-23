@@ -91,6 +91,10 @@ examples/
                    computed status (200 for GET, 405 otherwise) and a concat body
                    echoing the path. Demonstrates 3d + 3e composing in one record
                    without if/else record duplication. ~921 B on port 18894.
+  audit_strict.*   Phase 8 slice 8d showcase: log block with on_error: abort.
+                   Server exits with status 1 on any open/write failure in the
+                   audit path — fail-closed posture for Article 12 chains.
+                   ~1240 B on port 18895.
   demo.html        Browser demo (WASM)
 
 tools/
@@ -190,6 +194,7 @@ Tracking what native emits today, what it still rejects, and the design rules th
 | 7 (3d) | Handler body assembled at runtime via `concat(...)` of literals, request text fields (`req.method`, `req.path`), and numbers. The concat runs through the existing `emit_concat_to_buffer` path (same code serving reaction logs and `Result(text, _)` arms), leaving `(rax=ptr, rdx=len)` which we store in the body slots `[rbp-32]`/`[rbp-40]`. Iteration epilogue frees the buffer — and any log buffer stacked above it — via `lea rsp, [rbp - frame_size]` (7 bytes) right before `jmp accept_top`. Works because nothing between `accept` and the handler touches `rsp`, so pre-handler `rsp` is always `rbp - frame_size`. | ~1.3 KB | `echo_path.verbose::echo_server` (1263 B) |
 | 7 (3e) | `status` field accepts any Number-typed expression inside one HttpResponse record (not just a literal). Slice 3c forced you to wrap in `if … then HttpResponse{200,…} else HttpResponse{404,…}` even when the body was identical; 3e lets `HttpResponse { status: if cond then 200 else 405, body: … }` stand alone. Native trusts the verifier's type-check against the declared `status: number [100, 599]` range and dispatches non-literal status through `emit_eval_expr` → `mov [rbp-24], rax`. Number-literal status keeps the 7-byte immediate-store fast path. | ~900 B | `method_guard.verbose::guard_endpoint` (921 B) |
 | 8 (8a–8c) | Per-request `log:` block on a service. Closed grammar: `text`/`number` literals, `concat(...)`, plus `req.method`, `req.path`, `req.timestamp`, `resp.status`, `resp.body`. Slice 8a wires the `append_file` between handler and serializer using shared `emit_append_file_call` (same path as reaction logs). Slice 8b enriches the log scope with `resp.status` (number, slot -24) and `resp.body` (text via BoundText, slots -32/-40) — handler-populated, no extra runtime cost. Slice 8c adds `req.timestamp` (number, slot -56) backed by one `clock_gettime(CLOCK_REALTIME)` after `accept` — frame grows by 8 only when timestamp is referenced. The handler never sees these names; the rewrite is local to the log scope so the response stays reproducible from `(method, path)`. | ~1.3 KB (no ts) / ~1.7 KB (with ts) | `hello_router_logged.verbose` (1294 B) / `audit_complete.verbose` (1735 B) |
+| 8 (8d) | Optional `on_error: drop \| abort` line in the log block. Drop is the default (slice 8a behaviour, silent on failure). Abort emits a `test rax, rax; js abort_label` (8 bytes) after each fallible log syscall — open and write — branching to a shared `mov rax, 60; mov rdi, 1; syscall` epilogue (16 bytes) at the end of the binary. Cost: zero when policy is Drop (no checks, no label). Lets the operator opt into fail-closed audit semantics when an Article 12 chain requires that no log persisted means no claim of having served the request. Reaction effects (rules) keep the Drop default; the knob is service-level only. | ~1.2 KB | `audit_strict.verbose::strict_endpoint` (1240 B) |
 
 *Locked designs for each phase (3, 4, 5b, 2F, 2G, 2H-b) are in [docs/native-designs.md](docs/native-designs.md). They're frozen after implementation — consult them for rationale, not for the current state.*
 
@@ -274,7 +279,7 @@ printf "3 auth\n1 web\n" | /tmp/alert                                           
 cargo run -- examples/invoices.verbose --wasm /tmp/rule.wasm --run important_invoice # WASM
 cargo run -- examples/invoices.verbose --benchmark --run important_invoice          # compare all backends
 cargo run -- --demo-http /tmp/server                                                 # HTTP server — tier-3 emitter probe, NOT in .verbose (see docs/known-gaps.md)
-cargo test                                                                          # 196 tests
+cargo test                                                                          # 198 tests
 make demo                                                                           # full demo
 ```
 

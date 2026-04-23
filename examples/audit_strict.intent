@@ -1,0 +1,7 @@
+An HTTP/1.0 endpoint identical to access_log_json in shape (handler
+returns 200 ok), but the log block declares on_error: abort. If the
+audit log file becomes unwritable (disk full, FS read-only, target
+directory removed), the next failed write terminates the process with
+exit status 1 instead of silently dropping the line. This is the
+fail-closed posture an Article 12 audit chain needs: no log line
+persisted means no claim that the request was processed.

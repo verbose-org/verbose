@@ -961,6 +961,7 @@ impl Parser {
         let mut max_request = None;
         let mut handler = None;
         let mut log: Option<Effect> = None;
+        let mut log_on_error: ErrorPolicy = ErrorPolicy::Drop;
 
         while !self.check_kind(&TokenKind::Dedent) && !self.at_eof() {
             if let Some(attr) = self.peek_attribute_name() {
@@ -1049,6 +1050,11 @@ impl Parser {
                 // Phase 8 slice 8a: optional single-effect log block. Only
                 // `append_file "path" <expr>` is accepted; multi-effect and
                 // other effect variants land in later slices.
+                //
+                // Phase 8 slice 8d: an optional `on_error: drop | abort`
+                // line may follow the append_file line, controlling what
+                // happens when a log syscall fails. Drop is the default
+                // (matches slice 8a behaviour).
                 self.advance();
                 self.expect_kind(TokenKind::Colon)?;
                 self.expect_kind(TokenKind::Newline)?;
@@ -1066,6 +1072,23 @@ impl Parser {
                 let content = self.parse_expr()?;
                 self.expect_kind(TokenKind::Newline)?;
                 log = Some(Effect::AppendFile { path, content });
+                // Optional on_error line.
+                if self.check_ident("on_error") {
+                    self.advance();
+                    self.expect_kind(TokenKind::Colon)?;
+                    let policy_name = self.expect_ident_any()?;
+                    log_on_error = match policy_name.as_str() {
+                        "drop" => ErrorPolicy::Drop,
+                        "abort" => ErrorPolicy::Abort,
+                        other => {
+                            return Err(self.error(&format!(
+                                "unknown on_error policy '{}' (allowed: drop, abort)",
+                                other
+                            )));
+                        }
+                    };
+                    self.expect_kind(TokenKind::Newline)?;
+                }
                 self.expect_kind(TokenKind::Dedent)?;
             } else {
                 return Err(self.error("expected attribute, 'listen:', 'handler:', or 'log:' in service"));
@@ -1082,6 +1105,7 @@ impl Parser {
             max_request: max_request.ok_or_else(|| self.error("service missing 'listen.max_request'"))?,
             handler: handler.ok_or_else(|| self.error("service missing 'handler'"))?,
             log,
+            log_on_error,
         })
     }
 

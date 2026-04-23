@@ -1495,10 +1495,23 @@ fn emit_append_file_call(
     offsets: &HashMap<&str, i32>,
     field_ranges: &HashMap<&str, (i64, i64)>,
     text_bindings: &TextBindings<'_>,
+    on_error: ErrorPolicy,
+    abort_patches: &mut Vec<usize>,
 ) -> Result<(), NativeError> {
     // First, emit the open() call. The path is always a compile-time literal,
     // so we embed it inline and point rdi at it.
     emit_open_append(code, path);
+    // Phase 8 slice 8d: when policy is Abort, branch to the shared
+    // abort sequence on a negative open() return. open() returns -errno
+    // on failure (negative i64), so a sign check via `js` catches every
+    // failure mode without enumerating errno values.
+    if on_error == ErrorPolicy::Abort {
+        // test rax, rax  ; js rel32 (placeholder, caller patches)
+        code.extend_from_slice(&[0x48, 0x85, 0xC0]);
+        code.extend_from_slice(&[0x0F, 0x88]);
+        abort_patches.push(code.len());
+        code.extend_from_slice(&[0, 0, 0, 0]);
+    }
     // rax = fd; save in r15.
     // mov r15, rax  (49 89 C7)
     code.extend_from_slice(&[0x49, 0x89, 0xC7]);
@@ -1507,6 +1520,17 @@ fn emit_append_file_call(
     // so that the Call arm (Phase 2H-a) can recurse on callee.logic.value
     // without re-opening the file or re-validating the path.
     emit_append_write_to_r15(code, content, rule, concept, all_rules, offsets, field_ranges, text_bindings)?;
+    // write() also returns -errno on failure (or fewer bytes than requested
+    // on a partial write — short writes happen in practice on disk full).
+    // Same `js` check picks up the negative return; a partial write below
+    // the requested count is treated as success here, deliberately. Real
+    // partial-write handling is its own slice and lives outside 8d.
+    if on_error == ErrorPolicy::Abort {
+        code.extend_from_slice(&[0x48, 0x85, 0xC0]);
+        code.extend_from_slice(&[0x0F, 0x88]);
+        abort_patches.push(code.len());
+        code.extend_from_slice(&[0, 0, 0, 0]);
+    }
 
     // === close(fd) ===
     // mov rax, 3 (sys_close)
@@ -4527,6 +4551,9 @@ fn emit_reaction_program(
     for effect in &reaction.effects {
         match effect {
             Effect::AppendFile { path, content } => {
+                // Reactions don't expose the slice 8d on_error knob — they
+                // ride the Drop default, matching pre-8d behaviour.
+                let mut _no_aborts: Vec<usize> = Vec::new();
                 emit_append_file_call(
                     &mut code,
                     path,
@@ -4537,6 +4564,8 @@ fn emit_reaction_program(
                     &ctx.binding_offsets,
                     &ctx.field_ranges,
                     &no_text_bindings(),
+                    ErrorPolicy::Drop,
+                    &mut _no_aborts,
                 )?;
             }
             Effect::Print(args) => {
@@ -6933,6 +6962,10 @@ fn emit_http10_dynamic_bytes(
         })
         .unwrap_or(false);
     let frame_base: i32 = if uses_timestamp { 56 } else { 48 };
+    // Phase 8 slice 8d: collected `js abort_label` patch sites from
+    // emit_append_file_call. Resolved after the accept loop emits the
+    // shared abort sequence; left empty when policy is Drop.
+    let mut abort_patches: Vec<usize> = Vec::new();
     let frame_size: u32 = (frame_base as u32) + max_request;
     let buf_offset_from_rbp: i32 = -(frame_base + max_request as i32);
 
@@ -7090,6 +7123,8 @@ fn emit_http10_dynamic_bytes(
                 &log_offsets,
                 field_ranges,
                 &log_text_bindings,
+                service.log_on_error,
+                &mut abort_patches,
             )?;
         }
     }
@@ -7126,6 +7161,23 @@ fn emit_http10_dynamic_bytes(
     code.push(0xE9);
     let back = accept_top as i32 - (code.len() as i32 + 4);
     code.extend_from_slice(&back.to_le_bytes());
+
+    // ═══ ABORT SEQUENCE (Phase 8 slice 8d) ═════════════════════
+    // Reachable only when on_error: abort and a log syscall returned
+    // negative. Each `js` site in emit_append_file_call branches here;
+    // we resolve them now that the label position is known. Sequence:
+    // sys_exit(1).
+    if !abort_patches.is_empty() {
+        let abort_label = code.len();
+        for site in &abort_patches {
+            let rel = abort_label as i32 - (*site as i32 + 4);
+            code[*site..*site + 4].copy_from_slice(&rel.to_le_bytes());
+        }
+        // mov rax, 60 (sys_exit) ; mov rdi, 1 ; syscall
+        code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x3C, 0x00, 0x00, 0x00]);
+        code.extend_from_slice(&[0x48, 0xC7, 0xC7, 0x01, 0x00, 0x00, 0x00]);
+        code.extend_from_slice(&[0x0F, 0x05]);
+    }
 
     Ok(code)
 }
@@ -8831,6 +8883,89 @@ mod tests {
         assert!(
             bytes.windows(log_path.len()).any(|w| w == log_path),
             "log path literal not found in binary — string must be inlined"
+        );
+
+        let _ = fs::remove_file(out);
+    }
+
+    /// Phase 8 slice 8d regression: a service with `on_error: abort`
+    /// embeds the shared sys_exit(1) sequence at the end of the binary
+    /// (mov rax,60; mov rdi,1; syscall) and a `test rax, rax; js rel32`
+    /// check after each fallible log syscall.
+    #[test]
+    fn phase8_slice8d_audit_strict_embeds_abort_sequence() {
+        use std::fs;
+        let src = fs::read_to_string("examples/audit_strict.verbose")
+            .expect("examples/audit_strict.verbose is expected to exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let out = std::env::temp_dir().join("verbosec_test_phase8_slice8d_strict");
+        compile_service(&program, "strict_endpoint", out.to_str().unwrap())
+            .expect("Http10 slice-8d service compile");
+
+        let bytes = fs::read(&out).expect("read output");
+        let size = bytes.len();
+        assert!(
+            (1000..1500).contains(&size),
+            "audit_strict service binary size {} outside expected [1000, 1500] envelope", size
+        );
+
+        // The shared abort label runs sys_exit(1):
+        // mov rax, 60 = 0x48 0xC7 0xC0 0x3C 00 00 00
+        // mov rdi, 1  = 0x48 0xC7 0xC7 0x01 00 00 00
+        // syscall     = 0x0F 0x05
+        let abort_seq = [
+            0x48, 0xC7, 0xC0, 0x3C, 0x00, 0x00, 0x00,
+            0x48, 0xC7, 0xC7, 0x01, 0x00, 0x00, 0x00,
+            0x0F, 0x05,
+        ];
+        assert!(
+            bytes.windows(abort_seq.len()).any(|w| w == abort_seq),
+            "expected sys_exit(1) abort sequence not found — slice 8d not wired"
+        );
+
+        // A `test rax, rax ; js rel32` check appears after each fallible
+        // syscall — there are at least two (open + write). Encoding:
+        // 48 85 C0 0F 88 + i32 (placeholder distance to abort label).
+        let check_prefix = [0x48, 0x85, 0xC0, 0x0F, 0x88];
+        let check_count = bytes
+            .windows(check_prefix.len())
+            .filter(|w| *w == check_prefix)
+            .count();
+        assert!(
+            check_count >= 2,
+            "expected at least 2 `test rax, rax; js` abort checks (open + write), found {}",
+            check_count
+        );
+
+        let _ = fs::remove_file(out);
+    }
+
+    /// Phase 8 slice 8d regression: a service WITHOUT `on_error: abort`
+    /// (the slice 8a default) does NOT embed the abort sequence — zero
+    /// cost when the policy is Drop.
+    #[test]
+    fn phase8_slice8d_default_drop_omits_abort_sequence() {
+        use std::fs;
+        let src = fs::read_to_string("examples/access_log_json.verbose")
+            .expect("examples/access_log_json.verbose is expected to exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let out = std::env::temp_dir().join("verbosec_test_phase8_slice8d_default");
+        compile_service(&program, "access_logged_service", out.to_str().unwrap())
+            .expect("Http10 default-drop service compile");
+
+        let bytes = fs::read(&out).expect("read output");
+        let abort_seq = [
+            0x48, 0xC7, 0xC0, 0x3C, 0x00, 0x00, 0x00,
+            0x48, 0xC7, 0xC7, 0x01, 0x00, 0x00, 0x00,
+            0x0F, 0x05,
+        ];
+        assert!(
+            !bytes.windows(abort_seq.len()).any(|w| w == abort_seq),
+            "Drop-policy service must NOT embed sys_exit(1) abort sequence — slice 8d default broke"
         );
 
         let _ = fs::remove_file(out);
