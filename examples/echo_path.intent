@@ -1,0 +1,9 @@
+An HTTP/1.0 endpoint whose response body is built per-request from the
+request's path and method via concat. GET / returns "got GET on /". POST
+/foo returns "got POST on /foo". Anything else returns 404 with a body
+that also embeds the offending method and path so the client can see
+what the server thought it received.
+
+This exists to exercise slice 3d: the handler computes the response
+body at runtime via a stack-resident concat buffer, and the iteration
+epilogue frees it in one instruction by restoring rsp from rbp.

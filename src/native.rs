@@ -6692,10 +6692,18 @@ fn classify_http_response_record(
                     {
                         has_dynamic_field = true;
                     }
+                    // Slice 3d: body via concat(...) — args go through the
+                    // existing concat pipeline (text literals, request fields,
+                    // numbers). The buffer is allocated on the iteration's
+                    // stack and freed in one shot when the accept loop
+                    // restores rsp before jumping back.
+                    Expr::Concat(_) => {
+                        has_dynamic_field = true;
+                    }
                     _ => {
                         return Http10HandlerShape::Unsupported(format!(
-                            "slice 3c: body must be a text literal or req.method / req.path; \
-                             concat and other computed bodies land in slice 3d+ (got {:?})",
+                            "slice 3d: body must be a text literal, req.method / req.path, \
+                             or concat(...); other computed bodies land in a later slice (got {:?})",
                             expr_kind(f_expr)
                         ));
                     }
@@ -7096,6 +7104,19 @@ fn emit_http10_dynamic_bytes(
     code.extend_from_slice(&[0x48, 0x8B, 0x7D, 0xD0]);                   // rdi = [rbp-48]
     code.extend_from_slice(&[0x0F, 0x05]);                               // syscall
 
+    // ═══ ITERATION RSP RESTORE (Phase 7 slice 3d) ══════════════
+    // Slice 3d allows the handler to allocate a stack-resident concat
+    // buffer for the response body; the log effect (slice 8a–8c) may
+    // also briefly grow rsp. Restoring rsp to its post-prologue value
+    // here frees both in one instruction, regardless of which (if any)
+    // ran. The prologue invariant (rsp = rbp - frame_size after the
+    // initial sub) means this is a no-op when no concat ran.
+    //
+    // `lea rsp, [rbp + neg_frame_size]`  (REX.W + 0x8D + ModRM 0xA5 + disp32)
+    code.extend_from_slice(&[0x48, 0x8D, 0xA5]);
+    let neg_frame: i32 = -(frame_size as i32);
+    code.extend_from_slice(&neg_frame.to_le_bytes());
+
     // jmp accept_top
     code.push(0xE9);
     let back = accept_top as i32 - (code.len() as i32 + 4);
@@ -7301,9 +7322,35 @@ fn emit_handler_to_slots(
                     // mov [rbp-40], rcx
                     code.extend_from_slice(&[0x48, 0x89, 0x4D, 0xD8]);
                 }
+                // Slice 3d: body assembled at runtime via concat(...). The
+                // existing concat-to-buffer infra handles every arg shape
+                // (text literal, number, req.method / req.path text field).
+                // Result: rax = ptr, rdx = len. We stash both in the body
+                // slots; the iteration epilogue restores rsp from rbp,
+                // freeing the buffer (and any log buffer above it) in one
+                // instruction. ConcatBufResult is intentionally ignored
+                // here — the per-iteration rsp restore subsumes both
+                // Static and Dynamic free strategies.
+                Expr::Concat(args) => {
+                    let req_concept = http_request_builtin_concept_native();
+                    let _ = emit_concat_to_buffer(
+                        code,
+                        args,
+                        input_name,
+                        &req_concept,
+                        all_rules,
+                        offsets,
+                        field_ranges,
+                        &no_text_bindings(),
+                    )?;
+                    // mov [rbp-32], rax  (body ptr)
+                    code.extend_from_slice(&[0x48, 0x89, 0x45, 0xE0]);
+                    // mov [rbp-40], rdx  (body len)
+                    code.extend_from_slice(&[0x48, 0x89, 0x55, 0xD8]);
+                }
                 _ => {
                     return Err(NativeError {
-                        message: "body shape not supported in slice 3c".into(),
+                        message: "body shape not supported in slice 3d".into(),
                     });
                 }
             }
@@ -8771,6 +8818,64 @@ mod tests {
         assert!(
             bytes.windows(log_path.len()).any(|w| w == log_path),
             "log path literal not found in binary — string must be inlined"
+        );
+
+        let _ = fs::remove_file(out);
+    }
+
+    /// Phase 7 slice 3d regression: the echo_path service compiles; the
+    /// binary embeds each `concat`'s literal pieces inline; and the size
+    /// sits in the expected envelope.
+    #[test]
+    fn phase7_slice3d_http10_concat_body_compiles() {
+        use std::fs;
+        let src = fs::read_to_string("examples/echo_path.verbose")
+            .expect("examples/echo_path.verbose is expected to exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let out = std::env::temp_dir().join("verbosec_test_phase7_slice3d_echo");
+        compile_service(&program, "echo_server", out.to_str().unwrap())
+            .expect("Http10 slice-3d service compile");
+
+        let bytes = fs::read(&out).expect("read output");
+        let size = bytes.len();
+        assert!(
+            (1000..1700).contains(&size),
+            "slice-3d echo server size {} outside expected [1000, 1700] envelope", size
+        );
+
+        // Each arm's concat has at least one literal piece — they must all
+        // appear inline in the .text section, just like literal bodies do
+        // in slice 3c.
+        for lit in [
+            &b"got GET on "[..],
+            &b"got POST on "[..],
+            &b"unsupported method "[..],
+            &b" on "[..],
+        ] {
+            assert!(
+                bytes.windows(lit.len()).any(|w| w == lit),
+                "concat literal {:?} not found in slice-3d binary",
+                std::str::from_utf8(lit).unwrap()
+            );
+        }
+
+        // The iteration rsp restore is the Phase 7 slice 3d hallmark:
+        // `lea rsp, [rbp - frame_size]` — REX.W 0x8D 0xA5 + neg i32. For
+        // echo_path with max_request=4096 and no timestamp, frame_size =
+        // 48 + 4096 = 4144, so neg_frame = -4144 = 0xFFFFEFD0 in LE.
+        let lea_prefix = [0x48, 0x8D, 0xA5];
+        let lea_disp = (-(48i32 + 4096)).to_le_bytes();
+        let pattern = {
+            let mut p = Vec::with_capacity(7);
+            p.extend_from_slice(&lea_prefix);
+            p.extend_from_slice(&lea_disp);
+            p
+        };
+        assert!(
+            bytes.windows(pattern.len()).any(|w| w == pattern.as_slice()),
+            "expected `lea rsp, [rbp - 4144]` iteration rsp-restore not found"
         );
 
         let _ = fs::remove_file(out);

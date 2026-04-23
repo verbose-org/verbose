@@ -1,0 +1,45 @@
+@verbose 0.1.0
+
+-- Phase 7 slice 3d: HTTP body assembled at runtime via concat(...) of
+-- request fields and literals. Until 3d, body had to be a pure literal
+-- or a single req.method/path pointer; 3d unlocks responses that
+-- actually echo the request, the first time the binary's wire output
+-- is a function of more than one request slot.
+--
+-- The buffer lives on the iteration's stack, between the read buffer
+-- and the response. The accept loop's tail (lea rsp, [rbp - frame_size]
+-- right before jmp accept_top) frees it in 7 bytes, regardless of which
+-- branch ran or whether the body was literal vs. concat.
+
+
+rule echo_handler
+  @intention: "Echo the request method and path in the response body"
+  @source: echo_path.intent:1
+
+  input:
+    req : HttpRequest
+
+  output:
+    resp : HttpResponse
+
+  logic:
+    resp = if req.method == "GET" then HttpResponse { status: 200, body: concat("got GET on ", req.path) } else if req.method == "POST" then HttpResponse { status: 200, body: concat("got POST on ", req.path) } else HttpResponse { status: 404, body: concat("unsupported method ", req.method, " on ", req.path) }
+
+  proofs:
+    purity:
+      reads : [req.method, req.path]
+      calls : []
+    termination:
+      bound : 10
+
+
+service echo_server
+  @intention: "Listen on port 18893, echo method+path in body for every request"
+  @source: echo_path.intent:7
+
+  listen:
+    protocol    : http_1_0
+    port        : 18893
+    max_request : 4096
+
+  handler: echo_handler
