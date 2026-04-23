@@ -1,0 +1,16 @@
+An HTTP/1.0 access controller that authorises or refuses each request
+on the basis of method and path, with a complete Article 12 audit
+trail emitted by the binary itself — no external wrapper. GET requests
+to paths under /public/ are allowed (200 with an "allowed" reason in
+the body). Anything else is refused (403 with a reason naming the
+specific criterion that failed: wrong method, or path outside the
+allowlist). Every request — allowed or refused — produces one JSONL
+line on the audit log. If the audit log cannot be written, the server
+exits with status 1 rather than serve a request whose audit trail was
+lost.
+
+This is the AI Act high-risk gate pattern, expressed end-to-end in one
+.verbose file: Article 13 disclosure (this paragraph + the rule's
+@intention), Article 86 explanation (the resp.body the user receives
+is the same text that lands in the audit log), Article 12 trail (the
+log: block), and the fail-closed guarantee (on_error: abort).

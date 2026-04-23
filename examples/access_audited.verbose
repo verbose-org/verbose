@@ -1,0 +1,53 @@
+@verbose 0.1.0
+
+-- Worked example for docs/ai-act-usage.md, second pattern (HTTP-fronted).
+--
+-- Combines four slices that landed across Phase 7 and Phase 8:
+--   * 3d  body: concat(...)                   — runtime-built reason
+--   * 3e  status: if cond then 200 else 403   — single-record decision
+--   * 8b  resp.status / resp.body in log:     — verdict reaches the audit
+--   * 8c  req.timestamp in log:               — per-request capture
+--   * 8d  on_error: abort                     — fail-closed audit chain
+--
+-- The user-facing reason (resp.body) is bit-for-bit the reason that
+-- lands in the audit log (resp.body in the log: scope). That equality
+-- is the structural anchor for Article 86's right-to-explanation: there
+-- is no place where a reviewer can produce a verdict for the user and
+-- a different one for the audit, because both flow from the same slot.
+
+
+rule decide_access
+  @intention: "Allow GET on /public/*; refuse everything else with a reason"
+  @source: access_audited.intent:1
+
+  input:
+    req : HttpRequest
+
+  output:
+    resp : HttpResponse
+
+  logic:
+    resp = if req.method == "GET" and req.path == "/public/index" then HttpResponse { status: 200, body: "allowed: GET /public/index" } else if req.method == "GET" then HttpResponse { status: 403, body: concat("refused: path ", req.path, " is outside the public allowlist") } else HttpResponse { status: 403, body: concat("refused: method ", req.method, " is not GET") }
+
+  proofs:
+    purity:
+      reads : [req.method, req.path]
+      calls : []
+    termination:
+      bound : 12
+
+
+service access_gate
+  @intention: "Listen on port 18897, decide allow/block, JSONL audit, abort on log failure"
+  @source: access_audited.intent:1
+
+  listen:
+    protocol    : http_1_0
+    port        : 18897
+    max_request : 4096
+
+  handler: decide_access
+
+  log:
+    append_file "/tmp/verbose_access_audited.jsonl" concat("{\"ts\":", req.timestamp, ",\"method\":\"", req.method, "\",\"path\":\"", req.path, "\",\"status\":", resp.status, ",\"reason\":\"", resp.body, "\"}\n")
+    on_error: abort

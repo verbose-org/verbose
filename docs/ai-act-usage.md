@@ -15,7 +15,12 @@ The AI Act demands, for each high-risk automated decision, that the following be
 
 In a conventional stack these sit in four different places: a Confluence page for (1), code comments and design docs for (2), an ad-hoc string concatenation returning an HTTP 403 body for (3), and an observability pipeline feeding Splunk for (4). Drift between any two of them is invisible until a regulator or a refused applicant asks a pointed question.
 
-Verbose collapses (1), (2), and (3) into three mechanically-linked artefacts. (4) becomes a thin wrapper the operator controls directly. The chain is *structural* — nothing depends on anyone remembering to update the Confluence page or to keep the rejection message strings in sync with the code.
+Verbose collapses (1), (2), and (3) into three mechanically-linked artefacts. Two patterns are documented for (4):
+
+- **Pattern 1 — wrapper around stdout/stderr.** Works for any rule, including batch and queue-driven runners. The audit chain lives in a shell wrapper the operator controls. Documented below with `loan_decision`.
+- **Pattern 2 — HTTP-fronted with an in-binary `log:` block.** Phase 7 introduced declarable network listeners; Phase 8 added a per-request audit-log effect on services. The wrapper disappears: log-append, timestamp capture, and fail-closed semantics are all part of the binary, verified alongside the rule. Documented below with `access_audited`.
+
+The chain is *structural* in both patterns — nothing depends on anyone remembering to update the Confluence page or to keep the rejection message strings in sync with the code.
 
 ## The pattern, in five points
 
@@ -44,13 +49,13 @@ printf '30000 650 12 0\n15000 650 12 0\n' | /tmp/loan
 
 ## Per-article mapping
 
-| Article | Requirement | Artefact in this pattern |
-|---|---|---|
-| 12 | Automatic record-keeping of events over the system's lifecycle | Shell wrapper (below), or any append-only sink over stdout + stderr |
-| 13 | Transparency: operation disclosed in a form users can understand | `.intent` file (numbered sentences, plain language) |
-| 15 | Accuracy, robustness, cybersecurity by design | Verifier-enforced: purity, termination bound, overflow bounds, zero external deps |
-| 17 | Quality management system, documented over the lifecycle | Git repo history + `docs/vision-journal.md` + `cargo test` output |
-| 86 | Right to explanation for adversely-affected individuals | Text payload of each `Err` branch, produced mechanically by the binary |
+| Article | Requirement | Pattern 1 (wrapper) | Pattern 2 (HTTP-fronted) |
+|---|---|---|---|
+| 12 | Automatic record-keeping of events over the system's lifecycle | Shell wrapper around stdout + stderr | `log:` block on the service, `on_error: abort` for fail-closed |
+| 13 | Transparency: operation disclosed in a form users can understand | `.intent` file (same in both) | `.intent` file (same in both) |
+| 15 | Accuracy, robustness, cybersecurity by design | Verifier-enforced: purity, termination bound, overflow bounds, zero external deps | Same verifier guarantees + closed-grammar log scope |
+| 17 | Quality management system, documented over the lifecycle | Git history + `docs/vision-journal.md` + `cargo test` | Same |
+| 86 | Right to explanation for adversely-affected individuals | Text of each `Err` branch | `resp.body` slot — same value to user and to audit log |
 
 Note that Articles 15 and 17 are covered *structurally* (the way Verbose is built, you could not skip them if you tried); Articles 13, 86, and 12 require the author to actually write the `.intent`, the `Err` texts, and the log wrapper. The compiler cannot produce natural-language disclosure content for you.
 
@@ -107,8 +112,37 @@ Honesty matters more than sales pitch. This pattern addresses the parts of AI Ac
 
 What this pattern *does* collapse: the drift problem between (disclosure) ↔ (specification) ↔ (code) ↔ (explanation). Those four are often four separate artefacts maintained by different people. Here they are three mechanically-linked artefacts plus a wrapper the operator controls. That is the scope.
 
-## Going further
+## Pattern 2 (HTTP-fronted): the binary IS the audit chain
 
-Once a future Verbose phase introduces declarable network / file primitives (see `docs/known-gaps.md` — "Network syscalls not describable in Verbose, Phase 7+ target"), the Article 12 shell wrapper disappears: the log-append itself becomes a declared reaction in the `.verbose` file, verified alongside the rule. The audit chain becomes entirely describable in one artefact. Until then, the shell wrapper is the seam.
+The shell wrapper above existed because, until Phase 7, Verbose could not describe a network listener nor a file-append effect. Phases 7 and 8 closed both gaps. A `service` declares the listener; a `log:` block on that service declares the per-request append-only audit effect. The wrapper disappears.
 
-For a second high-risk category, duplicate the loan pattern with a new concept, a new rule, and domain-appropriate Err messages. Candidates whose Annex III classification is clear today: health or auto insurance scoring (point 5(a)), CV screening and employment decisions (point 4(a)), eligibility determination for public benefits (point 5(c)). The structure is the same; only the concept fields, the thresholds, and the rejection text change.
+The repository ships the worked case at `examples/access_audited.verbose`. Same regulatory shape as `loan_decision`, applied to an access-control gate:
+
+```bash
+cargo run -- examples/access_audited.verbose --native /tmp/gate
+/tmp/gate &
+curl -s http://127.0.0.1:18897/public/index    # allowed: GET /public/index
+curl -s http://127.0.0.1:18897/private/secret  # refused: path /private/secret is outside the public allowlist
+curl -s -X POST http://127.0.0.1:18897/public/index  # refused: method POST is not GET
+cat /tmp/verbose_access_audited.jsonl | jq -c .
+```
+
+The audit log:
+```json
+{"ts":1776934638,"method":"GET","path":"/public/index","status":200,"reason":"allowed: GET /public/index"}
+{"ts":1776934638,"method":"GET","path":"/private/secret","status":403,"reason":"refused: path /private/secret is outside the public allowlist"}
+{"ts":1776934638,"method":"POST","path":"/public/index","status":403,"reason":"refused: method POST is not GET"}
+```
+
+What changed structurally vs the wrapper pattern:
+
+- **Article 86 anchor is mechanical, not aspirational.** The user-facing reason (`resp.body`) and the audit log reason (`resp.body` referenced in the log scope) are the same rbp slot. There is no place where a reviewer can render a verdict for the user and a different one for the trail; both flow from one assignment.
+- **Article 12 is in-process, not subprocess.** No `mktemp`, no `jq`, no shell at all. One open + one write + one close per request, all visible in the binary's syscall trace.
+- **Article 12 is fail-closed when declared as such.** `on_error: abort` (Phase 8 slice 8d) terminates the process with status 1 on any open/write failure. The next request fails to connect rather than silently succeeding without a logged trail. Default remains `drop` (silent ignore) for setups that prefer availability over guaranteed audit; the operator opts into the strict posture.
+- **Timestamp comes from the kernel, not the wrapper.** `req.timestamp` (Phase 8 slice 8c) is one `clock_gettime(CLOCK_REALTIME)` per accept loop, captured before the parser runs. Visible only inside the log scope so the response stays reproducible from `(method, path)` alone — replaying a request produces the same verdict, only the timestamp differs.
+
+When to keep using Pattern 1 (shell wrapper around stdout+stderr): non-HTTP workflows (batch scoring from a file, message-queue consumption), or rules whose input shape is too rich for path-based encoding. The two patterns coexist; neither replaces the other.
+
+## For a second high-risk category
+
+Duplicate either pattern with a new concept, a new rule, and domain-appropriate refusal text. Candidates whose Annex III classification is clear today: health or auto insurance scoring (point 5(a)), CV screening and employment decisions (point 4(a)), eligibility determination for public benefits (point 5(c)). The structure is the same; only the concept fields, the thresholds, and the rejection text change.

@@ -95,6 +95,11 @@ examples/
                    Server exits with status 1 on any open/write failure in the
                    audit path — fail-closed posture for Article 12 chains.
                    ~1240 B on port 18895.
+  access_audited.* AI Act high-risk gate (HTTP-fronted). Combines slices 3d/3e/8b/8c/8d:
+                   user-facing reason (resp.body) is bit-for-bit the audit log
+                   reason; req.timestamp captured per-request; on_error: abort
+                   for fail-closed audit. Worked example for docs/ai-act-usage.md
+                   Pattern 2. ~2019 B on port 18897.
   demo.html        Browser demo (WASM)
 
 tools/
