@@ -69,6 +69,8 @@ examples/
   greeting_line.*  Phase 5a: `output: text` per-record — greeting_line compiles to a ~564-byte native binary
   roster.*         Phase 5b: `output: text` via top-level fold — roster_line compiles to a ~708-byte native binary
                    (append-only body: concat(acc, e.name, "=", e.salary, "; "); two-pass sizing, single write per input record)
+  ledger_line.*    Phase 2I: non-literal text let bindings. `let tagged = concat(...)`, `let full = concat(tagged, ...)`,
+                   return value chains through both lets. Compiles to ~964 B; exercises chained (ptr, len) slot resolution.
   payroll.*        Phase 3: four rules on the same input — map to Record (~670 B), filter (~670 B), map to number (~455 B), map to text (~410 B).
                    Phase 4: two reductions on the same input — sum (~486 B), count (~532 B).
                    (purchase.verbose::discounted_purchase compiles to ~750 bytes via Phase 2D match_result inlining)
@@ -186,6 +188,7 @@ Tracking what native emits today, what it still rejects, and the design rules th
 | 2G | Text-returning rule call inlined in `emit_text_write_to_fd`. When a text-position expression is `Call(helper, [Ident(input)])`, the emitter recurses on `helper.logic.value` — byte-for-byte equivalent to inlining the helper's body. Same-concept / same-input-name / no-lets restrictions mirror Phase 2D. Unlocks one new code path that flows into every existing text sink (`output: text`, Record field, match_result Err, Result(text,_) arms). See "Phase 2G design (locked)" below. | ~529 B | `compose.verbose::name_line` |
 | 2H-a | Same Phase 2G inlining applied to reaction `append_file` content. `emit_append_file_call` factored into `emit_append_write_to_r15`, which recurses on `callee.logic.value` for the Call case with the same restrictions as 2G. The reaction's `open` / `close` bookkeeping stays around the recursion. | ~655 B | `log_via_helper.verbose::log_alert` |
 | 2H-b | `Call` as a `concat(...)` argument. Pre-eval loop reserves a `16*N` slot array pointed to by `r11`, evaluates each Call exactly once, stashes `(rax=ptr, rdx=len)` at `[r11 + 16*i + {0,8}]`. Sizing reads `[r11+16*i+8]`; filling copies from `[r11+16*i]`. Final `mov rsp, r9` frees everything. Nested inner concat (callee body = concat) uses `is_nested=true` to skip its own r9 save and refuse further CallText (one level of pre-eval). See "Phase 2H-b design (locked)" below. | ~560–780 B | `compose.verbose::greeting` (772 B) |
+| 2I | Non-literal text `let` bindings in `output: text` rules. The prologue's let-eval loop classifies each RHS as text (Concat / text-typed Field / text-returning Call / Ident pointing at a prior text let) or number (everything else). Text bindings get two consecutive rbp slots (ptr, len) — same shape as Phase 2F's err_var — and are registered in a `TextBindings` map carried on `RecordLoopCtx`. The text-output emitter passes that map to `emit_text_write_to_fd`, so `Ident(let-name)` resolves as a BoundText wherever it appears in the logic body or in a later let RHS. The record-loop epilogue's `mov rsp, rbp; pop rbp` frees any concat buffer the lets allocated, once per record. Scope restriction: only `output: text` rules today; Result, service handler, and collection/fold contexts still reject. | ~960 B | `ledger_line.verbose::format_line` (964 B) |
 | 3 | `output: collection(T)` with `map` or `filter` — streaming element emission (one JSON Lines per element), no arena, count-prefixed argv. `filter` uses identity pass-through: predicate false skips emission, predicate true emits the element as-is. See "Phase 3 design (locked)" below. | ~670 B | `payroll.verbose::compute_bonuses` (map) / `::high_earners` (filter) |
 | 3.2 | `output: collection(number)` / `collection(text)` — scalar element map. `map(w.employees, e => e.salary)` emits one number per line; text body emits one string per line. No JSON wrapping, so scalar-element binaries are smaller (~400-500 B). | ~455 B | `payroll.verbose::salaries` / `::names` |
 | 4 | `output: number` with `fold`/`sum`/`count`/`min`/`max` at the top level — inner loop accumulates into a single stack slot, emits the final value on stdout once per input record. First emitter with cross-iteration state; no arena (the accumulator is one i64). See "Phase 4 design (locked)" below. | ~490–530 B | `payroll.verbose::total_salaries` (sum, 486 B) / `::high_earner_count` (count, 532 B) |
@@ -263,6 +266,7 @@ Full rationale: README.md → "Why Not Transpile Rust/Go → Verbose?".
 - **The native backend is the destination** — the Rust transpiler is a fallback. Architectural decisions should keep the native path open.
 - **Every feature must serve security, performance, or unique machine code.** No ergonomic sugar without optimization value.
 - **All documentation in English.** The repo is international.
+- **Pop sub-agents for exploration-heavy work.** When mapping a refactor across many files, scanning for every touch point of a construct, or investigating a broad "where is X used" question, delegate to a sub-agent (`Agent` tool, `Explore` type for searches, `general-purpose` for mixed read+reasoning). The agent's summary lands in the main context; the raw file reads do not. Reserve the main context for actual edits and conversation with the human. Sub-agents are not a substitute for judgment — always read the code you're about to modify yourself, and verify the agent's claims against the file before acting on them.
 
 ## Design Lessons
 
@@ -284,7 +288,7 @@ printf "3 auth\n1 web\n" | /tmp/alert                                           
 cargo run -- examples/invoices.verbose --wasm /tmp/rule.wasm --run important_invoice # WASM
 cargo run -- examples/invoices.verbose --benchmark --run important_invoice          # compare all backends
 cargo run -- --demo-http /tmp/server                                                 # HTTP server — tier-3 emitter probe, NOT in .verbose (see docs/known-gaps.md)
-cargo test                                                                          # 198 tests
+cargo test                                                                          # 199 tests
 make demo                                                                           # full demo
 ```
 

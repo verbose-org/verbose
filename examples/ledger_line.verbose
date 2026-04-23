@@ -1,0 +1,47 @@
+@verbose 0.1.0
+
+-- Phase 2I showcase: non-literal text let bindings. Each `let` whose
+-- RHS is a text expression (concat here) lands in two consecutive rbp
+-- slots (ptr, len); references from later expressions resolve through
+-- the same BoundText path Phase 2F already uses for match_result's
+-- err_var. The record-loop epilogue frees any concat buffer the lets
+-- allocated via the usual `mov rsp, rbp; pop rbp` pair, once per record.
+--
+-- The scope is deliberately narrow: this works for rules whose output
+-- is `text`. Extending non-literal text lets to Result rules and to
+-- service handlers is a later slice — each of those paths has its own
+-- text-emission call site that would need to consume ctx.text_bindings
+-- the same way emit_text_program does today.
+
+
+concept Entry
+  @intention: "A ledger entry has a user, an id, and an amount"
+  @source: ledger_line.intent:1
+
+  fields:
+    user   : text [..32]
+    id     : number [0, 1000000]
+    amount : number [-1000000, 1000000]
+
+
+rule format_line
+  @intention: "Build `[user#id] amount=N posted` per entry using text let bindings"
+  @source: ledger_line.intent:1
+
+  input:
+    e : Entry
+
+  output:
+    line : text
+
+  logic:
+    let tagged = concat("[", e.user, "#", e.id, "]")
+    let full = concat(tagged, " amount=", e.amount)
+    line = concat(full, " posted")
+
+  proofs:
+    purity:
+      reads : [e.user, e.id, e.amount]
+      calls : []
+    termination:
+      bound : 12

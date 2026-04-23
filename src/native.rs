@@ -7,7 +7,7 @@
 /// The generated binary reads groups of N numbers from command-line arguments
 /// (one group per record, N = number of fields) and prints the result.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::verifier::compute_range;
 use std::io::Write;
@@ -343,6 +343,13 @@ struct RecordLoopCtx<'a> {
     binding_offsets: HashMap<&'a str, i32>,
     /// Field range map for overflow-proved arithmetic in emit_eval_expr.
     field_ranges: HashMap<&'a str, (i64, i64)>,
+    /// Phase 2I (non-literal text let bindings): maps text-typed let
+    /// binding names to their (ptr_slot, len_slot) pair. Populated by the
+    /// prologue's let-eval loop when a binding's RHS is a text
+    /// expression; empty otherwise. Consumers that emit text (concat,
+    /// text-write) read this to resolve `Ident(name)` as a BoundText,
+    /// picking up exactly the same shape as Phase 2F's err_var capture.
+    text_bindings: TextBindings<'a>,
     /// Bottom-of-frame slot reserved for `match_result`'s Ok-value binding
     /// (Phase 2D). Present regardless of whether the rule uses match_result;
     /// a stable rbp offset is cheaper than a conditional frame layout.
@@ -402,6 +409,44 @@ fn emit_argc_guard(code: &mut Vec<u8>, min_argc: i32) {
 /// `match_slot` is reserved at the bottom of the frame (used only by
 /// emit_result_program today, but reserving it unconditionally keeps the
 /// frame layout uniform across emitters — 8 bytes of waste when unused).
+/// Phase 2I — classify whether a let binding's RHS produces a text value.
+/// The optimiser has already inlined `Expr::Text` literals, so the cases
+/// that reach the emitter are: `Concat(...)`, `Field` on a text-typed
+/// field, `Call` to a text-returning rule, and `Ident` to a prior text
+/// let binding. Anything else is treated as number (the existing path).
+fn let_rhs_is_text(
+    expr: &Expr,
+    concept: &Concept,
+    context_concept: Option<&Concept>,
+    all_rules: &HashMap<&str, &Rule>,
+    prior_text_lets: &HashSet<&str>,
+) -> bool {
+    match expr {
+        Expr::Text(_) | Expr::Concat(_) => true,
+        Expr::Field(base, fname) => {
+            if !matches!(base.as_ref(), Expr::Ident(_)) {
+                return false;
+            }
+            // Look up in input concept first, then context concept.
+            if let Some(f) = concept.fields.iter().find(|f| &f.name == fname) {
+                return matches!(f.ty, Type::Text);
+            }
+            if let Some(cc) = context_concept {
+                if let Some(f) = cc.fields.iter().find(|f| &f.name == fname) {
+                    return matches!(f.ty, Type::Text);
+                }
+            }
+            false
+        }
+        Expr::Call(name, _) => all_rules
+            .get(name.as_str())
+            .map(|r| matches!(r.output_ty, Type::Text))
+            .unwrap_or(false),
+        Expr::Ident(n) => prior_text_lets.contains(n.as_str()),
+        _ => false,
+    }
+}
+
 fn emit_record_loop_prologue<'a>(
     code: &mut Vec<u8>,
     rule: &'a Rule,
@@ -411,7 +456,25 @@ fn emit_record_loop_prologue<'a>(
 ) -> Result<RecordLoopCtx<'a>, NativeError> {
     let n_ctx = context_concept.map_or(0, |c| c.fields.len());
     let nfields = input_concept.fields.len();
-    let n_bindings = rule.logic.bindings.len();
+    // Phase 2I: classify each let binding as text (2 slots) or number
+    // (1 slot), walking the list in source order so a later binding can
+    // see prior text lets as text-typed identifiers. The classifier
+    // matches exactly what the emit loop will dispatch on — same
+    // helper called twice with the same predicate.
+    let mut prior_text: HashSet<&str> = HashSet::new();
+    let binding_is_text: Vec<bool> = rule
+        .logic
+        .bindings
+        .iter()
+        .map(|(name, expr)| {
+            let is_text = let_rhs_is_text(expr, input_concept, context_concept, all_rules, &prior_text);
+            if is_text {
+                prior_text.insert(name.as_str());
+            }
+            is_text
+        })
+        .collect();
+    let n_binding_slots: usize = binding_is_text.iter().map(|b| if *b { 2 } else { 1 }).sum();
     // Bottom-of-frame reserved slots, in order:
     //   base + 1: match_slot          (Phase 2D Ok-bound i64)
     //   base + 2: err_ptr_slot        (Phase 2F Err-bound text ptr)
@@ -419,9 +482,9 @@ fn emit_record_loop_prologue<'a>(
     //   base + 4: err_frame_save_slot (Phase 2F rsp saved before callee Err concat)
     //   base + 5: exit_flag_slot      (exit code: 0=success, 1=failure)
     let n_reserved = 5;
-    let frame_slots = n_ctx + nfields + n_bindings + n_reserved;
+    let frame_slots = n_ctx + nfields + n_binding_slots + n_reserved;
     let frame_size = (frame_slots * 8) as i32;
-    let base = (n_ctx + nfields + n_bindings) as i32;
+    let base = (n_ctx + nfields + n_binding_slots) as i32;
     let match_slot: i32 = -((base + 1) * 8);
     let err_ptr_slot: i32 = -((base + 2) * 8);
     let err_len_slot: i32 = -((base + 3) * 8);
@@ -529,24 +592,66 @@ fn emit_record_loop_prologue<'a>(
     }
 
     // Evaluate let bindings into successive rbp slots.
+    // Phase 2I — two evaluation paths:
+    //   * Number RHS: existing single-slot path (emit_eval_expr → rax → one store).
+    //   * Text RHS:   emit_text_produce_ptrlen → (rax=ptr, rdx=len) → two consecutive
+    //                 slots. The name goes into text_bindings so downstream emitters
+    //                 that already handle BoundText (concat args, text-write) see it.
     let mut binding_offsets = offsets;
-    // Merge context fields so logic can access cfg.field_name
     for (k, v) in &ctx_offsets {
         binding_offsets.insert(k, *v);
     }
     let field_ranges = build_field_ranges(input_concept);
+    let mut text_bindings: TextBindings<'a> = HashMap::new();
     let mut next_slot = -(((n_ctx + nfields) as i32 + 1) * 8);
-    for (name, expr) in &rule.logic.bindings {
-        emit_eval_expr(code, expr, &rule.input_name, &binding_offsets, all_rules, &field_ranges)?;
-        if next_slot >= -128 {
-            code.extend_from_slice(&[0x48, 0x89, 0x45]);
-            code.push(next_slot as u8);
+    for (idx, (name, expr)) in rule.logic.bindings.iter().enumerate() {
+        if binding_is_text[idx] {
+            // Produce (rax, rdx). Note: concat RHS allocates a stack buffer
+            // below rsp; it stays live until the record loop epilogue restores
+            // rsp via `mov rsp, rbp`, which happens once per record — correct
+            // scope for a per-record binding.
+            emit_text_produce_ptrlen(
+                code,
+                expr,
+                &rule.input_name,
+                input_concept,
+                all_rules,
+                &binding_offsets,
+                &field_ranges,
+                &text_bindings,
+            )?;
+            let ptr_slot = next_slot;
+            let len_slot = next_slot - 8;
+            // mov [rbp + ptr_slot], rax
+            if ptr_slot >= -128 {
+                code.extend_from_slice(&[0x48, 0x89, 0x45]);
+                code.push(ptr_slot as u8);
+            } else {
+                code.extend_from_slice(&[0x48, 0x89, 0x85]);
+                code.extend_from_slice(&ptr_slot.to_le_bytes());
+            }
+            // mov [rbp + len_slot], rdx
+            if len_slot >= -128 {
+                code.extend_from_slice(&[0x48, 0x89, 0x55]);
+                code.push(len_slot as u8);
+            } else {
+                code.extend_from_slice(&[0x48, 0x89, 0x95]);
+                code.extend_from_slice(&len_slot.to_le_bytes());
+            }
+            text_bindings.insert(name.as_str(), (ptr_slot, len_slot));
+            next_slot -= 16;
         } else {
-            code.extend_from_slice(&[0x48, 0x89, 0x85]);
-            code.extend_from_slice(&next_slot.to_le_bytes());
+            emit_eval_expr(code, expr, &rule.input_name, &binding_offsets, all_rules, &field_ranges)?;
+            if next_slot >= -128 {
+                code.extend_from_slice(&[0x48, 0x89, 0x45]);
+                code.push(next_slot as u8);
+            } else {
+                code.extend_from_slice(&[0x48, 0x89, 0x85]);
+                code.extend_from_slice(&next_slot.to_le_bytes());
+            }
+            binding_offsets.insert(name.as_str(), next_slot);
+            next_slot -= 8;
         }
-        binding_offsets.insert(name.as_str(), next_slot);
-        next_slot -= 8;
     }
 
     Ok(RecordLoopCtx {
@@ -554,6 +659,7 @@ fn emit_record_loop_prologue<'a>(
         exit_patch,
         binding_offsets,
         field_ranges,
+        text_bindings,
         match_slot,
         err_ptr_slot,
         err_len_slot,
@@ -656,6 +762,11 @@ fn emit_text_program(
     let mut code = Vec::new();
     let ctx = emit_record_loop_prologue(&mut code, rule, concept, None, all_rules)?;
 
+    // Phase 2I — pass the text_bindings built from the prologue's let-eval
+    // loop so text-write resolves Ident(let-name) as a BoundText (same path
+    // as Phase 2F's err_var). Without this, a rule like
+    // `let msg = concat(...); msg` would fall through to
+    // emit_text_write_to_fd's "unsupported shape" arm.
     emit_text_write_to_fd(
         &mut code,
         &rule.logic.value,
@@ -665,7 +776,7 @@ fn emit_text_program(
         all_rules,
         &ctx.binding_offsets,
         &ctx.field_ranges,
-        &no_text_bindings(),
+        &ctx.text_bindings,
     )?;
     emit_write_newline(&mut code, 1);
 
@@ -8884,6 +8995,63 @@ mod tests {
             bytes.windows(log_path.len()).any(|w| w == log_path),
             "log path literal not found in binary — string must be inlined"
         );
+
+        let _ = fs::remove_file(out);
+    }
+
+    /// Phase 2I regression: a text-output rule with chained non-literal
+    /// text let bindings compiles and runs correctly. Exercises:
+    ///   * `let tagged = concat(...)`  — first-level text let
+    ///   * `let full = concat(tagged, ...)` — later let references prior one
+    ///   * `line = concat(full, ...)`  — logic.value references text let
+    ///
+    /// Before this slice, all three `concat` arms would have had to be
+    /// inlined at the return site because emit_eval_expr rejects text
+    /// literals and had no slot-pair mechanism for computed text values.
+    #[test]
+    fn phase2i_non_literal_text_let_bindings_compile_and_run() {
+        use std::fs;
+        use std::process::Command;
+        let src = fs::read_to_string("examples/ledger_line.verbose")
+            .expect("examples/ledger_line.verbose is expected to exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let out = std::env::temp_dir().join("verbosec_test_phase2i_ledger");
+        compile_native(&program, "format_line", out.to_str().unwrap(), false, false)
+            .expect("ledger_line compile");
+
+        let bytes = fs::read(&out).expect("read output");
+        let size = bytes.len();
+        assert!(
+            (700..1400).contains(&size),
+            "ledger_line binary size {} outside [700, 1400] envelope",
+            size
+        );
+
+        // Run the binary and assert both text lets were resolved correctly
+        // — if `tagged` had not been captured as a BoundText, the second
+        // concat would have failed at emit time; if the slot layout were
+        // off, the runtime output would mismatch.
+        let output = Command::new(&out)
+            .args(["alice", "42", "100"])
+            .output()
+            .expect("run ledger_line");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert_eq!(
+            stdout.trim(),
+            "[alice#42] amount=100 posted",
+            "unexpected output from chained text lets: {:?}",
+            stdout
+        );
+
+        // Negative number path through the int-to-text formatter.
+        let output = Command::new(&out)
+            .args(["bob", "7", "-25"])
+            .output()
+            .expect("run ledger_line negative");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert_eq!(stdout.trim(), "[bob#7] amount=-25 posted");
 
         let _ = fs::remove_file(out);
     }

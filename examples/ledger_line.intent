@@ -1,0 +1,8 @@
+A text-output rule that formats one ledger entry per input record.
+The line is built from two intermediate text let bindings: a tagged
+identifier mixing the user name and entry id, then the full line
+mixing the tagged id with the amount and a literal suffix. Neither
+let RHS is a pure text literal — both are concat(...) — so this is
+the first example whose native binary is only possible after Phase 2I
+(non-literal text let bindings). Before 2I, the same output had to
+be written as a single monolithic concat at the return site.

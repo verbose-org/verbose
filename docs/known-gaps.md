@@ -128,32 +128,50 @@ Still deferred:
   graphemes) is not in scope and is unlikely to ever be — Verbose
   stays at the byte level on purpose.
 
-## Text-valued let bindings (partial — literals only)
+## Text-valued let bindings (partial — text-output rules only)
 
-**What works (since 2026-04-23)**: `let sep = " | "` followed by
-`concat(..., sep, ...)` is now accepted. The optimiser inlines every
-reference to the let-name with the literal at AST level, runs once before
-any backend sees the rule, and respects lambda / fold / match-result
-scope shadowing. A `let a = "x"; let b = a` chain is also resolved (each
-binding is substituted in source order). Number lets are unchanged.
+**What works (since 2026-04-23)**:
 
-**What still fails**: non-literal text bindings.
-```
-let user_msg = concat("user=", p.user)
-let key      = req.method
-```
-Both still hit `text literals not supported in native backend`. Inlining
-isn't valid here — the value is computed at runtime, not at compile time.
+- **Text literal lets**, everywhere. The optimiser inlines every
+  reference to the let-name with the literal at AST level (runs once
+  before any backend sees the rule; respects lambda / fold /
+  match-result scope shadowing; chains like `let a = "x"; let b = a`
+  resolve in source order).
+- **Non-literal text lets in `output: text` rules**. `let tagged =
+  concat("[", e.user, "#", e.id, "]")` followed by `concat(tagged,
+  " amount=", e.amount)` now compiles natively. The prologue's
+  let-eval loop classifies each binding's RHS (text vs number),
+  allocates two consecutive rbp slots for text ones, emits through
+  `emit_text_produce_ptrlen`, and registers the name in
+  `ctx.text_bindings`. The record-loop epilogue frees the concat
+  buffer via `mov rsp, rbp` once per iteration — same mechanism as a
+  bare Phase 5a text-output rule. See `examples/ledger_line.verbose`.
 
-**Workaround for the rejected cases**: inline the expression at each
-usage site, or factor it through a helper rule whose output is text and
-call that rule (see Phase 2G/2H-a/2H-b paths in `native.rs`).
+**What still fails**:
 
-**Fix path for the rest**: extend `emit_eval_expr` to handle text values
-by storing (ptr, len) in TWO consecutive rbp slots (similar to Phase 2F's
-err_ptr_slot/err_len_slot) so that any text-typed expression can land in
-a binding. That's a real slice; it needs slot allocation, every emitter
-that walks bindings, and an extension of TextBindings.
+- **Non-literal text lets in Result rules.** `emit_result_program`
+  doesn't yet thread `ctx.text_bindings` through
+  `emit_eval_result_expr`, so a `let msg = concat(...)` referenced in
+  an Ok or Err arm falls through to "concat argument type not yet
+  supported". Fix path: extend the MatchSlots /
+  emit_eval_result_expr chain to take text_bindings (thread through
+  each recursive helper that emits text).
+- **Non-literal text lets in service handlers.** Phase 7 slice 3+ has
+  its own handler emission path (`emit_handler_to_slots`) which
+  doesn't go through `emit_record_loop_prologue`. Handler-body lets
+  are still rejected at the `analyze_http10_handler_shape` gate.
+  Fix path: run the same classify-and-emit loop inside
+  `emit_http10_dynamic_bytes` before dispatching to the handler
+  emitter, building a handler-local offsets + text_bindings pair.
+- **Non-literal text lets in collection / fold programs** (map, filter,
+  sum, count, the Phase 3/4/5b families). Each has its own
+  `rule.logic.bindings` walk that still calls `emit_eval_expr`
+  directly. Same fix shape as the record-loop prologue.
+
+**Workaround for the rejected contexts**: inline the text expression
+at each usage site, or factor it through a helper rule whose output
+is text and call that rule (Phase 2G / 2H-a / 2H-b cover rule calls
+in every text sink).
 
 ## Nested concat with Call args at 2+ levels
 
