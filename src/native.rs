@@ -2330,6 +2330,7 @@ fn emit_result_program(
         all_rules,
         &ctx.binding_offsets,
         &ctx.field_ranges,
+        &ctx.text_bindings,
         slots,
     )?;
 
@@ -2374,6 +2375,7 @@ fn emit_eval_result_expr(
     all_rules: &HashMap<&str, &Rule>,
     offsets: &HashMap<&str, i32>,
     field_ranges: &HashMap<&str, (i64, i64)>,
+    text_bindings: &TextBindings<'_>,
     slots: MatchSlots,
 ) -> Result<(), NativeError> {
     // Extract the declared (T, E) from the rule's Result(T, E) output so the
@@ -2396,9 +2398,11 @@ fn emit_eval_result_expr(
                 Type::Text => {
                     // Text Ok: write the bytes (literal or concat buffer) to
                     // stdout (fd 1), then append a newline symmetric to itoa.
+                    // Phase 2I: pass the caller's text_bindings so let-bound
+                    // text values can be referenced in the Ok arm.
                     emit_text_write_to_fd(
                         code, inner, 1, &rule.input_name, concept, all_rules, offsets, field_ranges,
-                        &no_text_bindings(),
+                        text_bindings,
                     )?;
                     emit_write_newline(code, 1);
                 }
@@ -2420,9 +2424,11 @@ fn emit_eval_result_expr(
         Expr::Err(inner) => {
             // Err is always text in the shapes we accept. Write to stderr
             // (fd 2), then a newline so multi-record runs separate cleanly.
+            // Phase 2I: pass text_bindings so the Err text expression can
+            // reference let-bound text from the outer rule's prologue.
             emit_text_write_to_fd(
                 code, inner, 2, &rule.input_name, concept, all_rules, offsets, field_ranges,
-                &no_text_bindings(),
+                text_bindings,
             )?;
             emit_write_newline(code, 2);
             // Set exit flag to 1 (failure)
@@ -2447,7 +2453,7 @@ fn emit_eval_result_expr(
 
             // .then — each leaf self-terminates with jmp loop_top.
             emit_eval_result_expr(
-                code, then_e, loop_top, rule, concept, all_rules, offsets, field_ranges, slots,
+                code, then_e, loop_top, rule, concept, all_rules, offsets, field_ranges, text_bindings, slots,
             )?;
 
             // .else:
@@ -2455,7 +2461,7 @@ fn emit_eval_result_expr(
             let else_off = else_pos as i32 - (else_patch as i32 + 4);
             code[else_patch..else_patch + 4].copy_from_slice(&else_off.to_le_bytes());
             emit_eval_result_expr(
-                code, else_e, loop_top, rule, concept, all_rules, offsets, field_ranges, slots,
+                code, else_e, loop_top, rule, concept, all_rules, offsets, field_ranges, text_bindings, slots,
             )?;
             Ok(())
         }
@@ -2478,6 +2484,7 @@ fn emit_eval_result_expr(
                 all_rules,
                 offsets,
                 field_ranges,
+                text_bindings,
                 slots,
             )
         }
@@ -2526,6 +2533,7 @@ fn emit_match_result_inlined(
     all_rules: &HashMap<&str, &Rule>,
     offsets: &HashMap<&str, i32>,
     field_ranges: &HashMap<&str, (i64, i64)>,
+    text_bindings: &TextBindings<'_>,
     slots: MatchSlots,
 ) -> Result<(), NativeError> {
     // The outer Err body must be `Err(<text_expr>)`. Phase 2F accepts any
@@ -2591,6 +2599,7 @@ fn emit_match_result_inlined(
         all_rules,
         offsets,
         field_ranges,
+        text_bindings,
         slots,
     )
 }
@@ -2609,6 +2618,7 @@ fn emit_redirect_callee_leaves(
     all_rules: &HashMap<&str, &Rule>,
     offsets: &HashMap<&str, i32>,
     field_ranges: &HashMap<&str, (i64, i64)>,
+    text_bindings: &TextBindings<'_>,
     slots: MatchSlots,
 ) -> Result<(), NativeError> {
     match expr {
@@ -2642,6 +2652,7 @@ fn emit_redirect_callee_leaves(
                 all_rules,
                 &augmented,
                 field_ranges,
+                text_bindings,
                 slots,
             )
         }
@@ -2723,9 +2734,12 @@ fn emit_redirect_callee_leaves(
                     // Build the concat buffer; get (rax=ptr, rdx=len).
                     // The buffer stays alive across the outer arm; cleanup
                     // via `mov rsp, [rbp+err_frame_save_slot]` at the end.
+                    // Passes text_bindings so the callee's Err concat can
+                    // reference text-let values from the outer rule's
+                    // prologue (Phase 2I integration point).
                     let _buf = emit_concat_to_buffer(
                         code, args, &outer_rule.input_name, concept, all_rules,
-                        offsets, field_ranges, &no_text_bindings(),
+                        offsets, field_ranges, text_bindings,
                     )?;
                     store_rax_at_rbp(code, slots.err_ptr_slot);
                     // mov [rbp + err_len_slot], rdx
@@ -2748,8 +2762,11 @@ fn emit_redirect_callee_leaves(
             }
 
             // 3. Build bindings for err_var and emit the outer Err body's
-            //    text into stderr.
-            let mut bindings: TextBindings = HashMap::new();
+            //    text into stderr. Phase 2I: MERGE the caller's text_bindings
+            //    (let-bound text from the prologue) with err_var so the outer
+            //    Err body can reference both — e.g., `Err(concat(msg, err))`
+            //    where `msg` is a prior text let and `err` is this err_var.
+            let mut bindings: TextBindings = text_bindings.clone();
             bindings.insert(err_var, (slots.err_ptr_slot, slots.err_len_slot));
             emit_text_write_to_fd(
                 code, outer_err_inner, 2, &outer_rule.input_name, concept, all_rules,
@@ -2779,7 +2796,7 @@ fn emit_redirect_callee_leaves(
 
             emit_redirect_callee_leaves(
                 code, then_e, callee, ok_var, ok_body, err_var, outer_err_inner, loop_top,
-                outer_rule, concept, all_rules, offsets, field_ranges, slots,
+                outer_rule, concept, all_rules, offsets, field_ranges, text_bindings, slots,
             )?;
 
             let else_pos = code.len();
@@ -2787,7 +2804,7 @@ fn emit_redirect_callee_leaves(
             code[else_patch..else_patch + 4].copy_from_slice(&else_off.to_le_bytes());
             emit_redirect_callee_leaves(
                 code, else_e, callee, ok_var, ok_body, err_var, outer_err_inner, loop_top,
-                outer_rule, concept, all_rules, offsets, field_ranges, slots,
+                outer_rule, concept, all_rules, offsets, field_ranges, text_bindings, slots,
             )?;
             Ok(())
         }
@@ -8995,6 +9012,47 @@ mod tests {
             bytes.windows(log_path.len()).any(|w| w == log_path),
             "log path literal not found in binary — string must be inlined"
         );
+
+        let _ = fs::remove_file(out);
+    }
+
+    /// Phase 2I-Result regression: a Result(text, text) rule whose Ok and
+    /// Err arms each reference a distinct non-literal text let binding.
+    /// Exercises the ctx.text_bindings thread through
+    /// emit_result_program -> emit_eval_result_expr -> emit_text_write_to_fd.
+    /// Without the thread, either arm would fall through to "unsupported
+    /// shape" when resolving the Ident(let-name).
+    #[test]
+    fn phase2i_result_rule_text_lets_compile_and_run() {
+        use std::fs;
+        use std::process::Command;
+        let src = fs::read_to_string("examples/gate_result.verbose")
+            .expect("examples/gate_result.verbose is expected to exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let out = std::env::temp_dir().join("verbosec_test_phase2i_gate_result");
+        compile_native(&program, "gate", out.to_str().unwrap(), false, false)
+            .expect("gate_result compile");
+
+        // Adult → stdout, exit 0.
+        let output = Command::new(&out)
+            .args(["alice", "30"])
+            .output()
+            .expect("run gate adult");
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "welcome alice");
+        assert_eq!(output.status.code(), Some(0));
+
+        // Minor → stderr, exit 1.
+        let output = Command::new(&out)
+            .args(["bob", "15"])
+            .output()
+            .expect("run gate minor");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stderr).trim(),
+            "sorry bob, minimum age is 18"
+        );
+        assert_eq!(output.status.code(), Some(1));
 
         let _ = fs::remove_file(out);
     }

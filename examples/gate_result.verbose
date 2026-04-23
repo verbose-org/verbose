@@ -1,0 +1,42 @@
+@verbose 0.1.0
+
+-- Phase 2I extension to Result rules. Both text let bindings resolve
+-- through the TextBindings map `emit_eval_result_expr` now threads
+-- into its text-emission call sites. The record-loop epilogue frees
+-- any concat buffer the lets allocated.
+--
+-- Before this extension, building a personalized reason for Ok/Err
+-- forced every concat to be inlined at the leaf, or factored through
+-- a helper rule whose signature matched the Phase 2G constraints.
+
+
+concept Applicant
+  @intention: "An applicant has a name and an age"
+  @source: gate_result.intent:1
+
+  fields:
+    name : text [..32]
+    age  : number [0, 150]
+
+
+rule gate
+  @intention: "Admit applicants 18+ with a greeting; refuse younger ones with a rejection reason"
+  @source: gate_result.intent:1
+
+  input:
+    a : Applicant
+
+  output:
+    verdict : Result(text, text)
+
+  logic:
+    let greeting = concat("welcome ", a.name)
+    let rejection = concat("sorry ", a.name, ", minimum age is 18")
+    verdict = if a.age >= 18 then Ok(greeting) else Err(rejection)
+
+  proofs:
+    purity:
+      reads : [a.name, a.age]
+      calls : []
+    termination:
+      bound : 8

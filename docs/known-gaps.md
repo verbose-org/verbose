@@ -146,16 +146,18 @@ Still deferred:
   `ctx.text_bindings`. The record-loop epilogue frees the concat
   buffer via `mov rsp, rbp` once per iteration — same mechanism as a
   bare Phase 5a text-output rule. See `examples/ledger_line.verbose`.
+- **Non-literal text lets in Result rules** (`Result(number, text)`
+  and `Result(text, text)`). `ctx.text_bindings` is threaded through
+  `emit_eval_result_expr` → `emit_match_result_inlined` →
+  `emit_redirect_callee_leaves`, so Ident(let-name) resolves in Ok,
+  Err, and match_result Err capture arms. The Phase 2F err_var local
+  binding is merged with the caller's text_bindings (one clone + one
+  insert) so the outer Err body can reference both prior text lets
+  AND the captured err_var in a single concat. See
+  `examples/gate_result.verbose`.
 
 **What still fails**:
 
-- **Non-literal text lets in Result rules.** `emit_result_program`
-  doesn't yet thread `ctx.text_bindings` through
-  `emit_eval_result_expr`, so a `let msg = concat(...)` referenced in
-  an Ok or Err arm falls through to "concat argument type not yet
-  supported". Fix path: extend the MatchSlots /
-  emit_eval_result_expr chain to take text_bindings (thread through
-  each recursive helper that emits text).
 - **Non-literal text lets in service handlers.** Phase 7 slice 3+ has
   its own handler emission path (`emit_handler_to_slots`) which
   doesn't go through `emit_record_loop_prologue`. Handler-body lets

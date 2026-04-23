@@ -1,0 +1,10 @@
+A gate rule that decides whether an applicant is admitted, with both
+decisions carrying a personalized reason built via a non-literal text
+let binding. Applicants at least 18 years old are admitted with a
+greeting line that mentions their name; younger ones are refused with
+a rejection line that also mentions their name. Both text lets are
+built via concat; both are referenced from inside Ok/Err constructors.
+
+Exercises Phase 2I in a Result(text, text) rule — text let bindings
+reach the Ok arm, the Err arm, and would reach a match_result err_var
+arm the same way.
