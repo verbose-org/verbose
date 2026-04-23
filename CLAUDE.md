@@ -80,6 +80,9 @@ examples/
   alert.*          Streaming event filter — --stream mode, reads events line by line,
                    filters by severity + source. 772-byte long-running process.
                    Usage: tail -f events.log | ./alert_filter
+  audit_complete.* Phase 8 slices 8b+8c showcase: HTTP service whose JSONL audit
+                   log captures req.timestamp + req.method/path + resp.status/body
+                   in one line per request. ~1735 B native binary on port 18892.
   demo.html        Browser demo (WASM)
 
 tools/
@@ -175,6 +178,8 @@ Tracking what native emits today, what it still rejects, and the design rules th
 | 6 | Scalar output (`number`/`bool`) with embedded quantifiers — `if all(xs, p) then X else if any(xs, p) then Y else Z`. Quantifiers are extracted from the expression tree, desugared to folds, and computed in a **single pass** with one accumulator slot per fold. After the inner loop, the remaining scalar expression is evaluated against the fold results. Multi-accumulator design means N quantifiers = 1 pass, not N passes. | ~700 B | `logs.verbose::health_score` (702 B) / `report.verbose::risk_score` (702 B) |
 | stdin | `--stdin` flag prepends a stdin reader prologue (~173 B) that reads whitespace-separated tokens from fd 0, tokenizes, and builds an argc/argv layout on the stack so the rule prologue works unchanged. Enables `echo "data" \| ./binary` and `./binary < file.txt`. Adds ~173 B overhead to any phase's binary. Design in `docs/stdin-reader-design.md`. | +173 B | any example with `--stdin` |
 | stream | `--stream` flag wraps the rule code in a line-by-line read loop. Reads ONE line from stdin per iteration (byte-by-byte until `\n`), tokenizes, processes, loops. On EOF, exits cleanly. First long-running Verbose binary. Not supported with SIMD-vectorized or parallel rules. | ~770+ B | `alert.verbose::should_alert` (772 B) |
+| 7 (3a–3c) | Top-level `service` construct with `Protocol::Http10` / `Protocol::RawTcp`. Slice 3a synthesises the built-in `HttpRequest` / `HttpResponse` concepts at verify time. Slice 3b emits a constant-response binary (handler logic = a literal `HttpResponse` record). Slice 3c emits the dynamic router: a per-accept loop with HTTP parse → handler → HTTP serialize, with the handler's if/else chain producing the response slots. Same shared register convention as the rest of native (r12=server fd, r14 unused here, rbp frame for handler I/O). | ~430 B (constant) / ~1 KB (router) | `hello_http.verbose` / `hello_router.verbose` |
+| 8 (8a–8c) | Per-request `log:` block on a service. Closed grammar: `text`/`number` literals, `concat(...)`, plus `req.method`, `req.path`, `req.timestamp`, `resp.status`, `resp.body`. Slice 8a wires the `append_file` between handler and serializer using shared `emit_append_file_call` (same path as reaction logs). Slice 8b enriches the log scope with `resp.status` (number, slot -24) and `resp.body` (text via BoundText, slots -32/-40) — handler-populated, no extra runtime cost. Slice 8c adds `req.timestamp` (number, slot -56) backed by one `clock_gettime(CLOCK_REALTIME)` after `accept` — frame grows by 8 only when timestamp is referenced. The handler never sees these names; the rewrite is local to the log scope so the response stays reproducible from `(method, path)`. | ~1.3 KB (no ts) / ~1.7 KB (with ts) | `hello_router_logged.verbose` (1294 B) / `audit_complete.verbose` (1735 B) |
 
 *Locked designs for each phase (3, 4, 5b, 2F, 2G, 2H-b) are in [docs/native-designs.md](docs/native-designs.md). They're frozen after implementation — consult them for rationale, not for the current state.*
 
@@ -259,7 +264,7 @@ printf "3 auth\n1 web\n" | /tmp/alert                                           
 cargo run -- examples/invoices.verbose --wasm /tmp/rule.wasm --run important_invoice # WASM
 cargo run -- examples/invoices.verbose --benchmark --run important_invoice          # compare all backends
 cargo run -- --demo-http /tmp/server                                                 # HTTP server — tier-3 emitter probe, NOT in .verbose (see docs/known-gaps.md)
-cargo test                                                                          # 161 tests
+cargo test                                                                          # 190 tests
 make demo                                                                           # full demo
 ```
 

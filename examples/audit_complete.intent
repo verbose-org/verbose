@@ -1,0 +1,12 @@
+An HTTP/1.0 endpoint that classifies a request and writes a complete
+audit trail line per request: receipt timestamp, request method and path,
+response status, and response body. The line is JSONL — one JSON object
+per request, the format SIEM pipelines (Splunk, Loki, Elastic) and an
+Article 12 audit processor consume directly.
+
+The handler returns 200 with body "ok" for GET /, 200 with body "ping"
+for GET /ping, and 404 with body "not found" otherwise. The handler
+itself reads only req.method and req.path; it never observes the
+timestamp, so the response is fully reproducible from the (method, path)
+pair. The clock read happens once per accept loop and is exposed only to
+the log scope, which is what makes verdict and audit independent.

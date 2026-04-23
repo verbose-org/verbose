@@ -296,37 +296,34 @@ fn verify_service(
         }
     }
 
-    // Phase 8 slice 8a: if a log effect is declared, type-check its content
-    // against Text using the handler's input concept as field scope. Only
-    // `AppendFile` is accepted (parser enforces this); double-check here.
+    // Phase 8 slices 8a/8b/8c: if a log effect is declared, validate its
+    // content against the closed log-scope grammar (text literals, scalar
+    // numbers, concat thereof, and field accesses on the synthetic `req`
+    // and `resp` bindings). The subset is intentionally narrow — anything
+    // outside of it is rejected here rather than silently miscompiled.
     if let Some(log_effect) = &s.log {
         match log_effect {
             Effect::AppendFile { content, .. } => {
-                // Slice 8a restricts log to Http10 services: the content
-                // expression resolves req.method / req.path via the synthesised
-                // HttpRequest concept, which only exists in an Http10 context.
                 if s.protocol != Protocol::Http10 {
                     errors.push(VerifyError {
                         context: format!("service '{}' / log", s.name),
                         message: "Phase 8 slice 8a restricts log to http_1_0 services (raw_tcp log lands in a later slice)".into(),
                     });
                 } else {
-                    // Handler's input concept (HttpRequest) carries method and
-                    // path; look it up from the concepts map (the built-in is
-                    // already injected above for Http10).
-                    let input_concept = match &handler.input_ty {
+                    let req_concept = match &handler.input_ty {
                         Type::Named(n) => concepts.get(n).copied(),
                         _ => None,
                     };
-                    check_expr_against(
-                        content,
-                        &Type::Text,
-                        handler,
-                        all_rules,
-                        input_concept,
-                        concepts,
-                        errors,
-                    );
+                    let resp_concept = match &handler.output_ty {
+                        Type::Named(n) => concepts.get(n).copied(),
+                        _ => None,
+                    };
+                    let scope_ctx = format!("service '{}' / log", s.name);
+                    if let Err(msg) =
+                        verify_log_content(content, req_concept, resp_concept, &Type::Text)
+                    {
+                        errors.push(VerifyError { context: scope_ctx, message: msg });
+                    }
                 }
             }
             // Reactions today only define AppendFile and Print; parser
@@ -338,6 +335,144 @@ fn verify_service(
                 });
             }
         }
+    }
+}
+
+/// Phase 8 slices 8a/8b/8c — type-check a log content expression against
+/// the closed log-scope grammar.
+///
+/// Accepted shapes (recursively for `concat`):
+///   - `text` / `number` literal
+///   - `Field(Ident("req"), name)` where `name` is a declared HttpRequest
+///     field (slice 8a: `method`, `path`)
+///   - `Field(Ident("req"), "timestamp")` — synthetic Unix-seconds slot
+///     populated once per accept loop (slice 8c)
+///   - `Field(Ident("resp"), "status")` — handler-populated status (slice 8b)
+///   - `Field(Ident("resp"), "body")`   — handler-populated body  (slice 8b)
+///   - `concat(arg, ...)` where every arg is itself accepted and produces
+///     a scalar (text, number, or bool — the existing concat fill rule)
+///
+/// Anything else (if/else, rule calls, record construction, arbitrary let
+/// bindings, unknown fields) is rejected with a precise message.
+fn verify_log_content(
+    expr: &Expr,
+    req_concept: Option<&Concept>,
+    resp_concept: Option<&Concept>,
+    expected: &Type,
+) -> Result<(), String> {
+    let ty = log_content_type(expr, req_concept, resp_concept)?;
+    if &ty != expected {
+        return Err(format!(
+            "expression has type '{}' but log content must be '{}'",
+            type_display(&ty),
+            type_display(expected),
+        ));
+    }
+    Ok(())
+}
+
+/// Walk a log content expression, returning its inferred type if it
+/// matches the closed grammar, or an error otherwise. Used by
+/// `verify_log_content` and recursively to validate `concat` arguments.
+fn log_content_type(
+    expr: &Expr,
+    req_concept: Option<&Concept>,
+    resp_concept: Option<&Concept>,
+) -> Result<Type, String> {
+    match expr {
+        Expr::Text(_) => Ok(Type::Text),
+        Expr::Number(_) => Ok(Type::Number),
+        Expr::Field(base, field_name) => {
+            let base_name = match base.as_ref() {
+                Expr::Ident(n) => n,
+                _ => {
+                    return Err(format!(
+                        "field access base must be `req` or `resp`, got a non-identifier expression"
+                    ))
+                }
+            };
+            match base_name.as_str() {
+                "req" => {
+                    if field_name == "timestamp" {
+                        return Ok(Type::Number);
+                    }
+                    let c = req_concept.ok_or_else(|| {
+                        "log content references `req` but the handler input is not a named concept".to_string()
+                    })?;
+                    let f = c.fields.iter().find(|f| &f.name == field_name).ok_or_else(|| {
+                        format!(
+                            "`req.{}` is not a declared HttpRequest field; allowed: {}, plus the synthetic `req.timestamp`",
+                            field_name,
+                            c.fields.iter().map(|f| f.name.as_str()).collect::<Vec<_>>().join(", ")
+                        )
+                    })?;
+                    Ok(f.ty.clone())
+                }
+                "resp" => {
+                    let c = resp_concept.ok_or_else(|| {
+                        "log content references `resp` but the handler output is not a named concept".to_string()
+                    })?;
+                    let f = c.fields.iter().find(|f| &f.name == field_name).ok_or_else(|| {
+                        format!(
+                            "`resp.{}` is not a declared HttpResponse field; allowed: {}",
+                            field_name,
+                            c.fields.iter().map(|f| f.name.as_str()).collect::<Vec<_>>().join(", ")
+                        )
+                    })?;
+                    Ok(f.ty.clone())
+                }
+                other => Err(format!(
+                    "log content can read fields of `req` or `resp` only; got `{}`",
+                    other
+                )),
+            }
+        }
+        Expr::Concat(args) => {
+            for (i, arg) in args.iter().enumerate() {
+                let arg_ty = log_content_type(arg, req_concept, resp_concept)
+                    .map_err(|m| format!("concat arg #{}: {}", i + 1, m))?;
+                match arg_ty {
+                    Type::Number | Type::Bool | Type::Text => {}
+                    other => {
+                        return Err(format!(
+                            "concat arg #{} has type '{}'; only scalar text/number/bool allowed",
+                            i + 1,
+                            type_display(&other),
+                        ))
+                    }
+                }
+            }
+            Ok(Type::Text)
+        }
+        other => Err(format!(
+            "expression `{}` is not allowed in a log content; allowed: text/number literals, `req.field`, `resp.field`, `concat(...)`",
+            describe_expr_kind(other)
+        )),
+    }
+}
+
+/// Short label for an Expr variant — used in user-facing log errors so the
+/// message says "if/else" instead of dumping the whole AST.
+fn describe_expr_kind(e: &Expr) -> &'static str {
+    match e {
+        Expr::Number(_) => "number",
+        Expr::Text(_) => "text",
+        Expr::Ident(_) => "identifier",
+        Expr::Field(_, _) => "field access",
+        Expr::Binary(_, _, _) => "binary op",
+        Expr::Neg(_) => "negation",
+        Expr::Not(_) => "boolean not",
+        Expr::If(_, _, _) => "if/else",
+        Expr::Quantifier(_, _, _, _) => "quantifier",
+        Expr::Map(_, _, _) => "map",
+        Expr::Filter(_, _, _) => "filter",
+        Expr::Fold(_, _, _, _, _) => "fold",
+        Expr::Call(_, _) => "rule call",
+        Expr::Ok(_) => "Ok(...)",
+        Expr::Err(_) => "Err(...)",
+        Expr::MatchResult(_, _, _, _, _) => "match_result",
+        Expr::Record(_, _) => "record construction",
+        Expr::Concat(_) => "concat",
     }
 }
 
@@ -2547,5 +2682,76 @@ rule test
         let src = "@verbose 0.1.0\n\nconcept HttpRequest\n  @intention: \"user domain\"\n  @source: invoices.intent:1\n  fields:\n    x : number\n";
         let errs = verify_str(src);
         assert!(errs.is_empty(), "expected no errors outside Http10 context, got: {:#?}", errs);
+    }
+
+    /// Phase 8 slice 8a/8b/8c regression helper: full Http10 service with a
+    /// log content under test. The handler is fixed; only the log content
+    /// expression varies.
+    fn http10_log_src(log_content: &str) -> String {
+        format!(
+            "@verbose 0.1.0\n\nrule h\n  @intention: \"x\"\n  @source: invoices.intent:1\n  input:\n    req : HttpRequest\n  output:\n    resp : HttpResponse\n  logic:\n    resp = HttpResponse {{ status: 200, body: \"ok\" }}\n  proofs:\n    purity:\n      reads: []\n      calls: []\n    termination:\n      bound: 1\n\nservice s\n  @intention: \"x\"\n  @source: invoices.intent:1\n  listen:\n    protocol: http_1_0\n    port: 8080\n    max_request: 4096\n  handler: h\n  log:\n    append_file \"/tmp/x.log\" {}\n",
+            log_content
+        )
+    }
+
+    #[test]
+    fn phase8b_log_accepts_resp_status_and_body() {
+        let errs =
+            verify_str(&http10_log_src("concat(req.method, \" \", resp.status, \" \", resp.body)"));
+        assert!(errs.is_empty(), "expected no errors, got: {:#?}", errs);
+    }
+
+    #[test]
+    fn phase8c_log_accepts_req_timestamp() {
+        let errs = verify_str(&http10_log_src("concat(req.timestamp, \" \", req.method)"));
+        assert!(errs.is_empty(), "expected no errors, got: {:#?}", errs);
+    }
+
+    #[test]
+    fn phase8b_log_rejects_unknown_resp_field() {
+        let errs = verify_str(&http10_log_src("concat(\"x\", resp.headers)"));
+        assert!(
+            errs.iter().any(|e| e.message.contains("`resp.headers`")
+                && e.message.contains("not a declared HttpResponse field")),
+            "expected resp.headers rejection, got: {:#?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn phase8b_log_rejects_unknown_req_field() {
+        let errs = verify_str(&http10_log_src("concat(\"x\", req.user_agent)"));
+        assert!(
+            errs.iter().any(|e| e.message.contains("`req.user_agent`")
+                && e.message.contains("not a declared HttpRequest field")),
+            "expected req.user_agent rejection, got: {:#?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn phase8_log_rejects_unknown_base_identifier() {
+        // Only `req` and `resp` are valid bases — no `service`, `cfg`, etc.
+        let errs = verify_str(&http10_log_src("concat(\"x\", service.name)"));
+        assert!(
+            errs.iter().any(|e| e.message.contains("can read fields of `req` or `resp` only")),
+            "expected unknown-base rejection, got: {:#?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn phase8_log_rejects_if_else_in_content() {
+        // The log scope is a closed grammar — control flow stays out so
+        // the audit line shape is statically obvious from the source.
+        let errs = verify_str(&http10_log_src(
+            "if req.method == \"GET\" then \"got\" else \"other\"",
+        ));
+        assert!(
+            errs.iter().any(|e| e.message.contains("not allowed in a log content")
+                && e.message.contains("if/else")),
+            "expected if/else rejection, got: {:#?}",
+            errs
+        );
     }
 }

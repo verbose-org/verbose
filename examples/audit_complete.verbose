@@ -1,0 +1,49 @@
+@verbose 0.1.0
+
+-- Phase 8 slices 8b and 8c together: the per-request audit log captures
+-- the receipt timestamp (req.timestamp, slice 8c), the request method
+-- and path (req.method / req.path, slice 8a), and the handler verdict
+-- (resp.status / resp.body, slice 8b) — the four columns an Article 12
+-- audit trail typically needs.
+--
+-- The handler is pure: it reads only req.method and req.path. It never
+-- sees req.timestamp, so the response is reproducible from the (method,
+-- path) pair alone. This separation between handler scope (deterministic)
+-- and log scope (timestamp-aware) is what makes the verdict and the audit
+-- trail independent — exactly what AI Act compliance asks for.
+
+
+rule classify
+  @intention: "Return 200/ok for GET /, 200/ping for GET /ping, 404/not found otherwise"
+  @source: audit_complete.intent:9
+
+  input:
+    req : HttpRequest
+
+  output:
+    resp : HttpResponse
+
+  logic:
+    resp = if req.method == "GET" and req.path == "/" then HttpResponse { status: 200, body: "ok" } else if req.method == "GET" and req.path == "/ping" then HttpResponse { status: 200, body: "ping" } else HttpResponse { status: 404, body: "not found" }
+
+  proofs:
+    purity:
+      reads : [req.method, req.path]
+      calls : []
+    termination:
+      bound : 11
+
+
+service audit_endpoint
+  @intention: "Listen on port 18892, classify, log JSONL with timestamp + method + path + status + body"
+  @source: audit_complete.intent:1
+
+  listen:
+    protocol    : http_1_0
+    port        : 18892
+    max_request : 4096
+
+  handler: classify
+
+  log:
+    append_file "/tmp/verbose_audit_complete.jsonl" concat("{\"ts\":", req.timestamp, ",\"method\":\"", req.method, "\",\"path\":\"", req.path, "\",\"status\":", resp.status, ",\"body\":\"", resp.body, "\"}\n")

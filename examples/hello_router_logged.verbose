@@ -6,11 +6,13 @@
 -- effect is now part of the binary itself — one less shim between the
 -- auditor and the program.
 --
--- Slice 8a scope boundaries (each lifted by a later slice):
---   * log content references request fields only (method, path);
---     response-field access (resp.status, resp.body) lands in slice 8b
+-- This example sticks to slice 8a's request-only log content; see
+-- audit_complete.verbose for the slice 8b/8c form that also captures
+-- resp.status, resp.body, and req.timestamp.
+--
+-- Remaining boundaries (each lifted by a later slice):
 --   * path is a compile-time string literal (permanent discipline)
---   * open / write / close errors are silently ignored in 8a;
+--   * open / write / close errors are silently ignored;
 --     explicit error policy lands in slice 8d
 --   * one log effect per service (8e for multi-effect)
 

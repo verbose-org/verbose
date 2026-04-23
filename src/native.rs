@@ -1494,6 +1494,7 @@ fn emit_append_file_call(
     all_rules: &HashMap<&str, &Rule>,
     offsets: &HashMap<&str, i32>,
     field_ranges: &HashMap<&str, (i64, i64)>,
+    text_bindings: &TextBindings<'_>,
 ) -> Result<(), NativeError> {
     // First, emit the open() call. The path is always a compile-time literal,
     // so we embed it inline and point rdi at it.
@@ -1505,7 +1506,7 @@ fn emit_append_file_call(
     // Now the write() — dispatch on content shape. Factored into a helper
     // so that the Call arm (Phase 2H-a) can recurse on callee.logic.value
     // without re-opening the file or re-validating the path.
-    emit_append_write_to_r15(code, content, rule, concept, all_rules, offsets, field_ranges)?;
+    emit_append_write_to_r15(code, content, rule, concept, all_rules, offsets, field_ranges, text_bindings)?;
 
     // === close(fd) ===
     // mov rax, 3 (sys_close)
@@ -1533,6 +1534,7 @@ fn emit_append_write_to_r15(
     all_rules: &HashMap<&str, &Rule>,
     offsets: &HashMap<&str, i32>,
     field_ranges: &HashMap<&str, (i64, i64)>,
+    text_bindings: &TextBindings<'_>,
 ) -> Result<(), NativeError> {
     match content {
         Expr::Text(s) => {
@@ -1573,7 +1575,7 @@ fn emit_append_write_to_r15(
             // reported by emit_concat_to_buffer.
             let buf = emit_concat_to_buffer(
                 code, args, &rule.input_name, concept, all_rules, offsets, field_ranges,
-                &no_text_bindings(),
+                text_bindings,
             )?;
             // At this point: rax = buf ptr, rdx = length, fd still in r15.
             // mov rsi, rax — write syscall wants source in rsi
@@ -1651,6 +1653,7 @@ fn emit_append_write_to_r15(
             // Recurse: treat the callee's body as the append_file content.
             emit_append_write_to_r15(
                 code, &callee.logic.value, rule, concept, all_rules, offsets, field_ranges,
+                text_bindings,
             )
         }
         other => Err(NativeError {
@@ -4533,6 +4536,7 @@ fn emit_reaction_program(
                     all_rules,
                     &ctx.binding_offsets,
                     &ctx.field_ranges,
+                    &no_text_bindings(),
                 )?;
             }
             Effect::Print(args) => {
@@ -6744,6 +6748,71 @@ fn expr_kind(e: &Expr) -> &'static str {
     }
 }
 
+/// Phase 8 slice 8b/8c — walk the log content to detect whether the
+/// program needs a per-request `clock_gettime` slot. Returns true if any
+/// subexpression references `req.timestamp`, which is the only synthetic
+/// field whose value is not already populated by the time the log fires.
+/// `resp.status` and `resp.body` ride existing handler-output slots.
+fn log_content_uses_req_timestamp(expr: &Expr) -> bool {
+    match expr {
+        Expr::Field(base, name)
+            if matches!(base.as_ref(), Expr::Ident(n) if n == "req") && name == "timestamp" =>
+        {
+            true
+        }
+        Expr::Concat(args) => args.iter().any(log_content_uses_req_timestamp),
+        _ => false,
+    }
+}
+
+/// Phase 8 slice 8b/8c — rewrite the log content so that `resp.*` and
+/// `req.timestamp` references resolve through the enriched log-scope
+/// concept and text-binding maps the emitter prepares around the existing
+/// concat pipeline. The rewrite is local to the log scope; the handler's
+/// logic is never touched.
+///
+/// Mappings:
+///   - `Field(Ident("resp"), "status")`     → `Field(Ident(input_name), "__resp_status")`  (Number, slot -24)
+///   - `Field(Ident("resp"), "body")`       → `Ident("__resp_body")`                       (BoundText, slots (-32, -40))
+///   - `Field(Ident("req"), "timestamp")`   → `Field(Ident(input_name), "__req_timestamp")` (Number, slot -56)
+///
+/// Other shapes pass through unchanged. `resp.body` resolves to a BoundText
+/// (ptr, len) pair rather than a NUL-terminated text field so that the
+/// concat fill copies exactly `body_len` bytes — `emit_strlen` would walk
+/// past the end of the body buffer (the body is not NUL-terminated by the
+/// handler).
+fn rewrite_log_content(expr: &Expr, input_name: &str) -> Expr {
+    match expr {
+        Expr::Field(base, name)
+            if matches!(base.as_ref(), Expr::Ident(n) if n == "resp") && name == "status" =>
+        {
+            Expr::Field(
+                Box::new(Expr::Ident(input_name.to_string())),
+                "__resp_status".to_string(),
+            )
+        }
+        Expr::Field(base, name)
+            if matches!(base.as_ref(), Expr::Ident(n) if n == "resp") && name == "body" =>
+        {
+            Expr::Ident("__resp_body".to_string())
+        }
+        Expr::Field(base, name)
+            if matches!(base.as_ref(), Expr::Ident(n) if n == "req") && name == "timestamp" =>
+        {
+            Expr::Field(
+                Box::new(Expr::Ident(input_name.to_string())),
+                "__req_timestamp".to_string(),
+            )
+        }
+        Expr::Concat(args) => Expr::Concat(
+            args.iter()
+                .map(|a| rewrite_log_content(a, input_name))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
 /// Phase 7 slice 3c: Http10 service whose handler contains one or more
 /// if/else branches producing different HttpResponse records. The handler's
 /// condition evaluation reuses emit_eval_expr (Phase 2's generic expression
@@ -6834,8 +6903,25 @@ fn emit_http10_dynamic_bytes(
     let port_be = service.port.to_be_bytes();
     let max_request = service.max_request;
     let buf_bytes = max_request.to_le_bytes();
-    let frame_size: u32 = 48 + max_request;
-    let buf_offset_from_rbp: i32 = -(48i32 + max_request as i32);
+
+    // Phase 8 slice 8c: when the log content references `req.timestamp`, the
+    // frame grows by 8 bytes for the seconds slot at [rbp-56], pushing the
+    // read buffer down accordingly. Without timestamp, the layout is
+    // unchanged from slice 8a (frame_base = 48). The timestamp clock value is
+    // captured once per accept loop (after accept, before read) so that all
+    // log uses of req.timestamp within a single request observe the same
+    // monotonic instant.
+    let uses_timestamp = service
+        .log
+        .as_ref()
+        .map(|e| match e {
+            Effect::AppendFile { content, .. } => log_content_uses_req_timestamp(content),
+            _ => false,
+        })
+        .unwrap_or(false);
+    let frame_base: i32 = if uses_timestamp { 56 } else { 48 };
+    let frame_size: u32 = (frame_base as u32) + max_request;
+    let buf_offset_from_rbp: i32 = -(frame_base + max_request as i32);
 
     // ═══ PROLOGUE: rbp frame ═══════════════════════════════════
     code.push(0x55);                                     // push rbp
@@ -6892,6 +6978,29 @@ fn emit_http10_dynamic_bytes(
     // mov [rbp-48], rax  (save client_fd)
     code.extend_from_slice(&[0x48, 0x89, 0x45, 0xD0]);                   // -48 = 0xD0 i8
 
+    // ═══ TIMESTAMP (Phase 8 slice 8c) ══════════════════════════
+    // If the log reads req.timestamp, capture CLOCK_REALTIME seconds once
+    // per request, before the parser runs. The 16-byte timespec is laid out
+    // at the start of the read buffer area (still unused at this point —
+    // the read happens next and overwrites it), then we copy tv_sec into
+    // the dedicated [rbp-56] slot. One syscall, 8 bytes of frame growth.
+    if uses_timestamp {
+        // mov rax, 228  (sys_clock_gettime)
+        code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0xE4, 0x00, 0x00, 0x00]);
+        // xor rdi, rdi  (CLOCK_REALTIME = 0)
+        code.extend_from_slice(&[0x48, 0x31, 0xFF]);
+        // lea rsi, [rbp + buf_offset_from_rbp]  (timespec scratch)
+        code.extend_from_slice(&[0x48, 0x8D, 0xB5]);
+        code.extend_from_slice(&buf_offset_from_rbp.to_le_bytes());
+        // syscall
+        code.extend_from_slice(&[0x0F, 0x05]);
+        // mov rax, [rbp + buf_offset_from_rbp]  (tv_sec)
+        code.extend_from_slice(&[0x48, 0x8B, 0x85]);
+        code.extend_from_slice(&buf_offset_from_rbp.to_le_bytes());
+        // mov [rbp-56], rax
+        code.extend_from_slice(&[0x48, 0x89, 0x45, 0xC8]);                // -56 = 0xC8 i8
+    }
+
     // ═══ READ ══════════════════════════════════════════════════
     code.extend_from_slice(&[0x48, 0x31, 0xC0]);                         // xor rax, rax
     code.extend_from_slice(&[0x48, 0x8B, 0x7D, 0xD0]);                   // rdi = [rbp-48]
@@ -6920,24 +7029,54 @@ fn emit_http10_dynamic_bytes(
         field_ranges,
     )?;
 
-    // ═══ LOG EFFECT (Phase 8 slice 8a) ═════════════════════════
+    // ═══ LOG EFFECT (Phase 8 slices 8a/8b/8c) ══════════════════
     // After the handler has populated the output slots and before the
     // response is serialised, fire the optional log append_file effect.
     // Fd lives in r15 across emit_append_file_call (its convention); we
     // don't need to save/restore it because nothing above or below it
     // in this path uses r15.
+    //
+    // Slice 8b/8c: enrich the scope visible to the log content with the
+    // handler's response and the per-request timestamp, then rewrite the
+    // content so that `resp.status`, `resp.body` and `req.timestamp`
+    // resolve through synthetic identifiers backed by the existing rbp
+    // slots. The handler itself never sees these names — the rewrite is
+    // strictly local to the log scope, preserving handler purity and
+    // keeping req.timestamp out of any decision the response depends on.
     if let Some(log_effect) = &service.log {
         if let Effect::AppendFile { path, content } = log_effect {
-            let req_concept = http_request_builtin_concept_native();
+            let mut log_concept = http_request_builtin_concept_native();
+            log_concept.fields.push(Field {
+                name: "__resp_status".to_string(),
+                ty: Type::Number,
+                range: Some((100, 599)),
+            });
+            if uses_timestamp {
+                log_concept.fields.push(Field {
+                    name: "__req_timestamp".to_string(),
+                    ty: Type::Number,
+                    range: None,
+                });
+            }
+            let mut log_offsets: HashMap<&str, i32> = offsets.clone();
+            log_offsets.insert("__resp_status", -24);
+            if uses_timestamp {
+                log_offsets.insert("__req_timestamp", -56);
+            }
+            let mut log_text_bindings: TextBindings = HashMap::new();
+            log_text_bindings.insert("__resp_body", (-32, -40));
+
+            let rewritten = rewrite_log_content(content, &handler.input_name);
             emit_append_file_call(
                 &mut code,
                 path,
-                content,
+                &rewritten,
                 handler,
-                &req_concept,
+                &log_concept,
                 all_rules,
-                offsets,
+                &log_offsets,
                 field_ranges,
+                &log_text_bindings,
             )?;
         }
     }
@@ -8632,6 +8771,63 @@ mod tests {
         assert!(
             bytes.windows(log_path.len()).any(|w| w == log_path),
             "log path literal not found in binary — string must be inlined"
+        );
+
+        let _ = fs::remove_file(out);
+    }
+
+    /// Phase 8 slice 8b/8c regression: the audit_complete service compiles,
+    /// includes the response bodies and the JSONL skeleton inline, and
+    /// — because req.timestamp appears in the log content — embeds the
+    /// clock_gettime syscall number (228) and the CLOCK_REALTIME load
+    /// from the [rbp-56] timestamp slot.
+    #[test]
+    fn phase8_http10_service_with_resp_and_timestamp_compiles() {
+        use std::fs;
+        let src = fs::read_to_string("examples/audit_complete.verbose")
+            .expect("examples/audit_complete.verbose is expected to exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let out = std::env::temp_dir().join("verbosec_test_phase8_audit_complete");
+        compile_service(&program, "audit_endpoint", out.to_str().unwrap())
+            .expect("Http10 audit-complete service compile");
+
+        let bytes = fs::read(&out).expect("read output");
+        let size = bytes.len();
+        assert!(
+            (1500..2200).contains(&size),
+            "audit_complete service binary size {} outside expected [1500, 2200] envelope", size
+        );
+
+        // Handler body literals still inline.
+        for body in [&b"ok"[..], &b"ping"[..], &b"not found"[..]] {
+            assert!(
+                bytes.windows(body.len()).any(|w| w == body),
+                "body literal {:?} not found in audit_complete binary",
+                std::str::from_utf8(body).unwrap()
+            );
+        }
+        // The log path is a compile-time literal — must appear inline.
+        let log_path = b"/tmp/verbose_audit_complete.jsonl";
+        assert!(
+            bytes.windows(log_path.len()).any(|w| w == log_path),
+            "log path literal not found in binary"
+        );
+        // The JSONL skeleton fragment that names the timestamp field must
+        // appear inline — it's a literal arg of the concat.
+        let ts_key = b"{\"ts\":";
+        assert!(
+            bytes.windows(ts_key.len()).any(|w| w == ts_key),
+            "JSONL ts key not found in binary"
+        );
+        // clock_gettime = syscall 228 = 0xE4 — the prologue uses
+        // `mov rax, 228` encoded as `48 c7 c0 e4 00 00 00`. Anchor on
+        // that 7-byte sequence so we know the timestamp capture is wired.
+        let mov_rax_228 = [0x48, 0xC7, 0xC0, 0xE4, 0x00, 0x00, 0x00];
+        assert!(
+            bytes.windows(mov_rax_228.len()).any(|w| w == mov_rax_228),
+            "clock_gettime syscall number (228) not embedded in binary — slice 8c not wired"
         );
 
         let _ = fs::remove_file(out);

@@ -83,6 +83,47 @@ and raw TCP) emitted by the compiler around a normal rule. That sketch is
 not an implementation commitment; it fixes the target shape so that when
 Phase 7 is built, the design is already decided.
 
+## Phase 8 audit-log gaps still open (2026-04-23)
+
+Phase 8 lets a `service` declare a per-request `log:` block that fires
+between the handler and the wire response. As of 2026-04-23, slices 8a,
+8b, and 8c have landed. The log scope sees a closed grammar: text/number
+literals, `concat(...)`, plus four field accesses backed by rbp slots:
+
+  - `req.method`, `req.path`     — slice 8a, parsed from the request
+  - `resp.status`, `resp.body`   — slice 8b, populated by the handler
+  - `req.timestamp`              — slice 8c, captured by `clock_gettime`
+                                    once per accept loop
+
+The handler itself never sees `req.timestamp`; the rewrite is local to
+the log scope so the response stays reproducible from `(method, path)`
+alone. `audit_complete.verbose` exercises all four in one JSONL line.
+
+Still deferred:
+
+- **Slice 8d — explicit `write` error policy.** Today an `append_file`
+  whose write fails (disk full, permission revoked) is silently ignored
+  so a downed log surface never takes the service down. Acceptable for
+  demos; a real Article 12 audit chain wants the option to fail closed.
+  Fix path: a per-log declaration like `on_error: drop | abort`.
+- **Slice 8e — multiple log effects per service.** One `append_file`
+  per service today. Two separate audit sinks (e.g. JSONL + a binary
+  ring buffer) need either a list under `log:` or a parallel `audit:`
+  block.
+- **Slice 8f — JSON escaping primitive.** `concat` does not escape
+  special characters in user-controlled fields. A path containing `"`
+  produces broken JSON. Workaround until 8f: trust the upstream parser
+  to reject the request before it reaches the log line, or expose the
+  raw line through a JSON-tolerant pipeline. Real fix: a `json_escape`
+  text primitive.
+- **`req.timestamp` resolution.** The captured value is whole seconds
+  (`tv_sec`); sub-second precision is in `tv_nsec` but not yet wired.
+  Adds another slot and another itoa.
+- **`resp.body` length is byte length.** The Phase 7 HTTP serializer
+  treats the body as opaque bytes. Multibyte-aware length (codepoints,
+  graphemes) is not in scope and is unlikely to ever be — Verbose
+  stays at the byte level on purpose.
+
 ## Text-valued let bindings
 
 **Symptom**: `let sep = " | "` followed by `concat(... sep ...)` fails:
