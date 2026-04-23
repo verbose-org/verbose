@@ -117,6 +117,8 @@ fn main() {
         eprintln!("  --emit-rust                        Print generated Rust source to stdout");
         eprintln!("  --compile <output>                 Compile to a standalone binary via rustc");
         eprintln!("  --native <output>                  Compile to native x86-64 ELF (no dependencies)");
+        eprintln!("                                       Target: --run <name> (rule or service); defaults to the last");
+        eprintln!("                                       declared service, else the last declared rule.");
         eprintln!("  --native <output> --stdin           Native ELF that reads input from stdin");
         eprintln!("  --native <output> --stream          Streaming: reads stdin line by line (long-running)");
         eprintln!("  --wasm <output>                    Compile to WebAssembly module (.wasm)");
@@ -272,15 +274,33 @@ fn main() {
         println!("  Proofs verified:  purity, termination");
     } else if let Some(output) = native_output {
         let native_rule_str = find_flag(&args, "--run").unwrap_or_else(|| {
+            // No explicit --run target: a service is a program entry point,
+            // so prefer the last declared service when one exists. Fall
+            // back to the last rule for non-service files (the historical
+            // behaviour, kept so single-rule files still work without
+            // --run). Empty programs error out explicitly rather than
+            // failing later with an opaque codegen message.
             program
                 .items
                 .iter()
                 .rev()
                 .find_map(|i| match i {
-                    ast::Item::Rule(r) => Some(r.name.clone()),
+                    ast::Item::Service(s) => Some(s.name.clone()),
                     _ => None,
                 })
-                .unwrap_or_default()
+                .or_else(|| {
+                    program.items.iter().rev().find_map(|i| match i {
+                        ast::Item::Rule(r) => Some(r.name.clone()),
+                        _ => None,
+                    })
+                })
+                .unwrap_or_else(|| {
+                    eprintln!(
+                        "--native requires a target: pass --run <name>, or declare at least one rule or service in {}",
+                        path
+                    );
+                    process::exit(1);
+                })
         });
 
         // Phase 7: if the --run name is an Item::Service, dispatch to the
