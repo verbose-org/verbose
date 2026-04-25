@@ -1,0 +1,70 @@
+@verbose 0.1.0
+
+-- Phase 9 slice 9.2 showcase: read(resource) inside an HTTP service
+-- handler. The handler's body field is loaded from the file declared
+-- by the resource at compile time. Each accept iteration: open file,
+-- read up to max bytes, close, emit response.
+--
+-- Composition with slices already shipped:
+--   * 3e (status: if cond then ... else ...)        — method gate
+--   * 8a/8b/8c/8d (log: with on_error: abort)        — full audit
+--   * 9.1 (resource declaration + read primitive)   — file source
+--
+-- Layout the binary actually does, in order, per accept:
+--   1. accept connection
+--   2. clock_gettime → req.timestamp slot
+--   3. open(/tmp/verbose_static_index.html, O_RDONLY) → r15 → js abort
+--   4. read(r15, buf, 4096)                          → js abort
+--   5. close(r15)
+--   6. parse HTTP method + path
+--   7. handler: status from method, body from resource (ptr+len already loaded)
+--   8. log line built from resp.body + req.timestamp + req.method/path
+--   9. write HTTP/1.0 response
+--  10. close client fd
+--  11. lea rsp, [rbp - frame_size] ; jmp accept_top
+
+
+resource index_page
+  @intention: "The single page this server serves"
+  @source: static_file_server.intent:1
+
+  path: "/tmp/verbose_static_index.html"
+  max:  4096
+  on_read_error: abort
+
+
+rule serve_index
+  @intention: "Echo the index page on GET; 405 on anything else"
+  @source: static_file_server.intent:1
+
+  input:
+    req : HttpRequest
+
+  output:
+    resp : HttpResponse
+
+  logic:
+    resp = HttpResponse { status: if req.method == "GET" then 200 else 405, body: read(index_page) }
+
+  proofs:
+    purity:
+      reads : [req.method, index_page]
+      calls : []
+    termination:
+      bound : 4
+
+
+service static_server
+  @intention: "Listen on port 18901, serve index_page on GET, audit each request"
+  @source: static_file_server.intent:1
+
+  listen:
+    protocol    : http_1_0
+    port        : 18901
+    max_request : 4096
+
+  handler: serve_index
+
+  log:
+    append_file "/tmp/verbose_static_server.jsonl" concat("{\"ts\":", req.timestamp, ",\"method\":\"", req.method, "\",\"path\":\"", req.path, "\",\"status\":", resp.status, "}\n")
+    on_error: abort

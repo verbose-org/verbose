@@ -1,0 +1,15 @@
+An HTTP/1.0 service that serves a single static HTML file. The file
+path is declared in the source as a resource — the binary cannot
+serve any other file because there is no syntax for runtime path
+selection. Every request gets the same file; status is computed from
+the request method (GET → 200, anything else → 405).
+
+The file is read from disk on every accept loop iteration, so an
+operator can update /tmp/verbose_static_index.html and the next
+request sees the new content (no recompile, no signal). If the file
+becomes unreadable mid-flight (deleted, permission revoked) the
+process exits with status 1 — the on_read_error: abort policy makes
+"silently serving stale content" impossible.
+
+This is the smallest demonstrable static file server in Verbose: one
+file, one route, one binary, full audit story.

@@ -7197,10 +7197,20 @@ fn classify_http_response_record(
                     Expr::Concat(_) => {
                         has_dynamic_field = true;
                     }
+                    // Phase 9 slice 2: body = read(<resource>). The accept
+                    // loop reads the file once per request into a per-frame
+                    // buffer; the body slots receive (ptr, len) directly
+                    // from the resource's bound (ptr_slot, len_slot). Goes
+                    // through the Dynamic path so the resource open/read
+                    // sequence is emitted before the handler runs.
+                    Expr::Read(_) => {
+                        has_dynamic_field = true;
+                    }
                     _ => {
                         return Http10HandlerShape::Unsupported(format!(
                             "slice 3d: body must be a text literal, req.method / req.path, \
-                             or concat(...); other computed bodies land in a later slice (got {:?})",
+                             concat(...), or read(<resource>); other computed bodies land in a \
+                             later slice (got {:?})",
                             expr_kind(f_expr)
                         ));
                     }
@@ -7369,7 +7379,17 @@ fn compile_http10_dynamic_service(
     let no_rules: HashMap<&str, &Rule> = HashMap::new();
     let no_ranges: HashMap<&str, (i64, i64)> = HashMap::new();
 
-    let code = emit_http10_dynamic_bytes(service, handler, &offsets, &no_rules, &no_ranges)?;
+    // Phase 9 slice 2: index every top-level `resource` block by name so
+    // the dynamic emitter can look up resources the handler reads. Same
+    // shape as compile_native's resources index — kept local to the
+    // service path because rule binaries and service binaries take
+    // different code paths.
+    let all_resources: HashMap<&str, &Resource> = program.items.iter().filter_map(|i| match i {
+        Item::Resource(r) => Some((r.name.as_str(), r)),
+        _ => None,
+    }).collect();
+
+    let code = emit_http10_dynamic_bytes(service, handler, &offsets, &no_rules, &no_ranges, &all_resources)?;
     write_server_elf(&code, output_path, "service", service.port)
 }
 
@@ -7404,6 +7424,7 @@ fn emit_http10_dynamic_bytes(
     offsets: &HashMap<&str, i32>,
     all_rules: &HashMap<&str, &Rule>,
     field_ranges: &HashMap<&str, (i64, i64)>,
+    all_resources: &HashMap<&str, &Resource>,
 ) -> Result<Vec<u8>, NativeError> {
     let mut code = Vec::new();
     let port_be = service.port.to_be_bytes();
@@ -7425,11 +7446,52 @@ fn emit_http10_dynamic_bytes(
             _ => false,
         })
         .unwrap_or(false);
-    let frame_base: i32 = if uses_timestamp { 56 } else { 48 };
+    // Phase 9 slice 2: enumerate resources the handler reads, in source
+    // order, and resolve each against the program's top-level resource
+    // table. A name unknown at this point is a hard error — the verifier
+    // already rejects unknown resources at parse time, so reaching here
+    // means the dispatcher was invoked with a stale handler.
+    let referenced_resources: Vec<&Resource> = {
+        let names = collect_rule_read_names(handler);
+        let mut out: Vec<&Resource> = Vec::with_capacity(names.len());
+        for name in &names {
+            let r = all_resources.get(name.as_str()).ok_or_else(|| NativeError {
+                message: format!(
+                    "service handler '{}' reads resource '{}' but no top-level `resource {}` was declared",
+                    handler.name, name, name
+                ),
+            })?;
+            out.push(*r);
+        }
+        out
+    };
+    // Each resource contributes 16 bytes (ptr + len) plus a max_bytes
+    // buffer padded to 8 bytes — same accounting as the rule-prologue
+    // path in emit_record_loop_prologue.
+    let resource_extra_bytes: i32 = referenced_resources
+        .iter()
+        .map(|r| 16 + (((r.max_bytes as i32) + 7) & !7))
+        .sum();
+    // Slot map below rbp:
+    //   -8     method ptr (parser output)
+    //   -16    path ptr   (parser output)
+    //   -24    status     (handler output)
+    //   -32    body ptr   (handler output)
+    //   -40    body len   (handler output)
+    //   -48    client_fd
+    //   -56    timestamp seconds        (only when uses_timestamp)
+    //   below: resource (ptr, len) pairs + buffers, growing downward
+    //   bottom: HTTP read buffer (max_request bytes)
+    let frame_base_fixed: i32 = if uses_timestamp { 56 } else { 48 };
+    let frame_base: i32 = frame_base_fixed + resource_extra_bytes;
     // Phase 8 slice 8d: collected `js abort_label` patch sites from
     // emit_append_file_call. Resolved after the accept loop emits the
     // shared abort sequence; left empty when policy is Drop.
     let mut abort_patches: Vec<usize> = Vec::new();
+    // Phase 9 slice 2: open/read failure patches from each
+    // emit_resource_read_sequence. They land at the same sys_exit(1)
+    // sequence the slice-8d path already emits, so we just append into
+    // `abort_patches` after the per-resource emit.
     let frame_size: u32 = (frame_base as u32) + max_request;
     let buf_offset_from_rbp: i32 = -(frame_base + max_request as i32);
 
@@ -7511,6 +7573,31 @@ fn emit_http10_dynamic_bytes(
         code.extend_from_slice(&[0x48, 0x89, 0x45, 0xC8]);                // -56 = 0xC8 i8
     }
 
+    // ═══ RESOURCES (Phase 9 slice 2) ═══════════════════════════
+    // Per-accept open + read + close for every resource the handler reads.
+    // Buffers + (ptr, len) slots live within the per-accept frame; they are
+    // overwritten on every iteration, so the file is consulted fresh per
+    // request without crossing accept boundaries. text_bindings registers
+    // each resource name → (ptr_slot, len_slot) so that downstream
+    // emitters (handler body Read arm, concat args via the shared
+    // BoundText path, log content) all resolve through the same lookup.
+    //
+    // Slot layout: first slot below client_fd (or below timestamp when
+    // present) holds the first resource's ptr; len follows 8 bytes lower;
+    // buffer follows below; next resource (if any) continues from there.
+    let mut http_text_bindings: TextBindings = HashMap::new();
+    let mut resource_next_slot: i32 = -(frame_base_fixed + 8);
+    for r in &referenced_resources {
+        let (ptr_slot, len_slot, _buf_slot, new_next) = emit_resource_read_sequence(
+            &mut code,
+            r,
+            resource_next_slot,
+            &mut abort_patches,
+        );
+        http_text_bindings.insert(r.name.as_str(), (ptr_slot, len_slot));
+        resource_next_slot = new_next;
+    }
+
     // ═══ READ ══════════════════════════════════════════════════
     code.extend_from_slice(&[0x48, 0x31, 0xC0]);                         // xor rax, rax
     code.extend_from_slice(&[0x48, 0x8B, 0x7D, 0xD0]);                   // rdi = [rbp-48]
@@ -7537,6 +7624,7 @@ fn emit_http10_dynamic_bytes(
         offsets,
         all_rules,
         field_ranges,
+        &http_text_bindings,
     )?;
 
     // ═══ LOG EFFECT (Phase 8 slices 8a/8b/8c) ══════════════════
@@ -7762,6 +7850,7 @@ fn emit_handler_to_slots(
     offsets: &HashMap<&str, i32>,
     all_rules: &HashMap<&str, &Rule>,
     field_ranges: &HashMap<&str, (i64, i64)>,
+    text_bindings: &TextBindings<'_>,
 ) -> Result<(), NativeError> {
     match expr {
         Expr::Record(name, fields) if name == "HttpResponse" => {
@@ -7870,12 +7959,41 @@ fn emit_handler_to_slots(
                         all_rules,
                         offsets,
                         field_ranges,
-                        &no_text_bindings(),
+                        text_bindings,
                     )?;
                     // mov [rbp-32], rax  (body ptr)
                     code.extend_from_slice(&[0x48, 0x89, 0x45, 0xE0]);
                     // mov [rbp-40], rdx  (body len)
                     code.extend_from_slice(&[0x48, 0x89, 0x55, 0xD8]);
+                }
+                // Phase 9 slice 2: body = read(<resource>). The accept loop
+                // already opened, read, and closed the file before the
+                // handler ran; (ptr, len) live at the slots registered in
+                // text_bindings under the resource's name. Copy both into
+                // the body slots — same shape as the input-text-field arm
+                // above, just with a known-good slot pair.
+                Expr::Read(name) if text_bindings.contains_key(name.as_str()) => {
+                    let (ptr_slot, len_slot) = text_bindings[name.as_str()];
+                    // mov rax, [rbp + ptr_slot]
+                    if ptr_slot >= -128 {
+                        code.extend_from_slice(&[0x48, 0x8B, 0x45]);
+                        code.push(ptr_slot as u8);
+                    } else {
+                        code.extend_from_slice(&[0x48, 0x8B, 0x85]);
+                        code.extend_from_slice(&ptr_slot.to_le_bytes());
+                    }
+                    // mov [rbp-32], rax (body ptr)
+                    code.extend_from_slice(&[0x48, 0x89, 0x45, 0xE0]);
+                    // mov rax, [rbp + len_slot]
+                    if len_slot >= -128 {
+                        code.extend_from_slice(&[0x48, 0x8B, 0x45]);
+                        code.push(len_slot as u8);
+                    } else {
+                        code.extend_from_slice(&[0x48, 0x8B, 0x85]);
+                        code.extend_from_slice(&len_slot.to_le_bytes());
+                    }
+                    // mov [rbp-40], rax (body len)
+                    code.extend_from_slice(&[0x48, 0x89, 0x45, 0xD8]);
                 }
                 _ => {
                     return Err(NativeError {
@@ -7896,7 +8014,7 @@ fn emit_handler_to_slots(
             code.extend_from_slice(&[0, 0, 0, 0]);
 
             // then arm
-            emit_handler_to_slots(code, then_e, input_name, offsets, all_rules, field_ranges)?;
+            emit_handler_to_slots(code, then_e, input_name, offsets, all_rules, field_ranges, text_bindings)?;
             // jmp end_label
             code.push(0xE9);
             let patch_end = code.len();
@@ -7908,7 +8026,7 @@ fn emit_handler_to_slots(
             code[patch_else..patch_else + 4].copy_from_slice(&rel.to_le_bytes());
 
             // else arm
-            emit_handler_to_slots(code, else_e, input_name, offsets, all_rules, field_ranges)?;
+            emit_handler_to_slots(code, else_e, input_name, offsets, all_rules, field_ranges, text_bindings)?;
 
             // end_label:
             let end_pos = code.len();
@@ -9978,5 +10096,228 @@ rule echo_banner
 
         let _ = std::fs::remove_file(out);
         let _ = std::fs::remove_file(path);
+    }
+
+    /// Phase 9 slice 2: an Http10 service whose handler returns
+    /// `HttpResponse { status: 200, body: read(<resource>) }` must
+    /// embed the resource path literal, the open + read syscall numbers,
+    /// and the shared sys_exit(1) abort sequence (reused for both the
+    /// slice-8d log abort and the slice-9.2 resource-read failure).
+    #[test]
+    fn phase9_slice2_http_handler_read_embeds_syscalls_and_path() {
+        let src = r#"@verbose 0.1.0
+
+resource page
+  @intention: "static welcome page"
+  @source: invoices.intent:1
+  path: "/tmp/verbosec_test_phase9_slice2_page.html"
+  max: 1024
+
+rule serve_page
+  @intention: "serve the static page"
+  @source: invoices.intent:1
+  input:
+    req : HttpRequest
+  output:
+    resp : HttpResponse
+  logic:
+    resp = HttpResponse { status: 200, body: read(page) }
+  proofs:
+    purity:
+      reads: [page]
+      calls: []
+    termination:
+      bound: 1
+
+service web
+  @intention: "static page server"
+  @source: invoices.intent:1
+  listen:
+    protocol: http_1_0
+    port: 18901
+    max_request: 4096
+  handler: serve_page
+"#;
+        let tokens = crate::lexer::Lexer::new(src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens)
+            .parse_program()
+            .expect("parse");
+
+        let out = std::env::temp_dir().join("verbosec_test_phase9_slice2_static");
+        compile_service(&program, "web", out.to_str().unwrap())
+            .expect("Http10 service with read(resource) compile");
+
+        let bytes = std::fs::read(&out).expect("read output binary");
+        let size = bytes.len();
+        assert!(
+            (800..2000).contains(&size),
+            "phase 9 slice 2 service binary size {} outside [800, 2000] envelope",
+            size
+        );
+
+        // Resource path literal embedded at the open site (NUL-terminated).
+        let path_marker = b"/tmp/verbosec_test_phase9_slice2_page.html\0";
+        assert!(
+            bytes.windows(path_marker.len()).any(|w| w == path_marker),
+            "expected resource path literal + NUL not embedded in service binary"
+        );
+
+        // sys_open immediate: mov rax, 2.
+        let open_seq = [0x48, 0xC7, 0xC0, 0x02, 0x00, 0x00, 0x00];
+        assert!(
+            bytes.windows(open_seq.len()).any(|w| w == open_seq),
+            "expected `mov rax, 2` (sys_open) for resource open"
+        );
+        // sys_read immediate: mov rax, 0.
+        let read_seq = [0x48, 0xC7, 0xC0, 0x00, 0x00, 0x00, 0x00];
+        assert!(
+            bytes.windows(read_seq.len()).any(|w| w == read_seq),
+            "expected `mov rax, 0` (sys_read) for resource read"
+        );
+        // Shared abort sequence: mov rax, 60 ; mov rdi, 1 ; syscall.
+        let abort_seq = [
+            0x48, 0xC7, 0xC0, 0x3C, 0x00, 0x00, 0x00,
+            0x48, 0xC7, 0xC7, 0x01, 0x00, 0x00, 0x00,
+            0x0F, 0x05,
+        ];
+        assert!(
+            bytes.windows(abort_seq.len()).any(|w| w == abort_seq),
+            "expected sys_exit(1) abort sequence in service binary"
+        );
+
+        let _ = std::fs::remove_file(out);
+    }
+
+    /// Phase 9 slice 2 end-to-end: spawn the compiled service binary,
+    /// connect via TCP, send an HTTP/1.0 GET, and assert the response
+    /// body is byte-for-byte the contents of the seeded resource file.
+    /// Uses a distinct port from any other test to avoid bind conflicts.
+    #[test]
+    fn phase9_slice2_http_handler_serves_file_contents() {
+        use std::io::{Read, Write};
+        use std::net::TcpStream;
+        use std::process::{Command, Stdio};
+        use std::time::Duration;
+
+        let resource_path = std::env::temp_dir()
+            .join("verbosec_test_phase9_slice2_runtime.html");
+        let payload = b"<html><body>hello from disk</body></html>";
+        std::fs::write(&resource_path, payload).expect("seed resource file");
+
+        let port: u16 = 18902;
+        let src = format!(
+            r#"@verbose 0.1.0
+
+resource page
+  @intention: "runtime-served static page"
+  @source: invoices.intent:1
+  path: "{}"
+  max: 4096
+
+rule serve_page
+  @intention: "echo the page bytes as the response body"
+  @source: invoices.intent:1
+  input:
+    req : HttpRequest
+  output:
+    resp : HttpResponse
+  logic:
+    resp = HttpResponse {{ status: 200, body: read(page) }}
+  proofs:
+    purity:
+      reads: [page]
+      calls: []
+    termination:
+      bound: 1
+
+service web
+  @intention: "static page server"
+  @source: invoices.intent:1
+  listen:
+    protocol: http_1_0
+    port: {}
+    max_request: 4096
+  handler: serve_page
+"#,
+            resource_path.display(),
+            port
+        );
+
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens)
+            .parse_program()
+            .expect("parse");
+
+        let out = std::env::temp_dir().join("verbosec_test_phase9_slice2_runtime_bin");
+        compile_service(&program, "web", out.to_str().unwrap())
+            .expect("Http10 service with read(resource) compile");
+
+        // Spawn the server in the background. It binds, listens, and
+        // accepts forever — we kill it after the request roundtrips.
+        let mut child = Command::new(&out)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn service binary");
+
+        // Give the kernel a brief moment to bind and listen. A short
+        // retry loop avoids racing the listen() syscall without a
+        // long fixed sleep.
+        let mut stream: Option<TcpStream> = None;
+        for _ in 0..50 {
+            match TcpStream::connect_timeout(
+                &format!("127.0.0.1:{}", port).parse().unwrap(),
+                Duration::from_millis(100),
+            ) {
+                Ok(s) => {
+                    stream = Some(s);
+                    break;
+                }
+                Err(_) => std::thread::sleep(Duration::from_millis(20)),
+            }
+        }
+
+        let runtime_result: Result<Vec<u8>, String> = (|| {
+            let mut s = stream.ok_or_else(|| "could not connect to service".to_string())?;
+            s.set_read_timeout(Some(Duration::from_secs(2))).ok();
+            s.write_all(b"GET / HTTP/1.0\r\n\r\n")
+                .map_err(|e| format!("write: {}", e))?;
+            let mut buf = Vec::new();
+            s.read_to_end(&mut buf).map_err(|e| format!("read: {}", e))?;
+            Ok(buf)
+        })();
+
+        // Kill the server before asserting so a panic doesn't leak the
+        // process across tests.
+        let _ = child.kill();
+        let _ = child.wait();
+
+        let response = runtime_result.expect("HTTP roundtrip failed");
+        // Split off headers; the body is everything after the empty line.
+        let sep = b"\r\n\r\n";
+        let split_at = response
+            .windows(sep.len())
+            .position(|w| w == sep)
+            .expect("response missing CRLF/CRLF header terminator");
+        let body = &response[split_at + sep.len()..];
+
+        assert_eq!(
+            body, payload,
+            "response body did not match resource contents: body={:?}",
+            body
+        );
+        // Status line check — the response should advertise 200.
+        let status_line: &[u8] = response
+            .split(|b| *b == b'\r')
+            .next()
+            .unwrap_or(&[]);
+        assert!(
+            status_line.starts_with(b"HTTP/1.0 200"),
+            "expected HTTP/1.0 200 status line, got {:?}",
+            String::from_utf8_lossy(status_line)
+        );
+
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_file(&resource_path);
     }
 }

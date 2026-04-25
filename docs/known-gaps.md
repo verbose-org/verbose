@@ -123,23 +123,35 @@ streaming rule reading the same resource for every record reads the
 file once, not N times. Worked example: `examples/read_config.verbose`
 (541-byte binary).
 
+**Slice 2 (2026-04-25):** `read(<name>)` now works inside HTTP
+service handlers. The handler body can be `body: read(page)` directly
+or via `concat(...)` containing a read. The open/read/close sequence
+is emitted per-accept iteration (above the HTTP parse step), so the
+operator can update the file on disk and the next request sees the
+new content — no recompile, no signal. `static_file_server.verbose`
+ships the worked example (1572-byte binary).
+
 **Still deferred for later slices:**
 
-- **Slice 2 — `on_read_error: drop`** (silent-ignore + empty text).
-  The strict-only default in slice 1 makes failure obvious; relaxing
-  is an explicit opt-in if needed.
-- **Slice 3 — file resources in non-text-output contexts** (Result
-  rules, collection / fold programs, service handlers). Slice 1 only
-  threads the prologue's `text_bindings` map through `emit_text_program`
-  and `emit_record_program` paths.
-- **Slice 4 — multiple resources in a single rule, ordered.** Today
-  each rule sequentially opens / reads / closes each declared resource.
-  No interleaving with the let-eval loop.
-- **Slice 5 — request-derived file paths in services** (e.g.,
+- **`on_read_error: drop`** (silent-ignore + empty text). Slice 1's
+  strict-only default makes failure obvious; relaxing is an explicit
+  opt-in if needed.
+- **File resources in collection / fold / parallel programs.**
+  `emit_collection_program` and friends still reject `read(...)` —
+  same shape as slice 1's prologue work but for fold-context frames.
+- **Multiple resources composing in a single concat in service
+  handlers.** Single-resource handler bodies tested; multi-resource
+  in one expression should work via text_bindings but isn't covered
+  by a regression test yet.
+- **Request-derived file paths in services** (e.g.,
   `GET /static/file.html` → open `/var/www/file.html`). Requires path
-  traversal proofs that slice 1 deliberately refuses; a separate
+  traversal proofs that slice 1/2 deliberately refuse; separate
   design pass with normalised path slots and `O_NOFOLLOW`.
-- **Streaming reads larger than `max:`.** Slice 1 single-shot only.
+- **Streaming reads larger than `max:`.** Single-shot only.
+- **`cache: true`** declaration to read once at server startup
+  instead of per-accept. Performance-sensitive deployments will
+  want this; trade-off is staleness vs. ~3 µs syscall overhead per
+  request.
 
 ## Phase 8 audit-log gaps still open (2026-04-23)
 
