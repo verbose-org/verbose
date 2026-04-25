@@ -68,3 +68,9 @@ service static_server
   log:
     append_file "/tmp/verbose_static_server.jsonl" concat("{\"ts\":", req.timestamp, ",\"method\":\"", req.method, "\",\"path\":\"", req.path, "\",\"status\":", resp.status, "}\n")
     on_error: abort
+
+  -- Phase 10 slice 10: fork-per-accept. The parent immediately closes
+  -- the client fd and loops back to accept; the child runs the handler,
+  -- log, and response, then sys_exits(0). SIGCHLD = SIG_IGN at startup
+  -- means the kernel auto-reaps children — no zombies, no waitpid.
+  concurrency: forked

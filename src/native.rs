@@ -7534,6 +7534,53 @@ fn emit_http10_dynamic_bytes(
     code.extend_from_slice(&[0x0F, 0x05]);                               // syscall
     code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x10]);                   // add rsp, 16
 
+    // ═══ SIGCHLD = SIG_IGN (Phase 10 slice 10) ═════════════════
+    // Forked mode only. Setting SIGCHLD's disposition to SIG_IGN tells
+    // the kernel to auto-reap exiting children — no `wait`/`waitpid`,
+    // no zombie processes accumulating. One syscall at startup, before
+    // listen(), so it covers the very first connection. Sequential
+    // mode skips this block entirely (preserving byte-for-byte
+    // identity with the slice 9 binary).
+    //
+    // `struct sigaction` is the kernel x86-64 ABI shape (NOT libc):
+    //   offset 0:  sa_handler  (8 bytes) = SIG_IGN = 1
+    //   offset 8:  sa_flags    (8 bytes) = 0
+    //   offset 16: sa_restorer (8 bytes) = 0  (unused without SA_RESTORER)
+    //   offset 24: sa_mask     (8 bytes) = 0  (one longword, sigsetsize=8)
+    //
+    // Layout: jmp short over the 32-byte data block, then the syscall
+    // itself with `lea rsi, [rip + disp32]` pointing back at the data.
+    if service.concurrency == ConcurrencyMode::Forked {
+        // jmp short +32 (over the data block)
+        code.extend_from_slice(&[0xEB, 0x20]);
+        let sigaction_data_at = code.len();
+        // sa_handler = SIG_IGN = 1
+        code.extend_from_slice(&1u64.to_le_bytes());
+        // sa_flags = 0
+        code.extend_from_slice(&0u64.to_le_bytes());
+        // sa_restorer = 0
+        code.extend_from_slice(&0u64.to_le_bytes());
+        // sa_mask = 0
+        code.extend_from_slice(&0u64.to_le_bytes());
+        // mov rax, 13 (rt_sigaction)
+        code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x0D, 0x00, 0x00, 0x00]);
+        // mov rdi, 17 (SIGCHLD)
+        code.extend_from_slice(&[0x48, 0xC7, 0xC7, 0x11, 0x00, 0x00, 0x00]);
+        // lea rsi, [rip + disp32]  →  point at sigaction_data_at
+        code.extend_from_slice(&[0x48, 0x8D, 0x35]);
+        let lea_disp_at = code.len();
+        code.extend_from_slice(&[0u8; 4]); // patched below
+        let after_lea = code.len();
+        let disp = sigaction_data_at as i32 - after_lea as i32;
+        code[lea_disp_at..lea_disp_at + 4].copy_from_slice(&disp.to_le_bytes());
+        // mov rdx, 0 (oldact = NULL)
+        code.extend_from_slice(&[0x48, 0xC7, 0xC2, 0x00, 0x00, 0x00, 0x00]);
+        // mov r10, 8 (sigsetsize)
+        code.extend_from_slice(&[0x49, 0xC7, 0xC2, 0x08, 0x00, 0x00, 0x00]);
+        // syscall
+        code.extend_from_slice(&[0x0F, 0x05]);
+    }
+
     // LISTEN
     code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x32, 0x00, 0x00, 0x00]); // rax=50
     code.extend_from_slice(&[0x4C, 0x89, 0xE7]);                         // rdi=r12
@@ -7549,6 +7596,84 @@ fn emit_http10_dynamic_bytes(
     code.extend_from_slice(&[0x0F, 0x05]);                               // syscall
     // mov [rbp-48], rax  (save client_fd)
     code.extend_from_slice(&[0x48, 0x89, 0x45, 0xD0]);                   // -48 = 0xD0 i8
+
+    // ═══ FORK DISPATCH (Phase 10 slice 10) ═════════════════════
+    // Forked mode only. After saving client_fd, fork(). Three branches:
+    //   rax > 0  (parent): close(client_fd), jmp accept_top
+    //   rax == 0 (child):  fall through to the existing iteration body
+    //   rax < 0  (failed): write "fork failed\n" to stderr, then take
+    //                      the same close + loop path as the parent
+    //                      (drop the connection, keep serving).
+    //
+    // Layout (so the child path is the natural fall-through):
+    //   mov rax, 57; syscall; test rax, rax
+    //   jz child            (forward, into the rest of the function)
+    //   js fork_error       (forward, into the inline error handler)
+    //   <parent close + loop>
+    //   <fork_error>: write to stderr, then jmp parent_close
+    //   <child label>: end of dispatch — falls through naturally
+    if service.concurrency == ConcurrencyMode::Forked {
+        // mov rax, 57 (sys_fork) ; syscall ; test rax, rax
+        code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x39, 0x00, 0x00, 0x00]);
+        code.extend_from_slice(&[0x0F, 0x05]);
+        code.extend_from_slice(&[0x48, 0x85, 0xC0]);                     // test rax, rax
+        // jz rel8 to `child` (end of dispatch). Patched after we know
+        // the dispatch length.
+        code.extend_from_slice(&[0x74, 0x00]);
+        let jz_to_child_at = code.len() - 1;
+        // js rel8 to `fork_error`. Patched after parent_close emits.
+        code.extend_from_slice(&[0x78, 0x00]);
+        let js_to_err_at = code.len() - 1;
+
+        // ── parent_close: close(client_fd) + jmp accept_top ──
+        let parent_close_at = code.len();
+        // mov rax, 3 (close) ; mov rdi, [rbp-48] ; syscall
+        code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x03, 0x00, 0x00, 0x00]);
+        code.extend_from_slice(&[0x48, 0x8B, 0x7D, 0xD0]);
+        code.extend_from_slice(&[0x0F, 0x05]);
+        // jmp accept_top (rel32 backward)
+        code.push(0xE9);
+        let back = accept_top as i32 - (code.len() as i32 + 4);
+        code.extend_from_slice(&back.to_le_bytes());
+
+        // ── fork_error: write "fork failed\n" to stderr, jmp parent_close ──
+        let fork_error_at = code.len();
+        // patch js_to_err: distance from end of `js` (js_to_err_at + 1 + 1) to fork_error_at
+        let js_disp = (fork_error_at as i32) - (js_to_err_at as i32 + 1);
+        // i8 fits — small forward jump
+        code[js_to_err_at] = js_disp as i8 as u8;
+
+        // jmp short +12 (over the message bytes)
+        code.extend_from_slice(&[0xEB, 0x0C]);
+        let msg_at = code.len();
+        code.extend_from_slice(b"fork failed\n");
+        // mov rax, 1 (write) ; mov rdi, 2 (stderr)
+        code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x01, 0x00, 0x00, 0x00]);
+        code.extend_from_slice(&[0x48, 0xC7, 0xC7, 0x02, 0x00, 0x00, 0x00]);
+        // lea rsi, [rip + disp32]  →  point at msg_at
+        code.extend_from_slice(&[0x48, 0x8D, 0x35]);
+        let lea_disp_at = code.len();
+        code.extend_from_slice(&[0u8; 4]);
+        let after_lea = code.len();
+        let disp = msg_at as i32 - after_lea as i32;
+        code[lea_disp_at..lea_disp_at + 4].copy_from_slice(&disp.to_le_bytes());
+        // mov rdx, 12 (length)
+        code.extend_from_slice(&[0x48, 0xC7, 0xC2, 0x0C, 0x00, 0x00, 0x00]);
+        // syscall
+        code.extend_from_slice(&[0x0F, 0x05]);
+        // jmp parent_close (rel32 backward)
+        code.push(0xE9);
+        let back = parent_close_at as i32 - (code.len() as i32 + 4);
+        code.extend_from_slice(&back.to_le_bytes());
+
+        // ── child label: rest of iteration body falls through ──
+        let child_at = code.len();
+        let jz_disp = (child_at as i32) - (jz_to_child_at as i32 + 1);
+        // sanity: jz uses rel8; our dispatch is small enough to fit i8
+        debug_assert!((-128..=127).contains(&jz_disp),
+            "phase 10: jz to child path overflowed rel8 ({})", jz_disp);
+        code[jz_to_child_at] = jz_disp as i8 as u8;
+    }
 
     // ═══ TIMESTAMP (Phase 8 slice 8c) ══════════════════════════
     // If the log reads req.timestamp, capture CLOCK_REALTIME seconds once
@@ -7696,23 +7821,34 @@ fn emit_http10_dynamic_bytes(
     code.extend_from_slice(&[0x48, 0x8B, 0x7D, 0xD0]);                   // rdi = [rbp-48]
     code.extend_from_slice(&[0x0F, 0x05]);                               // syscall
 
-    // ═══ ITERATION RSP RESTORE (Phase 7 slice 3d) ══════════════
-    // Slice 3d allows the handler to allocate a stack-resident concat
-    // buffer for the response body; the log effect (slice 8a–8c) may
-    // also briefly grow rsp. Restoring rsp to its post-prologue value
-    // here frees both in one instruction, regardless of which (if any)
-    // ran. The prologue invariant (rsp = rbp - frame_size after the
-    // initial sub) means this is a no-op when no concat ran.
+    // ═══ ITERATION TAIL ════════════════════════════════════════
+    // Sequential mode: the standard slice 3d epilogue — restore rsp to
+    // the post-prologue invariant (frees any handler-allocated concat
+    // buffer in one instruction) and jump back to accept_top.
     //
-    // `lea rsp, [rbp + neg_frame_size]`  (REX.W + 0x8D + ModRM 0xA5 + disp32)
-    code.extend_from_slice(&[0x48, 0x8D, 0xA5]);
-    let neg_frame: i32 = -(frame_size as i32);
-    code.extend_from_slice(&neg_frame.to_le_bytes());
-
-    // jmp accept_top
-    code.push(0xE9);
-    let back = accept_top as i32 - (code.len() as i32 + 4);
-    code.extend_from_slice(&back.to_le_bytes());
+    // Forked mode: control reached here only inside the child process
+    // (the parent took the close + jmp accept_top path inside the fork
+    // dispatch). The child has finished serving one request, so it
+    // exits with status 0 — sys_exit closes any remaining fds and
+    // releases the per-request frame; no rsp restore needed.
+    match service.concurrency {
+        ConcurrencyMode::Sequential => {
+            // `lea rsp, [rbp + neg_frame_size]`  (REX.W + 0x8D + ModRM 0xA5 + disp32)
+            code.extend_from_slice(&[0x48, 0x8D, 0xA5]);
+            let neg_frame: i32 = -(frame_size as i32);
+            code.extend_from_slice(&neg_frame.to_le_bytes());
+            // jmp accept_top
+            code.push(0xE9);
+            let back = accept_top as i32 - (code.len() as i32 + 4);
+            code.extend_from_slice(&back.to_le_bytes());
+        }
+        ConcurrencyMode::Forked => {
+            // mov rax, 60 (sys_exit) ; mov rdi, 0 ; syscall
+            code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x3C, 0x00, 0x00, 0x00]);
+            code.extend_from_slice(&[0x48, 0xC7, 0xC7, 0x00, 0x00, 0x00, 0x00]);
+            code.extend_from_slice(&[0x0F, 0x05]);
+        }
+    }
 
     // ═══ ABORT SEQUENCE (Phase 8 slice 8d) ═════════════════════
     // Reachable only when on_error: abort and a log syscall returned
@@ -10316,6 +10452,237 @@ service web
             "expected HTTP/1.0 200 status line, got {:?}",
             String::from_utf8_lossy(status_line)
         );
+
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_file(&resource_path);
+    }
+
+    /// Phase 10 slice 10 byte-pattern regression: compiling
+    /// static_file_server.verbose (which carries `concurrency: forked`)
+    /// must embed the kernel-ABI sigaction setup, the fork dispatch, the
+    /// child sys_exit, and the "fork failed\n" stderr literal. We assert
+    /// each one as a bare byte sequence rather than using disassembly so
+    /// the test fails loudly if the emitter ever drops or rewires one of
+    /// the four moving parts.
+    #[test]
+    fn phase10_static_file_server_forked_embeds_dispatch_bytes() {
+        use std::fs;
+        let src = fs::read_to_string("examples/static_file_server.verbose")
+            .expect("examples/static_file_server.verbose is expected to exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens)
+            .parse_program()
+            .expect("parse");
+
+        let out = std::env::temp_dir().join("verbosec_test_phase10_static_forked");
+        compile_service(&program, "static_server", out.to_str().unwrap())
+            .expect("forked static_file_server compile");
+
+        let bytes = fs::read(&out).expect("read output");
+
+        // mov rax, 13  (rt_sigaction)  — sigaction setup before listen
+        assert!(
+            bytes.windows(7).any(|w| w == [0x48, 0xC7, 0xC0, 0x0D, 0x00, 0x00, 0x00]),
+            "rt_sigaction syscall (rax=13) not found in forked binary"
+        );
+        // mov rdi, 17  (SIGCHLD)  — argument to rt_sigaction
+        assert!(
+            bytes.windows(7).any(|w| w == [0x48, 0xC7, 0xC7, 0x11, 0x00, 0x00, 0x00]),
+            "SIGCHLD constant (rdi=17) not found in forked binary"
+        );
+        // mov rax, 57  (sys_fork)  — per-accept fork dispatch
+        assert!(
+            bytes.windows(7).any(|w| w == [0x48, 0xC7, 0xC0, 0x39, 0x00, 0x00, 0x00]),
+            "sys_fork syscall (rax=57) not found in forked binary"
+        );
+        // mov rax, 60  (sys_exit)  — child path tail. The Phase 8 slice 8d
+        // abort sequence at the very end of the binary also emits
+        // `mov rax, 60`, and static_file_server happens to use
+        // `on_error: abort`. To prove the *child-exit* mov-rax-60 is
+        // present (not just the abort one), assert there are at least
+        // two occurrences of the 7-byte sequence.
+        let exit_seq: [u8; 7] = [0x48, 0xC7, 0xC0, 0x3C, 0x00, 0x00, 0x00];
+        let exit_count = bytes
+            .windows(exit_seq.len())
+            .filter(|w| *w == exit_seq)
+            .count();
+        assert!(
+            exit_count >= 2,
+            "expected at least 2 occurrences of mov rax, 60 (one for child exit, one for abort), got {}",
+            exit_count
+        );
+        // "fork failed\n" literal — error path stderr message
+        let err_msg = b"fork failed\n";
+        assert!(
+            bytes.windows(err_msg.len()).any(|w| w == err_msg),
+            "'fork failed\\n' literal not found in forked binary"
+        );
+        // Sanity: existing slice 9.2 invariants still hold.
+        let log_path = b"/tmp/verbose_static_server.jsonl";
+        assert!(
+            bytes.windows(log_path.len()).any(|w| w == log_path),
+            "log path literal must still be inlined (slice 8a contract)"
+        );
+
+        let _ = fs::remove_file(out);
+    }
+
+    /// Phase 10 slice 10 concurrency smoke test: the forked binary should
+    /// serve four parallel HTTP/1.0 GET requests successfully. We spawn
+    /// the binary on port 18910 (chosen to avoid collision with other
+    /// service tests' ports), fire four threads each opening a socket,
+    /// writing a request, and reading the response, then assert all four
+    /// bodies match the seeded resource file.
+    ///
+    /// The point is not raw throughput — sequential mode would also pass
+    /// four requests in series — but to exercise the fork/parent-close
+    /// path: if fork() were missing, the second connection would block
+    /// behind the first; if the parent didn't close client_fd, the
+    /// kernel would eventually exhaust fds; if the child didn't exit,
+    /// children would loop back to accept and steal connections from
+    /// the parent. Anything broken in the dispatch surfaces here.
+    #[test]
+    fn phase10_forked_service_serves_parallel_requests() {
+        use std::io::{Read, Write};
+        use std::net::TcpStream;
+        use std::process::{Command, Stdio};
+        use std::time::Duration;
+
+        let resource_path = std::env::temp_dir()
+            .join("verbosec_test_phase10_forked_index.html");
+        let payload = b"<html><body>forked</body></html>";
+        std::fs::write(&resource_path, payload).expect("seed resource file");
+
+        let port: u16 = 18910;
+        let src = format!(
+            r#"@verbose 0.1.0
+
+resource page
+  @intention: "page served by a forked HTTP service"
+  @source: invoices.intent:1
+  path: "{}"
+  max: 4096
+
+rule serve_page
+  @intention: "echo the page bytes as the response body"
+  @source: invoices.intent:1
+  input:
+    req : HttpRequest
+  output:
+    resp : HttpResponse
+  logic:
+    resp = HttpResponse {{ status: 200, body: read(page) }}
+  proofs:
+    purity:
+      reads: [page]
+      calls: []
+    termination:
+      bound: 1
+
+service web
+  @intention: "fork-per-accept static page server"
+  @source: invoices.intent:1
+  listen:
+    protocol: http_1_0
+    port: {}
+    max_request: 4096
+  handler: serve_page
+  concurrency: forked
+"#,
+            resource_path.display(),
+            port
+        );
+
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens)
+            .parse_program()
+            .expect("parse");
+
+        let out = std::env::temp_dir().join("verbosec_test_phase10_forked_bin");
+        compile_service(&program, "web", out.to_str().unwrap())
+            .expect("forked Http10 service compile");
+
+        let mut child = Command::new(&out)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn forked service binary");
+
+        // Wait for listen() with a short retry loop. We probe the same
+        // port the binary binds to; once a connect succeeds the kernel
+        // has accepted the bind+listen, so the rest of the test can run.
+        let mut probed = false;
+        for _ in 0..50 {
+            if let Ok(s) = TcpStream::connect_timeout(
+                &format!("127.0.0.1:{}", port).parse().unwrap(),
+                Duration::from_millis(100),
+            ) {
+                drop(s);
+                probed = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        let runtime_result: Result<Vec<Vec<u8>>, String> = (|| {
+            if !probed {
+                return Err("server never accepted TCP connections".into());
+            }
+            // Fire four parallel requests. Each thread opens its own
+            // socket, sends a GET, and reads the full response.
+            let port = port;
+            let handles: Vec<_> = (0..4)
+                .map(|_| {
+                    std::thread::spawn(move || -> Result<Vec<u8>, String> {
+                        let mut s = TcpStream::connect_timeout(
+                            &format!("127.0.0.1:{}", port).parse().unwrap(),
+                            Duration::from_secs(2),
+                        )
+                        .map_err(|e| format!("connect: {}", e))?;
+                        s.set_read_timeout(Some(Duration::from_secs(3))).ok();
+                        s.write_all(b"GET / HTTP/1.0\r\n\r\n")
+                            .map_err(|e| format!("write: {}", e))?;
+                        let mut buf = Vec::new();
+                        s.read_to_end(&mut buf).map_err(|e| format!("read: {}", e))?;
+                        Ok(buf)
+                    })
+                })
+                .collect();
+            let mut responses = Vec::new();
+            for h in handles {
+                let r = h.join().map_err(|_| "thread panicked".to_string())??;
+                responses.push(r);
+            }
+            Ok(responses)
+        })();
+
+        // Always kill the server (and its forked children) before
+        // asserting so a panic doesn't leak processes across tests.
+        let _ = child.kill();
+        let _ = child.wait();
+
+        let responses = runtime_result.expect("parallel HTTP roundtrip failed");
+        assert_eq!(responses.len(), 4, "expected 4 responses");
+        let sep = b"\r\n\r\n";
+        for (idx, response) in responses.iter().enumerate() {
+            let split_at = response
+                .windows(sep.len())
+                .position(|w| w == sep)
+                .unwrap_or_else(|| panic!("response {} missing CRLF/CRLF terminator", idx));
+            let body = &response[split_at + sep.len()..];
+            assert_eq!(
+                body, payload,
+                "response {} body did not match resource contents: body={:?}",
+                idx, body
+            );
+            let status_line: &[u8] = response.split(|b| *b == b'\r').next().unwrap_or(&[]);
+            assert!(
+                status_line.starts_with(b"HTTP/1.0 200"),
+                "response {} expected HTTP/1.0 200, got {:?}",
+                idx,
+                String::from_utf8_lossy(status_line)
+            );
+        }
 
         let _ = std::fs::remove_file(&out);
         let _ = std::fs::remove_file(&resource_path);

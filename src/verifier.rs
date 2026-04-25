@@ -461,6 +461,18 @@ fn verify_service(
             }
         }
     }
+
+    // Phase 10 slice 10: forked concurrency is currently restricted to
+    // http_1_0. raw_tcp services that fork would also need the parent to
+    // close the client fd before re-entering accept (same shape) but the
+    // recon explicitly scoped this slice to Http10; lifting the
+    // restriction is one slice, not a free side-effect.
+    if s.concurrency == ConcurrencyMode::Forked && s.protocol != Protocol::Http10 {
+        errors.push(VerifyError {
+            context: format!("service '{}' / concurrency", s.name),
+            message: "Phase 10: concurrency: forked currently restricted to http_1_0 services".into(),
+        });
+    }
 }
 
 /// Phase 8 slices 8a/8b/8c — type-check a log content expression against

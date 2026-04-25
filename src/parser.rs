@@ -974,6 +974,10 @@ impl Parser {
         let mut handler = None;
         let mut log: Option<Effect> = None;
         let mut log_on_error: ErrorPolicy = ErrorPolicy::Drop;
+        // Phase 10 slice 10: optional `concurrency:` knob. Default is
+        // Sequential — preserves the slice 9 binary byte-for-byte when
+        // the line is omitted.
+        let mut concurrency: ConcurrencyMode = ConcurrencyMode::Sequential;
 
         while !self.check_kind(&TokenKind::Dedent) && !self.at_eof() {
             if let Some(attr) = self.peek_attribute_name() {
@@ -1102,8 +1106,26 @@ impl Parser {
                     self.expect_kind(TokenKind::Newline)?;
                 }
                 self.expect_kind(TokenKind::Dedent)?;
+            } else if self.check_ident("concurrency") {
+                // Phase 10 slice 10: closed-set concurrency knob. Mirrors
+                // the on_error parser pattern — single ident on the RHS,
+                // unknown values rejected at parse time.
+                self.advance();
+                self.expect_kind(TokenKind::Colon)?;
+                let mode_name = self.expect_ident_any()?;
+                concurrency = match mode_name.as_str() {
+                    "sequential" => ConcurrencyMode::Sequential,
+                    "forked" => ConcurrencyMode::Forked,
+                    other => {
+                        return Err(self.error(&format!(
+                            "unknown concurrency mode '{}' (allowed: sequential, forked)",
+                            other
+                        )));
+                    }
+                };
+                self.expect_kind(TokenKind::Newline)?;
             } else {
-                return Err(self.error("expected attribute, 'listen:', 'handler:', or 'log:' in service"));
+                return Err(self.error("expected attribute, 'listen:', 'handler:', 'log:', or 'concurrency:' in service"));
             }
         }
         self.expect_kind(TokenKind::Dedent)?;
@@ -1118,6 +1140,7 @@ impl Parser {
             handler: handler.ok_or_else(|| self.error("service missing 'handler'"))?,
             log,
             log_on_error,
+            concurrency,
         })
     }
 

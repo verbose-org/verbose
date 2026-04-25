@@ -87,6 +87,34 @@ pub struct Service {
     /// claim to have served the request. Meaningless when `log` is None;
     /// parser fills the default in that case.
     pub log_on_error: ErrorPolicy,
+    /// Phase 10 slice 10: how the accept loop dispatches each connection.
+    /// Defaults to `Sequential` so existing services compile byte-for-byte
+    /// identically — the slice is purely additive. `Forked` makes the
+    /// service `fork()` after each accept and have the child run the
+    /// handler / log / response while the parent immediately closes the
+    /// client fd and loops back to accept; `SIGCHLD` is set to `SIG_IGN`
+    /// once at startup so the kernel auto-reaps the children with no
+    /// per-request bookkeeping. The knob is service-level (not per-rule)
+    /// because concurrency belongs to the wire-facing layer, not the
+    /// pure logic the handler computes.
+    pub concurrency: ConcurrencyMode,
+}
+
+/// Phase 10 slice 10: how a service's accept loop dispatches each
+/// connection. Closed set; new variants (e.g. a worker pool) would land
+/// in their own slice with explicit emitter behaviour.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConcurrencyMode {
+    /// Default. One connection at a time — accept, handle to completion,
+    /// loop back. The shape every Phase 7/8/9 slice was emitted under;
+    /// keeping it as the default means absent-knob services compile to
+    /// byte-for-byte identical binaries.
+    Sequential,
+    /// `fork()` after each accept. Parent closes the client fd and loops
+    /// back to accept; child runs the handler / log / response then
+    /// `sys_exit(0)`. `SIGCHLD` is set to `SIG_IGN` once at startup so
+    /// no `wait`/`waitpid` is needed and no zombies accumulate.
+    Forked,
 }
 
 /// Phase 8 slice 8d: how a service should react when its log effect

@@ -109,11 +109,12 @@ examples/
                    a rule's logic. open(O_RDONLY) + read + close emitted once per rule
                    invocation; on_read_error: abort exits with status 1 on any syscall
                    failure. ~541 B native binary; reads /tmp/verbose_demo_config.txt.
-  static_file_server.* Phase 9 slice 2: HTTP/1.0 service that serves a single static
-                   file. Composes 3e (computed status from req.method) + 8a–8d (audit log
-                   with on_error: abort) + 9.1 (resource declaration) + 9.2 (read inside
-                   handler body). Per-accept open/read/close — operator-editable file,
-                   no recompile, fail-closed on FS error. ~1572 B native binary on port 18901.
+  static_file_server.* Phase 9 slice 2 + Phase 10: HTTP/1.0 static file server.
+                   Composes 3e (computed status) + 8a–8d (audit log, on_error: abort) +
+                   9.1 (resource decl) + 9.2 (read in handler) + 10 (concurrency: forked).
+                   ~1572 B sequential / ~1730 B forked. Forked variant handles parallel
+                   requests via fork-per-accept; SIGCHLD = SIG_IGN so kernel auto-reaps
+                   children — no zombies, no waitpid.
   demo.html        Browser demo (WASM)
 
 tools/
@@ -218,6 +219,7 @@ Tracking what native emits today, what it still rejects, and the design rules th
 | 8 (8d) | Optional `on_error: drop \| abort` line in the log block. Drop is the default (slice 8a behaviour, silent on failure). Abort emits a `test rax, rax; js abort_label` (8 bytes) after each fallible log syscall — open and write — branching to a shared `mov rax, 60; mov rdi, 1; syscall` epilogue (16 bytes) at the end of the binary. Cost: zero when policy is Drop (no checks, no label). Lets the operator opt into fail-closed audit semantics when an Article 12 chain requires that no log persisted means no claim of having served the request. Reaction effects (rules) keep the Drop default; the knob is service-level only. | ~1.2 KB | `audit_strict.verbose::strict_endpoint` (1240 B) |
 | 9 (slice 1) | Top-level `resource <name>` declaration + `read(<name>)` expression. The path is a literal embedded inline (auditor sees every file the binary can open); `max:` bounds a per-resource stack buffer. `emit_record_loop_prologue` walks the rule's logic for `Read` references, allocates `(ptr_slot, len_slot)` + buffer per unique resource, and emits `open(O_RDONLY) → test+js abort → mov r15, rax → read → store len → test+js abort → close` ONCE per rule invocation (before `loop_top`, so per-record loops don't reread). `text_bindings` registers `name → (ptr, len)` so `Expr::Read` reuses the Phase 2I/2F BoundText path through `emit_text_write_to_fd` / `emit_concat_to_buffer`. Failure routes to a per-rule abort label (sys_exit 1). Slice 1 covers `output: text` rules; collection / fold / record / service-handler contexts still reject. | ~540 B | `read_config.verbose::load_config` (541 B) |
 | 9 (slice 2) | `read(<name>)` inside an HTTP service handler body. Same `emit_resource_read_sequence` helper as slice 1, hoisted into the per-accept iteration of `emit_http10_dynamic_bytes` (right after `accept` + the optional `clock_gettime`, before HTTP parse + handler dispatch). `frame_base` grows by `sum(16 + max_padded)` per resource, the read buffer + parser scratch shift below. Resource (ptr, len) registered in a local `text_bindings` threaded through `emit_handler_to_slots`; the body field accepts `Expr::Read(name)` directly (loads (ptr, len) into `[rbp-32]/[rbp-40]`) AND inside `concat(...)` via the existing BoundText classifier path. Per-accept, not per-binary-lifetime: the operator can edit the file and the next request sees the new content. Failure shares the slice 8d abort label. Composes with 3e status, 8b/8c log fields, 8d on_error. | ~1.5–1.6 KB | `static_file_server.verbose::static_server` (1572 B) |
+| 10 | Service-level `concurrency: forked` opt-in. Default `Sequential` keeps every prior service binary byte-for-byte identical (purely additive slice). When `Forked`: a one-shot `rt_sigaction(SIGCHLD, SIG_IGN, NULL, 8)` (kernel-ABI 32-byte struct inlined via jmp-over-data) runs before the `listen` syscall — kernel auto-reaps children, no `wait`/`waitpid`, no zombies, zero per-request bookkeeping. Then after each `accept` saves client_fd: `mov rax, 57; syscall` (fork), `test rax, rax`, `js fork_error` (write `"fork failed\n"` to stderr + close client_fd + jmp accept_top), `jz child` (fall through to existing iteration body), parent path closes client_fd + `jmp accept_top`. The iteration body is shared — child falls through; parent skips. At the iteration tail, a `match service.concurrency` swaps the existing `lea rsp + jmp accept_top` for `mov rax, 60; mov rdi, 0; syscall` so the child exits 0 instead of looping. r12 (server fd) survives across fork by kernel guarantee; r15 (resource fd from slice 9.2) is allocated in the child after fork, so no parent/child conflict. Restricted to `Protocol::Http10` (verifier rejects forked raw_tcp). | +~160 B | `static_file_server.verbose` with `concurrency: forked` (1730 B) |
 
 *Locked designs for each phase (3, 4, 5b, 2F, 2G, 2H-b) are in [docs/native-designs.md](docs/native-designs.md). They're frozen after implementation — consult them for rationale, not for the current state.*
 
@@ -303,7 +305,7 @@ printf "3 auth\n1 web\n" | /tmp/alert                                           
 cargo run -- examples/invoices.verbose --wasm /tmp/rule.wasm --run important_invoice # WASM
 cargo run -- examples/invoices.verbose --benchmark --run important_invoice          # compare all backends
 cargo run -- --demo-http /tmp/server                                                 # HTTP server — tier-3 emitter probe, NOT in .verbose (see docs/known-gaps.md)
-cargo test                                                                          # 210 tests
+cargo test                                                                          # 212 tests
 make demo                                                                           # full demo
 ```
 

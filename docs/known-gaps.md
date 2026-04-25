@@ -123,6 +123,17 @@ streaming rule reading the same resource for every record reads the
 file once, not N times. Worked example: `examples/read_config.verbose`
 (541-byte binary).
 
+**Phase 10 (2026-04-25):** opt-in `concurrency: forked` on services.
+The Apache mpm_prefork shape via `fork()` after each `accept`. Parent
+closes the client fd and loops; child runs the handler / log /
+response then `sys_exit(0)`. `rt_sigaction(SIGCHLD, SIG_IGN)` once at
+startup makes the kernel auto-reap children — no `wait`/`waitpid`,
+no zombies. Default stays `Sequential` so existing services compile
+byte-for-byte identical (additive slice). Restricted to HTTP/1.0
+today (raw_tcp + fork combination is a later slice). Worked example:
+`static_file_server.verbose` with `concurrency: forked` ships at
+1730 bytes — +158 over the sequential variant.
+
 **Slice 2 (2026-04-25):** `read(<name>)` now works inside HTTP
 service handlers. The handler body can be `body: read(page)` directly
 or via `concat(...)` containing a read. The open/read/close sequence
