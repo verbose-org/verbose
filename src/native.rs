@@ -127,6 +127,13 @@ fn compile_native_code(
     // (Extracted from compile_native — same dispatch logic.)
     let concepts: Vec<&Concept> = program.items.iter().filter_map(|i| match i { Item::Concept(c) => Some(c), _ => None }).collect();
     let rules: HashMap<&str, &Rule> = program.items.iter().filter_map(|i| match i { Item::Rule(r) => Some((r.name.as_str(), r)), _ => None }).collect();
+    // Phase 9 slice 1: index every top-level `resource` block by name. The
+    // emitter walks the rule's logic to discover which entries it actually
+    // reads; entries the rule never references contribute zero bytes.
+    let resources: HashMap<&str, &Resource> = program.items.iter().filter_map(|i| match i {
+        Item::Resource(r) => Some((r.name.as_str(), r)),
+        _ => None,
+    }).collect();
     let reaction = program.items.iter().find_map(|i| match i { Item::Reaction(rx) if rx.name == rule_name => Some(rx), _ => None });
 
     let (rule, concept) = if let Some(rx) = reaction {
@@ -186,9 +193,9 @@ fn compile_native_code(
     let record_output_concept: Option<&Concept> = match &rule.output_ty { Type::Named(n) => concepts.iter().find(|c| c.name == *n).copied(), _ => None };
 
     let mut code = if let Some(rx) = reaction {
-        emit_reaction_program(rx, rule, concept, &rules)?
+        emit_reaction_program(rx, rule, concept, &rules, &resources)?
     } else if is_result_output {
-        emit_result_program(rule, concept, &rules)?
+        emit_result_program(rule, concept, &rules, &resources)?
     } else if is_collection_output {
         emit_collection_program(rule, concept, &concepts, &rules)?
     } else if is_fold_number_output {
@@ -204,18 +211,18 @@ fn compile_native_code(
     } else if is_fold_text_output {
         emit_text_fold_program(rule, concept, &concepts, &rules)?
     } else if matches!(&rule.output_ty, Type::Text) {
-        emit_text_program(rule, concept, &rules)?
+        emit_text_program(rule, concept, &rules, &resources)?
     } else if let Some(rec_concept) = record_output_concept {
-        emit_record_program(rule, rec_concept, concept, &concepts, &rules)?
+        emit_record_program(rule, rec_concept, concept, &concepts, &rules, &resources)?
     } else if matches!(&rule.output_ty, Type::Number | Type::Bool) && contains_quantifier(&rule.logic.value) {
         // Phase 6: scalar output with embedded quantifiers (e.g. if all(...) then X else Y).
         emit_multi_fold_program(rule, concept, &concepts, &rules)?
     } else if is_vectorizable && concept.fields.len() == 1 {
-        if let Some(threshold) = extract_simple_gt(rule) { emit_vectorized_program(threshold)? } else { emit_full_program(rule, concept, context_concept, &rules)? }
+        if let Some(threshold) = extract_simple_gt(rule) { emit_vectorized_program(threshold)? } else { emit_full_program(rule, concept, context_concept, &rules, &resources)? }
     } else if is_parallel {
         emit_parallel_program(rule, concept, &rules)?
     } else {
-        emit_full_program(rule, concept, context_concept, &rules)?
+        emit_full_program(rule, concept, context_concept, &rules, &resources)?
     };
 
     if stream {
@@ -370,6 +377,12 @@ struct RecordLoopCtx<'a> {
     /// Bool rules set this to 1 on false; Result rules set it on Err.
     /// The epilogue loads this into rdi for sys_exit.
     exit_flag_slot: i32,
+    /// Phase 9 slice 1: js patch sites left by the resource open/read
+    /// sequences emitted before the loop top. The epilogue resolves them
+    /// to a shared abort label (sys_exit(1)) emitted after the normal
+    /// exit syscall, when the vector is non-empty. Empty (and zero cost)
+    /// for rules that do not reference any resource.
+    resource_abort_patches: Vec<usize>,
 }
 
 /// Emit an argc guard: if r12 (argc) < min_argc, write an error message
@@ -447,12 +460,222 @@ fn let_rhs_is_text(
     }
 }
 
+/// Phase 9 slice 1 — walk an expression tree collecting every `Read(name)`
+/// reference, de-duplicated, in source order. The native prologue iterates
+/// this list once per rule invocation to emit the open/read/close sequence
+/// for every referenced resource. Mirrors `verifier::collect_read_names`
+/// exactly so the two stay in sync if Expr grows new variants.
+fn collect_read_names_native(expr: &Expr, out: &mut Vec<String>) {
+    match expr {
+        Expr::Read(name) => {
+            if !out.iter().any(|n| n == name) {
+                out.push(name.clone());
+            }
+        }
+        Expr::Number(_) | Expr::Text(_) | Expr::Ident(_) => {}
+        Expr::Field(base, _) => collect_read_names_native(base, out),
+        Expr::Binary(_, l, r) => {
+            collect_read_names_native(l, out);
+            collect_read_names_native(r, out);
+        }
+        Expr::Not(i) | Expr::Neg(i) | Expr::Ok(i) | Expr::Err(i) => {
+            collect_read_names_native(i, out)
+        }
+        Expr::If(c, t, e) => {
+            collect_read_names_native(c, out);
+            collect_read_names_native(t, out);
+            collect_read_names_native(e, out);
+        }
+        Expr::Call(_, args) | Expr::Concat(args) => {
+            for a in args {
+                collect_read_names_native(a, out);
+            }
+        }
+        Expr::Quantifier(_, c, _, body) => {
+            collect_read_names_native(c, out);
+            collect_read_names_native(body, out);
+        }
+        Expr::Fold(c, init, _, _, body) => {
+            collect_read_names_native(c, out);
+            collect_read_names_native(init, out);
+            collect_read_names_native(body, out);
+        }
+        Expr::Map(c, _, body) | Expr::Filter(c, _, body) => {
+            collect_read_names_native(c, out);
+            collect_read_names_native(body, out);
+        }
+        Expr::MatchResult(t, _, ok, _, err) => {
+            collect_read_names_native(t, out);
+            collect_read_names_native(ok, out);
+            collect_read_names_native(err, out);
+        }
+        Expr::Record(_, fields) => {
+            for (_, e) in fields {
+                collect_read_names_native(e, out);
+            }
+        }
+    }
+}
+
+/// Walk a rule's logic — both let-binding RHS expressions and the value
+/// — and return every distinct resource name referenced via `read(...)`,
+/// in source order. Empty for rules that do not touch any resource.
+fn collect_rule_read_names(rule: &Rule) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    for (_, expr) in &rule.logic.bindings {
+        collect_read_names_native(expr, &mut names);
+    }
+    collect_read_names_native(&rule.logic.value, &mut names);
+    names
+}
+
+/// Phase 9 slice 1 — emit `open(path, O_RDONLY, 0); read(fd, buf, max);
+/// close(fd)` once per resource the rule reads. The path is the literal
+/// declared on the resource. The buffer is reserved on the stack (size =
+/// max_bytes padded to 8) and lives until the per-rule frame is freed.
+///
+/// Slot layout (relative to rbp, after caller has consumed up to
+/// `*next_slot`):
+///   [rbp + ptr_slot]    = pointer to the start of the read buffer
+///   [rbp + len_slot]    = bytes read (0..=max_bytes)
+///   [rbp + buf_slot]    = first byte of the read buffer
+///   [rbp + buf_slot - (buf_padded - 8)]  = last byte of the read buffer
+///
+/// On open() or read() failure (sign-bit set on rax — Linux returns
+/// -errno), control falls through to `js rel32` placeholders pushed into
+/// `abort_patches`; the epilogue patches them to a shared sys_exit(1)
+/// label emitted after the success exit syscall.
+///
+/// Returns `(ptr_slot, len_slot, buf_slot)` and the new `next_slot` (one
+/// past the last used slot, suitable for further allocation by callers
+/// that want to chain more reservations).
+///
+/// Registers used: rax (syscall return), rdi/rsi/rdx (syscall args), r15
+/// (saved fd between read and close — same role as in the reaction
+/// emitter). r12, r13, r14, rbp preserved.
+fn emit_resource_read_sequence(
+    code: &mut Vec<u8>,
+    resource: &Resource,
+    next_slot: i32,
+    abort_patches: &mut Vec<usize>,
+) -> (i32, i32, i32, i32) {
+    // Slot layout (rbp-relative, going from higher to lower addresses):
+    //   [rbp + ptr_slot, ptr_slot+7]   — buffer base pointer (8 bytes)
+    //   [rbp + len_slot, len_slot+7]   — bytes read so far (8 bytes)
+    //   [rbp + buf_slot, buf_slot+pad-1] — read buffer (max_bytes padded to 8)
+    //   [rbp + new_next, new_next+7]   — next caller-allocatable 8-byte slot
+    //
+    // Placing the buffer BELOW the (ptr, len) pair keeps the indexing
+    // monotonically descending — the next resource read or any other
+    // bottom-of-frame allocator just continues from `new_next` without
+    // ever stepping over the buffer's range.
+    let ptr_slot = next_slot;
+    let len_slot = next_slot - 8;
+    let buf_padded = ((resource.max_bytes as i32) + 7) & !7;
+    let buf_slot = len_slot - buf_padded;
+    let new_next = buf_slot - 8;
+    // === open(path, O_RDONLY=0, 0) ===
+    let path_bytes = resource.path.as_bytes();
+    let path_with_nul_len = path_bytes.len() + 1;
+    if path_with_nul_len <= 127 {
+        code.push(0xEB);
+        code.push(path_with_nul_len as u8);
+    } else {
+        code.push(0xE9);
+        code.extend_from_slice(&(path_with_nul_len as i32).to_le_bytes());
+    }
+    let path_addr = code.len();
+    code.extend_from_slice(path_bytes);
+    code.push(0);
+    // mov rax, 2 (sys_open)
+    code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x02, 0x00, 0x00, 0x00]);
+    // lea rdi, [rip + rel32] → path
+    let end = code.len() + 7;
+    let rel32 = path_addr as i32 - end as i32;
+    code.extend_from_slice(&[0x48, 0x8D, 0x3D]);
+    code.extend_from_slice(&rel32.to_le_bytes());
+    // mov rsi, 0 (O_RDONLY)
+    code.extend_from_slice(&[0x48, 0xC7, 0xC6, 0x00, 0x00, 0x00, 0x00]);
+    // mov rdx, 0 (mode unused for O_RDONLY)
+    code.extend_from_slice(&[0x48, 0xC7, 0xC2, 0x00, 0x00, 0x00, 0x00]);
+    // syscall
+    code.extend_from_slice(&[0x0F, 0x05]);
+    // test rax, rax ; js rel32 (abort patch)
+    code.extend_from_slice(&[0x48, 0x85, 0xC0]);
+    code.extend_from_slice(&[0x0F, 0x88]);
+    abort_patches.push(code.len());
+    code.extend_from_slice(&[0, 0, 0, 0]);
+    // mov r15, rax  — save fd across the read
+    code.extend_from_slice(&[0x49, 0x89, 0xC7]);
+
+    // === read(r15, buf, max_bytes) ===
+    // mov rax, 0 (sys_read)
+    code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x00, 0x00, 0x00, 0x00]);
+    // mov rdi, r15
+    code.extend_from_slice(&[0x4C, 0x89, 0xFF]);
+    // lea rsi, [rbp + buf_slot]
+    if buf_slot >= -128 {
+        code.extend_from_slice(&[0x48, 0x8D, 0x75]);
+        code.push(buf_slot as u8);
+    } else {
+        code.extend_from_slice(&[0x48, 0x8D, 0xB5]);
+        code.extend_from_slice(&buf_slot.to_le_bytes());
+    }
+    // mov rdx, max_bytes (32-bit immediate is fine — verifier caps at 64 MiB)
+    code.extend_from_slice(&[0x48, 0xC7, 0xC2]);
+    code.extend_from_slice(&(resource.max_bytes as i32).to_le_bytes());
+    // syscall
+    code.extend_from_slice(&[0x0F, 0x05]);
+    // test rax, rax ; js rel32 (abort patch)
+    code.extend_from_slice(&[0x48, 0x85, 0xC0]);
+    code.extend_from_slice(&[0x0F, 0x88]);
+    abort_patches.push(code.len());
+    code.extend_from_slice(&[0, 0, 0, 0]);
+
+    // Store len: mov [rbp + len_slot], rax
+    if len_slot >= -128 {
+        code.extend_from_slice(&[0x48, 0x89, 0x45]);
+        code.push(len_slot as u8);
+    } else {
+        code.extend_from_slice(&[0x48, 0x89, 0x85]);
+        code.extend_from_slice(&len_slot.to_le_bytes());
+    }
+    // Store ptr: lea rax, [rbp + buf_slot] ; mov [rbp + ptr_slot], rax
+    if buf_slot >= -128 {
+        code.extend_from_slice(&[0x48, 0x8D, 0x45]);
+        code.push(buf_slot as u8);
+    } else {
+        code.extend_from_slice(&[0x48, 0x8D, 0x85]);
+        code.extend_from_slice(&buf_slot.to_le_bytes());
+    }
+    if ptr_slot >= -128 {
+        code.extend_from_slice(&[0x48, 0x89, 0x45]);
+        code.push(ptr_slot as u8);
+    } else {
+        code.extend_from_slice(&[0x48, 0x89, 0x85]);
+        code.extend_from_slice(&ptr_slot.to_le_bytes());
+    }
+
+    // === close(r15) — failure here is intentionally ignored. close() ===
+    // returns -errno on failure (e.g. EINTR), but the data already lives in
+    // the buffer and a leaked fd is harmless for a one-shot rule binary.
+    // mov rax, 3 (sys_close)
+    code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x03, 0x00, 0x00, 0x00]);
+    // mov rdi, r15
+    code.extend_from_slice(&[0x4C, 0x89, 0xFF]);
+    // syscall
+    code.extend_from_slice(&[0x0F, 0x05]);
+
+    (ptr_slot, len_slot, buf_slot, new_next)
+}
+
 fn emit_record_loop_prologue<'a>(
     code: &mut Vec<u8>,
     rule: &'a Rule,
     input_concept: &'a Concept,
     context_concept: Option<&'a Concept>,
     all_rules: &HashMap<&str, &Rule>,
+    all_resources: &HashMap<&str, &'a Resource>,
 ) -> Result<RecordLoopCtx<'a>, NativeError> {
     let n_ctx = context_concept.map_or(0, |c| c.fields.len());
     let nfields = input_concept.fields.len();
@@ -482,8 +705,31 @@ fn emit_record_loop_prologue<'a>(
     //   base + 4: err_frame_save_slot (Phase 2F rsp saved before callee Err concat)
     //   base + 5: exit_flag_slot      (exit code: 0=success, 1=failure)
     let n_reserved = 5;
+    // Phase 9 slice 1: enumerate the resources the rule reads, in source
+    // order. Each contributes 2 slots (ptr, len) plus a max_bytes buffer
+    // padded to 8 bytes. Resources unknown at the program level become a
+    // hard error here — the verifier already validates names, so reaching
+    // an undeclared one means the dispatch was called with a stale rule.
+    let referenced_resources: Vec<&Resource> = {
+        let names = collect_rule_read_names(rule);
+        let mut out: Vec<&Resource> = Vec::with_capacity(names.len());
+        for name in &names {
+            let r = all_resources.get(name.as_str()).ok_or_else(|| NativeError {
+                message: format!(
+                    "rule '{}' reads resource '{}' but no top-level `resource {}` was declared",
+                    rule.name, name, name
+                ),
+            })?;
+            out.push(*r);
+        }
+        out
+    };
+    let resource_extra_bytes: i32 = referenced_resources
+        .iter()
+        .map(|r| 16 + (((r.max_bytes as i32) + 7) & !7))
+        .sum();
     let frame_slots = n_ctx + nfields + n_binding_slots + n_reserved;
-    let frame_size = (frame_slots * 8) as i32;
+    let frame_size = (frame_slots * 8) as i32 + resource_extra_bytes;
     let base = (n_ctx + nfields + n_binding_slots) as i32;
     let match_slot: i32 = -((base + 1) * 8);
     let err_ptr_slot: i32 = -((base + 2) * 8);
@@ -534,6 +780,26 @@ fn emit_record_loop_prologue<'a>(
             code.extend_from_slice(&[0x49, 0xFF, 0xC6]);
             ctx_offsets.insert(f.name.as_str(), offset);
         }
+    }
+
+    // ─── Phase 9 slice 1: read every referenced resource ONCE before the
+    // record loop. The buffer + (ptr, len) pair live below the n_reserved
+    // slots; both stay valid for the whole rule invocation (the buffer
+    // outlives the record loop because it lives within the per-rule frame
+    // freed by `mov rsp, rbp; pop rbp` in the epilogue). open/read failure
+    // patches into the shared abort label emitted by emit_record_loop_epilogue.
+    let mut text_bindings: TextBindings<'a> = HashMap::new();
+    let mut resource_abort_patches: Vec<usize> = Vec::new();
+    let mut resource_next_slot: i32 = -((base + n_reserved as i32 + 1) * 8);
+    for r in &referenced_resources {
+        let (ptr_slot, len_slot, _buf_slot, new_next) = emit_resource_read_sequence(
+            code,
+            r,
+            resource_next_slot,
+            &mut resource_abort_patches,
+        );
+        text_bindings.insert(r.name.as_str(), (ptr_slot, len_slot));
+        resource_next_slot = new_next;
     }
 
     let loop_top = code.len();
@@ -602,7 +868,10 @@ fn emit_record_loop_prologue<'a>(
         binding_offsets.insert(k, *v);
     }
     let field_ranges = build_field_ranges(input_concept);
-    let mut text_bindings: TextBindings<'a> = HashMap::new();
+    // Phase 9 slice 1: text_bindings already contains the resource entries
+    // populated above the loop_top. Let bindings continue to populate it
+    // in source order; the namespaces don't collide (verifier rejects a
+    // let with the same name as a resource at the resource-name check).
     let mut next_slot = -(((n_ctx + nfields) as i32 + 1) * 8);
     for (idx, (name, expr)) in rule.logic.bindings.iter().enumerate() {
         if binding_is_text[idx] {
@@ -665,6 +934,7 @@ fn emit_record_loop_prologue<'a>(
         err_len_slot,
         err_frame_save_slot,
         exit_flag_slot,
+        resource_abort_patches,
     })
 }
 
@@ -688,6 +958,22 @@ fn emit_record_loop_epilogue(code: &mut Vec<u8>, ctx: &RecordLoopCtx<'_>) {
     // mov rax, 60 (sys_exit) ; syscall
     code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x3C, 0x00, 0x00, 0x00]);
     code.extend_from_slice(&[0x0F, 0x05]);
+
+    // Phase 9 slice 1: shared abort label for resource open/read failures.
+    // The slice 8d service abort path stays separate; this one only fires
+    // for rule-level resource I/O failures and only exists when at least
+    // one resource read was emitted, so non-resource rules pay zero bytes.
+    if !ctx.resource_abort_patches.is_empty() {
+        let abort_label = code.len();
+        for site in &ctx.resource_abort_patches {
+            let rel = abort_label as i32 - (*site as i32 + 4);
+            code[*site..*site + 4].copy_from_slice(&rel.to_le_bytes());
+        }
+        // mov rax, 60 ; mov rdi, 1 ; syscall — mirror slice 8d's sequence.
+        code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x3C, 0x00, 0x00, 0x00]);
+        code.extend_from_slice(&[0x48, 0xC7, 0xC7, 0x01, 0x00, 0x00, 0x00]);
+        code.extend_from_slice(&[0x0F, 0x05]);
+    }
 }
 
 fn emit_full_program(
@@ -695,10 +981,11 @@ fn emit_full_program(
     concept: &Concept,
     context_concept: Option<&Concept>,
     all_rules: &HashMap<&str, &Rule>,
+    all_resources: &HashMap<&str, &Resource>,
 ) -> Result<Vec<u8>, NativeError> {
     let is_bool = rule.output_ty == Type::Bool;
     let mut code = Vec::new();
-    let ctx = emit_record_loop_prologue(&mut code, rule, concept, context_concept, all_rules)?;
+    let ctx = emit_record_loop_prologue(&mut code, rule, concept, context_concept, all_rules, all_resources)?;
 
     // Evaluate final expression — result in rax
     emit_eval_expr(
@@ -758,9 +1045,10 @@ fn emit_text_program(
     rule: &Rule,
     concept: &Concept,
     all_rules: &HashMap<&str, &Rule>,
+    all_resources: &HashMap<&str, &Resource>,
 ) -> Result<Vec<u8>, NativeError> {
     let mut code = Vec::new();
-    let ctx = emit_record_loop_prologue(&mut code, rule, concept, None, all_rules)?;
+    let ctx = emit_record_loop_prologue(&mut code, rule, concept, None, all_rules, all_resources)?;
 
     // Phase 2I — pass the text_bindings built from the prologue's let-eval
     // loop so text-write resolves Ident(let-name) as a BoundText (same path
@@ -826,6 +1114,14 @@ fn classify_concat_arg(
         Expr::Text(_) => Some(ConcatArgKind::Text),
         Expr::Number(_) | Expr::Neg(_) => Some(ConcatArgKind::Number),
         Expr::Ident(name) if text_bindings.contains_key(name.as_str()) => {
+            Some(ConcatArgKind::BoundText)
+        }
+        // Phase 9 slice 1: read(<resource>) is wired into the same
+        // BoundText path. The prologue stores (ptr, len) at fixed rbp
+        // slots and registers the resource name in text_bindings, so
+        // emit_concat_fill can resolve it through the same machinery
+        // serving Phase 2F's err_var and Phase 2I's text lets.
+        Expr::Read(name) if text_bindings.contains_key(name.as_str()) => {
             Some(ConcatArgKind::BoundText)
         }
         Expr::Call(_, _) => Some(ConcatArgKind::CallText),
@@ -1395,6 +1691,21 @@ fn emit_text_produce_ptrlen(
             }
             Ok(())
         }
+        // Phase 9 slice 1: read(<resource>) — the prologue already filled
+        // (ptr, len) at the registered slots. Identical shape to the
+        // text-let / err-var case above.
+        Expr::Read(name) if text_bindings.contains_key(name.as_str()) => {
+            let (ptr_slot, len_slot) = text_bindings[name.as_str()];
+            load_rax_from_rbp(code, ptr_slot);
+            if len_slot >= -128 {
+                code.extend_from_slice(&[0x48, 0x8B, 0x55]);
+                code.push(len_slot as u8);
+            } else {
+                code.extend_from_slice(&[0x48, 0x8B, 0x95]);
+                code.extend_from_slice(&len_slot.to_le_bytes());
+            }
+            Ok(())
+        }
         Expr::Concat(inner_args) => {
             // Recurse into a nested concat. is_nested=true so the inner
             // skips `mov r9, rsp` (outer's r9 survives) and rejects CallText
@@ -1482,9 +1793,15 @@ fn emit_concat_fill(
             ConcatArgKind::BoundText => {
                 // Copy the bound (ptr, len) contents to the buffer.
                 // No strlen needed at fill time — length is already stored.
-                if let Expr::Ident(name) = arg {
+                // Phase 9 slice 1 routes Expr::Read here too — same shape,
+                // identical (ptr, len) representation in text_bindings.
+                let bound_name = match arg {
+                    Expr::Ident(n) | Expr::Read(n) => Some(n.as_str()),
+                    _ => None,
+                };
+                if let Some(name) = bound_name {
                     let (ptr_slot, len_slot) = *text_bindings
-                        .get(name.as_str())
+                        .get(name)
                         .expect("classified as BoundText so present in bindings");
                     // mov rsi, [rbp + ptr_slot]
                     if ptr_slot >= -128 {
@@ -2015,8 +2332,14 @@ fn emit_text_write_to_fd(
 ) -> Result<(), NativeError> {
     // Phase 2F: bound text var — (ptr, len) already in two rbp slots.
     // Write them directly to the fd; no strlen (length is stored).
-    if let Expr::Ident(name) = text_expr {
-        if let Some(&(ptr_slot, len_slot)) = text_bindings.get(name.as_str()) {
+    // Phase 9 slice 1 extends this: Expr::Read shares the exact same
+    // (ptr, len) slot shape, so funnel both through the same code path.
+    let bound_name = match text_expr {
+        Expr::Ident(n) | Expr::Read(n) => Some(n.as_str()),
+        _ => None,
+    };
+    if let Some(name) = bound_name {
+        if let Some(&(ptr_slot, len_slot)) = text_bindings.get(name) {
             // mov rsi, [rbp + ptr_slot]
             if ptr_slot >= -128 {
                 code.extend_from_slice(&[0x48, 0x8B, 0x75]);
@@ -2288,6 +2611,7 @@ fn emit_result_program(
     rule: &Rule,
     concept: &Concept,
     all_rules: &HashMap<&str, &Rule>,
+    all_resources: &HashMap<&str, &Resource>,
 ) -> Result<Vec<u8>, NativeError> {
     // Restrict to Result(number, text) for now — the calling convention is
     // different for other Result shapes (e.g. text payload on Ok) and they
@@ -2310,7 +2634,7 @@ fn emit_result_program(
     }
 
     let mut code = Vec::new();
-    let ctx = emit_record_loop_prologue(&mut code, rule, concept, None, all_rules)?;
+    let ctx = emit_record_loop_prologue(&mut code, rule, concept, None, all_rules, all_resources)?;
 
     // Evaluate the logic in Result context. Every Ok/Err leaf self-terminates
     // with a jmp loop_top, so there is no fall-through to handle here.
@@ -2854,6 +3178,7 @@ fn emit_record_program(
     input_concept: &Concept,
     all_concepts: &[&Concept],
     all_rules: &HashMap<&str, &Rule>,
+    all_resources: &HashMap<&str, &Resource>,
 ) -> Result<Vec<u8>, NativeError> {
     // Validate output concept's fields — native today handles number + text only.
     for f in &output_concept.fields {
@@ -2871,7 +3196,7 @@ fn emit_record_program(
     }
 
     let mut code = Vec::new();
-    let ctx = emit_record_loop_prologue(&mut code, rule, input_concept, None, all_rules)?;
+    let ctx = emit_record_loop_prologue(&mut code, rule, input_concept, None, all_rules, all_resources)?;
 
     emit_eval_record_expr(
         &mut code,
@@ -4652,11 +4977,12 @@ fn emit_reaction_program(
     trigger_rule: &Rule,
     concept: &Concept,
     all_rules: &HashMap<&str, &Rule>,
+    all_resources: &HashMap<&str, &Resource>,
 ) -> Result<Vec<u8>, NativeError> {
     // Both Print and AppendFile effects are handled below.
 
     let mut code = Vec::new();
-    let ctx = emit_record_loop_prologue(&mut code, trigger_rule, concept, None, all_rules)?;
+    let ctx = emit_record_loop_prologue(&mut code, trigger_rule, concept, None, all_rules, all_resources)?;
 
     // Evaluate trigger rule's logic → rax (0 = no fire, nonzero = fire).
     emit_eval_expr(
@@ -4790,6 +5116,9 @@ fn max_stack_depth(expr: &Expr) -> usize {
         }
         Expr::Record(_, fields) => fields.iter().map(|(_, e)| max_stack_depth(e)).max().unwrap_or(0),
         Expr::Concat(args) => args.iter().map(max_stack_depth).max().unwrap_or(0),
+        // Phase 9 slice 1 stub: a Read leaf has no eval-stack consumption
+        // (the result lands in registers/slots like any other text).
+        Expr::Read(_) => 0,
     }
 }
 
@@ -5261,6 +5590,12 @@ fn emit_eval_expr(
                 })
             }
         }
+        // Phase 9 slice 1 stub: read() returns text and is only meaningful in
+        // a text-typed context. Reaching this number-context emitter means
+        // someone tried to use it where a number was expected.
+        Expr::Read(_) => Err(NativeError {
+            message: "Expr::Read in number context — read() returns text, use it in a text-typed position".into(),
+        }),
     }
 }
 
@@ -6915,6 +7250,7 @@ fn expr_kind(e: &Expr) -> &'static str {
         Expr::MatchResult(_, _, _, _, _) => "MatchResult",
         Expr::Record(_, _) => "Record",
         Expr::Concat(_) => "Concat",
+        Expr::Read(_) => "Read",
     }
 }
 
@@ -9482,5 +9818,165 @@ mod tests {
 
         let _ = fs::remove_file(svc_out);
         let _ = fs::remove_file(probe_out);
+    }
+
+    /// Phase 9 slice 1: a rule whose logic is `read(<resource>)` must
+    /// embed the open + read + close syscalls for the declared path,
+    /// plus the shared sys_exit(1) abort sequence at the binary's tail
+    /// (mirrors slice 8d's pattern; only present when the rule actually
+    /// reads at least one resource).
+    #[test]
+    fn phase9_slice1_resource_read_embeds_syscalls_and_abort() {
+        let src = r#"@verbose 0.1.0
+
+resource greeting
+  @intention: "fixed welcome banner"
+  @source: invoices.intent:1
+  path: "/tmp/verbosec_test_phase9_banner.txt"
+  max: 64
+
+concept Tick
+  @intention: "trivial input record"
+  @source: invoices.intent:1
+  fields:
+    n : number
+
+rule banner
+  @intention: "echo the banner"
+  @source: invoices.intent:1
+  input:
+    t : Tick
+  output:
+    out : text
+  logic:
+    out = read(greeting)
+  proofs:
+    purity:
+      reads: [greeting]
+      calls: []
+    termination:
+      bound: 1
+"#;
+        let tokens = crate::lexer::Lexer::new(src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens)
+            .parse_program()
+            .expect("parse");
+
+        let out = std::env::temp_dir().join("verbosec_test_phase9_banner_bin");
+        compile_native(&program, "banner", out.to_str().unwrap(), false, false)
+            .expect("native compile of resource-reading rule");
+
+        let bytes = std::fs::read(&out).expect("read output binary");
+        let size = bytes.len();
+        assert!(
+            (500..1500).contains(&size),
+            "phase 9 slice 1 binary size {} outside [500, 1500] envelope",
+            size
+        );
+
+        // Path bytes (NUL-terminated) embedded at the open site.
+        let path_marker = b"/tmp/verbosec_test_phase9_banner.txt\0";
+        assert!(
+            bytes.windows(path_marker.len()).any(|w| w == path_marker),
+            "expected resource path + NUL not found in binary"
+        );
+
+        // sys_open immediate: mov rax, 2 — encoded 48 C7 C0 02 00 00 00.
+        let open_seq = [0x48, 0xC7, 0xC0, 0x02, 0x00, 0x00, 0x00];
+        assert!(
+            bytes.windows(open_seq.len()).any(|w| w == open_seq),
+            "expected `mov rax, 2` (sys_open) for resource open"
+        );
+        // sys_read immediate: mov rax, 0 — encoded 48 C7 C0 00 00 00 00.
+        let read_seq = [0x48, 0xC7, 0xC0, 0x00, 0x00, 0x00, 0x00];
+        assert!(
+            bytes.windows(read_seq.len()).any(|w| w == read_seq),
+            "expected `mov rax, 0` (sys_read) for resource read"
+        );
+        // Shared abort label: mov rax, 60 ; mov rdi, 1 ; syscall.
+        let abort_seq = [
+            0x48, 0xC7, 0xC0, 0x3C, 0x00, 0x00, 0x00,
+            0x48, 0xC7, 0xC7, 0x01, 0x00, 0x00, 0x00,
+            0x0F, 0x05,
+        ];
+        assert!(
+            bytes.windows(abort_seq.len()).any(|w| w == abort_seq),
+            "expected sys_exit(1) abort sequence in resource-reading binary"
+        );
+
+        let _ = std::fs::remove_file(out);
+    }
+
+    /// Phase 9 slice 1: the binary actually reads the declared file at
+    /// runtime and writes its contents to stdout. We pre-populate the
+    /// path with a known string, run the binary against a one-record
+    /// argv, and assert stdout matches the file contents byte-for-byte.
+    #[test]
+    fn phase9_slice1_resource_read_runs_and_emits_file_contents() {
+        use std::process::Command;
+        let path = std::env::temp_dir().join("verbosec_test_phase9_runtime_input.txt");
+        let path_str = path.to_str().unwrap().to_string();
+        let payload = b"hello-from-resource";
+        std::fs::write(&path, payload).expect("seed resource file");
+
+        let src = format!(
+            r#"@verbose 0.1.0
+
+resource msg
+  @intention: "runtime-supplied banner"
+  @source: invoices.intent:1
+  path: "{}"
+  max: 256
+
+concept Tick
+  @intention: "trivial input record"
+  @source: invoices.intent:1
+  fields:
+    n : number
+
+rule echo_banner
+  @intention: "emit the banner"
+  @source: invoices.intent:1
+  input:
+    t : Tick
+  output:
+    out : text
+  logic:
+    out = read(msg)
+  proofs:
+    purity:
+      reads: [msg]
+      calls: []
+    termination:
+      bound: 1
+"#,
+            path_str
+        );
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens)
+            .parse_program()
+            .expect("parse");
+
+        let out = std::env::temp_dir().join("verbosec_test_phase9_runtime_bin");
+        compile_native(&program, "echo_banner", out.to_str().unwrap(), false, false)
+            .expect("native compile of runtime resource-reading rule");
+
+        let result = Command::new(&out)
+            .arg("1")
+            .output()
+            .expect("run resource-reading binary");
+        assert!(result.status.success(), "binary exited with non-zero: {:?}", result);
+        // emit_text_program writes the resource bytes followed by a newline.
+        // Compare against payload + "\n".
+        let mut expected = payload.to_vec();
+        expected.push(b'\n');
+        assert_eq!(
+            result.stdout, expected,
+            "stdout did not match resource contents: stdout={:?}, stderr={:?}",
+            result.stdout, result.stderr
+        );
+
+        let _ = std::fs::remove_file(out);
+        let _ = std::fs::remove_file(path);
     }
 }

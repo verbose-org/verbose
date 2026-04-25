@@ -75,10 +75,47 @@ pub fn verify_program(program: &Program, base_dir: &StdPath) -> Vec<VerifyError>
         })
         .collect();
 
+    // Phase 9 slice 1: collect declared resource names for cross-checking
+    // every `read(name)` reference. Duplicate resource names also rejected
+    // here (resource namespace is global at the program level).
+    let mut all_resources: HashSet<String> = HashSet::new();
+    for item in &program.items {
+        if let Item::Resource(r) = item {
+            if !all_resources.insert(r.name.clone()) {
+                errors.push(VerifyError {
+                    context: format!("resource '{}'", r.name),
+                    message: format!("duplicate resource name '{}'", r.name),
+                });
+            }
+        }
+    }
+
     for item in &program.items {
         match item {
             Item::Concept(c) => verify_concept(c, base_dir, &mut errors),
-            Item::Rule(r) => verify_rule(r, &concepts, &all_rules, base_dir, &mut errors),
+            Item::Rule(r) => {
+                verify_rule(r, &concepts, &all_rules, &all_resources, base_dir, &mut errors);
+                // Phase 9 slice 1: every read(name) in the rule's logic
+                // must resolve to a declared resource. This is a separate
+                // pass to keep check_expr_against's signature stable; the
+                // walk is shallow and does not duplicate type checking.
+                let mut referenced: Vec<String> = Vec::new();
+                collect_read_names(&r.logic.value, &mut referenced);
+                for (_, expr) in &r.logic.bindings {
+                    collect_read_names(expr, &mut referenced);
+                }
+                for name in &referenced {
+                    if !all_resources.contains(name) {
+                        errors.push(VerifyError {
+                            context: format!("rule '{}' / logic", r.name),
+                            message: format!(
+                                "read('{}') references unknown resource — declare it at top level with `resource {} ...`",
+                                name, name
+                            ),
+                        });
+                    }
+                }
+            }
             Item::Reaction(rx) => {
                 // Verify source ref exists
                 if let Err(msg) = verify_source_ref(&rx.source, base_dir) {
@@ -121,9 +158,97 @@ pub fn verify_program(program: &Program, base_dir: &StdPath) -> Vec<VerifyError>
                 }
             }
             Item::Service(s) => verify_service(s, &concepts, &all_rules, base_dir, &mut errors),
+            Item::Resource(r) => verify_resource_stub(r, base_dir, &mut errors),
         }
     }
     errors
+}
+
+/// Phase 9 slice 1: per-resource validation. Checks the @source ref
+/// resolves and that max_bytes is within the slice-1 bound. Name
+/// uniqueness across all top-level items is enforced separately by
+/// verify_program (see the duplicate-name pre-pass).
+///
+/// Maximum read size capped at 64 MiB — well above any reasonable
+/// "static config / template" payload, well below "we should be
+/// streaming". Streaming larger files is a later slice.
+const SLICE1_MAX_RESOURCE_BYTES: u32 = 64 * 1024 * 1024;
+
+/// Phase 9 slice 1 — walk an expression tree collecting every `Read(name)`
+/// reference (de-duplicated by caller). Used by verify_program to
+/// cross-check that each `read(name)` resolves to a declared resource.
+fn collect_read_names(expr: &Expr, out: &mut Vec<String>) {
+    match expr {
+        Expr::Read(name) => {
+            if !out.contains(name) {
+                out.push(name.clone());
+            }
+        }
+        Expr::Number(_) | Expr::Text(_) | Expr::Ident(_) => {}
+        Expr::Field(base, _) => collect_read_names(base, out),
+        Expr::Binary(_, l, r) => {
+            collect_read_names(l, out);
+            collect_read_names(r, out);
+        }
+        Expr::Not(i) | Expr::Neg(i) | Expr::Ok(i) | Expr::Err(i) => collect_read_names(i, out),
+        Expr::If(c, t, e) => {
+            collect_read_names(c, out);
+            collect_read_names(t, out);
+            collect_read_names(e, out);
+        }
+        Expr::Call(_, args) | Expr::Concat(args) => {
+            for a in args {
+                collect_read_names(a, out);
+            }
+        }
+        Expr::Quantifier(_, c, _, body) => {
+            collect_read_names(c, out);
+            collect_read_names(body, out);
+        }
+        Expr::Fold(c, init, _, _, body) => {
+            collect_read_names(c, out);
+            collect_read_names(init, out);
+            collect_read_names(body, out);
+        }
+        Expr::Map(c, _, body) | Expr::Filter(c, _, body) => {
+            collect_read_names(c, out);
+            collect_read_names(body, out);
+        }
+        Expr::MatchResult(t, _, ok, _, err) => {
+            collect_read_names(t, out);
+            collect_read_names(ok, out);
+            collect_read_names(err, out);
+        }
+        Expr::Record(_, fields) => {
+            for (_, e) in fields {
+                collect_read_names(e, out);
+            }
+        }
+    }
+}
+
+fn verify_resource_stub(r: &Resource, base_dir: &StdPath, errors: &mut Vec<VerifyError>) {
+    if let Err(msg) = verify_source_ref(&r.source, base_dir) {
+        errors.push(VerifyError {
+            context: format!("resource '{}' / @source", r.name),
+            message: msg,
+        });
+    }
+    if r.max_bytes == 0 {
+        errors.push(VerifyError {
+            context: format!("resource '{}' / max", r.name),
+            message: "max must be greater than zero".into(),
+        });
+    }
+    if r.max_bytes > SLICE1_MAX_RESOURCE_BYTES {
+        errors.push(VerifyError {
+            context: format!("resource '{}' / max", r.name),
+            message: format!(
+                "max {} exceeds slice-1 ceiling of {} bytes (64 MiB) — larger files require streaming, a later slice",
+                r.max_bytes, SLICE1_MAX_RESOURCE_BYTES
+            ),
+        });
+    }
 }
 
 /// Phase 7 slice 3a: synthesised `HttpRequest` concept injected into the
@@ -473,6 +598,7 @@ fn describe_expr_kind(e: &Expr) -> &'static str {
         Expr::MatchResult(_, _, _, _, _) => "match_result",
         Expr::Record(_, _) => "record construction",
         Expr::Concat(_) => "concat",
+        Expr::Read(_) => "read",
     }
 }
 
@@ -620,6 +746,7 @@ fn verify_rule(
     rule: &Rule,
     concepts: &HashMap<String, &Concept>,
     all_rules: &[&Rule],
+    all_resources: &HashSet<String>,
     base_dir: &StdPath,
     errors: &mut Vec<VerifyError>,
 ) {
@@ -657,7 +784,7 @@ fn verify_rule(
     let facts = collect_logic_facts(&rule.logic);
 
     for path in &facts.reads {
-        if let Some(msg) = validate_read_path(path, rule, input_concept) {
+        if let Some(msg) = validate_read_path(path, rule, input_concept, all_resources) {
             errors.push(VerifyError {
                 context: format!("rule '{}' / logic", rule.name),
                 message: msg,
@@ -897,6 +1024,10 @@ fn infer_expr_type(
     match expr {
         Expr::Number(_) => Some(Type::Number),
         Expr::Text(_) => Some(Type::Text),
+        // Phase 9 slice 1: read(<resource>) returns text. Existence of the
+        // resource is checked separately by verify_rule via a dedicated
+        // walk; this inference path only needs the type.
+        Expr::Read(_) => Some(Type::Text),
         Expr::Ident(name) if name == &rule.input_name => Some(rule.input_ty.clone()),
         Expr::Ident(_) => None, // let/lambda-bound — not tracked in this pass
         Expr::Field(base, field_name) => {
@@ -1198,6 +1329,13 @@ fn collect_expr_facts(
                 collect_expr_facts(arg, reads, calls);
             }
         }
+        // Phase 9 slice 1: a resource read contributes the resource name
+        // to the rule's `reads:` purity facts. The author MUST list the
+        // resource name in `proofs.purity.reads` (e.g., `reads: [config]`)
+        // for the rule to verify — same discipline as field reads.
+        Expr::Read(name) => {
+            reads.insert(vec![name.clone()]);
+        }
     }
 }
 
@@ -1217,6 +1355,7 @@ fn validate_read_path(
     path: &[String],
     rule: &Rule,
     input_concept: Option<&Concept>,
+    all_resources: &HashSet<String>,
 ) -> Option<String> {
     if path.is_empty() {
         return None;
@@ -1225,6 +1364,14 @@ fn validate_read_path(
     // Accept both input name and context name (if present).
     let is_input = base == &rule.input_name;
     let is_context = rule.context_name.as_ref().map_or(false, |cn| base == cn);
+    // Phase 9 slice 1: also accept top-level resource names. A resource
+    // read is `read(name)` which collects to path == [name] (length 1, no
+    // field access). The verify_program pass already cross-checks that
+    // the resource exists; here we just permit the base.
+    let is_resource = path.len() == 1 && all_resources.contains(base);
+    if is_resource {
+        return None;
+    }
     if !is_input && !is_context {
         let scope = if let Some(cn) = &rule.context_name {
             format!("'{}' and '{}'", rule.input_name, cn)
@@ -1361,6 +1508,9 @@ fn count_operations(expr: &Expr) -> usize {
             // 1 op for the concat call itself + each arg.
             1 + args.iter().map(count_operations).sum::<usize>()
         }
+        // Phase 9 slice 1 stub: a file read costs one op (the syscall) and
+        // has no Expr children to count.
+        Expr::Read(_) => 1,
     }
 }
 
@@ -2736,6 +2886,79 @@ rule test
         assert!(
             errs.iter().any(|e| e.message.contains("can read fields of `req` or `resp` only")),
             "expected unknown-base rejection, got: {:#?}",
+            errs
+        );
+    }
+
+    /// Phase 9 slice 1 helper: a minimal program with a resource and a
+    /// rule that reads it. Used by the slice 9 verifier regression tests.
+    fn resource_src(reads: &str) -> String {
+        format!(
+            "@verbose 0.1.0\n\nresource cfg\n  @intention: \"x\"\n  @source: invoices.intent:1\n  path: \"/etc/x\"\n  max: 1024\n\nconcept C\n  @intention: \"x\"\n  @source: invoices.intent:1\n  fields:\n    x : number\n\nrule r\n  @intention: \"x\"\n  @source: invoices.intent:1\n  input:\n    c : C\n  output:\n    out : text\n  logic:\n    out = read(cfg)\n  proofs:\n    purity:\n      reads: {}\n      calls: []\n    termination:\n      bound: 1\n",
+            reads
+        )
+    }
+
+    #[test]
+    fn phase9_resource_happy_path() {
+        let errs = verify_str(&resource_src("[cfg]"));
+        assert!(errs.is_empty(), "expected no errors, got: {:#?}", errs);
+    }
+
+    #[test]
+    fn phase9_rejects_read_on_unknown_resource() {
+        let src = "@verbose 0.1.0\n\nconcept C\n  @intention: \"x\"\n  @source: invoices.intent:1\n  fields:\n    x : number\n\nrule r\n  @intention: \"x\"\n  @source: invoices.intent:1\n  input:\n    c : C\n  output:\n    out : text\n  logic:\n    out = read(missing)\n  proofs:\n    purity:\n      reads: [missing]\n      calls: []\n    termination:\n      bound: 1\n";
+        let errs = verify_str(src);
+        assert!(
+            errs.iter().any(|e| e.message.contains("read('missing') references unknown resource")),
+            "expected unknown-resource error, got: {:#?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn phase9_rejects_read_missing_from_purity_reads() {
+        // Rule reads cfg via read(cfg) but doesn't list it in purity.reads.
+        let errs = verify_str(&resource_src("[]"));
+        assert!(
+            errs.iter().any(|e| e.message.contains("declared reads do not match logic")
+                && e.message.contains("missing")
+                && e.message.contains("cfg")),
+            "expected purity-mismatch error for unlisted read('cfg'), got: {:#?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn phase9_rejects_resource_max_zero() {
+        let src = "@verbose 0.1.0\n\nresource bad\n  @intention: \"x\"\n  @source: invoices.intent:1\n  path: \"/etc/x\"\n  max: 0\n";
+        // max=0 hits the parser's positivity check before the verifier sees it
+        // (parser rejects "must be positive"). Verify the program string is
+        // rejected at parse time:
+        let tokens = crate::lexer::Lexer::new(src).tokenize().unwrap();
+        let res = crate::parser::Parser::new(tokens).parse_program();
+        assert!(res.is_err(), "expected parse error for max=0, got: {:#?}", res);
+    }
+
+    #[test]
+    fn phase9_rejects_resource_max_above_64mib() {
+        // 64 MiB + 1 — verifier rejects (parser accepts any u32).
+        let src = "@verbose 0.1.0\n\nresource huge\n  @intention: \"x\"\n  @source: invoices.intent:1\n  path: \"/etc/x\"\n  max: 67108865\n";
+        let errs = verify_str(src);
+        assert!(
+            errs.iter().any(|e| e.message.contains("exceeds slice-1 ceiling")),
+            "expected max-too-large error, got: {:#?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn phase9_rejects_duplicate_resource_name() {
+        let src = "@verbose 0.1.0\n\nresource dup\n  @intention: \"a\"\n  @source: invoices.intent:1\n  path: \"/a\"\n  max: 1\n\nresource dup\n  @intention: \"b\"\n  @source: invoices.intent:1\n  path: \"/b\"\n  max: 1\n";
+        let errs = verify_str(src);
+        assert!(
+            errs.iter().any(|e| e.message.contains("duplicate resource name 'dup'")),
+            "expected duplicate-resource error, got: {:#?}",
             errs
         );
     }

@@ -1,0 +1,11 @@
+A rule that loads a static configuration file from disk and emits its
+contents as text. The file path is declared in the source as a literal
+resource — auditing the binary tells you exactly which file the program
+can open. Reading a file the rule does not declare is impossible: the
+verifier rejects unknown read() targets at compile time, and the binary
+contains no other open() syscalls beyond the declared resource.
+
+If the file cannot be opened (missing, permission denied, FS error) the
+process exits with status 1 — the on_read_error: abort policy makes
+silent-failure impossible for slice 1. Recovery is the operator's job
+(systemd restart, alerting), not the binary's.

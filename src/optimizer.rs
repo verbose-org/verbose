@@ -51,6 +51,9 @@ fn count_nodes(expr: &Expr) -> usize {
         Expr::MatchResult(t, _, ob, _, eb) => 1 + count_nodes(t) + count_nodes(ob) + count_nodes(eb),
         Expr::Record(_, fields) => 1 + fields.iter().map(|(_, e)| count_nodes(e)).sum::<usize>(),
         Expr::Concat(args) => 1 + args.iter().map(count_nodes).sum::<usize>(),
+        // Phase 9 slice 1 stub: a Read carries a resource name (no child Expr
+        // to recurse on), so it counts as one node.
+        Expr::Read(_) => 1,
     }
 }
 
@@ -93,6 +96,9 @@ pub fn optimize_program(program: &Program) -> (Program, OptStats) {
                 Item::Reaction(rx) => Item::Reaction(rx.clone()),
                 // Services carry no logic expression to optimise; pass through.
                 Item::Service(s) => Item::Service(s.clone()),
+                // Phase 9 slice 1 stub: resources are declarative (no logic
+                // expression to optimise); pass through unchanged.
+                Item::Resource(r) => Item::Resource(r.clone()),
             })
             .collect(),
     };
@@ -322,6 +328,9 @@ fn substitute_ident(expr: &Expr, name: &str, replacement: &Expr) -> Expr {
         Expr::Concat(args) => Expr::Concat(
             args.iter().map(|a| substitute_ident(a, name, replacement)).collect(),
         ),
+        // Phase 9 slice 1 stub: Read carries a resource name (no Expr child
+        // to substitute into); pass through unchanged.
+        Expr::Read(n) => Expr::Read(n.clone()),
     }
 }
 
@@ -494,6 +503,9 @@ pub fn optimize_expr(
                 .map(|e| optimize_expr(e, input_name, field_ranges))
                 .collect(),
         ),
+        // Phase 9 slice 1 stub: a file read has no compile-time optimisation
+        // path (the contents aren't known until runtime); pass through.
+        Expr::Read(name) => Expr::Read(name.clone()),
     }
 }
 

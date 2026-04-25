@@ -31,6 +31,16 @@ pub fn emit_rust(program: &Program) -> String {
                 // stays coherent.
                 out.push_str(&format!("// Service: {} — \"{}\" (not transpiled; Phase 7 native-only)\n", s.name, s.intention));
             }
+            Item::Resource(r) => {
+                // Phase 9 slice 1: file resources are native-only today.
+                // Comment out for the Rust transpiler so the output stays
+                // coherent; rules that reference read(...) will fail a later
+                // pass when we add transpiler support for file I/O.
+                out.push_str(&format!(
+                    "// Resource: {} — \"{}\" → {} [max {}] (not transpiled; native-only)\n",
+                    r.name, r.intention, r.path, r.max_bytes
+                ));
+            }
         }
     }
     out.push('\n');
@@ -190,8 +200,9 @@ fn emit_expr(expr: &Expr, input_name: &str, concept: Option<&Concept>) -> String
         | Expr::Err(_)
         | Expr::MatchResult(_, _, _, _, _)
         | Expr::Record(_, _)
-        | Expr::Concat(_) => {
-            "(/* collection/result/record/concat op: use --run interpreter */false)".to_string()
+        | Expr::Concat(_)
+        | Expr::Read(_) => {
+            "(/* collection/result/record/concat/read op: use --run interpreter or --native */false)".to_string()
         }
         Expr::Call(name, _args) => {
             if let Some(c) = concept {

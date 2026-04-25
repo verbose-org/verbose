@@ -1,0 +1,50 @@
+@verbose 0.1.0
+
+-- Phase 9 slice 1: read-only file I/O. The first .verbose primitive
+-- that lets a rule consult external state at runtime. The path is a
+-- compile-time literal (the auditor sees it in the binary); the
+-- contents are read fresh at each invocation; failure to open or read
+-- exits the process with status 1 (on_read_error: abort).
+--
+-- Use case: load a static config or template that lives on disk so
+-- operators can change it without recompiling. Verbose retains the
+-- compile-time guarantee that no OTHER file can be touched, because
+-- read() takes a declared resource name (not a path string).
+
+
+resource config
+  @intention: "Static application config; one file, one rule"
+  @source: read_config.intent:1
+
+  path: "/tmp/verbose_demo_config.txt"
+  max:  4096
+  on_read_error: abort
+
+
+concept Tick
+  @intention: "A trivial input — one tick triggers one read"
+  @source: read_config.intent:1
+
+  fields:
+    nonce : number [0, 1000000000]
+
+
+rule load_config
+  @intention: "Read the configured file and emit its contents to stdout"
+  @source: read_config.intent:1
+
+  input:
+    t : Tick
+
+  output:
+    contents : text
+
+  logic:
+    contents = read(config)
+
+  proofs:
+    purity:
+      reads : [config]
+      calls : []
+    termination:
+      bound : 1

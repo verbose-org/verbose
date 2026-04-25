@@ -747,6 +747,9 @@ fn resolve_imports(mut program: ast::Program, base_dir: &Path) -> ast::Program {
                 ast::Item::Rule(r) => rewrite(&mut r.source),
                 ast::Item::Reaction(rx) => rewrite(&mut rx.source),
                 ast::Item::Service(s) => rewrite(&mut s.source),
+                // Phase 9 slice 1 stub: source-rewriting for imported
+                // resources lands when modules can re-export resources.
+                ast::Item::Resource(_) => {}
             }
         }
 

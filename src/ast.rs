@@ -18,6 +18,41 @@ pub enum Item {
     Rule(Rule),
     Reaction(Reaction),
     Service(Service),
+    /// Phase 9 slice 1: a top-level read-only file resource. The path is a
+    /// compile-time literal; the file contents are read at runtime by any
+    /// rule that references the resource via `read(<name>)`. Declaring the
+    /// resource at top-level (rather than inline at every read site) gives
+    /// the auditor a single place to enumerate every file the program can
+    /// touch.
+    Resource(Resource),
+}
+
+/// Phase 9 slice 1: a declared read-only file resource. Mirrors the shape
+/// established for `Service` and `Concept` (intention + source for audit,
+/// declared bounds enforced by the verifier).
+///
+/// `max_bytes` is the upper bound on a single read; the verifier enforces
+/// `1 <= max_bytes <= 64 MiB` so the buffer can be allocated on the stack
+/// at compile time without relying on heap or guessed sizes. Reads that
+/// would exceed `max_bytes` are truncated by the read syscall (slice 1 has
+/// no streaming support — that is a later slice).
+#[derive(Debug, Clone)]
+pub struct Resource {
+    pub name: String,
+    pub intention: String,
+    pub source: SourceRef,
+    /// Filesystem path, baked into the binary as a literal at the open site.
+    /// No concat, no field substitution, no request-derived paths — the
+    /// auditor reads the source (or `strings` the binary) and sees every
+    /// file the program can attempt to open.
+    pub path: String,
+    /// Stack buffer size for the read; verifier-bounded to [1, 64 MiB].
+    pub max_bytes: u32,
+    /// Phase 9 slice 1: only `Abort` accepted today (mirrors slice 8d). On
+    /// open or read failure the process exits with status 1. `Drop`
+    /// (silent-ignore) lands in a later slice if needed; making the strict
+    /// policy the only option in slice 1 keeps the failure mode obvious.
+    pub on_read_error: ErrorPolicy,
 }
 
 /// A service is a long-running program declaration. It binds a listener
@@ -299,6 +334,12 @@ pub enum Expr {
     /// Not an operator overload on `+` — we keep `+` strictly numeric and
     /// make text composition an explicit, audit-visible call.
     Concat(Vec<Expr>),
+    /// Phase 9 slice 1: read the contents of a top-level `resource` as
+    /// text. The string identifies the declared resource by name; the
+    /// verifier rejects references to undeclared resources, and the
+    /// rule's `reads:` purity proof must list every resource referenced
+    /// in its logic. Returns `text` — usable in any text-typed position.
+    Read(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

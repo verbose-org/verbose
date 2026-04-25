@@ -482,6 +482,8 @@ fn eval_expr(
                 }),
             }
         }
+        // Phase 9 slice 1: real read happens in native; interpreter returns empty placeholder for now.
+        Expr::Read(_) => Ok(Value::Text("".into())),
     }
 }
 

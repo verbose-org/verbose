@@ -83,6 +83,64 @@ and raw TCP) emitted by the compiler around a normal rule. That sketch is
 not an implementation commitment; it fixes the target shape so that when
 Phase 7 is built, the design is already decided.
 
+## Phase 9 file I/O — slice 1 landed (2026-04-25)
+
+Phase 9 introduces declarable file-system access. Slice 1 covers
+**read-only file reads** declared at the top level:
+
+```verbose
+resource config
+  @intention: "Static application config"
+  @source: read_config.intent:1
+  path: "/etc/myapp.conf"
+  max:  4096
+  on_read_error: abort
+```
+
+Any rule whose output type is `text` may then call `read(config)` to
+load the file contents at runtime. Constraints enforced by the
+verifier:
+
+- **Path is a string literal** baked into the binary inline. The
+  auditor reads the source — or `strings` the binary — and sees every
+  file the program can attempt to open. Dynamic paths
+  (`concat("/var/", req.path)`) are rejected; slice 1 trades
+  convenience for the no-traversal-by-construction guarantee.
+- **`max:` ≤ 64 MiB**, declared per resource. Allocates a stack
+  buffer of that size; reads larger than the bound truncate (no
+  streaming in slice 1).
+- **`on_read_error: abort`** is currently the only accepted policy
+  (the parser rejects `drop`). Open or read failure exits the process
+  with status 1 — same shape as Phase 8 slice 8d.
+- **Rule purity proof** must list every resource name in `reads:`
+  (e.g., `reads: [config]`), same discipline as field reads. Reading
+  a resource you didn't declare to read is a verifier error.
+
+Native cost: ~80 bytes for the open/read/close sequence + abort patch
+sites + a buffer of `max` bytes on the stack per unique resource. The
+sequence runs once per rule invocation (above `loop_top`), so a
+streaming rule reading the same resource for every record reads the
+file once, not N times. Worked example: `examples/read_config.verbose`
+(541-byte binary).
+
+**Still deferred for later slices:**
+
+- **Slice 2 — `on_read_error: drop`** (silent-ignore + empty text).
+  The strict-only default in slice 1 makes failure obvious; relaxing
+  is an explicit opt-in if needed.
+- **Slice 3 — file resources in non-text-output contexts** (Result
+  rules, collection / fold programs, service handlers). Slice 1 only
+  threads the prologue's `text_bindings` map through `emit_text_program`
+  and `emit_record_program` paths.
+- **Slice 4 — multiple resources in a single rule, ordered.** Today
+  each rule sequentially opens / reads / closes each declared resource.
+  No interleaving with the let-eval loop.
+- **Slice 5 — request-derived file paths in services** (e.g.,
+  `GET /static/file.html` → open `/var/www/file.html`). Requires path
+  traversal proofs that slice 1 deliberately refuses; a separate
+  design pass with normalised path slots and `O_NOFOLLOW`.
+- **Streaming reads larger than `max:`.** Slice 1 single-shot only.
+
 ## Phase 8 audit-log gaps still open (2026-04-23)
 
 Phase 8 lets a `service` declare a per-request `log:` block that fires

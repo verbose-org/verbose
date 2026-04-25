@@ -105,6 +105,10 @@ examples/
                    reason; req.timestamp captured per-request; on_error: abort
                    for fail-closed audit. Worked example for docs/ai-act-usage.md
                    Pattern 2. ~2019 B on port 18897.
+  read_config.*    Phase 9 slice 1: top-level `resource` declaration + `read(name)` in
+                   a rule's logic. open(O_RDONLY) + read + close emitted once per rule
+                   invocation; on_read_error: abort exits with status 1 on any syscall
+                   failure. ~541 B native binary; reads /tmp/verbose_demo_config.txt.
   demo.html        Browser demo (WASM)
 
 tools/
@@ -207,6 +211,7 @@ Tracking what native emits today, what it still rejects, and the design rules th
 | 7 (3e) | `status` field accepts any Number-typed expression inside one HttpResponse record (not just a literal). Slice 3c forced you to wrap in `if … then HttpResponse{200,…} else HttpResponse{404,…}` even when the body was identical; 3e lets `HttpResponse { status: if cond then 200 else 405, body: … }` stand alone. Native trusts the verifier's type-check against the declared `status: number [100, 599]` range and dispatches non-literal status through `emit_eval_expr` → `mov [rbp-24], rax`. Number-literal status keeps the 7-byte immediate-store fast path. | ~900 B | `method_guard.verbose::guard_endpoint` (921 B) |
 | 8 (8a–8c) | Per-request `log:` block on a service. Closed grammar: `text`/`number` literals, `concat(...)`, plus `req.method`, `req.path`, `req.timestamp`, `resp.status`, `resp.body`. Slice 8a wires the `append_file` between handler and serializer using shared `emit_append_file_call` (same path as reaction logs). Slice 8b enriches the log scope with `resp.status` (number, slot -24) and `resp.body` (text via BoundText, slots -32/-40) — handler-populated, no extra runtime cost. Slice 8c adds `req.timestamp` (number, slot -56) backed by one `clock_gettime(CLOCK_REALTIME)` after `accept` — frame grows by 8 only when timestamp is referenced. The handler never sees these names; the rewrite is local to the log scope so the response stays reproducible from `(method, path)`. | ~1.3 KB (no ts) / ~1.7 KB (with ts) | `hello_router_logged.verbose` (1294 B) / `audit_complete.verbose` (1735 B) |
 | 8 (8d) | Optional `on_error: drop \| abort` line in the log block. Drop is the default (slice 8a behaviour, silent on failure). Abort emits a `test rax, rax; js abort_label` (8 bytes) after each fallible log syscall — open and write — branching to a shared `mov rax, 60; mov rdi, 1; syscall` epilogue (16 bytes) at the end of the binary. Cost: zero when policy is Drop (no checks, no label). Lets the operator opt into fail-closed audit semantics when an Article 12 chain requires that no log persisted means no claim of having served the request. Reaction effects (rules) keep the Drop default; the knob is service-level only. | ~1.2 KB | `audit_strict.verbose::strict_endpoint` (1240 B) |
+| 9 (slice 1) | Top-level `resource <name>` declaration + `read(<name>)` expression. The path is a literal embedded inline (auditor sees every file the binary can open); `max:` bounds a per-resource stack buffer. `emit_record_loop_prologue` walks the rule's logic for `Read` references, allocates `(ptr_slot, len_slot)` + buffer per unique resource, and emits `open(O_RDONLY) → test+js abort → mov r15, rax → read → store len → test+js abort → close` ONCE per rule invocation (before `loop_top`, so per-record loops don't reread). `text_bindings` registers `name → (ptr, len)` so `Expr::Read` reuses the Phase 2I/2F BoundText path through `emit_text_write_to_fd` / `emit_concat_to_buffer`. Failure routes to a per-rule abort label (sys_exit 1). Slice 1 covers `output: text` rules; collection / fold / record / service-handler contexts still reject. | ~540 B | `read_config.verbose::load_config` (541 B) |
 
 *Locked designs for each phase (3, 4, 5b, 2F, 2G, 2H-b) are in [docs/native-designs.md](docs/native-designs.md). They're frozen after implementation — consult them for rationale, not for the current state.*
 
@@ -292,7 +297,7 @@ printf "3 auth\n1 web\n" | /tmp/alert                                           
 cargo run -- examples/invoices.verbose --wasm /tmp/rule.wasm --run important_invoice # WASM
 cargo run -- examples/invoices.verbose --benchmark --run important_invoice          # compare all backends
 cargo run -- --demo-http /tmp/server                                                 # HTTP server — tier-3 emitter probe, NOT in .verbose (see docs/known-gaps.md)
-cargo test                                                                          # 200 tests
+cargo test                                                                          # 208 tests
 make demo                                                                           # full demo
 ```
 

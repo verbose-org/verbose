@@ -48,8 +48,10 @@ impl Parser {
                 items.push(Item::Reaction(self.parse_reaction()?));
             } else if self.check_ident("service") {
                 items.push(Item::Service(self.parse_service()?));
+            } else if self.check_ident("resource") {
+                items.push(Item::Resource(self.parse_resource()?));
             } else {
-                return Err(self.error("expected 'concept', 'rule', 'reaction', or 'service' at top level"));
+                return Err(self.error("expected 'concept', 'rule', 'reaction', 'service', or 'resource' at top level"));
             }
         }
         Ok(Program { version, uses, items })
@@ -671,6 +673,16 @@ impl Parser {
                     return Err(self.error("concat() requires at least one argument"));
                 }
                 Ok(Expr::Concat(args))
+            } else if name == "read" && self.check_kind(&TokenKind::LParen) {
+                // Phase 9 slice 1: read(<resource_name>) — load the
+                // declared resource's contents as text. The argument must
+                // be a bare identifier naming a top-level resource; the
+                // verifier checks that the name resolves and that the
+                // rule's `reads:` proof lists it.
+                self.advance(); // (
+                let resource_name = self.expect_ident_any()?;
+                self.expect_kind(TokenKind::RParen)?;
+                Ok(Expr::Read(resource_name))
             } else if name == "match_result" && self.check_kind(&TokenKind::LParen) {
                 // match_result(target, ok_var => ok_body, err_var => err_body)
                 // The Result consumer. Both arms are explicit — no implicit
@@ -1106,6 +1118,116 @@ impl Parser {
             handler: handler.ok_or_else(|| self.error("service missing 'handler'"))?,
             log,
             log_on_error,
+        })
+    }
+
+    /// Phase 9 slice 1: parse a top-level `resource` block declaring a
+    /// read-only file handle the program can open at runtime.
+    ///
+    /// Grammar:
+    ///   resource <name>
+    ///     @intention: "..."
+    ///     @source: file.intent:NN
+    ///     path: "/literal/path"
+    ///     max:  <number>
+    ///     on_read_error: abort        (optional; default = abort)
+    ///
+    /// Path is a string literal (not an expression) so the auditor reads
+    /// the source — or `strings` the binary — and sees every file the
+    /// program can attempt to open. `max` bounds the per-read stack
+    /// buffer; the verifier enforces 1 ≤ max ≤ 64 MiB.
+    fn parse_resource(&mut self) -> Result<Resource, ParseError> {
+        self.expect_ident("resource")?;
+        let name = self.expect_ident_any()?;
+        self.expect_kind(TokenKind::Newline)?;
+        self.expect_kind(TokenKind::Indent)?;
+
+        let mut intention = None;
+        let mut source = None;
+        let mut path: Option<String> = None;
+        let mut max_bytes: Option<u32> = None;
+        let mut on_read_error: ErrorPolicy = ErrorPolicy::Abort;
+
+        while !self.check_kind(&TokenKind::Dedent) && !self.at_eof() {
+            if let Some(attr) = self.peek_attribute_name() {
+                match attr.as_str() {
+                    "intention" => {
+                        self.advance();
+                        self.expect_kind(TokenKind::Colon)?;
+                        intention = Some(self.expect_string()?);
+                        self.expect_kind(TokenKind::Newline)?;
+                    }
+                    "source" => {
+                        self.advance();
+                        self.expect_kind(TokenKind::Colon)?;
+                        source = Some(self.parse_source_ref()?);
+                        self.expect_kind(TokenKind::Newline)?;
+                    }
+                    other => {
+                        return Err(self.error(&format!(
+                            "unknown attribute '@{}' in resource",
+                            other
+                        )));
+                    }
+                }
+            } else if self.check_ident("path") {
+                self.advance();
+                self.expect_kind(TokenKind::Colon)?;
+                let p = self.expect_string().map_err(|_| {
+                    self.error("resource path must be a string literal — the auditor reads the binary and sees every file the program can touch")
+                })?;
+                path = Some(p);
+                self.expect_kind(TokenKind::Newline)?;
+            } else if self.check_ident("max") {
+                self.advance();
+                self.expect_kind(TokenKind::Colon)?;
+                let n = self.expect_number()?;
+                if n <= 0 {
+                    return Err(self.error(&format!(
+                        "resource max must be positive, got {}",
+                        n
+                    )));
+                }
+                if n > u32::MAX as i64 {
+                    return Err(self.error(&format!(
+                        "resource max {} exceeds u32 range",
+                        n
+                    )));
+                }
+                max_bytes = Some(n as u32);
+                self.expect_kind(TokenKind::Newline)?;
+            } else if self.check_ident("on_read_error") {
+                self.advance();
+                self.expect_kind(TokenKind::Colon)?;
+                let policy_name = self.expect_ident_any()?;
+                on_read_error = match policy_name.as_str() {
+                    "abort" => ErrorPolicy::Abort,
+                    "drop" => {
+                        return Err(self.error(
+                            "resource on_read_error: 'drop' lands in a later slice; only 'abort' is accepted today",
+                        ));
+                    }
+                    other => {
+                        return Err(self.error(&format!(
+                            "unknown on_read_error policy '{}' (allowed: abort)",
+                            other
+                        )));
+                    }
+                };
+                self.expect_kind(TokenKind::Newline)?;
+            } else {
+                return Err(self.error("expected attribute, 'path:', 'max:', or 'on_read_error:' in resource"));
+            }
+        }
+        self.expect_kind(TokenKind::Dedent)?;
+
+        Ok(Resource {
+            name,
+            intention: intention.ok_or_else(|| self.error("resource missing @intention"))?,
+            source: source.ok_or_else(|| self.error("resource missing @source"))?,
+            path: path.ok_or_else(|| self.error("resource missing 'path:'"))?,
+            max_bytes: max_bytes.ok_or_else(|| self.error("resource missing 'max:'"))?,
+            on_read_error,
         })
     }
 
