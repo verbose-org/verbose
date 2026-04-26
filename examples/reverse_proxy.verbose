@@ -1,0 +1,60 @@
+@verbose 0.1.0
+
+-- Phase 11 slice 3: a real reverse proxy. Slice 11.2 forwarded every
+-- request as a HARDCODED upstream call (`fetch(upstream, "GET /health
+-- HTTP/1.0\r\n\r\n")`); slice 11.3 lets the request bytes be a concat
+-- that pulls in req.method / req.path, so the upstream sees the same
+-- method and path the client sent. The reorder that makes this safe is
+-- emitting the per-accept fetch sequence AFTER the HTTP parse — with
+-- the parser slots already populated, the request_expr resolves
+-- through the same `offsets` map the response body uses.
+--
+-- The auditor still reads exactly one host:port (127.0.0.1:19030)
+-- the gateway can reach, and every byte of the upstream request line
+-- is composed from declared input fields plus literal text. There is
+-- no hidden routing — what you see in the source is what hits the wire.
+
+connection upstream
+  @intention: "Backend we forward all requests to"
+  @source: reverse_proxy.intent:1
+  host: "127.0.0.1"
+  port: 19030
+  max_response: 4096
+  on_connect_error: abort
+
+
+rule forward
+  @intention: "Forward incoming method+path to upstream and return its response"
+  @source: reverse_proxy.intent:1
+
+  input:
+    req : HttpRequest
+
+  output:
+    resp : HttpResponse
+
+  logic:
+    resp = HttpResponse {
+      status: 200,
+      body: fetch(upstream, concat(req.method, " ", req.path, " HTTP/1.0\r\n\r\n"))
+    }
+
+  proofs:
+    purity:
+      reads : [req.method, req.path, upstream]
+      calls : []
+
+    termination:
+      bound : 4
+
+
+service proxy_server
+  @intention: "Real reverse proxy: GET /foo forwarded as GET /foo to upstream"
+  @source: reverse_proxy.intent:1
+
+  listen:
+    protocol    : http_1_0
+    port        : 18930
+    max_request : 4096
+
+  handler: forward

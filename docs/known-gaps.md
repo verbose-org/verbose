@@ -123,6 +123,20 @@ streaming rule reading the same resource for every record reads the
 file once, not N times. Worked example: `examples/read_config.verbose`
 (541-byte binary).
 
+**Phase 11 slice 3 (2026-04-26):** REAL reverse proxy. The request
+bytes in `fetch()` can now compose with `req.method` / `req.path`,
+so incoming `GET /foo` is forwarded as `GET /foo` to the declared
+upstream. The reordering is the technical core: connection fetches
+moved from before-parse to after-parse in
+`emit_http10_dynamic_bytes` so the parsed slots are populated when
+the request_expr is lowered. The literal-only guard in
+`emit_connection_fetch_sequence` becomes an opt-in
+(`allow_dynamic_request: bool`) so rule prologues keep their slice
+11.1 invariants while HTTP handlers get the relaxed form. Resources
+still emit before parse (their paths stay static — slice 9.6 would
+lift that, separately). Closes the reverse-proxy arc:
+`reverse_proxy.verbose` ships at 1133 bytes.
+
 **Phase 11 slice 2 (2026-04-26):** `fetch()` now works inside HTTP
 service handler bodies — same shape as slice 9.2 did for resource
 reads. The fetch sequence (socket → connect → write → read → close)

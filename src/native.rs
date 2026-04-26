@@ -792,6 +792,21 @@ fn emit_connection_fetch_sequence(
     all_rules: &HashMap<&str, &Rule>,
     next_slot: i32,
     abort_patches: &mut Vec<usize>,
+    // Phase 11 slice 3: HTTP services emit the fetch AFTER the per-accept
+    // HTTP parse, so the request_expr can reference req.method / req.path —
+    // the caller passes the populated offsets, text_bindings and field_ranges
+    // from the surrounding handler context. Rule-prologue callers emit the
+    // fetch BEFORE the record loop where no per-record field is loaded yet,
+    // so they pass empty maps and the literal-only guard fires below.
+    offsets: &HashMap<&str, i32>,
+    field_ranges: &HashMap<&str, (i64, i64)>,
+    text_bindings: &TextBindings,
+    // When true (HTTP service path, slice 11.3) the request_expr is allowed
+    // to reference per-record fields and other text bindings. When false
+    // (rule-prologue path, slice 11.1) we keep the original literal-only
+    // restriction so a rule-level fetch can't accidentally read a field
+    // that hasn't been loaded into its slot yet.
+    allow_dynamic_request: bool,
 ) -> Result<(i32, i32, i32, i32), NativeError> {
     let ptr_slot = next_slot;
     let len_slot = next_slot - 8;
@@ -799,11 +814,13 @@ fn emit_connection_fetch_sequence(
     let buf_slot = len_slot - buf_padded;
     let new_next = buf_slot - 8;
 
-    // === Slice 1: lower the request bytes from a literal-only expression ===
-    // The only request shape we accept above loop_top is one that contains
-    // no per-record field references. We walk the AST and reject anything
-    // else upfront so the error fires at compile time, not via a confusing
-    // mid-emission failure.
+    // === Slice 1 / Slice 3: lower the request bytes ===
+    // Slice 1 (rule prologue, allow_dynamic_request=false): the request must
+    // be literal-only — no per-record field reference is reachable. The
+    // walker below enforces this so the error fires at compile time.
+    // Slice 3 (HTTP service, allow_dynamic_request=true): the request runs
+    // after the HTTP parse; concat(req.method, " ", req.path, ...) is
+    // permitted and resolves through `offsets` populated by the parser.
     fn request_is_literal_only(expr: &Expr) -> bool {
         match expr {
             Expr::Text(_) | Expr::Number(_) => true,
@@ -857,10 +874,10 @@ fn emit_connection_fetch_sequence(
             ),
         })?
     };
-    if !request_is_literal_only(request_expr) {
+    if !allow_dynamic_request && !request_is_literal_only(request_expr) {
         return Err(NativeError {
             message: format!(
-                "phase 11 slice 1: fetch('{}', request) request must be a text literal (or concat of literals); per-record / dynamic request bodies land in a later slice",
+                "phase 11 slice 1: fetch('{}', request) request must be a text literal (or concat of literals) when called from a rule prologue; per-record / dynamic request bodies are supported only inside HTTP service handlers (slice 11.3)",
                 connection.name
             ),
         });
@@ -927,21 +944,24 @@ fn emit_connection_fetch_sequence(
     code.extend_from_slice(&[0, 0, 0, 0]);
 
     // === Build request bytes via emit_text_produce_ptrlen ===
-    // Slice 1 restricts the request to literals, so no per-record field
-    // refs are possible. We pass empty offsets/field_ranges/text_bindings
-    // since the literal-only path doesn't consult them.
-    let empty_offsets: HashMap<&str, i32> = HashMap::new();
-    let empty_ranges: HashMap<&str, (i64, i64)> = HashMap::new();
-    let empty_bindings: TextBindings<'_> = HashMap::new();
+    // Slice 1 (rule prologue): the literal-only guard above ensures the
+    // request consults none of the maps; the empty defaults below would
+    // also work, but we pass the caller's maps for uniformity (they are
+    // empty in practice for that path).
+    // Slice 3 (HTTP service): the request_expr may reference req.method /
+    // req.path — `offsets` carries the parser slot map (-8, -16) and
+    // `text_bindings` carries any earlier-emitted resource/connection
+    // (ptr, len) pairs. emit_text_produce_ptrlen → emit_concat_to_buffer
+    // resolve those via the same BoundText path the response body uses.
     emit_text_produce_ptrlen(
         code,
         request_expr,
         &rule.input_name,
         input_concept,
         all_rules,
-        &empty_offsets,
-        &empty_ranges,
-        &empty_bindings,
+        offsets,
+        field_ranges,
+        text_bindings,
     )?;
     // After emit_text_produce_ptrlen: rax = req_ptr, rdx = req_len.
     // Stash into rsi (write expects buffer in rsi); rdx already correct.
@@ -1170,6 +1190,14 @@ fn emit_record_loop_prologue<'a>(
     // rbp slots. Failure of any fallible syscall jumps to the same shared
     // sys_exit(1) abort label as the resource path (single label, both
     // paths patch into it).
+    // The empty maps + allow_dynamic_request=false combo enforces the
+    // slice-1 invariant: rule-prologue fetches must use literal request
+    // bytes (per-record fields haven't been loaded yet). The literal-only
+    // guard inside emit_connection_fetch_sequence is what fails compilation
+    // before any field-resolution attempt happens.
+    let prologue_offsets: HashMap<&str, i32> = HashMap::new();
+    let prologue_ranges: HashMap<&str, (i64, i64)> = HashMap::new();
+    let prologue_bindings: TextBindings = HashMap::new();
     for c in &referenced_connections {
         let (ptr_slot, len_slot, _buf_slot, new_next) = emit_connection_fetch_sequence(
             code,
@@ -1179,6 +1207,10 @@ fn emit_record_loop_prologue<'a>(
             all_rules,
             resource_next_slot,
             &mut resource_abort_patches,
+            &prologue_offsets,
+            &prologue_ranges,
+            &prologue_bindings,
+            false, // allow_dynamic_request
         )?;
         text_bindings.insert(c.name.as_str(), (ptr_slot, len_slot));
         resource_next_slot = new_next;
@@ -8256,54 +8288,6 @@ fn emit_http10_dynamic_bytes(
         }
     }
 
-    // ═══ CONNECTIONS (Phase 11 slice 2) ════════════════════════
-    // Per-accept socket + connect + write(request) + read(response) + close
-    // for every connection the handler fetches. Slice 11.2 keeps every
-    // connection per-accept (no `cache: true` for connections in this slice),
-    // so the response is freshly fetched per request.
-    //
-    // Emitted AFTER the resource block: both share r15 (resource fd / socket
-    // fd). The resource sequence closes its fd before returning, so by the
-    // time the connection sequence runs r15 is free; the connection sequence
-    // closes its socket before returning, so when the HTTP read runs next
-    // r15 is free again. This sequential discipline is the same one Phase
-    // 11 slice 1 relies on inside emit_record_loop_prologue.
-    //
-    // The per-connection (ptr, len, buf) triple lives within the per-accept
-    // frame; on the next iteration we land back at accept_top with the same
-    // rsp (the close+loop tail does not touch rsp), so the slots get
-    // overwritten in place. http_text_bindings registers each connection
-    // name → (ptr_slot, len_slot) so emit_handler_to_slots' Fetch arm
-    // resolves through the same lookup as the Read arm.
-    //
-    // Slice 11.2 scope: the request bytes passed to fetch must be a text
-    // literal (or concat of literals). The Phase 11 slice 1 verifier rule
-    // (request_is_literal_only inside emit_connection_fetch_sequence)
-    // applies to handlers too — request bytes that reference req.method
-    // or req.path land in slice 11.3, which requires hoisting fetch to
-    // AFTER the HTTP parser has populated the method/path slots.
-    for c in &referenced_connections {
-        let (ptr_slot, len_slot, _buf_slot, new_next) = emit_connection_fetch_sequence(
-            &mut code,
-            c,
-            handler,
-            // Connection emission needs the input concept to validate the
-            // request expression; for HTTP service handlers the input is
-            // always the synthetic HttpRequest concept. Slice 11.2 only
-            // accepts literal-only request bytes, so the concept is not
-            // actually consulted by the literal path — but we pass the
-            // accurate one to keep the call shape uniform with the rule
-            // path (which DOES use it for field-ref validation in later
-            // slices).
-            &http_request_builtin_concept_native(),
-            all_rules,
-            resource_next_slot,
-            &mut abort_patches,
-        )?;
-        http_text_bindings.insert(c.name.as_str(), (ptr_slot, len_slot));
-        resource_next_slot = new_next;
-    }
-
     // ═══ READ ══════════════════════════════════════════════════
     code.extend_from_slice(&[0x48, 0x31, 0xC0]);                         // xor rax, rax
     code.extend_from_slice(&[0x48, 0x8B, 0x7D, 0xD0]);                   // rdi = [rbp-48]
@@ -8320,6 +8304,56 @@ fn emit_http10_dynamic_bytes(
     // the close/loop label via a pair of rel32 patch sites. We resolve
     // those after emitting the close.
     let parse_fail_patches = emit_http_parse_method_path(&mut code, buf_offset_from_rbp);
+
+    // ═══ CONNECTIONS (Phase 11 slice 2 + slice 3) ══════════════
+    // Per-accept socket + connect + write(request) + read(response) + close
+    // for every connection the handler fetches. No `cache: true` for
+    // connections in this phase, so the response is freshly fetched per
+    // request.
+    //
+    // Slice 11.3 reorder: this block runs AFTER the HTTP parse populates
+    // [rbp-8]=method ptr and [rbp-16]=path ptr, so the request_expr passed
+    // to fetch() can reference req.method / req.path via the existing
+    // `offsets` map. Slice 11.2 emitted the same block BEFORE the parse
+    // (literal-only request bytes only); moving it AFTER is harmless to
+    // literal-only requests and required for dynamic ones.
+    //
+    // Sharing r15: the resource sequence above (cached: at startup, non-
+    // cached: above the parse) closes its fd before returning, and the HTTP
+    // parse leaves rax/rbx clobbered but r15 untouched. The connection
+    // sequence closes its own socket before returning, so the read syscall
+    // ABOVE this block has already consumed the request bytes — no further
+    // r15 use happens between the parse and the handler body.
+    //
+    // The per-connection (ptr, len, buf) triple lives within the per-accept
+    // frame; on the next iteration we land back at accept_top with the same
+    // rsp (the close+loop tail does not touch rsp), so the slots get
+    // overwritten in place. http_text_bindings registers each connection
+    // name → (ptr_slot, len_slot) so emit_handler_to_slots' Fetch arm
+    // resolves through the same lookup as the Read arm.
+    //
+    // We pass `offsets` (carrying method→-8, path→-16), `field_ranges`
+    // (empty for HttpRequest — text fields don't have numeric ranges),
+    // `http_text_bindings` (resources + earlier connections), and
+    // allow_dynamic_request=true so the literal-only guard is lifted.
+    let http_request_concept_for_fetch = http_request_builtin_concept_native();
+    for c in &referenced_connections {
+        let (ptr_slot, len_slot, _buf_slot, new_next) = emit_connection_fetch_sequence(
+            &mut code,
+            c,
+            handler,
+            &http_request_concept_for_fetch,
+            all_rules,
+            resource_next_slot,
+            &mut abort_patches,
+            offsets,
+            field_ranges,
+            &http_text_bindings,
+            true, // allow_dynamic_request — slice 11.3 lifts the guard
+        )?;
+        http_text_bindings.insert(c.name.as_str(), (ptr_slot, len_slot));
+        resource_next_slot = new_next;
+    }
 
     // ═══ HANDLER BODY ══════════════════════════════════════════
     // Populates [rbp-24]=status, [rbp-32]=body_ptr, [rbp-40]=body_len.
@@ -12002,6 +12036,217 @@ service gateway
         assert!(
             body_str.contains("upstream!"),
             "gateway response body did not contain 'upstream!': body={:?}",
+            body_str
+        );
+
+        let _ = std::fs::remove_file(&out);
+    }
+
+    /// Phase 11 slice 3: byte-pattern check that the per-accept fetch
+    /// sequence is now emitted AFTER the HTTP parser (rather than before
+    /// the read+parse, as in slice 11.2). The reorder is what lets
+    /// fetch()'s request_expr reference req.method / req.path — the
+    /// parser must run first to populate [rbp-8] / [rbp-16].
+    ///
+    /// We anchor the assertion on three sites in a fixed sequence:
+    ///   1. sys_accept (`mov rax, 43`) — start of the per-accept body
+    ///   2. the parser's first byte-cmp-against-space (`cmp byte [rbx], 0x20`,
+    ///      encoded `80 3B 20`) — proof the parse happened
+    ///   3. sys_socket (`mov rax, 41`) — start of the fetch sequence
+    ///
+    /// Slice 11.2 had ordering 1 → 3 → 2 (parse ran AFTER socket, since
+    /// the connections block sat between resources and the read+parse).
+    /// Slice 11.3 must show 1 → 2 → 3.
+    #[test]
+    fn phase11_slice3_fetch_emits_after_http_parse() {
+        let src = std::fs::read_to_string("examples/reverse_proxy.verbose")
+            .expect("examples/reverse_proxy.verbose is expected to exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens)
+            .parse_program()
+            .expect("parse");
+
+        let out = std::env::temp_dir().join("verbosec_test_phase11_slice3_bytes");
+        compile_service(&program, "proxy_server", out.to_str().unwrap())
+            .expect("Http10 service with dynamic-request fetch compile");
+
+        let bytes = std::fs::read(&out).expect("read output binary");
+        let size = bytes.len();
+        assert!(
+            (800..3000).contains(&size),
+            "phase 11 slice 3 binary size {} outside [800, 3000] envelope",
+            size
+        );
+
+        // sys_accept: mov rax, 43 — encoded 48 C7 C0 2B 00 00 00.
+        // Unique to the accept loop entry.
+        let accept_seq: [u8; 7] = [0x48, 0xC7, 0xC0, 0x2B, 0x00, 0x00, 0x00];
+        let accept_pos = bytes
+            .windows(accept_seq.len())
+            .position(|w| w == accept_seq)
+            .expect("expected `mov rax, 43` (sys_accept) in service binary");
+
+        // HTTP parse fingerprint: the method scan compares `[rbx]` against
+        // ASCII space (0x20). The encoding `80 3B 20` (cmp byte ptr [rbx],
+        // 0x20) appears only in the parse helper. We take the FIRST
+        // occurrence after accept_pos to anchor "the parse ran here".
+        let parse_seq: [u8; 3] = [0x80, 0x3B, 0x20];
+        let parse_pos = bytes
+            .windows(parse_seq.len())
+            .enumerate()
+            .find_map(|(i, w)| if i > accept_pos && w == parse_seq { Some(i) } else { None })
+            .expect("expected HTTP parser's `cmp byte [rbx], 0x20` after sys_accept");
+
+        // sys_socket: mov rax, 41 — encoded 48 C7 C0 29 00 00 00.
+        // The HTTP server's startup also calls socket(); we want the LAST
+        // occurrence (the per-accept fetch one) and assert it comes AFTER
+        // the parse fingerprint. This is the slice 11.3 invariant: the
+        // fetch is hoisted INTO the per-accept body and scheduled AFTER
+        // the parse populates the request slots.
+        let socket_seq: [u8; 7] = [0x48, 0xC7, 0xC0, 0x29, 0x00, 0x00, 0x00];
+        let last_socket = bytes
+            .windows(socket_seq.len())
+            .enumerate()
+            .filter_map(|(i, w)| if w == socket_seq { Some(i) } else { None })
+            .last()
+            .expect("expected at least one `mov rax, 41` (sys_socket) in service binary");
+
+        assert!(
+            last_socket > parse_pos,
+            "phase 11 slice 3: per-accept sys_socket must follow the HTTP parse; \
+             accept@{} parse@{} last_socket@{}",
+            accept_pos, parse_pos, last_socket
+        );
+        assert!(
+            parse_pos > accept_pos,
+            "phase 11 slice 3: HTTP parse must follow sys_accept; \
+             accept@{} parse@{}",
+            accept_pos, parse_pos
+        );
+
+        let _ = std::fs::remove_file(out);
+    }
+
+    /// Phase 11 slice 3 end-to-end: spawn the compiled reverse_proxy
+    /// service, spawn a tiny TCP listener as the upstream backend, then
+    /// issue an HTTP request to the proxy whose method+path are unique
+    /// enough to be unmistakable in the listener's recorded buffer.
+    /// Assert (a) the listener saw the SAME method and path on the wire,
+    /// composed via concat(req.method, " ", req.path, ...), and (b) the
+    /// proxy's response body contains the upstream's payload.
+    ///
+    /// The byte-pattern test above proves the reorder happened in
+    /// machine code; this test proves the reordered code actually
+    /// resolves req.method / req.path through the populated parser
+    /// slots and writes their bytes onto the upstream socket.
+    #[test]
+    fn phase11_slice3_reverse_proxy_forwards_method_and_path() {
+        use std::io::{Read, Write};
+        use std::net::{TcpListener, TcpStream};
+        use std::process::{Command, Stdio};
+        use std::sync::{Arc, Mutex};
+        use std::thread;
+        use std::time::Duration;
+
+        let upstream_port: u16 = 19030;
+        let proxy_port: u16 = 18930;
+
+        let upstream =
+            TcpListener::bind(("127.0.0.1", upstream_port)).expect("bind upstream listener");
+        upstream.set_nonblocking(false).expect("blocking upstream");
+
+        // Capture what the upstream saw on the wire so we can assert
+        // method/path forwarding from the test thread after the join.
+        let captured: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        let captured_clone = Arc::clone(&captured);
+        let upstream_payload = b"HTTP/1.0 200 OK\r\nContent-Length: 9\r\n\r\nproxied!!";
+        let upstream_thread = thread::spawn(move || {
+            let (mut sock, _) = upstream.accept().expect("upstream accept");
+            sock.set_read_timeout(Some(Duration::from_secs(2))).ok();
+            let mut req = [0u8; 1024];
+            let n = sock.read(&mut req).unwrap_or(0);
+            if let Ok(mut g) = captured_clone.lock() {
+                g.extend_from_slice(&req[..n]);
+            }
+            sock.write_all(upstream_payload).expect("write upstream response");
+        });
+
+        let src = std::fs::read_to_string("examples/reverse_proxy.verbose")
+            .expect("examples/reverse_proxy.verbose is expected to exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens)
+            .parse_program()
+            .expect("parse");
+
+        let out =
+            std::env::temp_dir().join("verbosec_test_phase11_slice3_runtime_bin");
+        compile_service(&program, "proxy_server", out.to_str().unwrap())
+            .expect("Http10 service with dynamic-request fetch compile");
+
+        let mut child = Command::new(&out)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn proxy service binary");
+
+        // Wait for the proxy to bind.
+        let mut stream: Option<TcpStream> = None;
+        for _ in 0..50 {
+            match TcpStream::connect_timeout(
+                &format!("127.0.0.1:{}", proxy_port).parse().unwrap(),
+                Duration::from_millis(100),
+            ) {
+                Ok(s) => {
+                    stream = Some(s);
+                    break;
+                }
+                Err(_) => std::thread::sleep(Duration::from_millis(20)),
+            }
+        }
+
+        let runtime_result: Result<Vec<u8>, String> = (|| {
+            let mut s = stream.ok_or_else(|| "could not connect to proxy".to_string())?;
+            s.set_read_timeout(Some(Duration::from_secs(2))).ok();
+            // A path long and unique enough to be unmistakable in the
+            // upstream's captured buffer.
+            s.write_all(b"GET /some/test/path HTTP/1.0\r\n\r\n")
+                .map_err(|e| format!("write: {}", e))?;
+            let mut buf = Vec::new();
+            s.read_to_end(&mut buf).map_err(|e| format!("read: {}", e))?;
+            Ok(buf)
+        })();
+
+        // Reap server + upstream first so a panic does not leave dangling fds.
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = upstream_thread.join();
+
+        let response = runtime_result.expect("HTTP roundtrip failed");
+        let captured_bytes = captured.lock().expect("lock captured").clone();
+        let captured_str = String::from_utf8_lossy(&captured_bytes);
+
+        // Assertion (a): upstream saw the proxy's request line. The proxy
+        // emitted `concat(req.method, " ", req.path, " HTTP/1.0\r\n\r\n")`,
+        // so the wire bytes the listener captured must START with
+        // "GET /some/test/path HTTP/1.0\r\n\r\n".
+        assert!(
+            captured_str.starts_with("GET /some/test/path HTTP/1.0\r\n\r\n"),
+            "phase 11 slice 3: upstream did not see the forwarded method+path; \
+             expected 'GET /some/test/path HTTP/1.0\\r\\n\\r\\n' prefix, got {:?}",
+            captured_str
+        );
+
+        // Assertion (b): proxy returned upstream's payload as the body.
+        let sep = b"\r\n\r\n";
+        let split_at = response
+            .windows(sep.len())
+            .position(|w| w == sep)
+            .expect("proxy response missing CRLF/CRLF terminator");
+        let body = &response[split_at + sep.len()..];
+        let body_str = String::from_utf8_lossy(body);
+        assert!(
+            body_str.contains("proxied!!"),
+            "proxy response body did not contain 'proxied!!': body={:?}",
             body_str
         );
 
