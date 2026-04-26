@@ -25,6 +25,49 @@ pub enum Item {
     /// the auditor a single place to enumerate every file the program can
     /// touch.
     Resource(Resource),
+    /// Phase 11 slice 1: a top-level outbound TCP connection. The host
+    /// (IPv4 literal) and port are compile-time constants; the request
+    /// bytes are evaluated at the call site via `fetch(<name>, <bytes>)`.
+    /// Declaring the connection at top-level (rather than inline at every
+    /// fetch site) gives the auditor a single place to enumerate every
+    /// endpoint the program can touch — same discipline as Resource for
+    /// filesystem reads. No DNS, no TLS, no keep-alive in slice 1: the
+    /// surface stays narrow on purpose.
+    Connection(Connection),
+}
+
+/// Phase 11 slice 1: a declared outbound TCP destination. Mirrors the
+/// shape established for `Resource` and `Service` (intention + source for
+/// audit, declared bounds enforced by the verifier).
+///
+/// `host` is parsed as a quad-dotted IPv4 literal — no DNS lookup, no
+/// domain names, no IPv6. The auditor reads the source (or `strings` the
+/// binary) and sees every IP/port the program can attempt to dial.
+///
+/// `max_response` bounds the response buffer. Verifier enforces
+/// `1 <= max_response <= 64 MiB` so the buffer can be allocated on the
+/// stack at compile time. Bytes beyond this bound are simply not read by
+/// the read syscall — slice 1 is one-shot blocking, no streaming.
+#[derive(Debug, Clone)]
+pub struct Connection {
+    pub name: String,
+    pub intention: String,
+    pub source: SourceRef,
+    /// IPv4 host as a dotted-quad literal (e.g. "127.0.0.1"). Each octet
+    /// 0..=255; the parser rejects anything else (no DNS resolution, no
+    /// IPv6, no localhost shorthand).
+    pub host: String,
+    /// TCP port, 1..=65535.
+    pub port: u16,
+    /// Stack buffer size for the response read; verifier-bounded to
+    /// [1, 64 MiB].
+    pub max_response: u32,
+    /// Phase 11 slice 1: only `Abort` accepted today (mirrors slice 9.1
+    /// pattern). On socket / connect / write / read failure the process
+    /// exits with status 1. `Drop` lands in a later slice if needed;
+    /// keeping the strict policy as the only option in slice 1 keeps
+    /// the failure mode obvious.
+    pub on_connect_error: ErrorPolicy,
 }
 
 /// Phase 9 slice 1: a declared read-only file resource. Mirrors the shape
@@ -393,6 +436,16 @@ pub enum Expr {
     /// rule's `reads:` purity proof must list every resource referenced
     /// in its logic. Returns `text` — usable in any text-typed position.
     Read(String),
+    /// Phase 11 slice 1: open a TCP socket to a declared `connection`,
+    /// send the given request bytes, read up to the connection's
+    /// `max_response` bytes, close the socket, and return the response
+    /// as `text`. The String names the declared connection; the Expr
+    /// is the request bytes (must produce text). The verifier rejects
+    /// references to undeclared connections, and the rule's `reads:`
+    /// purity proof must list every connection referenced (same shape
+    /// as `Read` for resources). Slice 1 is one-shot blocking: at most
+    /// one fetch per connection per rule invocation.
+    Fetch(String, Box<Expr>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

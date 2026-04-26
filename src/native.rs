@@ -134,6 +134,14 @@ fn compile_native_code(
         Item::Resource(r) => Some((r.name.as_str(), r)),
         _ => None,
     }).collect();
+    // Phase 11 slice 1: index every top-level `connection` block by name —
+    // mirrors the resource map above. Rules walk their logic for fetch
+    // sites and the prologue allocates one (ptr, len, buf) slot triple
+    // per unique connection.
+    let connections: HashMap<&str, &Connection> = program.items.iter().filter_map(|i| match i {
+        Item::Connection(c) => Some((c.name.as_str(), c)),
+        _ => None,
+    }).collect();
     let reaction = program.items.iter().find_map(|i| match i { Item::Reaction(rx) if rx.name == rule_name => Some(rx), _ => None });
 
     let (rule, concept) = if let Some(rx) = reaction {
@@ -193,9 +201,9 @@ fn compile_native_code(
     let record_output_concept: Option<&Concept> = match &rule.output_ty { Type::Named(n) => concepts.iter().find(|c| c.name == *n).copied(), _ => None };
 
     let mut code = if let Some(rx) = reaction {
-        emit_reaction_program(rx, rule, concept, &rules, &resources)?
+        emit_reaction_program(rx, rule, concept, &rules, &resources, &connections)?
     } else if is_result_output {
-        emit_result_program(rule, concept, &rules, &resources)?
+        emit_result_program(rule, concept, &rules, &resources, &connections)?
     } else if is_collection_output {
         emit_collection_program(rule, concept, &concepts, &rules)?
     } else if is_fold_number_output {
@@ -211,18 +219,18 @@ fn compile_native_code(
     } else if is_fold_text_output {
         emit_text_fold_program(rule, concept, &concepts, &rules)?
     } else if matches!(&rule.output_ty, Type::Text) {
-        emit_text_program(rule, concept, &rules, &resources)?
+        emit_text_program(rule, concept, &rules, &resources, &connections)?
     } else if let Some(rec_concept) = record_output_concept {
-        emit_record_program(rule, rec_concept, concept, &concepts, &rules, &resources)?
+        emit_record_program(rule, rec_concept, concept, &concepts, &rules, &resources, &connections)?
     } else if matches!(&rule.output_ty, Type::Number | Type::Bool) && contains_quantifier(&rule.logic.value) {
         // Phase 6: scalar output with embedded quantifiers (e.g. if all(...) then X else Y).
         emit_multi_fold_program(rule, concept, &concepts, &rules)?
     } else if is_vectorizable && concept.fields.len() == 1 {
-        if let Some(threshold) = extract_simple_gt(rule) { emit_vectorized_program(threshold)? } else { emit_full_program(rule, concept, context_concept, &rules, &resources)? }
+        if let Some(threshold) = extract_simple_gt(rule) { emit_vectorized_program(threshold)? } else { emit_full_program(rule, concept, context_concept, &rules, &resources, &connections)? }
     } else if is_parallel {
         emit_parallel_program(rule, concept, &rules)?
     } else {
-        emit_full_program(rule, concept, context_concept, &rules, &resources)?
+        emit_full_program(rule, concept, context_concept, &rules, &resources, &connections)?
     };
 
     if stream {
@@ -514,6 +522,11 @@ fn collect_read_names_native(expr: &Expr, out: &mut Vec<String>) {
                 collect_read_names_native(e, out);
             }
         }
+        // Phase 11 slice 1: Fetch's connection name is collected by
+        // `collect_fetch_names_native`, not here. We still walk into the
+        // request bytes Expr so any read(...) inside the request body is
+        // captured.
+        Expr::Fetch(_, req) => collect_read_names_native(req, out),
     }
 }
 
@@ -526,6 +539,78 @@ fn collect_rule_read_names(rule: &Rule) -> Vec<String> {
         collect_read_names_native(expr, &mut names);
     }
     collect_read_names_native(&rule.logic.value, &mut names);
+    names
+}
+
+/// Phase 11 slice 1 — walk an expression tree collecting every
+/// `Fetch(name, _)` connection name (de-duplicated, in source order).
+/// Mirrors `collect_read_names_native` exactly. Used by the prologue to
+/// emit one socket+connect+write+read+close sequence per unique
+/// connection above loop_top.
+fn collect_fetch_names_native(expr: &Expr, out: &mut Vec<String>) {
+    match expr {
+        Expr::Fetch(name, req) => {
+            if !out.iter().any(|n| n == name) {
+                out.push(name.clone());
+            }
+            collect_fetch_names_native(req, out);
+        }
+        Expr::Number(_) | Expr::Text(_) | Expr::Ident(_) => {}
+        Expr::Read(_) => {}
+        Expr::Field(base, _) => collect_fetch_names_native(base, out),
+        Expr::Binary(_, l, r) => {
+            collect_fetch_names_native(l, out);
+            collect_fetch_names_native(r, out);
+        }
+        Expr::Not(i) | Expr::Neg(i) | Expr::Ok(i) | Expr::Err(i) => {
+            collect_fetch_names_native(i, out)
+        }
+        Expr::If(c, t, e) => {
+            collect_fetch_names_native(c, out);
+            collect_fetch_names_native(t, out);
+            collect_fetch_names_native(e, out);
+        }
+        Expr::Call(_, args) | Expr::Concat(args) => {
+            for a in args {
+                collect_fetch_names_native(a, out);
+            }
+        }
+        Expr::Quantifier(_, c, _, body) => {
+            collect_fetch_names_native(c, out);
+            collect_fetch_names_native(body, out);
+        }
+        Expr::Fold(c, init, _, _, body) => {
+            collect_fetch_names_native(c, out);
+            collect_fetch_names_native(init, out);
+            collect_fetch_names_native(body, out);
+        }
+        Expr::Map(c, _, body) | Expr::Filter(c, _, body) => {
+            collect_fetch_names_native(c, out);
+            collect_fetch_names_native(body, out);
+        }
+        Expr::MatchResult(t, _, ok, _, err) => {
+            collect_fetch_names_native(t, out);
+            collect_fetch_names_native(ok, out);
+            collect_fetch_names_native(err, out);
+        }
+        Expr::Record(_, fields) => {
+            for (_, e) in fields {
+                collect_fetch_names_native(e, out);
+            }
+        }
+    }
+}
+
+/// Phase 11 slice 1 — like `collect_rule_read_names` but for fetch.
+/// Returns the unique connection names referenced by the rule's logic
+/// (let bindings + value), in source order. Each entry corresponds to
+/// one (ptr, len, buf) slot triple emitted above loop_top.
+fn collect_rule_fetch_names(rule: &Rule) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    for (_, expr) in &rule.logic.bindings {
+        collect_fetch_names_native(expr, &mut names);
+    }
+    collect_fetch_names_native(&rule.logic.value, &mut names);
     names
 }
 
@@ -669,6 +754,261 @@ fn emit_resource_read_sequence(
     (ptr_slot, len_slot, buf_slot, new_next)
 }
 
+/// Phase 11 slice 1 — emit `socket(AF_INET, SOCK_STREAM, 0); connect(...);
+/// write(req); read(resp); close()` once per connection the rule fetches.
+/// Layout mirrors `emit_resource_read_sequence`: response buffer + (ptr,
+/// len) pair below the n_reserved slots, all freed by the per-rule frame
+/// teardown.
+///
+/// The request bytes for slice 1 must be a `Text` literal — the only
+/// text expression that can be lowered into machine code without field
+/// references (we're above loop_top, so the rbp field slots aren't yet
+/// populated). `Concat(...)` of literals is also fine because it
+/// classifies as text and the inner Text args don't read fields.
+/// Anything that reaches into the per-record input is rejected with a
+/// clear error; the natural workaround is "stage the dynamic part inside
+/// a let binding evaluated within the loop and wire it through a future
+/// slice that supports per-record fetches".
+///
+/// Slot layout (rbp-relative):
+///   [rbp + ptr_slot, +7]   — response buffer base pointer (8 bytes)
+///   [rbp + len_slot, +7]   — bytes read by the read() syscall (8 bytes)
+///   [rbp + buf_slot, +pad-1] — response buffer (max_response padded to 8)
+///
+/// Failures of the fallible syscalls (socket, connect, write, read) all
+/// patch into the same shared sys_exit(1) abort label as the resource
+/// path — the policy is `on_connect_error: abort` (slice-1 default and
+/// only option). close() is best-effort (errors ignored), matching the
+/// resource path.
+///
+/// Registers used: rax (syscall return), rdi/rsi/rdx/r10/r8 (syscall
+/// args), r15 (saved socket fd across syscalls — same role as in the
+/// resource path). r12, r13, r14, rbp preserved.
+fn emit_connection_fetch_sequence(
+    code: &mut Vec<u8>,
+    connection: &Connection,
+    rule: &Rule,
+    input_concept: &Concept,
+    all_rules: &HashMap<&str, &Rule>,
+    next_slot: i32,
+    abort_patches: &mut Vec<usize>,
+) -> Result<(i32, i32, i32, i32), NativeError> {
+    let ptr_slot = next_slot;
+    let len_slot = next_slot - 8;
+    let buf_padded = ((connection.max_response as i32) + 7) & !7;
+    let buf_slot = len_slot - buf_padded;
+    let new_next = buf_slot - 8;
+
+    // === Slice 1: lower the request bytes from a literal-only expression ===
+    // The only request shape we accept above loop_top is one that contains
+    // no per-record field references. We walk the AST and reject anything
+    // else upfront so the error fires at compile time, not via a confusing
+    // mid-emission failure.
+    fn request_is_literal_only(expr: &Expr) -> bool {
+        match expr {
+            Expr::Text(_) | Expr::Number(_) => true,
+            Expr::Concat(args) => args.iter().all(request_is_literal_only),
+            Expr::Neg(i) => request_is_literal_only(i),
+            _ => false,
+        }
+    }
+    // Find the Fetch we're emitting for — it's the first Fetch with this
+    // connection name in the rule's logic. The verifier already enforces
+    // "at most one fetch per connection per rule", so this is unambiguous.
+    fn first_fetch_for<'a>(expr: &'a Expr, name: &str) -> Option<&'a Expr> {
+        match expr {
+            Expr::Fetch(n, req) if n == name => Some(req),
+            Expr::Number(_) | Expr::Text(_) | Expr::Ident(_) | Expr::Read(_) => None,
+            Expr::Field(b, _) => first_fetch_for(b, name),
+            Expr::Binary(_, l, r) => first_fetch_for(l, name).or_else(|| first_fetch_for(r, name)),
+            Expr::Not(i) | Expr::Neg(i) | Expr::Ok(i) | Expr::Err(i) => first_fetch_for(i, name),
+            Expr::If(c, t, e) => first_fetch_for(c, name).or_else(|| first_fetch_for(t, name)).or_else(|| first_fetch_for(e, name)),
+            Expr::Call(_, args) | Expr::Concat(args) => {
+                args.iter().find_map(|a| first_fetch_for(a, name))
+            }
+            Expr::Quantifier(_, c, _, body) | Expr::Map(c, _, body) | Expr::Filter(c, _, body) => {
+                first_fetch_for(c, name).or_else(|| first_fetch_for(body, name))
+            }
+            Expr::Fold(c, init, _, _, body) => {
+                first_fetch_for(c, name).or_else(|| first_fetch_for(init, name)).or_else(|| first_fetch_for(body, name))
+            }
+            Expr::MatchResult(t, _, ok, _, err) => {
+                first_fetch_for(t, name).or_else(|| first_fetch_for(ok, name)).or_else(|| first_fetch_for(err, name))
+            }
+            Expr::Record(_, fs) => fs.iter().find_map(|(_, e)| first_fetch_for(e, name)),
+            Expr::Fetch(_, req) => first_fetch_for(req, name),
+        }
+    }
+    let request_expr: &Expr = {
+        let mut found: Option<&Expr> = None;
+        for (_, b) in &rule.logic.bindings {
+            if let Some(r) = first_fetch_for(b, &connection.name) {
+                found = Some(r);
+                break;
+            }
+        }
+        if found.is_none() {
+            found = first_fetch_for(&rule.logic.value, &connection.name);
+        }
+        found.ok_or_else(|| NativeError {
+            message: format!(
+                "internal: rule '{}' lists connection '{}' but no fetch site found",
+                rule.name, connection.name
+            ),
+        })?
+    };
+    if !request_is_literal_only(request_expr) {
+        return Err(NativeError {
+            message: format!(
+                "phase 11 slice 1: fetch('{}', request) request must be a text literal (or concat of literals); per-record / dynamic request bodies land in a later slice",
+                connection.name
+            ),
+        });
+    }
+
+    // === socket(AF_INET=2, SOCK_STREAM=1, 0) ===
+    code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x29, 0x00, 0x00, 0x00]); // mov rax, 41
+    code.extend_from_slice(&[0x48, 0xC7, 0xC7, 0x02, 0x00, 0x00, 0x00]); // mov rdi, 2
+    code.extend_from_slice(&[0x48, 0xC7, 0xC6, 0x01, 0x00, 0x00, 0x00]); // mov rsi, 1
+    code.extend_from_slice(&[0x48, 0x31, 0xD2]); // xor rdx, rdx
+    code.extend_from_slice(&[0x0F, 0x05]); // syscall
+    // test rax, rax ; js rel32 (abort patch)
+    code.extend_from_slice(&[0x48, 0x85, 0xC0]);
+    code.extend_from_slice(&[0x0F, 0x88]);
+    abort_patches.push(code.len());
+    code.extend_from_slice(&[0, 0, 0, 0]);
+    code.extend_from_slice(&[0x49, 0x89, 0xC7]); // mov r15, rax  (socket fd)
+
+    // === Inline sockaddr_in (16 bytes), then take its address ===
+    // struct sockaddr_in {
+    //   sin_family: u16 = AF_INET = 2  (little-endian on x86: 02 00)
+    //   sin_port:   u16 (big-endian: high byte first)
+    //   sin_addr:   u32 (big-endian: octet[0] octet[1] octet[2] octet[3])
+    //   sin_zero:   [u8; 8] = 0
+    // }
+    let mut sockaddr = [0u8; 16];
+    sockaddr[0] = 2; // sin_family low
+    sockaddr[1] = 0; // sin_family high
+    let port_be = connection.port.to_be_bytes();
+    sockaddr[2] = port_be[0];
+    sockaddr[3] = port_be[1];
+    let octets: Vec<u8> = connection
+        .host
+        .split('.')
+        .map(|o| o.parse::<u8>().expect("verifier checked host octets"))
+        .collect();
+    sockaddr[4] = octets[0];
+    sockaddr[5] = octets[1];
+    sockaddr[6] = octets[2];
+    sockaddr[7] = octets[3];
+    // sockaddr[8..16] already zero (padding)
+
+    // jmp over the 16-byte sockaddr literal embedded in the code stream.
+    code.push(0xEB);
+    code.push(16u8);
+    let sockaddr_addr = code.len();
+    code.extend_from_slice(&sockaddr);
+
+    // === connect(r15, &sockaddr_in, 16) ===
+    code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x2A, 0x00, 0x00, 0x00]); // mov rax, 42
+    code.extend_from_slice(&[0x4C, 0x89, 0xFF]); // mov rdi, r15
+    // lea rsi, [rip + rel32] → sockaddr
+    let end = code.len() + 7;
+    let rel32 = sockaddr_addr as i32 - end as i32;
+    code.extend_from_slice(&[0x48, 0x8D, 0x35]);
+    code.extend_from_slice(&rel32.to_le_bytes());
+    code.extend_from_slice(&[0x48, 0xC7, 0xC2, 0x10, 0x00, 0x00, 0x00]); // mov rdx, 16
+    code.extend_from_slice(&[0x0F, 0x05]); // syscall
+    // test rax, rax ; js rel32 (abort patch) — connect returns 0 on success,
+    // -errno on failure. Sign-bit checks both.
+    code.extend_from_slice(&[0x48, 0x85, 0xC0]);
+    code.extend_from_slice(&[0x0F, 0x88]);
+    abort_patches.push(code.len());
+    code.extend_from_slice(&[0, 0, 0, 0]);
+
+    // === Build request bytes via emit_text_produce_ptrlen ===
+    // Slice 1 restricts the request to literals, so no per-record field
+    // refs are possible. We pass empty offsets/field_ranges/text_bindings
+    // since the literal-only path doesn't consult them.
+    let empty_offsets: HashMap<&str, i32> = HashMap::new();
+    let empty_ranges: HashMap<&str, (i64, i64)> = HashMap::new();
+    let empty_bindings: TextBindings<'_> = HashMap::new();
+    emit_text_produce_ptrlen(
+        code,
+        request_expr,
+        &rule.input_name,
+        input_concept,
+        all_rules,
+        &empty_offsets,
+        &empty_ranges,
+        &empty_bindings,
+    )?;
+    // After emit_text_produce_ptrlen: rax = req_ptr, rdx = req_len.
+    // Stash into rsi (write expects buffer in rsi); rdx already correct.
+    // mov rsi, rax
+    code.extend_from_slice(&[0x48, 0x89, 0xC6]);
+
+    // === write(r15, rsi, rdx) ===
+    code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x01, 0x00, 0x00, 0x00]); // mov rax, 1
+    code.extend_from_slice(&[0x4C, 0x89, 0xFF]); // mov rdi, r15
+    code.extend_from_slice(&[0x0F, 0x05]); // syscall
+    code.extend_from_slice(&[0x48, 0x85, 0xC0]);
+    code.extend_from_slice(&[0x0F, 0x88]);
+    abort_patches.push(code.len());
+    code.extend_from_slice(&[0, 0, 0, 0]);
+
+    // === read(r15, buf, max_response) ===
+    code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x00, 0x00, 0x00, 0x00]); // mov rax, 0
+    code.extend_from_slice(&[0x4C, 0x89, 0xFF]); // mov rdi, r15
+    // lea rsi, [rbp + buf_slot]
+    if buf_slot >= -128 {
+        code.extend_from_slice(&[0x48, 0x8D, 0x75]);
+        code.push(buf_slot as u8);
+    } else {
+        code.extend_from_slice(&[0x48, 0x8D, 0xB5]);
+        code.extend_from_slice(&buf_slot.to_le_bytes());
+    }
+    // mov rdx, max_response
+    code.extend_from_slice(&[0x48, 0xC7, 0xC2]);
+    code.extend_from_slice(&(connection.max_response as i32).to_le_bytes());
+    code.extend_from_slice(&[0x0F, 0x05]); // syscall
+    code.extend_from_slice(&[0x48, 0x85, 0xC0]);
+    code.extend_from_slice(&[0x0F, 0x88]);
+    abort_patches.push(code.len());
+    code.extend_from_slice(&[0, 0, 0, 0]);
+
+    // Store len: mov [rbp + len_slot], rax
+    if len_slot >= -128 {
+        code.extend_from_slice(&[0x48, 0x89, 0x45]);
+        code.push(len_slot as u8);
+    } else {
+        code.extend_from_slice(&[0x48, 0x89, 0x85]);
+        code.extend_from_slice(&len_slot.to_le_bytes());
+    }
+    // Store ptr: lea rax, [rbp + buf_slot] ; mov [rbp + ptr_slot], rax
+    if buf_slot >= -128 {
+        code.extend_from_slice(&[0x48, 0x8D, 0x45]);
+        code.push(buf_slot as u8);
+    } else {
+        code.extend_from_slice(&[0x48, 0x8D, 0x85]);
+        code.extend_from_slice(&buf_slot.to_le_bytes());
+    }
+    if ptr_slot >= -128 {
+        code.extend_from_slice(&[0x48, 0x89, 0x45]);
+        code.push(ptr_slot as u8);
+    } else {
+        code.extend_from_slice(&[0x48, 0x89, 0x85]);
+        code.extend_from_slice(&ptr_slot.to_le_bytes());
+    }
+
+    // === close(r15) — best-effort, mirrors the resource path ===
+    code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x03, 0x00, 0x00, 0x00]); // mov rax, 3
+    code.extend_from_slice(&[0x4C, 0x89, 0xFF]); // mov rdi, r15
+    code.extend_from_slice(&[0x0F, 0x05]); // syscall
+
+    Ok((ptr_slot, len_slot, buf_slot, new_next))
+}
+
 fn emit_record_loop_prologue<'a>(
     code: &mut Vec<u8>,
     rule: &'a Rule,
@@ -676,6 +1016,7 @@ fn emit_record_loop_prologue<'a>(
     context_concept: Option<&'a Concept>,
     all_rules: &HashMap<&str, &Rule>,
     all_resources: &HashMap<&str, &'a Resource>,
+    all_connections: &HashMap<&str, &'a Connection>,
 ) -> Result<RecordLoopCtx<'a>, NativeError> {
     let n_ctx = context_concept.map_or(0, |c| c.fields.len());
     let nfields = input_concept.fields.len();
@@ -728,8 +1069,29 @@ fn emit_record_loop_prologue<'a>(
         .iter()
         .map(|r| 16 + (((r.max_bytes as i32) + 7) & !7))
         .sum();
+    // Phase 11 slice 1: enumerate the connections the rule fetches, in
+    // source order. Each contributes 2 slots (ptr, len) plus the response
+    // buffer (max_response padded to 8). Same shape as resources.
+    let referenced_connections: Vec<&Connection> = {
+        let names = collect_rule_fetch_names(rule);
+        let mut out: Vec<&Connection> = Vec::with_capacity(names.len());
+        for name in &names {
+            let c = all_connections.get(name.as_str()).ok_or_else(|| NativeError {
+                message: format!(
+                    "rule '{}' fetches connection '{}' but no top-level `connection {}` was declared",
+                    rule.name, name, name
+                ),
+            })?;
+            out.push(*c);
+        }
+        out
+    };
+    let connection_extra_bytes: i32 = referenced_connections
+        .iter()
+        .map(|c| 16 + (((c.max_response as i32) + 7) & !7))
+        .sum();
     let frame_slots = n_ctx + nfields + n_binding_slots + n_reserved;
-    let frame_size = (frame_slots * 8) as i32 + resource_extra_bytes;
+    let frame_size = (frame_slots * 8) as i32 + resource_extra_bytes + connection_extra_bytes;
     let base = (n_ctx + nfields + n_binding_slots) as i32;
     let match_slot: i32 = -((base + 1) * 8);
     let err_ptr_slot: i32 = -((base + 2) * 8);
@@ -799,6 +1161,26 @@ fn emit_record_loop_prologue<'a>(
             &mut resource_abort_patches,
         );
         text_bindings.insert(r.name.as_str(), (ptr_slot, len_slot));
+        resource_next_slot = new_next;
+    }
+
+    // ─── Phase 11 slice 1: fetch every referenced connection ONCE before
+    // the record loop. socket → connect → write(request) → read(response)
+    // → close, with (ptr, len) of the response stored at the registered
+    // rbp slots. Failure of any fallible syscall jumps to the same shared
+    // sys_exit(1) abort label as the resource path (single label, both
+    // paths patch into it).
+    for c in &referenced_connections {
+        let (ptr_slot, len_slot, _buf_slot, new_next) = emit_connection_fetch_sequence(
+            code,
+            c,
+            rule,
+            input_concept,
+            all_rules,
+            resource_next_slot,
+            &mut resource_abort_patches,
+        )?;
+        text_bindings.insert(c.name.as_str(), (ptr_slot, len_slot));
         resource_next_slot = new_next;
     }
 
@@ -982,10 +1364,11 @@ fn emit_full_program(
     context_concept: Option<&Concept>,
     all_rules: &HashMap<&str, &Rule>,
     all_resources: &HashMap<&str, &Resource>,
+    all_connections: &HashMap<&str, &Connection>,
 ) -> Result<Vec<u8>, NativeError> {
     let is_bool = rule.output_ty == Type::Bool;
     let mut code = Vec::new();
-    let ctx = emit_record_loop_prologue(&mut code, rule, concept, context_concept, all_rules, all_resources)?;
+    let ctx = emit_record_loop_prologue(&mut code, rule, concept, context_concept, all_rules, all_resources, all_connections)?;
 
     // Evaluate final expression — result in rax
     emit_eval_expr(
@@ -1046,9 +1429,10 @@ fn emit_text_program(
     concept: &Concept,
     all_rules: &HashMap<&str, &Rule>,
     all_resources: &HashMap<&str, &Resource>,
+    all_connections: &HashMap<&str, &Connection>,
 ) -> Result<Vec<u8>, NativeError> {
     let mut code = Vec::new();
-    let ctx = emit_record_loop_prologue(&mut code, rule, concept, None, all_rules, all_resources)?;
+    let ctx = emit_record_loop_prologue(&mut code, rule, concept, None, all_rules, all_resources, all_connections)?;
 
     // Phase 2I — pass the text_bindings built from the prologue's let-eval
     // loop so text-write resolves Ident(let-name) as a BoundText (same path
@@ -1122,6 +1506,13 @@ fn classify_concat_arg(
         // emit_concat_fill can resolve it through the same machinery
         // serving Phase 2F's err_var and Phase 2I's text lets.
         Expr::Read(name) if text_bindings.contains_key(name.as_str()) => {
+            Some(ConcatArgKind::BoundText)
+        }
+        // Phase 11 slice 1: fetch(<connection>, _) shares the same
+        // (ptr, len) slot shape — the prologue's emit_connection_fetch_sequence
+        // populated the response slots and registered the connection
+        // name in text_bindings.
+        Expr::Fetch(name, _) if text_bindings.contains_key(name.as_str()) => {
             Some(ConcatArgKind::BoundText)
         }
         Expr::Call(_, _) => Some(ConcatArgKind::CallText),
@@ -1706,6 +2097,20 @@ fn emit_text_produce_ptrlen(
             }
             Ok(())
         }
+        // Phase 11 slice 1: fetch(<connection>, _) — same shape as read,
+        // populated by emit_connection_fetch_sequence in the prologue.
+        Expr::Fetch(name, _) if text_bindings.contains_key(name.as_str()) => {
+            let (ptr_slot, len_slot) = text_bindings[name.as_str()];
+            load_rax_from_rbp(code, ptr_slot);
+            if len_slot >= -128 {
+                code.extend_from_slice(&[0x48, 0x8B, 0x55]);
+                code.push(len_slot as u8);
+            } else {
+                code.extend_from_slice(&[0x48, 0x8B, 0x95]);
+                code.extend_from_slice(&len_slot.to_le_bytes());
+            }
+            Ok(())
+        }
         Expr::Concat(inner_args) => {
             // Recurse into a nested concat. is_nested=true so the inner
             // skips `mov r9, rsp` (outer's r9 survives) and rejects CallText
@@ -1795,8 +2200,11 @@ fn emit_concat_fill(
                 // No strlen needed at fill time — length is already stored.
                 // Phase 9 slice 1 routes Expr::Read here too — same shape,
                 // identical (ptr, len) representation in text_bindings.
+                // Phase 11 slice 1 routes Expr::Fetch here on the same
+                // basis — the connection's response (ptr, len) lives in
+                // the bound text slot the prologue allocated.
                 let bound_name = match arg {
-                    Expr::Ident(n) | Expr::Read(n) => Some(n.as_str()),
+                    Expr::Ident(n) | Expr::Read(n) | Expr::Fetch(n, _) => Some(n.as_str()),
                     _ => None,
                 };
                 if let Some(name) = bound_name {
@@ -2334,8 +2742,13 @@ fn emit_text_write_to_fd(
     // Write them directly to the fd; no strlen (length is stored).
     // Phase 9 slice 1 extends this: Expr::Read shares the exact same
     // (ptr, len) slot shape, so funnel both through the same code path.
+    // Phase 11 slice 1: Expr::Fetch(name, _) lives in the same slot
+    // shape too — the prologue stored the response (ptr, len) at the
+    // slots registered in text_bindings under the connection name. The
+    // request bytes Expr inside the Fetch is consumed by the prologue;
+    // here we only consult the connection name.
     let bound_name = match text_expr {
-        Expr::Ident(n) | Expr::Read(n) => Some(n.as_str()),
+        Expr::Ident(n) | Expr::Read(n) | Expr::Fetch(n, _) => Some(n.as_str()),
         _ => None,
     };
     if let Some(name) = bound_name {
@@ -2612,6 +3025,7 @@ fn emit_result_program(
     concept: &Concept,
     all_rules: &HashMap<&str, &Rule>,
     all_resources: &HashMap<&str, &Resource>,
+    all_connections: &HashMap<&str, &Connection>,
 ) -> Result<Vec<u8>, NativeError> {
     // Restrict to Result(number, text) for now — the calling convention is
     // different for other Result shapes (e.g. text payload on Ok) and they
@@ -2634,7 +3048,7 @@ fn emit_result_program(
     }
 
     let mut code = Vec::new();
-    let ctx = emit_record_loop_prologue(&mut code, rule, concept, None, all_rules, all_resources)?;
+    let ctx = emit_record_loop_prologue(&mut code, rule, concept, None, all_rules, all_resources, all_connections)?;
 
     // Evaluate the logic in Result context. Every Ok/Err leaf self-terminates
     // with a jmp loop_top, so there is no fall-through to handle here.
@@ -3179,6 +3593,7 @@ fn emit_record_program(
     all_concepts: &[&Concept],
     all_rules: &HashMap<&str, &Rule>,
     all_resources: &HashMap<&str, &Resource>,
+    all_connections: &HashMap<&str, &Connection>,
 ) -> Result<Vec<u8>, NativeError> {
     // Validate output concept's fields — native today handles number + text only.
     for f in &output_concept.fields {
@@ -3196,7 +3611,7 @@ fn emit_record_program(
     }
 
     let mut code = Vec::new();
-    let ctx = emit_record_loop_prologue(&mut code, rule, input_concept, None, all_rules, all_resources)?;
+    let ctx = emit_record_loop_prologue(&mut code, rule, input_concept, None, all_rules, all_resources, all_connections)?;
 
     emit_eval_record_expr(
         &mut code,
@@ -4978,11 +5393,12 @@ fn emit_reaction_program(
     concept: &Concept,
     all_rules: &HashMap<&str, &Rule>,
     all_resources: &HashMap<&str, &Resource>,
+    all_connections: &HashMap<&str, &Connection>,
 ) -> Result<Vec<u8>, NativeError> {
     // Both Print and AppendFile effects are handled below.
 
     let mut code = Vec::new();
-    let ctx = emit_record_loop_prologue(&mut code, trigger_rule, concept, None, all_rules, all_resources)?;
+    let ctx = emit_record_loop_prologue(&mut code, trigger_rule, concept, None, all_rules, all_resources, all_connections)?;
 
     // Evaluate trigger rule's logic → rax (0 = no fire, nonzero = fire).
     emit_eval_expr(
@@ -5119,6 +5535,11 @@ fn max_stack_depth(expr: &Expr) -> usize {
         // Phase 9 slice 1 stub: a Read leaf has no eval-stack consumption
         // (the result lands in registers/slots like any other text).
         Expr::Read(_) => 0,
+        // Phase 11 slice 1: a Fetch's response lands in (ptr, len) slots
+        // populated by the prologue, exactly like Read. The request bytes
+        // expression is evaluated above loop_top once per rule invocation,
+        // so its eval-stack depth doesn't accumulate at the call site.
+        Expr::Fetch(_, _) => 0,
     }
 }
 
@@ -5595,6 +6016,12 @@ fn emit_eval_expr(
         // someone tried to use it where a number was expected.
         Expr::Read(_) => Err(NativeError {
             message: "Expr::Read in number context — read() returns text, use it in a text-typed position".into(),
+        }),
+        // Phase 11 slice 1: same shape as Read — fetch() returns text,
+        // not a number. The verifier already rejects this; the error
+        // here is a defensive catch.
+        Expr::Fetch(_, _) => Err(NativeError {
+            message: "Expr::Fetch in number context — fetch() returns text, use it in a text-typed position".into(),
         }),
     }
 }
@@ -7261,6 +7688,7 @@ fn expr_kind(e: &Expr) -> &'static str {
         Expr::Record(_, _) => "Record",
         Expr::Concat(_) => "Concat",
         Expr::Read(_) => "Read",
+        Expr::Fetch(_, _) => "Fetch",
     }
 }
 
@@ -10956,5 +11384,209 @@ service web
 
         let _ = std::fs::remove_file(&out);
         let _ = std::fs::remove_file(&resource_path);
+    }
+
+    /// Phase 11 slice 1: a rule whose logic is `fetch(<connection>, "...")`
+    /// must embed the socket / connect / write / read / close syscalls,
+    /// the inline sockaddr_in literal (family=2, htons(port), inet_aton(host),
+    /// 8 bytes of padding), and the shared sys_exit(1) abort sequence at
+    /// the binary's tail (the same one the resource path uses). Together
+    /// these prove the prologue laid down a complete fetch sequence and
+    /// wired its failure paths into the abort label.
+    #[test]
+    fn phase11_slice1_fetch_embeds_socket_connect_and_sockaddr() {
+        let src = r#"@verbose 0.1.0
+
+connection upstream
+  @intention: "remote endpoint we probe"
+  @source: invoices.intent:1
+  host: "127.0.0.1"
+  port: 19000
+  max_response: 1024
+  on_connect_error: abort
+
+concept Tick
+  @intention: "trivial input record"
+  @source: invoices.intent:1
+  fields:
+    n : number
+
+rule probe
+  @intention: "fetch upstream and emit the response"
+  @source: invoices.intent:1
+  input:
+    t : Tick
+  output:
+    out : text
+  logic:
+    out = fetch(upstream, "GET / HTTP/1.0\r\n\r\n")
+  proofs:
+    purity:
+      reads: [upstream]
+      calls: []
+    termination:
+      bound: 2
+"#;
+        let tokens = crate::lexer::Lexer::new(src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens)
+            .parse_program()
+            .expect("parse");
+
+        let out = std::env::temp_dir().join("verbosec_test_phase11_slice1_fetch_bin");
+        compile_native(&program, "probe", out.to_str().unwrap(), false, false)
+            .expect("native compile of fetch-using rule");
+
+        let bytes = std::fs::read(&out).expect("read output binary");
+        let size = bytes.len();
+        assert!(
+            (500..2000).contains(&size),
+            "phase 11 slice 1 binary size {} outside [500, 2000] envelope",
+            size
+        );
+
+        // sys_socket immediate: mov rax, 41 — encoded 48 C7 C0 29 00 00 00.
+        let socket_seq = [0x48, 0xC7, 0xC0, 0x29, 0x00, 0x00, 0x00];
+        assert!(
+            bytes.windows(socket_seq.len()).any(|w| w == socket_seq),
+            "expected `mov rax, 41` (sys_socket) in fetch binary"
+        );
+        // sys_connect immediate: mov rax, 42 — encoded 48 C7 C0 2A 00 00 00.
+        let connect_seq = [0x48, 0xC7, 0xC0, 0x2A, 0x00, 0x00, 0x00];
+        assert!(
+            bytes.windows(connect_seq.len()).any(|w| w == connect_seq),
+            "expected `mov rax, 42` (sys_connect) in fetch binary"
+        );
+        // sys_close immediate: mov rax, 3 — encoded 48 C7 C0 03 00 00 00.
+        let close_seq = [0x48, 0xC7, 0xC0, 0x03, 0x00, 0x00, 0x00];
+        assert!(
+            bytes.windows(close_seq.len()).any(|w| w == close_seq),
+            "expected `mov rax, 3` (sys_close) in fetch binary"
+        );
+        // Inline sockaddr_in: family=2 (02 00 little-endian), htons(19000)=0x4A38
+        // (high byte 0x4A, low byte 0x38), addr 127.0.0.1 = 7F 00 00 01.
+        // Layout: [02 00 4A 38 7F 00 00 01 00 00 00 00 00 00 00 00].
+        let sockaddr_marker = [
+            0x02, 0x00, 0x4A, 0x38, 0x7F, 0x00, 0x00, 0x01,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        assert!(
+            bytes.windows(sockaddr_marker.len()).any(|w| w == sockaddr_marker),
+            "expected inline sockaddr_in literal (family=2, htons(19000), 127.0.0.1, padding)"
+        );
+        // Shared abort label: mov rax, 60 ; mov rdi, 1 ; syscall — same one
+        // the resource path patches into when open/read fail.
+        let abort_seq = [
+            0x48, 0xC7, 0xC0, 0x3C, 0x00, 0x00, 0x00,
+            0x48, 0xC7, 0xC7, 0x01, 0x00, 0x00, 0x00,
+            0x0F, 0x05,
+        ];
+        assert!(
+            bytes.windows(abort_seq.len()).any(|w| w == abort_seq),
+            "expected sys_exit(1) abort sequence in fetch binary"
+        );
+
+        let _ = std::fs::remove_file(out);
+    }
+
+    /// Phase 11 slice 1: end-to-end. Spin up a tiny TCP listener on a
+    /// fixed loopback port, compile a rule that fetches from it, run
+    /// the binary, and assert stdout contains the response body the
+    /// listener wrote back. Proves the wire round-trip is real, not
+    /// just bytes embedded in the binary.
+    #[test]
+    fn phase11_slice1_fetch_round_trips_against_test_listener() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::process::Command;
+        use std::thread;
+        use std::time::Duration;
+
+        let port: u16 = 19000;
+        // Bind FIRST, then start a thread to accept once the binary
+        // connects. Binding from the test thread guarantees the kernel
+        // is ready before we spawn the binary — no fragile sleep race.
+        let listener = TcpListener::bind(("127.0.0.1", port))
+            .expect("bind test listener");
+        listener
+            .set_nonblocking(false)
+            .expect("blocking listener");
+
+        let server = thread::spawn(move || {
+            let (mut sock, _) = listener.accept().expect("accept");
+            sock.set_read_timeout(Some(Duration::from_secs(2))).ok();
+            let mut req = [0u8; 1024];
+            let _ = sock.read(&mut req);
+            sock.write_all(b"HTTP/1.0 200 OK\r\n\r\nhealthy")
+                .expect("write response");
+            // Drop closes the socket — the binary's read returns EOF.
+        });
+
+        let src = format!(
+            r#"@verbose 0.1.0
+
+connection upstream
+  @intention: "test endpoint"
+  @source: invoices.intent:1
+  host: "127.0.0.1"
+  port: {}
+  max_response: 1024
+  on_connect_error: abort
+
+concept Tick
+  @intention: "trivial input record"
+  @source: invoices.intent:1
+  fields:
+    n : number
+
+rule probe
+  @intention: "fetch upstream and emit the response"
+  @source: invoices.intent:1
+  input:
+    t : Tick
+  output:
+    out : text
+  logic:
+    out = fetch(upstream, "GET /health HTTP/1.0\r\n\r\n")
+  proofs:
+    purity:
+      reads: [upstream]
+      calls: []
+    termination:
+      bound: 2
+"#,
+            port
+        );
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens)
+            .parse_program()
+            .expect("parse");
+
+        let out = std::env::temp_dir().join("verbosec_test_phase11_slice1_runtime_bin");
+        compile_native(&program, "probe", out.to_str().unwrap(), false, false)
+            .expect("native compile of fetch-using rule");
+
+        let result = Command::new(&out)
+            .arg("1")
+            .output()
+            .expect("run fetch binary");
+        // Reap the listener thread so a panic doesn't leave a dangling fd.
+        let _ = server.join();
+
+        assert!(
+            result.status.success(),
+            "binary exited with non-zero: {:?}",
+            result
+        );
+        // emit_text_program writes the response bytes followed by a newline.
+        // The body the test listener sent back was b"HTTP/1.0 200 OK\r\n\r\nhealthy".
+        let mut expected = b"HTTP/1.0 200 OK\r\n\r\nhealthy".to_vec();
+        expected.push(b'\n');
+        assert_eq!(
+            result.stdout, expected,
+            "stdout did not match listener response: stdout={:?}, stderr={:?}",
+            result.stdout, result.stderr
+        );
+
+        let _ = std::fs::remove_file(out);
     }
 }

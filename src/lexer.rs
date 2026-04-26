@@ -293,6 +293,12 @@ impl<'a> Lexer<'a> {
                     match esc {
                         b'n' => s.push('\n'),
                         b't' => s.push('\t'),
+                        // Phase 11 slice 1: `\r` joins the closed set so
+                        // wire-protocol literals (HTTP/1.0 CRLF, raw TCP
+                        // line terminators) can be expressed without
+                        // out-of-band bytes. Same audit discipline as the
+                        // other escapes — typos still fail at lex time.
+                        b'r' => s.push('\r'),
                         b'\\' => s.push('\\'),
                         b'"' => s.push('"'),
                         other => {
@@ -300,7 +306,7 @@ impl<'a> Lexer<'a> {
                                 line: self.line,
                                 col: self.col,
                                 message: format!(
-                                    "unknown escape '\\{}' (supported: \\n, \\t, \\\\, \\\")",
+                                    "unknown escape '\\{}' (supported: \\n, \\r, \\t, \\\\, \\\")",
                                     other as char
                                 ),
                             });

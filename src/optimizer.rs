@@ -54,6 +54,9 @@ fn count_nodes(expr: &Expr) -> usize {
         // Phase 9 slice 1 stub: a Read carries a resource name (no child Expr
         // to recurse on), so it counts as one node.
         Expr::Read(_) => 1,
+        // Phase 11 slice 1: a Fetch carries the connection name plus a
+        // request bytes Expr — count this node + recurse.
+        Expr::Fetch(_, req) => 1 + count_nodes(req),
     }
 }
 
@@ -99,6 +102,10 @@ pub fn optimize_program(program: &Program) -> (Program, OptStats) {
                 // Phase 9 slice 1 stub: resources are declarative (no logic
                 // expression to optimise); pass through unchanged.
                 Item::Resource(r) => Item::Resource(r.clone()),
+                // Phase 11 slice 1 stub: connections are declarative; the
+                // request bytes live inside the rule's logic and are
+                // optimised through `optimize_expr` like any other Expr.
+                Item::Connection(c) => Item::Connection(c.clone()),
             })
             .collect(),
     };
@@ -331,6 +338,11 @@ fn substitute_ident(expr: &Expr, name: &str, replacement: &Expr) -> Expr {
         // Phase 9 slice 1 stub: Read carries a resource name (no Expr child
         // to substitute into); pass through unchanged.
         Expr::Read(n) => Expr::Read(n.clone()),
+        // Phase 11 slice 1: substitute through the request bytes Expr.
+        Expr::Fetch(n, req) => Expr::Fetch(
+            n.clone(),
+            Box::new(substitute_ident(req, name, replacement)),
+        ),
     }
 }
 
@@ -506,6 +518,13 @@ pub fn optimize_expr(
         // Phase 9 slice 1 stub: a file read has no compile-time optimisation
         // path (the contents aren't known until runtime); pass through.
         Expr::Read(name) => Expr::Read(name.clone()),
+        // Phase 11 slice 1: a TCP fetch has no compile-time optimisation
+        // path (response bytes aren't known until runtime); recurse into
+        // the request bytes Expr.
+        Expr::Fetch(name, req) => Expr::Fetch(
+            name.clone(),
+            Box::new(optimize_expr(req, input_name, field_ranges)),
+        ),
     }
 }
 

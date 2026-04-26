@@ -90,11 +90,36 @@ pub fn verify_program(program: &Program, base_dir: &StdPath) -> Vec<VerifyError>
         }
     }
 
+    // Phase 11 slice 1: collect declared connection names for cross-checking
+    // every `fetch(name, ...)` reference. Same global namespace discipline as
+    // resources; a connection name must not collide with a resource name
+    // (both flow through `reads:` purity facts as a single identifier path).
+    let mut all_connections: HashSet<String> = HashSet::new();
+    for item in &program.items {
+        if let Item::Connection(c) = item {
+            if !all_connections.insert(c.name.clone()) {
+                errors.push(VerifyError {
+                    context: format!("connection '{}'", c.name),
+                    message: format!("duplicate connection name '{}'", c.name),
+                });
+            }
+            if all_resources.contains(&c.name) {
+                errors.push(VerifyError {
+                    context: format!("connection '{}'", c.name),
+                    message: format!(
+                        "connection name '{}' collides with a resource of the same name; reads: lists merge both namespaces",
+                        c.name
+                    ),
+                });
+            }
+        }
+    }
+
     for item in &program.items {
         match item {
             Item::Concept(c) => verify_concept(c, base_dir, &mut errors),
             Item::Rule(r) => {
-                verify_rule(r, &concepts, &all_rules, &all_resources, base_dir, &mut errors);
+                verify_rule(r, &concepts, &all_rules, &all_resources, &all_connections, base_dir, &mut errors);
                 // Phase 9 slice 1: every read(name) in the rule's logic
                 // must resolve to a declared resource. This is a separate
                 // pass to keep check_expr_against's signature stable; the
@@ -111,6 +136,64 @@ pub fn verify_program(program: &Program, base_dir: &StdPath) -> Vec<VerifyError>
                             message: format!(
                                 "read('{}') references unknown resource — declare it at top level with `resource {} ...`",
                                 name, name
+                            ),
+                        });
+                    }
+                }
+                // Phase 11 slice 1: every fetch(name, ...) in the rule's
+                // logic must resolve to a declared connection. Mirrors the
+                // resource cross-check above — same shallow walk, separate
+                // namespace.
+                let mut fetch_refs: Vec<String> = Vec::new();
+                collect_fetch_names(&r.logic.value, &mut fetch_refs);
+                for (_, expr) in &r.logic.bindings {
+                    collect_fetch_names(expr, &mut fetch_refs);
+                }
+                for name in &fetch_refs {
+                    if !all_connections.contains(name) {
+                        errors.push(VerifyError {
+                            context: format!("rule '{}' / logic", r.name),
+                            message: format!(
+                                "fetch('{}', ...) references unknown connection — declare it at top level with `connection {} ...`",
+                                name, name
+                            ),
+                        });
+                    }
+                }
+                // Slice-1 limit: at most one fetch per connection per rule
+                // invocation. The native emitter allocates one (ptr, len,
+                // buf) slot triple per connection above loop_top and would
+                // need a runtime dispatch on the request bytes to fire
+                // multiple distinct sequences. That dispatch lands in a
+                // later slice; reject the shape here with a clear message.
+                let mut seen: HashSet<&String> = HashSet::new();
+                let mut dups: Vec<String> = Vec::new();
+                for n in &fetch_refs {
+                    if !seen.insert(n) {
+                        if !dups.contains(n) {
+                            dups.push(n.clone());
+                        }
+                    }
+                }
+                // collect_fetch_names dedupes already, so dups will be empty;
+                // do an explicit count-walk over the AST to catch true
+                // duplicates (the same connection used twice).
+                let mut count_walk: Vec<String> = Vec::new();
+                collect_fetch_names_with_dups(&r.logic.value, &mut count_walk);
+                for (_, expr) in &r.logic.bindings {
+                    collect_fetch_names_with_dups(expr, &mut count_walk);
+                }
+                let mut counts: HashMap<&str, usize> = HashMap::new();
+                for n in &count_walk {
+                    *counts.entry(n.as_str()).or_insert(0) += 1;
+                }
+                for (n, c) in &counts {
+                    if *c > 1 {
+                        errors.push(VerifyError {
+                            context: format!("rule '{}' / logic", r.name),
+                            message: format!(
+                                "slice 1: at most one fetch per connection per rule; '{}' is fetched {} times",
+                                n, c
                             ),
                         });
                     }
@@ -159,6 +242,7 @@ pub fn verify_program(program: &Program, base_dir: &StdPath) -> Vec<VerifyError>
             }
             Item::Service(s) => verify_service(s, &concepts, &all_rules, base_dir, &mut errors),
             Item::Resource(r) => verify_resource_stub(r, base_dir, &mut errors),
+            Item::Connection(c) => verify_connection_stub(c, base_dir, &mut errors),
         }
     }
     errors
@@ -224,6 +308,11 @@ fn collect_read_names(expr: &Expr, out: &mut Vec<String>) {
                 collect_read_names(e, out);
             }
         }
+        // Phase 11 slice 1: a fetch's connection name is collected by
+        // collect_fetch_names, not here; we still recurse into the
+        // request bytes expression so any nested read(...) inside a
+        // request body (e.g. fetch(c, read(template))) shows up.
+        Expr::Fetch(_, req) => collect_read_names(req, out),
     }
 }
 
@@ -246,6 +335,176 @@ fn verify_resource_stub(r: &Resource, base_dir: &StdPath, errors: &mut Vec<Verif
             message: format!(
                 "max {} exceeds slice-1 ceiling of {} bytes (64 MiB) — larger files require streaming, a later slice",
                 r.max_bytes, SLICE1_MAX_RESOURCE_BYTES
+            ),
+        });
+    }
+}
+
+/// Phase 11 slice 1 — walk an expression tree collecting every
+/// `Fetch(name, _)` connection name (de-duplicated by caller). Mirrors
+/// `collect_read_names` exactly so the two stay in sync if Expr grows
+/// new variants.
+fn collect_fetch_names(expr: &Expr, out: &mut Vec<String>) {
+    match expr {
+        Expr::Fetch(name, req) => {
+            if !out.contains(name) {
+                out.push(name.clone());
+            }
+            collect_fetch_names(req, out);
+        }
+        Expr::Number(_) | Expr::Text(_) | Expr::Ident(_) => {}
+        Expr::Read(_) => {}
+        Expr::Field(base, _) => collect_fetch_names(base, out),
+        Expr::Binary(_, l, r) => {
+            collect_fetch_names(l, out);
+            collect_fetch_names(r, out);
+        }
+        Expr::Not(i) | Expr::Neg(i) | Expr::Ok(i) | Expr::Err(i) => collect_fetch_names(i, out),
+        Expr::If(c, t, e) => {
+            collect_fetch_names(c, out);
+            collect_fetch_names(t, out);
+            collect_fetch_names(e, out);
+        }
+        Expr::Call(_, args) | Expr::Concat(args) => {
+            for a in args {
+                collect_fetch_names(a, out);
+            }
+        }
+        Expr::Quantifier(_, c, _, body) => {
+            collect_fetch_names(c, out);
+            collect_fetch_names(body, out);
+        }
+        Expr::Fold(c, init, _, _, body) => {
+            collect_fetch_names(c, out);
+            collect_fetch_names(init, out);
+            collect_fetch_names(body, out);
+        }
+        Expr::Map(c, _, body) | Expr::Filter(c, _, body) => {
+            collect_fetch_names(c, out);
+            collect_fetch_names(body, out);
+        }
+        Expr::MatchResult(t, _, ok, _, err) => {
+            collect_fetch_names(t, out);
+            collect_fetch_names(ok, out);
+            collect_fetch_names(err, out);
+        }
+        Expr::Record(_, fields) => {
+            for (_, e) in fields {
+                collect_fetch_names(e, out);
+            }
+        }
+    }
+}
+
+/// Phase 11 slice 1 — same as `collect_fetch_names` but does NOT
+/// deduplicate. Used to enforce the slice-1 "at most one fetch per
+/// connection per rule invocation" rule: if any connection name appears
+/// more than once in the resulting list, the rule is rejected.
+fn collect_fetch_names_with_dups(expr: &Expr, out: &mut Vec<String>) {
+    match expr {
+        Expr::Fetch(name, req) => {
+            out.push(name.clone());
+            collect_fetch_names_with_dups(req, out);
+        }
+        Expr::Number(_) | Expr::Text(_) | Expr::Ident(_) => {}
+        Expr::Read(_) => {}
+        Expr::Field(base, _) => collect_fetch_names_with_dups(base, out),
+        Expr::Binary(_, l, r) => {
+            collect_fetch_names_with_dups(l, out);
+            collect_fetch_names_with_dups(r, out);
+        }
+        Expr::Not(i) | Expr::Neg(i) | Expr::Ok(i) | Expr::Err(i) => {
+            collect_fetch_names_with_dups(i, out)
+        }
+        Expr::If(c, t, e) => {
+            collect_fetch_names_with_dups(c, out);
+            collect_fetch_names_with_dups(t, out);
+            collect_fetch_names_with_dups(e, out);
+        }
+        Expr::Call(_, args) | Expr::Concat(args) => {
+            for a in args {
+                collect_fetch_names_with_dups(a, out);
+            }
+        }
+        Expr::Quantifier(_, c, _, body) => {
+            collect_fetch_names_with_dups(c, out);
+            collect_fetch_names_with_dups(body, out);
+        }
+        Expr::Fold(c, init, _, _, body) => {
+            collect_fetch_names_with_dups(c, out);
+            collect_fetch_names_with_dups(init, out);
+            collect_fetch_names_with_dups(body, out);
+        }
+        Expr::Map(c, _, body) | Expr::Filter(c, _, body) => {
+            collect_fetch_names_with_dups(c, out);
+            collect_fetch_names_with_dups(body, out);
+        }
+        Expr::MatchResult(t, _, ok, _, err) => {
+            collect_fetch_names_with_dups(t, out);
+            collect_fetch_names_with_dups(ok, out);
+            collect_fetch_names_with_dups(err, out);
+        }
+        Expr::Record(_, fields) => {
+            for (_, e) in fields {
+                collect_fetch_names_with_dups(e, out);
+            }
+        }
+    }
+}
+
+/// Phase 11 slice 1: max response buffer size. Same envelope as
+/// SLICE1_MAX_RESOURCE_BYTES — well above any reasonable HTTP/1.0
+/// response payload, well below "we should be streaming".
+const SLICE1_MAX_RESPONSE_BYTES: u32 = 64 * 1024 * 1024;
+
+fn verify_connection_stub(c: &Connection, base_dir: &StdPath, errors: &mut Vec<VerifyError>) {
+    if let Err(msg) = verify_source_ref(&c.source, base_dir) {
+        errors.push(VerifyError {
+            context: format!("connection '{}' / @source", c.name),
+            message: msg,
+        });
+    }
+    // Host: parser already validates the dotted-quad shape, so reaching
+    // here with a malformed host means a bug in the parser (or an AST
+    // built bypassing the parser, e.g. a unit test). Re-validate here so
+    // a programmatic AST cannot smuggle in a bad host.
+    let octets: Vec<&str> = c.host.split('.').collect();
+    let mut host_ok = octets.len() == 4;
+    if host_ok {
+        for o in &octets {
+            match o.parse::<u32>() {
+                Ok(n) if n <= 255 => {}
+                _ => { host_ok = false; break; }
+            }
+        }
+    }
+    if !host_ok {
+        errors.push(VerifyError {
+            context: format!("connection '{}' / host", c.name),
+            message: format!(
+                "host '{}' is not an IPv4 dotted quad (slice 1 supports IPv4 literals only — no DNS, no IPv6)",
+                c.host
+            ),
+        });
+    }
+    if c.port == 0 {
+        errors.push(VerifyError {
+            context: format!("connection '{}' / port", c.name),
+            message: "port must be in 1..=65535".into(),
+        });
+    }
+    if c.max_response == 0 {
+        errors.push(VerifyError {
+            context: format!("connection '{}' / max_response", c.name),
+            message: "max_response must be greater than zero".into(),
+        });
+    }
+    if c.max_response > SLICE1_MAX_RESPONSE_BYTES {
+        errors.push(VerifyError {
+            context: format!("connection '{}' / max_response", c.name),
+            message: format!(
+                "max_response {} exceeds slice-1 ceiling of {} bytes (64 MiB) — larger responses require streaming, a later slice",
+                c.max_response, SLICE1_MAX_RESPONSE_BYTES
             ),
         });
     }
@@ -611,6 +870,7 @@ fn describe_expr_kind(e: &Expr) -> &'static str {
         Expr::Record(_, _) => "record construction",
         Expr::Concat(_) => "concat",
         Expr::Read(_) => "read",
+        Expr::Fetch(_, _) => "fetch",
     }
 }
 
@@ -759,6 +1019,7 @@ fn verify_rule(
     concepts: &HashMap<String, &Concept>,
     all_rules: &[&Rule],
     all_resources: &HashSet<String>,
+    all_connections: &HashSet<String>,
     base_dir: &StdPath,
     errors: &mut Vec<VerifyError>,
 ) {
@@ -796,7 +1057,7 @@ fn verify_rule(
     let facts = collect_logic_facts(&rule.logic);
 
     for path in &facts.reads {
-        if let Some(msg) = validate_read_path(path, rule, input_concept, all_resources) {
+        if let Some(msg) = validate_read_path(path, rule, input_concept, all_resources, all_connections) {
             errors.push(VerifyError {
                 context: format!("rule '{}' / logic", rule.name),
                 message: msg,
@@ -885,6 +1146,25 @@ fn check_expr_against(
             check_expr_against(cond, &Type::Bool, rule, all_rules, input_concept, all_concepts, errors);
             check_expr_against(then_e, expected, rule, all_rules, input_concept, all_concepts, errors);
             check_expr_against(else_e, expected, rule, all_rules, input_concept, all_concepts, errors);
+        }
+        // Phase 11 slice 1: fetch(<connection>, <request_bytes>) — request
+        // bytes must produce text. The fetch itself produces text; the
+        // outer-context check is handled by the fall-through arm via
+        // `infer_expr_type(Expr::Fetch(..))` returning Text.
+        (Expr::Fetch(_, req), expected_outer) => {
+            check_expr_against(req, &Type::Text, rule, all_rules, input_concept, all_concepts, errors);
+            // Outer-context check: fetch returns text. If context expected
+            // something else, surface the same error the fall-through arm
+            // would produce.
+            if expected_outer != &Type::Text {
+                errors.push(VerifyError {
+                    context: format!("rule '{}' / logic", rule.name),
+                    message: format!(
+                        "fetch produces text but the expected type is '{}'",
+                        type_display(expected_outer),
+                    ),
+                });
+            }
         }
         (Expr::MatchResult(_target, _, ok_body, _, err_body), _) => {
             // Both arms must produce `expected`. The target should be a Result —
@@ -1069,6 +1349,10 @@ fn infer_expr_type(
         Expr::Quantifier(_, _, _, _) => Some(Type::Bool),
         Expr::Record(name, _) => Some(Type::Named(name.clone())),
         Expr::Concat(_) => Some(Type::Text),
+        // Phase 11 slice 1: fetch(<connection>, _) returns text — same
+        // inference as read(<resource>). Existence of the connection and
+        // type-check of the request bytes are handled separately.
+        Expr::Fetch(_, _) => Some(Type::Text),
         // Map/Filter/Fold/Ok/Err/MatchResult: deferred until lambda binding
         // tracking lands. Returning None means we do not check; we also do not
         // falsely accept.
@@ -1348,6 +1632,15 @@ fn collect_expr_facts(
         Expr::Read(name) => {
             reads.insert(vec![name.clone()]);
         }
+        // Phase 11 slice 1: a fetch contributes the connection name to
+        // the rule's `reads:` facts (same single-segment shape as
+        // resources). The request bytes expression is also walked so any
+        // field accesses or nested reads inside the request body are
+        // captured too.
+        Expr::Fetch(name, req) => {
+            reads.insert(vec![name.clone()]);
+            collect_expr_facts(req, reads, calls);
+        }
     }
 }
 
@@ -1368,6 +1661,7 @@ fn validate_read_path(
     rule: &Rule,
     input_concept: Option<&Concept>,
     all_resources: &HashSet<String>,
+    all_connections: &HashSet<String>,
 ) -> Option<String> {
     if path.is_empty() {
         return None;
@@ -1382,6 +1676,13 @@ fn validate_read_path(
     // the resource exists; here we just permit the base.
     let is_resource = path.len() == 1 && all_resources.contains(base);
     if is_resource {
+        return None;
+    }
+    // Phase 11 slice 1: also accept top-level connection names. A fetch
+    // contributes the connection name to `reads:` exactly the way a
+    // resource read does — same path shape ([name], length 1, no field).
+    let is_connection = path.len() == 1 && all_connections.contains(base);
+    if is_connection {
         return None;
     }
     if !is_input && !is_context {
@@ -1523,6 +1824,10 @@ fn count_operations(expr: &Expr) -> usize {
         // Phase 9 slice 1 stub: a file read costs one op (the syscall) and
         // has no Expr children to count.
         Expr::Read(_) => 1,
+        // Phase 11 slice 1: a TCP fetch costs roughly one op (the
+        // socket+connect+write+read syscall sequence is opaque to the
+        // proof system) plus the cost of evaluating the request bytes.
+        Expr::Fetch(_, req) => 1 + count_operations(req),
     }
 }
 

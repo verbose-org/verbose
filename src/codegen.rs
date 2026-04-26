@@ -41,6 +41,17 @@ pub fn emit_rust(program: &Program) -> String {
                     r.name, r.intention, r.path, r.max_bytes
                 ));
             }
+            Item::Connection(c) => {
+                // Phase 11 slice 1: TCP connections are native-only today.
+                // Same handling as Resource — emit a header comment so the
+                // output stays coherent; rules that reference fetch(...)
+                // will fail a later pass when we add transpiler support
+                // for TCP I/O.
+                out.push_str(&format!(
+                    "// Connection: {} — \"{}\" → {}:{} [max_response {}] (not transpiled; native-only)\n",
+                    c.name, c.intention, c.host, c.port, c.max_response
+                ));
+            }
         }
     }
     out.push('\n');
@@ -201,8 +212,9 @@ fn emit_expr(expr: &Expr, input_name: &str, concept: Option<&Concept>) -> String
         | Expr::MatchResult(_, _, _, _, _)
         | Expr::Record(_, _)
         | Expr::Concat(_)
-        | Expr::Read(_) => {
-            "(/* collection/result/record/concat/read op: use --run interpreter or --native */false)".to_string()
+        | Expr::Read(_)
+        | Expr::Fetch(_, _) => {
+            "(/* collection/result/record/concat/read/fetch op: use --run interpreter or --native */false)".to_string()
         }
         Expr::Call(name, _args) => {
             if let Some(c) = concept {

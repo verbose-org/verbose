@@ -750,6 +750,10 @@ fn resolve_imports(mut program: ast::Program, base_dir: &Path) -> ast::Program {
                 // Phase 9 slice 1 stub: source-rewriting for imported
                 // resources lands when modules can re-export resources.
                 ast::Item::Resource(_) => {}
+                // Phase 11 slice 1 stub: same handling as Resource —
+                // connections re-exported via modules will need source
+                // rewriting in a later slice.
+                ast::Item::Connection(_) => {}
             }
         }
 

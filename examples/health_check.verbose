@@ -1,0 +1,45 @@
+@verbose 0.1.0
+
+-- Phase 11 slice 1: outbound TCP fetch.
+-- A `connection` block is a top-level audit anchor for an outbound IPv4 endpoint
+-- (one host:port pair, baked literal). A rule references it via fetch(name, request)
+-- which the native backend lowers to socket -> connect -> write -> read -> close
+-- once per rule invocation. The response is a `text` value usable in any text-typed
+-- position; here we wire it straight to stdout.
+
+connection upstream
+  @intention: "Remote health endpoint we probe on each tick"
+  @source: health_check.intent:1
+  host: "127.0.0.1"
+  port: 19000
+  max_response: 1024
+  on_connect_error: abort
+
+concept Tick
+  @intention: "A single tick triggers one probe of the remote endpoint"
+  @source: health_check.intent:1
+
+  fields:
+    nonce : number [0, 1000000]
+
+
+rule check_health
+  @intention: "Fetch /health from upstream and emit the response body verbatim"
+  @source: health_check.intent:1
+
+  input:
+    t : Tick
+
+  output:
+    body : text
+
+  logic:
+    body = fetch(upstream, "GET /health HTTP/1.0\r\n\r\n")
+
+  proofs:
+    purity:
+      reads : [upstream]
+      calls : []
+
+    termination:
+      bound : 2

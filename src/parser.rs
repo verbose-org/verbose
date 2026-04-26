@@ -50,8 +50,10 @@ impl Parser {
                 items.push(Item::Service(self.parse_service()?));
             } else if self.check_ident("resource") {
                 items.push(Item::Resource(self.parse_resource()?));
+            } else if self.check_ident("connection") {
+                items.push(Item::Connection(self.parse_connection()?));
             } else {
-                return Err(self.error("expected 'concept', 'rule', 'reaction', 'service', or 'resource' at top level"));
+                return Err(self.error("expected 'concept', 'rule', 'reaction', 'service', 'resource', or 'connection' at top level"));
             }
         }
         Ok(Program { version, uses, items })
@@ -683,6 +685,22 @@ impl Parser {
                 let resource_name = self.expect_ident_any()?;
                 self.expect_kind(TokenKind::RParen)?;
                 Ok(Expr::Read(resource_name))
+            } else if name == "fetch" && self.check_kind(&TokenKind::LParen) {
+                // Phase 11 slice 1: fetch(<connection_name>, <request_bytes>)
+                // — dial the declared TCP endpoint, send `request_bytes`
+                // (which must produce text), read up to max_response bytes,
+                // close the socket, return the response as text. The
+                // first argument is a bare identifier naming a top-level
+                // connection; the verifier checks that the name resolves
+                // and that the rule's `reads:` proof lists it. The second
+                // argument is any text-producing expression (string
+                // literal, concat, etc.).
+                self.advance(); // (
+                let connection_name = self.expect_ident_any()?;
+                self.expect_kind(TokenKind::Comma)?;
+                let request = self.parse_expr()?;
+                self.expect_kind(TokenKind::RParen)?;
+                Ok(Expr::Fetch(connection_name, Box::new(request)))
             } else if name == "match_result" && self.check_kind(&TokenKind::LParen) {
                 // match_result(target, ok_var => ok_body, err_var => err_body)
                 // The Result consumer. Both arms are explicit — no implicit
@@ -1277,6 +1295,161 @@ impl Parser {
             max_bytes: max_bytes.ok_or_else(|| self.error("resource missing 'max:'"))?,
             on_read_error,
             cache,
+        })
+    }
+
+    /// Phase 11 slice 1: parse a top-level `connection` block declaring an
+    /// outbound TCP endpoint the program can dial at runtime.
+    ///
+    /// Grammar:
+    ///   connection <name>
+    ///     @intention: "..."
+    ///     @source: file.intent:NN
+    ///     host: "X.X.X.X"               (IPv4 dotted quad — no DNS)
+    ///     port: <number>                 (1..=65535)
+    ///     max_response: <number>         (1..=64 MiB; stack buffer bound)
+    ///     on_connect_error: abort        (optional; default = abort)
+    ///
+    /// `host` is a string literal (not an expression) and is parsed here
+    /// as four dot-separated octets so the auditor reads the source — or
+    /// `strings` the binary — and sees every IP the program can attempt
+    /// to dial. `max_response` bounds the per-fetch stack buffer; the
+    /// verifier enforces 1 ≤ max_response ≤ 64 MiB.
+    fn parse_connection(&mut self) -> Result<Connection, ParseError> {
+        self.expect_ident("connection")?;
+        let name = self.expect_ident_any()?;
+        self.expect_kind(TokenKind::Newline)?;
+        self.expect_kind(TokenKind::Indent)?;
+
+        let mut intention = None;
+        let mut source = None;
+        let mut host: Option<String> = None;
+        let mut port: Option<u16> = None;
+        let mut max_response: Option<u32> = None;
+        let mut on_connect_error: ErrorPolicy = ErrorPolicy::Abort;
+
+        while !self.check_kind(&TokenKind::Dedent) && !self.at_eof() {
+            if let Some(attr) = self.peek_attribute_name() {
+                match attr.as_str() {
+                    "intention" => {
+                        self.advance();
+                        self.expect_kind(TokenKind::Colon)?;
+                        intention = Some(self.expect_string()?);
+                        self.expect_kind(TokenKind::Newline)?;
+                    }
+                    "source" => {
+                        self.advance();
+                        self.expect_kind(TokenKind::Colon)?;
+                        source = Some(self.parse_source_ref()?);
+                        self.expect_kind(TokenKind::Newline)?;
+                    }
+                    other => {
+                        return Err(self.error(&format!(
+                            "unknown attribute '@{}' in connection",
+                            other
+                        )));
+                    }
+                }
+            } else if self.check_ident("host") {
+                self.advance();
+                self.expect_kind(TokenKind::Colon)?;
+                let h = self.expect_string().map_err(|_| {
+                    self.error("connection host must be a string literal containing an IPv4 dotted quad (e.g. \"127.0.0.1\")")
+                })?;
+                // Validate IPv4 dotted quad: four 0..=255 octets separated
+                // by dots. Reject DNS names, IPv6, "localhost".
+                let octets: Vec<&str> = h.split('.').collect();
+                if octets.len() != 4 {
+                    return Err(self.error(&format!(
+                        "connection host '{}' is not an IPv4 dotted quad (expected four 0..=255 octets separated by dots; DNS names and IPv6 are not supported in slice 1)",
+                        h
+                    )));
+                }
+                for oct in &octets {
+                    if oct.is_empty() {
+                        return Err(self.error(&format!(
+                            "connection host '{}' has an empty octet",
+                            h
+                        )));
+                    }
+                    let n: u32 = oct.parse().map_err(|_| {
+                        self.error(&format!(
+                            "connection host '{}' octet '{}' is not a number",
+                            h, oct
+                        ))
+                    })?;
+                    if n > 255 {
+                        return Err(self.error(&format!(
+                            "connection host '{}' octet '{}' exceeds 255",
+                            h, oct
+                        )));
+                    }
+                }
+                host = Some(h);
+                self.expect_kind(TokenKind::Newline)?;
+            } else if self.check_ident("port") {
+                self.advance();
+                self.expect_kind(TokenKind::Colon)?;
+                let n = self.expect_number()?;
+                if n < 1 || n > 65535 {
+                    return Err(self.error(&format!(
+                        "connection port {} out of range (must be 1..=65535)",
+                        n
+                    )));
+                }
+                port = Some(n as u16);
+                self.expect_kind(TokenKind::Newline)?;
+            } else if self.check_ident("max_response") {
+                self.advance();
+                self.expect_kind(TokenKind::Colon)?;
+                let n = self.expect_number()?;
+                if n <= 0 {
+                    return Err(self.error(&format!(
+                        "connection max_response must be positive, got {}",
+                        n
+                    )));
+                }
+                if n > u32::MAX as i64 {
+                    return Err(self.error(&format!(
+                        "connection max_response {} exceeds u32 range",
+                        n
+                    )));
+                }
+                max_response = Some(n as u32);
+                self.expect_kind(TokenKind::Newline)?;
+            } else if self.check_ident("on_connect_error") {
+                self.advance();
+                self.expect_kind(TokenKind::Colon)?;
+                let policy_name = self.expect_ident_any()?;
+                on_connect_error = match policy_name.as_str() {
+                    "abort" => ErrorPolicy::Abort,
+                    "drop" => {
+                        return Err(self.error(
+                            "connection on_connect_error: 'drop' lands in a later slice; only 'abort' is accepted today",
+                        ));
+                    }
+                    other => {
+                        return Err(self.error(&format!(
+                            "unknown on_connect_error policy '{}' (allowed: abort)",
+                            other
+                        )));
+                    }
+                };
+                self.expect_kind(TokenKind::Newline)?;
+            } else {
+                return Err(self.error("expected attribute, 'host:', 'port:', 'max_response:', or 'on_connect_error:' in connection"));
+            }
+        }
+        self.expect_kind(TokenKind::Dedent)?;
+
+        Ok(Connection {
+            name,
+            intention: intention.ok_or_else(|| self.error("connection missing @intention"))?,
+            source: source.ok_or_else(|| self.error("connection missing @source"))?,
+            host: host.ok_or_else(|| self.error("connection missing 'host:'"))?,
+            port: port.ok_or_else(|| self.error("connection missing 'port:'"))?,
+            max_response: max_response.ok_or_else(|| self.error("connection missing 'max_response:'"))?,
+            on_connect_error,
         })
     }
 

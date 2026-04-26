@@ -123,6 +123,24 @@ streaming rule reading the same resource for every record reads the
 file once, not N times. Worked example: `examples/read_config.verbose`
 (541-byte binary).
 
+**Phase 11 slice 1 (2026-04-26):** outbound TCP. New top-level
+`connection <name>` declaration with literal IPv4 host + port +
+max_response, and a `fetch(name, request_bytes) -> text` primitive
+usable in rule logic. The binary opens a TCP socket, connects to
+the declared host:port, writes request bytes, reads up to
+max_response bytes, closes. First class of OUTBOUND syscalls in
+Verbose — completes the inbound (Phase 7) / file (Phase 9) /
+outbound (Phase 11) trio. `examples/health_check.verbose` ships a
+623-byte binary that fetches `GET /health HTTP/1.0` from a
+declared upstream and emits the response. Slice 1 restrictions
+(later slices lift each):
+  - IPv4 literal only — no DNS (Phase 12)
+  - one fetch per connection per rule
+  - request bytes must be literal/concat-of-literals (no per-record
+    dynamic body)
+  - rules only — service handlers in slice 11.2
+  - on_connect_error: abort only (drop in a later slice)
+
 **Phase 9 slice 4 (2026-04-26):** opt-in `cache: true` on resource
 declarations. When set, the resource's open/read/close sequence is
 hoisted ABOVE the `accept_top` label — runs ONCE at server startup,
