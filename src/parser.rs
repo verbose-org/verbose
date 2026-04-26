@@ -1170,6 +1170,11 @@ impl Parser {
         let mut path: Option<String> = None;
         let mut max_bytes: Option<u32> = None;
         let mut on_read_error: ErrorPolicy = ErrorPolicy::Abort;
+        // Phase 9 slice 9.4: opt-in caching of the resource read (one
+        // syscall sequence at server startup vs. one per request). Default
+        // is `false` so existing programs stay byte-for-byte identical to
+        // the pre-9.4 binary.
+        let mut cache: bool = false;
 
         while !self.check_kind(&TokenKind::Dedent) && !self.at_eof() {
             if let Some(attr) = self.peek_attribute_name() {
@@ -1238,8 +1243,28 @@ impl Parser {
                     }
                 };
                 self.expect_kind(TokenKind::Newline)?;
+            } else if self.check_ident("cache") {
+                // Phase 9 slice 9.4: closed-set bool. Mirrors the
+                // on_read_error / concurrency parser pattern — single
+                // ident on the RHS, unknown values rejected at parse
+                // time. `drop` is already refused above so the rule
+                // "cache: true requires abort" is structurally guaranteed.
+                self.advance();
+                self.expect_kind(TokenKind::Colon)?;
+                let value_name = self.expect_ident_any()?;
+                cache = match value_name.as_str() {
+                    "true" => true,
+                    "false" => false,
+                    other => {
+                        return Err(self.error(&format!(
+                            "cache must be 'true' or 'false', got '{}'",
+                            other
+                        )));
+                    }
+                };
+                self.expect_kind(TokenKind::Newline)?;
             } else {
-                return Err(self.error("expected attribute, 'path:', 'max:', or 'on_read_error:' in resource"));
+                return Err(self.error("expected attribute, 'path:', 'max:', 'on_read_error:', or 'cache:' in resource"));
             }
         }
         self.expect_kind(TokenKind::Dedent)?;
@@ -1251,6 +1276,7 @@ impl Parser {
             path: path.ok_or_else(|| self.error("resource missing 'path:'"))?,
             max_bytes: max_bytes.ok_or_else(|| self.error("resource missing 'max:'"))?,
             on_read_error,
+            cache,
         })
     }
 

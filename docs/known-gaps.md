@@ -123,6 +123,41 @@ streaming rule reading the same resource for every record reads the
 file once, not N times. Worked example: `examples/read_config.verbose`
 (541-byte binary).
 
+**Phase 9 slice 4 (2026-04-26):** opt-in `cache: true` on resource
+declarations. When set, the resource's open/read/close sequence is
+hoisted ABOVE the `accept_top` label — runs ONCE at server startup,
+populated slot reused on every request. Default `cache: false`
+preserves slice 9.2's per-accept read semantics (operator-editable
+file). Trade-off: ~3 µs syscall work saved per request, at the cost
+of staleness — file edits are NOT picked up until restart. Composes
+naturally with `concurrency: forked` (Phase 10): parent reads at
+startup, children inherit via copy-on-write, zero per-child read
+cost. For rules: syntactic no-op (the read already happens once
+above `loop_top`). Worked example: `static_file_server.verbose` with
+`cache: true` ships at 1730 bytes.
+
+### Dev-time gotcha (not a Verbose bug, worth flagging)
+
+Verbose services set `SO_REUSEADDR` on the listen socket — this is
+correct for production (avoids `bind: address already in use` after
+SIGTERM during a TIME_WAIT window) but can silently confuse
+debugging: a stale process from a previous shell session can keep
+listening on the same port, both the stale and the fresh binary
+bind successfully, and the kernel routes incoming connections to
+one or the other. With `concurrency: forked` it compounds: every
+connection routed to the stale parent is served by a child of THAT
+old parent, with whatever code generation was current when the
+parent started — fresh recompiles appear inert.
+
+Before debugging "the latest code change appears to do nothing":
+
+```bash
+ss -tlnp | grep <port>          # any other process on this port?
+pkill -9 -f <binary-name>       # kill stale instances first
+```
+
+Discovered the hard way during slice 9.4 development.
+
 **Phase 10 (2026-04-25):** opt-in `concurrency: forked` on services.
 The Apache mpm_prefork shape via `fork()` after each `accept`. Parent
 closes the client fd and loops; child runs the handler / log /

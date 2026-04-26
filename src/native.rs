@@ -7587,6 +7587,46 @@ fn emit_http10_dynamic_bytes(
     code.extend_from_slice(&[0x48, 0xC7, 0xC6, 0x80, 0x00, 0x00, 0x00]); // rsi=128
     code.extend_from_slice(&[0x0F, 0x05]);                               // syscall
 
+    // ═══ CACHED RESOURCES (Phase 9 slice 9.4) ══════════════════
+    // Resources marked `cache: true` get their open/read/close sequence
+    // emitted ONCE here, between LISTEN and the accept_top label. The
+    // (ptr, len) slots they populate sit within the per-process frame
+    // (allocated by the prologue's `sub rsp, frame_size`) and SURVIVE
+    // every iteration's `lea rsp, [rbp - frame_size]` epilogue, so the
+    // already-loaded buffer is reused on every accept.
+    //
+    // Forked mode (slice 10): the fork dispatch lives INSIDE the accept
+    // loop (after `accept` populates client_fd), so the cached read runs
+    // once in the parent BEFORE any fork — children inherit the populated
+    // slot via COW with no per-child read cost. Best case for static
+    // assets on a forking server.
+    //
+    // Slot allocation walks the SAME `resource_next_slot` cursor used by
+    // the per-iteration path below; this is what keeps `frame_base` correct
+    // regardless of which resources cached and which didn't, and what lets
+    // text_bindings register both kinds uniformly.
+    //
+    // Open/read failure here pushes into the same `abort_patches` Vec the
+    // per-iteration path uses; both resolve to the shared sys_exit(1) label
+    // at the end of the binary. Failures at startup kill the server before
+    // serving any request, which is exactly the desired fail-closed
+    // behaviour for any cached asset whose absence makes the service
+    // meaningless to run.
+    let mut http_text_bindings: TextBindings = HashMap::new();
+    let mut resource_next_slot: i32 = -(frame_base_fixed + 8);
+    for r in &referenced_resources {
+        if r.cache {
+            let (ptr_slot, len_slot, _buf_slot, new_next) = emit_resource_read_sequence(
+                &mut code,
+                r,
+                resource_next_slot,
+                &mut abort_patches,
+            );
+            http_text_bindings.insert(r.name.as_str(), (ptr_slot, len_slot));
+            resource_next_slot = new_next;
+        }
+    }
+
     // ═══ ACCEPT LOOP ═══════════════════════════════════════════
     let accept_top = code.len();
     code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x2B, 0x00, 0x00, 0x00]); // rax=43 accept
@@ -7699,28 +7739,37 @@ fn emit_http10_dynamic_bytes(
     }
 
     // ═══ RESOURCES (Phase 9 slice 2) ═══════════════════════════
-    // Per-accept open + read + close for every resource the handler reads.
-    // Buffers + (ptr, len) slots live within the per-accept frame; they are
-    // overwritten on every iteration, so the file is consulted fresh per
-    // request without crossing accept boundaries. text_bindings registers
-    // each resource name → (ptr_slot, len_slot) so that downstream
-    // emitters (handler body Read arm, concat args via the shared
-    // BoundText path, log content) all resolve through the same lookup.
+    // Per-accept open + read + close for every resource the handler reads
+    // that is NOT marked `cache: true`. The cached ones already emitted
+    // their read sequence above the accept_top label (slice 9.4) and
+    // populated their (ptr, len) slots — those entries are already in
+    // `http_text_bindings`.
     //
-    // Slot layout: first slot below client_fd (or below timestamp when
-    // present) holds the first resource's ptr; len follows 8 bytes lower;
-    // buffer follows below; next resource (if any) continues from there.
-    let mut http_text_bindings: TextBindings = HashMap::new();
-    let mut resource_next_slot: i32 = -(frame_base_fixed + 8);
+    // Buffers + (ptr, len) slots for non-cached resources live within the
+    // per-accept frame; they are overwritten on every iteration, so the
+    // file is consulted fresh per request without crossing accept
+    // boundaries. text_bindings registers each resource name → (ptr_slot,
+    // len_slot) so that downstream emitters (handler body Read arm,
+    // concat args via the shared BoundText path, log content) all
+    // resolve through the same lookup, regardless of whether the slot
+    // was populated at startup or per-iteration.
+    //
+    // Slot layout: the `resource_next_slot` cursor is shared with the
+    // cached pass above, so both kinds of resources contribute to the
+    // same monotonically-descending sequence of (ptr, len, buffer)
+    // triples. The relative ordering matches source order in the
+    // resource declarations the handler references.
     for r in &referenced_resources {
-        let (ptr_slot, len_slot, _buf_slot, new_next) = emit_resource_read_sequence(
-            &mut code,
-            r,
-            resource_next_slot,
-            &mut abort_patches,
-        );
-        http_text_bindings.insert(r.name.as_str(), (ptr_slot, len_slot));
-        resource_next_slot = new_next;
+        if !r.cache {
+            let (ptr_slot, len_slot, _buf_slot, new_next) = emit_resource_read_sequence(
+                &mut code,
+                r,
+                resource_next_slot,
+                &mut abort_patches,
+            );
+            http_text_bindings.insert(r.name.as_str(), (ptr_slot, len_slot));
+            resource_next_slot = new_next;
+        }
     }
 
     // ═══ READ ══════════════════════════════════════════════════
@@ -10451,6 +10500,227 @@ service web
             status_line.starts_with(b"HTTP/1.0 200"),
             "expected HTTP/1.0 200 status line, got {:?}",
             String::from_utf8_lossy(status_line)
+        );
+
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_file(&resource_path);
+    }
+
+    /// Phase 9 slice 9.4 byte-pattern regression: compiling
+    /// static_file_server.verbose (which now carries `cache: true` on the
+    /// `index_page` resource) must move the `mov rax, 2` (sys_open) for
+    /// the resource read BEFORE the `mov rax, 43` (sys_accept). In the
+    /// pre-9.4 binary, accept was emitted first (the accept loop opened
+    /// the file inside each iteration); slice 9.4 hoists the cached open
+    /// out to the startup path, between LISTEN and accept_top. Inverting
+    /// the in-binary ordering of these two syscall immediates is exactly
+    /// what proves the cached-emit path was taken.
+    ///
+    /// The resource path literal must still appear (no caching shortcut
+    /// can drop the open call entirely). The resource path on disk is
+    /// not opened at compile time — the assertion is purely about
+    /// emitted bytes.
+    #[test]
+    fn phase9_slice4_cache_true_moves_open_before_accept() {
+        use std::fs;
+        let src = fs::read_to_string("examples/static_file_server.verbose")
+            .expect("examples/static_file_server.verbose is expected to exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens)
+            .parse_program()
+            .expect("parse");
+
+        let out = std::env::temp_dir().join("verbosec_test_phase9_slice4_cache_bytes");
+        compile_service(&program, "static_server", out.to_str().unwrap())
+            .expect("cached static_file_server compile");
+
+        let bytes = fs::read(&out).expect("read output");
+
+        // Locate `mov rax, 2` (sys_open). Only the resource read sequence
+        // emits this 7-byte immediate — the socket() call uses `mov rax,
+        // 41` and AF_INET=2 lives in `mov rdi, 2` (different ModR/M).
+        let open_seq: [u8; 7] = [0x48, 0xC7, 0xC0, 0x02, 0x00, 0x00, 0x00];
+        let open_pos = bytes
+            .windows(open_seq.len())
+            .position(|w| w == open_seq)
+            .expect("expected `mov rax, 2` (sys_open) for cached resource read");
+
+        // Locate `mov rax, 43` (sys_accept) — unique to the accept loop.
+        let accept_seq: [u8; 7] = [0x48, 0xC7, 0xC0, 0x2B, 0x00, 0x00, 0x00];
+        let accept_pos = bytes
+            .windows(accept_seq.len())
+            .position(|w| w == accept_seq)
+            .expect("expected `mov rax, 43` (sys_accept) in accept loop");
+
+        // The whole point of cache: true — open hoisted ABOVE accept_top.
+        // Pre-9.4 binary had accept_pos < open_pos (open inside the loop
+        // body). Slice 9.4 inverts this for cached resources.
+        assert!(
+            open_pos < accept_pos,
+            "cache: true must hoist sys_open BEFORE sys_accept; got open at {} but accept at {}",
+            open_pos,
+            accept_pos
+        );
+
+        // The path literal must still be embedded (caching does not drop
+        // the syscall, only relocates it).
+        let path_marker = b"/tmp/verbose_static_index.html\0";
+        assert!(
+            bytes.windows(path_marker.len()).any(|w| w == path_marker),
+            "cached resource path literal must still be inlined in the binary"
+        );
+
+        let _ = fs::remove_file(out);
+    }
+
+    /// Phase 9 slice 9.4 end-to-end caching test. Spawn the server with a
+    /// `cache: true` resource pointing at a seed file, hit it via TCP and
+    /// confirm the body matches "version A". Then overwrite the file on
+    /// disk to "version B", hit the server AGAIN, and assert the response
+    /// body is STILL "version A" — proving the read happened once at
+    /// startup and the per-request path now reads from the cached buffer
+    /// rather than reopening the file.
+    ///
+    /// Sequential mode chosen on purpose: forked mode would also work
+    /// (children inherit the cached buffer via COW), but sequential keeps
+    /// the test plumbing simple — single accept loop, no fork bookkeeping.
+    /// The cache hoist is independent of concurrency mode.
+    #[test]
+    fn phase9_slice4_cache_true_serves_stale_content_after_disk_overwrite() {
+        use std::io::{Read, Write};
+        use std::net::TcpStream;
+        use std::process::{Command, Stdio};
+        use std::time::Duration;
+
+        let resource_path = std::env::temp_dir()
+            .join("verbosec_test_phase9_slice4_cached.html");
+        let version_a = b"version A";
+        let version_b = b"version B";
+        std::fs::write(&resource_path, version_a).expect("seed cached resource file");
+
+        let port: u16 = 18904;
+        let src = format!(
+            r#"@verbose 0.1.0
+
+resource page
+  @intention: "page cached at server startup"
+  @source: invoices.intent:1
+  path: "{}"
+  max: 4096
+  on_read_error: abort
+  cache: true
+
+rule serve_page
+  @intention: "echo the cached page bytes"
+  @source: invoices.intent:1
+  input:
+    req : HttpRequest
+  output:
+    resp : HttpResponse
+  logic:
+    resp = HttpResponse {{ status: 200, body: read(page) }}
+  proofs:
+    purity:
+      reads: [page]
+      calls: []
+    termination:
+      bound: 1
+
+service web
+  @intention: "cached static page server"
+  @source: invoices.intent:1
+  listen:
+    protocol: http_1_0
+    port: {}
+    max_request: 4096
+  handler: serve_page
+"#,
+            resource_path.display(),
+            port
+        );
+
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens)
+            .parse_program()
+            .expect("parse");
+
+        let out = std::env::temp_dir().join("verbosec_test_phase9_slice4_runtime_bin");
+        compile_service(&program, "web", out.to_str().unwrap())
+            .expect("Http10 service with cache: true compile");
+
+        let mut child = Command::new(&out)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn cached service binary");
+
+        // Helper closure: fire one HTTP/1.0 GET, return the body.
+        let do_request = |port: u16| -> Result<Vec<u8>, String> {
+            // Retry-connect loop — the server may still be binding.
+            let mut stream: Option<TcpStream> = None;
+            for _ in 0..50 {
+                match TcpStream::connect_timeout(
+                    &format!("127.0.0.1:{}", port).parse().unwrap(),
+                    Duration::from_millis(100),
+                ) {
+                    Ok(s) => {
+                        stream = Some(s);
+                        break;
+                    }
+                    Err(_) => std::thread::sleep(Duration::from_millis(20)),
+                }
+            }
+            let mut s = stream.ok_or_else(|| "could not connect".to_string())?;
+            s.set_read_timeout(Some(Duration::from_secs(2))).ok();
+            s.write_all(b"GET / HTTP/1.0\r\n\r\n")
+                .map_err(|e| format!("write: {}", e))?;
+            let mut buf = Vec::new();
+            s.read_to_end(&mut buf).map_err(|e| format!("read: {}", e))?;
+            let sep = b"\r\n\r\n";
+            let split_at = buf
+                .windows(sep.len())
+                .position(|w| w == sep)
+                .ok_or_else(|| "no header terminator".to_string())?;
+            Ok(buf[split_at + sep.len()..].to_vec())
+        };
+
+        let result: Result<(Vec<u8>, Vec<u8>), String> = (|| {
+            // First request — should see version A.
+            let body1 = do_request(port)?;
+            // Now overwrite the file on disk. Use a temp + rename to avoid
+            // partial-write windows confusing this test.
+            let tmp = std::env::temp_dir()
+                .join("verbosec_test_phase9_slice4_cached.tmp");
+            std::fs::write(&tmp, version_b).map_err(|e| format!("write tmp: {}", e))?;
+            std::fs::rename(&tmp, &resource_path)
+                .map_err(|e| format!("rename: {}", e))?;
+            // Second request — caching means body MUST still be version A.
+            let body2 = do_request(port)?;
+            Ok((body1, body2))
+        })();
+
+        // Tear down before asserting so a panic doesn't leak the process.
+        let _ = child.kill();
+        let _ = child.wait();
+
+        let (body1, body2) = result.expect("HTTP roundtrip(s) failed");
+
+        assert_eq!(
+            body1, version_a,
+            "first response body did not match seed contents: {:?}",
+            String::from_utf8_lossy(&body1)
+        );
+        // The load-bearing assertion of this test.
+        assert_eq!(
+            body2, version_a,
+            "cached resource must serve the startup-loaded contents even after on-disk overwrite; got {:?}",
+            String::from_utf8_lossy(&body2)
+        );
+        // Sanity: the disk file was actually changed.
+        let on_disk = std::fs::read(&resource_path).expect("re-read disk");
+        assert_eq!(
+            on_disk, version_b,
+            "test setup error: disk file was not overwritten as expected"
         );
 
         let _ = std::fs::remove_file(&out);

@@ -31,6 +31,16 @@ resource index_page
   path: "/tmp/verbose_static_index.html"
   max:  4096
   on_read_error: abort
+  -- Phase 9 slice 9.4: cache the file at startup. The open + read +
+  -- close syscalls fire ONCE between LISTEN and accept_top instead of
+  -- per request, so subsequent edits to the file on disk are NOT
+  -- picked up until the server restarts. With `concurrency: forked`
+  -- (below) the parent reads at startup; children inherit the
+  -- already-populated buffer slot via fork's copy-on-write — zero
+  -- per-child read cost. Trade-off: ~3 µs of syscall work saved per
+  -- request, at the cost of staleness. Ideal here because the file
+  -- is a stable static asset, not user-mutable state.
+  cache: true
 
 
 rule serve_index

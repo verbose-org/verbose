@@ -53,6 +53,31 @@ pub struct Resource {
     /// (silent-ignore) lands in a later slice if needed; making the strict
     /// policy the only option in slice 1 keeps the failure mode obvious.
     pub on_read_error: ErrorPolicy,
+    /// Phase 9 slice 9.4: opt-in `cache: true | false` (default `false`).
+    ///
+    /// When `false` (the default): for HTTP services the open/read/close
+    /// syscalls fire INSIDE the accept loop — every request consults the
+    /// file fresh, so on-disk edits are picked up immediately at the cost
+    /// of one open()+read()+close() per request (~3 µs of syscall work).
+    /// Sequential mode + `cache: false` is byte-for-byte identical to the
+    /// pre-9.4 binary.
+    ///
+    /// When `true`: for HTTP services the read sequence runs ONCE at
+    /// server startup, between LISTEN and the accept_top label (so the
+    /// cached buffer also crosses fork() in `concurrency: forked` mode —
+    /// children inherit the parent's already-populated slot via COW with
+    /// no per-child read cost). Trade staleness for the per-request open
+    /// overhead; ideal for static assets that are stable across the
+    /// server's lifetime.
+    ///
+    /// For rules: the resource is already read once per rule invocation
+    /// (above loop_top), so `cache: true` is a no-op there. Allowed for
+    /// grammar uniformity; documented as harmless.
+    ///
+    /// `cache: true` requires `on_read_error: abort` — the parser already
+    /// rejects `drop` so this is structurally guaranteed; no extra check
+    /// in the verifier.
+    pub cache: bool,
 }
 
 /// A service is a long-running program declaration. It binds a listener
