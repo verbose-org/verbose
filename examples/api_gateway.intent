@@ -1,0 +1,1 @@
+1. An HTTP service whose handler proxies every request to a fixed upstream endpoint and returns the upstream's response body verbatim.

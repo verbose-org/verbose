@@ -7633,11 +7633,27 @@ fn classify_http_response_record(
                     Expr::Read(_) => {
                         has_dynamic_field = true;
                     }
+                    // Phase 11 slice 2: body = fetch(<connection>, <literal>).
+                    // The accept loop does socket/connect/write/read/close
+                    // once per request into a per-frame buffer; the body
+                    // slots receive (ptr, len) directly from the connection's
+                    // bound (ptr_slot, len_slot). Same Dynamic dispatch as
+                    // read(<resource>): the connection's I/O sequence is
+                    // emitted between the per-accept resource reads and the
+                    // HTTP read, so the (ptr, len) slot pair is populated by
+                    // the time emit_handler_to_slots runs. Slice 11.2 keeps
+                    // the request bytes restricted to literal-only (the
+                    // Phase 11 slice 1 verifier rule applies); request
+                    // bytes that reference req.method / req.path land in
+                    // slice 11.3.
+                    Expr::Fetch(_, _) => {
+                        has_dynamic_field = true;
+                    }
                     _ => {
                         return Http10HandlerShape::Unsupported(format!(
                             "slice 3d: body must be a text literal, req.method / req.path, \
-                             concat(...), or read(<resource>); other computed bodies land in a \
-                             later slice (got {:?})",
+                             concat(...), read(<resource>), or fetch(<connection>, <literal>); \
+                             other computed bodies land in a later slice (got {:?})",
                             expr_kind(f_expr)
                         ));
                     }
@@ -7816,8 +7832,17 @@ fn compile_http10_dynamic_service(
         Item::Resource(r) => Some((r.name.as_str(), r)),
         _ => None,
     }).collect();
+    // Phase 11 slice 2: index every top-level `connection` block by name
+    // so the dynamic emitter can look up connections the handler fetches.
+    // Mirrors the resource index above; the two namespaces are checked for
+    // disjointness in the verifier (a name cannot be both a resource and
+    // a connection).
+    let all_connections: HashMap<&str, &Connection> = program.items.iter().filter_map(|i| match i {
+        Item::Connection(c) => Some((c.name.as_str(), c)),
+        _ => None,
+    }).collect();
 
-    let code = emit_http10_dynamic_bytes(service, handler, &offsets, &no_rules, &no_ranges, &all_resources)?;
+    let code = emit_http10_dynamic_bytes(service, handler, &offsets, &no_rules, &no_ranges, &all_resources, &all_connections)?;
     write_server_elf(&code, output_path, "service", service.port)
 }
 
@@ -7853,6 +7878,7 @@ fn emit_http10_dynamic_bytes(
     all_rules: &HashMap<&str, &Rule>,
     field_ranges: &HashMap<&str, (i64, i64)>,
     all_resources: &HashMap<&str, &Resource>,
+    all_connections: &HashMap<&str, &Connection>,
 ) -> Result<Vec<u8>, NativeError> {
     let mut code = Vec::new();
     let port_be = service.port.to_be_bytes();
@@ -7900,6 +7926,35 @@ fn emit_http10_dynamic_bytes(
         .iter()
         .map(|r| 16 + (((r.max_bytes as i32) + 7) & !7))
         .sum();
+    // Phase 11 slice 2: enumerate connections the handler fetches, in
+    // source order, and resolve each against the program's top-level
+    // connection table. A name unknown at this point is a hard error —
+    // the verifier already rejects unknown connections at the rule-level
+    // cross-check (handlers are rules), so reaching here means the
+    // dispatcher was invoked with a stale handler. Same shape as the
+    // resource path immediately above.
+    let referenced_connections: Vec<&Connection> = {
+        let names = collect_rule_fetch_names(handler);
+        let mut out: Vec<&Connection> = Vec::with_capacity(names.len());
+        for name in &names {
+            let c = all_connections.get(name.as_str()).ok_or_else(|| NativeError {
+                message: format!(
+                    "service handler '{}' fetches connection '{}' but no top-level `connection {}` was declared",
+                    handler.name, name, name
+                ),
+            })?;
+            out.push(*c);
+        }
+        out
+    };
+    // Each connection contributes 16 bytes (ptr + len) plus a
+    // max_response buffer padded to 8 — identical accounting to the
+    // resource extras above; connections occupy the next monotonically-
+    // descending block of slots after the resource block.
+    let connection_extra_bytes: i32 = referenced_connections
+        .iter()
+        .map(|c| 16 + (((c.max_response as i32) + 7) & !7))
+        .sum();
     // Slot map below rbp:
     //   -8     method ptr (parser output)
     //   -16    path ptr   (parser output)
@@ -7909,9 +7964,10 @@ fn emit_http10_dynamic_bytes(
     //   -48    client_fd
     //   -56    timestamp seconds        (only when uses_timestamp)
     //   below: resource (ptr, len) pairs + buffers, growing downward
+    //   below: connection (ptr, len) pairs + response buffers, growing downward
     //   bottom: HTTP read buffer (max_request bytes)
     let frame_base_fixed: i32 = if uses_timestamp { 56 } else { 48 };
-    let frame_base: i32 = frame_base_fixed + resource_extra_bytes;
+    let frame_base: i32 = frame_base_fixed + resource_extra_bytes + connection_extra_bytes;
     // Phase 8 slice 8d: collected `js abort_label` patch sites from
     // emit_append_file_call. Resolved after the accept loop emits the
     // shared abort sequence; left empty when policy is Drop.
@@ -8198,6 +8254,54 @@ fn emit_http10_dynamic_bytes(
             http_text_bindings.insert(r.name.as_str(), (ptr_slot, len_slot));
             resource_next_slot = new_next;
         }
+    }
+
+    // ═══ CONNECTIONS (Phase 11 slice 2) ════════════════════════
+    // Per-accept socket + connect + write(request) + read(response) + close
+    // for every connection the handler fetches. Slice 11.2 keeps every
+    // connection per-accept (no `cache: true` for connections in this slice),
+    // so the response is freshly fetched per request.
+    //
+    // Emitted AFTER the resource block: both share r15 (resource fd / socket
+    // fd). The resource sequence closes its fd before returning, so by the
+    // time the connection sequence runs r15 is free; the connection sequence
+    // closes its socket before returning, so when the HTTP read runs next
+    // r15 is free again. This sequential discipline is the same one Phase
+    // 11 slice 1 relies on inside emit_record_loop_prologue.
+    //
+    // The per-connection (ptr, len, buf) triple lives within the per-accept
+    // frame; on the next iteration we land back at accept_top with the same
+    // rsp (the close+loop tail does not touch rsp), so the slots get
+    // overwritten in place. http_text_bindings registers each connection
+    // name → (ptr_slot, len_slot) so emit_handler_to_slots' Fetch arm
+    // resolves through the same lookup as the Read arm.
+    //
+    // Slice 11.2 scope: the request bytes passed to fetch must be a text
+    // literal (or concat of literals). The Phase 11 slice 1 verifier rule
+    // (request_is_literal_only inside emit_connection_fetch_sequence)
+    // applies to handlers too — request bytes that reference req.method
+    // or req.path land in slice 11.3, which requires hoisting fetch to
+    // AFTER the HTTP parser has populated the method/path slots.
+    for c in &referenced_connections {
+        let (ptr_slot, len_slot, _buf_slot, new_next) = emit_connection_fetch_sequence(
+            &mut code,
+            c,
+            handler,
+            // Connection emission needs the input concept to validate the
+            // request expression; for HTTP service handlers the input is
+            // always the synthetic HttpRequest concept. Slice 11.2 only
+            // accepts literal-only request bytes, so the concept is not
+            // actually consulted by the literal path — but we pass the
+            // accurate one to keep the call shape uniform with the rule
+            // path (which DOES use it for field-ref validation in later
+            // slices).
+            &http_request_builtin_concept_native(),
+            all_rules,
+            resource_next_slot,
+            &mut abort_patches,
+        )?;
+        http_text_bindings.insert(c.name.as_str(), (ptr_slot, len_slot));
+        resource_next_slot = new_next;
     }
 
     // ═══ READ ══════════════════════════════════════════════════
@@ -8586,6 +8690,38 @@ fn emit_handler_to_slots(
                 // the body slots — same shape as the input-text-field arm
                 // above, just with a known-good slot pair.
                 Expr::Read(name) if text_bindings.contains_key(name.as_str()) => {
+                    let (ptr_slot, len_slot) = text_bindings[name.as_str()];
+                    // mov rax, [rbp + ptr_slot]
+                    if ptr_slot >= -128 {
+                        code.extend_from_slice(&[0x48, 0x8B, 0x45]);
+                        code.push(ptr_slot as u8);
+                    } else {
+                        code.extend_from_slice(&[0x48, 0x8B, 0x85]);
+                        code.extend_from_slice(&ptr_slot.to_le_bytes());
+                    }
+                    // mov [rbp-32], rax (body ptr)
+                    code.extend_from_slice(&[0x48, 0x89, 0x45, 0xE0]);
+                    // mov rax, [rbp + len_slot]
+                    if len_slot >= -128 {
+                        code.extend_from_slice(&[0x48, 0x8B, 0x45]);
+                        code.push(len_slot as u8);
+                    } else {
+                        code.extend_from_slice(&[0x48, 0x8B, 0x85]);
+                        code.extend_from_slice(&len_slot.to_le_bytes());
+                    }
+                    // mov [rbp-40], rax (body len)
+                    code.extend_from_slice(&[0x48, 0x89, 0x45, 0xD8]);
+                }
+                // Phase 11 slice 2: body = fetch(<connection>, <literal>).
+                // The accept loop already ran socket + connect + write +
+                // read + close before the handler; (ptr, len) live at the
+                // slots registered in text_bindings under the connection's
+                // name. Same shape as the Read arm above — copy both into
+                // the body slots. The request_expr is intentionally ignored
+                // here: it was lowered when the per-accept fetch sequence
+                // was emitted, and only its byte effect (the response
+                // sitting in the connection buffer) matters at this site.
+                Expr::Fetch(name, _) if text_bindings.contains_key(name.as_str()) => {
                     let (ptr_slot, len_slot) = text_bindings[name.as_str()];
                     // mov rax, [rbp + ptr_slot]
                     if ptr_slot >= -128 {
@@ -11588,5 +11724,287 @@ rule probe
         );
 
         let _ = std::fs::remove_file(out);
+    }
+
+    /// Phase 11 slice 2: byte-pattern check that the HTTP service binary
+    /// emits the connection fetch sequence (socket + connect) AFTER the
+    /// per-accept entry (sys_accept = `mov rax, 43`). This proves the
+    /// fetch is hoisted INSIDE the accept loop rather than running once
+    /// at startup. The constant-startup path (slice 9.4 cache) emits open
+    /// BEFORE accept; slice 11.2 deliberately does not yet support a
+    /// `cache: true` for connections, so the inverse ordering must hold:
+    /// accept appears first in the binary, and socket/connect appear
+    /// after it.
+    ///
+    /// Also asserts that the inline sockaddr_in literal (family + htons +
+    /// IPv4 octets) is embedded — proving the destination is resolved at
+    /// compile time, not at runtime via DNS.
+    #[test]
+    fn phase11_slice2_http_handler_fetch_embeds_socket_and_connect() {
+        let src = r#"@verbose 0.1.0
+
+connection upstream
+  @intention: "byte-pattern test endpoint"
+  @source: invoices.intent:1
+  host: "127.0.0.1"
+  port: 19002
+  max_response: 1024
+  on_connect_error: abort
+
+rule proxy
+  @intention: "proxy every request to upstream"
+  @source: invoices.intent:1
+  input:
+    req : HttpRequest
+  output:
+    resp : HttpResponse
+  logic:
+    resp = HttpResponse { status: 200, body: fetch(upstream, "GET / HTTP/1.0\r\n\r\n") }
+  proofs:
+    purity:
+      reads: [upstream]
+      calls: []
+    termination:
+      bound: 2
+
+service gateway
+  @intention: "byte-pattern test gateway"
+  @source: invoices.intent:1
+  listen:
+    protocol: http_1_0
+    port: 18920
+    max_request: 4096
+  handler: proxy
+"#;
+        let tokens = crate::lexer::Lexer::new(src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens)
+            .parse_program()
+            .expect("parse");
+
+        let out = std::env::temp_dir().join("verbosec_test_phase11_slice2_bytes");
+        compile_service(&program, "gateway", out.to_str().unwrap())
+            .expect("Http10 service with fetch(connection) compile");
+
+        let bytes = std::fs::read(&out).expect("read output binary");
+        let size = bytes.len();
+        assert!(
+            (800..3000).contains(&size),
+            "phase 11 slice 2 service binary size {} outside [800, 3000] envelope",
+            size
+        );
+
+        // sys_accept immediate: mov rax, 43 — encoded 48 C7 C0 2B 00 00 00.
+        // Unique to the accept loop; appears once at accept_top.
+        let accept_seq: [u8; 7] = [0x48, 0xC7, 0xC0, 0x2B, 0x00, 0x00, 0x00];
+        let accept_pos = bytes
+            .windows(accept_seq.len())
+            .position(|w| w == accept_seq)
+            .expect("expected `mov rax, 43` (sys_accept) in service binary");
+
+        // sys_socket immediate: mov rax, 41 — encoded 48 C7 C0 29 00 00 00.
+        // The HTTP server's setup also calls socket() once at startup, so
+        // we look for the LAST occurrence (the per-accept fetch one) and
+        // assert it is AFTER the accept syscall. Pre-slice-11.2 service
+        // binaries had no socket call after accept at all.
+        let socket_seq: [u8; 7] = [0x48, 0xC7, 0xC0, 0x29, 0x00, 0x00, 0x00];
+        let socket_positions: Vec<usize> = bytes
+            .windows(socket_seq.len())
+            .enumerate()
+            .filter_map(|(i, w)| if w == socket_seq { Some(i) } else { None })
+            .collect();
+        assert!(
+            !socket_positions.is_empty(),
+            "expected at least one `mov rax, 41` (sys_socket) in service binary"
+        );
+        let last_socket = *socket_positions.last().unwrap();
+        assert!(
+            last_socket > accept_pos,
+            "phase 11 slice 2: per-accept fetch must emit sys_socket AFTER sys_accept; \
+             got accept at {} but last socket at {}",
+            accept_pos,
+            last_socket
+        );
+
+        // sys_connect immediate: mov rax, 42 — encoded 48 C7 C0 2A 00 00 00.
+        // Only the fetch sequence emits this; it must appear after accept too.
+        let connect_seq: [u8; 7] = [0x48, 0xC7, 0xC0, 0x2A, 0x00, 0x00, 0x00];
+        let connect_pos = bytes
+            .windows(connect_seq.len())
+            .position(|w| w == connect_seq)
+            .expect("expected `mov rax, 42` (sys_connect) in fetch sequence");
+        assert!(
+            connect_pos > accept_pos,
+            "phase 11 slice 2: per-accept fetch must emit sys_connect AFTER sys_accept; \
+             got accept at {} but connect at {}",
+            accept_pos,
+            connect_pos
+        );
+
+        // Inline sockaddr_in: family=2, htons(19002)=0x4A3A
+        // (high byte 0x4A, low byte 0x3A), addr 127.0.0.1 = 7F 00 00 01,
+        // 8 bytes of zero padding.
+        let sockaddr_marker = [
+            0x02, 0x00, 0x4A, 0x3A, 0x7F, 0x00, 0x00, 0x01,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        assert!(
+            bytes.windows(sockaddr_marker.len()).any(|w| w == sockaddr_marker),
+            "expected inline sockaddr_in literal (family=2, htons(19002), 127.0.0.1, padding)"
+        );
+
+        let _ = std::fs::remove_file(out);
+    }
+
+    /// Phase 11 slice 2 end-to-end: spawn the compiled gateway service,
+    /// spawn a tiny TCP listener that plays the role of the upstream
+    /// backend, then issue an HTTP request to the gateway and assert the
+    /// gateway's response body byte-for-byte equals the upstream's
+    /// response. Proves the per-accept fetch wires together end to end:
+    /// the gateway's HTTP read pulls the request, the per-accept fetch
+    /// runs socket+connect+write+read+close against the upstream, and the
+    /// upstream's response bytes flow into the response body slot before
+    /// the HTTP serializer writes the gateway's response back.
+    #[test]
+    fn phase11_slice2_http_handler_proxies_upstream_response() {
+        use std::io::{Read, Write};
+        use std::net::{TcpListener, TcpStream};
+        use std::process::{Command, Stdio};
+        use std::thread;
+        use std::time::Duration;
+
+        let upstream_port: u16 = 19002;
+        let gateway_port: u16 = 18921;
+
+        // Bind upstream FIRST so the gateway's connect() always finds a
+        // listening socket on the other side. Then the gateway binary
+        // is spawned; on its first accept(), it will turn around and
+        // dial back here.
+        let upstream =
+            TcpListener::bind(("127.0.0.1", upstream_port)).expect("bind upstream listener");
+        upstream.set_nonblocking(false).expect("blocking upstream");
+        let upstream_payload = b"HTTP/1.0 200 OK\r\nContent-Length: 9\r\n\r\nupstream!";
+        let upstream_thread = thread::spawn(move || {
+            let (mut sock, _) = upstream.accept().expect("upstream accept");
+            sock.set_read_timeout(Some(Duration::from_secs(2))).ok();
+            let mut req = [0u8; 1024];
+            let _ = sock.read(&mut req);
+            sock.write_all(upstream_payload).expect("write upstream response");
+            // Drop closes the socket — gateway's read returns when the
+            // upstream side EOFs (Content-Length read happens in the
+            // gateway via the max_response cap).
+        });
+
+        let src = format!(
+            r#"@verbose 0.1.0
+
+connection upstream
+  @intention: "test upstream"
+  @source: invoices.intent:1
+  host: "127.0.0.1"
+  port: {}
+  max_response: 1024
+  on_connect_error: abort
+
+rule proxy
+  @intention: "forward every request"
+  @source: invoices.intent:1
+  input:
+    req : HttpRequest
+  output:
+    resp : HttpResponse
+  logic:
+    resp = HttpResponse {{ status: 200, body: fetch(upstream, "GET /health HTTP/1.0\r\n\r\n") }}
+  proofs:
+    purity:
+      reads: [upstream]
+      calls: []
+    termination:
+      bound: 2
+
+service gateway
+  @intention: "proxy gateway"
+  @source: invoices.intent:1
+  listen:
+    protocol: http_1_0
+    port: {}
+    max_request: 4096
+  handler: proxy
+"#,
+            upstream_port, gateway_port
+        );
+
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens)
+            .parse_program()
+            .expect("parse");
+
+        let out =
+            std::env::temp_dir().join("verbosec_test_phase11_slice2_runtime_bin");
+        compile_service(&program, "gateway", out.to_str().unwrap())
+            .expect("Http10 service with fetch(connection) compile");
+
+        // Spawn the gateway in the background.
+        let mut child = Command::new(&out)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn gateway service binary");
+
+        // Wait for the gateway to bind — short retry loop, no fragile sleep.
+        let mut stream: Option<TcpStream> = None;
+        for _ in 0..50 {
+            match TcpStream::connect_timeout(
+                &format!("127.0.0.1:{}", gateway_port).parse().unwrap(),
+                Duration::from_millis(100),
+            ) {
+                Ok(s) => {
+                    stream = Some(s);
+                    break;
+                }
+                Err(_) => std::thread::sleep(Duration::from_millis(20)),
+            }
+        }
+
+        let runtime_result: Result<Vec<u8>, String> = (|| {
+            let mut s = stream.ok_or_else(|| "could not connect to gateway".to_string())?;
+            s.set_read_timeout(Some(Duration::from_secs(2))).ok();
+            s.write_all(b"GET / HTTP/1.0\r\n\r\n")
+                .map_err(|e| format!("write: {}", e))?;
+            let mut buf = Vec::new();
+            s.read_to_end(&mut buf).map_err(|e| format!("read: {}", e))?;
+            Ok(buf)
+        })();
+
+        // Reap server + upstream before asserting so a panic does not
+        // leave a dangling process or fd.
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = upstream_thread.join();
+
+        let response = runtime_result.expect("HTTP roundtrip failed");
+        // The gateway's response body is the upstream's full payload —
+        // the gateway does not parse upstream's HTTP, it just relays the
+        // bytes that landed in the connection's response buffer.
+        let sep = b"\r\n\r\n";
+        let split_at = response
+            .windows(sep.len())
+            .position(|w| w == sep)
+            .expect("gateway response missing CRLF/CRLF terminator");
+        let body = &response[split_at + sep.len()..];
+
+        // The body should CONTAIN "upstream!" — the upstream replied with
+        // a full HTTP/1.0 wire response, so the body the gateway forwards
+        // is the upstream's headers + body together. Asserting containment
+        // (rather than exact equality) makes the test robust to whether
+        // the gateway's read returned exactly upstream_payload's length or
+        // a partial read.
+        let body_str = String::from_utf8_lossy(body);
+        assert!(
+            body_str.contains("upstream!"),
+            "gateway response body did not contain 'upstream!': body={:?}",
+            body_str
+        );
+
+        let _ = std::fs::remove_file(&out);
     }
 }

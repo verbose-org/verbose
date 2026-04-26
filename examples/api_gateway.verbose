@@ -1,0 +1,57 @@
+@verbose 0.1.0
+
+-- Phase 11 slice 2: connection fetch inside an HTTP service handler.
+-- Slice 11.1 wired socket -> connect -> write -> read -> close into the
+-- per-rule prologue; slice 11.2 hoists the same sequence into the
+-- per-accept block of an Http10 service so the handler's `body` field
+-- can be the literal text of the upstream's response.
+--
+-- The auditor reads the source -- or `strings` the binary -- and sees
+-- exactly one host:port (127.0.0.1:19002) that the gateway can reach.
+-- No DNS, no per-request URL routing: the destination is a static
+-- declaration and the request line is a literal. Variable upstream
+-- routing keyed on req.method / req.path lands in slice 11.3 (request
+-- bytes that reference parsed HTTP fields require the fetch to run
+-- AFTER the HTTP parse, which slice 11.2 deliberately does not yet do).
+
+connection upstream
+  @intention: "Backend health endpoint we proxy every request to"
+  @source: api_gateway.intent:1
+  host: "127.0.0.1"
+  port: 19002
+  max_response: 1024
+  on_connect_error: abort
+
+
+rule proxy
+  @intention: "Forward every request to upstream and return its response body"
+  @source: api_gateway.intent:1
+
+  input:
+    req : HttpRequest
+
+  output:
+    resp : HttpResponse
+
+  logic:
+    resp = HttpResponse { status: 200, body: fetch(upstream, "GET /health HTTP/1.0\r\n\r\n") }
+
+  proofs:
+    purity:
+      reads : [upstream]
+      calls : []
+
+    termination:
+      bound : 2
+
+
+service gateway
+  @intention: "Listen on 18920 and proxy every request to the static upstream"
+  @source: api_gateway.intent:1
+
+  listen:
+    protocol    : http_1_0
+    port        : 18920
+    max_request : 4096
+
+  handler: proxy

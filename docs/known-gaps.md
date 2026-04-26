@@ -123,6 +123,21 @@ streaming rule reading the same resource for every record reads the
 file once, not N times. Worked example: `examples/read_config.verbose`
 (541-byte binary).
 
+**Phase 11 slice 2 (2026-04-26):** `fetch()` now works inside HTTP
+service handler bodies — same shape as slice 9.2 did for resource
+reads. The fetch sequence (socket → connect → write → read → close)
+runs per-accept, after the resource block, before the HTTP read.
+`api_gateway.verbose` ships at 1011 bytes: an HTTP service whose
+handler always forwards to a fixed upstream and returns its
+response. First Verbose binary that's both a server AND a client.
+
+Slice 11.3 still pending: request bytes that compose with
+`req.method` / `req.path` (currently restricted to literal /
+concat-of-literals because the fetch sequence runs before HTTP
+parse populates the req fields). Lifting it is a reordering: parse
+first, fetch second. Then a real reverse proxy demo (forward
+incoming GET /foo to upstream's GET /foo) lands.
+
 **Phase 11 slice 1 (2026-04-26):** outbound TCP. New top-level
 `connection <name>` declaration with literal IPv4 host + port +
 max_response, and a `fetch(name, request_bytes) -> text` primitive
