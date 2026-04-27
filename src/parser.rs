@@ -1006,8 +1006,11 @@ impl Parser {
         let mut port = None;
         let mut max_request = None;
         let mut handler = None;
-        let mut log: Option<Effect> = None;
-        let mut log_on_error: ErrorPolicy = ErrorPolicy::Drop;
+        // Phase 8 slice 8e: zero or more `log:` blocks, each with its own
+        // append_file effect AND its own on_error policy. The parser pushes
+        // into this Vec for every `log:` block encountered, instead of
+        // overwriting a single Option as slice 8a did.
+        let mut logs: Vec<LogBlock> = Vec::new();
         // Phase 10 slice 10: optional `concurrency:` knob. Default is
         // Sequential — preserves the slice 9 binary byte-for-byte when
         // the line is omitted.
@@ -1097,14 +1100,12 @@ impl Parser {
                 handler = Some(self.expect_ident_any()?);
                 self.expect_kind(TokenKind::Newline)?;
             } else if self.check_ident("log") {
-                // Phase 8 slice 8a: optional single-effect log block. Only
-                // `append_file "path" <expr>` is accepted; multi-effect and
-                // other effect variants land in later slices.
-                //
-                // Phase 8 slice 8d: an optional `on_error: drop | abort`
-                // line may follow the append_file line, controlling what
-                // happens when a log syscall fails. Drop is the default
-                // (matches slice 8a behaviour).
+                // Phase 8 slice 8a/8e: a `log:` block. Only
+                // `append_file "path" <expr>` is accepted as the effect; an
+                // optional `on_error: drop | abort` follows. Slice 8e
+                // permits MULTIPLE `log:` blocks in the same service —
+                // each is independent and fires in source order between
+                // the handler and the response write.
                 self.advance();
                 self.expect_kind(TokenKind::Colon)?;
                 self.expect_kind(TokenKind::Newline)?;
@@ -1121,13 +1122,12 @@ impl Parser {
                 })?;
                 let content = self.parse_expr()?;
                 self.expect_kind(TokenKind::Newline)?;
-                log = Some(Effect::AppendFile { path, content });
-                // Optional on_error line.
+                let mut on_error = ErrorPolicy::Drop;
                 if self.check_ident("on_error") {
                     self.advance();
                     self.expect_kind(TokenKind::Colon)?;
                     let policy_name = self.expect_ident_any()?;
-                    log_on_error = match policy_name.as_str() {
+                    on_error = match policy_name.as_str() {
                         "drop" => ErrorPolicy::Drop,
                         "abort" => ErrorPolicy::Abort,
                         other => {
@@ -1140,6 +1140,10 @@ impl Parser {
                     self.expect_kind(TokenKind::Newline)?;
                 }
                 self.expect_kind(TokenKind::Dedent)?;
+                logs.push(LogBlock {
+                    effect: Effect::AppendFile { path, content },
+                    on_error,
+                });
             } else if self.check_ident("concurrency") {
                 // Phase 10 slice 10: closed-set concurrency knob. Mirrors
                 // the on_error parser pattern — single ident on the RHS,
@@ -1172,8 +1176,7 @@ impl Parser {
             port: port.ok_or_else(|| self.error("service missing 'listen.port'"))?,
             max_request: max_request.ok_or_else(|| self.error("service missing 'listen.max_request'"))?,
             handler: handler.ok_or_else(|| self.error("service missing 'handler'"))?,
-            log,
-            log_on_error,
+            logs,
             concurrency,
         })
     }

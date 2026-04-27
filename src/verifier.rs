@@ -695,12 +695,22 @@ fn verify_service(
     // numbers, concat thereof, and field accesses on the synthetic `req`
     // and `resp` bindings). The subset is intentionally narrow — anything
     // outside of it is rejected here rather than silently miscompiled.
-    if let Some(log_effect) = &s.log {
-        match log_effect {
+    // Phase 8 slice 8e: each log block is verified independently; multiple
+    // blocks on the same service compose without restriction (closed
+    // grammar applies block-by-block, on_error policy is per-block). The
+    // index in the error context lets a misdeclared second block surface
+    // its own message instead of being swallowed by a first-block fix.
+    for (i, log_block) in s.logs.iter().enumerate() {
+        let scope_ctx = if s.logs.len() == 1 {
+            format!("service '{}' / log", s.name)
+        } else {
+            format!("service '{}' / log[{}]", s.name, i)
+        };
+        match &log_block.effect {
             Effect::AppendFile { content, .. } => {
                 if s.protocol != Protocol::Http10 {
                     errors.push(VerifyError {
-                        context: format!("service '{}' / log", s.name),
+                        context: scope_ctx,
                         message: "Phase 8 slice 8a restricts log to http_1_0 services (raw_tcp log lands in a later slice)".into(),
                     });
                 } else {
@@ -712,7 +722,6 @@ fn verify_service(
                         Type::Named(n) => concepts.get(n).copied(),
                         _ => None,
                     };
-                    let scope_ctx = format!("service '{}' / log", s.name);
                     if let Err(msg) =
                         verify_log_content(content, req_concept, resp_concept, &Type::Text)
                     {
@@ -724,7 +733,7 @@ fn verify_service(
             // rejects Print in the log block, so this arm is defensive.
             Effect::Print(_) => {
                 errors.push(VerifyError {
-                    context: format!("service '{}' / log", s.name),
+                    context: scope_ctx,
                     message: "Phase 8 slice 8a: log blocks accept only 'append_file', not 'print'".into(),
                 });
             }

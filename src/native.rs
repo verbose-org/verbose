@@ -7947,7 +7947,7 @@ pub fn compile_service(
         // constant path does not emit the parser. The dynamic path handles
         // pure-literal Record leaves correctly, so no expressive loss.
         return match analyze_http10_handler_shape(handler) {
-            Http10HandlerShape::Constant if service.log.is_none() => {
+            Http10HandlerShape::Constant if service.logs.is_empty() => {
                 compile_http10_constant_service(program, service, output_path)
             }
             Http10HandlerShape::Constant | Http10HandlerShape::Dynamic => {
@@ -8431,14 +8431,13 @@ fn emit_http10_dynamic_bytes(
     // captured once per accept loop (after accept, before read) so that all
     // log uses of req.timestamp within a single request observe the same
     // monotonic instant.
-    let uses_timestamp = service
-        .log
-        .as_ref()
-        .map(|e| match e {
-            Effect::AppendFile { content, .. } => log_content_uses_req_timestamp(content),
-            _ => false,
-        })
-        .unwrap_or(false);
+    // Slice 8e: any log block referencing req.timestamp triggers the slot
+    // allocation — one timestamp slot serves all logs (clock_gettime fires
+    // once per accept, every log that needs it reads the same instant).
+    let uses_timestamp = service.logs.iter().any(|lb| match &lb.effect {
+        Effect::AppendFile { content, .. } => log_content_uses_req_timestamp(content),
+        _ => false,
+    });
     // Phase 9 slice 2: enumerate resources the handler reads, in source
     // order, and resolve each against the program's top-level resource
     // table. A name unknown at this point is a hard error — the verifier
@@ -8888,43 +8887,50 @@ fn emit_http10_dynamic_bytes(
     // slots. The handler itself never sees these names — the rewrite is
     // strictly local to the log scope, preserving handler purity and
     // keeping req.timestamp out of any decision the response depends on.
-    if let Some(log_effect) = &service.log {
-        if let Effect::AppendFile { path, content } = log_effect {
-            let mut log_concept = http_request_builtin_concept_native();
+    // Slice 8e: every declared log block fires in source order between the
+    // handler and the response write. The log scope (synthetic concept,
+    // offsets map, text_bindings) is built once outside the loop —
+    // identical for every block — and reused for each emission. Each
+    // block's own on_error policy is passed through to emit_append_file_call.
+    if !service.logs.is_empty() {
+        let mut log_concept = http_request_builtin_concept_native();
+        log_concept.fields.push(Field {
+            name: "__resp_status".to_string(),
+            ty: Type::Number,
+            range: Some((100, 599)),
+        });
+        if uses_timestamp {
             log_concept.fields.push(Field {
-                name: "__resp_status".to_string(),
+                name: "__req_timestamp".to_string(),
                 ty: Type::Number,
-                range: Some((100, 599)),
+                range: None,
             });
-            if uses_timestamp {
-                log_concept.fields.push(Field {
-                    name: "__req_timestamp".to_string(),
-                    ty: Type::Number,
-                    range: None,
-                });
-            }
-            let mut log_offsets: HashMap<&str, i32> = offsets.clone();
-            log_offsets.insert("__resp_status", -24);
-            if uses_timestamp {
-                log_offsets.insert("__req_timestamp", -56);
-            }
-            let mut log_text_bindings: TextBindings = HashMap::new();
-            log_text_bindings.insert("__resp_body", (-32, -40));
+        }
+        let mut log_offsets: HashMap<&str, i32> = offsets.clone();
+        log_offsets.insert("__resp_status", -24);
+        if uses_timestamp {
+            log_offsets.insert("__req_timestamp", -56);
+        }
+        let mut log_text_bindings: TextBindings = HashMap::new();
+        log_text_bindings.insert("__resp_body", (-32, -40));
 
-            let rewritten = rewrite_log_content(content, &handler.input_name);
-            emit_append_file_call(
-                &mut code,
-                path,
-                &rewritten,
-                handler,
-                &log_concept,
-                all_rules,
-                &log_offsets,
-                field_ranges,
-                &log_text_bindings,
-                service.log_on_error,
-                &mut abort_patches,
-            )?;
+        for log_block in &service.logs {
+            if let Effect::AppendFile { path, content } = &log_block.effect {
+                let rewritten = rewrite_log_content(content, &handler.input_name);
+                emit_append_file_call(
+                    &mut code,
+                    path,
+                    &rewritten,
+                    handler,
+                    &log_concept,
+                    all_rules,
+                    &log_offsets,
+                    field_ranges,
+                    &log_text_bindings,
+                    log_block.on_error,
+                    &mut abort_patches,
+                )?;
+            }
         }
     }
 
@@ -11008,6 +11014,181 @@ mod tests {
         );
 
         let _ = fs::remove_file(out);
+    }
+
+    /// Phase 8 slice 8e: a service may declare MULTIPLE `log:` blocks,
+    /// each with its own `append_file` path, content, and on_error
+    /// policy. This test stands up the service, fires two requests, and
+    /// asserts BOTH sinks receive one line per request — proving the
+    /// per-block emission is independent and order-preserving. It also
+    /// pins the fail-closed semantics: when the FIRST log (declared
+    /// `on_error: abort`) cannot open its file (we make the path a
+    /// directory so open-for-append fails), the process exits BEFORE
+    /// emitting the second (best-effort) log — no metrics line is
+    /// written. The order of declaration is therefore load-bearing for
+    /// dual-sink fail-closed semantics, and that contract belongs in
+    /// the regression suite.
+    #[test]
+    fn slice_8e_dual_log_blocks_write_independently_and_fail_closed() {
+        use std::io::{Read, Write};
+        use std::net::TcpStream;
+        use std::process::{Command, Stdio};
+        use std::time::Duration;
+
+        let svc_port: u16 = 18929;
+        let audit_path = "/tmp/verbosec_test_slice8e_audit.jsonl";
+        let metrics_path = "/tmp/verbosec_test_slice8e_metrics.ndjson";
+        let _ = std::fs::remove_file(audit_path);
+        let _ = std::fs::remove_file(metrics_path);
+        let _ = std::fs::remove_dir_all(audit_path);
+
+        let src = format!(
+            r#"@verbose 0.1.0
+
+rule echo_ok
+  @intention: "ok"
+  @source: invoices.intent:1
+  input:
+    req : HttpRequest
+  output:
+    resp : HttpResponse
+  logic:
+    resp = HttpResponse {{ status: 200, body: "ok\n" }}
+  proofs:
+    purity:
+      reads : []
+      calls : []
+    termination:
+      bound : 1
+
+service dual
+  @intention: "x"
+  @source: invoices.intent:1
+  listen:
+    protocol    : http_1_0
+    port        : {svc_port}
+    max_request : 4096
+  handler: echo_ok
+  log:
+    append_file "{audit_path}" concat("{{\"method\":\"", req.method, "\",\"path\":\"", req.path, "\",\"status\":", resp.status, "}}\n")
+    on_error: abort
+  log:
+    append_file "{metrics_path}" concat("{{\"status\":", resp.status, "}}\n")
+    on_error: drop
+"#
+        );
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+
+        let out = std::env::temp_dir().join("verbosec_test_slice8e_dual_log");
+        compile_service(&program, "dual", out.to_str().unwrap())
+            .expect("dual-log service should compile");
+
+        // ===== Phase A: happy path — both files writable =====
+        let mut child = Command::new(&out)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn dual service");
+
+        // Wait for the bind.
+        let mut connected = false;
+        for _ in 0..50 {
+            if TcpStream::connect_timeout(
+                &format!("127.0.0.1:{}", svc_port).parse().unwrap(),
+                Duration::from_millis(100),
+            )
+            .is_ok()
+            {
+                connected = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(connected, "dual service never bound");
+
+        let one_request = || -> Result<(), String> {
+            let mut s = TcpStream::connect_timeout(
+                &format!("127.0.0.1:{}", svc_port).parse().unwrap(),
+                Duration::from_secs(2),
+            )
+            .map_err(|e| format!("connect: {}", e))?;
+            s.set_read_timeout(Some(Duration::from_secs(2))).ok();
+            s.write_all(b"GET /a HTTP/1.0\r\n\r\n")
+                .map_err(|e| format!("write: {}", e))?;
+            let mut buf = Vec::new();
+            s.read_to_end(&mut buf).map_err(|e| format!("read: {}", e))?;
+            Ok(())
+        };
+        one_request().expect("happy req 1");
+        one_request().expect("happy req 2");
+
+        let _ = child.kill();
+        let _ = child.wait();
+
+        let audit = std::fs::read_to_string(audit_path).expect("read audit");
+        let metrics = std::fs::read_to_string(metrics_path).expect("read metrics");
+        assert_eq!(
+            audit.lines().count(), 2,
+            "expected 2 audit lines, got: {:?}",
+            audit
+        );
+        assert_eq!(
+            metrics.lines().count(), 2,
+            "expected 2 metrics lines, got: {:?}",
+            metrics
+        );
+        assert!(
+            audit.contains("\"method\":\"GET\"") && audit.contains("\"path\":\"/a\""),
+            "audit content unexpected: {:?}",
+            audit
+        );
+        assert!(
+            metrics.lines().all(|l| l == "{\"status\":200}"),
+            "metrics content unexpected: {:?}",
+            metrics
+        );
+
+        // ===== Phase B: fail-closed — strict log path becomes a dir =====
+        std::fs::remove_file(audit_path).ok();
+        std::fs::remove_file(metrics_path).ok();
+        std::fs::create_dir(audit_path).expect("turn audit path into a dir");
+
+        let mut child = Command::new(&out)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn dual service phase B");
+
+        for _ in 0..50 {
+            if TcpStream::connect_timeout(
+                &format!("127.0.0.1:{}", svc_port).parse().unwrap(),
+                Duration::from_millis(100),
+            )
+            .is_ok()
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        // Fire one request — server should abort BEFORE the metrics emit.
+        let _ = one_request(); // may error on read; we don't care about response
+        std::thread::sleep(Duration::from_millis(150));
+        let _ = child.kill();
+        let _ = child.wait();
+
+        // Strict log is a directory → metrics file should never have been
+        // created (abort fires after open() returns -EISDIR for the audit).
+        assert!(
+            !std::path::Path::new(metrics_path).exists(),
+            "fail-closed broken: metrics file was written even though strict audit could not open"
+        );
+
+        // Cleanup.
+        let _ = std::fs::remove_dir(audit_path);
+        let _ = std::fs::remove_file(metrics_path);
+        let _ = std::fs::remove_file(&out);
     }
 
     /// Phase 7 slice 3e regression: status assembled from a Number-typed

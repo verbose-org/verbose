@@ -1,0 +1,69 @@
+@verbose 0.1.0
+
+-- Phase 8 slice 8e showcase: TWO `log:` blocks on the same service.
+--
+-- Why two sinks: an Article 12 audit chain and an SRE metrics
+-- pipeline have different durability requirements. The audit JSONL
+-- MUST land on disk (on_error: abort) — if it doesn't, the operator
+-- cannot prove the request was served, so the only safe move is to
+-- exit before responding. The metrics ndjson is best-effort
+-- (on_error: drop) — losing a few status counters is preferable to
+-- taking the request path down.
+--
+-- Slice 8e lets these coexist without a wrapper script: the binary
+-- writes both files per request, in source order, each with its own
+-- on_error. The handler stays pure; the per-block scope sees the
+-- same req.method/path/timestamp + resp.status/body as the
+-- single-log path did in slice 8a.
+--
+-- Per-accept order:
+--   1. accept
+--   2. clock_gettime → req.timestamp slot (one slot, both logs read it)
+--   3. HTTP parse → req.method/path slots
+--   4. handler → resp.status / resp.body slots
+--   5. log[0]: append_file audit JSONL (rich content; abort on failure)
+--   6. log[1]: append_file metrics ndjson (status only; drop on failure)
+--   7. write HTTP/1.0 response
+--   8. close client fd ; jmp accept_top
+
+
+rule echo_ok
+  @intention: "Constant 200 response"
+  @source: dual_log.intent:1
+
+  input:
+    req : HttpRequest
+
+  output:
+    resp : HttpResponse
+
+  logic:
+    resp = HttpResponse { status: 200, body: "ok\n" }
+
+  proofs:
+    purity:
+      reads : []
+      calls : []
+
+    termination:
+      bound : 1
+
+
+service dual_logged
+  @intention: "Listen on 18925, write audit (strict) + metrics (best-effort) per request"
+  @source: dual_log.intent:1
+
+  listen:
+    protocol    : http_1_0
+    port        : 18925
+    max_request : 4096
+
+  handler: echo_ok
+
+  log:
+    append_file "/tmp/verbose_dual_audit.jsonl" concat("{\"ts\":", req.timestamp, ",\"method\":\"", req.method, "\",\"path\":\"", req.path, "\",\"status\":", resp.status, "}\n")
+    on_error: abort
+
+  log:
+    append_file "/tmp/verbose_dual_metrics.ndjson" concat("{\"status\":", resp.status, "}\n")
+    on_error: drop

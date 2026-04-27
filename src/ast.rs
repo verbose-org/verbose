@@ -140,21 +140,15 @@ pub struct Service {
     pub port: u16,
     pub max_request: u32,
     pub handler: String,
-    /// Phase 8 slice 8a: optional `log:` block. When present, the declared
-    /// effect fires once per service invocation, after the handler body
-    /// runs and before the response is written. Only `AppendFile` is
-    /// accepted by the parser (slice 8a scope); multi-effect logging and
-    /// other sinks land in later slices.
-    pub log: Option<Effect>,
-    /// Phase 8 slice 8d: error policy applied when the log effect's
-    /// underlying syscalls (open / write) fail. `Drop` (the default and
-    /// the slice-8a behaviour) silently ignores the error so a downed log
-    /// surface never takes the request path down. `Abort` exits the
-    /// process with status 1, which is what an Article 12 audit chain
-    /// needs: if the log line cannot be persisted, the service must not
-    /// claim to have served the request. Meaningless when `log` is None;
-    /// parser fills the default in that case.
-    pub log_on_error: ErrorPolicy,
+    /// Phase 8 slice 8a/8e: zero or more `log:` blocks. Each block declares
+    /// one effect (today: `append_file <path> <content>`) plus its own
+    /// `on_error` policy, and fires once per service invocation after the
+    /// handler body runs and before the response is written. Multiple
+    /// blocks fire in source order, each independently — a `Drop` log
+    /// can sit next to an `Abort` log so an operator can have a
+    /// best-effort metrics sink alongside a fail-closed audit sink.
+    /// Empty Vec means no logging (silent service).
+    pub logs: Vec<LogBlock>,
     /// Phase 10 slice 10: how the accept loop dispatches each connection.
     /// Defaults to `Sequential` so existing services compile byte-for-byte
     /// identically — the slice is purely additive. `Forked` makes the
@@ -244,6 +238,19 @@ pub enum Effect {
     /// read the source and see every file path this program can touch.
     /// No implicit newline: the content is exactly what is written.
     AppendFile { path: String, content: Expr },
+}
+
+/// Phase 8 slice 8e: one log block declared on a service. Carries its
+/// own effect AND its own on_error policy, so multiple blocks on the
+/// same service can mix policies (e.g., a `Drop` metrics sink next to
+/// an `Abort` audit sink). Today the effect is always `AppendFile` —
+/// the parser refuses other shapes — but the type is the shared
+/// `Effect` enum so future log effects (e.g., `print` for a tee to
+/// stdout) compose without a second wrapper type.
+#[derive(Debug, Clone)]
+pub struct LogBlock {
+    pub effect: Effect,
+    pub on_error: ErrorPolicy,
 }
 
 #[derive(Debug, Clone)]

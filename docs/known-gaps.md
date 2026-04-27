@@ -281,10 +281,13 @@ Drop.
 
 Still deferred:
 
-- **Slice 8e — multiple log effects per service.** One `append_file`
-  per service today. Two separate audit sinks (e.g. JSONL + a binary
-  ring buffer) need either a list under `log:` or a parallel `audit:`
-  block.
+- ~~**Slice 8e — multiple log effects per service.**~~ **Shipped
+  2026-04-27**: `Service.logs: Vec<LogBlock>` (was: single
+  `Option<Effect>`); each block carries its own `on_error` policy.
+  Multiple `log:` blocks fire in source order between handler and
+  response write. The strict block declared first is what makes a
+  dual-sink chain fail-closed (audit can't open → process aborts
+  before metrics emit). See `dual_log.verbose::dual_logged`.
 - **Slice 8f — JSON escaping primitive.** `concat` does not escape
   special characters in user-controlled fields. A path containing `"`
   produces broken JSON. Workaround until 8f: trust the upstream parser
