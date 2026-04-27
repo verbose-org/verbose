@@ -131,6 +131,19 @@ examples/
                    10 (concurrency: forked). 1730 B (forked + cached). Parent reads the
                    file once at startup, kids inherit via fork's COW — file edits are
                    NOT picked up until restart (the trade-off the operator opts into).
+  enriched_page.*  Coverage example: read(resource) + fetch(connection) BOTH in the
+                   same HTTP handler body. Body is concat(header_literal, read(file),
+                   sep_literal, fetch(upstream, "GET /data HTTP/1.0\r\n\r\n")) — the
+                   first example whose handler chains a per-request file read AND an
+                   outbound fetch in one accept iteration. Surfaced and pinned a real
+                   bug: `emit_concat_to_buffer_impl`'s sizing pass was matching only
+                   `Expr::Ident` for BoundText, so `Read(_)` and `Fetch(_, _)` args
+                   contributed zero bytes to the buffer size while the fill pass
+                   wrote them in full — overrunning into the HTTP request scratch
+                   and clobbering req.method/req.path. Fix in native.rs:1959 broadens
+                   the BoundText match to mirror the fill pass at native.rs:2368.
+                   1881 B native binary on port 18923. Pinned by the regression test
+                   `coverage_read_and_fetch_concat_in_handler_preserves_request_slots`.
   demo.html        Browser demo (WASM)
 
 tools/

@@ -1,0 +1,94 @@
+@verbose 0.1.0
+
+-- Coverage example: read(resource) AND fetch(connection) in the same
+-- HTTP service handler. Phase 9 slice 9.2 (read-in-handler) and Phase
+-- 11 slice 11.2 (fetch-in-handler) both claim to compose -- their
+-- entries in CLAUDE.md explicitly say "Composes with read+fetch in
+-- the same handler (resource fd closed before fetch fd opens)" -- but
+-- no worked example demonstrated the composition end-to-end before
+-- this one.
+--
+-- What the binary does, per accept (no caching, so the file IS reread
+-- each request):
+--   1. accept connection
+--   2. clock_gettime         -> req.timestamp slot
+--   3. open(/tmp/verbose_enriched_header.txt, O_RDONLY) -> r15 ; js abort
+--   4. read(r15, header_buf, 512) -> js abort
+--   5. close(r15)
+--   6. socket(AF_INET, SOCK_STREAM, 0) -> r15 ; js abort
+--   7. connect(r15, &127.0.0.1:19003, 16) -> js abort
+--   8. write(r15, "GET /data HTTP/1.0\r\n\r\n", 22) -> js abort
+--   9. read(r15, upstream_buf, 1024) -> js abort
+--  10. close(r15)
+--  11. parse HTTP method + path from the inbound request
+--  12. handler builds resp.body via concat(header, separator, upstream)
+--  13. append_file audit line (status + ts + method + path)
+--  14. write HTTP/1.0 response
+--  15. close client fd ; lea rsp, [rbp - frame_size] ; jmp accept_top
+--
+-- The two effect handles never overlap: r15 holds the file fd through
+-- step 5, then is reused as the outbound socket fd from step 6. close
+-- in step 5 happens before socket() in step 6, so even fd-recycling
+-- by the kernel cannot create aliasing.
+--
+-- on_error: abort on the audit log makes the chain fail-closed: if
+-- writing the audit line ever fails, the process exits 1 BEFORE the
+-- response goes out. The client never sees a served body that wasn't
+-- audited.
+
+
+resource header_template
+  @intention: "Static header prepended to every enriched response"
+  @source: enriched_page.intent:1
+
+  path: "/tmp/verbose_enriched_header.txt"
+  max:  512
+  on_read_error: abort
+
+
+connection data_api
+  @intention: "Backend JSON endpoint whose payload we splice under the header"
+  @source: enriched_page.intent:1
+
+  host: "127.0.0.1"
+  port: 19003
+  max_response: 1024
+  on_connect_error: abort
+
+
+rule serve_enriched
+  @intention: "For every request, serve the static header followed by a freshly fetched upstream payload"
+  @source: enriched_page.intent:1
+
+  input:
+    req : HttpRequest
+
+  output:
+    resp : HttpResponse
+
+  logic:
+    resp = HttpResponse { status: 200, body: concat("HEADER:\n", read(header_template), "\n---\nUPSTREAM:\n", fetch(data_api, "GET /data HTTP/1.0\r\n\r\n")) }
+
+  proofs:
+    purity:
+      reads : [header_template, data_api]
+      calls : []
+
+    termination:
+      bound : 4
+
+
+service enriched_server
+  @intention: "Listen on 18923, serve a header+upstream composite, audit each request"
+  @source: enriched_page.intent:1
+
+  listen:
+    protocol    : http_1_0
+    port        : 18923
+    max_request : 4096
+
+  handler: serve_enriched
+
+  log:
+    append_file "/tmp/verbose_enriched.jsonl" concat("{\"ts\":", req.timestamp, ",\"method\":\"", req.method, "\",\"path\":\"", req.path, "\",\"status\":", resp.status, "}\n")
+    on_error: abort

@@ -1,0 +1,1 @@
+1. An HTTP service whose handler reads a static header file from disk and fetches a JSON payload from a fixed upstream endpoint, then returns a single response body composed of the header followed by the upstream payload. Every request is audited to a JSONL file with method, path, status, and timestamp; if the audit cannot be written, the server aborts before responding.

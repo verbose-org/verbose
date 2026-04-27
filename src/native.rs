@@ -1957,8 +1957,17 @@ fn emit_concat_to_buffer_impl(
                 }
             }
             ConcatArgKind::BoundText => {
-                if let Expr::Ident(name) = arg {
-                    let (_, len_slot) = *text_bindings.get(name.as_str()).expect("classified as BoundText so present in bindings");
+                // Phase 9 slice 1 (Expr::Read) and Phase 11 slice 1 (Expr::Fetch)
+                // both classify as BoundText with (ptr_slot, len_slot) in
+                // text_bindings, just like Expr::Ident — the sizing pass must
+                // count their runtime length so the buffer is large enough,
+                // otherwise the fill pass overruns into adjacent slots.
+                let bound_name = match arg {
+                    Expr::Ident(n) | Expr::Read(n) | Expr::Fetch(n, _) => Some(n.as_str()),
+                    _ => None,
+                };
+                if let Some(name) = bound_name {
+                    let (_, len_slot) = *text_bindings.get(name).expect("classified as BoundText so present in bindings");
                     if len_slot >= -128 {
                         code.extend_from_slice(&[0x48, 0x03, 0x45]);
                         code.push(len_slot as u8);
@@ -12635,6 +12644,168 @@ service gateway
         );
 
         let _ = std::fs::remove_file(&out);
+    }
+
+    /// Audit-coverage regression: when an HTTP handler body composes
+    /// `concat(literal, read(resource), literal, fetch(connection, _))`,
+    /// both the resource read and the fetch response must contribute
+    /// their RUNTIME length to the body buffer's sizing pass. Before the
+    /// fix in `emit_concat_to_buffer_impl`, the BoundText sizing branch
+    /// matched only `Expr::Ident`, so `Read(_)` and `Fetch(_, _)` args
+    /// silently added zero — the fill pass then overran the buffer
+    /// upward into the HTTP request scratch and clobbered `req.method` /
+    /// `req.path`. The visible symptom was correct response bodies but
+    /// audit log lines whose method/path expanded to file/upstream
+    /// content. This test pins the fix: the audit line's method must be
+    /// "GET" and its path must be the request path, byte-for-byte.
+    #[test]
+    fn coverage_read_and_fetch_concat_in_handler_preserves_request_slots() {
+        use std::io::{Read, Write};
+        use std::net::{TcpListener, TcpStream};
+        use std::process::{Command, Stdio};
+        use std::thread;
+        use std::time::Duration;
+
+        let upstream_port: u16 = 19031;
+        let svc_port: u16 = 18931;
+        let header_path = "/tmp/verbosec_test_coverage_rf_header.txt";
+        let audit_path = "/tmp/verbosec_test_coverage_rf_audit.jsonl";
+
+        std::fs::write(header_path, b"HEADER-CONTENT-FOR-TEST\n").expect("write header");
+        let _ = std::fs::remove_file(audit_path);
+
+        let upstream =
+            TcpListener::bind(("127.0.0.1", upstream_port)).expect("bind test upstream");
+        upstream.set_nonblocking(false).expect("blocking upstream");
+        let upstream_payload =
+            b"HTTP/1.0 200 OK\r\nContent-Length: 24\r\n\r\nUPSTREAM-PAYLOAD-FOR-TST";
+        let upstream_thread = thread::spawn(move || {
+            let (mut sock, _) = upstream.accept().expect("upstream accept");
+            sock.set_read_timeout(Some(Duration::from_secs(2))).ok();
+            let mut req = [0u8; 1024];
+            let _ = sock.read(&mut req).unwrap_or(0);
+            sock.write_all(upstream_payload).expect("write upstream response");
+        });
+
+        let src = format!(
+            r#"@verbose 0.1.0
+
+resource header_template
+  @intention: "header file"
+  @source: invoices.intent:1
+  path: "{header_path}"
+  max:  512
+  on_read_error: abort
+
+connection upstream
+  @intention: "test upstream"
+  @source: invoices.intent:1
+  host: "127.0.0.1"
+  port: {upstream_port}
+  max_response: 1024
+  on_connect_error: abort
+
+rule serve
+  @intention: "header + upstream"
+  @source: invoices.intent:1
+  input:
+    req : HttpRequest
+  output:
+    resp : HttpResponse
+  logic:
+    resp = HttpResponse {{ status: 200, body: concat("H:", read(header_template), "|U:", fetch(upstream, "GET / HTTP/1.0\r\n\r\n")) }}
+  proofs:
+    purity:
+      reads : [header_template, upstream]
+      calls : []
+    termination:
+      bound : 4
+
+service rf_server
+  @intention: "test"
+  @source: invoices.intent:1
+  listen:
+    protocol    : http_1_0
+    port        : {svc_port}
+    max_request : 4096
+  handler: serve
+  log:
+    append_file "{audit_path}" concat("{{\"method\":\"", req.method, "\",\"path\":\"", req.path, "\"}}\n")
+    on_error: abort
+"#
+        );
+
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens)
+            .parse_program()
+            .expect("parse");
+
+        let out =
+            std::env::temp_dir().join("verbosec_test_coverage_rf_bin");
+        compile_service(&program, "rf_server", out.to_str().unwrap())
+            .expect("compile read+fetch service");
+
+        let mut child = Command::new(&out)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn service");
+
+        let mut stream: Option<TcpStream> = None;
+        for _ in 0..50 {
+            match TcpStream::connect_timeout(
+                &format!("127.0.0.1:{}", svc_port).parse().unwrap(),
+                Duration::from_millis(100),
+            ) {
+                Ok(s) => {
+                    stream = Some(s);
+                    break;
+                }
+                Err(_) => std::thread::sleep(Duration::from_millis(20)),
+            }
+        }
+
+        let runtime: Result<Vec<u8>, String> = (|| {
+            let mut s = stream.ok_or_else(|| "no connect".to_string())?;
+            s.set_read_timeout(Some(Duration::from_secs(2))).ok();
+            s.write_all(b"GET /coverage/path HTTP/1.0\r\n\r\n")
+                .map_err(|e| format!("write: {}", e))?;
+            let mut buf = Vec::new();
+            s.read_to_end(&mut buf).map_err(|e| format!("read: {}", e))?;
+            Ok(buf)
+        })();
+
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = upstream_thread.join();
+
+        let response = runtime.expect("HTTP roundtrip failed");
+        let response_str = String::from_utf8_lossy(&response);
+
+        // (a) Body must contain BOTH the header file content AND the
+        //     upstream payload — proves the concat fill copied both
+        //     BoundText args correctly.
+        assert!(
+            response_str.contains("H:HEADER-CONTENT-FOR-TEST")
+                && response_str.contains("U:HTTP/1.0 200 OK")
+                && response_str.contains("UPSTREAM-PAYLOAD-FOR-TST"),
+            "response body missing header or upstream content: {:?}",
+            response_str
+        );
+
+        // (b) The bug: req.method / req.path slots in the log scope were
+        //     clobbered by the body buffer overrun. With the sizing fix
+        //     they must contain exactly the parsed HTTP request fields.
+        let audit = std::fs::read_to_string(audit_path).expect("read audit log");
+        assert_eq!(
+            audit.trim_end(),
+            "{\"method\":\"GET\",\"path\":\"/coverage/path\"}",
+            "audit log line corrupted — read+fetch buffer overran into req slots"
+        );
+
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_file(header_path);
+        let _ = std::fs::remove_file(audit_path);
     }
 
     /// Phase 12 (json_escape) compile-time fold: when the inner is a text
