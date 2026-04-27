@@ -205,7 +205,7 @@ fn compile_native_code(
     } else if is_result_output {
         emit_result_program(rule, concept, &rules, &resources, &connections)?
     } else if is_collection_output {
-        emit_collection_program(rule, concept, &concepts, &rules)?
+        emit_collection_program(rule, concept, &concepts, &rules, &resources)?
     } else if is_fold_number_output {
         // If the logic was desugared from Quantifier→Fold, create a temp
         // rule with the desugared logic so emit_fold_program sees a Fold.
@@ -4029,6 +4029,7 @@ fn emit_record_program(
         all_rules,
         &ctx.binding_offsets,
         &ctx.field_ranges,
+        &ctx.text_bindings,
     )?;
 
     emit_record_loop_epilogue(&mut code, &ctx);
@@ -4051,6 +4052,7 @@ fn emit_collection_program(
     input_concept: &Concept,
     all_concepts: &[&Concept],
     all_rules: &HashMap<&str, &Rule>,
+    all_resources: &HashMap<&str, &Resource>,
 ) -> Result<Vec<u8>, NativeError> {
     // ===== Scope validation =====
     let elem_type_name = match &rule.output_ty {
@@ -4221,9 +4223,39 @@ fn emit_collection_program(
     let n_elem_fields = input_elem_concept.fields.len();
     let n_lets = rule.logic.bindings.len();
     let frame_slots = n_scalar + n_elem_fields + n_lets;
-    let frame_size = (frame_slots as i32) * 8;
+
+    // Slice 9.5c: enumerate resources the rule reads (in source order) so the
+    // open/read/close sequence runs ONCE above the outer loop and the (ptr,
+    // len) slots survive every record AND every element iteration. Same
+    // shape and shared `emit_resource_read_sequence` helper used by the rule
+    // prologue (slice 9.1) and the text-fold init (slice 9.5).
+    let referenced_resources: Vec<&Resource> = {
+        let names = collect_rule_read_names(rule);
+        let mut out: Vec<&Resource> = Vec::with_capacity(names.len());
+        for name in &names {
+            let r = all_resources.get(name.as_str()).ok_or_else(|| NativeError {
+                message: format!(
+                    "rule '{}' reads resource '{}' but no top-level `resource {}` was declared",
+                    rule.name, name, name
+                ),
+            })?;
+            out.push(*r);
+        }
+        out
+    };
+    let resource_extra_bytes: i32 = referenced_resources
+        .iter()
+        .map(|r| 16 + (((r.max_bytes as i32) + 7) & !7))
+        .sum();
+    let frame_size = (frame_slots as i32) * 8 + resource_extra_bytes;
 
     let mut code = Vec::new();
+    // Patches into the resource open/read failure jumps (filled at the end).
+    let mut resource_abort_patches: Vec<usize> = Vec::new();
+    // Names → (ptr_slot, len_slot) for resources, populated by the prologue
+    // and threaded through the body emitters so `Expr::Read` resolves
+    // through the BoundText path everywhere a text-typed value is consumed.
+    let mut text_bindings: TextBindings<'_> = HashMap::new();
 
     // _start — argv/rbp frame setup.
     code.extend_from_slice(&[0x4C, 0x8B, 0x24, 0x24]); // mov r12, [rsp]
@@ -4234,6 +4266,23 @@ fn emit_collection_program(
     code.extend_from_slice(&[0x48, 0x81, 0xEC]);
     code.extend_from_slice(&frame_size.to_le_bytes());
     code.extend_from_slice(&[0x49, 0xC7, 0xC6, 0x01, 0x00, 0x00, 0x00]); // mov r14, 1
+
+    // Slice 9.5c: emit each resource read sequence ABOVE the outer loop —
+    // the file is opened/read/closed once per rule invocation, and the
+    // (ptr, len) survive every record + every element via the rbp slots.
+    // Slot cursor descends from just below the existing frame slots so
+    // scalar/element/let slots stay where they were.
+    let mut resource_next_slot: i32 = -((frame_slots as i32) * 8 + 8);
+    for r in &referenced_resources {
+        let (ptr_slot, len_slot, _buf_slot, new_next) = emit_resource_read_sequence(
+            &mut code,
+            r,
+            resource_next_slot,
+            &mut resource_abort_patches,
+        );
+        text_bindings.insert(r.name.as_str(), (ptr_slot, len_slot));
+        resource_next_slot = new_next;
+    }
 
     // Outer loop: each iteration processes one input record (scalars + count + elements).
     let outer_loop_top = code.len();
@@ -4337,6 +4386,7 @@ fn emit_collection_program(
                 all_rules,
                 &elem_offsets,
                 &field_ranges,
+                &text_bindings,
             )?;
         }
         CollectionOp::MapScalar { lambda_var, body, is_text } => {
@@ -4346,7 +4396,7 @@ fn emit_collection_program(
                 emit_text_write_to_fd(
                     &mut code, body, 1, lambda_var, input_elem_concept, all_rules,
                     &elem_offsets, &field_ranges,
-                    &no_text_bindings(),
+                    &text_bindings,
                 )?;
                 emit_write_newline(&mut code, 1);
             } else {
@@ -4411,6 +4461,7 @@ fn emit_collection_program(
                 all_rules,
                 &elem_offsets,
                 &field_ranges,
+                &text_bindings,
             )?;
 
             // skip_emit:
@@ -4443,6 +4494,20 @@ fn emit_collection_program(
     code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x3C, 0x00, 0x00, 0x00]); // mov rax, 60
     code.extend_from_slice(&[0x48, 0x31, 0xFF]); // xor rdi, rdi
     code.extend_from_slice(&[0x0F, 0x05]); // syscall
+
+    // Slice 9.5c: shared abort label for resource open/read failures.
+    // Mirrors the rule-prologue path. Only emitted when at least one
+    // resource was read, so resource-free programs pay zero bytes.
+    if !resource_abort_patches.is_empty() {
+        let abort_label = code.len();
+        for site in &resource_abort_patches {
+            let rel = abort_label as i32 - (*site as i32 + 4);
+            code[*site..*site + 4].copy_from_slice(&rel.to_le_bytes());
+        }
+        code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x3C, 0x00, 0x00, 0x00]); // mov rax, 60
+        code.extend_from_slice(&[0x48, 0xC7, 0xC7, 0x01, 0x00, 0x00, 0x00]); // mov rdi, 1
+        code.extend_from_slice(&[0x0F, 0x05]);                               // syscall
+    }
 
     Ok(code)
 }
@@ -5776,6 +5841,7 @@ fn emit_eval_record_expr(
     all_rules: &HashMap<&str, &Rule>,
     offsets: &HashMap<&str, i32>,
     field_ranges: &HashMap<&str, (i64, i64)>,
+    text_bindings: &TextBindings<'_>,
 ) -> Result<(), NativeError> {
     match expr {
         Expr::Record(name, fields) => {
@@ -5799,6 +5865,7 @@ fn emit_eval_record_expr(
                 all_rules,
                 offsets,
                 field_ranges,
+                text_bindings,
             )?;
             // jmp loop_top
             code.push(0xE9);
@@ -5816,7 +5883,7 @@ fn emit_eval_record_expr(
 
             emit_eval_record_expr(
                 code, then_e, loop_top, output_concept, all_concepts, rule,
-                input_concept, all_rules, offsets, field_ranges,
+                input_concept, all_rules, offsets, field_ranges, text_bindings,
             )?;
 
             let else_pos = code.len();
@@ -5824,7 +5891,7 @@ fn emit_eval_record_expr(
             code[else_patch..else_patch + 4].copy_from_slice(&else_off.to_le_bytes());
             emit_eval_record_expr(
                 code, else_e, loop_top, output_concept, all_concepts, rule,
-                input_concept, all_rules, offsets, field_ranges,
+                input_concept, all_rules, offsets, field_ranges, text_bindings,
             )?;
             Ok(())
         }
@@ -5850,6 +5917,7 @@ fn emit_record_as_json(
     all_rules: &HashMap<&str, &Rule>,
     offsets: &HashMap<&str, i32>,
     field_ranges: &HashMap<&str, (i64, i64)>,
+    text_bindings: &TextBindings<'_>,
 ) -> Result<(), NativeError> {
     let provided: HashMap<&str, &Expr> = fields.iter().map(|(n, e)| (n.as_str(), e)).collect();
 
@@ -5879,6 +5947,11 @@ fn emit_record_as_json(
             }
             Type::Text => {
                 // Write the text bytes then the closing quote.
+                // Slice 9.5c: pass through the caller's text_bindings so
+                // `Expr::Read(name)` (and any future BoundText shape) in a
+                // record's text-typed field resolves correctly. emit_record_program
+                // passes &ctx.text_bindings; emit_collection_program passes its
+                // local map populated from the resource prologue.
                 emit_text_write_to_fd(
                     code,
                     value_expr,
@@ -5888,7 +5961,7 @@ fn emit_record_as_json(
                     all_rules,
                     offsets,
                     field_ranges,
-                    &no_text_bindings(),
+                    text_bindings,
                 )?;
                 emit_write_static_to_fd(code, b"\"", 1);
             }
@@ -11115,6 +11188,74 @@ mod tests {
         );
 
         let _ = fs::remove_file(out);
+    }
+
+    /// Phase 9 slice 9.5c: `read(<resource>)` is allowed inside a Phase 3
+    /// `map(...)` body that produces a record collection. The resource is
+    /// opened/read/closed ONCE above the outer record loop; (ptr, len)
+    /// slots survive every record AND every element iteration; each output
+    /// record's text field that uses `read(name)` resolves through the
+    /// BoundText path (same shape as Phase 9.1 / 9.2 / 9.5).
+    ///
+    /// This test pins:
+    ///   (a) the binary emits one valid JSON line per element
+    ///   (b) every element receives the SAME bytes from the file (the
+    ///       resource is read once and reused across iterations)
+    ///   (c) on_read_error: abort exits before any output if the file
+    ///       can't be opened
+    #[test]
+    fn slice_9_5c_collection_map_with_read_in_record_field() {
+        use std::process::Command;
+        let tag_path = "/tmp/verbosec_test_slice95c_tag.txt";
+        std::fs::write(tag_path, b"POLICY-vTEST").expect("write tag");
+
+        let src = std::fs::read_to_string("examples/tagged_bonuses.verbose")
+            .expect("examples/tagged_bonuses.verbose is expected to exist");
+        let src = src.replace("/tmp/verbose_policy_tag.txt", tag_path);
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+
+        let out = std::env::temp_dir().join("verbosec_test_slice95c_tagged");
+        compile_native(&program, "tag_employees", out.to_str().unwrap(), false, false)
+            .expect("Phase 3 collection-with-read should compile");
+
+        // Happy path: 3 employees, every output record carries the same tag.
+        let ok = Command::new(&out)
+            .args(["3", "alice", "100", "bob", "200", "carol", "300"])
+            .output()
+            .expect("spawn happy run");
+        assert!(ok.status.success(), "happy run exit: {:?}", ok.status);
+        let stdout = String::from_utf8_lossy(&ok.stdout);
+        let lines: Vec<&str> = stdout.lines().collect();
+        assert_eq!(lines.len(), 3, "expected 3 JSON lines, got {:?}", stdout);
+        for line in &lines {
+            assert!(
+                line.contains("\"policy_tag\":\"POLICY-vTEST\""),
+                "every record should carry the same policy_tag bytes; got line: {:?}",
+                line
+            );
+            assert!(
+                line.starts_with("{\"name\":\"") && line.ends_with("}"),
+                "each line must be a complete JSON object: {:?}",
+                line
+            );
+        }
+
+        // Abort path: no tag file at all → exit 1 with empty stdout.
+        let _ = std::fs::remove_file(tag_path);
+        let abort = Command::new(&out)
+            .args(["1", "eve", "400"])
+            .output()
+            .expect("spawn abort run");
+        assert!(
+            !abort.status.success() && abort.stdout.is_empty(),
+            "missing-file run should exit non-zero with empty stdout; got status={:?} stdout={:?}",
+            abort.status,
+            String::from_utf8_lossy(&abort.stdout)
+        );
+
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_file(tag_path);
     }
 
     /// Phase 2I-in-handlers: an HTTP service handler may declare

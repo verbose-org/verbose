@@ -230,16 +230,20 @@ ships the worked example (1572-byte binary).
   strict-only default makes failure obvious; relaxing is an explicit
   opt-in if needed.
 - **File resources in collection / fold / parallel programs.**
-  Slice 9.5 (2026-04-27) opened the door for Phase 5b text-fold
-  programs by allowing `read(<resource>)` as the FOLD INIT
-  expression — see `banner_roster.verbose::banner_line`. Still
-  refused: `read()` inside fold BODY (would need to flip the
-  BoundText rejection at the body classifier and account for
-  per-iteration sizing); `read()` in `emit_collection_program`
-  (Phase 3 map/filter); `read()` in `emit_fold_program` (Phase 4
-  number fold); `read()` in `emit_multi_fold_program` (Phase 6);
-  `read()` in `emit_parallel_program`. Each is a separate slice
-  following the same prologue-extraction pattern.
+  Two slices shipped 2026-04-27:
+  - 9.5 (text-fold init): `banner_roster.verbose::banner_line`
+  - 9.5c (Phase 3 collection map): `tagged_bonuses.verbose::tag_employees`
+    — `read()` inside the map body's record field; resource read
+    once above the outer record loop, every output record
+    references the same (ptr, len) slots via the threaded
+    `text_bindings`. Same pattern works for filter (synthetic
+    Record path uses the same `emit_record_as_json` helper).
+  Still refused: `read()` inside text-fold BODY (would need to
+  flip the BoundText rejection at the body classifier and account
+  for per-iteration sizing); `read()` in `emit_fold_program`
+  (Phase 4 number fold); `read()` in `emit_multi_fold_program`
+  (Phase 6); `read()` in `emit_parallel_program`. Each is a
+  separate slice following the same prologue-extraction pattern.
 - **Multiple resources composing in a single concat in service
   handlers.** Single-resource handler bodies tested; multi-resource
   in one expression should work via text_bindings but isn't covered

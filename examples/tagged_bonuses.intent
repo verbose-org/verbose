@@ -1,0 +1,1 @@
+1. A rule that takes a workforce and produces one JSON record per employee. Each output record carries the employee's name and salary, plus a constant "policy_tag" string loaded from a file at the start of the rule (so the tag can change between binary invocations without a recompile).

@@ -1,0 +1,86 @@
+@verbose 0.1.0
+
+-- Phase 9 slice 9.5c: `read(<resource>)` inside a Phase 3 collection
+-- emitter (`map` producing a record collection). The policy tag is
+-- loaded ONCE per rule invocation (above the outer record loop), then
+-- every output record copies it into its `policy_tag` text field via
+-- the BoundText path.
+--
+-- Why this composition matters: SIEM / audit-log enrichment pipelines
+-- routinely tag streamed records with a policy version, a feature
+-- flag value, or a deployment-time identifier loaded from disk.
+-- Without slice 9.5c the tag had to be hardcoded at compile time
+-- (recompile to bump the policy version) or fanned out from a wrapper
+-- script. Now it's a single `read()` in the map body, the binary
+-- stays a small standalone, and the auditor sees the file path
+-- inline in the source.
+--
+-- Per rule invocation:
+--   1. open(/tmp/verbose_policy_tag.txt, O_RDONLY) -> r15 ; js abort
+--   2. read(r15, buf, 64) -> js abort
+--   3. close(r15)
+--   4. for each record (here: one workforce per argv frame)
+--      4a. parse scalar fields + element count
+--      4b. for each employee
+--          - parse element fields (name, salary)
+--          - emit `{"name":"<n>","salary":<s>,"policy_tag":"<tag>"}\n`
+--            where the policy_tag bytes come from the (ptr,len) slots
+--            populated in step 2
+
+
+resource policy_tag
+  @intention: "Constant tag stamped onto every emitted record"
+  @source: tagged_bonuses.intent:1
+
+  path: "/tmp/verbose_policy_tag.txt"
+  max:  64
+  on_read_error: abort
+
+
+concept Employee
+  @intention: "An employee has a name and a salary"
+  @source: tagged_bonuses.intent:1
+
+  fields:
+    name   : text
+    salary : number [0, 1000000]
+
+
+concept Workforce
+  @intention: "A workforce is a collection of employees"
+  @source: tagged_bonuses.intent:1
+
+  fields:
+    employees : collection(Employee)
+
+
+concept TaggedRecord
+  @intention: "Per-employee output: name, salary, plus the runtime-loaded policy tag"
+  @source: tagged_bonuses.intent:1
+
+  fields:
+    name       : text
+    salary     : number [0, 1000000]
+    policy_tag : text
+
+
+rule tag_employees
+  @intention: "For each employee, emit a JSON record carrying the runtime policy tag"
+  @source: tagged_bonuses.intent:1
+
+  input:
+    w : Workforce
+
+  output:
+    out : collection(TaggedRecord)
+
+  logic:
+    out = map(w.employees, e => TaggedRecord { name: e.name, salary: e.salary, policy_tag: read(policy_tag) })
+
+  proofs:
+    purity:
+      reads : [w.employees, policy_tag]
+      calls : []
+
+    termination:
+      bound : 4
