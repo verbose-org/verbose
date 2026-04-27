@@ -1,0 +1,1 @@
+1. A rule that builds a single line per workforce by appending each employee's name and salary into an accumulator. Between consecutive entries, a separator string loaded from a file is interpolated, so the operator can change the format (e.g. "; " vs " | ") without recompiling.

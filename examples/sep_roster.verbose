@@ -1,0 +1,72 @@
+@verbose 0.1.0
+
+-- Phase 9 slice 9.5b: `read(<resource>)` allowed inside the BODY of a
+-- Phase 5b text fold. The separator is loaded ONCE per rule invocation
+-- (above the outer loop) and reused on every iteration, copying the
+-- bound (ptr, len) into the per-element concat fill — the same path
+-- the body uses for element text fields.
+--
+-- Why this composition matters: the operator can change the output
+-- format (`; ` vs ` | ` vs `\t`) by editing one file, no recompile.
+-- The binary stays a small standalone CLI.
+--
+-- Per rule invocation:
+--   1. open(/tmp/verbose_roster_sep.txt, O_RDONLY) -> r15 ; js abort
+--   2. read(r15, buf, 16) -> js abort
+--   3. close(r15)
+--   4. for each input record (one workforce per argv frame)
+--      4a. parse scalar fields + element count
+--      4b. compute total buffer size = init_lit + N * (per-element static
+--          + sep.max_bytes)   ← sep contributes max_bytes per element
+--      4c. allocate that buffer
+--      4d. for each employee
+--          - parse name + salary
+--          - copy into the buffer: name + "=" + salary + sep_bytes
+--      4e. one write to stdout, free buffer
+
+
+resource sep
+  @intention: "Separator interpolated between consecutive entries"
+  @source: sep_roster.intent:1
+
+  path: "/tmp/verbose_roster_sep.txt"
+  max:  16
+  on_read_error: abort
+
+
+concept Employee
+  @intention: "An employee has a name and a salary"
+  @source: sep_roster.intent:1
+
+  fields:
+    name   : text
+    salary : number [0, 1000000]
+
+
+concept Workforce
+  @intention: "A workforce is a collection of employees"
+  @source: sep_roster.intent:1
+
+  fields:
+    employees : collection(Employee)
+
+
+rule sep_line
+  @intention: "Build one roster line: name=salary entries glued by the runtime separator"
+  @source: sep_roster.intent:1
+
+  input:
+    w : Workforce
+
+  output:
+    line : text
+
+  logic:
+    line = fold(w.employees, "roster: ", acc, e => concat(acc, e.name, "=", e.salary, read(sep)))
+
+  proofs:
+    purity:
+      reads   : [w.employees, sep]
+      calls   : []
+    termination:
+      bound : 6

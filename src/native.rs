@@ -5286,18 +5286,57 @@ fn emit_text_fold_program(
     }
     verify_collection_target(coll_expr, &rule.input_name, &coll_field.name)?;
 
+    // Slice 9.5b: enumerate every resource the rule reads (init AND body),
+    // de-duplicated in source order. Registered in `prebuilt_text_bindings`
+    // BEFORE the body classifier runs so `Expr::Read(name)` is recognized
+    // as BoundText. The actual read sequences fire once per rule invocation
+    // above the outer loop — see the prologue below. For literal-init,
+    // resource-free programs `referenced_resources` stays empty and
+    // everything is byte-for-byte the slice-5b original.
+    let referenced_resources: Vec<&Resource> = {
+        let names = collect_rule_read_names(rule);
+        let mut out: Vec<&Resource> = Vec::with_capacity(names.len());
+        for name in &names {
+            let r = all_resources.get(name.as_str()).ok_or_else(|| NativeError {
+                message: format!(
+                    "rule '{}' reads resource '{}' but no top-level `resource {}` was declared",
+                    rule.name, name, name
+                ),
+            })?;
+            out.push(*r);
+        }
+        out
+    };
+    // We don't yet know the rbp slot offsets — the prologue assigns them
+    // AFTER frame setup. For the classifier we only need the names to be
+    // present in the bindings map (the map lookup is name → presence;
+    // the (i32, i32) values are placeholders here and overwritten below
+    // before any emission consults them). This is the pre-build step.
+    let mut prebuilt_text_bindings: TextBindings<'_> = HashMap::new();
+    for r in &referenced_resources {
+        prebuilt_text_bindings.insert(r.name.as_str(), (0, 0));
+    }
+
     // Classify rest args. The lambda var `item` is the "input" for field
-    // accesses within them.
+    // accesses within them. Pass `prebuilt_text_bindings` so `read(name)`
+    // classifies as BoundText (slice 9.5b extension).
     let mut rest_kinds: Vec<ConcatArgKind> = Vec::with_capacity(rest_args.len());
-    let empty_bindings = no_text_bindings();
     for arg in rest_args {
-        let k = classify_concat_arg(arg, elem_concept, item_name, &empty_bindings).ok_or_else(|| NativeError {
-            message: "Phase 5b: fold-body concat arg must be a text literal, number expression, or element text field".into(),
+        let k = classify_concat_arg(arg, elem_concept, item_name, &prebuilt_text_bindings).ok_or_else(|| NativeError {
+            message: "Phase 5b: fold-body concat arg must be a text literal, number expression, element text field, or read(<resource>)".into(),
         })?;
         if k == ConcatArgKind::BoundText {
-            return Err(NativeError {
-                message: "Phase 5b: fold body cannot reference bound text vars (no match_result inside fold bodies in native today)".into(),
-            });
+            // Slice 9.5b: only Expr::Read is admitted as BoundText in a
+            // fold body. Ident-bound text (Phase 2I let bindings) and
+            // Fetch (Phase 11) remain refused — each is a separate slice.
+            // Read works because its (ptr, len) live in stable rbp slots
+            // for the entire rule invocation, so iteration order is
+            // irrelevant to slot validity.
+            if !matches!(arg, Expr::Read(_)) {
+                return Err(NativeError {
+                    message: "Phase 5b: fold body BoundText arg must be `read(<resource>)`; let-bound text and fetch remain out of scope".into(),
+                });
+            }
         }
         if k == ConcatArgKind::CallText {
             return Err(NativeError {
@@ -5334,8 +5373,22 @@ fn emit_text_fold_program(
             ConcatArgKind::Number => {
                 static_per_element += 21;
             }
-            ConcatArgKind::BoundText | ConcatArgKind::CallText => {
-                unreachable!("BoundText/CallText rejected above")
+            ConcatArgKind::BoundText => {
+                // Slice 9.5b: only Read is allowed (gate above). The
+                // resource's `max:` bound is a compile-time constant
+                // upper bound on the byte count copied per iteration,
+                // so single-pass sizing stays available.
+                if let Expr::Read(name) = arg {
+                    let r = all_resources.get(name.as_str()).expect(
+                        "resource validated to exist when prebuilt_text_bindings was populated",
+                    );
+                    static_per_element += r.max_bytes as i32;
+                } else {
+                    unreachable!("BoundText non-Read arg rejected at classifier")
+                }
+            }
+            ConcatArgKind::CallText => {
+                unreachable!("CallText rejected above")
             }
             ConcatArgKind::JsonEscapedText => {
                 // Phase 12: json_escape inside a top-level fold body would
@@ -5354,28 +5407,31 @@ fn emit_text_fold_program(
     let n_elem_fields = elem_concept.fields.len();
     let n_lets = rule.logic.bindings.len();
     // frame: n_scalar + n_elem + n_lets + count_slot + argv_save_slot
-    //        (+ resource block at the bottom when init is read(...))
+    //        (+ one resource block per referenced resource at the bottom)
     let frame_slots = n_scalar + n_elem_fields + n_lets + 2;
-    // Slice 9.5: when init is `read(<resource>)`, reserve one resource block
-    // (16 bytes for ptr+len + max_padded buffer) below the existing slots.
-    // The resource is read ONCE at startup — same shape as
-    // emit_record_loop_prologue. Resource read failures route to a shared
-    // sys_exit(1) abort label appended at the very end of the binary.
-    let resource_extra_bytes: i32 = match &init_kind {
-        InitKind::Read(r) => 16 + (((r.max_bytes as i32) + 7) & !7),
-        InitKind::Literal(_) => 0,
-    };
+    // Slice 9.5b: ALL referenced resources contribute to the frame —
+    // both the init-position read (slice 9.5) and any read appearing in
+    // the body concat. Each contributes (16 bytes for ptr+len) + max
+    // padded to 8 bytes. Reads run ONCE at startup; the (ptr, len) live
+    // for the entire rule invocation.
+    let resource_extra_bytes: i32 = referenced_resources
+        .iter()
+        .map(|r| 16 + (((r.max_bytes as i32) + 7) & !7))
+        .sum();
     let frame_size = (frame_slots as i32) * 8 + resource_extra_bytes;
     let count_slot: i32 = -(((n_scalar + n_elem_fields + n_lets + 1) as i32) * 8);
     let argv_save_slot: i32 = -(((n_scalar + n_elem_fields + n_lets + 2) as i32) * 8);
-    // First resource (ptr) slot lives immediately below argv_save_slot.
-    let resource_first_slot: i32 = argv_save_slot - 8;
 
     let mut code = Vec::new();
     // Patches into the resource open/read failure jumps (filled at the end).
     let mut resource_abort_patches: Vec<usize> = Vec::new();
     // (ptr_slot, len_slot) of the init-position read, if any.
     let mut init_read_slots: Option<(i32, i32)> = None;
+    // Real text_bindings populated by the prologue below; consumed by
+    // the body fill pass via emit_concat_fill. Names match
+    // `prebuilt_text_bindings` from the classifier step but the
+    // (i32, i32) pairs are the real rbp slots assigned here.
+    let mut text_bindings: TextBindings<'_> = HashMap::new();
 
     // _start — argv/rbp setup.
     code.extend_from_slice(&[0x4C, 0x8B, 0x24, 0x24]);       // mov r12, [rsp]
@@ -5387,18 +5443,29 @@ fn emit_text_fold_program(
     code.extend_from_slice(&frame_size.to_le_bytes());       // sub rsp, frame_size
     code.extend_from_slice(&[0x49, 0xC7, 0xC6, 0x01, 0x00, 0x00, 0x00]); // mov r14, 1
 
-    // Slice 9.5: emit the resource read sequence ABOVE the outer loop —
-    // the file is opened/read/closed once per rule invocation, and the
-    // (ptr, len) survive every record iteration via the rbp slots. Same
-    // shape and same shared `emit_resource_read_sequence` helper as the
-    // emit_record_loop_prologue path.
+    // Slice 9.5 / 9.5b: emit ALL resource read sequences ABOVE the outer
+    // loop — files opened/read/closed once per rule invocation, every
+    // (ptr, len) survives every record iteration via the rbp slots.
+    // First slot starts immediately below argv_save_slot and descends.
+    // The init resource (if init_kind is Read) gets its slots pulled
+    // from text_bindings after the loop, by name.
+    {
+        let mut next_slot: i32 = argv_save_slot - 8;
+        for r in &referenced_resources {
+            let (ptr_slot, len_slot, _buf_slot, new_next) = emit_resource_read_sequence(
+                &mut code,
+                r,
+                next_slot,
+                &mut resource_abort_patches,
+            );
+            text_bindings.insert(r.name.as_str(), (ptr_slot, len_slot));
+            next_slot = new_next;
+        }
+    }
     if let InitKind::Read(r) = &init_kind {
-        let (ptr_slot, len_slot, _buf_slot, _new_next) = emit_resource_read_sequence(
-            &mut code,
-            r,
-            resource_first_slot,
-            &mut resource_abort_patches,
-        );
+        let &(ptr_slot, len_slot) = text_bindings
+            .get(r.name.as_str())
+            .expect("init resource always present in referenced_resources");
         init_read_slots = Some((ptr_slot, len_slot));
     }
 
@@ -5712,7 +5779,7 @@ fn emit_text_fold_program(
         all_rules,
         &elem_offsets,
         &field_ranges,
-        &empty_bindings,
+        &text_bindings,
     )?;
 
     // dec r15 ; jmp fill_loop_top
@@ -11188,6 +11255,82 @@ mod tests {
         );
 
         let _ = fs::remove_file(out);
+    }
+
+    /// Phase 9 slice 9.5b: `read(<resource>)` is allowed in the BODY of a
+    /// Phase 5b text fold (not just the init). The resource is opened
+    /// once above the outer record loop and its (ptr, len) live for the
+    /// entire rule invocation; the body classifier accepts BoundText
+    /// only when the arg is `Expr::Read` (Ident-bound text and Fetch
+    /// remain refused — narrower scope, same prologue extraction).
+    /// Sizing pass adds the resource's `max:` bound to
+    /// `static_per_element` (compile-time constant, so single-pass
+    /// fold sizing is preserved).
+    ///
+    /// This test pins:
+    ///   (a) the binary writes the literal init bytes once, then for
+    ///       each element appends `name=salary<separator-from-file>`,
+    ///       all in one write syscall per record
+    ///   (b) the same binary, run again with the file's content
+    ///       changed, produces output with the NEW separator (no
+    ///       recompile needed)
+    ///   (c) missing file → exit 1 with empty stdout
+    #[test]
+    fn slice_9_5b_text_fold_body_with_read_separator() {
+        use std::process::Command;
+        let sep_path = "/tmp/verbosec_test_slice95b_sep.txt";
+        std::fs::write(sep_path, b"; ").expect("initial sep");
+
+        let src = std::fs::read_to_string("examples/sep_roster.verbose")
+            .expect("examples/sep_roster.verbose is expected to exist");
+        let src = src.replace("/tmp/verbose_roster_sep.txt", sep_path);
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+
+        let out = std::env::temp_dir().join("verbosec_test_slice95b_sep_roster");
+        compile_native(&program, "sep_line", out.to_str().unwrap(), false, false)
+            .expect("Phase 5b text fold with body Read should compile");
+
+        // (a) First run with sep="; "
+        let r1 = Command::new(&out)
+            .args(["3", "alice", "100", "bob", "200", "carol", "300"])
+            .output()
+            .expect("spawn r1");
+        assert!(r1.status.success(), "r1 status {:?}", r1.status);
+        assert_eq!(
+            String::from_utf8_lossy(&r1.stdout).trim_end_matches('\n'),
+            "roster: alice=100; bob=200; carol=300; ",
+            "r1 output mismatch"
+        );
+
+        // (b) Edit the file, no recompile, second run picks up new sep.
+        std::fs::write(sep_path, b" | ").expect("update sep");
+        let r2 = Command::new(&out)
+            .args(["2", "dave", "400", "eve", "500"])
+            .output()
+            .expect("spawn r2");
+        assert!(r2.status.success(), "r2 status {:?}", r2.status);
+        assert_eq!(
+            String::from_utf8_lossy(&r2.stdout).trim_end_matches('\n'),
+            "roster: dave=400 | eve=500 | ",
+            "r2 should pick up the new separator without recompile"
+        );
+
+        // (c) Missing file → fail-closed.
+        let _ = std::fs::remove_file(sep_path);
+        let r3 = Command::new(&out)
+            .args(["1", "frank", "600"])
+            .output()
+            .expect("spawn r3");
+        assert!(
+            !r3.status.success() && r3.stdout.is_empty(),
+            "missing-file run should exit non-zero with empty stdout; got status={:?} stdout={:?}",
+            r3.status,
+            String::from_utf8_lossy(&r3.stdout)
+        );
+
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_file(sep_path);
     }
 
     /// Phase 9 slice 9.5c: `read(<resource>)` is allowed inside a Phase 3
