@@ -313,6 +313,10 @@ fn collect_read_names(expr: &Expr, out: &mut Vec<String>) {
         // request bytes expression so any nested read(...) inside a
         // request body (e.g. fetch(c, read(template))) shows up.
         Expr::Fetch(_, req) => collect_read_names(req, out),
+        // Phase 12 (json_escape): pure pass-through — recurse into the
+        // inner expression so any read(...) embedded in the source text
+        // is still collected.
+        Expr::JsonEscape(inner) => collect_read_names(inner, out),
     }
 }
 
@@ -393,6 +397,10 @@ fn collect_fetch_names(expr: &Expr, out: &mut Vec<String>) {
                 collect_fetch_names(e, out);
             }
         }
+        // Phase 12 (json_escape): pure pass-through — recurse into the
+        // inner expression so any fetch(...) embedded in the source text
+        // is still collected.
+        Expr::JsonEscape(inner) => collect_fetch_names(inner, out),
     }
 }
 
@@ -449,6 +457,8 @@ fn collect_fetch_names_with_dups(expr: &Expr, out: &mut Vec<String>) {
                 collect_fetch_names_with_dups(e, out);
             }
         }
+        // Phase 12 (json_escape): pure pass-through.
+        Expr::JsonEscape(inner) => collect_fetch_names_with_dups(inner, out),
     }
 }
 
@@ -840,8 +850,22 @@ fn log_content_type(
             }
             Ok(Type::Text)
         }
+        // Phase 12 (json_escape): allowed inside a log content as long as
+        // the inner expression is itself allowed by this grammar AND
+        // produces text. The transform's output is text by construction.
+        Expr::JsonEscape(inner) => {
+            let inner_ty = log_content_type(inner, req_concept, resp_concept)
+                .map_err(|m| format!("json_escape arg: {}", m))?;
+            match inner_ty {
+                Type::Text => Ok(Type::Text),
+                other => Err(format!(
+                    "json_escape arg has type '{}'; json_escape only accepts text",
+                    type_display(&other),
+                )),
+            }
+        }
         other => Err(format!(
-            "expression `{}` is not allowed in a log content; allowed: text/number literals, `req.field`, `resp.field`, `concat(...)`",
+            "expression `{}` is not allowed in a log content; allowed: text/number literals, `req.field`, `resp.field`, `concat(...)`, `json_escape(...)`",
             describe_expr_kind(other)
         )),
     }
@@ -871,6 +895,7 @@ fn describe_expr_kind(e: &Expr) -> &'static str {
         Expr::Concat(_) => "concat",
         Expr::Read(_) => "read",
         Expr::Fetch(_, _) => "fetch",
+        Expr::JsonEscape(_) => "json_escape",
     }
 }
 
@@ -1166,6 +1191,22 @@ fn check_expr_against(
                 });
             }
         }
+        // Phase 12 (json_escape): json_escape produces text and requires
+        // its inner expression to produce text. Mirrors the Fetch arm's
+        // shape — recurse on the inner with expected=Text, then surface
+        // an outer-context error when the surrounding type isn't text.
+        (Expr::JsonEscape(inner), Type::Text) => {
+            check_expr_against(inner, &Type::Text, rule, all_rules, input_concept, all_concepts, errors);
+        }
+        (Expr::JsonEscape(_), other) => {
+            errors.push(VerifyError {
+                context: format!("rule '{}' / logic", rule.name),
+                message: format!(
+                    "json_escape produces text but the expected type is '{}'",
+                    type_display(other),
+                ),
+            });
+        }
         (Expr::MatchResult(_target, _, ok_body, _, err_body), _) => {
             // Both arms must produce `expected`. The target should be a Result —
             // checking that requires inferring through lambda bindings, which
@@ -1353,6 +1394,10 @@ fn infer_expr_type(
         // inference as read(<resource>). Existence of the connection and
         // type-check of the request bytes are handled separately.
         Expr::Fetch(_, _) => Some(Type::Text),
+        // Phase 12 (json_escape): json_escape(<text>) returns text. The
+        // inner expression's text-ness is enforced by check_expr_against;
+        // here we only need the outer type for inference.
+        Expr::JsonEscape(_) => Some(Type::Text),
         // Map/Filter/Fold/Ok/Err/MatchResult: deferred until lambda binding
         // tracking lands. Returning None means we do not check; we also do not
         // falsely accept.
@@ -1641,6 +1686,13 @@ fn collect_expr_facts(
             reads.insert(vec![name.clone()]);
             collect_expr_facts(req, reads, calls);
         }
+        // Phase 12 (json_escape): pure pass-through. The transform is
+        // computed in-process from the inner expression's bytes — no
+        // syscalls, no fresh reads. The inner expression's facts ARE the
+        // facts.
+        Expr::JsonEscape(inner) => {
+            collect_expr_facts(inner, reads, calls);
+        }
     }
 }
 
@@ -1828,6 +1880,10 @@ fn count_operations(expr: &Expr) -> usize {
         // socket+connect+write+read syscall sequence is opaque to the
         // proof system) plus the cost of evaluating the request bytes.
         Expr::Fetch(_, req) => 1 + count_operations(req),
+        // Phase 12 (json_escape): one op for the transform itself plus
+        // the cost of evaluating the inner expression. Same shape as
+        // Ok/Err's pass-through accounting.
+        Expr::JsonEscape(inner) => 1 + count_operations(inner),
     }
 }
 

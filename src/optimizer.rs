@@ -57,6 +57,8 @@ fn count_nodes(expr: &Expr) -> usize {
         // Phase 11 slice 1: a Fetch carries the connection name plus a
         // request bytes Expr — count this node + recurse.
         Expr::Fetch(_, req) => 1 + count_nodes(req),
+        // Phase 12 (json_escape): one node + recurse on the inner.
+        Expr::JsonEscape(inner) => 1 + count_nodes(inner),
     }
 }
 
@@ -343,6 +345,10 @@ fn substitute_ident(expr: &Expr, name: &str, replacement: &Expr) -> Expr {
             n.clone(),
             Box::new(substitute_ident(req, name, replacement)),
         ),
+        // Phase 12 (json_escape): substitute through the inner expression.
+        Expr::JsonEscape(inner) => Expr::JsonEscape(
+            Box::new(substitute_ident(inner, name, replacement)),
+        ),
     }
 }
 
@@ -525,7 +531,50 @@ pub fn optimize_expr(
             name.clone(),
             Box::new(optimize_expr(req, input_name, field_ranges)),
         ),
+        // Phase 12 (json_escape): if the inner is a text literal, fold
+        // the escape at compile time — emits no runtime loop, the
+        // resulting Text literal flows through the existing concat
+        // machinery exactly like a hand-written escaped string.
+        // Otherwise, recurse and keep the JsonEscape wrapper for the
+        // backend to lower at runtime.
+        Expr::JsonEscape(inner) => {
+            let inner = optimize_expr(inner, input_name, field_ranges);
+            if let Expr::Text(s) = &inner {
+                return Expr::Text(escape_json_string(s));
+            }
+            Expr::JsonEscape(Box::new(inner))
+        }
     }
+}
+
+/// Phase 12 (json_escape) compile-time escape. Mirrors the runtime
+/// transform exactly so a literal-folded result is bit-for-bit identical
+/// to what the runtime loop would emit.
+///
+/// Five JSON-significant bytes are escaped:
+///   `"` (0x22) → `\"` (0x5C 0x22)
+///   `\` (0x5C) → `\\` (0x5C 0x5C)
+///   `\n` (0x0A) → `\n` literal (0x5C 0x6E)
+///   `\r` (0x0D) → `\r` literal (0x5C 0x72)
+///   `\t` (0x09) → `\t` literal (0x5C 0x74)
+///
+/// Other bytes (including `\b`, `\f`, control chars below 0x20) pass
+/// through unchanged in this slice — `\u00XX` lands in a follow-up if a
+/// real use case appears.
+pub fn escape_json_string(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        match b {
+            0x22 => { out.push('\\'); out.push('"'); }
+            0x5C => { out.push('\\'); out.push('\\'); }
+            0x0A => { out.push('\\'); out.push('n'); }
+            0x0D => { out.push('\\'); out.push('r'); }
+            0x09 => { out.push('\\'); out.push('t'); }
+            other => out.push(other as char),
+        }
+    }
+    out
 }
 
 /// Try to statically determine a boolean expression's result.

@@ -487,6 +487,36 @@ fn eval_expr(
         // Phase 11 slice 1: real fetch happens in native; interpreter
         // returns empty placeholder for now (same shape as Read).
         Expr::Fetch(_, _) => Ok(Value::Text("".into())),
+        // Phase 12 (json_escape): pure transform — evaluate inner, then
+        // escape the 5 JSON-significant bytes. Mirrors optimizer's
+        // escape_json_string so the interpreter and the literal-folder
+        // agree byte-for-byte.
+        Expr::JsonEscape(inner) => {
+            let v = eval_expr(inner, env, all_rules)?;
+            match v {
+                Value::Text(s) => {
+                    let bytes = s.as_bytes();
+                    let mut out = String::with_capacity(bytes.len() * 2);
+                    for &b in bytes {
+                        match b {
+                            0x22 => { out.push('\\'); out.push('"'); }
+                            0x5C => { out.push('\\'); out.push('\\'); }
+                            0x0A => { out.push('\\'); out.push('n'); }
+                            0x0D => { out.push('\\'); out.push('r'); }
+                            0x09 => { out.push('\\'); out.push('t'); }
+                            other => out.push(other as char),
+                        }
+                    }
+                    Ok(Value::Text(out))
+                }
+                other => Err(RuntimeError {
+                    message: format!(
+                        "json_escape requires a text value, got {}",
+                        other
+                    ),
+                }),
+            }
+        }
     }
 }
 

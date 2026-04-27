@@ -1,20 +1,19 @@
 @verbose 0.1.0
 
--- Phase 7 + Phase 8 combined showcase: HTTP service whose audit log is
--- in JSONL (one JSON object per line), the format typically consumed by
--- SIEM pipelines (Splunk, Elastic, Loki) and Article 12 audit processors.
+-- Phase 7 + Phase 8 + Phase 12 combined showcase: HTTP service whose audit
+-- log is in JSONL (one JSON object per line), the format typically consumed
+-- by SIEM pipelines (Splunk, Elastic, Loki) and Article 12 audit processors.
 --
 -- Pattern this unlocks in practice: the docs/ai-act-usage.md wrapper
 -- (audit-log.sh in bash) used to be required for JSONL output. With
 -- slice 8a the binary itself writes JSONL lines per request, reducing
 -- the trusted chain by one layer.
 --
--- Known limitation (to be lifted by a later slice): the log content
--- uses concat to assemble the JSON, which does NOT escape special
--- characters in request fields. A path containing an unencoded double
--- quote would produce broken JSON. Real production use would need a
--- json_escape primitive — slice 8f or wherever we introduce structured
--- text helpers.
+-- Phase 12 (json_escape) closes the structured-text gap: user-controlled
+-- request fields (req.method, req.path) are wrapped in `json_escape(...)`
+-- before they enter the JSON line. A path containing `"` or `\` no longer
+-- breaks the line. Five characters are escaped per JSON spec: `"`, `\`,
+-- `\n`, `\r`, `\t`.
 
 
 rule ok_handler
@@ -50,4 +49,4 @@ service access_logged_service
   handler: ok_handler
 
   log:
-    append_file "/tmp/verbose_access.jsonl" concat("{\"method\":\"", req.method, "\",\"path\":\"", req.path, "\"}\n")
+    append_file "/tmp/verbose_access.jsonl" concat("{\"method\":\"", json_escape(req.method), "\",\"path\":\"", json_escape(req.path), "\"}\n")

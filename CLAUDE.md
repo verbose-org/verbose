@@ -327,7 +327,7 @@ printf "3 auth\n1 web\n" | /tmp/alert                                           
 cargo run -- examples/invoices.verbose --wasm /tmp/rule.wasm --run important_invoice # WASM
 cargo run -- examples/invoices.verbose --benchmark --run important_invoice          # compare all backends
 cargo run -- --demo-http /tmp/server                                                 # HTTP server — tier-3 emitter probe, NOT in .verbose (see docs/known-gaps.md)
-cargo test                                                                          # 220 tests
+cargo test                                                                          # 223 tests
 make demo                                                                           # full demo
 ```
 

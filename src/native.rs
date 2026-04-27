@@ -464,6 +464,12 @@ fn let_rhs_is_text(
             .map(|r| matches!(r.output_ty, Type::Text))
             .unwrap_or(false),
         Expr::Ident(n) => prior_text_lets.contains(n.as_str()),
+        // Phase 12 (json_escape): the transform's output type is text by
+        // construction. The classifier needs to recognize it so a
+        // `let escaped = json_escape(req.path)` lands in the Phase 2I
+        // text-let path (two slots, BoundText resolution at use sites)
+        // rather than the number-let path.
+        Expr::JsonEscape(_) => true,
         _ => false,
     }
 }
@@ -527,6 +533,8 @@ fn collect_read_names_native(expr: &Expr, out: &mut Vec<String>) {
         // request bytes Expr so any read(...) inside the request body is
         // captured.
         Expr::Fetch(_, req) => collect_read_names_native(req, out),
+        // Phase 12 (json_escape): pure pass-through.
+        Expr::JsonEscape(inner) => collect_read_names_native(inner, out),
     }
 }
 
@@ -598,6 +606,8 @@ fn collect_fetch_names_native(expr: &Expr, out: &mut Vec<String>) {
                 collect_fetch_names_native(e, out);
             }
         }
+        // Phase 12 (json_escape): pure pass-through.
+        Expr::JsonEscape(inner) => collect_fetch_names_native(inner, out),
     }
 }
 
@@ -854,6 +864,8 @@ fn emit_connection_fetch_sequence(
             }
             Expr::Record(_, fs) => fs.iter().find_map(|(_, e)| first_fetch_for(e, name)),
             Expr::Fetch(_, req) => first_fetch_for(req, name),
+            // Phase 12 (json_escape): pass-through.
+            Expr::JsonEscape(inner) => first_fetch_for(inner, name),
         }
     }
     let request_expr: &Expr = {
@@ -1511,6 +1523,14 @@ enum ConcatArgKind {
     /// The slot_idx is decoupled from the arg position so non-Call args
     /// don't consume slots.
     CallText,
+    /// Phase 12 (json_escape): wrapper around an inner text-producing expr
+    /// that triggers the per-byte JSON-escape transform during the fill
+    /// pass. Sizing uses 2× the worst-case inner length. The inner shapes
+    /// supported in native today are Text input fields and BoundText
+    /// identifiers (resource Read, connection Fetch response, text let,
+    /// match-result err_var). Literal Text inners are folded out by the
+    /// optimizer before native sees them.
+    JsonEscapedText,
 }
 
 /// Mapping `identifier → (ptr_slot, len_slot)` for text-typed values bound
@@ -1548,6 +1568,21 @@ fn classify_concat_arg(
             Some(ConcatArgKind::BoundText)
         }
         Expr::Call(_, _) => Some(ConcatArgKind::CallText),
+        // Phase 12 (json_escape): the inner must classify as a text-producing
+        // kind. Native today supports Text-typed input fields and BoundText
+        // identifiers as inners; Number / CallText / nested JsonEscape stay
+        // as None so the dispatcher returns a clear "not supported" error
+        // (callers can either restructure their code or fall back to
+        // interpreter for those shapes).
+        Expr::JsonEscape(inner) => {
+            let inner_kind = classify_concat_arg(inner, concept, input_name, text_bindings)?;
+            match inner_kind {
+                ConcatArgKind::Text | ConcatArgKind::BoundText => {
+                    Some(ConcatArgKind::JsonEscapedText)
+                }
+                _ => None,
+            }
+        }
         Expr::Field(base, field_name) => {
             if matches!(base.as_ref(), Expr::Ident(n) if n == input_name) {
                 let f = concept.fields.iter().find(|f| &f.name == field_name)?;
@@ -1795,6 +1830,35 @@ fn emit_concat_to_buffer_impl(
                 call_slot_idx.push(n_calls);
                 n_calls += 1;
             }
+            ConcatArgKind::JsonEscapedText => {
+                // Phase 12 (json_escape): worst-case is 2× the inner length
+                // (every byte escapes to two). If the inner is a Field with a
+                // declared `[..N]` bound, we can size statically as `2*N`. If
+                // the inner is a BoundText (let / read / fetch / err_var) or
+                // an unbounded Field, the size is runtime-dynamic — sized in
+                // the dynamic path below by reading the inner's length and
+                // doubling it.
+                let inner = match arg { Expr::JsonEscape(i) => i.as_ref(), _ => unreachable!() };
+                let inner_static_max: Option<i32> = match inner {
+                    Expr::Field(base, field_name)
+                        if matches!(base.as_ref(), Expr::Ident(n) if n == input_name) =>
+                    {
+                        concept
+                            .fields
+                            .iter()
+                            .find(|f| &f.name == field_name)
+                            .and_then(|f| f.range)
+                            .map(|(_, max)| max as i32)
+                    }
+                    _ => None,
+                };
+                if let Some(max_len) = inner_static_max {
+                    static_total += 2 * max_len;
+                } else {
+                    has_dynamic = true;
+                }
+                call_slot_idx.push(-1);
+            }
         }
     }
     if static_total == 0 && !has_dynamic {
@@ -1915,6 +1979,72 @@ fn emit_concat_to_buffer_impl(
                 } else {
                     code.extend_from_slice(&[0x49, 0x03, 0x83]);
                     code.extend_from_slice(&disp.to_le_bytes());
+                }
+            }
+            ConcatArgKind::JsonEscapedText => {
+                // Phase 12 (json_escape) runtime sizing: only reached when
+                // the inner does NOT have a [..N] bound (otherwise the
+                // static_total path absorbed it). Compute 2 × inner_length
+                // into rcx, then add to rax.
+                let inner = match arg { Expr::JsonEscape(i) => i.as_ref(), _ => unreachable!() };
+                match inner {
+                    Expr::Field(_, field_name) => {
+                        // Same shape as the Text-field branch above: load
+                        // the field pointer, strlen → rdx, then we can
+                        // double + add. push/pop rax to preserve the
+                        // running size accumulator across emit_strlen
+                        // (which clobbers rax/rcx/rdx/rsi/rdi).
+                        let offset = *offsets.get(field_name.as_str()).ok_or_else(|| NativeError {
+                            message: format!(
+                                "json_escape inner field '{}' has no rbp slot",
+                                field_name
+                            ),
+                        })?;
+                        code.push(0x50); // push rax
+                        // mov rsi, [rbp + offset]
+                        if offset >= -128 {
+                            code.extend_from_slice(&[0x48, 0x8B, 0x75]);
+                            code.push(offset as u8);
+                        } else {
+                            code.extend_from_slice(&[0x48, 0x8B, 0xB5]);
+                            code.extend_from_slice(&offset.to_le_bytes());
+                        }
+                        emit_strlen(code); // rdx = length
+                        code.push(0x59); // pop rcx (running size into rcx)
+                        // shl rdx, 1  — double the inner length
+                        code.extend_from_slice(&[0x48, 0xD1, 0xE2]);
+                        // add rcx, rdx
+                        code.extend_from_slice(&[0x48, 0x01, 0xD1]);
+                        // mov rax, rcx
+                        code.extend_from_slice(&[0x48, 0x89, 0xC8]);
+                    }
+                    Expr::Ident(name) | Expr::Read(name) | Expr::Fetch(name, _) => {
+                        // BoundText: length is already in [rbp+len_slot].
+                        // Load it into rcx, double via shl, add to rax.
+                        let (_, len_slot) = *text_bindings
+                            .get(name.as_str())
+                            .expect("json_escape inner classified as BoundText");
+                        // mov rcx, [rbp + len_slot]
+                        if len_slot >= -128 {
+                            code.extend_from_slice(&[0x48, 0x8B, 0x4D]);
+                            code.push(len_slot as u8);
+                        } else {
+                            code.extend_from_slice(&[0x48, 0x8B, 0x8D]);
+                            code.extend_from_slice(&len_slot.to_le_bytes());
+                        }
+                        // shl rcx, 1
+                        code.extend_from_slice(&[0x48, 0xD1, 0xE1]);
+                        // add rax, rcx
+                        code.extend_from_slice(&[0x48, 0x01, 0xC8]);
+                    }
+                    other => {
+                        return Err(NativeError {
+                            message: format!(
+                                "json_escape inner shape not supported in native: {:?}",
+                                other
+                            ),
+                        });
+                    }
                 }
             }
             _ => {}
@@ -2293,6 +2423,16 @@ fn emit_concat_fill(
                 code.extend_from_slice(&[0xF3, 0xA4]);
                 code.extend_from_slice(&[0x48, 0x89, 0xFB]);
             }
+            ConcatArgKind::JsonEscapedText => {
+                // Phase 12 (json_escape) fill: load (rsi=src_ptr, rcx=src_len)
+                // for the inner expression, then run the per-byte transform
+                // loop that copies bytes verbatim except for the 5
+                // JSON-significant ones, which expand to two-byte escape
+                // sequences.
+                let inner = match arg { Expr::JsonEscape(i) => i.as_ref(), _ => unreachable!() };
+                emit_json_escape_load_src(code, inner, input_name, offsets, text_bindings)?;
+                emit_json_escape_fill_loop(code);
+            }
         }
         // If the arg is a Text FIELD (not a literal), emit strlen + rep movsb
         // at runtime. The field's value is a pointer stored at `offsets[field]`.
@@ -2326,6 +2466,230 @@ fn emit_concat_fill(
     }
 
     Ok(())
+}
+
+/// Phase 12 (json_escape): load (rsi = src_ptr, rcx = src_len) for the
+/// json_escape inner expression. Inner shapes supported in native today:
+///   - Text-typed input field: `mov rsi, [rbp+offset]; emit_strlen → rdx; mov rcx, rdx`
+///   - BoundText (Ident / Read / Fetch resolving via `text_bindings`):
+///     `mov rsi, [rbp+ptr_slot]; mov rcx, [rbp+len_slot]`
+///
+/// Anything else returns an error so the caller surfaces a clear "not
+/// supported" message — Concat / Call inners are deferred to a follow-up
+/// slice (each adds a different scratch-buffer ordering concern).
+fn emit_json_escape_load_src(
+    code: &mut Vec<u8>,
+    inner: &Expr,
+    input_name: &str,
+    offsets: &HashMap<&str, i32>,
+    text_bindings: &TextBindings<'_>,
+) -> Result<(), NativeError> {
+    match inner {
+        Expr::Field(base, field_name)
+            if matches!(base.as_ref(), Expr::Ident(n) if n == input_name) =>
+        {
+            let offset = *offsets.get(field_name.as_str()).ok_or_else(|| NativeError {
+                message: format!(
+                    "json_escape inner field '{}' has no rbp slot",
+                    field_name
+                ),
+            })?;
+            // mov rsi, [rbp + offset]
+            if offset >= -128 {
+                code.extend_from_slice(&[0x48, 0x8B, 0x75]);
+                code.push(offset as u8);
+            } else {
+                code.extend_from_slice(&[0x48, 0x8B, 0xB5]);
+                code.extend_from_slice(&offset.to_le_bytes());
+            }
+            // emit_strlen leaves rdx = length, rsi unchanged.
+            emit_strlen(code);
+            // mov rcx, rdx
+            code.extend_from_slice(&[0x48, 0x89, 0xD1]);
+            Ok(())
+        }
+        Expr::Ident(name) | Expr::Read(name) | Expr::Fetch(name, _)
+            if text_bindings.contains_key(name.as_str()) =>
+        {
+            let (ptr_slot, len_slot) = text_bindings[name.as_str()];
+            // mov rsi, [rbp + ptr_slot]
+            if ptr_slot >= -128 {
+                code.extend_from_slice(&[0x48, 0x8B, 0x75]);
+                code.push(ptr_slot as u8);
+            } else {
+                code.extend_from_slice(&[0x48, 0x8B, 0xB5]);
+                code.extend_from_slice(&ptr_slot.to_le_bytes());
+            }
+            // mov rcx, [rbp + len_slot]
+            if len_slot >= -128 {
+                code.extend_from_slice(&[0x48, 0x8B, 0x4D]);
+                code.push(len_slot as u8);
+            } else {
+                code.extend_from_slice(&[0x48, 0x8B, 0x8D]);
+                code.extend_from_slice(&len_slot.to_le_bytes());
+            }
+            Ok(())
+        }
+        other => Err(NativeError {
+            message: format!(
+                "json_escape inner shape not supported in native: {:?}",
+                other
+            ),
+        }),
+    }
+}
+
+/// Phase 12 (json_escape): emit the per-byte JSON-escape transform loop.
+/// Preconditions: rsi = source pointer, rcx = source length, rbx = write
+/// pointer into the reserved buffer.
+/// Postcondition: rbx advanced by `inner_length + 1` per escaped byte
+/// (each escape writes 2 bytes instead of 1). rsi/rcx clobbered.
+///
+/// Five bytes are escaped: `"` (0x22), `\` (0x5C), `\n` (0x0A), `\r`
+/// (0x0D), `\t` (0x09). Other bytes pass through unchanged. The loop
+/// uses byte-level x86 (mov al, [rsi]; cmp al, imm8; mov word [rbx],
+/// imm16) so each iteration is small enough that the back-edge fits in
+/// rel8.
+///
+/// Layout (instruction sizes shown):
+///   loop_top:
+///     test rcx, rcx      (3)
+///     jz loop_end        (2, rel8 forward)
+///     mov al, [rsi]      (2)
+///     cmp al, 0x22       (2)
+///     je esc_quote       (2, rel8 forward)
+///     cmp al, 0x5C       (2)
+///     je esc_back        (2)
+///     cmp al, 0x0A       (2)
+///     je esc_lf          (2)
+///     cmp al, 0x0D       (2)
+///     je esc_cr          (2)
+///     cmp al, 0x09       (2)
+///     je esc_tab         (2)
+///     mov [rbx], al      (2)
+///     inc rbx            (3, REX.W + FF /0)
+///     jmp advance        (2, rel8 forward)
+///   esc_quote:
+///     mov word [rbx], 0x225C   (5: 66 C7 03 5C 22)
+///     add rbx, 2               (4: 48 83 C3 02)
+///     jmp advance              (2)
+///   esc_back: ... (12 bytes total)
+///   esc_lf:   ... (12 bytes total)
+///   esc_cr:   ... (12 bytes total)
+///   esc_tab:  ... (10 bytes — falls through to advance, no jmp)
+///   advance:
+///     inc rsi            (3)
+///     dec rcx            (3)
+///     jmp loop_top       (2, rel8 backward)
+///   loop_end:
+///
+/// Total: ~95 bytes. All forward jumps are short (< 80 bytes); the back
+/// edge (advance → loop_top) is also short.
+fn emit_json_escape_fill_loop(code: &mut Vec<u8>) {
+    // loop_top:
+    let loop_top = code.len();
+    // test rcx, rcx
+    code.extend_from_slice(&[0x48, 0x85, 0xC9]);
+    // jz loop_end (rel8) — patch later
+    code.push(0x74);
+    let loop_end_patch = code.len();
+    code.push(0x00);
+    // mov al, [rsi]
+    code.extend_from_slice(&[0x8A, 0x06]);
+
+    // For each escape sequence we need a forward jump from the cmp+je to
+    // the corresponding handler block. We emit cmp+je with a placeholder
+    // and remember the patch position; once the handler block is laid
+    // down we patch the rel8.
+    // (cmp_imm, esc_word): the imm8 to compare al against, and the
+    // little-endian 16-bit value to store at [rbx] for the escape.
+    let esc_specs: [(u8, u16); 5] = [
+        (0x22, 0x225C), // "  → \"
+        (0x5C, 0x5C5C), // \  → \\
+        (0x0A, 0x6E5C), // LF → \n (literal)
+        (0x0D, 0x725C), // CR → \r
+        (0x09, 0x745C), // TAB → \t
+    ];
+
+    let mut esc_jump_patches: Vec<usize> = Vec::with_capacity(5);
+    for (cmp_imm, _) in &esc_specs {
+        // cmp al, imm8  (3C imm8)
+        code.push(0x3C);
+        code.push(*cmp_imm);
+        // je rel8 (74 disp)
+        code.push(0x74);
+        esc_jump_patches.push(code.len());
+        code.push(0x00);
+    }
+
+    // Plain byte path: mov [rbx], al ; inc rbx ; jmp advance
+    // mov [rbx], al  (88 03)
+    code.extend_from_slice(&[0x88, 0x03]);
+    // inc rbx  (REX.W + FF C3)
+    code.extend_from_slice(&[0x48, 0xFF, 0xC3]);
+    // jmp advance (rel8) — patch later
+    code.push(0xEB);
+    let plain_to_advance_patch = code.len();
+    code.push(0x00);
+
+    // Escape handler blocks: each is mov word [rbx], esc16 ; add rbx, 2 ;
+    // (jmp advance | fall through). All but the last jump to advance;
+    // the last falls through.
+    let mut esc_to_advance_patches: Vec<usize> = Vec::with_capacity(esc_specs.len() - 1);
+    for (i, (_, esc_word)) in esc_specs.iter().enumerate() {
+        // Patch the je from the cmp dispatch to here.
+        let block_start = code.len();
+        let dist = (block_start as i32) - (esc_jump_patches[i] as i32 + 1);
+        if !(-128..=127).contains(&dist) {
+            // Should never happen given total block size; defensive panic
+            // would corrupt the binary, so bail with a cleaner message via
+            // a deliberately oversize sequence is not an option — we only
+            // assert in the debug build for the tightness of this layout.
+            debug_assert!(false, "json_escape fill: cmp→escape jump out of rel8 range");
+        }
+        code[esc_jump_patches[i]] = dist as u8;
+
+        // mov word [rbx], esc16  — encoded as 66 C7 03 imm16
+        code.extend_from_slice(&[0x66, 0xC7, 0x03]);
+        code.extend_from_slice(&esc_word.to_le_bytes());
+        // add rbx, 2  (48 83 C3 02)
+        code.extend_from_slice(&[0x48, 0x83, 0xC3, 0x02]);
+
+        // The last block falls through into advance; the others jmp.
+        if i < esc_specs.len() - 1 {
+            code.push(0xEB);
+            esc_to_advance_patches.push(code.len());
+            code.push(0x00);
+        }
+    }
+
+    // advance:
+    let advance_pos = code.len();
+    // Patch all jmp→advance sites (plain path + intermediate escape blocks)
+    for patch in std::iter::once(plain_to_advance_patch).chain(esc_to_advance_patches.into_iter()) {
+        let dist = (advance_pos as i32) - (patch as i32 + 1);
+        debug_assert!((-128..=127).contains(&dist), "json_escape fill: jmp→advance out of rel8 range");
+        code[patch] = dist as u8;
+    }
+    // inc rsi  (48 FF C6)
+    code.extend_from_slice(&[0x48, 0xFF, 0xC6]);
+    // dec rcx  (48 FF C9)
+    code.extend_from_slice(&[0x48, 0xFF, 0xC9]);
+    // jmp loop_top  (rel8 backward — EB disp8)
+    code.push(0xEB);
+    let after_back_jmp = code.len() + 1;
+    let back_dist = (loop_top as i32) - (after_back_jmp as i32);
+    debug_assert!(
+        (-128..=127).contains(&back_dist),
+        "json_escape fill: back jump out of rel8 range; loop body grew too large"
+    );
+    code.push(back_dist as u8);
+
+    // loop_end:
+    let loop_end_pos = code.len();
+    let end_dist = (loop_end_pos as i32) - (loop_end_patch as i32 + 1);
+    debug_assert!((-128..=127).contains(&end_dist), "json_escape fill: jz→loop_end out of rel8 range");
+    code[loop_end_patch] = end_dist as u8;
 }
 
 /// Empty text-bindings map for call sites that don't need text binding.
@@ -4869,6 +5233,15 @@ fn emit_text_fold_program(
             ConcatArgKind::BoundText | ConcatArgKind::CallText => {
                 unreachable!("BoundText/CallText rejected above")
             }
+            ConcatArgKind::JsonEscapedText => {
+                // Phase 12: json_escape inside a top-level fold body would
+                // need its own per-element scratch handling (sized at 2×
+                // the inner length, possibly per-iteration). Out of scope
+                // for slice 5b; reject with a clear message.
+                return Err(NativeError {
+                    message: "Phase 5b: fold body cannot use json_escape (per-element scratch sizing not yet implemented)".into(),
+                });
+            }
         }
     }
 
@@ -5572,6 +5945,11 @@ fn max_stack_depth(expr: &Expr) -> usize {
         // expression is evaluated above loop_top once per rule invocation,
         // so its eval-stack depth doesn't accumulate at the call site.
         Expr::Fetch(_, _) => 0,
+        // Phase 12 (json_escape): the inner expression's depth dominates;
+        // the transform itself uses fixed registers (rsi/rcx) and the
+        // existing concat write pointer (rbx), no additional eval-stack
+        // pushes beyond what the inner already needs.
+        Expr::JsonEscape(inner) => max_stack_depth(inner),
     }
 }
 
@@ -6054,6 +6432,11 @@ fn emit_eval_expr(
         // here is a defensive catch.
         Expr::Fetch(_, _) => Err(NativeError {
             message: "Expr::Fetch in number context — fetch() returns text, use it in a text-typed position".into(),
+        }),
+        // Phase 12 (json_escape): json_escape returns text, not a number.
+        // Defensive catch — the verifier rejects this at compile time.
+        Expr::JsonEscape(_) => Err(NativeError {
+            message: "Expr::JsonEscape in number context — json_escape() returns text, use it in a text-typed position".into(),
         }),
     }
 }
@@ -7737,6 +8120,7 @@ fn expr_kind(e: &Expr) -> &'static str {
         Expr::Concat(_) => "Concat",
         Expr::Read(_) => "Read",
         Expr::Fetch(_, _) => "Fetch",
+        Expr::JsonEscape(_) => "JsonEscape",
     }
 }
 
@@ -12251,5 +12635,234 @@ service gateway
         );
 
         let _ = std::fs::remove_file(&out);
+    }
+
+    /// Phase 12 (json_escape) compile-time fold: when the inner is a text
+    /// literal, the optimizer must replace `Expr::JsonEscape(Text(s))`
+    /// with `Expr::Text(<escaped s>)` BEFORE native sees the AST. This
+    /// keeps the runtime free of a transform loop in the trivial case
+    /// and proves the optimizer-side escape function matches the spec.
+    #[test]
+    fn phase12_json_escape_literal_folds_at_compile_time() {
+        use crate::ast::{BinOp, Expr};
+        let src = r#"@verbose 0.1.0
+
+concept Tick
+  @intention: "trivial input"
+  @source: invoices.intent:1
+  fields:
+    n : number
+
+rule esc_literal
+  @intention: "escape a literal at compile time"
+  @source: invoices.intent:1
+  input:
+    t : Tick
+  output:
+    out : text
+  logic:
+    out = json_escape("a\"b\\c")
+  proofs:
+    purity:
+      reads: []
+      calls: []
+    termination:
+      bound: 2
+"#;
+        let tokens = crate::lexer::Lexer::new(src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens)
+            .parse_program()
+            .expect("parse");
+        let (optimized, _stats) = crate::optimizer::optimize_program(&program);
+
+        let rule = optimized
+            .items
+            .iter()
+            .find_map(|i| match i {
+                crate::ast::Item::Rule(r) if r.name == "esc_literal" => Some(r),
+                _ => None,
+            })
+            .expect("rule esc_literal present");
+        // The optimizer should have replaced JsonEscape(Text("a\"b\\c"))
+        // with Text("a\\\"b\\\\c") — the same bytes a hand-escaped string
+        // would carry. Suppress the warning Rust raises on the redundant
+        // BinOp use.
+        let _ = BinOp::Add;
+        match &rule.logic.value {
+            Expr::Text(s) => {
+                assert_eq!(
+                    s.as_str(),
+                    r#"a\"b\\c"#,
+                    "literal-fold did not produce expected escaped bytes: {:?}",
+                    s
+                );
+            }
+            other => panic!("expected folded Expr::Text, got {:?}", other),
+        }
+    }
+
+    /// Phase 12 (json_escape) runtime: compiling the access_log_json
+    /// service must embed the per-byte transform loop because the inner
+    /// is a runtime-known field (req.method / req.path), not a literal.
+    /// The signature byte sequence we look for is `cmp al, 0x22` (3C 22)
+    /// — the first comparison in the loop body. Its presence proves the
+    /// runtime path was emitted (the literal-fold path would not produce
+    /// this opcode pair).
+    #[test]
+    fn phase12_json_escape_runtime_emits_transform_loop_bytes() {
+        use std::fs;
+        let src = fs::read_to_string("examples/access_log_json.verbose")
+            .expect("examples/access_log_json.verbose is expected to exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let out = std::env::temp_dir().join("verbosec_test_phase12_json_escape_loop");
+        compile_service(&program, "access_logged_service", out.to_str().unwrap())
+            .expect("Http10 service with json_escape compile");
+
+        let bytes = fs::read(&out).expect("read output");
+        // 0x3C is `cmp al, imm8` and 0x22 is the immediate (the JSON
+        // double-quote we escape). The pair appears in the json_escape
+        // fill loop and nowhere else in the existing emitter.
+        let needle = [0x3C, 0x22];
+        let count = bytes
+            .windows(needle.len())
+            .filter(|w| *w == needle)
+            .count();
+        assert!(
+            count >= 2,
+            "expected at least 2 occurrences of `cmp al, 0x22` (one per json_escape call site), found {}",
+            count
+        );
+
+        let _ = fs::remove_file(out);
+    }
+
+    /// Phase 12 (json_escape) end-to-end: spawn the access_log_json
+    /// binary, send an HTTP request whose path contains a literal `"`
+    /// (URL-encoded as %22), kill the server, parse the JSONL log file
+    /// and assert each line contains the escaped quote `\"` inside the
+    /// `path` field. Without json_escape the line would carry a bare `"`
+    /// and break JSON parsing entirely.
+    #[test]
+    fn phase12_json_escape_access_log_produces_valid_jsonl() {
+        use std::fs;
+        use std::io::{Read, Write};
+        use std::net::TcpStream;
+        use std::process::{Command, Stdio};
+        use std::time::Duration;
+
+        // Use a per-test log path so concurrent test runs don't collide.
+        let log_path = std::env::temp_dir().join("verbosec_test_phase12_access.jsonl");
+        let _ = fs::remove_file(&log_path);
+
+        // Patch the example to write to our per-test log path. Re-using
+        // the example file directly would race with other tests that
+        // also touch /tmp/verbose_access.jsonl.
+        let src_template = fs::read_to_string("examples/access_log_json.verbose")
+            .expect("examples/access_log_json.verbose is expected to exist");
+        let src = src_template.replace("/tmp/verbose_access.jsonl", log_path.to_str().unwrap());
+
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens)
+            .parse_program()
+            .expect("parse");
+
+        let out = std::env::temp_dir().join("verbosec_test_phase12_access_e2e");
+        compile_service(&program, "access_logged_service", out.to_str().unwrap())
+            .expect("compile access_logged_service for e2e");
+
+        // The example's port is 18891; use a unique port to avoid
+        // collisions with other tests / dev runs.
+        // We patch the port via the source string so the test stays
+        // self-contained even if another test binds 18891.
+        let port: u16 = 18923;
+        let src = src.replace("port        : 18891", &format!("port        : {}", port));
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens)
+            .parse_program()
+            .expect("parse");
+        compile_service(&program, "access_logged_service", out.to_str().unwrap())
+            .expect("recompile with custom port");
+
+        let mut child = Command::new(&out)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn access_logged_service binary");
+
+        // Wait for listen() with a short retry loop.
+        let mut probed = false;
+        for _ in 0..50 {
+            if let Ok(s) = TcpStream::connect_timeout(
+                &format!("127.0.0.1:{}", port).parse().unwrap(),
+                Duration::from_millis(100),
+            ) {
+                drop(s);
+                probed = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        let runtime_result: Result<(), String> = (|| {
+            if !probed {
+                return Err("server never accepted TCP connections".into());
+            }
+            // Send a request whose path contains a literal `"` byte —
+            // the very character JSON requires us to escape. Per RFC
+            // 7230 the path can technically be any visible ASCII; the
+            // HTTP/1.0 parser in the binary takes whatever is between
+            // the method and the next space, so we can include a raw
+            // `"` here.
+            let mut s = TcpStream::connect_timeout(
+                &format!("127.0.0.1:{}", port).parse().unwrap(),
+                Duration::from_secs(2),
+            )
+            .map_err(|e| format!("connect: {}", e))?;
+            s.set_read_timeout(Some(Duration::from_secs(3))).ok();
+            // Path: /quoted"path  — the bare quote is the test point.
+            s.write_all(b"GET /quoted\"path HTTP/1.0\r\n\r\n")
+                .map_err(|e| format!("write: {}", e))?;
+            let mut buf = Vec::new();
+            s.read_to_end(&mut buf).map_err(|e| format!("read: {}", e))?;
+            Ok(())
+        })();
+
+        let _ = child.kill();
+        let _ = child.wait();
+
+        runtime_result.expect("HTTP roundtrip failed");
+
+        // Give the kernel a beat to flush the append_file write.
+        std::thread::sleep(Duration::from_millis(50));
+
+        let log_contents = fs::read_to_string(&log_path).expect("read log file");
+        assert!(
+            !log_contents.is_empty(),
+            "log file empty after the request"
+        );
+        // Each line should contain the escaped quote `\"` inside the
+        // `path` field — proving the runtime escape transform was
+        // applied to req.path before assembling the JSON line.
+        let mut saw_escape = false;
+        for line in log_contents.lines() {
+            // The path field appears as `"path":"<escaped path>"`. The
+            // un-escaped quote in our request would have produced
+            // `"path":"/quoted"path"` (broken JSON). With json_escape it
+            // becomes `"path":"/quoted\"path"`.
+            if line.contains(r#""path":"/quoted\"path""#) {
+                saw_escape = true;
+                break;
+            }
+        }
+        assert!(
+            saw_escape,
+            "log file did not contain an escaped quote in the path field; contents:\n{}",
+            log_contents
+        );
+
+        let _ = fs::remove_file(&out);
+        let _ = fs::remove_file(&log_path);
     }
 }

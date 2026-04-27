@@ -446,6 +446,17 @@ pub enum Expr {
     /// as `Read` for resources). Slice 1 is one-shot blocking: at most
     /// one fetch per connection per rule invocation.
     Fetch(String, Box<Expr>),
+    /// Phase 12 slice (json_escape): pure text-transform primitive that
+    /// escapes 5 JSON-significant bytes in its input — `"`, `\`, `\n`,
+    /// `\r`, `\t` — leaving every other byte unchanged. The result is
+    /// `text` and is a function of the input alone (no syscalls, no
+    /// state). Introduced so that JSONL log content composed via
+    /// `concat(...)` of request fields stays valid JSON when those
+    /// fields contain JSON-significant characters. Other bytes (including
+    /// `\b`, `\f`, control chars below 0x20) pass through unchanged in
+    /// this slice; `\u00XX` escaping lands in a follow-up if a real use
+    /// case appears.
+    JsonEscape(Box<Expr>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
