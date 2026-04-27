@@ -243,6 +243,8 @@ Tracking what native emits today, what it still rejects, and the design rules th
 
 *Locked designs for each phase (3, 4, 5b, 2F, 2G, 2H-b) are in [docs/native-designs.md](docs/native-designs.md). They're frozen after implementation — consult them for rationale, not for the current state.*
 
+*The full catalogue of declared external effects (append_file, read, fetch, service listen, fork, clock_gettime) — with declaration shape, required proof, syscalls emitted, error policy, memory bound, audit visibility, and allowed contexts — lives in [docs/effect-model.md](docs/effect-model.md). Read it before adding a new effect, or before judging a refusal. The "what is NOT in the model" section is part of the contract.*
+
 ### What native still rejects, and in which priority
 
 - **Result(T, E) with non-scalar T** (e.g. `Result(Record, text)`, `Result(collection, _)`) — each shape needs its own calling convention. Decide shape by shape, never fabricate a "universal Result" that carries unnecessary machinery.
