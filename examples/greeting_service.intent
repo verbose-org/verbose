@@ -1,0 +1,1 @@
+1. An HTTP service whose handler greets the requester. The greeting is built once via a `let` binding that concatenates a static prefix with the request method and path, then reused twice in the response body (once as a heading line, once as a footer signature).

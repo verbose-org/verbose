@@ -1,0 +1,57 @@
+@verbose 0.1.0
+
+-- Phase 2I-in-handlers showcase: a `let` binding inside an HTTP
+-- service handler. Today (before this slice) the verifier admits
+-- the rule but the native HTTP service emitter rejected the rule
+-- with "let bindings in the handler body are not supported until
+-- slice 3d+". The slice flips that gate AND emits a let-binding
+-- prologue between the HTTP parse and the response record so the
+-- bound name resolves through the existing BoundText path
+-- (text_bindings) used by Read / Fetch.
+--
+-- Worth noting:
+--   * `greeting` is built ONCE per request (not twice — even though
+--     the response body references it twice). Without the let, the
+--     concat would have to be repeated inline in every reference.
+--   * The bound (ptr, len) live in two dedicated rbp slots inside
+--     the handler frame; the resource/connection blocks (when
+--     present) sit BELOW these slots, so layout is collision-free.
+--   * The log scope is unchanged: log content can reference
+--     req.method / req.path / req.timestamp + resp.status / resp.body
+--     but NOT handler lets — keeping the log surface narrow and
+--     auditable in isolation from the handler logic.
+
+
+rule greet
+  @intention: "Build the greeting once via a let, then echo it twice in the response"
+  @source: greeting_service.intent:1
+
+  input:
+    req : HttpRequest
+
+  output:
+    resp : HttpResponse
+
+  logic:
+    let greeting = concat("Hello, you sent ", req.method, " ", req.path)
+    resp = HttpResponse { status: 200, body: concat(greeting, "\n---\nfooter: ", greeting, "\n") }
+
+  proofs:
+    purity:
+      reads : [req.method, req.path]
+      calls : []
+
+    termination:
+      bound : 3
+
+
+service greeter
+  @intention: "Listen on 18927 and respond with a greeting that echoes the request"
+  @source: greeting_service.intent:1
+
+  listen:
+    protocol    : http_1_0
+    port        : 18927
+    max_request : 4096
+
+  handler: greet

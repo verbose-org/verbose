@@ -8071,12 +8071,19 @@ enum Http10HandlerShape {
 /// Walk the handler's logic expression and classify it. Pure analysis — no
 /// emission, no borrow of the program. Called once per service dispatch.
 fn analyze_http10_handler_shape(handler: &Rule) -> Http10HandlerShape {
+    let shape = classify_http10_expr(&handler.logic.value, &handler.input_name);
+    // Phase 2I-in-handlers: handler `let` bindings are now supported via the
+    // dynamic emission path (let prologue runs after HTTP parse and before
+    // emit_handler_to_slots). The Constant fast path doesn't emit a let
+    // prologue, so any handler with bindings must route through Dynamic
+    // even when its response record is a literal pair — otherwise the
+    // bindings would be silently dropped.
     if !handler.logic.bindings.is_empty() {
-        return Http10HandlerShape::Unsupported(
-            "let bindings in the handler body are not supported until slice 3d+".into(),
-        );
+        if matches!(shape, Http10HandlerShape::Constant) {
+            return Http10HandlerShape::Dynamic;
+        }
     }
-    classify_http10_expr(&handler.logic.value, &handler.input_name)
+    shape
 }
 
 fn classify_http10_expr(expr: &Expr, input_name: &str) -> Http10HandlerShape {
@@ -8504,7 +8511,36 @@ fn emit_http10_dynamic_bytes(
     //   below: resource (ptr, len) pairs + buffers, growing downward
     //   below: connection (ptr, len) pairs + response buffers, growing downward
     //   bottom: HTTP read buffer (max_request bytes)
-    let frame_base_fixed: i32 = if uses_timestamp { 56 } else { 48 };
+    // Phase 2I-in-handlers: classify each handler `let` binding as text
+    // (2 slots: ptr + len, same shape as Phase 2F's err_var) or number
+    // (1 slot). Walk in source order so a later binding can refer to a
+    // prior text let — same predicate the rule path uses, applied to the
+    // synthetic HttpRequest concept the handler reads from.
+    let http_request_concept_for_lets = http_request_builtin_concept_native();
+    let mut prior_text_lets: HashSet<&str> = HashSet::new();
+    let handler_binding_is_text: Vec<bool> = handler
+        .logic
+        .bindings
+        .iter()
+        .map(|(name, expr)| {
+            let is_text = let_rhs_is_text(
+                expr,
+                &http_request_concept_for_lets,
+                None,
+                all_rules,
+                &prior_text_lets,
+            );
+            if is_text {
+                prior_text_lets.insert(name.as_str());
+            }
+            is_text
+        })
+        .collect();
+    let handler_let_slots_bytes: i32 = handler_binding_is_text
+        .iter()
+        .map(|t| if *t { 16i32 } else { 8 })
+        .sum();
+    let frame_base_fixed: i32 = (if uses_timestamp { 56 } else { 48 }) + handler_let_slots_bytes;
     let frame_base: i32 = frame_base_fixed + resource_extra_bytes + connection_extra_bytes;
     // Phase 8 slice 8d: collected `js abort_label` patch sites from
     // emit_append_file_call. Resolved after the accept loop emits the
@@ -8861,13 +8897,78 @@ fn emit_http10_dynamic_bytes(
         resource_next_slot = new_next;
     }
 
+    // ═══ HANDLER LET BINDINGS (Phase 2I-in-handlers) ══════════
+    // Evaluate the handler's `let` bindings AFTER the HTTP parse and any
+    // resource read / connection fetch have populated their slots, and
+    // BEFORE the response record evaluates. Each text let lands in two
+    // dedicated rbp slots (ptr + len) and registers in `http_text_bindings`
+    // so the body's BoundText classifier resolves `Ident(let_name)` the
+    // same way it does for `Read` / `Fetch`. Each number let lands in one
+    // slot and is added to `handler_offsets` so emit_eval_expr's Field /
+    // Ident resolution finds it.
+    //
+    // Slot layout (cursor descends from just below the fixed handler block):
+    //   first slot:   -(56 if uses_timestamp else 48) - 8
+    //   text let n:   ptr at cursor, len at cursor-8, cursor -= 16
+    //   number let n: value at cursor, cursor -= 8
+    // The slot range is reserved by `handler_let_slots_bytes` added into
+    // frame_base_fixed above, so it never collides with the resource or
+    // connection blocks below.
+    let mut handler_offsets: HashMap<&str, i32> = offsets.clone();
+    {
+        let let_block_start: i32 = -(if uses_timestamp { 56 } else { 48 });
+        let mut let_cursor: i32 = let_block_start - 8;
+        for ((name, expr), is_text) in
+            handler.logic.bindings.iter().zip(handler_binding_is_text.iter())
+        {
+            if *is_text {
+                let ptr_slot = let_cursor;
+                let len_slot = let_cursor - 8;
+                let_cursor -= 16;
+                emit_text_produce_ptrlen(
+                    &mut code,
+                    expr,
+                    &handler.input_name,
+                    &http_request_concept_for_lets,
+                    all_rules,
+                    &handler_offsets,
+                    field_ranges,
+                    &http_text_bindings,
+                )?;
+                store_rax_at_rbp(&mut code, ptr_slot);
+                // mov [rbp + len_slot], rdx
+                if len_slot >= -128 {
+                    code.extend_from_slice(&[0x48, 0x89, 0x55]);
+                    code.push(len_slot as u8);
+                } else {
+                    code.extend_from_slice(&[0x48, 0x89, 0x95]);
+                    code.extend_from_slice(&len_slot.to_le_bytes());
+                }
+                http_text_bindings.insert(name.as_str(), (ptr_slot, len_slot));
+            } else {
+                let value_slot = let_cursor;
+                let_cursor -= 8;
+                emit_eval_expr(
+                    &mut code,
+                    expr,
+                    &handler.input_name,
+                    &handler_offsets,
+                    all_rules,
+                    field_ranges,
+                )?;
+                store_rax_at_rbp(&mut code, value_slot);
+                handler_offsets.insert(name.as_str(), value_slot);
+            }
+        }
+    }
+
     // ═══ HANDLER BODY ══════════════════════════════════════════
     // Populates [rbp-24]=status, [rbp-32]=body_ptr, [rbp-40]=body_len.
     emit_handler_to_slots(
         &mut code,
         &handler.logic.value,
         &handler.input_name,
-        offsets,
+        &handler_offsets,
         all_rules,
         field_ranges,
         &http_text_bindings,
@@ -11014,6 +11115,125 @@ mod tests {
         );
 
         let _ = fs::remove_file(out);
+    }
+
+    /// Phase 2I-in-handlers: an HTTP service handler may declare
+    /// non-literal text `let` bindings whose values reference parsed
+    /// request fields (req.method, req.path), and the response record
+    /// can reuse the bound name multiple times. This test pins:
+    ///   (a) a single text let evaluated once per request flows into
+    ///       the response body via BoundText resolution
+    ///   (b) a SECOND let referencing the first resolves correctly
+    ///       (chained text bindings — later let sees earlier)
+    ///   (c) the value visible in the response is byte-identical
+    ///       across both reuses (no per-reuse re-evaluation, no
+    ///       cross-request slot pollution)
+    #[test]
+    fn phase_2i_handler_lets_resolve_in_body_and_chain() {
+        use std::io::{Read, Write};
+        use std::net::TcpStream;
+        use std::process::{Command, Stdio};
+        use std::time::Duration;
+
+        let svc_port: u16 = 18928;
+
+        let src = format!(
+            r#"@verbose 0.1.0
+
+rule greet
+  @intention: "let chain"
+  @source: invoices.intent:1
+  input:
+    req : HttpRequest
+  output:
+    resp : HttpResponse
+  logic:
+    let head = concat("M=", req.method, " P=", req.path)
+    let line = concat(head, " :: tagged")
+    resp = HttpResponse {{ status: 200, body: concat(line, "\n", line, "\n") }}
+  proofs:
+    purity:
+      reads : [req.method, req.path]
+      calls : []
+    termination:
+      bound : 4
+
+service chained
+  @intention: "x"
+  @source: invoices.intent:1
+  listen:
+    protocol    : http_1_0
+    port        : {svc_port}
+    max_request : 4096
+  handler: greet
+"#
+        );
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+
+        let out = std::env::temp_dir().join("verbosec_test_phase2i_handler_lets");
+        compile_service(&program, "chained", out.to_str().unwrap())
+            .expect("Phase 2I handler-lets service should compile");
+
+        let mut child = Command::new(&out)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn chained service");
+
+        let mut connected = false;
+        for _ in 0..50 {
+            if TcpStream::connect_timeout(
+                &format!("127.0.0.1:{}", svc_port).parse().unwrap(),
+                Duration::from_millis(100),
+            )
+            .is_ok()
+            {
+                connected = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(connected, "chained service never bound");
+
+        let send = |method: &str, path: &str| -> String {
+            let mut s = TcpStream::connect_timeout(
+                &format!("127.0.0.1:{}", svc_port).parse().unwrap(),
+                Duration::from_secs(2),
+            )
+            .expect("connect");
+            s.set_read_timeout(Some(Duration::from_secs(2))).ok();
+            let req = format!("{} {} HTTP/1.0\r\n\r\n", method, path);
+            s.write_all(req.as_bytes()).expect("write");
+            let mut buf = Vec::new();
+            s.read_to_end(&mut buf).expect("read");
+            String::from_utf8_lossy(&buf).to_string()
+        };
+
+        let r1 = send("GET", "/alpha");
+        let r2 = send("POST", "/beta/two");
+
+        let _ = child.kill();
+        let _ = child.wait();
+
+        // Body of r1 must contain the chained let twice, byte-identically.
+        let expected_line_1 = "M=GET P=/alpha :: tagged";
+        assert!(
+            r1.contains(&format!("{}\n{}\n", expected_line_1, expected_line_1)),
+            "r1 body should contain chained let twice; got: {:?}", r1
+        );
+        let expected_line_2 = "M=POST P=/beta/two :: tagged";
+        assert!(
+            r2.contains(&format!("{}\n{}\n", expected_line_2, expected_line_2)),
+            "r2 body should contain chained let twice; got: {:?}", r2
+        );
+        // Cross-request: r2 must NOT contain r1's slot value (no leak).
+        assert!(
+            !r2.contains("/alpha"),
+            "cross-request slot leak detected: r2 contains r1's path"
+        );
+
+        let _ = std::fs::remove_file(&out);
     }
 
     /// Phase 8 slice 8e: a service may declare MULTIPLE `log:` blocks,

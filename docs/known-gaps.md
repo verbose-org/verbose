@@ -332,13 +332,15 @@ Still deferred:
 
 **What still fails**:
 
-- **Non-literal text lets in service handlers.** Phase 7 slice 3+ has
-  its own handler emission path (`emit_handler_to_slots`) which
-  doesn't go through `emit_record_loop_prologue`. Handler-body lets
-  are still rejected at the `analyze_http10_handler_shape` gate.
-  Fix path: run the same classify-and-emit loop inside
-  `emit_http10_dynamic_bytes` before dispatching to the handler
-  emitter, building a handler-local offsets + text_bindings pair.
+- ~~**Non-literal text lets in service handlers.**~~ **Shipped
+  2026-04-27** as Phase 2I-H. The `analyze_http10_handler_shape` gate
+  no longer rejects bindings; handlers with bindings force-route
+  through the Dynamic shape, and `emit_http10_dynamic_bytes` runs a
+  classify-and-emit loop between the connection-fetch loop and
+  `emit_handler_to_slots`. Text lets land in two dedicated rbp slots
+  (ptr + len) inside the handler frame, register in
+  `http_text_bindings`, and resolve via the existing BoundText path
+  at the response body. See `examples/greeting_service.verbose`.
 - **Non-literal text lets in collection / fold programs** (map, filter,
   sum, count, the Phase 3/4/5b families). Each has its own
   `rule.logic.bindings` walk that still calls `emit_eval_expr`
