@@ -1,0 +1,67 @@
+@verbose 0.1.0
+
+-- Phase 9 slice 9.5: `read(<resource>)` as the INIT of a top-level
+-- fold whose output is text. The banner file is opened, read, and
+-- closed ONCE per rule invocation (above the outer per-record loop);
+-- its (ptr, len) live in dedicated rbp slots. The fold's per-record
+-- buffer starts by copying the banner content out of those slots,
+-- then appends one `name=salary; ` entry per employee.
+--
+-- Trade-off vs. literal init:
+--   * the banner can change without a recompile (read at every
+--     binary invocation)
+--   * cost is one open/read/close per invocation (~3 µs)
+--   * if the file is missing or unreadable, on_read_error: abort
+--     exits 1 BEFORE any output is written — the rule's audit trail
+--     stays consistent
+--
+-- This is the first Verbose binary that lets a top-level fold draw
+-- from a file. roster.verbose is the literal-init sister rule (same
+-- per-element body, "roster: " hardcoded).
+
+
+resource banner
+  @intention: "Header text prepended to each roster line"
+  @source: banner_roster.intent:1
+
+  path: "/tmp/verbose_roster_banner.txt"
+  max:  256
+  on_read_error: abort
+
+
+concept Employee
+  @intention: "An employee has a name and a salary"
+  @source: banner_roster.intent:1
+
+  fields:
+    name   : text
+    salary : number [0, 1000000]
+
+
+concept Workforce
+  @intention: "A workforce is a collection of employees"
+  @source: banner_roster.intent:1
+
+  fields:
+    employees : collection(Employee)
+
+
+rule banner_line
+  @intention: "Build one roster line: banner from file, then name=salary; per employee"
+  @source: banner_roster.intent:1
+
+  input:
+    w : Workforce
+
+  output:
+    line : text
+
+  logic:
+    line = fold(w.employees, read(banner), acc, e => concat(acc, e.name, "=", e.salary, "; "))
+
+  proofs:
+    purity:
+      reads   : [w.employees, banner]
+      calls   : []
+    termination:
+      bound : 6

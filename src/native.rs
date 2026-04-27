@@ -217,7 +217,7 @@ fn compile_native_code(
             emit_fold_program(rule, concept, &concepts, &rules)?
         }
     } else if is_fold_text_output {
-        emit_text_fold_program(rule, concept, &concepts, &rules)?
+        emit_text_fold_program(rule, concept, &concepts, &rules, &resources)?
     } else if matches!(&rule.output_ty, Type::Text) {
         emit_text_program(rule, concept, &rules, &resources, &connections)?
     } else if let Some(rec_concept) = record_output_concept {
@@ -5075,6 +5075,7 @@ fn emit_text_fold_program(
     input_concept: &Concept,
     all_concepts: &[&Concept],
     all_rules: &HashMap<&str, &Rule>,
+    all_resources: &HashMap<&str, &Resource>,
 ) -> Result<Vec<u8>, NativeError> {
     // ===== Scope validation =====
     if !matches!(rule.output_ty, Type::Text) {
@@ -5092,13 +5093,42 @@ fn emit_text_fold_program(
             })
         }
     };
-    let init_literal: &str = match init_expr {
-        Expr::Text(s) => s.as_str(),
+    // Slice 9.5: fold init is either a text literal (Phase 5b original) or
+    // `read(<resource>)` (this slice). When init is Read, the resource is
+    // opened/read/closed ONCE above the outer loop and its (ptr, len) lives
+    // in dedicated rbp slots; the init copy then becomes a `rep movsb` from
+    // those slots into the per-record buffer. The body's classifier still
+    // refuses BoundText args — keeping `read()` confined to the init keeps
+    // the diff small and the use case (banner per record) clean.
+    enum InitKind<'a> {
+        Literal(&'a str),
+        Read(&'a Resource),
+    }
+    let init_kind: InitKind = match init_expr {
+        Expr::Text(s) => InitKind::Literal(s.as_str()),
+        Expr::Read(name) => {
+            let r = all_resources.get(name.as_str()).ok_or_else(|| NativeError {
+                message: format!(
+                    "Phase 5b: fold init reads '{}' but no top-level `resource {}` was declared",
+                    name, name
+                ),
+            })?;
+            InitKind::Read(*r)
+        }
         _ => {
             return Err(NativeError {
-                message: "Phase 5b: fold init must be a text literal".into(),
+                message: "Phase 5b: fold init must be a text literal or `read(<resource>)`".into(),
             })
         }
+    };
+    // For sizing the per-record buffer we need either the literal length
+    // (compile-time constant) or the resource's `max:` bound (compile-time
+    // constant). Both fit in `init_size` as the WORST-CASE static contribution
+    // — the actual init copy uses the runtime `len_slot` so the buffer is
+    // never overrun even if the file was shorter than `max:`.
+    let init_size: i32 = match &init_kind {
+        InitKind::Literal(s) => s.as_bytes().len() as i32,
+        InitKind::Read(r) => r.max_bytes as i32,
     };
 
     // Body must be Concat(Ident(acc), ...rest), with acc absent from rest.
@@ -5259,12 +5289,28 @@ fn emit_text_fold_program(
     let n_elem_fields = elem_concept.fields.len();
     let n_lets = rule.logic.bindings.len();
     // frame: n_scalar + n_elem + n_lets + count_slot + argv_save_slot
+    //        (+ resource block at the bottom when init is read(...))
     let frame_slots = n_scalar + n_elem_fields + n_lets + 2;
-    let frame_size = (frame_slots as i32) * 8;
+    // Slice 9.5: when init is `read(<resource>)`, reserve one resource block
+    // (16 bytes for ptr+len + max_padded buffer) below the existing slots.
+    // The resource is read ONCE at startup — same shape as
+    // emit_record_loop_prologue. Resource read failures route to a shared
+    // sys_exit(1) abort label appended at the very end of the binary.
+    let resource_extra_bytes: i32 = match &init_kind {
+        InitKind::Read(r) => 16 + (((r.max_bytes as i32) + 7) & !7),
+        InitKind::Literal(_) => 0,
+    };
+    let frame_size = (frame_slots as i32) * 8 + resource_extra_bytes;
     let count_slot: i32 = -(((n_scalar + n_elem_fields + n_lets + 1) as i32) * 8);
     let argv_save_slot: i32 = -(((n_scalar + n_elem_fields + n_lets + 2) as i32) * 8);
+    // First resource (ptr) slot lives immediately below argv_save_slot.
+    let resource_first_slot: i32 = argv_save_slot - 8;
 
     let mut code = Vec::new();
+    // Patches into the resource open/read failure jumps (filled at the end).
+    let mut resource_abort_patches: Vec<usize> = Vec::new();
+    // (ptr_slot, len_slot) of the init-position read, if any.
+    let mut init_read_slots: Option<(i32, i32)> = None;
 
     // _start — argv/rbp setup.
     code.extend_from_slice(&[0x4C, 0x8B, 0x24, 0x24]);       // mov r12, [rsp]
@@ -5275,6 +5321,21 @@ fn emit_text_fold_program(
     code.extend_from_slice(&[0x48, 0x81, 0xEC]);
     code.extend_from_slice(&frame_size.to_le_bytes());       // sub rsp, frame_size
     code.extend_from_slice(&[0x49, 0xC7, 0xC6, 0x01, 0x00, 0x00, 0x00]); // mov r14, 1
+
+    // Slice 9.5: emit the resource read sequence ABOVE the outer loop —
+    // the file is opened/read/closed once per rule invocation, and the
+    // (ptr, len) survive every record iteration via the rbp slots. Same
+    // shape and same shared `emit_resource_read_sequence` helper as the
+    // emit_record_loop_prologue path.
+    if let InitKind::Read(r) = &init_kind {
+        let (ptr_slot, len_slot, _buf_slot, _new_next) = emit_resource_read_sequence(
+            &mut code,
+            r,
+            resource_first_slot,
+            &mut resource_abort_patches,
+        );
+        init_read_slots = Some((ptr_slot, len_slot));
+    }
 
     // Outer loop: one input record per iteration.
     let outer_loop_top = code.len();
@@ -5351,8 +5412,10 @@ fn emit_text_fold_program(
     }
 
     // ===== Pass 1: compute total buffer size into rax =====
-    let init_size = init_literal.as_bytes().len() as i32;
-
+    // `init_size` is the WORST-CASE init contribution computed above from
+    // either the literal length or the resource's `max:` bound. The actual
+    // init copy below uses the runtime `len_slot` for the Read variant, so
+    // the buffer is sized for the worst case but the write is exact.
     if all_text_fields_bounded {
         // Single-pass optimization: total = init_size + N * static_per_element.
         // No strlen loop needed — all text-field args have [..N] bounds whose
@@ -5464,32 +5527,68 @@ fn emit_text_fold_program(
     code.extend_from_slice(&[0x48, 0x89, 0xE3]); // mov rbx, rsp
     code.extend_from_slice(&[0x49, 0x89, 0xDA]); // mov r10, rbx
 
-    // Copy init literal into [rbx..]. Skip if empty.
-    if init_size > 0 {
-        let init_bytes = init_literal.as_bytes();
-        if init_size <= 127 {
-            code.push(0xEB);
-            code.push(init_size as u8);
-        } else {
-            code.push(0xE9);
-            code.extend_from_slice(&init_size.to_le_bytes());
+    // Copy the init bytes into [rbx..]. Two variants:
+    //   - Literal: bytes inline in the code, jumped over via short/near jmp
+    //     and copied via lea rsi/rep movsb (the original Phase 5b path).
+    //   - Read: the resource was already opened/read above the outer loop;
+    //     (ptr, len) live at rbp slots in `init_read_slots`. Copy from those
+    //     slots — the LENGTH used is the runtime `len_slot`, which can be
+    //     anywhere from 0 to `max:`, so the buffer (sized for `max:`) is
+    //     never overrun.
+    match &init_kind {
+        InitKind::Literal(s) => {
+            let init_bytes = s.as_bytes();
+            let lit_len = init_bytes.len() as i32;
+            if lit_len > 0 {
+                if lit_len <= 127 {
+                    code.push(0xEB);
+                    code.push(lit_len as u8);
+                } else {
+                    code.push(0xE9);
+                    code.extend_from_slice(&lit_len.to_le_bytes());
+                }
+                let data_addr = code.len();
+                code.extend_from_slice(init_bytes);
+                // mov rdi, rbx
+                code.extend_from_slice(&[0x48, 0x89, 0xDF]);
+                // lea rsi, [rip + rel32]
+                let end = code.len() + 7;
+                let rel32 = data_addr as i32 - end as i32;
+                code.extend_from_slice(&[0x48, 0x8D, 0x35]);
+                code.extend_from_slice(&rel32.to_le_bytes());
+                // mov rcx, lit_len
+                code.extend_from_slice(&[0x48, 0xC7, 0xC1]);
+                code.extend_from_slice(&lit_len.to_le_bytes());
+                // rep movsb
+                code.extend_from_slice(&[0xF3, 0xA4]);
+                // mov rbx, rdi
+                code.extend_from_slice(&[0x48, 0x89, 0xFB]);
+            }
         }
-        let data_addr = code.len();
-        code.extend_from_slice(init_bytes);
-        // mov rdi, rbx
-        code.extend_from_slice(&[0x48, 0x89, 0xDF]);
-        // lea rsi, [rip + rel32]
-        let end = code.len() + 7;
-        let rel32 = data_addr as i32 - end as i32;
-        code.extend_from_slice(&[0x48, 0x8D, 0x35]);
-        code.extend_from_slice(&rel32.to_le_bytes());
-        // mov rcx, init_size
-        code.extend_from_slice(&[0x48, 0xC7, 0xC1]);
-        code.extend_from_slice(&init_size.to_le_bytes());
-        // rep movsb
-        code.extend_from_slice(&[0xF3, 0xA4]);
-        // mov rbx, rdi
-        code.extend_from_slice(&[0x48, 0x89, 0xFB]);
+        InitKind::Read(_) => {
+            let (ptr_slot, len_slot) = init_read_slots
+                .expect("InitKind::Read implies the prologue allocated read slots");
+            // mov rsi, [rbp + ptr_slot]
+            if ptr_slot >= -128 {
+                code.extend_from_slice(&[0x48, 0x8B, 0x75]);
+                code.push(ptr_slot as u8);
+            } else {
+                code.extend_from_slice(&[0x48, 0x8B, 0xB5]);
+                code.extend_from_slice(&ptr_slot.to_le_bytes());
+            }
+            // mov rcx, [rbp + len_slot]
+            if len_slot >= -128 {
+                code.extend_from_slice(&[0x48, 0x8B, 0x4D]);
+                code.push(len_slot as u8);
+            } else {
+                code.extend_from_slice(&[0x48, 0x8B, 0x8D]);
+                code.extend_from_slice(&len_slot.to_le_bytes());
+            }
+            // mov rdi, rbx ; rep movsb ; mov rbx, rdi
+            code.extend_from_slice(&[0x48, 0x89, 0xDF]);
+            code.extend_from_slice(&[0xF3, 0xA4]);
+            code.extend_from_slice(&[0x48, 0x89, 0xFB]);
+        }
     }
 
     // Rewind r14 from argv_save_slot; reload r15 from count_slot.
@@ -5587,6 +5686,21 @@ fn emit_text_fold_program(
     code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x3C, 0x00, 0x00, 0x00]); // mov rax, 60
     code.extend_from_slice(&[0x48, 0x31, 0xFF]);                         // xor rdi, rdi
     code.extend_from_slice(&[0x0F, 0x05]);                               // syscall
+
+    // Slice 9.5: shared abort label for resource open/read failures.
+    // Mirrors the rule-prologue path in emit_record_loop_epilogue. The
+    // label only exists when at least one resource read was emitted, so
+    // literal-init programs pay zero bytes for it.
+    if !resource_abort_patches.is_empty() {
+        let abort_label = code.len();
+        for site in &resource_abort_patches {
+            let rel = abort_label as i32 - (*site as i32 + 4);
+            code[*site..*site + 4].copy_from_slice(&rel.to_le_bytes());
+        }
+        code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x3C, 0x00, 0x00, 0x00]); // mov rax, 60
+        code.extend_from_slice(&[0x48, 0xC7, 0xC7, 0x01, 0x00, 0x00, 0x00]); // mov rdi, 1
+        code.extend_from_slice(&[0x0F, 0x05]);                               // syscall
+    }
 
     Ok(code)
 }
@@ -10230,6 +10344,75 @@ mod tests {
         let size = fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
         assert!(size > 500 && size < 2_500, "unexpected binary size: {}", size);
         let _ = fs::remove_file(out);
+    }
+
+    /// Phase 9 slice 9.5: `read(<resource>)` allowed as the init expression
+    /// of a Phase 5b text fold. The resource is opened/read/closed ONCE
+    /// above the outer loop; (ptr, len) live in dedicated rbp slots; the
+    /// init copy uses the runtime length so a short file produces a tight
+    /// output and a missing file aborts the binary BEFORE any output is
+    /// written. This test exercises the full happy path (banner content
+    /// followed by per-element entries) AND the abort path (binary exits
+    /// non-zero when the resource path doesn't exist).
+    #[test]
+    fn slice_9_5_text_fold_with_read_init_runtime() {
+        use std::process::Command;
+        let banner_path = "/tmp/verbosec_test_slice95_banner.txt";
+        std::fs::write(banner_path, b"BANNER>> ").expect("write banner");
+
+        let src = std::fs::read_to_string("examples/banner_roster.verbose")
+            .expect("examples/banner_roster.verbose is expected to exist");
+        // Patch the path so the test doesn't fight with the example's
+        // own /tmp/verbose_roster_banner.txt that a user might be using.
+        let src = src.replace("/tmp/verbose_roster_banner.txt", banner_path);
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+
+        let out = std::env::temp_dir().join("verbosec_test_slice95_banner_roster");
+        compile_native(&program, "banner_line", out.to_str().unwrap(), false, false)
+            .expect("native compile of read-init text fold should succeed");
+
+        // Happy path: banner content + per-element entries on stdout.
+        let ok = Command::new(&out)
+            .args(["2", "alice", "100", "bob", "200"])
+            .output()
+            .expect("spawn ok run");
+        assert!(ok.status.success(), "expected success exit, got {:?}", ok.status);
+        let stdout = String::from_utf8_lossy(&ok.stdout);
+        assert_eq!(
+            stdout.trim_end(),
+            "BANNER>> alice=100; bob=200;",
+            "happy-path stdout mismatch: {:?}",
+            stdout
+        );
+
+        // Empty file path: zero-length init copy, body still runs.
+        std::fs::write(banner_path, b"").expect("truncate banner");
+        let empty = Command::new(&out)
+            .args(["1", "carol", "300"])
+            .output()
+            .expect("spawn empty run");
+        assert!(empty.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&empty.stdout).trim_end(),
+            "carol=300;",
+            "empty-banner stdout mismatch"
+        );
+
+        // Abort path: missing file exits 1 before any stdout is written.
+        let _ = std::fs::remove_file(banner_path);
+        let abort = Command::new(&out)
+            .args(["1", "dave", "400"])
+            .output()
+            .expect("spawn abort run");
+        assert!(
+            !abort.status.success() && abort.stdout.is_empty(),
+            "expected non-zero exit with empty stdout when banner missing; got status={:?} stdout={:?}",
+            abort.status,
+            String::from_utf8_lossy(&abort.stdout)
+        );
+
+        let _ = std::fs::remove_file(&out);
     }
 
     #[test]
