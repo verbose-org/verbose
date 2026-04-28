@@ -1,0 +1,1 @@
+1. A rule that takes a batch of events with Unix-epoch timestamps and counts those that happened within the last hour. The system clock is sampled once per binary invocation, then every event in the batch is judged against the same captured "now". Useful for sliding-window alerting: "fire if more than N events happened in the last 3600 seconds".

@@ -1671,6 +1671,10 @@ fn classify_concat_arg(
     match expr {
         Expr::Text(_) => Some(ConcatArgKind::Text),
         Expr::Number(_) | Expr::Neg(_) => Some(ConcatArgKind::Number),
+        // `now_unix()` is a Number-producing leaf. Concat fill routes
+        // Number args through emit_eval_expr, which resolves NowUnix
+        // via the offsets["now"] slot the surrounding emitter populated.
+        Expr::NowUnix => Some(ConcatArgKind::Number),
         Expr::Ident(name) if text_bindings.contains_key(name.as_str()) => {
             Some(ConcatArgKind::BoundText)
         }
@@ -4369,7 +4373,12 @@ fn emit_collection_program(
         .iter()
         .map(|r| 16 + (((r.max_bytes as i32) + 7) & !7))
         .sum();
-    let frame_size = (frame_slots as i32) * 8 + resource_extra_bytes;
+    // now_unix(): 16 bytes at the bottom of the frame; collection rules
+    // use it for per-element ts checks (e.g. enrich each emitted record
+    // with the same captured `now`).
+    let uses_now = rule_uses_now_unix(rule);
+    let now_extra_bytes: i32 = if uses_now { 16 } else { 0 };
+    let frame_size = (frame_slots as i32) * 8 + resource_extra_bytes + now_extra_bytes;
 
     let mut code = Vec::new();
     // Patches into the resource open/read failure jumps (filled at the end).
@@ -4406,6 +4415,16 @@ fn emit_collection_program(
         resource_next_slot = new_next;
     }
 
+    // now_unix(): one syscall ABOVE the outer loop. now_slot registered
+    // in elem_offsets below so the body's emit_eval_expr resolves it.
+    let now_slot: i32 = if uses_now {
+        let s = resource_next_slot - 8;
+        emit_capture_now_unix(&mut code, s);
+        s
+    } else {
+        0
+    };
+
     // Outer loop: each iteration processes one input record (scalars + count + elements).
     let outer_loop_top = code.len();
     code.extend_from_slice(&[0x4D, 0x39, 0xE6]); // cmp r14, r12
@@ -4422,6 +4441,9 @@ fn emit_collection_program(
     let mut elem_offsets: HashMap<&str, i32> = HashMap::new();
     for (i, f) in input_elem_concept.fields.iter().enumerate() {
         elem_offsets.insert(f.name.as_str(), -(((n_scalar + i) as i32 + 1) * 8));
+    }
+    if uses_now {
+        elem_offsets.insert("now", now_slot);
     }
 
     // Parse scalar input fields.
@@ -4758,7 +4780,13 @@ fn emit_fold_program(
         .iter()
         .map(|r| 16 + (((r.max_bytes as i32) + 7) & !7))
         .sum();
-    let frame_size = (frame_slots as i32) * 8 + resource_extra_bytes;
+    // now_unix(): 16 bytes if any reference exists in the rule (logic
+    // value or any let RHS). Sits at the very bottom of the frame so
+    // resource and acc slot positions stay byte-for-byte unchanged for
+    // rules without `now_unix()`.
+    let uses_now = rule_uses_now_unix(rule);
+    let now_extra_bytes: i32 = if uses_now { 16 } else { 0 };
+    let frame_size = (frame_slots as i32) * 8 + resource_extra_bytes + now_extra_bytes;
     let acc_offset: i32 = -((frame_slots as i32) * 8);
 
     let mut code = Vec::new();
@@ -4782,8 +4810,9 @@ fn emit_fold_program(
     // Slice 9.5d: emit each resource read sequence ABOVE the outer loop —
     // (ptr, len) survive every record and every element. First slot starts
     // immediately below acc_slot (the existing bottom of the frame).
+    let mut bottom_cursor: i32 = acc_offset - 8;
     {
-        let mut next_slot: i32 = acc_offset - 8;
+        let mut next_slot: i32 = bottom_cursor;
         for r in &referenced_resources {
             let (ptr_slot, len_slot, _buf_slot, new_next) = emit_resource_read_sequence(
                 &mut code,
@@ -4794,7 +4823,21 @@ fn emit_fold_program(
             text_bindings.insert(r.name.as_str(), (ptr_slot, len_slot));
             next_slot = new_next;
         }
+        bottom_cursor = next_slot;
     }
+
+    // now_unix(): clock_gettime(CLOCK_REALTIME) ONCE per rule invocation,
+    // ABOVE outer_loop_top. tv_sec at the deeper of two reserved slots
+    // (now_slot), tv_nsec scratch in the slot just above. Registered as
+    // ("now", now_slot) in body_offsets below so the inner loop's
+    // emit_eval_expr finds it via the standard offsets lookup.
+    let now_slot: i32 = if uses_now {
+        let s = bottom_cursor - 8;
+        emit_capture_now_unix(&mut code, s);
+        s
+    } else {
+        0
+    };
 
     // Outer loop — one input record per iteration.
     let outer_loop_top = code.len();
@@ -4815,6 +4858,13 @@ fn emit_fold_program(
     }
     // `acc_name` resolves to acc_slot inside the body.
     body_offsets.insert(acc_name, acc_offset);
+    // now_unix(): the synthetic name `now` is visible in both let RHS
+    // and the fold body. Registering in body_offsets covers the body
+    // path; let_offsets is built below from scalar_offsets, so we
+    // also need to insert there before the let-evaluation loop.
+    if uses_now {
+        body_offsets.insert("now", now_slot);
+    }
 
     // Parse scalar input fields.
     for f in &scalar_fields {
@@ -4834,6 +4884,9 @@ fn emit_fold_program(
     // Evaluate let bindings into rbp slots (after scalar fields, before element fields).
     let field_ranges_for_lets = build_field_ranges(input_concept);
     let mut let_offsets: HashMap<&str, i32> = scalar_offsets.clone();
+    if uses_now {
+        let_offsets.insert("now", now_slot);
+    }
     let mut next_let_slot = -(((n_scalar + n_elem_fields) as i32 + 1) * 8);
     for (name, expr) in &rule.logic.bindings {
         emit_eval_expr(&mut code, expr, &rule.input_name, &let_offsets, all_rules, &field_ranges_for_lets, &text_bindings)?;
@@ -5118,7 +5171,11 @@ fn emit_multi_fold_program(
         .iter()
         .map(|r| 16 + (((r.max_bytes as i32) + 7) & !7))
         .sum();
-    let frame_size = (frame_slots as i32) * 8 + resource_extra_bytes;
+    // now_unix(): 16 bytes at the very bottom of the frame when the rule
+    // touches the clock. Same shape as Phase 4 / record-loop prologue.
+    let uses_now = rule_uses_now_unix(rule);
+    let now_extra_bytes: i32 = if uses_now { 16 } else { 0 };
+    let frame_size = (frame_slots as i32) * 8 + resource_extra_bytes + now_extra_bytes;
 
     // Accumulator slot offsets (at the bottom of the original frame —
     // i.e. above the resource block, since acc slots get reused inside
@@ -5143,8 +5200,9 @@ fn emit_multi_fold_program(
     code.extend_from_slice(&[0x49, 0xC7, 0xC6, 0x01, 0x00, 0x00, 0x00]); // mov r14, 1
 
     // Slice 9.5e: emit each resource read sequence ABOVE the outer loop.
+    let mut bottom_cursor: i32 = last_acc_offset - 8;
     {
-        let mut next_slot: i32 = last_acc_offset - 8;
+        let mut next_slot: i32 = bottom_cursor;
         for r in &referenced_resources {
             let (ptr_slot, len_slot, _buf_slot, new_next) = emit_resource_read_sequence(
                 &mut code,
@@ -5155,7 +5213,18 @@ fn emit_multi_fold_program(
             text_bindings.insert(r.name.as_str(), (ptr_slot, len_slot));
             next_slot = new_next;
         }
+        bottom_cursor = next_slot;
     }
+
+    // now_unix(): one syscall ABOVE the outer loop. Slot registered in
+    // body_offsets and let_offsets below.
+    let now_slot: i32 = if uses_now {
+        let s = bottom_cursor - 8;
+        emit_capture_now_unix(&mut code, s);
+        s
+    } else {
+        0
+    };
 
     // Outer loop — one record per iteration.
     let outer_loop_top = code.len();
@@ -5180,6 +5249,9 @@ fn emit_multi_fold_program(
     for (i, fold) in folds.iter().enumerate() {
         body_offsets.insert(leak_string(&fold.acc_name), acc_offsets[i]);
     }
+    if uses_now {
+        body_offsets.insert("now", now_slot);
+    }
 
     // Parse scalar input fields (skip in logic, but consume from argv).
     for f in &scalar_fields {
@@ -5196,6 +5268,9 @@ fn emit_multi_fold_program(
     // Evaluate let bindings.
     let field_ranges_for_lets = build_field_ranges(input_concept);
     let mut let_offsets = scalar_offsets.clone();
+    if uses_now {
+        let_offsets.insert("now", now_slot);
+    }
     let mut next_let_slot = -(((n_scalar + n_elem) as i32 + 1) * 8);
     for (name, expr) in &rule.logic.bindings {
         emit_eval_expr(&mut code, expr, &rule.input_name, &let_offsets, all_rules, &field_ranges_for_lets, &text_bindings)?;
@@ -5660,7 +5735,12 @@ fn emit_text_fold_program(
         .iter()
         .map(|r| 16 + (((r.max_bytes as i32) + 7) & !7))
         .sum();
-    let frame_size = (frame_slots as i32) * 8 + resource_extra_bytes;
+    // now_unix(): 16 bytes at the bottom of the frame; useful here for
+    // text fold rendering (e.g. prepend a per-batch timestamp to each
+    // emitted line, captured once per rule invocation).
+    let uses_now = rule_uses_now_unix(rule);
+    let now_extra_bytes: i32 = if uses_now { 16 } else { 0 };
+    let frame_size = (frame_slots as i32) * 8 + resource_extra_bytes + now_extra_bytes;
     let count_slot: i32 = -(((n_scalar + n_elem_fields + n_lets + 1) as i32) * 8);
     let argv_save_slot: i32 = -(((n_scalar + n_elem_fields + n_lets + 2) as i32) * 8);
 
@@ -5691,18 +5771,16 @@ fn emit_text_fold_program(
     // First slot starts immediately below argv_save_slot and descends.
     // The init resource (if init_kind is Read) gets its slots pulled
     // from text_bindings after the loop, by name.
-    {
-        let mut next_slot: i32 = argv_save_slot - 8;
-        for r in &referenced_resources {
-            let (ptr_slot, len_slot, _buf_slot, new_next) = emit_resource_read_sequence(
-                &mut code,
-                r,
-                next_slot,
-                &mut resource_abort_patches,
-            );
-            text_bindings.insert(r.name.as_str(), (ptr_slot, len_slot));
-            next_slot = new_next;
-        }
+    let mut bottom_cursor: i32 = argv_save_slot - 8;
+    for r in &referenced_resources {
+        let (ptr_slot, len_slot, _buf_slot, new_next) = emit_resource_read_sequence(
+            &mut code,
+            r,
+            bottom_cursor,
+            &mut resource_abort_patches,
+        );
+        text_bindings.insert(r.name.as_str(), (ptr_slot, len_slot));
+        bottom_cursor = new_next;
     }
     if let InitKind::Read(r) = &init_kind {
         let &(ptr_slot, len_slot) = text_bindings
@@ -5710,6 +5788,17 @@ fn emit_text_fold_program(
             .expect("init resource always present in referenced_resources");
         init_read_slots = Some((ptr_slot, len_slot));
     }
+
+    // now_unix(): one syscall ABOVE the outer loop, slot at the bottom
+    // of the frame. Useful in text-fold rules for prepending a captured
+    // batch timestamp (formatted via the Number arg path in concat).
+    let now_slot: i32 = if uses_now {
+        let s = bottom_cursor - 8;
+        emit_capture_now_unix(&mut code, s);
+        s
+    } else {
+        0
+    };
 
     // Outer loop: one input record per iteration.
     let outer_loop_top = code.len();
@@ -5727,6 +5816,9 @@ fn emit_text_fold_program(
     let mut elem_offsets: HashMap<&str, i32> = HashMap::new();
     for (i, f) in elem_concept.fields.iter().enumerate() {
         elem_offsets.insert(f.name.as_str(), -(((n_scalar + i) as i32 + 1) * 8));
+    }
+    if uses_now {
+        elem_offsets.insert("now", now_slot);
     }
 
     // Parse scalar input fields.
@@ -5748,6 +5840,9 @@ fn emit_text_fold_program(
     {
         let field_ranges_for_lets = build_field_ranges(input_concept);
         let mut let_offsets: HashMap<&str, i32> = scalar_offsets.clone();
+        if uses_now {
+            let_offsets.insert("now", now_slot);
+        }
         let mut next_let_slot = -(((n_scalar + n_elem_fields) as i32 + 1) * 8);
         for (name, expr) in &rule.logic.bindings {
             emit_eval_expr(&mut code, expr, &rule.input_name, &let_offsets, all_rules, &field_ranges_for_lets, &text_bindings)?;
@@ -11805,6 +11900,69 @@ mod tests {
         );
 
         let _ = fs::remove_file(out);
+    }
+
+    /// `now_unix()` extension (2026-04-28): the primitive now works in
+    /// the body of a Phase 4 number fold (count/sum/min/max). The
+    /// canonical use case: count events in a sliding window, judged
+    /// against ONE captured "now" so a batch is consistent even if
+    /// the wall clock advances mid-iteration.
+    ///
+    /// This test spawns the binary multiple times; each invocation
+    /// captures its own clock independently, but within one batch
+    /// every event is judged against the same captured value.
+    #[test]
+    fn slice_now_unix_in_fold_body_sliding_window() {
+        use std::process::Command;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let src = std::fs::read_to_string("examples/sliding_count.verbose")
+            .expect("examples/sliding_count.verbose");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+        let out = std::env::temp_dir().join("verbosec_test_sliding_count");
+        compile_native(&program, "recent_count", out.to_str().unwrap(), false, false)
+            .expect("Phase 4 fold + now_unix() should compile");
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_secs() as i64;
+
+        let count = |args: &[String]| -> String {
+            let r = Command::new(&out).args(args).output().expect("spawn");
+            String::from_utf8_lossy(&r.stdout)
+                .trim_end_matches('\n')
+                .to_string()
+        };
+
+        // 3 fresh + 2 old → 3
+        let args: Vec<String> = vec![
+            "5".to_string(),
+            (now - 30).to_string(),
+            (now - 100).to_string(),
+            (now - 7200).to_string(),
+            (now - 60).to_string(),
+            (now - 5000).to_string(),
+        ];
+        assert_eq!(count(&args), "3");
+
+        // empty batch → 0
+        assert_eq!(count(&["0".to_string()]), "0");
+
+        // all old → 0
+        assert_eq!(
+            count(&["3".to_string(), (now - 4000).to_string(), (now - 5000).to_string(), (now - 7200).to_string()]),
+            "0"
+        );
+
+        // all fresh → 4
+        assert_eq!(
+            count(&["4".to_string(), (now - 1).to_string(), (now - 100).to_string(), (now - 1000).to_string(), (now - 3500).to_string()]),
+            "4"
+        );
+
+        let _ = std::fs::remove_file(&out);
     }
 
     /// `now_unix()` primitive (2026-04-28): system clock as a declared

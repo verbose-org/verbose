@@ -1,0 +1,54 @@
+@verbose 0.1.0
+
+-- now_unix() inside a Phase 4 number fold body. The classic
+-- sliding-window pattern: count how many events in the input batch
+-- happened within the last hour, judged against ONE captured "now"
+-- so the answer is consistent across the whole batch even if the
+-- wall clock advances mid-iteration.
+--
+-- Per binary invocation:
+--   1. clock_gettime(CLOCK_REALTIME) ONCE → now_slot at frame bottom
+--   2. for each input batch (one per argv frame):
+--      2a. parse element count → r15
+--      2b. seed acc = 0
+--      2c. for each event: parse e.ts; if now - e.ts < 3600 then
+--          acc = acc + 1 else acc unchanged
+--      2d. emit acc as decimal + newline
+
+
+concept Event
+  @intention: "An event with a Unix-epoch timestamp"
+  @source: sliding_count.intent:1
+
+  fields:
+    ts : number
+
+
+concept Stream
+  @intention: "A stream is a collection of events"
+  @source: sliding_count.intent:1
+
+  fields:
+    events : collection(Event)
+
+
+rule recent_count
+  @intention: "Number of events in the batch whose ts is within 3600 s of `now`"
+  @source: sliding_count.intent:1
+
+  input:
+    s : Stream
+
+  output:
+    n : number
+
+  logic:
+    n = count(s.events, e => now_unix() - e.ts < 3600)
+
+  proofs:
+    purity:
+      reads : [s.events, now]
+      calls : []
+
+    termination:
+      bound : 6
