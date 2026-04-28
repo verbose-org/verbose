@@ -1,0 +1,58 @@
+@verbose 0.1.0
+
+-- Slice "text equality with bound RHS" (2026-04-28): native text
+-- comparison now accepts `<field> == read(<resource>)` (and the
+-- symmetric form `read(...) == <field>`). Until this slice the
+-- equality fast path only handled `field == "literal"` — comparing
+-- against a runtime-loaded value forced a workaround through a
+-- separate verifier-only interpreter pass.
+--
+-- Mechanics:
+--   1. open /tmp/verbose_allowed_tag.txt + read once at startup
+--      (slice 9.1 prologue), (ptr, len) saved in rbp slots
+--   2. for each request: parse `req.tag` (text field, NUL-terminated
+--      argv string)
+--   3. compute strlen(req.tag) → rdx; load read_len → rcx; cmp
+--      rdx, rcx; jne .lengths_differ
+--   4. lengths match → reload rsi=field, rdi=read_ptr; cld; repe cmpsb;
+--      sete al
+--   5. movzx rax, al → emit "true"/"false" + newline
+
+
+resource allowed_tag
+  @intention: "The single tag that's currently allowed; reload by editing the file"
+  @source: allowlist.intent:1
+
+  path: "/tmp/verbose_allowed_tag.txt"
+  max:  64
+  on_read_error: abort
+
+
+concept Request
+  @intention: "A request carries the tag to check"
+  @source: allowlist.intent:1
+
+  fields:
+    tag : text
+
+
+rule is_authorized
+  @intention: "True iff the request tag matches the allowed tag loaded from disk"
+  @source: allowlist.intent:1
+
+  input:
+    req : Request
+
+  output:
+    ok : bool
+
+  logic:
+    ok = req.tag == read(allowed_tag)
+
+  proofs:
+    purity:
+      reads : [req.tag, allowed_tag]
+      calls : []
+
+    termination:
+      bound : 2

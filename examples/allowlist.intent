@@ -1,0 +1,1 @@
+1. A rule that takes a single text tag from the command line and reports whether that tag matches the allowed tag stored in a file. Returns true when the bytes match exactly, false otherwise. The allowed tag can be changed by editing the file between invocations without recompiling.

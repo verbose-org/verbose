@@ -1336,7 +1336,7 @@ fn emit_record_loop_prologue<'a>(
             text_bindings.insert(name.as_str(), (ptr_slot, len_slot));
             next_slot -= 16;
         } else {
-            emit_eval_expr(code, expr, &rule.input_name, &binding_offsets, all_rules, &field_ranges)?;
+            emit_eval_expr(code, expr, &rule.input_name, &binding_offsets, all_rules, &field_ranges, &text_bindings)?;
             if next_slot >= -128 {
                 code.extend_from_slice(&[0x48, 0x89, 0x45]);
                 code.push(next_slot as u8);
@@ -1422,6 +1422,7 @@ fn emit_full_program(
         &ctx.binding_offsets,
         all_rules,
         &ctx.field_ranges,
+        &ctx.text_bindings,
     )?;
 
     // Print result per record
@@ -2360,7 +2361,7 @@ fn emit_concat_fill(
             ConcatArgKind::Number => {
                 // push rbx — save write pointer (emit_eval_expr may clobber it via Binary op push/pop)
                 code.push(0x53);
-                emit_eval_expr(code, arg, input_name, offsets, all_rules, field_ranges)?;
+                emit_eval_expr(code, arg, input_name, offsets, all_rules, field_ranges, text_bindings)?;
                 // pop rbx
                 code.push(0x5B);
                 // itoa into buffer (rax → decimal digits at [rbx], rbx advanced)
@@ -3266,7 +3267,7 @@ fn emit_text_write_to_fd(
             // Conditional text: evaluate condition, branch, recurse on each
             // arm. Each arm writes its own text to the fd; control joins
             // after both branches.
-            emit_eval_expr(code, cond, input_name, offsets, all_rules, field_ranges)?;
+            emit_eval_expr(code, cond, input_name, offsets, all_rules, field_ranges, text_bindings)?;
             // test rax, rax ; jz else (rel32)
             code.extend_from_slice(&[0x48, 0x85, 0xC0]);
             code.push(0x0F);
@@ -3535,7 +3536,7 @@ fn emit_eval_result_expr(
             match t_ok {
                 Type::Number => {
                     // Number Ok: evaluate → rax, itoa writes decimal + \n to stdout.
-                    emit_eval_expr(code, inner, &rule.input_name, offsets, all_rules, field_ranges)?;
+                    emit_eval_expr(code, inner, &rule.input_name, offsets, all_rules, field_ranges, text_bindings)?;
                     emit_itoa_inline(code);
                 }
                 Type::Text => {
@@ -3586,7 +3587,7 @@ fn emit_eval_result_expr(
         }
         Expr::If(cond, then_e, else_e) => {
             // Evaluate the condition as a normal scalar (bool: 0 or 1).
-            emit_eval_expr(code, cond, &rule.input_name, offsets, all_rules, field_ranges)?;
+            emit_eval_expr(code, cond, &rule.input_name, offsets, all_rules, field_ranges, text_bindings)?;
             // test rax, rax ; jz .else (rel32 patch so arms can be large)
             code.extend_from_slice(&[0x48, 0x85, 0xC0]);
             code.push(0x0F);
@@ -3779,7 +3780,7 @@ fn emit_redirect_callee_leaves(
                 });
             }
             // Evaluate Ok's inner (a number) → rax.
-            emit_eval_expr(code, inner, &outer_rule.input_name, offsets, all_rules, field_ranges)?;
+            emit_eval_expr(code, inner, &outer_rule.input_name, offsets, all_rules, field_ranges, text_bindings)?;
             // Store at match_slot.
             store_rax_at_rbp(code, slots.match_slot);
             // Augment offsets with ok_var → match_slot, then emit outer ok_body
@@ -3930,7 +3931,7 @@ fn emit_redirect_callee_leaves(
             Ok(())
         }
         Expr::If(cond, then_e, else_e) => {
-            emit_eval_expr(code, cond, &outer_rule.input_name, offsets, all_rules, field_ranges)?;
+            emit_eval_expr(code, cond, &outer_rule.input_name, offsets, all_rules, field_ranges, text_bindings)?;
             code.extend_from_slice(&[0x48, 0x85, 0xC0]); // test rax, rax
             code.push(0x0F);
             code.push(0x84);
@@ -4323,7 +4324,7 @@ fn emit_collection_program(
         let mut let_offsets: HashMap<&str, i32> = scalar_offsets.clone();
         let mut next_let_slot = -(((n_scalar + n_elem_fields) as i32 + 1) * 8);
         for (name, expr) in &rule.logic.bindings {
-            emit_eval_expr(&mut code, expr, &rule.input_name, &let_offsets, all_rules, &field_ranges_for_lets)?;
+            emit_eval_expr(&mut code, expr, &rule.input_name, &let_offsets, all_rules, &field_ranges_for_lets, &text_bindings)?;
             store_rax_at_rbp(&mut code, next_let_slot);
             let_offsets.insert(name.as_str(), next_let_slot);
             next_let_slot -= 8;
@@ -4402,6 +4403,7 @@ fn emit_collection_program(
             } else {
                 emit_eval_expr(
                     &mut code, body, lambda_var, &elem_offsets, all_rules, &field_ranges,
+                    &text_bindings,
                 )?;
                 if matches!(output_kind, OutputElemKind::Bool) {
                     // Bool: rax = 0/1 → "true"/"false" + newline.
@@ -4427,6 +4429,7 @@ fn emit_collection_program(
             // Evaluate the predicate → rax (0 = skip, non-zero = keep).
             emit_eval_expr(
                 &mut code, predicate, lambda_var, &elem_offsets, all_rules, &field_ranges,
+                &text_bindings,
             )?;
             // test rax, rax ; je skip_emit (rel32, patched after the write block).
             code.extend_from_slice(&[0x48, 0x85, 0xC0]);
@@ -4664,7 +4667,7 @@ fn emit_fold_program(
     let mut let_offsets: HashMap<&str, i32> = scalar_offsets.clone();
     let mut next_let_slot = -(((n_scalar + n_elem_fields) as i32 + 1) * 8);
     for (name, expr) in &rule.logic.bindings {
-        emit_eval_expr(&mut code, expr, &rule.input_name, &let_offsets, all_rules, &field_ranges_for_lets)?;
+        emit_eval_expr(&mut code, expr, &rule.input_name, &let_offsets, all_rules, &field_ranges_for_lets, &no_text_bindings())?;
         store_rax_at_rbp(&mut code, next_let_slot);
         let_offsets.insert(name.as_str(), next_let_slot);
         next_let_slot -= 8;
@@ -4713,7 +4716,7 @@ fn emit_fold_program(
     // Evaluate the fold body; result is the NEW accumulator value in rax.
     // item_name is the "input" for field access resolution within the body.
     let field_ranges = build_field_ranges(elem_concept);
-    emit_eval_expr(&mut code, body, item_name, &body_offsets, all_rules, &field_ranges)?;
+    emit_eval_expr(&mut code, body, item_name, &body_offsets, all_rules, &field_ranges, &no_text_bindings())?;
     store_rax_at_rbp(&mut code, acc_offset);
 
     // dec r15 ; jmp inner_loop_top (rel32).
@@ -4968,7 +4971,7 @@ fn emit_multi_fold_program(
     let mut let_offsets = scalar_offsets.clone();
     let mut next_let_slot = -(((n_scalar + n_elem) as i32 + 1) * 8);
     for (name, expr) in &rule.logic.bindings {
-        emit_eval_expr(&mut code, expr, &rule.input_name, &let_offsets, all_rules, &field_ranges_for_lets)?;
+        emit_eval_expr(&mut code, expr, &rule.input_name, &let_offsets, all_rules, &field_ranges_for_lets, &no_text_bindings())?;
         store_rax_at_rbp(&mut code, next_let_slot);
         let_offsets.insert(name.as_str(), next_let_slot);
         next_let_slot -= 8;
@@ -5014,7 +5017,7 @@ fn emit_multi_fold_program(
     // Evaluate each fold body and update its accumulator.
     let field_ranges = build_field_ranges(elem_concept);
     for (i, fold) in folds.iter().enumerate() {
-        emit_eval_expr(&mut code, &fold.body, &fold.item_name, &body_offsets, all_rules, &field_ranges)?;
+        emit_eval_expr(&mut code, &fold.body, &fold.item_name, &body_offsets, all_rules, &field_ranges, &no_text_bindings())?;
         store_rax_at_rbp(&mut code, acc_offsets[i]);
     }
 
@@ -5045,7 +5048,7 @@ fn emit_multi_fold_program(
     // Evaluate the final scalar expression (quantifiers replaced by Ident refs).
     // Use an empty input name — the expression should only reference __fold_N idents.
     let empty_ranges: HashMap<&str, (i64, i64)> = HashMap::new();
-    emit_eval_expr(&mut code, &scalar_expr, "__phase6_none__", &final_offsets, all_rules, &empty_ranges)?;
+    emit_eval_expr(&mut code, &scalar_expr, "__phase6_none__", &final_offsets, all_rules, &empty_ranges, &no_text_bindings())?;
 
     // Print result.
     if is_bool_output {
@@ -5508,7 +5511,7 @@ fn emit_text_fold_program(
         let mut let_offsets: HashMap<&str, i32> = scalar_offsets.clone();
         let mut next_let_slot = -(((n_scalar + n_elem_fields) as i32 + 1) * 8);
         for (name, expr) in &rule.logic.bindings {
-            emit_eval_expr(&mut code, expr, &rule.input_name, &let_offsets, all_rules, &field_ranges_for_lets)?;
+            emit_eval_expr(&mut code, expr, &rule.input_name, &let_offsets, all_rules, &field_ranges_for_lets, &text_bindings)?;
             store_rax_at_rbp(&mut code, next_let_slot);
             let_offsets.insert(name.as_str(), next_let_slot);
             next_let_slot -= 8;
@@ -5941,7 +5944,7 @@ fn emit_eval_record_expr(
             Ok(())
         }
         Expr::If(cond, then_e, else_e) => {
-            emit_eval_expr(code, cond, &rule.input_name, offsets, all_rules, field_ranges)?;
+            emit_eval_expr(code, cond, &rule.input_name, offsets, all_rules, field_ranges, text_bindings)?;
             code.extend_from_slice(&[0x48, 0x85, 0xC0]); // test rax, rax
             code.push(0x0F);
             code.push(0x84); // je rel32
@@ -6009,7 +6012,7 @@ fn emit_record_as_json(
         match decl.ty {
             Type::Number => {
                 // Evaluate → rax, write digits to stdout, no newline.
-                emit_eval_expr(code, value_expr, input_name, offsets, all_rules, field_ranges)?;
+                emit_eval_expr(code, value_expr, input_name, offsets, all_rules, field_ranges, text_bindings)?;
                 emit_itoa_to_stdout_no_newline(code);
             }
             Type::Text => {
@@ -6076,6 +6079,7 @@ fn emit_reaction_program(
         &ctx.binding_offsets,
         all_rules,
         &ctx.field_ranges,
+        &ctx.text_bindings,
     )?;
 
     // cmp rax, 0 ; je skip_effects (rel32 so effect body can be large)
@@ -6133,6 +6137,7 @@ fn emit_reaction_program(
                         emit_eval_expr(
                             &mut code, arg, &trigger_rule.input_name,
                             &ctx.binding_offsets, all_rules, &ctx.field_ranges,
+                            &ctx.text_bindings,
                         )?;
                         emit_itoa_to_stdout_no_newline(&mut code);
                     } else {
@@ -6337,6 +6342,7 @@ fn emit_eval_expr(
     offsets: &HashMap<&str, i32>,
     all_rules: &HashMap<&str, &Rule>,
     field_ranges: &HashMap<&str, (i64, i64)>,
+    text_bindings: &TextBindings<'_>,
 ) -> Result<(), NativeError> {
     match expr {
         Expr::Number(n) => {
@@ -6388,7 +6394,7 @@ fn emit_eval_expr(
             if *op == BinOp::Mul {
                 if let Expr::Number(n) = right.as_ref() {
                     if *n > 0 && (*n as u64).is_power_of_two() {
-                        emit_eval_expr(code, left, input_name, offsets, all_rules, field_ranges)?;
+                        emit_eval_expr(code, left, input_name, offsets, all_rules, field_ranges, text_bindings)?;
                         let shift = (*n as u64).trailing_zeros() as u8;
                         code.extend_from_slice(&[0x48, 0xC1, 0xE0, shift]); // shl rax, shift
                         return Ok(());
@@ -6400,7 +6406,7 @@ fn emit_eval_expr(
             if *op == BinOp::Div {
                 if let Expr::Number(n) = right.as_ref() {
                     if *n > 0 && (*n as u64).is_power_of_two() {
-                        emit_eval_expr(code, left, input_name, offsets, all_rules, field_ranges)?;
+                        emit_eval_expr(code, left, input_name, offsets, all_rules, field_ranges, text_bindings)?;
                         let shift = (*n as u64).trailing_zeros() as u8;
                         code.extend_from_slice(&[0x48, 0xC1, 0xE8, shift]); // shr rax, shift
                         return Ok(());
@@ -6419,7 +6425,7 @@ fn emit_eval_expr(
                             let dividend_non_negative = compute_range(left, field_ranges, input_name)
                                 .map_or(false, |(min, _)| min >= 0);
                             if dividend_non_negative {
-                                emit_eval_expr(code, left, input_name, offsets, all_rules, field_ranges)?;
+                                emit_eval_expr(code, left, input_name, offsets, all_rules, field_ranges, text_bindings)?;
                                 // mov rcx, magic
                                 code.extend_from_slice(&[0x48, 0xB9]);
                                 code.extend_from_slice(&magic.to_le_bytes());
@@ -6449,16 +6455,16 @@ fn emit_eval_expr(
             // Strength reduction: multiply by 1 → identity
             if *op == BinOp::Mul {
                 if matches!(right.as_ref(), Expr::Number(1)) {
-                    return emit_eval_expr(code, left, input_name, offsets, all_rules, field_ranges);
+                    return emit_eval_expr(code, left, input_name, offsets, all_rules, field_ranges, text_bindings);
                 }
                 if matches!(left.as_ref(), Expr::Number(1)) {
-                    return emit_eval_expr(code, right, input_name, offsets, all_rules, field_ranges);
+                    return emit_eval_expr(code, right, input_name, offsets, all_rules, field_ranges, text_bindings);
                 }
             }
 
             // Strength reduction: add/sub 0 → identity
             if (*op == BinOp::Add || *op == BinOp::Sub) && matches!(right.as_ref(), Expr::Number(0)) {
-                return emit_eval_expr(code, left, input_name, offsets, all_rules, field_ranges);
+                return emit_eval_expr(code, left, input_name, offsets, all_rules, field_ranges, text_bindings);
             }
 
             // === Text comparison: field == "literal" or field != "literal" ===
@@ -6515,12 +6521,120 @@ fn emit_eval_expr(
                     }
                     return Ok(());
                 }
+
+                // === Text comparison: field == read(<resource>) ===
+                // Slice "text equality with bound RHS" (2026-04-28). Detect a
+                // text field compared to a resource read result. The literal
+                // path above used an inline NUL-terminated literal; here the
+                // bytes live at [rbp+ptr_slot] with the length at [rbp+len_slot].
+                // No NUL in the resource buffer (read's byte count is exact),
+                // so we cannot rely on the trailing NUL trick — we explicitly
+                // compare strlen(field) == read_len first and only do cmpsb on
+                // matching lengths. Field-side stays NUL-terminated (argv
+                // string) so emit_strlen still applies. Detected for both
+                // operand orders so `read(x) == p.tag` works the same as
+                // `p.tag == read(x)`.
+                let bound_pair: Option<(i32, &str)> = match (left.as_ref(), right.as_ref()) {
+                    (Expr::Field(base, fname), Expr::Read(rname))
+                        if matches!(base.as_ref(), Expr::Ident(n) if n == input_name) =>
+                    {
+                        offsets.get(fname.as_str()).map(|&o| (o, rname.as_str()))
+                    }
+                    (Expr::Read(rname), Expr::Field(base, fname))
+                        if matches!(base.as_ref(), Expr::Ident(n) if n == input_name) =>
+                    {
+                        offsets.get(fname.as_str()).map(|&o| (o, rname.as_str()))
+                    }
+                    _ => None,
+                };
+                if let Some((foff, rname)) = bound_pair {
+                    let &(ptr_slot, len_slot) = text_bindings.get(rname).ok_or_else(|| NativeError {
+                        message: format!(
+                            "text equality with read({}) expected the resource to be bound at this point — \
+                             reached emit_eval_expr with no slot in text_bindings",
+                            rname
+                        ),
+                    })?;
+
+                    // Step 1: compute strlen(field) into rdx.
+                    // mov rsi, [rbp + foff]
+                    if foff >= -128 {
+                        code.extend_from_slice(&[0x48, 0x8B, 0x75]);
+                        code.push(foff as u8);
+                    } else {
+                        code.extend_from_slice(&[0x48, 0x8B, 0xB5]);
+                        code.extend_from_slice(&foff.to_le_bytes());
+                    }
+                    emit_strlen(code); // rdx = strlen(field)
+
+                    // Step 2: load read length, compare with strlen.
+                    // mov rcx, [rbp + len_slot]
+                    if len_slot >= -128 {
+                        code.extend_from_slice(&[0x48, 0x8B, 0x4D]);
+                        code.push(len_slot as u8);
+                    } else {
+                        code.extend_from_slice(&[0x48, 0x8B, 0x8D]);
+                        code.extend_from_slice(&len_slot.to_le_bytes());
+                    }
+                    // cmp rdx, rcx
+                    code.extend_from_slice(&[0x48, 0x39, 0xCA]);
+                    // jne .lengths_differ (8-bit displacement; the body is
+                    // small enough — at most ~22 bytes for the cmpsb path
+                    // including reloads — to safely use a short jump).
+                    code.push(0x75);
+                    let lengths_differ_patch = code.len();
+                    code.push(0x00);
+
+                    // Step 3: lengths equal → cmpsb on rcx (= len_slot) bytes.
+                    // Reload rsi (field ptr) and load rdi (resource ptr).
+                    if foff >= -128 {
+                        code.extend_from_slice(&[0x48, 0x8B, 0x75]);
+                        code.push(foff as u8);
+                    } else {
+                        code.extend_from_slice(&[0x48, 0x8B, 0xB5]);
+                        code.extend_from_slice(&foff.to_le_bytes());
+                    }
+                    if ptr_slot >= -128 {
+                        code.extend_from_slice(&[0x48, 0x8B, 0x7D]);
+                        code.push(ptr_slot as u8);
+                    } else {
+                        code.extend_from_slice(&[0x48, 0x8B, 0xBD]);
+                        code.extend_from_slice(&ptr_slot.to_le_bytes());
+                    }
+                    // cld ; repe cmpsb
+                    code.push(0xFC);
+                    code.extend_from_slice(&[0xF3, 0xA6]);
+                    // sete al  (rax = 1 iff every byte matched)
+                    code.extend_from_slice(&[0x0F, 0x94, 0xC0]);
+                    // jmp .collect (skip the lengths-differ tail)
+                    code.push(0xEB);
+                    let collect_patch = code.len();
+                    code.push(0x00);
+
+                    // .lengths_differ:
+                    let ld_pos = code.len();
+                    code[lengths_differ_patch] = (ld_pos - lengths_differ_patch - 1) as u8;
+                    // xor al, al  (raw equal = 0)
+                    code.extend_from_slice(&[0x30, 0xC0]);
+
+                    // .collect:
+                    let collect_pos = code.len();
+                    code[collect_patch] = (collect_pos - collect_patch - 1) as u8;
+                    // movzx rax, al
+                    code.extend_from_slice(&[0x48, 0x0F, 0xB6, 0xC0]);
+
+                    // For NotEq, invert: xor rax, 1
+                    if *op == BinOp::NotEq {
+                        code.extend_from_slice(&[0x48, 0x83, 0xF0, 0x01]);
+                    }
+                    return Ok(());
+                }
             }
 
             // === General case: evaluate both sides, apply operator ===
-            emit_eval_expr(code, left, input_name, offsets, all_rules, field_ranges)?;
+            emit_eval_expr(code, left, input_name, offsets, all_rules, field_ranges, text_bindings)?;
             code.push(0x50); // push rax
-            emit_eval_expr(code, right, input_name, offsets, all_rules, field_ranges)?;
+            emit_eval_expr(code, right, input_name, offsets, all_rules, field_ranges, text_bindings)?;
             code.push(0x59); // pop rcx — now rcx=left, rax=right
 
             match op {
@@ -6608,6 +6722,7 @@ fn emit_eval_expr(
                 offsets,
                 all_rules,
                 field_ranges,
+                text_bindings,
             )
         }
         Expr::If(cond, then_e, else_e) => {
@@ -6615,14 +6730,14 @@ fn emit_eval_expr(
             if let Some(always) = try_static_condition(cond, field_ranges, input_name) {
                 if always {
                     // Condition always true — emit only then branch, skip comparison
-                    return emit_eval_expr(code, then_e, input_name, offsets, all_rules, field_ranges);
+                    return emit_eval_expr(code, then_e, input_name, offsets, all_rules, field_ranges, text_bindings);
                 } else {
                     // Condition always false — emit only else branch, skip comparison
-                    return emit_eval_expr(code, else_e, input_name, offsets, all_rules, field_ranges);
+                    return emit_eval_expr(code, else_e, input_name, offsets, all_rules, field_ranges, text_bindings);
                 }
             }
             // Dynamic: emit both branches with runtime check
-            emit_eval_expr(code, cond, input_name, offsets, all_rules, field_ranges)?;
+            emit_eval_expr(code, cond, input_name, offsets, all_rules, field_ranges, text_bindings)?;
             // test al, al
             code.extend_from_slice(&[0x84, 0xC0]);
             // jz .else_branch
@@ -6631,7 +6746,7 @@ fn emit_eval_expr(
             let else_patch = code.len();
             code.extend_from_slice(&[0x00; 4]);
             // then branch → rax
-            emit_eval_expr(code, then_e, input_name, offsets, all_rules, field_ranges)?;
+            emit_eval_expr(code, then_e, input_name, offsets, all_rules, field_ranges, text_bindings)?;
             // jmp .end
             code.push(0xE9);
             let end_patch = code.len();
@@ -6640,7 +6755,7 @@ fn emit_eval_expr(
             let else_pos = code.len();
             let eo = else_pos as i32 - (else_patch as i32 + 4);
             code[else_patch..else_patch + 4].copy_from_slice(&eo.to_le_bytes());
-            emit_eval_expr(code, else_e, input_name, offsets, all_rules, field_ranges)?;
+            emit_eval_expr(code, else_e, input_name, offsets, all_rules, field_ranges, text_bindings)?;
             // .end:
             let end_pos = code.len();
             let ep = end_pos as i32 - (end_patch as i32 + 4);
@@ -6648,13 +6763,13 @@ fn emit_eval_expr(
             Ok(())
         }
         Expr::Not(inner) => {
-            emit_eval_expr(code, inner, input_name, offsets, all_rules, field_ranges)?;
+            emit_eval_expr(code, inner, input_name, offsets, all_rules, field_ranges, text_bindings)?;
             // rax is 0 or 1; flip it
             code.extend_from_slice(&[0x48, 0x83, 0xF0, 0x01]); // xor rax, 1
             Ok(())
         }
         Expr::Neg(inner) => {
-            emit_eval_expr(code, inner, input_name, offsets, all_rules, field_ranges)?;
+            emit_eval_expr(code, inner, input_name, offsets, all_rules, field_ranges, text_bindings)?;
             code.extend_from_slice(&[0x48, 0xF7, 0xD8]); // neg rax
             Ok(())
         }
@@ -7057,6 +7172,7 @@ fn emit_parallel_program(
         &offsets,
         all_rules,
         &field_ranges,
+        &no_text_bindings(),
     )?;
 
     // Print result
@@ -9095,6 +9211,7 @@ fn emit_http10_dynamic_bytes(
                     &handler_offsets,
                     all_rules,
                     field_ranges,
+                    &http_text_bindings,
                 )?;
                 store_rax_at_rbp(&mut code, value_slot);
                 handler_offsets.insert(name.as_str(), value_slot);
@@ -9394,7 +9511,7 @@ fn emit_handler_to_slots(
                     // `status: number [100, 599]`; native trusts it and
                     // dispatches to the generic evaluator, then stores
                     // rax at the status slot.
-                    emit_eval_expr(code, status_expr, input_name, offsets, all_rules, field_ranges)?;
+                    emit_eval_expr(code, status_expr, input_name, offsets, all_rules, field_ranges, text_bindings)?;
                     // mov [rbp-24], rax
                     code.extend_from_slice(&[0x48, 0x89, 0x45, 0xE8]);
                 }
@@ -9542,7 +9659,7 @@ fn emit_handler_to_slots(
         }
         Expr::If(cond, then_e, else_e) => {
             // Evaluate cond → rax (0 or 1)
-            emit_eval_expr(code, cond, input_name, offsets, all_rules, field_ranges)?;
+            emit_eval_expr(code, cond, input_name, offsets, all_rules, field_ranges, text_bindings)?;
             // test rax, rax ; jz else_label
             code.extend_from_slice(&[0x48, 0x85, 0xC0]);
             code.push(0x0F);
@@ -11255,6 +11372,82 @@ mod tests {
         );
 
         let _ = fs::remove_file(out);
+    }
+
+    /// Slice "text equality with bound RHS" (2026-04-28): native text
+    /// comparison now accepts `<field> == read(<resource>)` and the
+    /// symmetric `read(...) == <field>` form. Until this slice the
+    /// equality fast path only handled `field == "literal"`. The new
+    /// path computes `strlen(field)` and compares against the resource's
+    /// runtime length first; only when lengths match does it cmpsb the
+    /// bytes. The runtime-loaded value can change between binary
+    /// invocations without recompile, unlocking SIEM-style filter-by-
+    /// allowlist patterns AND being the prerequisite for slice 9.5d.
+    ///
+    /// This test pins the four behaviors:
+    ///   (a) matching bytes  → true
+    ///   (b) different bytes → false
+    ///   (c) length differs (prefix or longer)  → false (length check
+    ///       catches it before cmpsb)
+    ///   (d) empty file == empty argv → true (rcx=0, repe cmpsb is a
+    ///       no-op, ZF stays set from the cmp before)
+    ///   (e) NotEq inverts each (compiled as a separate rule because
+    ///       the verifier rejects mixing the same logic with different
+    ///       output values inside one rule).
+    #[test]
+    fn slice_text_eq_with_read_rhs_runtime() {
+        use std::process::Command;
+        let tag_path = "/tmp/verbosec_test_text_eq_read_tag.txt";
+        std::fs::write(tag_path, b"INTERNAL").expect("write tag");
+
+        let src = std::fs::read_to_string("examples/allowlist.verbose")
+            .expect("examples/allowlist.verbose is expected to exist");
+        let src = src.replace("/tmp/verbose_allowed_tag.txt", tag_path);
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+
+        let out = std::env::temp_dir().join("verbosec_test_text_eq_read");
+        compile_native(&program, "is_authorized", out.to_str().unwrap(), false, false)
+            .expect("text-eq-with-read should compile");
+
+        let run = |arg: &str| -> String {
+            let r = Command::new(&out)
+                .args([arg])
+                .output()
+                .expect("spawn run");
+            String::from_utf8_lossy(&r.stdout).trim_end_matches('\n').to_string()
+        };
+
+        // (a) matching bytes
+        assert_eq!(run("INTERNAL"), "true", "matching tag should yield true");
+        // (b) different bytes, same length (8 vs 8)
+        assert_eq!(run("EXTERNAL"), "false", "different bytes (same length) should be false");
+        // (c.1) prefix (length too short)
+        assert_eq!(run("INT"), "false", "prefix should be false (length differs)");
+        // (c.2) extension (length too long)
+        assert_eq!(run("INTERNALX"), "false", "extension should be false (length differs)");
+
+        // (d) empty file vs empty argv → true
+        std::fs::write(tag_path, b"").expect("truncate tag");
+        assert_eq!(run(""), "true", "empty == empty should be true");
+        // empty file vs non-empty → false (length differs the other way)
+        assert_eq!(run("X"), "false", "empty file vs non-empty argv should be false");
+
+        // (e) Abort path: missing file → exit 1, no stdout
+        let _ = std::fs::remove_file(tag_path);
+        let abort = Command::new(&out)
+            .args(["INTERNAL"])
+            .output()
+            .expect("spawn abort");
+        assert!(
+            !abort.status.success() && abort.stdout.is_empty(),
+            "missing-file run should exit non-zero with empty stdout; got status={:?} stdout={:?}",
+            abort.status,
+            String::from_utf8_lossy(&abort.stdout)
+        );
+
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_file(tag_path);
     }
 
     /// Phase 9 slice 9.5b: `read(<resource>)` is allowed in the BODY of a

@@ -158,6 +158,14 @@ examples/
                    ~970 B native binary; on_read_error: abort exits 1 if
                    the file is missing. First Verbose binary that reads a
                    resource from inside a collection-emitting rule.
+  allowlist.*      Slice "text equality with bound RHS" (2026-04-28):
+                   native text comparison now accepts `<field> == read(<resource>)`
+                   alongside the existing `<field> == "<literal>"` form.
+                   The runtime-loaded value can change between binary
+                   invocations without recompile (filter-by-allowlist
+                   pattern). Length compared first (strlen vs len_slot);
+                   only on equal lengths does cmpsb fire. ~575 B native
+                   binary; pinned by slice_text_eq_with_read_rhs_runtime.
   sep_roster.*     Phase 9 slice 9.5b: `read(<resource>)` allowed in the
                    BODY of a Phase 5b text fold. Separator text loaded
                    once per rule invocation, copied between consecutive
