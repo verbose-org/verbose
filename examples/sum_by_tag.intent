@@ -1,0 +1,1 @@
+1. A rule that takes a collection of order records, each with a tag and an amount, and computes the sum of amounts whose tag matches the value loaded from a file at startup. Operator can change the file between binary invocations to redirect the sum to a different tag without recompiling.

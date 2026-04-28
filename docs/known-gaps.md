@@ -230,23 +230,18 @@ ships the worked example (1572-byte binary).
   strict-only default makes failure obvious; relaxing is an explicit
   opt-in if needed.
 - **File resources in collection / fold / parallel programs.**
-  Three slices shipped 2026-04-27:
+  Four slices shipped 2026-04-27/28:
   - 9.5 (text-fold init): `banner_roster.verbose::banner_line`
+  - 9.5b (text-fold body): `sep_roster.verbose::sep_line`
   - 9.5c (Phase 3 collection map): `tagged_bonuses.verbose::tag_employees`
-    — `read()` inside the map body's record field; resource read
-    once above the outer record loop, every output record
-    references the same (ptr, len) slots via the threaded
-    `text_bindings`. Same pattern works for filter (synthetic
-    Record path uses the same `emit_record_as_json` helper).
-  - 9.5b (text-fold body): `sep_roster.verbose::sep_line` — `read()`
-    in fold body concat args; separator file loaded once at startup,
-    copied between consecutive entries every iteration; operator can
-    change the file between invocations without recompile.
-  Still refused: `read()` in `emit_fold_program` (Phase 4 number
-  fold) — would require text-equality with bound RHS (today only
-  `field == Text(literal)`); `read()` in `emit_multi_fold_program`
-  (Phase 6) — same constraint, plus multi-acc layout; `read()` in
-  `emit_parallel_program` — different register discipline.
+  - 9.5d (Phase 4 number fold): `sum_by_tag.verbose::sum_for_target`
+    — composes with the new BoundText text-equality
+    (`field == read(...)`) shipped same-day to support
+    SIEM filter-by-allowlist sums.
+  Still refused: `read()` in `emit_multi_fold_program` (Phase 6 quantifier
+  desugar) — same shape as 9.5d but multi-acc layout means revisiting
+  the slot map; `read()` in `emit_parallel_program` — different register
+  discipline (parses argv into an array, not field slots).
 - **Multiple resources composing in a single concat in service
   handlers.** Single-resource handler bodies tested; multi-resource
   in one expression should work via text_bindings but isn't covered

@@ -1,0 +1,68 @@
+@verbose 0.1.0
+
+-- Slice 9.5d: `read(<resource>)` inside the body of a Phase 4
+-- number fold. Combined with the new `field == read(<resource>)`
+-- text equality, this unlocks SIEM-style filter-by-allowlist sums:
+-- aggregate over only the elements whose tag matches a runtime-
+-- loaded reference, without recompiling when the reference changes.
+--
+-- Per binary invocation:
+--   1. open + read /tmp/verbose_target_tag.txt once at startup
+--      (slice 9.1 prologue), (ptr, len) saved in rbp slots
+--   2. for each input record (one batch per argv frame):
+--      2a. parse scalar fields + element count (= n orders)
+--      2b. seed acc = 0
+--      2c. for each order:
+--          - parse o.tag (text) + o.amount (number)
+--          - body = if o.tag == read(target) then acc + o.amount else acc
+--            (the equality is the new BoundText path: strlen(o.tag)
+--             vs target_len, then cmpsb on equal lengths)
+--      2d. emit acc as decimal + newline
+
+
+resource target
+  @intention: "Tag selecting which orders contribute to the sum"
+  @source: sum_by_tag.intent:1
+
+  path: "/tmp/verbose_target_tag.txt"
+  max:  64
+  on_read_error: abort
+
+
+concept Order
+  @intention: "An order has a tag and an amount"
+  @source: sum_by_tag.intent:1
+
+  fields:
+    tag    : text
+    amount : number [0, 1000000]
+
+
+concept Batch
+  @intention: "A batch is a collection of orders"
+  @source: sum_by_tag.intent:1
+
+  fields:
+    orders : collection(Order)
+
+
+rule sum_for_target
+  @intention: "Sum the amounts of orders whose tag matches the runtime-loaded target"
+  @source: sum_by_tag.intent:1
+
+  input:
+    b : Batch
+
+  output:
+    total : number
+
+  logic:
+    total = sum(b.orders, o => if o.tag == read(target) then o.amount else 0)
+
+  proofs:
+    purity:
+      reads : [b.orders, target]
+      calls : []
+
+    termination:
+      bound : 5

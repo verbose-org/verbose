@@ -212,9 +212,9 @@ fn compile_native_code(
         if let Some(ref desugared) = desugared_fold {
             let mut rule_copy = rule.clone();
             rule_copy.logic.value = desugared.clone();
-            emit_fold_program(&rule_copy, concept, &concepts, &rules)?
+            emit_fold_program(&rule_copy, concept, &concepts, &rules, &resources)?
         } else {
-            emit_fold_program(rule, concept, &concepts, &rules)?
+            emit_fold_program(rule, concept, &concepts, &rules, &resources)?
         }
     } else if is_fold_text_output {
         emit_text_fold_program(rule, concept, &concepts, &rules, &resources)?
@@ -4534,6 +4534,7 @@ fn emit_fold_program(
     input_concept: &Concept,
     all_concepts: &[&Concept],
     all_rules: &HashMap<&str, &Rule>,
+    all_resources: &HashMap<&str, &Resource>,
 ) -> Result<Vec<u8>, NativeError> {
     // ===== Scope validation =====
     let is_bool_output = matches!(rule.output_ty, Type::Bool);
@@ -4610,12 +4611,42 @@ fn emit_fold_program(
     let n_scalar = scalar_fields.len();
     let n_elem_fields = elem_concept.fields.len();
     let n_lets = rule.logic.bindings.len();
-    // Frame: scalars + element fields + let bindings + acc slot.
+    // Frame: scalars + element fields + let bindings + acc slot
+    //        (+ resource block at the bottom when read() is referenced)
     let frame_slots = n_scalar + n_elem_fields + n_lets + 1;
-    let frame_size = (frame_slots as i32) * 8;
+
+    // Slice 9.5d: enumerate resources the rule reads (init / let RHS /
+    // fold body). Same shape as slice 9.5b/c — collect_rule_read_names
+    // walks every Read in the AST so a `read()` deep inside the body
+    // gets the same prologue as a top-level let RHS reference.
+    let referenced_resources: Vec<&Resource> = {
+        let names = collect_rule_read_names(rule);
+        let mut out: Vec<&Resource> = Vec::with_capacity(names.len());
+        for name in &names {
+            let r = all_resources.get(name.as_str()).ok_or_else(|| NativeError {
+                message: format!(
+                    "rule '{}' reads resource '{}' but no top-level `resource {}` was declared",
+                    rule.name, name, name
+                ),
+            })?;
+            out.push(*r);
+        }
+        out
+    };
+    let resource_extra_bytes: i32 = referenced_resources
+        .iter()
+        .map(|r| 16 + (((r.max_bytes as i32) + 7) & !7))
+        .sum();
+    let frame_size = (frame_slots as i32) * 8 + resource_extra_bytes;
     let acc_offset: i32 = -((frame_slots as i32) * 8);
 
     let mut code = Vec::new();
+    // Resource open/read failure jumps land here (patched at the end).
+    let mut resource_abort_patches: Vec<usize> = Vec::new();
+    // text_bindings populated by the prologue and threaded through the
+    // body's emit_eval_expr — `req.tag == read(allowlist)` resolves via
+    // the new BinOp::Eq Field-vs-Read path against the registered slots.
+    let mut text_bindings: TextBindings<'_> = HashMap::new();
 
     // _start — argv/rbp frame setup.
     code.extend_from_slice(&[0x4C, 0x8B, 0x24, 0x24]); // mov r12, [rsp]
@@ -4626,6 +4657,23 @@ fn emit_fold_program(
     code.extend_from_slice(&[0x48, 0x81, 0xEC]);
     code.extend_from_slice(&frame_size.to_le_bytes());
     code.extend_from_slice(&[0x49, 0xC7, 0xC6, 0x01, 0x00, 0x00, 0x00]); // mov r14, 1
+
+    // Slice 9.5d: emit each resource read sequence ABOVE the outer loop —
+    // (ptr, len) survive every record and every element. First slot starts
+    // immediately below acc_slot (the existing bottom of the frame).
+    {
+        let mut next_slot: i32 = acc_offset - 8;
+        for r in &referenced_resources {
+            let (ptr_slot, len_slot, _buf_slot, new_next) = emit_resource_read_sequence(
+                &mut code,
+                r,
+                next_slot,
+                &mut resource_abort_patches,
+            );
+            text_bindings.insert(r.name.as_str(), (ptr_slot, len_slot));
+            next_slot = new_next;
+        }
+    }
 
     // Outer loop — one input record per iteration.
     let outer_loop_top = code.len();
@@ -4667,7 +4715,7 @@ fn emit_fold_program(
     let mut let_offsets: HashMap<&str, i32> = scalar_offsets.clone();
     let mut next_let_slot = -(((n_scalar + n_elem_fields) as i32 + 1) * 8);
     for (name, expr) in &rule.logic.bindings {
-        emit_eval_expr(&mut code, expr, &rule.input_name, &let_offsets, all_rules, &field_ranges_for_lets, &no_text_bindings())?;
+        emit_eval_expr(&mut code, expr, &rule.input_name, &let_offsets, all_rules, &field_ranges_for_lets, &text_bindings)?;
         store_rax_at_rbp(&mut code, next_let_slot);
         let_offsets.insert(name.as_str(), next_let_slot);
         next_let_slot -= 8;
@@ -4716,7 +4764,7 @@ fn emit_fold_program(
     // Evaluate the fold body; result is the NEW accumulator value in rax.
     // item_name is the "input" for field access resolution within the body.
     let field_ranges = build_field_ranges(elem_concept);
-    emit_eval_expr(&mut code, body, item_name, &body_offsets, all_rules, &field_ranges, &no_text_bindings())?;
+    emit_eval_expr(&mut code, body, item_name, &body_offsets, all_rules, &field_ranges, &text_bindings)?;
     store_rax_at_rbp(&mut code, acc_offset);
 
     // dec r15 ; jmp inner_loop_top (rel32).
@@ -4763,6 +4811,20 @@ fn emit_fold_program(
     code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x3C, 0x00, 0x00, 0x00]); // mov rax, 60
     code.extend_from_slice(&[0x48, 0x31, 0xFF]); // xor rdi, rdi
     code.extend_from_slice(&[0x0F, 0x05]); // syscall
+
+    // Slice 9.5d: shared abort label for resource open/read failures.
+    // Only emitted when at least one resource was read; resource-free
+    // programs pay zero bytes.
+    if !resource_abort_patches.is_empty() {
+        let abort_label = code.len();
+        for site in &resource_abort_patches {
+            let rel = abort_label as i32 - (*site as i32 + 4);
+            code[*site..*site + 4].copy_from_slice(&rel.to_le_bytes());
+        }
+        code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x3C, 0x00, 0x00, 0x00]); // mov rax, 60
+        code.extend_from_slice(&[0x48, 0xC7, 0xC7, 0x01, 0x00, 0x00, 0x00]); // mov rdi, 1
+        code.extend_from_slice(&[0x0F, 0x05]);                               // syscall
+    }
 
     Ok(code)
 }
@@ -11372,6 +11434,69 @@ mod tests {
         );
 
         let _ = fs::remove_file(out);
+    }
+
+    /// Phase 9 slice 9.5d (2026-04-28): `read(<resource>)` allowed inside
+    /// the body of a Phase 4 number fold (sum/count/min/max). Composes
+    /// with the new BoundText text-equality path so a body like
+    /// `if o.tag == read(target) then o.amount else 0` filters by a
+    /// runtime-loaded reference. Resource read once at startup; (ptr,
+    /// len) survive every record AND every element via the new
+    /// resource block at the bottom of the fold frame.
+    ///
+    /// This test pins:
+    ///   (a) sum picks up only matching tags
+    ///   (b) editing the file between invocations changes the result
+    ///   (c) empty target file → 0 matches → 0 sum
+    ///   (d) missing file → fail-closed (exit 1, no stdout)
+    #[test]
+    fn slice_9_5d_number_fold_with_read_in_body() {
+        use std::process::Command;
+        let target_path = "/tmp/verbosec_test_slice95d_target.txt";
+        std::fs::write(target_path, b"PROD").expect("write target");
+
+        let src = std::fs::read_to_string("examples/sum_by_tag.verbose")
+            .expect("examples/sum_by_tag.verbose is expected to exist");
+        let src = src.replace("/tmp/verbose_target_tag.txt", target_path);
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+
+        let out = std::env::temp_dir().join("verbosec_test_slice95d_sum_by_tag");
+        compile_native(&program, "sum_for_target", out.to_str().unwrap(), false, false)
+            .expect("Phase 4 fold with body Read should compile");
+
+        let run = || -> String {
+            let r = Command::new(&out)
+                .args(["4", "PROD", "100", "DEV", "50", "PROD", "200", "STAGING", "75"])
+                .output()
+                .expect("spawn");
+            String::from_utf8_lossy(&r.stdout).trim_end_matches('\n').to_string()
+        };
+
+        // (a) target=PROD → sum = 100 + 200 = 300
+        assert_eq!(run(), "300", "PROD sum should be 300");
+
+        // (b) change file → STAGING → sum = 75
+        std::fs::write(target_path, b"STAGING").expect("update target");
+        assert_eq!(run(), "75", "after target change, STAGING sum should be 75");
+
+        // (c) empty target → no orders match → 0
+        std::fs::write(target_path, b"").expect("empty target");
+        assert_eq!(run(), "0", "empty target should match nothing");
+
+        // (d) missing file → exit 1
+        let _ = std::fs::remove_file(target_path);
+        let abort = Command::new(&out)
+            .args(["1", "PROD", "100"])
+            .output()
+            .expect("spawn abort");
+        assert!(
+            !abort.status.success() && abort.stdout.is_empty(),
+            "missing-file run should exit non-zero with empty stdout"
+        );
+
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_file(target_path);
     }
 
     /// Slice "text equality with bound RHS" (2026-04-28): native text

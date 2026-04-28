@@ -158,6 +158,12 @@ examples/
                    ~970 B native binary; on_read_error: abort exits 1 if
                    the file is missing. First Verbose binary that reads a
                    resource from inside a collection-emitting rule.
+  sum_by_tag.*     Phase 9 slice 9.5d (2026-04-28): `read(<resource>)` in
+                   the body of a Phase 4 number fold, composed with the
+                   new BoundText text-equality. `sum(orders, o => if o.tag
+                   == read(target) then o.amount else 0)` filters by a
+                   runtime-loaded reference. ~791 B native binary; pinned
+                   by slice_9_5d_number_fold_with_read_in_body.
   allowlist.*      Slice "text equality with bound RHS" (2026-04-28):
                    native text comparison now accepts `<field> == read(<resource>)`
                    alongside the existing `<field> == "<literal>"` form.
