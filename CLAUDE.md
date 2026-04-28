@@ -158,6 +158,15 @@ examples/
                    ~970 B native binary; on_read_error: abort exits 1 if
                    the file is missing. First Verbose binary that reads a
                    resource from inside a collection-emitting rule.
+  threshold_sum.*  `parse_int(<text>)` primitive (2026-04-28): convert a
+                   text value to a number, abort on invalid input. Composes
+                   with read() so a numeric threshold lives in a file and
+                   can be re-tuned without recompile. `sum(orders, o => if
+                   o.amount > parse_int(read(threshold)) then o.amount
+                   else 0)` — fail-closed twice (missing file + invalid
+                   integer both abort). ~845 B native binary; pinned by
+                   parse_int_runtime_scan_with_read_inner +
+                   parse_int_literal_folds_at_compile_time.
   access_check.*   Phase 9 slice 9.5e (2026-04-28): `read(<resource>)` in
                    the body of a Phase 6 multi-fold (extracted quantifier).
                    `all(events, e => e.role == read(role))` desugars to a
@@ -227,6 +236,7 @@ tools/
 - Result: `Ok(v)` / `Err(e)` constructors; `match_result(r, v => ok_body, e => err_body)` consumer with both arms explicit
 - Record construction: `ConceptName { field: expr, field: expr, ... }` — typed constructor; verifier cross-checks field set + per-field types match the concept declaration
 - Text composition: `concat(e1, e2, ...)` — variadic text builder, scalar args only (number → decimal, bool → true/false, text as-is); no operator overloading on `+`, each arg is explicit
+- Text→number conversion: `parse_int(<text>)` — strict scan (optional `-`, then 1+ ASCII digits, then end-of-input); aborts the binary on any other shape (empty input, lone `-`, non-digit byte). Optimizer folds `parse_int("<literal>")` to `Number` at compile time; native runtime path handles `parse_int(read(<resource>))` and other BoundText sources via the same (ptr, len) shape used by Read / Fetch / Phase-2I lets
 - Verifier type check: bidirectional shape check on logic — `Ok`/`Err` rejected outside `Result(...)` context; `Ok(x)`/`Err(e)` content checked against declared arms when inferable; top-level output type checked against declared; conservative on lambda/let-bound vars to avoid false positives
 - General reduction: `fold(collection, initial, acc, var => body)`
 - Proofs: purity (reads/calls), termination (bound)

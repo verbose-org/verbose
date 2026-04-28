@@ -717,6 +717,23 @@ impl Parser {
                 }
                 self.expect_kind(TokenKind::RParen)?;
                 Ok(Expr::JsonEscape(Box::new(inner)))
+            } else if name == "parse_int" && self.check_kind(&TokenKind::LParen) {
+                // Phase 12 (parse_int): parse_int(<text_expr>) — strict
+                // text-to-number conversion. Exactly one argument; zero or
+                // two-plus is a parse-time error. The verifier checks that
+                // the inner expression produces text; the runtime fails
+                // closed (sys_exit 1) if the bytes don't form a valid
+                // signed integer.
+                self.advance(); // (
+                if self.check_kind(&TokenKind::RParen) {
+                    return Err(self.error("parse_int requires exactly one argument, got zero"));
+                }
+                let inner = self.parse_expr()?;
+                if self.check_kind(&TokenKind::Comma) {
+                    return Err(self.error("parse_int requires exactly one argument, got more than one"));
+                }
+                self.expect_kind(TokenKind::RParen)?;
+                Ok(Expr::ParseInt(Box::new(inner)))
             } else if name == "match_result" && self.check_kind(&TokenKind::LParen) {
                 // match_result(target, ok_var => ok_body, err_var => err_body)
                 // The Result consumer. Both arms are explicit — no implicit

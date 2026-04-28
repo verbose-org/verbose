@@ -239,20 +239,23 @@ ships the worked example (1572-byte binary).
     — composes with the new BoundText text-equality
     (`field == read(...)`) shipped same-day; supports
     `all`/`any` quantifiers filtered by a runtime-loaded reference.
-  Only one emitter remains, structurally blocked by an UNRELATED
-  language gap: `read()` in `emit_parallel_program`. The parallel
-  emitter assumes every input field is `number` (the per-record
-  parse loop unconditionally `atoi`s each argv slot), so there is
-  currently no useful body shape for `Read`. The text-equality
-  fast path (`field == read(...)`) requires a text field; the
-  number context rejects `Read` outright. To unlock 9.5f, either:
-  (a) extend the parallel emitter to handle text input fields
-  (would let `text_field == read(target)` work), OR (b) add a
-  `parse_int(read(...))` primitive (would let
-  `field > parse_int(read(threshold))` work). Both are larger
-  slices on their own. The plumbing change for 9.5f itself is
-  ~80 LOC mechanical, but landing it without a worked example
-  would be infrastructure for nobody — deferred.
+  Path (b) of two unblockers SHIPPED 2026-04-28: `parse_int(<text>)`
+  primitive lands `parse_int(read(threshold))` as a number expression
+  in any emitter that has resource-aware text_bindings. This means
+  9.5f is no longer "useful body shape: nothing"; it now has at
+  least `if field > parse_int(read(threshold)) then ... else ...`.
+  Still pending: the plumbing change inside `emit_parallel_program`
+  itself (~80 LOC: thread text_bindings into the body emit_eval_expr
+  + add the resource prologue between rbp frame setup and array
+  allocation, with r15 saved across the resource read since
+  emit_resource_read_sequence reuses r15 as the file fd). Worked
+  example would be `parallel_threshold.verbose` mirroring
+  `threshold_sum.verbose` but with `parallel: "..."` hint. One
+  remaining design call: whether parallel rules WITH per-record
+  resource access make sense (each worker reads the same buffer
+  via COW so the read is shared, but the conceptual "parallel
+  rule that depends on shared state" deserves a deliberate accept
+  rather than a drift).
 - **Multiple resources composing in a single concat in service
   handlers.** Single-resource handler bodies tested; multi-resource
   in one expression should work via text_bindings but isn't covered

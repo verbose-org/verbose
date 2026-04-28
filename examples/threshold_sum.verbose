@@ -1,0 +1,60 @@
+@verbose 0.1.0
+
+-- parse_int(<text>) primitive (2026-04-28): convert a text value to
+-- a number, abort on invalid input. Composes with read() so a numeric
+-- threshold can live in a file and be re-tuned without recompile.
+--
+-- Two layers of fail-closed posture:
+--   1. on_read_error: abort on the resource — missing file → exit 1
+--   2. parse_int aborts if the file's bytes aren't a valid integer
+--      (empty input, lone '-', non-digit, '-' alone, etc.)
+-- The operator gets a binary that either runs cleanly with a
+-- well-formed threshold file, or fails loudly. No silent miscompute
+-- on bad config.
+
+
+resource threshold
+  @intention: "Numeric threshold; orders strictly above this contribute to the sum"
+  @source: threshold_sum.intent:1
+
+  path: "/tmp/verbose_threshold.txt"
+  max:  32
+  on_read_error: abort
+
+
+concept Order
+  @intention: "An order has an amount"
+  @source: threshold_sum.intent:1
+
+  fields:
+    amount : number [0, 1000000]
+
+
+concept Batch
+  @intention: "A batch is a collection of orders"
+  @source: threshold_sum.intent:1
+
+  fields:
+    orders : collection(Order)
+
+
+rule sum_above_threshold
+  @intention: "Sum the amounts strictly greater than the runtime-loaded threshold"
+  @source: threshold_sum.intent:1
+
+  input:
+    b : Batch
+
+  output:
+    total : number
+
+  logic:
+    total = sum(b.orders, o => if o.amount > parse_int(read(threshold)) then o.amount else 0)
+
+  proofs:
+    purity:
+      reads : [b.orders, threshold]
+      calls : []
+
+    termination:
+      bound : 6

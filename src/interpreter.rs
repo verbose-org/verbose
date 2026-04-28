@@ -517,6 +517,31 @@ fn eval_expr(
                 }),
             }
         }
+        // Phase 12 (parse_int): pure transform — evaluate inner, then
+        // parse with strict semantics (trim whitespace, then i64 parse).
+        // On parse failure, return an interpreter error in the same shape
+        // as json_escape's type mismatch — fail-closed posture mirrors the
+        // native sys_exit(1) abort.
+        Expr::ParseInt(inner) => {
+            let v = eval_expr(inner, env, all_rules)?;
+            match v {
+                Value::Text(s) => match s.trim().parse::<i64>() {
+                    Ok(n) => Ok(Value::Number(n)),
+                    Err(_) => Err(RuntimeError {
+                        message: format!(
+                            "parse_int could not parse {:?} as a number",
+                            s
+                        ),
+                    }),
+                },
+                other => Err(RuntimeError {
+                    message: format!(
+                        "parse_int requires a text value, got {}",
+                        other
+                    ),
+                }),
+            }
+        }
     }
 }
 

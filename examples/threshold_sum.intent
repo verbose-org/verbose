@@ -1,0 +1,1 @@
+1. A rule that takes a collection of orders and returns the sum of amounts strictly greater than a threshold loaded as a number from a file at startup. The threshold can be edited between binary invocations without recompiling. If the threshold file is missing, or its content isn't a valid integer, the binary aborts before producing any output.

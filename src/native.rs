@@ -470,6 +470,10 @@ fn let_rhs_is_text(
         // text-let path (two slots, BoundText resolution at use sites)
         // rather than the number-let path.
         Expr::JsonEscape(_) => true,
+        // Phase 12 (parse_int): output type is number, not text. The text
+        // classifier returns false so let-bindings pointing at parse_int
+        // land in the number-let path (single slot).
+        Expr::ParseInt(_) => false,
         _ => false,
     }
 }
@@ -535,6 +539,8 @@ fn collect_read_names_native(expr: &Expr, out: &mut Vec<String>) {
         Expr::Fetch(_, req) => collect_read_names_native(req, out),
         // Phase 12 (json_escape): pure pass-through.
         Expr::JsonEscape(inner) => collect_read_names_native(inner, out),
+        // Phase 12 (parse_int): pure pass-through.
+        Expr::ParseInt(inner) => collect_read_names_native(inner, out),
     }
 }
 
@@ -608,6 +614,8 @@ fn collect_fetch_names_native(expr: &Expr, out: &mut Vec<String>) {
         }
         // Phase 12 (json_escape): pure pass-through.
         Expr::JsonEscape(inner) => collect_fetch_names_native(inner, out),
+        // Phase 12 (parse_int): pure pass-through.
+        Expr::ParseInt(inner) => collect_fetch_names_native(inner, out),
     }
 }
 
@@ -866,6 +874,8 @@ fn emit_connection_fetch_sequence(
             Expr::Fetch(_, req) => first_fetch_for(req, name),
             // Phase 12 (json_escape): pass-through.
             Expr::JsonEscape(inner) => first_fetch_for(inner, name),
+            // Phase 12 (parse_int): pass-through.
+            Expr::ParseInt(inner) => first_fetch_for(inner, name),
         }
     }
     let request_expr: &Expr = {
@@ -6336,6 +6346,9 @@ fn max_stack_depth(expr: &Expr) -> usize {
         // existing concat write pointer (rbx), no additional eval-stack
         // pushes beyond what the inner already needs.
         Expr::JsonEscape(inner) => max_stack_depth(inner),
+        // Phase 12 (parse_int): same shape — the parse loop is fixed-
+        // register, so the inner's depth dominates.
+        Expr::ParseInt(inner) => max_stack_depth(inner),
     }
 }
 
@@ -6934,7 +6947,175 @@ fn emit_eval_expr(
         Expr::JsonEscape(_) => Err(NativeError {
             message: "Expr::JsonEscape in number context — json_escape() returns text, use it in a text-typed position".into(),
         }),
+        // parse_int(<text>) — convert a runtime-loaded text value to a
+        // number. Inner must produce a (ptr, len) pair we can scan; the
+        // strict scan accepts an optional leading `-`, then 1+ ASCII
+        // digits, then end-of-input. Anything else (empty input,
+        // whitespace, non-digit, lone `-`, overflow not yet checked)
+        // sys_exit(1)s the binary — same fail-closed posture as
+        // `on_read_error: abort`. Self-contained: the abort sequence is
+        // emitted inline at the end of this branch (no per-binary
+        // patches needed), so callers don't need any new bookkeeping.
+        Expr::ParseInt(inner) => emit_parse_int(code, inner.as_ref(), text_bindings, offsets),
     }
+}
+
+/// Slice "parse_int": resolve the inner text expression to (rsi=ptr,
+/// rcx=len), then run the strict scan into rax. Self-contained — the
+/// abort tail is inlined at the end of the emitted sequence.
+///
+/// Inner is restricted to text-producing shapes whose (ptr, len) live
+/// in stable rbp slots:
+///   - `Expr::Read(name)`  — resource buffer + len from the prologue
+///   - `Expr::Ident(name)` with a text_bindings entry — Phase 2I lets
+///                                                       and Fetch
+///   - `Expr::Fetch(name, _)` — connection response (ptr, len)
+///
+/// Other shapes (Field text via argv, Concat, Call, JsonEscape) would
+/// need either a strlen pre-pass or a per-call scratch buffer. They
+/// can be added in a follow-up; the dominant use case is parse_int(read(...)).
+fn emit_parse_int(
+    code: &mut Vec<u8>,
+    inner: &Expr,
+    text_bindings: &TextBindings<'_>,
+    _offsets: &HashMap<&str, i32>,
+) -> Result<(), NativeError> {
+    // Step 1: resolve (ptr_slot, len_slot) for the inner.
+    let (ptr_slot, len_slot) = match inner {
+        Expr::Read(name) | Expr::Ident(name) | Expr::Fetch(name, _) => {
+            *text_bindings.get(name.as_str()).ok_or_else(|| NativeError {
+                message: format!(
+                    "parse_int: inner expression references '{}' but no (ptr, len) slots are registered \
+                     at this point — the resource/connection/let must be visible in the surrounding scope",
+                    name
+                ),
+            })?
+        }
+        _ => {
+            return Err(NativeError {
+                message: format!(
+                    "parse_int: inner must be a text reference with bound (ptr, len) — \
+                     got {:?}. Supported today: read(<resource>), Ident(<text-let>), \
+                     fetch(<connection>, ...). Field-text/concat/call/json_escape parse_int \
+                     can be added in a follow-up slice.",
+                    expr_kind(inner)
+                ),
+            });
+        }
+    };
+
+    // Step 2: load (rsi=ptr, rcx=len) from the bound slots.
+    // mov rsi, [rbp + ptr_slot]
+    if ptr_slot >= -128 {
+        code.extend_from_slice(&[0x48, 0x8B, 0x75]);
+        code.push(ptr_slot as u8);
+    } else {
+        code.extend_from_slice(&[0x48, 0x8B, 0xB5]);
+        code.extend_from_slice(&ptr_slot.to_le_bytes());
+    }
+    // mov rcx, [rbp + len_slot]
+    if len_slot >= -128 {
+        code.extend_from_slice(&[0x48, 0x8B, 0x4D]);
+        code.push(len_slot as u8);
+    } else {
+        code.extend_from_slice(&[0x48, 0x8B, 0x8D]);
+        code.extend_from_slice(&len_slot.to_le_bytes());
+    }
+
+    // Step 3: empty input → abort (parse_int requires at least one digit).
+    // test rcx, rcx ; je .pi_abort
+    code.extend_from_slice(&[0x48, 0x85, 0xC9]);
+    code.push(0x0F);
+    code.push(0x84);
+    let empty_abort_patch = code.len();
+    code.extend_from_slice(&[0; 4]);
+
+    // Step 4: optional leading '-'. r8b = sign flag (1 if negative).
+    // xor r8d, r8d
+    code.extend_from_slice(&[0x45, 0x31, 0xC0]);
+    // mov al, [rsi]
+    code.extend_from_slice(&[0x8A, 0x06]);
+    // cmp al, '-'
+    code.extend_from_slice(&[0x3C, 0x2D]);
+    // jne .digits_init — patched after we know the consume-minus block size.
+    code.push(0x75);
+    let skip_minus_patch = code.len();
+    code.push(0x00);
+    // Consume-minus block: inc rsi (3) + dec rcx (3) + mov r8b, 1 (3) = 9 bytes.
+    code.extend_from_slice(&[0x48, 0xFF, 0xC6]); // inc rsi
+    code.extend_from_slice(&[0x48, 0xFF, 0xC9]); // dec rcx
+    code.extend_from_slice(&[0x41, 0xB0, 0x01]); // mov r8b, 1
+    // Patch the jne to skip exactly the consume-minus block.
+    let after_consume = code.len();
+    code[skip_minus_patch] = (after_consume - skip_minus_patch - 1) as u8;
+    // .digits_init:
+    // After consuming minus, rcx may have hit 0 → '-' alone is invalid.
+    // test rcx, rcx ; je .pi_abort
+    code.extend_from_slice(&[0x48, 0x85, 0xC9]);
+    code.push(0x0F);
+    code.push(0x84);
+    let lone_minus_abort_patch = code.len();
+    code.extend_from_slice(&[0; 4]);
+
+    // Step 5: scan loop.
+    // xor rax, rax  (accumulator)
+    code.extend_from_slice(&[0x48, 0x31, 0xC0]);
+    let loop_top = code.len();
+    // movzx rdx, byte [rsi]
+    code.extend_from_slice(&[0x48, 0x0F, 0xB6, 0x16]);
+    // sub rdx, '0'
+    code.extend_from_slice(&[0x48, 0x83, 0xEA, 0x30]);
+    // cmp rdx, 9 ; ja .pi_abort
+    code.extend_from_slice(&[0x48, 0x83, 0xFA, 0x09]);
+    code.push(0x0F);
+    code.push(0x87);
+    let nondigit_abort_patch = code.len();
+    code.extend_from_slice(&[0; 4]);
+    // imul rax, rax, 10  (3-operand form, 4 bytes)
+    code.extend_from_slice(&[0x48, 0x6B, 0xC0, 0x0A]);
+    // add rax, rdx
+    code.extend_from_slice(&[0x48, 0x01, 0xD0]);
+    // inc rsi ; dec rcx ; jnz loop_top
+    code.extend_from_slice(&[0x48, 0xFF, 0xC6]);
+    code.extend_from_slice(&[0x48, 0xFF, 0xC9]);
+    // jnz rel32 back to loop_top
+    code.push(0x0F);
+    code.push(0x85);
+    let back_off = loop_top as i32 - (code.len() + 4) as i32;
+    code.extend_from_slice(&back_off.to_le_bytes());
+
+    // Step 6: apply sign.
+    // test r8b, r8b ; je .pi_done
+    code.extend_from_slice(&[0x45, 0x84, 0xC0]);
+    code.push(0x74);
+    code.push(0x03);  // skip the 3-byte neg
+    // neg rax
+    code.extend_from_slice(&[0x48, 0xF7, 0xD8]);
+
+    // jmp .pi_done (skip the abort tail)
+    code.push(0xEB);
+    let done_jmp_patch = code.len();
+    code.push(0x00);
+
+    // .pi_abort: sys_exit(1) — fail-closed on any parse error.
+    let pi_abort_label = code.len();
+    code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x3C, 0x00, 0x00, 0x00]); // mov rax, 60
+    code.extend_from_slice(&[0x48, 0xC7, 0xC7, 0x01, 0x00, 0x00, 0x00]); // mov rdi, 1
+    code.extend_from_slice(&[0x0F, 0x05]);                               // syscall
+
+    // Patch the three abort jumps to land at .pi_abort.
+    let off = pi_abort_label as i32 - (empty_abort_patch as i32 + 4);
+    code[empty_abort_patch..empty_abort_patch + 4].copy_from_slice(&off.to_le_bytes());
+    let off = pi_abort_label as i32 - (lone_minus_abort_patch as i32 + 4);
+    code[lone_minus_abort_patch..lone_minus_abort_patch + 4].copy_from_slice(&off.to_le_bytes());
+    let off = pi_abort_label as i32 - (nondigit_abort_patch as i32 + 4);
+    code[nondigit_abort_patch..nondigit_abort_patch + 4].copy_from_slice(&off.to_le_bytes());
+
+    // .pi_done: rax holds the parsed (signed) value.
+    let pi_done_label = code.len();
+    code[done_jmp_patch] = (pi_done_label - done_jmp_patch - 1) as u8;
+
+    Ok(())
 }
 
 /// Inline atoi: parse null-terminated decimal string at rdi into rax.
@@ -8625,6 +8806,7 @@ fn expr_kind(e: &Expr) -> &'static str {
         Expr::Read(_) => "Read",
         Expr::Fetch(_, _) => "Fetch",
         Expr::JsonEscape(_) => "JsonEscape",
+        Expr::ParseInt(_) => "ParseInt",
     }
 }
 
@@ -11490,6 +11672,160 @@ mod tests {
         );
 
         let _ = fs::remove_file(out);
+    }
+
+    /// `parse_int(<text>)` primitive (2026-04-28): convert a text
+    /// value to a number with strict scan + fail-closed abort. Inner
+    /// must reference a text source whose (ptr, len) live in stable
+    /// rbp slots — `read(<resource>)`, `Ident(<text-let>)`, or
+    /// `fetch(<connection>, _)`. The optimizer compile-time-folds
+    /// `parse_int("<literal>")` to `Number(<parsed>)` so that path
+    /// never reaches native; this test focuses on the runtime scan
+    /// triggered by `parse_int(read(threshold))`.
+    ///
+    /// Pins:
+    ///   (a) valid positive integer → correct sum
+    ///   (b) edit file between invocations → updated result
+    ///   (c) "0" → all orders contribute
+    ///   (d) negative integer → all orders contribute (sign handled)
+    ///   (e) non-digit content → exit 1, no stdout
+    ///   (f) empty file → exit 1
+    ///   (g) lone "-" → exit 1
+    ///   (h) missing file → exit 1 (resource read aborts before parse_int runs)
+    #[test]
+    fn parse_int_runtime_scan_with_read_inner() {
+        use std::process::Command;
+        let path = "/tmp/verbosec_test_parse_int_threshold.txt";
+        std::fs::write(path, b"100").expect("write threshold");
+
+        let src = std::fs::read_to_string("examples/threshold_sum.verbose")
+            .expect("examples/threshold_sum.verbose is expected to exist");
+        let src = src.replace("/tmp/verbose_threshold.txt", path);
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+
+        let out = std::env::temp_dir().join("verbosec_test_parse_int_threshold");
+        compile_native(&program, "sum_above_threshold", out.to_str().unwrap(), false, false)
+            .expect("parse_int(read(...)) should compile");
+
+        let run = || -> std::process::Output {
+            Command::new(&out)
+                .args(["4", "50", "150", "200", "75"])
+                .output()
+                .expect("spawn")
+        };
+        let stdout_of = |o: &std::process::Output| -> String {
+            String::from_utf8_lossy(&o.stdout).trim_end_matches('\n').to_string()
+        };
+
+        // (a) threshold=100 → 150 + 200 = 350
+        let r = run();
+        assert!(r.status.success() && stdout_of(&r) == "350", "threshold=100: {:?}", stdout_of(&r));
+
+        // (b) threshold=200 → none strictly above → 0
+        std::fs::write(path, b"200").expect("update");
+        let r = run();
+        assert!(r.status.success() && stdout_of(&r) == "0", "threshold=200: {:?}", stdout_of(&r));
+
+        // (c) threshold=0 → 50+150+200+75 = 475
+        std::fs::write(path, b"0").expect("update");
+        let r = run();
+        assert!(r.status.success() && stdout_of(&r) == "475", "threshold=0: {:?}", stdout_of(&r));
+
+        // (d) threshold=-1 → 475
+        std::fs::write(path, b"-1").expect("update");
+        let r = run();
+        assert!(r.status.success() && stdout_of(&r) == "475", "threshold=-1: {:?}", stdout_of(&r));
+
+        // (e) non-digit → exit 1, empty stdout
+        std::fs::write(path, b"abc").expect("update");
+        let r = Command::new(&out).args(["1", "50"]).output().expect("spawn");
+        assert!(!r.status.success() && r.stdout.is_empty(), "non-digit should abort");
+
+        // (f) empty file
+        std::fs::write(path, b"").expect("empty");
+        let r = Command::new(&out).args(["1", "50"]).output().expect("spawn");
+        assert!(!r.status.success() && r.stdout.is_empty(), "empty file should abort");
+
+        // (g) lone "-"
+        std::fs::write(path, b"-").expect("update");
+        let r = Command::new(&out).args(["1", "50"]).output().expect("spawn");
+        assert!(!r.status.success() && r.stdout.is_empty(), "lone minus should abort");
+
+        // (h) missing file → resource read aborts first (covered by slice 9.1
+        // semantics, but worth pinning here so we know the chain is intact)
+        let _ = std::fs::remove_file(path);
+        let r = Command::new(&out).args(["1", "50"]).output().expect("spawn");
+        assert!(!r.status.success() && r.stdout.is_empty(), "missing file should abort");
+
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// `parse_int("<literal>")` is folded by the optimizer to
+    /// `Number(<parsed>)` BEFORE native sees the AST. This test pins
+    /// that the runtime scan loop is NOT emitted for literal-arg
+    /// calls — the resulting binary should be compact (no per-call
+    /// scan + abort tail).
+    #[test]
+    fn parse_int_literal_folds_at_compile_time() {
+        use std::fs;
+        let src = r#"@verbose 0.1.0
+
+concept T
+  @intention: "trivial"
+  @source: invoices.intent:1
+  fields:
+    x : number
+
+rule lit
+  @intention: "literal parse_int folded"
+  @source: invoices.intent:1
+  input:
+    t : T
+  output:
+    n : number
+  logic:
+    n = parse_int("42") + t.x
+  proofs:
+    purity:
+      reads : [t.x]
+      calls : []
+    termination:
+      bound : 2
+"#;
+        let tokens = crate::lexer::Lexer::new(src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+        // Mirror the CLI flow: optimizer runs before native dispatch so
+        // `parse_int("42")` is folded to `Number(42)` BEFORE this compile
+        // sees it. Without this step, the test would exercise the runtime
+        // scan loop (which doesn't accept Text inner) and miss the point
+        // of the fold.
+        let (program, _) = crate::optimizer::optimize_program(&program);
+        let out = std::env::temp_dir().join("verbosec_test_parse_int_literal_fold");
+        compile_native(&program, "lit", out.to_str().unwrap(), false, false)
+            .expect("literal parse_int should compile");
+
+        // Run with t.x = 8; expect 42 + 8 = 50.
+        let r = std::process::Command::new(&out)
+            .args(["8"])
+            .output()
+            .expect("spawn");
+        assert!(r.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&r.stdout).trim_end_matches('\n'),
+            "50"
+        );
+
+        // Tight binary: literal fold means no scan loop, no abort tail.
+        let size = fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
+        assert!(
+            size < 600,
+            "literal-fold binary should stay tight (under 600 B); got {}",
+            size
+        );
+
+        let _ = fs::remove_file(&out);
     }
 
     /// Phase 9 slice 9.5e (2026-04-28): `read(<resource>)` inside the

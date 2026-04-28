@@ -214,8 +214,9 @@ fn emit_expr(expr: &Expr, input_name: &str, concept: Option<&Concept>) -> String
         | Expr::Concat(_)
         | Expr::Read(_)
         | Expr::Fetch(_, _)
-        | Expr::JsonEscape(_) => {
-            "(/* collection/result/record/concat/read/fetch/json_escape op: use --run interpreter or --native */false)".to_string()
+        | Expr::JsonEscape(_)
+        | Expr::ParseInt(_) => {
+            "(/* collection/result/record/concat/read/fetch/json_escape/parse_int op: use --run interpreter or --native */false)".to_string()
         }
         Expr::Call(name, _args) => {
             if let Some(c) = concept {

@@ -317,6 +317,9 @@ fn collect_read_names(expr: &Expr, out: &mut Vec<String>) {
         // inner expression so any read(...) embedded in the source text
         // is still collected.
         Expr::JsonEscape(inner) => collect_read_names(inner, out),
+        // Phase 12 (parse_int): pure pass-through — recurse into the inner
+        // text expression (which is typically `read(...)` itself).
+        Expr::ParseInt(inner) => collect_read_names(inner, out),
     }
 }
 
@@ -401,6 +404,8 @@ fn collect_fetch_names(expr: &Expr, out: &mut Vec<String>) {
         // inner expression so any fetch(...) embedded in the source text
         // is still collected.
         Expr::JsonEscape(inner) => collect_fetch_names(inner, out),
+        // Phase 12 (parse_int): pure pass-through.
+        Expr::ParseInt(inner) => collect_fetch_names(inner, out),
     }
 }
 
@@ -459,6 +464,8 @@ fn collect_fetch_names_with_dups(expr: &Expr, out: &mut Vec<String>) {
         }
         // Phase 12 (json_escape): pure pass-through.
         Expr::JsonEscape(inner) => collect_fetch_names_with_dups(inner, out),
+        // Phase 12 (parse_int): pure pass-through.
+        Expr::ParseInt(inner) => collect_fetch_names_with_dups(inner, out),
     }
 }
 
@@ -873,8 +880,23 @@ fn log_content_type(
                 )),
             }
         }
+        // Phase 12 (parse_int): inner must be text; output is number. Same
+        // shape as JsonEscape, but the produced type is Number — a literal
+        // `parse_int(...)` inside a log content is an unusual but legal way
+        // to lift a textual count into a numeric position.
+        Expr::ParseInt(inner) => {
+            let inner_ty = log_content_type(inner, req_concept, resp_concept)
+                .map_err(|m| format!("parse_int arg: {}", m))?;
+            match inner_ty {
+                Type::Text => Ok(Type::Number),
+                other => Err(format!(
+                    "parse_int arg has type '{}'; parse_int only accepts text",
+                    type_display(&other),
+                )),
+            }
+        }
         other => Err(format!(
-            "expression `{}` is not allowed in a log content; allowed: text/number literals, `req.field`, `resp.field`, `concat(...)`, `json_escape(...)`",
+            "expression `{}` is not allowed in a log content; allowed: text/number literals, `req.field`, `resp.field`, `concat(...)`, `json_escape(...)`, `parse_int(...)`",
             describe_expr_kind(other)
         )),
     }
@@ -905,6 +927,7 @@ fn describe_expr_kind(e: &Expr) -> &'static str {
         Expr::Read(_) => "read",
         Expr::Fetch(_, _) => "fetch",
         Expr::JsonEscape(_) => "json_escape",
+        Expr::ParseInt(_) => "parse_int",
     }
 }
 
@@ -1216,6 +1239,21 @@ fn check_expr_against(
                 ),
             });
         }
+        // Phase 12 (parse_int): mirrors JsonEscape's structure but the
+        // outer-context type is Number (parse_int returns a number). Inner
+        // must still produce text.
+        (Expr::ParseInt(inner), Type::Number) => {
+            check_expr_against(inner, &Type::Text, rule, all_rules, input_concept, all_concepts, errors);
+        }
+        (Expr::ParseInt(_), other) => {
+            errors.push(VerifyError {
+                context: format!("rule '{}' / logic", rule.name),
+                message: format!(
+                    "parse_int produces number but the expected type is '{}'",
+                    type_display(other),
+                ),
+            });
+        }
         (Expr::MatchResult(_target, _, ok_body, _, err_body), _) => {
             // Both arms must produce `expected`. The target should be a Result —
             // checking that requires inferring through lambda bindings, which
@@ -1407,6 +1445,9 @@ fn infer_expr_type(
         // inner expression's text-ness is enforced by check_expr_against;
         // here we only need the outer type for inference.
         Expr::JsonEscape(_) => Some(Type::Text),
+        // Phase 12 (parse_int): parse_int(<text>) returns number. Inner
+        // text-ness enforced by check_expr_against.
+        Expr::ParseInt(_) => Some(Type::Number),
         // Map/Filter/Fold/Ok/Err/MatchResult: deferred until lambda binding
         // tracking lands. Returning None means we do not check; we also do not
         // falsely accept.
@@ -1702,6 +1743,11 @@ fn collect_expr_facts(
         Expr::JsonEscape(inner) => {
             collect_expr_facts(inner, reads, calls);
         }
+        // Phase 12 (parse_int): pure pass-through. The transform itself
+        // makes no syscalls; the inner expression's facts are the facts.
+        Expr::ParseInt(inner) => {
+            collect_expr_facts(inner, reads, calls);
+        }
     }
 }
 
@@ -1893,6 +1939,9 @@ fn count_operations(expr: &Expr) -> usize {
         // the cost of evaluating the inner expression. Same shape as
         // Ok/Err's pass-through accounting.
         Expr::JsonEscape(inner) => 1 + count_operations(inner),
+        // Phase 12 (parse_int): same shape as JsonEscape — one op for
+        // the scan/parse loop plus the inner.
+        Expr::ParseInt(inner) => 1 + count_operations(inner),
     }
 }
 

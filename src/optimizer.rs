@@ -59,6 +59,8 @@ fn count_nodes(expr: &Expr) -> usize {
         Expr::Fetch(_, req) => 1 + count_nodes(req),
         // Phase 12 (json_escape): one node + recurse on the inner.
         Expr::JsonEscape(inner) => 1 + count_nodes(inner),
+        // Phase 12 (parse_int): same shape as JsonEscape — one node + recurse.
+        Expr::ParseInt(inner) => 1 + count_nodes(inner),
     }
 }
 
@@ -349,6 +351,10 @@ fn substitute_ident(expr: &Expr, name: &str, replacement: &Expr) -> Expr {
         Expr::JsonEscape(inner) => Expr::JsonEscape(
             Box::new(substitute_ident(inner, name, replacement)),
         ),
+        // Phase 12 (parse_int): substitute through the inner expression.
+        Expr::ParseInt(inner) => Expr::ParseInt(
+            Box::new(substitute_ident(inner, name, replacement)),
+        ),
     }
 }
 
@@ -543,6 +549,20 @@ pub fn optimize_expr(
                 return Expr::Text(escape_json_string(s));
             }
             Expr::JsonEscape(Box::new(inner))
+        }
+        // Phase 12 (parse_int): if the inner is a text literal, fold the
+        // parse at compile time — emits no runtime scan loop, the resulting
+        // Number literal flows through the existing arithmetic machinery.
+        // On parse failure, KEEP `Expr::ParseInt(Box::new(inner))` unchanged
+        // so the runtime path can fail-closed (sys_exit(1) in native).
+        Expr::ParseInt(inner) => {
+            let inner = optimize_expr(inner, input_name, field_ranges);
+            if let Expr::Text(s) = &inner {
+                if let Ok(n) = s.trim().parse::<i64>() {
+                    return Expr::Number(n);
+                }
+            }
+            Expr::ParseInt(Box::new(inner))
         }
     }
 }

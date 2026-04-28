@@ -464,6 +464,16 @@ pub enum Expr {
     /// this slice; `\u00XX` escaping lands in a follow-up if a real use
     /// case appears.
     JsonEscape(Box<Expr>),
+    /// `parse_int(<text_expr>)` — convert a text value to a number.
+    /// Accepted shape: optional leading `-`, then 1+ ASCII digits, then
+    /// end-of-input. Anything else (whitespace, non-digit, empty input)
+    /// aborts the binary with sys_exit(1) — same fail-closed posture as
+    /// `on_read_error: abort`. Introduced so that numbers loaded from a
+    /// file (`parse_int(read(threshold))`) flow into number contexts
+    /// without forcing every caller to wrap in match_result. Native
+    /// emits a strict scan loop length-aware for both NUL-terminated
+    /// argv text and Read-bound (ptr, len) text.
+    ParseInt(Box<Expr>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
