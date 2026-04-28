@@ -1,0 +1,59 @@
+@verbose 0.1.0
+
+-- Slice 9.5e (2026-04-28): `read(<resource>)` inside a Phase 6
+-- multi-fold body — the `all` quantifier desugars to a fold whose
+-- body needs the runtime-loaded allowed_role for filtering.
+--
+-- Composition: emit_multi_fold_program now mirrors emit_fold_program's
+-- prologue (one resource block at the bottom of the frame, slots
+-- survive every record + every element). The new BoundText
+-- text-equality from earlier today resolves `e.role == read(role)`
+-- per element, so `all(events, e => e.role == read(role))` becomes
+-- a single-pass scan with one accumulator slot.
+
+
+resource role
+  @intention: "The role that's currently authorized; reload by editing the file"
+  @source: access_check.intent:1
+
+  path: "/tmp/verbose_allowed_role.txt"
+  max:  64
+  on_read_error: abort
+
+
+concept Event
+  @intention: "An access event has the role of the requester"
+  @source: access_check.intent:1
+
+  fields:
+    role : text
+
+
+concept Stream
+  @intention: "A stream is a collection of access events"
+  @source: access_check.intent:1
+
+  fields:
+    events : collection(Event)
+
+
+rule all_authorized
+  @intention: "True iff every event in the stream is from the runtime-allowed role"
+  @source: access_check.intent:1
+
+  input:
+    s : Stream
+
+  output:
+    ok : bool
+
+  logic:
+    ok = all(s.events, e => e.role == read(role))
+
+  proofs:
+    purity:
+      reads : [s.events, role]
+      calls : []
+
+    termination:
+      bound : 4

@@ -224,7 +224,7 @@ fn compile_native_code(
         emit_record_program(rule, rec_concept, concept, &concepts, &rules, &resources, &connections)?
     } else if matches!(&rule.output_ty, Type::Number | Type::Bool) && contains_quantifier(&rule.logic.value) {
         // Phase 6: scalar output with embedded quantifiers (e.g. if all(...) then X else Y).
-        emit_multi_fold_program(rule, concept, &concepts, &rules)?
+        emit_multi_fold_program(rule, concept, &concepts, &rules, &resources)?
     } else if is_vectorizable && concept.fields.len() == 1 {
         if let Some(threshold) = extract_simple_gt(rule) { emit_vectorized_program(threshold)? } else { emit_full_program(rule, concept, context_concept, &rules, &resources, &connections)? }
     } else if is_parallel {
@@ -4920,6 +4920,7 @@ fn emit_multi_fold_program(
     input_concept: &Concept,
     all_concepts: &[&Concept],
     all_rules: &HashMap<&str, &Rule>,
+    all_resources: &HashMap<&str, &Resource>,
 ) -> Result<Vec<u8>, NativeError> {
     let is_bool_output = matches!(rule.output_ty, Type::Bool);
     if !matches!(rule.output_ty, Type::Number | Type::Bool) {
@@ -4972,15 +4973,43 @@ fn emit_multi_fold_program(
     let n_lets = rule.logic.bindings.len();
     let n_folds = folds.len();
     // Frame: scalars + element fields + let bindings + N accumulator slots
+    //        (+ resource block at the bottom when read() is referenced)
     let frame_slots = n_scalar + n_elem + n_lets + n_folds;
-    let frame_size = (frame_slots as i32) * 8;
 
-    // Accumulator slot offsets (at the bottom of the frame).
+    // Slice 9.5e: enumerate resources the rule reads (same shape as
+    // slice 9.5d). Compose with text equality for filter-by-allowlist
+    // patterns inside `all`/`any` quantifiers.
+    let referenced_resources: Vec<&Resource> = {
+        let names = collect_rule_read_names(rule);
+        let mut out: Vec<&Resource> = Vec::with_capacity(names.len());
+        for name in &names {
+            let r = all_resources.get(name.as_str()).ok_or_else(|| NativeError {
+                message: format!(
+                    "rule '{}' reads resource '{}' but no top-level `resource {}` was declared",
+                    rule.name, name, name
+                ),
+            })?;
+            out.push(*r);
+        }
+        out
+    };
+    let resource_extra_bytes: i32 = referenced_resources
+        .iter()
+        .map(|r| 16 + (((r.max_bytes as i32) + 7) & !7))
+        .sum();
+    let frame_size = (frame_slots as i32) * 8 + resource_extra_bytes;
+
+    // Accumulator slot offsets (at the bottom of the original frame —
+    // i.e. above the resource block, since acc slots get reused inside
+    // the inner loop while resource (ptr, len) live for the whole rule).
     let acc_offsets: Vec<i32> = (0..n_folds)
         .map(|i| -(((n_scalar + n_elem + n_lets + i) as i32 + 1) * 8))
         .collect();
+    let last_acc_offset: i32 = if n_folds == 0 { -((frame_slots as i32) * 8) } else { acc_offsets[n_folds - 1] };
 
     let mut code = Vec::new();
+    let mut resource_abort_patches: Vec<usize> = Vec::new();
+    let mut text_bindings: TextBindings<'_> = HashMap::new();
 
     // _start — argv/rbp frame setup.
     code.extend_from_slice(&[0x4C, 0x8B, 0x24, 0x24]); // mov r12, [rsp]
@@ -4991,6 +5020,21 @@ fn emit_multi_fold_program(
     code.extend_from_slice(&[0x48, 0x81, 0xEC]);
     code.extend_from_slice(&frame_size.to_le_bytes());
     code.extend_from_slice(&[0x49, 0xC7, 0xC6, 0x01, 0x00, 0x00, 0x00]); // mov r14, 1
+
+    // Slice 9.5e: emit each resource read sequence ABOVE the outer loop.
+    {
+        let mut next_slot: i32 = last_acc_offset - 8;
+        for r in &referenced_resources {
+            let (ptr_slot, len_slot, _buf_slot, new_next) = emit_resource_read_sequence(
+                &mut code,
+                r,
+                next_slot,
+                &mut resource_abort_patches,
+            );
+            text_bindings.insert(r.name.as_str(), (ptr_slot, len_slot));
+            next_slot = new_next;
+        }
+    }
 
     // Outer loop — one record per iteration.
     let outer_loop_top = code.len();
@@ -5033,7 +5077,7 @@ fn emit_multi_fold_program(
     let mut let_offsets = scalar_offsets.clone();
     let mut next_let_slot = -(((n_scalar + n_elem) as i32 + 1) * 8);
     for (name, expr) in &rule.logic.bindings {
-        emit_eval_expr(&mut code, expr, &rule.input_name, &let_offsets, all_rules, &field_ranges_for_lets, &no_text_bindings())?;
+        emit_eval_expr(&mut code, expr, &rule.input_name, &let_offsets, all_rules, &field_ranges_for_lets, &text_bindings)?;
         store_rax_at_rbp(&mut code, next_let_slot);
         let_offsets.insert(name.as_str(), next_let_slot);
         next_let_slot -= 8;
@@ -5079,7 +5123,7 @@ fn emit_multi_fold_program(
     // Evaluate each fold body and update its accumulator.
     let field_ranges = build_field_ranges(elem_concept);
     for (i, fold) in folds.iter().enumerate() {
-        emit_eval_expr(&mut code, &fold.body, &fold.item_name, &body_offsets, all_rules, &field_ranges, &no_text_bindings())?;
+        emit_eval_expr(&mut code, &fold.body, &fold.item_name, &body_offsets, all_rules, &field_ranges, &text_bindings)?;
         store_rax_at_rbp(&mut code, acc_offsets[i]);
     }
 
@@ -5110,7 +5154,7 @@ fn emit_multi_fold_program(
     // Evaluate the final scalar expression (quantifiers replaced by Ident refs).
     // Use an empty input name — the expression should only reference __fold_N idents.
     let empty_ranges: HashMap<&str, (i64, i64)> = HashMap::new();
-    emit_eval_expr(&mut code, &scalar_expr, "__phase6_none__", &final_offsets, all_rules, &empty_ranges, &no_text_bindings())?;
+    emit_eval_expr(&mut code, &scalar_expr, "__phase6_none__", &final_offsets, all_rules, &empty_ranges, &text_bindings)?;
 
     // Print result.
     if is_bool_output {
@@ -5143,6 +5187,18 @@ fn emit_multi_fold_program(
     code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x3C, 0x00, 0x00, 0x00]);
     code.extend_from_slice(&[0x48, 0x31, 0xFF]);
     code.extend_from_slice(&[0x0F, 0x05]);
+
+    // Slice 9.5e: shared abort label for resource open/read failures.
+    if !resource_abort_patches.is_empty() {
+        let abort_label = code.len();
+        for site in &resource_abort_patches {
+            let rel = abort_label as i32 - (*site as i32 + 4);
+            code[*site..*site + 4].copy_from_slice(&rel.to_le_bytes());
+        }
+        code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x3C, 0x00, 0x00, 0x00]); // mov rax, 60
+        code.extend_from_slice(&[0x48, 0xC7, 0xC7, 0x01, 0x00, 0x00, 0x00]); // mov rdi, 1
+        code.extend_from_slice(&[0x0F, 0x05]);                               // syscall
+    }
 
     Ok(code)
 }
@@ -11434,6 +11490,61 @@ mod tests {
         );
 
         let _ = fs::remove_file(out);
+    }
+
+    /// Phase 9 slice 9.5e (2026-04-28): `read(<resource>)` inside the
+    /// body of a Phase 6 multi-fold (extracted quantifier).
+    /// `all(events, e => e.role == read(role))` desugars to a fold
+    /// whose body uses the new BoundText text-equality path. Same
+    /// frame layout as 9.5d but with the n_folds accumulator slots
+    /// above the resource block.
+    ///
+    /// Pins: matching role → true, mismatch → false, role swap (no
+    /// recompile) flips the result, empty collection → vacuous true,
+    /// missing file → fail-closed.
+    #[test]
+    fn slice_9_5e_multi_fold_with_read_in_body() {
+        use std::process::Command;
+        let role_path = "/tmp/verbosec_test_slice95e_role.txt";
+        std::fs::write(role_path, b"admin").expect("write role");
+
+        let src = std::fs::read_to_string("examples/access_check.verbose")
+            .expect("examples/access_check.verbose is expected to exist");
+        let src = src.replace("/tmp/verbose_allowed_role.txt", role_path);
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+
+        let out = std::env::temp_dir().join("verbosec_test_slice95e_access");
+        compile_native(&program, "all_authorized", out.to_str().unwrap(), false, false)
+            .expect("Phase 6 multi-fold with body Read should compile");
+
+        let run = |args: &[&str]| -> String {
+            let r = Command::new(&out).args(args).output().expect("spawn");
+            String::from_utf8_lossy(&r.stdout).trim_end_matches('\n').to_string()
+        };
+
+        // role=admin, all admin → true
+        assert_eq!(run(&["3", "admin", "admin", "admin"]), "true");
+        // role=admin, one user → false
+        assert_eq!(run(&["3", "admin", "user", "admin"]), "false");
+
+        // role swap → user; all user → true (same binary)
+        std::fs::write(role_path, b"user").expect("swap role");
+        assert_eq!(run(&["2", "user", "user"]), "true");
+
+        // empty collection → vacuous true (all([]) = true is the standard)
+        assert_eq!(run(&["0"]), "true");
+
+        // Abort: missing file
+        let _ = std::fs::remove_file(role_path);
+        let abort = Command::new(&out).args(["1", "admin"]).output().expect("spawn abort");
+        assert!(
+            !abort.status.success() && abort.stdout.is_empty(),
+            "missing file should exit non-zero with empty stdout"
+        );
+
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_file(role_path);
     }
 
     /// Phase 9 slice 9.5d (2026-04-28): `read(<resource>)` allowed inside

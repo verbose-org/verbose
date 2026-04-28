@@ -230,18 +230,18 @@ ships the worked example (1572-byte binary).
   strict-only default makes failure obvious; relaxing is an explicit
   opt-in if needed.
 - **File resources in collection / fold / parallel programs.**
-  Four slices shipped 2026-04-27/28:
+  Five slices shipped 2026-04-27/28:
   - 9.5 (text-fold init): `banner_roster.verbose::banner_line`
   - 9.5b (text-fold body): `sep_roster.verbose::sep_line`
   - 9.5c (Phase 3 collection map): `tagged_bonuses.verbose::tag_employees`
   - 9.5d (Phase 4 number fold): `sum_by_tag.verbose::sum_for_target`
+  - 9.5e (Phase 6 multi-fold): `access_check.verbose::all_authorized`
     — composes with the new BoundText text-equality
-    (`field == read(...)`) shipped same-day to support
-    SIEM filter-by-allowlist sums.
-  Still refused: `read()` in `emit_multi_fold_program` (Phase 6 quantifier
-  desugar) — same shape as 9.5d but multi-acc layout means revisiting
-  the slot map; `read()` in `emit_parallel_program` — different register
-  discipline (parses argv into an array, not field slots).
+    (`field == read(...)`) shipped same-day; supports
+    `all`/`any` quantifiers filtered by a runtime-loaded reference.
+  Only one emitter remains: `read()` in `emit_parallel_program` —
+  different register discipline (parses argv into an array, not field
+  slots), so a separate prologue design pass is needed.
 - **Multiple resources composing in a single concat in service
   handlers.** Single-resource handler bodies tested; multi-resource
   in one expression should work via text_bindings but isn't covered

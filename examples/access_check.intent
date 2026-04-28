@@ -1,0 +1,1 @@
+1. A rule that takes a collection of access events and returns true iff every event came from the role loaded from a file at startup. The rule says "all events were authorized" — yes/no — based on a runtime-tunable allowed-role list.
