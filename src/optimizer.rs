@@ -61,6 +61,8 @@ fn count_nodes(expr: &Expr) -> usize {
         Expr::JsonEscape(inner) => 1 + count_nodes(inner),
         // Phase 12 (parse_int): same shape as JsonEscape — one node + recurse.
         Expr::ParseInt(inner) => 1 + count_nodes(inner),
+        // `now_unix()` — leaf node (no children to recurse on), counts as one.
+        Expr::NowUnix => 1,
     }
 }
 
@@ -355,6 +357,9 @@ fn substitute_ident(expr: &Expr, name: &str, replacement: &Expr) -> Expr {
         Expr::ParseInt(inner) => Expr::ParseInt(
             Box::new(substitute_ident(inner, name, replacement)),
         ),
+        // `now_unix()` carries no inner expression and binds no name —
+        // substitution is a no-op.
+        Expr::NowUnix => expr.clone(),
     }
 }
 
@@ -564,6 +569,9 @@ pub fn optimize_expr(
             }
             Expr::ParseInt(Box::new(inner))
         }
+        // `now_unix()` cannot be folded at compile time — the clock value is
+        // unknown until runtime. Pass through unchanged.
+        Expr::NowUnix => expr.clone(),
     }
 }
 

@@ -734,6 +734,18 @@ impl Parser {
                 }
                 self.expect_kind(TokenKind::RParen)?;
                 Ok(Expr::ParseInt(Box::new(inner)))
+            } else if name == "now_unix" && self.check_kind(&TokenKind::LParen) {
+                // `now_unix()` — nullary primitive returning the current
+                // Unix epoch seconds as a number. No arguments allowed; any
+                // token between `(` and `)` is a parse-time error. The
+                // verifier requires the rule's `reads:` proof to declare
+                // the synthetic name `now`.
+                self.advance(); // (
+                if !self.check_kind(&TokenKind::RParen) {
+                    return Err(self.error("now_unix takes no arguments"));
+                }
+                self.expect_kind(TokenKind::RParen)?;
+                Ok(Expr::NowUnix)
             } else if name == "match_result" && self.check_kind(&TokenKind::LParen) {
                 // match_result(target, ok_var => ok_body, err_var => err_body)
                 // The Result consumer. Both arms are explicit — no implicit

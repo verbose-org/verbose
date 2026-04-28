@@ -1,0 +1,43 @@
+@verbose 0.1.0
+
+-- now_unix() primitive (2026-04-28): system clock as a declared
+-- read. CLOCK_REALTIME sampled ONCE per rule invocation (above the
+-- record loop), every reference in the rule body loads the captured
+-- seconds from a dedicated rbp slot. Same value visible at every
+-- call site within one invocation — mirror of how req.timestamp
+-- works in HTTP services.
+--
+-- The synthetic name `now` MUST appear in the rule's `reads:` proof,
+-- same as a resource name. Auditors grep `now` in `reads:` to find
+-- every rule that touches the system clock — the audit shape is
+-- exactly the same as `read(<resource>)`.
+
+
+concept Event
+  @intention: "An event with a Unix-epoch timestamp"
+  @source: recent_event.intent:1
+
+  fields:
+    ts : number
+
+
+rule recent
+  @intention: "True iff the event happened within the last hour"
+  @source: recent_event.intent:1
+
+  input:
+    e : Event
+
+  output:
+    fresh : bool
+
+  logic:
+    fresh = now_unix() - e.ts < 3600
+
+  proofs:
+    purity:
+      reads : [e.ts, now]
+      calls : []
+
+    termination:
+      bound : 3

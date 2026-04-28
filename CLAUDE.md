@@ -158,6 +158,13 @@ examples/
                    ~970 B native binary; on_read_error: abort exits 1 if
                    the file is missing. First Verbose binary that reads a
                    resource from inside a collection-emitting rule.
+  recent_event.*   `now_unix()` primitive (2026-04-28): system clock as a
+                   declared read. clock_gettime(CLOCK_REALTIME) sampled
+                   ONCE per rule invocation; every reference loads the
+                   captured seconds from a dedicated rbp slot. Verifier
+                   requires `reads: [now]` in the rule's purity proof —
+                   same audit shape as `read(<resource>)`. ~475 B native
+                   binary; pinned by now_unix_runtime_capture_and_verifier_check.
   threshold_sum.*  `parse_int(<text>)` primitive (2026-04-28): convert a
                    text value to a number, abort on invalid input. Composes
                    with read() so a numeric threshold lives in a file and
@@ -237,6 +244,7 @@ tools/
 - Record construction: `ConceptName { field: expr, field: expr, ... }` — typed constructor; verifier cross-checks field set + per-field types match the concept declaration
 - Text composition: `concat(e1, e2, ...)` — variadic text builder, scalar args only (number → decimal, bool → true/false, text as-is); no operator overloading on `+`, each arg is explicit
 - Text→number conversion: `parse_int(<text>)` — strict scan (optional `-`, then 1+ ASCII digits, then end-of-input); aborts the binary on any other shape (empty input, lone `-`, non-digit byte). Optimizer folds `parse_int("<literal>")` to `Number` at compile time; native runtime path handles `parse_int(read(<resource>))` and other BoundText sources via the same (ptr, len) shape used by Read / Fetch / Phase-2I lets
+- System clock: `now_unix()` — current Unix-epoch seconds as a number. Sampled ONCE per rule invocation via `clock_gettime(CLOCK_REALTIME)`; every reference in the rule logic loads the same captured value from a dedicated rbp slot (mirror of `req.timestamp` in HTTP services). The synthetic name `now` MUST appear in the rule's `reads:` proof so auditors find every clock-touching rule with a single grep — same audit shape as `read(<resource>)`. Today wired in `emit_record_loop_prologue` (covers Phase 0 / 2 / Result / Record output rules); fold/collection/parallel emitters reject `now_unix()` until a follow-up extends them
 - Verifier type check: bidirectional shape check on logic — `Ok`/`Err` rejected outside `Result(...)` context; `Ok(x)`/`Err(e)` content checked against declared arms when inferable; top-level output type checked against declared; conservative on lambda/let-bound vars to avoid false positives
 - General reduction: `fold(collection, initial, acc, var => body)`
 - Proofs: purity (reads/calls), termination (bound)

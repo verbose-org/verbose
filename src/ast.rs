@@ -474,6 +474,18 @@ pub enum Expr {
     /// emits a strict scan loop length-aware for both NUL-terminated
     /// argv text and Read-bound (ptr, len) text.
     ParseInt(Box<Expr>),
+    /// `now_unix()` — current Unix epoch seconds as a number. Sampled
+    /// ONCE per rule invocation (clock_gettime(CLOCK_REALTIME) above
+    /// the record loop), then every reference in the rule's logic
+    /// loads the same captured value from a dedicated rbp slot.
+    /// Mirror of how `req.timestamp` works in HTTP services (slice 8c)
+    /// — one wall-clock sample per request, every log line in the
+    /// scope sees the same instant. The clock is an external effect
+    /// (non-deterministic source), so the verifier requires the rule's
+    /// `reads:` proof to declare the synthetic name `now`. Auditors
+    /// grep for `now` in `reads:` to find every rule that touches the
+    /// system clock — same audit shape as `read(<resource>)`.
+    NowUnix,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

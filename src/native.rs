@@ -474,6 +474,8 @@ fn let_rhs_is_text(
         // classifier returns false so let-bindings pointing at parse_int
         // land in the number-let path (single slot).
         Expr::ParseInt(_) => false,
+        // `now_unix()` returns number — same number-let path as ParseInt.
+        Expr::NowUnix => false,
         _ => false,
     }
 }
@@ -541,7 +543,80 @@ fn collect_read_names_native(expr: &Expr, out: &mut Vec<String>) {
         Expr::JsonEscape(inner) => collect_read_names_native(inner, out),
         // Phase 12 (parse_int): pure pass-through.
         Expr::ParseInt(inner) => collect_read_names_native(inner, out),
+        // `now_unix()` is a clock read, not a resource read — leaf node.
+        Expr::NowUnix => {}
     }
+}
+
+/// `now_unix()` primitive: walk an expression and return true if any
+/// reference to `Expr::NowUnix` is reachable. Mirrors the shape of
+/// collect_read_names_native — recurse through every variant; only
+/// the NowUnix leaf returns true. Used by emitters to decide whether
+/// to grow the frame for the timespec scratch and emit clock_gettime.
+fn expr_uses_now_unix(e: &Expr) -> bool {
+    match e {
+        Expr::NowUnix => true,
+        Expr::Number(_) | Expr::Text(_) | Expr::Ident(_) | Expr::Read(_) => false,
+        Expr::Field(b, _) => expr_uses_now_unix(b),
+        Expr::Binary(_, l, r) => expr_uses_now_unix(l) || expr_uses_now_unix(r),
+        Expr::Not(i) | Expr::Neg(i) | Expr::Ok(i) | Expr::Err(i) => expr_uses_now_unix(i),
+        Expr::JsonEscape(i) | Expr::ParseInt(i) => expr_uses_now_unix(i),
+        Expr::If(c, t, el) => {
+            expr_uses_now_unix(c) || expr_uses_now_unix(t) || expr_uses_now_unix(el)
+        }
+        Expr::Call(_, args) | Expr::Concat(args) => args.iter().any(expr_uses_now_unix),
+        Expr::Quantifier(_, c, _, b) => expr_uses_now_unix(c) || expr_uses_now_unix(b),
+        Expr::Fold(c, init, _, _, b) => {
+            expr_uses_now_unix(c) || expr_uses_now_unix(init) || expr_uses_now_unix(b)
+        }
+        Expr::Map(c, _, b) | Expr::Filter(c, _, b) => {
+            expr_uses_now_unix(c) || expr_uses_now_unix(b)
+        }
+        Expr::MatchResult(t, _, ok, _, err) => {
+            expr_uses_now_unix(t) || expr_uses_now_unix(ok) || expr_uses_now_unix(err)
+        }
+        Expr::Record(_, fields) => fields.iter().any(|(_, e)| expr_uses_now_unix(e)),
+        Expr::Fetch(_, req) => expr_uses_now_unix(req),
+    }
+}
+
+/// True iff the rule's logic (value OR any let-binding RHS) references
+/// `now_unix()` anywhere. Used by every emitter that supports clock
+/// capture to decide whether to grow the frame and emit the syscall.
+fn rule_uses_now_unix(rule: &Rule) -> bool {
+    expr_uses_now_unix(&rule.logic.value)
+        || rule.logic.bindings.iter().any(|(_, e)| expr_uses_now_unix(e))
+}
+
+/// Emit a single `clock_gettime(CLOCK_REALTIME, &timespec)` syscall
+/// that lands tv_sec at `[rbp + tv_sec_slot]` and tv_nsec at
+/// `[rbp + tv_sec_slot + 8]` (one slot ABOVE — the caller MUST have
+/// reserved 16 bytes total: tv_sec at the deepest position, tv_nsec
+/// scratch in the slot just above it). Caller registers tv_sec_slot
+/// in the local `offsets` map under the synthetic name `"now"` so
+/// `emit_eval_expr`'s NowUnix arm finds it.
+///
+/// Linux struct timespec on x86-64: { tv_sec: i64; tv_nsec: i64 }.
+/// rsi must point AT tv_sec (kernel writes byte 0..7 = tv_sec, 8..15
+/// = tv_nsec). syscall = 228.
+fn emit_capture_now_unix(code: &mut Vec<u8>, tv_sec_slot: i32) {
+    // mov rax, 228 (sys_clock_gettime)
+    code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0xE4, 0x00, 0x00, 0x00]);
+    // xor edi, edi (CLOCK_REALTIME = 0; 32-bit zero suffices, upper auto-cleared)
+    code.extend_from_slice(&[0x31, 0xFF]);
+    // lea rsi, [rbp + tv_sec_slot]
+    if tv_sec_slot >= -128 {
+        code.extend_from_slice(&[0x48, 0x8D, 0x75]);
+        code.push(tv_sec_slot as u8);
+    } else {
+        code.extend_from_slice(&[0x48, 0x8D, 0xB5]);
+        code.extend_from_slice(&tv_sec_slot.to_le_bytes());
+    }
+    // syscall
+    code.extend_from_slice(&[0x0F, 0x05]);
+    // (tv_sec is now at [rbp + tv_sec_slot]; the kernel doesn't return
+    // an error for CLOCK_REALTIME on a sane Linux, so no abort path —
+    // matches the documented expectation that wall-clock reads succeed.)
 }
 
 /// Walk a rule's logic — both let-binding RHS expressions and the value
@@ -616,6 +691,8 @@ fn collect_fetch_names_native(expr: &Expr, out: &mut Vec<String>) {
         Expr::JsonEscape(inner) => collect_fetch_names_native(inner, out),
         // Phase 12 (parse_int): pure pass-through.
         Expr::ParseInt(inner) => collect_fetch_names_native(inner, out),
+        // `now_unix()` is not a connection — leaf node.
+        Expr::NowUnix => {}
     }
 }
 
@@ -876,6 +953,8 @@ fn emit_connection_fetch_sequence(
             Expr::JsonEscape(inner) => first_fetch_for(inner, name),
             // Phase 12 (parse_int): pass-through.
             Expr::ParseInt(inner) => first_fetch_for(inner, name),
+            // `now_unix()` is not a Fetch — leaf node.
+            Expr::NowUnix => None,
         }
     }
     let request_expr: &Expr = {
@@ -1132,8 +1211,19 @@ fn emit_record_loop_prologue<'a>(
         .iter()
         .map(|c| 16 + (((c.max_response as i32) + 7) & !7))
         .sum();
+    // `now_unix()` reservation: 16 bytes (tv_sec at the deeper of two
+    // slots, tv_nsec scratch at the slot just above). Detected from the
+    // rule's logic + let bindings via `rule_uses_now_unix`. The slot
+    // sits at the very bottom of the frame, BELOW any resource and
+    // connection blocks, so the existing slot offsets stay byte-for-
+    // byte unchanged for rules that don't touch the clock.
+    let uses_now = rule_uses_now_unix(rule);
+    let now_extra_bytes: i32 = if uses_now { 16 } else { 0 };
     let frame_slots = n_ctx + nfields + n_binding_slots + n_reserved;
-    let frame_size = (frame_slots * 8) as i32 + resource_extra_bytes + connection_extra_bytes;
+    let frame_size = (frame_slots * 8) as i32
+        + resource_extra_bytes
+        + connection_extra_bytes
+        + now_extra_bytes;
     let base = (n_ctx + nfields + n_binding_slots) as i32;
     let match_slot: i32 = -((base + 1) * 8);
     let err_ptr_slot: i32 = -((base + 2) * 8);
@@ -1238,6 +1328,20 @@ fn emit_record_loop_prologue<'a>(
         resource_next_slot = new_next;
     }
 
+    // ─── now_unix() capture: clock_gettime(CLOCK_REALTIME) ONCE at rule
+    // entry, ABOVE loop_top, so every record sees the same captured
+    // value. tv_sec lands at `now_slot` (the deeper of two reserved
+    // slots); tv_nsec scratch occupies the slot immediately above.
+    // The slot is registered under the synthetic name `"now"` in
+    // binding_offsets below so emit_eval_expr's NowUnix arm finds it.
+    let now_slot: i32 = if uses_now {
+        let s = resource_next_slot - 8; // tv_sec at deeper slot
+        emit_capture_now_unix(code, s);
+        s
+    } else {
+        0 // unused; uses_now=false guards the only consumer
+    };
+
     let loop_top = code.len();
 
     // cmp r14, r12 ; jge exit (rel32 placeholder)
@@ -1302,6 +1406,13 @@ fn emit_record_loop_prologue<'a>(
     let mut binding_offsets = offsets;
     for (k, v) in &ctx_offsets {
         binding_offsets.insert(k, *v);
+    }
+    // Register the now_unix() slot so any reference in the rule's logic
+    // (top-level or inside a let RHS) resolves through emit_eval_expr's
+    // NowUnix arm to a load from this slot. Static lifetime literal so
+    // the &'a str bound on binding_offsets is satisfied.
+    if uses_now {
+        binding_offsets.insert("now", now_slot);
     }
     let field_ranges = build_field_ranges(input_concept);
     // Phase 9 slice 1: text_bindings already contains the resource entries
@@ -6349,6 +6460,9 @@ fn max_stack_depth(expr: &Expr) -> usize {
         // Phase 12 (parse_int): same shape — the parse loop is fixed-
         // register, so the inner's depth dominates.
         Expr::ParseInt(inner) => max_stack_depth(inner),
+        // `now_unix()` is a leaf — the captured value lives in an rbp slot,
+        // emission at use sites is a single load, no eval-stack pushes.
+        Expr::NowUnix => 0,
     }
 }
 
@@ -6957,6 +7071,24 @@ fn emit_eval_expr(
         // emitted inline at the end of this branch (no per-binary
         // patches needed), so callers don't need any new bookkeeping.
         Expr::ParseInt(inner) => emit_parse_int(code, inner.as_ref(), text_bindings, offsets),
+        // `now_unix()` — load the captured CLOCK_REALTIME seconds from
+        // the dedicated `now` slot. The slot is populated ONCE per rule
+        // invocation by a `clock_gettime` call hoisted above the record
+        // loop (see `emit_capture_now_unix`). Same value visible at
+        // every call site within the rule — mirror of slice 8c's
+        // req.timestamp scope. Emitters that don't yet wire the
+        // capture register no `now` in offsets, so this arm fails with
+        // a clear message naming the unwired emitter.
+        Expr::NowUnix => {
+            let slot = *offsets.get("now").ok_or_else(|| NativeError {
+                message: "now_unix() reached emit_eval_expr in a context that did not capture \
+                          the clock — the surrounding emitter must call emit_capture_now_unix \
+                          and register the slot under the synthetic name \"now\" in its offsets map"
+                    .into(),
+            })?;
+            load_rax_from_rbp(code, slot);
+            Ok(())
+        }
     }
 }
 
@@ -8807,6 +8939,7 @@ fn expr_kind(e: &Expr) -> &'static str {
         Expr::Fetch(_, _) => "Fetch",
         Expr::JsonEscape(_) => "JsonEscape",
         Expr::ParseInt(_) => "ParseInt",
+        Expr::NowUnix => "NowUnix",
     }
 }
 
@@ -11672,6 +11805,82 @@ mod tests {
         );
 
         let _ = fs::remove_file(out);
+    }
+
+    /// `now_unix()` primitive (2026-04-28): system clock as a declared
+    /// read. CLOCK_REALTIME sampled ONCE per rule invocation; every
+    /// reference loads the same captured value from a dedicated rbp
+    /// slot. Verifier requires `reads: [now]` (synthetic name token).
+    ///
+    /// This test pins:
+    ///   (a) recent event → true
+    ///   (b) old event → false
+    ///   (c) multiple records in one binary invocation share the same
+    ///       captured "now" (subtle but load-bearing — without single-
+    ///       capture semantics, two records 1 ms apart could disagree
+    ///       on whether they're "fresh")
+    ///   (d) verifier rejects `now_unix()` use without `now` in reads
+    #[test]
+    fn now_unix_runtime_capture_and_verifier_check() {
+        use std::process::Command;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let src = std::fs::read_to_string("examples/recent_event.verbose")
+            .expect("examples/recent_event.verbose");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+        let out = std::env::temp_dir().join("verbosec_test_now_unix_recent");
+        compile_native(&program, "recent", out.to_str().unwrap(), false, false)
+            .expect("now_unix() rule should compile");
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_secs() as i64;
+        let run_one = |ts: i64| -> String {
+            let r = Command::new(&out)
+                .args([ts.to_string()])
+                .output()
+                .expect("spawn");
+            String::from_utf8_lossy(&r.stdout).trim_end_matches('\n').to_string()
+        };
+
+        // (a) 30 seconds old → true
+        assert_eq!(run_one(now - 30), "true", "30s ago should be fresh");
+        // (b) 7200 seconds old (2 hours) → false
+        assert_eq!(run_one(now - 7200), "false", "2h ago should NOT be fresh");
+        // 3599 vs 3600 boundary
+        assert_eq!(run_one(now - 3599), "true", "3599s should be fresh (< 3600)");
+        assert_eq!(run_one(now - 3600), "false", "3600s should NOT be fresh (strict <)");
+
+        // (c) one binary, three records — all judged against the same
+        // captured "now". With single-capture semantics, two records
+        // submitted in the same invocation see identical "now" values
+        // even if the wall clock advanced between iterations. Verify
+        // the boolean output for each.
+        let r = Command::new(&out)
+            .args([(now - 30).to_string(), (now - 7200).to_string(), (now - 100).to_string()])
+            .output()
+            .expect("spawn batch");
+        let lines: Vec<&str> = std::str::from_utf8(&r.stdout).unwrap().lines().collect();
+        assert_eq!(lines, vec!["true", "false", "true"],
+                   "batch outputs must reflect a single captured now");
+
+        // (d) Verifier rejects undeclared use.
+        let bad_src = src.replace("reads : [e.ts, now]", "reads : [e.ts]");
+        let tokens = crate::lexer::Lexer::new(&bad_src).tokenize().expect("tokenize");
+        let bad_program = crate::parser::Parser::new(tokens)
+            .parse_program()
+            .expect("parse");
+        let errors = crate::verifier::verify_program(&bad_program, std::path::Path::new("examples"));
+        assert!(
+            errors.iter().any(|e| e.message.contains("missing")
+                              && e.message.contains("now")),
+            "verifier must reject now_unix() without `now` in reads; got errors: {:?}",
+            errors
+        );
+
+        let _ = std::fs::remove_file(&out);
     }
 
     /// `parse_int(<text>)` primitive (2026-04-28): convert a text

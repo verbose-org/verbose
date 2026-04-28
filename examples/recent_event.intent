@@ -1,0 +1,1 @@
+1. A rule that takes an event with a Unix-epoch timestamp and returns true if the event happened within the last hour (3600 seconds before the system clock at rule entry). The system clock is sampled exactly once per binary invocation and reused for every input record, so a batch of events is judged against a single consistent "now".

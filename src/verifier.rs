@@ -320,6 +320,9 @@ fn collect_read_names(expr: &Expr, out: &mut Vec<String>) {
         // Phase 12 (parse_int): pure pass-through — recurse into the inner
         // text expression (which is typically `read(...)` itself).
         Expr::ParseInt(inner) => collect_read_names(inner, out),
+        // `now_unix()` is not a resource read — its synthetic name `now`
+        // is added by `collect_expr_facts` directly. No recursion needed.
+        Expr::NowUnix => {}
     }
 }
 
@@ -406,6 +409,8 @@ fn collect_fetch_names(expr: &Expr, out: &mut Vec<String>) {
         Expr::JsonEscape(inner) => collect_fetch_names(inner, out),
         // Phase 12 (parse_int): pure pass-through.
         Expr::ParseInt(inner) => collect_fetch_names(inner, out),
+        // `now_unix()` is not a connection — leaf node, nothing to collect.
+        Expr::NowUnix => {}
     }
 }
 
@@ -466,6 +471,8 @@ fn collect_fetch_names_with_dups(expr: &Expr, out: &mut Vec<String>) {
         Expr::JsonEscape(inner) => collect_fetch_names_with_dups(inner, out),
         // Phase 12 (parse_int): pure pass-through.
         Expr::ParseInt(inner) => collect_fetch_names_with_dups(inner, out),
+        // `now_unix()` is not a fetch — leaf node, nothing to collect.
+        Expr::NowUnix => {}
     }
 }
 
@@ -928,6 +935,7 @@ fn describe_expr_kind(e: &Expr) -> &'static str {
         Expr::Fetch(_, _) => "fetch",
         Expr::JsonEscape(_) => "json_escape",
         Expr::ParseInt(_) => "parse_int",
+        Expr::NowUnix => "now_unix",
     }
 }
 
@@ -1448,6 +1456,8 @@ fn infer_expr_type(
         // Phase 12 (parse_int): parse_int(<text>) returns number. Inner
         // text-ness enforced by check_expr_against.
         Expr::ParseInt(_) => Some(Type::Number),
+        // `now_unix()` returns number (Unix epoch seconds).
+        Expr::NowUnix => Some(Type::Number),
         // Map/Filter/Fold/Ok/Err/MatchResult: deferred until lambda binding
         // tracking lands. Returning None means we do not check; we also do not
         // falsely accept.
@@ -1748,6 +1758,13 @@ fn collect_expr_facts(
         Expr::ParseInt(inner) => {
             collect_expr_facts(inner, reads, calls);
         }
+        // `now_unix()` reads the system clock — a non-deterministic external
+        // source. Surface it as a synthetic read of the name `now` so the
+        // rule's declared `reads:` proof must list `now` (auditors grep
+        // `reads:` to find every rule that touches the wall clock).
+        Expr::NowUnix => {
+            reads.insert(vec!["now".to_string()]);
+        }
     }
 }
 
@@ -1790,6 +1807,12 @@ fn validate_read_path(
     // resource read does — same path shape ([name], length 1, no field).
     let is_connection = path.len() == 1 && all_connections.contains(base);
     if is_connection {
+        return None;
+    }
+    // `now_unix()` synthesises a `reads: [now]` entry. Accept the synthetic
+    // name `now` as a valid base (length 1, no field access) — same audit
+    // shape as a resource or connection name.
+    if path.len() == 1 && base == "now" {
         return None;
     }
     if !is_input && !is_context {
@@ -1942,6 +1965,9 @@ fn count_operations(expr: &Expr) -> usize {
         // Phase 12 (parse_int): same shape as JsonEscape — one op for
         // the scan/parse loop plus the inner.
         Expr::ParseInt(inner) => 1 + count_operations(inner),
+        // `now_unix()` — one op (the clock_gettime syscall) and no inner
+        // expression. Same shape as Read.
+        Expr::NowUnix => 1,
     }
 }
 
