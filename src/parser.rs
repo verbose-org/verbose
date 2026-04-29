@@ -746,6 +746,27 @@ impl Parser {
                 }
                 self.expect_kind(TokenKind::RParen)?;
                 Ok(Expr::NowUnix)
+            } else if name == "starts_with" && self.check_kind(&TokenKind::LParen) {
+                // `starts_with(<haystack>, <needle>)` — byte-level prefix
+                // test returning bool. Exactly two arguments; zero / one /
+                // three-plus is a parse-time error so the message points at
+                // the call site rather than failing later in the verifier.
+                // The verifier enforces that both children are text-typed.
+                self.advance(); // (
+                if self.check_kind(&TokenKind::RParen) {
+                    return Err(self.error("starts_with requires exactly two arguments, got zero"));
+                }
+                let haystack = self.parse_expr()?;
+                if !self.check_kind(&TokenKind::Comma) {
+                    return Err(self.error("starts_with requires exactly two arguments, got one"));
+                }
+                self.advance(); // ,
+                let needle = self.parse_expr()?;
+                if self.check_kind(&TokenKind::Comma) {
+                    return Err(self.error("starts_with requires exactly two arguments, got more than two"));
+                }
+                self.expect_kind(TokenKind::RParen)?;
+                Ok(Expr::StartsWith(Box::new(haystack), Box::new(needle)))
             } else if name == "match_result" && self.check_kind(&TokenKind::LParen) {
                 // match_result(target, ok_var => ok_body, err_var => err_body)
                 // The Result consumer. Both arms are explicit — no implicit

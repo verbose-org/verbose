@@ -553,6 +553,25 @@ fn eval_expr(
                 .unwrap_or(0);
             Ok(Value::Number(secs))
         }
+        // `starts_with(<haystack>, <needle>)` — byte-level prefix test.
+        // Both children must be text; empty needle is always true; needle
+        // longer than haystack is false. Mirrors Rust's str::starts_with
+        // on the byte slices, matching what native will emit.
+        Expr::StartsWith(haystack, needle) => {
+            let h = eval_expr(haystack, env, all_rules)?;
+            let n = eval_expr(needle, env, all_rules)?;
+            match (h, n) {
+                (Value::Text(hs), Value::Text(ns)) => {
+                    Ok(Value::Bool(hs.as_bytes().starts_with(ns.as_bytes())))
+                }
+                (h, n) => Err(RuntimeError {
+                    message: format!(
+                        "starts_with requires two text arguments, got {} and {}",
+                        h, n
+                    ),
+                }),
+            }
+        }
     }
 }
 

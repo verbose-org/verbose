@@ -486,6 +486,22 @@ pub enum Expr {
     /// grep for `now` in `reads:` to find every rule that touches the
     /// system clock — same audit shape as `read(<resource>)`.
     NowUnix,
+    /// `starts_with(<haystack>, <needle>)` — does the haystack text
+    /// begin with the needle's bytes? Returns `bool`. Both args must
+    /// be text-typed; the verifier rejects number args.
+    ///
+    /// Edge cases (canonical):
+    ///   - empty needle → always true (every text starts with the
+    ///     empty prefix — the standard convention)
+    ///   - needle longer than haystack → false (no slot to match)
+    ///   - byte-exact match required (no encoding awareness, no case
+    ///     folding — Verbose stays at the byte level on purpose)
+    ///
+    /// Composes with the BoundText shape: needle can be a literal,
+    /// a text input field, `read(<resource>)`, or a Phase-2I text
+    /// let. Same family as `field == read(<resource>)` (slice
+    /// "text equality with bound RHS" 2026-04-28).
+    StartsWith(Box<Expr>, Box<Expr>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

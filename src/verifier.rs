@@ -323,6 +323,13 @@ fn collect_read_names(expr: &Expr, out: &mut Vec<String>) {
         // `now_unix()` is not a resource read — its synthetic name `now`
         // is added by `collect_expr_facts` directly. No recursion needed.
         Expr::NowUnix => {}
+        // `starts_with(haystack, needle)` — recurse into both children;
+        // either side may carry a `read(...)` (e.g. needle is loaded from
+        // a resource).
+        Expr::StartsWith(h, n) => {
+            collect_read_names(h, out);
+            collect_read_names(n, out);
+        }
     }
 }
 
@@ -411,6 +418,11 @@ fn collect_fetch_names(expr: &Expr, out: &mut Vec<String>) {
         Expr::ParseInt(inner) => collect_fetch_names(inner, out),
         // `now_unix()` is not a connection — leaf node, nothing to collect.
         Expr::NowUnix => {}
+        // `starts_with(haystack, needle)` — recurse into both children.
+        Expr::StartsWith(h, n) => {
+            collect_fetch_names(h, out);
+            collect_fetch_names(n, out);
+        }
     }
 }
 
@@ -473,6 +485,11 @@ fn collect_fetch_names_with_dups(expr: &Expr, out: &mut Vec<String>) {
         Expr::ParseInt(inner) => collect_fetch_names_with_dups(inner, out),
         // `now_unix()` is not a fetch — leaf node, nothing to collect.
         Expr::NowUnix => {}
+        // `starts_with(haystack, needle)` — recurse into both children.
+        Expr::StartsWith(h, n) => {
+            collect_fetch_names_with_dups(h, out);
+            collect_fetch_names_with_dups(n, out);
+        }
     }
 }
 
@@ -936,6 +953,7 @@ fn describe_expr_kind(e: &Expr) -> &'static str {
         Expr::JsonEscape(_) => "json_escape",
         Expr::ParseInt(_) => "parse_int",
         Expr::NowUnix => "now_unix",
+        Expr::StartsWith(_, _) => "starts_with",
     }
 }
 
@@ -1262,6 +1280,24 @@ fn check_expr_against(
                 ),
             });
         }
+        // `starts_with(<haystack>, <needle>)` produces bool. When the
+        // surrounding context expects bool, recurse into both children with
+        // expected=Text so the verifier rejects number arguments. When the
+        // context expects something else, surface a clear mismatch naming
+        // `starts_with` (mirror of the JsonEscape/ParseInt arms).
+        (Expr::StartsWith(h, n), Type::Bool) => {
+            check_expr_against(h, &Type::Text, rule, all_rules, input_concept, all_concepts, errors);
+            check_expr_against(n, &Type::Text, rule, all_rules, input_concept, all_concepts, errors);
+        }
+        (Expr::StartsWith(_, _), other) => {
+            errors.push(VerifyError {
+                context: format!("rule '{}' / logic", rule.name),
+                message: format!(
+                    "starts_with produces bool but the expected type is '{}'",
+                    type_display(other),
+                ),
+            });
+        }
         (Expr::MatchResult(_target, _, ok_body, _, err_body), _) => {
             // Both arms must produce `expected`. The target should be a Result —
             // checking that requires inferring through lambda bindings, which
@@ -1458,6 +1494,10 @@ fn infer_expr_type(
         Expr::ParseInt(_) => Some(Type::Number),
         // `now_unix()` returns number (Unix epoch seconds).
         Expr::NowUnix => Some(Type::Number),
+        // `starts_with(<text>, <text>)` returns bool. Both arguments must be
+        // text-typed; check_expr_against enforces that — here we only need
+        // the outer type for inference.
+        Expr::StartsWith(_, _) => Some(Type::Bool),
         // Map/Filter/Fold/Ok/Err/MatchResult: deferred until lambda binding
         // tracking lands. Returning None means we do not check; we also do not
         // falsely accept.
@@ -1765,6 +1805,13 @@ fn collect_expr_facts(
         Expr::NowUnix => {
             reads.insert(vec!["now".to_string()]);
         }
+        // `starts_with(haystack, needle)` — pure: the comparison itself adds
+        // no synthetic name (unlike NowUnix's `now`). Each child contributes
+        // its own facts.
+        Expr::StartsWith(h, n) => {
+            collect_expr_facts(h, reads, calls);
+            collect_expr_facts(n, reads, calls);
+        }
     }
 }
 
@@ -1968,6 +2015,9 @@ fn count_operations(expr: &Expr) -> usize {
         // `now_unix()` — one op (the clock_gettime syscall) and no inner
         // expression. Same shape as Read.
         Expr::NowUnix => 1,
+        // `starts_with(haystack, needle)` — one op for the byte-compare
+        // loop plus the cost of evaluating each child (same shape as Binary).
+        Expr::StartsWith(h, n) => 1 + count_operations(h) + count_operations(n),
     }
 }
 

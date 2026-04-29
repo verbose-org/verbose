@@ -1,0 +1,1 @@
+1. An HTTP service whose handler routes by URL path prefix. Requests starting with "/api/v1/" return status 200 and body "api". Requests starting with "/health" return status 200 and body "ok". Anything else returns 404. The body of every response also echoes the request method so the operator can confirm at a glance what was matched.

@@ -63,6 +63,9 @@ fn count_nodes(expr: &Expr) -> usize {
         Expr::ParseInt(inner) => 1 + count_nodes(inner),
         // `now_unix()` — leaf node (no children to recurse on), counts as one.
         Expr::NowUnix => 1,
+        // `starts_with(haystack, needle)` — count this node + recurse into
+        // both children (same shape as Binary).
+        Expr::StartsWith(h, n) => 1 + count_nodes(h) + count_nodes(n),
     }
 }
 
@@ -360,6 +363,11 @@ fn substitute_ident(expr: &Expr, name: &str, replacement: &Expr) -> Expr {
         // `now_unix()` carries no inner expression and binds no name —
         // substitution is a no-op.
         Expr::NowUnix => expr.clone(),
+        // `starts_with(haystack, needle)` — substitute through both children.
+        Expr::StartsWith(h, n) => Expr::StartsWith(
+            Box::new(substitute_ident(h, name, replacement)),
+            Box::new(substitute_ident(n, name, replacement)),
+        ),
     }
 }
 
@@ -572,6 +580,18 @@ pub fn optimize_expr(
         // `now_unix()` cannot be folded at compile time — the clock value is
         // unknown until runtime. Pass through unchanged.
         Expr::NowUnix => expr.clone(),
+        // `starts_with(haystack, needle)` — recurse into both children, then
+        // fold to `0`/`1` when both have collapsed to text literals (bool
+        // result encoded as a 0/1 number per the existing convention used
+        // by Eq/Lt/Gt comparisons above).
+        Expr::StartsWith(h, n) => {
+            let h_opt = optimize_expr(h, input_name, field_ranges);
+            let n_opt = optimize_expr(n, input_name, field_ranges);
+            if let (Expr::Text(s1), Expr::Text(s2)) = (&h_opt, &n_opt) {
+                return Expr::Number(if s1.as_bytes().starts_with(s2.as_bytes()) { 1 } else { 0 });
+            }
+            Expr::StartsWith(Box::new(h_opt), Box::new(n_opt))
+        }
     }
 }
 

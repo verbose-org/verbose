@@ -545,6 +545,13 @@ fn collect_read_names_native(expr: &Expr, out: &mut Vec<String>) {
         Expr::ParseInt(inner) => collect_read_names_native(inner, out),
         // `now_unix()` is a clock read, not a resource read — leaf node.
         Expr::NowUnix => {}
+        // `starts_with(haystack, needle)` — recurse into both children;
+        // either side may carry a `read(...)` reference (e.g. needle is a
+        // text loaded from a resource).
+        Expr::StartsWith(h, n) => {
+            collect_read_names_native(h, out);
+            collect_read_names_native(n, out);
+        }
     }
 }
 
@@ -577,6 +584,7 @@ fn expr_uses_now_unix(e: &Expr) -> bool {
         }
         Expr::Record(_, fields) => fields.iter().any(|(_, e)| expr_uses_now_unix(e)),
         Expr::Fetch(_, req) => expr_uses_now_unix(req),
+        Expr::StartsWith(h, n) => expr_uses_now_unix(h) || expr_uses_now_unix(n),
     }
 }
 
@@ -693,6 +701,12 @@ fn collect_fetch_names_native(expr: &Expr, out: &mut Vec<String>) {
         Expr::ParseInt(inner) => collect_fetch_names_native(inner, out),
         // `now_unix()` is not a connection — leaf node.
         Expr::NowUnix => {}
+        // `starts_with(haystack, needle)` — recurse into both children;
+        // either side may carry a `fetch(...)` reference.
+        Expr::StartsWith(h, n) => {
+            collect_fetch_names_native(h, out);
+            collect_fetch_names_native(n, out);
+        }
     }
 }
 
@@ -955,6 +969,8 @@ fn emit_connection_fetch_sequence(
             Expr::ParseInt(inner) => first_fetch_for(inner, name),
             // `now_unix()` is not a Fetch — leaf node.
             Expr::NowUnix => None,
+            // `starts_with(haystack, needle)` — recurse into both children.
+            Expr::StartsWith(h, n) => first_fetch_for(h, name).or_else(|| first_fetch_for(n, name)),
         }
     }
     let request_expr: &Expr = {
@@ -6558,6 +6574,11 @@ fn max_stack_depth(expr: &Expr) -> usize {
         // `now_unix()` is a leaf — the captured value lives in an rbp slot,
         // emission at use sites is a single load, no eval-stack pushes.
         Expr::NowUnix => 0,
+        // `starts_with(haystack, needle)` — the byte-compare loop is fixed-
+        // register (rsi/rdi/rcx); whichever child has the larger eval-stack
+        // depth dominates. Same shape as Binary minus the +1 push (the
+        // result is materialized in rax, not pushed for the parent).
+        Expr::StartsWith(h, n) => max_stack_depth(h).max(max_stack_depth(n)),
     }
 }
 
@@ -7184,7 +7205,193 @@ fn emit_eval_expr(
             load_rax_from_rbp(code, slot);
             Ok(())
         }
+        // `starts_with(haystack, needle)` — bool result. Both args are
+        // text. Algorithm (concrete byte-compare, no allocator):
+        //   1. produce (rsi=ptr, rcx=len) for haystack; save into r8, r9
+        //   2. produce (rsi=ptr, rcx=len) for needle
+        //   3. mov rdi, rsi (rdi = needle_ptr)
+        //   4. cmp r9, rcx ; jb .nope    (haystack shorter than needle → false)
+        //   5. test rcx, rcx ; je .empty  (empty needle → true)
+        //   6. mov rsi, r8                (restore haystack ptr)
+        //   7. cld ; repe cmpsb           (compare needle_len bytes)
+        //   8. sete al
+        //   9. movzx rax, al
+        // Edge cases:
+        //   - empty needle → always true (standard convention)
+        //   - needle longer than haystack → false
+        //   - byte-exact match required (no encoding awareness)
+        Expr::StartsWith(haystack, needle) => emit_starts_with(
+            code,
+            haystack.as_ref(),
+            needle.as_ref(),
+            input_name,
+            offsets,
+            text_bindings,
+        ),
     }
+}
+
+/// Helper for `starts_with`: produce (rsi=ptr, rcx=len) for a simple
+/// text expression. Restricted to allocation-free shapes (literal,
+/// text input field, BoundText) so the caller doesn't need to manage
+/// stack buffers across the two-arg evaluation. Concat / Call /
+/// JsonEscape / ParseInt are rejected with a clear message — they
+/// would need a per-call scratch managed across the second emit, which
+/// is out of scope for this slice.
+fn emit_starts_with_load_text(
+    code: &mut Vec<u8>,
+    expr: &Expr,
+    input_name: &str,
+    offsets: &HashMap<&str, i32>,
+    text_bindings: &TextBindings<'_>,
+) -> Result<(), NativeError> {
+    match expr {
+        Expr::Text(s) => {
+            let bytes = s.as_bytes();
+            let n = bytes.len() as i32;
+            // jmp over inline bytes
+            if n <= 127 {
+                code.push(0xEB);
+                code.push(n as u8);
+            } else {
+                code.push(0xE9);
+                code.extend_from_slice(&n.to_le_bytes());
+            }
+            let data_addr = code.len();
+            code.extend_from_slice(bytes);
+            // lea rsi, [rip + rel32]
+            let end = code.len() + 7;
+            let rel32 = data_addr as i32 - end as i32;
+            code.extend_from_slice(&[0x48, 0x8D, 0x35]);
+            code.extend_from_slice(&rel32.to_le_bytes());
+            // mov rcx, n  (literal length, compile-time constant)
+            code.extend_from_slice(&[0x48, 0xC7, 0xC1]);
+            code.extend_from_slice(&n.to_le_bytes());
+            Ok(())
+        }
+        Expr::Field(base, fname) if matches!(base.as_ref(), Expr::Ident(n) if n == input_name) => {
+            let &offset = offsets.get(fname.as_str()).ok_or_else(|| NativeError {
+                message: format!("starts_with: unknown text input field '{}'", fname),
+            })?;
+            // mov rsi, [rbp + offset]  (NUL-terminated argv pointer)
+            if offset >= -128 {
+                code.extend_from_slice(&[0x48, 0x8B, 0x75]);
+                code.push(offset as u8);
+            } else {
+                code.extend_from_slice(&[0x48, 0x8B, 0xB5]);
+                code.extend_from_slice(&offset.to_le_bytes());
+            }
+            // emit_strlen reads rsi, writes rdx (length)
+            emit_strlen(code);
+            // mov rcx, rdx
+            code.extend_from_slice(&[0x48, 0x89, 0xD1]);
+            Ok(())
+        }
+        Expr::Read(name) | Expr::Ident(name) | Expr::Fetch(name, _)
+            if text_bindings.contains_key(name.as_str()) =>
+        {
+            let &(ptr_slot, len_slot) = text_bindings.get(name.as_str()).unwrap();
+            // mov rsi, [rbp + ptr_slot]
+            if ptr_slot >= -128 {
+                code.extend_from_slice(&[0x48, 0x8B, 0x75]);
+                code.push(ptr_slot as u8);
+            } else {
+                code.extend_from_slice(&[0x48, 0x8B, 0xB5]);
+                code.extend_from_slice(&ptr_slot.to_le_bytes());
+            }
+            // mov rcx, [rbp + len_slot]
+            if len_slot >= -128 {
+                code.extend_from_slice(&[0x48, 0x8B, 0x4D]);
+                code.push(len_slot as u8);
+            } else {
+                code.extend_from_slice(&[0x48, 0x8B, 0x8D]);
+                code.extend_from_slice(&len_slot.to_le_bytes());
+            }
+            Ok(())
+        }
+        _ => Err(NativeError {
+            message: format!(
+                "starts_with: argument must be a text literal, text input field, \
+                 read(<resource>), fetch(<connection>, ...), or a text let in scope — \
+                 got {:?}. Concat / Call / JsonEscape / ParseInt as starts_with args \
+                 are out of scope for this slice.",
+                expr_kind(expr)
+            ),
+        }),
+    }
+}
+
+/// Emit `starts_with(haystack, needle)` returning bool in rax. See the
+/// comment on the StartsWith arm of emit_eval_expr for the algorithm.
+fn emit_starts_with(
+    code: &mut Vec<u8>,
+    haystack: &Expr,
+    needle: &Expr,
+    input_name: &str,
+    offsets: &HashMap<&str, i32>,
+    text_bindings: &TextBindings<'_>,
+) -> Result<(), NativeError> {
+    // Step 1: load haystack into (rsi, rcx); save into (r8, r9).
+    emit_starts_with_load_text(code, haystack, input_name, offsets, text_bindings)?;
+    // mov r8, rsi
+    code.extend_from_slice(&[0x49, 0x89, 0xF0]);
+    // mov r9, rcx
+    code.extend_from_slice(&[0x49, 0x89, 0xC9]);
+
+    // Step 2: load needle into (rsi, rcx).
+    emit_starts_with_load_text(code, needle, input_name, offsets, text_bindings)?;
+    // mov rdi, rsi  (cmpsb uses rdi as second source)
+    code.extend_from_slice(&[0x48, 0x89, 0xF7]);
+
+    // Step 3: cmp r9, rcx ; jb .nope (haystack shorter than needle → false)
+    code.extend_from_slice(&[0x49, 0x39, 0xC9]);
+    code.push(0x72);
+    let nope_patch = code.len();
+    code.push(0x00);
+
+    // Step 4: empty needle short-circuit (test rcx, rcx ; je .empty)
+    code.extend_from_slice(&[0x48, 0x85, 0xC9]);
+    code.push(0x74);
+    let empty_patch = code.len();
+    code.push(0x00);
+
+    // Step 5: restore haystack ptr to rsi (the load_text for needle put
+    // needle_ptr in rsi; we already mirrored it to rdi above).
+    // mov rsi, r8
+    code.extend_from_slice(&[0x4C, 0x89, 0xC6]);
+    // cld ; repe cmpsb
+    code.push(0xFC);
+    code.extend_from_slice(&[0xF3, 0xA6]);
+    // sete al
+    code.extend_from_slice(&[0x0F, 0x94, 0xC0]);
+    // jmp .done
+    code.push(0xEB);
+    let done_from_main_patch = code.len();
+    code.push(0x00);
+
+    // .empty: needle was empty → result is true
+    let empty_label = code.len();
+    code[empty_patch] = (empty_label - empty_patch - 1) as u8;
+    // mov al, 1
+    code.extend_from_slice(&[0xB0, 0x01]);
+    // jmp .done
+    code.push(0xEB);
+    let done_from_empty_patch = code.len();
+    code.push(0x00);
+
+    // .nope: haystack shorter than needle → false
+    let nope_label = code.len();
+    code[nope_patch] = (nope_label - nope_patch - 1) as u8;
+    // xor al, al
+    code.extend_from_slice(&[0x30, 0xC0]);
+
+    // .done: movzx rax, al  (zero-extend bool to qword)
+    let done_label = code.len();
+    code[done_from_main_patch] = (done_label - done_from_main_patch - 1) as u8;
+    code[done_from_empty_patch] = (done_label - done_from_empty_patch - 1) as u8;
+    code.extend_from_slice(&[0x48, 0x0F, 0xB6, 0xC0]);
+
+    Ok(())
 }
 
 /// Slice "parse_int": resolve the inner text expression to (rsi=ptr,
@@ -9035,6 +9242,7 @@ fn expr_kind(e: &Expr) -> &'static str {
         Expr::JsonEscape(_) => "JsonEscape",
         Expr::ParseInt(_) => "ParseInt",
         Expr::NowUnix => "NowUnix",
+        Expr::StartsWith(_, _) => "StartsWith",
     }
 }
 
@@ -11900,6 +12108,92 @@ mod tests {
         );
 
         let _ = fs::remove_file(out);
+    }
+
+    /// `starts_with(<haystack>, <needle>)` primitive (2026-04-29):
+    /// native byte-compare returning bool. Both args text. Composes
+    /// with the existing HTTP service handler emitter to express
+    /// path-prefix routing without regex.
+    ///
+    /// This test pins the four behaviors:
+    ///   (a) prefix match → true
+    ///   (b) length-too-short → false (the cmp r9, rcx ; jb gate)
+    ///   (c) byte mismatch within length → false (cmpsb sets ZF=0)
+    ///   (d) empty needle → always true (the test rcx ; je shortcut)
+    /// Plus a router test that exercises the more interesting
+    /// composition: starts_with inside an HTTP service handler's
+    /// if/else routing chain.
+    #[test]
+    fn slice_starts_with_runtime_byte_compare() {
+        use std::process::Command;
+        let src = r#"@verbose 0.1.0
+
+concept Req
+  @intention: "x"
+  @source: invoices.intent:1
+  fields:
+    path : text
+
+rule check
+  @intention: "x"
+  @source: invoices.intent:1
+  input:
+    r : Req
+  output:
+    ok : bool
+  logic:
+    ok = starts_with(r.path, "/admin/")
+  proofs:
+    purity:
+      reads : [r.path]
+      calls : []
+    termination:
+      bound : 1
+"#;
+        let tokens = crate::lexer::Lexer::new(src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+        let out = std::env::temp_dir().join("verbosec_test_starts_with");
+        compile_native(&program, "check", out.to_str().unwrap(), false, false)
+            .expect("starts_with should compile");
+
+        let run = |arg: &str| -> String {
+            let r = Command::new(&out).args([arg]).output().expect("spawn");
+            String::from_utf8_lossy(&r.stdout).trim_end_matches('\n').to_string()
+        };
+
+        // (a) prefix matches
+        assert_eq!(run("/admin/users"), "true");
+        assert_eq!(run("/admin/"), "true", "exact length match should be true");
+        // (b) length too short — the haystack is shorter than the needle
+        assert_eq!(run("/admin"), "false", "shorter than needle should be false");
+        assert_eq!(run("/adm"), "false");
+        assert_eq!(run(""), "false", "empty haystack vs non-empty needle");
+        // (c) byte mismatch within length
+        assert_eq!(run("/api/x"), "false");
+        assert_eq!(run("/admixn"), "false", "byte mismatch within length");
+
+        let _ = std::fs::remove_file(&out);
+
+        // Empty needle: any haystack matches.
+        let empty_src = src.replace("\"/admin/\"", "\"\"");
+        let tokens = crate::lexer::Lexer::new(&empty_src).tokenize().expect("tokenize");
+        let empty_program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+        let out2 = std::env::temp_dir().join("verbosec_test_starts_with_empty");
+        compile_native(&empty_program, "check", out2.to_str().unwrap(), false, false)
+            .expect("starts_with with empty needle should compile");
+        let r = Command::new(&out2).args(["/anything"]).output().expect("spawn");
+        assert_eq!(
+            String::from_utf8_lossy(&r.stdout).trim_end_matches('\n'),
+            "true",
+            "empty needle should match any haystack"
+        );
+        let r = Command::new(&out2).args([""]).output().expect("spawn");
+        assert_eq!(
+            String::from_utf8_lossy(&r.stdout).trim_end_matches('\n'),
+            "true",
+            "empty needle vs empty haystack should match"
+        );
+        let _ = std::fs::remove_file(&out2);
     }
 
     /// `now_unix()` extension (2026-04-28): the primitive now works in

@@ -1,0 +1,49 @@
+@verbose 0.1.0
+
+-- starts_with(<haystack>, <needle>) primitive (2026-04-29). Native
+-- byte-compare returning bool. Composed here with the existing HTTP
+-- service handler emitter to express path-prefix routing without
+-- regex, without external libraries, in a binary that fits in a
+-- single page.
+--
+-- Per request:
+--   1. parse HTTP method + path
+--   2. evaluate the if/else chain:
+--      - starts_with(req.path, "/api/v1/") → 200, body "api: <method>"
+--      - starts_with(req.path, "/health")  → 200, body "ok: <method>"
+--      - else                              → 404, body "not found: <method>"
+--   3. write response
+
+
+rule serve
+  @intention: "Route by URL path prefix; echo the method in the body"
+  @source: prefix_router.intent:1
+
+  input:
+    req : HttpRequest
+
+  output:
+    resp : HttpResponse
+
+  logic:
+    resp = if starts_with(req.path, "/api/v1/") then HttpResponse { status: 200, body: concat("api: ", req.method, "\n") } else if starts_with(req.path, "/health") then HttpResponse { status: 200, body: concat("ok: ", req.method, "\n") } else HttpResponse { status: 404, body: concat("not found: ", req.method, "\n") }
+
+  proofs:
+    purity:
+      reads : [req.path, req.method]
+      calls : []
+
+    termination:
+      bound : 10
+
+
+service router
+  @intention: "Listen on 18931 and route by URL path prefix"
+  @source: prefix_router.intent:1
+
+  listen:
+    protocol    : http_1_0
+    port        : 18931
+    max_request : 4096
+
+  handler: serve
