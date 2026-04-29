@@ -165,6 +165,16 @@ examples/
                    requires `reads: [now]` in the rule's purity proof —
                    same audit shape as `read(<resource>)`. ~475 B native
                    binary; pinned by now_unix_runtime_capture_and_verifier_check.
+  recent_event_abs.* `abs(<number>)` primitive (2026-04-29): branch-free
+                   5-byte inline (cqo + xor + sub) absolute value.
+                   Corrects the silent edge-case bug in the natural
+                   operator-style time-window pattern (`now - ts < 3600`
+                   silently passes ANY future event because the
+                   subtraction goes negative). `abs(now - ts) < 3600`
+                   expresses the symmetric ±3600s window correctly.
+                   ~483 B native binary; pinned by
+                   slice_abs_branch_free_and_corrects_future_event_bug
+                   + slice_abs_literal_folds_at_compile_time.
   parallel_threshold.* Slice 9.5f (2026-04-29): closes the resource-aware
                    emitter sweep. `read(<resource>)` allowed in
                    `emit_parallel_program`. The parent reads the
@@ -281,6 +291,7 @@ tools/
 - Record construction: `ConceptName { field: expr, field: expr, ... }` — typed constructor; verifier cross-checks field set + per-field types match the concept declaration
 - Text composition: `concat(e1, e2, ...)` — variadic text builder, scalar args only (number → decimal, bool → true/false, text as-is); no operator overloading on `+`, each arg is explicit
 - Text→number conversion: `parse_int(<text>)` — strict scan (optional `-`, then 1+ ASCII digits, then end-of-input); aborts the binary on any other shape (empty input, lone `-`, non-digit byte). Optimizer folds `parse_int("<literal>")` to `Number` at compile time; native runtime path handles `parse_int(read(<resource>))` and other BoundText sources via the same (ptr, len) shape used by Read / Fetch / Phase-2I lets
+- Number absolute value: `abs(<number>)` — Number, branch-free inline (`cqo; xor rax, rdx; sub rax, rdx` — 5 bytes total). Doesn't panic on `i64::MIN` (the value stays at MIN; optimizer fold uses `wrapping_abs` for the same property). Composes anywhere a number expression appears. Motivating use case: time-window comparisons where the natural `now - ts < window` form silently passes future events because the subtraction goes negative — `abs(now - ts) < window` expresses the symmetric window correctly
 - Text substring test: `contains(<haystack>, <needle>)` — bool, true iff `needle`'s bytes appear anywhere as a contiguous substring of `haystack`. Empty needle is always true; needle longer than haystack is false. Byte-exact (case-sensitive). Native: naive O(N*M) scan using `rep cmpsb` per candidate offset; verifier `max:` bounds make worst-case work statically known. Both args restricted to allocation-free shapes (literal / text input field / BoundText). Optimizer compile-time-folds `contains("<lit_a>", "<lit_b>")` to `Number(0|1)`
 - Text byte count: `length(<text>)` — Number, byte count of a text expression. Counts bytes (not characters): for ASCII this is the obvious answer; for multibyte UTF-8 the result is storage size, not visual length. Native dispatches: text input field → inline `emit_strlen` scan; BoundText (read / fetch / Phase-2I let) → load `len_slot` directly (zero scan because the prologue already counted the bytes); literal → optimizer folds to `Number` at compile time. Concat / Call / JsonEscape / ParseInt as length-arg refused
 - Text prefix test: `starts_with(<haystack>, <needle>)` — bool, true iff `haystack`'s bytes begin with `needle`'s bytes. Empty needle is always true (standard convention); needle longer than haystack is false. Both args must be text-typed; native restricts each arg to allocation-free shapes (literal, text input field, BoundText: `read(<resource>)` / `fetch(<connection>, _)` / Phase-2I text let). Optimizer compile-time-folds `starts_with("<lit_a>", "<lit_b>")` to `Number(0|1)`. Composes naturally with HTTP service handlers for path-prefix routing without regex

@@ -291,6 +291,14 @@ fn eval_expr(
                 }),
             }
         }
+        Expr::Abs(inner) => {
+            match eval_expr(inner, env, all_rules)? {
+                Value::Number(n) => Ok(Value::Number(n.wrapping_abs())),
+                other => Err(RuntimeError {
+                    message: format!("'abs' requires number, got {}", other),
+                }),
+            }
+        }
         Expr::Quantifier(kind, collection, var_name, predicate) => {
             let coll_val = eval_expr(collection, env, all_rules)?;
             let items = match coll_val {

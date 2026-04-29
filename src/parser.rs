@@ -804,6 +804,22 @@ impl Parser {
                 }
                 self.expect_kind(TokenKind::RParen)?;
                 Ok(Expr::Length(Box::new(inner)))
+            } else if name == "abs" && self.check_kind(&TokenKind::LParen) {
+                // `abs(<number_expr>)` — absolute value. Exactly one argument;
+                // zero or two-plus is a parse-time error. The verifier checks
+                // that the inner expression produces number (NOT text — this
+                // is the key difference from parse_int/length). Same arity
+                // shape as parse_int.
+                self.advance(); // (
+                if self.check_kind(&TokenKind::RParen) {
+                    return Err(self.error("abs requires exactly one argument, got zero"));
+                }
+                let inner = self.parse_expr()?;
+                if self.check_kind(&TokenKind::Comma) {
+                    return Err(self.error("abs requires exactly one argument, got more than one"));
+                }
+                self.expect_kind(TokenKind::RParen)?;
+                Ok(Expr::Abs(Box::new(inner)))
             } else if name == "match_result" && self.check_kind(&TokenKind::LParen) {
                 // match_result(target, ok_var => ok_body, err_var => err_body)
                 // The Result consumer. Both arms are explicit — no implicit

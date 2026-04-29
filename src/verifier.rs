@@ -340,6 +340,9 @@ fn collect_read_names(expr: &Expr, out: &mut Vec<String>) {
         // `length(<text_expr>)` — pure pass-through; the inner may carry a
         // `read(...)` (e.g. `length(read(name))`).
         Expr::Length(inner) => collect_read_names(inner, out),
+        // `abs(<number_expr>)` — pure pass-through; the inner may carry a
+        // `read(...)` via `parse_int(read(name))` etc.
+        Expr::Abs(inner) => collect_read_names(inner, out),
     }
 }
 
@@ -440,6 +443,8 @@ fn collect_fetch_names(expr: &Expr, out: &mut Vec<String>) {
         }
         // `length(<text_expr>)` — pure pass-through.
         Expr::Length(inner) => collect_fetch_names(inner, out),
+        // `abs(<number_expr>)` — pure pass-through.
+        Expr::Abs(inner) => collect_fetch_names(inner, out),
     }
 }
 
@@ -514,6 +519,8 @@ fn collect_fetch_names_with_dups(expr: &Expr, out: &mut Vec<String>) {
         }
         // `length(<text_expr>)` — pure pass-through.
         Expr::Length(inner) => collect_fetch_names_with_dups(inner, out),
+        // `abs(<number_expr>)` — pure pass-through.
+        Expr::Abs(inner) => collect_fetch_names_with_dups(inner, out),
     }
 }
 
@@ -993,6 +1000,7 @@ fn describe_expr_kind(e: &Expr) -> &'static str {
         Expr::StartsWith(_, _) => "starts_with",
         Expr::Contains(_, _) => "contains",
         Expr::Length(_) => "length",
+        Expr::Abs(_) => "abs",
     }
 }
 
@@ -1368,6 +1376,22 @@ fn check_expr_against(
                 ),
             });
         }
+        // `abs(<number_expr>)` produces number. Differs from ParseInt/Length/
+        // JsonEscape: inner is number, not text. When the surrounding context
+        // expects number, recurse into the inner with expected=Number; the
+        // verifier will reject text/bool args via that recursion.
+        (Expr::Abs(inner), Type::Number) => {
+            check_expr_against(inner, &Type::Number, rule, all_rules, input_concept, all_concepts, errors);
+        }
+        (Expr::Abs(_), other) => {
+            errors.push(VerifyError {
+                context: format!("rule '{}' / logic", rule.name),
+                message: format!(
+                    "abs produces number but the expected type is '{}'",
+                    type_display(other),
+                ),
+            });
+        }
         (Expr::MatchResult(_target, _, ok_body, _, err_body), _) => {
             // Both arms must produce `expected`. The target should be a Result —
             // checking that requires inferring through lambda bindings, which
@@ -1575,6 +1599,9 @@ fn infer_expr_type(
         // `length(<text>)` returns number. Inner text-ness enforced by
         // check_expr_against.
         Expr::Length(_) => Some(Type::Number),
+        // `abs(<number>)` returns number. Inner number-ness enforced by
+        // check_expr_against.
+        Expr::Abs(_) => Some(Type::Number),
         // Map/Filter/Fold/Ok/Err/MatchResult: deferred until lambda binding
         // tracking lands. Returning None means we do not check; we also do not
         // falsely accept.
@@ -1901,6 +1928,11 @@ fn collect_expr_facts(
         Expr::Length(inner) => {
             collect_expr_facts(inner, reads, calls);
         }
+        // `abs(<number_expr>)` — pure pass-through. The absolute value adds
+        // no synthetic read; the inner expression's facts are the facts.
+        Expr::Abs(inner) => {
+            collect_expr_facts(inner, reads, calls);
+        }
     }
 }
 
@@ -2114,6 +2146,8 @@ fn count_operations(expr: &Expr) -> usize {
         Expr::Contains(h, n) => 1 + count_operations(h) + count_operations(n),
         // `length(<text_expr>)` — same shape as ParseInt: one op + inner cost.
         Expr::Length(inner) => 1 + count_operations(inner),
+        // `abs(<number_expr>)` — same shape as Neg: one op + inner cost.
+        Expr::Abs(inner) => 1 + count_operations(inner),
     }
 }
 

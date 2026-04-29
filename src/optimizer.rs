@@ -71,6 +71,8 @@ fn count_nodes(expr: &Expr) -> usize {
         Expr::Contains(h, n) => 1 + count_nodes(h) + count_nodes(n),
         // `length(<text_expr>)` — same shape as ParseInt: one node + recurse.
         Expr::Length(inner) => 1 + count_nodes(inner),
+        // `abs(<number_expr>)` — same shape as Neg: one node + recurse.
+        Expr::Abs(inner) => 1 + count_nodes(inner),
     }
 }
 
@@ -382,6 +384,10 @@ fn substitute_ident(expr: &Expr, name: &str, replacement: &Expr) -> Expr {
         Expr::Length(inner) => Expr::Length(
             Box::new(substitute_ident(inner, name, replacement)),
         ),
+        // `abs(<number_expr>)` — substitute through the inner expression.
+        Expr::Abs(inner) => Expr::Abs(
+            Box::new(substitute_ident(inner, name, replacement)),
+        ),
     }
 }
 
@@ -636,6 +642,17 @@ pub fn optimize_expr(
                 return Expr::Number(s.as_bytes().len() as i64);
             }
             Expr::Length(Box::new(inner))
+        }
+        // `abs(<number_expr>)` — if the inner is a number literal, fold to
+        // the absolute value at compile time. `wrapping_abs` avoids panic
+        // on i64::MIN (mirrors Neg's wrapping fold convention). Otherwise
+        // recurse and keep the wrapper for the backend.
+        Expr::Abs(inner) => {
+            let inner = optimize_expr(inner, input_name, field_ranges);
+            if let Expr::Number(n) = &inner {
+                return Expr::Number(n.wrapping_abs());
+            }
+            Expr::Abs(Box::new(inner))
         }
     }
 }

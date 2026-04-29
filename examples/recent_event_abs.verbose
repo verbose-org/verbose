@@ -1,0 +1,52 @@
+@verbose 0.1.0
+
+-- abs(<number>) primitive (2026-04-29). Corrects the silent edge
+-- case in `recent_event.verbose`: that rule says
+--
+--    fresh = now_unix() - e.ts < 3600
+--
+-- which gives `true` for any event STRICTLY IN THE FUTURE (clock
+-- skew, replay attack, manual injection) because future ts → negative
+-- subtraction → less than 3600 → "fresh". A bug-prone pattern that
+-- the natural operator-style invites.
+--
+-- This rule expresses the symmetric time window correctly:
+--
+--    fresh = abs(now_unix() - e.ts) < 3600
+--
+-- True iff the event is within ±3600 seconds of `now`. Future events
+-- more than an hour out are rejected; past events more than an hour
+-- old are rejected. No silent pass-through.
+--
+-- Native: 5-byte branch-free inline (cqo + xor + sub) after the
+-- subtraction. Zero overhead vs the buggy form.
+
+
+concept Event
+  @intention: "An event with a Unix-epoch timestamp"
+  @source: recent_event_abs.intent:1
+
+  fields:
+    ts : number
+
+
+rule recent
+  @intention: "True iff the event is within an hour of `now` (past or future)"
+  @source: recent_event_abs.intent:1
+
+  input:
+    e : Event
+
+  output:
+    fresh : bool
+
+  logic:
+    fresh = abs(now_unix() - e.ts) < 3600
+
+  proofs:
+    purity:
+      reads : [e.ts, now]
+      calls : []
+
+    termination:
+      bound : 4

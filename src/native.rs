@@ -476,6 +476,8 @@ fn let_rhs_is_text(
         Expr::ParseInt(_) => false,
         // `now_unix()` returns number — same number-let path as ParseInt.
         Expr::NowUnix => false,
+        // `abs(<number>)` returns number — same number-let path as ParseInt.
+        Expr::Abs(_) => false,
         _ => false,
     }
 }
@@ -561,6 +563,8 @@ fn collect_read_names_native(expr: &Expr, out: &mut Vec<String>) {
         }
         // `length(<text_expr>)` — pure pass-through.
         Expr::Length(inner) => collect_read_names_native(inner, out),
+        // `abs(<number_expr>)` — pure pass-through.
+        Expr::Abs(inner) => collect_read_names_native(inner, out),
     }
 }
 
@@ -576,7 +580,7 @@ fn expr_uses_now_unix(e: &Expr) -> bool {
         Expr::Field(b, _) => expr_uses_now_unix(b),
         Expr::Binary(_, l, r) => expr_uses_now_unix(l) || expr_uses_now_unix(r),
         Expr::Not(i) | Expr::Neg(i) | Expr::Ok(i) | Expr::Err(i) => expr_uses_now_unix(i),
-        Expr::JsonEscape(i) | Expr::ParseInt(i) | Expr::Length(i) => expr_uses_now_unix(i),
+        Expr::JsonEscape(i) | Expr::ParseInt(i) | Expr::Length(i) | Expr::Abs(i) => expr_uses_now_unix(i),
         Expr::If(c, t, el) => {
             expr_uses_now_unix(c) || expr_uses_now_unix(t) || expr_uses_now_unix(el)
         }
@@ -725,6 +729,8 @@ fn collect_fetch_names_native(expr: &Expr, out: &mut Vec<String>) {
         }
         // `length(<text_expr>)` — pure pass-through.
         Expr::Length(inner) => collect_fetch_names_native(inner, out),
+        // `abs(<number_expr>)` — pure pass-through.
+        Expr::Abs(inner) => collect_fetch_names_native(inner, out),
     }
 }
 
@@ -993,6 +999,8 @@ fn emit_connection_fetch_sequence(
             Expr::Contains(h, n) => first_fetch_for(h, name).or_else(|| first_fetch_for(n, name)),
             // `length(<text_expr>)` — pass-through.
             Expr::Length(inner) => first_fetch_for(inner, name),
+            // `abs(<number_expr>)` — pass-through.
+            Expr::Abs(inner) => first_fetch_for(inner, name),
         }
     }
     let request_expr: &Expr = {
@@ -6607,6 +6615,9 @@ fn max_stack_depth(expr: &Expr) -> usize {
         // `length(<text_expr>)` — fixed-register strlen scan / len_slot
         // load, the inner's depth dominates.
         Expr::Length(inner) => max_stack_depth(inner),
+        // `abs(<number_expr>)` — 5-byte inline (cqo; xor rax, rdx; sub rax, rdx),
+        // no eval-stack push, the inner's depth dominates.
+        Expr::Abs(inner) => max_stack_depth(inner),
     }
 }
 
@@ -7292,6 +7303,27 @@ fn emit_eval_expr(
         //     ParseInt as length-arg would require a per-call scratch
         //     evaluation; not in this slice)
         Expr::Length(inner) => emit_length(code, inner.as_ref(), input_name, offsets, text_bindings),
+        // `abs(<number>)` — branch-free absolute value via the canonical
+        // 5-byte inline:
+        //   cqo                 ; rdx = (rax < 0) ? -1 : 0
+        //   xor rax, rdx        ; flip bits if negative
+        //   sub rax, rdx        ; add 1 if negative (because rdx is -1)
+        // For non-negative values: cqo→rdx=0, xor with 0 leaves rax,
+        // sub 0 leaves rax. For negative: cqo→rdx=-1, xor flips bits
+        // (= bitwise NOT), sub -1 adds 1 → that's two's complement
+        // negation. Branch-free, no `cmp`, 5 bytes total. Doesn't
+        // panic on i64::MIN (it stays at i64::MIN; the optimizer fold
+        // uses wrapping_abs for the same property).
+        Expr::Abs(inner) => {
+            emit_eval_expr(code, inner, input_name, offsets, all_rules, field_ranges, text_bindings)?;
+            // cqo
+            code.extend_from_slice(&[0x48, 0x99]);
+            // xor rax, rdx
+            code.extend_from_slice(&[0x48, 0x31, 0xD0]);
+            // sub rax, rdx
+            code.extend_from_slice(&[0x48, 0x29, 0xD0]);
+            Ok(())
+        }
     }
 }
 
@@ -9559,6 +9591,7 @@ fn expr_kind(e: &Expr) -> &'static str {
         Expr::StartsWith(_, _) => "StartsWith",
         Expr::Contains(_, _) => "Contains",
         Expr::Length(_) => "Length",
+        Expr::Abs(_) => "Abs",
     }
 }
 
@@ -12424,6 +12457,112 @@ mod tests {
         );
 
         let _ = fs::remove_file(out);
+    }
+
+    /// `abs(<number>)` primitive (2026-04-29): branch-free 5-byte
+    /// inline absolute value. Composes anywhere a number expression
+    /// can appear. The motivating use case: time-window comparisons
+    /// where the natural operator-style `now - ts < window` silently
+    /// passes ANY future event because the subtraction goes negative.
+    /// `abs(now - ts) < window` expresses the symmetric window
+    /// correctly.
+    ///
+    /// Pins:
+    ///   (a) past events within window → true
+    ///   (b) past events outside window → false
+    ///   (c) future events within window → true (the operator-style
+    ///       buggy form would also say true here — both correct)
+    ///   (d) future events OUTSIDE window → false (the buggy form
+    ///       would say true — this is the bug abs() fixes)
+    ///   (e) boundary at ±3599 (true) vs ±3600 (false, strict <)
+    ///   (f) abs of i64 values doesn't panic on i64::MIN (uses cqo)
+    #[test]
+    fn slice_abs_branch_free_and_corrects_future_event_bug() {
+        use std::process::Command;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let src = std::fs::read_to_string("examples/recent_event_abs.verbose")
+            .expect("examples/recent_event_abs.verbose");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+        let out = std::env::temp_dir().join("verbosec_test_abs_recent");
+        compile_native(&program, "recent", out.to_str().unwrap(), false, false)
+            .expect("abs(now_unix() - ts) < 3600 should compile");
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_secs() as i64;
+        let run = |ts: i64| -> String {
+            let r = Command::new(&out).args([ts.to_string()]).output().expect("spawn");
+            String::from_utf8_lossy(&r.stdout).trim_end_matches('\n').to_string()
+        };
+
+        // (a) past, within
+        assert_eq!(run(now - 30), "true");
+        assert_eq!(run(now - 100), "true");
+        // (b) past, outside
+        assert_eq!(run(now - 7200), "false");
+        // (c) future, within
+        assert_eq!(run(now + 30), "true", "future within window must be true");
+        // (d) future, outside — this is the BUG abs fixes
+        assert_eq!(run(now + 7200), "false",
+            "future event outside window must be false (this fails the buggy operator-style form)");
+        // (e) boundaries (strict <)
+        assert_eq!(run(now - 3599), "true");
+        assert_eq!(run(now + 3599), "true");
+        assert_eq!(run(now - 3600), "false");
+        assert_eq!(run(now + 3600), "false");
+
+        let _ = std::fs::remove_file(&out);
+    }
+
+    /// `abs` literal-fold smoke test: optimizer turns `abs(<negative>)`
+    /// into `Number(positive)` BEFORE native sees the AST. Pins the
+    /// `wrapping_abs` semantics (no panic on edge cases like i64::MIN).
+    #[test]
+    fn slice_abs_literal_folds_at_compile_time() {
+        let src = r#"@verbose 0.1.0
+
+concept T
+  @intention: "x"
+  @source: invoices.intent:1
+  fields:
+    n : number
+
+rule lit
+  @intention: "x"
+  @source: invoices.intent:1
+  input:
+    t : T
+  output:
+    out : number
+  logic:
+    out = abs(0 - 42) + t.n
+  proofs:
+    purity:
+      reads : [t.n]
+      calls : []
+    termination:
+      bound : 3
+"#;
+        let tokens = crate::lexer::Lexer::new(src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+        // Mirror the CLI flow: optimizer runs before native dispatch.
+        let (program, _) = crate::optimizer::optimize_program(&program);
+        let out = std::env::temp_dir().join("verbosec_test_abs_literal_fold");
+        compile_native(&program, "lit", out.to_str().unwrap(), false, false)
+            .expect("literal abs should compile");
+        let r = std::process::Command::new(&out)
+            .args(["8"])
+            .output()
+            .expect("spawn");
+        assert_eq!(
+            String::from_utf8_lossy(&r.stdout).trim_end_matches('\n'),
+            "50",
+            "abs(0 - 42) + 8 = 42 + 8 = 50"
+        );
+        let _ = std::fs::remove_file(&out);
     }
 
     /// Slice 9.5f (2026-04-29): closes the resource-aware emitter sweep.

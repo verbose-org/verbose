@@ -1,0 +1,1 @@
+1. A rule that takes an event with a Unix-epoch timestamp and returns true if the event happened within an hour of the system clock — past OR future. The same value as the older recent_event but corrects the silent edge case where a future-dated event (clock skew, replay attack, manual injection) would otherwise pass the filter via a negative subtraction.

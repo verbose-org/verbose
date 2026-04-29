@@ -534,6 +534,17 @@ pub enum Expr {
     /// haystack can each be a literal, a text input field, or BoundText
     /// (`read(<resource>)`, `fetch(<connection>, ...)`, Phase-2I let).
     Contains(Box<Expr>, Box<Expr>),
+    /// `abs(<number_expr>)` — absolute value. Inner must be number-typed;
+    /// output is `number`. Useful where the natural operator-style
+    /// `a - b < window` is bug-prone (future timestamps make the
+    /// difference negative and silently pass the filter); `abs(a - b)
+    /// < window` expresses the symmetric time-window correctly.
+    ///
+    /// Native: 5-byte canonical inline (`cqo; xor rax, rdx; sub rax, rdx`)
+    /// — sign-extends rax into rdx (which becomes 0 for non-negative,
+    /// -1 for negative), then xor + sub flips the bits and adds 1 only
+    /// when negative. No branch.
+    Abs(Box<Expr>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
