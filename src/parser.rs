@@ -767,6 +767,21 @@ impl Parser {
                 }
                 self.expect_kind(TokenKind::RParen)?;
                 Ok(Expr::StartsWith(Box::new(haystack), Box::new(needle)))
+            } else if name == "length" && self.check_kind(&TokenKind::LParen) {
+                // `length(<text_expr>)` — byte count of inner text as a
+                // number. Exactly one argument; zero or two-plus is a
+                // parse-time error. The verifier checks that the inner
+                // expression produces text. Same shape as parse_int.
+                self.advance(); // (
+                if self.check_kind(&TokenKind::RParen) {
+                    return Err(self.error("length requires exactly one argument, got zero"));
+                }
+                let inner = self.parse_expr()?;
+                if self.check_kind(&TokenKind::Comma) {
+                    return Err(self.error("length requires exactly one argument, got more than one"));
+                }
+                self.expect_kind(TokenKind::RParen)?;
+                Ok(Expr::Length(Box::new(inner)))
             } else if name == "match_result" && self.check_kind(&TokenKind::LParen) {
                 // match_result(target, ok_var => ok_body, err_var => err_body)
                 // The Result consumer. Both arms are explicit — no implicit

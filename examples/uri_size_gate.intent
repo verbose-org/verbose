@@ -1,0 +1,1 @@
+1. An HTTP service whose handler rejects requests whose URL path is longer than a maximum loaded from a file at startup. If the path's byte length exceeds the limit, the response is 414 with a body explaining the limit. Otherwise the response is 200 with the path echoed. The limit can be tuned without recompiling by editing the file.

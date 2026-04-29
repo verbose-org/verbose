@@ -1,0 +1,58 @@
+@verbose 0.1.0
+
+-- length(<text>) primitive (2026-04-29). Composes naturally with
+-- parse_int + read for runtime-tunable input validation. Concrete
+-- pattern: gate a request by URL path length, with the limit loaded
+-- from a file the operator can edit between binary invocations.
+--
+-- Why this composition:
+--   - length(req.path) loads from an rbp slot the prologue already
+--     populated when the HTTP parser ran (zero scan)
+--   - parse_int(read(max_uri)) loads + validates a number from disk
+--     (fail-closed on missing file or invalid content)
+--   - the comparison is a regular arithmetic > between two numbers
+-- Total: 6 declared effects (1 read, 1 parse_int abort path) and a
+-- one-line if/else.
+
+
+resource max_uri
+  @intention: "Maximum allowed URL path length in bytes"
+  @source: uri_size_gate.intent:1
+
+  path: "/tmp/verbose_max_uri.txt"
+  max:  16
+  on_read_error: abort
+
+
+rule serve
+  @intention: "Reject requests whose URL path exceeds the runtime limit"
+  @source: uri_size_gate.intent:1
+
+  input:
+    req : HttpRequest
+
+  output:
+    resp : HttpResponse
+
+  logic:
+    resp = if length(req.path) > parse_int(read(max_uri)) then HttpResponse { status: 414, body: "URI too long\n" } else HttpResponse { status: 200, body: concat("ok: ", req.path, "\n") }
+
+  proofs:
+    purity:
+      reads : [req.path, max_uri]
+      calls : []
+
+    termination:
+      bound : 8
+
+
+service uri_gate
+  @intention: "Listen on 18933 and gate requests by URL path length"
+  @source: uri_size_gate.intent:1
+
+  listen:
+    protocol    : http_1_0
+    port        : 18933
+    max_request : 4096
+
+  handler: serve

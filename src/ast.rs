@@ -502,6 +502,20 @@ pub enum Expr {
     /// let. Same family as `field == read(<resource>)` (slice
     /// "text equality with bound RHS" 2026-04-28).
     StartsWith(Box<Expr>, Box<Expr>),
+    /// `length(<text_expr>)` — byte count of a text expression as a
+    /// number. Inner must be text-typed; output is `number`.
+    ///
+    /// Counts bytes, not characters — Verbose stays at the byte level
+    /// (no UTF-8 awareness). For ASCII this is the obvious answer; for
+    /// multibyte UTF-8 the result is the storage size, not the visual
+    /// length. Documented and intentional.
+    ///
+    /// Composes with the existing BoundText shape: argv text fields
+    /// use the inline `emit_strlen` scan; bound text (read / fetch /
+    /// Phase-2I let) loads the length directly from the registered
+    /// len_slot — zero scan cost for runtime-loaded data whose length
+    /// the prologue already knows.
+    Length(Box<Expr>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

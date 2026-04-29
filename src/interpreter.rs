@@ -572,6 +572,22 @@ fn eval_expr(
                 }),
             }
         }
+        // `length(<text_expr>)` — byte count of inner text. Inner must
+        // evaluate to Value::Text (else type error). Returns the byte
+        // length as a Number, mirroring what native emits via the
+        // strlen scan / len_slot load.
+        Expr::Length(inner) => {
+            let v = eval_expr(inner, env, all_rules)?;
+            match v {
+                Value::Text(s) => Ok(Value::Number(s.as_bytes().len() as i64)),
+                other => Err(RuntimeError {
+                    message: format!(
+                        "length requires a text value, got {}",
+                        other
+                    ),
+                }),
+            }
+        }
     }
 }
 

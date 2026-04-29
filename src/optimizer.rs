@@ -66,6 +66,8 @@ fn count_nodes(expr: &Expr) -> usize {
         // `starts_with(haystack, needle)` — count this node + recurse into
         // both children (same shape as Binary).
         Expr::StartsWith(h, n) => 1 + count_nodes(h) + count_nodes(n),
+        // `length(<text_expr>)` — same shape as ParseInt: one node + recurse.
+        Expr::Length(inner) => 1 + count_nodes(inner),
     }
 }
 
@@ -368,6 +370,10 @@ fn substitute_ident(expr: &Expr, name: &str, replacement: &Expr) -> Expr {
             Box::new(substitute_ident(h, name, replacement)),
             Box::new(substitute_ident(n, name, replacement)),
         ),
+        // `length(<text_expr>)` — substitute through the inner expression.
+        Expr::Length(inner) => Expr::Length(
+            Box::new(substitute_ident(inner, name, replacement)),
+        ),
     }
 }
 
@@ -591,6 +597,16 @@ pub fn optimize_expr(
                 return Expr::Number(if s1.as_bytes().starts_with(s2.as_bytes()) { 1 } else { 0 });
             }
             Expr::StartsWith(Box::new(h_opt), Box::new(n_opt))
+        }
+        // `length(<text_expr>)` — if the inner is a text literal, fold the
+        // byte count at compile time. Otherwise recurse and keep the
+        // wrapper for the backend to lower at runtime.
+        Expr::Length(inner) => {
+            let inner = optimize_expr(inner, input_name, field_ranges);
+            if let Expr::Text(s) = &inner {
+                return Expr::Number(s.as_bytes().len() as i64);
+            }
+            Expr::Length(Box::new(inner))
         }
     }
 }

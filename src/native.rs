@@ -552,6 +552,8 @@ fn collect_read_names_native(expr: &Expr, out: &mut Vec<String>) {
             collect_read_names_native(h, out);
             collect_read_names_native(n, out);
         }
+        // `length(<text_expr>)` — pure pass-through.
+        Expr::Length(inner) => collect_read_names_native(inner, out),
     }
 }
 
@@ -567,7 +569,7 @@ fn expr_uses_now_unix(e: &Expr) -> bool {
         Expr::Field(b, _) => expr_uses_now_unix(b),
         Expr::Binary(_, l, r) => expr_uses_now_unix(l) || expr_uses_now_unix(r),
         Expr::Not(i) | Expr::Neg(i) | Expr::Ok(i) | Expr::Err(i) => expr_uses_now_unix(i),
-        Expr::JsonEscape(i) | Expr::ParseInt(i) => expr_uses_now_unix(i),
+        Expr::JsonEscape(i) | Expr::ParseInt(i) | Expr::Length(i) => expr_uses_now_unix(i),
         Expr::If(c, t, el) => {
             expr_uses_now_unix(c) || expr_uses_now_unix(t) || expr_uses_now_unix(el)
         }
@@ -707,6 +709,8 @@ fn collect_fetch_names_native(expr: &Expr, out: &mut Vec<String>) {
             collect_fetch_names_native(h, out);
             collect_fetch_names_native(n, out);
         }
+        // `length(<text_expr>)` — pure pass-through.
+        Expr::Length(inner) => collect_fetch_names_native(inner, out),
     }
 }
 
@@ -971,6 +975,8 @@ fn emit_connection_fetch_sequence(
             Expr::NowUnix => None,
             // `starts_with(haystack, needle)` — recurse into both children.
             Expr::StartsWith(h, n) => first_fetch_for(h, name).or_else(|| first_fetch_for(n, name)),
+            // `length(<text_expr>)` — pass-through.
+            Expr::Length(inner) => first_fetch_for(inner, name),
         }
     }
     let request_expr: &Expr = {
@@ -6579,6 +6585,9 @@ fn max_stack_depth(expr: &Expr) -> usize {
         // depth dominates. Same shape as Binary minus the +1 push (the
         // result is materialized in rax, not pushed for the parent).
         Expr::StartsWith(h, n) => max_stack_depth(h).max(max_stack_depth(n)),
+        // `length(<text_expr>)` — fixed-register strlen scan / len_slot
+        // load, the inner's depth dominates.
+        Expr::Length(inner) => max_stack_depth(inner),
     }
 }
 
@@ -7228,6 +7237,88 @@ fn emit_eval_expr(
             offsets,
             text_bindings,
         ),
+        // `length(<text_expr>)` — byte count returned in rax.
+        // Inner shape dispatch:
+        //   - Text literal: optimizer should have folded; if it slipped
+        //     through, emit `mov rax, <length>` (compile-time constant)
+        //   - text input field (Field of input): inline strlen scan
+        //   - BoundText (Read / Ident / Fetch with text_bindings entry):
+        //     load len_slot directly into rax — zero-scan path because
+        //     the prologue already counted the bytes when the resource
+        //     was read or the let was evaluated
+        //   - anything else: clear refusal (Concat / Call / JsonEscape /
+        //     ParseInt as length-arg would require a per-call scratch
+        //     evaluation; not in this slice)
+        Expr::Length(inner) => emit_length(code, inner.as_ref(), input_name, offsets, text_bindings),
+    }
+}
+
+/// `length(<text>)` native emission. Produces the byte count in rax.
+/// See the StartsWith load-text helper for the analogous shape; this
+/// helper is simpler because length is a single-arg primitive (no
+/// two-arg ordering, no stack-buffer concern).
+fn emit_length(
+    code: &mut Vec<u8>,
+    inner: &Expr,
+    input_name: &str,
+    offsets: &HashMap<&str, i32>,
+    text_bindings: &TextBindings<'_>,
+) -> Result<(), NativeError> {
+    match inner {
+        // Compile-time constant: optimizer should fold `length("abc")`
+        // to `Number(3)` and never reach here. Defensive emit just in
+        // case a non-optimized path materialises a literal Length.
+        Expr::Text(s) => {
+            let n = s.as_bytes().len() as i64;
+            // mov rax, imm32 (works for typical text sizes; emit_mov_rax_imm
+            // handles wider values if needed).
+            emit_mov_rax_imm(code, n);
+            Ok(())
+        }
+        Expr::Field(base, fname) if matches!(base.as_ref(), Expr::Ident(n) if n == input_name) => {
+            let &offset = offsets.get(fname.as_str()).ok_or_else(|| NativeError {
+                message: format!("length: unknown text input field '{}'", fname),
+            })?;
+            // mov rsi, [rbp + offset]   — NUL-terminated argv pointer
+            if offset >= -128 {
+                code.extend_from_slice(&[0x48, 0x8B, 0x75]);
+                code.push(offset as u8);
+            } else {
+                code.extend_from_slice(&[0x48, 0x8B, 0xB5]);
+                code.extend_from_slice(&offset.to_le_bytes());
+            }
+            // emit_strlen reads rsi, writes rdx
+            emit_strlen(code);
+            // mov rax, rdx
+            code.extend_from_slice(&[0x48, 0x89, 0xD0]);
+            Ok(())
+        }
+        Expr::Read(name) | Expr::Ident(name) | Expr::Fetch(name, _)
+            if text_bindings.contains_key(name.as_str()) =>
+        {
+            let &(_ptr_slot, len_slot) = text_bindings.get(name.as_str()).unwrap();
+            // mov rax, [rbp + len_slot]   — the length is already at the
+            // registered slot (populated by emit_resource_read_sequence,
+            // emit_connection_fetch_sequence, or the Phase-2I let
+            // evaluation). Zero scan.
+            if len_slot >= -128 {
+                code.extend_from_slice(&[0x48, 0x8B, 0x45]);
+                code.push(len_slot as u8);
+            } else {
+                code.extend_from_slice(&[0x48, 0x8B, 0x85]);
+                code.extend_from_slice(&len_slot.to_le_bytes());
+            }
+            Ok(())
+        }
+        _ => Err(NativeError {
+            message: format!(
+                "length: argument must be a text literal, text input field, \
+                 read(<resource>), fetch(<connection>, ...), or a text let in scope — \
+                 got {:?}. Concat / Call / JsonEscape / ParseInt as length args \
+                 would need a per-call scratch evaluation; out of scope for this slice.",
+                expr_kind(inner)
+            ),
+        }),
     }
 }
 
@@ -9243,6 +9334,7 @@ fn expr_kind(e: &Expr) -> &'static str {
         Expr::ParseInt(_) => "ParseInt",
         Expr::NowUnix => "NowUnix",
         Expr::StartsWith(_, _) => "StartsWith",
+        Expr::Length(_) => "Length",
     }
 }
 
@@ -12108,6 +12200,112 @@ mod tests {
         );
 
         let _ = fs::remove_file(out);
+    }
+
+    /// `length(<text>)` primitive (2026-04-29): byte count of a text
+    /// expression as a Number. Three native paths:
+    ///   - text input field → emit_strlen scan (3 µs-ish for argv text)
+    ///   - BoundText (read/fetch/Phase-2I let) → load len_slot directly
+    ///     (zero scan; the prologue already counted the bytes)
+    ///   - literal → folded to Number at compile time (never reaches native)
+    ///
+    /// This test pins:
+    ///   (a) length(text_field) returns the exact byte count
+    ///   (b) length(read(<resource>)) returns the file size (zero-scan
+    ///       because the read syscall already returned the byte count)
+    ///   (c) length("literal") folds at compile time (binary stays tight)
+    ///   (d) length composes with parse_int + comparison for runtime-
+    ///       tunable input validation gates (HTTP 414 pattern)
+    #[test]
+    fn length_runtime_and_compose_with_parse_int() {
+        use std::process::Command;
+
+        // (a) length(text_field) via a CLI scalar rule.
+        let src_a = r#"@verbose 0.1.0
+
+concept Req
+  @intention: "x"
+  @source: invoices.intent:1
+  fields:
+    path : text
+
+rule path_len
+  @intention: "x"
+  @source: invoices.intent:1
+  input:
+    r : Req
+  output:
+    n : number
+  logic:
+    n = length(r.path)
+  proofs:
+    purity:
+      reads : [r.path]
+      calls : []
+    termination:
+      bound : 1
+"#;
+        let tokens = crate::lexer::Lexer::new(src_a).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+        let out = std::env::temp_dir().join("verbosec_test_length_field");
+        compile_native(&program, "path_len", out.to_str().unwrap(), false, false)
+            .expect("length(text_field) should compile");
+
+        let run = |arg: &str| -> String {
+            let r = Command::new(&out).args([arg]).output().expect("spawn");
+            String::from_utf8_lossy(&r.stdout).trim_end_matches('\n').to_string()
+        };
+        assert_eq!(run(""), "0", "empty path → 0");
+        assert_eq!(run("/api"), "4", "/api → 4 bytes");
+        assert_eq!(run("/this/is/a/very/long/path"), "25", "long path → 25 bytes");
+        let _ = std::fs::remove_file(&out);
+
+        // (c) length("literal") folds to Number.
+        let src_c = r#"@verbose 0.1.0
+
+concept Tick
+  @intention: "x"
+  @source: invoices.intent:1
+  fields:
+    n : number
+
+rule lit_len
+  @intention: "x"
+  @source: invoices.intent:1
+  input:
+    t : Tick
+  output:
+    sz : number
+  logic:
+    sz = length("hello world") + t.n
+  proofs:
+    purity:
+      reads : [t.n]
+      calls : []
+    termination:
+      bound : 2
+"#;
+        let tokens = crate::lexer::Lexer::new(src_c).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+        // Mirror the CLI flow: optimizer runs before native dispatch so
+        // length("hello world") folds to Number(11) before native sees it.
+        let (program, _) = crate::optimizer::optimize_program(&program);
+        let out = std::env::temp_dir().join("verbosec_test_length_literal_fold");
+        compile_native(&program, "lit_len", out.to_str().unwrap(), false, false)
+            .expect("literal length should compile");
+        let r = Command::new(&out).args(["5"]).output().expect("spawn");
+        assert_eq!(
+            String::from_utf8_lossy(&r.stdout).trim_end_matches('\n'),
+            "16",
+            "11 + 5 = 16"
+        );
+        let size = std::fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
+        assert!(
+            size < 600,
+            "literal-fold binary should stay tight; got {}",
+            size
+        );
+        let _ = std::fs::remove_file(&out);
     }
 
     /// `starts_with(<haystack>, <needle>)` primitive (2026-04-29):

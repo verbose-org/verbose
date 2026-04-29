@@ -165,6 +165,14 @@ examples/
                    requires `reads: [now]` in the rule's purity proof —
                    same audit shape as `read(<resource>)`. ~475 B native
                    binary; pinned by now_unix_runtime_capture_and_verifier_check.
+  uri_size_gate.*  `length(<text>)` primitive (2026-04-29): byte count
+                   of a text expression as Number. Composes with
+                   `parse_int(read(...))` for runtime-tunable input
+                   validation. HTTP service that gates requests by URL
+                   path length, with the limit loaded from a file the
+                   operator can edit between invocations. ~1237 B
+                   native binary on port 18933. Pinned by
+                   length_runtime_and_compose_with_parse_int.
   prefix_router.*  `starts_with(<haystack>, <needle>)` primitive (2026-04-29):
                    native byte-compare returning bool. Composed here
                    inside an HTTP service handler's if/else chain to
@@ -256,6 +264,7 @@ tools/
 - Record construction: `ConceptName { field: expr, field: expr, ... }` — typed constructor; verifier cross-checks field set + per-field types match the concept declaration
 - Text composition: `concat(e1, e2, ...)` — variadic text builder, scalar args only (number → decimal, bool → true/false, text as-is); no operator overloading on `+`, each arg is explicit
 - Text→number conversion: `parse_int(<text>)` — strict scan (optional `-`, then 1+ ASCII digits, then end-of-input); aborts the binary on any other shape (empty input, lone `-`, non-digit byte). Optimizer folds `parse_int("<literal>")` to `Number` at compile time; native runtime path handles `parse_int(read(<resource>))` and other BoundText sources via the same (ptr, len) shape used by Read / Fetch / Phase-2I lets
+- Text byte count: `length(<text>)` — Number, byte count of a text expression. Counts bytes (not characters): for ASCII this is the obvious answer; for multibyte UTF-8 the result is storage size, not visual length. Native dispatches: text input field → inline `emit_strlen` scan; BoundText (read / fetch / Phase-2I let) → load `len_slot` directly (zero scan because the prologue already counted the bytes); literal → optimizer folds to `Number` at compile time. Concat / Call / JsonEscape / ParseInt as length-arg refused
 - Text prefix test: `starts_with(<haystack>, <needle>)` — bool, true iff `haystack`'s bytes begin with `needle`'s bytes. Empty needle is always true (standard convention); needle longer than haystack is false. Both args must be text-typed; native restricts each arg to allocation-free shapes (literal, text input field, BoundText: `read(<resource>)` / `fetch(<connection>, _)` / Phase-2I text let). Optimizer compile-time-folds `starts_with("<lit_a>", "<lit_b>")` to `Number(0|1)`. Composes naturally with HTTP service handlers for path-prefix routing without regex
 - System clock: `now_unix()` — current Unix-epoch seconds as a number. Sampled ONCE per rule invocation via `clock_gettime(CLOCK_REALTIME)`; every reference in the rule logic loads the same captured value from a dedicated rbp slot (mirror of `req.timestamp` in HTTP services). The synthetic name `now` MUST appear in the rule's `reads:` proof so auditors find every clock-touching rule with a single grep — same audit shape as `read(<resource>)`. Wired in `emit_record_loop_prologue` (Phase 0 / 2 / Result / Record output rules), `emit_fold_program` (Phase 4 number fold), `emit_text_fold_program` (Phase 5b text fold), `emit_collection_program` (Phase 3 map/filter), and `emit_multi_fold_program` (Phase 6 quantifier desugar). Only `emit_parallel_program` still rejects (same prologue change pattern as other emitters; deferred for the design call about per-record clock semantics in parallel rules)
 - Verifier type check: bidirectional shape check on logic — `Ok`/`Err` rejected outside `Result(...)` context; `Ok(x)`/`Err(e)` content checked against declared arms when inferable; top-level output type checked against declared; conservative on lambda/let-bound vars to avoid false positives

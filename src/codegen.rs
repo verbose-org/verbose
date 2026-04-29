@@ -217,8 +217,9 @@ fn emit_expr(expr: &Expr, input_name: &str, concept: Option<&Concept>) -> String
         | Expr::JsonEscape(_)
         | Expr::ParseInt(_)
         | Expr::NowUnix
-        | Expr::StartsWith(_, _) => {
-            "(/* collection/result/record/concat/read/fetch/json_escape/parse_int/now_unix/starts_with op: use --run interpreter or --native */false)".to_string()
+        | Expr::StartsWith(_, _)
+        | Expr::Length(_) => {
+            "(/* collection/result/record/concat/read/fetch/json_escape/parse_int/now_unix/starts_with/length op: use --run interpreter or --native */false)".to_string()
         }
         Expr::Call(name, _args) => {
             if let Some(c) = concept {
