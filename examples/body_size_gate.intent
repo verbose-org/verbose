@@ -1,0 +1,1 @@
+1. An HTTP service that reads the body of incoming POST/PUT requests and rejects them if the body exceeds a maximum size loaded from a file at startup. Allowed requests echo a confirmation containing the byte count. Every request is audited as a JSON line with method, path, status, and the body byte count.

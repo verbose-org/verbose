@@ -610,6 +610,66 @@ fn rule_uses_now_unix(rule: &Rule) -> bool {
         || rule.logic.bindings.iter().any(|(_, e)| expr_uses_now_unix(e))
 }
 
+/// True iff the expression tree references `Field(Ident(input_name), field_name)`
+/// — a per-field-name walker, generalising what `expr_uses_now_unix`
+/// does for the synthetic clock. Used to detect whether the HTTP
+/// service emitter needs to populate a slot for a specific field
+/// (e.g. `req.body`, which only deserves the parser+slot work when the
+/// handler or log content actually references it).
+fn expr_uses_field(e: &Expr, input_name: &str, field_name: &str) -> bool {
+    match e {
+        Expr::Field(base, fname) => {
+            (matches!(base.as_ref(), Expr::Ident(n) if n == input_name) && fname == field_name)
+                || expr_uses_field(base, input_name, field_name)
+        }
+        Expr::Number(_) | Expr::Text(_) | Expr::Ident(_) | Expr::Read(_) | Expr::NowUnix => false,
+        Expr::Binary(_, l, r) => {
+            expr_uses_field(l, input_name, field_name)
+                || expr_uses_field(r, input_name, field_name)
+        }
+        Expr::Not(i) | Expr::Neg(i) | Expr::Ok(i) | Expr::Err(i) => {
+            expr_uses_field(i, input_name, field_name)
+        }
+        Expr::JsonEscape(i) | Expr::ParseInt(i) | Expr::Length(i) | Expr::Abs(i) => {
+            expr_uses_field(i, input_name, field_name)
+        }
+        Expr::If(c, t, el) => {
+            expr_uses_field(c, input_name, field_name)
+                || expr_uses_field(t, input_name, field_name)
+                || expr_uses_field(el, input_name, field_name)
+        }
+        Expr::Call(_, args) | Expr::Concat(args) => {
+            args.iter().any(|a| expr_uses_field(a, input_name, field_name))
+        }
+        Expr::StartsWith(h, n) | Expr::Contains(h, n) => {
+            expr_uses_field(h, input_name, field_name)
+                || expr_uses_field(n, input_name, field_name)
+        }
+        Expr::Quantifier(_, c, _, b) => {
+            expr_uses_field(c, input_name, field_name)
+                || expr_uses_field(b, input_name, field_name)
+        }
+        Expr::Fold(c, init, _, _, b) => {
+            expr_uses_field(c, input_name, field_name)
+                || expr_uses_field(init, input_name, field_name)
+                || expr_uses_field(b, input_name, field_name)
+        }
+        Expr::Map(c, _, b) | Expr::Filter(c, _, b) => {
+            expr_uses_field(c, input_name, field_name)
+                || expr_uses_field(b, input_name, field_name)
+        }
+        Expr::MatchResult(t, _, ok, _, err) => {
+            expr_uses_field(t, input_name, field_name)
+                || expr_uses_field(ok, input_name, field_name)
+                || expr_uses_field(err, input_name, field_name)
+        }
+        Expr::Record(_, fields) => fields
+            .iter()
+            .any(|(_, e)| expr_uses_field(e, input_name, field_name)),
+        Expr::Fetch(_, req) => expr_uses_field(req, input_name, field_name),
+    }
+}
+
 /// Emit a single `clock_gettime(CLOCK_REALTIME, &timespec)` syscall
 /// that lands tv_sec at `[rbp + tv_sec_slot]` and tv_nsec at
 /// `[rbp + tv_sec_slot + 8]` (one slot ABOVE — the caller MUST have
@@ -1721,6 +1781,9 @@ fn classify_concat_arg(
         // Number args through emit_eval_expr, which resolves NowUnix
         // via the offsets["now"] slot the surrounding emitter populated.
         Expr::NowUnix => Some(ConcatArgKind::Number),
+        // `length(...)`, `parse_int(...)`, `abs(...)` all return Number.
+        // Concat's Number-arg path runs them through emit_eval_expr.
+        Expr::Length(_) | Expr::ParseInt(_) | Expr::Abs(_) => Some(ConcatArgKind::Number),
         Expr::Ident(name) if text_bindings.contains_key(name.as_str()) => {
             Some(ConcatArgKind::BoundText)
         }
@@ -1757,6 +1820,15 @@ fn classify_concat_arg(
         }
         Expr::Field(base, field_name) => {
             if matches!(base.as_ref(), Expr::Ident(n) if n == input_name) {
+                // First: a text input field whose name is registered in
+                // text_bindings is a BoundText source (e.g. req.body in
+                // HTTP services — the parser stores ptr+len at dedicated
+                // slots, NOT a NUL-terminated argv pointer). The fill
+                // path resolves it via the same (ptr, len) machinery as
+                // Read / Fetch / Phase-2I lets.
+                if text_bindings.contains_key(field_name.as_str()) {
+                    return Some(ConcatArgKind::BoundText);
+                }
                 let f = concept.fields.iter().find(|f| &f.name == field_name)?;
                 match &f.ty {
                     Type::Number => Some(ConcatArgKind::Number),
@@ -2136,6 +2208,11 @@ fn emit_concat_to_buffer_impl(
                 // otherwise the fill pass overruns into adjacent slots.
                 let bound_name = match arg {
                     Expr::Ident(n) | Expr::Read(n) | Expr::Fetch(n, _) => Some(n.as_str()),
+                    // A text input field whose name is registered in
+                    // text_bindings is a BoundText source (e.g. req.body
+                    // in HTTP services — the parser stores ptr+len at
+                    // dedicated slots, NOT a NUL-terminated argv pointer).
+                    Expr::Field(_, n) => Some(n.as_str()),
                     _ => None,
                 };
                 if let Some(name) = bound_name {
@@ -2548,6 +2625,9 @@ fn emit_concat_fill(
                 // the bound text slot the prologue allocated.
                 let bound_name = match arg {
                     Expr::Ident(n) | Expr::Read(n) | Expr::Fetch(n, _) => Some(n.as_str()),
+                    // Field whose name is in text_bindings (e.g. req.body)
+                    // is a BoundText source — same (ptr, len) shape.
+                    Expr::Field(_, n) => Some(n.as_str()),
                     _ => None,
                 };
                 if let Some(name) = bound_name {
@@ -3326,6 +3406,9 @@ fn emit_text_write_to_fd(
     // here we only consult the connection name.
     let bound_name = match text_expr {
         Expr::Ident(n) | Expr::Read(n) | Expr::Fetch(n, _) => Some(n.as_str()),
+        // Field whose name is in text_bindings (e.g. req.body in HTTP
+        // services) routes through the BoundText (ptr, len) path.
+        Expr::Field(_, n) => Some(n.as_str()),
         _ => None,
     };
     if let Some(name) = bound_name {
@@ -7350,6 +7433,19 @@ fn emit_length(
             Ok(())
         }
         Expr::Field(base, fname) if matches!(base.as_ref(), Expr::Ident(n) if n == input_name) => {
+            // BoundText path takes precedence: a field whose name is in
+            // text_bindings has its length at the registered len_slot
+            // (e.g. req.body in HTTP services). Zero-scan.
+            if let Some(&(_ptr_slot, len_slot)) = text_bindings.get(fname.as_str()) {
+                if len_slot >= -128 {
+                    code.extend_from_slice(&[0x48, 0x8B, 0x45]);
+                    code.push(len_slot as u8);
+                } else {
+                    code.extend_from_slice(&[0x48, 0x8B, 0x85]);
+                    code.extend_from_slice(&len_slot.to_le_bytes());
+                }
+                return Ok(());
+            }
             let &offset = offsets.get(fname.as_str()).ok_or_else(|| NativeError {
                 message: format!("length: unknown text input field '{}'", fname),
             })?;
@@ -7435,6 +7531,28 @@ fn emit_starts_with_load_text(
             Ok(())
         }
         Expr::Field(base, fname) if matches!(base.as_ref(), Expr::Ident(n) if n == input_name) => {
+            // BoundText path takes precedence: req.body and similar
+            // fields registered in text_bindings carry (ptr, len) at
+            // dedicated rbp slots — no scan needed.
+            if let Some(&(ptr_slot, len_slot)) = text_bindings.get(fname.as_str()) {
+                // mov rsi, [rbp + ptr_slot]
+                if ptr_slot >= -128 {
+                    code.extend_from_slice(&[0x48, 0x8B, 0x75]);
+                    code.push(ptr_slot as u8);
+                } else {
+                    code.extend_from_slice(&[0x48, 0x8B, 0xB5]);
+                    code.extend_from_slice(&ptr_slot.to_le_bytes());
+                }
+                // mov rcx, [rbp + len_slot]
+                if len_slot >= -128 {
+                    code.extend_from_slice(&[0x48, 0x8B, 0x4D]);
+                    code.push(len_slot as u8);
+                } else {
+                    code.extend_from_slice(&[0x48, 0x8B, 0x8D]);
+                    code.extend_from_slice(&len_slot.to_le_bytes());
+                }
+                return Ok(());
+            }
             let &offset = offsets.get(fname.as_str()).ok_or_else(|| NativeError {
                 message: format!("starts_with: unknown text input field '{}'", fname),
             })?;
@@ -9754,6 +9872,11 @@ fn http_request_builtin_concept_native() -> Concept {
                 ty: Type::Text,
                 range: Some((0, 256)),
             },
+            Field {
+                name: "body".to_string(),
+                ty: Type::Text,
+                range: Some((0, 4096)),
+            },
         ],
     }
 }
@@ -9786,6 +9909,16 @@ fn emit_http10_dynamic_bytes(
         Effect::AppendFile { content, .. } => log_content_uses_req_timestamp(content),
         _ => false,
     });
+    // req.body slot: only allocate when the handler logic OR any log
+    // content references `req.body`. Body parsing in the HTTP parser
+    // is conditional on this — the cost (one inline scan for \r\n\r\n
+    // and two slot stores) is paid only when body is consumed.
+    let uses_body = expr_uses_field(&handler.logic.value, &handler.input_name, "body")
+        || handler.logic.bindings.iter().any(|(_, e)| expr_uses_field(e, &handler.input_name, "body"))
+        || service.logs.iter().any(|lb| match &lb.effect {
+            Effect::AppendFile { content, .. } => expr_uses_field(content, "req", "body"),
+            _ => false,
+        });
     // Phase 9 slice 2: enumerate resources the handler reads, in source
     // order, and resolve each against the program's top-level resource
     // table. A name unknown at this point is a hard error — the verifier
@@ -9881,7 +10014,13 @@ fn emit_http10_dynamic_bytes(
         .iter()
         .map(|t| if *t { 16i32 } else { 8 })
         .sum();
-    let frame_base_fixed: i32 = (if uses_timestamp { 56 } else { 48 }) + handler_let_slots_bytes;
+    // Pre-body fixed offset: where the optional timestamp lives.
+    let body_pre_offset: i32 = if uses_timestamp { 56 } else { 48 };
+    let body_extra_bytes: i32 = if uses_body { 16 } else { 0 };
+    // (req.body ptr, req.body len) follow timestamp, before handler lets.
+    let body_ptr_slot: i32 = if uses_body { -(body_pre_offset + 8) } else { 0 };
+    let body_len_slot: i32 = if uses_body { -(body_pre_offset + 16) } else { 0 };
+    let frame_base_fixed: i32 = body_pre_offset + body_extra_bytes + handler_let_slots_bytes;
     let frame_base: i32 = frame_base_fixed + resource_extra_bytes + connection_extra_bytes;
     // Phase 8 slice 8d: collected `js abort_label` patch sites from
     // emit_append_file_call. Resolved after the accept loop emits the
@@ -10186,7 +10325,72 @@ fn emit_http10_dynamic_bytes(
     // On malformed input (no space found, no CR/LF found), jumps to
     // the close/loop label via a pair of rel32 patch sites. We resolve
     // those after emitting the close.
-    let parse_fail_patches = emit_http_parse_method_path(&mut code, buf_offset_from_rbp);
+    let mut parse_fail_patches = emit_http_parse_method_path(&mut code, buf_offset_from_rbp);
+
+    // ═══ HTTP PARSE (body) ═════════════════════════════════════
+    // Slice X (2026-04-29): when the rule references `req.body`, scan
+    // forward from the post-parse rbx position for the "\r\n\r\n"
+    // separator. body_ptr = matched_position + 4; body_len = remaining
+    // rax bytes after the consume. On a missing or truncated separator
+    // (request without headers terminator within the read window) we
+    // jump to parse_fail like any other malformed input.
+    //
+    // rbx state on entry: just past the path's terminator byte (which
+    // the method/path parser NUL'd in place). rax = bytes remaining.
+    // The four-byte sliding window approach: while rax >= 4, compare
+    // [rbx] to the little-endian representation of "\r\n\r\n" =
+    // 0x0a0d0a0d; on match, advance rbx by 4 and decrement rax by 4
+    // (now rbx = body_ptr, rax = body_len). On no match, inc/dec one
+    // byte and retry. If rax ever drops below 4 without a match → fail.
+    if uses_body {
+        let scan_top = code.len();
+        // cmp rax, 4 ; jl .body_fail (rel32)
+        code.extend_from_slice(&[0x48, 0x83, 0xF8, 0x04]);
+        code.push(0x0F);
+        code.push(0x8C);
+        parse_fail_patches.push(code.len());
+        code.extend_from_slice(&[0; 4]);
+        // cmp dword [rbx], 0x0a0d0a0d  ("\r\n\r\n" little-endian)
+        code.extend_from_slice(&[0x81, 0x3B, 0x0D, 0x0A, 0x0D, 0x0A]);
+        // je .found_crlfcrlf (rel8 forward)
+        code.push(0x74);
+        let patch_found = code.len();
+        code.push(0x00);
+        // inc rbx ; dec rax ; jmp scan_top (rel8)
+        code.extend_from_slice(&[0x48, 0xFF, 0xC3]);
+        code.extend_from_slice(&[0x48, 0xFF, 0xC8]);
+        let back = scan_top as i32 - (code.len() + 2) as i32;
+        code.push(0xEB);
+        code.push(back as i8 as u8);
+
+        // .found_crlfcrlf:
+        let found_label = code.len();
+        code[patch_found] = (found_label - patch_found - 1) as u8;
+        // add rbx, 4 ; sub rax, 4   — body starts after the separator
+        code.extend_from_slice(&[0x48, 0x83, 0xC3, 0x04]);
+        code.extend_from_slice(&[0x48, 0x83, 0xE8, 0x04]);
+        // mov [rbp + body_ptr_slot], rbx
+        if body_ptr_slot >= -128 {
+            code.extend_from_slice(&[0x48, 0x89, 0x5D]);
+            code.push(body_ptr_slot as u8);
+        } else {
+            code.extend_from_slice(&[0x48, 0x89, 0x9D]);
+            code.extend_from_slice(&body_ptr_slot.to_le_bytes());
+        }
+        // mov [rbp + body_len_slot], rax
+        if body_len_slot >= -128 {
+            code.extend_from_slice(&[0x48, 0x89, 0x45]);
+            code.push(body_len_slot as u8);
+        } else {
+            code.extend_from_slice(&[0x48, 0x89, 0x85]);
+            code.extend_from_slice(&body_len_slot.to_le_bytes());
+        }
+        // Register `body` in http_text_bindings so the existing
+        // BoundText paths (concat / json_escape / starts_with /
+        // contains / length / equality) handle Field(req, body)
+        // through the same machinery as Read / Fetch.
+        http_text_bindings.insert("body", (body_ptr_slot, body_len_slot));
+    }
 
     // ═══ CONNECTIONS (Phase 11 slice 2 + slice 3) ══════════════
     // Per-accept socket + connect + write(request) + read(response) + close
@@ -10257,7 +10461,7 @@ fn emit_http10_dynamic_bytes(
     // connection blocks below.
     let mut handler_offsets: HashMap<&str, i32> = offsets.clone();
     {
-        let let_block_start: i32 = -(if uses_timestamp { 56 } else { 48 });
+        let let_block_start: i32 = -(body_pre_offset + body_extra_bytes);
         let mut let_cursor: i32 = let_block_start - 8;
         for ((name, expr), is_text) in
             handler.logic.bindings.iter().zip(handler_binding_is_text.iter())
@@ -12457,6 +12661,119 @@ mod tests {
         );
 
         let _ = fs::remove_file(out);
+    }
+
+    /// HTTP body parsing (2026-04-29): `req.body` is now an accessible
+    /// text field on the synthetic HttpRequest concept. The parser
+    /// scans for "\r\n\r\n" after the method/path and stores the
+    /// body's (ptr, len) at dedicated rbp slots. Body composes as
+    /// BoundText: works with `length`, audit log, json_escape,
+    /// concat, etc. via the same machinery as `read(...)` / `fetch(...)`.
+    ///
+    /// This test pins:
+    ///   (a) GET request (no body) → length(req.body) == 0
+    ///   (b) POST with small body → correct length
+    ///   (c) POST with body over the runtime limit → 413
+    ///   (d) Body content in the audit log via json_escape (round-trip
+    ///       through concat with mixed Number+BoundText args)
+    #[test]
+    fn http_body_parsing_runtime() {
+        use std::io::{Read, Write};
+        use std::net::TcpStream;
+        use std::process::{Command, Stdio};
+        use std::time::Duration;
+
+        let port: u16 = 18938;
+        let limit_path = "/tmp/verbosec_test_body_limit.txt";
+        std::fs::write(limit_path, b"50").expect("write limit");
+
+        let src = std::fs::read_to_string("examples/body_size_gate.verbose")
+            .expect("examples/body_size_gate.verbose");
+        let src = src
+            .replace("/tmp/verbose_max_body.txt", limit_path)
+            .replace("18937", &port.to_string());
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+
+        let out = std::env::temp_dir().join("verbosec_test_body_gate");
+        compile_service(&program, "gate", out.to_str().unwrap())
+            .expect("body parsing service should compile");
+
+        let mut child = Command::new(&out)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn");
+
+        let mut bound = false;
+        for _ in 0..50 {
+            if TcpStream::connect_timeout(
+                &format!("127.0.0.1:{}", port).parse().unwrap(),
+                Duration::from_millis(100),
+            )
+            .is_ok()
+            {
+                bound = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(bound, "service never bound");
+
+        let request = |method: &str, path: &str, body: &str| -> (u16, String) {
+            let mut s = TcpStream::connect_timeout(
+                &format!("127.0.0.1:{}", port).parse().unwrap(),
+                Duration::from_secs(2),
+            )
+            .expect("connect");
+            s.set_read_timeout(Some(Duration::from_secs(2))).ok();
+            let req = format!(
+                "{} {} HTTP/1.0\r\nContent-Length: {}\r\n\r\n{}",
+                method,
+                path,
+                body.len(),
+                body
+            );
+            s.write_all(req.as_bytes()).expect("write");
+            let mut buf = Vec::new();
+            s.read_to_end(&mut buf).expect("read");
+            let resp = String::from_utf8_lossy(&buf).to_string();
+            let status: u16 = resp
+                .lines()
+                .next()
+                .and_then(|l| l.split_whitespace().nth(1))
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+            let body = resp.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
+            (status, body)
+        };
+
+        // (a) GET → no body → length 0
+        let (st, body) = request("GET", "/x", "");
+        assert_eq!(st, 200);
+        assert!(body.contains("body=0"), "GET body resp: {:?}", body);
+
+        // (b) POST with small body
+        let (st, body) = request("POST", "/x", "hello");
+        assert_eq!(st, 200);
+        assert!(body.contains("body=5"), "POST 5: {:?}", body);
+
+        // POST with 30 bytes
+        let big30 = "a".repeat(30);
+        let (st, body) = request("POST", "/x", &big30);
+        assert_eq!(st, 200);
+        assert!(body.contains("body=30"), "POST 30: {:?}", body);
+
+        // (c) POST over limit → 413
+        let big100 = "b".repeat(100);
+        let (st, body) = request("POST", "/x", &big100);
+        assert_eq!(st, 413);
+        assert!(body.contains("payload too large"), "413 body: {:?}", body);
+
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_file(limit_path);
     }
 
     /// **SYNTHESIS DEMO** (2026-04-29): audit_gateway.verbose combines

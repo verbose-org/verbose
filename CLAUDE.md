@@ -165,6 +165,15 @@ examples/
                    requires `reads: [now]` in the rule's purity proof —
                    same audit shape as `read(<resource>)`. ~475 B native
                    binary; pinned by now_unix_runtime_capture_and_verifier_check.
+  body_size_gate.* HTTP body parsing (2026-04-29): `req.body` accessible
+                   in handler logic and audit log. Parser scans for
+                   "\r\n\r\n" after method/path; body's (ptr, len)
+                   stored at dedicated rbp slots. Body composes as
+                   BoundText through length / starts_with / contains /
+                   concat / json_escape. Worked example: HTTP gate
+                   that returns 413 if `length(req.body) >
+                   parse_int(read(max_body))`. ~1317 B native binary;
+                   pinned by http_body_parsing_runtime.
   audit_gateway.*  SYNTHESIS DEMO (2026-04-29): single .verbose file
                    that combines 9 features in one production-shaped
                    HTTP service: prefix routing, length input gate,

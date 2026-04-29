@@ -587,13 +587,17 @@ fn verify_connection_stub(c: &Connection, base_dir: &StdPath, errors: &mut Vec<V
 /// does not see this declaration in any .verbose file; it lives in the
 /// compiler because the wire-format-to-concept bridge is a closed,
 /// compiler-owned translation. Fields:
-///   method : text [..8]   — GET / POST / DELETE / etc. (fits OPTIONS = 7)
-///   path   : text [..256] — URL path segment
+///   method : text [..8]    — GET / POST / DELETE / etc. (fits OPTIONS = 7)
+///   path   : text [..256]  — URL path segment
+///   body   : text [..4096] — the bytes after the \r\n\r\n delimiter; capped
+///                            by the service's `max_request` at runtime.
+///                            Stored as (ptr, len) — body may contain
+///                            arbitrary bytes so NUL-termination is unsafe.
 fn builtin_http_request() -> Concept {
     Concept {
         name: "HttpRequest".to_string(),
         intention:
-            "A parsed HTTP/1.0 request: method and path (compiler built-in for Protocol::Http10)"
+            "A parsed HTTP/1.0 request: method, path, and body (compiler built-in for Protocol::Http10)"
                 .to_string(),
         source: SourceRef { file: "<builtin>".to_string(), line: 0 },
         fields: vec![
@@ -606,6 +610,11 @@ fn builtin_http_request() -> Concept {
                 name: "path".to_string(),
                 ty: Type::Text,
                 range: Some((0, 256)),
+            },
+            Field {
+                name: "body".to_string(),
+                ty: Type::Text,
+                range: Some((0, 4096)),
             },
         ],
     }

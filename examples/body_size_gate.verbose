@@ -1,0 +1,56 @@
+@verbose 0.1.0
+
+-- HTTP body parsing (2026-04-29). Adds `req.body` to the synthetic
+-- HttpRequest concept; the parser scans for "\r\n\r\n" and stores
+-- the body's (ptr, len) at dedicated rbp slots. Body becomes a
+-- BoundText source: composes with `length`, `concat`, audit log,
+-- json_escape exactly like `read(<resource>)` and `fetch(...)`.
+--
+-- This service inspects the body byte count, NOT the body content.
+-- Most real validation (json shape, schema check) lives outside
+-- Verbose for now; the body LENGTH gate is the primitive that
+-- combines what we have today (length + parse_int + read).
+
+
+resource max_body
+  @intention: "Maximum allowed body length in bytes — operator-tunable"
+  @source: body_size_gate.intent:1
+
+  path: "/tmp/verbose_max_body.txt"
+  max:  16
+  on_read_error: abort
+  cache: true
+
+
+rule serve
+  @intention: "Echo body byte count if under the runtime limit; otherwise 413"
+  @source: body_size_gate.intent:1
+
+  input:
+    req : HttpRequest
+
+  output:
+    resp : HttpResponse
+
+  logic:
+    resp = if length(req.body) > parse_int(read(max_body)) then HttpResponse { status: 413, body: "payload too large\n" } else HttpResponse { status: 200, body: concat("ok: body=", length(req.body), " bytes\n") }
+
+  proofs:
+    purity:
+      reads : [req.body, max_body]
+      calls : []
+
+    termination:
+      bound : 9
+
+
+service gate
+  @intention: "Listen on 18937 and gate by body size"
+  @source: body_size_gate.intent:1
+
+  listen:
+    protocol    : http_1_0
+    port        : 18937
+    max_request : 4096
+
+  handler: serve
