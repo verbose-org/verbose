@@ -15,6 +15,7 @@ If you want to know what a feature *looks like* in source, find it below and rea
 
 | File | What it shows |
 |------|---------------|
+| [`audit_gateway.verbose`](audit_gateway.verbose) | **SYNTHESIS DEMO** — production-shaped HTTP policy gate combining 9 features in one file. The example to read first if you want to know what Verbose actually does. ~2.9 KB native binary. |
 | [`invoices.verbose`](invoices.verbose) | Smallest possible rule: one concept, one bool. The hello-world. |
 | [`business.verbose`](business.verbose) | Arithmetic + composition (4 rules building on each other). |
 | [`showcase.verbose`](showcase.verbose) | Almost every feature in one business scenario (6 rules). |

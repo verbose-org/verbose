@@ -1,0 +1,90 @@
+@verbose 0.1.0
+
+-- ╔══════════════════════════════════════════════════════════════╗
+-- ║  SYNTHESIS DEMO: audited HTTP policy gate                    ║
+-- ║  (2026-04-29 — combines 4 days of primitives in one file)    ║
+-- ╚══════════════════════════════════════════════════════════════╝
+--
+-- One binary, every effect declared.
+--
+-- HTTP service           → Phase 7 (slice 3)
+-- prefix routing         → starts_with (2026-04-29)
+-- length input gate      → length (2026-04-29)
+-- runtime config         → parse_int + read (2026-04-28)
+-- runtime allowlist      → field == read (2026-04-28)
+-- per-request audit JSON → Phase 8 + json_escape (2026-04-27)
+-- captured timestamp     → req.timestamp (slice 8c)
+-- fail-closed audit      → on_error: abort (slice 8d)
+-- concurrency            → fork-per-accept (Phase 10)
+-- cached config (COW)    → cache: true (slice 9.4)
+--
+-- Audit story: every external effect this binary can have appears
+-- as a top-level declaration. `grep -E "resource|connection|service|reaction|log:|append_file" audit_gateway.verbose`
+-- returns the COMPLETE list of files the binary can read or write,
+-- ports it can bind, hosts it can reach. No hidden middleware.
+
+
+-- ── Runtime config ──────────────────────────────────────────────
+
+resource max_uri
+  @intention: "Maximum allowed URL path length in bytes — operator-tunable"
+  @source: audit_gateway.intent:1
+
+  path: "/tmp/verbose_audit_max_uri.txt"
+  max:  16
+  on_read_error: abort
+  cache: true        -- read once at startup, inherit via fork's COW
+
+
+resource allowed_method
+  @intention: "The single HTTP method authorized for /api/v1/* requests"
+  @source: audit_gateway.intent:1
+
+  path: "/tmp/verbose_audit_allowed_method.txt"
+  max:  16
+  on_read_error: abort
+  cache: true
+
+
+-- ── Handler logic ───────────────────────────────────────────────
+
+rule serve
+  @intention: "Route by prefix; gate /api/v1/ requests by URI length and allowed method; emit 200/403/404 with a reason in the body"
+  @source: audit_gateway.intent:1
+
+  input:
+    req : HttpRequest
+
+  output:
+    resp : HttpResponse
+
+  logic:
+    resp = if starts_with(req.path, "/health") then HttpResponse { status: 200, body: "ok\n" } else if starts_with(req.path, "/api/v1/") then if length(req.path) > parse_int(read(max_uri)) then HttpResponse { status: 403, body: "deny: uri too long\n" } else if req.method == read(allowed_method) then HttpResponse { status: 200, body: concat("allow: ", req.method, " ", req.path, "\n") } else HttpResponse { status: 403, body: concat("deny: method ", req.method, " not allowed\n") } else HttpResponse { status: 404, body: "not found\n" }
+
+  proofs:
+    purity:
+      reads : [req.path, req.method, max_uri, allowed_method]
+      calls : []
+
+    termination:
+      bound : 19
+
+
+-- ── Service ─────────────────────────────────────────────────────
+
+service gateway
+  @intention: "Listen on 18935, audit every request, fork-per-accept"
+  @source: audit_gateway.intent:1
+
+  listen:
+    protocol    : http_1_0
+    port        : 18935
+    max_request : 4096
+
+  handler: serve
+
+  log:
+    append_file "/tmp/verbose_audit_gateway.jsonl" concat("{\"ts\":", req.timestamp, ",\"method\":\"", json_escape(req.method), "\",\"path\":\"", json_escape(req.path), "\",\"status\":", resp.status, "}\n")
+    on_error: abort        -- fail-closed: no audit, no response
+
+  concurrency: forked      -- each request handled by a forked child

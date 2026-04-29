@@ -165,6 +165,16 @@ examples/
                    requires `reads: [now]` in the rule's purity proof —
                    same audit shape as `read(<resource>)`. ~475 B native
                    binary; pinned by now_unix_runtime_capture_and_verifier_check.
+  audit_gateway.*  SYNTHESIS DEMO (2026-04-29): single .verbose file
+                   that combines 9 features in one production-shaped
+                   HTTP service: prefix routing, length input gate,
+                   runtime config (parse_int + read), runtime allowlist
+                   (field == read), per-request JSONL audit with
+                   json_escape on user-controlled fields, captured
+                   req.timestamp, on_error: abort fail-closed, forked
+                   concurrency, cached resources (COW). 2888 B native
+                   binary. THE example to point at when someone asks
+                   "what does Verbose actually do?".
   recent_event_abs.* `abs(<number>)` primitive (2026-04-29): branch-free
                    5-byte inline (cqo + xor + sub) absolute value.
                    Corrects the silent edge-case bug in the natural

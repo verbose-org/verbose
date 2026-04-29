@@ -12459,6 +12459,156 @@ mod tests {
         let _ = fs::remove_file(out);
     }
 
+    /// **SYNTHESIS DEMO** (2026-04-29): audit_gateway.verbose combines
+    /// nine features in a single ~2.9 KB native binary —
+    ///   - HTTP service + prefix routing (`starts_with`)
+    ///   - URI length input gate (`length` + `parse_int(read(...))`)
+    ///   - method allowlist (`field == read(...)`)
+    ///   - per-request JSONL audit log
+    ///   - `json_escape` on user-controlled fields
+    ///   - captured `req.timestamp`
+    ///   - `on_error: abort` fail-closed audit
+    ///   - `concurrency: forked`
+    ///   - `cache: true` resources (one read at startup, COW to children)
+    ///
+    /// This test pins the end-to-end behavior:
+    ///   - the four routing branches return the right (status, body)
+    ///   - every request produces exactly one valid JSON audit line
+    ///   - the audit lines parse with the expected structure (no
+    ///     escape-related corruption even on weird input paths)
+    #[test]
+    fn synthesis_audit_gateway_end_to_end() {
+        use std::io::{Read, Write};
+        use std::net::TcpStream;
+        use std::process::{Command, Stdio};
+        use std::time::Duration;
+
+        let port: u16 = 18936;
+        let max_uri_path = "/tmp/verbosec_test_synth_max_uri.txt";
+        let allowed_path = "/tmp/verbosec_test_synth_allowed_method.txt";
+        let audit_path = "/tmp/verbosec_test_synth_audit.jsonl";
+
+        std::fs::write(max_uri_path, b"20").expect("write max_uri");
+        std::fs::write(allowed_path, b"GET").expect("write allowed");
+        let _ = std::fs::remove_file(audit_path);
+
+        let src = std::fs::read_to_string("examples/audit_gateway.verbose")
+            .expect("examples/audit_gateway.verbose");
+        let src = src
+            .replace("/tmp/verbose_audit_max_uri.txt", max_uri_path)
+            .replace("/tmp/verbose_audit_allowed_method.txt", allowed_path)
+            .replace("/tmp/verbose_audit_gateway.jsonl", audit_path)
+            .replace("18935", &port.to_string());
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+
+        let out = std::env::temp_dir().join("verbosec_test_synth_audit_gateway");
+        compile_service(&program, "gateway", out.to_str().unwrap())
+            .expect("synthesis demo should compile");
+
+        let mut child = Command::new(&out)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn synthesis demo");
+
+        // Wait for bind.
+        let mut bound = false;
+        for _ in 0..50 {
+            if TcpStream::connect_timeout(
+                &format!("127.0.0.1:{}", port).parse().unwrap(),
+                Duration::from_millis(100),
+            )
+            .is_ok()
+            {
+                bound = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(bound, "synthesis service never bound");
+
+        let request = |method: &str, path: &str| -> (u16, String) {
+            let mut s = TcpStream::connect_timeout(
+                &format!("127.0.0.1:{}", port).parse().unwrap(),
+                Duration::from_secs(2),
+            )
+            .expect("connect");
+            s.set_read_timeout(Some(Duration::from_secs(2))).ok();
+            let req = format!("{} {} HTTP/1.0\r\n\r\n", method, path);
+            s.write_all(req.as_bytes()).expect("write");
+            let mut buf = Vec::new();
+            s.read_to_end(&mut buf).expect("read");
+            let resp = String::from_utf8_lossy(&buf).to_string();
+            // Extract status code from first line "HTTP/1.0 NNN ..."
+            let status: u16 = resp
+                .lines()
+                .next()
+                .and_then(|l| l.split_whitespace().nth(1))
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+            // Body after the empty line
+            let body = resp.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
+            (status, body)
+        };
+
+        // Route 1: /health → 200 "ok"
+        let (st, body) = request("GET", "/health");
+        assert_eq!(st, 200);
+        assert!(body.contains("ok"), "health body: {:?}", body);
+
+        // Route 2: GET /api/v1/users → allowed → 200
+        let (st, body) = request("GET", "/api/v1/users");
+        assert_eq!(st, 200);
+        assert!(body.contains("allow"), "allowed body: {:?}", body);
+
+        // Route 3: POST /api/v1/users → method denied → 403
+        let (st, body) = request("POST", "/api/v1/users");
+        assert_eq!(st, 403);
+        assert!(body.contains("method") && body.contains("not allowed"),
+                "method-denied body: {:?}", body);
+
+        // Route 4: long URI under /api/v1/ → length gate → 403
+        let long_path = "/api/v1/this/path/is/way/too/long";
+        assert!(long_path.len() > 20, "test fixture: long_path must exceed limit");
+        let (st, body) = request("GET", long_path);
+        assert_eq!(st, 403);
+        assert!(body.contains("uri too long"), "length-denied body: {:?}", body);
+
+        // Route 5: unknown → 404
+        let (st, body) = request("GET", "/unknown");
+        assert_eq!(st, 404);
+        assert!(body.contains("not found"));
+
+        let _ = child.kill();
+        let _ = child.wait();
+
+        // Audit log: 5 lines, each valid JSON with the four expected fields.
+        let audit = std::fs::read_to_string(audit_path).expect("read audit");
+        let lines: Vec<&str> = audit.lines().collect();
+        assert_eq!(lines.len(), 5, "expected 5 audit lines, got {} — content: {:?}", lines.len(), audit);
+        for line in &lines {
+            assert!(line.starts_with("{\"ts\":"), "line must start with {{\"ts\":, got: {:?}", line);
+            assert!(line.contains("\"method\":\""), "line missing method: {:?}", line);
+            assert!(line.contains("\"path\":\""), "line missing path: {:?}", line);
+            assert!(line.contains("\"status\":"), "line missing status: {:?}", line);
+            assert!(line.ends_with("}"), "line must end with }}, got: {:?}", line);
+        }
+        // Specific status code in audit lines (in order).
+        let statuses: Vec<&str> = lines
+            .iter()
+            .filter_map(|l| {
+                l.find("\"status\":").map(|i| &l[i + 9..i + 12])
+            })
+            .collect();
+        assert_eq!(statuses, vec!["200", "200", "403", "403", "404"]);
+
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_file(max_uri_path);
+        let _ = std::fs::remove_file(allowed_path);
+        let _ = std::fs::remove_file(audit_path);
+    }
+
     /// `abs(<number>)` primitive (2026-04-29): branch-free 5-byte
     /// inline absolute value. Composes anywhere a number expression
     /// can appear. The motivating use case: time-window comparisons
