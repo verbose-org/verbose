@@ -516,6 +516,24 @@ pub enum Expr {
     /// len_slot — zero scan cost for runtime-loaded data whose length
     /// the prologue already knows.
     Length(Box<Expr>),
+    /// `contains(<haystack>, <needle>)` — does the haystack text
+    /// contain the needle's bytes anywhere as a contiguous substring?
+    /// Returns `bool`. Both args must be text-typed.
+    ///
+    /// Edge cases (canonical):
+    ///   - empty needle → always true (every text contains the empty
+    ///     string as a substring)
+    ///   - needle longer than haystack → false (no slot to match)
+    ///   - byte-exact match required (no encoding awareness, no case
+    ///     folding)
+    ///
+    /// Native algorithm: naive O(N*M) substring search using `rep cmpsb`
+    /// for each candidate offset. Bounded by the verifier's `max:`
+    /// declarations on the resource, so worst-case work is statically
+    /// known. Composes with the existing BoundText shape: needle and
+    /// haystack can each be a literal, a text input field, or BoundText
+    /// (`read(<resource>)`, `fetch(<connection>, ...)`, Phase-2I let).
+    Contains(Box<Expr>, Box<Expr>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

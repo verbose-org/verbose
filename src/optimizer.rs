@@ -66,6 +66,9 @@ fn count_nodes(expr: &Expr) -> usize {
         // `starts_with(haystack, needle)` — count this node + recurse into
         // both children (same shape as Binary).
         Expr::StartsWith(h, n) => 1 + count_nodes(h) + count_nodes(n),
+        // `contains(haystack, needle)` — same shape as StartsWith: count
+        // this node + recurse into both children.
+        Expr::Contains(h, n) => 1 + count_nodes(h) + count_nodes(n),
         // `length(<text_expr>)` — same shape as ParseInt: one node + recurse.
         Expr::Length(inner) => 1 + count_nodes(inner),
     }
@@ -370,6 +373,11 @@ fn substitute_ident(expr: &Expr, name: &str, replacement: &Expr) -> Expr {
             Box::new(substitute_ident(h, name, replacement)),
             Box::new(substitute_ident(n, name, replacement)),
         ),
+        // `contains(haystack, needle)` — substitute through both children.
+        Expr::Contains(h, n) => Expr::Contains(
+            Box::new(substitute_ident(h, name, replacement)),
+            Box::new(substitute_ident(n, name, replacement)),
+        ),
         // `length(<text_expr>)` — substitute through the inner expression.
         Expr::Length(inner) => Expr::Length(
             Box::new(substitute_ident(inner, name, replacement)),
@@ -597,6 +605,27 @@ pub fn optimize_expr(
                 return Expr::Number(if s1.as_bytes().starts_with(s2.as_bytes()) { 1 } else { 0 });
             }
             Expr::StartsWith(Box::new(h_opt), Box::new(n_opt))
+        }
+        // `contains(haystack, needle)` — same fold shape as StartsWith. When
+        // both children collapse to text literals, fold to 0/1. Edge case:
+        // an empty needle MUST yield true (matches stdlib `str::contains`),
+        // but `windows(0)` would also yield true via per-position empty
+        // matches — handle the empty case explicitly so the optimizer
+        // matches the runtime semantics bit-for-bit.
+        Expr::Contains(h, n) => {
+            let h_opt = optimize_expr(h, input_name, field_ranges);
+            let n_opt = optimize_expr(n, input_name, field_ranges);
+            if let (Expr::Text(s1), Expr::Text(s2)) = (&h_opt, &n_opt) {
+                let result = if s2.is_empty() {
+                    1
+                } else if s1.as_bytes().windows(s2.as_bytes().len()).any(|w| w == s2.as_bytes()) {
+                    1
+                } else {
+                    0
+                };
+                return Expr::Number(result);
+            }
+            Expr::Contains(Box::new(h_opt), Box::new(n_opt))
         }
         // `length(<text_expr>)` — if the inner is a text literal, fold the
         // byte count at compile time. Otherwise recurse and keep the

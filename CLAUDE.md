@@ -165,6 +165,12 @@ examples/
                    requires `reads: [now]` in the rule's purity proof —
                    same audit shape as `read(<resource>)`. ~475 B native
                    binary; pinned by now_unix_runtime_capture_and_verifier_check.
+  keyword_filter.* `contains(<haystack>, <needle>)` primitive (2026-04-29):
+                   naive O(N*M) substring search. Composed with
+                   `read(<resource>)` for an operator-tunable keyword
+                   filter — deploy once, retarget by editing the file.
+                   ~630 B native binary; pinned by
+                   slice_contains_substring_search.
   uri_size_gate.*  `length(<text>)` primitive (2026-04-29): byte count
                    of a text expression as Number. Composes with
                    `parse_int(read(...))` for runtime-tunable input
@@ -264,6 +270,7 @@ tools/
 - Record construction: `ConceptName { field: expr, field: expr, ... }` — typed constructor; verifier cross-checks field set + per-field types match the concept declaration
 - Text composition: `concat(e1, e2, ...)` — variadic text builder, scalar args only (number → decimal, bool → true/false, text as-is); no operator overloading on `+`, each arg is explicit
 - Text→number conversion: `parse_int(<text>)` — strict scan (optional `-`, then 1+ ASCII digits, then end-of-input); aborts the binary on any other shape (empty input, lone `-`, non-digit byte). Optimizer folds `parse_int("<literal>")` to `Number` at compile time; native runtime path handles `parse_int(read(<resource>))` and other BoundText sources via the same (ptr, len) shape used by Read / Fetch / Phase-2I lets
+- Text substring test: `contains(<haystack>, <needle>)` — bool, true iff `needle`'s bytes appear anywhere as a contiguous substring of `haystack`. Empty needle is always true; needle longer than haystack is false. Byte-exact (case-sensitive). Native: naive O(N*M) scan using `rep cmpsb` per candidate offset; verifier `max:` bounds make worst-case work statically known. Both args restricted to allocation-free shapes (literal / text input field / BoundText). Optimizer compile-time-folds `contains("<lit_a>", "<lit_b>")` to `Number(0|1)`
 - Text byte count: `length(<text>)` — Number, byte count of a text expression. Counts bytes (not characters): for ASCII this is the obvious answer; for multibyte UTF-8 the result is storage size, not visual length. Native dispatches: text input field → inline `emit_strlen` scan; BoundText (read / fetch / Phase-2I let) → load `len_slot` directly (zero scan because the prologue already counted the bytes); literal → optimizer folds to `Number` at compile time. Concat / Call / JsonEscape / ParseInt as length-arg refused
 - Text prefix test: `starts_with(<haystack>, <needle>)` — bool, true iff `haystack`'s bytes begin with `needle`'s bytes. Empty needle is always true (standard convention); needle longer than haystack is false. Both args must be text-typed; native restricts each arg to allocation-free shapes (literal, text input field, BoundText: `read(<resource>)` / `fetch(<connection>, _)` / Phase-2I text let). Optimizer compile-time-folds `starts_with("<lit_a>", "<lit_b>")` to `Number(0|1)`. Composes naturally with HTTP service handlers for path-prefix routing without regex
 - System clock: `now_unix()` — current Unix-epoch seconds as a number. Sampled ONCE per rule invocation via `clock_gettime(CLOCK_REALTIME)`; every reference in the rule logic loads the same captured value from a dedicated rbp slot (mirror of `req.timestamp` in HTTP services). The synthetic name `now` MUST appear in the rule's `reads:` proof so auditors find every clock-touching rule with a single grep — same audit shape as `read(<resource>)`. Wired in `emit_record_loop_prologue` (Phase 0 / 2 / Result / Record output rules), `emit_fold_program` (Phase 4 number fold), `emit_text_fold_program` (Phase 5b text fold), `emit_collection_program` (Phase 3 map/filter), and `emit_multi_fold_program` (Phase 6 quantifier desugar). Only `emit_parallel_program` still rejects (same prologue change pattern as other emitters; deferred for the design call about per-record clock semantics in parallel rules)

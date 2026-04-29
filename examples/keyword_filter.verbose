@@ -1,0 +1,49 @@
+@verbose 0.1.0
+
+-- contains(<haystack>, <needle>) primitive (2026-04-29). Naive
+-- O(N*M) substring search — bounded by the verifier's `max:`
+-- declarations so worst-case work is statically known.
+--
+-- Composed here with read(<resource>) for an operator-tunable
+-- keyword filter: the binary is fixed once, the keyword file edits
+-- redirect the filter without recompiling. Pattern is exactly what
+-- ad-hoc log triage needs — "deploy once, retarget by editing".
+
+
+resource keyword
+  @intention: "Substring to flag in incoming log lines"
+  @source: keyword_filter.intent:1
+
+  path: "/tmp/verbose_keyword.txt"
+  max:  64
+  on_read_error: abort
+
+
+concept LogLine
+  @intention: "A single log line"
+  @source: keyword_filter.intent:1
+
+  fields:
+    line : text
+
+
+rule flag
+  @intention: "True iff the line contains the runtime-loaded keyword"
+  @source: keyword_filter.intent:1
+
+  input:
+    l : LogLine
+
+  output:
+    matched : bool
+
+  logic:
+    matched = contains(l.line, read(keyword))
+
+  proofs:
+    purity:
+      reads : [l.line, keyword]
+      calls : []
+
+    termination:
+      bound : 2

@@ -572,6 +572,26 @@ fn eval_expr(
                 }),
             }
         }
+        // `contains(<haystack>, <needle>)` — byte-level substring test.
+        // Both children must be text; empty needle is always true (stdlib
+        // convention via str::contains); needle longer than haystack is
+        // false. Returns Value::Bool. Mirrors what native will emit
+        // (naive O(N*M) substring search bounded by `max:` declarations).
+        Expr::Contains(haystack, needle) => {
+            let h = eval_expr(haystack, env, all_rules)?;
+            let n = eval_expr(needle, env, all_rules)?;
+            match (h, n) {
+                (Value::Text(hs), Value::Text(ns)) => {
+                    Ok(Value::Bool(hs.contains(&ns)))
+                }
+                (h, n) => Err(RuntimeError {
+                    message: format!(
+                        "contains requires two text arguments, got {} and {}",
+                        h, n
+                    ),
+                }),
+            }
+        }
         // `length(<text_expr>)` — byte count of inner text. Inner must
         // evaluate to Value::Text (else type error). Returns the byte
         // length as a Number, mirroring what native emits via the

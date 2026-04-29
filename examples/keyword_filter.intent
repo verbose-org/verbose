@@ -1,0 +1,1 @@
+1. A rule that takes a log line as input and returns true if the line contains a keyword loaded from a file at startup. The keyword can be edited between binary invocations to retarget the filter without recompiling. Useful for ad-hoc grep-style log triage where the operator wants to redirect a deployed binary to a new keyword by editing one file.

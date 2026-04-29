@@ -767,6 +767,28 @@ impl Parser {
                 }
                 self.expect_kind(TokenKind::RParen)?;
                 Ok(Expr::StartsWith(Box::new(haystack), Box::new(needle)))
+            } else if name == "contains" && self.check_kind(&TokenKind::LParen) {
+                // `contains(<haystack>, <needle>)` — byte-level substring
+                // test returning bool. Same arity rules as starts_with:
+                // exactly two arguments, zero / one / three-plus is a
+                // parse-time error so the message points at the call
+                // site. The verifier enforces that both children are
+                // text-typed.
+                self.advance(); // (
+                if self.check_kind(&TokenKind::RParen) {
+                    return Err(self.error("contains requires exactly two arguments, got zero"));
+                }
+                let haystack = self.parse_expr()?;
+                if !self.check_kind(&TokenKind::Comma) {
+                    return Err(self.error("contains requires exactly two arguments, got one"));
+                }
+                self.advance(); // ,
+                let needle = self.parse_expr()?;
+                if self.check_kind(&TokenKind::Comma) {
+                    return Err(self.error("contains requires exactly two arguments, got more than two"));
+                }
+                self.expect_kind(TokenKind::RParen)?;
+                Ok(Expr::Contains(Box::new(haystack), Box::new(needle)))
             } else if name == "length" && self.check_kind(&TokenKind::LParen) {
                 // `length(<text_expr>)` — byte count of inner text as a
                 // number. Exactly one argument; zero or two-plus is a

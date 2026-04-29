@@ -552,6 +552,13 @@ fn collect_read_names_native(expr: &Expr, out: &mut Vec<String>) {
             collect_read_names_native(h, out);
             collect_read_names_native(n, out);
         }
+        // `contains(haystack, needle)` — recurse into both children;
+        // either side may carry a `read(...)` reference. Same shape as
+        // StartsWith — wraps two text-typed children, no own read.
+        Expr::Contains(h, n) => {
+            collect_read_names_native(h, out);
+            collect_read_names_native(n, out);
+        }
         // `length(<text_expr>)` — pure pass-through.
         Expr::Length(inner) => collect_read_names_native(inner, out),
     }
@@ -587,6 +594,7 @@ fn expr_uses_now_unix(e: &Expr) -> bool {
         Expr::Record(_, fields) => fields.iter().any(|(_, e)| expr_uses_now_unix(e)),
         Expr::Fetch(_, req) => expr_uses_now_unix(req),
         Expr::StartsWith(h, n) => expr_uses_now_unix(h) || expr_uses_now_unix(n),
+        Expr::Contains(h, n) => expr_uses_now_unix(h) || expr_uses_now_unix(n),
     }
 }
 
@@ -706,6 +714,12 @@ fn collect_fetch_names_native(expr: &Expr, out: &mut Vec<String>) {
         // `starts_with(haystack, needle)` — recurse into both children;
         // either side may carry a `fetch(...)` reference.
         Expr::StartsWith(h, n) => {
+            collect_fetch_names_native(h, out);
+            collect_fetch_names_native(n, out);
+        }
+        // `contains(haystack, needle)` — recurse into both children;
+        // either side may carry a `fetch(...)` reference.
+        Expr::Contains(h, n) => {
             collect_fetch_names_native(h, out);
             collect_fetch_names_native(n, out);
         }
@@ -975,6 +989,8 @@ fn emit_connection_fetch_sequence(
             Expr::NowUnix => None,
             // `starts_with(haystack, needle)` — recurse into both children.
             Expr::StartsWith(h, n) => first_fetch_for(h, name).or_else(|| first_fetch_for(n, name)),
+            // `contains(haystack, needle)` — recurse into both children.
+            Expr::Contains(h, n) => first_fetch_for(h, name).or_else(|| first_fetch_for(n, name)),
             // `length(<text_expr>)` — pass-through.
             Expr::Length(inner) => first_fetch_for(inner, name),
         }
@@ -6585,6 +6601,9 @@ fn max_stack_depth(expr: &Expr) -> usize {
         // depth dominates. Same shape as Binary minus the +1 push (the
         // result is materialized in rax, not pushed for the parent).
         Expr::StartsWith(h, n) => max_stack_depth(h).max(max_stack_depth(n)),
+        // `contains(haystack, needle)` — same shape as StartsWith: fixed-
+        // register substring search, no eval-stack push for the result.
+        Expr::Contains(h, n) => max_stack_depth(h).max(max_stack_depth(n)),
         // `length(<text_expr>)` — fixed-register strlen scan / len_slot
         // load, the inner's depth dominates.
         Expr::Length(inner) => max_stack_depth(inner),
@@ -7237,6 +7256,29 @@ fn emit_eval_expr(
             offsets,
             text_bindings,
         ),
+        // `contains(haystack, needle)` — naive O(N*M) substring search.
+        // Algorithm:
+        //   1. Load haystack → (r8 = ptr, r9 = len) via the StartsWith
+        //      load helper (allocation-free shapes only)
+        //   2. Load needle → (r10 = ptr, r11 = len) likewise
+        //   3. Empty needle → return 1 (true)
+        //   4. needle_len > hay_len → return 0 (false)
+        //   5. max_offset = hay_len - needle_len; iterate offset = 0..=max:
+        //        rsi = r8 + offset ; rdi = r10 ; rcx = r11
+        //        cld ; repe cmpsb
+        //        if ZF=1 → return 1
+        //        else inc offset, continue
+        //   6. Loop exhausted → return 0
+        // Verifier guarantees `max:` bounds on resources, so worst-case
+        // work is statically known.
+        Expr::Contains(haystack, needle) => emit_contains(
+            code,
+            haystack.as_ref(),
+            needle.as_ref(),
+            input_name,
+            offsets,
+            text_bindings,
+        ),
         // `length(<text_expr>)` — byte count returned in rax.
         // Inner shape dispatch:
         //   - Text literal: optimizer should have folded; if it slipped
@@ -7480,6 +7522,117 @@ fn emit_starts_with(
     let done_label = code.len();
     code[done_from_main_patch] = (done_label - done_from_main_patch - 1) as u8;
     code[done_from_empty_patch] = (done_label - done_from_empty_patch - 1) as u8;
+    code.extend_from_slice(&[0x48, 0x0F, 0xB6, 0xC0]);
+
+    Ok(())
+}
+
+/// Emit `contains(haystack, needle)` returning bool in rax. Naive
+/// O(N*M) substring scan. Verifier-bounded because resources have
+/// `max:` declarations — worst-case work is statically known.
+///
+/// Register layout for the scan:
+///   r8  = haystack ptr (preserved across the loop)
+///   r9  = max_offset = hay_len - needle_len (loop bound)
+///   r10 = needle ptr
+///   r11 = needle len
+///   rax = current scan offset, also the bool result on exit
+///   rsi = haystack[offset] (recomputed per iteration)
+///   rdi = needle[0] (loaded per iteration; cmpsb advances it)
+///   rcx = remaining needle bytes (loaded per iteration)
+fn emit_contains(
+    code: &mut Vec<u8>,
+    haystack: &Expr,
+    needle: &Expr,
+    input_name: &str,
+    offsets: &HashMap<&str, i32>,
+    text_bindings: &TextBindings<'_>,
+) -> Result<(), NativeError> {
+    // Step 1: load haystack into (rsi, rcx); save into (r8, r9).
+    emit_starts_with_load_text(code, haystack, input_name, offsets, text_bindings)?;
+    // mov r8, rsi  ; mov r9, rcx
+    code.extend_from_slice(&[0x49, 0x89, 0xF0]);
+    code.extend_from_slice(&[0x49, 0x89, 0xC9]);
+
+    // Step 2: load needle into (rsi, rcx); save into (r10, r11).
+    emit_starts_with_load_text(code, needle, input_name, offsets, text_bindings)?;
+    // mov r10, rsi ; mov r11, rcx
+    code.extend_from_slice(&[0x49, 0x89, 0xF2]);
+    code.extend_from_slice(&[0x49, 0x89, 0xCB]);
+
+    // Step 3: empty needle → return 1.
+    // test r11, r11 ; je .yes
+    code.extend_from_slice(&[0x4D, 0x85, 0xDB]);
+    code.push(0x0F);
+    code.push(0x84);
+    let yes_from_empty_patch = code.len();
+    code.extend_from_slice(&[0; 4]);
+
+    // Step 4: needle_len > hay_len → return 0.
+    // cmp r9, r11 ; jb .no
+    code.extend_from_slice(&[0x4D, 0x39, 0xD9]);
+    code.push(0x0F);
+    code.push(0x82);
+    let no_from_short_patch = code.len();
+    code.extend_from_slice(&[0; 4]);
+
+    // Step 5: r9 -= r11  (r9 = max_offset)
+    // sub r9, r11
+    code.extend_from_slice(&[0x4D, 0x29, 0xD9]);
+
+    // Step 6: rax = 0 (current offset)
+    code.extend_from_slice(&[0x48, 0x31, 0xC0]);
+
+    // Step 7: .scan_loop:
+    let scan_loop_top = code.len();
+    // mov rsi, r8 ; add rsi, rax
+    code.extend_from_slice(&[0x4C, 0x89, 0xC6]);
+    code.extend_from_slice(&[0x48, 0x01, 0xC6]);
+    // mov rdi, r10 ; mov rcx, r11
+    code.extend_from_slice(&[0x4C, 0x89, 0xD7]);
+    code.extend_from_slice(&[0x4C, 0x89, 0xD9]);
+    // cld ; repe cmpsb
+    code.push(0xFC);
+    code.extend_from_slice(&[0xF3, 0xA6]);
+    // je .yes (rel32)
+    code.push(0x0F);
+    code.push(0x84);
+    let yes_from_match_patch = code.len();
+    code.extend_from_slice(&[0; 4]);
+
+    // inc rax ; cmp rax, r9 ; jbe .scan_loop
+    code.extend_from_slice(&[0x48, 0xFF, 0xC0]);
+    code.extend_from_slice(&[0x4C, 0x39, 0xC8]);
+    code.push(0x0F);
+    code.push(0x86); // jbe rel32
+    let back_off = scan_loop_top as i32 - (code.len() + 4) as i32;
+    code.extend_from_slice(&back_off.to_le_bytes());
+
+    // Fall through to .no.
+    // .no:
+    let no_label = code.len();
+    let no_off = no_label as i32 - (no_from_short_patch as i32 + 4);
+    code[no_from_short_patch..no_from_short_patch + 4].copy_from_slice(&no_off.to_le_bytes());
+    // xor al, al ; jmp .done
+    code.extend_from_slice(&[0x30, 0xC0]);
+    code.push(0xEB);
+    let done_from_no_patch = code.len();
+    code.push(0x00);
+
+    // .yes:
+    let yes_label = code.len();
+    let yes_off_empty = yes_label as i32 - (yes_from_empty_patch as i32 + 4);
+    code[yes_from_empty_patch..yes_from_empty_patch + 4]
+        .copy_from_slice(&yes_off_empty.to_le_bytes());
+    let yes_off_match = yes_label as i32 - (yes_from_match_patch as i32 + 4);
+    code[yes_from_match_patch..yes_from_match_patch + 4]
+        .copy_from_slice(&yes_off_match.to_le_bytes());
+    // mov al, 1
+    code.extend_from_slice(&[0xB0, 0x01]);
+
+    // .done: movzx rax, al
+    let done_label = code.len();
+    code[done_from_no_patch] = (done_label - done_from_no_patch - 1) as u8;
     code.extend_from_slice(&[0x48, 0x0F, 0xB6, 0xC0]);
 
     Ok(())
@@ -9334,6 +9487,7 @@ fn expr_kind(e: &Expr) -> &'static str {
         Expr::ParseInt(_) => "ParseInt",
         Expr::NowUnix => "NowUnix",
         Expr::StartsWith(_, _) => "StartsWith",
+        Expr::Contains(_, _) => "Contains",
         Expr::Length(_) => "Length",
     }
 }
@@ -12200,6 +12354,81 @@ mod tests {
         );
 
         let _ = fs::remove_file(out);
+    }
+
+    /// `contains(<haystack>, <needle>)` primitive (2026-04-29):
+    /// naive O(N*M) substring search returning bool. Verifier-bounded
+    /// by `max:` declarations so worst-case work is statically known.
+    ///
+    /// Pins the eight behaviors:
+    ///   (a) match anywhere in the middle
+    ///   (b) match at the start
+    ///   (c) match at the end
+    ///   (d) byte mismatch in the only candidate position → false
+    ///   (e) needle longer than haystack → false (early-out)
+    ///   (f) empty haystack vs non-empty needle → false
+    ///   (g) empty needle → always true (standard convention)
+    ///   (h) case-sensitive — "errOR" doesn't match "ERROR"
+    #[test]
+    fn slice_contains_substring_search() {
+        use std::process::Command;
+        let key = "/tmp/verbosec_test_contains_keyword.txt";
+        std::fs::write(key, b"abc").expect("write key");
+
+        let src = std::fs::read_to_string("examples/keyword_filter.verbose")
+            .expect("examples/keyword_filter.verbose");
+        let src = src.replace("/tmp/verbose_keyword.txt", key);
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+        let out = std::env::temp_dir().join("verbosec_test_contains_keyword");
+        compile_native(&program, "flag", out.to_str().unwrap(), false, false)
+            .expect("contains should compile");
+
+        let run = |arg: &str| -> String {
+            let r = Command::new(&out).args([arg]).output().expect("spawn");
+            String::from_utf8_lossy(&r.stdout).trim_end_matches('\n').to_string()
+        };
+
+        // (a) middle, (b) start, (c) end
+        assert_eq!(run("xxxabcxxx"), "true", "middle match");
+        assert_eq!(run("abcdef"), "true", "start match");
+        assert_eq!(run("xyzabc"), "true", "end match");
+        // (d) candidate position mismatches
+        assert_eq!(run("ab cabd"), "false", "no abc anywhere");
+        assert_eq!(run("aabbcc"), "false", "letters present but not contiguous");
+        // (e) needle longer than haystack
+        assert_eq!(run("a"), "false");
+        assert_eq!(run("ab"), "false");
+        // (f) empty haystack vs non-empty needle
+        assert_eq!(run(""), "false");
+        // (h) case-sensitive
+        assert_eq!(run("ABC"), "false", "case-sensitive: ABC ≠ abc");
+        assert_eq!(run("ABCABCABC"), "false");
+
+        let _ = std::fs::remove_file(&out);
+
+        // (g) empty needle → always true
+        std::fs::write(key, b"").expect("empty key");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().expect("tokenize");
+        let empty_program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+        let out_empty = std::env::temp_dir().join("verbosec_test_contains_empty_needle");
+        compile_native(&empty_program, "flag", out_empty.to_str().unwrap(), false, false)
+            .expect("contains with empty needle should compile");
+        let r = Command::new(&out_empty).args(["anything"]).output().expect("spawn");
+        assert_eq!(
+            String::from_utf8_lossy(&r.stdout).trim_end_matches('\n'),
+            "true",
+            "empty needle should always match"
+        );
+        let r = Command::new(&out_empty).args([""]).output().expect("spawn");
+        assert_eq!(
+            String::from_utf8_lossy(&r.stdout).trim_end_matches('\n'),
+            "true",
+            "empty needle vs empty haystack is true"
+        );
+
+        let _ = std::fs::remove_file(&out_empty);
+        let _ = std::fs::remove_file(key);
     }
 
     /// `length(<text>)` primitive (2026-04-29): byte count of a text
