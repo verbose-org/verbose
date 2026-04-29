@@ -228,7 +228,7 @@ fn compile_native_code(
     } else if is_vectorizable && concept.fields.len() == 1 {
         if let Some(threshold) = extract_simple_gt(rule) { emit_vectorized_program(threshold)? } else { emit_full_program(rule, concept, context_concept, &rules, &resources, &connections)? }
     } else if is_parallel {
-        emit_parallel_program(rule, concept, &rules)?
+        emit_parallel_program(rule, concept, &rules, &resources)?
     } else {
         emit_full_program(rule, concept, context_concept, &rules, &resources, &connections)?
     };
@@ -8008,11 +8008,38 @@ fn emit_parallel_program(
     rule: &Rule,
     concept: &Concept,
     all_rules: &HashMap<&str, &Rule>,
+    all_resources: &HashMap<&str, &Resource>,
 ) -> Result<Vec<u8>, NativeError> {
     let nfields = concept.fields.len();
     let offsets = field_offsets(concept);
     let is_bool = rule.output_ty == Type::Bool;
+
+    // Slice 9.5f: enumerate resources the rule reads, in source order.
+    // Each contributes 16 bytes (ptr + len) plus a max-padded buffer to
+    // the rbp frame. Same accounting as every other resource-aware
+    // emitter — the canonical pattern from slice 9.1.
+    let referenced_resources: Vec<&Resource> = {
+        let names = collect_rule_read_names(rule);
+        let mut out: Vec<&Resource> = Vec::with_capacity(names.len());
+        for name in &names {
+            let r = all_resources.get(name.as_str()).ok_or_else(|| NativeError {
+                message: format!(
+                    "rule '{}' reads resource '{}' but no top-level `resource {}` was declared",
+                    rule.name, name, name
+                ),
+            })?;
+            out.push(*r);
+        }
+        out
+    };
+    let resource_extra_bytes: i32 = referenced_resources
+        .iter()
+        .map(|r| 16 + (((r.max_bytes as i32) + 7) & !7))
+        .sum();
+
     let mut code = Vec::new();
+    let mut resource_abort_patches: Vec<usize> = Vec::new();
+    let mut text_bindings: TextBindings<'_> = HashMap::new();
 
     // === Setup: save argc/argv ===
     code.extend_from_slice(&[0x4C, 0x8B, 0x24, 0x24]); // mov r12, [rsp]
@@ -8031,12 +8058,39 @@ fn emit_parallel_program(
     code.extend_from_slice(&[0x48, 0x29, 0xC4]); // sub rsp, rax
     code.extend_from_slice(&[0x49, 0x89, 0xE7]); // mov r15, rsp
 
-    // Setup rbp frame for field storage
+    // Setup rbp frame for field storage. Slice 9.5f: grow by
+    // resource_extra_bytes so each resource's (ptr, len, buffer) lives
+    // INSIDE the rbp frame (not on the array side). Children inherit
+    // these slots via fork's COW after the resource read happens
+    // ONCE in the parent — no per-worker syscall, consistent with
+    // slice 10 + 9.4's forked+cached pattern.
     code.push(0x55); // push rbp
     code.extend_from_slice(&[0x48, 0x89, 0xE5]); // mov rbp, rsp
-    let frame = ((nfields * 8 + 15) & !15) as i32;
+    let frame = ((nfields * 8 + resource_extra_bytes as usize + 15) & !15) as i32;
     code.extend_from_slice(&[0x48, 0x81, 0xEC]);
     code.extend_from_slice(&frame.to_le_bytes());
+
+    // Slice 9.5f: emit each resource read sequence ONCE, BEFORE the
+    // parse loop and BEFORE the fork. emit_resource_read_sequence
+    // reuses r15 as the file fd; we save/restore r15 (the array base)
+    // around each call to preserve it.
+    if !referenced_resources.is_empty() {
+        // push r15  (save array base across the resource reads)
+        code.extend_from_slice(&[0x41, 0x57]);
+        let mut next_slot: i32 = -((nfields as i32) * 8 + 8);
+        for r in &referenced_resources {
+            let (ptr_slot, len_slot, _buf_slot, new_next) = emit_resource_read_sequence(
+                &mut code,
+                r,
+                next_slot,
+                &mut resource_abort_patches,
+            );
+            text_bindings.insert(r.name.as_str(), (ptr_slot, len_slot));
+            next_slot = new_next;
+        }
+        // pop r15  (restore array base)
+        code.extend_from_slice(&[0x41, 0x5F]);
+    }
 
     // === Phase 1: Parse all argv numbers into array ===
     code.extend_from_slice(&[0x48, 0x31, 0xDB]); // xor rbx, rbx
@@ -8149,7 +8203,7 @@ fn emit_parallel_program(
         &offsets,
         all_rules,
         &field_ranges,
-        &no_text_bindings(),
+        &text_bindings,
     )?;
 
     // Print result
@@ -8186,6 +8240,22 @@ fn emit_parallel_program(
     code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x3C, 0x00, 0x00, 0x00]);
     code.extend_from_slice(&[0x48, 0x31, 0xFF]);
     code.extend_from_slice(&[0x0F, 0x05]);
+
+    // Slice 9.5f: shared abort label for resource open/read failures.
+    // Resource reads happen in the parent BEFORE the fork, so an abort
+    // here kills the single parent process without orphaning any
+    // child — fail-closed even under parallel dispatch. Zero-byte cost
+    // when no resource is referenced (the abort label is conditional).
+    if !resource_abort_patches.is_empty() {
+        let abort_label = code.len();
+        for site in &resource_abort_patches {
+            let rel = abort_label as i32 - (*site as i32 + 4);
+            code[*site..*site + 4].copy_from_slice(&rel.to_le_bytes());
+        }
+        code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x3C, 0x00, 0x00, 0x00]); // mov rax, 60
+        code.extend_from_slice(&[0x48, 0xC7, 0xC7, 0x01, 0x00, 0x00, 0x00]); // mov rdi, 1
+        code.extend_from_slice(&[0x0F, 0x05]);                               // syscall
+    }
 
     Ok(code)
 }
@@ -12354,6 +12424,82 @@ mod tests {
         );
 
         let _ = fs::remove_file(out);
+    }
+
+    /// Slice 9.5f (2026-04-29): closes the resource-aware emitter sweep.
+    /// `read(<resource>)` is now allowed in `emit_parallel_program`. The
+    /// parent reads the threshold file ONCE before the fork; both
+    /// halves of the record stream inherit the (ptr, len) slot via
+    /// fork's copy-on-write. Composes with `parse_int` to load a
+    /// runtime-tunable number from disk.
+    ///
+    /// Pins:
+    ///   (a) parallel rule with `read()` compiles + emits the parallel
+    ///       hint
+    ///   (b) per-record output respects the runtime threshold
+    ///   (c) editing the file between invocations changes the result
+    ///   (d) abort on invalid threshold (parse_int) — fail-closed
+    ///   (e) abort on missing file (read) — fail-closed
+    #[test]
+    fn slice_9_5f_parallel_with_read_threshold() {
+        use std::process::Command;
+
+        let path = "/tmp/verbosec_test_parallel_threshold.txt";
+        std::fs::write(path, b"100").expect("write threshold");
+
+        let src = std::fs::read_to_string("examples/parallel_threshold.verbose")
+            .expect("examples/parallel_threshold.verbose");
+        let src = src.replace("/tmp/verbose_parallel_threshold.txt", path);
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+        let out = std::env::temp_dir().join("verbosec_test_parallel_threshold");
+        compile_native(&program, "above", out.to_str().unwrap(), false, false)
+            .expect("parallel + read should compile");
+
+        // (b) batch run with threshold=100. We don't assert ORDER (parallel
+        // dispatch can interleave) — we assert the SET of outputs matches
+        // the expected counts of true vs false.
+        let r = Command::new(&out)
+            .args(["50", "150", "200", "75", "99", "101"])
+            .output()
+            .expect("spawn");
+        assert!(r.status.success(), "happy run exit: {:?}", r.status);
+        let out_text = String::from_utf8_lossy(&r.stdout);
+        let trues = out_text.lines().filter(|l| l.trim() == "true").count();
+        let falses = out_text.lines().filter(|l| l.trim() == "false").count();
+        assert_eq!(trues, 3, "threshold=100, expected 3 true (150/200/101); stdout={:?}", out_text);
+        assert_eq!(falses, 3, "threshold=100, expected 3 false (50/75/99); stdout={:?}", out_text);
+
+        // (c) edit file → recount with threshold=50
+        std::fs::write(path, b"50").expect("update");
+        let r = Command::new(&out)
+            .args(["50", "150", "200", "75", "99", "101"])
+            .output()
+            .expect("spawn");
+        let out_text = String::from_utf8_lossy(&r.stdout);
+        let trues = out_text.lines().filter(|l| l.trim() == "true").count();
+        let falses = out_text.lines().filter(|l| l.trim() == "false").count();
+        assert_eq!(trues, 5, "threshold=50, expected 5 true; stdout={:?}", out_text);
+        assert_eq!(falses, 1, "threshold=50, expected 1 false (50); stdout={:?}", out_text);
+
+        // (d) Invalid threshold → parse_int abort
+        std::fs::write(path, b"abc").expect("invalid");
+        let r = Command::new(&out)
+            .args(["50", "150"])
+            .output()
+            .expect("spawn");
+        assert!(!r.status.success(), "invalid threshold must abort");
+
+        // (e) Missing file → resource read abort
+        let _ = std::fs::remove_file(path);
+        let r = Command::new(&out)
+            .args(["50", "150"])
+            .output()
+            .expect("spawn");
+        assert!(!r.status.success(), "missing file must abort");
+
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_file(path);
     }
 
     /// `contains(<haystack>, <needle>)` primitive (2026-04-29):

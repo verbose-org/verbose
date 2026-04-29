@@ -239,23 +239,15 @@ ships the worked example (1572-byte binary).
     — composes with the new BoundText text-equality
     (`field == read(...)`) shipped same-day; supports
     `all`/`any` quantifiers filtered by a runtime-loaded reference.
-  Path (b) of two unblockers SHIPPED 2026-04-28: `parse_int(<text>)`
-  primitive lands `parse_int(read(threshold))` as a number expression
-  in any emitter that has resource-aware text_bindings. This means
-  9.5f is no longer "useful body shape: nothing"; it now has at
-  least `if field > parse_int(read(threshold)) then ... else ...`.
-  Still pending: the plumbing change inside `emit_parallel_program`
-  itself (~80 LOC: thread text_bindings into the body emit_eval_expr
-  + add the resource prologue between rbp frame setup and array
-  allocation, with r15 saved across the resource read since
-  emit_resource_read_sequence reuses r15 as the file fd). Worked
-  example would be `parallel_threshold.verbose` mirroring
-  `threshold_sum.verbose` but with `parallel: "..."` hint. One
-  remaining design call: whether parallel rules WITH per-record
-  resource access make sense (each worker reads the same buffer
-  via COW so the read is shared, but the conceptual "parallel
-  rule that depends on shared state" deserves a deliberate accept
-  rather than a drift).
+  ~~Path (b)~~ **SHIPPED 2026-04-28** (`parse_int`) and
+  **9.5f SHIPPED 2026-04-29** (`parallel_threshold.verbose`).
+  The resource-aware emitter sweep is now COMPLETE — every native
+  emitter accepts `read(<resource>)` with the same prologue pattern
+  (frame grow + emit_resource_read_sequence + register in
+  text_bindings). The parallel-specific concern about per-record
+  resource access resolved itself: parent reads ONCE, children
+  inherit via fork's copy-on-write — no per-worker syscall, exact
+  same shape as slice 10 (forked) + slice 9.4 (cached) for HTTP.
 - **Multiple resources composing in a single concat in service
   handlers.** Single-resource handler bodies tested; multi-resource
   in one expression should work via text_bindings but isn't covered

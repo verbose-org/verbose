@@ -1,0 +1,57 @@
+@verbose 0.1.0
+
+-- Slice 9.5f (2026-04-29): read(<resource>) inside a parallel rule.
+-- Closes the resource-aware emitter sweep — same prologue pattern
+-- as Phase 0/2/3/4/5b/6 emitters, but adapted to emit_parallel_program's
+-- different register convention (r15 = array base, fork after array fill).
+--
+-- The parent reads the threshold file ONCE before the fork. Both
+-- halves of the record stream inherit the (ptr, len) slot via fork's
+-- copy-on-write — no per-worker syscall, consistent with slice 10
+-- (forked) + slice 9.4 (cached) for HTTP services.
+--
+-- Composes with parse_int(read(...)) to give a number from disk
+-- without recompile. The classic "deploy once, retarget by editing"
+-- pattern, lifted to a parallel rule.
+
+
+resource threshold
+  @intention: "Numeric threshold; values strictly above this are flagged"
+  @source: parallel_threshold.intent:1
+
+  path: "/tmp/verbose_parallel_threshold.txt"
+  max:  32
+  on_read_error: abort
+
+
+concept Reading
+  @intention: "A single sensor reading"
+  @source: parallel_threshold.intent:1
+
+  fields:
+    value : number
+
+
+rule above
+  @intention: "True iff value > runtime-loaded threshold"
+  @source: parallel_threshold.intent:1
+
+  input:
+    r : Reading
+
+  output:
+    flagged : bool
+
+  logic:
+    flagged = r.value > parse_int(read(threshold))
+
+  proofs:
+    purity:
+      reads : [r.value, threshold]
+      calls : []
+
+    termination:
+      bound : 3
+
+  hints:
+    parallel : "pure comparison against a constant; each record independent"

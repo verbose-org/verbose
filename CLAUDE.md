@@ -165,6 +165,17 @@ examples/
                    requires `reads: [now]` in the rule's purity proof —
                    same audit shape as `read(<resource>)`. ~475 B native
                    binary; pinned by now_unix_runtime_capture_and_verifier_check.
+  parallel_threshold.* Slice 9.5f (2026-04-29): closes the resource-aware
+                   emitter sweep. `read(<resource>)` allowed in
+                   `emit_parallel_program`. The parent reads the
+                   threshold file ONCE before the fork; both halves
+                   of the record stream inherit the (ptr, len) slot
+                   via fork's COW — no per-worker syscall, consistent
+                   with slice 10 (forked) + slice 9.4 (cached) for
+                   HTTP services. Composes with `parse_int(read(...))`
+                   for an operator-tunable threshold without recompile.
+                   ~828 B native binary; pinned by
+                   slice_9_5f_parallel_with_read_threshold.
   keyword_filter.* `contains(<haystack>, <needle>)` primitive (2026-04-29):
                    naive O(N*M) substring search. Composed with
                    `read(<resource>)` for an operator-tunable keyword
