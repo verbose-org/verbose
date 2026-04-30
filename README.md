@@ -58,6 +58,54 @@ See `docs/spec-proofs.md` for a field-by-field classification of *mechanical* (c
 - Not an AI replacement for programmers. The human (or the AI) still has to think carefully enough to produce a clean intent. The compiler holds the floor, not the intent.
 - Not a transpilation target for existing code. Rust/Go/other source → Verbose is deliberately refused: the source has no proofs to translate, and inferring them would violate the zero-trust rule. See `CLAUDE.md` → "Transpilation Strategy".
 
+## Try it in 5 minutes — the synthesis demo
+
+[`examples/audit_gateway.verbose`](examples/audit_gateway.verbose) is one
+~120-line file that compiles to a **2888-byte native binary** doing the
+work of a small production HTTP service: prefix routing, length input
+validation, runtime config loaded from disk, allowlist gating, per-request
+JSONL audit log with `req.timestamp` and `json_escape` on user-controlled
+fields, fail-closed audit (`on_error: abort`), and fork-per-accept
+concurrency. Every external effect the binary can have appears as a
+top-level declaration in the source — `grep -E 'resource|connection|service|reaction|log:|append_file' audit_gateway.verbose` returns the
+**complete** inventory of files it can touch and ports it can bind. No
+hidden middleware, no framework dance.
+
+```sh
+# Build the binary
+$ cargo run -- examples/audit_gateway.verbose --native /tmp/audit_gw --run gateway
+service: /tmp/audit_gw (2888 bytes, port 18935)
+
+# Set up runtime config (operator-tunable without recompile)
+$ printf '20'  > /tmp/verbose_audit_max_uri.txt
+$ printf 'GET' > /tmp/verbose_audit_allowed_method.txt
+
+# Launch
+$ /tmp/audit_gw &
+
+# Hammer it
+$ curl -s http://127.0.0.1:18935/health
+ok
+$ curl -s http://127.0.0.1:18935/api/v1/users
+allow: GET /api/v1/users
+$ curl -s -X POST http://127.0.0.1:18935/api/v1/users
+deny: method POST not allowed
+$ curl -s http://127.0.0.1:18935/api/v1/this/path/is/way/too/long
+deny: uri too long
+$ curl -s http://127.0.0.1:18935/unknown
+not found
+
+# Read the audit (every request, JSONL, json_escaped, fail-closed)
+$ cat /tmp/verbose_audit_gateway.jsonl | jq .
+{"ts":1777478145,"method":"GET","path":"/health","status":200}
+{"ts":1777478145,"method":"GET","path":"/api/v1/users","status":200}
+{"ts":1777478146,"method":"POST","path":"/api/v1/users","status":403}
+...
+```
+
+For a full index of the 70+ examples grouped by feature, see
+[`examples/README.md`](examples/README.md).
+
 ## Live Example
 
 Human writes this (`collections.intent`):
@@ -115,21 +163,24 @@ A reusable compliance pattern is documented in [`docs/ai-act-usage.md`](docs/ai-
 
 Both rules output `Result(number, text)` where each `Err` branch carries the plain-language rejection reason — which mechanically produces the explanation Article 86 (right to explanation) obliges providers to give to adversely-affected persons. The stdout/stderr split of the streaming binary makes the Article 12 audit trail a shell-wrapper away; the [`audit-log.sh`](docs/ai-act-usage.md#article-12--the-logging-wrapper) example in the doc is domain-agnostic and works on both binaries without modification. Applying the pattern to a third Annex III category is a ~30-minute exercise following the template.
 
-## Phase 7 + 8: network services described in `.verbose`
+## Phases 7 / 8 / 9 / 10 / 11 / 12: HTTP services, file I/O, fetch, audit logs
 
-The native backend can now emit complete long-running network services from a `.verbose` source. The `service` top-level construct binds a listener (protocol, port, bounded request size) to a handler rule, and optionally a `log:` effect that fires per request:
+The native backend emits complete long-running network services from a `.verbose` source. The `service` top-level construct binds a listener (protocol, port, bounded request size) to a handler rule, and a per-request `log:` block. As of 2026-04-30, the surface includes: HTTP/1.0 services with prefix routing and computed status; cached + per-request file reads with `on_read_error: abort`; outbound `fetch()` to declared connections; multiple `log:` blocks per service (strict + best-effort sinks); fork-per-accept concurrency; `req.body` parsing; and a family of runtime primitives (`read`, `parse_int`, `now_unix`, `length`, `starts_with`, `contains`, `abs`, `field == read(...)`, `json_escape`).
 
 | Example | Binary | What it does |
 |---|---|---|
-| [`examples/raw_tcp_echo.verbose`](examples/raw_tcp_echo.verbose) | 358 B | Raw TCP echo. Replaces the hand-emitted `--echo-server` probe with a tier-1 source (see [`docs/known-gaps.md`](docs/known-gaps.md)). |
-| [`examples/hello_http.verbose`](examples/hello_http.verbose) | 429 B | HTTP/1.0 constant-response server. |
-| [`examples/hello_router.verbose`](examples/hello_router.verbose) | 1056 B | HTTP router with if/else over `req.method` and `req.path`; 200 / 404 per route. |
-| [`examples/hello_router_logged.verbose`](examples/hello_router_logged.verbose) | 1294 B | Same router plus a per-request `append_file` audit log. |
-| [`examples/access_log_json.verbose`](examples/access_log_json.verbose) | 1072 B | HTTP service whose audit log is valid JSONL — one `{"method":"…","path":"…"}` line per request, parseable by `jq` or any SIEM. |
+| [`examples/audit_gateway.verbose`](examples/audit_gateway.verbose) | 2888 B | **Synthesis demo** — combines 9 features in one file (see "Try it in 5 minutes" above). |
+| [`examples/static_file_server.verbose`](examples/static_file_server.verbose) | 1730 B | HTTP/1.0 static file server with `cache: true` + `concurrency: forked`. Parent reads the file once at startup; children inherit via fork's COW. |
+| [`examples/reverse_proxy.verbose`](examples/reverse_proxy.verbose) | 1133 B | Real reverse proxy. The `fetch()` request bytes are built from `req.method` + `req.path`, so an incoming `GET /foo` is forwarded to upstream as exactly that. |
+| [`examples/api_gateway.verbose`](examples/api_gateway.verbose) | 1011 B | First Verbose binary that's both server AND client — proxies every request to a static upstream via `fetch()`. |
+| [`examples/dual_log.verbose`](examples/dual_log.verbose) | 1657 B | Two `log:` blocks per service: strict JSONL audit (`on_error: abort`) + best-effort metrics (`on_error: drop`). Order matters for the fail-closed chain. |
+| [`examples/body_size_gate.verbose`](examples/body_size_gate.verbose) | 1317 B | Inspects `req.body`: `if length(req.body) > parse_int(read(max_body)) then 413`. Body composes as BoundText with all text primitives. |
+| [`examples/prefix_router.verbose`](examples/prefix_router.verbose) | 1369 B | Path-prefix routing without regex via `starts_with(req.path, "/api/v1/")`. |
+| [`examples/uri_size_gate.verbose`](examples/uri_size_gate.verbose) | 1237 B | Runtime-tunable URI length gate via `length(req.path) > parse_int(read(max_uri))`. |
+| [`examples/access_audited.verbose`](examples/access_audited.verbose) | 2019 B | EU AI Act high-risk gate (HTTP-fronted). User-facing reason ≡ audit-log reason; `on_error: abort` for fail-closed audit. |
+| [`examples/raw_tcp_echo.verbose`](examples/raw_tcp_echo.verbose) | 358 B | Raw TCP echo. Smallest networked binary in the project. |
 
-Each binary is zero-dependency native x86-64 (`ldd` shows nothing), the `.verbose` source is the complete program including the socket / bind / accept / read / HTTP parse / handler dispatch / response / log / close loop. Design rationale and slice-by-slice rollout in [`docs/phase-7-design.md`](docs/phase-7-design.md) and the entries of [`docs/vision-journal.md`](docs/vision-journal.md) dated 2026-04-19 and 2026-04-20.
-
-Slice 8a (the `log:` block) is already enough to replace the `audit-log.sh` wrapper of the AI Act pattern for access-log-style output. Logging the decision *verdict* alongside the request (response-field access in `log:` content) is slice 8b; timestamps are slice 8c; strict error-on-write-failure is slice 8d. Together they close the full Article 12 gap.
+Each binary is zero-dependency native x86-64 (`ldd` shows nothing), the `.verbose` source is the complete program including socket / bind / accept / read / HTTP parse / handler dispatch / response / log / close loop, plus any declared file I/O and outbound fetches. Full slice-by-slice rollout in [`docs/phase-7-design.md`](docs/phase-7-design.md), [`docs/effect-model.md`](docs/effect-model.md), and the dated entries in [`docs/vision-journal.md`](docs/vision-journal.md). Index of all 70+ examples in [`examples/README.md`](examples/README.md).
 
 ## Numbers
 
