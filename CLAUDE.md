@@ -165,6 +165,13 @@ examples/
                    requires `reads: [now]` in the rule's purity proof —
                    same audit shape as `read(<resource>)`. ~475 B native
                    binary; pinned by now_unix_runtime_capture_and_verifier_check.
+  body_content_gate.* WAF-style content filter (2026-05-01): three
+                   gates — size (413), banned substring loaded from
+                   disk (403), allow (200). Composes body parsing
+                   (2026-04-29) with `contains` + `read` to express
+                   a deployable content filter without recompile.
+                   Audit log includes `body_bytes`. ~2678 B native
+                   binary; pinned by body_content_gate_routing_and_audit.
   body_size_gate.* HTTP body parsing (2026-04-29): `req.body` accessible
                    in handler logic and audit log. Parser scans for
                    "\r\n\r\n" after method/path; body's (ptr, len)

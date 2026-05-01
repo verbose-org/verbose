@@ -1,0 +1,85 @@
+@verbose 0.1.0
+
+-- ╔══════════════════════════════════════════════════════════════╗
+-- ║  WAF-style body content gate                                 ║
+-- ║  (composes 2026-04-29 body parsing + contains + read)        ║
+-- ╚══════════════════════════════════════════════════════════════╝
+--
+-- Pattern: a deployable filter that sits in front of a backend and
+-- rejects requests whose body contains a forbidden substring loaded
+-- from disk. The substring (the "deny rule") and the size limit
+-- (the "abuse cap") are both operator-tunable without recompile.
+--
+-- Three gates, in order:
+--   1. body too large  → 413 (cheap, runs first to bound work)
+--   2. body contains blacklisted substring → 403
+--   3. otherwise → 200
+--
+-- Every request audited as JSONL: method, path, status, body byte
+-- count, timestamp. Failure to audit aborts the process (fail-closed).
+
+
+-- ── Runtime config ──────────────────────────────────────────────
+
+resource max_body
+  @intention: "Maximum request body size in bytes — operator-tunable"
+  @source: body_content_gate.intent:1
+
+  path: "/tmp/verbose_waf_max_body.txt"
+  max:  16
+  on_read_error: abort
+  cache: true
+
+
+resource banned
+  @intention: "Forbidden substring; reject any body that contains it"
+  @source: body_content_gate.intent:1
+
+  path: "/tmp/verbose_waf_banned.txt"
+  max:  64
+  on_read_error: abort
+  cache: true
+
+
+-- ── Handler logic ───────────────────────────────────────────────
+
+rule filter
+  @intention: "Three-gate body filter: size, then content, then allow"
+  @source: body_content_gate.intent:1
+
+  input:
+    req : HttpRequest
+
+  output:
+    resp : HttpResponse
+
+  logic:
+    resp = if length(req.body) > parse_int(read(max_body)) then HttpResponse { status: 413, body: "blocked: payload too large\n" } else if contains(req.body, read(banned)) then HttpResponse { status: 403, body: "blocked: forbidden content\n" } else HttpResponse { status: 200, body: concat("ok: body=", length(req.body), " bytes accepted\n") }
+
+  proofs:
+    purity:
+      reads : [req.body, max_body, banned]
+      calls : []
+
+    termination:
+      bound : 13
+
+
+-- ── Service ─────────────────────────────────────────────────────
+
+service waf
+  @intention: "Listen on 18939, inspect bodies, audit every request"
+  @source: body_content_gate.intent:1
+
+  listen:
+    protocol    : http_1_0
+    port        : 18939
+    max_request : 4096
+
+  handler: filter
+
+  log:
+    append_file "/tmp/verbose_waf_audit.jsonl" concat("{\"ts\":", req.timestamp, ",\"method\":\"", json_escape(req.method), "\",\"path\":\"", json_escape(req.path), "\",\"status\":", resp.status, ",\"body_bytes\":", length(req.body), "}\n")
+    on_error: abort
+
+  concurrency: forked

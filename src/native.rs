@@ -10560,6 +10560,14 @@ fn emit_http10_dynamic_bytes(
         }
         let mut log_text_bindings: TextBindings = HashMap::new();
         log_text_bindings.insert("__resp_body", (-32, -40));
+        // req.body in log content (since 2026-04-30 body parsing): the
+        // log scope sees body via the Field(req, body) form. Register
+        // "body" with the same slot offsets the handler uses, so the
+        // BoundText classifier (which looks up by field name) resolves
+        // it through the same machinery as resp.body / resources / fetches.
+        if uses_body {
+            log_text_bindings.insert("body", (body_ptr_slot, body_len_slot));
+        }
 
         for log_block in &service.logs {
             if let Effect::AppendFile { path, content } = &log_block.effect {
@@ -12661,6 +12669,121 @@ mod tests {
         );
 
         let _ = fs::remove_file(out);
+    }
+
+    /// WAF-style body content gate (2026-05-01): pairs the HTTP body
+    /// parsing slice with `contains` + `read` to express a deployable
+    /// content filter. Three gates in order:
+    ///   1. body too large → 413
+    ///   2. body contains blacklisted substring (loaded from disk) → 403
+    ///   3. otherwise → 200
+    ///
+    /// This test pins the four routing branches AND the audit log
+    /// structure (body_bytes field, json_escape on user-controlled
+    /// values).
+    #[test]
+    fn body_content_gate_routing_and_audit() {
+        use std::io::{Read, Write};
+        use std::net::TcpStream;
+        use std::process::{Command, Stdio};
+        use std::time::Duration;
+
+        let port: u16 = 18941;
+        let max_body_path = "/tmp/verbosec_test_waf_max_body.txt";
+        let banned_path = "/tmp/verbosec_test_waf_banned.txt";
+        let audit_path = "/tmp/verbosec_test_waf_audit.jsonl";
+
+        std::fs::write(max_body_path, b"50").expect("write limit");
+        std::fs::write(banned_path, b"PASSWORD").expect("write banned");
+        let _ = std::fs::remove_file(audit_path);
+
+        let src = std::fs::read_to_string("examples/body_content_gate.verbose")
+            .expect("examples/body_content_gate.verbose");
+        let src = src
+            .replace("/tmp/verbose_waf_max_body.txt", max_body_path)
+            .replace("/tmp/verbose_waf_banned.txt", banned_path)
+            .replace("/tmp/verbose_waf_audit.jsonl", audit_path)
+            .replace("18939", &port.to_string());
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+
+        let out = std::env::temp_dir().join("verbosec_test_waf");
+        compile_service(&program, "waf", out.to_str().unwrap()).expect("WAF should compile");
+
+        let mut child = Command::new(&out)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn");
+
+        let mut bound = false;
+        for _ in 0..50 {
+            if TcpStream::connect_timeout(
+                &format!("127.0.0.1:{}", port).parse().unwrap(),
+                Duration::from_millis(100),
+            )
+            .is_ok()
+            {
+                bound = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(bound, "WAF service never bound");
+
+        let request = |method: &str, path: &str, body: &str| -> u16 {
+            let mut s = TcpStream::connect_timeout(
+                &format!("127.0.0.1:{}", port).parse().unwrap(),
+                Duration::from_secs(2),
+            )
+            .expect("connect");
+            s.set_read_timeout(Some(Duration::from_secs(2))).ok();
+            let req = format!(
+                "{} {} HTTP/1.0\r\nContent-Length: {}\r\n\r\n{}",
+                method, path, body.len(), body
+            );
+            s.write_all(req.as_bytes()).expect("write");
+            let mut buf = Vec::new();
+            s.read_to_end(&mut buf).expect("read");
+            String::from_utf8_lossy(&buf)
+                .lines()
+                .next()
+                .and_then(|l| l.split_whitespace().nth(1))
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0)
+        };
+
+        // 1. GET no body → 200
+        assert_eq!(request("GET", "/", ""), 200);
+        // 2. Innocent POST → 200
+        assert_eq!(request("POST", "/api", "hello world"), 200);
+        // 3. Body containing banned word → 403
+        assert_eq!(request("POST", "/api", "sending PASSWORD=x"), 403);
+        // 4. Body too large → 413
+        assert_eq!(request("POST", "/api", &"a".repeat(100)), 413);
+        // 5. Both banned + too large → 413 (size gate runs first)
+        let payload = format!("PASSWORD{}", "a".repeat(100));
+        assert_eq!(request("POST", "/api", &payload), 413);
+
+        let _ = child.kill();
+        let _ = child.wait();
+
+        // Audit log: 5 lines, each with body_bytes field reflecting
+        // the actual incoming body length (even rejected requests).
+        let audit = std::fs::read_to_string(audit_path).expect("read audit");
+        let lines: Vec<&str> = audit.lines().collect();
+        assert_eq!(lines.len(), 5, "expected 5 audit lines");
+        for line in &lines {
+            assert!(line.contains("\"body_bytes\":"), "missing body_bytes: {:?}", line);
+        }
+        // Spot-check: line 4 (POST 100 bytes "a"*100) should report body_bytes:100
+        assert!(lines[3].contains("\"body_bytes\":100"),
+                "line 4 body_bytes should be 100; got: {:?}", lines[3]);
+
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_file(max_body_path);
+        let _ = std::fs::remove_file(banned_path);
+        let _ = std::fs::remove_file(audit_path);
     }
 
     /// HTTP body parsing (2026-04-29): `req.body` is now an accessible

@@ -175,6 +175,7 @@ The native backend emits complete long-running network services from a `.verbose
 | [`examples/api_gateway.verbose`](examples/api_gateway.verbose) | 1011 B | First Verbose binary that's both server AND client — proxies every request to a static upstream via `fetch()`. |
 | [`examples/dual_log.verbose`](examples/dual_log.verbose) | 1657 B | Two `log:` blocks per service: strict JSONL audit (`on_error: abort`) + best-effort metrics (`on_error: drop`). Order matters for the fail-closed chain. |
 | [`examples/body_size_gate.verbose`](examples/body_size_gate.verbose) | 1317 B | Inspects `req.body`: `if length(req.body) > parse_int(read(max_body)) then 413`. Body composes as BoundText with all text primitives. |
+| [`examples/body_content_gate.verbose`](examples/body_content_gate.verbose) | 2678 B | WAF-style three-gate filter: size, then `contains(req.body, read(banned))` content match, then allow. Audit log includes `body_bytes`. |
 | [`examples/prefix_router.verbose`](examples/prefix_router.verbose) | 1369 B | Path-prefix routing without regex via `starts_with(req.path, "/api/v1/")`. |
 | [`examples/uri_size_gate.verbose`](examples/uri_size_gate.verbose) | 1237 B | Runtime-tunable URI length gate via `length(req.path) > parse_int(read(max_uri))`. |
 | [`examples/access_audited.verbose`](examples/access_audited.verbose) | 2019 B | EU AI Act high-risk gate (HTTP-fronted). User-facing reason ≡ audit-log reason; `on_error: abort` for fail-closed audit. |
