@@ -75,6 +75,9 @@ fn count_nodes(expr: &Expr) -> usize {
         Expr::Length(inner) => 1 + count_nodes(inner),
         // `abs(<number_expr>)` — same shape as Neg: one node + recurse.
         Expr::Abs(inner) => 1 + count_nodes(inner),
+        // `min(a, b)` / `max(a, b)` — same shape as Binary: count this node
+        // + recurse into both children.
+        Expr::Min(l, r) | Expr::Max(l, r) => 1 + count_nodes(l) + count_nodes(r),
     }
 }
 
@@ -395,6 +398,16 @@ fn substitute_ident(expr: &Expr, name: &str, replacement: &Expr) -> Expr {
         Expr::Abs(inner) => Expr::Abs(
             Box::new(substitute_ident(inner, name, replacement)),
         ),
+        // `min(a, b)` — substitute through both children.
+        Expr::Min(l, r) => Expr::Min(
+            Box::new(substitute_ident(l, name, replacement)),
+            Box::new(substitute_ident(r, name, replacement)),
+        ),
+        // `max(a, b)` — substitute through both children.
+        Expr::Max(l, r) => Expr::Max(
+            Box::new(substitute_ident(l, name, replacement)),
+            Box::new(substitute_ident(r, name, replacement)),
+        ),
     }
 }
 
@@ -676,6 +689,27 @@ pub fn optimize_expr(
                 return Expr::Number(n.wrapping_abs());
             }
             Expr::Abs(Box::new(inner))
+        }
+        // `min(a, b)` — recurse into both children. When both collapse to
+        // number literals, fold to the smaller at compile time. Otherwise
+        // rebuild and let the backend lower at runtime (native: cmp + cmovg).
+        Expr::Min(l, r) => {
+            let l_opt = optimize_expr(l, input_name, field_ranges);
+            let r_opt = optimize_expr(r, input_name, field_ranges);
+            if let (Expr::Number(a), Expr::Number(b)) = (&l_opt, &r_opt) {
+                return Expr::Number((*a).min(*b));
+            }
+            Expr::Min(Box::new(l_opt), Box::new(r_opt))
+        }
+        // `max(a, b)` — same fold shape as Min: literal-literal folds to the
+        // larger; otherwise rebuild for the backend (native: cmp + cmovl).
+        Expr::Max(l, r) => {
+            let l_opt = optimize_expr(l, input_name, field_ranges);
+            let r_opt = optimize_expr(r, input_name, field_ranges);
+            if let (Expr::Number(a), Expr::Number(b)) = (&l_opt, &r_opt) {
+                return Expr::Number((*a).max(*b));
+            }
+            Expr::Max(Box::new(l_opt), Box::new(r_opt))
         }
     }
 }

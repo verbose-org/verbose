@@ -636,6 +636,38 @@ fn eval_expr(
                 }),
             }
         }
+        // `min(<a>, <b>)` — binary scalar minimum. Both args must be
+        // Number; returns the smaller of the two. Mirrors what native
+        // emits via cmp + cmovg (branch-free).
+        Expr::Min(left, right) => {
+            let l = eval_expr(left, env, all_rules)?;
+            let r = eval_expr(right, env, all_rules)?;
+            match (l, r) {
+                (Value::Number(a), Value::Number(b)) => Ok(Value::Number(a.min(b))),
+                (l, r) => Err(RuntimeError {
+                    message: format!(
+                        "min requires two number arguments, got {} and {}",
+                        l, r
+                    ),
+                }),
+            }
+        }
+        // `max(<a>, <b>)` — binary scalar maximum. Both args must be
+        // Number; returns the larger of the two. Mirrors what native
+        // emits via cmp + cmovl (branch-free).
+        Expr::Max(left, right) => {
+            let l = eval_expr(left, env, all_rules)?;
+            let r = eval_expr(right, env, all_rules)?;
+            match (l, r) {
+                (Value::Number(a), Value::Number(b)) => Ok(Value::Number(a.max(b))),
+                (l, r) => Err(RuntimeError {
+                    message: format!(
+                        "max requires two number arguments, got {} and {}",
+                        l, r
+                    ),
+                }),
+            }
+        }
     }
 }
 

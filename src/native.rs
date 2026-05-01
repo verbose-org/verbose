@@ -572,6 +572,12 @@ fn collect_read_names_native(expr: &Expr, out: &mut Vec<String>) {
         Expr::Length(inner) => collect_read_names_native(inner, out),
         // `abs(<number_expr>)` — pure pass-through.
         Expr::Abs(inner) => collect_read_names_native(inner, out),
+        // `min(a, b)` / `max(a, b)` — recurse into both children; either
+        // side may carry a `read(...)` reference.
+        Expr::Min(l, r) | Expr::Max(l, r) => {
+            collect_read_names_native(l, out);
+            collect_read_names_native(r, out);
+        }
     }
 }
 
@@ -607,6 +613,7 @@ fn expr_uses_now_unix(e: &Expr) -> bool {
         Expr::StartsWith(h, n) => expr_uses_now_unix(h) || expr_uses_now_unix(n),
         Expr::Contains(h, n) => expr_uses_now_unix(h) || expr_uses_now_unix(n),
         Expr::EndsWith(h, n) => expr_uses_now_unix(h) || expr_uses_now_unix(n),
+        Expr::Min(l, r) | Expr::Max(l, r) => expr_uses_now_unix(l) || expr_uses_now_unix(r),
     }
 }
 
@@ -675,6 +682,10 @@ fn expr_uses_field(e: &Expr, input_name: &str, field_name: &str) -> bool {
             .iter()
             .any(|(_, e)| expr_uses_field(e, input_name, field_name)),
         Expr::Fetch(_, req) => expr_uses_field(req, input_name, field_name),
+        Expr::Min(l, r) | Expr::Max(l, r) => {
+            expr_uses_field(l, input_name, field_name)
+                || expr_uses_field(r, input_name, field_name)
+        }
     }
 }
 
@@ -860,6 +871,11 @@ fn collect_fetch_names_native(expr: &Expr, out: &mut Vec<String>) {
         Expr::Length(inner) => collect_fetch_names_native(inner, out),
         // `abs(<number_expr>)` — pure pass-through.
         Expr::Abs(inner) => collect_fetch_names_native(inner, out),
+        // `min(a, b)` / `max(a, b)` — recurse into both children.
+        Expr::Min(l, r) | Expr::Max(l, r) => {
+            collect_fetch_names_native(l, out);
+            collect_fetch_names_native(r, out);
+        }
     }
 }
 
@@ -1132,6 +1148,10 @@ fn emit_connection_fetch_sequence(
             Expr::Length(inner) => first_fetch_for(inner, name),
             // `abs(<number_expr>)` — pass-through.
             Expr::Abs(inner) => first_fetch_for(inner, name),
+            // `min(a, b)` / `max(a, b)` — recurse into both children.
+            Expr::Min(l, r) | Expr::Max(l, r) => {
+                first_fetch_for(l, name).or_else(|| first_fetch_for(r, name))
+            }
         }
     }
     let request_expr: &Expr = {
@@ -6654,6 +6674,13 @@ fn max_stack_depth(expr: &Expr) -> usize {
         // `abs(<number_expr>)` — 5-byte inline (cqo; xor rax, rdx; sub rax, rdx),
         // no eval-stack push, the inner's depth dominates.
         Expr::Abs(inner) => max_stack_depth(inner),
+        // `min(a, b)` / `max(a, b)` — branch-free cmp + cmov; left is
+        // evaluated and pushed, right is evaluated, so same shape as Binary.
+        Expr::Min(l, r) | Expr::Max(l, r) => {
+            let left_depth = max_stack_depth(l) + 1;
+            let right_depth = max_stack_depth(r);
+            left_depth.max(right_depth)
+        }
     }
 }
 
@@ -7377,6 +7404,36 @@ fn emit_eval_expr(
             code.extend_from_slice(&[0x48, 0x31, 0xD0]);
             // sub rax, rdx
             code.extend_from_slice(&[0x48, 0x29, 0xD0]);
+            Ok(())
+        }
+        // `min(a, b)` / `max(a, b)` — branch-free binary scalar via
+        // `cmp + cmovl/cmovg`. Algorithm:
+        //   eval left  → rax ; push rax
+        //   eval right → rax
+        //   pop rcx              ; rcx = left, rax = right
+        //   cmp rcx, rax         ; sets flags from (left <=> right)
+        //   cmovl rax, rcx       ; min: if left < right, take left
+        //   (max uses cmovg: if left > right, take left)
+        // 11 bytes total per call (4 instructions). Branch-free, no
+        // flag dependency on subsequent code.
+        Expr::Min(left, right) | Expr::Max(left, right) => {
+            let is_max = matches!(expr, Expr::Max(_, _));
+            // eval left → rax; push rax
+            emit_eval_expr(code, left, input_name, offsets, all_rules, field_ranges, text_bindings)?;
+            code.push(0x50); // push rax
+            // eval right → rax
+            emit_eval_expr(code, right, input_name, offsets, all_rules, field_ranges, text_bindings)?;
+            // pop rcx (rcx = left, rax = right)
+            code.push(0x59);
+            // cmp rcx, rax
+            code.extend_from_slice(&[0x48, 0x39, 0xC1]);
+            if is_max {
+                // cmovg rax, rcx (if left > right, rax = left)
+                code.extend_from_slice(&[0x48, 0x0F, 0x4F, 0xC1]);
+            } else {
+                // cmovl rax, rcx (if left < right, rax = left)
+                code.extend_from_slice(&[0x48, 0x0F, 0x4C, 0xC1]);
+            }
             Ok(())
         }
     }
@@ -9735,6 +9792,8 @@ fn expr_kind(e: &Expr) -> &'static str {
         Expr::EndsWith(_, _) => "EndsWith",
         Expr::Length(_) => "Length",
         Expr::Abs(_) => "Abs",
+        Expr::Min(_, _) => "Min",
+        Expr::Max(_, _) => "Max",
     }
 }
 
@@ -16728,5 +16787,180 @@ rule esc_literal
 
         let _ = fs::remove_file(&out);
         let _ = fs::remove_file(&log_path);
+    }
+
+    /// `min(a, b)` / `max(a, b)` binary primitives (2026-04-29). Native
+    /// emits a branch-free `cmp + cmovl/cmovg` (11 bytes total per op).
+    /// Composes with `parse_int(read(<resource>))` so a clamping range
+    /// can live on disk and be re-tuned without recompile — same fail-
+    /// closed posture as `threshold_sum.verbose`.
+    ///
+    /// Pinned behaviours:
+    ///   (a) raw inside [floor, ceiling] passes through untouched
+    ///   (b) raw below floor is bumped UP to floor (max picks floor)
+    ///   (c) raw above ceiling is pinned at ceiling (min picks ceiling)
+    ///   (d) raw at the boundaries returns the boundary (no off-by-one)
+    ///   (e) negative raw values clamp correctly (signed cmovl/cmovg)
+    ///   (f) malformed floor/ceiling file aborts (parse_int fail-closed)
+    ///   (g) missing file aborts (resource read fail-closed)
+    #[test]
+    fn slice_min_max_binary_runtime_clamp() {
+        use std::process::Command;
+        let floor_path = "/tmp/verbosec_test_clamp_floor.txt";
+        let ceiling_path = "/tmp/verbosec_test_clamp_ceiling.txt";
+        std::fs::write(floor_path, b"10").expect("write floor");
+        std::fs::write(ceiling_path, b"90").expect("write ceiling");
+
+        let src = std::fs::read_to_string("examples/clamped_score.verbose")
+            .expect("examples/clamped_score.verbose");
+        let src = src
+            .replace("/tmp/verbose_clamp_floor.txt", floor_path)
+            .replace("/tmp/verbose_clamp_ceiling.txt", ceiling_path);
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+
+        let out = std::env::temp_dir().join("verbosec_test_clamp");
+        compile_native(&program, "clamp", out.to_str().unwrap(), false, false)
+            .expect("min/max + parse_int + read should compile");
+
+        let run = |raw: &str| -> std::process::Output {
+            // Pass exactly one arg: the binary's argv loop treats every
+            // argv slot as a separate record, so `--` would be parsed as
+            // an extra Reading and the test would see two outputs.
+            Command::new(&out).args([raw]).output().expect("spawn")
+        };
+        let stdout_of = |o: &std::process::Output| -> String {
+            String::from_utf8_lossy(&o.stdout).trim_end_matches('\n').to_string()
+        };
+
+        // (a) inside the range
+        let r = run("50");
+        assert!(r.status.success() && stdout_of(&r) == "50", "raw=50: {:?}", stdout_of(&r));
+
+        // (b) below floor → floor
+        let r = run("5");
+        assert!(r.status.success() && stdout_of(&r) == "10", "raw=5: {:?}", stdout_of(&r));
+
+        // (c) above ceiling → ceiling
+        let r = run("200");
+        assert!(r.status.success() && stdout_of(&r) == "90", "raw=200: {:?}", stdout_of(&r));
+
+        // (d) exact boundaries
+        let r = run("10");
+        assert!(r.status.success() && stdout_of(&r) == "10", "raw=10: {:?}", stdout_of(&r));
+        let r = run("90");
+        assert!(r.status.success() && stdout_of(&r) == "90", "raw=90: {:?}", stdout_of(&r));
+
+        // (e) negative raw, well below floor
+        let r = run("-100");
+        assert!(r.status.success() && stdout_of(&r) == "10", "raw=-100: {:?}", stdout_of(&r));
+
+        // (f) malformed ceiling → parse_int abort
+        std::fs::write(ceiling_path, b"abc").expect("update ceiling");
+        let r = run("50");
+        assert!(!r.status.success() && r.stdout.is_empty(), "non-digit ceiling should abort");
+
+        // (g) missing floor → resource read abort
+        std::fs::write(ceiling_path, b"90").expect("restore ceiling");
+        let _ = std::fs::remove_file(floor_path);
+        let r = run("50");
+        assert!(!r.status.success() && r.stdout.is_empty(), "missing floor file should abort");
+
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_file(floor_path);
+        let _ = std::fs::remove_file(ceiling_path);
+    }
+
+    /// Pin the branch-free shape of binary `min` / `max` emission:
+    /// for each op we expect one `cmp rcx, rax` (48 39 C1) and one
+    /// `cmovl rax, rcx` (48 0F 4C C1) for `min`, or `cmovg rax, rcx`
+    /// (48 0F 4F C1) for `max`. Without the cmov, the optimizer or
+    /// emitter would have silently grown a conditional jump; this
+    /// test fails fast if that ever happens.
+    #[test]
+    fn slice_min_max_binary_emits_cmp_and_cmov() {
+        let src = r#"@verbose 0.1.0
+
+concept T
+  @intention: "x"
+  @source: invoices.intent:1
+  fields:
+    a : number
+    b : number
+
+rule pick_min
+  @intention: "x"
+  @source: invoices.intent:1
+  input:
+    t : T
+  output:
+    n : number
+  logic:
+    n = min(t.a, t.b)
+  proofs:
+    purity:
+      reads : [t.a, t.b]
+      calls : []
+    termination:
+      bound : 1
+
+rule pick_max
+  @intention: "x"
+  @source: invoices.intent:1
+  input:
+    t : T
+  output:
+    n : number
+  logic:
+    n = max(t.a, t.b)
+  proofs:
+    purity:
+      reads : [t.a, t.b]
+      calls : []
+    termination:
+      bound : 1
+"#;
+        let tokens = crate::lexer::Lexer::new(src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+
+        let out_min = std::env::temp_dir().join("verbosec_test_min_cmov");
+        compile_native(&program, "pick_min", out_min.to_str().unwrap(), false, false)
+            .expect("min should compile");
+        let bytes_min = std::fs::read(&out_min).expect("read min binary");
+        let cmp_seq = [0x48u8, 0x39, 0xC1];
+        let cmovl_seq = [0x48u8, 0x0F, 0x4C, 0xC1];
+        let cmovg_seq = [0x48u8, 0x0F, 0x4F, 0xC1];
+        assert!(
+            bytes_min.windows(3).any(|w| w == cmp_seq),
+            "min binary missing `cmp rcx, rax`"
+        );
+        assert!(
+            bytes_min.windows(4).any(|w| w == cmovl_seq),
+            "min binary missing `cmovl rax, rcx`"
+        );
+        assert!(
+            !bytes_min.windows(4).any(|w| w == cmovg_seq),
+            "min binary should NOT contain a cmovg (would mean we emitted max instead)"
+        );
+
+        let out_max = std::env::temp_dir().join("verbosec_test_max_cmov");
+        compile_native(&program, "pick_max", out_max.to_str().unwrap(), false, false)
+            .expect("max should compile");
+        let bytes_max = std::fs::read(&out_max).expect("read max binary");
+        assert!(
+            bytes_max.windows(3).any(|w| w == cmp_seq),
+            "max binary missing `cmp rcx, rax`"
+        );
+        assert!(
+            bytes_max.windows(4).any(|w| w == cmovg_seq),
+            "max binary missing `cmovg rax, rcx`"
+        );
+        assert!(
+            !bytes_max.windows(4).any(|w| w == cmovl_seq),
+            "max binary should NOT contain a cmovl (would mean we emitted min instead)"
+        );
+
+        let _ = std::fs::remove_file(&out_min);
+        let _ = std::fs::remove_file(&out_max);
     }
 }

@@ -1,0 +1,60 @@
+@verbose 0.1.0
+
+-- min(a, b) / max(a, b) binary primitives (2026-04-29): branch-free
+-- scalar reductions over two arguments. Composes with parse_int + read
+-- so a clamping range (floor, ceiling) can live on disk and be tuned
+-- by the operator without recompile.
+--
+-- Three layers of fail-closed posture:
+--   1. on_read_error: abort on each resource — missing file → exit 1
+--   2. parse_int aborts if either file's bytes aren't a valid integer
+--   3. The clamp itself is branch-free (cmp + cmovl/cmovg), so there
+--      is no fast/slow path divergence on adversarial inputs.
+
+
+resource floor
+  @intention: "Lower bound for the clamp; readings below are bumped up to this value"
+  @source: clamped_score.intent:1
+
+  path: "/tmp/verbose_clamp_floor.txt"
+  max:  32
+  on_read_error: abort
+
+
+resource ceiling
+  @intention: "Upper bound for the clamp; readings above are pinned at this value"
+  @source: clamped_score.intent:1
+
+  path: "/tmp/verbose_clamp_ceiling.txt"
+  max:  32
+  on_read_error: abort
+
+
+concept Reading
+  @intention: "A sensor reading carries one raw integer value"
+  @source: clamped_score.intent:1
+
+  fields:
+    raw : number [-1000000, 1000000]
+
+
+rule clamp
+  @intention: "Clamp the raw reading to [floor, ceiling] loaded from disk"
+  @source: clamped_score.intent:1
+
+  input:
+    r : Reading
+
+  output:
+    out : number
+
+  logic:
+    out = max(parse_int(read(floor)), min(parse_int(read(ceiling)), r.raw))
+
+  proofs:
+    purity:
+      reads : [r.raw, floor, ceiling]
+      calls : []
+
+    termination:
+      bound : 8

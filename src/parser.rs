@@ -515,9 +515,35 @@ impl Parser {
             if (name == "sum" || name == "count" || name == "min" || name == "max") && self.check_kind(&TokenKind::LParen) {
                 // Sugar: sum(coll, var => expr) → fold(coll, 0, __acc, var => __acc + expr)
                 //        count(coll, var => pred) → fold(coll, 0, __acc, var => __acc + if pred then 1 else 0)
+                //
+                // For `min` and `max`, an alternative shape exists since
+                // 2026-05-01: `min(a, b)` / `max(a, b)` are binary scalar
+                // primitives with no lambda. We disambiguate by parsing
+                // the first two args, then checking the next token: if it's
+                // `=>`, the second arg was actually the lambda var (must be
+                // an Ident) and we proceed with the fold path; if it's `)`,
+                // we shipped the binary form. `sum`/`count` only have the
+                // fold form and skip the disambiguation.
                 self.advance(); // (
                 let collection = self.parse_expr()?;
                 self.expect_kind(TokenKind::Comma)?;
+                let second_pos = self.pos;
+                let second = self.parse_expr()?;
+                let is_fold_lambda = self.check_kind(&TokenKind::FatArrow);
+                if (name == "min" || name == "max") && !is_fold_lambda {
+                    // Binary form: `second` is the second number arg.
+                    self.expect_kind(TokenKind::RParen)?;
+                    return Ok(if name == "min" {
+                        Expr::Min(Box::new(collection), Box::new(second))
+                    } else {
+                        Expr::Max(Box::new(collection), Box::new(second))
+                    });
+                }
+                // Fold form: rewind to `second_pos` and re-parse the var as
+                // an Ident (parse_expr could have consumed more than just
+                // the bare ident in obscure shapes; the rewind keeps the
+                // existing path semantically identical to before this slice).
+                self.pos = second_pos;
                 let var = self.expect_ident_any()?;
                 self.expect_kind(TokenKind::FatArrow)?;
                 let body = self.parse_expr()?;

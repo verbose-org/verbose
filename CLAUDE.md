@@ -226,6 +226,18 @@ examples/
                    operator can edit between invocations. ~1237 B
                    native binary on port 18933. Pinned by
                    length_runtime_and_compose_with_parse_int.
+  clamped_score.*  Binary `min(a, b)` / `max(a, b)` primitives (2026-04-29):
+                   branch-free `cmp + cmovl/cmovg`. Worked example for the
+                   classic clamp pattern: `out = max(parse_int(read(floor)),
+                   min(parse_int(read(ceiling)), r.raw))`. Both bounds load
+                   from disk per rule invocation, so the operator re-tunes
+                   the range without recompile. Three layers of fail-closed
+                   posture: `on_read_error: abort` on each resource,
+                   `parse_int` aborts on malformed bytes, and the clamp
+                   itself is branch-free so adversarial inputs don't
+                   diverge into a fast/slow path. ~975 B native binary;
+                   pinned by slice_min_max_binary_runtime_clamp +
+                   slice_min_max_binary_emits_cmp_and_cmov.
   prefix_router.*  `starts_with(<haystack>, <needle>)` primitive (2026-04-29):
                    native byte-compare returning bool. Composed here
                    inside an HTTP service handler's if/else chain to
@@ -322,6 +334,7 @@ tools/
 - Text byte count: `length(<text>)` — Number, byte count of a text expression. Counts bytes (not characters): for ASCII this is the obvious answer; for multibyte UTF-8 the result is storage size, not visual length. Native dispatches: text input field → inline `emit_strlen` scan; BoundText (read / fetch / Phase-2I let) → load `len_slot` directly (zero scan because the prologue already counted the bytes); literal → optimizer folds to `Number` at compile time. Concat / Call / JsonEscape / ParseInt as length-arg refused
 - Text suffix test: `ends_with(<haystack>, <needle>)` — bool, true iff `haystack`'s bytes end with `needle`'s bytes. Symmetric of `starts_with`. Empty needle is always true; needle longer than haystack is false. Native: load both args, compute `haystack_ptr + (hay_len - needle_len)` as scan start, then `repe cmpsb` on `needle_len` bytes. Same allocation-free arg constraints as `starts_with` (literal / text input field / BoundText). Optimizer compile-time-folds `ends_with("<lit_a>", "<lit_b>")` to `Number(0|1)`. Use case: file-extension routing without regex
 - Text prefix test: `starts_with(<haystack>, <needle>)` — bool, true iff `haystack`'s bytes begin with `needle`'s bytes. Empty needle is always true (standard convention); needle longer than haystack is false. Both args must be text-typed; native restricts each arg to allocation-free shapes (literal, text input field, BoundText: `read(<resource>)` / `fetch(<connection>, _)` / Phase-2I text let). Optimizer compile-time-folds `starts_with("<lit_a>", "<lit_b>")` to `Number(0|1)`. Composes naturally with HTTP service handlers for path-prefix routing without regex
+- Binary scalar reductions: `min(a, b)` / `max(a, b)` — Number, branch-free `cmp + cmovl/cmovg` (11 bytes per op). Distinct from the unary fold forms `min(coll, var => expr)` / `max(coll, var => expr)`: parser disambiguates by lookahead — if the second argument is followed by `=>` it's the fold form, otherwise the binary form. Both arguments are evaluated in source order (left then right) and both must be Number-typed; verifier rejects mixed types. Composes with `parse_int(read(<resource>))` for runtime-tunable clamps without recompile (`max(parse_int(read(floor)), min(parse_int(read(ceiling)), x))`); fail-closed posture inherited end-to-end from `parse_int` + resource `on_read_error: abort`. Optimizer is conservative (no compile-time fold yet — both args evaluated at runtime even when both are number literals)
 - System clock: `now_unix()` — current Unix-epoch seconds as a number. Sampled ONCE per rule invocation via `clock_gettime(CLOCK_REALTIME)`; every reference in the rule logic loads the same captured value from a dedicated rbp slot (mirror of `req.timestamp` in HTTP services). The synthetic name `now` MUST appear in the rule's `reads:` proof so auditors find every clock-touching rule with a single grep — same audit shape as `read(<resource>)`. Wired in `emit_record_loop_prologue` (Phase 0 / 2 / Result / Record output rules), `emit_fold_program` (Phase 4 number fold), `emit_text_fold_program` (Phase 5b text fold), `emit_collection_program` (Phase 3 map/filter), and `emit_multi_fold_program` (Phase 6 quantifier desugar). Only `emit_parallel_program` still rejects (same prologue change pattern as other emitters; deferred for the design call about per-record clock semantics in parallel rules)
 - Verifier type check: bidirectional shape check on logic — `Ok`/`Err` rejected outside `Result(...)` context; `Ok(x)`/`Err(e)` content checked against declared arms when inferable; top-level output type checked against declared; conservative on lambda/let-bound vars to avoid false positives
 - General reduction: `fold(collection, initial, acc, var => body)`

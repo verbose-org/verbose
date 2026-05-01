@@ -1,0 +1,1 @@
+1. A rule that takes a sensor reading with a raw value and returns the value clamped to a range whose floor and ceiling are loaded from a file at startup. Values below the floor are bumped up to the floor; values above the ceiling are pinned at the ceiling; everything in between passes through unchanged. The floor and ceiling are operator-tunable without recompiling.

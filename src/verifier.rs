@@ -349,6 +349,12 @@ fn collect_read_names(expr: &Expr, out: &mut Vec<String>) {
         // `abs(<number_expr>)` — pure pass-through; the inner may carry a
         // `read(...)` via `parse_int(read(name))` etc.
         Expr::Abs(inner) => collect_read_names(inner, out),
+        // `min(a, b)` / `max(a, b)` — recurse into both children; either
+        // side may carry a `read(...)` (e.g. `min(amount, parse_int(read(cap)))`).
+        Expr::Min(l, r) | Expr::Max(l, r) => {
+            collect_read_names(l, out);
+            collect_read_names(r, out);
+        }
     }
 }
 
@@ -456,6 +462,11 @@ fn collect_fetch_names(expr: &Expr, out: &mut Vec<String>) {
         Expr::Length(inner) => collect_fetch_names(inner, out),
         // `abs(<number_expr>)` — pure pass-through.
         Expr::Abs(inner) => collect_fetch_names(inner, out),
+        // `min(a, b)` / `max(a, b)` — recurse into both children.
+        Expr::Min(l, r) | Expr::Max(l, r) => {
+            collect_fetch_names(l, out);
+            collect_fetch_names(r, out);
+        }
     }
 }
 
@@ -537,6 +548,11 @@ fn collect_fetch_names_with_dups(expr: &Expr, out: &mut Vec<String>) {
         Expr::Length(inner) => collect_fetch_names_with_dups(inner, out),
         // `abs(<number_expr>)` — pure pass-through.
         Expr::Abs(inner) => collect_fetch_names_with_dups(inner, out),
+        // `min(a, b)` / `max(a, b)` — recurse into both children.
+        Expr::Min(l, r) | Expr::Max(l, r) => {
+            collect_fetch_names_with_dups(l, out);
+            collect_fetch_names_with_dups(r, out);
+        }
     }
 }
 
@@ -1027,6 +1043,8 @@ fn describe_expr_kind(e: &Expr) -> &'static str {
         Expr::EndsWith(_, _) => "ends_with",
         Expr::Length(_) => "length",
         Expr::Abs(_) => "abs",
+        Expr::Min(_, _) => "min",
+        Expr::Max(_, _) => "max",
     }
 }
 
@@ -1434,6 +1452,37 @@ fn check_expr_against(
                 ),
             });
         }
+        // `min(<a>, <b>)` produces number. Both children must be number-typed;
+        // recurse against Type::Number so non-number args are rejected through
+        // the usual channel. Mirror of the Abs arms, but with two children.
+        (Expr::Min(l, r), Type::Number) => {
+            check_expr_against(l, &Type::Number, rule, all_rules, input_concept, all_concepts, errors);
+            check_expr_against(r, &Type::Number, rule, all_rules, input_concept, all_concepts, errors);
+        }
+        (Expr::Min(_, _), other) => {
+            errors.push(VerifyError {
+                context: format!("rule '{}' / logic", rule.name),
+                message: format!(
+                    "min produces number but the expected type is '{}'",
+                    type_display(other),
+                ),
+            });
+        }
+        // `max(<a>, <b>)` — same shape as Min: both children number-typed,
+        // outer produces number.
+        (Expr::Max(l, r), Type::Number) => {
+            check_expr_against(l, &Type::Number, rule, all_rules, input_concept, all_concepts, errors);
+            check_expr_against(r, &Type::Number, rule, all_rules, input_concept, all_concepts, errors);
+        }
+        (Expr::Max(_, _), other) => {
+            errors.push(VerifyError {
+                context: format!("rule '{}' / logic", rule.name),
+                message: format!(
+                    "max produces number but the expected type is '{}'",
+                    type_display(other),
+                ),
+            });
+        }
         (Expr::MatchResult(_target, _, ok_body, _, err_body), _) => {
             // Both arms must produce `expected`. The target should be a Result —
             // checking that requires inferring through lambda bindings, which
@@ -1647,6 +1696,9 @@ fn infer_expr_type(
         // `abs(<number>)` returns number. Inner number-ness enforced by
         // check_expr_against.
         Expr::Abs(_) => Some(Type::Number),
+        // `min(<number>, <number>)` / `max(<number>, <number>)` return number.
+        // Both children are number-typed; check_expr_against enforces that.
+        Expr::Min(_, _) | Expr::Max(_, _) => Some(Type::Number),
         // Map/Filter/Fold/Ok/Err/MatchResult: deferred until lambda binding
         // tracking lands. Returning None means we do not check; we also do not
         // falsely accept.
@@ -1984,6 +2036,12 @@ fn collect_expr_facts(
         Expr::Abs(inner) => {
             collect_expr_facts(inner, reads, calls);
         }
+        // `min(a, b)` / `max(a, b)` — pure: branch-free scalar comparison
+        // adds no synthetic read; each child contributes its own facts.
+        Expr::Min(l, r) | Expr::Max(l, r) => {
+            collect_expr_facts(l, reads, calls);
+            collect_expr_facts(r, reads, calls);
+        }
     }
 }
 
@@ -2201,6 +2259,8 @@ fn count_operations(expr: &Expr) -> usize {
         Expr::Length(inner) => 1 + count_operations(inner),
         // `abs(<number_expr>)` — same shape as Neg: one op + inner cost.
         Expr::Abs(inner) => 1 + count_operations(inner),
+        // `min(a, b)` / `max(a, b)` — branch-free scalar; one op + each child.
+        Expr::Min(l, r) | Expr::Max(l, r) => 1 + count_operations(l) + count_operations(r),
     }
 }
 

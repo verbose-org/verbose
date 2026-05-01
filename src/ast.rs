@@ -556,6 +556,16 @@ pub enum Expr {
     /// haystack_ptr + (haystack_len - needle_len), then `repe cmpsb` on
     /// needle_len bytes.
     EndsWith(Box<Expr>, Box<Expr>),
+    /// `min(<a>, <b>)` — binary scalar minimum, returns Number.
+    /// Distinct from the existing fold-style `min(coll, var => expr)`
+    /// which reduces a collection. The parser disambiguates by the
+    /// presence of `=>` after the second argument: with lambda → fold,
+    /// without → binary scalar. Both args must be number-typed.
+    /// Native: branch-free `cmp + cmovg` (3 instructions).
+    Min(Box<Expr>, Box<Expr>),
+    /// `max(<a>, <b>)` — binary scalar maximum, returns Number. Same
+    /// disambiguation rule and shape as Min. Native: `cmp + cmovl`.
+    Max(Box<Expr>, Box<Expr>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
