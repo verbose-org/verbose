@@ -721,6 +721,61 @@ fn collect_rule_read_names(rule: &Rule) -> Vec<String> {
     names
 }
 
+/// Resolve every resource name read by `rule` against the program's
+/// top-level resource table. Mirror of the by-hand block 7 emitters
+/// were duplicating before this helper was extracted (2026-05-01).
+/// `role` distinguishes the error message between rule-level and
+/// service-handler-level callers ("rule" vs "service handler") —
+/// that's the only meaningful variation across call sites.
+fn collect_referenced_resources<'a>(
+    rule: &Rule,
+    all_resources: &HashMap<&str, &'a Resource>,
+    role: &str,
+) -> Result<Vec<&'a Resource>, NativeError> {
+    let names = collect_rule_read_names(rule);
+    let mut out: Vec<&'a Resource> = Vec::with_capacity(names.len());
+    for name in &names {
+        let r = all_resources.get(name.as_str()).ok_or_else(|| NativeError {
+            message: format!(
+                "{} '{}' reads resource '{}' but no top-level `resource {}` was declared",
+                role, rule.name, name, name
+            ),
+        })?;
+        out.push(*r);
+    }
+    Ok(out)
+}
+
+/// Each resource contributes 16 bytes (ptr + len) plus a max_bytes
+/// buffer padded to 8 bytes. Same accounting in every emitter that
+/// participates in the read() sweep — extracted for legibility and
+/// to keep the formula in one place.
+fn compute_resource_extra_bytes(referenced: &[&Resource]) -> i32 {
+    referenced
+        .iter()
+        .map(|r| 16 + (((r.max_bytes as i32) + 7) & !7))
+        .sum()
+}
+
+/// Shared sys_exit(1) tail for resource open/read failures. Emitted
+/// only when at least one resource was read — resource-free programs
+/// pay zero bytes for this. The same 9-line block was inlined at the
+/// end of every emit_*_program that supports `read()`; extraction
+/// here keeps the abort posture consistent across emitters.
+fn emit_resource_abort_tail(code: &mut Vec<u8>, abort_patches: &[usize]) {
+    if abort_patches.is_empty() {
+        return;
+    }
+    let abort_label = code.len();
+    for site in abort_patches {
+        let rel = abort_label as i32 - (*site as i32 + 4);
+        code[*site..*site + 4].copy_from_slice(&rel.to_le_bytes());
+    }
+    code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x3C, 0x00, 0x00, 0x00]); // mov rax, 60
+    code.extend_from_slice(&[0x48, 0xC7, 0xC7, 0x01, 0x00, 0x00, 0x00]); // mov rdi, 1
+    code.extend_from_slice(&[0x0F, 0x05]);                               // syscall
+}
+
 /// Phase 11 slice 1 — walk an expression tree collecting every
 /// `Fetch(name, _)` connection name (de-duplicated, in source order).
 /// Mirrors `collect_read_names_native` exactly. Used by the prologue to
@@ -1294,24 +1349,9 @@ fn emit_record_loop_prologue<'a>(
     // padded to 8 bytes. Resources unknown at the program level become a
     // hard error here — the verifier already validates names, so reaching
     // an undeclared one means the dispatch was called with a stale rule.
-    let referenced_resources: Vec<&Resource> = {
-        let names = collect_rule_read_names(rule);
-        let mut out: Vec<&Resource> = Vec::with_capacity(names.len());
-        for name in &names {
-            let r = all_resources.get(name.as_str()).ok_or_else(|| NativeError {
-                message: format!(
-                    "rule '{}' reads resource '{}' but no top-level `resource {}` was declared",
-                    rule.name, name, name
-                ),
-            })?;
-            out.push(*r);
-        }
-        out
-    };
-    let resource_extra_bytes: i32 = referenced_resources
-        .iter()
-        .map(|r| 16 + (((r.max_bytes as i32) + 7) & !7))
-        .sum();
+    let referenced_resources: Vec<&Resource> =
+        collect_referenced_resources(rule, all_resources, "rule")?;
+    let resource_extra_bytes: i32 = compute_resource_extra_bytes(&referenced_resources);
     // Phase 11 slice 1: enumerate the connections the rule fetches, in
     // source order. Each contributes 2 slots (ptr, len) plus the response
     // buffer (max_response padded to 8). Same shape as resources.
@@ -1632,17 +1672,7 @@ fn emit_record_loop_epilogue(code: &mut Vec<u8>, ctx: &RecordLoopCtx<'_>) {
     // The slice 8d service abort path stays separate; this one only fires
     // for rule-level resource I/O failures and only exists when at least
     // one resource read was emitted, so non-resource rules pay zero bytes.
-    if !ctx.resource_abort_patches.is_empty() {
-        let abort_label = code.len();
-        for site in &ctx.resource_abort_patches {
-            let rel = abort_label as i32 - (*site as i32 + 4);
-            code[*site..*site + 4].copy_from_slice(&rel.to_le_bytes());
-        }
-        // mov rax, 60 ; mov rdi, 1 ; syscall — mirror slice 8d's sequence.
-        code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x3C, 0x00, 0x00, 0x00]);
-        code.extend_from_slice(&[0x48, 0xC7, 0xC7, 0x01, 0x00, 0x00, 0x00]);
-        code.extend_from_slice(&[0x0F, 0x05]);
-    }
+    emit_resource_abort_tail(code, &ctx.resource_abort_patches);
 }
 
 fn emit_full_program(
@@ -4500,24 +4530,9 @@ fn emit_collection_program(
     // len) slots survive every record AND every element iteration. Same
     // shape and shared `emit_resource_read_sequence` helper used by the rule
     // prologue (slice 9.1) and the text-fold init (slice 9.5).
-    let referenced_resources: Vec<&Resource> = {
-        let names = collect_rule_read_names(rule);
-        let mut out: Vec<&Resource> = Vec::with_capacity(names.len());
-        for name in &names {
-            let r = all_resources.get(name.as_str()).ok_or_else(|| NativeError {
-                message: format!(
-                    "rule '{}' reads resource '{}' but no top-level `resource {}` was declared",
-                    rule.name, name, name
-                ),
-            })?;
-            out.push(*r);
-        }
-        out
-    };
-    let resource_extra_bytes: i32 = referenced_resources
-        .iter()
-        .map(|r| 16 + (((r.max_bytes as i32) + 7) & !7))
-        .sum();
+    let referenced_resources: Vec<&Resource> =
+        collect_referenced_resources(rule, all_resources, "rule")?;
+    let resource_extra_bytes: i32 = compute_resource_extra_bytes(&referenced_resources);
     // now_unix(): 16 bytes at the bottom of the frame; collection rules
     // use it for per-element ts checks (e.g. enrich each emitted record
     // with the same captured `now`).
@@ -4789,16 +4804,7 @@ fn emit_collection_program(
     // Slice 9.5c: shared abort label for resource open/read failures.
     // Mirrors the rule-prologue path. Only emitted when at least one
     // resource was read, so resource-free programs pay zero bytes.
-    if !resource_abort_patches.is_empty() {
-        let abort_label = code.len();
-        for site in &resource_abort_patches {
-            let rel = abort_label as i32 - (*site as i32 + 4);
-            code[*site..*site + 4].copy_from_slice(&rel.to_le_bytes());
-        }
-        code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x3C, 0x00, 0x00, 0x00]); // mov rax, 60
-        code.extend_from_slice(&[0x48, 0xC7, 0xC7, 0x01, 0x00, 0x00, 0x00]); // mov rdi, 1
-        code.extend_from_slice(&[0x0F, 0x05]);                               // syscall
-    }
+    emit_resource_abort_tail(&mut code, &resource_abort_patches);
 
     Ok(code)
 }
@@ -4907,24 +4913,9 @@ fn emit_fold_program(
     // fold body). Same shape as slice 9.5b/c — collect_rule_read_names
     // walks every Read in the AST so a `read()` deep inside the body
     // gets the same prologue as a top-level let RHS reference.
-    let referenced_resources: Vec<&Resource> = {
-        let names = collect_rule_read_names(rule);
-        let mut out: Vec<&Resource> = Vec::with_capacity(names.len());
-        for name in &names {
-            let r = all_resources.get(name.as_str()).ok_or_else(|| NativeError {
-                message: format!(
-                    "rule '{}' reads resource '{}' but no top-level `resource {}` was declared",
-                    rule.name, name, name
-                ),
-            })?;
-            out.push(*r);
-        }
-        out
-    };
-    let resource_extra_bytes: i32 = referenced_resources
-        .iter()
-        .map(|r| 16 + (((r.max_bytes as i32) + 7) & !7))
-        .sum();
+    let referenced_resources: Vec<&Resource> =
+        collect_referenced_resources(rule, all_resources, "rule")?;
+    let resource_extra_bytes: i32 = compute_resource_extra_bytes(&referenced_resources);
     // now_unix(): 16 bytes if any reference exists in the rule (logic
     // value or any let RHS). Sits at the very bottom of the frame so
     // resource and acc slot positions stay byte-for-byte unchanged for
@@ -5134,16 +5125,7 @@ fn emit_fold_program(
     // Slice 9.5d: shared abort label for resource open/read failures.
     // Only emitted when at least one resource was read; resource-free
     // programs pay zero bytes.
-    if !resource_abort_patches.is_empty() {
-        let abort_label = code.len();
-        for site in &resource_abort_patches {
-            let rel = abort_label as i32 - (*site as i32 + 4);
-            code[*site..*site + 4].copy_from_slice(&rel.to_le_bytes());
-        }
-        code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x3C, 0x00, 0x00, 0x00]); // mov rax, 60
-        code.extend_from_slice(&[0x48, 0xC7, 0xC7, 0x01, 0x00, 0x00, 0x00]); // mov rdi, 1
-        code.extend_from_slice(&[0x0F, 0x05]);                               // syscall
-    }
+    emit_resource_abort_tail(&mut code, &resource_abort_patches);
 
     Ok(code)
 }
@@ -5298,24 +5280,9 @@ fn emit_multi_fold_program(
     // Slice 9.5e: enumerate resources the rule reads (same shape as
     // slice 9.5d). Compose with text equality for filter-by-allowlist
     // patterns inside `all`/`any` quantifiers.
-    let referenced_resources: Vec<&Resource> = {
-        let names = collect_rule_read_names(rule);
-        let mut out: Vec<&Resource> = Vec::with_capacity(names.len());
-        for name in &names {
-            let r = all_resources.get(name.as_str()).ok_or_else(|| NativeError {
-                message: format!(
-                    "rule '{}' reads resource '{}' but no top-level `resource {}` was declared",
-                    rule.name, name, name
-                ),
-            })?;
-            out.push(*r);
-        }
-        out
-    };
-    let resource_extra_bytes: i32 = referenced_resources
-        .iter()
-        .map(|r| 16 + (((r.max_bytes as i32) + 7) & !7))
-        .sum();
+    let referenced_resources: Vec<&Resource> =
+        collect_referenced_resources(rule, all_resources, "rule")?;
+    let resource_extra_bytes: i32 = compute_resource_extra_bytes(&referenced_resources);
     // now_unix(): 16 bytes at the very bottom of the frame when the rule
     // touches the clock. Same shape as Phase 4 / record-loop prologue.
     let uses_now = rule_uses_now_unix(rule);
@@ -5530,16 +5497,7 @@ fn emit_multi_fold_program(
     code.extend_from_slice(&[0x0F, 0x05]);
 
     // Slice 9.5e: shared abort label for resource open/read failures.
-    if !resource_abort_patches.is_empty() {
-        let abort_label = code.len();
-        for site in &resource_abort_patches {
-            let rel = abort_label as i32 - (*site as i32 + 4);
-            code[*site..*site + 4].copy_from_slice(&rel.to_le_bytes());
-        }
-        code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x3C, 0x00, 0x00, 0x00]); // mov rax, 60
-        code.extend_from_slice(&[0x48, 0xC7, 0xC7, 0x01, 0x00, 0x00, 0x00]); // mov rdi, 1
-        code.extend_from_slice(&[0x0F, 0x05]);                               // syscall
-    }
+    emit_resource_abort_tail(&mut code, &resource_abort_patches);
 
     Ok(code)
 }
@@ -5755,20 +5713,8 @@ fn emit_text_fold_program(
     // above the outer loop — see the prologue below. For literal-init,
     // resource-free programs `referenced_resources` stays empty and
     // everything is byte-for-byte the slice-5b original.
-    let referenced_resources: Vec<&Resource> = {
-        let names = collect_rule_read_names(rule);
-        let mut out: Vec<&Resource> = Vec::with_capacity(names.len());
-        for name in &names {
-            let r = all_resources.get(name.as_str()).ok_or_else(|| NativeError {
-                message: format!(
-                    "rule '{}' reads resource '{}' but no top-level `resource {}` was declared",
-                    rule.name, name, name
-                ),
-            })?;
-            out.push(*r);
-        }
-        out
-    };
+    let referenced_resources: Vec<&Resource> =
+        collect_referenced_resources(rule, all_resources, "rule")?;
     // We don't yet know the rbp slot offsets — the prologue assigns them
     // AFTER frame setup. For the classifier we only need the names to be
     // present in the bindings map (the map lookup is name → presence;
@@ -5876,10 +5822,7 @@ fn emit_text_fold_program(
     // the body concat. Each contributes (16 bytes for ptr+len) + max
     // padded to 8 bytes. Reads run ONCE at startup; the (ptr, len) live
     // for the entire rule invocation.
-    let resource_extra_bytes: i32 = referenced_resources
-        .iter()
-        .map(|r| 16 + (((r.max_bytes as i32) + 7) & !7))
-        .sum();
+    let resource_extra_bytes: i32 = compute_resource_extra_bytes(&referenced_resources);
     // now_unix(): 16 bytes at the bottom of the frame; useful here for
     // text fold rendering (e.g. prepend a per-batch timestamp to each
     // emitted line, captured once per rule invocation).
@@ -6305,16 +6248,7 @@ fn emit_text_fold_program(
     // Mirrors the rule-prologue path in emit_record_loop_epilogue. The
     // label only exists when at least one resource read was emitted, so
     // literal-init programs pay zero bytes for it.
-    if !resource_abort_patches.is_empty() {
-        let abort_label = code.len();
-        for site in &resource_abort_patches {
-            let rel = abort_label as i32 - (*site as i32 + 4);
-            code[*site..*site + 4].copy_from_slice(&rel.to_le_bytes());
-        }
-        code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x3C, 0x00, 0x00, 0x00]); // mov rax, 60
-        code.extend_from_slice(&[0x48, 0xC7, 0xC7, 0x01, 0x00, 0x00, 0x00]); // mov rdi, 1
-        code.extend_from_slice(&[0x0F, 0x05]);                               // syscall
-    }
+    emit_resource_abort_tail(&mut code, &resource_abort_patches);
 
     Ok(code)
 }
@@ -8282,24 +8216,9 @@ fn emit_parallel_program(
     // Each contributes 16 bytes (ptr + len) plus a max-padded buffer to
     // the rbp frame. Same accounting as every other resource-aware
     // emitter — the canonical pattern from slice 9.1.
-    let referenced_resources: Vec<&Resource> = {
-        let names = collect_rule_read_names(rule);
-        let mut out: Vec<&Resource> = Vec::with_capacity(names.len());
-        for name in &names {
-            let r = all_resources.get(name.as_str()).ok_or_else(|| NativeError {
-                message: format!(
-                    "rule '{}' reads resource '{}' but no top-level `resource {}` was declared",
-                    rule.name, name, name
-                ),
-            })?;
-            out.push(*r);
-        }
-        out
-    };
-    let resource_extra_bytes: i32 = referenced_resources
-        .iter()
-        .map(|r| 16 + (((r.max_bytes as i32) + 7) & !7))
-        .sum();
+    let referenced_resources: Vec<&Resource> =
+        collect_referenced_resources(rule, all_resources, "rule")?;
+    let resource_extra_bytes: i32 = compute_resource_extra_bytes(&referenced_resources);
 
     let mut code = Vec::new();
     let mut resource_abort_patches: Vec<usize> = Vec::new();
@@ -8510,16 +8429,7 @@ fn emit_parallel_program(
     // here kills the single parent process without orphaning any
     // child — fail-closed even under parallel dispatch. Zero-byte cost
     // when no resource is referenced (the abort label is conditional).
-    if !resource_abort_patches.is_empty() {
-        let abort_label = code.len();
-        for site in &resource_abort_patches {
-            let rel = abort_label as i32 - (*site as i32 + 4);
-            code[*site..*site + 4].copy_from_slice(&rel.to_le_bytes());
-        }
-        code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x3C, 0x00, 0x00, 0x00]); // mov rax, 60
-        code.extend_from_slice(&[0x48, 0xC7, 0xC7, 0x01, 0x00, 0x00, 0x00]); // mov rdi, 1
-        code.extend_from_slice(&[0x0F, 0x05]);                               // syscall
-    }
+    emit_resource_abort_tail(&mut code, &resource_abort_patches);
 
     Ok(code)
 }
@@ -10039,27 +9949,12 @@ fn emit_http10_dynamic_bytes(
     // table. A name unknown at this point is a hard error — the verifier
     // already rejects unknown resources at parse time, so reaching here
     // means the dispatcher was invoked with a stale handler.
-    let referenced_resources: Vec<&Resource> = {
-        let names = collect_rule_read_names(handler);
-        let mut out: Vec<&Resource> = Vec::with_capacity(names.len());
-        for name in &names {
-            let r = all_resources.get(name.as_str()).ok_or_else(|| NativeError {
-                message: format!(
-                    "service handler '{}' reads resource '{}' but no top-level `resource {}` was declared",
-                    handler.name, name, name
-                ),
-            })?;
-            out.push(*r);
-        }
-        out
-    };
+    let referenced_resources: Vec<&Resource> =
+        collect_referenced_resources(handler, all_resources, "service handler")?;
     // Each resource contributes 16 bytes (ptr + len) plus a max_bytes
     // buffer padded to 8 bytes — same accounting as the rule-prologue
     // path in emit_record_loop_prologue.
-    let resource_extra_bytes: i32 = referenced_resources
-        .iter()
-        .map(|r| 16 + (((r.max_bytes as i32) + 7) & !7))
-        .sum();
+    let resource_extra_bytes: i32 = compute_resource_extra_bytes(&referenced_resources);
     // Phase 11 slice 2: enumerate connections the handler fetches, in
     // source order, and resolve each against the program's top-level
     // connection table. A name unknown at this point is a hard error —
