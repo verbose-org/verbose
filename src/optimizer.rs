@@ -69,6 +69,8 @@ fn count_nodes(expr: &Expr) -> usize {
         // `contains(haystack, needle)` — same shape as StartsWith: count
         // this node + recurse into both children.
         Expr::Contains(h, n) => 1 + count_nodes(h) + count_nodes(n),
+        // `ends_with(haystack, needle)` — same shape as StartsWith.
+        Expr::EndsWith(h, n) => 1 + count_nodes(h) + count_nodes(n),
         // `length(<text_expr>)` — same shape as ParseInt: one node + recurse.
         Expr::Length(inner) => 1 + count_nodes(inner),
         // `abs(<number_expr>)` — same shape as Neg: one node + recurse.
@@ -380,6 +382,11 @@ fn substitute_ident(expr: &Expr, name: &str, replacement: &Expr) -> Expr {
             Box::new(substitute_ident(h, name, replacement)),
             Box::new(substitute_ident(n, name, replacement)),
         ),
+        // `ends_with(haystack, needle)` — substitute through both children.
+        Expr::EndsWith(h, n) => Expr::EndsWith(
+            Box::new(substitute_ident(h, name, replacement)),
+            Box::new(substitute_ident(n, name, replacement)),
+        ),
         // `length(<text_expr>)` — substitute through the inner expression.
         Expr::Length(inner) => Expr::Length(
             Box::new(substitute_ident(inner, name, replacement)),
@@ -632,6 +639,22 @@ pub fn optimize_expr(
                 return Expr::Number(result);
             }
             Expr::Contains(Box::new(h_opt), Box::new(n_opt))
+        }
+        // `ends_with(haystack, needle)` — recurse into both children, then
+        // fold to 0/1 when both have collapsed to text literals. Empty needle
+        // is always true (matches stdlib `str::ends_with` and the runtime).
+        Expr::EndsWith(h, n) => {
+            let h_opt = optimize_expr(h, input_name, field_ranges);
+            let n_opt = optimize_expr(n, input_name, field_ranges);
+            if let (Expr::Text(s1), Expr::Text(s2)) = (&h_opt, &n_opt) {
+                let result = if s2.is_empty() || s1.as_bytes().ends_with(s2.as_bytes()) {
+                    1
+                } else {
+                    0
+                };
+                return Expr::Number(result);
+            }
+            Expr::EndsWith(Box::new(h_opt), Box::new(n_opt))
         }
         // `length(<text_expr>)` — if the inner is a text literal, fold the
         // byte count at compile time. Otherwise recurse and keep the

@@ -545,6 +545,17 @@ pub enum Expr {
     /// -1 for negative), then xor + sub flips the bits and adds 1 only
     /// when negative. No branch.
     Abs(Box<Expr>),
+    /// `ends_with(<haystack>, <needle>)` — symmetric of `starts_with`.
+    /// Returns `bool`: true iff `haystack`'s LAST `length(needle)` bytes
+    /// match `needle` byte-for-byte. Empty needle is always true (every
+    /// text ends with the empty suffix). Needle longer than haystack is
+    /// false. Byte-exact, no encoding awareness.
+    ///
+    /// Native algorithm: load haystack and needle (ptr, len), check
+    /// haystack_len >= needle_len, compute haystack_tail_ptr =
+    /// haystack_ptr + (haystack_len - needle_len), then `repe cmpsb` on
+    /// needle_len bytes.
+    EndsWith(Box<Expr>, Box<Expr>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

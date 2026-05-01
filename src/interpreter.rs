@@ -600,6 +600,26 @@ fn eval_expr(
                 }),
             }
         }
+        // `ends_with(<haystack>, <needle>)` — byte-level suffix test.
+        // Symmetric of starts_with: true iff haystack's last len(needle)
+        // bytes match needle byte-for-byte. Empty needle is always true;
+        // needle longer than haystack is false. Mirrors Rust's
+        // str::ends_with on the byte slices, matching what native will emit.
+        Expr::EndsWith(haystack, needle) => {
+            let h = eval_expr(haystack, env, all_rules)?;
+            let n = eval_expr(needle, env, all_rules)?;
+            match (h, n) {
+                (Value::Text(hs), Value::Text(ns)) => {
+                    Ok(Value::Bool(hs.as_bytes().ends_with(ns.as_bytes())))
+                }
+                (h, n) => Err(RuntimeError {
+                    message: format!(
+                        "ends_with requires two text arguments, got {} and {}",
+                        h, n
+                    ),
+                }),
+            }
+        }
         // `length(<text_expr>)` — byte count of inner text. Inner must
         // evaluate to Value::Text (else type error). Returns the byte
         // length as a Number, mirroring what native emits via the

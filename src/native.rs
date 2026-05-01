@@ -561,6 +561,13 @@ fn collect_read_names_native(expr: &Expr, out: &mut Vec<String>) {
             collect_read_names_native(h, out);
             collect_read_names_native(n, out);
         }
+        // `ends_with(haystack, needle)` — recurse into both children;
+        // either side may carry a `read(...)` reference. Same shape as
+        // StartsWith / Contains.
+        Expr::EndsWith(h, n) => {
+            collect_read_names_native(h, out);
+            collect_read_names_native(n, out);
+        }
         // `length(<text_expr>)` — pure pass-through.
         Expr::Length(inner) => collect_read_names_native(inner, out),
         // `abs(<number_expr>)` — pure pass-through.
@@ -599,6 +606,7 @@ fn expr_uses_now_unix(e: &Expr) -> bool {
         Expr::Fetch(_, req) => expr_uses_now_unix(req),
         Expr::StartsWith(h, n) => expr_uses_now_unix(h) || expr_uses_now_unix(n),
         Expr::Contains(h, n) => expr_uses_now_unix(h) || expr_uses_now_unix(n),
+        Expr::EndsWith(h, n) => expr_uses_now_unix(h) || expr_uses_now_unix(n),
     }
 }
 
@@ -641,7 +649,7 @@ fn expr_uses_field(e: &Expr, input_name: &str, field_name: &str) -> bool {
         Expr::Call(_, args) | Expr::Concat(args) => {
             args.iter().any(|a| expr_uses_field(a, input_name, field_name))
         }
-        Expr::StartsWith(h, n) | Expr::Contains(h, n) => {
+        Expr::StartsWith(h, n) | Expr::Contains(h, n) | Expr::EndsWith(h, n) => {
             expr_uses_field(h, input_name, field_name)
                 || expr_uses_field(n, input_name, field_name)
         }
@@ -784,6 +792,12 @@ fn collect_fetch_names_native(expr: &Expr, out: &mut Vec<String>) {
         // `contains(haystack, needle)` — recurse into both children;
         // either side may carry a `fetch(...)` reference.
         Expr::Contains(h, n) => {
+            collect_fetch_names_native(h, out);
+            collect_fetch_names_native(n, out);
+        }
+        // `ends_with(haystack, needle)` — recurse into both children;
+        // either side may carry a `fetch(...)` reference.
+        Expr::EndsWith(h, n) => {
             collect_fetch_names_native(h, out);
             collect_fetch_names_native(n, out);
         }
@@ -1057,6 +1071,8 @@ fn emit_connection_fetch_sequence(
             Expr::StartsWith(h, n) => first_fetch_for(h, name).or_else(|| first_fetch_for(n, name)),
             // `contains(haystack, needle)` — recurse into both children.
             Expr::Contains(h, n) => first_fetch_for(h, name).or_else(|| first_fetch_for(n, name)),
+            // `ends_with(haystack, needle)` — recurse into both children.
+            Expr::EndsWith(h, n) => first_fetch_for(h, name).or_else(|| first_fetch_for(n, name)),
             // `length(<text_expr>)` — pass-through.
             Expr::Length(inner) => first_fetch_for(inner, name),
             // `abs(<number_expr>)` — pass-through.
@@ -6695,6 +6711,9 @@ fn max_stack_depth(expr: &Expr) -> usize {
         // `contains(haystack, needle)` — same shape as StartsWith: fixed-
         // register substring search, no eval-stack push for the result.
         Expr::Contains(h, n) => max_stack_depth(h).max(max_stack_depth(n)),
+        // `ends_with(haystack, needle)` — same shape as StartsWith: fixed-
+        // register suffix compare, no eval-stack push for the result.
+        Expr::EndsWith(h, n) => max_stack_depth(h).max(max_stack_depth(n)),
         // `length(<text_expr>)` — fixed-register strlen scan / len_slot
         // load, the inner's depth dominates.
         Expr::Length(inner) => max_stack_depth(inner),
@@ -7373,6 +7392,25 @@ fn emit_eval_expr(
             offsets,
             text_bindings,
         ),
+        // `ends_with(haystack, needle)` — symmetric of starts_with.
+        // Algorithm:
+        //   1. produce (rsi=ptr, rcx=len) for haystack; save into r8, r9
+        //   2. produce (rsi=ptr, rcx=len) for needle
+        //   3. mov rdi, rsi (rdi = needle_ptr)
+        //   4. cmp r9, rcx ; jb .nope    (haystack shorter than needle → false)
+        //   5. test rcx, rcx ; je .empty  (empty needle → always true)
+        //   6. mov rsi, r8 ; add rsi, r9 ; sub rsi, rcx
+        //      (rsi = haystack_ptr + hay_len - needle_len = tail start)
+        //   7. cld ; repe cmpsb           (compare needle_len bytes)
+        //   8. sete al ; movzx rax, al
+        Expr::EndsWith(haystack, needle) => emit_ends_with(
+            code,
+            haystack.as_ref(),
+            needle.as_ref(),
+            input_name,
+            offsets,
+            text_bindings,
+        ),
         // `length(<text_expr>)` — byte count returned in rax.
         // Inner shape dispatch:
         //   - Text literal: optimizer should have folded; if it slipped
@@ -7669,6 +7707,82 @@ fn emit_starts_with(
     code.extend_from_slice(&[0x30, 0xC0]);
 
     // .done: movzx rax, al  (zero-extend bool to qword)
+    let done_label = code.len();
+    code[done_from_main_patch] = (done_label - done_from_main_patch - 1) as u8;
+    code[done_from_empty_patch] = (done_label - done_from_empty_patch - 1) as u8;
+    code.extend_from_slice(&[0x48, 0x0F, 0xB6, 0xC0]);
+
+    Ok(())
+}
+
+/// Emit `ends_with(haystack, needle)` returning bool in rax. Symmetric
+/// of starts_with: load both args, check haystack_len >= needle_len,
+/// position rsi at the haystack's tail (haystack_ptr + hay_len - needle_len),
+/// then `repe cmpsb` on needle_len bytes.
+fn emit_ends_with(
+    code: &mut Vec<u8>,
+    haystack: &Expr,
+    needle: &Expr,
+    input_name: &str,
+    offsets: &HashMap<&str, i32>,
+    text_bindings: &TextBindings<'_>,
+) -> Result<(), NativeError> {
+    // Step 1: load haystack into (rsi, rcx); save into (r8, r9).
+    emit_starts_with_load_text(code, haystack, input_name, offsets, text_bindings)?;
+    // mov r8, rsi  ; mov r9, rcx
+    code.extend_from_slice(&[0x49, 0x89, 0xF0]);
+    code.extend_from_slice(&[0x49, 0x89, 0xC9]);
+
+    // Step 2: load needle into (rsi, rcx).
+    emit_starts_with_load_text(code, needle, input_name, offsets, text_bindings)?;
+    // mov rdi, rsi  (cmpsb uses rdi as second source)
+    code.extend_from_slice(&[0x48, 0x89, 0xF7]);
+
+    // Step 3: cmp r9, rcx ; jb .nope (haystack shorter than needle → false)
+    code.extend_from_slice(&[0x49, 0x39, 0xC9]);
+    code.push(0x72);
+    let nope_patch = code.len();
+    code.push(0x00);
+
+    // Step 4: empty needle short-circuit (test rcx, rcx ; je .empty)
+    code.extend_from_slice(&[0x48, 0x85, 0xC9]);
+    code.push(0x74);
+    let empty_patch = code.len();
+    code.push(0x00);
+
+    // Step 5: rsi = haystack_ptr + (hay_len - needle_len)
+    //   mov rsi, r8 ; add rsi, r9 ; sub rsi, rcx
+    // The needle_ptr lives in rdi (set at step 2's mov rdi, rsi).
+    code.extend_from_slice(&[0x4C, 0x89, 0xC6]);  // mov rsi, r8
+    code.extend_from_slice(&[0x4C, 0x01, 0xCE]);  // add rsi, r9
+    code.extend_from_slice(&[0x48, 0x29, 0xCE]);  // sub rsi, rcx
+    // cld ; repe cmpsb
+    code.push(0xFC);
+    code.extend_from_slice(&[0xF3, 0xA6]);
+    // sete al
+    code.extend_from_slice(&[0x0F, 0x94, 0xC0]);
+    // jmp .done
+    code.push(0xEB);
+    let done_from_main_patch = code.len();
+    code.push(0x00);
+
+    // .empty: needle was empty → result is true
+    let empty_label = code.len();
+    code[empty_patch] = (empty_label - empty_patch - 1) as u8;
+    // mov al, 1
+    code.extend_from_slice(&[0xB0, 0x01]);
+    // jmp .done
+    code.push(0xEB);
+    let done_from_empty_patch = code.len();
+    code.push(0x00);
+
+    // .nope: haystack shorter than needle → false
+    let nope_label = code.len();
+    code[nope_patch] = (nope_label - nope_patch - 1) as u8;
+    // xor al, al
+    code.extend_from_slice(&[0x30, 0xC0]);
+
+    // .done: movzx rax, al
     let done_label = code.len();
     code[done_from_main_patch] = (done_label - done_from_main_patch - 1) as u8;
     code[done_from_empty_patch] = (done_label - done_from_empty_patch - 1) as u8;
@@ -9708,6 +9822,7 @@ fn expr_kind(e: &Expr) -> &'static str {
         Expr::NowUnix => "NowUnix",
         Expr::StartsWith(_, _) => "StartsWith",
         Expr::Contains(_, _) => "Contains",
+        Expr::EndsWith(_, _) => "EndsWith",
         Expr::Length(_) => "Length",
         Expr::Abs(_) => "Abs",
     }
@@ -12669,6 +12784,93 @@ mod tests {
         );
 
         let _ = fs::remove_file(out);
+    }
+
+    /// `ends_with(<haystack>, <needle>)` primitive (2026-05-01):
+    /// symmetric of `starts_with`. Native algorithm: position rsi at
+    /// haystack_ptr + (hay_len - needle_len), then `repe cmpsb` on
+    /// needle_len bytes.
+    ///
+    /// Pins the same edge cases as starts_with, mirrored for suffix:
+    ///   (a) suffix matches → true
+    ///   (b) length too short → false
+    ///   (c) byte mismatch in tail → false
+    ///   (d) empty needle → always true
+    ///   (e) needle that's a PREFIX but not a suffix → false (this is
+    ///       what differentiates ends_with from starts_with)
+    ///   (f) case sensitive
+    #[test]
+    fn slice_ends_with_runtime_byte_compare() {
+        use std::process::Command;
+        let src = r#"@verbose 0.1.0
+
+concept Path
+  @intention: "x"
+  @source: invoices.intent:1
+  fields:
+    p : text
+
+rule is_css
+  @intention: "x"
+  @source: invoices.intent:1
+  input:
+    r : Path
+  output:
+    css : bool
+  logic:
+    css = ends_with(r.p, ".css")
+  proofs:
+    purity:
+      reads : [r.p]
+      calls : []
+    termination:
+      bound : 1
+"#;
+        let tokens = crate::lexer::Lexer::new(src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+        let out = std::env::temp_dir().join("verbosec_test_ends_with");
+        compile_native(&program, "is_css", out.to_str().unwrap(), false, false)
+            .expect("ends_with should compile");
+        let run = |arg: &str| -> String {
+            let r = Command::new(&out).args([arg]).output().expect("spawn");
+            String::from_utf8_lossy(&r.stdout).trim_end_matches('\n').to_string()
+        };
+
+        // (a) suffix matches
+        assert_eq!(run("/static/main.css"), "true");
+        assert_eq!(run(".css"), "true", "exact match");
+        // (b) length too short
+        assert_eq!(run(".cs"), "false");
+        assert_eq!(run(""), "false");
+        // (c) byte mismatch in tail
+        assert_eq!(run("/static/main.js"), "false");
+        // (e) prefix-but-not-suffix — this is what distinguishes
+        // ends_with from starts_with. ".css/style" STARTS with ".css"
+        // but does NOT end with it.
+        assert_eq!(run(".css/style"), "false");
+        // (f) case-sensitive
+        assert_eq!(run("/main.CSS"), "false");
+
+        let _ = std::fs::remove_file(&out);
+
+        // (d) empty needle → always true (literal fold path)
+        let empty_src = src.replace("\".css\"", "\"\"");
+        let tokens = crate::lexer::Lexer::new(&empty_src).tokenize().expect("tokenize");
+        let empty_program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+        let out2 = std::env::temp_dir().join("verbosec_test_ends_with_empty");
+        compile_native(&empty_program, "is_css", out2.to_str().unwrap(), false, false)
+            .expect("empty-needle ends_with should compile");
+        let r = Command::new(&out2).args(["anything"]).output().expect("spawn");
+        assert_eq!(
+            String::from_utf8_lossy(&r.stdout).trim_end_matches('\n'),
+            "true"
+        );
+        let r = Command::new(&out2).args([""]).output().expect("spawn");
+        assert_eq!(
+            String::from_utf8_lossy(&r.stdout).trim_end_matches('\n'),
+            "true"
+        );
+        let _ = std::fs::remove_file(&out2);
     }
 
     /// WAF-style body content gate (2026-05-01): pairs the HTTP body

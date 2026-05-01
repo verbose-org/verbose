@@ -337,6 +337,12 @@ fn collect_read_names(expr: &Expr, out: &mut Vec<String>) {
             collect_read_names(h, out);
             collect_read_names(n, out);
         }
+        // `ends_with(haystack, needle)` — recurse into both children;
+        // either side may carry a `read(...)` reference.
+        Expr::EndsWith(h, n) => {
+            collect_read_names(h, out);
+            collect_read_names(n, out);
+        }
         // `length(<text_expr>)` — pure pass-through; the inner may carry a
         // `read(...)` (e.g. `length(read(name))`).
         Expr::Length(inner) => collect_read_names(inner, out),
@@ -441,6 +447,11 @@ fn collect_fetch_names(expr: &Expr, out: &mut Vec<String>) {
             collect_fetch_names(h, out);
             collect_fetch_names(n, out);
         }
+        // `ends_with(haystack, needle)` — recurse into both children.
+        Expr::EndsWith(h, n) => {
+            collect_fetch_names(h, out);
+            collect_fetch_names(n, out);
+        }
         // `length(<text_expr>)` — pure pass-through.
         Expr::Length(inner) => collect_fetch_names(inner, out),
         // `abs(<number_expr>)` — pure pass-through.
@@ -514,6 +525,11 @@ fn collect_fetch_names_with_dups(expr: &Expr, out: &mut Vec<String>) {
         }
         // `contains(haystack, needle)` — recurse into both children.
         Expr::Contains(h, n) => {
+            collect_fetch_names_with_dups(h, out);
+            collect_fetch_names_with_dups(n, out);
+        }
+        // `ends_with(haystack, needle)` — recurse into both children.
+        Expr::EndsWith(h, n) => {
             collect_fetch_names_with_dups(h, out);
             collect_fetch_names_with_dups(n, out);
         }
@@ -1008,6 +1024,7 @@ fn describe_expr_kind(e: &Expr) -> &'static str {
         Expr::NowUnix => "now_unix",
         Expr::StartsWith(_, _) => "starts_with",
         Expr::Contains(_, _) => "contains",
+        Expr::EndsWith(_, _) => "ends_with",
         Expr::Length(_) => "length",
         Expr::Abs(_) => "abs",
     }
@@ -1370,6 +1387,22 @@ fn check_expr_against(
                 ),
             });
         }
+        // `ends_with(<haystack>, <needle>)` produces bool. Same shape as
+        // StartsWith / Contains: when context is bool, both children must be
+        // text; otherwise surface a mismatch naming `ends_with`.
+        (Expr::EndsWith(h, n), Type::Bool) => {
+            check_expr_against(h, &Type::Text, rule, all_rules, input_concept, all_concepts, errors);
+            check_expr_against(n, &Type::Text, rule, all_rules, input_concept, all_concepts, errors);
+        }
+        (Expr::EndsWith(_, _), other) => {
+            errors.push(VerifyError {
+                context: format!("rule '{}' / logic", rule.name),
+                message: format!(
+                    "ends_with produces bool but the expected type is '{}'",
+                    type_display(other),
+                ),
+            });
+        }
         // `length(<text_expr>)` produces number. When the surrounding
         // context expects number, recurse into the inner with expected=Text.
         // Otherwise surface a clear mismatch (mirror of the ParseInt arms).
@@ -1605,6 +1638,9 @@ fn infer_expr_type(
         // StartsWith — both arguments must be text-typed; the outer type
         // is fixed at bool for inference.
         Expr::Contains(_, _) => Some(Type::Bool),
+        // `ends_with(<text>, <text>)` returns bool. Same shape as
+        // StartsWith / Contains.
+        Expr::EndsWith(_, _) => Some(Type::Bool),
         // `length(<text>)` returns number. Inner text-ness enforced by
         // check_expr_against.
         Expr::Length(_) => Some(Type::Number),
@@ -1932,6 +1968,12 @@ fn collect_expr_facts(
             collect_expr_facts(h, reads, calls);
             collect_expr_facts(n, reads, calls);
         }
+        // `ends_with(haystack, needle)` — pure, same shape as StartsWith /
+        // Contains: each child contributes its own facts.
+        Expr::EndsWith(h, n) => {
+            collect_expr_facts(h, reads, calls);
+            collect_expr_facts(n, reads, calls);
+        }
         // `length(<text_expr>)` — pure pass-through. The byte count itself
         // adds no synthetic read; the inner expression's facts are the facts.
         Expr::Length(inner) => {
@@ -2153,6 +2195,8 @@ fn count_operations(expr: &Expr) -> usize {
         // inner work (O(N*M)) is bounded by `max:` declarations on the
         // resources backing each side.
         Expr::Contains(h, n) => 1 + count_operations(h) + count_operations(n),
+        // `ends_with(haystack, needle)` — same shape as StartsWith.
+        Expr::EndsWith(h, n) => 1 + count_operations(h) + count_operations(n),
         // `length(<text_expr>)` — same shape as ParseInt: one op + inner cost.
         Expr::Length(inner) => 1 + count_operations(inner),
         // `abs(<number_expr>)` — same shape as Neg: one op + inner cost.
