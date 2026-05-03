@@ -339,6 +339,12 @@ tools/
   phase_sizes.sh   Per-phase native binary size report
 ```
 
+*Operator-facing reference for both generators (auth modes, the
+ANTHROPIC_API_KEY-vs-OAuth precedence gotcha, cost discussion, how to
+read the eval metric, how to extend the prompt) lives in
+[docs/generator-pipeline.md](docs/generator-pipeline.md). Read it
+before running the eval for the first time.*
+
 ## Language Features (current)
 
 - Types: `number`, `bool`, `text`, `collection(Type)`, `Result(T, E)` (declared failure path), named types
