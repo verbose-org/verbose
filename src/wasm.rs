@@ -3,15 +3,57 @@
 /// WASM is a stack-based bytecode that runs in browsers (Chrome, Firefox,
 /// Safari) and server-side (Node.js, Deno, Cloudflare Workers).
 ///
-/// A Verbose rule compiles to a single exported WASM function:
-///   (func (export "rule_name") (param i64 ...) (result i64 or i32)
-///     ... bytecode ...
-///   )
+/// # ABI
 ///
-/// The WASM module is typically 60-200 bytes — even smaller than our
-/// x86-64 binaries because WASM has no ELF headers or syscall overhead.
+/// Per concept-field type, params encode as:
+///   - `number` → 1 × i64
+///   - `bool`   → 1 × i32  (only seen for inputs; not exposed yet for fields)
+///   - `text`   → 2 × i32  (ptr, len) into the module's exported linear memory
+///
+/// Per output type, results encode as:
+///   - `number` → 1 × i64
+///   - `bool`   → 1 × i32
+///   - `text`   → 2 × i32  (ptr, len) — multi-value return
+///
+/// Choice rationale (slice W3a, 2026-05-03): the (ptr, len) pair
+/// mirrors native's BoundText slot convention exactly, so an auditor
+/// reads either backend with the same mental model. The bound travels
+/// alongside the data — never derived from a sentinel — so a
+/// misbehaving caller cannot cause a read past the intended end.
+///
+/// # Memory
+///
+/// When any text I/O is present the module declares & exports a
+/// linear memory of 1 page (64 KiB). Static text literals are placed
+/// in the data section starting at offset `LITERAL_BASE` (1024) so
+/// the first 1 KiB stays reserved for future runtime state (a bump
+/// allocator for `concat` outputs lands in W3b).
+///
+/// The host calls into the module by writing input text bytes into
+/// the exported memory, then passing the matching (ptr, len) as the
+/// two i32 params. Output text bytes — for now only literals — live
+/// in the data section and are read back by the host via
+/// `(new TextDecoder()).decode(memory.subarray(ptr, ptr+len))`.
 
 use crate::ast::*;
+use std::collections::HashMap;
+
+/// First memory offset where text literals are placed. The 0..1024
+/// range is reserved for future runtime state (bump allocator
+/// metadata, scratch buffers) so adding it later doesn't shift
+/// existing literal offsets and break already-shipped modules.
+const LITERAL_BASE: u32 = 1024;
+
+/// How a concept field is represented in the WASM function's params
+/// — sole source of truth for `Expr::Field` emission and for the
+/// type-section signature.
+#[derive(Debug, Clone, Copy)]
+enum FieldShape {
+    /// `number` field, single i64 param at this local index.
+    Number(u32),
+    /// `text` field, two i32 params: (ptr_local, len_local).
+    Text { ptr: u32, len: u32 },
+}
 
 #[derive(Debug)]
 pub struct WasmError {
@@ -57,8 +99,86 @@ pub fn compile_wasm(
         _ => return Err(WasmError { message: "rule input must be a named concept".into() }),
     };
 
-    let nfields = concept.fields.len();
+    // --- Param schema ---------------------------------------------
+    // Walk concept fields once; each field becomes one or two WASM
+    // params depending on its type. The map is the sole source of
+    // truth for `Expr::Field` emission below; the type section is a
+    // by-product of the same walk.
+    let mut field_shapes: HashMap<&str, FieldShape> = HashMap::new();
+    let mut param_types: Vec<u8> = Vec::new();
+    let mut param_idx: u32 = 0;
+    for f in &concept.fields {
+        match &f.ty {
+            Type::Number => {
+                field_shapes.insert(f.name.as_str(), FieldShape::Number(param_idx));
+                param_types.push(0x7E); // i64
+                param_idx += 1;
+            }
+            Type::Bool => {
+                // Bool input fields haven't been needed by any rule
+                // we've shipped — keep refusing until there's a real
+                // shape requirement to lock down.
+                return Err(WasmError {
+                    message: format!("bool input field '{}' is not yet supported in the WASM backend", f.name),
+                });
+            }
+            Type::Text => {
+                field_shapes.insert(f.name.as_str(), FieldShape::Text { ptr: param_idx, len: param_idx + 1 });
+                param_types.push(0x7F); // i32 ptr
+                param_types.push(0x7F); // i32 len
+                param_idx += 2;
+            }
+            other => {
+                return Err(WasmError {
+                    message: format!("unsupported field type {:?} for '{}' in the WASM backend", other, f.name),
+                });
+            }
+        }
+    }
+    let total_param_slots = param_idx;
+
+    // --- Result schema --------------------------------------------
+    // `text` output uses multi-value (i32, i32). Bool stays i32,
+    // Number stays i64 — both 1-result.
+    let result_types: Vec<u8> = match &rule.output_ty {
+        Type::Bool => vec![0x7F],
+        Type::Number => vec![0x7E],
+        Type::Text => vec![0x7F, 0x7F],
+        other => {
+            return Err(WasmError {
+                message: format!("unsupported output type {:?} in the WASM backend", other),
+            });
+        }
+    };
     let is_bool = rule.output_ty == Type::Bool;
+    let is_text_out = rule.output_ty == Type::Text;
+
+    // --- Text literal collection + offset assignment ---------------
+    // Walk the rule body and let-binding RHSes for every Expr::Text
+    // occurrence; assign each unique literal an offset starting at
+    // LITERAL_BASE. Identical literals are deduplicated.
+    let mut text_literals: HashMap<String, u32> = HashMap::new();
+    let mut literal_cursor: u32 = LITERAL_BASE;
+    {
+        let mut collect = |s: &str| {
+            if !text_literals.contains_key(s) {
+                text_literals.insert(s.to_string(), literal_cursor);
+                literal_cursor += s.len() as u32;
+            }
+        };
+        for (_, rhs) in &rule.logic.bindings {
+            walk_text_literals(rhs, &mut collect);
+        }
+        walk_text_literals(&rule.logic.value, &mut collect);
+    }
+
+    // Memory section is required iff there's any text I/O. A rule that
+    // returns `text` from a literal still needs memory because the host
+    // reads bytes from the data section through it; a pure-number rule
+    // skips memory entirely (keeps modules tiny).
+    let needs_memory = is_text_out
+        || field_shapes.values().any(|s| matches!(s, FieldShape::Text { .. }))
+        || !text_literals.is_empty();
 
     let mut module = Vec::new();
 
@@ -68,57 +188,59 @@ pub fn compile_wasm(
 
     // === Type section (function signature) ===
     let mut type_section = Vec::new();
-    type_section.push(1); // 1 type
-    type_section.push(0x60); // func type
-    type_section.push(nfields as u8); // N params
-    for _ in 0..nfields {
-        type_section.push(0x7E); // i64
-    }
-    type_section.push(1); // 1 result
-    type_section.push(if is_bool { 0x7F } else { 0x7E }); // i32 for bool, i64 for number
+    emit_leb128(&mut type_section, 1);              // 1 type
+    type_section.push(0x60);                         // func type
+    emit_leb128(&mut type_section, param_types.len() as u64);
+    type_section.extend_from_slice(&param_types);
+    emit_leb128(&mut type_section, result_types.len() as u64);
+    type_section.extend_from_slice(&result_types);
     emit_section(&mut module, 1, &type_section);
 
     // === Function section ===
     let func_section = vec![1, 0]; // 1 function, uses type 0
     emit_section(&mut module, 3, &func_section);
 
+    // === Memory section (only if text I/O present) ===
+    if needs_memory {
+        // limits=0 means no max; min=1 page (64 KiB).
+        let memory_section = vec![0x01, 0x00, 0x01];
+        emit_section(&mut module, 5, &memory_section);
+    }
+
     // === Export section ===
+    // Always export the rule function. Also export "memory" when
+    // declared so the host can read text bytes.
     let mut export_section = Vec::new();
-    export_section.push(1); // 1 export
+    let n_exports: u32 = 1 + if needs_memory { 1 } else { 0 };
+    emit_leb128(&mut export_section, n_exports as u64);
     emit_name(&mut export_section, rule_name);
     export_section.push(0x00); // export kind: function
-    export_section.push(0x00); // function index 0
+    emit_leb128(&mut export_section, 0); // function index 0
+    if needs_memory {
+        emit_name(&mut export_section, "memory");
+        export_section.push(0x02); // export kind: memory
+        emit_leb128(&mut export_section, 0); // memory index 0
+    }
     emit_section(&mut module, 7, &export_section);
 
     // === Code section ===
     let mut body = Vec::new();
 
-    // Locals layout (all i64):
-    //   - params 0..nfields           = concept fields
-    //   - locals nfields..+n_bindings = let bindings (in source order)
-    //   - locals +0, +1               = scratch_a, scratch_b
+    // Locals layout (all i64 today — text bindings would require two
+    // i32 slots and aren't supported until W3b's bump allocator can
+    // back text-let RHSes that aren't pure literals):
+    //   - params 0..total_param_slots             = concept fields
+    //   - locals total..+n_bindings               = let bindings
+    //   - locals +0, +1                           = scratch_a, scratch_b
     //
-    // Scratch locals are reserved when the rule body uses one of the binary/
-    // unary scalar primitives (`abs`, `min(a,b)`, `max(a,b)`). WASM has no
-    // DUP — to evaluate a sub-expression once and reuse it, the value must
-    // be parked in a local. Scratches are SHARED across all such call sites
-    // because each emission writes both before reading either, so nesting
-    // (e.g. `min(min(a,b), min(c,d))`) is safe: the outer min only reads its
-    // scratches AFTER both sub-expressions have finished writing theirs.
+    // See the W1 commit for the scratch-locals discipline (eval both
+    // sub-exprs onto the stack before parking, to survive nesting).
     let n_bindings = rule.logic.bindings.len();
     let needs_scratch = expr_uses_scratch(&rule.logic.value)
         || rule.logic.bindings.iter().any(|(_, e)| expr_uses_scratch(e));
     let n_scratch = if needs_scratch { 2 } else { 0 };
     let n_locals = n_bindings + n_scratch;
 
-    // WASM local declarations: vec(localdecl), each localdecl = (count, valtype).
-    // We pack everything into a single i64 group when n_locals > 0; otherwise
-    // emit zero groups.
-    //
-    // The previous encoding ("n_locals groups, first one has n_locals items")
-    // worked by accident only for n=0 and n=1 — for n>=2 it produced an invalid
-    // module that no test exercised. The single-group form below is the spec-
-    // correct shape and degenerates to the prior bytes for n in {0, 1}.
     if n_locals > 0 {
         emit_leb128(&mut body, 1);                  // 1 declaration group
         emit_leb128(&mut body, n_locals as u64);    // group has n_locals items
@@ -127,18 +249,30 @@ pub fn compile_wasm(
         body.push(0);                                // 0 declaration groups
     }
 
-    // Emit let binding computations
-    for (i, (_, expr)) in rule.logic.bindings.iter().enumerate() {
-        emit_wasm_expr(&mut body, expr, rule, concept, &rules)?;
-        // Store in local (params take slots 0..nfields-1, locals start at nfields)
+    // Emit let binding computations.
+    // Text RHSes are refused — the binding slot is i64 today and a
+    // text value would need two i32 slots; making that work cleanly
+    // is W3b territory (with the bump allocator in place).
+    for (i, (name, expr)) in rule.logic.bindings.iter().enumerate() {
+        if binding_rhs_is_text(expr, &field_shapes) {
+            return Err(WasmError {
+                message: format!(
+                    "let binding '{}' has a text-typed RHS — not yet supported in the WASM backend (slice W3b)",
+                    name
+                ),
+            });
+        }
+        emit_wasm_expr(&mut body, expr, rule, concept, &rules, &field_shapes, total_param_slots, &text_literals)?;
         body.push(0x21); // local.set
-        emit_leb128(&mut body, (nfields + i) as u64);
+        emit_leb128(&mut body, (total_param_slots as usize + i) as u64);
     }
 
-    // Emit main expression
-    emit_wasm_expr(&mut body, &rule.logic.value, rule, concept, &rules)?;
+    // Emit main expression.
+    emit_wasm_expr(&mut body, &rule.logic.value, rule, concept, &rules, &field_shapes, total_param_slots, &text_literals)?;
 
-    // If rule returns bool but expr produces i64, wrap to i32
+    // If rule returns bool but expr produces i64, wrap to i32. Text
+    // outputs already leave (i32, i32) on the stack from Expr::Text /
+    // text Expr::Field — no widening needed.
     if is_bool {
         body.push(0xA7); // i32.wrap_i64
     }
@@ -151,11 +285,70 @@ pub fn compile_wasm(
     code_section.extend_from_slice(&body);
     emit_section(&mut module, 10, &code_section);
 
+    // === Data section (only if literals were collected) ===
+    // One active segment per literal at its assigned offset. We could
+    // pack adjacent literals into one segment, but per-literal segments
+    // keep the byte-shape obvious to an auditor reading the module
+    // dump and cost only a few bytes each.
+    if !text_literals.is_empty() {
+        // Sort by offset so the section bytes are deterministic — a
+        // HashMap iteration order would otherwise reshuffle modules
+        // between builds.
+        let mut sorted: Vec<(&String, &u32)> = text_literals.iter().collect();
+        sorted.sort_by_key(|(_, &off)| off);
+
+        let mut data_section = Vec::new();
+        emit_leb128(&mut data_section, sorted.len() as u64);
+        for (s, &off) in &sorted {
+            data_section.push(0x00);                       // mode: active in memory 0
+            data_section.push(0x41);                       // i32.const
+            emit_sleb128(&mut data_section, off as i64);
+            data_section.push(0x0B);                       // end
+            emit_leb128(&mut data_section, s.len() as u64);
+            data_section.extend_from_slice(s.as_bytes());
+        }
+        emit_section(&mut module, 11, &data_section);
+    }
+
     std::fs::write(output_path, &module).map_err(|e| WasmError {
         message: format!("cannot write '{}': {}", output_path, e),
     })?;
 
     Ok(())
+}
+
+/// Recursively enumerate every text literal occurring in `expr`. The
+/// callback is invoked once per occurrence — dedup is the caller's
+/// job (so the offset map stays in one place).
+fn walk_text_literals<F: FnMut(&str)>(expr: &Expr, f: &mut F) {
+    match expr {
+        Expr::Text(s) => f(s),
+        Expr::Binary(_, l, r) => { walk_text_literals(l, f); walk_text_literals(r, f); }
+        Expr::If(c, t, e) => { walk_text_literals(c, f); walk_text_literals(t, f); walk_text_literals(e, f); }
+        Expr::Not(inner) | Expr::Neg(inner) | Expr::Abs(inner) => walk_text_literals(inner, f),
+        Expr::Min(a, b) | Expr::Max(a, b) => { walk_text_literals(a, f); walk_text_literals(b, f); }
+        Expr::Call(_, args) => { for a in args { walk_text_literals(a, f); } }
+        _ => {}
+    }
+}
+
+/// Best-effort check: would emitting this expression leave a text
+/// (ptr, len) pair on the stack? Used to refuse text-typed RHSes in
+/// let bindings (W3a doesn't allocate the two i32 slots a text
+/// binding would need). Conservative — anything we don't recognize
+/// is treated as non-text (the actual emitter will then either
+/// produce a number or raise its own error).
+fn binding_rhs_is_text(expr: &Expr, field_shapes: &HashMap<&str, FieldShape>) -> bool {
+    match expr {
+        Expr::Text(_) => true,
+        Expr::Field(base, name) => {
+            // `Ident(input)` is the only base shape today; conservatively
+            // treat anything else as non-text and let the emitter error.
+            matches!(base.as_ref(), Expr::Ident(_))
+                && matches!(field_shapes.get(name.as_str()), Some(FieldShape::Text { .. }))
+        }
+        _ => false,
+    }
 }
 
 fn emit_wasm_expr(
@@ -164,38 +357,61 @@ fn emit_wasm_expr(
     rule: &Rule,
     concept: &Concept,
     all_rules: &std::collections::HashMap<&str, &Rule>,
+    field_shapes: &HashMap<&str, FieldShape>,
+    total_param_slots: u32,
+    text_literals: &HashMap<String, u32>,
 ) -> Result<(), WasmError> {
-    let nfields = concept.fields.len();
-
     match expr {
         Expr::Number(n) => {
             code.push(0x42); // i64.const
             emit_sleb128(code, *n);
             Ok(())
         }
+        Expr::Text(s) => {
+            // Push (ptr, len) — the offset was assigned by the compiler
+            // pre-pass. Empty literals get an arbitrary offset; len=0
+            // makes them safe regardless.
+            let offset = *text_literals.get(s).ok_or_else(|| WasmError {
+                message: format!("internal: text literal '{}' not in offset map", s),
+            })?;
+            code.push(0x41);                            // i32.const ptr
+            emit_sleb128(code, offset as i64);
+            code.push(0x41);                            // i32.const len
+            emit_sleb128(code, s.len() as i64);
+            Ok(())
+        }
         Expr::Field(base, field_name) => {
             if !matches!(base.as_ref(), Expr::Ident(n) if n == &rule.input_name) {
                 return Err(WasmError { message: "nested field access not supported".into() });
             }
-            let idx = concept.fields.iter().position(|f| f.name == *field_name)
-                .ok_or_else(|| WasmError { message: format!("unknown field '{}'", field_name) })?;
-            code.push(0x20); // local.get
-            emit_leb128(code, idx as u64);
-            Ok(())
+            match field_shapes.get(field_name.as_str()) {
+                Some(FieldShape::Number(idx)) => {
+                    code.push(0x20); // local.get
+                    emit_leb128(code, *idx as u64);
+                    Ok(())
+                }
+                Some(FieldShape::Text { ptr, len }) => {
+                    code.push(0x20); emit_leb128(code, *ptr as u64);   // local.get ptr
+                    code.push(0x20); emit_leb128(code, *len as u64);   // local.get len
+                    Ok(())
+                }
+                None => Err(WasmError { message: format!("unknown field '{}'", field_name) }),
+            }
         }
         Expr::Ident(name) => {
-            // Check let bindings
+            // Check let bindings (number-typed only in W3a — text RHSes
+            // are refused at the binding-emit site).
             if let Some(idx) = rule.logic.bindings.iter().position(|(n, _)| n == name) {
                 code.push(0x20); // local.get
-                emit_leb128(code, (nfields + idx) as u64);
+                emit_leb128(code, total_param_slots as u64 + idx as u64);
                 Ok(())
             } else {
                 Err(WasmError { message: format!("unresolved ident '{}'", name) })
             }
         }
         Expr::Binary(op, left, right) => {
-            emit_wasm_expr(code, left, rule, concept, all_rules)?;
-            emit_wasm_expr(code, right, rule, concept, all_rules)?;
+            emit_wasm_expr(code, left, rule, concept, all_rules, field_shapes, total_param_slots, text_literals)?;
+            emit_wasm_expr(code, right, rule, concept, all_rules, field_shapes, total_param_slots, text_literals)?;
             match op {
                 BinOp::Add => code.push(0x7C),    // i64.add
                 BinOp::Sub => code.push(0x7D),    // i64.sub
@@ -215,24 +431,24 @@ fn emit_wasm_expr(
             Ok(())
         }
         Expr::If(cond, then_e, else_e) => {
-            emit_wasm_expr(code, cond, rule, concept, all_rules)?;
+            emit_wasm_expr(code, cond, rule, concept, all_rules, field_shapes, total_param_slots, text_literals)?;
             code.push(0xA7); // i32.wrap_i64 (condition must be i32)
             code.push(0x04); // if
             code.push(0x7E); // result type: i64
-            emit_wasm_expr(code, then_e, rule, concept, all_rules)?;
+            emit_wasm_expr(code, then_e, rule, concept, all_rules, field_shapes, total_param_slots, text_literals)?;
             code.push(0x05); // else
-            emit_wasm_expr(code, else_e, rule, concept, all_rules)?;
+            emit_wasm_expr(code, else_e, rule, concept, all_rules, field_shapes, total_param_slots, text_literals)?;
             code.push(0x0B); // end
             Ok(())
         }
         Expr::Not(inner) => {
-            emit_wasm_expr(code, inner, rule, concept, all_rules)?;
+            emit_wasm_expr(code, inner, rule, concept, all_rules, field_shapes, total_param_slots, text_literals)?;
             code.push(0x50); // i64.eqz
             Ok(())
         }
         Expr::Neg(inner) => {
             code.push(0x42); code.push(0x00); // i64.const 0
-            emit_wasm_expr(code, inner, rule, concept, all_rules)?;
+            emit_wasm_expr(code, inner, rule, concept, all_rules, field_shapes, total_param_slots, text_literals)?;
             code.push(0x7D); // i64.sub (0 - x = -x)
             Ok(())
         }
@@ -243,8 +459,8 @@ fn emit_wasm_expr(
             // i64.ge_s already returns i32 so no extend is needed for the
             // select condition (unlike the rule-output path that uniformly
             // widens comparisons via 0xAD for i64 chaining).
-            let scratch_a = (nfields + rule.logic.bindings.len()) as u64;
-            emit_wasm_expr(code, inner, rule, concept, all_rules)?;
+            let scratch_a = total_param_slots as u64 + rule.logic.bindings.len() as u64;
+            emit_wasm_expr(code, inner, rule, concept, all_rules, field_shapes, total_param_slots, text_literals)?;
             code.push(0x22); emit_leb128(code, scratch_a);   // local.tee scratch_a
             code.push(0x42); code.push(0x00);                // i64.const 0
             code.push(0x20); emit_leb128(code, scratch_a);   // local.get scratch_a
@@ -273,11 +489,11 @@ fn emit_wasm_expr(
             // For min: cond = (a < b)  (i64.lt_s = 0x53)
             // For max: cond = (a > b)  (i64.gt_s = 0x55)
             let is_max = matches!(expr, Expr::Max(_, _));
-            let scratch_a = (nfields + rule.logic.bindings.len()) as u64;
+            let scratch_a = total_param_slots as u64 + rule.logic.bindings.len() as u64;
             let scratch_b = scratch_a + 1;
 
-            emit_wasm_expr(code, a, rule, concept, all_rules)?;     // [a]
-            emit_wasm_expr(code, b, rule, concept, all_rules)?;     // [a, b]
+            emit_wasm_expr(code, a, rule, concept, all_rules, field_shapes, total_param_slots, text_literals)?;     // [a]
+            emit_wasm_expr(code, b, rule, concept, all_rules, field_shapes, total_param_slots, text_literals)?;     // [a, b]
             code.push(0x21); emit_leb128(code, scratch_b);           // pop b: $sb = b
             code.push(0x21); emit_leb128(code, scratch_a);           // pop a: $sa = a
             code.push(0x20); emit_leb128(code, scratch_a);           // [a]      val_1
@@ -296,7 +512,7 @@ fn emit_wasm_expr(
                 message: format!("unknown rule '{}'", name),
             })?;
             // Inline the called rule's logic with the same field layout
-            emit_wasm_expr(code, &called.logic.value, called, concept, all_rules)
+            emit_wasm_expr(code, &called.logic.value, called, concept, all_rules, field_shapes, total_param_slots, text_literals)
         }
         _ => Err(WasmError {
             message: format!("unsupported expression in WASM backend"),
@@ -856,5 +1072,331 @@ async function check(path, fn, args, expected) {{
         );
         // Sanity: at least one OK line so we didn't silently no-op.
         assert!(stdout.contains("OK"), "no OK lines from node; stdout:\n{}", stdout);
+    }
+
+    /// W3a: a rule with `output: text` returning a literal compiles to
+    /// a multi-value `(i32, i32)` function and bundles a memory + data
+    /// section. Pinned shape: type entry has `0x02 0x7F 0x7F` for the
+    /// results, and the literal bytes appear in the data section.
+    #[test]
+    fn wasm_w3a_text_literal_output_emits_memory_and_data() {
+        let src = r#"@verbose 0.1.0
+concept T
+  @intention: "t"
+  @source: invoices.intent:1
+  fields:
+    x : number
+rule say_hi
+  @intention: "t"
+  @source: invoices.intent:1
+  input:
+    t : T
+  output:
+    out : text
+  logic:
+    out = "hello"
+  proofs:
+    purity:
+      reads: []
+      calls: []
+    termination:
+      bound: 1
+"#;
+        let bytes = compile_to_bytes(src, "say_hi", "text_lit_out");
+        assert_eq!(&bytes[0..4], b"\0asm");
+        // Multi-value result triple: 0x02 0x7F 0x7F (2 results, both i32)
+        // appears in the type section.
+        assert!(
+            bytes.windows(3).any(|w| w == [0x02, 0x7F, 0x7F]),
+            "type section should declare 2 i32 results"
+        );
+        // Memory section (id 5) declares 1 page.
+        // Pattern: 0x05 0x03 0x01 0x00 0x01 — section id, length 3,
+        // 1 memory, limits=0 (no max), min=1.
+        assert!(
+            bytes.windows(5).any(|w| w == [0x05, 0x03, 0x01, 0x00, 0x01]),
+            "memory section must declare 1 page"
+        );
+        // The literal "hello" bytes appear in the data section.
+        assert!(
+            bytes.windows(5).any(|w| w == b"hello"),
+            "data section must embed the literal bytes"
+        );
+        // Memory is also exported (so the host can read it).
+        assert!(bytes.windows(6).any(|w| w == b"memory"), "memory should be exported");
+    }
+
+    /// W3a: a rule that echoes a text input field declares two i32
+    /// params (ptr, len) for that field and returns the same pair.
+    /// Pinned: param triple `0x02 0x7F 0x7F` (2 params i32 i32) and
+    /// matching result triple — function type effectively
+    /// `(i32, i32) -> (i32, i32)`.
+    #[test]
+    fn wasm_w3a_text_input_field_passes_two_i32_params() {
+        let src = r#"@verbose 0.1.0
+concept Greet
+  @intention: "g"
+  @source: invoices.intent:1
+  fields:
+    name : text
+rule echo_name
+  @intention: "g"
+  @source: invoices.intent:1
+  input:
+    g : Greet
+  output:
+    out : text
+  logic:
+    out = g.name
+  proofs:
+    purity:
+      reads: [g.name]
+      calls: []
+    termination:
+      bound: 1
+"#;
+        let bytes = compile_to_bytes(src, "echo_name", "text_echo");
+        assert_eq!(&bytes[0..4], b"\0asm");
+        // Two consecutive `0x02 0x7F 0x7F` triples in the type section
+        // = (i32, i32) params + (i32, i32) results. We don't slice the
+        // section here; presence of TWO non-overlapping windows is
+        // enough to pin the shape.
+        let tag = [0x02u8, 0x7F, 0x7F];
+        let occurrences: Vec<usize> = bytes
+            .windows(3)
+            .enumerate()
+            .filter_map(|(i, w)| if w == tag { Some(i) } else { None })
+            .collect();
+        // First triple is params, second is results — they should be
+        // at distinct, non-overlapping positions.
+        assert!(
+            occurrences.len() >= 2 && occurrences[1] >= occurrences[0] + 3,
+            "expected two `02 7F 7F` triples (params + results), got positions {:?}",
+            occurrences
+        );
+        // Memory is exported (host writes input bytes here before calling).
+        assert!(bytes.windows(6).any(|w| w == b"memory"));
+    }
+
+    /// W3a: text input fields shift binding/scratch local indices by
+    /// the additional i32 slot. Concept `[name: text, age: number]`
+    /// → params (i32 ptr, i32 len, i64 age), and a let binding `let x
+    /// = age + 1` lives at local index 3 (not 2). Pinned indirectly
+    /// by checking the locals declaration plus an opcode that reads
+    /// the age param at index 2.
+    #[test]
+    fn wasm_w3a_text_field_shifts_subsequent_param_indices() {
+        let src = r#"@verbose 0.1.0
+concept P
+  @intention: "p"
+  @source: invoices.intent:1
+  fields:
+    name : text
+    age : number
+rule age_plus_one
+  @intention: "p"
+  @source: invoices.intent:1
+  input:
+    p : P
+  output:
+    n : number
+  logic:
+    let bumped = p.age + 1
+    n = bumped
+  proofs:
+    purity:
+      reads: [p.age]
+      calls: []
+    termination:
+      bound: 2
+"#;
+        let bytes = compile_to_bytes(src, "age_plus_one", "shift_idx");
+        assert_eq!(&bytes[0..4], b"\0asm");
+        // `local.get 2` (0x20 0x02) reads the age param — name took
+        // slots 0 and 1. If the emitter were still using
+        // concept.fields.len() instead of total_param_slots, this
+        // would have read slot 1 (= len half of name) and produced
+        // a type-mismatch validation failure.
+        assert!(
+            bytes.windows(2).any(|w| w == [0x20, 0x02]),
+            "expected `local.get 2` to read the age param after the text field"
+        );
+        // Param signature is (i32, i32, i64) = 0x03 0x7F 0x7F 0x7E.
+        assert!(
+            bytes.windows(4).any(|w| w == [0x03, 0x7F, 0x7F, 0x7E]),
+            "expected param triple `03 7F 7F 7E` (i32, i32, i64)"
+        );
+    }
+
+    /// W3a: a text-typed RHS in a let binding is refused with a
+    /// pointer to the W3b slice that will lift the limit.
+    #[test]
+    fn wasm_w3a_text_let_binding_is_refused() {
+        let src = r#"@verbose 0.1.0
+concept G
+  @intention: "g"
+  @source: invoices.intent:1
+  fields:
+    name : text
+rule bad
+  @intention: "g"
+  @source: invoices.intent:1
+  input:
+    g : G
+  output:
+    out : text
+  logic:
+    let alias = g.name
+    out = alias
+  proofs:
+    purity:
+      reads: [g.name]
+      calls: []
+    termination:
+      bound: 1
+"#;
+        use crate::lexer::Lexer;
+        use crate::parser::Parser;
+        let tokens = Lexer::new(src).tokenize().expect("tokenize");
+        let program = Parser::new(tokens).parse_program().expect("parse");
+        let path = "/tmp/wasm_w3a_text_let_refused.wasm";
+        let err = compile_wasm(&program, "bad", path).expect_err("text let must be refused");
+        assert!(
+            err.message.contains("text-typed RHS") && err.message.contains("W3b"),
+            "error should pin the W3b deferral; got: {}",
+            err.message
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// W3a end-to-end: load the compiled module in node, exercise
+    /// both literal-output and echo, and check the bytes round-trip
+    /// through TextDecoder. This is the slice's true regression net
+    /// — bytecode-shape tests pin the SECTIONS, only a real engine
+    /// catches an offset-vs-length mistake or a multi-value ABI
+    /// mismatch.
+    ///
+    /// Skipped silently if `node` is absent.
+    #[test]
+    fn wasm_w3a_runtime_text_literal_and_echo() {
+        use std::process::Command;
+
+        if Command::new("node").arg("--version").output().is_err() {
+            eprintln!("note: `node` not found, skipping WASM W3a runtime test");
+            return;
+        }
+
+        let src = r#"@verbose 0.1.0
+concept G
+  @intention: "g"
+  @source: invoices.intent:1
+  fields:
+    name : text
+rule say_hi
+  @intention: "g"
+  @source: invoices.intent:1
+  input:
+    g : G
+  output:
+    out : text
+  logic:
+    out = "hello, verbose"
+  proofs:
+    purity:
+      reads: []
+      calls: []
+    termination:
+      bound: 1
+rule echo_name
+  @intention: "g"
+  @source: invoices.intent:1
+  input:
+    g : G
+  output:
+    out : text
+  logic:
+    out = g.name
+  proofs:
+    purity:
+      reads: [g.name]
+      calls: []
+    termination:
+      bound: 1
+"#;
+        let lit_path = "/tmp/wasm_w3a_runtime_lit.wasm";
+        let echo_path = "/tmp/wasm_w3a_runtime_echo.wasm";
+
+        use crate::lexer::Lexer;
+        use crate::parser::Parser;
+        let tokens = Lexer::new(src).tokenize().expect("tokenize");
+        let program = Parser::new(tokens).parse_program().expect("parse");
+        compile_wasm(&program, "say_hi", lit_path).expect("compile lit");
+        compile_wasm(&program, "echo_name", echo_path).expect("compile echo");
+
+        let script = format!(
+            r#"
+const fs = require("fs");
+const decoder = new TextDecoder();
+async function readResult(path, fn, args) {{
+  const buf = fs.readFileSync(path);
+  if (!WebAssembly.validate(buf)) {{ console.log("FAIL invalid module"); return; }}
+  const m = await WebAssembly.instantiate(buf);
+  const [ptr, len] = fn(m, args);
+  const mem = new Uint8Array(m.instance.exports.memory.buffer);
+  return decoder.decode(mem.subarray(ptr, ptr+len));
+}}
+
+(async () => {{
+  // Literal output: rule takes one input record (one i32 ptr +
+  // one i32 len) and returns (i32, i32). We pass dummy 0,0 for the
+  // unused name field — the rule ignores it.
+  let s = await readResult("{lit_path}",
+    (m, args) => m.instance.exports.say_hi(0, 0),
+    null);
+  console.log(s === "hello, verbose" ? "OK lit" : "FAIL lit got " + JSON.stringify(s));
+
+  // Echo: write "Alice" into memory at offset 4096, pass (4096, 5),
+  // expect the same bytes back.
+  let buf = fs.readFileSync("{echo_path}");
+  let m = await WebAssembly.instantiate(buf);
+  let mem = new Uint8Array(m.instance.exports.memory.buffer);
+  const inputBytes = new TextEncoder().encode("Alice");
+  mem.set(inputBytes, 4096);
+  const [ptr, len] = m.instance.exports.echo_name(4096, inputBytes.length);
+  const got = decoder.decode(mem.subarray(ptr, ptr+len));
+  console.log(got === "Alice" ? "OK echo" : "FAIL echo got " + JSON.stringify(got));
+
+  // Echo with longer input — make sure ptr+len isn't tied to a
+  // particular length.
+  const long = "the quick brown fox jumps over the lazy dog";
+  const longBytes = new TextEncoder().encode(long);
+  mem.set(longBytes, 8192);
+  const [p2, l2] = m.instance.exports.echo_name(8192, longBytes.length);
+  const got2 = decoder.decode(mem.subarray(p2, p2+l2));
+  console.log(got2 === long ? "OK echo-long" : "FAIL echo-long got " + JSON.stringify(got2));
+}})();
+"#
+        );
+
+        let out = Command::new("node")
+            .args(["-e", &script])
+            .output()
+            .expect("spawn node");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+
+        let _ = std::fs::remove_file(lit_path);
+        let _ = std::fs::remove_file(echo_path);
+
+        assert!(
+            !stdout.contains("FAIL"),
+            "WASM W3a runtime check failed; node stdout:\n{}\nstderr:\n{}",
+            stdout,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            stdout.matches("OK").count() >= 3,
+            "expected >=3 OK lines (lit + echo + echo-long); stdout:\n{}",
+            stdout
+        );
     }
 }
