@@ -55,6 +55,52 @@ enum FieldShape {
     Text { ptr: u32, len: u32 },
 }
 
+/// How a `let` binding is represented in the function's locals.
+/// Number bindings sit in the i64 locals group, text bindings in
+/// the i32 locals group as a (ptr, len) pair — same shape as a
+/// text input field.
+#[derive(Debug, Clone, Copy)]
+enum BindingShape {
+    Number(u32),
+    Text { ptr: u32, len: u32 },
+}
+
+/// The five i32 locals reserved when a rule uses `concat(...)`.
+/// `bump_ptr` persists across multiple sibling concats in the same
+/// rule call (it's the allocator state); the others are per-concat
+/// temporaries and are safe to reuse because we refuse nested concat.
+#[derive(Debug, Clone, Copy)]
+struct ConcatLocals {
+    bump_ptr: u32,
+    cursor: u32,
+    result_ptr: u32,
+    arg_ptr: u32,
+    arg_len: u32,
+}
+
+/// Per-emit context bundle. Keeps the emit_wasm_expr signature
+/// short as the backend grows; everything the recursive emitter
+/// needs to look up sits here.
+struct WasmCtx<'a> {
+    rule: &'a Rule,
+    concept: &'a Concept,
+    all_rules: &'a std::collections::HashMap<&'a str, &'a Rule>,
+    field_shapes: &'a HashMap<&'a str, FieldShape>,
+    binding_shapes: &'a HashMap<&'a str, BindingShape>,
+    text_literals: &'a HashMap<String, u32>,
+    /// Local index just past the last i64 local — used when min/max/abs
+    /// computes scratch_a / scratch_b on the fly.
+    scratch_base_i64: u32,
+    /// `Some` iff the rule uses `concat(...)`. Carries the five i32
+    /// scratch locals reserved for the bump allocator and concat
+    /// temporaries.
+    concat: Option<ConcatLocals>,
+    /// Function index of the inlined itoa helper, if the module
+    /// emits one. `None` means concat with numeric args is refused
+    /// (the caller has already verified this won't happen).
+    itoa_func_idx: Option<u32>,
+}
+
 #[derive(Debug)]
 pub struct WasmError {
     pub message: String,
@@ -180,6 +226,118 @@ pub fn compile_wasm(
         || field_shapes.values().any(|s| matches!(s, FieldShape::Text { .. }))
         || !text_literals.is_empty();
 
+    // --- Binding shape classification ------------------------------
+    // Walk bindings in source order, classifying each RHS as text
+    // (yields ptr+len pair) or number (single i64). Text bindings
+    // get two i32 slots; number bindings get one i64 slot. Build
+    // the binding_shapes map incrementally so a later binding's
+    // RHS can reference an earlier text binding via Ident.
+    //
+    // ALSO: refuse a text binding whose RHS is a `Concat(...)`
+    // containing a nested concat — the nested concat would need
+    // its own scratch set. The workaround is to bind the inner
+    // concat to its own let first (which is now legal in W3b).
+    let mut binding_shapes: HashMap<&str, BindingShape> = HashMap::new();
+    let mut binding_assignments: Vec<(usize, BindingShape)> = Vec::new();
+    let mut next_binding_i64 = total_param_slots;       // first i64 binding slot
+    let mut n_i64_bindings: u32 = 0;
+    let mut n_text_bindings: u32 = 0;
+    // First pass: only count slots so we know where the i32 group
+    // starts. We can't classify Ident-typed RHSes accurately without
+    // the binding_shapes map being partially populated, but for now
+    // the only "yields text" Idents would reference an earlier text
+    // binding. We rely on source order during the actual classify
+    // pass below.
+    for (_, expr) in &rule.logic.bindings {
+        if expr_yields_text(expr, &field_shapes, &binding_shapes) {
+            n_text_bindings += 1;
+        } else {
+            n_i64_bindings += 1;
+        }
+        // Speculatively register the shape so subsequent ident
+        // lookups during the same pass behave consistently. The
+        // local indices are filler — they get overwritten in the
+        // actual emit pass below.
+        if expr_yields_text(expr, &field_shapes, &binding_shapes) {
+            // unused at this point; populated below
+        }
+    }
+
+    let needs_scratch = expr_uses_scratch(&rule.logic.value)
+        || rule.logic.bindings.iter().any(|(_, e)| expr_uses_scratch(e));
+    let n_scratch_i64 = if needs_scratch { 2 } else { 0 };
+
+    // i64 group total: number bindings + scratch_a + scratch_b
+    let n_i64_locals = n_i64_bindings + n_scratch_i64;
+    let scratch_base_i64 = total_param_slots + n_i64_bindings;
+    let i32_base = total_param_slots + n_i64_locals;
+
+    let needs_concat = expr_uses_concat(&rule.logic.value)
+        || rule.logic.bindings.iter().any(|(_, e)| expr_uses_concat(e));
+
+    // Refuse nested concat upfront with a clear pointer to the
+    // workaround.
+    if expr_has_nested_concat(&rule.logic.value)
+        || rule.logic.bindings.iter().any(|(_, e)| expr_has_nested_concat(e))
+    {
+        return Err(WasmError {
+            message: "nested concat(...) is not supported in the WASM backend; bind the inner concat to a `let` first".into(),
+        });
+    }
+
+    // i32 group total: text-binding ptr/len pairs + concat scratches
+    let n_concat_locals: u32 = if needs_concat { 5 } else { 0 };
+    let n_i32_locals = n_text_bindings * 2 + n_concat_locals;
+
+    // Concat scratch indices (just past the text bindings in the i32 group)
+    let concat_locals: Option<ConcatLocals> = if needs_concat {
+        let base = i32_base + n_text_bindings * 2;
+        Some(ConcatLocals {
+            bump_ptr: base,
+            cursor: base + 1,
+            result_ptr: base + 2,
+            arg_ptr: base + 3,
+            arg_len: base + 4,
+        })
+    } else {
+        None
+    };
+
+    // Now do the real binding-shape classification pass and assign
+    // local indices. Counters track separate i64 and i32 cursors.
+    let mut i64_cursor = total_param_slots;
+    let mut i32_cursor = i32_base;
+    for (i, (name, expr)) in rule.logic.bindings.iter().enumerate() {
+        if expr_yields_text(expr, &field_shapes, &binding_shapes) {
+            let shape = BindingShape::Text { ptr: i32_cursor, len: i32_cursor + 1 };
+            binding_shapes.insert(name.as_str(), shape);
+            binding_assignments.push((i, shape));
+            i32_cursor += 2;
+        } else {
+            let shape = BindingShape::Number(i64_cursor);
+            binding_shapes.insert(name.as_str(), shape);
+            binding_assignments.push((i, shape));
+            i64_cursor += 1;
+        }
+    }
+    // Place scratch_a / scratch_b right after the number bindings in
+    // the i64 group; just past them is `scratch_base_i64`.
+    debug_assert_eq!(i64_cursor, scratch_base_i64);
+
+    // --- Detect itoa need -----------------------------------------
+    let needs_itoa = expr_concat_has_number_arg(&rule.logic.value, &field_shapes, &binding_shapes)
+        || rule.logic.bindings.iter().any(|(_, e)| {
+            expr_concat_has_number_arg(e, &field_shapes, &binding_shapes)
+        });
+
+    // --- ALLOC_BASE for the bump allocator ------------------------
+    // Pick the first 16-byte-aligned address past all literals. If
+    // the rule uses no literals this collapses to LITERAL_BASE
+    // (1024). The 0..LITERAL_BASE range stays reserved: bytes 16..48
+    // back the itoa scratch region, bytes 0..16 stay free for future
+    // allocator metadata.
+    let alloc_base: u32 = (literal_cursor + 15) & !15;
+
     let mut module = Vec::new();
 
     // === WASM header ===
@@ -187,17 +345,29 @@ pub fn compile_wasm(
     module.extend_from_slice(&1u32.to_le_bytes()); // version 1
 
     // === Type section (function signature) ===
+    // 1 type if no itoa, 2 types otherwise. Itoa's signature is
+    // (i64) -> (i32, i32) — the same shape every time, so we can
+    // hard-code its type bytes.
     let mut type_section = Vec::new();
-    emit_leb128(&mut type_section, 1);              // 1 type
-    type_section.push(0x60);                         // func type
+    let n_types: u32 = if needs_itoa { 2 } else { 1 };
+    emit_leb128(&mut type_section, n_types as u64);
+    type_section.push(0x60);                         // type 0: rule
     emit_leb128(&mut type_section, param_types.len() as u64);
     type_section.extend_from_slice(&param_types);
     emit_leb128(&mut type_section, result_types.len() as u64);
     type_section.extend_from_slice(&result_types);
+    if needs_itoa {
+        // type 1: itoa (i64) -> (i32, i32)
+        type_section.extend_from_slice(&[0x60, 0x01, 0x7E, 0x02, 0x7F, 0x7F]);
+    }
     emit_section(&mut module, 1, &type_section);
 
     // === Function section ===
-    let func_section = vec![1, 0]; // 1 function, uses type 0
+    let func_section: Vec<u8> = if needs_itoa {
+        vec![2, 0, 1] // 2 funcs: func 0 = type 0 (rule), func 1 = type 1 (itoa)
+    } else {
+        vec![1, 0]
+    };
     emit_section(&mut module, 3, &func_section);
 
     // === Memory section (only if text I/O present) ===
@@ -209,13 +379,13 @@ pub fn compile_wasm(
 
     // === Export section ===
     // Always export the rule function. Also export "memory" when
-    // declared so the host can read text bytes.
+    // declared so the host can read text bytes. Itoa stays internal.
     let mut export_section = Vec::new();
     let n_exports: u32 = 1 + if needs_memory { 1 } else { 0 };
     emit_leb128(&mut export_section, n_exports as u64);
     emit_name(&mut export_section, rule_name);
     export_section.push(0x00); // export kind: function
-    emit_leb128(&mut export_section, 0); // function index 0
+    emit_leb128(&mut export_section, 0); // function index 0 (rule)
     if needs_memory {
         emit_name(&mut export_section, "memory");
         export_section.push(0x02); // export kind: memory
@@ -224,65 +394,90 @@ pub fn compile_wasm(
     emit_section(&mut module, 7, &export_section);
 
     // === Code section ===
-    let mut body = Vec::new();
-
-    // Locals layout (all i64 today — text bindings would require two
-    // i32 slots and aren't supported until W3b's bump allocator can
-    // back text-let RHSes that aren't pure literals):
-    //   - params 0..total_param_slots             = concept fields
-    //   - locals total..+n_bindings               = let bindings
-    //   - locals +0, +1                           = scratch_a, scratch_b
     //
-    // See the W1 commit for the scratch-locals discipline (eval both
-    // sub-exprs onto the stack before parking, to survive nesting).
-    let n_bindings = rule.logic.bindings.len();
-    let needs_scratch = expr_uses_scratch(&rule.logic.value)
-        || rule.logic.bindings.iter().any(|(_, e)| expr_uses_scratch(e));
-    let n_scratch = if needs_scratch { 2 } else { 0 };
-    let n_locals = n_bindings + n_scratch;
-
-    if n_locals > 0 {
-        emit_leb128(&mut body, 1);                  // 1 declaration group
-        emit_leb128(&mut body, n_locals as u64);    // group has n_locals items
-        body.push(0x7E);                             // all i64
-    } else {
-        body.push(0);                                // 0 declaration groups
+    // Locals layout:
+    //   - params 0..total_param_slots                 (concept fields)
+    //   - i64 group: number bindings, then scratch_a/b if used
+    //   - i32 group: text-binding ptr/len pairs, then concat scratches
+    //                (bump_ptr, cursor, result_ptr, arg_ptr, arg_len)
+    //
+    // Locals declarations are emitted as `vec(localdecl)` where each
+    // localdecl is `(count, valtype)`. We use up to two groups (one
+    // per valtype) and skip any group whose count is zero.
+    let mut body = Vec::new();
+    let mut groups: Vec<(u32, u8)> = Vec::new();
+    if n_i64_locals > 0 { groups.push((n_i64_locals, 0x7E)); }
+    if n_i32_locals > 0 { groups.push((n_i32_locals, 0x7F)); }
+    emit_leb128(&mut body, groups.len() as u64);
+    for (count, ty) in &groups {
+        emit_leb128(&mut body, *count as u64);
+        body.push(*ty);
     }
 
-    // Emit let binding computations.
-    // Text RHSes are refused — the binding slot is i64 today and a
-    // text value would need two i32 slots; making that work cleanly
-    // is W3b territory (with the bump allocator in place).
-    for (i, (name, expr)) in rule.logic.bindings.iter().enumerate() {
-        if binding_rhs_is_text(expr, &field_shapes) {
-            return Err(WasmError {
-                message: format!(
-                    "let binding '{}' has a text-typed RHS — not yet supported in the WASM backend (slice W3b)",
-                    name
-                ),
-            });
+    // Bump allocator init: $bump_ptr = ALLOC_BASE. Emitted before
+    // any binding so a binding RHS that uses concat starts from a
+    // fresh allocator state. Reset on every call → returned (ptr,
+    // len) from a previous call is invalidated by the next call.
+    if let Some(cl) = concat_locals {
+        body.push(0x41);                              // i32.const
+        emit_sleb128(&mut body, alloc_base as i64);
+        body.push(0x21);                              // local.set
+        emit_leb128(&mut body, cl.bump_ptr as u64);
+    }
+
+    let ctx = WasmCtx {
+        rule,
+        concept,
+        all_rules: &rules,
+        field_shapes: &field_shapes,
+        binding_shapes: &binding_shapes,
+        text_literals: &text_literals,
+        scratch_base_i64,
+        concat: concat_locals,
+        itoa_func_idx: if needs_itoa { Some(1) } else { None },
+    };
+
+    // Emit let binding computations. Text bindings leave (ptr, len)
+    // on the stack — pop into the two i32 slots in reverse order
+    // (len first, then ptr). Number bindings store one i64.
+    for (i, (_, expr)) in rule.logic.bindings.iter().enumerate() {
+        emit_wasm_expr(&mut body, expr, &ctx)?;
+        match binding_assignments[i].1 {
+            BindingShape::Number(idx) => {
+                body.push(0x21);
+                emit_leb128(&mut body, idx as u64);
+            }
+            BindingShape::Text { ptr, len } => {
+                body.push(0x21); emit_leb128(&mut body, len as u64);   // pop len
+                body.push(0x21); emit_leb128(&mut body, ptr as u64);   // pop ptr
+            }
         }
-        emit_wasm_expr(&mut body, expr, rule, concept, &rules, &field_shapes, total_param_slots, &text_literals)?;
-        body.push(0x21); // local.set
-        emit_leb128(&mut body, (total_param_slots as usize + i) as u64);
     }
 
     // Emit main expression.
-    emit_wasm_expr(&mut body, &rule.logic.value, rule, concept, &rules, &field_shapes, total_param_slots, &text_literals)?;
+    emit_wasm_expr(&mut body, &rule.logic.value, &ctx)?;
 
     // If rule returns bool but expr produces i64, wrap to i32. Text
     // outputs already leave (i32, i32) on the stack from Expr::Text /
-    // text Expr::Field — no widening needed.
+    // text Expr::Field / Concat — no widening needed.
     if is_bool {
         body.push(0xA7); // i32.wrap_i64
     }
 
     body.push(0x0B); // end
 
+    // Itoa function body (func 1) — only emitted when needs_itoa.
+    let itoa_body: Vec<u8> = if needs_itoa { build_itoa_body() } else { Vec::new() };
+
     let mut code_section = Vec::new();
-    code_section.push(1); // 1 function body
+    let n_bodies: u32 = if needs_itoa { 2 } else { 1 };
+    emit_leb128(&mut code_section, n_bodies as u64);
     emit_leb128(&mut code_section, body.len() as u64);
     code_section.extend_from_slice(&body);
+    if needs_itoa {
+        emit_leb128(&mut code_section, itoa_body.len() as u64);
+        code_section.extend_from_slice(&itoa_body);
+    }
     emit_section(&mut module, 10, &code_section);
 
     // === Data section (only if literals were collected) ===
@@ -317,6 +512,86 @@ pub fn compile_wasm(
     Ok(())
 }
 
+/// Build the WASM body for the itoa helper function.
+///
+/// Signature: `(i64) -> (i32, i32)`. Writes the ASCII decimal of
+/// the input value into linear memory at `[16, 48)` (writing
+/// digits BACKWARDS from offset 47), returns `(ptr, len)` pointing
+/// at the first written byte.
+///
+/// Locals (after the i64 input param at index 0):
+///   1: $val      (i64) — working copy, mutated as we divide by 10
+///   2: $cursor   (i32) — write position, starts at 47
+///   3: $isNeg    (i32) — flag, 1 if input was negative
+///
+/// Why unsigned div/rem (`i64.div_u` / `i64.rem_u`): for `i64::MIN`,
+/// the negation `0 - val` overflows in signed semantics but
+/// produces the correct positive bit pattern when interpreted as
+/// u64 (2^63). Signed div/rem on that pattern would treat it as
+/// negative again, breaking the loop. Unsigned div/rem treats it
+/// at face value. Validated against Node for the full i64 range.
+///
+/// Bytes match the prototype that was hand-validated against Node
+/// before this slice was implemented — see the W3b commit message.
+fn build_itoa_body() -> Vec<u8> {
+    vec![
+        // Locals: 2 groups
+        0x02,
+        0x01, 0x7E,                             // 1 × i64 ($val)
+        0x02, 0x7F,                             // 2 × i32 ($cursor, $isNeg)
+        // $val = param 0
+        0x20, 0x00,                             // local.get 0
+        0x21, 0x01,                             // local.set 1 ($val)
+        // $isNeg = 0
+        0x41, 0x00,                             // i32.const 0
+        0x21, 0x03,                             // local.set 3
+        // If $val < 0: $isNeg = 1; $val = 0 - $val (wraps for i64::MIN)
+        0x20, 0x01, 0x42, 0x00, 0x53,           // local.get 1; i64.const 0; i64.lt_s
+        0x04, 0x40,                             // if (no result)
+            0x41, 0x01, 0x21, 0x03,             //   i32.const 1; local.set 3
+            0x42, 0x00, 0x20, 0x01, 0x7D,       //   i64.const 0; local.get 1; i64.sub
+            0x21, 0x01,                         //   local.set 1
+        0x0B,                                    // end if
+        // Special case: $val == 0 → write '0' to mem[16]; return (16, 1)
+        0x20, 0x01, 0x50,                       // local.get 1; i64.eqz
+        0x04, 0x40,                             // if
+            0x41, 0x10, 0x41, 0x30,             //   i32.const 16; i32.const 48 ('0')
+            0x3A, 0x00, 0x00,                   //   i32.store8 align=0 offset=0
+            0x41, 0x10, 0x41, 0x01,             //   push 16, 1
+            0x0F,                                //   return
+        0x0B,                                    // end if
+        // $cursor = 47
+        0x41, 0x2F, 0x21, 0x02,                 // i32.const 47; local.set 2
+        // loop: while $val != 0
+        0x03, 0x40,                             // loop (no result)
+            // mem[$cursor] = ($val rem_u 10) + '0'
+            0x20, 0x02,                         // local.get 2 (dest)
+            0x20, 0x01,                         // local.get 1 ($val)
+            0x42, 0x0A,                         // i64.const 10
+            0x82,                               // i64.rem_u
+            0xA7,                               // i32.wrap_i64
+            0x41, 0x30, 0x6A,                   // i32.const 48; i32.add
+            0x3A, 0x00, 0x00,                   // i32.store8
+            // $cursor -= 1
+            0x20, 0x02, 0x41, 0x01, 0x6B, 0x21, 0x02,
+            // $val = $val div_u 10
+            0x20, 0x01, 0x42, 0x0A, 0x80, 0x21, 0x01,
+            // continue if $val != 0
+            0x20, 0x01, 0x42, 0x00, 0x52, 0x0D, 0x00,
+        0x0B,                                    // end loop
+        // If $isNeg: write '-' at $cursor; cursor -= 1
+        0x20, 0x03,                             // local.get 3
+        0x04, 0x40,                             // if
+            0x20, 0x02, 0x41, 0x2D, 0x3A, 0x00, 0x00,   // store '-'
+            0x20, 0x02, 0x41, 0x01, 0x6B, 0x21, 0x02,   // cursor -= 1
+        0x0B,                                    // end if
+        // Return (cursor + 1, 47 - cursor)
+        0x20, 0x02, 0x41, 0x01, 0x6A,           // cursor + 1
+        0x41, 0x2F, 0x20, 0x02, 0x6B,           // 47 - cursor
+        0x0B,                                    // end func
+    ]
+}
+
 /// Recursively enumerate every text literal occurring in `expr`. The
 /// callback is invoked once per occurrence — dedup is the caller's
 /// job (so the offset map stays in one place).
@@ -328,25 +603,118 @@ fn walk_text_literals<F: FnMut(&str)>(expr: &Expr, f: &mut F) {
         Expr::Not(inner) | Expr::Neg(inner) | Expr::Abs(inner) => walk_text_literals(inner, f),
         Expr::Min(a, b) | Expr::Max(a, b) => { walk_text_literals(a, f); walk_text_literals(b, f); }
         Expr::Call(_, args) => { for a in args { walk_text_literals(a, f); } }
+        Expr::Concat(args) => { for a in args { walk_text_literals(a, f); } }
         _ => {}
     }
 }
 
-/// Best-effort check: would emitting this expression leave a text
-/// (ptr, len) pair on the stack? Used to refuse text-typed RHSes in
-/// let bindings (W3a doesn't allocate the two i32 slots a text
-/// binding would need). Conservative — anything we don't recognize
-/// is treated as non-text (the actual emitter will then either
-/// produce a number or raise its own error).
-fn binding_rhs_is_text(expr: &Expr, field_shapes: &HashMap<&str, FieldShape>) -> bool {
+/// Type-shape classifier for an expression: would emitting this
+/// expression leave a text `(ptr, len)` pair on the stack (true) or
+/// a single i64 / i32 value (false)?
+///
+/// Source of truth for:
+///   - choosing the binding slot shape (i64 vs i32 ptr+len)
+///   - dispatching concat-arg emission (text path vs number path)
+///
+/// Walks the Expr tree against the field/binding shape maps that
+/// the compiler has already populated. Conservative: anything we
+/// don't recognise is treated as non-text — the actual emitter
+/// will either emit a number or raise a clear error.
+fn expr_yields_text(
+    expr: &Expr,
+    field_shapes: &HashMap<&str, FieldShape>,
+    binding_shapes: &HashMap<&str, BindingShape>,
+) -> bool {
     match expr {
         Expr::Text(_) => true,
+        Expr::Concat(_) => true,
         Expr::Field(base, name) => {
-            // `Ident(input)` is the only base shape today; conservatively
-            // treat anything else as non-text and let the emitter error.
             matches!(base.as_ref(), Expr::Ident(_))
                 && matches!(field_shapes.get(name.as_str()), Some(FieldShape::Text { .. }))
         }
+        Expr::Ident(name) => {
+            matches!(binding_shapes.get(name.as_str()), Some(BindingShape::Text { .. }))
+        }
+        // Conservative defaults below: treat unknown shapes as non-text.
+        // If/Else with text branches isn't allowed in W3b (the type
+        // system would forbid mixed branches) — refuse upstream if it
+        // ever appears.
+        _ => false,
+    }
+}
+
+/// True iff `expr` (or any sub-expression) is a `Concat(...)` —
+/// drives the decision to reserve concat scratches and the bump
+/// allocator's local.
+fn expr_uses_concat(expr: &Expr) -> bool {
+    match expr {
+        Expr::Concat(_) => true,
+        Expr::Binary(_, l, r) => expr_uses_concat(l) || expr_uses_concat(r),
+        Expr::If(c, t, e) => expr_uses_concat(c) || expr_uses_concat(t) || expr_uses_concat(e),
+        Expr::Not(inner) | Expr::Neg(inner) | Expr::Abs(inner) => expr_uses_concat(inner),
+        Expr::Min(a, b) | Expr::Max(a, b) => expr_uses_concat(a) || expr_uses_concat(b),
+        Expr::Call(_, args) => args.iter().any(expr_uses_concat),
+        _ => false,
+    }
+}
+
+/// True iff a `Concat(...)` somewhere in `expr` has at least one
+/// number-typed argument — drives the decision to emit the itoa
+/// helper function. Walks recursively so a concat nested inside an
+/// `if` arm still counts.
+fn expr_concat_has_number_arg(
+    expr: &Expr,
+    field_shapes: &HashMap<&str, FieldShape>,
+    binding_shapes: &HashMap<&str, BindingShape>,
+) -> bool {
+    match expr {
+        Expr::Concat(args) => args.iter().any(|a| !expr_yields_text(a, field_shapes, binding_shapes)),
+        Expr::Binary(_, l, r) => {
+            expr_concat_has_number_arg(l, field_shapes, binding_shapes)
+                || expr_concat_has_number_arg(r, field_shapes, binding_shapes)
+        }
+        Expr::If(c, t, e) => {
+            expr_concat_has_number_arg(c, field_shapes, binding_shapes)
+                || expr_concat_has_number_arg(t, field_shapes, binding_shapes)
+                || expr_concat_has_number_arg(e, field_shapes, binding_shapes)
+        }
+        Expr::Not(inner) | Expr::Neg(inner) | Expr::Abs(inner) => {
+            expr_concat_has_number_arg(inner, field_shapes, binding_shapes)
+        }
+        Expr::Min(a, b) | Expr::Max(a, b) => {
+            expr_concat_has_number_arg(a, field_shapes, binding_shapes)
+                || expr_concat_has_number_arg(b, field_shapes, binding_shapes)
+        }
+        Expr::Call(_, args) => args.iter().any(|a| expr_concat_has_number_arg(a, field_shapes, binding_shapes)),
+        _ => false,
+    }
+}
+
+/// True iff `expr` contains a Concat directly inside another Concat's
+/// args. We refuse this in W3b because each concat call needs its
+/// own private (cursor, result_ptr, arg_ptr, arg_len) — sharing them
+/// across nesting would clobber. Workaround: bind the inner concat
+/// to a `let` and reference the binding (which is now allowed since
+/// W3b lifts the text-let-RHS refusal).
+fn expr_has_nested_concat(expr: &Expr) -> bool {
+    fn inside_concat(e: &Expr) -> bool {
+        match e {
+            Expr::Concat(_) => true,
+            Expr::Binary(_, l, r) => inside_concat(l) || inside_concat(r),
+            Expr::If(c, t, ee) => inside_concat(c) || inside_concat(t) || inside_concat(ee),
+            Expr::Not(i) | Expr::Neg(i) | Expr::Abs(i) => inside_concat(i),
+            Expr::Min(a, b) | Expr::Max(a, b) => inside_concat(a) || inside_concat(b),
+            Expr::Call(_, args) => args.iter().any(inside_concat),
+            _ => false,
+        }
+    }
+    match expr {
+        Expr::Concat(args) => args.iter().any(inside_concat),
+        Expr::Binary(_, l, r) => expr_has_nested_concat(l) || expr_has_nested_concat(r),
+        Expr::If(c, t, e) => expr_has_nested_concat(c) || expr_has_nested_concat(t) || expr_has_nested_concat(e),
+        Expr::Not(i) | Expr::Neg(i) | Expr::Abs(i) => expr_has_nested_concat(i),
+        Expr::Min(a, b) | Expr::Max(a, b) => expr_has_nested_concat(a) || expr_has_nested_concat(b),
+        Expr::Call(_, args) => args.iter().any(expr_has_nested_concat),
         _ => false,
     }
 }
@@ -354,12 +722,7 @@ fn binding_rhs_is_text(expr: &Expr, field_shapes: &HashMap<&str, FieldShape>) ->
 fn emit_wasm_expr(
     code: &mut Vec<u8>,
     expr: &Expr,
-    rule: &Rule,
-    concept: &Concept,
-    all_rules: &std::collections::HashMap<&str, &Rule>,
-    field_shapes: &HashMap<&str, FieldShape>,
-    total_param_slots: u32,
-    text_literals: &HashMap<String, u32>,
+    ctx: &WasmCtx,
 ) -> Result<(), WasmError> {
     match expr {
         Expr::Number(n) => {
@@ -371,7 +734,7 @@ fn emit_wasm_expr(
             // Push (ptr, len) — the offset was assigned by the compiler
             // pre-pass. Empty literals get an arbitrary offset; len=0
             // makes them safe regardless.
-            let offset = *text_literals.get(s).ok_or_else(|| WasmError {
+            let offset = *ctx.text_literals.get(s).ok_or_else(|| WasmError {
                 message: format!("internal: text literal '{}' not in offset map", s),
             })?;
             code.push(0x41);                            // i32.const ptr
@@ -381,10 +744,10 @@ fn emit_wasm_expr(
             Ok(())
         }
         Expr::Field(base, field_name) => {
-            if !matches!(base.as_ref(), Expr::Ident(n) if n == &rule.input_name) {
+            if !matches!(base.as_ref(), Expr::Ident(n) if n == &ctx.rule.input_name) {
                 return Err(WasmError { message: "nested field access not supported".into() });
             }
-            match field_shapes.get(field_name.as_str()) {
+            match ctx.field_shapes.get(field_name.as_str()) {
                 Some(FieldShape::Number(idx)) => {
                     code.push(0x20); // local.get
                     emit_leb128(code, *idx as u64);
@@ -399,19 +762,23 @@ fn emit_wasm_expr(
             }
         }
         Expr::Ident(name) => {
-            // Check let bindings (number-typed only in W3a — text RHSes
-            // are refused at the binding-emit site).
-            if let Some(idx) = rule.logic.bindings.iter().position(|(n, _)| n == name) {
-                code.push(0x20); // local.get
-                emit_leb128(code, total_param_slots as u64 + idx as u64);
-                Ok(())
-            } else {
-                Err(WasmError { message: format!("unresolved ident '{}'", name) })
+            match ctx.binding_shapes.get(name.as_str()) {
+                Some(BindingShape::Number(idx)) => {
+                    code.push(0x20);
+                    emit_leb128(code, *idx as u64);
+                    Ok(())
+                }
+                Some(BindingShape::Text { ptr, len }) => {
+                    code.push(0x20); emit_leb128(code, *ptr as u64);
+                    code.push(0x20); emit_leb128(code, *len as u64);
+                    Ok(())
+                }
+                None => Err(WasmError { message: format!("unresolved ident '{}'", name) }),
             }
         }
         Expr::Binary(op, left, right) => {
-            emit_wasm_expr(code, left, rule, concept, all_rules, field_shapes, total_param_slots, text_literals)?;
-            emit_wasm_expr(code, right, rule, concept, all_rules, field_shapes, total_param_slots, text_literals)?;
+            emit_wasm_expr(code, left, ctx)?;
+            emit_wasm_expr(code, right, ctx)?;
             match op {
                 BinOp::Add => code.push(0x7C),    // i64.add
                 BinOp::Sub => code.push(0x7D),    // i64.sub
@@ -431,24 +798,24 @@ fn emit_wasm_expr(
             Ok(())
         }
         Expr::If(cond, then_e, else_e) => {
-            emit_wasm_expr(code, cond, rule, concept, all_rules, field_shapes, total_param_slots, text_literals)?;
+            emit_wasm_expr(code, cond, ctx)?;
             code.push(0xA7); // i32.wrap_i64 (condition must be i32)
             code.push(0x04); // if
             code.push(0x7E); // result type: i64
-            emit_wasm_expr(code, then_e, rule, concept, all_rules, field_shapes, total_param_slots, text_literals)?;
+            emit_wasm_expr(code, then_e, ctx)?;
             code.push(0x05); // else
-            emit_wasm_expr(code, else_e, rule, concept, all_rules, field_shapes, total_param_slots, text_literals)?;
+            emit_wasm_expr(code, else_e, ctx)?;
             code.push(0x0B); // end
             Ok(())
         }
         Expr::Not(inner) => {
-            emit_wasm_expr(code, inner, rule, concept, all_rules, field_shapes, total_param_slots, text_literals)?;
+            emit_wasm_expr(code, inner, ctx)?;
             code.push(0x50); // i64.eqz
             Ok(())
         }
         Expr::Neg(inner) => {
             code.push(0x42); code.push(0x00); // i64.const 0
-            emit_wasm_expr(code, inner, rule, concept, all_rules, field_shapes, total_param_slots, text_literals)?;
+            emit_wasm_expr(code, inner, ctx)?;
             code.push(0x7D); // i64.sub (0 - x = -x)
             Ok(())
         }
@@ -459,8 +826,8 @@ fn emit_wasm_expr(
             // i64.ge_s already returns i32 so no extend is needed for the
             // select condition (unlike the rule-output path that uniformly
             // widens comparisons via 0xAD for i64 chaining).
-            let scratch_a = total_param_slots as u64 + rule.logic.bindings.len() as u64;
-            emit_wasm_expr(code, inner, rule, concept, all_rules, field_shapes, total_param_slots, text_literals)?;
+            let scratch_a = ctx.scratch_base_i64 as u64;
+            emit_wasm_expr(code, inner, ctx)?;
             code.push(0x22); emit_leb128(code, scratch_a);   // local.tee scratch_a
             code.push(0x42); code.push(0x00);                // i64.const 0
             code.push(0x20); emit_leb128(code, scratch_a);   // local.get scratch_a
@@ -489,11 +856,11 @@ fn emit_wasm_expr(
             // For min: cond = (a < b)  (i64.lt_s = 0x53)
             // For max: cond = (a > b)  (i64.gt_s = 0x55)
             let is_max = matches!(expr, Expr::Max(_, _));
-            let scratch_a = total_param_slots as u64 + rule.logic.bindings.len() as u64;
+            let scratch_a = ctx.scratch_base_i64 as u64;
             let scratch_b = scratch_a + 1;
 
-            emit_wasm_expr(code, a, rule, concept, all_rules, field_shapes, total_param_slots, text_literals)?;     // [a]
-            emit_wasm_expr(code, b, rule, concept, all_rules, field_shapes, total_param_slots, text_literals)?;     // [a, b]
+            emit_wasm_expr(code, a, ctx)?;     // [a]
+            emit_wasm_expr(code, b, ctx)?;     // [a, b]
             code.push(0x21); emit_leb128(code, scratch_b);           // pop b: $sb = b
             code.push(0x21); emit_leb128(code, scratch_a);           // pop a: $sa = a
             code.push(0x20); emit_leb128(code, scratch_a);           // [a]      val_1
@@ -504,15 +871,105 @@ fn emit_wasm_expr(
             code.push(0x1B);                                          // select
             Ok(())
         }
+        Expr::Concat(args) => {
+            // Single-pass concat: write each arg to $cursor in source
+            // order, advancing $cursor by arg_len after each memcpy.
+            // No prior sizing pass — the result length falls out of
+            // (cursor - result_ptr) at the end.
+            //
+            // Allocator state ($bump_ptr) advances ONCE at the end so
+            // sibling concats in the same rule call get fresh regions
+            // (a `let x = concat(a,b); let y = concat(c,d)` produces
+            // two adjacent allocations rather than overlapping ones).
+            //
+            // Nested concat is refused at the compile_wasm gate: each
+            // concat needs its own private (cursor, result_ptr,
+            // arg_ptr, arg_len) and we have only one set per rule.
+            let cl = ctx.concat.ok_or_else(|| WasmError {
+                message: "internal: Expr::Concat reached emit without concat scratches reserved".into(),
+            })?;
+
+            // Init: $result_ptr = $cursor = $bump_ptr
+            code.push(0x20); emit_leb128(code, cl.bump_ptr as u64);   // [bump]
+            code.push(0x22); emit_leb128(code, cl.result_ptr as u64); // [bump], $result_ptr = bump
+            code.push(0x21); emit_leb128(code, cl.cursor as u64);     // [], $cursor = bump
+
+            for arg in args {
+                let yields_text = expr_yields_text(arg, ctx.field_shapes, ctx.binding_shapes);
+                if yields_text {
+                    // Eval arg → [..., arg_ptr, arg_len]
+                    emit_wasm_expr(code, arg, ctx)?;
+                } else {
+                    // Eval number arg → [..., i64], then call itoa to
+                    // get [..., i32 ptr, i32 len].
+                    let itoa_idx = ctx.itoa_func_idx.ok_or_else(|| WasmError {
+                        message: "internal: number arg in concat without itoa wired up".into(),
+                    })?;
+                    emit_wasm_expr(code, arg, ctx)?;
+                    code.push(0x10); emit_leb128(code, itoa_idx as u64);   // call itoa
+                }
+                // Stack now: [..., arg_ptr, arg_len].
+                // Park into scratches, then memcpy from arg_ptr to
+                // $cursor for arg_len bytes.
+                code.push(0x21); emit_leb128(code, cl.arg_len as u64);   // pop len
+                code.push(0x21); emit_leb128(code, cl.arg_ptr as u64);   // pop ptr
+                // memory.copy(dest=$cursor, src=$arg_ptr, n=$arg_len)
+                code.push(0x20); emit_leb128(code, cl.cursor as u64);
+                code.push(0x20); emit_leb128(code, cl.arg_ptr as u64);
+                code.push(0x20); emit_leb128(code, cl.arg_len as u64);
+                code.extend_from_slice(&[0xFC, 0x0A, 0x00, 0x00]);       // memory.copy 0 0
+                // $cursor += $arg_len
+                code.push(0x20); emit_leb128(code, cl.cursor as u64);
+                code.push(0x20); emit_leb128(code, cl.arg_len as u64);
+                code.push(0x6A);                                          // i32.add
+                code.push(0x21); emit_leb128(code, cl.cursor as u64);
+            }
+
+            // Update allocator state: $bump_ptr = $cursor (next concat
+            // in this rule call starts past the bytes we just wrote).
+            code.push(0x20); emit_leb128(code, cl.cursor as u64);
+            code.push(0x21); emit_leb128(code, cl.bump_ptr as u64);
+
+            // Push result: ($result_ptr, $cursor - $result_ptr)
+            code.push(0x20); emit_leb128(code, cl.result_ptr as u64);  // ptr
+            code.push(0x20); emit_leb128(code, cl.cursor as u64);
+            code.push(0x20); emit_leb128(code, cl.result_ptr as u64);
+            code.push(0x6B);                                            // i32.sub → len
+            Ok(())
+        }
         Expr::Call(name, args) => {
             if args.len() != 1 {
                 return Err(WasmError { message: "call requires 1 argument".into() });
             }
-            let called = all_rules.get(name.as_str()).ok_or_else(|| WasmError {
+            let called = ctx.all_rules.get(name.as_str()).ok_or_else(|| WasmError {
                 message: format!("unknown rule '{}'", name),
             })?;
-            // Inline the called rule's logic with the same field layout
-            emit_wasm_expr(code, &called.logic.value, called, concept, all_rules, field_shapes, total_param_slots, text_literals)
+            // Inline the callee's logic against the caller's field
+            // layout. The callee MUST share the caller's input concept
+            // and have no bindings of its own — otherwise the caller's
+            // binding_shapes / text_literals are the wrong tables to
+            // resolve through. Both restrictions match what's been
+            // shipped historically; lifting them is its own slice.
+            if !called.logic.bindings.is_empty() {
+                return Err(WasmError {
+                    message: format!("call into rule '{}' with let bindings is not yet supported", name),
+                });
+            }
+            // Swap rule for the recursion so the callee's `input_name`
+            // resolves correctly (caller and callee may name the same
+            // concept binding differently).
+            let callee_ctx = WasmCtx {
+                rule: called,
+                concept: ctx.concept,
+                all_rules: ctx.all_rules,
+                field_shapes: ctx.field_shapes,
+                binding_shapes: ctx.binding_shapes,
+                text_literals: ctx.text_literals,
+                scratch_base_i64: ctx.scratch_base_i64,
+                concat: ctx.concat,
+                itoa_func_idx: ctx.itoa_func_idx,
+            };
+            emit_wasm_expr(code, &called.logic.value, &callee_ctx)
         }
         _ => Err(WasmError {
             message: format!("unsupported expression in WASM backend"),
@@ -1228,17 +1685,19 @@ rule age_plus_one
         );
     }
 
-    /// W3a: a text-typed RHS in a let binding is refused with a
-    /// pointer to the W3b slice that will lift the limit.
+    /// W3b: text-typed let bindings now compile (W3a refused them).
+    /// `let alias = g.name` parks (ptr, len) into two i32 slots and
+    /// `Ident("alias")` resolves to two `local.get`s. Pinned by
+    /// presence of an i32 group AFTER the text-input-field params.
     #[test]
-    fn wasm_w3a_text_let_binding_is_refused() {
+    fn wasm_w3b_text_let_binding_compiles() {
         let src = r#"@verbose 0.1.0
 concept G
   @intention: "g"
   @source: invoices.intent:1
   fields:
     name : text
-rule bad
+rule passthrough
   @intention: "g"
   @source: invoices.intent:1
   input:
@@ -1255,18 +1714,15 @@ rule bad
     termination:
       bound: 1
 "#;
-        use crate::lexer::Lexer;
-        use crate::parser::Parser;
-        let tokens = Lexer::new(src).tokenize().expect("tokenize");
-        let program = Parser::new(tokens).parse_program().expect("parse");
-        let path = "/tmp/wasm_w3a_text_let_refused.wasm";
-        let err = compile_wasm(&program, "bad", path).expect_err("text let must be refused");
+        let bytes = compile_to_bytes(src, "passthrough", "text_let");
+        assert_eq!(&bytes[0..4], b"\0asm");
+        // Locals declarations: a single i32 group of 2 (the text
+        // binding's ptr+len) → bytes `01 02 7F`. There are no number
+        // bindings and no scratches, so the i64 group is absent.
         assert!(
-            err.message.contains("text-typed RHS") && err.message.contains("W3b"),
-            "error should pin the W3b deferral; got: {}",
-            err.message
+            bytes.windows(3).any(|w| w == [0x01, 0x02, 0x7F]),
+            "expected single i32 locals group of 2 (text binding ptr+len)"
         );
-        let _ = std::fs::remove_file(path);
     }
 
     /// W3a end-to-end: load the compiled module in node, exercise
@@ -1396,6 +1852,331 @@ async function readResult(path, fn, args) {{
         assert!(
             stdout.matches("OK").count() >= 3,
             "expected >=3 OK lines (lit + echo + echo-long); stdout:\n{}",
+            stdout
+        );
+    }
+
+    /// W3b: a rule that uses `concat(...)` reserves the bump allocator
+    /// local + the four per-concat scratches. With ONE text input
+    /// field (2 i32 params), no number bindings, no min/max/abs, and
+    /// no text bindings, the i32 locals group should hold exactly 5
+    /// entries: the concat scratches (bump_ptr, cursor, result_ptr,
+    /// arg_ptr, arg_len). Encoded as `01 05 7F`.
+    #[test]
+    fn wasm_w3b_concat_reserves_five_i32_scratches() {
+        let src = r#"@verbose 0.1.0
+concept G
+  @intention: "g"
+  @source: invoices.intent:1
+  fields:
+    name : text
+rule greet
+  @intention: "g"
+  @source: invoices.intent:1
+  input:
+    g : G
+  output:
+    out : text
+  logic:
+    out = concat("hello, ", g.name)
+  proofs:
+    purity:
+      reads: [g.name]
+      calls: []
+    termination:
+      bound: 1
+"#;
+        let bytes = compile_to_bytes(src, "greet", "concat_scratches");
+        assert_eq!(&bytes[0..4], b"\0asm");
+        // Exactly one i32 group of 5 entries (no i64 group present:
+        // no number bindings, no scratches).
+        assert!(
+            bytes.windows(3).any(|w| w == [0x01, 0x05, 0x7F]),
+            "expected single i32 locals group of 5 (concat scratches): {:02X?}",
+            bytes
+        );
+        // memory.copy bytes (0xFC 0x0A 0x00 0x00) should appear once
+        // per concat arg — here, twice.
+        let copy_pat = [0xFCu8, 0x0A, 0x00, 0x00];
+        let copy_count = bytes.windows(4).filter(|w| **w == copy_pat).count();
+        assert_eq!(copy_count, 2, "expected 2 memory.copy ops, found {}", copy_count);
+    }
+
+    /// W3b: a `concat(...)` containing a number arg makes the module
+    /// emit a 2-function shape (rule + itoa helper). Pinned by the
+    /// type section declaring 2 types (`02` after the section length)
+    /// and by the itoa-distinctive byte sequence appearing once in
+    /// the code section.
+    #[test]
+    fn wasm_w3b_concat_with_number_arg_emits_itoa_func() {
+        let src = r#"@verbose 0.1.0
+concept Q
+  @intention: "q"
+  @source: invoices.intent:1
+  fields:
+    n : number
+rule format_n
+  @intention: "q"
+  @source: invoices.intent:1
+  input:
+    q : Q
+  output:
+    out : text
+  logic:
+    out = concat("value=", q.n)
+  proofs:
+    purity:
+      reads: [q.n]
+      calls: []
+    termination:
+      bound: 1
+"#;
+        let bytes = compile_to_bytes(src, "format_n", "concat_with_num");
+        assert_eq!(&bytes[0..4], b"\0asm");
+        // The function section content should be `02 00 01` (2 funcs,
+        // type 0 then type 1). Pinned by direct byte search.
+        assert!(
+            bytes.windows(3).any(|w| w == [0x02, 0x00, 0x01]),
+            "expected function section content `02 00 01` (rule + itoa)"
+        );
+        // itoa contains the unsigned div/rem opcodes (0x80, 0x82) —
+        // these don't appear in any other emission today, so their
+        // joint presence pins itoa being there.
+        assert!(bytes.contains(&0x80), "expected i64.div_u from itoa");
+        assert!(bytes.contains(&0x82), "expected i64.rem_u from itoa");
+        // `call 1` (0x10 0x01) for the itoa invocation in concat.
+        assert!(
+            bytes.windows(2).any(|w| w == [0x10, 0x01]),
+            "expected `call 1` (itoa) from concat"
+        );
+    }
+
+    /// W3b: nested concat is refused with a clear pointer to the
+    /// `let` workaround (which is now legal because text-let RHSes
+    /// were just lifted).
+    #[test]
+    fn wasm_w3b_nested_concat_is_refused_with_let_hint() {
+        let src = r#"@verbose 0.1.0
+concept G
+  @intention: "g"
+  @source: invoices.intent:1
+  fields:
+    name : text
+rule bad
+  @intention: "g"
+  @source: invoices.intent:1
+  input:
+    g : G
+  output:
+    out : text
+  logic:
+    out = concat("x", concat("a", g.name), "y")
+  proofs:
+    purity:
+      reads: [g.name]
+      calls: []
+    termination:
+      bound: 2
+"#;
+        use crate::lexer::Lexer;
+        use crate::parser::Parser;
+        let tokens = Lexer::new(src).tokenize().expect("tokenize");
+        let program = Parser::new(tokens).parse_program().expect("parse");
+        let path = "/tmp/wasm_w3b_nested_concat_refused.wasm";
+        let err = compile_wasm(&program, "bad", path).expect_err("nested concat must be refused");
+        assert!(
+            err.message.contains("nested concat") && err.message.contains("let"),
+            "error should hint at the let workaround; got: {}",
+            err.message
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// W3b end-to-end in node: exercises (a) text-only concat with a
+    /// text-input field, (b) concat with a number arg via itoa across
+    /// boundary values including i64::MIN, (c) sibling concats in
+    /// the same call so the bump allocator advances correctly, and
+    /// (d) two CALLS of the same module to confirm the allocator
+    /// resets on entry. Like W1's runtime test, this is the only
+    /// thing that catches a wrong scratch index or memcpy mishap.
+    #[test]
+    fn wasm_w3b_runtime_concat_text_and_numbers() {
+        use std::process::Command;
+
+        if Command::new("node").arg("--version").output().is_err() {
+            eprintln!("note: `node` not found, skipping WASM W3b runtime test");
+            return;
+        }
+
+        let src = r#"@verbose 0.1.0
+concept G
+  @intention: "g"
+  @source: invoices.intent:1
+  fields:
+    name : text
+    n : number
+rule greet
+  @intention: "g"
+  @source: invoices.intent:1
+  input:
+    g : G
+  output:
+    out : text
+  logic:
+    out = concat("hello, ", g.name, "!")
+  proofs:
+    purity:
+      reads: [g.name]
+      calls: []
+    termination:
+      bound: 1
+rule format_with_num
+  @intention: "g"
+  @source: invoices.intent:1
+  input:
+    g : G
+  output:
+    out : text
+  logic:
+    out = concat(g.name, "=", g.n)
+  proofs:
+    purity:
+      reads: [g.name, g.n]
+      calls: []
+    termination:
+      bound: 2
+rule chain_lets
+  @intention: "g"
+  @source: invoices.intent:1
+  input:
+    g : G
+  output:
+    out : text
+  logic:
+    let prefix = concat("[", g.name, "] ")
+    let suffix = concat("(n=", g.n, ")")
+    out = concat(prefix, suffix)
+  proofs:
+    purity:
+      reads: [g.name, g.n]
+      calls: []
+    termination:
+      bound: 4
+"#;
+        let greet_path = "/tmp/wasm_w3b_runtime_greet.wasm";
+        let fmt_path = "/tmp/wasm_w3b_runtime_fmt.wasm";
+        let chain_path = "/tmp/wasm_w3b_runtime_chain.wasm";
+
+        use crate::lexer::Lexer;
+        use crate::parser::Parser;
+        let tokens = Lexer::new(src).tokenize().expect("tokenize");
+        let program = Parser::new(tokens).parse_program().expect("parse");
+        compile_wasm(&program, "greet", greet_path).expect("compile greet");
+        compile_wasm(&program, "format_with_num", fmt_path).expect("compile fmt");
+        compile_wasm(&program, "chain_lets", chain_path).expect("compile chain");
+
+        let script = format!(
+            r#"
+const fs = require("fs");
+const dec = new TextDecoder();
+const enc = new TextEncoder();
+
+async function load(path) {{
+  const buf = fs.readFileSync(path);
+  if (!WebAssembly.validate(buf)) {{
+    console.log("FAIL invalid module " + path);
+    return null;
+  }}
+  return WebAssembly.instantiate(buf);
+}}
+
+function writeStr(mem, off, s) {{
+  const bytes = enc.encode(s);
+  mem.set(bytes, off);
+  return bytes.length;
+}}
+
+(async () => {{
+  // --- (a) text concat: "hello, " + name + "!"
+  let m = await load("{greet_path}");
+  let mem = new Uint8Array(m.instance.exports.memory.buffer);
+  let nameLen = writeStr(mem, 4096, "Alice");
+  // greet takes 3 i32 params (name_ptr, name_len, n) — n is unused
+  // here but the signature includes it because the concept has it.
+  let [p, l] = m.instance.exports.greet(4096, nameLen, 0n);
+  let got = dec.decode((new Uint8Array(m.instance.exports.memory.buffer)).subarray(p, p+l));
+  console.log(got === "hello, Alice!" ? "OK greet" : "FAIL greet got " + JSON.stringify(got));
+
+  // --- (b) concat with number, including i64::MIN edge case
+  m = await load("{fmt_path}");
+  mem = new Uint8Array(m.instance.exports.memory.buffer);
+  for (const [name, n, expected] of [
+    ["amount", 42n, "amount=42"],
+    ["amount", 0n, "amount=0"],
+    ["amount", -1n, "amount=-1"],
+    ["balance", 9223372036854775807n, "balance=9223372036854775807"],
+    ["balance", -9223372036854775808n, "balance=-9223372036854775808"],
+  ]) {{
+    mem = new Uint8Array(m.instance.exports.memory.buffer);
+    const len = writeStr(mem, 4096, name);
+    const [p2, l2] = m.instance.exports.format_with_num(4096, len, n);
+    mem = new Uint8Array(m.instance.exports.memory.buffer);
+    const out = dec.decode(mem.subarray(p2, p2+l2));
+    console.log(out === expected ? "OK fmt " + n : "FAIL fmt " + n + " got " + JSON.stringify(out) + " expected " + expected);
+  }}
+
+  // --- (c) chain_lets: prefix and suffix concat each, then a
+  //         third concat over both lets. Validates sibling-concat
+  //         allocator advancement.
+  m = await load("{chain_path}");
+  mem = new Uint8Array(m.instance.exports.memory.buffer);
+  let chainLen = writeStr(mem, 4096, "Bob");
+  let [p3, l3] = m.instance.exports.chain_lets(4096, chainLen, 99n);
+  mem = new Uint8Array(m.instance.exports.memory.buffer);
+  let chainOut = dec.decode(mem.subarray(p3, p3+l3));
+  console.log(chainOut === "[Bob] (n=99)" ? "OK chain" : "FAIL chain got " + JSON.stringify(chainOut));
+
+  // --- (d) allocator reset: call greet twice, second call's bytes
+  //         must equal the second input — not the first input's bytes.
+  m = await load("{greet_path}");
+  mem = new Uint8Array(m.instance.exports.memory.buffer);
+  let first = writeStr(mem, 4096, "First");
+  let [p4, l4] = m.instance.exports.greet(4096, first, 0n);
+  mem = new Uint8Array(m.instance.exports.memory.buffer);
+  const firstOut = dec.decode(mem.subarray(p4, p4+l4));
+  let second = writeStr(mem, 8192, "Second");
+  let [p5, l5] = m.instance.exports.greet(8192, second, 0n);
+  mem = new Uint8Array(m.instance.exports.memory.buffer);
+  const secondOut = dec.decode(mem.subarray(p5, p5+l5));
+  // The second call's result_ptr should equal the FIRST call's
+  // result_ptr (allocator reset on entry). Pin both contents.
+  console.log(firstOut === "hello, First!" ? "OK reset-1" : "FAIL reset-1 got " + JSON.stringify(firstOut));
+  console.log(secondOut === "hello, Second!" ? "OK reset-2" : "FAIL reset-2 got " + JSON.stringify(secondOut));
+  console.log(p4 === p5 ? "OK reset-ptr" : "FAIL reset-ptr first=" + p4 + " second=" + p5);
+}})();
+"#
+        );
+
+        let out = Command::new("node")
+            .args(["-e", &script])
+            .output()
+            .expect("spawn node");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+
+        let _ = std::fs::remove_file(greet_path);
+        let _ = std::fs::remove_file(fmt_path);
+        let _ = std::fs::remove_file(chain_path);
+
+        assert!(
+            !stdout.contains("FAIL"),
+            "WASM W3b runtime check failed; node stdout:\n{}\nstderr:\n{}",
+            stdout,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        // We expect: 1 OK greet + 5 OK fmt + 1 OK chain + 3 OK reset = 10.
+        assert!(
+            stdout.matches("OK").count() >= 10,
+            "expected >=10 OK lines; stdout:\n{}",
             stdout
         );
     }
