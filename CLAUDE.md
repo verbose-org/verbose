@@ -337,6 +337,12 @@ tools/
                    that has never seen the source? Each run is one data point.
   benchmark.sh     Reproducible comparison vs gcc
   phase_sizes.sh   Per-phase native binary size report
+  requirements.txt Frozen deps for generate_sdk.py path. Install via
+                   `uv venv && uv pip install -r tools/requirements.txt`
+                   from the repo root, then run scripts via
+                   `.venv/bin/python tools/...` (or `source .venv/bin/activate`).
+                   The API path (generate.py + non-SDK eval.py) stays
+                   stdlib-only — no venv needed.
 ```
 
 *Operator-facing reference for both generators (auth modes, the

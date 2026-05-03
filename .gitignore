@@ -23,3 +23,6 @@ target
 # Python bytecode cache from tools/
 __pycache__/
 *.pyc
+
+# Python virtual environment (created by `uv venv`)
+.venv/

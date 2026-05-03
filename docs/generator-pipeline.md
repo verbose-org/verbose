@@ -15,21 +15,34 @@ the verifier checks, see [spec-proofs.md](spec-proofs.md).
 
 ```bash
 # One-time setup, subscription auth (recommended for habitual use):
-pip install claude-agent-sdk
-claude setup-token
+uv venv                              # create .venv/ at repo root
+uv pip install -r tools/requirements.txt
+claude setup-token                   # OAuth flow, gives you a 1-year token
 
 # Per-session:
 export CLAUDE_CODE_OAUTH_TOKEN=<token>
-unset ANTHROPIC_API_KEY    # critical, see "Auth precedence gotcha" below
-python3 tools/eval.py --use-sdk
+unset ANTHROPIC_API_KEY              # critical, see "Auth precedence gotcha" below
+.venv/bin/python tools/eval.py --use-sdk
 
-# One-shot, per-token billing (no setup beyond the API key):
+# One-shot, per-token billing (no SDK install needed):
 export ANTHROPIC_API_KEY=sk-ant-...
-python3 tools/eval.py
+python3 tools/eval.py                # API path uses stdlib only — no venv required
 ```
 
 Either path runs the generator across a curated sample of repo
 intents and prints `first_try=X/N, after_corrections=Y/N, failed=Z/N`.
+
+The two scripts have different dependency profiles:
+
+- `tools/generate.py` (API path): **stdlib-only**, runs against the
+  system Python.
+- `tools/generate_sdk.py` (subscription path): needs the
+  `claude-agent-sdk` package + ~30 transitive deps. **Install in a
+  venv** to keep your system Python clean.
+
+`tools/requirements.txt` pins the exact versions installed by
+`uv pip install claude-agent-sdk` so eval runs are reproducible
+across machines.
 
 ## What the pipeline does
 
@@ -79,9 +92,13 @@ thing that changes between them is the HTTP client and the auth header.
 
 ### Subscription (Claude Pro / Max)
 
+Recommended setup uses uv for an isolated venv:
+
 ```bash
-pip install claude-agent-sdk
-claude setup-token
+# from repo root
+uv venv                                          # creates .venv/
+uv pip install -r tools/requirements.txt         # installs claude-agent-sdk + transitive deps
+claude setup-token                               # OAuth flow → 1-year token
 ```
 
 `claude setup-token` opens an OAuth flow in your browser, then prints
@@ -94,6 +111,26 @@ unset ANTHROPIC_API_KEY      # see precedence gotcha below
 
 The SDK picks up `CLAUDE_CODE_OAUTH_TOKEN` automatically — no code
 change needed.
+
+After this, every invocation uses `.venv/bin/python` instead of the
+system `python3`:
+
+```bash
+.venv/bin/python tools/generate_sdk.py examples/foo.intent
+.venv/bin/python tools/eval.py --use-sdk
+```
+
+Or activate the venv to drop the prefix:
+
+```bash
+source .venv/bin/activate
+python tools/eval.py --use-sdk
+deactivate                                       # when you're done
+```
+
+If `pip install` (without uv) is your habit, that works too — just
+make sure you're inside a venv (the SDK install pulls ~30 transitive
+deps that don't belong in the system Python).
 
 ### API key (per-token billing)
 
