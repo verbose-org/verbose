@@ -62,14 +62,16 @@ def run_one(
     max_corrections: int,
     model: str,
     quiet: bool,
+    use_sdk: bool,
 ) -> tuple[str, int]:
-    """Invoke generate.py for one intent. Return (status, attempts).
+    """Invoke generate.py (or generate_sdk.py) for one intent.
 
-    status ∈ {"first_try", "corrected", "failed"}.
+    Returns (status, attempts) where status ∈ {"first_try", "corrected", "failed"}.
     """
+    script = "generate_sdk.py" if use_sdk else "generate.py"
     cmd = [
         sys.executable,
-        str(REPO / "tools" / "generate.py"),
+        str(REPO / "tools" / script),
         str(intent_path),
         "--output", str(output_path),
         "--max-corrections", str(max_corrections),
@@ -121,10 +123,23 @@ def main():
     parser.add_argument("--max-corrections", type=int, default=3)
     parser.add_argument("--model", default="claude-sonnet-4-6")
     parser.add_argument("--quiet", action="store_true", help="suppress per-attempt logs from generator")
+    parser.add_argument(
+        "--use-sdk",
+        action="store_true",
+        help="route through generate_sdk.py (Claude Agent SDK + subscription auth) "
+             "instead of generate.py (direct API + ANTHROPIC_API_KEY)",
+    )
     args = parser.parse_args()
 
-    if not os.environ.get("ANTHROPIC_API_KEY"):
-        sys.exit("ANTHROPIC_API_KEY is not set")
+    if args.use_sdk:
+        if not (os.environ.get("CLAUDE_CODE_OAUTH_TOKEN") or os.environ.get("ANTHROPIC_API_KEY")):
+            sys.exit(
+                "no auth configured for --use-sdk. Pick one:\n"
+                "  - subscription:  claude setup-token  → export CLAUDE_CODE_OAUTH_TOKEN=<token>\n"
+                "  - per-token:     export ANTHROPIC_API_KEY=sk-ant-..."
+            )
+    elif not os.environ.get("ANTHROPIC_API_KEY"):
+        sys.exit("ANTHROPIC_API_KEY is not set (or pass --use-sdk to use the Claude Agent SDK)")
 
     if args.all:
         intent_paths = sorted(EXAMPLES.glob("*.intent"))
@@ -163,6 +178,7 @@ def main():
             max_corrections=args.max_corrections,
             model=args.model,
             quiet=args.quiet,
+            use_sdk=args.use_sdk,
         )
         results.append((intent_path.name, status, attempts))
         print()

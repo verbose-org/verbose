@@ -316,14 +316,25 @@ tools/
                    Stdlib-only Python (urllib for HTTP). Closes the loop the
                    project's thesis depends on (.intent → .verbose → binary).
                    Usage: `ANTHROPIC_API_KEY=... python3 tools/generate.py
-                   examples/foo.intent`. Default model: claude-sonnet-4-6.
+                   examples/foo.intent`. Per-token billing.
+  generate_sdk.py  Same logic, same prompt, same exit codes — but uses the
+                   Claude Agent SDK (`pip install claude-agent-sdk`) so the
+                   operator can authenticate via a Claude Pro/Max subscription
+                   instead of an API key. Pickup: `claude setup-token` mints
+                   a year-long OAuth token; export it as
+                   CLAUDE_CODE_OAUTH_TOKEN. Critical gotcha the script warns
+                   about: ANTHROPIC_API_KEY takes precedence in the SDK, so
+                   you must `unset` it for subscription auth to actually
+                   kick in. Imports the prompt-building helpers from
+                   generate.py so the two paths produce identical prompts.
   eval.py          Runs generate.py across a curated sample of repo intents
                    (or all of them via --all) and reports the metric:
-                   first_try=X/N, after_corrections=Y/N, failed=Z/N. Forces
-                   --output into a tmpdir so the canonical examples/*.verbose
-                   are NEVER touched. This is the metric the project lacked:
-                   how authorable is Verbose by an AI that has never seen the
-                   source? Each run is one data point.
+                   first_try=X/N, after_corrections=Y/N, failed=Z/N. Pass
+                   --use-sdk to route through generate_sdk.py instead.
+                   Forces --output into a tmpdir so the canonical
+                   examples/*.verbose are NEVER touched. This is the metric
+                   the project lacked: how authorable is Verbose by an AI
+                   that has never seen the source? Each run is one data point.
   benchmark.sh     Reproducible comparison vs gcc
   phase_sizes.sh   Per-phase native binary size report
 ```
