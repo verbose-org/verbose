@@ -310,8 +310,22 @@ examples/
   demo.html        Browser demo (WASM)
 
 tools/
-  generate.sh      Intent -> Verbose via Claude API
+  generate.py      Intent -> Verbose via Claude API, with verify-and-correct loop:
+                   generates a `.verbose`, runs `verbosec` on it, if rejected
+                   feeds the diagnostic back to the model and retries (cap N).
+                   Stdlib-only Python (urllib for HTTP). Closes the loop the
+                   project's thesis depends on (.intent → .verbose → binary).
+                   Usage: `ANTHROPIC_API_KEY=... python3 tools/generate.py
+                   examples/foo.intent`. Default model: claude-sonnet-4-6.
+  eval.py          Runs generate.py across a curated sample of repo intents
+                   (or all of them via --all) and reports the metric:
+                   first_try=X/N, after_corrections=Y/N, failed=Z/N. Forces
+                   --output into a tmpdir so the canonical examples/*.verbose
+                   are NEVER touched. This is the metric the project lacked:
+                   how authorable is Verbose by an AI that has never seen the
+                   source? Each run is one data point.
   benchmark.sh     Reproducible comparison vs gcc
+  phase_sizes.sh   Per-phase native binary size report
 ```
 
 ## Language Features (current)
