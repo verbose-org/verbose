@@ -61,32 +61,41 @@ A `.verbose` file declares concepts and rules that operate on them.
 Every rule carries proofs the compiler verifies — they are NOT
 optional.
 
-### Skeleton
+### Indentation rules (the parser is strict)
 
-    @verbose 0.1.0
+All top-level declarations (`@verbose`, `concept`, `rule`, `reaction`,
+`service`, `resource`, `connection`) MUST start at column 0 — never
+indented. Their nested sections (`fields:`, `input:`, `output:`,
+`logic:`, `proofs:`) are indented by 2 spaces from the declaration.
+The contents of those sections are indented by 4 spaces total. Any
+leading whitespace before a top-level keyword causes a parse error.
 
-    concept ConceptName
-      @intention: "what this concept represents"
-      @source: <intent_filename>:<line>
-      fields:
-        field_name : type            -- types: number, bool, text, collection(Other)
-        field_name : number [a, b]   -- optional integer range
+### Skeleton (these declarations begin at column 0)
 
-    rule rule_name
-      @intention: "what this rule expresses"
-      @source: <intent_filename>:<line>
-      input:
-        var : ConceptName
-      output:
-        result_name : type
-      logic:
-        result_name = <expression>
-      proofs:
-        purity:
-          reads : [var.field, ...]   -- exactly the fields touched
-          calls : [other_rule, ...]  -- exactly the rules called
-        termination:
-          bound : N                  -- >= count of Binary/Call/If/Not/Neg ops
+@verbose 0.1.0
+
+concept ConceptName
+  @intention: "what this concept represents"
+  @source: <intent_filename>:<line>
+  fields:
+    field_name : type            -- types: number, bool, text, collection(Other)
+    field_name : number [a, b]   -- optional integer range
+
+rule rule_name
+  @intention: "what this rule expresses"
+  @source: <intent_filename>:<line>
+  input:
+    var : ConceptName
+  output:
+    result_name : type
+  logic:
+    result_name = <expression>
+  proofs:
+    purity:
+      reads : [var.field, ...]   -- exactly the fields touched
+      calls : [other_rule, ...]  -- exactly the rules called
+    termination:
+      bound : N                  -- >= count of Binary/Call/If/Not/Neg ops
 
 ### Expressions
 
@@ -111,16 +120,78 @@ optional.
 
 ### Reactions (declared side effects)
 
-    reaction name
-      @intention: "..."
-      @source: ...:..
-      trigger: a_bool_rule
-      effects:
-        print "literal {var.field}"
-        append_file "/path/literal" "literal {var.field}"
+reaction name
+  @intention: "..."
+  @source: ...:..
+  trigger: a_bool_rule
+  effects:
+    print "literal {var.field}"
+    append_file "/path/literal" "literal {var.field}"
 
 The path of `append_file` is a string literal; the content is a
 text expression (use `concat(...)` for dynamic content).
+
+### Bound counting (the verifier's exact view)
+
+`bound:` must be >= the verifier's recursive operation count of the
+rule's `logic:` expression. The verifier adds 1 for each of:
+
+  - Binary op (+, -, *, /, %, ==, !=, <, >, <=, >=, and, or)
+  - if/then/else
+  - not, neg, abs
+  - rule_call, concat, parse_int, length, json_escape
+  - starts_with, ends_with, contains
+  - Ok, Err, match_result
+  - min(a, b), max(a, b)        -- the BINARY scalar form
+  - all, any, filter, map, fold
+  - Record { ... } construction
+  - read(<resource>), fetch(<conn>, ...), now_unix()
+
+It adds 0 for: Field access (`x.f`), Ident, Number literal, Text literal.
+
+CRITICAL: `sum`, `count`, and the COLLECTION forms of `min(xs, x => ..)`
+/ `max(xs, x => ..)` are SYNTACTIC SUGAR. The parser desugars them to
+`fold` with an explicit accumulator body that has extra ops. The verifier
+counts the desugared form. Specifically:
+
+  sum(xs, x => f(x))   ==> fold(xs, 0, acc, x => acc + f(x))
+                            cost: 1 (fold) + 1 (+) + cost(f(x))
+
+  count(xs, x => p(x)) ==> fold(xs, 0, acc, x => acc + (if p(x) then 1 else 0))
+                            cost: 1 (fold) + 1 (+) + 1 (if) + cost(p(x))
+
+  min(xs, x => f(x))   ==> fold(xs, head, acc, x => if f(x) < acc then f(x) else acc)
+                            cost: 1 (fold) + 1 (if) + 1 (<) + 2*cost(f(x))
+
+  max(xs, x => f(x))   ==> fold with `>` instead of `<` ; same shape.
+
+Worked examples (count these by hand to confirm your bound):
+
+  total = sum(xs, x => x.amount)
+    => fold(xs, 0, acc, x => acc + x.amount)
+    => 1 (fold) + 1 (+) = 2          -- field reads contribute 0
+
+  n = count(xs, x => x.days > 30)
+    => fold(xs, 0, acc, x => acc + (if x.days > 30 then 1 else 0))
+    => 1 (fold) + 1 (+) + 1 (if) + 1 (>) = 4
+
+  amt = sum(xs, x => if x.flag then x.amount else 0)
+    => fold(xs, 0, acc, x => acc + (if x.flag then x.amount else 0))
+    => 1 (fold) + 1 (+) + 1 (if) = 3   -- the Field x.flag is 0
+
+  r = if c.balance >= 100000 then Ok("p") else Err(concat("b=", c.balance))
+    => 1 (if) + 1 (>=) + 1 (Ok) + 1 (Err) + 1 (concat) = 5
+       -- text/number literals and field reads inside concat are 0
+
+  r = match_result(callee(p), v => Ok(v * 90 / 100), e => Err(e))
+    => 1 (match_result) + 1 (Call callee) + 1 (Ok) + 1 (Binary *) + 1 (Binary /) + 1 (Err) = 6
+       -- IMPORTANT: `a * b / c` is TWO Binary ops (* then /), not one.
+       --            chained arithmetic adds one per operator.
+
+CHEAP SAFETY NET: when in doubt, ROUND UP. Adding +1 or +2 to your
+computed bound is always safe — the verifier rejects bound too low
+but NEVER too high. A `bound: 10` for a rule whose actual cost is 6
+verifies cleanly.
 
 ### Hints (optional, each MUST carry a string justification)
 
@@ -153,36 +224,36 @@ intent:
     2. An invoice is important when its amount exceeds 10000.
 
 verbose:
-    @verbose 0.1.0
+@verbose 0.1.0
 
-    concept Invoice
-      @intention: "An invoice has an amount"
-      @source: invoices.intent:1
+concept Invoice
+  @intention: "An invoice has an amount"
+  @source: invoices.intent:1
 
-      fields:
-        amount : number
+  fields:
+    amount : number
 
 
-    rule important_invoice
-      @intention: "An invoice is important when its amount exceeds 10000"
-      @source: invoices.intent:2
+rule important_invoice
+  @intention: "An invoice is important when its amount exceeds 10000"
+  @source: invoices.intent:2
 
-      input:
-        i : Invoice
+  input:
+    i : Invoice
 
-      output:
-        important : bool
+  output:
+    important : bool
 
-      logic:
-        important = i.amount > 10000
+  logic:
+    important = i.amount > 10000
 
-      proofs:
-        purity:
-          reads   : [i.amount]
-          calls   : []
+  proofs:
+    purity:
+      reads   : [i.amount]
+      calls   : []
 
-        termination:
-          bound : 1
+    termination:
+      bound : 1
 
 
 ### Example 2 — arithmetic + composition (multiple rules calling each other)
@@ -195,100 +266,100 @@ intent:
     5. An invoice is critical when it is both important and overdue.
 
 verbose:
-    @verbose 0.1.0
+@verbose 0.1.0
 
-    concept Invoice
-      @intention: "An invoice has an amount, a tax rate, and a number of days overdue"
-      @source: business.intent:1
+concept Invoice
+  @intention: "An invoice has an amount, a tax rate, and a number of days overdue"
+  @source: business.intent:1
 
-      fields:
-        amount       : number
-        tax_rate     : number
-        days_overdue : number
-
-
-    rule total_with_tax
-      @intention: "The total with tax is amount plus amount times the tax rate divided by 100"
-      @source: business.intent:2
-
-      input:
-        i : Invoice
-
-      output:
-        total : number
-
-      logic:
-        total = i.amount + i.amount * i.tax_rate / 100
-
-      proofs:
-        purity:
-          reads   : [i.amount, i.tax_rate]
-          calls   : []
-        termination:
-          bound : 3
+  fields:
+    amount       : number
+    tax_rate     : number
+    days_overdue : number
 
 
-    rule important_invoice
-      @intention: "An invoice is important when its total exceeds 10000"
-      @source: business.intent:3
+rule total_with_tax
+  @intention: "The total with tax is amount plus amount times the tax rate divided by 100"
+  @source: business.intent:2
 
-      input:
-        i : Invoice
+  input:
+    i : Invoice
 
-      output:
-        important : bool
+  output:
+    total : number
 
-      logic:
-        important = total_with_tax(i) > 10000
+  logic:
+    total = i.amount + i.amount * i.tax_rate / 100
 
-      proofs:
-        purity:
-          reads   : [i]
-          calls   : [total_with_tax]
-        termination:
-          bound : 2
-
-
-    rule overdue_invoice
-      @intention: "An invoice is overdue when it has more than 30 days overdue"
-      @source: business.intent:4
-
-      input:
-        i : Invoice
-
-      output:
-        overdue : bool
-
-      logic:
-        overdue = i.days_overdue > 30
-
-      proofs:
-        purity:
-          reads   : [i.days_overdue]
-          calls   : []
-        termination:
-          bound : 1
+  proofs:
+    purity:
+      reads   : [i.amount, i.tax_rate]
+      calls   : []
+    termination:
+      bound : 3
 
 
-    rule critical_invoice
-      @intention: "An invoice is critical when it is both important and overdue"
-      @source: business.intent:5
+rule important_invoice
+  @intention: "An invoice is important when its total exceeds 10000"
+  @source: business.intent:3
 
-      input:
-        i : Invoice
+  input:
+    i : Invoice
 
-      output:
-        critical : bool
+  output:
+    important : bool
 
-      logic:
-        critical = important_invoice(i) and overdue_invoice(i)
+  logic:
+    important = total_with_tax(i) > 10000
 
-      proofs:
-        purity:
-          reads   : [i]
-          calls   : [important_invoice, overdue_invoice]
-        termination:
-          bound : 3
+  proofs:
+    purity:
+      reads   : [i]
+      calls   : [total_with_tax]
+    termination:
+      bound : 2
+
+
+rule overdue_invoice
+  @intention: "An invoice is overdue when it has more than 30 days overdue"
+  @source: business.intent:4
+
+  input:
+    i : Invoice
+
+  output:
+    overdue : bool
+
+  logic:
+    overdue = i.days_overdue > 30
+
+  proofs:
+    purity:
+      reads   : [i.days_overdue]
+      calls   : []
+    termination:
+      bound : 1
+
+
+rule critical_invoice
+  @intention: "An invoice is critical when it is both important and overdue"
+  @source: business.intent:5
+
+  input:
+    i : Invoice
+
+  output:
+    critical : bool
+
+  logic:
+    critical = important_invoice(i) and overdue_invoice(i)
+
+  proofs:
+    purity:
+      reads   : [i]
+      calls   : [important_invoice, overdue_invoice]
+    termination:
+      bound : 3
 
 
 ### Example 3 — collections + quantifiers
@@ -301,87 +372,87 @@ intent:
     5. A client is at risk when any of their invoices are overdue.
 
 verbose:
-    @verbose 0.1.0
+@verbose 0.1.0
 
-    concept Invoice
-      @intention: "An invoice has an amount and a number of days overdue"
-      @source: collections.intent:1
+concept Invoice
+  @intention: "An invoice has an amount and a number of days overdue"
+  @source: collections.intent:1
 
-      fields:
-        amount       : number
-        days_overdue : number
-
-
-    concept Client
-      @intention: "A client has a name and a list of invoices"
-      @source: collections.intent:2
-
-      fields:
-        name     : text
-        invoices : collection(Invoice)
+  fields:
+    amount       : number
+    days_overdue : number
 
 
-    rule invoice_overdue
-      @intention: "An invoice is overdue when it has more than 30 days overdue"
-      @source: collections.intent:3
+concept Client
+  @intention: "A client has a name and a list of invoices"
+  @source: collections.intent:2
 
-      input:
-        inv : Invoice
-
-      output:
-        overdue : bool
-
-      logic:
-        overdue = inv.days_overdue > 30
-
-      proofs:
-        purity:
-          reads   : [inv.days_overdue]
-          calls   : []
-        termination:
-          bound : 1
+  fields:
+    name     : text
+    invoices : collection(Invoice)
 
 
-    rule client_blocked
-      @intention: "A client is blocked when all their invoices are overdue"
-      @source: collections.intent:4
+rule invoice_overdue
+  @intention: "An invoice is overdue when it has more than 30 days overdue"
+  @source: collections.intent:3
 
-      input:
-        c : Client
+  input:
+    inv : Invoice
 
-      output:
-        blocked : bool
+  output:
+    overdue : bool
 
-      logic:
-        blocked = all(c.invoices, inv => invoice_overdue(inv))
+  logic:
+    overdue = inv.days_overdue > 30
 
-      proofs:
-        purity:
-          reads   : [c.invoices]
-          calls   : [invoice_overdue]
-        termination:
-          bound : 2
+  proofs:
+    purity:
+      reads   : [inv.days_overdue]
+      calls   : []
+    termination:
+      bound : 1
 
 
-    rule client_at_risk
-      @intention: "A client is at risk when any of their invoices are overdue"
-      @source: collections.intent:5
+rule client_blocked
+  @intention: "A client is blocked when all their invoices are overdue"
+  @source: collections.intent:4
 
-      input:
-        c : Client
+  input:
+    c : Client
 
-      output:
-        at_risk : bool
+  output:
+    blocked : bool
 
-      logic:
-        at_risk = any(c.invoices, inv => invoice_overdue(inv))
+  logic:
+    blocked = all(c.invoices, inv => invoice_overdue(inv))
 
-      proofs:
-        purity:
-          reads   : [c.invoices]
-          calls   : [invoice_overdue]
-        termination:
-          bound : 2
+  proofs:
+    purity:
+      reads   : [c.invoices]
+      calls   : [invoice_overdue]
+    termination:
+      bound : 2
+
+
+rule client_at_risk
+  @intention: "A client is at risk when any of their invoices are overdue"
+  @source: collections.intent:5
+
+  input:
+    c : Client
+
+  output:
+    at_risk : bool
+
+  logic:
+    at_risk = any(c.invoices, inv => invoice_overdue(inv))
+
+  proofs:
+    purity:
+      reads   : [c.invoices]
+      calls   : [invoice_overdue]
+    termination:
+      bound : 2
 """
 
 
