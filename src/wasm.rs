@@ -78,6 +78,35 @@ struct ConcatLocals {
     arg_len: u32,
 }
 
+/// The five i32 locals reserved when a rule uses any of the W3c text
+/// primitives that need 2-arg compare loops (`starts_with`, `ends_with`,
+/// `contains`). `length` reuses the first slot to drop the unwanted
+/// `ptr` half of a text value off the stack. `parse_int` and
+/// `json_escape` route through helper functions so they don't draw on
+/// these locals at all.
+///
+/// Kept SEPARATE from `ConcatLocals` because a primitive can appear
+/// inside a concat arg (e.g. `concat("...", starts_with(a, b))`). The
+/// inner call writes its own scratches; reusing concat's would clobber
+/// the outer concat's per-call temporaries mid-emission.
+#[derive(Debug, Clone, Copy)]
+struct TextPrimLocals {
+    /// Haystack `(ptr, len)` of a 2-arg primitive. Also doubles as the
+    /// single-arg slot for `length`.
+    h_ptr: u32,
+    h_len: u32,
+    /// Needle `(ptr, len)` of a 2-arg primitive. Unused for `length`.
+    n_ptr: u32,
+    n_len: u32,
+    /// Outer loop counter for `contains` (candidate offset in haystack)
+    /// and forward index for `starts_with` / `ends_with`.
+    i: u32,
+    /// Inner loop counter for `contains` (byte offset into the needle
+    /// during the per-candidate compare). `starts_with` / `ends_with`
+    /// only need one counter and don't touch this slot.
+    j: u32,
+}
+
 /// Per-emit context bundle. Keeps the emit_wasm_expr signature
 /// short as the backend grows; everything the recursive emitter
 /// needs to look up sits here.
@@ -95,10 +124,20 @@ struct WasmCtx<'a> {
     /// scratch locals reserved for the bump allocator and concat
     /// temporaries.
     concat: Option<ConcatLocals>,
+    /// `Some` iff the rule uses any W3c text primitive. Carries the
+    /// five i32 scratch locals used by `length` and the byte-compare
+    /// loops of `starts_with` / `ends_with` / `contains`.
+    text_prim: Option<TextPrimLocals>,
     /// Function index of the inlined itoa helper, if the module
     /// emits one. `None` means concat with numeric args is refused
     /// (the caller has already verified this won't happen).
     itoa_func_idx: Option<u32>,
+    /// Function index of the inlined parse_int helper. `None` if the
+    /// rule never references `parse_int(...)`.
+    parse_int_func_idx: Option<u32>,
+    /// Function index of the inlined json_escape helper. `None` if the
+    /// rule never references `json_escape(...)`.
+    json_escape_func_idx: Option<u32>,
 }
 
 #[derive(Debug)]
@@ -272,8 +311,16 @@ pub fn compile_wasm(
     let scratch_base_i64 = total_param_slots + n_i64_bindings;
     let i32_base = total_param_slots + n_i64_locals;
 
+    // json_escape allocates in the bump region too — force the concat
+    // scratches (which carry $bump_ptr) to be reserved even when the
+    // rule has no explicit `concat(...)`. Over-reserves 4 scratches
+    // (cursor/result_ptr/arg_ptr/arg_len) that json_escape doesn't
+    // touch — ~16 bytes of WASM module — in exchange for keeping the
+    // allocator state in one well-known place.
     let needs_concat = expr_uses_concat(&rule.logic.value)
-        || rule.logic.bindings.iter().any(|(_, e)| expr_uses_concat(e));
+        || rule.logic.bindings.iter().any(|(_, e)| expr_uses_concat(e))
+        || expr_uses_json_escape(&rule.logic.value)
+        || rule.logic.bindings.iter().any(|(_, e)| expr_uses_json_escape(e));
 
     // Refuse nested concat upfront with a clear pointer to the
     // workaround.
@@ -286,10 +333,16 @@ pub fn compile_wasm(
     }
 
     // i32 group total: text-binding ptr/len pairs + concat scratches
+    //                  + W3c text-primitive scratches (5 i32 if any of
+    //                  length/parse_int/json_escape/starts_with/ends_with
+    //                  /contains appears in the rule).
+    let needs_text_prim = expr_uses_text_primitive(&rule.logic.value)
+        || rule.logic.bindings.iter().any(|(_, e)| expr_uses_text_primitive(e));
     let n_concat_locals: u32 = if needs_concat { 5 } else { 0 };
-    let n_i32_locals = n_text_bindings * 2 + n_concat_locals;
+    let n_text_prim_locals: u32 = if needs_text_prim { 6 } else { 0 };
+    let n_i32_locals = n_text_bindings * 2 + n_concat_locals + n_text_prim_locals;
 
-    // Concat scratch indices (just past the text bindings in the i32 group)
+    // Concat scratch indices (just past the text bindings in the i32 group).
     let concat_locals: Option<ConcatLocals> = if needs_concat {
         let base = i32_base + n_text_bindings * 2;
         Some(ConcatLocals {
@@ -298,6 +351,21 @@ pub fn compile_wasm(
             result_ptr: base + 2,
             arg_ptr: base + 3,
             arg_len: base + 4,
+        })
+    } else {
+        None
+    };
+
+    // Text-primitive scratch indices (just past the concat scratches).
+    let text_prim_locals: Option<TextPrimLocals> = if needs_text_prim {
+        let base = i32_base + n_text_bindings * 2 + n_concat_locals;
+        Some(TextPrimLocals {
+            h_ptr: base,
+            h_len: base + 1,
+            n_ptr: base + 2,
+            n_len: base + 3,
+            i: base + 4,
+            j: base + 5,
         })
     } else {
         None
@@ -324,11 +392,30 @@ pub fn compile_wasm(
     // the i64 group; just past them is `scratch_base_i64`.
     debug_assert_eq!(i64_cursor, scratch_base_i64);
 
-    // --- Detect itoa need -----------------------------------------
+    // --- Detect helper-function needs -----------------------------
     let needs_itoa = expr_concat_has_number_arg(&rule.logic.value, &field_shapes, &binding_shapes)
         || rule.logic.bindings.iter().any(|(_, e)| {
             expr_concat_has_number_arg(e, &field_shapes, &binding_shapes)
         });
+    let needs_parse_int = expr_uses_parse_int(&rule.logic.value)
+        || rule.logic.bindings.iter().any(|(_, e)| expr_uses_parse_int(e));
+    let needs_json_escape = expr_uses_json_escape(&rule.logic.value)
+        || rule.logic.bindings.iter().any(|(_, e)| expr_uses_json_escape(e));
+
+    // Helper-function indices. Func 0 is always the rule. Helpers
+    // are appended in a fixed order (itoa, parse_int, json_escape)
+    // so per-helper tests can predict their indices.
+    let mut next_helper_idx: u32 = 1;
+    let itoa_func_idx = if needs_itoa {
+        let idx = next_helper_idx; next_helper_idx += 1; Some(idx)
+    } else { None };
+    let parse_int_func_idx = if needs_parse_int {
+        let idx = next_helper_idx; next_helper_idx += 1; Some(idx)
+    } else { None };
+    let json_escape_func_idx = if needs_json_escape {
+        let idx = next_helper_idx; next_helper_idx += 1; Some(idx)
+    } else { None };
+    let n_helpers: u32 = (needs_itoa as u32) + (needs_parse_int as u32) + (needs_json_escape as u32);
 
     // --- ALLOC_BASE for the bump allocator ------------------------
     // Pick the first 16-byte-aligned address past all literals. If
@@ -345,11 +432,11 @@ pub fn compile_wasm(
     module.extend_from_slice(&1u32.to_le_bytes()); // version 1
 
     // === Type section (function signature) ===
-    // 1 type if no itoa, 2 types otherwise. Itoa's signature is
-    // (i64) -> (i32, i32) — the same shape every time, so we can
-    // hard-code its type bytes.
+    // Type 0 is always the rule's signature. Helper functions append
+    // their own types in a fixed order (itoa → parse_int → json_escape)
+    // so type/func indices line up with `next_helper_idx` above.
     let mut type_section = Vec::new();
-    let n_types: u32 = if needs_itoa { 2 } else { 1 };
+    let n_types: u32 = 1 + n_helpers;
     emit_leb128(&mut type_section, n_types as u64);
     type_section.push(0x60);                         // type 0: rule
     emit_leb128(&mut type_section, param_types.len() as u64);
@@ -357,17 +444,33 @@ pub fn compile_wasm(
     emit_leb128(&mut type_section, result_types.len() as u64);
     type_section.extend_from_slice(&result_types);
     if needs_itoa {
-        // type 1: itoa (i64) -> (i32, i32)
+        // itoa: (i64) -> (i32, i32)
         type_section.extend_from_slice(&[0x60, 0x01, 0x7E, 0x02, 0x7F, 0x7F]);
+    }
+    if needs_parse_int {
+        // parse_int: (i32 ptr, i32 len) -> i64
+        type_section.extend_from_slice(&[0x60, 0x02, 0x7F, 0x7F, 0x01, 0x7E]);
+    }
+    if needs_json_escape {
+        // json_escape: (i32 in_ptr, i32 in_len, i32 bump_ptr) ->
+        //              (i32 out_ptr, i32 out_len, i32 new_bump_ptr)
+        // 3-result return uses WASM 2.0 multi-value, supported in Node.
+        type_section.extend_from_slice(&[0x60, 0x03, 0x7F, 0x7F, 0x7F, 0x03, 0x7F, 0x7F, 0x7F]);
     }
     emit_section(&mut module, 1, &type_section);
 
     // === Function section ===
-    let func_section: Vec<u8> = if needs_itoa {
-        vec![2, 0, 1] // 2 funcs: func 0 = type 0 (rule), func 1 = type 1 (itoa)
-    } else {
-        vec![1, 0]
-    };
+    // (1 + n_helpers) funcs; each is its own type index in the same
+    // order: rule (type 0), then itoa, parse_int, json_escape (in
+    // declared order, skipping any that aren't needed).
+    let mut func_section: Vec<u8> = Vec::new();
+    emit_leb128(&mut func_section, 1 + n_helpers as u64);
+    func_section.push(0); // rule = type 0
+    let mut next_type_idx: u32 = 1;
+    if needs_itoa { func_section.push(next_type_idx as u8); next_type_idx += 1; }
+    if needs_parse_int { func_section.push(next_type_idx as u8); next_type_idx += 1; }
+    if needs_json_escape { func_section.push(next_type_idx as u8); next_type_idx += 1; }
+    let _ = next_type_idx;
     emit_section(&mut module, 3, &func_section);
 
     // === Memory section (only if text I/O present) ===
@@ -434,7 +537,10 @@ pub fn compile_wasm(
         text_literals: &text_literals,
         scratch_base_i64,
         concat: concat_locals,
-        itoa_func_idx: if needs_itoa { Some(1) } else { None },
+        text_prim: text_prim_locals,
+        itoa_func_idx,
+        parse_int_func_idx,
+        json_escape_func_idx,
     };
 
     // Emit let binding computations. Text bindings leave (ptr, len)
@@ -466,17 +572,20 @@ pub fn compile_wasm(
 
     body.push(0x0B); // end
 
-    // Itoa function body (func 1) — only emitted when needs_itoa.
-    let itoa_body: Vec<u8> = if needs_itoa { build_itoa_body() } else { Vec::new() };
+    // Helper function bodies. Order MUST match the type-section /
+    // function-section emission above (itoa, parse_int, json_escape).
+    let mut helper_bodies: Vec<Vec<u8>> = Vec::new();
+    if needs_itoa { helper_bodies.push(build_itoa_body()); }
+    if needs_parse_int { helper_bodies.push(build_parse_int_body()); }
+    if needs_json_escape { helper_bodies.push(build_json_escape_body()); }
 
     let mut code_section = Vec::new();
-    let n_bodies: u32 = if needs_itoa { 2 } else { 1 };
-    emit_leb128(&mut code_section, n_bodies as u64);
+    emit_leb128(&mut code_section, 1 + helper_bodies.len() as u64);
     emit_leb128(&mut code_section, body.len() as u64);
     code_section.extend_from_slice(&body);
-    if needs_itoa {
-        emit_leb128(&mut code_section, itoa_body.len() as u64);
-        code_section.extend_from_slice(&itoa_body);
+    for h in &helper_bodies {
+        emit_leb128(&mut code_section, h.len() as u64);
+        code_section.extend_from_slice(h);
     }
     emit_section(&mut module, 10, &code_section);
 
@@ -592,6 +701,216 @@ fn build_itoa_body() -> Vec<u8> {
     ]
 }
 
+/// Build the WASM body for the parse_int helper.
+///
+/// Signature: `(i32 ptr, i32 len) -> i64`. Strict scan: optional
+/// leading `-`, then 1+ ASCII digits, then end-of-input. Anything
+/// else (empty input, lone `-`, non-digit byte, trailing
+/// whitespace) traps via `unreachable` (0x00) — same fail-closed
+/// posture as native's sys_exit(1).
+///
+/// Locals (after the 2 i32 params at indices 0,1):
+///   2 = $val   (i64 accumulator)
+///   3 = $i     (i32 cursor)
+///   4 = $isNeg (i32 flag)
+///   5 = $byte  (i32 current byte, also reused as digit value)
+///
+/// Control flow note: the loop is wrapped in an outer `block`. Inside
+/// the loop body, `br 0` continues the loop (loop labels target the
+/// loop's start), `br 2` from inside an `if` exits the surrounding
+/// `block` (block labels target the block's END). A bare `br 1`
+/// from inside the loop body would also continue the loop, which is
+/// why the `block`/`loop` pairing is required for natural exits.
+fn build_parse_int_body() -> Vec<u8> {
+    vec![
+        // Locals: 2 groups
+        0x02,
+        0x01, 0x7E,                              // 1 × i64 ($val)
+        0x03, 0x7F,                              // 3 × i32 ($i, $isNeg, $byte)
+        // $val = 0; $i = 0; $isNeg = 0
+        0x42, 0x00, 0x21, 0x02,                  // i64.const 0; local.set 2
+        0x41, 0x00, 0x21, 0x03,                  // i32.const 0; local.set 3
+        0x41, 0x00, 0x21, 0x04,                  // i32.const 0; local.set 4
+        // If len == 0: trap (empty input rejected)
+        0x20, 0x01, 0x45, 0x04, 0x40, 0x00, 0x0B,// local.get 1; i32.eqz; if; unreachable; end
+        // First-byte check: is it '-' (45)?
+        0x20, 0x00, 0x2D, 0x00, 0x00,            // local.get 0; i32.load8_u offset=0
+        0x21, 0x05,                              // local.set $byte
+        0x20, 0x05, 0x41, 0x2D, 0x46,            // local.get $byte; i32.const 45; i32.eq
+        0x04, 0x40,                              // if (no result)
+            // $isNeg = 1; $i = 1
+            0x41, 0x01, 0x21, 0x04,
+            0x41, 0x01, 0x21, 0x03,
+            // If len == 1 (lone '-'): trap
+            0x20, 0x01, 0x41, 0x01, 0x46,        // local.get 1; i32.const 1; i32.eq
+            0x04, 0x40, 0x00, 0x0B,              // if; unreachable; end
+        0x0B,                                     // end if (negative branch)
+        // block + loop (br 2 from inside-if-inside-loop = exit block)
+        0x02, 0x40,                              // block (no result)
+            0x03, 0x40,                          //   loop (no result)
+                // exit: if $i >= $len, br 2 (out of block)
+                0x20, 0x03, 0x20, 0x01, 0x4E,    //     $i; $len; i32.ge_s
+                0x04, 0x40, 0x0C, 0x02, 0x0B,    //     if; br 2; end
+                // $byte = mem[$ptr + $i]
+                0x20, 0x00, 0x20, 0x03, 0x6A,    //     $ptr; $i; i32.add
+                0x2D, 0x00, 0x00,                //     i32.load8_u
+                0x21, 0x05,                      //     local.set $byte
+                // Trap if byte < '0' (48) or byte > '9' (57)
+                0x20, 0x05, 0x41, 0x30, 0x48,    //     $byte; 48; i32.lt_s
+                0x04, 0x40, 0x00, 0x0B,          //     if; unreachable; end
+                0x20, 0x05, 0x41, 0x39, 0x4A,    //     $byte; 57; i32.gt_s
+                0x04, 0x40, 0x00, 0x0B,          //     if; unreachable; end
+                // $val = $val * 10 + ($byte - 48)
+                0x20, 0x02, 0x42, 0x0A, 0x7E,    //     $val; 10; i64.mul
+                0x20, 0x05, 0x41, 0x30, 0x6B,    //     $byte; 48; i32.sub
+                0xAC,                             //     i64.extend_i32_s
+                0x7C,                             //     i64.add
+                0x21, 0x02,                      //     local.set $val
+                // $i++
+                0x20, 0x03, 0x41, 0x01, 0x6A, 0x21, 0x03,
+                0x0C, 0x00,                      //     br 0 (continue loop)
+            0x0B,                                 //   end loop
+        0x0B,                                     // end block
+        // If $isNeg: $val = -$val (0 - $val handles i64::MIN bit pattern)
+        0x20, 0x04,                              // local.get $isNeg
+        0x04, 0x40,                              // if
+            0x42, 0x00, 0x20, 0x02, 0x7D,        // i64.const 0; $val; i64.sub
+            0x21, 0x02,                          // local.set $val
+        0x0B,                                     // end if
+        // Return $val
+        0x20, 0x02,                              // local.get $val
+        0x0B,                                     // end func
+    ]
+}
+
+/// Build the WASM body for the json_escape helper.
+///
+/// Signature:
+///   `(i32 in_ptr, i32 in_len, i32 bump_ptr) ->
+///    (i32 out_ptr, i32 out_len, i32 new_bump_ptr)`
+///
+/// Walks the input text byte by byte and copies it to the bump
+/// region with JSON escaping applied:
+///   `"`  -> `\"`
+///   `\\` -> `\\\\`
+///   `\n` -> `\\n`
+///   `\r` -> `\\r`
+///   `\t` -> `\\t`
+///   bytes < 0x20 NOT covered by the above -> `\\u00XX` (6 bytes)
+///   anything else -> copied as-is (1 byte)
+///
+/// Returns the start of the escaped output (= bump_ptr at entry),
+/// its length, and the new bump_ptr to thread back to the caller's
+/// allocator local.
+///
+/// Locals (after the 3 i32 params):
+///   3 = $cursor    (write position, starts at $bump_ptr)
+///   4 = $i         (read position into in_ptr)
+///   5 = $byte      (current byte being processed)
+///   6 = $hex_lo    (low nibble for \u00XX path)
+fn build_json_escape_body() -> Vec<u8> {
+    // The body is a longer one; structured as init + loop + return.
+    let mut b = Vec::new();
+    // Locals: 1 group of 4 i32
+    b.extend_from_slice(&[0x01, 0x04, 0x7F]);
+    // $cursor = $bump_ptr (param 2)
+    b.extend_from_slice(&[0x20, 0x02, 0x21, 0x03]);
+    // $i = 0
+    b.extend_from_slice(&[0x41, 0x00, 0x21, 0x04]);
+    // block + loop wrapper so exit-cond `br N` actually exits past
+    // the loop. `br 0` continues, `br 2` from inside the if-inside-
+    // loop targets the surrounding block's end.
+    b.extend_from_slice(&[0x02, 0x40]);                    // block (no result)
+    b.extend_from_slice(&[0x03, 0x40]);                    // loop (no result)
+        // if $i >= $in_len: br 2 (exit block, past loop)
+        b.extend_from_slice(&[0x20, 0x04, 0x20, 0x01, 0x4E]); // $i >= $in_len
+        b.extend_from_slice(&[0x04, 0x40, 0x0C, 0x02, 0x0B]); // if; br 2; end
+        // $byte = mem[$in_ptr + $i]
+        b.extend_from_slice(&[0x20, 0x00, 0x20, 0x04, 0x6A, 0x2D, 0x00, 0x00, 0x21, 0x05]);
+        // Decision tree on $byte. We use a chain of if/else rather
+        // than a single br_table because the matched values are
+        // sparse and the tree keeps the body readable.
+        //
+        // case $byte == '"' (34): write \" (2 bytes)
+        b.extend_from_slice(&[0x20, 0x05, 0x41, 0x22, 0x46]); // $byte; 34; i32.eq
+        b.extend_from_slice(&[0x04, 0x40]);                    // if
+            // mem[$cursor] = '\\'; mem[$cursor+1] = '"'; cursor += 2
+            b.extend_from_slice(&[0x20, 0x03, 0x41, 0xDC, 0x00, 0x3A, 0x00, 0x00]);            // store '\\'
+            b.extend_from_slice(&[0x20, 0x03, 0x41, 0x01, 0x6A, 0x41, 0x22, 0x3A, 0x00, 0x00]); // store '"' at cursor+1
+            b.extend_from_slice(&[0x20, 0x03, 0x41, 0x02, 0x6A, 0x21, 0x03]);            // cursor += 2
+        b.extend_from_slice(&[0x05]);                          // else
+        // case $byte == '\\' (92): write \\ (2 bytes)
+        b.extend_from_slice(&[0x20, 0x05, 0x41, 0xDC, 0x00, 0x46]);  // $byte == 92
+        b.extend_from_slice(&[0x04, 0x40]);                    // if
+            b.extend_from_slice(&[0x20, 0x03, 0x41, 0xDC, 0x00, 0x3A, 0x00, 0x00]);
+            b.extend_from_slice(&[0x20, 0x03, 0x41, 0x01, 0x6A, 0x41, 0xDC, 0x00, 0x3A, 0x00, 0x00]);
+            b.extend_from_slice(&[0x20, 0x03, 0x41, 0x02, 0x6A, 0x21, 0x03]);
+        b.extend_from_slice(&[0x05]);                          // else
+        // case $byte == '\n' (10): write \n
+        b.extend_from_slice(&[0x20, 0x05, 0x41, 0x0A, 0x46]);
+        b.extend_from_slice(&[0x04, 0x40]);
+            b.extend_from_slice(&[0x20, 0x03, 0x41, 0xDC, 0x00, 0x3A, 0x00, 0x00]);
+            b.extend_from_slice(&[0x20, 0x03, 0x41, 0x01, 0x6A, 0x41, 0xEE, 0x00, 0x3A, 0x00, 0x00]); // 'n' = 110
+            b.extend_from_slice(&[0x20, 0x03, 0x41, 0x02, 0x6A, 0x21, 0x03]);
+        b.extend_from_slice(&[0x05]);                          // else
+        // case $byte == '\r' (13): write \r
+        b.extend_from_slice(&[0x20, 0x05, 0x41, 0x0D, 0x46]);
+        b.extend_from_slice(&[0x04, 0x40]);
+            b.extend_from_slice(&[0x20, 0x03, 0x41, 0xDC, 0x00, 0x3A, 0x00, 0x00]);
+            b.extend_from_slice(&[0x20, 0x03, 0x41, 0x01, 0x6A, 0x41, 0xF2, 0x00, 0x3A, 0x00, 0x00]); // 'r' = 114
+            b.extend_from_slice(&[0x20, 0x03, 0x41, 0x02, 0x6A, 0x21, 0x03]);
+        b.extend_from_slice(&[0x05]);                          // else
+        // case $byte == '\t' (9): write \t
+        b.extend_from_slice(&[0x20, 0x05, 0x41, 0x09, 0x46]);
+        b.extend_from_slice(&[0x04, 0x40]);
+            b.extend_from_slice(&[0x20, 0x03, 0x41, 0xDC, 0x00, 0x3A, 0x00, 0x00]);
+            b.extend_from_slice(&[0x20, 0x03, 0x41, 0x01, 0x6A, 0x41, 0xF4, 0x00, 0x3A, 0x00, 0x00]); // 't' = 116
+            b.extend_from_slice(&[0x20, 0x03, 0x41, 0x02, 0x6A, 0x21, 0x03]);
+        b.extend_from_slice(&[0x05]);                          // else
+        // case $byte < 0x20: write \u00XX (6 bytes)
+        b.extend_from_slice(&[0x20, 0x05, 0x41, 0x20, 0x48]); // $byte; 32; i32.lt_s
+        b.extend_from_slice(&[0x04, 0x40]);                    // if
+            // \, u, 0, 0
+            b.extend_from_slice(&[0x20, 0x03, 0x41, 0xDC, 0x00, 0x3A, 0x00, 0x00]);
+            b.extend_from_slice(&[0x20, 0x03, 0x41, 0x01, 0x6A, 0x41, 0xF5, 0x00, 0x3A, 0x00, 0x00]); // 'u'
+            b.extend_from_slice(&[0x20, 0x03, 0x41, 0x02, 0x6A, 0x41, 0x30, 0x3A, 0x00, 0x00]); // '0'
+            b.extend_from_slice(&[0x20, 0x03, 0x41, 0x03, 0x6A, 0x41, 0x30, 0x3A, 0x00, 0x00]); // '0'
+            // High nibble: ($byte >> 4) & 0xF; since byte < 0x20, this is 0 or 1
+            b.extend_from_slice(&[0x20, 0x03, 0x41, 0x04, 0x6A]);                 // dest = cursor + 4
+            b.extend_from_slice(&[0x20, 0x05, 0x41, 0x04, 0x76]);                 // $byte >> 4 (signed shift, but byte < 32 so 0/1)
+            b.extend_from_slice(&[0x41, 0x30, 0x6A]);                             // + '0' (gives '0' or '1')
+            b.extend_from_slice(&[0x3A, 0x00, 0x00]);                             // i32.store8
+            // Low nibble: $byte & 0xF, then 0..9 -> '0'..'9', 10..15 -> 'a'..'f'
+            // Compute lo = $byte & 0xF; if lo < 10 then lo + '0' else lo + ('a' - 10)
+            b.extend_from_slice(&[0x20, 0x05, 0x41, 0x0F, 0x71, 0x21, 0x06]);     // $hex_lo = $byte & 0xF
+            b.extend_from_slice(&[0x20, 0x03, 0x41, 0x05, 0x6A]);                 // dest = cursor + 5
+            // Choose '0'+lo vs 'a'-10+lo via select
+            b.extend_from_slice(&[0x20, 0x06, 0x41, 0x30, 0x6A]);                 // val_1: lo + '0' (for 0-9)
+            b.extend_from_slice(&[0x20, 0x06, 0x41, 0xD7, 0x00, 0x6A]);                 // val_2: lo + 87 ('a'-10) (for 10-15)
+            b.extend_from_slice(&[0x20, 0x06, 0x41, 0x0A, 0x48]);                 // cond: lo < 10 (i32.lt_s)
+            b.extend_from_slice(&[0x1B]);                                          // select
+            b.extend_from_slice(&[0x3A, 0x00, 0x00]);                             // i32.store8
+            // cursor += 6
+            b.extend_from_slice(&[0x20, 0x03, 0x41, 0x06, 0x6A, 0x21, 0x03]);
+        b.extend_from_slice(&[0x05]);                          // else (default: copy 1 byte)
+            b.extend_from_slice(&[0x20, 0x03, 0x20, 0x05, 0x3A, 0x00, 0x00]);     // mem[cursor] = $byte
+            b.extend_from_slice(&[0x20, 0x03, 0x41, 0x01, 0x6A, 0x21, 0x03]);     // cursor++
+        // Close all 6 if/else blocks
+        for _ in 0..6 { b.push(0x0B); }
+        // $i++
+        b.extend_from_slice(&[0x20, 0x04, 0x41, 0x01, 0x6A, 0x21, 0x04]);
+        // br 0 (continue loop)
+        b.extend_from_slice(&[0x0C, 0x00]);
+    b.extend_from_slice(&[0x0B]);                              // end loop
+    b.extend_from_slice(&[0x0B]);                              // end block (paired with the wrapper added above)
+    // Return: ($bump_ptr, $cursor - $bump_ptr, $cursor)
+    b.extend_from_slice(&[0x20, 0x02]);                        // out_ptr = $bump_ptr
+    b.extend_from_slice(&[0x20, 0x03, 0x20, 0x02, 0x6B]);      // out_len = $cursor - $bump_ptr
+    b.extend_from_slice(&[0x20, 0x03]);                        // new_bump = $cursor
+    b.push(0x0B);                                              // end func
+    b
+}
+
 /// Recursively enumerate every text literal occurring in `expr`. The
 /// callback is invoked once per occurrence — dedup is the caller's
 /// job (so the offset map stays in one place).
@@ -604,7 +923,66 @@ fn walk_text_literals<F: FnMut(&str)>(expr: &Expr, f: &mut F) {
         Expr::Min(a, b) | Expr::Max(a, b) => { walk_text_literals(a, f); walk_text_literals(b, f); }
         Expr::Call(_, args) => { for a in args { walk_text_literals(a, f); } }
         Expr::Concat(args) => { for a in args { walk_text_literals(a, f); } }
+        // W3c text primitives: literals can appear in their args (e.g.
+        // `starts_with(req.path, "/api/v1/")`). Recurse into each.
+        Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i) => walk_text_literals(i, f),
+        Expr::StartsWith(h, n) | Expr::EndsWith(h, n) | Expr::Contains(h, n) => {
+            walk_text_literals(h, f); walk_text_literals(n, f);
+        }
         _ => {}
+    }
+}
+
+/// True iff the expression (or any sub-expression) uses one of the W3c
+/// text primitives. Drives reservation of `TextPrimLocals` and
+/// emission of helper functions. The 1-arg and 2-arg primitives all
+/// flip the same bit — the per-helper detection lives in
+/// `expr_uses_parse_int` / `expr_uses_json_escape` below.
+fn expr_uses_text_primitive(expr: &Expr) -> bool {
+    match expr {
+        Expr::Length(_) | Expr::ParseInt(_) | Expr::JsonEscape(_)
+        | Expr::StartsWith(_, _) | Expr::EndsWith(_, _) | Expr::Contains(_, _) => true,
+        Expr::Binary(_, l, r) => expr_uses_text_primitive(l) || expr_uses_text_primitive(r),
+        Expr::If(c, t, e) => expr_uses_text_primitive(c) || expr_uses_text_primitive(t) || expr_uses_text_primitive(e),
+        Expr::Not(i) | Expr::Neg(i) | Expr::Abs(i) => expr_uses_text_primitive(i),
+        Expr::Min(a, b) | Expr::Max(a, b) => expr_uses_text_primitive(a) || expr_uses_text_primitive(b),
+        Expr::Call(_, args) => args.iter().any(expr_uses_text_primitive),
+        Expr::Concat(args) => args.iter().any(expr_uses_text_primitive),
+        _ => false,
+    }
+}
+
+fn expr_uses_parse_int(expr: &Expr) -> bool {
+    match expr {
+        Expr::ParseInt(_) => true,
+        Expr::Binary(_, l, r) => expr_uses_parse_int(l) || expr_uses_parse_int(r),
+        Expr::If(c, t, e) => expr_uses_parse_int(c) || expr_uses_parse_int(t) || expr_uses_parse_int(e),
+        Expr::Not(i) | Expr::Neg(i) | Expr::Abs(i) => expr_uses_parse_int(i),
+        Expr::Min(a, b) | Expr::Max(a, b) => expr_uses_parse_int(a) || expr_uses_parse_int(b),
+        Expr::Call(_, args) => args.iter().any(expr_uses_parse_int),
+        Expr::Concat(args) => args.iter().any(expr_uses_parse_int),
+        Expr::Length(i) | Expr::JsonEscape(i) => expr_uses_parse_int(i),
+        Expr::StartsWith(h, n) | Expr::EndsWith(h, n) | Expr::Contains(h, n) => {
+            expr_uses_parse_int(h) || expr_uses_parse_int(n)
+        }
+        _ => false,
+    }
+}
+
+fn expr_uses_json_escape(expr: &Expr) -> bool {
+    match expr {
+        Expr::JsonEscape(_) => true,
+        Expr::Binary(_, l, r) => expr_uses_json_escape(l) || expr_uses_json_escape(r),
+        Expr::If(c, t, e) => expr_uses_json_escape(c) || expr_uses_json_escape(t) || expr_uses_json_escape(e),
+        Expr::Not(i) | Expr::Neg(i) | Expr::Abs(i) => expr_uses_json_escape(i),
+        Expr::Min(a, b) | Expr::Max(a, b) => expr_uses_json_escape(a) || expr_uses_json_escape(b),
+        Expr::Call(_, args) => args.iter().any(expr_uses_json_escape),
+        Expr::Concat(args) => args.iter().any(expr_uses_json_escape),
+        Expr::Length(i) | Expr::ParseInt(i) => expr_uses_json_escape(i),
+        Expr::StartsWith(h, n) | Expr::EndsWith(h, n) | Expr::Contains(h, n) => {
+            expr_uses_json_escape(h) || expr_uses_json_escape(n)
+        }
+        _ => false,
     }
 }
 
@@ -628,6 +1006,10 @@ fn expr_yields_text(
     match expr {
         Expr::Text(_) => true,
         Expr::Concat(_) => true,
+        // W3c: json_escape returns text (transforms input via the bump
+        // allocator). length / parse_int / starts_with / ends_with /
+        // contains all return number or bool, NOT text.
+        Expr::JsonEscape(_) => true,
         Expr::Field(base, name) => {
             matches!(base.as_ref(), Expr::Ident(_))
                 && matches!(field_shapes.get(name.as_str()), Some(FieldShape::Text { .. }))
@@ -654,6 +1036,13 @@ fn expr_uses_concat(expr: &Expr) -> bool {
         Expr::Not(inner) | Expr::Neg(inner) | Expr::Abs(inner) => expr_uses_concat(inner),
         Expr::Min(a, b) | Expr::Max(a, b) => expr_uses_concat(a) || expr_uses_concat(b),
         Expr::Call(_, args) => args.iter().any(expr_uses_concat),
+        // W3c text primitives: their args may contain a concat (e.g.
+        // `starts_with(concat("/api/v", n), "...")`). Recurse so the
+        // allocator scratches get reserved.
+        Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i) => expr_uses_concat(i),
+        Expr::StartsWith(h, n) | Expr::EndsWith(h, n) | Expr::Contains(h, n) => {
+            expr_uses_concat(h) || expr_uses_concat(n)
+        }
         _ => false,
     }
 }
@@ -686,6 +1075,13 @@ fn expr_concat_has_number_arg(
                 || expr_concat_has_number_arg(b, field_shapes, binding_shapes)
         }
         Expr::Call(_, args) => args.iter().any(|a| expr_concat_has_number_arg(a, field_shapes, binding_shapes)),
+        Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i) => {
+            expr_concat_has_number_arg(i, field_shapes, binding_shapes)
+        }
+        Expr::StartsWith(h, n) | Expr::EndsWith(h, n) | Expr::Contains(h, n) => {
+            expr_concat_has_number_arg(h, field_shapes, binding_shapes)
+                || expr_concat_has_number_arg(n, field_shapes, binding_shapes)
+        }
         _ => false,
     }
 }
@@ -705,6 +1101,10 @@ fn expr_has_nested_concat(expr: &Expr) -> bool {
             Expr::Not(i) | Expr::Neg(i) | Expr::Abs(i) => inside_concat(i),
             Expr::Min(a, b) | Expr::Max(a, b) => inside_concat(a) || inside_concat(b),
             Expr::Call(_, args) => args.iter().any(inside_concat),
+            Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i) => inside_concat(i),
+            Expr::StartsWith(h, n) | Expr::EndsWith(h, n) | Expr::Contains(h, n) => {
+                inside_concat(h) || inside_concat(n)
+            }
             _ => false,
         }
     }
@@ -715,6 +1115,10 @@ fn expr_has_nested_concat(expr: &Expr) -> bool {
         Expr::Not(i) | Expr::Neg(i) | Expr::Abs(i) => expr_has_nested_concat(i),
         Expr::Min(a, b) | Expr::Max(a, b) => expr_has_nested_concat(a) || expr_has_nested_concat(b),
         Expr::Call(_, args) => args.iter().any(expr_has_nested_concat),
+        Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i) => expr_has_nested_concat(i),
+        Expr::StartsWith(h, n) | Expr::EndsWith(h, n) | Expr::Contains(h, n) => {
+            expr_has_nested_concat(h) || expr_has_nested_concat(n)
+        }
         _ => false,
     }
 }
@@ -966,15 +1370,300 @@ fn emit_wasm_expr(
                 binding_shapes: ctx.binding_shapes,
                 text_literals: ctx.text_literals,
                 scratch_base_i64: ctx.scratch_base_i64,
+                text_prim: ctx.text_prim,
+                parse_int_func_idx: ctx.parse_int_func_idx,
+                json_escape_func_idx: ctx.json_escape_func_idx,
                 concat: ctx.concat,
                 itoa_func_idx: ctx.itoa_func_idx,
             };
             emit_wasm_expr(code, &called.logic.value, &callee_ctx)
         }
+        Expr::Length(inner) => {
+            // text → i64 (number).
+            // Stack discipline: eval inner → [ptr, len]. We want
+            // just len, widened to i64 (Verbose `number` is i64
+            // throughout the backend). WASM has no swap or rot, so
+            // we park len, drop ptr, restore len, extend.
+            let tp = ctx.text_prim.ok_or_else(|| WasmError {
+                message: "internal: Expr::Length reached emit without text-prim scratches".into(),
+            })?;
+            emit_wasm_expr(code, inner, ctx)?;        // [ptr, len]
+            code.push(0x21); emit_leb128(code, tp.h_len as u64);  // pop len → $h_len
+            code.push(0x1A);                                       // drop ptr
+            code.push(0x20); emit_leb128(code, tp.h_len as u64);  // push $h_len
+            code.push(0xAD);                                       // i64.extend_i32_u
+            Ok(())
+        }
+        Expr::ParseInt(inner) => {
+            // text → i64. Helper function does the strict scan +
+            // trap on bad input. We just push (ptr, len) and call.
+            let idx = ctx.parse_int_func_idx.ok_or_else(|| WasmError {
+                message: "internal: Expr::ParseInt reached emit without parse_int helper".into(),
+            })?;
+            emit_wasm_expr(code, inner, ctx)?;        // [ptr, len]
+            code.push(0x10); emit_leb128(code, idx as u64);   // call $parse_int → [i64]
+            Ok(())
+        }
+        Expr::JsonEscape(inner) => {
+            // text → text. Helper reads $bump_ptr as a param,
+            // returns (out_ptr, out_len, new_bump_ptr). Caller
+            // updates its bump_ptr local and leaves (ptr, len) on
+            // the stack as the text result.
+            let cl = ctx.concat.ok_or_else(|| WasmError {
+                message: "internal: Expr::JsonEscape needs the bump allocator (concat scratches not reserved)".into(),
+            })?;
+            let idx = ctx.json_escape_func_idx.ok_or_else(|| WasmError {
+                message: "internal: Expr::JsonEscape reached emit without json_escape helper".into(),
+            })?;
+            emit_wasm_expr(code, inner, ctx)?;                // [in_ptr, in_len]
+            code.push(0x20); emit_leb128(code, cl.bump_ptr as u64);  // [in_ptr, in_len, bump_ptr]
+            code.push(0x10); emit_leb128(code, idx as u64);    // call → [out_ptr, out_len, new_bump]
+            // Pop new_bump into $bump_ptr; (ptr, len) remain on stack.
+            code.push(0x21); emit_leb128(code, cl.bump_ptr as u64);  // pops top (new_bump)
+            Ok(())
+        }
+        Expr::StartsWith(haystack, needle) => {
+            emit_starts_or_ends_with(code, haystack, needle, ctx, /* from_end */ false)
+        }
+        Expr::EndsWith(haystack, needle) => {
+            emit_starts_or_ends_with(code, haystack, needle, ctx, /* from_end */ true)
+        }
+        Expr::Contains(haystack, needle) => {
+            emit_contains(code, haystack, needle, ctx)
+        }
         _ => Err(WasmError {
             message: format!("unsupported expression in WASM backend"),
         }),
     }
+}
+
+/// Inline emission for `starts_with(h, n)` and `ends_with(h, n)`.
+///
+/// Both share the same byte-compare loop; the only difference is the
+/// initial offset into the haystack (0 for starts_with,
+/// `h_len - n_len` for ends_with). The result is an i32 bool (0 or
+/// 1) — comparisons in WASM produce i32, no extension needed for the
+/// rule's internal bool path (the rule prologue handles widening to
+/// i64 if the rule output is `bool` via i64.extend, or wraps if
+/// output is bool — see compile_wasm's `is_bool` handling).
+///
+/// Edge cases pinned:
+///   - empty needle → always true (loop body never runs)
+///   - needle longer than haystack → false (length check before loop)
+///   - exact-length match → true (loop runs n_len iterations)
+fn emit_starts_or_ends_with(
+    code: &mut Vec<u8>,
+    haystack: &Expr,
+    needle: &Expr,
+    ctx: &WasmCtx,
+    from_end: bool,
+) -> Result<(), WasmError> {
+    let tp = ctx.text_prim.ok_or_else(|| WasmError {
+        message: "internal: starts_with/ends_with reached emit without text-prim scratches".into(),
+    })?;
+
+    // Eval BOTH args first, then park. Mirror of the W1 discipline
+    // for min/max — a nested call inside `needle` must not clobber
+    // the haystack scratches mid-park. With both on the stack, we
+    // pop in reverse (n_len, n_ptr, h_len, h_ptr) and the inner
+    // scratches it touched are now safe to overwrite.
+    emit_wasm_expr(code, haystack, ctx)?;       // [h_ptr, h_len]
+    emit_wasm_expr(code, needle, ctx)?;         // [h_ptr, h_len, n_ptr, n_len]
+    code.push(0x21); emit_leb128(code, tp.n_len as u64);
+    code.push(0x21); emit_leb128(code, tp.n_ptr as u64);
+    code.push(0x21); emit_leb128(code, tp.h_len as u64);
+    code.push(0x21); emit_leb128(code, tp.h_ptr as u64);
+
+    // Length pre-check: if n_len > h_len, push 0 and return early.
+    // We use a block with br to skip the compare loop in that case.
+    code.extend_from_slice(&[0x02, 0x7F]);              // block (i32 result)
+        // First check: if n_len > h_len, push 0 and br out.
+        code.push(0x20); emit_leb128(code, tp.n_len as u64);
+        code.push(0x20); emit_leb128(code, tp.h_len as u64);
+        code.push(0x4B);                                 // i32.gt_u (n_len > h_len, unsigned)
+        code.extend_from_slice(&[0x04, 0x40,             // if (no result)
+            0x41, 0x00,                                  //   i32.const 0
+            0x0C, 0x01,                                  //   br 1 (out of block)
+        0x0B]);                                          // end if
+
+        // Initialize $i = 0
+        code.push(0x41); code.push(0x00);
+        code.push(0x21); emit_leb128(code, tp.i as u64);
+
+        // For ends_with: shift h_ptr forward by (h_len - n_len) so the
+        // following loop compares the suffix of haystack against needle.
+        if from_end {
+            code.push(0x20); emit_leb128(code, tp.h_ptr as u64);
+            code.push(0x20); emit_leb128(code, tp.h_len as u64);
+            code.push(0x20); emit_leb128(code, tp.n_len as u64);
+            code.push(0x6B);                              // i32.sub (h_len - n_len)
+            code.push(0x6A);                              // i32.add (h_ptr + diff)
+            code.push(0x21); emit_leb128(code, tp.h_ptr as u64);
+        }
+
+        // loop: while $i < n_len, compare bytes
+        code.extend_from_slice(&[0x03, 0x40]);            // loop (no result)
+            // exit condition: $i >= n_len → push 1 and br out
+            code.push(0x20); emit_leb128(code, tp.i as u64);
+            code.push(0x20); emit_leb128(code, tp.n_len as u64);
+            code.push(0x4E);                              // i32.ge_s
+            code.extend_from_slice(&[0x04, 0x40,
+                0x41, 0x01,                               // push 1 (matched)
+                0x0C, 0x02,                               // br 2 (out of block)
+            0x0B]);
+            // load mem[h_ptr + i]
+            code.push(0x20); emit_leb128(code, tp.h_ptr as u64);
+            code.push(0x20); emit_leb128(code, tp.i as u64);
+            code.push(0x6A);                              // add
+            code.extend_from_slice(&[0x2D, 0x00, 0x00]);  // i32.load8_u
+            // load mem[n_ptr + i]
+            code.push(0x20); emit_leb128(code, tp.n_ptr as u64);
+            code.push(0x20); emit_leb128(code, tp.i as u64);
+            code.push(0x6A);
+            code.extend_from_slice(&[0x2D, 0x00, 0x00]);
+            // mismatch → push 0 and br out
+            code.push(0x47);                              // i32.ne
+            code.extend_from_slice(&[0x04, 0x40,
+                0x41, 0x00,
+                0x0C, 0x02,                               // br 2 (out of block)
+            0x0B]);
+            // i++
+            code.push(0x20); emit_leb128(code, tp.i as u64);
+            code.push(0x41); code.push(0x01);
+            code.push(0x6A);
+            code.push(0x21); emit_leb128(code, tp.i as u64);
+            code.push(0x0C); code.push(0x00);            // br 0 (continue loop)
+        code.push(0x0B);                                  // end loop
+        // The loop's only escapes are br 1 paths that already
+        // pushed an i32. Natural fallthrough past `end loop` is
+        // impossible at runtime, but the WASM validator needs a
+        // static proof. `unreachable` poisons the stack so the
+        // surrounding block's i32 result requirement is satisfied
+        // via dead-code typing.
+        code.push(0x00);                                  // unreachable
+    code.push(0x0B);                                      // end block — i32 result on stack
+
+    // The result is i32 (0 or 1). The verifier's bool widening at
+    // the rule's TOP level handles extension; here we leave it as
+    // i32. But if this expression is NOT the rule's top output — it's
+    // a sub-expr of an arithmetic chain or a binding — we'd need
+    // i64 to type-match. Concretely: predicates only flow into
+    // bool-typed sinks today (rule output = bool, or bound to a
+    // bool-typed name), so i32 is what's wanted. If a number-typed
+    // context demands i64 later, this is the place to add
+    // i64.extend_i32_u.
+    code.push(0xAD);                                       // i64.extend_i32_u — uniform i64 in expression chains
+    Ok(())
+}
+
+/// Inline emission for `contains(haystack, needle)`.
+///
+/// Naive O(N*M) substring search: for each candidate offset $i in
+/// the haystack (0..=h_len-n_len), run a forward byte-compare loop
+/// over $j (0..n_len) checking `h[i+j] == n[j]`. Returns 1 on the
+/// first full match, 0 if no offset matches.
+///
+/// Edge cases pinned:
+///   - empty needle → true (n_len == 0 so the inner loop sets
+///     `inner_match = 1` immediately at i=0)
+///   - needle longer than haystack → false (the outer pre-check
+///     `n_len > h_len` short-circuits to 0)
+fn emit_contains(
+    code: &mut Vec<u8>,
+    haystack: &Expr,
+    needle: &Expr,
+    ctx: &WasmCtx,
+) -> Result<(), WasmError> {
+    let tp = ctx.text_prim.ok_or_else(|| WasmError {
+        message: "internal: contains reached emit without text-prim scratches".into(),
+    })?;
+
+    // Same eval-then-park discipline as starts_with: both args
+    // first onto the stack, then pop in reverse.
+    emit_wasm_expr(code, haystack, ctx)?;
+    emit_wasm_expr(code, needle, ctx)?;
+    code.push(0x21); emit_leb128(code, tp.n_len as u64);
+    code.push(0x21); emit_leb128(code, tp.n_ptr as u64);
+    code.push(0x21); emit_leb128(code, tp.h_len as u64);
+    code.push(0x21); emit_leb128(code, tp.h_ptr as u64);
+
+    // Outer block (i32 result): 0 = not found, 1 = found.
+    code.extend_from_slice(&[0x02, 0x7F]);
+        // n_len > h_len → 0
+        code.push(0x20); emit_leb128(code, tp.n_len as u64);
+        code.push(0x20); emit_leb128(code, tp.h_len as u64);
+        code.push(0x4B);                                 // i32.gt_u
+        code.extend_from_slice(&[0x04, 0x40, 0x41, 0x00, 0x0C, 0x01, 0x0B]);
+
+        // $i = 0
+        code.push(0x41); code.push(0x00);
+        code.push(0x21); emit_leb128(code, tp.i as u64);
+
+        // outer loop over candidate offsets
+        code.extend_from_slice(&[0x03, 0x40]);
+            // if $i + n_len > h_len → not found; 0 and br out
+            code.push(0x20); emit_leb128(code, tp.i as u64);
+            code.push(0x20); emit_leb128(code, tp.n_len as u64);
+            code.push(0x6A);                              // add
+            code.push(0x20); emit_leb128(code, tp.h_len as u64);
+            code.push(0x4B);                              // i32.gt_u
+            code.extend_from_slice(&[0x04, 0x40, 0x41, 0x00, 0x0C, 0x02, 0x0B]);
+
+            // Inner block (i32 result): 1 = match at $i, 0 = mismatch
+            code.extend_from_slice(&[0x02, 0x7F]);
+                // $j = 0
+                code.push(0x41); code.push(0x00);
+                code.push(0x21); emit_leb128(code, tp.j as u64);
+                // inner loop
+                code.extend_from_slice(&[0x03, 0x40]);
+                    // exit on $j >= n_len → 1 (full needle matched)
+                    code.push(0x20); emit_leb128(code, tp.j as u64);
+                    code.push(0x20); emit_leb128(code, tp.n_len as u64);
+                    code.push(0x4E);                      // i32.ge_s
+                    code.extend_from_slice(&[0x04, 0x40, 0x41, 0x01, 0x0C, 0x02, 0x0B]);
+                    // load mem[h_ptr + i + j]
+                    code.push(0x20); emit_leb128(code, tp.h_ptr as u64);
+                    code.push(0x20); emit_leb128(code, tp.i as u64);
+                    code.push(0x6A);
+                    code.push(0x20); emit_leb128(code, tp.j as u64);
+                    code.push(0x6A);
+                    code.extend_from_slice(&[0x2D, 0x00, 0x00]);
+                    // load mem[n_ptr + j]
+                    code.push(0x20); emit_leb128(code, tp.n_ptr as u64);
+                    code.push(0x20); emit_leb128(code, tp.j as u64);
+                    code.push(0x6A);
+                    code.extend_from_slice(&[0x2D, 0x00, 0x00]);
+                    // mismatch → 0 and br out (of inner block)
+                    code.push(0x47);                      // i32.ne
+                    code.extend_from_slice(&[0x04, 0x40, 0x41, 0x00, 0x0C, 0x02, 0x0B]);
+                    // j++
+                    code.push(0x20); emit_leb128(code, tp.j as u64);
+                    code.push(0x41); code.push(0x01);
+                    code.push(0x6A);
+                    code.push(0x21); emit_leb128(code, tp.j as u64);
+                    code.push(0x0C); code.push(0x00);    // br 0 (continue inner)
+                code.push(0x0B);                          // end inner loop
+                code.push(0x00);                          // unreachable (validator's dead-fallthrough proof)
+            code.push(0x0B);                              // end inner block — i32 on stack
+
+            // If inner_match == 1 → found; push 1 and br out of outer block.
+            // If 0 → continue outer loop with i++.
+            code.extend_from_slice(&[0x04, 0x40,         // if (inner_match nonzero)
+                0x41, 0x01, 0x0C, 0x02,                  //   push 1; br 2 (out of outer block)
+            0x0B]);                                       // end if
+
+            // i++
+            code.push(0x20); emit_leb128(code, tp.i as u64);
+            code.push(0x41); code.push(0x01);
+            code.push(0x6A);
+            code.push(0x21); emit_leb128(code, tp.i as u64);
+            code.push(0x0C); code.push(0x00);            // br 0 (continue outer)
+        code.push(0x0B);                                  // end outer loop
+        code.push(0x00);                                  // unreachable
+    code.push(0x0B);                                      // end outer block
+
+    code.push(0xAD);                                       // i64.extend_i32_u
+    Ok(())
 }
 
 /// True iff `expr` (or any sub-expression) needs the WASM scratch locals.
@@ -992,6 +1681,12 @@ fn expr_uses_scratch(expr: &Expr) -> bool {
         Expr::If(c, t, e) => expr_uses_scratch(c) || expr_uses_scratch(t) || expr_uses_scratch(e),
         Expr::Not(inner) | Expr::Neg(inner) => expr_uses_scratch(inner),
         Expr::Call(_, args) => args.iter().any(expr_uses_scratch),
+        Expr::Concat(args) => args.iter().any(expr_uses_scratch),
+        // W3c text primitives — abs/min/max may be nested in their args.
+        Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i) => expr_uses_scratch(i),
+        Expr::StartsWith(h, n) | Expr::EndsWith(h, n) | Expr::Contains(h, n) => {
+            expr_uses_scratch(h) || expr_uses_scratch(n)
+        }
         // Leaves and shapes the backend doesn't yet emit.
         _ => false,
     }
@@ -2177,6 +2872,451 @@ function writeStr(mem, off, s) {{
         assert!(
             stdout.matches("OK").count() >= 10,
             "expected >=10 OK lines; stdout:\n{}",
+            stdout
+        );
+    }
+
+    /// W3c: `length(text)` reserves the 6-i32 text-prim scratch group
+    /// and emits `i64.extend_i32_u` (opcode 0xAD) — the widening that
+    /// turns the popped i32 len into a number-typed i64.
+    #[test]
+    fn wasm_w3c_length_reserves_scratches_and_emits_extend() {
+        let src = r#"@verbose 0.1.0
+concept G
+  @intention: "x"
+  @source: invoices.intent:1
+  fields:
+    name : text
+rule len_of
+  @intention: "x"
+  @source: invoices.intent:1
+  input:
+    g : G
+  output:
+    n : number
+  logic:
+    n = length(g.name)
+  proofs:
+    purity:
+      reads: [g.name]
+      calls: []
+    termination:
+      bound: 1
+"#;
+        let bytes = compile_to_bytes(src, "len_of", "w3c_length");
+        assert_eq!(&bytes[0..4], b"\0asm");
+        // The rule has a text input field (2 i32 params) but no
+        // bindings, no concat, no scratch primitives. text_prim
+        // scratches are 6 i32 → expect a single i32 group of 6
+        // (`01 06 7F`) in the locals declaration.
+        assert!(
+            bytes.windows(3).any(|w| w == [0x01, 0x06, 0x7F]),
+            "length should reserve 6 text-prim i32 scratches"
+        );
+        // `i64.extend_i32_u` (0xAD) appears at least once — that's
+        // length's widening of the popped len i32 to i64.
+        assert!(bytes.contains(&0xAD), "missing i64.extend_i32_u for length");
+    }
+
+    /// W3c: `starts_with(...)` emits a 2-function module is NOT
+    /// required (no helper) — the byte-compare loop is inlined. But
+    /// the loop's `unreachable` (0x00) must appear after `end loop`
+    /// to satisfy the validator's dead-fallthrough proof. Pinned by
+    /// presence of opcode 0x00 in the module bytes (also the trap
+    /// opcode — but starts_with is the only thing in this module
+    /// that emits it).
+    #[test]
+    fn wasm_w3c_starts_with_emits_unreachable_for_dead_loop_exit() {
+        let src = r#"@verbose 0.1.0
+concept G
+  @intention: "x"
+  @source: invoices.intent:1
+  fields:
+    path : text
+rule check
+  @intention: "x"
+  @source: invoices.intent:1
+  input:
+    g : G
+  output:
+    ok : bool
+  logic:
+    ok = starts_with(g.path, "/admin/")
+  proofs:
+    purity:
+      reads: [g.path]
+      calls: []
+    termination:
+      bound: 1
+"#;
+        let bytes = compile_to_bytes(src, "check", "w3c_sw");
+        assert_eq!(&bytes[0..4], b"\0asm");
+        // Compiles + validates (the test_smoke `cargo test wasm::`
+        // already fails-fast if the module doesn't validate). Verify
+        // text-prim scratches reserved.
+        assert!(
+            bytes.windows(3).any(|w| w == [0x01, 0x06, 0x7F]),
+            "starts_with should reserve 6 text-prim i32 scratches"
+        );
+        // The `unreachable` opcode (0x00) sits inside the function
+        // body as the dead fallthrough marker.
+        assert!(bytes.contains(&0x00), "missing unreachable for loop's dead fallthrough");
+    }
+
+    /// W3c: `parse_int(text)` causes the module to grow a second
+    /// function (the parse_int helper). Pinned by the type section
+    /// declaring 2 types (one for the rule, one for the helper) and
+    /// the function body containing `call 1` (calls the helper).
+    #[test]
+    fn wasm_w3c_parse_int_emits_helper_function() {
+        let src = r#"@verbose 0.1.0
+concept G
+  @intention: "x"
+  @source: invoices.intent:1
+  fields:
+    s : text
+rule p
+  @intention: "x"
+  @source: invoices.intent:1
+  input:
+    g : G
+  output:
+    n : number
+  logic:
+    n = parse_int(g.s)
+  proofs:
+    purity:
+      reads: [g.s]
+      calls: []
+    termination:
+      bound: 1
+"#;
+        let bytes = compile_to_bytes(src, "p", "w3c_pi");
+        assert_eq!(&bytes[0..4], b"\0asm");
+        // Function section: 2 funcs, types 0 and 1.
+        assert!(
+            bytes.windows(3).any(|w| w == [0x02, 0x00, 0x01]),
+            "expected function section `02 00 01` (rule + parse_int helper)"
+        );
+        // `call 1` (0x10 0x01) for the parse_int invocation.
+        assert!(
+            bytes.windows(2).any(|w| w == [0x10, 0x01]),
+            "expected `call 1` (parse_int helper) in rule body"
+        );
+    }
+
+    /// W3c: `json_escape(text)` causes BOTH the bump allocator (since
+    /// it allocates) AND the json_escape helper function to be
+    /// emitted. The helper has 3-result type which is distinctive:
+    /// `0x60 0x03 0x7F 0x7F 0x7F 0x03 0x7F 0x7F 0x7F`.
+    #[test]
+    fn wasm_w3c_json_escape_emits_helper_with_three_results() {
+        let src = r#"@verbose 0.1.0
+concept G
+  @intention: "x"
+  @source: invoices.intent:1
+  fields:
+    s : text
+rule esc
+  @intention: "x"
+  @source: invoices.intent:1
+  input:
+    g : G
+  output:
+    out : text
+  logic:
+    out = json_escape(g.s)
+  proofs:
+    purity:
+      reads: [g.s]
+      calls: []
+    termination:
+      bound: 1
+"#;
+        let bytes = compile_to_bytes(src, "esc", "w3c_je");
+        assert_eq!(&bytes[0..4], b"\0asm");
+        // The 3-results type signature for json_escape is unique in
+        // the type section: 3 i32 params + 3 i32 results.
+        assert!(
+            bytes.windows(9).any(|w| w == [0x60, 0x03, 0x7F, 0x7F, 0x7F, 0x03, 0x7F, 0x7F, 0x7F]),
+            "expected json_escape's (i32,i32,i32) -> (i32,i32,i32) type entry"
+        );
+        // The bump allocator (concat scratches) is also reserved
+        // since json_escape needs $bump_ptr — even though no concat
+        // appears in the rule. Locals decl is i32 only (no number
+        // bindings, no min/max scratches): 6 text-prim + 5 concat
+        // + 0 text bindings = 11 i32 locals → `01 0B 7F`.
+        assert!(
+            bytes.windows(3).any(|w| w == [0x01, 0x0B, 0x7F]),
+            "expected 11 i32 locals (5 concat scratches + 6 text-prim scratches)"
+        );
+    }
+
+    /// W3c end-to-end: load all 6 primitives in node, exercise each
+    /// against a small but pointed corpus that hits the canonical
+    /// edge cases (empty input, length boundary, i64::MIN for
+    /// parse_int, all four explicit JSON escape sequences plus
+    /// `\u00XX` path for json_escape, etc.). Skipped if `node` is
+    /// absent.
+    #[test]
+    fn wasm_w3c_runtime_all_six_primitives() {
+        use std::process::Command;
+
+        if Command::new("node").arg("--version").output().is_err() {
+            eprintln!("note: `node` not found, skipping WASM W3c runtime test");
+            return;
+        }
+
+        // One source compiles to 6 distinct .wasm modules (one per
+        // rule). The driver script then calls each export with
+        // tailored inputs and prints OK/FAIL per case.
+        let src = r#"@verbose 0.1.0
+concept G
+  @intention: "x"
+  @source: invoices.intent:1
+  fields:
+    s : text
+    needle : text
+
+rule len_of
+  @intention: "x"
+  @source: invoices.intent:1
+  input:
+    g : G
+  output:
+    n : number
+  logic:
+    n = length(g.s)
+  proofs:
+    purity:
+      reads: [g.s]
+      calls: []
+    termination:
+      bound: 1
+
+rule sw_check
+  @intention: "x"
+  @source: invoices.intent:1
+  input:
+    g : G
+  output:
+    ok : bool
+  logic:
+    ok = starts_with(g.s, g.needle)
+  proofs:
+    purity:
+      reads: [g.s, g.needle]
+      calls: []
+    termination:
+      bound: 1
+
+rule ew_check
+  @intention: "x"
+  @source: invoices.intent:1
+  input:
+    g : G
+  output:
+    ok : bool
+  logic:
+    ok = ends_with(g.s, g.needle)
+  proofs:
+    purity:
+      reads: [g.s, g.needle]
+      calls: []
+    termination:
+      bound: 1
+
+rule co_check
+  @intention: "x"
+  @source: invoices.intent:1
+  input:
+    g : G
+  output:
+    ok : bool
+  logic:
+    ok = contains(g.s, g.needle)
+  proofs:
+    purity:
+      reads: [g.s, g.needle]
+      calls: []
+    termination:
+      bound: 1
+
+rule pi_check
+  @intention: "x"
+  @source: invoices.intent:1
+  input:
+    g : G
+  output:
+    n : number
+  logic:
+    n = parse_int(g.s)
+  proofs:
+    purity:
+      reads: [g.s]
+      calls: []
+    termination:
+      bound: 1
+
+rule je_check
+  @intention: "x"
+  @source: invoices.intent:1
+  input:
+    g : G
+  output:
+    out : text
+  logic:
+    out = json_escape(g.s)
+  proofs:
+    purity:
+      reads: [g.s]
+      calls: []
+    termination:
+      bound: 1
+"#;
+
+        use crate::lexer::Lexer;
+        use crate::parser::Parser;
+        let tokens = Lexer::new(src).tokenize().expect("tokenize");
+        let program = Parser::new(tokens).parse_program().expect("parse");
+
+        let paths = [
+            ("len_of",   "/tmp/wasm_w3c_runtime_len.wasm"),
+            ("sw_check", "/tmp/wasm_w3c_runtime_sw.wasm"),
+            ("ew_check", "/tmp/wasm_w3c_runtime_ew.wasm"),
+            ("co_check", "/tmp/wasm_w3c_runtime_co.wasm"),
+            ("pi_check", "/tmp/wasm_w3c_runtime_pi.wasm"),
+            ("je_check", "/tmp/wasm_w3c_runtime_je.wasm"),
+        ];
+        for (rule, path) in &paths {
+            compile_wasm(&program, rule, path).expect(&format!("compile {}", rule));
+        }
+
+        let script = format!(
+            r#"
+const fs = require("fs");
+const enc = new TextEncoder();
+const dec = new TextDecoder();
+
+async function load(path) {{
+  const buf = fs.readFileSync(path);
+  if (!WebAssembly.validate(buf)) {{ console.log("FAIL invalid module " + path); return null; }}
+  return WebAssembly.instantiate(buf);
+}}
+function setS(mem, s) {{
+  const b = enc.encode(s);
+  mem.set(b, 4096);
+  return b.length;
+}}
+function setN(mem, s) {{
+  const b = enc.encode(s);
+  mem.set(b, 8192);
+  return b.length;
+}}
+
+(async () => {{
+  // length
+  let m = await load("{len_path}");
+  for (const [s, exp] of [["", 0], ["a", 1], ["hello", 5], ["the quick brown fox", 19]]) {{
+    let mem = new Uint8Array(m.instance.exports.memory.buffer);
+    const sLen = setS(mem, s);
+    const got = Number(m.instance.exports.len_of(4096, sLen, 0, 0));
+    console.log(got === exp ? `OK length ${{JSON.stringify(s)}} = ${{got}}` : `FAIL length ${{JSON.stringify(s)}} got ${{got}} expected ${{exp}}`);
+  }}
+  // starts_with
+  m = await load("{sw_path}");
+  for (const [s, n, exp] of [["/admin/u","/admin/",1],["/admin/","/admin/",1],["/admin","/admin/",0],["","x",0],["","",1]]) {{
+    let mem = new Uint8Array(m.instance.exports.memory.buffer);
+    const sLen = setS(mem, s); const nLen = setN(mem, n);
+    const got = Number(m.instance.exports.sw_check(4096, sLen, 8192, nLen));
+    console.log(got === exp ? `OK starts_with(${{JSON.stringify(s)}}, ${{JSON.stringify(n)}}) = ${{got}}` : `FAIL starts_with(${{JSON.stringify(s)}}, ${{JSON.stringify(n)}}) got ${{got}} expected ${{exp}}`);
+  }}
+  // ends_with
+  m = await load("{ew_path}");
+  for (const [s, n, exp] of [["app.log",".log",1],[".log",".log",1],["log.txt",".log",0],["a.log.bak",".log",0],["","x",0],["","",1]]) {{
+    let mem = new Uint8Array(m.instance.exports.memory.buffer);
+    const sLen = setS(mem, s); const nLen = setN(mem, n);
+    const got = Number(m.instance.exports.ew_check(4096, sLen, 8192, nLen));
+    console.log(got === exp ? `OK ends_with(${{JSON.stringify(s)}}, ${{JSON.stringify(n)}}) = ${{got}}` : `FAIL ends_with(${{JSON.stringify(s)}}, ${{JSON.stringify(n)}}) got ${{got}} expected ${{exp}}`);
+  }}
+  // contains
+  m = await load("{co_path}");
+  for (const [s, n, exp] of [["/admin/u","admin",1],["foo/admin","admin",1],["admin","admin",1],["/api/x","admin",0],["","admin",0],["a","",1]]) {{
+    let mem = new Uint8Array(m.instance.exports.memory.buffer);
+    const sLen = setS(mem, s); const nLen = setN(mem, n);
+    const got = Number(m.instance.exports.co_check(4096, sLen, 8192, nLen));
+    console.log(got === exp ? `OK contains(${{JSON.stringify(s)}}, ${{JSON.stringify(n)}}) = ${{got}}` : `FAIL contains(${{JSON.stringify(s)}}, ${{JSON.stringify(n)}}) got ${{got}} expected ${{exp}}`);
+  }}
+  // parse_int (valid + trap cases)
+  m = await load("{pi_path}");
+  for (const [s, exp] of [["0",0n],["42",42n],["-1",-1n],["9223372036854775807",9223372036854775807n],["-9223372036854775808",-9223372036854775808n]]) {{
+    let mem = new Uint8Array(m.instance.exports.memory.buffer);
+    const sLen = setS(mem, s);
+    const got = m.instance.exports.pi_check(4096, sLen, 0, 0);
+    console.log(got === exp ? `OK parse_int(${{JSON.stringify(s)}}) = ${{got}}` : `FAIL parse_int(${{JSON.stringify(s)}}) got ${{got}} expected ${{exp}}`);
+  }}
+  for (const s of ["", "-", "abc", "12abc", "+5"]) {{
+    let mem = new Uint8Array(m.instance.exports.memory.buffer);
+    const sLen = setS(mem, s);
+    try {{
+      const got = m.instance.exports.pi_check(4096, sLen, 0, 0);
+      console.log(`FAIL parse_int(${{JSON.stringify(s)}}) = ${{got}} should have trapped`);
+    }} catch (e) {{
+      console.log(`OK parse_int(${{JSON.stringify(s)}}) trapped`);
+    }}
+  }}
+  // json_escape — the four explicit escapes + control char + identity
+  m = await load("{je_path}");
+  for (const [s, exp] of [
+    ["hello", "hello"],
+    ["a\"b", "a\\\"b"],
+    ["a\\b", "a\\\\b"],
+    ["a\nb", "a\\nb"],
+    ["a\tb", "a\\tb"],
+    ["a\rb", "a\\rb"],
+    ["\x01", "\\u0001"],
+    ["\x1f", "\\u001f"],
+  ]) {{
+    let mem = new Uint8Array(m.instance.exports.memory.buffer);
+    const sLen = setS(mem, s);
+    const [p, l] = m.instance.exports.je_check(4096, sLen, 0, 0);
+    mem = new Uint8Array(m.instance.exports.memory.buffer);
+    const got = dec.decode(mem.subarray(p, p+l));
+    console.log(got === exp ? `OK json_escape(${{JSON.stringify(s)}}) = ${{JSON.stringify(got)}}` : `FAIL json_escape(${{JSON.stringify(s)}}) got ${{JSON.stringify(got)}} expected ${{JSON.stringify(exp)}}`);
+  }}
+}})();
+"#,
+            len_path = paths[0].1,
+            sw_path = paths[1].1,
+            ew_path = paths[2].1,
+            co_path = paths[3].1,
+            pi_path = paths[4].1,
+            je_path = paths[5].1,
+        );
+
+        let out = Command::new("node")
+            .args(["-e", &script])
+            .output()
+            .expect("spawn node");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+
+        for (_, p) in &paths {
+            let _ = std::fs::remove_file(p);
+        }
+
+        assert!(
+            !stdout.contains("FAIL"),
+            "WASM W3c runtime check failed; node stdout:\n{}\nstderr:\n{}",
+            stdout,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        // Expected OK count: 4 length + 5 sw + 6 ew + 6 co +
+        // (5 valid + 5 trap = 10) parse_int + 8 json_escape = 39.
+        let ok_count = stdout.matches("OK").count();
+        assert!(
+            ok_count >= 39,
+            "expected >=39 OK lines (got {}); stdout:\n{}",
+            ok_count,
             stdout
         );
     }
