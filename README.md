@@ -116,8 +116,9 @@ that ships with the repo (or write your own), and:
 $ uv venv && uv pip install -r tools/requirements.txt
 $ claude setup-token   # OAuth flow, gives a 1-year token
 
-$ export CLAUDE_CODE_OAUTH_TOKEN=<the token>
-$ unset ANTHROPIC_API_KEY    # the SDK prefers it; you want the subscription
+$ cp .env.example .env
+# edit .env to put: CLAUDE_CODE_OAUTH_TOKEN=<the token from setup-token>
+# (.env is gitignored — safer than `export` which leaks into shell history)
 
 $ .venv/bin/python tools/generate_sdk.py examples/invoices.intent --output /tmp/inv.verbose
   [attempt 1] calling claude-sonnet-4-6 (SDK)...

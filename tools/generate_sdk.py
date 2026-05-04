@@ -59,6 +59,7 @@ from generate import (  # noqa: E402
     build_initial_user_prompt,
     build_system_prompt,
     indent,
+    load_dotenv,
     normalize_source_paths,
     strip_code_fence,
     verify,
@@ -159,13 +160,16 @@ def _check_auth(quiet: bool):
         )
     if not has_key and not has_oauth:
         sys.exit(
-            "no auth configured. Pick one:\n"
-            "  - subscription:  claude setup-token  → export CLAUDE_CODE_OAUTH_TOKEN=<token>\n"
-            "  - per-token:     export ANTHROPIC_API_KEY=sk-ant-..."
+            "no auth configured. Put one of these in .env (copy .env.example\n"
+            "as a starting point) or `export` it:\n"
+            "  - subscription:  CLAUDE_CODE_OAUTH_TOKEN=<token from `claude setup-token`>\n"
+            "  - per-token:     ANTHROPIC_API_KEY=sk-ant-..."
         )
 
 
 def main():
+    load_dotenv()
+
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("intent_path", type=Path)
     parser.add_argument("--output", type=Path, help="output .verbose path (default: same dir as input)")

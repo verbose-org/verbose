@@ -34,6 +34,12 @@ import sys
 import tempfile
 from pathlib import Path
 
+# Reuse the .env loader from generate.py so eval picks up
+# CLAUDE_CODE_OAUTH_TOKEN / ANTHROPIC_API_KEY from a gitignored .env
+# file before its auth check runs.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from generate import load_dotenv  # noqa: E402
+
 REPO = Path(__file__).resolve().parent.parent
 EXAMPLES = REPO / "examples"
 
@@ -124,6 +130,8 @@ def run_one(
 
 
 def main():
+    load_dotenv()
+
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument(
         "stems",
@@ -146,12 +154,16 @@ def main():
     if args.use_sdk:
         if not (os.environ.get("CLAUDE_CODE_OAUTH_TOKEN") or os.environ.get("ANTHROPIC_API_KEY")):
             sys.exit(
-                "no auth configured for --use-sdk. Pick one:\n"
-                "  - subscription:  claude setup-token  → export CLAUDE_CODE_OAUTH_TOKEN=<token>\n"
-                "  - per-token:     export ANTHROPIC_API_KEY=sk-ant-..."
+                "no auth configured for --use-sdk. Put one of these in .env\n"
+                "(copy .env.example as a starting point) or export it:\n"
+                "  - subscription:  CLAUDE_CODE_OAUTH_TOKEN=<token from `claude setup-token`>\n"
+                "  - per-token:     ANTHROPIC_API_KEY=sk-ant-..."
             )
     elif not os.environ.get("ANTHROPIC_API_KEY"):
-        sys.exit("ANTHROPIC_API_KEY is not set (or pass --use-sdk to use the Claude Agent SDK)")
+        sys.exit(
+            "ANTHROPIC_API_KEY is not set (or pass --use-sdk to use the Claude Agent SDK).\n"
+            "Put it in .env (copy .env.example as a starting point) or `export` it."
+        )
 
     if args.all:
         intent_paths = sorted(EXAMPLES.glob("*.intent"))

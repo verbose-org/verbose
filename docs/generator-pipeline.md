@@ -19,15 +19,23 @@ uv venv                              # create .venv/ at repo root
 uv pip install -r tools/requirements.txt
 claude setup-token                   # OAuth flow, gives you a 1-year token
 
-# Per-session:
-export CLAUDE_CODE_OAUTH_TOKEN=<token>
-unset ANTHROPIC_API_KEY              # critical, see "Auth precedence gotcha" below
+# One-time secrets:
+cp .env.example .env                 # then edit .env with your token(s)
+                                     # .env is gitignored; safer than `export`
+                                     # which leaks into shell history & process tables.
+
+# Per-session (no env vars to remember — .env is auto-loaded):
 .venv/bin/python tools/eval.py --use-sdk
 
 # One-shot, per-token billing (no SDK install needed):
-export ANTHROPIC_API_KEY=sk-ant-...
+# Same .env file works; just put ANTHROPIC_API_KEY in it instead of (or alongside)
+# the OAuth token, and run:
 python3 tools/eval.py                # API path uses stdlib only — no venv required
 ```
+
+The scripts auto-load a `.env` at the repo root before checking auth.
+Existing env vars still win, so `export X=Y` on the command line
+overrides the file value if you need a one-shot override.
 
 Either path runs the generator across a curated sample of repo
 intents and prints `first_try=X/N, after_corrections=Y/N, failed=Z/N`.
@@ -102,15 +110,27 @@ claude setup-token                               # OAuth flow → 1-year token
 ```
 
 `claude setup-token` opens an OAuth flow in your browser, then prints
-a token valid for one year. Copy it and:
+a token valid for one year. Put it in a `.env` file at the repo
+root rather than `export`-ing it in your shell:
 
 ```bash
-export CLAUDE_CODE_OAUTH_TOKEN=<the token from setup-token>
-unset ANTHROPIC_API_KEY      # see precedence gotcha below
+cp .env.example .env
+# then edit .env to:
+#     CLAUDE_CODE_OAUTH_TOKEN=<paste the token>
+#     # leave ANTHROPIC_API_KEY commented out (see precedence gotcha)
 ```
 
-The SDK picks up `CLAUDE_CODE_OAUTH_TOKEN` automatically — no code
-change needed.
+`.env` is gitignored, so the token can't accidentally end up in a
+commit. The scripts auto-load it before the auth check, so no
+`export` needed in subsequent shells.
+
+> ⚠️ **Token revocation is not currently supported in Claude's UI.**
+> If the token leaks (pasted into a chat transcript, accidentally
+> echoed in a shell command, etc.), there's no clean revoke button —
+> the token stays valid for several days even after `claude
+> logout`. The blast radius is "your subscription quota gets used by
+> someone else" (no data access), but it's annoying. Use `.env` and
+> never paste the token into commands or messages.
 
 After this, every invocation uses `.venv/bin/python` instead of the
 system `python3`:

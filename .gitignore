@@ -26,3 +26,10 @@ __pycache__/
 
 # Python virtual environment (created by `uv venv`)
 .venv/
+
+# Operator-local secrets for tools/generate*.py and tools/eval.py
+# (ANTHROPIC_API_KEY / CLAUDE_CODE_OAUTH_TOKEN). The committed
+# `.env.example` shows the format; .env itself is never tracked.
+.env
+.env.local
+.env.*.local

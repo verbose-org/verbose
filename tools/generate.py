@@ -39,6 +39,45 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 DEFAULT_MODEL = "claude-sonnet-4-6"
 
+
+def load_dotenv(path: Path = REPO / ".env") -> None:
+    """Read KEY=value lines from `.env` and put them in os.environ.
+
+    Stdlib-only (no `python-dotenv` dep so generate.py keeps its
+    zero-deps promise — generate_sdk.py imports this same helper
+    rather than pulling another package). Existing env vars win
+    over .env so an explicit `export X=Y` on the command line is
+    never overridden by a stale value in the file.
+
+    The .env file is gitignored — it's the safe place to keep
+    `ANTHROPIC_API_KEY` and `CLAUDE_CODE_OAUTH_TOKEN` without
+    risking them ending up in shell history, transcripts, or
+    git diffs.
+
+    Format (keep it simple — no shell expansion, no quotes
+    required, # for comments):
+
+        # comment line
+        ANTHROPIC_API_KEY=sk-ant-...
+        CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-...
+    """
+    if not path.exists():
+        return
+    for raw in path.read_text().splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            continue
+        key, _, val = line.partition("=")
+        key = key.strip()
+        # Strip surrounding quotes if present, but not internal whitespace.
+        val = val.strip()
+        if (val.startswith('"') and val.endswith('"')) or (val.startswith("'") and val.endswith("'")):
+            val = val[1:-1]
+        if key and key not in os.environ:
+            os.environ[key] = val
+
 # ---------------------------------------------------------------------------
 # Prompt assets
 # ---------------------------------------------------------------------------
@@ -657,6 +696,10 @@ def run(
 
 
 def main():
+    # Load .env BEFORE argparse so any env-driven defaults (none today
+    # but cheap to support) read the right values.
+    load_dotenv()
+
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("intent_path", type=Path)
     parser.add_argument("--output", type=Path, help="output .verbose path (default: same dir as input)")
