@@ -1,0 +1,4 @@
+1. A forum post has an author name, a title, and a body of text.
+2. A post looks like spam when its title contains "FREE" or its body contains "click here".
+3. A post comes from an untrusted account when its author name starts with "guest_".
+4. A post is rejected when it looks like spam or it comes from an untrusted account.

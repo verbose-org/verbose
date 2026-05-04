@@ -1,0 +1,2 @@
+1. A sensor reading has a sensor identifier (text), a temperature in celsius, and a unix timestamp recorded when the measurement was taken.
+2. Validate a reading by its freshness: accept it with its temperature when the absolute difference between the current unix time and the recorded timestamp is strictly less than 60 seconds; otherwise reject with a reason mentioning the sensor identifier and the recorded timestamp.

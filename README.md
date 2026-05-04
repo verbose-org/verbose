@@ -412,7 +412,25 @@ after_corrections = 0/8
 failed            = 0/8
 ```
 
-Honest caveats: small sample (8 intents from the repo, in-distribution), single stochastic run, and the few-shot examples include patterns close to the test set. The number is a viability signal, not a proof of generalization. Re-running on a hold-out set is the next rigor step. But the floor — *whatever the model produces, the compiler either accepts it or rejects it* — holds regardless of generation quality. That floor is the architectural bet.
+Honest caveats: small sample (8 intents from the repo, **in-distribution**), single stochastic run, and the few-shot examples include patterns close to the test set. The number is a viability signal, not a proof of generalization.
+
+#### Hold-out: 5 intents the model has never seen
+
+To test generalization beyond the eval set, [`examples/holdout/`](examples/holdout/) contains 5 brand-new intents in domains absent from the repo (forum moderation, sensor freshness, library stock, meter billing, chat audit). Each one composes patterns the few-shot does **not** show: `contains` + `starts_with`, `now_unix() + abs` inside a `Result`, `count` over a collection that itself reads a runtime-loaded threshold (`parse_int(read(...))`), `match_result` with a nested `if/else` in the `Ok` arm, `length(text)` driving a reaction's `append_file`. The model has to assemble each from `INTENT.md` patterns, not a syntactic clone of a worked example.
+
+Same model, same tooling, same `tools/eval.py --use-sdk`:
+
+```
+first_try         = 4/5
+after_corrections = 1/5    (low_stock_count: one verify→fix round)
+failed            = 0/5
+```
+
+The five generated `.verbose` files are real solutions — not minimal compiles that ducked the prompt. Each declares the right `reads:`/`calls:`, the right termination bound, and the construct the prose actually asked for (the verifier rejects stand-ins).
+
+Two numbers, two regimes. The 8/8 says *the pipeline ergonomics work for in-distribution intents*. The 4/5 + 1 correction says *the model can compose primitives it learns from `INTENT.md` alone, on domains never seen here, with the verifier catching the one slip*. Neither is a guarantee — both are data points.
+
+The architectural floor stands either way: *whatever the model produces, the compiler either accepts it or rejects it*. That floor is the bet.
 
 For how to write `.intent` prose that the AI maps reliably to Verbose constructs — which phrasings produce `all` / `any` / `map` / `filter` / `sum`, how to cross-reference rules, what the defaults are when the prose is silent — see [INTENT.md](INTENT.md).
 

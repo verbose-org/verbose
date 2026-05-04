@@ -1,0 +1,3 @@
+1. A meter reading has a previous index and a current index.
+2. Validate a meter reading: accept with the consumption (current minus previous) when the current index is at least the previous index; otherwise reject with a reason mentioning both indices.
+3. Apply tiered pricing to a validated consumption, returning the bill amount in cents: if validation succeeded and the consumption is at most 100, the bill is 15 times the consumption; if validation succeeded and the consumption is more than 100, the bill is 1500 plus 25 times the consumption minus 100. If validation failed, propagate the rejection reason unchanged.

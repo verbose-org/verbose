@@ -1,0 +1,3 @@
+1. A book has a category and a number of copies in stock.
+2. A library has a list of books.
+3. The number of low-stock books in a library is the count of books whose number of copies is strictly less than a threshold loaded as a number from a file at startup. The threshold can be edited between binary invocations without recompiling. If the threshold file is missing, or its content isn't a valid integer, the binary aborts before producing any output.
