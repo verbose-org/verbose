@@ -106,6 +106,32 @@ $ cat /tmp/verbose_audit_gateway.jsonl | jq .
 For a full index of the 70+ examples grouped by feature, see
 [`examples/README.md`](examples/README.md).
 
+### Generate one yourself (optional, requires a Claude account)
+
+If you have a Claude Pro/Max subscription, you can run the full
+`.intent → .verbose → binary` loop end-to-end. Pick any `.intent`
+that ships with the repo (or write your own), and:
+
+```sh
+$ uv venv && uv pip install -r tools/requirements.txt
+$ claude setup-token   # OAuth flow, gives a 1-year token
+
+$ export CLAUDE_CODE_OAUTH_TOKEN=<the token>
+$ unset ANTHROPIC_API_KEY    # the SDK prefers it; you want the subscription
+
+$ .venv/bin/python tools/generate_sdk.py examples/invoices.intent --output /tmp/inv.verbose
+  [attempt 1] calling claude-sonnet-4-6 (SDK)...
+OK  invoices.intent verified after 1 attempt(s); output: /tmp/inv.verbose
+
+$ cargo run -- /tmp/inv.verbose --native /tmp/inv --run important_invoice
+$ /tmp/inv 15000
+true
+```
+
+The first run measured 8/8 first-try verification across the curated
+sample — see [the generator pipeline doc](docs/generator-pipeline.md)
+for the full operator reference and `tools/eval.py` for the metric.
+
 ## Live Example
 
 Human writes this (`collections.intent`):
@@ -358,13 +384,34 @@ verbosec (deterministic)      verifies and compiles — never trusts, never gues
 
 The compiler will never generate code. It will never "help" the AI by inferring missing proofs. It verifies, or it rejects. Like a financial auditor: if the accountant and the auditor are the same person, the audit is worthless.
 
-A generation tool is included (`tools/generate.sh`) — it calls the Claude API to produce `.verbose` files from `.intent` files. It is deliberately separate from the compiler:
+### The generator pipeline
 
-```bash
-export ANTHROPIC_API_KEY=sk-ant-...
-./tools/generate.sh examples/invoices.intent > generated.verbose
-cargo run -- generated.verbose   # compiler verifies independently
+Two generator scripts live in `tools/`, both producing `.verbose` from `.intent` via Claude with a verify-and-correct loop (the script asks the model to fix errors the compiler reported, up to N retries):
+
+- [`tools/generate.py`](tools/generate.py) — Anthropic Messages API directly. Per-token billing. Stdlib-only Python (no install).
+- [`tools/generate_sdk.py`](tools/generate_sdk.py) — Claude Agent SDK. Authenticates via your Claude Pro/Max **subscription** (no per-token charges). Needs `pip install claude-agent-sdk` in a venv.
+
+Both produce identical prompts; pick the auth model that fits your account. Full operator reference (auth setup, the `ANTHROPIC_API_KEY`-vs-OAuth precedence gotcha, prompt internals) is in [`docs/generator-pipeline.md`](docs/generator-pipeline.md).
+
+### Does it actually work? — first measured numbers
+
+`tools/eval.py` runs the generator across a curated 8-intent sample spanning the language surface (scalar, arithmetic + composition, collections, fold/sum/count, map/filter, reactions, `Result + match_result`) and reports:
+
 ```
+first_try         = X/N    — verified by the compiler on the first attempt
+after_corrections = Y/N    — verified after K verify→fix rounds
+failed            = Z/N    — never converged within the cap
+```
+
+First measured run with Claude Sonnet 4.6 via subscription auth (commit `9cb990f`, 2026-05-04):
+
+```
+first_try         = 8/8
+after_corrections = 0/8
+failed            = 0/8
+```
+
+Honest caveats: small sample (8 intents from the repo, in-distribution), single stochastic run, and the few-shot examples include patterns close to the test set. The number is a viability signal, not a proof of generalization. Re-running on a hold-out set is the next rigor step. But the floor — *whatever the model produces, the compiler either accepts it or rejects it* — holds regardless of generation quality. That floor is the architectural bet.
 
 For how to write `.intent` prose that the AI maps reliably to Verbose constructs — which phrasings produce `all` / `any` / `map` / `filter` / `sum`, how to cross-reference rules, what the defaults are when the prose is silent — see [INTENT.md](INTENT.md).
 
