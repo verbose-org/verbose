@@ -68,11 +68,23 @@ def run_one(
 
     Returns (status, attempts) where status ∈ {"first_try", "corrected", "failed"}.
     """
+    # The verifier resolves `@source: <basename>:<line>` relative to
+    # the .verbose file's directory. Since we write the .verbose into
+    # a tmpdir (to keep the canonical examples/*.verbose intact), the
+    # original .intent is not co-located. Symlink it next to the
+    # output so the verifier finds the intent alongside the verbose.
+    sibling_intent = output_path.parent / intent_path.name
+    if not sibling_intent.exists():
+        sibling_intent.symlink_to(intent_path.resolve())
+
     script = "generate_sdk.py" if use_sdk else "generate.py"
     cmd = [
         sys.executable,
         str(REPO / "tools" / script),
-        str(intent_path),
+        # Pass the intent via its symlinked tmpdir path so the model's
+        # `@source: <basename>:LINE` matches what the verifier resolves
+        # (basename of the symlink, looked up next to the .verbose).
+        str(sibling_intent),
         "--output", str(output_path),
         "--max-corrections", str(max_corrections),
         "--model", model,

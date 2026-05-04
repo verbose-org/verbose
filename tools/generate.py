@@ -432,6 +432,34 @@ Output the complete .verbose file now.
 """
 
 
+# Matches `@source:` lines whose value contains a path component (any `/`
+# or `\` before the `:line` suffix). The Claude Agent SDK injects the
+# CWD via system-reminder messages on every turn, which biases the
+# model toward emitting absolute paths even when the prompt instructs
+# otherwise. Rather than fight the prompt, we normalise post-generation:
+# any path-like @source value gets its basename extracted.
+import re as _re
+_SOURCE_PATH_RE = _re.compile(
+    r'(@source\s*:\s*)([^\s:]*[\\/][^\s:]*)(:\d+)',
+    _re.MULTILINE,
+)
+
+
+def normalize_source_paths(verbose_text: str) -> str:
+    """Collapse any path in `@source: <path>:<line>` to its basename.
+
+    Idempotent and safe on already-correct input (the regex only fires
+    when a slash is present in the value).
+    """
+    def _basename(match):
+        prefix, path, suffix = match.group(1), match.group(2), match.group(3)
+        # Use the part after the last separator. Both / and \ handled —
+        # the model occasionally emits Windows-style paths even on Linux.
+        bare = path.replace("\\", "/").rsplit("/", 1)[-1]
+        return f"{prefix}{bare}{suffix}"
+    return _SOURCE_PATH_RE.sub(_basename, verbose_text)
+
+
 def build_correction_user_prompt(diagnostic: str) -> str:
     # Trim the diagnostic — the verifier sometimes prints multi-page
     # output. The first ~2000 chars usually contain the actionable
@@ -540,7 +568,7 @@ def run(
         if not quiet:
             print(f"  [attempt {attempt + 1}] calling {model}...", file=sys.stderr)
         text = call_claude(model, system, messages)
-        verbose = strip_code_fence(text)
+        verbose = normalize_source_paths(strip_code_fence(text))
         output_path.write_text(verbose)
 
         ok, diag = verify(output_path)

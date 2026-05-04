@@ -59,6 +59,7 @@ from generate import (  # noqa: E402
     build_initial_user_prompt,
     build_system_prompt,
     indent,
+    normalize_source_paths,
     strip_code_fence,
     verify,
 )
@@ -129,7 +130,7 @@ async def run_async(
                         if isinstance(block, TextBlock):
                             text += block.text
 
-            verbose = strip_code_fence(text)
+            verbose = normalize_source_paths(strip_code_fence(text))
             output_path.write_text(verbose)
 
             ok, diag = verify(output_path)
