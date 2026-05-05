@@ -428,7 +428,17 @@ failed            = 0/5
 
 The five generated `.verbose` files are real solutions — not minimal compiles that ducked the prompt. Each declares the right `reads:`/`calls:`, the right termination bound, and the construct the prose actually asked for (the verifier rejects stand-ins).
 
-Two numbers, two regimes. The 8/8 says *the pipeline ergonomics work for in-distribution intents*. The 4/5 + 1 correction says *the model can compose primitives it learns from `INTENT.md` alone, on domains never seen here, with the verifier catching the one slip*. Neither is a guarantee — both are data points.
+Same hold-out re-run with **Claude Opus 4.7** (`--model claude-opus-4-7`):
+
+```
+first_try         = 5/5
+after_corrections = 0/5
+failed            = 0/5
+```
+
+The stronger model resolves `low_stock_count` on the first attempt, so the correction loop never fires. The five `.verbose` outputs are again real solutions; one micro-tell that Opus is doing more work before emitting — on `meter_billing`'s tiered-price arm it wrote `25 * consumption - 1000` where Sonnet wrote `1500 + 25 * (consumption - 100)` (algebraically equal, constant-folded). Both are accepted; the verifier doesn't care which.
+
+Three numbers, three regimes. The 8/8 says *the pipeline ergonomics work for in-distribution intents*. The 4/5 + 1 correction says *Sonnet can compose primitives it learns from `INTENT.md` alone, on domains never seen here, with the verifier catching the one slip*. The 5/5 with Opus says *a stronger model raises the first-try rate without changing the floor*. None of these is a guarantee — all are data points.
 
 The architectural floor stands either way: *whatever the model produces, the compiler either accepts it or rejects it*. That floor is the bet.
 
