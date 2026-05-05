@@ -107,6 +107,19 @@ struct TextPrimLocals {
     j: u32,
 }
 
+/// What kind of Result the rule returns. Drives both the
+/// type-section signature and the leaf encoding inside
+/// `emit_wasm_result_body`. Slice W4-Result supports two shapes;
+/// the rest are still rejected at the result_types match.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResultShape {
+    /// Result(number, text) — (i32 tag, i64 ok, i32 err_ptr, i32 err_len).
+    NumberText,
+    /// Result(text, text) — (i32 tag, i32 ok_ptr, i32 ok_len,
+    /// i32 err_ptr, i32 err_len).
+    TextText,
+}
+
 /// Per-emit context bundle. Keeps the emit_wasm_expr signature
 /// short as the backend grows; everything the recursive emitter
 /// needs to look up sits here.
@@ -225,10 +238,32 @@ pub fn compile_wasm(
     // --- Result schema --------------------------------------------
     // `text` output uses multi-value (i32, i32). Bool stays i32,
     // Number stays i64 — both 1-result.
+    //
+    // W4-Result (this slice): `Result(T, E)` outputs are encoded as a
+    // tagged tuple. Tag is i32 (0 = Ok, 1 = Err); each arm contributes
+    // its full encoding (i64 for number, i32+i32 for text). Both arms
+    // are always emitted on the stack — the un-live arm's slots get
+    // zero placeholders. Host reads `tag` first; the un-live slots
+    // are not contractually meaningful. Supported shapes:
+    //
+    //   Result(number, text):  (i32 tag, i64 ok, i32 err_ptr, i32 err_len)
+    //   Result(text, text):    (i32 tag, i32 ok_ptr, i32 ok_len,
+    //                           i32 err_ptr, i32 err_len)
     let result_types: Vec<u8> = match &rule.output_ty {
         Type::Bool => vec![0x7F],
         Type::Number => vec![0x7E],
         Type::Text => vec![0x7F, 0x7F],
+        Type::Result(ok_ty, err_ty) => match (ok_ty.as_ref(), err_ty.as_ref()) {
+            (Type::Number, Type::Text) => vec![0x7F, 0x7E, 0x7F, 0x7F],
+            (Type::Text,   Type::Text) => vec![0x7F, 0x7F, 0x7F, 0x7F, 0x7F],
+            _ => return Err(WasmError {
+                message: format!(
+                    "WASM: Result({:?}, {:?}) outputs not yet supported. Slice W4-Result handles \
+                     Result(number, text) and Result(text, text); other shapes need their own ABI design call.",
+                    ok_ty, err_ty,
+                ),
+            }),
+        },
         other => {
             return Err(WasmError {
                 message: format!("unsupported output type {:?} in the WASM backend", other),
@@ -237,6 +272,18 @@ pub fn compile_wasm(
     };
     let is_bool = rule.output_ty == Type::Bool;
     let is_text_out = rule.output_ty == Type::Text;
+    // For routing the rule body's emit phase + the multi-value if
+    // blocktype, we need to know not just "is Result" but which
+    // shape, since the Ok arm's payload width differs.
+    let result_shape: Option<ResultShape> = match &rule.output_ty {
+        Type::Result(ok_ty, err_ty) => match (ok_ty.as_ref(), err_ty.as_ref()) {
+            (Type::Number, Type::Text) => Some(ResultShape::NumberText),
+            (Type::Text,   Type::Text) => Some(ResultShape::TextText),
+            _ => unreachable!("guarded by the result_types match above"),
+        },
+        _ => None,
+    };
+    let is_result_out = result_shape.is_some();
 
     // --- Text literal collection + offset assignment ---------------
     // Walk the rule body and let-binding RHSes for every Expr::Text
@@ -261,7 +308,12 @@ pub fn compile_wasm(
     // returns `text` from a literal still needs memory because the host
     // reads bytes from the data section through it; a pure-number rule
     // skips memory entirely (keeps modules tiny).
+    //
+    // Result outputs always need memory: the Err arm carries text, and
+    // the host-side decoder reads the err bytes from the exported
+    // memory via (err_ptr, err_len).
     let needs_memory = is_text_out
+        || is_result_out
         || field_shapes.values().any(|s| matches!(s, FieldShape::Text { .. }))
         || !text_literals.is_empty();
 
@@ -435,8 +487,15 @@ pub fn compile_wasm(
     // Type 0 is always the rule's signature. Helper functions append
     // their own types in a fixed order (itoa → parse_int → json_escape)
     // so type/func indices line up with `next_helper_idx` above.
+    //
+    // For Result-typed rules (W4-Result), one extra type entry is
+    // appended at the END as the multi-value blocktype the if/else
+    // instruction references: `() -> (... result types ...)`. It has
+    // no params and the same result schema as the rule itself. No
+    // function points to it — only the `if blocktype` byte does.
     let mut type_section = Vec::new();
-    let n_types: u32 = 1 + n_helpers;
+    let n_extra_types: u32 = if is_result_out { 1 } else { 0 };
+    let n_types: u32 = 1 + n_helpers + n_extra_types;
     emit_leb128(&mut type_section, n_types as u64);
     type_section.push(0x60);                         // type 0: rule
     emit_leb128(&mut type_section, param_types.len() as u64);
@@ -457,6 +516,18 @@ pub fn compile_wasm(
         // 3-result return uses WASM 2.0 multi-value, supported in Node.
         type_section.extend_from_slice(&[0x60, 0x03, 0x7F, 0x7F, 0x7F, 0x03, 0x7F, 0x7F, 0x7F]);
     }
+    let result_block_typeidx: Option<u32> = if is_result_out {
+        // Same result schema as type 0, but no params (it's a block
+        // type, the if's stack delta starts empty and ends with the
+        // result tuple).
+        type_section.push(0x60);
+        type_section.push(0x00);                     // 0 params
+        emit_leb128(&mut type_section, result_types.len() as u64);
+        type_section.extend_from_slice(&result_types);
+        Some(1 + n_helpers)
+    } else {
+        None
+    };
     emit_section(&mut module, 1, &type_section);
 
     // === Function section ===
@@ -560,14 +631,21 @@ pub fn compile_wasm(
         }
     }
 
-    // Emit main expression.
-    emit_wasm_expr(&mut body, &rule.logic.value, &ctx)?;
-
-    // If rule returns bool but expr produces i64, wrap to i32. Text
-    // outputs already leave (i32, i32) on the stack from Expr::Text /
-    // text Expr::Field / Concat — no widening needed.
-    if is_bool {
-        body.push(0xA7); // i32.wrap_i64
+    // Emit main expression. For Result-typed rules we route through
+    // emit_wasm_result_body, which handles Ok/Err leaves and any
+    // top-level if/else with the multi-value blocktype.
+    if let Some(shape) = result_shape {
+        let block_idx = result_block_typeidx
+            .expect("result_block_typeidx is set whenever result_shape is");
+        emit_wasm_result_body(&mut body, &rule.logic.value, &ctx, shape, block_idx)?;
+    } else {
+        emit_wasm_expr(&mut body, &rule.logic.value, &ctx)?;
+        // If rule returns bool but expr produces i64, wrap to i32. Text
+        // outputs already leave (i32, i32) on the stack from Expr::Text /
+        // text Expr::Field / Concat — no widening needed.
+        if is_bool {
+            body.push(0xA7); // i32.wrap_i64
+        }
     }
 
     body.push(0x0B); // end
@@ -929,6 +1007,9 @@ fn walk_text_literals<F: FnMut(&str)>(expr: &Expr, f: &mut F) {
         Expr::StartsWith(h, n) | Expr::EndsWith(h, n) | Expr::Contains(h, n) => {
             walk_text_literals(h, f); walk_text_literals(n, f);
         }
+        // W4-Result: Ok/Err wrap an inner expression that may carry
+        // its own literals (e.g. Err("rejected") or Err(concat(...))).
+        Expr::Ok(inner) | Expr::Err(inner) => walk_text_literals(inner, f),
         _ => {}
     }
 }
@@ -948,6 +1029,7 @@ fn expr_uses_text_primitive(expr: &Expr) -> bool {
         Expr::Min(a, b) | Expr::Max(a, b) => expr_uses_text_primitive(a) || expr_uses_text_primitive(b),
         Expr::Call(_, args) => args.iter().any(expr_uses_text_primitive),
         Expr::Concat(args) => args.iter().any(expr_uses_text_primitive),
+        Expr::Ok(inner) | Expr::Err(inner) => expr_uses_text_primitive(inner),
         _ => false,
     }
 }
@@ -965,6 +1047,7 @@ fn expr_uses_parse_int(expr: &Expr) -> bool {
         Expr::StartsWith(h, n) | Expr::EndsWith(h, n) | Expr::Contains(h, n) => {
             expr_uses_parse_int(h) || expr_uses_parse_int(n)
         }
+        Expr::Ok(inner) | Expr::Err(inner) => expr_uses_parse_int(inner),
         _ => false,
     }
 }
@@ -982,6 +1065,7 @@ fn expr_uses_json_escape(expr: &Expr) -> bool {
         Expr::StartsWith(h, n) | Expr::EndsWith(h, n) | Expr::Contains(h, n) => {
             expr_uses_json_escape(h) || expr_uses_json_escape(n)
         }
+        Expr::Ok(inner) | Expr::Err(inner) => expr_uses_json_escape(inner),
         _ => false,
     }
 }
@@ -1043,6 +1127,7 @@ fn expr_uses_concat(expr: &Expr) -> bool {
         Expr::StartsWith(h, n) | Expr::EndsWith(h, n) | Expr::Contains(h, n) => {
             expr_uses_concat(h) || expr_uses_concat(n)
         }
+        Expr::Ok(inner) | Expr::Err(inner) => expr_uses_concat(inner),
         _ => false,
     }
 }
@@ -1082,6 +1167,9 @@ fn expr_concat_has_number_arg(
             expr_concat_has_number_arg(h, field_shapes, binding_shapes)
                 || expr_concat_has_number_arg(n, field_shapes, binding_shapes)
         }
+        Expr::Ok(inner) | Expr::Err(inner) => {
+            expr_concat_has_number_arg(inner, field_shapes, binding_shapes)
+        }
         _ => false,
     }
 }
@@ -1105,6 +1193,7 @@ fn expr_has_nested_concat(expr: &Expr) -> bool {
             Expr::StartsWith(h, n) | Expr::EndsWith(h, n) | Expr::Contains(h, n) => {
                 inside_concat(h) || inside_concat(n)
             }
+            Expr::Ok(inner) | Expr::Err(inner) => inside_concat(inner),
             _ => false,
         }
     }
@@ -1119,6 +1208,7 @@ fn expr_has_nested_concat(expr: &Expr) -> bool {
         Expr::StartsWith(h, n) | Expr::EndsWith(h, n) | Expr::Contains(h, n) => {
             expr_has_nested_concat(h) || expr_has_nested_concat(n)
         }
+        Expr::Ok(inner) | Expr::Err(inner) => expr_has_nested_concat(inner),
         _ => false,
     }
 }
@@ -1192,8 +1282,8 @@ fn emit_wasm_expr(
                 // Comparisons return i32 in WASM — extend to i64 for consistency
                 BinOp::Gt => { code.push(0x55); code.push(0xAD); }     // i64.gt_s → i64.extend_i32_u
                 BinOp::Lt => { code.push(0x53); code.push(0xAD); }     // i64.lt_s → i64.extend_i32_u
-                BinOp::GtEq => { code.push(0x57); code.push(0xAD); }   // i64.ge_s → i64.extend_i32_u
-                BinOp::LtEq => { code.push(0x55); code.push(0xAD); }   // i64.le_s → i64.extend_i32_u
+                BinOp::GtEq => { code.push(0x59); code.push(0xAD); }   // i64.ge_s → i64.extend_i32_u
+                BinOp::LtEq => { code.push(0x57); code.push(0xAD); }   // i64.le_s → i64.extend_i32_u
                 BinOp::Eq => { code.push(0x51); code.push(0xAD); }     // i64.eq → i64.extend_i32_u
                 BinOp::NotEq => { code.push(0x52); code.push(0xAD); }  // i64.ne → i64.extend_i32_u
                 BinOp::And => code.push(0x83),     // i64.and
@@ -1433,6 +1523,107 @@ fn emit_wasm_expr(
         }
         _ => Err(WasmError {
             message: format!("unsupported expression in WASM backend"),
+        }),
+    }
+}
+
+/// Emit the body of a `Result(T, E)`-typed rule (W4-Result).
+///
+/// The legal top-level shapes are:
+///   - `Ok(<inner>)`               — a flat success constructor
+///   - `Err(<inner>)`              — a flat failure constructor
+///   - `if cond then A else B`     — where each arm is one of the
+///                                   above (recursively); the if uses
+///                                   a multi-value blocktype matching
+///                                   the rule's result schema
+///
+/// Per shape, both Ok and Err arms always emit ALL the result slots
+/// onto the stack — the un-live arm gets zero placeholders. The host
+/// reads `tag` first; the placeholder slots are deliberately
+/// meaningless to consumers (the contract is "tag picks the live
+/// payload"), so the cheap zero is fine.
+///
+/// Callers responsible for: putting the type-section entry for
+/// `result_block_typeidx` in place beforehand, and threading
+/// `result_shape` correctly so number-vs-text Ok payloads emit the
+/// right WASM type.
+///
+/// Slice scope: `match_result` is rejected here. The fallthrough arm
+/// will land in slice W4-MatchResult.
+fn emit_wasm_result_body(
+    code: &mut Vec<u8>,
+    expr: &Expr,
+    ctx: &WasmCtx,
+    shape: ResultShape,
+    result_block_typeidx: u32,
+) -> Result<(), WasmError> {
+    match expr {
+        Expr::Ok(inner) => {
+            // tag = 0
+            code.push(0x41);                                 // i32.const
+            emit_sleb128(code, 0);
+            // ok payload
+            match shape {
+                ResultShape::NumberText => {
+                    emit_wasm_expr(code, inner, ctx)?;        // pushes i64
+                }
+                ResultShape::TextText => {
+                    emit_wasm_expr(code, inner, ctx)?;        // pushes (i32 ptr, i32 len)
+                }
+            }
+            // err arm placeholders (always two i32s for text)
+            code.push(0x41); emit_sleb128(code, 0);          // err_ptr = 0
+            code.push(0x41); emit_sleb128(code, 0);          // err_len = 0
+            Ok(())
+        }
+        Expr::Err(inner) => {
+            // tag = 1
+            code.push(0x41);
+            emit_sleb128(code, 1);
+            // ok arm placeholder (width depends on shape)
+            match shape {
+                ResultShape::NumberText => {
+                    code.push(0x42); emit_sleb128(code, 0);  // i64.const 0
+                }
+                ResultShape::TextText => {
+                    code.push(0x41); emit_sleb128(code, 0);  // ok_ptr = 0
+                    code.push(0x41); emit_sleb128(code, 0);  // ok_len = 0
+                }
+            }
+            // err payload (text)
+            emit_wasm_expr(code, inner, ctx)?;                // pushes (i32 ptr, i32 len)
+            Ok(())
+        }
+        Expr::If(cond, then_e, else_e) => {
+            // The condition is an i64 in our scalar pipeline (comparisons
+            // chain through i64.extend_i32_u). The if instruction takes
+            // an i32 condition, so wrap before the branch.
+            emit_wasm_expr(code, cond, ctx)?;
+            code.push(0xA7);                                 // i32.wrap_i64
+            code.push(0x04);                                 // if
+            // Multi-value blocktype: signed leb128 of the type index.
+            // Positive values denote a typeidx (the alternative — a
+            // single-value blocktype — uses the negative-encoded
+            // valtype byte, which is what other if sites use today).
+            emit_sleb128(code, result_block_typeidx as i64);
+            emit_wasm_result_body(code, then_e, ctx, shape, result_block_typeidx)?;
+            code.push(0x05);                                 // else
+            emit_wasm_result_body(code, else_e, ctx, shape, result_block_typeidx)?;
+            code.push(0x0B);                                 // end
+            Ok(())
+        }
+        Expr::MatchResult(_, _, _, _, _) => {
+            Err(WasmError {
+                message: "WASM: match_result is not yet supported (slice W4-MatchResult will lift this). \
+                          For now, inline the validation as `if cond then Ok(...) else Err(...)`."
+                          .into(),
+            })
+        }
+        other => Err(WasmError {
+            message: format!(
+                "WASM: a Result-typed rule's body must be Ok(...), Err(...), or an if/else of those shapes; got {:?}",
+                other,
+            ),
         }),
     }
 }
@@ -1687,6 +1878,9 @@ fn expr_uses_scratch(expr: &Expr) -> bool {
         Expr::StartsWith(h, n) | Expr::EndsWith(h, n) | Expr::Contains(h, n) => {
             expr_uses_scratch(h) || expr_uses_scratch(n)
         }
+        // W4-Result: Ok/Err inner can use abs/min/max inside the
+        // ok/err payload expression.
+        Expr::Ok(inner) | Expr::Err(inner) => expr_uses_scratch(inner),
         // Leaves and shapes the backend doesn't yet emit.
         _ => false,
     }
@@ -3319,5 +3513,435 @@ function setN(mem, s) {{
             ok_count,
             stdout
         );
+    }
+
+    /// Regression: `>=` and `<=` had swapped opcodes
+    /// (`0x57` for GtEq, `0x55` for LtEq — the bytes for `le_s` and
+    /// `gt_s` respectively, not `ge_s` and `le_s`). The bug went
+    /// unnoticed because no W1/W3a/W3b/W3c test ran a rule whose
+    /// result depends on `>=` or `<=`. Result-typed rules surfaced
+    /// it (validate_purchase uses `customer_age >= 18`).
+    /// Pinned here at runtime so a future opcode shuffle can't
+    /// reintroduce the swap silently.
+    #[test]
+    fn wasm_w1_runtime_gteq_lteq_round_trip() {
+        use std::process::Command;
+        if Command::new("node").arg("--version").output().is_err() {
+            eprintln!("note: `node` not found, skipping WASM runtime test");
+            return;
+        }
+        let src = r#"@verbose 0.1.0
+concept Pair
+  @intention: "p"
+  @source: invoices.intent:1
+  fields:
+    a : number
+    b : number
+rule a_at_least_b
+  @intention: "a >= b"
+  @source: invoices.intent:1
+  input:
+    p : Pair
+  output:
+    n : number
+  logic:
+    n = if p.a >= p.b then 1 else 0
+  proofs:
+    purity:
+      reads : [p.a, p.b]
+      calls : []
+    termination:
+      bound : 2
+rule a_at_most_b
+  @intention: "a <= b"
+  @source: invoices.intent:1
+  input:
+    p : Pair
+  output:
+    n : number
+  logic:
+    n = if p.a <= p.b then 1 else 0
+  proofs:
+    purity:
+      reads : [p.a, p.b]
+      calls : []
+    termination:
+      bound : 2
+"#;
+        let ge_path = "/tmp/wasm_w1_runtime_gteq.wasm";
+        let le_path = "/tmp/wasm_w1_runtime_lteq.wasm";
+
+        use crate::lexer::Lexer;
+        use crate::parser::Parser;
+        let tokens = Lexer::new(src).tokenize().expect("tokenize");
+        let program = Parser::new(tokens).parse_program().expect("parse");
+        compile_wasm(&program, "a_at_least_b", ge_path).expect("compile ge");
+        compile_wasm(&program, "a_at_most_b", le_path).expect("compile le");
+
+        let script = format!(
+            r#"
+const fs = require("fs");
+async function check(path, fn, args, expected) {{
+  const buf = fs.readFileSync(path);
+  if (!WebAssembly.validate(buf)) {{ console.log("FAIL: invalid module " + path); return; }}
+  const m = await WebAssembly.instantiate(buf);
+  const got = m.instance.exports[fn](...args);
+  const gotStr = typeof got === "bigint" ? got.toString() : String(got);
+  if (gotStr === String(expected)) {{
+    console.log("OK " + fn + "(" + args.join(",") + ") = " + gotStr);
+  }} else {{
+    console.log("FAIL " + fn + "(" + args.join(",") + ") = " + gotStr + ", expected " + expected);
+  }}
+}}
+(async () => {{
+  // a >= b
+  await check("{ge_path}", "a_at_least_b", [5n, 3n], 1);   // strictly greater
+  await check("{ge_path}", "a_at_least_b", [5n, 5n], 1);   // equal — the test that distinguishes >= from >
+  await check("{ge_path}", "a_at_least_b", [3n, 5n], 0);   // strictly less
+  // a <= b
+  await check("{le_path}", "a_at_most_b", [3n, 5n], 1);
+  await check("{le_path}", "a_at_most_b", [5n, 5n], 1);
+  await check("{le_path}", "a_at_most_b", [5n, 3n], 0);
+}})();
+"#
+        );
+        let out = Command::new("node").args(["-e", &script]).output().expect("spawn node");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let _ = std::fs::remove_file(ge_path);
+        let _ = std::fs::remove_file(le_path);
+        assert!(
+            !stdout.contains("FAIL"),
+            "GtEq/LtEq runtime check failed; stdout:\n{}\nstderr:\n{}",
+            stdout,
+            String::from_utf8_lossy(&out.stderr),
+        );
+        assert!(stdout.contains("OK a_at_least_b(5,5)"), "no equal-case OK; stdout:\n{}", stdout);
+    }
+
+    /// W4-Result: `output: Result(number, text)` produces a 4-result
+    /// function signature `(i32 tag, i64 ok, i32 err_ptr, i32 err_len)`,
+    /// AND a SECOND type entry that the if/else's blocktype references
+    /// (no params, same 4 results).
+    ///
+    /// Pinned shape: type section starts with `02` (two type entries),
+    /// the rule's result-tuple bytes `04 7F 7E 7F 7F` appear, AND a
+    /// no-params block-type entry `60 00 04 7F 7E 7F 7F` appears too.
+    #[test]
+    fn wasm_w4_result_number_text_type_section_pins_4_results_and_blocktype() {
+        let src = r#"@verbose 0.1.0
+concept C
+  @intention: "c"
+  @source: invoices.intent:1
+  fields:
+    age    : number
+    amount : number
+rule validate
+  @intention: "validate"
+  @source: invoices.intent:1
+  input:
+    c : C
+  output:
+    r : Result(number, text)
+  logic:
+    r = if c.age >= 18 then Ok(c.amount) else Err("under 18")
+  proofs:
+    purity:
+      reads : [c.age, c.amount]
+      calls : []
+    termination:
+      bound : 4
+"#;
+        let bytes = compile_to_bytes(src, "validate", "result_num_text_typesec");
+        assert_eq!(&bytes[0..4], b"\0asm");
+        // Rule's result-tuple bytes: 4 results (0x04) of (i32 i64 i32 i32).
+        assert!(
+            bytes.windows(5).any(|w| w == [0x04, 0x7F, 0x7E, 0x7F, 0x7F]),
+            "missing rule result tuple `04 7F 7E 7F 7F`; bytes:\n{:02X?}", bytes
+        );
+        // Block-type entry: type header `60 00 04 7F 7E 7F 7F` (0 params, 4 results).
+        // This MUST appear in addition to the rule's signature so the
+        // if/else can reference it as its multi-value blocktype.
+        assert!(
+            bytes.windows(7).any(|w| w == [0x60, 0x00, 0x04, 0x7F, 0x7E, 0x7F, 0x7F]),
+            "missing blocktype entry `60 00 04 7F 7E 7F 7F`; bytes:\n{:02X?}", bytes
+        );
+    }
+
+    /// W4-Result: `output: Result(text, text)` is the 5-result variant
+    /// `(i32 tag, i32 ok_ptr, i32 ok_len, i32 err_ptr, i32 err_len)`,
+    /// and the matching block-type entry is `60 00 05 7F 7F 7F 7F 7F`.
+    #[test]
+    fn wasm_w4_result_text_text_type_section_pins_5_results() {
+        let src = r#"@verbose 0.1.0
+concept C
+  @intention: "c"
+  @source: invoices.intent:1
+  fields:
+    balance : number
+rule classify
+  @intention: "classify"
+  @source: invoices.intent:1
+  input:
+    c : C
+  output:
+    r : Result(text, text)
+  logic:
+    r = if c.balance >= 100000 then Ok("premium") else Err("below threshold")
+  proofs:
+    purity:
+      reads : [c.balance]
+      calls : []
+    termination:
+      bound : 4
+"#;
+        let bytes = compile_to_bytes(src, "classify", "result_text_text_typesec");
+        assert_eq!(&bytes[0..4], b"\0asm");
+        assert!(
+            bytes.windows(6).any(|w| w == [0x05, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F]),
+            "missing rule result tuple `05 7F*5`; bytes:\n{:02X?}", bytes
+        );
+        assert!(
+            bytes.windows(8).any(|w| w == [0x60, 0x00, 0x05, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F]),
+            "missing blocktype entry `60 00 05 7F*5`; bytes:\n{:02X?}", bytes
+        );
+    }
+
+    /// W4-Result end-to-end: load the compiled `Result(number, text)`
+    /// module in Node and check both Ok and Err arms. Specifically pins
+    /// that:
+    ///   - tag=0 with the live ok value, err slots are placeholder zeros
+    ///   - tag=1 with the err (ptr, len) pointing at decodable bytes,
+    ///     ok slot is placeholder zero
+    ///   - the err arm tolerates a `concat(...)` payload that mixes a
+    ///     literal and a number (exercises itoa on the bump allocator
+    ///     side-by-side with the new Result emitter).
+    #[test]
+    fn wasm_w4_runtime_result_number_text_both_arms() {
+        use std::process::Command;
+        if Command::new("node").arg("--version").output().is_err() {
+            eprintln!("note: `node` not found, skipping WASM runtime test");
+            return;
+        }
+        let src = r#"@verbose 0.1.0
+concept Purchase
+  @intention: "p"
+  @source: invoices.intent:1
+  fields:
+    amount : number
+    age    : number
+rule validate
+  @intention: "v"
+  @source: invoices.intent:1
+  input:
+    p : Purchase
+  output:
+    r : Result(number, text)
+  logic:
+    r = if p.age >= 18 then Ok(p.amount) else Err(concat("age ", p.age, " under 18"))
+  proofs:
+    purity:
+      reads : [p.amount, p.age]
+      calls : []
+    termination:
+      bound : 6
+"#;
+        let path = "/tmp/wasm_w4_runtime_result_num.wasm";
+        use crate::lexer::Lexer;
+        use crate::parser::Parser;
+        let tokens = Lexer::new(src).tokenize().expect("tokenize");
+        let program = Parser::new(tokens).parse_program().expect("parse");
+        compile_wasm(&program, "validate", path).expect("compile");
+
+        let script = format!(
+            r#"
+const fs = require("fs");
+(async () => {{
+  const buf = fs.readFileSync("{path}");
+  if (!WebAssembly.validate(buf)) {{ console.log("FAIL: invalid module"); return; }}
+  const m = await WebAssembly.instantiate(buf);
+  const fn = m.instance.exports.validate;
+  const mem = new Uint8Array(m.instance.exports.memory.buffer);
+  const dec = new TextDecoder();
+  // Ok arm: amount=1000, age=25
+  const ok = fn(1000n, 25n);
+  if (ok[0] === 0 && ok[1] === 1000n && ok[2] === 0 && ok[3] === 0) {{
+    console.log("OK ok-arm:", JSON.stringify(ok, (_, v) => typeof v === "bigint" ? v.toString() : v));
+  }} else {{
+    console.log("FAIL ok-arm: got", JSON.stringify(ok, (_, v) => typeof v === "bigint" ? v.toString() : v));
+  }}
+  // Err arm: amount=1000, age=15 — ok slot is placeholder, err slots live
+  const err = fn(1000n, 15n);
+  if (err[0] === 1 && err[1] === 0n && err[3] > 0) {{
+    const msg = dec.decode(mem.subarray(err[2], err[2] + err[3]));
+    if (msg === "age 15 under 18") {{
+      console.log("OK err-arm: msg =", JSON.stringify(msg));
+    }} else {{
+      console.log("FAIL err-arm: msg =", JSON.stringify(msg));
+    }}
+  }} else {{
+    console.log("FAIL err-arm: got", JSON.stringify(err, (_, v) => typeof v === "bigint" ? v.toString() : v));
+  }}
+}})();
+"#
+        );
+        let out = Command::new("node").args(["-e", &script]).output().expect("spawn node");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let _ = std::fs::remove_file(path);
+        assert!(
+            !stdout.contains("FAIL"),
+            "Result(number, text) runtime check failed; stdout:\n{}\nstderr:\n{}",
+            stdout,
+            String::from_utf8_lossy(&out.stderr),
+        );
+        assert!(stdout.contains("OK ok-arm"), "no ok-arm OK; stdout:\n{}", stdout);
+        assert!(stdout.contains("OK err-arm"), "no err-arm OK; stdout:\n{}", stdout);
+    }
+
+    /// W4-Result end-to-end: same shape as the previous test but for
+    /// `Result(text, text)`. Both arms produce text; the un-live arm's
+    /// (ptr, len) slots are placeholder zeros.
+    #[test]
+    fn wasm_w4_runtime_result_text_text_both_arms() {
+        use std::process::Command;
+        if Command::new("node").arg("--version").output().is_err() {
+            eprintln!("note: `node` not found, skipping WASM runtime test");
+            return;
+        }
+        let src = r#"@verbose 0.1.0
+concept C
+  @intention: "c"
+  @source: invoices.intent:1
+  fields:
+    balance : number
+rule classify
+  @intention: "classify"
+  @source: invoices.intent:1
+  input:
+    c : C
+  output:
+    r : Result(text, text)
+  logic:
+    r = if c.balance >= 100000 then Ok("premium") else Err(concat("balance ", c.balance, " below"))
+  proofs:
+    purity:
+      reads : [c.balance]
+      calls : []
+    termination:
+      bound : 5
+"#;
+        let path = "/tmp/wasm_w4_runtime_result_text.wasm";
+        use crate::lexer::Lexer;
+        use crate::parser::Parser;
+        let tokens = Lexer::new(src).tokenize().expect("tokenize");
+        let program = Parser::new(tokens).parse_program().expect("parse");
+        compile_wasm(&program, "classify", path).expect("compile");
+
+        let script = format!(
+            r#"
+const fs = require("fs");
+(async () => {{
+  const buf = fs.readFileSync("{path}");
+  if (!WebAssembly.validate(buf)) {{ console.log("FAIL: invalid module"); return; }}
+  const m = await WebAssembly.instantiate(buf);
+  const fn = m.instance.exports.classify;
+  const mem = new Uint8Array(m.instance.exports.memory.buffer);
+  const dec = new TextDecoder();
+  const decode = (p, l) => dec.decode(mem.subarray(p, p + l));
+  // Ok arm
+  const ok = fn(150000n);
+  if (ok[0] === 0 && ok[3] === 0 && ok[4] === 0 && decode(ok[1], ok[2]) === "premium") {{
+    console.log("OK ok-arm");
+  }} else {{
+    console.log("FAIL ok-arm:", JSON.stringify(ok));
+  }}
+  // Err arm
+  const err = fn(50000n);
+  if (err[0] === 1 && err[1] === 0 && err[2] === 0) {{
+    const msg = decode(err[3], err[4]);
+    if (msg === "balance 50000 below") {{
+      console.log("OK err-arm: msg =", JSON.stringify(msg));
+    }} else {{
+      console.log("FAIL err-arm: msg =", JSON.stringify(msg));
+    }}
+  }} else {{
+    console.log("FAIL err-arm:", JSON.stringify(err));
+  }}
+}})();
+"#
+        );
+        let out = Command::new("node").args(["-e", &script]).output().expect("spawn node");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let _ = std::fs::remove_file(path);
+        assert!(
+            !stdout.contains("FAIL"),
+            "Result(text, text) runtime check failed; stdout:\n{}\nstderr:\n{}",
+            stdout,
+            String::from_utf8_lossy(&out.stderr),
+        );
+        assert!(stdout.contains("OK ok-arm"), "no ok-arm OK; stdout:\n{}", stdout);
+        assert!(stdout.contains("OK err-arm"), "no err-arm OK; stdout:\n{}", stdout);
+    }
+
+    /// W4-Result slice scope: `match_result(...)` is rejected with a
+    /// clear, actionable message that points at the slice extension
+    /// (W4-MatchResult) lifting it. Pin the message so future grammar
+    /// or test-name shifts don't silently drop the breadcrumb.
+    #[test]
+    fn wasm_w4_match_result_rejected_with_breadcrumb() {
+        let src = r#"@verbose 0.1.0
+concept Purchase
+  @intention: "p"
+  @source: invoices.intent:1
+  fields:
+    age    : number
+    amount : number
+rule validate
+  @intention: "v"
+  @source: invoices.intent:1
+  input:
+    p : Purchase
+  output:
+    r : Result(number, text)
+  logic:
+    r = if p.age >= 18 then Ok(p.amount) else Err("under")
+  proofs:
+    purity:
+      reads : [p.age, p.amount]
+      calls : []
+    termination:
+      bound : 4
+rule discounted
+  @intention: "d"
+  @source: invoices.intent:1
+  input:
+    p : Purchase
+  output:
+    r : Result(number, text)
+  logic:
+    r = match_result(validate(p), v => Ok(v * 90 / 100), e => Err(e))
+  proofs:
+    purity:
+      reads : [p]
+      calls : [validate]
+    termination:
+      bound : 6
+"#;
+        use crate::lexer::Lexer;
+        use crate::parser::Parser;
+        let tokens = Lexer::new(src).tokenize().expect("tokenize");
+        let program = Parser::new(tokens).parse_program().expect("parse");
+        let path = "/tmp/wasm_w4_match_rejected.wasm";
+        let err = compile_wasm(&program, "discounted", path).expect_err("must reject match_result");
+        assert!(
+            err.message.contains("match_result is not yet supported"),
+            "expected breadcrumb mentioning match_result; got: {}",
+            err.message
+        );
+        assert!(
+            err.message.contains("W4-MatchResult"),
+            "expected slice name reference in error; got: {}",
+            err.message
+        );
+        let _ = std::fs::remove_file(path);
     }
 }
