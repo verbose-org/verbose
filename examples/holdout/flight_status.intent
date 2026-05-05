@@ -1,0 +1,2 @@
+1. A flight has a flight number, a departure city (text), an arrival city (text), and a delay in minutes.
+2. Produce a one-line status text for a flight: if the delay is greater than zero, the line is "Flight " followed by the flight number, then ": ", then the departure city, then " -> ", then the arrival city, then " (", then the delay, then " min late)"; otherwise the line is "Flight " followed by the flight number, then ": ", then the departure city, then " -> ", then the arrival city, then " ON TIME".

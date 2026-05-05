@@ -1,0 +1,2 @@
+1. An incoming request has a URL path.
+2. Classify a request by its path: if its path starts with "/api/", the category is "api"; otherwise if its path starts with "/admin/", the category is "admin"; otherwise the category is "public".

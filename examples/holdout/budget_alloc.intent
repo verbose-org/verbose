@@ -1,0 +1,2 @@
+1. A budget request has an amount requested and a remaining quota.
+2. The amount allocated to a budget request is the smaller of the amount requested and the remaining quota.

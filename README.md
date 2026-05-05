@@ -414,31 +414,31 @@ failed            = 0/8
 
 Honest caveats: small sample (8 intents from the repo, **in-distribution**), single stochastic run, and the few-shot examples include patterns close to the test set. The number is a viability signal, not a proof of generalization.
 
-#### Hold-out: 5 intents the model has never seen
+#### Hold-out: 10 intents the model has never seen
 
-To test generalization beyond the eval set, [`examples/holdout/`](examples/holdout/) contains 5 brand-new intents in domains absent from the repo (forum moderation, sensor freshness, library stock, meter billing, chat audit). Each one composes patterns the few-shot does **not** show: `contains` + `starts_with`, `now_unix() + abs` inside a `Result`, `count` over a collection that itself reads a runtime-loaded threshold (`parse_int(read(...))`), `match_result` with a nested `if/else` in the `Ok` arm, `length(text)` driving a reaction's `append_file`. The model has to assemble each from `INTENT.md` patterns, not a syntactic clone of a worked example.
+To test generalization beyond the eval set, [`examples/holdout/`](examples/holdout/) contains 10 brand-new intents in domains absent from the repo (forum moderation, sensor freshness, library stock, meter billing, chat audit, tournament prize pool, budget allocation, URL classifier, racing laps, flight status). Each composes patterns the few-shot does **not** show: text predicates (`contains`, `starts_with`, `length`), conditional text composition (`if cond then concat(...) else concat(...)`), runtime-loaded resources (`parse_int(read(...))`), the binary `min(a, b)` and the collection `min(coll, x => ...)` sugars side-by-side, `now_unix() + abs` inside a `Result`, `match_result` with a nested `if/else` in the `Ok` arm, `length(text)` driving a reaction's `append_file`, `sum` with conditional accumulation in a multi-rule chain. The model has to assemble each from `INTENT.md` patterns, not a syntactic clone of a worked example.
 
-Same model, same tooling, same `tools/eval.py --use-sdk`:
-
-```
-first_try         = 4/5
-after_corrections = 1/5    (low_stock_count: one verify→fix round)
-failed            = 0/5
-```
-
-The five generated `.verbose` files are real solutions — not minimal compiles that ducked the prompt. Each declares the right `reads:`/`calls:`, the right termination bound, and the construct the prose actually asked for (the verifier rejects stand-ins).
-
-Same hold-out re-run with **Claude Opus 4.7** (`--model claude-opus-4-7`):
+`tools/eval.py --use-sdk` against the 10 (Sonnet 4.6, the default model):
 
 ```
-first_try         = 5/5
-after_corrections = 0/5
-failed            = 0/5
+first_try         = 9/10
+after_corrections = 1/10    (low_stock_count: missing @intention on the resource block)
+failed            = 0/10
 ```
 
-The stronger model resolves `low_stock_count` on the first attempt, so the correction loop never fires. The five `.verbose` outputs are again real solutions; one micro-tell that Opus is doing more work before emitting — on `meter_billing`'s tiered-price arm it wrote `25 * consumption - 1000` where Sonnet wrote `1500 + 25 * (consumption - 100)` (algebraically equal, constant-folded). Both are accepted; the verifier doesn't care which.
+Same hold-out, `--model claude-opus-4-7`:
 
-Three numbers, three regimes. The 8/8 says *the pipeline ergonomics work for in-distribution intents*. The 4/5 + 1 correction says *Sonnet can compose primitives it learns from `INTENT.md` alone, on domains never seen here, with the verifier catching the one slip*. The 5/5 with Opus says *a stronger model raises the first-try rate without changing the floor*. None of these is a guarantee — all are data points.
+```
+first_try         = 8/10
+after_corrections = 2/10    (low_stock_count + prize_pool: lambda-bound var leaked into reads:)
+failed            = 0/10
+```
+
+Both runs are single stochastic shots; the per-model order is not load-bearing. What matters: zero failures across 20 model-runs, every correction converged in one round, every produced `.verbose` is a real solution (verified `reads:` / `calls:` / termination bound + the construct the prose asked for — the verifier rejects stand-ins).
+
+The recurring slip — only visible because the new diagnostic logging in `tools/generate.py` surfaces verifier rejections on stderr — is models declaring lambda-bound fields in `reads:`. In `sum(t.contestants, c => ... c.score ...)` both Sonnet and Opus occasionally include `c.score` as a top-level read; the verifier rejects, the model fixes it on the next round. Identifying this pattern is the kind of feedback the eval was supposed to surface, and now does.
+
+Three numbers, three regimes. The 8/8 says *the pipeline ergonomics work for in-distribution intents*. The 9/10 + 1 (Sonnet) and 8/10 + 2 (Opus) say *both models compose `INTENT.md` patterns on never-seen domains, with the verifier catching every slip and the correction loop closing in one round each*. None is a guarantee — all are data points, single runs, and the failure modes are now actionable.
 
 The architectural floor stands either way: *whatever the model produces, the compiler either accepts it or rejects it*. That floor is the bet.
 

@@ -1,0 +1,4 @@
+1. A contestant has a score and a number of questions answered.
+2. A tournament has a list of contestants.
+3. A contestant qualifies for the prize when they answered at least 10 questions.
+4. The total prize pool of a tournament is the sum of the scores of its qualifying contestants.

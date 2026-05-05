@@ -1,0 +1,3 @@
+1. A lap has a time in milliseconds.
+2. A race has a list of laps.
+3. The fastest lap time of a race is the smallest lap time among the laps.
