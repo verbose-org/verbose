@@ -570,6 +570,22 @@ def normalize_source_paths(verbose_text: str) -> str:
     return _SOURCE_PATH_RE.sub(_basename, verbose_text)
 
 
+def format_diagnostic_snippet(diagnostic: str, *, max_chars: int = 600) -> str:
+    """Render a truncated, indented version of the verifier's diagnostic
+    for stderr logging. Keeps the FIRST max_chars — the verifier puts
+    the actionable error line near the top, so head-truncation loses
+    the least signal.
+
+    Used by both generate.py and generate_sdk.py so the correction
+    loop is self-documenting: when an intent verifies after K rounds,
+    the operator sees what each round had to fix.
+    """
+    snippet = diagnostic.strip()
+    if len(snippet) > max_chars:
+        snippet = snippet[:max_chars] + "\n... (diagnostic truncated)"
+    return indent(snippet, "      ")
+
+
 def build_correction_user_prompt(diagnostic: str) -> str:
     # Trim the diagnostic — the verifier sometimes prints multi-page
     # output. The first ~2000 chars usually contain the actionable
@@ -687,7 +703,8 @@ def run(
         if attempt == max_corrections:
             return False, attempt + 1, diag
         if not quiet:
-            print(f"  [attempt {attempt + 1}] rejected; retrying with diagnostic", file=sys.stderr)
+            print(f"  [attempt {attempt + 1}] rejected; retrying with diagnostic:", file=sys.stderr)
+            print(format_diagnostic_snippet(diag), file=sys.stderr)
         messages.append({"role": "assistant", "content": verbose})
         messages.append({"role": "user", "content": build_correction_user_prompt(diag)})
 

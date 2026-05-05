@@ -58,6 +58,7 @@ from generate import (  # noqa: E402
     build_correction_user_prompt,
     build_initial_user_prompt,
     build_system_prompt,
+    format_diagnostic_snippet,
     indent,
     load_dotenv,
     normalize_source_paths,
@@ -140,7 +141,8 @@ async def run_async(
             if attempt == max_corrections:
                 return False, attempt + 1, diag
             if not quiet:
-                print(f"  [attempt {attempt + 1}] rejected; retrying with diagnostic", file=sys.stderr)
+                print(f"  [attempt {attempt + 1}] rejected; retrying with diagnostic:", file=sys.stderr)
+                print(format_diagnostic_snippet(diag), file=sys.stderr)
 
     # Unreachable; return for type checker.
     return False, max_corrections + 1, diag
