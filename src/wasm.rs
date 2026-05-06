@@ -120,6 +120,39 @@ enum ResultShape {
     TextText,
 }
 
+/// W4-MatchResult locals: where the four-or-five-tuple from the inlined
+/// callee body gets stashed before tag dispatch, plus the locals that
+/// hold the bound `ok_var` / `err_var` for the outer Ok/Err arms.
+///
+/// All indices are absolute (relative to the function's local index
+/// space, i.e. params + i64-group + i32-group). The shape decides
+/// which fields are meaningful: for NumberText `ok_stash_i64` and
+/// `ok_var_i64` are used; for TextText `ok_stash_ptr_i32` /
+/// `ok_stash_len_i32` and `ok_var_ptr_i32` / `ok_var_len_i32` are
+/// used. The unused slot indices stay as `u32::MAX` to surface a
+/// loud error if the wrong arm is read.
+#[derive(Debug, Clone, Copy)]
+struct MatchResultLocals {
+    /// i32 local that holds the callee tuple's tag.
+    tag_stash_i32: u32,
+    /// For NumberText: the i64 holding the callee's ok value.
+    ok_stash_i64: u32,
+    /// For TextText: i32 ptr/len holding the callee's ok text.
+    ok_stash_ptr_i32: u32,
+    ok_stash_len_i32: u32,
+    /// Always: i32 ptr/len holding the callee's err text.
+    err_stash_ptr_i32: u32,
+    err_stash_len_i32: u32,
+    /// For NumberText: the bound ok_var's i64 local (visible in outer ok_body).
+    ok_var_i64: u32,
+    /// For TextText: the bound ok_var's i32 ptr/len locals.
+    ok_var_ptr_i32: u32,
+    ok_var_len_i32: u32,
+    /// Always: the bound err_var's i32 ptr/len locals.
+    err_var_ptr_i32: u32,
+    err_var_len_i32: u32,
+}
+
 /// Per-emit context bundle. Keeps the emit_wasm_expr signature
 /// short as the backend grows; everything the recursive emitter
 /// needs to look up sits here.
@@ -151,6 +184,12 @@ struct WasmCtx<'a> {
     /// Function index of the inlined json_escape helper. `None` if the
     /// rule never references `json_escape(...)`.
     json_escape_func_idx: Option<u32>,
+    /// Locals reserved for a top-level `match_result(...)` in the rule
+    /// body (W4-MatchResult). `None` if the rule has no match_result.
+    /// The indices here are populated in compile_wasm before the
+    /// emitter runs; reading is gated on `result_shape` so the
+    /// shape-irrelevant fields never participate.
+    match_result_locals: Option<MatchResultLocals>,
 }
 
 #[derive(Debug)]
@@ -285,6 +324,80 @@ pub fn compile_wasm(
     };
     let is_result_out = result_shape.is_some();
 
+    // --- W4-MatchResult plan ---------------------------------------
+    // Detect a top-level `match_result(...)` and validate it against
+    // the slice 1 constraints (one occurrence at the rule body's
+    // top level; target is `Call(callee, [Ident(input)])`; same
+    // input concept; callee has no bindings; outer & callee shapes
+    // match). The plan is `Some` when the rule body is a
+    // match_result; None otherwise (the existing W4-Result path
+    // covers if/Ok/Err shapes without a callee).
+    let match_result_plan: Option<MatchResultPlan> = if is_result_out {
+        extract_top_level_match_result(&rule.logic.value, &rule.input_name, &rules)
+    } else {
+        None
+    };
+    if let Some(plan) = match_result_plan {
+        // Cross-concept callees would need argument re-marshalling
+        // (their fields might not align with the caller's params).
+        // Slice 1 keeps the input concept identical between caller
+        // and callee — the caller's params double as the callee's.
+        if plan.callee.input_ty != rule.input_ty {
+            return Err(WasmError {
+                message: format!(
+                    "WASM: match_result callee '{}' has a different input concept than the outer rule; \
+                     slice W4-MatchResult requires same-concept callees (cross-concept needs its own slice).",
+                    plan.callee.name,
+                ),
+            });
+        }
+        if !plan.callee.logic.bindings.is_empty() {
+            return Err(WasmError {
+                message: format!(
+                    "WASM: match_result callee '{}' has let bindings, which slice W4-MatchResult \
+                     does not yet support (the inlined callee body would need its own binding-shape pass).",
+                    plan.callee.name,
+                ),
+            });
+        }
+        if plan.callee.output_ty != rule.output_ty {
+            return Err(WasmError {
+                message: format!(
+                    "WASM: match_result callee '{}' returns {:?} but the outer rule returns {:?}; \
+                     slice W4-MatchResult requires the shapes to match (mismatched shapes need a separate slice).",
+                    plan.callee.name, plan.callee.output_ty, rule.output_ty,
+                ),
+            });
+        }
+    }
+    // Reject any non-top-level match_result with a clear breadcrumb;
+    // in slice 1 we only handle the top-level form.
+    {
+        fn has_nested_match(e: &Expr) -> bool {
+            match e {
+                Expr::MatchResult(_, _, _, _, _) => true,
+                Expr::If(c, t, el) => has_nested_match(c) || has_nested_match(t) || has_nested_match(el),
+                Expr::Ok(i) | Expr::Err(i) => has_nested_match(i),
+                _ => false,
+            }
+        }
+        let nested = match &rule.logic.value {
+            // The top-level shape might itself be MatchResult; that's
+            // legal. We only want to flag match_result that's NOT the
+            // outermost node.
+            Expr::MatchResult(t, _, ob, _, eb) => {
+                has_nested_match(t) || has_nested_match(ob) || has_nested_match(eb)
+            }
+            other => has_nested_match(other),
+        };
+        if nested {
+            return Err(WasmError {
+                message: "WASM: nested match_result(...) is not supported in slice W4-MatchResult; \
+                          only one match_result, at the rule body's top level, is allowed for now.".into(),
+            });
+        }
+    }
+
     // --- Text literal collection + offset assignment ---------------
     // Walk the rule body and let-binding RHSes for every Expr::Text
     // occurrence; assign each unique literal an offset starting at
@@ -302,6 +415,13 @@ pub fn compile_wasm(
             walk_text_literals(rhs, &mut collect);
         }
         walk_text_literals(&rule.logic.value, &mut collect);
+        // W4-MatchResult: the inlined callee's body lives outside the
+        // rule's own AST; reach it explicitly so any text literals it
+        // uses (e.g. an Err("...") in the callee) get their offsets
+        // assigned alongside the outer rule's literals.
+        if let Some(plan) = match_result_plan {
+            walk_text_literals(&plan.callee.logic.value, &mut collect);
+        }
     }
 
     // Memory section is required iff there's any text I/O. A rule that
@@ -355,12 +475,25 @@ pub fn compile_wasm(
     }
 
     let needs_scratch = expr_uses_scratch(&rule.logic.value)
-        || rule.logic.bindings.iter().any(|(_, e)| expr_uses_scratch(e));
+        || rule.logic.bindings.iter().any(|(_, e)| expr_uses_scratch(e))
+        || match_result_plan
+            .map_or(false, |p| expr_uses_scratch(&p.callee.logic.value));
     let n_scratch_i64 = if needs_scratch { 2 } else { 0 };
 
-    // i64 group total: number bindings + scratch_a + scratch_b
-    let n_i64_locals = n_i64_bindings + n_scratch_i64;
+    // n_match_i64: how many i64 locals W4-MatchResult adds. Depends on
+    // both `match_result_plan` (presence) and `result_shape` (which
+    // shape — Number-arm needs an i64 stash + i64 binding, Text-arm
+    // uses i32 ptr/len pairs only).
+    let n_match_i64: u32 = match (match_result_plan, result_shape) {
+        (Some(_), Some(ResultShape::NumberText)) => 2,
+        _ => 0,
+    };
+
+    // i64 group total: number bindings + scratch_a + scratch_b +
+    // match-result NumberText stash + binding.
+    let n_i64_locals = n_i64_bindings + n_scratch_i64 + n_match_i64;
     let scratch_base_i64 = total_param_slots + n_i64_bindings;
+    let match_base_i64 = total_param_slots + n_i64_bindings + n_scratch_i64;
     let i32_base = total_param_slots + n_i64_locals;
 
     // json_escape allocates in the bump region too — force the concat
@@ -372,12 +505,17 @@ pub fn compile_wasm(
     let needs_concat = expr_uses_concat(&rule.logic.value)
         || rule.logic.bindings.iter().any(|(_, e)| expr_uses_concat(e))
         || expr_uses_json_escape(&rule.logic.value)
-        || rule.logic.bindings.iter().any(|(_, e)| expr_uses_json_escape(e));
+        || rule.logic.bindings.iter().any(|(_, e)| expr_uses_json_escape(e))
+        || match_result_plan.map_or(false, |p| {
+            expr_uses_concat(&p.callee.logic.value) || expr_uses_json_escape(&p.callee.logic.value)
+        });
 
     // Refuse nested concat upfront with a clear pointer to the
     // workaround.
     if expr_has_nested_concat(&rule.logic.value)
         || rule.logic.bindings.iter().any(|(_, e)| expr_has_nested_concat(e))
+        || match_result_plan
+            .map_or(false, |p| expr_has_nested_concat(&p.callee.logic.value))
     {
         return Err(WasmError {
             message: "nested concat(...) is not supported in the WASM backend; bind the inner concat to a `let` first".into(),
@@ -389,10 +527,28 @@ pub fn compile_wasm(
     //                  length/parse_int/json_escape/starts_with/ends_with
     //                  /contains appears in the rule).
     let needs_text_prim = expr_uses_text_primitive(&rule.logic.value)
-        || rule.logic.bindings.iter().any(|(_, e)| expr_uses_text_primitive(e));
+        || rule.logic.bindings.iter().any(|(_, e)| expr_uses_text_primitive(e))
+        || match_result_plan
+            .map_or(false, |p| expr_uses_text_primitive(&p.callee.logic.value));
     let n_concat_locals: u32 = if needs_concat { 5 } else { 0 };
     let n_text_prim_locals: u32 = if needs_text_prim { 6 } else { 0 };
-    let n_i32_locals = n_text_bindings * 2 + n_concat_locals + n_text_prim_locals;
+
+    // W4-MatchResult i32 group additions, AFTER text-prim scratches.
+    // Layout (when match_result_plan is Some):
+    //   - tag_stash                                       (+1 i32)
+    //   - For NumberText: err_ptr_stash, err_len_stash    (+2 i32)
+    //                     err_var_ptr,   err_var_len      (+2 i32)
+    //                     (ok_stash + ok_var live in the i64 group)
+    //   - For TextText:   ok_stash_ptr, ok_stash_len      (+2 i32)
+    //                     err_ptr_stash, err_len_stash    (+2 i32)
+    //                     ok_var_ptr,   ok_var_len        (+2 i32)
+    //                     err_var_ptr,  err_var_len       (+2 i32)
+    let n_match_i32: u32 = match (match_result_plan, result_shape) {
+        (Some(_), Some(ResultShape::NumberText)) => 5,
+        (Some(_), Some(ResultShape::TextText))   => 9,
+        _ => 0,
+    };
+    let n_i32_locals = n_text_bindings * 2 + n_concat_locals + n_text_prim_locals + n_match_i32;
 
     // Concat scratch indices (just past the text bindings in the i32 group).
     let concat_locals: Option<ConcatLocals> = if needs_concat {
@@ -423,6 +579,71 @@ pub fn compile_wasm(
         None
     };
 
+    // W4-MatchResult locals — populated only when the rule body is a
+    // top-level match_result. The i32 base sits past the text-prim
+    // scratches; the i64 base sits past scratch_a/b (when present).
+    let match_result_locals: Option<MatchResultLocals> = if let (Some(_), Some(shape)) =
+        (match_result_plan, result_shape)
+    {
+        let i32_base_for_match =
+            i32_base + n_text_bindings * 2 + n_concat_locals + n_text_prim_locals;
+        match shape {
+            ResultShape::NumberText => {
+                // i64 group: ok_stash, ok_var (in that order)
+                let ok_stash_i64 = match_base_i64;
+                let ok_var_i64 = match_base_i64 + 1;
+                // i32 group: tag, err_ptr_stash, err_len_stash, err_var_ptr, err_var_len
+                let tag_stash_i32 = i32_base_for_match;
+                let err_stash_ptr_i32 = i32_base_for_match + 1;
+                let err_stash_len_i32 = i32_base_for_match + 2;
+                let err_var_ptr_i32 = i32_base_for_match + 3;
+                let err_var_len_i32 = i32_base_for_match + 4;
+                Some(MatchResultLocals {
+                    tag_stash_i32,
+                    ok_stash_i64,
+                    ok_stash_ptr_i32: u32::MAX,
+                    ok_stash_len_i32: u32::MAX,
+                    err_stash_ptr_i32,
+                    err_stash_len_i32,
+                    ok_var_i64,
+                    ok_var_ptr_i32: u32::MAX,
+                    ok_var_len_i32: u32::MAX,
+                    err_var_ptr_i32,
+                    err_var_len_i32,
+                })
+            }
+            ResultShape::TextText => {
+                // No i64 group additions for TextText (everything text).
+                // i32 group: tag, ok_ptr_stash, ok_len_stash, err_ptr_stash, err_len_stash,
+                //           ok_var_ptr, ok_var_len, err_var_ptr, err_var_len
+                let tag_stash_i32 = i32_base_for_match;
+                let ok_stash_ptr_i32 = i32_base_for_match + 1;
+                let ok_stash_len_i32 = i32_base_for_match + 2;
+                let err_stash_ptr_i32 = i32_base_for_match + 3;
+                let err_stash_len_i32 = i32_base_for_match + 4;
+                let ok_var_ptr_i32 = i32_base_for_match + 5;
+                let ok_var_len_i32 = i32_base_for_match + 6;
+                let err_var_ptr_i32 = i32_base_for_match + 7;
+                let err_var_len_i32 = i32_base_for_match + 8;
+                Some(MatchResultLocals {
+                    tag_stash_i32,
+                    ok_stash_i64: u32::MAX,
+                    ok_stash_ptr_i32,
+                    ok_stash_len_i32,
+                    err_stash_ptr_i32,
+                    err_stash_len_i32,
+                    ok_var_i64: u32::MAX,
+                    ok_var_ptr_i32,
+                    ok_var_len_i32,
+                    err_var_ptr_i32,
+                    err_var_len_i32,
+                })
+            }
+        }
+    } else {
+        None
+    };
+
     // Now do the real binding-shape classification pass and assign
     // local indices. Counters track separate i64 and i32 cursors.
     let mut i64_cursor = total_param_slots;
@@ -445,14 +666,21 @@ pub fn compile_wasm(
     debug_assert_eq!(i64_cursor, scratch_base_i64);
 
     // --- Detect helper-function needs -----------------------------
+    // Each detection ALSO walks the W4-MatchResult callee body so its
+    // helper needs flow into the outer rule's reservations.
     let needs_itoa = expr_concat_has_number_arg(&rule.logic.value, &field_shapes, &binding_shapes)
         || rule.logic.bindings.iter().any(|(_, e)| {
             expr_concat_has_number_arg(e, &field_shapes, &binding_shapes)
+        })
+        || match_result_plan.map_or(false, |p| {
+            expr_concat_has_number_arg(&p.callee.logic.value, &field_shapes, &binding_shapes)
         });
     let needs_parse_int = expr_uses_parse_int(&rule.logic.value)
-        || rule.logic.bindings.iter().any(|(_, e)| expr_uses_parse_int(e));
+        || rule.logic.bindings.iter().any(|(_, e)| expr_uses_parse_int(e))
+        || match_result_plan.map_or(false, |p| expr_uses_parse_int(&p.callee.logic.value));
     let needs_json_escape = expr_uses_json_escape(&rule.logic.value)
-        || rule.logic.bindings.iter().any(|(_, e)| expr_uses_json_escape(e));
+        || rule.logic.bindings.iter().any(|(_, e)| expr_uses_json_escape(e))
+        || match_result_plan.map_or(false, |p| expr_uses_json_escape(&p.callee.logic.value));
 
     // Helper-function indices. Func 0 is always the rule. Helpers
     // are appended in a fixed order (itoa, parse_int, json_escape)
@@ -612,6 +840,7 @@ pub fn compile_wasm(
         itoa_func_idx,
         parse_int_func_idx,
         json_escape_func_idx,
+        match_result_locals,
     };
 
     // Emit let binding computations. Text bindings leave (ptr, len)
@@ -1010,6 +1239,17 @@ fn walk_text_literals<F: FnMut(&str)>(expr: &Expr, f: &mut F) {
         // W4-Result: Ok/Err wrap an inner expression that may carry
         // its own literals (e.g. Err("rejected") or Err(concat(...))).
         Expr::Ok(inner) | Expr::Err(inner) => walk_text_literals(inner, f),
+        // W4-MatchResult: visit the target (Call(callee, [Ident])) — no
+        // literals there in slice scope, but walking is cheap and
+        // future-proofs against argument shapes growing — plus the
+        // outer ok_body and err_body. Literals INSIDE the callee's
+        // body itself are reached via a separate explicit walk in
+        // compile_wasm (callee body lives outside this rule's AST).
+        Expr::MatchResult(target, _, ok_body, _, err_body) => {
+            walk_text_literals(target, f);
+            walk_text_literals(ok_body, f);
+            walk_text_literals(err_body, f);
+        }
         _ => {}
     }
 }
@@ -1030,6 +1270,11 @@ fn expr_uses_text_primitive(expr: &Expr) -> bool {
         Expr::Call(_, args) => args.iter().any(expr_uses_text_primitive),
         Expr::Concat(args) => args.iter().any(expr_uses_text_primitive),
         Expr::Ok(inner) | Expr::Err(inner) => expr_uses_text_primitive(inner),
+        Expr::MatchResult(t, _, ok_b, _, err_b) => {
+            expr_uses_text_primitive(t)
+                || expr_uses_text_primitive(ok_b)
+                || expr_uses_text_primitive(err_b)
+        }
         _ => false,
     }
 }
@@ -1048,6 +1293,11 @@ fn expr_uses_parse_int(expr: &Expr) -> bool {
             expr_uses_parse_int(h) || expr_uses_parse_int(n)
         }
         Expr::Ok(inner) | Expr::Err(inner) => expr_uses_parse_int(inner),
+        Expr::MatchResult(t, _, ok_b, _, err_b) => {
+            expr_uses_parse_int(t)
+                || expr_uses_parse_int(ok_b)
+                || expr_uses_parse_int(err_b)
+        }
         _ => false,
     }
 }
@@ -1066,6 +1316,11 @@ fn expr_uses_json_escape(expr: &Expr) -> bool {
             expr_uses_json_escape(h) || expr_uses_json_escape(n)
         }
         Expr::Ok(inner) | Expr::Err(inner) => expr_uses_json_escape(inner),
+        Expr::MatchResult(t, _, ok_b, _, err_b) => {
+            expr_uses_json_escape(t)
+                || expr_uses_json_escape(ok_b)
+                || expr_uses_json_escape(err_b)
+        }
         _ => false,
     }
 }
@@ -1128,6 +1383,9 @@ fn expr_uses_concat(expr: &Expr) -> bool {
             expr_uses_concat(h) || expr_uses_concat(n)
         }
         Expr::Ok(inner) | Expr::Err(inner) => expr_uses_concat(inner),
+        Expr::MatchResult(t, _, ok_b, _, err_b) => {
+            expr_uses_concat(t) || expr_uses_concat(ok_b) || expr_uses_concat(err_b)
+        }
         _ => false,
     }
 }
@@ -1170,6 +1428,11 @@ fn expr_concat_has_number_arg(
         Expr::Ok(inner) | Expr::Err(inner) => {
             expr_concat_has_number_arg(inner, field_shapes, binding_shapes)
         }
+        Expr::MatchResult(t, _, ok_b, _, err_b) => {
+            expr_concat_has_number_arg(t, field_shapes, binding_shapes)
+                || expr_concat_has_number_arg(ok_b, field_shapes, binding_shapes)
+                || expr_concat_has_number_arg(err_b, field_shapes, binding_shapes)
+        }
         _ => false,
     }
 }
@@ -1194,6 +1457,9 @@ fn expr_has_nested_concat(expr: &Expr) -> bool {
                 inside_concat(h) || inside_concat(n)
             }
             Expr::Ok(inner) | Expr::Err(inner) => inside_concat(inner),
+            Expr::MatchResult(t, _, ok_b, _, err_b) => {
+                inside_concat(t) || inside_concat(ok_b) || inside_concat(err_b)
+            }
             _ => false,
         }
     }
@@ -1209,6 +1475,11 @@ fn expr_has_nested_concat(expr: &Expr) -> bool {
             expr_has_nested_concat(h) || expr_has_nested_concat(n)
         }
         Expr::Ok(inner) | Expr::Err(inner) => expr_has_nested_concat(inner),
+        Expr::MatchResult(t, _, ok_b, _, err_b) => {
+            expr_has_nested_concat(t)
+                || expr_has_nested_concat(ok_b)
+                || expr_has_nested_concat(err_b)
+        }
         _ => false,
     }
 }
@@ -1465,6 +1736,7 @@ fn emit_wasm_expr(
                 json_escape_func_idx: ctx.json_escape_func_idx,
                 concat: ctx.concat,
                 itoa_func_idx: ctx.itoa_func_idx,
+                match_result_locals: ctx.match_result_locals,
             };
             emit_wasm_expr(code, &called.logic.value, &callee_ctx)
         }
@@ -1612,12 +1884,99 @@ fn emit_wasm_result_body(
             code.push(0x0B);                                 // end
             Ok(())
         }
-        Expr::MatchResult(_, _, _, _, _) => {
-            Err(WasmError {
-                message: "WASM: match_result is not yet supported (slice W4-MatchResult will lift this). \
-                          For now, inline the validation as `if cond then Ok(...) else Err(...)`."
-                          .into(),
-            })
+        Expr::MatchResult(target, ok_var, ok_body, err_var, err_body) => {
+            // The slice 1 constraints (top-level match_result, target
+            // shape, callee correctness, shape parity) were validated
+            // up-front in compile_wasm. By the time we land here, those
+            // hold; we just look up what we need and emit.
+            let callee_name = match target.as_ref() {
+                Expr::Call(n, _) => n,
+                _ => return Err(WasmError {
+                    message: "WASM: match_result target must be a rule call (slice W4-MatchResult).".into(),
+                }),
+            };
+            let callee = *ctx.all_rules.get(callee_name.as_str()).ok_or_else(|| WasmError {
+                message: format!("WASM: match_result callee '{}' not found", callee_name),
+            })?;
+            let mr = ctx.match_result_locals.ok_or_else(|| WasmError {
+                message: "internal: match_result reached emit without locals reserved".into(),
+            })?;
+
+            // 1) Inline the callee's body. Recursive call goes through
+            //    the same emitter — the callee's body is W4-Result-shaped
+            //    so it produces the same 4-or-5 result tuple on the stack.
+            //    Same input concept (slice constraint) means the caller's
+            //    field locals double as the callee's, so we keep the same
+            //    ctx — except we swap `rule` so any future code that reads
+            //    callee.input_name resolves correctly.
+            let callee_ctx = WasmCtx { rule: callee, ..*ctx };
+            emit_wasm_result_body(code, &callee.logic.value, &callee_ctx, shape, result_block_typeidx)?;
+
+            // 2) Stash the tuple from the stack (LIFO) into our locals.
+            //    For NumberText: stack top is err_len (i32), then err_ptr,
+            //    then ok_value (i64), then tag (i32).
+            //    For TextText: top is err_len, err_ptr, ok_len, ok_ptr, tag.
+            match shape {
+                ResultShape::NumberText => {
+                    code.push(0x21); emit_leb128(code, mr.err_stash_len_i32 as u64);
+                    code.push(0x21); emit_leb128(code, mr.err_stash_ptr_i32 as u64);
+                    code.push(0x21); emit_leb128(code, mr.ok_stash_i64    as u64);
+                    code.push(0x21); emit_leb128(code, mr.tag_stash_i32   as u64);
+                }
+                ResultShape::TextText => {
+                    code.push(0x21); emit_leb128(code, mr.err_stash_len_i32 as u64);
+                    code.push(0x21); emit_leb128(code, mr.err_stash_ptr_i32 as u64);
+                    code.push(0x21); emit_leb128(code, mr.ok_stash_len_i32  as u64);
+                    code.push(0x21); emit_leb128(code, mr.ok_stash_ptr_i32  as u64);
+                    code.push(0x21); emit_leb128(code, mr.tag_stash_i32     as u64);
+                }
+            }
+
+            // 3) Dispatch: load tag, eqz so tag==0 (Ok) routes to the
+            //    `then` arm (more readable than swapping arms).
+            code.push(0x20); emit_leb128(code, mr.tag_stash_i32 as u64);  // local.get tag
+            code.push(0x45);                                               // i32.eqz
+            code.push(0x04);                                               // if
+            emit_sleb128(code, result_block_typeidx as i64);
+
+            // 4) Ok arm: copy stashed ok payload into ok_var binding
+            //    locals, then emit the outer ok_body with an extended
+            //    ctx so its Ident lookups resolve `ok_var`.
+            let ok_binding = match shape {
+                ResultShape::NumberText => {
+                    code.push(0x20); emit_leb128(code, mr.ok_stash_i64 as u64);
+                    code.push(0x21); emit_leb128(code, mr.ok_var_i64   as u64);
+                    BindingShape::Number(mr.ok_var_i64)
+                }
+                ResultShape::TextText => {
+                    code.push(0x20); emit_leb128(code, mr.ok_stash_ptr_i32 as u64);
+                    code.push(0x21); emit_leb128(code, mr.ok_var_ptr_i32   as u64);
+                    code.push(0x20); emit_leb128(code, mr.ok_stash_len_i32 as u64);
+                    code.push(0x21); emit_leb128(code, mr.ok_var_len_i32   as u64);
+                    BindingShape::Text { ptr: mr.ok_var_ptr_i32, len: mr.ok_var_len_i32 }
+                }
+            };
+            let mut bindings_ok = ctx.binding_shapes.clone();
+            bindings_ok.insert(ok_var.as_str(), ok_binding);
+            let ctx_ok = WasmCtx { binding_shapes: &bindings_ok, ..*ctx };
+            emit_wasm_result_body(code, ok_body, &ctx_ok, shape, result_block_typeidx)?;
+
+            // 5) Else arm: same dance for err_var (always Text).
+            code.push(0x05);                                               // else
+            code.push(0x20); emit_leb128(code, mr.err_stash_ptr_i32 as u64);
+            code.push(0x21); emit_leb128(code, mr.err_var_ptr_i32   as u64);
+            code.push(0x20); emit_leb128(code, mr.err_stash_len_i32 as u64);
+            code.push(0x21); emit_leb128(code, mr.err_var_len_i32   as u64);
+            let mut bindings_err = ctx.binding_shapes.clone();
+            bindings_err.insert(
+                err_var.as_str(),
+                BindingShape::Text { ptr: mr.err_var_ptr_i32, len: mr.err_var_len_i32 },
+            );
+            let ctx_err = WasmCtx { binding_shapes: &bindings_err, ..*ctx };
+            emit_wasm_result_body(code, err_body, &ctx_err, shape, result_block_typeidx)?;
+
+            code.push(0x0B);                                               // end
+            Ok(())
         }
         other => Err(WasmError {
             message: format!(
@@ -1864,6 +2223,57 @@ fn emit_contains(
 /// Walked once before the locals declaration so the function header
 /// reserves scratches up-front; missed cases would surface as
 /// "unknown local" validation errors at module load.
+/// Slice W4-MatchResult: extract the (callee_rule, ok_var, ok_body,
+/// err_var, err_body) of a TOP-LEVEL `match_result(...)` in a rule body.
+/// Returns `None` if the rule body isn't a match_result, or if the
+/// target isn't `Call(callee_name, [Ident(input)])` (those forms get
+/// caller-side error messages so the breadcrumb is precise about which
+/// constraint was violated).
+///
+/// Slice 1 scope: only the rule body itself; not nested in if/Ok/Err.
+/// Lifting to nested positions needs separate locals reservation per
+/// occurrence and is its own slice.
+fn extract_top_level_match_result<'a>(
+    rule_body: &'a Expr,
+    input_name: &str,
+    all_rules: &'a HashMap<&'a str, &'a Rule>,
+) -> Option<MatchResultPlan<'a>> {
+    let (target, ok_var, ok_body, err_var, err_body) = match rule_body {
+        Expr::MatchResult(t, ov, ob, ev, eb) => (t.as_ref(), ov, ob.as_ref(), ev, eb.as_ref()),
+        _ => return None,
+    };
+    let (callee_name, args) = match target {
+        Expr::Call(n, a) => (n.as_str(), a),
+        _ => return None,
+    };
+    if args.len() != 1 {
+        return None;
+    }
+    if !matches!(&args[0], Expr::Ident(n) if n == input_name) {
+        return None;
+    }
+    let callee = *all_rules.get(callee_name)?;
+    Some(MatchResultPlan {
+        callee,
+        ok_var: ok_var.as_str(),
+        ok_body,
+        err_var: err_var.as_str(),
+        err_body,
+    })
+}
+
+/// Per-rule plan for a slice-1 `match_result(...)`. Built once in
+/// compile_wasm and re-used both in the pre-pass walks (callee body
+/// must contribute to needs detection) and in the emitter.
+#[derive(Debug, Clone, Copy)]
+struct MatchResultPlan<'a> {
+    callee: &'a Rule,
+    ok_var: &'a str,
+    ok_body: &'a Expr,
+    err_var: &'a str,
+    err_body: &'a Expr,
+}
+
 fn expr_uses_scratch(expr: &Expr) -> bool {
     match expr {
         Expr::Abs(_) | Expr::Min(_, _) | Expr::Max(_, _) => true,
@@ -1881,6 +2291,13 @@ fn expr_uses_scratch(expr: &Expr) -> bool {
         // W4-Result: Ok/Err inner can use abs/min/max inside the
         // ok/err payload expression.
         Expr::Ok(inner) | Expr::Err(inner) => expr_uses_scratch(inner),
+        // W4-MatchResult: outer arms (and the target's argument list)
+        // may use scratch primitives.
+        Expr::MatchResult(t, _, ok_b, _, err_b) => {
+            expr_uses_scratch(t)
+                || expr_uses_scratch(ok_b)
+                || expr_uses_scratch(err_b)
+        }
         // Leaves and shapes the backend doesn't yet emit.
         _ => false,
     }
@@ -3882,19 +4299,25 @@ const fs = require("fs");
         assert!(stdout.contains("OK err-arm"), "no err-arm OK; stdout:\n{}", stdout);
     }
 
-    /// W4-Result slice scope: `match_result(...)` is rejected with a
-    /// clear, actionable message that points at the slice extension
-    /// (W4-MatchResult) lifting it. Pin the message so future grammar
-    /// or test-name shifts don't silently drop the breadcrumb.
+    /// W4-MatchResult end-to-end on the canonical discounted_purchase
+    /// shape: outer Ok arm transforms the bound `amount` (multiply by
+    /// 90/100), outer Err arm propagates `reason` unchanged. Pinned at
+    /// runtime by both arms (Ok with arithmetic transform, Err with
+    /// pass-through carrying a concat-built message from the callee).
     #[test]
-    fn wasm_w4_match_result_rejected_with_breadcrumb() {
+    fn wasm_w4_match_result_runtime_discounted_purchase() {
+        use std::process::Command;
+        if Command::new("node").arg("--version").output().is_err() {
+            eprintln!("note: `node` not found, skipping WASM runtime test");
+            return;
+        }
         let src = r#"@verbose 0.1.0
 concept Purchase
   @intention: "p"
   @source: invoices.intent:1
   fields:
-    age    : number
     amount : number
+    age    : number
 rule validate
   @intention: "v"
   @source: invoices.intent:1
@@ -3903,13 +4326,13 @@ rule validate
   output:
     r : Result(number, text)
   logic:
-    r = if p.age >= 18 then Ok(p.amount) else Err("under")
+    r = if p.age >= 18 then Ok(p.amount) else Err(concat("age ", p.age, " under 18"))
   proofs:
     purity:
-      reads : [p.age, p.amount]
+      reads : [p.amount, p.age]
       calls : []
     termination:
-      bound : 4
+      bound : 6
 rule discounted
   @intention: "d"
   @source: invoices.intent:1
@@ -3918,29 +4341,258 @@ rule discounted
   output:
     r : Result(number, text)
   logic:
-    r = match_result(validate(p), v => Ok(v * 90 / 100), e => Err(e))
+    r = match_result(validate(p), amount => Ok(amount * 90 / 100), reason => Err(reason))
   proofs:
     purity:
       reads : [p]
       calls : [validate]
     termination:
-      bound : 6
+      bound : 7
+"#;
+        let path = "/tmp/wasm_w4_match_discounted.wasm";
+        use crate::lexer::Lexer;
+        use crate::parser::Parser;
+        let tokens = Lexer::new(src).tokenize().expect("tokenize");
+        let program = Parser::new(tokens).parse_program().expect("parse");
+        compile_wasm(&program, "discounted", path).expect("compile");
+
+        let script = format!(
+            r#"
+const fs = require("fs");
+(async () => {{
+  const buf = fs.readFileSync("{path}");
+  if (!WebAssembly.validate(buf)) {{ console.log("FAIL: invalid module"); return; }}
+  const m = await WebAssembly.instantiate(buf);
+  const fn = m.instance.exports.discounted;
+  const mem = new Uint8Array(m.instance.exports.memory.buffer);
+  const dec = new TextDecoder();
+  // Ok arm: amount=1000, age=25 -> 1000 * 90 / 100 = 900
+  const ok = fn(1000n, 25n);
+  if (ok[0] === 0 && ok[1] === 900n && ok[2] === 0 && ok[3] === 0) {{
+    console.log("OK ok-arm transform: 1000 -> 900");
+  }} else {{
+    console.log("FAIL ok-arm:", JSON.stringify(ok, (_, v) => typeof v === "bigint" ? v.toString() : v));
+  }}
+  // Err arm: amount=1000, age=15 -> reason propagated unchanged
+  const err = fn(1000n, 15n);
+  if (err[0] === 1 && err[1] === 0n && err[3] > 0) {{
+    const msg = dec.decode(mem.subarray(err[2], err[2] + err[3]));
+    if (msg === "age 15 under 18") {{
+      console.log("OK err-arm pass-through: msg =", JSON.stringify(msg));
+    }} else {{
+      console.log("FAIL err-arm: msg =", JSON.stringify(msg));
+    }}
+  }} else {{
+    console.log("FAIL err-arm:", JSON.stringify(err, (_, v) => typeof v === "bigint" ? v.toString() : v));
+  }}
+}})();
+"#
+        );
+        let out = Command::new("node").args(["-e", &script]).output().expect("spawn node");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let _ = std::fs::remove_file(path);
+        assert!(
+            !stdout.contains("FAIL"),
+            "match_result discounted_purchase runtime check failed; stdout:\n{}\nstderr:\n{}",
+            stdout,
+            String::from_utf8_lossy(&out.stderr),
+        );
+        assert!(stdout.contains("OK ok-arm"), "missing ok-arm; stdout:\n{}", stdout);
+        assert!(stdout.contains("OK err-arm"), "missing err-arm; stdout:\n{}", stdout);
+    }
+
+    /// W4-MatchResult: callee with let bindings is rejected with a
+    /// clear breadcrumb pointing at the slice limitation. Important
+    /// because the rejection message is the only thing telling the
+    /// user "this works in native today, but the WASM emitter hasn't
+    /// caught up yet."
+    #[test]
+    fn wasm_w4_match_result_rejects_callee_with_bindings() {
+        let src = r#"@verbose 0.1.0
+concept P
+  @intention: "p"
+  @source: invoices.intent:1
+  fields:
+    a : number
+rule callee_with_let
+  @intention: "callee that has a let"
+  @source: invoices.intent:1
+  input:
+    p : P
+  output:
+    r : Result(number, text)
+  logic:
+    let half = p.a / 2
+    r = if half > 0 then Ok(half) else Err("non-positive")
+  proofs:
+    purity:
+      reads : [p.a]
+      calls : []
+    termination:
+      bound : 4
+rule outer
+  @intention: "calls the let-using callee"
+  @source: invoices.intent:1
+  input:
+    p : P
+  output:
+    r : Result(number, text)
+  logic:
+    r = match_result(callee_with_let(p), v => Ok(v), e => Err(e))
+  proofs:
+    purity:
+      reads : [p]
+      calls : [callee_with_let]
+    termination:
+      bound : 5
 "#;
         use crate::lexer::Lexer;
         use crate::parser::Parser;
         let tokens = Lexer::new(src).tokenize().expect("tokenize");
         let program = Parser::new(tokens).parse_program().expect("parse");
-        let path = "/tmp/wasm_w4_match_rejected.wasm";
-        let err = compile_wasm(&program, "discounted", path).expect_err("must reject match_result");
+        let path = "/tmp/wasm_w4_match_callee_lets.wasm";
+        let err = compile_wasm(&program, "outer", path).expect_err("must reject callee with bindings");
         assert!(
-            err.message.contains("match_result is not yet supported"),
-            "expected breadcrumb mentioning match_result; got: {}",
-            err.message
+            err.message.contains("let bindings"),
+            "expected callee-bindings breadcrumb; got: {}",
+            err.message,
         );
         assert!(
             err.message.contains("W4-MatchResult"),
-            "expected slice name reference in error; got: {}",
-            err.message
+            "expected slice reference; got: {}",
+            err.message,
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// W4-MatchResult: callee with a different input concept is
+    /// rejected — slice 1 keeps the input concepts identical between
+    /// caller and callee so their params align.
+    #[test]
+    fn wasm_w4_match_result_rejects_cross_concept_callee() {
+        let src = r#"@verbose 0.1.0
+concept A
+  @intention: "a"
+  @source: invoices.intent:1
+  fields:
+    n : number
+concept B
+  @intention: "b"
+  @source: invoices.intent:1
+  fields:
+    n : number
+rule a_validate
+  @intention: "v"
+  @source: invoices.intent:1
+  input:
+    a : A
+  output:
+    r : Result(number, text)
+  logic:
+    r = if a.n > 0 then Ok(a.n) else Err("neg")
+  proofs:
+    purity:
+      reads : [a.n]
+      calls : []
+    termination:
+      bound : 3
+rule b_outer
+  @intention: "calls a_validate from a B-input rule"
+  @source: invoices.intent:1
+  input:
+    b : B
+  output:
+    r : Result(number, text)
+  logic:
+    r = match_result(a_validate(b), v => Ok(v), e => Err(e))
+  proofs:
+    purity:
+      reads : [b]
+      calls : [a_validate]
+    termination:
+      bound : 5
+"#;
+        use crate::lexer::Lexer;
+        use crate::parser::Parser;
+        let tokens = Lexer::new(src).tokenize().expect("tokenize");
+        let program = Parser::new(tokens).parse_program().expect("parse");
+        let path = "/tmp/wasm_w4_match_cross_concept.wasm";
+        let err = compile_wasm(&program, "b_outer", path).expect_err("must reject cross-concept");
+        assert!(
+            err.message.contains("different input concept"),
+            "expected cross-concept breadcrumb; got: {}",
+            err.message,
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// W4-MatchResult: a nested `match_result(...)` inside an outer
+    /// match_result's arm is rejected. Slice 1 reserves locals for one
+    /// match_result; nesting needs its own slice.
+    #[test]
+    fn wasm_w4_match_result_rejects_nested() {
+        let src = r#"@verbose 0.1.0
+concept P
+  @intention: "p"
+  @source: invoices.intent:1
+  fields:
+    a : number
+rule v1
+  @intention: "v1"
+  @source: invoices.intent:1
+  input:
+    p : P
+  output:
+    r : Result(number, text)
+  logic:
+    r = if p.a > 0 then Ok(p.a) else Err("neg")
+  proofs:
+    purity:
+      reads : [p.a]
+      calls : []
+    termination:
+      bound : 3
+rule v2
+  @intention: "v2"
+  @source: invoices.intent:1
+  input:
+    p : P
+  output:
+    r : Result(number, text)
+  logic:
+    r = if p.a < 100 then Ok(p.a) else Err("too big")
+  proofs:
+    purity:
+      reads : [p.a]
+      calls : []
+    termination:
+      bound : 3
+rule outer
+  @intention: "nested match"
+  @source: invoices.intent:1
+  input:
+    p : P
+  output:
+    r : Result(number, text)
+  logic:
+    r = match_result(v1(p), v => match_result(v2(p), w => Ok(w), e => Err(e)), e => Err(e))
+  proofs:
+    purity:
+      reads : [p]
+      calls : [v1, v2]
+    termination:
+      bound : 9
+"#;
+        use crate::lexer::Lexer;
+        use crate::parser::Parser;
+        let tokens = Lexer::new(src).tokenize().expect("tokenize");
+        let program = Parser::new(tokens).parse_program().expect("parse");
+        let path = "/tmp/wasm_w4_match_nested.wasm";
+        let err = compile_wasm(&program, "outer", path).expect_err("must reject nested match_result");
+        assert!(
+            err.message.contains("nested match_result"),
+            "expected nested-match breadcrumb; got: {}",
+            err.message,
         );
         let _ = std::fs::remove_file(path);
     }
