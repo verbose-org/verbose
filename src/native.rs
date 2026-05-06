@@ -381,6 +381,11 @@ struct RecordLoopCtx<'a> {
     /// the callee allocated. When the callee's Err doesn't use concat,
     /// this slot just holds the unchanged rsp — restoring is a no-op.
     err_frame_save_slot: i32,
+    /// Number of match_result quartets reserved past depth 0. Equal to
+    /// `(max_nesting_depth - 1)` when the rule has nested match_result;
+    /// 0 otherwise. `match_slots_at_depth` derives slot offsets for
+    /// depths > 0 from this and the depth-0 slots above.
+    extra_match_slot_quartets: usize,
     /// Exit code flag: 0 = all records succeeded, 1 = at least one failed.
     /// Bool rules set this to 1 on false; Result rules set it on Err.
     /// The epilogue loads this into rdi for sys_exit.
@@ -623,6 +628,99 @@ fn expr_uses_now_unix(e: &Expr) -> bool {
 fn rule_uses_now_unix(rule: &Rule) -> bool {
     expr_uses_now_unix(&rule.logic.value)
         || rule.logic.bindings.iter().any(|(_, e)| expr_uses_now_unix(e))
+}
+
+/// Derive `MatchSlots` for a given match_result nesting depth from the
+/// rule's RecordLoopCtx. Depth 0 returns the prologue's depth-0 quartet
+/// (existing same-concept / non-nested layout). Depth N>0 sits at
+/// 32 bytes per level deeper into the frame; the prologue must have
+/// reserved that space (extra_match_slot_quartets >= depth).
+///
+/// Errors out cleanly if the requested depth exceeds what was reserved
+/// — this would only fire on a bug in the depth-counting walker, since
+/// the prologue's reservation is supposed to be the static MAX of any
+/// depth the emitter will request.
+fn match_slots_at_depth(
+    ctx: &RecordLoopCtx<'_>,
+    depth: usize,
+) -> Result<MatchSlots, NativeError> {
+    if depth > ctx.extra_match_slot_quartets {
+        return Err(NativeError {
+            message: format!(
+                "internal: match_result emitter requested depth {} but only {} extra quartets were reserved \
+                 (max depth was {}); count_match_result_max_depth missed a nested match",
+                depth, ctx.extra_match_slot_quartets, ctx.extra_match_slot_quartets + 1,
+            ),
+        });
+    }
+    let shift = (depth as i32) * 32;  // 4 i64 slots per level
+    Ok(MatchSlots {
+        match_slot: ctx.match_slot - shift,
+        err_ptr_slot: ctx.err_ptr_slot - shift,
+        err_len_slot: ctx.err_len_slot - shift,
+        err_frame_save_slot: ctx.err_frame_save_slot - shift,
+        exit_flag_slot: ctx.exit_flag_slot,
+    })
+}
+
+/// Maximum nesting depth of `match_result(...)` along any path through
+/// the expression tree. Drives the prologue's reservation of
+/// match_result slot quartets. Counted as:
+///   - `MatchResult` itself contributes 1 + max(depth of its arms)
+///   - `Ok` / `Err` / unary inner / `If` branches recurse
+///
+/// `Err`'s body is grammar-restricted to `Err(<text_expr>)`, so the
+/// err_body never actually carries a nested match_result, but we still
+/// recurse into it for safety. Cost: zero — the walker just doesn't
+/// find any match_result there.
+fn count_match_result_max_depth(expr: &Expr) -> usize {
+    match expr {
+        Expr::MatchResult(_, _, ok_body, _, err_body) => {
+            1 + std::cmp::max(
+                count_match_result_max_depth(ok_body),
+                count_match_result_max_depth(err_body),
+            )
+        }
+        Expr::If(c, t, e) => {
+            count_match_result_max_depth(c)
+                .max(count_match_result_max_depth(t))
+                .max(count_match_result_max_depth(e))
+        }
+        Expr::Ok(i) | Expr::Err(i) | Expr::Not(i) | Expr::Neg(i) | Expr::Abs(i)
+        | Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i) => {
+            count_match_result_max_depth(i)
+        }
+        Expr::Binary(_, l, r) => {
+            count_match_result_max_depth(l).max(count_match_result_max_depth(r))
+        }
+        Expr::Min(a, b) | Expr::Max(a, b) | Expr::StartsWith(a, b)
+        | Expr::EndsWith(a, b) | Expr::Contains(a, b) => {
+            count_match_result_max_depth(a).max(count_match_result_max_depth(b))
+        }
+        Expr::Call(_, args) | Expr::Concat(args) => {
+            args.iter().map(count_match_result_max_depth).max().unwrap_or(0)
+        }
+        Expr::Fold(coll, init, _, _, body) => {
+            count_match_result_max_depth(coll)
+                .max(count_match_result_max_depth(init))
+                .max(count_match_result_max_depth(body))
+        }
+        Expr::Quantifier(_, coll, _, body)
+        | Expr::Map(coll, _, body)
+        | Expr::Filter(coll, _, body) => {
+            count_match_result_max_depth(coll)
+                .max(count_match_result_max_depth(body))
+        }
+        Expr::Record(_, fields) => fields
+            .iter()
+            .map(|(_, e)| count_match_result_max_depth(e))
+            .max()
+            .unwrap_or(0),
+        Expr::Fetch(_, request) => count_match_result_max_depth(request),
+        // Leaves: no inner expression to recurse into.
+        Expr::Number(_) | Expr::Text(_) | Expr::Field(_, _) | Expr::Ident(_)
+        | Expr::Read(_) | Expr::NowUnix => 0,
+    }
 }
 
 /// True iff the expression tree references `Field(Ident(input_name), field_name)`
@@ -1358,12 +1456,29 @@ fn emit_record_loop_prologue<'a>(
         .collect();
     let n_binding_slots: usize = binding_is_text.iter().map(|b| if *b { 2 } else { 1 }).sum();
     // Bottom-of-frame reserved slots, in order:
-    //   base + 1: match_slot          (Phase 2D Ok-bound i64)
+    //   base + 1: match_slot          (Phase 2D Ok-bound i64)         <-- depth 0
     //   base + 2: err_ptr_slot        (Phase 2F Err-bound text ptr)
     //   base + 3: err_len_slot        (Phase 2F Err-bound text length)
     //   base + 4: err_frame_save_slot (Phase 2F rsp saved before callee Err concat)
-    //   base + 5: exit_flag_slot      (exit code: 0=success, 1=failure)
-    let n_reserved = 5;
+    //   base + 5: match_slot          (depth 1, only if nested)
+    //   base + 6: err_ptr_slot        (depth 1)
+    //   base + 7: err_len_slot        (depth 1)
+    //   base + 8: err_frame_save_slot (depth 1)
+    //   ... 4 slots per added depth ...
+    //   base + 4*N + 1: exit_flag_slot
+    //
+    // Nested match_result (slice "nested match"): one quartet per
+    // `match_result` nesting level, indexed by depth via
+    // `match_slots_at_depth(ctx, depth)`. Always at least one quartet
+    // is reserved, even for non-match-result rules — the existing
+    // layout has historically had these slots, so keeping them stable
+    // when N=1 means non-nested binaries are byte-for-byte unchanged.
+    let max_match_depth = std::cmp::max(
+        1,
+        count_match_result_max_depth(&rule.logic.value),
+    );
+    let n_match_quartets = max_match_depth;
+    let n_reserved = 4 * n_match_quartets + 1;
     // Phase 9 slice 1: enumerate the resources the rule reads, in source
     // order. Each contributes 2 slots (ptr, len) plus a max_bytes buffer
     // padded to 8 bytes. Resources unknown at the program level become a
@@ -1407,11 +1522,14 @@ fn emit_record_loop_prologue<'a>(
         + connection_extra_bytes
         + now_extra_bytes;
     let base = (n_ctx + nfields + n_binding_slots) as i32;
+    // Depth-0 quartet (always present). Deeper depths sit at base + 4*depth + {1..4}.
     let match_slot: i32 = -((base + 1) * 8);
     let err_ptr_slot: i32 = -((base + 2) * 8);
     let err_len_slot: i32 = -((base + 3) * 8);
     let err_frame_save_slot: i32 = -((base + 4) * 8);
-    let exit_flag_slot: i32 = -((base + 5) * 8);
+    // exit_flag sits past all match-result quartets so its offset stays
+    // stable for non-nested rules.
+    let exit_flag_slot: i32 = -((base + 4 * (n_match_quartets as i32) + 1) * 8);
 
     // mov r12, [rsp]            — argc
     code.extend_from_slice(&[0x4C, 0x8B, 0x24, 0x24]);
@@ -1662,6 +1780,7 @@ fn emit_record_loop_prologue<'a>(
         err_ptr_slot,
         err_len_slot,
         err_frame_save_slot,
+        extra_match_slot_quartets: n_match_quartets - 1,
         exit_flag_slot,
         resource_abort_patches,
     })
@@ -3938,6 +4057,21 @@ fn emit_eval_result_expr(
             // lands at match_slot) and its Err leaves into the outer Err arm
             // (Err-bound text captured to err_ptr_slot/err_len_slot, then the
             // outer Err body runs with `err_var → (ptr, len)` bound).
+            //
+            // Nested match_result (slice "nested match"): the OUTER arms can
+            // themselves contain another `match_result` (e.g. a chained
+            // validation). Each level needs its own quartet of slots — the
+            // prologue reserved them based on the static max depth. We pass
+            // `next_slots` for the +1 level deeper, derived by shifting the
+            // current `slots` 32 bytes (4 i64) further into the frame.
+            // exit_flag_slot stays shared across all levels.
+            let next_slots = MatchSlots {
+                match_slot: slots.match_slot - 32,
+                err_ptr_slot: slots.err_ptr_slot - 32,
+                err_len_slot: slots.err_len_slot - 32,
+                err_frame_save_slot: slots.err_frame_save_slot - 32,
+                exit_flag_slot: slots.exit_flag_slot,
+            };
             emit_match_result_inlined(
                 code,
                 target,
@@ -3954,6 +4088,7 @@ fn emit_eval_result_expr(
                 field_ranges,
                 text_bindings,
                 slots,
+                next_slots,
             )
         }
         other => Err(NativeError {
@@ -4004,6 +4139,7 @@ fn emit_match_result_inlined(
     field_ranges: &HashMap<&str, (i64, i64)>,
     text_bindings: &TextBindings<'_>,
     slots: MatchSlots,
+    next_slots: MatchSlots,
 ) -> Result<(), NativeError> {
     // The outer Err body must be `Err(<text_expr>)`. Phase 2F accepts any
     // text_expr that emit_text_write_to_fd can handle — literal, input text
@@ -4104,6 +4240,7 @@ fn emit_match_result_inlined(
         field_ranges,
         text_bindings,
         slots,
+        next_slots,
     )
 }
 
@@ -4124,6 +4261,11 @@ fn emit_redirect_callee_leaves(
     field_ranges: &HashMap<&str, (i64, i64)>,
     text_bindings: &TextBindings<'_>,
     slots: MatchSlots,
+    // `next_slots` are the slots to use for any nested match_result inside
+    // the OUTER arms (`ok_body` / `err_body`). Computed by the caller as
+    // `slots` shifted 32 bytes deeper (one quartet down). Unused — but
+    // harmless — when the outer arms contain no nested match_result.
+    next_slots: MatchSlots,
 ) -> Result<(), NativeError> {
     match expr {
         Expr::Ok(inner) => {
@@ -4141,6 +4283,10 @@ fn emit_redirect_callee_leaves(
             // arm self-terminates.
             let mut augmented = offsets.clone();
             augmented.insert(ok_var, slots.match_slot);
+            // Pass `next_slots` to the recursive emit so a nested
+            // match_result inside the outer ok_body uses a fresh
+            // quartet (one level deeper into the frame). For
+            // non-nested ok_body this argument is unused.
             emit_eval_result_expr(
                 code,
                 ok_body,
@@ -4152,7 +4298,7 @@ fn emit_redirect_callee_leaves(
                 &augmented,
                 field_ranges,
                 text_bindings,
-                slots,
+                next_slots,
             )
         }
         Expr::Err(inner) => {
@@ -4309,7 +4455,7 @@ fn emit_redirect_callee_leaves(
 
             emit_redirect_callee_leaves(
                 code, then_e, callee, ok_var, ok_body, err_var, outer_err_inner, loop_top,
-                outer_rule, concept, all_concepts, all_rules, offsets, field_ranges, text_bindings, slots,
+                outer_rule, concept, all_concepts, all_rules, offsets, field_ranges, text_bindings, slots, next_slots,
             )?;
 
             let else_pos = code.len();
@@ -4317,7 +4463,7 @@ fn emit_redirect_callee_leaves(
             code[else_patch..else_patch + 4].copy_from_slice(&else_off.to_le_bytes());
             emit_redirect_callee_leaves(
                 code, else_e, callee, ok_var, ok_body, err_var, outer_err_inner, loop_top,
-                outer_rule, concept, all_concepts, all_rules, offsets, field_ranges, text_bindings, slots,
+                outer_rule, concept, all_concepts, all_rules, offsets, field_ranges, text_bindings, slots, next_slots,
             )?;
             Ok(())
         }
@@ -12035,6 +12181,145 @@ rule discount_purchase
             "non-positive amount",
             "Err arm should propagate the callee's reason on stderr; got stdout={:?} stderr={:?}",
             err_run.stdout, err_run.stderr,
+        );
+
+        let _ = fs::remove_file(out);
+    }
+
+    /// Nested match_result: an outer match_result whose Ok arm itself
+    /// runs another match_result (chained validation). The prologue
+    /// reserves N quartets where N = static max nesting depth; each
+    /// level uses its own quartet via the +32-byte shift in
+    /// `next_slots`. This test exercises a 2-deep chain with all four
+    /// reachable arm combinations: outer Err, outer-Ok-then-inner-Err,
+    /// outer-Ok-then-inner-Ok.
+    #[test]
+    fn native_nested_match_result_runtime() {
+        use std::fs;
+        use std::process::Command;
+        let src = r#"@verbose 0.1.0
+
+concept P
+  @intention: "amount + age"
+  @source: invoices.intent:1
+
+  fields:
+    amount       : number
+    customer_age : number
+
+
+rule validate_amount
+  @intention: "positive amount → Ok, else Err"
+  @source: invoices.intent:1
+
+  input:
+    p : P
+
+  output:
+    r : Result(number, text)
+
+  logic:
+    r = if p.amount > 0 then Ok(p.amount) else Err("non-positive amount")
+
+  proofs:
+    purity:
+      reads   : [p.amount]
+      calls   : []
+    termination:
+      bound : 4
+
+
+rule validate_age
+  @intention: "adult age → Ok, else Err"
+  @source: invoices.intent:1
+
+  input:
+    p : P
+
+  output:
+    r : Result(number, text)
+
+  logic:
+    r = if p.customer_age >= 18 then Ok(p.customer_age) else Err("under 18")
+
+  proofs:
+    purity:
+      reads   : [p.customer_age]
+      calls   : []
+    termination:
+      bound : 4
+
+
+rule chained_validate
+  @intention: "amount validated → then age validated; both must pass"
+  @source: invoices.intent:1
+
+  input:
+    p : P
+
+  output:
+    r : Result(number, text)
+
+  logic:
+    r = match_result(validate_amount(p),
+          amt => match_result(validate_age(p),
+                  age => Ok(amt),
+                  inner_e => Err(inner_e)),
+          outer_e => Err(outer_e))
+
+  proofs:
+    purity:
+      reads   : [p]
+      calls   : [validate_amount, validate_age]
+    termination:
+      bound : 9
+"#;
+        let tokens = crate::lexer::Lexer::new(src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let out = std::env::temp_dir().join("verbosec_test_nested_match");
+        compile_native(&program, "chained_validate", out.to_str().unwrap(), false, false)
+            .expect("nested match_result must compile");
+
+        // (1) Outer Ok, inner Ok → produces amount.
+        let r_okok = Command::new(&out)
+            .args(["1000", "25"])
+            .output()
+            .expect("spawn ok-ok");
+        assert_eq!(
+            String::from_utf8_lossy(&r_okok.stdout).trim(),
+            "1000",
+            "outer-Ok / inner-Ok should output the amount; stdout={:?} stderr={:?}",
+            r_okok.stdout, r_okok.stderr,
+        );
+
+        // (2) Outer Ok, inner Err → "under 18" — exercises the inner
+        //     match_result's Err arm. Critical: inner Err must propagate
+        //     through the OUTER's match_result Ok-arm wrapping (the
+        //     outer's Ok arm IS the inner match_result, so the inner
+        //     match_result's Err is the outer rule's Err).
+        let r_okerr = Command::new(&out)
+            .args(["1000", "15"])
+            .output()
+            .expect("spawn ok-err");
+        assert_eq!(
+            String::from_utf8_lossy(&r_okerr.stderr).trim(),
+            "under 18",
+            "outer-Ok / inner-Err should propagate inner's Err on stderr; stdout={:?} stderr={:?}",
+            r_okerr.stdout, r_okerr.stderr,
+        );
+
+        // (3) Outer Err → "non-positive amount". Inner match_result
+        //     never runs — outer's Err arm fires first.
+        let r_err = Command::new(&out)
+            .args(["-50", "25"])
+            .output()
+            .expect("spawn outer-err");
+        assert_eq!(
+            String::from_utf8_lossy(&r_err.stderr).trim(),
+            "non-positive amount",
+            "outer-Err should bypass inner match_result; stdout={:?} stderr={:?}",
+            r_err.stdout, r_err.stderr,
         );
 
         let _ = fs::remove_file(out);
