@@ -203,7 +203,7 @@ fn compile_native_code(
     let mut code = if let Some(rx) = reaction {
         emit_reaction_program(rx, rule, concept, &rules, &resources, &connections)?
     } else if is_result_output {
-        emit_result_program(rule, concept, &rules, &resources, &connections)?
+        emit_result_program(rule, concept, &concepts, &rules, &resources, &connections)?
     } else if is_collection_output {
         emit_collection_program(rule, concept, &concepts, &rules, &resources)?
     } else if is_fold_number_output {
@@ -3749,6 +3749,7 @@ fn emit_open_append(code: &mut Vec<u8>, path: &str) {
 fn emit_result_program(
     rule: &Rule,
     concept: &Concept,
+    all_concepts: &[&Concept],
     all_rules: &HashMap<&str, &Rule>,
     all_resources: &HashMap<&str, &Resource>,
     all_connections: &HashMap<&str, &Connection>,
@@ -3791,6 +3792,7 @@ fn emit_result_program(
         ctx.loop_top,
         rule,
         concept,
+        all_concepts,
         all_rules,
         &ctx.binding_offsets,
         &ctx.field_ranges,
@@ -3836,6 +3838,7 @@ fn emit_eval_result_expr(
     loop_top: usize,
     rule: &Rule,
     concept: &Concept,
+    all_concepts: &[&Concept],
     all_rules: &HashMap<&str, &Rule>,
     offsets: &HashMap<&str, i32>,
     field_ranges: &HashMap<&str, (i64, i64)>,
@@ -3917,7 +3920,7 @@ fn emit_eval_result_expr(
 
             // .then — each leaf self-terminates with jmp loop_top.
             emit_eval_result_expr(
-                code, then_e, loop_top, rule, concept, all_rules, offsets, field_ranges, text_bindings, slots,
+                code, then_e, loop_top, rule, concept, all_concepts, all_rules, offsets, field_ranges, text_bindings, slots,
             )?;
 
             // .else:
@@ -3925,7 +3928,7 @@ fn emit_eval_result_expr(
             let else_off = else_pos as i32 - (else_patch as i32 + 4);
             code[else_patch..else_patch + 4].copy_from_slice(&else_off.to_le_bytes());
             emit_eval_result_expr(
-                code, else_e, loop_top, rule, concept, all_rules, offsets, field_ranges, text_bindings, slots,
+                code, else_e, loop_top, rule, concept, all_concepts, all_rules, offsets, field_ranges, text_bindings, slots,
             )?;
             Ok(())
         }
@@ -3945,6 +3948,7 @@ fn emit_eval_result_expr(
                 loop_top,
                 rule,
                 concept,
+                all_concepts,
                 all_rules,
                 offsets,
                 field_ranges,
@@ -3994,6 +3998,7 @@ fn emit_match_result_inlined(
     loop_top: usize,
     rule: &Rule,
     concept: &Concept,
+    all_concepts: &[&Concept],
     all_rules: &HashMap<&str, &Rule>,
     offsets: &HashMap<&str, i32>,
     field_ranges: &HashMap<&str, (i64, i64)>,
@@ -4033,19 +4038,52 @@ fn emit_match_result_inlined(
         message: format!("match_result calls unknown rule '{}'", callee_name),
     })?;
 
-    // Validate callee's input concept matches outer rule's. Same-concept
-    // means the rbp slots already populated by the prologue are reusable.
+    // Validate callee's input concept against outer's. Same-concept
+    // is the easy case — rbp slots already populated by the prologue
+    // are reusable as-is. Cross-concept (slice "cross-concept
+    // match_result") accepts a callee whose concept's fields are a
+    // SUBSET of the outer's by name AND type: the callee's body uses
+    // the existing offsets/field-types, but only references fields
+    // the outer also has. The check below makes the contract
+    // explicit so a mismatched name or a same-name-different-type
+    // surfaces a clear native error rather than silently
+    // miscompiling.
     let callee_input = match &callee.input_ty {
         Type::Named(n) => n.as_str(),
         _ => return Err(NativeError { message: "callee input must be a named concept".into() }),
     };
     if callee_input != concept.name.as_str() {
-        return Err(NativeError {
-            message: format!(
-                "match_result callee '{}' takes input concept '{}' but caller takes '{}' — same-concept required for native",
-                callee_name, callee_input, concept.name
-            ),
-        });
+        let callee_concept = all_concepts
+            .iter()
+            .find(|c| c.name == callee_input)
+            .copied()
+            .ok_or_else(|| NativeError {
+                message: format!(
+                    "match_result callee '{}' references unknown concept '{}'",
+                    callee_name, callee_input
+                ),
+            })?;
+        for f in &callee_concept.fields {
+            match concept.fields.iter().find(|of| of.name == f.name) {
+                None => {
+                    return Err(NativeError {
+                        message: format!(
+                            "cross-concept match_result: callee '{}' references field '{}' not present in outer concept '{}'",
+                            callee_name, f.name, concept.name,
+                        ),
+                    });
+                }
+                Some(of) if of.ty != f.ty => {
+                    return Err(NativeError {
+                        message: format!(
+                            "cross-concept match_result: callee '{}' field '{}' is {:?} but outer concept '{}' has it as {:?}",
+                            callee_name, f.name, f.ty, concept.name, of.ty,
+                        ),
+                    });
+                }
+                Some(_) => {}
+            }
+        }
     }
 
     // Walk callee's logic, redirecting leaves.
@@ -4060,6 +4098,7 @@ fn emit_match_result_inlined(
         loop_top,
         rule,
         concept,
+        all_concepts,
         all_rules,
         offsets,
         field_ranges,
@@ -4079,6 +4118,7 @@ fn emit_redirect_callee_leaves(
     loop_top: usize,
     outer_rule: &Rule,
     concept: &Concept,
+    all_concepts: &[&Concept],
     all_rules: &HashMap<&str, &Rule>,
     offsets: &HashMap<&str, i32>,
     field_ranges: &HashMap<&str, (i64, i64)>,
@@ -4087,24 +4127,18 @@ fn emit_redirect_callee_leaves(
 ) -> Result<(), NativeError> {
     match expr {
         Expr::Ok(inner) => {
-            // Evaluate inner using callee's input_name (typically same as outer's
-            // since concepts match, but the names could differ syntactically).
-            // For simplicity we currently require the names to also match —
-            // otherwise the inner expression's Ident lookups would miss.
-            if callee.input_name != outer_rule.input_name {
-                return Err(NativeError {
-                    message: format!(
-                        "match_result callee uses input name '{}' but outer rule uses '{}' — same input name required for native today",
-                        callee.input_name, outer_rule.input_name
-                    ),
-                });
-            }
-            // Evaluate Ok's inner (a number) → rax.
-            emit_eval_expr(code, inner, &outer_rule.input_name, offsets, all_rules, field_ranges, text_bindings)?;
+            // The inner expression originates from the CALLEE's body, so
+            // its Field accesses use the callee's input name. Pass
+            // callee.input_name to emit_eval_expr; offsets/field_ranges
+            // are the outer's tables (same field names, by slice
+            // contract — validated up-front).
+            emit_eval_expr(code, inner, &callee.input_name, offsets, all_rules, field_ranges, text_bindings)?;
             // Store at match_slot.
             store_rax_at_rbp(code, slots.match_slot);
             // Augment offsets with ok_var → match_slot, then emit outer ok_body
-            // in result context. The outer arm self-terminates.
+            // in result context using the OUTER's input_name (the outer arm's
+            // expressions reference the outer's input identifier). The outer
+            // arm self-terminates.
             let mut augmented = offsets.clone();
             augmented.insert(ok_var, slots.match_slot);
             emit_eval_result_expr(
@@ -4113,6 +4147,7 @@ fn emit_redirect_callee_leaves(
                 loop_top,
                 outer_rule,
                 concept,
+                all_concepts,
                 all_rules,
                 &augmented,
                 field_ranges,
@@ -4161,8 +4196,14 @@ fn emit_redirect_callee_leaves(
                     code.extend_from_slice(&n.to_le_bytes());
                 }
                 Expr::Field(base, field_name)
-                    if matches!(base.as_ref(), Expr::Ident(n) if n == &outer_rule.input_name) =>
+                    if matches!(base.as_ref(), Expr::Ident(n) if n == &callee.input_name) =>
                 {
+                    // The Field expression was emitted by the callee — its
+                    // base ident is the callee's input name. The field
+                    // resolves through the OUTER's concept (slice contract:
+                    // callee.fields ⊆ outer.fields by name + type), so
+                    // both `concept.fields.find` and `offsets[name]` use
+                    // the outer's tables here.
                     let f = concept
                         .fields
                         .iter()
@@ -4196,13 +4237,17 @@ fn emit_redirect_callee_leaves(
                 }
                 Expr::Concat(args) => {
                     // Build the concat buffer; get (rax=ptr, rdx=len).
-                    // The buffer stays alive across the outer arm; cleanup
-                    // via `mov rsp, [rbp+err_frame_save_slot]` at the end.
-                    // Passes text_bindings so the callee's Err concat can
-                    // reference text-let values from the outer rule's
-                    // prologue (Phase 2I integration point).
+                    // The concat is in the CALLEE's body — its args
+                    // reference fields via callee.input_name. Pass that
+                    // name to the buffer builder; offsets/concept stay
+                    // the outer's tables (slice contract: callee.fields
+                    // ⊆ outer.fields). The buffer stays alive across the
+                    // outer arm; cleanup via `mov rsp, [rbp+err_frame_save_slot]`
+                    // at the end. Passes text_bindings so the callee's
+                    // Err concat can reference text-let values from the
+                    // outer rule's prologue (Phase 2I integration point).
                     let _buf = emit_concat_to_buffer(
-                        code, args, &outer_rule.input_name, concept, all_rules,
+                        code, args, &callee.input_name, concept, all_rules,
                         offsets, field_ranges, text_bindings,
                     )?;
                     store_rax_at_rbp(code, slots.err_ptr_slot);
@@ -4251,7 +4296,11 @@ fn emit_redirect_callee_leaves(
             Ok(())
         }
         Expr::If(cond, then_e, else_e) => {
-            emit_eval_expr(code, cond, &outer_rule.input_name, offsets, all_rules, field_ranges, text_bindings)?;
+            // Cond originates from the CALLEE's body — evaluate against
+            // callee.input_name. Field accesses resolve through `offsets`
+            // (built from the outer's concept), which by slice contract
+            // contains every name the callee could reference.
+            emit_eval_expr(code, cond, &callee.input_name, offsets, all_rules, field_ranges, text_bindings)?;
             code.extend_from_slice(&[0x48, 0x85, 0xC0]); // test rax, rax
             code.push(0x0F);
             code.push(0x84);
@@ -4260,7 +4309,7 @@ fn emit_redirect_callee_leaves(
 
             emit_redirect_callee_leaves(
                 code, then_e, callee, ok_var, ok_body, err_var, outer_err_inner, loop_top,
-                outer_rule, concept, all_rules, offsets, field_ranges, text_bindings, slots,
+                outer_rule, concept, all_concepts, all_rules, offsets, field_ranges, text_bindings, slots,
             )?;
 
             let else_pos = code.len();
@@ -4268,7 +4317,7 @@ fn emit_redirect_callee_leaves(
             code[else_patch..else_patch + 4].copy_from_slice(&else_off.to_le_bytes());
             emit_redirect_callee_leaves(
                 code, else_e, callee, ok_var, ok_body, err_var, outer_err_inner, loop_top,
-                outer_rule, concept, all_rules, offsets, field_ranges, text_bindings, slots,
+                outer_rule, concept, all_concepts, all_rules, offsets, field_ranges, text_bindings, slots,
             )?;
             Ok(())
         }
@@ -11883,6 +11932,274 @@ mod tests {
         let size = fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
         assert!(size > 500 && size < 2_500, "unexpected binary size: {}", size);
         let _ = fs::remove_file(out);
+    }
+
+    /// Cross-concept match_result: the outer rule takes a wider concept
+    /// (Purchase: amount + age + name) than the callee (AmountOnly: just
+    /// amount). The slice contract — callee.fields ⊆ outer.fields by
+    /// (name, type) — lets the inlined callee body reuse the outer's
+    /// rbp slots without re-marshalling. End-to-end runtime check
+    /// covers both arms.
+    #[test]
+    fn native_cross_concept_match_result_runtime() {
+        use std::fs;
+        use std::process::Command;
+        let src = r#"@verbose 0.1.0
+
+concept AmountOnly
+  @intention: "Just an amount"
+  @source: invoices.intent:1
+
+  fields:
+    amount : number
+
+
+concept Purchase
+  @intention: "A purchase has amount, age, and customer name"
+  @source: invoices.intent:1
+
+  fields:
+    amount        : number
+    customer_age  : number
+    customer_name : text
+
+
+rule validate_amount
+  @intention: "Reusable validator: positive amount → Ok, else Err"
+  @source: invoices.intent:1
+
+  input:
+    a : AmountOnly
+
+  output:
+    r : Result(number, text)
+
+  logic:
+    r = if a.amount > 0 then Ok(a.amount) else Err("non-positive amount")
+
+  proofs:
+    purity:
+      reads   : [a.amount]
+      calls   : []
+    termination:
+      bound : 4
+
+
+rule discount_purchase
+  @intention: "Apply 10% discount via the cross-concept validator"
+  @source: invoices.intent:1
+
+  input:
+    p : Purchase
+
+  output:
+    r : Result(number, text)
+
+  logic:
+    r = match_result(validate_amount(p), amount => Ok(amount * 90 / 100), reason => Err(reason))
+
+  proofs:
+    purity:
+      reads   : [p]
+      calls   : [validate_amount]
+    termination:
+      bound : 6
+"#;
+        let tokens = crate::lexer::Lexer::new(src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let out = std::env::temp_dir().join("verbosec_test_cross_concept_match");
+        compile_native(&program, "discount_purchase", out.to_str().unwrap(), false, false)
+            .expect("cross-concept match_result must compile");
+
+        // Runtime: both arms must produce the right thing.
+        // Adult, positive amount → Ok arm → 1000 * 90 / 100 = 900
+        let ok_run = Command::new(&out)
+            .args(["1000", "25", "Alice"])
+            .output()
+            .expect("spawn discount_purchase");
+        assert_eq!(
+            String::from_utf8_lossy(&ok_run.stdout).trim(),
+            "900",
+            "Ok arm should output 900; full stdout: {:?}",
+            ok_run.stdout,
+        );
+
+        // Negative amount → callee Err → outer Err pass-through
+        let err_run = Command::new(&out)
+            .args(["-50", "25", "Bob"])
+            .output()
+            .expect("spawn discount_purchase err arm");
+        assert_eq!(
+            String::from_utf8_lossy(&err_run.stderr).trim(),
+            "non-positive amount",
+            "Err arm should propagate the callee's reason on stderr; got stdout={:?} stderr={:?}",
+            err_run.stdout, err_run.stderr,
+        );
+
+        let _ = fs::remove_file(out);
+    }
+
+    /// Cross-concept rejection: callee references a field that doesn't
+    /// exist in the outer's concept. Slice contract enforces that the
+    /// callee's fields are a SUBSET of the outer's; without the field
+    /// in `offsets`, the inline emission would silently miscompile, so
+    /// we reject up-front with a breadcrumb naming the missing field.
+    #[test]
+    fn native_cross_concept_match_rejects_missing_field() {
+        let src = r#"@verbose 0.1.0
+
+concept Wider
+  @intention: "Has an extra field the outer doesn't"
+  @source: invoices.intent:1
+
+  fields:
+    amount : number
+    bonus  : number
+
+
+concept Outer
+  @intention: "Smaller concept — no `bonus`"
+  @source: invoices.intent:1
+
+  fields:
+    amount : number
+
+
+rule validate_wider
+  @intention: "Reads the missing field"
+  @source: invoices.intent:1
+
+  input:
+    w : Wider
+
+  output:
+    r : Result(number, text)
+
+  logic:
+    r = if w.bonus > 0 then Ok(w.amount) else Err("no bonus")
+
+  proofs:
+    purity:
+      reads   : [w.bonus, w.amount]
+      calls   : []
+    termination:
+      bound : 4
+
+
+rule outer_rule
+  @intention: "Calls validate_wider — callee references field not in Outer"
+  @source: invoices.intent:1
+
+  input:
+    o : Outer
+
+  output:
+    r : Result(number, text)
+
+  logic:
+    r = match_result(validate_wider(o), v => Ok(v), reason => Err(reason))
+
+  proofs:
+    purity:
+      reads   : [o]
+      calls   : [validate_wider]
+    termination:
+      bound : 5
+"#;
+        let tokens = crate::lexer::Lexer::new(src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let out = std::env::temp_dir().join("verbosec_test_cross_concept_missing");
+        let err = compile_native(&program, "outer_rule", out.to_str().unwrap(), false, false)
+            .expect_err("cross-concept with missing field must reject");
+        let msg = format!("{:?}", err);
+        assert!(
+            msg.contains("bonus") && msg.contains("not present in outer concept"),
+            "expected breadcrumb naming missing field 'bonus'; got: {}",
+            msg
+        );
+        let _ = std::fs::remove_file(out);
+    }
+
+    /// Cross-concept rejection: callee has a field with the same name
+    /// as the outer's, but a different type. Without this check the
+    /// callee would read the outer's slot through the wrong-typed
+    /// access and silently miscompile.
+    #[test]
+    fn native_cross_concept_match_rejects_type_mismatch() {
+        let src = r#"@verbose 0.1.0
+
+concept TextAmount
+  @intention: "amount is text here"
+  @source: invoices.intent:1
+
+  fields:
+    amount : text
+
+
+concept NumAmount
+  @intention: "amount is number here"
+  @source: invoices.intent:1
+
+  fields:
+    amount : number
+
+
+rule text_validate
+  @intention: "Validator over a text field"
+  @source: invoices.intent:1
+
+  input:
+    t : TextAmount
+
+  output:
+    r : Result(text, text)
+
+  logic:
+    r = if length(t.amount) > 0 then Ok(t.amount) else Err("empty")
+
+  proofs:
+    purity:
+      reads   : [t.amount]
+      calls   : []
+    termination:
+      bound : 4
+
+
+rule num_outer
+  @intention: "Calls text_validate from a number-amount input"
+  @source: invoices.intent:1
+
+  input:
+    n : NumAmount
+
+  output:
+    r : Result(text, text)
+
+  logic:
+    r = match_result(text_validate(n), v => Ok(v), reason => Err(reason))
+
+  proofs:
+    purity:
+      reads   : [n]
+      calls   : [text_validate]
+    termination:
+      bound : 5
+"#;
+        let tokens = crate::lexer::Lexer::new(src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let out = std::env::temp_dir().join("verbosec_test_cross_concept_type_mismatch");
+        let err = compile_native(&program, "num_outer", out.to_str().unwrap(), false, false)
+            .expect_err("cross-concept with type mismatch must reject");
+        let msg = format!("{:?}", err);
+        assert!(
+            msg.contains("amount") && msg.contains("Text") && msg.contains("Number"),
+            "expected breadcrumb naming the type mismatch on 'amount'; got: {}",
+            msg
+        );
+        let _ = std::fs::remove_file(out);
     }
 
     #[test]
