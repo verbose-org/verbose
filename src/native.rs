@@ -3884,13 +3884,32 @@ fn emit_result_program(
             })
         }
     };
-    // Accept Result(Number, Text) and Result(Text, Text). Other shapes
-    // (Result(Record, _), Result(collection, _), etc.) need their own
-    // calling convention design and stay interpreter-only.
-    if !matches!(t_ok, Type::Number | Type::Text) || !matches!(t_err, Type::Text) {
+    // Accept Result(Number, Text), Result(Text, Text), and Result(Named, Text).
+    // The Named case (slice "Result(Record, text)") routes the Ok arm through
+    // emit_record_as_json — same one-JSON-object-per-record format that
+    // `output: Named(C)` rules already emit. Err stays text everywhere.
+    let ok_is_named = matches!(t_ok, Type::Named(_));
+    if !(matches!(t_ok, Type::Number | Type::Text) || ok_is_named)
+        || !matches!(t_err, Type::Text)
+    {
         return Err(NativeError {
-            message: "native Result rules today support Ok = number|text and Err = text; other shapes are interpreter-only".into(),
+            message: format!(
+                "native Result rules today support Ok = number | text | <concept>, Err = text. \
+                 Got Result({:?}, {:?}).",
+                t_ok, t_err,
+            ),
         });
+    }
+    // For Result(Named(c), text), make sure the named concept exists.
+    if let Type::Named(name) = t_ok {
+        if !all_concepts.iter().any(|c| c.name == *name) {
+            return Err(NativeError {
+                message: format!(
+                    "Result Ok arm references unknown concept '{}'",
+                    name
+                ),
+            });
+        }
     }
 
     let mut code = Vec::new();
@@ -3992,10 +4011,61 @@ fn emit_eval_result_expr(
                     )?;
                     emit_write_newline(code, 1);
                 }
+                Type::Named(out_concept_name) => {
+                    // Result(Record, Text) Ok arm. The inner expression must
+                    // be a `Concept { ... }` constructor matching the
+                    // declared output concept. Slice scope: no `if/else`
+                    // inside Ok yet — direct Record only. (The if/else
+                    // already wraps the Ok at the rule-body level via the
+                    // existing `Expr::If` arm below; nesting another inside
+                    // the Ok would need to recurse through the record-
+                    // dispatch emitter and is its own slice.)
+                    let record_fields = match inner.as_ref() {
+                        Expr::Record(name, fields) => {
+                            if name != out_concept_name {
+                                return Err(NativeError {
+                                    message: format!(
+                                        "Ok-arm record constructor '{}' does not match declared concept '{}'",
+                                        name, out_concept_name
+                                    ),
+                                });
+                            }
+                            fields.as_slice()
+                        }
+                        other => {
+                            return Err(NativeError {
+                                message: format!(
+                                    "Result(Record, Text) Ok arm must be a `{} {{ ... }}` constructor; got {:?}",
+                                    out_concept_name, other
+                                ),
+                            });
+                        }
+                    };
+                    let out_concept = all_concepts
+                        .iter()
+                        .find(|c| c.name == *out_concept_name)
+                        .copied()
+                        .ok_or_else(|| NativeError {
+                            message: format!("unknown output concept '{}'", out_concept_name),
+                        })?;
+                    emit_record_as_json(
+                        code,
+                        record_fields,
+                        out_concept,
+                        &rule.input_name,
+                        concept,
+                        all_rules,
+                        offsets,
+                        field_ranges,
+                        text_bindings,
+                    )?;
+                    // emit_record_as_json already wrote the trailing `}\n`
+                    // — no extra newline needed.
+                }
                 other => {
                     return Err(NativeError {
                         message: format!(
-                            "Ok arm type '{:?}' not yet supported in native — only number and text",
+                            "Ok arm type '{:?}' not yet supported in native — only number, text, and named concept",
                             other
                         ),
                     });
@@ -12320,6 +12390,99 @@ rule chained_validate
             "non-positive amount",
             "outer-Err should bypass inner match_result; stdout={:?} stderr={:?}",
             r_err.stdout, r_err.stderr,
+        );
+
+        let _ = fs::remove_file(out);
+    }
+
+    /// `Result(<Record>, text)` end-to-end. Outer rule has
+    /// `output: Result(Refined, text)` where Refined is a concept with
+    /// number+text fields. The Ok arm emits the record as a single JSON
+    /// line on stdout (same `{"f":v,...}\n` format as `output: Named(C)`
+    /// rules). The Err arm writes the rejection reason to stderr +
+    /// exit 1. Three reachable cases exercised: Ok with one tier
+    /// branch, Ok with the other tier branch (text-field if/else), Err.
+    #[test]
+    fn native_result_record_text_runtime() {
+        use std::fs;
+        use std::process::Command;
+        let src = r#"@verbose 0.1.0
+
+concept Purchase
+  @intention: "p"
+  @source: invoices.intent:1
+
+  fields:
+    amount        : number
+    customer_age  : number
+
+
+concept Refined
+  @intention: "validated purchase + derived tier"
+  @source: invoices.intent:1
+
+  fields:
+    amount : number
+    tier   : text
+
+
+rule classify_purchase
+  @intention: "v"
+  @source: invoices.intent:1
+
+  input:
+    p : Purchase
+
+  output:
+    r : Result(Refined, text)
+
+  logic:
+    r = if p.customer_age >= 18 then Ok(Refined { amount: p.amount, tier: if p.amount >= 1000 then "premium" else "standard" }) else Err(concat("under 18: age=", p.customer_age))
+
+  proofs:
+    purity:
+      reads   : [p.customer_age, p.amount]
+      calls   : []
+    termination:
+      bound : 9
+"#;
+        let tokens = crate::lexer::Lexer::new(src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let out = std::env::temp_dir().join("verbosec_test_result_record");
+        compile_native(&program, "classify_purchase", out.to_str().unwrap(), false, false)
+            .expect("Result(Record, text) must compile");
+
+        // Ok arm, premium tier.
+        let r_premium = Command::new(&out).args(["1500", "25"]).output().unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&r_premium.stdout).trim(),
+            r#"{"amount":1500,"tier":"premium"}"#,
+            "premium tier; stdout={:?} stderr={:?}",
+            r_premium.stdout, r_premium.stderr,
+        );
+
+        // Ok arm, standard tier.
+        let r_standard = Command::new(&out).args(["200", "25"]).output().unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&r_standard.stdout).trim(),
+            r#"{"amount":200,"tier":"standard"}"#,
+            "standard tier; stdout={:?} stderr={:?}",
+            r_standard.stdout, r_standard.stderr,
+        );
+
+        // Err arm: minor customer.
+        let r_err = Command::new(&out).args(["1500", "15"]).output().unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&r_err.stderr).trim(),
+            "under 18: age=15",
+            "minor Err; stdout={:?} stderr={:?}",
+            r_err.stdout, r_err.stderr,
+        );
+        assert_eq!(
+            r_err.status.code(),
+            Some(1),
+            "Err arm should exit 1 (compare to existing same-shape Result(text, text) tests)",
         );
 
         let _ = fs::remove_file(out);
