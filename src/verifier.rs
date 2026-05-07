@@ -2125,6 +2125,71 @@ fn validate_read_path(
     None
 }
 
+/// Collect every identifier that's bound by a lambda-shaped construct
+/// anywhere in the expression tree. Drives the diagnostic hint in
+/// `check_purity` when an extra `reads:` entry's base ident matches.
+///
+/// "Lambda-bound" here means: variables whose scope is local to a body
+/// expression — quantifier var (`all` / `any`), fold's acc + element,
+/// map/filter element, match_result's ok_var + err_var. Field
+/// accesses like `var.field` inside that body do NOT belong in
+/// `reads:`; the verifier's fact-collection (`collect_expr_facts`)
+/// already filters them out, so a stale entry in `reads:` is the
+/// model's mistake.
+fn collect_lambda_bound_names(expr: &Expr) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    fn walk(e: &Expr, out: &mut std::collections::HashSet<String>) {
+        match e {
+            Expr::Quantifier(_, coll, var, body) => {
+                out.insert(var.clone());
+                walk(coll, out);
+                walk(body, out);
+            }
+            Expr::Map(coll, var, body) | Expr::Filter(coll, var, body) => {
+                out.insert(var.clone());
+                walk(coll, out);
+                walk(body, out);
+            }
+            Expr::Fold(coll, init, acc, item, body) => {
+                out.insert(acc.clone());
+                out.insert(item.clone());
+                walk(coll, out);
+                walk(init, out);
+                walk(body, out);
+            }
+            Expr::MatchResult(target, ok_var, ok_body, err_var, err_body) => {
+                out.insert(ok_var.clone());
+                out.insert(err_var.clone());
+                walk(target, out);
+                walk(ok_body, out);
+                walk(err_body, out);
+            }
+            Expr::Binary(_, l, r) => { walk(l, out); walk(r, out); }
+            Expr::If(c, t, el) => { walk(c, out); walk(t, out); walk(el, out); }
+            Expr::Not(i) | Expr::Neg(i) | Expr::Abs(i) | Expr::Length(i)
+            | Expr::ParseInt(i) | Expr::JsonEscape(i) | Expr::Ok(i) | Expr::Err(i) => {
+                walk(i, out);
+            }
+            Expr::Min(a, b) | Expr::Max(a, b) | Expr::StartsWith(a, b)
+            | Expr::EndsWith(a, b) | Expr::Contains(a, b) => {
+                walk(a, out); walk(b, out);
+            }
+            Expr::Call(_, args) | Expr::Concat(args) => {
+                for a in args { walk(a, out); }
+            }
+            Expr::Record(_, fields) => {
+                for (_, v) in fields { walk(v, out); }
+            }
+            Expr::Fetch(_, request) => walk(request, out),
+            // Leaves
+            Expr::Number(_) | Expr::Text(_) | Expr::Field(_, _) | Expr::Ident(_)
+            | Expr::Read(_) | Expr::NowUnix => {}
+        }
+    }
+    walk(expr, &mut out);
+    out
+}
+
 fn check_purity(rule: &Rule, facts: &LogicFacts, errors: &mut Vec<VerifyError>) {
     let ctx = |sub: &str| format!("rule '{}' / {}", rule.name, sub);
 
@@ -2137,10 +2202,11 @@ fn check_purity(rule: &Rule, facts: &LogicFacts, errors: &mut Vec<VerifyError>) 
             .difference(&declared_reads)
             .map(|p| p.join("."))
             .collect();
-        let extra: Vec<String> = declared_reads
+        let extra_paths: Vec<Vec<String>> = declared_reads
             .difference(&facts.reads)
-            .map(|p| p.join("."))
+            .cloned()
             .collect();
+        let extra: Vec<String> = extra_paths.iter().map(|p| p.join(".")).collect();
         let mut parts = Vec::new();
         if !missing.is_empty() {
             parts.push(format!("missing: [{}]", missing.join(", ")));
@@ -2148,9 +2214,38 @@ fn check_purity(rule: &Rule, facts: &LogicFacts, errors: &mut Vec<VerifyError>) 
         if !extra.is_empty() {
             parts.push(format!("extra: [{}]", extra.join(", ")));
         }
+        // Diagnostic hint: when an `extra` path's base identifier is
+        // bound by a lambda inside the rule body (quantifier var,
+        // map/filter/fold var, fold acc, match_result ok_var/err_var),
+        // the most likely cause is the model emitted `reads: [..., var.f]`
+        // for a field accessed inside the lambda body. Lambda-bound
+        // accesses don't count as `reads:` (the verifier's
+        // `collect_expr_facts` already filters them out). Surface that
+        // explicitly so a generator that hit this trap can correct on
+        // the first round instead of guessing.
+        let lambda_bound = collect_lambda_bound_names(&rule.logic.value);
+        let lambda_extras: Vec<&str> = extra_paths
+            .iter()
+            .filter_map(|p| p.first().map(String::as_str))
+            .filter(|name| lambda_bound.contains(*name))
+            .collect();
+        let mut message = format!("declared reads do not match logic; {}", parts.join(", "));
+        if !lambda_extras.is_empty() {
+            // Dedupe + stable order for a tight message.
+            let mut names: Vec<&str> = lambda_extras;
+            names.sort();
+            names.dedup();
+            message.push_str(&format!(
+                "\n  hint: '{}' {} lambda-bound by a quantifier/fold/map/filter/match_result \
+                 — fields accessed through such a variable do NOT belong in `reads:`. \
+                 Only fields of the rule's input concept (or top-level resource names) appear there.",
+                names.join("', '"),
+                if names.len() == 1 { "is" } else { "are" },
+            ));
+        }
         errors.push(VerifyError {
             context: ctx("purity.reads"),
-            message: format!("declared reads do not match logic; {}", parts.join(", ")),
+            message,
         });
     }
 
@@ -3725,6 +3820,138 @@ rule test
                 && e.message.contains("if/else")),
             "expected if/else rejection, got: {:#?}",
             errs
+        );
+    }
+
+    /// Regression: when a model declares a lambda-bound field in the
+    /// `reads:` proof (e.g. `b.copies` in `count(lib.books, b => b.copies < 5)`),
+    /// the verifier rejects with the existing "extra: [...]" message AND
+    /// appends a hint identifying `b` as lambda-bound. The hint was the
+    /// load-bearing addition: the hold-out eval (2026-05-05) showed both
+    /// Sonnet 4.6 and Opus 4.7 falling into this trap on intents that
+    /// use a quantifier — without the hint, the diagnostic looked like
+    /// any other "reads" mismatch and the model couldn't tell that
+    /// removing the entry is the fix (not adding it).
+    #[test]
+    fn purity_extra_reads_hints_at_lambda_bound_var() {
+        let errs = verify_str(
+            r#"@verbose 0.1.0
+
+concept Book
+  @intention: "b"
+  @source: invoices.intent:1
+
+  fields:
+    copies : number
+
+
+concept Library
+  @intention: "l"
+  @source: invoices.intent:1
+
+  fields:
+    books : collection(Book)
+
+
+rule low_stock_count
+  @intention: "n"
+  @source: invoices.intent:1
+
+  input:
+    lib : Library
+
+  output:
+    n : number
+
+  logic:
+    n = count(lib.books, b => b.copies < 5)
+
+  proofs:
+    purity:
+      reads   : [lib.books, b.copies]
+      calls   : []
+    termination:
+      bound : 4
+"#,
+        );
+        let purity_err = errs
+            .iter()
+            .find(|e| e.message.contains("declared reads do not match logic"))
+            .unwrap_or_else(|| panic!("no purity error in: {:#?}", errs));
+        // The base error stays exactly as before (so existing
+        // matchers / generators don't break).
+        assert!(
+            purity_err.message.contains("extra: [b.copies]"),
+            "missing extra-reads breadcrumb; got: {}",
+            purity_err.message,
+        );
+        // The new hint identifies `b` as lambda-bound and tells the
+        // model what to do about it.
+        assert!(
+            purity_err.message.contains("hint:") && purity_err.message.contains("'b' is lambda-bound"),
+            "missing lambda-bound hint; got: {}",
+            purity_err.message,
+        );
+        assert!(
+            purity_err.message.contains("do NOT belong in `reads:`"),
+            "missing actionable instruction in hint; got: {}",
+            purity_err.message,
+        );
+    }
+
+    /// The hint must NOT fire when the extra read is just a stale
+    /// input-field reference (no lambda binding involved). Otherwise
+    /// the model would get told "remove this from `reads:`" for cases
+    /// where the actual fix is to remove the dead field from the
+    /// declaration. Keeps the hint specific to the lambda trap.
+    #[test]
+    fn purity_extra_reads_no_hint_when_not_lambda_bound() {
+        let errs = verify_str(
+            r#"@verbose 0.1.0
+
+concept Inv
+  @intention: "i"
+  @source: invoices.intent:1
+
+  fields:
+    amount : number
+    other  : number
+
+
+rule check
+  @intention: "c"
+  @source: invoices.intent:1
+
+  input:
+    i : Inv
+
+  output:
+    ok : bool
+
+  logic:
+    ok = i.amount > 100
+
+  proofs:
+    purity:
+      reads   : [i.amount, i.other]
+      calls   : []
+    termination:
+      bound : 1
+"#,
+        );
+        let purity_err = errs
+            .iter()
+            .find(|e| e.message.contains("declared reads do not match logic"))
+            .unwrap_or_else(|| panic!("no purity error: {:#?}", errs));
+        assert!(
+            purity_err.message.contains("extra: [i.other]"),
+            "missing extra-reads breadcrumb; got: {}",
+            purity_err.message,
+        );
+        assert!(
+            !purity_err.message.contains("hint:"),
+            "hint should NOT fire for non-lambda-bound base ident; got: {}",
+            purity_err.message,
         );
     }
 }

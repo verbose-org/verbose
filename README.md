@@ -436,7 +436,19 @@ failed            = 0/10
 
 Both runs are single stochastic shots; the per-model order is not load-bearing. What matters: zero failures across 20 model-runs, every correction converged in one round, every produced `.verbose` is a real solution (verified `reads:` / `calls:` / termination bound + the construct the prose asked for — the verifier rejects stand-ins).
 
-The recurring slip — only visible because the new diagnostic logging in `tools/generate.py` surfaces verifier rejections on stderr — is models declaring lambda-bound fields in `reads:`. In `sum(t.contestants, c => ... c.score ...)` both Sonnet and Opus occasionally include `c.score` as a top-level read; the verifier rejects, the model fixes it on the next round. Identifying this pattern is the kind of feedback the eval was supposed to surface, and now does.
+The recurring slip — only visible because the new diagnostic logging in `tools/generate.py` surfaces verifier rejections on stderr — is models declaring lambda-bound fields in `reads:`. In `sum(t.contestants, c => ... c.score ...)` both Sonnet and Opus occasionally include `c.score` as a top-level read; the verifier rejects, the model fixes it on the next round. Identifying this pattern is the kind of feedback the eval was supposed to surface.
+
+After the eval surfaced the pattern, the verifier itself was updated (commit landing 2026-05-07) to attach a hint when the extra `reads:` entry's base identifier is lambda-bound by a quantifier / fold / map / filter / `match_result`:
+
+```
+extra: [b.copies]
+  hint: 'b' is lambda-bound by a quantifier/fold/map/filter/match_result —
+        fields accessed through such a variable do NOT belong in `reads:`.
+        Only fields of the rule's input concept (or top-level resource names)
+        appear there.
+```
+
+The next hold-out run should see this trap converted from "one correction round" to "first-try success." Pinned by `purity_extra_reads_hints_at_lambda_bound_var` (and a negative test ensuring the hint stays scoped to the lambda case).
 
 Three numbers, three regimes. The 8/8 says *the pipeline ergonomics work for in-distribution intents*. The 9/10 + 1 (Sonnet) and 8/10 + 2 (Opus) say *both models compose `INTENT.md` patterns on never-seen domains, with the verifier catching every slip and the correction loop closing in one round each*. None is a guarantee — all are data points, single runs, and the failure modes are now actionable.
 
