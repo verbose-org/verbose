@@ -136,6 +136,23 @@ rule rule_name
     termination:
       bound : N                  -- >= count of Binary/Call/If/Not/Neg ops
 
+resource resource_name
+  @intention: "what this file holds"
+  @source: <intent_filename>:<line>
+  path: "/absolute/path/to/file"
+  max: 32                          -- max bytes; bounds the read buffer
+  on_read_error: abort             -- only `abort` is supported today
+
+  -- Referenced from a rule's logic via `read(resource_name)` (returns
+  -- the file bytes as text). The rule's `reads:` proof MUST include the
+  -- resource name (NOT a field path, just the bare name).
+  --
+  -- All FOUR header lines (@intention, @source, path, max, on_read_error)
+  -- are REQUIRED — same rule as concept and rule blocks. The parser
+  -- rejects any resource block missing @intention with `parse error at
+  -- LINE:1: resource missing @intention`. Treat the @intention line as
+  -- non-optional even when the file's purpose feels obvious from context.
+
 ### Expressions
 
 - arithmetic: +, -, *, /, %

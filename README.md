@@ -452,7 +452,7 @@ The next hold-out run should see this trap converted from "one correction round"
 
 Two complementary fixes were applied for the trap and re-measured the same day. (a) The verifier's hint above. (b) The system prompt in `tools/generate.py` was extended with a focused "what goes in `reads:` and what does NOT" section: a CRITICAL note that lambda-bound vars (quantifier var, fold acc/var, map/filter var, match_result ok_var/err_var) NEVER appear in `reads:`, plus three Wrong → Right pairs covering the exact shapes the eval surfaced.
 
-Re-running with both fixes in place:
+Re-running with the verifier hint and prompt rule in place:
 
 ```
                       Sonnet 4.6           Opus 4.7
@@ -460,7 +460,18 @@ hold-out (run 1)      9/10 + 1            8/10 + 2
 hold-out (run 3)      9/10 + 1            9/10 + 1   ← prize_pool went 2 → 1 attempt
 ```
 
-Opus's `prize_pool` (the `sum(...c.score...)` shape) flipped from "one correction round" to "first-try success" — the targeted improvement. Sonnet's score is unchanged because Sonnet hadn't been tripping on the lambda-bound trap in the first place; its remaining correction is a separate `@intention missing on resource` pattern that the prompt doesn't address yet (a different slice). Single-run sample, but the converted intent is named — that's the load-bearing observation, not the headline number.
+Opus's `prize_pool` (the `sum(...c.score...)` shape) flipped from "one correction round" to "first-try success" — the targeted improvement. The remaining correction in both runs is a separate `@intention missing on resource` parse trap on `low_stock_count`: when the model emits a `resource` block, it sometimes forgets the required `@intention` line because the prompt's skeleton didn't show one.
+
+A follow-up commit added a `resource` skeleton to the prompt's "Skeleton" section with `@intention` and `@source` shown alongside `path` / `max` / `on_read_error`, plus a CRITICAL note that the parse error is "treat the @intention line as non-optional even when the file's purpose feels obvious from context." Re-measured immediately:
+
+```
+                      Sonnet 4.6           Opus 4.7
+hold-out (run 4)      10/10 + 0            9/10 + 1   ← low_stock_count flipped to first-try
+```
+
+Sonnet hits 10/10 — first clean sweep on the hold-out. Opus's `low_stock_count` is now first-try too (the resource trap is gone); a different trap appeared in this run (`flight_status` parse error at a multi-line `if/then/else` — Opus tried to break the expression across lines, the parser is line-sensitive there). Different bug, separately addressable.
+
+Reading these numbers honestly: the four runs together show that **identifiable failure patterns can be eliminated by editing the verifier diagnostic AND the system prompt in tandem**. Each fix names the intent it was meant to fix. The headline numbers shift, the named failures change, but the floor — "the verifier rejects what shouldn't compile" — never depends on any of this.
 
 The architectural floor stands either way: *whatever the model produces, the compiler either accepts it or rejects it*. That floor is the bet.
 
