@@ -484,10 +484,29 @@ impl Parser {
     fn parse_primary(&mut self) -> Result<Expr, ParseError> {
         if self.check_ident("if") {
             self.advance();
+            // Multi-line `if/then/else`: NEWLINE tokens between the
+            // structural keywords (`if`, `then`, `else`) and their
+            // adjoining sub-expressions are skipped. Lets a long
+            // expression break across lines without forcing a single
+            // physical line — common when the model emits something
+            // like
+            //     status = if cond
+            //              then concat(...)
+            //              else concat(...)
+            // and the eval surfaced the trap on Opus 4.7 generating
+            // examples/holdout/flight_status. Indentation tokens
+            // (INDENT/DEDENT) are NOT skipped here — those still
+            // delimit the surrounding block; only NEWLINE between
+            // the keywords flows through.
+            self.skip_newlines();
             let condition = self.parse_expr()?;
+            self.skip_newlines();
             self.expect_ident("then")?;
+            self.skip_newlines();
             let then_expr = self.parse_expr()?;
+            self.skip_newlines();
             self.expect_ident("else")?;
+            self.skip_newlines();
             let else_expr = self.parse_expr()?;
             return Ok(Expr::If(
                 Box::new(condition),
@@ -1727,6 +1746,16 @@ impl Parser {
         matches!(self.peek_kind(), Some(TokenKind::Ident(n)) if n.as_str() == name)
     }
 
+    /// Consume any NEWLINE tokens at the cursor. Used to relax
+    /// line-sensitivity in expressions that legitimately span lines
+    /// (today: `if/then/else`). INDENT/DEDENT are deliberately NOT
+    /// consumed — they still mark the surrounding block boundaries.
+    fn skip_newlines(&mut self) {
+        while matches!(self.peek_kind(), Some(TokenKind::Newline)) {
+            self.advance();
+        }
+    }
+
     fn peek_attribute_name(&self) -> Option<String> {
         if let Some(TokenKind::Attribute(n)) = self.peek_kind() {
             Some(n.clone())
@@ -1922,8 +1951,31 @@ rule important_invoice
 
     #[test]
     fn if_then_else_parsed() {
-        let src = "@verbose 0.1.0\n\nconcept T\n  @intention: \"t\"\n  @source: f.intent:1\n  fields:\n    x : number\n\nrule test\n  @intention: \"t\"\n  @source: f.intent:1\n  input:\n    t : T\n  output:\n    r : number\n  logic:\n    r = if t.x > 10 then 1 else 0\n  proofs:\n    purity:\n      reads: [t.x]\n      calls: []\n    termination:\n      bound: 3\n";
+        let src = "@verbose 0.1.0\n\nconcept T\n  @intention: \"t\"\n  @source: f.intent:1\n  fields:\n    x : number\n\nrule test\n  @intention: \"t\"\n  @source: f.intent:1\n  input:\n    t : T\n  output:\n    r : number\n  logic:\n    r = if t.x > 10 then 1 else 0\n  proofs:\n    purity:\n      reads: [t.x]\n      calls: []\n    termination:\n      bound : 3\n";
         let p = parse(src).unwrap();
+        match &p.items[1] {
+            Item::Rule(r) => {
+                assert!(matches!(&r.logic.value, Expr::If(_, _, _)));
+            }
+            _ => panic!("expected rule"),
+        }
+    }
+
+    /// `if/then/else` allows NEWLINE between the structural keywords.
+    /// Surfaced by Opus 4.7 generating a multi-line if for the
+    /// `flight_status` hold-out intent — the model produced
+    ///   r = if cond
+    ///       then concat(...)
+    ///       else concat(...)
+    /// with `then` on the next line at the same indent column. The
+    /// parser previously rejected with `expected 'then', got NEWLINE`.
+    /// Same-column continuation now parses; indented continuation
+    /// (which would require INDENT/DEDENT swallowing inside the
+    /// expression) stays refused — that's its own slice.
+    #[test]
+    fn if_then_else_allows_newlines_at_same_indent() {
+        let src = "@verbose 0.1.0\n\nconcept T\n  @intention: \"t\"\n  @source: f.intent:1\n  fields:\n    x : number\n\nrule test\n  @intention: \"t\"\n  @source: f.intent:1\n  input:\n    t : T\n  output:\n    r : number\n  logic:\n    r = if t.x > 10\n    then 1\n    else 0\n  proofs:\n    purity:\n      reads: [t.x]\n      calls: []\n    termination:\n      bound : 3\n";
+        let p = parse(src).unwrap_or_else(|e| panic!("multi-line if must parse: {:?}", e));
         match &p.items[1] {
             Item::Rule(r) => {
                 assert!(matches!(&r.logic.value, Expr::If(_, _, _)));
