@@ -450,7 +450,17 @@ extra: [b.copies]
 
 The next hold-out run should see this trap converted from "one correction round" to "first-try success." Pinned by `purity_extra_reads_hints_at_lambda_bound_var` (and a negative test ensuring the hint stays scoped to the lambda case).
 
-Three numbers, three regimes. The 8/8 says *the pipeline ergonomics work for in-distribution intents*. The 9/10 + 1 (Sonnet) and 8/10 + 2 (Opus) say *both models compose `INTENT.md` patterns on never-seen domains, with the verifier catching every slip and the correction loop closing in one round each*. None is a guarantee — all are data points, single runs, and the failure modes are now actionable.
+Two complementary fixes were applied for the trap and re-measured the same day. (a) The verifier's hint above. (b) The system prompt in `tools/generate.py` was extended with a focused "what goes in `reads:` and what does NOT" section: a CRITICAL note that lambda-bound vars (quantifier var, fold acc/var, map/filter var, match_result ok_var/err_var) NEVER appear in `reads:`, plus three Wrong → Right pairs covering the exact shapes the eval surfaced.
+
+Re-running with both fixes in place:
+
+```
+                      Sonnet 4.6           Opus 4.7
+hold-out (run 1)      9/10 + 1            8/10 + 2
+hold-out (run 3)      9/10 + 1            9/10 + 1   ← prize_pool went 2 → 1 attempt
+```
+
+Opus's `prize_pool` (the `sum(...c.score...)` shape) flipped from "one correction round" to "first-try success" — the targeted improvement. Sonnet's score is unchanged because Sonnet hadn't been tripping on the lambda-bound trap in the first place; its remaining correction is a separate `@intention missing on resource` pattern that the prompt doesn't address yet (a different slice). Single-run sample, but the converted intent is named — that's the load-bearing observation, not the headline number.
 
 The architectural floor stands either way: *whatever the model produces, the compiler either accepts it or rejects it*. That floor is the bet.
 

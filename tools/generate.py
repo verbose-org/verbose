@@ -232,6 +232,63 @@ computed bound is always safe — the verifier rejects bound too low
 but NEVER too high. A `bound: 10` for a rule whose actual cost is 6
 verifies cleanly.
 
+### Purity proofs: what goes in `reads:` and what does NOT
+
+`reads:` declares EXACTLY the things the rule's logic touches at the
+top level — fields of the rule's input concept, and top-level
+`resource` / `connection` names referenced via `read(...)` / `fetch(...)`.
+The synthetic `now` (from `now_unix()`) also goes here.
+
+CRITICAL — lambda-bound vars do NOT belong in `reads:`. When you
+write a quantifier, fold, map, filter, or `match_result`, the
+lambda's variable is a LOCAL binding scoped to the body; field
+accesses through it (`x.field`, `acc.f`, `ok_var.f`, `err_var.f`)
+are NOT input-concept reads and the verifier silently filters them
+out of its facts. If you declare them anyway, the verifier rejects
+with `extra: [...]` plus a hint identifying the lambda-bound var.
+
+  `count(xs, x => x.field > N)`           — `x` is lambda-bound
+  `sum(xs, x => x.amount)`                — `x` is lambda-bound
+  `all(xs, x => predicate(x))`            — `x` is lambda-bound
+  `map(xs, x => Record { f: x.field })`   — `x` is lambda-bound
+  `fold(xs, 0, acc, x => acc + x.amount)` — both `acc` and `x`
+  `match_result(c(p), v => Ok(v + 1), e => Err(e))` — `v`, `e`
+
+Worked examples (every Wrong → Right pair mirrors a real trap):
+
+  rule low_stock_count
+    input:  lib : Library     -- fields: books : collection(Book)
+    logic:
+      n = count(lib.books, b => b.copies < 5)
+    proofs:
+      purity:
+        reads : [lib.books]                       -- ✓ Right
+      # reads : [lib.books, b.copies]             -- ✗ Wrong: `b` is lambda-bound
+
+  rule total_prize_pool
+    input:  t : Tournament    -- fields: contestants : collection(Contestant)
+    logic:
+      total = sum(t.contestants, c => if qualifies(c) then c.score else 0)
+    proofs:
+      purity:
+        reads : [t.contestants]                   -- ✓ Right
+        calls : [qualifies]
+      # reads : [t.contestants, c.score]          -- ✗ Wrong: `c` is lambda-bound
+
+  rule discount
+    input:  p : Purchase
+    logic:
+      r = match_result(validate(p), v => Ok(v * 90 / 100), e => Err(e))
+    proofs:
+      purity:
+        reads : [p]                                -- ✓ Right (no field touched)
+        calls : [validate]
+      # reads : [p, v]                            -- ✗ Wrong: `v` is lambda-bound
+
+The pattern: walk every field access in `logic:`, ask "is the base
+identifier the rule's input variable, or is it bound by a lambda
+above this point?" Only the input-variable accesses go in `reads:`.
+
 ### Hints (optional, each MUST carry a string justification)
 
       hints:
