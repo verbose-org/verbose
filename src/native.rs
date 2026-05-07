@@ -4012,35 +4012,15 @@ fn emit_eval_result_expr(
                     emit_write_newline(code, 1);
                 }
                 Type::Named(out_concept_name) => {
-                    // Result(Record, Text) Ok arm. The inner expression must
-                    // be a `Concept { ... }` constructor matching the
-                    // declared output concept. Slice scope: no `if/else`
-                    // inside Ok yet — direct Record only. (The if/else
-                    // already wraps the Ok at the rule-body level via the
-                    // existing `Expr::If` arm below; nesting another inside
-                    // the Ok would need to recurse through the record-
-                    // dispatch emitter and is its own slice.)
-                    let record_fields = match inner.as_ref() {
-                        Expr::Record(name, fields) => {
-                            if name != out_concept_name {
-                                return Err(NativeError {
-                                    message: format!(
-                                        "Ok-arm record constructor '{}' does not match declared concept '{}'",
-                                        name, out_concept_name
-                                    ),
-                                });
-                            }
-                            fields.as_slice()
-                        }
-                        other => {
-                            return Err(NativeError {
-                                message: format!(
-                                    "Result(Record, Text) Ok arm must be a `{} {{ ... }}` constructor; got {:?}",
-                                    out_concept_name, other
-                                ),
-                            });
-                        }
-                    };
+                    // Result(Record, Text) Ok arm. The inner expression
+                    // must produce a record of the declared concept;
+                    // we accept either a direct `Concept { ... }` or
+                    // `if cond then Concept{...} else Concept{...}`
+                    // (nestable). Each Record leaf emits its JSON +
+                    // trailing `}\n` and falls through; the if/else
+                    // branches converge below the helper, and the
+                    // outer `jmp loop_top` after this match ends the
+                    // record loop iteration once.
                     let out_concept = all_concepts
                         .iter()
                         .find(|c| c.name == *out_concept_name)
@@ -4048,19 +4028,17 @@ fn emit_eval_result_expr(
                         .ok_or_else(|| NativeError {
                             message: format!("unknown output concept '{}'", out_concept_name),
                         })?;
-                    emit_record_as_json(
+                    emit_ok_record_dispatch(
                         code,
-                        record_fields,
+                        inner,
                         out_concept,
-                        &rule.input_name,
+                        rule,
                         concept,
                         all_rules,
                         offsets,
                         field_ranges,
                         text_bindings,
                     )?;
-                    // emit_record_as_json already wrote the trailing `}\n`
-                    // — no extra newline needed.
                 }
                 other => {
                     return Err(NativeError {
@@ -6667,6 +6645,97 @@ fn emit_eval_record_expr(
             message: format!(
                 "record-context expression not yet supported in native: {:?}",
                 other
+            ),
+        }),
+    }
+}
+
+/// `Result(Record, Text)` Ok-arm dispatch. Accepts either a direct
+/// `<Concept> { ... }` constructor or `if cond then ... else ...`
+/// where each branch is itself another dispatchable shape (so
+/// arbitrarily-nested if/else is fine). Each Record leaf emits a
+/// single JSON line via `emit_record_as_json` and falls through; the
+/// caller's outer `jmp loop_top` provides the single tail.
+///
+/// Slice rationale: `emit_eval_record_expr` (the record-output rule
+/// emitter) handles Record + If for the no-Result case but
+/// self-terminates with its own `jmp loop_top`. We can't reuse it
+/// here because the Ok arm's tail jmp is shared with the surrounding
+/// Number/Text Ok arms, and we don't want two jmp_loop_tops emitted
+/// by the same Ok branch.
+fn emit_ok_record_dispatch(
+    code: &mut Vec<u8>,
+    expr: &Expr,
+    output_concept: &Concept,
+    rule: &Rule,
+    input_concept: &Concept,
+    all_rules: &HashMap<&str, &Rule>,
+    offsets: &HashMap<&str, i32>,
+    field_ranges: &HashMap<&str, (i64, i64)>,
+    text_bindings: &TextBindings<'_>,
+) -> Result<(), NativeError> {
+    match expr {
+        Expr::Record(name, fields) => {
+            if name != &output_concept.name {
+                return Err(NativeError {
+                    message: format!(
+                        "Ok-arm record constructor '{}' does not match declared concept '{}'",
+                        name, output_concept.name
+                    ),
+                });
+            }
+            emit_record_as_json(
+                code,
+                fields,
+                output_concept,
+                &rule.input_name,
+                input_concept,
+                all_rules,
+                offsets,
+                field_ranges,
+                text_bindings,
+            )
+        }
+        Expr::If(cond, then_e, else_e) => {
+            // cond → rax; test, jz else
+            emit_eval_expr(code, cond, &rule.input_name, offsets, all_rules, field_ranges, text_bindings)?;
+            code.extend_from_slice(&[0x48, 0x85, 0xC0]); // test rax, rax
+            code.push(0x0F);
+            code.push(0x84); // je rel32
+            let else_patch = code.len();
+            code.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+
+            emit_ok_record_dispatch(
+                code, then_e, output_concept, rule, input_concept, all_rules,
+                offsets, field_ranges, text_bindings,
+            )?;
+            // Then-branch finished its record JSON; jump past the else
+            // branch to the common tail. (The outer `jmp loop_top` is
+            // beyond the patched end_patch site.)
+            code.push(0xE9);
+            let end_patch = code.len();
+            code.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+
+            // Else label: patch the je to here.
+            let else_pos = code.len();
+            let else_off = else_pos as i32 - (else_patch as i32 + 4);
+            code[else_patch..else_patch + 4].copy_from_slice(&else_off.to_le_bytes());
+
+            emit_ok_record_dispatch(
+                code, else_e, output_concept, rule, input_concept, all_rules,
+                offsets, field_ranges, text_bindings,
+            )?;
+
+            // End label: patch the jmp from the then-branch to here.
+            let end_pos = code.len();
+            let end_off = end_pos as i32 - (end_patch as i32 + 4);
+            code[end_patch..end_patch + 4].copy_from_slice(&end_off.to_le_bytes());
+            Ok(())
+        }
+        other => Err(NativeError {
+            message: format!(
+                "Result({}, Text) Ok arm must be a `{} {{ ... }}` constructor or `if/else` of those; got {:?}",
+                output_concept.name, output_concept.name, other,
             ),
         }),
     }
@@ -12484,6 +12553,87 @@ rule classify_purchase
             Some(1),
             "Err arm should exit 1 (compare to existing same-shape Result(text, text) tests)",
         );
+
+        let _ = fs::remove_file(out);
+    }
+
+    /// `Result(<Record>, text)` Ok arm with `if/else` directly INSIDE
+    /// the Ok constructor — the form
+    ///   r = if outer then Ok(if inner then RecordA{...} else RecordB{...}) else Err(...)
+    /// Each branch resolves to a different field set; both converge at
+    /// the common jmp_loop_top below the dispatch. Pinned with two
+    /// distinct record shapes so a swapped branch would surface in
+    /// the JSON output.
+    #[test]
+    fn native_result_record_if_inside_ok_runtime() {
+        use std::fs;
+        use std::process::Command;
+        let src = r#"@verbose 0.1.0
+
+concept Purchase
+  @intention: "p"
+  @source: invoices.intent:1
+
+  fields:
+    amount        : number
+    customer_age  : number
+
+
+concept Refined
+  @intention: "validated purchase + tier"
+  @source: invoices.intent:1
+
+  fields:
+    amount : number
+    tier   : text
+
+
+rule classify
+  @intention: "if-inside-Ok shape"
+  @source: invoices.intent:1
+
+  input:
+    p : Purchase
+
+  output:
+    r : Result(Refined, text)
+
+  logic:
+    r = if p.customer_age >= 18 then Ok(if p.amount >= 1000 then Refined { amount: p.amount, tier: "premium" } else Refined { amount: p.amount, tier: "standard" }) else Err("under 18")
+
+  proofs:
+    purity:
+      reads   : [p.customer_age, p.amount]
+      calls   : []
+    termination:
+      bound : 8
+"#;
+        let tokens = crate::lexer::Lexer::new(src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let out = std::env::temp_dir().join("verbosec_test_result_record_if_in_ok");
+        compile_native(&program, "classify", out.to_str().unwrap(), false, false)
+            .expect("if-inside-Ok must compile");
+
+        let r_premium = Command::new(&out).args(["1500", "25"]).output().unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&r_premium.stdout).trim(),
+            r#"{"amount":1500,"tier":"premium"}"#,
+        );
+
+        let r_standard = Command::new(&out).args(["200", "25"]).output().unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&r_standard.stdout).trim(),
+            r#"{"amount":200,"tier":"standard"}"#,
+            "the inner if/else picked the wrong Refined branch",
+        );
+
+        let r_err = Command::new(&out).args(["1500", "15"]).output().unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&r_err.stderr).trim(),
+            "under 18",
+        );
+        assert_eq!(r_err.status.code(), Some(1));
 
         let _ = fs::remove_file(out);
     }
