@@ -12638,6 +12638,110 @@ rule classify
         let _ = fs::remove_file(out);
     }
 
+    /// `match_result` chained into a `Result(Record, text)` outer rule.
+    /// Pattern: validate via a Result(number, text) callee, then wrap
+    /// the bound Ok value into a richer Refined record. Two slices
+    /// composing — match_result inlining + Result(Record, text) Ok
+    /// dispatch — neither was independently designed with the other
+    /// in mind, so this regression test pins the composition. Both
+    /// arms exercised; any drift in either slice would surface here
+    /// before silently changing semantics.
+    #[test]
+    fn native_match_result_into_result_record_runtime() {
+        use std::fs;
+        use std::process::Command;
+        let src = r#"@verbose 0.1.0
+
+concept Purchase
+  @intention: "p"
+  @source: invoices.intent:1
+
+  fields:
+    amount        : number
+    customer_age  : number
+
+
+concept Refined
+  @intention: "validated + discounted purchase as a record"
+  @source: invoices.intent:1
+
+  fields:
+    discounted : number
+    tier       : text
+
+
+rule validate_amount
+  @intention: "v"
+  @source: invoices.intent:1
+
+  input:
+    p : Purchase
+
+  output:
+    r : Result(number, text)
+
+  logic:
+    r = if p.amount > 0 then Ok(p.amount) else Err("non-positive amount")
+
+  proofs:
+    purity:
+      reads   : [p.amount]
+      calls   : []
+    termination:
+      bound : 4
+
+
+rule discount_purchase
+  @intention: "match_result chain → Result(Record, text)"
+  @source: invoices.intent:1
+
+  input:
+    p : Purchase
+
+  output:
+    r : Result(Refined, text)
+
+  logic:
+    r = match_result(validate_amount(p),
+          v => Ok(Refined { discounted: v * 90 / 100, tier: "premium" }),
+          e => Err(e))
+
+  proofs:
+    purity:
+      reads   : [p]
+      calls   : [validate_amount]
+    termination:
+      bound : 8
+"#;
+        let tokens = crate::lexer::Lexer::new(src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let out = std::env::temp_dir().join("verbosec_test_match_to_record");
+        compile_native(&program, "discount_purchase", out.to_str().unwrap(), false, false)
+            .expect("match_result → Result(Record, text) must compile");
+
+        // Ok arm: validate_amount returns Ok(1000), bound to v;
+        // outer wraps into Refined { discounted: 900, tier: "premium" }.
+        let r_ok = Command::new(&out).args(["1000", "25"]).output().unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&r_ok.stdout).trim(),
+            r#"{"discounted":900,"tier":"premium"}"#,
+            "Ok arm; stdout={:?} stderr={:?}",
+            r_ok.stdout, r_ok.stderr,
+        );
+
+        // Err arm: validate_amount Err propagated through outer Err.
+        let r_err = Command::new(&out).args(["-50", "25"]).output().unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&r_err.stderr).trim(),
+            "non-positive amount",
+            "Err arm; stdout={:?} stderr={:?}",
+            r_err.stdout, r_err.stderr,
+        );
+
+        let _ = fs::remove_file(out);
+    }
+
     /// Cross-concept rejection: callee references a field that doesn't
     /// exist in the outer's concept. Slice contract enforces that the
     /// callee's fields are a SUBSET of the outer's; without the field
