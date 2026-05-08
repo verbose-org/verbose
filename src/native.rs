@@ -4483,7 +4483,18 @@ fn emit_redirect_callee_leaves(
             // mov rsp, rax
             code.extend_from_slice(&[0x48, 0x89, 0xC4]);
 
-            // 5. jmp loop_top
+            // 5. Set exit flag to 1 (failure) — mirror what
+            //    emit_eval_result_expr's direct-Err arm does so that an
+            //    Err propagated through a match_result chain has the
+            //    same exit-code semantics as a literal Err in the rule
+            //    body. Pre-2026-05-08 this was missing and produced
+            //    exit=0 even on rejected records when the rejection
+            //    came from an inlined-callee's Err.
+            code.extend_from_slice(&[0x48, 0xC7, 0x85]);
+            code.extend_from_slice(&slots.exit_flag_slot.to_le_bytes());
+            code.extend_from_slice(&[0x01, 0x00, 0x00, 0x00]);
+
+            // 6. jmp loop_top
             code.push(0xE9);
             let off = loop_top as i32 - (code.len() + 4) as i32;
             code.extend_from_slice(&off.to_le_bytes());

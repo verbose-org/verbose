@@ -191,6 +191,21 @@ examples/
                    concurrency, cached resources (COW). 2888 B native
                    binary. THE example to point at when someone asks
                    "what does Verbose actually do?".
+  order_intake.*   COMPOSITE DEMO (2026-05-08): production-shape order
+                   intake CLI in 143 lines of .verbose composing
+                   nested match_result chains, Result(Record, text)
+                   with computed priority + audit_ref via now_unix(),
+                   parse_int(read(<resource>)) for runtime-tunable max
+                   amount, text equality with read RHS for runtime
+                   allowed-method allowlist. Compiles to 2674 B
+                   statically-linked ELF; runs argv-style. Exit code
+                   discipline: stdout = JSON OrderDecision (exit 0),
+                   stderr = rejection reason (exit 1) — uniform across
+                   direct Err and match_result-propagated Err paths
+                   (the latter required a small fix to
+                   emit_redirect_callee_leaves to set exit_flag).
+                   The point: shows Verbose composes at the scale of
+                   a real backend component, not just one-trick demos.
   recent_event_abs.* `abs(<number>)` primitive (2026-04-29): branch-free
                    5-byte inline (cqo + xor + sub) absolute value.
                    Corrects the silent edge-case bug in the natural

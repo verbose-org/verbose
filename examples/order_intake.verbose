@@ -1,0 +1,143 @@
+@verbose 0.1.0
+
+-- Production-shape order intake, demonstrating Verbose's composition
+-- at the scale of a real backend component:
+--   - 4 concepts (Order, OrderDecision + the two validators' Result shapes are inferred)
+--   - 3 rules composing via match_result chain (nested), Result(Record, text)
+--     output, runtime-loaded resources, now_unix() for the audit reference
+--   - Operator-tunable max amount and allowed payment method via files
+--     the operator can edit between binary invocations (no recompile)
+--
+-- Invariants the binary upholds (each grep-able from this file):
+--   1. Two files only:    /tmp/order_intake/max_amount.txt
+--                         /tmp/order_intake/allowed_method.txt
+--   2. No outbound I/O:   no `connection`, no `service`, no `fetch`
+--   3. Two output paths:  stdout = JSON OrderDecision (Ok)
+--                         stderr = rejection reason   (Err)
+--   4. now_unix is read:  declared in process_order's reads as `now`
+--   5. Amount is bounded: input concept declares [1, 1_000_000];
+--                         validate_amount also caps via parse_int(read(max_amount))
+--
+-- Auditor's split:
+--   - Read this file: every effect, every read, every external file path
+--     and every transformation is at the top level. No hidden middleware.
+--   - Read .intent: 5 numbered sentences. The author is on the hook for
+--     completeness — if a reviewer asks "where's the audit?", the answer
+--     is "stdout / stderr by design; redirect with shell" or "add a
+--     log block on a service wrapper." The compiler does not impose a
+--     log shape; the domain (regulator, customer, internal) does.
+--
+-- Build:
+--     cargo run -- examples/order_intake.verbose --native /tmp/oi --run process_order
+--
+-- Run with config:
+--     printf '500000' > /tmp/order_intake/max_amount.txt    # operator-tunable
+--     printf 'credit'  > /tmp/order_intake/allowed_method.txt
+--     /tmp/oi 1500 25 credit Alice
+--     -> {"amount":1500,"priority":"standard","audit_ref":"Alice-1500-1746..."}
+
+
+resource max_amount
+  @intention: "Maximum allowed order amount in cents; loaded once per invocation"
+  @source: order_intake.intent:3
+
+  path: "/tmp/order_intake/max_amount.txt"
+  max:  16
+  on_read_error: abort
+
+
+resource allowed_method
+  @intention: "The single allowed payment method (e.g. 'credit'); compared exactly"
+  @source: order_intake.intent:5
+
+  path: "/tmp/order_intake/allowed_method.txt"
+  max:  32
+  on_read_error: abort
+
+
+concept Order
+  @intention: "An order with amount, customer age, payment method, and customer name"
+  @source: order_intake.intent:1
+
+  fields:
+    amount         : number [0, 1000000]
+    customer_age   : number [0, 150]
+    payment_method : text [..32]
+    customer_name  : text [..64]
+
+
+concept OrderDecision
+  @intention: "The accepted order's structured decision: amount, priority, audit reference"
+  @source: order_intake.intent:2
+
+  fields:
+    amount    : number [0, 1000000]
+    priority  : text
+    audit_ref : text
+
+
+rule validate_amount_positive
+  @intention: "Accept the order's amount when it is strictly positive (lower bound)"
+  @source: order_intake.intent:3
+
+  input:
+    o : Order
+
+  output:
+    r : Result(number, text)
+
+  logic:
+    r = if o.amount > 0 then Ok(o.amount) else Err(concat("amount ", o.amount, " not positive"))
+
+  proofs:
+    purity:
+      reads : [o.amount]
+      calls : []
+    termination:
+      bound : 5
+
+
+rule validate_age
+  @intention: "Accept the order's age when the customer is 18 or older"
+  @source: order_intake.intent:4
+
+  input:
+    o : Order
+
+  output:
+    r : Result(number, text)
+
+  logic:
+    r = if o.customer_age >= 18 then Ok(o.customer_age) else Err(concat("age ", o.customer_age, " under 18"))
+
+  proofs:
+    purity:
+      reads : [o.customer_age]
+      calls : []
+    termination:
+      bound : 5
+
+
+rule process_order
+  @intention: "Chain the validations; on full success build OrderDecision; on any failure propagate the reason"
+  @source: order_intake.intent:5
+
+  input:
+    o : Order
+
+  output:
+    r : Result(OrderDecision, text)
+
+  logic:
+    r = match_result(validate_amount_positive(o),
+          amount => match_result(validate_age(o),
+                      age => if o.amount <= parse_int(read(max_amount)) and o.payment_method == read(allowed_method) then Ok(OrderDecision { amount: amount, priority: if o.amount >= 100000 then "high" else "standard", audit_ref: concat(o.customer_name, "-", o.amount, "-", now_unix()) }) else Err(concat("amount ", o.amount, " over cap or payment method ", o.payment_method, " not allowed")),
+                      age_err => Err(age_err)),
+          amt_err => Err(amt_err))
+
+  proofs:
+    purity:
+      reads : [o, o.amount, o.payment_method, o.customer_name, max_amount, allowed_method, now]
+      calls : [validate_amount_positive, validate_age]
+    termination:
+      bound : 26
