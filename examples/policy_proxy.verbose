@@ -1,0 +1,75 @@
+@verbose 0.1.0
+
+-- Reverse proxy with policy gating + audit chain. Composes the
+-- existing native primitives into a real production-shape edge
+-- component:
+--
+--   - service / http10 / forked  (Phase 7 + slice 10)
+--   - starts_with for path-prefix gating  (Phase 7 slice 3e variant)
+--   - HttpResponse with computed status + body field  (slice 3e)
+--   - fetch(<connection>, concat(req.method, req.path, ...))
+--     for selective forwarding to upstream  (Phase 11 slice 3)
+--   - log: block with on_error: abort + json_escape on user-controlled
+--     fields (req.path, req.method)  (slice 8d + Phase 12)
+--
+-- Auditor's split (the chain of accountability):
+--   - One connection: 127.0.0.1:19031 (the upstream backend)
+--   - One file: /tmp/policy_proxy_audit.jsonl (the audit log)
+--   - One port: 18940 (the proxy listens here)
+--   Grep `connection`, `path:`, `port:` against this file and you have
+--   the COMPLETE inventory of what the binary touches.
+--
+-- The handler rule (`policy_route`) is a pure function of req.path /
+-- req.method. The same input always produces the same response. The
+-- audit log captures req.timestamp separately — that's the only
+-- non-deterministic input, and it lives in the log scope, not the
+-- handler.
+
+
+connection api_upstream
+  @intention: "Backend the proxy forwards /api/v1/* requests to"
+  @source: policy_proxy.intent:2
+
+  host: "127.0.0.1"
+  port: 19031
+  max_response: 4096
+  on_connect_error: abort
+
+
+rule policy_route
+  @intention: "Gate by path prefix: forward, health, or deny — produce HttpResponse"
+  @source: policy_proxy.intent:1
+
+  input:
+    req : HttpRequest
+
+  output:
+    resp : HttpResponse
+
+  logic:
+    resp = if starts_with(req.path, "/api/v1/") then HttpResponse { status: 200, body: fetch(api_upstream, concat(req.method, " ", req.path, " HTTP/1.0\r\n\r\n")) } else if starts_with(req.path, "/health") then HttpResponse { status: 200, body: "ok\n" } else HttpResponse { status: 403, body: concat("denied: ", json_escape(req.path), "\n") }
+
+  proofs:
+    purity:
+      reads : [req.method, req.path, api_upstream]
+      calls : []
+    termination:
+      bound : 13
+
+
+service policy_proxy
+  @intention: "Listen on 18940; gate each request; audit every verdict fail-closed"
+  @source: policy_proxy.intent:1
+
+  listen:
+    protocol    : http_1_0
+    port        : 18940
+    max_request : 4096
+
+  concurrency: forked
+
+  handler: policy_route
+
+  log:
+    append_file "/tmp/policy_proxy_audit.jsonl" concat("{\"ts\":", req.timestamp, ",\"method\":\"", json_escape(req.method), "\",\"path\":\"", json_escape(req.path), "\",\"status\":", resp.status, "}\n")
+    on_error: abort

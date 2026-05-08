@@ -1,0 +1,6 @@
+1. The proxy listens on port 18940 (HTTP/1.0). Each accepted request is gated by its URL path before any upstream call is made.
+2. Requests whose path starts with "/api/v1/" are forwarded to the upstream backend at 127.0.0.1:19031, with the original method and path preserved. The upstream's response body is returned to the client with status 200.
+3. Requests whose path starts with "/health" are answered locally with status 200 and the body "ok" — no upstream call.
+4. Every other path is denied: the client receives status 403 and a body naming the rejected path (json-escaped for safety).
+5. Every request, regardless of verdict, is appended to the audit log "/tmp/policy_proxy_audit.jsonl" as a single JSONL line containing the unix timestamp, the method, the path (json-escaped), and the response status. If the audit log cannot be written for any reason, the binary aborts the request before responding (fail-closed).
+6. Concurrency is fork-per-request: the parent accepts, the child handles + audits + responds + exits.

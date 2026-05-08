@@ -206,6 +206,25 @@ examples/
                    emit_redirect_callee_leaves to set exit_flag).
                    The point: shows Verbose composes at the scale of
                    a real backend component, not just one-trick demos.
+  policy_proxy.*   COMPOSITE DEMO (2026-05-08): reverse proxy with
+                   policy gating + audit chain in ~80 lines of .verbose,
+                   compiles to 2519 B statically-linked ELF on port
+                   18940. Three response paths: /api/v1/* forwards to
+                   upstream via fetch(connection, concat(req.method,
+                   req.path, ...)); /health answers locally with 200/ok;
+                   anything else returns 403 with json_escape'd path
+                   in the body. Audit log at /tmp/policy_proxy_audit.jsonl
+                   captures ts/method/path/status per request, fail-
+                   closed (`on_error: abort`). Forked concurrency.
+                   Composes service + slice 3e (computed status) +
+                   slice 11.3 (dynamic fetch request) + slice 8c
+                   (req.timestamp) + slice 8d (on_error: abort) +
+                   Phase 12 (json_escape). The "infrastructure"
+                   sister of order_intake — shows Verbose at the
+                   scale of an edge component, not a backend service.
+                   At 2519 B it's ~5 orders of magnitude smaller than
+                   nginx/haproxy and the three branches + the audit
+                   chain are visible in 80 lines.
   recent_event_abs.* `abs(<number>)` primitive (2026-04-29): branch-free
                    5-byte inline (cqo + xor + sub) absolute value.
                    Corrects the silent edge-case bug in the natural
