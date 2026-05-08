@@ -6,11 +6,18 @@
 >
 > *"I created this not so the machine replaces us, but so the machine is held accountable to us."*
 
-Verbose is an experimental language whose compiler holds a narrow, specific promise: whatever a `.verbose` file declares, the binary it produces will match exactly — with a 500-byte to 2 KB footprint, zero dependencies, and every declared proof mechanically verified against the code.
+Verbose is an experimental language built around a clear separation of responsibility:
+
+- **The author owns the intention.** Every concept, every rule, every effect (reads, calls, file appends, network fetches, log blocks, audit chains) is declared in source. What the program is supposed to do, you write down.
+- **The compiler owns the faithfulness.** Every declared read, every termination bound, every effect path is mechanically verified against the actual AST. The binary cannot drift from the declarations.
+
+When code generation is delegated — to AI, to a teammate, to anyone who is not the eventual auditor — the question stops being "did the AI hallucinate?" and becomes **"what did the author ask for, and does the binary do exactly that?"** If the delegate forgets to declare an audit log, the program won't have one — and that absence is plainly visible in source. The auditor reads the file, asks "where's the audit log?", and the author has to answer. The compiler's job is *not* to enforce that the right thing was asked — that's human accountability work, governed by the domain (regulator, stakeholder, customer, whatever). The compiler's job is to enforce that **exactly what was asked is what runs**, with no place between source and binary where either can quietly drift.
+
+That separation is the architectural bet. The author thinks. The compiler verifies. As a side effect, you get binaries 500 B to 2 KB, statically linked, without libc, every external effect named at the source level, all proofs mechanically checked. But the headline is the **chain of accountability** between intent and binary, not the byte count.
 
 ## The architecture's bet
 
-The compiler is small and strict by design. Its scope is deliberately **not** the whole gap between "what a human meant" and "what the machine does" — it is the inner half of that chain: from a formalized `.verbose` program to a verified binary. The outer half (natural-language intention → `.verbose`) is left to humans, AI, or both working together.
+The compiler is small and strict by design. Its scope is deliberately **not** the whole gap between "what a human meant" and "what the machine does" — it is the inner half of that chain: from a formalized `.verbose` program to a verified binary. The outer half (natural-language intention → `.verbose`) is left to humans, AI, or both working together. **The author bears the responsibility for the intention being the right thing for the domain.** The compiler bears the responsibility for the binary being exactly the intention as declared.
 
 The bet is that the **floor matters, not the average**. Most AI-assisted tooling degrades gracefully as models hallucinate; here, a bad `.verbose` produces a *rejected* `.verbose`, never a wrong binary. Trust is anchored in the compiler's verification, not in whoever (or whatever) wrote the source. As AI generation quality rises over time, the same floor keeps holding — the architecture rides the curve without having to chase it.
 
@@ -45,10 +52,14 @@ Verified mechanically, against the AST:
 - `@source: file:line` references an existing line in the named file
 - Reaction `append_file` paths are string literals — the auditor can grep every file the program can touch
 
-**Not verified** (out of scope, by design):
+**Not verified — by design, this is the author's responsibility**:
 
 - Whether the `.verbose` is a faithful translation of prose intent
-- Whether the intent itself is the right answer to the underlying problem
+- Whether the intent itself asks for the right thing
+- Whether the program declares the right effects for its domain (e.g. an audit log is required for a regulated decision; the compiler does not impose this — the author does)
+- Whether the program's logic is *correct* for the business problem (only that it does what its declarations say)
+
+The compiler will verify that whatever the author declares is honored. **Whatever the author forgets to declare or asks for incorrectly is on the author**, and the omission is plainly visible in source — the auditor can grep, diff, and challenge. This is the right shape for delegated authorship: the AI (or teammate) is held to the spec, but the spec itself stays human-accountable.
 
 See `docs/spec-proofs.md` for a field-by-field classification of *mechanical* (consistency-checked against the AST) vs *semantic* (carrying information the AST cannot encode) declarations. See `docs/vision-journal.md` for positioning rationale and decision trail.
 
