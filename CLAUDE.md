@@ -22,6 +22,34 @@ The identity is: **explicit + verified + optimized**. Without optimization, it's
 
 Key filter: if a declaration serves neither verification nor optimization, it doesn't belong in the IR. This prevents *false explicitation* (verbose noise that looks rigorous but isn't mechanically checked).
 
+## Project structure (the GitHub org)
+
+The project lives under the `verbose-org` GitHub organization. Two kinds of repos sit there, with deliberately different roles:
+
+**`verbose-org/verbose`** (this repo) — the **canonical compiler + language** :
+- `src/`: lexer, parser, AST, verifier, three backends (native, WASM, interpreter)
+- `examples/`: worked examples that exercise specific features (1-3 rules each, demonstrating each Phase / slice)
+- `examples/holdout/`: AI-as-source-author hold-out intents (kept separate from the few-shot)
+- `tools/`: generator pipeline (`generate.py`, `generate_sdk.py`, `eval.py`) and benchmarking
+- `docs/`: design lessons, generator pipeline operator reference, native designs
+- `INTENT.md`: documented prose patterns the generator maps to language constructs
+- `CLAUDE.md` (this file): the design journal — every architectural decision, every constraint, every "why we don't do X"
+- `README.md`: the public-facing pitch and reasoning
+
+This repo evolves the language. It is the source of truth.
+
+**`verbose-org/verbose-<poc-name>`** (separate repos, planned) — **POCs that consume the language**:
+- One repo per POC. First planned: `verbose-homelab-filter` (URL filter for homelab/family networks).
+- Each POC is a real, deployable program written in Verbose. It includes the `.intent`, the `.verbose`, runtime config, and deployment glue (systemd unit, install script, README oriented at deployers, not language designers).
+- POCs **consume** the language at whatever version is current — they don't fork it.
+- POCs do **not** drive language features. If a POC needs something the language doesn't have, the discipline is:
+  1. Note the gap (issue or memo on this repo)
+  2. Workaround in the POC to ship the slice
+  3. If the gap is bloquant, discuss adding the feature to the language **on its own merits**, not as a POC dependency
+- POCs are time-boxed: 1-2 focused sessions to ship, then they stand on their own. They are NOT side-projects that grow indefinitely.
+
+The split is structural: `verbose-org/verbose` is for the language; everything else demonstrates it. This keeps the language pure (no ad-hoc features for one specific use case) and lets POCs be honest demonstrations (they live or die by what the current language can do).
+
 ## Architecture
 
 ```
