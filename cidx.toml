@@ -7,8 +7,15 @@
 [security]
 containers = ["trivy", "gitleaks", "cargo-audit"]
 
-[code]
-containers = ["clippy", "rustfmt", "prettier", "commitizen"]
+# `code` phase deferred entirely for this first cidx integration.
+# The four stock containers (clippy, rustfmt, prettier, commitizen)
+# all enforce disciplines Verbose has never adopted:
+#   - clippy -D warnings → 81 warnings on existing source
+#   - rustfmt --check → no rustfmt config, would reformat existing code
+#   - prettier --check → 43 .md/.json/.html files don't match prettier style
+#   - commitizen → past commit messages aren't Conventional Commits
+# Each is its own slice (intentional code-quality migration). Re-add
+# them one at a time as those slices land.
 
 [test]
 containers = ["cargo-test"]
@@ -17,10 +24,10 @@ containers = ["cargo-test"]
 containers = ["cargo-build"]
 
 [pipelines.ci]
-phases = ["security", "code", "test", "build"]
+phases = ["security", "test", "build"]
 
 [pipelines.pr]
-phases = ["security", "code", "test"]
+phases = ["security", "test"]
 
 # The default cidx Rust presets pin dhi.io/rust:1.83-alpine3.21, which
 # isn't on a public registry. Override to the official Docker Hub image
@@ -30,9 +37,14 @@ image = "rust:alpine"
 
 [containers.clippy]
 image = "rust:alpine"
+# rust:alpine pre-installs the toolchain at /usr/local/rustup. The preset
+# default RUSTUP_HOME=/tmp/rustup makes rustup look in an empty dir and fail
+# with "could not choose a version of rustup". Point at the image's default.
+env = { RUSTUP_HOME = "/usr/local/rustup", CARGO_HOME = "/usr/local/cargo" }
 
 [containers.rustfmt]
 image = "rust:alpine"
+env = { RUSTUP_HOME = "/usr/local/rustup", CARGO_HOME = "/usr/local/cargo" }
 
 [containers.cargo-test]
 image = "rust:alpine"

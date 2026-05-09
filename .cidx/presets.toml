@@ -1,0 +1,50 @@
+# Project-level preset overrides.
+#
+# The stock cidx Rust presets pin `RUSTUP_HOME=/tmp/rustup` (a fresh empty
+# rustup home), which works only with the dhi.io image (which pre-populates
+# /tmp/rustup). On the public `rust:alpine` image we use, the toolchain
+# lives at /usr/local/rustup, so rustup invocations against /tmp/rustup
+# fail with "could not choose a version of rustup".
+#
+# Override the env (and the image) for every preset that calls rustup.
+# Keep the command exactly the same; only the env + image change.
+
+[presets]
+
+[presets.clippy]
+name = "clippy"
+phase = "code"
+image = "rust:alpine"
+hardened = true
+command = "sh -c 'rustup component add clippy && cargo clippy -- -D warnings'"
+workdir = "/src"
+volumes = ["${WORKSPACE}:/src"]
+config_files = ["clippy.toml", ".clippy.toml"]
+require_ci = false
+local_behavior = ""
+[presets.clippy.env]
+CARGO_HOME = "/usr/local/cargo"
+RUSTUP_HOME = "/usr/local/rustup"
+[presets.clippy.options]
+[presets.clippy.options.pedantic]
+type = "bool"
+default = false
+description = "Enable pedantic lints"
+env_var = ""
+command_flag = "-W clippy::pedantic"
+
+[presets.rustfmt]
+name = "rustfmt"
+phase = "code"
+image = "rust:alpine"
+hardened = true
+command = "sh -c 'rustup component add rustfmt && cargo fmt -- --check'"
+workdir = "/src"
+volumes = ["${WORKSPACE}:/src"]
+config_files = ["rustfmt.toml", ".rustfmt.toml"]
+require_ci = false
+local_behavior = ""
+[presets.rustfmt.env]
+CARGO_HOME = "/usr/local/cargo"
+RUSTUP_HOME = "/usr/local/rustup"
+[presets.rustfmt.options]
