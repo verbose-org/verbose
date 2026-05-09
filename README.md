@@ -1,6 +1,6 @@
 # Verbose
 
-[![CI](https://github.com/verbose-org/verbose/actions/workflows/ci.yml/badge.svg)](https://github.com/verbose-org/verbose/actions/workflows/ci.yml)
+[![CI](https://github.com/verbose-org/verbose/actions/workflows/cidx.yml/badge.svg)](https://github.com/verbose-org/verbose/actions/workflows/cidx.yml)
 
 > *Formalize intention. Verify mechanically. Compile to auditable native code.*
 >

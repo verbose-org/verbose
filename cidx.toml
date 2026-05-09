@@ -1,0 +1,41 @@
+# CIDX Configuration
+# Auto-detected: Rust project
+#
+# Edit to match your needs. Run 'cidx preset list' for all available tools.
+# Run 'cidx validate' to check, 'cidx run ci' to execute.
+
+[security]
+containers = ["trivy", "gitleaks", "cargo-audit"]
+
+[code]
+containers = ["clippy", "rustfmt", "prettier", "commitizen"]
+
+[test]
+containers = ["cargo-test"]
+
+[build]
+containers = ["cargo-build"]
+
+[pipelines.ci]
+phases = ["security", "code", "test", "build"]
+
+[pipelines.pr]
+phases = ["security", "code", "test"]
+
+# The default cidx Rust presets pin dhi.io/rust:1.83-alpine3.21, which
+# isn't on a public registry. Override to the official Docker Hub image
+# so anyone running this CI locally / in GitHub Actions can pull it.
+[containers.cargo-audit]
+image = "rust:alpine"
+
+[containers.clippy]
+image = "rust:alpine"
+
+[containers.rustfmt]
+image = "rust:alpine"
+
+[containers.cargo-test]
+image = "rust:alpine"
+
+[containers.cargo-build]
+image = "rust:alpine"
