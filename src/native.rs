@@ -830,6 +830,110 @@ fn collect_rule_read_names(rule: &Rule) -> Vec<String> {
     names
 }
 
+/// Same as `collect_rule_read_names` but also follows `match_result`
+/// targets into their callees and gathers THEIR `read(...)` names. The
+/// native match_result emitter inlines callees into the outer rule's
+/// frame, so any resource the callee reads must be allocated in the
+/// outer's prologue. Symmetric with the verifier's
+/// `augment_facts_with_transitive_match_result_reads` pass — what the
+/// verifier says is a legitimate transitive read, the emitter now
+/// allocates a slot for.
+///
+/// Cycle protection via a visited set keyed on rule name; a circular
+/// chain stops at first re-entry.
+fn collect_rule_read_names_transitive(
+    rule: &Rule,
+    all_rules: &HashMap<&str, &Rule>,
+) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+    visited.insert(rule.name.clone());
+    for (_, expr) in &rule.logic.bindings {
+        collect_read_names_native(expr, &mut names);
+        gather_transitive_callee_reads(expr, all_rules, &mut visited, &mut names);
+    }
+    collect_read_names_native(&rule.logic.value, &mut names);
+    gather_transitive_callee_reads(&rule.logic.value, all_rules, &mut visited, &mut names);
+    names
+}
+
+/// Walk for `MatchResult` nodes whose target is a `Call(callee, [...])`,
+/// look up the callee, and merge ITS read names into `out`.
+fn gather_transitive_callee_reads(
+    expr: &Expr,
+    all_rules: &HashMap<&str, &Rule>,
+    visited: &mut std::collections::HashSet<String>,
+    out: &mut Vec<String>,
+) {
+    match expr {
+        Expr::MatchResult(target, _, ok_body, _, err_body) => {
+            if let Expr::Call(name, _) = target.as_ref() {
+                if let Some(callee) = all_rules.get(name.as_str()) {
+                    if visited.insert(callee.name.clone()) {
+                        // Add the callee's own direct read names.
+                        for (_, e) in &callee.logic.bindings {
+                            collect_read_names_native(e, out);
+                        }
+                        collect_read_names_native(&callee.logic.value, out);
+                        // Recurse: the callee may itself match_result on
+                        // another rule.
+                        for (_, e) in &callee.logic.bindings {
+                            gather_transitive_callee_reads(e, all_rules, visited, out);
+                        }
+                        gather_transitive_callee_reads(&callee.logic.value, all_rules, visited, out);
+                    }
+                }
+            }
+            gather_transitive_callee_reads(ok_body, all_rules, visited, out);
+            gather_transitive_callee_reads(err_body, all_rules, visited, out);
+        }
+        Expr::If(c, t, e) => {
+            gather_transitive_callee_reads(c, all_rules, visited, out);
+            gather_transitive_callee_reads(t, all_rules, visited, out);
+            gather_transitive_callee_reads(e, all_rules, visited, out);
+        }
+        Expr::Ok(i) | Expr::Err(i) | Expr::Not(i) | Expr::Neg(i) | Expr::Abs(i)
+        | Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i) => {
+            gather_transitive_callee_reads(i, all_rules, visited, out);
+        }
+        Expr::Binary(_, l, r) => {
+            gather_transitive_callee_reads(l, all_rules, visited, out);
+            gather_transitive_callee_reads(r, all_rules, visited, out);
+        }
+        Expr::Min(a, b) | Expr::Max(a, b) | Expr::StartsWith(a, b)
+        | Expr::EndsWith(a, b) | Expr::Contains(a, b) => {
+            gather_transitive_callee_reads(a, all_rules, visited, out);
+            gather_transitive_callee_reads(b, all_rules, visited, out);
+        }
+        Expr::Call(_, args) | Expr::Concat(args) => {
+            for a in args {
+                gather_transitive_callee_reads(a, all_rules, visited, out);
+            }
+        }
+        Expr::Record(_, fields) => {
+            for (_, v) in fields {
+                gather_transitive_callee_reads(v, all_rules, visited, out);
+            }
+        }
+        Expr::Fetch(_, req) => {
+            gather_transitive_callee_reads(req, all_rules, visited, out);
+        }
+        Expr::Fold(coll, init, _, _, body) => {
+            gather_transitive_callee_reads(coll, all_rules, visited, out);
+            gather_transitive_callee_reads(init, all_rules, visited, out);
+            gather_transitive_callee_reads(body, all_rules, visited, out);
+        }
+        Expr::Quantifier(_, coll, _, body)
+        | Expr::Map(coll, _, body)
+        | Expr::Filter(coll, _, body) => {
+            gather_transitive_callee_reads(coll, all_rules, visited, out);
+            gather_transitive_callee_reads(body, all_rules, visited, out);
+        }
+        Expr::Number(_) | Expr::Text(_) | Expr::Field(_, _) | Expr::Ident(_)
+        | Expr::Read(_) | Expr::NowUnix => {}
+    }
+}
+
 /// Resolve every resource name read by `rule` against the program's
 /// top-level resource table. Mirror of the by-hand block 7 emitters
 /// were duplicating before this helper was extracted (2026-05-01).
@@ -839,9 +943,17 @@ fn collect_rule_read_names(rule: &Rule) -> Vec<String> {
 fn collect_referenced_resources<'a>(
     rule: &Rule,
     all_resources: &HashMap<&str, &'a Resource>,
+    all_rules: &HashMap<&str, &Rule>,
     role: &str,
 ) -> Result<Vec<&'a Resource>, NativeError> {
-    let names = collect_rule_read_names(rule);
+    // Transitive: include resources read by callees inlined via
+    // match_result chains. The emitter needs slots for ALL resources
+    // that will be touched at runtime, including those whose `read(...)`
+    // sits inside an inlined callee body. Verifier's
+    // `augment_facts_with_transitive_match_result_reads` walks the same
+    // closure; keeping them in lockstep is what lets a rule declare its
+    // callees' resources in `reads:` without surprise.
+    let names = collect_rule_read_names_transitive(rule, all_rules);
     let mut out: Vec<&'a Resource> = Vec::with_capacity(names.len());
     for name in &names {
         let r = all_resources.get(name.as_str()).ok_or_else(|| NativeError {
@@ -1485,7 +1597,7 @@ fn emit_record_loop_prologue<'a>(
     // hard error here — the verifier already validates names, so reaching
     // an undeclared one means the dispatch was called with a stale rule.
     let referenced_resources: Vec<&Resource> =
-        collect_referenced_resources(rule, all_resources, "rule")?;
+        collect_referenced_resources(rule, all_resources, all_rules, "rule")?;
     let resource_extra_bytes: i32 = compute_resource_extra_bytes(&referenced_resources);
     // Phase 11 slice 1: enumerate the connections the rule fetches, in
     // source order. Each contributes 2 slots (ptr, len) plus the response
@@ -4805,7 +4917,7 @@ fn emit_collection_program(
     // shape and shared `emit_resource_read_sequence` helper used by the rule
     // prologue (slice 9.1) and the text-fold init (slice 9.5).
     let referenced_resources: Vec<&Resource> =
-        collect_referenced_resources(rule, all_resources, "rule")?;
+        collect_referenced_resources(rule, all_resources, all_rules, "rule")?;
     let resource_extra_bytes: i32 = compute_resource_extra_bytes(&referenced_resources);
     // now_unix(): 16 bytes at the bottom of the frame; collection rules
     // use it for per-element ts checks (e.g. enrich each emitted record
@@ -5188,7 +5300,7 @@ fn emit_fold_program(
     // walks every Read in the AST so a `read()` deep inside the body
     // gets the same prologue as a top-level let RHS reference.
     let referenced_resources: Vec<&Resource> =
-        collect_referenced_resources(rule, all_resources, "rule")?;
+        collect_referenced_resources(rule, all_resources, all_rules, "rule")?;
     let resource_extra_bytes: i32 = compute_resource_extra_bytes(&referenced_resources);
     // now_unix(): 16 bytes if any reference exists in the rule (logic
     // value or any let RHS). Sits at the very bottom of the frame so
@@ -5555,7 +5667,7 @@ fn emit_multi_fold_program(
     // slice 9.5d). Compose with text equality for filter-by-allowlist
     // patterns inside `all`/`any` quantifiers.
     let referenced_resources: Vec<&Resource> =
-        collect_referenced_resources(rule, all_resources, "rule")?;
+        collect_referenced_resources(rule, all_resources, all_rules, "rule")?;
     let resource_extra_bytes: i32 = compute_resource_extra_bytes(&referenced_resources);
     // now_unix(): 16 bytes at the very bottom of the frame when the rule
     // touches the clock. Same shape as Phase 4 / record-loop prologue.
@@ -5988,7 +6100,7 @@ fn emit_text_fold_program(
     // resource-free programs `referenced_resources` stays empty and
     // everything is byte-for-byte the slice-5b original.
     let referenced_resources: Vec<&Resource> =
-        collect_referenced_resources(rule, all_resources, "rule")?;
+        collect_referenced_resources(rule, all_resources, all_rules, "rule")?;
     // We don't yet know the rbp slot offsets — the prologue assigns them
     // AFTER frame setup. For the classifier we only need the names to be
     // present in the bindings map (the map lookup is name → presence;
@@ -8619,7 +8731,7 @@ fn emit_parallel_program(
     // the rbp frame. Same accounting as every other resource-aware
     // emitter — the canonical pattern from slice 9.1.
     let referenced_resources: Vec<&Resource> =
-        collect_referenced_resources(rule, all_resources, "rule")?;
+        collect_referenced_resources(rule, all_resources, all_rules, "rule")?;
     let resource_extra_bytes: i32 = compute_resource_extra_bytes(&referenced_resources);
 
     let mut code = Vec::new();
@@ -10354,7 +10466,7 @@ fn emit_http10_dynamic_bytes(
     // already rejects unknown resources at parse time, so reaching here
     // means the dispatcher was invoked with a stale handler.
     let referenced_resources: Vec<&Resource> =
-        collect_referenced_resources(handler, all_resources, "service handler")?;
+        collect_referenced_resources(handler, all_resources, all_rules, "service handler")?;
     // Each resource contributes 16 bytes (ptr + len) plus a max_bytes
     // buffer padded to 8 bytes — same accounting as the rule-prologue
     // path in emit_record_loop_prologue.
@@ -12751,6 +12863,132 @@ rule discount_purchase
         );
 
         let _ = fs::remove_file(out);
+    }
+
+    /// Transitive resource reads through match_result chains.
+    ///
+    /// Surfaced while building `examples/order_intake.verbose`: a rule
+    /// `discounted` does `match_result(validate_amount(o), ...)` where
+    /// `validate_amount` reads a resource `cap` via
+    /// `parse_int(read(cap))`. The native emitter inlines the callee
+    /// into `discounted`'s frame, so `discounted`'s prologue must
+    /// allocate the slot for `cap`. Pre-fix, the verifier rejected
+    /// `discounted`'s declaration of `cap` in `reads:` as "extra"
+    /// (the literal AST of `discounted` doesn't reference `cap`), and
+    /// without it the emitter failed with
+    /// "no (ptr, len) slots are registered at this point".
+    ///
+    /// Fix: the verifier's
+    /// `augment_facts_with_transitive_match_result_reads` and the
+    /// native's `collect_rule_read_names_transitive` both walk
+    /// match_result targets into callees and collect their reads.
+    /// What the verifier accepts, the emitter now allocates.
+    ///
+    /// Runtime check: validate the file is open + read, then either
+    /// arm produces the right result.
+    #[test]
+    fn native_match_result_transitive_resource_reads_runtime() {
+        use std::fs;
+        use std::process::Command;
+        let src = r#"@verbose 0.1.0
+
+resource cap
+  @intention: "numeric cap loaded at startup"
+  @source: invoices.intent:1
+
+  path: "/tmp/verbosec_test_transitive_cap.txt"
+  max:  16
+  on_read_error: abort
+
+
+concept O
+  @intention: "an order with amount"
+  @source: invoices.intent:1
+
+  fields:
+    amount : number [0, 1000000]
+
+
+rule validate_amount
+  @intention: "accept when amount <= runtime-loaded cap"
+  @source: invoices.intent:1
+
+  input:
+    o : O
+
+  output:
+    r : Result(number, text)
+
+  logic:
+    r = if o.amount <= parse_int(read(cap)) then Ok(o.amount) else Err("over cap")
+
+  proofs:
+    purity:
+      reads : [o.amount, cap]
+      calls : []
+    termination:
+      bound : 6
+
+
+rule discounted
+  @intention: "match_result chain on validate_amount — cap read flows transitively"
+  @source: invoices.intent:1
+
+  input:
+    o : O
+
+  output:
+    r : Result(number, text)
+
+  logic:
+    r = match_result(validate_amount(o), v => Ok(v * 90 / 100), e => Err(e))
+
+  proofs:
+    purity:
+      reads : [o, cap]
+      calls : [validate_amount]
+    termination:
+      bound : 7
+"#;
+        let tokens = crate::lexer::Lexer::new(src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let out = std::env::temp_dir().join("verbosec_test_transitive_reads");
+        compile_native(&program, "discounted", out.to_str().unwrap(), false, false)
+            .expect("transitive resource reads must compile");
+
+        // Write the cap file. `printf` (no trailing newline) so parse_int
+        // doesn't abort on a stray byte.
+        let cap_path = "/tmp/verbosec_test_transitive_cap.txt";
+        std::fs::write(cap_path, b"500").expect("write cap file");
+
+        // Ok arm: amount=200 → validate_amount returns Ok(200) →
+        // outer Ok(200 * 90 / 100) = 180.
+        let r_ok = Command::new(&out).args(["200"]).output().expect("spawn ok");
+        assert_eq!(
+            String::from_utf8_lossy(&r_ok.stdout).trim(),
+            "180",
+            "Ok arm; stdout={:?} stderr={:?}",
+            r_ok.stdout, r_ok.stderr,
+        );
+
+        // Err arm: amount=1000 > cap=500 → validate_amount returns
+        // Err("over cap") → outer Err passes through.
+        let r_err = Command::new(&out).args(["1000"]).output().expect("spawn err");
+        assert_eq!(
+            String::from_utf8_lossy(&r_err.stderr).trim(),
+            "over cap",
+            "Err arm; stdout={:?} stderr={:?}",
+            r_err.stdout, r_err.stderr,
+        );
+        assert_eq!(
+            r_err.status.code(),
+            Some(1),
+            "Err propagated through match_result should exit 1",
+        );
+
+        let _ = fs::remove_file(out);
+        let _ = fs::remove_file(cap_path);
     }
 
     /// Cross-concept rejection: callee references a field that doesn't

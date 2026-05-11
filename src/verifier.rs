@@ -1228,7 +1228,18 @@ fn verify_rule(
         _ => None,
     };
 
-    let facts = collect_logic_facts(&rule.logic);
+    let mut facts = collect_logic_facts(&rule.logic);
+    // Transitive resource/connection reads via `match_result` chains.
+    // When a rule does `match_result(callee(input), ...)`, the native
+    // emitter inlines the callee's body INTO the outer rule's frame,
+    // which means the callee's resource and connection reads happen at
+    // the outer rule's runtime layer — and the outer rule's prologue
+    // needs them in its `reads:` declaration to allocate the right
+    // slots. The verifier surfaces this as a legitimate read of the
+    // outer rule, not as an "extra" entry.
+    augment_facts_with_transitive_match_result_reads(
+        rule, all_rules, all_resources, all_connections, &mut facts,
+    );
 
     for path in &facts.reads {
         if let Some(msg) = validate_read_path(path, rule, input_concept, all_resources, all_connections) {
@@ -1846,6 +1857,158 @@ fn verify_source_ref(sref: &SourceRef, base_dir: &StdPath) -> Result<(), String>
 struct LogicFacts {
     reads: HashSet<Vec<String>>,
     calls: HashSet<Vec<String>>,
+}
+
+/// When a rule's body contains `match_result(callee(...), ...)`, the
+/// native emitter inlines the callee's body into the outer rule's
+/// frame. The callee's resource/connection reads (and its `now` read)
+/// therefore happen during the outer rule's execution — and the
+/// outer's prologue must declare them.
+///
+/// This pass walks the rule body for `match_result` nodes whose target
+/// is a `Call(callee_name, [...])`, looks the callee up, gathers ITS
+/// reads, filters to the ones that are top-level resource/connection
+/// names or the synthetic `now`, and adds them to the outer rule's
+/// facts. Field reads (`p.amount`-style) are NOT propagated — those
+/// are bound to the callee's input variable and don't appear in the
+/// outer's scope.
+///
+/// Cycle protection: if the callee chain ever loops, we stop at each
+/// rule once via a visited set. The verifier's `calls` check elsewhere
+/// catches genuine circular references; here we just refuse to recurse
+/// infinitely.
+fn augment_facts_with_transitive_match_result_reads(
+    rule: &Rule,
+    all_rules: &[&Rule],
+    all_resources: &HashSet<String>,
+    all_connections: &HashSet<String>,
+    facts: &mut LogicFacts,
+) {
+    let rules_by_name: std::collections::HashMap<&str, &Rule> =
+        all_rules.iter().map(|r| (r.name.as_str(), *r)).collect();
+    let mut visited: HashSet<String> = HashSet::new();
+    visited.insert(rule.name.clone());
+    walk_for_match_result_callees(
+        &rule.logic.value,
+        &rules_by_name,
+        all_resources,
+        all_connections,
+        &mut visited,
+        &mut facts.reads,
+    );
+    for (_, expr) in &rule.logic.bindings {
+        walk_for_match_result_callees(
+            expr,
+            &rules_by_name,
+            all_resources,
+            all_connections,
+            &mut visited,
+            &mut facts.reads,
+        );
+    }
+}
+
+/// Walk an expression for `MatchResult` nodes whose target is a Call;
+/// merge each callee's resource/connection/now reads into `out_reads`.
+fn walk_for_match_result_callees(
+    expr: &Expr,
+    rules_by_name: &std::collections::HashMap<&str, &Rule>,
+    all_resources: &HashSet<String>,
+    all_connections: &HashSet<String>,
+    visited: &mut HashSet<String>,
+    out_reads: &mut HashSet<Vec<String>>,
+) {
+    match expr {
+        Expr::MatchResult(target, _, ok_body, _, err_body) => {
+            if let Expr::Call(callee_name, _) = target.as_ref() {
+                if let Some(callee) = rules_by_name.get(callee_name.as_str()) {
+                    if visited.insert(callee.name.clone()) {
+                        // Collect the callee's own facts and merge the
+                        // resource/connection-shape reads in.
+                        let callee_facts = collect_logic_facts(&callee.logic);
+                        for path in &callee_facts.reads {
+                            if path.len() == 1 {
+                                let name = &path[0];
+                                if all_resources.contains(name)
+                                    || all_connections.contains(name)
+                                    || name == "now"
+                                {
+                                    out_reads.insert(path.clone());
+                                }
+                            }
+                        }
+                        // Recurse: the callee may itself match_result on
+                        // another rule. Same propagation rules apply.
+                        walk_for_match_result_callees(
+                            &callee.logic.value,
+                            rules_by_name,
+                            all_resources,
+                            all_connections,
+                            visited,
+                            out_reads,
+                        );
+                        for (_, e) in &callee.logic.bindings {
+                            walk_for_match_result_callees(
+                                e,
+                                rules_by_name,
+                                all_resources,
+                                all_connections,
+                                visited,
+                                out_reads,
+                            );
+                        }
+                    }
+                }
+            }
+            walk_for_match_result_callees(ok_body, rules_by_name, all_resources, all_connections, visited, out_reads);
+            walk_for_match_result_callees(err_body, rules_by_name, all_resources, all_connections, visited, out_reads);
+        }
+        // Recurse into shapes that can contain a MatchResult somewhere.
+        Expr::If(c, t, e) => {
+            walk_for_match_result_callees(c, rules_by_name, all_resources, all_connections, visited, out_reads);
+            walk_for_match_result_callees(t, rules_by_name, all_resources, all_connections, visited, out_reads);
+            walk_for_match_result_callees(e, rules_by_name, all_resources, all_connections, visited, out_reads);
+        }
+        Expr::Ok(i) | Expr::Err(i) | Expr::Not(i) | Expr::Neg(i) | Expr::Abs(i)
+        | Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i) => {
+            walk_for_match_result_callees(i, rules_by_name, all_resources, all_connections, visited, out_reads);
+        }
+        Expr::Binary(_, l, r) => {
+            walk_for_match_result_callees(l, rules_by_name, all_resources, all_connections, visited, out_reads);
+            walk_for_match_result_callees(r, rules_by_name, all_resources, all_connections, visited, out_reads);
+        }
+        Expr::Min(a, b) | Expr::Max(a, b) | Expr::StartsWith(a, b)
+        | Expr::EndsWith(a, b) | Expr::Contains(a, b) => {
+            walk_for_match_result_callees(a, rules_by_name, all_resources, all_connections, visited, out_reads);
+            walk_for_match_result_callees(b, rules_by_name, all_resources, all_connections, visited, out_reads);
+        }
+        Expr::Call(_, args) | Expr::Concat(args) => {
+            for a in args {
+                walk_for_match_result_callees(a, rules_by_name, all_resources, all_connections, visited, out_reads);
+            }
+        }
+        Expr::Record(_, fields) => {
+            for (_, v) in fields {
+                walk_for_match_result_callees(v, rules_by_name, all_resources, all_connections, visited, out_reads);
+            }
+        }
+        Expr::Fetch(_, req) => {
+            walk_for_match_result_callees(req, rules_by_name, all_resources, all_connections, visited, out_reads);
+        }
+        Expr::Fold(coll, init, _, _, body) => {
+            walk_for_match_result_callees(coll, rules_by_name, all_resources, all_connections, visited, out_reads);
+            walk_for_match_result_callees(init, rules_by_name, all_resources, all_connections, visited, out_reads);
+            walk_for_match_result_callees(body, rules_by_name, all_resources, all_connections, visited, out_reads);
+        }
+        Expr::Quantifier(_, coll, _, body)
+        | Expr::Map(coll, _, body)
+        | Expr::Filter(coll, _, body) => {
+            walk_for_match_result_callees(coll, rules_by_name, all_resources, all_connections, visited, out_reads);
+            walk_for_match_result_callees(body, rules_by_name, all_resources, all_connections, visited, out_reads);
+        }
+        Expr::Number(_) | Expr::Text(_) | Expr::Field(_, _) | Expr::Ident(_)
+        | Expr::Read(_) | Expr::NowUnix => {}
+    }
 }
 
 fn collect_logic_facts(logic: &LogicStmt) -> LogicFacts {
