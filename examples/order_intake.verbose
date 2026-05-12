@@ -76,8 +76,8 @@ concept OrderDecision
     audit_ref : text
 
 
-rule validate_amount_positive
-  @intention: "Accept the order's amount when it is strictly positive (lower bound)"
+rule validate_amount
+  @intention: "Accept the order's amount when it is positive and within the runtime-loaded cap"
   @source: order_intake.intent:3
 
   input:
@@ -87,14 +87,14 @@ rule validate_amount_positive
     r : Result(number, text)
 
   logic:
-    r = if o.amount > 0 then Ok(o.amount) else Err(concat("amount ", o.amount, " not positive"))
+    r = if o.amount > 0 and o.amount <= parse_int(read(max_amount)) then Ok(o.amount) else Err(concat("amount ", o.amount, " out of range"))
 
   proofs:
     purity:
-      reads : [o.amount]
+      reads : [o.amount, max_amount]
       calls : []
     termination:
-      bound : 5
+      bound : 11
 
 
 rule validate_age
@@ -129,15 +129,15 @@ rule process_order
     r : Result(OrderDecision, text)
 
   logic:
-    r = match_result(validate_amount_positive(o),
+    r = match_result(validate_amount(o),
           amount => match_result(validate_age(o),
-                      age => if o.amount <= parse_int(read(max_amount)) and o.payment_method == read(allowed_method) then Ok(OrderDecision { amount: amount, priority: if o.amount >= 100000 then "high" else "standard", audit_ref: concat(o.customer_name, "-", o.amount, "-", now_unix()) }) else Err(concat("amount ", o.amount, " over cap or payment method ", o.payment_method, " not allowed")),
+                      age => if o.payment_method == read(allowed_method) then Ok(OrderDecision { amount: amount, priority: if o.amount >= 100000 then "high" else "standard", audit_ref: concat(o.customer_name, "-", o.amount, "-", now_unix()) }) else Err(concat("payment method ", o.payment_method, " not allowed")),
                       age_err => Err(age_err)),
           amt_err => Err(amt_err))
 
   proofs:
     purity:
       reads : [o, o.amount, o.payment_method, o.customer_name, max_amount, allowed_method, now]
-      calls : [validate_amount_positive, validate_age]
+      calls : [validate_amount, validate_age]
     termination:
-      bound : 26
+      bound : 20
