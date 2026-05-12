@@ -7785,6 +7785,7 @@ fn emit_eval_expr(
             needle.as_ref(),
             input_name,
             offsets,
+            all_rules,
             text_bindings,
         ),
         // `contains(haystack, needle)` — naive O(N*M) substring search.
@@ -7808,6 +7809,7 @@ fn emit_eval_expr(
             needle.as_ref(),
             input_name,
             offsets,
+            all_rules,
             text_bindings,
         ),
         // `ends_with(haystack, needle)` — symmetric of starts_with.
@@ -7827,6 +7829,7 @@ fn emit_eval_expr(
             needle.as_ref(),
             input_name,
             offsets,
+            all_rules,
             text_bindings,
         ),
         // `length(<text_expr>)` — byte count returned in rax.
@@ -8179,17 +8182,18 @@ fn emit_length(
 }
 
 /// Helper for `starts_with`: produce (rsi=ptr, rcx=len) for a simple
-/// text expression. Restricted to allocation-free shapes (literal,
-/// text input field, BoundText) so the caller doesn't need to manage
-/// stack buffers across the two-arg evaluation. Concat / Call /
-/// JsonEscape / ParseInt are rejected with a clear message — they
-/// would need a per-call scratch managed across the second emit, which
-/// is out of scope for this slice.
+/// text expression. Restricted to allocation-free shapes:
+/// literal, text input field, BoundText, OR a text-returning rule call
+/// whose body itself resolves to one of those shapes (Phase 2G-shape:
+/// same input ident, no callee lets). Concat / JsonEscape / ParseInt
+/// remain rejected — they would materialise a buffer that the
+/// two-arg evaluation would have to manage across the second emit.
 fn emit_starts_with_load_text(
     code: &mut Vec<u8>,
     expr: &Expr,
     input_name: &str,
     offsets: &HashMap<&str, i32>,
+    all_rules: &HashMap<&str, &Rule>,
     text_bindings: &TextBindings<'_>,
 ) -> Result<(), NativeError> {
     match expr {
@@ -8278,12 +8282,82 @@ fn emit_starts_with_load_text(
             }
             Ok(())
         }
+        Expr::Call(callee_name, call_args) => {
+            // Phase 2G-shape inline: same single Ident(input) arg, callee
+            // has no let bindings, callee returns text. Recurse on the
+            // callee body so it produces (rsi, rcx) under the caller's
+            // offsets / text_bindings — byte-for-byte equivalent to
+            // hoisting the body's load into the caller. Used by
+            // starts_with / ends_with / contains identically.
+            if call_args.len() != 1 {
+                return Err(NativeError {
+                    message: format!(
+                        "starts_with/ends_with/contains: callee '{}' must take exactly one argument; got {}",
+                        callee_name, call_args.len()
+                    ),
+                });
+            }
+            match &call_args[0] {
+                Expr::Ident(n) if n == input_name => {}
+                other => {
+                    return Err(NativeError {
+                        message: format!(
+                            "starts_with/ends_with/contains: callee '{}' argument must be the caller's input ident '{}'; got {}",
+                            callee_name, input_name, expr_kind(other)
+                        ),
+                    });
+                }
+            }
+            let callee = all_rules.get(callee_name.as_str()).ok_or_else(|| NativeError {
+                message: format!("starts_with/ends_with/contains: unknown rule '{}'", callee_name),
+            })?;
+            if !callee.logic.bindings.is_empty() {
+                return Err(NativeError {
+                    message: format!(
+                        "starts_with/ends_with/contains: callee '{}' has let bindings, which aren't supported \
+                         for inline (same Phase 2G constraint as length(call)). Workaround: inline the let RHSes \
+                         into the body, or bind the callee result via a `let` in the caller and pass the let here.",
+                        callee_name
+                    ),
+                });
+            }
+            if !matches!(callee.output_ty, Type::Text) {
+                return Err(NativeError {
+                    message: format!(
+                        "starts_with/ends_with/contains: callee '{}' must return text; got {:?}",
+                        callee_name, callee.output_ty
+                    ),
+                });
+            }
+            if callee.input_name != input_name {
+                return Err(NativeError {
+                    message: format!(
+                        "starts_with/ends_with/contains: callee '{}' uses input ident '{}', caller uses '{}' — \
+                         inline requires the same input ident name",
+                        callee_name, callee.input_name, input_name
+                    ),
+                });
+            }
+            // Recurse on the callee body. Any allocation-needing shape
+            // (Concat, nested Call, JsonEscape) hits the catch-all
+            // below with a message that names the offending shape.
+            emit_starts_with_load_text(
+                code,
+                &callee.logic.value,
+                input_name,
+                offsets,
+                all_rules,
+                text_bindings,
+            )
+        }
         _ => Err(NativeError {
             message: format!(
                 "starts_with: argument must be a text literal, text input field, \
-                 read(<resource>), fetch(<connection>, ...), or a text let in scope — \
-                 got {:?}. Concat / Call / JsonEscape / ParseInt as starts_with args \
-                 are out of scope for this slice.",
+                 read(<resource>), fetch(<connection>, ...), a text let in scope, \
+                 or a text-returning rule call whose body resolves to one of those \
+                 shapes (Phase 2G inline) — got {:?}. Concat / JsonEscape / ParseInt \
+                 as starts_with args still need a buffer materialisation that the \
+                 two-arg evaluation explicitly avoids.",
                 expr_kind(expr)
             ),
         }),
@@ -8298,17 +8372,18 @@ fn emit_starts_with(
     needle: &Expr,
     input_name: &str,
     offsets: &HashMap<&str, i32>,
+    all_rules: &HashMap<&str, &Rule>,
     text_bindings: &TextBindings<'_>,
 ) -> Result<(), NativeError> {
     // Step 1: load haystack into (rsi, rcx); save into (r8, r9).
-    emit_starts_with_load_text(code, haystack, input_name, offsets, text_bindings)?;
+    emit_starts_with_load_text(code, haystack, input_name, offsets, all_rules, text_bindings)?;
     // mov r8, rsi
     code.extend_from_slice(&[0x49, 0x89, 0xF0]);
     // mov r9, rcx
     code.extend_from_slice(&[0x49, 0x89, 0xC9]);
 
     // Step 2: load needle into (rsi, rcx).
-    emit_starts_with_load_text(code, needle, input_name, offsets, text_bindings)?;
+    emit_starts_with_load_text(code, needle, input_name, offsets, all_rules, text_bindings)?;
     // mov rdi, rsi  (cmpsb uses rdi as second source)
     code.extend_from_slice(&[0x48, 0x89, 0xF7]);
 
@@ -8373,16 +8448,17 @@ fn emit_ends_with(
     needle: &Expr,
     input_name: &str,
     offsets: &HashMap<&str, i32>,
+    all_rules: &HashMap<&str, &Rule>,
     text_bindings: &TextBindings<'_>,
 ) -> Result<(), NativeError> {
     // Step 1: load haystack into (rsi, rcx); save into (r8, r9).
-    emit_starts_with_load_text(code, haystack, input_name, offsets, text_bindings)?;
+    emit_starts_with_load_text(code, haystack, input_name, offsets, all_rules, text_bindings)?;
     // mov r8, rsi  ; mov r9, rcx
     code.extend_from_slice(&[0x49, 0x89, 0xF0]);
     code.extend_from_slice(&[0x49, 0x89, 0xC9]);
 
     // Step 2: load needle into (rsi, rcx).
-    emit_starts_with_load_text(code, needle, input_name, offsets, text_bindings)?;
+    emit_starts_with_load_text(code, needle, input_name, offsets, all_rules, text_bindings)?;
     // mov rdi, rsi  (cmpsb uses rdi as second source)
     code.extend_from_slice(&[0x48, 0x89, 0xF7]);
 
@@ -8458,16 +8534,17 @@ fn emit_contains(
     needle: &Expr,
     input_name: &str,
     offsets: &HashMap<&str, i32>,
+    all_rules: &HashMap<&str, &Rule>,
     text_bindings: &TextBindings<'_>,
 ) -> Result<(), NativeError> {
     // Step 1: load haystack into (rsi, rcx); save into (r8, r9).
-    emit_starts_with_load_text(code, haystack, input_name, offsets, text_bindings)?;
+    emit_starts_with_load_text(code, haystack, input_name, offsets, all_rules, text_bindings)?;
     // mov r8, rsi  ; mov r9, rcx
     code.extend_from_slice(&[0x49, 0x89, 0xF0]);
     code.extend_from_slice(&[0x49, 0x89, 0xC9]);
 
     // Step 2: load needle into (rsi, rcx); save into (r10, r11).
-    emit_starts_with_load_text(code, needle, input_name, offsets, text_bindings)?;
+    emit_starts_with_load_text(code, needle, input_name, offsets, all_rules, text_bindings)?;
     // mov r10, rsi ; mov r11, rcx
     code.extend_from_slice(&[0x49, 0x89, 0xF2]);
     code.extend_from_slice(&[0x49, 0x89, 0xCB]);
@@ -15554,6 +15631,169 @@ rule l
         assert!(
             msg.contains("json_escape inner shape not supported"),
             "error should name the unsupported inner shape: {}",
+            msg
+        );
+    }
+
+    /// `starts_with` / `ends_with` / `contains` accept a text-returning
+    /// `Call(callee, [Ident(input)])` (2026-05-12), Phase 2G-shape
+    /// inline. The callee's body resolves into (rsi, rcx) under the
+    /// caller's offsets, byte-for-byte equivalent to hoisting the
+    /// body's load. Restriction: callee body must itself resolve to a
+    /// non-allocating shape (literal, text field, BoundText). A callee
+    /// whose body is `concat(...)` is rejected — the two-arg
+    /// byte-compare can't manage a buffer between the haystack and
+    /// needle emits. Workaround: bind via a `let` and pass the let.
+    ///
+    /// Same Phase 2G constraints as length(Call): single Ident(input)
+    /// arg, callee has no let bindings, callee returns text.
+    #[test]
+    fn slice_byte_prims_accept_call_phase_2g() {
+        use std::process::Command;
+        let src = r#"@verbose 0.1.0
+
+concept O
+  @intention: "x"
+  @source: invoices.intent:1
+  fields:
+    name : text
+
+rule lookup
+  @intention: "passthrough callee — body is a text field, no allocation"
+  @source: invoices.intent:1
+  input:
+    o : O
+  output:
+    s : text
+  logic:
+    s = o.name
+  proofs:
+    purity:
+      reads : [o.name]
+      calls : []
+    termination:
+      bound : 1
+
+rule starts_alice
+  @intention: "x"
+  @source: invoices.intent:1
+  input:
+    o : O
+  output:
+    b : bool
+  logic:
+    b = starts_with(lookup(o), "Ali")
+  proofs:
+    purity:
+      reads : [o]
+      calls : [lookup]
+    termination:
+      bound : 2
+
+rule ends_e
+  @intention: "x"
+  @source: invoices.intent:1
+  input:
+    o : O
+  output:
+    b : bool
+  logic:
+    b = ends_with(lookup(o), "e")
+  proofs:
+    purity:
+      reads : [o]
+      calls : [lookup]
+    termination:
+      bound : 2
+
+rule has_i
+  @intention: "x"
+  @source: invoices.intent:1
+  input:
+    o : O
+  output:
+    b : bool
+  logic:
+    b = contains(lookup(o), "i")
+  proofs:
+    purity:
+      reads : [o]
+      calls : [lookup]
+    termination:
+      bound : 2
+"#;
+        let tokens = crate::lexer::Lexer::new(src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+        let run_rule = |rule: &str, arg: &str| -> String {
+            let bin = std::env::temp_dir().join(format!("verbosec_test_byte_prim_call_{}", rule));
+            compile_native(&program, rule, bin.to_str().unwrap(), false, false)
+                .expect("compile");
+            let r = Command::new(&bin).args([arg]).output().expect("spawn");
+            let out = String::from_utf8_lossy(&r.stdout).trim_end_matches('\n').to_string();
+            let _ = std::fs::remove_file(&bin);
+            out
+        };
+        // starts_with(lookup(o), "Ali")
+        assert_eq!(run_rule("starts_alice", "Alice"), "true");
+        assert_eq!(run_rule("starts_alice", "Bob"), "false");
+        // ends_with(lookup(o), "e")
+        assert_eq!(run_rule("ends_e", "Alice"), "true");
+        assert_eq!(run_rule("ends_e", "Bob"), "false");
+        // contains(lookup(o), "i")
+        assert_eq!(run_rule("has_i", "Alice"), "true");
+        assert_eq!(run_rule("has_i", "Bob"), "false");
+
+        // Refusal path: callee body is a concat — would need a buffer
+        // between the haystack and needle emits.
+        let src_refuse = r#"@verbose 0.1.0
+
+concept O
+  @intention: "x"
+  @source: invoices.intent:1
+  fields:
+    name : text
+
+rule greet
+  @intention: "x"
+  @source: invoices.intent:1
+  input:
+    o : O
+  output:
+    s : text
+  logic:
+    s = concat("Hello, ", o.name)
+  proofs:
+    purity:
+      reads : [o.name]
+      calls : []
+    termination:
+      bound : 2
+
+rule bad
+  @intention: "x"
+  @source: invoices.intent:1
+  input:
+    o : O
+  output:
+    b : bool
+  logic:
+    b = starts_with(greet(o), "Hello")
+  proofs:
+    purity:
+      reads : [o]
+      calls : [greet]
+    termination:
+      bound : 3
+"#;
+        let tokens = crate::lexer::Lexer::new(src_refuse).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+        let bin = std::env::temp_dir().join("verbosec_test_byte_prim_call_refuse");
+        let err = compile_native(&program, "bad", bin.to_str().unwrap(), false, false)
+            .expect_err("concat callee body must be refused");
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("Concat"),
+            "error should name the offending shape: {}",
             msg
         );
     }
