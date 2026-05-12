@@ -2988,7 +2988,7 @@ fn emit_concat_fill(
                 // JSON-significant ones, which expand to two-byte escape
                 // sequences.
                 let inner = match arg { Expr::JsonEscape(i) => i.as_ref(), _ => unreachable!() };
-                emit_json_escape_load_src(code, inner, input_name, offsets, text_bindings)?;
+                emit_json_escape_load_src(code, inner, input_name, offsets, all_rules, text_bindings)?;
                 emit_json_escape_fill_loop(code);
             }
         }
@@ -3040,6 +3040,7 @@ fn emit_json_escape_load_src(
     inner: &Expr,
     input_name: &str,
     offsets: &HashMap<&str, i32>,
+    all_rules: &HashMap<&str, &Rule>,
     text_bindings: &TextBindings<'_>,
 ) -> Result<(), NativeError> {
     match inner {
@@ -3087,6 +3088,74 @@ fn emit_json_escape_load_src(
                 code.extend_from_slice(&len_slot.to_le_bytes());
             }
             Ok(())
+        }
+        // Phase 2G-shape inline: a Call returning text via a body that
+        // itself resolves to a json_escape-supported shape (Field of input
+        // or BoundText). Same constraints as length(Call): single
+        // Ident(input) arg, callee has no let bindings, callee returns
+        // text. A callee body that itself is a concat / nested call / etc.
+        // bubbles up the existing "not supported" error.
+        Expr::Call(callee_name, call_args) => {
+            if call_args.len() != 1 {
+                return Err(NativeError {
+                    message: format!(
+                        "json_escape(call): callee '{}' must take exactly one argument; got {}",
+                        callee_name, call_args.len()
+                    ),
+                });
+            }
+            match &call_args[0] {
+                Expr::Ident(n) if n == input_name => {}
+                other => {
+                    return Err(NativeError {
+                        message: format!(
+                            "json_escape(call): callee '{}' argument must be the caller's input ident '{}'; got {}",
+                            callee_name, input_name, expr_kind(other)
+                        ),
+                    });
+                }
+            }
+            let callee = all_rules.get(callee_name.as_str()).ok_or_else(|| NativeError {
+                message: format!("json_escape(call): unknown rule '{}'", callee_name),
+            })?;
+            if !callee.logic.bindings.is_empty() {
+                return Err(NativeError {
+                    message: format!(
+                        "json_escape(call): callee '{}' has let bindings (same Phase 2G restriction as length(call) / starts_with(call)). \
+                         Workaround: inline the let RHSes into the body, or bind the callee result via a `let` in the caller \
+                         and json_escape the let.",
+                        callee_name
+                    ),
+                });
+            }
+            if !matches!(callee.output_ty, Type::Text) {
+                return Err(NativeError {
+                    message: format!(
+                        "json_escape(call): callee '{}' must return text; got {:?}",
+                        callee_name, callee.output_ty
+                    ),
+                });
+            }
+            if callee.input_name != input_name {
+                return Err(NativeError {
+                    message: format!(
+                        "json_escape(call): callee '{}' uses input ident '{}', caller uses '{}' — \
+                         inline requires the same input ident name",
+                        callee_name, callee.input_name, input_name
+                    ),
+                });
+            }
+            // Recurse on the callee body. Allocation-needing shapes
+            // (Concat, nested Call, JsonEscape) bubble up the existing
+            // catch-all message naming the offending shape.
+            emit_json_escape_load_src(
+                code,
+                &callee.logic.value,
+                input_name,
+                offsets,
+                all_rules,
+                text_bindings,
+            )
         }
         other => Err(NativeError {
             message: format!(
@@ -8119,7 +8188,7 @@ fn emit_length(
         Expr::JsonEscape(inner) => {
             // Load (rsi = src ptr, rcx = src len) for the inner. Errors
             // propagate with a clear message if the shape is unsupported.
-            emit_json_escape_load_src(code, inner.as_ref(), input_name, offsets, text_bindings)?;
+            emit_json_escape_load_src(code, inner.as_ref(), input_name, offsets, all_rules, text_bindings)?;
             // mov r8, rcx   — output length accumulator starts at input length
             code.extend_from_slice(&[0x49, 0x89, 0xC8]);
             // test rcx, rcx ; jz .done   (empty input → output is 0)
@@ -15550,6 +15619,136 @@ rule l
         let out = std::env::temp_dir().join("verbosec_test_length_json_escape_refuse");
         let err = compile_native(&program, "l", out.to_str().unwrap(), false, false)
             .expect_err("json_escape inner = Concat must be refused in this slice");
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("json_escape inner shape not supported"),
+            "error should name the unsupported inner shape: {}",
+            msg
+        );
+    }
+
+    /// `json_escape(<Call>)` accepts a text-returning rule call (2026-05-12),
+    /// Phase 2G-shape inline. Same constraints as length(Call) /
+    /// starts_with(Call): single Ident(input) arg, callee has no let
+    /// bindings, callee returns text. The callee body must itself
+    /// resolve to a json_escape-supported shape (text input field or
+    /// BoundText) — a callee body that's a concat / nested call is
+    /// rejected (no buffer materialisation at this layer; bind via a
+    /// `let` in the caller).
+    ///
+    /// Pinned through length(json_escape(call(o))) which exercises
+    /// both the json_escape Call inline AND length's json_escape arm
+    /// — verifies the recursion through emit_json_escape_load_src
+    /// produces the right byte count.
+    #[test]
+    fn slice_json_escape_accepts_call_phase_2g() {
+        use std::process::Command;
+        let src = r#"@verbose 0.1.0
+
+concept O
+  @intention: "x"
+  @source: invoices.intent:1
+  fields:
+    name : text
+
+rule lookup
+  @intention: "passthrough callee — body is a text field"
+  @source: invoices.intent:1
+  input:
+    o : O
+  output:
+    s : text
+  logic:
+    s = o.name
+  proofs:
+    purity:
+      reads : [o.name]
+      calls : []
+    termination:
+      bound : 1
+
+rule escaped_len
+  @intention: "byte count after json-escape of helper output"
+  @source: invoices.intent:1
+  input:
+    o : O
+  output:
+    n : number
+  logic:
+    n = length(json_escape(lookup(o)))
+  proofs:
+    purity:
+      reads : [o]
+      calls : [lookup]
+    termination:
+      bound : 3
+"#;
+        let tokens = crate::lexer::Lexer::new(src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+        let out = std::env::temp_dir().join("verbosec_test_json_escape_call");
+        compile_native(&program, "escaped_len", out.to_str().unwrap(), false, false)
+            .expect("json_escape(Call) should compile");
+        let run = |arg: &str| -> String {
+            let r = Command::new(&out).args([arg]).output().expect("spawn");
+            String::from_utf8_lossy(&r.stdout).trim_end_matches('\n').to_string()
+        };
+        // Plain ASCII: no escapes → output length = input length
+        assert_eq!(run("Alice"), "5");
+        assert_eq!(run("hello world"), "11");
+        // Quote inside: +1
+        assert_eq!(run("foo\"bar"), "8");
+        // Backslash + newline: +2
+        assert_eq!(run("a\\b\nc"), "7");
+        let _ = std::fs::remove_file(&out);
+
+        // Refusal: callee body is a concat (would need buffer
+        // materialisation that json_escape's loader path explicitly
+        // avoids).
+        let src_refuse = r#"@verbose 0.1.0
+
+concept O
+  @intention: "x"
+  @source: invoices.intent:1
+  fields:
+    name : text
+
+rule greet
+  @intention: "x"
+  @source: invoices.intent:1
+  input:
+    o : O
+  output:
+    s : text
+  logic:
+    s = concat("Hello, ", o.name)
+  proofs:
+    purity:
+      reads : [o.name]
+      calls : []
+    termination:
+      bound : 2
+
+rule bad
+  @intention: "x"
+  @source: invoices.intent:1
+  input:
+    o : O
+  output:
+    n : number
+  logic:
+    n = length(json_escape(greet(o)))
+  proofs:
+    purity:
+      reads : [o]
+      calls : [greet]
+    termination:
+      bound : 3
+"#;
+        let tokens = crate::lexer::Lexer::new(src_refuse).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+        let bin = std::env::temp_dir().join("verbosec_test_json_escape_call_refuse");
+        let err = compile_native(&program, "bad", bin.to_str().unwrap(), false, false)
+            .expect_err("concat callee body must be refused for json_escape inner");
         let msg = format!("{}", err);
         assert!(
             msg.contains("json_escape inner shape not supported"),
