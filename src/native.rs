@@ -8107,13 +8107,71 @@ fn emit_length(
                 text_bindings,
             )
         }
+        // length(json_escape(<text>)) — count the escaped output bytes
+        // without materialising the escape transform. Native's json_escape
+        // only escapes five bytes (", \, \n, \r, \t), each becoming 2
+        // bytes; every other byte passes through as 1. So the output
+        // length = input length + count of escape-triggering bytes.
+        // One pass over the input, accumulating in r8. Inner restricted
+        // to the same shapes emit_json_escape_load_src accepts (text
+        // input field, BoundText) so the fill-pass path that already
+        // exists in the binary is the one we measure here.
+        Expr::JsonEscape(inner) => {
+            // Load (rsi = src ptr, rcx = src len) for the inner. Errors
+            // propagate with a clear message if the shape is unsupported.
+            emit_json_escape_load_src(code, inner.as_ref(), input_name, offsets, text_bindings)?;
+            // mov r8, rcx   — output length accumulator starts at input length
+            code.extend_from_slice(&[0x49, 0x89, 0xC8]);
+            // test rcx, rcx ; jz .done   (empty input → output is 0)
+            code.extend_from_slice(&[0x48, 0x85, 0xC9]);
+            code.push(0x74);
+            let done_patch = code.len();
+            code.push(0x00);
+            // .loop:
+            let loop_top = code.len();
+            // movzx eax, byte [rsi]
+            code.extend_from_slice(&[0x0F, 0xB6, 0x06]);
+            // Five escape-byte checks. Each match jumps to the `+1`
+            // accumulator; no match falls through to .skip.
+            let mut je_patches: Vec<usize> = Vec::new();
+            for byte in [0x22u8, 0x5C, 0x0A, 0x0D, 0x09] {
+                code.push(0x3C); code.push(byte); // cmp al, byte
+                code.push(0x74); je_patches.push(code.len()); code.push(0x00); // je .add
+            }
+            // jmp .skip (no escape)
+            code.push(0xEB);
+            let skip_jmp_patch = code.len();
+            code.push(0x00);
+            // .add: inc r8
+            let add_pos = code.len();
+            for p in &je_patches {
+                code[*p] = (add_pos - p - 1) as u8;
+            }
+            code.extend_from_slice(&[0x49, 0xFF, 0xC0]); // inc r8
+            // .skip:
+            let skip_pos = code.len();
+            code[skip_jmp_patch] = (skip_pos - skip_jmp_patch - 1) as u8;
+            // inc rsi ; dec rcx
+            code.extend_from_slice(&[0x48, 0xFF, 0xC6]);
+            code.extend_from_slice(&[0x48, 0xFF, 0xC9]);
+            // jnz .loop (rel8 backward)
+            code.push(0x75);
+            let back = loop_top as i32 - (code.len() as i32 + 1);
+            code.push(back as u8);
+            // .done:
+            let done_pos = code.len();
+            code[done_patch] = (done_pos - done_patch - 1) as u8;
+            // mov rax, r8
+            code.extend_from_slice(&[0x4C, 0x89, 0xC0]);
+            Ok(())
+        }
         _ => Err(NativeError {
             message: format!(
                 "length: argument must be a text literal, text input field, \
                  read(<resource>), fetch(<connection>, ...), a text let in scope, \
-                 concat(...) with text-only args, or a text-returning rule call — \
-                 got {:?}. JsonEscape / ParseInt as length args still need a \
-                 per-call scratch evaluation; out of scope for this slice.",
+                 concat(...) with text-only args, json_escape(<text>) of a \
+                 text input field or BoundText, or a text-returning rule call — \
+                 got {:?}.",
                 expr_kind(inner)
             ),
         }),
@@ -15240,6 +15298,118 @@ rule with_let_len
         assert!(
             msg.contains("let bindings") && msg.contains("greet_with_let"),
             "error should explain the Phase 2G let restriction: {}",
+            msg
+        );
+    }
+
+    /// `length(json_escape(<text>))` runtime composition (2026-05-12):
+    /// count the escaped output bytes without materialising the escape
+    /// transform. Native's json_escape only escapes five bytes
+    /// (`"` `\` `\n` `\r` `\t`), each becoming 2 bytes; every other byte
+    /// passes through as 1. So the output length = input length + count
+    /// of escape-triggering bytes. One byte pass, accumulator in r8,
+    /// zero allocation.
+    ///
+    /// This test pins four runtime behaviors:
+    ///   (a) input with no escape-triggering bytes → output length
+    ///       equals input length (the +1-per-escape path never fires)
+    ///   (b) input with a single quote → output length = input + 1
+    ///   (c) input with multiple escape chars → +1 per match
+    ///   (d) empty input → 0
+    /// And one refusal: inner shape outside the
+    /// `emit_json_escape_load_src` accepted set (literal Text, Call,
+    /// nested JsonEscape) is rejected with a clear message.
+    #[test]
+    fn slice_length_json_escape_byte_scan() {
+        use std::process::Command;
+        let src = r#"@verbose 0.1.0
+
+concept O
+  @intention: "x"
+  @source: invoices.intent:1
+  fields:
+    msg : text
+
+rule escaped_len
+  @intention: "x"
+  @source: invoices.intent:1
+  input:
+    o : O
+  output:
+    n : number
+  logic:
+    n = length(json_escape(o.msg))
+  proofs:
+    purity:
+      reads : [o.msg]
+      calls : []
+    termination:
+      bound : 2
+"#;
+        let tokens = crate::lexer::Lexer::new(src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+        let out = std::env::temp_dir().join("verbosec_test_length_json_escape");
+        compile_native(&program, "escaped_len", out.to_str().unwrap(), false, false)
+            .expect("length(json_escape(field)) should compile");
+        let run = |arg: &str| -> String {
+            let r = Command::new(&out).args([arg]).output().expect("spawn");
+            String::from_utf8_lossy(&r.stdout).trim_end_matches('\n').to_string()
+        };
+        // (a) plain ASCII, no escapes
+        assert_eq!(run("hello"), "5", "plain ASCII: 5 bytes in, 5 out");
+        assert_eq!(run("the quick brown fox"), "19", "ASCII no escapes");
+        // (b) single quote → +1
+        assert_eq!(run("foo\"bar"), "8", "7 input bytes + 1 escape = 8");
+        // (c) several escape chars
+        // input = a"b\c → 5 bytes, 2 escapes ("/\\) → 7 out
+        assert_eq!(run("a\"b\\c"), "7", "5 in + 2 escapes (\" and \\) = 7");
+        // tab + newline mid-string
+        // input = "a\tb\nc" → 5 bytes, 2 escapes (\t, \n) → 7 out
+        assert_eq!(run("a\tb\nc"), "7", "5 in + 2 escapes (\\t, \\n) = 7");
+        // all five escape classes at once
+        // input = `"\\\n\r\t` → 5 bytes, all 5 escape → 10 out
+        assert_eq!(run("\"\\\n\r\t"), "10", "5 escape bytes → 10 out");
+        // (d) empty input
+        assert_eq!(run(""), "0", "empty in → 0 out");
+        let _ = std::fs::remove_file(&out);
+
+        // (e) refusal: inner is a Concat (emit_json_escape_load_src
+        // doesn't accept Concat — that path materialises a buffer
+        // first, which we explicitly avoid in length scans).
+        let src_e = r#"@verbose 0.1.0
+
+concept O
+  @intention: "x"
+  @source: invoices.intent:1
+  fields:
+    a : text
+    b : text
+
+rule l
+  @intention: "x"
+  @source: invoices.intent:1
+  input:
+    o : O
+  output:
+    n : number
+  logic:
+    n = length(json_escape(concat(o.a, o.b)))
+  proofs:
+    purity:
+      reads : [o.a, o.b]
+      calls : []
+    termination:
+      bound : 3
+"#;
+        let tokens = crate::lexer::Lexer::new(src_e).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+        let out = std::env::temp_dir().join("verbosec_test_length_json_escape_refuse");
+        let err = compile_native(&program, "l", out.to_str().unwrap(), false, false)
+            .expect_err("json_escape inner = Concat must be refused in this slice");
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("json_escape inner shape not supported"),
+            "error should name the unsupported inner shape: {}",
             msg
         );
     }
