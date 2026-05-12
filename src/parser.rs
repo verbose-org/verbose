@@ -367,7 +367,13 @@ impl Parser {
         let target = self.expect_ident_any()?;
         self.expect_kind(TokenKind::Equal)?;
         let value = self.parse_expr()?;
-        self.expect_kind(TokenKind::Newline)?;
+        // Statement terminator: either NEWLINE then DEDENT (the usual
+        // single-line form), or just DEDENT (when the expression was
+        // a multi-line if/then/else whose balance loop consumed the
+        // trailing NEWLINE while closing matching INDENTs).
+        if matches!(self.peek_kind(), Some(TokenKind::Newline)) {
+            self.advance();
+        }
         self.expect_kind(TokenKind::Dedent)?;
         Ok(LogicStmt {
             bindings,
@@ -484,30 +490,51 @@ impl Parser {
     fn parse_primary(&mut self) -> Result<Expr, ParseError> {
         if self.check_ident("if") {
             self.advance();
-            // Multi-line `if/then/else`: NEWLINE tokens between the
-            // structural keywords (`if`, `then`, `else`) and their
-            // adjoining sub-expressions are skipped. Lets a long
-            // expression break across lines without forcing a single
-            // physical line — common when the model emits something
-            // like
+            // Multi-line `if/then/else`: NEWLINE / INDENT / DEDENT
+            // tokens between the structural keywords (`if`, `then`,
+            // `else`) and their adjoining sub-expressions are skipped,
+            // INDENT/DEDENT in balanced pairs tracked by a local depth
+            // counter. Lets both the same-column form
+            //     status = if cond
+            //     then concat(...)
+            //     else concat(...)
+            // AND the indented form
             //     status = if cond
             //              then concat(...)
             //              else concat(...)
-            // and the eval surfaced the trap on Opus 4.7 generating
-            // examples/holdout/flight_status. Indentation tokens
-            // (INDENT/DEDENT) are NOT skipped here — those still
-            // delimit the surrounding block; only NEWLINE between
-            // the keywords flows through.
-            self.skip_newlines();
+            // parse cleanly. The eval surfaced the trap on Opus 4.7
+            // generating examples/holdout/flight_status — Opus
+            // gravitates to the indented form (a common natural-language
+            // habit) and the parser used to reject "expected 'then',
+            // got INDENT".
+            //
+            // The depth counter ensures we only consume DEDENTs that
+            // match INDENTs we ate during this if-expression. DEDENTs
+            // that close the surrounding block (e.g. the `logic:` body)
+            // stay untouched for the parent parser. After the
+            // else-expression, we consume any remaining matching
+            // DEDENTs so the if-expression leaves the indent state
+            // exactly where it found it.
+            let mut depth: u32 = 0;
+            self.skip_if_separators(&mut depth);
             let condition = self.parse_expr()?;
-            self.skip_newlines();
+            self.skip_if_separators(&mut depth);
             self.expect_ident("then")?;
-            self.skip_newlines();
+            self.skip_if_separators(&mut depth);
             let then_expr = self.parse_expr()?;
-            self.skip_newlines();
+            self.skip_if_separators(&mut depth);
             self.expect_ident("else")?;
-            self.skip_newlines();
+            self.skip_if_separators(&mut depth);
             let else_expr = self.parse_expr()?;
+            // Balance any indent we opened. NEWLINEs interleaved with
+            // DEDENTs are skipped along the way.
+            while depth > 0 {
+                match self.peek_kind() {
+                    Some(TokenKind::Newline) => self.advance(),
+                    Some(TokenKind::Dedent) => { depth -= 1; self.advance(); }
+                    _ => break,
+                }
+            }
             return Ok(Expr::If(
                 Box::new(condition),
                 Box::new(then_expr),
@@ -1756,6 +1783,29 @@ impl Parser {
         }
     }
 
+    /// Skip NEWLINE / INDENT / DEDENT inside an `if/then/else`
+    /// expression, tracking how many INDENT tokens we've consumed so
+    /// the parent caller can balance them with matching DEDENTs after
+    /// the else-expression. INDENT increments `depth`; DEDENT
+    /// decrements it (and is consumed) only if `depth > 0`, otherwise
+    /// the DEDENT is left in place for the surrounding block to see.
+    /// This is the discipline that lets the indented continuation form
+    ///   status = if cond
+    ///            then "a"
+    ///            else "b"
+    /// parse without swallowing the DEDENT that closes the enclosing
+    /// `logic:` (or other) block.
+    fn skip_if_separators(&mut self, depth: &mut u32) {
+        loop {
+            match self.peek_kind() {
+                Some(TokenKind::Newline) => self.advance(),
+                Some(TokenKind::Indent) => { *depth += 1; self.advance(); }
+                Some(TokenKind::Dedent) if *depth > 0 => { *depth -= 1; self.advance(); }
+                _ => break,
+            }
+        }
+    }
+
     fn peek_attribute_name(&self) -> Option<String> {
         if let Some(TokenKind::Attribute(n)) = self.peek_kind() {
             Some(n.clone())
@@ -1976,6 +2026,32 @@ rule important_invoice
     fn if_then_else_allows_newlines_at_same_indent() {
         let src = "@verbose 0.1.0\n\nconcept T\n  @intention: \"t\"\n  @source: f.intent:1\n  fields:\n    x : number\n\nrule test\n  @intention: \"t\"\n  @source: f.intent:1\n  input:\n    t : T\n  output:\n    r : number\n  logic:\n    r = if t.x > 10\n    then 1\n    else 0\n  proofs:\n    purity:\n      reads: [t.x]\n      calls: []\n    termination:\n      bound : 3\n";
         let p = parse(src).unwrap_or_else(|e| panic!("multi-line if must parse: {:?}", e));
+        match &p.items[1] {
+            Item::Rule(r) => {
+                assert!(matches!(&r.logic.value, Expr::If(_, _, _)));
+            }
+            _ => panic!("expected rule"),
+        }
+    }
+
+    /// `if/then/else` allows the genuinely-INDENTED continuation form:
+    ///   r = if cond
+    ///       then ...     <- column deeper than `if`
+    ///       else ...     <- same deeper column
+    /// The parser tracks an indent depth across the if-expression and
+    /// consumes a balancing DEDENT for each INDENT it ate. The
+    /// surrounding block's DEDENT (one less indent level out) is left
+    /// untouched. `parse_logic_block`'s statement terminator was made
+    /// lenient about NEWLINE-before-DEDENT to accommodate the case
+    /// where the balance loop consumed the trailing NEWLINE.
+    ///
+    /// Pinned because Opus 4.7 gravitates to this form when generating
+    /// long `if` expressions for the holdout intents — `examples/holdout/
+    /// flight_status` triggered the prior rejection.
+    #[test]
+    fn if_then_else_allows_indented_continuation() {
+        let src = "@verbose 0.1.0\n\nconcept T\n  @intention: \"t\"\n  @source: f.intent:1\n  fields:\n    x : number\n\nrule test\n  @intention: \"t\"\n  @source: f.intent:1\n  input:\n    t : T\n  output:\n    r : number\n  logic:\n    r = if t.x > 10\n        then 1\n        else 0\n  proofs:\n    purity:\n      reads: [t.x]\n      calls: []\n    termination:\n      bound : 3\n";
+        let p = parse(src).unwrap_or_else(|e| panic!("indented multi-line if must parse: {:?}", e));
         match &p.items[1] {
             Item::Rule(r) => {
                 assert!(matches!(&r.logic.value, Expr::If(_, _, _)));
