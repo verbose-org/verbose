@@ -7841,7 +7841,7 @@ fn emit_eval_expr(
         //   - anything else: clear refusal (Concat / Call / JsonEscape /
         //     ParseInt as length-arg would require a per-call scratch
         //     evaluation; not in this slice)
-        Expr::Length(inner) => emit_length(code, inner.as_ref(), input_name, offsets, text_bindings),
+        Expr::Length(inner) => emit_length(code, inner.as_ref(), input_name, offsets, all_rules, field_ranges, text_bindings),
         // `abs(<number>)` — branch-free absolute value via the canonical
         // 5-byte inline:
         //   cqo                 ; rdx = (rax < 0) ? -1 : 0
@@ -7905,6 +7905,8 @@ fn emit_length(
     inner: &Expr,
     input_name: &str,
     offsets: &HashMap<&str, i32>,
+    all_rules: &HashMap<&str, &Rule>,
+    field_ranges: &HashMap<&str, (i64, i64)>,
     text_bindings: &TextBindings<'_>,
 ) -> Result<(), NativeError> {
     match inner {
@@ -7931,6 +7933,18 @@ fn emit_length(
                     code.extend_from_slice(&len_slot.to_le_bytes());
                 }
                 return Ok(());
+            }
+            // Number-typed fields land in `field_ranges`. Strlen on a
+            // Number slot would scan whatever bytes happen to be there
+            // (the field stores an i64, not a NUL-terminated string),
+            // so reject explicitly rather than silently produce garbage.
+            if field_ranges.contains_key(fname.as_str()) {
+                return Err(NativeError {
+                    message: format!(
+                        "length: field '{}' is number-typed; length only accepts text",
+                        fname
+                    ),
+                });
             }
             let &offset = offsets.get(fname.as_str()).ok_or_else(|| NativeError {
                 message: format!("length: unknown text input field '{}'", fname),
@@ -7966,12 +7980,140 @@ fn emit_length(
             }
             Ok(())
         }
+        // length(concat(args)): sum each arg's length into a stack
+        // accumulator, then load into rax. No buffer allocation — we
+        // never materialise the concatenation, only count its bytes.
+        // Args restricted to text-producing shapes; number args refused
+        // explicitly (a number arg's decimal width would require running
+        // an itoa-width helper, which is its own slice). Each arg
+        // recurses through emit_length, so nested concat / Call args
+        // compose naturally without ad-hoc scratch.
+        Expr::Concat(args) => {
+            // sub rsp, 8   ; mov qword [rsp], 0
+            code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x08]);
+            code.extend_from_slice(&[0x48, 0xC7, 0x04, 0x24, 0x00, 0x00, 0x00, 0x00]);
+            for (i, arg) in args.iter().enumerate() {
+                // Refuse number-producing kinds before recursion so the
+                // error names the actual offender, not the inner shape.
+                match arg {
+                    Expr::Number(_)
+                    | Expr::Neg(_)
+                    | Expr::Abs(_)
+                    | Expr::Length(_)
+                    | Expr::ParseInt(_)
+                    | Expr::NowUnix
+                    | Expr::Binary(_, _, _)
+                    | Expr::Min(_, _)
+                    | Expr::Max(_, _) => {
+                        // free the accumulator slot before reporting so a
+                        // partially emitted prologue doesn't poison later
+                        // tests if this error is caught somewhere upstream.
+                        code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x08]);
+                        return Err(NativeError {
+                            message: format!(
+                                "length(concat(...)): arg {} is number-typed ({}). \
+                                 length only sums text-producing args; materialise \
+                                 the concat via a `let` and call length on it.",
+                                i,
+                                expr_kind(arg)
+                            ),
+                        });
+                    }
+                    _ => {}
+                }
+                // Recurse on this arg — emit_length will produce the
+                // arg's byte count in rax (or fail with a clear message).
+                emit_length(code, arg, input_name, offsets, all_rules, field_ranges, text_bindings)?;
+                // add [rsp], rax
+                code.extend_from_slice(&[0x48, 0x01, 0x04, 0x24]);
+            }
+            // mov rax, [rsp]  ;  add rsp, 8
+            code.extend_from_slice(&[0x48, 0x8B, 0x04, 0x24]);
+            code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x08]);
+            Ok(())
+        }
+        // length(Call(callee, [Ident(input)])): inline-resolve the callee
+        // body (Phase 2G shape) and recurse. The callee's bytes never get
+        // materialised — we compute their length directly. Phase 2G
+        // constraints apply: single ident arg matching input_name, callee
+        // returns text, callee has no let bindings.
+        Expr::Call(callee_name, call_args) => {
+            if call_args.len() != 1 {
+                return Err(NativeError {
+                    message: format!(
+                        "length(call): callee '{}' must take exactly one argument; got {}",
+                        callee_name,
+                        call_args.len()
+                    ),
+                });
+            }
+            match &call_args[0] {
+                Expr::Ident(n) if n == input_name => {}
+                other => {
+                    return Err(NativeError {
+                        message: format!(
+                            "length(call): callee '{}' argument must be the caller's input ident '{}'; got {}",
+                            callee_name,
+                            input_name,
+                            expr_kind(other)
+                        ),
+                    });
+                }
+            }
+            let callee = all_rules.get(callee_name.as_str()).ok_or_else(|| NativeError {
+                message: format!("length(call): unknown rule '{}'", callee_name),
+            })?;
+            if !callee.logic.bindings.is_empty() {
+                return Err(NativeError {
+                    message: format!(
+                        "length(call): callee '{}' has let bindings, which aren't supported \
+                         for length(call) inlining (same restriction as Phase 2G text inlining). \
+                         Workaround: inline the let RHSes into the body, or call the rule \
+                         once into a caller-side let and length that.",
+                        callee_name
+                    ),
+                });
+            }
+            if !matches!(callee.output_ty, Type::Text) {
+                return Err(NativeError {
+                    message: format!(
+                        "length(call): callee '{}' must return text; got {:?}",
+                        callee_name, callee.output_ty
+                    ),
+                });
+            }
+            if callee.input_name != input_name {
+                return Err(NativeError {
+                    message: format!(
+                        "length(call): callee '{}' uses input ident '{}', caller uses '{}' — \
+                         length(call) inlining requires the same input ident name \
+                         (same Phase 2G constraint that lets the body resolve under the caller's offsets).",
+                        callee_name, callee.input_name, input_name
+                    ),
+                });
+            }
+            // Recurse on the callee body. The callee's logic value is a
+            // text expression evaluated under the same input slots as the
+            // caller, so offsets / field_ranges / text_bindings all apply
+            // unchanged. Any failure deeper inside the body propagates a
+            // message that names the offending shape.
+            emit_length(
+                code,
+                &callee.logic.value,
+                input_name,
+                offsets,
+                all_rules,
+                field_ranges,
+                text_bindings,
+            )
+        }
         _ => Err(NativeError {
             message: format!(
                 "length: argument must be a text literal, text input field, \
-                 read(<resource>), fetch(<connection>, ...), or a text let in scope — \
-                 got {:?}. Concat / Call / JsonEscape / ParseInt as length args \
-                 would need a per-call scratch evaluation; out of scope for this slice.",
+                 read(<resource>), fetch(<connection>, ...), a text let in scope, \
+                 concat(...) with text-only args, or a text-returning rule call — \
+                 got {:?}. JsonEscape / ParseInt as length args still need a \
+                 per-call scratch evaluation; out of scope for this slice.",
                 expr_kind(inner)
             ),
         }),
@@ -14834,6 +14976,272 @@ rule lit_len
             size
         );
         let _ = std::fs::remove_file(&out);
+    }
+
+    /// `length(<Call>)` and `length(<Concat>)` runtime composition
+    /// (2026-05-12): the inner arg can now be a text-returning rule call
+    /// (Phase 2G-shape, recursed into the callee body) or a `concat(...)`
+    /// of text-only args (each arg's length contributes to a stack
+    /// accumulator). No buffer allocation — the concatenation never
+    /// materialises, we only count its bytes.
+    ///
+    /// This test pins three runtime behaviors and two refusals:
+    ///   (a) `length(call(input))` where the callee body is
+    ///       `concat(<literal>, input.field)` returns the right byte
+    ///       count and varies with the input field's bytes.
+    ///   (b) `length(concat(...))` directly (no helper) sums correctly.
+    ///   (c) nested: `length(concat(<literal>, call(input)))` composes —
+    ///       outer Concat slot accumulates the literal AND the recursive
+    ///       Call-length, which itself opens its own slot.
+    ///   (d) refusal: `length(concat(...))` with a number-typed field
+    ///       arg produces a clear error naming the offending field.
+    ///   (e) refusal: `length(call(input))` where the callee has let
+    ///       bindings is rejected (Phase 2G-style restriction).
+    #[test]
+    fn slice_length_call_and_concat_compose() {
+        use std::process::Command;
+
+        // (a) length(Call) — callee body is concat("Hello, ", o.name).
+        let src_a = r#"@verbose 0.1.0
+
+concept O
+  @intention: "x"
+  @source: invoices.intent:1
+  fields:
+    name : text
+
+rule greet
+  @intention: "x"
+  @source: invoices.intent:1
+  input:
+    o : O
+  output:
+    s : text
+  logic:
+    s = concat("Hello, ", o.name)
+  proofs:
+    purity:
+      reads : [o.name]
+      calls : []
+    termination:
+      bound : 2
+
+rule greet_len
+  @intention: "x"
+  @source: invoices.intent:1
+  input:
+    o : O
+  output:
+    n : number
+  logic:
+    n = length(greet(o))
+  proofs:
+    purity:
+      reads : [o]
+      calls : [greet]
+    termination:
+      bound : 3
+"#;
+        let tokens = crate::lexer::Lexer::new(src_a).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+        let out = std::env::temp_dir().join("verbosec_test_length_call");
+        compile_native(&program, "greet_len", out.to_str().unwrap(), false, false)
+            .expect("length(call) should compile");
+        let run = |arg: &str| -> String {
+            let r = Command::new(&out).args([arg]).output().expect("spawn");
+            String::from_utf8_lossy(&r.stdout).trim_end_matches('\n').to_string()
+        };
+        assert_eq!(run(""), "7", "Hello, + empty → 7");
+        assert_eq!(run("Bob"), "10", "Hello, + Bob → 10");
+        assert_eq!(run("Christopher"), "18", "Hello, + Christopher → 18");
+        let _ = std::fs::remove_file(&out);
+
+        // (b) length(Concat) directly.
+        let src_b = r#"@verbose 0.1.0
+
+concept O
+  @intention: "x"
+  @source: invoices.intent:1
+  fields:
+    name : text
+
+rule msg_len
+  @intention: "x"
+  @source: invoices.intent:1
+  input:
+    o : O
+  output:
+    n : number
+  logic:
+    n = length(concat("Hi, ", o.name, "!"))
+  proofs:
+    purity:
+      reads : [o.name]
+      calls : []
+    termination:
+      bound : 2
+"#;
+        let tokens = crate::lexer::Lexer::new(src_b).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+        let out = std::env::temp_dir().join("verbosec_test_length_concat_direct");
+        compile_native(&program, "msg_len", out.to_str().unwrap(), false, false)
+            .expect("length(concat) should compile");
+        let run = |arg: &str| -> String {
+            let r = Command::new(&out).args([arg]).output().expect("spawn");
+            String::from_utf8_lossy(&r.stdout).trim_end_matches('\n').to_string()
+        };
+        // "Hi, " (4) + name + "!" (1) = 5 + name_len
+        assert_eq!(run(""), "5");
+        assert_eq!(run("Bob"), "8");
+        assert_eq!(run("Christopher"), "16");
+        let _ = std::fs::remove_file(&out);
+
+        // (c) nested: length(concat(literal, call(input))) — outer
+        // Concat slot composes with the inner Call's slot.
+        let src_c = r#"@verbose 0.1.0
+
+concept O
+  @intention: "x"
+  @source: invoices.intent:1
+  fields:
+    name : text
+
+rule greet
+  @intention: "x"
+  @source: invoices.intent:1
+  input:
+    o : O
+  output:
+    s : text
+  logic:
+    s = concat("Hello, ", o.name)
+  proofs:
+    purity:
+      reads : [o.name]
+      calls : []
+    termination:
+      bound : 2
+
+rule wrap_len
+  @intention: "x"
+  @source: invoices.intent:1
+  input:
+    o : O
+  output:
+    n : number
+  logic:
+    n = length(concat("[", greet(o), "]"))
+  proofs:
+    purity:
+      reads : [o]
+      calls : [greet]
+    termination:
+      bound : 4
+"#;
+        let tokens = crate::lexer::Lexer::new(src_c).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+        let out = std::env::temp_dir().join("verbosec_test_length_nested");
+        compile_native(&program, "wrap_len", out.to_str().unwrap(), false, false)
+            .expect("length(concat with call arg) should compile");
+        let run = |arg: &str| -> String {
+            let r = Command::new(&out).args([arg]).output().expect("spawn");
+            String::from_utf8_lossy(&r.stdout).trim_end_matches('\n').to_string()
+        };
+        // "[" (1) + "Hello, " (7) + name + "]" (1) = 9 + name_len
+        assert_eq!(run(""), "9");
+        assert_eq!(run("Bob"), "12");
+        let _ = std::fs::remove_file(&out);
+
+        // (d) refusal: number-typed field as concat arg.
+        let src_d = r#"@verbose 0.1.0
+
+concept O
+  @intention: "x"
+  @source: invoices.intent:1
+  fields:
+    amt : number
+
+rule l
+  @intention: "x"
+  @source: invoices.intent:1
+  input:
+    o : O
+  output:
+    n : number
+  logic:
+    n = length(concat("x", o.amt))
+  proofs:
+    purity:
+      reads : [o.amt]
+      calls : []
+    termination:
+      bound : 2
+"#;
+        let tokens = crate::lexer::Lexer::new(src_d).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+        let out = std::env::temp_dir().join("verbosec_test_length_number_refuse");
+        let err = compile_native(&program, "l", out.to_str().unwrap(), false, false)
+            .expect_err("number-typed field arg must be refused");
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("number-typed") && msg.contains("amt"),
+            "error should name the field and its type: {}",
+            msg
+        );
+
+        // (e) refusal: callee has let bindings (Phase 2G constraint).
+        let src_e = r#"@verbose 0.1.0
+
+concept O
+  @intention: "x"
+  @source: invoices.intent:1
+  fields:
+    name : text
+
+rule greet_with_let
+  @intention: "x"
+  @source: invoices.intent:1
+  input:
+    o : O
+  output:
+    s : text
+  logic:
+    let prefix = concat("Hi, ", o.name)
+    s = concat(prefix, "!")
+  proofs:
+    purity:
+      reads : [o.name]
+      calls : []
+    termination:
+      bound : 3
+
+rule with_let_len
+  @intention: "x"
+  @source: invoices.intent:1
+  input:
+    o : O
+  output:
+    n : number
+  logic:
+    n = length(greet_with_let(o))
+  proofs:
+    purity:
+      reads : [o]
+      calls : [greet_with_let]
+    termination:
+      bound : 4
+"#;
+        let tokens = crate::lexer::Lexer::new(src_e).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+        let out = std::env::temp_dir().join("verbosec_test_length_lets_refuse");
+        let err = compile_native(&program, "with_let_len", out.to_str().unwrap(), false, false)
+            .expect_err("callee with let bindings must be refused");
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("let bindings") && msg.contains("greet_with_let"),
+            "error should explain the Phase 2G let restriction: {}",
+            msg
+        );
     }
 
     /// `starts_with(<haystack>, <needle>)` primitive (2026-04-29):
