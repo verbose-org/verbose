@@ -8865,7 +8865,7 @@ fn emit_parallel_program(
     all_resources: &HashMap<&str, &Resource>,
 ) -> Result<Vec<u8>, NativeError> {
     let nfields = concept.fields.len();
-    let offsets = field_offsets(concept);
+    let mut offsets = field_offsets(concept);
     let is_bool = rule.output_ty == Type::Bool;
 
     // Slice 9.5f: enumerate resources the rule reads, in source order.
@@ -8875,6 +8875,15 @@ fn emit_parallel_program(
     let referenced_resources: Vec<&Resource> =
         collect_referenced_resources(rule, all_resources, all_rules, "rule")?;
     let resource_extra_bytes: i32 = compute_resource_extra_bytes(&referenced_resources);
+
+    // now_unix() in parallel rules: parent samples clock_gettime ONCE
+    // before fork; both halves inherit the captured value via COW.
+    // Same "ONCE per rule invocation" invariant as every other emitter,
+    // and the same fork-COW propagation pattern as Phase 9 slice 4's
+    // `cache: true` resources — the captured value is fixed at fork
+    // time, so children CANNOT diverge into per-worker clock samples.
+    let uses_now = rule_uses_now_unix(rule);
+    let now_extra_bytes: i32 = if uses_now { 16 } else { 0 };
 
     let mut code = Vec::new();
     let mut resource_abort_patches: Vec<usize> = Vec::new();
@@ -8905,7 +8914,11 @@ fn emit_parallel_program(
     // slice 10 + 9.4's forked+cached pattern.
     code.push(0x55); // push rbp
     code.extend_from_slice(&[0x48, 0x89, 0xE5]); // mov rbp, rsp
-    let frame = ((nfields * 8 + resource_extra_bytes as usize + 15) & !15) as i32;
+    let frame = ((nfields * 8
+        + resource_extra_bytes as usize
+        + now_extra_bytes as usize
+        + 15)
+        & !15) as i32;
     code.extend_from_slice(&[0x48, 0x81, 0xEC]);
     code.extend_from_slice(&frame.to_le_bytes());
 
@@ -8913,10 +8926,10 @@ fn emit_parallel_program(
     // parse loop and BEFORE the fork. emit_resource_read_sequence
     // reuses r15 as the file fd; we save/restore r15 (the array base)
     // around each call to preserve it.
+    let mut next_slot: i32 = -((nfields as i32) * 8 + 8);
     if !referenced_resources.is_empty() {
         // push r15  (save array base across the resource reads)
         code.extend_from_slice(&[0x41, 0x57]);
-        let mut next_slot: i32 = -((nfields as i32) * 8 + 8);
         for r in &referenced_resources {
             let (ptr_slot, len_slot, _buf_slot, new_next) = emit_resource_read_sequence(
                 &mut code,
@@ -8930,6 +8943,26 @@ fn emit_parallel_program(
         // pop r15  (restore array base)
         code.extend_from_slice(&[0x41, 0x5F]);
     }
+
+    // now_unix() capture: clock_gettime(CLOCK_REALTIME) ONCE in the
+    // parent, BEFORE fork. tv_sec lands at `now_slot` (the deeper of two
+    // reserved slots); tv_nsec scratch occupies the slot immediately
+    // above. Both fork halves see the same captured value via COW —
+    // matches the "ONCE per rule invocation" semantic of non-parallel
+    // emitters. Slot registered under the synthetic name `"now"` in
+    // `offsets` below so emit_eval_expr's NowUnix arm resolves to a
+    // load from this slot. The clock_gettime syscall clobbers rax/
+    // rcx/r11, which are all ephemeral at this point in the prologue
+    // (r12=argc, r13=argv, r14/r15 set later); no save needed.
+    let now_slot: i32 = if uses_now {
+        let s = next_slot - 8; // tv_sec at deeper slot
+        emit_capture_now_unix(&mut code, s);
+        offsets.insert("now", s);
+        s
+    } else {
+        0
+    };
+    let _ = now_slot;
 
     // === Phase 1: Parse all argv numbers into array ===
     code.extend_from_slice(&[0x48, 0x31, 0xDB]); // xor rbx, rbx
@@ -15242,6 +15275,96 @@ rule with_let_len
             "error should explain the Phase 2G let restriction: {}",
             msg
         );
+    }
+
+    /// `now_unix()` allowed in parallel rules (2026-05-12): parent
+    /// samples clock_gettime ONCE before the fork; both children inherit
+    /// the captured value via fork's COW. This closes the last
+    /// "now_unix() reached emit_eval_expr in a context that did not
+    /// capture the clock" refusal — every emitter that supports parallel
+    /// records now wires the timestamp.
+    ///
+    /// The invariant pinned here: every record processed by the binary
+    /// reads the SAME `now` value. We submit records whose values are
+    /// successive small constants and check that the output deltas
+    /// equal the input deltas. If a child had re-sampled the clock
+    /// between fork and record processing, the second half's records
+    /// would carry a different `now` and the deltas would diverge by
+    /// (roughly) one second.
+    #[test]
+    fn slice_now_unix_in_parallel_inherits_via_cow() {
+        use std::process::Command;
+        let src = r#"@verbose 0.1.0
+
+concept R
+  @intention: "a record"
+  @source: invoices.intent:1
+  fields:
+    amount : number
+
+rule stamped
+  @intention: "amount plus captured now"
+  @source: invoices.intent:1
+
+  hints:
+    parallel: "split across two children"
+
+  input:
+    r : R
+
+  output:
+    n : number
+
+  logic:
+    n = r.amount + now_unix()
+
+  proofs:
+    purity:
+      reads : [r.amount, now]
+      calls : []
+    termination:
+      bound : 2
+"#;
+        let tokens = crate::lexer::Lexer::new(src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+        let out = std::env::temp_dir().join("verbosec_test_parallel_now");
+        compile_native(&program, "stamped", out.to_str().unwrap(), false, false)
+            .expect("now_unix() in parallel rule should compile");
+        // Feed six records (3 to the child, 3 to the parent post-wait).
+        // Inputs chosen with a deliberate gap (10, 20, 30, 1000, 1010,
+        // 1020) so that if a worker re-sampled the clock between fork
+        // and processing, the gap between the first-half and second-
+        // half outputs would be poisoned by the clock drift.
+        let r = Command::new(&out)
+            .args(["10", "20", "30", "1000", "1010", "1020"])
+            .output()
+            .expect("spawn");
+        assert!(r.status.success(), "binary should exit 0; stderr: {}",
+            String::from_utf8_lossy(&r.stderr));
+        let out_str = String::from_utf8_lossy(&r.stdout);
+        let lines: Vec<&str> = out_str.lines().collect();
+        assert_eq!(lines.len(), 6, "expected six output lines, got: {:?}", lines);
+        let nums: Vec<i64> = lines.iter().map(|l| l.parse().expect("number")).collect();
+        // All six outputs must share the same `now` baseline. Recover
+        // it from each output (output[i] = input[i] + now) and verify
+        // every line yields the same now.
+        let inputs = [10i64, 20, 30, 1000, 1010, 1020];
+        let now_baselines: Vec<i64> = nums.iter().zip(inputs.iter())
+            .map(|(out, inp)| out - inp).collect();
+        let first = now_baselines[0];
+        for (i, b) in now_baselines.iter().enumerate() {
+            assert_eq!(
+                *b, first,
+                "record {} sees a different `now` ({} vs first {}). Children must inherit \
+                 the parent's pre-fork clock sample via COW, not re-sample.",
+                i, b, first
+            );
+        }
+        // Sanity: the captured `now` is in a plausible Unix-epoch range
+        // (post-2020, pre-2050) so we know clock_gettime actually ran.
+        assert!(first > 1_577_836_800, "now {} looks bogus (pre-2020)", first);
+        assert!(first < 2_524_608_000, "now {} looks bogus (post-2050)", first);
+        let _ = std::fs::remove_file(&out);
     }
 
     /// `starts_with(<haystack>, <needle>)` primitive (2026-04-29):
