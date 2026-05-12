@@ -8568,48 +8568,81 @@ fn emit_parse_int(
     code: &mut Vec<u8>,
     inner: &Expr,
     text_bindings: &TextBindings<'_>,
-    _offsets: &HashMap<&str, i32>,
+    offsets: &HashMap<&str, i32>,
 ) -> Result<(), NativeError> {
-    // Step 1: resolve (ptr_slot, len_slot) for the inner.
-    let (ptr_slot, len_slot) = match inner {
-        Expr::Read(name) | Expr::Ident(name) | Expr::Fetch(name, _) => {
-            *text_bindings.get(name.as_str()).ok_or_else(|| NativeError {
+    // Step 1: resolve (rsi=ptr, rcx=len) for the inner. Three shapes:
+    //   - BoundText (Read / Ident / Fetch in text_bindings): load
+    //     (ptr, len) from the two registered slots — zero scan.
+    //   - text input field: pointer is in the field's rbp slot;
+    //     length recovered via emit_strlen (argv-style NUL terminator).
+    //   - anything else (Concat, Call, JsonEscape, ...): refused with
+    //     a clear message. Workaround: bind via a `let` and parse_int
+    //     the let.
+    match inner {
+        Expr::Read(name) | Expr::Ident(name) | Expr::Fetch(name, _)
+            if text_bindings.contains_key(name.as_str()) =>
+        {
+            let (ptr_slot, len_slot) = text_bindings[name.as_str()];
+            // mov rsi, [rbp + ptr_slot]
+            if ptr_slot >= -128 {
+                code.extend_from_slice(&[0x48, 0x8B, 0x75]);
+                code.push(ptr_slot as u8);
+            } else {
+                code.extend_from_slice(&[0x48, 0x8B, 0xB5]);
+                code.extend_from_slice(&ptr_slot.to_le_bytes());
+            }
+            // mov rcx, [rbp + len_slot]
+            if len_slot >= -128 {
+                code.extend_from_slice(&[0x48, 0x8B, 0x4D]);
+                code.push(len_slot as u8);
+            } else {
+                code.extend_from_slice(&[0x48, 0x8B, 0x8D]);
+                code.extend_from_slice(&len_slot.to_le_bytes());
+            }
+        }
+        Expr::Field(_, fname) => {
+            let &offset = offsets.get(fname.as_str()).ok_or_else(|| NativeError {
                 message: format!(
-                    "parse_int: inner expression references '{}' but no (ptr, len) slots are registered \
-                     at this point — the resource/connection/let must be visible in the surrounding scope",
+                    "parse_int: field '{}' has no rbp slot in scope",
+                    fname
+                ),
+            })?;
+            // mov rsi, [rbp + offset]   — NUL-terminated argv pointer
+            if offset >= -128 {
+                code.extend_from_slice(&[0x48, 0x8B, 0x75]);
+                code.push(offset as u8);
+            } else {
+                code.extend_from_slice(&[0x48, 0x8B, 0xB5]);
+                code.extend_from_slice(&offset.to_le_bytes());
+            }
+            // emit_strlen reads rsi, writes rdx (rsi unchanged). Then
+            // copy length into rcx so the scan loop below works
+            // identically to the BoundText path.
+            emit_strlen(code);
+            // mov rcx, rdx
+            code.extend_from_slice(&[0x48, 0x89, 0xD1]);
+        }
+        Expr::Read(name) | Expr::Ident(name) | Expr::Fetch(name, _) => {
+            return Err(NativeError {
+                message: format!(
+                    "parse_int: inner '{}' has no (ptr, len) slots registered at this point — \
+                     the resource/connection/let must be visible in the surrounding scope",
                     name
                 ),
-            })?
+            });
         }
         _ => {
             return Err(NativeError {
                 message: format!(
-                    "parse_int: inner must be a text reference with bound (ptr, len) — \
-                     got {:?}. Supported today: read(<resource>), Ident(<text-let>), \
-                     fetch(<connection>, ...). Field-text/concat/call/json_escape parse_int \
-                     can be added in a follow-up slice.",
+                    "parse_int: inner must be a text input field, a BoundText reference \
+                     (read(<resource>), text let, fetch(<connection>, ...)), or another \
+                     parse_int-supported text shape — got {:?}. Concat / Call / JsonEscape \
+                     as parse_int args still need a buffer materialisation that the strict-scan \
+                     algorithm explicitly avoids; bind via a `let` and parse_int the let.",
                     expr_kind(inner)
                 ),
             });
         }
-    };
-
-    // Step 2: load (rsi=ptr, rcx=len) from the bound slots.
-    // mov rsi, [rbp + ptr_slot]
-    if ptr_slot >= -128 {
-        code.extend_from_slice(&[0x48, 0x8B, 0x75]);
-        code.push(ptr_slot as u8);
-    } else {
-        code.extend_from_slice(&[0x48, 0x8B, 0xB5]);
-        code.extend_from_slice(&ptr_slot.to_le_bytes());
-    }
-    // mov rcx, [rbp + len_slot]
-    if len_slot >= -128 {
-        code.extend_from_slice(&[0x48, 0x8B, 0x4D]);
-        code.push(len_slot as u8);
-    } else {
-        code.extend_from_slice(&[0x48, 0x8B, 0x8D]);
-        code.extend_from_slice(&len_slot.to_le_bytes());
     }
 
     // Step 3: empty input → abort (parse_int requires at least one digit).
@@ -15900,6 +15933,72 @@ rule lit
             "literal-fold binary should stay tight (under 600 B); got {}",
             size
         );
+
+        let _ = fs::remove_file(&out);
+    }
+
+    /// `parse_int(<text-field>)` runtime scan (2026-05-12): parse a
+    /// text-typed input field as a number. The field's pointer lives at
+    /// the existing rbp slot (NUL-terminated argv pointer); we recover
+    /// length via emit_strlen and run the existing strict scan loop.
+    /// Closes a long-standing gap noted in emit_parse_int's old catch-
+    /// all message ("Field-text/concat/call/json_escape parse_int can
+    /// be added in a follow-up slice").
+    ///
+    /// Fail-closed posture intact: empty input aborts, lone '-' aborts,
+    /// any non-digit byte aborts — same sys_exit(1) abort label shared
+    /// with the BoundText path.
+    #[test]
+    fn parse_int_text_field_runtime() {
+        use std::fs;
+        use std::process::Command;
+        let src = r#"@verbose 0.1.0
+
+concept O
+  @intention: "x"
+  @source: invoices.intent:1
+  fields:
+    raw : text
+
+rule parsed
+  @intention: "parse the raw text field as a number"
+  @source: invoices.intent:1
+  input:
+    o : O
+  output:
+    n : number
+  logic:
+    n = parse_int(o.raw)
+  proofs:
+    purity:
+      reads : [o.raw]
+      calls : []
+    termination:
+      bound : 2
+"#;
+        let tokens = crate::lexer::Lexer::new(src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+        let out = std::env::temp_dir().join("verbosec_test_parse_int_field");
+        compile_native(&program, "parsed", out.to_str().unwrap(), false, false)
+            .expect("parse_int(text_field) should compile");
+
+        let run = |arg: &str| -> (i32, String) {
+            let r = Command::new(&out).args([arg]).output().expect("spawn");
+            let code = r.status.code().unwrap_or(-1);
+            let stdout = String::from_utf8_lossy(&r.stdout).trim_end_matches('\n').to_string();
+            (code, stdout)
+        };
+        // Success cases — all-digit, signed, zero
+        assert_eq!(run("42"), (0, "42".into()));
+        assert_eq!(run("-7"), (0, "-7".into()));
+        assert_eq!(run("0"), (0, "0".into()));
+        assert_eq!(run("1000000"), (0, "1000000".into()));
+
+        // Fail-closed cases — exit 1, no stdout
+        assert_eq!(run("").0, 1, "empty input must abort");
+        assert_eq!(run("abc").0, 1, "non-digit must abort");
+        assert_eq!(run("-").0, 1, "lone minus must abort");
+        assert_eq!(run("12x").0, 1, "trailing non-digit must abort");
 
         let _ = fs::remove_file(&out);
     }
