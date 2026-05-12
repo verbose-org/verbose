@@ -575,11 +575,37 @@ pub fn optimize_expr(
                 .collect(),
         ),
 
-        Expr::Concat(args) => Expr::Concat(
-            args.iter()
+        // `concat(...)` — recurse on each arg, then fold to a single
+        // text literal when every arg is a Text or Number literal.
+        // Numbers go through stdlib `to_string` (matches native's itoa
+        // byte-for-byte: signed decimal, no leading zeros, '-' prefix
+        // on negatives). The fold cascades — `length(concat("a",
+        // "b", 42))` lowers to `length("ab42")` and then to
+        // `Number(4)` via the existing length fold below. Mixed
+        // args with field accesses / calls / arithmetic stay unfolded
+        // since their values aren't known at compile time.
+        Expr::Concat(args) => {
+            let optimized: Vec<Expr> = args
+                .iter()
                 .map(|e| optimize_expr(e, input_name, field_ranges))
-                .collect(),
-        ),
+                .collect();
+            let mut all_literal = true;
+            let mut joined = String::new();
+            for arg in &optimized {
+                match arg {
+                    Expr::Text(s) => joined.push_str(s),
+                    Expr::Number(n) => joined.push_str(&n.to_string()),
+                    _ => {
+                        all_literal = false;
+                        break;
+                    }
+                }
+            }
+            if all_literal {
+                return Expr::Text(joined);
+            }
+            Expr::Concat(optimized)
+        }
         // Phase 9 slice 1 stub: a file read has no compile-time optimisation
         // path (the contents aren't known until runtime); pass through.
         Expr::Read(name) => Expr::Read(name.clone()),
@@ -920,6 +946,73 @@ mod tests {
         );
         let result = optimize_expr(&expr, "i", &HashMap::new());
         assert!(matches!(result, Expr::Ident(_)));
+    }
+
+    /// `concat(<all-literal args>)` folds to a single `Expr::Text` at
+    /// compile time. Numbers go through stdlib `to_string`, which matches
+    /// native's itoa byte-for-byte (signed decimal, no leading zeros).
+    /// Mixed concats with field accesses / calls / arithmetic stay
+    /// unfolded.
+    ///
+    /// The fold cascades downstream: `length(concat("a", "b"))` lowers
+    /// to `length("ab")` which the existing length fold turns into
+    /// `Number(2)` — pinned in the second case below.
+    #[test]
+    fn concat_of_literals_folds_to_text() {
+        // (a) all-text args
+        let expr = Expr::Concat(vec![
+            Expr::Text("Hello, ".into()),
+            Expr::Text("World".into()),
+            Expr::Text("!".into()),
+        ]);
+        let result = optimize_expr(&expr, "i", &HashMap::new());
+        match result {
+            Expr::Text(s) => assert_eq!(s, "Hello, World!"),
+            other => panic!("expected Text, got {:?}", other),
+        }
+
+        // (b) mixed text + number args — number formatted via to_string
+        let expr = Expr::Concat(vec![
+            Expr::Text("amount=".into()),
+            Expr::Number(42),
+            Expr::Text(", ratio=".into()),
+            Expr::Number(-7),
+        ]);
+        let result = optimize_expr(&expr, "i", &HashMap::new());
+        match result {
+            Expr::Text(s) => assert_eq!(s, "amount=42, ratio=-7"),
+            other => panic!("expected Text, got {:?}", other),
+        }
+
+        // (c) cascade: length(concat-of-literals) → length(literal) → Number
+        let expr = Expr::Length(Box::new(Expr::Concat(vec![
+            Expr::Text("ab".into()),
+            Expr::Number(123),
+        ])));
+        let result = optimize_expr(&expr, "i", &HashMap::new());
+        match result {
+            Expr::Number(n) => assert_eq!(n, 5, "len('ab123') = 5"),
+            other => panic!("expected Number(5), got {:?}", other),
+        }
+
+        // (d) non-literal arg blocks the fold
+        let expr = Expr::Concat(vec![
+            Expr::Text("user=".into()),
+            Expr::Field(Box::new(Expr::Ident("o".into())), "name".into()),
+        ]);
+        let result = optimize_expr(&expr, "o", &HashMap::new());
+        assert!(
+            matches!(result, Expr::Concat(_)),
+            "concat with a Field arg should stay unfolded"
+        );
+
+        // (e) single-arg concat of literal still folds
+        let expr = Expr::Concat(vec![Expr::Text("alone".into())]);
+        let result = optimize_expr(&expr, "i", &HashMap::new());
+        assert!(
+            matches!(&result, Expr::Text(s) if s == "alone"),
+            "single-arg concat of a literal collapses to the literal"
+        );
     }
 
     #[test]
