@@ -2142,6 +2142,16 @@ fn classify_concat_arg(
             Some(ConcatArgKind::BoundText)
         }
         Expr::Call(_, _) => Some(ConcatArgKind::CallText),
+        // Substring shares CallText's pre-eval/stash/fill machinery
+        // 1-for-1: classify reserves a 16-byte slot, the pre-eval loop
+        // calls emit_text_produce_ptrlen on the whole Substring expr
+        // (which has a Substring arm since slice 1, producing rax=ptr,
+        // rdx=len with the same fail-closed bounds), the sizing loop
+        // loads the len from the slot, the fill loop copies (ptr, len)
+        // from the slot. Substring inherits CallText's `is_nested`
+        // rejection — only one level of pre-eval supported, same
+        // constraint as Phase 2H-b Call args.
+        Expr::Substring(_, _, _) => Some(ConcatArgKind::CallText),
         // Phase 12 (json_escape): the inner must classify as a text-producing
         // kind. Native today supports Text-typed input fields and BoundText
         // identifiers as inners; Number / CallText / nested JsonEscape stay
@@ -8021,6 +8031,7 @@ fn emit_eval_expr(
             input_name,
             offsets,
             all_rules,
+            field_ranges,
             text_bindings,
         ),
         // `contains(haystack, needle)` — naive O(N*M) substring search.
@@ -8045,6 +8056,7 @@ fn emit_eval_expr(
             input_name,
             offsets,
             all_rules,
+            field_ranges,
             text_bindings,
         ),
         // `ends_with(haystack, needle)` — symmetric of starts_with.
@@ -8065,6 +8077,7 @@ fn emit_eval_expr(
             input_name,
             offsets,
             all_rules,
+            field_ranges,
             text_bindings,
         ),
         // `length(<text_expr>)` — byte count returned in rax.
@@ -8509,6 +8522,7 @@ fn emit_starts_with_load_text(
     input_name: &str,
     offsets: &HashMap<&str, i32>,
     all_rules: &HashMap<&str, &Rule>,
+    field_ranges: &HashMap<&str, (i64, i64)>,
     text_bindings: &TextBindings<'_>,
 ) -> Result<(), NativeError> {
     match expr {
@@ -8662,17 +8676,107 @@ fn emit_starts_with_load_text(
                 input_name,
                 offsets,
                 all_rules,
+                field_ranges,
                 text_bindings,
             )
+        }
+        // substring(text, start, end) as a starts_with/ends_with/contains
+        // arg: inline the substring emit (same logic as
+        // emit_text_produce_ptrlen's Substring arm, slice 1) to produce
+        // (rax=slice_ptr, rdx=slice_len), then adapt to the byte-prim
+        // convention (rsi=ptr, rcx=len). Bounds enforced fail-closed
+        // via inline sys_exit(1) tail — same posture as the let-RHS
+        // path. Cost ~85 bytes per substring-as-byte-prim-arg call
+        // (a couple bytes more than the let path because of the
+        // rsi/rcx adapter at the tail).
+        //
+        // Implementation note: duplicates the substring emit logic
+        // from emit_text_produce_ptrlen (which has concept in scope
+        // for defense-in-depth Field type-checks). Here we skip that
+        // check — the verifier already enforced that the text inner
+        // is text-typed before native sees it. If a future slice
+        // factors emit_substring_to_rax_rdx as a shared helper, both
+        // call sites can converge on it.
+        Expr::Substring(text, start_expr, end_expr) => {
+            // (1) Load text inner via the same shape dispatch as the
+            // load_text function we're already inside — emit_starts_with_load_text
+            // already produces (rsi=ptr, rcx=len) for literal/field/BoundText/Call.
+            // The trick: recurse on the text inner here (NOT on the Substring),
+            // ending with (rsi, rcx) holding the text's (ptr, len).
+            emit_starts_with_load_text(
+                code, text, input_name, offsets, all_rules, field_ranges, text_bindings,
+            )?;
+            // (2) push rsi ; push rcx — save (text_ptr at [rsp+16], text_len at [rsp+8] after push end)
+            code.push(0x56); // push rsi (text_ptr)
+            code.push(0x51); // push rcx (text_len)
+            // (3) Evaluate end → rax
+            emit_eval_expr(
+                code, end_expr, input_name, offsets, all_rules, field_ranges, text_bindings,
+            )?;
+            // (4) push rax (end at [rsp])
+            code.push(0x50);
+            // (5) Bounds: end > text_len → abort.
+            //    mov rcx, [rsp+8]  ; rcx = text_len
+            code.extend_from_slice(&[0x48, 0x8B, 0x4C, 0x24, 0x08]);
+            //    cmp rax, rcx
+            code.extend_from_slice(&[0x48, 0x39, 0xC8]);
+            //    ja .abort (rel32)
+            code.push(0x0F); code.push(0x87);
+            let end_abort_patch = code.len();
+            code.extend_from_slice(&[0; 4]);
+            // (6) Evaluate start → rax
+            emit_eval_expr(
+                code, start_expr, input_name, offsets, all_rules, field_ranges, text_bindings,
+            )?;
+            // (7) Bounds: start > end → abort.
+            //    mov rcx, [rsp]    ; rcx = end
+            code.extend_from_slice(&[0x48, 0x8B, 0x0C, 0x24]);
+            //    cmp rax, rcx
+            code.extend_from_slice(&[0x48, 0x39, 0xC8]);
+            code.push(0x0F); code.push(0x87);
+            let start_abort_patch = code.len();
+            code.extend_from_slice(&[0; 4]);
+            // (8) slice_len = end - start = rcx - rax; slice_ptr = text_ptr + start
+            //    mov rdx, rcx       ; rdx = end
+            code.extend_from_slice(&[0x48, 0x89, 0xCA]);
+            //    sub rdx, rax       ; rdx = end - start = slice_len
+            code.extend_from_slice(&[0x48, 0x29, 0xC2]);
+            //    mov rcx, [rsp+16]  ; rcx = text_ptr
+            code.extend_from_slice(&[0x48, 0x8B, 0x4C, 0x24, 0x10]);
+            //    add rcx, rax       ; rcx = text_ptr + start = slice_ptr
+            code.extend_from_slice(&[0x48, 0x01, 0xC1]);
+            // (9) Adapt to byte-prim convention: rsi = slice_ptr, rcx = slice_len
+            //    mov rsi, rcx
+            code.extend_from_slice(&[0x48, 0x89, 0xCE]);
+            //    mov rcx, rdx
+            code.extend_from_slice(&[0x48, 0x89, 0xD1]);
+            // (10) add rsp, 24 ; jmp .ok
+            code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x18]);
+            code.push(0xE9);
+            let ok_jmp_patch = code.len();
+            code.extend_from_slice(&[0; 4]);
+            // .abort: sys_exit(1)
+            let abort_pos = code.len();
+            let end_rel = abort_pos as i32 - (end_abort_patch as i32 + 4);
+            code[end_abort_patch..end_abort_patch + 4].copy_from_slice(&end_rel.to_le_bytes());
+            let start_rel = abort_pos as i32 - (start_abort_patch as i32 + 4);
+            code[start_abort_patch..start_abort_patch + 4].copy_from_slice(&start_rel.to_le_bytes());
+            code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x3C, 0x00, 0x00, 0x00]);
+            code.extend_from_slice(&[0x48, 0xC7, 0xC7, 0x01, 0x00, 0x00, 0x00]);
+            code.extend_from_slice(&[0x0F, 0x05]);
+            // .ok:
+            let ok_pos = code.len();
+            let ok_rel = ok_pos as i32 - (ok_jmp_patch as i32 + 4);
+            code[ok_jmp_patch..ok_jmp_patch + 4].copy_from_slice(&ok_rel.to_le_bytes());
+            Ok(())
         }
         _ => Err(NativeError {
             message: format!(
                 "starts_with: argument must be a text literal, text input field, \
                  read(<resource>), fetch(<connection>, ...), a text let in scope, \
-                 or a text-returning rule call whose body resolves to one of those \
-                 shapes (Phase 2G inline) — got {:?}. Concat / JsonEscape / ParseInt \
-                 as starts_with args still need a buffer materialisation that the \
-                 two-arg evaluation explicitly avoids.",
+                 a text-returning rule call (Phase 2G), or substring(<text>, <start>, <end>) — \
+                 got {:?}. Concat / JsonEscape / ParseInt as starts_with args still need \
+                 a buffer materialisation that the two-arg evaluation explicitly avoids.",
                 expr_kind(expr)
             ),
         }),
@@ -8688,17 +8792,18 @@ fn emit_starts_with(
     input_name: &str,
     offsets: &HashMap<&str, i32>,
     all_rules: &HashMap<&str, &Rule>,
+    field_ranges: &HashMap<&str, (i64, i64)>,
     text_bindings: &TextBindings<'_>,
 ) -> Result<(), NativeError> {
     // Step 1: load haystack into (rsi, rcx); save into (r8, r9).
-    emit_starts_with_load_text(code, haystack, input_name, offsets, all_rules, text_bindings)?;
+    emit_starts_with_load_text(code, haystack, input_name, offsets, all_rules, field_ranges, text_bindings)?;
     // mov r8, rsi
     code.extend_from_slice(&[0x49, 0x89, 0xF0]);
     // mov r9, rcx
     code.extend_from_slice(&[0x49, 0x89, 0xC9]);
 
     // Step 2: load needle into (rsi, rcx).
-    emit_starts_with_load_text(code, needle, input_name, offsets, all_rules, text_bindings)?;
+    emit_starts_with_load_text(code, needle, input_name, offsets, all_rules, field_ranges, text_bindings)?;
     // mov rdi, rsi  (cmpsb uses rdi as second source)
     code.extend_from_slice(&[0x48, 0x89, 0xF7]);
 
@@ -8764,16 +8869,17 @@ fn emit_ends_with(
     input_name: &str,
     offsets: &HashMap<&str, i32>,
     all_rules: &HashMap<&str, &Rule>,
+    field_ranges: &HashMap<&str, (i64, i64)>,
     text_bindings: &TextBindings<'_>,
 ) -> Result<(), NativeError> {
     // Step 1: load haystack into (rsi, rcx); save into (r8, r9).
-    emit_starts_with_load_text(code, haystack, input_name, offsets, all_rules, text_bindings)?;
+    emit_starts_with_load_text(code, haystack, input_name, offsets, all_rules, field_ranges, text_bindings)?;
     // mov r8, rsi  ; mov r9, rcx
     code.extend_from_slice(&[0x49, 0x89, 0xF0]);
     code.extend_from_slice(&[0x49, 0x89, 0xC9]);
 
     // Step 2: load needle into (rsi, rcx).
-    emit_starts_with_load_text(code, needle, input_name, offsets, all_rules, text_bindings)?;
+    emit_starts_with_load_text(code, needle, input_name, offsets, all_rules, field_ranges, text_bindings)?;
     // mov rdi, rsi  (cmpsb uses rdi as second source)
     code.extend_from_slice(&[0x48, 0x89, 0xF7]);
 
@@ -8850,16 +8956,17 @@ fn emit_contains(
     input_name: &str,
     offsets: &HashMap<&str, i32>,
     all_rules: &HashMap<&str, &Rule>,
+    field_ranges: &HashMap<&str, (i64, i64)>,
     text_bindings: &TextBindings<'_>,
 ) -> Result<(), NativeError> {
     // Step 1: load haystack into (rsi, rcx); save into (r8, r9).
-    emit_starts_with_load_text(code, haystack, input_name, offsets, all_rules, text_bindings)?;
+    emit_starts_with_load_text(code, haystack, input_name, offsets, all_rules, field_ranges, text_bindings)?;
     // mov r8, rsi  ; mov r9, rcx
     code.extend_from_slice(&[0x49, 0x89, 0xF0]);
     code.extend_from_slice(&[0x49, 0x89, 0xC9]);
 
     // Step 2: load needle into (rsi, rcx); save into (r10, r11).
-    emit_starts_with_load_text(code, needle, input_name, offsets, all_rules, text_bindings)?;
+    emit_starts_with_load_text(code, needle, input_name, offsets, all_rules, field_ranges, text_bindings)?;
     // mov r10, rsi ; mov r11, rcx
     code.extend_from_slice(&[0x49, 0x89, 0xF2]);
     code.extend_from_slice(&[0x49, 0x89, 0xCB]);
@@ -17116,6 +17223,211 @@ rule len_mid
         // Fail-closed
         assert_eq!(run("len3", "ab").0, 1, "end=3 > len=2 must abort");
         assert_eq!(run("len_mid", "abcdef").0, 1, "end=7 > len=6 must abort");
+    }
+
+    /// `concat(..., substring(...), ...)` direct composition (2026-05-13),
+    /// slice 2b. Substring as a direct concat arg, without a let
+    /// workaround. Substring shares CallText's pre-eval/stash/fill
+    /// machinery 1-for-1 — the classify_concat_arg change is one line,
+    /// and the existing pre-eval path calls emit_text_produce_ptrlen
+    /// on the whole Substring expression (which has a Substring arm
+    /// since slice 1, producing rax=ptr, rdx=len with the same
+    /// fail-closed bounds).
+    ///
+    /// This test pins:
+    ///   (a) substring at concat tail: concat("[", substring(...), "]")
+    ///   (b) substring at concat middle: concat(prefix, substring(...), suffix)
+    ///   (c) two substring args in the same concat (independent slots)
+    ///   (d) fail-closed: bounds violation in substring still aborts
+    #[test]
+    fn slice_concat_substring_direct() {
+        use std::process::Command;
+        let src = r#"@verbose 0.1.0
+
+concept O
+  @intention: "x"
+  @source: invoices.intent:1
+  fields:
+    source : text
+
+rule wrap
+  @intention: "wrap first 3 bytes in brackets"
+  @source: invoices.intent:1
+  input:
+    o : O
+  output:
+    s : text
+  logic:
+    s = concat("[", substring(o.source, 0, 3), "]")
+  proofs:
+    purity:
+      reads : [o.source]
+      calls : []
+    termination:
+      bound : 3
+
+rule labelled
+  @intention: "substring in concat middle"
+  @source: invoices.intent:1
+  input:
+    o : O
+  output:
+    s : text
+  logic:
+    s = concat("prefix=", substring(o.source, 1, 4), ";suffix")
+  proofs:
+    purity:
+      reads : [o.source]
+      calls : []
+    termination:
+      bound : 3
+
+rule two_slices
+  @intention: "two substring args in same concat (independent pre-eval slots)"
+  @source: invoices.intent:1
+  input:
+    o : O
+  output:
+    s : text
+  logic:
+    s = concat(substring(o.source, 0, 2), "-", substring(o.source, 3, 5))
+  proofs:
+    purity:
+      reads : [o.source]
+      calls : []
+    termination:
+      bound : 5
+"#;
+        let tokens = crate::lexer::Lexer::new(src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+        let run = |rule: &str, arg: &str| -> (i32, String) {
+            let bin = std::env::temp_dir().join(format!("verbosec_test_concat_substring_{}", rule));
+            compile_native(&program, rule, bin.to_str().unwrap(), false, false)
+                .expect("compile");
+            let r = Command::new(&bin).args([arg]).output().expect("spawn");
+            let code = r.status.code().unwrap_or(-1);
+            let stdout = String::from_utf8_lossy(&r.stdout).trim_end_matches('\n').to_string();
+            let _ = std::fs::remove_file(&bin);
+            (code, stdout)
+        };
+        // (a) substring at end
+        assert_eq!(run("wrap", "hello"), (0, "[hel]".into()));
+        assert_eq!(run("wrap", "abcdef"), (0, "[abc]".into()));
+        // (b) substring in middle
+        assert_eq!(run("labelled", "abcde"), (0, "prefix=bcd;suffix".into()));
+        // (c) two substring args
+        assert_eq!(run("two_slices", "abcdef"), (0, "ab-de".into()));
+        assert_eq!(run("two_slices", "abcdefghij"), (0, "ab-de".into()),
+            "longer input — same slices");
+        // (d) bounds violation in any substring → abort
+        assert_eq!(run("wrap", "ab").0, 1, "end=3 > len=2 must abort");
+        assert_eq!(run("two_slices", "abc").0, 1, "end=5 > len=3 in second substring must abort");
+    }
+
+    /// `starts_with` / `ends_with` / `contains` accept substring as
+    /// direct arg (2026-05-13), slice 2c. Closes the substring
+    /// integration story across all text-consuming primitives.
+    ///
+    /// The substring emit inside the byte-prim loader duplicates the
+    /// logic in emit_text_produce_ptrlen's Substring arm — they're
+    /// kept in sync until a follow-up factors emit_substring_to_rax_rdx
+    /// as a shared helper. The convention adapter at the tail
+    /// (mov rsi, slice_ptr ; mov rcx, slice_len) is the only delta
+    /// from the let-RHS path.
+    ///
+    /// field_ranges plumbed through emit_starts_with_load_text +
+    /// emit_starts_with + emit_ends_with + emit_contains so the
+    /// substring's start/end exprs can resolve any Number-typed
+    /// expression (including field reads with declared bounds).
+    #[test]
+    fn slice_byte_prims_substring_direct() {
+        use std::process::Command;
+        let src = r#"@verbose 0.1.0
+
+concept O
+  @intention: "x"
+  @source: invoices.intent:1
+  fields:
+    source : text
+
+rule starts_ab
+  @intention: "first-3 slice starts with ab"
+  @source: invoices.intent:1
+  input:
+    o : O
+  output:
+    b : bool
+  logic:
+    b = starts_with(substring(o.source, 0, 3), "ab")
+  proofs:
+    purity:
+      reads : [o.source]
+      calls : []
+    termination:
+      bound : 5
+
+rule ends_lo
+  @intention: "1..4 slice ends with lo"
+  @source: invoices.intent:1
+  input:
+    o : O
+  output:
+    b : bool
+  logic:
+    b = ends_with(substring(o.source, 1, 4), "lo")
+  proofs:
+    purity:
+      reads : [o.source]
+      calls : []
+    termination:
+      bound : 5
+
+rule has_p
+  @intention: "1..5 slice contains p"
+  @source: invoices.intent:1
+  input:
+    o : O
+  output:
+    b : bool
+  logic:
+    b = contains(substring(o.source, 1, 5), "p")
+  proofs:
+    purity:
+      reads : [o.source]
+      calls : []
+    termination:
+      bound : 5
+"#;
+        let tokens = crate::lexer::Lexer::new(src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+        let run = |rule: &str, arg: &str| -> (i32, String) {
+            let bin = std::env::temp_dir().join(format!("verbosec_test_byteprim_substring_{}", rule));
+            compile_native(&program, rule, bin.to_str().unwrap(), false, false)
+                .expect("compile");
+            let r = Command::new(&bin).args([arg]).output().expect("spawn");
+            let code = r.status.code().unwrap_or(-1);
+            let stdout = String::from_utf8_lossy(&r.stdout).trim_end_matches('\n').to_string();
+            let _ = std::fs::remove_file(&bin);
+            (code, stdout)
+        };
+        // Verbose bool convention: true → exit 0, false → exit 1
+        // (shell-script-friendly). So we check stdout for the value
+        // and pair with the expected exit code.
+        // starts_with: substring(source, 0, 3) starts with "ab"
+        assert_eq!(run("starts_ab", "abcdef"), (0, "true".into()));
+        assert_eq!(run("starts_ab", "xy-def"), (1, "false".into()));
+        // ends_with: substring(source, 1, 4) ends with "lo"
+        assert_eq!(run("ends_lo", "hello"), (1, "false".into()), "1..4='ell'");
+        assert_eq!(run("ends_lo", "halo"), (0, "true".into()), "1..4='alo'");
+        // contains: substring(source, 1, 5) contains "p"
+        assert_eq!(run("has_p", "happle"), (0, "true".into()), "1..5='appl'");
+        assert_eq!(run("has_p", "abcde"), (1, "false".into()), "1..5='bcde'");
+        // Fail-closed: substring bounds violation in any primitive
+        // also produces exit 1, but with NO stdout (the rule aborts
+        // before printing).
+        assert_eq!(run("starts_ab", "ab"), (1, "".into()), "substring end=3 > len=2 must abort");
+        assert_eq!(run("ends_lo", "ab"), (1, "".into()), "substring end=4 > len=2 must abort");
+        assert_eq!(run("has_p", "abc"), (1, "".into()), "substring end=5 > len=3 must abort");
     }
 
     /// Phase 9 slice 9.5e (2026-04-28): `read(<resource>)` inside the
