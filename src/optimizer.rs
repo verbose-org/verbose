@@ -80,6 +80,8 @@ fn count_nodes(expr: &Expr) -> usize {
         Expr::Min(l, r) | Expr::Max(l, r) => 1 + count_nodes(l) + count_nodes(r),
         // `substring(text, start, end)` — three children, all expressions.
         Expr::Substring(t, s, e) => 1 + count_nodes(t) + count_nodes(s) + count_nodes(e),
+        // `byte_at(text, index)` — two children, all expressions.
+        Expr::ByteAt(t, i) => 1 + count_nodes(t) + count_nodes(i),
     }
 }
 
@@ -415,6 +417,11 @@ fn substitute_ident(expr: &Expr, name: &str, replacement: &Expr) -> Expr {
             Box::new(substitute_ident(t, name, replacement)),
             Box::new(substitute_ident(s, name, replacement)),
             Box::new(substitute_ident(e, name, replacement)),
+        ),
+        // `byte_at(text, index)` — substitute through both children.
+        Expr::ByteAt(t, i) => Expr::ByteAt(
+            Box::new(substitute_ident(t, name, replacement)),
+            Box::new(substitute_ident(i, name, replacement)),
         ),
     }
 }
@@ -767,6 +774,20 @@ pub fn optimize_expr(
                 }
             }
             Expr::Substring(Box::new(t_opt), Box::new(s_opt), Box::new(e_opt))
+        }
+        // `byte_at(text, index)` — recurse into both children. Compile-time
+        // fold when both have collapsed to literals AND the index is in
+        // range. Out-of-range literal indices keep the wrapper so the
+        // runtime path can fail-closed (sys_exit(1) in native).
+        Expr::ByteAt(t, i) => {
+            let t_opt = optimize_expr(t, input_name, field_ranges);
+            let i_opt = optimize_expr(i, input_name, field_ranges);
+            if let (Expr::Text(text), Expr::Number(idx)) = (&t_opt, &i_opt) {
+                if let Some(&b) = text.as_bytes().get(*idx as usize) {
+                    return Expr::Number(b as i64);
+                }
+            }
+            Expr::ByteAt(Box::new(t_opt), Box::new(i_opt))
         }
     }
 }

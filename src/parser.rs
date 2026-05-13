@@ -923,6 +923,28 @@ impl Parser {
                 }
                 self.expect_kind(TokenKind::RParen)?;
                 Ok(Expr::Substring(Box::new(text_arg), Box::new(start_arg), Box::new(end_arg)))
+            } else if name == "byte_at" && self.check_kind(&TokenKind::LParen) {
+                // `byte_at(<text>, <index>)` — read the byte at a given
+                // offset of the text, returning a Number in 0..256.
+                // Exactly two arguments; any other arity is a parse-time
+                // error. The verifier checks text-typed first arg and
+                // Number-typed index; bounds are enforced fail-closed
+                // at runtime.
+                self.advance(); // (
+                if self.check_kind(&TokenKind::RParen) {
+                    return Err(self.error("byte_at requires exactly two arguments (text, index), got zero"));
+                }
+                let text_arg = self.parse_expr()?;
+                if !self.check_kind(&TokenKind::Comma) {
+                    return Err(self.error("byte_at requires exactly two arguments (text, index), got one"));
+                }
+                self.expect_kind(TokenKind::Comma)?;
+                let index_arg = self.parse_expr()?;
+                if self.check_kind(&TokenKind::Comma) {
+                    return Err(self.error("byte_at requires exactly two arguments (text, index), got more than two"));
+                }
+                self.expect_kind(TokenKind::RParen)?;
+                Ok(Expr::ByteAt(Box::new(text_arg), Box::new(index_arg)))
             } else if name == "abs" && self.check_kind(&TokenKind::LParen) {
                 // `abs(<number_expr>)` — absolute value. Exactly one argument;
                 // zero or two-plus is a parse-time error. The verifier checks

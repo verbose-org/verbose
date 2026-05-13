@@ -712,6 +712,37 @@ fn eval_expr(
                 }),
             }
         }
+        // `byte_at(<text>, <index>)` — read the byte at the given offset of
+        // the text expression, returning a Number in 0..256. Index is
+        // zero-based. Bounds enforced fail-closed (same posture as the
+        // native abort path): index must be < length(text). Negative
+        // indices and out-of-range values produce a RuntimeError (mirrors
+        // what native lowers to sys_exit(1)).
+        Expr::ByteAt(text, index) => {
+            let t = eval_expr(text, env, all_rules)?;
+            let i = eval_expr(index, env, all_rules)?;
+            match (t, i) {
+                (Value::Text(text_val), Value::Number(idx)) => {
+                    let bytes = text_val.as_bytes();
+                    let len = bytes.len() as i64;
+                    if idx < 0 || idx >= len {
+                        return Err(RuntimeError {
+                            message: format!(
+                                "byte_at index out of range: index={}, length={}",
+                                idx, len
+                            ),
+                        });
+                    }
+                    Ok(Value::Number(bytes[idx as usize] as i64))
+                }
+                (t, i) => Err(RuntimeError {
+                    message: format!(
+                        "byte_at requires (text, number), got ({}, {})",
+                        t, i
+                    ),
+                }),
+            }
+        }
     }
 }
 
