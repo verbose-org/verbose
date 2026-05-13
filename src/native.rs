@@ -8412,13 +8412,84 @@ fn emit_length(
             code.extend_from_slice(&[0x4C, 0x89, 0xC0]);
             Ok(())
         }
+        // length(substring(text, start, end)) — produces (end - start)
+        // with the same fail-closed bounds as substring itself
+        // (end > length(text) → abort, start > end → abort). We do
+        // NOT need to materialise the slice — we only need its length.
+        // Recurse on length(text) for the bounds check, evaluate
+        // start/end, do the same two checks substring would do, then
+        // emit end - start directly. Cost ~70 bytes per length-substring
+        // call. The inline abort tail matches substring's posture.
+        //
+        // Optimisation note: an even tighter codegen would skip
+        // length(text) entirely when the AST guarantees text is bounded
+        // (e.g., field with declared `[..N]` range), but slice 2 stays
+        // conservative — always emit the runtime check so the user
+        // sees the same fail-closed semantic as substring-in-a-let.
+        Expr::Substring(text, start_expr, end_expr) => {
+            // (1) Recurse on length(text) → rax
+            emit_length(code, text.as_ref(), input_name, offsets, all_rules, field_ranges, text_bindings)?;
+            // (2) push rax (text_len at [rsp+8] after later push)
+            code.push(0x50);
+            // (3) Evaluate end → rax
+            emit_eval_expr(code, end_expr, input_name, offsets, all_rules, field_ranges, text_bindings)?;
+            // (4) cmp end, text_len ; ja .abort
+            //    mov rcx, [rsp]
+            code.extend_from_slice(&[0x48, 0x8B, 0x0C, 0x24]);
+            //    cmp rax, rcx
+            code.extend_from_slice(&[0x48, 0x39, 0xC8]);
+            //    ja .abort (rel32 placeholder)
+            code.push(0x0F); code.push(0x87);
+            let end_abort_patch = code.len();
+            code.extend_from_slice(&[0; 4]);
+            // (5) push rax (end at [rsp])
+            code.push(0x50);
+            // (6) Evaluate start → rax
+            emit_eval_expr(code, start_expr, input_name, offsets, all_rules, field_ranges, text_bindings)?;
+            // (7) cmp start, end ; ja .abort
+            //    mov rcx, [rsp]  (rcx = end)
+            code.extend_from_slice(&[0x48, 0x8B, 0x0C, 0x24]);
+            //    cmp rax, rcx
+            code.extend_from_slice(&[0x48, 0x39, 0xC8]);
+            //    ja .abort
+            code.push(0x0F); code.push(0x87);
+            let start_abort_patch = code.len();
+            code.extend_from_slice(&[0; 4]);
+            // (8) Compute length = end - start = rcx - rax
+            //    mov rdx, rcx
+            code.extend_from_slice(&[0x48, 0x89, 0xCA]);
+            //    sub rdx, rax
+            code.extend_from_slice(&[0x48, 0x29, 0xC2]);
+            //    mov rax, rdx (result in rax per length convention)
+            code.extend_from_slice(&[0x48, 0x89, 0xD0]);
+            // (9) add rsp, 16 (free saved end + text_len)
+            code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x10]);
+            // (10) jmp .ok
+            code.push(0xE9);
+            let ok_jmp_patch = code.len();
+            code.extend_from_slice(&[0; 4]);
+            // .abort: sys_exit(1)
+            let abort_pos = code.len();
+            let end_rel = abort_pos as i32 - (end_abort_patch as i32 + 4);
+            code[end_abort_patch..end_abort_patch + 4].copy_from_slice(&end_rel.to_le_bytes());
+            let start_rel = abort_pos as i32 - (start_abort_patch as i32 + 4);
+            code[start_abort_patch..start_abort_patch + 4].copy_from_slice(&start_rel.to_le_bytes());
+            code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x3C, 0x00, 0x00, 0x00]);
+            code.extend_from_slice(&[0x48, 0xC7, 0xC7, 0x01, 0x00, 0x00, 0x00]);
+            code.extend_from_slice(&[0x0F, 0x05]);
+            // .ok:
+            let ok_pos = code.len();
+            let ok_rel = ok_pos as i32 - (ok_jmp_patch as i32 + 4);
+            code[ok_jmp_patch..ok_jmp_patch + 4].copy_from_slice(&ok_rel.to_le_bytes());
+            Ok(())
+        }
         _ => Err(NativeError {
             message: format!(
                 "length: argument must be a text literal, text input field, \
                  read(<resource>), fetch(<connection>, ...), a text let in scope, \
                  concat(...) with text-only args, json_escape(<text>) of a \
-                 text input field or BoundText, or a text-returning rule call — \
-                 got {:?}.",
+                 text input field or BoundText, substring(<text>, <start>, <end>), \
+                 or a text-returning rule call — got {:?}.",
                 expr_kind(inner)
             ),
         }),
@@ -16972,6 +17043,79 @@ rule bad_range
         let r = Command::new(&bin).args(["hello"]).output().expect("spawn");
         assert_eq!(r.status.code(), Some(1), "start=3 > end=1 must abort");
         let _ = std::fs::remove_file(&bin);
+    }
+
+    /// `length(substring(text, start, end))` direct composition
+    /// (2026-05-13), slice 2 of substring. Lets the AI write
+    /// `length(substring(o.source, 0, 3))` without a let-workaround.
+    /// The result is `end - start`, with the same fail-closed bounds
+    /// substring itself enforces (end > length(text) → abort,
+    /// start > end → abort). No allocation: we compute the length
+    /// arithmetically without materialising the slice.
+    #[test]
+    fn slice_length_substring_direct() {
+        use std::process::Command;
+        let src = r#"@verbose 0.1.0
+
+concept O
+  @intention: "x"
+  @source: invoices.intent:1
+  fields:
+    source : text
+
+rule len3
+  @intention: "length of the first-3 slice"
+  @source: invoices.intent:1
+  input:
+    o : O
+  output:
+    n : number
+  logic:
+    n = length(substring(o.source, 0, 3))
+  proofs:
+    purity:
+      reads : [o.source]
+      calls : []
+    termination:
+      bound : 2
+
+rule len_mid
+  @intention: "length of a mid slice"
+  @source: invoices.intent:1
+  input:
+    o : O
+  output:
+    n : number
+  logic:
+    n = length(substring(o.source, 2, 7))
+  proofs:
+    purity:
+      reads : [o.source]
+      calls : []
+    termination:
+      bound : 2
+"#;
+        let tokens = crate::lexer::Lexer::new(src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+        let run = |rule: &str, arg: &str| -> (i32, String) {
+            let bin = std::env::temp_dir().join(format!("verbosec_test_length_substring_{}", rule));
+            compile_native(&program, rule, bin.to_str().unwrap(), false, false)
+                .expect("compile");
+            let r = Command::new(&bin).args([arg]).output().expect("spawn");
+            let code = r.status.code().unwrap_or(-1);
+            let stdout = String::from_utf8_lossy(&r.stdout).trim_end_matches('\n').to_string();
+            let _ = std::fs::remove_file(&bin);
+            (code, stdout)
+        };
+        // Happy paths
+        assert_eq!(run("len3", "hello"), (0, "3".into()));
+        assert_eq!(run("len3", "abcdef"), (0, "3".into()));
+        assert_eq!(run("len3", "abc"), (0, "3".into()), "end == length is OK");
+        assert_eq!(run("len_mid", "abcdefghij"), (0, "5".into()), "7 - 2 = 5");
+        assert_eq!(run("len_mid", "abcdefg"), (0, "5".into()), "exact-end mid");
+        // Fail-closed
+        assert_eq!(run("len3", "ab").0, 1, "end=3 > len=2 must abort");
+        assert_eq!(run("len_mid", "abcdef").0, 1, "end=7 > len=6 must abort");
     }
 
     /// Phase 9 slice 9.5e (2026-04-28): `read(<resource>)` inside the
