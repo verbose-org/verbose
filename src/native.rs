@@ -2142,6 +2142,16 @@ fn classify_concat_arg(
             Some(ConcatArgKind::BoundText)
         }
         Expr::Call(_, _) => Some(ConcatArgKind::CallText),
+        // Substring shares CallText's pre-eval/stash/fill machinery
+        // 1-for-1: classify reserves a 16-byte slot, the pre-eval loop
+        // calls emit_text_produce_ptrlen on the whole Substring expr
+        // (which has a Substring arm since slice 1, producing rax=ptr,
+        // rdx=len with the same fail-closed bounds), the sizing loop
+        // loads the len from the slot, the fill loop copies (ptr, len)
+        // from the slot. Substring inherits CallText's `is_nested`
+        // rejection — only one level of pre-eval supported, same
+        // constraint as Phase 2H-b Call args.
+        Expr::Substring(_, _, _) => Some(ConcatArgKind::CallText),
         // Phase 12 (json_escape): the inner must classify as a text-producing
         // kind. Native today supports Text-typed input fields and BoundText
         // identifiers as inners; Number / CallText / nested JsonEscape stay
@@ -17116,6 +17126,105 @@ rule len_mid
         // Fail-closed
         assert_eq!(run("len3", "ab").0, 1, "end=3 > len=2 must abort");
         assert_eq!(run("len_mid", "abcdef").0, 1, "end=7 > len=6 must abort");
+    }
+
+    /// `concat(..., substring(...), ...)` direct composition (2026-05-13),
+    /// slice 2b. Substring as a direct concat arg, without a let
+    /// workaround. Substring shares CallText's pre-eval/stash/fill
+    /// machinery 1-for-1 — the classify_concat_arg change is one line,
+    /// and the existing pre-eval path calls emit_text_produce_ptrlen
+    /// on the whole Substring expression (which has a Substring arm
+    /// since slice 1, producing rax=ptr, rdx=len with the same
+    /// fail-closed bounds).
+    ///
+    /// This test pins:
+    ///   (a) substring at concat tail: concat("[", substring(...), "]")
+    ///   (b) substring at concat middle: concat(prefix, substring(...), suffix)
+    ///   (c) two substring args in the same concat (independent slots)
+    ///   (d) fail-closed: bounds violation in substring still aborts
+    #[test]
+    fn slice_concat_substring_direct() {
+        use std::process::Command;
+        let src = r#"@verbose 0.1.0
+
+concept O
+  @intention: "x"
+  @source: invoices.intent:1
+  fields:
+    source : text
+
+rule wrap
+  @intention: "wrap first 3 bytes in brackets"
+  @source: invoices.intent:1
+  input:
+    o : O
+  output:
+    s : text
+  logic:
+    s = concat("[", substring(o.source, 0, 3), "]")
+  proofs:
+    purity:
+      reads : [o.source]
+      calls : []
+    termination:
+      bound : 3
+
+rule labelled
+  @intention: "substring in concat middle"
+  @source: invoices.intent:1
+  input:
+    o : O
+  output:
+    s : text
+  logic:
+    s = concat("prefix=", substring(o.source, 1, 4), ";suffix")
+  proofs:
+    purity:
+      reads : [o.source]
+      calls : []
+    termination:
+      bound : 3
+
+rule two_slices
+  @intention: "two substring args in same concat (independent pre-eval slots)"
+  @source: invoices.intent:1
+  input:
+    o : O
+  output:
+    s : text
+  logic:
+    s = concat(substring(o.source, 0, 2), "-", substring(o.source, 3, 5))
+  proofs:
+    purity:
+      reads : [o.source]
+      calls : []
+    termination:
+      bound : 5
+"#;
+        let tokens = crate::lexer::Lexer::new(src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+        let run = |rule: &str, arg: &str| -> (i32, String) {
+            let bin = std::env::temp_dir().join(format!("verbosec_test_concat_substring_{}", rule));
+            compile_native(&program, rule, bin.to_str().unwrap(), false, false)
+                .expect("compile");
+            let r = Command::new(&bin).args([arg]).output().expect("spawn");
+            let code = r.status.code().unwrap_or(-1);
+            let stdout = String::from_utf8_lossy(&r.stdout).trim_end_matches('\n').to_string();
+            let _ = std::fs::remove_file(&bin);
+            (code, stdout)
+        };
+        // (a) substring at end
+        assert_eq!(run("wrap", "hello"), (0, "[hel]".into()));
+        assert_eq!(run("wrap", "abcdef"), (0, "[abc]".into()));
+        // (b) substring in middle
+        assert_eq!(run("labelled", "abcde"), (0, "prefix=bcd;suffix".into()));
+        // (c) two substring args
+        assert_eq!(run("two_slices", "abcdef"), (0, "ab-de".into()));
+        assert_eq!(run("two_slices", "abcdefghij"), (0, "ab-de".into()),
+            "longer input — same slices");
+        // (d) bounds violation in any substring → abort
+        assert_eq!(run("wrap", "ab").0, 1, "end=3 > len=2 must abort");
+        assert_eq!(run("two_slices", "abc").0, 1, "end=5 > len=3 in second substring must abort");
     }
 
     /// Phase 9 slice 9.5e (2026-04-28): `read(<resource>)` inside the
