@@ -2702,6 +2702,103 @@ fn emit_mov_r11_disp_from_reg(code: &mut Vec<u8>, disp: i32, is_rax: bool) {
     }
 }
 
+/// Shared substring emit, factored from four duplicated call sites
+/// (emit_text_produce_ptrlen's Substring arm, plus the byte-prim
+/// loaders for starts_with/ends_with/contains, json_escape, and
+/// parse_int).
+///
+/// **Precondition (caller-provided):** `rax = text_ptr`,
+/// `rdx = text_len`. The caller loads the text inner using whatever
+/// dispatch it supports (each loader has different shape restrictions
+/// — Concat / Call recursion / nested substring / etc.). All of them
+/// converge to (rax, rdx) here at the entry to this helper.
+///
+/// **Postcondition (success path):** `rax = slice_ptr`,
+/// `rdx = slice_len`. No other registers preserved (rcx is clobbered;
+/// rsi/rdi untouched). Stack restored.
+///
+/// **Postcondition (fail-closed):** if `end > text_len` or
+/// `start > end`, the emit jumps to an inline `sys_exit(1)` tail. The
+/// process terminates; no return to caller. Negative start/end fall
+/// under `start > end` after unsigned reinterpretation.
+///
+/// **Stack:** uses 24 bytes of scratch (text_ptr + text_len + end),
+/// freed by `add rsp, 24` before the success-path return.
+///
+/// Cost: ~75 bytes of code per call site, plus the inline 16-byte
+/// abort tail (jumped over on success, only reached on bounds
+/// violation). No allocation, no buffer — the slice is a pointer
+/// into the input buffer with a computed length.
+fn emit_substring_bounds_and_slice(
+    code: &mut Vec<u8>,
+    start_expr: &Expr,
+    end_expr: &Expr,
+    input_name: &str,
+    offsets: &HashMap<&str, i32>,
+    all_rules: &HashMap<&str, &Rule>,
+    field_ranges: &HashMap<&str, (i64, i64)>,
+    text_bindings: &TextBindings<'_>,
+) -> Result<(), NativeError> {
+    // (1) push rax (text_ptr) ; push rdx (text_len)
+    //   After 2 pushes: [rsp]=text_len, [rsp+8]=text_ptr.
+    //   After push end below: [rsp]=end, [rsp+8]=text_len, [rsp+16]=text_ptr.
+    code.push(0x50); // push rax
+    code.push(0x52); // push rdx
+    // (2) Evaluate end → rax
+    emit_eval_expr(
+        code, end_expr, input_name, offsets, all_rules, field_ranges, text_bindings,
+    )?;
+    // (3) push rax (save end at [rsp])
+    code.push(0x50);
+    // (4) Bounds: end > text_len → abort
+    //   mov rcx, [rsp+8] ; cmp rax, rcx ; ja .abort
+    code.extend_from_slice(&[0x48, 0x8B, 0x4C, 0x24, 0x08]);
+    code.extend_from_slice(&[0x48, 0x39, 0xC8]);
+    code.push(0x0F); code.push(0x87);
+    let end_abort_patch = code.len();
+    code.extend_from_slice(&[0; 4]);
+    // (5) Evaluate start → rax
+    emit_eval_expr(
+        code, start_expr, input_name, offsets, all_rules, field_ranges, text_bindings,
+    )?;
+    // (6) Bounds: start > end → abort
+    //   mov rcx, [rsp] ; cmp rax, rcx ; ja .abort
+    code.extend_from_slice(&[0x48, 0x8B, 0x0C, 0x24]);
+    code.extend_from_slice(&[0x48, 0x39, 0xC8]);
+    code.push(0x0F); code.push(0x87);
+    let start_abort_patch = code.len();
+    code.extend_from_slice(&[0; 4]);
+    // (7) Compute slice: slice_len = end - start, slice_ptr = text_ptr + start
+    //   rcx = end (from previous load) ; rax = start
+    //   mov rdx, rcx ; sub rdx, rax        (rdx = slice_len)
+    code.extend_from_slice(&[0x48, 0x89, 0xCA]);
+    code.extend_from_slice(&[0x48, 0x29, 0xC2]);
+    //   mov rcx, [rsp+16] ; add rcx, rax   (rcx = slice_ptr)
+    code.extend_from_slice(&[0x48, 0x8B, 0x4C, 0x24, 0x10]);
+    code.extend_from_slice(&[0x48, 0x01, 0xC1]);
+    //   mov rax, rcx                        (rax = slice_ptr per convention)
+    code.extend_from_slice(&[0x48, 0x89, 0xC8]);
+    // (8) add rsp, 24 ; jmp .ok
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x18]);
+    code.push(0xE9);
+    let ok_jmp_patch = code.len();
+    code.extend_from_slice(&[0; 4]);
+    // .abort: sys_exit(1)
+    let abort_pos = code.len();
+    let end_rel = abort_pos as i32 - (end_abort_patch as i32 + 4);
+    code[end_abort_patch..end_abort_patch + 4].copy_from_slice(&end_rel.to_le_bytes());
+    let start_rel = abort_pos as i32 - (start_abort_patch as i32 + 4);
+    code[start_abort_patch..start_abort_patch + 4].copy_from_slice(&start_rel.to_le_bytes());
+    code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x3C, 0x00, 0x00, 0x00]);
+    code.extend_from_slice(&[0x48, 0xC7, 0xC7, 0x01, 0x00, 0x00, 0x00]);
+    code.extend_from_slice(&[0x0F, 0x05]);
+    // .ok: result at (rax = slice_ptr, rdx = slice_len)
+    let ok_pos = code.len();
+    let ok_rel = ok_pos as i32 - (ok_jmp_patch as i32 + 4);
+    code[ok_jmp_patch..ok_jmp_patch + 4].copy_from_slice(&ok_rel.to_le_bytes());
+    Ok(())
+}
+
 /// Produce (rax = ptr, rdx = len) for a text-producing expression — used by
 /// the Phase 2H-b pre-eval pass when evaluating a Call arg's body.
 ///
@@ -2934,79 +3031,19 @@ fn emit_text_produce_ptrlen(
         // return), so the literal offsets [rsp], [rsp+8], [rsp+16] keep
         // pointing at our saved values across the recursive emits.
         Expr::Substring(text, start_expr, end_expr) => {
-            // (1) Load (rax = ptr, rdx = len) for `text`.
+            // Load (rax, rdx) for the text inner using the same loader
+            // we're already inside (handles literals, Field, BoundText,
+            // nested Concat callees through the Phase 2H-b path, Call
+            // via Phase 2G inline). Then delegate the bounds-check +
+            // slice computation to the shared helper.
             emit_text_produce_ptrlen(
                 code, text, input_name, concept, all_rules,
                 offsets, field_ranges, text_bindings,
             )?;
-            // (2) push rax ; push rdx
-            code.push(0x50); // push rax (text_ptr at [rsp+16] after push end)
-            code.push(0x52); // push rdx (text_len at [rsp+8] after push end)
-            // (3) Evaluate end → rax.
-            emit_eval_expr(
-                code, end_expr, input_name, offsets, all_rules, field_ranges, text_bindings,
-            )?;
-            // (4) push rax (end at [rsp])
-            code.push(0x50);
-            // (5) Bounds check: end > text_len → abort.
-            //    mov rcx, [rsp+8]   ; rcx = text_len
-            code.extend_from_slice(&[0x48, 0x8B, 0x4C, 0x24, 0x08]);
-            //    cmp rax, rcx       ; cmp end, text_len
-            code.extend_from_slice(&[0x48, 0x39, 0xC8]);
-            //    ja .abort (rel32 placeholder, patched after we know the offset)
-            code.push(0x0F); code.push(0x87);
-            let end_abort_patch = code.len();
-            code.extend_from_slice(&[0; 4]);
-            // (6) Evaluate start → rax.
-            emit_eval_expr(
-                code, start_expr, input_name, offsets, all_rules, field_ranges, text_bindings,
-            )?;
-            // (7) Bounds check: start > end → abort.
-            //    mov rcx, [rsp]     ; rcx = end
-            code.extend_from_slice(&[0x48, 0x8B, 0x0C, 0x24]);
-            //    cmp rax, rcx       ; cmp start, end
-            code.extend_from_slice(&[0x48, 0x39, 0xC8]);
-            //    ja .abort
-            code.push(0x0F); code.push(0x87);
-            let start_abort_patch = code.len();
-            code.extend_from_slice(&[0; 4]);
-            // (8) Compute slice:
-            //    mov rdx, rcx       ; rdx = end
-            code.extend_from_slice(&[0x48, 0x89, 0xCA]);
-            //    sub rdx, rax       ; rdx = end - start = slice_len
-            code.extend_from_slice(&[0x48, 0x29, 0xC2]);
-            //    mov rcx, [rsp+16]  ; rcx = text_ptr
-            code.extend_from_slice(&[0x48, 0x8B, 0x4C, 0x24, 0x10]);
-            //    add rcx, rax       ; rcx = text_ptr + start = slice_ptr
-            code.extend_from_slice(&[0x48, 0x01, 0xC1]);
-            //    mov rax, rcx       ; rax = slice_ptr
-            code.extend_from_slice(&[0x48, 0x89, 0xC8]);
-            // (9) add rsp, 24       ; free saved (text_ptr, text_len, end)
-            code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x18]);
-            // (10) jmp .ok
-            code.push(0xE9);
-            let ok_jmp_patch = code.len();
-            code.extend_from_slice(&[0; 4]);
-            // .abort: mov rax, 60 ; mov rdi, 1 ; syscall
-            let abort_pos = code.len();
-            code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x3C, 0x00, 0x00, 0x00]);
-            code.extend_from_slice(&[0x48, 0xC7, 0xC7, 0x01, 0x00, 0x00, 0x00]);
-            code.extend_from_slice(&[0x0F, 0x05]);
-            // Patch the two `ja .abort` rel32 to point at abort_pos.
-            let end_rel = abort_pos as i32 - (end_abort_patch as i32 + 4);
-            code[end_abort_patch..end_abort_patch + 4]
-                .copy_from_slice(&end_rel.to_le_bytes());
-            let start_rel = abort_pos as i32 - (start_abort_patch as i32 + 4);
-            code[start_abort_patch..start_abort_patch + 4]
-                .copy_from_slice(&start_rel.to_le_bytes());
-            // .ok:
-            let ok_pos = code.len();
-            let ok_rel = ok_pos as i32 - (ok_jmp_patch as i32 + 4);
-            code[ok_jmp_patch..ok_jmp_patch + 4]
-                .copy_from_slice(&ok_rel.to_le_bytes());
-            // Result: (rax = slice_ptr, rdx = slice_len). rsp restored
-            // by `add rsp, 24` above; the .abort path never returns.
-            Ok(())
+            emit_substring_bounds_and_slice(
+                code, start_expr, end_expr,
+                input_name, offsets, all_rules, field_ranges, text_bindings,
+            )
         }
         other => Err(NativeError {
             message: format!(
@@ -3333,63 +3370,24 @@ fn emit_json_escape_load_src(
         // logic (kept in sync until a future cleanup factors a
         // shared emit_substring_to_rax_rdx helper).
         Expr::Substring(text, start_expr, end_expr) => {
-            // (1) Load text inner via this same loader (recurse) so the
-            // text resolves to (rsi=ptr, rcx=len) under the same shape
-            // constraints (literal / field-of-input / BoundText / Call).
+            // Load text via this same loader (rsi/rcx convention),
+            // adapt to (rax, rdx) for the shared helper, then back
+            // to (rsi, rcx) for the fill loop downstream. The 4-byte
+            // adapters dominate the small extra cost; the shared
+            // helper is identical to the one used by other primitives.
             emit_json_escape_load_src(
                 code, text, input_name, offsets, all_rules, field_ranges, text_bindings,
             )?;
-            // (2) push rsi ; push rcx — save text (ptr at [rsp+16], len at [rsp+8] after push end)
-            code.push(0x56);
-            code.push(0x51);
-            // (3) Evaluate end → rax
-            emit_eval_expr(
-                code, end_expr, input_name, offsets, all_rules, field_ranges, text_bindings,
+            // mov rax, rsi ; mov rdx, rcx (rsi/rcx → rax/rdx)
+            code.extend_from_slice(&[0x48, 0x89, 0xF0]);
+            code.extend_from_slice(&[0x48, 0x89, 0xCA]);
+            emit_substring_bounds_and_slice(
+                code, start_expr, end_expr,
+                input_name, offsets, all_rules, field_ranges, text_bindings,
             )?;
-            // (4) push rax (end at [rsp])
-            code.push(0x50);
-            // (5) cmp end, text_len ; ja .abort
-            code.extend_from_slice(&[0x48, 0x8B, 0x4C, 0x24, 0x08]); // mov rcx, [rsp+8]
-            code.extend_from_slice(&[0x48, 0x39, 0xC8]);              // cmp rax, rcx
-            code.push(0x0F); code.push(0x87);
-            let end_abort_patch = code.len();
-            code.extend_from_slice(&[0; 4]);
-            // (6) Evaluate start → rax
-            emit_eval_expr(
-                code, start_expr, input_name, offsets, all_rules, field_ranges, text_bindings,
-            )?;
-            // (7) cmp start, end ; ja .abort
-            code.extend_from_slice(&[0x48, 0x8B, 0x0C, 0x24]); // mov rcx, [rsp]
-            code.extend_from_slice(&[0x48, 0x39, 0xC8]);        // cmp rax, rcx
-            code.push(0x0F); code.push(0x87);
-            let start_abort_patch = code.len();
-            code.extend_from_slice(&[0; 4]);
-            // (8) slice_len = end - start, slice_ptr = text_ptr + start
-            code.extend_from_slice(&[0x48, 0x89, 0xCA]);              // mov rdx, rcx (end)
-            code.extend_from_slice(&[0x48, 0x29, 0xC2]);              // sub rdx, rax (slice_len)
-            code.extend_from_slice(&[0x48, 0x8B, 0x4C, 0x24, 0x10]);  // mov rcx, [rsp+16] (text_ptr)
-            code.extend_from_slice(&[0x48, 0x01, 0xC1]);              // add rcx, rax (slice_ptr)
-            // (9) Convention: rsi = slice_ptr, rcx = slice_len
-            code.extend_from_slice(&[0x48, 0x89, 0xCE]);              // mov rsi, rcx
-            code.extend_from_slice(&[0x48, 0x89, 0xD1]);              // mov rcx, rdx
-            // (10) add rsp, 24 ; jmp .ok
-            code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x18]);
-            code.push(0xE9);
-            let ok_jmp_patch = code.len();
-            code.extend_from_slice(&[0; 4]);
-            // .abort: sys_exit(1)
-            let abort_pos = code.len();
-            let end_rel = abort_pos as i32 - (end_abort_patch as i32 + 4);
-            code[end_abort_patch..end_abort_patch + 4].copy_from_slice(&end_rel.to_le_bytes());
-            let start_rel = abort_pos as i32 - (start_abort_patch as i32 + 4);
-            code[start_abort_patch..start_abort_patch + 4].copy_from_slice(&start_rel.to_le_bytes());
-            code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x3C, 0x00, 0x00, 0x00]);
-            code.extend_from_slice(&[0x48, 0xC7, 0xC7, 0x01, 0x00, 0x00, 0x00]);
-            code.extend_from_slice(&[0x0F, 0x05]);
-            // .ok:
-            let ok_pos = code.len();
-            let ok_rel = ok_pos as i32 - (ok_jmp_patch as i32 + 4);
-            code[ok_jmp_patch..ok_jmp_patch + 4].copy_from_slice(&ok_rel.to_le_bytes());
+            // mov rsi, rax ; mov rcx, rdx (rax/rdx → rsi/rcx)
+            code.extend_from_slice(&[0x48, 0x89, 0xC6]);
+            code.extend_from_slice(&[0x48, 0x89, 0xD1]);
             Ok(())
         }
         other => Err(NativeError {
@@ -8767,76 +8765,22 @@ fn emit_starts_with_load_text(
         // factors emit_substring_to_rax_rdx as a shared helper, both
         // call sites can converge on it.
         Expr::Substring(text, start_expr, end_expr) => {
-            // (1) Load text inner via the same shape dispatch as the
-            // load_text function we're already inside — emit_starts_with_load_text
-            // already produces (rsi=ptr, rcx=len) for literal/field/BoundText/Call.
-            // The trick: recurse on the text inner here (NOT on the Substring),
-            // ending with (rsi, rcx) holding the text's (ptr, len).
+            // Load text inner via this same loader (rsi/rcx convention),
+            // adapt to (rax, rdx) for the shared helper, then back to
+            // (rsi, rcx) for the byte-prim's cmpsb downstream.
             emit_starts_with_load_text(
                 code, text, input_name, offsets, all_rules, field_ranges, text_bindings,
             )?;
-            // (2) push rsi ; push rcx — save (text_ptr at [rsp+16], text_len at [rsp+8] after push end)
-            code.push(0x56); // push rsi (text_ptr)
-            code.push(0x51); // push rcx (text_len)
-            // (3) Evaluate end → rax
-            emit_eval_expr(
-                code, end_expr, input_name, offsets, all_rules, field_ranges, text_bindings,
-            )?;
-            // (4) push rax (end at [rsp])
-            code.push(0x50);
-            // (5) Bounds: end > text_len → abort.
-            //    mov rcx, [rsp+8]  ; rcx = text_len
-            code.extend_from_slice(&[0x48, 0x8B, 0x4C, 0x24, 0x08]);
-            //    cmp rax, rcx
-            code.extend_from_slice(&[0x48, 0x39, 0xC8]);
-            //    ja .abort (rel32)
-            code.push(0x0F); code.push(0x87);
-            let end_abort_patch = code.len();
-            code.extend_from_slice(&[0; 4]);
-            // (6) Evaluate start → rax
-            emit_eval_expr(
-                code, start_expr, input_name, offsets, all_rules, field_ranges, text_bindings,
-            )?;
-            // (7) Bounds: start > end → abort.
-            //    mov rcx, [rsp]    ; rcx = end
-            code.extend_from_slice(&[0x48, 0x8B, 0x0C, 0x24]);
-            //    cmp rax, rcx
-            code.extend_from_slice(&[0x48, 0x39, 0xC8]);
-            code.push(0x0F); code.push(0x87);
-            let start_abort_patch = code.len();
-            code.extend_from_slice(&[0; 4]);
-            // (8) slice_len = end - start = rcx - rax; slice_ptr = text_ptr + start
-            //    mov rdx, rcx       ; rdx = end
+            // mov rax, rsi ; mov rdx, rcx
+            code.extend_from_slice(&[0x48, 0x89, 0xF0]);
             code.extend_from_slice(&[0x48, 0x89, 0xCA]);
-            //    sub rdx, rax       ; rdx = end - start = slice_len
-            code.extend_from_slice(&[0x48, 0x29, 0xC2]);
-            //    mov rcx, [rsp+16]  ; rcx = text_ptr
-            code.extend_from_slice(&[0x48, 0x8B, 0x4C, 0x24, 0x10]);
-            //    add rcx, rax       ; rcx = text_ptr + start = slice_ptr
-            code.extend_from_slice(&[0x48, 0x01, 0xC1]);
-            // (9) Adapt to byte-prim convention: rsi = slice_ptr, rcx = slice_len
-            //    mov rsi, rcx
-            code.extend_from_slice(&[0x48, 0x89, 0xCE]);
-            //    mov rcx, rdx
+            emit_substring_bounds_and_slice(
+                code, start_expr, end_expr,
+                input_name, offsets, all_rules, field_ranges, text_bindings,
+            )?;
+            // mov rsi, rax ; mov rcx, rdx
+            code.extend_from_slice(&[0x48, 0x89, 0xC6]);
             code.extend_from_slice(&[0x48, 0x89, 0xD1]);
-            // (10) add rsp, 24 ; jmp .ok
-            code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x18]);
-            code.push(0xE9);
-            let ok_jmp_patch = code.len();
-            code.extend_from_slice(&[0; 4]);
-            // .abort: sys_exit(1)
-            let abort_pos = code.len();
-            let end_rel = abort_pos as i32 - (end_abort_patch as i32 + 4);
-            code[end_abort_patch..end_abort_patch + 4].copy_from_slice(&end_rel.to_le_bytes());
-            let start_rel = abort_pos as i32 - (start_abort_patch as i32 + 4);
-            code[start_abort_patch..start_abort_patch + 4].copy_from_slice(&start_rel.to_le_bytes());
-            code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x3C, 0x00, 0x00, 0x00]);
-            code.extend_from_slice(&[0x48, 0xC7, 0xC7, 0x01, 0x00, 0x00, 0x00]);
-            code.extend_from_slice(&[0x0F, 0x05]);
-            // .ok:
-            let ok_pos = code.len();
-            let ok_rel = ok_pos as i32 - (ok_jmp_patch as i32 + 4);
-            code[ok_jmp_patch..ok_jmp_patch + 4].copy_from_slice(&ok_rel.to_le_bytes());
             Ok(())
         }
         _ => Err(NativeError {
@@ -9280,15 +9224,11 @@ fn emit_parse_int(
         // slice 2c and json_escape slice 2d — duplicated here for
         // the same reason (no shared helper yet).
         Expr::Substring(text, start_expr, end_expr) => {
-            // (1) Load text inner into (rsi, rcx) via the same shape
-            // dispatch parse_int already supports for its top-level
-            // inner. Easiest: recurse parse_int's loader logic by
-            // delegating to a wrapper that ONLY does the load — but
-            // parse_int doesn't have a load-only entry point. Instead,
-            // we inline the load shapes directly (text input field,
-            // BoundText). Concat / Call / nested substring as the
-            // text inner of substring-inside-parse_int are refused
-            // here (would need a buffer); user must restructure.
+            // Inline-load the text inner (parse_int restricts to text
+            // input field or BoundText — no Call recursion via the
+            // load function exists for parse_int). Produces (rsi, rcx).
+            // Then adapt to (rax, rdx), call helper, adapt back to
+            // (rsi, rcx) — parse_int's scan loop downstream reads (rsi, rcx).
             match text.as_ref() {
                 Expr::Read(name) | Expr::Ident(name) | Expr::Fetch(name, _)
                     if text_bindings.contains_key(name.as_str()) =>
@@ -9338,59 +9278,17 @@ fn emit_parse_int(
                     });
                 }
             }
-            // (2) push rsi ; push rcx — save text (ptr at [rsp+16], len at [rsp+8] after push end)
-            code.push(0x56);
-            code.push(0x51);
-            // (3) Evaluate end → rax
-            emit_eval_expr(
-                code, end_expr, input_name, offsets, all_rules, field_ranges, text_bindings,
+            // Adapt (rsi, rcx) → (rax, rdx) for the helper.
+            code.extend_from_slice(&[0x48, 0x89, 0xF0]); // mov rax, rsi
+            code.extend_from_slice(&[0x48, 0x89, 0xCA]); // mov rdx, rcx
+            emit_substring_bounds_and_slice(
+                code, start_expr, end_expr,
+                input_name, offsets, all_rules, field_ranges, text_bindings,
             )?;
-            // (4) push rax
-            code.push(0x50);
-            // (5) cmp end, text_len ; ja .abort
-            code.extend_from_slice(&[0x48, 0x8B, 0x4C, 0x24, 0x08]);
-            code.extend_from_slice(&[0x48, 0x39, 0xC8]);
-            code.push(0x0F); code.push(0x87);
-            let end_abort_patch = code.len();
-            code.extend_from_slice(&[0; 4]);
-            // (6) Evaluate start → rax
-            emit_eval_expr(
-                code, start_expr, input_name, offsets, all_rules, field_ranges, text_bindings,
-            )?;
-            // (7) cmp start, end ; ja .abort
-            code.extend_from_slice(&[0x48, 0x8B, 0x0C, 0x24]);
-            code.extend_from_slice(&[0x48, 0x39, 0xC8]);
-            code.push(0x0F); code.push(0x87);
-            let start_abort_patch = code.len();
-            code.extend_from_slice(&[0; 4]);
-            // (8) slice_len = end - start, slice_ptr = text_ptr + start
-            code.extend_from_slice(&[0x48, 0x89, 0xCA]);              // mov rdx, rcx (end)
-            code.extend_from_slice(&[0x48, 0x29, 0xC2]);              // sub rdx, rax (slice_len)
-            code.extend_from_slice(&[0x48, 0x8B, 0x4C, 0x24, 0x10]);  // mov rcx, [rsp+16] (text_ptr)
-            code.extend_from_slice(&[0x48, 0x01, 0xC1]);              // add rcx, rax (slice_ptr)
-            // (9) parse_int convention: rsi = slice_ptr, rcx = slice_len
-            code.extend_from_slice(&[0x48, 0x89, 0xCE]);              // mov rsi, rcx
-            code.extend_from_slice(&[0x48, 0x89, 0xD1]);              // mov rcx, rdx
-            // (10) add rsp, 24 ; jmp .ok
-            code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x18]);
-            code.push(0xE9);
-            let ok_jmp_patch = code.len();
-            code.extend_from_slice(&[0; 4]);
-            // .abort: sys_exit(1)
-            let abort_pos = code.len();
-            let end_rel = abort_pos as i32 - (end_abort_patch as i32 + 4);
-            code[end_abort_patch..end_abort_patch + 4].copy_from_slice(&end_rel.to_le_bytes());
-            let start_rel = abort_pos as i32 - (start_abort_patch as i32 + 4);
-            code[start_abort_patch..start_abort_patch + 4].copy_from_slice(&start_rel.to_le_bytes());
-            code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x3C, 0x00, 0x00, 0x00]);
-            code.extend_from_slice(&[0x48, 0xC7, 0xC7, 0x01, 0x00, 0x00, 0x00]);
-            code.extend_from_slice(&[0x0F, 0x05]);
-            // .ok:
-            let ok_pos = code.len();
-            let ok_rel = ok_pos as i32 - (ok_jmp_patch as i32 + 4);
-            code[ok_jmp_patch..ok_jmp_patch + 4].copy_from_slice(&ok_rel.to_le_bytes());
-            // Fall through to parse_int's scan loop (step 3+ of the
-            // outer function) which reads (rsi, rcx) and produces rax.
+            // Adapt back: (rax, rdx) → (rsi, rcx). parse_int's scan
+            // loop below reads (rsi, rcx).
+            code.extend_from_slice(&[0x48, 0x89, 0xC6]); // mov rsi, rax
+            code.extend_from_slice(&[0x48, 0x89, 0xD1]); // mov rcx, rdx
         }
         _ => {
             return Err(NativeError {
