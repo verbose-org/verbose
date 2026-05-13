@@ -78,6 +78,8 @@ fn count_nodes(expr: &Expr) -> usize {
         // `min(a, b)` / `max(a, b)` — same shape as Binary: count this node
         // + recurse into both children.
         Expr::Min(l, r) | Expr::Max(l, r) => 1 + count_nodes(l) + count_nodes(r),
+        // `substring(text, start, end)` — three children, all expressions.
+        Expr::Substring(t, s, e) => 1 + count_nodes(t) + count_nodes(s) + count_nodes(e),
     }
 }
 
@@ -408,6 +410,12 @@ fn substitute_ident(expr: &Expr, name: &str, replacement: &Expr) -> Expr {
             Box::new(substitute_ident(l, name, replacement)),
             Box::new(substitute_ident(r, name, replacement)),
         ),
+        // `substring(text, start, end)` — substitute through all three children.
+        Expr::Substring(t, s, e) => Expr::Substring(
+            Box::new(substitute_ident(t, name, replacement)),
+            Box::new(substitute_ident(s, name, replacement)),
+            Box::new(substitute_ident(e, name, replacement)),
+        ),
     }
 }
 
@@ -736,6 +744,29 @@ pub fn optimize_expr(
                 return Expr::Number((*a).max(*b));
             }
             Expr::Max(Box::new(l_opt), Box::new(r_opt))
+        }
+        // `substring(text, start, end)` — recurse into all three children.
+        // Compile-time fold when every child has collapsed to a literal
+        // and the bounds are valid; otherwise rebuild and let the backend
+        // lower at runtime. Out-of-range literal bounds keep the wrapper
+        // so the runtime path can fail-closed (sys_exit(1) in native).
+        Expr::Substring(t, s, e) => {
+            let t_opt = optimize_expr(t, input_name, field_ranges);
+            let s_opt = optimize_expr(s, input_name, field_ranges);
+            let e_opt = optimize_expr(e, input_name, field_ranges);
+            if let (Expr::Text(text), Expr::Number(start), Expr::Number(end)) =
+                (&t_opt, &s_opt, &e_opt)
+            {
+                let bytes = text.as_bytes();
+                let len = bytes.len() as i64;
+                if *start >= 0 && *end >= 0 && *end <= len && *start <= *end {
+                    let slice = &bytes[*start as usize..*end as usize];
+                    if let Ok(s) = std::str::from_utf8(slice) {
+                        return Expr::Text(s.to_string());
+                    }
+                }
+            }
+            Expr::Substring(Box::new(t_opt), Box::new(s_opt), Box::new(e_opt))
         }
     }
 }

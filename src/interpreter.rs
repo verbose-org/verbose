@@ -668,6 +668,50 @@ fn eval_expr(
                 }),
             }
         }
+        // `substring(<text>, <start>, <end>)` — byte-slice of inner text
+        // over the half-open range [start, end). Bounds are enforced
+        // fail-closed (same posture as the native abort path): end must
+        // be <= length(text) and start must be <= end. Negative offsets
+        // and out-of-range values produce a RuntimeError (mirrors what
+        // native lowers to sys_exit(1)).
+        Expr::Substring(text, start, end) => {
+            let t = eval_expr(text, env, all_rules)?;
+            let s = eval_expr(start, env, all_rules)?;
+            let e = eval_expr(end, env, all_rules)?;
+            match (t, s, e) {
+                (Value::Text(text_val), Value::Number(start_n), Value::Number(end_n)) => {
+                    let bytes = text_val.as_bytes();
+                    let len = bytes.len() as i64;
+                    if start_n < 0 || end_n < 0 || end_n > len || start_n > end_n {
+                        return Err(RuntimeError {
+                            message: format!(
+                                "substring bounds out of range: start={}, end={}, length={}",
+                                start_n, end_n, len
+                            ),
+                        });
+                    }
+                    let slice = &bytes[start_n as usize..end_n as usize];
+                    match std::str::from_utf8(slice) {
+                        Ok(s) => Ok(Value::Text(s.to_string())),
+                        Err(_) => {
+                            // Native treats the buffer as raw bytes; for the
+                            // interpreter's Value::Text (which is a Rust String)
+                            // we fall back to a lossy conversion. The native
+                            // path doesn't reject non-UTF-8 slices either, so
+                            // this preserves cross-backend agreement on valid
+                            // ASCII input (the common case).
+                            Ok(Value::Text(String::from_utf8_lossy(slice).into_owned()))
+                        }
+                    }
+                }
+                (t, s, e) => Err(RuntimeError {
+                    message: format!(
+                        "substring requires (text, number, number), got ({}, {}, {})",
+                        t, s, e
+                    ),
+                }),
+            }
+        }
     }
 }
 

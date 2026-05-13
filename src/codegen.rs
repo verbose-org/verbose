@@ -223,8 +223,9 @@ fn emit_expr(expr: &Expr, input_name: &str, concept: Option<&Concept>) -> String
         | Expr::Length(_)
         | Expr::Abs(_)
         | Expr::Min(_, _)
-        | Expr::Max(_, _) => {
-            "(/* collection/result/record/concat/read/fetch/json_escape/parse_int/now_unix/starts_with/contains/ends_with/length/abs/min/max op: use --run interpreter or --native */false)".to_string()
+        | Expr::Max(_, _)
+        | Expr::Substring(_, _, _) => {
+            "(/* collection/result/record/concat/read/fetch/json_escape/parse_int/now_unix/starts_with/contains/ends_with/length/abs/min/max/substring op: use --run interpreter or --native */false)".to_string()
         }
         Expr::Call(name, _args) => {
             if let Some(c) = concept {

@@ -483,6 +483,12 @@ fn let_rhs_is_text(
         Expr::NowUnix => false,
         // `abs(<number>)` returns number — same number-let path as ParseInt.
         Expr::Abs(_) => false,
+        // `substring(text, start, end)` returns text by construction.
+        // Same classifier shape as JsonEscape: the let lands in the
+        // Phase 2I text-let path (two slots, BoundText resolution at
+        // use sites), and emit_text_produce_ptrlen's Substring arm
+        // produces the slice (ptr, len).
+        Expr::Substring(_, _, _) => true,
         _ => false,
     }
 }
@@ -583,6 +589,14 @@ fn collect_read_names_native(expr: &Expr, out: &mut Vec<String>) {
             collect_read_names_native(l, out);
             collect_read_names_native(r, out);
         }
+        // `substring(text, start, end)` — recurse into all three children;
+        // any child may carry a `read(...)` reference (e.g. the source text
+        // is `read(buf)`).
+        Expr::Substring(t, s, e) => {
+            collect_read_names_native(t, out);
+            collect_read_names_native(s, out);
+            collect_read_names_native(e, out);
+        }
     }
 }
 
@@ -619,6 +633,9 @@ fn expr_uses_now_unix(e: &Expr) -> bool {
         Expr::Contains(h, n) => expr_uses_now_unix(h) || expr_uses_now_unix(n),
         Expr::EndsWith(h, n) => expr_uses_now_unix(h) || expr_uses_now_unix(n),
         Expr::Min(l, r) | Expr::Max(l, r) => expr_uses_now_unix(l) || expr_uses_now_unix(r),
+        Expr::Substring(t, s, e) => {
+            expr_uses_now_unix(t) || expr_uses_now_unix(s) || expr_uses_now_unix(e)
+        }
     }
 }
 
@@ -696,6 +713,11 @@ fn count_match_result_max_depth(expr: &Expr) -> usize {
         Expr::Min(a, b) | Expr::Max(a, b) | Expr::StartsWith(a, b)
         | Expr::EndsWith(a, b) | Expr::Contains(a, b) => {
             count_match_result_max_depth(a).max(count_match_result_max_depth(b))
+        }
+        Expr::Substring(t, s, e) => {
+            count_match_result_max_depth(t)
+                .max(count_match_result_max_depth(s))
+                .max(count_match_result_max_depth(e))
         }
         Expr::Call(_, args) | Expr::Concat(args) => {
             args.iter().map(count_match_result_max_depth).max().unwrap_or(0)
@@ -783,6 +805,11 @@ fn expr_uses_field(e: &Expr, input_name: &str, field_name: &str) -> bool {
         Expr::Min(l, r) | Expr::Max(l, r) => {
             expr_uses_field(l, input_name, field_name)
                 || expr_uses_field(r, input_name, field_name)
+        }
+        Expr::Substring(t, s, e) => {
+            expr_uses_field(t, input_name, field_name)
+                || expr_uses_field(s, input_name, field_name)
+                || expr_uses_field(e, input_name, field_name)
         }
     }
 }
@@ -928,6 +955,11 @@ fn gather_transitive_callee_reads(
         | Expr::Filter(coll, _, body) => {
             gather_transitive_callee_reads(coll, all_rules, visited, out);
             gather_transitive_callee_reads(body, all_rules, visited, out);
+        }
+        Expr::Substring(t, s, e) => {
+            gather_transitive_callee_reads(t, all_rules, visited, out);
+            gather_transitive_callee_reads(s, all_rules, visited, out);
+            gather_transitive_callee_reads(e, all_rules, visited, out);
         }
         Expr::Number(_) | Expr::Text(_) | Expr::Field(_, _) | Expr::Ident(_)
         | Expr::Read(_) | Expr::NowUnix => {}
@@ -1085,6 +1117,12 @@ fn collect_fetch_names_native(expr: &Expr, out: &mut Vec<String>) {
         Expr::Min(l, r) | Expr::Max(l, r) => {
             collect_fetch_names_native(l, out);
             collect_fetch_names_native(r, out);
+        }
+        // `substring(text, start, end)` — recurse into all three children.
+        Expr::Substring(t, s, e) => {
+            collect_fetch_names_native(t, out);
+            collect_fetch_names_native(s, out);
+            collect_fetch_names_native(e, out);
         }
     }
 }
@@ -1362,6 +1400,10 @@ fn emit_connection_fetch_sequence(
             Expr::Min(l, r) | Expr::Max(l, r) => {
                 first_fetch_for(l, name).or_else(|| first_fetch_for(r, name))
             }
+            // `substring(text, start, end)` — recurse into all three children.
+            Expr::Substring(t, s, e) => first_fetch_for(t, name)
+                .or_else(|| first_fetch_for(s, name))
+                .or_else(|| first_fetch_for(e, name)),
         }
     }
     let request_expr: &Expr = {
@@ -2780,9 +2822,18 @@ fn emit_text_produce_ptrlen(
             let offset = offsets[field_name.as_str()];
             // mov rax, [rbp + offset]  (ptr)
             load_rax_from_rbp(code, offset);
-            // mov rsi, rax ; emit_strlen -> rdx = len
+            // mov rsi, rax              (rsi = text_ptr, survives emit_strlen)
             code.extend_from_slice(&[0x48, 0x89, 0xC6]);
+            // emit_strlen reads rsi, writes rdx, CLOBBERS rax (xor eax, eax).
+            // Caller's convention is (rax = ptr, rdx = len), so restore rax
+            // from rsi after the scan. This was a latent bug on the path —
+            // no existing test exercised a bare-Field text-let RHS, so the
+            // rax = 0 from xor leaked silently. substring(<text-field>, …)
+            // is the first caller that pushes rax to the stack as the
+            // saved text_ptr, which surfaced the issue.
             emit_strlen(code);
+            // mov rax, rsi              (rax = text_ptr again)
+            code.extend_from_slice(&[0x48, 0x89, 0xF0]);
             Ok(())
         }
         Expr::Ident(name) if text_bindings.contains_key(name.as_str()) => {
@@ -2839,6 +2890,112 @@ fn emit_text_produce_ptrlen(
                 text_bindings,
                 /* is_nested= */ true,
             )?;
+            Ok(())
+        }
+        // `substring(<text>, <start>, <end>)` produces text by slicing
+        // the inner buffer (ptr, len) at byte offsets [start, end).
+        // No allocation: the result is (text_ptr + start, end - start)
+        // — a pointer into the same buffer as the input.
+        //
+        // Algorithm:
+        //   1. emit_text_produce_ptrlen(text)       ; (rax=ptr, rdx=len)
+        //   2. push rax ; push rdx                  ; save text (ptr, len)
+        //   3. emit_eval_expr(end) → rax            ; end value
+        //   4. push rax                             ; save end
+        //   5. cmp end, text_len ; ja .abort        ; fail-closed bounds
+        //   6. emit_eval_expr(start) → rax          ; start value
+        //   7. cmp start, end ; ja .abort           ; fail-closed range
+        //   8. compute slice_ptr = text_ptr + start
+        //                slice_len = end - start
+        //   9. add rsp, 24                          ; free 3 saved
+        //  10. jmp .ok
+        //  .abort:  mov rax, 60 ; mov rdi, 1 ; syscall   (sys_exit 1)
+        //  .ok:     result in (rax = slice_ptr, rdx = slice_len)
+        //
+        // The abort path is inlined per substring call (12 bytes) rather
+        // than routed through the shared abort tail; this keeps
+        // emit_text_produce_ptrlen's signature unchanged. Cost ≈ +80
+        // bytes per substring call. Auditable on the binary side: every
+        // substring call is a self-contained block with a visible
+        // sys_exit(1) tail.
+        //
+        // The push/pop sequence is rsp-balanced: emit_eval_expr is
+        // contractually rsp-neutral (each push has a matching pop before
+        // return), so the literal offsets [rsp], [rsp+8], [rsp+16] keep
+        // pointing at our saved values across the recursive emits.
+        Expr::Substring(text, start_expr, end_expr) => {
+            // (1) Load (rax = ptr, rdx = len) for `text`.
+            emit_text_produce_ptrlen(
+                code, text, input_name, concept, all_rules,
+                offsets, field_ranges, text_bindings,
+            )?;
+            // (2) push rax ; push rdx
+            code.push(0x50); // push rax (text_ptr at [rsp+16] after push end)
+            code.push(0x52); // push rdx (text_len at [rsp+8] after push end)
+            // (3) Evaluate end → rax.
+            emit_eval_expr(
+                code, end_expr, input_name, offsets, all_rules, field_ranges, text_bindings,
+            )?;
+            // (4) push rax (end at [rsp])
+            code.push(0x50);
+            // (5) Bounds check: end > text_len → abort.
+            //    mov rcx, [rsp+8]   ; rcx = text_len
+            code.extend_from_slice(&[0x48, 0x8B, 0x4C, 0x24, 0x08]);
+            //    cmp rax, rcx       ; cmp end, text_len
+            code.extend_from_slice(&[0x48, 0x39, 0xC8]);
+            //    ja .abort (rel32 placeholder, patched after we know the offset)
+            code.push(0x0F); code.push(0x87);
+            let end_abort_patch = code.len();
+            code.extend_from_slice(&[0; 4]);
+            // (6) Evaluate start → rax.
+            emit_eval_expr(
+                code, start_expr, input_name, offsets, all_rules, field_ranges, text_bindings,
+            )?;
+            // (7) Bounds check: start > end → abort.
+            //    mov rcx, [rsp]     ; rcx = end
+            code.extend_from_slice(&[0x48, 0x8B, 0x0C, 0x24]);
+            //    cmp rax, rcx       ; cmp start, end
+            code.extend_from_slice(&[0x48, 0x39, 0xC8]);
+            //    ja .abort
+            code.push(0x0F); code.push(0x87);
+            let start_abort_patch = code.len();
+            code.extend_from_slice(&[0; 4]);
+            // (8) Compute slice:
+            //    mov rdx, rcx       ; rdx = end
+            code.extend_from_slice(&[0x48, 0x89, 0xCA]);
+            //    sub rdx, rax       ; rdx = end - start = slice_len
+            code.extend_from_slice(&[0x48, 0x29, 0xC2]);
+            //    mov rcx, [rsp+16]  ; rcx = text_ptr
+            code.extend_from_slice(&[0x48, 0x8B, 0x4C, 0x24, 0x10]);
+            //    add rcx, rax       ; rcx = text_ptr + start = slice_ptr
+            code.extend_from_slice(&[0x48, 0x01, 0xC1]);
+            //    mov rax, rcx       ; rax = slice_ptr
+            code.extend_from_slice(&[0x48, 0x89, 0xC8]);
+            // (9) add rsp, 24       ; free saved (text_ptr, text_len, end)
+            code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x18]);
+            // (10) jmp .ok
+            code.push(0xE9);
+            let ok_jmp_patch = code.len();
+            code.extend_from_slice(&[0; 4]);
+            // .abort: mov rax, 60 ; mov rdi, 1 ; syscall
+            let abort_pos = code.len();
+            code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x3C, 0x00, 0x00, 0x00]);
+            code.extend_from_slice(&[0x48, 0xC7, 0xC7, 0x01, 0x00, 0x00, 0x00]);
+            code.extend_from_slice(&[0x0F, 0x05]);
+            // Patch the two `ja .abort` rel32 to point at abort_pos.
+            let end_rel = abort_pos as i32 - (end_abort_patch as i32 + 4);
+            code[end_abort_patch..end_abort_patch + 4]
+                .copy_from_slice(&end_rel.to_le_bytes());
+            let start_rel = abort_pos as i32 - (start_abort_patch as i32 + 4);
+            code[start_abort_patch..start_abort_patch + 4]
+                .copy_from_slice(&start_rel.to_le_bytes());
+            // .ok:
+            let ok_pos = code.len();
+            let ok_rel = ok_pos as i32 - (ok_jmp_patch as i32 + 4);
+            code[ok_jmp_patch..ok_jmp_patch + 4]
+                .copy_from_slice(&ok_rel.to_le_bytes());
+            // Result: (rax = slice_ptr, rdx = slice_len). rsp restored
+            // by `add rsp, 24` above; the .abort path never returns.
             Ok(())
         }
         other => Err(NativeError {
@@ -7206,6 +7363,16 @@ fn max_stack_depth(expr: &Expr) -> usize {
             let right_depth = max_stack_depth(r);
             left_depth.max(right_depth)
         }
+        // `substring(text, start, end)` — the slice operation itself uses
+        // fixed registers (the text source is materialised as a (ptr, len)
+        // pair, then bounded by start/end values that live in rbp slots).
+        // No eval-stack pushes beyond what the children's individual
+        // depths already require.
+        Expr::Substring(t, s, e) => {
+            max_stack_depth(t)
+                .max(max_stack_depth(s))
+                .max(max_stack_depth(e))
+        }
     }
 }
 
@@ -7964,6 +8131,15 @@ fn emit_eval_expr(
             }
             Ok(())
         }
+        // `substring(<text>, <start>, <end>)` produces text (a (ptr, len)
+        // pair), not a scalar. It cannot be evaluated through this scalar
+        // dispatcher; the text-producing path lives in
+        // `emit_text_produce_ptrlen`. Refuse here with a clear breadcrumb —
+        // the wire-up of substring as a text expression in let-RHS / concat
+        // arg / record field positions is the next slice's responsibility.
+        Expr::Substring(_, _, _) => Err(NativeError {
+            message: "substring not yet supported in this context — only as RHS of a text-typed let binding in Phase 2I; coming in slice 1".into(),
+        }),
     }
 }
 
@@ -10736,6 +10912,7 @@ fn expr_kind(e: &Expr) -> &'static str {
         Expr::Abs(_) => "Abs",
         Expr::Min(_, _) => "Min",
         Expr::Max(_, _) => "Max",
+        Expr::Substring(_, _, _) => "Substring",
     }
 }
 
@@ -16638,6 +16815,163 @@ rule bad
             "error should explain why concat-body callee is refused: {}",
             msg
         );
+    }
+
+    /// `substring(<text>, <start>, <end>)` slice 1 (2026-05-13): the
+    /// missing tokenizer primitive — half-open slice by byte offset,
+    /// returns text. No allocation: the result is `(text_ptr + start,
+    /// end - start)`, a pointer into the same buffer as the input.
+    ///
+    /// Self-hosting target depends on this — without `substring` you
+    /// can't extract a literal out of a source buffer in a tokenizer.
+    ///
+    /// Slice 1 wires substring only as the RHS of a text-typed `let`
+    /// binding (Phase 2I shape); use as a direct arg to length /
+    /// concat / etc. is slice 2's responsibility (deferred to keep
+    /// this slice bounded).
+    ///
+    /// This test pins:
+    ///   (a) Happy path: substring("hello", 0, 3) → "hel"
+    ///   (b) Mid slice: substring("abcdef", 2, 5) → "cde"
+    ///   (c) Exact end (end == len): substring("abcde", 2, 5) → "cde"
+    ///   (d) Empty slice (start == end): substring("hello", 2, 2) → ""
+    ///   (e) Fail-closed: end > length → sys_exit(1)
+    ///   (f) Fail-closed: start > end → sys_exit(1)
+    ///   (g) Surfaces & fixes a latent bug in emit_text_produce_ptrlen's
+    ///       Field arm where rax was clobbered by emit_strlen's
+    ///       `xor eax, eax` — no prior test exercised a bare-Field
+    ///       text-let RHS, so the rax = 0 leaked silently. substring
+    ///       pushes rax to the stack as saved text_ptr, surfacing the
+    ///       issue. The fix saves text_ptr in rsi (survives emit_strlen)
+    ///       and restores rax = rsi after the scan.
+    #[test]
+    fn slice_substring_via_text_let_runtime() {
+        use std::process::Command;
+
+        // (a–c) Happy paths through a text-let RHS.
+        let src = r#"@verbose 0.1.0
+
+concept O
+  @intention: "x"
+  @source: invoices.intent:1
+  fields:
+    source : text
+
+rule head3
+  @intention: "first 3 bytes"
+  @source: invoices.intent:1
+  input:
+    o : O
+  output:
+    s : text
+  logic:
+    let slice = substring(o.source, 0, 3)
+    s = slice
+  proofs:
+    purity:
+      reads : [o.source]
+      calls : []
+    termination:
+      bound : 2
+
+rule mid
+  @intention: "bytes 2..5"
+  @source: invoices.intent:1
+  input:
+    o : O
+  output:
+    s : text
+  logic:
+    let slice = substring(o.source, 2, 5)
+    s = slice
+  proofs:
+    purity:
+      reads : [o.source]
+      calls : []
+    termination:
+      bound : 2
+
+rule empty_slice
+  @intention: "empty slice when start == end"
+  @source: invoices.intent:1
+  input:
+    o : O
+  output:
+    s : text
+  logic:
+    let slice = substring(o.source, 2, 2)
+    s = slice
+  proofs:
+    purity:
+      reads : [o.source]
+      calls : []
+    termination:
+      bound : 2
+"#;
+        let tokens = crate::lexer::Lexer::new(src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+
+        let run = |rule: &str, arg: &str| -> (i32, String) {
+            let bin = std::env::temp_dir().join(format!("verbosec_test_substring_{}", rule));
+            compile_native(&program, rule, bin.to_str().unwrap(), false, false)
+                .expect("compile");
+            let r = Command::new(&bin).args([arg]).output().expect("spawn");
+            let code = r.status.code().unwrap_or(-1);
+            let stdout = String::from_utf8_lossy(&r.stdout).trim_end_matches('\n').to_string();
+            let _ = std::fs::remove_file(&bin);
+            (code, stdout)
+        };
+
+        // (a) substring("hello", 0, 3) → "hel"
+        assert_eq!(run("head3", "hello"), (0, "hel".into()));
+        // First-three bytes of any longer string.
+        assert_eq!(run("head3", "abcdef"), (0, "abc".into()));
+        // (b) Mid slice.
+        assert_eq!(run("mid", "abcdef"), (0, "cde".into()));
+        assert_eq!(run("mid", "helloworld"), (0, "llo".into()));
+        // (c) Exact-end (end == length) — empty trailing range OK.
+        assert_eq!(run("mid", "abcde"), (0, "cde".into()));
+        // (d) Empty slice produces empty output.
+        assert_eq!(run("empty_slice", "hello"), (0, "".into()));
+
+        // (e) Fail-closed: end > length(text).
+        assert_eq!(run("head3", "ab").0, 1, "end=3 > len=2 must abort");
+        assert_eq!(run("mid", "abc").0, 1, "end=5 > len=3 must abort");
+
+        // (f) Fail-closed: start > end. Build a rule whose start > end.
+        let src_inverted = r#"@verbose 0.1.0
+
+concept O
+  @intention: "x"
+  @source: invoices.intent:1
+  fields:
+    source : text
+
+rule bad_range
+  @intention: "start > end"
+  @source: invoices.intent:1
+  input:
+    o : O
+  output:
+    s : text
+  logic:
+    let slice = substring(o.source, 3, 1)
+    s = slice
+  proofs:
+    purity:
+      reads : [o.source]
+      calls : []
+    termination:
+      bound : 2
+"#;
+        let tokens = crate::lexer::Lexer::new(src_inverted).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+        let bin = std::env::temp_dir().join("verbosec_test_substring_bad_range");
+        compile_native(&program, "bad_range", bin.to_str().unwrap(), false, false)
+            .expect("compile");
+        let r = Command::new(&bin).args(["hello"]).output().expect("spawn");
+        assert_eq!(r.status.code(), Some(1), "start=3 > end=1 must abort");
+        let _ = std::fs::remove_file(&bin);
     }
 
     /// Phase 9 slice 9.5e (2026-04-28): `read(<resource>)` inside the
