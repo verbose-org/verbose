@@ -3155,7 +3155,7 @@ fn emit_concat_fill(
                 // JSON-significant ones, which expand to two-byte escape
                 // sequences.
                 let inner = match arg { Expr::JsonEscape(i) => i.as_ref(), _ => unreachable!() };
-                emit_json_escape_load_src(code, inner, input_name, offsets, all_rules, text_bindings)?;
+                emit_json_escape_load_src(code, inner, input_name, offsets, all_rules, field_ranges, text_bindings)?;
                 emit_json_escape_fill_loop(code);
             }
         }
@@ -3208,6 +3208,7 @@ fn emit_json_escape_load_src(
     input_name: &str,
     offsets: &HashMap<&str, i32>,
     all_rules: &HashMap<&str, &Rule>,
+    field_ranges: &HashMap<&str, (i64, i64)>,
     text_bindings: &TextBindings<'_>,
 ) -> Result<(), NativeError> {
     match inner {
@@ -3320,8 +3321,76 @@ fn emit_json_escape_load_src(
                 input_name,
                 offsets,
                 all_rules,
+                field_ranges,
                 text_bindings,
             )
+        }
+        // substring(text, start, end) as a json_escape inner —
+        // same shape as the byte-prim slice 2c: inline the substring
+        // emit and produce (rsi=slice_ptr, rcx=slice_len), which is
+        // the convention the json_escape fill loop expects.
+        // Duplicates the emit_text_produce_ptrlen's Substring arm
+        // logic (kept in sync until a future cleanup factors a
+        // shared emit_substring_to_rax_rdx helper).
+        Expr::Substring(text, start_expr, end_expr) => {
+            // (1) Load text inner via this same loader (recurse) so the
+            // text resolves to (rsi=ptr, rcx=len) under the same shape
+            // constraints (literal / field-of-input / BoundText / Call).
+            emit_json_escape_load_src(
+                code, text, input_name, offsets, all_rules, field_ranges, text_bindings,
+            )?;
+            // (2) push rsi ; push rcx — save text (ptr at [rsp+16], len at [rsp+8] after push end)
+            code.push(0x56);
+            code.push(0x51);
+            // (3) Evaluate end → rax
+            emit_eval_expr(
+                code, end_expr, input_name, offsets, all_rules, field_ranges, text_bindings,
+            )?;
+            // (4) push rax (end at [rsp])
+            code.push(0x50);
+            // (5) cmp end, text_len ; ja .abort
+            code.extend_from_slice(&[0x48, 0x8B, 0x4C, 0x24, 0x08]); // mov rcx, [rsp+8]
+            code.extend_from_slice(&[0x48, 0x39, 0xC8]);              // cmp rax, rcx
+            code.push(0x0F); code.push(0x87);
+            let end_abort_patch = code.len();
+            code.extend_from_slice(&[0; 4]);
+            // (6) Evaluate start → rax
+            emit_eval_expr(
+                code, start_expr, input_name, offsets, all_rules, field_ranges, text_bindings,
+            )?;
+            // (7) cmp start, end ; ja .abort
+            code.extend_from_slice(&[0x48, 0x8B, 0x0C, 0x24]); // mov rcx, [rsp]
+            code.extend_from_slice(&[0x48, 0x39, 0xC8]);        // cmp rax, rcx
+            code.push(0x0F); code.push(0x87);
+            let start_abort_patch = code.len();
+            code.extend_from_slice(&[0; 4]);
+            // (8) slice_len = end - start, slice_ptr = text_ptr + start
+            code.extend_from_slice(&[0x48, 0x89, 0xCA]);              // mov rdx, rcx (end)
+            code.extend_from_slice(&[0x48, 0x29, 0xC2]);              // sub rdx, rax (slice_len)
+            code.extend_from_slice(&[0x48, 0x8B, 0x4C, 0x24, 0x10]);  // mov rcx, [rsp+16] (text_ptr)
+            code.extend_from_slice(&[0x48, 0x01, 0xC1]);              // add rcx, rax (slice_ptr)
+            // (9) Convention: rsi = slice_ptr, rcx = slice_len
+            code.extend_from_slice(&[0x48, 0x89, 0xCE]);              // mov rsi, rcx
+            code.extend_from_slice(&[0x48, 0x89, 0xD1]);              // mov rcx, rdx
+            // (10) add rsp, 24 ; jmp .ok
+            code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x18]);
+            code.push(0xE9);
+            let ok_jmp_patch = code.len();
+            code.extend_from_slice(&[0; 4]);
+            // .abort: sys_exit(1)
+            let abort_pos = code.len();
+            let end_rel = abort_pos as i32 - (end_abort_patch as i32 + 4);
+            code[end_abort_patch..end_abort_patch + 4].copy_from_slice(&end_rel.to_le_bytes());
+            let start_rel = abort_pos as i32 - (start_abort_patch as i32 + 4);
+            code[start_abort_patch..start_abort_patch + 4].copy_from_slice(&start_rel.to_le_bytes());
+            code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x3C, 0x00, 0x00, 0x00]);
+            code.extend_from_slice(&[0x48, 0xC7, 0xC7, 0x01, 0x00, 0x00, 0x00]);
+            code.extend_from_slice(&[0x0F, 0x05]);
+            // .ok:
+            let ok_pos = code.len();
+            let ok_rel = ok_pos as i32 - (ok_jmp_patch as i32 + 4);
+            code[ok_jmp_patch..ok_jmp_patch + 4].copy_from_slice(&ok_rel.to_le_bytes());
+            Ok(())
         }
         other => Err(NativeError {
             message: format!(
@@ -7990,7 +8059,7 @@ fn emit_eval_expr(
         // `on_read_error: abort`. Self-contained: the abort sequence is
         // emitted inline at the end of this branch (no per-binary
         // patches needed), so callers don't need any new bookkeeping.
-        Expr::ParseInt(inner) => emit_parse_int(code, inner.as_ref(), input_name, text_bindings, offsets, all_rules),
+        Expr::ParseInt(inner) => emit_parse_int(code, inner.as_ref(), input_name, text_bindings, offsets, all_rules, field_ranges),
         // `now_unix()` — load the captured CLOCK_REALTIME seconds from
         // the dedicated `now` slot. The slot is populated ONCE per rule
         // invocation by a `clock_gettime` call hoisted above the record
@@ -8379,7 +8448,7 @@ fn emit_length(
         Expr::JsonEscape(inner) => {
             // Load (rsi = src ptr, rcx = src len) for the inner. Errors
             // propagate with a clear message if the shape is unsupported.
-            emit_json_escape_load_src(code, inner.as_ref(), input_name, offsets, all_rules, text_bindings)?;
+            emit_json_escape_load_src(code, inner.as_ref(), input_name, offsets, all_rules, field_ranges, text_bindings)?;
             // mov r8, rcx   — output length accumulator starts at input length
             code.extend_from_slice(&[0x49, 0x89, 0xC8]);
             // test rcx, rcx ; jz .done   (empty input → output is 0)
@@ -9070,6 +9139,7 @@ fn emit_parse_int(
     text_bindings: &TextBindings<'_>,
     offsets: &HashMap<&str, i32>,
     all_rules: &HashMap<&str, &Rule>,
+    field_ranges: &HashMap<&str, (i64, i64)>,
 ) -> Result<(), NativeError> {
     // Step 1: resolve (rsi=ptr, rcx=len) for the inner. Three shapes:
     //   - BoundText (Read / Ident / Fetch in text_bindings): load
@@ -9201,17 +9271,136 @@ fn emit_parse_int(
                 text_bindings,
                 offsets,
                 all_rules,
+                field_ranges,
             );
+        }
+        // substring(text, start, end) as parse_int's inner: inline
+        // the substring emit, leave (rsi=slice_ptr, rcx=slice_len)
+        // for the scan loop below. Same algorithm as the byte-prim
+        // slice 2c and json_escape slice 2d — duplicated here for
+        // the same reason (no shared helper yet).
+        Expr::Substring(text, start_expr, end_expr) => {
+            // (1) Load text inner into (rsi, rcx) via the same shape
+            // dispatch parse_int already supports for its top-level
+            // inner. Easiest: recurse parse_int's loader logic by
+            // delegating to a wrapper that ONLY does the load — but
+            // parse_int doesn't have a load-only entry point. Instead,
+            // we inline the load shapes directly (text input field,
+            // BoundText). Concat / Call / nested substring as the
+            // text inner of substring-inside-parse_int are refused
+            // here (would need a buffer); user must restructure.
+            match text.as_ref() {
+                Expr::Read(name) | Expr::Ident(name) | Expr::Fetch(name, _)
+                    if text_bindings.contains_key(name.as_str()) =>
+                {
+                    let (ptr_slot, len_slot) = text_bindings[name.as_str()];
+                    if ptr_slot >= -128 {
+                        code.extend_from_slice(&[0x48, 0x8B, 0x75]);
+                        code.push(ptr_slot as u8);
+                    } else {
+                        code.extend_from_slice(&[0x48, 0x8B, 0xB5]);
+                        code.extend_from_slice(&ptr_slot.to_le_bytes());
+                    }
+                    if len_slot >= -128 {
+                        code.extend_from_slice(&[0x48, 0x8B, 0x4D]);
+                        code.push(len_slot as u8);
+                    } else {
+                        code.extend_from_slice(&[0x48, 0x8B, 0x8D]);
+                        code.extend_from_slice(&len_slot.to_le_bytes());
+                    }
+                }
+                Expr::Field(_, fname) => {
+                    let &offset = offsets.get(fname.as_str()).ok_or_else(|| NativeError {
+                        message: format!(
+                            "parse_int(substring): text inner field '{}' has no rbp slot",
+                            fname
+                        ),
+                    })?;
+                    if offset >= -128 {
+                        code.extend_from_slice(&[0x48, 0x8B, 0x75]);
+                        code.push(offset as u8);
+                    } else {
+                        code.extend_from_slice(&[0x48, 0x8B, 0xB5]);
+                        code.extend_from_slice(&offset.to_le_bytes());
+                    }
+                    emit_strlen(code);
+                    code.extend_from_slice(&[0x48, 0x89, 0xD1]); // mov rcx, rdx
+                }
+                other => {
+                    return Err(NativeError {
+                        message: format!(
+                            "parse_int(substring): text inner must be a text input field \
+                             or BoundText (read / text-let / fetch) — got {:?}. Concat / \
+                             Call / nested substring as text inner would need buffer \
+                             materialisation; bind via a `let` first.",
+                            expr_kind(other)
+                        ),
+                    });
+                }
+            }
+            // (2) push rsi ; push rcx — save text (ptr at [rsp+16], len at [rsp+8] after push end)
+            code.push(0x56);
+            code.push(0x51);
+            // (3) Evaluate end → rax
+            emit_eval_expr(
+                code, end_expr, input_name, offsets, all_rules, field_ranges, text_bindings,
+            )?;
+            // (4) push rax
+            code.push(0x50);
+            // (5) cmp end, text_len ; ja .abort
+            code.extend_from_slice(&[0x48, 0x8B, 0x4C, 0x24, 0x08]);
+            code.extend_from_slice(&[0x48, 0x39, 0xC8]);
+            code.push(0x0F); code.push(0x87);
+            let end_abort_patch = code.len();
+            code.extend_from_slice(&[0; 4]);
+            // (6) Evaluate start → rax
+            emit_eval_expr(
+                code, start_expr, input_name, offsets, all_rules, field_ranges, text_bindings,
+            )?;
+            // (7) cmp start, end ; ja .abort
+            code.extend_from_slice(&[0x48, 0x8B, 0x0C, 0x24]);
+            code.extend_from_slice(&[0x48, 0x39, 0xC8]);
+            code.push(0x0F); code.push(0x87);
+            let start_abort_patch = code.len();
+            code.extend_from_slice(&[0; 4]);
+            // (8) slice_len = end - start, slice_ptr = text_ptr + start
+            code.extend_from_slice(&[0x48, 0x89, 0xCA]);              // mov rdx, rcx (end)
+            code.extend_from_slice(&[0x48, 0x29, 0xC2]);              // sub rdx, rax (slice_len)
+            code.extend_from_slice(&[0x48, 0x8B, 0x4C, 0x24, 0x10]);  // mov rcx, [rsp+16] (text_ptr)
+            code.extend_from_slice(&[0x48, 0x01, 0xC1]);              // add rcx, rax (slice_ptr)
+            // (9) parse_int convention: rsi = slice_ptr, rcx = slice_len
+            code.extend_from_slice(&[0x48, 0x89, 0xCE]);              // mov rsi, rcx
+            code.extend_from_slice(&[0x48, 0x89, 0xD1]);              // mov rcx, rdx
+            // (10) add rsp, 24 ; jmp .ok
+            code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x18]);
+            code.push(0xE9);
+            let ok_jmp_patch = code.len();
+            code.extend_from_slice(&[0; 4]);
+            // .abort: sys_exit(1)
+            let abort_pos = code.len();
+            let end_rel = abort_pos as i32 - (end_abort_patch as i32 + 4);
+            code[end_abort_patch..end_abort_patch + 4].copy_from_slice(&end_rel.to_le_bytes());
+            let start_rel = abort_pos as i32 - (start_abort_patch as i32 + 4);
+            code[start_abort_patch..start_abort_patch + 4].copy_from_slice(&start_rel.to_le_bytes());
+            code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x3C, 0x00, 0x00, 0x00]);
+            code.extend_from_slice(&[0x48, 0xC7, 0xC7, 0x01, 0x00, 0x00, 0x00]);
+            code.extend_from_slice(&[0x0F, 0x05]);
+            // .ok:
+            let ok_pos = code.len();
+            let ok_rel = ok_pos as i32 - (ok_jmp_patch as i32 + 4);
+            code[ok_jmp_patch..ok_jmp_patch + 4].copy_from_slice(&ok_rel.to_le_bytes());
+            // Fall through to parse_int's scan loop (step 3+ of the
+            // outer function) which reads (rsi, rcx) and produces rax.
         }
         _ => {
             return Err(NativeError {
                 message: format!(
                     "parse_int: inner must be a text input field, a BoundText reference \
-                     (read(<resource>), text let, fetch(<connection>, ...)), or a text-returning \
-                     rule call whose body resolves to one of those shapes (Phase 2G inline) — \
-                     got {:?}. Concat / JsonEscape as parse_int args still need a buffer \
-                     materialisation that the strict-scan algorithm explicitly avoids; bind via \
-                     a `let` and parse_int the let.",
+                     (read(<resource>), text let, fetch(<connection>, ...)), a text-returning \
+                     rule call (Phase 2G), or substring(<text>, <start>, <end>) — got {:?}. \
+                     Concat / JsonEscape as parse_int args still need a buffer materialisation \
+                     that the strict-scan algorithm explicitly avoids; bind via a `let` and \
+                     parse_int the let.",
                     expr_kind(inner)
                 ),
             });
@@ -17428,6 +17617,96 @@ rule has_p
         assert_eq!(run("starts_ab", "ab"), (1, "".into()), "substring end=3 > len=2 must abort");
         assert_eq!(run("ends_lo", "ab"), (1, "".into()), "substring end=4 > len=2 must abort");
         assert_eq!(run("has_p", "abc"), (1, "".into()), "substring end=5 > len=3 must abort");
+    }
+
+    /// `json_escape(substring(...))` and `parse_int(substring(...))`
+    /// direct (2026-05-13), slices 2d + 2e. Closes the substring
+    /// integration story across every text-consuming primitive.
+    /// Same algorithm + fail-closed posture as 2b/2c — same
+    /// duplication caveat (a shared emit_substring_to_rax_rdx helper
+    /// would consolidate four call sites).
+    ///
+    /// 2d pinned via `length(json_escape(substring(...)))` which
+    /// exercises the escape transform on the slice (verifies the
+    /// byte counting goes through the substring slice, not the
+    /// original buffer).
+    ///
+    /// 2e pinned via direct `parse_int(substring(...))` with happy
+    /// path (slice contains valid digits) and two fail-closed paths
+    /// (substring bounds violation; slice contains non-digit).
+    #[test]
+    fn slice_json_escape_and_parse_int_substring_direct() {
+        use std::process::Command;
+        let src = r#"@verbose 0.1.0
+
+concept O
+  @intention: "x"
+  @source: invoices.intent:1
+  fields:
+    source : text
+
+rule escape_slice_len
+  @intention: "byte count of the escaped first-5 slice"
+  @source: invoices.intent:1
+  input:
+    o : O
+  output:
+    n : number
+  logic:
+    n = length(json_escape(substring(o.source, 0, 5)))
+  proofs:
+    purity:
+      reads : [o.source]
+      calls : []
+    termination:
+      bound : 5
+
+rule parse_slice
+  @intention: "parse the first-3 slice as a number"
+  @source: invoices.intent:1
+  input:
+    o : O
+  output:
+    n : number
+  logic:
+    n = parse_int(substring(o.source, 0, 3))
+  proofs:
+    purity:
+      reads : [o.source]
+      calls : []
+    termination:
+      bound : 5
+"#;
+        let tokens = crate::lexer::Lexer::new(src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+        let run = |rule: &str, arg: &str| -> (i32, String) {
+            let bin = std::env::temp_dir().join(format!("verbosec_test_subst_2de_{}", rule));
+            compile_native(&program, rule, bin.to_str().unwrap(), false, false)
+                .expect("compile");
+            let r = Command::new(&bin).args([arg]).output().expect("spawn");
+            let code = r.status.code().unwrap_or(-1);
+            let stdout = String::from_utf8_lossy(&r.stdout).trim_end_matches('\n').to_string();
+            let _ = std::fs::remove_file(&bin);
+            (code, stdout)
+        };
+
+        // 2d: length(json_escape(substring))
+        // 'abcde' (5 bytes, no escapes) → escaped length = 5
+        assert_eq!(run("escape_slice_len", "abcde"), (0, "5".into()));
+        // 'a"bcd' (5 bytes, 1 escape `"` → 2 bytes) → 6
+        assert_eq!(run("escape_slice_len", "a\"bcd"), (0, "6".into()));
+        // 'ab' (too short for substring(0, 5)) → abort
+        assert_eq!(run("escape_slice_len", "ab").0, 1, "substring end=5 > len=2 must abort");
+
+        // 2e: parse_int(substring)
+        // '123abc' → slice='123' → 123
+        assert_eq!(run("parse_slice", "123abc"), (0, "123".into()));
+        // '042xyz' → slice='042' → 42 (parse_int handles leading zeros)
+        assert_eq!(run("parse_slice", "042xyz"), (0, "42".into()));
+        // 'ab' (too short) → substring bounds abort
+        assert_eq!(run("parse_slice", "ab").0, 1, "substring end=3 > len=2 must abort");
+        // 'abc' (slice='abc', not digits) → parse_int abort
+        assert_eq!(run("parse_slice", "abc").0, 1, "non-digit slice must abort parse_int");
     }
 
     /// Phase 9 slice 9.5e (2026-04-28): `read(<resource>)` inside the
