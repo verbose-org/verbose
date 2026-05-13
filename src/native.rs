@@ -7813,7 +7813,7 @@ fn emit_eval_expr(
         // `on_read_error: abort`. Self-contained: the abort sequence is
         // emitted inline at the end of this branch (no per-binary
         // patches needed), so callers don't need any new bookkeeping.
-        Expr::ParseInt(inner) => emit_parse_int(code, inner.as_ref(), text_bindings, offsets),
+        Expr::ParseInt(inner) => emit_parse_int(code, inner.as_ref(), input_name, text_bindings, offsets, all_rules),
         // `now_unix()` — load the captured CLOCK_REALTIME seconds from
         // the dedicated `now` slot. The slot is populated ONCE per rule
         // invocation by a `clock_gettime` call hoisted above the record
@@ -8712,8 +8712,10 @@ fn emit_contains(
 fn emit_parse_int(
     code: &mut Vec<u8>,
     inner: &Expr,
+    input_name: &str,
     text_bindings: &TextBindings<'_>,
     offsets: &HashMap<&str, i32>,
+    all_rules: &HashMap<&str, &Rule>,
 ) -> Result<(), NativeError> {
     // Step 1: resolve (rsi=ptr, rcx=len) for the inner. Three shapes:
     //   - BoundText (Read / Ident / Fetch in text_bindings): load
@@ -8776,14 +8778,86 @@ fn emit_parse_int(
                 ),
             });
         }
+        // Phase 2G-shape inline: a Call returning text via a body that
+        // itself resolves to a parse_int-supported shape (text input
+        // field or BoundText). Same constraints as the rest of the
+        // Phase 2G family: single Ident(input) arg, no callee lets,
+        // callee returns text, same input ident name. A callee body
+        // that's a concat / nested call would need buffer
+        // materialisation and is refused.
+        Expr::Call(callee_name, call_args) => {
+            if call_args.len() != 1 {
+                return Err(NativeError {
+                    message: format!(
+                        "parse_int(call): callee '{}' must take exactly one argument; got {}",
+                        callee_name, call_args.len()
+                    ),
+                });
+            }
+            match &call_args[0] {
+                Expr::Ident(n) if n == input_name => {}
+                other => {
+                    return Err(NativeError {
+                        message: format!(
+                            "parse_int(call): callee '{}' argument must be the caller's input ident '{}'; got {}",
+                            callee_name, input_name, expr_kind(other)
+                        ),
+                    });
+                }
+            }
+            let callee = all_rules.get(callee_name.as_str()).ok_or_else(|| NativeError {
+                message: format!("parse_int(call): unknown rule '{}'", callee_name),
+            })?;
+            if !callee.logic.bindings.is_empty() {
+                return Err(NativeError {
+                    message: format!(
+                        "parse_int(call): callee '{}' has let bindings (same Phase 2G restriction \
+                         as length(call) / starts_with(call) / json_escape(call)). Workaround: \
+                         inline the let RHSes into the body, or bind the callee result via a `let` \
+                         in the caller and parse_int the let.",
+                        callee_name
+                    ),
+                });
+            }
+            if !matches!(callee.output_ty, Type::Text) {
+                return Err(NativeError {
+                    message: format!(
+                        "parse_int(call): callee '{}' must return text; got {:?}",
+                        callee_name, callee.output_ty
+                    ),
+                });
+            }
+            if callee.input_name != input_name {
+                return Err(NativeError {
+                    message: format!(
+                        "parse_int(call): callee '{}' uses input ident '{}', caller uses '{}' — \
+                         inline requires the same input ident name",
+                        callee_name, callee.input_name, input_name
+                    ),
+                });
+            }
+            // Recurse on the callee body. The match arms above
+            // re-dispatch on the body's shape; allocation-needing
+            // shapes bubble up the catch-all error naming the
+            // offending shape inside the callee.
+            return emit_parse_int(
+                code,
+                &callee.logic.value,
+                input_name,
+                text_bindings,
+                offsets,
+                all_rules,
+            );
+        }
         _ => {
             return Err(NativeError {
                 message: format!(
                     "parse_int: inner must be a text input field, a BoundText reference \
-                     (read(<resource>), text let, fetch(<connection>, ...)), or another \
-                     parse_int-supported text shape — got {:?}. Concat / Call / JsonEscape \
-                     as parse_int args still need a buffer materialisation that the strict-scan \
-                     algorithm explicitly avoids; bind via a `let` and parse_int the let.",
+                     (read(<resource>), text let, fetch(<connection>, ...)), or a text-returning \
+                     rule call whose body resolves to one of those shapes (Phase 2G inline) — \
+                     got {:?}. Concat / JsonEscape as parse_int args still need a buffer \
+                     materialisation that the strict-scan algorithm explicitly avoids; bind via \
+                     a `let` and parse_int the let.",
                     expr_kind(inner)
                 ),
             });
@@ -16436,6 +16510,134 @@ rule parsed
         assert_eq!(run("12x").0, 1, "trailing non-digit must abort");
 
         let _ = fs::remove_file(&out);
+    }
+
+    /// `parse_int(<Call>)` accepts a text-returning rule call (2026-05-13),
+    /// Phase 2G-shape inline. Closes the Phase 2G family across every
+    /// text-consuming primitive (length, parse_int, starts_with,
+    /// ends_with, contains, json_escape all accept a Call now). The
+    /// callee body must itself resolve to a parse_int-supported shape
+    /// (text input field or BoundText); concat / nested call bubble up
+    /// the existing catch-all.
+    ///
+    /// Same fail-closed posture as the other parse_int shapes:
+    /// empty / lone '-' / non-digit byte all abort with sys_exit(1).
+    #[test]
+    fn slice_parse_int_accepts_call_phase_2g() {
+        use std::fs;
+        use std::process::Command;
+        let src = r#"@verbose 0.1.0
+
+concept O
+  @intention: "x"
+  @source: invoices.intent:1
+  fields:
+    raw : text
+
+rule lookup
+  @intention: "passthrough"
+  @source: invoices.intent:1
+  input:
+    o : O
+  output:
+    s : text
+  logic:
+    s = o.raw
+  proofs:
+    purity:
+      reads : [o.raw]
+      calls : []
+    termination:
+      bound : 1
+
+rule parsed
+  @intention: "parse the helper output"
+  @source: invoices.intent:1
+  input:
+    o : O
+  output:
+    n : number
+  logic:
+    n = parse_int(lookup(o))
+  proofs:
+    purity:
+      reads : [o]
+      calls : [lookup]
+    termination:
+      bound : 2
+"#;
+        let tokens = crate::lexer::Lexer::new(src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+        let out = std::env::temp_dir().join("verbosec_test_parse_int_call");
+        compile_native(&program, "parsed", out.to_str().unwrap(), false, false)
+            .expect("parse_int(Call) should compile");
+        let run = |arg: &str| -> (i32, String) {
+            let r = Command::new(&out).args([arg]).output().expect("spawn");
+            let code = r.status.code().unwrap_or(-1);
+            let stdout = String::from_utf8_lossy(&r.stdout).trim_end_matches('\n').to_string();
+            (code, stdout)
+        };
+        assert_eq!(run("42"), (0, "42".into()));
+        assert_eq!(run("-7"), (0, "-7".into()));
+        assert_eq!(run("0"), (0, "0".into()));
+        assert_eq!(run("").0, 1, "empty input must abort");
+        assert_eq!(run("abc").0, 1, "non-digit must abort");
+        let _ = fs::remove_file(&out);
+
+        // Refusal: callee body is concat (needs buffer materialisation
+        // that the strict scan avoids).
+        let src_refuse = r#"@verbose 0.1.0
+
+concept O
+  @intention: "x"
+  @source: invoices.intent:1
+  fields:
+    a : text
+    b : text
+
+rule joined
+  @intention: "x"
+  @source: invoices.intent:1
+  input:
+    o : O
+  output:
+    s : text
+  logic:
+    s = concat(o.a, o.b)
+  proofs:
+    purity:
+      reads : [o.a, o.b]
+      calls : []
+    termination:
+      bound : 2
+
+rule bad
+  @intention: "x"
+  @source: invoices.intent:1
+  input:
+    o : O
+  output:
+    n : number
+  logic:
+    n = parse_int(joined(o))
+  proofs:
+    purity:
+      reads : [o]
+      calls : [joined]
+    termination:
+      bound : 3
+"#;
+        let tokens = crate::lexer::Lexer::new(src_refuse).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+        let bin = std::env::temp_dir().join("verbosec_test_parse_int_call_refuse");
+        let err = compile_native(&program, "bad", bin.to_str().unwrap(), false, false)
+            .expect_err("concat callee body must be refused for parse_int inner");
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("parse_int") && (msg.contains("Concat") || msg.contains("buffer")),
+            "error should explain why concat-body callee is refused: {}",
+            msg
+        );
     }
 
     /// Phase 9 slice 9.5e (2026-04-28): `read(<resource>)` inside the
