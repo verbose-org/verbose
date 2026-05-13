@@ -363,6 +363,12 @@ fn collect_read_names(expr: &Expr, out: &mut Vec<String>) {
             collect_read_names(s, out);
             collect_read_names(e, out);
         }
+        // `byte_at(text, index)` — recurse into both children; either side
+        // may carry a `read(...)` (e.g. the source text might be `read(buf)`).
+        Expr::ByteAt(t, i) => {
+            collect_read_names(t, out);
+            collect_read_names(i, out);
+        }
     }
 }
 
@@ -481,6 +487,11 @@ fn collect_fetch_names(expr: &Expr, out: &mut Vec<String>) {
             collect_fetch_names(s, out);
             collect_fetch_names(e, out);
         }
+        // `byte_at(text, index)` — recurse into both children.
+        Expr::ByteAt(t, i) => {
+            collect_fetch_names(t, out);
+            collect_fetch_names(i, out);
+        }
     }
 }
 
@@ -572,6 +583,11 @@ fn collect_fetch_names_with_dups(expr: &Expr, out: &mut Vec<String>) {
             collect_fetch_names_with_dups(t, out);
             collect_fetch_names_with_dups(s, out);
             collect_fetch_names_with_dups(e, out);
+        }
+        // `byte_at(text, index)` — recurse into both children.
+        Expr::ByteAt(t, i) => {
+            collect_fetch_names_with_dups(t, out);
+            collect_fetch_names_with_dups(i, out);
         }
     }
 }
@@ -1066,6 +1082,7 @@ fn describe_expr_kind(e: &Expr) -> &'static str {
         Expr::Min(_, _) => "min",
         Expr::Max(_, _) => "max",
         Expr::Substring(_, _, _) => "substring",
+        Expr::ByteAt(_, _) => "byte_at",
     }
 }
 
@@ -1535,6 +1552,24 @@ fn check_expr_against(
                 ),
             });
         }
+        // `byte_at(<text>, <index>)` produces a number (the byte value at the
+        // given offset, in 0..256). When the context expects number, recurse
+        // into the first child with expected=Text and into the index child
+        // with expected=Number. Otherwise surface a clear mismatch (mirror of
+        // the Substring arms, but with two children and a Number return).
+        (Expr::ByteAt(t, i), Type::Number) => {
+            check_expr_against(t, &Type::Text, rule, all_rules, input_concept, all_concepts, errors);
+            check_expr_against(i, &Type::Number, rule, all_rules, input_concept, all_concepts, errors);
+        }
+        (Expr::ByteAt(_, _), other) => {
+            errors.push(VerifyError {
+                context: format!("rule '{}' / logic", rule.name),
+                message: format!(
+                    "byte_at produces number but the expected type is '{}'",
+                    type_display(other),
+                ),
+            });
+        }
         (Expr::MatchResult(_target, _, ok_body, _, err_body), _) => {
             // Both arms must produce `expected`. The target should be a Result —
             // checking that requires inferring through lambda bindings, which
@@ -1755,6 +1790,10 @@ fn infer_expr_type(
         // are enforced by check_expr_against; here we only need the outer
         // type for inference.
         Expr::Substring(_, _, _) => Some(Type::Text),
+        // `byte_at(<text>, <number>)` returns number. Inner shapes are
+        // enforced by check_expr_against; here we only need the outer type
+        // for inference.
+        Expr::ByteAt(_, _) => Some(Type::Number),
         // Map/Filter/Fold/Ok/Err/MatchResult: deferred until lambda binding
         // tracking lands. Returning None means we do not check; we also do not
         // falsely accept.
@@ -2056,6 +2095,10 @@ fn walk_for_match_result_callees(
             walk_for_match_result_callees(s, rules_by_name, all_resources, all_connections, visited, out_reads);
             walk_for_match_result_callees(e, rules_by_name, all_resources, all_connections, visited, out_reads);
         }
+        Expr::ByteAt(t, i) => {
+            walk_for_match_result_callees(t, rules_by_name, all_resources, all_connections, visited, out_reads);
+            walk_for_match_result_callees(i, rules_by_name, all_resources, all_connections, visited, out_reads);
+        }
         Expr::Number(_) | Expr::Text(_) | Expr::Field(_, _) | Expr::Ident(_)
         | Expr::Read(_) | Expr::NowUnix => {}
     }
@@ -2262,6 +2305,12 @@ fn collect_expr_facts(
             collect_expr_facts(s, reads, calls);
             collect_expr_facts(e, reads, calls);
         }
+        // `byte_at(text, index)` — pure pass-through: each child contributes
+        // its own facts.
+        Expr::ByteAt(t, i) => {
+            collect_expr_facts(t, reads, calls);
+            collect_expr_facts(i, reads, calls);
+        }
     }
 }
 
@@ -2396,6 +2445,9 @@ fn collect_lambda_bound_names(expr: &Expr) -> std::collections::HashSet<String> 
             }
             Expr::Substring(t, s, e) => {
                 walk(t, out); walk(s, out); walk(e, out);
+            }
+            Expr::ByteAt(t, i) => {
+                walk(t, out); walk(i, out);
             }
             Expr::Call(_, args) | Expr::Concat(args) => {
                 for a in args { walk(a, out); }
@@ -2582,6 +2634,9 @@ fn count_operations(expr: &Expr) -> usize {
         // `substring(text, start, end)` — one op for the slice operation
         // (bounds check + pointer arithmetic) plus the cost of each child.
         Expr::Substring(t, s, e) => 1 + count_operations(t) + count_operations(s) + count_operations(e),
+        // `byte_at(text, index)` — one op (bounds check + load) plus the
+        // cost of each child.
+        Expr::ByteAt(t, i) => 1 + count_operations(t) + count_operations(i),
     }
 }
 

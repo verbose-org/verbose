@@ -588,6 +588,23 @@ pub enum Expr {
     /// out of a source buffer you need to know start/end and slice it.
     /// Self-hosting target depends on this.
     Substring(Box<Expr>, Box<Expr>, Box<Expr>),
+    /// `byte_at(<text_expr>, <index>)` — read the byte at the given
+    /// offset of the text expression, returning a Number in 0..256.
+    /// Index is zero-based.
+    ///
+    /// Bounds enforced at runtime, fail-closed: `index >= length(text)`
+    /// aborts with sys_exit(1). Negative index falls under the same
+    /// check via unsigned reinterpretation (becomes a huge value,
+    /// always > length).
+    ///
+    /// This is the second tokenizer primitive (along with substring):
+    /// a tokenizer scans `byte_at(source, i)` byte-by-byte to find
+    /// token boundaries, then uses `substring(source, start, end)` to
+    /// extract the lexeme. Self-hosting depends on both.
+    ///
+    /// Cheap: no allocation, no scratch — the emit is a bounded
+    /// `cmp + jae .abort ; movzx eax, byte [text_ptr + index]`.
+    ByteAt(Box<Expr>, Box<Expr>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
