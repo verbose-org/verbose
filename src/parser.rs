@@ -897,6 +897,32 @@ impl Parser {
                 }
                 self.expect_kind(TokenKind::RParen)?;
                 Ok(Expr::Length(Box::new(inner)))
+            } else if name == "substring" && self.check_kind(&TokenKind::LParen) {
+                // `substring(<text>, <start>, <end>)` — half-open slice
+                // by byte offset, returns text. Exactly three arguments;
+                // any other arity is a parse-time error. The verifier
+                // checks text-typed first arg and Number-typed start/end;
+                // bounds are enforced mechanically at runtime, fail-closed.
+                self.advance(); // (
+                if self.check_kind(&TokenKind::RParen) {
+                    return Err(self.error("substring requires exactly three arguments (text, start, end), got zero"));
+                }
+                let text_arg = self.parse_expr()?;
+                if !self.check_kind(&TokenKind::Comma) {
+                    return Err(self.error("substring requires exactly three arguments (text, start, end), got one"));
+                }
+                self.expect_kind(TokenKind::Comma)?;
+                let start_arg = self.parse_expr()?;
+                if !self.check_kind(&TokenKind::Comma) {
+                    return Err(self.error("substring requires exactly three arguments (text, start, end), got two"));
+                }
+                self.expect_kind(TokenKind::Comma)?;
+                let end_arg = self.parse_expr()?;
+                if self.check_kind(&TokenKind::Comma) {
+                    return Err(self.error("substring requires exactly three arguments (text, start, end), got more than three"));
+                }
+                self.expect_kind(TokenKind::RParen)?;
+                Ok(Expr::Substring(Box::new(text_arg), Box::new(start_arg), Box::new(end_arg)))
             } else if name == "abs" && self.check_kind(&TokenKind::LParen) {
                 // `abs(<number_expr>)` — absolute value. Exactly one argument;
                 // zero or two-plus is a parse-time error. The verifier checks

@@ -566,6 +566,28 @@ pub enum Expr {
     /// `max(<a>, <b>)` — binary scalar maximum, returns Number. Same
     /// disambiguation rule and shape as Min. Native: `cmp + cmovl`.
     Max(Box<Expr>, Box<Expr>),
+    /// `substring(<text_expr>, <start>, <end>)` — slice a sub-range of
+    /// the input text by byte offset. Returns `text`. Semantics are
+    /// half-open: bytes [start, end), so `substring(s, 0, length(s))`
+    /// reproduces `s` and `substring(s, k, k)` is the empty text.
+    ///
+    /// Bounds are enforced mechanically at runtime, fail-closed:
+    ///   - `end > length(text_expr)` → sys_exit(1)
+    ///   - `start > end` → sys_exit(1)
+    /// Negative start/end fall under `start > end` after the unsigned
+    /// comparison reinterprets them as huge, so they abort too.
+    ///
+    /// No allocation: the result is `(text_ptr + start, end - start)`
+    /// — a pointer slice into the same buffer as the input. The
+    /// auditor reads "substring" and knows no copy happened, no heap
+    /// touched, no scratch allocated. Lifetime of the result equals
+    /// the lifetime of the input buffer (which lives at least until
+    /// the enclosing record loop's rsp frame is freed).
+    ///
+    /// This is the missing tokenizer primitive — to extract a literal
+    /// out of a source buffer you need to know start/end and slice it.
+    /// Self-hosting target depends on this.
+    Substring(Box<Expr>, Box<Expr>, Box<Expr>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
