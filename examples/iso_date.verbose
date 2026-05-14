@@ -1,0 +1,46 @@
+@verbose 0.1.0
+
+concept Input
+  @intention: "An ISO 8601 date string in YYYY-MM-DD form"
+  @source: iso_date.intent:1
+
+  fields:
+    s : text [..10]
+
+
+concept DateParts
+  @intention: "Parsed year, month, day from the ISO date"
+  @source: iso_date.intent:2
+
+  fields:
+    year : number [0, 9999]
+    month : number [1, 12]
+    day : number [1, 31]
+
+
+rule parse_date
+  @intention: "Parse YYYY-MM-DD into year/month/day; fail-closed on length and separator violations"
+  @source: iso_date.intent:3
+
+  input:
+    i : Input
+
+  output:
+    r : Result(DateParts, text)
+
+  logic:
+    r = if length(i.s) != 10 then Err("input must be 10 chars: YYYY-MM-DD")
+        else if byte_at(i.s, 4) != 45 then Err("separator at position 4 must be '-'")
+        else if byte_at(i.s, 7) != 45 then Err("separator at position 7 must be '-'")
+        else Ok(DateParts {
+          year: parse_int(substring(i.s, 0, 4)),
+          month: parse_int(substring(i.s, 5, 7)),
+          day: parse_int(substring(i.s, 8, 10))
+        })
+
+  proofs:
+    purity:
+      reads : [i.s]
+      calls : []
+    termination:
+      bound : 25
