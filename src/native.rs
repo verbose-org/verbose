@@ -17447,6 +17447,81 @@ rule pick
         let _ = std::fs::remove_file(&out);
     }
 
+    /// First composite worked example exercising the tokenizer
+    /// primitives (substring + byte_at + parse_int) on a real shape:
+    /// an ISO 8601 date parser. Fixed-format (YYYY-MM-DD), so positions
+    /// are known statically — no byte iteration needed for this case.
+    /// Surfaces three things together: byte_at for separator validation,
+    /// substring for slicing the digit groups at known positions, and
+    /// parse_int on each slice to produce numbers. Plus a Result(Record,
+    /// text) output to express "valid date as structured value" vs
+    /// "rejection reason as text."
+    ///
+    /// Pinned through examples/iso_date.verbose (the canonical example),
+    /// not an inline source string, so the example stays exercised in CI.
+    #[test]
+    fn iso_date_parser_composite_runtime() {
+        use std::fs;
+        use std::process::Command;
+        let src = fs::read_to_string("examples/iso_date.verbose")
+            .expect("examples/iso_date.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+        let out = std::env::temp_dir().join("verbosec_test_iso_date_parser");
+        compile_native(&program, "parse_date", out.to_str().unwrap(), false, false)
+            .expect("iso_date.verbose must compile");
+        let run = |arg: &str| -> (i32, String, String) {
+            let r = Command::new(&out).args([arg]).output().expect("spawn");
+            (
+                r.status.code().unwrap_or(-1),
+                String::from_utf8_lossy(&r.stdout).trim_end_matches('\n').to_string(),
+                String::from_utf8_lossy(&r.stderr).trim_end_matches('\n').to_string(),
+            )
+        };
+        // Happy paths — Ok arm, JSON to stdout.
+        assert_eq!(
+            run("2026-05-13"),
+            (0, r#"{"year":2026,"month":5,"day":13}"#.into(), "".into()),
+        );
+        assert_eq!(
+            run("1999-12-31"),
+            (0, r#"{"year":1999,"month":12,"day":31}"#.into(), "".into()),
+        );
+        // Length violation → Err arm, reason on stderr.
+        assert_eq!(
+            run("20260513"),
+            (1, "".into(), "input must be 10 chars: YYYY-MM-DD".into()),
+        );
+        assert_eq!(
+            run("2026-05"),
+            (1, "".into(), "input must be 10 chars: YYYY-MM-DD".into()),
+        );
+        // Wrong separator → Err arm naming the position.
+        assert_eq!(
+            run("2026/05/13"),
+            (1, "".into(), "separator at position 4 must be '-'".into()),
+        );
+        assert_eq!(
+            run("2026-05/13"),
+            (1, "".into(), "separator at position 7 must be '-'".into()),
+        );
+        // Non-digit content in a digit group → parse_int aborts.
+        // The streaming JSON emission means partial stdout (the
+        // already-emitted prefix) is visible before the abort, but
+        // the binary exits 1 and the JSON is incomplete — fail-closed
+        // posture preserved (no clean consumable output on bad input).
+        let (code, _stdout, _stderr) = run("YYYY-MM-DD");
+        assert_eq!(code, 1, "non-digit year must abort via parse_int's fail-closed path");
+        // The binary stays tight: ISO parser in ~2 KB.
+        let size = fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
+        assert!(
+            size < 2500,
+            "ISO date parser binary should stay under 2.5 KB; got {}",
+            size
+        );
+        let _ = fs::remove_file(&out);
+    }
+
     /// `length(substring(text, start, end))` direct composition
     /// (2026-05-13), slice 2 of substring. Lets the AI write
     /// `length(substring(o.source, 0, 3))` without a let-workaround.

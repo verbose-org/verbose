@@ -1,0 +1,9 @@
+An ISO 8601 date parser.
+
+1. We accept text input that should be a 10-character ISO 8601 date in the form `YYYY-MM-DD` (year-month-day, separators are ASCII hyphens at positions 4 and 7).
+2. The output structure has three numeric fields: `year` (0..9999), `month` (1..12), and `day` (1..31).
+3. The parser produces a `Result(DateParts, text)`:
+   - `Ok(DateParts { year, month, day })` when the input is exactly 10 bytes long, has `-` at positions 4 and 7, and the three digit groups parse as numbers.
+   - `Err(<reason>)` otherwise. The reason text is one of: `"input must be 10 chars: YYYY-MM-DD"`, `"separator at position 4 must be '-'"`, `"separator at position 7 must be '-'"`, or — if the digit groups contain non-digit bytes — the binary aborts via `parse_int`'s fail-closed path (separate from the Err arm).
+
+This is a fixed-format parser: positions are known statically, so no byte-by-byte iteration is needed. The byte_at + substring + parse_int composition validates the recent tokenizer primitives on a real shape.
