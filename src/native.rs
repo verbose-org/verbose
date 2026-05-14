@@ -603,6 +603,14 @@ fn collect_read_names_native(expr: &Expr, out: &mut Vec<String>) {
             collect_read_names_native(t, out);
             collect_read_names_native(i, out);
         }
+        // `fold_bytes(text, init, acc, byte, idx => body)` — recurse into
+        // text, init, and body. Same shape as Fold; the three bound names
+        // are scoped to the body.
+        Expr::FoldBytes(t, init, _, _, _, body) => {
+            collect_read_names_native(t, out);
+            collect_read_names_native(init, out);
+            collect_read_names_native(body, out);
+        }
     }
 }
 
@@ -641,6 +649,9 @@ fn expr_uses_now_unix(e: &Expr) -> bool {
         Expr::Min(l, r) | Expr::Max(l, r) => expr_uses_now_unix(l) || expr_uses_now_unix(r),
         Expr::Substring(t, s, e) => {
             expr_uses_now_unix(t) || expr_uses_now_unix(s) || expr_uses_now_unix(e)
+        }
+        Expr::FoldBytes(t, init, _, _, _, body) => {
+            expr_uses_now_unix(t) || expr_uses_now_unix(init) || expr_uses_now_unix(body)
         }
         Expr::ByteAt(t, i) => expr_uses_now_unix(t) || expr_uses_now_unix(i),
     }
@@ -737,6 +748,11 @@ fn count_match_result_max_depth(expr: &Expr) -> usize {
                 .max(count_match_result_max_depth(init))
                 .max(count_match_result_max_depth(body))
         }
+        Expr::FoldBytes(t, init, _, _, _, body) => {
+            count_match_result_max_depth(t)
+                .max(count_match_result_max_depth(init))
+                .max(count_match_result_max_depth(body))
+        }
         Expr::Quantifier(_, coll, _, body)
         | Expr::Map(coll, _, body)
         | Expr::Filter(coll, _, body) => {
@@ -824,6 +840,11 @@ fn expr_uses_field(e: &Expr, input_name: &str, field_name: &str) -> bool {
         Expr::ByteAt(t, i) => {
             expr_uses_field(t, input_name, field_name)
                 || expr_uses_field(i, input_name, field_name)
+        }
+        Expr::FoldBytes(t, init, _, _, _, body) => {
+            expr_uses_field(t, input_name, field_name)
+                || expr_uses_field(init, input_name, field_name)
+                || expr_uses_field(body, input_name, field_name)
         }
     }
 }
@@ -978,6 +999,11 @@ fn gather_transitive_callee_reads(
         Expr::ByteAt(t, i) => {
             gather_transitive_callee_reads(t, all_rules, visited, out);
             gather_transitive_callee_reads(i, all_rules, visited, out);
+        }
+        Expr::FoldBytes(t, init, _, _, _, body) => {
+            gather_transitive_callee_reads(t, all_rules, visited, out);
+            gather_transitive_callee_reads(init, all_rules, visited, out);
+            gather_transitive_callee_reads(body, all_rules, visited, out);
         }
         Expr::Number(_) | Expr::Text(_) | Expr::Field(_, _) | Expr::Ident(_)
         | Expr::Read(_) | Expr::NowUnix => {}
@@ -1146,6 +1172,13 @@ fn collect_fetch_names_native(expr: &Expr, out: &mut Vec<String>) {
         Expr::ByteAt(t, i) => {
             collect_fetch_names_native(t, out);
             collect_fetch_names_native(i, out);
+        }
+        // `fold_bytes(text, init, acc, byte, idx => body)` — recurse into
+        // text, init, and body. Same shape as Fold.
+        Expr::FoldBytes(t, init, _, _, _, body) => {
+            collect_fetch_names_native(t, out);
+            collect_fetch_names_native(init, out);
+            collect_fetch_names_native(body, out);
         }
     }
 }
@@ -1429,6 +1462,11 @@ fn emit_connection_fetch_sequence(
                 .or_else(|| first_fetch_for(e, name)),
             // `byte_at(text, index)` — recurse into both children.
             Expr::ByteAt(t, i) => first_fetch_for(t, name).or_else(|| first_fetch_for(i, name)),
+            // `fold_bytes(text, init, acc, byte, idx => body)` — recurse
+            // into text, init, and body.
+            Expr::FoldBytes(t, init, _, _, _, body) => first_fetch_for(t, name)
+                .or_else(|| first_fetch_for(init, name))
+                .or_else(|| first_fetch_for(body, name)),
         }
     }
     let request_expr: &Expr = {
@@ -6248,6 +6286,11 @@ fn expr_mentions_ident(e: &Expr, name: &str) -> bool {
                 || expr_mentions_ident(init, name)
                 || expr_mentions_ident(b, name)
         }
+        Expr::FoldBytes(t, init, _, _, _, b) => {
+            expr_mentions_ident(t, name)
+                || expr_mentions_ident(init, name)
+                || expr_mentions_ident(b, name)
+        }
         _ => false,
     }
 }
@@ -7479,6 +7522,14 @@ fn max_stack_depth(expr: &Expr) -> usize {
         // registers (bounds check + movzx load). No eval-stack pushes
         // beyond what the children's individual depths already require.
         Expr::ByteAt(t, i) => max_stack_depth(t).max(max_stack_depth(i)),
+        // `fold_bytes(text, init, acc, byte, idx => body)` — like Fold, the
+        // loop is driven by fixed registers (byte cursor / accumulator
+        // slot); whichever child has the deepest eval-stack dominates.
+        Expr::FoldBytes(t, init, _, _, _, body) => {
+            max_stack_depth(t)
+                .max(max_stack_depth(init))
+                .max(max_stack_depth(body))
+        }
     }
 }
 
@@ -8090,6 +8141,21 @@ fn emit_eval_expr(
         | Expr::Concat(_) => Err(NativeError {
             message: "rich operations (collection/result/record/concat) not supported in native backend (use --run interpreter) — see CLAUDE.md, 'Two Execution Modes'"
                 .into(),
+        }),
+        // `fold_bytes(text, init, acc, byte, idx => body)` — semantic
+        // surface complete (AST + parser + verifier + interpreter).
+        // Native emit deferred to the follow-up slice: it requires
+        // its own emit_fold_bytes_program (rbp slots for acc/byte/idx,
+        // proper frame allocation, dispatch from compile_native) —
+        // ~200 lines mirroring emit_fold_program's shape. For now,
+        // run rules with fold_bytes via the interpreter:
+        //   verbosec your.verbose --run rule_name --input data.json
+        // The interpreter handles the byte loop end-to-end.
+        Expr::FoldBytes(_, _, _, _, _, _) => Err(NativeError {
+            message: "fold_bytes is not yet supported in the native backend (interpreter only — \
+                      run with --run). The native emit_fold_bytes_program is the next slice; this \
+                      one delivers the parser/verifier/interpreter surface so rules using fold_bytes \
+                      compile and the semantics can be exercised today.".into(),
         }),
         Expr::Ident(name) if name == input_name => Err(NativeError {
             message: "bare input binding not supported in expressions".into(),
@@ -11320,6 +11386,7 @@ fn expr_kind(e: &Expr) -> &'static str {
         Expr::Max(_, _) => "Max",
         Expr::Substring(_, _, _) => "Substring",
         Expr::ByteAt(_, _) => "ByteAt",
+        Expr::FoldBytes(_, _, _, _, _, _) => "FoldBytes",
     }
 }
 

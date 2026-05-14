@@ -82,6 +82,12 @@ fn count_nodes(expr: &Expr) -> usize {
         Expr::Substring(t, s, e) => 1 + count_nodes(t) + count_nodes(s) + count_nodes(e),
         // `byte_at(text, index)` — two children, all expressions.
         Expr::ByteAt(t, i) => 1 + count_nodes(t) + count_nodes(i),
+        // `fold_bytes(text, init, acc, byte, idx => body)` — three Expr
+        // children (text, init, body); the three bound names are strings,
+        // not nodes.
+        Expr::FoldBytes(t, init, _, _, _, body) => {
+            1 + count_nodes(t) + count_nodes(init) + count_nodes(body)
+        }
     }
 }
 
@@ -423,6 +429,29 @@ fn substitute_ident(expr: &Expr, name: &str, replacement: &Expr) -> Expr {
             Box::new(substitute_ident(t, name, replacement)),
             Box::new(substitute_ident(i, name, replacement)),
         ),
+        // `fold_bytes(text, init, acc, byte, idx => body)` — substitute
+        // through text + init unconditionally. The body sees three bound
+        // names that shadow the outer scope: if any of them matches the
+        // ident being substituted, skip the substitution inside body
+        // (mirror of Fold's `shadowed` guard, extended to three names).
+        Expr::FoldBytes(t, init, acc, byte, idx, body) => {
+            let new_text = substitute_ident(t, name, replacement);
+            let new_init = substitute_ident(init, name, replacement);
+            let shadowed = acc == name || byte == name || idx == name;
+            let new_body = if shadowed {
+                (**body).clone()
+            } else {
+                substitute_ident(body, name, replacement)
+            };
+            Expr::FoldBytes(
+                Box::new(new_text),
+                Box::new(new_init),
+                acc.clone(),
+                byte.clone(),
+                idx.clone(),
+                Box::new(new_body),
+            )
+        }
     }
 }
 
@@ -789,6 +818,19 @@ pub fn optimize_expr(
             }
             Expr::ByteAt(Box::new(t_opt), Box::new(i_opt))
         }
+        // `fold_bytes(text, init, acc, byte, idx => body)` — recurse on
+        // text + init + body. No literal fold today: the body refers to
+        // three bound names whose values vary per byte at runtime, so a
+        // compile-time fold would need a mini-interpreter we don't ship.
+        // Pass-through, same shape as Fold.
+        Expr::FoldBytes(t, init, acc, byte, idx, body) => Expr::FoldBytes(
+            Box::new(optimize_expr(t, input_name, field_ranges)),
+            Box::new(optimize_expr(init, input_name, field_ranges)),
+            acc.clone(),
+            byte.clone(),
+            idx.clone(),
+            Box::new(optimize_expr(body, input_name, field_ranges)),
+        ),
     }
 }
 

@@ -204,6 +204,7 @@ fn emit_expr(expr: &Expr, input_name: &str, concept: Option<&Concept>) -> String
         Expr::Not(inner) => format!("!{}", emit_expr(inner, input_name, concept)),
         Expr::Neg(inner) => format!("-{}", emit_expr(inner, input_name, concept)),
         Expr::Fold(_, _, _, _, _)
+        | Expr::FoldBytes(_, _, _, _, _, _)
         | Expr::Quantifier(_, _, _, _)
         | Expr::Map(_, _, _)
         | Expr::Filter(_, _, _)
@@ -226,7 +227,7 @@ fn emit_expr(expr: &Expr, input_name: &str, concept: Option<&Concept>) -> String
         | Expr::Max(_, _)
         | Expr::Substring(_, _, _)
         | Expr::ByteAt(_, _) => {
-            "(/* collection/result/record/concat/read/fetch/json_escape/parse_int/now_unix/starts_with/contains/ends_with/length/abs/min/max/substring/byte_at op: use --run interpreter or --native */false)".to_string()
+            "(/* collection/result/record/concat/read/fetch/json_escape/parse_int/now_unix/starts_with/contains/ends_with/length/abs/min/max/substring/byte_at/fold_bytes op: use --run interpreter or --native */false)".to_string()
         }
         Expr::Call(name, _args) => {
             if let Some(c) = concept {
