@@ -605,6 +605,31 @@ pub enum Expr {
     /// Cheap: no allocation, no scratch — the emit is a bounded
     /// `cmp + jae .abort ; movzx eax, byte [text_ptr + index]`.
     ByteAt(Box<Expr>, Box<Expr>),
+    /// `fold_bytes(<text>, <init>, acc, byte, idx => <body>)`
+    ///
+    /// Iterate over the bytes of `text`, threading an accumulator
+    /// `acc` (initialized to `<init>`) through each iteration. For
+    /// each byte at index `idx`, evaluate `<body>` with three names
+    /// in scope (all Number-typed):
+    ///   - `acc` — the running accumulator (Number)
+    ///   - `byte` — the current byte value (Number 0..256)
+    ///   - `idx` — the current byte position (Number, 0-based)
+    /// The body's result becomes the next accumulator value. After
+    /// the last byte, the final accumulator value is the fold result.
+    ///
+    /// Output type: Number. Body must return Number.
+    ///
+    /// This is the byte-level iteration primitive that unlocks
+    /// variable-length tokenizing: find first digit position, count
+    /// digits, find a separator, compute a simple checksum, etc.
+    /// Without it, scans require N if/else branches for a max-N-byte
+    /// input — verbose and bound at compile time. fold_bytes scales
+    /// to any text length.
+    ///
+    /// Layout in the variant: (text, init, acc_name, byte_name,
+    /// idx_name, body). Six fields, mirroring the existing Fold's
+    /// 5-field shape with one extra binding for the position.
+    FoldBytes(Box<Expr>, Box<Expr>, String, String, String, Box<Expr>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

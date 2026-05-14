@@ -370,6 +370,35 @@ fn eval_expr(
             }
             Ok(acc)
         }
+        Expr::FoldBytes(text, initial, acc_name, byte_name, idx_name, body) => {
+            // Iterate over the bytes of `text`, threading a Number-typed
+            // accumulator through three bound names: acc, byte, idx. Body
+            // returns the next accumulator value. Same shape as Fold but
+            // the iteration source is a text's bytes, not a collection.
+            let text_val = eval_expr(text, env, all_rules)?;
+            let s = match text_val {
+                Value::Text(s) => s,
+                _ => return Err(RuntimeError { message: "fold_bytes requires text as first argument".into() }),
+            };
+            let init_val = eval_expr(initial, env, all_rules)?;
+            let mut acc = match init_val {
+                Value::Number(_) => init_val,
+                _ => return Err(RuntimeError { message: "fold_bytes init must be a number".into() }),
+            };
+            for (i, &b) in s.as_bytes().iter().enumerate() {
+                let mut inner_env = env.clone();
+                inner_env.insert(acc_name.clone(), acc);
+                inner_env.insert(byte_name.clone(), Value::Number(b as i64));
+                inner_env.insert(idx_name.clone(), Value::Number(i as i64));
+                acc = eval_expr(body, &inner_env, all_rules)?;
+                if !matches!(acc, Value::Number(_)) {
+                    return Err(RuntimeError {
+                        message: "fold_bytes body must return a number".into(),
+                    });
+                }
+            }
+            Ok(acc)
+        }
         Expr::Map(collection, var_name, body) => {
             let coll_val = eval_expr(collection, env, all_rules)?;
             let items = match coll_val {
@@ -1430,5 +1459,99 @@ mod tests {
         let records = parse_json_array(json).unwrap();
         assert_eq!(records[0]["active"], Value::Bool(true));
         assert_eq!(records[0]["deleted"], Value::Bool(false));
+    }
+
+    /// fold_bytes slice 1 — semantic surface. The interpreter handles
+    /// the byte-loop end-to-end (native emit is a follow-up slice).
+    /// This test pins the canonical "find first digit position" use
+    /// case, which is the exemplar that motivated fold_bytes in the
+    /// first place: variable-length scan with running accumulator,
+    /// idx-aware so the position can be returned.
+    ///
+    /// Body grammar: standard if/else chain on acc/byte/idx, with
+    /// short-circuit `and` (from PR #20) for the digit range check.
+    #[test]
+    fn fold_bytes_find_first_digit_position() {
+        // Build the rule manually:
+        //   fold_bytes(i.s, -1, acc, b, idx =>
+        //     if acc >= 0 then acc
+        //     else if b >= 48 and b <= 57 then idx
+        //     else acc)
+        let body = Expr::If(
+            Box::new(Expr::Binary(
+                BinOp::GtEq,
+                Box::new(Expr::Ident("acc".into())),
+                Box::new(Expr::Number(0)),
+            )),
+            Box::new(Expr::Ident("acc".into())),
+            Box::new(Expr::If(
+                Box::new(Expr::Binary(
+                    BinOp::And,
+                    Box::new(Expr::Binary(
+                        BinOp::GtEq,
+                        Box::new(Expr::Ident("b".into())),
+                        Box::new(Expr::Number(48)),
+                    )),
+                    Box::new(Expr::Binary(
+                        BinOp::LtEq,
+                        Box::new(Expr::Ident("b".into())),
+                        Box::new(Expr::Number(57)),
+                    )),
+                )),
+                Box::new(Expr::Ident("idx".into())),
+                Box::new(Expr::Ident("acc".into())),
+            )),
+        );
+        let logic_value = Expr::FoldBytes(
+            Box::new(Expr::Field(Box::new(Expr::Ident("i".into())), "s".into())),
+            Box::new(Expr::Number(-1)),
+            "acc".into(),
+            "b".into(),
+            "idx".into(),
+            Box::new(body),
+        );
+        let rule = Rule {
+            name: "first_digit_pos".into(),
+            intention: "t".into(),
+            source: SourceRef { file: "t.intent".into(), line: 1 },
+            input_name: "i".into(),
+            input_ty: Type::Named("Input".into()),
+            output_name: "n".into(),
+            output_ty: Type::Number,
+            logic: LogicStmt {
+                bindings: vec![],
+                target: "n".into(),
+                value: logic_value,
+            },
+            proofs: Proofs {
+                purity: Purity {
+                    reads: vec![Path { segments: vec!["i".into(), "s".into()] }],
+                    calls: vec![],
+                },
+                termination: Termination { bound: Some(10) },
+            },
+            hints: None,
+            layer: None,
+            context_name: None,
+            context_ty: None,
+        };
+
+        let run = |text: &str| -> Value {
+            let mut input = HashMap::new();
+            input.insert("s".into(), Value::Text(text.into()));
+            eval_rule(&rule, &[], &input).unwrap()
+        };
+        // '  42' → 2 (first digit at position 2)
+        assert_eq!(run("  42"), Value::Number(2));
+        // '123' → 0 (first digit at position 0)
+        assert_eq!(run("123"), Value::Number(0));
+        // 'abc' → -1 (no digit found, initial acc preserved)
+        assert_eq!(run("abc"), Value::Number(-1));
+        // '' → -1 (no bytes to iterate)
+        assert_eq!(run(""), Value::Number(-1));
+        // 'a9' → 1 (digit at position 1)
+        assert_eq!(run("a9"), Value::Number(1));
+        // Long input: 'xxxxxx5' → 6 (digit at end)
+        assert_eq!(run("xxxxxx5"), Value::Number(6));
     }
 }

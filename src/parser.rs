@@ -661,6 +661,33 @@ impl Parser {
                     item,
                     Box::new(body),
                 ))
+            } else if name == "fold_bytes" && self.check_kind(&TokenKind::LParen) {
+                // `fold_bytes(<text>, <init>, acc, byte, idx => <body>)`
+                // Byte-level iteration with three bound Number-typed names
+                // (acc, byte, idx). Same arity shape as `fold` plus one
+                // extra identifier (idx) before the `=>`. Body returns
+                // Number (the next accumulator value).
+                self.advance(); // (
+                let text = self.parse_expr()?;
+                self.expect_kind(TokenKind::Comma)?;
+                let initial = self.parse_expr()?;
+                self.expect_kind(TokenKind::Comma)?;
+                let acc = self.expect_ident_any()?;
+                self.expect_kind(TokenKind::Comma)?;
+                let byte_var = self.expect_ident_any()?;
+                self.expect_kind(TokenKind::Comma)?;
+                let idx_var = self.expect_ident_any()?;
+                self.expect_kind(TokenKind::FatArrow)?;
+                let body = self.parse_expr()?;
+                self.expect_kind(TokenKind::RParen)?;
+                Ok(Expr::FoldBytes(
+                    Box::new(text),
+                    Box::new(initial),
+                    acc,
+                    byte_var,
+                    idx_var,
+                    Box::new(body),
+                ))
             } else if (name == "all" || name == "any") && self.check_kind(&TokenKind::LParen) {
                 let kind = if name == "all" {
                     QuantifierKind::All

@@ -369,6 +369,16 @@ fn collect_read_names(expr: &Expr, out: &mut Vec<String>) {
             collect_read_names(t, out);
             collect_read_names(i, out);
         }
+        // `fold_bytes(text, init, acc, byte, idx => body)` — recurse into
+        // text, init, and body. The three bound names (acc, byte, idx) are
+        // lambda-bound so any field accesses prefixed with them are filtered
+        // out by `collect_expr_facts`; here we collect every read regardless
+        // and let the purity check filter (mirrors Fold's shape).
+        Expr::FoldBytes(t, init, _, _, _, body) => {
+            collect_read_names(t, out);
+            collect_read_names(init, out);
+            collect_read_names(body, out);
+        }
     }
 }
 
@@ -492,6 +502,14 @@ fn collect_fetch_names(expr: &Expr, out: &mut Vec<String>) {
             collect_fetch_names(t, out);
             collect_fetch_names(i, out);
         }
+        // `fold_bytes(text, init, acc, byte, idx => body)` — recurse into
+        // text, init, and body. Same shape as Fold: no name bindings here,
+        // just children.
+        Expr::FoldBytes(t, init, _, _, _, body) => {
+            collect_fetch_names(t, out);
+            collect_fetch_names(init, out);
+            collect_fetch_names(body, out);
+        }
     }
 }
 
@@ -588,6 +606,13 @@ fn collect_fetch_names_with_dups(expr: &Expr, out: &mut Vec<String>) {
         Expr::ByteAt(t, i) => {
             collect_fetch_names_with_dups(t, out);
             collect_fetch_names_with_dups(i, out);
+        }
+        // `fold_bytes(text, init, acc, byte, idx => body)` — recurse into
+        // text, init, and body. Bound names contribute no fetches.
+        Expr::FoldBytes(t, init, _, _, _, body) => {
+            collect_fetch_names_with_dups(t, out);
+            collect_fetch_names_with_dups(init, out);
+            collect_fetch_names_with_dups(body, out);
         }
     }
 }
@@ -1083,6 +1108,7 @@ fn describe_expr_kind(e: &Expr) -> &'static str {
         Expr::Max(_, _) => "max",
         Expr::Substring(_, _, _) => "substring",
         Expr::ByteAt(_, _) => "byte_at",
+        Expr::FoldBytes(_, _, _, _, _, _) => "fold_bytes",
     }
 }
 
@@ -1570,6 +1596,26 @@ fn check_expr_against(
                 ),
             });
         }
+        // `fold_bytes(<text>, <init>, acc, byte, idx => <body>)` produces a
+        // number (the final accumulator value). When the context expects
+        // number, recurse into text with expected=Text and into init with
+        // expected=Number. The body is left unchecked here (its three
+        // lambda-bound vars — acc, byte, idx — aren't tracked in this
+        // pass), consistent with how Fold's body is handled. Otherwise
+        // surface a clear mismatch.
+        (Expr::FoldBytes(t, init, _, _, _, _body), Type::Number) => {
+            check_expr_against(t, &Type::Text, rule, all_rules, input_concept, all_concepts, errors);
+            check_expr_against(init, &Type::Number, rule, all_rules, input_concept, all_concepts, errors);
+        }
+        (Expr::FoldBytes(_, _, _, _, _, _), other) => {
+            errors.push(VerifyError {
+                context: format!("rule '{}' / logic", rule.name),
+                message: format!(
+                    "fold_bytes produces number but the expected type is '{}'",
+                    type_display(other),
+                ),
+            });
+        }
         (Expr::MatchResult(_target, _, ok_body, _, err_body), _) => {
             // Both arms must produce `expected`. The target should be a Result —
             // checking that requires inferring through lambda bindings, which
@@ -1794,6 +1840,10 @@ fn infer_expr_type(
         // enforced by check_expr_against; here we only need the outer type
         // for inference.
         Expr::ByteAt(_, _) => Some(Type::Number),
+        // `fold_bytes(<text>, <init>, acc, byte, idx => <body>)` returns
+        // number (the final accumulator). Body shape is enforced by
+        // check_expr_against; outer type is what inference cares about.
+        Expr::FoldBytes(_, _, _, _, _, _) => Some(Type::Number),
         // Map/Filter/Fold/Ok/Err/MatchResult: deferred until lambda binding
         // tracking lands. Returning None means we do not check; we also do not
         // falsely accept.
@@ -2099,6 +2149,11 @@ fn walk_for_match_result_callees(
             walk_for_match_result_callees(t, rules_by_name, all_resources, all_connections, visited, out_reads);
             walk_for_match_result_callees(i, rules_by_name, all_resources, all_connections, visited, out_reads);
         }
+        Expr::FoldBytes(t, init, _, _, _, body) => {
+            walk_for_match_result_callees(t, rules_by_name, all_resources, all_connections, visited, out_reads);
+            walk_for_match_result_callees(init, rules_by_name, all_resources, all_connections, visited, out_reads);
+            walk_for_match_result_callees(body, rules_by_name, all_resources, all_connections, visited, out_reads);
+        }
         Expr::Number(_) | Expr::Text(_) | Expr::Field(_, _) | Expr::Ident(_)
         | Expr::Read(_) | Expr::NowUnix => {}
     }
@@ -2311,6 +2366,29 @@ fn collect_expr_facts(
             collect_expr_facts(t, reads, calls);
             collect_expr_facts(i, reads, calls);
         }
+        // `fold_bytes(text, init, acc, byte, idx => body)` — purity shape
+        // mirrors Fold: text + init reads propagate as-is; body reads are
+        // filtered by the three lambda-bound names (acc, byte, idx) so any
+        // path like `acc.foo` or `idx.bar` inside the body does NOT escape
+        // as a stale `reads:` entry. Same machinery as Fold, three names
+        // instead of two.
+        Expr::FoldBytes(text, initial, acc_name, byte_name, idx_name, body) => {
+            collect_expr_facts(text, reads, calls);
+            collect_expr_facts(initial, reads, calls);
+            let mut inner_reads = HashSet::new();
+            let mut inner_calls = HashSet::new();
+            collect_expr_facts(body, &mut inner_reads, &mut inner_calls);
+            calls.extend(inner_calls);
+            for path in inner_reads {
+                let base = path.first().map(|s| s.as_str());
+                if base != Some(acc_name.as_str())
+                    && base != Some(byte_name.as_str())
+                    && base != Some(idx_name.as_str())
+                {
+                    reads.insert(path);
+                }
+            }
+        }
     }
 }
 
@@ -2448,6 +2526,14 @@ fn collect_lambda_bound_names(expr: &Expr) -> std::collections::HashSet<String> 
             }
             Expr::ByteAt(t, i) => {
                 walk(t, out); walk(i, out);
+            }
+            Expr::FoldBytes(t, init, acc, byte, idx, body) => {
+                out.insert(acc.clone());
+                out.insert(byte.clone());
+                out.insert(idx.clone());
+                walk(t, out);
+                walk(init, out);
+                walk(body, out);
             }
             Expr::Call(_, args) | Expr::Concat(args) => {
                 for a in args { walk(a, out); }
@@ -2637,6 +2723,13 @@ fn count_operations(expr: &Expr) -> usize {
         // `byte_at(text, index)` — one op (bounds check + load) plus the
         // cost of each child.
         Expr::ByteAt(t, i) => 1 + count_operations(t) + count_operations(i),
+        // `fold_bytes(text, init, acc, byte, idx => body)` — one op for the
+        // fold-machinery setup plus the cost of evaluating text, init, and
+        // body. Same shape as Fold; the bound names don't contribute their
+        // own ops.
+        Expr::FoldBytes(t, init, _, _, _, body) => {
+            1 + count_operations(t) + count_operations(init) + count_operations(body)
+        }
     }
 }
 
