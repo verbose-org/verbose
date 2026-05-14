@@ -7892,6 +7892,50 @@ fn emit_eval_expr(
                 }
             }
 
+            // === Short-circuit And/Or — must precede the general case
+            // because the general case evaluates both sides eagerly. ===
+            //
+            // Verbose bool values are 0 or 1 (comparisons set/movzx
+            // produce normalised i64). For And: if left is 0, the
+            // result is 0 regardless of right — skip the right emit.
+            // For Or: if left is non-zero (i.e., 1 in well-formed
+            // code), the result is left — skip the right emit.
+            //
+            // Semantic value: `length(s) > 4 and byte_at(s, 4) == 45`
+            // is now safe — byte_at is NOT called when length is
+            // insufficient. Without short-circuit, byte_at fires
+            // unconditionally and aborts the binary via its bounds
+            // check. This pattern is universal: guard then probe.
+            //
+            // Emit shape (both ops symmetric):
+            //   eval left → rax
+            //   test rax, rax
+            //   jz/jnz .skip_right  (rel32 — right expr can be large)
+            //   eval right → rax    (overwrites rax with right's value)
+            //   .skip_right:
+            //
+            // On the skip path rax holds the left's value (0 for And,
+            // a non-zero bool for Or) — which is the correct result
+            // by the short-circuit semantics. No explicit `mov rax`
+            // needed because rax is already correct.
+            if matches!(op, BinOp::And | BinOp::Or) {
+                emit_eval_expr(code, left, input_name, offsets, all_rules, field_ranges, text_bindings)?;
+                // test rax, rax
+                code.extend_from_slice(&[0x48, 0x85, 0xC0]);
+                // jz/jnz rel32 — depending on op
+                code.push(0x0F);
+                code.push(if *op == BinOp::And { 0x84 /* jz */ } else { 0x85 /* jnz */ });
+                let skip_patch = code.len();
+                code.extend_from_slice(&[0; 4]);
+                // Evaluate right (overwrites rax with right's value)
+                emit_eval_expr(code, right, input_name, offsets, all_rules, field_ranges, text_bindings)?;
+                // .skip_right:
+                let skip_pos = code.len();
+                let skip_rel = skip_pos as i32 - (skip_patch as i32 + 4);
+                code[skip_patch..skip_patch + 4].copy_from_slice(&skip_rel.to_le_bytes());
+                return Ok(());
+            }
+
             // === General case: evaluate both sides, apply operator ===
             emit_eval_expr(code, left, input_name, offsets, all_rules, field_ranges, text_bindings)?;
             code.push(0x50); // push rax
@@ -7957,11 +8001,12 @@ fn emit_eval_expr(
                     code.extend_from_slice(&[0x0F, 0x9E, 0xC0]); // setle al
                     code.extend_from_slice(&[0x48, 0x0F, 0xB6, 0xC0]); // movzx rax, al
                 }
-                BinOp::And => {
-                    code.extend_from_slice(&[0x48, 0x21, 0xC8]); // and rax, rcx
-                }
-                BinOp::Or => {
-                    code.extend_from_slice(&[0x48, 0x09, 0xC8]); // or rax, rcx
+                BinOp::And | BinOp::Or => {
+                    // Unreachable: the short-circuit branch above
+                    // returns early for And/Or. Kept as a match arm
+                    // for exhaustiveness; if reached, it's a bug
+                    // (someone broke the early return).
+                    unreachable!("And/Or are short-circuited; should not reach the general case");
                 }
             }
             Ok(())
@@ -17520,6 +17565,140 @@ rule pick
             size
         );
         let _ = fs::remove_file(&out);
+    }
+
+    /// Short-circuit `and` / `or` (2026-05-15).
+    ///
+    /// Before this slice, `length(s) > N and byte_at(s, N) == '-'` was
+    /// unsafe: `byte_at` is unconditionally evaluated, so a length-too-
+    /// short input aborted the binary via byte_at's bounds check. The
+    /// tokenizer experiment yesterday surfaced this gap — guarded
+    /// indexing didn't compose naturally.
+    ///
+    /// After this slice: `and`/`or` short-circuit. The right-hand side
+    /// is NOT evaluated when the left already determines the result
+    /// (left=0 for `and`, left non-zero for `or`). Emit shape:
+    ///   eval left → rax
+    ///   test rax, rax
+    ///   jz/jnz .skip_right
+    ///   eval right → rax
+    ///   .skip_right:
+    ///
+    /// On the skip path rax holds left's value (0 for And-skip, the
+    /// non-zero bool for Or-skip) — the correct result by short-
+    /// circuit semantics; no extra mov needed.
+    ///
+    /// This test pins the *side-effect* aspect: byte_at-out-of-bounds
+    /// is NOT triggered when the length guard is false. Pre-slice, the
+    /// `abc` (length=3) case aborts with exit 1 because byte_at(s, 3)
+    /// fires regardless. Post-slice, the result is -1 with exit 0.
+    #[test]
+    fn slice_short_circuit_and_or_guards_byte_at() {
+        use std::fs;
+        use std::process::Command;
+        // A scan that uses `length > N and byte_at(s, N) ...` — the
+        // pattern that was unsafe yesterday. Now the byte_at probe is
+        // guarded by the length check via short-circuit.
+        let src = r#"@verbose 0.1.0
+
+concept Input
+  @intention: "x"
+  @source: invoices.intent:1
+  fields:
+    s : text [..8]
+
+rule find_first_digit
+  @intention: "position of first digit (0..3), or -1"
+  @source: invoices.intent:1
+  input:
+    i : Input
+  output:
+    pos : number
+  logic:
+    pos = if length(i.s) > 0 and byte_at(i.s, 0) >= 48 and byte_at(i.s, 0) <= 57 then 0
+          else if length(i.s) > 1 and byte_at(i.s, 1) >= 48 and byte_at(i.s, 1) <= 57 then 1
+          else if length(i.s) > 2 and byte_at(i.s, 2) >= 48 and byte_at(i.s, 2) <= 57 then 2
+          else if length(i.s) > 3 and byte_at(i.s, 3) >= 48 and byte_at(i.s, 3) <= 57 then 3
+          else -1
+  proofs:
+    purity:
+      reads : [i.s]
+      calls : []
+    termination:
+      bound : 100
+"#;
+        let tokens = crate::lexer::Lexer::new(src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+        let out = std::env::temp_dir().join("verbosec_test_short_circuit_scan");
+        compile_native(&program, "find_first_digit", out.to_str().unwrap(), false, false)
+            .expect("scan should compile");
+        let run = |arg: &str| -> (i32, String) {
+            let r = Command::new(&out).args([arg]).output().expect("spawn");
+            (
+                r.status.code().unwrap_or(-1),
+                String::from_utf8_lossy(&r.stdout).trim_end_matches('\n').to_string(),
+            )
+        };
+        // Happy cases where a digit is found.
+        assert_eq!(run("123"), (0, "0".into()));
+        assert_eq!(run(" 12"), (0, "1".into()));
+        assert_eq!(run("  1"), (0, "2".into()));
+        // The critical regression cases: byte_at(s, N) is guarded by
+        // length(s) > N. Pre-slice these all aborted (exit 1, no stdout)
+        // because byte_at's bounds check fired. Post-slice: clean -1.
+        assert_eq!(run("abc"), (0, "-1".into()),
+            "length=3, no digits, byte_at not probed beyond length");
+        assert_eq!(run(""), (0, "-1".into()),
+            "empty input, no byte_at probe at all");
+        assert_eq!(run("a"), (0, "-1".into()),
+            "length=1, byte_at(s, 0) probed (valid), byte_at(s, 1+) not (would be OOB)");
+
+        // Also test `or`: a guard with `or` that short-circuits on true.
+        // Pattern: `if zero or byte_at(s, 0) == '?' then 1 else 0`.
+        // When zero is true, byte_at must NOT be evaluated; an empty
+        // input would otherwise abort.
+        let src_or = r#"@verbose 0.1.0
+
+concept Input
+  @intention: "x"
+  @source: invoices.intent:1
+  fields:
+    s : text [..8]
+    skip : number
+
+rule check
+  @intention: "ok if skip is non-zero, else look for '?' at index 0"
+  @source: invoices.intent:1
+  input:
+    i : Input
+  output:
+    ok : bool
+  logic:
+    ok = i.skip == 1 or byte_at(i.s, 0) == 63
+  proofs:
+    purity:
+      reads : [i.skip, i.s]
+      calls : []
+    termination:
+      bound : 5
+"#;
+        let tokens = crate::lexer::Lexer::new(src_or).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+        let out2 = std::env::temp_dir().join("verbosec_test_short_circuit_or");
+        compile_native(&program, "check", out2.to_str().unwrap(), false, false)
+            .expect("or short-circuit should compile");
+        let run2 = |s: &str, skip: &str| -> i32 {
+            Command::new(&out2).args([s, skip]).output().expect("spawn").status.code().unwrap_or(-1)
+        };
+        // skip=1 (true) → short-circuit fires, byte_at NOT called even on empty input
+        assert_eq!(run2("", "1"), 0, "skip=1 short-circuits, empty s safe");
+        // skip=0, s has '?' at index 0 → right side evaluated, true
+        assert_eq!(run2("?abc", "0"), 0, "byte_at(s,0)='?' matches");
+        // skip=0, s does NOT start with '?' → right side evaluated, false → exit 1
+        assert_eq!(run2("abc", "0"), 1, "false: skip=0 and s[0]!='?'");
+
+        let _ = fs::remove_file(&out);
+        let _ = fs::remove_file(&out2);
     }
 
     /// `length(substring(text, start, end))` direct composition
