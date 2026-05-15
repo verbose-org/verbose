@@ -368,6 +368,7 @@ mod tests {
                         ty: Type::Number,
                     range: None,
                     }],
+                    variants: vec![],
                 }),
                 Item::Rule(Rule {
                     name: "check_foo".into(),
@@ -452,6 +453,7 @@ mod tests {
             intention: "t".into(),
             source: SourceRef { file: "t".into(), line: 1 },
             fields,
+            variants: vec![],
         };
         let expr = Expr::Call("other_rule".into(), vec![Expr::Ident("i".into())]);
         let result = emit_expr(&expr, "i", Some(&concept));

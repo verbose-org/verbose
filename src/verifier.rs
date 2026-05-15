@@ -710,6 +710,7 @@ fn builtin_http_request() -> Concept {
                 range: Some((0, 4096)),
             },
         ],
+        variants: vec![],
     }
 }
 
@@ -737,6 +738,7 @@ fn builtin_http_response() -> Concept {
                 range: Some((0, 4096)),
             },
         ],
+        variants: vec![],
     }
 }
 

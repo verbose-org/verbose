@@ -259,6 +259,11 @@ pub struct Concept {
     pub intention: String,
     pub source: SourceRef,
     pub fields: Vec<Field>,
+    /// Phase A slice 1: optional `variants:` block. Mutually exclusive
+    /// with `fields:` — a concept is either a record (fields, current
+    /// behavior, variants empty) OR a sum type (variants, fields empty).
+    /// Verifier rejects both non-empty or both empty.
+    pub variants: Vec<Variant>,
 }
 
 #[derive(Debug, Clone)]
@@ -266,6 +271,22 @@ pub struct Field {
     pub name: String,
     pub ty: Type,
     pub range: Option<(i64, i64)>,
+}
+
+/// Phase A slice 1: a variant in a sum-type concept.
+///
+/// Each variant has a name and zero or more typed fields, like a
+/// mini-record. Pattern `variants: VarA of (x: number, y: text) |
+/// VarB of (z: bool) | VarC` (the last form is a no-field variant).
+///
+/// Field bindings inside a variant are scoped to that variant — the
+/// `match e: VarA(x, y) => ...` destructure (to be added in slice A.3)
+/// binds `x` and `y` to the values stored in the matched variant's
+/// payload.
+#[derive(Debug, Clone)]
+pub struct Variant {
+    pub name: String,
+    pub fields: Vec<Field>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

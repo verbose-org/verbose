@@ -11884,6 +11884,7 @@ fn http_request_builtin_concept_native() -> Concept {
                 range: Some((0, 4096)),
             },
         ],
+        variants: vec![],
     }
 }
 
@@ -15124,6 +15125,7 @@ rule num_outer
                 Field { name: "b".into(), ty: Type::Number, range: None },
                 Field { name: "c".into(), ty: Type::Number, range: None },
             ],
+            variants: vec![],
         };
         let offsets = field_offsets(&concept);
         assert_eq!(offsets["a"], -8);
