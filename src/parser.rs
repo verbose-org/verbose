@@ -83,6 +83,9 @@ impl Parser {
         let mut intention = None;
         let mut source = None;
         let mut fields = None;
+        // Phase A slice 1: optional `variants:` block. Mutually
+        // exclusive with `fields:` — see parse_variants_block.
+        let mut variants: Option<Vec<Variant>> = None;
 
         while !self.check_kind(&TokenKind::Dedent) && !self.at_eof() {
             if let Some(attr) = self.peek_attribute_name() {
@@ -108,9 +111,11 @@ impl Parser {
                 }
             } else if self.check_ident("fields") {
                 fields = Some(self.parse_fields_block()?);
+            } else if self.check_ident("variants") {
+                variants = Some(self.parse_variants_block()?);
             } else {
                 return Err(self.error(
-                    "expected attribute or 'fields:' in concept body",
+                    "expected attribute, 'fields:', or 'variants:' in concept body",
                 ));
             }
         }
@@ -120,15 +125,103 @@ impl Parser {
             .ok_or_else(|| self.error(&format!("concept '{}' missing @intention", name)))?;
         let source = source
             .ok_or_else(|| self.error(&format!("concept '{}' missing @source", name)))?;
-        let fields = fields
-            .ok_or_else(|| self.error(&format!("concept '{}' missing 'fields:' block", name)))?;
+
+        // Phase A slice 1: concept must have exactly one of fields/variants.
+        // Both empty → no shape declared. Both non-empty → ambiguous declaration.
+        let (fields, variants) = match (fields, variants) {
+            (Some(f), None) => (f, vec![]),
+            (None, Some(v)) => (vec![], v),
+            (Some(_), Some(_)) => {
+                return Err(self.error(&format!(
+                    "concept '{}' has both 'fields:' and 'variants:' blocks — only one is allowed (record OR sum type, not both)",
+                    name
+                )));
+            }
+            (None, None) => {
+                return Err(self.error(&format!(
+                    "concept '{}' missing 'fields:' or 'variants:' block",
+                    name
+                )));
+            }
+        };
 
         Ok(Concept {
             name,
             intention,
             source,
             fields,
+            variants,
         })
+    }
+
+    /// Parse a `variants:` block.
+    ///
+    /// Syntax (Phase A slice 1):
+    /// ```
+    /// variants:
+    ///   VarA of (x : number, y : text)
+    ///   VarB of (z : bool)
+    ///   VarC                              ; no payload
+    /// ```
+    ///
+    /// One variant per indented line. Field syntax mirrors `fields:`
+    /// (name : type), but inside a parenthesised payload after `of`.
+    /// A no-payload variant omits `of (...)` entirely.
+    fn parse_variants_block(&mut self) -> Result<Vec<Variant>, ParseError> {
+        self.expect_ident("variants")?;
+        self.expect_kind(TokenKind::Colon)?;
+        self.expect_kind(TokenKind::Newline)?;
+        self.expect_kind(TokenKind::Indent)?;
+        let mut variants = Vec::new();
+        let mut seen_names = std::collections::HashSet::new();
+        while !self.check_kind(&TokenKind::Dedent) && !self.at_eof() {
+            let variant_name = self.expect_ident_any()?;
+            if !seen_names.insert(variant_name.clone()) {
+                return Err(self.error(&format!(
+                    "duplicate variant name '{}' in variants block",
+                    variant_name
+                )));
+            }
+            // Optional `of (...)` payload.
+            let mut fields: Vec<Field> = Vec::new();
+            let mut payload_field_names = std::collections::HashSet::new();
+            if self.check_ident("of") {
+                self.advance();
+                self.expect_kind(TokenKind::LParen)?;
+                while !self.check_kind(&TokenKind::RParen) {
+                    let fname = self.expect_ident_any()?;
+                    if !payload_field_names.insert(fname.clone()) {
+                        return Err(self.error(&format!(
+                            "duplicate payload field '{}' in variant '{}'",
+                            fname, variant_name
+                        )));
+                    }
+                    self.expect_kind(TokenKind::Colon)?;
+                    let ty = self.parse_type()?;
+                    // No range bounds on variant payload fields in slice 1;
+                    // can be lifted later if needed.
+                    fields.push(Field { name: fname, ty, range: None });
+                    if self.check_kind(&TokenKind::Comma) {
+                        self.advance();
+                    } else {
+                        break;
+                    }
+                }
+                self.expect_kind(TokenKind::RParen)?;
+            }
+            self.expect_kind(TokenKind::Newline)?;
+            variants.push(Variant {
+                name: variant_name,
+                fields,
+            });
+        }
+        self.expect_kind(TokenKind::Dedent)?;
+        if variants.is_empty() {
+            return Err(self.error(
+                "variants block cannot be empty — declare at least one variant",
+            ));
+        }
+        Ok(variants)
     }
 
     fn parse_fields_block(&mut self) -> Result<Vec<Field>, ParseError> {
@@ -2537,6 +2630,118 @@ rule important_invoice
         assert!(
             format!("{:?}", err).contains("listen.port"),
             "expected listen.port missing error, got {:?}",
+            err
+        );
+    }
+
+    /// Phase A slice 1 — sum-type concept declarations.
+    ///
+    /// A `concept Foo variants: VarA of (...) | VarB | ...` parses and
+    /// verifies. The variant declarations populate `concept.variants`;
+    /// `concept.fields` stays empty (mutually exclusive with variants).
+    /// Construction and pattern match are later slices (A.2 / A.3).
+    ///
+    /// Pinned cases:
+    ///   (a) Multiple variants with various payload shapes
+    ///   (b) No-payload variant (`Eof` form, no `of (...)`)
+    ///   (c) Rejection: concept with both `fields:` and `variants:`
+    ///   (d) Rejection: concept with neither
+    ///   (e) Rejection: duplicate variant name within one concept
+    ///   (f) Rejection: duplicate payload field name within one variant
+    #[test]
+    fn phase_a1_sum_type_concept_declaration() {
+        // (a) + (b): happy path, multiple variants including no-payload
+        let src = r#"@verbose 0.1.0
+
+concept TokenKind
+  @intention: "x"
+  @source: invoices.intent:1
+  variants:
+    Ident of (name : text)
+    Int of (value : number)
+    Op of (sym : text)
+    Eof
+"#;
+        let program = parse(src).expect("variants declaration should parse");
+        let concept = program.items.iter().find_map(|i| match i {
+            Item::Concept(c) if c.name == "TokenKind" => Some(c),
+            _ => None,
+        }).expect("TokenKind concept");
+        assert!(concept.fields.is_empty(), "sum-type concept has no top-level fields");
+        assert_eq!(concept.variants.len(), 4);
+        assert_eq!(concept.variants[0].name, "Ident");
+        assert_eq!(concept.variants[0].fields.len(), 1);
+        assert_eq!(concept.variants[0].fields[0].name, "name");
+        assert!(matches!(concept.variants[0].fields[0].ty, Type::Text));
+        assert_eq!(concept.variants[1].name, "Int");
+        assert_eq!(concept.variants[1].fields[0].name, "value");
+        assert!(matches!(concept.variants[1].fields[0].ty, Type::Number));
+        assert_eq!(concept.variants[3].name, "Eof");
+        assert!(concept.variants[3].fields.is_empty(),
+            "no-payload variant has zero fields");
+
+        // (c) Both fields and variants → reject
+        let both = r#"@verbose 0.1.0
+
+concept Bad
+  @intention: "x"
+  @source: invoices.intent:1
+  fields:
+    x : number
+  variants:
+    Foo
+"#;
+        let err = parse(both).err().expect("both blocks must be rejected");
+        assert!(
+            format!("{:?}", err).contains("both 'fields:' and 'variants:'"),
+            "error should name the conflict: {:?}",
+            err
+        );
+
+        // (d) Neither → reject
+        let neither = r#"@verbose 0.1.0
+
+concept Empty
+  @intention: "x"
+  @source: invoices.intent:1
+"#;
+        let err = parse(neither).err().expect("neither block must be rejected");
+        assert!(
+            format!("{:?}", err).contains("missing 'fields:' or 'variants:'"),
+            "error should ask for one or the other: {:?}",
+            err
+        );
+
+        // (e) Duplicate variant name → reject
+        let dup_variant = r#"@verbose 0.1.0
+
+concept Dup
+  @intention: "x"
+  @source: invoices.intent:1
+  variants:
+    A
+    A
+"#;
+        let err = parse(dup_variant).err().expect("duplicate variant must be rejected");
+        assert!(
+            format!("{:?}", err).contains("duplicate variant name"),
+            "error should name the duplication: {:?}",
+            err
+        );
+
+        // (f) Duplicate payload field → reject
+        let dup_field = r#"@verbose 0.1.0
+
+concept Dup
+  @intention: "x"
+  @source: invoices.intent:1
+  variants:
+    Foo of (x : number, x : text)
+"#;
+        let err = parse(dup_field).err().expect("duplicate payload field must be rejected");
+        assert!(
+            format!("{:?}", err).contains("duplicate payload field"),
+            "error should name the duplication: {:?}",
             err
         );
     }
