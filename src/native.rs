@@ -198,6 +198,11 @@ fn compile_native_code(
     let effective_logic = desugared_fold.as_ref().unwrap_or(&rule.logic.value);
     let is_fold_number_output = matches!(&rule.output_ty, Type::Number | Type::Bool) && matches!(effective_logic, Expr::Fold(_, _, _, _, _));
     let is_fold_text_output = matches!(&rule.output_ty, Type::Text) && matches!(&rule.logic.value, Expr::Fold(_, _, _, _, _));
+    // fold_bytes slice 2 (2026-05-15): top-level fold_bytes for
+    // Number-typed rules. Dispatched to emit_fold_bytes_program
+    // (mirrors emit_fold_program's shape but iterates bytes of a
+    // text field rather than records of an input collection).
+    let is_fold_bytes_output = matches!(&rule.output_ty, Type::Number) && matches!(&rule.logic.value, Expr::FoldBytes(_, _, _, _, _, _));
     let record_output_concept: Option<&Concept> = match &rule.output_ty { Type::Named(n) => concepts.iter().find(|c| c.name == *n).copied(), _ => None };
 
     let mut code = if let Some(rx) = reaction {
@@ -218,6 +223,8 @@ fn compile_native_code(
         }
     } else if is_fold_text_output {
         emit_text_fold_program(rule, concept, &concepts, &rules, &resources)?
+    } else if is_fold_bytes_output {
+        emit_fold_bytes_program(rule, concept, &rules, &resources)?
     } else if matches!(&rule.output_ty, Type::Text) {
         emit_text_program(rule, concept, &rules, &resources, &connections)?
     } else if let Some(rec_concept) = record_output_concept {
@@ -5894,6 +5901,328 @@ struct ExtractedFold {
     acc_name: String,   // unique accumulator name (e.g. "__fold_0_acc")
     item_name: String,  // element variable name from the quantifier (e.g. "e")
     body: Expr,         // fold body referencing acc_name and item_name
+}
+
+/// Emit a top-level `fold_bytes` rule whose body is exactly:
+///   n = fold_bytes(<input.text_field>, <init_literal>, acc, byte, idx => <body>)
+///
+/// Output type: Number. Input concept: scalar fields (Number/Text) — no
+/// trailing collection (unlike emit_fold_program, which iterates records).
+///
+/// Frame layout (rbp-relative, top to bottom):
+///   - input field slots: -8 to -8 * nfields
+///   - acc slot:          -8 * (nfields + 1)
+///   - byte slot:         -8 * (nfields + 2)
+///   - idx slot:          -8 * (nfields + 3)
+///   - let-binding slots: below idx, one per let
+///   - resource (ptr, len, buffer) blocks: below let slots
+///   - now_unix (16 bytes) if used: at the bottom
+///
+/// Algorithm:
+///   1. Standard argv → field slots prologue
+///   2. Resolve text inner: load (ptr, len) into rsi/rcx
+///   3. Init acc = init_literal, idx = 0
+///   4. Loop:
+///        test rcx, rcx ; jz .done
+///        movzx eax, byte [rsi] ; mov [rbp + byte_slot], rax
+///        emit_eval_expr(body) → rax    (acc/byte/idx readable from rbp)
+///        mov [rbp + acc_slot], rax
+///        inc rsi ; dec rcx ; inc qword [rbp + idx_slot]
+///        jmp .loop
+///   5. .done: load acc into rax, itoa, exit 0
+///
+/// Restriction (slice 1): text inner of fold_bytes MUST be a direct
+/// Field(Ident(input), name) where the field is Text-typed. Other text
+/// sources (BoundText, Call, Concat) deferred to a follow-up.
+fn emit_fold_bytes_program(
+    rule: &Rule,
+    input_concept: &Concept,
+    all_rules: &HashMap<&str, &Rule>,
+    all_resources: &HashMap<&str, &Resource>,
+) -> Result<Vec<u8>, NativeError> {
+    // ===== Decompose top-level fold_bytes =====
+    let (text_expr, init_expr, acc_name, byte_name, idx_name, body) = match &rule.logic.value {
+        Expr::FoldBytes(t, i, a, b, ix, body) => {
+            (t.as_ref(), i.as_ref(), a.as_str(), b.as_str(), ix.as_str(), body.as_ref())
+        }
+        _ => return Err(NativeError {
+            message: "emit_fold_bytes_program called on non-FoldBytes top-level expression".into(),
+        }),
+    };
+    if !matches!(rule.output_ty, Type::Number) {
+        return Err(NativeError {
+            message: "fold_bytes native rule must have Number output".into(),
+        });
+    }
+    // Init must be a literal number for native emit. We accept both
+    // `Number(n)` and `Neg(Number(n))` because the parser produces
+    // `-1` as `Neg(Number(1))` until the optimizer folds it. compile_native
+    // tests bypass the optimizer, so accepting both keeps the slice
+    // usable from tests AND from the CLI. Common scan patterns (-1
+    // sentinel, 0 accumulator) satisfy this.
+    let init_literal: i64 = match init_expr {
+        Expr::Number(n) => *n,
+        Expr::Neg(inner) => match inner.as_ref() {
+            Expr::Number(n) => -*n,
+            _ => return Err(NativeError {
+                message: "fold_bytes init must be a literal number (slice 2 scope)".into(),
+            }),
+        },
+        _ => return Err(NativeError {
+            message: "fold_bytes init must be a literal number (slice 2 scope)".into(),
+        }),
+    };
+    // Slice 2: text inner must be Field(input, text_field_name).
+    let text_field_name: &str = match text_expr {
+        Expr::Field(base, fname) if matches!(base.as_ref(), Expr::Ident(n) if n == &rule.input_name) => fname.as_str(),
+        _ => return Err(NativeError {
+            message: "fold_bytes text inner must be a text field of the input (e.g. `i.s`) — slice 2 scope".into(),
+        }),
+    };
+    // Validate the field exists and is Text-typed.
+    let text_field = input_concept.fields.iter().find(|f| f.name == text_field_name).ok_or_else(|| NativeError {
+        message: format!("fold_bytes text field '{}' not found on input concept '{}'", text_field_name, input_concept.name),
+    })?;
+    if !matches!(text_field.ty, Type::Text) {
+        return Err(NativeError {
+            message: format!("fold_bytes text field '{}' must be text-typed", text_field_name),
+        });
+    }
+    // All input fields must be scalar (Number/Text) — same restriction
+    // as the base record-loop prologue.
+    for f in &input_concept.fields {
+        if !matches!(f.ty, Type::Number | Type::Text) {
+            return Err(NativeError {
+                message: format!("fold_bytes input field '{}' has unsupported type (slice 2 supports Number/Text scalars)", f.name),
+            });
+        }
+    }
+
+    // ===== Frame layout =====
+    let nfields = input_concept.fields.len();
+    let n_lets = rule.logic.bindings.len();
+    // Layout: nfields + acc + byte + idx + lets, plus resource and now blocks.
+    let base_slots = nfields + 3 + n_lets; // 3 = acc, byte, idx
+    let referenced_resources: Vec<&Resource> =
+        collect_referenced_resources(rule, all_resources, all_rules, "rule")?;
+    let resource_extra_bytes: i32 = compute_resource_extra_bytes(&referenced_resources);
+    let uses_now = rule_uses_now_unix(rule);
+    let now_extra_bytes: i32 = if uses_now { 16 } else { 0 };
+    let frame_size = (base_slots as i32) * 8 + resource_extra_bytes + now_extra_bytes;
+    let acc_slot: i32 = -(((nfields + 1) as i32) * 8);
+    let byte_slot: i32 = -(((nfields + 2) as i32) * 8);
+    let idx_slot: i32 = -(((nfields + 3) as i32) * 8);
+
+    let mut code = Vec::new();
+    let mut resource_abort_patches: Vec<usize> = Vec::new();
+    let mut text_bindings: TextBindings<'_> = HashMap::new();
+
+    // ===== Prologue: argv guard + rbp frame =====
+    code.extend_from_slice(&[0x4C, 0x8B, 0x24, 0x24]); // mov r12, [rsp]
+    emit_argc_guard(&mut code, (nfields as i32) + 1);
+    code.extend_from_slice(&[0x4C, 0x8D, 0x6C, 0x24, 0x08]); // lea r13, [rsp+8]
+    code.push(0x55); // push rbp
+    code.extend_from_slice(&[0x48, 0x89, 0xE5]); // mov rbp, rsp
+    code.extend_from_slice(&[0x48, 0x81, 0xEC]);
+    code.extend_from_slice(&frame_size.to_le_bytes());
+    code.extend_from_slice(&[0x49, 0xC7, 0xC6, 0x01, 0x00, 0x00, 0x00]); // mov r14, 1 (arg index)
+
+    // ===== Read input fields into slots =====
+    let mut offsets: HashMap<&str, i32> = HashMap::new();
+    for (i, f) in input_concept.fields.iter().enumerate() {
+        let offset = -(((i + 1) as i32) * 8);
+        offsets.insert(f.name.as_str(), offset);
+        // mov rdi, [r13 + r14*8]   — argv[r14]
+        code.extend_from_slice(&[0x4B, 0x8B, 0x7C, 0xF5, 0x00]);
+        match f.ty {
+            Type::Number => {
+                emit_atoi_inline(&mut code);
+                // mov [rbp + offset], rax
+                if offset >= -128 {
+                    code.extend_from_slice(&[0x48, 0x89, 0x45]);
+                    code.push(offset as u8);
+                } else {
+                    code.extend_from_slice(&[0x48, 0x89, 0x85]);
+                    code.extend_from_slice(&offset.to_le_bytes());
+                }
+            }
+            Type::Text => {
+                // store argv pointer at the field slot
+                if offset >= -128 {
+                    code.extend_from_slice(&[0x48, 0x89, 0x7D]);
+                    code.push(offset as u8);
+                } else {
+                    code.extend_from_slice(&[0x48, 0x89, 0xBD]);
+                    code.extend_from_slice(&offset.to_le_bytes());
+                }
+            }
+            _ => unreachable!("scalar-only enforced above"),
+        }
+        // inc r14
+        code.extend_from_slice(&[0x49, 0xFF, 0xC6]);
+    }
+
+    // ===== Resource block (read(<resource>) above the byte loop) =====
+    let mut bottom_cursor: i32 = idx_slot - 8;
+    {
+        let mut next_slot: i32 = bottom_cursor;
+        for r in &referenced_resources {
+            let (ptr_slot, len_slot, _buf_slot, new_next) = emit_resource_read_sequence(
+                &mut code, r, next_slot, &mut resource_abort_patches,
+            );
+            text_bindings.insert(r.name.as_str(), (ptr_slot, len_slot));
+            next_slot = new_next;
+        }
+        bottom_cursor = next_slot;
+    }
+
+    // ===== now_unix() capture (above the byte loop) =====
+    let now_slot: i32 = if uses_now {
+        let s = bottom_cursor - 8;
+        emit_capture_now_unix(&mut code, s);
+        s
+    } else {
+        0
+    };
+    if uses_now {
+        offsets.insert("now", now_slot);
+    }
+
+    // ===== Initialize acc = init_literal, idx = 0 =====
+    // mov rax, init_literal ; mov [rbp + acc_slot], rax
+    emit_mov_rax_imm(&mut code, init_literal);
+    if acc_slot >= -128 {
+        code.extend_from_slice(&[0x48, 0x89, 0x45]);
+        code.push(acc_slot as u8);
+    } else {
+        code.extend_from_slice(&[0x48, 0x89, 0x85]);
+        code.extend_from_slice(&acc_slot.to_le_bytes());
+    }
+    // mov qword [rbp + idx_slot], 0
+    if idx_slot >= -128 {
+        code.extend_from_slice(&[0x48, 0xC7, 0x45]);
+        code.push(idx_slot as u8);
+    } else {
+        code.extend_from_slice(&[0x48, 0xC7, 0x85]);
+        code.extend_from_slice(&idx_slot.to_le_bytes());
+    }
+    code.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // imm32 = 0
+
+    // ===== Load text field: rsi = ptr, rcx = len (via strlen) =====
+    let text_field_offset = offsets[text_field_name];
+    // mov rsi, [rbp + text_field_offset]
+    if text_field_offset >= -128 {
+        code.extend_from_slice(&[0x48, 0x8B, 0x75]);
+        code.push(text_field_offset as u8);
+    } else {
+        code.extend_from_slice(&[0x48, 0x8B, 0xB5]);
+        code.extend_from_slice(&text_field_offset.to_le_bytes());
+    }
+    emit_strlen(&mut code); // rdx = length
+    // mov rcx, rdx
+    code.extend_from_slice(&[0x48, 0x89, 0xD1]);
+
+    // ===== Register acc/byte/idx in offsets for the body's emit_eval_expr =====
+    offsets.insert(acc_name, acc_slot);
+    offsets.insert(byte_name, byte_slot);
+    offsets.insert(idx_name, idx_slot);
+
+    let field_ranges = build_field_ranges(input_concept);
+
+    // ===== Emit let-binding prologue (number-only for slice 2) =====
+    // Same convention as other emitters: one slot per let, evaluated in
+    // source order, registered in offsets.
+    for (let_idx, (name, expr)) in rule.logic.bindings.iter().enumerate() {
+        let slot = -(((nfields + 3 + let_idx + 1) as i32) * 8);
+        emit_eval_expr(&mut code, expr, &rule.input_name, &offsets, all_rules, &field_ranges, &text_bindings)?;
+        // mov [rbp + slot], rax
+        if slot >= -128 {
+            code.extend_from_slice(&[0x48, 0x89, 0x45]);
+            code.push(slot as u8);
+        } else {
+            code.extend_from_slice(&[0x48, 0x89, 0x85]);
+            code.extend_from_slice(&slot.to_le_bytes());
+        }
+        offsets.insert(name, slot);
+    }
+
+    // ===== Byte loop =====
+    let loop_top = code.len();
+    // test rcx, rcx ; jz .done (rel32 placeholder)
+    code.extend_from_slice(&[0x48, 0x85, 0xC9]);
+    code.push(0x0F); code.push(0x84);
+    let done_patch = code.len();
+    code.extend_from_slice(&[0; 4]);
+
+    // movzx rax, byte [rsi]
+    code.extend_from_slice(&[0x48, 0x0F, 0xB6, 0x06]);
+    // mov [rbp + byte_slot], rax
+    if byte_slot >= -128 {
+        code.extend_from_slice(&[0x48, 0x89, 0x45]);
+        code.push(byte_slot as u8);
+    } else {
+        code.extend_from_slice(&[0x48, 0x89, 0x85]);
+        code.extend_from_slice(&byte_slot.to_le_bytes());
+    }
+    // Save rsi/rcx across body (emit_eval_expr may clobber)
+    code.push(0x56); // push rsi
+    code.push(0x51); // push rcx
+
+    // Body — emits to rax
+    emit_eval_expr(&mut code, body, &rule.input_name, &offsets, all_rules, &field_ranges, &text_bindings)?;
+
+    // Restore rsi/rcx
+    code.push(0x59); // pop rcx
+    code.push(0x5E); // pop rsi
+    // mov [rbp + acc_slot], rax (next accumulator)
+    if acc_slot >= -128 {
+        code.extend_from_slice(&[0x48, 0x89, 0x45]);
+        code.push(acc_slot as u8);
+    } else {
+        code.extend_from_slice(&[0x48, 0x89, 0x85]);
+        code.extend_from_slice(&acc_slot.to_le_bytes());
+    }
+    // inc rsi ; dec rcx
+    code.extend_from_slice(&[0x48, 0xFF, 0xC6]);
+    code.extend_from_slice(&[0x48, 0xFF, 0xC9]);
+    // inc qword [rbp + idx_slot]
+    if idx_slot >= -128 {
+        code.extend_from_slice(&[0x48, 0xFF, 0x45]);
+        code.push(idx_slot as u8);
+    } else {
+        code.extend_from_slice(&[0x48, 0xFF, 0x85]);
+        code.extend_from_slice(&idx_slot.to_le_bytes());
+    }
+    // jmp .loop (rel32 backward)
+    code.push(0xE9);
+    let back = loop_top as i32 - (code.len() as i32 + 4);
+    code.extend_from_slice(&back.to_le_bytes());
+
+    // .done:
+    let done_pos = code.len();
+    let done_rel = done_pos as i32 - (done_patch as i32 + 4);
+    code[done_patch..done_patch + 4].copy_from_slice(&done_rel.to_le_bytes());
+
+    // Load final acc into rax
+    if acc_slot >= -128 {
+        code.extend_from_slice(&[0x48, 0x8B, 0x45]);
+        code.push(acc_slot as u8);
+    } else {
+        code.extend_from_slice(&[0x48, 0x8B, 0x85]);
+        code.extend_from_slice(&acc_slot.to_le_bytes());
+    }
+
+    // ===== Exit: itoa to stdout + sys_exit(0) =====
+    emit_itoa_inline(&mut code);
+    // sys_exit(0)
+    code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x3C, 0x00, 0x00, 0x00]); // mov rax, 60
+    code.extend_from_slice(&[0x48, 0x31, 0xFF]);                          // xor rdi, rdi
+    code.extend_from_slice(&[0x0F, 0x05]);                                // syscall
+
+    // ===== Resource abort tail =====
+    emit_resource_abort_tail(&mut code, &resource_abort_patches);
+
+    Ok(code)
 }
 
 /// Returns true if the expression tree contains any Quantifier node.
@@ -17629,6 +17958,80 @@ rule pick
         assert!(
             size < 2500,
             "ISO date parser binary should stay under 2.5 KB; got {}",
+            size
+        );
+        let _ = fs::remove_file(&out);
+    }
+
+    /// `fold_bytes` native emit slice 2 (2026-05-15).
+    ///
+    /// Top-level Number rule whose body is exactly
+    /// `n = fold_bytes(<input.field>, <init_literal>, acc, byte, idx => <body>)`
+    /// now compiles to a native binary that loops over the text field's
+    /// bytes, threads the accumulator through each iteration, and writes
+    /// the final value to stdout. Companion to PR #21 (semantic surface
+    /// + interpreter only). Native binary size: ~580 B for the canonical
+    /// "find first digit position" scan.
+    ///
+    /// This test pins the same six cases as the interpreter regression
+    /// (fold_bytes_find_first_digit_position) but routes through the
+    /// native ELF instead — proving the algorithm produces identical
+    /// results in both backends.
+    #[test]
+    fn slice_fold_bytes_native_runtime() {
+        use std::fs;
+        use std::process::Command;
+        let src = r#"@verbose 0.1.0
+
+concept Input
+  @intention: "x"
+  @source: invoices.intent:1
+  fields:
+    s : text
+
+rule first_digit_pos
+  @intention: "position of first ASCII digit, or -1"
+  @source: invoices.intent:1
+  input:
+    i : Input
+  output:
+    n : number
+  logic:
+    n = fold_bytes(i.s, -1, acc, b, idx =>
+      if acc >= 0 then acc
+      else if b >= 48 and b <= 57 then idx
+      else acc)
+  proofs:
+    purity:
+      reads : [i.s]
+      calls : []
+    termination:
+      bound : 50
+"#;
+        let tokens = crate::lexer::Lexer::new(src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+        let out = std::env::temp_dir().join("verbosec_test_fold_bytes_native");
+        compile_native(&program, "first_digit_pos", out.to_str().unwrap(), false, false)
+            .expect("fold_bytes top-level Number rule should compile in native");
+        let run = |arg: &str| -> (i32, String) {
+            let r = Command::new(&out).args([arg]).output().expect("spawn");
+            (
+                r.status.code().unwrap_or(-1),
+                String::from_utf8_lossy(&r.stdout).trim_end_matches('\n').to_string(),
+            )
+        };
+        // Same six cases as the interpreter regression — identical results.
+        assert_eq!(run("  42"), (0, "2".into()), "digit at idx 2");
+        assert_eq!(run("123"), (0, "0".into()), "digit at idx 0");
+        assert_eq!(run("abc"), (0, "-1".into()), "no digit → init preserved");
+        assert_eq!(run(""), (0, "-1".into()), "empty input → no iteration → init");
+        assert_eq!(run("a9"), (0, "1".into()), "digit at idx 1");
+        assert_eq!(run("xxxxxx5"), (0, "6".into()), "digit at end");
+        // Binary size budget — scan rule should stay tight.
+        let size = fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
+        assert!(
+            size < 1000,
+            "fold_bytes native binary should stay under 1 KB; got {}",
             size
         );
         let _ = fs::remove_file(&out);
