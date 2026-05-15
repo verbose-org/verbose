@@ -17963,6 +17963,60 @@ rule pick
         let _ = fs::remove_file(&out);
     }
 
+    /// Worked example exercising the full tokenizer-primitive stack
+    /// (fold_bytes + short-circuit and/or + comparison + arithmetic)
+    /// on a real shape: byte classifier with three rules counting
+    /// digits, letters, and whitespace.
+    ///
+    /// The point: validate that the primitives compose in a single
+    /// native binary, and that each rule emits a tight binary (~600 B).
+    /// Pinned through examples/byte_classifier.verbose so the
+    /// example stays exercised in CI.
+    #[test]
+    fn byte_classifier_worked_example_runtime() {
+        use std::fs;
+        use std::process::Command;
+        let src = fs::read_to_string("examples/byte_classifier.verbose")
+            .expect("examples/byte_classifier.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+
+        let run = |rule: &str, arg: &str| -> (i32, String) {
+            let bin = std::env::temp_dir().join(format!("verbosec_test_byte_classifier_{}", rule));
+            compile_native(&program, rule, bin.to_str().unwrap(), false, false)
+                .expect("compile");
+            let r = Command::new(&bin).args([arg]).output().expect("spawn");
+            let code = r.status.code().unwrap_or(-1);
+            let stdout = String::from_utf8_lossy(&r.stdout).trim_end_matches('\n').to_string();
+            // Size budget per rule: each fold_bytes rule should stay tight.
+            let size = fs::metadata(&bin).map(|m| m.len()).unwrap_or(0);
+            assert!(size < 800, "rule '{}' binary should stay under 800 B; got {}", rule, size);
+            let _ = fs::remove_file(&bin);
+            (code, stdout)
+        };
+
+        // count_digits
+        assert_eq!(run("count_digits", "abc123"), (0, "3".into()));
+        assert_eq!(run("count_digits", "hello"), (0, "0".into()));
+        assert_eq!(run("count_digits", "42+8=50"), (0, "5".into()),
+            "5 digits: 4, 2, 8, 5, 0");
+        assert_eq!(run("count_digits", ""), (0, "0".into()), "empty source");
+
+        // count_letters
+        assert_eq!(run("count_letters", "abc123"), (0, "3".into()));
+        assert_eq!(run("count_letters", "Hello, World!"), (0, "10".into()),
+            "H,e,l,l,o,W,o,r,l,d = 10 letters");
+        assert_eq!(run("count_letters", "123 + 456"), (0, "0".into()),
+            "no letters");
+
+        // count_whitespace
+        assert_eq!(run("count_whitespace", "a b c"), (0, "2".into()),
+            "two spaces between three letters");
+        assert_eq!(run("count_whitespace", "hello"), (0, "0".into()));
+        assert_eq!(run("count_whitespace", "a\tb"), (0, "1".into()),
+            "tab counts");
+    }
+
     /// `fold_bytes` native emit slice 2 (2026-05-15).
     ///
     /// Top-level Number rule whose body is exactly

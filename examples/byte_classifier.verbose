@@ -1,0 +1,79 @@
+@verbose 0.1.0
+
+concept Input
+  @intention: "Source text whose bytes we classify"
+  @source: byte_classifier.intent:1
+
+  fields:
+    source : text
+
+
+rule count_digits
+  @intention: "Count of ASCII digit bytes (0x30..0x39) in the source"
+  @source: byte_classifier.intent:3
+
+  input:
+    i : Input
+
+  output:
+    n : number
+
+  logic:
+    n = fold_bytes(i.source, 0, acc, b, idx =>
+      if b >= 48 and b <= 57 then acc + 1
+      else acc)
+
+  proofs:
+    purity:
+      reads : [i.source]
+      calls : []
+    termination:
+      bound : 20
+
+
+rule count_letters
+  @intention: "Count of ASCII letter bytes (A-Z or a-z) in the source"
+  @source: byte_classifier.intent:3
+
+  input:
+    i : Input
+
+  output:
+    n : number
+
+  logic:
+    n = fold_bytes(i.source, 0, acc, b, idx =>
+      if b >= 65 and b <= 90 then acc + 1
+      else if b >= 97 and b <= 122 then acc + 1
+      else acc)
+
+  proofs:
+    purity:
+      reads : [i.source]
+      calls : []
+    termination:
+      bound : 20
+
+
+rule count_whitespace
+  @intention: "Count of space (0x20) and tab (0x09) bytes in the source"
+  @source: byte_classifier.intent:3
+
+  input:
+    i : Input
+
+  output:
+    n : number
+
+  logic:
+    n = fold_bytes(i.source, 0, acc, b, idx =>
+      if b == 32 then acc + 1
+      else if b == 9 then acc + 1
+      else acc)
+
+  proofs:
+    purity:
+      reads : [i.source]
+      calls : []
+    termination:
+      bound : 20

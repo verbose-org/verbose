@@ -1,0 +1,16 @@
+A byte classifier — given a single source text, count bytes of various classes via fold_bytes.
+
+1. The input is one text field `source` containing arbitrary bytes (ASCII expected for the canonical cases).
+2. Each rule outputs a `number`: the count of bytes in the source that match a specific class.
+3. Three rules are provided:
+   - `count_digits` — bytes in `0x30..0x39` (ASCII '0' through '9')
+   - `count_letters` — bytes in `0x41..0x5A` (uppercase 'A'..'Z') or `0x61..0x7A` (lowercase 'a'..'z')
+   - `count_whitespace` — bytes equal to `0x20` (space) or `0x09` (tab)
+
+Each rule is a single top-level `fold_bytes(source, 0, acc, b, idx => if classified then acc + 1 else acc)`. The body uses short-circuit `and` for the range checks. Native binary expected to be small — a few hundred bytes per rule.
+
+This is the worked example demonstrating that the full tokenizer-primitive stack (fold_bytes + short-circuit and/or + comparisons + arithmetic) composes into a native binary that scans a text byte-by-byte. The next class of demos would extract the bytes (substring at runtime offsets), which requires either:
+- fold_bytes in expression position (currently refused in native; let-RHS / Record fields / etc.)
+- An accumulator that's a richer shape than Number (Record or collection)
+
+Both are follow-up slices; this example establishes the bottom of the stack first.
