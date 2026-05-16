@@ -16,6 +16,14 @@ pub enum Value {
     Ok(Box<Value>),
     /// Err(inner) — the declared failure arm of a Result-typed output.
     Err(Box<Value>),
+    /// Phase A slice 2: a value of a sum-type concept, tagged with its
+    /// concept name + variant name and carrying the payload field values
+    /// (empty when the variant has no payload).
+    Variant {
+        concept: String,
+        variant: String,
+        fields: HashMap<String, Value>,
+    },
 }
 
 impl fmt::Display for Value {
@@ -46,6 +54,22 @@ impl fmt::Display for Value {
             }
             Value::Ok(inner) => write!(f, "Ok({})", inner),
             Value::Err(inner) => write!(f, "Err({})", inner),
+            Value::Variant { concept, variant, fields } => {
+                write!(f, "{}::{}", concept, variant)?;
+                if !fields.is_empty() {
+                    write!(f, " {{")?;
+                    let mut first = true;
+                    for (k, v) in fields {
+                        if !first {
+                            write!(f, ", ")?;
+                        }
+                        write!(f, "{}: {}", k, v)?;
+                        first = false;
+                    }
+                    write!(f, "}}")?;
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -452,6 +476,23 @@ fn eval_expr(
                 map.insert(name.clone(), v);
             }
             Ok(Value::Record(map))
+        }
+        // Phase A slice 2: variant construction. Evaluate each payload field
+        // expression in source order, collect into a HashMap, and tag with
+        // (concept, variant). No-payload variants produce an empty fields map.
+        // The verifier already validated the concept/variant/field set, so
+        // here we trust the structure.
+        Expr::VariantConstruct(concept_name, variant_name, fields) => {
+            let mut map = HashMap::new();
+            for (name, expr) in fields {
+                let v = eval_expr(expr, env, all_rules)?;
+                map.insert(name.clone(), v);
+            }
+            Ok(Value::Variant {
+                concept: concept_name.clone(),
+                variant: variant_name.clone(),
+                fields: map,
+            })
         }
         Expr::Concat(args) => {
             // Variadic text builder. Each argument is converted to its text
@@ -1553,5 +1594,107 @@ mod tests {
         assert_eq!(run("a9"), Value::Number(1));
         // Long input: 'xxxxxx5' → 6 (digit at end)
         assert_eq!(run("xxxxxx5"), Value::Number(6));
+    }
+
+    /// Phase A slice 2 — variant construction in the interpreter.
+    ///
+    /// `Expr::VariantConstruct(concept, variant, fields)` evaluates to a
+    /// `Value::Variant` tagged with the concept + variant name and carrying
+    /// the evaluated payload. No-payload variants produce a Variant whose
+    /// fields map is empty (NOT a Record or a Unit — the tag is what
+    /// distinguishes the variant). This is the runtime semantics the
+    /// later pattern-match slice (A.3) will dispatch on.
+    #[test]
+    fn phase_a2_variant_construct_runtime() {
+        // Build a rule manually:
+        //   rule wrap_id
+        //     input:  i : Input  (id: number)
+        //     output: t : Token
+        //     logic:  t = Token::Int { value: i.id }
+        //
+        // We don't need the concept declarations at runtime — the
+        // interpreter only sees the AST. The verifier validates the
+        // shape; the interpreter trusts it.
+        let payload_rule = Rule {
+            name: "wrap_id".into(),
+            intention: "t".into(),
+            source: SourceRef { file: "t.intent".into(), line: 1 },
+            input_name: "i".into(),
+            input_ty: Type::Named("Input".into()),
+            output_name: "t".into(),
+            output_ty: Type::Named("Token".into()),
+            logic: LogicStmt {
+                bindings: vec![],
+                target: "t".into(),
+                value: Expr::VariantConstruct(
+                    "Token".into(),
+                    "Int".into(),
+                    vec![(
+                        "value".into(),
+                        Expr::Field(Box::new(Expr::Ident("i".into())), "id".into()),
+                    )],
+                ),
+            },
+            proofs: Proofs {
+                purity: Purity {
+                    reads: vec![Path { segments: vec!["i".into(), "id".into()] }],
+                    calls: vec![],
+                },
+                termination: Termination { bound: Some(1) },
+            },
+            hints: None,
+            layer: None,
+            context_name: None,
+            context_ty: None,
+        };
+
+        let mut input = HashMap::new();
+        input.insert("id".into(), Value::Number(42));
+        let result = eval_rule(&payload_rule, &[], &input).unwrap();
+        match result {
+            Value::Variant { concept, variant, fields } => {
+                assert_eq!(concept, "Token");
+                assert_eq!(variant, "Int");
+                assert_eq!(fields.len(), 1);
+                assert_eq!(fields.get("value"), Some(&Value::Number(42)));
+            }
+            other => panic!("expected Value::Variant, got {:?}", other),
+        }
+
+        // No-payload variant: Token::Eof
+        let eof_rule = Rule {
+            name: "make_eof".into(),
+            intention: "t".into(),
+            source: SourceRef { file: "t.intent".into(), line: 1 },
+            input_name: "i".into(),
+            input_ty: Type::Named("Input".into()),
+            output_name: "t".into(),
+            output_ty: Type::Named("Token".into()),
+            logic: LogicStmt {
+                bindings: vec![],
+                target: "t".into(),
+                value: Expr::VariantConstruct("Token".into(), "Eof".into(), vec![]),
+            },
+            proofs: Proofs {
+                purity: Purity {
+                    reads: vec![],
+                    calls: vec![],
+                },
+                termination: Termination { bound: Some(1) },
+            },
+            hints: None,
+            layer: None,
+            context_name: None,
+            context_ty: None,
+        };
+        let result = eval_rule(&eof_rule, &[], &HashMap::new()).unwrap();
+        match result {
+            Value::Variant { concept, variant, fields } => {
+                assert_eq!(concept, "Token");
+                assert_eq!(variant, "Eof");
+                assert!(fields.is_empty(), "no-payload variant has empty fields map");
+            }
+            other => panic!("expected Value::Variant, got {:?}", other),
+        }
     }
 }

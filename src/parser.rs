@@ -651,6 +651,40 @@ impl Parser {
             Ok(Expr::Number(n))
         } else if is_ident {
             let name = self.expect_ident_any()?;
+            if self.check_kind(&TokenKind::DoubleColon) {
+                // Phase A slice 2: variant construction.
+                // `ConceptName::VariantName { field: expr, ... }`  (with payload)
+                // `ConceptName::VariantName`                       (no payload)
+                //
+                // The verifier resolves the concept/variant and cross-checks
+                // the field set. Same field-block shape as `Record(name, fields)`
+                // below, with the variant qualifier captured as the second
+                // String in the AST node.
+                self.advance(); // ::
+                let variant_name = self.expect_ident_any()?;
+                let mut fields = Vec::new();
+                if self.check_kind(&TokenKind::LBrace) {
+                    self.advance(); // {
+                    if !self.check_kind(&TokenKind::RBrace) {
+                        loop {
+                            let field_name = self.expect_ident_any()?;
+                            self.expect_kind(TokenKind::Colon)?;
+                            let value = self.parse_expr()?;
+                            fields.push((field_name, value));
+                            if self.check_kind(&TokenKind::Comma) {
+                                self.advance();
+                                if self.check_kind(&TokenKind::RBrace) {
+                                    break;
+                                }
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                    self.expect_kind(TokenKind::RBrace)?;
+                }
+                return Ok(Expr::VariantConstruct(name, variant_name, fields));
+            }
             if (name == "sum" || name == "count" || name == "min" || name == "max") && self.check_kind(&TokenKind::LParen) {
                 // Sugar: sum(coll, var => expr) → fold(coll, 0, __acc, var => __acc + expr)
                 //        count(coll, var => pred) → fold(coll, 0, __acc, var => __acc + if pred then 1 else 0)

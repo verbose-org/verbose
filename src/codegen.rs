@@ -212,6 +212,7 @@ fn emit_expr(expr: &Expr, input_name: &str, concept: Option<&Concept>) -> String
         | Expr::Err(_)
         | Expr::MatchResult(_, _, _, _, _)
         | Expr::Record(_, _)
+        | Expr::VariantConstruct(_, _, _)
         | Expr::Concat(_)
         | Expr::Read(_)
         | Expr::Fetch(_, _)
@@ -227,7 +228,7 @@ fn emit_expr(expr: &Expr, input_name: &str, concept: Option<&Concept>) -> String
         | Expr::Max(_, _)
         | Expr::Substring(_, _, _)
         | Expr::ByteAt(_, _) => {
-            "(/* collection/result/record/concat/read/fetch/json_escape/parse_int/now_unix/starts_with/contains/ends_with/length/abs/min/max/substring/byte_at/fold_bytes op: use --run interpreter or --native */false)".to_string()
+            "(/* collection/result/record/variant/concat/read/fetch/json_escape/parse_int/now_unix/starts_with/contains/ends_with/length/abs/min/max/substring/byte_at/fold_bytes op: use --run interpreter or --native */false)".to_string()
         }
         Expr::Call(name, _args) => {
             if let Some(c) = concept {
