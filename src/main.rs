@@ -481,6 +481,15 @@ fn main() {
             })
             .collect();
 
+        let all_concepts: Vec<&ast::Concept> = program
+            .items
+            .iter()
+            .filter_map(|i| match i {
+                ast::Item::Concept(c) => Some(c),
+                _ => None,
+            })
+            .collect();
+
         // Check if it's a reaction
         let reaction = program.items.iter().find_map(|i| match i {
             ast::Item::Reaction(rx) if rx.name == rule_name => Some(rx),
@@ -506,7 +515,7 @@ fn main() {
                 rule_name, rx.trigger, records.len());
 
             for (idx, record) in records.iter().enumerate() {
-                match interpreter::eval_rule(trigger_rule, &all_rules, record) {
+                match interpreter::eval_rule(trigger_rule, &all_rules, &all_concepts, record) {
                     Ok(val) => {
                         let should_fire = match &val {
                             interpreter::Value::Bool(true) => true,
@@ -518,7 +527,7 @@ fn main() {
                                 match effect {
                                     ast::Effect::Print(args) => {
                                         let parts: Vec<String> = args.iter().map(|arg| {
-                                            match interpreter::eval_rule_expr(arg, trigger_rule, &all_rules, record) {
+                                            match interpreter::eval_rule_expr(arg, trigger_rule, &all_rules, &all_concepts, record) {
                                                 Ok(v) => format!("{}", v),
                                                 Err(_) => format!("{:?}", arg),
                                             }
@@ -530,7 +539,7 @@ fn main() {
                                         // append to the declared path. The path is a
                                         // literal at parse time, so this is the only
                                         // file this effect can ever touch.
-                                        let text = match interpreter::eval_rule_expr(content, trigger_rule, &all_rules, record) {
+                                        let text = match interpreter::eval_rule_expr(content, trigger_rule, &all_rules, &all_concepts, record) {
                                             Ok(interpreter::Value::Text(s)) => s,
                                             Ok(interpreter::Value::Number(n)) => n.to_string(),
                                             Ok(interpreter::Value::Bool(b)) => b.to_string(),
@@ -590,7 +599,7 @@ fn main() {
             // Machine-readable JSON output
             let mut results = Vec::new();
             for record in records.iter() {
-                match interpreter::eval_rule(rule, &all_rules, record) {
+                match interpreter::eval_rule(rule, &all_rules, &all_concepts, record) {
                     Ok(val) => {
                         let json_val = value_to_json(&val);
                         results.push(format!(
@@ -613,7 +622,7 @@ fn main() {
                 records.len()
             );
             for (idx, record) in records.iter().enumerate() {
-                match interpreter::eval_rule(rule, &all_rules, record) {
+                match interpreter::eval_rule(rule, &all_rules, &all_concepts, record) {
                     Ok(val) => {
                         println!("  [{}] {} = {}", idx, rule.output_name, val);
                     }

@@ -673,6 +673,53 @@ pub enum Expr {
     /// Native emit deferred to slice A.4+ (tagged union layout +
     /// dispatch). Interpreter handles construction today.
     VariantConstruct(String, String, Vec<(String, Expr)>),
+    /// Phase A slice 3 — pattern match across a sum-type's variants.
+    /// Syntax (block form):
+    ///
+    /// ```verbose
+    /// match e:
+    ///   VarA(x, _, z) => body_a
+    ///   VarB(n)       => body_b
+    ///   VarC          => body_c       -- no-payload variant
+    /// ```
+    ///
+    /// Layout: (scrutinee, arms). Each arm pins one variant of the
+    /// scrutinee's concept and provides a (positional) destructuring
+    /// of the variant's payload — `None` is the wildcard `_`,
+    /// `Some(name)` binds the field's value to `name` in the arm's
+    /// body. Binders are positional (one per declared payload field,
+    /// in declaration order); the body is scoped to its own arm so
+    /// binders can be reused across arms without collision.
+    ///
+    /// Verifier cross-checks (slice 3):
+    ///   - scrutinee type is `Type::Named(C)` for a sum-type concept C
+    ///     (verifier rejects if C is a record concept or unknown)
+    ///   - every arm's variant name exists on C
+    ///   - every arm's binder count == that variant's payload arity
+    ///   - the set of arm variant names equals C's variant set exactly
+    ///     (no missing variant, no duplicate, no unknown extra)
+    ///   - each arm body typechecks against the rule's output type
+    ///     (with binders introduced into the lambda-scope set so
+    ///     purity's `reads:` proof doesn't trip on them)
+    ///
+    /// Generalization of the existing `match_result` (which stays
+    /// grandfathered for `Result(T, E)` consumption). Native emit
+    /// deferred to slice A.4+ (tag dispatch + payload load); today the
+    /// interpreter handles dispatch and binding.
+    MatchVariant(Box<Expr>, Vec<MatchArm>),
+}
+
+/// Phase A slice 3 — one arm of a pattern match. Each arm pins a
+/// variant by name and provides positional destructuring of its
+/// payload. A `None` binder is the wildcard `_` (skip the field);
+/// `Some(name)` binds the field's value to `name` in `body`'s scope.
+/// `binders` length MUST match the variant's payload arity; the
+/// verifier rejects mismatches with a clear breadcrumb.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MatchArm {
+    pub variant_name: String,
+    pub binders: Vec<Option<String>>,
+    pub body: Expr,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

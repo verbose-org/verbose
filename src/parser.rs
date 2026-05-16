@@ -634,6 +634,73 @@ impl Parser {
                 Box::new(else_expr),
             ));
         }
+        // Phase A slice 3 — block-form pattern match:
+        //
+        //   match <scrutinee>:
+        //     VarA(b1, _, b3) => body_a
+        //     VarB(n)         => body_b
+        //     VarC            => body_c          -- no-payload variant
+        //
+        // After `match` we parse the scrutinee on the same line, an
+        // explicit `:`, then NEWLINE INDENT, one arm per line, DEDENT.
+        // Arms are positional destructurings of the matched variant's
+        // payload — `_` is a wildcard (no binding), every other ident
+        // binds the field's value to that name in the arm body.
+        //
+        // Exhaustiveness, arm-arity, and binder-collision are verifier
+        // checks (slice 3 of Phase A), not parser-level. The parser
+        // only enforces the syntactic shape; semantic validation
+        // happens against the resolved sum-type concept.
+        //
+        // `match` is reserved in expression position here: once we see
+        // it, we commit to parsing the block form. The standalone
+        // identifier `match` is not used elsewhere in the language.
+        if self.check_ident("match") {
+            self.advance(); // match
+            let scrutinee = self.parse_expr()?;
+            self.expect_kind(TokenKind::Colon)?;
+            self.expect_kind(TokenKind::Newline)?;
+            self.expect_kind(TokenKind::Indent)?;
+            let mut arms: Vec<MatchArm> = Vec::new();
+            while !self.check_kind(&TokenKind::Dedent) && !self.at_eof() {
+                // Skip stray blank lines between arms.
+                if self.check_kind(&TokenKind::Newline) {
+                    self.advance();
+                    continue;
+                }
+                let variant_name = self.expect_ident_any()?;
+                let mut binders: Vec<Option<String>> = Vec::new();
+                if self.check_kind(&TokenKind::LParen) {
+                    self.advance(); // (
+                    if !self.check_kind(&TokenKind::RParen) {
+                        loop {
+                            let binder = self.expect_ident_any()?;
+                            // `_` is the wildcard; every other ident
+                            // binds the field positionally.
+                            if binder == "_" {
+                                binders.push(None);
+                            } else {
+                                binders.push(Some(binder));
+                            }
+                            if self.check_kind(&TokenKind::Comma) {
+                                self.advance();
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                    self.expect_kind(TokenKind::RParen)?;
+                }
+                self.expect_kind(TokenKind::FatArrow)?;
+                let body = self.parse_expr()?;
+                // Each arm ends with a NEWLINE (lexer always emits one
+                // at end-of-line). The DEDENT closes the block.
+                self.expect_kind(TokenKind::Newline)?;
+                arms.push(MatchArm { variant_name, binders, body });
+            }
+            self.expect_kind(TokenKind::Dedent)?;
+            return Ok(Expr::MatchVariant(Box::new(scrutinee), arms));
+        }
         if matches!(self.peek_kind(), Some(TokenKind::LParen)) {
             self.advance();
             let expr = self.parse_expr()?;
