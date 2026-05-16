@@ -379,6 +379,13 @@ fn collect_read_names(expr: &Expr, out: &mut Vec<String>) {
             collect_read_names(init, out);
             collect_read_names(body, out);
         }
+        // Phase A slice 2: variant construction — recurse into each field
+        // assignment's expression. Same shape as `Record`.
+        Expr::VariantConstruct(_, _, fields) => {
+            for (_, e) in fields {
+                collect_read_names(e, out);
+            }
+        }
     }
 }
 
@@ -510,6 +517,13 @@ fn collect_fetch_names(expr: &Expr, out: &mut Vec<String>) {
             collect_fetch_names(init, out);
             collect_fetch_names(body, out);
         }
+        // Phase A slice 2: variant construction — recurse into each field
+        // assignment's expression. Same shape as `Record`.
+        Expr::VariantConstruct(_, _, fields) => {
+            for (_, e) in fields {
+                collect_fetch_names(e, out);
+            }
+        }
     }
 }
 
@@ -613,6 +627,13 @@ fn collect_fetch_names_with_dups(expr: &Expr, out: &mut Vec<String>) {
             collect_fetch_names_with_dups(t, out);
             collect_fetch_names_with_dups(init, out);
             collect_fetch_names_with_dups(body, out);
+        }
+        // Phase A slice 2: variant construction — recurse into each field
+        // assignment's expression. Same shape as `Record`.
+        Expr::VariantConstruct(_, _, fields) => {
+            for (_, e) in fields {
+                collect_fetch_names_with_dups(e, out);
+            }
         }
     }
 }
@@ -1111,6 +1132,7 @@ fn describe_expr_kind(e: &Expr) -> &'static str {
         Expr::Substring(_, _, _) => "substring",
         Expr::ByteAt(_, _) => "byte_at",
         Expr::FoldBytes(_, _, _, _, _, _) => "fold_bytes",
+        Expr::VariantConstruct(_, _, _) => "variant construction",
     }
 }
 
@@ -1670,6 +1692,107 @@ fn check_expr_against(
                 ),
             });
         }
+        // Phase A slice 2: variant construction —
+        // `ConceptName::VariantName { field: expr, ... }`. Cross-check that
+        // the concept is a sum-type concept, the variant exists, and the
+        // assignment field set matches the variant's payload exactly.
+        (Expr::VariantConstruct(name, variant_name, fields), expected_ty) => {
+            let concept = match all_concepts.get(name) {
+                Some(c) => *c,
+                None => {
+                    errors.push(VerifyError {
+                        context: format!("rule '{}' / logic", rule.name),
+                        message: format!(
+                            "variant constructor references unknown concept '{}'",
+                            name
+                        ),
+                    });
+                    return;
+                }
+            };
+            // Concept must be a sum type (non-empty variants, empty fields).
+            if concept.variants.is_empty() {
+                errors.push(VerifyError {
+                    context: format!("rule '{}' / logic", rule.name),
+                    message: format!(
+                        "concept '{}' is a record concept (has fields), expected sum-type concept for variant construction `{}::{}`",
+                        name, name, variant_name
+                    ),
+                });
+                return;
+            }
+            // Locate the named variant.
+            let variant = match concept.variants.iter().find(|v| &v.name == variant_name) {
+                Some(v) => v,
+                None => {
+                    let available: Vec<&str> = concept.variants.iter().map(|v| v.name.as_str()).collect();
+                    errors.push(VerifyError {
+                        context: format!("rule '{}' / logic", rule.name),
+                        message: format!(
+                            "concept '{}' has no variant named '{}' (available: {})",
+                            name,
+                            variant_name,
+                            available.join(", ")
+                        ),
+                    });
+                    return;
+                }
+            };
+            // Expected type, when known, should be the named concept.
+            let shape_matches = match expected_ty {
+                Type::Named(n) => n == name,
+                Type::Collection(elem) => elem == name, // for use inside a map body
+                _ => false,
+            };
+            if !shape_matches {
+                errors.push(VerifyError {
+                    context: format!("rule '{}' / logic", rule.name),
+                    message: format!(
+                        "variant constructor '{}::{}' produces type '{}' but context expects '{}'",
+                        name,
+                        variant_name,
+                        name,
+                        type_display(expected_ty),
+                    ),
+                });
+            }
+            // Field set: every payload field must be provided, no extras.
+            let provided: HashSet<&str> = fields.iter().map(|(n, _)| n.as_str()).collect();
+            let declared: HashSet<&str> = variant.fields.iter().map(|f| f.name.as_str()).collect();
+            for missing in declared.difference(&provided) {
+                errors.push(VerifyError {
+                    context: format!("rule '{}' / logic", rule.name),
+                    message: format!(
+                        "variant constructor '{}::{}' is missing payload field '{}'",
+                        name, variant_name, missing
+                    ),
+                });
+            }
+            for extra in provided.difference(&declared) {
+                errors.push(VerifyError {
+                    context: format!("rule '{}' / logic", rule.name),
+                    message: format!(
+                        "variant constructor '{}::{}' has unknown payload field '{}'",
+                        name, variant_name, extra
+                    ),
+                });
+            }
+            // Per-field type check: each provided field's expression must
+            // match the declared payload field's type (when inferable).
+            for (field_name, field_expr) in fields {
+                if let Some(decl) = variant.fields.iter().find(|f| &f.name == field_name) {
+                    check_expr_against(
+                        field_expr,
+                        &decl.ty,
+                        rule,
+                        all_rules,
+                        input_concept,
+                        all_concepts,
+                        errors,
+                    );
+                }
+            }
+        }
         // Record(ConceptName) construction: cross-check field set + types.
         (Expr::Record(name, fields), expected_ty) => {
             let concept = match all_concepts.get(name) {
@@ -1800,6 +1923,9 @@ fn infer_expr_type(
         Expr::If(_, then_e, _) => infer_expr_type(then_e, rule, all_rules, concept),
         Expr::Quantifier(_, _, _, _) => Some(Type::Bool),
         Expr::Record(name, _) => Some(Type::Named(name.clone())),
+        // Phase A slice 2: variant construction yields the concept type —
+        // same outer shape as record construction.
+        Expr::VariantConstruct(name, _, _) => Some(Type::Named(name.clone())),
         Expr::Concat(_) => Some(Type::Text),
         // Phase 11 slice 1: fetch(<connection>, _) returns text — same
         // inference as read(<resource>). Existence of the connection and
@@ -2156,6 +2282,12 @@ fn walk_for_match_result_callees(
             walk_for_match_result_callees(init, rules_by_name, all_resources, all_connections, visited, out_reads);
             walk_for_match_result_callees(body, rules_by_name, all_resources, all_connections, visited, out_reads);
         }
+        // Phase A slice 2: recurse into each field assignment's expression.
+        Expr::VariantConstruct(_, _, fields) => {
+            for (_, v) in fields {
+                walk_for_match_result_callees(v, rules_by_name, all_resources, all_connections, visited, out_reads);
+            }
+        }
         Expr::Number(_) | Expr::Text(_) | Expr::Field(_, _) | Expr::Ident(_)
         | Expr::Read(_) | Expr::NowUnix => {}
     }
@@ -2391,6 +2523,14 @@ fn collect_expr_facts(
                 }
             }
         }
+        // Phase A slice 2: variant construction is a pass-through for facts —
+        // each field assignment's expression contributes its own reads/calls.
+        // Same shape as Record.
+        Expr::VariantConstruct(_, _, fields) => {
+            for (_, field_expr) in fields {
+                collect_expr_facts(field_expr, reads, calls);
+            }
+        }
     }
 }
 
@@ -2541,6 +2681,10 @@ fn collect_lambda_bound_names(expr: &Expr) -> std::collections::HashSet<String> 
                 for a in args { walk(a, out); }
             }
             Expr::Record(_, fields) => {
+                for (_, v) in fields { walk(v, out); }
+            }
+            // Phase A slice 2: variant construction — same shape as Record.
+            Expr::VariantConstruct(_, _, fields) => {
                 for (_, v) in fields { walk(v, out); }
             }
             Expr::Fetch(_, request) => walk(request, out),
@@ -2732,6 +2876,11 @@ fn count_operations(expr: &Expr) -> usize {
         Expr::FoldBytes(t, init, _, _, _, body) => {
             1 + count_operations(t) + count_operations(init) + count_operations(body)
         }
+        // Phase A slice 2: variant construction — 1 op for the tag + each
+        // payload field's expression cost. Same shape as Record.
+        Expr::VariantConstruct(_, _, fields) => {
+            1 + fields.iter().map(|(_, e)| count_operations(e)).sum::<usize>()
+        }
     }
 }
 
@@ -2828,7 +2977,7 @@ concept Invoice
 
 rule important_invoice
   @intention: "y"
-  @source: invoices.intent:2
+  @source: invoices.intent:1
   input:
     i : Invoice
   output:
@@ -2869,7 +3018,7 @@ concept T
 
 rule trig
   @intention: "y"
-  @source: invoices.intent:2
+  @source: invoices.intent:1
   input:
     t : T
   output:
@@ -2885,7 +3034,7 @@ rule trig
 
 reaction bad
   @intention: "z"
-  @source: invoices.intent:2
+  @source: invoices.intent:1
   trigger: trig
   effects:
     append_file "/tmp/x.log" t.x
@@ -2948,7 +3097,7 @@ concept In
 
 rule make
   @intention: "y"
-  @source: invoices.intent:2
+  @source: invoices.intent:1
   input:
     i : In
   output:
@@ -2992,7 +3141,7 @@ concept In
 
 rule make
   @intention: "y"
-  @source: invoices.intent:2
+  @source: invoices.intent:1
   input:
     i : In
   output:
@@ -3033,7 +3182,7 @@ concept In
 
 rule make
   @intention: "y"
-  @source: invoices.intent:2
+  @source: invoices.intent:1
   input:
     i : In
   output:
@@ -3074,7 +3223,7 @@ concept In
 
 rule make
   @intention: "y"
-  @source: invoices.intent:2
+  @source: invoices.intent:1
   input:
     i : In
   output:
@@ -3150,7 +3299,7 @@ concept T
 
 rule bad
   @intention: "y"
-  @source: invoices.intent:2
+  @source: invoices.intent:1
   input:
     t : T
   output:
@@ -3187,7 +3336,7 @@ concept T
 
 rule bad
   @intention: "y"
-  @source: invoices.intent:2
+  @source: invoices.intent:1
   input:
     t : T
   output:
@@ -3225,7 +3374,7 @@ concept T
 
 rule bad
   @intention: "y"
-  @source: invoices.intent:2
+  @source: invoices.intent:1
   input:
     t : T
   output:
@@ -3263,7 +3412,7 @@ concept Invoice
 
 rule is_large
   @intention: "y"
-  @source: invoices.intent:2
+  @source: invoices.intent:1
   @layer: domain
   input:
     i : Invoice
@@ -3280,7 +3429,7 @@ rule is_large
 
 rule flag_critical
   @intention: "y"
-  @source: invoices.intent:2
+  @source: invoices.intent:1
   @layer: application
   input:
     i : Invoice
@@ -3313,7 +3462,7 @@ concept Invoice
 
 rule upper_orchestration
   @intention: "y"
-  @source: invoices.intent:2
+  @source: invoices.intent:1
   @layer: application
   input:
     i : Invoice
@@ -3330,7 +3479,7 @@ rule upper_orchestration
 
 rule lower_domain
   @intention: "y"
-  @source: invoices.intent:2
+  @source: invoices.intent:1
   @layer: domain
   input:
     i : Invoice
@@ -3369,7 +3518,7 @@ concept Invoice
 
 rule unlayered_helper
   @intention: "y"
-  @source: invoices.intent:2
+  @source: invoices.intent:1
   input:
     i : Invoice
   output:
@@ -3385,7 +3534,7 @@ rule unlayered_helper
 
 rule layered_caller
   @intention: "y"
-  @source: invoices.intent:2
+  @source: invoices.intent:1
   @layer: application
   input:
     i : Invoice
@@ -3679,7 +3828,7 @@ rule positives
 
     #[test]
     fn bad_source_line_rejected() {
-        let bad = VALID.replace("invoices.intent:2", "invoices.intent:999");
+        let bad = VALID.replace("invoices.intent:1", "invoices.intent:999");
         let errs = verify_str(&bad);
         assert!(
             errs.iter()
@@ -4328,6 +4477,199 @@ rule check
             !purity_err.message.contains("hint:"),
             "hint should NOT fire for non-lambda-bound base ident; got: {}",
             purity_err.message,
+        );
+    }
+
+    /// Phase A slice 2 — variant construction.
+    ///
+    /// A rule whose `output` is a sum-type concept can construct a variant
+    /// in its logic via `ConceptName::VariantName { field: expr, ... }` or
+    /// `ConceptName::VariantName` (no payload). The verifier cross-checks
+    /// concept-name resolution, sum-type-ness, variant existence, and the
+    /// payload field set against the declaration.
+    ///
+    /// Pinned cases:
+    ///   (a) Happy path: variant with payload — accepts
+    ///   (b) Happy path: variant without payload (`Token::Eof`) — accepts
+    ///   (c) Unknown variant name → rejected with breadcrumb
+    ///   (d) Missing payload field → rejected
+    ///   (e) Extra payload field → rejected
+    ///   (f) VariantConstruct on a record concept → rejected
+    ///   (g) VariantConstruct on unknown concept → rejected
+    #[test]
+    fn phase_a2_variant_construct_verifier() {
+        let common_concepts = r#"@verbose 0.1.0
+
+concept Input
+  @intention: "input record"
+  @source: invoices.intent:1
+  fields:
+    id : number [0, 1000]
+
+concept Token
+  @intention: "a tagged token"
+  @source: invoices.intent:1
+  variants:
+    Ident of (name : text)
+    Int of (value : number)
+    Eof
+
+"#;
+
+        let happy_payload = format!("{}{}", common_concepts, r#"rule make_int_token
+  @intention: "wrap id into a Token::Int"
+  @source: invoices.intent:1
+  input:
+    i : Input
+  output:
+    t : Token
+  logic:
+    t = Token::Int { value: i.id }
+  proofs:
+    purity:
+      reads : [i.id]
+      calls : []
+    termination:
+      bound : 1
+"#);
+        let errs = verify_str(&happy_payload);
+        assert!(errs.is_empty(), "(a) happy-path payload should verify, got: {:#?}", errs);
+
+        let happy_no_payload = format!("{}{}", common_concepts, r#"rule make_eof
+  @intention: "produce Token::Eof regardless of input"
+  @source: invoices.intent:1
+  input:
+    i : Input
+  output:
+    t : Token
+  logic:
+    t = Token::Eof
+  proofs:
+    purity:
+      reads : []
+      calls : []
+    termination:
+      bound : 1
+"#);
+        let errs = verify_str(&happy_no_payload);
+        assert!(errs.is_empty(), "(b) no-payload variant should verify, got: {:#?}", errs);
+
+        let unknown_variant = format!("{}{}", common_concepts, r#"rule bad
+  @intention: "x"
+  @source: invoices.intent:1
+  input:
+    i : Input
+  output:
+    t : Token
+  logic:
+    t = Token::Float { value: i.id }
+  proofs:
+    purity:
+      reads : [i.id]
+      calls : []
+    termination:
+      bound : 1
+"#);
+        let errs = verify_str(&unknown_variant);
+        assert!(
+            errs.iter().any(|e| e.message.contains("no variant named 'Float'")),
+            "(c) unknown variant should be rejected: {:#?}", errs
+        );
+
+        let missing_field = format!("{}{}", common_concepts, r#"rule bad
+  @intention: "x"
+  @source: invoices.intent:1
+  input:
+    i : Input
+  output:
+    t : Token
+  logic:
+    t = Token::Int { }
+  proofs:
+    purity:
+      reads : []
+      calls : []
+    termination:
+      bound : 1
+"#);
+        let errs = verify_str(&missing_field);
+        assert!(
+            errs.iter().any(|e| e.message.contains("missing payload field 'value'")),
+            "(d) missing field should be rejected: {:#?}", errs
+        );
+
+        let extra_field = format!("{}{}", common_concepts, r#"rule bad
+  @intention: "x"
+  @source: invoices.intent:1
+  input:
+    i : Input
+  output:
+    t : Token
+  logic:
+    t = Token::Int { value: i.id, junk: 99 }
+  proofs:
+    purity:
+      reads : [i.id]
+      calls : []
+    termination:
+      bound : 1
+"#);
+        let errs = verify_str(&extra_field);
+        assert!(
+            errs.iter().any(|e| e.message.contains("unknown payload field 'junk'")),
+            "(e) extra field should be rejected: {:#?}", errs
+        );
+
+        let on_record_concept = r#"@verbose 0.1.0
+
+concept RecordConcept
+  @intention: "x"
+  @source: invoices.intent:1
+  fields:
+    a : number
+
+rule bad
+  @intention: "x"
+  @source: invoices.intent:1
+  input:
+    r : RecordConcept
+  output:
+    r2 : RecordConcept
+  logic:
+    r2 = RecordConcept::Foo
+  proofs:
+    purity:
+      reads : []
+      calls : []
+    termination:
+      bound : 1
+"#;
+        let errs = verify_str(on_record_concept);
+        assert!(
+            errs.iter().any(|e| e.message.contains("is a record concept")),
+            "(f) variant construction on record concept should be rejected: {:#?}", errs
+        );
+
+        let unknown_concept = format!("{}{}", common_concepts, r#"rule bad
+  @intention: "x"
+  @source: invoices.intent:1
+  input:
+    i : Input
+  output:
+    t : Token
+  logic:
+    t = NonExistent::Foo
+  proofs:
+    purity:
+      reads : []
+      calls : []
+    termination:
+      bound : 1
+"#);
+        let errs = verify_str(&unknown_concept);
+        assert!(
+            errs.iter().any(|e| e.message.contains("unknown concept 'NonExistent'")),
+            "(g) unknown concept should be rejected: {:#?}", errs
         );
     }
 }

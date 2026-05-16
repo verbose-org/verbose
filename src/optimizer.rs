@@ -88,6 +88,11 @@ fn count_nodes(expr: &Expr) -> usize {
         Expr::FoldBytes(t, init, _, _, _, body) => {
             1 + count_nodes(t) + count_nodes(init) + count_nodes(body)
         }
+        // Phase A slice 2: variant construction — one node + each payload
+        // field's expression cost. Same shape as Record.
+        Expr::VariantConstruct(_, _, fields) => {
+            1 + fields.iter().map(|(_, e)| count_nodes(e)).sum::<usize>()
+        }
     }
 }
 
@@ -452,6 +457,16 @@ fn substitute_ident(expr: &Expr, name: &str, replacement: &Expr) -> Expr {
                 Box::new(new_body),
             )
         }
+        // Phase A slice 2: variant construction — substitute through each
+        // payload field's expression. Same shape as Record.
+        Expr::VariantConstruct(concept_name, variant_name, fields) => Expr::VariantConstruct(
+            concept_name.clone(),
+            variant_name.clone(),
+            fields
+                .iter()
+                .map(|(n, v)| (n.clone(), substitute_ident(v, name, replacement)))
+                .collect(),
+        ),
     }
 }
 
@@ -830,6 +845,17 @@ pub fn optimize_expr(
             byte.clone(),
             idx.clone(),
             Box::new(optimize_expr(body, input_name, field_ranges)),
+        ),
+        // Phase A slice 2: variant construction — recurse through each
+        // payload field's expression. No literal fold today (variants
+        // have no compile-time equivalent yet). Same shape as Record.
+        Expr::VariantConstruct(concept_name, variant_name, fields) => Expr::VariantConstruct(
+            concept_name.clone(),
+            variant_name.clone(),
+            fields
+                .iter()
+                .map(|(n, e)| (n.clone(), optimize_expr(e, input_name, field_ranges)))
+                .collect(),
         ),
     }
 }

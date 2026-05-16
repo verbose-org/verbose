@@ -653,6 +653,24 @@ fn value_to_json(val: &interpreter::Value) -> String {
         }
         interpreter::Value::Ok(inner) => format!("{{\"ok\":{}}}", value_to_json(inner)),
         interpreter::Value::Err(inner) => format!("{{\"err\":{}}}", value_to_json(inner)),
+        // Phase A slice 2: tagged-union JSON shape — `{"variant":"<name>","fields":{...}}`.
+        // The concept name is included so multi-concept programs disambiguate.
+        // This is a provisional encoding for the interpreter path; the
+        // native/wasm tagged-union layout will land in slice A.4+.
+        interpreter::Value::Variant { concept, variant, fields } => {
+            let mut keys: Vec<&String> = fields.keys().collect();
+            keys.sort();
+            let field_parts: Vec<String> = keys
+                .into_iter()
+                .map(|k| format!("\"{}\":{}", k, value_to_json(&fields[k])))
+                .collect();
+            format!(
+                "{{\"concept\":\"{}\",\"variant\":\"{}\",\"fields\":{{{}}}}}",
+                concept,
+                variant,
+                field_parts.join(",")
+            )
+        }
     }
 }
 

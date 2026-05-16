@@ -618,6 +618,13 @@ fn collect_read_names_native(expr: &Expr, out: &mut Vec<String>) {
             collect_read_names_native(init, out);
             collect_read_names_native(body, out);
         }
+        // Phase A slice 2: recurse into each payload field's expression.
+        // Same shape as Record.
+        Expr::VariantConstruct(_, _, fields) => {
+            for (_, e) in fields {
+                collect_read_names_native(e, out);
+            }
+        }
     }
 }
 
@@ -661,6 +668,8 @@ fn expr_uses_now_unix(e: &Expr) -> bool {
             expr_uses_now_unix(t) || expr_uses_now_unix(init) || expr_uses_now_unix(body)
         }
         Expr::ByteAt(t, i) => expr_uses_now_unix(t) || expr_uses_now_unix(i),
+        // Phase A slice 2: any payload field may reference now_unix().
+        Expr::VariantConstruct(_, _, fields) => fields.iter().any(|(_, e)| expr_uses_now_unix(e)),
     }
 }
 
@@ -772,6 +781,13 @@ fn count_match_result_max_depth(expr: &Expr) -> usize {
             .max()
             .unwrap_or(0),
         Expr::Fetch(_, request) => count_match_result_max_depth(request),
+        // Phase A slice 2: payload field expressions can themselves contain
+        // match_result chains. Same shape as Record.
+        Expr::VariantConstruct(_, _, fields) => fields
+            .iter()
+            .map(|(_, e)| count_match_result_max_depth(e))
+            .max()
+            .unwrap_or(0),
         // Leaves: no inner expression to recurse into.
         Expr::Number(_) | Expr::Text(_) | Expr::Field(_, _) | Expr::Ident(_)
         | Expr::Read(_) | Expr::NowUnix => 0,
@@ -853,6 +869,11 @@ fn expr_uses_field(e: &Expr, input_name: &str, field_name: &str) -> bool {
                 || expr_uses_field(init, input_name, field_name)
                 || expr_uses_field(body, input_name, field_name)
         }
+        // Phase A slice 2: any payload field's expression may reference
+        // the named input field. Same shape as Record.
+        Expr::VariantConstruct(_, _, fields) => fields
+            .iter()
+            .any(|(_, e)| expr_uses_field(e, input_name, field_name)),
     }
 }
 
@@ -1011,6 +1032,13 @@ fn gather_transitive_callee_reads(
             gather_transitive_callee_reads(t, all_rules, visited, out);
             gather_transitive_callee_reads(init, all_rules, visited, out);
             gather_transitive_callee_reads(body, all_rules, visited, out);
+        }
+        // Phase A slice 2: recurse into each payload field's expression.
+        // Same shape as Record.
+        Expr::VariantConstruct(_, _, fields) => {
+            for (_, v) in fields {
+                gather_transitive_callee_reads(v, all_rules, visited, out);
+            }
         }
         Expr::Number(_) | Expr::Text(_) | Expr::Field(_, _) | Expr::Ident(_)
         | Expr::Read(_) | Expr::NowUnix => {}
@@ -1186,6 +1214,13 @@ fn collect_fetch_names_native(expr: &Expr, out: &mut Vec<String>) {
             collect_fetch_names_native(t, out);
             collect_fetch_names_native(init, out);
             collect_fetch_names_native(body, out);
+        }
+        // Phase A slice 2: recurse into each payload field's expression.
+        // Same shape as Record.
+        Expr::VariantConstruct(_, _, fields) => {
+            for (_, e) in fields {
+                collect_fetch_names_native(e, out);
+            }
         }
     }
 }
@@ -1474,6 +1509,10 @@ fn emit_connection_fetch_sequence(
             Expr::FoldBytes(t, init, _, _, _, body) => first_fetch_for(t, name)
                 .or_else(|| first_fetch_for(init, name))
                 .or_else(|| first_fetch_for(body, name)),
+            // Phase A slice 2: recurse into each payload field's expression.
+            Expr::VariantConstruct(_, _, fields) => fields
+                .iter()
+                .find_map(|(_, e)| first_fetch_for(e, name)),
         }
     }
     let request_expr: &Expr = {
@@ -7859,6 +7898,14 @@ fn max_stack_depth(expr: &Expr) -> usize {
                 .max(max_stack_depth(init))
                 .max(max_stack_depth(body))
         }
+        // Phase A slice 2: variant construction's emit path is stubbed
+        // (Err) — but for completeness, payload field expressions
+        // contribute their own stack depth.
+        Expr::VariantConstruct(_, _, fields) => fields
+            .iter()
+            .map(|(_, e)| max_stack_depth(e))
+            .max()
+            .unwrap_or(0),
     }
 }
 
@@ -8485,6 +8532,15 @@ fn emit_eval_expr(
                       run with --run). The native emit_fold_bytes_program is the next slice; this \
                       one delivers the parser/verifier/interpreter surface so rules using fold_bytes \
                       compile and the semantics can be exercised today.".into(),
+        }),
+        // Phase A slice 2: variant construction's tagged-union layout +
+        // dispatch is deferred to slice A.4+. Today the AST + parser +
+        // verifier + interpreter surface is enough to exercise the
+        // semantics via --run.
+        Expr::VariantConstruct(_, _, _) => Err(NativeError {
+            message: "variant construction not yet implemented in native — Phase A slice 4+ \
+                      wires the tagged union layout. Run rules using variant construction \
+                      via --run.".into(),
         }),
         Expr::Ident(name) if name == input_name => Err(NativeError {
             message: "bare input binding not supported in expressions".into(),
@@ -11716,6 +11772,7 @@ fn expr_kind(e: &Expr) -> &'static str {
         Expr::Substring(_, _, _) => "Substring",
         Expr::ByteAt(_, _) => "ByteAt",
         Expr::FoldBytes(_, _, _, _, _, _) => "FoldBytes",
+        Expr::VariantConstruct(_, _, _) => "VariantConstruct",
     }
 }
 

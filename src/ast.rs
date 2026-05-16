@@ -651,6 +651,28 @@ pub enum Expr {
     /// idx_name, body). Six fields, mirroring the existing Fold's
     /// 5-field shape with one extra binding for the position.
     FoldBytes(Box<Expr>, Box<Expr>, String, String, String, Box<Expr>),
+    /// Phase A slice 2 — variant construction. Syntax:
+    ///   `ConceptName::VariantName { field: expr, ... }`         (with payload)
+    ///   `ConceptName::VariantName`                              (no-payload variant)
+    ///
+    /// Constructs a value of the named concept tagged with the given
+    /// variant. The verifier cross-checks:
+    ///   - The concept exists and is a sum-type concept (non-empty `variants`).
+    ///   - The variant exists on that concept.
+    ///   - The field assignments match the variant's declared payload exactly
+    ///     (same field names + each expression typechecks against the
+    ///     declared field type).
+    ///   - A no-payload variant carries an empty field list; verifier
+    ///     rejects extraneous fields with a clear breadcrumb.
+    ///
+    /// Layout: (concept_name, variant_name, field_assignments).
+    /// The same shape as `Record(name, fields)` but with the extra
+    /// variant qualifier — the auditor reads the qualified form and
+    /// knows which concept owns the variant.
+    ///
+    /// Native emit deferred to slice A.4+ (tagged union layout +
+    /// dispatch). Interpreter handles construction today.
+    VariantConstruct(String, String, Vec<(String, Expr)>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
