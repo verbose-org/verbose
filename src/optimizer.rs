@@ -93,6 +93,13 @@ fn count_nodes(expr: &Expr) -> usize {
         Expr::VariantConstruct(_, _, fields) => {
             1 + fields.iter().map(|(_, e)| count_nodes(e)).sum::<usize>()
         }
+        // Phase A slice 3: pattern match — one node + scrutinee + sum of
+        // each arm body's cost. Same shape as MatchResult, generalized to
+        // N arms.
+        Expr::MatchVariant(scrutinee, arms) => {
+            1 + count_nodes(scrutinee)
+                + arms.iter().map(|a| count_nodes(&a.body)).sum::<usize>()
+        }
     }
 }
 
@@ -467,6 +474,35 @@ fn substitute_ident(expr: &Expr, name: &str, replacement: &Expr) -> Expr {
                 .map(|(n, v)| (n.clone(), substitute_ident(v, name, replacement)))
                 .collect(),
         ),
+        // Phase A slice 3: pattern match — substitute through the
+        // scrutinee unconditionally. For each arm, if ANY binder
+        // (`Some(b) == name`) shadows the substituted ident, leave that
+        // arm's body untouched; otherwise recurse. Mirror of the
+        // Map/Filter/Fold shadowing guard, generalized to N positional
+        // binders per arm (wildcards `None` cannot shadow anything).
+        Expr::MatchVariant(scrutinee, arms) => {
+            let new_scrut = substitute_ident(scrutinee, name, replacement);
+            let new_arms: Vec<MatchArm> = arms
+                .iter()
+                .map(|a| {
+                    let shadowed = a
+                        .binders
+                        .iter()
+                        .any(|b| b.as_deref() == Some(name));
+                    let new_body = if shadowed {
+                        a.body.clone()
+                    } else {
+                        substitute_ident(&a.body, name, replacement)
+                    };
+                    MatchArm {
+                        variant_name: a.variant_name.clone(),
+                        binders: a.binders.clone(),
+                        body: new_body,
+                    }
+                })
+                .collect();
+            Expr::MatchVariant(Box::new(new_scrut), new_arms)
+        }
     }
 }
 
@@ -855,6 +891,19 @@ pub fn optimize_expr(
             fields
                 .iter()
                 .map(|(n, e)| (n.clone(), optimize_expr(e, input_name, field_ranges)))
+                .collect(),
+        ),
+        // Phase A slice 3: pattern match — recurse on scrutinee + each
+        // arm's body. No constant-fold today (slice A.3 is the verifier +
+        // interpreter wiring; folding requires the constructor side too).
+        Expr::MatchVariant(scrutinee, arms) => Expr::MatchVariant(
+            Box::new(optimize_expr(scrutinee, input_name, field_ranges)),
+            arms.iter()
+                .map(|a| MatchArm {
+                    variant_name: a.variant_name.clone(),
+                    binders: a.binders.clone(),
+                    body: optimize_expr(&a.body, input_name, field_ranges),
+                })
                 .collect(),
         ),
     }

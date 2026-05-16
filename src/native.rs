@@ -625,6 +625,14 @@ fn collect_read_names_native(expr: &Expr, out: &mut Vec<String>) {
                 collect_read_names_native(e, out);
             }
         }
+        // Phase A slice 3: pattern match — recurse into scrutinee + each
+        // arm's body. Same shape as MatchResult, generalized to N arms.
+        Expr::MatchVariant(scrutinee, arms) => {
+            collect_read_names_native(scrutinee, out);
+            for a in arms {
+                collect_read_names_native(&a.body, out);
+            }
+        }
     }
 }
 
@@ -670,6 +678,11 @@ fn expr_uses_now_unix(e: &Expr) -> bool {
         Expr::ByteAt(t, i) => expr_uses_now_unix(t) || expr_uses_now_unix(i),
         // Phase A slice 2: any payload field may reference now_unix().
         Expr::VariantConstruct(_, _, fields) => fields.iter().any(|(_, e)| expr_uses_now_unix(e)),
+        // Phase A slice 3: pattern match — scrutinee OR any arm's body
+        // may reference now_unix().
+        Expr::MatchVariant(scrutinee, arms) => {
+            expr_uses_now_unix(scrutinee) || arms.iter().any(|a| expr_uses_now_unix(&a.body))
+        }
     }
 }
 
@@ -788,6 +801,18 @@ fn count_match_result_max_depth(expr: &Expr) -> usize {
             .map(|(_, e)| count_match_result_max_depth(e))
             .max()
             .unwrap_or(0),
+        // Phase A slice 3: pattern match — recurse into scrutinee + each
+        // arm's body, returning the max. MatchVariant itself does not
+        // contribute to MatchResult depth (it's a different dispatch).
+        Expr::MatchVariant(scrutinee, arms) => {
+            let scrut_depth = count_match_result_max_depth(scrutinee);
+            let arms_depth = arms
+                .iter()
+                .map(|a| count_match_result_max_depth(&a.body))
+                .max()
+                .unwrap_or(0);
+            scrut_depth.max(arms_depth)
+        }
         // Leaves: no inner expression to recurse into.
         Expr::Number(_) | Expr::Text(_) | Expr::Field(_, _) | Expr::Ident(_)
         | Expr::Read(_) | Expr::NowUnix => 0,
@@ -874,6 +899,12 @@ fn expr_uses_field(e: &Expr, input_name: &str, field_name: &str) -> bool {
         Expr::VariantConstruct(_, _, fields) => fields
             .iter()
             .any(|(_, e)| expr_uses_field(e, input_name, field_name)),
+        // Phase A slice 3: pattern match — scrutinee OR any arm's body
+        // may reference the named input field.
+        Expr::MatchVariant(scrutinee, arms) => {
+            expr_uses_field(scrutinee, input_name, field_name)
+                || arms.iter().any(|a| expr_uses_field(&a.body, input_name, field_name))
+        }
     }
 }
 
@@ -1038,6 +1069,16 @@ fn gather_transitive_callee_reads(
         Expr::VariantConstruct(_, _, fields) => {
             for (_, v) in fields {
                 gather_transitive_callee_reads(v, all_rules, visited, out);
+            }
+        }
+        // Phase A slice 3: pattern match — recurse into scrutinee + each
+        // arm's body. MatchVariant itself has no Call target shape (unlike
+        // MatchResult), so no inlined-callee fact propagation here; we
+        // just walk for any MatchResult nested inside the bodies.
+        Expr::MatchVariant(scrutinee, arms) => {
+            gather_transitive_callee_reads(scrutinee, all_rules, visited, out);
+            for a in arms {
+                gather_transitive_callee_reads(&a.body, all_rules, visited, out);
             }
         }
         Expr::Number(_) | Expr::Text(_) | Expr::Field(_, _) | Expr::Ident(_)
@@ -1220,6 +1261,14 @@ fn collect_fetch_names_native(expr: &Expr, out: &mut Vec<String>) {
         Expr::VariantConstruct(_, _, fields) => {
             for (_, e) in fields {
                 collect_fetch_names_native(e, out);
+            }
+        }
+        // Phase A slice 3: pattern match — recurse into scrutinee + each
+        // arm's body. Same shape as MatchResult, generalized to N arms.
+        Expr::MatchVariant(scrutinee, arms) => {
+            collect_fetch_names_native(scrutinee, out);
+            for a in arms {
+                collect_fetch_names_native(&a.body, out);
             }
         }
     }
@@ -1513,6 +1562,9 @@ fn emit_connection_fetch_sequence(
             Expr::VariantConstruct(_, _, fields) => fields
                 .iter()
                 .find_map(|(_, e)| first_fetch_for(e, name)),
+            // Phase A slice 3: recurse into scrutinee + each arm's body.
+            Expr::MatchVariant(scrutinee, arms) => first_fetch_for(scrutinee, name)
+                .or_else(|| arms.iter().find_map(|a| first_fetch_for(&a.body, name))),
         }
     }
     let request_expr: &Expr = {
@@ -7906,6 +7958,18 @@ fn max_stack_depth(expr: &Expr) -> usize {
             .map(|(_, e)| max_stack_depth(e))
             .max()
             .unwrap_or(0),
+        // Phase A slice 3: pattern match emit path is stubbed (Err) — but
+        // for completeness, scrutinee + each arm body contribute their
+        // own stack depth.
+        Expr::MatchVariant(scrutinee, arms) => {
+            let scrut_depth = max_stack_depth(scrutinee);
+            let arms_depth = arms
+                .iter()
+                .map(|a| max_stack_depth(&a.body))
+                .max()
+                .unwrap_or(0);
+            scrut_depth.max(arms_depth)
+        }
     }
 }
 
@@ -8541,6 +8605,15 @@ fn emit_eval_expr(
             message: "variant construction not yet implemented in native — Phase A slice 4+ \
                       wires the tagged union layout. Run rules using variant construction \
                       via --run.".into(),
+        }),
+        // Phase A slice 3: pattern match's tag dispatch + payload load is
+        // deferred to slice A.4+, riding on the same tagged-union layout
+        // that variant construction depends on. Today the AST + parser +
+        // verifier + interpreter surface is enough to exercise the
+        // semantics via --run.
+        Expr::MatchVariant(_, _) => Err(NativeError {
+            message: "pattern match (MatchVariant) not yet implemented in native — Phase A slice 4+ \
+                      wires tag dispatch + payload load. Run rules using pattern match via --run.".into(),
         }),
         Expr::Ident(name) if name == input_name => Err(NativeError {
             message: "bare input binding not supported in expressions".into(),
@@ -11773,6 +11846,7 @@ fn expr_kind(e: &Expr) -> &'static str {
         Expr::ByteAt(_, _) => "ByteAt",
         Expr::FoldBytes(_, _, _, _, _, _) => "FoldBytes",
         Expr::VariantConstruct(_, _, _) => "VariantConstruct",
+        Expr::MatchVariant(_, _) => "MatchVariant",
     }
 }
 

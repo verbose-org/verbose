@@ -386,6 +386,14 @@ fn collect_read_names(expr: &Expr, out: &mut Vec<String>) {
                 collect_read_names(e, out);
             }
         }
+        // Phase A slice 3: pattern match — recurse into scrutinee + each
+        // arm's body. Same shape as MatchResult, generalized to N arms.
+        Expr::MatchVariant(scrutinee, arms) => {
+            collect_read_names(scrutinee, out);
+            for a in arms {
+                collect_read_names(&a.body, out);
+            }
+        }
     }
 }
 
@@ -524,6 +532,14 @@ fn collect_fetch_names(expr: &Expr, out: &mut Vec<String>) {
                 collect_fetch_names(e, out);
             }
         }
+        // Phase A slice 3: pattern match — recurse into scrutinee + each
+        // arm's body. Same shape as MatchResult, generalized to N arms.
+        Expr::MatchVariant(scrutinee, arms) => {
+            collect_fetch_names(scrutinee, out);
+            for a in arms {
+                collect_fetch_names(&a.body, out);
+            }
+        }
     }
 }
 
@@ -633,6 +649,14 @@ fn collect_fetch_names_with_dups(expr: &Expr, out: &mut Vec<String>) {
         Expr::VariantConstruct(_, _, fields) => {
             for (_, e) in fields {
                 collect_fetch_names_with_dups(e, out);
+            }
+        }
+        // Phase A slice 3: pattern match — recurse into scrutinee + each
+        // arm's body. Same shape as MatchResult, generalized to N arms.
+        Expr::MatchVariant(scrutinee, arms) => {
+            collect_fetch_names_with_dups(scrutinee, out);
+            for a in arms {
+                collect_fetch_names_with_dups(&a.body, out);
             }
         }
     }
@@ -1133,6 +1157,7 @@ fn describe_expr_kind(e: &Expr) -> &'static str {
         Expr::ByteAt(_, _) => "byte_at",
         Expr::FoldBytes(_, _, _, _, _, _) => "fold_bytes",
         Expr::VariantConstruct(_, _, _) => "variant construction",
+        Expr::MatchVariant(_, _) => "pattern match",
     }
 }
 
@@ -1793,6 +1818,144 @@ fn check_expr_against(
                 }
             }
         }
+        // Phase A slice 3 — pattern match over a sum-type's variants.
+        // Cross-check the scrutinee resolves to a sum-type concept, every
+        // arm names a real variant of that concept, binder count matches
+        // payload arity, the set of arm variants equals the concept's
+        // variant set exactly (exhaustiveness + no duplicate + no unknown),
+        // and each arm body typechecks against the rule's expected output
+        // type. Binders introduced by an arm are lambda-bound for purity's
+        // `reads:` proof (handled separately in `collect_lambda_bound_names`).
+        (Expr::MatchVariant(scrutinee, arms), expected) => {
+            // Resolve the scrutinee's concept name. Slice-3 limit: the
+            // scrutinee must infer to a `Type::Named(C)`. Common shapes
+            // — input ident, VariantConstruct, Call returning Named —
+            // are all covered by `infer_expr_type`; let/lambda-bound
+            // scrutinees infer to None and are reported.
+            let concept_name = match infer_expr_type(scrutinee, rule, all_rules, input_concept) {
+                Some(Type::Named(n)) => n,
+                Some(other) => {
+                    errors.push(VerifyError {
+                        context: format!("rule '{}' / logic", rule.name),
+                        message: format!(
+                            "match scrutinee has type '{}' but pattern match requires a sum-type concept",
+                            type_display(&other),
+                        ),
+                    });
+                    return;
+                }
+                None => {
+                    errors.push(VerifyError {
+                        context: format!("rule '{}' / logic", rule.name),
+                        message: "match scrutinee's type could not be inferred — \
+                                  slice A.3 requires the scrutinee to be the rule \
+                                  input, a variant constructor, or a rule call \
+                                  returning a named sum-type concept".into(),
+                    });
+                    return;
+                }
+            };
+            let concept = match all_concepts.get(&concept_name) {
+                Some(c) => *c,
+                None => {
+                    errors.push(VerifyError {
+                        context: format!("rule '{}' / logic", rule.name),
+                        message: format!(
+                            "match scrutinee references unknown concept '{}'",
+                            concept_name
+                        ),
+                    });
+                    return;
+                }
+            };
+            if concept.variants.is_empty() {
+                errors.push(VerifyError {
+                    context: format!("rule '{}' / logic", rule.name),
+                    message: format!(
+                        "match scrutinee has type '{}' which is a record concept (has fields), expected sum-type concept",
+                        concept_name
+                    ),
+                });
+                return;
+            }
+            // Walk arms: validate variant name, binder arity, and body type.
+            // We track seen variant names to detect duplicates and to
+            // compute the exhaustiveness diff at the end.
+            let mut seen: HashSet<&str> = HashSet::new();
+            for arm in arms {
+                let variant = match concept.variants.iter().find(|v| v.name == arm.variant_name) {
+                    Some(v) => v,
+                    None => {
+                        let available: Vec<&str> = concept.variants.iter().map(|v| v.name.as_str()).collect();
+                        errors.push(VerifyError {
+                            context: format!("rule '{}' / logic", rule.name),
+                            message: format!(
+                                "match arm references unknown variant '{}::{}' (available: {})",
+                                concept_name,
+                                arm.variant_name,
+                                available.join(", ")
+                            ),
+                        });
+                        continue;
+                    }
+                };
+                if !seen.insert(arm.variant_name.as_str()) {
+                    errors.push(VerifyError {
+                        context: format!("rule '{}' / logic", rule.name),
+                        message: format!(
+                            "match arm for '{}::{}' is duplicated",
+                            concept_name, arm.variant_name
+                        ),
+                    });
+                }
+                if arm.binders.len() != variant.fields.len() {
+                    errors.push(VerifyError {
+                        context: format!("rule '{}' / logic", rule.name),
+                        message: format!(
+                            "match arm '{}::{}' has {} binder(s) but the variant's payload has {} field(s)",
+                            concept_name,
+                            arm.variant_name,
+                            arm.binders.len(),
+                            variant.fields.len(),
+                        ),
+                    });
+                }
+                // Detect collisions within the same arm — two
+                // positional binders that share the same name would
+                // shadow each other at runtime and confuse the auditor.
+                let mut arm_seen: HashSet<&str> = HashSet::new();
+                for b in &arm.binders {
+                    if let Some(name) = b {
+                        if !arm_seen.insert(name.as_str()) {
+                            errors.push(VerifyError {
+                                context: format!("rule '{}' / logic", rule.name),
+                                message: format!(
+                                    "match arm '{}::{}' binds '{}' twice in the same arm",
+                                    concept_name, arm.variant_name, name
+                                ),
+                            });
+                        }
+                    }
+                }
+                // Body must produce the rule's expected output type.
+                // Binders are in scope for the body — the lambda-bound
+                // walk (`collect_lambda_bound_names`) accounts for them
+                // when purity checks the body's `reads:` proof.
+                check_expr_against(&arm.body, expected, rule, all_rules, input_concept, all_concepts, errors);
+            }
+            // Exhaustiveness: every declared variant must have an arm.
+            for declared in &concept.variants {
+                if !seen.contains(declared.name.as_str()) {
+                    errors.push(VerifyError {
+                        context: format!("rule '{}' / logic", rule.name),
+                        message: format!(
+                            "match on '{}' is not exhaustive — missing arm for variant '{}::{}'",
+                            concept_name, concept_name, declared.name
+                        ),
+                    });
+                }
+            }
+        }
         // Record(ConceptName) construction: cross-check field set + types.
         (Expr::Record(name, fields), expected_ty) => {
             let concept = match all_concepts.get(name) {
@@ -2288,6 +2451,16 @@ fn walk_for_match_result_callees(
                 walk_for_match_result_callees(v, rules_by_name, all_resources, all_connections, visited, out_reads);
             }
         }
+        // Phase A slice 3: pattern match — recurse into scrutinee + each
+        // arm's body. The MatchVariant itself doesn't have a Call target
+        // shape (unlike MatchResult), so no inlined-callee fact propagation
+        // here; we just walk for any MatchResult nested inside the bodies.
+        Expr::MatchVariant(scrutinee, arms) => {
+            walk_for_match_result_callees(scrutinee, rules_by_name, all_resources, all_connections, visited, out_reads);
+            for a in arms {
+                walk_for_match_result_callees(&a.body, rules_by_name, all_resources, all_connections, visited, out_reads);
+            }
+        }
         Expr::Number(_) | Expr::Text(_) | Expr::Field(_, _) | Expr::Ident(_)
         | Expr::Read(_) | Expr::NowUnix => {}
     }
@@ -2531,6 +2704,32 @@ fn collect_expr_facts(
                 collect_expr_facts(field_expr, reads, calls);
             }
         }
+        // Phase A slice 3: pattern match — scrutinee reads propagate. Each
+        // arm's reads propagate with that arm's positional binders scoped
+        // out (same machinery as MatchResult, generalized to N arms with
+        // N positional binders; wildcards `None` cannot shadow anything).
+        // Auditors find these locally-bound names by reading the arm
+        // header; they are NOT external reads.
+        Expr::MatchVariant(scrutinee, arms) => {
+            collect_expr_facts(scrutinee, reads, calls);
+            for a in arms {
+                let bound: HashSet<&str> = a
+                    .binders
+                    .iter()
+                    .filter_map(|b| b.as_deref())
+                    .collect();
+                let mut inner_reads = HashSet::new();
+                let mut inner_calls = HashSet::new();
+                collect_expr_facts(&a.body, &mut inner_reads, &mut inner_calls);
+                calls.extend(inner_calls);
+                for path in inner_reads {
+                    let base = path.first().map(|s| s.as_str()).unwrap_or("");
+                    if !bound.contains(base) {
+                        reads.insert(path);
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -2686,6 +2885,23 @@ fn collect_lambda_bound_names(expr: &Expr) -> std::collections::HashSet<String> 
             // Phase A slice 2: variant construction — same shape as Record.
             Expr::VariantConstruct(_, _, fields) => {
                 for (_, v) in fields { walk(v, out); }
+            }
+            // Phase A slice 3: pattern match — each arm's positional
+            // binders (`Some(name)`) are lambda-bound in that arm's body
+            // scope. Add every non-wildcard binder to the lambda-bound
+            // set, then recurse into scrutinee + each arm body. Auditors
+            // know these names are NOT external reads — they're the
+            // payload destructuring slots.
+            Expr::MatchVariant(scrutinee, arms) => {
+                walk(scrutinee, out);
+                for a in arms {
+                    for binder in &a.binders {
+                        if let Some(name) = binder {
+                            out.insert(name.clone());
+                        }
+                    }
+                    walk(&a.body, out);
+                }
             }
             Expr::Fetch(_, request) => walk(request, out),
             // Leaves
@@ -2880,6 +3096,13 @@ fn count_operations(expr: &Expr) -> usize {
         // payload field's expression cost. Same shape as Record.
         Expr::VariantConstruct(_, _, fields) => {
             1 + fields.iter().map(|(_, e)| count_operations(e)).sum::<usize>()
+        }
+        // Phase A slice 3: pattern match — 1 op for the tag dispatch +
+        // scrutinee cost + sum of each arm body's cost. Same shape as
+        // MatchResult generalized to N arms.
+        Expr::MatchVariant(scrutinee, arms) => {
+            1 + count_operations(scrutinee)
+                + arms.iter().map(|a| count_operations(&a.body)).sum::<usize>()
         }
     }
 }
@@ -3618,6 +3841,14 @@ rule layered_caller
                     _ => None,
                 })
                 .collect();
+            let all_concepts: Vec<&Concept> = program
+                .items
+                .iter()
+                .filter_map(|i| match i {
+                    Item::Concept(c) => Some(c),
+                    _ => None,
+                })
+                .collect();
             let rule = match all_rules.last() {
                 Some(r) => *r,
                 None => continue,
@@ -3626,7 +3857,7 @@ rule layered_caller
                 panic!("cannot load {}: {}", json_path.display(), e)
             });
             for (idx, record) in records.iter().enumerate() {
-                let result = eval_rule(rule, &all_rules, record);
+                let result = eval_rule(rule, &all_rules, &all_concepts, record);
                 assert!(
                     result.is_ok(),
                     "runtime error running rule '{}' in {} on record [{}]:\n  {}",
@@ -4670,6 +4901,239 @@ rule bad
         assert!(
             errs.iter().any(|e| e.message.contains("unknown concept 'NonExistent'")),
             "(g) unknown concept should be rejected: {:#?}", errs
+        );
+    }
+
+    /// Phase A slice 3 — pattern match across the variants of a sum-type
+    /// concept. A rule whose input is a sum-type concept can destructure
+    /// it with `match e: VarA(...) => ... ; VarB(...) => ... ; VarC => ...`.
+    /// The verifier cross-checks the scrutinee's resolved concept, the
+    /// arm-variant set (exhaustiveness + no extras + no duplicates), the
+    /// per-arm binder arity, and the per-arm body type against the rule's
+    /// declared output type. Binders introduced by an arm are lambda-bound
+    /// for purity (so the body's `reads:` proof does not flag them as
+    /// extra external reads).
+    ///
+    /// Pinned cases:
+    ///   (a) Happy path: exhaustive match on a 3-variant concept — accepts
+    ///   (b) Missing arm (non-exhaustive) → rejected
+    ///   (c) Unknown variant name → rejected
+    ///   (d) Wrong binder count → rejected
+    ///   (e) Duplicate arm for same variant → rejected
+    ///   (f) Match on a record concept → rejected
+    ///   (g) Match on unresolvable scrutinee → rejected
+    ///   (h) Duplicate binder within one arm → rejected
+    #[test]
+    fn phase_a3_match_variant_verifier() {
+        let common_concepts = r#"@verbose 0.1.0
+
+concept Token
+  @intention: "a tagged token"
+  @source: invoices.intent:1
+  variants:
+    Ident of (name : text)
+    Int of (value : number)
+    Eof
+
+"#;
+
+        // (a) Happy: exhaustive match, each arm produces a number.
+        let happy = format!("{}{}", common_concepts, r#"rule token_length
+  @intention: "compute a numeric proxy for the token"
+  @source: invoices.intent:1
+  input:
+    t : Token
+  output:
+    n : number
+  logic:
+    n = match t:
+      Ident(_) => 1
+      Int(v) => v
+      Eof => 0
+
+  proofs:
+    purity:
+      reads : [t]
+      calls : []
+    termination:
+      bound : 1
+"#);
+        let errs = verify_str(&happy);
+        assert!(errs.is_empty(), "(a) exhaustive match should verify, got: {:#?}", errs);
+
+        // (b) Missing arm → non-exhaustive.
+        let missing_arm = format!("{}{}", common_concepts, r#"rule bad
+  @intention: "x"
+  @source: invoices.intent:1
+  input:
+    t : Token
+  output:
+    n : number
+  logic:
+    n = match t:
+      Ident(_) => 1
+      Int(v) => v
+
+  proofs:
+    purity:
+      reads : [t]
+      calls : []
+    termination:
+      bound : 1
+"#);
+        let errs = verify_str(&missing_arm);
+        assert!(
+            errs.iter().any(|e| e.message.contains("not exhaustive") && e.message.contains("Token::Eof")),
+            "(b) missing-Eof arm should be rejected: {:#?}", errs
+        );
+
+        // (c) Unknown variant name.
+        let unknown_arm = format!("{}{}", common_concepts, r#"rule bad
+  @intention: "x"
+  @source: invoices.intent:1
+  input:
+    t : Token
+  output:
+    n : number
+  logic:
+    n = match t:
+      Ident(_) => 1
+      Int(v) => v
+      Eof => 0
+      Float(x) => x
+
+  proofs:
+    purity:
+      reads : [t]
+      calls : []
+    termination:
+      bound : 1
+"#);
+        let errs = verify_str(&unknown_arm);
+        assert!(
+            errs.iter().any(|e| e.message.contains("unknown variant 'Token::Float'")),
+            "(c) unknown variant should be rejected: {:#?}", errs
+        );
+
+        // (d) Wrong binder count.
+        let wrong_arity = format!("{}{}", common_concepts, r#"rule bad
+  @intention: "x"
+  @source: invoices.intent:1
+  input:
+    t : Token
+  output:
+    n : number
+  logic:
+    n = match t:
+      Ident(a, b) => 1
+      Int(v) => v
+      Eof => 0
+
+  proofs:
+    purity:
+      reads : [t]
+      calls : []
+    termination:
+      bound : 1
+"#);
+        let errs = verify_str(&wrong_arity);
+        assert!(
+            errs.iter().any(|e| e.message.contains("Token::Ident") && e.message.contains("2 binder") && e.message.contains("1 field")),
+            "(d) wrong arity should be rejected with arity diagnostic: {:#?}", errs
+        );
+
+        // (e) Duplicate arm for the same variant.
+        let dup_arm = format!("{}{}", common_concepts, r#"rule bad
+  @intention: "x"
+  @source: invoices.intent:1
+  input:
+    t : Token
+  output:
+    n : number
+  logic:
+    n = match t:
+      Ident(_) => 1
+      Ident(_) => 2
+      Int(v) => v
+      Eof => 0
+
+  proofs:
+    purity:
+      reads : [t]
+      calls : []
+    termination:
+      bound : 1
+"#);
+        let errs = verify_str(&dup_arm);
+        assert!(
+            errs.iter().any(|e| e.message.contains("Token::Ident") && e.message.contains("duplicated")),
+            "(e) duplicate arm should be rejected: {:#?}", errs
+        );
+
+        // (f) Match on a record concept.
+        let on_record = r#"@verbose 0.1.0
+
+concept Recd
+  @intention: "x"
+  @source: invoices.intent:1
+  fields:
+    a : number
+
+rule bad
+  @intention: "x"
+  @source: invoices.intent:1
+  input:
+    r : Recd
+  output:
+    n : number
+  logic:
+    n = match r:
+      Foo => 0
+
+  proofs:
+    purity:
+      reads : [r]
+      calls : []
+    termination:
+      bound : 1
+"#;
+        let errs = verify_str(on_record);
+        assert!(
+            errs.iter().any(|e| e.message.contains("record concept")),
+            "(f) match on record should be rejected: {:#?}", errs
+        );
+
+        // (h) Duplicate binder within one arm.
+        let dup_binder = r#"@verbose 0.1.0
+
+concept Pair
+  @intention: "x"
+  @source: invoices.intent:1
+  variants:
+    Two of (a : number, b : number)
+
+rule bad
+  @intention: "x"
+  @source: invoices.intent:1
+  input:
+    p : Pair
+  output:
+    n : number
+  logic:
+    n = match p:
+      Two(x, x) => x
+
+  proofs:
+    purity:
+      reads : [p]
+      calls : []
+    termination:
+      bound : 1
+"#;
+        let errs = verify_str(dup_binder);
+        assert!(
+            errs.iter().any(|e| e.message.contains("Pair::Two") && e.message.contains("binds 'x' twice")),
+            "(h) duplicate binder should be rejected: {:#?}", errs
         );
     }
 }
