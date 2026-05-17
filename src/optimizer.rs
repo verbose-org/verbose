@@ -278,7 +278,7 @@ fn inline_text_literal_lets(
 /// `replacement`, respecting lambda / fold / match-result scopes. When a
 /// sub-expression rebinds `name` as a lambda or match-arm variable, that
 /// sub-tree is left untouched so shadowing is preserved.
-fn substitute_ident(expr: &Expr, name: &str, replacement: &Expr) -> Expr {
+pub fn substitute_ident(expr: &Expr, name: &str, replacement: &Expr) -> Expr {
     match expr {
         Expr::Ident(n) if n == name => replacement.clone(),
         Expr::Ident(_) | Expr::Number(_) | Expr::Text(_) => expr.clone(),
