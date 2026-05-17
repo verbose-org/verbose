@@ -1,0 +1,86 @@
+@verbose 0.1.0
+
+-- Phase A end-to-end demonstration: declare a sum-type concept,
+-- construct its variants, and dispatch on the tag — all in one
+-- runnable example.
+--
+--   slice 1 (PR #25):  `variants:` block declares Token
+--   slice 2 (PR #27):  Token::Int { value: ... } / Token::Zero / Token::Eof construct a Variant
+--   slice 3 (PR #28):  match e: ... dispatches on the tag
+--
+-- The example deliberately avoids native-incompatible shapes — both
+-- rules run via the interpreter today (`--run score --input
+-- token_classify.json`). The native lowering for sum types is Phase A
+-- slice 4+ (tagged-union layout + tag dispatch); when it lands this
+-- same .verbose file should produce a byte-for-byte equivalent binary
+-- against `--run`.
+--
+-- Bounds note: `n : number [0, 1000]` is deliberate — without an
+-- explicit range, the optimizer's default `[0, i32::MAX]` would
+-- statically eliminate any `n < 0` branch (interval arithmetic
+-- proves it dead). All classification predicates here stay inside
+-- the declared range, so the optimizer cannot fold a live arm away.
+
+
+concept Sample
+  @intention: "A sample wraps a single non-negative integer (0..=1000)"
+  @source: token_classify.intent:1
+
+  fields:
+    n : number [0, 1000]
+
+
+concept Token
+  @intention: "A token kind: integer literal, zero marker, or end-of-input"
+  @source: token_classify.intent:2
+
+  variants:
+    Int of (value : number)
+    Zero
+    Eof
+
+
+rule classify
+  @intention: "Map a sample to a Token: 0=Zero, >100=Eof, otherwise Int(n)"
+  @source: token_classify.intent:3
+
+  input:
+    s : Sample
+
+  output:
+    t : Token
+
+  logic:
+    t = if s.n == 0 then Token::Zero else if s.n > 100 then Token::Eof else Token::Int { value: s.n }
+
+  proofs:
+    purity:
+      reads   : [s.n]
+      calls   : []
+    termination:
+      bound : 7
+
+
+rule score
+  @intention: "Score a sample: Eof→-1, Zero→0, Int(v)→v"
+  @source: token_classify.intent:4
+
+  input:
+    s : Sample
+
+  output:
+    out : number
+
+  logic:
+    out = match classify(s):
+      Int(v) => v
+      Zero => 0
+      Eof => -1
+
+
+  proofs:
+    purity:
+      reads   : [s]
+      calls   : [classify]
+    termination:
+      bound : 5

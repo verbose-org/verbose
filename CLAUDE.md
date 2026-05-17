@@ -411,6 +411,20 @@ examples/
                    the BoundText match to mirror the fill pass at native.rs:2368.
                    1881 B native binary on port 18923. Pinned by the regression test
                    `coverage_read_and_fetch_concat_in_handler_preserves_request_slots`.
+  token_classify.* Phase A end-to-end demo (slices 1+2+3): a `variants:` block
+                   declares Token (Int(value)/Zero/Eof); `classify` constructs
+                   variants via `Token::Int { value: s.n }` / `Token::Zero` /
+                   `Token::Eof` inside a chained if/else; `score` dispatches
+                   on the tag with `match classify(s): Int(v) => v ; Zero =>
+                   0 ; Eof => -1`. Runs via `--run score --input
+                   token_classify.json` (interpreter only — native lowering
+                   for sum types is Phase A slice 4+). Bounds note:
+                   `n : number [0, 1000]` is explicit because the
+                   optimizer's default field range is `[0, i32::MAX]`,
+                   which would dead-eliminate any `s.n < 0` branch via
+                   interval arithmetic — all classification predicates
+                   stay inside the declared `[0, 1000]` so the optimizer
+                   cannot fold a live arm away.
   demo.html        Browser demo (WASM)
 
 tools/

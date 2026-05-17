@@ -1,0 +1,4 @@
+1. A sample wraps a single non-negative integer in the range 0 to 1000.
+2. A token is one of three kinds: an integer-valued literal, a special "zero" marker, or an end-of-input sentinel.
+3. To classify a sample: if the integer is 0 it is the zero marker; if it is strictly greater than 100 it represents end-of-input; otherwise it is an integer-valued literal carrying the integer.
+4. To score a sample: classify it; if the result is end-of-input score -1, if it is the zero marker score 0, if it is an integer literal score the integer value.
