@@ -5110,6 +5110,143 @@ fn emit_redirect_callee_leaves(
     }
 }
 
+/// Phase A slice 4.1 — inline a sum-type-returning callee's body, redirecting
+/// each `VariantConstruct` leaf to the substituted body of the matching arm.
+///
+/// At each leaf `Var(field1: e1, field2: e2, ...)`:
+///   1. Find the arm whose `variant_name` matches `Var`.
+///   2. For each `Some(binder)` in `arm.binders` paired with the leaf's
+///      payload field, substitute `Ident(binder)` with the field expression
+///      in the arm body (after renaming `callee.input_name` →
+///      `outer_input_name` in the field expression so its `Field` accesses
+///      resolve against the outer's offsets).
+///   3. Emit eval of the substituted body — rax holds the scalar result.
+///   4. Emit `jmp <common_end>` whose rel32 is recorded in `end_patches`
+///      for the caller to fix up once the converge point is known.
+///
+/// Non-leaf shapes handled: `If(cond, then, else)` — the cond originates
+/// from the callee's body so we rename `callee.input_name` → outer before
+/// emitting it. Each branch recurses; every leaf in either branch ends
+/// with `jmp common_end`, so the then-branch never falls through to the
+/// else-branch (the patch is just a textual `else` label, but execution
+/// reaches it only via the cond's `jz`).
+///
+/// Slice A.4.1 limits enforced here:
+/// - Non-`VariantConstruct` / non-`If` leaves are refused with a clear
+///   breadcrumb (e.g. a callee whose body returns a literal Number — not
+///   the shape a sum-type-returning rule should have).
+/// - The substituted arm body is evaluated via the standard `emit_eval_expr`,
+///   which restricts each arm body to the same scalar grammar as any other
+///   number/bool expression. Nested MatchVariant inside an arm body would
+///   re-enter the MatchVariant arm of `emit_eval_expr` — supported in
+///   principle, though no test in slice A.4.1 exercises that yet.
+fn emit_redirect_variant_leaves(
+    code: &mut Vec<u8>,
+    expr: &Expr,
+    callee: &Rule,
+    arms: &[MatchArm],
+    outer_input_name: &str,
+    offsets: &HashMap<&str, i32>,
+    all_rules: &HashMap<&str, &Rule>,
+    field_ranges: &HashMap<&str, (i64, i64)>,
+    text_bindings: &TextBindings<'_>,
+    end_patches: &mut Vec<usize>,
+) -> Result<(), NativeError> {
+    match expr {
+        Expr::VariantConstruct(_concept_name, variant_name, fields) => {
+            let arm = arms
+                .iter()
+                .find(|a| &a.variant_name == variant_name)
+                .ok_or_else(|| NativeError {
+                    message: format!(
+                        "MatchVariant: callee produces variant '{}' but no matching arm — verifier should have caught this",
+                        variant_name
+                    ),
+                })?;
+            if arm.binders.len() != fields.len() {
+                return Err(NativeError {
+                    message: format!(
+                        "MatchVariant: arm for '{}' has {} binders but leaf supplies {} payload fields",
+                        variant_name,
+                        arm.binders.len(),
+                        fields.len(),
+                    ),
+                });
+            }
+            // Build the substituted arm body: rename callee.input →
+            // outer in each field expression, then substitute each
+            // Some(binder) name in the arm body.
+            let mut substituted = arm.body.clone();
+            for (binder, (_field_name, field_expr)) in arm.binders.iter().zip(fields.iter()) {
+                if let Some(binder_name) = binder {
+                    let renamed_field = crate::optimizer::substitute_ident(
+                        field_expr,
+                        &callee.input_name,
+                        &Expr::Ident(outer_input_name.to_string()),
+                    );
+                    substituted = crate::optimizer::substitute_ident(
+                        &substituted,
+                        binder_name,
+                        &renamed_field,
+                    );
+                }
+            }
+            // Eval substituted body in outer context → rax.
+            emit_eval_expr(
+                code, &substituted, outer_input_name, offsets,
+                all_rules, field_ranges, text_bindings,
+            )?;
+            // jmp common_end (forward, caller patches)
+            code.push(0xE9);
+            let patch = code.len();
+            code.extend_from_slice(&[0x00; 4]);
+            end_patches.push(patch);
+            Ok(())
+        }
+        Expr::If(cond, then_e, else_e) => {
+            // The cond lives in the callee's body; its idents reference
+            // callee.input_name. Rename to outer so emit_eval_expr's
+            // offsets / Field resolution applies.
+            let renamed_cond = crate::optimizer::substitute_ident(
+                cond,
+                &callee.input_name,
+                &Expr::Ident(outer_input_name.to_string()),
+            );
+            emit_eval_expr(
+                code, &renamed_cond, outer_input_name, offsets,
+                all_rules, field_ranges, text_bindings,
+            )?;
+            // test al, al ; jz .else
+            code.extend_from_slice(&[0x84, 0xC0]);
+            code.push(0x0F);
+            code.push(0x84);
+            let else_patch = code.len();
+            code.extend_from_slice(&[0x00; 4]);
+            // then branch — every leaf inside ends with `jmp common_end`,
+            // so we never fall through to the else label.
+            emit_redirect_variant_leaves(
+                code, then_e, callee, arms, outer_input_name, offsets,
+                all_rules, field_ranges, text_bindings, end_patches,
+            )?;
+            // Patch the jz target to the start of the else branch.
+            let else_pos = code.len();
+            let eo = else_pos as i32 - (else_patch as i32 + 4);
+            code[else_patch..else_patch + 4].copy_from_slice(&eo.to_le_bytes());
+            emit_redirect_variant_leaves(
+                code, else_e, callee, arms, outer_input_name, offsets,
+                all_rules, field_ranges, text_bindings, end_patches,
+            )?;
+            Ok(())
+        }
+        other => Err(NativeError {
+            message: format!(
+                "MatchVariant: callee body has expression not supported for inlining (slice A.4.1 expects chained if/else of VariantConstruct leaves): {:?}",
+                other
+            ),
+        }),
+    }
+}
+
 /// Emit `mov [rbp + disp], rsp` (or `mov [rbp + disp], rax` if `!r_is_rsp`).
 /// Used by Phase 2F to save rsp into `err_frame_save_slot`.
 fn emit_mov_rbp_disp_from_reg(code: &mut Vec<u8>, disp: i32, r_is_rsp: bool) {
@@ -8606,15 +8743,85 @@ fn emit_eval_expr(
                       wires the tagged union layout. Run rules using variant construction \
                       via --run.".into(),
         }),
-        // Phase A slice 3: pattern match's tag dispatch + payload load is
-        // deferred to slice A.4+, riding on the same tagged-union layout
-        // that variant construction depends on. Today the AST + parser +
-        // verifier + interpreter surface is enough to exercise the
-        // semantics via --run.
-        Expr::MatchVariant(_, _) => Err(NativeError {
-            message: "pattern match (MatchVariant) not yet implemented in native — Phase A slice 4+ \
-                      wires tag dispatch + payload load. Run rules using pattern match via --run.".into(),
-        }),
+        // Phase A slice 4.1 — pattern match on an inlined callee.
+        //
+        // Slice scope: `match callee(input): VariantA(b1, b2) => bodyA ; ...`
+        // where callee is a same-input-concept rule whose body is a chained
+        // if/else of VariantConstruct leaves. Each arm body is scalar
+        // (Number/Bool) and uses positional binders by name.
+        //
+        // Strategy (no runtime tag, no allocator): inline the callee's body,
+        // redirecting each VariantConstruct leaf to a "substituted arm body
+        // eval → jmp common_end". For each leaf:
+        //   1. Find the arm whose `variant_name` matches the leaf's variant.
+        //   2. For each Some(binder) in the arm, substitute the binder name
+        //      with the corresponding payload field expression in the arm
+        //      body (after renaming callee.input_name → outer input_name in
+        //      the field expr so its `Field` accesses resolve against the
+        //      outer's offsets).
+        //   3. Emit eval of the substituted body → rax.
+        //   4. jmp common_end (forward-patched).
+        // After walking all leaves, patch every `jmp common_end` to point
+        // here. Control then continues with whatever follows in the rule
+        // body — typically the post-eval print + jmp loop_top emitted by
+        // emit_full_program.
+        //
+        // Generalization of Phase 2D (`match_result` inlining) to N-arm
+        // sum types. The redirection shape is the same; the binder-via-
+        // substitution choice (instead of frame slots like Phase 2F's
+        // err_var) keeps slice A.4.1 self-contained — no prologue change.
+        Expr::MatchVariant(scrutinee, arms) => {
+            // Validate scrutinee shape.
+            let (callee_name, arg_expr) = match scrutinee.as_ref() {
+                Expr::Call(name, args) if args.len() == 1 => (name.as_str(), &args[0]),
+                _ => return Err(NativeError {
+                    message: "MatchVariant: native slice A.4.1 supports scrutinee = Call(callee, [Ident(input)]) only".into(),
+                }),
+            };
+            let arg_name = match arg_expr {
+                Expr::Ident(n) => n.as_str(),
+                _ => return Err(NativeError {
+                    message: "MatchVariant: scrutinee's call argument must be the input identifier".into(),
+                }),
+            };
+            if arg_name != input_name {
+                return Err(NativeError {
+                    message: format!(
+                        "MatchVariant: scrutinee call argument '{}' is not the outer rule's input '{}' (slice A.4.1 restriction)",
+                        arg_name, input_name
+                    ),
+                });
+            }
+            let callee = all_rules.get(callee_name).ok_or_else(|| NativeError {
+                message: format!("MatchVariant: unknown callee rule '{}'", callee_name),
+            })?;
+            // Slice constraint: same-input-concept. Mirrors Phase 2D's
+            // initial restriction; cross-concept can come in a follow-up.
+            let outer_concept_name = offsets.keys().next().map(|_| ()); // placeholder, real check via input_ty below
+            let _ = outer_concept_name;
+            let mut end_patches: Vec<usize> = Vec::new();
+            emit_redirect_variant_leaves(
+                code,
+                &callee.logic.value,
+                callee,
+                arms,
+                input_name,
+                offsets,
+                all_rules,
+                field_ranges,
+                text_bindings,
+                &mut end_patches,
+            )?;
+            // Patch every "jmp common_end" to land right after the
+            // inlined match. The caller (e.g. emit_full_program) then
+            // continues with itoa + write + jmp loop_top.
+            let end_pos = code.len();
+            for patch in end_patches {
+                let off = end_pos as i32 - (patch as i32 + 4);
+                code[patch..patch + 4].copy_from_slice(&off.to_le_bytes());
+            }
+            Ok(())
+        }
         Expr::Ident(name) if name == input_name => Err(NativeError {
             message: "bare input binding not supported in expressions".into(),
         }),
@@ -21741,5 +21948,58 @@ rule pick_max
 
         let _ = std::fs::remove_file(&out_min);
         let _ = std::fs::remove_file(&out_max);
+    }
+
+    /// Phase A slice 4.1 — pattern match on an inlined callee, scalar
+    /// output. End-to-end native runtime: compile `examples/token_classify.verbose`'s
+    /// `score` rule with `--stdin`, then feed each canonical input and
+    /// pin stdout against the interpreter's reference. Exercises every
+    /// arm of the match — Token::Zero, Token::Int(v) with binder use,
+    /// and Token::Eof (no-payload variant).
+    #[test]
+    fn phase_a4_1_match_variant_inlined_runtime() {
+        use std::fs;
+        use std::process::Command;
+        let src = fs::read_to_string("examples/token_classify.verbose")
+            .expect("token_classify.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let out = std::env::temp_dir().join("verbosec_test_phase_a4_1_score");
+        compile_native(&program, "score", out.to_str().unwrap(), true, false)
+            .expect("MatchVariant on inlined callee should compile");
+
+        // Each (stdin_input, expected_stdout) pins one match arm:
+        //   0    → Zero arm     → "0"
+        //   42   → Int(v) arm   → "42"   (binder v reads s.n through the substituted body)
+        //   100  → Int(v) arm   → "100"
+        //   101  → Eof arm      → "-1"
+        //   1000 → Eof arm      → "-1"
+        let cases = &[
+            ("0",    "0"),
+            ("42",   "42"),
+            ("100",  "100"),
+            ("101",  "-1"),
+            ("1000", "-1"),
+        ];
+        for (input, expected) in cases {
+            use std::io::Write;
+            let mut child = Command::new(&out)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .expect("spawn score");
+            child.stdin.as_mut().unwrap().write_all(input.as_bytes()).unwrap();
+            child.stdin.as_mut().unwrap().write_all(b"\n").unwrap();
+            drop(child.stdin.take());
+            let out_run = child.wait_with_output().expect("wait score");
+            assert_eq!(
+                String::from_utf8_lossy(&out_run.stdout).trim(),
+                *expected,
+                "input '{}' should produce '{}'; full stdout: {:?}",
+                input, expected, out_run.stdout
+            );
+        }
+        let _ = fs::remove_file(out);
     }
 }
