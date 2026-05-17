@@ -1,0 +1,78 @@
+@verbose 0.1.0
+
+-- Phase A slice 4.2 worked example: pattern match with text-typed
+-- payload binders, text-output rule. The `label_of` rule routes
+-- through emit_text_write_to_fd's MatchVariant arm — same
+-- substitution model as slice 4.1's scalar path, but each arm's
+-- substituted body is a `concat(...)` written directly to stdout.
+--
+-- Compiles natively via `--run label_of --stdin --native`. Each
+-- record is `<n> <name>\n` on stdin; per-record output is one of:
+--   "id:<name>"   when n == 0     (Ident arm; text binder use)
+--   "int:<n>"     when 1..=100    (Int arm; number binder use)
+--   "eof"         when n > 100    (Eof arm; no payload)
+
+
+concept Sample
+  @intention: "A sample wraps an integer and a label string"
+  @source: token_label.intent:1
+
+  fields:
+    n    : number [0, 1000]
+    name : text [..32]
+
+
+concept Token
+  @intention: "A token kind with optional payload"
+  @source: token_label.intent:2
+
+  variants:
+    Ident of (label : text)
+    Int of (value : number)
+    Eof
+
+
+rule classify
+  @intention: "Map a sample to a Token: 0=Ident(name), >100=Eof, otherwise Int(n)"
+  @source: token_label.intent:3
+
+  input:
+    s : Sample
+
+  output:
+    t : Token
+
+  logic:
+    t = if s.n == 0 then Token::Ident { label: s.name } else if s.n > 100 then Token::Eof else Token::Int { value: s.n }
+
+  proofs:
+    purity:
+      reads   : [s.n, s.name]
+      calls   : []
+    termination:
+      bound : 7
+
+
+rule label_of
+  @intention: "Produce the printable label of a sample's Token classification"
+  @source: token_label.intent:4
+
+  input:
+    s : Sample
+
+  output:
+    tag : text
+
+  logic:
+    tag = match classify(s):
+      Ident(label) => concat("id:", label)
+      Int(v) => concat("int:", v)
+      Eof => "eof"
+
+
+  proofs:
+    purity:
+      reads   : [s]
+      calls   : [classify]
+    termination:
+      bound : 7

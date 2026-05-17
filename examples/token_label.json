@@ -1,0 +1,7 @@
+[
+  {"n": 0,   "name": "hello"},
+  {"n": 42,  "name": "ignored"},
+  {"n": 100, "name": "ignored"},
+  {"n": 101, "name": "ignored"},
+  {"n": 1000, "name": "ignored"}
+]

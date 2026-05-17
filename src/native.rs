@@ -4386,6 +4386,58 @@ fn emit_text_write_to_fd(
                 text_bindings,
             )
         }
+        // Phase A slice 4.2 — pattern match in a text-producing context.
+        // Mirrors `emit_eval_expr`'s MatchVariant arm but with each redirected
+        // arm body emitted via the recursive `emit_text_write_to_fd` (one
+        // write syscall per arm) and a forward `jmp common_end` so all arms
+        // converge to the same post-write point.
+        Expr::MatchVariant(scrutinee, arms) => {
+            // Validate scrutinee shape (same restrictions as the scalar path).
+            let (callee_name, arg_expr) = match scrutinee.as_ref() {
+                Expr::Call(name, args) if args.len() == 1 => (name.as_str(), &args[0]),
+                _ => return Err(NativeError {
+                    message: "MatchVariant in text context: native slice A.4.2 supports scrutinee = Call(callee, [Ident(input)]) only".into(),
+                }),
+            };
+            let arg_name = match arg_expr {
+                Expr::Ident(n) => n.as_str(),
+                _ => return Err(NativeError {
+                    message: "MatchVariant in text context: scrutinee's call argument must be the input identifier".into(),
+                }),
+            };
+            if arg_name != input_name {
+                return Err(NativeError {
+                    message: format!(
+                        "MatchVariant in text context: scrutinee call argument '{}' is not the outer rule's input '{}' (slice A.4.2 restriction)",
+                        arg_name, input_name
+                    ),
+                });
+            }
+            let callee = all_rules.get(callee_name).ok_or_else(|| NativeError {
+                message: format!("MatchVariant in text context: unknown callee rule '{}'", callee_name),
+            })?;
+            let mut end_patches: Vec<usize> = Vec::new();
+            emit_redirect_variant_leaves_text(
+                code,
+                &callee.logic.value,
+                callee,
+                arms,
+                fd,
+                input_name,
+                concept,
+                all_rules,
+                offsets,
+                field_ranges,
+                text_bindings,
+                &mut end_patches,
+            )?;
+            let end_pos = code.len();
+            for patch in end_patches {
+                let off = end_pos as i32 - (patch as i32 + 4);
+                code[patch..patch + 4].copy_from_slice(&off.to_le_bytes());
+            }
+            Ok(())
+        }
         other => Err(NativeError {
             message: format!(
                 "text-producing expression not yet supported in native: {:?}",
@@ -5241,6 +5293,111 @@ fn emit_redirect_variant_leaves(
         other => Err(NativeError {
             message: format!(
                 "MatchVariant: callee body has expression not supported for inlining (slice A.4.1 expects chained if/else of VariantConstruct leaves): {:?}",
+                other
+            ),
+        }),
+    }
+}
+
+/// Phase A slice 4.2 — text-context variant of `emit_redirect_variant_leaves`.
+/// Same dispatch + AST substitution, but each leaf's substituted arm body is
+/// emitted via `emit_text_write_to_fd` (writes directly to `fd`) instead of
+/// `emit_eval_expr` (leaves result in rax). The forward-patch list converges
+/// every arm to the same common_end point; the caller patches it.
+fn emit_redirect_variant_leaves_text(
+    code: &mut Vec<u8>,
+    expr: &Expr,
+    callee: &Rule,
+    arms: &[MatchArm],
+    fd: i32,
+    outer_input_name: &str,
+    concept: &Concept,
+    all_rules: &HashMap<&str, &Rule>,
+    offsets: &HashMap<&str, i32>,
+    field_ranges: &HashMap<&str, (i64, i64)>,
+    text_bindings: &TextBindings<'_>,
+    end_patches: &mut Vec<usize>,
+) -> Result<(), NativeError> {
+    match expr {
+        Expr::VariantConstruct(_concept_name, variant_name, fields) => {
+            let arm = arms
+                .iter()
+                .find(|a| &a.variant_name == variant_name)
+                .ok_or_else(|| NativeError {
+                    message: format!(
+                        "MatchVariant: callee produces variant '{}' but no matching arm — verifier should have caught this",
+                        variant_name
+                    ),
+                })?;
+            if arm.binders.len() != fields.len() {
+                return Err(NativeError {
+                    message: format!(
+                        "MatchVariant: arm for '{}' has {} binders but leaf supplies {} payload fields",
+                        variant_name, arm.binders.len(), fields.len(),
+                    ),
+                });
+            }
+            let mut substituted = arm.body.clone();
+            for (binder, (_field_name, field_expr)) in arm.binders.iter().zip(fields.iter()) {
+                if let Some(binder_name) = binder {
+                    let renamed_field = crate::optimizer::substitute_ident(
+                        field_expr,
+                        &callee.input_name,
+                        &Expr::Ident(outer_input_name.to_string()),
+                    );
+                    substituted = crate::optimizer::substitute_ident(
+                        &substituted,
+                        binder_name,
+                        &renamed_field,
+                    );
+                }
+            }
+            // Emit the substituted body as a text write to `fd`.
+            emit_text_write_to_fd(
+                code, &substituted, fd, outer_input_name, concept,
+                all_rules, offsets, field_ranges, text_bindings,
+            )?;
+            // jmp common_end (forward, caller patches)
+            code.push(0xE9);
+            let patch = code.len();
+            code.extend_from_slice(&[0x00; 4]);
+            end_patches.push(patch);
+            Ok(())
+        }
+        Expr::If(cond, then_e, else_e) => {
+            let renamed_cond = crate::optimizer::substitute_ident(
+                cond,
+                &callee.input_name,
+                &Expr::Ident(outer_input_name.to_string()),
+            );
+            // The cond is a Number expression; eval into rax with the
+            // standard emit_eval_expr — text_bindings is irrelevant for
+            // a numeric comparison but harmless to forward.
+            emit_eval_expr(
+                code, &renamed_cond, outer_input_name, offsets,
+                all_rules, field_ranges, text_bindings,
+            )?;
+            code.extend_from_slice(&[0x84, 0xC0]);
+            code.push(0x0F);
+            code.push(0x84);
+            let else_patch = code.len();
+            code.extend_from_slice(&[0x00; 4]);
+            emit_redirect_variant_leaves_text(
+                code, then_e, callee, arms, fd, outer_input_name, concept,
+                all_rules, offsets, field_ranges, text_bindings, end_patches,
+            )?;
+            let else_pos = code.len();
+            let eo = else_pos as i32 - (else_patch as i32 + 4);
+            code[else_patch..else_patch + 4].copy_from_slice(&eo.to_le_bytes());
+            emit_redirect_variant_leaves_text(
+                code, else_e, callee, arms, fd, outer_input_name, concept,
+                all_rules, offsets, field_ranges, text_bindings, end_patches,
+            )?;
+            Ok(())
+        }
+        other => Err(NativeError {
+            message: format!(
+                "MatchVariant (text): callee body has expression not supported for inlining: {:?}",
                 other
             ),
         }),
@@ -21948,6 +22105,54 @@ rule pick_max
 
         let _ = std::fs::remove_file(&out_min);
         let _ = std::fs::remove_file(&out_max);
+    }
+
+    /// Phase A slice 4.2 — pattern match in a text-producing context
+    /// with text-typed payload binders. End-to-end: compile
+    /// `examples/token_label.verbose`'s `label_of` rule with `--stdin`,
+    /// feed `<n> <name>\n` per record, pin stdout. Exercises both:
+    /// text-binder substitution (Ident arm's `label` flows into
+    /// `concat("id:", label)`) AND text-output match routing through
+    /// `emit_text_write_to_fd`'s MatchVariant arm.
+    #[test]
+    fn phase_a4_2_match_variant_text_output_runtime() {
+        use std::fs;
+        use std::process::Command;
+        let src = fs::read_to_string("examples/token_label.verbose")
+            .expect("token_label.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let out = std::env::temp_dir().join("verbosec_test_phase_a4_2_label");
+        compile_native(&program, "label_of", out.to_str().unwrap(), true, false)
+            .expect("MatchVariant text output should compile");
+
+        let cases: &[(&str, &str)] = &[
+            ("0 hello",     "id:hello"),
+            ("42 ignored",  "int:42"),
+            ("100 ignored", "int:100"),
+            ("101 ignored", "eof"),
+            ("1000 ignored", "eof"),
+        ];
+        for (input, expected) in cases {
+            use std::io::Write;
+            let mut child = Command::new(&out)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .expect("spawn label_of");
+            child.stdin.as_mut().unwrap().write_all(input.as_bytes()).unwrap();
+            child.stdin.as_mut().unwrap().write_all(b"\n").unwrap();
+            drop(child.stdin.take());
+            let out_run = child.wait_with_output().expect("wait label_of");
+            assert_eq!(
+                String::from_utf8_lossy(&out_run.stdout).trim(),
+                *expected,
+                "input '{}' should produce '{}'; full stdout: {:?}",
+                input, expected, out_run.stdout
+            );
+        }
+        let _ = fs::remove_file(out);
     }
 
     /// Phase A slice 4.1 — pattern match on an inlined callee, scalar
