@@ -154,6 +154,31 @@ fn compile_native_code(
         (*r, *c)
     };
 
+    // Phase A slice 5.0 — refuse recursive rules at compile time.
+    //
+    // Every native emit path today inlines callees (Phase 2D match_result,
+    // Phase 2G text-returning call, Phase 2H-a/b reaction logs, Phase A
+    // slice 4.1/4.2 MatchVariant). A recursive call graph — direct or
+    // mutual — would expand forever during inlining and stack-overflow
+    // the compiler. Detect the cycle here and refuse with a clear
+    // breadcrumb instead of crashing.
+    //
+    // Slice 5.0 is the safety floor. Slice 5.1+ ships a real call
+    // convention (push rbp / call <label> / pop rbp / ret) that lifts
+    // this restriction for shapes where it's audit-defensible. Until
+    // then, recursive rules stay interpreter-only via `--run`.
+    //
+    // Reactions are checked against their trigger rule's call graph
+    // (the reaction itself doesn't recurse, but its trigger might).
+    if let Some(cycle) = detect_native_recursion(rule, &rules) {
+        return Err(NativeError {
+            message: format!(
+                "rule '{}' is part of a recursive call graph (cycle through '{}'); native lowering needs Phase A slice 5.1+ (real call convention). Use --run for now.",
+                rule.name, cycle
+            ),
+        });
+    }
+
     // Look up the context concept (if multi-input rule).
     let context_concept: Option<&Concept> = match &rule.context_ty {
         Some(Type::Named(n)) => Some(
@@ -949,6 +974,148 @@ fn collect_rule_read_names(rule: &Rule) -> Vec<String> {
     }
     collect_read_names_native(&rule.logic.value, &mut names);
     names
+}
+
+/// Phase A slice 5.0 — detect a cycle in the native call graph reachable
+/// from `entry`. Returns `Some(name)` where `name` is a rule that lies on
+/// a cycle (direct self-recursion: `name == entry.name`; mutual recursion:
+/// `name` is somewhere in the chain). `None` means the call graph is a
+/// DAG and inlining will terminate.
+///
+/// Used at native compile entry to refuse rules whose inlining would
+/// infinitely expand. The check walks every `Call(name, args)` reachable
+/// from the entry rule's logic — through if/else, ok/err arms,
+/// match_result, MatchVariant, concat, map/filter/fold bodies, etc.
+///
+/// Algorithm: DFS with a recursion stack (`on_stack`) and a fully-
+/// explored set (`fully_done`). A back-edge to a node on the stack is
+/// a cycle. Symmetric with classic strongly-connected-component
+/// detection, simplified because we only need a witness (any node on
+/// the cycle is enough for the breadcrumb).
+fn detect_native_recursion(entry: &Rule, all_rules: &HashMap<&str, &Rule>) -> Option<String> {
+    let mut on_stack: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut fully_done: std::collections::HashSet<String> = std::collections::HashSet::new();
+    dfs_native_cycle(&entry.name, all_rules, &mut on_stack, &mut fully_done)
+}
+
+fn dfs_native_cycle(
+    name: &str,
+    all_rules: &HashMap<&str, &Rule>,
+    on_stack: &mut std::collections::HashSet<String>,
+    fully_done: &mut std::collections::HashSet<String>,
+) -> Option<String> {
+    if on_stack.contains(name) {
+        return Some(name.to_string());
+    }
+    if fully_done.contains(name) {
+        return None;
+    }
+    let rule = match all_rules.get(name) {
+        Some(r) => *r,
+        None => return None,
+    };
+    on_stack.insert(name.to_string());
+    // Collect every Call(name, _) referenced by this rule's logic.
+    let mut callees: Vec<String> = Vec::new();
+    for (_, e) in &rule.logic.bindings {
+        collect_native_callees(e, &mut callees);
+    }
+    collect_native_callees(&rule.logic.value, &mut callees);
+    for c in callees {
+        if let Some(witness) = dfs_native_cycle(&c, all_rules, on_stack, fully_done) {
+            return Some(witness);
+        }
+    }
+    on_stack.remove(name);
+    fully_done.insert(name.to_string());
+    None
+}
+
+/// Collect every `Call(name, _)` referenced by `expr`. Walks the same
+/// shapes as `gather_transitive_callee_reads` but only emits the callee
+/// names (no resource reads, no further walking — the caller does the
+/// recursion via the DFS).
+fn collect_native_callees(expr: &Expr, out: &mut Vec<String>) {
+    match expr {
+        Expr::Call(name, args) => {
+            out.push(name.clone());
+            for a in args {
+                collect_native_callees(a, out);
+            }
+        }
+        Expr::If(c, t, e) => {
+            collect_native_callees(c, out);
+            collect_native_callees(t, out);
+            collect_native_callees(e, out);
+        }
+        Expr::Binary(_, l, r) => {
+            collect_native_callees(l, out);
+            collect_native_callees(r, out);
+        }
+        Expr::Ok(i) | Expr::Err(i) | Expr::Not(i) | Expr::Neg(i) | Expr::Abs(i)
+        | Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i) => {
+            collect_native_callees(i, out);
+        }
+        Expr::Min(a, b) | Expr::Max(a, b) | Expr::StartsWith(a, b)
+        | Expr::EndsWith(a, b) | Expr::Contains(a, b) => {
+            collect_native_callees(a, out);
+            collect_native_callees(b, out);
+        }
+        Expr::Concat(args) => {
+            for a in args {
+                collect_native_callees(a, out);
+            }
+        }
+        Expr::MatchResult(target, _, ok_body, _, err_body) => {
+            collect_native_callees(target, out);
+            collect_native_callees(ok_body, out);
+            collect_native_callees(err_body, out);
+        }
+        Expr::MatchVariant(scrutinee, arms) => {
+            collect_native_callees(scrutinee, out);
+            for arm in arms {
+                collect_native_callees(&arm.body, out);
+            }
+        }
+        Expr::Quantifier(_, coll, _, body) => {
+            collect_native_callees(coll, out);
+            collect_native_callees(body, out);
+        }
+        Expr::Fold(coll, init, _, _, body) => {
+            collect_native_callees(coll, out);
+            collect_native_callees(init, out);
+            collect_native_callees(body, out);
+        }
+        Expr::FoldBytes(text, init, _, _, _, body) => {
+            collect_native_callees(text, out);
+            collect_native_callees(init, out);
+            collect_native_callees(body, out);
+        }
+        Expr::Map(coll, _, body) | Expr::Filter(coll, _, body) => {
+            collect_native_callees(coll, out);
+            collect_native_callees(body, out);
+        }
+        Expr::Record(_, fields) | Expr::VariantConstruct(_, _, fields) => {
+            for (_, e) in fields {
+                collect_native_callees(e, out);
+            }
+        }
+        Expr::Substring(t, a, b) => {
+            collect_native_callees(t, out);
+            collect_native_callees(a, out);
+            collect_native_callees(b, out);
+        }
+        Expr::ByteAt(t, i) => {
+            collect_native_callees(t, out);
+            collect_native_callees(i, out);
+        }
+        Expr::Fetch(_, request) => {
+            collect_native_callees(request, out);
+        }
+        // Leaves
+        Expr::Number(_) | Expr::Text(_)
+        | Expr::Ident(_) | Expr::Field(_, _) | Expr::Read(_) | Expr::NowUnix => {}
+    }
 }
 
 /// Same as `collect_rule_read_names` but also follows `match_result`
@@ -22206,5 +22373,115 @@ rule pick_max
             );
         }
         let _ = fs::remove_file(out);
+    }
+
+    /// Phase A slice 5.0 — refuse recursive rules at native compile time
+    /// with a clear breadcrumb instead of stack-overflowing the compiler.
+    ///
+    /// Three cases:
+    ///   (a) Self-recursive rule  → refused, breadcrumb names the rule
+    ///   (b) Mutually-recursive   → refused (cycle through one of the pair)
+    ///   (c) Non-recursive Call   → still compiles (no false positive)
+    #[test]
+    fn phase_a5_0_refuses_recursive_native() {
+        // (a) Direct self-recursion
+        let self_rec = r#"@verbose 0.1.0
+
+concept N
+  @intention: "n"
+  @source: invoices.intent:1
+  fields:
+    v : number [0, 10]
+
+rule fact
+  @intention: "self-recursive"
+  @source: invoices.intent:1
+  input:
+    n : N
+  output:
+    out : number
+  logic:
+    out = if n.v == 0 then 1 else n.v * fact(n)
+  proofs:
+    purity:
+      reads : [n, n.v]
+      calls : [fact]
+    termination:
+      bound : 100
+"#;
+        let tokens = crate::lexer::Lexer::new(self_rec).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+        let out = std::env::temp_dir().join("verbosec_test_phase_a5_self_rec");
+        let err = compile_native(&program, "fact", out.to_str().unwrap(), true, false)
+            .expect_err("self-recursive rule must be refused");
+        assert!(
+            err.message.contains("recursive call graph") && err.message.contains("'fact'") && err.message.contains("slice 5.1"),
+            "self-recursion breadcrumb should name the rule and the slice: {}",
+            err.message
+        );
+
+        // (b) Mutual recursion: a calls b calls a
+        let mutual = r#"@verbose 0.1.0
+
+concept N
+  @intention: "n"
+  @source: invoices.intent:1
+  fields:
+    v : number [0, 10]
+
+rule even_ish
+  @intention: "calls odd_ish"
+  @source: invoices.intent:1
+  input:
+    n : N
+  output:
+    out : number
+  logic:
+    out = if n.v == 0 then 1 else odd_ish(n)
+  proofs:
+    purity:
+      reads : [n, n.v]
+      calls : [odd_ish]
+    termination:
+      bound : 100
+
+rule odd_ish
+  @intention: "calls even_ish"
+  @source: invoices.intent:1
+  input:
+    n : N
+  output:
+    out : number
+  logic:
+    out = if n.v == 0 then 0 else even_ish(n)
+  proofs:
+    purity:
+      reads : [n, n.v]
+      calls : [even_ish]
+    termination:
+      bound : 100
+"#;
+        let tokens = crate::lexer::Lexer::new(mutual).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+        let out = std::env::temp_dir().join("verbosec_test_phase_a5_mutual_rec");
+        let err = compile_native(&program, "even_ish", out.to_str().unwrap(), true, false)
+            .expect_err("mutually-recursive rule must be refused");
+        assert!(
+            err.message.contains("recursive call graph") && err.message.contains("slice 5.1"),
+            "mutual recursion breadcrumb should mention the cycle and the slice: {}",
+            err.message
+        );
+
+        // (c) Non-recursive Call — must still compile (no false positive).
+        // `score` from `examples/token_classify.verbose` calls `classify`
+        // but neither rule recurses; compile must succeed.
+        let src = std::fs::read_to_string("examples/token_classify.verbose")
+            .expect("token_classify must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+        let out = std::env::temp_dir().join("verbosec_test_phase_a5_nonrec");
+        compile_native(&program, "score", out.to_str().unwrap(), true, false)
+            .expect("non-recursive Call should compile cleanly");
+        let _ = std::fs::remove_file(out);
     }
 }
