@@ -1,0 +1,2 @@
+1. A wrapper holds a single non-negative integer between 0 and 10.
+2. To produce the label of the wrapped integer: if it is 0 the label is the text "done"; otherwise the label is the label of the wrapper carrying one less.
