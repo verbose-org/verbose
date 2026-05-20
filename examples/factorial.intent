@@ -1,0 +1,2 @@
+1. A wrapper holds a single non-negative integer between 0 and 10.
+2. To compute the factorial of the wrapped integer: when the integer is 0 the factorial is 1; otherwise the factorial is the integer multiplied by the factorial of the wrapper carrying one less.
