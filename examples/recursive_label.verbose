@@ -1,0 +1,50 @@
+@verbose 0.1.0
+
+-- Phase A slice 5.2 worked example: text-returning recursive native
+-- callable. The (rax = ptr, rdx = len) two-register return ABI lifted
+-- the scalar-only restriction from slice 5.1a/5.1b.
+--
+-- Every recursion level returns the same text literal "done" — the
+-- recursion itself isn't doing useful work, but the ABI machinery
+-- is exercised end-to-end: each `call <label>` propagates (rax, rdx)
+-- through up to 11 frames, and the _start loop's final write picks
+-- up the converged pair and emits it to stdout.
+--
+-- Composition with the runtime input bounds-check (PR #35) keeps the
+-- depth bounded by `v : number [0, 10]` — at most 11 recursive frames,
+-- well within Linux's 8 MiB stack.
+--
+-- The text literal "done" lives in an inline jmp-over-data block at
+-- the leaf. The returned `rax` points into the binary's .text section
+-- (effectively) and survives across the callable's epilogue —
+-- contrast with heap-allocated text return, which is a later slice
+-- once the stack-budget design lands.
+
+
+concept N
+  @intention: "A wrapper holding one non-negative integer 0..=10"
+  @source: recursive_label.intent:1
+
+  fields:
+    v : number [0, 10]
+
+
+rule label_of
+  @intention: "Recursively produce 'done' regardless of input value"
+  @source: recursive_label.intent:2
+
+  input:
+    n : N
+
+  output:
+    out : text
+
+  logic:
+    out = if n.v == 0 then "done" else label_of(N { v: n.v - 1 })
+
+  proofs:
+    purity:
+      reads   : [n.v]
+      calls   : [label_of]
+    termination:
+      bound : 100

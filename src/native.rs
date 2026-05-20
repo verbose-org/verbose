@@ -214,10 +214,10 @@ fn compile_native_code(
                 ),
             });
         }
-        if !matches!(&rule.output_ty, Type::Number | Type::Bool) {
+        if !matches!(&rule.output_ty, Type::Number | Type::Bool | Type::Text) {
             return Err(NativeError {
                 message: format!(
-                    "slice 5.1a: recursive rule '{}' output must be Number or Bool (got {:?}); text/Result/Record returns are later slices.",
+                    "recursive rule '{}' output must be Number, Bool, or Text (got {:?}); Result/Record returns are later slices.",
                     rule.name, rule.output_ty
                 ),
             });
@@ -2524,6 +2524,7 @@ fn emit_self_recursive_program(
     all_connections: &HashMap<&str, &Connection>,
 ) -> Result<Vec<u8>, NativeError> {
     let is_bool = rule.output_ty == Type::Bool;
+    let is_text = rule.output_ty == Type::Text;
     let mut code = Vec::new();
 
     // Leading jump that skips over the callable so _start runs first
@@ -2552,22 +2553,41 @@ fn emit_self_recursive_program(
         callable_field_ranges.insert(field_name, (min, max));
     }
     let callable_text_bindings = TextBindings::new();
+    let self_call = SelfCallCtx {
+        rule_name: rule.name.as_str(),
+        target_offset: callable_label_offset,
+    };
 
-    // Emit the rule body inside the callable, with self_call wiring up
-    // any `Call(rule.name, [Ident(input)])` to a real recursive call.
-    emit_eval_expr(
-        &mut code,
-        &rule.logic.value,
-        &rule.input_name,
-        &callable_offsets,
-        all_rules,
-        &callable_field_ranges,
-        &callable_text_bindings,
-        Some(SelfCallCtx {
-            rule_name: rule.name.as_str(),
-            target_offset: callable_label_offset,
-        }),
-    )?;
+    if is_text {
+        // Slice 5.2: text return ABI. Body's leaves produce (rax = ptr,
+        // rdx = len) — either a text literal embedded inline, or a
+        // recursive call whose own return propagates. `ret` carries the
+        // pair to the caller (System V uses rax+rdx for two-register
+        // returns; we re-use rdx as the length slot).
+        emit_recursive_text_body(
+            &mut code,
+            &rule.logic.value,
+            &rule.input_name,
+            &callable_offsets,
+            all_rules,
+            &callable_field_ranges,
+            &callable_text_bindings,
+            self_call,
+        )?;
+    } else {
+        // Slice 5.1a/5.1b: scalar (Number/Bool) body. emit_eval_expr
+        // leaves the value in rax; the callable epilogue rets with that.
+        emit_eval_expr(
+            &mut code,
+            &rule.logic.value,
+            &rule.input_name,
+            &callable_offsets,
+            all_rules,
+            &callable_field_ranges,
+            &callable_text_bindings,
+            Some(self_call),
+        )?;
+    }
 
     // Callable epilogue.
     code.extend_from_slice(&[0x48, 0x89, 0xEC]);           // mov rsp, rbp
@@ -2598,7 +2618,7 @@ fn emit_self_recursive_program(
     let rel32 = callable_label_offset - call_end;
     code.extend_from_slice(&rel32.to_le_bytes());
 
-    // Print result — mirrors emit_full_program.
+    // Print result — mirrors emit_full_program / emit_text_program.
     if is_bool {
         code.extend_from_slice(&[0x84, 0xC0]);
         code.push(0x74);
@@ -2616,6 +2636,19 @@ fn emit_self_recursive_program(
         code.extend_from_slice(&[0x01, 0x00, 0x00, 0x00]);
         let ap_pos = code.len();
         code[ap_patch] = (ap_pos - ap_patch - 1) as u8;
+    } else if is_text {
+        // Write (rax, rdx) to stdout via sys_write(1, rax, rdx),
+        // then a newline. The callable left ptr in rax, len in rdx.
+        // mov rsi, rax — buffer
+        code.extend_from_slice(&[0x48, 0x89, 0xC6]);
+        // mov rdi, 1 — fd=stdout
+        code.extend_from_slice(&[0x48, 0xC7, 0xC7, 0x01, 0x00, 0x00, 0x00]);
+        // mov rax, 1 — sys_write
+        code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x01, 0x00, 0x00, 0x00]);
+        // syscall
+        code.extend_from_slice(&[0x0F, 0x05]);
+        // newline
+        emit_write_newline(&mut code, 1);
     } else {
         emit_itoa_inline(&mut code);
     }
@@ -2627,6 +2660,175 @@ fn emit_self_recursive_program(
 
     emit_record_loop_epilogue(&mut code, &ctx);
     Ok(code)
+}
+
+/// Phase A slice 5.2 — emit a recursive callable's body that returns a
+/// `text` value via the (rax = ptr, rdx = len) System-V-style two-register
+/// pair. The body's grammar is intentionally narrow:
+///
+///   - `Expr::Text(literal)` at a leaf → emit a jmp-over-data block, load
+///     `lea rax, [rip + data]` and `mov rdx, imm32` (length).
+///   - `Expr::Call(rule.name, [...])` recursing on self → emit the standard
+///     slice-5.1a/5.1b argument materialisation followed by `call <label>`;
+///     the callee's return populates (rax, rdx) directly.
+///   - `Expr::If(cond, then, else)` → evaluate cond into rax via
+///     emit_eval_expr, dispatch via `test al, al ; jz .else`, recurse
+///     on each branch. Each branch ends with the (rax, rdx) load and
+///     converges at the natural fall-through path (callable's epilogue
+///     follows immediately after, so both branches reach the same ret).
+///
+/// Anything else — concat, text input fields, BoundText, helper rule
+/// calls — is refused with a clear breadcrumb. Slice 5.2 deliberately
+/// stays on text literals at leaves so the (rax, rdx) values point at
+/// data that outlives the recursive callable's frame (the .text section
+/// effectively). Heap-allocated text return (concat + recursion) is a
+/// later slice once the stack-budget design lands.
+fn emit_recursive_text_body(
+    code: &mut Vec<u8>,
+    expr: &Expr,
+    input_name: &str,
+    offsets: &HashMap<&str, i32>,
+    all_rules: &HashMap<&str, &Rule>,
+    field_ranges: &HashMap<&str, (i64, i64)>,
+    text_bindings: &TextBindings<'_>,
+    self_call: SelfCallCtx<'_>,
+) -> Result<(), NativeError> {
+    match expr {
+        Expr::Text(s) => {
+            // Embed the literal inline via jmp-over-data, then load
+            // (rax = data_addr, rdx = len). Same shape as
+            // `emit_text_write_to_fd`'s literal-text arm but stops at
+            // the load — no syscall here.
+            let bytes = s.as_bytes();
+            let n = bytes.len() as i32;
+            if n <= 127 {
+                code.push(0xEB);
+                code.push(n as u8);
+            } else {
+                code.push(0xE9);
+                code.extend_from_slice(&n.to_le_bytes());
+            }
+            let data_addr = code.len();
+            code.extend_from_slice(bytes);
+            // lea rax, [rip + rel32]
+            let lea_end = code.len() + 7;
+            let rel32 = data_addr as i32 - lea_end as i32;
+            code.extend_from_slice(&[0x48, 0x8D, 0x05]);
+            code.extend_from_slice(&rel32.to_le_bytes());
+            // mov rdx, n (imm32 sign-extended via REX.W + 0xC7 + ModRM(rdx))
+            code.extend_from_slice(&[0x48, 0xC7, 0xC2]);
+            code.extend_from_slice(&n.to_le_bytes());
+            Ok(())
+        }
+        Expr::Call(name, args) => {
+            if name != self_call.rule_name {
+                return Err(NativeError {
+                    message: format!(
+                        "slice 5.2: text-returning recursive body can only call self ('{}'); got call to '{}'",
+                        self_call.rule_name, name
+                    ),
+                });
+            }
+            if args.len() != 1 {
+                return Err(NativeError {
+                    message: "slice 5.2: recursive call must take exactly 1 arg".into(),
+                });
+            }
+            // Set up rdi exactly like the scalar path's self-call.
+            // Both slice-5.1a (Ident pass-through) and slice-5.1b (Record
+            // construction) shapes work — the inner expression evaluates
+            // to a Number that becomes the next recursion's input.
+            match &args[0] {
+                Expr::Ident(n) if n == input_name => {
+                    if offsets.len() != 1 {
+                        return Err(NativeError {
+                            message: "slice 5.2: recursive call expects single-field input".into(),
+                        });
+                    }
+                    let field_offset = *offsets.values().next().unwrap();
+                    if field_offset >= -128 {
+                        code.extend_from_slice(&[0x48, 0x8B, 0x7D]);
+                        code.push(field_offset as u8);
+                    } else {
+                        code.extend_from_slice(&[0x48, 0x8B, 0xBD]);
+                        code.extend_from_slice(&field_offset.to_le_bytes());
+                    }
+                }
+                Expr::Record(_concept_name, fields) => {
+                    if fields.len() != 1 {
+                        return Err(NativeError {
+                            message: "slice 5.2: recursive Record must have exactly 1 field".into(),
+                        });
+                    }
+                    let (_, field_expr) = &fields[0];
+                    emit_eval_expr(
+                        code, field_expr, input_name, offsets,
+                        all_rules, field_ranges, text_bindings,
+                        Some(self_call),
+                    )?;
+                    code.extend_from_slice(&[0x48, 0x89, 0xC7]); // mov rdi, rax
+                }
+                other => {
+                    return Err(NativeError {
+                        message: format!(
+                            "slice 5.2: recursive call arg must be Ident(input) or Record(_, {{ field: expr }}); got {:?}",
+                            other
+                        ),
+                    });
+                }
+            }
+            // call <target_offset>: rel32 to the callable's prologue.
+            code.push(0xE8);
+            let call_end = (code.len() + 4) as i32;
+            let rel32 = self_call.target_offset - call_end;
+            code.extend_from_slice(&rel32.to_le_bytes());
+            // Callee left (rax, rdx) populated; no further setup.
+            Ok(())
+        }
+        Expr::If(cond, then_e, else_e) => {
+            // Standard if dispatch — cond evaluates to a Bool/Number in
+            // rax; jz else_branch. Both arms recurse on
+            // emit_recursive_text_body and converge at the callable's
+            // ret instruction (which follows this body emit).
+            emit_eval_expr(
+                code, cond, input_name, offsets, all_rules,
+                field_ranges, text_bindings, Some(self_call),
+            )?;
+            code.extend_from_slice(&[0x84, 0xC0]); // test al, al
+            code.push(0x0F);
+            code.push(0x84);                       // jz .else (long form)
+            let else_patch = code.len();
+            code.extend_from_slice(&[0x00; 4]);
+            // then branch
+            emit_recursive_text_body(
+                code, then_e, input_name, offsets, all_rules,
+                field_ranges, text_bindings, self_call,
+            )?;
+            // Both arms terminate here; we need to jump over the else.
+            code.push(0xE9);
+            let end_patch = code.len();
+            code.extend_from_slice(&[0x00; 4]);
+            // .else:
+            let else_pos = code.len();
+            let else_off = else_pos as i32 - (else_patch as i32 + 4);
+            code[else_patch..else_patch + 4].copy_from_slice(&else_off.to_le_bytes());
+            emit_recursive_text_body(
+                code, else_e, input_name, offsets, all_rules,
+                field_ranges, text_bindings, self_call,
+            )?;
+            // .end:
+            let end_pos = code.len();
+            let end_off = end_pos as i32 - (end_patch as i32 + 4);
+            code[end_patch..end_patch + 4].copy_from_slice(&end_off.to_le_bytes());
+            Ok(())
+        }
+        other => Err(NativeError {
+            message: format!(
+                "slice 5.2: text-returning recursive body grammar is `Text literal | self-call | if/else`; got {:?}",
+                other
+            ),
+        }),
+    }
 }
 
 /// Phase 5a: `output: text` with a per-record body. The body is a text
@@ -22947,6 +23149,52 @@ rule rec
         compile_native(&program, "score", out.to_str().unwrap(), true, false)
             .expect("non-recursive Call should compile cleanly");
         let _ = std::fs::remove_file(out);
+    }
+
+    /// Phase A slice 5.2 — text return from a recursive native callable.
+    /// Returns (rax = ptr, rdx = len) via the System-V-style two-register
+    /// pair. Body grammar: chained if/else where leaves are either text
+    /// literals (embedded inline via jmp-over-data) or self-calls.
+    ///
+    /// Worked example: `recursive_label.verbose::label_of` recurses to the
+    /// base case (v == 0) and returns the literal "done"; every parent
+    /// frame propagates (rax, rdx) unchanged. For input v=10 the call
+    /// stack reaches depth 11, then collapses back through `ret` 11 times
+    /// — each ret carries the (rax, rdx) pair pointing at the same 4 data
+    /// bytes embedded in the binary. The _start loop's final write picks
+    /// up the converged pair and emits it to stdout.
+    #[test]
+    fn phase_a5_2_text_return_runtime() {
+        use std::io::Write;
+        let src = std::fs::read_to_string("examples/recursive_label.verbose")
+            .expect("examples/recursive_label.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+        let out = std::env::temp_dir().join("verbosec_test_phase_a5_2_label");
+        compile_native(&program, "label_of", out.to_str().unwrap(), true, false)
+            .expect("text-returning recursive rule must compile");
+
+        let run = |input: &str| -> String {
+            let mut child = std::process::Command::new(&out)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .expect("spawn label_of");
+            child.stdin.as_mut().unwrap().write_all(input.as_bytes()).unwrap();
+            drop(child.stdin.take());
+            let r = child.wait_with_output().expect("wait label_of");
+            assert!(r.status.success(), "label_of({}) must exit 0; got {:?}", input.trim(), r.status);
+            String::from_utf8_lossy(&r.stdout).trim().to_string()
+        };
+
+        // Every input in [0, 10] recurses to the base and returns "done".
+        // The recursion fires at runtime for v > 0; we verify a few depths.
+        assert_eq!(run("0\n"),  "done");
+        assert_eq!(run("1\n"),  "done");
+        assert_eq!(run("5\n"),  "done");
+        assert_eq!(run("10\n"), "done");
+        let _ = std::fs::remove_file(&out);
     }
 
     /// Phase A slice 5.1b — first runtime-recursive native binary.
