@@ -1368,6 +1368,47 @@ fn compute_resource_extra_bytes(referenced: &[&Resource]) -> i32 {
 /// pay zero bytes for this. The same 9-line block was inlined at the
 /// end of every emit_*_program that supports `read()`; extraction
 /// here keeps the abort posture consistent across emitters.
+/// Runtime input bounds-check (2026-05-20). For a Number field declared
+/// with explicit `[min, max]` bounds, emit a range guard right after
+/// `emit_atoi_inline` has parsed the value into rax. On out-of-range
+/// input, jump to the shared sys_exit(1) abort tail.
+///
+/// Two checks per call: `rax < min ⇒ abort` and `rax > max ⇒ abort`.
+/// Signed comparison via `cmp rax, r10` (r10 holds the bound). Patches
+/// are appended to the caller-supplied vec (shared with `resource_abort_patches`
+/// so a single `emit_resource_abort_tail` covers both failure modes —
+/// the abort message stays silent today, distinguishing input-range
+/// from resource-failure is a follow-up if the audit story demands).
+///
+/// Size: 2 × (mov r10, imm64 = 10B + cmp rax, r10 = 3B + jcc rel32 = 6B)
+/// = 38 bytes per bounded Number field. The common case (small bounds
+/// fitting in i32) could shrink to ~24 bytes via `cmp rax, imm32`;
+/// kept uniform here for clarity. The optimization is a follow-up if
+/// binary size becomes a constraint.
+fn emit_bounds_check(code: &mut Vec<u8>, min: i64, max: i64, abort_patches: &mut Vec<usize>) {
+    // mov r10, min — REX.WB (0x49) + 0xBA + imm64
+    code.push(0x49);
+    code.push(0xBA);
+    code.extend_from_slice(&min.to_le_bytes());
+    // cmp rax, r10 — REX.WR (0x4C) + 0x39 + ModRM(11_010_000)
+    code.extend_from_slice(&[0x4C, 0x39, 0xD0]);
+    // jl rel32 — 0x0F 0x8C + 4-byte placeholder (signed less)
+    code.extend_from_slice(&[0x0F, 0x8C]);
+    abort_patches.push(code.len());
+    code.extend_from_slice(&[0, 0, 0, 0]);
+
+    // mov r10, max
+    code.push(0x49);
+    code.push(0xBA);
+    code.extend_from_slice(&max.to_le_bytes());
+    // cmp rax, r10
+    code.extend_from_slice(&[0x4C, 0x39, 0xD0]);
+    // jg rel32 — 0x0F 0x8F + 4-byte placeholder (signed greater)
+    code.extend_from_slice(&[0x0F, 0x8F]);
+    abort_patches.push(code.len());
+    code.extend_from_slice(&[0, 0, 0, 0]);
+}
+
 fn emit_resource_abort_tail(code: &mut Vec<u8>, abort_patches: &[usize]) {
     if abort_patches.is_empty() {
         return;
@@ -2212,6 +2253,21 @@ fn emit_record_loop_prologue<'a>(
         match field.ty {
             Type::Number => {
                 emit_atoi_inline(code);
+                // Runtime input bounds-check (2026-05-20). When the field
+                // has an explicit `[min, max]` declaration, enforce it at
+                // load time — sys_exit(1) on out-of-range. Surfaces a
+                // latent gap (subagent review of the slice 5.1+ design
+                // doc, point 5): the optimizer's interval arithmetic
+                // assumes declared ranges hold, but the runtime previously
+                // didn't enforce them. Now consistent: declared `[0, 10]`
+                // ⇒ runtime guarantees 0 ≤ value ≤ 10 OR the binary exits
+                // before evaluating the rule body. Fields without an
+                // explicit range stay unclamped (purely-additive slice;
+                // no existing example file changes behavior unless it
+                // declared a range AND passed out-of-range inputs).
+                if let Some((min, max)) = field.range {
+                    emit_bounds_check(code, min, max, &mut resource_abort_patches);
+                }
                 // mov [rbp + offset], rax
                 if offset >= -128 {
                     code.extend_from_slice(&[0x48, 0x89, 0x45]);
@@ -22849,5 +22905,131 @@ rule rec
         compile_native(&program, "score", out.to_str().unwrap(), true, false)
             .expect("non-recursive Call should compile cleanly");
         let _ = std::fs::remove_file(out);
+    }
+
+    /// Runtime input bounds-check (2026-05-20). A Number field declared
+    /// with `[min, max]` produces a binary that sys-exits(1) when the
+    /// runtime input falls outside the range. Surfaced as a prerequisite
+    /// to slice 5.1b: previously the optimizer assumed declared ranges
+    /// hold (for interval arithmetic / dead-branch elimination) but the
+    /// runtime didn't enforce them — a recursive rule on a "v : number
+    /// [0, 10]" field could be invoked with v=1000000 and produce 1M+
+    /// recursive frames before SIGSEGV. After this slice, that case
+    /// exits(1) at field-load with no rule body ever entered.
+    ///
+    /// Four cases:
+    ///   (a) in-range value → exits 0 with correct output
+    ///   (b) value below min → exits 1
+    ///   (c) value above max → exits 1
+    ///   (d) field without explicit range → no clamp (unchanged behavior)
+    #[test]
+    fn runtime_input_bounds_check_enforced_at_field_load() {
+        use std::io::Write;
+        let bounded = r#"@verbose 0.1.0
+
+concept N
+  @intention: "n"
+  @source: invoices.intent:1
+  fields:
+    v : number [0, 10]
+
+rule echo
+  @intention: "echo"
+  @source: invoices.intent:1
+  input:
+    n : N
+  output:
+    out : number
+  logic:
+    out = n.v
+  proofs:
+    purity:
+      reads : [n.v]
+      calls : []
+    termination:
+      bound : 1
+"#;
+        let tokens = crate::lexer::Lexer::new(bounded).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+        let out = std::env::temp_dir().join("verbosec_test_bounds_echo");
+        compile_native(&program, "echo", out.to_str().unwrap(), true, false)
+            .expect("bounded rule must compile");
+
+        let run = |input: &str| -> std::process::Output {
+            let mut child = std::process::Command::new(&out)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .expect("spawn echo");
+            child.stdin.as_mut().unwrap().write_all(input.as_bytes()).unwrap();
+            drop(child.stdin.take());
+            child.wait_with_output().expect("wait echo")
+        };
+
+        // (a) In range
+        let r = run("5\n");
+        assert!(r.status.success(), "v=5 in [0,10] must succeed; got {:?}", r.status);
+        assert_eq!(String::from_utf8_lossy(&r.stdout).trim(), "5");
+
+        // (b) Below min
+        let r = run("-1\n");
+        assert!(!r.status.success(), "v=-1 below min=0 must exit non-zero; got {:?}", r.status);
+
+        // (c) Above max
+        let r = run("11\n");
+        assert!(!r.status.success(), "v=11 above max=10 must exit non-zero; got {:?}", r.status);
+
+        // (a') Boundary in range
+        let r = run("0\n");
+        assert!(r.status.success(), "v=0 at min must succeed; got {:?}", r.status);
+        let r = run("10\n");
+        assert!(r.status.success(), "v=10 at max must succeed; got {:?}", r.status);
+
+        let _ = std::fs::remove_file(&out);
+
+        // (d) Field WITHOUT explicit range — no runtime clamp, unchanged
+        // behavior. Slice is purely additive for these fields.
+        let unbounded = r#"@verbose 0.1.0
+
+concept N
+  @intention: "n"
+  @source: invoices.intent:1
+  fields:
+    v : number
+
+rule echo
+  @intention: "echo"
+  @source: invoices.intent:1
+  input:
+    n : N
+  output:
+    out : number
+  logic:
+    out = n.v
+  proofs:
+    purity:
+      reads : [n.v]
+      calls : []
+    termination:
+      bound : 1
+"#;
+        let tokens = crate::lexer::Lexer::new(unbounded).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+        let out = std::env::temp_dir().join("verbosec_test_bounds_unbounded");
+        compile_native(&program, "echo", out.to_str().unwrap(), true, false)
+            .expect("unbounded rule must compile");
+        // Large value passes through (no clamp emitted).
+        let mut child = std::process::Command::new(&out)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn echo unbounded");
+        child.stdin.as_mut().unwrap().write_all(b"123456789\n").unwrap();
+        drop(child.stdin.take());
+        let r = child.wait_with_output().expect("wait echo unbounded");
+        assert!(r.status.success(), "unbounded field must accept large value");
+        assert_eq!(String::from_utf8_lossy(&r.stdout).trim(), "123456789");
+        let _ = std::fs::remove_file(&out);
     }
 }
