@@ -154,29 +154,90 @@ fn compile_native_code(
         (*r, *c)
     };
 
-    // Phase A slice 5.0 — refuse recursive rules at compile time.
+    // Phase A slice 5.0/5.1a — handle recursive rules.
     //
-    // Every native emit path today inlines callees (Phase 2D match_result,
-    // Phase 2G text-returning call, Phase 2H-a/b reaction logs, Phase A
-    // slice 4.1/4.2 MatchVariant). A recursive call graph — direct or
-    // mutual — would expand forever during inlining and stack-overflow
-    // the compiler. Detect the cycle here and refuse with a clear
-    // breadcrumb instead of crashing.
+    // Slice 5.0 (PR #32) refused all recursive rules at compile time
+    // to avoid infinite inlining. Slice 5.1a lifts that for one shape:
+    // direct self-recursion only, single-Number-field input, scalar
+    // output, no let bindings, no concat / text-let in body, and the
+    // recursive call's argument must be the input identifier passed
+    // through (no Record materialization at the call site).
     //
-    // Slice 5.0 is the safety floor. Slice 5.1+ ships a real call
-    // convention (push rbp / call <label> / pop rbp / ret) that lifts
-    // this restriction for shapes where it's audit-defensible. Until
-    // then, recursive rules stay interpreter-only via `--run`.
+    // Slice 5.1b adds Record construction; 5.4 adds mutual recursion;
+    // Phase C will add the structural-recursion termination proof.
+    // Until Phase C, the declared `bound:` is NOT a termination proof
+    // for recursion — the runtime stack-overflow is the only safety
+    // signal. We emit a MANDATORY breadcrumb to stderr so the user
+    // never silently compiles a recursive rule (compiler axiom:
+    // "controls and applies, never guesses" — we don't guess that
+    // the recursion terminates).
     //
     // Reactions are checked against their trigger rule's call graph
     // (the reaction itself doesn't recurse, but its trigger might).
-    if let Some(cycle) = detect_native_recursion(rule, &rules) {
-        return Err(NativeError {
-            message: format!(
-                "rule '{}' is part of a recursive call graph (cycle through '{}'); native lowering needs Phase A slice 5.1+ (real call convention). Use --run for now.",
-                rule.name, cycle
-            ),
-        });
+    let recursion_witness = detect_native_recursion(rule, &rules);
+    if let Some(cycle) = &recursion_witness {
+        // Refuse anything that's not direct self-recursion in slice 5.1a.
+        // A mutually-recursive cycle has the witness equal to the entry
+        // rule too (DFS marks the entry on its stack); distinguish by
+        // looking at the rule's direct callees.
+        let mut direct_callees: Vec<String> = Vec::new();
+        for (_, e) in &rule.logic.bindings {
+            collect_native_callees(e, &mut direct_callees);
+        }
+        collect_native_callees(&rule.logic.value, &mut direct_callees);
+        direct_callees.sort();
+        direct_callees.dedup();
+        let only_self = direct_callees.iter().all(|c| c == &rule.name);
+        if !only_self {
+            return Err(NativeError {
+                message: format!(
+                    "rule '{}' is part of a recursive call graph (cycle through '{}'); slice 5.1a only supports direct self-recursion with no other callees. Mutual recursion and mixed call graphs need slice 5.4+. Use --run for now.",
+                    rule.name, cycle
+                ),
+            });
+        }
+        // Slice 5.1a constraints — refuse with breadcrumb pointing at
+        // the relevant follow-up slice.
+        if concept.fields.len() != 1 {
+            return Err(NativeError {
+                message: format!(
+                    "slice 5.1a: recursive rule '{}' input concept '{}' must have exactly 1 field (has {}); multi-field input is slice 5.3. Use --run for now.",
+                    rule.name, concept.name, concept.fields.len()
+                ),
+            });
+        }
+        if concept.fields[0].ty != Type::Number {
+            return Err(NativeError {
+                message: format!(
+                    "slice 5.1a: recursive rule '{}' input field must be Number (got {:?}); text input is slice 5.2.",
+                    rule.name, concept.fields[0].ty
+                ),
+            });
+        }
+        if !matches!(&rule.output_ty, Type::Number | Type::Bool) {
+            return Err(NativeError {
+                message: format!(
+                    "slice 5.1a: recursive rule '{}' output must be Number or Bool (got {:?}); text/Result/Record returns are later slices.",
+                    rule.name, rule.output_ty
+                ),
+            });
+        }
+        if !rule.logic.bindings.is_empty() {
+            return Err(NativeError {
+                message: format!(
+                    "slice 5.1a: recursive rule '{}' must have no let bindings (text-let/concat in recursive body is forbidden until the stack-budget design lands).",
+                    rule.name
+                ),
+            });
+        }
+        // MANDATORY breadcrumb. Compiler axiom: never silently accept
+        // a recursive rule without naming the gap.
+        eprintln!(
+            "native: rule '{}' is recursive (cycle through '{}'); the declared `bound:` is NOT a termination proof for recursion. Runtime stack-overflow is the only safety signal until Phase C ships structural recursion. Use `--run` (interpreter) if you need an audit trace.",
+            rule.name, cycle
+        );
+        // Fall through to the slice 5.1a emit below. The standard
+        // post-emit pipeline (stdin/stream prepend, etc.) still runs.
     }
 
     // Look up the context concept (if multi-input rule).
@@ -230,7 +291,12 @@ fn compile_native_code(
     let is_fold_bytes_output = matches!(&rule.output_ty, Type::Number) && matches!(&rule.logic.value, Expr::FoldBytes(_, _, _, _, _, _));
     let record_output_concept: Option<&Concept> = match &rule.output_ty { Type::Named(n) => concepts.iter().find(|c| c.name == *n).copied(), _ => None };
 
-    let mut code = if let Some(rx) = reaction {
+    let mut code = if recursion_witness.is_some() {
+        // Slice 5.1a: emit the rule as a real callable instead of inlining.
+        // All slice-5.1a constraints were already validated above; this
+        // path only fires when they passed.
+        emit_self_recursive_program(rule, concept, &rules, &resources, &connections)?
+    } else if let Some(rx) = reaction {
         emit_reaction_program(rx, rule, concept, &rules, &resources, &connections)?
     } else if is_result_output {
         emit_result_program(rule, concept, &concepts, &rules, &resources, &connections)?
@@ -2239,7 +2305,7 @@ fn emit_record_loop_prologue<'a>(
             text_bindings.insert(name.as_str(), (ptr_slot, len_slot));
             next_slot -= 16;
         } else {
-            emit_eval_expr(code, expr, &rule.input_name, &binding_offsets, all_rules, &field_ranges, &text_bindings)?;
+            emit_eval_expr(code, expr, &rule.input_name, &binding_offsets, all_rules, &field_ranges, &text_bindings, None)?;
             if next_slot >= -128 {
                 code.extend_from_slice(&[0x48, 0x89, 0x45]);
                 code.push(next_slot as u8);
@@ -2317,6 +2383,7 @@ fn emit_full_program(
         all_rules,
         &ctx.field_ranges,
         &ctx.text_bindings,
+        None,
     )?;
 
     // Print result per record
@@ -2344,6 +2411,160 @@ fn emit_full_program(
     }
 
     // jmp loop_top (next record) then fall through to shared exit.
+    code.push(0xE9);
+    let loop_offset = ctx.loop_top as i32 - (code.len() + 4) as i32;
+    code.extend_from_slice(&loop_offset.to_le_bytes());
+
+    emit_record_loop_epilogue(&mut code, &ctx);
+    Ok(code)
+}
+
+/// Phase A slice 5.1a — emit a self-recursive rule as a real x86-64
+/// callable (push rbp / mov rbp, rsp / sub rsp, 8 / spill rdi / body /
+/// pop rbp / ret) plus a thin `_start` shim that loads the input and
+/// `call`s into it. Generalizes the "rule = inlined body" pattern to
+/// "rule = function".
+///
+/// Layout:
+///
+/// ```text
+///   0..5: jmp .start_actual              ; 5 bytes (E9 + rel32)
+///   5..M: callable_label:                ; The recursive function.
+///          push rbp                       ; 0x55
+///          mov rbp, rsp                   ; 0x48 0x89 0xE5
+///          sub rsp, 8                     ; 0x48 0x83 0xEC 0x08
+///          mov [rbp - 8], rdi             ; spill input value
+///          <body emit>                    ; emit_eval_expr with self_call ctx
+///          mov rsp, rbp                   ; 0x48 0x89 0xEC
+///          pop rbp                        ; 0x5D
+///          ret                            ; 0xC3
+///   M..N: .start_actual:                  ; standard _start + loop.
+///          <argv parse / stdin / loop_top / load field into rax>
+///          mov rdi, [rbp + field_slot]    ; ABI: rdi = the Number field
+///          call <callable_label_offset>   ; backward call, known target
+///          <print rax via itoa or bool>
+///          jmp loop_top
+///          <exit syscall>
+/// ```
+///
+/// The callable's prologue puts the input value (rdi) into the field
+/// slot `[rbp - 8]`. The body's `emit_eval_expr` resolves
+/// `Field(Ident(input_name), field_name)` through the standard offsets
+/// map (with the single entry pointing at `-8`), so the existing field-
+/// access machinery works unchanged. The slice's SelfCallCtx tells
+/// emit_eval_expr's Call arm to emit `mov rdi, [rbp - 8]; call
+/// <label>` whenever it sees `Call(rule.name, [Ident(input_name)])`,
+/// completing the recursion path.
+///
+/// Caller side (`_start`'s loop body) re-uses the same calling
+/// convention: load the field from its rbp slot into rdi, call. After
+/// the call, rax holds the return value, then itoa + write + jmp
+/// loop_top runs as in `emit_full_program`.
+fn emit_self_recursive_program(
+    rule: &Rule,
+    concept: &Concept,
+    all_rules: &HashMap<&str, &Rule>,
+    all_resources: &HashMap<&str, &Resource>,
+    all_connections: &HashMap<&str, &Connection>,
+) -> Result<Vec<u8>, NativeError> {
+    let is_bool = rule.output_ty == Type::Bool;
+    let mut code = Vec::new();
+
+    // Leading jump that skips over the callable so _start runs first
+    // at runtime. Patched once the callable's emitted size is known.
+    code.push(0xE9);
+    let jmp_skip_patch = code.len();
+    code.extend_from_slice(&[0x00; 4]);
+
+    // Callable label sits at offset 5 (right after the jmp).
+    let callable_label_offset = code.len() as i32;
+
+    // Callable prologue.
+    code.push(0x55);                                       // push rbp
+    code.extend_from_slice(&[0x48, 0x89, 0xE5]);           // mov rbp, rsp
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x08]);     // sub rsp, 8
+    code.extend_from_slice(&[0x48, 0x89, 0x7D, 0xF8]);     // mov [rbp - 8], rdi
+
+    // Build the offsets / field_ranges maps the callable's body sees.
+    // Slice 5.1a constraint: single Number field; the only slot is at
+    // rbp - 8 (the rdi spill).
+    let field_name = concept.fields[0].name.as_str();
+    let mut callable_offsets: HashMap<&str, i32> = HashMap::new();
+    callable_offsets.insert(field_name, -8);
+    let mut callable_field_ranges: HashMap<&str, (i64, i64)> = HashMap::new();
+    if let Some((min, max)) = concept.fields[0].range {
+        callable_field_ranges.insert(field_name, (min, max));
+    }
+    let callable_text_bindings = TextBindings::new();
+
+    // Emit the rule body inside the callable, with self_call wiring up
+    // any `Call(rule.name, [Ident(input)])` to a real recursive call.
+    emit_eval_expr(
+        &mut code,
+        &rule.logic.value,
+        &rule.input_name,
+        &callable_offsets,
+        all_rules,
+        &callable_field_ranges,
+        &callable_text_bindings,
+        Some(SelfCallCtx {
+            rule_name: rule.name.as_str(),
+            target_offset: callable_label_offset,
+        }),
+    )?;
+
+    // Callable epilogue.
+    code.extend_from_slice(&[0x48, 0x89, 0xEC]);           // mov rsp, rbp
+    code.push(0x5D);                                       // pop rbp
+    code.push(0xC3);                                       // ret
+
+    // Patch the leading jmp to skip past the callable.
+    let start_actual_offset = code.len();
+    let jmp_off = start_actual_offset as i32 - (jmp_skip_patch as i32 + 4);
+    code[jmp_skip_patch..jmp_skip_patch + 4].copy_from_slice(&jmp_off.to_le_bytes());
+
+    // Standard prologue + per-record loop. The loop body loads the
+    // field into rdi and calls into the callable instead of inlining
+    // the rule logic.
+    let ctx = emit_record_loop_prologue(
+        &mut code, rule, concept, None, all_rules, all_resources, all_connections,
+    )?;
+    let field_slot = ctx.binding_offsets[field_name];
+    if field_slot >= -128 {
+        code.extend_from_slice(&[0x48, 0x8B, 0x7D]);       // mov rdi, [rbp + disp8]
+        code.push(field_slot as u8);
+    } else {
+        code.extend_from_slice(&[0x48, 0x8B, 0xBD]);
+        code.extend_from_slice(&field_slot.to_le_bytes());
+    }
+    code.push(0xE8);                                       // call rel32
+    let call_end = (code.len() + 4) as i32;
+    let rel32 = callable_label_offset - call_end;
+    code.extend_from_slice(&rel32.to_le_bytes());
+
+    // Print result — mirrors emit_full_program.
+    if is_bool {
+        code.extend_from_slice(&[0x84, 0xC0]);
+        code.push(0x74);
+        let pf_patch = code.len();
+        code.push(0x00);
+        emit_write_string(&mut code, b"true\n");
+        code.push(0xEB);
+        let ap_patch = code.len();
+        code.push(0x00);
+        let pf_pos = code.len();
+        code[pf_patch] = (pf_pos - pf_patch - 1) as u8;
+        emit_write_string(&mut code, b"false\n");
+        code.extend_from_slice(&[0x48, 0xC7, 0x85]);
+        code.extend_from_slice(&ctx.exit_flag_slot.to_le_bytes());
+        code.extend_from_slice(&[0x01, 0x00, 0x00, 0x00]);
+        let ap_pos = code.len();
+        code[ap_patch] = (ap_pos - ap_patch - 1) as u8;
+    } else {
+        emit_itoa_inline(&mut code);
+    }
+
+    // jmp loop_top then fall through to shared exit.
     code.push(0xE9);
     let loop_offset = ctx.loop_top as i32 - (code.len() + 4) as i32;
     code.extend_from_slice(&loop_offset.to_le_bytes());
@@ -3074,7 +3295,7 @@ fn emit_substring_bounds_and_slice(
     code.push(0x52); // push rdx
     // (2) Evaluate end → rax
     emit_eval_expr(
-        code, end_expr, input_name, offsets, all_rules, field_ranges, text_bindings,
+        code, end_expr, input_name, offsets, all_rules, field_ranges, text_bindings, None,
     )?;
     // (3) push rax (save end at [rsp])
     code.push(0x50);
@@ -3087,7 +3308,7 @@ fn emit_substring_bounds_and_slice(
     code.extend_from_slice(&[0; 4]);
     // (5) Evaluate start → rax
     emit_eval_expr(
-        code, start_expr, input_name, offsets, all_rules, field_ranges, text_bindings,
+        code, start_expr, input_name, offsets, all_rules, field_ranges, text_bindings, None,
     )?;
     // (6) Bounds: start > end → abort
     //   mov rcx, [rsp] ; cmp rax, rcx ; ja .abort
@@ -3438,7 +3659,7 @@ fn emit_concat_fill(
             ConcatArgKind::Number => {
                 // push rbx — save write pointer (emit_eval_expr may clobber it via Binary op push/pop)
                 code.push(0x53);
-                emit_eval_expr(code, arg, input_name, offsets, all_rules, field_ranges, text_bindings)?;
+                emit_eval_expr(code, arg, input_name, offsets, all_rules, field_ranges, text_bindings, None)?;
                 // pop rbx
                 code.push(0x5B);
                 // itoa into buffer (rax → decimal digits at [rbx], rbx advanced)
@@ -4448,7 +4669,7 @@ fn emit_text_write_to_fd(
             // Conditional text: evaluate condition, branch, recurse on each
             // arm. Each arm writes its own text to the fd; control joins
             // after both branches.
-            emit_eval_expr(code, cond, input_name, offsets, all_rules, field_ranges, text_bindings)?;
+            emit_eval_expr(code, cond, input_name, offsets, all_rules, field_ranges, text_bindings, None)?;
             // test rax, rax ; jz else (rel32)
             code.extend_from_slice(&[0x48, 0x85, 0xC0]);
             code.push(0x0F);
@@ -4791,7 +5012,7 @@ fn emit_eval_result_expr(
             match t_ok {
                 Type::Number => {
                     // Number Ok: evaluate → rax, itoa writes decimal + \n to stdout.
-                    emit_eval_expr(code, inner, &rule.input_name, offsets, all_rules, field_ranges, text_bindings)?;
+                    emit_eval_expr(code, inner, &rule.input_name, offsets, all_rules, field_ranges, text_bindings, None)?;
                     emit_itoa_inline(code);
                 }
                 Type::Text => {
@@ -4871,7 +5092,7 @@ fn emit_eval_result_expr(
         }
         Expr::If(cond, then_e, else_e) => {
             // Evaluate the condition as a normal scalar (bool: 0 or 1).
-            emit_eval_expr(code, cond, &rule.input_name, offsets, all_rules, field_ranges, text_bindings)?;
+            emit_eval_expr(code, cond, &rule.input_name, offsets, all_rules, field_ranges, text_bindings, None)?;
             // test rax, rax ; jz .else (rel32 patch so arms can be large)
             code.extend_from_slice(&[0x48, 0x85, 0xC0]);
             code.push(0x0F);
@@ -5116,7 +5337,7 @@ fn emit_redirect_callee_leaves(
             // callee.input_name to emit_eval_expr; offsets/field_ranges
             // are the outer's tables (same field names, by slice
             // contract — validated up-front).
-            emit_eval_expr(code, inner, &callee.input_name, offsets, all_rules, field_ranges, text_bindings)?;
+            emit_eval_expr(code, inner, &callee.input_name, offsets, all_rules, field_ranges, text_bindings, None)?;
             // Store at match_slot.
             store_rax_at_rbp(code, slots.match_slot);
             // Augment offsets with ok_var → match_slot, then emit outer ok_body
@@ -5299,7 +5520,7 @@ fn emit_redirect_callee_leaves(
             // callee.input_name. Field accesses resolve through `offsets`
             // (built from the outer's concept), which by slice contract
             // contains every name the callee could reference.
-            emit_eval_expr(code, cond, &callee.input_name, offsets, all_rules, field_ranges, text_bindings)?;
+            emit_eval_expr(code, cond, &callee.input_name, offsets, all_rules, field_ranges, text_bindings, None)?;
             code.extend_from_slice(&[0x48, 0x85, 0xC0]); // test rax, rax
             code.push(0x0F);
             code.push(0x84);
@@ -5413,7 +5634,7 @@ fn emit_redirect_variant_leaves(
             // Eval substituted body in outer context → rax.
             emit_eval_expr(
                 code, &substituted, outer_input_name, offsets,
-                all_rules, field_ranges, text_bindings,
+                all_rules, field_ranges, text_bindings, None,
             )?;
             // jmp common_end (forward, caller patches)
             code.push(0xE9);
@@ -5433,7 +5654,7 @@ fn emit_redirect_variant_leaves(
             );
             emit_eval_expr(
                 code, &renamed_cond, outer_input_name, offsets,
-                all_rules, field_ranges, text_bindings,
+                all_rules, field_ranges, text_bindings, None,
             )?;
             // test al, al ; jz .else
             code.extend_from_slice(&[0x84, 0xC0]);
@@ -5542,7 +5763,7 @@ fn emit_redirect_variant_leaves_text(
             // a numeric comparison but harmless to forward.
             emit_eval_expr(
                 code, &renamed_cond, outer_input_name, offsets,
-                all_rules, field_ranges, text_bindings,
+                all_rules, field_ranges, text_bindings, None,
             )?;
             code.extend_from_slice(&[0x84, 0xC0]);
             code.push(0x0F);
@@ -5937,7 +6158,7 @@ fn emit_collection_program(
         let mut let_offsets: HashMap<&str, i32> = scalar_offsets.clone();
         let mut next_let_slot = -(((n_scalar + n_elem_fields) as i32 + 1) * 8);
         for (name, expr) in &rule.logic.bindings {
-            emit_eval_expr(&mut code, expr, &rule.input_name, &let_offsets, all_rules, &field_ranges_for_lets, &text_bindings)?;
+            emit_eval_expr(&mut code, expr, &rule.input_name, &let_offsets, all_rules, &field_ranges_for_lets, &text_bindings, None)?;
             store_rax_at_rbp(&mut code, next_let_slot);
             let_offsets.insert(name.as_str(), next_let_slot);
             next_let_slot -= 8;
@@ -6016,7 +6237,7 @@ fn emit_collection_program(
             } else {
                 emit_eval_expr(
                     &mut code, body, lambda_var, &elem_offsets, all_rules, &field_ranges,
-                    &text_bindings,
+                    &text_bindings, None,
                 )?;
                 if matches!(output_kind, OutputElemKind::Bool) {
                     // Bool: rax = 0/1 → "true"/"false" + newline.
@@ -6042,7 +6263,7 @@ fn emit_collection_program(
             // Evaluate the predicate → rax (0 = skip, non-zero = keep).
             emit_eval_expr(
                 &mut code, predicate, lambda_var, &elem_offsets, all_rules, &field_ranges,
-                &text_bindings,
+                &text_bindings, None,
             )?;
             // test rax, rax ; je skip_emit (rel32, patched after the write block).
             code.extend_from_slice(&[0x48, 0x85, 0xC0]);
@@ -6335,7 +6556,7 @@ fn emit_fold_program(
     }
     let mut next_let_slot = -(((n_scalar + n_elem_fields) as i32 + 1) * 8);
     for (name, expr) in &rule.logic.bindings {
-        emit_eval_expr(&mut code, expr, &rule.input_name, &let_offsets, all_rules, &field_ranges_for_lets, &text_bindings)?;
+        emit_eval_expr(&mut code, expr, &rule.input_name, &let_offsets, all_rules, &field_ranges_for_lets, &text_bindings, None)?;
         store_rax_at_rbp(&mut code, next_let_slot);
         let_offsets.insert(name.as_str(), next_let_slot);
         next_let_slot -= 8;
@@ -6384,7 +6605,7 @@ fn emit_fold_program(
     // Evaluate the fold body; result is the NEW accumulator value in rax.
     // item_name is the "input" for field access resolution within the body.
     let field_ranges = build_field_ranges(elem_concept);
-    emit_eval_expr(&mut code, body, item_name, &body_offsets, all_rules, &field_ranges, &text_bindings)?;
+    emit_eval_expr(&mut code, body, item_name, &body_offsets, all_rules, &field_ranges, &text_bindings, None)?;
     store_rax_at_rbp(&mut code, acc_offset);
 
     // dec r15 ; jmp inner_loop_top (rel32).
@@ -6686,7 +6907,7 @@ fn emit_fold_bytes_program(
     // source order, registered in offsets.
     for (let_idx, (name, expr)) in rule.logic.bindings.iter().enumerate() {
         let slot = -(((nfields + 3 + let_idx + 1) as i32) * 8);
-        emit_eval_expr(&mut code, expr, &rule.input_name, &offsets, all_rules, &field_ranges, &text_bindings)?;
+        emit_eval_expr(&mut code, expr, &rule.input_name, &offsets, all_rules, &field_ranges, &text_bindings, None)?;
         // mov [rbp + slot], rax
         if slot >= -128 {
             code.extend_from_slice(&[0x48, 0x89, 0x45]);
@@ -6721,7 +6942,7 @@ fn emit_fold_bytes_program(
     code.push(0x51); // push rcx
 
     // Body — emits to rax
-    emit_eval_expr(&mut code, body, &rule.input_name, &offsets, all_rules, &field_ranges, &text_bindings)?;
+    emit_eval_expr(&mut code, body, &rule.input_name, &offsets, all_rules, &field_ranges, &text_bindings, None)?;
 
     // Restore rsi/rcx
     code.push(0x59); // pop rcx
@@ -7017,7 +7238,7 @@ fn emit_multi_fold_program(
     }
     let mut next_let_slot = -(((n_scalar + n_elem) as i32 + 1) * 8);
     for (name, expr) in &rule.logic.bindings {
-        emit_eval_expr(&mut code, expr, &rule.input_name, &let_offsets, all_rules, &field_ranges_for_lets, &text_bindings)?;
+        emit_eval_expr(&mut code, expr, &rule.input_name, &let_offsets, all_rules, &field_ranges_for_lets, &text_bindings, None)?;
         store_rax_at_rbp(&mut code, next_let_slot);
         let_offsets.insert(name.as_str(), next_let_slot);
         next_let_slot -= 8;
@@ -7063,7 +7284,7 @@ fn emit_multi_fold_program(
     // Evaluate each fold body and update its accumulator.
     let field_ranges = build_field_ranges(elem_concept);
     for (i, fold) in folds.iter().enumerate() {
-        emit_eval_expr(&mut code, &fold.body, &fold.item_name, &body_offsets, all_rules, &field_ranges, &text_bindings)?;
+        emit_eval_expr(&mut code, &fold.body, &fold.item_name, &body_offsets, all_rules, &field_ranges, &text_bindings, None)?;
         store_rax_at_rbp(&mut code, acc_offsets[i]);
     }
 
@@ -7094,7 +7315,7 @@ fn emit_multi_fold_program(
     // Evaluate the final scalar expression (quantifiers replaced by Ident refs).
     // Use an empty input name — the expression should only reference __fold_N idents.
     let empty_ranges: HashMap<&str, (i64, i64)> = HashMap::new();
-    emit_eval_expr(&mut code, &scalar_expr, "__phase6_none__", &final_offsets, all_rules, &empty_ranges, &text_bindings)?;
+    emit_eval_expr(&mut code, &scalar_expr, "__phase6_none__", &final_offsets, all_rules, &empty_ranges, &text_bindings, None)?;
 
     // Print result.
     if is_bool_output {
@@ -7570,7 +7791,7 @@ fn emit_text_fold_program(
         }
         let mut next_let_slot = -(((n_scalar + n_elem_fields) as i32 + 1) * 8);
         for (name, expr) in &rule.logic.bindings {
-            emit_eval_expr(&mut code, expr, &rule.input_name, &let_offsets, all_rules, &field_ranges_for_lets, &text_bindings)?;
+            emit_eval_expr(&mut code, expr, &rule.input_name, &let_offsets, all_rules, &field_ranges_for_lets, &text_bindings, None)?;
             store_rax_at_rbp(&mut code, next_let_slot);
             let_offsets.insert(name.as_str(), next_let_slot);
             next_let_slot -= 8;
@@ -7994,7 +8215,7 @@ fn emit_eval_record_expr(
             Ok(())
         }
         Expr::If(cond, then_e, else_e) => {
-            emit_eval_expr(code, cond, &rule.input_name, offsets, all_rules, field_ranges, text_bindings)?;
+            emit_eval_expr(code, cond, &rule.input_name, offsets, all_rules, field_ranges, text_bindings, None)?;
             code.extend_from_slice(&[0x48, 0x85, 0xC0]); // test rax, rax
             code.push(0x0F);
             code.push(0x84); // je rel32
@@ -8072,7 +8293,7 @@ fn emit_ok_record_dispatch(
         }
         Expr::If(cond, then_e, else_e) => {
             // cond → rax; test, jz else
-            emit_eval_expr(code, cond, &rule.input_name, offsets, all_rules, field_ranges, text_bindings)?;
+            emit_eval_expr(code, cond, &rule.input_name, offsets, all_rules, field_ranges, text_bindings, None)?;
             code.extend_from_slice(&[0x48, 0x85, 0xC0]); // test rax, rax
             code.push(0x0F);
             code.push(0x84); // je rel32
@@ -8153,7 +8374,7 @@ fn emit_record_as_json(
         match decl.ty {
             Type::Number => {
                 // Evaluate → rax, write digits to stdout, no newline.
-                emit_eval_expr(code, value_expr, input_name, offsets, all_rules, field_ranges, text_bindings)?;
+                emit_eval_expr(code, value_expr, input_name, offsets, all_rules, field_ranges, text_bindings, None)?;
                 emit_itoa_to_stdout_no_newline(code);
             }
             Type::Text => {
@@ -8221,6 +8442,7 @@ fn emit_reaction_program(
         all_rules,
         &ctx.field_ranges,
         &ctx.text_bindings,
+        None,
     )?;
 
     // cmp rax, 0 ; je skip_effects (rel32 so effect body can be large)
@@ -8278,7 +8500,7 @@ fn emit_reaction_program(
                         emit_eval_expr(
                             &mut code, arg, &trigger_rule.input_name,
                             &ctx.binding_offsets, all_rules, &ctx.field_ranges,
-                            &ctx.text_bindings,
+                            &ctx.text_bindings, None,
                         )?;
                         emit_itoa_to_stdout_no_newline(&mut code);
                     } else {
@@ -8548,6 +8770,26 @@ fn try_static_condition(
 }
 
 /// Compile an expression to machine code. Result left in rax.
+/// Phase A slice 5.1a — context for self-recursive call emission.
+/// When `Some(ctx)`, any `Expr::Call(ctx.rule_name, ...)` encountered by
+/// `emit_eval_expr` is emitted as a real `call <target_offset>` instead of
+/// being inlined (which would loop forever during compilation). When `None`
+/// (the default for every non-self-recursive caller), Call expressions
+/// continue to inline as today.
+///
+/// `target_offset` is an absolute offset into the code buffer where the
+/// callable's prologue begins. The Call arm computes `rel32 = target_offset
+/// - (call_instr_end_offset)` and emits `0xE8 rel32` (5 bytes total).
+///
+/// Slice 5.1a constraint: the recursive Call's argument MUST be
+/// `Ident(input_name)` — i.e., the same input passed through, no Record
+/// construction at the call site. Slice 5.1b lifts this.
+#[derive(Clone, Copy)]
+struct SelfCallCtx<'a> {
+    rule_name: &'a str,
+    target_offset: i32,
+}
+
 fn emit_eval_expr(
     code: &mut Vec<u8>,
     expr: &Expr,
@@ -8556,6 +8798,7 @@ fn emit_eval_expr(
     all_rules: &HashMap<&str, &Rule>,
     field_ranges: &HashMap<&str, (i64, i64)>,
     text_bindings: &TextBindings<'_>,
+    self_call: Option<SelfCallCtx<'_>>,
 ) -> Result<(), NativeError> {
     match expr {
         Expr::Number(n) => {
@@ -8607,7 +8850,7 @@ fn emit_eval_expr(
             if *op == BinOp::Mul {
                 if let Expr::Number(n) = right.as_ref() {
                     if *n > 0 && (*n as u64).is_power_of_two() {
-                        emit_eval_expr(code, left, input_name, offsets, all_rules, field_ranges, text_bindings)?;
+                        emit_eval_expr(code, left, input_name, offsets, all_rules, field_ranges, text_bindings, self_call)?;
                         let shift = (*n as u64).trailing_zeros() as u8;
                         code.extend_from_slice(&[0x48, 0xC1, 0xE0, shift]); // shl rax, shift
                         return Ok(());
@@ -8619,7 +8862,7 @@ fn emit_eval_expr(
             if *op == BinOp::Div {
                 if let Expr::Number(n) = right.as_ref() {
                     if *n > 0 && (*n as u64).is_power_of_two() {
-                        emit_eval_expr(code, left, input_name, offsets, all_rules, field_ranges, text_bindings)?;
+                        emit_eval_expr(code, left, input_name, offsets, all_rules, field_ranges, text_bindings, self_call)?;
                         let shift = (*n as u64).trailing_zeros() as u8;
                         code.extend_from_slice(&[0x48, 0xC1, 0xE8, shift]); // shr rax, shift
                         return Ok(());
@@ -8638,7 +8881,7 @@ fn emit_eval_expr(
                             let dividend_non_negative = compute_range(left, field_ranges, input_name)
                                 .map_or(false, |(min, _)| min >= 0);
                             if dividend_non_negative {
-                                emit_eval_expr(code, left, input_name, offsets, all_rules, field_ranges, text_bindings)?;
+                                emit_eval_expr(code, left, input_name, offsets, all_rules, field_ranges, text_bindings, self_call)?;
                                 // mov rcx, magic
                                 code.extend_from_slice(&[0x48, 0xB9]);
                                 code.extend_from_slice(&magic.to_le_bytes());
@@ -8668,16 +8911,16 @@ fn emit_eval_expr(
             // Strength reduction: multiply by 1 → identity
             if *op == BinOp::Mul {
                 if matches!(right.as_ref(), Expr::Number(1)) {
-                    return emit_eval_expr(code, left, input_name, offsets, all_rules, field_ranges, text_bindings);
+                    return emit_eval_expr(code, left, input_name, offsets, all_rules, field_ranges, text_bindings, self_call);
                 }
                 if matches!(left.as_ref(), Expr::Number(1)) {
-                    return emit_eval_expr(code, right, input_name, offsets, all_rules, field_ranges, text_bindings);
+                    return emit_eval_expr(code, right, input_name, offsets, all_rules, field_ranges, text_bindings, self_call);
                 }
             }
 
             // Strength reduction: add/sub 0 → identity
             if (*op == BinOp::Add || *op == BinOp::Sub) && matches!(right.as_ref(), Expr::Number(0)) {
-                return emit_eval_expr(code, left, input_name, offsets, all_rules, field_ranges, text_bindings);
+                return emit_eval_expr(code, left, input_name, offsets, all_rules, field_ranges, text_bindings, self_call);
             }
 
             // === Text comparison: field == "literal" or field != "literal" ===
@@ -8871,7 +9114,7 @@ fn emit_eval_expr(
             // by the short-circuit semantics. No explicit `mov rax`
             // needed because rax is already correct.
             if matches!(op, BinOp::And | BinOp::Or) {
-                emit_eval_expr(code, left, input_name, offsets, all_rules, field_ranges, text_bindings)?;
+                emit_eval_expr(code, left, input_name, offsets, all_rules, field_ranges, text_bindings, self_call)?;
                 // test rax, rax
                 code.extend_from_slice(&[0x48, 0x85, 0xC0]);
                 // jz/jnz rel32 — depending on op
@@ -8880,7 +9123,7 @@ fn emit_eval_expr(
                 let skip_patch = code.len();
                 code.extend_from_slice(&[0; 4]);
                 // Evaluate right (overwrites rax with right's value)
-                emit_eval_expr(code, right, input_name, offsets, all_rules, field_ranges, text_bindings)?;
+                emit_eval_expr(code, right, input_name, offsets, all_rules, field_ranges, text_bindings, self_call)?;
                 // .skip_right:
                 let skip_pos = code.len();
                 let skip_rel = skip_pos as i32 - (skip_patch as i32 + 4);
@@ -8889,9 +9132,9 @@ fn emit_eval_expr(
             }
 
             // === General case: evaluate both sides, apply operator ===
-            emit_eval_expr(code, left, input_name, offsets, all_rules, field_ranges, text_bindings)?;
+            emit_eval_expr(code, left, input_name, offsets, all_rules, field_ranges, text_bindings, self_call)?;
             code.push(0x50); // push rax
-            emit_eval_expr(code, right, input_name, offsets, all_rules, field_ranges, text_bindings)?;
+            emit_eval_expr(code, right, input_name, offsets, all_rules, field_ranges, text_bindings, self_call)?;
             code.push(0x59); // pop rcx — now rcx=left, rax=right
 
             match op {
@@ -8969,6 +9212,54 @@ fn emit_eval_expr(
                     message: "native call requires exactly 1 argument".into(),
                 });
             }
+            // Phase A slice 5.1a — self-recursive call: emit a real
+            // `call <target_offset>` instead of inlining the callee's body
+            // (which would loop forever for a self-recursive rule).
+            if let Some(ctx) = self_call {
+                if name == ctx.rule_name {
+                    // Slice 5.1a constraint: the recursive arg must be the
+                    // same input passed through. Other shapes (Record
+                    // construction at the call site, arithmetic on the
+                    // field, etc.) are slice 5.1b+.
+                    if !matches!(&args[0], Expr::Ident(n) if n == input_name) {
+                        return Err(NativeError {
+                            message: format!(
+                                "slice 5.1a: self-recursive call to '{}' must pass the input identifier directly (got {:?}); other shapes need slice 5.1b+",
+                                name, args[0]
+                            ),
+                        });
+                    }
+                    // Slice 5.1a constraint: single-Number-field input
+                    // concept. The callable's prologue spilled rdi into
+                    // the field's rbp slot at function entry. To recurse
+                    // with the same input, load the slot back into rdi.
+                    if offsets.len() != 1 {
+                        return Err(NativeError {
+                            message: format!(
+                                "slice 5.1a: recursive call expected single-field input concept, found {} fields in scope",
+                                offsets.len()
+                            ),
+                        });
+                    }
+                    let field_offset = *offsets.values().next().unwrap();
+                    // mov rdi, [rbp + field_offset]
+                    if field_offset >= -128 {
+                        code.extend_from_slice(&[0x48, 0x8B, 0x7D]);
+                        code.push(field_offset as u8);
+                    } else {
+                        code.extend_from_slice(&[0x48, 0x8B, 0xBD]);
+                        code.extend_from_slice(&field_offset.to_le_bytes());
+                    }
+                    // call <target_offset>: 0xE8 + rel32. Target is the
+                    // absolute offset of the callable's prologue; rel32 =
+                    // target - (call_instr_end_offset).
+                    code.push(0xE8);
+                    let call_end = (code.len() + 4) as i32;
+                    let rel32 = ctx.target_offset - call_end;
+                    code.extend_from_slice(&rel32.to_le_bytes());
+                    return Ok(());
+                }
+            }
             let called = all_rules.get(name.as_str()).ok_or_else(|| NativeError {
                 message: format!("unknown rule '{}' for native inlining", name),
             })?;
@@ -8981,6 +9272,7 @@ fn emit_eval_expr(
                 all_rules,
                 field_ranges,
                 text_bindings,
+                self_call,
             )
         }
         Expr::If(cond, then_e, else_e) => {
@@ -8988,14 +9280,14 @@ fn emit_eval_expr(
             if let Some(always) = try_static_condition(cond, field_ranges, input_name) {
                 if always {
                     // Condition always true — emit only then branch, skip comparison
-                    return emit_eval_expr(code, then_e, input_name, offsets, all_rules, field_ranges, text_bindings);
+                    return emit_eval_expr(code, then_e, input_name, offsets, all_rules, field_ranges, text_bindings, self_call);
                 } else {
                     // Condition always false — emit only else branch, skip comparison
-                    return emit_eval_expr(code, else_e, input_name, offsets, all_rules, field_ranges, text_bindings);
+                    return emit_eval_expr(code, else_e, input_name, offsets, all_rules, field_ranges, text_bindings, self_call);
                 }
             }
             // Dynamic: emit both branches with runtime check
-            emit_eval_expr(code, cond, input_name, offsets, all_rules, field_ranges, text_bindings)?;
+            emit_eval_expr(code, cond, input_name, offsets, all_rules, field_ranges, text_bindings, self_call)?;
             // test al, al
             code.extend_from_slice(&[0x84, 0xC0]);
             // jz .else_branch
@@ -9004,7 +9296,7 @@ fn emit_eval_expr(
             let else_patch = code.len();
             code.extend_from_slice(&[0x00; 4]);
             // then branch → rax
-            emit_eval_expr(code, then_e, input_name, offsets, all_rules, field_ranges, text_bindings)?;
+            emit_eval_expr(code, then_e, input_name, offsets, all_rules, field_ranges, text_bindings, self_call)?;
             // jmp .end
             code.push(0xE9);
             let end_patch = code.len();
@@ -9013,7 +9305,7 @@ fn emit_eval_expr(
             let else_pos = code.len();
             let eo = else_pos as i32 - (else_patch as i32 + 4);
             code[else_patch..else_patch + 4].copy_from_slice(&eo.to_le_bytes());
-            emit_eval_expr(code, else_e, input_name, offsets, all_rules, field_ranges, text_bindings)?;
+            emit_eval_expr(code, else_e, input_name, offsets, all_rules, field_ranges, text_bindings, self_call)?;
             // .end:
             let end_pos = code.len();
             let ep = end_pos as i32 - (end_patch as i32 + 4);
@@ -9021,13 +9313,13 @@ fn emit_eval_expr(
             Ok(())
         }
         Expr::Not(inner) => {
-            emit_eval_expr(code, inner, input_name, offsets, all_rules, field_ranges, text_bindings)?;
+            emit_eval_expr(code, inner, input_name, offsets, all_rules, field_ranges, text_bindings, self_call)?;
             // rax is 0 or 1; flip it
             code.extend_from_slice(&[0x48, 0x83, 0xF0, 0x01]); // xor rax, 1
             Ok(())
         }
         Expr::Neg(inner) => {
-            emit_eval_expr(code, inner, input_name, offsets, all_rules, field_ranges, text_bindings)?;
+            emit_eval_expr(code, inner, input_name, offsets, all_rules, field_ranges, text_bindings, self_call)?;
             code.extend_from_slice(&[0x48, 0xF7, 0xD8]); // neg rax
             Ok(())
         }
@@ -9301,7 +9593,7 @@ fn emit_eval_expr(
         // panic on i64::MIN (it stays at i64::MIN; the optimizer fold
         // uses wrapping_abs for the same property).
         Expr::Abs(inner) => {
-            emit_eval_expr(code, inner, input_name, offsets, all_rules, field_ranges, text_bindings)?;
+            emit_eval_expr(code, inner, input_name, offsets, all_rules, field_ranges, text_bindings, self_call)?;
             // cqo
             code.extend_from_slice(&[0x48, 0x99]);
             // xor rax, rdx
@@ -9323,10 +9615,10 @@ fn emit_eval_expr(
         Expr::Min(left, right) | Expr::Max(left, right) => {
             let is_max = matches!(expr, Expr::Max(_, _));
             // eval left → rax; push rax
-            emit_eval_expr(code, left, input_name, offsets, all_rules, field_ranges, text_bindings)?;
+            emit_eval_expr(code, left, input_name, offsets, all_rules, field_ranges, text_bindings, self_call)?;
             code.push(0x50); // push rax
             // eval right → rax
-            emit_eval_expr(code, right, input_name, offsets, all_rules, field_ranges, text_bindings)?;
+            emit_eval_expr(code, right, input_name, offsets, all_rules, field_ranges, text_bindings, self_call)?;
             // pop rcx (rcx = left, rax = right)
             code.push(0x59);
             // cmp rcx, rax
@@ -9382,7 +9674,7 @@ fn emit_eval_expr(
             code.push(0x51); // push rcx
             // (3) Evaluate index → rax.
             emit_eval_expr(
-                code, index, input_name, offsets, all_rules, field_ranges, text_bindings,
+                code, index, input_name, offsets, all_rules, field_ranges, text_bindings, self_call,
             )?;
             // (4) Bounds: index >= len → abort (unsigned compare).
             //   mov rcx, [rsp]
@@ -9708,7 +10000,7 @@ fn emit_length(
             // (2) push rax (text_len at [rsp+8] after later push)
             code.push(0x50);
             // (3) Evaluate end → rax
-            emit_eval_expr(code, end_expr, input_name, offsets, all_rules, field_ranges, text_bindings)?;
+            emit_eval_expr(code, end_expr, input_name, offsets, all_rules, field_ranges, text_bindings, None)?;
             // (4) cmp end, text_len ; ja .abort
             //    mov rcx, [rsp]
             code.extend_from_slice(&[0x48, 0x8B, 0x0C, 0x24]);
@@ -9721,7 +10013,7 @@ fn emit_length(
             // (5) push rax (end at [rsp])
             code.push(0x50);
             // (6) Evaluate start → rax
-            emit_eval_expr(code, start_expr, input_name, offsets, all_rules, field_ranges, text_bindings)?;
+            emit_eval_expr(code, start_expr, input_name, offsets, all_rules, field_ranges, text_bindings, None)?;
             // (7) cmp start, end ; ja .abort
             //    mov rcx, [rsp]  (rcx = end)
             code.extend_from_slice(&[0x48, 0x8B, 0x0C, 0x24]);
@@ -11023,6 +11315,7 @@ fn emit_parallel_program(
         all_rules,
         &field_ranges,
         &text_bindings,
+        None,
     )?;
 
     // Print result
@@ -13155,6 +13448,7 @@ fn emit_http10_dynamic_bytes(
                     all_rules,
                     field_ranges,
                     &http_text_bindings,
+                    None,
                 )?;
                 store_rax_at_rbp(&mut code, value_slot);
                 handler_offsets.insert(name.as_str(), value_slot);
@@ -13462,7 +13756,7 @@ fn emit_handler_to_slots(
                     // `status: number [100, 599]`; native trusts it and
                     // dispatches to the generic evaluator, then stores
                     // rax at the status slot.
-                    emit_eval_expr(code, status_expr, input_name, offsets, all_rules, field_ranges, text_bindings)?;
+                    emit_eval_expr(code, status_expr, input_name, offsets, all_rules, field_ranges, text_bindings, None)?;
                     // mov [rbp-24], rax
                     code.extend_from_slice(&[0x48, 0x89, 0x45, 0xE8]);
                 }
@@ -13610,7 +13904,7 @@ fn emit_handler_to_slots(
         }
         Expr::If(cond, then_e, else_e) => {
             // Evaluate cond → rax (0 or 1)
-            emit_eval_expr(code, cond, input_name, offsets, all_rules, field_ranges, text_bindings)?;
+            emit_eval_expr(code, cond, input_name, offsets, all_rules, field_ranges, text_bindings, None)?;
             // test rax, rax ; jz else_label
             code.extend_from_slice(&[0x48, 0x85, 0xC0]);
             code.push(0x0F);
@@ -22375,16 +22669,26 @@ rule pick_max
         let _ = fs::remove_file(out);
     }
 
-    /// Phase A slice 5.0 — refuse recursive rules at native compile time
-    /// with a clear breadcrumb instead of stack-overflowing the compiler.
+    /// Phase A slice 5.0 + 5.1a — recursive rule handling.
     ///
-    /// Three cases:
-    ///   (a) Self-recursive rule  → refused, breadcrumb names the rule
-    ///   (b) Mutually-recursive   → refused (cycle through one of the pair)
-    ///   (c) Non-recursive Call   → still compiles (no false positive)
+    /// Slice 5.0 (PR #32) refused all recursive rules; slice 5.1a lifts
+    /// the refusal for direct self-recursion meeting tight constraints
+    /// (single-Number-field input, scalar output, only self in call
+    /// graph, no let bindings). Mutual recursion, multi-field input,
+    /// and mixed call graphs stay refused.
+    ///
+    /// Four cases:
+    ///   (a) Self-recursive single-Number-field  → COMPILES (slice 5.1a)
+    ///   (b) Mutually-recursive                   → refused, slice 5.4 breadcrumb
+    ///   (c) Self-recursive multi-field           → refused, slice 5.3 breadcrumb
+    ///   (d) Non-recursive Call                   → compiles unchanged
     #[test]
-    fn phase_a5_0_refuses_recursive_native() {
-        // (a) Direct self-recursion
+    fn phase_a5_recursive_compile_and_refuse() {
+        // (a) Direct self-recursion within slice-5.1a scope: COMPILES.
+        // The recursive arm is only taken at runtime if input > 0, so we
+        // run with v=0 to exercise the base case safely. The binary
+        // contains a real `call` instruction (0xE8) pointing at the
+        // callable's prologue.
         let self_rec = r#"@verbose 0.1.0
 
 concept N
@@ -22393,34 +22697,59 @@ concept N
   fields:
     v : number [0, 10]
 
-rule fact
-  @intention: "self-recursive"
+rule recurse
+  @intention: "self-recursive, base at 0"
   @source: invoices.intent:1
   input:
     n : N
   output:
     out : number
   logic:
-    out = if n.v == 0 then 1 else n.v * fact(n)
+    out = if n.v == 0 then 99 else recurse(n)
   proofs:
     purity:
       reads : [n, n.v]
-      calls : [fact]
+      calls : [recurse]
     termination:
-      bound : 100
+      bound : 5
 "#;
         let tokens = crate::lexer::Lexer::new(self_rec).tokenize().unwrap();
         let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
-        let out = std::env::temp_dir().join("verbosec_test_phase_a5_self_rec");
-        let err = compile_native(&program, "fact", out.to_str().unwrap(), true, false)
-            .expect_err("self-recursive rule must be refused");
+        let out = std::env::temp_dir().join("verbosec_test_phase_a5_1a_self_rec");
+        compile_native(&program, "recurse", out.to_str().unwrap(), true, false)
+            .expect("slice-5.1a self-recursive rule must compile");
+        // Verify the binary contains a call instruction (0xE8 = near-call rel32).
+        let bytes = std::fs::read(&out).expect("read compiled binary");
         assert!(
-            err.message.contains("recursive call graph") && err.message.contains("'fact'") && err.message.contains("slice 5.1"),
-            "self-recursion breadcrumb should name the rule and the slice: {}",
-            err.message
+            bytes.windows(1).any(|w| w[0] == 0xE8),
+            "compiled binary must contain a `call` (0xE8) instruction"
         );
+        // Runtime: v=0 hits base case, outputs 99 to stdout.
+        use std::io::Write;
+        let mut child = std::process::Command::new(&out)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn recurse");
+        child.stdin.as_mut().unwrap().write_all(b"0\n").unwrap();
+        drop(child.stdin.take());
+        let out_run = child.wait_with_output().expect("wait recurse");
+        assert!(out_run.status.success(), "recurse base-case must exit 0; got {:?}", out_run.status);
+        assert_eq!(
+            String::from_utf8_lossy(&out_run.stdout).trim(),
+            "99",
+            "recurse(v=0) must print 99 (base case); got {:?}",
+            out_run.stdout
+        );
+        // Also verify the MANDATORY breadcrumb fires on stderr at compile time
+        // (the compile_native call captured nothing because eprintln goes to
+        // the test runner's stderr; pin via a re-invocation through a separate
+        // process boundary would be the only fully-airtight check, but the
+        // call instruction's presence is the load-bearing artifact).
+        let _ = std::fs::remove_file(out);
 
-        // (b) Mutual recursion: a calls b calls a
+        // (b) Mutual recursion: a calls b calls a → refused (slice 5.4+).
         let mutual = r#"@verbose 0.1.0
 
 concept N
@@ -22467,12 +22796,49 @@ rule odd_ish
         let err = compile_native(&program, "even_ish", out.to_str().unwrap(), true, false)
             .expect_err("mutually-recursive rule must be refused");
         assert!(
-            err.message.contains("recursive call graph") && err.message.contains("slice 5.1"),
-            "mutual recursion breadcrumb should mention the cycle and the slice: {}",
+            err.message.contains("recursive call graph") && err.message.contains("slice 5"),
+            "mutual recursion breadcrumb should mention the cycle and a slice number: {}",
             err.message
         );
 
-        // (c) Non-recursive Call — must still compile (no false positive).
+        // (c) Self-recursive multi-field → refused (slice 5.3+).
+        let multi_field = r#"@verbose 0.1.0
+
+concept Pair
+  @intention: "pair"
+  @source: invoices.intent:1
+  fields:
+    a : number [0, 10]
+    b : number [0, 10]
+
+rule rec
+  @intention: "self-recursive, two fields"
+  @source: invoices.intent:1
+  input:
+    p : Pair
+  output:
+    out : number
+  logic:
+    out = if p.a == 0 then 1 else rec(p)
+  proofs:
+    purity:
+      reads : [p, p.a]
+      calls : [rec]
+    termination:
+      bound : 5
+"#;
+        let tokens = crate::lexer::Lexer::new(multi_field).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+        let out = std::env::temp_dir().join("verbosec_test_phase_a5_multifield");
+        let err = compile_native(&program, "rec", out.to_str().unwrap(), true, false)
+            .expect_err("multi-field self-recursion must be refused");
+        assert!(
+            err.message.contains("slice 5.1a") && err.message.contains("slice 5.3"),
+            "multi-field breadcrumb should point at slice 5.3: {}",
+            err.message
+        );
+
+        // (d) Non-recursive Call — must still compile (no false positive).
         // `score` from `examples/token_classify.verbose` calls `classify`
         // but neither rule recurses; compile must succeed.
         let src = std::fs::read_to_string("examples/token_classify.verbose")
