@@ -1,0 +1,50 @@
+@verbose 0.1.0
+
+-- Phase A slice 5.1b worked example: factorial as a self-recursive
+-- rule that compiles to a real x86-64 binary with `call`/`ret`.
+--
+-- This is THE FIRST runtime-recursive Verbose native binary. Every
+-- earlier native binary inlined every call; recursion would have
+-- infinite-expanded the inliner and stack-overflowed the COMPILER.
+-- Slice 5.0 (PR #32) refused that case; slice 5.1a (PR #34) shipped
+-- the call/ret ABI but only accepted pass-through recursive args;
+-- slice 5.1b (this example) accepts Record construction at the
+-- recursive call site, enabling a real decreasing argument.
+--
+-- Stack budget: `v : number [0, 10]` declares the range; the runtime
+-- bounds-check (PR #35) enforces it at field-load, so recursion depth
+-- is at most 11 frames. Linux's 8 MiB stack covers that with several
+-- orders of magnitude of headroom.
+--
+-- Termination is NOT mechanically proven yet (Phase C ships that via
+-- `termination: structural : <var>`). The compiler emits a mandatory
+-- breadcrumb to stderr on every recursive compile, naming the gap.
+
+
+concept N
+  @intention: "A wrapper holding one non-negative integer 0..=10"
+  @source: factorial.intent:1
+
+  fields:
+    v : number [0, 10]
+
+
+rule fact
+  @intention: "Factorial: 0!=1, n!=n*(n-1)!"
+  @source: factorial.intent:2
+
+  input:
+    n : N
+
+  output:
+    out : number
+
+  logic:
+    out = if n.v == 0 then 1 else n.v * fact(N { v: n.v - 1 })
+
+  proofs:
+    purity:
+      reads   : [n.v]
+      calls   : [fact]
+    termination:
+      bound : 100

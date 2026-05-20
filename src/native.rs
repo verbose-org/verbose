@@ -9268,27 +9268,21 @@ fn emit_eval_expr(
                     message: "native call requires exactly 1 argument".into(),
                 });
             }
-            // Phase A slice 5.1a — self-recursive call: emit a real
+            // Phase A slice 5.1a/5.1b — self-recursive call: emit a real
             // `call <target_offset>` instead of inlining the callee's body
             // (which would loop forever for a self-recursive rule).
+            //
+            // Slice 5.1a accepts only `Call(self, [Ident(input)])` —
+            // pass the input record through unchanged. Slice 5.1b also
+            // accepts `Call(self, [Record(C, [(field, expr)])])` —
+            // construct a fresh record with one field's value derived
+            // from an expression. Together they cover the natural
+            // recursive shapes: pass-through and decreasing-arg.
             if let Some(ctx) = self_call {
                 if name == ctx.rule_name {
-                    // Slice 5.1a constraint: the recursive arg must be the
-                    // same input passed through. Other shapes (Record
-                    // construction at the call site, arithmetic on the
-                    // field, etc.) are slice 5.1b+.
-                    if !matches!(&args[0], Expr::Ident(n) if n == input_name) {
-                        return Err(NativeError {
-                            message: format!(
-                                "slice 5.1a: self-recursive call to '{}' must pass the input identifier directly (got {:?}); other shapes need slice 5.1b+",
-                                name, args[0]
-                            ),
-                        });
-                    }
                     // Slice 5.1a constraint: single-Number-field input
                     // concept. The callable's prologue spilled rdi into
-                    // the field's rbp slot at function entry. To recurse
-                    // with the same input, load the slot back into rdi.
+                    // the field's rbp slot at function entry.
                     if offsets.len() != 1 {
                         return Err(NativeError {
                             message: format!(
@@ -9297,14 +9291,62 @@ fn emit_eval_expr(
                             ),
                         });
                     }
-                    let field_offset = *offsets.values().next().unwrap();
-                    // mov rdi, [rbp + field_offset]
-                    if field_offset >= -128 {
-                        code.extend_from_slice(&[0x48, 0x8B, 0x7D]);
-                        code.push(field_offset as u8);
-                    } else {
-                        code.extend_from_slice(&[0x48, 0x8B, 0xBD]);
-                        code.extend_from_slice(&field_offset.to_le_bytes());
+                    match &args[0] {
+                        // Slice 5.1a: pass-through. Load the field slot
+                        // straight into rdi.
+                        Expr::Ident(n) if n == input_name => {
+                            let field_offset = *offsets.values().next().unwrap();
+                            if field_offset >= -128 {
+                                code.extend_from_slice(&[0x48, 0x8B, 0x7D]);
+                                code.push(field_offset as u8);
+                            } else {
+                                code.extend_from_slice(&[0x48, 0x8B, 0xBD]);
+                                code.extend_from_slice(&field_offset.to_le_bytes());
+                            }
+                        }
+                        // Slice 5.1b: Record construction at the call
+                        // site. The Record must name the input concept
+                        // (verifier checks this), and have exactly one
+                        // payload field (Number-typed). Evaluate the
+                        // field's expression into rax, then move to rdi
+                        // — the callable's prologue spills rdi to its
+                        // own field slot, so the value lands where the
+                        // body expects it.
+                        Expr::Record(_concept_name, fields) => {
+                            if fields.len() != 1 {
+                                return Err(NativeError {
+                                    message: format!(
+                                        "slice 5.1b: recursive call's Record must have exactly 1 field (got {}); multi-field is slice 5.3",
+                                        fields.len()
+                                    ),
+                                });
+                            }
+                            let (_field_name, field_expr) = &fields[0];
+                            // Evaluate field_expr → rax. The recursion
+                            // forwards self_call so a nested self-call
+                            // inside the expression (uncommon but legal)
+                            // also routes to the real-call path.
+                            emit_eval_expr(
+                                code,
+                                field_expr,
+                                input_name,
+                                offsets,
+                                all_rules,
+                                field_ranges,
+                                text_bindings,
+                                self_call,
+                            )?;
+                            // mov rdi, rax
+                            code.extend_from_slice(&[0x48, 0x89, 0xC7]);
+                        }
+                        other => {
+                            return Err(NativeError {
+                                message: format!(
+                                    "slice 5.1b: self-recursive call to '{}' arg must be Ident(input) or Record(input_concept, {{ field: expr }}) (got {:?})",
+                                    name, other
+                                ),
+                            });
+                        }
                     }
                     // call <target_offset>: 0xE8 + rel32. Target is the
                     // absolute offset of the callable's prologue; rel32 =
@@ -22905,6 +22947,52 @@ rule rec
         compile_native(&program, "score", out.to_str().unwrap(), true, false)
             .expect("non-recursive Call should compile cleanly");
         let _ = std::fs::remove_file(out);
+    }
+
+    /// Phase A slice 5.1b — first runtime-recursive native binary.
+    /// Lifts slice 5.1a's "recursive arg must be Ident(input)" by
+    /// also accepting `Record(input_concept, { field: expr })` at the
+    /// recursive call site. The classic factorial shape compiles now:
+    /// `out = if n.v == 0 then 1 else n.v * fact(N { v: n.v - 1 })`.
+    ///
+    /// Composed with runtime input bounds-check (PR #35): the
+    /// declared `v : number [0, 10]` enforces recursion depth ≤ 11
+    /// at runtime, well within Linux's 8 MiB stack.
+    #[test]
+    fn phase_a5_1b_factorial_runtime() {
+        use std::io::Write;
+        let src = std::fs::read_to_string("examples/factorial.verbose")
+            .expect("examples/factorial.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+        let out = std::env::temp_dir().join("verbosec_test_phase_a5_1b_fact");
+        compile_native(&program, "fact", out.to_str().unwrap(), true, false)
+            .expect("factorial must compile");
+
+        let run = |input: &str| -> String {
+            let mut child = std::process::Command::new(&out)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .expect("spawn fact");
+            child.stdin.as_mut().unwrap().write_all(input.as_bytes()).unwrap();
+            drop(child.stdin.take());
+            let r = child.wait_with_output().expect("wait fact");
+            assert!(r.status.success(), "fact({}) must exit 0; got {:?}", input.trim(), r.status);
+            String::from_utf8_lossy(&r.stdout).trim().to_string()
+        };
+
+        // The classic factorial table — exercises real runtime recursion
+        // (each recursive call materializes a fresh N{v: n.v - 1} into rdi
+        // before `call <fact_label>`).
+        assert_eq!(run("0\n"),  "1");
+        assert_eq!(run("1\n"),  "1");
+        assert_eq!(run("2\n"),  "2");
+        assert_eq!(run("3\n"),  "6");
+        assert_eq!(run("5\n"),  "120");
+        assert_eq!(run("10\n"), "3628800");
+        let _ = std::fs::remove_file(&out);
     }
 
     /// Runtime input bounds-check (2026-05-20). A Number field declared
