@@ -196,23 +196,33 @@ fn compile_native_code(
                 ),
             });
         }
-        // Slice 5.1a constraints — refuse with breadcrumb pointing at
-        // the relevant follow-up slice.
-        if concept.fields.len() != 1 {
+        // Slice 5.1a + 5.3 constraints — refuse with breadcrumb pointing
+        // at the relevant follow-up slice.
+        //
+        // Slice 5.1a: single Number field input → rdi holds the value.
+        // Slice 5.3: multi-field Number-only input → rdi holds a pointer
+        // to a fields struct laid out on the caller's stack below rsp,
+        // with one i64 slot per field in declaration order. The compiler
+        // emits the marshalling at every call site; the language stays
+        // pointer-free (no syntax for &x, *p, casts, or arithmetic on
+        // the pointer — it's an ABI artifact, never a first-class value).
+        if concept.fields.is_empty() {
             return Err(NativeError {
                 message: format!(
-                    "slice 5.1a: recursive rule '{}' input concept '{}' must have exactly 1 field (has {}); multi-field input is slice 5.3. Use --run for now.",
-                    rule.name, concept.name, concept.fields.len()
+                    "recursive rule '{}' input concept '{}' has no fields (recursion needs at least one field to vary the argument)",
+                    rule.name, concept.name
                 ),
             });
         }
-        if concept.fields[0].ty != Type::Number {
-            return Err(NativeError {
-                message: format!(
-                    "slice 5.1a: recursive rule '{}' input field must be Number (got {:?}); text input is slice 5.2.",
-                    rule.name, concept.fields[0].ty
-                ),
-            });
+        for f in &concept.fields {
+            if f.ty != Type::Number {
+                return Err(NativeError {
+                    message: format!(
+                        "recursive rule '{}' input field '{}' must be Number (got {:?}); text input in a recursive rule is a later slice (no multi-field text ABI yet).",
+                        rule.name, f.name, f.ty
+                    ),
+                });
+            }
         }
         if !matches!(&rule.output_ty, Type::Number | Type::Bool | Type::Text) {
             return Err(NativeError {
@@ -2525,6 +2535,8 @@ fn emit_self_recursive_program(
 ) -> Result<Vec<u8>, NativeError> {
     let is_bool = rule.output_ty == Type::Bool;
     let is_text = rule.output_ty == Type::Text;
+    let nfields = concept.fields.len();
+    let is_multi_field = nfields > 1;
     let mut code = Vec::new();
 
     // Leading jump that skips over the callable so _start runs first
@@ -2537,20 +2549,62 @@ fn emit_self_recursive_program(
     let callable_label_offset = code.len() as i32;
 
     // Callable prologue.
+    // - Single-field rules (slice 5.1a): rdi holds the scalar value;
+    //   spill to [rbp - 8].
+    // - Multi-field rules (slice 5.3): rdi holds a pointer to a fields
+    //   struct laid out by the caller below rsp (Number-only, i64 per
+    //   field, in declaration order). Copy each slot from
+    //   [rdi + 8*i] into the rule's own rbp slot at -8*(i+1) so the
+    //   body sees the standard field-slot layout.
     code.push(0x55);                                       // push rbp
     code.extend_from_slice(&[0x48, 0x89, 0xE5]);           // mov rbp, rsp
-    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x08]);     // sub rsp, 8
-    code.extend_from_slice(&[0x48, 0x89, 0x7D, 0xF8]);     // mov [rbp - 8], rdi
+    let frame_bytes = (nfields * 8) as i32;
+    if frame_bytes <= 127 {
+        code.extend_from_slice(&[0x48, 0x83, 0xEC]);       // sub rsp, imm8
+        code.push(frame_bytes as u8);
+    } else {
+        code.extend_from_slice(&[0x48, 0x81, 0xEC]);       // sub rsp, imm32
+        code.extend_from_slice(&frame_bytes.to_le_bytes());
+    }
+    if !is_multi_field {
+        // mov [rbp - 8], rdi
+        code.extend_from_slice(&[0x48, 0x89, 0x7D, 0xF8]);
+    } else {
+        // For each field i in declaration order:
+        //   mov rax, [rdi + 8*i]
+        //   mov [rbp - 8*(i+1)], rax
+        for i in 0..nfields {
+            let src_off = (i * 8) as i32;
+            if src_off == 0 {
+                code.extend_from_slice(&[0x48, 0x8B, 0x07]); // mov rax, [rdi]
+            } else if src_off <= 127 {
+                code.extend_from_slice(&[0x48, 0x8B, 0x47]); // mov rax, [rdi + disp8]
+                code.push(src_off as u8);
+            } else {
+                code.extend_from_slice(&[0x48, 0x8B, 0x87]); // mov rax, [rdi + disp32]
+                code.extend_from_slice(&src_off.to_le_bytes());
+            }
+            let dst_off = -((i as i32 + 1) * 8);
+            if dst_off >= -128 {
+                code.extend_from_slice(&[0x48, 0x89, 0x45]); // mov [rbp + disp8], rax
+                code.push(dst_off as u8);
+            } else {
+                code.extend_from_slice(&[0x48, 0x89, 0x85]);
+                code.extend_from_slice(&dst_off.to_le_bytes());
+            }
+        }
+    }
 
     // Build the offsets / field_ranges maps the callable's body sees.
-    // Slice 5.1a constraint: single Number field; the only slot is at
-    // rbp - 8 (the rdi spill).
-    let field_name = concept.fields[0].name.as_str();
+    // Each field at rbp - 8*(i+1) in declaration order.
     let mut callable_offsets: HashMap<&str, i32> = HashMap::new();
-    callable_offsets.insert(field_name, -8);
     let mut callable_field_ranges: HashMap<&str, (i64, i64)> = HashMap::new();
-    if let Some((min, max)) = concept.fields[0].range {
-        callable_field_ranges.insert(field_name, (min, max));
+    for (i, f) in concept.fields.iter().enumerate() {
+        let off = -((i as i32 + 1) * 8);
+        callable_offsets.insert(f.name.as_str(), off);
+        if let Some((min, max)) = f.range {
+            callable_field_ranges.insert(f.name.as_str(), (min, max));
+        }
     }
     let callable_text_bindings = TextBindings::new();
     let self_call = SelfCallCtx {
@@ -2599,24 +2653,74 @@ fn emit_self_recursive_program(
     let jmp_off = start_actual_offset as i32 - (jmp_skip_patch as i32 + 4);
     code[jmp_skip_patch..jmp_skip_patch + 4].copy_from_slice(&jmp_off.to_le_bytes());
 
-    // Standard prologue + per-record loop. The loop body loads the
-    // field into rdi and calls into the callable instead of inlining
-    // the rule logic.
+    // Standard prologue + per-record loop. The loop body calls into the
+    // callable instead of inlining the rule logic.
     let ctx = emit_record_loop_prologue(
         &mut code, rule, concept, None, all_rules, all_resources, all_connections,
     )?;
-    let field_slot = ctx.binding_offsets[field_name];
-    if field_slot >= -128 {
-        code.extend_from_slice(&[0x48, 0x8B, 0x7D]);       // mov rdi, [rbp + disp8]
-        code.push(field_slot as u8);
+    if !is_multi_field {
+        // Single-field: rdi = value.
+        let field_slot = ctx.binding_offsets[concept.fields[0].name.as_str()];
+        if field_slot >= -128 {
+            code.extend_from_slice(&[0x48, 0x8B, 0x7D]);   // mov rdi, [rbp + disp8]
+            code.push(field_slot as u8);
+        } else {
+            code.extend_from_slice(&[0x48, 0x8B, 0xBD]);
+            code.extend_from_slice(&field_slot.to_le_bytes());
+        }
     } else {
-        code.extend_from_slice(&[0x48, 0x8B, 0xBD]);
-        code.extend_from_slice(&field_slot.to_le_bytes());
+        // Multi-field: build a fields struct on the stack below rsp,
+        // then rdi = rsp.
+        //   sub rsp, 8*nfields
+        //   for each field i in declaration order:
+        //     mov rax, [rbp + ctx.field_slot[name]]
+        //     mov [rsp + 8*i], rax
+        //   mov rdi, rsp
+        // After the call we free with `add rsp, 8*nfields`.
+        if frame_bytes <= 127 {
+            code.extend_from_slice(&[0x48, 0x83, 0xEC]);
+            code.push(frame_bytes as u8);
+        } else {
+            code.extend_from_slice(&[0x48, 0x81, 0xEC]);
+            code.extend_from_slice(&frame_bytes.to_le_bytes());
+        }
+        for (i, f) in concept.fields.iter().enumerate() {
+            let src = ctx.binding_offsets[f.name.as_str()];
+            if src >= -128 {
+                code.extend_from_slice(&[0x48, 0x8B, 0x45]); // mov rax, [rbp + disp8]
+                code.push(src as u8);
+            } else {
+                code.extend_from_slice(&[0x48, 0x8B, 0x85]);
+                code.extend_from_slice(&src.to_le_bytes());
+            }
+            let dst = (i * 8) as i32;
+            if dst == 0 {
+                code.extend_from_slice(&[0x48, 0x89, 0x04, 0x24]); // mov [rsp], rax
+            } else if dst <= 127 {
+                code.extend_from_slice(&[0x48, 0x89, 0x44, 0x24]); // mov [rsp + disp8], rax
+                code.push(dst as u8);
+            } else {
+                code.extend_from_slice(&[0x48, 0x89, 0x84, 0x24]); // mov [rsp + disp32], rax
+                code.extend_from_slice(&dst.to_le_bytes());
+            }
+        }
+        // mov rdi, rsp
+        code.extend_from_slice(&[0x48, 0x89, 0xE7]);
     }
     code.push(0xE8);                                       // call rel32
     let call_end = (code.len() + 4) as i32;
     let rel32 = callable_label_offset - call_end;
     code.extend_from_slice(&rel32.to_le_bytes());
+    if is_multi_field {
+        // Free the fields struct: add rsp, 8*nfields.
+        if frame_bytes <= 127 {
+            code.extend_from_slice(&[0x48, 0x83, 0xC4]);
+            code.push(frame_bytes as u8);
+        } else {
+            code.extend_from_slice(&[0x48, 0x81, 0xC4]);
+            code.extend_from_slice(&frame_bytes.to_le_bytes());
+        }
+    }
 
     // Print result — mirrors emit_full_program / emit_text_program.
     if is_bool {
@@ -9482,20 +9586,119 @@ fn emit_eval_expr(
             // recursive shapes: pass-through and decreasing-arg.
             if let Some(ctx) = self_call {
                 if name == ctx.rule_name {
-                    // Slice 5.1a constraint: single-Number-field input
-                    // concept. The callable's prologue spilled rdi into
-                    // the field's rbp slot at function entry.
-                    if offsets.len() != 1 {
-                        return Err(NativeError {
-                            message: format!(
-                                "slice 5.1a: recursive call expected single-field input concept, found {} fields in scope",
-                                offsets.len()
-                            ),
-                        });
+                    let nfields = offsets.len();
+                    let multi_field = nfields > 1;
+                    // Single-field path (slice 5.1a/5.1b): rdi holds the
+                    // scalar value. Multi-field path (slice 5.3): rdi
+                    // holds a pointer to a fields struct laid out below
+                    // rsp, one i64 per field in declaration order. The
+                    // declaration-order index for a given field name is
+                    // derived from its rbp slot via
+                    //   index = (-rbp_off / 8) - 1
+                    //   struct_off = index * 8 = -rbp_off - 8
+                    // (callable's prologue placed field i at rbp - 8*(i+1)).
+                    if multi_field {
+                        let frame_bytes = (nfields * 8) as i32;
+                        // sub rsp, frame_bytes
+                        if frame_bytes <= 127 {
+                            code.extend_from_slice(&[0x48, 0x83, 0xEC]);
+                            code.push(frame_bytes as u8);
+                        } else {
+                            code.extend_from_slice(&[0x48, 0x81, 0xEC]);
+                            code.extend_from_slice(&frame_bytes.to_le_bytes());
+                        }
+                        match &args[0] {
+                            Expr::Ident(n) if n == input_name => {
+                                // Pass-through: copy each rbp slot into
+                                // the corresponding struct slot.
+                                for (&name, &rbp_off) in offsets.iter() {
+                                    let _ = name;
+                                    let struct_off = -rbp_off - 8;
+                                    // mov rax, [rbp + rbp_off]
+                                    if rbp_off >= -128 {
+                                        code.extend_from_slice(&[0x48, 0x8B, 0x45]);
+                                        code.push(rbp_off as u8);
+                                    } else {
+                                        code.extend_from_slice(&[0x48, 0x8B, 0x85]);
+                                        code.extend_from_slice(&rbp_off.to_le_bytes());
+                                    }
+                                    // mov [rsp + struct_off], rax
+                                    if struct_off == 0 {
+                                        code.extend_from_slice(&[0x48, 0x89, 0x04, 0x24]);
+                                    } else if struct_off <= 127 {
+                                        code.extend_from_slice(&[0x48, 0x89, 0x44, 0x24]);
+                                        code.push(struct_off as u8);
+                                    } else {
+                                        code.extend_from_slice(&[0x48, 0x89, 0x84, 0x24]);
+                                        code.extend_from_slice(&struct_off.to_le_bytes());
+                                    }
+                                }
+                            }
+                            Expr::Record(_concept_name, fields) => {
+                                if fields.len() != nfields {
+                                    return Err(NativeError {
+                                        message: format!(
+                                            "slice 5.3: recursive call's Record must have {} fields (concept arity), got {}",
+                                            nfields, fields.len()
+                                        ),
+                                    });
+                                }
+                                // Evaluate each field expression in source
+                                // order; place result at the struct offset
+                                // implied by the FIELD NAME (declaration
+                                // order), not the source order.
+                                for (fname, fexpr) in fields {
+                                    let rbp_off = *offsets.get(fname.as_str()).ok_or_else(|| NativeError {
+                                        message: format!(
+                                            "slice 5.3: Record field '{}' is not a declared field of the input concept",
+                                            fname
+                                        ),
+                                    })?;
+                                    let struct_off = -rbp_off - 8;
+                                    emit_eval_expr(
+                                        code, fexpr, input_name, offsets,
+                                        all_rules, field_ranges, text_bindings,
+                                        self_call,
+                                    )?;
+                                    if struct_off == 0 {
+                                        code.extend_from_slice(&[0x48, 0x89, 0x04, 0x24]);
+                                    } else if struct_off <= 127 {
+                                        code.extend_from_slice(&[0x48, 0x89, 0x44, 0x24]);
+                                        code.push(struct_off as u8);
+                                    } else {
+                                        code.extend_from_slice(&[0x48, 0x89, 0x84, 0x24]);
+                                        code.extend_from_slice(&struct_off.to_le_bytes());
+                                    }
+                                }
+                            }
+                            other => {
+                                return Err(NativeError {
+                                    message: format!(
+                                        "slice 5.3: self-recursive call to '{}' arg must be Ident(input) or Record(input_concept, {{...}}) (got {:?})",
+                                        name, other
+                                    ),
+                                });
+                            }
+                        }
+                        // mov rdi, rsp
+                        code.extend_from_slice(&[0x48, 0x89, 0xE7]);
+                        // call <target>
+                        code.push(0xE8);
+                        let call_end = (code.len() + 4) as i32;
+                        let rel32 = ctx.target_offset - call_end;
+                        code.extend_from_slice(&rel32.to_le_bytes());
+                        // add rsp, frame_bytes
+                        if frame_bytes <= 127 {
+                            code.extend_from_slice(&[0x48, 0x83, 0xC4]);
+                            code.push(frame_bytes as u8);
+                        } else {
+                            code.extend_from_slice(&[0x48, 0x81, 0xC4]);
+                            code.extend_from_slice(&frame_bytes.to_le_bytes());
+                        }
+                        return Ok(());
                     }
+                    // Single-field path (slice 5.1a/5.1b).
                     match &args[0] {
-                        // Slice 5.1a: pass-through. Load the field slot
-                        // straight into rdi.
                         Expr::Ident(n) if n == input_name => {
                             let field_offset = *offsets.values().next().unwrap();
                             if field_offset >= -128 {
@@ -9506,53 +9709,32 @@ fn emit_eval_expr(
                                 code.extend_from_slice(&field_offset.to_le_bytes());
                             }
                         }
-                        // Slice 5.1b: Record construction at the call
-                        // site. The Record must name the input concept
-                        // (verifier checks this), and have exactly one
-                        // payload field (Number-typed). Evaluate the
-                        // field's expression into rax, then move to rdi
-                        // — the callable's prologue spills rdi to its
-                        // own field slot, so the value lands where the
-                        // body expects it.
                         Expr::Record(_concept_name, fields) => {
                             if fields.len() != 1 {
                                 return Err(NativeError {
                                     message: format!(
-                                        "slice 5.1b: recursive call's Record must have exactly 1 field (got {}); multi-field is slice 5.3",
+                                        "single-field recursive call expects Record with 1 field (got {})",
                                         fields.len()
                                     ),
                                 });
                             }
                             let (_field_name, field_expr) = &fields[0];
-                            // Evaluate field_expr → rax. The recursion
-                            // forwards self_call so a nested self-call
-                            // inside the expression (uncommon but legal)
-                            // also routes to the real-call path.
                             emit_eval_expr(
-                                code,
-                                field_expr,
-                                input_name,
-                                offsets,
-                                all_rules,
-                                field_ranges,
-                                text_bindings,
+                                code, field_expr, input_name, offsets,
+                                all_rules, field_ranges, text_bindings,
                                 self_call,
                             )?;
-                            // mov rdi, rax
-                            code.extend_from_slice(&[0x48, 0x89, 0xC7]);
+                            code.extend_from_slice(&[0x48, 0x89, 0xC7]); // mov rdi, rax
                         }
                         other => {
                             return Err(NativeError {
                                 message: format!(
-                                    "slice 5.1b: self-recursive call to '{}' arg must be Ident(input) or Record(input_concept, {{ field: expr }}) (got {:?})",
+                                    "self-recursive call to '{}' arg must be Ident(input) or Record(input_concept, {{ field: expr }}) (got {:?})",
                                     name, other
                                 ),
                             });
                         }
                     }
-                    // call <target_offset>: 0xE8 + rel32. Target is the
-                    // absolute offset of the callable's prologue; rel32 =
-                    // target - (call_instr_end_offset).
                     code.push(0xE8);
                     let call_end = (code.len() + 4) as i32;
                     let rel32 = ctx.target_offset - call_end;
@@ -23101,7 +23283,11 @@ rule odd_ish
             err.message
         );
 
-        // (c) Self-recursive multi-field → refused (slice 5.3+).
+        // (c) Self-recursive multi-field → COMPILES since slice 5.3.
+        // (Previously refused with a slice-5.3 breadcrumb.) Now the
+        // pointer-in-rdi multi-field ABI is wired; test only that
+        // compilation succeeds — runtime coverage is in
+        // `phase_a5_3_multifield_gcd_runtime` against the worked example.
         let multi_field = r#"@verbose 0.1.0
 
 concept Pair
@@ -23122,7 +23308,7 @@ rule rec
     out = if p.a == 0 then 1 else rec(p)
   proofs:
     purity:
-      reads : [p, p.a]
+      reads : [p.a]
       calls : [rec]
     termination:
       bound : 5
@@ -23130,13 +23316,9 @@ rule rec
         let tokens = crate::lexer::Lexer::new(multi_field).tokenize().unwrap();
         let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
         let out = std::env::temp_dir().join("verbosec_test_phase_a5_multifield");
-        let err = compile_native(&program, "rec", out.to_str().unwrap(), true, false)
-            .expect_err("multi-field self-recursion must be refused");
-        assert!(
-            err.message.contains("slice 5.1a") && err.message.contains("slice 5.3"),
-            "multi-field breadcrumb should point at slice 5.3: {}",
-            err.message
-        );
+        compile_native(&program, "rec", out.to_str().unwrap(), true, false)
+            .expect("multi-field self-recursion compiles in slice 5.3");
+        let _ = std::fs::remove_file(&out);
 
         // (d) Non-recursive Call — must still compile (no false positive).
         // `score` from `examples/token_classify.verbose` calls `classify`
@@ -23149,6 +23331,54 @@ rule rec
         compile_native(&program, "score", out.to_str().unwrap(), true, false)
             .expect("non-recursive Call should compile cleanly");
         let _ = std::fs::remove_file(out);
+    }
+
+    /// Phase A slice 5.3 — multi-field recursive native callable.
+    /// First Verbose binary that passes a multi-field record across
+    /// `call`/`ret` via the Option A ABI: rdi = pointer to a fields
+    /// struct laid out below the caller's rsp, one i64 per field in
+    /// declaration order. Caller marshalling is emitted at every call
+    /// site (`sub rsp, 8*nfields ; store each field ; mov rdi, rsp ;
+    /// call ; add rsp, 8*nfields`); callee prologue copies the struct
+    /// slots into rbp-relative slots so the body sees the standard
+    /// field-slot layout.
+    ///
+    /// Worked example: Euclidean GCD on a Pair concept. 4 canonical
+    /// inputs exercise the full Euclidean unwind:
+    ///   gcd(12, 8)    = 4
+    ///   gcd(100, 35)  = 5
+    ///   gcd(7, 14)    = 7  (single step: gcd(14, 7) = gcd(7, 0) = 7)
+    ///   gcd(1000, 1)  = 1
+    #[test]
+    fn phase_a5_3_multifield_gcd_runtime() {
+        use std::io::Write;
+        let src = std::fs::read_to_string("examples/gcd.verbose")
+            .expect("examples/gcd.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+        let out = std::env::temp_dir().join("verbosec_test_phase_a5_3_gcd");
+        compile_native(&program, "gcd", out.to_str().unwrap(), true, false)
+            .expect("multi-field recursive rule must compile");
+
+        let run = |input: &str| -> String {
+            let mut child = std::process::Command::new(&out)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .expect("spawn gcd");
+            child.stdin.as_mut().unwrap().write_all(input.as_bytes()).unwrap();
+            drop(child.stdin.take());
+            let r = child.wait_with_output().expect("wait gcd");
+            assert!(r.status.success(), "gcd({}) must exit 0; got {:?}", input.trim(), r.status);
+            String::from_utf8_lossy(&r.stdout).trim().to_string()
+        };
+
+        assert_eq!(run("12 8\n"),    "4");
+        assert_eq!(run("100 35\n"),  "5");
+        assert_eq!(run("7 14\n"),    "7");
+        assert_eq!(run("1000 1\n"),  "1");
+        let _ = std::fs::remove_file(&out);
     }
 
     /// Phase A slice 5.2 — text return from a recursive native callable.
