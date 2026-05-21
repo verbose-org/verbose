@@ -52,6 +52,26 @@ pub fn emit_rust(program: &Program) -> String {
                     c.name, c.intention, c.host, c.port, c.max_response
                 ));
             }
+            Item::ConceptGroup(g) => {
+                // Phase B slice 1: concept groups are parser+verifier
+                // only. The Rust transpiler does not yet model
+                // recursive types (arena layout / index references
+                // land in slice B.4+). Emit a header comment listing
+                // the group and its members so the file stays
+                // coherent; rules attempting to consume a group type
+                // are refused by the verifier (see
+                // refuse_rule_using_group_type) and would not reach
+                // codegen.
+                let inner: Vec<&str> = g.concepts.iter().map(|c| c.name.as_str()).collect();
+                out.push_str(&format!(
+                    "// ConceptGroup: {} — \"{}\" [max_depth {}, max_nodes {}] members: {} (not transpiled; recursive types are Phase B slice 4+)\n",
+                    g.name,
+                    g.intention,
+                    g.max_depth,
+                    g.max_nodes,
+                    inner.join(", ")
+                ));
+            }
         }
     }
     out.push('\n');

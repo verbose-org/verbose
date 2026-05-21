@@ -34,6 +34,82 @@ pub enum Item {
     /// filesystem reads. No DNS, no TLS, no keep-alive in slice 1: the
     /// surface stays narrow on purpose.
     Connection(Connection),
+    /// Phase B slice 1: a group of mutually-recursive sum-type concepts
+    /// sharing a single set of `[max_depth: N, max_nodes: M]` bounds.
+    ///
+    /// The group is the AST-level analogue of a strongly-connected
+    /// component in the type graph: every concept inside may reference
+    /// every other concept in the same group via `Type::Named(...)`
+    /// inside variant payloads, and cycles between them are EXPECTED
+    /// (that's the whole point of the construct). Bounds apply to the
+    /// combined tree shape across all concepts in the group, not
+    /// per-concept — see docs/recursive-types-design.md §3.2 / §4.
+    ///
+    /// In B.1 this is parser+verifier-only: a program that contains a
+    /// `ConceptGroup` plus a rule whose input/output references a
+    /// concept inside it is refused at verify time with a clear
+    /// breadcrumb pointing at slice B.3+. Native and codegen also
+    /// refuse with a forward-looking message; the optimizer passes
+    /// through unchanged.
+    ConceptGroup(ConceptGroup),
+}
+
+/// Phase B slice 1: a mutually-recursive concept group.
+///
+/// Carries the shared `[max_depth, max_nodes]` SCC bounds and the
+/// sequence of inner concepts. Inner concepts use the same `Concept`
+/// shape as top-level concepts so the existing variant / field / type
+/// parsing machinery applies unchanged; the only difference is that
+/// `Type::Named(N)` references inside their variants may resolve to
+/// other concepts in the SAME group (intra-group recursion). Top-level
+/// concept declarations remain non-recursive — the verifier rejects
+/// self-reference and cross-concept reference outside a group.
+#[derive(Debug, Clone)]
+pub struct ConceptGroup {
+    pub name: String,
+    pub intention: String,
+    pub source: SourceRef,
+    /// Maximum recursion depth across all concepts in the group. Bounded
+    /// to `(0, 65535]` by the verifier — large enough for real ASTs,
+    /// small enough that index arithmetic stays within 16 bits when the
+    /// node count also fits (see docs/recursive-types-design.md §6 +
+    /// Q2). The slice-1 verifier check is purely sanity (positive and
+    /// not absurd); the actual depth-bound emitter wiring lands in
+    /// Phase B.4+.
+    pub max_depth: u32,
+    /// Maximum total node count across all concepts in the group. Same
+    /// cap as `max_depth`: `(0, 65535]` in slice 1 so 16-bit indices
+    /// always suffice. The cap is the only verifier exploitation in
+    /// B.1; arena sizing follows in B.4+.
+    pub max_nodes: u32,
+    /// The concepts that compose the group, in declaration order. Each
+    /// is a `Concept` with `variants:` (record-shape concepts inside a
+    /// group are refused by the verifier — a group exists to carry sum
+    /// types). Field references inside variant payloads may resolve to
+    /// other concepts in the SAME group (intra-group recursion); cross-
+    /// group references are refused in B.1.
+    pub concepts: Vec<Concept>,
+}
+
+/// Phase B slice 1: iterate every `Concept` declared in a program,
+/// whether at top level (`Item::Concept`) or nested inside a
+/// `ConceptGroup`. Consumers that need the FULL concept namespace
+/// (verifier name resolution, codegen, optimizer field-range collection,
+/// native concept lookup, wasm concept lookup, …) should use this
+/// helper rather than filtering for `Item::Concept` alone — otherwise
+/// concepts inside a group are silently invisible.
+///
+/// Returns concepts in source order: top-level concepts and group
+/// concepts interleaved in the order they appear in `items`, with each
+/// group's inner concepts following the group declaration itself.
+pub fn iter_all_concepts(items: &[Item]) -> impl Iterator<Item = &Concept> {
+    items.iter().flat_map(|it| -> Box<dyn Iterator<Item = &Concept>> {
+        match it {
+            Item::Concept(c) => Box::new(std::iter::once(c)),
+            Item::ConceptGroup(g) => Box::new(g.concepts.iter()),
+            _ => Box::new(std::iter::empty()),
+        }
+    })
 }
 
 /// Phase 11 slice 1: a declared outbound TCP destination. Mirrors the

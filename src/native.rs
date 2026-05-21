@@ -124,6 +124,22 @@ fn compile_native_code(
     stdin: bool,
     stream: bool,
 ) -> Result<Vec<u8>, NativeError> {
+    // Phase B slice 1: native lowering for `concept_group` is Phase B
+    // slice 4+ (arena allocation in the rbp frame + 16-bit index
+    // references — see docs/recursive-types-design.md §6). Refuse here
+    // with a clear breadcrumb so an operator who tries to compile a
+    // program with recursive types sees the right milestone name.
+    if let Some(g) = program.items.iter().find_map(|i| match i {
+        Item::ConceptGroup(g) => Some(g),
+        _ => None,
+    }) {
+        return Err(NativeError {
+            message: format!(
+                "native lowering for concept_group ('{}') is Phase B slice 4+; use --run after slice 3 ships",
+                g.name
+            ),
+        });
+    }
     // (Extracted from compile_native — same dispatch logic.)
     let concepts: Vec<&Concept> = program.items.iter().filter_map(|i| match i { Item::Concept(c) => Some(c), _ => None }).collect();
     let rules: HashMap<&str, &Rule> = program.items.iter().filter_map(|i| match i { Item::Rule(r) => Some((r.name.as_str(), r)), _ => None }).collect();
