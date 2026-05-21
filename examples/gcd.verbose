@@ -1,0 +1,54 @@
+@verbose 0.1.0
+
+-- Phase A slice 5.3 worked example: Euclidean GCD as a multi-field
+-- recursive native callable. First Verbose binary that passes a
+-- multi-field record across `call`/`ret` via the Option A ABI
+-- (rdi = pointer to a 2-slot fields struct laid out below caller's rsp).
+--
+-- The compiler emits all marshalling at the call site:
+--   sub rsp, 16
+--   mov rax, <p.b value> ; mov [rsp + 0], rax    ; new a := p.b
+--   mov rax, <p.a % p.b> ; mov [rsp + 8], rax    ; new b := p.a % p.b
+--   mov rdi, rsp
+--   call <gcd_label>
+--   add rsp, 16
+-- The pointer in rdi is invisible to the .verbose source — there is
+-- no syntax for &x, *p, casts, or arithmetic on it. It exists only
+-- as an ABI artifact between caller and callee, lifetime bounded by
+-- the call/ret pair (caller `sub rsp` allocates, callee reads, caller
+-- `add rsp` frees on return). No first-class pointers in the language.
+--
+-- Bounds: a, b ∈ [0, 1000] both runtime-clamped. Recursion depth is
+-- bounded by the number of Euclidean steps, which is O(log(min(a, b)))
+-- — at most ~15 for 1000-bounded inputs. Linux's 8 MiB stack has
+-- orders of magnitude of headroom.
+
+
+concept Pair
+  @intention: "A pair of two non-negative integers"
+  @source: gcd.intent:1
+
+  fields:
+    a : number [0, 1000]
+    b : number [0, 1000]
+
+
+rule gcd
+  @intention: "Euclidean GCD: gcd(a, 0) = a; gcd(a, b) = gcd(b, a mod b)"
+  @source: gcd.intent:2
+
+  input:
+    p : Pair
+
+  output:
+    out : number
+
+  logic:
+    out = if p.b == 0 then p.a else gcd(Pair { a: p.b, b: p.a % p.b })
+
+  proofs:
+    purity:
+      reads   : [p.a, p.b]
+      calls   : [gcd]
+    termination:
+      bound : 100

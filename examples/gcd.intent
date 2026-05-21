@@ -1,0 +1,2 @@
+1. A pair holds two non-negative integers, each between 0 and 1000.
+2. To compute the greatest common divisor of a pair: when the second integer is 0 the result is the first integer; otherwise the result is the gcd of the pair carrying the second integer paired with the first modulo the second.
