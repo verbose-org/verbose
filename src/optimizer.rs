@@ -149,6 +149,16 @@ pub fn optimize_program(program: &Program) -> (Program, OptStats) {
                 // request bytes live inside the rule's logic and are
                 // optimised through `optimize_expr` like any other Expr.
                 Item::Connection(c) => Item::Connection(c.clone()),
+                // Phase B slice 1 stub: a concept_group is a declarative
+                // type container with no expressions to optimise. The
+                // optimizer treats it the same as a single Concept —
+                // pass through unchanged. Field-range collection
+                // (`concept_field_ranges`) already operates on top-level
+                // concepts only; rules using group concepts are refused
+                // by the verifier before reaching the optimizer, so the
+                // optimizer never has to resolve a group-internal field
+                // type today.
+                Item::ConceptGroup(g) => Item::ConceptGroup(g.clone()),
             })
             .collect(),
     };

@@ -40,7 +40,9 @@ impl Parser {
 
         let mut items = Vec::new();
         while !self.at_eof() {
-            if self.check_ident("concept") {
+            if self.check_ident("concept_group") {
+                items.push(Item::ConceptGroup(self.parse_concept_group()?));
+            } else if self.check_ident("concept") {
                 items.push(Item::Concept(self.parse_concept()?));
             } else if self.check_ident("rule") {
                 items.push(Item::Rule(self.parse_rule()?));
@@ -53,10 +55,136 @@ impl Parser {
             } else if self.check_ident("connection") {
                 items.push(Item::Connection(self.parse_connection()?));
             } else {
-                return Err(self.error("expected 'concept', 'rule', 'reaction', 'service', 'resource', or 'connection' at top level"));
+                return Err(self.error("expected 'concept', 'concept_group', 'rule', 'reaction', 'service', 'resource', or 'connection' at top level"));
             }
         }
         Ok(Program { version, uses, items })
+    }
+
+    /// Phase B slice 1: parse a `concept_group` block.
+    ///
+    /// Grammar:
+    /// ```
+    /// concept_group <Name> [max_depth: <N>, max_nodes: <M>]
+    ///   @intention: "..."
+    ///   @source: file.intent:NN
+    ///
+    ///   concept Foo
+    ///     ...
+    ///   concept Bar
+    ///     ...
+    /// ```
+    ///
+    /// `max_depth` and `max_nodes` are declared in a single bracketed
+    /// header on the same physical line as `concept_group <Name>`. Both
+    /// are required; the order is fixed (depth then nodes) so the
+    /// auditor never has to guess which bound is which. Inside the
+    /// indented body, after the standard `@intention` / `@source`
+    /// attributes, one or more `concept` blocks declare the sum types
+    /// that compose the group; we reuse `parse_concept` so the variant
+    /// syntax inside is byte-for-byte identical to a top-level concept.
+    fn parse_concept_group(&mut self) -> Result<ConceptGroup, ParseError> {
+        self.expect_ident("concept_group")?;
+        let name = self.expect_ident_any()?;
+
+        // Header bounds: `[max_depth: <N>, max_nodes: <M>]`. Required.
+        // Order is fixed for predictable audit reading; the verifier
+        // bounds-checks the values, the parser just enforces shape.
+        self.expect_kind(TokenKind::LBracket)?;
+        self.expect_ident("max_depth")?;
+        self.expect_kind(TokenKind::Colon)?;
+        let depth_raw = self.expect_number()?;
+        if depth_raw < 0 {
+            return Err(self.error(&format!(
+                "concept_group '{}' max_depth must be non-negative, got {}",
+                name, depth_raw
+            )));
+        }
+        if depth_raw > u32::MAX as i64 {
+            return Err(self.error(&format!(
+                "concept_group '{}' max_depth {} exceeds u32 range",
+                name, depth_raw
+            )));
+        }
+        let max_depth = depth_raw as u32;
+        self.expect_kind(TokenKind::Comma)?;
+        self.expect_ident("max_nodes")?;
+        self.expect_kind(TokenKind::Colon)?;
+        let nodes_raw = self.expect_number()?;
+        if nodes_raw < 0 {
+            return Err(self.error(&format!(
+                "concept_group '{}' max_nodes must be non-negative, got {}",
+                name, nodes_raw
+            )));
+        }
+        if nodes_raw > u32::MAX as i64 {
+            return Err(self.error(&format!(
+                "concept_group '{}' max_nodes {} exceeds u32 range",
+                name, nodes_raw
+            )));
+        }
+        let max_nodes = nodes_raw as u32;
+        self.expect_kind(TokenKind::RBracket)?;
+        self.expect_kind(TokenKind::Newline)?;
+        self.expect_kind(TokenKind::Indent)?;
+
+        let mut intention: Option<String> = None;
+        let mut source: Option<SourceRef> = None;
+        let mut concepts: Vec<Concept> = Vec::new();
+
+        while !self.check_kind(&TokenKind::Dedent) && !self.at_eof() {
+            if let Some(attr) = self.peek_attribute_name() {
+                match attr.as_str() {
+                    "intention" => {
+                        self.advance();
+                        self.expect_kind(TokenKind::Colon)?;
+                        intention = Some(self.expect_string()?);
+                        self.expect_kind(TokenKind::Newline)?;
+                    }
+                    "source" => {
+                        self.advance();
+                        self.expect_kind(TokenKind::Colon)?;
+                        source = Some(self.parse_source_ref()?);
+                        self.expect_kind(TokenKind::Newline)?;
+                    }
+                    other => {
+                        return Err(self.error(&format!(
+                            "unknown attribute '@{}' in concept_group (allowed: @intention, @source)",
+                            other
+                        )));
+                    }
+                }
+            } else if self.check_ident("concept") {
+                concepts.push(self.parse_concept()?);
+            } else {
+                return Err(self.error(
+                    "expected attribute or 'concept ...' block in concept_group body",
+                ));
+            }
+        }
+        self.expect_kind(TokenKind::Dedent)?;
+
+        let intention = intention.ok_or_else(|| {
+            self.error(&format!("concept_group '{}' missing @intention", name))
+        })?;
+        let source = source.ok_or_else(|| {
+            self.error(&format!("concept_group '{}' missing @source", name))
+        })?;
+        if concepts.is_empty() {
+            return Err(self.error(&format!(
+                "concept_group '{}' is empty — declare at least one concept inside",
+                name
+            )));
+        }
+
+        Ok(ConceptGroup {
+            name,
+            intention,
+            source,
+            max_depth,
+            max_nodes,
+            concepts,
+        })
     }
 
     fn parse_version_directive(&mut self) -> Result<Version, ParseError> {

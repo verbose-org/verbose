@@ -171,11 +171,10 @@ fn main() {
     let show_stats = args.iter().any(|a| a == "--stats");
     let (program, opt_stats) = optimizer::optimize_program(&program);
 
-    let n_concepts = program
-        .items
-        .iter()
-        .filter(|i| matches!(i, ast::Item::Concept(_)))
-        .count();
+    // Count every concept the program declares, including those nested
+    // inside a `concept_group`. The `iter_all_concepts` helper centralises
+    // this discipline so consumers don't silently miss group concepts.
+    let n_concepts = ast::iter_all_concepts(&program.items).count();
     let n_rules = program
         .items
         .iter()
@@ -781,6 +780,14 @@ fn resolve_imports(mut program: ast::Program, base_dir: &Path) -> ast::Program {
                 // connections re-exported via modules will need source
                 // rewriting in a later slice.
                 ast::Item::Connection(_) => {}
+                // Phase B slice 1 stub: re-export of a concept_group
+                // through a module needs to rewrite the group's @source
+                // AND every inner concept's @source. Modules can't yet
+                // import group types (rules referencing them are
+                // refused by the verifier), so leave it unwired today
+                // and revisit when slice B.3 ships the interpreter
+                // path.
+                ast::Item::ConceptGroup(_) => {}
             }
         }
 

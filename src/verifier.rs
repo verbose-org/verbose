@@ -66,6 +66,34 @@ pub fn verify_program(program: &Program, base_dir: &StdPath) -> Vec<VerifyError>
         concepts.insert(c.name.clone(), c);
     }
 
+    // Phase B slice 1: concepts declared inside a `concept_group` share
+    // the program-wide concept namespace. Register them here so name
+    // collisions with top-level concepts are caught and so downstream
+    // references can resolve them. We also record each group concept's
+    // owning group so the rule check below can refuse a rule that uses
+    // a group concept as its input/output (lifts in slice B.3).
+    let mut group_concept_owner: HashMap<String, String> = HashMap::new();
+    for item in &program.items {
+        if let Item::ConceptGroup(g) = item {
+            for c in &g.concepts {
+                if concepts.contains_key(&c.name) {
+                    errors.push(VerifyError {
+                        context: format!(
+                            "concept_group '{}' / concept '{}'",
+                            g.name, c.name
+                        ),
+                        message: format!(
+                            "concept name '{}' collides with another concept (top-level or in a different group)",
+                            c.name
+                        ),
+                    });
+                }
+                group_concept_owner.insert(c.name.clone(), g.name.clone());
+                concepts.insert(c.name.clone(), c);
+            }
+        }
+    }
+
     let all_rules: Vec<&Rule> = program
         .items
         .iter()
@@ -118,7 +146,18 @@ pub fn verify_program(program: &Program, base_dir: &StdPath) -> Vec<VerifyError>
     for item in &program.items {
         match item {
             Item::Concept(c) => verify_concept(c, base_dir, &mut errors),
+            Item::ConceptGroup(g) => {
+                verify_concept_group(g, &group_concept_owner, base_dir, &mut errors);
+            }
             Item::Rule(r) => {
+                // Phase B slice 1: rules cannot yet reference a concept
+                // declared inside a `concept_group` from their input or
+                // output. The interpreter / native / wasm paths for
+                // group-typed values land in slice B.3+ (interpreter) and
+                // B.4+ (native). Refuse here with a forward-looking
+                // breadcrumb so the auditor never has a binary that
+                // partially supports recursive types.
+                refuse_rule_using_group_type(r, &group_concept_owner, &mut errors);
                 verify_rule(r, &concepts, &all_rules, &all_resources, &all_connections, base_dir, &mut errors);
                 // Phase 9 slice 1: every read(name) in the rule's logic
                 // must resolve to a declared resource. This is a separate
@@ -1299,6 +1338,274 @@ fn verify_concept(c: &Concept, base_dir: &StdPath, errors: &mut Vec<VerifyError>
             message: msg,
         });
     }
+}
+
+/// Phase B slice 1: bounds ceiling on `max_depth` and `max_nodes`. Picked
+/// at 65535 (16-bit) so the future arena-emitter (B.4+) can use 16-bit
+/// indices unconditionally — see docs/recursive-types-design.md §6 / Q2.
+/// The actual emitter exploitation lands in B.4; B.1 just refuses
+/// declarations that would later force a wider index width.
+const PHASE_B1_MAX_BOUND: u32 = 65535;
+
+/// Phase B slice 1: verify a `concept_group` block. Checks the @source
+/// ref, the `max_depth` / `max_nodes` bounds, and the inner concepts'
+/// well-formedness:
+///   - every inner concept must be a sum-type (non-empty `variants`);
+///     record-shape concepts (with `fields`) belong at top level — a
+///     group exists to carry mutually-recursive sum types
+///   - every `Type::Named(N)` inside a variant payload must resolve to
+///     either a primitive type, another concept in the SAME group, or
+///     a top-level concept; cross-group references are refused in B.1
+///   - cycles within the group are EXPECTED — they are the whole point
+///     of a `concept_group`, not refused
+fn verify_concept_group(
+    g: &ConceptGroup,
+    group_concept_owner: &HashMap<String, String>,
+    base_dir: &StdPath,
+    errors: &mut Vec<VerifyError>,
+) {
+    if let Err(msg) = verify_source_ref(&g.source, base_dir) {
+        errors.push(VerifyError {
+            context: format!("concept_group '{}' / @source", g.name),
+            message: msg,
+        });
+    }
+
+    if g.max_depth == 0 {
+        errors.push(VerifyError {
+            context: format!("concept_group '{}' / max_depth", g.name),
+            message: "max_depth must be greater than zero — a recursive tree must allow at least one level".into(),
+        });
+    }
+    if g.max_depth > PHASE_B1_MAX_BOUND {
+        errors.push(VerifyError {
+            context: format!("concept_group '{}' / max_depth", g.name),
+            message: format!(
+                "max_depth {} exceeds the slice-1 ceiling of {} (16-bit index budget — see docs/recursive-types-design.md §6 / Q2)",
+                g.max_depth, PHASE_B1_MAX_BOUND
+            ),
+        });
+    }
+    if g.max_nodes == 0 {
+        errors.push(VerifyError {
+            context: format!("concept_group '{}' / max_nodes", g.name),
+            message: "max_nodes must be greater than zero — a recursive tree must allow at least one node".into(),
+        });
+    }
+    if g.max_nodes > PHASE_B1_MAX_BOUND {
+        errors.push(VerifyError {
+            context: format!("concept_group '{}' / max_nodes", g.name),
+            message: format!(
+                "max_nodes {} exceeds the slice-1 ceiling of {} (16-bit index budget — see docs/recursive-types-design.md §6 / Q2)",
+                g.max_nodes, PHASE_B1_MAX_BOUND
+            ),
+        });
+    }
+
+    // Build the set of concept names this group owns. Used to admit
+    // intra-group references in variant payloads (the recursive ones).
+    let in_group: HashSet<&str> = g.concepts.iter().map(|c| c.name.as_str()).collect();
+
+    for c in &g.concepts {
+        // Walk @source on inner concepts too — same audit trail.
+        if let Err(msg) = verify_source_ref(&c.source, base_dir) {
+            errors.push(VerifyError {
+                context: format!(
+                    "concept_group '{}' / concept '{}' / @source",
+                    g.name, c.name
+                ),
+                message: msg,
+            });
+        }
+
+        // Slice 1: every concept in a group must be a sum type. A
+        // record-shape concept lives at the top level — a group exists
+        // to carry sum types whose variants compose recursively. The
+        // parser already forbids `concept Foo` with neither `fields:`
+        // nor `variants:` (concept_must_have_one_shape), so a non-empty
+        // `fields` here is the only failure mode.
+        if !c.fields.is_empty() {
+            errors.push(VerifyError {
+                context: format!(
+                    "concept_group '{}' / concept '{}'",
+                    g.name, c.name
+                ),
+                message: format!(
+                    "concept '{}' in concept_group '{}' must be a sum type (use `variants:`, not `fields:`); record concepts belong at top level",
+                    c.name, g.name
+                ),
+            });
+            continue;
+        }
+        if c.variants.is_empty() {
+            // Defensive — parser forbids this today, but guard so the
+            // walk below doesn't silently pass an empty concept.
+            errors.push(VerifyError {
+                context: format!(
+                    "concept_group '{}' / concept '{}'",
+                    g.name, c.name
+                ),
+                message: format!(
+                    "concept '{}' in concept_group '{}' must declare at least one variant",
+                    c.name, g.name
+                ),
+            });
+            continue;
+        }
+
+        // For each variant, validate type references in payload fields.
+        // Intra-group: OK (recursive). Cross-group: refused in B.1.
+        // Top-level concept: OK (the group consumes a sibling, no cycle
+        // through the group walls). Primitives: OK.
+        for variant in &c.variants {
+            for field in &variant.fields {
+                check_group_payload_type(
+                    g,
+                    c,
+                    variant,
+                    field,
+                    &field.ty,
+                    &in_group,
+                    group_concept_owner,
+                    errors,
+                );
+            }
+        }
+    }
+}
+
+/// Phase B slice 1: helper for `verify_concept_group`. Walks a variant
+/// payload field's type and refuses cross-group references with a clear
+/// breadcrumb. Other shapes (primitives, `Type::Result(...)`,
+/// `Type::Collection(...)`) pass through — they'll be re-validated by
+/// the existing rule-level type checker when a rule eventually consumes
+/// the value, which is slice B.3+.
+fn check_group_payload_type(
+    g: &ConceptGroup,
+    c: &Concept,
+    variant: &Variant,
+    field: &Field,
+    ty: &Type,
+    in_group: &HashSet<&str>,
+    group_concept_owner: &HashMap<String, String>,
+    errors: &mut Vec<VerifyError>,
+) {
+    match ty {
+        Type::Named(n) => {
+            // Intra-group reference: the recursive case. Always OK.
+            if in_group.contains(n.as_str()) {
+                return;
+            }
+            // Cross-group reference: refused in B.1. Cross-group
+            // recursion needs a verifier strategy for the SCC bound,
+            // which is a later slice.
+            if let Some(other_group) = group_concept_owner.get(n) {
+                if other_group != &g.name {
+                    errors.push(VerifyError {
+                        context: format!(
+                            "concept_group '{}' / concept '{}' / variant '{}' / field '{}'",
+                            g.name, c.name, variant.name, field.name
+                        ),
+                        message: format!(
+                            "field type '{}' refers to a concept in a DIFFERENT concept_group ('{}') — cross-group references are not supported until a later slice",
+                            n, other_group
+                        ),
+                    });
+                    return;
+                }
+            }
+            // Otherwise it's a top-level concept (or undeclared);
+            // we leave the existence check to the standard concept-
+            // resolution pass that fires when a rule consumes the
+            // value. B.1 is parser + verifier only and rules cannot
+            // reference group concepts yet, so the dangling-reference
+            // case shows up the moment B.3 wires the interpreter.
+        }
+        Type::Result(t, e) => {
+            check_group_payload_type(g, c, variant, field, t, in_group, group_concept_owner, errors);
+            check_group_payload_type(g, c, variant, field, e, in_group, group_concept_owner, errors);
+        }
+        // Collection(inner) where inner is the name of a type. For
+        // intra-group recursion via `collection(Foo)` we'd need
+        // payload-level recursion through a list — the design doc
+        // ships it as `list<T> [..N]` and we deliberately defer to
+        // slice B.1b. Today we don't refuse it (a `collection(T)`
+        // referring to a group concept would surface again when a
+        // rule consumes the value), but flag a clear breadcrumb if
+        // it does point at the same group so the deferral is loud.
+        Type::Collection(inner) => {
+            if in_group.contains(inner.as_str()) {
+                errors.push(VerifyError {
+                    context: format!(
+                        "concept_group '{}' / concept '{}' / variant '{}' / field '{}'",
+                        g.name, c.name, variant.name, field.name
+                    ),
+                    message: format!(
+                        "collection({}) of a group-internal concept is deferred to slice B.1b; declare a non-collection field for now",
+                        inner
+                    ),
+                });
+            }
+        }
+        // Primitives — nothing to validate here.
+        Type::Number | Type::Bool | Type::Text | Type::Bytes => {}
+    }
+}
+
+/// Phase B slice 1: refuse a rule whose `input:` or `output:` (or
+/// transitively, `context:`) references a concept declared inside a
+/// `concept_group`. The interpreter / native / wasm code paths for
+/// group-typed values do not exist yet — interpreter lands in B.3,
+/// native in B.4+. Refusing here keeps the slice honest: a program
+/// with a `concept_group` can compile a non-group rule fine, but the
+/// moment a rule tries to consume a group value the verifier names
+/// the slice that will lift the restriction.
+fn refuse_rule_using_group_type(
+    rule: &Rule,
+    group_concept_owner: &HashMap<String, String>,
+    errors: &mut Vec<VerifyError>,
+) {
+    let mut check_ty = |label: &str, ty: &Type| {
+        let referenced = group_concept_name(ty);
+        for name in referenced {
+            if let Some(group_name) = group_concept_owner.get(name) {
+                errors.push(VerifyError {
+                    context: format!("rule '{}' / {}", rule.name, label),
+                    message: format!(
+                        "rule '{}' uses a concept_group type ('{}' in group '{}') — Phase B slice 3+ wires recursive types through rules; use --run only when that ships",
+                        rule.name, name, group_name
+                    ),
+                });
+            }
+        }
+    };
+    check_ty("input", &rule.input_ty);
+    check_ty("output", &rule.output_ty);
+    if let Some(ctx_ty) = &rule.context_ty {
+        check_ty("context", ctx_ty);
+    }
+}
+
+/// Phase B slice 1: collect every `Type::Named` name referenced by a
+/// type. Returns a Vec of borrowed names from the type tree (no clones
+/// during the walk). Used by `refuse_rule_using_group_type` — we want
+/// every concept name a type mentions, not just the top-level one, so
+/// `Result(Stmt, text)` is flagged the same way as `Stmt`.
+fn group_concept_name(ty: &Type) -> Vec<&str> {
+    let mut out = Vec::new();
+    fn walk<'a>(ty: &'a Type, out: &mut Vec<&'a str>) {
+        match ty {
+            Type::Named(n) => out.push(n.as_str()),
+            Type::Collection(n) => out.push(n.as_str()),
+            Type::Result(t, e) => {
+                walk(t, out);
+                walk(e, out);
+            }
+            Type::Number | Type::Bool | Type::Text | Type::Bytes => {}
+        }
+    }
+    walk(ty, &mut out);
+    out
 }
 
 fn verify_rule(
@@ -5135,5 +5442,200 @@ rule bad
             errs.iter().any(|e| e.message.contains("Pair::Two") && e.message.contains("binds 'x' twice")),
             "(h) duplicate binder should be rejected: {:#?}", errs
         );
+    }
+
+    // ── Phase B slice 1 — concept_group declaration ─────────────────
+    //
+    // A `concept_group` declares mutually-recursive sum-type concepts
+    // sharing a single set of `[max_depth, max_nodes]` bounds. Slice 1
+    // is parser + verifier only: the construct is accepted at the top
+    // level, refused inside a rule that consumes it, and rejected when
+    // its bounds are absurd. See docs/recursive-types-design.md §4 / §5.
+
+    const VALID_GROUP_SRC: &str = r#"@verbose 0.1.0
+
+concept_group AST [max_depth: 30, max_nodes: 5000]
+  @intention: "a tiny AST"
+  @source: invoices.intent:1
+
+  concept Expr
+    @intention: "an expression"
+    @source: invoices.intent:1
+    variants:
+      Int    of (value : number)
+      Binary of (op : text, lhs : Expr, rhs : Expr)
+
+  concept Stmt
+    @intention: "a statement"
+    @source: invoices.intent:1
+    variants:
+      Return of (e : Expr)
+      Skip
+"#;
+
+    #[test]
+    fn phase_b1_concept_group_parses() {
+        // Confirms the parser materialises a `ConceptGroup` with the
+        // declared header bounds and the inner concepts in source
+        // order. No verifier interaction — just the AST shape.
+        let tokens = crate::lexer::Lexer::new(VALID_GROUP_SRC).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+        let group = program.items.iter().find_map(|it| match it {
+            Item::ConceptGroup(g) => Some(g),
+            _ => None,
+        }).expect("expected a ConceptGroup item");
+        assert_eq!(group.name, "AST");
+        assert_eq!(group.max_depth, 30);
+        assert_eq!(group.max_nodes, 5000);
+        assert_eq!(group.concepts.len(), 2);
+        assert_eq!(group.concepts[0].name, "Expr");
+        assert_eq!(group.concepts[1].name, "Stmt");
+        // Inner concepts must be sum-typed.
+        assert!(group.concepts[0].fields.is_empty());
+        assert_eq!(group.concepts[0].variants.len(), 2);
+        // The recursive Binary variant references Expr in its payload.
+        let binary = &group.concepts[0].variants[1];
+        assert_eq!(binary.name, "Binary");
+        assert!(matches!(binary.fields[1].ty, Type::Named(ref n) if n == "Expr"));
+    }
+
+    #[test]
+    fn phase_b1_concept_group_verifies() {
+        // A well-formed group with no consuming rule must verify clean.
+        let errs = verify_str(VALID_GROUP_SRC);
+        assert!(
+            errs.is_empty(),
+            "expected no verify errors on a valid concept_group, got {:#?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn phase_b1_rejects_zero_max_depth() {
+        let src = r#"@verbose 0.1.0
+
+concept_group AST [max_depth: 0, max_nodes: 100]
+  @intention: "x"
+  @source: invoices.intent:1
+
+  concept Expr
+    @intention: "e"
+    @source: invoices.intent:1
+    variants:
+      Int of (n : number)
+"#;
+        let errs = verify_str(src);
+        assert!(
+            errs.iter().any(|e| e.context.contains("max_depth")
+                && e.message.contains("greater than zero")),
+            "expected max_depth=0 rejection, got {:#?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn phase_b1_rejects_zero_max_nodes() {
+        let src = r#"@verbose 0.1.0
+
+concept_group AST [max_depth: 10, max_nodes: 0]
+  @intention: "x"
+  @source: invoices.intent:1
+
+  concept Expr
+    @intention: "e"
+    @source: invoices.intent:1
+    variants:
+      Int of (n : number)
+"#;
+        let errs = verify_str(src);
+        assert!(
+            errs.iter().any(|e| e.context.contains("max_nodes")
+                && e.message.contains("greater than zero")),
+            "expected max_nodes=0 rejection, got {:#?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn phase_b1_rejects_max_nodes_over_65535() {
+        // Verifier refuses node counts past 16-bit so the future
+        // arena emitter can use 16-bit indices unconditionally
+        // (docs/recursive-types-design.md §6 / Q2).
+        let src = r#"@verbose 0.1.0
+
+concept_group AST [max_depth: 10, max_nodes: 100000]
+  @intention: "x"
+  @source: invoices.intent:1
+
+  concept Expr
+    @intention: "e"
+    @source: invoices.intent:1
+    variants:
+      Int of (n : number)
+"#;
+        let errs = verify_str(src);
+        assert!(
+            errs.iter().any(|e| e.context.contains("max_nodes")
+                && e.message.contains("16-bit")),
+            "expected max_nodes=100000 rejection with 16-bit breadcrumb, got {:#?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn phase_b1_rule_using_group_type_refused() {
+        // A rule whose input or output is a concept declared inside a
+        // concept_group is refused at verify time. Slice B.3 wires the
+        // interpreter; slice B.4+ wires native. The breadcrumb must
+        // name slice 3+ so an operator knows which milestone unlocks
+        // the path.
+        let src = r#"@verbose 0.1.0
+
+concept_group AST [max_depth: 5, max_nodes: 50]
+  @intention: "x"
+  @source: invoices.intent:1
+
+  concept Expr
+    @intention: "e"
+    @source: invoices.intent:1
+    variants:
+      Int of (n : number)
+
+rule bad
+  @intention: "y"
+  @source: invoices.intent:1
+  input:
+    e : Expr
+  output:
+    n : number
+  logic:
+    n = 0
+  proofs:
+    purity:
+      reads : []
+      calls : []
+    termination:
+      bound : 1
+"#;
+        let errs = verify_str(src);
+        assert!(
+            errs.iter().any(|e| e.message.contains("concept_group type")
+                && e.message.contains("Phase B slice 3+")),
+            "expected rule-using-group-type rejection naming slice 3+, got {:#?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn phase_b1_iter_all_concepts_includes_group_concepts() {
+        // The `iter_all_concepts` helper must surface concepts declared
+        // inside a concept_group; otherwise downstream consumers
+        // (name-resolution, codegen, optimizer) would silently treat
+        // group concepts as undeclared.
+        let tokens = crate::lexer::Lexer::new(VALID_GROUP_SRC).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+        let names: Vec<&str> = iter_all_concepts(&program.items).map(|c| c.name.as_str()).collect();
+        assert!(names.contains(&"Expr"), "expected Expr in iter, got {:?}", names);
+        assert!(names.contains(&"Stmt"), "expected Stmt in iter, got {:?}", names);
     }
 }
