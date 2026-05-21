@@ -175,37 +175,60 @@ fn compile_native_code(
     // Reactions are checked against their trigger rule's call graph
     // (the reaction itself doesn't recurse, but its trigger might).
     let recursion_witness = detect_native_recursion(rule, &rules);
+    // Computed lazily: the SCC (set of rules in the same cycle as entry).
+    // For single self-recursion, scc = [entry]. For mutual (slice 5.4+),
+    // scc holds every rule in the cycle.
+    let mut scc_rules_owned: Vec<&Rule> = Vec::new();
     if let Some(cycle) = &recursion_witness {
-        // Refuse anything that's not direct self-recursion in slice 5.1a.
-        // A mutually-recursive cycle has the witness equal to the entry
-        // rule too (DFS marks the entry on its stack); distinguish by
-        // looking at the rule's direct callees.
-        let mut direct_callees: Vec<String> = Vec::new();
-        for (_, e) in &rule.logic.bindings {
-            collect_native_callees(e, &mut direct_callees);
+        // Slice 5.4: lift the "only_self" restriction. Mutually-recursive
+        // rules are now accepted as long as every member of the SCC
+        // satisfies the same constraints as the entry rule (same input
+        // concept, same output type, Number-only fields, no let bindings,
+        // no concat in body — inherited from slice 5.1a-5.3).
+        let scc_names = collect_scc_containing(rule, &rules);
+        // Put the entry rule first so its callable label sits at the
+        // canonical offset 5 — caller's _start loop calls it directly.
+        let mut ordered: Vec<&Rule> = Vec::new();
+        ordered.push(rule);
+        for name in &scc_names {
+            if name != &rule.name {
+                if let Some(&r) = rules.get(name.as_str()) {
+                    ordered.push(r);
+                }
+            }
         }
-        collect_native_callees(&rule.logic.value, &mut direct_callees);
-        direct_callees.sort();
-        direct_callees.dedup();
-        let only_self = direct_callees.iter().all(|c| c == &rule.name);
-        if !only_self {
-            return Err(NativeError {
-                message: format!(
-                    "rule '{}' is part of a recursive call graph (cycle through '{}'); slice 5.1a only supports direct self-recursion with no other callees. Mutual recursion and mixed call graphs need slice 5.4+. Use --run for now.",
-                    rule.name, cycle
-                ),
-            });
+        scc_rules_owned = ordered;
+
+        // Slice 5.4 constraint: every SCC rule shares the entry's input
+        // concept (cross-concept mutual recursion needs Phase B-shaped
+        // ABI work and is not in scope here).
+        for r in &scc_rules_owned {
+            if r.input_ty != rule.input_ty {
+                return Err(NativeError {
+                    message: format!(
+                        "slice 5.4: mutually-recursive rule '{}' has input type {:?} but entry rule '{}' has type {:?}; cross-concept mutual recursion is a later slice.",
+                        r.name, r.input_ty, rule.name, rule.input_ty,
+                    ),
+                });
+            }
+            if r.output_ty != rule.output_ty {
+                return Err(NativeError {
+                    message: format!(
+                        "slice 5.4: mutually-recursive rule '{}' output {:?} differs from entry '{}'s output {:?}; SCC rules must share output type.",
+                        r.name, r.output_ty, rule.name, rule.output_ty,
+                    ),
+                });
+            }
+            if !r.logic.bindings.is_empty() {
+                return Err(NativeError {
+                    message: format!(
+                        "recursive rule '{}' must have no let bindings (text-let/concat in recursive body is forbidden until the stack-budget design lands).",
+                        r.name
+                    ),
+                });
+            }
         }
-        // Slice 5.1a + 5.3 constraints — refuse with breadcrumb pointing
-        // at the relevant follow-up slice.
-        //
-        // Slice 5.1a: single Number field input → rdi holds the value.
-        // Slice 5.3: multi-field Number-only input → rdi holds a pointer
-        // to a fields struct laid out on the caller's stack below rsp,
-        // with one i64 slot per field in declaration order. The compiler
-        // emits the marshalling at every call site; the language stays
-        // pointer-free (no syntax for &x, *p, casts, or arithmetic on
-        // the pointer — it's an ABI artifact, never a first-class value).
+
         if concept.fields.is_empty() {
             return Err(NativeError {
                 message: format!(
@@ -232,14 +255,8 @@ fn compile_native_code(
                 ),
             });
         }
-        if !rule.logic.bindings.is_empty() {
-            return Err(NativeError {
-                message: format!(
-                    "slice 5.1a: recursive rule '{}' must have no let bindings (text-let/concat in recursive body is forbidden until the stack-budget design lands).",
-                    rule.name
-                ),
-            });
-        }
+        // (let-bindings already checked per-rule above.)
+        let _ = cycle;
         // MANDATORY breadcrumb. Compiler axiom: never silently accept
         // a recursive rule without naming the gap.
         eprintln!(
@@ -302,10 +319,10 @@ fn compile_native_code(
     let record_output_concept: Option<&Concept> = match &rule.output_ty { Type::Named(n) => concepts.iter().find(|c| c.name == *n).copied(), _ => None };
 
     let mut code = if recursion_witness.is_some() {
-        // Slice 5.1a: emit the rule as a real callable instead of inlining.
-        // All slice-5.1a constraints were already validated above; this
-        // path only fires when they passed.
-        emit_self_recursive_program(rule, concept, &rules, &resources, &connections)?
+        // Slice 5.1a-5.4: emit the rule (or SCC) as real callables.
+        // scc_rules_owned was populated above when recursion was detected;
+        // for single self-recursion it has one entry, for mutual it has N.
+        emit_self_recursive_program(rule, &scc_rules_owned, concept, &rules, &resources, &connections)?
     } else if let Some(rx) = reaction {
         emit_reaction_program(rx, rule, concept, &rules, &resources, &connections)?
     } else if is_result_output {
@@ -1105,6 +1122,81 @@ fn dfs_native_cycle(
     on_stack.remove(name);
     fully_done.insert(name.to_string());
     None
+}
+
+/// Phase A slice 5.4 — strongly-connected component containing `entry`.
+/// Returns every rule reachable from `entry` AND from which `entry` is
+/// reachable (intersection of forward- and backward-reachable sets).
+/// Used by `compile_native_code` to discover all rules that need to be
+/// emitted as real callables for a mutually-recursive group.
+///
+/// For a non-recursive rule, returns `[entry.name]` (entry reaches itself
+/// vacuously and is reachable from itself). For a self-recursive rule,
+/// returns `[entry.name]` too. For a 2-rule mutual recursion (a ↔ b),
+/// returns `[a, b]`. Generalises to N-rule SCCs.
+fn collect_scc_containing(
+    entry: &Rule,
+    all_rules: &HashMap<&str, &Rule>,
+) -> Vec<String> {
+    // Forward: rules reachable from entry via Call edges.
+    let mut forward: std::collections::HashSet<String> = std::collections::HashSet::new();
+    forward.insert(entry.name.clone());
+    let mut stack = vec![entry.name.clone()];
+    while let Some(n) = stack.pop() {
+        if let Some(&r) = all_rules.get(n.as_str()) {
+            let mut callees: Vec<String> = Vec::new();
+            for (_, e) in &r.logic.bindings {
+                collect_native_callees(e, &mut callees);
+            }
+            collect_native_callees(&r.logic.value, &mut callees);
+            for c in callees {
+                if forward.insert(c.clone()) {
+                    stack.push(c);
+                }
+            }
+        }
+    }
+    // Backward: rules from which entry is reachable.
+    let mut backward: std::collections::HashSet<String> = std::collections::HashSet::new();
+    backward.insert(entry.name.clone());
+    let entry_name = entry.name.as_str();
+    for &name in all_rules.keys() {
+        let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+        if reaches_target(name, entry_name, all_rules, &mut visited) {
+            backward.insert(name.to_string());
+        }
+    }
+    // SCC = forward ∩ backward.
+    forward.intersection(&backward).cloned().collect()
+}
+
+/// DFS helper for `collect_scc_containing`: true iff `target` is
+/// reachable from `from` via Call edges in `all_rules`.
+fn reaches_target(
+    from: &str,
+    target: &str,
+    all_rules: &HashMap<&str, &Rule>,
+    visited: &mut std::collections::HashSet<String>,
+) -> bool {
+    if from == target {
+        return true;
+    }
+    if !visited.insert(from.to_string()) {
+        return false;
+    }
+    if let Some(&r) = all_rules.get(from) {
+        let mut callees: Vec<String> = Vec::new();
+        for (_, e) in &r.logic.bindings {
+            collect_native_callees(e, &mut callees);
+        }
+        collect_native_callees(&r.logic.value, &mut callees);
+        for c in callees {
+            if reaches_target(&c, target, all_rules, visited) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Collect every `Call(name, _)` referenced by `expr`. Walks the same
@@ -2527,136 +2619,66 @@ fn emit_full_program(
 /// the call, rax holds the return value, then itoa + write + jmp
 /// loop_top runs as in `emit_full_program`.
 fn emit_self_recursive_program(
-    rule: &Rule,
+    entry_rule: &Rule,
+    scc_rules: &[&Rule],
     concept: &Concept,
     all_rules: &HashMap<&str, &Rule>,
     all_resources: &HashMap<&str, &Resource>,
     all_connections: &HashMap<&str, &Connection>,
 ) -> Result<Vec<u8>, NativeError> {
-    let is_bool = rule.output_ty == Type::Bool;
-    let is_text = rule.output_ty == Type::Text;
+    let is_bool = entry_rule.output_ty == Type::Bool;
+    let is_text = entry_rule.output_ty == Type::Text;
     let nfields = concept.fields.len();
     let is_multi_field = nfields > 1;
+    let frame_bytes = (nfields * 8) as i32;
     let mut code = Vec::new();
 
-    // Leading jump that skips over the callable so _start runs first
-    // at runtime. Patched once the callable's emitted size is known.
+    // Leading jump that skips over ALL callables so _start runs first
+    // at runtime. Patched once total callable size is known.
     code.push(0xE9);
     let jmp_skip_patch = code.len();
     code.extend_from_slice(&[0x00; 4]);
 
-    // Callable label sits at offset 5 (right after the jmp).
-    let callable_label_offset = code.len() as i32;
-
-    // Callable prologue.
-    // - Single-field rules (slice 5.1a): rdi holds the scalar value;
-    //   spill to [rbp - 8].
-    // - Multi-field rules (slice 5.3): rdi holds a pointer to a fields
-    //   struct laid out by the caller below rsp (Number-only, i64 per
-    //   field, in declaration order). Copy each slot from
-    //   [rdi + 8*i] into the rule's own rbp slot at -8*(i+1) so the
-    //   body sees the standard field-slot layout.
-    code.push(0x55);                                       // push rbp
-    code.extend_from_slice(&[0x48, 0x89, 0xE5]);           // mov rbp, rsp
-    let frame_bytes = (nfields * 8) as i32;
-    if frame_bytes <= 127 {
-        code.extend_from_slice(&[0x48, 0x83, 0xEC]);       // sub rsp, imm8
-        code.push(frame_bytes as u8);
-    } else {
-        code.extend_from_slice(&[0x48, 0x81, 0xEC]);       // sub rsp, imm32
-        code.extend_from_slice(&frame_bytes.to_le_bytes());
+    // Two-pass label resolution (slice 5.4). For a single self-recursive
+    // rule (slice 5.1a-5.3) scc_rules.len() == 1 and the second pass
+    // is byte-for-byte identical to the single-pass emit it replaces.
+    // For mutually-recursive groups (slice 5.4+) each callable's offset
+    // is forward-referenced by earlier callables; the first pass measures
+    // sizes with placeholder labels, the second pass fills in real ones.
+    let placeholder_labels: HashMap<&str, i32> = scc_rules.iter()
+        .map(|r| (r.name.as_str(), 0_i32))
+        .collect();
+    let placeholder_ctx = SelfCallCtx { labels: &placeholder_labels };
+    let mut sizes: Vec<usize> = Vec::with_capacity(scc_rules.len());
+    for &r in scc_rules {
+        let mut scratch = Vec::new();
+        emit_callable_into(&mut scratch, r, concept, all_rules, placeholder_ctx)?;
+        sizes.push(scratch.len());
     }
-    if !is_multi_field {
-        // mov [rbp - 8], rdi
-        code.extend_from_slice(&[0x48, 0x89, 0x7D, 0xF8]);
-    } else {
-        // For each field i in declaration order:
-        //   mov rax, [rdi + 8*i]
-        //   mov [rbp - 8*(i+1)], rax
-        for i in 0..nfields {
-            let src_off = (i * 8) as i32;
-            if src_off == 0 {
-                code.extend_from_slice(&[0x48, 0x8B, 0x07]); // mov rax, [rdi]
-            } else if src_off <= 127 {
-                code.extend_from_slice(&[0x48, 0x8B, 0x47]); // mov rax, [rdi + disp8]
-                code.push(src_off as u8);
-            } else {
-                code.extend_from_slice(&[0x48, 0x8B, 0x87]); // mov rax, [rdi + disp32]
-                code.extend_from_slice(&src_off.to_le_bytes());
-            }
-            let dst_off = -((i as i32 + 1) * 8);
-            if dst_off >= -128 {
-                code.extend_from_slice(&[0x48, 0x89, 0x45]); // mov [rbp + disp8], rax
-                code.push(dst_off as u8);
-            } else {
-                code.extend_from_slice(&[0x48, 0x89, 0x85]);
-                code.extend_from_slice(&dst_off.to_le_bytes());
-            }
-        }
+    let leading_size = code.len(); // = 5
+    let mut labels: HashMap<&str, i32> = HashMap::new();
+    let mut next_offset = leading_size as i32;
+    for (i, &r) in scc_rules.iter().enumerate() {
+        labels.insert(r.name.as_str(), next_offset);
+        next_offset += sizes[i] as i32;
+    }
+    let final_ctx = SelfCallCtx { labels: &labels };
+
+    // Pass 2: emit each callable with real labels.
+    for &r in scc_rules {
+        emit_callable_into(&mut code, r, concept, all_rules, final_ctx)?;
     }
 
-    // Build the offsets / field_ranges maps the callable's body sees.
-    // Each field at rbp - 8*(i+1) in declaration order.
-    let mut callable_offsets: HashMap<&str, i32> = HashMap::new();
-    let mut callable_field_ranges: HashMap<&str, (i64, i64)> = HashMap::new();
-    for (i, f) in concept.fields.iter().enumerate() {
-        let off = -((i as i32 + 1) * 8);
-        callable_offsets.insert(f.name.as_str(), off);
-        if let Some((min, max)) = f.range {
-            callable_field_ranges.insert(f.name.as_str(), (min, max));
-        }
-    }
-    let callable_text_bindings = TextBindings::new();
-    let self_call = SelfCallCtx {
-        rule_name: rule.name.as_str(),
-        target_offset: callable_label_offset,
-    };
-
-    if is_text {
-        // Slice 5.2: text return ABI. Body's leaves produce (rax = ptr,
-        // rdx = len) — either a text literal embedded inline, or a
-        // recursive call whose own return propagates. `ret` carries the
-        // pair to the caller (System V uses rax+rdx for two-register
-        // returns; we re-use rdx as the length slot).
-        emit_recursive_text_body(
-            &mut code,
-            &rule.logic.value,
-            &rule.input_name,
-            &callable_offsets,
-            all_rules,
-            &callable_field_ranges,
-            &callable_text_bindings,
-            self_call,
-        )?;
-    } else {
-        // Slice 5.1a/5.1b: scalar (Number/Bool) body. emit_eval_expr
-        // leaves the value in rax; the callable epilogue rets with that.
-        emit_eval_expr(
-            &mut code,
-            &rule.logic.value,
-            &rule.input_name,
-            &callable_offsets,
-            all_rules,
-            &callable_field_ranges,
-            &callable_text_bindings,
-            Some(self_call),
-        )?;
-    }
-
-    // Callable epilogue.
-    code.extend_from_slice(&[0x48, 0x89, 0xEC]);           // mov rsp, rbp
-    code.push(0x5D);                                       // pop rbp
-    code.push(0xC3);                                       // ret
-
-    // Patch the leading jmp to skip past the callable.
+    // Patch the leading jmp to skip past all callables.
     let start_actual_offset = code.len();
     let jmp_off = start_actual_offset as i32 - (jmp_skip_patch as i32 + 4);
     code[jmp_skip_patch..jmp_skip_patch + 4].copy_from_slice(&jmp_off.to_le_bytes());
 
-    // Standard prologue + per-record loop. The loop body calls into the
-    // callable instead of inlining the rule logic.
+    // Standard prologue + per-record loop. The loop body calls the
+    // entry rule's callable (the user invoked `--run entry_rule`).
+    let entry_label = labels[entry_rule.name.as_str()];
     let ctx = emit_record_loop_prologue(
-        &mut code, rule, concept, None, all_rules, all_resources, all_connections,
+        &mut code, entry_rule, concept, None, all_rules, all_resources, all_connections,
     )?;
     if !is_multi_field {
         // Single-field: rdi = value.
@@ -2669,14 +2691,7 @@ fn emit_self_recursive_program(
             code.extend_from_slice(&field_slot.to_le_bytes());
         }
     } else {
-        // Multi-field: build a fields struct on the stack below rsp,
-        // then rdi = rsp.
-        //   sub rsp, 8*nfields
-        //   for each field i in declaration order:
-        //     mov rax, [rbp + ctx.field_slot[name]]
-        //     mov [rsp + 8*i], rax
-        //   mov rdi, rsp
-        // After the call we free with `add rsp, 8*nfields`.
+        // Multi-field: build a fields struct on the stack below rsp.
         if frame_bytes <= 127 {
             code.extend_from_slice(&[0x48, 0x83, 0xEC]);
             code.push(frame_bytes as u8);
@@ -2687,7 +2702,7 @@ fn emit_self_recursive_program(
         for (i, f) in concept.fields.iter().enumerate() {
             let src = ctx.binding_offsets[f.name.as_str()];
             if src >= -128 {
-                code.extend_from_slice(&[0x48, 0x8B, 0x45]); // mov rax, [rbp + disp8]
+                code.extend_from_slice(&[0x48, 0x8B, 0x45]);
                 code.push(src as u8);
             } else {
                 code.extend_from_slice(&[0x48, 0x8B, 0x85]);
@@ -2695,12 +2710,12 @@ fn emit_self_recursive_program(
             }
             let dst = (i * 8) as i32;
             if dst == 0 {
-                code.extend_from_slice(&[0x48, 0x89, 0x04, 0x24]); // mov [rsp], rax
+                code.extend_from_slice(&[0x48, 0x89, 0x04, 0x24]);
             } else if dst <= 127 {
-                code.extend_from_slice(&[0x48, 0x89, 0x44, 0x24]); // mov [rsp + disp8], rax
+                code.extend_from_slice(&[0x48, 0x89, 0x44, 0x24]);
                 code.push(dst as u8);
             } else {
-                code.extend_from_slice(&[0x48, 0x89, 0x84, 0x24]); // mov [rsp + disp32], rax
+                code.extend_from_slice(&[0x48, 0x89, 0x84, 0x24]);
                 code.extend_from_slice(&dst.to_le_bytes());
             }
         }
@@ -2709,10 +2724,9 @@ fn emit_self_recursive_program(
     }
     code.push(0xE8);                                       // call rel32
     let call_end = (code.len() + 4) as i32;
-    let rel32 = callable_label_offset - call_end;
+    let rel32 = entry_label - call_end;
     code.extend_from_slice(&rel32.to_le_bytes());
     if is_multi_field {
-        // Free the fields struct: add rsp, 8*nfields.
         if frame_bytes <= 127 {
             code.extend_from_slice(&[0x48, 0x83, 0xC4]);
             code.push(frame_bytes as u8);
@@ -2764,6 +2778,102 @@ fn emit_self_recursive_program(
 
     emit_record_loop_epilogue(&mut code, &ctx);
     Ok(code)
+}
+
+/// Phase A slice 5.4 — emit one callable's prologue + body + epilogue.
+/// Encapsulates per-rule emit so `emit_self_recursive_program` can loop
+/// over SCC members. For a single self-recursive rule, this is called
+/// once; for a mutually-recursive group, called N times in declaration
+/// order with the labels map already populated for cross-references.
+///
+/// The callable's ABI matches slice 5.1a/5.1b/5.2/5.3:
+/// - Single-field rule: rdi = scalar value, spilled to [rbp - 8] in prologue.
+/// - Multi-field rule: rdi = pointer to fields struct, copied to rbp slots.
+/// - Number/Bool return: rax.
+/// - Text return: (rax = ptr, rdx = len) via emit_recursive_text_body.
+///
+/// The `self_call` ctx routes any Call to a rule in `labels` to a real
+/// `call <target_offset>` instead of inlining. For slice 5.4 the labels
+/// map contains every SCC member, so cross-rule calls resolve correctly.
+fn emit_callable_into(
+    code: &mut Vec<u8>,
+    rule: &Rule,
+    concept: &Concept,
+    all_rules: &HashMap<&str, &Rule>,
+    self_call: SelfCallCtx<'_>,
+) -> Result<(), NativeError> {
+    let is_text = rule.output_ty == Type::Text;
+    let nfields = concept.fields.len();
+    let is_multi_field = nfields > 1;
+    let frame_bytes = (nfields * 8) as i32;
+
+    // Prologue.
+    code.push(0x55);                                       // push rbp
+    code.extend_from_slice(&[0x48, 0x89, 0xE5]);           // mov rbp, rsp
+    if frame_bytes <= 127 {
+        code.extend_from_slice(&[0x48, 0x83, 0xEC]);
+        code.push(frame_bytes as u8);
+    } else {
+        code.extend_from_slice(&[0x48, 0x81, 0xEC]);
+        code.extend_from_slice(&frame_bytes.to_le_bytes());
+    }
+    if !is_multi_field {
+        code.extend_from_slice(&[0x48, 0x89, 0x7D, 0xF8]); // mov [rbp - 8], rdi
+    } else {
+        // Copy fields struct from [rdi + 8*i] to [rbp - 8*(i+1)].
+        for i in 0..nfields {
+            let src_off = (i * 8) as i32;
+            if src_off == 0 {
+                code.extend_from_slice(&[0x48, 0x8B, 0x07]);
+            } else if src_off <= 127 {
+                code.extend_from_slice(&[0x48, 0x8B, 0x47]);
+                code.push(src_off as u8);
+            } else {
+                code.extend_from_slice(&[0x48, 0x8B, 0x87]);
+                code.extend_from_slice(&src_off.to_le_bytes());
+            }
+            let dst_off = -((i as i32 + 1) * 8);
+            if dst_off >= -128 {
+                code.extend_from_slice(&[0x48, 0x89, 0x45]);
+                code.push(dst_off as u8);
+            } else {
+                code.extend_from_slice(&[0x48, 0x89, 0x85]);
+                code.extend_from_slice(&dst_off.to_le_bytes());
+            }
+        }
+    }
+
+    // Build offsets / field_ranges maps for the body.
+    let mut callable_offsets: HashMap<&str, i32> = HashMap::new();
+    let mut callable_field_ranges: HashMap<&str, (i64, i64)> = HashMap::new();
+    for (i, f) in concept.fields.iter().enumerate() {
+        let off = -((i as i32 + 1) * 8);
+        callable_offsets.insert(f.name.as_str(), off);
+        if let Some((min, max)) = f.range {
+            callable_field_ranges.insert(f.name.as_str(), (min, max));
+        }
+    }
+    let callable_text_bindings = TextBindings::new();
+
+    // Body.
+    if is_text {
+        emit_recursive_text_body(
+            code, &rule.logic.value, &rule.input_name, &callable_offsets,
+            all_rules, &callable_field_ranges, &callable_text_bindings, self_call,
+        )?;
+    } else {
+        emit_eval_expr(
+            code, &rule.logic.value, &rule.input_name, &callable_offsets,
+            all_rules, &callable_field_ranges, &callable_text_bindings,
+            Some(self_call),
+        )?;
+    }
+
+    // Epilogue.
+    code.extend_from_slice(&[0x48, 0x89, 0xEC]);           // mov rsp, rbp
+    code.push(0x5D);                                       // pop rbp
+    code.push(0xC3);                                       // ret
+    Ok(())
 }
 
 /// Phase A slice 5.2 — emit a recursive callable's body that returns a
@@ -2825,14 +2935,12 @@ fn emit_recursive_text_body(
             Ok(())
         }
         Expr::Call(name, args) => {
-            if name != self_call.rule_name {
-                return Err(NativeError {
-                    message: format!(
-                        "slice 5.2: text-returning recursive body can only call self ('{}'); got call to '{}'",
-                        self_call.rule_name, name
-                    ),
-                });
-            }
+            let target_offset = self_call.labels.get(name.as_str()).copied().ok_or_else(|| NativeError {
+                message: format!(
+                    "slice 5.2: text-returning recursive body can only call rules in the recursion's call graph; got call to '{}' which is not in scope",
+                    name
+                ),
+            })?;
             if args.len() != 1 {
                 return Err(NativeError {
                     message: "slice 5.2: recursive call must take exactly 1 arg".into(),
@@ -2884,7 +2992,7 @@ fn emit_recursive_text_body(
             // call <target_offset>: rel32 to the callable's prologue.
             code.push(0xE8);
             let call_end = (code.len() + 4) as i32;
-            let rel32 = self_call.target_offset - call_end;
+            let rel32 = target_offset - call_end;
             code.extend_from_slice(&rel32.to_le_bytes());
             // Callee left (rax, rdx) populated; no further setup.
             Ok(())
@@ -9132,24 +9240,27 @@ fn try_static_condition(
 }
 
 /// Compile an expression to machine code. Result left in rax.
-/// Phase A slice 5.1a — context for self-recursive call emission.
-/// When `Some(ctx)`, any `Expr::Call(ctx.rule_name, ...)` encountered by
-/// `emit_eval_expr` is emitted as a real `call <target_offset>` instead of
-/// being inlined (which would loop forever during compilation). When `None`
-/// (the default for every non-self-recursive caller), Call expressions
-/// continue to inline as today.
+/// Phase A slice 5.1a–5.4 — context for recursive call emission.
 ///
-/// `target_offset` is an absolute offset into the code buffer where the
-/// callable's prologue begins. The Call arm computes `rel32 = target_offset
-/// - (call_instr_end_offset)` and emits `0xE8 rel32` (5 bytes total).
+/// `labels` maps each rule name in the recursion's call graph to the
+/// absolute offset of its callable's prologue. When `emit_eval_expr`
+/// hits `Expr::Call(name, args)` and `labels.get(name)` returns
+/// `Some(target_offset)`, the call is emitted as a real `call <target>`
+/// instead of being inlined.
 ///
-/// Slice 5.1a constraint: the recursive Call's argument MUST be
-/// `Ident(input_name)` — i.e., the same input passed through, no Record
-/// construction at the call site. Slice 5.1b lifts this.
+/// - Slice 5.1a/5.1b/5.2/5.3: single rule (self-recursion). `labels`
+///   has exactly one entry: the rule's own name → its label offset.
+/// - Slice 5.4: mutually-recursive group. `labels` has one entry per
+///   rule in the SCC; cross-rule calls inside any callable's body
+///   resolve through the same map.
+///
+/// Slice 5.4 keeps the same arg-marshalling for any call in the map —
+/// pass-through `Ident(input)` or `Record(input_concept, {...})` — and
+/// requires all rules in the SCC to share the same input concept (no
+/// cross-concept marshalling yet; that's Phase B territory).
 #[derive(Clone, Copy)]
 struct SelfCallCtx<'a> {
-    rule_name: &'a str,
-    target_offset: i32,
+    labels: &'a HashMap<&'a str, i32>,
 }
 
 fn emit_eval_expr(
@@ -9585,7 +9696,7 @@ fn emit_eval_expr(
             // from an expression. Together they cover the natural
             // recursive shapes: pass-through and decreasing-arg.
             if let Some(ctx) = self_call {
-                if name == ctx.rule_name {
+                if let Some(&self_target_offset) = ctx.labels.get(name.as_str()) {
                     let nfields = offsets.len();
                     let multi_field = nfields > 1;
                     // Single-field path (slice 5.1a/5.1b): rdi holds the
@@ -9685,7 +9796,7 @@ fn emit_eval_expr(
                         // call <target>
                         code.push(0xE8);
                         let call_end = (code.len() + 4) as i32;
-                        let rel32 = ctx.target_offset - call_end;
+                        let rel32 = self_target_offset - call_end;
                         code.extend_from_slice(&rel32.to_le_bytes());
                         // add rsp, frame_bytes
                         if frame_bytes <= 127 {
@@ -9737,7 +9848,7 @@ fn emit_eval_expr(
                     }
                     code.push(0xE8);
                     let call_end = (code.len() + 4) as i32;
-                    let rel32 = ctx.target_offset - call_end;
+                    let rel32 = self_target_offset - call_end;
                     code.extend_from_slice(&rel32.to_le_bytes());
                     return Ok(());
                 }
@@ -23251,7 +23362,7 @@ rule even_ish
     out = if n.v == 0 then 1 else odd_ish(n)
   proofs:
     purity:
-      reads : [n, n.v]
+      reads : [n.v]
       calls : [odd_ish]
     termination:
       bound : 100
@@ -23267,7 +23378,7 @@ rule odd_ish
     out = if n.v == 0 then 0 else even_ish(n)
   proofs:
     purity:
-      reads : [n, n.v]
+      reads : [n.v]
       calls : [even_ish]
     termination:
       bound : 100
@@ -23275,13 +23386,11 @@ rule odd_ish
         let tokens = crate::lexer::Lexer::new(mutual).tokenize().unwrap();
         let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
         let out = std::env::temp_dir().join("verbosec_test_phase_a5_mutual_rec");
-        let err = compile_native(&program, "even_ish", out.to_str().unwrap(), true, false)
-            .expect_err("mutually-recursive rule must be refused");
-        assert!(
-            err.message.contains("recursive call graph") && err.message.contains("slice 5"),
-            "mutual recursion breadcrumb should mention the cycle and a slice number: {}",
-            err.message
-        );
+        // Slice 5.4: mutual recursion COMPILES now (was refused pre-5.4).
+        // Runtime coverage is in `phase_a5_4_mutual_recursion_runtime`.
+        compile_native(&program, "even_ish", out.to_str().unwrap(), true, false)
+            .expect("mutual recursion compiles in slice 5.4");
+        let _ = std::fs::remove_file(&out);
 
         // (c) Self-recursive multi-field → COMPILES since slice 5.3.
         // (Previously refused with a slice-5.3 breadcrumb.) Now the
@@ -23331,6 +23440,48 @@ rule rec
         compile_native(&program, "score", out.to_str().unwrap(), true, false)
             .expect("non-recursive Call should compile cleanly");
         let _ = std::fs::remove_file(out);
+    }
+
+    /// Phase A slice 5.4 — mutual recursion. Two rules `even_ish` ↔
+    /// `odd_ish` form a cycle; both compile as separate callables in
+    /// the same binary, and cross-rule `call`s resolve via the labels
+    /// map populated during the two-pass emit. Worked example exercises
+    /// the entire cycle for v ∈ [0, 10]: each input recurses down to
+    /// v=0 alternating between the two callables, then unwinds.
+    #[test]
+    fn phase_a5_4_mutual_recursion_runtime() {
+        use std::io::Write;
+        let src = std::fs::read_to_string("examples/even_odd.verbose")
+            .expect("examples/even_odd.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+        let out = std::env::temp_dir().join("verbosec_test_phase_a5_4_eo");
+        compile_native(&program, "even_ish", out.to_str().unwrap(), true, false)
+            .expect("mutually-recursive even_ish must compile");
+
+        let run = |input: &str| -> String {
+            let mut child = std::process::Command::new(&out)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .expect("spawn even_ish");
+            child.stdin.as_mut().unwrap().write_all(input.as_bytes()).unwrap();
+            drop(child.stdin.take());
+            let r = child.wait_with_output().expect("wait even_ish");
+            assert!(r.status.success(), "even_ish({}) must exit 0; got {:?}", input.trim(), r.status);
+            String::from_utf8_lossy(&r.stdout).trim().to_string()
+        };
+
+        // even_ish(0)=1, even_ish(1)=0, even_ish(2)=1, ..., alternating.
+        // Both rules' callables fire during the unwind of v > 0.
+        assert_eq!(run("0\n"),  "1");
+        assert_eq!(run("1\n"),  "0");
+        assert_eq!(run("2\n"),  "1");
+        assert_eq!(run("3\n"),  "0");
+        assert_eq!(run("5\n"),  "0");
+        assert_eq!(run("10\n"), "1");
+        let _ = std::fs::remove_file(&out);
     }
 
     /// Phase A slice 5.3 — multi-field recursive native callable.

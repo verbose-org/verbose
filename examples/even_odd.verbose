@@ -1,0 +1,75 @@
+@verbose 0.1.0
+
+-- Phase A slice 5.4 worked example: mutually-recursive native callables.
+-- THE FIRST Verbose native binary where two distinct rules emit as
+-- separate callables and `call` each other across the cycle.
+--
+-- The compiler:
+--   1. Detects the cycle even_ish ↔ odd_ish in the call graph.
+--   2. Computes the SCC containing the entry rule.
+--   3. Emits both callables sequentially (two-pass: pass 1 measures
+--      each callable's size with placeholder labels, pass 2 emits
+--      with the real cross-rule label offsets).
+--   4. The _start loop calls into the entry's callable; that callable
+--      calls the other; the other calls back into the first. All
+--      cross-rule `call`s use known rel32 offsets — no forward
+--      patching at runtime.
+--
+-- ABI unchanged from slice 5.1a/5.1b/5.3: rdi = single Number value
+-- (or pointer to fields struct for multi-field). The cross-rule call
+-- machinery reuses the same SelfCallCtx labels HashMap; the only new
+-- thing in slice 5.4 is that the map has more than one entry.
+--
+-- Composes with slice 5.0's mandatory breadcrumb (recursion is named
+-- explicitly on stderr at compile time) and slice 5.1's runtime
+-- bounds-check (`v : number [0, 10]` enforces depth ≤ 11 per rule).
+
+
+concept N
+  @intention: "A wrapper holding one non-negative integer 0..=10"
+  @source: even_odd.intent:1
+
+  fields:
+    v : number [0, 10]
+
+
+rule even_ish
+  @intention: "1 when v is even (recursive: 0 is even; n+1 is even iff n is odd)"
+  @source: even_odd.intent:2
+
+  input:
+    n : N
+
+  output:
+    out : number
+
+  logic:
+    out = if n.v == 0 then 1 else odd_ish(N { v: n.v - 1 })
+
+  proofs:
+    purity:
+      reads   : [n.v]
+      calls   : [odd_ish]
+    termination:
+      bound : 100
+
+
+rule odd_ish
+  @intention: "0 when v is even (recursive: 0 is not odd; n+1 is odd iff n is even)"
+  @source: even_odd.intent:3
+
+  input:
+    n : N
+
+  output:
+    out : number
+
+  logic:
+    out = if n.v == 0 then 0 else even_ish(N { v: n.v - 1 })
+
+  proofs:
+    purity:
+      reads   : [n.v]
+      calls   : [even_ish]
+    termination:
+      bound : 100
