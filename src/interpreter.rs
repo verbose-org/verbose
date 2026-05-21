@@ -223,8 +223,29 @@ pub fn eval_rule(
     concepts: &[&Concept],
     input: &HashMap<String, Value>,
 ) -> Result<Value, RuntimeError> {
+    // Existing record-input entry point: wrap input as Value::Record
+    // and delegate to the generic eval_rule_with_value path.
+    eval_rule_with_value(rule, all_rules, concepts, Value::Record(input.clone()))
+}
+
+/// Phase B slice 3 — generic rule-eval entry point that accepts any
+/// `Value` as input, not just a `Value::Record` of a record concept.
+/// Lets a recursive rule walk a sum-type tree: at each recursion step
+/// the bound payload field (`lhs`, `rhs` from a `Binary` match arm) is
+/// a `Value::Variant`, which we pass straight back into `eval_rule`
+/// without trying to coerce it into a HashMap.
+///
+/// The existing `eval_rule(...)` wraps a `HashMap<String, Value>` as
+/// `Value::Record` and calls into this entry — purely additive, every
+/// existing call site stays unchanged.
+pub fn eval_rule_with_value(
+    rule: &Rule,
+    all_rules: &[&Rule],
+    concepts: &[&Concept],
+    input_value: Value,
+) -> Result<Value, RuntimeError> {
     let mut env: HashMap<String, Value> = HashMap::new();
-    env.insert(rule.input_name.clone(), Value::Record(input.clone()));
+    env.insert(rule.input_name.clone(), input_value);
     for (name, expr) in &rule.logic.bindings {
         let val = eval_expr(expr, &env, all_rules, concepts)?;
         env.insert(name.clone(), val);
@@ -642,12 +663,13 @@ fn eval_expr(
                 });
             }
             let arg_val = eval_expr(&args[0], env, all_rules, concepts)?;
-            match arg_val {
-                Value::Record(fields) => eval_rule(called, all_rules, concepts, &fields),
-                _ => Err(RuntimeError {
-                    message: "call argument must be a record".into(),
-                }),
-            }
+            // Phase B slice 3: accept any Value as call argument, not
+            // just Value::Record. Lets recursive rules pass Variant
+            // values bound by a `match` arm directly into the next
+            // recursion (e.g., `eval(Binary(_, lhs, rhs)) = eval(lhs)
+            // + eval(rhs)` where `lhs` is itself a Variant). Pre-B.3
+            // this refused with "call argument must be a record".
+            eval_rule_with_value(called, all_rules, concepts, arg_val)
         }
         // Phase 9 slice 1: real read happens in native; interpreter returns empty placeholder for now.
         Expr::Read(_) => Ok(Value::Text("".into())),
@@ -1908,5 +1930,150 @@ mod tests {
             eval_rule(&rule_eof, &[], &concepts, &empty_input).unwrap(),
             Value::Number(0)
         );
+    }
+
+    /// Phase B slice 3 — interpreter handles recursive Variant values.
+    ///
+    /// Pinned shape: a sum-type concept `Expr` declared inside a
+    /// `concept_group AST [...]` block contains itself in a variant
+    /// payload (`Binary` carries two `Expr` fields). The recursive
+    /// rule `eval` walks the tree by `match`ing on the variant tag and
+    /// recursively calling itself on the sub-expressions. Before B.3
+    /// the Call arm of `eval_expr` refused with "call argument must be
+    /// a record"; after B.3 it accepts any Value (the new
+    /// `eval_rule_with_value` entry point).
+    ///
+    /// The test builds the expression `(1 + 2) * 3` as a Value::Variant
+    /// tree manually (mirroring what VariantConstruct would produce),
+    /// then evaluates it. Expected result: 9.
+    #[test]
+    fn phase_b3_recursive_variant_eval_runtime() {
+        // The interpreter doesn't need the concept_group declaration at
+        // runtime — the verifier/parser sees it but eval only operates
+        // on Value::Variant. We declare the concept for the type-aware
+        // lookups (positional binders → declared field order).
+        let expr_concept = Concept {
+            name: "Expr".into(),
+            intention: "e".into(),
+            source: SourceRef { file: "t.intent".into(), line: 1 },
+            fields: vec![],
+            variants: vec![
+                Variant {
+                    name: "Int".into(),
+                    fields: vec![Field { name: "value".into(), ty: Type::Number, range: None }],
+                },
+                Variant {
+                    name: "Add".into(),
+                    fields: vec![
+                        Field { name: "lhs".into(), ty: Type::Named("Expr".into()), range: None },
+                        Field { name: "rhs".into(), ty: Type::Named("Expr".into()), range: None },
+                    ],
+                },
+                Variant {
+                    name: "Mul".into(),
+                    fields: vec![
+                        Field { name: "lhs".into(), ty: Type::Named("Expr".into()), range: None },
+                        Field { name: "rhs".into(), ty: Type::Named("Expr".into()), range: None },
+                    ],
+                },
+            ],
+        };
+        let concepts: Vec<&Concept> = vec![&expr_concept];
+
+        // `eval(e: Expr) -> number`
+        //   logic:
+        //     n = match e:
+        //       Int(value) => value
+        //       Add(lhs, rhs) => eval(lhs) + eval(rhs)
+        //       Mul(lhs, rhs) => eval(lhs) * eval(rhs)
+        let arms = vec![
+            MatchArm {
+                variant_name: "Int".into(),
+                binders: vec![Some("value".into())],
+                body: Expr::Ident("value".into()),
+            },
+            MatchArm {
+                variant_name: "Add".into(),
+                binders: vec![Some("lhs".into()), Some("rhs".into())],
+                body: Expr::Binary(
+                    BinOp::Add,
+                    Box::new(Expr::Call("eval".into(), vec![Expr::Ident("lhs".into())])),
+                    Box::new(Expr::Call("eval".into(), vec![Expr::Ident("rhs".into())])),
+                ),
+            },
+            MatchArm {
+                variant_name: "Mul".into(),
+                binders: vec![Some("lhs".into()), Some("rhs".into())],
+                body: Expr::Binary(
+                    BinOp::Mul,
+                    Box::new(Expr::Call("eval".into(), vec![Expr::Ident("lhs".into())])),
+                    Box::new(Expr::Call("eval".into(), vec![Expr::Ident("rhs".into())])),
+                ),
+            },
+        ];
+        let eval_rule_def = Rule {
+            name: "eval".into(),
+            intention: "evaluate an Expr to a Number".into(),
+            source: SourceRef { file: "t.intent".into(), line: 1 },
+            input_name: "e".into(),
+            input_ty: Type::Named("Expr".into()),
+            output_name: "n".into(),
+            output_ty: Type::Number,
+            logic: LogicStmt {
+                bindings: vec![],
+                target: "n".into(),
+                value: Expr::MatchVariant(Box::new(Expr::Ident("e".into())), arms),
+            },
+            proofs: Proofs {
+                purity: Purity {
+                    reads: vec![],
+                    calls: vec![],
+                },
+                termination: Termination { bound: Some(10) },
+            },
+            hints: None,
+            layer: None,
+            context_name: None,
+            context_ty: None,
+        };
+        let all_rules: Vec<&Rule> = vec![&eval_rule_def];
+
+        // Build (1 + 2) * 3 as a Value::Variant tree.
+        let mk_int = |n: i64| Value::Variant {
+            concept: "Expr".into(),
+            variant: "Int".into(),
+            fields: {
+                let mut m = HashMap::new();
+                m.insert("value".into(), Value::Number(n));
+                m
+            },
+        };
+        let mk_bin = |variant: &str, l: Value, r: Value| Value::Variant {
+            concept: "Expr".into(),
+            variant: variant.into(),
+            fields: {
+                let mut m = HashMap::new();
+                m.insert("lhs".into(), l);
+                m.insert("rhs".into(), r);
+                m
+            },
+        };
+        let one_plus_two = mk_bin("Add", mk_int(1), mk_int(2));
+        let times_three = mk_bin("Mul", one_plus_two, mk_int(3));
+
+        // eval((1 + 2) * 3) → 9
+        let result = eval_rule_with_value(&eval_rule_def, &all_rules, &concepts, times_three).unwrap();
+        assert_eq!(result, Value::Number(9));
+
+        // Single Int — recursion depth 1.
+        let result = eval_rule_with_value(&eval_rule_def, &all_rules, &concepts, mk_int(42)).unwrap();
+        assert_eq!(result, Value::Number(42));
+
+        // Deeper tree: ((2 * 3) + 4) * 5 = 50
+        let two_times_three = mk_bin("Mul", mk_int(2), mk_int(3));
+        let plus_four = mk_bin("Add", two_times_three, mk_int(4));
+        let times_five = mk_bin("Mul", plus_four, mk_int(5));
+        let result = eval_rule_with_value(&eval_rule_def, &all_rules, &concepts, times_five).unwrap();
+        assert_eq!(result, Value::Number(50));
     }
 }

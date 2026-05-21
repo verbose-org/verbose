@@ -1,0 +1,5 @@
+1. An expression is either an integer literal or the sum of two sub-expressions.
+2. A seed holds a non-negative integer between 0 and 10.
+3. To build a chain expression from a seed: when the seed integer is 0 the chain is the integer literal 0; otherwise the chain is the sum of the integer literal of the seed integer and the chain built from one less.
+4. To evaluate an expression: if it is an integer literal the result is the integer; if it is a sum the result is the evaluation of the left sub-expression plus the evaluation of the right.
+5. To compute the sum of integers up to the seed: build the chain from the seed and evaluate it.
