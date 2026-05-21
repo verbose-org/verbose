@@ -480,14 +480,12 @@ fn main() {
             })
             .collect();
 
-        let all_concepts: Vec<&ast::Concept> = program
-            .items
-            .iter()
-            .filter_map(|i| match i {
-                ast::Item::Concept(c) => Some(c),
-                _ => None,
-            })
-            .collect();
+        // Phase B slice 3: include concepts declared inside a
+        // `concept_group` so the interpreter's MatchVariant arm can
+        // resolve positional binders against their variant declarations.
+        // `iter_all_concepts` walks both top-level and group-nested
+        // concepts (added in B.1).
+        let all_concepts: Vec<&ast::Concept> = ast::iter_all_concepts(&program.items).collect();
 
         // Check if it's a reaction
         let reaction = program.items.iter().find_map(|i| match i {

@@ -1,0 +1,111 @@
+@verbose 0.1.0
+
+-- Phase B slice 3 worked example: FIRST Verbose program with
+-- mutually-recursive types evaluated at runtime via `--run`.
+--
+-- An `Expr` is a sum type that contains itself in one of its variants
+-- (`Add of (lhs : Expr, rhs : Expr)`). Such a self-referencing type
+-- requires a `concept_group` block, which declares both the max
+-- recursion depth and the max node count up-front. Pre-B.1 this
+-- declaration didn't parse; pre-B.3 the verifier refused rules whose
+-- input or output referenced a group concept.
+--
+-- B.3 lifted the interpreter refusal: `--run` now evaluates rules that
+-- build and walk recursive Variant values. The Call arm of
+-- `eval_expr` accepts any `Value` (including `Value::Variant`) instead
+-- of only `Value::Record`, via the new `eval_rule_with_value` entry
+-- point.
+--
+-- Native lowering for `concept_group` is still Phase B slice 4+ (arena
+-- allocation in the rbp frame + 16-bit index references — see
+-- docs/recursive-types-design.md §6). `--native` refuses with a clear
+-- breadcrumb until that ships.
+--
+-- Run with: --run sum_seed --input sum_chain.json
+-- Expected: 0, 6, 15, 55 (sum of 0..=n for n ∈ {0, 3, 5, 10}).
+
+
+concept_group AST [max_depth: 30, max_nodes: 100]
+  @intention: "A tiny expression AST: Int literals and Add nodes"
+  @source: sum_chain.intent:1
+
+  concept Expr
+    @intention: "An expression: integer literal or sum of two sub-expressions"
+    @source: sum_chain.intent:1
+    variants:
+      Int of (value : number)
+      Add of (lhs : Expr, rhs : Expr)
+
+
+concept Seed
+  @intention: "A seed holds a non-negative integer between 0 and 10"
+  @source: sum_chain.intent:2
+
+  fields:
+    n : number [0, 10]
+
+
+rule build_chain
+  @intention: "Build Add(Int(n), Add(Int(n-1), ... Int(0))) from a seed"
+  @source: sum_chain.intent:3
+
+  input:
+    s : Seed
+
+  output:
+    e : Expr
+
+  logic:
+    e = if s.n == 0 then Expr::Int { value: 0 } else Expr::Add { lhs: Expr::Int { value: s.n }, rhs: build_chain(Seed { n: s.n - 1 }) }
+
+  proofs:
+    purity:
+      reads   : [s.n]
+      calls   : [build_chain]
+    termination:
+      bound : 100
+
+
+rule eval
+  @intention: "Evaluate an Expr to a Number by recursing on the tree"
+  @source: sum_chain.intent:4
+
+  input:
+    e : Expr
+
+  output:
+    out : number
+
+  logic:
+    out = match e:
+      Int(value) => value
+      Add(lhs, rhs) => eval(lhs) + eval(rhs)
+
+
+  proofs:
+    purity:
+      reads   : [e]
+      calls   : [eval]
+    termination:
+      bound : 100
+
+
+rule sum_seed
+  @intention: "Compose: build the chain then evaluate it"
+  @source: sum_chain.intent:5
+
+  input:
+    s : Seed
+
+  output:
+    out : number
+
+  logic:
+    out = eval(build_chain(s))
+
+  proofs:
+    purity:
+      reads   : [s]
+      calls   : [build_chain, eval]
+    termination:
+      bound : 10

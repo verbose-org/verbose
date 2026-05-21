@@ -152,12 +152,15 @@ pub fn verify_program(program: &Program, base_dir: &StdPath) -> Vec<VerifyError>
             Item::Rule(r) => {
                 // Phase B slice 1: rules cannot yet reference a concept
                 // declared inside a `concept_group` from their input or
-                // output. The interpreter / native / wasm paths for
-                // group-typed values land in slice B.3+ (interpreter) and
-                // B.4+ (native). Refuse here with a forward-looking
-                // breadcrumb so the auditor never has a binary that
-                // partially supports recursive types.
-                refuse_rule_using_group_type(r, &group_concept_owner, &mut errors);
+                // output. Phase B slice 3 (2026-05-21) lifted the
+                // interpreter refusal: rules can now build and traverse
+                // recursive Variant values via `--run`. The native
+                // refusal moves to `compile_native_code` (Phase B
+                // slice 4+ ships arena allocation + tag dispatch).
+                // The verifier no longer rejects rules that use group
+                // types — type-checking against `Type::Named(C)` where
+                // C is in a group works through the program-wide
+                // namespace already shared by B.1.
                 verify_rule(r, &concepts, &all_rules, &all_resources, &all_connections, base_dir, &mut errors);
                 // Phase 9 slice 1: every read(name) in the rule's logic
                 // must resolve to a declared resource. This is a separate
@@ -4148,14 +4151,10 @@ rule layered_caller
                     _ => None,
                 })
                 .collect();
-            let all_concepts: Vec<&Concept> = program
-                .items
-                .iter()
-                .filter_map(|i| match i {
-                    Item::Concept(c) => Some(c),
-                    _ => None,
-                })
-                .collect();
+            // Phase B slice 3: also include concepts declared inside
+            // a `concept_group` so the interpreter's MatchVariant arm
+            // can resolve positional binders against their declarations.
+            let all_concepts: Vec<&Concept> = iter_all_concepts(&program.items).collect();
             let rule = match all_rules.last() {
                 Some(r) => *r,
                 None => continue,
@@ -5583,12 +5582,12 @@ concept_group AST [max_depth: 10, max_nodes: 100000]
     }
 
     #[test]
-    fn phase_b1_rule_using_group_type_refused() {
-        // A rule whose input or output is a concept declared inside a
-        // concept_group is refused at verify time. Slice B.3 wires the
-        // interpreter; slice B.4+ wires native. The breadcrumb must
-        // name slice 3+ so an operator knows which milestone unlocks
-        // the path.
+    fn phase_b3_rule_using_group_type_verifies_for_interpreter() {
+        // Phase B slice 3 lifts the slice-1 verifier refusal: a rule
+        // whose input or output is a concept declared inside a
+        // `concept_group` is now ACCEPTED at verify time and runnable
+        // via `--run`. Native still refuses (slice B.4+ wires arena
+        // emit); that refusal moves to `compile_native_code`.
         let src = r#"@verbose 0.1.0
 
 concept_group AST [max_depth: 5, max_nodes: 50]
@@ -5601,7 +5600,7 @@ concept_group AST [max_depth: 5, max_nodes: 50]
     variants:
       Int of (n : number)
 
-rule bad
+rule ok
   @intention: "y"
   @source: invoices.intent:1
   input:
@@ -5619,9 +5618,8 @@ rule bad
 "#;
         let errs = verify_str(src);
         assert!(
-            errs.iter().any(|e| e.message.contains("concept_group type")
-                && e.message.contains("Phase B slice 3+")),
-            "expected rule-using-group-type rejection naming slice 3+, got {:#?}",
+            errs.is_empty(),
+            "B.3 lifted the slice-1 refusal; this rule must verify cleanly. Got: {:#?}",
             errs
         );
     }
