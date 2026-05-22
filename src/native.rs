@@ -232,41 +232,26 @@ fn compile_native_code(
     // sum_seed --native` reach an emit site for `eval`'s MatchVariant
     // and produce a stale Phase-A breadcrumb. Walking every rule is
     // O(program size) — cheap enough to do once per compile.
-    // Phase B slice 4a.2 — lifts the slice-4a.1 blanket refusal on
-    // group-concept `VariantConstruct`. The per-construct-site emit
-    // (`emit_eval_expr`'s VariantConstruct arm) now writes into the
-    // arena set up by slice 4a.1's prologue. Multi-concept groups and
-    // text/collection payloads are still refused at the construct site
-    // with B.4b/B.4c/B.4d breadcrumbs.
+    // Phase B slice 4a.3 — lifts the slice-4a.1 blanket refusal on
+    // group-concept `MatchVariant`. The per-match-site emit
+    // (`emit_eval_expr`'s MatchVariant arm) now dispatches off the
+    // arena entry's tag byte at runtime. Together with slice 4a.2's
+    // VariantConstruct emit (which writes the arena entries), this
+    // closes the round-trip needed for recursive types: build via
+    // VariantConstruct, walk via MatchVariant. The discriminator
+    // between Phase A's inlined-callee shape and the arena-dispatch
+    // shape is the SCRUTINEE TYPE — group concept ⇒ arena dispatch.
     //
-    // MatchVariant still walks here — slice 4a.3 will lift that arm
-    // with the arena-aware dispatch (read tag from `r11 + idx *
-    // entry_size`, jump-table over variants).
-    if !group_concept_names.is_empty() {
-        for (rname, r) in &rules {
-            let mut exprs_to_walk: Vec<&Expr> = vec![&r.logic.value];
-            for (_, e) in &r.logic.bindings {
-                exprs_to_walk.push(e);
-            }
-            // MatchVariant refusal (B.4a.3 follow-up).
-            for e in &exprs_to_walk {
-                if let Some(name) = find_group_match_variant_in_expr(
-                    e,
-                    &group_concept_names,
-                    &r.input_name,
-                    &r.input_ty,
-                    &rules,
-                ) {
-                    return Err(NativeError {
-                        message: format!(
-                            "native MatchVariant on concept_group type '{}' (in rule '{}') is Phase B slice 4a.3; use --run for now",
-                            name, rname
-                        ),
-                    });
-                }
-            }
-        }
-    }
+    // Slice constraints still in force (refused at emit time, not
+    // here):
+    //   - multi-concept groups → B.4b breadcrumb
+    //   - text payloads in variants → B.4c breadcrumb
+    //   - collection payloads in variants → B.4d breadcrumb
+    //   - arity > 2 → B.4a-followup breadcrumb (single-concept group's
+    //     `max_variant_arity` caps the tmp/binder pool sizes)
+    let _ = group_concept_names; // group_concept_names retained for future
+                                  // refusal points; slice 4a.3 emits, no
+                                  // longer refuses at the entry-rule walk.
 
     // Phase A slice 5.0/5.1a — handle recursive rules.
     //
@@ -313,25 +298,60 @@ fn compile_native_code(
         }
         scc_rules_owned = ordered;
 
-        // Slice 5.4 constraint: every SCC rule shares the entry's input
-        // concept (cross-concept mutual recursion needs Phase B-shaped
-        // ABI work and is not in scope here).
-        for r in &scc_rules_owned {
-            if r.input_ty != rule.input_ty {
-                return Err(NativeError {
-                    message: format!(
-                        "slice 5.4: mutually-recursive rule '{}' has input type {:?} but entry rule '{}' has type {:?}; cross-concept mutual recursion is a later slice.",
-                        r.name, r.input_ty, rule.name, rule.input_ty,
-                    ),
-                });
+        // Slice 4a.3: when the program declares a concept_group, extend
+        // `scc_rules_owned` with every recursive rule transitively
+        // reachable from the entry. This lifts the slice-5.4 same-SCC
+        // restriction (sum_seed's SCC is just {sum_seed}; eval and
+        // build_chain are each in their own SCCs). Each rule gets its
+        // own callable label so cross-SCC calls (`sum_seed`→`eval`,
+        // `sum_seed`→`build_chain`) resolve through the labels map
+        // instead of being inlined. This is gated on having a group:
+        // legacy Phase A recursion (no group) stays on the existing
+        // single-SCC discipline byte-for-byte.
+        let has_group = concept_group.is_some();
+        if has_group {
+            let mut already_in: std::collections::HashSet<String> =
+                scc_rules_owned.iter().map(|r| r.name.clone()).collect();
+            // Forward-reachable set from entry, restricted to recursive
+            // rules (those that are themselves part of some cycle). The
+            // entry itself is always included even if not recursive — it
+            // needs a callable so cross-SCC calls hit a real label.
+            let recursive_reachable =
+                collect_transitive_recursive_callees(rule, &rules);
+            for name in &recursive_reachable {
+                if already_in.contains(name) {
+                    continue;
+                }
+                if let Some(&r) = rules.get(name.as_str()) {
+                    scc_rules_owned.push(r);
+                    already_in.insert(name.clone());
+                }
             }
-            if r.output_ty != rule.output_ty {
-                return Err(NativeError {
-                    message: format!(
-                        "slice 5.4: mutually-recursive rule '{}' output {:?} differs from entry '{}'s output {:?}; SCC rules must share output type.",
-                        r.name, r.output_ty, rule.name, rule.output_ty,
-                    ),
-                });
+        }
+
+        // Slice 5.4 / 4a.3 constraint walk. Per-rule shape checks (no let
+        // bindings, output type, field types). For non-group programs we
+        // retain the original same-input/same-output check across the SCC.
+        // For group programs each callable has its own input/output shape,
+        // so those cross-rule equality checks are skipped.
+        for r in &scc_rules_owned {
+            if !has_group {
+                if r.input_ty != rule.input_ty {
+                    return Err(NativeError {
+                        message: format!(
+                            "slice 5.4: mutually-recursive rule '{}' has input type {:?} but entry rule '{}' has type {:?}; cross-concept mutual recursion is a later slice.",
+                            r.name, r.input_ty, rule.name, rule.input_ty,
+                        ),
+                    });
+                }
+                if r.output_ty != rule.output_ty {
+                    return Err(NativeError {
+                        message: format!(
+                            "slice 5.4: mutually-recursive rule '{}' output {:?} differs from entry '{}'s output {:?}; SCC rules must share output type.",
+                            r.name, r.output_ty, rule.name, rule.output_ty,
+                        ),
+                    });
+                }
             }
             if !r.logic.bindings.is_empty() {
                 return Err(NativeError {
@@ -341,33 +361,65 @@ fn compile_native_code(
                     ),
                 });
             }
-        }
-
-        if concept.fields.is_empty() {
-            return Err(NativeError {
-                message: format!(
-                    "recursive rule '{}' input concept '{}' has no fields (recursion needs at least one field to vary the argument)",
-                    rule.name, concept.name
-                ),
+            // Per-rule input shape check: group-concept input is allowed
+            // (single i64 index in rdi); record-concept input must have
+            // at least one Number field (slice 5.1a-5.3 ABI).
+            let r_concept_name: Option<&str> = match &r.input_ty {
+                Type::Named(n) => Some(n.as_str()),
+                _ => None,
+            };
+            let r_concept: Option<&Concept> = r_concept_name.and_then(|n| {
+                concepts.iter().find(|c| c.name == n).copied()
             });
-        }
-        for f in &concept.fields {
-            if f.ty != Type::Number {
+            let is_group_input = match r_concept {
+                Some(c) => !c.variants.is_empty(),
+                None => false,
+            };
+            if is_group_input {
+                // Group-concept input: ABI is i64 index in rdi, no field
+                // layout. Slice 4a.3 supports single-concept groups only
+                // (multi-concept refused at compile_native_code's earlier
+                // single-concept-per-group check).
+            } else if let Some(c) = r_concept {
+                if c.fields.is_empty() {
+                    return Err(NativeError {
+                        message: format!(
+                            "recursive rule '{}' input concept '{}' has no fields (recursion needs at least one field to vary the argument)",
+                            r.name, c.name
+                        ),
+                    });
+                }
+                for f in &c.fields {
+                    if f.ty != Type::Number {
+                        return Err(NativeError {
+                            message: format!(
+                                "recursive rule '{}' input field '{}' must be Number (got {:?}); text input in a recursive rule is a later slice (no multi-field text ABI yet).",
+                                r.name, f.name, f.ty
+                            ),
+                        });
+                    }
+                }
+            }
+            // Per-rule output check. Group-concept output is allowed
+            // (single i64 index in rax, populated by VariantConstruct
+            // emit). Otherwise must be Number/Bool/Text.
+            let is_group_output = match &r.output_ty {
+                Type::Named(n) => concepts
+                    .iter()
+                    .find(|c| c.name == *n)
+                    .map_or(false, |c| !c.variants.is_empty()),
+                _ => false,
+            };
+            if !is_group_output
+                && !matches!(&r.output_ty, Type::Number | Type::Bool | Type::Text)
+            {
                 return Err(NativeError {
                     message: format!(
-                        "recursive rule '{}' input field '{}' must be Number (got {:?}); text input in a recursive rule is a later slice (no multi-field text ABI yet).",
-                        rule.name, f.name, f.ty
+                        "recursive rule '{}' output must be Number, Bool, or Text (got {:?}); Result/Record returns are later slices.",
+                        r.name, r.output_ty
                     ),
                 });
             }
-        }
-        if !matches!(&rule.output_ty, Type::Number | Type::Bool | Type::Text) {
-            return Err(NativeError {
-                message: format!(
-                    "recursive rule '{}' output must be Number, Bool, or Text (got {:?}); Result/Record returns are later slices.",
-                    rule.name, rule.output_ty
-                ),
-            });
         }
         // (let-bindings already checked per-rule above.)
         let _ = cycle;
@@ -448,7 +500,7 @@ fn compile_native_code(
         // Slice 5.1a-5.4: emit the rule (or SCC) as real callables.
         // scc_rules_owned was populated above when recursion was detected;
         // for single self-recursion it has one entry, for mutual it has N.
-        emit_self_recursive_program(rule, &scc_rules_owned, concept, &rules, &resources, &connections, concept_group)?
+        emit_self_recursive_program(rule, &scc_rules_owned, concept, &rules, &resources, &connections, concept_group, &concepts)?
     } else if let Some(rx) = reaction {
         emit_reaction_program(rx, rule, concept, &rules, &resources, &connections, concept_group)?
     } else if is_result_output {
@@ -1382,6 +1434,55 @@ fn reaches_target(
         }
     }
     false
+}
+
+/// Phase B slice 4a.3 — collect every rule transitively reachable from
+/// `entry` via Call edges that is itself part of some cycle. Used when
+/// the program declares a `concept_group`: each recursive callee in the
+/// forward call graph needs its own callable label so cross-SCC calls
+/// resolve at runtime instead of being inlined infinitely.
+///
+/// Strategy: forward-walk from entry; for every rule visited, run an
+/// independent self-cycle DFS to decide whether THAT rule is recursive.
+/// O(N^2) in the worst case, but real programs have << 100 rules so the
+/// cost is negligible. The entry rule is included if it's itself
+/// recursive (its own cycle); the slice-5.4 SCC path already adds it
+/// otherwise via `scc_rules_owned`.
+fn collect_transitive_recursive_callees(
+    entry: &Rule,
+    all_rules: &HashMap<&str, &Rule>,
+) -> Vec<String> {
+    let mut forward: std::collections::HashSet<String> = std::collections::HashSet::new();
+    forward.insert(entry.name.clone());
+    let mut stack = vec![entry.name.clone()];
+    while let Some(n) = stack.pop() {
+        if let Some(&r) = all_rules.get(n.as_str()) {
+            let mut callees: Vec<String> = Vec::new();
+            for (_, e) in &r.logic.bindings {
+                collect_native_callees(e, &mut callees);
+            }
+            collect_native_callees(&r.logic.value, &mut callees);
+            for c in callees {
+                if forward.insert(c.clone()) {
+                    stack.push(c);
+                }
+            }
+        }
+    }
+    // Filter to recursive rules. A rule is recursive iff it can reach
+    // itself via Call edges. `detect_native_recursion` does exactly that
+    // (DFS finding a back edge); reuse it per-rule.
+    let mut out: Vec<String> = Vec::new();
+    for name in &forward {
+        if let Some(&r) = all_rules.get(name.as_str()) {
+            if detect_native_recursion(r, all_rules).is_some() {
+                out.push(name.clone());
+            }
+        }
+    }
+    // Stable order so callable layout is deterministic across compiles.
+    out.sort();
+    out
 }
 
 /// Collect every `Call(name, _)` referenced by `expr`. Walks the same
@@ -2847,10 +2948,42 @@ fn emit_record_loop_prologue<'a>(
     let exit_patch = code.len();
     code.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
 
-    // Input field offsets are shifted down by n_ctx to avoid colliding with context slots.
-    let offsets: HashMap<&str, i32> = input_concept.fields.iter().enumerate()
-        .map(|(i, f)| (f.name.as_str(), -(((n_ctx + i) as i32 + 1) * 8)))
-        .collect();
+    // Phase B slice 4a.3: when the input is a group concept (sum type
+    // with `variants:` but no `fields:`), treat it as a single i64
+    // index slot keyed by the rule's `input_name`. The argv entry is
+    // parsed as a Number (atoi) and stored in that slot. From the
+    // body's POV the input identifier resolves to the arena index,
+    // ready for MatchVariant arena dispatch.
+    let input_is_group = input_concept.fields.is_empty() && !input_concept.variants.is_empty();
+    let offsets: HashMap<&str, i32> = if input_is_group {
+        let off = -(((n_ctx as i32) + 1) * 8);
+        let mut m = HashMap::new();
+        m.insert(rule.input_name.as_str(), off);
+        m
+    } else {
+        input_concept.fields.iter().enumerate()
+            .map(|(i, f)| (f.name.as_str(), -(((n_ctx + i) as i32 + 1) * 8)))
+            .collect()
+    };
+
+    // Group-concept input: read the single i64 index from argv into the
+    // synthetic slot. Mirrors the per-field loop below but skips the
+    // type-dispatch (always Number).
+    if input_is_group {
+        let offset = offsets[rule.input_name.as_str()];
+        // mov rdi, [r13 + r14*8]
+        code.extend_from_slice(&[0x4B, 0x8B, 0x7C, 0xF5, 0x00]);
+        emit_atoi_inline(code);
+        if offset >= -128 {
+            code.extend_from_slice(&[0x48, 0x89, 0x45]);
+            code.push(offset as u8);
+        } else {
+            code.extend_from_slice(&[0x48, 0x89, 0x85]);
+            code.extend_from_slice(&offset.to_le_bytes());
+        }
+        // inc r14
+        code.extend_from_slice(&[0x49, 0xFF, 0xC6]);
+    }
 
     // Per-field dispatch: Number via atoi, Text stores the argv pointer.
     for field in &input_concept.fields {
@@ -3207,6 +3340,7 @@ fn emit_self_recursive_program<'a>(
     all_resources: &HashMap<&str, &'a Resource>,
     all_connections: &HashMap<&str, &'a Connection>,
     concept_group: Option<&'a ConceptGroup>,
+    all_concepts: &[&'a Concept],
 ) -> Result<Vec<u8>, NativeError> {
     let is_bool = entry_rule.output_ty == Type::Bool;
     let is_text = entry_rule.output_ty == Type::Text;
@@ -3221,20 +3355,54 @@ fn emit_self_recursive_program<'a>(
     let jmp_skip_patch = code.len();
     code.extend_from_slice(&[0x00; 4]);
 
+    // Phase B slice 4a.3 — per-rule input concept lookup. With group
+    // recursion the entry's input concept differs from a callee's (e.g.
+    // sum_seed:Seed → eval:Expr → build_chain:Seed). Each callable's
+    // prologue + body needs the rule's OWN input concept. Non-group
+    // Phase A recursion has all SCC rules sharing `concept` (slice-5.4
+    // constraint), so the per-rule lookup returns the same concept and
+    // emit is byte-for-byte unchanged.
+    let lookup_concept = |r: &'a Rule| -> Result<&'a Concept, NativeError> {
+        match &r.input_ty {
+            Type::Named(n) => all_concepts.iter().find(|c| c.name == *n).copied().ok_or_else(|| NativeError {
+                message: format!("native callable: unknown input concept '{}' for rule '{}'", n, r.name),
+            }),
+            _ => Err(NativeError {
+                message: format!("native callable: rule '{}' input must be a named concept (got {:?})", r.name, r.input_ty),
+            }),
+        }
+    };
+
+    // Pre-compute concept_group reference so each callable can thread
+    // the arena context into its body emit.
+    let cg: Option<&ConceptGroup> = concept_group;
+
     // Two-pass label resolution (slice 5.4). For a single self-recursive
     // rule (slice 5.1a-5.3) scc_rules.len() == 1 and the second pass
     // is byte-for-byte identical to the single-pass emit it replaces.
     // For mutually-recursive groups (slice 5.4+) each callable's offset
     // is forward-referenced by earlier callables; the first pass measures
     // sizes with placeholder labels, the second pass fills in real ones.
+    // Build the per-rule input arity table. For a group-concept input,
+    // arity is 1 (synthetic single i64 index slot); for a record-concept
+    // input, arity = `concept.fields.len()`. This drives the multi-field
+    // ABI dispatch in emit_eval_expr's Call arm independently of
+    // `offsets.len()` (which inflates when MatchVariant arms add binders).
+    let mut arities: HashMap<&str, usize> = HashMap::new();
+    for &r in scc_rules {
+        let c = lookup_concept(r)?;
+        let arity = if !c.variants.is_empty() { 1 } else { c.fields.len() };
+        arities.insert(r.name.as_str(), arity);
+    }
     let placeholder_labels: HashMap<&str, i32> = scc_rules.iter()
         .map(|r| (r.name.as_str(), 0_i32))
         .collect();
-    let placeholder_ctx = SelfCallCtx { labels: &placeholder_labels };
+    let placeholder_ctx = SelfCallCtx { labels: &placeholder_labels, arities: &arities };
     let mut sizes: Vec<usize> = Vec::with_capacity(scc_rules.len());
     for &r in scc_rules {
         let mut scratch = Vec::new();
-        emit_callable_into(&mut scratch, r, concept, all_rules, placeholder_ctx)?;
+        let r_concept = lookup_concept(r)?;
+        emit_callable_into(&mut scratch, r, r_concept, all_rules, placeholder_ctx, cg)?;
         sizes.push(scratch.len());
     }
     let leading_size = code.len(); // = 5
@@ -3244,11 +3412,12 @@ fn emit_self_recursive_program<'a>(
         labels.insert(r.name.as_str(), next_offset);
         next_offset += sizes[i] as i32;
     }
-    let final_ctx = SelfCallCtx { labels: &labels };
+    let final_ctx = SelfCallCtx { labels: &labels, arities: &arities };
 
     // Pass 2: emit each callable with real labels.
     for &r in scc_rules {
-        emit_callable_into(&mut code, r, concept, all_rules, final_ctx)?;
+        let r_concept = lookup_concept(r)?;
+        emit_callable_into(&mut code, r, r_concept, all_rules, final_ctx, cg)?;
     }
 
     // Patch the leading jmp to skip past all callables.
@@ -3259,11 +3428,26 @@ fn emit_self_recursive_program<'a>(
     // Standard prologue + per-record loop. The loop body calls the
     // entry rule's callable (the user invoked `--run entry_rule`).
     let entry_label = labels[entry_rule.name.as_str()];
+    // Phase B slice 4a.3: if the entry rule's input is a group concept,
+    // it has no record fields. The prologue treats it as a single i64
+    // input read from argv into the synthetic slot keyed by the rule's
+    // input_name. We use that slot here too.
+    let entry_is_group = !concept.variants.is_empty();
     let ctx = emit_record_loop_prologue(
         &mut code, entry_rule, concept, None, all_rules, all_resources, all_connections,
         concept_group,
     )?;
-    if !is_multi_field {
+    if entry_is_group {
+        // Single i64 — load from the synthetic slot keyed by input_name.
+        let field_slot = ctx.binding_offsets[entry_rule.input_name.as_str()];
+        if field_slot >= -128 {
+            code.extend_from_slice(&[0x48, 0x8B, 0x7D]);   // mov rdi, [rbp + disp8]
+            code.push(field_slot as u8);
+        } else {
+            code.extend_from_slice(&[0x48, 0x8B, 0xBD]);
+            code.extend_from_slice(&field_slot.to_le_bytes());
+        }
+    } else if !is_multi_field {
         // Single-field: rdi = value.
         let field_slot = ctx.binding_offsets[concept.fields[0].name.as_str()];
         if field_slot >= -128 {
@@ -3378,17 +3562,59 @@ fn emit_self_recursive_program<'a>(
 /// The `self_call` ctx routes any Call to a rule in `labels` to a real
 /// `call <target_offset>` instead of inlining. For slice 5.4 the labels
 /// map contains every SCC member, so cross-rule calls resolve correctly.
-fn emit_callable_into(
+fn emit_callable_into<'a>(
     code: &mut Vec<u8>,
-    rule: &Rule,
-    concept: &Concept,
+    rule: &'a Rule,
+    concept: &'a Concept,
     all_rules: &HashMap<&str, &Rule>,
     self_call: SelfCallCtx<'_>,
+    concept_group: Option<&'a ConceptGroup>,
 ) -> Result<(), NativeError> {
     let is_text = rule.output_ty == Type::Text;
-    let nfields = concept.fields.len();
+    // Phase B slice 4a.3: group-concept input has no `fields` (sum
+    // type). The callable's ABI degenerates to single i64 in rdi
+    // (the arena INDEX), spilled to `[rbp - 8]`. The input name (e.g.
+    // `e` for `eval(e: Expr)`) maps directly to that slot — no field
+    // dereference needed. This is the same ABI as the single-Number-
+    // field path of slice 5.1a; the difference is the slot holds an
+    // INDEX semantically, not a value.
+    let is_group_input = !concept.variants.is_empty();
+    let nfields = if is_group_input { 1 } else { concept.fields.len() };
     let is_multi_field = nfields > 1;
-    let frame_bytes = (nfields * 8) as i32;
+    // Phase B slice 4a.3: count match arms across the body to size the
+    // binder slot pool. Each arm body's binders are bound by storing
+    // payload slot values from the arena entry into per-binder rbp
+    // slots BEFORE the arm body runs. Max arity over all matches caps
+    // the pool size; slice 4a.3 single-concept group caps this at 2
+    // (Add has 2 recursive payload fields).
+    let max_arm_binders = count_max_match_arm_binders(&rule.logic.value);
+    // Phase B slice 4a.3: count VariantConstruct sites that need tmp
+    // slots. The slice-4a.1 prologue allocates tmp_slot_base + arena
+    // when called from `_start` (emit_full_program path), but RECURSIVE
+    // callables don't go through emit_record_loop_prologue — their tmp
+    // pool must live in the callable's own frame. Sized at the group's
+    // max_variant_arity when a group is declared AND the rule's body
+    // contains a VariantConstruct (slice 4a.3 only: e.g. build_chain).
+    // Eval has no VariantConstruct, so its tmp pool is 0 bytes (no
+    // change to the slice-5.1a frame layout).
+    let needs_tmp_pool = body_contains_variant_construct(&rule.logic.value);
+    let tmp_arity: i32 = if needs_tmp_pool {
+        concept_group
+            .and_then(|g| g.concepts.first())
+            .map(|c| c.variants.iter().map(|v| v.fields.len()).max().unwrap_or(0))
+            .unwrap_or(0) as i32
+    } else {
+        0
+    };
+    // Frame layout:
+    //   [rbp - 8 .. rbp - 8*(nfields)]      input fields / index
+    //   [rbp - 8*(nfields+1) .. rbp - 8*(nfields+max_arm_binders)]   binder slots
+    //   [rbp - 8*(nfields+max_arm_binders+1) .. tmp slots]
+    let binder_slot_base = -((nfields as i32 + 1) * 8); // first binder at this offset
+    let _ = binder_slot_base;
+    let tmp_slot_base_local = -((nfields as i32 + max_arm_binders as i32 + 1) * 8); // first tmp here
+    let total_slots = nfields + (max_arm_binders as usize) + (tmp_arity as usize);
+    let frame_bytes = (total_slots * 8) as i32;
 
     // Prologue.
     code.push(0x55);                                       // push rbp
@@ -3429,28 +3655,113 @@ fn emit_callable_into(
     // Build offsets / field_ranges maps for the body.
     let mut callable_offsets: HashMap<&str, i32> = HashMap::new();
     let mut callable_field_ranges: HashMap<&str, (i64, i64)> = HashMap::new();
-    for (i, f) in concept.fields.iter().enumerate() {
-        let off = -((i as i32 + 1) * 8);
-        callable_offsets.insert(f.name.as_str(), off);
-        if let Some((min, max)) = f.range {
-            callable_field_ranges.insert(f.name.as_str(), (min, max));
+    if is_group_input {
+        // Map the input identifier directly to the single i64 slot.
+        // The match-variant dispatch loads this as the arena index.
+        callable_offsets.insert(rule.input_name.as_str(), -8);
+    } else {
+        for (i, f) in concept.fields.iter().enumerate() {
+            let off = -((i as i32 + 1) * 8);
+            callable_offsets.insert(f.name.as_str(), off);
+            if let Some((min, max)) = f.range {
+                callable_field_ranges.insert(f.name.as_str(), (min, max));
+            }
         }
     }
     let callable_text_bindings = TextBindings::new();
 
+    // Phase B slice 4a.3 — build ArenaCtx for the callable's body when
+    // a concept_group is declared. The arena's rbp_offset is invalid
+    // inside the callable (different rbp); the in-callable variant
+    // skips the reload and TRUSTS r11 (caller set it up; no syscalls
+    // in recursive bodies). Tag/field maps come from the group.
+    let arena_holder: Option<(HashMap<&str, u8>, HashMap<&str, Vec<(String, Type)>>, &str, u32, i32, i32)>;
+    if let Some(g) = concept_group {
+        if let Some(group_concept) = g.concepts.first() {
+            let mut tags: HashMap<&str, u8> = HashMap::new();
+            let mut fields_map: HashMap<&str, Vec<(String, Type)>> = HashMap::new();
+            for (idx, v) in group_concept.variants.iter().enumerate() {
+                tags.insert(v.name.as_str(), idx as u8);
+                fields_map.insert(
+                    v.name.as_str(),
+                    v.fields.iter().map(|f| (f.name.clone(), f.ty.clone())).collect(),
+                );
+            }
+            let entry_size = compute_arena_entry_size(g);
+            arena_holder = Some((tags, fields_map, group_concept.name.as_str(), g.max_nodes, entry_size, tmp_arity));
+        } else {
+            arena_holder = None;
+        }
+    } else {
+        arena_holder = None;
+    }
+
     // Body.
     if is_text {
+        // Slice 4a.3 doesn't extend the text-recursive path; same as A.5.2.
         emit_recursive_text_body(
             code, &rule.logic.value, &rule.input_name, &callable_offsets,
             all_rules, &callable_field_ranges, &callable_text_bindings, self_call,
         )?;
     } else {
+        // Construct ArenaCtx for the body. The in-callable shape uses
+        // an i32 sentinel for arena_rbp_offset that tells VariantConstruct
+        // to TRUST r11 instead of reloading from the (now-stale) outer
+        // rbp. The MatchVariant arena dispatch uses entry_size + tag/
+        // field maps directly.
+        let arena_ctx_owned = arena_holder.as_ref().map(|(tags, fields_map, gname, max_nodes, entry_size, tmp_arity)| {
+            ArenaCtx {
+                arena_rbp_offset: i32::MAX, // sentinel: trust r11, do not reload
+                node_count_slot: 0, // unused inside callable for slice 4a.3
+                                    // (eval never constructs; build_chain
+                                    // constructs but the outer prologue
+                                    // owns the counter — slot offset would
+                                    // be wrong here. See in_callable note.)
+                entry_size: *entry_size,
+                max_nodes: *max_nodes,
+                tmp_slot_base: tmp_slot_base_local,
+                variant_tags: tags,
+                variant_fields: fields_map,
+                group_concept_name: gname,
+                arena_abort_patches: std::cell::RefCell::new(Vec::new()),
+                in_callable: true,
+                callable_node_count_seed: *tmp_arity, // unused but harmless
+            }
+        });
+        let arena_ctx_ref = arena_ctx_owned.as_ref();
         emit_eval_expr(
             code, &rule.logic.value, &rule.input_name, &callable_offsets,
             all_rules, &callable_field_ranges, &callable_text_bindings,
             Some(self_call),
-            None,
+            arena_ctx_ref,
         )?;
+        // Slice 4a.3: arena_abort_patches accumulated inside the callable
+        // must be resolved to a sys_exit(1) target. The callable doesn't
+        // own a per-rule abort label; we emit one inline (jmp-over) so
+        // the abort path is local to this callable. Cost: ~12 bytes only
+        // when at least one VariantConstruct site exists.
+        if let Some(ac) = arena_ctx_owned {
+            let patches = ac.arena_abort_patches.into_inner();
+            if !patches.is_empty() {
+                // jmp-over the abort tail so normal control flow continues.
+                code.push(0xEB); // jmp short
+                code.push(13);   // skip 13 bytes (mov+mov+syscall = 7+7+2 = 16? let's compute)
+                // Actually: mov rax, 60 = 7 bytes; mov rdi, 1 = 7 bytes; syscall = 2 bytes => 16
+                // Patch the jmp short offset.
+                let jmp_off_patch = code.len() - 1;
+                let abort_label = code.len();
+                for site in &patches {
+                    let rel = abort_label as i32 - (*site as i32 + 4);
+                    code[*site..*site + 4].copy_from_slice(&rel.to_le_bytes());
+                }
+                code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x3C, 0x00, 0x00, 0x00]);
+                code.extend_from_slice(&[0x48, 0xC7, 0xC7, 0x01, 0x00, 0x00, 0x00]);
+                code.extend_from_slice(&[0x0F, 0x05]);
+                let after = code.len();
+                let skip = (after as i32 - (abort_label as i32)) as i32;
+                code[jmp_off_patch] = skip as u8;
+            }
+        }
     }
 
     // Epilogue.
@@ -3458,6 +3769,80 @@ fn emit_callable_into(
     code.push(0x5D);                                       // pop rbp
     code.push(0xC3);                                       // ret
     Ok(())
+}
+
+/// Phase B slice 4a.3 — recursively count the max arity of any
+/// `MatchVariant` arm in `expr`. The callable's prologue reserves
+/// `max_binders * 8` bytes to back arm payload binders.
+fn count_max_match_arm_binders(expr: &Expr) -> u32 {
+    let mut max_n: u32 = 0;
+    fn walk(e: &Expr, m: &mut u32) {
+        match e {
+            Expr::MatchVariant(scrut, arms) => {
+                walk(scrut, m);
+                for a in arms {
+                    let n = a.binders.len() as u32;
+                    if n > *m {
+                        *m = n;
+                    }
+                    walk(&a.body, m);
+                }
+            }
+            Expr::Number(_) | Expr::Text(_) | Expr::Ident(_) | Expr::Read(_) | Expr::NowUnix => {}
+            Expr::Field(b, _) => walk(b, m),
+            Expr::Binary(_, l, r) => { walk(l, m); walk(r, m); }
+            Expr::Not(i) | Expr::Neg(i) | Expr::Ok(i) | Expr::Err(i)
+            | Expr::Abs(i) | Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i) => walk(i, m),
+            Expr::If(c, t, ee) => { walk(c, m); walk(t, m); walk(ee, m); }
+            Expr::Call(_, args) | Expr::Concat(args) => { for a in args { walk(a, m); } }
+            Expr::Quantifier(_, c, _, body) => { walk(c, m); walk(body, m); }
+            Expr::Fold(c, init, _, _, body) => { walk(c, m); walk(init, m); walk(body, m); }
+            Expr::FoldBytes(t, init, _, _, _, body) => { walk(t, m); walk(init, m); walk(body, m); }
+            Expr::Map(c, _, body) | Expr::Filter(c, _, body) => { walk(c, m); walk(body, m); }
+            Expr::MatchResult(t, _, ok, _, err) => { walk(t, m); walk(ok, m); walk(err, m); }
+            Expr::Record(_, fields) => { for (_, e) in fields { walk(e, m); } }
+            Expr::VariantConstruct(_, _, fields) => { for (_, e) in fields { walk(e, m); } }
+            Expr::Fetch(_, req) => walk(req, m),
+            Expr::StartsWith(h, n) | Expr::Contains(h, n) | Expr::EndsWith(h, n)
+            | Expr::Min(h, n) | Expr::Max(h, n) | Expr::ByteAt(h, n) => { walk(h, m); walk(n, m); }
+            Expr::Substring(t, s, e) => { walk(t, m); walk(s, m); walk(e, m); }
+        }
+    }
+    walk(expr, &mut max_n);
+    max_n
+}
+
+/// Phase B slice 4a.3 — does the expression tree contain a
+/// `VariantConstruct`? Used to decide whether a recursive callable
+/// needs tmp slots reserved in its frame.
+fn body_contains_variant_construct(expr: &Expr) -> bool {
+    match expr {
+        Expr::VariantConstruct(_, _, _) => true,
+        Expr::Number(_) | Expr::Text(_) | Expr::Ident(_) | Expr::Read(_) | Expr::NowUnix => false,
+        Expr::Field(b, _) => body_contains_variant_construct(b),
+        Expr::Binary(_, l, r) => body_contains_variant_construct(l) || body_contains_variant_construct(r),
+        Expr::Not(i) | Expr::Neg(i) | Expr::Ok(i) | Expr::Err(i)
+        | Expr::Abs(i) | Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i) => {
+            body_contains_variant_construct(i)
+        }
+        Expr::If(c, t, e) => body_contains_variant_construct(c) || body_contains_variant_construct(t) || body_contains_variant_construct(e),
+        Expr::Call(_, args) | Expr::Concat(args) => args.iter().any(body_contains_variant_construct),
+        Expr::Quantifier(_, c, _, body) => body_contains_variant_construct(c) || body_contains_variant_construct(body),
+        Expr::Fold(c, init, _, _, body) => body_contains_variant_construct(c) || body_contains_variant_construct(init) || body_contains_variant_construct(body),
+        Expr::FoldBytes(t, init, _, _, _, body) => body_contains_variant_construct(t) || body_contains_variant_construct(init) || body_contains_variant_construct(body),
+        Expr::Map(c, _, body) | Expr::Filter(c, _, body) => body_contains_variant_construct(c) || body_contains_variant_construct(body),
+        Expr::MatchResult(t, _, ok, _, err) => body_contains_variant_construct(t) || body_contains_variant_construct(ok) || body_contains_variant_construct(err),
+        Expr::Record(_, fields) => fields.iter().any(|(_, e)| body_contains_variant_construct(e)),
+        Expr::MatchVariant(scrut, arms) => {
+            body_contains_variant_construct(scrut) || arms.iter().any(|a| body_contains_variant_construct(&a.body))
+        }
+        Expr::Fetch(_, req) => body_contains_variant_construct(req),
+        Expr::StartsWith(h, n) | Expr::Contains(h, n) | Expr::EndsWith(h, n)
+        | Expr::Min(h, n) | Expr::Max(h, n) | Expr::ByteAt(h, n) => {
+            body_contains_variant_construct(h) || body_contains_variant_construct(n)
+        }
+        Expr::Substring(t, s, e) => body_contains_variant_construct(t) || body_contains_variant_construct(s) || body_contains_variant_construct(e),
+    }
 }
 
 /// Phase A slice 5.2 — emit a recursive callable's body that returns a
@@ -9860,6 +10245,14 @@ fn try_static_condition(
 #[derive(Clone, Copy)]
 struct SelfCallCtx<'a> {
     labels: &'a HashMap<&'a str, i32>,
+    /// Phase B slice 4a.3: per-callable input arity (number of i64 slots
+    /// the ABI consumes; 1 for group-concept inputs, 1+ for record-concept
+    /// inputs). Populated by `emit_self_recursive_program` BEFORE the
+    /// callables emit, so cross-callable calls inside any body can pick
+    /// the right marshaling path. Empty for Phase A code paths that
+    /// haven't been migrated; consumers fall back to `offsets.len()` in
+    /// that case (preserving byte-for-byte Phase A behavior).
+    arities: &'a HashMap<&'a str, usize>,
 }
 
 /// Phase B slice 4a.2 — arena context for `VariantConstruct` emission.
@@ -9888,8 +10281,16 @@ struct SelfCallCtx<'a> {
 /// invariant across arbitrary emit_eval_expr recursion).
 struct ArenaCtx<'a> {
     /// rbp offset to load r11 from (`lea r11, [rbp + arena_rbp_offset]`).
+    /// Slice 4a.3 sentinel: `i32::MAX` means "inside a recursive callable —
+    /// do NOT reload, trust the current r11 (set up once by the outer
+    /// prologue, preserved across `call`/`ret` because callables don't
+    /// touch r11 and recursive bodies have no syscalls)."
     arena_rbp_offset: i32,
     /// rbp offset of the 8-byte node_count slot.
+    /// Slice 4a.3 wrinkle: inside a callable the rbp differs, but the
+    /// counter conceptually belongs to the OUTER prologue's frame.
+    /// `in_callable` flips the addressing mode to reach it through r11
+    /// instead — see emit_eval_expr's VariantConstruct arm.
     node_count_slot: i32,
     /// Per-entry size (1 byte tag + 8 bytes per payload field, padded to 8).
     entry_size: i32,
@@ -9918,6 +10319,46 @@ struct ArenaCtx<'a> {
     /// `RecordLoopCtx.arena_abort_patches` once the top-level
     /// emit_eval_expr returns.
     arena_abort_patches: std::cell::RefCell<Vec<usize>>,
+    /// Phase B slice 4a.3: true when this ArenaCtx is threaded into a
+    /// recursive callable's body. Two consequences:
+    ///   1. VariantConstruct uses r11 directly without reloading from
+    ///      `arena_rbp_offset` (would be wrong: callable's rbp differs).
+    ///   2. The node_count counter and arena bytes still live in the
+    ///      outer prologue's frame; the callable accesses them via a
+    ///      pointer-based addressing scheme. For slice 4a.3 we store
+    ///      node_count just before the arena at a fixed offset relative
+    ///      to r11 (the arena base): r11 + max_nodes * entry_size is
+    ///      the byte right after the arena, and r11 - 8 is unused.
+    ///      Instead of moving the counter we KEEP it in the outer
+    ///      frame; the callable receives the node_count pointer via a
+    ///      dedicated register OR (slice 4a.3 choice) the counter is
+    ///      accessed via a known fixed offset from r11.
+    ///
+    /// Slice 4a.3 implementation: store node_count_addr in r10 at the
+    /// caller's prologue. r10 is caller-saved and may be clobbered by
+    /// the callable body. So we use a different approach: place the
+    /// node_count slot at a FIXED negative offset relative to r11
+    /// (e.g. r11 - 8). This works because:
+    ///   - The outer prologue puts node_count just below the arena
+    ///     (i.e. at lower addresses); arena base = r11.
+    ///   - From r11 - 8 we'd be ABOVE the arena, in the tmp slot
+    ///     pool. That collides.
+    ///
+    /// Simpler: in the outer prologue, put node_count slot at
+    /// `arena_base + arena_size` (i.e., r11 + max_nodes * entry_size,
+    /// which is the byte right after the arena). The callable can
+    /// then access node_count via `mov rax, [r11 + arena_size]`,
+    /// independent of rbp. This trades one i64 above the arena (still
+    /// inside the frame's reservation) for rbp-independence.
+    ///
+    /// For slice 4a.3, sum_chain's `eval` rule has no VariantConstruct,
+    /// so node_count access from a callable is academic — but
+    /// `build_chain` (the inverse) DOES construct from a callable.
+    /// We adopt the r11+arena_size scheme.
+    in_callable: bool,
+    /// Slice 4a.3 placeholder (unused in current emit but reserved for
+    /// future per-rule node_count seeding).
+    callable_node_count_seed: i32,
 }
 
 impl<'a> ArenaCtx<'a> {
@@ -9939,6 +10380,8 @@ impl<'a> ArenaCtx<'a> {
             variant_fields: &ctx.variant_fields,
             group_concept_name: ctx.group_concept_name,
             arena_abort_patches: std::cell::RefCell::new(Vec::new()),
+            in_callable: false,
+            callable_node_count_seed: 0,
         })
     }
 
@@ -10013,7 +10456,7 @@ fn emit_eval_expr(
             if *op == BinOp::Mul {
                 if let Expr::Number(n) = right.as_ref() {
                     if *n > 0 && (*n as u64).is_power_of_two() {
-                        emit_eval_expr(code, left, input_name, offsets, all_rules, field_ranges, text_bindings, self_call, None)?;
+                        emit_eval_expr(code, left, input_name, offsets, all_rules, field_ranges, text_bindings, self_call, arena_ctx)?;
                         let shift = (*n as u64).trailing_zeros() as u8;
                         code.extend_from_slice(&[0x48, 0xC1, 0xE0, shift]); // shl rax, shift
                         return Ok(());
@@ -10025,7 +10468,7 @@ fn emit_eval_expr(
             if *op == BinOp::Div {
                 if let Expr::Number(n) = right.as_ref() {
                     if *n > 0 && (*n as u64).is_power_of_two() {
-                        emit_eval_expr(code, left, input_name, offsets, all_rules, field_ranges, text_bindings, self_call, None)?;
+                        emit_eval_expr(code, left, input_name, offsets, all_rules, field_ranges, text_bindings, self_call, arena_ctx)?;
                         let shift = (*n as u64).trailing_zeros() as u8;
                         code.extend_from_slice(&[0x48, 0xC1, 0xE8, shift]); // shr rax, shift
                         return Ok(());
@@ -10044,7 +10487,7 @@ fn emit_eval_expr(
                             let dividend_non_negative = compute_range(left, field_ranges, input_name)
                                 .map_or(false, |(min, _)| min >= 0);
                             if dividend_non_negative {
-                                emit_eval_expr(code, left, input_name, offsets, all_rules, field_ranges, text_bindings, self_call, None)?;
+                                emit_eval_expr(code, left, input_name, offsets, all_rules, field_ranges, text_bindings, self_call, arena_ctx)?;
                                 // mov rcx, magic
                                 code.extend_from_slice(&[0x48, 0xB9]);
                                 code.extend_from_slice(&magic.to_le_bytes());
@@ -10074,16 +10517,16 @@ fn emit_eval_expr(
             // Strength reduction: multiply by 1 → identity
             if *op == BinOp::Mul {
                 if matches!(right.as_ref(), Expr::Number(1)) {
-                    return emit_eval_expr(code, left, input_name, offsets, all_rules, field_ranges, text_bindings, self_call, None);
+                    return emit_eval_expr(code, left, input_name, offsets, all_rules, field_ranges, text_bindings, self_call, arena_ctx);
                 }
                 if matches!(left.as_ref(), Expr::Number(1)) {
-                    return emit_eval_expr(code, right, input_name, offsets, all_rules, field_ranges, text_bindings, self_call, None);
+                    return emit_eval_expr(code, right, input_name, offsets, all_rules, field_ranges, text_bindings, self_call, arena_ctx);
                 }
             }
 
             // Strength reduction: add/sub 0 → identity
             if (*op == BinOp::Add || *op == BinOp::Sub) && matches!(right.as_ref(), Expr::Number(0)) {
-                return emit_eval_expr(code, left, input_name, offsets, all_rules, field_ranges, text_bindings, self_call, None);
+                return emit_eval_expr(code, left, input_name, offsets, all_rules, field_ranges, text_bindings, self_call, arena_ctx);
             }
 
             // === Text comparison: field == "literal" or field != "literal" ===
@@ -10277,7 +10720,7 @@ fn emit_eval_expr(
             // by the short-circuit semantics. No explicit `mov rax`
             // needed because rax is already correct.
             if matches!(op, BinOp::And | BinOp::Or) {
-                emit_eval_expr(code, left, input_name, offsets, all_rules, field_ranges, text_bindings, self_call, None)?;
+                emit_eval_expr(code, left, input_name, offsets, all_rules, field_ranges, text_bindings, self_call, arena_ctx)?;
                 // test rax, rax
                 code.extend_from_slice(&[0x48, 0x85, 0xC0]);
                 // jz/jnz rel32 — depending on op
@@ -10286,7 +10729,7 @@ fn emit_eval_expr(
                 let skip_patch = code.len();
                 code.extend_from_slice(&[0; 4]);
                 // Evaluate right (overwrites rax with right's value)
-                emit_eval_expr(code, right, input_name, offsets, all_rules, field_ranges, text_bindings, self_call, None)?;
+                emit_eval_expr(code, right, input_name, offsets, all_rules, field_ranges, text_bindings, self_call, arena_ctx)?;
                 // .skip_right:
                 let skip_pos = code.len();
                 let skip_rel = skip_pos as i32 - (skip_patch as i32 + 4);
@@ -10295,9 +10738,9 @@ fn emit_eval_expr(
             }
 
             // === General case: evaluate both sides, apply operator ===
-            emit_eval_expr(code, left, input_name, offsets, all_rules, field_ranges, text_bindings, self_call, None)?;
+            emit_eval_expr(code, left, input_name, offsets, all_rules, field_ranges, text_bindings, self_call, arena_ctx)?;
             code.push(0x50); // push rax
-            emit_eval_expr(code, right, input_name, offsets, all_rules, field_ranges, text_bindings, self_call, None)?;
+            emit_eval_expr(code, right, input_name, offsets, all_rules, field_ranges, text_bindings, self_call, arena_ctx)?;
             code.push(0x59); // pop rcx — now rcx=left, rax=right
 
             match op {
@@ -10387,7 +10830,19 @@ fn emit_eval_expr(
             // recursive shapes: pass-through and decreasing-arg.
             if let Some(ctx) = self_call {
                 if let Some(&self_target_offset) = ctx.labels.get(name.as_str()) {
-                    let nfields = offsets.len();
+                    // Phase B slice 4a.3: `offsets.len()` may be larger
+                    // than the callee's actual input arity because
+                    // MatchVariant arms add binders to the offsets map.
+                    // The SelfCallCtx carries a per-callable arity map
+                    // (`arities`), populated by emit_self_recursive_program
+                    // when building the labels table. The lookup gives
+                    // the i64-slot count for the callee's input ABI
+                    // (1 for group concepts, N for record concepts with
+                    // N fields). Fall back to offsets.len() only if the
+                    // callee isn't in the map, which means slice 4a.3
+                    // wasn't invoked — preserves Phase A byte-for-byte.
+                    let callee_arity = ctx.arities.get(name.as_str()).copied();
+                    let nfields = callee_arity.unwrap_or(offsets.len());
                     let multi_field = nfields > 1;
                     // Single-field path (slice 5.1a/5.1b): rdi holds the
                     // scalar value. Multi-field path (slice 5.3): rdi
@@ -10499,10 +10954,34 @@ fn emit_eval_expr(
                         }
                         return Ok(());
                     }
-                    // Single-field path (slice 5.1a/5.1b).
+                    // Single-field path (slice 5.1a/5.1b/4a.3).
+                    //
+                    // Slice 4a.3 generalisation: the arg used to be limited
+                    // to `Ident(input)` (pass-through) or `Record(C, {f: e})`
+                    // (slice 5.1b). To support `eval(lhs)` where `lhs` is a
+                    // match-arm binder (resolving to a binder rbp slot), any
+                    // Ident bound in `offsets` is now accepted via a generic
+                    // emit_eval_expr fallthrough. Pass-through `Ident(input)`
+                    // keeps its byte-for-byte specialised path (load directly
+                    // from the input slot, no eval call) — Phase A binaries
+                    // unchanged.
                     match &args[0] {
                         Expr::Ident(n) if n == input_name => {
-                            let field_offset = *offsets.values().next().unwrap();
+                            // Phase A path: offsets keys = field names of
+                            // the single-Number-field input, so the only
+                            // entry's value IS the field slot (held in
+                            // rdi by the callable's caller).
+                            // Phase B 4a.3 group path: offsets[input_name]
+                            // == -8 (the synthetic single-i64 slot).
+                            // Both shapes resolve via the same fallback:
+                            // pick the input_name entry if present, else
+                            // the first (which for single-field rules is
+                            // the only one).
+                            let field_offset = if let Some(&o) = offsets.get(input_name) {
+                                o
+                            } else {
+                                *offsets.values().next().unwrap()
+                            };
                             if field_offset >= -128 {
                                 code.extend_from_slice(&[0x48, 0x8B, 0x7D]);
                                 code.push(field_offset as u8);
@@ -10525,17 +11004,25 @@ fn emit_eval_expr(
                                 code, field_expr, input_name, offsets,
                                 all_rules, field_ranges, text_bindings,
                                 self_call,
-                                None,
+                                arena_ctx,
                             )?;
                             code.extend_from_slice(&[0x48, 0x89, 0xC7]); // mov rdi, rax
                         }
+                        // Slice 4a.3: any Number-typed expression (binder,
+                        // arithmetic, Call returning Number, etc.) becomes
+                        // the next recursion's arg via `emit_eval_expr →
+                        // rax → mov rdi, rax`. The verifier already type-
+                        // checked the call argument as Number-compatible
+                        // with the callee's single-i64 ABI, so we trust
+                        // the AST here.
                         other => {
-                            return Err(NativeError {
-                                message: format!(
-                                    "self-recursive call to '{}' arg must be Ident(input) or Record(input_concept, {{ field: expr }}) (got {:?})",
-                                    name, other
-                                ),
-                            });
+                            emit_eval_expr(
+                                code, other, input_name, offsets,
+                                all_rules, field_ranges, text_bindings,
+                                self_call,
+                                arena_ctx,
+                            )?;
+                            code.extend_from_slice(&[0x48, 0x89, 0xC7]); // mov rdi, rax
                         }
                     }
                     code.push(0xE8);
@@ -10566,14 +11053,14 @@ fn emit_eval_expr(
             if let Some(always) = try_static_condition(cond, field_ranges, input_name) {
                 if always {
                     // Condition always true — emit only then branch, skip comparison
-                    return emit_eval_expr(code, then_e, input_name, offsets, all_rules, field_ranges, text_bindings, self_call, None);
+                    return emit_eval_expr(code, then_e, input_name, offsets, all_rules, field_ranges, text_bindings, self_call, arena_ctx);
                 } else {
                     // Condition always false — emit only else branch, skip comparison
-                    return emit_eval_expr(code, else_e, input_name, offsets, all_rules, field_ranges, text_bindings, self_call, None);
+                    return emit_eval_expr(code, else_e, input_name, offsets, all_rules, field_ranges, text_bindings, self_call, arena_ctx);
                 }
             }
             // Dynamic: emit both branches with runtime check
-            emit_eval_expr(code, cond, input_name, offsets, all_rules, field_ranges, text_bindings, self_call, None)?;
+            emit_eval_expr(code, cond, input_name, offsets, all_rules, field_ranges, text_bindings, self_call, arena_ctx)?;
             // test al, al
             code.extend_from_slice(&[0x84, 0xC0]);
             // jz .else_branch
@@ -10582,7 +11069,7 @@ fn emit_eval_expr(
             let else_patch = code.len();
             code.extend_from_slice(&[0x00; 4]);
             // then branch → rax
-            emit_eval_expr(code, then_e, input_name, offsets, all_rules, field_ranges, text_bindings, self_call, None)?;
+            emit_eval_expr(code, then_e, input_name, offsets, all_rules, field_ranges, text_bindings, self_call, arena_ctx)?;
             // jmp .end
             code.push(0xE9);
             let end_patch = code.len();
@@ -10591,7 +11078,7 @@ fn emit_eval_expr(
             let else_pos = code.len();
             let eo = else_pos as i32 - (else_patch as i32 + 4);
             code[else_patch..else_patch + 4].copy_from_slice(&eo.to_le_bytes());
-            emit_eval_expr(code, else_e, input_name, offsets, all_rules, field_ranges, text_bindings, self_call, None)?;
+            emit_eval_expr(code, else_e, input_name, offsets, all_rules, field_ranges, text_bindings, self_call, arena_ctx)?;
             // .end:
             let end_pos = code.len();
             let ep = end_pos as i32 - (end_patch as i32 + 4);
@@ -10599,13 +11086,13 @@ fn emit_eval_expr(
             Ok(())
         }
         Expr::Not(inner) => {
-            emit_eval_expr(code, inner, input_name, offsets, all_rules, field_ranges, text_bindings, self_call, None)?;
+            emit_eval_expr(code, inner, input_name, offsets, all_rules, field_ranges, text_bindings, self_call, arena_ctx)?;
             // rax is 0 or 1; flip it
             code.extend_from_slice(&[0x48, 0x83, 0xF0, 0x01]); // xor rax, 1
             Ok(())
         }
         Expr::Neg(inner) => {
-            emit_eval_expr(code, inner, input_name, offsets, all_rules, field_ranges, text_bindings, self_call, None)?;
+            emit_eval_expr(code, inner, input_name, offsets, all_rules, field_ranges, text_bindings, self_call, arena_ctx)?;
             code.extend_from_slice(&[0x48, 0xF7, 0xD8]); // neg rax
             Ok(())
         }
@@ -10776,14 +11263,37 @@ fn emit_eval_expr(
                 }
             }
             // ── Step 2: load current node_count into rax ──
-            // mov rax, [rbp + node_count_slot]
-            let ncs = ac.node_count_slot;
-            if ncs >= -128 {
-                code.extend_from_slice(&[0x48, 0x8B, 0x45]);
-                code.push(ncs as u8);
+            //
+            // Slice 4a.3 wrinkle: inside a recursive callable the rbp
+            // differs from the outer prologue's rbp, so accessing
+            // node_count via `[rbp + node_count_slot]` would read
+            // garbage. The node_count slot lives at
+            // `arena_base + max_nodes * entry_size`, i.e. immediately
+            // above the arena. We address it via r11 + arena_size
+            // when in_callable=true, so the load is rbp-independent.
+            // When in_callable=false (slice 4a.2 path), the existing
+            // rbp-relative load runs byte-for-byte unchanged.
+            let arena_size_bytes = (ac.max_nodes as i32) * ac.entry_size;
+            if ac.in_callable {
+                // mov rax, [r11 + arena_size_bytes]
+                //   r11-indirect needs REX.B; disp32 form when offset > 127.
+                if arena_size_bytes <= 127 {
+                    code.extend_from_slice(&[0x49, 0x8B, 0x43]);
+                    code.push(arena_size_bytes as u8);
+                } else {
+                    code.extend_from_slice(&[0x49, 0x8B, 0x83]);
+                    code.extend_from_slice(&arena_size_bytes.to_le_bytes());
+                }
             } else {
-                code.extend_from_slice(&[0x48, 0x8B, 0x85]);
-                code.extend_from_slice(&ncs.to_le_bytes());
+                // mov rax, [rbp + node_count_slot]
+                let ncs = ac.node_count_slot;
+                if ncs >= -128 {
+                    code.extend_from_slice(&[0x48, 0x8B, 0x45]);
+                    code.push(ncs as u8);
+                } else {
+                    code.extend_from_slice(&[0x48, 0x8B, 0x85]);
+                    code.extend_from_slice(&ncs.to_le_bytes());
+                }
             }
             // ── Step 3: bounds check rax < max_nodes ──
             // mov r10, max_nodes_imm  (REX.WB 0x49, 0xBA, imm64)
@@ -10804,13 +11314,21 @@ fn emit_eval_expr(
             // syscalls in the construction path so the reload is
             // defensive; cheaper than tracking r11-liveness across
             // emit_eval_expr recursion.
-            let aro = ac.arena_rbp_offset;
-            if aro >= -128 {
-                code.extend_from_slice(&[0x4C, 0x8D, 0x5D]);
-                code.push(aro as u8);
-            } else {
-                code.extend_from_slice(&[0x4C, 0x8D, 0x9D]);
-                code.extend_from_slice(&aro.to_le_bytes());
+            //
+            // Slice 4a.3: skip the reload when inside a callable —
+            // r11 was set up by the OUTER prologue's frame, which is
+            // no longer addressable from the callable's rbp. Recursive
+            // bodies have no syscalls (slice constraint), so r11
+            // survives across `call`/`ret` and we trust it.
+            if !ac.in_callable {
+                let aro = ac.arena_rbp_offset;
+                if aro >= -128 {
+                    code.extend_from_slice(&[0x4C, 0x8D, 0x5D]);
+                    code.push(aro as u8);
+                } else {
+                    code.extend_from_slice(&[0x4C, 0x8D, 0x9D]);
+                    code.extend_from_slice(&aro.to_le_bytes());
+                }
             }
             // ── Step 5: compute entry address rcx = r11 + rax * entry_size ──
             // §11 pushback #1: compute address from PRE-inc index, then
@@ -10860,12 +11378,27 @@ fn emit_eval_expr(
             }
             // ── Step 8: bump node_count (rax already holds the pre-inc index) ──
             // inc qword [rbp + node_count_slot]  (REX.W 0x48, 0xFF, /0 = 0x45 disp8)
-            if ncs >= -128 {
-                code.extend_from_slice(&[0x48, 0xFF, 0x45]);
-                code.push(ncs as u8);
+            //
+            // Slice 4a.3: when in_callable, address node_count via r11 +
+            // arena_size (rbp-independent — see Step 2 rationale).
+            if ac.in_callable {
+                // inc qword [r11 + arena_size_bytes]  (REX.WB 0x49, 0xFF, /0 = 0x43)
+                if arena_size_bytes <= 127 {
+                    code.extend_from_slice(&[0x49, 0xFF, 0x43]);
+                    code.push(arena_size_bytes as u8);
+                } else {
+                    code.extend_from_slice(&[0x49, 0xFF, 0x83]);
+                    code.extend_from_slice(&arena_size_bytes.to_le_bytes());
+                }
             } else {
-                code.extend_from_slice(&[0x48, 0xFF, 0x85]);
-                code.extend_from_slice(&ncs.to_le_bytes());
+                let ncs = ac.node_count_slot;
+                if ncs >= -128 {
+                    code.extend_from_slice(&[0x48, 0xFF, 0x45]);
+                    code.push(ncs as u8);
+                } else {
+                    code.extend_from_slice(&[0x48, 0xFF, 0x85]);
+                    code.extend_from_slice(&ncs.to_le_bytes());
+                }
             }
             // rax holds the pre-inc index = the index of the just-
             // constructed node. Caller consumes it as a Number.
@@ -10899,6 +11432,172 @@ fn emit_eval_expr(
         // substitution choice (instead of frame slots like Phase 2F's
         // err_var) keeps slice A.4.1 self-contained — no prologue change.
         Expr::MatchVariant(scrutinee, arms) => {
+            // Phase B slice 4a.3 — arena-aware dispatch on a group-concept
+            // scrutinee. Trigger: ArenaCtx is present (program declares a
+            // concept_group). The scrutinee evaluates to a Number (the
+            // arena INDEX); we load the entry's tag byte, compare against
+            // each variant's declaration-order tag, bind payload slots to
+            // rbp-local binder slots, and dispatch to the matching arm.
+            //
+            // Slice 4a.3 scrutinee shapes accepted:
+            //   - `Ident(name)` where name resolves in `offsets`. The
+            //     binder load assumes the slot holds an i64 index.
+            //   - `Call(callee, [arg])` where callee returns a group
+            //     concept value (an index). We emit_eval_expr the Call,
+            //     leaving the index in rax, then dispatch.
+            //
+            // The Phase A 4.1 path (inlined-callee shape) stays as the
+            // fallback for non-group concepts. The discriminator is
+            // arena_ctx.is_some() — when None, no arena exists, so
+            // there is no group, so the Phase A path applies.
+            if let Some(ac) = arena_ctx {
+                // Step 1: produce the scrutinee value (an index) in rax.
+                emit_eval_expr(
+                    code, scrutinee, input_name, offsets, all_rules,
+                    field_ranges, text_bindings, self_call,
+                    Some(ac),
+                )?;
+                // Step 2: compute entry pointer in rax = r11 + idx * entry_size.
+                // mov r10, entry_size_imm
+                code.push(0x49);
+                code.push(0xBA);
+                code.extend_from_slice(&(ac.entry_size as i64).to_le_bytes());
+                // imul rax, r10  (REX.WB 0x49, 0x0F, 0xAF, ModR/M dst=rax reg=000 src=r10 rm=010 = 0xC2)
+                code.extend_from_slice(&[0x49, 0x0F, 0xAF, 0xC2]);
+                // add rax, r11  (REX.WR 0x4C, 0x01, ModR/M dst=rax rm=000 src=r11 reg=011 = 0xD8)
+                code.extend_from_slice(&[0x4C, 0x01, 0xD8]);
+                // Step 3: load tag byte into rcx.
+                // movzx rcx, byte [rax]  (REX.W 0x48, 0x0F, 0xB6, ModR/M dst=rcx reg=001 rm=000(rax) = 0x08)
+                code.extend_from_slice(&[0x48, 0x0F, 0xB6, 0x08]);
+                // Step 4: per-arm dispatch. For each arm in declaration
+                // order, emit:
+                //   cmp rcx, TAG_imm
+                //   jne .next_arm
+                //   <bind payload slots>
+                //   <emit arm body>
+                //   jmp .match_end
+                //   .next_arm:
+                // For the FINAL arm, we skip the cmp (verifier guarantees
+                // exhaustiveness — and we install a trap after the last
+                // arm to catch tag corruption).
+                //
+                // Binder slot layout: the callable's prologue reserved N
+                // slots starting at -((input_slots + 1) * 8). The first
+                // binder of any arm lands at that offset, the second at
+                // offset - 8, etc. Arms don't overlap (they're branches),
+                // so the pool can be shared across arms.
+                //
+                // Binder slot derivation: the callable prologue reserved
+                // them at -((nfields + 1) * 8) onwards. We derive nfields
+                // from the offsets map's smallest (most-negative) value
+                // for the input identifier(s). Simpler: scan offsets, find
+                // the most-negative existing slot, place binders below it.
+                let lowest_offset: i32 = offsets.values().copied().min().unwrap_or(-8);
+                // First binder slot is 8 bytes below the lowest existing
+                // offset. binder i sits at first - 8*i.
+                let binder_base = lowest_offset - 8;
+
+                let mut end_patches: Vec<usize> = Vec::new();
+                let n_arms = arms.len();
+                for (arm_idx, arm) in arms.iter().enumerate() {
+                    let is_last_arm = arm_idx + 1 == n_arms;
+                    let tag = *ac.variant_tags.get(arm.variant_name.as_str()).ok_or_else(|| NativeError {
+                        message: format!(
+                            "MatchVariant: arm references unknown variant '{}' for group '{}'",
+                            arm.variant_name, ac.group_concept_name
+                        ),
+                    })?;
+                    let declared_fields = ac.variant_fields.get(arm.variant_name.as_str()).ok_or_else(|| NativeError {
+                        message: format!(
+                            "MatchVariant: missing field metadata for variant '{}'",
+                            arm.variant_name
+                        ),
+                    })?;
+                    if arm.binders.len() != declared_fields.len() {
+                        return Err(NativeError {
+                            message: format!(
+                                "MatchVariant: arm '{}' has {} binders but variant declares {} fields",
+                                arm.variant_name, arm.binders.len(), declared_fields.len()
+                            ),
+                        });
+                    }
+                    // cmp rcx, tag_imm (cmp r/m64, imm8 sign-extended: REX.W 0x48, 0x83, /7 = 0xF9, imm8)
+                    code.extend_from_slice(&[0x48, 0x83, 0xF9]);
+                    code.push(tag);
+                    // jne .next_arm  (rel32 placeholder)
+                    code.push(0x0F);
+                    code.push(0x85);
+                    let next_arm_patch = code.len();
+                    code.extend_from_slice(&[0x00; 4]);
+                    // Bind payload slots from the entry (rax still points at it).
+                    // Each declared field is one i64 slot at offset 8 + 8*i.
+                    let mut extended_offsets = offsets.clone();
+                    let mut extended_ranges = field_ranges.clone();
+                    let _ = &mut extended_ranges;
+                    for (i, binder_opt) in arm.binders.iter().enumerate() {
+                        if let Some(binder_name) = binder_opt {
+                            let slot = binder_base - 8 * (i as i32);
+                            // mov rdx, [rax + (8 + 8*i)]
+                            let off = (8 + 8 * (i as i32)) as i32;
+                            if off <= 127 {
+                                code.extend_from_slice(&[0x48, 0x8B, 0x50]);
+                                code.push(off as u8);
+                            } else {
+                                code.extend_from_slice(&[0x48, 0x8B, 0x90]);
+                                code.extend_from_slice(&off.to_le_bytes());
+                            }
+                            // mov [rbp + slot], rdx
+                            if slot >= -128 {
+                                code.extend_from_slice(&[0x48, 0x89, 0x55]);
+                                code.push(slot as u8);
+                            } else {
+                                code.extend_from_slice(&[0x48, 0x89, 0x95]);
+                                code.extend_from_slice(&slot.to_le_bytes());
+                            }
+                            extended_offsets.insert(binder_name.as_str(), slot);
+                        }
+                    }
+                    // Emit arm body. Eval result lands in rax.
+                    emit_eval_expr(
+                        code, &arm.body, input_name, &extended_offsets,
+                        all_rules, &extended_ranges, text_bindings,
+                        self_call,
+                        Some(ac),
+                    )?;
+                    // jmp .match_end (rel32 forward)
+                    code.push(0xE9);
+                    let end_patch = code.len();
+                    code.extend_from_slice(&[0x00; 4]);
+                    end_patches.push(end_patch);
+                    // Patch the jne to point at the next arm (the byte
+                    // immediately after our jmp).
+                    let next_arm_pos = code.len();
+                    let next_off = next_arm_pos as i32 - (next_arm_patch as i32 + 4);
+                    code[next_arm_patch..next_arm_patch + 4].copy_from_slice(&next_off.to_le_bytes());
+                    let _ = is_last_arm;
+                }
+                // Trap: tag corruption — exit(2). Patches into here are
+                // the LAST arm's `jne` patch (since if it failed, no arm
+                // matched). The arm loop above already patched it to fall
+                // through here.
+                //   mov rax, 60 ; mov rdi, 2 ; syscall
+                code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x3C, 0x00, 0x00, 0x00]);
+                code.extend_from_slice(&[0x48, 0xC7, 0xC7, 0x02, 0x00, 0x00, 0x00]);
+                code.extend_from_slice(&[0x0F, 0x05]);
+                // Patch every "jmp .match_end" to land here (right after
+                // the trap). Control then continues with whatever follows
+                // in the caller — typically itoa + write + jmp loop_top.
+                let match_end = code.len();
+                for patch in end_patches {
+                    let off = match_end as i32 - (patch as i32 + 4);
+                    code[patch..patch + 4].copy_from_slice(&off.to_le_bytes());
+                }
+                return Ok(());
+            }
+            // Phase A slice 4.1 path: inlined-callee shape for non-group
+            // concepts. The arena_ctx is None, so we use the substitution
+            // strategy below.
+            //
             // Validate scrutinee shape.
             let (callee_name, arg_expr) = match scrutinee.as_ref() {
                 Expr::Call(name, args) if args.len() == 1 => (name.as_str(), &args[0]),
@@ -10950,9 +11649,23 @@ fn emit_eval_expr(
             }
             Ok(())
         }
-        Expr::Ident(name) if name == input_name => Err(NativeError {
-            message: "bare input binding not supported in expressions".into(),
-        }),
+        Expr::Ident(name) if name == input_name => {
+            // Phase B slice 4a.3: when the input concept is a group sum
+            // type, a bare `Ident(input_name)` means "the i64 index of
+            // the input value". Load it directly from the input slot.
+            // For record-concept inputs (Phase A path) the slot doesn't
+            // carry a meaningful scalar value, so we keep the legacy
+            // refusal there.
+            if let Some(offset) = offsets.get(name.as_str()) {
+                if arena_ctx.is_some() {
+                    load_rax_from_rbp(code, *offset);
+                    return Ok(());
+                }
+            }
+            Err(NativeError {
+                message: "bare input binding not supported in expressions".into(),
+            })
+        }
         Expr::Ident(name) => {
             // Let-bound variable — load from rbp-relative slot
             if let Some(offset) = offsets.get(name.as_str()) {
@@ -11105,7 +11818,7 @@ fn emit_eval_expr(
         // panic on i64::MIN (it stays at i64::MIN; the optimizer fold
         // uses wrapping_abs for the same property).
         Expr::Abs(inner) => {
-            emit_eval_expr(code, inner, input_name, offsets, all_rules, field_ranges, text_bindings, self_call, None)?;
+            emit_eval_expr(code, inner, input_name, offsets, all_rules, field_ranges, text_bindings, self_call, arena_ctx)?;
             // cqo
             code.extend_from_slice(&[0x48, 0x99]);
             // xor rax, rdx
@@ -11127,10 +11840,10 @@ fn emit_eval_expr(
         Expr::Min(left, right) | Expr::Max(left, right) => {
             let is_max = matches!(expr, Expr::Max(_, _));
             // eval left → rax; push rax
-            emit_eval_expr(code, left, input_name, offsets, all_rules, field_ranges, text_bindings, self_call, None)?;
+            emit_eval_expr(code, left, input_name, offsets, all_rules, field_ranges, text_bindings, self_call, arena_ctx)?;
             code.push(0x50); // push rax
             // eval right → rax
-            emit_eval_expr(code, right, input_name, offsets, all_rules, field_ranges, text_bindings, self_call, None)?;
+            emit_eval_expr(code, right, input_name, offsets, all_rules, field_ranges, text_bindings, self_call, arena_ctx)?;
             // pop rcx (rcx = left, rax = right)
             code.push(0x59);
             // cmp rcx, rax
@@ -25127,13 +25840,14 @@ rule make_color
         let _ = std::fs::remove_file(&out);
     }
 
-    /// Phase B slice 4a.1 — a rule that pattern-matches on a group
-    /// concept refuses with a B.4a.3 breadcrumb. Note that the rule
-    /// being refused doesn't have to be the entry rule — slice 4a.1
-    /// refuses across the entire program's rule set, so an entry
-    /// rule that calls into a group-matching rule also refuses.
+    /// Phase B slice 4a.3 — pattern match on a group concept compiles
+    /// (it used to refuse in slice 4a.1 with a B.4a.3 breadcrumb;
+    /// slice 4a.3 lifts that refusal with an arena-aware dispatch).
+    /// We just check that a single-arm match on a group concept value
+    /// compiles to native code without panicking. End-to-end runtime
+    /// validation lives in the companion sum_chain test.
     #[test]
-    fn phase_b4a1_match_variant_on_group_refused() {
+    fn phase_b4a3_match_variant_int_only_compiles() {
         let src = r#"@verbose 0.1.0
 
 concept_group AST [max_depth: 10, max_nodes: 32]
@@ -25154,7 +25868,7 @@ concept Seed
     n : number [0, 10]
 
 rule eval_int
-  @intention: "match an Expr — must be refused in 4a.1"
+  @intention: "match an Expr — compiles after slice 4a.3"
   @source: t.intent:1
   input:
     e : Expr
@@ -25163,30 +25877,112 @@ rule eval_int
   logic:
     out = match e:
       Int(value) => value
-      Add(lhs, rhs) => 0
+      Add(lhs, rhs) => eval_int(lhs)
   proofs:
     purity:
       reads : [e]
-      calls : []
+      calls : [eval_int]
     termination:
-      bound : 1
+      bound : 30
 "#;
         let tokens = crate::lexer::Lexer::new(src).tokenize().expect("tokenize");
         let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
-        let out = std::env::temp_dir().join("verbosec_test_b4a1_match_variant_refused");
-        let err = compile_native(&program, "eval_int", out.to_str().unwrap(), false, false)
-            .expect_err("MatchVariant on group concept must be refused in slice 4a.1");
-        let msg = err.message;
-        assert!(
-            msg.contains("slice 4a.3"),
-            "refusal must point at slice 4a.3; got: {}",
-            msg
-        );
-        assert!(
-            msg.contains("MatchVariant"),
-            "refusal must name MatchVariant; got: {}",
-            msg
-        );
+        let out = std::env::temp_dir().join("verbosec_test_b4a3_match_variant_int_only");
+        // Slice 4a.3 lifts the slice-4a.1 refusal — compile must succeed.
+        compile_native(&program, "eval_int", out.to_str().unwrap(), false, false)
+            .expect("MatchVariant on group concept must compile in slice 4a.3");
+        // Sanity: the binary should exist on disk after compile_native
+        // (no runtime test here — it requires arena pre-population).
+        let _ = std::fs::metadata(&out).expect("compiled binary should exist");
+        let _ = std::fs::remove_file(&out);
+    }
+
+    /// Phase B slice 4a.3 — two-arm MatchVariant on a group concept
+    /// compiles, with the Add arm body referencing match-arm binders
+    /// (`lhs`, `rhs`) in self-calls. This exercises the binder-slot
+    /// allocation + recursive-call arg-eval-with-arena_ctx path,
+    /// which together close the round-trip needed for sum_chain.
+    #[test]
+    fn phase_b4a3_match_variant_two_arm_compiles() {
+        let src = r#"@verbose 0.1.0
+
+concept_group AST [max_depth: 30, max_nodes: 100]
+  @intention: "tiny ast"
+  @source: t.intent:1
+
+  concept Expr
+    @intention: "expr"
+    @source: t.intent:1
+    variants:
+      Int of (value : number)
+      Add of (lhs : Expr, rhs : Expr)
+
+rule eval_two_arm
+  @intention: "match an Expr — recursive in both arms"
+  @source: t.intent:1
+  input:
+    e : Expr
+  output:
+    out : number
+  logic:
+    out = match e:
+      Int(value) => value
+      Add(lhs, rhs) => eval_two_arm(lhs) + eval_two_arm(rhs)
+  proofs:
+    purity:
+      reads : [e]
+      calls : [eval_two_arm]
+    termination:
+      bound : 30
+"#;
+        let tokens = crate::lexer::Lexer::new(src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+        let out = std::env::temp_dir().join("verbosec_test_b4a3_two_arm");
+        compile_native(&program, "eval_two_arm", out.to_str().unwrap(), false, false)
+            .expect("two-arm MatchVariant on group concept must compile in slice 4a.3");
+        let _ = std::fs::metadata(&out).expect("compiled binary should exist");
+        let _ = std::fs::remove_file(&out);
+    }
+
+    /// Phase B slice 4a.3 — the audit-defensible worked example:
+    /// `examples/sum_chain.verbose::sum_seed` compiles natively and
+    /// produces the same output as `--run`. This is the milestone test
+    /// for Phase B: recursive types compile AND run natively.
+    #[test]
+    fn phase_b4a3_sum_chain_native_runtime() {
+        let src = std::fs::read_to_string("examples/sum_chain.verbose")
+            .expect("examples/sum_chain.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+        let out = std::env::temp_dir().join("verbosec_test_b4a3_sum_chain");
+        compile_native(&program, "sum_seed", out.to_str().unwrap(), false, false)
+            .expect("sum_seed must compile natively in slice 4a.3");
+        // Make sure binary has executable bit.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o755));
+        }
+        // Run for each canonical n and check the produced stdout.
+        let cases: &[(&str, &str)] = &[("0", "0\n"), ("3", "6\n"), ("5", "15\n"), ("10", "55\n")];
+        for (n_arg, expected) in cases {
+            let output = std::process::Command::new(&out)
+                .arg(n_arg)
+                .output()
+                .expect("native sum_seed must run");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert_eq!(
+                stdout.as_ref(),
+                *expected,
+                "sum_seed({}) native output mismatch: expected {:?}, got {:?}",
+                n_arg, expected, stdout
+            );
+            assert!(
+                output.status.success(),
+                "sum_seed({}) native should exit 0; got {:?}",
+                n_arg, output.status
+            );
+        }
         let _ = std::fs::remove_file(&out);
     }
 
