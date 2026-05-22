@@ -232,24 +232,21 @@ fn compile_native_code(
     // sum_seed --native` reach an emit site for `eval`'s MatchVariant
     // and produce a stale Phase-A breadcrumb. Walking every rule is
     // O(program size) — cheap enough to do once per compile.
+    // Phase B slice 4a.2 — lifts the slice-4a.1 blanket refusal on
+    // group-concept `VariantConstruct`. The per-construct-site emit
+    // (`emit_eval_expr`'s VariantConstruct arm) now writes into the
+    // arena set up by slice 4a.1's prologue. Multi-concept groups and
+    // text/collection payloads are still refused at the construct site
+    // with B.4b/B.4c/B.4d breadcrumbs.
+    //
+    // MatchVariant still walks here — slice 4a.3 will lift that arm
+    // with the arena-aware dispatch (read tag from `r11 + idx *
+    // entry_size`, jump-table over variants).
     if !group_concept_names.is_empty() {
         for (rname, r) in &rules {
-            // Skip rules whose input is not a Named concept (defensive —
-            // those can't reference a group concept by construction).
             let mut exprs_to_walk: Vec<&Expr> = vec![&r.logic.value];
             for (_, e) in &r.logic.bindings {
                 exprs_to_walk.push(e);
-            }
-            // VariantConstruct refusal (B.4a.2 follow-up).
-            for e in &exprs_to_walk {
-                if let Some(name) = find_group_variant_construct_in_expr(e, &group_concept_names) {
-                    return Err(NativeError {
-                        message: format!(
-                            "native VariantConstruct for concept_group type '{}' (in rule '{}') is Phase B slice 4a.2; use --run for now",
-                            name, rname
-                        ),
-                    });
-                }
             }
             // MatchVariant refusal (B.4a.3 follow-up).
             for e in &exprs_to_walk {
@@ -433,7 +430,19 @@ fn compile_native_code(
     // (mirrors emit_fold_program's shape but iterates bytes of a
     // text field rather than records of an input collection).
     let is_fold_bytes_output = matches!(&rule.output_ty, Type::Number) && matches!(&rule.logic.value, Expr::FoldBytes(_, _, _, _, _, _));
-    let record_output_concept: Option<&Concept> = match &rule.output_ty { Type::Named(n) => concepts.iter().find(|c| c.name == *n).copied(), _ => None };
+    // Phase B slice 4a.2: a rule whose `output: Named(N)` where N is a
+    // group concept (sum type, `variants:` present, no `fields:`) must
+    // NOT route through `emit_record_program` — that emitter assumes a
+    // record-shape output and would walk an empty `fields` list. Instead
+    // these rules fall through to `emit_full_program`, which prints the
+    // ARENA INDEX (a Number) left in rax by the VariantConstruct emit.
+    // `record_output_concept` therefore filters to record-shape concepts
+    // only; sum-type group concepts are deliberately treated as Number
+    // outputs at the dispatch layer.
+    let record_output_concept: Option<&Concept> = match &rule.output_ty {
+        Type::Named(n) => concepts.iter().find(|c| c.name == *n).copied().filter(|c| !c.fields.is_empty() || c.variants.is_empty()),
+        _ => None,
+    };
 
     let mut code = if recursion_witness.is_some() {
         // Slice 5.1a-5.4: emit the rule (or SCC) as real callables.
@@ -668,6 +677,35 @@ struct RecordLoopCtx<'a> {
     /// label unconditionally when `arena_size > 0` — this gives B.4a.2 a
     /// patch target without needing to modify the prologue or epilogue.
     arena_abort_patches: Vec<usize>,
+    /// Phase B slice 4a.2: rbp offset of the first (most-shallow) tmp
+    /// slot used to spill subterms before a `VariantConstruct` writes the
+    /// arena entry. The i-th tmp lives at `tmp_slot_base - 8*i`. The
+    /// pool size equals `max_variant_arity` over the group's only
+    /// concept's variants (capped at 2 by slice 4a.2's single-concept
+    /// constraint; sum_chain's `Add` is the upper bound at 2). 0 when no
+    /// group is declared — purely-additive layout (the slot doesn't
+    /// exist in the frame in that case).
+    tmp_slot_base: i32,
+    /// Phase B slice 4a.2: variant name → tag byte, declaration order
+    /// starting at 0. Tags fit in 1 byte; the verifier's 65535-variant
+    /// ceiling (from B.1) is well above the 256 cap of a u8 here, but
+    /// real programs have at most a dozen variants. Empty when no group
+    /// is declared.
+    variant_tags: HashMap<&'a str, u8>,
+    /// Phase B slice 4a.2: variant name → owned list of (field name, field
+    /// type) pairs in declaration order. Owned because the AST's
+    /// `Variant.fields` is the source of truth; the prologue snapshots a
+    /// reference-friendly view here for the emit loop. Empty when no
+    /// group is declared.
+    variant_fields: HashMap<&'a str, Vec<(String, Type)>>,
+    /// Phase B slice 4a.2: name of the single group concept (the only
+    /// type whose `Type::Named(...)` payload field counts as a self-
+    /// reference for arena indexing). Empty string when no group is
+    /// declared.
+    group_concept_name: &'a str,
+    /// Phase B slice 4a.2: cap on arena entries (`max_nodes` from the
+    /// group declaration). 0 when no group is declared.
+    arena_max_nodes: u32,
 }
 
 /// Emit an argc guard: if r12 (argc) < min_argc, write an error message
@@ -2584,7 +2622,27 @@ fn emit_record_loop_prologue<'a>(
         }
         None => (0, 0),
     };
-    let arena_extra_bytes: i32 = if arena_size > 0 { arena_size + 8 } else { 0 };
+    // Phase B slice 4a.2 — tmp slot pool for VariantConstruct subterm
+    // spilling. Slice constraint (single-concept group) lets us compute
+    // the pool size as `max_variant_arity` over the only concept. Each
+    // tmp slot holds an i64 (Number value or zero-extended arena index)
+    // so the pool is `max_variant_arity * 8` bytes. Reserved BELOW the
+    // arena (most-negative end of the frame) so the existing fixed
+    // slot offsets (above the arena) stay byte-for-byte unchanged.
+    let max_variant_arity: i32 = match concept_group {
+        Some(g) => g
+            .concepts
+            .first()
+            .map(|c| c.variants.iter().map(|v| v.fields.len()).max().unwrap_or(0))
+            .unwrap_or(0) as i32,
+        None => 0,
+    };
+    let tmp_slot_extra_bytes: i32 = if arena_size > 0 { max_variant_arity * 8 } else { 0 };
+    let arena_extra_bytes: i32 = if arena_size > 0 {
+        arena_size + 8 + tmp_slot_extra_bytes
+    } else {
+        0
+    };
 
     let frame_slots = n_ctx + nfields + n_binding_slots + n_reserved;
     let frame_size = (frame_slots * 8) as i32
@@ -2745,9 +2803,14 @@ fn emit_record_loop_prologue<'a>(
     // reserved but never written. r11 is set up so 4a.2's VariantConstruct
     // emit can land directly on it (when called immediately after the
     // prologue, before any syscall).
-    let (node_count_slot, arena_rbp_offset): (i32, i32) = if arena_size > 0 {
+    let (node_count_slot, arena_rbp_offset, tmp_slot_base): (i32, i32, i32) = if arena_size > 0 {
         let nc_slot = post_now_next_slot - 8;
         let arena_off = nc_slot - arena_size;
+        // Phase B slice 4a.2 — tmp slot pool sits BELOW the arena
+        // (deeper, more-negative addresses) so node_count_slot and
+        // arena_rbp_offset keep their slice-4a.1 layout. The first tmp
+        // is the i64 just below the arena's bottom byte.
+        let tmp_base = arena_off - 8;
         // mov qword [rbp + nc_slot], 0  — initialize node_count to 0.
         if nc_slot >= -128 {
             code.extend_from_slice(&[0x48, 0xC7, 0x45]);
@@ -2770,9 +2833,9 @@ fn emit_record_loop_prologue<'a>(
             code.extend_from_slice(&[0x4C, 0x8D, 0x9D]);
             code.extend_from_slice(&arena_off.to_le_bytes());
         }
-        (nc_slot, arena_off)
+        (nc_slot, arena_off, tmp_base)
     } else {
-        (0, 0)
+        (0, 0, 0)
     };
 
     let loop_top = code.len();
@@ -2905,7 +2968,7 @@ fn emit_record_loop_prologue<'a>(
             text_bindings.insert(name.as_str(), (ptr_slot, len_slot));
             next_slot -= 16;
         } else {
-            emit_eval_expr(code, expr, &rule.input_name, &binding_offsets, all_rules, &field_ranges, &text_bindings, None)?;
+            emit_eval_expr(code, expr, &rule.input_name, &binding_offsets, all_rules, &field_ranges, &text_bindings, None, None)?;
             if next_slot >= -128 {
                 code.extend_from_slice(&[0x48, 0x89, 0x45]);
                 code.push(next_slot as u8);
@@ -2917,6 +2980,31 @@ fn emit_record_loop_prologue<'a>(
             next_slot -= 8;
         }
     }
+
+    // Phase B slice 4a.2 — variant tag map + field-shape snapshot for
+    // the only group concept (when one is declared). Tags are assigned
+    // in declaration order starting at 0. Empty otherwise.
+    let (variant_tags, variant_fields, group_concept_name, arena_max_nodes) = match concept_group {
+        Some(g) => match g.concepts.first() {
+            Some(c) => {
+                let mut tags: HashMap<&str, u8> = HashMap::new();
+                let mut fields: HashMap<&str, Vec<(String, Type)>> = HashMap::new();
+                for (idx, v) in c.variants.iter().enumerate() {
+                    tags.insert(v.name.as_str(), idx as u8);
+                    fields.insert(
+                        v.name.as_str(),
+                        v.fields
+                            .iter()
+                            .map(|f| (f.name.clone(), f.ty.clone()))
+                            .collect(),
+                    );
+                }
+                (tags, fields, c.name.as_str(), g.max_nodes)
+            }
+            None => (HashMap::new(), HashMap::new(), "", 0u32),
+        },
+        None => (HashMap::new(), HashMap::new(), "", 0u32),
+    };
 
     Ok(RecordLoopCtx {
         loop_top,
@@ -2936,6 +3024,11 @@ fn emit_record_loop_prologue<'a>(
         node_count_slot,
         entry_size: arena_entry_size,
         arena_abort_patches: Vec::new(),
+        tmp_slot_base,
+        variant_tags,
+        variant_fields,
+        group_concept_name,
+        arena_max_nodes,
     })
 }
 
@@ -2999,19 +3092,38 @@ fn emit_full_program<'a>(
 ) -> Result<Vec<u8>, NativeError> {
     let is_bool = rule.output_ty == Type::Bool;
     let mut code = Vec::new();
-    let ctx = emit_record_loop_prologue(&mut code, rule, concept, context_concept, all_rules, all_resources, all_connections, concept_group)?;
+    let mut ctx = emit_record_loop_prologue(&mut code, rule, concept, context_concept, all_rules, all_resources, all_connections, concept_group)?;
 
-    // Evaluate final expression — result in rax
-    emit_eval_expr(
-        &mut code,
-        &rule.logic.value,
-        &rule.input_name,
-        &ctx.binding_offsets,
-        all_rules,
-        &ctx.field_ranges,
-        &ctx.text_bindings,
-        None,
-    )?;
+    // Phase B slice 4a.2 — build an arena context iff the program
+    // declares a concept_group. Non-group programs pass `None` (byte-
+    // for-byte unchanged from the slice-4a.1 path). The block scopes
+    // the immutable borrows on ctx so the patch-drain below can take
+    // a mutable borrow.
+    let drained_patches: Vec<usize> = {
+        let arena_ctx = ArenaCtx::from_record_ctx(&ctx);
+
+        // Evaluate final expression — result in rax
+        emit_eval_expr(
+            &mut code,
+            &rule.logic.value,
+            &rule.input_name,
+            &ctx.binding_offsets,
+            all_rules,
+            &ctx.field_ranges,
+            &ctx.text_bindings,
+            None,
+            arena_ctx.as_ref(),
+        )?;
+
+        match arena_ctx {
+            Some(ac) => ac.arena_abort_patches.into_inner(),
+            None => Vec::new(),
+        }
+    };
+    // Drain arena-overflow patch sites into the RecordLoopCtx so the
+    // epilogue's existing patch-resolution loop (slice 4a.1) lands them
+    // at the shared per-group abort label.
+    ctx.arena_abort_patches.extend(drained_patches);
 
     // Print result per record
     if is_bool {
@@ -3337,6 +3449,7 @@ fn emit_callable_into(
             code, &rule.logic.value, &rule.input_name, &callable_offsets,
             all_rules, &callable_field_ranges, &callable_text_bindings,
             Some(self_call),
+            None,
         )?;
     }
 
@@ -3448,6 +3561,7 @@ fn emit_recursive_text_body(
                         code, field_expr, input_name, offsets,
                         all_rules, field_ranges, text_bindings,
                         Some(self_call),
+                        None,
                     )?;
                     code.extend_from_slice(&[0x48, 0x89, 0xC7]); // mov rdi, rax
                 }
@@ -3476,6 +3590,7 @@ fn emit_recursive_text_body(
             emit_eval_expr(
                 code, cond, input_name, offsets, all_rules,
                 field_ranges, text_bindings, Some(self_call),
+                None,
             )?;
             code.extend_from_slice(&[0x84, 0xC0]); // test al, al
             code.push(0x0F);
@@ -4238,6 +4353,7 @@ fn emit_substring_bounds_and_slice(
     // (2) Evaluate end → rax
     emit_eval_expr(
         code, end_expr, input_name, offsets, all_rules, field_ranges, text_bindings, None,
+        None,
     )?;
     // (3) push rax (save end at [rsp])
     code.push(0x50);
@@ -4251,6 +4367,7 @@ fn emit_substring_bounds_and_slice(
     // (5) Evaluate start → rax
     emit_eval_expr(
         code, start_expr, input_name, offsets, all_rules, field_ranges, text_bindings, None,
+        None,
     )?;
     // (6) Bounds: start > end → abort
     //   mov rcx, [rsp] ; cmp rax, rcx ; ja .abort
@@ -4601,7 +4718,7 @@ fn emit_concat_fill(
             ConcatArgKind::Number => {
                 // push rbx — save write pointer (emit_eval_expr may clobber it via Binary op push/pop)
                 code.push(0x53);
-                emit_eval_expr(code, arg, input_name, offsets, all_rules, field_ranges, text_bindings, None)?;
+                emit_eval_expr(code, arg, input_name, offsets, all_rules, field_ranges, text_bindings, None, None)?;
                 // pop rbx
                 code.push(0x5B);
                 // itoa into buffer (rax → decimal digits at [rbx], rbx advanced)
@@ -5611,7 +5728,7 @@ fn emit_text_write_to_fd(
             // Conditional text: evaluate condition, branch, recurse on each
             // arm. Each arm writes its own text to the fd; control joins
             // after both branches.
-            emit_eval_expr(code, cond, input_name, offsets, all_rules, field_ranges, text_bindings, None)?;
+            emit_eval_expr(code, cond, input_name, offsets, all_rules, field_ranges, text_bindings, None, None)?;
             // test rax, rax ; jz else (rel32)
             code.extend_from_slice(&[0x48, 0x85, 0xC0]);
             code.push(0x0F);
@@ -5955,7 +6072,7 @@ fn emit_eval_result_expr(
             match t_ok {
                 Type::Number => {
                     // Number Ok: evaluate → rax, itoa writes decimal + \n to stdout.
-                    emit_eval_expr(code, inner, &rule.input_name, offsets, all_rules, field_ranges, text_bindings, None)?;
+                    emit_eval_expr(code, inner, &rule.input_name, offsets, all_rules, field_ranges, text_bindings, None, None)?;
                     emit_itoa_inline(code);
                 }
                 Type::Text => {
@@ -6035,7 +6152,7 @@ fn emit_eval_result_expr(
         }
         Expr::If(cond, then_e, else_e) => {
             // Evaluate the condition as a normal scalar (bool: 0 or 1).
-            emit_eval_expr(code, cond, &rule.input_name, offsets, all_rules, field_ranges, text_bindings, None)?;
+            emit_eval_expr(code, cond, &rule.input_name, offsets, all_rules, field_ranges, text_bindings, None, None)?;
             // test rax, rax ; jz .else (rel32 patch so arms can be large)
             code.extend_from_slice(&[0x48, 0x85, 0xC0]);
             code.push(0x0F);
@@ -6280,7 +6397,7 @@ fn emit_redirect_callee_leaves(
             // callee.input_name to emit_eval_expr; offsets/field_ranges
             // are the outer's tables (same field names, by slice
             // contract — validated up-front).
-            emit_eval_expr(code, inner, &callee.input_name, offsets, all_rules, field_ranges, text_bindings, None)?;
+            emit_eval_expr(code, inner, &callee.input_name, offsets, all_rules, field_ranges, text_bindings, None, None)?;
             // Store at match_slot.
             store_rax_at_rbp(code, slots.match_slot);
             // Augment offsets with ok_var → match_slot, then emit outer ok_body
@@ -6463,7 +6580,7 @@ fn emit_redirect_callee_leaves(
             // callee.input_name. Field accesses resolve through `offsets`
             // (built from the outer's concept), which by slice contract
             // contains every name the callee could reference.
-            emit_eval_expr(code, cond, &callee.input_name, offsets, all_rules, field_ranges, text_bindings, None)?;
+            emit_eval_expr(code, cond, &callee.input_name, offsets, all_rules, field_ranges, text_bindings, None, None)?;
             code.extend_from_slice(&[0x48, 0x85, 0xC0]); // test rax, rax
             code.push(0x0F);
             code.push(0x84);
@@ -6578,6 +6695,7 @@ fn emit_redirect_variant_leaves(
             emit_eval_expr(
                 code, &substituted, outer_input_name, offsets,
                 all_rules, field_ranges, text_bindings, None,
+                None,
             )?;
             // jmp common_end (forward, caller patches)
             code.push(0xE9);
@@ -6598,6 +6716,7 @@ fn emit_redirect_variant_leaves(
             emit_eval_expr(
                 code, &renamed_cond, outer_input_name, offsets,
                 all_rules, field_ranges, text_bindings, None,
+                None,
             )?;
             // test al, al ; jz .else
             code.extend_from_slice(&[0x84, 0xC0]);
@@ -6707,6 +6826,7 @@ fn emit_redirect_variant_leaves_text(
             emit_eval_expr(
                 code, &renamed_cond, outer_input_name, offsets,
                 all_rules, field_ranges, text_bindings, None,
+                None,
             )?;
             code.extend_from_slice(&[0x84, 0xC0]);
             code.push(0x0F);
@@ -7102,7 +7222,7 @@ fn emit_collection_program(
         let mut let_offsets: HashMap<&str, i32> = scalar_offsets.clone();
         let mut next_let_slot = -(((n_scalar + n_elem_fields) as i32 + 1) * 8);
         for (name, expr) in &rule.logic.bindings {
-            emit_eval_expr(&mut code, expr, &rule.input_name, &let_offsets, all_rules, &field_ranges_for_lets, &text_bindings, None)?;
+            emit_eval_expr(&mut code, expr, &rule.input_name, &let_offsets, all_rules, &field_ranges_for_lets, &text_bindings, None, None)?;
             store_rax_at_rbp(&mut code, next_let_slot);
             let_offsets.insert(name.as_str(), next_let_slot);
             next_let_slot -= 8;
@@ -7182,6 +7302,7 @@ fn emit_collection_program(
                 emit_eval_expr(
                     &mut code, body, lambda_var, &elem_offsets, all_rules, &field_ranges,
                     &text_bindings, None,
+                    None,
                 )?;
                 if matches!(output_kind, OutputElemKind::Bool) {
                     // Bool: rax = 0/1 → "true"/"false" + newline.
@@ -7208,6 +7329,7 @@ fn emit_collection_program(
             emit_eval_expr(
                 &mut code, predicate, lambda_var, &elem_offsets, all_rules, &field_ranges,
                 &text_bindings, None,
+                None,
             )?;
             // test rax, rax ; je skip_emit (rel32, patched after the write block).
             code.extend_from_slice(&[0x48, 0x85, 0xC0]);
@@ -7500,7 +7622,7 @@ fn emit_fold_program(
     }
     let mut next_let_slot = -(((n_scalar + n_elem_fields) as i32 + 1) * 8);
     for (name, expr) in &rule.logic.bindings {
-        emit_eval_expr(&mut code, expr, &rule.input_name, &let_offsets, all_rules, &field_ranges_for_lets, &text_bindings, None)?;
+        emit_eval_expr(&mut code, expr, &rule.input_name, &let_offsets, all_rules, &field_ranges_for_lets, &text_bindings, None, None)?;
         store_rax_at_rbp(&mut code, next_let_slot);
         let_offsets.insert(name.as_str(), next_let_slot);
         next_let_slot -= 8;
@@ -7549,7 +7671,7 @@ fn emit_fold_program(
     // Evaluate the fold body; result is the NEW accumulator value in rax.
     // item_name is the "input" for field access resolution within the body.
     let field_ranges = build_field_ranges(elem_concept);
-    emit_eval_expr(&mut code, body, item_name, &body_offsets, all_rules, &field_ranges, &text_bindings, None)?;
+    emit_eval_expr(&mut code, body, item_name, &body_offsets, all_rules, &field_ranges, &text_bindings, None, None)?;
     store_rax_at_rbp(&mut code, acc_offset);
 
     // dec r15 ; jmp inner_loop_top (rel32).
@@ -7851,7 +7973,7 @@ fn emit_fold_bytes_program(
     // source order, registered in offsets.
     for (let_idx, (name, expr)) in rule.logic.bindings.iter().enumerate() {
         let slot = -(((nfields + 3 + let_idx + 1) as i32) * 8);
-        emit_eval_expr(&mut code, expr, &rule.input_name, &offsets, all_rules, &field_ranges, &text_bindings, None)?;
+        emit_eval_expr(&mut code, expr, &rule.input_name, &offsets, all_rules, &field_ranges, &text_bindings, None, None)?;
         // mov [rbp + slot], rax
         if slot >= -128 {
             code.extend_from_slice(&[0x48, 0x89, 0x45]);
@@ -7886,7 +8008,7 @@ fn emit_fold_bytes_program(
     code.push(0x51); // push rcx
 
     // Body — emits to rax
-    emit_eval_expr(&mut code, body, &rule.input_name, &offsets, all_rules, &field_ranges, &text_bindings, None)?;
+    emit_eval_expr(&mut code, body, &rule.input_name, &offsets, all_rules, &field_ranges, &text_bindings, None, None)?;
 
     // Restore rsi/rcx
     code.push(0x59); // pop rcx
@@ -8182,7 +8304,7 @@ fn emit_multi_fold_program(
     }
     let mut next_let_slot = -(((n_scalar + n_elem) as i32 + 1) * 8);
     for (name, expr) in &rule.logic.bindings {
-        emit_eval_expr(&mut code, expr, &rule.input_name, &let_offsets, all_rules, &field_ranges_for_lets, &text_bindings, None)?;
+        emit_eval_expr(&mut code, expr, &rule.input_name, &let_offsets, all_rules, &field_ranges_for_lets, &text_bindings, None, None)?;
         store_rax_at_rbp(&mut code, next_let_slot);
         let_offsets.insert(name.as_str(), next_let_slot);
         next_let_slot -= 8;
@@ -8228,7 +8350,7 @@ fn emit_multi_fold_program(
     // Evaluate each fold body and update its accumulator.
     let field_ranges = build_field_ranges(elem_concept);
     for (i, fold) in folds.iter().enumerate() {
-        emit_eval_expr(&mut code, &fold.body, &fold.item_name, &body_offsets, all_rules, &field_ranges, &text_bindings, None)?;
+        emit_eval_expr(&mut code, &fold.body, &fold.item_name, &body_offsets, all_rules, &field_ranges, &text_bindings, None, None)?;
         store_rax_at_rbp(&mut code, acc_offsets[i]);
     }
 
@@ -8259,7 +8381,7 @@ fn emit_multi_fold_program(
     // Evaluate the final scalar expression (quantifiers replaced by Ident refs).
     // Use an empty input name — the expression should only reference __fold_N idents.
     let empty_ranges: HashMap<&str, (i64, i64)> = HashMap::new();
-    emit_eval_expr(&mut code, &scalar_expr, "__phase6_none__", &final_offsets, all_rules, &empty_ranges, &text_bindings, None)?;
+    emit_eval_expr(&mut code, &scalar_expr, "__phase6_none__", &final_offsets, all_rules, &empty_ranges, &text_bindings, None, None)?;
 
     // Print result.
     if is_bool_output {
@@ -8735,7 +8857,7 @@ fn emit_text_fold_program(
         }
         let mut next_let_slot = -(((n_scalar + n_elem_fields) as i32 + 1) * 8);
         for (name, expr) in &rule.logic.bindings {
-            emit_eval_expr(&mut code, expr, &rule.input_name, &let_offsets, all_rules, &field_ranges_for_lets, &text_bindings, None)?;
+            emit_eval_expr(&mut code, expr, &rule.input_name, &let_offsets, all_rules, &field_ranges_for_lets, &text_bindings, None, None)?;
             store_rax_at_rbp(&mut code, next_let_slot);
             let_offsets.insert(name.as_str(), next_let_slot);
             next_let_slot -= 8;
@@ -9159,7 +9281,7 @@ fn emit_eval_record_expr(
             Ok(())
         }
         Expr::If(cond, then_e, else_e) => {
-            emit_eval_expr(code, cond, &rule.input_name, offsets, all_rules, field_ranges, text_bindings, None)?;
+            emit_eval_expr(code, cond, &rule.input_name, offsets, all_rules, field_ranges, text_bindings, None, None)?;
             code.extend_from_slice(&[0x48, 0x85, 0xC0]); // test rax, rax
             code.push(0x0F);
             code.push(0x84); // je rel32
@@ -9237,7 +9359,7 @@ fn emit_ok_record_dispatch(
         }
         Expr::If(cond, then_e, else_e) => {
             // cond → rax; test, jz else
-            emit_eval_expr(code, cond, &rule.input_name, offsets, all_rules, field_ranges, text_bindings, None)?;
+            emit_eval_expr(code, cond, &rule.input_name, offsets, all_rules, field_ranges, text_bindings, None, None)?;
             code.extend_from_slice(&[0x48, 0x85, 0xC0]); // test rax, rax
             code.push(0x0F);
             code.push(0x84); // je rel32
@@ -9318,7 +9440,7 @@ fn emit_record_as_json(
         match decl.ty {
             Type::Number => {
                 // Evaluate → rax, write digits to stdout, no newline.
-                emit_eval_expr(code, value_expr, input_name, offsets, all_rules, field_ranges, text_bindings, None)?;
+                emit_eval_expr(code, value_expr, input_name, offsets, all_rules, field_ranges, text_bindings, None, None)?;
                 emit_itoa_to_stdout_no_newline(code);
             }
             Type::Text => {
@@ -9388,6 +9510,7 @@ fn emit_reaction_program<'a>(
         &ctx.field_ranges,
         &ctx.text_bindings,
         None,
+        None,
     )?;
 
     // cmp rax, 0 ; je skip_effects (rel32 so effect body can be large)
@@ -9446,6 +9569,7 @@ fn emit_reaction_program<'a>(
                             &mut code, arg, &trigger_rule.input_name,
                             &ctx.binding_offsets, all_rules, &ctx.field_ranges,
                             &ctx.text_bindings, None,
+                            None,
                         )?;
                         emit_itoa_to_stdout_no_newline(&mut code);
                     } else {
@@ -9738,6 +9862,96 @@ struct SelfCallCtx<'a> {
     labels: &'a HashMap<&'a str, i32>,
 }
 
+/// Phase B slice 4a.2 — arena context for `VariantConstruct` emission.
+///
+/// Threaded through `emit_eval_expr` so a `VariantConstruct` leaf can:
+///   1. Bounds-check `node_count` against `max_nodes` (per-construct
+///      `jae rel32` patch sites collected in `arena_abort_patches` and
+///      drained by the caller into `RecordLoopCtx.arena_abort_patches`,
+///      which the epilogue then patches to the per-group abort label).
+///   2. Compute the entry address: `r11 + idx * entry_size`.
+///   3. Write the variant tag byte (looked up in `variant_tags`).
+///   4. Spill subterms to a small fixed tmp slot pool (per-variant
+///      arity, capped at 2 in slice 4a.2's single-concept group).
+///   5. Bump `node_count`, leaving the PRE-inc index in rax (§11 pushback
+///      #3: callers consume the index directly via the rdi=i64 ABI).
+///
+/// `arena_abort_patches` is a `RefCell<Vec<usize>>` so the `emit_eval_expr`
+/// recursive walk (which borrows the ctx immutably) can still grow the
+/// patch list. After the top-level call returns, the caller drains this
+/// into `RecordLoopCtx.arena_abort_patches` before the epilogue.
+///
+/// `r11` is reloaded from `arena_rbp_offset` before each construct.
+/// Slice 4a.2 has no syscalls in the construction path, so this reload
+/// is strictly defensive (matches §11 pushback #2 — the lea is one
+/// instruction cheaper than maintaining a "is r11 still live?"
+/// invariant across arbitrary emit_eval_expr recursion).
+struct ArenaCtx<'a> {
+    /// rbp offset to load r11 from (`lea r11, [rbp + arena_rbp_offset]`).
+    arena_rbp_offset: i32,
+    /// rbp offset of the 8-byte node_count slot.
+    node_count_slot: i32,
+    /// Per-entry size (1 byte tag + 8 bytes per payload field, padded to 8).
+    entry_size: i32,
+    /// Compile-time cap from the group declaration.
+    max_nodes: u32,
+    /// rbp offset of the first tmp slot (most-shallow). i-th tmp lives
+    /// at `tmp_slot_base - 8*i`. Capacity = max payload arity over the
+    /// group's only concept's variants (capped at 2 by slice 4a.2's
+    /// single-concept constraint).
+    tmp_slot_base: i32,
+    /// Variant name → tag byte (declaration order, starting at 0).
+    /// Tags fit in 1 byte (256-variant ceiling — fine for slice 4a.2).
+    variant_tags: &'a HashMap<&'a str, u8>,
+    /// Variant name → list of payload field (name, type) pairs in
+    /// declaration order. Slice 4a.2 only supports `Number` and self-
+    /// reference (encoded as `Type::Named(group_concept_name)`); other
+    /// shapes are refused at the construct site with a B.4c/B.4d
+    /// breadcrumb.
+    variant_fields: &'a HashMap<&'a str, Vec<(String, Type)>>,
+    /// The single group concept's name (slice 4a.2 ships single-concept
+    /// groups only). Used to recognize `Type::Named(group)` payload
+    /// fields as self-references during emit.
+    group_concept_name: &'a str,
+    /// Patch sites for arena-overflow `jae rel32` jumps. Grown by
+    /// VariantConstruct emit; drained by the caller into
+    /// `RecordLoopCtx.arena_abort_patches` once the top-level
+    /// emit_eval_expr returns.
+    arena_abort_patches: std::cell::RefCell<Vec<usize>>,
+}
+
+impl<'a> ArenaCtx<'a> {
+    /// Phase B slice 4a.2 — construct an `ArenaCtx` from the prologue's
+    /// `RecordLoopCtx` if and only if the program declared a concept
+    /// group (`ctx.arena_size > 0`). Returns `None` for non-group
+    /// programs so callers pass `None` to `emit_eval_expr` unchanged.
+    fn from_record_ctx(ctx: &'a RecordLoopCtx<'a>) -> Option<Self> {
+        if ctx.arena_size <= 0 {
+            return None;
+        }
+        Some(ArenaCtx {
+            arena_rbp_offset: ctx.arena_rbp_offset,
+            node_count_slot: ctx.node_count_slot,
+            entry_size: ctx.entry_size,
+            max_nodes: ctx.arena_max_nodes,
+            tmp_slot_base: ctx.tmp_slot_base,
+            variant_tags: &ctx.variant_tags,
+            variant_fields: &ctx.variant_fields,
+            group_concept_name: ctx.group_concept_name,
+            arena_abort_patches: std::cell::RefCell::new(Vec::new()),
+        })
+    }
+
+    /// Drain accumulated patch sites into the supplied vector. Called
+    /// AFTER the top-level emit_eval_expr returns and BEFORE the
+    /// epilogue runs (the epilogue resolves these to the shared per-
+    /// group abort label).
+    fn drain_patches_into(self, dest: &mut Vec<usize>) {
+        let inner = self.arena_abort_patches.into_inner();
+        dest.extend(inner);
+    }
+}
+
 fn emit_eval_expr(
     code: &mut Vec<u8>,
     expr: &Expr,
@@ -9747,6 +9961,7 @@ fn emit_eval_expr(
     field_ranges: &HashMap<&str, (i64, i64)>,
     text_bindings: &TextBindings<'_>,
     self_call: Option<SelfCallCtx<'_>>,
+    arena_ctx: Option<&ArenaCtx<'_>>,
 ) -> Result<(), NativeError> {
     match expr {
         Expr::Number(n) => {
@@ -9798,7 +10013,7 @@ fn emit_eval_expr(
             if *op == BinOp::Mul {
                 if let Expr::Number(n) = right.as_ref() {
                     if *n > 0 && (*n as u64).is_power_of_two() {
-                        emit_eval_expr(code, left, input_name, offsets, all_rules, field_ranges, text_bindings, self_call)?;
+                        emit_eval_expr(code, left, input_name, offsets, all_rules, field_ranges, text_bindings, self_call, None)?;
                         let shift = (*n as u64).trailing_zeros() as u8;
                         code.extend_from_slice(&[0x48, 0xC1, 0xE0, shift]); // shl rax, shift
                         return Ok(());
@@ -9810,7 +10025,7 @@ fn emit_eval_expr(
             if *op == BinOp::Div {
                 if let Expr::Number(n) = right.as_ref() {
                     if *n > 0 && (*n as u64).is_power_of_two() {
-                        emit_eval_expr(code, left, input_name, offsets, all_rules, field_ranges, text_bindings, self_call)?;
+                        emit_eval_expr(code, left, input_name, offsets, all_rules, field_ranges, text_bindings, self_call, None)?;
                         let shift = (*n as u64).trailing_zeros() as u8;
                         code.extend_from_slice(&[0x48, 0xC1, 0xE8, shift]); // shr rax, shift
                         return Ok(());
@@ -9829,7 +10044,7 @@ fn emit_eval_expr(
                             let dividend_non_negative = compute_range(left, field_ranges, input_name)
                                 .map_or(false, |(min, _)| min >= 0);
                             if dividend_non_negative {
-                                emit_eval_expr(code, left, input_name, offsets, all_rules, field_ranges, text_bindings, self_call)?;
+                                emit_eval_expr(code, left, input_name, offsets, all_rules, field_ranges, text_bindings, self_call, None)?;
                                 // mov rcx, magic
                                 code.extend_from_slice(&[0x48, 0xB9]);
                                 code.extend_from_slice(&magic.to_le_bytes());
@@ -9859,16 +10074,16 @@ fn emit_eval_expr(
             // Strength reduction: multiply by 1 → identity
             if *op == BinOp::Mul {
                 if matches!(right.as_ref(), Expr::Number(1)) {
-                    return emit_eval_expr(code, left, input_name, offsets, all_rules, field_ranges, text_bindings, self_call);
+                    return emit_eval_expr(code, left, input_name, offsets, all_rules, field_ranges, text_bindings, self_call, None);
                 }
                 if matches!(left.as_ref(), Expr::Number(1)) {
-                    return emit_eval_expr(code, right, input_name, offsets, all_rules, field_ranges, text_bindings, self_call);
+                    return emit_eval_expr(code, right, input_name, offsets, all_rules, field_ranges, text_bindings, self_call, None);
                 }
             }
 
             // Strength reduction: add/sub 0 → identity
             if (*op == BinOp::Add || *op == BinOp::Sub) && matches!(right.as_ref(), Expr::Number(0)) {
-                return emit_eval_expr(code, left, input_name, offsets, all_rules, field_ranges, text_bindings, self_call);
+                return emit_eval_expr(code, left, input_name, offsets, all_rules, field_ranges, text_bindings, self_call, None);
             }
 
             // === Text comparison: field == "literal" or field != "literal" ===
@@ -10062,7 +10277,7 @@ fn emit_eval_expr(
             // by the short-circuit semantics. No explicit `mov rax`
             // needed because rax is already correct.
             if matches!(op, BinOp::And | BinOp::Or) {
-                emit_eval_expr(code, left, input_name, offsets, all_rules, field_ranges, text_bindings, self_call)?;
+                emit_eval_expr(code, left, input_name, offsets, all_rules, field_ranges, text_bindings, self_call, None)?;
                 // test rax, rax
                 code.extend_from_slice(&[0x48, 0x85, 0xC0]);
                 // jz/jnz rel32 — depending on op
@@ -10071,7 +10286,7 @@ fn emit_eval_expr(
                 let skip_patch = code.len();
                 code.extend_from_slice(&[0; 4]);
                 // Evaluate right (overwrites rax with right's value)
-                emit_eval_expr(code, right, input_name, offsets, all_rules, field_ranges, text_bindings, self_call)?;
+                emit_eval_expr(code, right, input_name, offsets, all_rules, field_ranges, text_bindings, self_call, None)?;
                 // .skip_right:
                 let skip_pos = code.len();
                 let skip_rel = skip_pos as i32 - (skip_patch as i32 + 4);
@@ -10080,9 +10295,9 @@ fn emit_eval_expr(
             }
 
             // === General case: evaluate both sides, apply operator ===
-            emit_eval_expr(code, left, input_name, offsets, all_rules, field_ranges, text_bindings, self_call)?;
+            emit_eval_expr(code, left, input_name, offsets, all_rules, field_ranges, text_bindings, self_call, None)?;
             code.push(0x50); // push rax
-            emit_eval_expr(code, right, input_name, offsets, all_rules, field_ranges, text_bindings, self_call)?;
+            emit_eval_expr(code, right, input_name, offsets, all_rules, field_ranges, text_bindings, self_call, None)?;
             code.push(0x59); // pop rcx — now rcx=left, rax=right
 
             match op {
@@ -10245,6 +10460,7 @@ fn emit_eval_expr(
                                         code, fexpr, input_name, offsets,
                                         all_rules, field_ranges, text_bindings,
                                         self_call,
+                                        None,
                                     )?;
                                     if struct_off == 0 {
                                         code.extend_from_slice(&[0x48, 0x89, 0x04, 0x24]);
@@ -10309,6 +10525,7 @@ fn emit_eval_expr(
                                 code, field_expr, input_name, offsets,
                                 all_rules, field_ranges, text_bindings,
                                 self_call,
+                                None,
                             )?;
                             code.extend_from_slice(&[0x48, 0x89, 0xC7]); // mov rdi, rax
                         }
@@ -10341,6 +10558,7 @@ fn emit_eval_expr(
                 field_ranges,
                 text_bindings,
                 self_call,
+                None,
             )
         }
         Expr::If(cond, then_e, else_e) => {
@@ -10348,14 +10566,14 @@ fn emit_eval_expr(
             if let Some(always) = try_static_condition(cond, field_ranges, input_name) {
                 if always {
                     // Condition always true — emit only then branch, skip comparison
-                    return emit_eval_expr(code, then_e, input_name, offsets, all_rules, field_ranges, text_bindings, self_call);
+                    return emit_eval_expr(code, then_e, input_name, offsets, all_rules, field_ranges, text_bindings, self_call, None);
                 } else {
                     // Condition always false — emit only else branch, skip comparison
-                    return emit_eval_expr(code, else_e, input_name, offsets, all_rules, field_ranges, text_bindings, self_call);
+                    return emit_eval_expr(code, else_e, input_name, offsets, all_rules, field_ranges, text_bindings, self_call, None);
                 }
             }
             // Dynamic: emit both branches with runtime check
-            emit_eval_expr(code, cond, input_name, offsets, all_rules, field_ranges, text_bindings, self_call)?;
+            emit_eval_expr(code, cond, input_name, offsets, all_rules, field_ranges, text_bindings, self_call, None)?;
             // test al, al
             code.extend_from_slice(&[0x84, 0xC0]);
             // jz .else_branch
@@ -10364,7 +10582,7 @@ fn emit_eval_expr(
             let else_patch = code.len();
             code.extend_from_slice(&[0x00; 4]);
             // then branch → rax
-            emit_eval_expr(code, then_e, input_name, offsets, all_rules, field_ranges, text_bindings, self_call)?;
+            emit_eval_expr(code, then_e, input_name, offsets, all_rules, field_ranges, text_bindings, self_call, None)?;
             // jmp .end
             code.push(0xE9);
             let end_patch = code.len();
@@ -10373,7 +10591,7 @@ fn emit_eval_expr(
             let else_pos = code.len();
             let eo = else_pos as i32 - (else_patch as i32 + 4);
             code[else_patch..else_patch + 4].copy_from_slice(&eo.to_le_bytes());
-            emit_eval_expr(code, else_e, input_name, offsets, all_rules, field_ranges, text_bindings, self_call)?;
+            emit_eval_expr(code, else_e, input_name, offsets, all_rules, field_ranges, text_bindings, self_call, None)?;
             // .end:
             let end_pos = code.len();
             let ep = end_pos as i32 - (end_patch as i32 + 4);
@@ -10381,13 +10599,13 @@ fn emit_eval_expr(
             Ok(())
         }
         Expr::Not(inner) => {
-            emit_eval_expr(code, inner, input_name, offsets, all_rules, field_ranges, text_bindings, self_call)?;
+            emit_eval_expr(code, inner, input_name, offsets, all_rules, field_ranges, text_bindings, self_call, None)?;
             // rax is 0 or 1; flip it
             code.extend_from_slice(&[0x48, 0x83, 0xF0, 0x01]); // xor rax, 1
             Ok(())
         }
         Expr::Neg(inner) => {
-            emit_eval_expr(code, inner, input_name, offsets, all_rules, field_ranges, text_bindings, self_call)?;
+            emit_eval_expr(code, inner, input_name, offsets, all_rules, field_ranges, text_bindings, self_call, None)?;
             code.extend_from_slice(&[0x48, 0xF7, 0xD8]); // neg rax
             Ok(())
         }
@@ -10418,15 +10636,241 @@ fn emit_eval_expr(
                       one delivers the parser/verifier/interpreter surface so rules using fold_bytes \
                       compile and the semantics can be exercised today.".into(),
         }),
-        // Phase A slice 2: variant construction's tagged-union layout +
-        // dispatch is deferred to slice A.4+. Today the AST + parser +
-        // verifier + interpreter surface is enough to exercise the
-        // semantics via --run.
-        Expr::VariantConstruct(_, _, _) => Err(NativeError {
-            message: "variant construction not yet implemented in native — Phase A slice 4+ \
-                      wires the tagged union layout. Run rules using variant construction \
-                      via --run.".into(),
-        }),
+        // Phase B slice 4a.2 — variant construction on a concept_group.
+        //
+        // Emit shape (from docs/phase-b4a-scope.md §4, with §11 pushbacks
+        // #1/#2/#3 applied):
+        //
+        //   ; --- Pre-eval each subterm depth-first; spill to tmp slots ---
+        //   for i in 0..arity:
+        //     <emit fields[i].expr>             ; rax = i-th subterm value
+        //     mov [rbp + tmp_slot_base - 8*i], rax
+        //
+        //   ; --- Bounds check ---
+        //   mov rax, [rbp + node_count_slot]
+        //   mov r10, max_nodes_imm
+        //   cmp rax, r10
+        //   jae .arena_full_abort                ; patched by epilogue
+        //
+        //   ; --- Compute entry address into rcx (reload r11 defensively) ---
+        //   lea r11, [rbp + arena_rbp_offset]
+        //   mov rcx, rax                         ; rcx = idx (preserved)
+        //   mov r10, entry_size_imm
+        //   imul rcx, r10                        ; rcx = idx * entry_size
+        //   add rcx, r11                         ; rcx = arena_base + offset
+        //
+        //   ; --- Write tag byte at entry offset 0 ---
+        //   mov byte [rcx], TAG_VARIANT
+        //
+        //   ; --- Write payload slots at offsets 8, 16, ... ---
+        //   for i in 0..arity:
+        //     mov rdx, [rbp + tmp_slot_base - 8*i]
+        //     mov [rcx + 8 + 8*i], rdx
+        //
+        //   ; --- Bump node_count; rax already holds the pre-inc index ---
+        //   inc qword [rbp + node_count_slot]
+        //
+        // Slice constraints rejected here with breadcrumbs:
+        //   - non-group concept (top-level concept with `variants:`) →
+        //     slice A.4+ work (no arena, different layout).
+        //   - payload field whose type is neither Number nor a self-
+        //     reference to the group concept → B.4c (text payload) or
+        //     B.4d (collection payload).
+        Expr::VariantConstruct(concept_name, variant_name, fields) => {
+            let ac = arena_ctx.ok_or_else(|| NativeError {
+                message: format!(
+                    "native VariantConstruct for concept '{}' requires a concept_group declaration; \
+                     top-level variant concepts (Phase A) have no arena yet — Phase A slice 4+ adds \
+                     the no-arena tagged-union path. Use --run for now.",
+                    concept_name
+                ),
+            })?;
+            // Look up tag + declared variant fields from the prologue's
+            // snapshot. If the variant isn't in the map, the verifier
+            // would have rejected the construct site upstream; surface
+            // a clear error rather than silently emitting garbage.
+            let tag = *ac.variant_tags.get(variant_name.as_str()).ok_or_else(|| NativeError {
+                message: format!(
+                    "native VariantConstruct: unknown variant '{}' on concept '{}' (group: '{}')",
+                    variant_name, concept_name, ac.group_concept_name
+                ),
+            })?;
+            let declared_fields = ac.variant_fields.get(variant_name.as_str()).ok_or_else(|| NativeError {
+                message: format!(
+                    "native VariantConstruct: missing field metadata for variant '{}'",
+                    variant_name
+                ),
+            })?;
+            // Verifier guarantees declared/passed field counts match;
+            // assert defensively (a mismatch here means a bug upstream).
+            if declared_fields.len() != fields.len() {
+                return Err(NativeError {
+                    message: format!(
+                        "native VariantConstruct '{}::{}': declared {} fields but {} provided",
+                        concept_name, variant_name, declared_fields.len(), fields.len()
+                    ),
+                });
+            }
+            // Per-field type guard (slice 4a.2 scope: Number or self-ref only).
+            for (decl_name, decl_ty) in declared_fields {
+                match decl_ty {
+                    Type::Number => {}
+                    Type::Named(n) if n == ac.group_concept_name => {}
+                    Type::Text => {
+                        return Err(NativeError {
+                            message: format!(
+                                "native VariantConstruct '{}::{}': field '{}' has text type; \
+                                 text payload in a variant lands in Phase B slice 4c (needs a \
+                                 (ptr, len) layout in the arena slot). Use --run for now.",
+                                concept_name, variant_name, decl_name
+                            ),
+                        });
+                    }
+                    Type::Collection(_) => {
+                        return Err(NativeError {
+                            message: format!(
+                                "native VariantConstruct '{}::{}': field '{}' has collection type; \
+                                 collection payload in a variant lands in Phase B slice 4d.",
+                                concept_name, variant_name, decl_name
+                            ),
+                        });
+                    }
+                    other => {
+                        return Err(NativeError {
+                            message: format!(
+                                "native VariantConstruct '{}::{}': field '{}' has unsupported type {:?}; \
+                                 slice 4a.2 supports Number and self-reference only.",
+                                concept_name, variant_name, decl_name, other
+                            ),
+                        });
+                    }
+                }
+            }
+            // ── Step 1: pre-evaluate each subterm and spill to tmp slot ──
+            // Build a name-keyed lookup so we walk declared-field order
+            // (matches the slot order in the arena entry) regardless of
+            // the source-text field order.
+            let mut by_name: HashMap<&str, &Expr> = HashMap::new();
+            for (n, e) in fields {
+                by_name.insert(n.as_str(), e);
+            }
+            for (i, (decl_name, _)) in declared_fields.iter().enumerate() {
+                let expr_i = by_name.get(decl_name.as_str()).ok_or_else(|| NativeError {
+                    message: format!(
+                        "native VariantConstruct '{}::{}': missing field '{}' in literal",
+                        concept_name, variant_name, decl_name
+                    ),
+                })?;
+                emit_eval_expr(
+                    code, expr_i, input_name, offsets, all_rules,
+                    field_ranges, text_bindings, self_call, arena_ctx,
+                )?;
+                let slot = ac.tmp_slot_base - 8 * (i as i32);
+                // mov [rbp + slot], rax
+                if slot >= -128 {
+                    code.extend_from_slice(&[0x48, 0x89, 0x45]);
+                    code.push(slot as u8);
+                } else {
+                    code.extend_from_slice(&[0x48, 0x89, 0x85]);
+                    code.extend_from_slice(&slot.to_le_bytes());
+                }
+            }
+            // ── Step 2: load current node_count into rax ──
+            // mov rax, [rbp + node_count_slot]
+            let ncs = ac.node_count_slot;
+            if ncs >= -128 {
+                code.extend_from_slice(&[0x48, 0x8B, 0x45]);
+                code.push(ncs as u8);
+            } else {
+                code.extend_from_slice(&[0x48, 0x8B, 0x85]);
+                code.extend_from_slice(&ncs.to_le_bytes());
+            }
+            // ── Step 3: bounds check rax < max_nodes ──
+            // mov r10, max_nodes_imm  (REX.WB 0x49, 0xBA, imm64)
+            code.push(0x49);
+            code.push(0xBA);
+            code.extend_from_slice(&(ac.max_nodes as i64).to_le_bytes());
+            // cmp rax, r10  (REX.WR 0x4C, 0x39, 0xD0)
+            code.extend_from_slice(&[0x4C, 0x39, 0xD0]);
+            // jae .arena_full_abort  (rel32 placeholder)
+            code.push(0x0F);
+            code.push(0x83);
+            let patch_site = code.len();
+            code.extend_from_slice(&[0x00; 4]);
+            ac.arena_abort_patches.borrow_mut().push(patch_site);
+            // ── Step 4: reload r11 from rbp + arena_rbp_offset ──
+            // §11 pushback #2: r11 was set up at prologue but Linux
+            // syscalls clobber it (rcx + r11 by ABI). Slice 4a.2 has no
+            // syscalls in the construction path so the reload is
+            // defensive; cheaper than tracking r11-liveness across
+            // emit_eval_expr recursion.
+            let aro = ac.arena_rbp_offset;
+            if aro >= -128 {
+                code.extend_from_slice(&[0x4C, 0x8D, 0x5D]);
+                code.push(aro as u8);
+            } else {
+                code.extend_from_slice(&[0x4C, 0x8D, 0x9D]);
+                code.extend_from_slice(&aro.to_le_bytes());
+            }
+            // ── Step 5: compute entry address rcx = r11 + rax * entry_size ──
+            // §11 pushback #1: compute address from PRE-inc index, then
+            // inc AFTER. rax holds the pre-inc index throughout.
+            // mov rcx, rax  (REX.W 0x48, 0x89, 0xC1)
+            code.extend_from_slice(&[0x48, 0x89, 0xC1]);
+            // mov r10, entry_size_imm (REX.WB 0x49, 0xBA, imm64)
+            code.push(0x49);
+            code.push(0xBA);
+            code.extend_from_slice(&(ac.entry_size as i64).to_le_bytes());
+            // imul rcx, r10
+            //   `imul r64, r/m64` opcode 0x0F 0xAF (operand order reg, r/m).
+            //   dst=rcx (reg=001), src=r10 (rm=010, requires REX.B).
+            //   REX.W + REX.B = 0x49, 0x0F, 0xAF, ModR/M = 11.001.010 = 0xCA.
+            code.extend_from_slice(&[0x49, 0x0F, 0xAF, 0xCA]);
+            // add rcx, r11
+            //   `add r/m64, r64` opcode 0x01 (operand order r/m, reg).
+            //   dst=rcx (rm=001), src=r11 (reg=011, requires REX.R).
+            //   REX.W + REX.R = 0x4C, 0x01, ModR/M = 11.011.001 = 0xD9.
+            code.extend_from_slice(&[0x4C, 0x01, 0xD9]);
+            // ── Step 6: write tag byte at [rcx] ──
+            // mov byte [rcx], tag  (0xC6 0x01 tag)
+            code.extend_from_slice(&[0xC6, 0x01, tag]);
+            // ── Step 7: write payload slots ──
+            for i in 0..declared_fields.len() {
+                let slot = ac.tmp_slot_base - 8 * (i as i32);
+                // mov rdx, [rbp + slot]
+                if slot >= -128 {
+                    code.extend_from_slice(&[0x48, 0x8B, 0x55]);
+                    code.push(slot as u8);
+                } else {
+                    code.extend_from_slice(&[0x48, 0x8B, 0x95]);
+                    code.extend_from_slice(&slot.to_le_bytes());
+                }
+                // mov [rcx + (8 + 8*i)], rdx
+                let off = 8 + 8 * (i as i32);
+                if off == 0 {
+                    // unreachable (off >= 8) but defensive
+                    code.extend_from_slice(&[0x48, 0x89, 0x11]);
+                } else if off <= 127 {
+                    code.extend_from_slice(&[0x48, 0x89, 0x51]);
+                    code.push(off as u8);
+                } else {
+                    code.extend_from_slice(&[0x48, 0x89, 0x91]);
+                    code.extend_from_slice(&off.to_le_bytes());
+                }
+            }
+            // ── Step 8: bump node_count (rax already holds the pre-inc index) ──
+            // inc qword [rbp + node_count_slot]  (REX.W 0x48, 0xFF, /0 = 0x45 disp8)
+            if ncs >= -128 {
+                code.extend_from_slice(&[0x48, 0xFF, 0x45]);
+                code.push(ncs as u8);
+            } else {
+                code.extend_from_slice(&[0x48, 0xFF, 0x85]);
+                code.extend_from_slice(&ncs.to_le_bytes());
+            }
+            // rax holds the pre-inc index = the index of the just-
+            // constructed node. Caller consumes it as a Number.
+            Ok(())
+        }
         // Phase A slice 4.1 — pattern match on an inlined callee.
         //
         // Slice scope: `match callee(input): VariantA(b1, b2) => bodyA ; ...`
@@ -10661,7 +11105,7 @@ fn emit_eval_expr(
         // panic on i64::MIN (it stays at i64::MIN; the optimizer fold
         // uses wrapping_abs for the same property).
         Expr::Abs(inner) => {
-            emit_eval_expr(code, inner, input_name, offsets, all_rules, field_ranges, text_bindings, self_call)?;
+            emit_eval_expr(code, inner, input_name, offsets, all_rules, field_ranges, text_bindings, self_call, None)?;
             // cqo
             code.extend_from_slice(&[0x48, 0x99]);
             // xor rax, rdx
@@ -10683,10 +11127,10 @@ fn emit_eval_expr(
         Expr::Min(left, right) | Expr::Max(left, right) => {
             let is_max = matches!(expr, Expr::Max(_, _));
             // eval left → rax; push rax
-            emit_eval_expr(code, left, input_name, offsets, all_rules, field_ranges, text_bindings, self_call)?;
+            emit_eval_expr(code, left, input_name, offsets, all_rules, field_ranges, text_bindings, self_call, None)?;
             code.push(0x50); // push rax
             // eval right → rax
-            emit_eval_expr(code, right, input_name, offsets, all_rules, field_ranges, text_bindings, self_call)?;
+            emit_eval_expr(code, right, input_name, offsets, all_rules, field_ranges, text_bindings, self_call, None)?;
             // pop rcx (rcx = left, rax = right)
             code.push(0x59);
             // cmp rcx, rax
@@ -10743,6 +11187,7 @@ fn emit_eval_expr(
             // (3) Evaluate index → rax.
             emit_eval_expr(
                 code, index, input_name, offsets, all_rules, field_ranges, text_bindings, self_call,
+                None,
             )?;
             // (4) Bounds: index >= len → abort (unsigned compare).
             //   mov rcx, [rsp]
@@ -11068,7 +11513,7 @@ fn emit_length(
             // (2) push rax (text_len at [rsp+8] after later push)
             code.push(0x50);
             // (3) Evaluate end → rax
-            emit_eval_expr(code, end_expr, input_name, offsets, all_rules, field_ranges, text_bindings, None)?;
+            emit_eval_expr(code, end_expr, input_name, offsets, all_rules, field_ranges, text_bindings, None, None)?;
             // (4) cmp end, text_len ; ja .abort
             //    mov rcx, [rsp]
             code.extend_from_slice(&[0x48, 0x8B, 0x0C, 0x24]);
@@ -11081,7 +11526,7 @@ fn emit_length(
             // (5) push rax (end at [rsp])
             code.push(0x50);
             // (6) Evaluate start → rax
-            emit_eval_expr(code, start_expr, input_name, offsets, all_rules, field_ranges, text_bindings, None)?;
+            emit_eval_expr(code, start_expr, input_name, offsets, all_rules, field_ranges, text_bindings, None, None)?;
             // (7) cmp start, end ; ja .abort
             //    mov rcx, [rsp]  (rcx = end)
             code.extend_from_slice(&[0x48, 0x8B, 0x0C, 0x24]);
@@ -12383,6 +12828,7 @@ fn emit_parallel_program(
         all_rules,
         &field_ranges,
         &text_bindings,
+        None,
         None,
     )?;
 
@@ -14517,6 +14963,7 @@ fn emit_http10_dynamic_bytes(
                     field_ranges,
                     &http_text_bindings,
                     None,
+                    None,
                 )?;
                 store_rax_at_rbp(&mut code, value_slot);
                 handler_offsets.insert(name.as_str(), value_slot);
@@ -14824,7 +15271,7 @@ fn emit_handler_to_slots(
                     // `status: number [100, 599]`; native trusts it and
                     // dispatches to the generic evaluator, then stores
                     // rax at the status slot.
-                    emit_eval_expr(code, status_expr, input_name, offsets, all_rules, field_ranges, text_bindings, None)?;
+                    emit_eval_expr(code, status_expr, input_name, offsets, all_rules, field_ranges, text_bindings, None, None)?;
                     // mov [rbp-24], rax
                     code.extend_from_slice(&[0x48, 0x89, 0x45, 0xE8]);
                 }
@@ -14972,7 +15419,7 @@ fn emit_handler_to_slots(
         }
         Expr::If(cond, then_e, else_e) => {
             // Evaluate cond → rax (0 or 1)
-            emit_eval_expr(code, cond, input_name, offsets, all_rules, field_ranges, text_bindings, None)?;
+            emit_eval_expr(code, cond, input_name, offsets, all_rules, field_ranges, text_bindings, None, None)?;
             // test rax, rax ; jz else_label
             code.extend_from_slice(&[0x48, 0x85, 0xC0]);
             code.push(0x0F);
@@ -24388,12 +24835,18 @@ rule scalar
         let _ = std::fs::remove_file(&without_out);
     }
 
-    /// Phase B slice 4a.1 — a rule that VariantConstructs a group
-    /// concept refuses with a B.4a.2 breadcrumb pointing at the
-    /// follow-up slice that will wire VariantConstruct emit into the
-    /// arena.
+    /// Phase B slice 4a.2 — lifts the slice-4a.1 refusal of
+    /// `VariantConstruct` on group concepts AND verifies the resulting
+    /// binary writes a real arena entry per construction.
+    ///
+    /// Worked end-to-end shape: rule `make_int(s: Seed) -> Expr` with
+    /// `e = Expr::Int { value: s.n }`. Each invocation builds one
+    /// Int node, returning the pre-inc arena index in rax. Since the
+    /// rule's output type is a group concept (sum type, no fields),
+    /// dispatch routes through `emit_full_program` which prints the
+    /// rax (= index) as a Number via `emit_itoa_inline`.
     #[test]
-    fn phase_b4a1_variant_construct_on_group_refused() {
+    fn phase_b4a2_construct_one_node_runtime() {
         let src = r#"@verbose 0.1.0
 
 concept_group AST [max_depth: 10, max_nodes: 32]
@@ -24411,10 +24864,10 @@ concept Seed
   @intention: "seed"
   @source: t.intent:1
   fields:
-    n : number [0, 10]
+    n : number [0, 100]
 
 rule make_int
-  @intention: "constructs an Expr — must be refused natively in 4a.1"
+  @intention: "constructs an Expr — slice 4a.2 lifts the refusal"
   @source: t.intent:1
   input:
     s : Seed
@@ -24431,21 +24884,246 @@ rule make_int
 "#;
         let tokens = crate::lexer::Lexer::new(src).tokenize().expect("tokenize");
         let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
-        let out = std::env::temp_dir().join("verbosec_test_b4a1_variant_construct_refused");
-        let err = compile_native(&program, "make_int", out.to_str().unwrap(), false, false)
-            .expect_err("VariantConstruct on group concept must be refused in slice 4a.1");
-        let msg = err.message;
-        assert!(
-            msg.contains("slice 4a.2"),
-            "refusal must point at slice 4a.2; got: {}",
-            msg
+        let out = std::env::temp_dir().join("verbosec_test_b4a2_construct_one_node");
+        compile_native(&program, "make_int", out.to_str().unwrap(), false, false)
+            .expect("slice 4a.2: VariantConstruct on group concept must compile");
+
+        // Single input → one Int node constructed → index 0 printed.
+        let r = std::process::Command::new(&out).args(["7"]).output()
+            .expect("spawn make_int");
+        assert!(r.status.success(), "make_int(7) must exit 0; got {:?}", r.status);
+        assert_eq!(
+            String::from_utf8_lossy(&r.stdout).trim(),
+            "0",
+            "first constructed node must have arena index 0"
         );
-        assert!(
-            msg.contains("VariantConstruct"),
-            "refusal must name VariantConstruct; got: {}",
-            msg
+
+        // Two inputs in one invocation — second one gets index 1.
+        let r = std::process::Command::new(&out).args(["7", "11"]).output()
+            .expect("spawn make_int multi");
+        assert!(r.status.success());
+        let lines: Vec<&str> = std::str::from_utf8(&r.stdout).unwrap().trim().split('\n').collect();
+        assert_eq!(lines, vec!["0", "1"], "consecutive constructs must yield 0, 1");
+
+        let _ = std::fs::remove_file(&out);
+    }
+
+    /// Phase B slice 4a.2 — nested VariantConstructs work: `Expr::Add {
+    /// lhs: Expr::Int{value: s.n}, rhs: Expr::Int{value: s.n+1} }` runs
+    /// pre-eval depth-first, so the Add node's lhs/rhs slots receive
+    /// the indices (0, 1) of the two Int nodes constructed just before.
+    /// The returned index is 2 — the Add node, which was the third
+    /// construction in the rule body.
+    ///
+    /// Together with the bounds-check, this also exercises arena overflow
+    /// (running enough records that `node_count >= max_nodes` triggers
+    /// the per-group abort label).
+    #[test]
+    fn phase_b4a2_construct_nested_and_arena_overflow() {
+        let src = r#"@verbose 0.1.0
+
+concept_group AST [max_depth: 10, max_nodes: 32]
+  @intention: "tiny ast"
+  @source: t.intent:1
+
+  concept Expr
+    @intention: "expr"
+    @source: t.intent:1
+    variants:
+      Int of (value : number)
+      Add of (lhs : Expr, rhs : Expr)
+
+concept Seed
+  @intention: "seed"
+  @source: t.intent:1
+  fields:
+    n : number [0, 100]
+
+rule make_add
+  @intention: "build Add(Int(n), Int(n+1))"
+  @source: t.intent:1
+  input:
+    s : Seed
+  output:
+    e : Expr
+  logic:
+    e = Expr::Add { lhs: Expr::Int { value: s.n }, rhs: Expr::Int { value: s.n + 1 } }
+  proofs:
+    purity:
+      reads : [s.n]
+      calls : []
+    termination:
+      bound : 4
+"#;
+        let tokens = crate::lexer::Lexer::new(src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+        let out = std::env::temp_dir().join("verbosec_test_b4a2_construct_nested");
+        compile_native(&program, "make_add", out.to_str().unwrap(), false, false)
+            .expect("slice 4a.2: nested VariantConstruct must compile");
+
+        // Single record: three nodes constructed (Int@0, Int@1, Add@2).
+        // The rule's output is Add → index 2 printed.
+        let r = std::process::Command::new(&out).args(["5"]).output()
+            .expect("spawn make_add");
+        assert!(r.status.success(), "make_add(5) must exit 0; got {:?}", r.status);
+        assert_eq!(
+            String::from_utf8_lossy(&r.stdout).trim(),
+            "2",
+            "Add node's arena index after two Int children must be 2"
         );
-        // Defensive: the dead binary file shouldn't exist (compile errored).
+
+        // Three records → 9 nodes (indices 0..9). Add nodes at 2, 5, 8.
+        let r = std::process::Command::new(&out).args(["1", "2", "3"]).output()
+            .expect("spawn make_add multi");
+        assert!(r.status.success());
+        let lines: Vec<&str> = std::str::from_utf8(&r.stdout).unwrap().trim().split('\n').collect();
+        assert_eq!(lines, vec!["2", "5", "8"], "per-record Add indices stride by 3");
+
+        // Arena overflow: max_nodes=32, 3 nodes per record. 11 records
+        // would need 33 — the 11th's first Int already hits the `jae
+        // .arena_full_abort` (at index 32 == max_nodes).
+        let inputs: Vec<&str> = vec!["1"; 11];
+        let r = std::process::Command::new(&out).args(&inputs).output()
+            .expect("spawn make_add overflow");
+        assert!(!r.status.success(), "overflow must exit non-zero");
+        // 10 records succeed before abort → 10 lines printed (2, 5, ... 29).
+        let stdout = String::from_utf8_lossy(&r.stdout);
+        let lines: Vec<&str> = stdout.trim().split('\n').collect();
+        assert_eq!(
+            lines.len(), 10,
+            "10 records must print before arena exhaustion; got {} lines (stdout={:?})",
+            lines.len(), stdout
+        );
+
+        let _ = std::fs::remove_file(&out);
+    }
+
+    /// Phase B slice 4a.2 — verify the actual machine code contains
+    /// the load-bearing instructions: tag write `mov byte [rcx], 0x00`
+    /// (Int's tag is 0), payload write `mov [rcx + 8], rdx`, and node-
+    /// count bump `inc qword [rbp + nc_slot]`. The patterns are
+    /// architecture-stable as long as the encoding choices in
+    /// emit_eval_expr's VariantConstruct arm don't change.
+    #[test]
+    fn phase_b4a2_construct_emits_tag_payload_and_count_bump() {
+        let src = r#"@verbose 0.1.0
+
+concept_group AST [max_depth: 10, max_nodes: 32]
+  @intention: "tiny ast"
+  @source: t.intent:1
+
+  concept Expr
+    @intention: "expr"
+    @source: t.intent:1
+    variants:
+      Int of (value : number)
+      Add of (lhs : Expr, rhs : Expr)
+
+concept Seed
+  @intention: "seed"
+  @source: t.intent:1
+  fields:
+    n : number [0, 100]
+
+rule make_int
+  @intention: "construct"
+  @source: t.intent:1
+  input:
+    s : Seed
+  output:
+    e : Expr
+  logic:
+    e = Expr::Int { value: s.n }
+  proofs:
+    purity:
+      reads : [s.n]
+      calls : []
+    termination:
+      bound : 1
+"#;
+        let tokens = crate::lexer::Lexer::new(src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+        let out = std::env::temp_dir().join("verbosec_test_b4a2_bytes");
+        compile_native(&program, "make_int", out.to_str().unwrap(), false, false)
+            .expect("compile must succeed");
+        let bytes = std::fs::read(&out).expect("read binary");
+
+        // Tag write for Int (tag = 0): `mov byte [rcx], 0x00`  = C6 01 00
+        assert!(
+            bytes.windows(3).any(|w| w == [0xC6, 0x01, 0x00]),
+            "binary must contain `mov byte [rcx], 0x00` (Int tag write)"
+        );
+
+        // Payload write at offset +8: `mov [rcx + 8], rdx`  = 48 89 51 08
+        assert!(
+            bytes.windows(4).any(|w| w == [0x48, 0x89, 0x51, 0x08]),
+            "binary must contain `mov [rcx + 8], rdx` (payload write at offset 8)"
+        );
+
+        // `imul rcx, r10`  =  49 0F AF CA
+        assert!(
+            bytes.windows(4).any(|w| w == [0x49, 0x0F, 0xAF, 0xCA]),
+            "binary must contain `imul rcx, r10` (entry-address computation)"
+        );
+
+        // `add rcx, r11`  =  4C 01 D9
+        assert!(
+            bytes.windows(3).any(|w| w == [0x4C, 0x01, 0xD9]),
+            "binary must contain `add rcx, r11` (base + offset)"
+        );
+
+        let _ = std::fs::remove_file(&out);
+    }
+
+    /// Phase B slice 4a.2 — VariantConstruct on a TOP-LEVEL (non-group)
+    /// concept still refuses with a slice-A.4+ breadcrumb. The arena
+    /// emit path only fires when a `concept_group` is declared; without
+    /// one, the ArenaCtx is `None` and the VariantConstruct arm trips
+    /// its "requires a concept_group declaration" error.
+    #[test]
+    fn phase_b4a2_construct_on_non_group_concept_refused() {
+        let src = r#"@verbose 0.1.0
+
+concept Color
+  @intention: "color"
+  @source: t.intent:1
+  variants:
+    Red
+    Green
+    Blue
+
+concept Seed
+  @intention: "seed"
+  @source: t.intent:1
+  fields:
+    n : number
+
+rule make_color
+  @intention: "non-group construct"
+  @source: t.intent:1
+  input:
+    s : Seed
+  output:
+    c : Color
+  logic:
+    c = Color::Red
+  proofs:
+    purity:
+      reads : []
+      calls : []
+    termination:
+      bound : 1
+"#;
+        let tokens = crate::lexer::Lexer::new(src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+        let out = std::env::temp_dir().join("verbosec_test_b4a2_non_group_refused");
+        let err = compile_native(&program, "make_color", out.to_str().unwrap(), false, false)
+            .expect_err("non-group VariantConstruct must still refuse");
+        assert!(
+            err.message.contains("concept_group"),
+            "refusal must mention concept_group; got: {}",
+            err.message
+        );
         let _ = std::fs::remove_file(&out);
     }
 
