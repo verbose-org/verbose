@@ -124,25 +124,70 @@ fn compile_native_code(
     stdin: bool,
     stream: bool,
 ) -> Result<Vec<u8>, NativeError> {
-    // Phase B slice 4+: native lowering for `concept_group` (arena
-    // allocation in the rbp frame + 16-bit index references — see
-    // docs/recursive-types-design.md §6). B.3 shipped interpreter
-    // support; native is the next milestone. Refuse here with a clear
-    // breadcrumb so an operator who tries to compile a program with
-    // recursive types sees `--run` as the working path today.
-    if let Some(g) = program.items.iter().find_map(|i| match i {
+    // Phase B slice 4a.1: lift the blanket refusal on `concept_group`.
+    // From this slice forward, a program containing a `concept_group`
+    // declaration can compile natively AS LONG AS the entry rule does
+    // not construct (VariantConstruct) or pattern-match (MatchVariant)
+    // a value of a group concept type. Those two emit sites refuse
+    // with breadcrumbs pointing at B.4a.2 / B.4a.3.
+    //
+    // Slice 4a.1 ships ONLY the prologue infrastructure: arena byte
+    // reservation in the rbp frame, `r11` initialized as arena base,
+    // `node_count_slot` initialized to 0, per-group abort label
+    // appended at end of binary. No new emit semantics. The arena
+    // sits unused until 4a.2 wires VariantConstruct to write into it.
+    //
+    // Slice constraints (memo §1, the smallest reviewable wedge):
+    //   - exactly one `concept_group` in the program (multi-group →
+    //     B.4a-followup);
+    //   - that group declares exactly one inner concept (multi-
+    //     concept-per-group → B.4b — tag namespace + arena
+    //     partitioning needs its own design pass).
+    // Both refusals carry the slice name explicitly so an operator
+    // reading the diagnostic knows which follow-up lifts it.
+    let groups: Vec<&ConceptGroup> = program.items.iter().filter_map(|i| match i {
         Item::ConceptGroup(g) => Some(g),
         _ => None,
-    }) {
+    }).collect();
+    // Snapshot the group-concept names. Cheap because slice 4a.1 limits
+    // the program to one group containing one concept; checked below.
+    let group_concept_names: HashSet<String> = groups
+        .iter()
+        .flat_map(|g| g.concepts.iter().map(|c| c.name.clone()))
+        .collect();
+    let concept_group: Option<&ConceptGroup> = if groups.len() > 1 {
         return Err(NativeError {
             message: format!(
-                "native lowering for concept_group ('{}') is Phase B slice 4+; use --run (slice 3 shipped) for now",
-                g.name
+                "native: more than one concept_group declared (found {}); B.4a.1 \
+                 supports at most one group per program. Multi-group native lowering \
+                 is B.4a-followup (mutual recursion across arenas needs its own \
+                 design pass).",
+                groups.len()
             ),
         });
-    }
+    } else if let Some(g) = groups.first() {
+        if g.concepts.len() != 1 {
+            return Err(NativeError {
+                message: format!(
+                    "native: concept_group '{}' declares {} concepts; B.4a.1 supports \
+                     single-concept groups only. Multi-concept groups (mutual type \
+                     recursion in one arena) land in B.4b — needs tag namespace and \
+                     arena partitioning design.",
+                    g.name, g.concepts.len()
+                ),
+            });
+        }
+        Some(*g)
+    } else {
+        None
+    };
     // (Extracted from compile_native — same dispatch logic.)
-    let concepts: Vec<&Concept> = program.items.iter().filter_map(|i| match i { Item::Concept(c) => Some(c), _ => None }).collect();
+    // Phase B slice 1: use `iter_all_concepts` so group-nested concepts
+    // are visible to native dispatch for refusal walks. Before this slice
+    // group concepts weren't reachable from native at all; in slice 4a.1
+    // we need to resolve `Type::Named(N)` references whose N lives in a
+    // group (e.g. to surface the right MatchVariant refusal breadcrumb).
+    let concepts: Vec<&Concept> = crate::ast::iter_all_concepts(&program.items).collect();
     let rules: HashMap<&str, &Rule> = program.items.iter().filter_map(|i| match i { Item::Rule(r) => Some((r.name.as_str(), r)), _ => None }).collect();
     // Phase 9 slice 1: index every top-level `resource` block by name. The
     // emitter walks the rule's logic to discover which entries it actually
@@ -170,6 +215,61 @@ fn compile_native_code(
         let c = match &r.input_ty { Type::Named(n) => concepts.iter().find(|c| c.name == *n).ok_or_else(|| NativeError { message: format!("unknown concept '{}'", n) })?, _ => return Err(NativeError { message: "rule input must be a named concept".into() }) };
         (*r, *c)
     };
+
+    // Phase B slice 4a.1 — early refusal when ANY rule in the program
+    // TOUCHES a group concept. The prologue infrastructure ships in
+    // slice 4a.1, but VariantConstruct emit (writing into the arena)
+    // lands in B.4a.2 and MatchVariant emit (dispatching off an arena
+    // index) lands in B.4a.3. Detect each shape via a static walk over
+    // every rule's logic + let-binding RHSes; refuse before any code
+    // is emitted.
+    //
+    // Why walk EVERY rule, not just the entry? Because the entry rule
+    // may delegate via Call to callees that themselves touch the
+    // group (e.g. sum_chain.verbose's `sum_seed` calls `eval` which
+    // pattern-matches on Expr). The verifier permits these callees;
+    // refusing only the entry rule would let `sum_chain.verbose --run
+    // sum_seed --native` reach an emit site for `eval`'s MatchVariant
+    // and produce a stale Phase-A breadcrumb. Walking every rule is
+    // O(program size) — cheap enough to do once per compile.
+    if !group_concept_names.is_empty() {
+        for (rname, r) in &rules {
+            // Skip rules whose input is not a Named concept (defensive —
+            // those can't reference a group concept by construction).
+            let mut exprs_to_walk: Vec<&Expr> = vec![&r.logic.value];
+            for (_, e) in &r.logic.bindings {
+                exprs_to_walk.push(e);
+            }
+            // VariantConstruct refusal (B.4a.2 follow-up).
+            for e in &exprs_to_walk {
+                if let Some(name) = find_group_variant_construct_in_expr(e, &group_concept_names) {
+                    return Err(NativeError {
+                        message: format!(
+                            "native VariantConstruct for concept_group type '{}' (in rule '{}') is Phase B slice 4a.2; use --run for now",
+                            name, rname
+                        ),
+                    });
+                }
+            }
+            // MatchVariant refusal (B.4a.3 follow-up).
+            for e in &exprs_to_walk {
+                if let Some(name) = find_group_match_variant_in_expr(
+                    e,
+                    &group_concept_names,
+                    &r.input_name,
+                    &r.input_ty,
+                    &rules,
+                ) {
+                    return Err(NativeError {
+                        message: format!(
+                            "native MatchVariant on concept_group type '{}' (in rule '{}') is Phase B slice 4a.3; use --run for now",
+                            name, rname
+                        ),
+                    });
+                }
+            }
+        }
+    }
 
     // Phase A slice 5.0/5.1a — handle recursive rules.
     //
@@ -339,11 +439,11 @@ fn compile_native_code(
         // Slice 5.1a-5.4: emit the rule (or SCC) as real callables.
         // scc_rules_owned was populated above when recursion was detected;
         // for single self-recursion it has one entry, for mutual it has N.
-        emit_self_recursive_program(rule, &scc_rules_owned, concept, &rules, &resources, &connections)?
+        emit_self_recursive_program(rule, &scc_rules_owned, concept, &rules, &resources, &connections, concept_group)?
     } else if let Some(rx) = reaction {
-        emit_reaction_program(rx, rule, concept, &rules, &resources, &connections)?
+        emit_reaction_program(rx, rule, concept, &rules, &resources, &connections, concept_group)?
     } else if is_result_output {
-        emit_result_program(rule, concept, &concepts, &rules, &resources, &connections)?
+        emit_result_program(rule, concept, &concepts, &rules, &resources, &connections, concept_group)?
     } else if is_collection_output {
         emit_collection_program(rule, concept, &concepts, &rules, &resources)?
     } else if is_fold_number_output {
@@ -361,18 +461,18 @@ fn compile_native_code(
     } else if is_fold_bytes_output {
         emit_fold_bytes_program(rule, concept, &rules, &resources)?
     } else if matches!(&rule.output_ty, Type::Text) {
-        emit_text_program(rule, concept, &rules, &resources, &connections)?
+        emit_text_program(rule, concept, &rules, &resources, &connections, concept_group)?
     } else if let Some(rec_concept) = record_output_concept {
-        emit_record_program(rule, rec_concept, concept, &concepts, &rules, &resources, &connections)?
+        emit_record_program(rule, rec_concept, concept, &concepts, &rules, &resources, &connections, concept_group)?
     } else if matches!(&rule.output_ty, Type::Number | Type::Bool) && contains_quantifier(&rule.logic.value) {
         // Phase 6: scalar output with embedded quantifiers (e.g. if all(...) then X else Y).
         emit_multi_fold_program(rule, concept, &concepts, &rules, &resources)?
     } else if is_vectorizable && concept.fields.len() == 1 {
-        if let Some(threshold) = extract_simple_gt(rule) { emit_vectorized_program(threshold)? } else { emit_full_program(rule, concept, context_concept, &rules, &resources, &connections)? }
+        if let Some(threshold) = extract_simple_gt(rule) { emit_vectorized_program(threshold)? } else { emit_full_program(rule, concept, context_concept, &rules, &resources, &connections, concept_group)? }
     } else if is_parallel {
         emit_parallel_program(rule, concept, &rules, &resources)?
     } else {
-        emit_full_program(rule, concept, context_concept, &rules, &resources, &connections)?
+        emit_full_program(rule, concept, context_concept, &rules, &resources, &connections, concept_group)?
     };
 
     if stream {
@@ -538,6 +638,36 @@ struct RecordLoopCtx<'a> {
     /// exit syscall, when the vector is non-empty. Empty (and zero cost)
     /// for rules that do not reference any resource.
     resource_abort_patches: Vec<usize>,
+    /// Phase B slice 4a.1: total bytes reserved at the bottom of the
+    /// rbp frame for the concept_group's runtime arena. Equals
+    /// `max_nodes * entry_size` when a single-concept group is declared
+    /// in the program; 0 otherwise. Slice 4a.1 only reserves the bytes
+    /// — no VariantConstruct writes here yet. Future slice (4a.2) will
+    /// emit into [r11 + idx * entry_size].
+    arena_size: i32,
+    /// Phase B slice 4a.1: rbp-relative offset at which the arena starts
+    /// (most-negative byte). Used to emit `lea r11, [rbp + arena_rbp_offset]`
+    /// once at prologue. 0 when no group is declared (purely-additive
+    /// slice — the field has no consumer in 4a.1).
+    arena_rbp_offset: i32,
+    /// Phase B slice 4a.1: rbp-relative offset of the 8-byte slot that
+    /// holds the count of arena entries currently in use. Initialized to
+    /// 0 at prologue when a group is declared. Slice 4a.2 will bump this
+    /// slot on every successful VariantConstruct. 0 when no group is
+    /// declared (the slot doesn't exist in the frame in that case).
+    node_count_slot: i32,
+    /// Phase B slice 4a.1: per-variant entry size in bytes (1 tag byte +
+    /// 8 bytes per payload field, padded up to 8). Computed from the
+    /// single concept's variants. 0 when no group is declared. Future
+    /// slices compute `idx * entry_size` from this constant.
+    entry_size: i32,
+    /// Phase B slice 4a.1: jae patch sites left by future VariantConstruct
+    /// emits for arena overflow bounds-checks. Slice 4a.1 leaves this
+    /// vector empty (no construct sites to bounds-check yet). The epilogue
+    /// resolves the empty vector to a no-op AND emits the per-group abort
+    /// label unconditionally when `arena_size > 0` — this gives B.4a.2 a
+    /// patch target without needing to modify the prologue or epilogue.
+    arena_abort_patches: Vec<usize>,
 }
 
 /// Emit an argc guard: if r12 (argc) < min_argc, write an error message
@@ -2133,6 +2263,214 @@ fn emit_connection_fetch_sequence(
     Ok((ptr_slot, len_slot, buf_slot, new_next))
 }
 
+/// Phase B slice 4a.1 — check whether an expression tree contains a
+/// `VariantConstruct` whose concept name belongs to a `concept_group`.
+/// Returns the variant-concept name on hit so the caller can build a
+/// precise breadcrumb. Used to refuse early in `compile_native_code`
+/// with a B.4a.2 message — slice 4a.1 ships the prologue
+/// infrastructure but not the construct emit yet.
+fn find_group_variant_construct_in_expr(
+    expr: &Expr,
+    group_concepts: &HashSet<String>,
+) -> Option<String> {
+    match expr {
+        Expr::VariantConstruct(concept_name, _, fields) => {
+            if group_concepts.contains(concept_name) {
+                return Some(concept_name.clone());
+            }
+            for (_, e) in fields {
+                if let Some(hit) = find_group_variant_construct_in_expr(e, group_concepts) {
+                    return Some(hit);
+                }
+            }
+            None
+        }
+        Expr::Number(_) | Expr::Text(_) | Expr::Ident(_) | Expr::Read(_) | Expr::NowUnix => None,
+        Expr::Field(b, _) => find_group_variant_construct_in_expr(b, group_concepts),
+        Expr::Binary(_, l, r) => find_group_variant_construct_in_expr(l, group_concepts)
+            .or_else(|| find_group_variant_construct_in_expr(r, group_concepts)),
+        Expr::Not(i) | Expr::Neg(i) | Expr::Ok(i) | Expr::Err(i)
+        | Expr::Abs(i) | Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i) => {
+            find_group_variant_construct_in_expr(i, group_concepts)
+        }
+        Expr::If(c, t, e) => find_group_variant_construct_in_expr(c, group_concepts)
+            .or_else(|| find_group_variant_construct_in_expr(t, group_concepts))
+            .or_else(|| find_group_variant_construct_in_expr(e, group_concepts)),
+        Expr::Call(_, args) | Expr::Concat(args) => args
+            .iter()
+            .find_map(|a| find_group_variant_construct_in_expr(a, group_concepts)),
+        Expr::Quantifier(_, c, _, body) => find_group_variant_construct_in_expr(c, group_concepts)
+            .or_else(|| find_group_variant_construct_in_expr(body, group_concepts)),
+        Expr::Fold(c, init, _, _, body) => find_group_variant_construct_in_expr(c, group_concepts)
+            .or_else(|| find_group_variant_construct_in_expr(init, group_concepts))
+            .or_else(|| find_group_variant_construct_in_expr(body, group_concepts)),
+        Expr::FoldBytes(t, init, _, _, _, body) => {
+            find_group_variant_construct_in_expr(t, group_concepts)
+                .or_else(|| find_group_variant_construct_in_expr(init, group_concepts))
+                .or_else(|| find_group_variant_construct_in_expr(body, group_concepts))
+        }
+        Expr::Map(c, _, body) | Expr::Filter(c, _, body) => {
+            find_group_variant_construct_in_expr(c, group_concepts)
+                .or_else(|| find_group_variant_construct_in_expr(body, group_concepts))
+        }
+        Expr::MatchResult(t, _, ok, _, err) => find_group_variant_construct_in_expr(t, group_concepts)
+            .or_else(|| find_group_variant_construct_in_expr(ok, group_concepts))
+            .or_else(|| find_group_variant_construct_in_expr(err, group_concepts)),
+        Expr::Record(_, fields) => fields
+            .iter()
+            .find_map(|(_, e)| find_group_variant_construct_in_expr(e, group_concepts)),
+        Expr::Fetch(_, req) => find_group_variant_construct_in_expr(req, group_concepts),
+        Expr::StartsWith(h, n) | Expr::Contains(h, n) | Expr::EndsWith(h, n)
+        | Expr::Min(h, n) | Expr::Max(h, n) | Expr::ByteAt(h, n) => {
+            find_group_variant_construct_in_expr(h, group_concepts)
+                .or_else(|| find_group_variant_construct_in_expr(n, group_concepts))
+        }
+        Expr::Substring(t, s, e) => find_group_variant_construct_in_expr(t, group_concepts)
+            .or_else(|| find_group_variant_construct_in_expr(s, group_concepts))
+            .or_else(|| find_group_variant_construct_in_expr(e, group_concepts)),
+        Expr::MatchVariant(scrutinee, arms) => {
+            // The scrutinee itself can never be a VariantConstruct of a
+            // group concept (we'd find it via this recursion regardless)
+            // so the MatchVariant arm's primary job is to recurse into
+            // each arm's body and the scrutinee.
+            find_group_variant_construct_in_expr(scrutinee, group_concepts)
+                .or_else(|| arms.iter().find_map(|a| find_group_variant_construct_in_expr(&a.body, group_concepts)))
+        }
+    }
+}
+
+/// Phase B slice 4a.1 — detect a `MatchVariant` whose scrutinee
+/// produces a value of a group concept type. The slice refuses these
+/// with a B.4a.3 breadcrumb (arena-aware dispatch lands in 4a.3).
+///
+/// Strategy: walk the expression tree; at each MatchVariant, attempt to
+/// resolve the scrutinee's type. Slice 4a.1 handles the common shapes:
+///   - `Call(callee, _)` where `callee.output_ty == Type::Named(N)` and
+///     N is in the group → match-on-group, refuse.
+///   - `Ident(name)` where `name == rule.input_name` AND the rule's
+///     input is a Named group concept → match-on-group, refuse.
+/// Other scrutinee shapes (e.g. Field of a group-typed record field)
+/// are not in scope for slice 4a.1 — the language doesn't yet support
+/// group-typed Field reads outside of variant payloads, so this
+/// heuristic covers every shape the verifier currently lets through.
+fn find_group_match_variant_in_expr(
+    expr: &Expr,
+    group_concepts: &HashSet<String>,
+    rule_input_name: &str,
+    rule_input_ty: &Type,
+    all_rules: &HashMap<&str, &Rule>,
+) -> Option<String> {
+    match expr {
+        Expr::MatchVariant(scrutinee, arms) => {
+            // Check the scrutinee type first.
+            let scrut_concept: Option<&str> = match scrutinee.as_ref() {
+                Expr::Call(callee_name, _) => all_rules.get(callee_name.as_str()).and_then(|r| match &r.output_ty {
+                    Type::Named(n) => Some(n.as_str()),
+                    _ => None,
+                }),
+                Expr::Ident(name) if name == rule_input_name => match rule_input_ty {
+                    Type::Named(n) => Some(n.as_str()),
+                    _ => None,
+                },
+                _ => None,
+            };
+            if let Some(n) = scrut_concept {
+                if group_concepts.contains(n) {
+                    return Some(n.to_string());
+                }
+            }
+            // Recurse into scrutinee + each arm body for nested matches.
+            if let Some(hit) = find_group_match_variant_in_expr(scrutinee, group_concepts, rule_input_name, rule_input_ty, all_rules) {
+                return Some(hit);
+            }
+            for a in arms {
+                if let Some(hit) = find_group_match_variant_in_expr(&a.body, group_concepts, rule_input_name, rule_input_ty, all_rules) {
+                    return Some(hit);
+                }
+            }
+            None
+        }
+        Expr::Number(_) | Expr::Text(_) | Expr::Ident(_) | Expr::Read(_) | Expr::NowUnix => None,
+        Expr::Field(b, _) => find_group_match_variant_in_expr(b, group_concepts, rule_input_name, rule_input_ty, all_rules),
+        Expr::Binary(_, l, r) => find_group_match_variant_in_expr(l, group_concepts, rule_input_name, rule_input_ty, all_rules)
+            .or_else(|| find_group_match_variant_in_expr(r, group_concepts, rule_input_name, rule_input_ty, all_rules)),
+        Expr::Not(i) | Expr::Neg(i) | Expr::Ok(i) | Expr::Err(i)
+        | Expr::Abs(i) | Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i) => {
+            find_group_match_variant_in_expr(i, group_concepts, rule_input_name, rule_input_ty, all_rules)
+        }
+        Expr::If(c, t, e) => find_group_match_variant_in_expr(c, group_concepts, rule_input_name, rule_input_ty, all_rules)
+            .or_else(|| find_group_match_variant_in_expr(t, group_concepts, rule_input_name, rule_input_ty, all_rules))
+            .or_else(|| find_group_match_variant_in_expr(e, group_concepts, rule_input_name, rule_input_ty, all_rules)),
+        Expr::Call(_, args) | Expr::Concat(args) => args
+            .iter()
+            .find_map(|a| find_group_match_variant_in_expr(a, group_concepts, rule_input_name, rule_input_ty, all_rules)),
+        Expr::Quantifier(_, c, _, body) => find_group_match_variant_in_expr(c, group_concepts, rule_input_name, rule_input_ty, all_rules)
+            .or_else(|| find_group_match_variant_in_expr(body, group_concepts, rule_input_name, rule_input_ty, all_rules)),
+        Expr::Fold(c, init, _, _, body) => find_group_match_variant_in_expr(c, group_concepts, rule_input_name, rule_input_ty, all_rules)
+            .or_else(|| find_group_match_variant_in_expr(init, group_concepts, rule_input_name, rule_input_ty, all_rules))
+            .or_else(|| find_group_match_variant_in_expr(body, group_concepts, rule_input_name, rule_input_ty, all_rules)),
+        Expr::FoldBytes(t, init, _, _, _, body) => {
+            find_group_match_variant_in_expr(t, group_concepts, rule_input_name, rule_input_ty, all_rules)
+                .or_else(|| find_group_match_variant_in_expr(init, group_concepts, rule_input_name, rule_input_ty, all_rules))
+                .or_else(|| find_group_match_variant_in_expr(body, group_concepts, rule_input_name, rule_input_ty, all_rules))
+        }
+        Expr::Map(c, _, body) | Expr::Filter(c, _, body) => {
+            find_group_match_variant_in_expr(c, group_concepts, rule_input_name, rule_input_ty, all_rules)
+                .or_else(|| find_group_match_variant_in_expr(body, group_concepts, rule_input_name, rule_input_ty, all_rules))
+        }
+        Expr::MatchResult(t, _, ok, _, err) => find_group_match_variant_in_expr(t, group_concepts, rule_input_name, rule_input_ty, all_rules)
+            .or_else(|| find_group_match_variant_in_expr(ok, group_concepts, rule_input_name, rule_input_ty, all_rules))
+            .or_else(|| find_group_match_variant_in_expr(err, group_concepts, rule_input_name, rule_input_ty, all_rules)),
+        Expr::Record(_, fields) => fields
+            .iter()
+            .find_map(|(_, e)| find_group_match_variant_in_expr(e, group_concepts, rule_input_name, rule_input_ty, all_rules)),
+        Expr::VariantConstruct(_, _, fields) => fields
+            .iter()
+            .find_map(|(_, e)| find_group_match_variant_in_expr(e, group_concepts, rule_input_name, rule_input_ty, all_rules)),
+        Expr::Fetch(_, req) => find_group_match_variant_in_expr(req, group_concepts, rule_input_name, rule_input_ty, all_rules),
+        Expr::StartsWith(h, n) | Expr::Contains(h, n) | Expr::EndsWith(h, n)
+        | Expr::Min(h, n) | Expr::Max(h, n) | Expr::ByteAt(h, n) => {
+            find_group_match_variant_in_expr(h, group_concepts, rule_input_name, rule_input_ty, all_rules)
+                .or_else(|| find_group_match_variant_in_expr(n, group_concepts, rule_input_name, rule_input_ty, all_rules))
+        }
+        Expr::Substring(t, s, e) => find_group_match_variant_in_expr(t, group_concepts, rule_input_name, rule_input_ty, all_rules)
+            .or_else(|| find_group_match_variant_in_expr(s, group_concepts, rule_input_name, rule_input_ty, all_rules))
+            .or_else(|| find_group_match_variant_in_expr(e, group_concepts, rule_input_name, rule_input_ty, all_rules)),
+    }
+}
+
+/// Phase B slice 4a.1 — compute the per-entry byte size of a sum-type
+/// concept inside a `concept_group`. Layout: 1 byte tag + 8 bytes per
+/// payload field (each field gets one i64 slot — Number values held
+/// directly, recursive references held as a zero-extended 16-bit
+/// arena index, both fit in 8 bytes), rounded up to 8-byte alignment.
+///
+/// For `Expr` with variants `Int(value: number)` (1 field) and
+/// `Add(lhs: Expr, rhs: Expr)` (2 fields): max(1+8, 1+16) = 17 → pad
+/// to 24. The 4 unused bytes of `Int` entries are accepted waste —
+/// uniform entry size keeps `idx * entry_size` a single `imul`.
+///
+/// Slice 4a.1 only computes this size for the prologue's frame
+/// reservation; no entries are written yet.
+fn compute_arena_entry_size(group: &ConceptGroup) -> i32 {
+    // Slice 4a.1 constraint: exactly one concept per group (enforced
+    // at compile_native_code). The caller checks this before reaching
+    // here, but we still defensively pick the first concept.
+    let concept = match group.concepts.first() {
+        Some(c) => c,
+        None => return 0,
+    };
+    let max_payload_fields = concept
+        .variants
+        .iter()
+        .map(|v| v.fields.len())
+        .max()
+        .unwrap_or(0) as i32;
+    let raw = 1 + 8 * max_payload_fields;
+    // Round up to 8-byte alignment.
+    (raw + 7) & !7
+}
+
 fn emit_record_loop_prologue<'a>(
     code: &mut Vec<u8>,
     rule: &'a Rule,
@@ -2141,6 +2479,7 @@ fn emit_record_loop_prologue<'a>(
     all_rules: &HashMap<&str, &Rule>,
     all_resources: &HashMap<&str, &'a Resource>,
     all_connections: &HashMap<&str, &'a Connection>,
+    concept_group: Option<&'a ConceptGroup>,
 ) -> Result<RecordLoopCtx<'a>, NativeError> {
     let n_ctx = context_concept.map_or(0, |c| c.fields.len());
     let nfields = input_concept.fields.len();
@@ -2224,11 +2563,35 @@ fn emit_record_loop_prologue<'a>(
     // byte unchanged for rules that don't touch the clock.
     let uses_now = rule_uses_now_unix(rule);
     let now_extra_bytes: i32 = if uses_now { 16 } else { 0 };
+
+    // Phase B slice 4a.1 — arena reservation. When a `concept_group` is
+    // declared in the program, ALL emitter paths that use this prologue
+    // reserve `max_nodes * entry_size` bytes for the runtime arena plus
+    // 8 bytes for the `node_count` counter. Slice 4a.1 writes nothing
+    // into the arena yet; the slot is just initialized to 0 so 4a.2's
+    // VariantConstruct emit lands cleanly on a zeroed counter.
+    //
+    // The arena lives at the BOTTOM of the frame (below resource and
+    // connection blocks, below the now_unix slot). Layout chosen so
+    // future fixed-slot offsets (above) keep the same rbp-relative
+    // address as the no-group case — only the frame_size grows, the
+    // prior slot layout is byte-for-byte unchanged.
+    let (arena_size, arena_entry_size) = match concept_group {
+        Some(g) => {
+            let entry_size = compute_arena_entry_size(g);
+            let arena_bytes = (g.max_nodes as i32) * entry_size;
+            (arena_bytes, entry_size)
+        }
+        None => (0, 0),
+    };
+    let arena_extra_bytes: i32 = if arena_size > 0 { arena_size + 8 } else { 0 };
+
     let frame_slots = n_ctx + nfields + n_binding_slots + n_reserved;
     let frame_size = (frame_slots * 8) as i32
         + resource_extra_bytes
         + connection_extra_bytes
-        + now_extra_bytes;
+        + now_extra_bytes
+        + arena_extra_bytes;
     let base = (n_ctx + nfields + n_binding_slots) as i32;
     // Depth-0 quartet (always present). Deeper depths sit at base + 4*depth + {1..4}.
     let match_slot: i32 = -((base + 1) * 8);
@@ -2348,6 +2711,68 @@ fn emit_record_loop_prologue<'a>(
         s
     } else {
         0 // unused; uses_now=false guards the only consumer
+    };
+    // After now_unix, the next available slot for further allocations
+    // sits below tv_sec (the deeper slot, when uses_now is true).
+    let post_now_next_slot: i32 = if uses_now {
+        now_slot - 8
+    } else {
+        resource_next_slot
+    };
+
+    // ─── Phase B slice 4a.1 — arena setup. When a `concept_group` is
+    // declared in the program, the prologue reserves arena bytes at the
+    // BOTTOM of the rbp frame (below all other reservations), initializes
+    // `node_count_slot` to 0, and sets `r11` to point at the start of
+    // the arena (lowest address).
+    //
+    // r11 honesty: Linux syscalls clobber rcx and r11 by ABI, so the
+    // per-record body's append_file / read / fetch / text-write syscalls
+    // all destroy r11. The load-bearing invariant in slice 4a.1 is the
+    // rbp-relative `arena_rbp_offset` (a compile-time constant) — slice
+    // 4a.2's VariantConstruct emit will either reload r11 from its lea
+    // expression before each arena access OR keep arena access outside
+    // syscall-touching code paths. The lea here at the prologue is the
+    // canonical starting state for body code that runs before any
+    // syscall; it's a no-op when the body never reads from r11.
+    //
+    // Slot layout (when arena_size > 0):
+    //   node_count_slot at rbp + post_now_next_slot - 8
+    //   arena_rbp_offset = node_count_slot - arena_size  (lowest byte
+    //                                                     of the arena)
+    //
+    // Slice 4a.1 only initializes node_count to 0. The arena bytes are
+    // reserved but never written. r11 is set up so 4a.2's VariantConstruct
+    // emit can land directly on it (when called immediately after the
+    // prologue, before any syscall).
+    let (node_count_slot, arena_rbp_offset): (i32, i32) = if arena_size > 0 {
+        let nc_slot = post_now_next_slot - 8;
+        let arena_off = nc_slot - arena_size;
+        // mov qword [rbp + nc_slot], 0  — initialize node_count to 0.
+        if nc_slot >= -128 {
+            code.extend_from_slice(&[0x48, 0xC7, 0x45]);
+            code.push(nc_slot as u8);
+            code.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+        } else {
+            code.extend_from_slice(&[0x48, 0xC7, 0x85]);
+            code.extend_from_slice(&nc_slot.to_le_bytes());
+            code.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+        }
+        // lea r11, [rbp + arena_off]  — set r11 to the start of the arena.
+        // REX.WR (0x4C) + LEA opcode 0x8D + ModRM disp32 form (0x9D)
+        // when arena_off doesn't fit in disp8; disp8 form (0x5D) when
+        // it does. arena_off is highly negative (frame is large when
+        // arena is present), so disp32 is the realistic case.
+        if arena_off >= -128 {
+            code.extend_from_slice(&[0x4C, 0x8D, 0x5D]);
+            code.push(arena_off as u8);
+        } else {
+            code.extend_from_slice(&[0x4C, 0x8D, 0x9D]);
+            code.extend_from_slice(&arena_off.to_le_bytes());
+        }
+        (nc_slot, arena_off)
+    } else {
+        (0, 0)
     };
 
     let loop_top = code.len();
@@ -2506,6 +2931,11 @@ fn emit_record_loop_prologue<'a>(
         extra_match_slot_quartets: n_match_quartets - 1,
         exit_flag_slot,
         resource_abort_patches,
+        arena_size,
+        arena_rbp_offset,
+        node_count_slot,
+        entry_size: arena_entry_size,
+        arena_abort_patches: Vec::new(),
     })
 }
 
@@ -2535,19 +2965,41 @@ fn emit_record_loop_epilogue(code: &mut Vec<u8>, ctx: &RecordLoopCtx<'_>) {
     // for rule-level resource I/O failures and only exists when at least
     // one resource read was emitted, so non-resource rules pay zero bytes.
     emit_resource_abort_tail(code, &ctx.resource_abort_patches);
+    // Phase B slice 4a.1: per-group arena abort label. Emitted unconditionally
+    // when the program declares a `concept_group` (i.e. arena_size > 0), so
+    // that follow-up slice 4a.2's VariantConstruct emit has a stable patch
+    // target. Slice 4a.1 emits no patches, so this label sits at the end of
+    // the binary with no inbound jumps — verbosec validators are fine with
+    // dead-but-reachable-by-jmp code, but we keep the size honest by only
+    // emitting it when a group is present. The label content is the same
+    // sys_exit(1) sequence as the resource abort tail; future slices that
+    // want a different exit code or message can split this into a dedicated
+    // helper.
+    if ctx.arena_size > 0 {
+        let abort_label = code.len();
+        for site in &ctx.arena_abort_patches {
+            let rel = abort_label as i32 - (*site as i32 + 4);
+            code[*site..*site + 4].copy_from_slice(&rel.to_le_bytes());
+        }
+        // mov rax, 60 ; mov rdi, 1 ; syscall
+        code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x3C, 0x00, 0x00, 0x00]);
+        code.extend_from_slice(&[0x48, 0xC7, 0xC7, 0x01, 0x00, 0x00, 0x00]);
+        code.extend_from_slice(&[0x0F, 0x05]);
+    }
 }
 
-fn emit_full_program(
-    rule: &Rule,
-    concept: &Concept,
-    context_concept: Option<&Concept>,
+fn emit_full_program<'a>(
+    rule: &'a Rule,
+    concept: &'a Concept,
+    context_concept: Option<&'a Concept>,
     all_rules: &HashMap<&str, &Rule>,
-    all_resources: &HashMap<&str, &Resource>,
-    all_connections: &HashMap<&str, &Connection>,
+    all_resources: &HashMap<&str, &'a Resource>,
+    all_connections: &HashMap<&str, &'a Connection>,
+    concept_group: Option<&'a ConceptGroup>,
 ) -> Result<Vec<u8>, NativeError> {
     let is_bool = rule.output_ty == Type::Bool;
     let mut code = Vec::new();
-    let ctx = emit_record_loop_prologue(&mut code, rule, concept, context_concept, all_rules, all_resources, all_connections)?;
+    let ctx = emit_record_loop_prologue(&mut code, rule, concept, context_concept, all_rules, all_resources, all_connections, concept_group)?;
 
     // Evaluate final expression — result in rax
     emit_eval_expr(
@@ -2635,13 +3087,14 @@ fn emit_full_program(
 /// convention: load the field from its rbp slot into rdi, call. After
 /// the call, rax holds the return value, then itoa + write + jmp
 /// loop_top runs as in `emit_full_program`.
-fn emit_self_recursive_program(
-    entry_rule: &Rule,
-    scc_rules: &[&Rule],
-    concept: &Concept,
+fn emit_self_recursive_program<'a>(
+    entry_rule: &'a Rule,
+    scc_rules: &[&'a Rule],
+    concept: &'a Concept,
     all_rules: &HashMap<&str, &Rule>,
-    all_resources: &HashMap<&str, &Resource>,
-    all_connections: &HashMap<&str, &Connection>,
+    all_resources: &HashMap<&str, &'a Resource>,
+    all_connections: &HashMap<&str, &'a Connection>,
+    concept_group: Option<&'a ConceptGroup>,
 ) -> Result<Vec<u8>, NativeError> {
     let is_bool = entry_rule.output_ty == Type::Bool;
     let is_text = entry_rule.output_ty == Type::Text;
@@ -2696,6 +3149,7 @@ fn emit_self_recursive_program(
     let entry_label = labels[entry_rule.name.as_str()];
     let ctx = emit_record_loop_prologue(
         &mut code, entry_rule, concept, None, all_rules, all_resources, all_connections,
+        concept_group,
     )?;
     if !is_multi_field {
         // Single-field: rdi = value.
@@ -3071,15 +3525,16 @@ fn emit_recursive_text_body(
 /// Rejection comes naturally: a `Fold(...)` expression at the top of a
 /// text-output rule would hit `emit_text_write_to_fd`'s fallback arm, which
 /// refuses anything that isn't Text / Field / Concat.
-fn emit_text_program(
-    rule: &Rule,
-    concept: &Concept,
+fn emit_text_program<'a>(
+    rule: &'a Rule,
+    concept: &'a Concept,
     all_rules: &HashMap<&str, &Rule>,
-    all_resources: &HashMap<&str, &Resource>,
-    all_connections: &HashMap<&str, &Connection>,
+    all_resources: &HashMap<&str, &'a Resource>,
+    all_connections: &HashMap<&str, &'a Connection>,
+    concept_group: Option<&'a ConceptGroup>,
 ) -> Result<Vec<u8>, NativeError> {
     let mut code = Vec::new();
-    let ctx = emit_record_loop_prologue(&mut code, rule, concept, None, all_rules, all_resources, all_connections)?;
+    let ctx = emit_record_loop_prologue(&mut code, rule, concept, None, all_rules, all_resources, all_connections, concept_group)?;
 
     // Phase 2I — pass the text_bindings built from the prologue's let-eval
     // loop so text-write resolves Ident(let-name) as a BoundText (same path
@@ -5367,13 +5822,14 @@ fn emit_open_append(code: &mut Vec<u8>, path: &str) {
 /// intermediate tagged "Result value" materialized in registers or memory —
 /// avoids the register-lifetime / stack-cleanup complexity when a leaf
 /// allocates a concat buffer.
-fn emit_result_program(
-    rule: &Rule,
-    concept: &Concept,
+fn emit_result_program<'a>(
+    rule: &'a Rule,
+    concept: &'a Concept,
     all_concepts: &[&Concept],
     all_rules: &HashMap<&str, &Rule>,
-    all_resources: &HashMap<&str, &Resource>,
-    all_connections: &HashMap<&str, &Connection>,
+    all_resources: &HashMap<&str, &'a Resource>,
+    all_connections: &HashMap<&str, &'a Connection>,
+    concept_group: Option<&'a ConceptGroup>,
 ) -> Result<Vec<u8>, NativeError> {
     // Restrict to Result(number, text) for now — the calling convention is
     // different for other Result shapes (e.g. text payload on Ok) and they
@@ -5415,7 +5871,7 @@ fn emit_result_program(
     }
 
     let mut code = Vec::new();
-    let ctx = emit_record_loop_prologue(&mut code, rule, concept, None, all_rules, all_resources, all_connections)?;
+    let ctx = emit_record_loop_prologue(&mut code, rule, concept, None, all_rules, all_resources, all_connections, concept_group)?;
 
     // Evaluate the logic in Result context. Every Ok/Err leaf self-terminates
     // with a jmp loop_top, so there is no fall-through to handle here.
@@ -6310,14 +6766,15 @@ fn emit_mov_rbp_disp_from_reg(code: &mut Vec<u8>, disp: i32, r_is_rsp: bool) {
 /// Continuation-passing: a structural `If` between two record-producing
 /// branches recurses on each arm, and each arm emits its own JSON line +
 /// jmp loop_top. Same leaf-terminates-itself convention as Result.
-fn emit_record_program(
-    rule: &Rule,
+fn emit_record_program<'a>(
+    rule: &'a Rule,
     output_concept: &Concept,
-    input_concept: &Concept,
+    input_concept: &'a Concept,
     all_concepts: &[&Concept],
     all_rules: &HashMap<&str, &Rule>,
-    all_resources: &HashMap<&str, &Resource>,
-    all_connections: &HashMap<&str, &Connection>,
+    all_resources: &HashMap<&str, &'a Resource>,
+    all_connections: &HashMap<&str, &'a Connection>,
+    concept_group: Option<&'a ConceptGroup>,
 ) -> Result<Vec<u8>, NativeError> {
     // Validate output concept's fields — native today handles number + text only.
     for f in &output_concept.fields {
@@ -6335,7 +6792,7 @@ fn emit_record_program(
     }
 
     let mut code = Vec::new();
-    let ctx = emit_record_loop_prologue(&mut code, rule, input_concept, None, all_rules, all_resources, all_connections)?;
+    let ctx = emit_record_loop_prologue(&mut code, rule, input_concept, None, all_rules, all_resources, all_connections, concept_group)?;
 
     emit_eval_record_expr(
         &mut code,
@@ -8907,18 +9364,19 @@ fn emit_record_as_json(
 /// For this commit the only supported effect is `append_file "path" "content"`
 /// where the content is a STRING LITERAL. `concat(...)` content comes in the
 /// next commit (itoa + stack-buffer concat in machine code).
-fn emit_reaction_program(
+fn emit_reaction_program<'a>(
     reaction: &Reaction,
-    trigger_rule: &Rule,
-    concept: &Concept,
+    trigger_rule: &'a Rule,
+    concept: &'a Concept,
     all_rules: &HashMap<&str, &Rule>,
-    all_resources: &HashMap<&str, &Resource>,
-    all_connections: &HashMap<&str, &Connection>,
+    all_resources: &HashMap<&str, &'a Resource>,
+    all_connections: &HashMap<&str, &'a Connection>,
+    concept_group: Option<&'a ConceptGroup>,
 ) -> Result<Vec<u8>, NativeError> {
     // Both Print and AppendFile effects are handled below.
 
     let mut code = Vec::new();
-    let ctx = emit_record_loop_prologue(&mut code, trigger_rule, concept, None, all_rules, all_resources, all_connections)?;
+    let ctx = emit_record_loop_prologue(&mut code, trigger_rule, concept, None, all_rules, all_resources, all_connections, concept_group)?;
 
     // Evaluate trigger rule's logic → rax (0 = no fire, nonzero = fire).
     emit_eval_expr(
@@ -23764,6 +24222,361 @@ rule echo
         let r = child.wait_with_output().expect("wait echo unbounded");
         assert!(r.status.success(), "unbounded field must accept large value");
         assert_eq!(String::from_utf8_lossy(&r.stdout).trim(), "123456789");
+        let _ = std::fs::remove_file(&out);
+    }
+
+    /// Phase B slice 4a.1 — a program that declares a `concept_group`
+    /// but whose entry rule does NOT construct or pattern-match on a
+    /// group concept compiles natively. The arena bytes + node_count
+    /// slot are reserved in the rbp frame, the per-group abort label
+    /// sits at the end of the binary, and the only consumer that
+    /// drives binary size growth is the increased `sub rsp, frame_size`
+    /// immediate plus the small init code.
+    ///
+    /// Pinned shape: compared to the SAME program with the group block
+    /// removed, the with-group binary is strictly larger AND the with-
+    /// group binary's size is consistent with the expected arena bytes
+    /// (`max_nodes * entry_size` + counter + abort label + init code).
+    #[test]
+    fn phase_b4a1_concept_group_with_no_use_compiles() {
+        let with_group = r#"@verbose 0.1.0
+
+concept_group AST [max_depth: 10, max_nodes: 32]
+  @intention: "tiny ast"
+  @source: t.intent:1
+
+  concept Expr
+    @intention: "expr"
+    @source: t.intent:1
+    variants:
+      Int of (value : number)
+      Add of (lhs : Expr, rhs : Expr)
+
+concept N
+  @intention: "n"
+  @source: t.intent:1
+  fields:
+    v : number
+
+rule scalar
+  @intention: "doesn't touch the group"
+  @source: t.intent:1
+  input:
+    n : N
+  output:
+    out : number
+  logic:
+    out = n.v + 1
+  proofs:
+    purity:
+      reads : [n, n.v]
+      calls : []
+    termination:
+      bound : 1
+"#;
+        let without_group = r#"@verbose 0.1.0
+
+concept N
+  @intention: "n"
+  @source: t.intent:1
+  fields:
+    v : number
+
+rule scalar
+  @intention: "no group"
+  @source: t.intent:1
+  input:
+    n : N
+  output:
+    out : number
+  logic:
+    out = n.v + 1
+  proofs:
+    purity:
+      reads : [n, n.v]
+      calls : []
+    termination:
+      bound : 1
+"#;
+        // Compile both — both should succeed.
+        let tokens = crate::lexer::Lexer::new(with_group).tokenize().expect("tokenize with_group");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse with_group");
+        let with_out = std::env::temp_dir().join("verbosec_test_b4a1_with_group");
+        compile_native(&program, "scalar", with_out.to_str().unwrap(), false, false)
+            .expect("with_group: program with concept_group declared (no use in rule) must compile in slice 4a.1");
+        let with_bytes = std::fs::read(&with_out).expect("read with_group binary");
+
+        let tokens = crate::lexer::Lexer::new(without_group).tokenize().expect("tokenize without_group");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse without_group");
+        let without_out = std::env::temp_dir().join("verbosec_test_b4a1_without_group");
+        compile_native(&program, "scalar", without_out.to_str().unwrap(), false, false)
+            .expect("without_group: baseline must compile");
+        let without_bytes = std::fs::read(&without_out).expect("read without_group binary");
+
+        // With-group binary must be STRICTLY larger than without-group.
+        // The arena itself (max_nodes * entry_size) is reserved on the
+        // stack at runtime via a larger `sub rsp, imm32` — but the imm32
+        // operand width is constant, so arena_bytes do NOT grow the ELF.
+        // Binary growth comes from the prologue's `lea r11, [rbp+off]`
+        // (~7 B) + `mov qword [rbp+nc_slot], 0` (~10 B) + per-group
+        // abort tail (~17 B): roughly 30-50 B per group declaration.
+        assert!(
+            with_bytes.len() > without_bytes.len(),
+            "with-group binary ({} B) must be larger than without-group ({} B); \
+             slice 4a.1 promises the arena init + abort tail grow the binary.",
+            with_bytes.len(), without_bytes.len()
+        );
+        let delta = with_bytes.len() - without_bytes.len();
+        // Sanity-check the growth: the abort tail alone is ~17 B, so the
+        // delta must be at least that much. Upper-bound it to catch
+        // regressions where the arena emission accidentally inlines the
+        // 768 B of arena bytes into the ELF (that would be a serious bug
+        // — the arena belongs on the stack, not in .text).
+        assert!(
+            delta >= 17,
+            "with-group delta is {} B; expected at least 17 (the abort tail alone).",
+            delta
+        );
+        assert!(
+            delta < 256,
+            "with-group delta is {} B; the arena belongs on the stack, not in .text. \
+             A delta this large suggests the arena bytes leaked into the binary itself.",
+            delta
+        );
+
+        // Check that the `sub rsp, imm32` immediate in the with-group binary
+        // is at LEAST 768 bytes larger than the without-group baseline.
+        // That's the load-bearing artifact: the stack frame must actually
+        // grow by the arena size, even though the imm32 operand width is
+        // constant in bytes.
+        let find_sub_rsp = |bytes: &[u8]| -> Option<u32> {
+            // 48 81 EC <imm32> = `sub rsp, imm32`
+            bytes.windows(7).find_map(|w| {
+                if &w[0..3] == &[0x48, 0x81, 0xEC] {
+                    let imm = u32::from_le_bytes([w[3], w[4], w[5], w[6]]);
+                    Some(imm)
+                } else {
+                    None
+                }
+            })
+        };
+        let with_imm = find_sub_rsp(&with_bytes).expect("find sub rsp in with_group");
+        let without_imm = find_sub_rsp(&without_bytes).expect("find sub rsp in without_group");
+        assert!(
+            with_imm >= without_imm + 768,
+            "with_group sub rsp imm ({}) must be at least 768 larger than without_group ({})",
+            with_imm, without_imm
+        );
+
+        // Both binaries should run correctly on the same input. The
+        // arena is dead bytes — its presence must not perturb behavior.
+        use std::process::Command;
+        let r_with = Command::new(&with_out).args(["41"]).output().expect("spawn with");
+        let r_without = Command::new(&without_out).args(["41"]).output().expect("spawn without");
+        assert_eq!(
+            String::from_utf8_lossy(&r_with.stdout).trim(),
+            "42",
+            "with-group binary must produce 42 on input 41"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&r_without.stdout).trim(),
+            "42",
+            "without-group binary must produce 42 on input 41"
+        );
+
+        let _ = std::fs::remove_file(&with_out);
+        let _ = std::fs::remove_file(&without_out);
+    }
+
+    /// Phase B slice 4a.1 — a rule that VariantConstructs a group
+    /// concept refuses with a B.4a.2 breadcrumb pointing at the
+    /// follow-up slice that will wire VariantConstruct emit into the
+    /// arena.
+    #[test]
+    fn phase_b4a1_variant_construct_on_group_refused() {
+        let src = r#"@verbose 0.1.0
+
+concept_group AST [max_depth: 10, max_nodes: 32]
+  @intention: "tiny ast"
+  @source: t.intent:1
+
+  concept Expr
+    @intention: "expr"
+    @source: t.intent:1
+    variants:
+      Int of (value : number)
+      Add of (lhs : Expr, rhs : Expr)
+
+concept Seed
+  @intention: "seed"
+  @source: t.intent:1
+  fields:
+    n : number [0, 10]
+
+rule make_int
+  @intention: "constructs an Expr — must be refused natively in 4a.1"
+  @source: t.intent:1
+  input:
+    s : Seed
+  output:
+    e : Expr
+  logic:
+    e = Expr::Int { value: s.n }
+  proofs:
+    purity:
+      reads : [s.n]
+      calls : []
+    termination:
+      bound : 1
+"#;
+        let tokens = crate::lexer::Lexer::new(src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+        let out = std::env::temp_dir().join("verbosec_test_b4a1_variant_construct_refused");
+        let err = compile_native(&program, "make_int", out.to_str().unwrap(), false, false)
+            .expect_err("VariantConstruct on group concept must be refused in slice 4a.1");
+        let msg = err.message;
+        assert!(
+            msg.contains("slice 4a.2"),
+            "refusal must point at slice 4a.2; got: {}",
+            msg
+        );
+        assert!(
+            msg.contains("VariantConstruct"),
+            "refusal must name VariantConstruct; got: {}",
+            msg
+        );
+        // Defensive: the dead binary file shouldn't exist (compile errored).
+        let _ = std::fs::remove_file(&out);
+    }
+
+    /// Phase B slice 4a.1 — a rule that pattern-matches on a group
+    /// concept refuses with a B.4a.3 breadcrumb. Note that the rule
+    /// being refused doesn't have to be the entry rule — slice 4a.1
+    /// refuses across the entire program's rule set, so an entry
+    /// rule that calls into a group-matching rule also refuses.
+    #[test]
+    fn phase_b4a1_match_variant_on_group_refused() {
+        let src = r#"@verbose 0.1.0
+
+concept_group AST [max_depth: 10, max_nodes: 32]
+  @intention: "tiny ast"
+  @source: t.intent:1
+
+  concept Expr
+    @intention: "expr"
+    @source: t.intent:1
+    variants:
+      Int of (value : number)
+      Add of (lhs : Expr, rhs : Expr)
+
+concept Seed
+  @intention: "seed"
+  @source: t.intent:1
+  fields:
+    n : number [0, 10]
+
+rule eval_int
+  @intention: "match an Expr — must be refused in 4a.1"
+  @source: t.intent:1
+  input:
+    e : Expr
+  output:
+    out : number
+  logic:
+    out = match e:
+      Int(value) => value
+      Add(lhs, rhs) => 0
+  proofs:
+    purity:
+      reads : [e]
+      calls : []
+    termination:
+      bound : 1
+"#;
+        let tokens = crate::lexer::Lexer::new(src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+        let out = std::env::temp_dir().join("verbosec_test_b4a1_match_variant_refused");
+        let err = compile_native(&program, "eval_int", out.to_str().unwrap(), false, false)
+            .expect_err("MatchVariant on group concept must be refused in slice 4a.1");
+        let msg = err.message;
+        assert!(
+            msg.contains("slice 4a.3"),
+            "refusal must point at slice 4a.3; got: {}",
+            msg
+        );
+        assert!(
+            msg.contains("MatchVariant"),
+            "refusal must name MatchVariant; got: {}",
+            msg
+        );
+        let _ = std::fs::remove_file(&out);
+    }
+
+    /// Phase B slice 4a.1 — a `concept_group` with more than one
+    /// concept refuses with a B.4b breadcrumb. Multi-concept groups
+    /// (mutual type recursion) need their own design pass for tag
+    /// namespace and arena partitioning, so the slice constraint
+    /// caps at one concept per group.
+    #[test]
+    fn phase_b4a1_multi_concept_group_refused() {
+        let src = r#"@verbose 0.1.0
+
+concept_group AST [max_depth: 10, max_nodes: 32]
+  @intention: "two-concept group — refused in 4a.1"
+  @source: t.intent:1
+
+  concept Expr
+    @intention: "expr"
+    @source: t.intent:1
+    variants:
+      Int of (value : number)
+      Use of (s : Stmt)
+
+  concept Stmt
+    @intention: "stmt"
+    @source: t.intent:1
+    variants:
+      Lit of (n : number)
+      Wrap of (e : Expr)
+
+concept N
+  @intention: "n"
+  @source: t.intent:1
+  fields:
+    v : number
+
+rule scalar
+  @intention: "doesn't touch the group"
+  @source: t.intent:1
+  input:
+    n : N
+  output:
+    out : number
+  logic:
+    out = n.v
+  proofs:
+    purity:
+      reads : [n, n.v]
+      calls : []
+    termination:
+      bound : 1
+"#;
+        let tokens = crate::lexer::Lexer::new(src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+        let out = std::env::temp_dir().join("verbosec_test_b4a1_multi_concept_refused");
+        let err = compile_native(&program, "scalar", out.to_str().unwrap(), false, false)
+            .expect_err("multi-concept group must be refused in slice 4a.1");
+        let msg = err.message;
+        assert!(
+            msg.contains("B.4b") || msg.contains("4b"),
+            "refusal must point at slice B.4b; got: {}",
+            msg
+        );
+        assert!(
+            msg.contains("Multi-concept") || msg.contains("multi-concept") || msg.contains("single-concept"),
+            "refusal must mention the multi-concept restriction; got: {}",
+            msg
+        );
         let _ = std::fs::remove_file(&out);
     }
 }
