@@ -1,0 +1,51 @@
+@verbose 0.1.0
+
+-- Mutable state showcase: HTTP counter service.
+-- A 1.5 KB native binary with mutable state between requests,
+-- no libc, no heap, no allocator — pure machine code from a
+-- declarative source.
+--
+-- Each request returns the current count in the response body;
+-- the after: block increments it for the next request.
+-- Sequential mode: one process, one counter, monotonically
+-- increasing. Forked mode: child inherits parent's counter
+-- via fork's COW, but mutations don't propagate back.
+
+
+rule handle
+  @intention: "Return the current count"
+  @source: counter_service.intent:3
+
+  input:
+    req : HttpRequest
+
+  output:
+    resp : HttpResponse
+
+  logic:
+    resp = HttpResponse { status: 200, body: concat("count:", state.count) }
+
+  proofs:
+    purity:
+      reads : [state.count]
+      calls : []
+    termination:
+      bound : 3
+
+
+service counter
+  @intention: "HTTP counter — increments on every request"
+  @source: counter_service.intent:5
+
+  listen:
+    protocol    : http_1_0
+    port        : 18950
+    max_request : 4096
+
+  handler: handle
+
+  state:
+    count : number = 0
+
+  after:
+    set count = state.count + 1

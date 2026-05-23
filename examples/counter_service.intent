@@ -1,0 +1,5 @@
+1. Accept HTTP requests on port 18950
+2. Keep a request counter that starts at 0
+3. Return the current counter value in the response body
+4. Increment the counter after each response
+5. Declare the service with mutable state
