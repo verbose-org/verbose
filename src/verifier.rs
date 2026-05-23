@@ -1004,6 +1004,71 @@ fn verify_service(
             message: "Phase 10: concurrency: forked currently restricted to http_1_0 services".into(),
         });
     }
+
+    // Mutable state validation.
+    // 1. Each state field must be Number-typed (text state is a follow-up).
+    // 2. No duplicate field names.
+    // 3. Each after_set must reference an existing state field.
+    // 4. State is restricted to http_1_0 services in this slice.
+    if !s.state_fields.is_empty() && s.protocol != Protocol::Http10 {
+        errors.push(VerifyError {
+            context: format!("service '{}' / state", s.name),
+            message: "mutable state is currently restricted to http_1_0 services".into(),
+        });
+    }
+    {
+        let mut seen_names: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for sf in &s.state_fields {
+            if sf.ty != Type::Number {
+                errors.push(VerifyError {
+                    context: format!("service '{}' / state / {}", s.name, sf.name),
+                    message: format!(
+                        "state field '{}' must be type 'number' in this slice; got {:?}",
+                        sf.name, sf.ty
+                    ),
+                });
+            }
+            if !seen_names.insert(sf.name.as_str()) {
+                errors.push(VerifyError {
+                    context: format!("service '{}' / state / {}", s.name, sf.name),
+                    message: format!("duplicate state field name '{}'", sf.name),
+                });
+            }
+        }
+    }
+    for aset in &s.after_sets {
+        if !s.state_fields.iter().any(|sf| sf.name == aset.field_name) {
+            errors.push(VerifyError {
+                context: format!("service '{}' / after / set {}", s.name, aset.field_name),
+                message: format!(
+                    "after block sets unknown state field '{}'; declared state fields: [{}]",
+                    aset.field_name,
+                    s.state_fields.iter().map(|sf| sf.name.as_str()).collect::<Vec<_>>().join(", ")
+                ),
+            });
+        }
+    }
+    // Cross-check: handler's `reads:` paths of the form `state.X` must
+    // reference actual state fields declared in this service.
+    if !s.state_fields.is_empty() {
+        let handler_facts = collect_logic_facts(&handler.logic);
+        for path in &handler_facts.reads {
+            if path.len() == 2 && path[0] == "state" {
+                let field_name = &path[1];
+                if !s.state_fields.iter().any(|sf| &sf.name == field_name) {
+                    errors.push(VerifyError {
+                        context: format!("service '{}' / handler '{}' / reads", s.name, s.handler),
+                        message: format!(
+                            "handler reads state.{} but service declares no state field '{}'; declared: [{}]",
+                            field_name,
+                            field_name,
+                            s.state_fields.iter().map(|sf| sf.name.as_str()).collect::<Vec<_>>().join(", ")
+                        ),
+                    });
+                }
+            }
+        }
+    }
 }
 
 /// Phase 8 slices 8a/8b/8c — type-check a log content expression against
@@ -3088,6 +3153,13 @@ fn validate_read_path(
     // name `now` as a valid base (length 1, no field access) — same audit
     // shape as a resource or connection name.
     if path.len() == 1 && base == "now" {
+        return None;
+    }
+    // `state.field` accesses for service mutable state. The base `state`
+    // is a reserved synthetic scope — the service verification cross-checks
+    // that each referenced field actually exists in the service's
+    // `state_fields` declaration. Accepted as length-2 path only.
+    if base == "state" && path.len() == 2 {
         return None;
     }
     if !is_input && !is_context {
@@ -5635,5 +5707,164 @@ rule ok
         let names: Vec<&str> = iter_all_concepts(&program.items).map(|c| c.name.as_str()).collect();
         assert!(names.contains(&"Expr"), "expected Expr in iter, got {:?}", names);
         assert!(names.contains(&"Stmt"), "expected Stmt in iter, got {:?}", names);
+    }
+
+    // ─── Mutable state: verifier tests ───────────────────────────────────
+
+    #[test]
+    fn service_state_after_set_unknown_field_rejected() {
+        let src = r#"@verbose 0.1.0
+
+rule h
+  @intention: "t"
+  @source: invoices.intent:1
+  input:
+    req : HttpRequest
+  output:
+    resp : HttpResponse
+  logic:
+    resp = HttpResponse { status: 200, body: "ok" }
+  proofs:
+    purity:
+      reads : []
+      calls : []
+    termination:
+      bound : 1
+
+service s
+  @intention: "test"
+  @source: invoices.intent:1
+  listen:
+    protocol: http_1_0
+    port: 9999
+    max_request: 4096
+  handler: h
+  state:
+    counter : number = 0
+  after:
+    set nonexistent = 1
+"#;
+        let errs = verify_str(src);
+        assert!(
+            errs.iter().any(|e| e.context.contains("after") && e.message.contains("nonexistent")),
+            "expected unknown-state-field error in after block, got: {:#?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn service_state_duplicate_field_rejected() {
+        let src = r#"@verbose 0.1.0
+
+rule h
+  @intention: "t"
+  @source: invoices.intent:1
+  input:
+    req : HttpRequest
+  output:
+    resp : HttpResponse
+  logic:
+    resp = HttpResponse { status: 200, body: "ok" }
+  proofs:
+    purity:
+      reads : []
+      calls : []
+    termination:
+      bound : 1
+
+service s
+  @intention: "test"
+  @source: invoices.intent:1
+  listen:
+    protocol: http_1_0
+    port: 9999
+    max_request: 4096
+  handler: h
+  state:
+    counter : number = 0
+    counter : number = 5
+"#;
+        let errs = verify_str(src);
+        assert!(
+            errs.iter().any(|e| e.message.contains("duplicate state field")),
+            "expected duplicate-state-field error, got: {:#?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn service_state_handler_reads_cross_checked() {
+        let src = r#"@verbose 0.1.0
+
+rule h
+  @intention: "t"
+  @source: invoices.intent:1
+  input:
+    req : HttpRequest
+  output:
+    resp : HttpResponse
+  logic:
+    resp = HttpResponse { status: 200, body: concat("c:", state.bogus) }
+  proofs:
+    purity:
+      reads : [state.bogus]
+      calls : []
+    termination:
+      bound : 1
+
+service s
+  @intention: "test"
+  @source: invoices.intent:1
+  listen:
+    protocol: http_1_0
+    port: 9999
+    max_request: 4096
+  handler: h
+  state:
+    counter : number = 0
+"#;
+        let errs = verify_str(src);
+        assert!(
+            errs.iter().any(|e| e.message.contains("state.bogus") && e.message.contains("no state field")),
+            "expected cross-check error for state.bogus, got: {:#?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn service_state_valid_counter_passes() {
+        let src = r#"@verbose 0.1.0
+
+rule h
+  @intention: "t"
+  @source: invoices.intent:1
+  input:
+    req : HttpRequest
+  output:
+    resp : HttpResponse
+  logic:
+    resp = HttpResponse { status: 200, body: concat("count:", state.counter) }
+  proofs:
+    purity:
+      reads : [state.counter]
+      calls : []
+    termination:
+      bound : 3
+
+service s
+  @intention: "test"
+  @source: invoices.intent:1
+  listen:
+    protocol: http_1_0
+    port: 9999
+    max_request: 4096
+  handler: h
+  state:
+    counter : number = 0
+  after:
+    set counter = state.counter + 1
+"#;
+        let errs = verify_str(src);
+        assert!(errs.is_empty(), "valid counter service should verify cleanly, got: {:#?}", errs);
     }
 }

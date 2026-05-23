@@ -4175,6 +4175,11 @@ fn classify_concat_arg(
                     Type::Text => Some(ConcatArgKind::Text),
                     _ => None,
                 }
+            } else if matches!(base.as_ref(), Expr::Ident(n) if n == "state") {
+                // state.field — Number-only in this slice. The offsets map
+                // contains "__state_<field_name>" so emit_eval_expr resolves
+                // it; classify as Number for concat sizing/fill.
+                Some(ConcatArgKind::Number)
             } else {
                 None
             }
@@ -10428,7 +10433,15 @@ fn emit_eval_expr(
                     });
                 }
             }
-            let offset = *offsets.get(field_name.as_str()).ok_or_else(|| NativeError {
+            // state.field accesses use a composite key "__state_<field_name>"
+            // in the offsets map to avoid collisions with input fields.
+            let lookup_key = match base.as_ref() {
+                Expr::Ident(base_name) if base_name == "state" => {
+                    format!("__state_{}", field_name)
+                }
+                _ => field_name.clone(),
+            };
+            let offset = *offsets.get(lookup_key.as_str()).ok_or_else(|| NativeError {
                 message: format!("unknown field '{}' in native codegen", field_name),
             })?;
             load_rax_from_rbp(code, offset);
@@ -13295,6 +13308,27 @@ fn emit_mov_rax_imm(code: &mut Vec<u8>, value: i64) {
     }
 }
 
+/// Emit `mov qword [rbp+offset], imm64`. For values that fit in i32,
+/// uses the sign-extending `mov [rbp+disp], imm32` (7 or 10 bytes).
+/// For larger values, goes through rax as scratch.
+fn emit_mov_rbp_slot_imm(code: &mut Vec<u8>, offset: i32, value: i64) {
+    if value >= i32::MIN as i64 && value <= i32::MAX as i64 {
+        // mov qword [rbp+offset], imm32 (sign-extended to 64-bit)
+        if offset >= -128 {
+            code.extend_from_slice(&[0x48, 0xC7, 0x45]);
+            code.push(offset as u8);
+        } else {
+            code.extend_from_slice(&[0x48, 0xC7, 0x85]);
+            code.extend_from_slice(&offset.to_le_bytes());
+        }
+        code.extend_from_slice(&(value as i32).to_le_bytes());
+    } else {
+        // movabs rax, imm64 ; mov [rbp+offset], rax
+        emit_mov_rax_imm(code, value);
+        store_rax_at_rbp(code, offset);
+    }
+}
+
 fn emit_write_string(code: &mut Vec<u8>, s: &[u8]) {
     let len = s.len();
     code.push(0xEB);
@@ -15188,13 +15222,26 @@ fn emit_http10_dynamic_bytes(
         .iter()
         .map(|t| if *t { 16i32 } else { 8 })
         .sum();
+    // Mutable state: one 8-byte slot per Number-typed state field.
+    let state_slots_bytes: i32 = (service.state_fields.len() as i32) * 8;
     // Pre-body fixed offset: where the optional timestamp lives.
     let body_pre_offset: i32 = if uses_timestamp { 56 } else { 48 };
     let body_extra_bytes: i32 = if uses_body { 16 } else { 0 };
     // (req.body ptr, req.body len) follow timestamp, before handler lets.
     let body_ptr_slot: i32 = if uses_body { -(body_pre_offset + 8) } else { 0 };
     let body_len_slot: i32 = if uses_body { -(body_pre_offset + 16) } else { 0 };
-    let frame_base_fixed: i32 = body_pre_offset + body_extra_bytes + handler_let_slots_bytes;
+    let frame_base_fixed: i32 = body_pre_offset + body_extra_bytes + handler_let_slots_bytes + state_slots_bytes;
+    // Build state offsets map: each state field gets a dedicated rbp slot
+    // below the handler let slots. These slots survive per-iteration rsp
+    // reset because they're within the rbp-relative frame.
+    let mut state_offsets: HashMap<&str, i32> = HashMap::new();
+    {
+        let state_block_start: i32 = -(body_pre_offset + body_extra_bytes + handler_let_slots_bytes);
+        for (i, sf) in service.state_fields.iter().enumerate() {
+            let slot = state_block_start - 8 * (i as i32 + 1);
+            state_offsets.insert(sf.name.as_str(), slot);
+        }
+    }
     let frame_base: i32 = frame_base_fixed + resource_extra_bytes + connection_extra_bytes;
     // Phase 8 slice 8d: collected `js abort_label` patch sites from
     // emit_append_file_call. Resolved after the accept loop emits the
@@ -15212,6 +15259,17 @@ fn emit_http10_dynamic_bytes(
     code.extend_from_slice(&[0x48, 0x89, 0xE5]);         // mov rbp, rsp
     code.extend_from_slice(&[0x48, 0x81, 0xEC]);         // sub rsp, imm32
     code.extend_from_slice(&frame_size.to_le_bytes());
+
+    // ═══ STATE INIT ═══════════════════════════════════════════
+    // Initialize each mutable state field to its declared initial value.
+    // These slots persist across accept iterations because they're within
+    // the rbp-relative frame (lea rsp, [rbp - frame_size] restores rsp
+    // below them but never overwrites the slots themselves).
+    for sf in &service.state_fields {
+        let slot = state_offsets[sf.name.as_str()];
+        // mov qword [rbp + slot], initial_value
+        emit_mov_rbp_slot_imm(&mut code, slot, sf.initial_value);
+    }
 
     // ═══ SOCKET ════════════════════════════════════════════════
     code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x29, 0x00, 0x00, 0x00]); // mov rax, 41
@@ -15633,7 +15691,19 @@ fn emit_http10_dynamic_bytes(
     // The slot range is reserved by `handler_let_slots_bytes` added into
     // frame_base_fixed above, so it never collides with the resource or
     // connection blocks below.
+    // Build owned composite keys for state fields. These must outlive
+    // handler_offsets, which borrows &str from them. POC-level allocation
+    // (one String per state field, once per compile).
+    let state_composite_keys: Vec<String> = service.state_fields.iter()
+        .map(|sf| format!("__state_{}", sf.name))
+        .collect();
     let mut handler_offsets: HashMap<&str, i32> = offsets.clone();
+    // Register state field offsets under composite keys so emit_eval_expr's
+    // Field(Ident("state"), name) arm resolves them via "__state_<name>".
+    for (i, sf) in service.state_fields.iter().enumerate() {
+        let slot = state_offsets[sf.name.as_str()];
+        handler_offsets.insert(&state_composite_keys[i], slot);
+    }
     {
         let let_block_start: i32 = -(body_pre_offset + body_extra_bytes);
         let mut let_cursor: i32 = let_block_start - 8;
@@ -15767,6 +15837,33 @@ fn emit_http10_dynamic_bytes(
 
     // ═══ HTTP SERIALIZE ════════════════════════════════════════
     emit_http_serialize(&mut code);
+
+    // ═══ AFTER BLOCK (mutable state mutations) ═════════════════
+    // Runs AFTER the response is written, AFTER log blocks. Each entry
+    // evaluates its value expression (can reference state.*, req.* fields)
+    // and stores the result into the corresponding state slot.
+    for aset in &service.after_sets {
+        let state_slot = state_offsets.get(aset.field_name.as_str())
+            .copied()
+            .ok_or_else(|| NativeError {
+                message: format!(
+                    "after block references unknown state field '{}' (verifier should have caught this)",
+                    aset.field_name
+                ),
+            })?;
+        emit_eval_expr(
+            &mut code,
+            &aset.value,
+            &handler.input_name,
+            &handler_offsets,
+            all_rules,
+            field_ranges,
+            &http_text_bindings,
+            None,
+            None,
+        )?;
+        store_rax_at_rbp(&mut code, state_slot);
+    }
 
     // ═══ CLOSE + LOOP ══════════════════════════════════════════
     let close_label = code.len();
@@ -26051,6 +26148,88 @@ rule scalar
             "refusal must mention the multi-concept restriction; got: {}",
             msg
         );
+        let _ = std::fs::remove_file(&out);
+    }
+
+    /// Mutable state: HTTP counter service. Verifies that:
+    /// 1. The binary compiles (parser + verifier + native emit)
+    /// 2. State initializes to 0 on startup
+    /// 3. Each request reads the current state (count:0, count:1, count:2)
+    /// 4. The after: block increments state between requests
+    #[test]
+    fn service_mutable_state_counter() {
+        use std::io::{Read, Write};
+        use std::net::TcpStream;
+        use std::process::{Command, Stdio};
+        use std::time::Duration;
+
+        let port: u16 = 18950;
+
+        let src = std::fs::read_to_string("examples/counter_service.verbose")
+            .expect("examples/counter_service.verbose");
+        // Replace port to avoid collisions with concurrent tests
+        let src = src.replace("18950", &port.to_string());
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+
+        let out = std::env::temp_dir().join("verbosec_test_counter_service");
+        compile_service(&program, "counter", out.to_str().unwrap())
+            .expect("counter service should compile");
+
+        let size = std::fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
+        assert!(size > 0 && size <= 2048, "binary size {} exceeds 2 KB target", size);
+
+        let mut child = Command::new(&out)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn");
+
+        let mut bound = false;
+        for _ in 0..50 {
+            if TcpStream::connect_timeout(
+                &format!("127.0.0.1:{}", port).parse().unwrap(),
+                Duration::from_millis(100),
+            )
+            .is_ok()
+            {
+                bound = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(bound, "counter service never bound on port {}", port);
+
+        let request = |expected_body: &str| {
+            let mut s = TcpStream::connect_timeout(
+                &format!("127.0.0.1:{}", port).parse().unwrap(),
+                Duration::from_secs(2),
+            )
+            .expect("connect");
+            s.set_read_timeout(Some(Duration::from_secs(2))).ok();
+            s.write_all(b"GET / HTTP/1.0\r\n\r\n").expect("write");
+            let mut buf = Vec::new();
+            s.read_to_end(&mut buf).expect("read");
+            let response = String::from_utf8_lossy(&buf);
+            assert!(
+                response.contains("200 OK"),
+                "expected 200 OK, got: {}",
+                response
+            );
+            assert!(
+                response.contains(expected_body),
+                "expected body '{}', got: {}",
+                expected_body,
+                response
+            );
+        };
+
+        request("count:0");
+        request("count:1");
+        request("count:2");
+
+        let _ = child.kill();
+        let _ = child.wait();
         let _ = std::fs::remove_file(&out);
     }
 }

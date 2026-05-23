@@ -236,6 +236,47 @@ pub struct Service {
     /// because concurrency belongs to the wire-facing layer, not the
     /// pure logic the handler computes.
     pub concurrency: ConcurrencyMode,
+    /// Mutable state fields that persist across requests within a single
+    /// process lifetime. Each field has a type, an initial value (literal),
+    /// and lives in a dedicated rbp slot allocated at server startup. The
+    /// handler reads state fields via `state.field`; the `after:` block
+    /// mutates them via `set field = expr`.
+    ///
+    /// For `concurrency: sequential`: straightforward — one process, one
+    /// set of slots. Mutations in the `after:` block are visible to the
+    /// next accept iteration.
+    ///
+    /// For `concurrency: forked`: the child inherits the parent's state
+    /// via fork's COW. Mutations in the child's `after:` block do NOT
+    /// propagate back to the parent — documented limitation (POC-level;
+    /// shared-memory state is a future design point).
+    ///
+    /// Number-only in slice 1. Text state fields need (ptr, len, buffer)
+    /// management and are a follow-up.
+    pub state_fields: Vec<StateField>,
+    /// Post-response mutation block. Runs AFTER the response is written,
+    /// AFTER the log blocks. Each entry mutates one state field:
+    /// `set <field_name> = <expr>` where <expr> can reference `state.*`,
+    /// `req.*`, `resp.*`. Empty Vec means no mutation (pure service).
+    pub after_sets: Vec<StateSet>,
+}
+
+/// A mutable state field declared in a service's `state:` block.
+/// Number-only in the first slice (text state needs buffer management).
+#[derive(Debug, Clone)]
+pub struct StateField {
+    pub name: String,
+    pub ty: Type,
+    pub initial_value: i64,
+}
+
+/// A mutation in a service's `after:` block.
+/// `set <field_name> = <expr>` where expr runs in the post-response
+/// scope (can reference state.*, req.*, resp.*).
+#[derive(Debug, Clone)]
+pub struct StateSet {
+    pub field_name: String,
+    pub value: Expr,
 }
 
 /// Phase 10 slice 10: how a service's accept loop dispatches each

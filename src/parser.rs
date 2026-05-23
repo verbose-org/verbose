@@ -1608,6 +1608,10 @@ impl Parser {
         // Sequential — preserves the slice 9 binary byte-for-byte when
         // the line is omitted.
         let mut concurrency: ConcurrencyMode = ConcurrencyMode::Sequential;
+        // Mutable state fields persisting across requests (Number-only in slice 1).
+        let mut state_fields: Vec<StateField> = Vec::new();
+        // Post-response mutation block.
+        let mut after_sets: Vec<StateSet> = Vec::new();
 
         while !self.check_kind(&TokenKind::Dedent) && !self.at_eof() {
             if let Some(attr) = self.peek_attribute_name() {
@@ -1755,11 +1759,62 @@ impl Parser {
                     }
                 };
                 self.expect_kind(TokenKind::Newline)?;
+            } else if self.check_ident("state") {
+                // Mutable state block. Each line: `name : number = <literal>`.
+                // Number-only in this slice; text state is a follow-up.
+                self.advance();
+                self.expect_kind(TokenKind::Colon)?;
+                self.expect_kind(TokenKind::Newline)?;
+                self.expect_kind(TokenKind::Indent)?;
+                while !self.check_kind(&TokenKind::Dedent) && !self.at_eof() {
+                    let fname = self.expect_ident_any()?;
+                    self.expect_kind(TokenKind::Colon)?;
+                    let ty = self.parse_type()?;
+                    if ty != Type::Number {
+                        return Err(self.error(&format!(
+                            "state field '{}': only 'number' type is supported in this slice; got {:?}",
+                            fname, ty
+                        )));
+                    }
+                    // Expect `= <literal>`
+                    self.expect_kind(TokenKind::Equal)?;
+                    let initial_value = self.parse_signed_number()?;
+                    state_fields.push(StateField {
+                        name: fname,
+                        ty,
+                        initial_value,
+                    });
+                    self.expect_kind(TokenKind::Newline)?;
+                }
+                self.expect_kind(TokenKind::Dedent)?;
+            } else if self.check_ident("after") {
+                // Post-response mutation block. Each line: `set <name> = <expr>`.
+                self.advance();
+                self.expect_kind(TokenKind::Colon)?;
+                self.expect_kind(TokenKind::Newline)?;
+                self.expect_kind(TokenKind::Indent)?;
+                while !self.check_kind(&TokenKind::Dedent) && !self.at_eof() {
+                    if !self.check_ident("set") {
+                        return Err(self.error("expected 'set <field> = <expr>' in after block"));
+                    }
+                    self.advance();
+                    let field_name = self.expect_ident_any()?;
+                    self.expect_kind(TokenKind::Equal)?;
+                    let value = self.parse_expr()?;
+                    after_sets.push(StateSet { field_name, value });
+                    self.expect_kind(TokenKind::Newline)?;
+                }
+                self.expect_kind(TokenKind::Dedent)?;
             } else {
-                return Err(self.error("expected attribute, 'listen:', 'handler:', 'log:', or 'concurrency:' in service"));
+                return Err(self.error("expected attribute, 'listen:', 'handler:', 'log:', 'concurrency:', 'state:', or 'after:' in service"));
             }
         }
         self.expect_kind(TokenKind::Dedent)?;
+
+        // Validate: after_sets non-empty requires state_fields non-empty.
+        if !after_sets.is_empty() && state_fields.is_empty() {
+            return Err(self.error("'after:' block requires a 'state:' block declaring the fields it mutates"));
+        }
 
         Ok(Service {
             name,
@@ -1771,6 +1826,8 @@ impl Parser {
             handler: handler.ok_or_else(|| self.error("service missing 'handler'"))?,
             logs,
             concurrency,
+            state_fields,
+            after_sets,
         })
     }
 
@@ -2973,5 +3030,150 @@ concept Dup
             "error should name the duplication: {:?}",
             err
         );
+    }
+
+    // ─── Mutable state: parser tests ─────────────────────────────────────
+
+    #[test]
+    fn service_state_block_parsed() {
+        let src = r#"@verbose 0.1.0
+
+rule h
+  @intention: "t"
+  @source: f.intent:1
+  input:
+    req : HttpRequest
+  output:
+    resp : HttpResponse
+  logic:
+    resp = HttpResponse { status: 200, body: "ok" }
+  proofs:
+    purity:
+      reads : []
+      calls : []
+    termination:
+      bound : 1
+
+service s
+  @intention: "test"
+  @source: f.intent:1
+  listen:
+    protocol: http_1_0
+    port: 9999
+    max_request: 4096
+  handler: h
+  state:
+    counter : number = 0
+    total   : number = 100
+  after:
+    set counter = state.counter + 1
+"#;
+        let p = parse(src).unwrap();
+        let svc = p.items.iter().find_map(|i| match i {
+            Item::Service(s) => Some(s),
+            _ => None,
+        }).expect("expected a service item");
+        assert_eq!(svc.state_fields.len(), 2);
+        assert_eq!(svc.state_fields[0].name, "counter");
+        assert_eq!(svc.state_fields[0].initial_value, 0);
+        assert_eq!(svc.state_fields[1].name, "total");
+        assert_eq!(svc.state_fields[1].initial_value, 100);
+        assert_eq!(svc.after_sets.len(), 1);
+        assert_eq!(svc.after_sets[0].field_name, "counter");
+    }
+
+    #[test]
+    fn service_state_rejects_text_type() {
+        let src = r#"@verbose 0.1.0
+
+rule h
+  @intention: "t"
+  @source: f.intent:1
+  input:
+    req : HttpRequest
+  output:
+    resp : HttpResponse
+  logic:
+    resp = HttpResponse { status: 200, body: "ok" }
+  proofs:
+    purity:
+      reads : []
+      calls : []
+    termination:
+      bound : 1
+
+service s
+  @intention: "test"
+  @source: f.intent:1
+  listen:
+    protocol: http_1_0
+    port: 9999
+    max_request: 4096
+  handler: h
+  state:
+    name : text = 0
+"#;
+        let err = parse(src).err().expect("text state should be rejected");
+        assert!(
+            format!("{:?}", err).contains("only 'number' type"),
+            "expected type rejection, got {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn service_after_without_state_rejected() {
+        let src = r#"@verbose 0.1.0
+
+rule h
+  @intention: "t"
+  @source: f.intent:1
+  input:
+    req : HttpRequest
+  output:
+    resp : HttpResponse
+  logic:
+    resp = HttpResponse { status: 200, body: "ok" }
+  proofs:
+    purity:
+      reads : []
+      calls : []
+    termination:
+      bound : 1
+
+service s
+  @intention: "test"
+  @source: f.intent:1
+  listen:
+    protocol: http_1_0
+    port: 9999
+    max_request: 4096
+  handler: h
+  after:
+    set counter = 1
+"#;
+        let err = parse(src).err().expect("after without state should be rejected");
+        assert!(
+            format!("{:?}", err).contains("requires a 'state:' block"),
+            "expected state-required error, got {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn service_empty_state_and_after_backward_compat() {
+        // Existing services without state:/after: must parse identically.
+        let src = service_src(
+            "    protocol: raw_tcp\n    port: 9999\n    max_request: 4096\n",
+            "handler: h",
+        );
+        let p = parse(&src).unwrap();
+        match &p.items[2] {
+            Item::Service(s) => {
+                assert!(s.state_fields.is_empty());
+                assert!(s.after_sets.is_empty());
+            }
+            _ => panic!("expected service"),
+        }
     }
 }
