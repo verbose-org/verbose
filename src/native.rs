@@ -423,12 +423,16 @@ fn compile_native_code(
         }
         // (let-bindings already checked per-rule above.)
         let _ = cycle;
-        // MANDATORY breadcrumb. Compiler axiom: never silently accept
-        // a recursive rule without naming the gap.
-        eprintln!(
-            "native: rule '{}' is recursive (cycle through '{}'); the declared `bound:` is NOT a termination proof for recursion. Runtime stack-overflow is the only safety signal until Phase C ships structural recursion. Use `--run` (interpreter) if you need an audit trace.",
-            rule.name, cycle
-        );
+        // Phase C: suppress the breadcrumb when structural recursion is
+        // proven for the entry rule. The verifier already checked the
+        // proof; here we just gate the warning on its absence.
+        let has_structural_proof = rule.proofs.termination.structural.is_some();
+        if !has_structural_proof {
+            eprintln!(
+                "native: rule '{}' is recursive (cycle through '{}'); the declared `bound:` is NOT a termination proof for recursion. Runtime stack-overflow is the only safety signal until Phase C ships structural recursion. Use `--run` (interpreter) if you need an audit trace.",
+                rule.name, cycle
+            );
+        }
         // Fall through to the slice 5.1a emit below. The standard
         // post-emit pipeline (stdin/stream prepend, etc.) still runs.
     }
@@ -26689,5 +26693,83 @@ rule label_len
             );
         }
         let _ = std::fs::remove_file(&out);
+    }
+
+    #[test]
+    fn phase_c_structural_recursion_suppresses_breadcrumb() {
+        let src = std::fs::read_to_string("examples/sum_chain.verbose")
+            .expect("examples/sum_chain.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+        let errors = crate::verifier::verify_program(&program, std::path::Path::new("."));
+        let structural_errors: Vec<_> = errors.iter()
+            .filter(|e| e.context.contains("structural"))
+            .collect();
+        assert!(
+            structural_errors.is_empty(),
+            "structural recursion proof on eval should verify cleanly, got: {:?}",
+            structural_errors
+        );
+        let out = std::env::temp_dir().join("verbosec_test_phase_c_structural");
+        compile_native(&program, "sum_seed", out.to_str().unwrap(), false, false)
+            .expect("sum_seed must compile with structural proof");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o755));
+        }
+        let output = std::process::Command::new(&out)
+            .arg("5")
+            .output()
+            .expect("native binary must run");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert_eq!(stdout.as_ref(), "15\n", "sum_seed(5) should produce 15");
+        let _ = std::fs::remove_file(&out);
+    }
+
+    #[test]
+    fn phase_c_structural_rejects_non_subterm() {
+        let src = r#"@verbose 0.1.0
+
+concept_group AST [max_depth: 10, max_nodes: 32]
+  @intention: "tiny ast"
+  @source: t.intent:1
+
+  concept Expr
+    @intention: "expr"
+    @source: t.intent:1
+    variants:
+      Int of (value : number)
+      Add of (lhs : Expr, rhs : Expr)
+
+rule bad_eval
+  @intention: "passes non-subterm to recursive call"
+  @source: t.intent:1
+  input:
+    e : Expr
+  output:
+    out : number
+  logic:
+    out = match e:
+      Int(value) => value
+      Add(lhs, rhs) => bad_eval(e)
+  proofs:
+    purity:
+      reads : [e]
+      calls : [bad_eval]
+    termination:
+      bound : 30
+      structural : e
+"#;
+        let tokens = crate::lexer::Lexer::new(src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+        let errors = crate::verifier::verify_program(&program, std::path::Path::new("."));
+        let structural_errors: Vec<_> = errors.iter()
+            .filter(|e| e.context.contains("structural"))
+            .collect();
+        assert!(
+            !structural_errors.is_empty(),
+            "passing `e` (the whole input) to bad_eval should be rejected by structural check"
+        );
     }
 }
