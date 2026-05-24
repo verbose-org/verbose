@@ -1,0 +1,5 @@
+Build a labeled binary tree and measure total label length.
+The tree uses concept_group with text payloads (Phase B.4c).
+Recursive evaluation uses structural recursion (Phase C).
+Entry rule: measure(Seed{n}) builds a tree then sums label lengths.
+Expected: measure(0) = 1, measure(1) = 3, measure(3) = 7.

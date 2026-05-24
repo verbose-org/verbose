@@ -1,0 +1,72 @@
+@verbose 0.1.0
+
+concept_group LabelTree [max_depth: 10, max_nodes: 50]
+  @intention: "Binary tree with text labels on leaves"
+  @source: label_tree.intent:1
+
+  concept LNode
+    @intention: "A leaf with a text label or a branch with two children"
+    @source: label_tree.intent:1
+    variants:
+      Leaf of (label : text)
+      Branch of (left : LNode, right : LNode)
+
+concept Seed
+  @intention: "Input: tree depth"
+  @source: label_tree.intent:1
+  fields:
+    n : number [0, 5]
+
+
+rule build_tree
+  @intention: "Construct a tree of depth n with text labels"
+  @source: label_tree.intent:2
+  input:
+    s : Seed
+  output:
+    out : LNode
+  logic:
+    out = if s.n == 0 then LNode::Leaf { label: "x" } else LNode::Branch { left: build_tree(Seed { n: s.n - 1 }), right: LNode::Leaf { label: "ab" } }
+  proofs:
+    purity:
+      reads : [s.n]
+      calls : [build_tree]
+    termination:
+      bound : 100
+
+
+rule total_label_length
+  @intention: "Sum the byte lengths of all leaf labels in the tree"
+  @source: label_tree.intent:3
+  input:
+    node : LNode
+  output:
+    out : number
+  logic:
+    out = match node:
+      Leaf(label) => length(label)
+      Branch(left, right) => total_label_length(left) + total_label_length(right)
+  proofs:
+    purity:
+      reads : [node]
+      calls : [total_label_length]
+    termination:
+      bound : 100
+      structural : node
+
+
+rule measure
+  @intention: "Build a tree then measure total label length"
+  @source: label_tree.intent:4
+  input:
+    s : Seed
+  output:
+    out : number
+  logic:
+    out = total_label_length(build_tree(s))
+  proofs:
+    purity:
+      reads : [s]
+      calls : [build_tree, total_label_length]
+    termination:
+      bound : 100

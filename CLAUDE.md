@@ -497,6 +497,17 @@ examples/
                    with the right breadcrumb. Pinned by
                    `all_examples_with_json_run_without_panicking` (sweeps
                    every .verbose example with a paired .json).
+  label_tree.*     Phase B.4c + Phase C worked example: concept_group
+                   with TEXT payloads + structural recursion proof.
+                   `LNode` has `Leaf of (label: text)` and `Branch of
+                   (left: LNode, right: LNode)`. `build_tree(seed)`
+                   constructs a depth-n tree with text labels;
+                   `total_label_length(node)` walks it via structural
+                   recursion summing `length(label)` across leaves.
+                   `measure(s)` composes both. 1074 B native binary;
+                   verified for n ∈ {0, 1, 3, 5}: 1, 3, 7, 11.
+                   First Verbose binary that stores and retrieves text
+                   from an arena via the type-aware (ptr, len) layout.
   demo.html        Browser demo (WASM)
 
 tools/
@@ -567,7 +578,7 @@ before running the eval for the first time.*
 - System clock: `now_unix()` — current Unix-epoch seconds as a number. Sampled ONCE per rule invocation via `clock_gettime(CLOCK_REALTIME)`; every reference in the rule logic loads the same captured value from a dedicated rbp slot (mirror of `req.timestamp` in HTTP services). The synthetic name `now` MUST appear in the rule's `reads:` proof so auditors find every clock-touching rule with a single grep — same audit shape as `read(<resource>)`. Wired in `emit_record_loop_prologue` (Phase 0 / 2 / Result / Record output rules), `emit_fold_program` (Phase 4 number fold), `emit_text_fold_program` (Phase 5b text fold), `emit_collection_program` (Phase 3 map/filter), `emit_multi_fold_program` (Phase 6 quantifier desugar), and `emit_parallel_program` (parallel hint — parent samples ONCE before fork; both children inherit the captured seconds via fork's COW, preserving the "ONCE per rule invocation" invariant without any per-worker syscall). Every emitter now wires the timestamp; no remaining clock-rejecting code path
 - Verifier type check: bidirectional shape check on logic — `Ok`/`Err` rejected outside `Result(...)` context; `Ok(x)`/`Err(e)` content checked against declared arms when inferable; top-level output type checked against declared; conservative on lambda/let-bound vars to avoid false positives
 - General reduction: `fold(collection, initial, acc, var => body)`
-- Proofs: purity (reads/calls), termination (bound)
+- Proofs: purity (reads/calls), termination (bound, structural)
 - Hints: `vectorizable: "reason"`, `parallel: "reason"`, `cache_result: "reason"` (justification required, parser rejects bare form), `overflow: [min, max]` (bounds mechanically verified against interval arithmetic)
 - Traceability: `@intention` (string), `@source` (file:line), `@layer: domain|application|interface` (optional, sealed-subgraph discipline)
 - Modules: `use "stdlib/finance.verbose"`

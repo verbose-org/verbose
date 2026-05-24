@@ -11306,7 +11306,13 @@ fn emit_eval_expr(
             for (n, e) in fields {
                 by_name.insert(n.as_str(), e);
             }
-            let mut tmp_cursor = ac.tmp_slot_base;
+            // ── Step 1: pre-evaluate each subterm and push to stack ──
+            // Push/pop instead of rbp-relative tmp slots: a field
+            // expression may itself be a VariantConstruct (nested
+            // construct), which would clobber shared tmp slots. The
+            // stack-based approach is nesting-safe: each level pushes
+            // its own values, and the LIFO order is restored in step 7.
+            let mut n_pushed: i32 = 0;
             for (_, (decl_name, decl_ty)) in declared_fields.iter().enumerate() {
                 let expr_i = by_name.get(decl_name.as_str()).ok_or_else(|| NativeError {
                     message: format!(
@@ -11314,13 +11320,7 @@ fn emit_eval_expr(
                         concept_name, variant_name, decl_name
                     ),
                 })?;
-                let width = arena_field_byte_width(decl_ty, ac.group_concept_name);
                 if matches!(decl_ty, Type::Text) {
-                    // Slice 4c: text field → produce (rax=ptr, rdx=len).
-                    // Arena-safety: refuse Concat (stack buffer freed
-                    // before arena lifetime ends) and Call (callee may
-                    // concat). Safe shapes: literal, input field,
-                    // BoundText, substring of those.
                     match *expr_i {
                         Expr::Text(ref s) => {
                             let bytes = s.as_bytes();
@@ -11389,37 +11389,17 @@ fn emit_eval_expr(
                             });
                         }
                     }
-                    // Store ptr (rax) and len (rdx) into two tmp slots.
-                    if tmp_cursor >= -128 {
-                        code.extend_from_slice(&[0x48, 0x89, 0x45]);
-                        code.push(tmp_cursor as u8);
-                    } else {
-                        code.extend_from_slice(&[0x48, 0x89, 0x85]);
-                        code.extend_from_slice(&tmp_cursor.to_le_bytes());
-                    }
-                    let len_slot = tmp_cursor - 8;
-                    if len_slot >= -128 {
-                        code.extend_from_slice(&[0x48, 0x89, 0x55]);
-                        code.push(len_slot as u8);
-                    } else {
-                        code.extend_from_slice(&[0x48, 0x89, 0x95]);
-                        code.extend_from_slice(&len_slot.to_le_bytes());
-                    }
+                    code.push(0x50); // push rax (ptr)
+                    code.push(0x52); // push rdx (len)
+                    n_pushed += 2;
                 } else {
                     emit_eval_expr(
                         code, expr_i, input_name, offsets, all_rules,
                         field_ranges, text_bindings, self_call, arena_ctx,
                     )?;
-                    // mov [rbp + tmp_cursor], rax
-                    if tmp_cursor >= -128 {
-                        code.extend_from_slice(&[0x48, 0x89, 0x45]);
-                        code.push(tmp_cursor as u8);
-                    } else {
-                        code.extend_from_slice(&[0x48, 0x89, 0x85]);
-                        code.extend_from_slice(&tmp_cursor.to_le_bytes());
-                    }
+                    code.push(0x50); // push rax
+                    n_pushed += 1;
                 }
-                tmp_cursor -= width;
             }
             // ── Step 2: load current node_count into rax ──
             //
@@ -11511,36 +11491,15 @@ fn emit_eval_expr(
             // ── Step 6: write tag byte at [rcx] ──
             // mov byte [rcx], tag  (0xC6 0x01 tag)
             code.extend_from_slice(&[0xC6, 0x01, tag]);
-            // ── Step 7: write payload slots (type-aware offsets) ──
-            let mut write_tmp_cursor = ac.tmp_slot_base;
-            for (i, (_, decl_ty)) in declared_fields.iter().enumerate() {
-                let field_width = arena_field_byte_width(decl_ty, ac.group_concept_name);
+            // ── Step 7: pop pre-evaluated values in reverse and write ──
+            // Stack has values in LIFO order (last field on top). Pop in
+            // reverse declared order; write each to its arena offset.
+            for i in (0..declared_fields.len()).rev() {
+                let (_, ref decl_ty) = declared_fields[i];
                 let arena_off = arena_field_offset(declared_fields, i, ac.group_concept_name);
                 if matches!(decl_ty, Type::Text) {
-                    // ptr from tmp → arena
-                    if write_tmp_cursor >= -128 {
-                        code.extend_from_slice(&[0x48, 0x8B, 0x55]);
-                        code.push(write_tmp_cursor as u8);
-                    } else {
-                        code.extend_from_slice(&[0x48, 0x8B, 0x95]);
-                        code.extend_from_slice(&write_tmp_cursor.to_le_bytes());
-                    }
-                    if arena_off <= 127 {
-                        code.extend_from_slice(&[0x48, 0x89, 0x51]);
-                        code.push(arena_off as u8);
-                    } else {
-                        code.extend_from_slice(&[0x48, 0x89, 0x91]);
-                        code.extend_from_slice(&arena_off.to_le_bytes());
-                    }
-                    // len from tmp → arena
-                    let len_tmp = write_tmp_cursor - 8;
-                    if len_tmp >= -128 {
-                        code.extend_from_slice(&[0x48, 0x8B, 0x55]);
-                        code.push(len_tmp as u8);
-                    } else {
-                        code.extend_from_slice(&[0x48, 0x8B, 0x95]);
-                        code.extend_from_slice(&len_tmp.to_le_bytes());
-                    }
+                    // pop rdx (len was pushed second → on top)
+                    code.push(0x5A);
                     let arena_len_off = arena_off + 8;
                     if arena_len_off <= 127 {
                         code.extend_from_slice(&[0x48, 0x89, 0x51]);
@@ -11549,16 +11508,18 @@ fn emit_eval_expr(
                         code.extend_from_slice(&[0x48, 0x89, 0x91]);
                         code.extend_from_slice(&arena_len_off.to_le_bytes());
                     }
-                } else {
-                    // mov rdx, [rbp + write_tmp_cursor]
-                    if write_tmp_cursor >= -128 {
-                        code.extend_from_slice(&[0x48, 0x8B, 0x55]);
-                        code.push(write_tmp_cursor as u8);
+                    // pop rdx (ptr was pushed first → below len)
+                    code.push(0x5A);
+                    if arena_off <= 127 {
+                        code.extend_from_slice(&[0x48, 0x89, 0x51]);
+                        code.push(arena_off as u8);
                     } else {
-                        code.extend_from_slice(&[0x48, 0x8B, 0x95]);
-                        code.extend_from_slice(&write_tmp_cursor.to_le_bytes());
+                        code.extend_from_slice(&[0x48, 0x89, 0x91]);
+                        code.extend_from_slice(&arena_off.to_le_bytes());
                     }
-                    // mov [rcx + arena_off], rdx
+                } else {
+                    // pop rdx
+                    code.push(0x5A);
                     if arena_off <= 127 {
                         code.extend_from_slice(&[0x48, 0x89, 0x51]);
                         code.push(arena_off as u8);
@@ -11567,7 +11528,6 @@ fn emit_eval_expr(
                         code.extend_from_slice(&arena_off.to_le_bytes());
                     }
                 }
-                write_tmp_cursor -= field_width;
             }
             // ── Step 8: bump node_count (rax already holds the pre-inc index) ──
             // inc qword [rbp + node_count_slot]  (REX.W 0x48, 0xFF, /0 = 0x45 disp8)
@@ -26689,6 +26649,41 @@ rule label_len
             assert_eq!(
                 stdout.as_ref(), *expected,
                 "label_len({}) output mismatch: expected {:?}, got {:?}",
+                arg, expected, stdout
+            );
+        }
+        let _ = std::fs::remove_file(&out);
+    }
+
+    #[test]
+    fn phase_b4c_label_tree_native_runtime() {
+        let src = std::fs::read_to_string("examples/label_tree.verbose")
+            .expect("examples/label_tree.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+        let out = std::env::temp_dir().join("verbosec_test_label_tree");
+        compile_native(&program, "measure", out.to_str().unwrap(), false, false)
+            .expect("label_tree::measure must compile");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o755));
+        }
+        let cases: &[(&str, &str)] = &[
+            ("0", "1\n"),
+            ("1", "3\n"),
+            ("3", "7\n"),
+            ("5", "11\n"),
+        ];
+        for (arg, expected) in cases {
+            let output = std::process::Command::new(&out)
+                .arg(arg)
+                .output()
+                .expect("native binary must run");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert_eq!(
+                stdout.as_ref(), *expected,
+                "measure({}) output mismatch: expected {:?}, got {:?}",
                 arg, expected, stdout
             );
         }
