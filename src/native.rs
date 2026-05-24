@@ -2589,24 +2589,42 @@ fn find_group_match_variant_in_expr(
 /// to 24. The 4 unused bytes of `Int` entries are accepted waste —
 /// uniform entry size keeps `idx * entry_size` a single `imul`.
 ///
-/// Slice 4a.1 only computes this size for the prologue's frame
-/// reservation; no entries are written yet.
+/// Slice 4c: text-typed payload fields use 16 bytes (ptr, len) instead
+/// of 8. Entry size is `1 + sum(field_widths)` for the variant with
+/// the largest payload, rounded up to 8.
+fn arena_field_byte_width(ty: &Type, group_concept_name: &str) -> i32 {
+    match ty {
+        Type::Text => 16,
+        Type::Number | Type::Bool => 8,
+        Type::Named(n) if n == group_concept_name => 8,
+        _ => 8,
+    }
+}
+
+fn arena_variant_payload_bytes(fields: &[Field], group_concept_name: &str) -> i32 {
+    fields.iter().map(|f| arena_field_byte_width(&f.ty, group_concept_name)).sum()
+}
+
+fn arena_field_offset(fields: &[(String, Type)], field_index: usize, group_concept_name: &str) -> i32 {
+    let mut off = 8i32;
+    for i in 0..field_index {
+        off += arena_field_byte_width(&fields[i].1, group_concept_name);
+    }
+    off
+}
+
 fn compute_arena_entry_size(group: &ConceptGroup) -> i32 {
-    // Slice 4a.1 constraint: exactly one concept per group (enforced
-    // at compile_native_code). The caller checks this before reaching
-    // here, but we still defensively pick the first concept.
     let concept = match group.concepts.first() {
         Some(c) => c,
         None => return 0,
     };
-    let max_payload_fields = concept
+    let max_payload_bytes: i32 = concept
         .variants
         .iter()
-        .map(|v| v.fields.len())
+        .map(|v| arena_variant_payload_bytes(&v.fields, &concept.name))
         .max()
-        .unwrap_or(0) as i32;
-    let raw = 1 + 8 * max_payload_fields;
-    // Round up to 8-byte alignment.
+        .unwrap_or(0);
+    let raw = 1 + max_payload_bytes;
     (raw + 7) & !7
 }
 
@@ -2723,22 +2741,20 @@ fn emit_record_loop_prologue<'a>(
         }
         None => (0, 0),
     };
-    // Phase B slice 4a.2 — tmp slot pool for VariantConstruct subterm
-    // spilling. Slice constraint (single-concept group) lets us compute
-    // the pool size as `max_variant_arity` over the only concept. Each
-    // tmp slot holds an i64 (Number value or zero-extended arena index)
-    // so the pool is `max_variant_arity * 8` bytes. Reserved BELOW the
-    // arena (most-negative end of the frame) so the existing fixed
-    // slot offsets (above the arena) stay byte-for-byte unchanged.
-    let max_variant_arity: i32 = match concept_group {
-        Some(g) => g
-            .concepts
-            .first()
-            .map(|c| c.variants.iter().map(|v| v.fields.len()).max().unwrap_or(0))
-            .unwrap_or(0) as i32,
+    // Phase B slice 4a.2 / 4c — tmp slot pool for VariantConstruct
+    // subterm spilling. Each tmp slot holds an i64 (8 B for Number /
+    // arena-index) or a (ptr, len) pair (16 B for Text). Pool sized at
+    // the variant with the largest total payload bytes.
+    let tmp_slot_extra_bytes: i32 = match concept_group {
+        Some(g) => if arena_size > 0 {
+            g.concepts.first()
+                .map(|c| c.variants.iter()
+                    .map(|v| arena_variant_payload_bytes(&v.fields, &c.name))
+                    .max().unwrap_or(0))
+                .unwrap_or(0)
+        } else { 0 },
         None => 0,
     };
-    let tmp_slot_extra_bytes: i32 = if arena_size > 0 { max_variant_arity * 8 } else { 0 };
     let arena_extra_bytes: i32 = if arena_size > 0 {
         arena_size + 8 + tmp_slot_extra_bytes
     } else {
@@ -3581,39 +3597,34 @@ fn emit_callable_into<'a>(
     let is_group_input = !concept.variants.is_empty();
     let nfields = if is_group_input { 1 } else { concept.fields.len() };
     let is_multi_field = nfields > 1;
-    // Phase B slice 4a.3: count match arms across the body to size the
-    // binder slot pool. Each arm body's binders are bound by storing
-    // payload slot values from the arena entry into per-binder rbp
-    // slots BEFORE the arm body runs. Max arity over all matches caps
-    // the pool size; slice 4a.3 single-concept group caps this at 2
-    // (Add has 2 recursive payload fields).
-    let max_arm_binders = count_max_match_arm_binders(&rule.logic.value);
-    // Phase B slice 4a.3: count VariantConstruct sites that need tmp
-    // slots. The slice-4a.1 prologue allocates tmp_slot_base + arena
-    // when called from `_start` (emit_full_program path), but RECURSIVE
-    // callables don't go through emit_record_loop_prologue — their tmp
-    // pool must live in the callable's own frame. Sized at the group's
-    // max_variant_arity when a group is declared AND the rule's body
-    // contains a VariantConstruct (slice 4a.3 only: e.g. build_chain).
-    // Eval has no VariantConstruct, so its tmp pool is 0 bytes (no
-    // change to the slice-5.1a frame layout).
+    // Phase B slice 4a.3 / 4c: count match arm binder SLOTS (not count).
+    // Text binders need 2 slots (ptr + len); others need 1. Max across
+    // all arms in the body sizes the shared binder pool.
+    let max_arm_binder_slots = count_max_match_arm_binder_slots(&rule.logic.value, concept_group);
+    // Phase B slice 4a.3 / 4c: tmp pool for VariantConstruct subterm
+    // spilling. Text fields need 16 B (2 slots); others need 8 B (1).
     let needs_tmp_pool = body_contains_variant_construct(&rule.logic.value);
-    let tmp_arity: i32 = if needs_tmp_pool {
+    let tmp_slots: i32 = if needs_tmp_pool {
         concept_group
             .and_then(|g| g.concepts.first())
-            .map(|c| c.variants.iter().map(|v| v.fields.len()).max().unwrap_or(0))
-            .unwrap_or(0) as i32
+            .map(|c| {
+                let max_bytes: i32 = c.variants.iter()
+                    .map(|v| arena_variant_payload_bytes(&v.fields, &c.name))
+                    .max().unwrap_or(0);
+                max_bytes / 8
+            })
+            .unwrap_or(0)
     } else {
         0
     };
     // Frame layout:
     //   [rbp - 8 .. rbp - 8*(nfields)]      input fields / index
-    //   [rbp - 8*(nfields+1) .. rbp - 8*(nfields+max_arm_binders)]   binder slots
-    //   [rbp - 8*(nfields+max_arm_binders+1) .. tmp slots]
-    let binder_slot_base = -((nfields as i32 + 1) * 8); // first binder at this offset
+    //   [rbp - 8*(nfields+1) .. -8*(nfields+binder_slots)]  binder slots
+    //   [rbp - 8*(nfields+binder_slots+1) .. tmp slots]
+    let binder_slot_base = -((nfields as i32 + 1) * 8);
     let _ = binder_slot_base;
-    let tmp_slot_base_local = -((nfields as i32 + max_arm_binders as i32 + 1) * 8); // first tmp here
-    let total_slots = nfields + (max_arm_binders as usize) + (tmp_arity as usize);
+    let tmp_slot_base_local = -((nfields as i32 + max_arm_binder_slots as i32 + 1) * 8);
+    let total_slots = nfields + (max_arm_binder_slots as usize) + (tmp_slots as usize);
     let frame_bytes = (total_slots * 8) as i32;
 
     // Prologue.
@@ -3688,7 +3699,7 @@ fn emit_callable_into<'a>(
                 );
             }
             let entry_size = compute_arena_entry_size(g);
-            arena_holder = Some((tags, fields_map, group_concept.name.as_str(), g.max_nodes, entry_size, tmp_arity));
+            arena_holder = Some((tags, fields_map, group_concept.name.as_str(), g.max_nodes, entry_size, tmp_slots));
         } else {
             arena_holder = None;
         }
@@ -3709,14 +3720,10 @@ fn emit_callable_into<'a>(
         // to TRUST r11 instead of reloading from the (now-stale) outer
         // rbp. The MatchVariant arena dispatch uses entry_size + tag/
         // field maps directly.
-        let arena_ctx_owned = arena_holder.as_ref().map(|(tags, fields_map, gname, max_nodes, entry_size, tmp_arity)| {
+        let arena_ctx_owned = arena_holder.as_ref().map(|(tags, fields_map, gname, max_nodes, entry_size, tmp_slots_val)| {
             ArenaCtx {
-                arena_rbp_offset: i32::MAX, // sentinel: trust r11, do not reload
-                node_count_slot: 0, // unused inside callable for slice 4a.3
-                                    // (eval never constructs; build_chain
-                                    // constructs but the outer prologue
-                                    // owns the counter — slot offset would
-                                    // be wrong here. See in_callable note.)
+                arena_rbp_offset: i32::MAX,
+                node_count_slot: 0,
                 entry_size: *entry_size,
                 max_nodes: *max_nodes,
                 tmp_slot_base: tmp_slot_base_local,
@@ -3725,7 +3732,7 @@ fn emit_callable_into<'a>(
                 group_concept_name: gname,
                 arena_abort_patches: std::cell::RefCell::new(Vec::new()),
                 in_callable: true,
-                callable_node_count_seed: *tmp_arity, // unused but harmless
+                callable_node_count_seed: *tmp_slots_val,
             }
         });
         let arena_ctx_ref = arena_ctx_owned.as_ref();
@@ -3810,6 +3817,54 @@ fn count_max_match_arm_binders(expr: &Expr) -> u32 {
     }
     walk(expr, &mut max_n);
     max_n
+}
+
+/// Phase B slice 4c — type-aware version of count_max_match_arm_binders.
+/// Text-typed binders need 2 slots (ptr + len) instead of 1. Returns
+/// the max total 8-byte SLOTS (not binder count) across all arms.
+/// Falls back to the count-based answer when no concept_group is
+/// provided, so non-group programs stay byte-for-byte unchanged.
+fn count_max_match_arm_binder_slots(expr: &Expr, concept_group: Option<&ConceptGroup>) -> u32 {
+    let mut max_slots: u32 = 0;
+    fn walk(e: &Expr, m: &mut u32, cg: Option<&ConceptGroup>) {
+        match e {
+            Expr::MatchVariant(_, arms) => {
+                for a in arms {
+                    let slots: u32 = if let Some(g) = cg {
+                        if let Some(concept) = g.concepts.first() {
+                            if let Some(variant) = concept.variants.iter().find(|v| v.name == a.variant_name) {
+                                variant.fields.iter().take(a.binders.len())
+                                    .map(|f| if matches!(f.ty, Type::Text) { 2u32 } else { 1u32 })
+                                    .sum()
+                            } else { a.binders.len() as u32 }
+                        } else { a.binders.len() as u32 }
+                    } else { a.binders.len() as u32 };
+                    if slots > *m { *m = slots; }
+                    walk(&a.body, m, cg);
+                }
+            }
+            Expr::Number(_) | Expr::Text(_) | Expr::Ident(_) | Expr::Read(_) | Expr::NowUnix => {}
+            Expr::Field(b, _) => walk(b, m, cg),
+            Expr::Binary(_, l, r) => { walk(l, m, cg); walk(r, m, cg); }
+            Expr::Not(i) | Expr::Neg(i) | Expr::Ok(i) | Expr::Err(i)
+            | Expr::Abs(i) | Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i) => walk(i, m, cg),
+            Expr::If(c, t, ee) => { walk(c, m, cg); walk(t, m, cg); walk(ee, m, cg); }
+            Expr::Call(_, args) | Expr::Concat(args) => { for a in args { walk(a, m, cg); } }
+            Expr::Quantifier(_, c, _, body) => { walk(c, m, cg); walk(body, m, cg); }
+            Expr::Fold(c, init, _, _, body) => { walk(c, m, cg); walk(init, m, cg); walk(body, m, cg); }
+            Expr::FoldBytes(t, init, _, _, _, body) => { walk(t, m, cg); walk(init, m, cg); walk(body, m, cg); }
+            Expr::Map(c, _, body) | Expr::Filter(c, _, body) => { walk(c, m, cg); walk(body, m, cg); }
+            Expr::MatchResult(t, _, ok, _, err) => { walk(t, m, cg); walk(ok, m, cg); walk(err, m, cg); }
+            Expr::Record(_, fields) => { for (_, e) in fields { walk(e, m, cg); } }
+            Expr::VariantConstruct(_, _, fields) => { for (_, e) in fields { walk(e, m, cg); } }
+            Expr::Fetch(_, req) => walk(req, m, cg),
+            Expr::StartsWith(h, n) | Expr::Contains(h, n) | Expr::EndsWith(h, n)
+            | Expr::Min(h, n) | Expr::Max(h, n) | Expr::ByteAt(h, n) => { walk(h, m, cg); walk(n, m, cg); }
+            Expr::Substring(t, s, e) => { walk(t, m, cg); walk(s, m, cg); walk(e, m, cg); }
+        }
+    }
+    walk(expr, &mut max_slots, concept_group);
+    max_slots
 }
 
 /// Phase B slice 4a.3 — does the expression tree contain a
@@ -11048,7 +11103,9 @@ fn emit_eval_expr(
             let called = all_rules.get(name.as_str()).ok_or_else(|| NativeError {
                 message: format!("unknown rule '{}' for native inlining", name),
             })?;
-            // Inline: emit the called rule's logic with the same field layout
+            // Inline: emit the called rule's logic with the same field layout.
+            // Thread arena_ctx so VariantConstruct inside the callee can
+            // access the arena (Phase B slice 4c).
             emit_eval_expr(
                 code,
                 &called.logic.value,
@@ -11058,7 +11115,7 @@ fn emit_eval_expr(
                 field_ranges,
                 text_bindings,
                 self_call,
-                None,
+                arena_ctx,
             )
         }
         Expr::If(cond, then_e, else_e) => {
@@ -11211,21 +11268,12 @@ fn emit_eval_expr(
                     ),
                 });
             }
-            // Per-field type guard (slice 4a.2 scope: Number or self-ref only).
+            // Per-field type guard (slice 4a.2 + 4c).
             for (decl_name, decl_ty) in declared_fields {
                 match decl_ty {
-                    Type::Number => {}
+                    Type::Number | Type::Bool => {}
+                    Type::Text => {}
                     Type::Named(n) if n == ac.group_concept_name => {}
-                    Type::Text => {
-                        return Err(NativeError {
-                            message: format!(
-                                "native VariantConstruct '{}::{}': field '{}' has text type; \
-                                 text payload in a variant lands in Phase B slice 4c (needs a \
-                                 (ptr, len) layout in the arena slot). Use --run for now.",
-                                concept_name, variant_name, decl_name
-                            ),
-                        });
-                    }
                     Type::Collection(_) => {
                         return Err(NativeError {
                             message: format!(
@@ -11239,7 +11287,7 @@ fn emit_eval_expr(
                         return Err(NativeError {
                             message: format!(
                                 "native VariantConstruct '{}::{}': field '{}' has unsupported type {:?}; \
-                                 slice 4a.2 supports Number and self-reference only.",
+                                 slice 4c supports Number, Text, and self-reference.",
                                 concept_name, variant_name, decl_name, other
                             ),
                         });
@@ -11254,26 +11302,120 @@ fn emit_eval_expr(
             for (n, e) in fields {
                 by_name.insert(n.as_str(), e);
             }
-            for (i, (decl_name, _)) in declared_fields.iter().enumerate() {
+            let mut tmp_cursor = ac.tmp_slot_base;
+            for (_, (decl_name, decl_ty)) in declared_fields.iter().enumerate() {
                 let expr_i = by_name.get(decl_name.as_str()).ok_or_else(|| NativeError {
                     message: format!(
                         "native VariantConstruct '{}::{}': missing field '{}' in literal",
                         concept_name, variant_name, decl_name
                     ),
                 })?;
-                emit_eval_expr(
-                    code, expr_i, input_name, offsets, all_rules,
-                    field_ranges, text_bindings, self_call, arena_ctx,
-                )?;
-                let slot = ac.tmp_slot_base - 8 * (i as i32);
-                // mov [rbp + slot], rax
-                if slot >= -128 {
-                    code.extend_from_slice(&[0x48, 0x89, 0x45]);
-                    code.push(slot as u8);
+                let width = arena_field_byte_width(decl_ty, ac.group_concept_name);
+                if matches!(decl_ty, Type::Text) {
+                    // Slice 4c: text field → produce (rax=ptr, rdx=len).
+                    // Arena-safety: refuse Concat (stack buffer freed
+                    // before arena lifetime ends) and Call (callee may
+                    // concat). Safe shapes: literal, input field,
+                    // BoundText, substring of those.
+                    match *expr_i {
+                        Expr::Text(ref s) => {
+                            let bytes = s.as_bytes();
+                            let n = bytes.len() as i32;
+                            if n <= 127 {
+                                code.push(0xEB);
+                                code.push(n as u8);
+                            } else {
+                                code.push(0xE9);
+                                code.extend_from_slice(&n.to_le_bytes());
+                            }
+                            let addr = code.len();
+                            code.extend_from_slice(bytes);
+                            let end = code.len() + 7;
+                            let rel32 = addr as i32 - end as i32;
+                            code.extend_from_slice(&[0x48, 0x8D, 0x05]);
+                            code.extend_from_slice(&rel32.to_le_bytes());
+                            code.extend_from_slice(&[0x48, 0xC7, 0xC2]);
+                            code.extend_from_slice(&n.to_le_bytes());
+                        }
+                        Expr::Ident(ref name) if text_bindings.contains_key(name.as_str()) => {
+                            let &(ptr_slot, len_slot) = &text_bindings[name.as_str()];
+                            load_rax_from_rbp(code, ptr_slot);
+                            if len_slot >= -128 {
+                                code.extend_from_slice(&[0x48, 0x8B, 0x55]);
+                                code.push(len_slot as u8);
+                            } else {
+                                code.extend_from_slice(&[0x48, 0x8B, 0x95]);
+                                code.extend_from_slice(&len_slot.to_le_bytes());
+                            }
+                        }
+                        Expr::Read(ref name) if text_bindings.contains_key(name.as_str()) => {
+                            let &(ptr_slot, len_slot) = &text_bindings[name.as_str()];
+                            load_rax_from_rbp(code, ptr_slot);
+                            if len_slot >= -128 {
+                                code.extend_from_slice(&[0x48, 0x8B, 0x55]);
+                                code.push(len_slot as u8);
+                            } else {
+                                code.extend_from_slice(&[0x48, 0x8B, 0x95]);
+                                code.extend_from_slice(&len_slot.to_le_bytes());
+                            }
+                        }
+                        Expr::Field(ref base, ref field_name)
+                            if matches!(base.as_ref(), Expr::Ident(ref n) if n == input_name) =>
+                        {
+                            let offset = *offsets.get(field_name.as_str()).ok_or_else(|| NativeError {
+                                message: format!(
+                                    "native VariantConstruct text field '{}': unknown input field '{}'",
+                                    decl_name, field_name
+                                ),
+                            })?;
+                            load_rax_from_rbp(code, offset);
+                            code.extend_from_slice(&[0x48, 0x89, 0xC6]); // mov rsi, rax
+                            emit_strlen(code);
+                            code.extend_from_slice(&[0x48, 0x89, 0xF0]); // mov rax, rsi
+                        }
+                        _ => {
+                            return Err(NativeError {
+                                message: format!(
+                                    "native VariantConstruct '{}::{}': text field '{}' has an expression shape \
+                                     not yet supported in arena storage (concat and call are not arena-safe \
+                                     — their stack buffers are freed before the arena entry is consumed). \
+                                     Use a literal, input field, read(), or BoundText. Use --run for now.",
+                                    concept_name, variant_name, decl_name
+                                ),
+                            });
+                        }
+                    }
+                    // Store ptr (rax) and len (rdx) into two tmp slots.
+                    if tmp_cursor >= -128 {
+                        code.extend_from_slice(&[0x48, 0x89, 0x45]);
+                        code.push(tmp_cursor as u8);
+                    } else {
+                        code.extend_from_slice(&[0x48, 0x89, 0x85]);
+                        code.extend_from_slice(&tmp_cursor.to_le_bytes());
+                    }
+                    let len_slot = tmp_cursor - 8;
+                    if len_slot >= -128 {
+                        code.extend_from_slice(&[0x48, 0x89, 0x55]);
+                        code.push(len_slot as u8);
+                    } else {
+                        code.extend_from_slice(&[0x48, 0x89, 0x95]);
+                        code.extend_from_slice(&len_slot.to_le_bytes());
+                    }
                 } else {
-                    code.extend_from_slice(&[0x48, 0x89, 0x85]);
-                    code.extend_from_slice(&slot.to_le_bytes());
+                    emit_eval_expr(
+                        code, expr_i, input_name, offsets, all_rules,
+                        field_ranges, text_bindings, self_call, arena_ctx,
+                    )?;
+                    // mov [rbp + tmp_cursor], rax
+                    if tmp_cursor >= -128 {
+                        code.extend_from_slice(&[0x48, 0x89, 0x45]);
+                        code.push(tmp_cursor as u8);
+                    } else {
+                        code.extend_from_slice(&[0x48, 0x89, 0x85]);
+                        code.extend_from_slice(&tmp_cursor.to_le_bytes());
+                    }
                 }
+                tmp_cursor -= width;
             }
             // ── Step 2: load current node_count into rax ──
             //
@@ -11365,29 +11507,63 @@ fn emit_eval_expr(
             // ── Step 6: write tag byte at [rcx] ──
             // mov byte [rcx], tag  (0xC6 0x01 tag)
             code.extend_from_slice(&[0xC6, 0x01, tag]);
-            // ── Step 7: write payload slots ──
-            for i in 0..declared_fields.len() {
-                let slot = ac.tmp_slot_base - 8 * (i as i32);
-                // mov rdx, [rbp + slot]
-                if slot >= -128 {
-                    code.extend_from_slice(&[0x48, 0x8B, 0x55]);
-                    code.push(slot as u8);
+            // ── Step 7: write payload slots (type-aware offsets) ──
+            let mut write_tmp_cursor = ac.tmp_slot_base;
+            for (i, (_, decl_ty)) in declared_fields.iter().enumerate() {
+                let field_width = arena_field_byte_width(decl_ty, ac.group_concept_name);
+                let arena_off = arena_field_offset(declared_fields, i, ac.group_concept_name);
+                if matches!(decl_ty, Type::Text) {
+                    // ptr from tmp → arena
+                    if write_tmp_cursor >= -128 {
+                        code.extend_from_slice(&[0x48, 0x8B, 0x55]);
+                        code.push(write_tmp_cursor as u8);
+                    } else {
+                        code.extend_from_slice(&[0x48, 0x8B, 0x95]);
+                        code.extend_from_slice(&write_tmp_cursor.to_le_bytes());
+                    }
+                    if arena_off <= 127 {
+                        code.extend_from_slice(&[0x48, 0x89, 0x51]);
+                        code.push(arena_off as u8);
+                    } else {
+                        code.extend_from_slice(&[0x48, 0x89, 0x91]);
+                        code.extend_from_slice(&arena_off.to_le_bytes());
+                    }
+                    // len from tmp → arena
+                    let len_tmp = write_tmp_cursor - 8;
+                    if len_tmp >= -128 {
+                        code.extend_from_slice(&[0x48, 0x8B, 0x55]);
+                        code.push(len_tmp as u8);
+                    } else {
+                        code.extend_from_slice(&[0x48, 0x8B, 0x95]);
+                        code.extend_from_slice(&len_tmp.to_le_bytes());
+                    }
+                    let arena_len_off = arena_off + 8;
+                    if arena_len_off <= 127 {
+                        code.extend_from_slice(&[0x48, 0x89, 0x51]);
+                        code.push(arena_len_off as u8);
+                    } else {
+                        code.extend_from_slice(&[0x48, 0x89, 0x91]);
+                        code.extend_from_slice(&arena_len_off.to_le_bytes());
+                    }
                 } else {
-                    code.extend_from_slice(&[0x48, 0x8B, 0x95]);
-                    code.extend_from_slice(&slot.to_le_bytes());
+                    // mov rdx, [rbp + write_tmp_cursor]
+                    if write_tmp_cursor >= -128 {
+                        code.extend_from_slice(&[0x48, 0x8B, 0x55]);
+                        code.push(write_tmp_cursor as u8);
+                    } else {
+                        code.extend_from_slice(&[0x48, 0x8B, 0x95]);
+                        code.extend_from_slice(&write_tmp_cursor.to_le_bytes());
+                    }
+                    // mov [rcx + arena_off], rdx
+                    if arena_off <= 127 {
+                        code.extend_from_slice(&[0x48, 0x89, 0x51]);
+                        code.push(arena_off as u8);
+                    } else {
+                        code.extend_from_slice(&[0x48, 0x89, 0x91]);
+                        code.extend_from_slice(&arena_off.to_le_bytes());
+                    }
                 }
-                // mov [rcx + (8 + 8*i)], rdx
-                let off = 8 + 8 * (i as i32);
-                if off == 0 {
-                    // unreachable (off >= 8) but defensive
-                    code.extend_from_slice(&[0x48, 0x89, 0x11]);
-                } else if off <= 127 {
-                    code.extend_from_slice(&[0x48, 0x89, 0x51]);
-                    code.push(off as u8);
-                } else {
-                    code.extend_from_slice(&[0x48, 0x89, 0x91]);
-                    code.extend_from_slice(&off.to_le_bytes());
-                }
+                write_tmp_cursor -= field_width;
             }
             // ── Step 8: bump node_count (rax already holds the pre-inc index) ──
             // inc qword [rbp + node_count_slot]  (REX.W 0x48, 0xFF, /0 = 0x45 disp8)
@@ -11543,37 +11719,82 @@ fn emit_eval_expr(
                     let next_arm_patch = code.len();
                     code.extend_from_slice(&[0x00; 4]);
                     // Bind payload slots from the entry (rax still points at it).
-                    // Each declared field is one i64 slot at offset 8 + 8*i.
+                    // Slice 4c: type-aware offsets — text binders get 2 slots
+                    // (ptr + len), others get 1. Text binders go into
+                    // extended_text_bindings, not extended_offsets.
                     let mut extended_offsets = offsets.clone();
                     let mut extended_ranges = field_ranges.clone();
                     let _ = &mut extended_ranges;
+                    let mut extended_text_bindings: TextBindings<'_> = text_bindings.clone();
+                    let mut binder_cursor = binder_base;
                     for (i, binder_opt) in arm.binders.iter().enumerate() {
+                        let field_ty = &declared_fields[i].1;
+                        let is_text = matches!(field_ty, Type::Text);
+                        let arena_off = arena_field_offset(declared_fields, i, ac.group_concept_name);
                         if let Some(binder_name) = binder_opt {
-                            let slot = binder_base - 8 * (i as i32);
-                            // mov rdx, [rax + (8 + 8*i)]
-                            let off = (8 + 8 * (i as i32)) as i32;
-                            if off <= 127 {
-                                code.extend_from_slice(&[0x48, 0x8B, 0x50]);
-                                code.push(off as u8);
+                            if is_text {
+                                // Load ptr from [rax + arena_off]
+                                if arena_off <= 127 {
+                                    code.extend_from_slice(&[0x48, 0x8B, 0x50]);
+                                    code.push(arena_off as u8);
+                                } else {
+                                    code.extend_from_slice(&[0x48, 0x8B, 0x90]);
+                                    code.extend_from_slice(&arena_off.to_le_bytes());
+                                }
+                                // Store ptr to [rbp + binder_cursor]
+                                let ptr_slot = binder_cursor;
+                                if ptr_slot >= -128 {
+                                    code.extend_from_slice(&[0x48, 0x89, 0x55]);
+                                    code.push(ptr_slot as u8);
+                                } else {
+                                    code.extend_from_slice(&[0x48, 0x89, 0x95]);
+                                    code.extend_from_slice(&ptr_slot.to_le_bytes());
+                                }
+                                // Load len from [rax + arena_off + 8]
+                                let arena_len_off = arena_off + 8;
+                                if arena_len_off <= 127 {
+                                    code.extend_from_slice(&[0x48, 0x8B, 0x50]);
+                                    code.push(arena_len_off as u8);
+                                } else {
+                                    code.extend_from_slice(&[0x48, 0x8B, 0x90]);
+                                    code.extend_from_slice(&arena_len_off.to_le_bytes());
+                                }
+                                // Store len to [rbp + binder_cursor - 8]
+                                let len_slot = binder_cursor - 8;
+                                if len_slot >= -128 {
+                                    code.extend_from_slice(&[0x48, 0x89, 0x55]);
+                                    code.push(len_slot as u8);
+                                } else {
+                                    code.extend_from_slice(&[0x48, 0x89, 0x95]);
+                                    code.extend_from_slice(&len_slot.to_le_bytes());
+                                }
+                                extended_text_bindings.insert(binder_name.as_str(), (ptr_slot, len_slot));
                             } else {
-                                code.extend_from_slice(&[0x48, 0x8B, 0x90]);
-                                code.extend_from_slice(&off.to_le_bytes());
+                                // mov rdx, [rax + arena_off]
+                                if arena_off <= 127 {
+                                    code.extend_from_slice(&[0x48, 0x8B, 0x50]);
+                                    code.push(arena_off as u8);
+                                } else {
+                                    code.extend_from_slice(&[0x48, 0x8B, 0x90]);
+                                    code.extend_from_slice(&arena_off.to_le_bytes());
+                                }
+                                // mov [rbp + binder_cursor], rdx
+                                if binder_cursor >= -128 {
+                                    code.extend_from_slice(&[0x48, 0x89, 0x55]);
+                                    code.push(binder_cursor as u8);
+                                } else {
+                                    code.extend_from_slice(&[0x48, 0x89, 0x95]);
+                                    code.extend_from_slice(&binder_cursor.to_le_bytes());
+                                }
+                                extended_offsets.insert(binder_name.as_str(), binder_cursor);
                             }
-                            // mov [rbp + slot], rdx
-                            if slot >= -128 {
-                                code.extend_from_slice(&[0x48, 0x89, 0x55]);
-                                code.push(slot as u8);
-                            } else {
-                                code.extend_from_slice(&[0x48, 0x89, 0x95]);
-                                code.extend_from_slice(&slot.to_le_bytes());
-                            }
-                            extended_offsets.insert(binder_name.as_str(), slot);
                         }
+                        binder_cursor -= if is_text { 16 } else { 8 };
                     }
                     // Emit arm body. Eval result lands in rax.
                     emit_eval_expr(
                         code, &arm.body, input_name, &extended_offsets,
-                        all_rules, &extended_ranges, text_bindings,
+                        all_rules, &extended_ranges, &extended_text_bindings,
                         self_call,
                         Some(ac),
                     )?;
@@ -26230,6 +26451,243 @@ rule scalar
 
         let _ = child.kill();
         let _ = child.wait();
+        let _ = std::fs::remove_file(&out);
+    }
+
+    #[test]
+    fn phase_b4c_text_payload_compiles() {
+        let src = r#"@verbose 0.1.0
+
+concept_group Tags [max_depth: 5, max_nodes: 20]
+  @intention: "tagged values with text labels"
+  @source: t.intent:1
+
+  concept Tag
+    @intention: "tag"
+    @source: t.intent:1
+    variants:
+      Labeled of (name : text, value : number)
+      Plain of (value : number)
+
+concept Seed
+  @intention: "seed"
+  @source: t.intent:1
+  fields:
+    n : number [0, 5]
+
+rule make_tag
+  @intention: "create a tag"
+  @source: t.intent:1
+  input:
+    s : Seed
+  output:
+    out : Tag
+  logic:
+    out = if s.n > 0 then Tag::Labeled { name: "hello", value: s.n } else Tag::Plain { value: 0 }
+  proofs:
+    purity:
+      reads : [s]
+      calls : [make_tag]
+    termination:
+      bound : 5
+
+rule score
+  @intention: "extract value from tag"
+  @source: t.intent:1
+  input:
+    s : Seed
+  output:
+    out : number
+  logic:
+    out = match make_tag(s):
+      Labeled(name, v) => v
+      Plain(v) => v
+  proofs:
+    purity:
+      reads : [s]
+      calls : [make_tag, score]
+    termination:
+      bound : 5
+"#;
+        let tokens = crate::lexer::Lexer::new(src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+        let out = std::env::temp_dir().join("verbosec_test_b4c_text_payload");
+        compile_native(&program, "score", out.to_str().unwrap(), false, false)
+            .expect("text-payload variant must compile in slice 4c");
+        let _ = std::fs::metadata(&out).expect("compiled binary should exist");
+        let _ = std::fs::remove_file(&out);
+    }
+
+    #[test]
+    fn phase_b4c_text_payload_runtime() {
+        let src = r#"@verbose 0.1.0
+
+concept_group Tags [max_depth: 5, max_nodes: 20]
+  @intention: "tagged values with text labels"
+  @source: t.intent:1
+
+  concept Tag
+    @intention: "tag"
+    @source: t.intent:1
+    variants:
+      Labeled of (name : text, value : number)
+      Plain of (value : number)
+
+concept Seed
+  @intention: "seed"
+  @source: t.intent:1
+  fields:
+    n : number [0, 5]
+
+rule make_tag
+  @intention: "create a tag"
+  @source: t.intent:1
+  input:
+    s : Seed
+  output:
+    out : Tag
+  logic:
+    out = if s.n > 0 then Tag::Labeled { name: "hello", value: s.n } else Tag::Plain { value: 0 }
+  proofs:
+    purity:
+      reads : [s]
+      calls : [make_tag]
+    termination:
+      bound : 5
+
+rule score
+  @intention: "extract value from tag"
+  @source: t.intent:1
+  input:
+    s : Seed
+  output:
+    out : number
+  logic:
+    out = match make_tag(s):
+      Labeled(name, v) => v
+      Plain(v) => v
+  proofs:
+    purity:
+      reads : [s]
+      calls : [make_tag, score]
+    termination:
+      bound : 5
+"#;
+        let tokens = crate::lexer::Lexer::new(src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+        let out = std::env::temp_dir().join("verbosec_test_b4c_text_runtime");
+        compile_native(&program, "score", out.to_str().unwrap(), false, false)
+            .expect("text-payload variant must compile");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o755));
+        }
+        let cases: &[(&str, &str)] = &[
+            ("0", "0\n"),
+            ("1", "1\n"),
+            ("3", "3\n"),
+            ("5", "5\n"),
+        ];
+        for (arg, expected) in cases {
+            let output = std::process::Command::new(&out)
+                .arg(arg)
+                .output()
+                .expect("native binary must run");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert_eq!(
+                stdout.as_ref(), *expected,
+                "score({}) output mismatch: expected {:?}, got {:?}",
+                arg, expected, stdout
+            );
+        }
+        let _ = std::fs::remove_file(&out);
+    }
+
+    #[test]
+    fn phase_b4c_text_binder_length_runtime() {
+        let src = r#"@verbose 0.1.0
+
+concept_group Tags [max_depth: 5, max_nodes: 20]
+  @intention: "tagged values with text labels"
+  @source: t.intent:1
+
+  concept Tag
+    @intention: "tag"
+    @source: t.intent:1
+    variants:
+      Labeled of (name : text, value : number)
+      Plain of (value : number)
+
+concept Seed
+  @intention: "seed"
+  @source: t.intent:1
+  fields:
+    n : number [0, 5]
+
+rule make_tag
+  @intention: "create a tag"
+  @source: t.intent:1
+  input:
+    s : Seed
+  output:
+    out : Tag
+  logic:
+    out = if s.n > 0 then Tag::Labeled { name: "hello", value: s.n } else Tag::Plain { value: 0 }
+  proofs:
+    purity:
+      reads : [s]
+      calls : [make_tag]
+    termination:
+      bound : 5
+
+rule label_len
+  @intention: "get length of the label (0 if plain)"
+  @source: t.intent:1
+  input:
+    s : Seed
+  output:
+    out : number
+  logic:
+    out = match make_tag(s):
+      Labeled(name, v) => length(name)
+      Plain(v) => 0
+  proofs:
+    purity:
+      reads : [s]
+      calls : [make_tag, label_len]
+    termination:
+      bound : 5
+"#;
+        let tokens = crate::lexer::Lexer::new(src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+        let out = std::env::temp_dir().join("verbosec_test_b4c_text_binder_len");
+        compile_native(&program, "label_len", out.to_str().unwrap(), false, false)
+            .expect("text binder with length must compile");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o755));
+        }
+        // n=3 → Labeled("hello", 3) → length("hello") = 5
+        // n=0 → Plain(0) → 0
+        let cases: &[(&str, &str)] = &[
+            ("0", "0\n"),
+            ("1", "5\n"),
+            ("3", "5\n"),
+        ];
+        for (arg, expected) in cases {
+            let output = std::process::Command::new(&out)
+                .arg(arg)
+                .output()
+                .expect("native binary must run");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert_eq!(
+                stdout.as_ref(), *expected,
+                "label_len({}) output mismatch: expected {:?}, got {:?}",
+                arg, expected, stdout
+            );
+        }
         let _ = std::fs::remove_file(&out);
     }
 }
