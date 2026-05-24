@@ -1458,6 +1458,7 @@ impl Parser {
         self.expect_kind(TokenKind::Indent)?;
 
         let mut bound = None;
+        let mut structural = None;
 
         while !self.check_kind(&TokenKind::Dedent) && !self.at_eof() {
             let key = self.expect_ident_any()?;
@@ -1466,9 +1467,12 @@ impl Parser {
                 "bound" => {
                     bound = Some(self.expect_number()?);
                 }
+                "structural" => {
+                    structural = Some(self.expect_ident_any()?);
+                }
                 _ => {
                     return Err(self.error(&format!(
-                        "unknown key '{}' in termination block (allowed: bound)",
+                        "unknown key '{}' in termination block (allowed: bound, structural)",
                         key
                     )));
                 }
@@ -1477,7 +1481,7 @@ impl Parser {
         }
         self.expect_kind(TokenKind::Dedent)?;
 
-        Ok(Termination { bound })
+        Ok(Termination { bound, structural })
     }
 
     fn parse_reaction(&mut self) -> Result<Reaction, ParseError> {

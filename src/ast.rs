@@ -876,4 +876,5 @@ pub struct Path {
 #[derive(Debug, Clone)]
 pub struct Termination {
     pub bound: Option<i64>,
+    pub structural: Option<String>,
 }
