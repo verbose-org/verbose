@@ -426,8 +426,9 @@ fn compile_native_code(
         // Phase C: suppress the breadcrumb when structural recursion is
         // proven for the entry rule. The verifier already checked the
         // proof; here we just gate the warning on its absence.
-        let has_structural_proof = rule.proofs.termination.structural.is_some();
-        if !has_structural_proof {
+        let has_termination_proof = rule.proofs.termination.structural.is_some()
+            || rule.proofs.termination.decreasing.is_some();
+        if !has_termination_proof {
             eprintln!(
                 "native: rule '{}' is recursive (cycle through '{}'); the declared `bound:` is NOT a termination proof for recursion. Runtime stack-overflow is the only safety signal until Phase C ships structural recursion. Use `--run` (interpreter) if you need an audit trace.",
                 rule.name, cycle
@@ -26765,6 +26766,79 @@ rule bad_eval
         assert!(
             !structural_errors.is_empty(),
             "passing `e` (the whole input) to bad_eval should be rejected by structural check"
+        );
+    }
+
+    #[test]
+    fn phase_c_decreasing_factorial_no_breadcrumb() {
+        let src = std::fs::read_to_string("examples/factorial.verbose")
+            .expect("examples/factorial.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+        let errors = crate::verifier::verify_program(&program, std::path::Path::new("."));
+        let decreasing_errors: Vec<_> = errors.iter()
+            .filter(|e| e.context.contains("decreasing"))
+            .collect();
+        assert!(
+            decreasing_errors.is_empty(),
+            "decreasing proof on factorial should verify cleanly, got: {:?}",
+            decreasing_errors
+        );
+        let out = std::env::temp_dir().join("verbosec_test_phase_c_decreasing");
+        compile_native(&program, "fact", out.to_str().unwrap(), false, false)
+            .expect("factorial must compile with decreasing proof");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o755));
+        }
+        let output = std::process::Command::new(&out)
+            .arg("5")
+            .output()
+            .expect("native binary must run");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).as_ref(), "120\n",
+            "fact(5) should produce 120"
+        );
+        let _ = std::fs::remove_file(&out);
+    }
+
+    #[test]
+    fn phase_c_decreasing_rejects_non_decreasing() {
+        let src = r#"@verbose 0.1.0
+
+concept N
+  @intention: "n"
+  @source: t.intent:1
+  fields:
+    v : number [0, 10]
+
+rule bad_fact
+  @intention: "passes same value — not decreasing"
+  @source: t.intent:1
+  input:
+    n : N
+  output:
+    out : number
+  logic:
+    out = if n.v == 0 then 1 else n.v * bad_fact(N { v: n.v })
+  proofs:
+    purity:
+      reads : [n.v]
+      calls : [bad_fact]
+    termination:
+      bound : 100
+      decreasing : v
+"#;
+        let tokens = crate::lexer::Lexer::new(src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+        let errors = crate::verifier::verify_program(&program, std::path::Path::new("."));
+        let decreasing_errors: Vec<_> = errors.iter()
+            .filter(|e| e.context.contains("decreasing"))
+            .collect();
+        assert!(
+            !decreasing_errors.is_empty(),
+            "bad_fact passes n.v (not n.v - k) — should be rejected by decreasing check"
         );
     }
 }

@@ -64,6 +64,7 @@ rule build_chain
       calls   : [build_chain]
     termination:
       bound : 100
+      decreasing : n
 
 
 rule eval
