@@ -3412,6 +3412,10 @@ fn check_termination(
     if let Some(ref structural_param) = rule.proofs.termination.structural {
         check_structural_recursion(rule, structural_param, concepts, group_concept_owner, errors);
     }
+
+    if let Some(ref decreasing_field) = rule.proofs.termination.decreasing {
+        check_decreasing_recursion(rule, decreasing_field, concepts, errors);
+    }
 }
 
 fn check_structural_recursion(
@@ -3514,6 +3518,150 @@ fn collect_recursive_call_args(expr: &Expr, rule_name: &str, out: &mut Vec<Strin
         Expr::StartsWith(h, n) | Expr::Contains(h, n) | Expr::EndsWith(h, n)
         | Expr::Min(h, n) | Expr::Max(h, n) | Expr::ByteAt(h, n) => { collect_recursive_call_args(h, rule_name, out); collect_recursive_call_args(n, rule_name, out); }
         Expr::Substring(t, s, e) => { collect_recursive_call_args(t, rule_name, out); collect_recursive_call_args(s, rule_name, out); collect_recursive_call_args(e, rule_name, out); }
+    }
+}
+
+fn check_decreasing_recursion(
+    rule: &Rule,
+    field_name: &str,
+    concepts: &HashMap<String, &Concept>,
+    errors: &mut Vec<VerifyError>,
+) {
+    let ctx = |sub: &str| format!("rule '{}' / {}", rule.name, sub);
+    let concept_name = match &rule.input_ty {
+        Type::Named(n) => n.as_str(),
+        _ => {
+            errors.push(VerifyError {
+                context: ctx("termination.decreasing"),
+                message: "decreasing requires the input to be a named concept".into(),
+            });
+            return;
+        }
+    };
+    let concept = match concepts.get(concept_name) {
+        Some(c) => *c,
+        None => return,
+    };
+    let field = concept.fields.iter().find(|f| f.name == field_name);
+    match field {
+        Some(f) => {
+            if !matches!(f.ty, Type::Number) {
+                errors.push(VerifyError {
+                    context: ctx("termination.decreasing"),
+                    message: format!(
+                        "field '{}' must be Number-typed for decreasing proof (got {:?})",
+                        field_name, f.ty
+                    ),
+                });
+                return;
+            }
+            if f.range.is_none() {
+                errors.push(VerifyError {
+                    context: ctx("termination.decreasing"),
+                    message: format!(
+                        "field '{}' must have a declared range [min, max] for decreasing proof",
+                        field_name
+                    ),
+                });
+                return;
+            }
+        }
+        None => {
+            errors.push(VerifyError {
+                context: ctx("termination.decreasing"),
+                message: format!(
+                    "field '{}' not found on concept '{}'",
+                    field_name, concept_name
+                ),
+            });
+            return;
+        }
+    }
+    let mut call_args: Vec<(String, Expr)> = Vec::new();
+    collect_recursive_call_record_args(&rule.logic.value, &rule.name, &mut call_args);
+    for (callee, arg_expr) in &call_args {
+        if callee != &rule.name {
+            continue;
+        }
+        if let Expr::Record(_, fields) = arg_expr {
+            let field_expr = fields.iter().find(|(n, _)| n == field_name).map(|(_, e)| e);
+            match field_expr {
+                Some(e) if is_decreasing_by_positive(e, &rule.input_name, field_name) => {}
+                Some(_) => {
+                    errors.push(VerifyError {
+                        context: ctx("termination.decreasing"),
+                        message: format!(
+                            "recursive call to '{}' must pass '{}.{} - k' (k > 0) for field '{}'; \
+                             the expression does not match the decreasing pattern",
+                            rule.name, rule.input_name, field_name, field_name
+                        ),
+                    });
+                }
+                None => {
+                    errors.push(VerifyError {
+                        context: ctx("termination.decreasing"),
+                        message: format!(
+                            "recursive call to '{}' passes a Record without field '{}'",
+                            rule.name, field_name
+                        ),
+                    });
+                }
+            }
+        } else {
+            errors.push(VerifyError {
+                context: ctx("termination.decreasing"),
+                message: format!(
+                    "recursive call to '{}' must pass a Record constructor (got {:?})",
+                    rule.name, arg_expr
+                ),
+            });
+        }
+    }
+}
+
+fn is_decreasing_by_positive(expr: &Expr, input_name: &str, field_name: &str) -> bool {
+    match expr {
+        Expr::Binary(BinOp::Sub, left, right) => {
+            let left_is_field = matches!(left.as_ref(),
+                Expr::Field(base, fname)
+                if matches!(base.as_ref(), Expr::Ident(n) if n == input_name)
+                   && fname == field_name
+            );
+            let right_is_positive = matches!(right.as_ref(), Expr::Number(k) if *k > 0);
+            left_is_field && right_is_positive
+        }
+        _ => false,
+    }
+}
+
+fn collect_recursive_call_record_args(expr: &Expr, rule_name: &str, out: &mut Vec<(String, Expr)>) {
+    match expr {
+        Expr::Call(name, args) if name == rule_name => {
+            if let Some(arg) = args.first() {
+                out.push((name.clone(), arg.clone()));
+            }
+        }
+        Expr::Number(_) | Expr::Text(_) | Expr::Ident(_) | Expr::Read(_) | Expr::NowUnix => {}
+        Expr::Field(b, _) => collect_recursive_call_record_args(b, rule_name, out),
+        Expr::Binary(_, l, r) => { collect_recursive_call_record_args(l, rule_name, out); collect_recursive_call_record_args(r, rule_name, out); }
+        Expr::Not(i) | Expr::Neg(i) | Expr::Ok(i) | Expr::Err(i)
+        | Expr::Abs(i) | Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i) => collect_recursive_call_record_args(i, rule_name, out),
+        Expr::If(c, t, e) => { collect_recursive_call_record_args(c, rule_name, out); collect_recursive_call_record_args(t, rule_name, out); collect_recursive_call_record_args(e, rule_name, out); }
+        Expr::Call(_, args) | Expr::Concat(args) => { for a in args { collect_recursive_call_record_args(a, rule_name, out); } }
+        Expr::Quantifier(_, c, _, body) => { collect_recursive_call_record_args(c, rule_name, out); collect_recursive_call_record_args(body, rule_name, out); }
+        Expr::Fold(c, init, _, _, body) => { collect_recursive_call_record_args(c, rule_name, out); collect_recursive_call_record_args(init, rule_name, out); collect_recursive_call_record_args(body, rule_name, out); }
+        Expr::FoldBytes(t, init, _, _, _, body) => { collect_recursive_call_record_args(t, rule_name, out); collect_recursive_call_record_args(init, rule_name, out); collect_recursive_call_record_args(body, rule_name, out); }
+        Expr::Map(c, _, body) | Expr::Filter(c, _, body) => { collect_recursive_call_record_args(c, rule_name, out); collect_recursive_call_record_args(body, rule_name, out); }
+        Expr::MatchResult(t, _, ok, _, err) => { collect_recursive_call_record_args(t, rule_name, out); collect_recursive_call_record_args(ok, rule_name, out); collect_recursive_call_record_args(err, rule_name, out); }
+        Expr::Record(_, fields) | Expr::VariantConstruct(_, _, fields) => { for (_, e) in fields { collect_recursive_call_record_args(e, rule_name, out); } }
+        Expr::MatchVariant(scrut, arms) => {
+            collect_recursive_call_record_args(scrut, rule_name, out);
+            for a in arms { collect_recursive_call_record_args(&a.body, rule_name, out); }
+        }
+        Expr::Fetch(_, req) => collect_recursive_call_record_args(req, rule_name, out),
+        Expr::StartsWith(h, n) | Expr::Contains(h, n) | Expr::EndsWith(h, n)
+        | Expr::Min(h, n) | Expr::Max(h, n) | Expr::ByteAt(h, n) => { collect_recursive_call_record_args(h, rule_name, out); collect_recursive_call_record_args(n, rule_name, out); }
+        Expr::Substring(t, s, e) => { collect_recursive_call_record_args(t, rule_name, out); collect_recursive_call_record_args(s, rule_name, out); collect_recursive_call_record_args(e, rule_name, out); }
     }
 }
 

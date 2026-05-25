@@ -424,7 +424,7 @@ mod tests {
                         },
                         termination: Termination {
                             bound: Some(1),
-                            structural: None,
+                            structural: None, decreasing: None,
                         },
                     },
                     hints: None,

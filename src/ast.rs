@@ -877,4 +877,5 @@ pub struct Path {
 pub struct Termination {
     pub bound: Option<i64>,
     pub structural: Option<String>,
+    pub decreasing: Option<String>,
 }

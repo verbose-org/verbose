@@ -33,6 +33,7 @@ rule build_tree
       calls : [build_tree]
     termination:
       bound : 100
+      decreasing : n
 
 
 rule total_label_length

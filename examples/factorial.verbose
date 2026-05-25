@@ -48,3 +48,4 @@ rule fact
       calls   : [fact]
     termination:
       bound : 100
+      decreasing : v
