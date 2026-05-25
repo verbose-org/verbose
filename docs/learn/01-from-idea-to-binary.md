@@ -345,14 +345,19 @@ Le point d'entrée (`e_entry`) est à `0x400078` — c'est l'adresse `0x400000 +
 
 ### Ce qui manque (et pourquoi c'est bien)
 
-Un binaire C compilé avec GCC contient typiquement :
-- Un dynamic linker (`/lib64/ld-linux-x86-64.so.2`)
-- Des sections `.plt`, `.got` pour les appels de bibliothèque
-- La libc (malloc, printf, etc.)
-- Des informations de debug, des symboles
-- Taille minimale : **~15 000 octets**
+Un programme C **équivalent** (même logique : lit un entier sur stdin, calcule la factorielle, écrit sur stdout, syscalls directs, pas de libc) compilé avec `gcc -nostdlib -static -Os -s --gc-sections` fait **4 744 octets** — presque 6× plus gros. Avec les settings par défaut de GCC (dynamic linking, libc, symboles), c'est **16 088 octets** — 20× plus gros.
 
-Notre binaire verbose : **802 octets**. Pas de libc, pas de dynamic linking, pas de symboles. Les deux seuls syscalls utilisés sont `read` (lire stdin), `write` (écrire stdout) et `exit` (quitter). Le programme parle directement au noyau Linux.
+Notre binaire verbose : **802 octets**. Pas de libc, pas de dynamic linking, pas de symboles. Les seuls syscalls utilisés sont `read` (lire stdin), `write` (écrire stdout) et `exit` (quitter). Le programme parle directement au noyau Linux.
+
+**"Mais GCC fait ça pour de bonnes raisons, non ?"**
+
+Oui. Les sections séparées permettent le chargement paresseux. Le dynamic linker permet de partager la libc entre processus. Les symboles permettent le debug en production. La table PLT/GOT permet de mettre à jour une bibliothèque sans recompiler. Ces choix sont justifiés pour un binaire **général** qui doit s'intégrer dans un écosystème.
+
+Verbose ne joue pas dans cette catégorie. Un binaire verbose est **un programme, une règle, un exécutable**. Pas de bibliothèque externe. Pas de debug en production (le programme est vérifié avant d'émettre). Pas de chargement partiel (tout tient dans une page mémoire). Il ne *supprime* pas les sections ELF pour gagner des octets — il ne les a jamais *eues* parce qu'il n'en a jamais eu *besoin*.
+
+Et le point le plus important : les 802 octets de verbose **incluent** les 38 octets de bounds-check + les 16 octets d'abort tail. Le programme C de 4 744 octets, lui, n'a **aucune** vérification de bornes. Enlevez le bounds-check à verbose et vous descendez à 748 octets — mais verbose refuse de le faire. La vérification n'est pas optionnelle. Elle fait partie du contrat entre le développeur qui déclare `[0, 10]` et le binaire qui l'applique.
+
+Verbose est plus petit **et** plus sûr. Pas l'un au détriment de l'autre.
 
 ---
 
