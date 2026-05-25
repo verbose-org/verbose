@@ -390,13 +390,16 @@ fn compile_native_code(
                     });
                 }
                 for f in &c.fields {
-                    if f.ty != Type::Number {
-                        return Err(NativeError {
-                            message: format!(
-                                "recursive rule '{}' input field '{}' must be Number (got {:?}); text input in a recursive rule is a later slice (no multi-field text ABI yet).",
-                                r.name, f.name, f.ty
-                            ),
-                        });
+                    match f.ty {
+                        Type::Number | Type::Text => {}
+                        _ => {
+                            return Err(NativeError {
+                                message: format!(
+                                    "recursive rule '{}' input field '{}' must be Number or Text (got {:?})",
+                                    r.name, f.name, f.ty
+                                ),
+                            });
+                        }
                     }
                 }
             }
@@ -3365,9 +3368,11 @@ fn emit_self_recursive_program<'a>(
 ) -> Result<Vec<u8>, NativeError> {
     let is_bool = entry_rule.output_ty == Type::Bool;
     let is_text = entry_rule.output_ty == Type::Text;
-    let nfields = concept.fields.len();
-    let is_multi_field = nfields > 1;
-    let frame_bytes = (nfields * 8) as i32;
+    let nslots: usize = concept.fields.iter()
+        .map(|f| if matches!(f.ty, Type::Text) { 2usize } else { 1 })
+        .sum();
+    let is_multi_field = nslots > 1;
+    let frame_bytes = (nslots * 8) as i32;
     let mut code = Vec::new();
 
     // Leading jump that skips over ALL callables so _start runs first
@@ -3410,15 +3415,30 @@ fn emit_self_recursive_program<'a>(
     // ABI dispatch in emit_eval_expr's Call arm independently of
     // `offsets.len()` (which inflates when MatchVariant arms add binders).
     let mut arities: HashMap<&str, usize> = HashMap::new();
+    let mut struct_layouts: HashMap<&str, Vec<(String, i32, bool)>> = HashMap::new();
     for &r in scc_rules {
         let c = lookup_concept(r)?;
-        let arity = if !c.variants.is_empty() { 1 } else { c.fields.len() };
-        arities.insert(r.name.as_str(), arity);
+        if !c.variants.is_empty() {
+            arities.insert(r.name.as_str(), 1);
+            struct_layouts.insert(r.name.as_str(), Vec::new());
+        } else {
+            let mut layout = Vec::new();
+            let mut struct_off = 0i32;
+            let mut slots = 0usize;
+            for f in &c.fields {
+                let is_text = matches!(f.ty, Type::Text);
+                layout.push((f.name.clone(), struct_off, is_text));
+                if is_text { struct_off += 16; slots += 2; }
+                else { struct_off += 8; slots += 1; }
+            }
+            arities.insert(r.name.as_str(), slots);
+            struct_layouts.insert(r.name.as_str(), layout);
+        }
     }
     let placeholder_labels: HashMap<&str, i32> = scc_rules.iter()
         .map(|r| (r.name.as_str(), 0_i32))
         .collect();
-    let placeholder_ctx = SelfCallCtx { labels: &placeholder_labels, arities: &arities };
+    let placeholder_ctx = SelfCallCtx { labels: &placeholder_labels, arities: &arities, struct_layouts: &struct_layouts };
     let mut sizes: Vec<usize> = Vec::with_capacity(scc_rules.len());
     for &r in scc_rules {
         let mut scratch = Vec::new();
@@ -3433,7 +3453,7 @@ fn emit_self_recursive_program<'a>(
         labels.insert(r.name.as_str(), next_offset);
         next_offset += sizes[i] as i32;
     }
-    let final_ctx = SelfCallCtx { labels: &labels, arities: &arities };
+    let final_ctx = SelfCallCtx { labels: &labels, arities: &arities, struct_layouts: &struct_layouts };
 
     // Pass 2: emit each callable with real labels.
     for &r in scc_rules {
@@ -3487,24 +3507,24 @@ fn emit_self_recursive_program<'a>(
             code.extend_from_slice(&[0x48, 0x81, 0xEC]);
             code.extend_from_slice(&frame_bytes.to_le_bytes());
         }
-        for (i, f) in concept.fields.iter().enumerate() {
-            let src = ctx.binding_offsets[f.name.as_str()];
-            if src >= -128 {
-                code.extend_from_slice(&[0x48, 0x8B, 0x45]);
-                code.push(src as u8);
+        let entry_layout = &struct_layouts[entry_rule.name.as_str()];
+        for (fname, s_off, is_text) in entry_layout {
+            if *is_text {
+                let src = ctx.binding_offsets[fname.as_str()];
+                // ptr: load argv pointer from prologue slot
+                load_rax_from_rbp(&mut code, src);
+                emit_store_rax_to_rsp(&mut code, *s_off);
+                // len: compute via strlen (prologue only stores ptr)
+                // mov rsi, rax (strlen reads rsi, writes rdx)
+                code.extend_from_slice(&[0x48, 0x89, 0xC6]);
+                emit_strlen(&mut code);
+                // mov rax, rdx (len into rax for store)
+                code.extend_from_slice(&[0x48, 0x89, 0xD0]);
+                emit_store_rax_to_rsp(&mut code, s_off + 8);
             } else {
-                code.extend_from_slice(&[0x48, 0x8B, 0x85]);
-                code.extend_from_slice(&src.to_le_bytes());
-            }
-            let dst = (i * 8) as i32;
-            if dst == 0 {
-                code.extend_from_slice(&[0x48, 0x89, 0x04, 0x24]);
-            } else if dst <= 127 {
-                code.extend_from_slice(&[0x48, 0x89, 0x44, 0x24]);
-                code.push(dst as u8);
-            } else {
-                code.extend_from_slice(&[0x48, 0x89, 0x84, 0x24]);
-                code.extend_from_slice(&dst.to_le_bytes());
+                let src = ctx.binding_offsets[fname.as_str()];
+                load_rax_from_rbp(&mut code, src);
+                emit_store_rax_to_rsp(&mut code, *s_off);
             }
         }
         // mov rdi, rsp
@@ -3600,7 +3620,9 @@ fn emit_callable_into<'a>(
     // field path of slice 5.1a; the difference is the slot holds an
     // INDEX semantically, not a value.
     let is_group_input = !concept.variants.is_empty();
-    let nfields = if is_group_input { 1 } else { concept.fields.len() };
+    let nfields = if is_group_input { 1 } else {
+        concept.fields.iter().map(|f| if matches!(f.ty, Type::Text) { 2usize } else { 1 }).sum()
+    };
     let is_multi_field = nfields > 1;
     // Phase B slice 4a.3 / 4c: count match arm binder SLOTS (not count).
     // Text binders need 2 slots (ptr + len); others need 1. Max across
@@ -3645,46 +3667,65 @@ fn emit_callable_into<'a>(
     if !is_multi_field {
         code.extend_from_slice(&[0x48, 0x89, 0x7D, 0xF8]); // mov [rbp - 8], rdi
     } else {
-        // Copy fields struct from [rdi + 8*i] to [rbp - 8*(i+1)].
-        for i in 0..nfields {
-            let src_off = (i * 8) as i32;
-            if src_off == 0 {
-                code.extend_from_slice(&[0x48, 0x8B, 0x07]);
-            } else if src_off <= 127 {
-                code.extend_from_slice(&[0x48, 0x8B, 0x47]);
-                code.push(src_off as u8);
-            } else {
-                code.extend_from_slice(&[0x48, 0x8B, 0x87]);
-                code.extend_from_slice(&src_off.to_le_bytes());
+        // Copy fields struct from [rdi + struct_off] to [rbp - slot_off].
+        // Type-aware: text fields copy 2 i64s (ptr, len).
+        let mut struct_off = 0i32;
+        let mut slot_idx = 0usize;
+        for f in &concept.fields {
+            let is_text = matches!(f.ty, Type::Text);
+            let n_copies = if is_text { 2 } else { 1 };
+            for j in 0..n_copies {
+                let src = struct_off + (j as i32) * 8;
+                // mov rax, [rdi + src]
+                if src == 0 {
+                    code.extend_from_slice(&[0x48, 0x8B, 0x07]);
+                } else if src <= 127 {
+                    code.extend_from_slice(&[0x48, 0x8B, 0x47]);
+                    code.push(src as u8);
+                } else {
+                    code.extend_from_slice(&[0x48, 0x8B, 0x87]);
+                    code.extend_from_slice(&src.to_le_bytes());
+                }
+                let dst = -(((slot_idx + j) as i32 + 1) * 8);
+                // mov [rbp + dst], rax
+                if dst >= -128 {
+                    code.extend_from_slice(&[0x48, 0x89, 0x45]);
+                    code.push(dst as u8);
+                } else {
+                    code.extend_from_slice(&[0x48, 0x89, 0x85]);
+                    code.extend_from_slice(&dst.to_le_bytes());
+                }
             }
-            let dst_off = -((i as i32 + 1) * 8);
-            if dst_off >= -128 {
-                code.extend_from_slice(&[0x48, 0x89, 0x45]);
-                code.push(dst_off as u8);
-            } else {
-                code.extend_from_slice(&[0x48, 0x89, 0x85]);
-                code.extend_from_slice(&dst_off.to_le_bytes());
-            }
+            struct_off += if is_text { 16 } else { 8 };
+            slot_idx += n_copies;
         }
     }
 
     // Build offsets / field_ranges maps for the body.
     let mut callable_offsets: HashMap<&str, i32> = HashMap::new();
     let mut callable_field_ranges: HashMap<&str, (i64, i64)> = HashMap::new();
+    let mut callable_text_bindings: TextBindings = TextBindings::new();
     if is_group_input {
-        // Map the input identifier directly to the single i64 slot.
-        // The match-variant dispatch loads this as the arena index.
         callable_offsets.insert(rule.input_name.as_str(), -8);
     } else {
-        for (i, f) in concept.fields.iter().enumerate() {
-            let off = -((i as i32 + 1) * 8);
-            callable_offsets.insert(f.name.as_str(), off);
-            if let Some((min, max)) = f.range {
-                callable_field_ranges.insert(f.name.as_str(), (min, max));
+        let mut slot_idx = 0usize;
+        for f in &concept.fields {
+            let is_text = matches!(f.ty, Type::Text);
+            if is_text {
+                let ptr_slot = -(((slot_idx) as i32 + 1) * 8);
+                let len_slot = -(((slot_idx + 1) as i32 + 1) * 8);
+                callable_text_bindings.insert(f.name.as_str(), (ptr_slot, len_slot));
+                slot_idx += 2;
+            } else {
+                let off = -((slot_idx as i32 + 1) * 8);
+                callable_offsets.insert(f.name.as_str(), off);
+                if let Some((min, max)) = f.range {
+                    callable_field_ranges.insert(f.name.as_str(), (min, max));
+                }
+                slot_idx += 1;
             }
         }
     }
-    let callable_text_bindings = TextBindings::new();
 
     // Phase B slice 4a.3 — build ArenaCtx for the callable's body when
     // a concept_group is declared. The arena's rbp_offset is invalid
@@ -9674,6 +9715,23 @@ fn store_rdi_at_rbp(code: &mut Vec<u8>, offset: i32) {
 
 /// Emit `mov rax, [rbp+offset]` — symmetric to `store_rax_at_rbp`. Short form
 /// (disp8) when the offset fits in an i8; otherwise the disp32 encoding.
+fn emit_copy_rbp_to_rsp(code: &mut Vec<u8>, rbp_off: i32, rsp_off: i32) {
+    load_rax_from_rbp(code, rbp_off);
+    emit_store_rax_to_rsp(code, rsp_off);
+}
+
+fn emit_store_rax_to_rsp(code: &mut Vec<u8>, rsp_off: i32) {
+    if rsp_off == 0 {
+        code.extend_from_slice(&[0x48, 0x89, 0x04, 0x24]);
+    } else if rsp_off <= 127 {
+        code.extend_from_slice(&[0x48, 0x89, 0x44, 0x24]);
+        code.push(rsp_off as u8);
+    } else {
+        code.extend_from_slice(&[0x48, 0x89, 0x84, 0x24]);
+        code.extend_from_slice(&rsp_off.to_le_bytes());
+    }
+}
+
 fn load_rax_from_rbp(code: &mut Vec<u8>, offset: i32) {
     if offset >= -128 {
         code.extend_from_slice(&[0x48, 0x8B, 0x45]);
@@ -10310,14 +10368,12 @@ fn try_static_condition(
 #[derive(Clone, Copy)]
 struct SelfCallCtx<'a> {
     labels: &'a HashMap<&'a str, i32>,
-    /// Phase B slice 4a.3: per-callable input arity (number of i64 slots
-    /// the ABI consumes; 1 for group-concept inputs, 1+ for record-concept
-    /// inputs). Populated by `emit_self_recursive_program` BEFORE the
-    /// callables emit, so cross-callable calls inside any body can pick
-    /// the right marshaling path. Empty for Phase A code paths that
-    /// haven't been migrated; consumers fall back to `offsets.len()` in
-    /// that case (preserving byte-for-byte Phase A behavior).
+    /// Per-callable input slot count (i64 units; text fields = 2, others = 1).
     arities: &'a HashMap<&'a str, usize>,
+    /// Per-callable struct layout: (field_name, struct_byte_offset, is_text).
+    /// Drives type-aware marshalling in the Call arm. Empty for legacy
+    /// Phase A paths; consumers fall back to the uniform-8B shortcut.
+    struct_layouts: &'a HashMap<&'a str, Vec<(String, i32, bool)>>,
 }
 
 /// Phase B slice 4a.2 — arena context for `VariantConstruct` emission.
@@ -10928,7 +10984,6 @@ fn emit_eval_expr(
                     // (callable's prologue placed field i at rbp - 8*(i+1)).
                     if multi_field {
                         let frame_bytes = (nfields * 8) as i32;
-                        // sub rsp, frame_bytes
                         if frame_bytes <= 127 {
                             code.extend_from_slice(&[0x48, 0x83, 0xEC]);
                             code.push(frame_bytes as u8);
@@ -10936,75 +10991,90 @@ fn emit_eval_expr(
                             code.extend_from_slice(&[0x48, 0x81, 0xEC]);
                             code.extend_from_slice(&frame_bytes.to_le_bytes());
                         }
+                        let callee_layout = ctx.struct_layouts.get(name.as_str());
                         match &args[0] {
                             Expr::Ident(n) if n == input_name => {
-                                // Pass-through: copy each rbp slot into
-                                // the corresponding struct slot.
-                                for (&name, &rbp_off) in offsets.iter() {
-                                    let _ = name;
-                                    let struct_off = -rbp_off - 8;
-                                    // mov rax, [rbp + rbp_off]
-                                    if rbp_off >= -128 {
-                                        code.extend_from_slice(&[0x48, 0x8B, 0x45]);
-                                        code.push(rbp_off as u8);
-                                    } else {
-                                        code.extend_from_slice(&[0x48, 0x8B, 0x85]);
-                                        code.extend_from_slice(&rbp_off.to_le_bytes());
+                                if let Some(layout) = callee_layout {
+                                    for (fname, s_off, is_text) in layout {
+                                        if *is_text {
+                                            if let Some(&(ptr_slot, len_slot)) = text_bindings.get(fname.as_str()) {
+                                                emit_copy_rbp_to_rsp(code, ptr_slot, *s_off);
+                                                emit_copy_rbp_to_rsp(code, len_slot, s_off + 8);
+                                            }
+                                        } else if let Some(&rbp_off) = offsets.get(fname.as_str()) {
+                                            emit_copy_rbp_to_rsp(code, rbp_off, *s_off);
+                                        }
                                     }
-                                    // mov [rsp + struct_off], rax
-                                    if struct_off == 0 {
-                                        code.extend_from_slice(&[0x48, 0x89, 0x04, 0x24]);
-                                    } else if struct_off <= 127 {
-                                        code.extend_from_slice(&[0x48, 0x89, 0x44, 0x24]);
-                                        code.push(struct_off as u8);
-                                    } else {
-                                        code.extend_from_slice(&[0x48, 0x89, 0x84, 0x24]);
-                                        code.extend_from_slice(&struct_off.to_le_bytes());
+                                } else {
+                                    for (_, &rbp_off) in offsets.iter() {
+                                        let struct_off = -rbp_off - 8;
+                                        emit_copy_rbp_to_rsp(code, rbp_off, struct_off);
                                     }
                                 }
                             }
                             Expr::Record(_concept_name, fields) => {
-                                if fields.len() != nfields {
-                                    return Err(NativeError {
-                                        message: format!(
-                                            "slice 5.3: recursive call's Record must have {} fields (concept arity), got {}",
-                                            nfields, fields.len()
-                                        ),
-                                    });
-                                }
-                                // Evaluate each field expression in source
-                                // order; place result at the struct offset
-                                // implied by the FIELD NAME (declaration
-                                // order), not the source order.
+                                let layout = callee_layout.ok_or_else(|| NativeError {
+                                    message: format!(
+                                        "multi-field Record call to '{}' requires struct_layout (internal error)",
+                                        name
+                                    ),
+                                })?;
                                 for (fname, fexpr) in fields {
-                                    let rbp_off = *offsets.get(fname.as_str()).ok_or_else(|| NativeError {
-                                        message: format!(
-                                            "slice 5.3: Record field '{}' is not a declared field of the input concept",
-                                            fname
-                                        ),
-                                    })?;
-                                    let struct_off = -rbp_off - 8;
-                                    emit_eval_expr(
-                                        code, fexpr, input_name, offsets,
-                                        all_rules, field_ranges, text_bindings,
-                                        self_call,
-                                        None,
-                                    )?;
-                                    if struct_off == 0 {
-                                        code.extend_from_slice(&[0x48, 0x89, 0x04, 0x24]);
-                                    } else if struct_off <= 127 {
-                                        code.extend_from_slice(&[0x48, 0x89, 0x44, 0x24]);
-                                        code.push(struct_off as u8);
+                                    let (_, s_off, is_text) = layout.iter()
+                                        .find(|(n, _, _)| n == fname)
+                                        .ok_or_else(|| NativeError {
+                                            message: format!(
+                                                "Record field '{}' not found in callee '{}' struct layout",
+                                                fname, name
+                                            ),
+                                        })?;
+                                    if *is_text {
+                                        match fexpr {
+                                            Expr::Field(base, field_name)
+                                                if matches!(base.as_ref(), Expr::Ident(ref n) if n == input_name) =>
+                                            {
+                                                if let Some(&(ptr_slot, len_slot)) = text_bindings.get(field_name.as_str()) {
+                                                    emit_copy_rbp_to_rsp(code, ptr_slot, *s_off);
+                                                    emit_copy_rbp_to_rsp(code, len_slot, s_off + 8);
+                                                } else {
+                                                    return Err(NativeError {
+                                                        message: format!(
+                                                            "text field '{}' references input field '{}' which is not in text_bindings",
+                                                            fname, field_name
+                                                        ),
+                                                    });
+                                                }
+                                            }
+                                            Expr::Ident(ref ident_name) if text_bindings.contains_key(ident_name.as_str()) => {
+                                                let &(ptr_slot, len_slot) = &text_bindings[ident_name.as_str()];
+                                                emit_copy_rbp_to_rsp(code, ptr_slot, *s_off);
+                                                emit_copy_rbp_to_rsp(code, len_slot, s_off + 8);
+                                            }
+                                            _ => {
+                                                return Err(NativeError {
+                                                    message: format!(
+                                                        "text field '{}' in Record constructor for recursive call to '{}': \
+                                                         only input field pass-through and BoundText are supported",
+                                                        fname, name
+                                                    ),
+                                                });
+                                            }
+                                        }
                                     } else {
-                                        code.extend_from_slice(&[0x48, 0x89, 0x84, 0x24]);
-                                        code.extend_from_slice(&struct_off.to_le_bytes());
+                                        emit_eval_expr(
+                                            code, fexpr, input_name, offsets,
+                                            all_rules, field_ranges, text_bindings,
+                                            self_call,
+                                            arena_ctx,
+                                        )?;
+                                        emit_store_rax_to_rsp(code, *s_off);
                                     }
                                 }
                             }
                             other => {
                                 return Err(NativeError {
                                     message: format!(
-                                        "slice 5.3: self-recursive call to '{}' arg must be Ident(input) or Record(input_concept, {{...}}) (got {:?})",
+                                        "self-recursive call to '{}' arg must be Ident(input) or Record(...) (got {:?})",
                                         name, other
                                     ),
                                 });
@@ -26840,5 +26910,67 @@ rule bad_fact
             !decreasing_errors.is_empty(),
             "bad_fact passes n.v (not n.v - k) — should be rejected by decreasing check"
         );
+    }
+
+    #[test]
+    fn text_input_recursive_callable_runtime() {
+        let src = r#"@verbose 0.1.0
+
+concept State
+  @intention: "scanner state"
+  @source: t.intent:1
+  fields:
+    source : text [..64]
+    pos : number [0, 64]
+
+rule count_a
+  @intention: "count occurrences of byte 97 (a) from pos onward"
+  @source: t.intent:1
+  input:
+    s : State
+  output:
+    out : number
+  logic:
+    out = if s.pos >= length(s.source) then 0 else if byte_at(s.source, s.pos) == 97 then 1 + count_a(State { source: s.source, pos: s.pos + 1 }) else count_a(State { source: s.source, pos: s.pos + 1 })
+  proofs:
+    purity:
+      reads : [s]
+      calls : [count_a]
+    termination:
+      bound : 100
+"#;
+        let tokens = crate::lexer::Lexer::new(src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+        let out = std::env::temp_dir().join("verbosec_test_text_input_recursive");
+        compile_native(&program, "count_a", out.to_str().unwrap(), false, false)
+            .expect("text input recursive callable must compile");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o755));
+        }
+        // count_a("banana", 0) → 3 ('a' at positions 1, 3, 5)
+        let output = std::process::Command::new(&out)
+            .args(&["banana", "0"])
+            .output()
+            .expect("native binary must run");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert_eq!(
+            stdout.as_ref(), "3\n",
+            "count_a(banana, 0) should find 3 'a' bytes, got {:?}",
+            stdout
+        );
+        // count_a("hello", 0) → 0
+        let output2 = std::process::Command::new(&out)
+            .args(&["hello", "0"])
+            .output()
+            .expect("native binary must run");
+        let stdout2 = String::from_utf8_lossy(&output2.stdout);
+        assert_eq!(
+            stdout2.as_ref(), "0\n",
+            "count_a(hello, 0) should find 0 'a' bytes, got {:?}",
+            stdout2
+        );
+        let _ = std::fs::remove_file(&out);
     }
 }
