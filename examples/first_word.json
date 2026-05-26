@@ -1,0 +1,6 @@
+[
+  {"source": "  hello world", "pos": 0},
+  {"source": "abc", "pos": 0},
+  {"source": "   ", "pos": 0},
+  {"source": "  XY", "pos": 0}
+]
