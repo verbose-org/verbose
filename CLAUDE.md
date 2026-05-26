@@ -508,6 +508,15 @@ examples/
                    verified for n ∈ {0, 1, 3, 5}: 1, 3, 7, 11.
                    First Verbose binary that stores and retrieves text
                    from an arena via the type-aware (ptr, len) layout.
+  scan_word.*      Self-hosting building block: recursive text scanner
+                   that counts consecutive lowercase letters starting at
+                   a given position. First Verbose recursive callable with
+                   a text input field (PR #52). `word_length(ScanState
+                   {source: text, pos: number})` recurses with `pos + 1`
+                   while `byte_at(source, pos)` is in [97, 122]. 921 B
+                   native binary; verified for "hello"/0 → 5, "  abc"/0
+                   → 0. Scanner primitive: combined with `substring`, this
+                   extracts identifiers from source text.
   demo.html        Browser demo (WASM)
 
 tools/

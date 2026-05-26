@@ -26973,4 +26973,38 @@ rule count_a
         );
         let _ = std::fs::remove_file(&out);
     }
+
+    #[test]
+    fn scan_word_native_runtime() {
+        let src = std::fs::read_to_string("examples/scan_word.verbose")
+            .expect("examples/scan_word.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+        let out = std::env::temp_dir().join("verbosec_test_scan_word");
+        compile_native(&program, "word_length", out.to_str().unwrap(), false, false)
+            .expect("scan_word must compile natively");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o755));
+        }
+        let cases: &[(&[&str], &str)] = &[
+            (&["hello", "0"], "5\n"),
+            (&["hello world", "6"], "5\n"),
+            (&["  abc", "0"], "0\n"),
+            (&["abc", "3"], "0\n"),
+        ];
+        for (args, expected) in cases {
+            let output = std::process::Command::new(&out)
+                .args(*args)
+                .output()
+                .expect("native binary must run");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert_eq!(
+                stdout.as_ref(), *expected,
+                "word_length({:?}) output mismatch", args
+            );
+        }
+        let _ = std::fs::remove_file(&out);
+    }
 }
