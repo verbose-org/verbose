@@ -308,14 +308,14 @@ fn compile_native_code(
         // instead of being inlined. This is gated on having a group:
         // legacy Phase A recursion (no group) stays on the existing
         // single-SCC discipline byte-for-byte.
-        let has_group = concept_group.is_some();
-        if has_group {
+        // Extend with every recursive rule transitively reachable from
+        // the entry. Originally gated on has_group (Phase B 4a.3); now
+        // unconditional so composition patterns (entry calls recursive
+        // helpers with let bindings) route through real `call` instead
+        // of inlining (the inline path ignores callee let bindings).
+        {
             let mut already_in: std::collections::HashSet<String> =
                 scc_rules_owned.iter().map(|r| r.name.clone()).collect();
-            // Forward-reachable set from entry, restricted to recursive
-            // rules (those that are themselves part of some cycle). The
-            // entry itself is always included even if not recursive — it
-            // needs a callable so cross-SCC calls hit a real label.
             let recursive_reachable =
                 collect_transitive_recursive_callees(rule, &rules);
             for name in &recursive_reachable {
@@ -328,6 +328,7 @@ fn compile_native_code(
                 }
             }
         }
+        let has_group = concept_group.is_some();
 
         // Slice 5.4 / 4a.3 constraint walk. Per-rule shape checks (no let
         // bindings, output type, field types). For non-group programs we
@@ -3530,8 +3531,15 @@ fn emit_self_recursive_program<'a>(
     // input read from argv into the synthetic slot keyed by the rule's
     // input_name. We use that slot here too.
     let entry_is_group = !concept.variants.is_empty();
+    // The entry rule's let bindings are handled by the callable's own
+    // prologue (emit_callable_into). Strip them here so the _start
+    // prologue doesn't try to evaluate them in a context without
+    // self_call (which would inline callees that expect callable-local
+    // let bindings).
+    let mut entry_for_prologue = entry_rule.clone();
+    entry_for_prologue.logic.bindings.clear();
     let ctx = emit_record_loop_prologue(
-        &mut code, entry_rule, concept, None, all_rules, all_resources, all_connections,
+        &mut code, &entry_for_prologue, concept, None, all_rules, all_resources, all_connections,
         concept_group,
     )?;
     if entry_is_group {
@@ -27196,6 +27204,37 @@ rule count_upper
             .expect("native binary must run");
         let stdout2 = String::from_utf8_lossy(&output2.stdout);
         assert_eq!(stdout2.as_ref(), "0\n", "count_upper(hello, 0) = 0, got {:?}", stdout2);
+        let _ = std::fs::remove_file(&out);
+    }
+
+    #[test]
+    fn first_word_composed_scanner_runtime() {
+        let src = std::fs::read_to_string("examples/first_word.verbose")
+            .expect("examples/first_word.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+        let out = std::env::temp_dir().join("verbosec_test_first_word");
+        compile_native(&program, "first_word_len", out.to_str().unwrap(), false, false)
+            .expect("first_word must compile natively");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o755));
+        }
+        let cases: &[(&[&str], &str)] = &[
+            (&["  hello world", "0"], "5\n"),
+            (&["abc", "0"], "3\n"),
+            (&["   ", "0"], "0\n"),
+            (&["  XY", "0"], "0\n"),
+        ];
+        for (args, expected) in cases {
+            let output = std::process::Command::new(&out)
+                .args(*args)
+                .output()
+                .expect("native binary must run");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert_eq!(stdout.as_ref(), *expected, "first_word_len({:?}) mismatch", args);
+        }
         let _ = std::fs::remove_file(&out);
     }
 }

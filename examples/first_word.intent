@@ -1,0 +1,4 @@
+Skip leading spaces, then measure the first word (consecutive lowercase letters).
+Composes two recursive callables via let bindings in a third.
+Expected: first_word("  hello world", 0) = 5, first_word("abc", 0) = 3,
+first_word("   ", 0) = 0, first_word("  XY", 0) = 0.
