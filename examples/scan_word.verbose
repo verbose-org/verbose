@@ -23,3 +23,4 @@ rule word_length
       calls : [word_length]
     termination:
       bound : 256
+      increasing : pos

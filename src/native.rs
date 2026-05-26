@@ -437,7 +437,8 @@ fn compile_native_code(
         // proven for the entry rule. The verifier already checked the
         // proof; here we just gate the warning on its absence.
         let has_termination_proof = rule.proofs.termination.structural.is_some()
-            || rule.proofs.termination.decreasing.is_some();
+            || rule.proofs.termination.decreasing.is_some()
+            || rule.proofs.termination.increasing.is_some();
         if !has_termination_proof {
             eprintln!(
                 "native: rule '{}' is recursive (cycle through '{}'); the declared `bound:` is NOT a termination proof for recursion. Runtime stack-overflow is the only safety signal until Phase C ships structural recursion. Use `--run` (interpreter) if you need an audit trace.",
