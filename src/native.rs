@@ -353,13 +353,20 @@ fn compile_native_code(
                     });
                 }
             }
-            if !r.logic.bindings.is_empty() {
-                return Err(NativeError {
-                    message: format!(
-                        "recursive rule '{}' must have no let bindings (text-let/concat in recursive body is forbidden until the stack-budget design lands).",
-                        r.name
-                    ),
-                });
+            // Let bindings: number lets allowed; text lets allowed only
+            // for allocation-free shapes (field pass-through, BoundText).
+            // Concat-producing text lets refused (stack buffer lifetime).
+            for (bname, bexpr) in &r.logic.bindings {
+                if callable_let_is_text(bexpr, r, &concepts) {
+                    if !callable_text_let_is_safe(bexpr) {
+                        return Err(NativeError {
+                            message: format!(
+                                "recursive rule '{}': text let '{}' uses concat or call (stack buffer not safe across recursive frames). Use a field pass-through or BoundText.",
+                                r.name, bname
+                            ),
+                        });
+                    }
+                }
             }
             // Per-rule input shape check: group-concept input is allowed
             // (single i64 index in rdi); record-concept input must have
@@ -1330,6 +1337,54 @@ fn collect_rule_read_names(rule: &Rule) -> Vec<String> {
 /// a cycle. Symmetric with classic strongly-connected-component
 /// detection, simplified because we only need a witness (any node on
 /// the cycle is enough for the breadcrumb).
+fn callable_let_is_text(expr: &Expr, rule: &Rule, concepts: &[&Concept]) -> bool {
+    let concept = match &rule.input_ty {
+        Type::Named(n) => concepts.iter().find(|c| c.name == *n).copied(),
+        _ => None,
+    };
+    match expr {
+        Expr::Text(_) => true,
+        Expr::Concat(_) => true,
+        Expr::Field(base, fname) => {
+            if matches!(base.as_ref(), Expr::Ident(ref n) if *n == rule.input_name) {
+                if let Some(c) = concept {
+                    c.fields.iter().any(|f| &f.name == fname && matches!(f.ty, Type::Text))
+                } else { false }
+            } else { false }
+        }
+        Expr::Substring(_, _, _) => true,
+        Expr::Ident(_) | Expr::Read(_) | Expr::Fetch(_, _) => true,
+        Expr::Call(name, _) => {
+            // A call returning text
+            false // conservative: treat as number, will fail at emit if wrong
+        }
+        _ => false,
+    }
+}
+
+fn callable_let_is_text_for_frame(expr: &Expr, concept: &Concept) -> bool {
+    match expr {
+        Expr::Text(_) | Expr::Concat(_) | Expr::Substring(_, _, _) => true,
+        Expr::Field(base, fname) => {
+            if matches!(base.as_ref(), Expr::Ident(_)) {
+                concept.fields.iter().any(|f| &f.name == fname && matches!(f.ty, Type::Text))
+            } else { false }
+        }
+        Expr::Read(_) | Expr::Fetch(_, _) => true,
+        Expr::Ident(_) => true, // conservative: might be text binding
+        _ => false,
+    }
+}
+
+fn callable_text_let_is_safe(expr: &Expr) -> bool {
+    match expr {
+        Expr::Concat(_) => false,
+        Expr::Call(_, _) => false,
+        Expr::Substring(inner, _, _) => callable_text_let_is_safe(inner),
+        _ => true,
+    }
+}
+
 fn detect_native_recursion(entry: &Rule, all_rules: &HashMap<&str, &Rule>) -> Option<String> {
     let mut on_stack: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut fully_done: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -3644,14 +3699,22 @@ fn emit_callable_into<'a>(
     } else {
         0
     };
+    // Classify let bindings for frame sizing.
+    let callable_binding_is_text: Vec<bool> = rule.logic.bindings.iter()
+        .map(|(_, expr)| callable_let_is_text_for_frame(expr, concept))
+        .collect();
+    let n_let_slots: usize = callable_binding_is_text.iter()
+        .map(|b| if *b { 2 } else { 1 })
+        .sum();
     // Frame layout:
-    //   [rbp - 8 .. rbp - 8*(nfields)]      input fields / index
-    //   [rbp - 8*(nfields+1) .. -8*(nfields+binder_slots)]  binder slots
-    //   [rbp - 8*(nfields+binder_slots+1) .. tmp slots]
+    //   [rbp - 8 .. -8*nfields]                    input fields / index
+    //   [rbp - 8*(nfields+1) .. -8*(nfields+lets)]  let binding slots
+    //   [rbp - ... binder_slots]                    MatchVariant binders
+    //   [rbp - ... tmp_slots]                       VariantConstruct pre-eval
     let binder_slot_base = -((nfields as i32 + 1) * 8);
     let _ = binder_slot_base;
-    let tmp_slot_base_local = -((nfields as i32 + max_arm_binder_slots as i32 + 1) * 8);
-    let total_slots = nfields + (max_arm_binder_slots as usize) + (tmp_slots as usize);
+    let tmp_slot_base_local = -((nfields as i32 + n_let_slots as i32 + max_arm_binder_slots as i32 + 1) * 8);
+    let total_slots = nfields + n_let_slots + (max_arm_binder_slots as usize) + (tmp_slots as usize);
     let frame_bytes = (total_slots * 8) as i32;
 
     // Prologue.
@@ -3723,6 +3786,78 @@ fn emit_callable_into<'a>(
                     callable_field_ranges.insert(f.name.as_str(), (min, max));
                 }
                 slot_idx += 1;
+            }
+        }
+    }
+
+    // Evaluate let bindings into successive rbp slots after input fields.
+    {
+        let mut let_slot_idx = nfields;
+        for (idx, (name, expr)) in rule.logic.bindings.iter().enumerate() {
+            if callable_binding_is_text[idx] {
+                // Text let: produce (rax=ptr, rdx=len) via inline emit.
+                // Only allocation-free shapes reach here (constraint
+                // enforced at compile_native_code).
+                match expr {
+                    Expr::Field(base, fname)
+                        if matches!(base.as_ref(), Expr::Ident(ref n) if *n == rule.input_name) =>
+                    {
+                        if let Some(&(ptr_slot, len_slot)) = callable_text_bindings.get(fname.as_str()) {
+                            load_rax_from_rbp(code, ptr_slot);
+                            let ptr_dst = -(((let_slot_idx) as i32 + 1) * 8);
+                            if ptr_dst >= -128 {
+                                code.extend_from_slice(&[0x48, 0x89, 0x45]);
+                                code.push(ptr_dst as u8);
+                            } else {
+                                code.extend_from_slice(&[0x48, 0x89, 0x85]);
+                                code.extend_from_slice(&ptr_dst.to_le_bytes());
+                            }
+                            load_rax_from_rbp(code, len_slot);
+                            let len_dst = -(((let_slot_idx + 1) as i32 + 1) * 8);
+                            if len_dst >= -128 {
+                                code.extend_from_slice(&[0x48, 0x89, 0x45]);
+                                code.push(len_dst as u8);
+                            } else {
+                                code.extend_from_slice(&[0x48, 0x89, 0x85]);
+                                code.extend_from_slice(&len_dst.to_le_bytes());
+                            }
+                            callable_text_bindings.insert(name.as_str(), (ptr_dst, len_dst));
+                        }
+                    }
+                    Expr::Ident(ref ident_name) if callable_text_bindings.contains_key(ident_name.as_str()) => {
+                        let &(src_ptr, src_len) = &callable_text_bindings[ident_name.as_str()];
+                        let ptr_dst = -(((let_slot_idx) as i32 + 1) * 8);
+                        let len_dst = -(((let_slot_idx + 1) as i32 + 1) * 8);
+                        load_rax_from_rbp(code, src_ptr);
+                        if ptr_dst >= -128 { code.extend_from_slice(&[0x48, 0x89, 0x45]); code.push(ptr_dst as u8); }
+                        else { code.extend_from_slice(&[0x48, 0x89, 0x85]); code.extend_from_slice(&ptr_dst.to_le_bytes()); }
+                        load_rax_from_rbp(code, src_len);
+                        if len_dst >= -128 { code.extend_from_slice(&[0x48, 0x89, 0x45]); code.push(len_dst as u8); }
+                        else { code.extend_from_slice(&[0x48, 0x89, 0x85]); code.extend_from_slice(&len_dst.to_le_bytes()); }
+                        callable_text_bindings.insert(name.as_str(), (ptr_dst, len_dst));
+                    }
+                    _ => {
+                        // Other safe text shapes can be added later.
+                    }
+                }
+                let_slot_idx += 2;
+            } else {
+                // Number let: evaluate → rax → store.
+                emit_eval_expr(
+                    code, expr, &rule.input_name, &callable_offsets,
+                    all_rules, &callable_field_ranges, &callable_text_bindings,
+                    Some(self_call), None,
+                )?;
+                let slot = -(((let_slot_idx) as i32 + 1) * 8);
+                if slot >= -128 {
+                    code.extend_from_slice(&[0x48, 0x89, 0x45]);
+                    code.push(slot as u8);
+                } else {
+                    code.extend_from_slice(&[0x48, 0x89, 0x85]);
+                    code.extend_from_slice(&slot.to_le_bytes());
+                }
+                callable_offsets.insert(name.as_str(), slot);
+                let_slot_idx += 1;
             }
         }
     }
@@ -27005,6 +27140,61 @@ rule count_a
                 "word_length({:?}) output mismatch", args
             );
         }
+        let _ = std::fs::remove_file(&out);
+    }
+
+    #[test]
+    fn let_bindings_in_recursive_callable_runtime() {
+        let src = r#"@verbose 0.1.0
+
+concept ScanState
+  @intention: "s"
+  @source: t.intent:1
+  fields:
+    source : text [..64]
+    pos : number [0, 64]
+
+rule count_upper
+  @intention: "count uppercase letters using a let binding for length"
+  @source: t.intent:1
+  input:
+    s : ScanState
+  output:
+    out : number
+  logic:
+    let len = length(s.source)
+    out = if s.pos >= len then 0 else if byte_at(s.source, s.pos) >= 65 and byte_at(s.source, s.pos) <= 90 then 1 + count_upper(ScanState { source: s.source, pos: s.pos + 1 }) else count_upper(ScanState { source: s.source, pos: s.pos + 1 })
+  proofs:
+    purity:
+      reads : [s.source, s.pos]
+      calls : [count_upper]
+    termination:
+      bound : 64
+"#;
+        let tokens = crate::lexer::Lexer::new(src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+        let out = std::env::temp_dir().join("verbosec_test_let_recursive");
+        compile_native(&program, "count_upper", out.to_str().unwrap(), false, false)
+            .expect("let bindings in recursive callable must compile");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o755));
+        }
+        // "HeLLo" has 3 uppercase: H, L, L
+        let output = std::process::Command::new(&out)
+            .args(&["HeLLo", "0"])
+            .output()
+            .expect("native binary must run");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert_eq!(stdout.as_ref(), "3\n", "count_upper(HeLLo, 0) = 3, got {:?}", stdout);
+        // "hello" has 0 uppercase
+        let output2 = std::process::Command::new(&out)
+            .args(&["hello", "0"])
+            .output()
+            .expect("native binary must run");
+        let stdout2 = String::from_utf8_lossy(&output2.stdout);
+        assert_eq!(stdout2.as_ref(), "0\n", "count_upper(hello, 0) = 0, got {:?}", stdout2);
         let _ = std::fs::remove_file(&out);
     }
 }
