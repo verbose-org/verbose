@@ -1460,6 +1460,7 @@ impl Parser {
         let mut bound = None;
         let mut structural = None;
         let mut decreasing = None;
+        let mut increasing = None;
 
         while !self.check_kind(&TokenKind::Dedent) && !self.at_eof() {
             let key = self.expect_ident_any()?;
@@ -1474,9 +1475,12 @@ impl Parser {
                 "decreasing" => {
                     decreasing = Some(self.expect_ident_any()?);
                 }
+                "increasing" => {
+                    increasing = Some(self.expect_ident_any()?);
+                }
                 _ => {
                     return Err(self.error(&format!(
-                        "unknown key '{}' in termination block (allowed: bound, structural, decreasing)",
+                        "unknown key '{}' in termination block (allowed: bound, structural, decreasing, increasing)",
                         key
                     )));
                 }
@@ -1485,7 +1489,7 @@ impl Parser {
         }
         self.expect_kind(TokenKind::Dedent)?;
 
-        Ok(Termination { bound, structural, decreasing })
+        Ok(Termination { bound, structural, decreasing, increasing })
     }
 
     fn parse_reaction(&mut self) -> Result<Reaction, ParseError> {

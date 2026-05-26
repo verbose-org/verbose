@@ -3416,6 +3416,10 @@ fn check_termination(
     if let Some(ref decreasing_field) = rule.proofs.termination.decreasing {
         check_decreasing_recursion(rule, decreasing_field, concepts, errors);
     }
+
+    if let Some(ref increasing_field) = rule.proofs.termination.increasing {
+        check_increasing_recursion(rule, increasing_field, concepts, errors);
+    }
 }
 
 fn check_structural_recursion(
@@ -3629,6 +3633,112 @@ fn is_decreasing_by_positive(expr: &Expr, input_name: &str, field_name: &str) ->
             );
             let right_is_positive = matches!(right.as_ref(), Expr::Number(k) if *k > 0);
             left_is_field && right_is_positive
+        }
+        _ => false,
+    }
+}
+
+fn check_increasing_recursion(
+    rule: &Rule,
+    field_name: &str,
+    concepts: &HashMap<String, &Concept>,
+    errors: &mut Vec<VerifyError>,
+) {
+    let ctx = |sub: &str| format!("rule '{}' / {}", rule.name, sub);
+    let concept_name = match &rule.input_ty {
+        Type::Named(n) => n.as_str(),
+        _ => {
+            errors.push(VerifyError {
+                context: ctx("termination.increasing"),
+                message: "increasing requires the input to be a named concept".into(),
+            });
+            return;
+        }
+    };
+    let concept = match concepts.get(concept_name) {
+        Some(c) => *c,
+        None => return,
+    };
+    let field = concept.fields.iter().find(|f| f.name == field_name);
+    match field {
+        Some(f) => {
+            if !matches!(f.ty, Type::Number) {
+                errors.push(VerifyError {
+                    context: ctx("termination.increasing"),
+                    message: format!(
+                        "field '{}' must be Number-typed for increasing proof (got {:?})",
+                        field_name, f.ty
+                    ),
+                });
+                return;
+            }
+            if f.range.is_none() {
+                errors.push(VerifyError {
+                    context: ctx("termination.increasing"),
+                    message: format!(
+                        "field '{}' must have a declared range [min, max] for increasing proof",
+                        field_name
+                    ),
+                });
+                return;
+            }
+        }
+        None => {
+            errors.push(VerifyError {
+                context: ctx("termination.increasing"),
+                message: format!("field '{}' not found on concept '{}'", field_name, concept_name),
+            });
+            return;
+        }
+    }
+    let mut call_args: Vec<(String, Expr)> = Vec::new();
+    collect_recursive_call_record_args(&rule.logic.value, &rule.name, &mut call_args);
+    for (callee, arg_expr) in &call_args {
+        if callee != &rule.name { continue; }
+        if let Expr::Record(_, fields) = arg_expr {
+            let field_expr = fields.iter().find(|(n, _)| n == field_name).map(|(_, e)| e);
+            match field_expr {
+                Some(e) if is_increasing_by_positive(e, &rule.input_name, field_name) => {}
+                Some(_) => {
+                    errors.push(VerifyError {
+                        context: ctx("termination.increasing"),
+                        message: format!(
+                            "recursive call to '{}' must pass '{}.{} + k' (k > 0) for field '{}'",
+                            rule.name, rule.input_name, field_name, field_name
+                        ),
+                    });
+                }
+                None => {
+                    errors.push(VerifyError {
+                        context: ctx("termination.increasing"),
+                        message: format!(
+                            "recursive call to '{}' passes a Record without field '{}'",
+                            rule.name, field_name
+                        ),
+                    });
+                }
+            }
+        }
+    }
+}
+
+fn is_increasing_by_positive(expr: &Expr, input_name: &str, field_name: &str) -> bool {
+    match expr {
+        Expr::Binary(BinOp::Add, left, right) => {
+            let left_is_field = matches!(left.as_ref(),
+                Expr::Field(base, fname)
+                if matches!(base.as_ref(), Expr::Ident(n) if n == input_name)
+                   && fname == field_name
+            );
+            let right_is_positive = matches!(right.as_ref(), Expr::Number(k) if *k > 0);
+            if left_is_field && right_is_positive { return true; }
+            let right_is_field = matches!(right.as_ref(),
+                Expr::Field(base, fname)
+                if matches!(base.as_ref(), Expr::Ident(n) if n == input_name)
+                   && fname == field_name
+            );
+            let left_is_positive = matches!(left.as_ref(), Expr::Number(k) if *k > 0);
+            right_is_field && left_is_positive
         }
         _ => false,
     }
