@@ -1,0 +1,97 @@
+@verbose 0.1.0
+
+concept_group Tokens [max_depth: 1, max_nodes: 10]
+  @intention: "Token variants for a tiny scanner"
+  @source: token_scan.intent:1
+
+  concept Token
+    @intention: "A scanned token"
+    @source: token_scan.intent:1
+    variants:
+      Word of (start : number, wlen : number)
+      Num of (value : number)
+      Eof
+
+concept ScanState
+  @intention: "Scanner position in source text"
+  @source: token_scan.intent:2
+  fields:
+    source : text [..256]
+    pos : number [0, 256]
+
+
+rule skip_spaces
+  @intention: "Advance past spaces"
+  @source: token_scan.intent:3
+  input:
+    s : ScanState
+  output:
+    out : number
+  logic:
+    let len = length(s.source)
+    out = if s.pos >= len then s.pos else if byte_at(s.source, s.pos) == 32 then skip_spaces(ScanState { source: s.source, pos: s.pos + 1 }) else s.pos
+  proofs:
+    purity:
+      reads : [s.source, s.pos]
+      calls : [skip_spaces]
+    termination:
+      bound : 256
+      increasing : pos
+
+
+rule word_length
+  @intention: "Count consecutive lowercase letters"
+  @source: token_scan.intent:3
+  input:
+    s : ScanState
+  output:
+    out : number
+  logic:
+    let len = length(s.source)
+    out = if s.pos >= len then 0 else if byte_at(s.source, s.pos) >= 97 and byte_at(s.source, s.pos) <= 122 then 1 + word_length(ScanState { source: s.source, pos: s.pos + 1 }) else 0
+  proofs:
+    purity:
+      reads : [s.source, s.pos]
+      calls : [word_length]
+    termination:
+      bound : 256
+      increasing : pos
+
+
+rule scan_token
+  @intention: "Produce the first token at the current position"
+  @source: token_scan.intent:4
+  input:
+    s : ScanState
+  output:
+    out : Token
+  logic:
+    let len = length(s.source)
+    let p = skip_spaces(s)
+    out = if p >= len then Token::Eof else if byte_at(s.source, p) >= 97 and byte_at(s.source, p) <= 122 then Token::Word { start: p, wlen: word_length(ScanState { source: s.source, pos: p }) } else if byte_at(s.source, p) >= 48 and byte_at(s.source, p) <= 57 then Token::Num { value: byte_at(s.source, p) - 48 } else Token::Eof
+  proofs:
+    purity:
+      reads : [s.source, s]
+      calls : [skip_spaces, word_length]
+    termination:
+      bound : 256
+
+
+rule classify
+  @intention: "Scan a token and return its payload as a number"
+  @source: token_scan.intent:5
+  input:
+    s : ScanState
+  output:
+    out : number
+  logic:
+    out = match scan_token(s):
+      Word(start, wlen) => wlen
+      Num(value) => value
+      Eof => 0
+  proofs:
+    purity:
+      reads : [s]
+      calls : [scan_token]
+    termination:
+      bound : 256

@@ -1,0 +1,5 @@
+Scan the first token from source text after skipping whitespace.
+Returns a Token variant: Word(start, len), Num(value), or Eof.
+classify returns: word length for Word, digit value for Num, 0 for Eof.
+Expected: classify("  hello", 0) = 5, classify("42x", 0) = 4,
+classify("   ", 0) = 0.

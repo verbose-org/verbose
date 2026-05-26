@@ -335,8 +335,11 @@ fn compile_native_code(
         // retain the original same-input/same-output check across the SCC.
         // For group programs each callable has its own input/output shape,
         // so those cross-rule equality checks are skipped.
+        let scc_names_vec = collect_scc_containing(rule, &rules);
+        let scc_names: std::collections::HashSet<String> = scc_names_vec.into_iter().collect();
         for r in &scc_rules_owned {
-            if !has_group {
+            let is_in_entry_scc = scc_names.contains(&r.name);
+            if !has_group && is_in_entry_scc {
                 if r.input_ty != rule.input_ty {
                     return Err(NativeError {
                         message: format!(
@@ -1534,13 +1537,17 @@ fn collect_transitive_recursive_callees(
             }
         }
     }
-    // Filter to recursive rules. A rule is recursive iff it can reach
-    // itself via Call edges. `detect_native_recursion` does exactly that
-    // (DFS finding a back edge); reuse it per-rule.
+    // Include rules that are recursive OR have let bindings. Recursive
+    // rules must be callables (can't inline a cycle). Rules with let
+    // bindings must also be callables because the inline path in
+    // emit_eval_expr's Call arm evaluates only logic.value, ignoring
+    // logic.bindings — inlining drops their let-bound names.
     let mut out: Vec<String> = Vec::new();
     for name in &forward {
         if let Some(&r) = all_rules.get(name.as_str()) {
-            if detect_native_recursion(r, all_rules).is_some() {
+            if detect_native_recursion(r, all_rules).is_some()
+                || !r.logic.bindings.is_empty()
+            {
                 out.push(name.clone());
             }
         }
@@ -27234,6 +27241,36 @@ rule count_upper
                 .expect("native binary must run");
             let stdout = String::from_utf8_lossy(&output.stdout);
             assert_eq!(stdout.as_ref(), *expected, "first_word_len({:?}) mismatch", args);
+        }
+        let _ = std::fs::remove_file(&out);
+    }
+
+    #[test]
+    fn token_scan_native_runtime() {
+        let src = std::fs::read_to_string("examples/token_scan.verbose")
+            .expect("examples/token_scan.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+        let out = std::env::temp_dir().join("verbosec_test_token_scan");
+        compile_native(&program, "classify", out.to_str().unwrap(), false, false)
+            .expect("token_scan::classify must compile natively");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o755));
+        }
+        let cases: &[(&[&str], &str)] = &[
+            (&["  hello", "0"], "5\n"),
+            (&["42x", "0"], "4\n"),
+            (&["   ", "0"], "0\n"),
+        ];
+        for (args, expected) in cases {
+            let output = std::process::Command::new(&out)
+                .args(*args)
+                .output()
+                .expect("native binary must run");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert_eq!(stdout.as_ref(), *expected, "classify({:?}) mismatch", args);
         }
         let _ = std::fs::remove_file(&out);
     }
