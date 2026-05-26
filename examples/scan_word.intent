@@ -1,0 +1,4 @@
+Find the length of the first word (consecutive lowercase letters) at a given position.
+Uses text input in a recursive callable (PR #52).
+Expected: scan_word("hello world", 0) = 5, scan_word("hello world", 6) = 5,
+scan_word("  abc", 0) = 0, scan_word("abc", 3) = 0.

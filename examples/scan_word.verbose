@@ -1,0 +1,25 @@
+@verbose 0.1.0
+
+concept ScanState
+  @intention: "Scanner position in a source text"
+  @source: scan_word.intent:1
+  fields:
+    source : text [..256]
+    pos : number [0, 256]
+
+
+rule word_length
+  @intention: "Count consecutive lowercase letters starting at pos"
+  @source: scan_word.intent:2
+  input:
+    s : ScanState
+  output:
+    out : number
+  logic:
+    out = if s.pos >= length(s.source) then 0 else if byte_at(s.source, s.pos) >= 97 and byte_at(s.source, s.pos) <= 122 then 1 + word_length(ScanState { source: s.source, pos: s.pos + 1 }) else 0
+  proofs:
+    purity:
+      reads : [s.source, s.pos]
+      calls : [word_length]
+    termination:
+      bound : 256
