@@ -1,0 +1,4 @@
+Count the number of tokens (words and digits) in a source string.
+Composes skip_spaces + word_length + recursive position advance.
+Expected: count_tokens("hello world", 0) = 2,
+count_tokens("42 abc", 0) = 3, count_tokens("   ", 0) = 0.

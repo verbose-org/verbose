@@ -27274,4 +27274,35 @@ rule count_upper
         }
         let _ = std::fs::remove_file(&out);
     }
+
+    #[test]
+    fn count_tokens_native_runtime() {
+        let src = std::fs::read_to_string("examples/count_tokens.verbose")
+            .expect("examples/count_tokens.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+        let out = std::env::temp_dir().join("verbosec_test_count_tokens");
+        compile_native(&program, "count_tokens", out.to_str().unwrap(), false, false)
+            .expect("count_tokens must compile natively");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o755));
+        }
+        let cases: &[(&[&str], &str)] = &[
+            (&["hello world", "0"], "2\n"),
+            (&["42 abc", "0"], "3\n"),
+            (&["   ", "0"], "0\n"),
+            (&["a b c", "0"], "3\n"),
+        ];
+        for (args, expected) in cases {
+            let output = std::process::Command::new(&out)
+                .args(*args)
+                .output()
+                .expect("native binary must run");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert_eq!(stdout.as_ref(), *expected, "count_tokens({:?}) mismatch", args);
+        }
+        let _ = std::fs::remove_file(&out);
+    }
 }
