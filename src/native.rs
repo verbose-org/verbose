@@ -11599,13 +11599,72 @@ fn emit_eval_expr(
                             emit_strlen(code);
                             code.extend_from_slice(&[0x48, 0x89, 0xF0]); // mov rax, rsi
                         }
+                        Expr::Substring(ref inner_text, ref start_expr, ref end_expr) => {
+                            // Recursive: produce (rax, rdx) for the inner
+                            // text, then slice via bounds-check helper.
+                            // Zero-copy: result points into the source
+                            // buffer, so the arena entry is safe.
+                            fn emit_arena_text_inner(
+                                code: &mut Vec<u8>,
+                                expr: &Expr,
+                                input_name: &str,
+                                offsets: &HashMap<&str, i32>,
+                                text_bindings: &TextBindings<'_>,
+                            ) -> Result<(), NativeError> {
+                                match expr {
+                                    Expr::Field(base, field_name)
+                                        if matches!(base.as_ref(), Expr::Ident(ref n) if n == input_name) =>
+                                    {
+                                        if let Some(&(ptr_slot, len_slot)) = text_bindings.get(field_name.as_str()) {
+                                            load_rax_from_rbp(code, ptr_slot);
+                                            if len_slot >= -128 {
+                                                code.extend_from_slice(&[0x48, 0x8B, 0x55]);
+                                                code.push(len_slot as u8);
+                                            } else {
+                                                code.extend_from_slice(&[0x48, 0x8B, 0x95]);
+                                                code.extend_from_slice(&len_slot.to_le_bytes());
+                                            }
+                                            return Ok(());
+                                        }
+                                        let offset = *offsets.get(field_name.as_str()).ok_or_else(|| NativeError {
+                                            message: format!("substring inner: unknown field '{}'", field_name),
+                                        })?;
+                                        load_rax_from_rbp(code, offset);
+                                        code.extend_from_slice(&[0x48, 0x89, 0xC6]);
+                                        emit_strlen(code);
+                                        code.extend_from_slice(&[0x48, 0x89, 0xF0]);
+                                        Ok(())
+                                    }
+                                    Expr::Ident(ref name) if text_bindings.contains_key(name.as_str()) => {
+                                        let &(ptr_slot, len_slot) = &text_bindings[name.as_str()];
+                                        load_rax_from_rbp(code, ptr_slot);
+                                        if len_slot >= -128 {
+                                            code.extend_from_slice(&[0x48, 0x8B, 0x55]);
+                                            code.push(len_slot as u8);
+                                        } else {
+                                            code.extend_from_slice(&[0x48, 0x8B, 0x95]);
+                                            code.extend_from_slice(&len_slot.to_le_bytes());
+                                        }
+                                        Ok(())
+                                    }
+                                    _ => Err(NativeError {
+                                        message: "substring inner text in VariantConstruct: only input field and BoundText supported".into(),
+                                    }),
+                                }
+                            }
+                            emit_arena_text_inner(code, inner_text, input_name, offsets, text_bindings)?;
+                            emit_substring_bounds_and_slice(
+                                code, start_expr, end_expr,
+                                input_name, offsets, all_rules, field_ranges, text_bindings,
+                            )?;
+                        }
                         _ => {
                             return Err(NativeError {
                                 message: format!(
                                     "native VariantConstruct '{}::{}': text field '{}' has an expression shape \
                                      not yet supported in arena storage (concat and call are not arena-safe \
                                      — their stack buffers are freed before the arena entry is consumed). \
-                                     Use a literal, input field, read(), or BoundText. Use --run for now.",
+                                     Use a literal, input field, read(), substring, or BoundText. Use --run for now.",
                                     concept_name, variant_name, decl_name
                                 ),
                             });
@@ -27302,6 +27361,36 @@ rule count_upper
                 .expect("native binary must run");
             let stdout = String::from_utf8_lossy(&output.stdout);
             assert_eq!(stdout.as_ref(), *expected, "count_tokens({:?}) mismatch", args);
+        }
+        let _ = std::fs::remove_file(&out);
+    }
+
+    #[test]
+    fn scan_lexeme_substring_in_variant_runtime() {
+        let src = std::fs::read_to_string("examples/scan_lexeme.verbose")
+            .expect("examples/scan_lexeme.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+        let out = std::env::temp_dir().join("verbosec_test_scan_lexeme");
+        compile_native(&program, "scan_label", out.to_str().unwrap(), false, false)
+            .expect("scan_lexeme must compile natively");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o755));
+        }
+        let cases: &[(&[&str], &str)] = &[
+            (&["  hello", "0"], "5\n"),
+            (&["42x", "0"], "0\n"),
+            (&["abc def", "0"], "3\n"),
+        ];
+        for (args, expected) in cases {
+            let output = std::process::Command::new(&out)
+                .args(*args)
+                .output()
+                .expect("native binary must run");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert_eq!(stdout.as_ref(), *expected, "scan_label({:?}) mismatch", args);
         }
         let _ = std::fs::remove_file(&out);
     }
