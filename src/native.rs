@@ -166,17 +166,10 @@ fn compile_native_code(
             ),
         });
     } else if let Some(g) = groups.first() {
-        if g.concepts.len() != 1 {
-            return Err(NativeError {
-                message: format!(
-                    "native: concept_group '{}' declares {} concepts; B.4a.1 supports \
-                     single-concept groups only. Multi-concept groups (mutual type \
-                     recursion in one arena) land in B.4b — needs tag namespace and \
-                     arena partitioning design.",
-                    g.name, g.concepts.len()
-                ),
-            });
-        }
+        // Phase B.4b: multi-concept groups now supported. The tag
+        // namespace is flat across all variants (verifier rejects
+        // collisions). Arena entry size is the max across all
+        // concepts' variants.
         Some(*g)
     } else {
         None
@@ -774,7 +767,7 @@ struct RecordLoopCtx<'a> {
     /// type whose `Type::Named(...)` payload field counts as a self-
     /// reference for arena indexing). Empty string when no group is
     /// declared.
-    group_concept_name: &'a str,
+    group_concept_names: HashSet<&'a str>,
     /// Phase B slice 4a.2: cap on arena entries (`max_nodes` from the
     /// group declaration). 0 when no group is declared.
     arena_max_nodes: u32,
@@ -2664,36 +2657,32 @@ fn find_group_match_variant_in_expr(
 /// Slice 4c: text-typed payload fields use 16 bytes (ptr, len) instead
 /// of 8. Entry size is `1 + sum(field_widths)` for the variant with
 /// the largest payload, rounded up to 8.
-fn arena_field_byte_width(ty: &Type, group_concept_name: &str) -> i32 {
+fn arena_field_byte_width(ty: &Type, group_names: &HashSet<&str>) -> i32 {
     match ty {
         Type::Text => 16,
         Type::Number | Type::Bool => 8,
-        Type::Named(n) if n == group_concept_name => 8,
+        Type::Named(n) if group_names.contains(n.as_str()) => 8,
         _ => 8,
     }
 }
 
-fn arena_variant_payload_bytes(fields: &[Field], group_concept_name: &str) -> i32 {
-    fields.iter().map(|f| arena_field_byte_width(&f.ty, group_concept_name)).sum()
+fn arena_variant_payload_bytes(fields: &[Field], group_names: &HashSet<&str>) -> i32 {
+    fields.iter().map(|f| arena_field_byte_width(&f.ty, group_names)).sum()
 }
 
-fn arena_field_offset(fields: &[(String, Type)], field_index: usize, group_concept_name: &str) -> i32 {
+fn arena_field_offset(fields: &[(String, Type)], field_index: usize, group_names: &HashSet<&str>) -> i32 {
     let mut off = 8i32;
     for i in 0..field_index {
-        off += arena_field_byte_width(&fields[i].1, group_concept_name);
+        off += arena_field_byte_width(&fields[i].1, group_names);
     }
     off
 }
 
 fn compute_arena_entry_size(group: &ConceptGroup) -> i32 {
-    let concept = match group.concepts.first() {
-        Some(c) => c,
-        None => return 0,
-    };
-    let max_payload_bytes: i32 = concept
-        .variants
-        .iter()
-        .map(|v| arena_variant_payload_bytes(&v.fields, &concept.name))
+    let gnames: HashSet<&str> = group.concepts.iter().map(|c| c.name.as_str()).collect();
+    let max_payload_bytes: i32 = group.concepts.iter()
+        .flat_map(|c| c.variants.iter())
+        .map(|v| arena_variant_payload_bytes(&v.fields, &gnames))
         .max()
         .unwrap_or(0);
     let raw = 1 + max_payload_bytes;
@@ -2819,11 +2808,11 @@ fn emit_record_loop_prologue<'a>(
     // the variant with the largest total payload bytes.
     let tmp_slot_extra_bytes: i32 = match concept_group {
         Some(g) => if arena_size > 0 {
-            g.concepts.first()
-                .map(|c| c.variants.iter()
-                    .map(|v| arena_variant_payload_bytes(&v.fields, &c.name))
-                    .max().unwrap_or(0))
-                .unwrap_or(0)
+            let gn: HashSet<&str> = g.concepts.iter().map(|c| c.name.as_str()).collect();
+            g.concepts.iter()
+                .flat_map(|c| c.variants.iter())
+                .map(|v| arena_variant_payload_bytes(&v.fields, &gn))
+                .max().unwrap_or(0)
         } else { 0 },
         None => 0,
     };
@@ -3205,26 +3194,28 @@ fn emit_record_loop_prologue<'a>(
     // Phase B slice 4a.2 — variant tag map + field-shape snapshot for
     // the only group concept (when one is declared). Tags are assigned
     // in declaration order starting at 0. Empty otherwise.
-    let (variant_tags, variant_fields, group_concept_name, arena_max_nodes) = match concept_group {
-        Some(g) => match g.concepts.first() {
-            Some(c) => {
-                let mut tags: HashMap<&str, u8> = HashMap::new();
-                let mut fields: HashMap<&str, Vec<(String, Type)>> = HashMap::new();
-                for (idx, v) in c.variants.iter().enumerate() {
-                    tags.insert(v.name.as_str(), idx as u8);
+    // Phase B slice 4b: tag map + field-shape snapshot across ALL concepts
+    // in the group. Tags assigned in declaration order across all variants
+    // of all concepts (global namespace — verifier rejects collisions).
+    let (variant_tags, variant_fields, group_concept_names_owned, arena_max_nodes) = match concept_group {
+        Some(g) => {
+            let mut tags: HashMap<&str, u8> = HashMap::new();
+            let mut fields: HashMap<&str, Vec<(String, Type)>> = HashMap::new();
+            let mut tag_idx: u8 = 0;
+            for c in &g.concepts {
+                for v in &c.variants {
+                    tags.insert(v.name.as_str(), tag_idx);
                     fields.insert(
                         v.name.as_str(),
-                        v.fields
-                            .iter()
-                            .map(|f| (f.name.clone(), f.ty.clone()))
-                            .collect(),
+                        v.fields.iter().map(|f| (f.name.clone(), f.ty.clone())).collect(),
                     );
+                    tag_idx += 1;
                 }
-                (tags, fields, c.name.as_str(), g.max_nodes)
             }
-            None => (HashMap::new(), HashMap::new(), "", 0u32),
+            let names: HashSet<&str> = g.concepts.iter().map(|c| c.name.as_str()).collect();
+            (tags, fields, names, g.max_nodes)
         },
-        None => (HashMap::new(), HashMap::new(), "", 0u32),
+        None => (HashMap::new(), HashMap::new(), HashSet::new(), 0u32),
     };
 
     Ok(RecordLoopCtx {
@@ -3248,7 +3239,7 @@ fn emit_record_loop_prologue<'a>(
         tmp_slot_base,
         variant_tags,
         variant_fields,
-        group_concept_name,
+        group_concept_names: group_concept_names_owned,
         arena_max_nodes,
     })
 }
@@ -3704,10 +3695,11 @@ fn emit_callable_into<'a>(
     let needs_tmp_pool = body_contains_variant_construct(&rule.logic.value);
     let tmp_slots: i32 = if needs_tmp_pool {
         concept_group
-            .and_then(|g| g.concepts.first())
-            .map(|c| {
-                let max_bytes: i32 = c.variants.iter()
-                    .map(|v| arena_variant_payload_bytes(&v.fields, &c.name))
+            .map(|g| {
+                let gn: HashSet<&str> = g.concepts.iter().map(|c| c.name.as_str()).collect();
+                let max_bytes: i32 = g.concepts.iter()
+                    .flat_map(|c| c.variants.iter())
+                    .map(|v| arena_variant_payload_bytes(&v.fields, &gn))
                     .max().unwrap_or(0);
                 max_bytes / 8
             })
@@ -3883,23 +3875,24 @@ fn emit_callable_into<'a>(
     // inside the callable (different rbp); the in-callable variant
     // skips the reload and TRUSTS r11 (caller set it up; no syscalls
     // in recursive bodies). Tag/field maps come from the group.
-    let arena_holder: Option<(HashMap<&str, u8>, HashMap<&str, Vec<(String, Type)>>, &str, u32, i32, i32)>;
+    let arena_holder: Option<(HashMap<&str, u8>, HashMap<&str, Vec<(String, Type)>>, HashSet<&str>, u32, i32, i32)>;
     if let Some(g) = concept_group {
-        if let Some(group_concept) = g.concepts.first() {
-            let mut tags: HashMap<&str, u8> = HashMap::new();
-            let mut fields_map: HashMap<&str, Vec<(String, Type)>> = HashMap::new();
-            for (idx, v) in group_concept.variants.iter().enumerate() {
-                tags.insert(v.name.as_str(), idx as u8);
+        let mut tags: HashMap<&str, u8> = HashMap::new();
+        let mut fields_map: HashMap<&str, Vec<(String, Type)>> = HashMap::new();
+        let mut tag_idx: u8 = 0;
+        for c in &g.concepts {
+            for v in &c.variants {
+                tags.insert(v.name.as_str(), tag_idx);
                 fields_map.insert(
                     v.name.as_str(),
                     v.fields.iter().map(|f| (f.name.clone(), f.ty.clone())).collect(),
                 );
+                tag_idx += 1;
             }
-            let entry_size = compute_arena_entry_size(g);
-            arena_holder = Some((tags, fields_map, group_concept.name.as_str(), g.max_nodes, entry_size, tmp_slots));
-        } else {
-            arena_holder = None;
         }
+        let gnames: HashSet<&str> = g.concepts.iter().map(|c| c.name.as_str()).collect();
+        let entry_size = compute_arena_entry_size(g);
+        arena_holder = Some((tags, fields_map, gnames, g.max_nodes, entry_size, tmp_slots));
     } else {
         arena_holder = None;
     }
@@ -3917,7 +3910,7 @@ fn emit_callable_into<'a>(
         // to TRUST r11 instead of reloading from the (now-stale) outer
         // rbp. The MatchVariant arena dispatch uses entry_size + tag/
         // field maps directly.
-        let arena_ctx_owned = arena_holder.as_ref().map(|(tags, fields_map, gname, max_nodes, entry_size, tmp_slots_val)| {
+        let arena_ctx_owned = arena_holder.as_ref().map(|(tags, fields_map, gnames, max_nodes, entry_size, tmp_slots_val)| {
             ArenaCtx {
                 arena_rbp_offset: i32::MAX,
                 node_count_slot: 0,
@@ -3926,7 +3919,7 @@ fn emit_callable_into<'a>(
                 tmp_slot_base: tmp_slot_base_local,
                 variant_tags: tags,
                 variant_fields: fields_map,
-                group_concept_name: gname,
+                group_concept_names: gnames.clone(),
                 arena_abort_patches: std::cell::RefCell::new(Vec::new()),
                 in_callable: true,
                 callable_node_count_seed: *tmp_slots_val,
@@ -10681,7 +10674,7 @@ struct ArenaCtx<'a> {
     /// The single group concept's name (slice 4a.2 ships single-concept
     /// groups only). Used to recognize `Type::Named(group)` payload
     /// fields as self-references during emit.
-    group_concept_name: &'a str,
+    group_concept_names: HashSet<&'a str>,
     /// Patch sites for arena-overflow `jae rel32` jumps. Grown by
     /// VariantConstruct emit; drained by the caller into
     /// `RecordLoopCtx.arena_abort_patches` once the top-level
@@ -10746,7 +10739,7 @@ impl<'a> ArenaCtx<'a> {
             tmp_slot_base: ctx.tmp_slot_base,
             variant_tags: &ctx.variant_tags,
             variant_fields: &ctx.variant_fields,
-            group_concept_name: ctx.group_concept_name,
+            group_concept_names: ctx.group_concept_names.clone(),
             arena_abort_patches: std::cell::RefCell::new(Vec::new()),
             in_callable: false,
             callable_node_count_seed: 0,
@@ -11570,8 +11563,8 @@ fn emit_eval_expr(
             // a clear error rather than silently emitting garbage.
             let tag = *ac.variant_tags.get(variant_name.as_str()).ok_or_else(|| NativeError {
                 message: format!(
-                    "native VariantConstruct: unknown variant '{}' on concept '{}' (group: '{}')",
-                    variant_name, concept_name, ac.group_concept_name
+                    "native VariantConstruct: unknown variant '{}' on concept '{}' (group: {:?})",
+                    variant_name, concept_name, ac.group_concept_names
                 ),
             })?;
             let declared_fields = ac.variant_fields.get(variant_name.as_str()).ok_or_else(|| NativeError {
@@ -11595,7 +11588,7 @@ fn emit_eval_expr(
                 match decl_ty {
                     Type::Number | Type::Bool => {}
                     Type::Text => {}
-                    Type::Named(n) if n == ac.group_concept_name => {}
+                    Type::Named(n) if ac.group_concept_names.contains(n.as_str()) => {}
                     Type::Collection(_) => {
                         return Err(NativeError {
                             message: format!(
@@ -11873,7 +11866,7 @@ fn emit_eval_expr(
             // reverse declared order; write each to its arena offset.
             for i in (0..declared_fields.len()).rev() {
                 let (_, ref decl_ty) = declared_fields[i];
-                let arena_off = arena_field_offset(declared_fields, i, ac.group_concept_name);
+                let arena_off = arena_field_offset(declared_fields, i, &ac.group_concept_names);
                 if matches!(decl_ty, Type::Text) {
                     // pop rdx (len was pushed second → on top)
                     code.push(0x5A);
@@ -12033,8 +12026,8 @@ fn emit_eval_expr(
                     let is_last_arm = arm_idx + 1 == n_arms;
                     let tag = *ac.variant_tags.get(arm.variant_name.as_str()).ok_or_else(|| NativeError {
                         message: format!(
-                            "MatchVariant: arm references unknown variant '{}' for group '{}'",
-                            arm.variant_name, ac.group_concept_name
+                            "MatchVariant: arm references unknown variant '{}' for group {:?}",
+                            arm.variant_name, ac.group_concept_names
                         ),
                     })?;
                     let declared_fields = ac.variant_fields.get(arm.variant_name.as_str()).ok_or_else(|| NativeError {
@@ -12071,7 +12064,7 @@ fn emit_eval_expr(
                     for (i, binder_opt) in arm.binders.iter().enumerate() {
                         let field_ty = &declared_fields[i].1;
                         let is_text = matches!(field_ty, Type::Text);
-                        let arena_off = arena_field_offset(declared_fields, i, ac.group_concept_name);
+                        let arena_off = arena_field_offset(declared_fields, i, &ac.group_concept_names);
                         if let Some(binder_name) = binder_opt {
                             if is_text {
                                 // Load ptr from [rax + arena_off]
@@ -26651,11 +26644,11 @@ rule eval_two_arm
     /// namespace and arena partitioning, so the slice constraint
     /// caps at one concept per group.
     #[test]
-    fn phase_b4a1_multi_concept_group_refused() {
+    fn phase_b4b_multi_concept_group_compiles() {
         let src = r#"@verbose 0.1.0
 
 concept_group AST [max_depth: 10, max_nodes: 32]
-  @intention: "two-concept group — refused in 4a.1"
+  @intention: "two-concept group — accepted in B.4b"
   @source: t.intent:1
 
   concept Expr
@@ -26696,20 +26689,10 @@ rule scalar
 "#;
         let tokens = crate::lexer::Lexer::new(src).tokenize().expect("tokenize");
         let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
-        let out = std::env::temp_dir().join("verbosec_test_b4a1_multi_concept_refused");
-        let err = compile_native(&program, "scalar", out.to_str().unwrap(), false, false)
-            .expect_err("multi-concept group must be refused in slice 4a.1");
-        let msg = err.message;
-        assert!(
-            msg.contains("B.4b") || msg.contains("4b"),
-            "refusal must point at slice B.4b; got: {}",
-            msg
-        );
-        assert!(
-            msg.contains("Multi-concept") || msg.contains("multi-concept") || msg.contains("single-concept"),
-            "refusal must mention the multi-concept restriction; got: {}",
-            msg
-        );
+        let out = std::env::temp_dir().join("verbosec_test_b4b_multi_concept");
+        compile_native(&program, "scalar", out.to_str().unwrap(), false, false)
+            .expect("multi-concept group must compile in B.4b");
+        let _ = std::fs::metadata(&out).expect("binary should exist");
         let _ = std::fs::remove_file(&out);
     }
 
