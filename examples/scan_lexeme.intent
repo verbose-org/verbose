@@ -1,0 +1,4 @@
+Scan the first token and extract its text via substring.
+Token::Word carries the lexeme as a text payload.
+scan_label returns length of the extracted lexeme (0 for non-word).
+Expected: scan_label("  hello", 0) = 5, scan_label("42x", 0) = 0.
