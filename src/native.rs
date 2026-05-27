@@ -4171,14 +4171,63 @@ fn emit_recursive_text_body(
             // Both slice-5.1a (Ident pass-through) and slice-5.1b (Record
             // construction) shapes work — the inner expression evaluates
             // to a Number that becomes the next recursion's input.
-            match &args[0] {
-                Expr::Ident(n) if n == input_name => {
-                    if offsets.len() != 1 {
+            let callee_arity = self_call.arities.get(name.as_str()).copied().unwrap_or(1);
+            let multi_field = callee_arity > 1;
+            if multi_field {
+                let frame_bytes = (callee_arity * 8) as i32;
+                if frame_bytes <= 127 {
+                    code.extend_from_slice(&[0x48, 0x83, 0xEC]);
+                    code.push(frame_bytes as u8);
+                } else {
+                    code.extend_from_slice(&[0x48, 0x81, 0xEC]);
+                    code.extend_from_slice(&frame_bytes.to_le_bytes());
+                }
+                let callee_layout = self_call.struct_layouts.get(name.as_str());
+                match &args[0] {
+                    Expr::Ident(n) if n == input_name => {
+                        if let Some(layout) = callee_layout {
+                            for (fname, s_off, is_text) in layout {
+                                if *is_text {
+                                    if let Some(&(ptr_slot, len_slot)) = text_bindings.get(fname.as_str()) {
+                                        emit_copy_rbp_to_rsp(code, ptr_slot, *s_off);
+                                        emit_copy_rbp_to_rsp(code, len_slot, s_off + 8);
+                                    }
+                                } else if let Some(&rbp_off) = offsets.get(fname.as_str()) {
+                                    emit_copy_rbp_to_rsp(code, rbp_off, *s_off);
+                                }
+                            }
+                        }
+                    }
+                    _ => {
                         return Err(NativeError {
-                            message: "slice 5.2: recursive call expects single-field input".into(),
+                            message: format!(
+                                "text-return multi-field call to '{}': only Ident(input) pass-through supported",
+                                name
+                            ),
                         });
                     }
-                    let field_offset = *offsets.values().next().unwrap();
+                }
+                code.extend_from_slice(&[0x48, 0x89, 0xE7]); // mov rdi, rsp
+                code.push(0xE8);
+                let call_end = (code.len() + 4) as i32;
+                let rel32 = target_offset - call_end;
+                code.extend_from_slice(&rel32.to_le_bytes());
+                if frame_bytes <= 127 {
+                    code.extend_from_slice(&[0x48, 0x83, 0xC4]);
+                    code.push(frame_bytes as u8);
+                } else {
+                    code.extend_from_slice(&[0x48, 0x81, 0xC4]);
+                    code.extend_from_slice(&frame_bytes.to_le_bytes());
+                }
+                return Ok(());
+            }
+            match &args[0] {
+                Expr::Ident(n) if n == input_name => {
+                    let field_offset = if let Some(&o) = offsets.get(input_name) {
+                        o
+                    } else {
+                        *offsets.values().next().unwrap()
+                    };
                     if field_offset >= -128 {
                         code.extend_from_slice(&[0x48, 0x8B, 0x7D]);
                         code.push(field_offset as u8);
@@ -4190,7 +4239,7 @@ fn emit_recursive_text_body(
                 Expr::Record(_concept_name, fields) => {
                     if fields.len() != 1 {
                         return Err(NativeError {
-                            message: "slice 5.2: recursive Record must have exactly 1 field".into(),
+                            message: "text-return single-field recursive Record must have 1 field".into(),
                         });
                     }
                     let (_, field_expr) = &fields[0];
@@ -4203,12 +4252,13 @@ fn emit_recursive_text_body(
                     code.extend_from_slice(&[0x48, 0x89, 0xC7]); // mov rdi, rax
                 }
                 other => {
-                    return Err(NativeError {
-                        message: format!(
-                            "slice 5.2: recursive call arg must be Ident(input) or Record(_, {{ field: expr }}); got {:?}",
-                            other
-                        ),
-                    });
+                    emit_eval_expr(
+                        code, &args[0], input_name, offsets,
+                        all_rules, field_ranges, text_bindings,
+                        Some(self_call),
+                        None,
+                    )?;
+                    code.extend_from_slice(&[0x48, 0x89, 0xC7]); // mov rdi, rax
                 }
             }
             // call <target_offset>: rel32 to the callable's prologue.
@@ -4257,9 +4307,55 @@ fn emit_recursive_text_body(
             code[end_patch..end_patch + 4].copy_from_slice(&end_off.to_le_bytes());
             Ok(())
         }
+        Expr::Ident(name) if text_bindings.contains_key(name.as_str()) => {
+            let &(ptr_slot, len_slot) = &text_bindings[name.as_str()];
+            load_rax_from_rbp(code, ptr_slot);
+            if len_slot >= -128 {
+                code.extend_from_slice(&[0x48, 0x8B, 0x55]);
+                code.push(len_slot as u8);
+            } else {
+                code.extend_from_slice(&[0x48, 0x8B, 0x95]);
+                code.extend_from_slice(&len_slot.to_le_bytes());
+            }
+            Ok(())
+        }
+        Expr::Field(base, field_name)
+            if matches!(base.as_ref(), Expr::Ident(ref n) if n == input_name) =>
+        {
+            if let Some(&(ptr_slot, len_slot)) = text_bindings.get(field_name.as_str()) {
+                load_rax_from_rbp(code, ptr_slot);
+                if len_slot >= -128 {
+                    code.extend_from_slice(&[0x48, 0x8B, 0x55]);
+                    code.push(len_slot as u8);
+                } else {
+                    code.extend_from_slice(&[0x48, 0x8B, 0x95]);
+                    code.extend_from_slice(&len_slot.to_le_bytes());
+                }
+                return Ok(());
+            }
+            let offset = *offsets.get(field_name.as_str()).ok_or_else(|| NativeError {
+                message: format!("text-return body: unknown field '{}'", field_name),
+            })?;
+            load_rax_from_rbp(code, offset);
+            code.extend_from_slice(&[0x48, 0x89, 0xC6]); // mov rsi, rax
+            emit_strlen(code);
+            code.extend_from_slice(&[0x48, 0x89, 0xF0]); // mov rax, rsi
+            Ok(())
+        }
+        Expr::Substring(inner_text, start_expr, end_expr) => {
+            emit_recursive_text_body(
+                code, inner_text, input_name, offsets, all_rules,
+                field_ranges, text_bindings, self_call,
+            )?;
+            emit_substring_bounds_and_slice(
+                code, start_expr, end_expr,
+                input_name, offsets, all_rules, field_ranges, text_bindings,
+            )
+        }
         other => Err(NativeError {
             message: format!(
-                "slice 5.2: text-returning recursive body grammar is `Text literal | self-call | if/else`; got {:?}",
+                "text-returning recursive body: unsupported expression {:?}; \
+                 supported: literal, self-call, if/else, BoundText, Field, substring",
                 other
             ),
         }),
@@ -27392,6 +27488,86 @@ rule count_upper
             let stdout = String::from_utf8_lossy(&output.stdout);
             assert_eq!(stdout.as_ref(), *expected, "scan_label({:?}) mismatch", args);
         }
+        let _ = std::fs::remove_file(&out);
+    }
+
+    #[test]
+    fn text_return_text_input_callable_runtime() {
+        let src = r#"@verbose 0.1.0
+
+concept ScanState
+  @intention: "s"
+  @source: t.intent:1
+  fields:
+    source : text [..64]
+    pos : number [0, 64]
+
+rule word_length
+  @intention: "count lowercase letters"
+  @source: t.intent:1
+  input:
+    s : ScanState
+  output:
+    out : number
+  logic:
+    let len = length(s.source)
+    out = if s.pos >= len then 0 else if byte_at(s.source, s.pos) >= 97 and byte_at(s.source, s.pos) <= 122 then 1 + word_length(ScanState { source: s.source, pos: s.pos + 1 }) else 0
+  proofs:
+    purity:
+      reads : [s.source, s.pos]
+      calls : [word_length]
+    termination:
+      bound : 64
+      increasing : pos
+
+rule extract_word
+  @intention: "extract first word as text via substring"
+  @source: t.intent:1
+  input:
+    s : ScanState
+  output:
+    out : text
+  logic:
+    let wlen = word_length(s)
+    out = if wlen > 0 then substring(s.source, s.pos, s.pos + wlen) else ""
+  proofs:
+    purity:
+      reads : [s.source, s]
+      calls : [word_length]
+    termination:
+      bound : 64
+"#;
+        let tokens = crate::lexer::Lexer::new(src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+        let out = std::env::temp_dir().join("verbosec_test_text_return_text_input");
+        compile_native(&program, "extract_word", out.to_str().unwrap(), false, false)
+            .expect("text-return + text-input callable must compile");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o755));
+        }
+        // extract_word("hello world", 0) → "hello"
+        let output = std::process::Command::new(&out)
+            .args(&["hello world", "0"])
+            .output()
+            .expect("native binary must run");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert_eq!(stdout.as_ref(), "hello\n", "extract_word(hello world, 0) = hello, got {:?}", stdout);
+        // extract_word("  xyz", 2) → "xyz"
+        let output2 = std::process::Command::new(&out)
+            .args(&["  xyz", "2"])
+            .output()
+            .expect("native binary must run");
+        let stdout2 = String::from_utf8_lossy(&output2.stdout);
+        assert_eq!(stdout2.as_ref(), "xyz\n", "extract_word(  xyz, 2) = xyz, got {:?}", stdout2);
+        // extract_word("123", 0) → ""
+        let output3 = std::process::Command::new(&out)
+            .args(&["123", "0"])
+            .output()
+            .expect("native binary must run");
+        let stdout3 = String::from_utf8_lossy(&output3.stdout);
+        assert_eq!(stdout3.as_ref(), "\n", "extract_word(123, 0) = empty, got {:?}", stdout3);
         let _ = std::fs::remove_file(&out);
     }
 }
