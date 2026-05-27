@@ -1,0 +1,5 @@
+Parse a decimal number from source text, skipping leading spaces.
+scan_digits accumulates value digit by digit via byte_at.
+read_number composes skip_spaces + scan_digits.
+Expected: read_number("  42 ", 0) = 42, read_number("123", 0) = 123,
+read_number("  0", 0) = 0, read_number("  ", 0) = 0.
