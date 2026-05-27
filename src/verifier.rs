@@ -1540,6 +1540,30 @@ fn verify_concept_group(
             }
         }
     }
+
+    // Phase B slice 4b: variant names must be unique across all concepts
+    // in the group. The native emitter uses a flat variant-name → tag
+    // map; collisions would make MatchVariant dispatch ambiguous.
+    let mut seen_variants: HashMap<&str, &str> = HashMap::new();
+    for c in &g.concepts {
+        for v in &c.variants {
+            if let Some(prev_concept) = seen_variants.get(v.name.as_str()) {
+                errors.push(VerifyError {
+                    context: format!(
+                        "concept_group '{}' / concept '{}' / variant '{}'",
+                        g.name, c.name, v.name
+                    ),
+                    message: format!(
+                        "variant name '{}' collides with a variant in concept '{}' — \
+                         variant names must be unique across all concepts in a concept_group",
+                        v.name, prev_concept
+                    ),
+                });
+            } else {
+                seen_variants.insert(v.name.as_str(), c.name.as_str());
+            }
+        }
+    }
 }
 
 /// Phase B slice 1: helper for `verify_concept_group`. Walks a variant
