@@ -1,0 +1,72 @@
+@verbose 0.1.0
+
+concept ScanState
+  @intention: "Scanner position"
+  @source: read_number.intent:1
+  fields:
+    source : text [..256]
+    pos : number [0, 256]
+
+concept DigitScan
+  @intention: "Digit scanner with accumulator"
+  @source: read_number.intent:2
+  fields:
+    source : text [..256]
+    pos : number [0, 256]
+    acc : number [0, 999999]
+
+
+rule skip_spaces
+  @intention: "Advance past spaces"
+  @source: read_number.intent:2
+  input:
+    s : ScanState
+  output:
+    out : number
+  logic:
+    let len = length(s.source)
+    out = if s.pos >= len then s.pos else if byte_at(s.source, s.pos) == 32 then skip_spaces(ScanState { source: s.source, pos: s.pos + 1 }) else s.pos
+  proofs:
+    purity:
+      reads : [s.source, s.pos]
+      calls : [skip_spaces]
+    termination:
+      bound : 256
+      increasing : pos
+
+
+rule scan_digits
+  @intention: "Accumulate decimal digits into a number"
+  @source: read_number.intent:3
+  input:
+    d : DigitScan
+  output:
+    out : number
+  logic:
+    let len = length(d.source)
+    out = if d.pos >= len then d.acc else if byte_at(d.source, d.pos) >= 48 and byte_at(d.source, d.pos) <= 57 then scan_digits(DigitScan { source: d.source, pos: d.pos + 1, acc: d.acc * 10 + byte_at(d.source, d.pos) - 48 }) else d.acc
+  proofs:
+    purity:
+      reads : [d.source, d.pos, d.acc]
+      calls : [scan_digits]
+    termination:
+      bound : 256
+      increasing : pos
+
+
+rule read_number
+  @intention: "Skip spaces then parse a decimal number"
+  @source: read_number.intent:4
+  input:
+    s : ScanState
+  output:
+    out : number
+  logic:
+    let p = skip_spaces(s)
+    out = scan_digits(DigitScan { source: s.source, pos: p, acc: 0 })
+  proofs:
+    purity:
+      reads : [s.source, s]
+      calls : [skip_spaces, scan_digits]
+    termination:
+      bound : 256

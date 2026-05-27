@@ -1,0 +1,6 @@
+[
+  {"source": "add 3 5", "pos": 0},
+  {"source": "neg 7", "pos": 0},
+  {"source": "42", "pos": 0},
+  {"source": "add 10 20", "pos": 0}
+]

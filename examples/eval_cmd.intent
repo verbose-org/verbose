@@ -1,0 +1,5 @@
+Evaluate a simple command: "add X Y" returns X+Y, "neg X" returns -X,
+bare number "X" returns X. Composes skip_spaces + word_length +
+scan_digits + substring for command detection.
+Expected: eval_cmd("add 3 5", 0) = 8, eval_cmd("neg 7", 0) = -7,
+eval_cmd("42", 0) = 42, eval_cmd("add 10 20", 0) = 30.

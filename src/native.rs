@@ -27582,4 +27582,35 @@ rule extract_word
         }
         let _ = std::fs::remove_file(&out);
     }
+
+    #[test]
+    fn eval_cmd_native_runtime() {
+        let src = std::fs::read_to_string("examples/eval_cmd.verbose")
+            .expect("examples/eval_cmd.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+        let out = std::env::temp_dir().join("verbosec_test_eval_cmd");
+        compile_native(&program, "eval_cmd", out.to_str().unwrap(), false, false)
+            .expect("eval_cmd must compile natively");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o755));
+        }
+        let cases: &[(&[&str], &str)] = &[
+            (&["add 3 5", "0"], "8\n"),
+            (&["neg 7", "0"], "-7\n"),
+            (&["42", "0"], "42\n"),
+            (&["add 10 20", "0"], "30\n"),
+        ];
+        for (args, expected) in cases {
+            let output = std::process::Command::new(&out)
+                .args(*args)
+                .output()
+                .expect("native binary must run");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert_eq!(stdout.as_ref(), *expected, "eval_cmd({:?}) mismatch", args);
+        }
+        let _ = std::fs::remove_file(&out);
+    }
 }
