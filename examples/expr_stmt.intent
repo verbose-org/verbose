@@ -1,0 +1,4 @@
+Two-concept group: Expr (Num, Neg) and Stmt (Eval, Seq).
+eval_expr walks an Expr tree; count_stmts counts Stmt nodes.
+compose builds a Stmt tree and counts it.
+Expected: compose(0) = 1, compose(1) = 2, compose(3) = 4.

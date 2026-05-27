@@ -1,0 +1,100 @@
+@verbose 0.1.0
+
+concept_group AST [max_depth: 10, max_nodes: 50]
+  @intention: "Two-concept group: expressions and statements"
+  @source: expr_stmt.intent:1
+
+  concept Expr
+    @intention: "A numeric expression"
+    @source: expr_stmt.intent:1
+    variants:
+      Num of (value : number)
+      Neg of (inner : Expr)
+
+  concept Stmt
+    @intention: "A statement containing an expression"
+    @source: expr_stmt.intent:1
+    variants:
+      Eval of (arg : Expr)
+      Seq of (first : Stmt, second : Stmt)
+
+concept Seed
+  @intention: "Input depth"
+  @source: expr_stmt.intent:2
+  fields:
+    n : number [0, 5]
+
+
+rule eval_expr
+  @intention: "Evaluate an Expr to a number"
+  @source: expr_stmt.intent:3
+  input:
+    e : Expr
+  output:
+    out : number
+  logic:
+    out = match e:
+      Num(value) => value
+      Neg(inner) => 0 - eval_expr(inner)
+  proofs:
+    purity:
+      reads : [e]
+      calls : [eval_expr]
+    termination:
+      bound : 50
+      structural : e
+
+
+rule count_stmts
+  @intention: "Count the number of Stmt nodes in a tree"
+  @source: expr_stmt.intent:3
+  input:
+    s : Stmt
+  output:
+    out : number
+  logic:
+    out = match s:
+      Eval(arg) => 1
+      Seq(first, second) => 1 + count_stmts(first) + count_stmts(second)
+  proofs:
+    purity:
+      reads : [s]
+      calls : [count_stmts]
+    termination:
+      bound : 50
+      structural : s
+
+
+rule build_stmt
+  @intention: "Build a Stmt tree of depth n"
+  @source: expr_stmt.intent:4
+  input:
+    seed : Seed
+  output:
+    out : Stmt
+  logic:
+    out = if seed.n == 0 then Stmt::Eval { arg: Expr::Num { value: 42 } } else Stmt::Seq { first: build_stmt(Seed { n: seed.n - 1 }), second: Stmt::Eval { arg: Expr::Neg { inner: Expr::Num { value: seed.n } } } }
+  proofs:
+    purity:
+      reads : [seed.n]
+      calls : [build_stmt]
+    termination:
+      bound : 50
+      decreasing : n
+
+
+rule compose
+  @intention: "Build a statement tree then count its nodes"
+  @source: expr_stmt.intent:4
+  input:
+    seed : Seed
+  output:
+    out : number
+  logic:
+    out = count_stmts(build_stmt(seed))
+  proofs:
+    purity:
+      reads : [seed]
+      calls : [build_stmt, count_stmts]
+    termination:
+      bound : 50

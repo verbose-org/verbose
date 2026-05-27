@@ -27553,4 +27553,33 @@ rule extract_word
         assert_eq!(stdout3.as_ref(), "\n", "extract_word(123, 0) = empty, got {:?}", stdout3);
         let _ = std::fs::remove_file(&out);
     }
+
+    #[test]
+    fn phase_b4b_expr_stmt_runtime() {
+        let src = std::fs::read_to_string("examples/expr_stmt.verbose")
+            .expect("examples/expr_stmt.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+        let out = std::env::temp_dir().join("verbosec_test_expr_stmt");
+        compile_native(&program, "compose", out.to_str().unwrap(), false, false)
+            .expect("multi-concept group expr_stmt must compile");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o755));
+        }
+        let cases: &[(&str, &str)] = &[("0", "1\n"), ("1", "3\n"), ("3", "7\n")];
+        for (arg, expected) in cases {
+            let output = std::process::Command::new(&out)
+                .arg(arg)
+                .output()
+                .expect("native binary must run");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert_eq!(
+                stdout.as_ref(), *expected,
+                "compose({}) mismatch", arg
+            );
+        }
+        let _ = std::fs::remove_file(&out);
+    }
 }
