@@ -27941,4 +27941,56 @@ rule extract_word
         );
         let _ = std::fs::remove_file(&out);
     }
+
+    /// Generic SHA-256: hash any text input (up to 55 bytes, single block).
+    /// The same compiled binary processes different argv inputs; each output
+    /// matches `echo -n <input> | sha256sum` byte-for-byte for "abc",
+    /// "hello", and empty string. Validates runtime W[0..15] packing from
+    /// padded bytes + W[16..63] extension via sliding window.
+    #[test]
+    fn sha256_text_matches_sha256sum_for_multiple_inputs() {
+        let handle = std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(sha256_text_test_body)
+            .expect("spawn test thread");
+        handle.join().expect("test thread panicked");
+    }
+
+    fn sha256_text_test_body() {
+        let src = std::fs::read_to_string("examples/sha256_text.verbose")
+            .expect("examples/sha256_text.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+        let out = std::env::temp_dir().join("verbosec_test_sha256_text");
+        compile_native(&program, "sha256_word", out.to_str().unwrap(), false, false)
+            .expect("sha256_word (generic) must compile");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o755));
+        }
+        let inputs = [
+            ("abc",   "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"),
+            ("hello", "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"),
+            ("",      "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"),
+        ];
+        for (input, expected_hex) in &inputs {
+            let mut hex_acc = String::new();
+            for i in 0..8 {
+                let i_str = i.to_string();
+                let output = std::process::Command::new(&out)
+                    .args(&[*input, i_str.as_str()])
+                    .output()
+                    .expect("native binary must run");
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let val: u64 = stdout.trim().parse().expect("parse word");
+                hex_acc.push_str(&format!("{:08x}", val));
+            }
+            assert_eq!(
+                hex_acc, *expected_hex,
+                "SHA-256({:?}) mismatch with sha256sum", input
+            );
+        }
+        let _ = std::fs::remove_file(&out);
+    }
 }
