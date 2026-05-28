@@ -27879,4 +27879,66 @@ rule extract_word
         );
         let _ = std::fs::remove_file(&out);
     }
+
+    /// Full 256-bit SHA-256 hash of "abc" — runs the parameterized binary
+    /// 8 times (argv = 0..7), concatenates the words as hex, compares
+    /// against `echo -n abc | sha256sum`. Byte-for-byte match.
+    #[test]
+    fn sha256_full_256bit_matches_sha256sum() {
+        let handle = std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(sha256_full_test_body)
+            .expect("spawn test thread");
+        handle.join().expect("test thread panicked");
+    }
+
+    fn sha256_full_test_body() {
+        let src = std::fs::read_to_string("examples/sha256_full.verbose")
+            .expect("examples/sha256_full.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+        let out = std::env::temp_dir().join("verbosec_test_sha256_full");
+        compile_native(&program, "sha256_word", out.to_str().unwrap(), false, false)
+            .expect("sha256_word must compile");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o755));
+        }
+        // SHA-256("abc") = ba7816bf 8f01cfea 414140de 5dae2223
+        //                  b00361a3 96177a9c b410ff61 f20015ad
+        let expected = [
+            (0, "3128432319"), // 0xba7816bf
+            (1, "2399260650"), // 0x8f01cfea
+            (2, "1094795486"), // 0x414140de
+            (3, "1571693091"), // 0x5dae2223
+            (4, "2953011619"), // 0xb00361a3
+            (5, "2518121116"), // 0x96177a9c
+            (6, "3021012833"), // 0xb410ff61
+            (7, "4060091821"), // 0xf20015ad
+        ];
+        let mut hex_acc = String::new();
+        for (i, expected_val) in &expected {
+            let output = std::process::Command::new(&out)
+                .arg(i.to_string())
+                .output()
+                .expect("native binary must run");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stdout = stdout.trim();
+            assert_eq!(
+                stdout, *expected_val,
+                "SHA-256('abc') word {} mismatch: got {}, expected {}",
+                i, stdout, expected_val
+            );
+            let val: u64 = stdout.parse().expect("parse word");
+            hex_acc.push_str(&format!("{:08x}", val));
+        }
+        // Full hash must equal `echo -n abc | sha256sum` output.
+        assert_eq!(
+            hex_acc,
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+            "Concatenated SHA-256('abc') hex mismatch with sha256sum"
+        );
+        let _ = std::fs::remove_file(&out);
+    }
 }
