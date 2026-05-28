@@ -1,0 +1,5 @@
+Full SHA-256 of "abc" in Verbose, parameterized on which 32-bit word
+to extract (0..7). Running the binary 8 times with argv 0..7 yields
+all 256 bits, matching `echo -n abc | sha256sum` byte-for-byte.
+sha256_word(0)=0xba7816bf, sha256_word(1)=0x8f01cfea, etc.
+End-to-end demonstration of crypto in Verbose.
