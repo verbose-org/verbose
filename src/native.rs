@@ -27833,4 +27833,50 @@ rule extract_word
             let _ = std::fs::remove_file(&out);
         }
     }
+
+    /// THE crypto demo: full SHA-256 of "abc" in Verbose. Aggregates all
+    /// the building blocks (bitwise primitives → rotr32 → ch/maj/sigmas →
+    /// 64-round compression loop → K[i]/W[i] lookups) into a single
+    /// recursive callable that produces the first 32-bit word of the hash.
+    /// Compares against `echo -n abc | sha256sum` → ba7816bf... → first
+    /// word = 0xba7816bf = 3128432319.
+    ///
+    /// Runs on a dedicated thread with a 16 MiB stack — the 64-deep
+    /// nested if/else for K[i]/W[i] lookups recurses through the
+    /// compiler's tree walkers and overflows the 2 MiB default test stack.
+    #[test]
+    fn sha256_abc_matches_sha256sum() {
+        let handle = std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(sha256_abc_test_body)
+            .expect("spawn test thread");
+        handle.join().expect("test thread panicked");
+    }
+
+    fn sha256_abc_test_body() {
+        let src = std::fs::read_to_string("examples/sha256_abc.verbose")
+            .expect("examples/sha256_abc.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+        let out = std::env::temp_dir().join("verbosec_test_sha256_abc");
+        compile_native(&program, "sha256_abc", out.to_str().unwrap(), false, false)
+            .expect("sha256_abc must compile");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o755));
+        }
+        let output = std::process::Command::new(&out)
+            .arg("0")
+            .output()
+            .expect("native binary must run");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        // First 32-bit word of SHA-256("abc") = 0xba7816bf = 3128432319.
+        // Matches `echo -n abc | sha256sum` which starts with ba7816bf.
+        assert_eq!(
+            stdout.as_ref(), "3128432319\n",
+            "SHA-256('abc') first word mismatch with sha256sum (expected 0xba7816bf)"
+        );
+        let _ = std::fs::remove_file(&out);
+    }
 }

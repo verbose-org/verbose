@@ -4567,6 +4567,14 @@ rule layered_caller
 
     #[test]
     fn all_examples_with_json_run_without_panicking() {
+        let handle = std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(all_examples_with_json_body)
+            .expect("spawn test thread");
+        handle.join().expect("test thread panicked");
+    }
+
+    fn all_examples_with_json_body() {
         // Integration guard: every .verbose file with a matching .json must
         // execute without runtime panic. Value::Err (a declared failure path)
         // is allowed — only eval_rule returning Err (missing field, type
@@ -4659,6 +4667,17 @@ rule layered_caller
 
     #[test]
     fn all_example_verbose_files_parse_and_verify() {
+        // Run on a dedicated 16 MiB stack — examples like sha256_abc.verbose
+        // have 64-deep nested if/else chains that recurse through the
+        // verifier's tree walkers and overflow the 2 MiB default test stack.
+        let handle = std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(all_example_verbose_files_parse_and_verify_body)
+            .expect("spawn test thread");
+        handle.join().expect("test thread panicked");
+    }
+
+    fn all_example_verbose_files_parse_and_verify_body() {
         // Integration guard: every file under examples/ that ends in .verbose
         // must parse cleanly and verify with zero errors. If this test goes
         // red, an example or the language has drifted — the failing file name
