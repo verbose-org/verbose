@@ -27793,4 +27793,44 @@ rule extract_word
             let _ = std::fs::remove_file(&out);
         }
     }
+
+    /// SHA-256 round 0 of hash("abc"): the new `a` and `e` after applying
+    /// the compression formula with initial H values + K[0] + W[0].
+    /// Validates the full round formula composing big_sigma0/1, ch, maj.
+    /// Python hashlib reference: new_a = 0x5d6aebcd, new_e = 0xfa2a4622.
+    /// The final SHA-256("abc") = ba7816bf8f01cfea... starts with 0xba7816bf
+    /// after all 64 rounds; this slice validates round 0 of 64.
+    #[test]
+    fn sha256_round_zero_matches_python() {
+        let src = std::fs::read_to_string("examples/sha256_round.verbose")
+            .expect("examples/sha256_round.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+        // Initial SHA-256 hash values H[0..7] + W[0] for "abc" + K[0].
+        let args = vec![
+            "1779033703", "3144134277", "1013904242", "2773480762",
+            "1359893119", "2600822924", "528734635", "1541459225",
+            "1633837952", "1116352408",
+        ];
+        for (rule, expected) in &[("new_a", "1567288269\n"), ("new_e", "4197074466\n")] {
+            let out = std::env::temp_dir().join(format!("verbosec_test_sha_round_{}", rule));
+            compile_native(&program, rule, out.to_str().unwrap(), false, false)
+                .expect("SHA-256 round must compile");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o755));
+            }
+            let output = std::process::Command::new(&out)
+                .args(&args)
+                .output()
+                .expect("native binary must run");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert_eq!(
+                stdout.as_ref(), *expected,
+                "{} for SHA-256 round 0 of 'abc' mismatch with Python", rule
+            );
+            let _ = std::fs::remove_file(&out);
+        }
+    }
 }
