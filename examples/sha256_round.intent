@@ -1,0 +1,5 @@
+SHA-256 compression round: given (a..h, w, k), compute the new a and e
+using the standard SHA-256 round formula.
+Validated against Python hashlib for round 0 of SHA-256("abc") with
+initial H values + W[0]=0x61626380 + K[0]=0x428a2f98:
+  new_a = 0x5d6aebcd, new_e = 0xfa2a4622.
