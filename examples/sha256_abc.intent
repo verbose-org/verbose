@@ -1,0 +1,5 @@
+Full SHA-256 of "abc" in Verbose. Combines all primitives (rotr32,
+ch, maj, sigmas), K[i]/W[i] lookups via 64-way if/else helpers, and
+a 64-iteration recursive compression loop.
+sha256_abc() returns the first 32-bit word of SHA-256("abc").
+Expected: 0xba7816bf = 3128432319, matching `echo -n abc | sha256sum`.
