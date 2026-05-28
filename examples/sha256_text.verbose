@@ -1,0 +1,394 @@
+@verbose 0.1.0
+
+concept Source
+  @intention: "input message + which 32-bit word to return"
+  @source: sha256_text.intent:1
+  fields:
+    source : text [..55]
+    which : number [0, 7]
+
+concept Idx
+  @intention: "round/W index 0..63"
+  @source: sha256_text.intent:1
+  fields:
+    i : number [0, 63]
+
+concept WordAndShift
+  @intention: "word + shift count"
+  @source: sha256_text.intent:1
+  fields:
+    x : number [0, 4294967295]
+    n : number [0, 31]
+
+concept OneWord
+  @intention: "single 32-bit word"
+  @source: sha256_text.intent:1
+  fields:
+    x : number [0, 4294967295]
+
+concept ThreeWords
+  @intention: "three 32-bit words"
+  @source: sha256_text.intent:1
+  fields:
+    x : number [0, 4294967295]
+    y : number [0, 4294967295]
+    z : number [0, 4294967295]
+
+concept PaddedByteAt
+  @intention: "i-th byte of the SHA-256 padded block"
+  @source: sha256_text.intent:1
+  fields:
+    source : text [..55]
+    len : number [0, 55]
+    pos : number [0, 63]
+
+concept WordInit
+  @intention: "i-th initial W value (0..15) from padded message"
+  @source: sha256_text.intent:1
+  fields:
+    source : text [..55]
+    len : number [0, 55]
+    i : number [0, 15]
+
+concept State
+  @intention: "8 working words + 16 W sliding window + round + which"
+  @source: sha256_text.intent:1
+  fields:
+    a : number [0, 4294967295]
+    b : number [0, 4294967295]
+    c : number [0, 4294967295]
+    d : number [0, 4294967295]
+    e : number [0, 4294967295]
+    f : number [0, 4294967295]
+    g : number [0, 4294967295]
+    h : number [0, 4294967295]
+    w0 : number [0, 4294967295]
+    w1 : number [0, 4294967295]
+    w2 : number [0, 4294967295]
+    w3 : number [0, 4294967295]
+    w4 : number [0, 4294967295]
+    w5 : number [0, 4294967295]
+    w6 : number [0, 4294967295]
+    w7 : number [0, 4294967295]
+    w8 : number [0, 4294967295]
+    w9 : number [0, 4294967295]
+    w10 : number [0, 4294967295]
+    w11 : number [0, 4294967295]
+    w12 : number [0, 4294967295]
+    w13 : number [0, 4294967295]
+    w14 : number [0, 4294967295]
+    w15 : number [0, 4294967295]
+    round : number [0, 64]
+    which : number [0, 7]
+
+
+rule rotr32
+  @intention: "rotate right by n bits within a 32-bit field"
+  @source: sha256_text.intent:2
+  input:
+    w : WordAndShift
+  output:
+    out : number
+  logic:
+    out = band(bor(shr(w.x, w.n), shl(w.x, 32 - w.n)), 4294967295)
+  proofs:
+    purity:
+      reads : [w.x, w.n]
+      calls : []
+    termination:
+      bound : 10
+
+
+rule ch
+  @intention: "(x AND y) XOR ((NOT x) AND z)"
+  @source: sha256_text.intent:2
+  input:
+    t : ThreeWords
+  output:
+    out : number
+  logic:
+    out = band(bxor(band(t.x, t.y), band(bnot(t.x), t.z)), 4294967295)
+  proofs:
+    purity:
+      reads : [t.x, t.y, t.z]
+      calls : []
+    termination:
+      bound : 10
+
+
+rule maj
+  @intention: "(x AND y) XOR (x AND z) XOR (y AND z)"
+  @source: sha256_text.intent:2
+  input:
+    t : ThreeWords
+  output:
+    out : number
+  logic:
+    out = band(bxor(bxor(band(t.x, t.y), band(t.x, t.z)), band(t.y, t.z)), 4294967295)
+  proofs:
+    purity:
+      reads : [t.x, t.y, t.z]
+      calls : []
+    termination:
+      bound : 10
+
+
+rule big_sigma0
+  @intention: "rotr(x,2) XOR rotr(x,13) XOR rotr(x,22)"
+  @source: sha256_text.intent:2
+  input:
+    w : OneWord
+  output:
+    out : number
+  logic:
+    let r2  = rotr32(WordAndShift { x: w.x, n: 2 })
+    let r13 = rotr32(WordAndShift { x: w.x, n: 13 })
+    let r22 = rotr32(WordAndShift { x: w.x, n: 22 })
+    out = band(bxor(bxor(r2, r13), r22), 4294967295)
+  proofs:
+    purity:
+      reads : [w.x]
+      calls : [rotr32]
+    termination:
+      bound : 20
+
+
+rule big_sigma1
+  @intention: "rotr(x,6) XOR rotr(x,11) XOR rotr(x,25)"
+  @source: sha256_text.intent:2
+  input:
+    w : OneWord
+  output:
+    out : number
+  logic:
+    let r6  = rotr32(WordAndShift { x: w.x, n: 6 })
+    let r11 = rotr32(WordAndShift { x: w.x, n: 11 })
+    let r25 = rotr32(WordAndShift { x: w.x, n: 25 })
+    out = band(bxor(bxor(r6, r11), r25), 4294967295)
+  proofs:
+    purity:
+      reads : [w.x]
+      calls : [rotr32]
+    termination:
+      bound : 20
+
+
+rule small_sigma0
+  @intention: "rotr(x,7) XOR rotr(x,18) XOR (x >> 3)"
+  @source: sha256_text.intent:2
+  input:
+    w : OneWord
+  output:
+    out : number
+  logic:
+    let r7  = rotr32(WordAndShift { x: w.x, n: 7 })
+    let r18 = rotr32(WordAndShift { x: w.x, n: 18 })
+    out = band(bxor(bxor(r7, r18), shr(w.x, 3)), 4294967295)
+  proofs:
+    purity:
+      reads : [w.x]
+      calls : [rotr32]
+    termination:
+      bound : 20
+
+
+rule small_sigma1
+  @intention: "rotr(x,17) XOR rotr(x,19) XOR (x >> 10)"
+  @source: sha256_text.intent:2
+  input:
+    w : OneWord
+  output:
+    out : number
+  logic:
+    let r17 = rotr32(WordAndShift { x: w.x, n: 17 })
+    let r19 = rotr32(WordAndShift { x: w.x, n: 19 })
+    out = band(bxor(bxor(r17, r19), shr(w.x, 10)), 4294967295)
+  proofs:
+    purity:
+      reads : [w.x]
+      calls : [rotr32]
+    termination:
+      bound : 20
+
+
+rule k_const
+  @intention: "SHA-256 K[i] lookup, 64 constants"
+  @source: sha256_text.intent:3
+  input:
+    idx : Idx
+  output:
+    out : number
+  logic:
+    out = if idx.i == 0 then 1116352408
+      else if idx.i == 1 then 1899447441
+      else if idx.i == 2 then 3049323471
+      else if idx.i == 3 then 3921009573
+      else if idx.i == 4 then 961987163
+      else if idx.i == 5 then 1508970993
+      else if idx.i == 6 then 2453635748
+      else if idx.i == 7 then 2870763221
+      else if idx.i == 8 then 3624381080
+      else if idx.i == 9 then 310598401
+      else if idx.i == 10 then 607225278
+      else if idx.i == 11 then 1426881987
+      else if idx.i == 12 then 1925078388
+      else if idx.i == 13 then 2162078206
+      else if idx.i == 14 then 2614888103
+      else if idx.i == 15 then 3248222580
+      else if idx.i == 16 then 3835390401
+      else if idx.i == 17 then 4022224774
+      else if idx.i == 18 then 264347078
+      else if idx.i == 19 then 604807628
+      else if idx.i == 20 then 770255983
+      else if idx.i == 21 then 1249150122
+      else if idx.i == 22 then 1555081692
+      else if idx.i == 23 then 1996064986
+      else if idx.i == 24 then 2554220882
+      else if idx.i == 25 then 2821834349
+      else if idx.i == 26 then 2952996808
+      else if idx.i == 27 then 3210313671
+      else if idx.i == 28 then 3336571891
+      else if idx.i == 29 then 3584528711
+      else if idx.i == 30 then 113926993
+      else if idx.i == 31 then 338241895
+      else if idx.i == 32 then 666307205
+      else if idx.i == 33 then 773529912
+      else if idx.i == 34 then 1294757372
+      else if idx.i == 35 then 1396182291
+      else if idx.i == 36 then 1695183700
+      else if idx.i == 37 then 1986661051
+      else if idx.i == 38 then 2177026350
+      else if idx.i == 39 then 2456956037
+      else if idx.i == 40 then 2730485921
+      else if idx.i == 41 then 2820302411
+      else if idx.i == 42 then 3259730800
+      else if idx.i == 43 then 3345764771
+      else if idx.i == 44 then 3516065817
+      else if idx.i == 45 then 3600352804
+      else if idx.i == 46 then 4094571909
+      else if idx.i == 47 then 275423344
+      else if idx.i == 48 then 430227734
+      else if idx.i == 49 then 506948616
+      else if idx.i == 50 then 659060556
+      else if idx.i == 51 then 883997877
+      else if idx.i == 52 then 958139571
+      else if idx.i == 53 then 1322822218
+      else if idx.i == 54 then 1537002063
+      else if idx.i == 55 then 1747873779
+      else if idx.i == 56 then 1955562222
+      else if idx.i == 57 then 2024104815
+      else if idx.i == 58 then 2227730452
+      else if idx.i == 59 then 2361852424
+      else if idx.i == 60 then 2428436474
+      else if idx.i == 61 then 2756734187
+      else if idx.i == 62 then 3204031479
+      else 3329325298
+  proofs:
+    purity:
+      reads : [idx.i]
+      calls : []
+    termination:
+      bound : 200
+
+
+rule padded_byte
+  @intention: "byte at pos of the 64-byte padded block (msg + 0x80 + zeros + length)"
+  @source: sha256_text.intent:4
+  input:
+    p : PaddedByteAt
+  output:
+    out : number
+  logic:
+    out = if p.pos < p.len then byte_at(p.source, p.pos) else if p.pos == p.len then 128 else if p.pos == 63 then shl(p.len, 3) else 0
+  proofs:
+    purity:
+      reads : [p.source, p.len, p.pos]
+      calls : []
+    termination:
+      bound : 20
+
+
+rule w_init
+  @intention: "pack 4 padded bytes into the i-th initial W value (big-endian)"
+  @source: sha256_text.intent:5
+  input:
+    wi : WordInit
+  output:
+    out : number
+  logic:
+    let b0 = padded_byte(PaddedByteAt { source: wi.source, len: wi.len, pos: wi.i * 4 })
+    let b1 = padded_byte(PaddedByteAt { source: wi.source, len: wi.len, pos: wi.i * 4 + 1 })
+    let b2 = padded_byte(PaddedByteAt { source: wi.source, len: wi.len, pos: wi.i * 4 + 2 })
+    let b3 = padded_byte(PaddedByteAt { source: wi.source, len: wi.len, pos: wi.i * 4 + 3 })
+    out = bor(bor(bor(shl(b0, 24), shl(b1, 16)), shl(b2, 8)), b3)
+  proofs:
+    purity:
+      reads : [wi.source, wi.len, wi.i]
+      calls : [padded_byte]
+    termination:
+      bound : 40
+
+
+rule compress
+  @intention: "SHA-256 compression: 64 rounds with sliding W window"
+  @source: sha256_text.intent:6
+  input:
+    s : State
+  output:
+    out : number
+  logic:
+    let k = k_const(Idx { i: s.round })
+    let bs1e = big_sigma1(OneWord { x: s.e })
+    let chefg = ch(ThreeWords { x: s.e, y: s.f, z: s.g })
+    let bs0a = big_sigma0(OneWord { x: s.a })
+    let majabc = maj(ThreeWords { x: s.a, y: s.b, z: s.c })
+    let t1 = band(s.h + bs1e + chefg + k + s.w0, 4294967295)
+    let t2 = band(bs0a + majabc, 4294967295)
+    let na = band(t1 + t2, 4294967295)
+    let ne = band(s.d + t1, 4294967295)
+    let new_w = band(small_sigma1(OneWord { x: s.w14 }) + s.w9 + small_sigma0(OneWord { x: s.w1 }) + s.w0, 4294967295)
+    out = if s.round >= 63 then (if s.which == 0 then na else if s.which == 1 then s.a else if s.which == 2 then s.b else if s.which == 3 then s.c else if s.which == 4 then ne else if s.which == 5 then s.e else if s.which == 6 then s.f else s.g) else compress(State { a: na, b: s.a, c: s.b, d: s.c, e: ne, f: s.e, g: s.f, h: s.g, w0: s.w1, w1: s.w2, w2: s.w3, w3: s.w4, w4: s.w5, w5: s.w6, w6: s.w7, w7: s.w8, w8: s.w9, w9: s.w10, w10: s.w11, w11: s.w12, w12: s.w13, w13: s.w14, w14: s.w15, w15: new_w, round: s.round + 1, which: s.which })
+  proofs:
+    purity:
+      reads : [s.a, s.b, s.c, s.d, s.e, s.f, s.g, s.h, s.w0, s.w1, s.w2, s.w3, s.w4, s.w5, s.w6, s.w7, s.w8, s.w9, s.w10, s.w11, s.w12, s.w13, s.w14, s.w15, s.round, s.which]
+      calls : [k_const, big_sigma1, ch, big_sigma0, maj, small_sigma1, small_sigma0, compress]
+    termination:
+      bound : 200
+      increasing : round
+
+
+rule sha256_word
+  @intention: "SHA-256 of input source text, returns the i-th 32-bit hash word"
+  @source: sha256_text.intent:7
+  input:
+    s : Source
+  output:
+    out : number
+  logic:
+    let len = length(s.source)
+    let w0 = w_init(WordInit { source: s.source, len: len, i: 0 })
+    let w1 = w_init(WordInit { source: s.source, len: len, i: 1 })
+    let w2 = w_init(WordInit { source: s.source, len: len, i: 2 })
+    let w3 = w_init(WordInit { source: s.source, len: len, i: 3 })
+    let w4 = w_init(WordInit { source: s.source, len: len, i: 4 })
+    let w5 = w_init(WordInit { source: s.source, len: len, i: 5 })
+    let w6 = w_init(WordInit { source: s.source, len: len, i: 6 })
+    let w7 = w_init(WordInit { source: s.source, len: len, i: 7 })
+    let w8 = w_init(WordInit { source: s.source, len: len, i: 8 })
+    let w9 = w_init(WordInit { source: s.source, len: len, i: 9 })
+    let w10 = w_init(WordInit { source: s.source, len: len, i: 10 })
+    let w11 = w_init(WordInit { source: s.source, len: len, i: 11 })
+    let w12 = w_init(WordInit { source: s.source, len: len, i: 12 })
+    let w13 = w_init(WordInit { source: s.source, len: len, i: 13 })
+    let w14 = w_init(WordInit { source: s.source, len: len, i: 14 })
+    let w15 = w_init(WordInit { source: s.source, len: len, i: 15 })
+    let final_x = compress(State { a: 1779033703, b: 3144134277, c: 1013904242, d: 2773480762, e: 1359893119, f: 2600822924, g: 528734635, h: 1541459225, w0: w0, w1: w1, w2: w2, w3: w3, w4: w4, w5: w5, w6: w6, w7: w7, w8: w8, w9: w9, w10: w10, w11: w11, w12: w12, w13: w13, w14: w14, w15: w15, round: 0, which: s.which })
+    let h_i = if s.which == 0 then 1779033703 else if s.which == 1 then 3144134277 else if s.which == 2 then 1013904242 else if s.which == 3 then 2773480762 else if s.which == 4 then 1359893119 else if s.which == 5 then 2600822924 else if s.which == 6 then 528734635 else 1541459225
+    out = band(h_i + final_x, 4294967295)
+  proofs:
+    purity:
+      reads : [s.source, s.which]
+      calls : [w_init, compress]
+    termination:
+      bound : 100
+

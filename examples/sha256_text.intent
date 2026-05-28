@@ -1,0 +1,8 @@
+Generic SHA-256 of any text input up to 55 bytes (single block).
+Pads, packs into W[0..15] at runtime via byte_at, extends W[16..63]
+inductively via sliding window during compression.
+Output: i-th 32-bit word of the hash (which: 0..7).
+Validated against sha256sum for multiple inputs.
+helper rules: padded_byte, w_init, k_const.
+compress is the recursive callable with W-window sliding.
+sha256_word is the entry rule.
