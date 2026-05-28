@@ -1310,6 +1310,51 @@ impl Parser {
                 }
                 self.expect_kind(TokenKind::RParen)?;
                 Ok(Expr::Abs(Box::new(inner)))
+            } else if (name == "band" || name == "bor" || name == "bxor"
+                       || name == "shl" || name == "shr")
+                      && self.check_kind(&TokenKind::LParen) {
+                // Bitwise binary primitives: `band(a, b)`, `bor(a, b)`,
+                // `bxor(a, b)`, `shl(a, n)`, `shr(a, n)`. Each takes
+                // exactly two number args; arity error at parse time
+                // for zero / one / three-plus. Same arity-check shape as
+                // `min`/`max`'s binary form. Verifier enforces number-typed
+                // args + number return.
+                self.advance(); // (
+                if self.check_kind(&TokenKind::RParen) {
+                    return Err(self.error(&format!("{} requires exactly two arguments, got zero", name)));
+                }
+                let left = self.parse_expr()?;
+                if !self.check_kind(&TokenKind::Comma) {
+                    return Err(self.error(&format!("{} requires exactly two arguments, got one", name)));
+                }
+                self.expect_kind(TokenKind::Comma)?;
+                let right = self.parse_expr()?;
+                if self.check_kind(&TokenKind::Comma) {
+                    return Err(self.error(&format!("{} requires exactly two arguments, got more than two", name)));
+                }
+                self.expect_kind(TokenKind::RParen)?;
+                Ok(match name.as_str() {
+                    "band" => Expr::BitAnd(Box::new(left), Box::new(right)),
+                    "bor" => Expr::BitOr(Box::new(left), Box::new(right)),
+                    "bxor" => Expr::BitXor(Box::new(left), Box::new(right)),
+                    "shl" => Expr::Shl(Box::new(left), Box::new(right)),
+                    "shr" => Expr::Shr(Box::new(left), Box::new(right)),
+                    _ => unreachable!(),
+                })
+            } else if name == "bnot" && self.check_kind(&TokenKind::LParen) {
+                // `bnot(<number_expr>)` — bitwise NOT. Exactly one argument;
+                // same arity-check shape as `abs`. Verifier enforces
+                // number-typed arg + number return.
+                self.advance(); // (
+                if self.check_kind(&TokenKind::RParen) {
+                    return Err(self.error("bnot requires exactly one argument, got zero"));
+                }
+                let inner = self.parse_expr()?;
+                if self.check_kind(&TokenKind::Comma) {
+                    return Err(self.error("bnot requires exactly one argument, got more than one"));
+                }
+                self.expect_kind(TokenKind::RParen)?;
+                Ok(Expr::BitNot(Box::new(inner)))
             } else if name == "match_result" && self.check_kind(&TokenKind::LParen) {
                 // match_result(target, ok_var => ok_body, err_var => err_body)
                 // The Result consumer. Both arms are explicit — no implicit

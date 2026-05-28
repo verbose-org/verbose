@@ -924,6 +924,53 @@ fn eval_expr(
                 }),
             }
         }
+        Expr::BitAnd(a, b) => {
+            let av = eval_expr(a, env, all_rules, concepts)?;
+            let bv = eval_expr(b, env, all_rules, concepts)?;
+            match (av, bv) {
+                (Value::Number(x), Value::Number(y)) => Ok(Value::Number(x & y)),
+                _ => Err(RuntimeError { message: "band: number args required".into() }),
+            }
+        }
+        Expr::BitOr(a, b) => {
+            let av = eval_expr(a, env, all_rules, concepts)?;
+            let bv = eval_expr(b, env, all_rules, concepts)?;
+            match (av, bv) {
+                (Value::Number(x), Value::Number(y)) => Ok(Value::Number(x | y)),
+                _ => Err(RuntimeError { message: "bor: number args required".into() }),
+            }
+        }
+        Expr::BitXor(a, b) => {
+            let av = eval_expr(a, env, all_rules, concepts)?;
+            let bv = eval_expr(b, env, all_rules, concepts)?;
+            match (av, bv) {
+                (Value::Number(x), Value::Number(y)) => Ok(Value::Number(x ^ y)),
+                _ => Err(RuntimeError { message: "bxor: number args required".into() }),
+            }
+        }
+        Expr::BitNot(i) => {
+            let v = eval_expr(i, env, all_rules, concepts)?;
+            match v {
+                Value::Number(x) => Ok(Value::Number(!x)),
+                _ => Err(RuntimeError { message: "bnot: number arg required".into() }),
+            }
+        }
+        Expr::Shl(a, b) => {
+            let av = eval_expr(a, env, all_rules, concepts)?;
+            let bv = eval_expr(b, env, all_rules, concepts)?;
+            match (av, bv) {
+                (Value::Number(x), Value::Number(y)) => Ok(Value::Number(x.wrapping_shl(y as u32))),
+                _ => Err(RuntimeError { message: "shl: number args required".into() }),
+            }
+        }
+        Expr::Shr(a, b) => {
+            let av = eval_expr(a, env, all_rules, concepts)?;
+            let bv = eval_expr(b, env, all_rules, concepts)?;
+            match (av, bv) {
+                (Value::Number(x), Value::Number(y)) => Ok(Value::Number(x.wrapping_shr(y as u32))),
+                _ => Err(RuntimeError { message: "shr: number args required".into() }),
+            }
+        }
     }
 }
 

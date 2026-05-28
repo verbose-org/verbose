@@ -358,7 +358,7 @@ fn collect_read_names(expr: &Expr, out: &mut Vec<String>) {
         // Phase 12 (json_escape): pure pass-through — recurse into the
         // inner expression so any read(...) embedded in the source text
         // is still collected.
-        Expr::JsonEscape(inner) => collect_read_names(inner, out),
+        Expr::JsonEscape(inner) | Expr::BitNot(inner) => collect_read_names(inner, out),
         // Phase 12 (parse_int): pure pass-through — recurse into the inner
         // text expression (which is typically `read(...)` itself).
         Expr::ParseInt(inner) => collect_read_names(inner, out),
@@ -390,10 +390,10 @@ fn collect_read_names(expr: &Expr, out: &mut Vec<String>) {
         Expr::Length(inner) => collect_read_names(inner, out),
         // `abs(<number_expr>)` — pure pass-through; the inner may carry a
         // `read(...)` via `parse_int(read(name))` etc.
-        Expr::Abs(inner) => collect_read_names(inner, out),
+        Expr::Abs(inner) | Expr::BitNot(inner) => collect_read_names(inner, out),
         // `min(a, b)` / `max(a, b)` — recurse into both children; either
         // side may carry a `read(...)` (e.g. `min(amount, parse_int(read(cap)))`).
-        Expr::Min(l, r) | Expr::Max(l, r) => {
+        Expr::Min(l, r) | Expr::Max(l, r) | Expr::BitAnd(l, r) | Expr::BitOr(l, r) | Expr::BitXor(l, r) | Expr::Shl(l, r) | Expr::Shr(l, r) => {
             collect_read_names(l, out);
             collect_read_names(r, out);
         }
@@ -519,7 +519,7 @@ fn collect_fetch_names(expr: &Expr, out: &mut Vec<String>) {
         // Phase 12 (json_escape): pure pass-through — recurse into the
         // inner expression so any fetch(...) embedded in the source text
         // is still collected.
-        Expr::JsonEscape(inner) => collect_fetch_names(inner, out),
+        Expr::JsonEscape(inner) | Expr::BitNot(inner) => collect_fetch_names(inner, out),
         // Phase 12 (parse_int): pure pass-through.
         Expr::ParseInt(inner) => collect_fetch_names(inner, out),
         // `now_unix()` is not a connection — leaf node, nothing to collect.
@@ -542,9 +542,9 @@ fn collect_fetch_names(expr: &Expr, out: &mut Vec<String>) {
         // `length(<text_expr>)` — pure pass-through.
         Expr::Length(inner) => collect_fetch_names(inner, out),
         // `abs(<number_expr>)` — pure pass-through.
-        Expr::Abs(inner) => collect_fetch_names(inner, out),
+        Expr::Abs(inner) | Expr::BitNot(inner) => collect_fetch_names(inner, out),
         // `min(a, b)` / `max(a, b)` — recurse into both children.
-        Expr::Min(l, r) | Expr::Max(l, r) => {
+        Expr::Min(l, r) | Expr::Max(l, r) | Expr::BitAnd(l, r) | Expr::BitOr(l, r) | Expr::BitXor(l, r) | Expr::Shl(l, r) | Expr::Shr(l, r) => {
             collect_fetch_names(l, out);
             collect_fetch_names(r, out);
         }
@@ -639,7 +639,7 @@ fn collect_fetch_names_with_dups(expr: &Expr, out: &mut Vec<String>) {
             }
         }
         // Phase 12 (json_escape): pure pass-through.
-        Expr::JsonEscape(inner) => collect_fetch_names_with_dups(inner, out),
+        Expr::JsonEscape(inner) | Expr::BitNot(inner) => collect_fetch_names_with_dups(inner, out),
         // Phase 12 (parse_int): pure pass-through.
         Expr::ParseInt(inner) => collect_fetch_names_with_dups(inner, out),
         // `now_unix()` is not a fetch — leaf node, nothing to collect.
@@ -662,9 +662,9 @@ fn collect_fetch_names_with_dups(expr: &Expr, out: &mut Vec<String>) {
         // `length(<text_expr>)` — pure pass-through.
         Expr::Length(inner) => collect_fetch_names_with_dups(inner, out),
         // `abs(<number_expr>)` — pure pass-through.
-        Expr::Abs(inner) => collect_fetch_names_with_dups(inner, out),
+        Expr::Abs(inner) | Expr::BitNot(inner) => collect_fetch_names_with_dups(inner, out),
         // `min(a, b)` / `max(a, b)` — recurse into both children.
-        Expr::Min(l, r) | Expr::Max(l, r) => {
+        Expr::Min(l, r) | Expr::Max(l, r) | Expr::BitAnd(l, r) | Expr::BitOr(l, r) | Expr::BitXor(l, r) | Expr::Shl(l, r) | Expr::Shr(l, r) => {
             collect_fetch_names_with_dups(l, out);
             collect_fetch_names_with_dups(r, out);
         }
@@ -1257,7 +1257,7 @@ fn describe_expr_kind(e: &Expr) -> &'static str {
         Expr::Contains(_, _) => "contains",
         Expr::EndsWith(_, _) => "ends_with",
         Expr::Length(_) => "length",
-        Expr::Abs(_) => "abs",
+        Expr::Abs(_) => "abs", Expr::BitAnd(_,_) => "band", Expr::BitOr(_,_) => "bor", Expr::BitXor(_,_) => "bxor", Expr::BitNot(_) => "bnot", Expr::Shl(_,_) => "shl", Expr::Shr(_,_) => "shr",
         Expr::Min(_, _) => "min",
         Expr::Max(_, _) => "max",
         Expr::Substring(_, _, _) => "substring",
@@ -2519,10 +2519,10 @@ fn infer_expr_type(
         Expr::Length(_) => Some(Type::Number),
         // `abs(<number>)` returns number. Inner number-ness enforced by
         // check_expr_against.
-        Expr::Abs(_) => Some(Type::Number),
+        Expr::Abs(_) | Expr::BitNot(_) => Some(Type::Number),
         // `min(<number>, <number>)` / `max(<number>, <number>)` return number.
         // Both children are number-typed; check_expr_against enforces that.
-        Expr::Min(_, _) | Expr::Max(_, _) => Some(Type::Number),
+        Expr::Min(_, _) | Expr::Max(_, _) | Expr::BitAnd(_,_) | Expr::BitOr(_,_) | Expr::BitXor(_,_) | Expr::Shl(_,_) | Expr::Shr(_,_) => Some(Type::Number),
         // `substring(<text>, <number>, <number>)` returns text. Inner shapes
         // are enforced by check_expr_against; here we only need the outer
         // type for inference.
@@ -2795,14 +2795,14 @@ fn walk_for_match_result_callees(
             walk_for_match_result_callees(e, rules_by_name, all_resources, all_connections, visited, out_reads);
         }
         Expr::Ok(i) | Expr::Err(i) | Expr::Not(i) | Expr::Neg(i) | Expr::Abs(i)
-        | Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i) => {
+        | Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i) | Expr::BitNot(i) => {
             walk_for_match_result_callees(i, rules_by_name, all_resources, all_connections, visited, out_reads);
         }
         Expr::Binary(_, l, r) => {
             walk_for_match_result_callees(l, rules_by_name, all_resources, all_connections, visited, out_reads);
             walk_for_match_result_callees(r, rules_by_name, all_resources, all_connections, visited, out_reads);
         }
-        Expr::Min(a, b) | Expr::Max(a, b) | Expr::StartsWith(a, b)
+        Expr::Min(a, b) | Expr::Max(a, b) | Expr::BitAnd(a, b) | Expr::BitOr(a, b) | Expr::BitXor(a, b) | Expr::Shl(a, b) | Expr::Shr(a, b) | Expr::StartsWith(a, b)
         | Expr::EndsWith(a, b) | Expr::Contains(a, b) => {
             walk_for_match_result_callees(a, rules_by_name, all_resources, all_connections, visited, out_reads);
             walk_for_match_result_callees(b, rules_by_name, all_resources, all_connections, visited, out_reads);
@@ -3009,7 +3009,7 @@ fn collect_expr_facts(
         // computed in-process from the inner expression's bytes — no
         // syscalls, no fresh reads. The inner expression's facts ARE the
         // facts.
-        Expr::JsonEscape(inner) => {
+        Expr::JsonEscape(inner) | Expr::BitNot(inner) => {
             collect_expr_facts(inner, reads, calls);
         }
         // Phase 12 (parse_int): pure pass-through. The transform itself
@@ -3056,7 +3056,7 @@ fn collect_expr_facts(
         }
         // `min(a, b)` / `max(a, b)` — pure: branch-free scalar comparison
         // adds no synthetic read; each child contributes its own facts.
-        Expr::Min(l, r) | Expr::Max(l, r) => {
+        Expr::Min(l, r) | Expr::Max(l, r) | Expr::BitAnd(l, r) | Expr::BitOr(l, r) | Expr::BitXor(l, r) | Expr::Shl(l, r) | Expr::Shr(l, r) => {
             collect_expr_facts(l, reads, calls);
             collect_expr_facts(r, reads, calls);
         }
@@ -3265,7 +3265,7 @@ fn collect_lambda_bound_names(expr: &Expr) -> std::collections::HashSet<String> 
             | Expr::ParseInt(i) | Expr::JsonEscape(i) | Expr::Ok(i) | Expr::Err(i) => {
                 walk(i, out);
             }
-            Expr::Min(a, b) | Expr::Max(a, b) | Expr::StartsWith(a, b)
+            Expr::Min(a, b) | Expr::Max(a, b) | Expr::BitAnd(a, b) | Expr::BitOr(a, b) | Expr::BitXor(a, b) | Expr::Shl(a, b) | Expr::Shr(a, b) | Expr::StartsWith(a, b)
             | Expr::EndsWith(a, b) | Expr::Contains(a, b) => {
                 walk(a, out); walk(b, out);
             }
@@ -3311,6 +3311,9 @@ fn collect_lambda_bound_names(expr: &Expr) -> std::collections::HashSet<String> 
                 }
             }
             Expr::Fetch(_, request) => walk(request, out),
+            Expr::BitAnd(a, b) | Expr::BitOr(a, b) | Expr::BitXor(a, b)
+            | Expr::Shl(a, b) | Expr::Shr(a, b) => { walk(a, out); walk(b, out); }
+            Expr::BitNot(i) => walk(i, out),
             // Leaves
             Expr::Number(_) | Expr::Text(_) | Expr::Field(_, _) | Expr::Ident(_)
             | Expr::Read(_) | Expr::NowUnix => {}
@@ -3529,7 +3532,7 @@ fn collect_recursive_call_args(expr: &Expr, rule_name: &str, out: &mut Vec<Strin
         Expr::Field(b, _) => collect_recursive_call_args(b, rule_name, out),
         Expr::Binary(_, l, r) => { collect_recursive_call_args(l, rule_name, out); collect_recursive_call_args(r, rule_name, out); }
         Expr::Not(i) | Expr::Neg(i) | Expr::Ok(i) | Expr::Err(i)
-        | Expr::Abs(i) | Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i) => collect_recursive_call_args(i, rule_name, out),
+        | Expr::Abs(i) | Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i) | Expr::BitNot(i) => collect_recursive_call_args(i, rule_name, out),
         Expr::If(c, t, e) => { collect_recursive_call_args(c, rule_name, out); collect_recursive_call_args(t, rule_name, out); collect_recursive_call_args(e, rule_name, out); }
         Expr::Call(_, args) | Expr::Concat(args) => { for a in args { collect_recursive_call_args(a, rule_name, out); } }
         Expr::Quantifier(_, c, _, body) => { collect_recursive_call_args(c, rule_name, out); collect_recursive_call_args(body, rule_name, out); }
@@ -3543,6 +3546,8 @@ fn collect_recursive_call_args(expr: &Expr, rule_name: &str, out: &mut Vec<Strin
             for a in arms { collect_recursive_call_args(&a.body, rule_name, out); }
         }
         Expr::Fetch(_, req) => collect_recursive_call_args(req, rule_name, out),
+        Expr::BitAnd(a, b) | Expr::BitOr(a, b) | Expr::BitXor(a, b)
+        | Expr::Shl(a, b) | Expr::Shr(a, b) => { collect_recursive_call_args(a, rule_name, out); collect_recursive_call_args(b, rule_name, out); }
         Expr::StartsWith(h, n) | Expr::Contains(h, n) | Expr::EndsWith(h, n)
         | Expr::Min(h, n) | Expr::Max(h, n) | Expr::ByteAt(h, n) => { collect_recursive_call_args(h, rule_name, out); collect_recursive_call_args(n, rule_name, out); }
         Expr::Substring(t, s, e) => { collect_recursive_call_args(t, rule_name, out); collect_recursive_call_args(s, rule_name, out); collect_recursive_call_args(e, rule_name, out); }
@@ -3779,7 +3784,7 @@ fn collect_recursive_call_record_args(expr: &Expr, rule_name: &str, out: &mut Ve
         Expr::Field(b, _) => collect_recursive_call_record_args(b, rule_name, out),
         Expr::Binary(_, l, r) => { collect_recursive_call_record_args(l, rule_name, out); collect_recursive_call_record_args(r, rule_name, out); }
         Expr::Not(i) | Expr::Neg(i) | Expr::Ok(i) | Expr::Err(i)
-        | Expr::Abs(i) | Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i) => collect_recursive_call_record_args(i, rule_name, out),
+        | Expr::Abs(i) | Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i) | Expr::BitNot(i) => collect_recursive_call_record_args(i, rule_name, out),
         Expr::If(c, t, e) => { collect_recursive_call_record_args(c, rule_name, out); collect_recursive_call_record_args(t, rule_name, out); collect_recursive_call_record_args(e, rule_name, out); }
         Expr::Call(_, args) | Expr::Concat(args) => { for a in args { collect_recursive_call_record_args(a, rule_name, out); } }
         Expr::Quantifier(_, c, _, body) => { collect_recursive_call_record_args(c, rule_name, out); collect_recursive_call_record_args(body, rule_name, out); }
@@ -3793,6 +3798,8 @@ fn collect_recursive_call_record_args(expr: &Expr, rule_name: &str, out: &mut Ve
             for a in arms { collect_recursive_call_record_args(&a.body, rule_name, out); }
         }
         Expr::Fetch(_, req) => collect_recursive_call_record_args(req, rule_name, out),
+        Expr::BitAnd(a, b) | Expr::BitOr(a, b) | Expr::BitXor(a, b)
+        | Expr::Shl(a, b) | Expr::Shr(a, b) => { collect_recursive_call_record_args(a, rule_name, out); collect_recursive_call_record_args(b, rule_name, out); }
         Expr::StartsWith(h, n) | Expr::Contains(h, n) | Expr::EndsWith(h, n)
         | Expr::Min(h, n) | Expr::Max(h, n) | Expr::ByteAt(h, n) => { collect_recursive_call_record_args(h, rule_name, out); collect_recursive_call_record_args(n, rule_name, out); }
         Expr::Substring(t, s, e) => { collect_recursive_call_record_args(t, rule_name, out); collect_recursive_call_record_args(s, rule_name, out); collect_recursive_call_record_args(e, rule_name, out); }
@@ -3833,7 +3840,7 @@ fn count_operations(expr: &Expr) -> usize {
         // Phase 12 (json_escape): one op for the transform itself plus
         // the cost of evaluating the inner expression. Same shape as
         // Ok/Err's pass-through accounting.
-        Expr::JsonEscape(inner) => 1 + count_operations(inner),
+        Expr::JsonEscape(inner) | Expr::BitNot(inner) => 1 + count_operations(inner),
         // Phase 12 (parse_int): same shape as JsonEscape — one op for
         // the scan/parse loop plus the inner.
         Expr::ParseInt(inner) => 1 + count_operations(inner),
@@ -3855,7 +3862,7 @@ fn count_operations(expr: &Expr) -> usize {
         // `abs(<number_expr>)` — same shape as Neg: one op + inner cost.
         Expr::Abs(inner) => 1 + count_operations(inner),
         // `min(a, b)` / `max(a, b)` — branch-free scalar; one op + each child.
-        Expr::Min(l, r) | Expr::Max(l, r) => 1 + count_operations(l) + count_operations(r),
+        Expr::Min(l, r) | Expr::Max(l, r) | Expr::BitAnd(l, r) | Expr::BitOr(l, r) | Expr::BitXor(l, r) | Expr::Shl(l, r) | Expr::Shr(l, r) => 1 + count_operations(l) + count_operations(r),
         // `substring(text, start, end)` — one op for the slice operation
         // (bounds check + pointer arithmetic) plus the cost of each child.
         Expr::Substring(t, s, e) => 1 + count_operations(t) + count_operations(s) + count_operations(e),

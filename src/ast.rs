@@ -704,6 +704,18 @@ pub enum Expr {
     /// `max(<a>, <b>)` — binary scalar maximum, returns Number. Same
     /// disambiguation rule and shape as Min. Native: `cmp + cmovl`.
     Max(Box<Expr>, Box<Expr>),
+    /// `band(<a>, <b>)` — bitwise AND on Number args. Native: `and rax, rcx`.
+    BitAnd(Box<Expr>, Box<Expr>),
+    /// `bor(<a>, <b>)` — bitwise OR on Number args. Native: `or rax, rcx`.
+    BitOr(Box<Expr>, Box<Expr>),
+    /// `bxor(<a>, <b>)` — bitwise XOR on Number args. Native: `xor rax, rcx`.
+    BitXor(Box<Expr>, Box<Expr>),
+    /// `bnot(<a>)` — bitwise NOT on Number arg. Native: `not rax`.
+    BitNot(Box<Expr>),
+    /// `shl(<a>, <n>)` — logical shift left by n bits. Native: `shl rax, cl`.
+    Shl(Box<Expr>, Box<Expr>),
+    /// `shr(<a>, <n>)` — logical shift right by n bits. Native: `shr rax, cl`.
+    Shr(Box<Expr>, Box<Expr>),
     /// `substring(<text_expr>, <start>, <end>)` — slice a sub-range of
     /// the input text by byte offset. Returns `text`. Semantics are
     /// half-open: bytes [start, end), so `substring(s, 0, length(s))`

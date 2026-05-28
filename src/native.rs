@@ -928,7 +928,7 @@ fn collect_read_names_native(expr: &Expr, out: &mut Vec<String>) {
         // captured.
         Expr::Fetch(_, req) => collect_read_names_native(req, out),
         // Phase 12 (json_escape): pure pass-through.
-        Expr::JsonEscape(inner) => collect_read_names_native(inner, out),
+        Expr::JsonEscape(inner) | Expr::BitNot(inner) => collect_read_names_native(inner, out),
         // Phase 12 (parse_int): pure pass-through.
         Expr::ParseInt(inner) => collect_read_names_native(inner, out),
         // `now_unix()` is a clock read, not a resource read — leaf node.
@@ -957,10 +957,10 @@ fn collect_read_names_native(expr: &Expr, out: &mut Vec<String>) {
         // `length(<text_expr>)` — pure pass-through.
         Expr::Length(inner) => collect_read_names_native(inner, out),
         // `abs(<number_expr>)` — pure pass-through.
-        Expr::Abs(inner) => collect_read_names_native(inner, out),
+        Expr::Abs(inner) | Expr::BitNot(inner) => collect_read_names_native(inner, out),
         // `min(a, b)` / `max(a, b)` — recurse into both children; either
         // side may carry a `read(...)` reference.
-        Expr::Min(l, r) | Expr::Max(l, r) => {
+        Expr::Min(l, r) | Expr::Max(l, r) | Expr::BitAnd(l, r) | Expr::BitOr(l, r) | Expr::BitXor(l, r) | Expr::Shl(l, r) | Expr::Shr(l, r) => {
             collect_read_names_native(l, out);
             collect_read_names_native(r, out);
         }
@@ -1016,7 +1016,7 @@ fn expr_uses_now_unix(e: &Expr) -> bool {
         Expr::Field(b, _) => expr_uses_now_unix(b),
         Expr::Binary(_, l, r) => expr_uses_now_unix(l) || expr_uses_now_unix(r),
         Expr::Not(i) | Expr::Neg(i) | Expr::Ok(i) | Expr::Err(i) => expr_uses_now_unix(i),
-        Expr::JsonEscape(i) | Expr::ParseInt(i) | Expr::Length(i) | Expr::Abs(i) => expr_uses_now_unix(i),
+        Expr::JsonEscape(i) | Expr::ParseInt(i) | Expr::Length(i) | Expr::Abs(i) | Expr::BitNot(i) => expr_uses_now_unix(i),
         Expr::If(c, t, el) => {
             expr_uses_now_unix(c) || expr_uses_now_unix(t) || expr_uses_now_unix(el)
         }
@@ -1036,7 +1036,7 @@ fn expr_uses_now_unix(e: &Expr) -> bool {
         Expr::StartsWith(h, n) => expr_uses_now_unix(h) || expr_uses_now_unix(n),
         Expr::Contains(h, n) => expr_uses_now_unix(h) || expr_uses_now_unix(n),
         Expr::EndsWith(h, n) => expr_uses_now_unix(h) || expr_uses_now_unix(n),
-        Expr::Min(l, r) | Expr::Max(l, r) => expr_uses_now_unix(l) || expr_uses_now_unix(r),
+        Expr::Min(l, r) | Expr::Max(l, r) | Expr::BitAnd(l, r) | Expr::BitOr(l, r) | Expr::BitXor(l, r) | Expr::Shl(l, r) | Expr::Shr(l, r) => expr_uses_now_unix(l) || expr_uses_now_unix(r),
         Expr::Substring(t, s, e) => {
             expr_uses_now_unix(t) || expr_uses_now_unix(s) || expr_uses_now_unix(e)
         }
@@ -1118,14 +1118,14 @@ fn count_match_result_max_depth(expr: &Expr) -> usize {
                 .max(count_match_result_max_depth(t))
                 .max(count_match_result_max_depth(e))
         }
-        Expr::Ok(i) | Expr::Err(i) | Expr::Not(i) | Expr::Neg(i) | Expr::Abs(i)
-        | Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i) => {
+        Expr::Ok(i) | Expr::Err(i) | Expr::Not(i) | Expr::Neg(i) | Expr::Abs(i) | Expr::BitNot(i)
+        | Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i) | Expr::BitNot(i) => {
             count_match_result_max_depth(i)
         }
         Expr::Binary(_, l, r) => {
             count_match_result_max_depth(l).max(count_match_result_max_depth(r))
         }
-        Expr::Min(a, b) | Expr::Max(a, b) | Expr::StartsWith(a, b)
+        Expr::Min(a, b) | Expr::Max(a, b) | Expr::BitAnd(a, b) | Expr::BitOr(a, b) | Expr::BitXor(a, b) | Expr::Shl(a, b) | Expr::Shr(a, b) | Expr::StartsWith(a, b)
         | Expr::EndsWith(a, b) | Expr::Contains(a, b) => {
             count_match_result_max_depth(a).max(count_match_result_max_depth(b))
         }
@@ -1207,7 +1207,7 @@ fn expr_uses_field(e: &Expr, input_name: &str, field_name: &str) -> bool {
         Expr::Not(i) | Expr::Neg(i) | Expr::Ok(i) | Expr::Err(i) => {
             expr_uses_field(i, input_name, field_name)
         }
-        Expr::JsonEscape(i) | Expr::ParseInt(i) | Expr::Length(i) | Expr::Abs(i) => {
+        Expr::JsonEscape(i) | Expr::ParseInt(i) | Expr::Length(i) | Expr::Abs(i) | Expr::BitNot(i) => {
             expr_uses_field(i, input_name, field_name)
         }
         Expr::If(c, t, el) => {
@@ -1244,7 +1244,7 @@ fn expr_uses_field(e: &Expr, input_name: &str, field_name: &str) -> bool {
             .iter()
             .any(|(_, e)| expr_uses_field(e, input_name, field_name)),
         Expr::Fetch(_, req) => expr_uses_field(req, input_name, field_name),
-        Expr::Min(l, r) | Expr::Max(l, r) => {
+        Expr::Min(l, r) | Expr::Max(l, r) | Expr::BitAnd(l, r) | Expr::BitOr(l, r) | Expr::BitXor(l, r) | Expr::Shl(l, r) | Expr::Shr(l, r) => {
             expr_uses_field(l, input_name, field_name)
                 || expr_uses_field(r, input_name, field_name)
         }
@@ -1571,11 +1571,11 @@ fn collect_native_callees(expr: &Expr, out: &mut Vec<String>) {
             collect_native_callees(l, out);
             collect_native_callees(r, out);
         }
-        Expr::Ok(i) | Expr::Err(i) | Expr::Not(i) | Expr::Neg(i) | Expr::Abs(i)
-        | Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i) => {
+        Expr::Ok(i) | Expr::Err(i) | Expr::Not(i) | Expr::Neg(i) | Expr::Abs(i) | Expr::BitNot(i)
+        | Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i) | Expr::BitNot(i) => {
             collect_native_callees(i, out);
         }
-        Expr::Min(a, b) | Expr::Max(a, b) | Expr::StartsWith(a, b)
+        Expr::Min(a, b) | Expr::Max(a, b) | Expr::BitAnd(a, b) | Expr::BitOr(a, b) | Expr::BitXor(a, b) | Expr::Shl(a, b) | Expr::Shr(a, b) | Expr::StartsWith(a, b)
         | Expr::EndsWith(a, b) | Expr::Contains(a, b) => {
             collect_native_callees(a, out);
             collect_native_callees(b, out);
@@ -1699,15 +1699,15 @@ fn gather_transitive_callee_reads(
             gather_transitive_callee_reads(t, all_rules, visited, out);
             gather_transitive_callee_reads(e, all_rules, visited, out);
         }
-        Expr::Ok(i) | Expr::Err(i) | Expr::Not(i) | Expr::Neg(i) | Expr::Abs(i)
-        | Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i) => {
+        Expr::Ok(i) | Expr::Err(i) | Expr::Not(i) | Expr::Neg(i) | Expr::Abs(i) | Expr::BitNot(i)
+        | Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i) | Expr::BitNot(i) => {
             gather_transitive_callee_reads(i, all_rules, visited, out);
         }
         Expr::Binary(_, l, r) => {
             gather_transitive_callee_reads(l, all_rules, visited, out);
             gather_transitive_callee_reads(r, all_rules, visited, out);
         }
-        Expr::Min(a, b) | Expr::Max(a, b) | Expr::StartsWith(a, b)
+        Expr::Min(a, b) | Expr::Max(a, b) | Expr::BitAnd(a, b) | Expr::BitOr(a, b) | Expr::BitXor(a, b) | Expr::Shl(a, b) | Expr::Shr(a, b) | Expr::StartsWith(a, b)
         | Expr::EndsWith(a, b) | Expr::Contains(a, b) => {
             gather_transitive_callee_reads(a, all_rules, visited, out);
             gather_transitive_callee_reads(b, all_rules, visited, out);
@@ -1933,7 +1933,7 @@ fn collect_fetch_names_native(expr: &Expr, out: &mut Vec<String>) {
             }
         }
         // Phase 12 (json_escape): pure pass-through.
-        Expr::JsonEscape(inner) => collect_fetch_names_native(inner, out),
+        Expr::JsonEscape(inner) | Expr::BitNot(inner) => collect_fetch_names_native(inner, out),
         // Phase 12 (parse_int): pure pass-through.
         Expr::ParseInt(inner) => collect_fetch_names_native(inner, out),
         // `now_unix()` is not a connection — leaf node.
@@ -1959,9 +1959,9 @@ fn collect_fetch_names_native(expr: &Expr, out: &mut Vec<String>) {
         // `length(<text_expr>)` — pure pass-through.
         Expr::Length(inner) => collect_fetch_names_native(inner, out),
         // `abs(<number_expr>)` — pure pass-through.
-        Expr::Abs(inner) => collect_fetch_names_native(inner, out),
+        Expr::Abs(inner) | Expr::BitNot(inner) => collect_fetch_names_native(inner, out),
         // `min(a, b)` / `max(a, b)` — recurse into both children.
-        Expr::Min(l, r) | Expr::Max(l, r) => {
+        Expr::Min(l, r) | Expr::Max(l, r) | Expr::BitAnd(l, r) | Expr::BitOr(l, r) | Expr::BitXor(l, r) | Expr::Shl(l, r) | Expr::Shr(l, r) => {
             collect_fetch_names_native(l, out);
             collect_fetch_names_native(r, out);
         }
@@ -2255,7 +2255,7 @@ fn emit_connection_fetch_sequence(
             Expr::Record(_, fs) => fs.iter().find_map(|(_, e)| first_fetch_for(e, name)),
             Expr::Fetch(_, req) => first_fetch_for(req, name),
             // Phase 12 (json_escape): pass-through.
-            Expr::JsonEscape(inner) => first_fetch_for(inner, name),
+            Expr::JsonEscape(inner) | Expr::BitNot(inner) => first_fetch_for(inner, name),
             // Phase 12 (parse_int): pass-through.
             Expr::ParseInt(inner) => first_fetch_for(inner, name),
             // `now_unix()` is not a Fetch — leaf node.
@@ -2269,9 +2269,9 @@ fn emit_connection_fetch_sequence(
             // `length(<text_expr>)` — pass-through.
             Expr::Length(inner) => first_fetch_for(inner, name),
             // `abs(<number_expr>)` — pass-through.
-            Expr::Abs(inner) => first_fetch_for(inner, name),
+            Expr::Abs(inner) | Expr::BitNot(inner) => first_fetch_for(inner, name),
             // `min(a, b)` / `max(a, b)` — recurse into both children.
-            Expr::Min(l, r) | Expr::Max(l, r) => {
+            Expr::Min(l, r) | Expr::Max(l, r) | Expr::BitAnd(l, r) | Expr::BitOr(l, r) | Expr::BitXor(l, r) | Expr::Shl(l, r) | Expr::Shr(l, r) => {
                 first_fetch_for(l, name).or_else(|| first_fetch_for(r, name))
             }
             // `substring(text, start, end)` — recurse into all three children.
@@ -2494,7 +2494,7 @@ fn find_group_variant_construct_in_expr(
         Expr::Binary(_, l, r) => find_group_variant_construct_in_expr(l, group_concepts)
             .or_else(|| find_group_variant_construct_in_expr(r, group_concepts)),
         Expr::Not(i) | Expr::Neg(i) | Expr::Ok(i) | Expr::Err(i)
-        | Expr::Abs(i) | Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i) => {
+        | Expr::Abs(i) | Expr::BitNot(i) | Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i) | Expr::BitNot(i) => {
             find_group_variant_construct_in_expr(i, group_concepts)
         }
         Expr::If(c, t, e) => find_group_variant_construct_in_expr(c, group_concepts)
@@ -2533,13 +2533,15 @@ fn find_group_variant_construct_in_expr(
             .or_else(|| find_group_variant_construct_in_expr(s, group_concepts))
             .or_else(|| find_group_variant_construct_in_expr(e, group_concepts)),
         Expr::MatchVariant(scrutinee, arms) => {
-            // The scrutinee itself can never be a VariantConstruct of a
-            // group concept (we'd find it via this recursion regardless)
-            // so the MatchVariant arm's primary job is to recurse into
-            // each arm's body and the scrutinee.
             find_group_variant_construct_in_expr(scrutinee, group_concepts)
                 .or_else(|| arms.iter().find_map(|a| find_group_variant_construct_in_expr(&a.body, group_concepts)))
         }
+        Expr::BitAnd(a, b) | Expr::BitOr(a, b) | Expr::BitXor(a, b)
+        | Expr::Shl(a, b) | Expr::Shr(a, b) => {
+            find_group_variant_construct_in_expr(a, group_concepts)
+                .or_else(|| find_group_variant_construct_in_expr(b, group_concepts))
+        }
+        Expr::BitNot(i) => find_group_variant_construct_in_expr(i, group_concepts),
     }
 }
 
@@ -2599,7 +2601,7 @@ fn find_group_match_variant_in_expr(
         Expr::Binary(_, l, r) => find_group_match_variant_in_expr(l, group_concepts, rule_input_name, rule_input_ty, all_rules)
             .or_else(|| find_group_match_variant_in_expr(r, group_concepts, rule_input_name, rule_input_ty, all_rules)),
         Expr::Not(i) | Expr::Neg(i) | Expr::Ok(i) | Expr::Err(i)
-        | Expr::Abs(i) | Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i) => {
+        | Expr::Abs(i) | Expr::BitNot(i) | Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i) | Expr::BitNot(i) => {
             find_group_match_variant_in_expr(i, group_concepts, rule_input_name, rule_input_ty, all_rules)
         }
         Expr::If(c, t, e) => find_group_match_variant_in_expr(c, group_concepts, rule_input_name, rule_input_ty, all_rules)
@@ -2640,6 +2642,12 @@ fn find_group_match_variant_in_expr(
         Expr::Substring(t, s, e) => find_group_match_variant_in_expr(t, group_concepts, rule_input_name, rule_input_ty, all_rules)
             .or_else(|| find_group_match_variant_in_expr(s, group_concepts, rule_input_name, rule_input_ty, all_rules))
             .or_else(|| find_group_match_variant_in_expr(e, group_concepts, rule_input_name, rule_input_ty, all_rules)),
+        Expr::BitAnd(a, b) | Expr::BitOr(a, b) | Expr::BitXor(a, b)
+        | Expr::Shl(a, b) | Expr::Shr(a, b) => {
+            find_group_match_variant_in_expr(a, group_concepts, rule_input_name, rule_input_ty, all_rules)
+                .or_else(|| find_group_match_variant_in_expr(b, group_concepts, rule_input_name, rule_input_ty, all_rules))
+        }
+        Expr::BitNot(i) => find_group_match_variant_in_expr(i, group_concepts, rule_input_name, rule_input_ty, all_rules),
     }
 }
 
@@ -3989,7 +3997,7 @@ fn count_max_match_arm_binders(expr: &Expr) -> u32 {
             Expr::Field(b, _) => walk(b, m),
             Expr::Binary(_, l, r) => { walk(l, m); walk(r, m); }
             Expr::Not(i) | Expr::Neg(i) | Expr::Ok(i) | Expr::Err(i)
-            | Expr::Abs(i) | Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i) => walk(i, m),
+            | Expr::Abs(i) | Expr::BitNot(i) | Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i) => walk(i, m),
             Expr::If(c, t, ee) => { walk(c, m); walk(t, m); walk(ee, m); }
             Expr::Call(_, args) | Expr::Concat(args) => { for a in args { walk(a, m); } }
             Expr::Quantifier(_, c, _, body) => { walk(c, m); walk(body, m); }
@@ -4001,7 +4009,9 @@ fn count_max_match_arm_binders(expr: &Expr) -> u32 {
             Expr::VariantConstruct(_, _, fields) => { for (_, e) in fields { walk(e, m); } }
             Expr::Fetch(_, req) => walk(req, m),
             Expr::StartsWith(h, n) | Expr::Contains(h, n) | Expr::EndsWith(h, n)
-            | Expr::Min(h, n) | Expr::Max(h, n) | Expr::ByteAt(h, n) => { walk(h, m); walk(n, m); }
+            | Expr::Min(h, n) | Expr::Max(h, n) | Expr::ByteAt(h, n)
+            | Expr::BitAnd(h, n) | Expr::BitOr(h, n) | Expr::BitXor(h, n)
+            | Expr::Shl(h, n) | Expr::Shr(h, n) => { walk(h, m); walk(n, m); }
             Expr::Substring(t, s, e) => { walk(t, m); walk(s, m); walk(e, m); }
         }
     }
@@ -4037,7 +4047,7 @@ fn count_max_match_arm_binder_slots(expr: &Expr, concept_group: Option<&ConceptG
             Expr::Field(b, _) => walk(b, m, cg),
             Expr::Binary(_, l, r) => { walk(l, m, cg); walk(r, m, cg); }
             Expr::Not(i) | Expr::Neg(i) | Expr::Ok(i) | Expr::Err(i)
-            | Expr::Abs(i) | Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i) => walk(i, m, cg),
+            | Expr::Abs(i) | Expr::BitNot(i) | Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i) | Expr::BitNot(i) => walk(i, m, cg),
             Expr::If(c, t, ee) => { walk(c, m, cg); walk(t, m, cg); walk(ee, m, cg); }
             Expr::Call(_, args) | Expr::Concat(args) => { for a in args { walk(a, m, cg); } }
             Expr::Quantifier(_, c, _, body) => { walk(c, m, cg); walk(body, m, cg); }
@@ -4049,7 +4059,9 @@ fn count_max_match_arm_binder_slots(expr: &Expr, concept_group: Option<&ConceptG
             Expr::VariantConstruct(_, _, fields) => { for (_, e) in fields { walk(e, m, cg); } }
             Expr::Fetch(_, req) => walk(req, m, cg),
             Expr::StartsWith(h, n) | Expr::Contains(h, n) | Expr::EndsWith(h, n)
-            | Expr::Min(h, n) | Expr::Max(h, n) | Expr::ByteAt(h, n) => { walk(h, m, cg); walk(n, m, cg); }
+            | Expr::Min(h, n) | Expr::Max(h, n) | Expr::ByteAt(h, n)
+            | Expr::BitAnd(h, n) | Expr::BitOr(h, n) | Expr::BitXor(h, n)
+            | Expr::Shl(h, n) | Expr::Shr(h, n) => { walk(h, m, cg); walk(n, m, cg); }
             Expr::Substring(t, s, e) => { walk(t, m, cg); walk(s, m, cg); walk(e, m, cg); }
         }
     }
@@ -4067,7 +4079,7 @@ fn body_contains_variant_construct(expr: &Expr) -> bool {
         Expr::Field(b, _) => body_contains_variant_construct(b),
         Expr::Binary(_, l, r) => body_contains_variant_construct(l) || body_contains_variant_construct(r),
         Expr::Not(i) | Expr::Neg(i) | Expr::Ok(i) | Expr::Err(i)
-        | Expr::Abs(i) | Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i) => {
+        | Expr::Abs(i) | Expr::BitNot(i) | Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i) | Expr::BitNot(i) => {
             body_contains_variant_construct(i)
         }
         Expr::If(c, t, e) => body_contains_variant_construct(c) || body_contains_variant_construct(t) || body_contains_variant_construct(e),
@@ -4083,7 +4095,9 @@ fn body_contains_variant_construct(expr: &Expr) -> bool {
         }
         Expr::Fetch(_, req) => body_contains_variant_construct(req),
         Expr::StartsWith(h, n) | Expr::Contains(h, n) | Expr::EndsWith(h, n)
-        | Expr::Min(h, n) | Expr::Max(h, n) | Expr::ByteAt(h, n) => {
+        | Expr::Min(h, n) | Expr::Max(h, n) | Expr::ByteAt(h, n)
+        | Expr::BitAnd(h, n) | Expr::BitOr(h, n) | Expr::BitXor(h, n)
+        | Expr::Shl(h, n) | Expr::Shr(h, n) => {
             body_contains_variant_construct(h) || body_contains_variant_construct(n)
         }
         Expr::Substring(t, s, e) => body_contains_variant_construct(t) || body_contains_variant_construct(s) || body_contains_variant_construct(e),
@@ -4490,7 +4504,7 @@ fn classify_concat_arg(
         // as None so the dispatcher returns a clear "not supported" error
         // (callers can either restructure their code or fall back to
         // interpreter for those shapes).
-        Expr::JsonEscape(inner) => {
+        Expr::JsonEscape(inner) | Expr::BitNot(inner) => {
             let inner_kind = classify_concat_arg(inner, concept, input_name, text_bindings)?;
             match inner_kind {
                 ConcatArgKind::Text | ConcatArgKind::BoundText => {
@@ -4768,7 +4782,7 @@ fn emit_concat_to_buffer_impl(
                 // an unbounded Field, the size is runtime-dynamic — sized in
                 // the dynamic path below by reading the inner's length and
                 // doubling it.
-                let inner = match arg { Expr::JsonEscape(i) => i.as_ref(), _ => unreachable!() };
+                let inner = match arg { Expr::JsonEscape(i) | Expr::BitNot(i) => i.as_ref(), _ => unreachable!() };
                 let inner_static_max: Option<i32> = match inner {
                     Expr::Field(base, field_name)
                         if matches!(base.as_ref(), Expr::Ident(n) if n == input_name) =>
@@ -4930,7 +4944,7 @@ fn emit_concat_to_buffer_impl(
                 // the inner does NOT have a [..N] bound (otherwise the
                 // static_total path absorbed it). Compute 2 × inner_length
                 // into rcx, then add to rax.
-                let inner = match arg { Expr::JsonEscape(i) => i.as_ref(), _ => unreachable!() };
+                let inner = match arg { Expr::JsonEscape(i) | Expr::BitNot(i) => i.as_ref(), _ => unreachable!() };
                 match inner {
                     Expr::Field(_, field_name) => {
                         // Same shape as the Text-field branch above: load
@@ -5530,7 +5544,7 @@ fn emit_concat_fill(
                 // loop that copies bytes verbatim except for the 5
                 // JSON-significant ones, which expand to two-byte escape
                 // sequences.
-                let inner = match arg { Expr::JsonEscape(i) => i.as_ref(), _ => unreachable!() };
+                let inner = match arg { Expr::JsonEscape(i) | Expr::BitNot(i) => i.as_ref(), _ => unreachable!() };
                 emit_json_escape_load_src(code, inner, input_name, offsets, all_rules, field_ranges, text_bindings)?;
                 emit_json_escape_fill_loop(code);
             }
@@ -10397,7 +10411,7 @@ fn max_stack_depth(expr: &Expr) -> usize {
         // the transform itself uses fixed registers (rsi/rcx) and the
         // existing concat write pointer (rbx), no additional eval-stack
         // pushes beyond what the inner already needs.
-        Expr::JsonEscape(inner) => max_stack_depth(inner),
+        Expr::JsonEscape(inner) | Expr::BitNot(inner) => max_stack_depth(inner),
         // Phase 12 (parse_int): same shape — the parse loop is fixed-
         // register, so the inner's depth dominates.
         Expr::ParseInt(inner) => max_stack_depth(inner),
@@ -10420,10 +10434,10 @@ fn max_stack_depth(expr: &Expr) -> usize {
         Expr::Length(inner) => max_stack_depth(inner),
         // `abs(<number_expr>)` — 5-byte inline (cqo; xor rax, rdx; sub rax, rdx),
         // no eval-stack push, the inner's depth dominates.
-        Expr::Abs(inner) => max_stack_depth(inner),
+        Expr::Abs(inner) | Expr::BitNot(inner) => max_stack_depth(inner),
         // `min(a, b)` / `max(a, b)` — branch-free cmp + cmov; left is
         // evaluated and pushed, right is evaluated, so same shape as Binary.
-        Expr::Min(l, r) | Expr::Max(l, r) => {
+        Expr::Min(l, r) | Expr::Max(l, r) | Expr::BitAnd(l, r) | Expr::BitOr(l, r) | Expr::BitXor(l, r) | Expr::Shl(l, r) | Expr::Shr(l, r) => {
             let left_depth = max_stack_depth(l) + 1;
             let right_depth = max_stack_depth(r);
             left_depth.max(right_depth)
@@ -12425,6 +12439,43 @@ fn emit_eval_expr(
             }
             Ok(())
         }
+        // Bitwise ops on Number args. Algorithm: eval left → rax, push;
+        // eval right → rax; mov rcx, rax; pop rax; OP rax, rcx.
+        Expr::BitAnd(left, right) | Expr::BitOr(left, right) | Expr::BitXor(left, right) => {
+            emit_eval_expr(code, left, input_name, offsets, all_rules, field_ranges, text_bindings, self_call, arena_ctx)?;
+            code.push(0x50); // push rax
+            emit_eval_expr(code, right, input_name, offsets, all_rules, field_ranges, text_bindings, self_call, arena_ctx)?;
+            code.extend_from_slice(&[0x48, 0x89, 0xC1]); // mov rcx, rax (right)
+            code.push(0x58); // pop rax (left)
+            match expr {
+                Expr::BitAnd(_, _) => code.extend_from_slice(&[0x48, 0x21, 0xC8]), // and rax, rcx
+                Expr::BitOr(_, _)  => code.extend_from_slice(&[0x48, 0x09, 0xC8]), // or rax, rcx
+                Expr::BitXor(_, _) => code.extend_from_slice(&[0x48, 0x31, 0xC8]), // xor rax, rcx
+                _ => unreachable!(),
+            }
+            Ok(())
+        }
+        // Shift ops: count must be in CL. Eval left → rax, push; eval
+        // right → rax; mov rcx, rax; pop rax; SHL/SHR rax, cl.
+        Expr::Shl(left, right) | Expr::Shr(left, right) => {
+            emit_eval_expr(code, left, input_name, offsets, all_rules, field_ranges, text_bindings, self_call, arena_ctx)?;
+            code.push(0x50); // push rax
+            emit_eval_expr(code, right, input_name, offsets, all_rules, field_ranges, text_bindings, self_call, arena_ctx)?;
+            code.extend_from_slice(&[0x48, 0x89, 0xC1]); // mov rcx, rax
+            code.push(0x58); // pop rax
+            match expr {
+                Expr::Shl(_, _) => code.extend_from_slice(&[0x48, 0xD3, 0xE0]), // shl rax, cl
+                Expr::Shr(_, _) => code.extend_from_slice(&[0x48, 0xD3, 0xE8]), // shr rax, cl
+                _ => unreachable!(),
+            }
+            Ok(())
+        }
+        // bnot(x): eval → rax; not rax.
+        Expr::BitNot(inner) => {
+            emit_eval_expr(code, inner, input_name, offsets, all_rules, field_ranges, text_bindings, self_call, arena_ctx)?;
+            code.extend_from_slice(&[0x48, 0xF7, 0xD0]); // not rax
+            Ok(())
+        }
         // `substring(<text>, <start>, <end>)` produces text (a (ptr, len)
         // pair), not a scalar. It cannot be evaluated through this scalar
         // dispatcher; the text-producing path lives in
@@ -12725,7 +12776,7 @@ fn emit_length(
         // to the same shapes emit_json_escape_load_src accepts (text
         // input field, BoundText) so the fill-pass path that already
         // exists in the binary is the one we measure here.
-        Expr::JsonEscape(inner) => {
+        Expr::JsonEscape(inner) | Expr::BitNot(inner) => {
             // Load (rsi = src ptr, rcx = src len) for the inner. Errors
             // propagate with a clear message if the shape is unsupported.
             emit_json_escape_load_src(code, inner.as_ref(), input_name, offsets, all_rules, field_ranges, text_bindings)?;
@@ -15487,6 +15538,12 @@ fn expr_kind(e: &Expr) -> &'static str {
         Expr::FoldBytes(_, _, _, _, _, _) => "FoldBytes",
         Expr::VariantConstruct(_, _, _) => "VariantConstruct",
         Expr::MatchVariant(_, _) => "MatchVariant",
+        Expr::BitAnd(_, _) => "BitAnd",
+        Expr::BitOr(_, _) => "BitOr",
+        Expr::BitXor(_, _) => "BitXor",
+        Expr::BitNot(_) => "BitNot",
+        Expr::Shl(_, _) => "Shl",
+        Expr::Shr(_, _) => "Shr",
     }
 }
 
@@ -27612,5 +27669,38 @@ rule extract_word
             assert_eq!(stdout.as_ref(), *expected, "eval_cmd({:?}) mismatch", args);
         }
         let _ = std::fs::remove_file(&out);
+    }
+
+    #[test]
+    fn bitwise_ops_native_runtime() {
+        let src = std::fs::read_to_string("examples/bit_ops.verbose")
+            .expect("examples/bit_ops.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+
+        for (rule, args, expected) in &[
+            ("xor_bytes", vec!["42", "15"], "37\n"),
+            ("xor_bytes", vec!["255", "170"], "85\n"),
+            ("isolate_low4", vec!["250", "0"], "10\n"),
+            ("invert_byte", vec!["5", "0"], "-6\n"),
+            ("invert_byte", vec!["0", "0"], "-1\n"),
+            ("pack_byte", vec!["7", "3"], "115\n"),
+        ] {
+            let out = std::env::temp_dir().join(format!("verbosec_test_bit_{}", rule));
+            compile_native(&program, rule, out.to_str().unwrap(), false, false)
+                .expect("bit op rule must compile");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o755));
+            }
+            let output = std::process::Command::new(&out)
+                .args(args)
+                .output()
+                .expect("native binary must run");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert_eq!(stdout.as_ref(), *expected, "{}({:?}) mismatch", rule, args);
+            let _ = std::fs::remove_file(&out);
+        }
     }
 }
