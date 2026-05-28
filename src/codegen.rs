@@ -251,6 +251,12 @@ fn emit_expr(expr: &Expr, input_name: &str, concept: Option<&Concept>) -> String
         | Expr::ByteAt(_, _) => {
             "(/* collection/result/record/variant/match/concat/read/fetch/json_escape/parse_int/now_unix/starts_with/contains/ends_with/length/abs/min/max/substring/byte_at/fold_bytes op: use --run interpreter or --native */false)".to_string()
         }
+        Expr::BitAnd(a, b) => format!("({} & {})", emit_expr(a, input_name, concept), emit_expr(b, input_name, concept)),
+        Expr::BitOr(a, b) => format!("({} | {})", emit_expr(a, input_name, concept), emit_expr(b, input_name, concept)),
+        Expr::BitXor(a, b) => format!("({} ^ {})", emit_expr(a, input_name, concept), emit_expr(b, input_name, concept)),
+        Expr::BitNot(i) => format!("!({})", emit_expr(i, input_name, concept)),
+        Expr::Shl(a, b) => format!("({} << ({} as u32))", emit_expr(a, input_name, concept), emit_expr(b, input_name, concept)),
+        Expr::Shr(a, b) => format!("({} >> ({} as u32))", emit_expr(a, input_name, concept), emit_expr(b, input_name, concept)),
         Expr::Call(name, _args) => {
             if let Some(c) = concept {
                 let fields: Vec<&str> = c.fields.iter().map(|f| f.name.as_str()).collect();

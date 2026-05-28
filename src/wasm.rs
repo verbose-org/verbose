@@ -1232,7 +1232,7 @@ fn walk_text_literals<F: FnMut(&str)>(expr: &Expr, f: &mut F) {
         Expr::Concat(args) => { for a in args { walk_text_literals(a, f); } }
         // W3c text primitives: literals can appear in their args (e.g.
         // `starts_with(req.path, "/api/v1/")`). Recurse into each.
-        Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i) => walk_text_literals(i, f),
+        Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i) | Expr::BitNot(i) => walk_text_literals(i, f),
         Expr::StartsWith(h, n) | Expr::EndsWith(h, n) | Expr::Contains(h, n) => {
             walk_text_literals(h, f); walk_text_literals(n, f);
         }
@@ -1288,7 +1288,7 @@ fn expr_uses_parse_int(expr: &Expr) -> bool {
         Expr::Min(a, b) | Expr::Max(a, b) => expr_uses_parse_int(a) || expr_uses_parse_int(b),
         Expr::Call(_, args) => args.iter().any(expr_uses_parse_int),
         Expr::Concat(args) => args.iter().any(expr_uses_parse_int),
-        Expr::Length(i) | Expr::JsonEscape(i) => expr_uses_parse_int(i),
+        Expr::Length(i) | Expr::JsonEscape(i) | Expr::BitNot(i) => expr_uses_parse_int(i),
         Expr::StartsWith(h, n) | Expr::EndsWith(h, n) | Expr::Contains(h, n) => {
             expr_uses_parse_int(h) || expr_uses_parse_int(n)
         }
@@ -1378,7 +1378,7 @@ fn expr_uses_concat(expr: &Expr) -> bool {
         // W3c text primitives: their args may contain a concat (e.g.
         // `starts_with(concat("/api/v", n), "...")`). Recurse so the
         // allocator scratches get reserved.
-        Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i) => expr_uses_concat(i),
+        Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i) | Expr::BitNot(i) => expr_uses_concat(i),
         Expr::StartsWith(h, n) | Expr::EndsWith(h, n) | Expr::Contains(h, n) => {
             expr_uses_concat(h) || expr_uses_concat(n)
         }
@@ -1418,7 +1418,7 @@ fn expr_concat_has_number_arg(
                 || expr_concat_has_number_arg(b, field_shapes, binding_shapes)
         }
         Expr::Call(_, args) => args.iter().any(|a| expr_concat_has_number_arg(a, field_shapes, binding_shapes)),
-        Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i) => {
+        Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i) | Expr::BitNot(i) => {
             expr_concat_has_number_arg(i, field_shapes, binding_shapes)
         }
         Expr::StartsWith(h, n) | Expr::EndsWith(h, n) | Expr::Contains(h, n) => {
@@ -1452,7 +1452,7 @@ fn expr_has_nested_concat(expr: &Expr) -> bool {
             Expr::Not(i) | Expr::Neg(i) | Expr::Abs(i) => inside_concat(i),
             Expr::Min(a, b) | Expr::Max(a, b) => inside_concat(a) || inside_concat(b),
             Expr::Call(_, args) => args.iter().any(inside_concat),
-            Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i) => inside_concat(i),
+            Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i) | Expr::BitNot(i) => inside_concat(i),
             Expr::StartsWith(h, n) | Expr::EndsWith(h, n) | Expr::Contains(h, n) => {
                 inside_concat(h) || inside_concat(n)
             }
@@ -1470,7 +1470,7 @@ fn expr_has_nested_concat(expr: &Expr) -> bool {
         Expr::Not(i) | Expr::Neg(i) | Expr::Abs(i) => expr_has_nested_concat(i),
         Expr::Min(a, b) | Expr::Max(a, b) => expr_has_nested_concat(a) || expr_has_nested_concat(b),
         Expr::Call(_, args) => args.iter().any(expr_has_nested_concat),
-        Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i) => expr_has_nested_concat(i),
+        Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i) | Expr::BitNot(i) => expr_has_nested_concat(i),
         Expr::StartsWith(h, n) | Expr::EndsWith(h, n) | Expr::Contains(h, n) => {
             expr_has_nested_concat(h) || expr_has_nested_concat(n)
         }
@@ -2284,7 +2284,7 @@ fn expr_uses_scratch(expr: &Expr) -> bool {
         Expr::Call(_, args) => args.iter().any(expr_uses_scratch),
         Expr::Concat(args) => args.iter().any(expr_uses_scratch),
         // W3c text primitives — abs/min/max may be nested in their args.
-        Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i) => expr_uses_scratch(i),
+        Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i) | Expr::BitNot(i) => expr_uses_scratch(i),
         Expr::StartsWith(h, n) | Expr::EndsWith(h, n) | Expr::Contains(h, n) => {
             expr_uses_scratch(h) || expr_uses_scratch(n)
         }

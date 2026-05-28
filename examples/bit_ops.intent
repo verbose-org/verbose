@@ -1,0 +1,6 @@
+Demonstrate bitwise primitives band, bor, bxor, bnot, shl, shr.
+xor_bytes(a, b): a XOR b.
+isolate_low4(x): x AND 0x0F.
+pack_byte(hi, lo): (hi << 4) OR lo.
+Expected: xor_bytes(42, 15) = 37, isolate_low4(0xFA) = 10,
+pack_byte(7, 3) = 115.

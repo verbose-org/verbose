@@ -1,0 +1,76 @@
+@verbose 0.1.0
+
+concept TwoBytes
+  @intention: "two byte values"
+  @source: bit_ops.intent:1
+  fields:
+    a : number [0, 255]
+    b : number [0, 255]
+
+
+rule xor_bytes
+  @intention: "bitwise XOR of two bytes"
+  @source: bit_ops.intent:2
+  input:
+    t : TwoBytes
+  output:
+    out : number
+  logic:
+    out = bxor(t.a, t.b)
+  proofs:
+    purity:
+      reads : [t.a, t.b]
+      calls : []
+    termination:
+      bound : 1
+
+
+rule isolate_low4
+  @intention: "keep only the low 4 bits via AND with 0x0F"
+  @source: bit_ops.intent:3
+  input:
+    t : TwoBytes
+  output:
+    out : number
+  logic:
+    out = band(t.a, 15)
+  proofs:
+    purity:
+      reads : [t.a]
+      calls : []
+    termination:
+      bound : 1
+
+
+rule invert_byte
+  @intention: "bitwise NOT of a byte (returns negative due to two's complement)"
+  @source: bit_ops.intent:4
+  input:
+    t : TwoBytes
+  output:
+    out : number
+  logic:
+    out = bnot(t.a)
+  proofs:
+    purity:
+      reads : [t.a]
+      calls : []
+    termination:
+      bound : 1
+
+
+rule pack_byte
+  @intention: "pack two nibbles into one byte: (hi << 4) | lo"
+  @source: bit_ops.intent:4
+  input:
+    t : TwoBytes
+  output:
+    out : number
+  logic:
+    out = bor(shl(t.a, 4), band(t.b, 15))
+  proofs:
+    purity:
+      reads : [t.a, t.b]
+      calls : []
+    termination:
+      bound : 10

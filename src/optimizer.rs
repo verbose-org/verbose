@@ -58,7 +58,7 @@ fn count_nodes(expr: &Expr) -> usize {
         // request bytes Expr — count this node + recurse.
         Expr::Fetch(_, req) => 1 + count_nodes(req),
         // Phase 12 (json_escape): one node + recurse on the inner.
-        Expr::JsonEscape(inner) => 1 + count_nodes(inner),
+        Expr::JsonEscape(inner) | Expr::BitNot(inner) => 1 + count_nodes(inner),
         // Phase 12 (parse_int): same shape as JsonEscape — one node + recurse.
         Expr::ParseInt(inner) => 1 + count_nodes(inner),
         // `now_unix()` — leaf node (no children to recurse on), counts as one.
@@ -74,10 +74,10 @@ fn count_nodes(expr: &Expr) -> usize {
         // `length(<text_expr>)` — same shape as ParseInt: one node + recurse.
         Expr::Length(inner) => 1 + count_nodes(inner),
         // `abs(<number_expr>)` — same shape as Neg: one node + recurse.
-        Expr::Abs(inner) => 1 + count_nodes(inner),
+        Expr::Abs(inner) | Expr::BitNot(inner) => 1 + count_nodes(inner),
         // `min(a, b)` / `max(a, b)` — same shape as Binary: count this node
         // + recurse into both children.
-        Expr::Min(l, r) | Expr::Max(l, r) => 1 + count_nodes(l) + count_nodes(r),
+        Expr::Min(l, r) | Expr::Max(l, r) | Expr::BitAnd(l, r) | Expr::BitOr(l, r) | Expr::BitXor(l, r) | Expr::Shl(l, r) | Expr::Shr(l, r) => 1 + count_nodes(l) + count_nodes(r),
         // `substring(text, start, end)` — three children, all expressions.
         Expr::Substring(t, s, e) => 1 + count_nodes(t) + count_nodes(s) + count_nodes(e),
         // `byte_at(text, index)` — two children, all expressions.
@@ -513,6 +513,12 @@ pub fn substitute_ident(expr: &Expr, name: &str, replacement: &Expr) -> Expr {
                 .collect();
             Expr::MatchVariant(Box::new(new_scrut), new_arms)
         }
+        Expr::BitAnd(a, b) => Expr::BitAnd(Box::new(substitute_ident(a, name, replacement)), Box::new(substitute_ident(b, name, replacement))),
+        Expr::BitOr(a, b) => Expr::BitOr(Box::new(substitute_ident(a, name, replacement)), Box::new(substitute_ident(b, name, replacement))),
+        Expr::BitXor(a, b) => Expr::BitXor(Box::new(substitute_ident(a, name, replacement)), Box::new(substitute_ident(b, name, replacement))),
+        Expr::BitNot(i) => Expr::BitNot(Box::new(substitute_ident(i, name, replacement))),
+        Expr::Shl(a, b) => Expr::Shl(Box::new(substitute_ident(a, name, replacement)), Box::new(substitute_ident(b, name, replacement))),
+        Expr::Shr(a, b) => Expr::Shr(Box::new(substitute_ident(a, name, replacement)), Box::new(substitute_ident(b, name, replacement))),
     }
 }
 
@@ -916,6 +922,12 @@ pub fn optimize_expr(
                 })
                 .collect(),
         ),
+        Expr::BitAnd(a, b) => Expr::BitAnd(Box::new(optimize_expr(a, input_name, field_ranges)), Box::new(optimize_expr(b, input_name, field_ranges))),
+        Expr::BitOr(a, b) => Expr::BitOr(Box::new(optimize_expr(a, input_name, field_ranges)), Box::new(optimize_expr(b, input_name, field_ranges))),
+        Expr::BitXor(a, b) => Expr::BitXor(Box::new(optimize_expr(a, input_name, field_ranges)), Box::new(optimize_expr(b, input_name, field_ranges))),
+        Expr::BitNot(i) => Expr::BitNot(Box::new(optimize_expr(i, input_name, field_ranges))),
+        Expr::Shl(a, b) => Expr::Shl(Box::new(optimize_expr(a, input_name, field_ranges)), Box::new(optimize_expr(b, input_name, field_ranges))),
+        Expr::Shr(a, b) => Expr::Shr(Box::new(optimize_expr(a, input_name, field_ranges)), Box::new(optimize_expr(b, input_name, field_ranges))),
     }
 }
 
