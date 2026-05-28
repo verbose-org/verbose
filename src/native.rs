@@ -27993,4 +27993,68 @@ rule extract_word
         }
         let _ = std::fs::remove_file(&out);
     }
+
+    /// Multi-block SHA-256: input up to 119 bytes (1 or 2 blocks).
+    /// Validates that padding spilling into a second block, plus the
+    /// running hash state carried across blocks, produces the same
+    /// output as sha256sum for inputs that straddle block boundaries.
+    #[test]
+    fn sha256_multi_2blocks_matches_sha256sum() {
+        let handle = std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(sha256_multi_test_body)
+            .expect("spawn test thread");
+        handle.join().expect("test thread panicked");
+    }
+
+    fn sha256_multi_test_body() {
+        let src = std::fs::read_to_string("examples/sha256_multi.verbose")
+            .expect("examples/sha256_multi.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+        let out = std::env::temp_dir().join("verbosec_test_sha256_multi");
+        compile_native(&program, "sha256_word", out.to_str().unwrap(), false, false)
+            .expect("sha256_multi must compile");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o755));
+        }
+        // Mix of 1-block and 2-block inputs.
+        let inputs: &[(&str, &str)] = &[
+            // 1-block
+            ("",
+             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"),
+            ("abc",
+             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"),
+            ("hello",
+             "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"),
+            ("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",  // 55 'a's
+             "9f4390f8d30c2dd92ec9f095b65e2b9ae9b0a925a5258e241c9f1e910f734318"),
+            // 2-block: padding spills into block 1
+            ("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",  // 56 'a's
+             "b35439a4ac6f0948b6d6f9e3c6af0f5f590ce20f1bde7090ef7970686ec6738a"),
+            // 2-block: longer
+            ("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",  // 100 'a's
+             "2816597888e4a0d3a36b82b83316ab32680eb8f00f8cd3b904d681246d285a0e"),
+        ];
+        for (input, expected_hex) in inputs {
+            let mut hex_acc = String::new();
+            for i in 0..8 {
+                let i_str = i.to_string();
+                let output = std::process::Command::new(&out)
+                    .args(&[*input, i_str.as_str()])
+                    .output()
+                    .expect("native binary must run");
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let val: u64 = stdout.trim().parse().expect("parse word");
+                hex_acc.push_str(&format!("{:08x}", val));
+            }
+            assert_eq!(
+                hex_acc, *expected_hex,
+                "SHA-256(len={}) mismatch with sha256sum", input.len()
+            );
+        }
+        let _ = std::fs::remove_file(&out);
+    }
 }
