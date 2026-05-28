@@ -1,0 +1,5 @@
+SHA-256 building blocks expressed in Verbose using the bitwise primitives.
+Each rule maps to a standard SHA-256 helper function. Output values
+match Python hashlib's reference values.
+Tested with rotr32, ch, maj, big_sigma0/1, small_sigma0/1 against
+known SHA-256 intermediate values.

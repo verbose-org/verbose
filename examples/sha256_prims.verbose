@@ -1,0 +1,151 @@
+@verbose 0.1.0
+
+concept OneWord
+  @intention: "single 32-bit word input"
+  @source: sha256_prims.intent:1
+  fields:
+    x : number [0, 4294967295]
+
+concept WordAndShift
+  @intention: "word + shift count for rotr32"
+  @source: sha256_prims.intent:1
+  fields:
+    x : number [0, 4294967295]
+    n : number [0, 31]
+
+concept ThreeWords
+  @intention: "three 32-bit words for ch/maj"
+  @source: sha256_prims.intent:1
+  fields:
+    x : number [0, 4294967295]
+    y : number [0, 4294967295]
+    z : number [0, 4294967295]
+
+
+rule rotr32
+  @intention: "rotate right by n bits within a 32-bit field"
+  @source: sha256_prims.intent:2
+  input:
+    w : WordAndShift
+  output:
+    out : number
+  logic:
+    out = band(bor(shr(w.x, w.n), shl(w.x, 32 - w.n)), 4294967295)
+  proofs:
+    purity:
+      reads : [w.x, w.n]
+      calls : []
+    termination:
+      bound : 10
+
+
+rule ch
+  @intention: "(x AND y) XOR ((NOT x) AND z)"
+  @source: sha256_prims.intent:3
+  input:
+    t : ThreeWords
+  output:
+    out : number
+  logic:
+    out = band(bxor(band(t.x, t.y), band(bnot(t.x), t.z)), 4294967295)
+  proofs:
+    purity:
+      reads : [t.x, t.y, t.z]
+      calls : []
+    termination:
+      bound : 10
+
+
+rule maj
+  @intention: "(x AND y) XOR (x AND z) XOR (y AND z)"
+  @source: sha256_prims.intent:3
+  input:
+    t : ThreeWords
+  output:
+    out : number
+  logic:
+    out = band(bxor(bxor(band(t.x, t.y), band(t.x, t.z)), band(t.y, t.z)), 4294967295)
+  proofs:
+    purity:
+      reads : [t.x, t.y, t.z]
+      calls : []
+    termination:
+      bound : 10
+
+
+rule big_sigma0
+  @intention: "rotr(x, 2) XOR rotr(x, 13) XOR rotr(x, 22)"
+  @source: sha256_prims.intent:4
+  input:
+    w : OneWord
+  output:
+    out : number
+  logic:
+    let r2  = rotr32(WordAndShift { x: w.x, n: 2 })
+    let r13 = rotr32(WordAndShift { x: w.x, n: 13 })
+    let r22 = rotr32(WordAndShift { x: w.x, n: 22 })
+    out = band(bxor(bxor(r2, r13), r22), 4294967295)
+  proofs:
+    purity:
+      reads : [w.x]
+      calls : [rotr32]
+    termination:
+      bound : 20
+
+
+rule big_sigma1
+  @intention: "rotr(x, 6) XOR rotr(x, 11) XOR rotr(x, 25)"
+  @source: sha256_prims.intent:4
+  input:
+    w : OneWord
+  output:
+    out : number
+  logic:
+    let r6  = rotr32(WordAndShift { x: w.x, n: 6 })
+    let r11 = rotr32(WordAndShift { x: w.x, n: 11 })
+    let r25 = rotr32(WordAndShift { x: w.x, n: 25 })
+    out = band(bxor(bxor(r6, r11), r25), 4294967295)
+  proofs:
+    purity:
+      reads : [w.x]
+      calls : [rotr32]
+    termination:
+      bound : 20
+
+
+rule small_sigma0
+  @intention: "rotr(x, 7) XOR rotr(x, 18) XOR (x >> 3)"
+  @source: sha256_prims.intent:4
+  input:
+    w : OneWord
+  output:
+    out : number
+  logic:
+    let r7  = rotr32(WordAndShift { x: w.x, n: 7 })
+    let r18 = rotr32(WordAndShift { x: w.x, n: 18 })
+    out = band(bxor(bxor(r7, r18), shr(w.x, 3)), 4294967295)
+  proofs:
+    purity:
+      reads : [w.x]
+      calls : [rotr32]
+    termination:
+      bound : 20
+
+
+rule small_sigma1
+  @intention: "rotr(x, 17) XOR rotr(x, 19) XOR (x >> 10)"
+  @source: sha256_prims.intent:4
+  input:
+    w : OneWord
+  output:
+    out : number
+  logic:
+    let r17 = rotr32(WordAndShift { x: w.x, n: 17 })
+    let r19 = rotr32(WordAndShift { x: w.x, n: 19 })
+    out = band(bxor(bxor(r17, r19), shr(w.x, 10)), 4294967295)
+  proofs:
+    purity:
+      reads : [w.x]
+      calls : [rotr32]
+    termination:
+      bound : 20

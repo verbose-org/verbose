@@ -267,29 +267,54 @@ fn compile_native_code(
     // Reactions are checked against their trigger rule's call graph
     // (the reaction itself doesn't recurse, but its trigger might).
     let recursion_witness = detect_native_recursion(rule, &rules);
-    // Computed lazily: the SCC (set of rules in the same cycle as entry).
-    // For single self-recursion, scc = [entry]. For mutual (slice 5.4+),
-    // scc holds every rule in the cycle.
+    // Also route through the callable path if any transitively-reachable
+    // callee has a different input concept than the entry — the inline
+    // path shares the caller's offsets map, which has the wrong fields
+    // for a cross-concept call.
+    let needs_callable_path = recursion_witness.is_some() || {
+        // Cross-concept callee detection only applies for scalar-output
+        // entry rules. Result/Collection/Record output rules have their
+        // own specialized emit paths that handle cross-concept calls
+        // (e.g. emit_result_program's match_result inline path).
+        let entry_scalar = matches!(&rule.input_ty, Type::Named(_))
+            && matches!(&rule.output_ty, Type::Number | Type::Bool | Type::Text);
+        let entry_input = match &rule.input_ty {
+            Type::Named(n) => Some(n.as_str()),
+            _ => None,
+        };
+        entry_scalar && {
+            let reachable = collect_transitive_recursive_callees(rule, &rules);
+            reachable.iter().any(|name| {
+                rules.get(name.as_str()).map_or(false, |r| {
+                    let r_in = match &r.input_ty {
+                        Type::Named(n) => Some(n.as_str()),
+                        _ => None,
+                    };
+                    entry_input.is_some() && r_in.is_some() && entry_input != r_in
+                })
+            })
+        }
+    };
     let mut scc_rules_owned: Vec<&Rule> = Vec::new();
-    if let Some(cycle) = &recursion_witness {
-        // Slice 5.4: lift the "only_self" restriction. Mutually-recursive
-        // rules are now accepted as long as every member of the SCC
-        // satisfies the same constraints as the entry rule (same input
-        // concept, same output type, Number-only fields, no let bindings,
-        // no concat in body — inherited from slice 5.1a-5.3).
-        let scc_names = collect_scc_containing(rule, &rules);
-        // Put the entry rule first so its callable label sits at the
-        // canonical offset 5 — caller's _start loop calls it directly.
-        let mut ordered: Vec<&Rule> = Vec::new();
-        ordered.push(rule);
-        for name in &scc_names {
-            if name != &rule.name {
-                if let Some(&r) = rules.get(name.as_str()) {
-                    ordered.push(r);
+    if needs_callable_path {
+        // Build the initial SCC. With recursion: the strongly-connected
+        // component containing the entry. Without (cross-concept only):
+        // just the entry rule. Transitive callees are added below.
+        if recursion_witness.is_some() {
+            let scc_names = collect_scc_containing(rule, &rules);
+            let mut ordered: Vec<&Rule> = Vec::new();
+            ordered.push(rule);
+            for name in &scc_names {
+                if name != &rule.name {
+                    if let Some(&r) = rules.get(name.as_str()) {
+                        ordered.push(r);
+                    }
                 }
             }
+            scc_rules_owned = ordered;
+        } else {
+            scc_rules_owned.push(rule);
         }
-        scc_rules_owned = ordered;
 
         // Slice 4a.3: when the program declares a concept_group, extend
         // `scc_rules_owned` with every recursive rule transitively
@@ -330,8 +355,18 @@ fn compile_native_code(
         // so those cross-rule equality checks are skipped.
         let scc_names_vec = collect_scc_containing(rule, &rules);
         let scc_names: std::collections::HashSet<String> = scc_names_vec.into_iter().collect();
+        // The recursion constraints (Number-only fields, scalar/text output,
+        // termination story) only apply to rules that are actually in a
+        // cycle. Cross-concept-only routing through the callable path is
+        // for layout correctness, not stack safety, so it bypasses these.
+        let entry_is_recursive = recursion_witness.is_some();
         for r in &scc_rules_owned {
             let is_in_entry_scc = scc_names.contains(&r.name);
+            if !entry_is_recursive {
+                // No cycle: only the inlining-correctness extension; skip
+                // recursion-specific constraints.
+                continue;
+            }
             if !has_group && is_in_entry_scc {
                 if r.input_ty != rule.input_ty {
                     return Err(NativeError {
@@ -429,18 +464,20 @@ fn compile_native_code(
             }
         }
         // (let-bindings already checked per-rule above.)
-        let _ = cycle;
         // Phase C: suppress the breadcrumb when structural recursion is
-        // proven for the entry rule. The verifier already checked the
-        // proof; here we just gate the warning on its absence.
-        let has_termination_proof = rule.proofs.termination.structural.is_some()
-            || rule.proofs.termination.decreasing.is_some()
-            || rule.proofs.termination.increasing.is_some();
-        if !has_termination_proof {
-            eprintln!(
-                "native: rule '{}' is recursive (cycle through '{}'); the declared `bound:` is NOT a termination proof for recursion. Runtime stack-overflow is the only safety signal until Phase C ships structural recursion. Use `--run` (interpreter) if you need an audit trace.",
-                rule.name, cycle
-            );
+        // proven for the entry rule. Only emit it when the rule is
+        // actually recursive (cross-concept-only triggers needs_callable_path
+        // but doesn't risk stack overflow — it's just a routing decision).
+        if let Some(cycle) = &recursion_witness {
+            let has_termination_proof = rule.proofs.termination.structural.is_some()
+                || rule.proofs.termination.decreasing.is_some()
+                || rule.proofs.termination.increasing.is_some();
+            if !has_termination_proof {
+                eprintln!(
+                    "native: rule '{}' is recursive (cycle through '{}'); the declared `bound:` is NOT a termination proof for recursion. Runtime stack-overflow is the only safety signal until Phase C ships structural recursion. Use `--run` (interpreter) if you need an audit trace.",
+                    rule.name, cycle
+                );
+            }
         }
         // Fall through to the slice 5.1a emit below. The standard
         // post-emit pipeline (stdin/stream prepend, etc.) still runs.
@@ -509,7 +546,7 @@ fn compile_native_code(
         _ => None,
     };
 
-    let mut code = if recursion_witness.is_some() {
+    let mut code = if needs_callable_path {
         // Slice 5.1a-5.4: emit the rule (or SCC) as real callables.
         // scc_rules_owned was populated above when recursion was detected;
         // for single self-recursion it has one entry, for mutual it has N.
@@ -1538,8 +1575,24 @@ fn collect_transitive_recursive_callees(
     let mut out: Vec<String> = Vec::new();
     for name in &forward {
         if let Some(&r) = all_rules.get(name.as_str()) {
+            // Include rules that need real `call` emission (not inlining):
+            //   - recursive rules (can't inline a cycle)
+            //   - rules with let bindings (inline path drops them)
+            //   - rules with a DIFFERENT input concept than the entry
+            //     (inline path shares caller's offsets — wrong if the
+            //     callee's input concept has different fields).
+            let entry_input = match &entry.input_ty {
+                Type::Named(n) => Some(n.as_str()),
+                _ => None,
+            };
+            let r_input = match &r.input_ty {
+                Type::Named(n) => Some(n.as_str()),
+                _ => None,
+            };
+            let cross_concept = entry_input.is_some() && r_input.is_some() && entry_input != r_input;
             if detect_native_recursion(r, all_rules).is_some()
                 || !r.logic.bindings.is_empty()
+                || cross_concept
             {
                 out.push(name.clone());
             }
@@ -27700,6 +27753,43 @@ rule extract_word
                 .expect("native binary must run");
             let stdout = String::from_utf8_lossy(&output.stdout);
             assert_eq!(stdout.as_ref(), *expected, "{}({:?}) mismatch", rule, args);
+            let _ = std::fs::remove_file(&out);
+        }
+    }
+
+    #[test]
+    fn sha256_primitives_match_python_reference() {
+        let src = std::fs::read_to_string("examples/sha256_prims.verbose")
+            .expect("examples/sha256_prims.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+        // Test vectors computed via Python hashlib reference (see Python
+        // script in PR #66 description).
+        let cases: &[(&str, Vec<&str>, &str)] = &[
+            ("rotr32",       vec!["4278190080", "8"], "16711680\n"),    // rotr(0xFF000000, 8)
+            ("rotr32",       vec!["305419896", "4"],  "2166572391\n"), // rotr(0x12345678, 4)
+            ("ch",           vec!["3405691582", "4294901760", "65535"], "3405661505\n"),
+            ("maj",          vec!["2863311530", "3149642683", "3435973836"], "2863311530\n"),
+            ("big_sigma0",   vec!["1779033703"], "3458249854\n"),
+            ("big_sigma1",   vec!["1359893119"], "898049835\n"),
+            ("small_sigma0", vec!["1116352408"], "3006415118\n"),
+            ("small_sigma1", vec!["1899447441"], "1254546284\n"),
+        ];
+        for (i, (rule, args, expected)) in cases.iter().enumerate() {
+            let out = std::env::temp_dir().join(format!("verbosec_test_sha_{}_{}", rule, i));
+            compile_native(&program, rule, out.to_str().unwrap(), false, false)
+                .expect("SHA-256 primitive must compile");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o755));
+            }
+            let output = std::process::Command::new(&out)
+                .args(args)
+                .output()
+                .expect("native binary must run");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert_eq!(stdout.as_ref(), *expected, "{}({:?}) mismatch with Python hashlib", rule, args);
             let _ = std::fs::remove_file(&out);
         }
     }
