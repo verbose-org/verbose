@@ -28222,4 +28222,109 @@ rule extract_word
         }
         let _ = std::fs::remove_file(&out);
     }
+
+    #[test]
+    fn aes_round_transforms_match_reference() {
+        // Validates sub_bytes / shift_rows / mix_columns / add_round_key in
+        // examples/aes_transforms.verbose against a Python-derived reference
+        // round (plaintext "00 11 22 ... ff", key "00 01 02 ... 0f", round
+        // key 1 from FIPS-197 KeyExpansion). All four transforms operate on
+        // a column-major 4x4 state, so b[i] = matrix[i % 4][i / 4]. Each
+        // rule returns the byte at output position `which` (0..15).
+        let handle = std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(aes_transforms_test_body)
+            .expect("spawn test thread");
+        handle.join().expect("test thread panicked");
+    }
+
+    fn aes_transforms_test_body() {
+        let src = std::fs::read_to_string("examples/aes_transforms.verbose")
+            .expect("examples/aes_transforms.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+
+        let state_in: [u8; 16] = [0x00,0x10,0x20,0x30,0x40,0x50,0x60,0x70,0x80,0x90,0xa0,0xb0,0xc0,0xd0,0xe0,0xf0];
+        let state_sb: [u8; 16] = [0x63,0xca,0xb7,0x04,0x09,0x53,0xd0,0x51,0xcd,0x60,0xe0,0xe7,0xba,0x70,0xe1,0x8c];
+        let state_sr: [u8; 16] = [0x63,0x53,0xe0,0x8c,0x09,0x60,0xe1,0x04,0xcd,0x70,0xb7,0x51,0xba,0xca,0xd0,0xe7];
+        let state_mc: [u8; 16] = [0x5f,0x72,0x64,0x15,0x57,0xf5,0xbc,0x92,0xf7,0xbe,0x3b,0x29,0x1d,0xb9,0xf9,0x1a];
+        let round_key1: [u8; 16] = [0xd6,0xaa,0x74,0xfd,0xd2,0xaf,0x72,0xfa,0xda,0xa6,0x78,0xf1,0xd6,0xab,0x76,0xfe];
+        let state_ark: [u8; 16] = [0x89,0xd8,0x10,0xe8,0x85,0x5a,0xce,0x68,0x2d,0x18,0x43,0xd8,0xcb,0x12,0x8f,0xe4];
+
+        let run = |rule: &str, args: &[u8]| -> u32 {
+            let out = std::env::temp_dir().join(format!("verbosec_test_aes_{}", rule));
+            compile_native(&program, rule, out.to_str().unwrap(), false, false)
+                .unwrap_or_else(|e| panic!("{} must compile: {:?}", rule, e));
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o755));
+            }
+            let mut cmd = std::process::Command::new(&out);
+            for a in args { cmd.arg(a.to_string()); }
+            let output = cmd.output().expect("native binary must run");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let v: u32 = stdout.trim().parse().unwrap_or_else(|_| panic!("parse {} -> {:?}", rule, stdout));
+            let _ = std::fs::remove_file(&out);
+            v
+        };
+
+        // Compile each rule once and validate all 16 byte positions.
+        for (rule, input_bytes, expected) in [
+            ("sub_bytes",     state_in.as_slice(), state_sb),
+            ("shift_rows",    state_sb.as_slice(), state_sr),
+            ("mix_columns",   state_sr.as_slice(), state_mc),
+        ] {
+            let out = std::env::temp_dir().join(format!("verbosec_test_aes_{}", rule));
+            compile_native(&program, rule, out.to_str().unwrap(), false, false)
+                .unwrap_or_else(|e| panic!("{} must compile: {:?}", rule, e));
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o755));
+            }
+            for w in 0u8..16 {
+                let mut args: Vec<u8> = input_bytes.to_vec();
+                args.push(w);
+                let mut cmd = std::process::Command::new(&out);
+                for a in &args { cmd.arg(a.to_string()); }
+                let output = cmd.output().expect("native binary must run");
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let got: u32 = stdout.trim().parse().unwrap_or_else(|_| panic!("parse {} w={}: {:?}", rule, w, stdout));
+                assert_eq!(
+                    got as u8, expected[w as usize],
+                    "{}[{}] = {:02x} but reference says {:02x}",
+                    rule, w, got, expected[w as usize]
+                );
+            }
+            let _ = std::fs::remove_file(&out);
+        }
+
+        // add_round_key takes state + round_key + which (33 args)
+        let _ = run; // shut up unused warn
+        let out = std::env::temp_dir().join("verbosec_test_aes_add_round_key");
+        compile_native(&program, "add_round_key", out.to_str().unwrap(), false, false)
+            .expect("add_round_key must compile");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o755));
+        }
+        for w in 0u8..16 {
+            let mut args: Vec<u8> = state_mc.to_vec();
+            args.extend_from_slice(&round_key1);
+            args.push(w);
+            let mut cmd = std::process::Command::new(&out);
+            for a in &args { cmd.arg(a.to_string()); }
+            let output = cmd.output().expect("native binary must run");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let got: u32 = stdout.trim().parse().unwrap_or_else(|_| panic!("parse add_round_key w={}: {:?}", w, stdout));
+            assert_eq!(
+                got as u8, state_ark[w as usize],
+                "add_round_key[{}] = {:02x} but reference says {:02x}",
+                w, got, state_ark[w as usize]
+            );
+        }
+        let _ = std::fs::remove_file(&out);
+    }
 }

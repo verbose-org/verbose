@@ -1,0 +1,9 @@
+AES round transforms: SubBytes, ShiftRows, MixColumns, AddRoundKey.
+Each transform is one rule, taking a 16-byte Block (or BlockAndKey
+for AddRoundKey) and returning the byte at output position `which`.
+Helpers: aes_sbox (FIPS-197 S-box), xtime (GF(2^8) multiply by x).
+Validated against FIPS-197 Appendix B worked example for round 1.
+Composing the four transforms (with KeyExpansion) gives a full
+AES-128 round; 10 such rounds form the cipher.
+sub_bytes: applies S-box to each state byte.
+shift_rows: positional permutation by row.
