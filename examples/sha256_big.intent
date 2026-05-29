@@ -1,0 +1,8 @@
+SHA-256 of text input up to 4087 bytes (1 to 64 blocks).
+Generalizes PR #72 by replacing the n_blocks if/else with the
+arithmetic formula: n_blocks = (len + 72) / 64.
+Validated against sha256sum for arbitrary-length inputs up to
+64 blocks.
+padded_byte, w_init_block: same as multi-block.
+compress: same as PR #70.
+iterate_blocks, sha256_word: same recursion shape, wider bounds.

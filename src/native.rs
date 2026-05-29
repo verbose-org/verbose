@@ -28112,4 +28112,55 @@ rule extract_word
         }
         let _ = std::fs::remove_file(&out);
     }
+
+    /// SHA-256 of text input up to 4087 bytes (64 blocks).
+    /// Uses arithmetic n_blocks = (len + 72) / 64 instead of an if-chain.
+    #[test]
+    fn sha256_big_64blocks() {
+        let handle = std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(sha256_big_test_body)
+            .expect("spawn test thread");
+        handle.join().expect("test thread panicked");
+    }
+
+    fn sha256_big_test_body() {
+        use std::process::Command;
+        let src = std::fs::read_to_string("examples/sha256_big.verbose")
+            .expect("examples/sha256_big.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+        let out = std::env::temp_dir().join("verbosec_test_sha256_big");
+        compile_native(&program, "sha256_word", out.to_str().unwrap(), false, false)
+            .expect("sha256_big must compile");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o755));
+        }
+        // Inputs spanning a wide block-count range.
+        let lengths = [0usize, 55, 56, 500, 1000, 2000, 4087];
+        for &len in &lengths {
+            let input = "a".repeat(len);
+            let py = format!(
+                "import hashlib;print(int(hashlib.sha256(b'a'*{}).hexdigest()[:8],16))",
+                len
+            );
+            let reference = Command::new("python3")
+                .arg("-c").arg(&py)
+                .output()
+                .expect("python3 must be available");
+            let expected = String::from_utf8_lossy(&reference.stdout).trim().to_string();
+            let output = Command::new(&out)
+                .args(&[input.as_str(), "0"])
+                .output()
+                .expect("native binary must run");
+            let got = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            assert_eq!(
+                got, expected,
+                "SHA-256(len={}) word 0 mismatch with Python", len
+            );
+        }
+        let _ = std::fs::remove_file(&out);
+    }
 }
