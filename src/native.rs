@@ -28057,4 +28057,59 @@ rule extract_word
         }
         let _ = std::fs::remove_file(&out);
     }
+
+    /// N-block SHA-256: text input up to 503 bytes (8 blocks max).
+    /// Hits every block boundary (1, 2, 3, ..., 8 blocks) to validate
+    /// the iterate_blocks recursion at scale. Each input is compared
+    /// against sha256sum's first 32-bit word.
+    #[test]
+    fn sha256_nblocks_8block_boundaries() {
+        let handle = std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(sha256_nblocks_test_body)
+            .expect("spawn test thread");
+        handle.join().expect("test thread panicked");
+    }
+
+    fn sha256_nblocks_test_body() {
+        use std::process::Command;
+        let src = std::fs::read_to_string("examples/sha256_nblocks.verbose")
+            .expect("examples/sha256_nblocks.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+        let out = std::env::temp_dir().join("verbosec_test_sha256_nblocks");
+        compile_native(&program, "sha256_word", out.to_str().unwrap(), false, false)
+            .expect("sha256_nblocks must compile");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o755));
+        }
+        // Boundary-crossing inputs: just below and just at each new block.
+        let lengths = [0usize, 55, 56, 119, 120, 183, 184, 247, 248, 311, 312, 375, 376, 439, 440, 503];
+        for &len in &lengths {
+            let input = "a".repeat(len);
+            // Compute reference: sha256sum of `a` * len, first 32-bit word.
+            // Use Python to avoid depending on sha256sum binary in the test env.
+            let py = format!(
+                "import hashlib;print(int(hashlib.sha256(b'a'*{}).hexdigest()[:8],16))",
+                len
+            );
+            let reference = Command::new("python3")
+                .arg("-c").arg(&py)
+                .output()
+                .expect("python3 must be available");
+            let expected = String::from_utf8_lossy(&reference.stdout).trim().to_string();
+            let output = Command::new(&out)
+                .args(&[input.as_str(), "0"])
+                .output()
+                .expect("native binary must run");
+            let got = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            assert_eq!(
+                got, expected,
+                "SHA-256(len={}) word 0 mismatch with Python", len
+            );
+        }
+        let _ = std::fs::remove_file(&out);
+    }
 }
