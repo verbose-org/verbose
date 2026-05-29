@@ -1,0 +1,453 @@
+@verbose 0.1.0
+
+concept Source
+  @intention: "input message (up to 2 blocks) + which 32-bit word to return"
+  @source: sha256_nblocks.intent:1
+  fields:
+    source : text [..503]
+    which : number [0, 7]
+
+concept Idx
+  @intention: "round/W index 0..63"
+  @source: sha256_nblocks.intent:1
+  fields:
+    i : number [0, 63]
+
+concept WordAndShift
+  @intention: "word + shift count"
+  @source: sha256_nblocks.intent:1
+  fields:
+    x : number [0, 4294967295]
+    n : number [0, 31]
+
+concept OneWord
+  @intention: "single 32-bit word"
+  @source: sha256_nblocks.intent:1
+  fields:
+    x : number [0, 4294967295]
+
+concept ThreeWords
+  @intention: "three 32-bit words"
+  @source: sha256_nblocks.intent:1
+  fields:
+    x : number [0, 4294967295]
+    y : number [0, 4294967295]
+    z : number [0, 4294967295]
+
+concept PaddedByte
+  @intention: "i-th byte of the SHA-256 padded message (multi-block aware)"
+  @source: sha256_nblocks.intent:1
+  fields:
+    source : text [..503]
+    len : number [0, 503]
+    n_blocks : number [1, 8]
+    block_idx : number [0, 7]
+    pos : number [0, 63]
+
+concept WordInit
+  @intention: "i-th initial W value (0..15) of the block_idx-th block"
+  @source: sha256_nblocks.intent:1
+  fields:
+    source : text [..503]
+    len : number [0, 503]
+    n_blocks : number [1, 8]
+    block_idx : number [0, 7]
+    i : number [0, 15]
+
+concept State
+  @intention: "compression working state for one block"
+  @source: sha256_nblocks.intent:1
+  fields:
+    a : number [0, 4294967295]
+    b : number [0, 4294967295]
+    c : number [0, 4294967295]
+    d : number [0, 4294967295]
+    e : number [0, 4294967295]
+    f : number [0, 4294967295]
+    g : number [0, 4294967295]
+    h : number [0, 4294967295]
+    w0 : number [0, 4294967295]
+    w1 : number [0, 4294967295]
+    w2 : number [0, 4294967295]
+    w3 : number [0, 4294967295]
+    w4 : number [0, 4294967295]
+    w5 : number [0, 4294967295]
+    w6 : number [0, 4294967295]
+    w7 : number [0, 4294967295]
+    w8 : number [0, 4294967295]
+    w9 : number [0, 4294967295]
+    w10 : number [0, 4294967295]
+    w11 : number [0, 4294967295]
+    w12 : number [0, 4294967295]
+    w13 : number [0, 4294967295]
+    w14 : number [0, 4294967295]
+    w15 : number [0, 4294967295]
+    round : number [0, 64]
+    which : number [0, 7]
+
+concept Outer
+  @intention: "multi-block iteration state: source + running hash + block index"
+  @source: sha256_nblocks.intent:1
+  fields:
+    source : text [..503]
+    len : number [0, 503]
+    n_blocks : number [1, 8]
+    h0 : number [0, 4294967295]
+    h1 : number [0, 4294967295]
+    h2 : number [0, 4294967295]
+    h3 : number [0, 4294967295]
+    h4 : number [0, 4294967295]
+    h5 : number [0, 4294967295]
+    h6 : number [0, 4294967295]
+    h7 : number [0, 4294967295]
+    block_idx : number [0, 8]
+    which : number [0, 7]
+
+
+rule rotr32
+  @intention: "rotate right by n bits"
+  @source: sha256_nblocks.intent:2
+  input:
+    w : WordAndShift
+  output:
+    out : number
+  logic:
+    out = band(bor(shr(w.x, w.n), shl(w.x, 32 - w.n)), 4294967295)
+  proofs:
+    purity:
+      reads : [w.x, w.n]
+      calls : []
+    termination:
+      bound : 10
+
+
+rule ch
+  @intention: "ch primitive"
+  @source: sha256_nblocks.intent:2
+  input:
+    t : ThreeWords
+  output:
+    out : number
+  logic:
+    out = band(bxor(band(t.x, t.y), band(bnot(t.x), t.z)), 4294967295)
+  proofs:
+    purity:
+      reads : [t.x, t.y, t.z]
+      calls : []
+    termination:
+      bound : 10
+
+
+rule maj
+  @intention: "maj primitive"
+  @source: sha256_nblocks.intent:2
+  input:
+    t : ThreeWords
+  output:
+    out : number
+  logic:
+    out = band(bxor(bxor(band(t.x, t.y), band(t.x, t.z)), band(t.y, t.z)), 4294967295)
+  proofs:
+    purity:
+      reads : [t.x, t.y, t.z]
+      calls : []
+    termination:
+      bound : 10
+
+
+rule big_sigma0
+  @intention: "big sigma 0"
+  @source: sha256_nblocks.intent:2
+  input:
+    w : OneWord
+  output:
+    out : number
+  logic:
+    let r2  = rotr32(WordAndShift { x: w.x, n: 2 })
+    let r13 = rotr32(WordAndShift { x: w.x, n: 13 })
+    let r22 = rotr32(WordAndShift { x: w.x, n: 22 })
+    out = band(bxor(bxor(r2, r13), r22), 4294967295)
+  proofs:
+    purity:
+      reads : [w.x]
+      calls : [rotr32]
+    termination:
+      bound : 20
+
+
+rule big_sigma1
+  @intention: "big sigma 1"
+  @source: sha256_nblocks.intent:2
+  input:
+    w : OneWord
+  output:
+    out : number
+  logic:
+    let r6  = rotr32(WordAndShift { x: w.x, n: 6 })
+    let r11 = rotr32(WordAndShift { x: w.x, n: 11 })
+    let r25 = rotr32(WordAndShift { x: w.x, n: 25 })
+    out = band(bxor(bxor(r6, r11), r25), 4294967295)
+  proofs:
+    purity:
+      reads : [w.x]
+      calls : [rotr32]
+    termination:
+      bound : 20
+
+
+rule small_sigma0
+  @intention: "small sigma 0"
+  @source: sha256_nblocks.intent:2
+  input:
+    w : OneWord
+  output:
+    out : number
+  logic:
+    let r7  = rotr32(WordAndShift { x: w.x, n: 7 })
+    let r18 = rotr32(WordAndShift { x: w.x, n: 18 })
+    out = band(bxor(bxor(r7, r18), shr(w.x, 3)), 4294967295)
+  proofs:
+    purity:
+      reads : [w.x]
+      calls : [rotr32]
+    termination:
+      bound : 20
+
+
+rule small_sigma1
+  @intention: "small sigma 1"
+  @source: sha256_nblocks.intent:2
+  input:
+    w : OneWord
+  output:
+    out : number
+  logic:
+    let r17 = rotr32(WordAndShift { x: w.x, n: 17 })
+    let r19 = rotr32(WordAndShift { x: w.x, n: 19 })
+    out = band(bxor(bxor(r17, r19), shr(w.x, 10)), 4294967295)
+  proofs:
+    purity:
+      reads : [w.x]
+      calls : [rotr32]
+    termination:
+      bound : 20
+
+
+rule k_const
+  @intention: "K[i]"
+  @source: sha256_nblocks.intent:2
+  input:
+    idx : Idx
+  output:
+    out : number
+  logic:
+    out = if idx.i == 0 then 1116352408
+      else if idx.i == 1 then 1899447441
+      else if idx.i == 2 then 3049323471
+      else if idx.i == 3 then 3921009573
+      else if idx.i == 4 then 961987163
+      else if idx.i == 5 then 1508970993
+      else if idx.i == 6 then 2453635748
+      else if idx.i == 7 then 2870763221
+      else if idx.i == 8 then 3624381080
+      else if idx.i == 9 then 310598401
+      else if idx.i == 10 then 607225278
+      else if idx.i == 11 then 1426881987
+      else if idx.i == 12 then 1925078388
+      else if idx.i == 13 then 2162078206
+      else if idx.i == 14 then 2614888103
+      else if idx.i == 15 then 3248222580
+      else if idx.i == 16 then 3835390401
+      else if idx.i == 17 then 4022224774
+      else if idx.i == 18 then 264347078
+      else if idx.i == 19 then 604807628
+      else if idx.i == 20 then 770255983
+      else if idx.i == 21 then 1249150122
+      else if idx.i == 22 then 1555081692
+      else if idx.i == 23 then 1996064986
+      else if idx.i == 24 then 2554220882
+      else if idx.i == 25 then 2821834349
+      else if idx.i == 26 then 2952996808
+      else if idx.i == 27 then 3210313671
+      else if idx.i == 28 then 3336571891
+      else if idx.i == 29 then 3584528711
+      else if idx.i == 30 then 113926993
+      else if idx.i == 31 then 338241895
+      else if idx.i == 32 then 666307205
+      else if idx.i == 33 then 773529912
+      else if idx.i == 34 then 1294757372
+      else if idx.i == 35 then 1396182291
+      else if idx.i == 36 then 1695183700
+      else if idx.i == 37 then 1986661051
+      else if idx.i == 38 then 2177026350
+      else if idx.i == 39 then 2456956037
+      else if idx.i == 40 then 2730485921
+      else if idx.i == 41 then 2820302411
+      else if idx.i == 42 then 3259730800
+      else if idx.i == 43 then 3345764771
+      else if idx.i == 44 then 3516065817
+      else if idx.i == 45 then 3600352804
+      else if idx.i == 46 then 4094571909
+      else if idx.i == 47 then 275423344
+      else if idx.i == 48 then 430227734
+      else if idx.i == 49 then 506948616
+      else if idx.i == 50 then 659060556
+      else if idx.i == 51 then 883997877
+      else if idx.i == 52 then 958139571
+      else if idx.i == 53 then 1322822218
+      else if idx.i == 54 then 1537002063
+      else if idx.i == 55 then 1747873779
+      else if idx.i == 56 then 1955562222
+      else if idx.i == 57 then 2024104815
+      else if idx.i == 58 then 2227730452
+      else if idx.i == 59 then 2361852424
+      else if idx.i == 60 then 2428436474
+      else if idx.i == 61 then 2756734187
+      else if idx.i == 62 then 3204031479
+      else 3329325298
+  proofs:
+    purity:
+      reads : [idx.i]
+      calls : []
+    termination:
+      bound : 200
+
+
+rule padded_byte
+  @intention: "byte at (block_idx, pos) of the padded N-block message"
+  @source: sha256_nblocks.intent:3
+  input:
+    p : PaddedByte
+  output:
+    out : number
+  logic:
+    let ap = p.block_idx * 64 + p.pos
+    let total = p.n_blocks * 64
+    let bits_lo = band(shl(p.len, 3), 255)
+    let bits_mid = band(shr(shl(p.len, 3), 8), 255)
+    out = if ap < p.len then byte_at(p.source, ap) else if ap == p.len then 128 else if ap == total - 1 then bits_lo else if ap == total - 2 then bits_mid else 0
+  proofs:
+    purity:
+      reads : [p.source, p.len, p.n_blocks, p.block_idx, p.pos]
+      calls : []
+    termination:
+      bound : 30
+
+
+rule w_init_block
+  @intention: "pack 4 padded bytes into the i-th W of block block_idx"
+  @source: sha256_nblocks.intent:4
+  input:
+    wi : WordInit
+  output:
+    out : number
+  logic:
+    let b0 = padded_byte(PaddedByte { source: wi.source, len: wi.len, n_blocks: wi.n_blocks, block_idx: wi.block_idx, pos: wi.i * 4 })
+    let b1 = padded_byte(PaddedByte { source: wi.source, len: wi.len, n_blocks: wi.n_blocks, block_idx: wi.block_idx, pos: wi.i * 4 + 1 })
+    let b2 = padded_byte(PaddedByte { source: wi.source, len: wi.len, n_blocks: wi.n_blocks, block_idx: wi.block_idx, pos: wi.i * 4 + 2 })
+    let b3 = padded_byte(PaddedByte { source: wi.source, len: wi.len, n_blocks: wi.n_blocks, block_idx: wi.block_idx, pos: wi.i * 4 + 3 })
+    out = bor(bor(bor(shl(b0, 24), shl(b1, 16)), shl(b2, 8)), b3)
+  proofs:
+    purity:
+      reads : [wi.source, wi.len, wi.n_blocks, wi.block_idx, wi.i]
+      calls : [padded_byte]
+    termination:
+      bound : 40
+
+
+rule compress
+  @intention: "64-round compression with sliding W window; returns working[which]"
+  @source: sha256_nblocks.intent:5
+  input:
+    s : State
+  output:
+    out : number
+  logic:
+    let k = k_const(Idx { i: s.round })
+    let bs1e = big_sigma1(OneWord { x: s.e })
+    let chefg = ch(ThreeWords { x: s.e, y: s.f, z: s.g })
+    let bs0a = big_sigma0(OneWord { x: s.a })
+    let majabc = maj(ThreeWords { x: s.a, y: s.b, z: s.c })
+    let t1 = band(s.h + bs1e + chefg + k + s.w0, 4294967295)
+    let t2 = band(bs0a + majabc, 4294967295)
+    let na = band(t1 + t2, 4294967295)
+    let ne = band(s.d + t1, 4294967295)
+    let new_w = band(small_sigma1(OneWord { x: s.w14 }) + s.w9 + small_sigma0(OneWord { x: s.w1 }) + s.w0, 4294967295)
+    out = if s.round >= 63 then (if s.which == 0 then na else if s.which == 1 then s.a else if s.which == 2 then s.b else if s.which == 3 then s.c else if s.which == 4 then ne else if s.which == 5 then s.e else if s.which == 6 then s.f else s.g) else compress(State { a: na, b: s.a, c: s.b, d: s.c, e: ne, f: s.e, g: s.f, h: s.g, w0: s.w1, w1: s.w2, w2: s.w3, w3: s.w4, w4: s.w5, w5: s.w6, w6: s.w7, w7: s.w8, w8: s.w9, w9: s.w10, w10: s.w11, w11: s.w12, w12: s.w13, w13: s.w14, w14: s.w15, w15: new_w, round: s.round + 1, which: s.which })
+  proofs:
+    purity:
+      reads : [s.a, s.b, s.c, s.d, s.e, s.f, s.g, s.h, s.w0, s.w1, s.w2, s.w3, s.w4, s.w5, s.w6, s.w7, s.w8, s.w9, s.w10, s.w11, s.w12, s.w13, s.w14, s.w15, s.round, s.which]
+      calls : [k_const, big_sigma1, ch, big_sigma0, maj, small_sigma1, small_sigma0, compress]
+    termination:
+      bound : 200
+      increasing : round
+
+
+rule iterate_blocks
+  @intention: "process one block via 8 compress calls, recurse to next; base case at block_idx == n_blocks"
+  @source: sha256_nblocks.intent:6
+  input:
+    o : Outer
+  output:
+    out : number
+  logic:
+    let b0_w0 = w_init_block(WordInit { source: o.source, len: o.len, n_blocks: o.n_blocks, block_idx: o.block_idx, i: 0 })
+    let b0_w1 = w_init_block(WordInit { source: o.source, len: o.len, n_blocks: o.n_blocks, block_idx: o.block_idx, i: 1 })
+    let b0_w2 = w_init_block(WordInit { source: o.source, len: o.len, n_blocks: o.n_blocks, block_idx: o.block_idx, i: 2 })
+    let b0_w3 = w_init_block(WordInit { source: o.source, len: o.len, n_blocks: o.n_blocks, block_idx: o.block_idx, i: 3 })
+    let b0_w4 = w_init_block(WordInit { source: o.source, len: o.len, n_blocks: o.n_blocks, block_idx: o.block_idx, i: 4 })
+    let b0_w5 = w_init_block(WordInit { source: o.source, len: o.len, n_blocks: o.n_blocks, block_idx: o.block_idx, i: 5 })
+    let b0_w6 = w_init_block(WordInit { source: o.source, len: o.len, n_blocks: o.n_blocks, block_idx: o.block_idx, i: 6 })
+    let b0_w7 = w_init_block(WordInit { source: o.source, len: o.len, n_blocks: o.n_blocks, block_idx: o.block_idx, i: 7 })
+    let b0_w8 = w_init_block(WordInit { source: o.source, len: o.len, n_blocks: o.n_blocks, block_idx: o.block_idx, i: 8 })
+    let b0_w9 = w_init_block(WordInit { source: o.source, len: o.len, n_blocks: o.n_blocks, block_idx: o.block_idx, i: 9 })
+    let b0_w10 = w_init_block(WordInit { source: o.source, len: o.len, n_blocks: o.n_blocks, block_idx: o.block_idx, i: 10 })
+    let b0_w11 = w_init_block(WordInit { source: o.source, len: o.len, n_blocks: o.n_blocks, block_idx: o.block_idx, i: 11 })
+    let b0_w12 = w_init_block(WordInit { source: o.source, len: o.len, n_blocks: o.n_blocks, block_idx: o.block_idx, i: 12 })
+    let b0_w13 = w_init_block(WordInit { source: o.source, len: o.len, n_blocks: o.n_blocks, block_idx: o.block_idx, i: 13 })
+    let b0_w14 = w_init_block(WordInit { source: o.source, len: o.len, n_blocks: o.n_blocks, block_idx: o.block_idx, i: 14 })
+    let b0_w15 = w_init_block(WordInit { source: o.source, len: o.len, n_blocks: o.n_blocks, block_idx: o.block_idx, i: 15 })
+    let b0_w_0 = compress(State { a: o.h0, b: o.h1, c: o.h2, d: o.h3, e: o.h4, f: o.h5, g: o.h6, h: o.h7, w0: b0_w0, w1: b0_w1, w2: b0_w2, w3: b0_w3, w4: b0_w4, w5: b0_w5, w6: b0_w6, w7: b0_w7, w8: b0_w8, w9: b0_w9, w10: b0_w10, w11: b0_w11, w12: b0_w12, w13: b0_w13, w14: b0_w14, w15: b0_w15, round: 0, which: 0 })
+    let b0_w_1 = compress(State { a: o.h0, b: o.h1, c: o.h2, d: o.h3, e: o.h4, f: o.h5, g: o.h6, h: o.h7, w0: b0_w0, w1: b0_w1, w2: b0_w2, w3: b0_w3, w4: b0_w4, w5: b0_w5, w6: b0_w6, w7: b0_w7, w8: b0_w8, w9: b0_w9, w10: b0_w10, w11: b0_w11, w12: b0_w12, w13: b0_w13, w14: b0_w14, w15: b0_w15, round: 0, which: 1 })
+    let b0_w_2 = compress(State { a: o.h0, b: o.h1, c: o.h2, d: o.h3, e: o.h4, f: o.h5, g: o.h6, h: o.h7, w0: b0_w0, w1: b0_w1, w2: b0_w2, w3: b0_w3, w4: b0_w4, w5: b0_w5, w6: b0_w6, w7: b0_w7, w8: b0_w8, w9: b0_w9, w10: b0_w10, w11: b0_w11, w12: b0_w12, w13: b0_w13, w14: b0_w14, w15: b0_w15, round: 0, which: 2 })
+    let b0_w_3 = compress(State { a: o.h0, b: o.h1, c: o.h2, d: o.h3, e: o.h4, f: o.h5, g: o.h6, h: o.h7, w0: b0_w0, w1: b0_w1, w2: b0_w2, w3: b0_w3, w4: b0_w4, w5: b0_w5, w6: b0_w6, w7: b0_w7, w8: b0_w8, w9: b0_w9, w10: b0_w10, w11: b0_w11, w12: b0_w12, w13: b0_w13, w14: b0_w14, w15: b0_w15, round: 0, which: 3 })
+    let b0_w_4 = compress(State { a: o.h0, b: o.h1, c: o.h2, d: o.h3, e: o.h4, f: o.h5, g: o.h6, h: o.h7, w0: b0_w0, w1: b0_w1, w2: b0_w2, w3: b0_w3, w4: b0_w4, w5: b0_w5, w6: b0_w6, w7: b0_w7, w8: b0_w8, w9: b0_w9, w10: b0_w10, w11: b0_w11, w12: b0_w12, w13: b0_w13, w14: b0_w14, w15: b0_w15, round: 0, which: 4 })
+    let b0_w_5 = compress(State { a: o.h0, b: o.h1, c: o.h2, d: o.h3, e: o.h4, f: o.h5, g: o.h6, h: o.h7, w0: b0_w0, w1: b0_w1, w2: b0_w2, w3: b0_w3, w4: b0_w4, w5: b0_w5, w6: b0_w6, w7: b0_w7, w8: b0_w8, w9: b0_w9, w10: b0_w10, w11: b0_w11, w12: b0_w12, w13: b0_w13, w14: b0_w14, w15: b0_w15, round: 0, which: 5 })
+    let b0_w_6 = compress(State { a: o.h0, b: o.h1, c: o.h2, d: o.h3, e: o.h4, f: o.h5, g: o.h6, h: o.h7, w0: b0_w0, w1: b0_w1, w2: b0_w2, w3: b0_w3, w4: b0_w4, w5: b0_w5, w6: b0_w6, w7: b0_w7, w8: b0_w8, w9: b0_w9, w10: b0_w10, w11: b0_w11, w12: b0_w12, w13: b0_w13, w14: b0_w14, w15: b0_w15, round: 0, which: 6 })
+    let b0_w_7 = compress(State { a: o.h0, b: o.h1, c: o.h2, d: o.h3, e: o.h4, f: o.h5, g: o.h6, h: o.h7, w0: b0_w0, w1: b0_w1, w2: b0_w2, w3: b0_w3, w4: b0_w4, w5: b0_w5, w6: b0_w6, w7: b0_w7, w8: b0_w8, w9: b0_w9, w10: b0_w10, w11: b0_w11, w12: b0_w12, w13: b0_w13, w14: b0_w14, w15: b0_w15, round: 0, which: 7 })
+    let b0_new_h0 = band(o.h0 + b0_w_0, 4294967295)
+    let b0_new_h1 = band(o.h1 + b0_w_1, 4294967295)
+    let b0_new_h2 = band(o.h2 + b0_w_2, 4294967295)
+    let b0_new_h3 = band(o.h3 + b0_w_3, 4294967295)
+    let b0_new_h4 = band(o.h4 + b0_w_4, 4294967295)
+    let b0_new_h5 = band(o.h5 + b0_w_5, 4294967295)
+    let b0_new_h6 = band(o.h6 + b0_w_6, 4294967295)
+    let b0_new_h7 = band(o.h7 + b0_w_7, 4294967295)
+    out = if o.block_idx >= o.n_blocks then (if o.which == 0 then o.h0 else if o.which == 1 then o.h1 else if o.which == 2 then o.h2 else if o.which == 3 then o.h3 else if o.which == 4 then o.h4 else if o.which == 5 then o.h5 else if o.which == 6 then o.h6 else o.h7) else iterate_blocks(Outer { source: o.source, len: o.len, n_blocks: o.n_blocks, h0: b0_new_h0, h1: b0_new_h1, h2: b0_new_h2, h3: b0_new_h3, h4: b0_new_h4, h5: b0_new_h5, h6: b0_new_h6, h7: b0_new_h7, block_idx: o.block_idx + 1, which: o.which })
+  proofs:
+    purity:
+      reads : [o.source, o.len, o.n_blocks, o.h0, o.h1, o.h2, o.h3, o.h4, o.h5, o.h6, o.h7, o.block_idx, o.which]
+      calls : [w_init_block, compress, iterate_blocks]
+    termination:
+      bound : 500
+      increasing : block_idx
+
+
+rule sha256_word
+  @intention: "SHA-256 of source text up to 503 bytes (1 to 8 blocks)"
+  @source: sha256_nblocks.intent:7
+  input:
+    s : Source
+  output:
+    out : number
+  logic:
+    let len = length(s.source)
+    let n_blocks = if len < 56 then 1 else if len < 120 then 2 else if len < 184 then 3 else if len < 248 then 4 else if len < 312 then 5 else if len < 376 then 6 else if len < 440 then 7 else 8
+    out = iterate_blocks(Outer { source: s.source, len: len, n_blocks: n_blocks, h0: 1779033703, h1: 3144134277, h2: 1013904242, h3: 2773480762, h4: 1359893119, h5: 2600822924, h6: 528734635, h7: 1541459225, block_idx: 0, which: s.which })
+  proofs:
+    purity:
+      reads : [s.source, s.which]
+      calls : [iterate_blocks]
+    termination:
+      bound : 30
+

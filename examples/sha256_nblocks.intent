@@ -1,0 +1,8 @@
+SHA-256 of text input up to 503 bytes (1 to 8 blocks).
+Generalizes the 2-block version (PR #71) to arbitrary block count.
+n_blocks formula extended to 8-way if/else: ceil((len + 9) / 64).
+iterate_blocks recursion unchanged — only the static bounds widen.
+Validated against sha256sum for inputs of every block boundary
+(0, 55, 56, 119, 120, 183, 184, 503).
+sha256_word entry rule, padded_byte/w_init_block helpers.
+compress unchanged from PR #70.
