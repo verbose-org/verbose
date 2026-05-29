@@ -1,0 +1,692 @@
+@verbose 0.1.0
+
+concept Byte
+  @intention: "single byte 0..255"
+  @source: aes_key_expansion.intent:1
+  fields:
+    b : number [0, 255]
+
+concept MasterKey
+  @intention: "16-byte AES-128 master key"
+  @source: aes_key_expansion.intent:1
+  fields:
+    k0 : number [0, 255]
+    k1 : number [0, 255]
+    k2 : number [0, 255]
+    k3 : number [0, 255]
+    k4 : number [0, 255]
+    k5 : number [0, 255]
+    k6 : number [0, 255]
+    k7 : number [0, 255]
+    k8 : number [0, 255]
+    k9 : number [0, 255]
+    k10 : number [0, 255]
+    k11 : number [0, 255]
+    k12 : number [0, 255]
+    k13 : number [0, 255]
+    k14 : number [0, 255]
+    k15 : number [0, 255]
+
+concept RoundKeyByte
+  @intention: "master key + round (0..10) + byte position (0..15)"
+  @source: aes_key_expansion.intent:1
+  fields:
+    k0 : number [0, 255]
+    k1 : number [0, 255]
+    k2 : number [0, 255]
+    k3 : number [0, 255]
+    k4 : number [0, 255]
+    k5 : number [0, 255]
+    k6 : number [0, 255]
+    k7 : number [0, 255]
+    k8 : number [0, 255]
+    k9 : number [0, 255]
+    k10 : number [0, 255]
+    k11 : number [0, 255]
+    k12 : number [0, 255]
+    k13 : number [0, 255]
+    k14 : number [0, 255]
+    k15 : number [0, 255]
+    round : number [0, 10]
+    which : number [0, 15]
+
+
+rule aes_sbox
+  @intention: "AES forward S-box (FIPS-197 Figure 7)"
+  @source: aes_key_expansion.intent:2
+  input:
+    inp : Byte
+  output:
+    out : number
+  logic:
+    out = if inp.b == 0 then 99
+      else if inp.b == 1 then 124
+      else if inp.b == 2 then 119
+      else if inp.b == 3 then 123
+      else if inp.b == 4 then 242
+      else if inp.b == 5 then 107
+      else if inp.b == 6 then 111
+      else if inp.b == 7 then 197
+      else if inp.b == 8 then 48
+      else if inp.b == 9 then 1
+      else if inp.b == 10 then 103
+      else if inp.b == 11 then 43
+      else if inp.b == 12 then 254
+      else if inp.b == 13 then 215
+      else if inp.b == 14 then 171
+      else if inp.b == 15 then 118
+      else if inp.b == 16 then 202
+      else if inp.b == 17 then 130
+      else if inp.b == 18 then 201
+      else if inp.b == 19 then 125
+      else if inp.b == 20 then 250
+      else if inp.b == 21 then 89
+      else if inp.b == 22 then 71
+      else if inp.b == 23 then 240
+      else if inp.b == 24 then 173
+      else if inp.b == 25 then 212
+      else if inp.b == 26 then 162
+      else if inp.b == 27 then 175
+      else if inp.b == 28 then 156
+      else if inp.b == 29 then 164
+      else if inp.b == 30 then 114
+      else if inp.b == 31 then 192
+      else if inp.b == 32 then 183
+      else if inp.b == 33 then 253
+      else if inp.b == 34 then 147
+      else if inp.b == 35 then 38
+      else if inp.b == 36 then 54
+      else if inp.b == 37 then 63
+      else if inp.b == 38 then 247
+      else if inp.b == 39 then 204
+      else if inp.b == 40 then 52
+      else if inp.b == 41 then 165
+      else if inp.b == 42 then 229
+      else if inp.b == 43 then 241
+      else if inp.b == 44 then 113
+      else if inp.b == 45 then 216
+      else if inp.b == 46 then 49
+      else if inp.b == 47 then 21
+      else if inp.b == 48 then 4
+      else if inp.b == 49 then 199
+      else if inp.b == 50 then 35
+      else if inp.b == 51 then 195
+      else if inp.b == 52 then 24
+      else if inp.b == 53 then 150
+      else if inp.b == 54 then 5
+      else if inp.b == 55 then 154
+      else if inp.b == 56 then 7
+      else if inp.b == 57 then 18
+      else if inp.b == 58 then 128
+      else if inp.b == 59 then 226
+      else if inp.b == 60 then 235
+      else if inp.b == 61 then 39
+      else if inp.b == 62 then 178
+      else if inp.b == 63 then 117
+      else if inp.b == 64 then 9
+      else if inp.b == 65 then 131
+      else if inp.b == 66 then 44
+      else if inp.b == 67 then 26
+      else if inp.b == 68 then 27
+      else if inp.b == 69 then 110
+      else if inp.b == 70 then 90
+      else if inp.b == 71 then 160
+      else if inp.b == 72 then 82
+      else if inp.b == 73 then 59
+      else if inp.b == 74 then 214
+      else if inp.b == 75 then 179
+      else if inp.b == 76 then 41
+      else if inp.b == 77 then 227
+      else if inp.b == 78 then 47
+      else if inp.b == 79 then 132
+      else if inp.b == 80 then 83
+      else if inp.b == 81 then 209
+      else if inp.b == 82 then 0
+      else if inp.b == 83 then 237
+      else if inp.b == 84 then 32
+      else if inp.b == 85 then 252
+      else if inp.b == 86 then 177
+      else if inp.b == 87 then 91
+      else if inp.b == 88 then 106
+      else if inp.b == 89 then 203
+      else if inp.b == 90 then 190
+      else if inp.b == 91 then 57
+      else if inp.b == 92 then 74
+      else if inp.b == 93 then 76
+      else if inp.b == 94 then 88
+      else if inp.b == 95 then 207
+      else if inp.b == 96 then 208
+      else if inp.b == 97 then 239
+      else if inp.b == 98 then 170
+      else if inp.b == 99 then 251
+      else if inp.b == 100 then 67
+      else if inp.b == 101 then 77
+      else if inp.b == 102 then 51
+      else if inp.b == 103 then 133
+      else if inp.b == 104 then 69
+      else if inp.b == 105 then 249
+      else if inp.b == 106 then 2
+      else if inp.b == 107 then 127
+      else if inp.b == 108 then 80
+      else if inp.b == 109 then 60
+      else if inp.b == 110 then 159
+      else if inp.b == 111 then 168
+      else if inp.b == 112 then 81
+      else if inp.b == 113 then 163
+      else if inp.b == 114 then 64
+      else if inp.b == 115 then 143
+      else if inp.b == 116 then 146
+      else if inp.b == 117 then 157
+      else if inp.b == 118 then 56
+      else if inp.b == 119 then 245
+      else if inp.b == 120 then 188
+      else if inp.b == 121 then 182
+      else if inp.b == 122 then 218
+      else if inp.b == 123 then 33
+      else if inp.b == 124 then 16
+      else if inp.b == 125 then 255
+      else if inp.b == 126 then 243
+      else if inp.b == 127 then 210
+      else if inp.b == 128 then 205
+      else if inp.b == 129 then 12
+      else if inp.b == 130 then 19
+      else if inp.b == 131 then 236
+      else if inp.b == 132 then 95
+      else if inp.b == 133 then 151
+      else if inp.b == 134 then 68
+      else if inp.b == 135 then 23
+      else if inp.b == 136 then 196
+      else if inp.b == 137 then 167
+      else if inp.b == 138 then 126
+      else if inp.b == 139 then 61
+      else if inp.b == 140 then 100
+      else if inp.b == 141 then 93
+      else if inp.b == 142 then 25
+      else if inp.b == 143 then 115
+      else if inp.b == 144 then 96
+      else if inp.b == 145 then 129
+      else if inp.b == 146 then 79
+      else if inp.b == 147 then 220
+      else if inp.b == 148 then 34
+      else if inp.b == 149 then 42
+      else if inp.b == 150 then 144
+      else if inp.b == 151 then 136
+      else if inp.b == 152 then 70
+      else if inp.b == 153 then 238
+      else if inp.b == 154 then 184
+      else if inp.b == 155 then 20
+      else if inp.b == 156 then 222
+      else if inp.b == 157 then 94
+      else if inp.b == 158 then 11
+      else if inp.b == 159 then 219
+      else if inp.b == 160 then 224
+      else if inp.b == 161 then 50
+      else if inp.b == 162 then 58
+      else if inp.b == 163 then 10
+      else if inp.b == 164 then 73
+      else if inp.b == 165 then 6
+      else if inp.b == 166 then 36
+      else if inp.b == 167 then 92
+      else if inp.b == 168 then 194
+      else if inp.b == 169 then 211
+      else if inp.b == 170 then 172
+      else if inp.b == 171 then 98
+      else if inp.b == 172 then 145
+      else if inp.b == 173 then 149
+      else if inp.b == 174 then 228
+      else if inp.b == 175 then 121
+      else if inp.b == 176 then 231
+      else if inp.b == 177 then 200
+      else if inp.b == 178 then 55
+      else if inp.b == 179 then 109
+      else if inp.b == 180 then 141
+      else if inp.b == 181 then 213
+      else if inp.b == 182 then 78
+      else if inp.b == 183 then 169
+      else if inp.b == 184 then 108
+      else if inp.b == 185 then 86
+      else if inp.b == 186 then 244
+      else if inp.b == 187 then 234
+      else if inp.b == 188 then 101
+      else if inp.b == 189 then 122
+      else if inp.b == 190 then 174
+      else if inp.b == 191 then 8
+      else if inp.b == 192 then 186
+      else if inp.b == 193 then 120
+      else if inp.b == 194 then 37
+      else if inp.b == 195 then 46
+      else if inp.b == 196 then 28
+      else if inp.b == 197 then 166
+      else if inp.b == 198 then 180
+      else if inp.b == 199 then 198
+      else if inp.b == 200 then 232
+      else if inp.b == 201 then 221
+      else if inp.b == 202 then 116
+      else if inp.b == 203 then 31
+      else if inp.b == 204 then 75
+      else if inp.b == 205 then 189
+      else if inp.b == 206 then 139
+      else if inp.b == 207 then 138
+      else if inp.b == 208 then 112
+      else if inp.b == 209 then 62
+      else if inp.b == 210 then 181
+      else if inp.b == 211 then 102
+      else if inp.b == 212 then 72
+      else if inp.b == 213 then 3
+      else if inp.b == 214 then 246
+      else if inp.b == 215 then 14
+      else if inp.b == 216 then 97
+      else if inp.b == 217 then 53
+      else if inp.b == 218 then 87
+      else if inp.b == 219 then 185
+      else if inp.b == 220 then 134
+      else if inp.b == 221 then 193
+      else if inp.b == 222 then 29
+      else if inp.b == 223 then 158
+      else if inp.b == 224 then 225
+      else if inp.b == 225 then 248
+      else if inp.b == 226 then 152
+      else if inp.b == 227 then 17
+      else if inp.b == 228 then 105
+      else if inp.b == 229 then 217
+      else if inp.b == 230 then 142
+      else if inp.b == 231 then 148
+      else if inp.b == 232 then 155
+      else if inp.b == 233 then 30
+      else if inp.b == 234 then 135
+      else if inp.b == 235 then 233
+      else if inp.b == 236 then 206
+      else if inp.b == 237 then 85
+      else if inp.b == 238 then 40
+      else if inp.b == 239 then 223
+      else if inp.b == 240 then 140
+      else if inp.b == 241 then 161
+      else if inp.b == 242 then 137
+      else if inp.b == 243 then 13
+      else if inp.b == 244 then 191
+      else if inp.b == 245 then 230
+      else if inp.b == 246 then 66
+      else if inp.b == 247 then 104
+      else if inp.b == 248 then 65
+      else if inp.b == 249 then 153
+      else if inp.b == 250 then 45
+      else if inp.b == 251 then 15
+      else if inp.b == 252 then 176
+      else if inp.b == 253 then 84
+      else if inp.b == 254 then 187
+      else 22
+  proofs:
+    purity:
+      reads : [inp.b]
+      calls : []
+    termination:
+      bound : 800
+
+
+rule round_key
+  @intention: "AES-128 KeyExpansion: returns byte `which` of round key `round` (round 0 = master key, 1..10 = expanded)"
+  @source: aes_key_expansion.intent:3
+  input:
+    rk : RoundKeyByte
+  output:
+    out : number
+  logic:
+    let b0 = rk.k0
+    let b1 = rk.k1
+    let b2 = rk.k2
+    let b3 = rk.k3
+    let b4 = rk.k4
+    let b5 = rk.k5
+    let b6 = rk.k6
+    let b7 = rk.k7
+    let b8 = rk.k8
+    let b9 = rk.k9
+    let b10 = rk.k10
+    let b11 = rk.k11
+    let b12 = rk.k12
+    let b13 = rk.k13
+    let b14 = rk.k14
+    let b15 = rk.k15
+    let b16 = band(bxor(bxor(b0, aes_sbox(Byte { b: b13 })), 1), 255)
+    let b17 = band(bxor(b1, aes_sbox(Byte { b: b14 })), 255)
+    let b18 = band(bxor(b2, aes_sbox(Byte { b: b15 })), 255)
+    let b19 = band(bxor(b3, aes_sbox(Byte { b: b12 })), 255)
+    let b20 = band(bxor(b4, b16), 255)
+    let b21 = band(bxor(b5, b17), 255)
+    let b22 = band(bxor(b6, b18), 255)
+    let b23 = band(bxor(b7, b19), 255)
+    let b24 = band(bxor(b8, b20), 255)
+    let b25 = band(bxor(b9, b21), 255)
+    let b26 = band(bxor(b10, b22), 255)
+    let b27 = band(bxor(b11, b23), 255)
+    let b28 = band(bxor(b12, b24), 255)
+    let b29 = band(bxor(b13, b25), 255)
+    let b30 = band(bxor(b14, b26), 255)
+    let b31 = band(bxor(b15, b27), 255)
+    let b32 = band(bxor(bxor(b16, aes_sbox(Byte { b: b29 })), 2), 255)
+    let b33 = band(bxor(b17, aes_sbox(Byte { b: b30 })), 255)
+    let b34 = band(bxor(b18, aes_sbox(Byte { b: b31 })), 255)
+    let b35 = band(bxor(b19, aes_sbox(Byte { b: b28 })), 255)
+    let b36 = band(bxor(b20, b32), 255)
+    let b37 = band(bxor(b21, b33), 255)
+    let b38 = band(bxor(b22, b34), 255)
+    let b39 = band(bxor(b23, b35), 255)
+    let b40 = band(bxor(b24, b36), 255)
+    let b41 = band(bxor(b25, b37), 255)
+    let b42 = band(bxor(b26, b38), 255)
+    let b43 = band(bxor(b27, b39), 255)
+    let b44 = band(bxor(b28, b40), 255)
+    let b45 = band(bxor(b29, b41), 255)
+    let b46 = band(bxor(b30, b42), 255)
+    let b47 = band(bxor(b31, b43), 255)
+    let b48 = band(bxor(bxor(b32, aes_sbox(Byte { b: b45 })), 4), 255)
+    let b49 = band(bxor(b33, aes_sbox(Byte { b: b46 })), 255)
+    let b50 = band(bxor(b34, aes_sbox(Byte { b: b47 })), 255)
+    let b51 = band(bxor(b35, aes_sbox(Byte { b: b44 })), 255)
+    let b52 = band(bxor(b36, b48), 255)
+    let b53 = band(bxor(b37, b49), 255)
+    let b54 = band(bxor(b38, b50), 255)
+    let b55 = band(bxor(b39, b51), 255)
+    let b56 = band(bxor(b40, b52), 255)
+    let b57 = band(bxor(b41, b53), 255)
+    let b58 = band(bxor(b42, b54), 255)
+    let b59 = band(bxor(b43, b55), 255)
+    let b60 = band(bxor(b44, b56), 255)
+    let b61 = band(bxor(b45, b57), 255)
+    let b62 = band(bxor(b46, b58), 255)
+    let b63 = band(bxor(b47, b59), 255)
+    let b64 = band(bxor(bxor(b48, aes_sbox(Byte { b: b61 })), 8), 255)
+    let b65 = band(bxor(b49, aes_sbox(Byte { b: b62 })), 255)
+    let b66 = band(bxor(b50, aes_sbox(Byte { b: b63 })), 255)
+    let b67 = band(bxor(b51, aes_sbox(Byte { b: b60 })), 255)
+    let b68 = band(bxor(b52, b64), 255)
+    let b69 = band(bxor(b53, b65), 255)
+    let b70 = band(bxor(b54, b66), 255)
+    let b71 = band(bxor(b55, b67), 255)
+    let b72 = band(bxor(b56, b68), 255)
+    let b73 = band(bxor(b57, b69), 255)
+    let b74 = band(bxor(b58, b70), 255)
+    let b75 = band(bxor(b59, b71), 255)
+    let b76 = band(bxor(b60, b72), 255)
+    let b77 = band(bxor(b61, b73), 255)
+    let b78 = band(bxor(b62, b74), 255)
+    let b79 = band(bxor(b63, b75), 255)
+    let b80 = band(bxor(bxor(b64, aes_sbox(Byte { b: b77 })), 16), 255)
+    let b81 = band(bxor(b65, aes_sbox(Byte { b: b78 })), 255)
+    let b82 = band(bxor(b66, aes_sbox(Byte { b: b79 })), 255)
+    let b83 = band(bxor(b67, aes_sbox(Byte { b: b76 })), 255)
+    let b84 = band(bxor(b68, b80), 255)
+    let b85 = band(bxor(b69, b81), 255)
+    let b86 = band(bxor(b70, b82), 255)
+    let b87 = band(bxor(b71, b83), 255)
+    let b88 = band(bxor(b72, b84), 255)
+    let b89 = band(bxor(b73, b85), 255)
+    let b90 = band(bxor(b74, b86), 255)
+    let b91 = band(bxor(b75, b87), 255)
+    let b92 = band(bxor(b76, b88), 255)
+    let b93 = band(bxor(b77, b89), 255)
+    let b94 = band(bxor(b78, b90), 255)
+    let b95 = band(bxor(b79, b91), 255)
+    let b96 = band(bxor(bxor(b80, aes_sbox(Byte { b: b93 })), 32), 255)
+    let b97 = band(bxor(b81, aes_sbox(Byte { b: b94 })), 255)
+    let b98 = band(bxor(b82, aes_sbox(Byte { b: b95 })), 255)
+    let b99 = band(bxor(b83, aes_sbox(Byte { b: b92 })), 255)
+    let b100 = band(bxor(b84, b96), 255)
+    let b101 = band(bxor(b85, b97), 255)
+    let b102 = band(bxor(b86, b98), 255)
+    let b103 = band(bxor(b87, b99), 255)
+    let b104 = band(bxor(b88, b100), 255)
+    let b105 = band(bxor(b89, b101), 255)
+    let b106 = band(bxor(b90, b102), 255)
+    let b107 = band(bxor(b91, b103), 255)
+    let b108 = band(bxor(b92, b104), 255)
+    let b109 = band(bxor(b93, b105), 255)
+    let b110 = band(bxor(b94, b106), 255)
+    let b111 = band(bxor(b95, b107), 255)
+    let b112 = band(bxor(bxor(b96, aes_sbox(Byte { b: b109 })), 64), 255)
+    let b113 = band(bxor(b97, aes_sbox(Byte { b: b110 })), 255)
+    let b114 = band(bxor(b98, aes_sbox(Byte { b: b111 })), 255)
+    let b115 = band(bxor(b99, aes_sbox(Byte { b: b108 })), 255)
+    let b116 = band(bxor(b100, b112), 255)
+    let b117 = band(bxor(b101, b113), 255)
+    let b118 = band(bxor(b102, b114), 255)
+    let b119 = band(bxor(b103, b115), 255)
+    let b120 = band(bxor(b104, b116), 255)
+    let b121 = band(bxor(b105, b117), 255)
+    let b122 = band(bxor(b106, b118), 255)
+    let b123 = band(bxor(b107, b119), 255)
+    let b124 = band(bxor(b108, b120), 255)
+    let b125 = band(bxor(b109, b121), 255)
+    let b126 = band(bxor(b110, b122), 255)
+    let b127 = band(bxor(b111, b123), 255)
+    let b128 = band(bxor(bxor(b112, aes_sbox(Byte { b: b125 })), 128), 255)
+    let b129 = band(bxor(b113, aes_sbox(Byte { b: b126 })), 255)
+    let b130 = band(bxor(b114, aes_sbox(Byte { b: b127 })), 255)
+    let b131 = band(bxor(b115, aes_sbox(Byte { b: b124 })), 255)
+    let b132 = band(bxor(b116, b128), 255)
+    let b133 = band(bxor(b117, b129), 255)
+    let b134 = band(bxor(b118, b130), 255)
+    let b135 = band(bxor(b119, b131), 255)
+    let b136 = band(bxor(b120, b132), 255)
+    let b137 = band(bxor(b121, b133), 255)
+    let b138 = band(bxor(b122, b134), 255)
+    let b139 = band(bxor(b123, b135), 255)
+    let b140 = band(bxor(b124, b136), 255)
+    let b141 = band(bxor(b125, b137), 255)
+    let b142 = band(bxor(b126, b138), 255)
+    let b143 = band(bxor(b127, b139), 255)
+    let b144 = band(bxor(bxor(b128, aes_sbox(Byte { b: b141 })), 27), 255)
+    let b145 = band(bxor(b129, aes_sbox(Byte { b: b142 })), 255)
+    let b146 = band(bxor(b130, aes_sbox(Byte { b: b143 })), 255)
+    let b147 = band(bxor(b131, aes_sbox(Byte { b: b140 })), 255)
+    let b148 = band(bxor(b132, b144), 255)
+    let b149 = band(bxor(b133, b145), 255)
+    let b150 = band(bxor(b134, b146), 255)
+    let b151 = band(bxor(b135, b147), 255)
+    let b152 = band(bxor(b136, b148), 255)
+    let b153 = band(bxor(b137, b149), 255)
+    let b154 = band(bxor(b138, b150), 255)
+    let b155 = band(bxor(b139, b151), 255)
+    let b156 = band(bxor(b140, b152), 255)
+    let b157 = band(bxor(b141, b153), 255)
+    let b158 = band(bxor(b142, b154), 255)
+    let b159 = band(bxor(b143, b155), 255)
+    let b160 = band(bxor(bxor(b144, aes_sbox(Byte { b: b157 })), 54), 255)
+    let b161 = band(bxor(b145, aes_sbox(Byte { b: b158 })), 255)
+    let b162 = band(bxor(b146, aes_sbox(Byte { b: b159 })), 255)
+    let b163 = band(bxor(b147, aes_sbox(Byte { b: b156 })), 255)
+    let b164 = band(bxor(b148, b160), 255)
+    let b165 = band(bxor(b149, b161), 255)
+    let b166 = band(bxor(b150, b162), 255)
+    let b167 = band(bxor(b151, b163), 255)
+    let b168 = band(bxor(b152, b164), 255)
+    let b169 = band(bxor(b153, b165), 255)
+    let b170 = band(bxor(b154, b166), 255)
+    let b171 = band(bxor(b155, b167), 255)
+    let b172 = band(bxor(b156, b168), 255)
+    let b173 = band(bxor(b157, b169), 255)
+    let b174 = band(bxor(b158, b170), 255)
+    let b175 = band(bxor(b159, b171), 255)
+    out = if rk.round == 0 and rk.which == 0 then b0
+      else if rk.round == 0 and rk.which == 1 then b1
+      else if rk.round == 0 and rk.which == 2 then b2
+      else if rk.round == 0 and rk.which == 3 then b3
+      else if rk.round == 0 and rk.which == 4 then b4
+      else if rk.round == 0 and rk.which == 5 then b5
+      else if rk.round == 0 and rk.which == 6 then b6
+      else if rk.round == 0 and rk.which == 7 then b7
+      else if rk.round == 0 and rk.which == 8 then b8
+      else if rk.round == 0 and rk.which == 9 then b9
+      else if rk.round == 0 and rk.which == 10 then b10
+      else if rk.round == 0 and rk.which == 11 then b11
+      else if rk.round == 0 and rk.which == 12 then b12
+      else if rk.round == 0 and rk.which == 13 then b13
+      else if rk.round == 0 and rk.which == 14 then b14
+      else if rk.round == 0 and rk.which == 15 then b15
+      else if rk.round == 1 and rk.which == 0 then b16
+      else if rk.round == 1 and rk.which == 1 then b17
+      else if rk.round == 1 and rk.which == 2 then b18
+      else if rk.round == 1 and rk.which == 3 then b19
+      else if rk.round == 1 and rk.which == 4 then b20
+      else if rk.round == 1 and rk.which == 5 then b21
+      else if rk.round == 1 and rk.which == 6 then b22
+      else if rk.round == 1 and rk.which == 7 then b23
+      else if rk.round == 1 and rk.which == 8 then b24
+      else if rk.round == 1 and rk.which == 9 then b25
+      else if rk.round == 1 and rk.which == 10 then b26
+      else if rk.round == 1 and rk.which == 11 then b27
+      else if rk.round == 1 and rk.which == 12 then b28
+      else if rk.round == 1 and rk.which == 13 then b29
+      else if rk.round == 1 and rk.which == 14 then b30
+      else if rk.round == 1 and rk.which == 15 then b31
+      else if rk.round == 2 and rk.which == 0 then b32
+      else if rk.round == 2 and rk.which == 1 then b33
+      else if rk.round == 2 and rk.which == 2 then b34
+      else if rk.round == 2 and rk.which == 3 then b35
+      else if rk.round == 2 and rk.which == 4 then b36
+      else if rk.round == 2 and rk.which == 5 then b37
+      else if rk.round == 2 and rk.which == 6 then b38
+      else if rk.round == 2 and rk.which == 7 then b39
+      else if rk.round == 2 and rk.which == 8 then b40
+      else if rk.round == 2 and rk.which == 9 then b41
+      else if rk.round == 2 and rk.which == 10 then b42
+      else if rk.round == 2 and rk.which == 11 then b43
+      else if rk.round == 2 and rk.which == 12 then b44
+      else if rk.round == 2 and rk.which == 13 then b45
+      else if rk.round == 2 and rk.which == 14 then b46
+      else if rk.round == 2 and rk.which == 15 then b47
+      else if rk.round == 3 and rk.which == 0 then b48
+      else if rk.round == 3 and rk.which == 1 then b49
+      else if rk.round == 3 and rk.which == 2 then b50
+      else if rk.round == 3 and rk.which == 3 then b51
+      else if rk.round == 3 and rk.which == 4 then b52
+      else if rk.round == 3 and rk.which == 5 then b53
+      else if rk.round == 3 and rk.which == 6 then b54
+      else if rk.round == 3 and rk.which == 7 then b55
+      else if rk.round == 3 and rk.which == 8 then b56
+      else if rk.round == 3 and rk.which == 9 then b57
+      else if rk.round == 3 and rk.which == 10 then b58
+      else if rk.round == 3 and rk.which == 11 then b59
+      else if rk.round == 3 and rk.which == 12 then b60
+      else if rk.round == 3 and rk.which == 13 then b61
+      else if rk.round == 3 and rk.which == 14 then b62
+      else if rk.round == 3 and rk.which == 15 then b63
+      else if rk.round == 4 and rk.which == 0 then b64
+      else if rk.round == 4 and rk.which == 1 then b65
+      else if rk.round == 4 and rk.which == 2 then b66
+      else if rk.round == 4 and rk.which == 3 then b67
+      else if rk.round == 4 and rk.which == 4 then b68
+      else if rk.round == 4 and rk.which == 5 then b69
+      else if rk.round == 4 and rk.which == 6 then b70
+      else if rk.round == 4 and rk.which == 7 then b71
+      else if rk.round == 4 and rk.which == 8 then b72
+      else if rk.round == 4 and rk.which == 9 then b73
+      else if rk.round == 4 and rk.which == 10 then b74
+      else if rk.round == 4 and rk.which == 11 then b75
+      else if rk.round == 4 and rk.which == 12 then b76
+      else if rk.round == 4 and rk.which == 13 then b77
+      else if rk.round == 4 and rk.which == 14 then b78
+      else if rk.round == 4 and rk.which == 15 then b79
+      else if rk.round == 5 and rk.which == 0 then b80
+      else if rk.round == 5 and rk.which == 1 then b81
+      else if rk.round == 5 and rk.which == 2 then b82
+      else if rk.round == 5 and rk.which == 3 then b83
+      else if rk.round == 5 and rk.which == 4 then b84
+      else if rk.round == 5 and rk.which == 5 then b85
+      else if rk.round == 5 and rk.which == 6 then b86
+      else if rk.round == 5 and rk.which == 7 then b87
+      else if rk.round == 5 and rk.which == 8 then b88
+      else if rk.round == 5 and rk.which == 9 then b89
+      else if rk.round == 5 and rk.which == 10 then b90
+      else if rk.round == 5 and rk.which == 11 then b91
+      else if rk.round == 5 and rk.which == 12 then b92
+      else if rk.round == 5 and rk.which == 13 then b93
+      else if rk.round == 5 and rk.which == 14 then b94
+      else if rk.round == 5 and rk.which == 15 then b95
+      else if rk.round == 6 and rk.which == 0 then b96
+      else if rk.round == 6 and rk.which == 1 then b97
+      else if rk.round == 6 and rk.which == 2 then b98
+      else if rk.round == 6 and rk.which == 3 then b99
+      else if rk.round == 6 and rk.which == 4 then b100
+      else if rk.round == 6 and rk.which == 5 then b101
+      else if rk.round == 6 and rk.which == 6 then b102
+      else if rk.round == 6 and rk.which == 7 then b103
+      else if rk.round == 6 and rk.which == 8 then b104
+      else if rk.round == 6 and rk.which == 9 then b105
+      else if rk.round == 6 and rk.which == 10 then b106
+      else if rk.round == 6 and rk.which == 11 then b107
+      else if rk.round == 6 and rk.which == 12 then b108
+      else if rk.round == 6 and rk.which == 13 then b109
+      else if rk.round == 6 and rk.which == 14 then b110
+      else if rk.round == 6 and rk.which == 15 then b111
+      else if rk.round == 7 and rk.which == 0 then b112
+      else if rk.round == 7 and rk.which == 1 then b113
+      else if rk.round == 7 and rk.which == 2 then b114
+      else if rk.round == 7 and rk.which == 3 then b115
+      else if rk.round == 7 and rk.which == 4 then b116
+      else if rk.round == 7 and rk.which == 5 then b117
+      else if rk.round == 7 and rk.which == 6 then b118
+      else if rk.round == 7 and rk.which == 7 then b119
+      else if rk.round == 7 and rk.which == 8 then b120
+      else if rk.round == 7 and rk.which == 9 then b121
+      else if rk.round == 7 and rk.which == 10 then b122
+      else if rk.round == 7 and rk.which == 11 then b123
+      else if rk.round == 7 and rk.which == 12 then b124
+      else if rk.round == 7 and rk.which == 13 then b125
+      else if rk.round == 7 and rk.which == 14 then b126
+      else if rk.round == 7 and rk.which == 15 then b127
+      else if rk.round == 8 and rk.which == 0 then b128
+      else if rk.round == 8 and rk.which == 1 then b129
+      else if rk.round == 8 and rk.which == 2 then b130
+      else if rk.round == 8 and rk.which == 3 then b131
+      else if rk.round == 8 and rk.which == 4 then b132
+      else if rk.round == 8 and rk.which == 5 then b133
+      else if rk.round == 8 and rk.which == 6 then b134
+      else if rk.round == 8 and rk.which == 7 then b135
+      else if rk.round == 8 and rk.which == 8 then b136
+      else if rk.round == 8 and rk.which == 9 then b137
+      else if rk.round == 8 and rk.which == 10 then b138
+      else if rk.round == 8 and rk.which == 11 then b139
+      else if rk.round == 8 and rk.which == 12 then b140
+      else if rk.round == 8 and rk.which == 13 then b141
+      else if rk.round == 8 and rk.which == 14 then b142
+      else if rk.round == 8 and rk.which == 15 then b143
+      else if rk.round == 9 and rk.which == 0 then b144
+      else if rk.round == 9 and rk.which == 1 then b145
+      else if rk.round == 9 and rk.which == 2 then b146
+      else if rk.round == 9 and rk.which == 3 then b147
+      else if rk.round == 9 and rk.which == 4 then b148
+      else if rk.round == 9 and rk.which == 5 then b149
+      else if rk.round == 9 and rk.which == 6 then b150
+      else if rk.round == 9 and rk.which == 7 then b151
+      else if rk.round == 9 and rk.which == 8 then b152
+      else if rk.round == 9 and rk.which == 9 then b153
+      else if rk.round == 9 and rk.which == 10 then b154
+      else if rk.round == 9 and rk.which == 11 then b155
+      else if rk.round == 9 and rk.which == 12 then b156
+      else if rk.round == 9 and rk.which == 13 then b157
+      else if rk.round == 9 and rk.which == 14 then b158
+      else if rk.round == 9 and rk.which == 15 then b159
+      else if rk.round == 10 and rk.which == 0 then b160
+      else if rk.round == 10 and rk.which == 1 then b161
+      else if rk.round == 10 and rk.which == 2 then b162
+      else if rk.round == 10 and rk.which == 3 then b163
+      else if rk.round == 10 and rk.which == 4 then b164
+      else if rk.round == 10 and rk.which == 5 then b165
+      else if rk.round == 10 and rk.which == 6 then b166
+      else if rk.round == 10 and rk.which == 7 then b167
+      else if rk.round == 10 and rk.which == 8 then b168
+      else if rk.round == 10 and rk.which == 9 then b169
+      else if rk.round == 10 and rk.which == 10 then b170
+      else if rk.round == 10 and rk.which == 11 then b171
+      else if rk.round == 10 and rk.which == 12 then b172
+      else if rk.round == 10 and rk.which == 13 then b173
+      else if rk.round == 10 and rk.which == 14 then b174
+      else b175
+  proofs:
+    purity:
+      reads : [rk.k0, rk.k1, rk.k2, rk.k3, rk.k4, rk.k5, rk.k6, rk.k7, rk.k8, rk.k9, rk.k10, rk.k11, rk.k12, rk.k13, rk.k14, rk.k15, rk.round, rk.which]
+      calls : [aes_sbox]
+    termination:
+      bound : 4000
+
