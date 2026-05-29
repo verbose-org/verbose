@@ -1,0 +1,7 @@
+AES forward S-box (FIPS-197 standard 256-byte substitution).
+The foundation of every AES operation: SubBytes round transform
+applies this to every state byte, and KeyExpansion uses it for
+the RotWord step.
+Output for byte b is the substituted byte from the standard table.
+Validated against any AES reference (Python's pycryptodome or
+openssl's S-box).

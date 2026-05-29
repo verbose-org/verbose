@@ -15,6 +15,22 @@ mod verifier;
 mod wasm;
 
 fn main() {
+    // Run the real main on a dedicated 16 MiB stack — examples with deeply
+    // nested if/else chains (256-way AES S-box, 64-way SHA-256 K/W lookups)
+    // recurse through the parser/verifier/emitter tree walkers and overflow
+    // the 2 MiB default stack. 16 MiB covers every example in the repo with
+    // generous headroom.
+    let handle = std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(real_main)
+        .expect("spawn main thread");
+    match handle.join() {
+        Ok(()) => {}
+        Err(_) => std::process::exit(2),
+    }
+}
+
+fn real_main() {
     let args: Vec<String> = env::args().collect();
 
     if args.iter().any(|a| a == "--version" || a == "-v") {
