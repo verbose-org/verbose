@@ -540,6 +540,42 @@ examples/
                    "hello world"/0 → 2, "42 abc"/0 → 3, "a b c"/0 → 3.
                    First Verbose binary that loops through a complete
                    text input scanning multiple tokens.
+
+  ── TLS 1.3 crypto arc (symmetric + KDF half of TLS_AES_128_GCM_SHA256) ──
+  Each brick is a standalone native binary, validated byte-for-byte against
+  its authoritative reference vector. All built as straight-line `let`-chain
+  unrolls with the `which` parameterization (one rule call returns one output
+  byte, dispatched 0..N at the end) — no recursion, no state.
+  aes_sbox.*        FIPS-197 forward S-box (256-way if/else). ~14 KB.
+  aes_transforms.*  SubBytes/ShiftRows/MixColumns/AddRoundKey (PR #75),
+                    column-major state, FIPS-197 Appendix B. xtime helper.
+  aes_key_expansion.* AES-128 KeyExpansion (PR #76): round_key(key, round,
+                    which) → 176-byte schedule. FIPS-197 A.1 + B, 176/176.
+  aes_encrypt.*     AES-128 single-block ECB encrypt, 10 rounds composed.
+                    FIPS-197 C.1 + `openssl enc -aes-128-ecb` + NIST. ~50 KB.
+  aes_ctr.*         AES-128-CTR: C = P XOR AES(counter). NIST SP 800-38A F.5
+                    + `openssl enc -aes-128-ctr` + round-trip. 53 KB.
+  ghash_mul.*       GF(2^128) multiply under the GCM polynomial (NIST SP
+                    800-38D Alg.1), 16-byte operands, shift-and-add unrolled.
+                    5 vectors incl. edge cases. 263 KB.
+  ghash.*           GHASH over 2 blocks: ((C*H) XOR L)*H — minimal GCM auth
+                    shape. GCM test-case 2. 523 KB.
+  aes_gcm.*         AES-128-GCM AEAD (one block, 96-bit IV, empty AAD):
+                    H=AES(0), J0, CTR encrypt, GHASH, tag=S XOR E(J0). One
+                    shared key schedule for all 3 AES blocks. Validated
+                    bit-for-bit against NIST GCM Test Case 2 (published C AND
+                    T) + a non-trivial vector. 625 KB. The milestone of the arc.
+  hmac_sha256.*     HMAC-SHA256 (RFC 2104): SHA256(opad‖SHA256(ipad‖m)), two
+                    SHA-256s built from the input bytes (general message
+                    schedule, unlike the hardcoded w_const of sha256_*).
+                    RFC 4231 Test Case 1. 328 KB.
+  hkdf.*            HKDF (RFC 5869): hkdf_extract (PRK = HMAC(salt,IKM)) +
+                    hkdf_expand (OKM = T(1)‖T(2) via iterated HMAC). RFC 5869
+                    Test Case 1 (published PRK + OKM). 329/647 KB. KDF layer done.
+  NOTE: the asymmetric half (X25519 key exchange, signature verification) is
+  NOT built — infeasible as a let-chain unroll (X25519's Montgomery ladder is
+  millions of ops) and needs bounded-loop / recursion infra over byte arrays +
+  multi-precision arithmetic. That is the next architectural chantier.
   demo.html        Browser demo (WASM)
 
 tools/
