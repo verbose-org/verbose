@@ -29039,4 +29039,205 @@ rule extract_word
         );
         let _ = std::fs::remove_file(&xp_out);
     }
+
+    // ── X25519 field arithmetic (10-limb 26/25-bit, mod 2^255-19) ──
+    // Rust port of the validated field reference (checked against big-int mod p
+    // over 20000 random + edge vectors). Locks the native binaries' behavior.
+    // All values are non-negative (invariant I1), so Rust's arithmetic `>>`
+    // coincides with the emitter's logical `shr`.
+    const X_W: [i64; 10] = [26, 25, 26, 25, 26, 25, 26, 25, 26, 25];
+    fn x_mask(i: usize) -> i64 { (1i64 << X_W[i]) - 1 }
+    fn x_two_p(i: usize) -> i64 { if i == 0 { (1i64 << 27) - 38 } else { (1i64 << (X_W[i] + 1)) - 2 } }
+    fn x_freduce(mut a: [i64; 10]) -> [i64; 10] {
+        for _ in 0..2 {
+            for i in 0..9 { let c = a[i] >> X_W[i]; a[i] &= x_mask(i); a[i + 1] += c; }
+            let c = a[9] >> X_W[9]; a[9] &= x_mask(9); a[0] += 19 * c;
+        }
+        a
+    }
+    fn x_fadd(a: &[i64; 10], b: &[i64; 10]) -> [i64; 10] {
+        let mut acc = [0i64; 10];
+        for i in 0..10 { acc[i] = a[i] + b[i]; }
+        x_freduce(acc)
+    }
+    fn x_fsub(a: &[i64; 10], b: &[i64; 10]) -> [i64; 10] {
+        let mut acc = [0i64; 10];
+        for i in 0..10 { acc[i] = a[i] + x_two_p(i) - b[i]; }
+        x_freduce(acc)
+    }
+    fn x_fmul(a: &[i64; 10], b: &[i64; 10]) -> [i64; 10] {
+        let mut acc = [0i64; 10];
+        for i in 0..10 {
+            for j in 0..10 {
+                let mut prod = a[i] * b[j];
+                if i % 2 == 1 && j % 2 == 1 { prod *= 2; }
+                let k = i + j;
+                if k < 10 { acc[k] += prod; } else { acc[k - 10] += 19 * prod; }
+            }
+        }
+        x_freduce(acc)
+    }
+
+    #[test]
+    fn x25519_field_arith_matches_reference() {
+        let h = std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(x25519_field_arith_test_body)
+            .expect("spawn");
+        h.join().expect("test thread panicked");
+    }
+
+    fn x25519_field_arith_test_body() {
+        let src = std::fs::read_to_string("examples/field_mul.verbose")
+            .expect("examples/field_mul.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+
+        let compile = |rule: &str| -> std::path::PathBuf {
+            let out = std::env::temp_dir().join(format!("verbosec_test_x_{}", rule));
+            compile_native(&program, rule, out.to_str().unwrap(), false, false)
+                .unwrap_or_else(|e| panic!("{} must compile: {:?}", rule, e));
+            #[cfg(unix)]
+            { use std::os::unix::fs::PermissionsExt;
+              let _ = std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o755)); }
+            out
+        };
+        let run = |bin: &std::path::Path, a: &[i64; 10], b: &[i64; 10]| -> [i64; 10] {
+            let mut r = [0i64; 10];
+            for w in 0..10u8 {
+                let mut cmd = std::process::Command::new(bin);
+                for v in a.iter().chain(b.iter()) { cmd.arg(v.to_string()); }
+                cmd.arg(w.to_string());
+                let o = cmd.output().expect("run");
+                r[w as usize] = String::from_utf8_lossy(&o.stdout).trim().parse()
+                    .unwrap_or_else(|_| panic!("parse w={}", w));
+            }
+            r
+        };
+
+        let fmul_bin = compile("fmul");
+        let fadd_bin = compile("fadd");
+        let fsub_bin = compile("fsub");
+
+        // Python-anchored vector (its product was validated against big-int mod p).
+        let a0: [i64; 10] = [35290521, 8602606, 23644292, 4012412, 1122334, 21845, 0, 0, 0, 0];
+        let b0: [i64; 10] = [33532569, 7877291, 21086708, 21512212, 16772438, 33550335, 4194303, 0, 0, 0];
+        let mul0: [i64; 10] = [33663114, 7656517, 18131225, 17625862, 61541024, 23713172, 17719346, 26084578, 7772789, 30368891];
+        assert_eq!(run(&fmul_bin, &a0, &b0), mul0, "anchored fmul vector mismatch");
+        assert_eq!(x_fmul(&a0, &b0), mul0, "rust ref vs anchor");
+
+        // Random reduced limbs vs the Rust reference (deterministic LCG, zero-dep).
+        let mut s: u64 = 0x9e3779b97f4a7c15;
+        let mut nextlimb = |i: usize, s: &mut u64| -> i64 {
+            *s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((*s >> 17) as i64) & x_mask(i)
+        };
+        for _ in 0..60 {
+            let mut a = [0i64; 10]; let mut b = [0i64; 10];
+            for i in 0..10 { a[i] = nextlimb(i, &mut s); b[i] = nextlimb(i, &mut s); }
+            assert_eq!(run(&fmul_bin, &a, &b), x_fmul(&a, &b), "fmul mismatch a={:?} b={:?}", a, b);
+            assert_eq!(run(&fadd_bin, &a, &b), x_fadd(&a, &b), "fadd mismatch");
+            assert_eq!(run(&fsub_bin, &a, &b), x_fsub(&a, &b), "fsub mismatch");
+        }
+        for f in [fmul_bin, fadd_bin, fsub_bin] { let _ = std::fs::remove_file(f); }
+    }
+
+    #[test]
+    fn x25519_codec_matches_reference() {
+        let h = std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(x25519_codec_test_body)
+            .expect("spawn");
+        h.join().expect("test thread panicked");
+    }
+
+    fn x25519_codec_test_body() {
+        let src = std::fs::read_to_string("examples/field_codec.verbose")
+            .expect("examples/field_codec.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+        let compile = |rule: &str| -> std::path::PathBuf {
+            let out = std::env::temp_dir().join(format!("verbosec_test_codec_{}", rule));
+            compile_native(&program, rule, out.to_str().unwrap(), false, false)
+                .unwrap_or_else(|e| panic!("{} compile: {:?}", rule, e));
+            #[cfg(unix)]
+            { use std::os::unix::fs::PermissionsExt;
+              let _ = std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o755)); }
+            out
+        };
+
+        const DEC_O: [usize; 10] = [0, 3, 6, 9, 12, 16, 19, 22, 25, 28];
+        const DEC_SH: [u32; 10] = [0, 2, 3, 5, 6, 0, 1, 3, 4, 6];
+        const OFF: [i64; 10] = [0, 26, 51, 77, 102, 128, 153, 179, 204, 230];
+        let ref_decode = |b: &[u8; 32]| -> [i64; 10] {
+            let word = |o: usize| -> i64 {
+                (b[o] as i64) | ((b[o+1] as i64) << 8) | ((b[o+2] as i64) << 16) | ((b[o+3] as i64) << 24)
+            };
+            let mut l = [0i64; 10];
+            for i in 0..10 { l[i] = (word(DEC_O[i]) >> DEC_SH[i]) & x_mask(i); }
+            l
+        };
+        let ref_encode = |l: &[i64; 10]| -> [u8; 32] {
+            let mut out = [0u8; 32];
+            for bi in 0..32 {
+                let mut v: i64 = 0;
+                for i in 0..10 {
+                    let (a, c) = (OFF[i], OFF[i] + X_W[i]);
+                    if a < 8 * bi as i64 + 8 && c > 8 * bi as i64 {
+                        let local = OFF[i] - 8 * bi as i64;
+                        v += if local >= 0 { l[i] << local } else { l[i] >> (-local) };
+                    }
+                }
+                out[bi] = (v & 0xff) as u8;
+            }
+            out
+        };
+
+        let decode_bin = compile("decode");
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let mut s: u64 = 0xd1b54a32d192ed03;
+            for _ in 0..30 {
+                let mut bytes = [0u8; 32];
+                for k in 0..32 {
+                    s = s.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    bytes[k] = ((s >> 33) as u8 % 255) + 1; // 1..=255, no NUL
+                }
+                let mut got = [0i64; 10];
+                for w in 0..10u8 {
+                    let o = std::process::Command::new(&decode_bin)
+                        .arg(std::ffi::OsStr::from_bytes(&bytes))
+                        .arg(w.to_string())
+                        .output().expect("run decode");
+                    got[w as usize] = String::from_utf8_lossy(&o.stdout).trim().parse()
+                        .unwrap_or_else(|_| panic!("parse decode w={}", w));
+                }
+                assert_eq!(got, ref_decode(&bytes), "decode mismatch bytes={:02x?}", bytes);
+            }
+        }
+        let _ = std::fs::remove_file(&decode_bin);
+
+        let encode_bin = compile("encode");
+        let mut s: u64 = 0x2545f4914f6cdd1d;
+        for _ in 0..30 {
+            let mut l = [0i64; 10];
+            for i in 0..10 {
+                s = s.wrapping_mul(6364136223846793005).wrapping_add(1);
+                l[i] = ((s >> 17) as i64) & x_mask(i);
+            }
+            let mut got = [0u8; 32];
+            for w in 0..32u8 {
+                let mut cmd = std::process::Command::new(&encode_bin);
+                for v in l.iter() { cmd.arg(v.to_string()); }
+                cmd.arg(w.to_string());
+                let o = cmd.output().expect("run encode");
+                got[w as usize] = String::from_utf8_lossy(&o.stdout).trim().parse::<u32>()
+                    .unwrap_or_else(|_| panic!("parse encode w={}", w)) as u8;
+            }
+            assert_eq!(got, ref_encode(&l), "encode mismatch limbs={:?}", l);
+        }
+        let _ = std::fs::remove_file(&encode_bin);
+    }
+
 }
