@@ -1,0 +1,315 @@
+@verbose 0.1.0
+
+concept FieldPair
+  @intention: "two GF(2^255-19) field elements as 10 reduced 26/25-bit limbs each, + which output limb"
+  @source: invoices.intent:1
+  fields:
+    a0 : number [0, 67108863]
+    a1 : number [0, 67108863]
+    a2 : number [0, 67108863]
+    a3 : number [0, 67108863]
+    a4 : number [0, 67108863]
+    a5 : number [0, 67108863]
+    a6 : number [0, 67108863]
+    a7 : number [0, 67108863]
+    a8 : number [0, 67108863]
+    a9 : number [0, 67108863]
+    b0 : number [0, 67108863]
+    b1 : number [0, 67108863]
+    b2 : number [0, 67108863]
+    b3 : number [0, 67108863]
+    b4 : number [0, 67108863]
+    b5 : number [0, 67108863]
+    b6 : number [0, 67108863]
+    b7 : number [0, 67108863]
+    b8 : number [0, 67108863]
+    b9 : number [0, 67108863]
+    which : number [0, 9]
+
+
+rule fadd
+  @intention: "field add mod 2^255-19 (limb-wise add then carry-reduce)"
+  @source: invoices.intent:1
+  input:
+    g : FieldPair
+  output:
+    out : number
+  logic:
+    let fadd_a0 = g.a0 + g.b0
+    let fadd_a1 = g.a1 + g.b1
+    let fadd_a2 = g.a2 + g.b2
+    let fadd_a3 = g.a3 + g.b3
+    let fadd_a4 = g.a4 + g.b4
+    let fadd_a5 = g.a5 + g.b5
+    let fadd_a6 = g.a6 + g.b6
+    let fadd_a7 = g.a7 + g.b7
+    let fadd_a8 = g.a8 + g.b8
+    let fadd_a9 = g.a9 + g.b9
+    let fadd_c0_0 = shr(fadd_a0, 26)
+    let fadd_lo0_0 = band(fadd_a0, 67108863)
+    let fadd_s0_0 = fadd_a1 + fadd_c0_0
+    let fadd_c0_1 = shr(fadd_s0_0, 25)
+    let fadd_lo0_1 = band(fadd_s0_0, 33554431)
+    let fadd_s0_1 = fadd_a2 + fadd_c0_1
+    let fadd_c0_2 = shr(fadd_s0_1, 26)
+    let fadd_lo0_2 = band(fadd_s0_1, 67108863)
+    let fadd_s0_2 = fadd_a3 + fadd_c0_2
+    let fadd_c0_3 = shr(fadd_s0_2, 25)
+    let fadd_lo0_3 = band(fadd_s0_2, 33554431)
+    let fadd_s0_3 = fadd_a4 + fadd_c0_3
+    let fadd_c0_4 = shr(fadd_s0_3, 26)
+    let fadd_lo0_4 = band(fadd_s0_3, 67108863)
+    let fadd_s0_4 = fadd_a5 + fadd_c0_4
+    let fadd_c0_5 = shr(fadd_s0_4, 25)
+    let fadd_lo0_5 = band(fadd_s0_4, 33554431)
+    let fadd_s0_5 = fadd_a6 + fadd_c0_5
+    let fadd_c0_6 = shr(fadd_s0_5, 26)
+    let fadd_lo0_6 = band(fadd_s0_5, 67108863)
+    let fadd_s0_6 = fadd_a7 + fadd_c0_6
+    let fadd_c0_7 = shr(fadd_s0_6, 25)
+    let fadd_lo0_7 = band(fadd_s0_6, 33554431)
+    let fadd_s0_7 = fadd_a8 + fadd_c0_7
+    let fadd_c0_8 = shr(fadd_s0_7, 26)
+    let fadd_lo0_8 = band(fadd_s0_7, 67108863)
+    let fadd_s0_8 = fadd_a9 + fadd_c0_8
+    let fadd_c0_9 = shr(fadd_s0_8, 25)
+    let fadd_lo0_9 = band(fadd_s0_8, 33554431)
+    let fadd_w0 = fadd_lo0_0 + 19 * fadd_c0_9
+    let fadd_c1_0 = shr(fadd_w0, 26)
+    let fadd_lo1_0 = band(fadd_w0, 67108863)
+    let fadd_s1_0 = fadd_lo0_1 + fadd_c1_0
+    let fadd_c1_1 = shr(fadd_s1_0, 25)
+    let fadd_lo1_1 = band(fadd_s1_0, 33554431)
+    let fadd_s1_1 = fadd_lo0_2 + fadd_c1_1
+    let fadd_c1_2 = shr(fadd_s1_1, 26)
+    let fadd_lo1_2 = band(fadd_s1_1, 67108863)
+    let fadd_s1_2 = fadd_lo0_3 + fadd_c1_2
+    let fadd_c1_3 = shr(fadd_s1_2, 25)
+    let fadd_lo1_3 = band(fadd_s1_2, 33554431)
+    let fadd_s1_3 = fadd_lo0_4 + fadd_c1_3
+    let fadd_c1_4 = shr(fadd_s1_3, 26)
+    let fadd_lo1_4 = band(fadd_s1_3, 67108863)
+    let fadd_s1_4 = fadd_lo0_5 + fadd_c1_4
+    let fadd_c1_5 = shr(fadd_s1_4, 25)
+    let fadd_lo1_5 = band(fadd_s1_4, 33554431)
+    let fadd_s1_5 = fadd_lo0_6 + fadd_c1_5
+    let fadd_c1_6 = shr(fadd_s1_5, 26)
+    let fadd_lo1_6 = band(fadd_s1_5, 67108863)
+    let fadd_s1_6 = fadd_lo0_7 + fadd_c1_6
+    let fadd_c1_7 = shr(fadd_s1_6, 25)
+    let fadd_lo1_7 = band(fadd_s1_6, 33554431)
+    let fadd_s1_7 = fadd_lo0_8 + fadd_c1_7
+    let fadd_c1_8 = shr(fadd_s1_7, 26)
+    let fadd_lo1_8 = band(fadd_s1_7, 67108863)
+    let fadd_s1_8 = fadd_lo0_9 + fadd_c1_8
+    let fadd_c1_9 = shr(fadd_s1_8, 25)
+    let fadd_lo1_9 = band(fadd_s1_8, 33554431)
+    let fadd_w1 = fadd_lo1_0 + 19 * fadd_c1_9
+    out = if g.which == 0 then fadd_w1
+      else if g.which == 1 then fadd_lo1_1
+      else if g.which == 2 then fadd_lo1_2
+      else if g.which == 3 then fadd_lo1_3
+      else if g.which == 4 then fadd_lo1_4
+      else if g.which == 5 then fadd_lo1_5
+      else if g.which == 6 then fadd_lo1_6
+      else if g.which == 7 then fadd_lo1_7
+      else if g.which == 8 then fadd_lo1_8
+      else fadd_lo1_9
+  proofs:
+    purity:
+      reads : [g.a0, g.a1, g.a2, g.a3, g.a4, g.a5, g.a6, g.a7, g.a8, g.a9, g.b0, g.b1, g.b2, g.b3, g.b4, g.b5, g.b6, g.b7, g.b8, g.b9, g.which]
+      calls : []
+    termination:
+      bound : 20000
+
+
+rule fsub
+  @intention: "field sub mod 2^255-19 (a + 2p - b, biased non-negative, then reduce)"
+  @source: invoices.intent:2
+  input:
+    g : FieldPair
+  output:
+    out : number
+  logic:
+    let fsub_a0 = g.a0 + 134217690 - g.b0
+    let fsub_a1 = g.a1 + 67108862 - g.b1
+    let fsub_a2 = g.a2 + 134217726 - g.b2
+    let fsub_a3 = g.a3 + 67108862 - g.b3
+    let fsub_a4 = g.a4 + 134217726 - g.b4
+    let fsub_a5 = g.a5 + 67108862 - g.b5
+    let fsub_a6 = g.a6 + 134217726 - g.b6
+    let fsub_a7 = g.a7 + 67108862 - g.b7
+    let fsub_a8 = g.a8 + 134217726 - g.b8
+    let fsub_a9 = g.a9 + 67108862 - g.b9
+    let fsub_c0_0 = shr(fsub_a0, 26)
+    let fsub_lo0_0 = band(fsub_a0, 67108863)
+    let fsub_s0_0 = fsub_a1 + fsub_c0_0
+    let fsub_c0_1 = shr(fsub_s0_0, 25)
+    let fsub_lo0_1 = band(fsub_s0_0, 33554431)
+    let fsub_s0_1 = fsub_a2 + fsub_c0_1
+    let fsub_c0_2 = shr(fsub_s0_1, 26)
+    let fsub_lo0_2 = band(fsub_s0_1, 67108863)
+    let fsub_s0_2 = fsub_a3 + fsub_c0_2
+    let fsub_c0_3 = shr(fsub_s0_2, 25)
+    let fsub_lo0_3 = band(fsub_s0_2, 33554431)
+    let fsub_s0_3 = fsub_a4 + fsub_c0_3
+    let fsub_c0_4 = shr(fsub_s0_3, 26)
+    let fsub_lo0_4 = band(fsub_s0_3, 67108863)
+    let fsub_s0_4 = fsub_a5 + fsub_c0_4
+    let fsub_c0_5 = shr(fsub_s0_4, 25)
+    let fsub_lo0_5 = band(fsub_s0_4, 33554431)
+    let fsub_s0_5 = fsub_a6 + fsub_c0_5
+    let fsub_c0_6 = shr(fsub_s0_5, 26)
+    let fsub_lo0_6 = band(fsub_s0_5, 67108863)
+    let fsub_s0_6 = fsub_a7 + fsub_c0_6
+    let fsub_c0_7 = shr(fsub_s0_6, 25)
+    let fsub_lo0_7 = band(fsub_s0_6, 33554431)
+    let fsub_s0_7 = fsub_a8 + fsub_c0_7
+    let fsub_c0_8 = shr(fsub_s0_7, 26)
+    let fsub_lo0_8 = band(fsub_s0_7, 67108863)
+    let fsub_s0_8 = fsub_a9 + fsub_c0_8
+    let fsub_c0_9 = shr(fsub_s0_8, 25)
+    let fsub_lo0_9 = band(fsub_s0_8, 33554431)
+    let fsub_w0 = fsub_lo0_0 + 19 * fsub_c0_9
+    let fsub_c1_0 = shr(fsub_w0, 26)
+    let fsub_lo1_0 = band(fsub_w0, 67108863)
+    let fsub_s1_0 = fsub_lo0_1 + fsub_c1_0
+    let fsub_c1_1 = shr(fsub_s1_0, 25)
+    let fsub_lo1_1 = band(fsub_s1_0, 33554431)
+    let fsub_s1_1 = fsub_lo0_2 + fsub_c1_1
+    let fsub_c1_2 = shr(fsub_s1_1, 26)
+    let fsub_lo1_2 = band(fsub_s1_1, 67108863)
+    let fsub_s1_2 = fsub_lo0_3 + fsub_c1_2
+    let fsub_c1_3 = shr(fsub_s1_2, 25)
+    let fsub_lo1_3 = band(fsub_s1_2, 33554431)
+    let fsub_s1_3 = fsub_lo0_4 + fsub_c1_3
+    let fsub_c1_4 = shr(fsub_s1_3, 26)
+    let fsub_lo1_4 = band(fsub_s1_3, 67108863)
+    let fsub_s1_4 = fsub_lo0_5 + fsub_c1_4
+    let fsub_c1_5 = shr(fsub_s1_4, 25)
+    let fsub_lo1_5 = band(fsub_s1_4, 33554431)
+    let fsub_s1_5 = fsub_lo0_6 + fsub_c1_5
+    let fsub_c1_6 = shr(fsub_s1_5, 26)
+    let fsub_lo1_6 = band(fsub_s1_5, 67108863)
+    let fsub_s1_6 = fsub_lo0_7 + fsub_c1_6
+    let fsub_c1_7 = shr(fsub_s1_6, 25)
+    let fsub_lo1_7 = band(fsub_s1_6, 33554431)
+    let fsub_s1_7 = fsub_lo0_8 + fsub_c1_7
+    let fsub_c1_8 = shr(fsub_s1_7, 26)
+    let fsub_lo1_8 = band(fsub_s1_7, 67108863)
+    let fsub_s1_8 = fsub_lo0_9 + fsub_c1_8
+    let fsub_c1_9 = shr(fsub_s1_8, 25)
+    let fsub_lo1_9 = band(fsub_s1_8, 33554431)
+    let fsub_w1 = fsub_lo1_0 + 19 * fsub_c1_9
+    out = if g.which == 0 then fsub_w1
+      else if g.which == 1 then fsub_lo1_1
+      else if g.which == 2 then fsub_lo1_2
+      else if g.which == 3 then fsub_lo1_3
+      else if g.which == 4 then fsub_lo1_4
+      else if g.which == 5 then fsub_lo1_5
+      else if g.which == 6 then fsub_lo1_6
+      else if g.which == 7 then fsub_lo1_7
+      else if g.which == 8 then fsub_lo1_8
+      else fsub_lo1_9
+  proofs:
+    purity:
+      reads : [g.a0, g.a1, g.a2, g.a3, g.a4, g.a5, g.a6, g.a7, g.a8, g.a9, g.b0, g.b1, g.b2, g.b3, g.b4, g.b5, g.b6, g.b7, g.b8, g.b9, g.which]
+      calls : []
+    termination:
+      bound : 20000
+
+
+rule fmul
+  @intention: "field mul mod 2^255-19 (schoolbook 10x10, 19-fold reduction, carry)"
+  @source: invoices.intent:1
+  input:
+    g : FieldPair
+  output:
+    out : number
+  logic:
+    let fmul_a0 = (g.a0 * g.b0) + 38 * (g.a1 * g.b9) + 19 * (g.a2 * g.b8) + 38 * (g.a3 * g.b7) + 19 * (g.a4 * g.b6) + 38 * (g.a5 * g.b5) + 19 * (g.a6 * g.b4) + 38 * (g.a7 * g.b3) + 19 * (g.a8 * g.b2) + 38 * (g.a9 * g.b1)
+    let fmul_a1 = (g.a0 * g.b1) + (g.a1 * g.b0) + 19 * (g.a2 * g.b9) + 19 * (g.a3 * g.b8) + 19 * (g.a4 * g.b7) + 19 * (g.a5 * g.b6) + 19 * (g.a6 * g.b5) + 19 * (g.a7 * g.b4) + 19 * (g.a8 * g.b3) + 19 * (g.a9 * g.b2)
+    let fmul_a2 = (g.a0 * g.b2) + 2 * (g.a1 * g.b1) + (g.a2 * g.b0) + 38 * (g.a3 * g.b9) + 19 * (g.a4 * g.b8) + 38 * (g.a5 * g.b7) + 19 * (g.a6 * g.b6) + 38 * (g.a7 * g.b5) + 19 * (g.a8 * g.b4) + 38 * (g.a9 * g.b3)
+    let fmul_a3 = (g.a0 * g.b3) + (g.a1 * g.b2) + (g.a2 * g.b1) + (g.a3 * g.b0) + 19 * (g.a4 * g.b9) + 19 * (g.a5 * g.b8) + 19 * (g.a6 * g.b7) + 19 * (g.a7 * g.b6) + 19 * (g.a8 * g.b5) + 19 * (g.a9 * g.b4)
+    let fmul_a4 = (g.a0 * g.b4) + 2 * (g.a1 * g.b3) + (g.a2 * g.b2) + 2 * (g.a3 * g.b1) + (g.a4 * g.b0) + 38 * (g.a5 * g.b9) + 19 * (g.a6 * g.b8) + 38 * (g.a7 * g.b7) + 19 * (g.a8 * g.b6) + 38 * (g.a9 * g.b5)
+    let fmul_a5 = (g.a0 * g.b5) + (g.a1 * g.b4) + (g.a2 * g.b3) + (g.a3 * g.b2) + (g.a4 * g.b1) + (g.a5 * g.b0) + 19 * (g.a6 * g.b9) + 19 * (g.a7 * g.b8) + 19 * (g.a8 * g.b7) + 19 * (g.a9 * g.b6)
+    let fmul_a6 = (g.a0 * g.b6) + 2 * (g.a1 * g.b5) + (g.a2 * g.b4) + 2 * (g.a3 * g.b3) + (g.a4 * g.b2) + 2 * (g.a5 * g.b1) + (g.a6 * g.b0) + 38 * (g.a7 * g.b9) + 19 * (g.a8 * g.b8) + 38 * (g.a9 * g.b7)
+    let fmul_a7 = (g.a0 * g.b7) + (g.a1 * g.b6) + (g.a2 * g.b5) + (g.a3 * g.b4) + (g.a4 * g.b3) + (g.a5 * g.b2) + (g.a6 * g.b1) + (g.a7 * g.b0) + 19 * (g.a8 * g.b9) + 19 * (g.a9 * g.b8)
+    let fmul_a8 = (g.a0 * g.b8) + 2 * (g.a1 * g.b7) + (g.a2 * g.b6) + 2 * (g.a3 * g.b5) + (g.a4 * g.b4) + 2 * (g.a5 * g.b3) + (g.a6 * g.b2) + 2 * (g.a7 * g.b1) + (g.a8 * g.b0) + 38 * (g.a9 * g.b9)
+    let fmul_a9 = (g.a0 * g.b9) + (g.a1 * g.b8) + (g.a2 * g.b7) + (g.a3 * g.b6) + (g.a4 * g.b5) + (g.a5 * g.b4) + (g.a6 * g.b3) + (g.a7 * g.b2) + (g.a8 * g.b1) + (g.a9 * g.b0)
+    let fmul_c0_0 = shr(fmul_a0, 26)
+    let fmul_lo0_0 = band(fmul_a0, 67108863)
+    let fmul_s0_0 = fmul_a1 + fmul_c0_0
+    let fmul_c0_1 = shr(fmul_s0_0, 25)
+    let fmul_lo0_1 = band(fmul_s0_0, 33554431)
+    let fmul_s0_1 = fmul_a2 + fmul_c0_1
+    let fmul_c0_2 = shr(fmul_s0_1, 26)
+    let fmul_lo0_2 = band(fmul_s0_1, 67108863)
+    let fmul_s0_2 = fmul_a3 + fmul_c0_2
+    let fmul_c0_3 = shr(fmul_s0_2, 25)
+    let fmul_lo0_3 = band(fmul_s0_2, 33554431)
+    let fmul_s0_3 = fmul_a4 + fmul_c0_3
+    let fmul_c0_4 = shr(fmul_s0_3, 26)
+    let fmul_lo0_4 = band(fmul_s0_3, 67108863)
+    let fmul_s0_4 = fmul_a5 + fmul_c0_4
+    let fmul_c0_5 = shr(fmul_s0_4, 25)
+    let fmul_lo0_5 = band(fmul_s0_4, 33554431)
+    let fmul_s0_5 = fmul_a6 + fmul_c0_5
+    let fmul_c0_6 = shr(fmul_s0_5, 26)
+    let fmul_lo0_6 = band(fmul_s0_5, 67108863)
+    let fmul_s0_6 = fmul_a7 + fmul_c0_6
+    let fmul_c0_7 = shr(fmul_s0_6, 25)
+    let fmul_lo0_7 = band(fmul_s0_6, 33554431)
+    let fmul_s0_7 = fmul_a8 + fmul_c0_7
+    let fmul_c0_8 = shr(fmul_s0_7, 26)
+    let fmul_lo0_8 = band(fmul_s0_7, 67108863)
+    let fmul_s0_8 = fmul_a9 + fmul_c0_8
+    let fmul_c0_9 = shr(fmul_s0_8, 25)
+    let fmul_lo0_9 = band(fmul_s0_8, 33554431)
+    let fmul_w0 = fmul_lo0_0 + 19 * fmul_c0_9
+    let fmul_c1_0 = shr(fmul_w0, 26)
+    let fmul_lo1_0 = band(fmul_w0, 67108863)
+    let fmul_s1_0 = fmul_lo0_1 + fmul_c1_0
+    let fmul_c1_1 = shr(fmul_s1_0, 25)
+    let fmul_lo1_1 = band(fmul_s1_0, 33554431)
+    let fmul_s1_1 = fmul_lo0_2 + fmul_c1_1
+    let fmul_c1_2 = shr(fmul_s1_1, 26)
+    let fmul_lo1_2 = band(fmul_s1_1, 67108863)
+    let fmul_s1_2 = fmul_lo0_3 + fmul_c1_2
+    let fmul_c1_3 = shr(fmul_s1_2, 25)
+    let fmul_lo1_3 = band(fmul_s1_2, 33554431)
+    let fmul_s1_3 = fmul_lo0_4 + fmul_c1_3
+    let fmul_c1_4 = shr(fmul_s1_3, 26)
+    let fmul_lo1_4 = band(fmul_s1_3, 67108863)
+    let fmul_s1_4 = fmul_lo0_5 + fmul_c1_4
+    let fmul_c1_5 = shr(fmul_s1_4, 25)
+    let fmul_lo1_5 = band(fmul_s1_4, 33554431)
+    let fmul_s1_5 = fmul_lo0_6 + fmul_c1_5
+    let fmul_c1_6 = shr(fmul_s1_5, 26)
+    let fmul_lo1_6 = band(fmul_s1_5, 67108863)
+    let fmul_s1_6 = fmul_lo0_7 + fmul_c1_6
+    let fmul_c1_7 = shr(fmul_s1_6, 25)
+    let fmul_lo1_7 = band(fmul_s1_6, 33554431)
+    let fmul_s1_7 = fmul_lo0_8 + fmul_c1_7
+    let fmul_c1_8 = shr(fmul_s1_7, 26)
+    let fmul_lo1_8 = band(fmul_s1_7, 67108863)
+    let fmul_s1_8 = fmul_lo0_9 + fmul_c1_8
+    let fmul_c1_9 = shr(fmul_s1_8, 25)
+    let fmul_lo1_9 = band(fmul_s1_8, 33554431)
+    let fmul_w1 = fmul_lo1_0 + 19 * fmul_c1_9
+    out = if g.which == 0 then fmul_w1
+      else if g.which == 1 then fmul_lo1_1
+      else if g.which == 2 then fmul_lo1_2
+      else if g.which == 3 then fmul_lo1_3
+      else if g.which == 4 then fmul_lo1_4
+      else if g.which == 5 then fmul_lo1_5
+      else if g.which == 6 then fmul_lo1_6
+      else if g.which == 7 then fmul_lo1_7
+      else if g.which == 8 then fmul_lo1_8
+      else fmul_lo1_9
+  proofs:
+    purity:
+      reads : [g.a0, g.a1, g.a2, g.a3, g.a4, g.a5, g.a6, g.a7, g.a8, g.a9, g.b0, g.b1, g.b2, g.b3, g.b4, g.b5, g.b6, g.b7, g.b8, g.b9, g.which]
+      calls : []
+    termination:
+      bound : 20000

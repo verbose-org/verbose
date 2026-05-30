@@ -1,0 +1,14 @@
+GF(2^255-19) field arithmetic on the 10-limb 26/25-bit representation,
+the make-or-break brick of X25519 (per docs/x25519-design.md). A field
+element is 10 signed-i64 limbs with alternating 26/25-bit widths, kept
+non-negative and fully reduced (invariant I1).
+
+fadd(a, b): limb-wise add then carry-reduce.
+fsub(a, b): a + 2p - b (biased to stay non-negative) then reduce.
+fmul(a, b): schoolbook 10x10 with odd*odd doubling and the 2^255 = 19
+            fold, then two carry passes. Every accumulator stays below
+            2^59, so no high-half multiply is ever needed.
+
+Each rule takes two elements (20 limbs) + which output limb (0..9).
+Validated against big-int (a op b) mod (2^255-19) over 20000 random
+vectors and edge cases.
