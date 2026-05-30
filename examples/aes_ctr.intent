@@ -1,0 +1,8 @@
+AES-128-CTR single block: encrypt a 16-byte plaintext block under a
+16-byte key and a 16-byte counter block. Counter mode turns the AES
+block cipher into a stream cipher: keystream = AES-128(counter, key),
+ciphertext = plaintext XOR keystream. The counter block is the IV seen
+as a 128-bit big-endian integer; block N uses counter = IV + N
+(incremented by the caller). CTR is its own inverse, so the same rule
+decrypts. This is the encryption half of AES-128-GCM.
+Single rule ctr_block(plaintext, key, counter, which) returns one byte.

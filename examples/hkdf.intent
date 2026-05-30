@@ -1,0 +1,6 @@
+HKDF (RFC 5869) over SHA-256, the TLS 1.3 key-derivation primitive.
+hkdf_extract(salt, IKM) = HMAC-SHA256(salt, IKM) -> PRK (32 bytes).
+hkdf_expand(PRK, info, L) concatenates T(i) = HMAC(PRK, T(i-1)||info||i)
+for i = 1.. until L bytes are produced (here L = 42, so T(1)||T(2)
+truncated). Both rules compose the inlined HMAC-SHA256. Validated
+against RFC 5869 Test Case 1 (published PRK and OKM).

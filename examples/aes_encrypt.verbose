@@ -1,0 +1,1023 @@
+@verbose 0.1.0
+
+concept Byte
+  @intention: "single byte 0..255"
+  @source: aes_encrypt.intent:1
+  fields:
+    b : number [0, 255]
+
+concept EncryptInput
+  @intention: "16-byte plaintext block + 16-byte AES-128 key + which output byte"
+  @source: aes_encrypt.intent:1
+  fields:
+    p0 : number [0, 255]
+    p1 : number [0, 255]
+    p2 : number [0, 255]
+    p3 : number [0, 255]
+    p4 : number [0, 255]
+    p5 : number [0, 255]
+    p6 : number [0, 255]
+    p7 : number [0, 255]
+    p8 : number [0, 255]
+    p9 : number [0, 255]
+    p10 : number [0, 255]
+    p11 : number [0, 255]
+    p12 : number [0, 255]
+    p13 : number [0, 255]
+    p14 : number [0, 255]
+    p15 : number [0, 255]
+    k0 : number [0, 255]
+    k1 : number [0, 255]
+    k2 : number [0, 255]
+    k3 : number [0, 255]
+    k4 : number [0, 255]
+    k5 : number [0, 255]
+    k6 : number [0, 255]
+    k7 : number [0, 255]
+    k8 : number [0, 255]
+    k9 : number [0, 255]
+    k10 : number [0, 255]
+    k11 : number [0, 255]
+    k12 : number [0, 255]
+    k13 : number [0, 255]
+    k14 : number [0, 255]
+    k15 : number [0, 255]
+    which : number [0, 15]
+
+
+rule aes_sbox
+  @intention: "AES forward S-box (FIPS-197 Figure 7)"
+  @source: aes_encrypt.intent:2
+  input:
+    inp : Byte
+  output:
+    out : number
+  logic:
+    out = if inp.b == 0 then 99
+      else if inp.b == 1 then 124
+      else if inp.b == 2 then 119
+      else if inp.b == 3 then 123
+      else if inp.b == 4 then 242
+      else if inp.b == 5 then 107
+      else if inp.b == 6 then 111
+      else if inp.b == 7 then 197
+      else if inp.b == 8 then 48
+      else if inp.b == 9 then 1
+      else if inp.b == 10 then 103
+      else if inp.b == 11 then 43
+      else if inp.b == 12 then 254
+      else if inp.b == 13 then 215
+      else if inp.b == 14 then 171
+      else if inp.b == 15 then 118
+      else if inp.b == 16 then 202
+      else if inp.b == 17 then 130
+      else if inp.b == 18 then 201
+      else if inp.b == 19 then 125
+      else if inp.b == 20 then 250
+      else if inp.b == 21 then 89
+      else if inp.b == 22 then 71
+      else if inp.b == 23 then 240
+      else if inp.b == 24 then 173
+      else if inp.b == 25 then 212
+      else if inp.b == 26 then 162
+      else if inp.b == 27 then 175
+      else if inp.b == 28 then 156
+      else if inp.b == 29 then 164
+      else if inp.b == 30 then 114
+      else if inp.b == 31 then 192
+      else if inp.b == 32 then 183
+      else if inp.b == 33 then 253
+      else if inp.b == 34 then 147
+      else if inp.b == 35 then 38
+      else if inp.b == 36 then 54
+      else if inp.b == 37 then 63
+      else if inp.b == 38 then 247
+      else if inp.b == 39 then 204
+      else if inp.b == 40 then 52
+      else if inp.b == 41 then 165
+      else if inp.b == 42 then 229
+      else if inp.b == 43 then 241
+      else if inp.b == 44 then 113
+      else if inp.b == 45 then 216
+      else if inp.b == 46 then 49
+      else if inp.b == 47 then 21
+      else if inp.b == 48 then 4
+      else if inp.b == 49 then 199
+      else if inp.b == 50 then 35
+      else if inp.b == 51 then 195
+      else if inp.b == 52 then 24
+      else if inp.b == 53 then 150
+      else if inp.b == 54 then 5
+      else if inp.b == 55 then 154
+      else if inp.b == 56 then 7
+      else if inp.b == 57 then 18
+      else if inp.b == 58 then 128
+      else if inp.b == 59 then 226
+      else if inp.b == 60 then 235
+      else if inp.b == 61 then 39
+      else if inp.b == 62 then 178
+      else if inp.b == 63 then 117
+      else if inp.b == 64 then 9
+      else if inp.b == 65 then 131
+      else if inp.b == 66 then 44
+      else if inp.b == 67 then 26
+      else if inp.b == 68 then 27
+      else if inp.b == 69 then 110
+      else if inp.b == 70 then 90
+      else if inp.b == 71 then 160
+      else if inp.b == 72 then 82
+      else if inp.b == 73 then 59
+      else if inp.b == 74 then 214
+      else if inp.b == 75 then 179
+      else if inp.b == 76 then 41
+      else if inp.b == 77 then 227
+      else if inp.b == 78 then 47
+      else if inp.b == 79 then 132
+      else if inp.b == 80 then 83
+      else if inp.b == 81 then 209
+      else if inp.b == 82 then 0
+      else if inp.b == 83 then 237
+      else if inp.b == 84 then 32
+      else if inp.b == 85 then 252
+      else if inp.b == 86 then 177
+      else if inp.b == 87 then 91
+      else if inp.b == 88 then 106
+      else if inp.b == 89 then 203
+      else if inp.b == 90 then 190
+      else if inp.b == 91 then 57
+      else if inp.b == 92 then 74
+      else if inp.b == 93 then 76
+      else if inp.b == 94 then 88
+      else if inp.b == 95 then 207
+      else if inp.b == 96 then 208
+      else if inp.b == 97 then 239
+      else if inp.b == 98 then 170
+      else if inp.b == 99 then 251
+      else if inp.b == 100 then 67
+      else if inp.b == 101 then 77
+      else if inp.b == 102 then 51
+      else if inp.b == 103 then 133
+      else if inp.b == 104 then 69
+      else if inp.b == 105 then 249
+      else if inp.b == 106 then 2
+      else if inp.b == 107 then 127
+      else if inp.b == 108 then 80
+      else if inp.b == 109 then 60
+      else if inp.b == 110 then 159
+      else if inp.b == 111 then 168
+      else if inp.b == 112 then 81
+      else if inp.b == 113 then 163
+      else if inp.b == 114 then 64
+      else if inp.b == 115 then 143
+      else if inp.b == 116 then 146
+      else if inp.b == 117 then 157
+      else if inp.b == 118 then 56
+      else if inp.b == 119 then 245
+      else if inp.b == 120 then 188
+      else if inp.b == 121 then 182
+      else if inp.b == 122 then 218
+      else if inp.b == 123 then 33
+      else if inp.b == 124 then 16
+      else if inp.b == 125 then 255
+      else if inp.b == 126 then 243
+      else if inp.b == 127 then 210
+      else if inp.b == 128 then 205
+      else if inp.b == 129 then 12
+      else if inp.b == 130 then 19
+      else if inp.b == 131 then 236
+      else if inp.b == 132 then 95
+      else if inp.b == 133 then 151
+      else if inp.b == 134 then 68
+      else if inp.b == 135 then 23
+      else if inp.b == 136 then 196
+      else if inp.b == 137 then 167
+      else if inp.b == 138 then 126
+      else if inp.b == 139 then 61
+      else if inp.b == 140 then 100
+      else if inp.b == 141 then 93
+      else if inp.b == 142 then 25
+      else if inp.b == 143 then 115
+      else if inp.b == 144 then 96
+      else if inp.b == 145 then 129
+      else if inp.b == 146 then 79
+      else if inp.b == 147 then 220
+      else if inp.b == 148 then 34
+      else if inp.b == 149 then 42
+      else if inp.b == 150 then 144
+      else if inp.b == 151 then 136
+      else if inp.b == 152 then 70
+      else if inp.b == 153 then 238
+      else if inp.b == 154 then 184
+      else if inp.b == 155 then 20
+      else if inp.b == 156 then 222
+      else if inp.b == 157 then 94
+      else if inp.b == 158 then 11
+      else if inp.b == 159 then 219
+      else if inp.b == 160 then 224
+      else if inp.b == 161 then 50
+      else if inp.b == 162 then 58
+      else if inp.b == 163 then 10
+      else if inp.b == 164 then 73
+      else if inp.b == 165 then 6
+      else if inp.b == 166 then 36
+      else if inp.b == 167 then 92
+      else if inp.b == 168 then 194
+      else if inp.b == 169 then 211
+      else if inp.b == 170 then 172
+      else if inp.b == 171 then 98
+      else if inp.b == 172 then 145
+      else if inp.b == 173 then 149
+      else if inp.b == 174 then 228
+      else if inp.b == 175 then 121
+      else if inp.b == 176 then 231
+      else if inp.b == 177 then 200
+      else if inp.b == 178 then 55
+      else if inp.b == 179 then 109
+      else if inp.b == 180 then 141
+      else if inp.b == 181 then 213
+      else if inp.b == 182 then 78
+      else if inp.b == 183 then 169
+      else if inp.b == 184 then 108
+      else if inp.b == 185 then 86
+      else if inp.b == 186 then 244
+      else if inp.b == 187 then 234
+      else if inp.b == 188 then 101
+      else if inp.b == 189 then 122
+      else if inp.b == 190 then 174
+      else if inp.b == 191 then 8
+      else if inp.b == 192 then 186
+      else if inp.b == 193 then 120
+      else if inp.b == 194 then 37
+      else if inp.b == 195 then 46
+      else if inp.b == 196 then 28
+      else if inp.b == 197 then 166
+      else if inp.b == 198 then 180
+      else if inp.b == 199 then 198
+      else if inp.b == 200 then 232
+      else if inp.b == 201 then 221
+      else if inp.b == 202 then 116
+      else if inp.b == 203 then 31
+      else if inp.b == 204 then 75
+      else if inp.b == 205 then 189
+      else if inp.b == 206 then 139
+      else if inp.b == 207 then 138
+      else if inp.b == 208 then 112
+      else if inp.b == 209 then 62
+      else if inp.b == 210 then 181
+      else if inp.b == 211 then 102
+      else if inp.b == 212 then 72
+      else if inp.b == 213 then 3
+      else if inp.b == 214 then 246
+      else if inp.b == 215 then 14
+      else if inp.b == 216 then 97
+      else if inp.b == 217 then 53
+      else if inp.b == 218 then 87
+      else if inp.b == 219 then 185
+      else if inp.b == 220 then 134
+      else if inp.b == 221 then 193
+      else if inp.b == 222 then 29
+      else if inp.b == 223 then 158
+      else if inp.b == 224 then 225
+      else if inp.b == 225 then 248
+      else if inp.b == 226 then 152
+      else if inp.b == 227 then 17
+      else if inp.b == 228 then 105
+      else if inp.b == 229 then 217
+      else if inp.b == 230 then 142
+      else if inp.b == 231 then 148
+      else if inp.b == 232 then 155
+      else if inp.b == 233 then 30
+      else if inp.b == 234 then 135
+      else if inp.b == 235 then 233
+      else if inp.b == 236 then 206
+      else if inp.b == 237 then 85
+      else if inp.b == 238 then 40
+      else if inp.b == 239 then 223
+      else if inp.b == 240 then 140
+      else if inp.b == 241 then 161
+      else if inp.b == 242 then 137
+      else if inp.b == 243 then 13
+      else if inp.b == 244 then 191
+      else if inp.b == 245 then 230
+      else if inp.b == 246 then 66
+      else if inp.b == 247 then 104
+      else if inp.b == 248 then 65
+      else if inp.b == 249 then 153
+      else if inp.b == 250 then 45
+      else if inp.b == 251 then 15
+      else if inp.b == 252 then 176
+      else if inp.b == 253 then 84
+      else if inp.b == 254 then 187
+      else 22
+  proofs:
+    purity:
+      reads : [inp.b]
+      calls : []
+    termination:
+      bound : 800
+
+
+rule xtime
+  @intention: "GF(2^8) multiply by x"
+  @source: aes_encrypt.intent:3
+  input:
+    inp : Byte
+  output:
+    out : number
+  logic:
+    out = if band(inp.b, 128) > 0 then band(bxor(shl(inp.b, 1), 27), 255) else band(shl(inp.b, 1), 255)
+  proofs:
+    purity:
+      reads : [inp.b]
+      calls : []
+    termination:
+      bound : 20
+
+
+rule encrypt
+  @intention: "AES-128 single-block ECB encrypt: returns byte `which` of the ciphertext"
+  @source: aes_encrypt.intent:4
+  input:
+    e : EncryptInput
+  output:
+    out : number
+  logic:
+    let ks0 = e.k0
+    let ks1 = e.k1
+    let ks2 = e.k2
+    let ks3 = e.k3
+    let ks4 = e.k4
+    let ks5 = e.k5
+    let ks6 = e.k6
+    let ks7 = e.k7
+    let ks8 = e.k8
+    let ks9 = e.k9
+    let ks10 = e.k10
+    let ks11 = e.k11
+    let ks12 = e.k12
+    let ks13 = e.k13
+    let ks14 = e.k14
+    let ks15 = e.k15
+    let ks16 = band(bxor(bxor(ks0, aes_sbox(Byte { b: ks13 })), 1), 255)
+    let ks17 = band(bxor(ks1, aes_sbox(Byte { b: ks14 })), 255)
+    let ks18 = band(bxor(ks2, aes_sbox(Byte { b: ks15 })), 255)
+    let ks19 = band(bxor(ks3, aes_sbox(Byte { b: ks12 })), 255)
+    let ks20 = band(bxor(ks4, ks16), 255)
+    let ks21 = band(bxor(ks5, ks17), 255)
+    let ks22 = band(bxor(ks6, ks18), 255)
+    let ks23 = band(bxor(ks7, ks19), 255)
+    let ks24 = band(bxor(ks8, ks20), 255)
+    let ks25 = band(bxor(ks9, ks21), 255)
+    let ks26 = band(bxor(ks10, ks22), 255)
+    let ks27 = band(bxor(ks11, ks23), 255)
+    let ks28 = band(bxor(ks12, ks24), 255)
+    let ks29 = band(bxor(ks13, ks25), 255)
+    let ks30 = band(bxor(ks14, ks26), 255)
+    let ks31 = band(bxor(ks15, ks27), 255)
+    let ks32 = band(bxor(bxor(ks16, aes_sbox(Byte { b: ks29 })), 2), 255)
+    let ks33 = band(bxor(ks17, aes_sbox(Byte { b: ks30 })), 255)
+    let ks34 = band(bxor(ks18, aes_sbox(Byte { b: ks31 })), 255)
+    let ks35 = band(bxor(ks19, aes_sbox(Byte { b: ks28 })), 255)
+    let ks36 = band(bxor(ks20, ks32), 255)
+    let ks37 = band(bxor(ks21, ks33), 255)
+    let ks38 = band(bxor(ks22, ks34), 255)
+    let ks39 = band(bxor(ks23, ks35), 255)
+    let ks40 = band(bxor(ks24, ks36), 255)
+    let ks41 = band(bxor(ks25, ks37), 255)
+    let ks42 = band(bxor(ks26, ks38), 255)
+    let ks43 = band(bxor(ks27, ks39), 255)
+    let ks44 = band(bxor(ks28, ks40), 255)
+    let ks45 = band(bxor(ks29, ks41), 255)
+    let ks46 = band(bxor(ks30, ks42), 255)
+    let ks47 = band(bxor(ks31, ks43), 255)
+    let ks48 = band(bxor(bxor(ks32, aes_sbox(Byte { b: ks45 })), 4), 255)
+    let ks49 = band(bxor(ks33, aes_sbox(Byte { b: ks46 })), 255)
+    let ks50 = band(bxor(ks34, aes_sbox(Byte { b: ks47 })), 255)
+    let ks51 = band(bxor(ks35, aes_sbox(Byte { b: ks44 })), 255)
+    let ks52 = band(bxor(ks36, ks48), 255)
+    let ks53 = band(bxor(ks37, ks49), 255)
+    let ks54 = band(bxor(ks38, ks50), 255)
+    let ks55 = band(bxor(ks39, ks51), 255)
+    let ks56 = band(bxor(ks40, ks52), 255)
+    let ks57 = band(bxor(ks41, ks53), 255)
+    let ks58 = band(bxor(ks42, ks54), 255)
+    let ks59 = band(bxor(ks43, ks55), 255)
+    let ks60 = band(bxor(ks44, ks56), 255)
+    let ks61 = band(bxor(ks45, ks57), 255)
+    let ks62 = band(bxor(ks46, ks58), 255)
+    let ks63 = band(bxor(ks47, ks59), 255)
+    let ks64 = band(bxor(bxor(ks48, aes_sbox(Byte { b: ks61 })), 8), 255)
+    let ks65 = band(bxor(ks49, aes_sbox(Byte { b: ks62 })), 255)
+    let ks66 = band(bxor(ks50, aes_sbox(Byte { b: ks63 })), 255)
+    let ks67 = band(bxor(ks51, aes_sbox(Byte { b: ks60 })), 255)
+    let ks68 = band(bxor(ks52, ks64), 255)
+    let ks69 = band(bxor(ks53, ks65), 255)
+    let ks70 = band(bxor(ks54, ks66), 255)
+    let ks71 = band(bxor(ks55, ks67), 255)
+    let ks72 = band(bxor(ks56, ks68), 255)
+    let ks73 = band(bxor(ks57, ks69), 255)
+    let ks74 = band(bxor(ks58, ks70), 255)
+    let ks75 = band(bxor(ks59, ks71), 255)
+    let ks76 = band(bxor(ks60, ks72), 255)
+    let ks77 = band(bxor(ks61, ks73), 255)
+    let ks78 = band(bxor(ks62, ks74), 255)
+    let ks79 = band(bxor(ks63, ks75), 255)
+    let ks80 = band(bxor(bxor(ks64, aes_sbox(Byte { b: ks77 })), 16), 255)
+    let ks81 = band(bxor(ks65, aes_sbox(Byte { b: ks78 })), 255)
+    let ks82 = band(bxor(ks66, aes_sbox(Byte { b: ks79 })), 255)
+    let ks83 = band(bxor(ks67, aes_sbox(Byte { b: ks76 })), 255)
+    let ks84 = band(bxor(ks68, ks80), 255)
+    let ks85 = band(bxor(ks69, ks81), 255)
+    let ks86 = band(bxor(ks70, ks82), 255)
+    let ks87 = band(bxor(ks71, ks83), 255)
+    let ks88 = band(bxor(ks72, ks84), 255)
+    let ks89 = band(bxor(ks73, ks85), 255)
+    let ks90 = band(bxor(ks74, ks86), 255)
+    let ks91 = band(bxor(ks75, ks87), 255)
+    let ks92 = band(bxor(ks76, ks88), 255)
+    let ks93 = band(bxor(ks77, ks89), 255)
+    let ks94 = band(bxor(ks78, ks90), 255)
+    let ks95 = band(bxor(ks79, ks91), 255)
+    let ks96 = band(bxor(bxor(ks80, aes_sbox(Byte { b: ks93 })), 32), 255)
+    let ks97 = band(bxor(ks81, aes_sbox(Byte { b: ks94 })), 255)
+    let ks98 = band(bxor(ks82, aes_sbox(Byte { b: ks95 })), 255)
+    let ks99 = band(bxor(ks83, aes_sbox(Byte { b: ks92 })), 255)
+    let ks100 = band(bxor(ks84, ks96), 255)
+    let ks101 = band(bxor(ks85, ks97), 255)
+    let ks102 = band(bxor(ks86, ks98), 255)
+    let ks103 = band(bxor(ks87, ks99), 255)
+    let ks104 = band(bxor(ks88, ks100), 255)
+    let ks105 = band(bxor(ks89, ks101), 255)
+    let ks106 = band(bxor(ks90, ks102), 255)
+    let ks107 = band(bxor(ks91, ks103), 255)
+    let ks108 = band(bxor(ks92, ks104), 255)
+    let ks109 = band(bxor(ks93, ks105), 255)
+    let ks110 = band(bxor(ks94, ks106), 255)
+    let ks111 = band(bxor(ks95, ks107), 255)
+    let ks112 = band(bxor(bxor(ks96, aes_sbox(Byte { b: ks109 })), 64), 255)
+    let ks113 = band(bxor(ks97, aes_sbox(Byte { b: ks110 })), 255)
+    let ks114 = band(bxor(ks98, aes_sbox(Byte { b: ks111 })), 255)
+    let ks115 = band(bxor(ks99, aes_sbox(Byte { b: ks108 })), 255)
+    let ks116 = band(bxor(ks100, ks112), 255)
+    let ks117 = band(bxor(ks101, ks113), 255)
+    let ks118 = band(bxor(ks102, ks114), 255)
+    let ks119 = band(bxor(ks103, ks115), 255)
+    let ks120 = band(bxor(ks104, ks116), 255)
+    let ks121 = band(bxor(ks105, ks117), 255)
+    let ks122 = band(bxor(ks106, ks118), 255)
+    let ks123 = band(bxor(ks107, ks119), 255)
+    let ks124 = band(bxor(ks108, ks120), 255)
+    let ks125 = band(bxor(ks109, ks121), 255)
+    let ks126 = band(bxor(ks110, ks122), 255)
+    let ks127 = band(bxor(ks111, ks123), 255)
+    let ks128 = band(bxor(bxor(ks112, aes_sbox(Byte { b: ks125 })), 128), 255)
+    let ks129 = band(bxor(ks113, aes_sbox(Byte { b: ks126 })), 255)
+    let ks130 = band(bxor(ks114, aes_sbox(Byte { b: ks127 })), 255)
+    let ks131 = band(bxor(ks115, aes_sbox(Byte { b: ks124 })), 255)
+    let ks132 = band(bxor(ks116, ks128), 255)
+    let ks133 = band(bxor(ks117, ks129), 255)
+    let ks134 = band(bxor(ks118, ks130), 255)
+    let ks135 = band(bxor(ks119, ks131), 255)
+    let ks136 = band(bxor(ks120, ks132), 255)
+    let ks137 = band(bxor(ks121, ks133), 255)
+    let ks138 = band(bxor(ks122, ks134), 255)
+    let ks139 = band(bxor(ks123, ks135), 255)
+    let ks140 = band(bxor(ks124, ks136), 255)
+    let ks141 = band(bxor(ks125, ks137), 255)
+    let ks142 = band(bxor(ks126, ks138), 255)
+    let ks143 = band(bxor(ks127, ks139), 255)
+    let ks144 = band(bxor(bxor(ks128, aes_sbox(Byte { b: ks141 })), 27), 255)
+    let ks145 = band(bxor(ks129, aes_sbox(Byte { b: ks142 })), 255)
+    let ks146 = band(bxor(ks130, aes_sbox(Byte { b: ks143 })), 255)
+    let ks147 = band(bxor(ks131, aes_sbox(Byte { b: ks140 })), 255)
+    let ks148 = band(bxor(ks132, ks144), 255)
+    let ks149 = band(bxor(ks133, ks145), 255)
+    let ks150 = band(bxor(ks134, ks146), 255)
+    let ks151 = band(bxor(ks135, ks147), 255)
+    let ks152 = band(bxor(ks136, ks148), 255)
+    let ks153 = band(bxor(ks137, ks149), 255)
+    let ks154 = band(bxor(ks138, ks150), 255)
+    let ks155 = band(bxor(ks139, ks151), 255)
+    let ks156 = band(bxor(ks140, ks152), 255)
+    let ks157 = band(bxor(ks141, ks153), 255)
+    let ks158 = band(bxor(ks142, ks154), 255)
+    let ks159 = band(bxor(ks143, ks155), 255)
+    let ks160 = band(bxor(bxor(ks144, aes_sbox(Byte { b: ks157 })), 54), 255)
+    let ks161 = band(bxor(ks145, aes_sbox(Byte { b: ks158 })), 255)
+    let ks162 = band(bxor(ks146, aes_sbox(Byte { b: ks159 })), 255)
+    let ks163 = band(bxor(ks147, aes_sbox(Byte { b: ks156 })), 255)
+    let ks164 = band(bxor(ks148, ks160), 255)
+    let ks165 = band(bxor(ks149, ks161), 255)
+    let ks166 = band(bxor(ks150, ks162), 255)
+    let ks167 = band(bxor(ks151, ks163), 255)
+    let ks168 = band(bxor(ks152, ks164), 255)
+    let ks169 = band(bxor(ks153, ks165), 255)
+    let ks170 = band(bxor(ks154, ks166), 255)
+    let ks171 = band(bxor(ks155, ks167), 255)
+    let ks172 = band(bxor(ks156, ks168), 255)
+    let ks173 = band(bxor(ks157, ks169), 255)
+    let ks174 = band(bxor(ks158, ks170), 255)
+    let ks175 = band(bxor(ks159, ks171), 255)
+    let st0_0 = band(bxor(e.p0, ks0), 255)
+    let st0_1 = band(bxor(e.p1, ks1), 255)
+    let st0_2 = band(bxor(e.p2, ks2), 255)
+    let st0_3 = band(bxor(e.p3, ks3), 255)
+    let st0_4 = band(bxor(e.p4, ks4), 255)
+    let st0_5 = band(bxor(e.p5, ks5), 255)
+    let st0_6 = band(bxor(e.p6, ks6), 255)
+    let st0_7 = band(bxor(e.p7, ks7), 255)
+    let st0_8 = band(bxor(e.p8, ks8), 255)
+    let st0_9 = band(bxor(e.p9, ks9), 255)
+    let st0_10 = band(bxor(e.p10, ks10), 255)
+    let st0_11 = band(bxor(e.p11, ks11), 255)
+    let st0_12 = band(bxor(e.p12, ks12), 255)
+    let st0_13 = band(bxor(e.p13, ks13), 255)
+    let st0_14 = band(bxor(e.p14, ks14), 255)
+    let st0_15 = band(bxor(e.p15, ks15), 255)
+    let sub1_0 = aes_sbox(Byte { b: st0_0 })
+    let sub1_1 = aes_sbox(Byte { b: st0_1 })
+    let sub1_2 = aes_sbox(Byte { b: st0_2 })
+    let sub1_3 = aes_sbox(Byte { b: st0_3 })
+    let sub1_4 = aes_sbox(Byte { b: st0_4 })
+    let sub1_5 = aes_sbox(Byte { b: st0_5 })
+    let sub1_6 = aes_sbox(Byte { b: st0_6 })
+    let sub1_7 = aes_sbox(Byte { b: st0_7 })
+    let sub1_8 = aes_sbox(Byte { b: st0_8 })
+    let sub1_9 = aes_sbox(Byte { b: st0_9 })
+    let sub1_10 = aes_sbox(Byte { b: st0_10 })
+    let sub1_11 = aes_sbox(Byte { b: st0_11 })
+    let sub1_12 = aes_sbox(Byte { b: st0_12 })
+    let sub1_13 = aes_sbox(Byte { b: st0_13 })
+    let sub1_14 = aes_sbox(Byte { b: st0_14 })
+    let sub1_15 = aes_sbox(Byte { b: st0_15 })
+    let mix1_0 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: sub1_0 }), xtime(Byte { b: sub1_5 })), sub1_5), sub1_10), sub1_15), 255)
+    let mix1_1 = band(bxor(bxor(bxor(bxor(sub1_0, xtime(Byte { b: sub1_5 })), xtime(Byte { b: sub1_10 })), sub1_10), sub1_15), 255)
+    let mix1_2 = band(bxor(bxor(bxor(bxor(sub1_0, sub1_5), xtime(Byte { b: sub1_10 })), xtime(Byte { b: sub1_15 })), sub1_15), 255)
+    let mix1_3 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: sub1_0 }), sub1_0), sub1_5), sub1_10), xtime(Byte { b: sub1_15 })), 255)
+    let mix1_4 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: sub1_4 }), xtime(Byte { b: sub1_9 })), sub1_9), sub1_14), sub1_3), 255)
+    let mix1_5 = band(bxor(bxor(bxor(bxor(sub1_4, xtime(Byte { b: sub1_9 })), xtime(Byte { b: sub1_14 })), sub1_14), sub1_3), 255)
+    let mix1_6 = band(bxor(bxor(bxor(bxor(sub1_4, sub1_9), xtime(Byte { b: sub1_14 })), xtime(Byte { b: sub1_3 })), sub1_3), 255)
+    let mix1_7 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: sub1_4 }), sub1_4), sub1_9), sub1_14), xtime(Byte { b: sub1_3 })), 255)
+    let mix1_8 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: sub1_8 }), xtime(Byte { b: sub1_13 })), sub1_13), sub1_2), sub1_7), 255)
+    let mix1_9 = band(bxor(bxor(bxor(bxor(sub1_8, xtime(Byte { b: sub1_13 })), xtime(Byte { b: sub1_2 })), sub1_2), sub1_7), 255)
+    let mix1_10 = band(bxor(bxor(bxor(bxor(sub1_8, sub1_13), xtime(Byte { b: sub1_2 })), xtime(Byte { b: sub1_7 })), sub1_7), 255)
+    let mix1_11 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: sub1_8 }), sub1_8), sub1_13), sub1_2), xtime(Byte { b: sub1_7 })), 255)
+    let mix1_12 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: sub1_12 }), xtime(Byte { b: sub1_1 })), sub1_1), sub1_6), sub1_11), 255)
+    let mix1_13 = band(bxor(bxor(bxor(bxor(sub1_12, xtime(Byte { b: sub1_1 })), xtime(Byte { b: sub1_6 })), sub1_6), sub1_11), 255)
+    let mix1_14 = band(bxor(bxor(bxor(bxor(sub1_12, sub1_1), xtime(Byte { b: sub1_6 })), xtime(Byte { b: sub1_11 })), sub1_11), 255)
+    let mix1_15 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: sub1_12 }), sub1_12), sub1_1), sub1_6), xtime(Byte { b: sub1_11 })), 255)
+    let st1_0 = band(bxor(mix1_0, ks16), 255)
+    let st1_1 = band(bxor(mix1_1, ks17), 255)
+    let st1_2 = band(bxor(mix1_2, ks18), 255)
+    let st1_3 = band(bxor(mix1_3, ks19), 255)
+    let st1_4 = band(bxor(mix1_4, ks20), 255)
+    let st1_5 = band(bxor(mix1_5, ks21), 255)
+    let st1_6 = band(bxor(mix1_6, ks22), 255)
+    let st1_7 = band(bxor(mix1_7, ks23), 255)
+    let st1_8 = band(bxor(mix1_8, ks24), 255)
+    let st1_9 = band(bxor(mix1_9, ks25), 255)
+    let st1_10 = band(bxor(mix1_10, ks26), 255)
+    let st1_11 = band(bxor(mix1_11, ks27), 255)
+    let st1_12 = band(bxor(mix1_12, ks28), 255)
+    let st1_13 = band(bxor(mix1_13, ks29), 255)
+    let st1_14 = band(bxor(mix1_14, ks30), 255)
+    let st1_15 = band(bxor(mix1_15, ks31), 255)
+    let sub2_0 = aes_sbox(Byte { b: st1_0 })
+    let sub2_1 = aes_sbox(Byte { b: st1_1 })
+    let sub2_2 = aes_sbox(Byte { b: st1_2 })
+    let sub2_3 = aes_sbox(Byte { b: st1_3 })
+    let sub2_4 = aes_sbox(Byte { b: st1_4 })
+    let sub2_5 = aes_sbox(Byte { b: st1_5 })
+    let sub2_6 = aes_sbox(Byte { b: st1_6 })
+    let sub2_7 = aes_sbox(Byte { b: st1_7 })
+    let sub2_8 = aes_sbox(Byte { b: st1_8 })
+    let sub2_9 = aes_sbox(Byte { b: st1_9 })
+    let sub2_10 = aes_sbox(Byte { b: st1_10 })
+    let sub2_11 = aes_sbox(Byte { b: st1_11 })
+    let sub2_12 = aes_sbox(Byte { b: st1_12 })
+    let sub2_13 = aes_sbox(Byte { b: st1_13 })
+    let sub2_14 = aes_sbox(Byte { b: st1_14 })
+    let sub2_15 = aes_sbox(Byte { b: st1_15 })
+    let mix2_0 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: sub2_0 }), xtime(Byte { b: sub2_5 })), sub2_5), sub2_10), sub2_15), 255)
+    let mix2_1 = band(bxor(bxor(bxor(bxor(sub2_0, xtime(Byte { b: sub2_5 })), xtime(Byte { b: sub2_10 })), sub2_10), sub2_15), 255)
+    let mix2_2 = band(bxor(bxor(bxor(bxor(sub2_0, sub2_5), xtime(Byte { b: sub2_10 })), xtime(Byte { b: sub2_15 })), sub2_15), 255)
+    let mix2_3 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: sub2_0 }), sub2_0), sub2_5), sub2_10), xtime(Byte { b: sub2_15 })), 255)
+    let mix2_4 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: sub2_4 }), xtime(Byte { b: sub2_9 })), sub2_9), sub2_14), sub2_3), 255)
+    let mix2_5 = band(bxor(bxor(bxor(bxor(sub2_4, xtime(Byte { b: sub2_9 })), xtime(Byte { b: sub2_14 })), sub2_14), sub2_3), 255)
+    let mix2_6 = band(bxor(bxor(bxor(bxor(sub2_4, sub2_9), xtime(Byte { b: sub2_14 })), xtime(Byte { b: sub2_3 })), sub2_3), 255)
+    let mix2_7 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: sub2_4 }), sub2_4), sub2_9), sub2_14), xtime(Byte { b: sub2_3 })), 255)
+    let mix2_8 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: sub2_8 }), xtime(Byte { b: sub2_13 })), sub2_13), sub2_2), sub2_7), 255)
+    let mix2_9 = band(bxor(bxor(bxor(bxor(sub2_8, xtime(Byte { b: sub2_13 })), xtime(Byte { b: sub2_2 })), sub2_2), sub2_7), 255)
+    let mix2_10 = band(bxor(bxor(bxor(bxor(sub2_8, sub2_13), xtime(Byte { b: sub2_2 })), xtime(Byte { b: sub2_7 })), sub2_7), 255)
+    let mix2_11 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: sub2_8 }), sub2_8), sub2_13), sub2_2), xtime(Byte { b: sub2_7 })), 255)
+    let mix2_12 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: sub2_12 }), xtime(Byte { b: sub2_1 })), sub2_1), sub2_6), sub2_11), 255)
+    let mix2_13 = band(bxor(bxor(bxor(bxor(sub2_12, xtime(Byte { b: sub2_1 })), xtime(Byte { b: sub2_6 })), sub2_6), sub2_11), 255)
+    let mix2_14 = band(bxor(bxor(bxor(bxor(sub2_12, sub2_1), xtime(Byte { b: sub2_6 })), xtime(Byte { b: sub2_11 })), sub2_11), 255)
+    let mix2_15 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: sub2_12 }), sub2_12), sub2_1), sub2_6), xtime(Byte { b: sub2_11 })), 255)
+    let st2_0 = band(bxor(mix2_0, ks32), 255)
+    let st2_1 = band(bxor(mix2_1, ks33), 255)
+    let st2_2 = band(bxor(mix2_2, ks34), 255)
+    let st2_3 = band(bxor(mix2_3, ks35), 255)
+    let st2_4 = band(bxor(mix2_4, ks36), 255)
+    let st2_5 = band(bxor(mix2_5, ks37), 255)
+    let st2_6 = band(bxor(mix2_6, ks38), 255)
+    let st2_7 = band(bxor(mix2_7, ks39), 255)
+    let st2_8 = band(bxor(mix2_8, ks40), 255)
+    let st2_9 = band(bxor(mix2_9, ks41), 255)
+    let st2_10 = band(bxor(mix2_10, ks42), 255)
+    let st2_11 = band(bxor(mix2_11, ks43), 255)
+    let st2_12 = band(bxor(mix2_12, ks44), 255)
+    let st2_13 = band(bxor(mix2_13, ks45), 255)
+    let st2_14 = band(bxor(mix2_14, ks46), 255)
+    let st2_15 = band(bxor(mix2_15, ks47), 255)
+    let sub3_0 = aes_sbox(Byte { b: st2_0 })
+    let sub3_1 = aes_sbox(Byte { b: st2_1 })
+    let sub3_2 = aes_sbox(Byte { b: st2_2 })
+    let sub3_3 = aes_sbox(Byte { b: st2_3 })
+    let sub3_4 = aes_sbox(Byte { b: st2_4 })
+    let sub3_5 = aes_sbox(Byte { b: st2_5 })
+    let sub3_6 = aes_sbox(Byte { b: st2_6 })
+    let sub3_7 = aes_sbox(Byte { b: st2_7 })
+    let sub3_8 = aes_sbox(Byte { b: st2_8 })
+    let sub3_9 = aes_sbox(Byte { b: st2_9 })
+    let sub3_10 = aes_sbox(Byte { b: st2_10 })
+    let sub3_11 = aes_sbox(Byte { b: st2_11 })
+    let sub3_12 = aes_sbox(Byte { b: st2_12 })
+    let sub3_13 = aes_sbox(Byte { b: st2_13 })
+    let sub3_14 = aes_sbox(Byte { b: st2_14 })
+    let sub3_15 = aes_sbox(Byte { b: st2_15 })
+    let mix3_0 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: sub3_0 }), xtime(Byte { b: sub3_5 })), sub3_5), sub3_10), sub3_15), 255)
+    let mix3_1 = band(bxor(bxor(bxor(bxor(sub3_0, xtime(Byte { b: sub3_5 })), xtime(Byte { b: sub3_10 })), sub3_10), sub3_15), 255)
+    let mix3_2 = band(bxor(bxor(bxor(bxor(sub3_0, sub3_5), xtime(Byte { b: sub3_10 })), xtime(Byte { b: sub3_15 })), sub3_15), 255)
+    let mix3_3 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: sub3_0 }), sub3_0), sub3_5), sub3_10), xtime(Byte { b: sub3_15 })), 255)
+    let mix3_4 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: sub3_4 }), xtime(Byte { b: sub3_9 })), sub3_9), sub3_14), sub3_3), 255)
+    let mix3_5 = band(bxor(bxor(bxor(bxor(sub3_4, xtime(Byte { b: sub3_9 })), xtime(Byte { b: sub3_14 })), sub3_14), sub3_3), 255)
+    let mix3_6 = band(bxor(bxor(bxor(bxor(sub3_4, sub3_9), xtime(Byte { b: sub3_14 })), xtime(Byte { b: sub3_3 })), sub3_3), 255)
+    let mix3_7 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: sub3_4 }), sub3_4), sub3_9), sub3_14), xtime(Byte { b: sub3_3 })), 255)
+    let mix3_8 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: sub3_8 }), xtime(Byte { b: sub3_13 })), sub3_13), sub3_2), sub3_7), 255)
+    let mix3_9 = band(bxor(bxor(bxor(bxor(sub3_8, xtime(Byte { b: sub3_13 })), xtime(Byte { b: sub3_2 })), sub3_2), sub3_7), 255)
+    let mix3_10 = band(bxor(bxor(bxor(bxor(sub3_8, sub3_13), xtime(Byte { b: sub3_2 })), xtime(Byte { b: sub3_7 })), sub3_7), 255)
+    let mix3_11 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: sub3_8 }), sub3_8), sub3_13), sub3_2), xtime(Byte { b: sub3_7 })), 255)
+    let mix3_12 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: sub3_12 }), xtime(Byte { b: sub3_1 })), sub3_1), sub3_6), sub3_11), 255)
+    let mix3_13 = band(bxor(bxor(bxor(bxor(sub3_12, xtime(Byte { b: sub3_1 })), xtime(Byte { b: sub3_6 })), sub3_6), sub3_11), 255)
+    let mix3_14 = band(bxor(bxor(bxor(bxor(sub3_12, sub3_1), xtime(Byte { b: sub3_6 })), xtime(Byte { b: sub3_11 })), sub3_11), 255)
+    let mix3_15 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: sub3_12 }), sub3_12), sub3_1), sub3_6), xtime(Byte { b: sub3_11 })), 255)
+    let st3_0 = band(bxor(mix3_0, ks48), 255)
+    let st3_1 = band(bxor(mix3_1, ks49), 255)
+    let st3_2 = band(bxor(mix3_2, ks50), 255)
+    let st3_3 = band(bxor(mix3_3, ks51), 255)
+    let st3_4 = band(bxor(mix3_4, ks52), 255)
+    let st3_5 = band(bxor(mix3_5, ks53), 255)
+    let st3_6 = band(bxor(mix3_6, ks54), 255)
+    let st3_7 = band(bxor(mix3_7, ks55), 255)
+    let st3_8 = band(bxor(mix3_8, ks56), 255)
+    let st3_9 = band(bxor(mix3_9, ks57), 255)
+    let st3_10 = band(bxor(mix3_10, ks58), 255)
+    let st3_11 = band(bxor(mix3_11, ks59), 255)
+    let st3_12 = band(bxor(mix3_12, ks60), 255)
+    let st3_13 = band(bxor(mix3_13, ks61), 255)
+    let st3_14 = band(bxor(mix3_14, ks62), 255)
+    let st3_15 = band(bxor(mix3_15, ks63), 255)
+    let sub4_0 = aes_sbox(Byte { b: st3_0 })
+    let sub4_1 = aes_sbox(Byte { b: st3_1 })
+    let sub4_2 = aes_sbox(Byte { b: st3_2 })
+    let sub4_3 = aes_sbox(Byte { b: st3_3 })
+    let sub4_4 = aes_sbox(Byte { b: st3_4 })
+    let sub4_5 = aes_sbox(Byte { b: st3_5 })
+    let sub4_6 = aes_sbox(Byte { b: st3_6 })
+    let sub4_7 = aes_sbox(Byte { b: st3_7 })
+    let sub4_8 = aes_sbox(Byte { b: st3_8 })
+    let sub4_9 = aes_sbox(Byte { b: st3_9 })
+    let sub4_10 = aes_sbox(Byte { b: st3_10 })
+    let sub4_11 = aes_sbox(Byte { b: st3_11 })
+    let sub4_12 = aes_sbox(Byte { b: st3_12 })
+    let sub4_13 = aes_sbox(Byte { b: st3_13 })
+    let sub4_14 = aes_sbox(Byte { b: st3_14 })
+    let sub4_15 = aes_sbox(Byte { b: st3_15 })
+    let mix4_0 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: sub4_0 }), xtime(Byte { b: sub4_5 })), sub4_5), sub4_10), sub4_15), 255)
+    let mix4_1 = band(bxor(bxor(bxor(bxor(sub4_0, xtime(Byte { b: sub4_5 })), xtime(Byte { b: sub4_10 })), sub4_10), sub4_15), 255)
+    let mix4_2 = band(bxor(bxor(bxor(bxor(sub4_0, sub4_5), xtime(Byte { b: sub4_10 })), xtime(Byte { b: sub4_15 })), sub4_15), 255)
+    let mix4_3 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: sub4_0 }), sub4_0), sub4_5), sub4_10), xtime(Byte { b: sub4_15 })), 255)
+    let mix4_4 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: sub4_4 }), xtime(Byte { b: sub4_9 })), sub4_9), sub4_14), sub4_3), 255)
+    let mix4_5 = band(bxor(bxor(bxor(bxor(sub4_4, xtime(Byte { b: sub4_9 })), xtime(Byte { b: sub4_14 })), sub4_14), sub4_3), 255)
+    let mix4_6 = band(bxor(bxor(bxor(bxor(sub4_4, sub4_9), xtime(Byte { b: sub4_14 })), xtime(Byte { b: sub4_3 })), sub4_3), 255)
+    let mix4_7 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: sub4_4 }), sub4_4), sub4_9), sub4_14), xtime(Byte { b: sub4_3 })), 255)
+    let mix4_8 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: sub4_8 }), xtime(Byte { b: sub4_13 })), sub4_13), sub4_2), sub4_7), 255)
+    let mix4_9 = band(bxor(bxor(bxor(bxor(sub4_8, xtime(Byte { b: sub4_13 })), xtime(Byte { b: sub4_2 })), sub4_2), sub4_7), 255)
+    let mix4_10 = band(bxor(bxor(bxor(bxor(sub4_8, sub4_13), xtime(Byte { b: sub4_2 })), xtime(Byte { b: sub4_7 })), sub4_7), 255)
+    let mix4_11 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: sub4_8 }), sub4_8), sub4_13), sub4_2), xtime(Byte { b: sub4_7 })), 255)
+    let mix4_12 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: sub4_12 }), xtime(Byte { b: sub4_1 })), sub4_1), sub4_6), sub4_11), 255)
+    let mix4_13 = band(bxor(bxor(bxor(bxor(sub4_12, xtime(Byte { b: sub4_1 })), xtime(Byte { b: sub4_6 })), sub4_6), sub4_11), 255)
+    let mix4_14 = band(bxor(bxor(bxor(bxor(sub4_12, sub4_1), xtime(Byte { b: sub4_6 })), xtime(Byte { b: sub4_11 })), sub4_11), 255)
+    let mix4_15 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: sub4_12 }), sub4_12), sub4_1), sub4_6), xtime(Byte { b: sub4_11 })), 255)
+    let st4_0 = band(bxor(mix4_0, ks64), 255)
+    let st4_1 = band(bxor(mix4_1, ks65), 255)
+    let st4_2 = band(bxor(mix4_2, ks66), 255)
+    let st4_3 = band(bxor(mix4_3, ks67), 255)
+    let st4_4 = band(bxor(mix4_4, ks68), 255)
+    let st4_5 = band(bxor(mix4_5, ks69), 255)
+    let st4_6 = band(bxor(mix4_6, ks70), 255)
+    let st4_7 = band(bxor(mix4_7, ks71), 255)
+    let st4_8 = band(bxor(mix4_8, ks72), 255)
+    let st4_9 = band(bxor(mix4_9, ks73), 255)
+    let st4_10 = band(bxor(mix4_10, ks74), 255)
+    let st4_11 = band(bxor(mix4_11, ks75), 255)
+    let st4_12 = band(bxor(mix4_12, ks76), 255)
+    let st4_13 = band(bxor(mix4_13, ks77), 255)
+    let st4_14 = band(bxor(mix4_14, ks78), 255)
+    let st4_15 = band(bxor(mix4_15, ks79), 255)
+    let sub5_0 = aes_sbox(Byte { b: st4_0 })
+    let sub5_1 = aes_sbox(Byte { b: st4_1 })
+    let sub5_2 = aes_sbox(Byte { b: st4_2 })
+    let sub5_3 = aes_sbox(Byte { b: st4_3 })
+    let sub5_4 = aes_sbox(Byte { b: st4_4 })
+    let sub5_5 = aes_sbox(Byte { b: st4_5 })
+    let sub5_6 = aes_sbox(Byte { b: st4_6 })
+    let sub5_7 = aes_sbox(Byte { b: st4_7 })
+    let sub5_8 = aes_sbox(Byte { b: st4_8 })
+    let sub5_9 = aes_sbox(Byte { b: st4_9 })
+    let sub5_10 = aes_sbox(Byte { b: st4_10 })
+    let sub5_11 = aes_sbox(Byte { b: st4_11 })
+    let sub5_12 = aes_sbox(Byte { b: st4_12 })
+    let sub5_13 = aes_sbox(Byte { b: st4_13 })
+    let sub5_14 = aes_sbox(Byte { b: st4_14 })
+    let sub5_15 = aes_sbox(Byte { b: st4_15 })
+    let mix5_0 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: sub5_0 }), xtime(Byte { b: sub5_5 })), sub5_5), sub5_10), sub5_15), 255)
+    let mix5_1 = band(bxor(bxor(bxor(bxor(sub5_0, xtime(Byte { b: sub5_5 })), xtime(Byte { b: sub5_10 })), sub5_10), sub5_15), 255)
+    let mix5_2 = band(bxor(bxor(bxor(bxor(sub5_0, sub5_5), xtime(Byte { b: sub5_10 })), xtime(Byte { b: sub5_15 })), sub5_15), 255)
+    let mix5_3 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: sub5_0 }), sub5_0), sub5_5), sub5_10), xtime(Byte { b: sub5_15 })), 255)
+    let mix5_4 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: sub5_4 }), xtime(Byte { b: sub5_9 })), sub5_9), sub5_14), sub5_3), 255)
+    let mix5_5 = band(bxor(bxor(bxor(bxor(sub5_4, xtime(Byte { b: sub5_9 })), xtime(Byte { b: sub5_14 })), sub5_14), sub5_3), 255)
+    let mix5_6 = band(bxor(bxor(bxor(bxor(sub5_4, sub5_9), xtime(Byte { b: sub5_14 })), xtime(Byte { b: sub5_3 })), sub5_3), 255)
+    let mix5_7 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: sub5_4 }), sub5_4), sub5_9), sub5_14), xtime(Byte { b: sub5_3 })), 255)
+    let mix5_8 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: sub5_8 }), xtime(Byte { b: sub5_13 })), sub5_13), sub5_2), sub5_7), 255)
+    let mix5_9 = band(bxor(bxor(bxor(bxor(sub5_8, xtime(Byte { b: sub5_13 })), xtime(Byte { b: sub5_2 })), sub5_2), sub5_7), 255)
+    let mix5_10 = band(bxor(bxor(bxor(bxor(sub5_8, sub5_13), xtime(Byte { b: sub5_2 })), xtime(Byte { b: sub5_7 })), sub5_7), 255)
+    let mix5_11 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: sub5_8 }), sub5_8), sub5_13), sub5_2), xtime(Byte { b: sub5_7 })), 255)
+    let mix5_12 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: sub5_12 }), xtime(Byte { b: sub5_1 })), sub5_1), sub5_6), sub5_11), 255)
+    let mix5_13 = band(bxor(bxor(bxor(bxor(sub5_12, xtime(Byte { b: sub5_1 })), xtime(Byte { b: sub5_6 })), sub5_6), sub5_11), 255)
+    let mix5_14 = band(bxor(bxor(bxor(bxor(sub5_12, sub5_1), xtime(Byte { b: sub5_6 })), xtime(Byte { b: sub5_11 })), sub5_11), 255)
+    let mix5_15 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: sub5_12 }), sub5_12), sub5_1), sub5_6), xtime(Byte { b: sub5_11 })), 255)
+    let st5_0 = band(bxor(mix5_0, ks80), 255)
+    let st5_1 = band(bxor(mix5_1, ks81), 255)
+    let st5_2 = band(bxor(mix5_2, ks82), 255)
+    let st5_3 = band(bxor(mix5_3, ks83), 255)
+    let st5_4 = band(bxor(mix5_4, ks84), 255)
+    let st5_5 = band(bxor(mix5_5, ks85), 255)
+    let st5_6 = band(bxor(mix5_6, ks86), 255)
+    let st5_7 = band(bxor(mix5_7, ks87), 255)
+    let st5_8 = band(bxor(mix5_8, ks88), 255)
+    let st5_9 = band(bxor(mix5_9, ks89), 255)
+    let st5_10 = band(bxor(mix5_10, ks90), 255)
+    let st5_11 = band(bxor(mix5_11, ks91), 255)
+    let st5_12 = band(bxor(mix5_12, ks92), 255)
+    let st5_13 = band(bxor(mix5_13, ks93), 255)
+    let st5_14 = band(bxor(mix5_14, ks94), 255)
+    let st5_15 = band(bxor(mix5_15, ks95), 255)
+    let sub6_0 = aes_sbox(Byte { b: st5_0 })
+    let sub6_1 = aes_sbox(Byte { b: st5_1 })
+    let sub6_2 = aes_sbox(Byte { b: st5_2 })
+    let sub6_3 = aes_sbox(Byte { b: st5_3 })
+    let sub6_4 = aes_sbox(Byte { b: st5_4 })
+    let sub6_5 = aes_sbox(Byte { b: st5_5 })
+    let sub6_6 = aes_sbox(Byte { b: st5_6 })
+    let sub6_7 = aes_sbox(Byte { b: st5_7 })
+    let sub6_8 = aes_sbox(Byte { b: st5_8 })
+    let sub6_9 = aes_sbox(Byte { b: st5_9 })
+    let sub6_10 = aes_sbox(Byte { b: st5_10 })
+    let sub6_11 = aes_sbox(Byte { b: st5_11 })
+    let sub6_12 = aes_sbox(Byte { b: st5_12 })
+    let sub6_13 = aes_sbox(Byte { b: st5_13 })
+    let sub6_14 = aes_sbox(Byte { b: st5_14 })
+    let sub6_15 = aes_sbox(Byte { b: st5_15 })
+    let mix6_0 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: sub6_0 }), xtime(Byte { b: sub6_5 })), sub6_5), sub6_10), sub6_15), 255)
+    let mix6_1 = band(bxor(bxor(bxor(bxor(sub6_0, xtime(Byte { b: sub6_5 })), xtime(Byte { b: sub6_10 })), sub6_10), sub6_15), 255)
+    let mix6_2 = band(bxor(bxor(bxor(bxor(sub6_0, sub6_5), xtime(Byte { b: sub6_10 })), xtime(Byte { b: sub6_15 })), sub6_15), 255)
+    let mix6_3 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: sub6_0 }), sub6_0), sub6_5), sub6_10), xtime(Byte { b: sub6_15 })), 255)
+    let mix6_4 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: sub6_4 }), xtime(Byte { b: sub6_9 })), sub6_9), sub6_14), sub6_3), 255)
+    let mix6_5 = band(bxor(bxor(bxor(bxor(sub6_4, xtime(Byte { b: sub6_9 })), xtime(Byte { b: sub6_14 })), sub6_14), sub6_3), 255)
+    let mix6_6 = band(bxor(bxor(bxor(bxor(sub6_4, sub6_9), xtime(Byte { b: sub6_14 })), xtime(Byte { b: sub6_3 })), sub6_3), 255)
+    let mix6_7 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: sub6_4 }), sub6_4), sub6_9), sub6_14), xtime(Byte { b: sub6_3 })), 255)
+    let mix6_8 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: sub6_8 }), xtime(Byte { b: sub6_13 })), sub6_13), sub6_2), sub6_7), 255)
+    let mix6_9 = band(bxor(bxor(bxor(bxor(sub6_8, xtime(Byte { b: sub6_13 })), xtime(Byte { b: sub6_2 })), sub6_2), sub6_7), 255)
+    let mix6_10 = band(bxor(bxor(bxor(bxor(sub6_8, sub6_13), xtime(Byte { b: sub6_2 })), xtime(Byte { b: sub6_7 })), sub6_7), 255)
+    let mix6_11 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: sub6_8 }), sub6_8), sub6_13), sub6_2), xtime(Byte { b: sub6_7 })), 255)
+    let mix6_12 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: sub6_12 }), xtime(Byte { b: sub6_1 })), sub6_1), sub6_6), sub6_11), 255)
+    let mix6_13 = band(bxor(bxor(bxor(bxor(sub6_12, xtime(Byte { b: sub6_1 })), xtime(Byte { b: sub6_6 })), sub6_6), sub6_11), 255)
+    let mix6_14 = band(bxor(bxor(bxor(bxor(sub6_12, sub6_1), xtime(Byte { b: sub6_6 })), xtime(Byte { b: sub6_11 })), sub6_11), 255)
+    let mix6_15 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: sub6_12 }), sub6_12), sub6_1), sub6_6), xtime(Byte { b: sub6_11 })), 255)
+    let st6_0 = band(bxor(mix6_0, ks96), 255)
+    let st6_1 = band(bxor(mix6_1, ks97), 255)
+    let st6_2 = band(bxor(mix6_2, ks98), 255)
+    let st6_3 = band(bxor(mix6_3, ks99), 255)
+    let st6_4 = band(bxor(mix6_4, ks100), 255)
+    let st6_5 = band(bxor(mix6_5, ks101), 255)
+    let st6_6 = band(bxor(mix6_6, ks102), 255)
+    let st6_7 = band(bxor(mix6_7, ks103), 255)
+    let st6_8 = band(bxor(mix6_8, ks104), 255)
+    let st6_9 = band(bxor(mix6_9, ks105), 255)
+    let st6_10 = band(bxor(mix6_10, ks106), 255)
+    let st6_11 = band(bxor(mix6_11, ks107), 255)
+    let st6_12 = band(bxor(mix6_12, ks108), 255)
+    let st6_13 = band(bxor(mix6_13, ks109), 255)
+    let st6_14 = band(bxor(mix6_14, ks110), 255)
+    let st6_15 = band(bxor(mix6_15, ks111), 255)
+    let sub7_0 = aes_sbox(Byte { b: st6_0 })
+    let sub7_1 = aes_sbox(Byte { b: st6_1 })
+    let sub7_2 = aes_sbox(Byte { b: st6_2 })
+    let sub7_3 = aes_sbox(Byte { b: st6_3 })
+    let sub7_4 = aes_sbox(Byte { b: st6_4 })
+    let sub7_5 = aes_sbox(Byte { b: st6_5 })
+    let sub7_6 = aes_sbox(Byte { b: st6_6 })
+    let sub7_7 = aes_sbox(Byte { b: st6_7 })
+    let sub7_8 = aes_sbox(Byte { b: st6_8 })
+    let sub7_9 = aes_sbox(Byte { b: st6_9 })
+    let sub7_10 = aes_sbox(Byte { b: st6_10 })
+    let sub7_11 = aes_sbox(Byte { b: st6_11 })
+    let sub7_12 = aes_sbox(Byte { b: st6_12 })
+    let sub7_13 = aes_sbox(Byte { b: st6_13 })
+    let sub7_14 = aes_sbox(Byte { b: st6_14 })
+    let sub7_15 = aes_sbox(Byte { b: st6_15 })
+    let mix7_0 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: sub7_0 }), xtime(Byte { b: sub7_5 })), sub7_5), sub7_10), sub7_15), 255)
+    let mix7_1 = band(bxor(bxor(bxor(bxor(sub7_0, xtime(Byte { b: sub7_5 })), xtime(Byte { b: sub7_10 })), sub7_10), sub7_15), 255)
+    let mix7_2 = band(bxor(bxor(bxor(bxor(sub7_0, sub7_5), xtime(Byte { b: sub7_10 })), xtime(Byte { b: sub7_15 })), sub7_15), 255)
+    let mix7_3 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: sub7_0 }), sub7_0), sub7_5), sub7_10), xtime(Byte { b: sub7_15 })), 255)
+    let mix7_4 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: sub7_4 }), xtime(Byte { b: sub7_9 })), sub7_9), sub7_14), sub7_3), 255)
+    let mix7_5 = band(bxor(bxor(bxor(bxor(sub7_4, xtime(Byte { b: sub7_9 })), xtime(Byte { b: sub7_14 })), sub7_14), sub7_3), 255)
+    let mix7_6 = band(bxor(bxor(bxor(bxor(sub7_4, sub7_9), xtime(Byte { b: sub7_14 })), xtime(Byte { b: sub7_3 })), sub7_3), 255)
+    let mix7_7 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: sub7_4 }), sub7_4), sub7_9), sub7_14), xtime(Byte { b: sub7_3 })), 255)
+    let mix7_8 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: sub7_8 }), xtime(Byte { b: sub7_13 })), sub7_13), sub7_2), sub7_7), 255)
+    let mix7_9 = band(bxor(bxor(bxor(bxor(sub7_8, xtime(Byte { b: sub7_13 })), xtime(Byte { b: sub7_2 })), sub7_2), sub7_7), 255)
+    let mix7_10 = band(bxor(bxor(bxor(bxor(sub7_8, sub7_13), xtime(Byte { b: sub7_2 })), xtime(Byte { b: sub7_7 })), sub7_7), 255)
+    let mix7_11 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: sub7_8 }), sub7_8), sub7_13), sub7_2), xtime(Byte { b: sub7_7 })), 255)
+    let mix7_12 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: sub7_12 }), xtime(Byte { b: sub7_1 })), sub7_1), sub7_6), sub7_11), 255)
+    let mix7_13 = band(bxor(bxor(bxor(bxor(sub7_12, xtime(Byte { b: sub7_1 })), xtime(Byte { b: sub7_6 })), sub7_6), sub7_11), 255)
+    let mix7_14 = band(bxor(bxor(bxor(bxor(sub7_12, sub7_1), xtime(Byte { b: sub7_6 })), xtime(Byte { b: sub7_11 })), sub7_11), 255)
+    let mix7_15 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: sub7_12 }), sub7_12), sub7_1), sub7_6), xtime(Byte { b: sub7_11 })), 255)
+    let st7_0 = band(bxor(mix7_0, ks112), 255)
+    let st7_1 = band(bxor(mix7_1, ks113), 255)
+    let st7_2 = band(bxor(mix7_2, ks114), 255)
+    let st7_3 = band(bxor(mix7_3, ks115), 255)
+    let st7_4 = band(bxor(mix7_4, ks116), 255)
+    let st7_5 = band(bxor(mix7_5, ks117), 255)
+    let st7_6 = band(bxor(mix7_6, ks118), 255)
+    let st7_7 = band(bxor(mix7_7, ks119), 255)
+    let st7_8 = band(bxor(mix7_8, ks120), 255)
+    let st7_9 = band(bxor(mix7_9, ks121), 255)
+    let st7_10 = band(bxor(mix7_10, ks122), 255)
+    let st7_11 = band(bxor(mix7_11, ks123), 255)
+    let st7_12 = band(bxor(mix7_12, ks124), 255)
+    let st7_13 = band(bxor(mix7_13, ks125), 255)
+    let st7_14 = band(bxor(mix7_14, ks126), 255)
+    let st7_15 = band(bxor(mix7_15, ks127), 255)
+    let sub8_0 = aes_sbox(Byte { b: st7_0 })
+    let sub8_1 = aes_sbox(Byte { b: st7_1 })
+    let sub8_2 = aes_sbox(Byte { b: st7_2 })
+    let sub8_3 = aes_sbox(Byte { b: st7_3 })
+    let sub8_4 = aes_sbox(Byte { b: st7_4 })
+    let sub8_5 = aes_sbox(Byte { b: st7_5 })
+    let sub8_6 = aes_sbox(Byte { b: st7_6 })
+    let sub8_7 = aes_sbox(Byte { b: st7_7 })
+    let sub8_8 = aes_sbox(Byte { b: st7_8 })
+    let sub8_9 = aes_sbox(Byte { b: st7_9 })
+    let sub8_10 = aes_sbox(Byte { b: st7_10 })
+    let sub8_11 = aes_sbox(Byte { b: st7_11 })
+    let sub8_12 = aes_sbox(Byte { b: st7_12 })
+    let sub8_13 = aes_sbox(Byte { b: st7_13 })
+    let sub8_14 = aes_sbox(Byte { b: st7_14 })
+    let sub8_15 = aes_sbox(Byte { b: st7_15 })
+    let mix8_0 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: sub8_0 }), xtime(Byte { b: sub8_5 })), sub8_5), sub8_10), sub8_15), 255)
+    let mix8_1 = band(bxor(bxor(bxor(bxor(sub8_0, xtime(Byte { b: sub8_5 })), xtime(Byte { b: sub8_10 })), sub8_10), sub8_15), 255)
+    let mix8_2 = band(bxor(bxor(bxor(bxor(sub8_0, sub8_5), xtime(Byte { b: sub8_10 })), xtime(Byte { b: sub8_15 })), sub8_15), 255)
+    let mix8_3 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: sub8_0 }), sub8_0), sub8_5), sub8_10), xtime(Byte { b: sub8_15 })), 255)
+    let mix8_4 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: sub8_4 }), xtime(Byte { b: sub8_9 })), sub8_9), sub8_14), sub8_3), 255)
+    let mix8_5 = band(bxor(bxor(bxor(bxor(sub8_4, xtime(Byte { b: sub8_9 })), xtime(Byte { b: sub8_14 })), sub8_14), sub8_3), 255)
+    let mix8_6 = band(bxor(bxor(bxor(bxor(sub8_4, sub8_9), xtime(Byte { b: sub8_14 })), xtime(Byte { b: sub8_3 })), sub8_3), 255)
+    let mix8_7 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: sub8_4 }), sub8_4), sub8_9), sub8_14), xtime(Byte { b: sub8_3 })), 255)
+    let mix8_8 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: sub8_8 }), xtime(Byte { b: sub8_13 })), sub8_13), sub8_2), sub8_7), 255)
+    let mix8_9 = band(bxor(bxor(bxor(bxor(sub8_8, xtime(Byte { b: sub8_13 })), xtime(Byte { b: sub8_2 })), sub8_2), sub8_7), 255)
+    let mix8_10 = band(bxor(bxor(bxor(bxor(sub8_8, sub8_13), xtime(Byte { b: sub8_2 })), xtime(Byte { b: sub8_7 })), sub8_7), 255)
+    let mix8_11 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: sub8_8 }), sub8_8), sub8_13), sub8_2), xtime(Byte { b: sub8_7 })), 255)
+    let mix8_12 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: sub8_12 }), xtime(Byte { b: sub8_1 })), sub8_1), sub8_6), sub8_11), 255)
+    let mix8_13 = band(bxor(bxor(bxor(bxor(sub8_12, xtime(Byte { b: sub8_1 })), xtime(Byte { b: sub8_6 })), sub8_6), sub8_11), 255)
+    let mix8_14 = band(bxor(bxor(bxor(bxor(sub8_12, sub8_1), xtime(Byte { b: sub8_6 })), xtime(Byte { b: sub8_11 })), sub8_11), 255)
+    let mix8_15 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: sub8_12 }), sub8_12), sub8_1), sub8_6), xtime(Byte { b: sub8_11 })), 255)
+    let st8_0 = band(bxor(mix8_0, ks128), 255)
+    let st8_1 = band(bxor(mix8_1, ks129), 255)
+    let st8_2 = band(bxor(mix8_2, ks130), 255)
+    let st8_3 = band(bxor(mix8_3, ks131), 255)
+    let st8_4 = band(bxor(mix8_4, ks132), 255)
+    let st8_5 = band(bxor(mix8_5, ks133), 255)
+    let st8_6 = band(bxor(mix8_6, ks134), 255)
+    let st8_7 = band(bxor(mix8_7, ks135), 255)
+    let st8_8 = band(bxor(mix8_8, ks136), 255)
+    let st8_9 = band(bxor(mix8_9, ks137), 255)
+    let st8_10 = band(bxor(mix8_10, ks138), 255)
+    let st8_11 = band(bxor(mix8_11, ks139), 255)
+    let st8_12 = band(bxor(mix8_12, ks140), 255)
+    let st8_13 = band(bxor(mix8_13, ks141), 255)
+    let st8_14 = band(bxor(mix8_14, ks142), 255)
+    let st8_15 = band(bxor(mix8_15, ks143), 255)
+    let sub9_0 = aes_sbox(Byte { b: st8_0 })
+    let sub9_1 = aes_sbox(Byte { b: st8_1 })
+    let sub9_2 = aes_sbox(Byte { b: st8_2 })
+    let sub9_3 = aes_sbox(Byte { b: st8_3 })
+    let sub9_4 = aes_sbox(Byte { b: st8_4 })
+    let sub9_5 = aes_sbox(Byte { b: st8_5 })
+    let sub9_6 = aes_sbox(Byte { b: st8_6 })
+    let sub9_7 = aes_sbox(Byte { b: st8_7 })
+    let sub9_8 = aes_sbox(Byte { b: st8_8 })
+    let sub9_9 = aes_sbox(Byte { b: st8_9 })
+    let sub9_10 = aes_sbox(Byte { b: st8_10 })
+    let sub9_11 = aes_sbox(Byte { b: st8_11 })
+    let sub9_12 = aes_sbox(Byte { b: st8_12 })
+    let sub9_13 = aes_sbox(Byte { b: st8_13 })
+    let sub9_14 = aes_sbox(Byte { b: st8_14 })
+    let sub9_15 = aes_sbox(Byte { b: st8_15 })
+    let mix9_0 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: sub9_0 }), xtime(Byte { b: sub9_5 })), sub9_5), sub9_10), sub9_15), 255)
+    let mix9_1 = band(bxor(bxor(bxor(bxor(sub9_0, xtime(Byte { b: sub9_5 })), xtime(Byte { b: sub9_10 })), sub9_10), sub9_15), 255)
+    let mix9_2 = band(bxor(bxor(bxor(bxor(sub9_0, sub9_5), xtime(Byte { b: sub9_10 })), xtime(Byte { b: sub9_15 })), sub9_15), 255)
+    let mix9_3 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: sub9_0 }), sub9_0), sub9_5), sub9_10), xtime(Byte { b: sub9_15 })), 255)
+    let mix9_4 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: sub9_4 }), xtime(Byte { b: sub9_9 })), sub9_9), sub9_14), sub9_3), 255)
+    let mix9_5 = band(bxor(bxor(bxor(bxor(sub9_4, xtime(Byte { b: sub9_9 })), xtime(Byte { b: sub9_14 })), sub9_14), sub9_3), 255)
+    let mix9_6 = band(bxor(bxor(bxor(bxor(sub9_4, sub9_9), xtime(Byte { b: sub9_14 })), xtime(Byte { b: sub9_3 })), sub9_3), 255)
+    let mix9_7 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: sub9_4 }), sub9_4), sub9_9), sub9_14), xtime(Byte { b: sub9_3 })), 255)
+    let mix9_8 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: sub9_8 }), xtime(Byte { b: sub9_13 })), sub9_13), sub9_2), sub9_7), 255)
+    let mix9_9 = band(bxor(bxor(bxor(bxor(sub9_8, xtime(Byte { b: sub9_13 })), xtime(Byte { b: sub9_2 })), sub9_2), sub9_7), 255)
+    let mix9_10 = band(bxor(bxor(bxor(bxor(sub9_8, sub9_13), xtime(Byte { b: sub9_2 })), xtime(Byte { b: sub9_7 })), sub9_7), 255)
+    let mix9_11 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: sub9_8 }), sub9_8), sub9_13), sub9_2), xtime(Byte { b: sub9_7 })), 255)
+    let mix9_12 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: sub9_12 }), xtime(Byte { b: sub9_1 })), sub9_1), sub9_6), sub9_11), 255)
+    let mix9_13 = band(bxor(bxor(bxor(bxor(sub9_12, xtime(Byte { b: sub9_1 })), xtime(Byte { b: sub9_6 })), sub9_6), sub9_11), 255)
+    let mix9_14 = band(bxor(bxor(bxor(bxor(sub9_12, sub9_1), xtime(Byte { b: sub9_6 })), xtime(Byte { b: sub9_11 })), sub9_11), 255)
+    let mix9_15 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: sub9_12 }), sub9_12), sub9_1), sub9_6), xtime(Byte { b: sub9_11 })), 255)
+    let st9_0 = band(bxor(mix9_0, ks144), 255)
+    let st9_1 = band(bxor(mix9_1, ks145), 255)
+    let st9_2 = band(bxor(mix9_2, ks146), 255)
+    let st9_3 = band(bxor(mix9_3, ks147), 255)
+    let st9_4 = band(bxor(mix9_4, ks148), 255)
+    let st9_5 = band(bxor(mix9_5, ks149), 255)
+    let st9_6 = band(bxor(mix9_6, ks150), 255)
+    let st9_7 = band(bxor(mix9_7, ks151), 255)
+    let st9_8 = band(bxor(mix9_8, ks152), 255)
+    let st9_9 = band(bxor(mix9_9, ks153), 255)
+    let st9_10 = band(bxor(mix9_10, ks154), 255)
+    let st9_11 = band(bxor(mix9_11, ks155), 255)
+    let st9_12 = band(bxor(mix9_12, ks156), 255)
+    let st9_13 = band(bxor(mix9_13, ks157), 255)
+    let st9_14 = band(bxor(mix9_14, ks158), 255)
+    let st9_15 = band(bxor(mix9_15, ks159), 255)
+    let sub10_0 = aes_sbox(Byte { b: st9_0 })
+    let sub10_1 = aes_sbox(Byte { b: st9_1 })
+    let sub10_2 = aes_sbox(Byte { b: st9_2 })
+    let sub10_3 = aes_sbox(Byte { b: st9_3 })
+    let sub10_4 = aes_sbox(Byte { b: st9_4 })
+    let sub10_5 = aes_sbox(Byte { b: st9_5 })
+    let sub10_6 = aes_sbox(Byte { b: st9_6 })
+    let sub10_7 = aes_sbox(Byte { b: st9_7 })
+    let sub10_8 = aes_sbox(Byte { b: st9_8 })
+    let sub10_9 = aes_sbox(Byte { b: st9_9 })
+    let sub10_10 = aes_sbox(Byte { b: st9_10 })
+    let sub10_11 = aes_sbox(Byte { b: st9_11 })
+    let sub10_12 = aes_sbox(Byte { b: st9_12 })
+    let sub10_13 = aes_sbox(Byte { b: st9_13 })
+    let sub10_14 = aes_sbox(Byte { b: st9_14 })
+    let sub10_15 = aes_sbox(Byte { b: st9_15 })
+    let st10_0 = band(bxor(sub10_0, ks160), 255)
+    let st10_1 = band(bxor(sub10_5, ks161), 255)
+    let st10_2 = band(bxor(sub10_10, ks162), 255)
+    let st10_3 = band(bxor(sub10_15, ks163), 255)
+    let st10_4 = band(bxor(sub10_4, ks164), 255)
+    let st10_5 = band(bxor(sub10_9, ks165), 255)
+    let st10_6 = band(bxor(sub10_14, ks166), 255)
+    let st10_7 = band(bxor(sub10_3, ks167), 255)
+    let st10_8 = band(bxor(sub10_8, ks168), 255)
+    let st10_9 = band(bxor(sub10_13, ks169), 255)
+    let st10_10 = band(bxor(sub10_2, ks170), 255)
+    let st10_11 = band(bxor(sub10_7, ks171), 255)
+    let st10_12 = band(bxor(sub10_12, ks172), 255)
+    let st10_13 = band(bxor(sub10_1, ks173), 255)
+    let st10_14 = band(bxor(sub10_6, ks174), 255)
+    let st10_15 = band(bxor(sub10_11, ks175), 255)
+    out = if e.which == 0 then st10_0
+      else if e.which == 1 then st10_1
+      else if e.which == 2 then st10_2
+      else if e.which == 3 then st10_3
+      else if e.which == 4 then st10_4
+      else if e.which == 5 then st10_5
+      else if e.which == 6 then st10_6
+      else if e.which == 7 then st10_7
+      else if e.which == 8 then st10_8
+      else if e.which == 9 then st10_9
+      else if e.which == 10 then st10_10
+      else if e.which == 11 then st10_11
+      else if e.which == 12 then st10_12
+      else if e.which == 13 then st10_13
+      else if e.which == 14 then st10_14
+      else st10_15
+  proofs:
+    purity:
+      reads : [e.p0, e.p1, e.p2, e.p3, e.p4, e.p5, e.p6, e.p7, e.p8, e.p9, e.p10, e.p11, e.p12, e.p13, e.p14, e.p15, e.k0, e.k1, e.k2, e.k3, e.k4, e.k5, e.k6, e.k7, e.k8, e.k9, e.k10, e.k11, e.k12, e.k13, e.k14, e.k15, e.which]
+      calls : [aes_sbox, xtime]
+    termination:
+      bound : 20000
+

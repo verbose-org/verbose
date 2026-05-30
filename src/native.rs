@@ -93,8 +93,9 @@ pub fn compile_native_multi(
         combined = full;
     }
 
-    // Self-verify + peephole on the combined code.
-    peephole_optimize(&mut combined);
+    // Self-verify the combined code. No peephole pass (see note in
+    // compile_native): byte-level push/pop elimination on resolved code
+    // breaks relative jump/call operands that span the deleted bytes.
     if let Err(e) = crate::validate_x86::validate_code(&combined) {
         eprintln!("warning: x86-64 validation: {} (decoder incomplete, may be false positive)", e);
     }
@@ -648,15 +649,18 @@ pub fn compile_native(
     stdin: bool,
     stream: bool,
 ) -> Result<(), NativeError> {
-    let mut code = compile_native_code(program, rule_name, stdin, stream)?;
+    let code = compile_native_code(program, rule_name, stdin, stream)?;
 
-    // Peephole optimization: eliminate redundant push/pop patterns
-    let before_size = code.len();
-    peephole_optimize(&mut code);
-    let saved = before_size - code.len();
-    if saved > 0 {
-        eprintln!("peephole: {} bytes eliminated", saved);
-    }
+    // NOTE: there is deliberately NO machine-code peephole pass here. A prior
+    // pass eliminated adjacent `push Rx; pop Rx` pairs from the FINISHED byte
+    // buffer, but it did not relocate the relative-jump operands (rel8/rel32)
+    // whose span crossed the deleted bytes. Small binaries happened to survive
+    // (no jump spanned a deleted pair); large ones — e.g. the GHASH GF(2^128)
+    // multiply at ~9000 lets — got jumps that overshot by the deleted width and
+    // SIGSEGV'd at runtime. The pass saved at most a handful of bytes and could
+    // silently miscompile, so it was removed. Any byte-level peephole must run
+    // at the label-resolution stage (before offsets are baked), never on the
+    // resolved buffer.
 
     if let Err(e) = crate::validate_x86::validate_code(&code) {
         eprintln!("warning: x86-64 validation: {} (decoder incomplete, may be false positive)", e);
@@ -10551,39 +10555,6 @@ fn max_stack_depth(expr: &Expr) -> usize {
 ///   50 59 → 48 89 C1 (push rax; pop rcx → mov rcx, rax)
 ///   Note: this makes code 1 byte larger but faster (no memory access)
 ///   We only apply pattern 1 (size reduction) for now.
-fn peephole_optimize(code: &mut Vec<u8>) {
-    let mut i = 0;
-    let mut out = Vec::with_capacity(code.len());
-
-    while i < code.len() {
-        // Pattern: push Rx; pop Rx (same register) → eliminate both
-        if i + 1 < code.len() {
-            let a = code[i];
-            let b = code[i + 1];
-            if (0x50..=0x57).contains(&a) && b == a + 8 {
-                // push Rx (0x50+r) followed by pop Rx (0x58+r) — same register
-                i += 2;
-                continue;
-            }
-        }
-
-        // Pattern: REX push Rx; REX pop Rx (r8-r15) → eliminate both
-        if i + 3 < code.len() {
-            if code[i] == 0x41 && (0x50..=0x57).contains(&code[i + 1])
-                && code[i + 2] == 0x41 && code[i + 3] == code[i + 1] + 8
-            {
-                i += 4;
-                continue;
-            }
-        }
-
-        out.push(code[i]);
-        i += 1;
-    }
-
-    *code = out;
-}
-
 /// Build field ranges from concept for static analysis.
 fn build_field_ranges(concept: &Concept) -> HashMap<&str, (i64, i64)> {
     concept
@@ -19102,13 +19073,6 @@ rule num_outer
     }
 
     #[test]
-    fn peephole_eliminates_push_pop_same_reg() {
-        let mut code = vec![0x50, 0x58, 0x90]; // push rax; pop rax; nop
-        peephole_optimize(&mut code);
-        assert_eq!(code, vec![0x90]); // only nop remains
-    }
-
-    #[test]
     fn stack_depth_simple() {
         // a > 10 → depth 1 (one push for Binary)
         let expr = Expr::Binary(
@@ -19142,13 +19106,6 @@ rule num_outer
     fn stack_depth_leaf() {
         assert_eq!(max_stack_depth(&Expr::Number(42)), 0);
         assert_eq!(max_stack_depth(&Expr::Ident("x".into())), 0);
-    }
-
-    #[test]
-    fn peephole_keeps_push_pop_different_reg() {
-        let mut code = vec![0x50, 0x59]; // push rax; pop rcx
-        peephole_optimize(&mut code);
-        assert_eq!(code, vec![0x50, 0x59]); // unchanged — different registers
     }
 
     #[test]
@@ -28429,5 +28386,657 @@ rule extract_word
             }
         }
         let _ = std::fs::remove_file(&out);
+    }
+
+    #[test]
+    fn aes128_encrypt_matches_fips197_and_nist() {
+        // Full AES-128 single-block ECB encrypt in pure Verbose. The encrypt
+        // rule composes the inline key schedule + 10 rounds of SubBytes /
+        // ShiftRows / MixColumns / AddRoundKey as a straight-line let chain,
+        // then dispatches on `which` (0..15) for the output byte. Validated
+        // against two canonical vectors:
+        //   - FIPS-197 Appendix C.1
+        //   - NIST SP 800-38A F.1.1 block 1
+        let handle = std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(aes128_encrypt_test_body)
+            .expect("spawn test thread");
+        handle.join().expect("test thread panicked");
+    }
+
+    fn aes128_encrypt_test_body() {
+        let src = std::fs::read_to_string("examples/aes_encrypt.verbose")
+            .expect("examples/aes_encrypt.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+        let out = std::env::temp_dir().join("verbosec_test_aes128_encrypt");
+        compile_native(&program, "encrypt", out.to_str().unwrap(), false, false)
+            .expect("encrypt must compile");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o755));
+        }
+
+        let encrypt_block = |pt: &[u8; 16], key: &[u8; 16]| -> [u8; 16] {
+            let mut ct = [0u8; 16];
+            for w in 0u8..16 {
+                let mut args: Vec<u8> = pt.to_vec();
+                args.extend_from_slice(key);
+                args.push(w);
+                let mut cmd = std::process::Command::new(&out);
+                for a in &args { cmd.arg(a.to_string()); }
+                let output = cmd.output().expect("native binary must run");
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                ct[w as usize] = stdout.trim().parse::<u32>()
+                    .unwrap_or_else(|_| panic!("parse which={}: {:?}", w, stdout)) as u8;
+            }
+            ct
+        };
+
+        // FIPS-197 Appendix C.1
+        let pt1: [u8; 16]  = [0x00,0x11,0x22,0x33,0x44,0x55,0x66,0x77,0x88,0x99,0xaa,0xbb,0xcc,0xdd,0xee,0xff];
+        let key1: [u8; 16] = [0x00,0x01,0x02,0x03,0x04,0x05,0x06,0x07,0x08,0x09,0x0a,0x0b,0x0c,0x0d,0x0e,0x0f];
+        let exp1: [u8; 16] = [0x69,0xc4,0xe0,0xd8,0x6a,0x7b,0x04,0x30,0xd8,0xcd,0xb7,0x80,0x70,0xb4,0xc5,0x5a];
+        assert_eq!(encrypt_block(&pt1, &key1), exp1, "FIPS-197 Appendix C.1 ciphertext mismatch");
+
+        // NIST SP 800-38A F.1.1 block 1
+        let pt2: [u8; 16]  = [0x6b,0xc1,0xbe,0xe2,0x2e,0x40,0x9f,0x96,0xe9,0x3d,0x7e,0x11,0x73,0x93,0x17,0x2a];
+        let key2: [u8; 16] = [0x2b,0x7e,0x15,0x16,0x28,0xae,0xd2,0xa6,0xab,0xf7,0x15,0x88,0x09,0xcf,0x4f,0x3c];
+        let exp2: [u8; 16] = [0x3a,0xd7,0x7b,0xb4,0x0d,0x7a,0x36,0x60,0xa8,0x9e,0xca,0xf3,0x24,0x66,0xef,0x97];
+        assert_eq!(encrypt_block(&pt2, &key2), exp2, "NIST SP 800-38A F.1.1 block 1 ciphertext mismatch");
+
+        let _ = std::fs::remove_file(&out);
+    }
+
+    #[test]
+    fn ghash_gf128_mul_matches_spec() {
+        // GF(2^128) multiply under the GCM reduction polynomial, NIST
+        // SP 800-38D Algorithm 1, fully unrolled (128 iterations) in
+        // examples/ghash_mul.verbose. Validated against a Rust reference
+        // of the same spec algorithm across 5 vectors including edge cases
+        // (zero operands, the GCM multiplicative identity 0x80..00, and the
+        // all-ones reduction-heavy case).
+        let handle = std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(ghash_gf128_mul_test_body)
+            .expect("spawn test thread");
+        handle.join().expect("test thread panicked");
+    }
+
+    fn gf128_mul_ref(x: &[u8; 16], y: &[u8; 16]) -> [u8; 16] {
+        let mut z = [0u8; 16];
+        let mut v = *x;
+        for i in 0..128 {
+            if (y[i / 8] >> (7 - (i % 8))) & 1 == 1 {
+                for k in 0..16 { z[k] ^= v[k]; }
+            }
+            let lsb = v[15] & 1;
+            let mut nv = [0u8; 16];
+            for k in 0..16 {
+                let hi = if k > 0 { v[k - 1] & 1 } else { 0 };
+                nv[k] = (v[k] >> 1) | (hi << 7);
+            }
+            if lsb == 1 { nv[0] ^= 0xe1; }
+            v = nv;
+        }
+        z
+    }
+
+    fn ghash_gf128_mul_test_body() {
+        let src = std::fs::read_to_string("examples/ghash_mul.verbose")
+            .expect("examples/ghash_mul.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+        let out = std::env::temp_dir().join("verbosec_test_ghash_mul");
+        compile_native(&program, "gf128_mul", out.to_str().unwrap(), false, false)
+            .expect("gf128_mul must compile");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o755));
+        }
+
+        let mul = |x: &[u8; 16], y: &[u8; 16]| -> [u8; 16] {
+            let mut prod = [0u8; 16];
+            for w in 0u8..16 {
+                let mut args: Vec<u8> = x.to_vec();
+                args.extend_from_slice(y);
+                args.push(w);
+                let mut cmd = std::process::Command::new(&out);
+                for a in &args { cmd.arg(a.to_string()); }
+                let output = cmd.output().expect("native binary must run");
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                prod[w as usize] = stdout.trim().parse::<u32>()
+                    .unwrap_or_else(|_| panic!("parse which={}: {:?}", w, stdout)) as u8;
+            }
+            prod
+        };
+
+        let hex = |s: &str| -> [u8; 16] {
+            let bytes: Vec<u8> = (0..16).map(|i| u8::from_str_radix(&s[i*2..i*2+2], 16).unwrap()).collect();
+            let mut a = [0u8; 16];
+            a.copy_from_slice(&bytes);
+            a
+        };
+
+        let vectors: [([u8; 16], [u8; 16]); 5] = [
+            (hex("66e94bd4ef8a2c3b884cfa59ca342b2e"), hex("0388dace60b6a392f328c2b971b2fe78")),
+            ([0u8; 16],                               hex("0388dace60b6a392f328c2b971b2fe78")),
+            (hex("66e94bd4ef8a2c3b884cfa59ca342b2e"), [0u8; 16]),
+            (hex("00000000000000000000000000000001"), hex("80000000000000000000000000000000")),
+            (hex("ffffffffffffffffffffffffffffffff"), hex("ffffffffffffffffffffffffffffffff")),
+        ];
+        for (x, y) in &vectors {
+            let got = mul(x, y);
+            let exp = gf128_mul_ref(x, y);
+            assert_eq!(got, exp, "GF(2^128) multiply mismatch for X={:02x?} Y={:02x?}", x, y);
+        }
+        let _ = std::fs::remove_file(&out);
+    }
+
+    #[test]
+    fn aes128_ctr_matches_nist_sp800_38a() {
+        // AES-128-CTR single block: ciphertext = plaintext XOR AES-128(counter, key).
+        // The encrypt block runs on the counter, then XORs the plaintext. Validated
+        // against NIST SP 800-38A F.5.1 blocks 1 and 2 (block 2 uses counter IV+1),
+        // plus a CTR-is-its-own-inverse round-trip.
+        let handle = std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(aes128_ctr_test_body)
+            .expect("spawn test thread");
+        handle.join().expect("test thread panicked");
+    }
+
+    fn aes128_ctr_test_body() {
+        let src = std::fs::read_to_string("examples/aes_ctr.verbose")
+            .expect("examples/aes_ctr.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+        let out = std::env::temp_dir().join("verbosec_test_aes_ctr");
+        compile_native(&program, "ctr_block", out.to_str().unwrap(), false, false)
+            .expect("ctr_block must compile");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o755));
+        }
+
+        let ctr = |pt: &[u8; 16], key: &[u8; 16], counter: &[u8; 16]| -> [u8; 16] {
+            let mut ct = [0u8; 16];
+            for w in 0u8..16 {
+                let mut args: Vec<u8> = pt.to_vec();
+                args.extend_from_slice(key);
+                args.extend_from_slice(counter);
+                args.push(w);
+                let mut cmd = std::process::Command::new(&out);
+                for a in &args { cmd.arg(a.to_string()); }
+                let output = cmd.output().expect("native binary must run");
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                ct[w as usize] = stdout.trim().parse::<u32>()
+                    .unwrap_or_else(|_| panic!("parse which={}: {:?}", w, stdout)) as u8;
+            }
+            ct
+        };
+        let hex16 = |s: &str| -> [u8; 16] {
+            let mut a = [0u8; 16];
+            for i in 0..16 { a[i] = u8::from_str_radix(&s[i*2..i*2+2], 16).unwrap(); }
+            a
+        };
+        let inc = |c: &[u8; 16]| -> [u8; 16] {
+            let n = u128::from_be_bytes(*c).wrapping_add(1);
+            n.to_be_bytes()
+        };
+
+        let key = hex16("2b7e151628aed2a6abf7158809cf4f3c");
+        let iv  = hex16("f0f1f2f3f4f5f6f7f8f9fafbfcfdfeff");
+        let pt1 = hex16("6bc1bee22e409f96e93d7e117393172a");
+        let pt2 = hex16("ae2d8a571e03ac9c9eb76fac45af8e51");
+        let exp1 = hex16("874d6191b620e3261bef6864990db6ce");
+        let exp2 = hex16("9806f66b7970fdff8617187bb9fffdff");
+
+        let ct1 = ctr(&pt1, &key, &iv);
+        assert_eq!(ct1, exp1, "NIST SP 800-38A F.5.1 block 1 mismatch");
+        let ct2 = ctr(&pt2, &key, &inc(&iv));
+        assert_eq!(ct2, exp2, "NIST SP 800-38A F.5.1 block 2 mismatch");
+
+        // CTR is its own inverse: feeding the ciphertext back yields the plaintext.
+        let back = ctr(&ct1, &key, &iv);
+        assert_eq!(back, pt1, "CTR round-trip (decrypt) mismatch");
+
+        let _ = std::fs::remove_file(&out);
+    }
+
+    #[test]
+    fn ghash_two_blocks_matches_spec() {
+        // GHASH over 2 blocks (the minimal GCM authentication shape: one
+        // ciphertext block + the length block, empty AAD), composing the
+        // GF(2^128) multiply twice: Y = ((blk0 * H) XOR blk1) * H. Validated
+        // against a Rust reference of the same fold across GCM test-case-2
+        // vectors plus all-zero / all-one edge cases. Also exercises the
+        // large-frame path (~9000 lets) that surfaced and fixed the broken
+        // machine-code peephole.
+        let handle = std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(ghash_two_blocks_test_body)
+            .expect("spawn test thread");
+        handle.join().expect("test thread panicked");
+    }
+
+    fn ghash_two_blocks_test_body() {
+        let src = std::fs::read_to_string("examples/ghash.verbose")
+            .expect("examples/ghash.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+        let out = std::env::temp_dir().join("verbosec_test_ghash2");
+        compile_native(&program, "ghash", out.to_str().unwrap(), false, false)
+            .expect("ghash must compile");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o755));
+        }
+
+        // Rust reference: same fold the rule implements.
+        fn ghash2(h: &[u8; 16], b0: &[u8; 16], b1: &[u8; 16]) -> [u8; 16] {
+            let y1 = gf128_mul_ref(b0, h);
+            let mut t = [0u8; 16];
+            for k in 0..16 { t[k] = y1[k] ^ b1[k]; }
+            gf128_mul_ref(&t, h)
+        }
+
+        let run = |h: &[u8; 16], b0: &[u8; 16], b1: &[u8; 16]| -> [u8; 16] {
+            let mut res = [0u8; 16];
+            for w in 0u8..16 {
+                let mut args: Vec<u8> = h.to_vec();
+                args.extend_from_slice(b0);
+                args.extend_from_slice(b1);
+                args.push(w);
+                let mut cmd = std::process::Command::new(&out);
+                for a in &args { cmd.arg(a.to_string()); }
+                let output = cmd.output().expect("native binary must run");
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                res[w as usize] = stdout.trim().parse::<u32>()
+                    .unwrap_or_else(|_| panic!("parse which={}: {:?}", w, stdout)) as u8;
+            }
+            res
+        };
+        let hex16 = |s: &str| -> [u8; 16] {
+            let mut a = [0u8; 16];
+            for i in 0..16 { a[i] = u8::from_str_radix(&s[i*2..i*2+2], 16).unwrap(); }
+            a
+        };
+
+        let vectors: [([u8; 16], [u8; 16], [u8; 16]); 3] = [
+            (hex16("66e94bd4ef8a2c3b884cfa59ca342b2e"),
+             hex16("0388dace60b6a392f328c2b971b2fe78"),
+             hex16("00000000000000000000000000000080")),
+            ([0u8; 16], [0u8; 16], [0u8; 16]),
+            (hex16("ffffffffffffffffffffffffffffffff"),
+             hex16("ffffffffffffffffffffffffffffffff"),
+             hex16("ffffffffffffffffffffffffffffffff")),
+        ];
+        for (h, b0, b1) in &vectors {
+            assert_eq!(run(h, b0, b1), ghash2(h, b0, b1), "GHASH mismatch H={:02x?}", h);
+        }
+        let _ = std::fs::remove_file(&out);
+    }
+
+    // Compact AES-128 reference (block encrypt) for the GCM integration test.
+    fn aes128_ref(key: &[u8; 16], blk: &[u8; 16]) -> [u8; 16] {
+        const SBOX: [u8; 256] = [
+            0x63,0x7c,0x77,0x7b,0xf2,0x6b,0x6f,0xc5,0x30,0x01,0x67,0x2b,0xfe,0xd7,0xab,0x76,
+            0xca,0x82,0xc9,0x7d,0xfa,0x59,0x47,0xf0,0xad,0xd4,0xa2,0xaf,0x9c,0xa4,0x72,0xc0,
+            0xb7,0xfd,0x93,0x26,0x36,0x3f,0xf7,0xcc,0x34,0xa5,0xe5,0xf1,0x71,0xd8,0x31,0x15,
+            0x04,0xc7,0x23,0xc3,0x18,0x96,0x05,0x9a,0x07,0x12,0x80,0xe2,0xeb,0x27,0xb2,0x75,
+            0x09,0x83,0x2c,0x1a,0x1b,0x6e,0x5a,0xa0,0x52,0x3b,0xd6,0xb3,0x29,0xe3,0x2f,0x84,
+            0x53,0xd1,0x00,0xed,0x20,0xfc,0xb1,0x5b,0x6a,0xcb,0xbe,0x39,0x4a,0x4c,0x58,0xcf,
+            0xd0,0xef,0xaa,0xfb,0x43,0x4d,0x33,0x85,0x45,0xf9,0x02,0x7f,0x50,0x3c,0x9f,0xa8,
+            0x51,0xa3,0x40,0x8f,0x92,0x9d,0x38,0xf5,0xbc,0xb6,0xda,0x21,0x10,0xff,0xf3,0xd2,
+            0xcd,0x0c,0x13,0xec,0x5f,0x97,0x44,0x17,0xc4,0xa7,0x7e,0x3d,0x64,0x5d,0x19,0x73,
+            0x60,0x81,0x4f,0xdc,0x22,0x2a,0x90,0x88,0x46,0xee,0xb8,0x14,0xde,0x5e,0x0b,0xdb,
+            0xe0,0x32,0x3a,0x0a,0x49,0x06,0x24,0x5c,0xc2,0xd3,0xac,0x62,0x91,0x95,0xe4,0x79,
+            0xe7,0xc8,0x37,0x6d,0x8d,0xd5,0x4e,0xa9,0x6c,0x56,0xf4,0xea,0x65,0x7a,0xae,0x08,
+            0xba,0x78,0x25,0x2e,0x1c,0xa6,0xb4,0xc6,0xe8,0xdd,0x74,0x1f,0x4b,0xbd,0x8b,0x8a,
+            0x70,0x3e,0xb5,0x66,0x48,0x03,0xf6,0x0e,0x61,0x35,0x57,0xb9,0x86,0xc1,0x1d,0x9e,
+            0xe1,0xf8,0x98,0x11,0x69,0xd9,0x8e,0x94,0x9b,0x1e,0x87,0xe9,0xce,0x55,0x28,0xdf,
+            0x8c,0xa1,0x89,0x0d,0xbf,0xe6,0x42,0x68,0x41,0x99,0x2d,0x0f,0xb0,0x54,0xbb,0x16,
+        ];
+        const RCON: [u8; 11] = [0,1,2,4,8,16,32,64,128,0x1b,0x36];
+        let xt = |x: u8| -> u8 { if x & 0x80 != 0 { (x << 1) ^ 0x1b } else { x << 1 } };
+        // Key expansion (176 bytes)
+        let mut w = [0u8; 176];
+        w[..16].copy_from_slice(key);
+        for i in 4..44 {
+            let mut t = [w[4*(i-1)], w[4*(i-1)+1], w[4*(i-1)+2], w[4*(i-1)+3]];
+            if i % 4 == 0 {
+                t = [SBOX[t[1] as usize], SBOX[t[2] as usize], SBOX[t[3] as usize], SBOX[t[0] as usize]];
+                t[0] ^= RCON[i/4];
+            }
+            for j in 0..4 { w[4*i+j] = w[4*(i-4)+j] ^ t[j]; }
+        }
+        let mut s = [0u8; 16];
+        for i in 0..16 { s[i] = blk[i] ^ w[i]; }
+        const SR: [usize; 16] = [0,5,10,15,4,9,14,3,8,13,2,7,12,1,6,11];
+        for r in 1..11 {
+            for i in 0..16 { s[i] = SBOX[s[i] as usize]; }
+            let mut sr = [0u8; 16];
+            for i in 0..16 { sr[i] = s[SR[i]]; }
+            s = sr;
+            if r < 10 {
+                let mut ns = [0u8; 16];
+                for c in 0..4 {
+                    let (a, b, cc, d) = (s[c*4], s[c*4+1], s[c*4+2], s[c*4+3]);
+                    ns[c*4]   = xt(a) ^ xt(b) ^ b ^ cc ^ d;
+                    ns[c*4+1] = a ^ xt(b) ^ xt(cc) ^ cc ^ d;
+                    ns[c*4+2] = a ^ b ^ xt(cc) ^ xt(d) ^ d;
+                    ns[c*4+3] = xt(a) ^ a ^ b ^ cc ^ xt(d);
+                }
+                s = ns;
+            }
+            for i in 0..16 { s[i] ^= w[16*r+i]; }
+        }
+        s
+    }
+
+    // GCM single-block, 96-bit IV, empty AAD → (ciphertext, tag).
+    fn gcm_ref(key: &[u8; 16], iv: &[u8; 12], p: &[u8; 16]) -> ([u8; 16], [u8; 16]) {
+        let h = aes128_ref(key, &[0u8; 16]);
+        let mut j0 = [0u8; 16];
+        j0[..12].copy_from_slice(iv); j0[15] = 1;
+        let mut cb1 = j0; cb1[15] = 2;
+        let ks = aes128_ref(key, &cb1);
+        let mut c = [0u8; 16];
+        for i in 0..16 { c[i] = p[i] ^ ks[i]; }
+        let mut l = [0u8; 16]; l[15] = 0x80;
+        let y1 = gf128_mul_ref(&c, &h);
+        let mut t = [0u8; 16];
+        for i in 0..16 { t[i] = y1[i] ^ l[i]; }
+        let sblk = gf128_mul_ref(&t, &h);
+        let ej0 = aes128_ref(key, &j0);
+        let mut tag = [0u8; 16];
+        for i in 0..16 { tag[i] = sblk[i] ^ ej0[i]; }
+        (c, tag)
+    }
+
+    #[test]
+    fn aes128_gcm_matches_nist_and_reference() {
+        // Full AES-128-GCM AEAD (one block, 96-bit IV, empty AAD) in pure
+        // Verbose, composing key expansion + 3 AES blocks (shared schedule) +
+        // 2-block GHASH + tag XOR. Anchored on NIST GCM Test Case 2, whose
+        // ciphertext AND tag are both published; cross-checked on a non-trivial
+        // vector (NIST Test Case 3's key/IV, whose first ciphertext block is
+        // the published 42831ec2..) against a self-contained Rust GCM reference.
+        let handle = std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(aes128_gcm_test_body)
+            .expect("spawn test thread");
+        handle.join().expect("test thread panicked");
+    }
+
+    fn aes128_gcm_test_body() {
+        let src = std::fs::read_to_string("examples/aes_gcm.verbose")
+            .expect("examples/aes_gcm.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+        let out = std::env::temp_dir().join("verbosec_test_aes_gcm");
+        compile_native(&program, "gcm_encrypt", out.to_str().unwrap(), false, false)
+            .expect("gcm_encrypt must compile");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o755));
+        }
+
+        let run = |key: &[u8; 16], iv: &[u8; 12], p: &[u8; 16]| -> ([u8; 16], [u8; 16]) {
+            let mut buf = [0u8; 32];
+            for w in 0u8..32 {
+                let mut args: Vec<u8> = key.to_vec();
+                args.extend_from_slice(iv);
+                args.extend_from_slice(p);
+                args.push(w);
+                let mut cmd = std::process::Command::new(&out);
+                for a in &args { cmd.arg(a.to_string()); }
+                let output = cmd.output().expect("native binary must run");
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                buf[w as usize] = stdout.trim().parse::<u32>()
+                    .unwrap_or_else(|_| panic!("parse which={}: {:?}", w, stdout)) as u8;
+            }
+            let mut c = [0u8; 16]; let mut t = [0u8; 16];
+            c.copy_from_slice(&buf[..16]); t.copy_from_slice(&buf[16..]);
+            (c, t)
+        };
+        let hex16 = |s: &str| -> [u8; 16] {
+            let mut a = [0u8; 16];
+            for i in 0..16 { a[i] = u8::from_str_radix(&s[i*2..i*2+2], 16).unwrap(); }
+            a
+        };
+
+        // NIST GCM Test Case 2 — authoritative published C and T.
+        let (c0, t0) = run(&[0u8; 16], &[0u8; 12], &[0u8; 16]);
+        assert_eq!(c0, hex16("0388dace60b6a392f328c2b971b2fe78"), "NIST GCM TC2 ciphertext mismatch");
+        assert_eq!(t0, hex16("ab6e47d42cec13bdf53a67b21257bddf"), "NIST GCM TC2 tag mismatch");
+        // Reference must itself reproduce TC2 (guards the reference).
+        let (rc0, rt0) = gcm_ref(&[0u8; 16], &[0u8; 12], &[0u8; 16]);
+        assert_eq!(rc0, c0); assert_eq!(rt0, t0);
+
+        // Non-trivial vector (NIST TC3 key/IV, single block). C[0] = published 42831ec2..
+        let key = hex16("feffe9928665731c6d6a8f9467308308");
+        let iv_hex = "cafebabefacedbaddecaf888";
+        let mut iv = [0u8; 12];
+        for i in 0..12 { iv[i] = u8::from_str_radix(&iv_hex[i*2..i*2+2], 16).unwrap(); }
+        let p = hex16("d9313225f88406e5a55909c5aff5269a");
+        let (cv, tv) = run(&key, &iv, &p);
+        let (cr, tr) = gcm_ref(&key, &iv, &p);
+        assert_eq!(cv, cr, "non-trivial ciphertext mismatch vs reference");
+        assert_eq!(tv, tr, "non-trivial tag mismatch vs reference");
+        assert_eq!(cv, hex16("42831ec2217774244b7221b784d0d49c"), "non-trivial C[0..16] != published NIST TC3 first block");
+
+        let _ = std::fs::remove_file(&out);
+    }
+
+    // Compact SHA-256 reference over a byte slice.
+    fn sha256_ref(msg: &[u8]) -> [u8; 32] {
+        const K: [u32; 64] = [
+            0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
+            0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
+            0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
+            0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
+            0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
+            0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
+            0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
+            0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2];
+        let mut h: [u32; 8] = [0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19];
+        let mut data = msg.to_vec();
+        let bitlen = (msg.len() as u64) * 8;
+        data.push(0x80);
+        while data.len() % 64 != 56 { data.push(0); }
+        data.extend_from_slice(&bitlen.to_be_bytes());
+        for block in data.chunks(64) {
+            let mut w = [0u32; 64];
+            for t in 0..16 {
+                w[t] = u32::from_be_bytes([block[4*t], block[4*t+1], block[4*t+2], block[4*t+3]]);
+            }
+            for t in 16..64 {
+                let s0 = w[t-15].rotate_right(7) ^ w[t-15].rotate_right(18) ^ (w[t-15] >> 3);
+                let s1 = w[t-2].rotate_right(17) ^ w[t-2].rotate_right(19) ^ (w[t-2] >> 10);
+                w[t] = w[t-16].wrapping_add(s0).wrapping_add(w[t-7]).wrapping_add(s1);
+            }
+            let (mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh) =
+                (h[0],h[1],h[2],h[3],h[4],h[5],h[6],h[7]);
+            for t in 0..64 {
+                let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+                let ch = (e & f) ^ ((!e) & g);
+                let t1 = hh.wrapping_add(s1).wrapping_add(ch).wrapping_add(K[t]).wrapping_add(w[t]);
+                let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+                let maj = (a & b) ^ (a & c) ^ (b & c);
+                let t2 = s0.wrapping_add(maj);
+                hh = g; g = f; f = e; e = d.wrapping_add(t1); d = c; c = b; b = a; a = t1.wrapping_add(t2);
+            }
+            h[0]=h[0].wrapping_add(a); h[1]=h[1].wrapping_add(b); h[2]=h[2].wrapping_add(c); h[3]=h[3].wrapping_add(d);
+            h[4]=h[4].wrapping_add(e); h[5]=h[5].wrapping_add(f); h[6]=h[6].wrapping_add(g); h[7]=h[7].wrapping_add(hh);
+        }
+        let mut out = [0u8; 32];
+        for i in 0..8 { out[4*i..4*i+4].copy_from_slice(&h[i].to_be_bytes()); }
+        out
+    }
+
+    // HMAC-SHA256 with a block-padded (64-byte) key.
+    fn hmac_sha256_ref(key64: &[u8; 64], msg: &[u8]) -> [u8; 32] {
+        let mut inner = Vec::with_capacity(64 + msg.len());
+        for i in 0..64 { inner.push(key64[i] ^ 0x36); }
+        inner.extend_from_slice(msg);
+        let id = sha256_ref(&inner);
+        let mut outer = Vec::with_capacity(96);
+        for i in 0..64 { outer.push(key64[i] ^ 0x5c); }
+        outer.extend_from_slice(&id);
+        sha256_ref(&outer)
+    }
+
+    #[test]
+    fn hmac_sha256_matches_rfc4231() {
+        // HMAC-SHA256 of an 8-byte message under a block-padded key, in pure
+        // Verbose (two inlined SHA-256s built from the input bytes). Anchored
+        // on RFC 4231 Test Case 1 (key = 0x0b*20, data = "Hi There", whose MAC
+        // b0344c61.. is published) and cross-checked on an alternate key via a
+        // self-contained Rust SHA-256/HMAC reference.
+        let handle = std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(hmac_sha256_test_body)
+            .expect("spawn test thread");
+        handle.join().expect("test thread panicked");
+    }
+
+    fn hmac_sha256_test_body() {
+        // Guard the reference itself against a known SHA-256 vector.
+        assert_eq!(
+            sha256_ref(b"abc").iter().map(|b| format!("{:02x}", b)).collect::<String>(),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+
+        let src = std::fs::read_to_string("examples/hmac_sha256.verbose")
+            .expect("examples/hmac_sha256.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+        let out = std::env::temp_dir().join("verbosec_test_hmac");
+        compile_native(&program, "hmac_sha256", out.to_str().unwrap(), false, false)
+            .expect("hmac_sha256 must compile");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o755));
+        }
+
+        let run = |key64: &[u8; 64], msg: &[u8; 8]| -> [u8; 32] {
+            let mut mac = [0u8; 32];
+            for w in 0u8..32 {
+                let mut args: Vec<u8> = key64.to_vec();
+                args.extend_from_slice(msg);
+                args.push(w);
+                let mut cmd = std::process::Command::new(&out);
+                for a in &args { cmd.arg(a.to_string()); }
+                let output = cmd.output().expect("native binary must run");
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                mac[w as usize] = stdout.trim().parse::<u32>()
+                    .unwrap_or_else(|_| panic!("parse which={}: {:?}", w, stdout)) as u8;
+            }
+            mac
+        };
+
+        // RFC 4231 Test Case 1: key = 0x0b*20 (block-padded), data = "Hi There".
+        let mut key64 = [0u8; 64];
+        for i in 0..20 { key64[i] = 0x0b; }
+        let msg = *b"Hi There";
+        let mac = run(&key64, &msg);
+        let exp = "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7";
+        assert_eq!(mac.iter().map(|b| format!("{:02x}", b)).collect::<String>(), exp,
+                   "RFC 4231 TC1 HMAC-SHA256 mismatch");
+        assert_eq!(mac, hmac_sha256_ref(&key64, &msg));
+
+        // Alternate key (non-test-vector) cross-checked against the reference.
+        let mut key2 = [0u8; 64];
+        for i in 0..20 { key2[i] = [0xAA,0xBB,0xCC,0xDD][i % 4]; }
+        assert_eq!(run(&key2, &msg), hmac_sha256_ref(&key2, &msg),
+                   "alternate-key HMAC-SHA256 mismatch vs reference");
+
+        let _ = std::fs::remove_file(&out);
+    }
+
+    #[test]
+    fn hkdf_matches_rfc5869() {
+        // HKDF (RFC 5869) over SHA-256, the TLS 1.3 key-derivation primitive,
+        // composing the inlined HMAC-SHA256. Two rules: hkdf_extract (PRK =
+        // HMAC(salt, IKM)) and hkdf_expand (OKM = T(1)||T(2) truncated to 42,
+        // T(i)=HMAC(PRK, T(i-1)||info||i)). Anchored on RFC 5869 Test Case 1,
+        // whose PRK and OKM are both published.
+        let handle = std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(hkdf_test_body)
+            .expect("spawn test thread");
+        handle.join().expect("test thread panicked");
+    }
+
+    fn hkdf_test_body() {
+        let src = std::fs::read_to_string("examples/hkdf.verbose")
+            .expect("examples/hkdf.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+
+        let hex = |s: &str| -> Vec<u8> {
+            (0..s.len()/2).map(|i| u8::from_str_radix(&s[i*2..i*2+2], 16).unwrap()).collect()
+        };
+
+        // --- hkdf_extract: PRK = HMAC(salt, IKM) ---
+        let ex_out = std::env::temp_dir().join("verbosec_test_hkdf_ex");
+        compile_native(&program, "hkdf_extract", ex_out.to_str().unwrap(), false, false)
+            .expect("hkdf_extract must compile");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&ex_out, std::fs::Permissions::from_mode(0o755));
+        }
+        // RFC 5869 TC1: IKM = 0x0b*22, salt = 00..0c (13 bytes, padded to 64).
+        let ikm = vec![0x0bu8; 22];
+        let mut salt64 = vec![0u8; 64];
+        for i in 0..13 { salt64[i] = i as u8; }
+        let run_bin = |bin: &std::path::Path, key: &[u8], msg: &[u8], n: u8| -> Vec<u8> {
+            (0..n).map(|w| {
+                let mut args: Vec<u8> = key.to_vec();
+                args.extend_from_slice(msg);
+                args.push(w);
+                let mut cmd = std::process::Command::new(bin);
+                for a in &args { cmd.arg(a.to_string()); }
+                let o = cmd.output().expect("run");
+                String::from_utf8_lossy(&o.stdout).trim().parse::<u32>()
+                    .unwrap_or_else(|_| panic!("parse w={}", w)) as u8
+            }).collect()
+        };
+        let prk = run_bin(&ex_out, &salt64, &ikm, 32);
+        // Reference HMAC for PRK.
+        let mut salt64a = [0u8; 64]; salt64a.copy_from_slice(&salt64);
+        assert_eq!(prk, hmac_sha256_ref(&salt64a, &ikm).to_vec());
+        assert_eq!(prk, hex("077709362c2e32df0ddc3f0dc47bba6390b6c73bb50f9c3122ec844ad7c2b3e5"),
+                   "RFC 5869 TC1 PRK mismatch");
+        let _ = std::fs::remove_file(&ex_out);
+
+        // --- hkdf_expand: OKM (42 bytes) from PRK + info ---
+        let xp_out = std::env::temp_dir().join("verbosec_test_hkdf_xp");
+        compile_native(&program, "hkdf_expand", xp_out.to_str().unwrap(), false, false)
+            .expect("hkdf_expand must compile");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&xp_out, std::fs::Permissions::from_mode(0o755));
+        }
+        let mut prk64 = vec![0u8; 64];
+        prk64[..32].copy_from_slice(&prk);
+        let info: Vec<u8> = (0xf0u8..0xfa).collect();
+        let okm = run_bin(&xp_out, &prk64, &info, 42);
+        assert_eq!(
+            okm,
+            hex("3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865"),
+            "RFC 5869 TC1 OKM mismatch"
+        );
+        let _ = std::fs::remove_file(&xp_out);
     }
 }
