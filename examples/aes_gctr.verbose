@@ -1,0 +1,1019 @@
+@verbose 0.1.0
+
+concept Byte
+  @intention: "byte"
+  @source: invoices.intent:1
+  fields:
+    b : number [0, 255]
+
+concept CtrInput
+  @intention: "AES-128 key + 12-byte IV + plaintext hex + nblocks + which output byte"
+  @source: invoices.intent:1
+  fields:
+    k0 : number [0, 255]
+    k1 : number [0, 255]
+    k2 : number [0, 255]
+    k3 : number [0, 255]
+    k4 : number [0, 255]
+    k5 : number [0, 255]
+    k6 : number [0, 255]
+    k7 : number [0, 255]
+    k8 : number [0, 255]
+    k9 : number [0, 255]
+    k10 : number [0, 255]
+    k11 : number [0, 255]
+    k12 : number [0, 255]
+    k13 : number [0, 255]
+    k14 : number [0, 255]
+    k15 : number [0, 255]
+    iv0 : number [0, 255]
+    iv1 : number [0, 255]
+    iv2 : number [0, 255]
+    iv3 : number [0, 255]
+    iv4 : number [0, 255]
+    iv5 : number [0, 255]
+    iv6 : number [0, 255]
+    iv7 : number [0, 255]
+    iv8 : number [0, 255]
+    iv9 : number [0, 255]
+    iv10 : number [0, 255]
+    iv11 : number [0, 255]
+    nblocks : number [0, 64]
+    which : number [0, 1023]
+    data : text
+
+
+rule aes_sbox
+  @intention: "AES forward S-box"
+  @source: invoices.intent:1
+  input:
+    inp : Byte
+  output:
+    out : number
+  logic:
+    out = if inp.b == 0 then 99
+      else if inp.b == 1 then 124
+      else if inp.b == 2 then 119
+      else if inp.b == 3 then 123
+      else if inp.b == 4 then 242
+      else if inp.b == 5 then 107
+      else if inp.b == 6 then 111
+      else if inp.b == 7 then 197
+      else if inp.b == 8 then 48
+      else if inp.b == 9 then 1
+      else if inp.b == 10 then 103
+      else if inp.b == 11 then 43
+      else if inp.b == 12 then 254
+      else if inp.b == 13 then 215
+      else if inp.b == 14 then 171
+      else if inp.b == 15 then 118
+      else if inp.b == 16 then 202
+      else if inp.b == 17 then 130
+      else if inp.b == 18 then 201
+      else if inp.b == 19 then 125
+      else if inp.b == 20 then 250
+      else if inp.b == 21 then 89
+      else if inp.b == 22 then 71
+      else if inp.b == 23 then 240
+      else if inp.b == 24 then 173
+      else if inp.b == 25 then 212
+      else if inp.b == 26 then 162
+      else if inp.b == 27 then 175
+      else if inp.b == 28 then 156
+      else if inp.b == 29 then 164
+      else if inp.b == 30 then 114
+      else if inp.b == 31 then 192
+      else if inp.b == 32 then 183
+      else if inp.b == 33 then 253
+      else if inp.b == 34 then 147
+      else if inp.b == 35 then 38
+      else if inp.b == 36 then 54
+      else if inp.b == 37 then 63
+      else if inp.b == 38 then 247
+      else if inp.b == 39 then 204
+      else if inp.b == 40 then 52
+      else if inp.b == 41 then 165
+      else if inp.b == 42 then 229
+      else if inp.b == 43 then 241
+      else if inp.b == 44 then 113
+      else if inp.b == 45 then 216
+      else if inp.b == 46 then 49
+      else if inp.b == 47 then 21
+      else if inp.b == 48 then 4
+      else if inp.b == 49 then 199
+      else if inp.b == 50 then 35
+      else if inp.b == 51 then 195
+      else if inp.b == 52 then 24
+      else if inp.b == 53 then 150
+      else if inp.b == 54 then 5
+      else if inp.b == 55 then 154
+      else if inp.b == 56 then 7
+      else if inp.b == 57 then 18
+      else if inp.b == 58 then 128
+      else if inp.b == 59 then 226
+      else if inp.b == 60 then 235
+      else if inp.b == 61 then 39
+      else if inp.b == 62 then 178
+      else if inp.b == 63 then 117
+      else if inp.b == 64 then 9
+      else if inp.b == 65 then 131
+      else if inp.b == 66 then 44
+      else if inp.b == 67 then 26
+      else if inp.b == 68 then 27
+      else if inp.b == 69 then 110
+      else if inp.b == 70 then 90
+      else if inp.b == 71 then 160
+      else if inp.b == 72 then 82
+      else if inp.b == 73 then 59
+      else if inp.b == 74 then 214
+      else if inp.b == 75 then 179
+      else if inp.b == 76 then 41
+      else if inp.b == 77 then 227
+      else if inp.b == 78 then 47
+      else if inp.b == 79 then 132
+      else if inp.b == 80 then 83
+      else if inp.b == 81 then 209
+      else if inp.b == 82 then 0
+      else if inp.b == 83 then 237
+      else if inp.b == 84 then 32
+      else if inp.b == 85 then 252
+      else if inp.b == 86 then 177
+      else if inp.b == 87 then 91
+      else if inp.b == 88 then 106
+      else if inp.b == 89 then 203
+      else if inp.b == 90 then 190
+      else if inp.b == 91 then 57
+      else if inp.b == 92 then 74
+      else if inp.b == 93 then 76
+      else if inp.b == 94 then 88
+      else if inp.b == 95 then 207
+      else if inp.b == 96 then 208
+      else if inp.b == 97 then 239
+      else if inp.b == 98 then 170
+      else if inp.b == 99 then 251
+      else if inp.b == 100 then 67
+      else if inp.b == 101 then 77
+      else if inp.b == 102 then 51
+      else if inp.b == 103 then 133
+      else if inp.b == 104 then 69
+      else if inp.b == 105 then 249
+      else if inp.b == 106 then 2
+      else if inp.b == 107 then 127
+      else if inp.b == 108 then 80
+      else if inp.b == 109 then 60
+      else if inp.b == 110 then 159
+      else if inp.b == 111 then 168
+      else if inp.b == 112 then 81
+      else if inp.b == 113 then 163
+      else if inp.b == 114 then 64
+      else if inp.b == 115 then 143
+      else if inp.b == 116 then 146
+      else if inp.b == 117 then 157
+      else if inp.b == 118 then 56
+      else if inp.b == 119 then 245
+      else if inp.b == 120 then 188
+      else if inp.b == 121 then 182
+      else if inp.b == 122 then 218
+      else if inp.b == 123 then 33
+      else if inp.b == 124 then 16
+      else if inp.b == 125 then 255
+      else if inp.b == 126 then 243
+      else if inp.b == 127 then 210
+      else if inp.b == 128 then 205
+      else if inp.b == 129 then 12
+      else if inp.b == 130 then 19
+      else if inp.b == 131 then 236
+      else if inp.b == 132 then 95
+      else if inp.b == 133 then 151
+      else if inp.b == 134 then 68
+      else if inp.b == 135 then 23
+      else if inp.b == 136 then 196
+      else if inp.b == 137 then 167
+      else if inp.b == 138 then 126
+      else if inp.b == 139 then 61
+      else if inp.b == 140 then 100
+      else if inp.b == 141 then 93
+      else if inp.b == 142 then 25
+      else if inp.b == 143 then 115
+      else if inp.b == 144 then 96
+      else if inp.b == 145 then 129
+      else if inp.b == 146 then 79
+      else if inp.b == 147 then 220
+      else if inp.b == 148 then 34
+      else if inp.b == 149 then 42
+      else if inp.b == 150 then 144
+      else if inp.b == 151 then 136
+      else if inp.b == 152 then 70
+      else if inp.b == 153 then 238
+      else if inp.b == 154 then 184
+      else if inp.b == 155 then 20
+      else if inp.b == 156 then 222
+      else if inp.b == 157 then 94
+      else if inp.b == 158 then 11
+      else if inp.b == 159 then 219
+      else if inp.b == 160 then 224
+      else if inp.b == 161 then 50
+      else if inp.b == 162 then 58
+      else if inp.b == 163 then 10
+      else if inp.b == 164 then 73
+      else if inp.b == 165 then 6
+      else if inp.b == 166 then 36
+      else if inp.b == 167 then 92
+      else if inp.b == 168 then 194
+      else if inp.b == 169 then 211
+      else if inp.b == 170 then 172
+      else if inp.b == 171 then 98
+      else if inp.b == 172 then 145
+      else if inp.b == 173 then 149
+      else if inp.b == 174 then 228
+      else if inp.b == 175 then 121
+      else if inp.b == 176 then 231
+      else if inp.b == 177 then 200
+      else if inp.b == 178 then 55
+      else if inp.b == 179 then 109
+      else if inp.b == 180 then 141
+      else if inp.b == 181 then 213
+      else if inp.b == 182 then 78
+      else if inp.b == 183 then 169
+      else if inp.b == 184 then 108
+      else if inp.b == 185 then 86
+      else if inp.b == 186 then 244
+      else if inp.b == 187 then 234
+      else if inp.b == 188 then 101
+      else if inp.b == 189 then 122
+      else if inp.b == 190 then 174
+      else if inp.b == 191 then 8
+      else if inp.b == 192 then 186
+      else if inp.b == 193 then 120
+      else if inp.b == 194 then 37
+      else if inp.b == 195 then 46
+      else if inp.b == 196 then 28
+      else if inp.b == 197 then 166
+      else if inp.b == 198 then 180
+      else if inp.b == 199 then 198
+      else if inp.b == 200 then 232
+      else if inp.b == 201 then 221
+      else if inp.b == 202 then 116
+      else if inp.b == 203 then 31
+      else if inp.b == 204 then 75
+      else if inp.b == 205 then 189
+      else if inp.b == 206 then 139
+      else if inp.b == 207 then 138
+      else if inp.b == 208 then 112
+      else if inp.b == 209 then 62
+      else if inp.b == 210 then 181
+      else if inp.b == 211 then 102
+      else if inp.b == 212 then 72
+      else if inp.b == 213 then 3
+      else if inp.b == 214 then 246
+      else if inp.b == 215 then 14
+      else if inp.b == 216 then 97
+      else if inp.b == 217 then 53
+      else if inp.b == 218 then 87
+      else if inp.b == 219 then 185
+      else if inp.b == 220 then 134
+      else if inp.b == 221 then 193
+      else if inp.b == 222 then 29
+      else if inp.b == 223 then 158
+      else if inp.b == 224 then 225
+      else if inp.b == 225 then 248
+      else if inp.b == 226 then 152
+      else if inp.b == 227 then 17
+      else if inp.b == 228 then 105
+      else if inp.b == 229 then 217
+      else if inp.b == 230 then 142
+      else if inp.b == 231 then 148
+      else if inp.b == 232 then 155
+      else if inp.b == 233 then 30
+      else if inp.b == 234 then 135
+      else if inp.b == 235 then 233
+      else if inp.b == 236 then 206
+      else if inp.b == 237 then 85
+      else if inp.b == 238 then 40
+      else if inp.b == 239 then 223
+      else if inp.b == 240 then 140
+      else if inp.b == 241 then 161
+      else if inp.b == 242 then 137
+      else if inp.b == 243 then 13
+      else if inp.b == 244 then 191
+      else if inp.b == 245 then 230
+      else if inp.b == 246 then 66
+      else if inp.b == 247 then 104
+      else if inp.b == 248 then 65
+      else if inp.b == 249 then 153
+      else if inp.b == 250 then 45
+      else if inp.b == 251 then 15
+      else if inp.b == 252 then 176
+      else if inp.b == 253 then 84
+      else if inp.b == 254 then 187
+      else 22
+  proofs:
+    purity:
+      reads : [inp.b]
+      calls : []
+    termination:
+      bound : 800
+
+
+rule xtime
+  @intention: "GF(2^8) mul by x"
+  @source: invoices.intent:1
+  input:
+    inp : Byte
+  output:
+    out : number
+  logic:
+    out = if band(inp.b, 128) > 0 then band(bxor(shl(inp.b, 1), 27), 255) else band(shl(inp.b, 1), 255)
+  proofs:
+    purity:
+      reads : [inp.b]
+      calls : []
+    termination:
+      bound : 20
+
+
+rule gctr
+  @intention: "AES-128 GCTR (GCM counter mode): byte which of plaintext XOR AES(IV||(which/16 + 2))"
+  @source: invoices.intent:1
+  input:
+    s : CtrInput
+  output:
+    out : number
+  logic:
+    let sched_ks0 = s.k0
+    let sched_ks1 = s.k1
+    let sched_ks2 = s.k2
+    let sched_ks3 = s.k3
+    let sched_ks4 = s.k4
+    let sched_ks5 = s.k5
+    let sched_ks6 = s.k6
+    let sched_ks7 = s.k7
+    let sched_ks8 = s.k8
+    let sched_ks9 = s.k9
+    let sched_ks10 = s.k10
+    let sched_ks11 = s.k11
+    let sched_ks12 = s.k12
+    let sched_ks13 = s.k13
+    let sched_ks14 = s.k14
+    let sched_ks15 = s.k15
+    let sched_ks16 = band(bxor(bxor(sched_ks0, aes_sbox(Byte { b: sched_ks13 })), 1), 255)
+    let sched_ks17 = band(bxor(sched_ks1, aes_sbox(Byte { b: sched_ks14 })), 255)
+    let sched_ks18 = band(bxor(sched_ks2, aes_sbox(Byte { b: sched_ks15 })), 255)
+    let sched_ks19 = band(bxor(sched_ks3, aes_sbox(Byte { b: sched_ks12 })), 255)
+    let sched_ks20 = band(bxor(sched_ks4, sched_ks16), 255)
+    let sched_ks21 = band(bxor(sched_ks5, sched_ks17), 255)
+    let sched_ks22 = band(bxor(sched_ks6, sched_ks18), 255)
+    let sched_ks23 = band(bxor(sched_ks7, sched_ks19), 255)
+    let sched_ks24 = band(bxor(sched_ks8, sched_ks20), 255)
+    let sched_ks25 = band(bxor(sched_ks9, sched_ks21), 255)
+    let sched_ks26 = band(bxor(sched_ks10, sched_ks22), 255)
+    let sched_ks27 = band(bxor(sched_ks11, sched_ks23), 255)
+    let sched_ks28 = band(bxor(sched_ks12, sched_ks24), 255)
+    let sched_ks29 = band(bxor(sched_ks13, sched_ks25), 255)
+    let sched_ks30 = band(bxor(sched_ks14, sched_ks26), 255)
+    let sched_ks31 = band(bxor(sched_ks15, sched_ks27), 255)
+    let sched_ks32 = band(bxor(bxor(sched_ks16, aes_sbox(Byte { b: sched_ks29 })), 2), 255)
+    let sched_ks33 = band(bxor(sched_ks17, aes_sbox(Byte { b: sched_ks30 })), 255)
+    let sched_ks34 = band(bxor(sched_ks18, aes_sbox(Byte { b: sched_ks31 })), 255)
+    let sched_ks35 = band(bxor(sched_ks19, aes_sbox(Byte { b: sched_ks28 })), 255)
+    let sched_ks36 = band(bxor(sched_ks20, sched_ks32), 255)
+    let sched_ks37 = band(bxor(sched_ks21, sched_ks33), 255)
+    let sched_ks38 = band(bxor(sched_ks22, sched_ks34), 255)
+    let sched_ks39 = band(bxor(sched_ks23, sched_ks35), 255)
+    let sched_ks40 = band(bxor(sched_ks24, sched_ks36), 255)
+    let sched_ks41 = band(bxor(sched_ks25, sched_ks37), 255)
+    let sched_ks42 = band(bxor(sched_ks26, sched_ks38), 255)
+    let sched_ks43 = band(bxor(sched_ks27, sched_ks39), 255)
+    let sched_ks44 = band(bxor(sched_ks28, sched_ks40), 255)
+    let sched_ks45 = band(bxor(sched_ks29, sched_ks41), 255)
+    let sched_ks46 = band(bxor(sched_ks30, sched_ks42), 255)
+    let sched_ks47 = band(bxor(sched_ks31, sched_ks43), 255)
+    let sched_ks48 = band(bxor(bxor(sched_ks32, aes_sbox(Byte { b: sched_ks45 })), 4), 255)
+    let sched_ks49 = band(bxor(sched_ks33, aes_sbox(Byte { b: sched_ks46 })), 255)
+    let sched_ks50 = band(bxor(sched_ks34, aes_sbox(Byte { b: sched_ks47 })), 255)
+    let sched_ks51 = band(bxor(sched_ks35, aes_sbox(Byte { b: sched_ks44 })), 255)
+    let sched_ks52 = band(bxor(sched_ks36, sched_ks48), 255)
+    let sched_ks53 = band(bxor(sched_ks37, sched_ks49), 255)
+    let sched_ks54 = band(bxor(sched_ks38, sched_ks50), 255)
+    let sched_ks55 = band(bxor(sched_ks39, sched_ks51), 255)
+    let sched_ks56 = band(bxor(sched_ks40, sched_ks52), 255)
+    let sched_ks57 = band(bxor(sched_ks41, sched_ks53), 255)
+    let sched_ks58 = band(bxor(sched_ks42, sched_ks54), 255)
+    let sched_ks59 = band(bxor(sched_ks43, sched_ks55), 255)
+    let sched_ks60 = band(bxor(sched_ks44, sched_ks56), 255)
+    let sched_ks61 = band(bxor(sched_ks45, sched_ks57), 255)
+    let sched_ks62 = band(bxor(sched_ks46, sched_ks58), 255)
+    let sched_ks63 = band(bxor(sched_ks47, sched_ks59), 255)
+    let sched_ks64 = band(bxor(bxor(sched_ks48, aes_sbox(Byte { b: sched_ks61 })), 8), 255)
+    let sched_ks65 = band(bxor(sched_ks49, aes_sbox(Byte { b: sched_ks62 })), 255)
+    let sched_ks66 = band(bxor(sched_ks50, aes_sbox(Byte { b: sched_ks63 })), 255)
+    let sched_ks67 = band(bxor(sched_ks51, aes_sbox(Byte { b: sched_ks60 })), 255)
+    let sched_ks68 = band(bxor(sched_ks52, sched_ks64), 255)
+    let sched_ks69 = band(bxor(sched_ks53, sched_ks65), 255)
+    let sched_ks70 = band(bxor(sched_ks54, sched_ks66), 255)
+    let sched_ks71 = band(bxor(sched_ks55, sched_ks67), 255)
+    let sched_ks72 = band(bxor(sched_ks56, sched_ks68), 255)
+    let sched_ks73 = band(bxor(sched_ks57, sched_ks69), 255)
+    let sched_ks74 = band(bxor(sched_ks58, sched_ks70), 255)
+    let sched_ks75 = band(bxor(sched_ks59, sched_ks71), 255)
+    let sched_ks76 = band(bxor(sched_ks60, sched_ks72), 255)
+    let sched_ks77 = band(bxor(sched_ks61, sched_ks73), 255)
+    let sched_ks78 = band(bxor(sched_ks62, sched_ks74), 255)
+    let sched_ks79 = band(bxor(sched_ks63, sched_ks75), 255)
+    let sched_ks80 = band(bxor(bxor(sched_ks64, aes_sbox(Byte { b: sched_ks77 })), 16), 255)
+    let sched_ks81 = band(bxor(sched_ks65, aes_sbox(Byte { b: sched_ks78 })), 255)
+    let sched_ks82 = band(bxor(sched_ks66, aes_sbox(Byte { b: sched_ks79 })), 255)
+    let sched_ks83 = band(bxor(sched_ks67, aes_sbox(Byte { b: sched_ks76 })), 255)
+    let sched_ks84 = band(bxor(sched_ks68, sched_ks80), 255)
+    let sched_ks85 = band(bxor(sched_ks69, sched_ks81), 255)
+    let sched_ks86 = band(bxor(sched_ks70, sched_ks82), 255)
+    let sched_ks87 = band(bxor(sched_ks71, sched_ks83), 255)
+    let sched_ks88 = band(bxor(sched_ks72, sched_ks84), 255)
+    let sched_ks89 = band(bxor(sched_ks73, sched_ks85), 255)
+    let sched_ks90 = band(bxor(sched_ks74, sched_ks86), 255)
+    let sched_ks91 = band(bxor(sched_ks75, sched_ks87), 255)
+    let sched_ks92 = band(bxor(sched_ks76, sched_ks88), 255)
+    let sched_ks93 = band(bxor(sched_ks77, sched_ks89), 255)
+    let sched_ks94 = band(bxor(sched_ks78, sched_ks90), 255)
+    let sched_ks95 = band(bxor(sched_ks79, sched_ks91), 255)
+    let sched_ks96 = band(bxor(bxor(sched_ks80, aes_sbox(Byte { b: sched_ks93 })), 32), 255)
+    let sched_ks97 = band(bxor(sched_ks81, aes_sbox(Byte { b: sched_ks94 })), 255)
+    let sched_ks98 = band(bxor(sched_ks82, aes_sbox(Byte { b: sched_ks95 })), 255)
+    let sched_ks99 = band(bxor(sched_ks83, aes_sbox(Byte { b: sched_ks92 })), 255)
+    let sched_ks100 = band(bxor(sched_ks84, sched_ks96), 255)
+    let sched_ks101 = band(bxor(sched_ks85, sched_ks97), 255)
+    let sched_ks102 = band(bxor(sched_ks86, sched_ks98), 255)
+    let sched_ks103 = band(bxor(sched_ks87, sched_ks99), 255)
+    let sched_ks104 = band(bxor(sched_ks88, sched_ks100), 255)
+    let sched_ks105 = band(bxor(sched_ks89, sched_ks101), 255)
+    let sched_ks106 = band(bxor(sched_ks90, sched_ks102), 255)
+    let sched_ks107 = band(bxor(sched_ks91, sched_ks103), 255)
+    let sched_ks108 = band(bxor(sched_ks92, sched_ks104), 255)
+    let sched_ks109 = band(bxor(sched_ks93, sched_ks105), 255)
+    let sched_ks110 = band(bxor(sched_ks94, sched_ks106), 255)
+    let sched_ks111 = band(bxor(sched_ks95, sched_ks107), 255)
+    let sched_ks112 = band(bxor(bxor(sched_ks96, aes_sbox(Byte { b: sched_ks109 })), 64), 255)
+    let sched_ks113 = band(bxor(sched_ks97, aes_sbox(Byte { b: sched_ks110 })), 255)
+    let sched_ks114 = band(bxor(sched_ks98, aes_sbox(Byte { b: sched_ks111 })), 255)
+    let sched_ks115 = band(bxor(sched_ks99, aes_sbox(Byte { b: sched_ks108 })), 255)
+    let sched_ks116 = band(bxor(sched_ks100, sched_ks112), 255)
+    let sched_ks117 = band(bxor(sched_ks101, sched_ks113), 255)
+    let sched_ks118 = band(bxor(sched_ks102, sched_ks114), 255)
+    let sched_ks119 = band(bxor(sched_ks103, sched_ks115), 255)
+    let sched_ks120 = band(bxor(sched_ks104, sched_ks116), 255)
+    let sched_ks121 = band(bxor(sched_ks105, sched_ks117), 255)
+    let sched_ks122 = band(bxor(sched_ks106, sched_ks118), 255)
+    let sched_ks123 = band(bxor(sched_ks107, sched_ks119), 255)
+    let sched_ks124 = band(bxor(sched_ks108, sched_ks120), 255)
+    let sched_ks125 = band(bxor(sched_ks109, sched_ks121), 255)
+    let sched_ks126 = band(bxor(sched_ks110, sched_ks122), 255)
+    let sched_ks127 = band(bxor(sched_ks111, sched_ks123), 255)
+    let sched_ks128 = band(bxor(bxor(sched_ks112, aes_sbox(Byte { b: sched_ks125 })), 128), 255)
+    let sched_ks129 = band(bxor(sched_ks113, aes_sbox(Byte { b: sched_ks126 })), 255)
+    let sched_ks130 = band(bxor(sched_ks114, aes_sbox(Byte { b: sched_ks127 })), 255)
+    let sched_ks131 = band(bxor(sched_ks115, aes_sbox(Byte { b: sched_ks124 })), 255)
+    let sched_ks132 = band(bxor(sched_ks116, sched_ks128), 255)
+    let sched_ks133 = band(bxor(sched_ks117, sched_ks129), 255)
+    let sched_ks134 = band(bxor(sched_ks118, sched_ks130), 255)
+    let sched_ks135 = band(bxor(sched_ks119, sched_ks131), 255)
+    let sched_ks136 = band(bxor(sched_ks120, sched_ks132), 255)
+    let sched_ks137 = band(bxor(sched_ks121, sched_ks133), 255)
+    let sched_ks138 = band(bxor(sched_ks122, sched_ks134), 255)
+    let sched_ks139 = band(bxor(sched_ks123, sched_ks135), 255)
+    let sched_ks140 = band(bxor(sched_ks124, sched_ks136), 255)
+    let sched_ks141 = band(bxor(sched_ks125, sched_ks137), 255)
+    let sched_ks142 = band(bxor(sched_ks126, sched_ks138), 255)
+    let sched_ks143 = band(bxor(sched_ks127, sched_ks139), 255)
+    let sched_ks144 = band(bxor(bxor(sched_ks128, aes_sbox(Byte { b: sched_ks141 })), 27), 255)
+    let sched_ks145 = band(bxor(sched_ks129, aes_sbox(Byte { b: sched_ks142 })), 255)
+    let sched_ks146 = band(bxor(sched_ks130, aes_sbox(Byte { b: sched_ks143 })), 255)
+    let sched_ks147 = band(bxor(sched_ks131, aes_sbox(Byte { b: sched_ks140 })), 255)
+    let sched_ks148 = band(bxor(sched_ks132, sched_ks144), 255)
+    let sched_ks149 = band(bxor(sched_ks133, sched_ks145), 255)
+    let sched_ks150 = band(bxor(sched_ks134, sched_ks146), 255)
+    let sched_ks151 = band(bxor(sched_ks135, sched_ks147), 255)
+    let sched_ks152 = band(bxor(sched_ks136, sched_ks148), 255)
+    let sched_ks153 = band(bxor(sched_ks137, sched_ks149), 255)
+    let sched_ks154 = band(bxor(sched_ks138, sched_ks150), 255)
+    let sched_ks155 = band(bxor(sched_ks139, sched_ks151), 255)
+    let sched_ks156 = band(bxor(sched_ks140, sched_ks152), 255)
+    let sched_ks157 = band(bxor(sched_ks141, sched_ks153), 255)
+    let sched_ks158 = band(bxor(sched_ks142, sched_ks154), 255)
+    let sched_ks159 = band(bxor(sched_ks143, sched_ks155), 255)
+    let sched_ks160 = band(bxor(bxor(sched_ks144, aes_sbox(Byte { b: sched_ks157 })), 54), 255)
+    let sched_ks161 = band(bxor(sched_ks145, aes_sbox(Byte { b: sched_ks158 })), 255)
+    let sched_ks162 = band(bxor(sched_ks146, aes_sbox(Byte { b: sched_ks159 })), 255)
+    let sched_ks163 = band(bxor(sched_ks147, aes_sbox(Byte { b: sched_ks156 })), 255)
+    let sched_ks164 = band(bxor(sched_ks148, sched_ks160), 255)
+    let sched_ks165 = band(bxor(sched_ks149, sched_ks161), 255)
+    let sched_ks166 = band(bxor(sched_ks150, sched_ks162), 255)
+    let sched_ks167 = band(bxor(sched_ks151, sched_ks163), 255)
+    let sched_ks168 = band(bxor(sched_ks152, sched_ks164), 255)
+    let sched_ks169 = band(bxor(sched_ks153, sched_ks165), 255)
+    let sched_ks170 = band(bxor(sched_ks154, sched_ks166), 255)
+    let sched_ks171 = band(bxor(sched_ks155, sched_ks167), 255)
+    let sched_ks172 = band(bxor(sched_ks156, sched_ks168), 255)
+    let sched_ks173 = band(bxor(sched_ks157, sched_ks169), 255)
+    let sched_ks174 = band(bxor(sched_ks158, sched_ks170), 255)
+    let sched_ks175 = band(bxor(sched_ks159, sched_ks171), 255)
+    let bidx = shr(s.which, 4)
+    let ctrv = bidx + 2
+    let cb12 = band(shr(ctrv, 24), 255)
+    let cb13 = band(shr(ctrv, 16), 255)
+    let cb14 = band(shr(ctrv, 8), 255)
+    let cb15 = band(ctrv, 255)
+    let ks_s0_0 = band(bxor(s.iv0, sched_ks0), 255)
+    let ks_s0_1 = band(bxor(s.iv1, sched_ks1), 255)
+    let ks_s0_2 = band(bxor(s.iv2, sched_ks2), 255)
+    let ks_s0_3 = band(bxor(s.iv3, sched_ks3), 255)
+    let ks_s0_4 = band(bxor(s.iv4, sched_ks4), 255)
+    let ks_s0_5 = band(bxor(s.iv5, sched_ks5), 255)
+    let ks_s0_6 = band(bxor(s.iv6, sched_ks6), 255)
+    let ks_s0_7 = band(bxor(s.iv7, sched_ks7), 255)
+    let ks_s0_8 = band(bxor(s.iv8, sched_ks8), 255)
+    let ks_s0_9 = band(bxor(s.iv9, sched_ks9), 255)
+    let ks_s0_10 = band(bxor(s.iv10, sched_ks10), 255)
+    let ks_s0_11 = band(bxor(s.iv11, sched_ks11), 255)
+    let ks_s0_12 = band(bxor(cb12, sched_ks12), 255)
+    let ks_s0_13 = band(bxor(cb13, sched_ks13), 255)
+    let ks_s0_14 = band(bxor(cb14, sched_ks14), 255)
+    let ks_s0_15 = band(bxor(cb15, sched_ks15), 255)
+    let ks_sub1_0 = aes_sbox(Byte { b: ks_s0_0 })
+    let ks_sub1_1 = aes_sbox(Byte { b: ks_s0_1 })
+    let ks_sub1_2 = aes_sbox(Byte { b: ks_s0_2 })
+    let ks_sub1_3 = aes_sbox(Byte { b: ks_s0_3 })
+    let ks_sub1_4 = aes_sbox(Byte { b: ks_s0_4 })
+    let ks_sub1_5 = aes_sbox(Byte { b: ks_s0_5 })
+    let ks_sub1_6 = aes_sbox(Byte { b: ks_s0_6 })
+    let ks_sub1_7 = aes_sbox(Byte { b: ks_s0_7 })
+    let ks_sub1_8 = aes_sbox(Byte { b: ks_s0_8 })
+    let ks_sub1_9 = aes_sbox(Byte { b: ks_s0_9 })
+    let ks_sub1_10 = aes_sbox(Byte { b: ks_s0_10 })
+    let ks_sub1_11 = aes_sbox(Byte { b: ks_s0_11 })
+    let ks_sub1_12 = aes_sbox(Byte { b: ks_s0_12 })
+    let ks_sub1_13 = aes_sbox(Byte { b: ks_s0_13 })
+    let ks_sub1_14 = aes_sbox(Byte { b: ks_s0_14 })
+    let ks_sub1_15 = aes_sbox(Byte { b: ks_s0_15 })
+    let ks_mix1_0 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: ks_sub1_0 }), xtime(Byte { b: ks_sub1_5 })), ks_sub1_5), ks_sub1_10), ks_sub1_15), 255)
+    let ks_mix1_1 = band(bxor(bxor(bxor(bxor(ks_sub1_0, xtime(Byte { b: ks_sub1_5 })), xtime(Byte { b: ks_sub1_10 })), ks_sub1_10), ks_sub1_15), 255)
+    let ks_mix1_2 = band(bxor(bxor(bxor(bxor(ks_sub1_0, ks_sub1_5), xtime(Byte { b: ks_sub1_10 })), xtime(Byte { b: ks_sub1_15 })), ks_sub1_15), 255)
+    let ks_mix1_3 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: ks_sub1_0 }), ks_sub1_0), ks_sub1_5), ks_sub1_10), xtime(Byte { b: ks_sub1_15 })), 255)
+    let ks_mix1_4 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: ks_sub1_4 }), xtime(Byte { b: ks_sub1_9 })), ks_sub1_9), ks_sub1_14), ks_sub1_3), 255)
+    let ks_mix1_5 = band(bxor(bxor(bxor(bxor(ks_sub1_4, xtime(Byte { b: ks_sub1_9 })), xtime(Byte { b: ks_sub1_14 })), ks_sub1_14), ks_sub1_3), 255)
+    let ks_mix1_6 = band(bxor(bxor(bxor(bxor(ks_sub1_4, ks_sub1_9), xtime(Byte { b: ks_sub1_14 })), xtime(Byte { b: ks_sub1_3 })), ks_sub1_3), 255)
+    let ks_mix1_7 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: ks_sub1_4 }), ks_sub1_4), ks_sub1_9), ks_sub1_14), xtime(Byte { b: ks_sub1_3 })), 255)
+    let ks_mix1_8 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: ks_sub1_8 }), xtime(Byte { b: ks_sub1_13 })), ks_sub1_13), ks_sub1_2), ks_sub1_7), 255)
+    let ks_mix1_9 = band(bxor(bxor(bxor(bxor(ks_sub1_8, xtime(Byte { b: ks_sub1_13 })), xtime(Byte { b: ks_sub1_2 })), ks_sub1_2), ks_sub1_7), 255)
+    let ks_mix1_10 = band(bxor(bxor(bxor(bxor(ks_sub1_8, ks_sub1_13), xtime(Byte { b: ks_sub1_2 })), xtime(Byte { b: ks_sub1_7 })), ks_sub1_7), 255)
+    let ks_mix1_11 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: ks_sub1_8 }), ks_sub1_8), ks_sub1_13), ks_sub1_2), xtime(Byte { b: ks_sub1_7 })), 255)
+    let ks_mix1_12 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: ks_sub1_12 }), xtime(Byte { b: ks_sub1_1 })), ks_sub1_1), ks_sub1_6), ks_sub1_11), 255)
+    let ks_mix1_13 = band(bxor(bxor(bxor(bxor(ks_sub1_12, xtime(Byte { b: ks_sub1_1 })), xtime(Byte { b: ks_sub1_6 })), ks_sub1_6), ks_sub1_11), 255)
+    let ks_mix1_14 = band(bxor(bxor(bxor(bxor(ks_sub1_12, ks_sub1_1), xtime(Byte { b: ks_sub1_6 })), xtime(Byte { b: ks_sub1_11 })), ks_sub1_11), 255)
+    let ks_mix1_15 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: ks_sub1_12 }), ks_sub1_12), ks_sub1_1), ks_sub1_6), xtime(Byte { b: ks_sub1_11 })), 255)
+    let ks_s1_0 = band(bxor(ks_mix1_0, sched_ks16), 255)
+    let ks_s1_1 = band(bxor(ks_mix1_1, sched_ks17), 255)
+    let ks_s1_2 = band(bxor(ks_mix1_2, sched_ks18), 255)
+    let ks_s1_3 = band(bxor(ks_mix1_3, sched_ks19), 255)
+    let ks_s1_4 = band(bxor(ks_mix1_4, sched_ks20), 255)
+    let ks_s1_5 = band(bxor(ks_mix1_5, sched_ks21), 255)
+    let ks_s1_6 = band(bxor(ks_mix1_6, sched_ks22), 255)
+    let ks_s1_7 = band(bxor(ks_mix1_7, sched_ks23), 255)
+    let ks_s1_8 = band(bxor(ks_mix1_8, sched_ks24), 255)
+    let ks_s1_9 = band(bxor(ks_mix1_9, sched_ks25), 255)
+    let ks_s1_10 = band(bxor(ks_mix1_10, sched_ks26), 255)
+    let ks_s1_11 = band(bxor(ks_mix1_11, sched_ks27), 255)
+    let ks_s1_12 = band(bxor(ks_mix1_12, sched_ks28), 255)
+    let ks_s1_13 = band(bxor(ks_mix1_13, sched_ks29), 255)
+    let ks_s1_14 = band(bxor(ks_mix1_14, sched_ks30), 255)
+    let ks_s1_15 = band(bxor(ks_mix1_15, sched_ks31), 255)
+    let ks_sub2_0 = aes_sbox(Byte { b: ks_s1_0 })
+    let ks_sub2_1 = aes_sbox(Byte { b: ks_s1_1 })
+    let ks_sub2_2 = aes_sbox(Byte { b: ks_s1_2 })
+    let ks_sub2_3 = aes_sbox(Byte { b: ks_s1_3 })
+    let ks_sub2_4 = aes_sbox(Byte { b: ks_s1_4 })
+    let ks_sub2_5 = aes_sbox(Byte { b: ks_s1_5 })
+    let ks_sub2_6 = aes_sbox(Byte { b: ks_s1_6 })
+    let ks_sub2_7 = aes_sbox(Byte { b: ks_s1_7 })
+    let ks_sub2_8 = aes_sbox(Byte { b: ks_s1_8 })
+    let ks_sub2_9 = aes_sbox(Byte { b: ks_s1_9 })
+    let ks_sub2_10 = aes_sbox(Byte { b: ks_s1_10 })
+    let ks_sub2_11 = aes_sbox(Byte { b: ks_s1_11 })
+    let ks_sub2_12 = aes_sbox(Byte { b: ks_s1_12 })
+    let ks_sub2_13 = aes_sbox(Byte { b: ks_s1_13 })
+    let ks_sub2_14 = aes_sbox(Byte { b: ks_s1_14 })
+    let ks_sub2_15 = aes_sbox(Byte { b: ks_s1_15 })
+    let ks_mix2_0 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: ks_sub2_0 }), xtime(Byte { b: ks_sub2_5 })), ks_sub2_5), ks_sub2_10), ks_sub2_15), 255)
+    let ks_mix2_1 = band(bxor(bxor(bxor(bxor(ks_sub2_0, xtime(Byte { b: ks_sub2_5 })), xtime(Byte { b: ks_sub2_10 })), ks_sub2_10), ks_sub2_15), 255)
+    let ks_mix2_2 = band(bxor(bxor(bxor(bxor(ks_sub2_0, ks_sub2_5), xtime(Byte { b: ks_sub2_10 })), xtime(Byte { b: ks_sub2_15 })), ks_sub2_15), 255)
+    let ks_mix2_3 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: ks_sub2_0 }), ks_sub2_0), ks_sub2_5), ks_sub2_10), xtime(Byte { b: ks_sub2_15 })), 255)
+    let ks_mix2_4 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: ks_sub2_4 }), xtime(Byte { b: ks_sub2_9 })), ks_sub2_9), ks_sub2_14), ks_sub2_3), 255)
+    let ks_mix2_5 = band(bxor(bxor(bxor(bxor(ks_sub2_4, xtime(Byte { b: ks_sub2_9 })), xtime(Byte { b: ks_sub2_14 })), ks_sub2_14), ks_sub2_3), 255)
+    let ks_mix2_6 = band(bxor(bxor(bxor(bxor(ks_sub2_4, ks_sub2_9), xtime(Byte { b: ks_sub2_14 })), xtime(Byte { b: ks_sub2_3 })), ks_sub2_3), 255)
+    let ks_mix2_7 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: ks_sub2_4 }), ks_sub2_4), ks_sub2_9), ks_sub2_14), xtime(Byte { b: ks_sub2_3 })), 255)
+    let ks_mix2_8 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: ks_sub2_8 }), xtime(Byte { b: ks_sub2_13 })), ks_sub2_13), ks_sub2_2), ks_sub2_7), 255)
+    let ks_mix2_9 = band(bxor(bxor(bxor(bxor(ks_sub2_8, xtime(Byte { b: ks_sub2_13 })), xtime(Byte { b: ks_sub2_2 })), ks_sub2_2), ks_sub2_7), 255)
+    let ks_mix2_10 = band(bxor(bxor(bxor(bxor(ks_sub2_8, ks_sub2_13), xtime(Byte { b: ks_sub2_2 })), xtime(Byte { b: ks_sub2_7 })), ks_sub2_7), 255)
+    let ks_mix2_11 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: ks_sub2_8 }), ks_sub2_8), ks_sub2_13), ks_sub2_2), xtime(Byte { b: ks_sub2_7 })), 255)
+    let ks_mix2_12 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: ks_sub2_12 }), xtime(Byte { b: ks_sub2_1 })), ks_sub2_1), ks_sub2_6), ks_sub2_11), 255)
+    let ks_mix2_13 = band(bxor(bxor(bxor(bxor(ks_sub2_12, xtime(Byte { b: ks_sub2_1 })), xtime(Byte { b: ks_sub2_6 })), ks_sub2_6), ks_sub2_11), 255)
+    let ks_mix2_14 = band(bxor(bxor(bxor(bxor(ks_sub2_12, ks_sub2_1), xtime(Byte { b: ks_sub2_6 })), xtime(Byte { b: ks_sub2_11 })), ks_sub2_11), 255)
+    let ks_mix2_15 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: ks_sub2_12 }), ks_sub2_12), ks_sub2_1), ks_sub2_6), xtime(Byte { b: ks_sub2_11 })), 255)
+    let ks_s2_0 = band(bxor(ks_mix2_0, sched_ks32), 255)
+    let ks_s2_1 = band(bxor(ks_mix2_1, sched_ks33), 255)
+    let ks_s2_2 = band(bxor(ks_mix2_2, sched_ks34), 255)
+    let ks_s2_3 = band(bxor(ks_mix2_3, sched_ks35), 255)
+    let ks_s2_4 = band(bxor(ks_mix2_4, sched_ks36), 255)
+    let ks_s2_5 = band(bxor(ks_mix2_5, sched_ks37), 255)
+    let ks_s2_6 = band(bxor(ks_mix2_6, sched_ks38), 255)
+    let ks_s2_7 = band(bxor(ks_mix2_7, sched_ks39), 255)
+    let ks_s2_8 = band(bxor(ks_mix2_8, sched_ks40), 255)
+    let ks_s2_9 = band(bxor(ks_mix2_9, sched_ks41), 255)
+    let ks_s2_10 = band(bxor(ks_mix2_10, sched_ks42), 255)
+    let ks_s2_11 = band(bxor(ks_mix2_11, sched_ks43), 255)
+    let ks_s2_12 = band(bxor(ks_mix2_12, sched_ks44), 255)
+    let ks_s2_13 = band(bxor(ks_mix2_13, sched_ks45), 255)
+    let ks_s2_14 = band(bxor(ks_mix2_14, sched_ks46), 255)
+    let ks_s2_15 = band(bxor(ks_mix2_15, sched_ks47), 255)
+    let ks_sub3_0 = aes_sbox(Byte { b: ks_s2_0 })
+    let ks_sub3_1 = aes_sbox(Byte { b: ks_s2_1 })
+    let ks_sub3_2 = aes_sbox(Byte { b: ks_s2_2 })
+    let ks_sub3_3 = aes_sbox(Byte { b: ks_s2_3 })
+    let ks_sub3_4 = aes_sbox(Byte { b: ks_s2_4 })
+    let ks_sub3_5 = aes_sbox(Byte { b: ks_s2_5 })
+    let ks_sub3_6 = aes_sbox(Byte { b: ks_s2_6 })
+    let ks_sub3_7 = aes_sbox(Byte { b: ks_s2_7 })
+    let ks_sub3_8 = aes_sbox(Byte { b: ks_s2_8 })
+    let ks_sub3_9 = aes_sbox(Byte { b: ks_s2_9 })
+    let ks_sub3_10 = aes_sbox(Byte { b: ks_s2_10 })
+    let ks_sub3_11 = aes_sbox(Byte { b: ks_s2_11 })
+    let ks_sub3_12 = aes_sbox(Byte { b: ks_s2_12 })
+    let ks_sub3_13 = aes_sbox(Byte { b: ks_s2_13 })
+    let ks_sub3_14 = aes_sbox(Byte { b: ks_s2_14 })
+    let ks_sub3_15 = aes_sbox(Byte { b: ks_s2_15 })
+    let ks_mix3_0 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: ks_sub3_0 }), xtime(Byte { b: ks_sub3_5 })), ks_sub3_5), ks_sub3_10), ks_sub3_15), 255)
+    let ks_mix3_1 = band(bxor(bxor(bxor(bxor(ks_sub3_0, xtime(Byte { b: ks_sub3_5 })), xtime(Byte { b: ks_sub3_10 })), ks_sub3_10), ks_sub3_15), 255)
+    let ks_mix3_2 = band(bxor(bxor(bxor(bxor(ks_sub3_0, ks_sub3_5), xtime(Byte { b: ks_sub3_10 })), xtime(Byte { b: ks_sub3_15 })), ks_sub3_15), 255)
+    let ks_mix3_3 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: ks_sub3_0 }), ks_sub3_0), ks_sub3_5), ks_sub3_10), xtime(Byte { b: ks_sub3_15 })), 255)
+    let ks_mix3_4 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: ks_sub3_4 }), xtime(Byte { b: ks_sub3_9 })), ks_sub3_9), ks_sub3_14), ks_sub3_3), 255)
+    let ks_mix3_5 = band(bxor(bxor(bxor(bxor(ks_sub3_4, xtime(Byte { b: ks_sub3_9 })), xtime(Byte { b: ks_sub3_14 })), ks_sub3_14), ks_sub3_3), 255)
+    let ks_mix3_6 = band(bxor(bxor(bxor(bxor(ks_sub3_4, ks_sub3_9), xtime(Byte { b: ks_sub3_14 })), xtime(Byte { b: ks_sub3_3 })), ks_sub3_3), 255)
+    let ks_mix3_7 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: ks_sub3_4 }), ks_sub3_4), ks_sub3_9), ks_sub3_14), xtime(Byte { b: ks_sub3_3 })), 255)
+    let ks_mix3_8 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: ks_sub3_8 }), xtime(Byte { b: ks_sub3_13 })), ks_sub3_13), ks_sub3_2), ks_sub3_7), 255)
+    let ks_mix3_9 = band(bxor(bxor(bxor(bxor(ks_sub3_8, xtime(Byte { b: ks_sub3_13 })), xtime(Byte { b: ks_sub3_2 })), ks_sub3_2), ks_sub3_7), 255)
+    let ks_mix3_10 = band(bxor(bxor(bxor(bxor(ks_sub3_8, ks_sub3_13), xtime(Byte { b: ks_sub3_2 })), xtime(Byte { b: ks_sub3_7 })), ks_sub3_7), 255)
+    let ks_mix3_11 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: ks_sub3_8 }), ks_sub3_8), ks_sub3_13), ks_sub3_2), xtime(Byte { b: ks_sub3_7 })), 255)
+    let ks_mix3_12 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: ks_sub3_12 }), xtime(Byte { b: ks_sub3_1 })), ks_sub3_1), ks_sub3_6), ks_sub3_11), 255)
+    let ks_mix3_13 = band(bxor(bxor(bxor(bxor(ks_sub3_12, xtime(Byte { b: ks_sub3_1 })), xtime(Byte { b: ks_sub3_6 })), ks_sub3_6), ks_sub3_11), 255)
+    let ks_mix3_14 = band(bxor(bxor(bxor(bxor(ks_sub3_12, ks_sub3_1), xtime(Byte { b: ks_sub3_6 })), xtime(Byte { b: ks_sub3_11 })), ks_sub3_11), 255)
+    let ks_mix3_15 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: ks_sub3_12 }), ks_sub3_12), ks_sub3_1), ks_sub3_6), xtime(Byte { b: ks_sub3_11 })), 255)
+    let ks_s3_0 = band(bxor(ks_mix3_0, sched_ks48), 255)
+    let ks_s3_1 = band(bxor(ks_mix3_1, sched_ks49), 255)
+    let ks_s3_2 = band(bxor(ks_mix3_2, sched_ks50), 255)
+    let ks_s3_3 = band(bxor(ks_mix3_3, sched_ks51), 255)
+    let ks_s3_4 = band(bxor(ks_mix3_4, sched_ks52), 255)
+    let ks_s3_5 = band(bxor(ks_mix3_5, sched_ks53), 255)
+    let ks_s3_6 = band(bxor(ks_mix3_6, sched_ks54), 255)
+    let ks_s3_7 = band(bxor(ks_mix3_7, sched_ks55), 255)
+    let ks_s3_8 = band(bxor(ks_mix3_8, sched_ks56), 255)
+    let ks_s3_9 = band(bxor(ks_mix3_9, sched_ks57), 255)
+    let ks_s3_10 = band(bxor(ks_mix3_10, sched_ks58), 255)
+    let ks_s3_11 = band(bxor(ks_mix3_11, sched_ks59), 255)
+    let ks_s3_12 = band(bxor(ks_mix3_12, sched_ks60), 255)
+    let ks_s3_13 = band(bxor(ks_mix3_13, sched_ks61), 255)
+    let ks_s3_14 = band(bxor(ks_mix3_14, sched_ks62), 255)
+    let ks_s3_15 = band(bxor(ks_mix3_15, sched_ks63), 255)
+    let ks_sub4_0 = aes_sbox(Byte { b: ks_s3_0 })
+    let ks_sub4_1 = aes_sbox(Byte { b: ks_s3_1 })
+    let ks_sub4_2 = aes_sbox(Byte { b: ks_s3_2 })
+    let ks_sub4_3 = aes_sbox(Byte { b: ks_s3_3 })
+    let ks_sub4_4 = aes_sbox(Byte { b: ks_s3_4 })
+    let ks_sub4_5 = aes_sbox(Byte { b: ks_s3_5 })
+    let ks_sub4_6 = aes_sbox(Byte { b: ks_s3_6 })
+    let ks_sub4_7 = aes_sbox(Byte { b: ks_s3_7 })
+    let ks_sub4_8 = aes_sbox(Byte { b: ks_s3_8 })
+    let ks_sub4_9 = aes_sbox(Byte { b: ks_s3_9 })
+    let ks_sub4_10 = aes_sbox(Byte { b: ks_s3_10 })
+    let ks_sub4_11 = aes_sbox(Byte { b: ks_s3_11 })
+    let ks_sub4_12 = aes_sbox(Byte { b: ks_s3_12 })
+    let ks_sub4_13 = aes_sbox(Byte { b: ks_s3_13 })
+    let ks_sub4_14 = aes_sbox(Byte { b: ks_s3_14 })
+    let ks_sub4_15 = aes_sbox(Byte { b: ks_s3_15 })
+    let ks_mix4_0 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: ks_sub4_0 }), xtime(Byte { b: ks_sub4_5 })), ks_sub4_5), ks_sub4_10), ks_sub4_15), 255)
+    let ks_mix4_1 = band(bxor(bxor(bxor(bxor(ks_sub4_0, xtime(Byte { b: ks_sub4_5 })), xtime(Byte { b: ks_sub4_10 })), ks_sub4_10), ks_sub4_15), 255)
+    let ks_mix4_2 = band(bxor(bxor(bxor(bxor(ks_sub4_0, ks_sub4_5), xtime(Byte { b: ks_sub4_10 })), xtime(Byte { b: ks_sub4_15 })), ks_sub4_15), 255)
+    let ks_mix4_3 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: ks_sub4_0 }), ks_sub4_0), ks_sub4_5), ks_sub4_10), xtime(Byte { b: ks_sub4_15 })), 255)
+    let ks_mix4_4 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: ks_sub4_4 }), xtime(Byte { b: ks_sub4_9 })), ks_sub4_9), ks_sub4_14), ks_sub4_3), 255)
+    let ks_mix4_5 = band(bxor(bxor(bxor(bxor(ks_sub4_4, xtime(Byte { b: ks_sub4_9 })), xtime(Byte { b: ks_sub4_14 })), ks_sub4_14), ks_sub4_3), 255)
+    let ks_mix4_6 = band(bxor(bxor(bxor(bxor(ks_sub4_4, ks_sub4_9), xtime(Byte { b: ks_sub4_14 })), xtime(Byte { b: ks_sub4_3 })), ks_sub4_3), 255)
+    let ks_mix4_7 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: ks_sub4_4 }), ks_sub4_4), ks_sub4_9), ks_sub4_14), xtime(Byte { b: ks_sub4_3 })), 255)
+    let ks_mix4_8 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: ks_sub4_8 }), xtime(Byte { b: ks_sub4_13 })), ks_sub4_13), ks_sub4_2), ks_sub4_7), 255)
+    let ks_mix4_9 = band(bxor(bxor(bxor(bxor(ks_sub4_8, xtime(Byte { b: ks_sub4_13 })), xtime(Byte { b: ks_sub4_2 })), ks_sub4_2), ks_sub4_7), 255)
+    let ks_mix4_10 = band(bxor(bxor(bxor(bxor(ks_sub4_8, ks_sub4_13), xtime(Byte { b: ks_sub4_2 })), xtime(Byte { b: ks_sub4_7 })), ks_sub4_7), 255)
+    let ks_mix4_11 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: ks_sub4_8 }), ks_sub4_8), ks_sub4_13), ks_sub4_2), xtime(Byte { b: ks_sub4_7 })), 255)
+    let ks_mix4_12 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: ks_sub4_12 }), xtime(Byte { b: ks_sub4_1 })), ks_sub4_1), ks_sub4_6), ks_sub4_11), 255)
+    let ks_mix4_13 = band(bxor(bxor(bxor(bxor(ks_sub4_12, xtime(Byte { b: ks_sub4_1 })), xtime(Byte { b: ks_sub4_6 })), ks_sub4_6), ks_sub4_11), 255)
+    let ks_mix4_14 = band(bxor(bxor(bxor(bxor(ks_sub4_12, ks_sub4_1), xtime(Byte { b: ks_sub4_6 })), xtime(Byte { b: ks_sub4_11 })), ks_sub4_11), 255)
+    let ks_mix4_15 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: ks_sub4_12 }), ks_sub4_12), ks_sub4_1), ks_sub4_6), xtime(Byte { b: ks_sub4_11 })), 255)
+    let ks_s4_0 = band(bxor(ks_mix4_0, sched_ks64), 255)
+    let ks_s4_1 = band(bxor(ks_mix4_1, sched_ks65), 255)
+    let ks_s4_2 = band(bxor(ks_mix4_2, sched_ks66), 255)
+    let ks_s4_3 = band(bxor(ks_mix4_3, sched_ks67), 255)
+    let ks_s4_4 = band(bxor(ks_mix4_4, sched_ks68), 255)
+    let ks_s4_5 = band(bxor(ks_mix4_5, sched_ks69), 255)
+    let ks_s4_6 = band(bxor(ks_mix4_6, sched_ks70), 255)
+    let ks_s4_7 = band(bxor(ks_mix4_7, sched_ks71), 255)
+    let ks_s4_8 = band(bxor(ks_mix4_8, sched_ks72), 255)
+    let ks_s4_9 = band(bxor(ks_mix4_9, sched_ks73), 255)
+    let ks_s4_10 = band(bxor(ks_mix4_10, sched_ks74), 255)
+    let ks_s4_11 = band(bxor(ks_mix4_11, sched_ks75), 255)
+    let ks_s4_12 = band(bxor(ks_mix4_12, sched_ks76), 255)
+    let ks_s4_13 = band(bxor(ks_mix4_13, sched_ks77), 255)
+    let ks_s4_14 = band(bxor(ks_mix4_14, sched_ks78), 255)
+    let ks_s4_15 = band(bxor(ks_mix4_15, sched_ks79), 255)
+    let ks_sub5_0 = aes_sbox(Byte { b: ks_s4_0 })
+    let ks_sub5_1 = aes_sbox(Byte { b: ks_s4_1 })
+    let ks_sub5_2 = aes_sbox(Byte { b: ks_s4_2 })
+    let ks_sub5_3 = aes_sbox(Byte { b: ks_s4_3 })
+    let ks_sub5_4 = aes_sbox(Byte { b: ks_s4_4 })
+    let ks_sub5_5 = aes_sbox(Byte { b: ks_s4_5 })
+    let ks_sub5_6 = aes_sbox(Byte { b: ks_s4_6 })
+    let ks_sub5_7 = aes_sbox(Byte { b: ks_s4_7 })
+    let ks_sub5_8 = aes_sbox(Byte { b: ks_s4_8 })
+    let ks_sub5_9 = aes_sbox(Byte { b: ks_s4_9 })
+    let ks_sub5_10 = aes_sbox(Byte { b: ks_s4_10 })
+    let ks_sub5_11 = aes_sbox(Byte { b: ks_s4_11 })
+    let ks_sub5_12 = aes_sbox(Byte { b: ks_s4_12 })
+    let ks_sub5_13 = aes_sbox(Byte { b: ks_s4_13 })
+    let ks_sub5_14 = aes_sbox(Byte { b: ks_s4_14 })
+    let ks_sub5_15 = aes_sbox(Byte { b: ks_s4_15 })
+    let ks_mix5_0 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: ks_sub5_0 }), xtime(Byte { b: ks_sub5_5 })), ks_sub5_5), ks_sub5_10), ks_sub5_15), 255)
+    let ks_mix5_1 = band(bxor(bxor(bxor(bxor(ks_sub5_0, xtime(Byte { b: ks_sub5_5 })), xtime(Byte { b: ks_sub5_10 })), ks_sub5_10), ks_sub5_15), 255)
+    let ks_mix5_2 = band(bxor(bxor(bxor(bxor(ks_sub5_0, ks_sub5_5), xtime(Byte { b: ks_sub5_10 })), xtime(Byte { b: ks_sub5_15 })), ks_sub5_15), 255)
+    let ks_mix5_3 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: ks_sub5_0 }), ks_sub5_0), ks_sub5_5), ks_sub5_10), xtime(Byte { b: ks_sub5_15 })), 255)
+    let ks_mix5_4 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: ks_sub5_4 }), xtime(Byte { b: ks_sub5_9 })), ks_sub5_9), ks_sub5_14), ks_sub5_3), 255)
+    let ks_mix5_5 = band(bxor(bxor(bxor(bxor(ks_sub5_4, xtime(Byte { b: ks_sub5_9 })), xtime(Byte { b: ks_sub5_14 })), ks_sub5_14), ks_sub5_3), 255)
+    let ks_mix5_6 = band(bxor(bxor(bxor(bxor(ks_sub5_4, ks_sub5_9), xtime(Byte { b: ks_sub5_14 })), xtime(Byte { b: ks_sub5_3 })), ks_sub5_3), 255)
+    let ks_mix5_7 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: ks_sub5_4 }), ks_sub5_4), ks_sub5_9), ks_sub5_14), xtime(Byte { b: ks_sub5_3 })), 255)
+    let ks_mix5_8 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: ks_sub5_8 }), xtime(Byte { b: ks_sub5_13 })), ks_sub5_13), ks_sub5_2), ks_sub5_7), 255)
+    let ks_mix5_9 = band(bxor(bxor(bxor(bxor(ks_sub5_8, xtime(Byte { b: ks_sub5_13 })), xtime(Byte { b: ks_sub5_2 })), ks_sub5_2), ks_sub5_7), 255)
+    let ks_mix5_10 = band(bxor(bxor(bxor(bxor(ks_sub5_8, ks_sub5_13), xtime(Byte { b: ks_sub5_2 })), xtime(Byte { b: ks_sub5_7 })), ks_sub5_7), 255)
+    let ks_mix5_11 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: ks_sub5_8 }), ks_sub5_8), ks_sub5_13), ks_sub5_2), xtime(Byte { b: ks_sub5_7 })), 255)
+    let ks_mix5_12 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: ks_sub5_12 }), xtime(Byte { b: ks_sub5_1 })), ks_sub5_1), ks_sub5_6), ks_sub5_11), 255)
+    let ks_mix5_13 = band(bxor(bxor(bxor(bxor(ks_sub5_12, xtime(Byte { b: ks_sub5_1 })), xtime(Byte { b: ks_sub5_6 })), ks_sub5_6), ks_sub5_11), 255)
+    let ks_mix5_14 = band(bxor(bxor(bxor(bxor(ks_sub5_12, ks_sub5_1), xtime(Byte { b: ks_sub5_6 })), xtime(Byte { b: ks_sub5_11 })), ks_sub5_11), 255)
+    let ks_mix5_15 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: ks_sub5_12 }), ks_sub5_12), ks_sub5_1), ks_sub5_6), xtime(Byte { b: ks_sub5_11 })), 255)
+    let ks_s5_0 = band(bxor(ks_mix5_0, sched_ks80), 255)
+    let ks_s5_1 = band(bxor(ks_mix5_1, sched_ks81), 255)
+    let ks_s5_2 = band(bxor(ks_mix5_2, sched_ks82), 255)
+    let ks_s5_3 = band(bxor(ks_mix5_3, sched_ks83), 255)
+    let ks_s5_4 = band(bxor(ks_mix5_4, sched_ks84), 255)
+    let ks_s5_5 = band(bxor(ks_mix5_5, sched_ks85), 255)
+    let ks_s5_6 = band(bxor(ks_mix5_6, sched_ks86), 255)
+    let ks_s5_7 = band(bxor(ks_mix5_7, sched_ks87), 255)
+    let ks_s5_8 = band(bxor(ks_mix5_8, sched_ks88), 255)
+    let ks_s5_9 = band(bxor(ks_mix5_9, sched_ks89), 255)
+    let ks_s5_10 = band(bxor(ks_mix5_10, sched_ks90), 255)
+    let ks_s5_11 = band(bxor(ks_mix5_11, sched_ks91), 255)
+    let ks_s5_12 = band(bxor(ks_mix5_12, sched_ks92), 255)
+    let ks_s5_13 = band(bxor(ks_mix5_13, sched_ks93), 255)
+    let ks_s5_14 = band(bxor(ks_mix5_14, sched_ks94), 255)
+    let ks_s5_15 = band(bxor(ks_mix5_15, sched_ks95), 255)
+    let ks_sub6_0 = aes_sbox(Byte { b: ks_s5_0 })
+    let ks_sub6_1 = aes_sbox(Byte { b: ks_s5_1 })
+    let ks_sub6_2 = aes_sbox(Byte { b: ks_s5_2 })
+    let ks_sub6_3 = aes_sbox(Byte { b: ks_s5_3 })
+    let ks_sub6_4 = aes_sbox(Byte { b: ks_s5_4 })
+    let ks_sub6_5 = aes_sbox(Byte { b: ks_s5_5 })
+    let ks_sub6_6 = aes_sbox(Byte { b: ks_s5_6 })
+    let ks_sub6_7 = aes_sbox(Byte { b: ks_s5_7 })
+    let ks_sub6_8 = aes_sbox(Byte { b: ks_s5_8 })
+    let ks_sub6_9 = aes_sbox(Byte { b: ks_s5_9 })
+    let ks_sub6_10 = aes_sbox(Byte { b: ks_s5_10 })
+    let ks_sub6_11 = aes_sbox(Byte { b: ks_s5_11 })
+    let ks_sub6_12 = aes_sbox(Byte { b: ks_s5_12 })
+    let ks_sub6_13 = aes_sbox(Byte { b: ks_s5_13 })
+    let ks_sub6_14 = aes_sbox(Byte { b: ks_s5_14 })
+    let ks_sub6_15 = aes_sbox(Byte { b: ks_s5_15 })
+    let ks_mix6_0 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: ks_sub6_0 }), xtime(Byte { b: ks_sub6_5 })), ks_sub6_5), ks_sub6_10), ks_sub6_15), 255)
+    let ks_mix6_1 = band(bxor(bxor(bxor(bxor(ks_sub6_0, xtime(Byte { b: ks_sub6_5 })), xtime(Byte { b: ks_sub6_10 })), ks_sub6_10), ks_sub6_15), 255)
+    let ks_mix6_2 = band(bxor(bxor(bxor(bxor(ks_sub6_0, ks_sub6_5), xtime(Byte { b: ks_sub6_10 })), xtime(Byte { b: ks_sub6_15 })), ks_sub6_15), 255)
+    let ks_mix6_3 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: ks_sub6_0 }), ks_sub6_0), ks_sub6_5), ks_sub6_10), xtime(Byte { b: ks_sub6_15 })), 255)
+    let ks_mix6_4 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: ks_sub6_4 }), xtime(Byte { b: ks_sub6_9 })), ks_sub6_9), ks_sub6_14), ks_sub6_3), 255)
+    let ks_mix6_5 = band(bxor(bxor(bxor(bxor(ks_sub6_4, xtime(Byte { b: ks_sub6_9 })), xtime(Byte { b: ks_sub6_14 })), ks_sub6_14), ks_sub6_3), 255)
+    let ks_mix6_6 = band(bxor(bxor(bxor(bxor(ks_sub6_4, ks_sub6_9), xtime(Byte { b: ks_sub6_14 })), xtime(Byte { b: ks_sub6_3 })), ks_sub6_3), 255)
+    let ks_mix6_7 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: ks_sub6_4 }), ks_sub6_4), ks_sub6_9), ks_sub6_14), xtime(Byte { b: ks_sub6_3 })), 255)
+    let ks_mix6_8 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: ks_sub6_8 }), xtime(Byte { b: ks_sub6_13 })), ks_sub6_13), ks_sub6_2), ks_sub6_7), 255)
+    let ks_mix6_9 = band(bxor(bxor(bxor(bxor(ks_sub6_8, xtime(Byte { b: ks_sub6_13 })), xtime(Byte { b: ks_sub6_2 })), ks_sub6_2), ks_sub6_7), 255)
+    let ks_mix6_10 = band(bxor(bxor(bxor(bxor(ks_sub6_8, ks_sub6_13), xtime(Byte { b: ks_sub6_2 })), xtime(Byte { b: ks_sub6_7 })), ks_sub6_7), 255)
+    let ks_mix6_11 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: ks_sub6_8 }), ks_sub6_8), ks_sub6_13), ks_sub6_2), xtime(Byte { b: ks_sub6_7 })), 255)
+    let ks_mix6_12 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: ks_sub6_12 }), xtime(Byte { b: ks_sub6_1 })), ks_sub6_1), ks_sub6_6), ks_sub6_11), 255)
+    let ks_mix6_13 = band(bxor(bxor(bxor(bxor(ks_sub6_12, xtime(Byte { b: ks_sub6_1 })), xtime(Byte { b: ks_sub6_6 })), ks_sub6_6), ks_sub6_11), 255)
+    let ks_mix6_14 = band(bxor(bxor(bxor(bxor(ks_sub6_12, ks_sub6_1), xtime(Byte { b: ks_sub6_6 })), xtime(Byte { b: ks_sub6_11 })), ks_sub6_11), 255)
+    let ks_mix6_15 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: ks_sub6_12 }), ks_sub6_12), ks_sub6_1), ks_sub6_6), xtime(Byte { b: ks_sub6_11 })), 255)
+    let ks_s6_0 = band(bxor(ks_mix6_0, sched_ks96), 255)
+    let ks_s6_1 = band(bxor(ks_mix6_1, sched_ks97), 255)
+    let ks_s6_2 = band(bxor(ks_mix6_2, sched_ks98), 255)
+    let ks_s6_3 = band(bxor(ks_mix6_3, sched_ks99), 255)
+    let ks_s6_4 = band(bxor(ks_mix6_4, sched_ks100), 255)
+    let ks_s6_5 = band(bxor(ks_mix6_5, sched_ks101), 255)
+    let ks_s6_6 = band(bxor(ks_mix6_6, sched_ks102), 255)
+    let ks_s6_7 = band(bxor(ks_mix6_7, sched_ks103), 255)
+    let ks_s6_8 = band(bxor(ks_mix6_8, sched_ks104), 255)
+    let ks_s6_9 = band(bxor(ks_mix6_9, sched_ks105), 255)
+    let ks_s6_10 = band(bxor(ks_mix6_10, sched_ks106), 255)
+    let ks_s6_11 = band(bxor(ks_mix6_11, sched_ks107), 255)
+    let ks_s6_12 = band(bxor(ks_mix6_12, sched_ks108), 255)
+    let ks_s6_13 = band(bxor(ks_mix6_13, sched_ks109), 255)
+    let ks_s6_14 = band(bxor(ks_mix6_14, sched_ks110), 255)
+    let ks_s6_15 = band(bxor(ks_mix6_15, sched_ks111), 255)
+    let ks_sub7_0 = aes_sbox(Byte { b: ks_s6_0 })
+    let ks_sub7_1 = aes_sbox(Byte { b: ks_s6_1 })
+    let ks_sub7_2 = aes_sbox(Byte { b: ks_s6_2 })
+    let ks_sub7_3 = aes_sbox(Byte { b: ks_s6_3 })
+    let ks_sub7_4 = aes_sbox(Byte { b: ks_s6_4 })
+    let ks_sub7_5 = aes_sbox(Byte { b: ks_s6_5 })
+    let ks_sub7_6 = aes_sbox(Byte { b: ks_s6_6 })
+    let ks_sub7_7 = aes_sbox(Byte { b: ks_s6_7 })
+    let ks_sub7_8 = aes_sbox(Byte { b: ks_s6_8 })
+    let ks_sub7_9 = aes_sbox(Byte { b: ks_s6_9 })
+    let ks_sub7_10 = aes_sbox(Byte { b: ks_s6_10 })
+    let ks_sub7_11 = aes_sbox(Byte { b: ks_s6_11 })
+    let ks_sub7_12 = aes_sbox(Byte { b: ks_s6_12 })
+    let ks_sub7_13 = aes_sbox(Byte { b: ks_s6_13 })
+    let ks_sub7_14 = aes_sbox(Byte { b: ks_s6_14 })
+    let ks_sub7_15 = aes_sbox(Byte { b: ks_s6_15 })
+    let ks_mix7_0 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: ks_sub7_0 }), xtime(Byte { b: ks_sub7_5 })), ks_sub7_5), ks_sub7_10), ks_sub7_15), 255)
+    let ks_mix7_1 = band(bxor(bxor(bxor(bxor(ks_sub7_0, xtime(Byte { b: ks_sub7_5 })), xtime(Byte { b: ks_sub7_10 })), ks_sub7_10), ks_sub7_15), 255)
+    let ks_mix7_2 = band(bxor(bxor(bxor(bxor(ks_sub7_0, ks_sub7_5), xtime(Byte { b: ks_sub7_10 })), xtime(Byte { b: ks_sub7_15 })), ks_sub7_15), 255)
+    let ks_mix7_3 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: ks_sub7_0 }), ks_sub7_0), ks_sub7_5), ks_sub7_10), xtime(Byte { b: ks_sub7_15 })), 255)
+    let ks_mix7_4 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: ks_sub7_4 }), xtime(Byte { b: ks_sub7_9 })), ks_sub7_9), ks_sub7_14), ks_sub7_3), 255)
+    let ks_mix7_5 = band(bxor(bxor(bxor(bxor(ks_sub7_4, xtime(Byte { b: ks_sub7_9 })), xtime(Byte { b: ks_sub7_14 })), ks_sub7_14), ks_sub7_3), 255)
+    let ks_mix7_6 = band(bxor(bxor(bxor(bxor(ks_sub7_4, ks_sub7_9), xtime(Byte { b: ks_sub7_14 })), xtime(Byte { b: ks_sub7_3 })), ks_sub7_3), 255)
+    let ks_mix7_7 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: ks_sub7_4 }), ks_sub7_4), ks_sub7_9), ks_sub7_14), xtime(Byte { b: ks_sub7_3 })), 255)
+    let ks_mix7_8 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: ks_sub7_8 }), xtime(Byte { b: ks_sub7_13 })), ks_sub7_13), ks_sub7_2), ks_sub7_7), 255)
+    let ks_mix7_9 = band(bxor(bxor(bxor(bxor(ks_sub7_8, xtime(Byte { b: ks_sub7_13 })), xtime(Byte { b: ks_sub7_2 })), ks_sub7_2), ks_sub7_7), 255)
+    let ks_mix7_10 = band(bxor(bxor(bxor(bxor(ks_sub7_8, ks_sub7_13), xtime(Byte { b: ks_sub7_2 })), xtime(Byte { b: ks_sub7_7 })), ks_sub7_7), 255)
+    let ks_mix7_11 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: ks_sub7_8 }), ks_sub7_8), ks_sub7_13), ks_sub7_2), xtime(Byte { b: ks_sub7_7 })), 255)
+    let ks_mix7_12 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: ks_sub7_12 }), xtime(Byte { b: ks_sub7_1 })), ks_sub7_1), ks_sub7_6), ks_sub7_11), 255)
+    let ks_mix7_13 = band(bxor(bxor(bxor(bxor(ks_sub7_12, xtime(Byte { b: ks_sub7_1 })), xtime(Byte { b: ks_sub7_6 })), ks_sub7_6), ks_sub7_11), 255)
+    let ks_mix7_14 = band(bxor(bxor(bxor(bxor(ks_sub7_12, ks_sub7_1), xtime(Byte { b: ks_sub7_6 })), xtime(Byte { b: ks_sub7_11 })), ks_sub7_11), 255)
+    let ks_mix7_15 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: ks_sub7_12 }), ks_sub7_12), ks_sub7_1), ks_sub7_6), xtime(Byte { b: ks_sub7_11 })), 255)
+    let ks_s7_0 = band(bxor(ks_mix7_0, sched_ks112), 255)
+    let ks_s7_1 = band(bxor(ks_mix7_1, sched_ks113), 255)
+    let ks_s7_2 = band(bxor(ks_mix7_2, sched_ks114), 255)
+    let ks_s7_3 = band(bxor(ks_mix7_3, sched_ks115), 255)
+    let ks_s7_4 = band(bxor(ks_mix7_4, sched_ks116), 255)
+    let ks_s7_5 = band(bxor(ks_mix7_5, sched_ks117), 255)
+    let ks_s7_6 = band(bxor(ks_mix7_6, sched_ks118), 255)
+    let ks_s7_7 = band(bxor(ks_mix7_7, sched_ks119), 255)
+    let ks_s7_8 = band(bxor(ks_mix7_8, sched_ks120), 255)
+    let ks_s7_9 = band(bxor(ks_mix7_9, sched_ks121), 255)
+    let ks_s7_10 = band(bxor(ks_mix7_10, sched_ks122), 255)
+    let ks_s7_11 = band(bxor(ks_mix7_11, sched_ks123), 255)
+    let ks_s7_12 = band(bxor(ks_mix7_12, sched_ks124), 255)
+    let ks_s7_13 = band(bxor(ks_mix7_13, sched_ks125), 255)
+    let ks_s7_14 = band(bxor(ks_mix7_14, sched_ks126), 255)
+    let ks_s7_15 = band(bxor(ks_mix7_15, sched_ks127), 255)
+    let ks_sub8_0 = aes_sbox(Byte { b: ks_s7_0 })
+    let ks_sub8_1 = aes_sbox(Byte { b: ks_s7_1 })
+    let ks_sub8_2 = aes_sbox(Byte { b: ks_s7_2 })
+    let ks_sub8_3 = aes_sbox(Byte { b: ks_s7_3 })
+    let ks_sub8_4 = aes_sbox(Byte { b: ks_s7_4 })
+    let ks_sub8_5 = aes_sbox(Byte { b: ks_s7_5 })
+    let ks_sub8_6 = aes_sbox(Byte { b: ks_s7_6 })
+    let ks_sub8_7 = aes_sbox(Byte { b: ks_s7_7 })
+    let ks_sub8_8 = aes_sbox(Byte { b: ks_s7_8 })
+    let ks_sub8_9 = aes_sbox(Byte { b: ks_s7_9 })
+    let ks_sub8_10 = aes_sbox(Byte { b: ks_s7_10 })
+    let ks_sub8_11 = aes_sbox(Byte { b: ks_s7_11 })
+    let ks_sub8_12 = aes_sbox(Byte { b: ks_s7_12 })
+    let ks_sub8_13 = aes_sbox(Byte { b: ks_s7_13 })
+    let ks_sub8_14 = aes_sbox(Byte { b: ks_s7_14 })
+    let ks_sub8_15 = aes_sbox(Byte { b: ks_s7_15 })
+    let ks_mix8_0 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: ks_sub8_0 }), xtime(Byte { b: ks_sub8_5 })), ks_sub8_5), ks_sub8_10), ks_sub8_15), 255)
+    let ks_mix8_1 = band(bxor(bxor(bxor(bxor(ks_sub8_0, xtime(Byte { b: ks_sub8_5 })), xtime(Byte { b: ks_sub8_10 })), ks_sub8_10), ks_sub8_15), 255)
+    let ks_mix8_2 = band(bxor(bxor(bxor(bxor(ks_sub8_0, ks_sub8_5), xtime(Byte { b: ks_sub8_10 })), xtime(Byte { b: ks_sub8_15 })), ks_sub8_15), 255)
+    let ks_mix8_3 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: ks_sub8_0 }), ks_sub8_0), ks_sub8_5), ks_sub8_10), xtime(Byte { b: ks_sub8_15 })), 255)
+    let ks_mix8_4 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: ks_sub8_4 }), xtime(Byte { b: ks_sub8_9 })), ks_sub8_9), ks_sub8_14), ks_sub8_3), 255)
+    let ks_mix8_5 = band(bxor(bxor(bxor(bxor(ks_sub8_4, xtime(Byte { b: ks_sub8_9 })), xtime(Byte { b: ks_sub8_14 })), ks_sub8_14), ks_sub8_3), 255)
+    let ks_mix8_6 = band(bxor(bxor(bxor(bxor(ks_sub8_4, ks_sub8_9), xtime(Byte { b: ks_sub8_14 })), xtime(Byte { b: ks_sub8_3 })), ks_sub8_3), 255)
+    let ks_mix8_7 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: ks_sub8_4 }), ks_sub8_4), ks_sub8_9), ks_sub8_14), xtime(Byte { b: ks_sub8_3 })), 255)
+    let ks_mix8_8 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: ks_sub8_8 }), xtime(Byte { b: ks_sub8_13 })), ks_sub8_13), ks_sub8_2), ks_sub8_7), 255)
+    let ks_mix8_9 = band(bxor(bxor(bxor(bxor(ks_sub8_8, xtime(Byte { b: ks_sub8_13 })), xtime(Byte { b: ks_sub8_2 })), ks_sub8_2), ks_sub8_7), 255)
+    let ks_mix8_10 = band(bxor(bxor(bxor(bxor(ks_sub8_8, ks_sub8_13), xtime(Byte { b: ks_sub8_2 })), xtime(Byte { b: ks_sub8_7 })), ks_sub8_7), 255)
+    let ks_mix8_11 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: ks_sub8_8 }), ks_sub8_8), ks_sub8_13), ks_sub8_2), xtime(Byte { b: ks_sub8_7 })), 255)
+    let ks_mix8_12 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: ks_sub8_12 }), xtime(Byte { b: ks_sub8_1 })), ks_sub8_1), ks_sub8_6), ks_sub8_11), 255)
+    let ks_mix8_13 = band(bxor(bxor(bxor(bxor(ks_sub8_12, xtime(Byte { b: ks_sub8_1 })), xtime(Byte { b: ks_sub8_6 })), ks_sub8_6), ks_sub8_11), 255)
+    let ks_mix8_14 = band(bxor(bxor(bxor(bxor(ks_sub8_12, ks_sub8_1), xtime(Byte { b: ks_sub8_6 })), xtime(Byte { b: ks_sub8_11 })), ks_sub8_11), 255)
+    let ks_mix8_15 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: ks_sub8_12 }), ks_sub8_12), ks_sub8_1), ks_sub8_6), xtime(Byte { b: ks_sub8_11 })), 255)
+    let ks_s8_0 = band(bxor(ks_mix8_0, sched_ks128), 255)
+    let ks_s8_1 = band(bxor(ks_mix8_1, sched_ks129), 255)
+    let ks_s8_2 = band(bxor(ks_mix8_2, sched_ks130), 255)
+    let ks_s8_3 = band(bxor(ks_mix8_3, sched_ks131), 255)
+    let ks_s8_4 = band(bxor(ks_mix8_4, sched_ks132), 255)
+    let ks_s8_5 = band(bxor(ks_mix8_5, sched_ks133), 255)
+    let ks_s8_6 = band(bxor(ks_mix8_6, sched_ks134), 255)
+    let ks_s8_7 = band(bxor(ks_mix8_7, sched_ks135), 255)
+    let ks_s8_8 = band(bxor(ks_mix8_8, sched_ks136), 255)
+    let ks_s8_9 = band(bxor(ks_mix8_9, sched_ks137), 255)
+    let ks_s8_10 = band(bxor(ks_mix8_10, sched_ks138), 255)
+    let ks_s8_11 = band(bxor(ks_mix8_11, sched_ks139), 255)
+    let ks_s8_12 = band(bxor(ks_mix8_12, sched_ks140), 255)
+    let ks_s8_13 = band(bxor(ks_mix8_13, sched_ks141), 255)
+    let ks_s8_14 = band(bxor(ks_mix8_14, sched_ks142), 255)
+    let ks_s8_15 = band(bxor(ks_mix8_15, sched_ks143), 255)
+    let ks_sub9_0 = aes_sbox(Byte { b: ks_s8_0 })
+    let ks_sub9_1 = aes_sbox(Byte { b: ks_s8_1 })
+    let ks_sub9_2 = aes_sbox(Byte { b: ks_s8_2 })
+    let ks_sub9_3 = aes_sbox(Byte { b: ks_s8_3 })
+    let ks_sub9_4 = aes_sbox(Byte { b: ks_s8_4 })
+    let ks_sub9_5 = aes_sbox(Byte { b: ks_s8_5 })
+    let ks_sub9_6 = aes_sbox(Byte { b: ks_s8_6 })
+    let ks_sub9_7 = aes_sbox(Byte { b: ks_s8_7 })
+    let ks_sub9_8 = aes_sbox(Byte { b: ks_s8_8 })
+    let ks_sub9_9 = aes_sbox(Byte { b: ks_s8_9 })
+    let ks_sub9_10 = aes_sbox(Byte { b: ks_s8_10 })
+    let ks_sub9_11 = aes_sbox(Byte { b: ks_s8_11 })
+    let ks_sub9_12 = aes_sbox(Byte { b: ks_s8_12 })
+    let ks_sub9_13 = aes_sbox(Byte { b: ks_s8_13 })
+    let ks_sub9_14 = aes_sbox(Byte { b: ks_s8_14 })
+    let ks_sub9_15 = aes_sbox(Byte { b: ks_s8_15 })
+    let ks_mix9_0 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: ks_sub9_0 }), xtime(Byte { b: ks_sub9_5 })), ks_sub9_5), ks_sub9_10), ks_sub9_15), 255)
+    let ks_mix9_1 = band(bxor(bxor(bxor(bxor(ks_sub9_0, xtime(Byte { b: ks_sub9_5 })), xtime(Byte { b: ks_sub9_10 })), ks_sub9_10), ks_sub9_15), 255)
+    let ks_mix9_2 = band(bxor(bxor(bxor(bxor(ks_sub9_0, ks_sub9_5), xtime(Byte { b: ks_sub9_10 })), xtime(Byte { b: ks_sub9_15 })), ks_sub9_15), 255)
+    let ks_mix9_3 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: ks_sub9_0 }), ks_sub9_0), ks_sub9_5), ks_sub9_10), xtime(Byte { b: ks_sub9_15 })), 255)
+    let ks_mix9_4 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: ks_sub9_4 }), xtime(Byte { b: ks_sub9_9 })), ks_sub9_9), ks_sub9_14), ks_sub9_3), 255)
+    let ks_mix9_5 = band(bxor(bxor(bxor(bxor(ks_sub9_4, xtime(Byte { b: ks_sub9_9 })), xtime(Byte { b: ks_sub9_14 })), ks_sub9_14), ks_sub9_3), 255)
+    let ks_mix9_6 = band(bxor(bxor(bxor(bxor(ks_sub9_4, ks_sub9_9), xtime(Byte { b: ks_sub9_14 })), xtime(Byte { b: ks_sub9_3 })), ks_sub9_3), 255)
+    let ks_mix9_7 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: ks_sub9_4 }), ks_sub9_4), ks_sub9_9), ks_sub9_14), xtime(Byte { b: ks_sub9_3 })), 255)
+    let ks_mix9_8 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: ks_sub9_8 }), xtime(Byte { b: ks_sub9_13 })), ks_sub9_13), ks_sub9_2), ks_sub9_7), 255)
+    let ks_mix9_9 = band(bxor(bxor(bxor(bxor(ks_sub9_8, xtime(Byte { b: ks_sub9_13 })), xtime(Byte { b: ks_sub9_2 })), ks_sub9_2), ks_sub9_7), 255)
+    let ks_mix9_10 = band(bxor(bxor(bxor(bxor(ks_sub9_8, ks_sub9_13), xtime(Byte { b: ks_sub9_2 })), xtime(Byte { b: ks_sub9_7 })), ks_sub9_7), 255)
+    let ks_mix9_11 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: ks_sub9_8 }), ks_sub9_8), ks_sub9_13), ks_sub9_2), xtime(Byte { b: ks_sub9_7 })), 255)
+    let ks_mix9_12 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: ks_sub9_12 }), xtime(Byte { b: ks_sub9_1 })), ks_sub9_1), ks_sub9_6), ks_sub9_11), 255)
+    let ks_mix9_13 = band(bxor(bxor(bxor(bxor(ks_sub9_12, xtime(Byte { b: ks_sub9_1 })), xtime(Byte { b: ks_sub9_6 })), ks_sub9_6), ks_sub9_11), 255)
+    let ks_mix9_14 = band(bxor(bxor(bxor(bxor(ks_sub9_12, ks_sub9_1), xtime(Byte { b: ks_sub9_6 })), xtime(Byte { b: ks_sub9_11 })), ks_sub9_11), 255)
+    let ks_mix9_15 = band(bxor(bxor(bxor(bxor(xtime(Byte { b: ks_sub9_12 }), ks_sub9_12), ks_sub9_1), ks_sub9_6), xtime(Byte { b: ks_sub9_11 })), 255)
+    let ks_s9_0 = band(bxor(ks_mix9_0, sched_ks144), 255)
+    let ks_s9_1 = band(bxor(ks_mix9_1, sched_ks145), 255)
+    let ks_s9_2 = band(bxor(ks_mix9_2, sched_ks146), 255)
+    let ks_s9_3 = band(bxor(ks_mix9_3, sched_ks147), 255)
+    let ks_s9_4 = band(bxor(ks_mix9_4, sched_ks148), 255)
+    let ks_s9_5 = band(bxor(ks_mix9_5, sched_ks149), 255)
+    let ks_s9_6 = band(bxor(ks_mix9_6, sched_ks150), 255)
+    let ks_s9_7 = band(bxor(ks_mix9_7, sched_ks151), 255)
+    let ks_s9_8 = band(bxor(ks_mix9_8, sched_ks152), 255)
+    let ks_s9_9 = band(bxor(ks_mix9_9, sched_ks153), 255)
+    let ks_s9_10 = band(bxor(ks_mix9_10, sched_ks154), 255)
+    let ks_s9_11 = band(bxor(ks_mix9_11, sched_ks155), 255)
+    let ks_s9_12 = band(bxor(ks_mix9_12, sched_ks156), 255)
+    let ks_s9_13 = band(bxor(ks_mix9_13, sched_ks157), 255)
+    let ks_s9_14 = band(bxor(ks_mix9_14, sched_ks158), 255)
+    let ks_s9_15 = band(bxor(ks_mix9_15, sched_ks159), 255)
+    let ks_sub10_0 = aes_sbox(Byte { b: ks_s9_0 })
+    let ks_sub10_1 = aes_sbox(Byte { b: ks_s9_1 })
+    let ks_sub10_2 = aes_sbox(Byte { b: ks_s9_2 })
+    let ks_sub10_3 = aes_sbox(Byte { b: ks_s9_3 })
+    let ks_sub10_4 = aes_sbox(Byte { b: ks_s9_4 })
+    let ks_sub10_5 = aes_sbox(Byte { b: ks_s9_5 })
+    let ks_sub10_6 = aes_sbox(Byte { b: ks_s9_6 })
+    let ks_sub10_7 = aes_sbox(Byte { b: ks_s9_7 })
+    let ks_sub10_8 = aes_sbox(Byte { b: ks_s9_8 })
+    let ks_sub10_9 = aes_sbox(Byte { b: ks_s9_9 })
+    let ks_sub10_10 = aes_sbox(Byte { b: ks_s9_10 })
+    let ks_sub10_11 = aes_sbox(Byte { b: ks_s9_11 })
+    let ks_sub10_12 = aes_sbox(Byte { b: ks_s9_12 })
+    let ks_sub10_13 = aes_sbox(Byte { b: ks_s9_13 })
+    let ks_sub10_14 = aes_sbox(Byte { b: ks_s9_14 })
+    let ks_sub10_15 = aes_sbox(Byte { b: ks_s9_15 })
+    let ks_s10_0 = band(bxor(ks_sub10_0, sched_ks160), 255)
+    let ks_s10_1 = band(bxor(ks_sub10_5, sched_ks161), 255)
+    let ks_s10_2 = band(bxor(ks_sub10_10, sched_ks162), 255)
+    let ks_s10_3 = band(bxor(ks_sub10_15, sched_ks163), 255)
+    let ks_s10_4 = band(bxor(ks_sub10_4, sched_ks164), 255)
+    let ks_s10_5 = band(bxor(ks_sub10_9, sched_ks165), 255)
+    let ks_s10_6 = band(bxor(ks_sub10_14, sched_ks166), 255)
+    let ks_s10_7 = band(bxor(ks_sub10_3, sched_ks167), 255)
+    let ks_s10_8 = band(bxor(ks_sub10_8, sched_ks168), 255)
+    let ks_s10_9 = band(bxor(ks_sub10_13, sched_ks169), 255)
+    let ks_s10_10 = band(bxor(ks_sub10_2, sched_ks170), 255)
+    let ks_s10_11 = band(bxor(ks_sub10_7, sched_ks171), 255)
+    let ks_s10_12 = band(bxor(ks_sub10_12, sched_ks172), 255)
+    let ks_s10_13 = band(bxor(ks_sub10_1, sched_ks173), 255)
+    let ks_s10_14 = band(bxor(ks_sub10_6, sched_ks174), 255)
+    let ks_s10_15 = band(bxor(ks_sub10_11, sched_ks175), 255)
+    let selb = band(s.which, 15)
+    let ksbyte = if selb == 0 then ks_s10_0 else if selb == 1 then ks_s10_1 else if selb == 2 then ks_s10_2 else if selb == 3 then ks_s10_3 else if selb == 4 then ks_s10_4 else if selb == 5 then ks_s10_5 else if selb == 6 then ks_s10_6 else if selb == 7 then ks_s10_7 else if selb == 8 then ks_s10_8 else if selb == 9 then ks_s10_9 else if selb == 10 then ks_s10_10 else if selb == 11 then ks_s10_11 else if selb == 12 then ks_s10_12 else if selb == 13 then ks_s10_13 else if selb == 14 then ks_s10_14 else ks_s10_15
+    let pos = s.which * 2
+    let phi = byte_at(s.data, pos)
+    let plo = byte_at(s.data, pos + 1)
+    let pvh = if phi <= 57 then phi - 48 else bor(phi, 32) - 87
+    let pvl = if plo <= 57 then plo - 48 else bor(plo, 32) - 87
+    let ptbyte = 16 * pvh + pvl
+    out = band(bxor(ksbyte, ptbyte), 255)
+  proofs:
+    purity:
+      reads : [s.k0, s.k1, s.k2, s.k3, s.k4, s.k5, s.k6, s.k7, s.k8, s.k9, s.k10, s.k11, s.k12, s.k13, s.k14, s.k15, s.iv0, s.iv1, s.iv2, s.iv3, s.iv4, s.iv5, s.iv6, s.iv7, s.iv8, s.iv9, s.iv10, s.iv11, s.which, s.data]
+      calls : [aes_sbox, xtime]
+    termination:
+      bound : 20000
