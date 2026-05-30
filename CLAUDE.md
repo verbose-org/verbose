@@ -792,7 +792,7 @@ Full rationale: README.md → "Why Not Transpile Rust/Go → Verbose?".
 - **No false explicitation** — every declaration must be mechanically verified or exploited. If it's just decoration, remove it.
 - **The native backend is the destination** — the Rust transpiler is a fallback. Architectural decisions should keep the native path open.
 - **Every feature must serve security, performance, or unique machine code.** No ergonomic sugar without optimization value.
-- **All documentation in English.** The repo is international.
+- **All documentation in English.** The repo is international. **One scoped exception: `docs/learn/`.** Those are pedagogical articles (cross-posted to [arcker.org](https://arcker.org), the canonical home) written in French, pinned to a stated language version per article. They are blog content that happens to live in the repo, not compiler reference docs — they do not track the current codebase and are exempt from the English rule and the "keep up to date" expectation. Everything else under `docs/` (design notes, effect model, native designs, etc.) stays English and current.
 - **Pop sub-agents for exploration-heavy work.** When mapping a refactor across many files, scanning for every touch point of a construct, or investigating a broad "where is X used" question, delegate to a sub-agent (`Agent` tool, `Explore` type for searches, `general-purpose` for mixed read+reasoning). The agent's summary lands in the main context; the raw file reads do not. Reserve the main context for actual edits and conversation with the human. Sub-agents are not a substitute for judgment — always read the code you're about to modify yourself, and verify the agent's claims against the file before acting on them.
 
 ## Design Lessons
