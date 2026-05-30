@@ -1,0 +1,27 @@
+The full X25519 Montgomery ladder as a recursive callable, Brick 3 of
+docs/x25519-design.md — the centerpiece that loops where the let-chain
+unroll cannot.
+
+`ladder` recurses 255 times over a single LadderState record (the four
+working coordinates x2,z2,x3,z3 + the base x1, 10 limbs each, plus swap,
+the bit counter i, the output selector which, and the 64-char hex
+scalar text). At each level it:
+  - extracts the clamped scalar bit at index i-1 (byte_at into the hex
+    scalar, decode 2 hex chars, shift+mask; RFC 7748 clamp folded in:
+    bits 0..2 forced 0, bit 254 forced 1);
+  - branch-free cswap of (x2,x3) and (z2,z3) on swap xor bit;
+  - one differential add-and-double (the Brick-2 step), inlined;
+  - recurses with i-1.
+At i==0 it does the final cswap and returns limb `which` (0..19) of the
+final (x2,z2).
+
+Termination is mechanical: `decreasing : i` over i : number [0,255].
+This is the first Verbose program to thread ~51 number fields plus a
+text field through 255 recursive frames (the wide ABI de-risked by the
+S2 spike). Validated end-to-end against RFC 7748 section 5.2 vector 1:
+the native ladder's final (x2,z2), after modular inversion and
+encoding, reproduces the published shared secret exactly. The integration
+test pins several output limbs against the RFC-derived reference.
+
+Still done outside Verbose for this brick: the final z2^(p-2) inversion
+and the byte encoding (Brick 4 brings those in-language).

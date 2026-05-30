@@ -29328,4 +29328,49 @@ rule extract_word
         let _ = std::fs::remove_file(&out);
     }
 
+
+    #[test]
+    fn x25519_ladder_recursive_matches_rfc7748() {
+        // The full 255-step Montgomery ladder as a recursive callable, validated
+        // against RFC 7748 section 5.2 vector 1. The expected final (x2,z2) limbs
+        // below were produced by the field/ladder reference that reproduces the
+        // published X25519 output exactly (see the live end-to-end check). Only a
+        // few output limbs are checked here because each native invocation re-runs
+        // the entire ladder (~5s); the full 20-limb + inversion + RFC sweep is
+        // covered by the out-of-band validation.
+        let h = std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(x25519_ladder_recursive_test_body)
+            .expect("spawn");
+        h.join().expect("test thread panicked");
+    }
+
+    fn x25519_ladder_recursive_test_body() {
+        let src = std::fs::read_to_string("examples/ladder_recursive.verbose")
+            .expect("examples/ladder_recursive.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+        let out = std::env::temp_dir().join("verbosec_test_ladder_rec");
+        compile_native(&program, "ladder", out.to_str().unwrap(), false, false)
+            .expect("ladder must compile");
+        #[cfg(unix)]
+        { use std::os::unix::fs::PermissionsExt;
+          let _ = std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o755)); }
+        let init: [i64; 50] = [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 57203686, 792089, 42384230, 19211788, 32603844, 2385522, 47813494, 19007334, 17457210, 19952303, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 57203686, 792089, 42384230, 19211788, 32603844, 2385522, 47813494, 19007334, 17457210, 19952303];
+        let sc_hex = "a546e36bf0527c9d3b16154b82465edd62144c0ac1fc5a18506a2244ba449ac4";
+        let run = |w: u8| -> i64 {
+            let mut cmd = std::process::Command::new(&out);
+            for v in init.iter() { cmd.arg(v.to_string()); }
+            cmd.arg("0").arg("255").arg(w.to_string()).arg(sc_hex); // swap=0, i=255, which, scalar
+            let o = cmd.output().expect("run ladder");
+            String::from_utf8_lossy(&o.stdout).trim().parse()
+                .unwrap_or_else(|_| panic!("parse which={}", w))
+        };
+        assert_eq!(run(0), 4861533, "ladder limb 0 (RFC 7748 v1) mismatch");
+        assert_eq!(run(9), 23600082, "ladder limb 9 (RFC 7748 v1) mismatch");
+        assert_eq!(run(10), 55039015, "ladder limb 10 (RFC 7748 v1) mismatch");
+        assert_eq!(run(19), 1108949, "ladder limb 19 (RFC 7748 v1) mismatch");
+        let _ = std::fs::remove_file(&out);
+    }
+
 }
