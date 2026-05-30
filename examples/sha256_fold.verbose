@@ -1,0 +1,686 @@
+@verbose 0.1.0
+
+concept ShaState
+  @intention: "SHA-256 fold state: 8 hash words + block count, counter, which, hex pre-padded data"
+  @source: invoices.intent:1
+  fields:
+    h0 : number [0, 4294967295]
+    h1 : number [0, 4294967295]
+    h2 : number [0, 4294967295]
+    h3 : number [0, 4294967295]
+    h4 : number [0, 4294967295]
+    h5 : number [0, 4294967295]
+    h6 : number [0, 4294967295]
+    h7 : number [0, 4294967295]
+    nblocks : number [0, 64]
+    i : number [0, 64]
+    which : number [0, 31]
+    data : text
+
+
+rule sha256_fold
+  @intention: "SHA-256 over N pre-padded 64-byte blocks (hex): state=IV; per block state=compress(state,block); returns digest byte which"
+  @source: invoices.intent:1
+  input:
+    s : ShaState
+  output:
+    out : number
+  logic:
+    let bidx = if s.i == 0 then 0 else s.nblocks - s.i
+    let boff = bidx * 128
+    let w0_hi0 = byte_at(s.data, boff + 0)
+    let w0_lo0 = byte_at(s.data, boff + 1)
+    let w0_hv0 = if w0_hi0 <= 57 then w0_hi0 - 48 else bor(w0_hi0, 32) - 87
+    let w0_lv0 = if w0_lo0 <= 57 then w0_lo0 - 48 else bor(w0_lo0, 32) - 87
+    let w0_b0 = 16 * w0_hv0 + w0_lv0
+    let w0_hi1 = byte_at(s.data, boff + 2)
+    let w0_lo1 = byte_at(s.data, boff + 3)
+    let w0_hv1 = if w0_hi1 <= 57 then w0_hi1 - 48 else bor(w0_hi1, 32) - 87
+    let w0_lv1 = if w0_lo1 <= 57 then w0_lo1 - 48 else bor(w0_lo1, 32) - 87
+    let w0_b1 = 16 * w0_hv1 + w0_lv1
+    let w0_hi2 = byte_at(s.data, boff + 4)
+    let w0_lo2 = byte_at(s.data, boff + 5)
+    let w0_hv2 = if w0_hi2 <= 57 then w0_hi2 - 48 else bor(w0_hi2, 32) - 87
+    let w0_lv2 = if w0_lo2 <= 57 then w0_lo2 - 48 else bor(w0_lo2, 32) - 87
+    let w0_b2 = 16 * w0_hv2 + w0_lv2
+    let w0_hi3 = byte_at(s.data, boff + 6)
+    let w0_lo3 = byte_at(s.data, boff + 7)
+    let w0_hv3 = if w0_hi3 <= 57 then w0_hi3 - 48 else bor(w0_hi3, 32) - 87
+    let w0_lv3 = if w0_lo3 <= 57 then w0_lo3 - 48 else bor(w0_lo3, 32) - 87
+    let w0_b3 = 16 * w0_hv3 + w0_lv3
+    let w0 = band(bor(bor(bor(shl(w0_b0, 24), shl(w0_b1, 16)), shl(w0_b2, 8)), w0_b3), 4294967295)
+    let w1_hi0 = byte_at(s.data, boff + 8)
+    let w1_lo0 = byte_at(s.data, boff + 9)
+    let w1_hv0 = if w1_hi0 <= 57 then w1_hi0 - 48 else bor(w1_hi0, 32) - 87
+    let w1_lv0 = if w1_lo0 <= 57 then w1_lo0 - 48 else bor(w1_lo0, 32) - 87
+    let w1_b0 = 16 * w1_hv0 + w1_lv0
+    let w1_hi1 = byte_at(s.data, boff + 10)
+    let w1_lo1 = byte_at(s.data, boff + 11)
+    let w1_hv1 = if w1_hi1 <= 57 then w1_hi1 - 48 else bor(w1_hi1, 32) - 87
+    let w1_lv1 = if w1_lo1 <= 57 then w1_lo1 - 48 else bor(w1_lo1, 32) - 87
+    let w1_b1 = 16 * w1_hv1 + w1_lv1
+    let w1_hi2 = byte_at(s.data, boff + 12)
+    let w1_lo2 = byte_at(s.data, boff + 13)
+    let w1_hv2 = if w1_hi2 <= 57 then w1_hi2 - 48 else bor(w1_hi2, 32) - 87
+    let w1_lv2 = if w1_lo2 <= 57 then w1_lo2 - 48 else bor(w1_lo2, 32) - 87
+    let w1_b2 = 16 * w1_hv2 + w1_lv2
+    let w1_hi3 = byte_at(s.data, boff + 14)
+    let w1_lo3 = byte_at(s.data, boff + 15)
+    let w1_hv3 = if w1_hi3 <= 57 then w1_hi3 - 48 else bor(w1_hi3, 32) - 87
+    let w1_lv3 = if w1_lo3 <= 57 then w1_lo3 - 48 else bor(w1_lo3, 32) - 87
+    let w1_b3 = 16 * w1_hv3 + w1_lv3
+    let w1 = band(bor(bor(bor(shl(w1_b0, 24), shl(w1_b1, 16)), shl(w1_b2, 8)), w1_b3), 4294967295)
+    let w2_hi0 = byte_at(s.data, boff + 16)
+    let w2_lo0 = byte_at(s.data, boff + 17)
+    let w2_hv0 = if w2_hi0 <= 57 then w2_hi0 - 48 else bor(w2_hi0, 32) - 87
+    let w2_lv0 = if w2_lo0 <= 57 then w2_lo0 - 48 else bor(w2_lo0, 32) - 87
+    let w2_b0 = 16 * w2_hv0 + w2_lv0
+    let w2_hi1 = byte_at(s.data, boff + 18)
+    let w2_lo1 = byte_at(s.data, boff + 19)
+    let w2_hv1 = if w2_hi1 <= 57 then w2_hi1 - 48 else bor(w2_hi1, 32) - 87
+    let w2_lv1 = if w2_lo1 <= 57 then w2_lo1 - 48 else bor(w2_lo1, 32) - 87
+    let w2_b1 = 16 * w2_hv1 + w2_lv1
+    let w2_hi2 = byte_at(s.data, boff + 20)
+    let w2_lo2 = byte_at(s.data, boff + 21)
+    let w2_hv2 = if w2_hi2 <= 57 then w2_hi2 - 48 else bor(w2_hi2, 32) - 87
+    let w2_lv2 = if w2_lo2 <= 57 then w2_lo2 - 48 else bor(w2_lo2, 32) - 87
+    let w2_b2 = 16 * w2_hv2 + w2_lv2
+    let w2_hi3 = byte_at(s.data, boff + 22)
+    let w2_lo3 = byte_at(s.data, boff + 23)
+    let w2_hv3 = if w2_hi3 <= 57 then w2_hi3 - 48 else bor(w2_hi3, 32) - 87
+    let w2_lv3 = if w2_lo3 <= 57 then w2_lo3 - 48 else bor(w2_lo3, 32) - 87
+    let w2_b3 = 16 * w2_hv3 + w2_lv3
+    let w2 = band(bor(bor(bor(shl(w2_b0, 24), shl(w2_b1, 16)), shl(w2_b2, 8)), w2_b3), 4294967295)
+    let w3_hi0 = byte_at(s.data, boff + 24)
+    let w3_lo0 = byte_at(s.data, boff + 25)
+    let w3_hv0 = if w3_hi0 <= 57 then w3_hi0 - 48 else bor(w3_hi0, 32) - 87
+    let w3_lv0 = if w3_lo0 <= 57 then w3_lo0 - 48 else bor(w3_lo0, 32) - 87
+    let w3_b0 = 16 * w3_hv0 + w3_lv0
+    let w3_hi1 = byte_at(s.data, boff + 26)
+    let w3_lo1 = byte_at(s.data, boff + 27)
+    let w3_hv1 = if w3_hi1 <= 57 then w3_hi1 - 48 else bor(w3_hi1, 32) - 87
+    let w3_lv1 = if w3_lo1 <= 57 then w3_lo1 - 48 else bor(w3_lo1, 32) - 87
+    let w3_b1 = 16 * w3_hv1 + w3_lv1
+    let w3_hi2 = byte_at(s.data, boff + 28)
+    let w3_lo2 = byte_at(s.data, boff + 29)
+    let w3_hv2 = if w3_hi2 <= 57 then w3_hi2 - 48 else bor(w3_hi2, 32) - 87
+    let w3_lv2 = if w3_lo2 <= 57 then w3_lo2 - 48 else bor(w3_lo2, 32) - 87
+    let w3_b2 = 16 * w3_hv2 + w3_lv2
+    let w3_hi3 = byte_at(s.data, boff + 30)
+    let w3_lo3 = byte_at(s.data, boff + 31)
+    let w3_hv3 = if w3_hi3 <= 57 then w3_hi3 - 48 else bor(w3_hi3, 32) - 87
+    let w3_lv3 = if w3_lo3 <= 57 then w3_lo3 - 48 else bor(w3_lo3, 32) - 87
+    let w3_b3 = 16 * w3_hv3 + w3_lv3
+    let w3 = band(bor(bor(bor(shl(w3_b0, 24), shl(w3_b1, 16)), shl(w3_b2, 8)), w3_b3), 4294967295)
+    let w4_hi0 = byte_at(s.data, boff + 32)
+    let w4_lo0 = byte_at(s.data, boff + 33)
+    let w4_hv0 = if w4_hi0 <= 57 then w4_hi0 - 48 else bor(w4_hi0, 32) - 87
+    let w4_lv0 = if w4_lo0 <= 57 then w4_lo0 - 48 else bor(w4_lo0, 32) - 87
+    let w4_b0 = 16 * w4_hv0 + w4_lv0
+    let w4_hi1 = byte_at(s.data, boff + 34)
+    let w4_lo1 = byte_at(s.data, boff + 35)
+    let w4_hv1 = if w4_hi1 <= 57 then w4_hi1 - 48 else bor(w4_hi1, 32) - 87
+    let w4_lv1 = if w4_lo1 <= 57 then w4_lo1 - 48 else bor(w4_lo1, 32) - 87
+    let w4_b1 = 16 * w4_hv1 + w4_lv1
+    let w4_hi2 = byte_at(s.data, boff + 36)
+    let w4_lo2 = byte_at(s.data, boff + 37)
+    let w4_hv2 = if w4_hi2 <= 57 then w4_hi2 - 48 else bor(w4_hi2, 32) - 87
+    let w4_lv2 = if w4_lo2 <= 57 then w4_lo2 - 48 else bor(w4_lo2, 32) - 87
+    let w4_b2 = 16 * w4_hv2 + w4_lv2
+    let w4_hi3 = byte_at(s.data, boff + 38)
+    let w4_lo3 = byte_at(s.data, boff + 39)
+    let w4_hv3 = if w4_hi3 <= 57 then w4_hi3 - 48 else bor(w4_hi3, 32) - 87
+    let w4_lv3 = if w4_lo3 <= 57 then w4_lo3 - 48 else bor(w4_lo3, 32) - 87
+    let w4_b3 = 16 * w4_hv3 + w4_lv3
+    let w4 = band(bor(bor(bor(shl(w4_b0, 24), shl(w4_b1, 16)), shl(w4_b2, 8)), w4_b3), 4294967295)
+    let w5_hi0 = byte_at(s.data, boff + 40)
+    let w5_lo0 = byte_at(s.data, boff + 41)
+    let w5_hv0 = if w5_hi0 <= 57 then w5_hi0 - 48 else bor(w5_hi0, 32) - 87
+    let w5_lv0 = if w5_lo0 <= 57 then w5_lo0 - 48 else bor(w5_lo0, 32) - 87
+    let w5_b0 = 16 * w5_hv0 + w5_lv0
+    let w5_hi1 = byte_at(s.data, boff + 42)
+    let w5_lo1 = byte_at(s.data, boff + 43)
+    let w5_hv1 = if w5_hi1 <= 57 then w5_hi1 - 48 else bor(w5_hi1, 32) - 87
+    let w5_lv1 = if w5_lo1 <= 57 then w5_lo1 - 48 else bor(w5_lo1, 32) - 87
+    let w5_b1 = 16 * w5_hv1 + w5_lv1
+    let w5_hi2 = byte_at(s.data, boff + 44)
+    let w5_lo2 = byte_at(s.data, boff + 45)
+    let w5_hv2 = if w5_hi2 <= 57 then w5_hi2 - 48 else bor(w5_hi2, 32) - 87
+    let w5_lv2 = if w5_lo2 <= 57 then w5_lo2 - 48 else bor(w5_lo2, 32) - 87
+    let w5_b2 = 16 * w5_hv2 + w5_lv2
+    let w5_hi3 = byte_at(s.data, boff + 46)
+    let w5_lo3 = byte_at(s.data, boff + 47)
+    let w5_hv3 = if w5_hi3 <= 57 then w5_hi3 - 48 else bor(w5_hi3, 32) - 87
+    let w5_lv3 = if w5_lo3 <= 57 then w5_lo3 - 48 else bor(w5_lo3, 32) - 87
+    let w5_b3 = 16 * w5_hv3 + w5_lv3
+    let w5 = band(bor(bor(bor(shl(w5_b0, 24), shl(w5_b1, 16)), shl(w5_b2, 8)), w5_b3), 4294967295)
+    let w6_hi0 = byte_at(s.data, boff + 48)
+    let w6_lo0 = byte_at(s.data, boff + 49)
+    let w6_hv0 = if w6_hi0 <= 57 then w6_hi0 - 48 else bor(w6_hi0, 32) - 87
+    let w6_lv0 = if w6_lo0 <= 57 then w6_lo0 - 48 else bor(w6_lo0, 32) - 87
+    let w6_b0 = 16 * w6_hv0 + w6_lv0
+    let w6_hi1 = byte_at(s.data, boff + 50)
+    let w6_lo1 = byte_at(s.data, boff + 51)
+    let w6_hv1 = if w6_hi1 <= 57 then w6_hi1 - 48 else bor(w6_hi1, 32) - 87
+    let w6_lv1 = if w6_lo1 <= 57 then w6_lo1 - 48 else bor(w6_lo1, 32) - 87
+    let w6_b1 = 16 * w6_hv1 + w6_lv1
+    let w6_hi2 = byte_at(s.data, boff + 52)
+    let w6_lo2 = byte_at(s.data, boff + 53)
+    let w6_hv2 = if w6_hi2 <= 57 then w6_hi2 - 48 else bor(w6_hi2, 32) - 87
+    let w6_lv2 = if w6_lo2 <= 57 then w6_lo2 - 48 else bor(w6_lo2, 32) - 87
+    let w6_b2 = 16 * w6_hv2 + w6_lv2
+    let w6_hi3 = byte_at(s.data, boff + 54)
+    let w6_lo3 = byte_at(s.data, boff + 55)
+    let w6_hv3 = if w6_hi3 <= 57 then w6_hi3 - 48 else bor(w6_hi3, 32) - 87
+    let w6_lv3 = if w6_lo3 <= 57 then w6_lo3 - 48 else bor(w6_lo3, 32) - 87
+    let w6_b3 = 16 * w6_hv3 + w6_lv3
+    let w6 = band(bor(bor(bor(shl(w6_b0, 24), shl(w6_b1, 16)), shl(w6_b2, 8)), w6_b3), 4294967295)
+    let w7_hi0 = byte_at(s.data, boff + 56)
+    let w7_lo0 = byte_at(s.data, boff + 57)
+    let w7_hv0 = if w7_hi0 <= 57 then w7_hi0 - 48 else bor(w7_hi0, 32) - 87
+    let w7_lv0 = if w7_lo0 <= 57 then w7_lo0 - 48 else bor(w7_lo0, 32) - 87
+    let w7_b0 = 16 * w7_hv0 + w7_lv0
+    let w7_hi1 = byte_at(s.data, boff + 58)
+    let w7_lo1 = byte_at(s.data, boff + 59)
+    let w7_hv1 = if w7_hi1 <= 57 then w7_hi1 - 48 else bor(w7_hi1, 32) - 87
+    let w7_lv1 = if w7_lo1 <= 57 then w7_lo1 - 48 else bor(w7_lo1, 32) - 87
+    let w7_b1 = 16 * w7_hv1 + w7_lv1
+    let w7_hi2 = byte_at(s.data, boff + 60)
+    let w7_lo2 = byte_at(s.data, boff + 61)
+    let w7_hv2 = if w7_hi2 <= 57 then w7_hi2 - 48 else bor(w7_hi2, 32) - 87
+    let w7_lv2 = if w7_lo2 <= 57 then w7_lo2 - 48 else bor(w7_lo2, 32) - 87
+    let w7_b2 = 16 * w7_hv2 + w7_lv2
+    let w7_hi3 = byte_at(s.data, boff + 62)
+    let w7_lo3 = byte_at(s.data, boff + 63)
+    let w7_hv3 = if w7_hi3 <= 57 then w7_hi3 - 48 else bor(w7_hi3, 32) - 87
+    let w7_lv3 = if w7_lo3 <= 57 then w7_lo3 - 48 else bor(w7_lo3, 32) - 87
+    let w7_b3 = 16 * w7_hv3 + w7_lv3
+    let w7 = band(bor(bor(bor(shl(w7_b0, 24), shl(w7_b1, 16)), shl(w7_b2, 8)), w7_b3), 4294967295)
+    let w8_hi0 = byte_at(s.data, boff + 64)
+    let w8_lo0 = byte_at(s.data, boff + 65)
+    let w8_hv0 = if w8_hi0 <= 57 then w8_hi0 - 48 else bor(w8_hi0, 32) - 87
+    let w8_lv0 = if w8_lo0 <= 57 then w8_lo0 - 48 else bor(w8_lo0, 32) - 87
+    let w8_b0 = 16 * w8_hv0 + w8_lv0
+    let w8_hi1 = byte_at(s.data, boff + 66)
+    let w8_lo1 = byte_at(s.data, boff + 67)
+    let w8_hv1 = if w8_hi1 <= 57 then w8_hi1 - 48 else bor(w8_hi1, 32) - 87
+    let w8_lv1 = if w8_lo1 <= 57 then w8_lo1 - 48 else bor(w8_lo1, 32) - 87
+    let w8_b1 = 16 * w8_hv1 + w8_lv1
+    let w8_hi2 = byte_at(s.data, boff + 68)
+    let w8_lo2 = byte_at(s.data, boff + 69)
+    let w8_hv2 = if w8_hi2 <= 57 then w8_hi2 - 48 else bor(w8_hi2, 32) - 87
+    let w8_lv2 = if w8_lo2 <= 57 then w8_lo2 - 48 else bor(w8_lo2, 32) - 87
+    let w8_b2 = 16 * w8_hv2 + w8_lv2
+    let w8_hi3 = byte_at(s.data, boff + 70)
+    let w8_lo3 = byte_at(s.data, boff + 71)
+    let w8_hv3 = if w8_hi3 <= 57 then w8_hi3 - 48 else bor(w8_hi3, 32) - 87
+    let w8_lv3 = if w8_lo3 <= 57 then w8_lo3 - 48 else bor(w8_lo3, 32) - 87
+    let w8_b3 = 16 * w8_hv3 + w8_lv3
+    let w8 = band(bor(bor(bor(shl(w8_b0, 24), shl(w8_b1, 16)), shl(w8_b2, 8)), w8_b3), 4294967295)
+    let w9_hi0 = byte_at(s.data, boff + 72)
+    let w9_lo0 = byte_at(s.data, boff + 73)
+    let w9_hv0 = if w9_hi0 <= 57 then w9_hi0 - 48 else bor(w9_hi0, 32) - 87
+    let w9_lv0 = if w9_lo0 <= 57 then w9_lo0 - 48 else bor(w9_lo0, 32) - 87
+    let w9_b0 = 16 * w9_hv0 + w9_lv0
+    let w9_hi1 = byte_at(s.data, boff + 74)
+    let w9_lo1 = byte_at(s.data, boff + 75)
+    let w9_hv1 = if w9_hi1 <= 57 then w9_hi1 - 48 else bor(w9_hi1, 32) - 87
+    let w9_lv1 = if w9_lo1 <= 57 then w9_lo1 - 48 else bor(w9_lo1, 32) - 87
+    let w9_b1 = 16 * w9_hv1 + w9_lv1
+    let w9_hi2 = byte_at(s.data, boff + 76)
+    let w9_lo2 = byte_at(s.data, boff + 77)
+    let w9_hv2 = if w9_hi2 <= 57 then w9_hi2 - 48 else bor(w9_hi2, 32) - 87
+    let w9_lv2 = if w9_lo2 <= 57 then w9_lo2 - 48 else bor(w9_lo2, 32) - 87
+    let w9_b2 = 16 * w9_hv2 + w9_lv2
+    let w9_hi3 = byte_at(s.data, boff + 78)
+    let w9_lo3 = byte_at(s.data, boff + 79)
+    let w9_hv3 = if w9_hi3 <= 57 then w9_hi3 - 48 else bor(w9_hi3, 32) - 87
+    let w9_lv3 = if w9_lo3 <= 57 then w9_lo3 - 48 else bor(w9_lo3, 32) - 87
+    let w9_b3 = 16 * w9_hv3 + w9_lv3
+    let w9 = band(bor(bor(bor(shl(w9_b0, 24), shl(w9_b1, 16)), shl(w9_b2, 8)), w9_b3), 4294967295)
+    let w10_hi0 = byte_at(s.data, boff + 80)
+    let w10_lo0 = byte_at(s.data, boff + 81)
+    let w10_hv0 = if w10_hi0 <= 57 then w10_hi0 - 48 else bor(w10_hi0, 32) - 87
+    let w10_lv0 = if w10_lo0 <= 57 then w10_lo0 - 48 else bor(w10_lo0, 32) - 87
+    let w10_b0 = 16 * w10_hv0 + w10_lv0
+    let w10_hi1 = byte_at(s.data, boff + 82)
+    let w10_lo1 = byte_at(s.data, boff + 83)
+    let w10_hv1 = if w10_hi1 <= 57 then w10_hi1 - 48 else bor(w10_hi1, 32) - 87
+    let w10_lv1 = if w10_lo1 <= 57 then w10_lo1 - 48 else bor(w10_lo1, 32) - 87
+    let w10_b1 = 16 * w10_hv1 + w10_lv1
+    let w10_hi2 = byte_at(s.data, boff + 84)
+    let w10_lo2 = byte_at(s.data, boff + 85)
+    let w10_hv2 = if w10_hi2 <= 57 then w10_hi2 - 48 else bor(w10_hi2, 32) - 87
+    let w10_lv2 = if w10_lo2 <= 57 then w10_lo2 - 48 else bor(w10_lo2, 32) - 87
+    let w10_b2 = 16 * w10_hv2 + w10_lv2
+    let w10_hi3 = byte_at(s.data, boff + 86)
+    let w10_lo3 = byte_at(s.data, boff + 87)
+    let w10_hv3 = if w10_hi3 <= 57 then w10_hi3 - 48 else bor(w10_hi3, 32) - 87
+    let w10_lv3 = if w10_lo3 <= 57 then w10_lo3 - 48 else bor(w10_lo3, 32) - 87
+    let w10_b3 = 16 * w10_hv3 + w10_lv3
+    let w10 = band(bor(bor(bor(shl(w10_b0, 24), shl(w10_b1, 16)), shl(w10_b2, 8)), w10_b3), 4294967295)
+    let w11_hi0 = byte_at(s.data, boff + 88)
+    let w11_lo0 = byte_at(s.data, boff + 89)
+    let w11_hv0 = if w11_hi0 <= 57 then w11_hi0 - 48 else bor(w11_hi0, 32) - 87
+    let w11_lv0 = if w11_lo0 <= 57 then w11_lo0 - 48 else bor(w11_lo0, 32) - 87
+    let w11_b0 = 16 * w11_hv0 + w11_lv0
+    let w11_hi1 = byte_at(s.data, boff + 90)
+    let w11_lo1 = byte_at(s.data, boff + 91)
+    let w11_hv1 = if w11_hi1 <= 57 then w11_hi1 - 48 else bor(w11_hi1, 32) - 87
+    let w11_lv1 = if w11_lo1 <= 57 then w11_lo1 - 48 else bor(w11_lo1, 32) - 87
+    let w11_b1 = 16 * w11_hv1 + w11_lv1
+    let w11_hi2 = byte_at(s.data, boff + 92)
+    let w11_lo2 = byte_at(s.data, boff + 93)
+    let w11_hv2 = if w11_hi2 <= 57 then w11_hi2 - 48 else bor(w11_hi2, 32) - 87
+    let w11_lv2 = if w11_lo2 <= 57 then w11_lo2 - 48 else bor(w11_lo2, 32) - 87
+    let w11_b2 = 16 * w11_hv2 + w11_lv2
+    let w11_hi3 = byte_at(s.data, boff + 94)
+    let w11_lo3 = byte_at(s.data, boff + 95)
+    let w11_hv3 = if w11_hi3 <= 57 then w11_hi3 - 48 else bor(w11_hi3, 32) - 87
+    let w11_lv3 = if w11_lo3 <= 57 then w11_lo3 - 48 else bor(w11_lo3, 32) - 87
+    let w11_b3 = 16 * w11_hv3 + w11_lv3
+    let w11 = band(bor(bor(bor(shl(w11_b0, 24), shl(w11_b1, 16)), shl(w11_b2, 8)), w11_b3), 4294967295)
+    let w12_hi0 = byte_at(s.data, boff + 96)
+    let w12_lo0 = byte_at(s.data, boff + 97)
+    let w12_hv0 = if w12_hi0 <= 57 then w12_hi0 - 48 else bor(w12_hi0, 32) - 87
+    let w12_lv0 = if w12_lo0 <= 57 then w12_lo0 - 48 else bor(w12_lo0, 32) - 87
+    let w12_b0 = 16 * w12_hv0 + w12_lv0
+    let w12_hi1 = byte_at(s.data, boff + 98)
+    let w12_lo1 = byte_at(s.data, boff + 99)
+    let w12_hv1 = if w12_hi1 <= 57 then w12_hi1 - 48 else bor(w12_hi1, 32) - 87
+    let w12_lv1 = if w12_lo1 <= 57 then w12_lo1 - 48 else bor(w12_lo1, 32) - 87
+    let w12_b1 = 16 * w12_hv1 + w12_lv1
+    let w12_hi2 = byte_at(s.data, boff + 100)
+    let w12_lo2 = byte_at(s.data, boff + 101)
+    let w12_hv2 = if w12_hi2 <= 57 then w12_hi2 - 48 else bor(w12_hi2, 32) - 87
+    let w12_lv2 = if w12_lo2 <= 57 then w12_lo2 - 48 else bor(w12_lo2, 32) - 87
+    let w12_b2 = 16 * w12_hv2 + w12_lv2
+    let w12_hi3 = byte_at(s.data, boff + 102)
+    let w12_lo3 = byte_at(s.data, boff + 103)
+    let w12_hv3 = if w12_hi3 <= 57 then w12_hi3 - 48 else bor(w12_hi3, 32) - 87
+    let w12_lv3 = if w12_lo3 <= 57 then w12_lo3 - 48 else bor(w12_lo3, 32) - 87
+    let w12_b3 = 16 * w12_hv3 + w12_lv3
+    let w12 = band(bor(bor(bor(shl(w12_b0, 24), shl(w12_b1, 16)), shl(w12_b2, 8)), w12_b3), 4294967295)
+    let w13_hi0 = byte_at(s.data, boff + 104)
+    let w13_lo0 = byte_at(s.data, boff + 105)
+    let w13_hv0 = if w13_hi0 <= 57 then w13_hi0 - 48 else bor(w13_hi0, 32) - 87
+    let w13_lv0 = if w13_lo0 <= 57 then w13_lo0 - 48 else bor(w13_lo0, 32) - 87
+    let w13_b0 = 16 * w13_hv0 + w13_lv0
+    let w13_hi1 = byte_at(s.data, boff + 106)
+    let w13_lo1 = byte_at(s.data, boff + 107)
+    let w13_hv1 = if w13_hi1 <= 57 then w13_hi1 - 48 else bor(w13_hi1, 32) - 87
+    let w13_lv1 = if w13_lo1 <= 57 then w13_lo1 - 48 else bor(w13_lo1, 32) - 87
+    let w13_b1 = 16 * w13_hv1 + w13_lv1
+    let w13_hi2 = byte_at(s.data, boff + 108)
+    let w13_lo2 = byte_at(s.data, boff + 109)
+    let w13_hv2 = if w13_hi2 <= 57 then w13_hi2 - 48 else bor(w13_hi2, 32) - 87
+    let w13_lv2 = if w13_lo2 <= 57 then w13_lo2 - 48 else bor(w13_lo2, 32) - 87
+    let w13_b2 = 16 * w13_hv2 + w13_lv2
+    let w13_hi3 = byte_at(s.data, boff + 110)
+    let w13_lo3 = byte_at(s.data, boff + 111)
+    let w13_hv3 = if w13_hi3 <= 57 then w13_hi3 - 48 else bor(w13_hi3, 32) - 87
+    let w13_lv3 = if w13_lo3 <= 57 then w13_lo3 - 48 else bor(w13_lo3, 32) - 87
+    let w13_b3 = 16 * w13_hv3 + w13_lv3
+    let w13 = band(bor(bor(bor(shl(w13_b0, 24), shl(w13_b1, 16)), shl(w13_b2, 8)), w13_b3), 4294967295)
+    let w14_hi0 = byte_at(s.data, boff + 112)
+    let w14_lo0 = byte_at(s.data, boff + 113)
+    let w14_hv0 = if w14_hi0 <= 57 then w14_hi0 - 48 else bor(w14_hi0, 32) - 87
+    let w14_lv0 = if w14_lo0 <= 57 then w14_lo0 - 48 else bor(w14_lo0, 32) - 87
+    let w14_b0 = 16 * w14_hv0 + w14_lv0
+    let w14_hi1 = byte_at(s.data, boff + 114)
+    let w14_lo1 = byte_at(s.data, boff + 115)
+    let w14_hv1 = if w14_hi1 <= 57 then w14_hi1 - 48 else bor(w14_hi1, 32) - 87
+    let w14_lv1 = if w14_lo1 <= 57 then w14_lo1 - 48 else bor(w14_lo1, 32) - 87
+    let w14_b1 = 16 * w14_hv1 + w14_lv1
+    let w14_hi2 = byte_at(s.data, boff + 116)
+    let w14_lo2 = byte_at(s.data, boff + 117)
+    let w14_hv2 = if w14_hi2 <= 57 then w14_hi2 - 48 else bor(w14_hi2, 32) - 87
+    let w14_lv2 = if w14_lo2 <= 57 then w14_lo2 - 48 else bor(w14_lo2, 32) - 87
+    let w14_b2 = 16 * w14_hv2 + w14_lv2
+    let w14_hi3 = byte_at(s.data, boff + 118)
+    let w14_lo3 = byte_at(s.data, boff + 119)
+    let w14_hv3 = if w14_hi3 <= 57 then w14_hi3 - 48 else bor(w14_hi3, 32) - 87
+    let w14_lv3 = if w14_lo3 <= 57 then w14_lo3 - 48 else bor(w14_lo3, 32) - 87
+    let w14_b3 = 16 * w14_hv3 + w14_lv3
+    let w14 = band(bor(bor(bor(shl(w14_b0, 24), shl(w14_b1, 16)), shl(w14_b2, 8)), w14_b3), 4294967295)
+    let w15_hi0 = byte_at(s.data, boff + 120)
+    let w15_lo0 = byte_at(s.data, boff + 121)
+    let w15_hv0 = if w15_hi0 <= 57 then w15_hi0 - 48 else bor(w15_hi0, 32) - 87
+    let w15_lv0 = if w15_lo0 <= 57 then w15_lo0 - 48 else bor(w15_lo0, 32) - 87
+    let w15_b0 = 16 * w15_hv0 + w15_lv0
+    let w15_hi1 = byte_at(s.data, boff + 122)
+    let w15_lo1 = byte_at(s.data, boff + 123)
+    let w15_hv1 = if w15_hi1 <= 57 then w15_hi1 - 48 else bor(w15_hi1, 32) - 87
+    let w15_lv1 = if w15_lo1 <= 57 then w15_lo1 - 48 else bor(w15_lo1, 32) - 87
+    let w15_b1 = 16 * w15_hv1 + w15_lv1
+    let w15_hi2 = byte_at(s.data, boff + 124)
+    let w15_lo2 = byte_at(s.data, boff + 125)
+    let w15_hv2 = if w15_hi2 <= 57 then w15_hi2 - 48 else bor(w15_hi2, 32) - 87
+    let w15_lv2 = if w15_lo2 <= 57 then w15_lo2 - 48 else bor(w15_lo2, 32) - 87
+    let w15_b2 = 16 * w15_hv2 + w15_lv2
+    let w15_hi3 = byte_at(s.data, boff + 126)
+    let w15_lo3 = byte_at(s.data, boff + 127)
+    let w15_hv3 = if w15_hi3 <= 57 then w15_hi3 - 48 else bor(w15_hi3, 32) - 87
+    let w15_lv3 = if w15_lo3 <= 57 then w15_lo3 - 48 else bor(w15_lo3, 32) - 87
+    let w15_b3 = 16 * w15_hv3 + w15_lv3
+    let w15 = band(bor(bor(bor(shl(w15_b0, 24), shl(w15_b1, 16)), shl(w15_b2, 8)), w15_b3), 4294967295)
+    let c_w16 = band(band(bxor(bxor(band(bor(shr(w14, 17), shl(w14, 15)), 4294967295), band(bor(shr(w14, 19), shl(w14, 13)), 4294967295)), shr(w14, 10)), 4294967295) + w9 + band(bxor(bxor(band(bor(shr(w1, 7), shl(w1, 25)), 4294967295), band(bor(shr(w1, 18), shl(w1, 14)), 4294967295)), shr(w1, 3)), 4294967295) + w0, 4294967295)
+    let c_w17 = band(band(bxor(bxor(band(bor(shr(w15, 17), shl(w15, 15)), 4294967295), band(bor(shr(w15, 19), shl(w15, 13)), 4294967295)), shr(w15, 10)), 4294967295) + w10 + band(bxor(bxor(band(bor(shr(w2, 7), shl(w2, 25)), 4294967295), band(bor(shr(w2, 18), shl(w2, 14)), 4294967295)), shr(w2, 3)), 4294967295) + w1, 4294967295)
+    let c_w18 = band(band(bxor(bxor(band(bor(shr(c_w16, 17), shl(c_w16, 15)), 4294967295), band(bor(shr(c_w16, 19), shl(c_w16, 13)), 4294967295)), shr(c_w16, 10)), 4294967295) + w11 + band(bxor(bxor(band(bor(shr(w3, 7), shl(w3, 25)), 4294967295), band(bor(shr(w3, 18), shl(w3, 14)), 4294967295)), shr(w3, 3)), 4294967295) + w2, 4294967295)
+    let c_w19 = band(band(bxor(bxor(band(bor(shr(c_w17, 17), shl(c_w17, 15)), 4294967295), band(bor(shr(c_w17, 19), shl(c_w17, 13)), 4294967295)), shr(c_w17, 10)), 4294967295) + w12 + band(bxor(bxor(band(bor(shr(w4, 7), shl(w4, 25)), 4294967295), band(bor(shr(w4, 18), shl(w4, 14)), 4294967295)), shr(w4, 3)), 4294967295) + w3, 4294967295)
+    let c_w20 = band(band(bxor(bxor(band(bor(shr(c_w18, 17), shl(c_w18, 15)), 4294967295), band(bor(shr(c_w18, 19), shl(c_w18, 13)), 4294967295)), shr(c_w18, 10)), 4294967295) + w13 + band(bxor(bxor(band(bor(shr(w5, 7), shl(w5, 25)), 4294967295), band(bor(shr(w5, 18), shl(w5, 14)), 4294967295)), shr(w5, 3)), 4294967295) + w4, 4294967295)
+    let c_w21 = band(band(bxor(bxor(band(bor(shr(c_w19, 17), shl(c_w19, 15)), 4294967295), band(bor(shr(c_w19, 19), shl(c_w19, 13)), 4294967295)), shr(c_w19, 10)), 4294967295) + w14 + band(bxor(bxor(band(bor(shr(w6, 7), shl(w6, 25)), 4294967295), band(bor(shr(w6, 18), shl(w6, 14)), 4294967295)), shr(w6, 3)), 4294967295) + w5, 4294967295)
+    let c_w22 = band(band(bxor(bxor(band(bor(shr(c_w20, 17), shl(c_w20, 15)), 4294967295), band(bor(shr(c_w20, 19), shl(c_w20, 13)), 4294967295)), shr(c_w20, 10)), 4294967295) + w15 + band(bxor(bxor(band(bor(shr(w7, 7), shl(w7, 25)), 4294967295), band(bor(shr(w7, 18), shl(w7, 14)), 4294967295)), shr(w7, 3)), 4294967295) + w6, 4294967295)
+    let c_w23 = band(band(bxor(bxor(band(bor(shr(c_w21, 17), shl(c_w21, 15)), 4294967295), band(bor(shr(c_w21, 19), shl(c_w21, 13)), 4294967295)), shr(c_w21, 10)), 4294967295) + c_w16 + band(bxor(bxor(band(bor(shr(w8, 7), shl(w8, 25)), 4294967295), band(bor(shr(w8, 18), shl(w8, 14)), 4294967295)), shr(w8, 3)), 4294967295) + w7, 4294967295)
+    let c_w24 = band(band(bxor(bxor(band(bor(shr(c_w22, 17), shl(c_w22, 15)), 4294967295), band(bor(shr(c_w22, 19), shl(c_w22, 13)), 4294967295)), shr(c_w22, 10)), 4294967295) + c_w17 + band(bxor(bxor(band(bor(shr(w9, 7), shl(w9, 25)), 4294967295), band(bor(shr(w9, 18), shl(w9, 14)), 4294967295)), shr(w9, 3)), 4294967295) + w8, 4294967295)
+    let c_w25 = band(band(bxor(bxor(band(bor(shr(c_w23, 17), shl(c_w23, 15)), 4294967295), band(bor(shr(c_w23, 19), shl(c_w23, 13)), 4294967295)), shr(c_w23, 10)), 4294967295) + c_w18 + band(bxor(bxor(band(bor(shr(w10, 7), shl(w10, 25)), 4294967295), band(bor(shr(w10, 18), shl(w10, 14)), 4294967295)), shr(w10, 3)), 4294967295) + w9, 4294967295)
+    let c_w26 = band(band(bxor(bxor(band(bor(shr(c_w24, 17), shl(c_w24, 15)), 4294967295), band(bor(shr(c_w24, 19), shl(c_w24, 13)), 4294967295)), shr(c_w24, 10)), 4294967295) + c_w19 + band(bxor(bxor(band(bor(shr(w11, 7), shl(w11, 25)), 4294967295), band(bor(shr(w11, 18), shl(w11, 14)), 4294967295)), shr(w11, 3)), 4294967295) + w10, 4294967295)
+    let c_w27 = band(band(bxor(bxor(band(bor(shr(c_w25, 17), shl(c_w25, 15)), 4294967295), band(bor(shr(c_w25, 19), shl(c_w25, 13)), 4294967295)), shr(c_w25, 10)), 4294967295) + c_w20 + band(bxor(bxor(band(bor(shr(w12, 7), shl(w12, 25)), 4294967295), band(bor(shr(w12, 18), shl(w12, 14)), 4294967295)), shr(w12, 3)), 4294967295) + w11, 4294967295)
+    let c_w28 = band(band(bxor(bxor(band(bor(shr(c_w26, 17), shl(c_w26, 15)), 4294967295), band(bor(shr(c_w26, 19), shl(c_w26, 13)), 4294967295)), shr(c_w26, 10)), 4294967295) + c_w21 + band(bxor(bxor(band(bor(shr(w13, 7), shl(w13, 25)), 4294967295), band(bor(shr(w13, 18), shl(w13, 14)), 4294967295)), shr(w13, 3)), 4294967295) + w12, 4294967295)
+    let c_w29 = band(band(bxor(bxor(band(bor(shr(c_w27, 17), shl(c_w27, 15)), 4294967295), band(bor(shr(c_w27, 19), shl(c_w27, 13)), 4294967295)), shr(c_w27, 10)), 4294967295) + c_w22 + band(bxor(bxor(band(bor(shr(w14, 7), shl(w14, 25)), 4294967295), band(bor(shr(w14, 18), shl(w14, 14)), 4294967295)), shr(w14, 3)), 4294967295) + w13, 4294967295)
+    let c_w30 = band(band(bxor(bxor(band(bor(shr(c_w28, 17), shl(c_w28, 15)), 4294967295), band(bor(shr(c_w28, 19), shl(c_w28, 13)), 4294967295)), shr(c_w28, 10)), 4294967295) + c_w23 + band(bxor(bxor(band(bor(shr(w15, 7), shl(w15, 25)), 4294967295), band(bor(shr(w15, 18), shl(w15, 14)), 4294967295)), shr(w15, 3)), 4294967295) + w14, 4294967295)
+    let c_w31 = band(band(bxor(bxor(band(bor(shr(c_w29, 17), shl(c_w29, 15)), 4294967295), band(bor(shr(c_w29, 19), shl(c_w29, 13)), 4294967295)), shr(c_w29, 10)), 4294967295) + c_w24 + band(bxor(bxor(band(bor(shr(c_w16, 7), shl(c_w16, 25)), 4294967295), band(bor(shr(c_w16, 18), shl(c_w16, 14)), 4294967295)), shr(c_w16, 3)), 4294967295) + w15, 4294967295)
+    let c_w32 = band(band(bxor(bxor(band(bor(shr(c_w30, 17), shl(c_w30, 15)), 4294967295), band(bor(shr(c_w30, 19), shl(c_w30, 13)), 4294967295)), shr(c_w30, 10)), 4294967295) + c_w25 + band(bxor(bxor(band(bor(shr(c_w17, 7), shl(c_w17, 25)), 4294967295), band(bor(shr(c_w17, 18), shl(c_w17, 14)), 4294967295)), shr(c_w17, 3)), 4294967295) + c_w16, 4294967295)
+    let c_w33 = band(band(bxor(bxor(band(bor(shr(c_w31, 17), shl(c_w31, 15)), 4294967295), band(bor(shr(c_w31, 19), shl(c_w31, 13)), 4294967295)), shr(c_w31, 10)), 4294967295) + c_w26 + band(bxor(bxor(band(bor(shr(c_w18, 7), shl(c_w18, 25)), 4294967295), band(bor(shr(c_w18, 18), shl(c_w18, 14)), 4294967295)), shr(c_w18, 3)), 4294967295) + c_w17, 4294967295)
+    let c_w34 = band(band(bxor(bxor(band(bor(shr(c_w32, 17), shl(c_w32, 15)), 4294967295), band(bor(shr(c_w32, 19), shl(c_w32, 13)), 4294967295)), shr(c_w32, 10)), 4294967295) + c_w27 + band(bxor(bxor(band(bor(shr(c_w19, 7), shl(c_w19, 25)), 4294967295), band(bor(shr(c_w19, 18), shl(c_w19, 14)), 4294967295)), shr(c_w19, 3)), 4294967295) + c_w18, 4294967295)
+    let c_w35 = band(band(bxor(bxor(band(bor(shr(c_w33, 17), shl(c_w33, 15)), 4294967295), band(bor(shr(c_w33, 19), shl(c_w33, 13)), 4294967295)), shr(c_w33, 10)), 4294967295) + c_w28 + band(bxor(bxor(band(bor(shr(c_w20, 7), shl(c_w20, 25)), 4294967295), band(bor(shr(c_w20, 18), shl(c_w20, 14)), 4294967295)), shr(c_w20, 3)), 4294967295) + c_w19, 4294967295)
+    let c_w36 = band(band(bxor(bxor(band(bor(shr(c_w34, 17), shl(c_w34, 15)), 4294967295), band(bor(shr(c_w34, 19), shl(c_w34, 13)), 4294967295)), shr(c_w34, 10)), 4294967295) + c_w29 + band(bxor(bxor(band(bor(shr(c_w21, 7), shl(c_w21, 25)), 4294967295), band(bor(shr(c_w21, 18), shl(c_w21, 14)), 4294967295)), shr(c_w21, 3)), 4294967295) + c_w20, 4294967295)
+    let c_w37 = band(band(bxor(bxor(band(bor(shr(c_w35, 17), shl(c_w35, 15)), 4294967295), band(bor(shr(c_w35, 19), shl(c_w35, 13)), 4294967295)), shr(c_w35, 10)), 4294967295) + c_w30 + band(bxor(bxor(band(bor(shr(c_w22, 7), shl(c_w22, 25)), 4294967295), band(bor(shr(c_w22, 18), shl(c_w22, 14)), 4294967295)), shr(c_w22, 3)), 4294967295) + c_w21, 4294967295)
+    let c_w38 = band(band(bxor(bxor(band(bor(shr(c_w36, 17), shl(c_w36, 15)), 4294967295), band(bor(shr(c_w36, 19), shl(c_w36, 13)), 4294967295)), shr(c_w36, 10)), 4294967295) + c_w31 + band(bxor(bxor(band(bor(shr(c_w23, 7), shl(c_w23, 25)), 4294967295), band(bor(shr(c_w23, 18), shl(c_w23, 14)), 4294967295)), shr(c_w23, 3)), 4294967295) + c_w22, 4294967295)
+    let c_w39 = band(band(bxor(bxor(band(bor(shr(c_w37, 17), shl(c_w37, 15)), 4294967295), band(bor(shr(c_w37, 19), shl(c_w37, 13)), 4294967295)), shr(c_w37, 10)), 4294967295) + c_w32 + band(bxor(bxor(band(bor(shr(c_w24, 7), shl(c_w24, 25)), 4294967295), band(bor(shr(c_w24, 18), shl(c_w24, 14)), 4294967295)), shr(c_w24, 3)), 4294967295) + c_w23, 4294967295)
+    let c_w40 = band(band(bxor(bxor(band(bor(shr(c_w38, 17), shl(c_w38, 15)), 4294967295), band(bor(shr(c_w38, 19), shl(c_w38, 13)), 4294967295)), shr(c_w38, 10)), 4294967295) + c_w33 + band(bxor(bxor(band(bor(shr(c_w25, 7), shl(c_w25, 25)), 4294967295), band(bor(shr(c_w25, 18), shl(c_w25, 14)), 4294967295)), shr(c_w25, 3)), 4294967295) + c_w24, 4294967295)
+    let c_w41 = band(band(bxor(bxor(band(bor(shr(c_w39, 17), shl(c_w39, 15)), 4294967295), band(bor(shr(c_w39, 19), shl(c_w39, 13)), 4294967295)), shr(c_w39, 10)), 4294967295) + c_w34 + band(bxor(bxor(band(bor(shr(c_w26, 7), shl(c_w26, 25)), 4294967295), band(bor(shr(c_w26, 18), shl(c_w26, 14)), 4294967295)), shr(c_w26, 3)), 4294967295) + c_w25, 4294967295)
+    let c_w42 = band(band(bxor(bxor(band(bor(shr(c_w40, 17), shl(c_w40, 15)), 4294967295), band(bor(shr(c_w40, 19), shl(c_w40, 13)), 4294967295)), shr(c_w40, 10)), 4294967295) + c_w35 + band(bxor(bxor(band(bor(shr(c_w27, 7), shl(c_w27, 25)), 4294967295), band(bor(shr(c_w27, 18), shl(c_w27, 14)), 4294967295)), shr(c_w27, 3)), 4294967295) + c_w26, 4294967295)
+    let c_w43 = band(band(bxor(bxor(band(bor(shr(c_w41, 17), shl(c_w41, 15)), 4294967295), band(bor(shr(c_w41, 19), shl(c_w41, 13)), 4294967295)), shr(c_w41, 10)), 4294967295) + c_w36 + band(bxor(bxor(band(bor(shr(c_w28, 7), shl(c_w28, 25)), 4294967295), band(bor(shr(c_w28, 18), shl(c_w28, 14)), 4294967295)), shr(c_w28, 3)), 4294967295) + c_w27, 4294967295)
+    let c_w44 = band(band(bxor(bxor(band(bor(shr(c_w42, 17), shl(c_w42, 15)), 4294967295), band(bor(shr(c_w42, 19), shl(c_w42, 13)), 4294967295)), shr(c_w42, 10)), 4294967295) + c_w37 + band(bxor(bxor(band(bor(shr(c_w29, 7), shl(c_w29, 25)), 4294967295), band(bor(shr(c_w29, 18), shl(c_w29, 14)), 4294967295)), shr(c_w29, 3)), 4294967295) + c_w28, 4294967295)
+    let c_w45 = band(band(bxor(bxor(band(bor(shr(c_w43, 17), shl(c_w43, 15)), 4294967295), band(bor(shr(c_w43, 19), shl(c_w43, 13)), 4294967295)), shr(c_w43, 10)), 4294967295) + c_w38 + band(bxor(bxor(band(bor(shr(c_w30, 7), shl(c_w30, 25)), 4294967295), band(bor(shr(c_w30, 18), shl(c_w30, 14)), 4294967295)), shr(c_w30, 3)), 4294967295) + c_w29, 4294967295)
+    let c_w46 = band(band(bxor(bxor(band(bor(shr(c_w44, 17), shl(c_w44, 15)), 4294967295), band(bor(shr(c_w44, 19), shl(c_w44, 13)), 4294967295)), shr(c_w44, 10)), 4294967295) + c_w39 + band(bxor(bxor(band(bor(shr(c_w31, 7), shl(c_w31, 25)), 4294967295), band(bor(shr(c_w31, 18), shl(c_w31, 14)), 4294967295)), shr(c_w31, 3)), 4294967295) + c_w30, 4294967295)
+    let c_w47 = band(band(bxor(bxor(band(bor(shr(c_w45, 17), shl(c_w45, 15)), 4294967295), band(bor(shr(c_w45, 19), shl(c_w45, 13)), 4294967295)), shr(c_w45, 10)), 4294967295) + c_w40 + band(bxor(bxor(band(bor(shr(c_w32, 7), shl(c_w32, 25)), 4294967295), band(bor(shr(c_w32, 18), shl(c_w32, 14)), 4294967295)), shr(c_w32, 3)), 4294967295) + c_w31, 4294967295)
+    let c_w48 = band(band(bxor(bxor(band(bor(shr(c_w46, 17), shl(c_w46, 15)), 4294967295), band(bor(shr(c_w46, 19), shl(c_w46, 13)), 4294967295)), shr(c_w46, 10)), 4294967295) + c_w41 + band(bxor(bxor(band(bor(shr(c_w33, 7), shl(c_w33, 25)), 4294967295), band(bor(shr(c_w33, 18), shl(c_w33, 14)), 4294967295)), shr(c_w33, 3)), 4294967295) + c_w32, 4294967295)
+    let c_w49 = band(band(bxor(bxor(band(bor(shr(c_w47, 17), shl(c_w47, 15)), 4294967295), band(bor(shr(c_w47, 19), shl(c_w47, 13)), 4294967295)), shr(c_w47, 10)), 4294967295) + c_w42 + band(bxor(bxor(band(bor(shr(c_w34, 7), shl(c_w34, 25)), 4294967295), band(bor(shr(c_w34, 18), shl(c_w34, 14)), 4294967295)), shr(c_w34, 3)), 4294967295) + c_w33, 4294967295)
+    let c_w50 = band(band(bxor(bxor(band(bor(shr(c_w48, 17), shl(c_w48, 15)), 4294967295), band(bor(shr(c_w48, 19), shl(c_w48, 13)), 4294967295)), shr(c_w48, 10)), 4294967295) + c_w43 + band(bxor(bxor(band(bor(shr(c_w35, 7), shl(c_w35, 25)), 4294967295), band(bor(shr(c_w35, 18), shl(c_w35, 14)), 4294967295)), shr(c_w35, 3)), 4294967295) + c_w34, 4294967295)
+    let c_w51 = band(band(bxor(bxor(band(bor(shr(c_w49, 17), shl(c_w49, 15)), 4294967295), band(bor(shr(c_w49, 19), shl(c_w49, 13)), 4294967295)), shr(c_w49, 10)), 4294967295) + c_w44 + band(bxor(bxor(band(bor(shr(c_w36, 7), shl(c_w36, 25)), 4294967295), band(bor(shr(c_w36, 18), shl(c_w36, 14)), 4294967295)), shr(c_w36, 3)), 4294967295) + c_w35, 4294967295)
+    let c_w52 = band(band(bxor(bxor(band(bor(shr(c_w50, 17), shl(c_w50, 15)), 4294967295), band(bor(shr(c_w50, 19), shl(c_w50, 13)), 4294967295)), shr(c_w50, 10)), 4294967295) + c_w45 + band(bxor(bxor(band(bor(shr(c_w37, 7), shl(c_w37, 25)), 4294967295), band(bor(shr(c_w37, 18), shl(c_w37, 14)), 4294967295)), shr(c_w37, 3)), 4294967295) + c_w36, 4294967295)
+    let c_w53 = band(band(bxor(bxor(band(bor(shr(c_w51, 17), shl(c_w51, 15)), 4294967295), band(bor(shr(c_w51, 19), shl(c_w51, 13)), 4294967295)), shr(c_w51, 10)), 4294967295) + c_w46 + band(bxor(bxor(band(bor(shr(c_w38, 7), shl(c_w38, 25)), 4294967295), band(bor(shr(c_w38, 18), shl(c_w38, 14)), 4294967295)), shr(c_w38, 3)), 4294967295) + c_w37, 4294967295)
+    let c_w54 = band(band(bxor(bxor(band(bor(shr(c_w52, 17), shl(c_w52, 15)), 4294967295), band(bor(shr(c_w52, 19), shl(c_w52, 13)), 4294967295)), shr(c_w52, 10)), 4294967295) + c_w47 + band(bxor(bxor(band(bor(shr(c_w39, 7), shl(c_w39, 25)), 4294967295), band(bor(shr(c_w39, 18), shl(c_w39, 14)), 4294967295)), shr(c_w39, 3)), 4294967295) + c_w38, 4294967295)
+    let c_w55 = band(band(bxor(bxor(band(bor(shr(c_w53, 17), shl(c_w53, 15)), 4294967295), band(bor(shr(c_w53, 19), shl(c_w53, 13)), 4294967295)), shr(c_w53, 10)), 4294967295) + c_w48 + band(bxor(bxor(band(bor(shr(c_w40, 7), shl(c_w40, 25)), 4294967295), band(bor(shr(c_w40, 18), shl(c_w40, 14)), 4294967295)), shr(c_w40, 3)), 4294967295) + c_w39, 4294967295)
+    let c_w56 = band(band(bxor(bxor(band(bor(shr(c_w54, 17), shl(c_w54, 15)), 4294967295), band(bor(shr(c_w54, 19), shl(c_w54, 13)), 4294967295)), shr(c_w54, 10)), 4294967295) + c_w49 + band(bxor(bxor(band(bor(shr(c_w41, 7), shl(c_w41, 25)), 4294967295), band(bor(shr(c_w41, 18), shl(c_w41, 14)), 4294967295)), shr(c_w41, 3)), 4294967295) + c_w40, 4294967295)
+    let c_w57 = band(band(bxor(bxor(band(bor(shr(c_w55, 17), shl(c_w55, 15)), 4294967295), band(bor(shr(c_w55, 19), shl(c_w55, 13)), 4294967295)), shr(c_w55, 10)), 4294967295) + c_w50 + band(bxor(bxor(band(bor(shr(c_w42, 7), shl(c_w42, 25)), 4294967295), band(bor(shr(c_w42, 18), shl(c_w42, 14)), 4294967295)), shr(c_w42, 3)), 4294967295) + c_w41, 4294967295)
+    let c_w58 = band(band(bxor(bxor(band(bor(shr(c_w56, 17), shl(c_w56, 15)), 4294967295), band(bor(shr(c_w56, 19), shl(c_w56, 13)), 4294967295)), shr(c_w56, 10)), 4294967295) + c_w51 + band(bxor(bxor(band(bor(shr(c_w43, 7), shl(c_w43, 25)), 4294967295), band(bor(shr(c_w43, 18), shl(c_w43, 14)), 4294967295)), shr(c_w43, 3)), 4294967295) + c_w42, 4294967295)
+    let c_w59 = band(band(bxor(bxor(band(bor(shr(c_w57, 17), shl(c_w57, 15)), 4294967295), band(bor(shr(c_w57, 19), shl(c_w57, 13)), 4294967295)), shr(c_w57, 10)), 4294967295) + c_w52 + band(bxor(bxor(band(bor(shr(c_w44, 7), shl(c_w44, 25)), 4294967295), band(bor(shr(c_w44, 18), shl(c_w44, 14)), 4294967295)), shr(c_w44, 3)), 4294967295) + c_w43, 4294967295)
+    let c_w60 = band(band(bxor(bxor(band(bor(shr(c_w58, 17), shl(c_w58, 15)), 4294967295), band(bor(shr(c_w58, 19), shl(c_w58, 13)), 4294967295)), shr(c_w58, 10)), 4294967295) + c_w53 + band(bxor(bxor(band(bor(shr(c_w45, 7), shl(c_w45, 25)), 4294967295), band(bor(shr(c_w45, 18), shl(c_w45, 14)), 4294967295)), shr(c_w45, 3)), 4294967295) + c_w44, 4294967295)
+    let c_w61 = band(band(bxor(bxor(band(bor(shr(c_w59, 17), shl(c_w59, 15)), 4294967295), band(bor(shr(c_w59, 19), shl(c_w59, 13)), 4294967295)), shr(c_w59, 10)), 4294967295) + c_w54 + band(bxor(bxor(band(bor(shr(c_w46, 7), shl(c_w46, 25)), 4294967295), band(bor(shr(c_w46, 18), shl(c_w46, 14)), 4294967295)), shr(c_w46, 3)), 4294967295) + c_w45, 4294967295)
+    let c_w62 = band(band(bxor(bxor(band(bor(shr(c_w60, 17), shl(c_w60, 15)), 4294967295), band(bor(shr(c_w60, 19), shl(c_w60, 13)), 4294967295)), shr(c_w60, 10)), 4294967295) + c_w55 + band(bxor(bxor(band(bor(shr(c_w47, 7), shl(c_w47, 25)), 4294967295), band(bor(shr(c_w47, 18), shl(c_w47, 14)), 4294967295)), shr(c_w47, 3)), 4294967295) + c_w46, 4294967295)
+    let c_w63 = band(band(bxor(bxor(band(bor(shr(c_w61, 17), shl(c_w61, 15)), 4294967295), band(bor(shr(c_w61, 19), shl(c_w61, 13)), 4294967295)), shr(c_w61, 10)), 4294967295) + c_w56 + band(bxor(bxor(band(bor(shr(c_w48, 7), shl(c_w48, 25)), 4294967295), band(bor(shr(c_w48, 18), shl(c_w48, 14)), 4294967295)), shr(c_w48, 3)), 4294967295) + c_w47, 4294967295)
+    let c_t1_0 = band(s.h7 + band(bxor(bxor(band(bor(shr(s.h4, 6), shl(s.h4, 26)), 4294967295), band(bor(shr(s.h4, 11), shl(s.h4, 21)), 4294967295)), band(bor(shr(s.h4, 25), shl(s.h4, 7)), 4294967295)), 4294967295) + band(bxor(band(s.h4, s.h5), band(bnot(s.h4), s.h6)), 4294967295) + 1116352408 + w0, 4294967295)
+    let c_t2_0 = band(band(bxor(bxor(band(bor(shr(s.h0, 2), shl(s.h0, 30)), 4294967295), band(bor(shr(s.h0, 13), shl(s.h0, 19)), 4294967295)), band(bor(shr(s.h0, 22), shl(s.h0, 10)), 4294967295)), 4294967295) + band(bxor(bxor(band(s.h0, s.h1), band(s.h0, s.h2)), band(s.h1, s.h2)), 4294967295), 4294967295)
+    let c_e0 = band(s.h3 + c_t1_0, 4294967295)
+    let c_a0 = band(c_t1_0 + c_t2_0, 4294967295)
+    let c_t1_1 = band(s.h6 + band(bxor(bxor(band(bor(shr(c_e0, 6), shl(c_e0, 26)), 4294967295), band(bor(shr(c_e0, 11), shl(c_e0, 21)), 4294967295)), band(bor(shr(c_e0, 25), shl(c_e0, 7)), 4294967295)), 4294967295) + band(bxor(band(c_e0, s.h4), band(bnot(c_e0), s.h5)), 4294967295) + 1899447441 + w1, 4294967295)
+    let c_t2_1 = band(band(bxor(bxor(band(bor(shr(c_a0, 2), shl(c_a0, 30)), 4294967295), band(bor(shr(c_a0, 13), shl(c_a0, 19)), 4294967295)), band(bor(shr(c_a0, 22), shl(c_a0, 10)), 4294967295)), 4294967295) + band(bxor(bxor(band(c_a0, s.h0), band(c_a0, s.h1)), band(s.h0, s.h1)), 4294967295), 4294967295)
+    let c_e1 = band(s.h2 + c_t1_1, 4294967295)
+    let c_a1 = band(c_t1_1 + c_t2_1, 4294967295)
+    let c_t1_2 = band(s.h5 + band(bxor(bxor(band(bor(shr(c_e1, 6), shl(c_e1, 26)), 4294967295), band(bor(shr(c_e1, 11), shl(c_e1, 21)), 4294967295)), band(bor(shr(c_e1, 25), shl(c_e1, 7)), 4294967295)), 4294967295) + band(bxor(band(c_e1, c_e0), band(bnot(c_e1), s.h4)), 4294967295) + 3049323471 + w2, 4294967295)
+    let c_t2_2 = band(band(bxor(bxor(band(bor(shr(c_a1, 2), shl(c_a1, 30)), 4294967295), band(bor(shr(c_a1, 13), shl(c_a1, 19)), 4294967295)), band(bor(shr(c_a1, 22), shl(c_a1, 10)), 4294967295)), 4294967295) + band(bxor(bxor(band(c_a1, c_a0), band(c_a1, s.h0)), band(c_a0, s.h0)), 4294967295), 4294967295)
+    let c_e2 = band(s.h1 + c_t1_2, 4294967295)
+    let c_a2 = band(c_t1_2 + c_t2_2, 4294967295)
+    let c_t1_3 = band(s.h4 + band(bxor(bxor(band(bor(shr(c_e2, 6), shl(c_e2, 26)), 4294967295), band(bor(shr(c_e2, 11), shl(c_e2, 21)), 4294967295)), band(bor(shr(c_e2, 25), shl(c_e2, 7)), 4294967295)), 4294967295) + band(bxor(band(c_e2, c_e1), band(bnot(c_e2), c_e0)), 4294967295) + 3921009573 + w3, 4294967295)
+    let c_t2_3 = band(band(bxor(bxor(band(bor(shr(c_a2, 2), shl(c_a2, 30)), 4294967295), band(bor(shr(c_a2, 13), shl(c_a2, 19)), 4294967295)), band(bor(shr(c_a2, 22), shl(c_a2, 10)), 4294967295)), 4294967295) + band(bxor(bxor(band(c_a2, c_a1), band(c_a2, c_a0)), band(c_a1, c_a0)), 4294967295), 4294967295)
+    let c_e3 = band(s.h0 + c_t1_3, 4294967295)
+    let c_a3 = band(c_t1_3 + c_t2_3, 4294967295)
+    let c_t1_4 = band(c_e0 + band(bxor(bxor(band(bor(shr(c_e3, 6), shl(c_e3, 26)), 4294967295), band(bor(shr(c_e3, 11), shl(c_e3, 21)), 4294967295)), band(bor(shr(c_e3, 25), shl(c_e3, 7)), 4294967295)), 4294967295) + band(bxor(band(c_e3, c_e2), band(bnot(c_e3), c_e1)), 4294967295) + 961987163 + w4, 4294967295)
+    let c_t2_4 = band(band(bxor(bxor(band(bor(shr(c_a3, 2), shl(c_a3, 30)), 4294967295), band(bor(shr(c_a3, 13), shl(c_a3, 19)), 4294967295)), band(bor(shr(c_a3, 22), shl(c_a3, 10)), 4294967295)), 4294967295) + band(bxor(bxor(band(c_a3, c_a2), band(c_a3, c_a1)), band(c_a2, c_a1)), 4294967295), 4294967295)
+    let c_e4 = band(c_a0 + c_t1_4, 4294967295)
+    let c_a4 = band(c_t1_4 + c_t2_4, 4294967295)
+    let c_t1_5 = band(c_e1 + band(bxor(bxor(band(bor(shr(c_e4, 6), shl(c_e4, 26)), 4294967295), band(bor(shr(c_e4, 11), shl(c_e4, 21)), 4294967295)), band(bor(shr(c_e4, 25), shl(c_e4, 7)), 4294967295)), 4294967295) + band(bxor(band(c_e4, c_e3), band(bnot(c_e4), c_e2)), 4294967295) + 1508970993 + w5, 4294967295)
+    let c_t2_5 = band(band(bxor(bxor(band(bor(shr(c_a4, 2), shl(c_a4, 30)), 4294967295), band(bor(shr(c_a4, 13), shl(c_a4, 19)), 4294967295)), band(bor(shr(c_a4, 22), shl(c_a4, 10)), 4294967295)), 4294967295) + band(bxor(bxor(band(c_a4, c_a3), band(c_a4, c_a2)), band(c_a3, c_a2)), 4294967295), 4294967295)
+    let c_e5 = band(c_a1 + c_t1_5, 4294967295)
+    let c_a5 = band(c_t1_5 + c_t2_5, 4294967295)
+    let c_t1_6 = band(c_e2 + band(bxor(bxor(band(bor(shr(c_e5, 6), shl(c_e5, 26)), 4294967295), band(bor(shr(c_e5, 11), shl(c_e5, 21)), 4294967295)), band(bor(shr(c_e5, 25), shl(c_e5, 7)), 4294967295)), 4294967295) + band(bxor(band(c_e5, c_e4), band(bnot(c_e5), c_e3)), 4294967295) + 2453635748 + w6, 4294967295)
+    let c_t2_6 = band(band(bxor(bxor(band(bor(shr(c_a5, 2), shl(c_a5, 30)), 4294967295), band(bor(shr(c_a5, 13), shl(c_a5, 19)), 4294967295)), band(bor(shr(c_a5, 22), shl(c_a5, 10)), 4294967295)), 4294967295) + band(bxor(bxor(band(c_a5, c_a4), band(c_a5, c_a3)), band(c_a4, c_a3)), 4294967295), 4294967295)
+    let c_e6 = band(c_a2 + c_t1_6, 4294967295)
+    let c_a6 = band(c_t1_6 + c_t2_6, 4294967295)
+    let c_t1_7 = band(c_e3 + band(bxor(bxor(band(bor(shr(c_e6, 6), shl(c_e6, 26)), 4294967295), band(bor(shr(c_e6, 11), shl(c_e6, 21)), 4294967295)), band(bor(shr(c_e6, 25), shl(c_e6, 7)), 4294967295)), 4294967295) + band(bxor(band(c_e6, c_e5), band(bnot(c_e6), c_e4)), 4294967295) + 2870763221 + w7, 4294967295)
+    let c_t2_7 = band(band(bxor(bxor(band(bor(shr(c_a6, 2), shl(c_a6, 30)), 4294967295), band(bor(shr(c_a6, 13), shl(c_a6, 19)), 4294967295)), band(bor(shr(c_a6, 22), shl(c_a6, 10)), 4294967295)), 4294967295) + band(bxor(bxor(band(c_a6, c_a5), band(c_a6, c_a4)), band(c_a5, c_a4)), 4294967295), 4294967295)
+    let c_e7 = band(c_a3 + c_t1_7, 4294967295)
+    let c_a7 = band(c_t1_7 + c_t2_7, 4294967295)
+    let c_t1_8 = band(c_e4 + band(bxor(bxor(band(bor(shr(c_e7, 6), shl(c_e7, 26)), 4294967295), band(bor(shr(c_e7, 11), shl(c_e7, 21)), 4294967295)), band(bor(shr(c_e7, 25), shl(c_e7, 7)), 4294967295)), 4294967295) + band(bxor(band(c_e7, c_e6), band(bnot(c_e7), c_e5)), 4294967295) + 3624381080 + w8, 4294967295)
+    let c_t2_8 = band(band(bxor(bxor(band(bor(shr(c_a7, 2), shl(c_a7, 30)), 4294967295), band(bor(shr(c_a7, 13), shl(c_a7, 19)), 4294967295)), band(bor(shr(c_a7, 22), shl(c_a7, 10)), 4294967295)), 4294967295) + band(bxor(bxor(band(c_a7, c_a6), band(c_a7, c_a5)), band(c_a6, c_a5)), 4294967295), 4294967295)
+    let c_e8 = band(c_a4 + c_t1_8, 4294967295)
+    let c_a8 = band(c_t1_8 + c_t2_8, 4294967295)
+    let c_t1_9 = band(c_e5 + band(bxor(bxor(band(bor(shr(c_e8, 6), shl(c_e8, 26)), 4294967295), band(bor(shr(c_e8, 11), shl(c_e8, 21)), 4294967295)), band(bor(shr(c_e8, 25), shl(c_e8, 7)), 4294967295)), 4294967295) + band(bxor(band(c_e8, c_e7), band(bnot(c_e8), c_e6)), 4294967295) + 310598401 + w9, 4294967295)
+    let c_t2_9 = band(band(bxor(bxor(band(bor(shr(c_a8, 2), shl(c_a8, 30)), 4294967295), band(bor(shr(c_a8, 13), shl(c_a8, 19)), 4294967295)), band(bor(shr(c_a8, 22), shl(c_a8, 10)), 4294967295)), 4294967295) + band(bxor(bxor(band(c_a8, c_a7), band(c_a8, c_a6)), band(c_a7, c_a6)), 4294967295), 4294967295)
+    let c_e9 = band(c_a5 + c_t1_9, 4294967295)
+    let c_a9 = band(c_t1_9 + c_t2_9, 4294967295)
+    let c_t1_10 = band(c_e6 + band(bxor(bxor(band(bor(shr(c_e9, 6), shl(c_e9, 26)), 4294967295), band(bor(shr(c_e9, 11), shl(c_e9, 21)), 4294967295)), band(bor(shr(c_e9, 25), shl(c_e9, 7)), 4294967295)), 4294967295) + band(bxor(band(c_e9, c_e8), band(bnot(c_e9), c_e7)), 4294967295) + 607225278 + w10, 4294967295)
+    let c_t2_10 = band(band(bxor(bxor(band(bor(shr(c_a9, 2), shl(c_a9, 30)), 4294967295), band(bor(shr(c_a9, 13), shl(c_a9, 19)), 4294967295)), band(bor(shr(c_a9, 22), shl(c_a9, 10)), 4294967295)), 4294967295) + band(bxor(bxor(band(c_a9, c_a8), band(c_a9, c_a7)), band(c_a8, c_a7)), 4294967295), 4294967295)
+    let c_e10 = band(c_a6 + c_t1_10, 4294967295)
+    let c_a10 = band(c_t1_10 + c_t2_10, 4294967295)
+    let c_t1_11 = band(c_e7 + band(bxor(bxor(band(bor(shr(c_e10, 6), shl(c_e10, 26)), 4294967295), band(bor(shr(c_e10, 11), shl(c_e10, 21)), 4294967295)), band(bor(shr(c_e10, 25), shl(c_e10, 7)), 4294967295)), 4294967295) + band(bxor(band(c_e10, c_e9), band(bnot(c_e10), c_e8)), 4294967295) + 1426881987 + w11, 4294967295)
+    let c_t2_11 = band(band(bxor(bxor(band(bor(shr(c_a10, 2), shl(c_a10, 30)), 4294967295), band(bor(shr(c_a10, 13), shl(c_a10, 19)), 4294967295)), band(bor(shr(c_a10, 22), shl(c_a10, 10)), 4294967295)), 4294967295) + band(bxor(bxor(band(c_a10, c_a9), band(c_a10, c_a8)), band(c_a9, c_a8)), 4294967295), 4294967295)
+    let c_e11 = band(c_a7 + c_t1_11, 4294967295)
+    let c_a11 = band(c_t1_11 + c_t2_11, 4294967295)
+    let c_t1_12 = band(c_e8 + band(bxor(bxor(band(bor(shr(c_e11, 6), shl(c_e11, 26)), 4294967295), band(bor(shr(c_e11, 11), shl(c_e11, 21)), 4294967295)), band(bor(shr(c_e11, 25), shl(c_e11, 7)), 4294967295)), 4294967295) + band(bxor(band(c_e11, c_e10), band(bnot(c_e11), c_e9)), 4294967295) + 1925078388 + w12, 4294967295)
+    let c_t2_12 = band(band(bxor(bxor(band(bor(shr(c_a11, 2), shl(c_a11, 30)), 4294967295), band(bor(shr(c_a11, 13), shl(c_a11, 19)), 4294967295)), band(bor(shr(c_a11, 22), shl(c_a11, 10)), 4294967295)), 4294967295) + band(bxor(bxor(band(c_a11, c_a10), band(c_a11, c_a9)), band(c_a10, c_a9)), 4294967295), 4294967295)
+    let c_e12 = band(c_a8 + c_t1_12, 4294967295)
+    let c_a12 = band(c_t1_12 + c_t2_12, 4294967295)
+    let c_t1_13 = band(c_e9 + band(bxor(bxor(band(bor(shr(c_e12, 6), shl(c_e12, 26)), 4294967295), band(bor(shr(c_e12, 11), shl(c_e12, 21)), 4294967295)), band(bor(shr(c_e12, 25), shl(c_e12, 7)), 4294967295)), 4294967295) + band(bxor(band(c_e12, c_e11), band(bnot(c_e12), c_e10)), 4294967295) + 2162078206 + w13, 4294967295)
+    let c_t2_13 = band(band(bxor(bxor(band(bor(shr(c_a12, 2), shl(c_a12, 30)), 4294967295), band(bor(shr(c_a12, 13), shl(c_a12, 19)), 4294967295)), band(bor(shr(c_a12, 22), shl(c_a12, 10)), 4294967295)), 4294967295) + band(bxor(bxor(band(c_a12, c_a11), band(c_a12, c_a10)), band(c_a11, c_a10)), 4294967295), 4294967295)
+    let c_e13 = band(c_a9 + c_t1_13, 4294967295)
+    let c_a13 = band(c_t1_13 + c_t2_13, 4294967295)
+    let c_t1_14 = band(c_e10 + band(bxor(bxor(band(bor(shr(c_e13, 6), shl(c_e13, 26)), 4294967295), band(bor(shr(c_e13, 11), shl(c_e13, 21)), 4294967295)), band(bor(shr(c_e13, 25), shl(c_e13, 7)), 4294967295)), 4294967295) + band(bxor(band(c_e13, c_e12), band(bnot(c_e13), c_e11)), 4294967295) + 2614888103 + w14, 4294967295)
+    let c_t2_14 = band(band(bxor(bxor(band(bor(shr(c_a13, 2), shl(c_a13, 30)), 4294967295), band(bor(shr(c_a13, 13), shl(c_a13, 19)), 4294967295)), band(bor(shr(c_a13, 22), shl(c_a13, 10)), 4294967295)), 4294967295) + band(bxor(bxor(band(c_a13, c_a12), band(c_a13, c_a11)), band(c_a12, c_a11)), 4294967295), 4294967295)
+    let c_e14 = band(c_a10 + c_t1_14, 4294967295)
+    let c_a14 = band(c_t1_14 + c_t2_14, 4294967295)
+    let c_t1_15 = band(c_e11 + band(bxor(bxor(band(bor(shr(c_e14, 6), shl(c_e14, 26)), 4294967295), band(bor(shr(c_e14, 11), shl(c_e14, 21)), 4294967295)), band(bor(shr(c_e14, 25), shl(c_e14, 7)), 4294967295)), 4294967295) + band(bxor(band(c_e14, c_e13), band(bnot(c_e14), c_e12)), 4294967295) + 3248222580 + w15, 4294967295)
+    let c_t2_15 = band(band(bxor(bxor(band(bor(shr(c_a14, 2), shl(c_a14, 30)), 4294967295), band(bor(shr(c_a14, 13), shl(c_a14, 19)), 4294967295)), band(bor(shr(c_a14, 22), shl(c_a14, 10)), 4294967295)), 4294967295) + band(bxor(bxor(band(c_a14, c_a13), band(c_a14, c_a12)), band(c_a13, c_a12)), 4294967295), 4294967295)
+    let c_e15 = band(c_a11 + c_t1_15, 4294967295)
+    let c_a15 = band(c_t1_15 + c_t2_15, 4294967295)
+    let c_t1_16 = band(c_e12 + band(bxor(bxor(band(bor(shr(c_e15, 6), shl(c_e15, 26)), 4294967295), band(bor(shr(c_e15, 11), shl(c_e15, 21)), 4294967295)), band(bor(shr(c_e15, 25), shl(c_e15, 7)), 4294967295)), 4294967295) + band(bxor(band(c_e15, c_e14), band(bnot(c_e15), c_e13)), 4294967295) + 3835390401 + c_w16, 4294967295)
+    let c_t2_16 = band(band(bxor(bxor(band(bor(shr(c_a15, 2), shl(c_a15, 30)), 4294967295), band(bor(shr(c_a15, 13), shl(c_a15, 19)), 4294967295)), band(bor(shr(c_a15, 22), shl(c_a15, 10)), 4294967295)), 4294967295) + band(bxor(bxor(band(c_a15, c_a14), band(c_a15, c_a13)), band(c_a14, c_a13)), 4294967295), 4294967295)
+    let c_e16 = band(c_a12 + c_t1_16, 4294967295)
+    let c_a16 = band(c_t1_16 + c_t2_16, 4294967295)
+    let c_t1_17 = band(c_e13 + band(bxor(bxor(band(bor(shr(c_e16, 6), shl(c_e16, 26)), 4294967295), band(bor(shr(c_e16, 11), shl(c_e16, 21)), 4294967295)), band(bor(shr(c_e16, 25), shl(c_e16, 7)), 4294967295)), 4294967295) + band(bxor(band(c_e16, c_e15), band(bnot(c_e16), c_e14)), 4294967295) + 4022224774 + c_w17, 4294967295)
+    let c_t2_17 = band(band(bxor(bxor(band(bor(shr(c_a16, 2), shl(c_a16, 30)), 4294967295), band(bor(shr(c_a16, 13), shl(c_a16, 19)), 4294967295)), band(bor(shr(c_a16, 22), shl(c_a16, 10)), 4294967295)), 4294967295) + band(bxor(bxor(band(c_a16, c_a15), band(c_a16, c_a14)), band(c_a15, c_a14)), 4294967295), 4294967295)
+    let c_e17 = band(c_a13 + c_t1_17, 4294967295)
+    let c_a17 = band(c_t1_17 + c_t2_17, 4294967295)
+    let c_t1_18 = band(c_e14 + band(bxor(bxor(band(bor(shr(c_e17, 6), shl(c_e17, 26)), 4294967295), band(bor(shr(c_e17, 11), shl(c_e17, 21)), 4294967295)), band(bor(shr(c_e17, 25), shl(c_e17, 7)), 4294967295)), 4294967295) + band(bxor(band(c_e17, c_e16), band(bnot(c_e17), c_e15)), 4294967295) + 264347078 + c_w18, 4294967295)
+    let c_t2_18 = band(band(bxor(bxor(band(bor(shr(c_a17, 2), shl(c_a17, 30)), 4294967295), band(bor(shr(c_a17, 13), shl(c_a17, 19)), 4294967295)), band(bor(shr(c_a17, 22), shl(c_a17, 10)), 4294967295)), 4294967295) + band(bxor(bxor(band(c_a17, c_a16), band(c_a17, c_a15)), band(c_a16, c_a15)), 4294967295), 4294967295)
+    let c_e18 = band(c_a14 + c_t1_18, 4294967295)
+    let c_a18 = band(c_t1_18 + c_t2_18, 4294967295)
+    let c_t1_19 = band(c_e15 + band(bxor(bxor(band(bor(shr(c_e18, 6), shl(c_e18, 26)), 4294967295), band(bor(shr(c_e18, 11), shl(c_e18, 21)), 4294967295)), band(bor(shr(c_e18, 25), shl(c_e18, 7)), 4294967295)), 4294967295) + band(bxor(band(c_e18, c_e17), band(bnot(c_e18), c_e16)), 4294967295) + 604807628 + c_w19, 4294967295)
+    let c_t2_19 = band(band(bxor(bxor(band(bor(shr(c_a18, 2), shl(c_a18, 30)), 4294967295), band(bor(shr(c_a18, 13), shl(c_a18, 19)), 4294967295)), band(bor(shr(c_a18, 22), shl(c_a18, 10)), 4294967295)), 4294967295) + band(bxor(bxor(band(c_a18, c_a17), band(c_a18, c_a16)), band(c_a17, c_a16)), 4294967295), 4294967295)
+    let c_e19 = band(c_a15 + c_t1_19, 4294967295)
+    let c_a19 = band(c_t1_19 + c_t2_19, 4294967295)
+    let c_t1_20 = band(c_e16 + band(bxor(bxor(band(bor(shr(c_e19, 6), shl(c_e19, 26)), 4294967295), band(bor(shr(c_e19, 11), shl(c_e19, 21)), 4294967295)), band(bor(shr(c_e19, 25), shl(c_e19, 7)), 4294967295)), 4294967295) + band(bxor(band(c_e19, c_e18), band(bnot(c_e19), c_e17)), 4294967295) + 770255983 + c_w20, 4294967295)
+    let c_t2_20 = band(band(bxor(bxor(band(bor(shr(c_a19, 2), shl(c_a19, 30)), 4294967295), band(bor(shr(c_a19, 13), shl(c_a19, 19)), 4294967295)), band(bor(shr(c_a19, 22), shl(c_a19, 10)), 4294967295)), 4294967295) + band(bxor(bxor(band(c_a19, c_a18), band(c_a19, c_a17)), band(c_a18, c_a17)), 4294967295), 4294967295)
+    let c_e20 = band(c_a16 + c_t1_20, 4294967295)
+    let c_a20 = band(c_t1_20 + c_t2_20, 4294967295)
+    let c_t1_21 = band(c_e17 + band(bxor(bxor(band(bor(shr(c_e20, 6), shl(c_e20, 26)), 4294967295), band(bor(shr(c_e20, 11), shl(c_e20, 21)), 4294967295)), band(bor(shr(c_e20, 25), shl(c_e20, 7)), 4294967295)), 4294967295) + band(bxor(band(c_e20, c_e19), band(bnot(c_e20), c_e18)), 4294967295) + 1249150122 + c_w21, 4294967295)
+    let c_t2_21 = band(band(bxor(bxor(band(bor(shr(c_a20, 2), shl(c_a20, 30)), 4294967295), band(bor(shr(c_a20, 13), shl(c_a20, 19)), 4294967295)), band(bor(shr(c_a20, 22), shl(c_a20, 10)), 4294967295)), 4294967295) + band(bxor(bxor(band(c_a20, c_a19), band(c_a20, c_a18)), band(c_a19, c_a18)), 4294967295), 4294967295)
+    let c_e21 = band(c_a17 + c_t1_21, 4294967295)
+    let c_a21 = band(c_t1_21 + c_t2_21, 4294967295)
+    let c_t1_22 = band(c_e18 + band(bxor(bxor(band(bor(shr(c_e21, 6), shl(c_e21, 26)), 4294967295), band(bor(shr(c_e21, 11), shl(c_e21, 21)), 4294967295)), band(bor(shr(c_e21, 25), shl(c_e21, 7)), 4294967295)), 4294967295) + band(bxor(band(c_e21, c_e20), band(bnot(c_e21), c_e19)), 4294967295) + 1555081692 + c_w22, 4294967295)
+    let c_t2_22 = band(band(bxor(bxor(band(bor(shr(c_a21, 2), shl(c_a21, 30)), 4294967295), band(bor(shr(c_a21, 13), shl(c_a21, 19)), 4294967295)), band(bor(shr(c_a21, 22), shl(c_a21, 10)), 4294967295)), 4294967295) + band(bxor(bxor(band(c_a21, c_a20), band(c_a21, c_a19)), band(c_a20, c_a19)), 4294967295), 4294967295)
+    let c_e22 = band(c_a18 + c_t1_22, 4294967295)
+    let c_a22 = band(c_t1_22 + c_t2_22, 4294967295)
+    let c_t1_23 = band(c_e19 + band(bxor(bxor(band(bor(shr(c_e22, 6), shl(c_e22, 26)), 4294967295), band(bor(shr(c_e22, 11), shl(c_e22, 21)), 4294967295)), band(bor(shr(c_e22, 25), shl(c_e22, 7)), 4294967295)), 4294967295) + band(bxor(band(c_e22, c_e21), band(bnot(c_e22), c_e20)), 4294967295) + 1996064986 + c_w23, 4294967295)
+    let c_t2_23 = band(band(bxor(bxor(band(bor(shr(c_a22, 2), shl(c_a22, 30)), 4294967295), band(bor(shr(c_a22, 13), shl(c_a22, 19)), 4294967295)), band(bor(shr(c_a22, 22), shl(c_a22, 10)), 4294967295)), 4294967295) + band(bxor(bxor(band(c_a22, c_a21), band(c_a22, c_a20)), band(c_a21, c_a20)), 4294967295), 4294967295)
+    let c_e23 = band(c_a19 + c_t1_23, 4294967295)
+    let c_a23 = band(c_t1_23 + c_t2_23, 4294967295)
+    let c_t1_24 = band(c_e20 + band(bxor(bxor(band(bor(shr(c_e23, 6), shl(c_e23, 26)), 4294967295), band(bor(shr(c_e23, 11), shl(c_e23, 21)), 4294967295)), band(bor(shr(c_e23, 25), shl(c_e23, 7)), 4294967295)), 4294967295) + band(bxor(band(c_e23, c_e22), band(bnot(c_e23), c_e21)), 4294967295) + 2554220882 + c_w24, 4294967295)
+    let c_t2_24 = band(band(bxor(bxor(band(bor(shr(c_a23, 2), shl(c_a23, 30)), 4294967295), band(bor(shr(c_a23, 13), shl(c_a23, 19)), 4294967295)), band(bor(shr(c_a23, 22), shl(c_a23, 10)), 4294967295)), 4294967295) + band(bxor(bxor(band(c_a23, c_a22), band(c_a23, c_a21)), band(c_a22, c_a21)), 4294967295), 4294967295)
+    let c_e24 = band(c_a20 + c_t1_24, 4294967295)
+    let c_a24 = band(c_t1_24 + c_t2_24, 4294967295)
+    let c_t1_25 = band(c_e21 + band(bxor(bxor(band(bor(shr(c_e24, 6), shl(c_e24, 26)), 4294967295), band(bor(shr(c_e24, 11), shl(c_e24, 21)), 4294967295)), band(bor(shr(c_e24, 25), shl(c_e24, 7)), 4294967295)), 4294967295) + band(bxor(band(c_e24, c_e23), band(bnot(c_e24), c_e22)), 4294967295) + 2821834349 + c_w25, 4294967295)
+    let c_t2_25 = band(band(bxor(bxor(band(bor(shr(c_a24, 2), shl(c_a24, 30)), 4294967295), band(bor(shr(c_a24, 13), shl(c_a24, 19)), 4294967295)), band(bor(shr(c_a24, 22), shl(c_a24, 10)), 4294967295)), 4294967295) + band(bxor(bxor(band(c_a24, c_a23), band(c_a24, c_a22)), band(c_a23, c_a22)), 4294967295), 4294967295)
+    let c_e25 = band(c_a21 + c_t1_25, 4294967295)
+    let c_a25 = band(c_t1_25 + c_t2_25, 4294967295)
+    let c_t1_26 = band(c_e22 + band(bxor(bxor(band(bor(shr(c_e25, 6), shl(c_e25, 26)), 4294967295), band(bor(shr(c_e25, 11), shl(c_e25, 21)), 4294967295)), band(bor(shr(c_e25, 25), shl(c_e25, 7)), 4294967295)), 4294967295) + band(bxor(band(c_e25, c_e24), band(bnot(c_e25), c_e23)), 4294967295) + 2952996808 + c_w26, 4294967295)
+    let c_t2_26 = band(band(bxor(bxor(band(bor(shr(c_a25, 2), shl(c_a25, 30)), 4294967295), band(bor(shr(c_a25, 13), shl(c_a25, 19)), 4294967295)), band(bor(shr(c_a25, 22), shl(c_a25, 10)), 4294967295)), 4294967295) + band(bxor(bxor(band(c_a25, c_a24), band(c_a25, c_a23)), band(c_a24, c_a23)), 4294967295), 4294967295)
+    let c_e26 = band(c_a22 + c_t1_26, 4294967295)
+    let c_a26 = band(c_t1_26 + c_t2_26, 4294967295)
+    let c_t1_27 = band(c_e23 + band(bxor(bxor(band(bor(shr(c_e26, 6), shl(c_e26, 26)), 4294967295), band(bor(shr(c_e26, 11), shl(c_e26, 21)), 4294967295)), band(bor(shr(c_e26, 25), shl(c_e26, 7)), 4294967295)), 4294967295) + band(bxor(band(c_e26, c_e25), band(bnot(c_e26), c_e24)), 4294967295) + 3210313671 + c_w27, 4294967295)
+    let c_t2_27 = band(band(bxor(bxor(band(bor(shr(c_a26, 2), shl(c_a26, 30)), 4294967295), band(bor(shr(c_a26, 13), shl(c_a26, 19)), 4294967295)), band(bor(shr(c_a26, 22), shl(c_a26, 10)), 4294967295)), 4294967295) + band(bxor(bxor(band(c_a26, c_a25), band(c_a26, c_a24)), band(c_a25, c_a24)), 4294967295), 4294967295)
+    let c_e27 = band(c_a23 + c_t1_27, 4294967295)
+    let c_a27 = band(c_t1_27 + c_t2_27, 4294967295)
+    let c_t1_28 = band(c_e24 + band(bxor(bxor(band(bor(shr(c_e27, 6), shl(c_e27, 26)), 4294967295), band(bor(shr(c_e27, 11), shl(c_e27, 21)), 4294967295)), band(bor(shr(c_e27, 25), shl(c_e27, 7)), 4294967295)), 4294967295) + band(bxor(band(c_e27, c_e26), band(bnot(c_e27), c_e25)), 4294967295) + 3336571891 + c_w28, 4294967295)
+    let c_t2_28 = band(band(bxor(bxor(band(bor(shr(c_a27, 2), shl(c_a27, 30)), 4294967295), band(bor(shr(c_a27, 13), shl(c_a27, 19)), 4294967295)), band(bor(shr(c_a27, 22), shl(c_a27, 10)), 4294967295)), 4294967295) + band(bxor(bxor(band(c_a27, c_a26), band(c_a27, c_a25)), band(c_a26, c_a25)), 4294967295), 4294967295)
+    let c_e28 = band(c_a24 + c_t1_28, 4294967295)
+    let c_a28 = band(c_t1_28 + c_t2_28, 4294967295)
+    let c_t1_29 = band(c_e25 + band(bxor(bxor(band(bor(shr(c_e28, 6), shl(c_e28, 26)), 4294967295), band(bor(shr(c_e28, 11), shl(c_e28, 21)), 4294967295)), band(bor(shr(c_e28, 25), shl(c_e28, 7)), 4294967295)), 4294967295) + band(bxor(band(c_e28, c_e27), band(bnot(c_e28), c_e26)), 4294967295) + 3584528711 + c_w29, 4294967295)
+    let c_t2_29 = band(band(bxor(bxor(band(bor(shr(c_a28, 2), shl(c_a28, 30)), 4294967295), band(bor(shr(c_a28, 13), shl(c_a28, 19)), 4294967295)), band(bor(shr(c_a28, 22), shl(c_a28, 10)), 4294967295)), 4294967295) + band(bxor(bxor(band(c_a28, c_a27), band(c_a28, c_a26)), band(c_a27, c_a26)), 4294967295), 4294967295)
+    let c_e29 = band(c_a25 + c_t1_29, 4294967295)
+    let c_a29 = band(c_t1_29 + c_t2_29, 4294967295)
+    let c_t1_30 = band(c_e26 + band(bxor(bxor(band(bor(shr(c_e29, 6), shl(c_e29, 26)), 4294967295), band(bor(shr(c_e29, 11), shl(c_e29, 21)), 4294967295)), band(bor(shr(c_e29, 25), shl(c_e29, 7)), 4294967295)), 4294967295) + band(bxor(band(c_e29, c_e28), band(bnot(c_e29), c_e27)), 4294967295) + 113926993 + c_w30, 4294967295)
+    let c_t2_30 = band(band(bxor(bxor(band(bor(shr(c_a29, 2), shl(c_a29, 30)), 4294967295), band(bor(shr(c_a29, 13), shl(c_a29, 19)), 4294967295)), band(bor(shr(c_a29, 22), shl(c_a29, 10)), 4294967295)), 4294967295) + band(bxor(bxor(band(c_a29, c_a28), band(c_a29, c_a27)), band(c_a28, c_a27)), 4294967295), 4294967295)
+    let c_e30 = band(c_a26 + c_t1_30, 4294967295)
+    let c_a30 = band(c_t1_30 + c_t2_30, 4294967295)
+    let c_t1_31 = band(c_e27 + band(bxor(bxor(band(bor(shr(c_e30, 6), shl(c_e30, 26)), 4294967295), band(bor(shr(c_e30, 11), shl(c_e30, 21)), 4294967295)), band(bor(shr(c_e30, 25), shl(c_e30, 7)), 4294967295)), 4294967295) + band(bxor(band(c_e30, c_e29), band(bnot(c_e30), c_e28)), 4294967295) + 338241895 + c_w31, 4294967295)
+    let c_t2_31 = band(band(bxor(bxor(band(bor(shr(c_a30, 2), shl(c_a30, 30)), 4294967295), band(bor(shr(c_a30, 13), shl(c_a30, 19)), 4294967295)), band(bor(shr(c_a30, 22), shl(c_a30, 10)), 4294967295)), 4294967295) + band(bxor(bxor(band(c_a30, c_a29), band(c_a30, c_a28)), band(c_a29, c_a28)), 4294967295), 4294967295)
+    let c_e31 = band(c_a27 + c_t1_31, 4294967295)
+    let c_a31 = band(c_t1_31 + c_t2_31, 4294967295)
+    let c_t1_32 = band(c_e28 + band(bxor(bxor(band(bor(shr(c_e31, 6), shl(c_e31, 26)), 4294967295), band(bor(shr(c_e31, 11), shl(c_e31, 21)), 4294967295)), band(bor(shr(c_e31, 25), shl(c_e31, 7)), 4294967295)), 4294967295) + band(bxor(band(c_e31, c_e30), band(bnot(c_e31), c_e29)), 4294967295) + 666307205 + c_w32, 4294967295)
+    let c_t2_32 = band(band(bxor(bxor(band(bor(shr(c_a31, 2), shl(c_a31, 30)), 4294967295), band(bor(shr(c_a31, 13), shl(c_a31, 19)), 4294967295)), band(bor(shr(c_a31, 22), shl(c_a31, 10)), 4294967295)), 4294967295) + band(bxor(bxor(band(c_a31, c_a30), band(c_a31, c_a29)), band(c_a30, c_a29)), 4294967295), 4294967295)
+    let c_e32 = band(c_a28 + c_t1_32, 4294967295)
+    let c_a32 = band(c_t1_32 + c_t2_32, 4294967295)
+    let c_t1_33 = band(c_e29 + band(bxor(bxor(band(bor(shr(c_e32, 6), shl(c_e32, 26)), 4294967295), band(bor(shr(c_e32, 11), shl(c_e32, 21)), 4294967295)), band(bor(shr(c_e32, 25), shl(c_e32, 7)), 4294967295)), 4294967295) + band(bxor(band(c_e32, c_e31), band(bnot(c_e32), c_e30)), 4294967295) + 773529912 + c_w33, 4294967295)
+    let c_t2_33 = band(band(bxor(bxor(band(bor(shr(c_a32, 2), shl(c_a32, 30)), 4294967295), band(bor(shr(c_a32, 13), shl(c_a32, 19)), 4294967295)), band(bor(shr(c_a32, 22), shl(c_a32, 10)), 4294967295)), 4294967295) + band(bxor(bxor(band(c_a32, c_a31), band(c_a32, c_a30)), band(c_a31, c_a30)), 4294967295), 4294967295)
+    let c_e33 = band(c_a29 + c_t1_33, 4294967295)
+    let c_a33 = band(c_t1_33 + c_t2_33, 4294967295)
+    let c_t1_34 = band(c_e30 + band(bxor(bxor(band(bor(shr(c_e33, 6), shl(c_e33, 26)), 4294967295), band(bor(shr(c_e33, 11), shl(c_e33, 21)), 4294967295)), band(bor(shr(c_e33, 25), shl(c_e33, 7)), 4294967295)), 4294967295) + band(bxor(band(c_e33, c_e32), band(bnot(c_e33), c_e31)), 4294967295) + 1294757372 + c_w34, 4294967295)
+    let c_t2_34 = band(band(bxor(bxor(band(bor(shr(c_a33, 2), shl(c_a33, 30)), 4294967295), band(bor(shr(c_a33, 13), shl(c_a33, 19)), 4294967295)), band(bor(shr(c_a33, 22), shl(c_a33, 10)), 4294967295)), 4294967295) + band(bxor(bxor(band(c_a33, c_a32), band(c_a33, c_a31)), band(c_a32, c_a31)), 4294967295), 4294967295)
+    let c_e34 = band(c_a30 + c_t1_34, 4294967295)
+    let c_a34 = band(c_t1_34 + c_t2_34, 4294967295)
+    let c_t1_35 = band(c_e31 + band(bxor(bxor(band(bor(shr(c_e34, 6), shl(c_e34, 26)), 4294967295), band(bor(shr(c_e34, 11), shl(c_e34, 21)), 4294967295)), band(bor(shr(c_e34, 25), shl(c_e34, 7)), 4294967295)), 4294967295) + band(bxor(band(c_e34, c_e33), band(bnot(c_e34), c_e32)), 4294967295) + 1396182291 + c_w35, 4294967295)
+    let c_t2_35 = band(band(bxor(bxor(band(bor(shr(c_a34, 2), shl(c_a34, 30)), 4294967295), band(bor(shr(c_a34, 13), shl(c_a34, 19)), 4294967295)), band(bor(shr(c_a34, 22), shl(c_a34, 10)), 4294967295)), 4294967295) + band(bxor(bxor(band(c_a34, c_a33), band(c_a34, c_a32)), band(c_a33, c_a32)), 4294967295), 4294967295)
+    let c_e35 = band(c_a31 + c_t1_35, 4294967295)
+    let c_a35 = band(c_t1_35 + c_t2_35, 4294967295)
+    let c_t1_36 = band(c_e32 + band(bxor(bxor(band(bor(shr(c_e35, 6), shl(c_e35, 26)), 4294967295), band(bor(shr(c_e35, 11), shl(c_e35, 21)), 4294967295)), band(bor(shr(c_e35, 25), shl(c_e35, 7)), 4294967295)), 4294967295) + band(bxor(band(c_e35, c_e34), band(bnot(c_e35), c_e33)), 4294967295) + 1695183700 + c_w36, 4294967295)
+    let c_t2_36 = band(band(bxor(bxor(band(bor(shr(c_a35, 2), shl(c_a35, 30)), 4294967295), band(bor(shr(c_a35, 13), shl(c_a35, 19)), 4294967295)), band(bor(shr(c_a35, 22), shl(c_a35, 10)), 4294967295)), 4294967295) + band(bxor(bxor(band(c_a35, c_a34), band(c_a35, c_a33)), band(c_a34, c_a33)), 4294967295), 4294967295)
+    let c_e36 = band(c_a32 + c_t1_36, 4294967295)
+    let c_a36 = band(c_t1_36 + c_t2_36, 4294967295)
+    let c_t1_37 = band(c_e33 + band(bxor(bxor(band(bor(shr(c_e36, 6), shl(c_e36, 26)), 4294967295), band(bor(shr(c_e36, 11), shl(c_e36, 21)), 4294967295)), band(bor(shr(c_e36, 25), shl(c_e36, 7)), 4294967295)), 4294967295) + band(bxor(band(c_e36, c_e35), band(bnot(c_e36), c_e34)), 4294967295) + 1986661051 + c_w37, 4294967295)
+    let c_t2_37 = band(band(bxor(bxor(band(bor(shr(c_a36, 2), shl(c_a36, 30)), 4294967295), band(bor(shr(c_a36, 13), shl(c_a36, 19)), 4294967295)), band(bor(shr(c_a36, 22), shl(c_a36, 10)), 4294967295)), 4294967295) + band(bxor(bxor(band(c_a36, c_a35), band(c_a36, c_a34)), band(c_a35, c_a34)), 4294967295), 4294967295)
+    let c_e37 = band(c_a33 + c_t1_37, 4294967295)
+    let c_a37 = band(c_t1_37 + c_t2_37, 4294967295)
+    let c_t1_38 = band(c_e34 + band(bxor(bxor(band(bor(shr(c_e37, 6), shl(c_e37, 26)), 4294967295), band(bor(shr(c_e37, 11), shl(c_e37, 21)), 4294967295)), band(bor(shr(c_e37, 25), shl(c_e37, 7)), 4294967295)), 4294967295) + band(bxor(band(c_e37, c_e36), band(bnot(c_e37), c_e35)), 4294967295) + 2177026350 + c_w38, 4294967295)
+    let c_t2_38 = band(band(bxor(bxor(band(bor(shr(c_a37, 2), shl(c_a37, 30)), 4294967295), band(bor(shr(c_a37, 13), shl(c_a37, 19)), 4294967295)), band(bor(shr(c_a37, 22), shl(c_a37, 10)), 4294967295)), 4294967295) + band(bxor(bxor(band(c_a37, c_a36), band(c_a37, c_a35)), band(c_a36, c_a35)), 4294967295), 4294967295)
+    let c_e38 = band(c_a34 + c_t1_38, 4294967295)
+    let c_a38 = band(c_t1_38 + c_t2_38, 4294967295)
+    let c_t1_39 = band(c_e35 + band(bxor(bxor(band(bor(shr(c_e38, 6), shl(c_e38, 26)), 4294967295), band(bor(shr(c_e38, 11), shl(c_e38, 21)), 4294967295)), band(bor(shr(c_e38, 25), shl(c_e38, 7)), 4294967295)), 4294967295) + band(bxor(band(c_e38, c_e37), band(bnot(c_e38), c_e36)), 4294967295) + 2456956037 + c_w39, 4294967295)
+    let c_t2_39 = band(band(bxor(bxor(band(bor(shr(c_a38, 2), shl(c_a38, 30)), 4294967295), band(bor(shr(c_a38, 13), shl(c_a38, 19)), 4294967295)), band(bor(shr(c_a38, 22), shl(c_a38, 10)), 4294967295)), 4294967295) + band(bxor(bxor(band(c_a38, c_a37), band(c_a38, c_a36)), band(c_a37, c_a36)), 4294967295), 4294967295)
+    let c_e39 = band(c_a35 + c_t1_39, 4294967295)
+    let c_a39 = band(c_t1_39 + c_t2_39, 4294967295)
+    let c_t1_40 = band(c_e36 + band(bxor(bxor(band(bor(shr(c_e39, 6), shl(c_e39, 26)), 4294967295), band(bor(shr(c_e39, 11), shl(c_e39, 21)), 4294967295)), band(bor(shr(c_e39, 25), shl(c_e39, 7)), 4294967295)), 4294967295) + band(bxor(band(c_e39, c_e38), band(bnot(c_e39), c_e37)), 4294967295) + 2730485921 + c_w40, 4294967295)
+    let c_t2_40 = band(band(bxor(bxor(band(bor(shr(c_a39, 2), shl(c_a39, 30)), 4294967295), band(bor(shr(c_a39, 13), shl(c_a39, 19)), 4294967295)), band(bor(shr(c_a39, 22), shl(c_a39, 10)), 4294967295)), 4294967295) + band(bxor(bxor(band(c_a39, c_a38), band(c_a39, c_a37)), band(c_a38, c_a37)), 4294967295), 4294967295)
+    let c_e40 = band(c_a36 + c_t1_40, 4294967295)
+    let c_a40 = band(c_t1_40 + c_t2_40, 4294967295)
+    let c_t1_41 = band(c_e37 + band(bxor(bxor(band(bor(shr(c_e40, 6), shl(c_e40, 26)), 4294967295), band(bor(shr(c_e40, 11), shl(c_e40, 21)), 4294967295)), band(bor(shr(c_e40, 25), shl(c_e40, 7)), 4294967295)), 4294967295) + band(bxor(band(c_e40, c_e39), band(bnot(c_e40), c_e38)), 4294967295) + 2820302411 + c_w41, 4294967295)
+    let c_t2_41 = band(band(bxor(bxor(band(bor(shr(c_a40, 2), shl(c_a40, 30)), 4294967295), band(bor(shr(c_a40, 13), shl(c_a40, 19)), 4294967295)), band(bor(shr(c_a40, 22), shl(c_a40, 10)), 4294967295)), 4294967295) + band(bxor(bxor(band(c_a40, c_a39), band(c_a40, c_a38)), band(c_a39, c_a38)), 4294967295), 4294967295)
+    let c_e41 = band(c_a37 + c_t1_41, 4294967295)
+    let c_a41 = band(c_t1_41 + c_t2_41, 4294967295)
+    let c_t1_42 = band(c_e38 + band(bxor(bxor(band(bor(shr(c_e41, 6), shl(c_e41, 26)), 4294967295), band(bor(shr(c_e41, 11), shl(c_e41, 21)), 4294967295)), band(bor(shr(c_e41, 25), shl(c_e41, 7)), 4294967295)), 4294967295) + band(bxor(band(c_e41, c_e40), band(bnot(c_e41), c_e39)), 4294967295) + 3259730800 + c_w42, 4294967295)
+    let c_t2_42 = band(band(bxor(bxor(band(bor(shr(c_a41, 2), shl(c_a41, 30)), 4294967295), band(bor(shr(c_a41, 13), shl(c_a41, 19)), 4294967295)), band(bor(shr(c_a41, 22), shl(c_a41, 10)), 4294967295)), 4294967295) + band(bxor(bxor(band(c_a41, c_a40), band(c_a41, c_a39)), band(c_a40, c_a39)), 4294967295), 4294967295)
+    let c_e42 = band(c_a38 + c_t1_42, 4294967295)
+    let c_a42 = band(c_t1_42 + c_t2_42, 4294967295)
+    let c_t1_43 = band(c_e39 + band(bxor(bxor(band(bor(shr(c_e42, 6), shl(c_e42, 26)), 4294967295), band(bor(shr(c_e42, 11), shl(c_e42, 21)), 4294967295)), band(bor(shr(c_e42, 25), shl(c_e42, 7)), 4294967295)), 4294967295) + band(bxor(band(c_e42, c_e41), band(bnot(c_e42), c_e40)), 4294967295) + 3345764771 + c_w43, 4294967295)
+    let c_t2_43 = band(band(bxor(bxor(band(bor(shr(c_a42, 2), shl(c_a42, 30)), 4294967295), band(bor(shr(c_a42, 13), shl(c_a42, 19)), 4294967295)), band(bor(shr(c_a42, 22), shl(c_a42, 10)), 4294967295)), 4294967295) + band(bxor(bxor(band(c_a42, c_a41), band(c_a42, c_a40)), band(c_a41, c_a40)), 4294967295), 4294967295)
+    let c_e43 = band(c_a39 + c_t1_43, 4294967295)
+    let c_a43 = band(c_t1_43 + c_t2_43, 4294967295)
+    let c_t1_44 = band(c_e40 + band(bxor(bxor(band(bor(shr(c_e43, 6), shl(c_e43, 26)), 4294967295), band(bor(shr(c_e43, 11), shl(c_e43, 21)), 4294967295)), band(bor(shr(c_e43, 25), shl(c_e43, 7)), 4294967295)), 4294967295) + band(bxor(band(c_e43, c_e42), band(bnot(c_e43), c_e41)), 4294967295) + 3516065817 + c_w44, 4294967295)
+    let c_t2_44 = band(band(bxor(bxor(band(bor(shr(c_a43, 2), shl(c_a43, 30)), 4294967295), band(bor(shr(c_a43, 13), shl(c_a43, 19)), 4294967295)), band(bor(shr(c_a43, 22), shl(c_a43, 10)), 4294967295)), 4294967295) + band(bxor(bxor(band(c_a43, c_a42), band(c_a43, c_a41)), band(c_a42, c_a41)), 4294967295), 4294967295)
+    let c_e44 = band(c_a40 + c_t1_44, 4294967295)
+    let c_a44 = band(c_t1_44 + c_t2_44, 4294967295)
+    let c_t1_45 = band(c_e41 + band(bxor(bxor(band(bor(shr(c_e44, 6), shl(c_e44, 26)), 4294967295), band(bor(shr(c_e44, 11), shl(c_e44, 21)), 4294967295)), band(bor(shr(c_e44, 25), shl(c_e44, 7)), 4294967295)), 4294967295) + band(bxor(band(c_e44, c_e43), band(bnot(c_e44), c_e42)), 4294967295) + 3600352804 + c_w45, 4294967295)
+    let c_t2_45 = band(band(bxor(bxor(band(bor(shr(c_a44, 2), shl(c_a44, 30)), 4294967295), band(bor(shr(c_a44, 13), shl(c_a44, 19)), 4294967295)), band(bor(shr(c_a44, 22), shl(c_a44, 10)), 4294967295)), 4294967295) + band(bxor(bxor(band(c_a44, c_a43), band(c_a44, c_a42)), band(c_a43, c_a42)), 4294967295), 4294967295)
+    let c_e45 = band(c_a41 + c_t1_45, 4294967295)
+    let c_a45 = band(c_t1_45 + c_t2_45, 4294967295)
+    let c_t1_46 = band(c_e42 + band(bxor(bxor(band(bor(shr(c_e45, 6), shl(c_e45, 26)), 4294967295), band(bor(shr(c_e45, 11), shl(c_e45, 21)), 4294967295)), band(bor(shr(c_e45, 25), shl(c_e45, 7)), 4294967295)), 4294967295) + band(bxor(band(c_e45, c_e44), band(bnot(c_e45), c_e43)), 4294967295) + 4094571909 + c_w46, 4294967295)
+    let c_t2_46 = band(band(bxor(bxor(band(bor(shr(c_a45, 2), shl(c_a45, 30)), 4294967295), band(bor(shr(c_a45, 13), shl(c_a45, 19)), 4294967295)), band(bor(shr(c_a45, 22), shl(c_a45, 10)), 4294967295)), 4294967295) + band(bxor(bxor(band(c_a45, c_a44), band(c_a45, c_a43)), band(c_a44, c_a43)), 4294967295), 4294967295)
+    let c_e46 = band(c_a42 + c_t1_46, 4294967295)
+    let c_a46 = band(c_t1_46 + c_t2_46, 4294967295)
+    let c_t1_47 = band(c_e43 + band(bxor(bxor(band(bor(shr(c_e46, 6), shl(c_e46, 26)), 4294967295), band(bor(shr(c_e46, 11), shl(c_e46, 21)), 4294967295)), band(bor(shr(c_e46, 25), shl(c_e46, 7)), 4294967295)), 4294967295) + band(bxor(band(c_e46, c_e45), band(bnot(c_e46), c_e44)), 4294967295) + 275423344 + c_w47, 4294967295)
+    let c_t2_47 = band(band(bxor(bxor(band(bor(shr(c_a46, 2), shl(c_a46, 30)), 4294967295), band(bor(shr(c_a46, 13), shl(c_a46, 19)), 4294967295)), band(bor(shr(c_a46, 22), shl(c_a46, 10)), 4294967295)), 4294967295) + band(bxor(bxor(band(c_a46, c_a45), band(c_a46, c_a44)), band(c_a45, c_a44)), 4294967295), 4294967295)
+    let c_e47 = band(c_a43 + c_t1_47, 4294967295)
+    let c_a47 = band(c_t1_47 + c_t2_47, 4294967295)
+    let c_t1_48 = band(c_e44 + band(bxor(bxor(band(bor(shr(c_e47, 6), shl(c_e47, 26)), 4294967295), band(bor(shr(c_e47, 11), shl(c_e47, 21)), 4294967295)), band(bor(shr(c_e47, 25), shl(c_e47, 7)), 4294967295)), 4294967295) + band(bxor(band(c_e47, c_e46), band(bnot(c_e47), c_e45)), 4294967295) + 430227734 + c_w48, 4294967295)
+    let c_t2_48 = band(band(bxor(bxor(band(bor(shr(c_a47, 2), shl(c_a47, 30)), 4294967295), band(bor(shr(c_a47, 13), shl(c_a47, 19)), 4294967295)), band(bor(shr(c_a47, 22), shl(c_a47, 10)), 4294967295)), 4294967295) + band(bxor(bxor(band(c_a47, c_a46), band(c_a47, c_a45)), band(c_a46, c_a45)), 4294967295), 4294967295)
+    let c_e48 = band(c_a44 + c_t1_48, 4294967295)
+    let c_a48 = band(c_t1_48 + c_t2_48, 4294967295)
+    let c_t1_49 = band(c_e45 + band(bxor(bxor(band(bor(shr(c_e48, 6), shl(c_e48, 26)), 4294967295), band(bor(shr(c_e48, 11), shl(c_e48, 21)), 4294967295)), band(bor(shr(c_e48, 25), shl(c_e48, 7)), 4294967295)), 4294967295) + band(bxor(band(c_e48, c_e47), band(bnot(c_e48), c_e46)), 4294967295) + 506948616 + c_w49, 4294967295)
+    let c_t2_49 = band(band(bxor(bxor(band(bor(shr(c_a48, 2), shl(c_a48, 30)), 4294967295), band(bor(shr(c_a48, 13), shl(c_a48, 19)), 4294967295)), band(bor(shr(c_a48, 22), shl(c_a48, 10)), 4294967295)), 4294967295) + band(bxor(bxor(band(c_a48, c_a47), band(c_a48, c_a46)), band(c_a47, c_a46)), 4294967295), 4294967295)
+    let c_e49 = band(c_a45 + c_t1_49, 4294967295)
+    let c_a49 = band(c_t1_49 + c_t2_49, 4294967295)
+    let c_t1_50 = band(c_e46 + band(bxor(bxor(band(bor(shr(c_e49, 6), shl(c_e49, 26)), 4294967295), band(bor(shr(c_e49, 11), shl(c_e49, 21)), 4294967295)), band(bor(shr(c_e49, 25), shl(c_e49, 7)), 4294967295)), 4294967295) + band(bxor(band(c_e49, c_e48), band(bnot(c_e49), c_e47)), 4294967295) + 659060556 + c_w50, 4294967295)
+    let c_t2_50 = band(band(bxor(bxor(band(bor(shr(c_a49, 2), shl(c_a49, 30)), 4294967295), band(bor(shr(c_a49, 13), shl(c_a49, 19)), 4294967295)), band(bor(shr(c_a49, 22), shl(c_a49, 10)), 4294967295)), 4294967295) + band(bxor(bxor(band(c_a49, c_a48), band(c_a49, c_a47)), band(c_a48, c_a47)), 4294967295), 4294967295)
+    let c_e50 = band(c_a46 + c_t1_50, 4294967295)
+    let c_a50 = band(c_t1_50 + c_t2_50, 4294967295)
+    let c_t1_51 = band(c_e47 + band(bxor(bxor(band(bor(shr(c_e50, 6), shl(c_e50, 26)), 4294967295), band(bor(shr(c_e50, 11), shl(c_e50, 21)), 4294967295)), band(bor(shr(c_e50, 25), shl(c_e50, 7)), 4294967295)), 4294967295) + band(bxor(band(c_e50, c_e49), band(bnot(c_e50), c_e48)), 4294967295) + 883997877 + c_w51, 4294967295)
+    let c_t2_51 = band(band(bxor(bxor(band(bor(shr(c_a50, 2), shl(c_a50, 30)), 4294967295), band(bor(shr(c_a50, 13), shl(c_a50, 19)), 4294967295)), band(bor(shr(c_a50, 22), shl(c_a50, 10)), 4294967295)), 4294967295) + band(bxor(bxor(band(c_a50, c_a49), band(c_a50, c_a48)), band(c_a49, c_a48)), 4294967295), 4294967295)
+    let c_e51 = band(c_a47 + c_t1_51, 4294967295)
+    let c_a51 = band(c_t1_51 + c_t2_51, 4294967295)
+    let c_t1_52 = band(c_e48 + band(bxor(bxor(band(bor(shr(c_e51, 6), shl(c_e51, 26)), 4294967295), band(bor(shr(c_e51, 11), shl(c_e51, 21)), 4294967295)), band(bor(shr(c_e51, 25), shl(c_e51, 7)), 4294967295)), 4294967295) + band(bxor(band(c_e51, c_e50), band(bnot(c_e51), c_e49)), 4294967295) + 958139571 + c_w52, 4294967295)
+    let c_t2_52 = band(band(bxor(bxor(band(bor(shr(c_a51, 2), shl(c_a51, 30)), 4294967295), band(bor(shr(c_a51, 13), shl(c_a51, 19)), 4294967295)), band(bor(shr(c_a51, 22), shl(c_a51, 10)), 4294967295)), 4294967295) + band(bxor(bxor(band(c_a51, c_a50), band(c_a51, c_a49)), band(c_a50, c_a49)), 4294967295), 4294967295)
+    let c_e52 = band(c_a48 + c_t1_52, 4294967295)
+    let c_a52 = band(c_t1_52 + c_t2_52, 4294967295)
+    let c_t1_53 = band(c_e49 + band(bxor(bxor(band(bor(shr(c_e52, 6), shl(c_e52, 26)), 4294967295), band(bor(shr(c_e52, 11), shl(c_e52, 21)), 4294967295)), band(bor(shr(c_e52, 25), shl(c_e52, 7)), 4294967295)), 4294967295) + band(bxor(band(c_e52, c_e51), band(bnot(c_e52), c_e50)), 4294967295) + 1322822218 + c_w53, 4294967295)
+    let c_t2_53 = band(band(bxor(bxor(band(bor(shr(c_a52, 2), shl(c_a52, 30)), 4294967295), band(bor(shr(c_a52, 13), shl(c_a52, 19)), 4294967295)), band(bor(shr(c_a52, 22), shl(c_a52, 10)), 4294967295)), 4294967295) + band(bxor(bxor(band(c_a52, c_a51), band(c_a52, c_a50)), band(c_a51, c_a50)), 4294967295), 4294967295)
+    let c_e53 = band(c_a49 + c_t1_53, 4294967295)
+    let c_a53 = band(c_t1_53 + c_t2_53, 4294967295)
+    let c_t1_54 = band(c_e50 + band(bxor(bxor(band(bor(shr(c_e53, 6), shl(c_e53, 26)), 4294967295), band(bor(shr(c_e53, 11), shl(c_e53, 21)), 4294967295)), band(bor(shr(c_e53, 25), shl(c_e53, 7)), 4294967295)), 4294967295) + band(bxor(band(c_e53, c_e52), band(bnot(c_e53), c_e51)), 4294967295) + 1537002063 + c_w54, 4294967295)
+    let c_t2_54 = band(band(bxor(bxor(band(bor(shr(c_a53, 2), shl(c_a53, 30)), 4294967295), band(bor(shr(c_a53, 13), shl(c_a53, 19)), 4294967295)), band(bor(shr(c_a53, 22), shl(c_a53, 10)), 4294967295)), 4294967295) + band(bxor(bxor(band(c_a53, c_a52), band(c_a53, c_a51)), band(c_a52, c_a51)), 4294967295), 4294967295)
+    let c_e54 = band(c_a50 + c_t1_54, 4294967295)
+    let c_a54 = band(c_t1_54 + c_t2_54, 4294967295)
+    let c_t1_55 = band(c_e51 + band(bxor(bxor(band(bor(shr(c_e54, 6), shl(c_e54, 26)), 4294967295), band(bor(shr(c_e54, 11), shl(c_e54, 21)), 4294967295)), band(bor(shr(c_e54, 25), shl(c_e54, 7)), 4294967295)), 4294967295) + band(bxor(band(c_e54, c_e53), band(bnot(c_e54), c_e52)), 4294967295) + 1747873779 + c_w55, 4294967295)
+    let c_t2_55 = band(band(bxor(bxor(band(bor(shr(c_a54, 2), shl(c_a54, 30)), 4294967295), band(bor(shr(c_a54, 13), shl(c_a54, 19)), 4294967295)), band(bor(shr(c_a54, 22), shl(c_a54, 10)), 4294967295)), 4294967295) + band(bxor(bxor(band(c_a54, c_a53), band(c_a54, c_a52)), band(c_a53, c_a52)), 4294967295), 4294967295)
+    let c_e55 = band(c_a51 + c_t1_55, 4294967295)
+    let c_a55 = band(c_t1_55 + c_t2_55, 4294967295)
+    let c_t1_56 = band(c_e52 + band(bxor(bxor(band(bor(shr(c_e55, 6), shl(c_e55, 26)), 4294967295), band(bor(shr(c_e55, 11), shl(c_e55, 21)), 4294967295)), band(bor(shr(c_e55, 25), shl(c_e55, 7)), 4294967295)), 4294967295) + band(bxor(band(c_e55, c_e54), band(bnot(c_e55), c_e53)), 4294967295) + 1955562222 + c_w56, 4294967295)
+    let c_t2_56 = band(band(bxor(bxor(band(bor(shr(c_a55, 2), shl(c_a55, 30)), 4294967295), band(bor(shr(c_a55, 13), shl(c_a55, 19)), 4294967295)), band(bor(shr(c_a55, 22), shl(c_a55, 10)), 4294967295)), 4294967295) + band(bxor(bxor(band(c_a55, c_a54), band(c_a55, c_a53)), band(c_a54, c_a53)), 4294967295), 4294967295)
+    let c_e56 = band(c_a52 + c_t1_56, 4294967295)
+    let c_a56 = band(c_t1_56 + c_t2_56, 4294967295)
+    let c_t1_57 = band(c_e53 + band(bxor(bxor(band(bor(shr(c_e56, 6), shl(c_e56, 26)), 4294967295), band(bor(shr(c_e56, 11), shl(c_e56, 21)), 4294967295)), band(bor(shr(c_e56, 25), shl(c_e56, 7)), 4294967295)), 4294967295) + band(bxor(band(c_e56, c_e55), band(bnot(c_e56), c_e54)), 4294967295) + 2024104815 + c_w57, 4294967295)
+    let c_t2_57 = band(band(bxor(bxor(band(bor(shr(c_a56, 2), shl(c_a56, 30)), 4294967295), band(bor(shr(c_a56, 13), shl(c_a56, 19)), 4294967295)), band(bor(shr(c_a56, 22), shl(c_a56, 10)), 4294967295)), 4294967295) + band(bxor(bxor(band(c_a56, c_a55), band(c_a56, c_a54)), band(c_a55, c_a54)), 4294967295), 4294967295)
+    let c_e57 = band(c_a53 + c_t1_57, 4294967295)
+    let c_a57 = band(c_t1_57 + c_t2_57, 4294967295)
+    let c_t1_58 = band(c_e54 + band(bxor(bxor(band(bor(shr(c_e57, 6), shl(c_e57, 26)), 4294967295), band(bor(shr(c_e57, 11), shl(c_e57, 21)), 4294967295)), band(bor(shr(c_e57, 25), shl(c_e57, 7)), 4294967295)), 4294967295) + band(bxor(band(c_e57, c_e56), band(bnot(c_e57), c_e55)), 4294967295) + 2227730452 + c_w58, 4294967295)
+    let c_t2_58 = band(band(bxor(bxor(band(bor(shr(c_a57, 2), shl(c_a57, 30)), 4294967295), band(bor(shr(c_a57, 13), shl(c_a57, 19)), 4294967295)), band(bor(shr(c_a57, 22), shl(c_a57, 10)), 4294967295)), 4294967295) + band(bxor(bxor(band(c_a57, c_a56), band(c_a57, c_a55)), band(c_a56, c_a55)), 4294967295), 4294967295)
+    let c_e58 = band(c_a54 + c_t1_58, 4294967295)
+    let c_a58 = band(c_t1_58 + c_t2_58, 4294967295)
+    let c_t1_59 = band(c_e55 + band(bxor(bxor(band(bor(shr(c_e58, 6), shl(c_e58, 26)), 4294967295), band(bor(shr(c_e58, 11), shl(c_e58, 21)), 4294967295)), band(bor(shr(c_e58, 25), shl(c_e58, 7)), 4294967295)), 4294967295) + band(bxor(band(c_e58, c_e57), band(bnot(c_e58), c_e56)), 4294967295) + 2361852424 + c_w59, 4294967295)
+    let c_t2_59 = band(band(bxor(bxor(band(bor(shr(c_a58, 2), shl(c_a58, 30)), 4294967295), band(bor(shr(c_a58, 13), shl(c_a58, 19)), 4294967295)), band(bor(shr(c_a58, 22), shl(c_a58, 10)), 4294967295)), 4294967295) + band(bxor(bxor(band(c_a58, c_a57), band(c_a58, c_a56)), band(c_a57, c_a56)), 4294967295), 4294967295)
+    let c_e59 = band(c_a55 + c_t1_59, 4294967295)
+    let c_a59 = band(c_t1_59 + c_t2_59, 4294967295)
+    let c_t1_60 = band(c_e56 + band(bxor(bxor(band(bor(shr(c_e59, 6), shl(c_e59, 26)), 4294967295), band(bor(shr(c_e59, 11), shl(c_e59, 21)), 4294967295)), band(bor(shr(c_e59, 25), shl(c_e59, 7)), 4294967295)), 4294967295) + band(bxor(band(c_e59, c_e58), band(bnot(c_e59), c_e57)), 4294967295) + 2428436474 + c_w60, 4294967295)
+    let c_t2_60 = band(band(bxor(bxor(band(bor(shr(c_a59, 2), shl(c_a59, 30)), 4294967295), band(bor(shr(c_a59, 13), shl(c_a59, 19)), 4294967295)), band(bor(shr(c_a59, 22), shl(c_a59, 10)), 4294967295)), 4294967295) + band(bxor(bxor(band(c_a59, c_a58), band(c_a59, c_a57)), band(c_a58, c_a57)), 4294967295), 4294967295)
+    let c_e60 = band(c_a56 + c_t1_60, 4294967295)
+    let c_a60 = band(c_t1_60 + c_t2_60, 4294967295)
+    let c_t1_61 = band(c_e57 + band(bxor(bxor(band(bor(shr(c_e60, 6), shl(c_e60, 26)), 4294967295), band(bor(shr(c_e60, 11), shl(c_e60, 21)), 4294967295)), band(bor(shr(c_e60, 25), shl(c_e60, 7)), 4294967295)), 4294967295) + band(bxor(band(c_e60, c_e59), band(bnot(c_e60), c_e58)), 4294967295) + 2756734187 + c_w61, 4294967295)
+    let c_t2_61 = band(band(bxor(bxor(band(bor(shr(c_a60, 2), shl(c_a60, 30)), 4294967295), band(bor(shr(c_a60, 13), shl(c_a60, 19)), 4294967295)), band(bor(shr(c_a60, 22), shl(c_a60, 10)), 4294967295)), 4294967295) + band(bxor(bxor(band(c_a60, c_a59), band(c_a60, c_a58)), band(c_a59, c_a58)), 4294967295), 4294967295)
+    let c_e61 = band(c_a57 + c_t1_61, 4294967295)
+    let c_a61 = band(c_t1_61 + c_t2_61, 4294967295)
+    let c_t1_62 = band(c_e58 + band(bxor(bxor(band(bor(shr(c_e61, 6), shl(c_e61, 26)), 4294967295), band(bor(shr(c_e61, 11), shl(c_e61, 21)), 4294967295)), band(bor(shr(c_e61, 25), shl(c_e61, 7)), 4294967295)), 4294967295) + band(bxor(band(c_e61, c_e60), band(bnot(c_e61), c_e59)), 4294967295) + 3204031479 + c_w62, 4294967295)
+    let c_t2_62 = band(band(bxor(bxor(band(bor(shr(c_a61, 2), shl(c_a61, 30)), 4294967295), band(bor(shr(c_a61, 13), shl(c_a61, 19)), 4294967295)), band(bor(shr(c_a61, 22), shl(c_a61, 10)), 4294967295)), 4294967295) + band(bxor(bxor(band(c_a61, c_a60), band(c_a61, c_a59)), band(c_a60, c_a59)), 4294967295), 4294967295)
+    let c_e62 = band(c_a58 + c_t1_62, 4294967295)
+    let c_a62 = band(c_t1_62 + c_t2_62, 4294967295)
+    let c_t1_63 = band(c_e59 + band(bxor(bxor(band(bor(shr(c_e62, 6), shl(c_e62, 26)), 4294967295), band(bor(shr(c_e62, 11), shl(c_e62, 21)), 4294967295)), band(bor(shr(c_e62, 25), shl(c_e62, 7)), 4294967295)), 4294967295) + band(bxor(band(c_e62, c_e61), band(bnot(c_e62), c_e60)), 4294967295) + 3329325298 + c_w63, 4294967295)
+    let c_t2_63 = band(band(bxor(bxor(band(bor(shr(c_a62, 2), shl(c_a62, 30)), 4294967295), band(bor(shr(c_a62, 13), shl(c_a62, 19)), 4294967295)), band(bor(shr(c_a62, 22), shl(c_a62, 10)), 4294967295)), 4294967295) + band(bxor(bxor(band(c_a62, c_a61), band(c_a62, c_a60)), band(c_a61, c_a60)), 4294967295), 4294967295)
+    let c_e63 = band(c_a59 + c_t1_63, 4294967295)
+    let c_a63 = band(c_t1_63 + c_t2_63, 4294967295)
+    let c_h0 = band(s.h0 + c_a63, 4294967295)
+    let c_h1 = band(s.h1 + c_a62, 4294967295)
+    let c_h2 = band(s.h2 + c_a61, 4294967295)
+    let c_h3 = band(s.h3 + c_a60, 4294967295)
+    let c_h4 = band(s.h4 + c_e63, 4294967295)
+    let c_h5 = band(s.h5 + c_e62, 4294967295)
+    let c_h6 = band(s.h6 + c_e61, 4294967295)
+    let c_h7 = band(s.h7 + c_e60, 4294967295)
+    out = if s.i == 0 then if s.which == 0 then band(shr(s.h0, 24), 255) else if s.which == 1 then band(shr(s.h0, 16), 255) else if s.which == 2 then band(shr(s.h0, 8), 255) else if s.which == 3 then band(shr(s.h0, 0), 255) else if s.which == 4 then band(shr(s.h1, 24), 255) else if s.which == 5 then band(shr(s.h1, 16), 255) else if s.which == 6 then band(shr(s.h1, 8), 255) else if s.which == 7 then band(shr(s.h1, 0), 255) else if s.which == 8 then band(shr(s.h2, 24), 255) else if s.which == 9 then band(shr(s.h2, 16), 255) else if s.which == 10 then band(shr(s.h2, 8), 255) else if s.which == 11 then band(shr(s.h2, 0), 255) else if s.which == 12 then band(shr(s.h3, 24), 255) else if s.which == 13 then band(shr(s.h3, 16), 255) else if s.which == 14 then band(shr(s.h3, 8), 255) else if s.which == 15 then band(shr(s.h3, 0), 255) else if s.which == 16 then band(shr(s.h4, 24), 255) else if s.which == 17 then band(shr(s.h4, 16), 255) else if s.which == 18 then band(shr(s.h4, 8), 255) else if s.which == 19 then band(shr(s.h4, 0), 255) else if s.which == 20 then band(shr(s.h5, 24), 255) else if s.which == 21 then band(shr(s.h5, 16), 255) else if s.which == 22 then band(shr(s.h5, 8), 255) else if s.which == 23 then band(shr(s.h5, 0), 255) else if s.which == 24 then band(shr(s.h6, 24), 255) else if s.which == 25 then band(shr(s.h6, 16), 255) else if s.which == 26 then band(shr(s.h6, 8), 255) else if s.which == 27 then band(shr(s.h6, 0), 255) else if s.which == 28 then band(shr(s.h7, 24), 255) else if s.which == 29 then band(shr(s.h7, 16), 255) else if s.which == 30 then band(shr(s.h7, 8), 255) else band(shr(s.h7, 0), 255) else sha256_fold(ShaState { h0: c_h0, h1: c_h1, h2: c_h2, h3: c_h3, h4: c_h4, h5: c_h5, h6: c_h6, h7: c_h7, nblocks: s.nblocks, i: s.i - 1, which: s.which, data: s.data })
+  proofs:
+    purity:
+      reads : [s.h0, s.h1, s.h2, s.h3, s.h4, s.h5, s.h6, s.h7, s.nblocks, s.i, s.which, s.data]
+      calls : [sha256_fold]
+    termination:
+      bound : 400000
+      decreasing : i
