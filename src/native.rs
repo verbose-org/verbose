@@ -29240,4 +29240,92 @@ rule extract_word
         let _ = std::fs::remove_file(&encode_bin);
     }
 
+
+    // One Montgomery differential add-and-double (RFC 7748 fmonty), Rust port,
+    // composing the field ops already defined above. Used to lock ladder_step.
+    fn x_step(x2: &[i64;10], z2: &[i64;10], x3: &[i64;10], z3: &[i64;10], x1: &[i64;10])
+        -> ([i64;10],[i64;10],[i64;10],[i64;10]) {
+        let sq = |a: &[i64;10]| x_fmul(a, a);
+        let a  = x_fadd(x2, z2);
+        let aa = sq(&a);
+        let b  = x_fsub(x2, z2);
+        let bb = sq(&b);
+        let e  = x_fsub(&aa, &bb);
+        let c  = x_fadd(x3, z3);
+        let d  = x_fsub(x3, z3);
+        let da = x_fmul(&d, &a);
+        let cb = x_fmul(&c, &b);
+        let x3n = sq(&x_fadd(&da, &cb));
+        let z3n = x_fmul(x1, &sq(&x_fsub(&da, &cb)));
+        let x2n = x_fmul(&aa, &bb);
+        let a24 = [121665i64, 0,0,0,0,0,0,0,0,0];
+        let a24e = x_fmul(&e, &a24);
+        let z2n = x_fmul(&e, &x_fadd(&aa, &a24e));
+        (x2n, z2n, x3n, z3n)
+    }
+
+    #[test]
+    fn x25519_ladder_step_matches_reference() {
+        let h = std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(x25519_ladder_step_test_body)
+            .expect("spawn");
+        h.join().expect("test thread panicked");
+    }
+
+    fn x25519_ladder_step_test_body() {
+        let src = std::fs::read_to_string("examples/ladder_step.verbose")
+            .expect("examples/ladder_step.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+        let out = std::env::temp_dir().join("verbosec_test_ladder_step");
+        compile_native(&program, "ladder_step", out.to_str().unwrap(), false, false)
+            .expect("ladder_step must compile");
+        #[cfg(unix)]
+        { use std::os::unix::fs::PermissionsExt;
+          let _ = std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o755)); }
+
+        let run = |e: &[[i64;10];5]| -> [i64;40] {
+            let mut r = [0i64;40];
+            for w in 0..40u8 {
+                let mut cmd = std::process::Command::new(&out);
+                for elem in e.iter() { for v in elem.iter() { cmd.arg(v.to_string()); } }
+                cmd.arg(w.to_string());
+                let o = cmd.output().expect("run");
+                r[w as usize] = String::from_utf8_lossy(&o.stdout).trim().parse()
+                    .unwrap_or_else(|_| panic!("parse w={}", w));
+            }
+            r
+        };
+        let cat = |a:&[i64;10],b:&[i64;10],c:&[i64;10],d:&[i64;10]| -> [i64;40] {
+            let mut r=[0i64;40];
+            for i in 0..10 { r[i]=a[i]; r[10+i]=b[i]; r[20+i]=c[i]; r[30+i]=d[i]; }
+            r
+        };
+        let to_limbs = |x: u128| -> [i64;10] {
+            const OFF: [u32;10] = [0,26,51,77,102,128,153,179,204,230];
+            let mut l=[0i64;10];
+            for i in 0..10 { l[i] = ((x >> OFF[i]) as i64) & x_mask(i); }
+            l
+        };
+
+        // Edge: base-point ladder start (x2=1, z2=0, x3=u, z3=1, x1=u=9).
+        let edge = [to_limbs(1), to_limbs(0), to_limbs(9), to_limbs(1), to_limbs(9)];
+        let (a,b,c,d) = x_step(&edge[0],&edge[1],&edge[2],&edge[3],&edge[4]);
+        assert_eq!(run(&edge), cat(&a,&b,&c,&d), "ladder_step base-point edge mismatch");
+
+        // Random states vs the Rust reference (deterministic LCG).
+        let mut s: u64 = 0x243f6a8885a308d3;
+        for _ in 0..25 {
+            let mut e = [[0i64;10];5];
+            for g in 0..5 { for i in 0..10 {
+                s = s.wrapping_mul(6364136223846793005).wrapping_add(1);
+                e[g][i] = ((s >> 17) as i64) & x_mask(i);
+            }}
+            let (a,b,c,d) = x_step(&e[0],&e[1],&e[2],&e[3],&e[4]);
+            assert_eq!(run(&e), cat(&a,&b,&c,&d), "ladder_step mismatch");
+        }
+        let _ = std::fs::remove_file(&out);
+    }
+
 }

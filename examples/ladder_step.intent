@@ -1,0 +1,17 @@
+One step of the X25519 Montgomery ladder: a differential add-and-double
+(RFC 7748 fmonty), Brick 2 of docs/x25519-design.md. Given the working
+points (x2, z2) and (x3, z3) and the base u-coordinate x1 (all 10-limb
+field elements), it produces the next (x2', z2', x3', z3') via the
+standard sequence of fadd/fsub/fmul/fsqr over GF(2^255-19):
+
+  A=x2+z2; AA=A^2; B=x2-z2; BB=B^2; E=AA-BB
+  C=x3+z3; D=x3-z3; DA=D*A; CB=C*B
+  x3'=(DA+CB)^2; z3'=x1*(DA-CB)^2
+  x2'=AA*BB; z2'=E*(AA + a24*E)   with a24 = 121665
+
+The field ops (from Brick 1) are inlined; the whole step is one
+unrolled let-chain. `which` (0..39) selects element x2'|z2'|x3'|z3'
+(which/10) and limb (which%10). Validated against a Python reference
+that reuses the big-int-checked field arithmetic; the external RFC 7748
+anchor lands at Brick 4 (the full x25519). No cswap/scalar bit here —
+those belong to the ladder loop (Brick 3).
