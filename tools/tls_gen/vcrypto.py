@@ -99,6 +99,66 @@ def finished_key(secret32): return _sched("finished_key", secret32, bytes(32))
 def expand_key(secret32): return run_bytes("expand_key",[str(b) for b in secret32],16)
 def expand_iv(secret32):  return run_bytes("expand_iv",[str(b) for b in secret32],12)
 
+# ---- AES-GCM AEAD record protection (primitives pure Verbose; framing host) ----
+def _aes_block(key16, block16):
+    return run_bytes("encrypt", [str(b) for b in block16]+[str(b) for b in key16], 16)
+def _gctr(key16, nonce12, data):
+    nb=(len(data)+15)//16
+    if nb==0: return b""
+    args=[str(b) for b in key16]+[str(b) for b in nonce12]+[str(nb)]
+    binp=BIN["gctr"]; hexd=bytes(data).hex()
+    def one(w): return int(subprocess.run([binp]+args+[str(w),hexd],capture_output=True,text=True,timeout=600).stdout.strip())
+    futs={w:_POOL.submit(one,w) for w in range(len(data))}
+    return bytes(futs[w].result() for w in range(len(data)))
+def _ghash(h16, data):
+    nb=len(data)//16
+    args=[str(b) for b in [0]*16]+[str(b) for b in h16]+[str(nb),str(nb)]
+    binp=BIN["ghash_fold"]; hexd=bytes(data).hex()
+    def one(w): return int(subprocess.run([binp]+args+[str(w),hexd],capture_output=True,text=True,timeout=600).stdout.strip())
+    futs={w:_POOL.submit(one,w) for w in range(16)}
+    return bytes(futs[w].result() for w in range(16))
+
+def _gcm(key16, nonce12, pt, aad):
+    H=_aes_block(key16, [0]*16)
+    C=_gctr(key16, nonce12, pt)
+    def pad(b): return bytes(b)+bytes((-len(b))%16)
+    lenb=(len(aad)*8).to_bytes(8,'big')+(len(C)*8).to_bytes(8,'big')
+    S=_ghash(H, pad(aad)+pad(C)+lenb)
+    EJ0=_aes_block(key16, list(nonce12)+[0,0,0,1])
+    tag=bytes(S[i]^EJ0[i] for i in range(16))
+    return bytes(C), tag
+
+def _nonce(iv12, seq):
+    n=bytearray(iv12); sb=seq.to_bytes(8,'big')
+    for j in range(8): n[4+j]^=sb[j]
+    return bytes(n)
+
+def aead_encrypt(key16, iv12, seq, inner_plaintext, content_type=0x17):
+    """TLS 1.3 record protect: returns the record (5-byte header + ct + tag)."""
+    inner=bytes(inner_plaintext)+bytes([content_type])
+    length=len(inner)+16
+    aad=bytes([0x17,0x03,0x03,(length>>8)&0xff,length&0xff])
+    C,tag=_gcm(key16, _nonce(iv12,seq), inner, aad)
+    return aad+C+tag
+
+def aead_decrypt(key16, iv12, seq, record):
+    """Verify+decrypt a TLS 1.3 record; returns (inner_content_type, plaintext) or None."""
+    aad=record[:5]; ct=record[5:-16]; tag=record[-16:]
+    C,exp=_gcm(key16, _nonce(iv12,seq), ct, aad)  # note: decrypt keystream == encrypt keystream
+    # recompute tag over received ct
+    H=_aes_block(key16,[0]*16)
+    def pad(b): return bytes(b)+bytes((-len(b))%16)
+    lenb=(len(aad)*8).to_bytes(8,'big')+(len(ct)*8).to_bytes(8,'big')
+    S=_ghash(H, pad(aad)+pad(ct)+lenb)
+    EJ0=_aes_block(key16, list(_nonce(iv12,seq))+[0,0,0,1])
+    calc=bytes(S[i]^EJ0[i] for i in range(16))
+    if calc!=tag: return None
+    plain=_gctr(key16, _nonce(iv12,seq), ct)  # CTR is its own inverse
+    # strip inner content type (last non-zero byte; TLS1.3 may zero-pad)
+    i=len(plain)-1
+    while i>=0 and plain[i]==0: i-=1
+    return (plain[i], bytes(plain[:i]))
+
 ALL_RULES = [
     ("ladder","ladder_recursive.verbose"), ("x25519_finish","x25519.verbose"),
     ("sha256_fold","sha256_fold.verbose"),
@@ -133,4 +193,9 @@ if __name__ == "__main__":
     shs=derive_s_hs(hs,thash); assert shs==el(hs,b"s hs traffic",thash,32)
     assert expand_key(shs)==el(shs,b"key",b"",16)
     assert expand_iv(shs)==el(shs,b"iv",b"",12)
-    print(f"VCRYPTO_OK  x25519={t_x:.1f}s  (parallel which-spawn)")
+    # 4) AEAD record round-trip (encrypt then decrypt)
+    rk=bytes(range(1,17)); riv=bytes(range(17,29))
+    rec=aead_encrypt(rk,riv,0,b"hello world",0x17)
+    ct,pt=aead_decrypt(rk,riv,0,rec)
+    assert ct==0x17 and pt==b"hello world", (ct,pt)
+    print(f"VCRYPTO_OK  x25519={t_x:.1f}s  aead_roundtrip=ok  (parallel which-spawn)")
