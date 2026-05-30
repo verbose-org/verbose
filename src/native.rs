@@ -29479,4 +29479,55 @@ rule extract_word
         let _ = std::fs::remove_file(&out);
     }
 
+
+    #[test]
+    fn aes_gctr_matches_reference() {
+        // AES-128 GCTR (GCM counter mode): ct[b] = pt[b] ^ AES(IV||(b/16 + 2))[b%16].
+        // Validated against the FIPS-checked aes128_ref (also matches openssl
+        // aes-128-ctr with iv = IV||00000002 — verified out-of-band).
+        let h = std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(aes_gctr_test_body)
+            .expect("spawn");
+        h.join().expect("test thread panicked");
+    }
+
+    fn aes_gctr_test_body() {
+        let src = std::fs::read_to_string("examples/aes_gctr.verbose")
+            .expect("examples/aes_gctr.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+        let out = std::env::temp_dir().join("verbosec_test_aes_gctr");
+        compile_native(&program, "gctr", out.to_str().unwrap(), false, false)
+            .expect("gctr must compile");
+        #[cfg(unix)]
+        { use std::os::unix::fs::PermissionsExt;
+          let _ = std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o755)); }
+        let key: [u8;16] = [165, 77, 202, 24, 37, 48, 187, 29, 109, 19, 44, 222, 214, 35, 123, 46];
+        let iv:  [u8;12] = [217, 30, 63, 114, 31, 203, 25, 113, 23, 68, 148, 214];
+        let pt = "493c9d5c3460be31201e69fedaa0eee8b9997f5c7c2999fdafe593253cd654af4dfad71427a0aeb3fee9232f8af2211f";
+        let ptb: Vec<u8> = (0..48).map(|i| u8::from_str_radix(&pt[i*2..i*2+2],16).unwrap()).collect();
+        let nb = (ptb.len()/16).to_string();
+        let expect = |w: usize| -> u8 {
+            let bidx = (w/16) as u32;
+            let ctr = bidx + 2;
+            let mut cb = [0u8;16];
+            cb[..12].copy_from_slice(&iv);
+            cb[12..16].copy_from_slice(&ctr.to_be_bytes());
+            let ksb = aes128_ref(&key, &cb);
+            ptb[w] ^ ksb[w%16]
+        };
+        for w in 0..ptb.len() {
+            let mut cmd = std::process::Command::new(&out);
+            for v in key.iter() { cmd.arg(v.to_string()); }
+            for v in iv.iter() { cmd.arg(v.to_string()); }
+            cmd.arg(&nb).arg(w.to_string()).arg(pt);
+            let o = cmd.output().expect("run");
+            let got: u8 = String::from_utf8_lossy(&o.stdout).trim().parse::<u32>()
+                .unwrap_or_else(|_| panic!("parse w={}", w)) as u8;
+            assert_eq!(got, expect(w), "gctr byte {} mismatch", w);
+        }
+        let _ = std::fs::remove_file(&out);
+    }
+
 }
