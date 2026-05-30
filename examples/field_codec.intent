@@ -1,0 +1,13 @@
+X25519 field-element codec between 32 little-endian bytes and the
+10-limb 26/25-bit representation (docs/x25519-design.md, Brick 0).
+
+decode(s, which): read limb `which` (0..9) from a 32-byte text value
+            via byte_at + shift + mask (the donna fexpand offsets, which
+            match our 26/25 limb layout). Bit 255 is discarded.
+encode(l, which): produce little-endian byte `which` (0..31) of the
+            reduced field element, gathering the 1-2 overlapping limbs.
+
+Validated against a Python codec (matching to_limbs/from_limbs and the
+canonical 32-byte little-endian encoding). Note: arbitrary binary input
+through argv cannot carry NUL bytes — the full X25519 assembly will need
+a binary input path; the codec logic itself is byte-value-agnostic.
