@@ -1,0 +1,20 @@
+GHASH over N 16-byte blocks — the recursion-over-blocks primitive the
+TLS 1.3 record layer needs (first brick of docs/tls13-roadmap.md
+Milestone 1). GHASH authenticates GCM: Y = 0; for each block B,
+Y = (Y XOR B) * H in GF(2^128) under the GCM reduction polynomial.
+
+ghash_fold threads the 16-byte accumulator Y + the hash subkey H
+through a recursive callable, one block per frame, terminating by
+`decreasing : i` over i : number [0, 64] (so up to 64 blocks = 1 KiB
+of GHASH input; larger records would need a deeper bound and more
+stack). The block data is passed as a hex text (argv-safe, no NUL):
+at each step block index nblocks-i is read 16 bytes at a time via
+byte_at + hex decode, XORed into Y, and multiplied by H using the
+inlined GF(2^128) shift-and-add. Returns byte `which` (0..15) of the
+final Y.
+
+This generalizes the fixed 2-block `ghash` example to arbitrary N via
+recursion (the same pattern as the X25519 ladder). Validated against a
+GCM GHASH reference: GCM test-case-2 (2 blocks -> f38cbb..) and
+random/deterministic 1/3/4/8-block cases. Next record-layer bricks:
+CTR over N blocks, then GCM-AEAD assembly (AAD + tag, encrypt/decrypt).

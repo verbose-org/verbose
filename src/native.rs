@@ -29419,4 +29419,64 @@ rule extract_word
         let _ = std::fs::remove_file(&out);
     }
 
+
+    #[test]
+    fn ghash_nblocks_matches_reference() {
+        // GHASH over N 16-byte blocks via the recursive fold (Y=(Y^B)*H per
+        // block). Validated against the GCM GHASH reference: GCM test-case-2
+        // (2 blocks, f38cbb..) and a 4-block deterministic case.
+        let h = std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(ghash_nblocks_test_body)
+            .expect("spawn");
+        h.join().expect("test thread panicked");
+    }
+
+    fn ghash_nblocks_test_body() {
+        let src = std::fs::read_to_string("examples/ghash_nblocks.verbose")
+            .expect("examples/ghash_nblocks.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+        let out = std::env::temp_dir().join("verbosec_test_ghash_nblocks");
+        compile_native(&program, "ghash_fold", out.to_str().unwrap(), false, false)
+            .expect("ghash_fold must compile");
+        #[cfg(unix)]
+        { use std::os::unix::fs::PermissionsExt;
+          let _ = std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o755)); }
+
+        // case 1: N=2
+        {
+            let h: [i64;16] = [102, 233, 75, 212, 239, 138, 44, 59, 136, 76, 250, 89, 202, 52, 43, 46];
+            let exp: [u8;16] = [243, 140, 187, 26, 214, 146, 35, 220, 195, 69, 122, 229, 182, 176, 248, 133];
+            let hexdata = "0388dace60b6a392f328c2b971b2fe7800000000000000000000000000000080";
+            for w in 0..16u8 {
+                let mut cmd = std::process::Command::new(&out);
+                for _ in 0..16 { cmd.arg("0"); }            // Y = 0
+                for v in h.iter() { cmd.arg(v.to_string()); }
+                cmd.arg("2").arg("2").arg(w.to_string()).arg(hexdata);
+                let o = cmd.output().expect("run");
+                let got: u8 = String::from_utf8_lossy(&o.stdout).trim().parse::<u32>()
+                    .unwrap_or_else(|_| panic!("parse w={}", w)) as u8;
+                assert_eq!(got, exp[w as usize], "GHASH-N case 1 byte {} mismatch", w);
+            }
+        }
+        // case 2: N=4
+        {
+            let h: [i64;16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+            let exp: [u8;16] = [197, 38, 75, 164, 160, 209, 4, 130, 239, 237, 48, 82, 58, 8, 104, 184];
+            let hexdata = "01080f161d242b323940474e555c636a71787f868d949ba2a9b0b7bec5ccd3dae1e8eff6fd040b121920272e353c434a51585f666d747b828990979ea5acb3ba";
+            for w in 0..16u8 {
+                let mut cmd = std::process::Command::new(&out);
+                for _ in 0..16 { cmd.arg("0"); }            // Y = 0
+                for v in h.iter() { cmd.arg(v.to_string()); }
+                cmd.arg("4").arg("4").arg(w.to_string()).arg(hexdata);
+                let o = cmd.output().expect("run");
+                let got: u8 = String::from_utf8_lossy(&o.stdout).trim().parse::<u32>()
+                    .unwrap_or_else(|_| panic!("parse w={}", w)) as u8;
+                assert_eq!(got, exp[w as usize], "GHASH-N case 2 byte {} mismatch", w);
+            }
+        }
+        let _ = std::fs::remove_file(&out);
+    }
+
 }
