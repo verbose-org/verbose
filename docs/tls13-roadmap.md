@@ -85,13 +85,40 @@ browser will not interoperate without TLS 1.3's compatibility quirks:
 - Emit a **dummy ChangeCipherSpec record** (`14 03 03 00 01 01`) after
   ServerHello, and tolerate one from the client. It is ignored cryptographically
   but its absence breaks middlebox-tolerant clients.
-- **HelloRetryRequest**: avoidable ONLY if the ClientHello's first `key_share`
-  already offers X25519. Browsers commonly do (X25519 or P-256 first), but it is
-  NOT guaranteed — at minimum the server must DETECT a missing X25519 share and
-  either HRR or fail cleanly. A hello-world MAY fail-closed on no-X25519, but
-  must not misparse.
-- **SNI**: may be ignored (single host). **ALPN**: optional (skip → no ALPN
-  extension; browser falls back to HTTP/1.1 over the TLS channel).
+- **HelloRetryRequest (REQUIRED for browsers — review B4 correction)**: HRR is
+  NOT avoidable for modern browsers. Current Chrome/Firefox lead with
+  **X25519MLKEM768** (post-quantum hybrid, group 0x11ec) as their first and
+  often only initial `key_share`, offering plain X25519 (0x001d) in
+  `supported_groups` but WITHOUT a key_share for it. An X25519-only server then
+  MUST send HelloRetryRequest to ask the client to resend an X25519 share. So:
+  CLI clients (`curl --curves x25519`, `openssl s_client`) can be pinned to send
+  X25519 first → HRR-free; **browsers cannot** → HRR is mandatory for the browser
+  milestone. HRR is a special ServerHello (magic random) naming the group, plus a
+  synthetic `message_hash` wrapper of ClientHello1 in the transcript.
+- **SNI**: may be ignored (single host, ack optional). **ALPN**: skip → no ALPN
+  extension → client uses **HTTP/1.1** (matches our handler). Getting this wrong
+  shows up as "TLS succeeds, then the browser sends an HTTP/2 preface our
+  HTTP/1.0 handler can't parse" — so omitting ALPN is a correctness choice.
+- **ServerHello MUST also carry `supported_versions` (0x002b → 0x0304)** beside
+  `key_share` — without it the client falls back to TLS 1.2 and the 1.3 path
+  collapses. `key_share` entry = NamedGroup(x25519=0x001d) + len(0x0020) + 32-byte
+  public.
+- **ClientHello parsing must skip unknown extensions by length** — browsers send
+  10–15 extensions including GREASE values (0x?a?a); reject-on-unknown breaks.
+
+**Transcript-hash rules (review M3 — silent-failure footguns):**
+- The transcript hashes **handshake-message bytes only** (`HandshakeType ||
+  length || body`) — the 5-byte record headers, the inner content-type byte, and
+  the dummy CCS are **excluded**.
+- Cut points that matter: Hash(CH..SH) for handshake secrets; Hash(..Certificate)
+  for CertificateVerify; Hash(..CertificateVerify) for the server Finished;
+  Hash(..server Finished) for the client Finished and app secrets.
+- `CertificateVerify` signs `64×0x20 || "TLS 1.3, server CertificateVerify" ||
+  0x00 || Transcript-Hash(..Certificate)` — pin these context bytes exactly.
+- `finished_key = HKDF-Expand-Label(server_hs_traffic_secret, "finished", "", 32)`;
+  Finished = `HMAC(finished_key, Transcript-Hash(..CertificateVerify))`.
+- If HRR fires, ClientHello1 is replaced in the transcript by a synthetic
+  `message_hash` wrapper — handle per RFC 8446 §4.4.1.
 
 ## 4. Gap A — the record layer (AEAD over real records)
 
@@ -113,6 +140,23 @@ Our `aes_gcm` is **single 16-byte block, empty AAD**. TLS records need:
 
 This is its own arc: "AES-128-GCM AEAD over arbitrary-length records, both
 directions, with AAD". The recursion-over-blocks is the new piece.
+
+**GCM correctness checklist (review M2 — known footguns our single-block TC-2
+path does not exercise):**
+- `J0 = nonce(12 bytes) || 0x00000001`; the **tag uses `E(J0)`**, the first data
+  counter block is **`inc32(J0)`** (counter = 2 for block 1).
+- GHASH order: **AAD blocks, then ciphertext blocks, then the length block.**
+- **Zero-pad** a partial AAD block and the final partial ciphertext block to 16
+  bytes before GHASH; the length block counts the **true unpadded** lengths.
+- Final GHASH block = **`len(AAD)_bits || len(C)_bits`**, each a 64-bit
+  **big-endian** bit-length (the classic GCM bug: bytes vs bits, or wrong
+  endianness).
+- `tag = GHASH(...) XOR E(J0)`.
+- **Decrypt order**: compute the tag over the *received* ciphertext+AAD, compare
+  it **constant-time**, and release plaintext ONLY on match (verify-then-return).
+- Note: NIST GCM TC-2 exercises neither AAD nor multi-block, so there is
+  currently **zero regression coverage** for any of the above — validate the new
+  path against `openssl enc -aes-128-gcm` / NIST GCM vectors with AAD.
 
 ## 5. Gap B — the server signature (the pivotal decision)
 
@@ -190,21 +234,31 @@ logic is proven. It is the right long-term fix, not a prerequisite.
 
 ## 7. Proposed ordering (critical path)
 
+**Milestone 1 — live PSK + (EC)DHE handshake, no certificate/signature** (the
+review's recommended target; Ed25519 OFF the critical path):
 1. **Record layer arc** (Gap A): N-block GCM (CTR + GHASH via recursion) + AAD
-   + decrypt + framing. Validate against openssl AES-128-GCM on multi-block
-   AEAD vectors. Independent of signatures — unblocks testing the rest.
+   + decrypt + constant-time tag compare + framing. Validate against
+   `openssl enc -aes-128-gcm` / NIST GCM AEAD vectors (with AAD + multi-block).
 2. **Key schedule**: HKDF-Expand-Label + Derive-Secret + transcript hash.
-   Validate against RFC 8448 (the TLS 1.3 worked-example trace) intermediate
-   secrets — RFC 8448 gives every secret byte-for-byte, an excellent anchor.
-3. **Resolve Gap C** (the buffer/return-shape infra) — likely a design doc of
-   its own. This is the gate for an in-Verbose handshake driver.
-4. **Ed25519 arc** (Gap B): SHA-512 → Edwards → sign, vs RFC 8032.
-5. **Handshake state machine + record I/O**: assemble against RFC 8448, then a
-   live `curl`/browser.
+   Validate against RFC 8448's published secrets (byte-for-byte).
+3. **Gap C I/O staging** (M1 scope, NOT a deep ABI change): a multi-step
+   read/write handler on one connection + persistent per-connection byte buffers
+   (resources); the two X25519 ladders are computed-once by construction.
+4. **PSK handshake state machine** (ClientHello → ServerHello → EE → Finished →
+   client Finished → app data), `psk_dhe_ke`, X25519 pinned (HRR-free).
+   Validate LIVE vs `openssl s_client -psk`.
 
-Steps 1, 2, 4 are independently validatable offline (RFC 8448 / 8032 / openssl)
-before any live socket — that is the disciplined path. Step 3 is the riskiest
-and may reorder things.
+**Milestone 2 — browser HTTPS (adds the certificate path):**
+5. **Ed25519 arc** (Gap B): SHA-512 → Edwards point ops → scalar-mult → mod-L →
+   sign, each vs RFC 8032.
+6. **Certificate + CertificateVerify + HelloRetryRequest + middlebox-compat**,
+   anchored offline against RFC 8448 (everything except the Ed25519 signature,
+   which 8448 signs with RSA — so the sig is anchored by RFC 8032 separately),
+   then live against a real browser.
+
+Steps 1, 2, 5 are independently validatable offline (openssl / RFC 8448 / RFC
+8032) before any live socket. Milestone 1 reaches a real TLS 1.3 peer
+signature-free and early; Milestone 2 is the long browser arc.
 
 ## 8. Honest scope assessment
 
@@ -216,7 +270,22 @@ multi-byte/stateful data-flow model the current rule ABI doesn't have (Gap C).
 RFC 8448 makes the handshake offline-testable, which de-risks correctness; the
 infra (Gap C) is where the genuine language design work is.
 
-**FIRST MILESTONE (review-promoted): reproduce RFC 8448 offline.** RFC 8448
+**FIRST MILESTONE (review's #1 de-risking recommendation): a live PSK + (EC)DHE
+handshake, no certificate, no signature.** Use `psk_dhe_ke` (RFC 8446 §2.2):
+authentication is by a pre-shared key + the Finished MAC (have HMAC), so there
+is NO Certificate and NO CertificateVerify — the entire Ed25519 arc (SHA-512 +
+Edwards + mod-L, the largest/riskiest sub-arc) is OFF the critical path. This
+still forces building everything else end-to-end: the record layer, the full key
+schedule (HKDF-Expand-Label / Derive-Secret), the transcript hash, the Finished
+MAC, the multi-message state machine, and Gap C's I/O staging. Validate LIVE
+against `openssl s_client -psk <key> -psk_identity <id> -tls1_3` (and Python
+`ssl`), which speaks `psk_dhe_ke` with X25519 pinned (HRR-free). This reaches a
+real TLS 1.3 peer talking to the Verbose server EARLY and signature-free.
+Browsers won't do external PSK, so this is a CLI milestone — but it proves the
+whole stack minus the signature.
+
+**SECOND MILESTONE: reproduce RFC 8448 offline** (correctness anchor for the
+certificate path). RFC 8448
 ("Example Handshake Traces for TLS 1.3") publishes a complete handshake with
 EVERY secret, key, IV, and message byte spelled out — including the server's
 ephemeral private key and randoms — so the entire ServerHello..Finished output
