@@ -1,0 +1,21 @@
+X25519 finish: the second half of the X25519 key exchange (Brick 4 of
+docs/x25519-design.md), assembling the published shared secret from the
+Montgomery ladder's result.
+
+x25519_finish(x2, z2, which) computes byte `which` (0..31) of
+encode(x2 * z2^(p-2) mod 2^255-19) — the affine u-coordinate of the
+ladder output. The modular inverse z2^(p-2) is the curve25519 fixed
+addition chain (266 field operations, unrolled as a top-level let-chain
+— NOT inside the recursive ladder, whose per-frame stack could not hold
+it). The final field element is encoded to little-endian bytes via the
+Brick-0 layout.
+
+This is deliberately a separate top-level rule, not folded into the
+ladder: the recursion ABI returns one Number, so the full X25519 is the
+external composition `ladder` (Brick 3) -> 20 limbs (x2,z2) -> finish.
+That orchestration mirrors what the eventual TLS handshake code does.
+
+Validated against RFC 7748 section 5.2: fed the ladder's (x2,z2) for
+both published vectors, the output bytes reproduce the shared secrets
+c3da5537..77a28552 and 95cbde94..7aac7957 exactly. The whole X25519
+(ladder + finish) is now pure Verbose, conformant to RFC 7748.

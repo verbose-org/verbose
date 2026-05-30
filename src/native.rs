@@ -29373,4 +29373,50 @@ rule extract_word
         let _ = std::fs::remove_file(&out);
     }
 
+
+    #[test]
+    fn x25519_finish_matches_rfc7748() {
+        // X25519 finish (curve25519 inversion chain + x2*z2^-1 + encode) on the
+        // ladder result for RFC 7748 section 5.2 vector 1. The (x2,z2) limbs and
+        // expected output bytes are the RFC-validated reference values; the full
+        // 32-byte sweep + vector 2 are covered out-of-band (each run re-does the
+        // ~281-field-op inversion).
+        let h = std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(x25519_finish_test_body)
+            .expect("spawn");
+        h.join().expect("test thread panicked");
+    }
+
+    fn x25519_finish_test_body() {
+        let src = std::fs::read_to_string("examples/x25519.verbose")
+            .expect("examples/x25519.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+        let out = std::env::temp_dir().join("verbosec_test_x25519_finish");
+        compile_native(&program, "x25519_finish", out.to_str().unwrap(), false, false)
+            .expect("x25519_finish must compile");
+        #[cfg(unix)]
+        { use std::os::unix::fs::PermissionsExt;
+          let _ = std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o755)); }
+        let inputs: [i64; 20] = [4861533, 29360812, 23747794, 7458816, 17373659, 27174613, 29321228, 11092345, 67059997, 23600082, 55039015, 8692074, 36030384, 26461211, 32572828, 28261139, 46857341, 2893566, 682381, 1108949];
+        let run = |w: u8| -> i64 {
+            let mut cmd = std::process::Command::new(&out);
+            for v in inputs.iter() { cmd.arg(v.to_string()); }
+            cmd.arg(w.to_string());
+            let o = cmd.output().expect("run finish");
+            String::from_utf8_lossy(&o.stdout).trim().parse()
+                .unwrap_or_else(|_| panic!("parse which={}", w))
+        };
+        assert_eq!(run(0), 195, "x25519 output byte 0 (RFC 7748 v1) mismatch");
+        assert_eq!(run(1), 218, "x25519 output byte 1 (RFC 7748 v1) mismatch");
+        assert_eq!(run(7), 144, "x25519 output byte 7 (RFC 7748 v1) mismatch");
+        assert_eq!(run(8), 142, "x25519 output byte 8 (RFC 7748 v1) mismatch");
+        assert_eq!(run(15), 79, "x25519 output byte 15 (RFC 7748 v1) mismatch");
+        assert_eq!(run(16), 50, "x25519 output byte 16 (RFC 7748 v1) mismatch");
+        assert_eq!(run(23), 247, "x25519 output byte 23 (RFC 7748 v1) mismatch");
+        assert_eq!(run(31), 82, "x25519 output byte 31 (RFC 7748 v1) mismatch");
+        let _ = std::fs::remove_file(&out);
+    }
+
 }
