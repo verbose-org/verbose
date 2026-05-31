@@ -83,3 +83,66 @@ if __name__ == "__main__":
         if from_limbs(fsub(to_limbs(x),to_limbs(y)))!=(x-y)%P: bad+=1
     print("FIELD_EMIT_OK" if bad==0 else f"{bad} FAIL")
     sys.exit(0 if bad==0 else 1)
+
+# ---- Fermat inverse z^(p-2) and little-endian byte encode (Ed25519 brick 4) ----
+def emit_finv(lets, pfx, z):
+    """Emit z^(p-2) mod p via the curve25519 addition chain. Returns 10 limbs."""
+    def sq(n, a): return emit_fmul(lets, f"{pfx}_{n}", a, a)
+    def mul(n, a, b): return emit_fmul(lets, f"{pfx}_{n}", a, b)
+    z2 = sq("z2", z)
+    t = sq("t0", z2); t = sq("t0b", t)        # z^8
+    z9 = mul("z9", t, z)
+    z11 = mul("z11", z9, z2)
+    t = sq("t1", z11)
+    z2_5_0 = mul("z2_5_0", t, z9)
+    t = sq("t2", z2_5_0)
+    for k in range(1,5): t = sq(f"t2_{k}", t)
+    z2_10_0 = mul("z2_10_0", t, z2_5_0)
+    t = sq("t3", z2_10_0)
+    for k in range(1,10): t = sq(f"t3_{k}", t)
+    z2_20_0 = mul("z2_20_0", t, z2_10_0)
+    t = sq("t4", z2_20_0)
+    for k in range(1,20): t = sq(f"t4_{k}", t)
+    t = mul("t4m", t, z2_20_0)
+    t = sq("t5", t)
+    for k in range(1,10): t = sq(f"t5_{k}", t)
+    z2_50_0 = mul("z2_50_0", t, z2_10_0)
+    t = sq("t6", z2_50_0)
+    for k in range(1,50): t = sq(f"t6_{k}", t)
+    z2_100_0 = mul("z2_100_0", t, z2_50_0)
+    t = sq("t7", z2_100_0)
+    for k in range(1,100): t = sq(f"t7_{k}", t)
+    t = mul("t7m", t, z2_100_0)
+    t = sq("t8", t)
+    for k in range(1,50): t = sq(f"t8_{k}", t)
+    t = mul("t8m", t, z2_50_0)
+    t = sq("t9", t)
+    for k in range(1,5): t = sq(f"t9_{k}", t)
+    return mul("zinv", t, z11)
+
+# little-endian byte b (0..31) gathers from limbs overlapping [8b,8b+8)
+def _enc_terms(bi):
+    terms=[]
+    lo,hi=8*bi,8*bi+8
+    for i in range(10):
+        a,c=OFF[i],OFF[i]+W[i]
+        if a<hi and c>lo:
+            terms.append((i, OFF[i]-8*bi))
+    return terms
+
+def emit_encode(lets, pfx, fe):
+    """fe: 10 reduced limb names. Returns 32 byte-name lets (little-endian)."""
+    out=[]
+    for bi in range(32):
+        parts=[]
+        for (i,local) in _enc_terms(bi):
+            parts.append(f"shl({fe[i]}, {local})" if local>0 else (fe[i] if local==0 else f"shr({fe[i]}, {-local})"))
+        e=parts[0]
+        for p_ in parts[1:]: e=f"bor({e}, {p_})"
+        nm=f"{pfx}_ob{bi}"; lets.append((nm, f"band({e}, 255)")); out.append(nm)
+    return out
+
+# Python oracles
+def finv(z): return pow(z, P-2, P)
+def encode_field(x):  # field int -> 32 LE bytes
+    return list((x % P).to_bytes(32,'little'))

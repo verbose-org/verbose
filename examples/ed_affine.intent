@@ -1,0 +1,11 @@
+Edwards point -> affine coordinates (Ed25519 brick 4, the field-crypto half of
+point compression). ed_affine takes an extended-coord point (X,Y,Z) and computes
+affine (x,y) = (X*Z^-1, Y*Z^-1) mod 2^255-19, with Z^-1 via the Fermat addition
+chain (z^(p-2)) reused from X25519. Returns limb which (0..19) of x|y.
+
+The host then canonicalizes (mod p) and packs to the 32-byte RFC 8032
+encodepoint form: y little-endian with the low bit of x in the top bit of byte
+31 — deterministic format conversion (same acknowledged host-glue category as
+TLS record framing). Validated: Verbose ed_affine + host pack == the RFC 8032
+encodepoint oracle for several points (EDAFFINE_OK). Used to encode the public
+key A and the signature point R.
