@@ -7,7 +7,7 @@ Cipher suite TLS_AES_128_GCM_SHA256, X25519, external PSK (psk_dhe_ke).
 Reachable by: openssl s_client -psk <hex32> -psk_identity test -tls1_3 \
   -ciphersuites TLS_AES_128_GCM_SHA256 -curves X25519 -connect 127.0.0.1:PORT
 """
-import sys, os, socket, hmac, hashlib
+import sys, os, socket, time, hmac, hashlib
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import vcrypto as V
 from tlswire import ClientHello
@@ -108,6 +108,7 @@ def serve(conn):
     http=b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\nContent-Type: text/plain\r\n\r\nhello world"
     conn.sendall(record(0x17, V.aead_encrypt(s_ak, s_aiv, 0, http, 0x17)))
     print("sent application data (hello world)")
+    time.sleep(2)  # let TCP deliver the record before close
 
 def main():
     port=int(sys.argv[1]) if len(sys.argv)>1 else 14443
