@@ -91,14 +91,21 @@ def serve(conn):
     conn.sendall(V.aead_encrypt(s_key, s_iv, 0, flight, 0x16))  # aead_encrypt already returns a full record
     print("sent SH + EE + Finished")
 
-    # 9. read client's encrypted Finished, decrypt with c_hs
-    rec = conn.recv(4096)
-    if rec and rec[0]==0x14:  # client may send its own CCS first
-        rec = conn.recv(4096)
+    # 9. read client CCS + encrypted Finished (may share one TCP segment)
+    def read_record(buf):
+        while len(buf) < 5 or len(buf) < 5+int.from_bytes(buf[3:5],"big"):
+            chunk=conn.recv(4096)
+            if not chunk: return None, buf
+            buf+=chunk
+        rlen=5+int.from_bytes(buf[3:5],"big")
+        return buf[:rlen], buf[rlen:]
+    buf=b""
+    rec,buf=read_record(buf)
+    if rec and rec[0]==0x14:        # skip client ChangeCipherSpec
+        rec,buf=read_record(buf)
     if rec:
-        dec = V.aead_decrypt(c_key, c_iv, 0, rec[:5+int.from_bytes(rec[3:5],'big')])
+        dec=V.aead_decrypt(c_key, c_iv, 0, rec)
         print("client finished decrypt:", "ok" if dec else "FAIL", dec[0] if dec else "")
-
     # 10. application data: master + app traffic secrets, respond "hello world"
     derived2 = V.run_bytes("derive_derived",[str(b) for b in handshake]+[str(b) for b in bytes(32)],32)
     master = hkdf_extract(derived2, bytes(32))
@@ -109,19 +116,3 @@ def serve(conn):
     conn.sendall(V.aead_encrypt(s_ak, s_aiv, 0, http, 0x17))  # aead_encrypt already returns a full record
     print("sent application data (hello world)")
     time.sleep(2)  # let TCP deliver the record before close
-
-def main():
-    port=int(sys.argv[1]) if len(sys.argv)>1 else 14443
-    V.ensure(V.ALL_RULES + [("psk_early_secret","psk_schedule.verbose"),
-                            ("psk_ext_binder_key","psk_schedule.verbose"),
-                            ("hkdf_extract","hkdf_extract.verbose")])
-    s=socket.socket(socket.AF_INET,socket.SOCK_STREAM)
-    s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
-    s.bind(("127.0.0.1",port)); s.listen(1)
-    print(f"TLS-Verbose listening on {port}", flush=True)
-    conn,_=s.accept()
-    try: serve(conn)
-    finally: conn.close(); s.close()
-
-if __name__=="__main__":
-    main()
