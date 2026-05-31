@@ -1,0 +1,582 @@
+@verbose 0.1.0
+
+concept ScMul
+  @intention: "a,b,c as 32 LE bytes each for (a*b+c) mod L (Ed25519 group order) + which output byte (0..31)"
+  @source: invoices.intent:1
+  fields:
+    a0 : number [0, 255]
+    a1 : number [0, 255]
+    a2 : number [0, 255]
+    a3 : number [0, 255]
+    a4 : number [0, 255]
+    a5 : number [0, 255]
+    a6 : number [0, 255]
+    a7 : number [0, 255]
+    a8 : number [0, 255]
+    a9 : number [0, 255]
+    a10 : number [0, 255]
+    a11 : number [0, 255]
+    a12 : number [0, 255]
+    a13 : number [0, 255]
+    a14 : number [0, 255]
+    a15 : number [0, 255]
+    a16 : number [0, 255]
+    a17 : number [0, 255]
+    a18 : number [0, 255]
+    a19 : number [0, 255]
+    a20 : number [0, 255]
+    a21 : number [0, 255]
+    a22 : number [0, 255]
+    a23 : number [0, 255]
+    a24 : number [0, 255]
+    a25 : number [0, 255]
+    a26 : number [0, 255]
+    a27 : number [0, 255]
+    a28 : number [0, 255]
+    a29 : number [0, 255]
+    a30 : number [0, 255]
+    a31 : number [0, 255]
+    b0 : number [0, 255]
+    b1 : number [0, 255]
+    b2 : number [0, 255]
+    b3 : number [0, 255]
+    b4 : number [0, 255]
+    b5 : number [0, 255]
+    b6 : number [0, 255]
+    b7 : number [0, 255]
+    b8 : number [0, 255]
+    b9 : number [0, 255]
+    b10 : number [0, 255]
+    b11 : number [0, 255]
+    b12 : number [0, 255]
+    b13 : number [0, 255]
+    b14 : number [0, 255]
+    b15 : number [0, 255]
+    b16 : number [0, 255]
+    b17 : number [0, 255]
+    b18 : number [0, 255]
+    b19 : number [0, 255]
+    b20 : number [0, 255]
+    b21 : number [0, 255]
+    b22 : number [0, 255]
+    b23 : number [0, 255]
+    b24 : number [0, 255]
+    b25 : number [0, 255]
+    b26 : number [0, 255]
+    b27 : number [0, 255]
+    b28 : number [0, 255]
+    b29 : number [0, 255]
+    b30 : number [0, 255]
+    b31 : number [0, 255]
+    c0 : number [0, 255]
+    c1 : number [0, 255]
+    c2 : number [0, 255]
+    c3 : number [0, 255]
+    c4 : number [0, 255]
+    c5 : number [0, 255]
+    c6 : number [0, 255]
+    c7 : number [0, 255]
+    c8 : number [0, 255]
+    c9 : number [0, 255]
+    c10 : number [0, 255]
+    c11 : number [0, 255]
+    c12 : number [0, 255]
+    c13 : number [0, 255]
+    c14 : number [0, 255]
+    c15 : number [0, 255]
+    c16 : number [0, 255]
+    c17 : number [0, 255]
+    c18 : number [0, 255]
+    c19 : number [0, 255]
+    c20 : number [0, 255]
+    c21 : number [0, 255]
+    c22 : number [0, 255]
+    c23 : number [0, 255]
+    c24 : number [0, 255]
+    c25 : number [0, 255]
+    c26 : number [0, 255]
+    c27 : number [0, 255]
+    c28 : number [0, 255]
+    c29 : number [0, 255]
+    c30 : number [0, 255]
+    c31 : number [0, 255]
+    which : number [0, 31]
+
+
+rule sc_muladd
+  @intention: "(a*b + c) mod L (Ed25519 group order, ref10); 32-byte LE operands; returns byte which (0..31)"
+  @source: invoices.intent:1
+  input:
+    g : ScMul
+  output:
+    out : number
+  logic:
+    let al1 = band(bor(bor(g.a0, shl(g.a1, 8)), shl(g.a2, 16)), 2097151)
+    let al2 = band(shr(bor(bor(bor(g.a2, shl(g.a3, 8)), shl(g.a4, 16)), shl(g.a5, 24)), 5), 2097151)
+    let al3 = band(shr(bor(bor(g.a5, shl(g.a6, 8)), shl(g.a7, 16)), 2), 2097151)
+    let al4 = band(shr(bor(bor(bor(g.a7, shl(g.a8, 8)), shl(g.a9, 16)), shl(g.a10, 24)), 7), 2097151)
+    let al5 = band(shr(bor(bor(bor(g.a10, shl(g.a11, 8)), shl(g.a12, 16)), shl(g.a13, 24)), 4), 2097151)
+    let al6 = band(shr(bor(bor(g.a13, shl(g.a14, 8)), shl(g.a15, 16)), 1), 2097151)
+    let al7 = band(shr(bor(bor(bor(g.a15, shl(g.a16, 8)), shl(g.a17, 16)), shl(g.a18, 24)), 6), 2097151)
+    let al8 = band(shr(bor(bor(g.a18, shl(g.a19, 8)), shl(g.a20, 16)), 3), 2097151)
+    let al9 = band(bor(bor(g.a21, shl(g.a22, 8)), shl(g.a23, 16)), 2097151)
+    let al10 = band(shr(bor(bor(bor(g.a23, shl(g.a24, 8)), shl(g.a25, 16)), shl(g.a26, 24)), 5), 2097151)
+    let al11 = band(shr(bor(bor(g.a26, shl(g.a27, 8)), shl(g.a28, 16)), 2), 2097151)
+    let al12 = shr(bor(bor(bor(g.a28, shl(g.a29, 8)), shl(g.a30, 16)), shl(g.a31, 24)), 7)
+    let bl13 = band(bor(bor(g.b0, shl(g.b1, 8)), shl(g.b2, 16)), 2097151)
+    let bl14 = band(shr(bor(bor(bor(g.b2, shl(g.b3, 8)), shl(g.b4, 16)), shl(g.b5, 24)), 5), 2097151)
+    let bl15 = band(shr(bor(bor(g.b5, shl(g.b6, 8)), shl(g.b7, 16)), 2), 2097151)
+    let bl16 = band(shr(bor(bor(bor(g.b7, shl(g.b8, 8)), shl(g.b9, 16)), shl(g.b10, 24)), 7), 2097151)
+    let bl17 = band(shr(bor(bor(bor(g.b10, shl(g.b11, 8)), shl(g.b12, 16)), shl(g.b13, 24)), 4), 2097151)
+    let bl18 = band(shr(bor(bor(g.b13, shl(g.b14, 8)), shl(g.b15, 16)), 1), 2097151)
+    let bl19 = band(shr(bor(bor(bor(g.b15, shl(g.b16, 8)), shl(g.b17, 16)), shl(g.b18, 24)), 6), 2097151)
+    let bl20 = band(shr(bor(bor(g.b18, shl(g.b19, 8)), shl(g.b20, 16)), 3), 2097151)
+    let bl21 = band(bor(bor(g.b21, shl(g.b22, 8)), shl(g.b23, 16)), 2097151)
+    let bl22 = band(shr(bor(bor(bor(g.b23, shl(g.b24, 8)), shl(g.b25, 16)), shl(g.b26, 24)), 5), 2097151)
+    let bl23 = band(shr(bor(bor(g.b26, shl(g.b27, 8)), shl(g.b28, 16)), 2), 2097151)
+    let bl24 = shr(bor(bor(bor(g.b28, shl(g.b29, 8)), shl(g.b30, 16)), shl(g.b31, 24)), 7)
+    let cl25 = band(bor(bor(g.c0, shl(g.c1, 8)), shl(g.c2, 16)), 2097151)
+    let cl26 = band(shr(bor(bor(bor(g.c2, shl(g.c3, 8)), shl(g.c4, 16)), shl(g.c5, 24)), 5), 2097151)
+    let cl27 = band(shr(bor(bor(g.c5, shl(g.c6, 8)), shl(g.c7, 16)), 2), 2097151)
+    let cl28 = band(shr(bor(bor(bor(g.c7, shl(g.c8, 8)), shl(g.c9, 16)), shl(g.c10, 24)), 7), 2097151)
+    let cl29 = band(shr(bor(bor(bor(g.c10, shl(g.c11, 8)), shl(g.c12, 16)), shl(g.c13, 24)), 4), 2097151)
+    let cl30 = band(shr(bor(bor(g.c13, shl(g.c14, 8)), shl(g.c15, 16)), 1), 2097151)
+    let cl31 = band(shr(bor(bor(bor(g.c15, shl(g.c16, 8)), shl(g.c17, 16)), shl(g.c18, 24)), 6), 2097151)
+    let cl32 = band(shr(bor(bor(g.c18, shl(g.c19, 8)), shl(g.c20, 16)), 3), 2097151)
+    let cl33 = band(bor(bor(g.c21, shl(g.c22, 8)), shl(g.c23, 16)), 2097151)
+    let cl34 = band(shr(bor(bor(bor(g.c23, shl(g.c24, 8)), shl(g.c25, 16)), shl(g.c26, 24)), 5), 2097151)
+    let cl35 = band(shr(bor(bor(g.c26, shl(g.c27, 8)), shl(g.c28, 16)), 2), 2097151)
+    let cl36 = shr(bor(bor(bor(g.c28, shl(g.c29, 8)), shl(g.c30, 16)), shl(g.c31, 24)), 7)
+    let s0_37 = cl25 + (al1 * bl13)
+    let s1_38 = cl26 + (al1 * bl14) + (al2 * bl13)
+    let s2_39 = cl27 + (al1 * bl15) + (al2 * bl14) + (al3 * bl13)
+    let s3_40 = cl28 + (al1 * bl16) + (al2 * bl15) + (al3 * bl14) + (al4 * bl13)
+    let s4_41 = cl29 + (al1 * bl17) + (al2 * bl16) + (al3 * bl15) + (al4 * bl14) + (al5 * bl13)
+    let s5_42 = cl30 + (al1 * bl18) + (al2 * bl17) + (al3 * bl16) + (al4 * bl15) + (al5 * bl14) + (al6 * bl13)
+    let s6_43 = cl31 + (al1 * bl19) + (al2 * bl18) + (al3 * bl17) + (al4 * bl16) + (al5 * bl15) + (al6 * bl14) + (al7 * bl13)
+    let s7_44 = cl32 + (al1 * bl20) + (al2 * bl19) + (al3 * bl18) + (al4 * bl17) + (al5 * bl16) + (al6 * bl15) + (al7 * bl14) + (al8 * bl13)
+    let s8_45 = cl33 + (al1 * bl21) + (al2 * bl20) + (al3 * bl19) + (al4 * bl18) + (al5 * bl17) + (al6 * bl16) + (al7 * bl15) + (al8 * bl14) + (al9 * bl13)
+    let s9_46 = cl34 + (al1 * bl22) + (al2 * bl21) + (al3 * bl20) + (al4 * bl19) + (al5 * bl18) + (al6 * bl17) + (al7 * bl16) + (al8 * bl15) + (al9 * bl14) + (al10 * bl13)
+    let s10_47 = cl35 + (al1 * bl23) + (al2 * bl22) + (al3 * bl21) + (al4 * bl20) + (al5 * bl19) + (al6 * bl18) + (al7 * bl17) + (al8 * bl16) + (al9 * bl15) + (al10 * bl14) + (al11 * bl13)
+    let s11_48 = cl36 + (al1 * bl24) + (al2 * bl23) + (al3 * bl22) + (al4 * bl21) + (al5 * bl20) + (al6 * bl19) + (al7 * bl18) + (al8 * bl17) + (al9 * bl16) + (al10 * bl15) + (al11 * bl14) + (al12 * bl13)
+    let s12_49 = (al2 * bl24) + (al3 * bl23) + (al4 * bl22) + (al5 * bl21) + (al6 * bl20) + (al7 * bl19) + (al8 * bl18) + (al9 * bl17) + (al10 * bl16) + (al11 * bl15) + (al12 * bl14)
+    let s13_50 = (al3 * bl24) + (al4 * bl23) + (al5 * bl22) + (al6 * bl21) + (al7 * bl20) + (al8 * bl19) + (al9 * bl18) + (al10 * bl17) + (al11 * bl16) + (al12 * bl15)
+    let s14_51 = (al4 * bl24) + (al5 * bl23) + (al6 * bl22) + (al7 * bl21) + (al8 * bl20) + (al9 * bl19) + (al10 * bl18) + (al11 * bl17) + (al12 * bl16)
+    let s15_52 = (al5 * bl24) + (al6 * bl23) + (al7 * bl22) + (al8 * bl21) + (al9 * bl20) + (al10 * bl19) + (al11 * bl18) + (al12 * bl17)
+    let s16_53 = (al6 * bl24) + (al7 * bl23) + (al8 * bl22) + (al9 * bl21) + (al10 * bl20) + (al11 * bl19) + (al12 * bl18)
+    let s17_54 = (al7 * bl24) + (al8 * bl23) + (al9 * bl22) + (al10 * bl21) + (al11 * bl20) + (al12 * bl19)
+    let s18_55 = (al8 * bl24) + (al9 * bl23) + (al10 * bl22) + (al11 * bl21) + (al12 * bl20)
+    let s19_56 = (al9 * bl24) + (al10 * bl23) + (al11 * bl22) + (al12 * bl21)
+    let s20_57 = (al10 * bl24) + (al11 * bl23) + (al12 * bl22)
+    let s21_58 = (al11 * bl24) + (al12 * bl23)
+    let s22_59 = (al12 * bl24)
+    let s23_60 = 0
+    let t61 = s0_37 + 1048576
+    let c62 = shr(t61 + 4503599627370496, 21) - 2147483648
+    let s1_63 = s1_38 + c62
+    let s0_64 = s0_37 - shl(c62, 21)
+    let t65 = s2_39 + 1048576
+    let c66 = shr(t65 + 4503599627370496, 21) - 2147483648
+    let s3_67 = s3_40 + c66
+    let s2_68 = s2_39 - shl(c66, 21)
+    let t69 = s4_41 + 1048576
+    let c70 = shr(t69 + 4503599627370496, 21) - 2147483648
+    let s5_71 = s5_42 + c70
+    let s4_72 = s4_41 - shl(c70, 21)
+    let t73 = s6_43 + 1048576
+    let c74 = shr(t73 + 4503599627370496, 21) - 2147483648
+    let s7_75 = s7_44 + c74
+    let s6_76 = s6_43 - shl(c74, 21)
+    let t77 = s8_45 + 1048576
+    let c78 = shr(t77 + 4503599627370496, 21) - 2147483648
+    let s9_79 = s9_46 + c78
+    let s8_80 = s8_45 - shl(c78, 21)
+    let t81 = s10_47 + 1048576
+    let c82 = shr(t81 + 4503599627370496, 21) - 2147483648
+    let s11_83 = s11_48 + c82
+    let s10_84 = s10_47 - shl(c82, 21)
+    let t85 = s12_49 + 1048576
+    let c86 = shr(t85 + 4503599627370496, 21) - 2147483648
+    let s13_87 = s13_50 + c86
+    let s12_88 = s12_49 - shl(c86, 21)
+    let t89 = s14_51 + 1048576
+    let c90 = shr(t89 + 4503599627370496, 21) - 2147483648
+    let s15_91 = s15_52 + c90
+    let s14_92 = s14_51 - shl(c90, 21)
+    let t93 = s16_53 + 1048576
+    let c94 = shr(t93 + 4503599627370496, 21) - 2147483648
+    let s17_95 = s17_54 + c94
+    let s16_96 = s16_53 - shl(c94, 21)
+    let t97 = s18_55 + 1048576
+    let c98 = shr(t97 + 4503599627370496, 21) - 2147483648
+    let s19_99 = s19_56 + c98
+    let s18_100 = s18_55 - shl(c98, 21)
+    let t101 = s20_57 + 1048576
+    let c102 = shr(t101 + 4503599627370496, 21) - 2147483648
+    let s21_103 = s21_58 + c102
+    let s20_104 = s20_57 - shl(c102, 21)
+    let t105 = s22_59 + 1048576
+    let c106 = shr(t105 + 4503599627370496, 21) - 2147483648
+    let s23_107 = s23_60 + c106
+    let s22_108 = s22_59 - shl(c106, 21)
+    let t109 = s1_63 + 1048576
+    let c110 = shr(t109 + 4503599627370496, 21) - 2147483648
+    let s2_111 = s2_68 + c110
+    let s1_112 = s1_63 - shl(c110, 21)
+    let t113 = s3_67 + 1048576
+    let c114 = shr(t113 + 4503599627370496, 21) - 2147483648
+    let s4_115 = s4_72 + c114
+    let s3_116 = s3_67 - shl(c114, 21)
+    let t117 = s5_71 + 1048576
+    let c118 = shr(t117 + 4503599627370496, 21) - 2147483648
+    let s6_119 = s6_76 + c118
+    let s5_120 = s5_71 - shl(c118, 21)
+    let t121 = s7_75 + 1048576
+    let c122 = shr(t121 + 4503599627370496, 21) - 2147483648
+    let s8_123 = s8_80 + c122
+    let s7_124 = s7_75 - shl(c122, 21)
+    let t125 = s9_79 + 1048576
+    let c126 = shr(t125 + 4503599627370496, 21) - 2147483648
+    let s10_127 = s10_84 + c126
+    let s9_128 = s9_79 - shl(c126, 21)
+    let t129 = s11_83 + 1048576
+    let c130 = shr(t129 + 4503599627370496, 21) - 2147483648
+    let s12_131 = s12_88 + c130
+    let s11_132 = s11_83 - shl(c130, 21)
+    let t133 = s13_87 + 1048576
+    let c134 = shr(t133 + 4503599627370496, 21) - 2147483648
+    let s14_135 = s14_92 + c134
+    let s13_136 = s13_87 - shl(c134, 21)
+    let t137 = s15_91 + 1048576
+    let c138 = shr(t137 + 4503599627370496, 21) - 2147483648
+    let s16_139 = s16_96 + c138
+    let s15_140 = s15_91 - shl(c138, 21)
+    let t141 = s17_95 + 1048576
+    let c142 = shr(t141 + 4503599627370496, 21) - 2147483648
+    let s18_143 = s18_100 + c142
+    let s17_144 = s17_95 - shl(c142, 21)
+    let t145 = s19_99 + 1048576
+    let c146 = shr(t145 + 4503599627370496, 21) - 2147483648
+    let s20_147 = s20_104 + c146
+    let s19_148 = s19_99 - shl(c146, 21)
+    let t149 = s21_103 + 1048576
+    let c150 = shr(t149 + 4503599627370496, 21) - 2147483648
+    let s22_151 = s22_108 + c150
+    let s21_152 = s21_103 - shl(c150, 21)
+    let s11_153 = s11_132 + (666643 * s23_107)
+    let s12_154 = s12_131 + (470296 * s23_107)
+    let s13_155 = s13_136 + (654183 * s23_107)
+    let s14_156 = s14_135 - (997805 * s23_107)
+    let s15_157 = s15_140 + (136657 * s23_107)
+    let s16_158 = s16_139 - (683901 * s23_107)
+    let s10_159 = s10_127 + (666643 * s22_151)
+    let s11_160 = s11_153 + (470296 * s22_151)
+    let s12_161 = s12_154 + (654183 * s22_151)
+    let s13_162 = s13_155 - (997805 * s22_151)
+    let s14_163 = s14_156 + (136657 * s22_151)
+    let s15_164 = s15_157 - (683901 * s22_151)
+    let s9_165 = s9_128 + (666643 * s21_152)
+    let s10_166 = s10_159 + (470296 * s21_152)
+    let s11_167 = s11_160 + (654183 * s21_152)
+    let s12_168 = s12_161 - (997805 * s21_152)
+    let s13_169 = s13_162 + (136657 * s21_152)
+    let s14_170 = s14_163 - (683901 * s21_152)
+    let s8_171 = s8_123 + (666643 * s20_147)
+    let s9_172 = s9_165 + (470296 * s20_147)
+    let s10_173 = s10_166 + (654183 * s20_147)
+    let s11_174 = s11_167 - (997805 * s20_147)
+    let s12_175 = s12_168 + (136657 * s20_147)
+    let s13_176 = s13_169 - (683901 * s20_147)
+    let s7_177 = s7_124 + (666643 * s19_148)
+    let s8_178 = s8_171 + (470296 * s19_148)
+    let s9_179 = s9_172 + (654183 * s19_148)
+    let s10_180 = s10_173 - (997805 * s19_148)
+    let s11_181 = s11_174 + (136657 * s19_148)
+    let s12_182 = s12_175 - (683901 * s19_148)
+    let s6_183 = s6_119 + (666643 * s18_143)
+    let s7_184 = s7_177 + (470296 * s18_143)
+    let s8_185 = s8_178 + (654183 * s18_143)
+    let s9_186 = s9_179 - (997805 * s18_143)
+    let s10_187 = s10_180 + (136657 * s18_143)
+    let s11_188 = s11_181 - (683901 * s18_143)
+    let t189 = s6_183 + 1048576
+    let c190 = shr(t189 + 4503599627370496, 21) - 2147483648
+    let s7_191 = s7_184 + c190
+    let s6_192 = s6_183 - shl(c190, 21)
+    let t193 = s8_185 + 1048576
+    let c194 = shr(t193 + 4503599627370496, 21) - 2147483648
+    let s9_195 = s9_186 + c194
+    let s8_196 = s8_185 - shl(c194, 21)
+    let t197 = s10_187 + 1048576
+    let c198 = shr(t197 + 4503599627370496, 21) - 2147483648
+    let s11_199 = s11_188 + c198
+    let s10_200 = s10_187 - shl(c198, 21)
+    let t201 = s12_182 + 1048576
+    let c202 = shr(t201 + 4503599627370496, 21) - 2147483648
+    let s13_203 = s13_176 + c202
+    let s12_204 = s12_182 - shl(c202, 21)
+    let t205 = s14_170 + 1048576
+    let c206 = shr(t205 + 4503599627370496, 21) - 2147483648
+    let s15_207 = s15_164 + c206
+    let s14_208 = s14_170 - shl(c206, 21)
+    let t209 = s16_158 + 1048576
+    let c210 = shr(t209 + 4503599627370496, 21) - 2147483648
+    let s17_211 = s17_144 + c210
+    let s16_212 = s16_158 - shl(c210, 21)
+    let t213 = s7_191 + 1048576
+    let c214 = shr(t213 + 4503599627370496, 21) - 2147483648
+    let s8_215 = s8_196 + c214
+    let s7_216 = s7_191 - shl(c214, 21)
+    let t217 = s9_195 + 1048576
+    let c218 = shr(t217 + 4503599627370496, 21) - 2147483648
+    let s10_219 = s10_200 + c218
+    let s9_220 = s9_195 - shl(c218, 21)
+    let t221 = s11_199 + 1048576
+    let c222 = shr(t221 + 4503599627370496, 21) - 2147483648
+    let s12_223 = s12_204 + c222
+    let s11_224 = s11_199 - shl(c222, 21)
+    let t225 = s13_203 + 1048576
+    let c226 = shr(t225 + 4503599627370496, 21) - 2147483648
+    let s14_227 = s14_208 + c226
+    let s13_228 = s13_203 - shl(c226, 21)
+    let t229 = s15_207 + 1048576
+    let c230 = shr(t229 + 4503599627370496, 21) - 2147483648
+    let s16_231 = s16_212 + c230
+    let s15_232 = s15_207 - shl(c230, 21)
+    let s5_233 = s5_120 + (666643 * s17_211)
+    let s6_234 = s6_192 + (470296 * s17_211)
+    let s7_235 = s7_216 + (654183 * s17_211)
+    let s8_236 = s8_215 - (997805 * s17_211)
+    let s9_237 = s9_220 + (136657 * s17_211)
+    let s10_238 = s10_219 - (683901 * s17_211)
+    let s4_239 = s4_115 + (666643 * s16_231)
+    let s5_240 = s5_233 + (470296 * s16_231)
+    let s6_241 = s6_234 + (654183 * s16_231)
+    let s7_242 = s7_235 - (997805 * s16_231)
+    let s8_243 = s8_236 + (136657 * s16_231)
+    let s9_244 = s9_237 - (683901 * s16_231)
+    let s3_245 = s3_116 + (666643 * s15_232)
+    let s4_246 = s4_239 + (470296 * s15_232)
+    let s5_247 = s5_240 + (654183 * s15_232)
+    let s6_248 = s6_241 - (997805 * s15_232)
+    let s7_249 = s7_242 + (136657 * s15_232)
+    let s8_250 = s8_243 - (683901 * s15_232)
+    let s2_251 = s2_111 + (666643 * s14_227)
+    let s3_252 = s3_245 + (470296 * s14_227)
+    let s4_253 = s4_246 + (654183 * s14_227)
+    let s5_254 = s5_247 - (997805 * s14_227)
+    let s6_255 = s6_248 + (136657 * s14_227)
+    let s7_256 = s7_249 - (683901 * s14_227)
+    let s1_257 = s1_112 + (666643 * s13_228)
+    let s2_258 = s2_251 + (470296 * s13_228)
+    let s3_259 = s3_252 + (654183 * s13_228)
+    let s4_260 = s4_253 - (997805 * s13_228)
+    let s5_261 = s5_254 + (136657 * s13_228)
+    let s6_262 = s6_255 - (683901 * s13_228)
+    let s0_263 = s0_64 + (666643 * s12_223)
+    let s1_264 = s1_257 + (470296 * s12_223)
+    let s2_265 = s2_258 + (654183 * s12_223)
+    let s3_266 = s3_259 - (997805 * s12_223)
+    let s4_267 = s4_260 + (136657 * s12_223)
+    let s5_268 = s5_261 - (683901 * s12_223)
+    let s12_269 = 0
+    let t270 = s0_263 + 1048576
+    let c271 = shr(t270 + 4503599627370496, 21) - 2147483648
+    let s1_272 = s1_264 + c271
+    let s0_273 = s0_263 - shl(c271, 21)
+    let t274 = s2_265 + 1048576
+    let c275 = shr(t274 + 4503599627370496, 21) - 2147483648
+    let s3_276 = s3_266 + c275
+    let s2_277 = s2_265 - shl(c275, 21)
+    let t278 = s4_267 + 1048576
+    let c279 = shr(t278 + 4503599627370496, 21) - 2147483648
+    let s5_280 = s5_268 + c279
+    let s4_281 = s4_267 - shl(c279, 21)
+    let t282 = s6_262 + 1048576
+    let c283 = shr(t282 + 4503599627370496, 21) - 2147483648
+    let s7_284 = s7_256 + c283
+    let s6_285 = s6_262 - shl(c283, 21)
+    let t286 = s8_250 + 1048576
+    let c287 = shr(t286 + 4503599627370496, 21) - 2147483648
+    let s9_288 = s9_244 + c287
+    let s8_289 = s8_250 - shl(c287, 21)
+    let t290 = s10_238 + 1048576
+    let c291 = shr(t290 + 4503599627370496, 21) - 2147483648
+    let s11_292 = s11_224 + c291
+    let s10_293 = s10_238 - shl(c291, 21)
+    let t294 = s1_272 + 1048576
+    let c295 = shr(t294 + 4503599627370496, 21) - 2147483648
+    let s2_296 = s2_277 + c295
+    let s1_297 = s1_272 - shl(c295, 21)
+    let t298 = s3_276 + 1048576
+    let c299 = shr(t298 + 4503599627370496, 21) - 2147483648
+    let s4_300 = s4_281 + c299
+    let s3_301 = s3_276 - shl(c299, 21)
+    let t302 = s5_280 + 1048576
+    let c303 = shr(t302 + 4503599627370496, 21) - 2147483648
+    let s6_304 = s6_285 + c303
+    let s5_305 = s5_280 - shl(c303, 21)
+    let t306 = s7_284 + 1048576
+    let c307 = shr(t306 + 4503599627370496, 21) - 2147483648
+    let s8_308 = s8_289 + c307
+    let s7_309 = s7_284 - shl(c307, 21)
+    let t310 = s9_288 + 1048576
+    let c311 = shr(t310 + 4503599627370496, 21) - 2147483648
+    let s10_312 = s10_293 + c311
+    let s9_313 = s9_288 - shl(c311, 21)
+    let t314 = s11_292 + 1048576
+    let c315 = shr(t314 + 4503599627370496, 21) - 2147483648
+    let s12_316 = s12_269 + c315
+    let s11_317 = s11_292 - shl(c315, 21)
+    let s0_318 = s0_273 + (666643 * s12_316)
+    let s1_319 = s1_297 + (470296 * s12_316)
+    let s2_320 = s2_296 + (654183 * s12_316)
+    let s3_321 = s3_301 - (997805 * s12_316)
+    let s4_322 = s4_300 + (136657 * s12_316)
+    let s5_323 = s5_305 - (683901 * s12_316)
+    let s12_324 = 0
+    let c325 = shr(s0_318 + 4503599627370496, 21) - 2147483648
+    let s1_326 = s1_319 + c325
+    let s0_327 = s0_318 - shl(c325, 21)
+    let c328 = shr(s1_326 + 4503599627370496, 21) - 2147483648
+    let s2_329 = s2_320 + c328
+    let s1_330 = s1_326 - shl(c328, 21)
+    let c331 = shr(s2_329 + 4503599627370496, 21) - 2147483648
+    let s3_332 = s3_321 + c331
+    let s2_333 = s2_329 - shl(c331, 21)
+    let c334 = shr(s3_332 + 4503599627370496, 21) - 2147483648
+    let s4_335 = s4_322 + c334
+    let s3_336 = s3_332 - shl(c334, 21)
+    let c337 = shr(s4_335 + 4503599627370496, 21) - 2147483648
+    let s5_338 = s5_323 + c337
+    let s4_339 = s4_335 - shl(c337, 21)
+    let c340 = shr(s5_338 + 4503599627370496, 21) - 2147483648
+    let s6_341 = s6_304 + c340
+    let s5_342 = s5_338 - shl(c340, 21)
+    let c343 = shr(s6_341 + 4503599627370496, 21) - 2147483648
+    let s7_344 = s7_309 + c343
+    let s6_345 = s6_341 - shl(c343, 21)
+    let c346 = shr(s7_344 + 4503599627370496, 21) - 2147483648
+    let s8_347 = s8_308 + c346
+    let s7_348 = s7_344 - shl(c346, 21)
+    let c349 = shr(s8_347 + 4503599627370496, 21) - 2147483648
+    let s9_350 = s9_313 + c349
+    let s8_351 = s8_347 - shl(c349, 21)
+    let c352 = shr(s9_350 + 4503599627370496, 21) - 2147483648
+    let s10_353 = s10_312 + c352
+    let s9_354 = s9_350 - shl(c352, 21)
+    let c355 = shr(s10_353 + 4503599627370496, 21) - 2147483648
+    let s11_356 = s11_317 + c355
+    let s10_357 = s10_353 - shl(c355, 21)
+    let c358 = shr(s11_356 + 4503599627370496, 21) - 2147483648
+    let s12_359 = s12_324 + c358
+    let s11_360 = s11_356 - shl(c358, 21)
+    let s0_361 = s0_327 + (666643 * s12_359)
+    let s1_362 = s1_330 + (470296 * s12_359)
+    let s2_363 = s2_333 + (654183 * s12_359)
+    let s3_364 = s3_336 - (997805 * s12_359)
+    let s4_365 = s4_339 + (136657 * s12_359)
+    let s5_366 = s5_342 - (683901 * s12_359)
+    let c367 = shr(s0_361 + 4503599627370496, 21) - 2147483648
+    let s1_368 = s1_362 + c367
+    let s0_369 = s0_361 - shl(c367, 21)
+    let c370 = shr(s1_368 + 4503599627370496, 21) - 2147483648
+    let s2_371 = s2_363 + c370
+    let s1_372 = s1_368 - shl(c370, 21)
+    let c373 = shr(s2_371 + 4503599627370496, 21) - 2147483648
+    let s3_374 = s3_364 + c373
+    let s2_375 = s2_371 - shl(c373, 21)
+    let c376 = shr(s3_374 + 4503599627370496, 21) - 2147483648
+    let s4_377 = s4_365 + c376
+    let s3_378 = s3_374 - shl(c376, 21)
+    let c379 = shr(s4_377 + 4503599627370496, 21) - 2147483648
+    let s5_380 = s5_366 + c379
+    let s4_381 = s4_377 - shl(c379, 21)
+    let c382 = shr(s5_380 + 4503599627370496, 21) - 2147483648
+    let s6_383 = s6_345 + c382
+    let s5_384 = s5_380 - shl(c382, 21)
+    let c385 = shr(s6_383 + 4503599627370496, 21) - 2147483648
+    let s7_386 = s7_348 + c385
+    let s6_387 = s6_383 - shl(c385, 21)
+    let c388 = shr(s7_386 + 4503599627370496, 21) - 2147483648
+    let s8_389 = s8_351 + c388
+    let s7_390 = s7_386 - shl(c388, 21)
+    let c391 = shr(s8_389 + 4503599627370496, 21) - 2147483648
+    let s9_392 = s9_354 + c391
+    let s8_393 = s8_389 - shl(c391, 21)
+    let c394 = shr(s9_392 + 4503599627370496, 21) - 2147483648
+    let s10_395 = s10_357 + c394
+    let s9_396 = s9_392 - shl(c394, 21)
+    let c397 = shr(s10_395 + 4503599627370496, 21) - 2147483648
+    let s11_398 = s11_360 + c397
+    let s10_399 = s10_395 - shl(c397, 21)
+    let o0_400 = band(s0_369, 255)
+    let o1_401 = band(shr(s0_369, 8), 255)
+    let o2_402 = band(bor(shr(s0_369, 16), shl(s1_372, 5)), 255)
+    let o3_403 = band(shr(s1_372, 3), 255)
+    let o4_404 = band(shr(s1_372, 11), 255)
+    let o5_405 = band(bor(shr(s1_372, 19), shl(s2_375, 2)), 255)
+    let o6_406 = band(shr(s2_375, 6), 255)
+    let o7_407 = band(bor(shr(s2_375, 14), shl(s3_378, 7)), 255)
+    let o8_408 = band(shr(s3_378, 1), 255)
+    let o9_409 = band(shr(s3_378, 9), 255)
+    let o10_410 = band(bor(shr(s3_378, 17), shl(s4_381, 4)), 255)
+    let o11_411 = band(shr(s4_381, 4), 255)
+    let o12_412 = band(shr(s4_381, 12), 255)
+    let o13_413 = band(bor(shr(s4_381, 20), shl(s5_384, 1)), 255)
+    let o14_414 = band(shr(s5_384, 7), 255)
+    let o15_415 = band(bor(shr(s5_384, 15), shl(s6_387, 6)), 255)
+    let o16_416 = band(shr(s6_387, 2), 255)
+    let o17_417 = band(shr(s6_387, 10), 255)
+    let o18_418 = band(bor(shr(s6_387, 18), shl(s7_390, 3)), 255)
+    let o19_419 = band(shr(s7_390, 5), 255)
+    let o20_420 = band(shr(s7_390, 13), 255)
+    let o21_421 = band(s8_393, 255)
+    let o22_422 = band(shr(s8_393, 8), 255)
+    let o23_423 = band(bor(shr(s8_393, 16), shl(s9_396, 5)), 255)
+    let o24_424 = band(shr(s9_396, 3), 255)
+    let o25_425 = band(shr(s9_396, 11), 255)
+    let o26_426 = band(bor(shr(s9_396, 19), shl(s10_399, 2)), 255)
+    let o27_427 = band(shr(s10_399, 6), 255)
+    let o28_428 = band(bor(shr(s10_399, 14), shl(s11_398, 7)), 255)
+    let o29_429 = band(shr(s11_398, 1), 255)
+    let o30_430 = band(shr(s11_398, 9), 255)
+    let o31_431 = band(shr(s11_398, 17), 255)
+    out = if g.which == 0 then o0_400
+      else if g.which == 1 then o1_401
+      else if g.which == 2 then o2_402
+      else if g.which == 3 then o3_403
+      else if g.which == 4 then o4_404
+      else if g.which == 5 then o5_405
+      else if g.which == 6 then o6_406
+      else if g.which == 7 then o7_407
+      else if g.which == 8 then o8_408
+      else if g.which == 9 then o9_409
+      else if g.which == 10 then o10_410
+      else if g.which == 11 then o11_411
+      else if g.which == 12 then o12_412
+      else if g.which == 13 then o13_413
+      else if g.which == 14 then o14_414
+      else if g.which == 15 then o15_415
+      else if g.which == 16 then o16_416
+      else if g.which == 17 then o17_417
+      else if g.which == 18 then o18_418
+      else if g.which == 19 then o19_419
+      else if g.which == 20 then o20_420
+      else if g.which == 21 then o21_421
+      else if g.which == 22 then o22_422
+      else if g.which == 23 then o23_423
+      else if g.which == 24 then o24_424
+      else if g.which == 25 then o25_425
+      else if g.which == 26 then o26_426
+      else if g.which == 27 then o27_427
+      else if g.which == 28 then o28_428
+      else if g.which == 29 then o29_429
+      else if g.which == 30 then o30_430
+      else o31_431
+  proofs:
+    purity:
+      reads : [g.a0, g.a1, g.a2, g.a3, g.a4, g.a5, g.a6, g.a7, g.a8, g.a9, g.a10, g.a11, g.a12, g.a13, g.a14, g.a15, g.a16, g.a17, g.a18, g.a19, g.a20, g.a21, g.a22, g.a23, g.a24, g.a25, g.a26, g.a27, g.a28, g.a29, g.a30, g.a31, g.b0, g.b1, g.b2, g.b3, g.b4, g.b5, g.b6, g.b7, g.b8, g.b9, g.b10, g.b11, g.b12, g.b13, g.b14, g.b15, g.b16, g.b17, g.b18, g.b19, g.b20, g.b21, g.b22, g.b23, g.b24, g.b25, g.b26, g.b27, g.b28, g.b29, g.b30, g.b31, g.c0, g.c1, g.c2, g.c3, g.c4, g.c5, g.c6, g.c7, g.c8, g.c9, g.c10, g.c11, g.c12, g.c13, g.c14, g.c15, g.c16, g.c17, g.c18, g.c19, g.c20, g.c21, g.c22, g.c23, g.c24, g.c25, g.c26, g.c27, g.c28, g.c29, g.c30, g.c31, g.which]
+      calls : []
+    termination:
+      bound : 20000
