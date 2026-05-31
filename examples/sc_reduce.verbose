@@ -1,0 +1,422 @@
+@verbose 0.1.0
+
+concept Sc64
+  @intention: "64 little-endian bytes to reduce mod the Ed25519 group order L, + which output byte (0..31)"
+  @source: invoices.intent:1
+  fields:
+    b0 : number [0, 255]
+    b1 : number [0, 255]
+    b2 : number [0, 255]
+    b3 : number [0, 255]
+    b4 : number [0, 255]
+    b5 : number [0, 255]
+    b6 : number [0, 255]
+    b7 : number [0, 255]
+    b8 : number [0, 255]
+    b9 : number [0, 255]
+    b10 : number [0, 255]
+    b11 : number [0, 255]
+    b12 : number [0, 255]
+    b13 : number [0, 255]
+    b14 : number [0, 255]
+    b15 : number [0, 255]
+    b16 : number [0, 255]
+    b17 : number [0, 255]
+    b18 : number [0, 255]
+    b19 : number [0, 255]
+    b20 : number [0, 255]
+    b21 : number [0, 255]
+    b22 : number [0, 255]
+    b23 : number [0, 255]
+    b24 : number [0, 255]
+    b25 : number [0, 255]
+    b26 : number [0, 255]
+    b27 : number [0, 255]
+    b28 : number [0, 255]
+    b29 : number [0, 255]
+    b30 : number [0, 255]
+    b31 : number [0, 255]
+    b32 : number [0, 255]
+    b33 : number [0, 255]
+    b34 : number [0, 255]
+    b35 : number [0, 255]
+    b36 : number [0, 255]
+    b37 : number [0, 255]
+    b38 : number [0, 255]
+    b39 : number [0, 255]
+    b40 : number [0, 255]
+    b41 : number [0, 255]
+    b42 : number [0, 255]
+    b43 : number [0, 255]
+    b44 : number [0, 255]
+    b45 : number [0, 255]
+    b46 : number [0, 255]
+    b47 : number [0, 255]
+    b48 : number [0, 255]
+    b49 : number [0, 255]
+    b50 : number [0, 255]
+    b51 : number [0, 255]
+    b52 : number [0, 255]
+    b53 : number [0, 255]
+    b54 : number [0, 255]
+    b55 : number [0, 255]
+    b56 : number [0, 255]
+    b57 : number [0, 255]
+    b58 : number [0, 255]
+    b59 : number [0, 255]
+    b60 : number [0, 255]
+    b61 : number [0, 255]
+    b62 : number [0, 255]
+    b63 : number [0, 255]
+    which : number [0, 31]
+
+
+rule sc_reduce
+  @intention: "reduce a 64-byte little-endian integer mod L (Ed25519 group order, ref10); returns byte which (0..31)"
+  @source: invoices.intent:1
+  input:
+    g : Sc64
+  output:
+    out : number
+  logic:
+    let s0_1 = band(bor(bor(g.b0, shl(g.b1, 8)), shl(g.b2, 16)), 2097151)
+    let s1_2 = band(shr(bor(bor(bor(g.b2, shl(g.b3, 8)), shl(g.b4, 16)), shl(g.b5, 24)), 5), 2097151)
+    let s2_3 = band(shr(bor(bor(g.b5, shl(g.b6, 8)), shl(g.b7, 16)), 2), 2097151)
+    let s3_4 = band(shr(bor(bor(bor(g.b7, shl(g.b8, 8)), shl(g.b9, 16)), shl(g.b10, 24)), 7), 2097151)
+    let s4_5 = band(shr(bor(bor(bor(g.b10, shl(g.b11, 8)), shl(g.b12, 16)), shl(g.b13, 24)), 4), 2097151)
+    let s5_6 = band(shr(bor(bor(g.b13, shl(g.b14, 8)), shl(g.b15, 16)), 1), 2097151)
+    let s6_7 = band(shr(bor(bor(bor(g.b15, shl(g.b16, 8)), shl(g.b17, 16)), shl(g.b18, 24)), 6), 2097151)
+    let s7_8 = band(shr(bor(bor(g.b18, shl(g.b19, 8)), shl(g.b20, 16)), 3), 2097151)
+    let s8_9 = band(bor(bor(g.b21, shl(g.b22, 8)), shl(g.b23, 16)), 2097151)
+    let s9_10 = band(shr(bor(bor(bor(g.b23, shl(g.b24, 8)), shl(g.b25, 16)), shl(g.b26, 24)), 5), 2097151)
+    let s10_11 = band(shr(bor(bor(g.b26, shl(g.b27, 8)), shl(g.b28, 16)), 2), 2097151)
+    let s11_12 = band(shr(bor(bor(bor(g.b28, shl(g.b29, 8)), shl(g.b30, 16)), shl(g.b31, 24)), 7), 2097151)
+    let s12_13 = band(shr(bor(bor(bor(g.b31, shl(g.b32, 8)), shl(g.b33, 16)), shl(g.b34, 24)), 4), 2097151)
+    let s13_14 = band(shr(bor(bor(g.b34, shl(g.b35, 8)), shl(g.b36, 16)), 1), 2097151)
+    let s14_15 = band(shr(bor(bor(bor(g.b36, shl(g.b37, 8)), shl(g.b38, 16)), shl(g.b39, 24)), 6), 2097151)
+    let s15_16 = band(shr(bor(bor(g.b39, shl(g.b40, 8)), shl(g.b41, 16)), 3), 2097151)
+    let s16_17 = band(bor(bor(g.b42, shl(g.b43, 8)), shl(g.b44, 16)), 2097151)
+    let s17_18 = band(shr(bor(bor(bor(g.b44, shl(g.b45, 8)), shl(g.b46, 16)), shl(g.b47, 24)), 5), 2097151)
+    let s18_19 = band(shr(bor(bor(g.b47, shl(g.b48, 8)), shl(g.b49, 16)), 2), 2097151)
+    let s19_20 = band(shr(bor(bor(bor(g.b49, shl(g.b50, 8)), shl(g.b51, 16)), shl(g.b52, 24)), 7), 2097151)
+    let s20_21 = band(shr(bor(bor(bor(g.b52, shl(g.b53, 8)), shl(g.b54, 16)), shl(g.b55, 24)), 4), 2097151)
+    let s21_22 = band(shr(bor(bor(g.b55, shl(g.b56, 8)), shl(g.b57, 16)), 1), 2097151)
+    let s22_23 = band(shr(bor(bor(bor(g.b57, shl(g.b58, 8)), shl(g.b59, 16)), shl(g.b60, 24)), 6), 2097151)
+    let s23_24 = shr(bor(bor(bor(g.b60, shl(g.b61, 8)), shl(g.b62, 16)), shl(g.b63, 24)), 3)
+    let s11_25 = s11_12 + (666643 * s23_24)
+    let s12_26 = s12_13 + (470296 * s23_24)
+    let s13_27 = s13_14 + (654183 * s23_24)
+    let s14_28 = s14_15 - (997805 * s23_24)
+    let s15_29 = s15_16 + (136657 * s23_24)
+    let s16_30 = s16_17 - (683901 * s23_24)
+    let s10_31 = s10_11 + (666643 * s22_23)
+    let s11_32 = s11_25 + (470296 * s22_23)
+    let s12_33 = s12_26 + (654183 * s22_23)
+    let s13_34 = s13_27 - (997805 * s22_23)
+    let s14_35 = s14_28 + (136657 * s22_23)
+    let s15_36 = s15_29 - (683901 * s22_23)
+    let s9_37 = s9_10 + (666643 * s21_22)
+    let s10_38 = s10_31 + (470296 * s21_22)
+    let s11_39 = s11_32 + (654183 * s21_22)
+    let s12_40 = s12_33 - (997805 * s21_22)
+    let s13_41 = s13_34 + (136657 * s21_22)
+    let s14_42 = s14_35 - (683901 * s21_22)
+    let s8_43 = s8_9 + (666643 * s20_21)
+    let s9_44 = s9_37 + (470296 * s20_21)
+    let s10_45 = s10_38 + (654183 * s20_21)
+    let s11_46 = s11_39 - (997805 * s20_21)
+    let s12_47 = s12_40 + (136657 * s20_21)
+    let s13_48 = s13_41 - (683901 * s20_21)
+    let s7_49 = s7_8 + (666643 * s19_20)
+    let s8_50 = s8_43 + (470296 * s19_20)
+    let s9_51 = s9_44 + (654183 * s19_20)
+    let s10_52 = s10_45 - (997805 * s19_20)
+    let s11_53 = s11_46 + (136657 * s19_20)
+    let s12_54 = s12_47 - (683901 * s19_20)
+    let s6_55 = s6_7 + (666643 * s18_19)
+    let s7_56 = s7_49 + (470296 * s18_19)
+    let s8_57 = s8_50 + (654183 * s18_19)
+    let s9_58 = s9_51 - (997805 * s18_19)
+    let s10_59 = s10_52 + (136657 * s18_19)
+    let s11_60 = s11_53 - (683901 * s18_19)
+    let t61 = s6_55 + 1048576
+    let c62 = shr(t61 + 4503599627370496, 21) - 2147483648
+    let s7_63 = s7_56 + c62
+    let s6_64 = s6_55 - shl(c62, 21)
+    let t65 = s8_57 + 1048576
+    let c66 = shr(t65 + 4503599627370496, 21) - 2147483648
+    let s9_67 = s9_58 + c66
+    let s8_68 = s8_57 - shl(c66, 21)
+    let t69 = s10_59 + 1048576
+    let c70 = shr(t69 + 4503599627370496, 21) - 2147483648
+    let s11_71 = s11_60 + c70
+    let s10_72 = s10_59 - shl(c70, 21)
+    let t73 = s12_54 + 1048576
+    let c74 = shr(t73 + 4503599627370496, 21) - 2147483648
+    let s13_75 = s13_48 + c74
+    let s12_76 = s12_54 - shl(c74, 21)
+    let t77 = s14_42 + 1048576
+    let c78 = shr(t77 + 4503599627370496, 21) - 2147483648
+    let s15_79 = s15_36 + c78
+    let s14_80 = s14_42 - shl(c78, 21)
+    let t81 = s16_30 + 1048576
+    let c82 = shr(t81 + 4503599627370496, 21) - 2147483648
+    let s17_83 = s17_18 + c82
+    let s16_84 = s16_30 - shl(c82, 21)
+    let t85 = s7_63 + 1048576
+    let c86 = shr(t85 + 4503599627370496, 21) - 2147483648
+    let s8_87 = s8_68 + c86
+    let s7_88 = s7_63 - shl(c86, 21)
+    let t89 = s9_67 + 1048576
+    let c90 = shr(t89 + 4503599627370496, 21) - 2147483648
+    let s10_91 = s10_72 + c90
+    let s9_92 = s9_67 - shl(c90, 21)
+    let t93 = s11_71 + 1048576
+    let c94 = shr(t93 + 4503599627370496, 21) - 2147483648
+    let s12_95 = s12_76 + c94
+    let s11_96 = s11_71 - shl(c94, 21)
+    let t97 = s13_75 + 1048576
+    let c98 = shr(t97 + 4503599627370496, 21) - 2147483648
+    let s14_99 = s14_80 + c98
+    let s13_100 = s13_75 - shl(c98, 21)
+    let t101 = s15_79 + 1048576
+    let c102 = shr(t101 + 4503599627370496, 21) - 2147483648
+    let s16_103 = s16_84 + c102
+    let s15_104 = s15_79 - shl(c102, 21)
+    let s5_105 = s5_6 + (666643 * s17_83)
+    let s6_106 = s6_64 + (470296 * s17_83)
+    let s7_107 = s7_88 + (654183 * s17_83)
+    let s8_108 = s8_87 - (997805 * s17_83)
+    let s9_109 = s9_92 + (136657 * s17_83)
+    let s10_110 = s10_91 - (683901 * s17_83)
+    let s4_111 = s4_5 + (666643 * s16_103)
+    let s5_112 = s5_105 + (470296 * s16_103)
+    let s6_113 = s6_106 + (654183 * s16_103)
+    let s7_114 = s7_107 - (997805 * s16_103)
+    let s8_115 = s8_108 + (136657 * s16_103)
+    let s9_116 = s9_109 - (683901 * s16_103)
+    let s3_117 = s3_4 + (666643 * s15_104)
+    let s4_118 = s4_111 + (470296 * s15_104)
+    let s5_119 = s5_112 + (654183 * s15_104)
+    let s6_120 = s6_113 - (997805 * s15_104)
+    let s7_121 = s7_114 + (136657 * s15_104)
+    let s8_122 = s8_115 - (683901 * s15_104)
+    let s2_123 = s2_3 + (666643 * s14_99)
+    let s3_124 = s3_117 + (470296 * s14_99)
+    let s4_125 = s4_118 + (654183 * s14_99)
+    let s5_126 = s5_119 - (997805 * s14_99)
+    let s6_127 = s6_120 + (136657 * s14_99)
+    let s7_128 = s7_121 - (683901 * s14_99)
+    let s1_129 = s1_2 + (666643 * s13_100)
+    let s2_130 = s2_123 + (470296 * s13_100)
+    let s3_131 = s3_124 + (654183 * s13_100)
+    let s4_132 = s4_125 - (997805 * s13_100)
+    let s5_133 = s5_126 + (136657 * s13_100)
+    let s6_134 = s6_127 - (683901 * s13_100)
+    let s0_135 = s0_1 + (666643 * s12_95)
+    let s1_136 = s1_129 + (470296 * s12_95)
+    let s2_137 = s2_130 + (654183 * s12_95)
+    let s3_138 = s3_131 - (997805 * s12_95)
+    let s4_139 = s4_132 + (136657 * s12_95)
+    let s5_140 = s5_133 - (683901 * s12_95)
+    let s12_141 = 0
+    let t142 = s0_135 + 1048576
+    let c143 = shr(t142 + 4503599627370496, 21) - 2147483648
+    let s1_144 = s1_136 + c143
+    let s0_145 = s0_135 - shl(c143, 21)
+    let t146 = s2_137 + 1048576
+    let c147 = shr(t146 + 4503599627370496, 21) - 2147483648
+    let s3_148 = s3_138 + c147
+    let s2_149 = s2_137 - shl(c147, 21)
+    let t150 = s4_139 + 1048576
+    let c151 = shr(t150 + 4503599627370496, 21) - 2147483648
+    let s5_152 = s5_140 + c151
+    let s4_153 = s4_139 - shl(c151, 21)
+    let t154 = s6_134 + 1048576
+    let c155 = shr(t154 + 4503599627370496, 21) - 2147483648
+    let s7_156 = s7_128 + c155
+    let s6_157 = s6_134 - shl(c155, 21)
+    let t158 = s8_122 + 1048576
+    let c159 = shr(t158 + 4503599627370496, 21) - 2147483648
+    let s9_160 = s9_116 + c159
+    let s8_161 = s8_122 - shl(c159, 21)
+    let t162 = s10_110 + 1048576
+    let c163 = shr(t162 + 4503599627370496, 21) - 2147483648
+    let s11_164 = s11_96 + c163
+    let s10_165 = s10_110 - shl(c163, 21)
+    let t166 = s1_144 + 1048576
+    let c167 = shr(t166 + 4503599627370496, 21) - 2147483648
+    let s2_168 = s2_149 + c167
+    let s1_169 = s1_144 - shl(c167, 21)
+    let t170 = s3_148 + 1048576
+    let c171 = shr(t170 + 4503599627370496, 21) - 2147483648
+    let s4_172 = s4_153 + c171
+    let s3_173 = s3_148 - shl(c171, 21)
+    let t174 = s5_152 + 1048576
+    let c175 = shr(t174 + 4503599627370496, 21) - 2147483648
+    let s6_176 = s6_157 + c175
+    let s5_177 = s5_152 - shl(c175, 21)
+    let t178 = s7_156 + 1048576
+    let c179 = shr(t178 + 4503599627370496, 21) - 2147483648
+    let s8_180 = s8_161 + c179
+    let s7_181 = s7_156 - shl(c179, 21)
+    let t182 = s9_160 + 1048576
+    let c183 = shr(t182 + 4503599627370496, 21) - 2147483648
+    let s10_184 = s10_165 + c183
+    let s9_185 = s9_160 - shl(c183, 21)
+    let t186 = s11_164 + 1048576
+    let c187 = shr(t186 + 4503599627370496, 21) - 2147483648
+    let s12_188 = s12_141 + c187
+    let s11_189 = s11_164 - shl(c187, 21)
+    let s0_190 = s0_145 + (666643 * s12_188)
+    let s1_191 = s1_169 + (470296 * s12_188)
+    let s2_192 = s2_168 + (654183 * s12_188)
+    let s3_193 = s3_173 - (997805 * s12_188)
+    let s4_194 = s4_172 + (136657 * s12_188)
+    let s5_195 = s5_177 - (683901 * s12_188)
+    let s12_196 = 0
+    let c197 = shr(s0_190 + 4503599627370496, 21) - 2147483648
+    let s1_198 = s1_191 + c197
+    let s0_199 = s0_190 - shl(c197, 21)
+    let c200 = shr(s1_198 + 4503599627370496, 21) - 2147483648
+    let s2_201 = s2_192 + c200
+    let s1_202 = s1_198 - shl(c200, 21)
+    let c203 = shr(s2_201 + 4503599627370496, 21) - 2147483648
+    let s3_204 = s3_193 + c203
+    let s2_205 = s2_201 - shl(c203, 21)
+    let c206 = shr(s3_204 + 4503599627370496, 21) - 2147483648
+    let s4_207 = s4_194 + c206
+    let s3_208 = s3_204 - shl(c206, 21)
+    let c209 = shr(s4_207 + 4503599627370496, 21) - 2147483648
+    let s5_210 = s5_195 + c209
+    let s4_211 = s4_207 - shl(c209, 21)
+    let c212 = shr(s5_210 + 4503599627370496, 21) - 2147483648
+    let s6_213 = s6_176 + c212
+    let s5_214 = s5_210 - shl(c212, 21)
+    let c215 = shr(s6_213 + 4503599627370496, 21) - 2147483648
+    let s7_216 = s7_181 + c215
+    let s6_217 = s6_213 - shl(c215, 21)
+    let c218 = shr(s7_216 + 4503599627370496, 21) - 2147483648
+    let s8_219 = s8_180 + c218
+    let s7_220 = s7_216 - shl(c218, 21)
+    let c221 = shr(s8_219 + 4503599627370496, 21) - 2147483648
+    let s9_222 = s9_185 + c221
+    let s8_223 = s8_219 - shl(c221, 21)
+    let c224 = shr(s9_222 + 4503599627370496, 21) - 2147483648
+    let s10_225 = s10_184 + c224
+    let s9_226 = s9_222 - shl(c224, 21)
+    let c227 = shr(s10_225 + 4503599627370496, 21) - 2147483648
+    let s11_228 = s11_189 + c227
+    let s10_229 = s10_225 - shl(c227, 21)
+    let c230 = shr(s11_228 + 4503599627370496, 21) - 2147483648
+    let s12_231 = s12_196 + c230
+    let s11_232 = s11_228 - shl(c230, 21)
+    let s0_233 = s0_199 + (666643 * s12_231)
+    let s1_234 = s1_202 + (470296 * s12_231)
+    let s2_235 = s2_205 + (654183 * s12_231)
+    let s3_236 = s3_208 - (997805 * s12_231)
+    let s4_237 = s4_211 + (136657 * s12_231)
+    let s5_238 = s5_214 - (683901 * s12_231)
+    let c239 = shr(s0_233 + 4503599627370496, 21) - 2147483648
+    let s1_240 = s1_234 + c239
+    let s0_241 = s0_233 - shl(c239, 21)
+    let c242 = shr(s1_240 + 4503599627370496, 21) - 2147483648
+    let s2_243 = s2_235 + c242
+    let s1_244 = s1_240 - shl(c242, 21)
+    let c245 = shr(s2_243 + 4503599627370496, 21) - 2147483648
+    let s3_246 = s3_236 + c245
+    let s2_247 = s2_243 - shl(c245, 21)
+    let c248 = shr(s3_246 + 4503599627370496, 21) - 2147483648
+    let s4_249 = s4_237 + c248
+    let s3_250 = s3_246 - shl(c248, 21)
+    let c251 = shr(s4_249 + 4503599627370496, 21) - 2147483648
+    let s5_252 = s5_238 + c251
+    let s4_253 = s4_249 - shl(c251, 21)
+    let c254 = shr(s5_252 + 4503599627370496, 21) - 2147483648
+    let s6_255 = s6_217 + c254
+    let s5_256 = s5_252 - shl(c254, 21)
+    let c257 = shr(s6_255 + 4503599627370496, 21) - 2147483648
+    let s7_258 = s7_220 + c257
+    let s6_259 = s6_255 - shl(c257, 21)
+    let c260 = shr(s7_258 + 4503599627370496, 21) - 2147483648
+    let s8_261 = s8_223 + c260
+    let s7_262 = s7_258 - shl(c260, 21)
+    let c263 = shr(s8_261 + 4503599627370496, 21) - 2147483648
+    let s9_264 = s9_226 + c263
+    let s8_265 = s8_261 - shl(c263, 21)
+    let c266 = shr(s9_264 + 4503599627370496, 21) - 2147483648
+    let s10_267 = s10_229 + c266
+    let s9_268 = s9_264 - shl(c266, 21)
+    let c269 = shr(s10_267 + 4503599627370496, 21) - 2147483648
+    let s11_270 = s11_232 + c269
+    let s10_271 = s10_267 - shl(c269, 21)
+    let o0_272 = band(s0_241, 255)
+    let o1_273 = band(shr(s0_241, 8), 255)
+    let o2_274 = band(bor(shr(s0_241, 16), shl(s1_244, 5)), 255)
+    let o3_275 = band(shr(s1_244, 3), 255)
+    let o4_276 = band(shr(s1_244, 11), 255)
+    let o5_277 = band(bor(shr(s1_244, 19), shl(s2_247, 2)), 255)
+    let o6_278 = band(shr(s2_247, 6), 255)
+    let o7_279 = band(bor(shr(s2_247, 14), shl(s3_250, 7)), 255)
+    let o8_280 = band(shr(s3_250, 1), 255)
+    let o9_281 = band(shr(s3_250, 9), 255)
+    let o10_282 = band(bor(shr(s3_250, 17), shl(s4_253, 4)), 255)
+    let o11_283 = band(shr(s4_253, 4), 255)
+    let o12_284 = band(shr(s4_253, 12), 255)
+    let o13_285 = band(bor(shr(s4_253, 20), shl(s5_256, 1)), 255)
+    let o14_286 = band(shr(s5_256, 7), 255)
+    let o15_287 = band(bor(shr(s5_256, 15), shl(s6_259, 6)), 255)
+    let o16_288 = band(shr(s6_259, 2), 255)
+    let o17_289 = band(shr(s6_259, 10), 255)
+    let o18_290 = band(bor(shr(s6_259, 18), shl(s7_262, 3)), 255)
+    let o19_291 = band(shr(s7_262, 5), 255)
+    let o20_292 = band(shr(s7_262, 13), 255)
+    let o21_293 = band(s8_265, 255)
+    let o22_294 = band(shr(s8_265, 8), 255)
+    let o23_295 = band(bor(shr(s8_265, 16), shl(s9_268, 5)), 255)
+    let o24_296 = band(shr(s9_268, 3), 255)
+    let o25_297 = band(shr(s9_268, 11), 255)
+    let o26_298 = band(bor(shr(s9_268, 19), shl(s10_271, 2)), 255)
+    let o27_299 = band(shr(s10_271, 6), 255)
+    let o28_300 = band(bor(shr(s10_271, 14), shl(s11_270, 7)), 255)
+    let o29_301 = band(shr(s11_270, 1), 255)
+    let o30_302 = band(shr(s11_270, 9), 255)
+    let o31_303 = band(shr(s11_270, 17), 255)
+    out = if g.which == 0 then o0_272
+      else if g.which == 1 then o1_273
+      else if g.which == 2 then o2_274
+      else if g.which == 3 then o3_275
+      else if g.which == 4 then o4_276
+      else if g.which == 5 then o5_277
+      else if g.which == 6 then o6_278
+      else if g.which == 7 then o7_279
+      else if g.which == 8 then o8_280
+      else if g.which == 9 then o9_281
+      else if g.which == 10 then o10_282
+      else if g.which == 11 then o11_283
+      else if g.which == 12 then o12_284
+      else if g.which == 13 then o13_285
+      else if g.which == 14 then o14_286
+      else if g.which == 15 then o15_287
+      else if g.which == 16 then o16_288
+      else if g.which == 17 then o17_289
+      else if g.which == 18 then o18_290
+      else if g.which == 19 then o19_291
+      else if g.which == 20 then o20_292
+      else if g.which == 21 then o21_293
+      else if g.which == 22 then o22_294
+      else if g.which == 23 then o23_295
+      else if g.which == 24 then o24_296
+      else if g.which == 25 then o25_297
+      else if g.which == 26 then o26_298
+      else if g.which == 27 then o27_299
+      else if g.which == 28 then o28_300
+      else if g.which == 29 then o29_301
+      else if g.which == 30 then o30_302
+      else o31_303
+  proofs:
+    purity:
+      reads : [g.b0, g.b1, g.b2, g.b3, g.b4, g.b5, g.b6, g.b7, g.b8, g.b9, g.b10, g.b11, g.b12, g.b13, g.b14, g.b15, g.b16, g.b17, g.b18, g.b19, g.b20, g.b21, g.b22, g.b23, g.b24, g.b25, g.b26, g.b27, g.b28, g.b29, g.b30, g.b31, g.b32, g.b33, g.b34, g.b35, g.b36, g.b37, g.b38, g.b39, g.b40, g.b41, g.b42, g.b43, g.b44, g.b45, g.b46, g.b47, g.b48, g.b49, g.b50, g.b51, g.b52, g.b53, g.b54, g.b55, g.b56, g.b57, g.b58, g.b59, g.b60, g.b61, g.b62, g.b63, g.which]
+      calls : []
+    termination:
+      bound : 4000
