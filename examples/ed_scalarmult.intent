@@ -1,0 +1,13 @@
+Ed25519 scalar multiplication [scalar]P (Ed25519 brick 3) — the recursive
+double-and-add over 256 scalar bits, analogous to the X25519 Montgomery ladder
+but on the twisted-Edwards curve. Threads the accumulator Q and the running
+point P (extended coords, 40 limbs each) + a bit counter j + the 64-hex-char
+scalar through a recursive callable, terminating by decreasing:j over j:[0,256].
+
+Per step (LSB-first): extract scalar bit (256-j); branch-free select
+Q := bit ? ed_add(Q,P) : Q (mask = 0-bit); double P := ed_add(P,P); recurse j-1.
+At j==0 return limb which (0..39) of Q (X|Y|Z|T). Each ed_add is inlined via the
+field_emit helpers. First Verbose recursive callable to thread ~82 number fields
+plus a text field (wider than the X25519 ladder's ~51). Validated against the
+RFC 8032 Edwards reference for [5]B and [9]B (EDSCALAR_OK). Public key A=[a]B and
+the signature points R=[r]B both use this rule.
