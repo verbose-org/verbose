@@ -1,0 +1,11 @@
+SHA-512 over N pre-padded 128-byte blocks (FIPS 180-4) — first brick of the
+Ed25519 signature arc (Ed25519 hashes with SHA-512). Same recursive-fold shape
+as sha256_fold, but 64-bit words: held as i64 (negative literals for K
+constants >= 2^63), with native mod-2^64 add and 64-bit band/shl/shr. No masking
+needed (unlike SHA-256's 32-bit emulation). 80 rounds.
+
+sha512_fold threads the 8 64-bit state words through a recursive callable, one
+128-byte block per frame, terminating by decreasing:i over i:[0,32]. The caller
+supplies the IV (H0) as the initial state and the message SHA-512-padded to a
+multiple of 128 bytes (16-byte big-endian bit-length), as hex. Returns digest
+byte which (0..63). Validated vs hashlib (lengths 0/3/43/200).
