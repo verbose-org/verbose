@@ -116,3 +116,19 @@ def serve(conn):
     conn.sendall(V.aead_encrypt(s_ak, s_aiv, 0, http, 0x17))  # aead_encrypt already returns a full record
     print("sent application data (hello world)")
     time.sleep(2)  # let TCP deliver the record before close
+
+def main():
+    port=int(sys.argv[1]) if len(sys.argv)>1 else 14443
+    V.ensure(V.ALL_RULES + [("psk_early_secret","psk_schedule.verbose"),
+                            ("psk_ext_binder_key","psk_schedule.verbose"),
+                            ("hkdf_extract","hkdf_extract.verbose")])
+    s=socket.socket(socket.AF_INET,socket.SOCK_STREAM)
+    s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
+    s.bind(("127.0.0.1",port)); s.listen(1)
+    print(f"TLS-Verbose listening on {port}", flush=True)
+    conn,_=s.accept()
+    try: serve(conn)
+    finally: conn.close(); s.close()
+
+if __name__=="__main__":
+    main()
