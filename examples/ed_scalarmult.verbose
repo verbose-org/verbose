@@ -97,7 +97,7 @@ rule ed_scalarmult
   output:
     out : number
   logic:
-    let bi = 256 - s.j
+    let bi = if s.j == 0 then 0 else 256 - s.j
     let bidx = shr(bi, 3)
     let bpos = band(bi, 7)
     let hpos = shl(bidx, 1)

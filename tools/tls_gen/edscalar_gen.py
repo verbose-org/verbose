@@ -26,7 +26,7 @@ Pt = grp("p")   # current point
 
 lets=[]
 # bit index = 256 - j (only used when j>0); at j==0 we finalize.
-lets.append(("bi", "256 - s.j"))
+lets.append(("bi", "if s.j == 0 then 0 else 256 - s.j"))
 lets.append(("bidx", "shr(bi, 3)"))
 lets.append(("bpos", "band(bi, 7)"))
 lets.append(("hpos", "shl(bidx, 1)"))
