@@ -36,7 +36,7 @@ lets.append(("hv", "if hc <= 57 then hc - 48 else bor(hc, 32) - 87"))
 lets.append(("lv", "if lc <= 57 then lc - 48 else bor(lc, 32) - 87"))
 lets.append(("bytev", "16 * hv + lv"))
 lets.append(("bit", "band(shr(bytev, bpos), 1)"))
-lets.append(("mask", "0 - bit"))   # 0x..00 or 0x..ff (all ones) for select
+# select via if/then/else (mask 0-bit proved unreliable at runtime)
 
 # Qadd = ed_add(Q, P)
 Qadd = emit_edadd(lets, "add_", Qt, Pt)
@@ -45,7 +45,7 @@ Qnew=[]
 flatQ = Qt[0]+Qt[1]+Qt[2]+Qt[3]
 flatQadd = Qadd[0]+Qadd[1]+Qadd[2]+Qadd[3]
 for i in range(40):
-    nm=f"qn{i}"; lets.append((nm, f"bxor({flatQ[i]}, band(mask, bxor({flatQ[i]}, {flatQadd[i]})))")); Qnew.append(nm)
+    nm=f"qn{i}"; lets.append((nm, f"if bit == 1 then {flatQadd[i]} else {flatQ[i]}")); Qnew.append(nm)
 # Pnew = ed_add(P,P) (double)
 Pdbl = emit_edadd(lets, "dbl_", Pt, Pt)
 flatPnew = Pdbl[0]+Pdbl[1]+Pdbl[2]+Pdbl[3]

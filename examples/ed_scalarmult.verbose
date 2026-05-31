@@ -107,7 +107,6 @@ rule ed_scalarmult
     let lv = if lc <= 57 then lc - 48 else bor(lc, 32) - 87
     let bytev = 16 * hv + lv
     let bit = band(shr(bytev, bpos), 1)
-    let mask = 0 - bit
     let add_yx1_a0 = s.qy0 + 134217690 - s.qx0
     let add_yx1_a1 = s.qy1 + 67108862 - s.qx1
     let add_yx1_a2 = s.qy2 + 134217726 - s.qx2
@@ -1368,46 +1367,46 @@ rule ed_scalarmult
     let add_T3_c1_9 = shr(add_T3_s1_8, 25)
     let add_T3_lo1_9 = band(add_T3_s1_8, 33554431)
     let add_T3_w1 = add_T3_lo1_0 + 19 * add_T3_c1_9
-    let qn0 = bxor(s.qx0, band(mask, bxor(s.qx0, add_X3_w1)))
-    let qn1 = bxor(s.qx1, band(mask, bxor(s.qx1, add_X3_lo1_1)))
-    let qn2 = bxor(s.qx2, band(mask, bxor(s.qx2, add_X3_lo1_2)))
-    let qn3 = bxor(s.qx3, band(mask, bxor(s.qx3, add_X3_lo1_3)))
-    let qn4 = bxor(s.qx4, band(mask, bxor(s.qx4, add_X3_lo1_4)))
-    let qn5 = bxor(s.qx5, band(mask, bxor(s.qx5, add_X3_lo1_5)))
-    let qn6 = bxor(s.qx6, band(mask, bxor(s.qx6, add_X3_lo1_6)))
-    let qn7 = bxor(s.qx7, band(mask, bxor(s.qx7, add_X3_lo1_7)))
-    let qn8 = bxor(s.qx8, band(mask, bxor(s.qx8, add_X3_lo1_8)))
-    let qn9 = bxor(s.qx9, band(mask, bxor(s.qx9, add_X3_lo1_9)))
-    let qn10 = bxor(s.qy0, band(mask, bxor(s.qy0, add_Y3_w1)))
-    let qn11 = bxor(s.qy1, band(mask, bxor(s.qy1, add_Y3_lo1_1)))
-    let qn12 = bxor(s.qy2, band(mask, bxor(s.qy2, add_Y3_lo1_2)))
-    let qn13 = bxor(s.qy3, band(mask, bxor(s.qy3, add_Y3_lo1_3)))
-    let qn14 = bxor(s.qy4, band(mask, bxor(s.qy4, add_Y3_lo1_4)))
-    let qn15 = bxor(s.qy5, band(mask, bxor(s.qy5, add_Y3_lo1_5)))
-    let qn16 = bxor(s.qy6, band(mask, bxor(s.qy6, add_Y3_lo1_6)))
-    let qn17 = bxor(s.qy7, band(mask, bxor(s.qy7, add_Y3_lo1_7)))
-    let qn18 = bxor(s.qy8, band(mask, bxor(s.qy8, add_Y3_lo1_8)))
-    let qn19 = bxor(s.qy9, band(mask, bxor(s.qy9, add_Y3_lo1_9)))
-    let qn20 = bxor(s.qz0, band(mask, bxor(s.qz0, add_Z3_w1)))
-    let qn21 = bxor(s.qz1, band(mask, bxor(s.qz1, add_Z3_lo1_1)))
-    let qn22 = bxor(s.qz2, band(mask, bxor(s.qz2, add_Z3_lo1_2)))
-    let qn23 = bxor(s.qz3, band(mask, bxor(s.qz3, add_Z3_lo1_3)))
-    let qn24 = bxor(s.qz4, band(mask, bxor(s.qz4, add_Z3_lo1_4)))
-    let qn25 = bxor(s.qz5, band(mask, bxor(s.qz5, add_Z3_lo1_5)))
-    let qn26 = bxor(s.qz6, band(mask, bxor(s.qz6, add_Z3_lo1_6)))
-    let qn27 = bxor(s.qz7, band(mask, bxor(s.qz7, add_Z3_lo1_7)))
-    let qn28 = bxor(s.qz8, band(mask, bxor(s.qz8, add_Z3_lo1_8)))
-    let qn29 = bxor(s.qz9, band(mask, bxor(s.qz9, add_Z3_lo1_9)))
-    let qn30 = bxor(s.qt0, band(mask, bxor(s.qt0, add_T3_w1)))
-    let qn31 = bxor(s.qt1, band(mask, bxor(s.qt1, add_T3_lo1_1)))
-    let qn32 = bxor(s.qt2, band(mask, bxor(s.qt2, add_T3_lo1_2)))
-    let qn33 = bxor(s.qt3, band(mask, bxor(s.qt3, add_T3_lo1_3)))
-    let qn34 = bxor(s.qt4, band(mask, bxor(s.qt4, add_T3_lo1_4)))
-    let qn35 = bxor(s.qt5, band(mask, bxor(s.qt5, add_T3_lo1_5)))
-    let qn36 = bxor(s.qt6, band(mask, bxor(s.qt6, add_T3_lo1_6)))
-    let qn37 = bxor(s.qt7, band(mask, bxor(s.qt7, add_T3_lo1_7)))
-    let qn38 = bxor(s.qt8, band(mask, bxor(s.qt8, add_T3_lo1_8)))
-    let qn39 = bxor(s.qt9, band(mask, bxor(s.qt9, add_T3_lo1_9)))
+    let qn0 = if bit == 1 then add_X3_w1 else s.qx0
+    let qn1 = if bit == 1 then add_X3_lo1_1 else s.qx1
+    let qn2 = if bit == 1 then add_X3_lo1_2 else s.qx2
+    let qn3 = if bit == 1 then add_X3_lo1_3 else s.qx3
+    let qn4 = if bit == 1 then add_X3_lo1_4 else s.qx4
+    let qn5 = if bit == 1 then add_X3_lo1_5 else s.qx5
+    let qn6 = if bit == 1 then add_X3_lo1_6 else s.qx6
+    let qn7 = if bit == 1 then add_X3_lo1_7 else s.qx7
+    let qn8 = if bit == 1 then add_X3_lo1_8 else s.qx8
+    let qn9 = if bit == 1 then add_X3_lo1_9 else s.qx9
+    let qn10 = if bit == 1 then add_Y3_w1 else s.qy0
+    let qn11 = if bit == 1 then add_Y3_lo1_1 else s.qy1
+    let qn12 = if bit == 1 then add_Y3_lo1_2 else s.qy2
+    let qn13 = if bit == 1 then add_Y3_lo1_3 else s.qy3
+    let qn14 = if bit == 1 then add_Y3_lo1_4 else s.qy4
+    let qn15 = if bit == 1 then add_Y3_lo1_5 else s.qy5
+    let qn16 = if bit == 1 then add_Y3_lo1_6 else s.qy6
+    let qn17 = if bit == 1 then add_Y3_lo1_7 else s.qy7
+    let qn18 = if bit == 1 then add_Y3_lo1_8 else s.qy8
+    let qn19 = if bit == 1 then add_Y3_lo1_9 else s.qy9
+    let qn20 = if bit == 1 then add_Z3_w1 else s.qz0
+    let qn21 = if bit == 1 then add_Z3_lo1_1 else s.qz1
+    let qn22 = if bit == 1 then add_Z3_lo1_2 else s.qz2
+    let qn23 = if bit == 1 then add_Z3_lo1_3 else s.qz3
+    let qn24 = if bit == 1 then add_Z3_lo1_4 else s.qz4
+    let qn25 = if bit == 1 then add_Z3_lo1_5 else s.qz5
+    let qn26 = if bit == 1 then add_Z3_lo1_6 else s.qz6
+    let qn27 = if bit == 1 then add_Z3_lo1_7 else s.qz7
+    let qn28 = if bit == 1 then add_Z3_lo1_8 else s.qz8
+    let qn29 = if bit == 1 then add_Z3_lo1_9 else s.qz9
+    let qn30 = if bit == 1 then add_T3_w1 else s.qt0
+    let qn31 = if bit == 1 then add_T3_lo1_1 else s.qt1
+    let qn32 = if bit == 1 then add_T3_lo1_2 else s.qt2
+    let qn33 = if bit == 1 then add_T3_lo1_3 else s.qt3
+    let qn34 = if bit == 1 then add_T3_lo1_4 else s.qt4
+    let qn35 = if bit == 1 then add_T3_lo1_5 else s.qt5
+    let qn36 = if bit == 1 then add_T3_lo1_6 else s.qt6
+    let qn37 = if bit == 1 then add_T3_lo1_7 else s.qt7
+    let qn38 = if bit == 1 then add_T3_lo1_8 else s.qt8
+    let qn39 = if bit == 1 then add_T3_lo1_9 else s.qt9
     let dbl_yx1_a0 = s.py0 + 134217690 - s.px0
     let dbl_yx1_a1 = s.py1 + 67108862 - s.px1
     let dbl_yx1_a2 = s.py2 + 134217726 - s.px2
