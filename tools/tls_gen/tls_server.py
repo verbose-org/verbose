@@ -88,7 +88,7 @@ def serve(conn):
     fin = hs_msg(0x14, verify_data)
     transcript += fin
     flight = ee + fin
-    conn.sendall(record(0x17, V.aead_encrypt(s_key, s_iv, 0, flight, 0x16)))
+    conn.sendall(V.aead_encrypt(s_key, s_iv, 0, flight, 0x16))  # aead_encrypt already returns a full record
     print("sent SH + EE + Finished")
 
     # 9. read client's encrypted Finished, decrypt with c_hs
@@ -106,7 +106,7 @@ def serve(conn):
     s_ap = V.run_bytes("derive_s_ap_traffic",[str(b) for b in master]+[str(b) for b in th_full],32)
     s_ak=V.run_bytes("expand_key",[str(b) for b in s_ap],16); s_aiv=V.run_bytes("expand_iv",[str(b) for b in s_ap],12)
     http=b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\nContent-Type: text/plain\r\n\r\nhello world"
-    conn.sendall(record(0x17, V.aead_encrypt(s_ak, s_aiv, 0, http, 0x17)))
+    conn.sendall(V.aead_encrypt(s_ak, s_aiv, 0, http, 0x17))  # aead_encrypt already returns a full record
     print("sent application data (hello world)")
     time.sleep(2)  # let TCP deliver the record before close
 
