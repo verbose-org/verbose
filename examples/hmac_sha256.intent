@@ -1,0 +1,9 @@
+HMAC-SHA256 (RFC 2104) of an 8-byte message under a block-sized
+(64-byte, zero-padded) key:
+  inner = SHA256( (K XOR ipad) || message )
+  HMAC  = SHA256( (K XOR opad) || inner )
+with ipad = 0x36 repeated, opad = 0x5c repeated. SHA-256 is computed
+from the input bytes (message schedule + 64 rounds + padding), inlined
+twice. This is the core of HKDF and the TLS 1.3 key schedule.
+Validated against RFC 4231 Test Case 1.
+Single rule hmac_sha256(key, message, which) returns one MAC byte.

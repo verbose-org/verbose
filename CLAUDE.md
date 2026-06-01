@@ -540,6 +540,42 @@ examples/
                    "hello world"/0 → 2, "42 abc"/0 → 3, "a b c"/0 → 3.
                    First Verbose binary that loops through a complete
                    text input scanning multiple tokens.
+
+  ── TLS 1.3 crypto arc (symmetric + KDF half of TLS_AES_128_GCM_SHA256) ──
+  Each brick is a standalone native binary, validated byte-for-byte against
+  its authoritative reference vector. All built as straight-line `let`-chain
+  unrolls with the `which` parameterization (one rule call returns one output
+  byte, dispatched 0..N at the end) — no recursion, no state.
+  aes_sbox.*        FIPS-197 forward S-box (256-way if/else). ~14 KB.
+  aes_transforms.*  SubBytes/ShiftRows/MixColumns/AddRoundKey (PR #75),
+                    column-major state, FIPS-197 Appendix B. xtime helper.
+  aes_key_expansion.* AES-128 KeyExpansion (PR #76): round_key(key, round,
+                    which) → 176-byte schedule. FIPS-197 A.1 + B, 176/176.
+  aes_encrypt.*     AES-128 single-block ECB encrypt, 10 rounds composed.
+                    FIPS-197 C.1 + `openssl enc -aes-128-ecb` + NIST. ~50 KB.
+  aes_ctr.*         AES-128-CTR: C = P XOR AES(counter). NIST SP 800-38A F.5
+                    + `openssl enc -aes-128-ctr` + round-trip. 53 KB.
+  ghash_mul.*       GF(2^128) multiply under the GCM polynomial (NIST SP
+                    800-38D Alg.1), 16-byte operands, shift-and-add unrolled.
+                    5 vectors incl. edge cases. 263 KB.
+  ghash.*           GHASH over 2 blocks: ((C*H) XOR L)*H — minimal GCM auth
+                    shape. GCM test-case 2. 523 KB.
+  aes_gcm.*         AES-128-GCM AEAD (one block, 96-bit IV, empty AAD):
+                    H=AES(0), J0, CTR encrypt, GHASH, tag=S XOR E(J0). One
+                    shared key schedule for all 3 AES blocks. Validated
+                    bit-for-bit against NIST GCM Test Case 2 (published C AND
+                    T) + a non-trivial vector. 625 KB. The milestone of the arc.
+  hmac_sha256.*     HMAC-SHA256 (RFC 2104): SHA256(opad‖SHA256(ipad‖m)), two
+                    SHA-256s built from the input bytes (general message
+                    schedule, unlike the hardcoded w_const of sha256_*).
+                    RFC 4231 Test Case 1. 328 KB.
+  hkdf.*            HKDF (RFC 5869): hkdf_extract (PRK = HMAC(salt,IKM)) +
+                    hkdf_expand (OKM = T(1)‖T(2) via iterated HMAC). RFC 5869
+                    Test Case 1 (published PRK + OKM). 329/647 KB. KDF layer done.
+  NOTE: the asymmetric half (X25519 key exchange, signature verification) is
+  NOT built — infeasible as a let-chain unroll (X25519's Montgomery ladder is
+  millions of ops) and needs bounded-loop / recursion infra over byte arrays +
+  multi-precision arithmetic. That is the next architectural chantier.
   demo.html        Browser demo (WASM)
 
 tools/
@@ -792,7 +828,7 @@ Full rationale: README.md → "Why Not Transpile Rust/Go → Verbose?".
 - **No false explicitation** — every declaration must be mechanically verified or exploited. If it's just decoration, remove it.
 - **The native backend is the destination** — the Rust transpiler is a fallback. Architectural decisions should keep the native path open.
 - **Every feature must serve security, performance, or unique machine code.** No ergonomic sugar without optimization value.
-- **All documentation in English.** The repo is international.
+- **All documentation in English.** The repo is international. **One scoped exception: `docs/learn/`.** Those are pedagogical articles (cross-posted to [arcker.org](https://arcker.org), the canonical home) written in French, pinned to a stated language version per article. They are blog content that happens to live in the repo, not compiler reference docs — they do not track the current codebase and are exempt from the English rule and the "keep up to date" expectation. Everything else under `docs/` (design notes, effect model, native designs, etc.) stays English and current.
 - **Pop sub-agents for exploration-heavy work.** When mapping a refactor across many files, scanning for every touch point of a construct, or investigating a broad "where is X used" question, delegate to a sub-agent (`Agent` tool, `Explore` type for searches, `general-purpose` for mixed read+reasoning). The agent's summary lands in the main context; the raw file reads do not. Reserve the main context for actual edits and conversation with the human. Sub-agents are not a substitute for judgment — always read the code you're about to modify yourself, and verify the agent's claims against the file before acting on them.
 
 ## Design Lessons

@@ -1,0 +1,11 @@
+Twisted-Edwards point addition in extended coordinates (Ed25519 brick 2).
+Unified addition formula for the curve -x^2+y^2 = 1+d x^2 y^2 (a=-1) over
+GF(2^255-19), reusing the X25519 field arithmetic (field_emit). Input: two
+points P1,P2 = (X,Y,Z,T) each as 10 limbs (80 number fields); output: limb
+`which` (0..39) of P3 = P1+P2 laid out X3|Y3|Z3|T3.
+
+Formula: A=(Y1-X1)(Y2-X2); B=(Y1+X1)(Y2+X2); C=T1*2d*T2; D=2*Z1*Z2;
+E=B-A; F=D-C; G=D+C; H=B+A; X3=E*F; Y3=G*H; Z3=F*G; T3=E*H. The constant
+2d is embedded as field-element limbs. Unified: also computes doublings (P+P).
+Validated against a self-contained RFC 8032 Edwards reference (B+B, 2B+B, B+5B).
+This is the core step of Ed25519 scalar multiplication (next brick).

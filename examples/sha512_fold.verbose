@@ -1,0 +1,1086 @@
+@verbose 0.1.0
+
+concept Sha512State
+  @intention: "SHA-512 fold state: 8 64-bit hash words + block count, counter, which, hex pre-padded data"
+  @source: invoices.intent:1
+  fields:
+    h0 : number
+    h1 : number
+    h2 : number
+    h3 : number
+    h4 : number
+    h5 : number
+    h6 : number
+    h7 : number
+    nblocks : number [0, 32]
+    i : number [0, 32]
+    which : number [0, 63]
+    data : text
+
+
+rule sha512_fold
+  @intention: "SHA-512 over N pre-padded 128-byte blocks (hex): state=IV; per block compress; returns digest byte which (FIPS 180-4)"
+  @source: invoices.intent:1
+  input:
+    s : Sha512State
+  output:
+    out : number
+  logic:
+    let bidx = if s.i == 0 then 0 else s.nblocks - s.i
+    let boff = bidx * 256
+    let w0_h0 = byte_at(s.data, boff + 0)
+    let w0_l0 = byte_at(s.data, boff + 1)
+    let w0_hv0 = if w0_h0 <= 57 then w0_h0 - 48 else bor(w0_h0, 32) - 87
+    let w0_lv0 = if w0_l0 <= 57 then w0_l0 - 48 else bor(w0_l0, 32) - 87
+    let w0_b0 = 16 * w0_hv0 + w0_lv0
+    let w0_h1 = byte_at(s.data, boff + 2)
+    let w0_l1 = byte_at(s.data, boff + 3)
+    let w0_hv1 = if w0_h1 <= 57 then w0_h1 - 48 else bor(w0_h1, 32) - 87
+    let w0_lv1 = if w0_l1 <= 57 then w0_l1 - 48 else bor(w0_l1, 32) - 87
+    let w0_b1 = 16 * w0_hv1 + w0_lv1
+    let w0_h2 = byte_at(s.data, boff + 4)
+    let w0_l2 = byte_at(s.data, boff + 5)
+    let w0_hv2 = if w0_h2 <= 57 then w0_h2 - 48 else bor(w0_h2, 32) - 87
+    let w0_lv2 = if w0_l2 <= 57 then w0_l2 - 48 else bor(w0_l2, 32) - 87
+    let w0_b2 = 16 * w0_hv2 + w0_lv2
+    let w0_h3 = byte_at(s.data, boff + 6)
+    let w0_l3 = byte_at(s.data, boff + 7)
+    let w0_hv3 = if w0_h3 <= 57 then w0_h3 - 48 else bor(w0_h3, 32) - 87
+    let w0_lv3 = if w0_l3 <= 57 then w0_l3 - 48 else bor(w0_l3, 32) - 87
+    let w0_b3 = 16 * w0_hv3 + w0_lv3
+    let w0_h4 = byte_at(s.data, boff + 8)
+    let w0_l4 = byte_at(s.data, boff + 9)
+    let w0_hv4 = if w0_h4 <= 57 then w0_h4 - 48 else bor(w0_h4, 32) - 87
+    let w0_lv4 = if w0_l4 <= 57 then w0_l4 - 48 else bor(w0_l4, 32) - 87
+    let w0_b4 = 16 * w0_hv4 + w0_lv4
+    let w0_h5 = byte_at(s.data, boff + 10)
+    let w0_l5 = byte_at(s.data, boff + 11)
+    let w0_hv5 = if w0_h5 <= 57 then w0_h5 - 48 else bor(w0_h5, 32) - 87
+    let w0_lv5 = if w0_l5 <= 57 then w0_l5 - 48 else bor(w0_l5, 32) - 87
+    let w0_b5 = 16 * w0_hv5 + w0_lv5
+    let w0_h6 = byte_at(s.data, boff + 12)
+    let w0_l6 = byte_at(s.data, boff + 13)
+    let w0_hv6 = if w0_h6 <= 57 then w0_h6 - 48 else bor(w0_h6, 32) - 87
+    let w0_lv6 = if w0_l6 <= 57 then w0_l6 - 48 else bor(w0_l6, 32) - 87
+    let w0_b6 = 16 * w0_hv6 + w0_lv6
+    let w0_h7 = byte_at(s.data, boff + 14)
+    let w0_l7 = byte_at(s.data, boff + 15)
+    let w0_hv7 = if w0_h7 <= 57 then w0_h7 - 48 else bor(w0_h7, 32) - 87
+    let w0_lv7 = if w0_l7 <= 57 then w0_l7 - 48 else bor(w0_l7, 32) - 87
+    let w0_b7 = 16 * w0_hv7 + w0_lv7
+    let w0 = bor(bor(bor(bor(bor(bor(bor(w0_b7, shl(w0_b0, 56)), shl(w0_b1, 48)), shl(w0_b2, 40)), shl(w0_b3, 32)), shl(w0_b4, 24)), shl(w0_b5, 16)), shl(w0_b6, 8))
+    let w1_h0 = byte_at(s.data, boff + 16)
+    let w1_l0 = byte_at(s.data, boff + 17)
+    let w1_hv0 = if w1_h0 <= 57 then w1_h0 - 48 else bor(w1_h0, 32) - 87
+    let w1_lv0 = if w1_l0 <= 57 then w1_l0 - 48 else bor(w1_l0, 32) - 87
+    let w1_b0 = 16 * w1_hv0 + w1_lv0
+    let w1_h1 = byte_at(s.data, boff + 18)
+    let w1_l1 = byte_at(s.data, boff + 19)
+    let w1_hv1 = if w1_h1 <= 57 then w1_h1 - 48 else bor(w1_h1, 32) - 87
+    let w1_lv1 = if w1_l1 <= 57 then w1_l1 - 48 else bor(w1_l1, 32) - 87
+    let w1_b1 = 16 * w1_hv1 + w1_lv1
+    let w1_h2 = byte_at(s.data, boff + 20)
+    let w1_l2 = byte_at(s.data, boff + 21)
+    let w1_hv2 = if w1_h2 <= 57 then w1_h2 - 48 else bor(w1_h2, 32) - 87
+    let w1_lv2 = if w1_l2 <= 57 then w1_l2 - 48 else bor(w1_l2, 32) - 87
+    let w1_b2 = 16 * w1_hv2 + w1_lv2
+    let w1_h3 = byte_at(s.data, boff + 22)
+    let w1_l3 = byte_at(s.data, boff + 23)
+    let w1_hv3 = if w1_h3 <= 57 then w1_h3 - 48 else bor(w1_h3, 32) - 87
+    let w1_lv3 = if w1_l3 <= 57 then w1_l3 - 48 else bor(w1_l3, 32) - 87
+    let w1_b3 = 16 * w1_hv3 + w1_lv3
+    let w1_h4 = byte_at(s.data, boff + 24)
+    let w1_l4 = byte_at(s.data, boff + 25)
+    let w1_hv4 = if w1_h4 <= 57 then w1_h4 - 48 else bor(w1_h4, 32) - 87
+    let w1_lv4 = if w1_l4 <= 57 then w1_l4 - 48 else bor(w1_l4, 32) - 87
+    let w1_b4 = 16 * w1_hv4 + w1_lv4
+    let w1_h5 = byte_at(s.data, boff + 26)
+    let w1_l5 = byte_at(s.data, boff + 27)
+    let w1_hv5 = if w1_h5 <= 57 then w1_h5 - 48 else bor(w1_h5, 32) - 87
+    let w1_lv5 = if w1_l5 <= 57 then w1_l5 - 48 else bor(w1_l5, 32) - 87
+    let w1_b5 = 16 * w1_hv5 + w1_lv5
+    let w1_h6 = byte_at(s.data, boff + 28)
+    let w1_l6 = byte_at(s.data, boff + 29)
+    let w1_hv6 = if w1_h6 <= 57 then w1_h6 - 48 else bor(w1_h6, 32) - 87
+    let w1_lv6 = if w1_l6 <= 57 then w1_l6 - 48 else bor(w1_l6, 32) - 87
+    let w1_b6 = 16 * w1_hv6 + w1_lv6
+    let w1_h7 = byte_at(s.data, boff + 30)
+    let w1_l7 = byte_at(s.data, boff + 31)
+    let w1_hv7 = if w1_h7 <= 57 then w1_h7 - 48 else bor(w1_h7, 32) - 87
+    let w1_lv7 = if w1_l7 <= 57 then w1_l7 - 48 else bor(w1_l7, 32) - 87
+    let w1_b7 = 16 * w1_hv7 + w1_lv7
+    let w1 = bor(bor(bor(bor(bor(bor(bor(w1_b7, shl(w1_b0, 56)), shl(w1_b1, 48)), shl(w1_b2, 40)), shl(w1_b3, 32)), shl(w1_b4, 24)), shl(w1_b5, 16)), shl(w1_b6, 8))
+    let w2_h0 = byte_at(s.data, boff + 32)
+    let w2_l0 = byte_at(s.data, boff + 33)
+    let w2_hv0 = if w2_h0 <= 57 then w2_h0 - 48 else bor(w2_h0, 32) - 87
+    let w2_lv0 = if w2_l0 <= 57 then w2_l0 - 48 else bor(w2_l0, 32) - 87
+    let w2_b0 = 16 * w2_hv0 + w2_lv0
+    let w2_h1 = byte_at(s.data, boff + 34)
+    let w2_l1 = byte_at(s.data, boff + 35)
+    let w2_hv1 = if w2_h1 <= 57 then w2_h1 - 48 else bor(w2_h1, 32) - 87
+    let w2_lv1 = if w2_l1 <= 57 then w2_l1 - 48 else bor(w2_l1, 32) - 87
+    let w2_b1 = 16 * w2_hv1 + w2_lv1
+    let w2_h2 = byte_at(s.data, boff + 36)
+    let w2_l2 = byte_at(s.data, boff + 37)
+    let w2_hv2 = if w2_h2 <= 57 then w2_h2 - 48 else bor(w2_h2, 32) - 87
+    let w2_lv2 = if w2_l2 <= 57 then w2_l2 - 48 else bor(w2_l2, 32) - 87
+    let w2_b2 = 16 * w2_hv2 + w2_lv2
+    let w2_h3 = byte_at(s.data, boff + 38)
+    let w2_l3 = byte_at(s.data, boff + 39)
+    let w2_hv3 = if w2_h3 <= 57 then w2_h3 - 48 else bor(w2_h3, 32) - 87
+    let w2_lv3 = if w2_l3 <= 57 then w2_l3 - 48 else bor(w2_l3, 32) - 87
+    let w2_b3 = 16 * w2_hv3 + w2_lv3
+    let w2_h4 = byte_at(s.data, boff + 40)
+    let w2_l4 = byte_at(s.data, boff + 41)
+    let w2_hv4 = if w2_h4 <= 57 then w2_h4 - 48 else bor(w2_h4, 32) - 87
+    let w2_lv4 = if w2_l4 <= 57 then w2_l4 - 48 else bor(w2_l4, 32) - 87
+    let w2_b4 = 16 * w2_hv4 + w2_lv4
+    let w2_h5 = byte_at(s.data, boff + 42)
+    let w2_l5 = byte_at(s.data, boff + 43)
+    let w2_hv5 = if w2_h5 <= 57 then w2_h5 - 48 else bor(w2_h5, 32) - 87
+    let w2_lv5 = if w2_l5 <= 57 then w2_l5 - 48 else bor(w2_l5, 32) - 87
+    let w2_b5 = 16 * w2_hv5 + w2_lv5
+    let w2_h6 = byte_at(s.data, boff + 44)
+    let w2_l6 = byte_at(s.data, boff + 45)
+    let w2_hv6 = if w2_h6 <= 57 then w2_h6 - 48 else bor(w2_h6, 32) - 87
+    let w2_lv6 = if w2_l6 <= 57 then w2_l6 - 48 else bor(w2_l6, 32) - 87
+    let w2_b6 = 16 * w2_hv6 + w2_lv6
+    let w2_h7 = byte_at(s.data, boff + 46)
+    let w2_l7 = byte_at(s.data, boff + 47)
+    let w2_hv7 = if w2_h7 <= 57 then w2_h7 - 48 else bor(w2_h7, 32) - 87
+    let w2_lv7 = if w2_l7 <= 57 then w2_l7 - 48 else bor(w2_l7, 32) - 87
+    let w2_b7 = 16 * w2_hv7 + w2_lv7
+    let w2 = bor(bor(bor(bor(bor(bor(bor(w2_b7, shl(w2_b0, 56)), shl(w2_b1, 48)), shl(w2_b2, 40)), shl(w2_b3, 32)), shl(w2_b4, 24)), shl(w2_b5, 16)), shl(w2_b6, 8))
+    let w3_h0 = byte_at(s.data, boff + 48)
+    let w3_l0 = byte_at(s.data, boff + 49)
+    let w3_hv0 = if w3_h0 <= 57 then w3_h0 - 48 else bor(w3_h0, 32) - 87
+    let w3_lv0 = if w3_l0 <= 57 then w3_l0 - 48 else bor(w3_l0, 32) - 87
+    let w3_b0 = 16 * w3_hv0 + w3_lv0
+    let w3_h1 = byte_at(s.data, boff + 50)
+    let w3_l1 = byte_at(s.data, boff + 51)
+    let w3_hv1 = if w3_h1 <= 57 then w3_h1 - 48 else bor(w3_h1, 32) - 87
+    let w3_lv1 = if w3_l1 <= 57 then w3_l1 - 48 else bor(w3_l1, 32) - 87
+    let w3_b1 = 16 * w3_hv1 + w3_lv1
+    let w3_h2 = byte_at(s.data, boff + 52)
+    let w3_l2 = byte_at(s.data, boff + 53)
+    let w3_hv2 = if w3_h2 <= 57 then w3_h2 - 48 else bor(w3_h2, 32) - 87
+    let w3_lv2 = if w3_l2 <= 57 then w3_l2 - 48 else bor(w3_l2, 32) - 87
+    let w3_b2 = 16 * w3_hv2 + w3_lv2
+    let w3_h3 = byte_at(s.data, boff + 54)
+    let w3_l3 = byte_at(s.data, boff + 55)
+    let w3_hv3 = if w3_h3 <= 57 then w3_h3 - 48 else bor(w3_h3, 32) - 87
+    let w3_lv3 = if w3_l3 <= 57 then w3_l3 - 48 else bor(w3_l3, 32) - 87
+    let w3_b3 = 16 * w3_hv3 + w3_lv3
+    let w3_h4 = byte_at(s.data, boff + 56)
+    let w3_l4 = byte_at(s.data, boff + 57)
+    let w3_hv4 = if w3_h4 <= 57 then w3_h4 - 48 else bor(w3_h4, 32) - 87
+    let w3_lv4 = if w3_l4 <= 57 then w3_l4 - 48 else bor(w3_l4, 32) - 87
+    let w3_b4 = 16 * w3_hv4 + w3_lv4
+    let w3_h5 = byte_at(s.data, boff + 58)
+    let w3_l5 = byte_at(s.data, boff + 59)
+    let w3_hv5 = if w3_h5 <= 57 then w3_h5 - 48 else bor(w3_h5, 32) - 87
+    let w3_lv5 = if w3_l5 <= 57 then w3_l5 - 48 else bor(w3_l5, 32) - 87
+    let w3_b5 = 16 * w3_hv5 + w3_lv5
+    let w3_h6 = byte_at(s.data, boff + 60)
+    let w3_l6 = byte_at(s.data, boff + 61)
+    let w3_hv6 = if w3_h6 <= 57 then w3_h6 - 48 else bor(w3_h6, 32) - 87
+    let w3_lv6 = if w3_l6 <= 57 then w3_l6 - 48 else bor(w3_l6, 32) - 87
+    let w3_b6 = 16 * w3_hv6 + w3_lv6
+    let w3_h7 = byte_at(s.data, boff + 62)
+    let w3_l7 = byte_at(s.data, boff + 63)
+    let w3_hv7 = if w3_h7 <= 57 then w3_h7 - 48 else bor(w3_h7, 32) - 87
+    let w3_lv7 = if w3_l7 <= 57 then w3_l7 - 48 else bor(w3_l7, 32) - 87
+    let w3_b7 = 16 * w3_hv7 + w3_lv7
+    let w3 = bor(bor(bor(bor(bor(bor(bor(w3_b7, shl(w3_b0, 56)), shl(w3_b1, 48)), shl(w3_b2, 40)), shl(w3_b3, 32)), shl(w3_b4, 24)), shl(w3_b5, 16)), shl(w3_b6, 8))
+    let w4_h0 = byte_at(s.data, boff + 64)
+    let w4_l0 = byte_at(s.data, boff + 65)
+    let w4_hv0 = if w4_h0 <= 57 then w4_h0 - 48 else bor(w4_h0, 32) - 87
+    let w4_lv0 = if w4_l0 <= 57 then w4_l0 - 48 else bor(w4_l0, 32) - 87
+    let w4_b0 = 16 * w4_hv0 + w4_lv0
+    let w4_h1 = byte_at(s.data, boff + 66)
+    let w4_l1 = byte_at(s.data, boff + 67)
+    let w4_hv1 = if w4_h1 <= 57 then w4_h1 - 48 else bor(w4_h1, 32) - 87
+    let w4_lv1 = if w4_l1 <= 57 then w4_l1 - 48 else bor(w4_l1, 32) - 87
+    let w4_b1 = 16 * w4_hv1 + w4_lv1
+    let w4_h2 = byte_at(s.data, boff + 68)
+    let w4_l2 = byte_at(s.data, boff + 69)
+    let w4_hv2 = if w4_h2 <= 57 then w4_h2 - 48 else bor(w4_h2, 32) - 87
+    let w4_lv2 = if w4_l2 <= 57 then w4_l2 - 48 else bor(w4_l2, 32) - 87
+    let w4_b2 = 16 * w4_hv2 + w4_lv2
+    let w4_h3 = byte_at(s.data, boff + 70)
+    let w4_l3 = byte_at(s.data, boff + 71)
+    let w4_hv3 = if w4_h3 <= 57 then w4_h3 - 48 else bor(w4_h3, 32) - 87
+    let w4_lv3 = if w4_l3 <= 57 then w4_l3 - 48 else bor(w4_l3, 32) - 87
+    let w4_b3 = 16 * w4_hv3 + w4_lv3
+    let w4_h4 = byte_at(s.data, boff + 72)
+    let w4_l4 = byte_at(s.data, boff + 73)
+    let w4_hv4 = if w4_h4 <= 57 then w4_h4 - 48 else bor(w4_h4, 32) - 87
+    let w4_lv4 = if w4_l4 <= 57 then w4_l4 - 48 else bor(w4_l4, 32) - 87
+    let w4_b4 = 16 * w4_hv4 + w4_lv4
+    let w4_h5 = byte_at(s.data, boff + 74)
+    let w4_l5 = byte_at(s.data, boff + 75)
+    let w4_hv5 = if w4_h5 <= 57 then w4_h5 - 48 else bor(w4_h5, 32) - 87
+    let w4_lv5 = if w4_l5 <= 57 then w4_l5 - 48 else bor(w4_l5, 32) - 87
+    let w4_b5 = 16 * w4_hv5 + w4_lv5
+    let w4_h6 = byte_at(s.data, boff + 76)
+    let w4_l6 = byte_at(s.data, boff + 77)
+    let w4_hv6 = if w4_h6 <= 57 then w4_h6 - 48 else bor(w4_h6, 32) - 87
+    let w4_lv6 = if w4_l6 <= 57 then w4_l6 - 48 else bor(w4_l6, 32) - 87
+    let w4_b6 = 16 * w4_hv6 + w4_lv6
+    let w4_h7 = byte_at(s.data, boff + 78)
+    let w4_l7 = byte_at(s.data, boff + 79)
+    let w4_hv7 = if w4_h7 <= 57 then w4_h7 - 48 else bor(w4_h7, 32) - 87
+    let w4_lv7 = if w4_l7 <= 57 then w4_l7 - 48 else bor(w4_l7, 32) - 87
+    let w4_b7 = 16 * w4_hv7 + w4_lv7
+    let w4 = bor(bor(bor(bor(bor(bor(bor(w4_b7, shl(w4_b0, 56)), shl(w4_b1, 48)), shl(w4_b2, 40)), shl(w4_b3, 32)), shl(w4_b4, 24)), shl(w4_b5, 16)), shl(w4_b6, 8))
+    let w5_h0 = byte_at(s.data, boff + 80)
+    let w5_l0 = byte_at(s.data, boff + 81)
+    let w5_hv0 = if w5_h0 <= 57 then w5_h0 - 48 else bor(w5_h0, 32) - 87
+    let w5_lv0 = if w5_l0 <= 57 then w5_l0 - 48 else bor(w5_l0, 32) - 87
+    let w5_b0 = 16 * w5_hv0 + w5_lv0
+    let w5_h1 = byte_at(s.data, boff + 82)
+    let w5_l1 = byte_at(s.data, boff + 83)
+    let w5_hv1 = if w5_h1 <= 57 then w5_h1 - 48 else bor(w5_h1, 32) - 87
+    let w5_lv1 = if w5_l1 <= 57 then w5_l1 - 48 else bor(w5_l1, 32) - 87
+    let w5_b1 = 16 * w5_hv1 + w5_lv1
+    let w5_h2 = byte_at(s.data, boff + 84)
+    let w5_l2 = byte_at(s.data, boff + 85)
+    let w5_hv2 = if w5_h2 <= 57 then w5_h2 - 48 else bor(w5_h2, 32) - 87
+    let w5_lv2 = if w5_l2 <= 57 then w5_l2 - 48 else bor(w5_l2, 32) - 87
+    let w5_b2 = 16 * w5_hv2 + w5_lv2
+    let w5_h3 = byte_at(s.data, boff + 86)
+    let w5_l3 = byte_at(s.data, boff + 87)
+    let w5_hv3 = if w5_h3 <= 57 then w5_h3 - 48 else bor(w5_h3, 32) - 87
+    let w5_lv3 = if w5_l3 <= 57 then w5_l3 - 48 else bor(w5_l3, 32) - 87
+    let w5_b3 = 16 * w5_hv3 + w5_lv3
+    let w5_h4 = byte_at(s.data, boff + 88)
+    let w5_l4 = byte_at(s.data, boff + 89)
+    let w5_hv4 = if w5_h4 <= 57 then w5_h4 - 48 else bor(w5_h4, 32) - 87
+    let w5_lv4 = if w5_l4 <= 57 then w5_l4 - 48 else bor(w5_l4, 32) - 87
+    let w5_b4 = 16 * w5_hv4 + w5_lv4
+    let w5_h5 = byte_at(s.data, boff + 90)
+    let w5_l5 = byte_at(s.data, boff + 91)
+    let w5_hv5 = if w5_h5 <= 57 then w5_h5 - 48 else bor(w5_h5, 32) - 87
+    let w5_lv5 = if w5_l5 <= 57 then w5_l5 - 48 else bor(w5_l5, 32) - 87
+    let w5_b5 = 16 * w5_hv5 + w5_lv5
+    let w5_h6 = byte_at(s.data, boff + 92)
+    let w5_l6 = byte_at(s.data, boff + 93)
+    let w5_hv6 = if w5_h6 <= 57 then w5_h6 - 48 else bor(w5_h6, 32) - 87
+    let w5_lv6 = if w5_l6 <= 57 then w5_l6 - 48 else bor(w5_l6, 32) - 87
+    let w5_b6 = 16 * w5_hv6 + w5_lv6
+    let w5_h7 = byte_at(s.data, boff + 94)
+    let w5_l7 = byte_at(s.data, boff + 95)
+    let w5_hv7 = if w5_h7 <= 57 then w5_h7 - 48 else bor(w5_h7, 32) - 87
+    let w5_lv7 = if w5_l7 <= 57 then w5_l7 - 48 else bor(w5_l7, 32) - 87
+    let w5_b7 = 16 * w5_hv7 + w5_lv7
+    let w5 = bor(bor(bor(bor(bor(bor(bor(w5_b7, shl(w5_b0, 56)), shl(w5_b1, 48)), shl(w5_b2, 40)), shl(w5_b3, 32)), shl(w5_b4, 24)), shl(w5_b5, 16)), shl(w5_b6, 8))
+    let w6_h0 = byte_at(s.data, boff + 96)
+    let w6_l0 = byte_at(s.data, boff + 97)
+    let w6_hv0 = if w6_h0 <= 57 then w6_h0 - 48 else bor(w6_h0, 32) - 87
+    let w6_lv0 = if w6_l0 <= 57 then w6_l0 - 48 else bor(w6_l0, 32) - 87
+    let w6_b0 = 16 * w6_hv0 + w6_lv0
+    let w6_h1 = byte_at(s.data, boff + 98)
+    let w6_l1 = byte_at(s.data, boff + 99)
+    let w6_hv1 = if w6_h1 <= 57 then w6_h1 - 48 else bor(w6_h1, 32) - 87
+    let w6_lv1 = if w6_l1 <= 57 then w6_l1 - 48 else bor(w6_l1, 32) - 87
+    let w6_b1 = 16 * w6_hv1 + w6_lv1
+    let w6_h2 = byte_at(s.data, boff + 100)
+    let w6_l2 = byte_at(s.data, boff + 101)
+    let w6_hv2 = if w6_h2 <= 57 then w6_h2 - 48 else bor(w6_h2, 32) - 87
+    let w6_lv2 = if w6_l2 <= 57 then w6_l2 - 48 else bor(w6_l2, 32) - 87
+    let w6_b2 = 16 * w6_hv2 + w6_lv2
+    let w6_h3 = byte_at(s.data, boff + 102)
+    let w6_l3 = byte_at(s.data, boff + 103)
+    let w6_hv3 = if w6_h3 <= 57 then w6_h3 - 48 else bor(w6_h3, 32) - 87
+    let w6_lv3 = if w6_l3 <= 57 then w6_l3 - 48 else bor(w6_l3, 32) - 87
+    let w6_b3 = 16 * w6_hv3 + w6_lv3
+    let w6_h4 = byte_at(s.data, boff + 104)
+    let w6_l4 = byte_at(s.data, boff + 105)
+    let w6_hv4 = if w6_h4 <= 57 then w6_h4 - 48 else bor(w6_h4, 32) - 87
+    let w6_lv4 = if w6_l4 <= 57 then w6_l4 - 48 else bor(w6_l4, 32) - 87
+    let w6_b4 = 16 * w6_hv4 + w6_lv4
+    let w6_h5 = byte_at(s.data, boff + 106)
+    let w6_l5 = byte_at(s.data, boff + 107)
+    let w6_hv5 = if w6_h5 <= 57 then w6_h5 - 48 else bor(w6_h5, 32) - 87
+    let w6_lv5 = if w6_l5 <= 57 then w6_l5 - 48 else bor(w6_l5, 32) - 87
+    let w6_b5 = 16 * w6_hv5 + w6_lv5
+    let w6_h6 = byte_at(s.data, boff + 108)
+    let w6_l6 = byte_at(s.data, boff + 109)
+    let w6_hv6 = if w6_h6 <= 57 then w6_h6 - 48 else bor(w6_h6, 32) - 87
+    let w6_lv6 = if w6_l6 <= 57 then w6_l6 - 48 else bor(w6_l6, 32) - 87
+    let w6_b6 = 16 * w6_hv6 + w6_lv6
+    let w6_h7 = byte_at(s.data, boff + 110)
+    let w6_l7 = byte_at(s.data, boff + 111)
+    let w6_hv7 = if w6_h7 <= 57 then w6_h7 - 48 else bor(w6_h7, 32) - 87
+    let w6_lv7 = if w6_l7 <= 57 then w6_l7 - 48 else bor(w6_l7, 32) - 87
+    let w6_b7 = 16 * w6_hv7 + w6_lv7
+    let w6 = bor(bor(bor(bor(bor(bor(bor(w6_b7, shl(w6_b0, 56)), shl(w6_b1, 48)), shl(w6_b2, 40)), shl(w6_b3, 32)), shl(w6_b4, 24)), shl(w6_b5, 16)), shl(w6_b6, 8))
+    let w7_h0 = byte_at(s.data, boff + 112)
+    let w7_l0 = byte_at(s.data, boff + 113)
+    let w7_hv0 = if w7_h0 <= 57 then w7_h0 - 48 else bor(w7_h0, 32) - 87
+    let w7_lv0 = if w7_l0 <= 57 then w7_l0 - 48 else bor(w7_l0, 32) - 87
+    let w7_b0 = 16 * w7_hv0 + w7_lv0
+    let w7_h1 = byte_at(s.data, boff + 114)
+    let w7_l1 = byte_at(s.data, boff + 115)
+    let w7_hv1 = if w7_h1 <= 57 then w7_h1 - 48 else bor(w7_h1, 32) - 87
+    let w7_lv1 = if w7_l1 <= 57 then w7_l1 - 48 else bor(w7_l1, 32) - 87
+    let w7_b1 = 16 * w7_hv1 + w7_lv1
+    let w7_h2 = byte_at(s.data, boff + 116)
+    let w7_l2 = byte_at(s.data, boff + 117)
+    let w7_hv2 = if w7_h2 <= 57 then w7_h2 - 48 else bor(w7_h2, 32) - 87
+    let w7_lv2 = if w7_l2 <= 57 then w7_l2 - 48 else bor(w7_l2, 32) - 87
+    let w7_b2 = 16 * w7_hv2 + w7_lv2
+    let w7_h3 = byte_at(s.data, boff + 118)
+    let w7_l3 = byte_at(s.data, boff + 119)
+    let w7_hv3 = if w7_h3 <= 57 then w7_h3 - 48 else bor(w7_h3, 32) - 87
+    let w7_lv3 = if w7_l3 <= 57 then w7_l3 - 48 else bor(w7_l3, 32) - 87
+    let w7_b3 = 16 * w7_hv3 + w7_lv3
+    let w7_h4 = byte_at(s.data, boff + 120)
+    let w7_l4 = byte_at(s.data, boff + 121)
+    let w7_hv4 = if w7_h4 <= 57 then w7_h4 - 48 else bor(w7_h4, 32) - 87
+    let w7_lv4 = if w7_l4 <= 57 then w7_l4 - 48 else bor(w7_l4, 32) - 87
+    let w7_b4 = 16 * w7_hv4 + w7_lv4
+    let w7_h5 = byte_at(s.data, boff + 122)
+    let w7_l5 = byte_at(s.data, boff + 123)
+    let w7_hv5 = if w7_h5 <= 57 then w7_h5 - 48 else bor(w7_h5, 32) - 87
+    let w7_lv5 = if w7_l5 <= 57 then w7_l5 - 48 else bor(w7_l5, 32) - 87
+    let w7_b5 = 16 * w7_hv5 + w7_lv5
+    let w7_h6 = byte_at(s.data, boff + 124)
+    let w7_l6 = byte_at(s.data, boff + 125)
+    let w7_hv6 = if w7_h6 <= 57 then w7_h6 - 48 else bor(w7_h6, 32) - 87
+    let w7_lv6 = if w7_l6 <= 57 then w7_l6 - 48 else bor(w7_l6, 32) - 87
+    let w7_b6 = 16 * w7_hv6 + w7_lv6
+    let w7_h7 = byte_at(s.data, boff + 126)
+    let w7_l7 = byte_at(s.data, boff + 127)
+    let w7_hv7 = if w7_h7 <= 57 then w7_h7 - 48 else bor(w7_h7, 32) - 87
+    let w7_lv7 = if w7_l7 <= 57 then w7_l7 - 48 else bor(w7_l7, 32) - 87
+    let w7_b7 = 16 * w7_hv7 + w7_lv7
+    let w7 = bor(bor(bor(bor(bor(bor(bor(w7_b7, shl(w7_b0, 56)), shl(w7_b1, 48)), shl(w7_b2, 40)), shl(w7_b3, 32)), shl(w7_b4, 24)), shl(w7_b5, 16)), shl(w7_b6, 8))
+    let w8_h0 = byte_at(s.data, boff + 128)
+    let w8_l0 = byte_at(s.data, boff + 129)
+    let w8_hv0 = if w8_h0 <= 57 then w8_h0 - 48 else bor(w8_h0, 32) - 87
+    let w8_lv0 = if w8_l0 <= 57 then w8_l0 - 48 else bor(w8_l0, 32) - 87
+    let w8_b0 = 16 * w8_hv0 + w8_lv0
+    let w8_h1 = byte_at(s.data, boff + 130)
+    let w8_l1 = byte_at(s.data, boff + 131)
+    let w8_hv1 = if w8_h1 <= 57 then w8_h1 - 48 else bor(w8_h1, 32) - 87
+    let w8_lv1 = if w8_l1 <= 57 then w8_l1 - 48 else bor(w8_l1, 32) - 87
+    let w8_b1 = 16 * w8_hv1 + w8_lv1
+    let w8_h2 = byte_at(s.data, boff + 132)
+    let w8_l2 = byte_at(s.data, boff + 133)
+    let w8_hv2 = if w8_h2 <= 57 then w8_h2 - 48 else bor(w8_h2, 32) - 87
+    let w8_lv2 = if w8_l2 <= 57 then w8_l2 - 48 else bor(w8_l2, 32) - 87
+    let w8_b2 = 16 * w8_hv2 + w8_lv2
+    let w8_h3 = byte_at(s.data, boff + 134)
+    let w8_l3 = byte_at(s.data, boff + 135)
+    let w8_hv3 = if w8_h3 <= 57 then w8_h3 - 48 else bor(w8_h3, 32) - 87
+    let w8_lv3 = if w8_l3 <= 57 then w8_l3 - 48 else bor(w8_l3, 32) - 87
+    let w8_b3 = 16 * w8_hv3 + w8_lv3
+    let w8_h4 = byte_at(s.data, boff + 136)
+    let w8_l4 = byte_at(s.data, boff + 137)
+    let w8_hv4 = if w8_h4 <= 57 then w8_h4 - 48 else bor(w8_h4, 32) - 87
+    let w8_lv4 = if w8_l4 <= 57 then w8_l4 - 48 else bor(w8_l4, 32) - 87
+    let w8_b4 = 16 * w8_hv4 + w8_lv4
+    let w8_h5 = byte_at(s.data, boff + 138)
+    let w8_l5 = byte_at(s.data, boff + 139)
+    let w8_hv5 = if w8_h5 <= 57 then w8_h5 - 48 else bor(w8_h5, 32) - 87
+    let w8_lv5 = if w8_l5 <= 57 then w8_l5 - 48 else bor(w8_l5, 32) - 87
+    let w8_b5 = 16 * w8_hv5 + w8_lv5
+    let w8_h6 = byte_at(s.data, boff + 140)
+    let w8_l6 = byte_at(s.data, boff + 141)
+    let w8_hv6 = if w8_h6 <= 57 then w8_h6 - 48 else bor(w8_h6, 32) - 87
+    let w8_lv6 = if w8_l6 <= 57 then w8_l6 - 48 else bor(w8_l6, 32) - 87
+    let w8_b6 = 16 * w8_hv6 + w8_lv6
+    let w8_h7 = byte_at(s.data, boff + 142)
+    let w8_l7 = byte_at(s.data, boff + 143)
+    let w8_hv7 = if w8_h7 <= 57 then w8_h7 - 48 else bor(w8_h7, 32) - 87
+    let w8_lv7 = if w8_l7 <= 57 then w8_l7 - 48 else bor(w8_l7, 32) - 87
+    let w8_b7 = 16 * w8_hv7 + w8_lv7
+    let w8 = bor(bor(bor(bor(bor(bor(bor(w8_b7, shl(w8_b0, 56)), shl(w8_b1, 48)), shl(w8_b2, 40)), shl(w8_b3, 32)), shl(w8_b4, 24)), shl(w8_b5, 16)), shl(w8_b6, 8))
+    let w9_h0 = byte_at(s.data, boff + 144)
+    let w9_l0 = byte_at(s.data, boff + 145)
+    let w9_hv0 = if w9_h0 <= 57 then w9_h0 - 48 else bor(w9_h0, 32) - 87
+    let w9_lv0 = if w9_l0 <= 57 then w9_l0 - 48 else bor(w9_l0, 32) - 87
+    let w9_b0 = 16 * w9_hv0 + w9_lv0
+    let w9_h1 = byte_at(s.data, boff + 146)
+    let w9_l1 = byte_at(s.data, boff + 147)
+    let w9_hv1 = if w9_h1 <= 57 then w9_h1 - 48 else bor(w9_h1, 32) - 87
+    let w9_lv1 = if w9_l1 <= 57 then w9_l1 - 48 else bor(w9_l1, 32) - 87
+    let w9_b1 = 16 * w9_hv1 + w9_lv1
+    let w9_h2 = byte_at(s.data, boff + 148)
+    let w9_l2 = byte_at(s.data, boff + 149)
+    let w9_hv2 = if w9_h2 <= 57 then w9_h2 - 48 else bor(w9_h2, 32) - 87
+    let w9_lv2 = if w9_l2 <= 57 then w9_l2 - 48 else bor(w9_l2, 32) - 87
+    let w9_b2 = 16 * w9_hv2 + w9_lv2
+    let w9_h3 = byte_at(s.data, boff + 150)
+    let w9_l3 = byte_at(s.data, boff + 151)
+    let w9_hv3 = if w9_h3 <= 57 then w9_h3 - 48 else bor(w9_h3, 32) - 87
+    let w9_lv3 = if w9_l3 <= 57 then w9_l3 - 48 else bor(w9_l3, 32) - 87
+    let w9_b3 = 16 * w9_hv3 + w9_lv3
+    let w9_h4 = byte_at(s.data, boff + 152)
+    let w9_l4 = byte_at(s.data, boff + 153)
+    let w9_hv4 = if w9_h4 <= 57 then w9_h4 - 48 else bor(w9_h4, 32) - 87
+    let w9_lv4 = if w9_l4 <= 57 then w9_l4 - 48 else bor(w9_l4, 32) - 87
+    let w9_b4 = 16 * w9_hv4 + w9_lv4
+    let w9_h5 = byte_at(s.data, boff + 154)
+    let w9_l5 = byte_at(s.data, boff + 155)
+    let w9_hv5 = if w9_h5 <= 57 then w9_h5 - 48 else bor(w9_h5, 32) - 87
+    let w9_lv5 = if w9_l5 <= 57 then w9_l5 - 48 else bor(w9_l5, 32) - 87
+    let w9_b5 = 16 * w9_hv5 + w9_lv5
+    let w9_h6 = byte_at(s.data, boff + 156)
+    let w9_l6 = byte_at(s.data, boff + 157)
+    let w9_hv6 = if w9_h6 <= 57 then w9_h6 - 48 else bor(w9_h6, 32) - 87
+    let w9_lv6 = if w9_l6 <= 57 then w9_l6 - 48 else bor(w9_l6, 32) - 87
+    let w9_b6 = 16 * w9_hv6 + w9_lv6
+    let w9_h7 = byte_at(s.data, boff + 158)
+    let w9_l7 = byte_at(s.data, boff + 159)
+    let w9_hv7 = if w9_h7 <= 57 then w9_h7 - 48 else bor(w9_h7, 32) - 87
+    let w9_lv7 = if w9_l7 <= 57 then w9_l7 - 48 else bor(w9_l7, 32) - 87
+    let w9_b7 = 16 * w9_hv7 + w9_lv7
+    let w9 = bor(bor(bor(bor(bor(bor(bor(w9_b7, shl(w9_b0, 56)), shl(w9_b1, 48)), shl(w9_b2, 40)), shl(w9_b3, 32)), shl(w9_b4, 24)), shl(w9_b5, 16)), shl(w9_b6, 8))
+    let w10_h0 = byte_at(s.data, boff + 160)
+    let w10_l0 = byte_at(s.data, boff + 161)
+    let w10_hv0 = if w10_h0 <= 57 then w10_h0 - 48 else bor(w10_h0, 32) - 87
+    let w10_lv0 = if w10_l0 <= 57 then w10_l0 - 48 else bor(w10_l0, 32) - 87
+    let w10_b0 = 16 * w10_hv0 + w10_lv0
+    let w10_h1 = byte_at(s.data, boff + 162)
+    let w10_l1 = byte_at(s.data, boff + 163)
+    let w10_hv1 = if w10_h1 <= 57 then w10_h1 - 48 else bor(w10_h1, 32) - 87
+    let w10_lv1 = if w10_l1 <= 57 then w10_l1 - 48 else bor(w10_l1, 32) - 87
+    let w10_b1 = 16 * w10_hv1 + w10_lv1
+    let w10_h2 = byte_at(s.data, boff + 164)
+    let w10_l2 = byte_at(s.data, boff + 165)
+    let w10_hv2 = if w10_h2 <= 57 then w10_h2 - 48 else bor(w10_h2, 32) - 87
+    let w10_lv2 = if w10_l2 <= 57 then w10_l2 - 48 else bor(w10_l2, 32) - 87
+    let w10_b2 = 16 * w10_hv2 + w10_lv2
+    let w10_h3 = byte_at(s.data, boff + 166)
+    let w10_l3 = byte_at(s.data, boff + 167)
+    let w10_hv3 = if w10_h3 <= 57 then w10_h3 - 48 else bor(w10_h3, 32) - 87
+    let w10_lv3 = if w10_l3 <= 57 then w10_l3 - 48 else bor(w10_l3, 32) - 87
+    let w10_b3 = 16 * w10_hv3 + w10_lv3
+    let w10_h4 = byte_at(s.data, boff + 168)
+    let w10_l4 = byte_at(s.data, boff + 169)
+    let w10_hv4 = if w10_h4 <= 57 then w10_h4 - 48 else bor(w10_h4, 32) - 87
+    let w10_lv4 = if w10_l4 <= 57 then w10_l4 - 48 else bor(w10_l4, 32) - 87
+    let w10_b4 = 16 * w10_hv4 + w10_lv4
+    let w10_h5 = byte_at(s.data, boff + 170)
+    let w10_l5 = byte_at(s.data, boff + 171)
+    let w10_hv5 = if w10_h5 <= 57 then w10_h5 - 48 else bor(w10_h5, 32) - 87
+    let w10_lv5 = if w10_l5 <= 57 then w10_l5 - 48 else bor(w10_l5, 32) - 87
+    let w10_b5 = 16 * w10_hv5 + w10_lv5
+    let w10_h6 = byte_at(s.data, boff + 172)
+    let w10_l6 = byte_at(s.data, boff + 173)
+    let w10_hv6 = if w10_h6 <= 57 then w10_h6 - 48 else bor(w10_h6, 32) - 87
+    let w10_lv6 = if w10_l6 <= 57 then w10_l6 - 48 else bor(w10_l6, 32) - 87
+    let w10_b6 = 16 * w10_hv6 + w10_lv6
+    let w10_h7 = byte_at(s.data, boff + 174)
+    let w10_l7 = byte_at(s.data, boff + 175)
+    let w10_hv7 = if w10_h7 <= 57 then w10_h7 - 48 else bor(w10_h7, 32) - 87
+    let w10_lv7 = if w10_l7 <= 57 then w10_l7 - 48 else bor(w10_l7, 32) - 87
+    let w10_b7 = 16 * w10_hv7 + w10_lv7
+    let w10 = bor(bor(bor(bor(bor(bor(bor(w10_b7, shl(w10_b0, 56)), shl(w10_b1, 48)), shl(w10_b2, 40)), shl(w10_b3, 32)), shl(w10_b4, 24)), shl(w10_b5, 16)), shl(w10_b6, 8))
+    let w11_h0 = byte_at(s.data, boff + 176)
+    let w11_l0 = byte_at(s.data, boff + 177)
+    let w11_hv0 = if w11_h0 <= 57 then w11_h0 - 48 else bor(w11_h0, 32) - 87
+    let w11_lv0 = if w11_l0 <= 57 then w11_l0 - 48 else bor(w11_l0, 32) - 87
+    let w11_b0 = 16 * w11_hv0 + w11_lv0
+    let w11_h1 = byte_at(s.data, boff + 178)
+    let w11_l1 = byte_at(s.data, boff + 179)
+    let w11_hv1 = if w11_h1 <= 57 then w11_h1 - 48 else bor(w11_h1, 32) - 87
+    let w11_lv1 = if w11_l1 <= 57 then w11_l1 - 48 else bor(w11_l1, 32) - 87
+    let w11_b1 = 16 * w11_hv1 + w11_lv1
+    let w11_h2 = byte_at(s.data, boff + 180)
+    let w11_l2 = byte_at(s.data, boff + 181)
+    let w11_hv2 = if w11_h2 <= 57 then w11_h2 - 48 else bor(w11_h2, 32) - 87
+    let w11_lv2 = if w11_l2 <= 57 then w11_l2 - 48 else bor(w11_l2, 32) - 87
+    let w11_b2 = 16 * w11_hv2 + w11_lv2
+    let w11_h3 = byte_at(s.data, boff + 182)
+    let w11_l3 = byte_at(s.data, boff + 183)
+    let w11_hv3 = if w11_h3 <= 57 then w11_h3 - 48 else bor(w11_h3, 32) - 87
+    let w11_lv3 = if w11_l3 <= 57 then w11_l3 - 48 else bor(w11_l3, 32) - 87
+    let w11_b3 = 16 * w11_hv3 + w11_lv3
+    let w11_h4 = byte_at(s.data, boff + 184)
+    let w11_l4 = byte_at(s.data, boff + 185)
+    let w11_hv4 = if w11_h4 <= 57 then w11_h4 - 48 else bor(w11_h4, 32) - 87
+    let w11_lv4 = if w11_l4 <= 57 then w11_l4 - 48 else bor(w11_l4, 32) - 87
+    let w11_b4 = 16 * w11_hv4 + w11_lv4
+    let w11_h5 = byte_at(s.data, boff + 186)
+    let w11_l5 = byte_at(s.data, boff + 187)
+    let w11_hv5 = if w11_h5 <= 57 then w11_h5 - 48 else bor(w11_h5, 32) - 87
+    let w11_lv5 = if w11_l5 <= 57 then w11_l5 - 48 else bor(w11_l5, 32) - 87
+    let w11_b5 = 16 * w11_hv5 + w11_lv5
+    let w11_h6 = byte_at(s.data, boff + 188)
+    let w11_l6 = byte_at(s.data, boff + 189)
+    let w11_hv6 = if w11_h6 <= 57 then w11_h6 - 48 else bor(w11_h6, 32) - 87
+    let w11_lv6 = if w11_l6 <= 57 then w11_l6 - 48 else bor(w11_l6, 32) - 87
+    let w11_b6 = 16 * w11_hv6 + w11_lv6
+    let w11_h7 = byte_at(s.data, boff + 190)
+    let w11_l7 = byte_at(s.data, boff + 191)
+    let w11_hv7 = if w11_h7 <= 57 then w11_h7 - 48 else bor(w11_h7, 32) - 87
+    let w11_lv7 = if w11_l7 <= 57 then w11_l7 - 48 else bor(w11_l7, 32) - 87
+    let w11_b7 = 16 * w11_hv7 + w11_lv7
+    let w11 = bor(bor(bor(bor(bor(bor(bor(w11_b7, shl(w11_b0, 56)), shl(w11_b1, 48)), shl(w11_b2, 40)), shl(w11_b3, 32)), shl(w11_b4, 24)), shl(w11_b5, 16)), shl(w11_b6, 8))
+    let w12_h0 = byte_at(s.data, boff + 192)
+    let w12_l0 = byte_at(s.data, boff + 193)
+    let w12_hv0 = if w12_h0 <= 57 then w12_h0 - 48 else bor(w12_h0, 32) - 87
+    let w12_lv0 = if w12_l0 <= 57 then w12_l0 - 48 else bor(w12_l0, 32) - 87
+    let w12_b0 = 16 * w12_hv0 + w12_lv0
+    let w12_h1 = byte_at(s.data, boff + 194)
+    let w12_l1 = byte_at(s.data, boff + 195)
+    let w12_hv1 = if w12_h1 <= 57 then w12_h1 - 48 else bor(w12_h1, 32) - 87
+    let w12_lv1 = if w12_l1 <= 57 then w12_l1 - 48 else bor(w12_l1, 32) - 87
+    let w12_b1 = 16 * w12_hv1 + w12_lv1
+    let w12_h2 = byte_at(s.data, boff + 196)
+    let w12_l2 = byte_at(s.data, boff + 197)
+    let w12_hv2 = if w12_h2 <= 57 then w12_h2 - 48 else bor(w12_h2, 32) - 87
+    let w12_lv2 = if w12_l2 <= 57 then w12_l2 - 48 else bor(w12_l2, 32) - 87
+    let w12_b2 = 16 * w12_hv2 + w12_lv2
+    let w12_h3 = byte_at(s.data, boff + 198)
+    let w12_l3 = byte_at(s.data, boff + 199)
+    let w12_hv3 = if w12_h3 <= 57 then w12_h3 - 48 else bor(w12_h3, 32) - 87
+    let w12_lv3 = if w12_l3 <= 57 then w12_l3 - 48 else bor(w12_l3, 32) - 87
+    let w12_b3 = 16 * w12_hv3 + w12_lv3
+    let w12_h4 = byte_at(s.data, boff + 200)
+    let w12_l4 = byte_at(s.data, boff + 201)
+    let w12_hv4 = if w12_h4 <= 57 then w12_h4 - 48 else bor(w12_h4, 32) - 87
+    let w12_lv4 = if w12_l4 <= 57 then w12_l4 - 48 else bor(w12_l4, 32) - 87
+    let w12_b4 = 16 * w12_hv4 + w12_lv4
+    let w12_h5 = byte_at(s.data, boff + 202)
+    let w12_l5 = byte_at(s.data, boff + 203)
+    let w12_hv5 = if w12_h5 <= 57 then w12_h5 - 48 else bor(w12_h5, 32) - 87
+    let w12_lv5 = if w12_l5 <= 57 then w12_l5 - 48 else bor(w12_l5, 32) - 87
+    let w12_b5 = 16 * w12_hv5 + w12_lv5
+    let w12_h6 = byte_at(s.data, boff + 204)
+    let w12_l6 = byte_at(s.data, boff + 205)
+    let w12_hv6 = if w12_h6 <= 57 then w12_h6 - 48 else bor(w12_h6, 32) - 87
+    let w12_lv6 = if w12_l6 <= 57 then w12_l6 - 48 else bor(w12_l6, 32) - 87
+    let w12_b6 = 16 * w12_hv6 + w12_lv6
+    let w12_h7 = byte_at(s.data, boff + 206)
+    let w12_l7 = byte_at(s.data, boff + 207)
+    let w12_hv7 = if w12_h7 <= 57 then w12_h7 - 48 else bor(w12_h7, 32) - 87
+    let w12_lv7 = if w12_l7 <= 57 then w12_l7 - 48 else bor(w12_l7, 32) - 87
+    let w12_b7 = 16 * w12_hv7 + w12_lv7
+    let w12 = bor(bor(bor(bor(bor(bor(bor(w12_b7, shl(w12_b0, 56)), shl(w12_b1, 48)), shl(w12_b2, 40)), shl(w12_b3, 32)), shl(w12_b4, 24)), shl(w12_b5, 16)), shl(w12_b6, 8))
+    let w13_h0 = byte_at(s.data, boff + 208)
+    let w13_l0 = byte_at(s.data, boff + 209)
+    let w13_hv0 = if w13_h0 <= 57 then w13_h0 - 48 else bor(w13_h0, 32) - 87
+    let w13_lv0 = if w13_l0 <= 57 then w13_l0 - 48 else bor(w13_l0, 32) - 87
+    let w13_b0 = 16 * w13_hv0 + w13_lv0
+    let w13_h1 = byte_at(s.data, boff + 210)
+    let w13_l1 = byte_at(s.data, boff + 211)
+    let w13_hv1 = if w13_h1 <= 57 then w13_h1 - 48 else bor(w13_h1, 32) - 87
+    let w13_lv1 = if w13_l1 <= 57 then w13_l1 - 48 else bor(w13_l1, 32) - 87
+    let w13_b1 = 16 * w13_hv1 + w13_lv1
+    let w13_h2 = byte_at(s.data, boff + 212)
+    let w13_l2 = byte_at(s.data, boff + 213)
+    let w13_hv2 = if w13_h2 <= 57 then w13_h2 - 48 else bor(w13_h2, 32) - 87
+    let w13_lv2 = if w13_l2 <= 57 then w13_l2 - 48 else bor(w13_l2, 32) - 87
+    let w13_b2 = 16 * w13_hv2 + w13_lv2
+    let w13_h3 = byte_at(s.data, boff + 214)
+    let w13_l3 = byte_at(s.data, boff + 215)
+    let w13_hv3 = if w13_h3 <= 57 then w13_h3 - 48 else bor(w13_h3, 32) - 87
+    let w13_lv3 = if w13_l3 <= 57 then w13_l3 - 48 else bor(w13_l3, 32) - 87
+    let w13_b3 = 16 * w13_hv3 + w13_lv3
+    let w13_h4 = byte_at(s.data, boff + 216)
+    let w13_l4 = byte_at(s.data, boff + 217)
+    let w13_hv4 = if w13_h4 <= 57 then w13_h4 - 48 else bor(w13_h4, 32) - 87
+    let w13_lv4 = if w13_l4 <= 57 then w13_l4 - 48 else bor(w13_l4, 32) - 87
+    let w13_b4 = 16 * w13_hv4 + w13_lv4
+    let w13_h5 = byte_at(s.data, boff + 218)
+    let w13_l5 = byte_at(s.data, boff + 219)
+    let w13_hv5 = if w13_h5 <= 57 then w13_h5 - 48 else bor(w13_h5, 32) - 87
+    let w13_lv5 = if w13_l5 <= 57 then w13_l5 - 48 else bor(w13_l5, 32) - 87
+    let w13_b5 = 16 * w13_hv5 + w13_lv5
+    let w13_h6 = byte_at(s.data, boff + 220)
+    let w13_l6 = byte_at(s.data, boff + 221)
+    let w13_hv6 = if w13_h6 <= 57 then w13_h6 - 48 else bor(w13_h6, 32) - 87
+    let w13_lv6 = if w13_l6 <= 57 then w13_l6 - 48 else bor(w13_l6, 32) - 87
+    let w13_b6 = 16 * w13_hv6 + w13_lv6
+    let w13_h7 = byte_at(s.data, boff + 222)
+    let w13_l7 = byte_at(s.data, boff + 223)
+    let w13_hv7 = if w13_h7 <= 57 then w13_h7 - 48 else bor(w13_h7, 32) - 87
+    let w13_lv7 = if w13_l7 <= 57 then w13_l7 - 48 else bor(w13_l7, 32) - 87
+    let w13_b7 = 16 * w13_hv7 + w13_lv7
+    let w13 = bor(bor(bor(bor(bor(bor(bor(w13_b7, shl(w13_b0, 56)), shl(w13_b1, 48)), shl(w13_b2, 40)), shl(w13_b3, 32)), shl(w13_b4, 24)), shl(w13_b5, 16)), shl(w13_b6, 8))
+    let w14_h0 = byte_at(s.data, boff + 224)
+    let w14_l0 = byte_at(s.data, boff + 225)
+    let w14_hv0 = if w14_h0 <= 57 then w14_h0 - 48 else bor(w14_h0, 32) - 87
+    let w14_lv0 = if w14_l0 <= 57 then w14_l0 - 48 else bor(w14_l0, 32) - 87
+    let w14_b0 = 16 * w14_hv0 + w14_lv0
+    let w14_h1 = byte_at(s.data, boff + 226)
+    let w14_l1 = byte_at(s.data, boff + 227)
+    let w14_hv1 = if w14_h1 <= 57 then w14_h1 - 48 else bor(w14_h1, 32) - 87
+    let w14_lv1 = if w14_l1 <= 57 then w14_l1 - 48 else bor(w14_l1, 32) - 87
+    let w14_b1 = 16 * w14_hv1 + w14_lv1
+    let w14_h2 = byte_at(s.data, boff + 228)
+    let w14_l2 = byte_at(s.data, boff + 229)
+    let w14_hv2 = if w14_h2 <= 57 then w14_h2 - 48 else bor(w14_h2, 32) - 87
+    let w14_lv2 = if w14_l2 <= 57 then w14_l2 - 48 else bor(w14_l2, 32) - 87
+    let w14_b2 = 16 * w14_hv2 + w14_lv2
+    let w14_h3 = byte_at(s.data, boff + 230)
+    let w14_l3 = byte_at(s.data, boff + 231)
+    let w14_hv3 = if w14_h3 <= 57 then w14_h3 - 48 else bor(w14_h3, 32) - 87
+    let w14_lv3 = if w14_l3 <= 57 then w14_l3 - 48 else bor(w14_l3, 32) - 87
+    let w14_b3 = 16 * w14_hv3 + w14_lv3
+    let w14_h4 = byte_at(s.data, boff + 232)
+    let w14_l4 = byte_at(s.data, boff + 233)
+    let w14_hv4 = if w14_h4 <= 57 then w14_h4 - 48 else bor(w14_h4, 32) - 87
+    let w14_lv4 = if w14_l4 <= 57 then w14_l4 - 48 else bor(w14_l4, 32) - 87
+    let w14_b4 = 16 * w14_hv4 + w14_lv4
+    let w14_h5 = byte_at(s.data, boff + 234)
+    let w14_l5 = byte_at(s.data, boff + 235)
+    let w14_hv5 = if w14_h5 <= 57 then w14_h5 - 48 else bor(w14_h5, 32) - 87
+    let w14_lv5 = if w14_l5 <= 57 then w14_l5 - 48 else bor(w14_l5, 32) - 87
+    let w14_b5 = 16 * w14_hv5 + w14_lv5
+    let w14_h6 = byte_at(s.data, boff + 236)
+    let w14_l6 = byte_at(s.data, boff + 237)
+    let w14_hv6 = if w14_h6 <= 57 then w14_h6 - 48 else bor(w14_h6, 32) - 87
+    let w14_lv6 = if w14_l6 <= 57 then w14_l6 - 48 else bor(w14_l6, 32) - 87
+    let w14_b6 = 16 * w14_hv6 + w14_lv6
+    let w14_h7 = byte_at(s.data, boff + 238)
+    let w14_l7 = byte_at(s.data, boff + 239)
+    let w14_hv7 = if w14_h7 <= 57 then w14_h7 - 48 else bor(w14_h7, 32) - 87
+    let w14_lv7 = if w14_l7 <= 57 then w14_l7 - 48 else bor(w14_l7, 32) - 87
+    let w14_b7 = 16 * w14_hv7 + w14_lv7
+    let w14 = bor(bor(bor(bor(bor(bor(bor(w14_b7, shl(w14_b0, 56)), shl(w14_b1, 48)), shl(w14_b2, 40)), shl(w14_b3, 32)), shl(w14_b4, 24)), shl(w14_b5, 16)), shl(w14_b6, 8))
+    let w15_h0 = byte_at(s.data, boff + 240)
+    let w15_l0 = byte_at(s.data, boff + 241)
+    let w15_hv0 = if w15_h0 <= 57 then w15_h0 - 48 else bor(w15_h0, 32) - 87
+    let w15_lv0 = if w15_l0 <= 57 then w15_l0 - 48 else bor(w15_l0, 32) - 87
+    let w15_b0 = 16 * w15_hv0 + w15_lv0
+    let w15_h1 = byte_at(s.data, boff + 242)
+    let w15_l1 = byte_at(s.data, boff + 243)
+    let w15_hv1 = if w15_h1 <= 57 then w15_h1 - 48 else bor(w15_h1, 32) - 87
+    let w15_lv1 = if w15_l1 <= 57 then w15_l1 - 48 else bor(w15_l1, 32) - 87
+    let w15_b1 = 16 * w15_hv1 + w15_lv1
+    let w15_h2 = byte_at(s.data, boff + 244)
+    let w15_l2 = byte_at(s.data, boff + 245)
+    let w15_hv2 = if w15_h2 <= 57 then w15_h2 - 48 else bor(w15_h2, 32) - 87
+    let w15_lv2 = if w15_l2 <= 57 then w15_l2 - 48 else bor(w15_l2, 32) - 87
+    let w15_b2 = 16 * w15_hv2 + w15_lv2
+    let w15_h3 = byte_at(s.data, boff + 246)
+    let w15_l3 = byte_at(s.data, boff + 247)
+    let w15_hv3 = if w15_h3 <= 57 then w15_h3 - 48 else bor(w15_h3, 32) - 87
+    let w15_lv3 = if w15_l3 <= 57 then w15_l3 - 48 else bor(w15_l3, 32) - 87
+    let w15_b3 = 16 * w15_hv3 + w15_lv3
+    let w15_h4 = byte_at(s.data, boff + 248)
+    let w15_l4 = byte_at(s.data, boff + 249)
+    let w15_hv4 = if w15_h4 <= 57 then w15_h4 - 48 else bor(w15_h4, 32) - 87
+    let w15_lv4 = if w15_l4 <= 57 then w15_l4 - 48 else bor(w15_l4, 32) - 87
+    let w15_b4 = 16 * w15_hv4 + w15_lv4
+    let w15_h5 = byte_at(s.data, boff + 250)
+    let w15_l5 = byte_at(s.data, boff + 251)
+    let w15_hv5 = if w15_h5 <= 57 then w15_h5 - 48 else bor(w15_h5, 32) - 87
+    let w15_lv5 = if w15_l5 <= 57 then w15_l5 - 48 else bor(w15_l5, 32) - 87
+    let w15_b5 = 16 * w15_hv5 + w15_lv5
+    let w15_h6 = byte_at(s.data, boff + 252)
+    let w15_l6 = byte_at(s.data, boff + 253)
+    let w15_hv6 = if w15_h6 <= 57 then w15_h6 - 48 else bor(w15_h6, 32) - 87
+    let w15_lv6 = if w15_l6 <= 57 then w15_l6 - 48 else bor(w15_l6, 32) - 87
+    let w15_b6 = 16 * w15_hv6 + w15_lv6
+    let w15_h7 = byte_at(s.data, boff + 254)
+    let w15_l7 = byte_at(s.data, boff + 255)
+    let w15_hv7 = if w15_h7 <= 57 then w15_h7 - 48 else bor(w15_h7, 32) - 87
+    let w15_lv7 = if w15_l7 <= 57 then w15_l7 - 48 else bor(w15_l7, 32) - 87
+    let w15_b7 = 16 * w15_hv7 + w15_lv7
+    let w15 = bor(bor(bor(bor(bor(bor(bor(w15_b7, shl(w15_b0, 56)), shl(w15_b1, 48)), shl(w15_b2, 40)), shl(w15_b3, 32)), shl(w15_b4, 24)), shl(w15_b5, 16)), shl(w15_b6, 8))
+    let w16 = bxor(bxor(bor(shr(w14, 19), shl(w14, 45)), bor(shr(w14, 61), shl(w14, 3))), shr(w14, 6)) + w9 + bxor(bxor(bor(shr(w1, 1), shl(w1, 63)), bor(shr(w1, 8), shl(w1, 56))), shr(w1, 7)) + w0
+    let w17 = bxor(bxor(bor(shr(w15, 19), shl(w15, 45)), bor(shr(w15, 61), shl(w15, 3))), shr(w15, 6)) + w10 + bxor(bxor(bor(shr(w2, 1), shl(w2, 63)), bor(shr(w2, 8), shl(w2, 56))), shr(w2, 7)) + w1
+    let w18 = bxor(bxor(bor(shr(w16, 19), shl(w16, 45)), bor(shr(w16, 61), shl(w16, 3))), shr(w16, 6)) + w11 + bxor(bxor(bor(shr(w3, 1), shl(w3, 63)), bor(shr(w3, 8), shl(w3, 56))), shr(w3, 7)) + w2
+    let w19 = bxor(bxor(bor(shr(w17, 19), shl(w17, 45)), bor(shr(w17, 61), shl(w17, 3))), shr(w17, 6)) + w12 + bxor(bxor(bor(shr(w4, 1), shl(w4, 63)), bor(shr(w4, 8), shl(w4, 56))), shr(w4, 7)) + w3
+    let w20 = bxor(bxor(bor(shr(w18, 19), shl(w18, 45)), bor(shr(w18, 61), shl(w18, 3))), shr(w18, 6)) + w13 + bxor(bxor(bor(shr(w5, 1), shl(w5, 63)), bor(shr(w5, 8), shl(w5, 56))), shr(w5, 7)) + w4
+    let w21 = bxor(bxor(bor(shr(w19, 19), shl(w19, 45)), bor(shr(w19, 61), shl(w19, 3))), shr(w19, 6)) + w14 + bxor(bxor(bor(shr(w6, 1), shl(w6, 63)), bor(shr(w6, 8), shl(w6, 56))), shr(w6, 7)) + w5
+    let w22 = bxor(bxor(bor(shr(w20, 19), shl(w20, 45)), bor(shr(w20, 61), shl(w20, 3))), shr(w20, 6)) + w15 + bxor(bxor(bor(shr(w7, 1), shl(w7, 63)), bor(shr(w7, 8), shl(w7, 56))), shr(w7, 7)) + w6
+    let w23 = bxor(bxor(bor(shr(w21, 19), shl(w21, 45)), bor(shr(w21, 61), shl(w21, 3))), shr(w21, 6)) + w16 + bxor(bxor(bor(shr(w8, 1), shl(w8, 63)), bor(shr(w8, 8), shl(w8, 56))), shr(w8, 7)) + w7
+    let w24 = bxor(bxor(bor(shr(w22, 19), shl(w22, 45)), bor(shr(w22, 61), shl(w22, 3))), shr(w22, 6)) + w17 + bxor(bxor(bor(shr(w9, 1), shl(w9, 63)), bor(shr(w9, 8), shl(w9, 56))), shr(w9, 7)) + w8
+    let w25 = bxor(bxor(bor(shr(w23, 19), shl(w23, 45)), bor(shr(w23, 61), shl(w23, 3))), shr(w23, 6)) + w18 + bxor(bxor(bor(shr(w10, 1), shl(w10, 63)), bor(shr(w10, 8), shl(w10, 56))), shr(w10, 7)) + w9
+    let w26 = bxor(bxor(bor(shr(w24, 19), shl(w24, 45)), bor(shr(w24, 61), shl(w24, 3))), shr(w24, 6)) + w19 + bxor(bxor(bor(shr(w11, 1), shl(w11, 63)), bor(shr(w11, 8), shl(w11, 56))), shr(w11, 7)) + w10
+    let w27 = bxor(bxor(bor(shr(w25, 19), shl(w25, 45)), bor(shr(w25, 61), shl(w25, 3))), shr(w25, 6)) + w20 + bxor(bxor(bor(shr(w12, 1), shl(w12, 63)), bor(shr(w12, 8), shl(w12, 56))), shr(w12, 7)) + w11
+    let w28 = bxor(bxor(bor(shr(w26, 19), shl(w26, 45)), bor(shr(w26, 61), shl(w26, 3))), shr(w26, 6)) + w21 + bxor(bxor(bor(shr(w13, 1), shl(w13, 63)), bor(shr(w13, 8), shl(w13, 56))), shr(w13, 7)) + w12
+    let w29 = bxor(bxor(bor(shr(w27, 19), shl(w27, 45)), bor(shr(w27, 61), shl(w27, 3))), shr(w27, 6)) + w22 + bxor(bxor(bor(shr(w14, 1), shl(w14, 63)), bor(shr(w14, 8), shl(w14, 56))), shr(w14, 7)) + w13
+    let w30 = bxor(bxor(bor(shr(w28, 19), shl(w28, 45)), bor(shr(w28, 61), shl(w28, 3))), shr(w28, 6)) + w23 + bxor(bxor(bor(shr(w15, 1), shl(w15, 63)), bor(shr(w15, 8), shl(w15, 56))), shr(w15, 7)) + w14
+    let w31 = bxor(bxor(bor(shr(w29, 19), shl(w29, 45)), bor(shr(w29, 61), shl(w29, 3))), shr(w29, 6)) + w24 + bxor(bxor(bor(shr(w16, 1), shl(w16, 63)), bor(shr(w16, 8), shl(w16, 56))), shr(w16, 7)) + w15
+    let w32 = bxor(bxor(bor(shr(w30, 19), shl(w30, 45)), bor(shr(w30, 61), shl(w30, 3))), shr(w30, 6)) + w25 + bxor(bxor(bor(shr(w17, 1), shl(w17, 63)), bor(shr(w17, 8), shl(w17, 56))), shr(w17, 7)) + w16
+    let w33 = bxor(bxor(bor(shr(w31, 19), shl(w31, 45)), bor(shr(w31, 61), shl(w31, 3))), shr(w31, 6)) + w26 + bxor(bxor(bor(shr(w18, 1), shl(w18, 63)), bor(shr(w18, 8), shl(w18, 56))), shr(w18, 7)) + w17
+    let w34 = bxor(bxor(bor(shr(w32, 19), shl(w32, 45)), bor(shr(w32, 61), shl(w32, 3))), shr(w32, 6)) + w27 + bxor(bxor(bor(shr(w19, 1), shl(w19, 63)), bor(shr(w19, 8), shl(w19, 56))), shr(w19, 7)) + w18
+    let w35 = bxor(bxor(bor(shr(w33, 19), shl(w33, 45)), bor(shr(w33, 61), shl(w33, 3))), shr(w33, 6)) + w28 + bxor(bxor(bor(shr(w20, 1), shl(w20, 63)), bor(shr(w20, 8), shl(w20, 56))), shr(w20, 7)) + w19
+    let w36 = bxor(bxor(bor(shr(w34, 19), shl(w34, 45)), bor(shr(w34, 61), shl(w34, 3))), shr(w34, 6)) + w29 + bxor(bxor(bor(shr(w21, 1), shl(w21, 63)), bor(shr(w21, 8), shl(w21, 56))), shr(w21, 7)) + w20
+    let w37 = bxor(bxor(bor(shr(w35, 19), shl(w35, 45)), bor(shr(w35, 61), shl(w35, 3))), shr(w35, 6)) + w30 + bxor(bxor(bor(shr(w22, 1), shl(w22, 63)), bor(shr(w22, 8), shl(w22, 56))), shr(w22, 7)) + w21
+    let w38 = bxor(bxor(bor(shr(w36, 19), shl(w36, 45)), bor(shr(w36, 61), shl(w36, 3))), shr(w36, 6)) + w31 + bxor(bxor(bor(shr(w23, 1), shl(w23, 63)), bor(shr(w23, 8), shl(w23, 56))), shr(w23, 7)) + w22
+    let w39 = bxor(bxor(bor(shr(w37, 19), shl(w37, 45)), bor(shr(w37, 61), shl(w37, 3))), shr(w37, 6)) + w32 + bxor(bxor(bor(shr(w24, 1), shl(w24, 63)), bor(shr(w24, 8), shl(w24, 56))), shr(w24, 7)) + w23
+    let w40 = bxor(bxor(bor(shr(w38, 19), shl(w38, 45)), bor(shr(w38, 61), shl(w38, 3))), shr(w38, 6)) + w33 + bxor(bxor(bor(shr(w25, 1), shl(w25, 63)), bor(shr(w25, 8), shl(w25, 56))), shr(w25, 7)) + w24
+    let w41 = bxor(bxor(bor(shr(w39, 19), shl(w39, 45)), bor(shr(w39, 61), shl(w39, 3))), shr(w39, 6)) + w34 + bxor(bxor(bor(shr(w26, 1), shl(w26, 63)), bor(shr(w26, 8), shl(w26, 56))), shr(w26, 7)) + w25
+    let w42 = bxor(bxor(bor(shr(w40, 19), shl(w40, 45)), bor(shr(w40, 61), shl(w40, 3))), shr(w40, 6)) + w35 + bxor(bxor(bor(shr(w27, 1), shl(w27, 63)), bor(shr(w27, 8), shl(w27, 56))), shr(w27, 7)) + w26
+    let w43 = bxor(bxor(bor(shr(w41, 19), shl(w41, 45)), bor(shr(w41, 61), shl(w41, 3))), shr(w41, 6)) + w36 + bxor(bxor(bor(shr(w28, 1), shl(w28, 63)), bor(shr(w28, 8), shl(w28, 56))), shr(w28, 7)) + w27
+    let w44 = bxor(bxor(bor(shr(w42, 19), shl(w42, 45)), bor(shr(w42, 61), shl(w42, 3))), shr(w42, 6)) + w37 + bxor(bxor(bor(shr(w29, 1), shl(w29, 63)), bor(shr(w29, 8), shl(w29, 56))), shr(w29, 7)) + w28
+    let w45 = bxor(bxor(bor(shr(w43, 19), shl(w43, 45)), bor(shr(w43, 61), shl(w43, 3))), shr(w43, 6)) + w38 + bxor(bxor(bor(shr(w30, 1), shl(w30, 63)), bor(shr(w30, 8), shl(w30, 56))), shr(w30, 7)) + w29
+    let w46 = bxor(bxor(bor(shr(w44, 19), shl(w44, 45)), bor(shr(w44, 61), shl(w44, 3))), shr(w44, 6)) + w39 + bxor(bxor(bor(shr(w31, 1), shl(w31, 63)), bor(shr(w31, 8), shl(w31, 56))), shr(w31, 7)) + w30
+    let w47 = bxor(bxor(bor(shr(w45, 19), shl(w45, 45)), bor(shr(w45, 61), shl(w45, 3))), shr(w45, 6)) + w40 + bxor(bxor(bor(shr(w32, 1), shl(w32, 63)), bor(shr(w32, 8), shl(w32, 56))), shr(w32, 7)) + w31
+    let w48 = bxor(bxor(bor(shr(w46, 19), shl(w46, 45)), bor(shr(w46, 61), shl(w46, 3))), shr(w46, 6)) + w41 + bxor(bxor(bor(shr(w33, 1), shl(w33, 63)), bor(shr(w33, 8), shl(w33, 56))), shr(w33, 7)) + w32
+    let w49 = bxor(bxor(bor(shr(w47, 19), shl(w47, 45)), bor(shr(w47, 61), shl(w47, 3))), shr(w47, 6)) + w42 + bxor(bxor(bor(shr(w34, 1), shl(w34, 63)), bor(shr(w34, 8), shl(w34, 56))), shr(w34, 7)) + w33
+    let w50 = bxor(bxor(bor(shr(w48, 19), shl(w48, 45)), bor(shr(w48, 61), shl(w48, 3))), shr(w48, 6)) + w43 + bxor(bxor(bor(shr(w35, 1), shl(w35, 63)), bor(shr(w35, 8), shl(w35, 56))), shr(w35, 7)) + w34
+    let w51 = bxor(bxor(bor(shr(w49, 19), shl(w49, 45)), bor(shr(w49, 61), shl(w49, 3))), shr(w49, 6)) + w44 + bxor(bxor(bor(shr(w36, 1), shl(w36, 63)), bor(shr(w36, 8), shl(w36, 56))), shr(w36, 7)) + w35
+    let w52 = bxor(bxor(bor(shr(w50, 19), shl(w50, 45)), bor(shr(w50, 61), shl(w50, 3))), shr(w50, 6)) + w45 + bxor(bxor(bor(shr(w37, 1), shl(w37, 63)), bor(shr(w37, 8), shl(w37, 56))), shr(w37, 7)) + w36
+    let w53 = bxor(bxor(bor(shr(w51, 19), shl(w51, 45)), bor(shr(w51, 61), shl(w51, 3))), shr(w51, 6)) + w46 + bxor(bxor(bor(shr(w38, 1), shl(w38, 63)), bor(shr(w38, 8), shl(w38, 56))), shr(w38, 7)) + w37
+    let w54 = bxor(bxor(bor(shr(w52, 19), shl(w52, 45)), bor(shr(w52, 61), shl(w52, 3))), shr(w52, 6)) + w47 + bxor(bxor(bor(shr(w39, 1), shl(w39, 63)), bor(shr(w39, 8), shl(w39, 56))), shr(w39, 7)) + w38
+    let w55 = bxor(bxor(bor(shr(w53, 19), shl(w53, 45)), bor(shr(w53, 61), shl(w53, 3))), shr(w53, 6)) + w48 + bxor(bxor(bor(shr(w40, 1), shl(w40, 63)), bor(shr(w40, 8), shl(w40, 56))), shr(w40, 7)) + w39
+    let w56 = bxor(bxor(bor(shr(w54, 19), shl(w54, 45)), bor(shr(w54, 61), shl(w54, 3))), shr(w54, 6)) + w49 + bxor(bxor(bor(shr(w41, 1), shl(w41, 63)), bor(shr(w41, 8), shl(w41, 56))), shr(w41, 7)) + w40
+    let w57 = bxor(bxor(bor(shr(w55, 19), shl(w55, 45)), bor(shr(w55, 61), shl(w55, 3))), shr(w55, 6)) + w50 + bxor(bxor(bor(shr(w42, 1), shl(w42, 63)), bor(shr(w42, 8), shl(w42, 56))), shr(w42, 7)) + w41
+    let w58 = bxor(bxor(bor(shr(w56, 19), shl(w56, 45)), bor(shr(w56, 61), shl(w56, 3))), shr(w56, 6)) + w51 + bxor(bxor(bor(shr(w43, 1), shl(w43, 63)), bor(shr(w43, 8), shl(w43, 56))), shr(w43, 7)) + w42
+    let w59 = bxor(bxor(bor(shr(w57, 19), shl(w57, 45)), bor(shr(w57, 61), shl(w57, 3))), shr(w57, 6)) + w52 + bxor(bxor(bor(shr(w44, 1), shl(w44, 63)), bor(shr(w44, 8), shl(w44, 56))), shr(w44, 7)) + w43
+    let w60 = bxor(bxor(bor(shr(w58, 19), shl(w58, 45)), bor(shr(w58, 61), shl(w58, 3))), shr(w58, 6)) + w53 + bxor(bxor(bor(shr(w45, 1), shl(w45, 63)), bor(shr(w45, 8), shl(w45, 56))), shr(w45, 7)) + w44
+    let w61 = bxor(bxor(bor(shr(w59, 19), shl(w59, 45)), bor(shr(w59, 61), shl(w59, 3))), shr(w59, 6)) + w54 + bxor(bxor(bor(shr(w46, 1), shl(w46, 63)), bor(shr(w46, 8), shl(w46, 56))), shr(w46, 7)) + w45
+    let w62 = bxor(bxor(bor(shr(w60, 19), shl(w60, 45)), bor(shr(w60, 61), shl(w60, 3))), shr(w60, 6)) + w55 + bxor(bxor(bor(shr(w47, 1), shl(w47, 63)), bor(shr(w47, 8), shl(w47, 56))), shr(w47, 7)) + w46
+    let w63 = bxor(bxor(bor(shr(w61, 19), shl(w61, 45)), bor(shr(w61, 61), shl(w61, 3))), shr(w61, 6)) + w56 + bxor(bxor(bor(shr(w48, 1), shl(w48, 63)), bor(shr(w48, 8), shl(w48, 56))), shr(w48, 7)) + w47
+    let w64 = bxor(bxor(bor(shr(w62, 19), shl(w62, 45)), bor(shr(w62, 61), shl(w62, 3))), shr(w62, 6)) + w57 + bxor(bxor(bor(shr(w49, 1), shl(w49, 63)), bor(shr(w49, 8), shl(w49, 56))), shr(w49, 7)) + w48
+    let w65 = bxor(bxor(bor(shr(w63, 19), shl(w63, 45)), bor(shr(w63, 61), shl(w63, 3))), shr(w63, 6)) + w58 + bxor(bxor(bor(shr(w50, 1), shl(w50, 63)), bor(shr(w50, 8), shl(w50, 56))), shr(w50, 7)) + w49
+    let w66 = bxor(bxor(bor(shr(w64, 19), shl(w64, 45)), bor(shr(w64, 61), shl(w64, 3))), shr(w64, 6)) + w59 + bxor(bxor(bor(shr(w51, 1), shl(w51, 63)), bor(shr(w51, 8), shl(w51, 56))), shr(w51, 7)) + w50
+    let w67 = bxor(bxor(bor(shr(w65, 19), shl(w65, 45)), bor(shr(w65, 61), shl(w65, 3))), shr(w65, 6)) + w60 + bxor(bxor(bor(shr(w52, 1), shl(w52, 63)), bor(shr(w52, 8), shl(w52, 56))), shr(w52, 7)) + w51
+    let w68 = bxor(bxor(bor(shr(w66, 19), shl(w66, 45)), bor(shr(w66, 61), shl(w66, 3))), shr(w66, 6)) + w61 + bxor(bxor(bor(shr(w53, 1), shl(w53, 63)), bor(shr(w53, 8), shl(w53, 56))), shr(w53, 7)) + w52
+    let w69 = bxor(bxor(bor(shr(w67, 19), shl(w67, 45)), bor(shr(w67, 61), shl(w67, 3))), shr(w67, 6)) + w62 + bxor(bxor(bor(shr(w54, 1), shl(w54, 63)), bor(shr(w54, 8), shl(w54, 56))), shr(w54, 7)) + w53
+    let w70 = bxor(bxor(bor(shr(w68, 19), shl(w68, 45)), bor(shr(w68, 61), shl(w68, 3))), shr(w68, 6)) + w63 + bxor(bxor(bor(shr(w55, 1), shl(w55, 63)), bor(shr(w55, 8), shl(w55, 56))), shr(w55, 7)) + w54
+    let w71 = bxor(bxor(bor(shr(w69, 19), shl(w69, 45)), bor(shr(w69, 61), shl(w69, 3))), shr(w69, 6)) + w64 + bxor(bxor(bor(shr(w56, 1), shl(w56, 63)), bor(shr(w56, 8), shl(w56, 56))), shr(w56, 7)) + w55
+    let w72 = bxor(bxor(bor(shr(w70, 19), shl(w70, 45)), bor(shr(w70, 61), shl(w70, 3))), shr(w70, 6)) + w65 + bxor(bxor(bor(shr(w57, 1), shl(w57, 63)), bor(shr(w57, 8), shl(w57, 56))), shr(w57, 7)) + w56
+    let w73 = bxor(bxor(bor(shr(w71, 19), shl(w71, 45)), bor(shr(w71, 61), shl(w71, 3))), shr(w71, 6)) + w66 + bxor(bxor(bor(shr(w58, 1), shl(w58, 63)), bor(shr(w58, 8), shl(w58, 56))), shr(w58, 7)) + w57
+    let w74 = bxor(bxor(bor(shr(w72, 19), shl(w72, 45)), bor(shr(w72, 61), shl(w72, 3))), shr(w72, 6)) + w67 + bxor(bxor(bor(shr(w59, 1), shl(w59, 63)), bor(shr(w59, 8), shl(w59, 56))), shr(w59, 7)) + w58
+    let w75 = bxor(bxor(bor(shr(w73, 19), shl(w73, 45)), bor(shr(w73, 61), shl(w73, 3))), shr(w73, 6)) + w68 + bxor(bxor(bor(shr(w60, 1), shl(w60, 63)), bor(shr(w60, 8), shl(w60, 56))), shr(w60, 7)) + w59
+    let w76 = bxor(bxor(bor(shr(w74, 19), shl(w74, 45)), bor(shr(w74, 61), shl(w74, 3))), shr(w74, 6)) + w69 + bxor(bxor(bor(shr(w61, 1), shl(w61, 63)), bor(shr(w61, 8), shl(w61, 56))), shr(w61, 7)) + w60
+    let w77 = bxor(bxor(bor(shr(w75, 19), shl(w75, 45)), bor(shr(w75, 61), shl(w75, 3))), shr(w75, 6)) + w70 + bxor(bxor(bor(shr(w62, 1), shl(w62, 63)), bor(shr(w62, 8), shl(w62, 56))), shr(w62, 7)) + w61
+    let w78 = bxor(bxor(bor(shr(w76, 19), shl(w76, 45)), bor(shr(w76, 61), shl(w76, 3))), shr(w76, 6)) + w71 + bxor(bxor(bor(shr(w63, 1), shl(w63, 63)), bor(shr(w63, 8), shl(w63, 56))), shr(w63, 7)) + w62
+    let w79 = bxor(bxor(bor(shr(w77, 19), shl(w77, 45)), bor(shr(w77, 61), shl(w77, 3))), shr(w77, 6)) + w72 + bxor(bxor(bor(shr(w64, 1), shl(w64, 63)), bor(shr(w64, 8), shl(w64, 56))), shr(w64, 7)) + w63
+    let t1_0 = s.h7 + bxor(bxor(bor(shr(s.h4, 14), shl(s.h4, 50)), bor(shr(s.h4, 18), shl(s.h4, 46))), bor(shr(s.h4, 41), shl(s.h4, 23))) + bxor(band(s.h4, s.h5), band(bnot(s.h4), s.h6)) + 4794697086780616226 + w0
+    let t2_0 = bxor(bxor(bor(shr(s.h0, 28), shl(s.h0, 36)), bor(shr(s.h0, 34), shl(s.h0, 30))), bor(shr(s.h0, 39), shl(s.h0, 25))) + bxor(bxor(band(s.h0, s.h1), band(s.h0, s.h2)), band(s.h1, s.h2))
+    let e_0 = s.h3 + t1_0
+    let a_0 = t1_0 + t2_0
+    let t1_1 = s.h6 + bxor(bxor(bor(shr(e_0, 14), shl(e_0, 50)), bor(shr(e_0, 18), shl(e_0, 46))), bor(shr(e_0, 41), shl(e_0, 23))) + bxor(band(e_0, s.h4), band(bnot(e_0), s.h5)) + 8158064640168781261 + w1
+    let t2_1 = bxor(bxor(bor(shr(a_0, 28), shl(a_0, 36)), bor(shr(a_0, 34), shl(a_0, 30))), bor(shr(a_0, 39), shl(a_0, 25))) + bxor(bxor(band(a_0, s.h0), band(a_0, s.h1)), band(s.h0, s.h1))
+    let e_1 = s.h2 + t1_1
+    let a_1 = t1_1 + t2_1
+    let t1_2 = s.h5 + bxor(bxor(bor(shr(e_1, 14), shl(e_1, 50)), bor(shr(e_1, 18), shl(e_1, 46))), bor(shr(e_1, 41), shl(e_1, 23))) + bxor(band(e_1, e_0), band(bnot(e_1), s.h4)) + -5349999486874862801 + w2
+    let t2_2 = bxor(bxor(bor(shr(a_1, 28), shl(a_1, 36)), bor(shr(a_1, 34), shl(a_1, 30))), bor(shr(a_1, 39), shl(a_1, 25))) + bxor(bxor(band(a_1, a_0), band(a_1, s.h0)), band(a_0, s.h0))
+    let e_2 = s.h1 + t1_2
+    let a_2 = t1_2 + t2_2
+    let t1_3 = s.h4 + bxor(bxor(bor(shr(e_2, 14), shl(e_2, 50)), bor(shr(e_2, 18), shl(e_2, 46))), bor(shr(e_2, 41), shl(e_2, 23))) + bxor(band(e_2, e_1), band(bnot(e_2), e_0)) + -1606136188198331460 + w3
+    let t2_3 = bxor(bxor(bor(shr(a_2, 28), shl(a_2, 36)), bor(shr(a_2, 34), shl(a_2, 30))), bor(shr(a_2, 39), shl(a_2, 25))) + bxor(bxor(band(a_2, a_1), band(a_2, a_0)), band(a_1, a_0))
+    let e_3 = s.h0 + t1_3
+    let a_3 = t1_3 + t2_3
+    let t1_4 = e_0 + bxor(bxor(bor(shr(e_3, 14), shl(e_3, 50)), bor(shr(e_3, 18), shl(e_3, 46))), bor(shr(e_3, 41), shl(e_3, 23))) + bxor(band(e_3, e_2), band(bnot(e_3), e_1)) + 4131703408338449720 + w4
+    let t2_4 = bxor(bxor(bor(shr(a_3, 28), shl(a_3, 36)), bor(shr(a_3, 34), shl(a_3, 30))), bor(shr(a_3, 39), shl(a_3, 25))) + bxor(bxor(band(a_3, a_2), band(a_3, a_1)), band(a_2, a_1))
+    let e_4 = a_0 + t1_4
+    let a_4 = t1_4 + t2_4
+    let t1_5 = e_1 + bxor(bxor(bor(shr(e_4, 14), shl(e_4, 50)), bor(shr(e_4, 18), shl(e_4, 46))), bor(shr(e_4, 41), shl(e_4, 23))) + bxor(band(e_4, e_3), band(bnot(e_4), e_2)) + 6480981068601479193 + w5
+    let t2_5 = bxor(bxor(bor(shr(a_4, 28), shl(a_4, 36)), bor(shr(a_4, 34), shl(a_4, 30))), bor(shr(a_4, 39), shl(a_4, 25))) + bxor(bxor(band(a_4, a_3), band(a_4, a_2)), band(a_3, a_2))
+    let e_5 = a_1 + t1_5
+    let a_5 = t1_5 + t2_5
+    let t1_6 = e_2 + bxor(bxor(bor(shr(e_5, 14), shl(e_5, 50)), bor(shr(e_5, 18), shl(e_5, 46))), bor(shr(e_5, 41), shl(e_5, 23))) + bxor(band(e_5, e_4), band(bnot(e_5), e_3)) + -7908458776815382629 + w6
+    let t2_6 = bxor(bxor(bor(shr(a_5, 28), shl(a_5, 36)), bor(shr(a_5, 34), shl(a_5, 30))), bor(shr(a_5, 39), shl(a_5, 25))) + bxor(bxor(band(a_5, a_4), band(a_5, a_3)), band(a_4, a_3))
+    let e_6 = a_2 + t1_6
+    let a_6 = t1_6 + t2_6
+    let t1_7 = e_3 + bxor(bxor(bor(shr(e_6, 14), shl(e_6, 50)), bor(shr(e_6, 18), shl(e_6, 46))), bor(shr(e_6, 41), shl(e_6, 23))) + bxor(band(e_6, e_5), band(bnot(e_6), e_4)) + -6116909921290321640 + w7
+    let t2_7 = bxor(bxor(bor(shr(a_6, 28), shl(a_6, 36)), bor(shr(a_6, 34), shl(a_6, 30))), bor(shr(a_6, 39), shl(a_6, 25))) + bxor(bxor(band(a_6, a_5), band(a_6, a_4)), band(a_5, a_4))
+    let e_7 = a_3 + t1_7
+    let a_7 = t1_7 + t2_7
+    let t1_8 = e_4 + bxor(bxor(bor(shr(e_7, 14), shl(e_7, 50)), bor(shr(e_7, 18), shl(e_7, 46))), bor(shr(e_7, 41), shl(e_7, 23))) + bxor(band(e_7, e_6), band(bnot(e_7), e_5)) + -2880145864133508542 + w8
+    let t2_8 = bxor(bxor(bor(shr(a_7, 28), shl(a_7, 36)), bor(shr(a_7, 34), shl(a_7, 30))), bor(shr(a_7, 39), shl(a_7, 25))) + bxor(bxor(band(a_7, a_6), band(a_7, a_5)), band(a_6, a_5))
+    let e_8 = a_4 + t1_8
+    let a_8 = t1_8 + t2_8
+    let t1_9 = e_5 + bxor(bxor(bor(shr(e_8, 14), shl(e_8, 50)), bor(shr(e_8, 18), shl(e_8, 46))), bor(shr(e_8, 41), shl(e_8, 23))) + bxor(band(e_8, e_7), band(bnot(e_8), e_6)) + 1334009975649890238 + w9
+    let t2_9 = bxor(bxor(bor(shr(a_8, 28), shl(a_8, 36)), bor(shr(a_8, 34), shl(a_8, 30))), bor(shr(a_8, 39), shl(a_8, 25))) + bxor(bxor(band(a_8, a_7), band(a_8, a_6)), band(a_7, a_6))
+    let e_9 = a_5 + t1_9
+    let a_9 = t1_9 + t2_9
+    let t1_10 = e_6 + bxor(bxor(bor(shr(e_9, 14), shl(e_9, 50)), bor(shr(e_9, 18), shl(e_9, 46))), bor(shr(e_9, 41), shl(e_9, 23))) + bxor(band(e_9, e_8), band(bnot(e_9), e_7)) + 2608012711638119052 + w10
+    let t2_10 = bxor(bxor(bor(shr(a_9, 28), shl(a_9, 36)), bor(shr(a_9, 34), shl(a_9, 30))), bor(shr(a_9, 39), shl(a_9, 25))) + bxor(bxor(band(a_9, a_8), band(a_9, a_7)), band(a_8, a_7))
+    let e_10 = a_6 + t1_10
+    let a_10 = t1_10 + t2_10
+    let t1_11 = e_7 + bxor(bxor(bor(shr(e_10, 14), shl(e_10, 50)), bor(shr(e_10, 18), shl(e_10, 46))), bor(shr(e_10, 41), shl(e_10, 23))) + bxor(band(e_10, e_9), band(bnot(e_10), e_8)) + 6128411473006802146 + w11
+    let t2_11 = bxor(bxor(bor(shr(a_10, 28), shl(a_10, 36)), bor(shr(a_10, 34), shl(a_10, 30))), bor(shr(a_10, 39), shl(a_10, 25))) + bxor(bxor(band(a_10, a_9), band(a_10, a_8)), band(a_9, a_8))
+    let e_11 = a_7 + t1_11
+    let a_11 = t1_11 + t2_11
+    let t1_12 = e_8 + bxor(bxor(bor(shr(e_11, 14), shl(e_11, 50)), bor(shr(e_11, 18), shl(e_11, 46))), bor(shr(e_11, 41), shl(e_11, 23))) + bxor(band(e_11, e_10), band(bnot(e_11), e_9)) + 8268148722764581231 + w12
+    let t2_12 = bxor(bxor(bor(shr(a_11, 28), shl(a_11, 36)), bor(shr(a_11, 34), shl(a_11, 30))), bor(shr(a_11, 39), shl(a_11, 25))) + bxor(bxor(band(a_11, a_10), band(a_11, a_9)), band(a_10, a_9))
+    let e_12 = a_8 + t1_12
+    let a_12 = t1_12 + t2_12
+    let t1_13 = e_9 + bxor(bxor(bor(shr(e_12, 14), shl(e_12, 50)), bor(shr(e_12, 18), shl(e_12, 46))), bor(shr(e_12, 41), shl(e_12, 23))) + bxor(band(e_12, e_11), band(bnot(e_12), e_10)) + -9160688886553864527 + w13
+    let t2_13 = bxor(bxor(bor(shr(a_12, 28), shl(a_12, 36)), bor(shr(a_12, 34), shl(a_12, 30))), bor(shr(a_12, 39), shl(a_12, 25))) + bxor(bxor(band(a_12, a_11), band(a_12, a_10)), band(a_11, a_10))
+    let e_13 = a_9 + t1_13
+    let a_13 = t1_13 + t2_13
+    let t1_14 = e_10 + bxor(bxor(bor(shr(e_13, 14), shl(e_13, 50)), bor(shr(e_13, 18), shl(e_13, 46))), bor(shr(e_13, 41), shl(e_13, 23))) + bxor(band(e_13, e_12), band(bnot(e_13), e_11)) + -7215885187991268811 + w14
+    let t2_14 = bxor(bxor(bor(shr(a_13, 28), shl(a_13, 36)), bor(shr(a_13, 34), shl(a_13, 30))), bor(shr(a_13, 39), shl(a_13, 25))) + bxor(bxor(band(a_13, a_12), band(a_13, a_11)), band(a_12, a_11))
+    let e_14 = a_10 + t1_14
+    let a_14 = t1_14 + t2_14
+    let t1_15 = e_11 + bxor(bxor(bor(shr(e_14, 14), shl(e_14, 50)), bor(shr(e_14, 18), shl(e_14, 46))), bor(shr(e_14, 41), shl(e_14, 23))) + bxor(band(e_14, e_13), band(bnot(e_14), e_12)) + -4495734319001033068 + w15
+    let t2_15 = bxor(bxor(bor(shr(a_14, 28), shl(a_14, 36)), bor(shr(a_14, 34), shl(a_14, 30))), bor(shr(a_14, 39), shl(a_14, 25))) + bxor(bxor(band(a_14, a_13), band(a_14, a_12)), band(a_13, a_12))
+    let e_15 = a_11 + t1_15
+    let a_15 = t1_15 + t2_15
+    let t1_16 = e_12 + bxor(bxor(bor(shr(e_15, 14), shl(e_15, 50)), bor(shr(e_15, 18), shl(e_15, 46))), bor(shr(e_15, 41), shl(e_15, 23))) + bxor(band(e_15, e_14), band(bnot(e_15), e_13)) + -1973867731355612462 + w16
+    let t2_16 = bxor(bxor(bor(shr(a_15, 28), shl(a_15, 36)), bor(shr(a_15, 34), shl(a_15, 30))), bor(shr(a_15, 39), shl(a_15, 25))) + bxor(bxor(band(a_15, a_14), band(a_15, a_13)), band(a_14, a_13))
+    let e_16 = a_12 + t1_16
+    let a_16 = t1_16 + t2_16
+    let t1_17 = e_13 + bxor(bxor(bor(shr(e_16, 14), shl(e_16, 50)), bor(shr(e_16, 18), shl(e_16, 46))), bor(shr(e_16, 41), shl(e_16, 23))) + bxor(band(e_16, e_15), band(bnot(e_16), e_14)) + -1171420211273849373 + w17
+    let t2_17 = bxor(bxor(bor(shr(a_16, 28), shl(a_16, 36)), bor(shr(a_16, 34), shl(a_16, 30))), bor(shr(a_16, 39), shl(a_16, 25))) + bxor(bxor(band(a_16, a_15), band(a_16, a_14)), band(a_15, a_14))
+    let e_17 = a_13 + t1_17
+    let a_17 = t1_17 + t2_17
+    let t1_18 = e_14 + bxor(bxor(bor(shr(e_17, 14), shl(e_17, 50)), bor(shr(e_17, 18), shl(e_17, 46))), bor(shr(e_17, 41), shl(e_17, 23))) + bxor(band(e_17, e_16), band(bnot(e_17), e_15)) + 1135362057144423861 + w18
+    let t2_18 = bxor(bxor(bor(shr(a_17, 28), shl(a_17, 36)), bor(shr(a_17, 34), shl(a_17, 30))), bor(shr(a_17, 39), shl(a_17, 25))) + bxor(bxor(band(a_17, a_16), band(a_17, a_15)), band(a_16, a_15))
+    let e_18 = a_14 + t1_18
+    let a_18 = t1_18 + t2_18
+    let t1_19 = e_15 + bxor(bxor(bor(shr(e_18, 14), shl(e_18, 50)), bor(shr(e_18, 18), shl(e_18, 46))), bor(shr(e_18, 41), shl(e_18, 23))) + bxor(band(e_18, e_17), band(bnot(e_18), e_16)) + 2597628984639134821 + w19
+    let t2_19 = bxor(bxor(bor(shr(a_18, 28), shl(a_18, 36)), bor(shr(a_18, 34), shl(a_18, 30))), bor(shr(a_18, 39), shl(a_18, 25))) + bxor(bxor(band(a_18, a_17), band(a_18, a_16)), band(a_17, a_16))
+    let e_19 = a_15 + t1_19
+    let a_19 = t1_19 + t2_19
+    let t1_20 = e_16 + bxor(bxor(bor(shr(e_19, 14), shl(e_19, 50)), bor(shr(e_19, 18), shl(e_19, 46))), bor(shr(e_19, 41), shl(e_19, 23))) + bxor(band(e_19, e_18), band(bnot(e_19), e_17)) + 3308224258029322869 + w20
+    let t2_20 = bxor(bxor(bor(shr(a_19, 28), shl(a_19, 36)), bor(shr(a_19, 34), shl(a_19, 30))), bor(shr(a_19, 39), shl(a_19, 25))) + bxor(bxor(band(a_19, a_18), band(a_19, a_17)), band(a_18, a_17))
+    let e_20 = a_16 + t1_20
+    let a_20 = t1_20 + t2_20
+    let t1_21 = e_17 + bxor(bxor(bor(shr(e_20, 14), shl(e_20, 50)), bor(shr(e_20, 18), shl(e_20, 46))), bor(shr(e_20, 41), shl(e_20, 23))) + bxor(band(e_20, e_19), band(bnot(e_20), e_18)) + 5365058923640841347 + w21
+    let t2_21 = bxor(bxor(bor(shr(a_20, 28), shl(a_20, 36)), bor(shr(a_20, 34), shl(a_20, 30))), bor(shr(a_20, 39), shl(a_20, 25))) + bxor(bxor(band(a_20, a_19), band(a_20, a_18)), band(a_19, a_18))
+    let e_21 = a_17 + t1_21
+    let a_21 = t1_21 + t2_21
+    let t1_22 = e_18 + bxor(bxor(bor(shr(e_21, 14), shl(e_21, 50)), bor(shr(e_21, 18), shl(e_21, 46))), bor(shr(e_21, 41), shl(e_21, 23))) + bxor(band(e_21, e_20), band(bnot(e_21), e_19)) + 6679025012923562964 + w22
+    let t2_22 = bxor(bxor(bor(shr(a_21, 28), shl(a_21, 36)), bor(shr(a_21, 34), shl(a_21, 30))), bor(shr(a_21, 39), shl(a_21, 25))) + bxor(bxor(band(a_21, a_20), band(a_21, a_19)), band(a_20, a_19))
+    let e_22 = a_18 + t1_22
+    let a_22 = t1_22 + t2_22
+    let t1_23 = e_19 + bxor(bxor(bor(shr(e_22, 14), shl(e_22, 50)), bor(shr(e_22, 18), shl(e_22, 46))), bor(shr(e_22, 41), shl(e_22, 23))) + bxor(band(e_22, e_21), band(bnot(e_22), e_20)) + 8573033837759648693 + w23
+    let t2_23 = bxor(bxor(bor(shr(a_22, 28), shl(a_22, 36)), bor(shr(a_22, 34), shl(a_22, 30))), bor(shr(a_22, 39), shl(a_22, 25))) + bxor(bxor(band(a_22, a_21), band(a_22, a_20)), band(a_21, a_20))
+    let e_23 = a_19 + t1_23
+    let a_23 = t1_23 + t2_23
+    let t1_24 = e_20 + bxor(bxor(bor(shr(e_23, 14), shl(e_23, 50)), bor(shr(e_23, 18), shl(e_23, 46))), bor(shr(e_23, 41), shl(e_23, 23))) + bxor(band(e_23, e_22), band(bnot(e_23), e_21)) + -7476448914759557205 + w24
+    let t2_24 = bxor(bxor(bor(shr(a_23, 28), shl(a_23, 36)), bor(shr(a_23, 34), shl(a_23, 30))), bor(shr(a_23, 39), shl(a_23, 25))) + bxor(bxor(band(a_23, a_22), band(a_23, a_21)), band(a_22, a_21))
+    let e_24 = a_20 + t1_24
+    let a_24 = t1_24 + t2_24
+    let t1_25 = e_21 + bxor(bxor(bor(shr(e_24, 14), shl(e_24, 50)), bor(shr(e_24, 18), shl(e_24, 46))), bor(shr(e_24, 41), shl(e_24, 23))) + bxor(band(e_24, e_23), band(bnot(e_24), e_22)) + -6327057829258317296 + w25
+    let t2_25 = bxor(bxor(bor(shr(a_24, 28), shl(a_24, 36)), bor(shr(a_24, 34), shl(a_24, 30))), bor(shr(a_24, 39), shl(a_24, 25))) + bxor(bxor(band(a_24, a_23), band(a_24, a_22)), band(a_23, a_22))
+    let e_25 = a_21 + t1_25
+    let a_25 = t1_25 + t2_25
+    let t1_26 = e_22 + bxor(bxor(bor(shr(e_25, 14), shl(e_25, 50)), bor(shr(e_25, 18), shl(e_25, 46))), bor(shr(e_25, 41), shl(e_25, 23))) + bxor(band(e_25, e_24), band(bnot(e_25), e_23)) + -5763719355590565569 + w26
+    let t2_26 = bxor(bxor(bor(shr(a_25, 28), shl(a_25, 36)), bor(shr(a_25, 34), shl(a_25, 30))), bor(shr(a_25, 39), shl(a_25, 25))) + bxor(bxor(band(a_25, a_24), band(a_25, a_23)), band(a_24, a_23))
+    let e_26 = a_22 + t1_26
+    let a_26 = t1_26 + t2_26
+    let t1_27 = e_23 + bxor(bxor(bor(shr(e_26, 14), shl(e_26, 50)), bor(shr(e_26, 18), shl(e_26, 46))), bor(shr(e_26, 41), shl(e_26, 23))) + bxor(band(e_26, e_25), band(bnot(e_26), e_24)) + -4658551843659510044 + w27
+    let t2_27 = bxor(bxor(bor(shr(a_26, 28), shl(a_26, 36)), bor(shr(a_26, 34), shl(a_26, 30))), bor(shr(a_26, 39), shl(a_26, 25))) + bxor(bxor(band(a_26, a_25), band(a_26, a_24)), band(a_25, a_24))
+    let e_27 = a_23 + t1_27
+    let a_27 = t1_27 + t2_27
+    let t1_28 = e_24 + bxor(bxor(bor(shr(e_27, 14), shl(e_27, 50)), bor(shr(e_27, 18), shl(e_27, 46))), bor(shr(e_27, 41), shl(e_27, 23))) + bxor(band(e_27, e_26), band(bnot(e_27), e_25)) + -4116276920077217854 + w28
+    let t2_28 = bxor(bxor(bor(shr(a_27, 28), shl(a_27, 36)), bor(shr(a_27, 34), shl(a_27, 30))), bor(shr(a_27, 39), shl(a_27, 25))) + bxor(bxor(band(a_27, a_26), band(a_27, a_25)), band(a_26, a_25))
+    let e_28 = a_24 + t1_28
+    let a_28 = t1_28 + t2_28
+    let t1_29 = e_25 + bxor(bxor(bor(shr(e_28, 14), shl(e_28, 50)), bor(shr(e_28, 18), shl(e_28, 46))), bor(shr(e_28, 41), shl(e_28, 23))) + bxor(band(e_28, e_27), band(bnot(e_28), e_26)) + -3051310485924567259 + w29
+    let t2_29 = bxor(bxor(bor(shr(a_28, 28), shl(a_28, 36)), bor(shr(a_28, 34), shl(a_28, 30))), bor(shr(a_28, 39), shl(a_28, 25))) + bxor(bxor(band(a_28, a_27), band(a_28, a_26)), band(a_27, a_26))
+    let e_29 = a_25 + t1_29
+    let a_29 = t1_29 + t2_29
+    let t1_30 = e_26 + bxor(bxor(bor(shr(e_29, 14), shl(e_29, 50)), bor(shr(e_29, 18), shl(e_29, 46))), bor(shr(e_29, 41), shl(e_29, 23))) + bxor(band(e_29, e_28), band(bnot(e_29), e_27)) + 489312712824947311 + w30
+    let t2_30 = bxor(bxor(bor(shr(a_29, 28), shl(a_29, 36)), bor(shr(a_29, 34), shl(a_29, 30))), bor(shr(a_29, 39), shl(a_29, 25))) + bxor(bxor(band(a_29, a_28), band(a_29, a_27)), band(a_28, a_27))
+    let e_30 = a_26 + t1_30
+    let a_30 = t1_30 + t2_30
+    let t1_31 = e_27 + bxor(bxor(bor(shr(e_30, 14), shl(e_30, 50)), bor(shr(e_30, 18), shl(e_30, 46))), bor(shr(e_30, 41), shl(e_30, 23))) + bxor(band(e_30, e_29), band(bnot(e_30), e_28)) + 1452737877330783856 + w31
+    let t2_31 = bxor(bxor(bor(shr(a_30, 28), shl(a_30, 36)), bor(shr(a_30, 34), shl(a_30, 30))), bor(shr(a_30, 39), shl(a_30, 25))) + bxor(bxor(band(a_30, a_29), band(a_30, a_28)), band(a_29, a_28))
+    let e_31 = a_27 + t1_31
+    let a_31 = t1_31 + t2_31
+    let t1_32 = e_28 + bxor(bxor(bor(shr(e_31, 14), shl(e_31, 50)), bor(shr(e_31, 18), shl(e_31, 46))), bor(shr(e_31, 41), shl(e_31, 23))) + bxor(band(e_31, e_30), band(bnot(e_31), e_29)) + 2861767655752347644 + w32
+    let t2_32 = bxor(bxor(bor(shr(a_31, 28), shl(a_31, 36)), bor(shr(a_31, 34), shl(a_31, 30))), bor(shr(a_31, 39), shl(a_31, 25))) + bxor(bxor(band(a_31, a_30), band(a_31, a_29)), band(a_30, a_29))
+    let e_32 = a_28 + t1_32
+    let a_32 = t1_32 + t2_32
+    let t1_33 = e_29 + bxor(bxor(bor(shr(e_32, 14), shl(e_32, 50)), bor(shr(e_32, 18), shl(e_32, 46))), bor(shr(e_32, 41), shl(e_32, 23))) + bxor(band(e_32, e_31), band(bnot(e_32), e_30)) + 3322285676063803686 + w33
+    let t2_33 = bxor(bxor(bor(shr(a_32, 28), shl(a_32, 36)), bor(shr(a_32, 34), shl(a_32, 30))), bor(shr(a_32, 39), shl(a_32, 25))) + bxor(bxor(band(a_32, a_31), band(a_32, a_30)), band(a_31, a_30))
+    let e_33 = a_29 + t1_33
+    let a_33 = t1_33 + t2_33
+    let t1_34 = e_30 + bxor(bxor(bor(shr(e_33, 14), shl(e_33, 50)), bor(shr(e_33, 18), shl(e_33, 46))), bor(shr(e_33, 41), shl(e_33, 23))) + bxor(band(e_33, e_32), band(bnot(e_33), e_31)) + 5560940570517711597 + w34
+    let t2_34 = bxor(bxor(bor(shr(a_33, 28), shl(a_33, 36)), bor(shr(a_33, 34), shl(a_33, 30))), bor(shr(a_33, 39), shl(a_33, 25))) + bxor(bxor(band(a_33, a_32), band(a_33, a_31)), band(a_32, a_31))
+    let e_34 = a_30 + t1_34
+    let a_34 = t1_34 + t2_34
+    let t1_35 = e_31 + bxor(bxor(bor(shr(e_34, 14), shl(e_34, 50)), bor(shr(e_34, 18), shl(e_34, 46))), bor(shr(e_34, 41), shl(e_34, 23))) + bxor(band(e_34, e_33), band(bnot(e_34), e_32)) + 5996557281743188959 + w35
+    let t2_35 = bxor(bxor(bor(shr(a_34, 28), shl(a_34, 36)), bor(shr(a_34, 34), shl(a_34, 30))), bor(shr(a_34, 39), shl(a_34, 25))) + bxor(bxor(band(a_34, a_33), band(a_34, a_32)), band(a_33, a_32))
+    let e_35 = a_31 + t1_35
+    let a_35 = t1_35 + t2_35
+    let t1_36 = e_32 + bxor(bxor(bor(shr(e_35, 14), shl(e_35, 50)), bor(shr(e_35, 18), shl(e_35, 46))), bor(shr(e_35, 41), shl(e_35, 23))) + bxor(band(e_35, e_34), band(bnot(e_35), e_33)) + 7280758554555802590 + w36
+    let t2_36 = bxor(bxor(bor(shr(a_35, 28), shl(a_35, 36)), bor(shr(a_35, 34), shl(a_35, 30))), bor(shr(a_35, 39), shl(a_35, 25))) + bxor(bxor(band(a_35, a_34), band(a_35, a_33)), band(a_34, a_33))
+    let e_36 = a_32 + t1_36
+    let a_36 = t1_36 + t2_36
+    let t1_37 = e_33 + bxor(bxor(bor(shr(e_36, 14), shl(e_36, 50)), bor(shr(e_36, 18), shl(e_36, 46))), bor(shr(e_36, 41), shl(e_36, 23))) + bxor(band(e_36, e_35), band(bnot(e_36), e_34)) + 8532644243296465576 + w37
+    let t2_37 = bxor(bxor(bor(shr(a_36, 28), shl(a_36, 36)), bor(shr(a_36, 34), shl(a_36, 30))), bor(shr(a_36, 39), shl(a_36, 25))) + bxor(bxor(band(a_36, a_35), band(a_36, a_34)), band(a_35, a_34))
+    let e_37 = a_33 + t1_37
+    let a_37 = t1_37 + t2_37
+    let t1_38 = e_34 + bxor(bxor(bor(shr(e_37, 14), shl(e_37, 50)), bor(shr(e_37, 18), shl(e_37, 46))), bor(shr(e_37, 41), shl(e_37, 23))) + bxor(band(e_37, e_36), band(bnot(e_37), e_35)) + -9096487096722542874 + w38
+    let t2_38 = bxor(bxor(bor(shr(a_37, 28), shl(a_37, 36)), bor(shr(a_37, 34), shl(a_37, 30))), bor(shr(a_37, 39), shl(a_37, 25))) + bxor(bxor(band(a_37, a_36), band(a_37, a_35)), band(a_36, a_35))
+    let e_38 = a_34 + t1_38
+    let a_38 = t1_38 + t2_38
+    let t1_39 = e_35 + bxor(bxor(bor(shr(e_38, 14), shl(e_38, 50)), bor(shr(e_38, 18), shl(e_38, 46))), bor(shr(e_38, 41), shl(e_38, 23))) + bxor(band(e_38, e_37), band(bnot(e_38), e_36)) + -7894198246740708037 + w39
+    let t2_39 = bxor(bxor(bor(shr(a_38, 28), shl(a_38, 36)), bor(shr(a_38, 34), shl(a_38, 30))), bor(shr(a_38, 39), shl(a_38, 25))) + bxor(bxor(band(a_38, a_37), band(a_38, a_36)), band(a_37, a_36))
+    let e_39 = a_35 + t1_39
+    let a_39 = t1_39 + t2_39
+    let t1_40 = e_36 + bxor(bxor(bor(shr(e_39, 14), shl(e_39, 50)), bor(shr(e_39, 18), shl(e_39, 46))), bor(shr(e_39, 41), shl(e_39, 23))) + bxor(band(e_39, e_38), band(bnot(e_39), e_37)) + -6719396339535248540 + w40
+    let t2_40 = bxor(bxor(bor(shr(a_39, 28), shl(a_39, 36)), bor(shr(a_39, 34), shl(a_39, 30))), bor(shr(a_39, 39), shl(a_39, 25))) + bxor(bxor(band(a_39, a_38), band(a_39, a_37)), band(a_38, a_37))
+    let e_40 = a_36 + t1_40
+    let a_40 = t1_40 + t2_40
+    let t1_41 = e_37 + bxor(bxor(bor(shr(e_40, 14), shl(e_40, 50)), bor(shr(e_40, 18), shl(e_40, 46))), bor(shr(e_40, 41), shl(e_40, 23))) + bxor(band(e_40, e_39), band(bnot(e_40), e_38)) + -6333637450476146687 + w41
+    let t2_41 = bxor(bxor(bor(shr(a_40, 28), shl(a_40, 36)), bor(shr(a_40, 34), shl(a_40, 30))), bor(shr(a_40, 39), shl(a_40, 25))) + bxor(bxor(band(a_40, a_39), band(a_40, a_38)), band(a_39, a_38))
+    let e_41 = a_37 + t1_41
+    let a_41 = t1_41 + t2_41
+    let t1_42 = e_38 + bxor(bxor(bor(shr(e_41, 14), shl(e_41, 50)), bor(shr(e_41, 18), shl(e_41, 46))), bor(shr(e_41, 41), shl(e_41, 23))) + bxor(band(e_41, e_40), band(bnot(e_41), e_39)) + -4446306890439682159 + w42
+    let t2_42 = bxor(bxor(bor(shr(a_41, 28), shl(a_41, 36)), bor(shr(a_41, 34), shl(a_41, 30))), bor(shr(a_41, 39), shl(a_41, 25))) + bxor(bxor(band(a_41, a_40), band(a_41, a_39)), band(a_40, a_39))
+    let e_42 = a_38 + t1_42
+    let a_42 = t1_42 + t2_42
+    let t1_43 = e_39 + bxor(bxor(bor(shr(e_42, 14), shl(e_42, 50)), bor(shr(e_42, 18), shl(e_42, 46))), bor(shr(e_42, 41), shl(e_42, 23))) + bxor(band(e_42, e_41), band(bnot(e_42), e_40)) + -4076793802049405392 + w43
+    let t2_43 = bxor(bxor(bor(shr(a_42, 28), shl(a_42, 36)), bor(shr(a_42, 34), shl(a_42, 30))), bor(shr(a_42, 39), shl(a_42, 25))) + bxor(bxor(band(a_42, a_41), band(a_42, a_40)), band(a_41, a_40))
+    let e_43 = a_39 + t1_43
+    let a_43 = t1_43 + t2_43
+    let t1_44 = e_40 + bxor(bxor(bor(shr(e_43, 14), shl(e_43, 50)), bor(shr(e_43, 18), shl(e_43, 46))), bor(shr(e_43, 41), shl(e_43, 23))) + bxor(band(e_43, e_42), band(bnot(e_43), e_41)) + -3345356375505022440 + w44
+    let t2_44 = bxor(bxor(bor(shr(a_43, 28), shl(a_43, 36)), bor(shr(a_43, 34), shl(a_43, 30))), bor(shr(a_43, 39), shl(a_43, 25))) + bxor(bxor(band(a_43, a_42), band(a_43, a_41)), band(a_42, a_41))
+    let e_44 = a_40 + t1_44
+    let a_44 = t1_44 + t2_44
+    let t1_45 = e_41 + bxor(bxor(bor(shr(e_44, 14), shl(e_44, 50)), bor(shr(e_44, 18), shl(e_44, 46))), bor(shr(e_44, 41), shl(e_44, 23))) + bxor(band(e_44, e_43), band(bnot(e_44), e_42)) + -2983346525034927856 + w45
+    let t2_45 = bxor(bxor(bor(shr(a_44, 28), shl(a_44, 36)), bor(shr(a_44, 34), shl(a_44, 30))), bor(shr(a_44, 39), shl(a_44, 25))) + bxor(bxor(band(a_44, a_43), band(a_44, a_42)), band(a_43, a_42))
+    let e_45 = a_41 + t1_45
+    let a_45 = t1_45 + t2_45
+    let t1_46 = e_42 + bxor(bxor(bor(shr(e_45, 14), shl(e_45, 50)), bor(shr(e_45, 18), shl(e_45, 46))), bor(shr(e_45, 41), shl(e_45, 23))) + bxor(band(e_45, e_44), band(bnot(e_45), e_43)) + -860691631967231958 + w46
+    let t2_46 = bxor(bxor(bor(shr(a_45, 28), shl(a_45, 36)), bor(shr(a_45, 34), shl(a_45, 30))), bor(shr(a_45, 39), shl(a_45, 25))) + bxor(bxor(band(a_45, a_44), band(a_45, a_43)), band(a_44, a_43))
+    let e_46 = a_42 + t1_46
+    let a_46 = t1_46 + t2_46
+    let t1_47 = e_43 + bxor(bxor(bor(shr(e_46, 14), shl(e_46, 50)), bor(shr(e_46, 18), shl(e_46, 46))), bor(shr(e_46, 41), shl(e_46, 23))) + bxor(band(e_46, e_45), band(bnot(e_46), e_44)) + 1182934255886127544 + w47
+    let t2_47 = bxor(bxor(bor(shr(a_46, 28), shl(a_46, 36)), bor(shr(a_46, 34), shl(a_46, 30))), bor(shr(a_46, 39), shl(a_46, 25))) + bxor(bxor(band(a_46, a_45), band(a_46, a_44)), band(a_45, a_44))
+    let e_47 = a_43 + t1_47
+    let a_47 = t1_47 + t2_47
+    let t1_48 = e_44 + bxor(bxor(bor(shr(e_47, 14), shl(e_47, 50)), bor(shr(e_47, 18), shl(e_47, 46))), bor(shr(e_47, 41), shl(e_47, 23))) + bxor(band(e_47, e_46), band(bnot(e_47), e_45)) + 1847814050463011016 + w48
+    let t2_48 = bxor(bxor(bor(shr(a_47, 28), shl(a_47, 36)), bor(shr(a_47, 34), shl(a_47, 30))), bor(shr(a_47, 39), shl(a_47, 25))) + bxor(bxor(band(a_47, a_46), band(a_47, a_45)), band(a_46, a_45))
+    let e_48 = a_44 + t1_48
+    let a_48 = t1_48 + t2_48
+    let t1_49 = e_45 + bxor(bxor(bor(shr(e_48, 14), shl(e_48, 50)), bor(shr(e_48, 18), shl(e_48, 46))), bor(shr(e_48, 41), shl(e_48, 23))) + bxor(band(e_48, e_47), band(bnot(e_48), e_46)) + 2177327727835720531 + w49
+    let t2_49 = bxor(bxor(bor(shr(a_48, 28), shl(a_48, 36)), bor(shr(a_48, 34), shl(a_48, 30))), bor(shr(a_48, 39), shl(a_48, 25))) + bxor(bxor(band(a_48, a_47), band(a_48, a_46)), band(a_47, a_46))
+    let e_49 = a_45 + t1_49
+    let a_49 = t1_49 + t2_49
+    let t1_50 = e_46 + bxor(bxor(bor(shr(e_49, 14), shl(e_49, 50)), bor(shr(e_49, 18), shl(e_49, 46))), bor(shr(e_49, 41), shl(e_49, 23))) + bxor(band(e_49, e_48), band(bnot(e_49), e_47)) + 2830643537854262169 + w50
+    let t2_50 = bxor(bxor(bor(shr(a_49, 28), shl(a_49, 36)), bor(shr(a_49, 34), shl(a_49, 30))), bor(shr(a_49, 39), shl(a_49, 25))) + bxor(bxor(band(a_49, a_48), band(a_49, a_47)), band(a_48, a_47))
+    let e_50 = a_46 + t1_50
+    let a_50 = t1_50 + t2_50
+    let t1_51 = e_47 + bxor(bxor(bor(shr(e_50, 14), shl(e_50, 50)), bor(shr(e_50, 18), shl(e_50, 46))), bor(shr(e_50, 41), shl(e_50, 23))) + bxor(band(e_50, e_49), band(bnot(e_50), e_48)) + 3796741975233480872 + w51
+    let t2_51 = bxor(bxor(bor(shr(a_50, 28), shl(a_50, 36)), bor(shr(a_50, 34), shl(a_50, 30))), bor(shr(a_50, 39), shl(a_50, 25))) + bxor(bxor(band(a_50, a_49), band(a_50, a_48)), band(a_49, a_48))
+    let e_51 = a_47 + t1_51
+    let a_51 = t1_51 + t2_51
+    let t1_52 = e_48 + bxor(bxor(bor(shr(e_51, 14), shl(e_51, 50)), bor(shr(e_51, 18), shl(e_51, 46))), bor(shr(e_51, 41), shl(e_51, 23))) + bxor(band(e_51, e_50), band(bnot(e_51), e_49)) + 4115178125766777443 + w52
+    let t2_52 = bxor(bxor(bor(shr(a_51, 28), shl(a_51, 36)), bor(shr(a_51, 34), shl(a_51, 30))), bor(shr(a_51, 39), shl(a_51, 25))) + bxor(bxor(band(a_51, a_50), band(a_51, a_49)), band(a_50, a_49))
+    let e_52 = a_48 + t1_52
+    let a_52 = t1_52 + t2_52
+    let t1_53 = e_49 + bxor(bxor(bor(shr(e_52, 14), shl(e_52, 50)), bor(shr(e_52, 18), shl(e_52, 46))), bor(shr(e_52, 41), shl(e_52, 23))) + bxor(band(e_52, e_51), band(bnot(e_52), e_50)) + 5681478168544905931 + w53
+    let t2_53 = bxor(bxor(bor(shr(a_52, 28), shl(a_52, 36)), bor(shr(a_52, 34), shl(a_52, 30))), bor(shr(a_52, 39), shl(a_52, 25))) + bxor(bxor(band(a_52, a_51), band(a_52, a_50)), band(a_51, a_50))
+    let e_53 = a_49 + t1_53
+    let a_53 = t1_53 + t2_53
+    let t1_54 = e_50 + bxor(bxor(bor(shr(e_53, 14), shl(e_53, 50)), bor(shr(e_53, 18), shl(e_53, 46))), bor(shr(e_53, 41), shl(e_53, 23))) + bxor(band(e_53, e_52), band(bnot(e_53), e_51)) + 6601373596472566643 + w54
+    let t2_54 = bxor(bxor(bor(shr(a_53, 28), shl(a_53, 36)), bor(shr(a_53, 34), shl(a_53, 30))), bor(shr(a_53, 39), shl(a_53, 25))) + bxor(bxor(band(a_53, a_52), band(a_53, a_51)), band(a_52, a_51))
+    let e_54 = a_50 + t1_54
+    let a_54 = t1_54 + t2_54
+    let t1_55 = e_51 + bxor(bxor(bor(shr(e_54, 14), shl(e_54, 50)), bor(shr(e_54, 18), shl(e_54, 46))), bor(shr(e_54, 41), shl(e_54, 23))) + bxor(band(e_54, e_53), band(bnot(e_54), e_52)) + 7507060721942968483 + w55
+    let t2_55 = bxor(bxor(bor(shr(a_54, 28), shl(a_54, 36)), bor(shr(a_54, 34), shl(a_54, 30))), bor(shr(a_54, 39), shl(a_54, 25))) + bxor(bxor(band(a_54, a_53), band(a_54, a_52)), band(a_53, a_52))
+    let e_55 = a_51 + t1_55
+    let a_55 = t1_55 + t2_55
+    let t1_56 = e_52 + bxor(bxor(bor(shr(e_55, 14), shl(e_55, 50)), bor(shr(e_55, 18), shl(e_55, 46))), bor(shr(e_55, 41), shl(e_55, 23))) + bxor(band(e_55, e_54), band(bnot(e_55), e_53)) + 8399075790359081724 + w56
+    let t2_56 = bxor(bxor(bor(shr(a_55, 28), shl(a_55, 36)), bor(shr(a_55, 34), shl(a_55, 30))), bor(shr(a_55, 39), shl(a_55, 25))) + bxor(bxor(band(a_55, a_54), band(a_55, a_53)), band(a_54, a_53))
+    let e_56 = a_52 + t1_56
+    let a_56 = t1_56 + t2_56
+    let t1_57 = e_53 + bxor(bxor(bor(shr(e_56, 14), shl(e_56, 50)), bor(shr(e_56, 18), shl(e_56, 46))), bor(shr(e_56, 41), shl(e_56, 23))) + bxor(band(e_56, e_55), band(bnot(e_56), e_54)) + 8693463985226723168 + w57
+    let t2_57 = bxor(bxor(bor(shr(a_56, 28), shl(a_56, 36)), bor(shr(a_56, 34), shl(a_56, 30))), bor(shr(a_56, 39), shl(a_56, 25))) + bxor(bxor(band(a_56, a_55), band(a_56, a_54)), band(a_55, a_54))
+    let e_57 = a_53 + t1_57
+    let a_57 = t1_57 + t2_57
+    let t1_58 = e_54 + bxor(bxor(bor(shr(e_57, 14), shl(e_57, 50)), bor(shr(e_57, 18), shl(e_57, 46))), bor(shr(e_57, 41), shl(e_57, 23))) + bxor(band(e_57, e_56), band(bnot(e_57), e_55)) + -8878714635349349518 + w58
+    let t2_58 = bxor(bxor(bor(shr(a_57, 28), shl(a_57, 36)), bor(shr(a_57, 34), shl(a_57, 30))), bor(shr(a_57, 39), shl(a_57, 25))) + bxor(bxor(band(a_57, a_56), band(a_57, a_55)), band(a_56, a_55))
+    let e_58 = a_54 + t1_58
+    let a_58 = t1_58 + t2_58
+    let t1_59 = e_55 + bxor(bxor(bor(shr(e_58, 14), shl(e_58, 50)), bor(shr(e_58, 18), shl(e_58, 46))), bor(shr(e_58, 41), shl(e_58, 23))) + bxor(band(e_58, e_57), band(bnot(e_58), e_56)) + -8302665154208450068 + w59
+    let t2_59 = bxor(bxor(bor(shr(a_58, 28), shl(a_58, 36)), bor(shr(a_58, 34), shl(a_58, 30))), bor(shr(a_58, 39), shl(a_58, 25))) + bxor(bxor(band(a_58, a_57), band(a_58, a_56)), band(a_57, a_56))
+    let e_59 = a_55 + t1_59
+    let a_59 = t1_59 + t2_59
+    let t1_60 = e_56 + bxor(bxor(bor(shr(e_59, 14), shl(e_59, 50)), bor(shr(e_59, 18), shl(e_59, 46))), bor(shr(e_59, 41), shl(e_59, 23))) + bxor(band(e_59, e_58), band(bnot(e_59), e_57)) + -8016688836872298968 + w60
+    let t2_60 = bxor(bxor(bor(shr(a_59, 28), shl(a_59, 36)), bor(shr(a_59, 34), shl(a_59, 30))), bor(shr(a_59, 39), shl(a_59, 25))) + bxor(bxor(band(a_59, a_58), band(a_59, a_57)), band(a_58, a_57))
+    let e_60 = a_56 + t1_60
+    let a_60 = t1_60 + t2_60
+    let t1_61 = e_57 + bxor(bxor(bor(shr(e_60, 14), shl(e_60, 50)), bor(shr(e_60, 18), shl(e_60, 46))), bor(shr(e_60, 41), shl(e_60, 23))) + bxor(band(e_60, e_59), band(bnot(e_60), e_58)) + -6606660893046293015 + w61
+    let t2_61 = bxor(bxor(bor(shr(a_60, 28), shl(a_60, 36)), bor(shr(a_60, 34), shl(a_60, 30))), bor(shr(a_60, 39), shl(a_60, 25))) + bxor(bxor(band(a_60, a_59), band(a_60, a_58)), band(a_59, a_58))
+    let e_61 = a_57 + t1_61
+    let a_61 = t1_61 + t2_61
+    let t1_62 = e_58 + bxor(bxor(bor(shr(e_61, 14), shl(e_61, 50)), bor(shr(e_61, 18), shl(e_61, 46))), bor(shr(e_61, 41), shl(e_61, 23))) + bxor(band(e_61, e_60), band(bnot(e_61), e_59)) + -4685533653050689259 + w62
+    let t2_62 = bxor(bxor(bor(shr(a_61, 28), shl(a_61, 36)), bor(shr(a_61, 34), shl(a_61, 30))), bor(shr(a_61, 39), shl(a_61, 25))) + bxor(bxor(band(a_61, a_60), band(a_61, a_59)), band(a_60, a_59))
+    let e_62 = a_58 + t1_62
+    let a_62 = t1_62 + t2_62
+    let t1_63 = e_59 + bxor(bxor(bor(shr(e_62, 14), shl(e_62, 50)), bor(shr(e_62, 18), shl(e_62, 46))), bor(shr(e_62, 41), shl(e_62, 23))) + bxor(band(e_62, e_61), band(bnot(e_62), e_60)) + -4147400797238176981 + w63
+    let t2_63 = bxor(bxor(bor(shr(a_62, 28), shl(a_62, 36)), bor(shr(a_62, 34), shl(a_62, 30))), bor(shr(a_62, 39), shl(a_62, 25))) + bxor(bxor(band(a_62, a_61), band(a_62, a_60)), band(a_61, a_60))
+    let e_63 = a_59 + t1_63
+    let a_63 = t1_63 + t2_63
+    let t1_64 = e_60 + bxor(bxor(bor(shr(e_63, 14), shl(e_63, 50)), bor(shr(e_63, 18), shl(e_63, 46))), bor(shr(e_63, 41), shl(e_63, 23))) + bxor(band(e_63, e_62), band(bnot(e_63), e_61)) + -3880063495543823972 + w64
+    let t2_64 = bxor(bxor(bor(shr(a_63, 28), shl(a_63, 36)), bor(shr(a_63, 34), shl(a_63, 30))), bor(shr(a_63, 39), shl(a_63, 25))) + bxor(bxor(band(a_63, a_62), band(a_63, a_61)), band(a_62, a_61))
+    let e_64 = a_60 + t1_64
+    let a_64 = t1_64 + t2_64
+    let t1_65 = e_61 + bxor(bxor(bor(shr(e_64, 14), shl(e_64, 50)), bor(shr(e_64, 18), shl(e_64, 46))), bor(shr(e_64, 41), shl(e_64, 23))) + bxor(band(e_64, e_63), band(bnot(e_64), e_62)) + -3348786107499101689 + w65
+    let t2_65 = bxor(bxor(bor(shr(a_64, 28), shl(a_64, 36)), bor(shr(a_64, 34), shl(a_64, 30))), bor(shr(a_64, 39), shl(a_64, 25))) + bxor(bxor(band(a_64, a_63), band(a_64, a_62)), band(a_63, a_62))
+    let e_65 = a_61 + t1_65
+    let a_65 = t1_65 + t2_65
+    let t1_66 = e_62 + bxor(bxor(bor(shr(e_65, 14), shl(e_65, 50)), bor(shr(e_65, 18), shl(e_65, 46))), bor(shr(e_65, 41), shl(e_65, 23))) + bxor(band(e_65, e_64), band(bnot(e_65), e_63)) + -1523767162380948706 + w66
+    let t2_66 = bxor(bxor(bor(shr(a_65, 28), shl(a_65, 36)), bor(shr(a_65, 34), shl(a_65, 30))), bor(shr(a_65, 39), shl(a_65, 25))) + bxor(bxor(band(a_65, a_64), band(a_65, a_63)), band(a_64, a_63))
+    let e_66 = a_62 + t1_66
+    let a_66 = t1_66 + t2_66
+    let t1_67 = e_63 + bxor(bxor(bor(shr(e_66, 14), shl(e_66, 50)), bor(shr(e_66, 18), shl(e_66, 46))), bor(shr(e_66, 41), shl(e_66, 23))) + bxor(band(e_66, e_65), band(bnot(e_66), e_64)) + -757361751448694408 + w67
+    let t2_67 = bxor(bxor(bor(shr(a_66, 28), shl(a_66, 36)), bor(shr(a_66, 34), shl(a_66, 30))), bor(shr(a_66, 39), shl(a_66, 25))) + bxor(bxor(band(a_66, a_65), band(a_66, a_64)), band(a_65, a_64))
+    let e_67 = a_63 + t1_67
+    let a_67 = t1_67 + t2_67
+    let t1_68 = e_64 + bxor(bxor(bor(shr(e_67, 14), shl(e_67, 50)), bor(shr(e_67, 18), shl(e_67, 46))), bor(shr(e_67, 41), shl(e_67, 23))) + bxor(band(e_67, e_66), band(bnot(e_67), e_65)) + 500013540394364858 + w68
+    let t2_68 = bxor(bxor(bor(shr(a_67, 28), shl(a_67, 36)), bor(shr(a_67, 34), shl(a_67, 30))), bor(shr(a_67, 39), shl(a_67, 25))) + bxor(bxor(band(a_67, a_66), band(a_67, a_65)), band(a_66, a_65))
+    let e_68 = a_64 + t1_68
+    let a_68 = t1_68 + t2_68
+    let t1_69 = e_65 + bxor(bxor(bor(shr(e_68, 14), shl(e_68, 50)), bor(shr(e_68, 18), shl(e_68, 46))), bor(shr(e_68, 41), shl(e_68, 23))) + bxor(band(e_68, e_67), band(bnot(e_68), e_66)) + 748580250866718886 + w69
+    let t2_69 = bxor(bxor(bor(shr(a_68, 28), shl(a_68, 36)), bor(shr(a_68, 34), shl(a_68, 30))), bor(shr(a_68, 39), shl(a_68, 25))) + bxor(bxor(band(a_68, a_67), band(a_68, a_66)), band(a_67, a_66))
+    let e_69 = a_65 + t1_69
+    let a_69 = t1_69 + t2_69
+    let t1_70 = e_66 + bxor(bxor(bor(shr(e_69, 14), shl(e_69, 50)), bor(shr(e_69, 18), shl(e_69, 46))), bor(shr(e_69, 41), shl(e_69, 23))) + bxor(band(e_69, e_68), band(bnot(e_69), e_67)) + 1242879168328830382 + w70
+    let t2_70 = bxor(bxor(bor(shr(a_69, 28), shl(a_69, 36)), bor(shr(a_69, 34), shl(a_69, 30))), bor(shr(a_69, 39), shl(a_69, 25))) + bxor(bxor(band(a_69, a_68), band(a_69, a_67)), band(a_68, a_67))
+    let e_70 = a_66 + t1_70
+    let a_70 = t1_70 + t2_70
+    let t1_71 = e_67 + bxor(bxor(bor(shr(e_70, 14), shl(e_70, 50)), bor(shr(e_70, 18), shl(e_70, 46))), bor(shr(e_70, 41), shl(e_70, 23))) + bxor(band(e_70, e_69), band(bnot(e_70), e_68)) + 1977374033974150939 + w71
+    let t2_71 = bxor(bxor(bor(shr(a_70, 28), shl(a_70, 36)), bor(shr(a_70, 34), shl(a_70, 30))), bor(shr(a_70, 39), shl(a_70, 25))) + bxor(bxor(band(a_70, a_69), band(a_70, a_68)), band(a_69, a_68))
+    let e_71 = a_67 + t1_71
+    let a_71 = t1_71 + t2_71
+    let t1_72 = e_68 + bxor(bxor(bor(shr(e_71, 14), shl(e_71, 50)), bor(shr(e_71, 18), shl(e_71, 46))), bor(shr(e_71, 41), shl(e_71, 23))) + bxor(band(e_71, e_70), band(bnot(e_71), e_69)) + 2944078676154940804 + w72
+    let t2_72 = bxor(bxor(bor(shr(a_71, 28), shl(a_71, 36)), bor(shr(a_71, 34), shl(a_71, 30))), bor(shr(a_71, 39), shl(a_71, 25))) + bxor(bxor(band(a_71, a_70), band(a_71, a_69)), band(a_70, a_69))
+    let e_72 = a_68 + t1_72
+    let a_72 = t1_72 + t2_72
+    let t1_73 = e_69 + bxor(bxor(bor(shr(e_72, 14), shl(e_72, 50)), bor(shr(e_72, 18), shl(e_72, 46))), bor(shr(e_72, 41), shl(e_72, 23))) + bxor(band(e_72, e_71), band(bnot(e_72), e_70)) + 3659926193048069267 + w73
+    let t2_73 = bxor(bxor(bor(shr(a_72, 28), shl(a_72, 36)), bor(shr(a_72, 34), shl(a_72, 30))), bor(shr(a_72, 39), shl(a_72, 25))) + bxor(bxor(band(a_72, a_71), band(a_72, a_70)), band(a_71, a_70))
+    let e_73 = a_69 + t1_73
+    let a_73 = t1_73 + t2_73
+    let t1_74 = e_70 + bxor(bxor(bor(shr(e_73, 14), shl(e_73, 50)), bor(shr(e_73, 18), shl(e_73, 46))), bor(shr(e_73, 41), shl(e_73, 23))) + bxor(band(e_73, e_72), band(bnot(e_73), e_71)) + 4368137639120453308 + w74
+    let t2_74 = bxor(bxor(bor(shr(a_73, 28), shl(a_73, 36)), bor(shr(a_73, 34), shl(a_73, 30))), bor(shr(a_73, 39), shl(a_73, 25))) + bxor(bxor(band(a_73, a_72), band(a_73, a_71)), band(a_72, a_71))
+    let e_74 = a_70 + t1_74
+    let a_74 = t1_74 + t2_74
+    let t1_75 = e_71 + bxor(bxor(bor(shr(e_74, 14), shl(e_74, 50)), bor(shr(e_74, 18), shl(e_74, 46))), bor(shr(e_74, 41), shl(e_74, 23))) + bxor(band(e_74, e_73), band(bnot(e_74), e_72)) + 4836135668995329356 + w75
+    let t2_75 = bxor(bxor(bor(shr(a_74, 28), shl(a_74, 36)), bor(shr(a_74, 34), shl(a_74, 30))), bor(shr(a_74, 39), shl(a_74, 25))) + bxor(bxor(band(a_74, a_73), band(a_74, a_72)), band(a_73, a_72))
+    let e_75 = a_71 + t1_75
+    let a_75 = t1_75 + t2_75
+    let t1_76 = e_72 + bxor(bxor(bor(shr(e_75, 14), shl(e_75, 50)), bor(shr(e_75, 18), shl(e_75, 46))), bor(shr(e_75, 41), shl(e_75, 23))) + bxor(band(e_75, e_74), band(bnot(e_75), e_73)) + 5532061633213252278 + w76
+    let t2_76 = bxor(bxor(bor(shr(a_75, 28), shl(a_75, 36)), bor(shr(a_75, 34), shl(a_75, 30))), bor(shr(a_75, 39), shl(a_75, 25))) + bxor(bxor(band(a_75, a_74), band(a_75, a_73)), band(a_74, a_73))
+    let e_76 = a_72 + t1_76
+    let a_76 = t1_76 + t2_76
+    let t1_77 = e_73 + bxor(bxor(bor(shr(e_76, 14), shl(e_76, 50)), bor(shr(e_76, 18), shl(e_76, 46))), bor(shr(e_76, 41), shl(e_76, 23))) + bxor(band(e_76, e_75), band(bnot(e_76), e_74)) + 6448918945643986474 + w77
+    let t2_77 = bxor(bxor(bor(shr(a_76, 28), shl(a_76, 36)), bor(shr(a_76, 34), shl(a_76, 30))), bor(shr(a_76, 39), shl(a_76, 25))) + bxor(bxor(band(a_76, a_75), band(a_76, a_74)), band(a_75, a_74))
+    let e_77 = a_73 + t1_77
+    let a_77 = t1_77 + t2_77
+    let t1_78 = e_74 + bxor(bxor(bor(shr(e_77, 14), shl(e_77, 50)), bor(shr(e_77, 18), shl(e_77, 46))), bor(shr(e_77, 41), shl(e_77, 23))) + bxor(band(e_77, e_76), band(bnot(e_77), e_75)) + 6902733635092675308 + w78
+    let t2_78 = bxor(bxor(bor(shr(a_77, 28), shl(a_77, 36)), bor(shr(a_77, 34), shl(a_77, 30))), bor(shr(a_77, 39), shl(a_77, 25))) + bxor(bxor(band(a_77, a_76), band(a_77, a_75)), band(a_76, a_75))
+    let e_78 = a_74 + t1_78
+    let a_78 = t1_78 + t2_78
+    let t1_79 = e_75 + bxor(bxor(bor(shr(e_78, 14), shl(e_78, 50)), bor(shr(e_78, 18), shl(e_78, 46))), bor(shr(e_78, 41), shl(e_78, 23))) + bxor(band(e_78, e_77), band(bnot(e_78), e_76)) + 7801388544844847127 + w79
+    let t2_79 = bxor(bxor(bor(shr(a_78, 28), shl(a_78, 36)), bor(shr(a_78, 34), shl(a_78, 30))), bor(shr(a_78, 39), shl(a_78, 25))) + bxor(bxor(band(a_78, a_77), band(a_78, a_76)), band(a_77, a_76))
+    let e_79 = a_75 + t1_79
+    let a_79 = t1_79 + t2_79
+    let nh0 = s.h0 + a_79
+    let nh1 = s.h1 + a_78
+    let nh2 = s.h2 + a_77
+    let nh3 = s.h3 + a_76
+    let nh4 = s.h4 + e_79
+    let nh5 = s.h5 + e_78
+    let nh6 = s.h6 + e_77
+    let nh7 = s.h7 + e_76
+    out = if s.i == 0 then if s.which == 0 then band(shr(s.h0, 56), 255) else if s.which == 1 then band(shr(s.h0, 48), 255) else if s.which == 2 then band(shr(s.h0, 40), 255) else if s.which == 3 then band(shr(s.h0, 32), 255) else if s.which == 4 then band(shr(s.h0, 24), 255) else if s.which == 5 then band(shr(s.h0, 16), 255) else if s.which == 6 then band(shr(s.h0, 8), 255) else if s.which == 7 then band(shr(s.h0, 0), 255) else if s.which == 8 then band(shr(s.h1, 56), 255) else if s.which == 9 then band(shr(s.h1, 48), 255) else if s.which == 10 then band(shr(s.h1, 40), 255) else if s.which == 11 then band(shr(s.h1, 32), 255) else if s.which == 12 then band(shr(s.h1, 24), 255) else if s.which == 13 then band(shr(s.h1, 16), 255) else if s.which == 14 then band(shr(s.h1, 8), 255) else if s.which == 15 then band(shr(s.h1, 0), 255) else if s.which == 16 then band(shr(s.h2, 56), 255) else if s.which == 17 then band(shr(s.h2, 48), 255) else if s.which == 18 then band(shr(s.h2, 40), 255) else if s.which == 19 then band(shr(s.h2, 32), 255) else if s.which == 20 then band(shr(s.h2, 24), 255) else if s.which == 21 then band(shr(s.h2, 16), 255) else if s.which == 22 then band(shr(s.h2, 8), 255) else if s.which == 23 then band(shr(s.h2, 0), 255) else if s.which == 24 then band(shr(s.h3, 56), 255) else if s.which == 25 then band(shr(s.h3, 48), 255) else if s.which == 26 then band(shr(s.h3, 40), 255) else if s.which == 27 then band(shr(s.h3, 32), 255) else if s.which == 28 then band(shr(s.h3, 24), 255) else if s.which == 29 then band(shr(s.h3, 16), 255) else if s.which == 30 then band(shr(s.h3, 8), 255) else if s.which == 31 then band(shr(s.h3, 0), 255) else if s.which == 32 then band(shr(s.h4, 56), 255) else if s.which == 33 then band(shr(s.h4, 48), 255) else if s.which == 34 then band(shr(s.h4, 40), 255) else if s.which == 35 then band(shr(s.h4, 32), 255) else if s.which == 36 then band(shr(s.h4, 24), 255) else if s.which == 37 then band(shr(s.h4, 16), 255) else if s.which == 38 then band(shr(s.h4, 8), 255) else if s.which == 39 then band(shr(s.h4, 0), 255) else if s.which == 40 then band(shr(s.h5, 56), 255) else if s.which == 41 then band(shr(s.h5, 48), 255) else if s.which == 42 then band(shr(s.h5, 40), 255) else if s.which == 43 then band(shr(s.h5, 32), 255) else if s.which == 44 then band(shr(s.h5, 24), 255) else if s.which == 45 then band(shr(s.h5, 16), 255) else if s.which == 46 then band(shr(s.h5, 8), 255) else if s.which == 47 then band(shr(s.h5, 0), 255) else if s.which == 48 then band(shr(s.h6, 56), 255) else if s.which == 49 then band(shr(s.h6, 48), 255) else if s.which == 50 then band(shr(s.h6, 40), 255) else if s.which == 51 then band(shr(s.h6, 32), 255) else if s.which == 52 then band(shr(s.h6, 24), 255) else if s.which == 53 then band(shr(s.h6, 16), 255) else if s.which == 54 then band(shr(s.h6, 8), 255) else if s.which == 55 then band(shr(s.h6, 0), 255) else if s.which == 56 then band(shr(s.h7, 56), 255) else if s.which == 57 then band(shr(s.h7, 48), 255) else if s.which == 58 then band(shr(s.h7, 40), 255) else if s.which == 59 then band(shr(s.h7, 32), 255) else if s.which == 60 then band(shr(s.h7, 24), 255) else if s.which == 61 then band(shr(s.h7, 16), 255) else if s.which == 62 then band(shr(s.h7, 8), 255) else band(shr(s.h7, 0), 255) else sha512_fold(Sha512State { h0: nh0, h1: nh1, h2: nh2, h3: nh3, h4: nh4, h5: nh5, h6: nh6, h7: nh7, nblocks: s.nblocks, i: s.i - 1, which: s.which, data: s.data })
+  proofs:
+    purity:
+      reads : [s.h0, s.h1, s.h2, s.h3, s.h4, s.h5, s.h6, s.h7, s.nblocks, s.i, s.which, s.data]
+      calls : [sha512_fold]
+    termination:
+      bound : 3000000
+      decreasing : i

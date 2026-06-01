@@ -1,0 +1,1403 @@
+@verbose 0.1.0
+
+concept EdAddInput
+  @intention: "two Edwards points in extended coords (X,Y,Z,T), 10 limbs each, + which output limb (0..39)"
+  @source: invoices.intent:1
+  fields:
+    x1_0 : number [0, 67108863]
+    x1_1 : number [0, 67108863]
+    x1_2 : number [0, 67108863]
+    x1_3 : number [0, 67108863]
+    x1_4 : number [0, 67108863]
+    x1_5 : number [0, 67108863]
+    x1_6 : number [0, 67108863]
+    x1_7 : number [0, 67108863]
+    x1_8 : number [0, 67108863]
+    x1_9 : number [0, 67108863]
+    y1_0 : number [0, 67108863]
+    y1_1 : number [0, 67108863]
+    y1_2 : number [0, 67108863]
+    y1_3 : number [0, 67108863]
+    y1_4 : number [0, 67108863]
+    y1_5 : number [0, 67108863]
+    y1_6 : number [0, 67108863]
+    y1_7 : number [0, 67108863]
+    y1_8 : number [0, 67108863]
+    y1_9 : number [0, 67108863]
+    z1_0 : number [0, 67108863]
+    z1_1 : number [0, 67108863]
+    z1_2 : number [0, 67108863]
+    z1_3 : number [0, 67108863]
+    z1_4 : number [0, 67108863]
+    z1_5 : number [0, 67108863]
+    z1_6 : number [0, 67108863]
+    z1_7 : number [0, 67108863]
+    z1_8 : number [0, 67108863]
+    z1_9 : number [0, 67108863]
+    t1_0 : number [0, 67108863]
+    t1_1 : number [0, 67108863]
+    t1_2 : number [0, 67108863]
+    t1_3 : number [0, 67108863]
+    t1_4 : number [0, 67108863]
+    t1_5 : number [0, 67108863]
+    t1_6 : number [0, 67108863]
+    t1_7 : number [0, 67108863]
+    t1_8 : number [0, 67108863]
+    t1_9 : number [0, 67108863]
+    x2_0 : number [0, 67108863]
+    x2_1 : number [0, 67108863]
+    x2_2 : number [0, 67108863]
+    x2_3 : number [0, 67108863]
+    x2_4 : number [0, 67108863]
+    x2_5 : number [0, 67108863]
+    x2_6 : number [0, 67108863]
+    x2_7 : number [0, 67108863]
+    x2_8 : number [0, 67108863]
+    x2_9 : number [0, 67108863]
+    y2_0 : number [0, 67108863]
+    y2_1 : number [0, 67108863]
+    y2_2 : number [0, 67108863]
+    y2_3 : number [0, 67108863]
+    y2_4 : number [0, 67108863]
+    y2_5 : number [0, 67108863]
+    y2_6 : number [0, 67108863]
+    y2_7 : number [0, 67108863]
+    y2_8 : number [0, 67108863]
+    y2_9 : number [0, 67108863]
+    z2_0 : number [0, 67108863]
+    z2_1 : number [0, 67108863]
+    z2_2 : number [0, 67108863]
+    z2_3 : number [0, 67108863]
+    z2_4 : number [0, 67108863]
+    z2_5 : number [0, 67108863]
+    z2_6 : number [0, 67108863]
+    z2_7 : number [0, 67108863]
+    z2_8 : number [0, 67108863]
+    z2_9 : number [0, 67108863]
+    t2_0 : number [0, 67108863]
+    t2_1 : number [0, 67108863]
+    t2_2 : number [0, 67108863]
+    t2_3 : number [0, 67108863]
+    t2_4 : number [0, 67108863]
+    t2_5 : number [0, 67108863]
+    t2_6 : number [0, 67108863]
+    t2_7 : number [0, 67108863]
+    t2_8 : number [0, 67108863]
+    t2_9 : number [0, 67108863]
+    which : number [0, 39]
+
+
+rule ed_add
+  @intention: "twisted-Edwards extended-coord unified point addition P1+P2 mod 2^255-19; returns limb which of X3|Y3|Z3|T3"
+  @source: invoices.intent:1
+  input:
+    g : EdAddInput
+  output:
+    out : number
+  logic:
+    let ymx1_a0 = g.y1_0 + 134217690 - g.x1_0
+    let ymx1_a1 = g.y1_1 + 67108862 - g.x1_1
+    let ymx1_a2 = g.y1_2 + 134217726 - g.x1_2
+    let ymx1_a3 = g.y1_3 + 67108862 - g.x1_3
+    let ymx1_a4 = g.y1_4 + 134217726 - g.x1_4
+    let ymx1_a5 = g.y1_5 + 67108862 - g.x1_5
+    let ymx1_a6 = g.y1_6 + 134217726 - g.x1_6
+    let ymx1_a7 = g.y1_7 + 67108862 - g.x1_7
+    let ymx1_a8 = g.y1_8 + 134217726 - g.x1_8
+    let ymx1_a9 = g.y1_9 + 67108862 - g.x1_9
+    let ymx1_c0_0 = shr(ymx1_a0, 26)
+    let ymx1_lo0_0 = band(ymx1_a0, 67108863)
+    let ymx1_s0_0 = ymx1_a1 + ymx1_c0_0
+    let ymx1_c0_1 = shr(ymx1_s0_0, 25)
+    let ymx1_lo0_1 = band(ymx1_s0_0, 33554431)
+    let ymx1_s0_1 = ymx1_a2 + ymx1_c0_1
+    let ymx1_c0_2 = shr(ymx1_s0_1, 26)
+    let ymx1_lo0_2 = band(ymx1_s0_1, 67108863)
+    let ymx1_s0_2 = ymx1_a3 + ymx1_c0_2
+    let ymx1_c0_3 = shr(ymx1_s0_2, 25)
+    let ymx1_lo0_3 = band(ymx1_s0_2, 33554431)
+    let ymx1_s0_3 = ymx1_a4 + ymx1_c0_3
+    let ymx1_c0_4 = shr(ymx1_s0_3, 26)
+    let ymx1_lo0_4 = band(ymx1_s0_3, 67108863)
+    let ymx1_s0_4 = ymx1_a5 + ymx1_c0_4
+    let ymx1_c0_5 = shr(ymx1_s0_4, 25)
+    let ymx1_lo0_5 = band(ymx1_s0_4, 33554431)
+    let ymx1_s0_5 = ymx1_a6 + ymx1_c0_5
+    let ymx1_c0_6 = shr(ymx1_s0_5, 26)
+    let ymx1_lo0_6 = band(ymx1_s0_5, 67108863)
+    let ymx1_s0_6 = ymx1_a7 + ymx1_c0_6
+    let ymx1_c0_7 = shr(ymx1_s0_6, 25)
+    let ymx1_lo0_7 = band(ymx1_s0_6, 33554431)
+    let ymx1_s0_7 = ymx1_a8 + ymx1_c0_7
+    let ymx1_c0_8 = shr(ymx1_s0_7, 26)
+    let ymx1_lo0_8 = band(ymx1_s0_7, 67108863)
+    let ymx1_s0_8 = ymx1_a9 + ymx1_c0_8
+    let ymx1_c0_9 = shr(ymx1_s0_8, 25)
+    let ymx1_lo0_9 = band(ymx1_s0_8, 33554431)
+    let ymx1_w0 = ymx1_lo0_0 + 19 * ymx1_c0_9
+    let ymx1_c1_0 = shr(ymx1_w0, 26)
+    let ymx1_lo1_0 = band(ymx1_w0, 67108863)
+    let ymx1_s1_0 = ymx1_lo0_1 + ymx1_c1_0
+    let ymx1_c1_1 = shr(ymx1_s1_0, 25)
+    let ymx1_lo1_1 = band(ymx1_s1_0, 33554431)
+    let ymx1_s1_1 = ymx1_lo0_2 + ymx1_c1_1
+    let ymx1_c1_2 = shr(ymx1_s1_1, 26)
+    let ymx1_lo1_2 = band(ymx1_s1_1, 67108863)
+    let ymx1_s1_2 = ymx1_lo0_3 + ymx1_c1_2
+    let ymx1_c1_3 = shr(ymx1_s1_2, 25)
+    let ymx1_lo1_3 = band(ymx1_s1_2, 33554431)
+    let ymx1_s1_3 = ymx1_lo0_4 + ymx1_c1_3
+    let ymx1_c1_4 = shr(ymx1_s1_3, 26)
+    let ymx1_lo1_4 = band(ymx1_s1_3, 67108863)
+    let ymx1_s1_4 = ymx1_lo0_5 + ymx1_c1_4
+    let ymx1_c1_5 = shr(ymx1_s1_4, 25)
+    let ymx1_lo1_5 = band(ymx1_s1_4, 33554431)
+    let ymx1_s1_5 = ymx1_lo0_6 + ymx1_c1_5
+    let ymx1_c1_6 = shr(ymx1_s1_5, 26)
+    let ymx1_lo1_6 = band(ymx1_s1_5, 67108863)
+    let ymx1_s1_6 = ymx1_lo0_7 + ymx1_c1_6
+    let ymx1_c1_7 = shr(ymx1_s1_6, 25)
+    let ymx1_lo1_7 = band(ymx1_s1_6, 33554431)
+    let ymx1_s1_7 = ymx1_lo0_8 + ymx1_c1_7
+    let ymx1_c1_8 = shr(ymx1_s1_7, 26)
+    let ymx1_lo1_8 = band(ymx1_s1_7, 67108863)
+    let ymx1_s1_8 = ymx1_lo0_9 + ymx1_c1_8
+    let ymx1_c1_9 = shr(ymx1_s1_8, 25)
+    let ymx1_lo1_9 = band(ymx1_s1_8, 33554431)
+    let ymx1_w1 = ymx1_lo1_0 + 19 * ymx1_c1_9
+    let ymx2_a0 = g.y2_0 + 134217690 - g.x2_0
+    let ymx2_a1 = g.y2_1 + 67108862 - g.x2_1
+    let ymx2_a2 = g.y2_2 + 134217726 - g.x2_2
+    let ymx2_a3 = g.y2_3 + 67108862 - g.x2_3
+    let ymx2_a4 = g.y2_4 + 134217726 - g.x2_4
+    let ymx2_a5 = g.y2_5 + 67108862 - g.x2_5
+    let ymx2_a6 = g.y2_6 + 134217726 - g.x2_6
+    let ymx2_a7 = g.y2_7 + 67108862 - g.x2_7
+    let ymx2_a8 = g.y2_8 + 134217726 - g.x2_8
+    let ymx2_a9 = g.y2_9 + 67108862 - g.x2_9
+    let ymx2_c0_0 = shr(ymx2_a0, 26)
+    let ymx2_lo0_0 = band(ymx2_a0, 67108863)
+    let ymx2_s0_0 = ymx2_a1 + ymx2_c0_0
+    let ymx2_c0_1 = shr(ymx2_s0_0, 25)
+    let ymx2_lo0_1 = band(ymx2_s0_0, 33554431)
+    let ymx2_s0_1 = ymx2_a2 + ymx2_c0_1
+    let ymx2_c0_2 = shr(ymx2_s0_1, 26)
+    let ymx2_lo0_2 = band(ymx2_s0_1, 67108863)
+    let ymx2_s0_2 = ymx2_a3 + ymx2_c0_2
+    let ymx2_c0_3 = shr(ymx2_s0_2, 25)
+    let ymx2_lo0_3 = band(ymx2_s0_2, 33554431)
+    let ymx2_s0_3 = ymx2_a4 + ymx2_c0_3
+    let ymx2_c0_4 = shr(ymx2_s0_3, 26)
+    let ymx2_lo0_4 = band(ymx2_s0_3, 67108863)
+    let ymx2_s0_4 = ymx2_a5 + ymx2_c0_4
+    let ymx2_c0_5 = shr(ymx2_s0_4, 25)
+    let ymx2_lo0_5 = band(ymx2_s0_4, 33554431)
+    let ymx2_s0_5 = ymx2_a6 + ymx2_c0_5
+    let ymx2_c0_6 = shr(ymx2_s0_5, 26)
+    let ymx2_lo0_6 = band(ymx2_s0_5, 67108863)
+    let ymx2_s0_6 = ymx2_a7 + ymx2_c0_6
+    let ymx2_c0_7 = shr(ymx2_s0_6, 25)
+    let ymx2_lo0_7 = band(ymx2_s0_6, 33554431)
+    let ymx2_s0_7 = ymx2_a8 + ymx2_c0_7
+    let ymx2_c0_8 = shr(ymx2_s0_7, 26)
+    let ymx2_lo0_8 = band(ymx2_s0_7, 67108863)
+    let ymx2_s0_8 = ymx2_a9 + ymx2_c0_8
+    let ymx2_c0_9 = shr(ymx2_s0_8, 25)
+    let ymx2_lo0_9 = band(ymx2_s0_8, 33554431)
+    let ymx2_w0 = ymx2_lo0_0 + 19 * ymx2_c0_9
+    let ymx2_c1_0 = shr(ymx2_w0, 26)
+    let ymx2_lo1_0 = band(ymx2_w0, 67108863)
+    let ymx2_s1_0 = ymx2_lo0_1 + ymx2_c1_0
+    let ymx2_c1_1 = shr(ymx2_s1_0, 25)
+    let ymx2_lo1_1 = band(ymx2_s1_0, 33554431)
+    let ymx2_s1_1 = ymx2_lo0_2 + ymx2_c1_1
+    let ymx2_c1_2 = shr(ymx2_s1_1, 26)
+    let ymx2_lo1_2 = band(ymx2_s1_1, 67108863)
+    let ymx2_s1_2 = ymx2_lo0_3 + ymx2_c1_2
+    let ymx2_c1_3 = shr(ymx2_s1_2, 25)
+    let ymx2_lo1_3 = band(ymx2_s1_2, 33554431)
+    let ymx2_s1_3 = ymx2_lo0_4 + ymx2_c1_3
+    let ymx2_c1_4 = shr(ymx2_s1_3, 26)
+    let ymx2_lo1_4 = band(ymx2_s1_3, 67108863)
+    let ymx2_s1_4 = ymx2_lo0_5 + ymx2_c1_4
+    let ymx2_c1_5 = shr(ymx2_s1_4, 25)
+    let ymx2_lo1_5 = band(ymx2_s1_4, 33554431)
+    let ymx2_s1_5 = ymx2_lo0_6 + ymx2_c1_5
+    let ymx2_c1_6 = shr(ymx2_s1_5, 26)
+    let ymx2_lo1_6 = band(ymx2_s1_5, 67108863)
+    let ymx2_s1_6 = ymx2_lo0_7 + ymx2_c1_6
+    let ymx2_c1_7 = shr(ymx2_s1_6, 25)
+    let ymx2_lo1_7 = band(ymx2_s1_6, 33554431)
+    let ymx2_s1_7 = ymx2_lo0_8 + ymx2_c1_7
+    let ymx2_c1_8 = shr(ymx2_s1_7, 26)
+    let ymx2_lo1_8 = band(ymx2_s1_7, 67108863)
+    let ymx2_s1_8 = ymx2_lo0_9 + ymx2_c1_8
+    let ymx2_c1_9 = shr(ymx2_s1_8, 25)
+    let ymx2_lo1_9 = band(ymx2_s1_8, 33554431)
+    let ymx2_w1 = ymx2_lo1_0 + 19 * ymx2_c1_9
+    let A_a0 = (ymx1_w1 * ymx2_w1) + 38 * (ymx1_lo1_1 * ymx2_lo1_9) + 19 * (ymx1_lo1_2 * ymx2_lo1_8) + 38 * (ymx1_lo1_3 * ymx2_lo1_7) + 19 * (ymx1_lo1_4 * ymx2_lo1_6) + 38 * (ymx1_lo1_5 * ymx2_lo1_5) + 19 * (ymx1_lo1_6 * ymx2_lo1_4) + 38 * (ymx1_lo1_7 * ymx2_lo1_3) + 19 * (ymx1_lo1_8 * ymx2_lo1_2) + 38 * (ymx1_lo1_9 * ymx2_lo1_1)
+    let A_a1 = (ymx1_w1 * ymx2_lo1_1) + (ymx1_lo1_1 * ymx2_w1) + 19 * (ymx1_lo1_2 * ymx2_lo1_9) + 19 * (ymx1_lo1_3 * ymx2_lo1_8) + 19 * (ymx1_lo1_4 * ymx2_lo1_7) + 19 * (ymx1_lo1_5 * ymx2_lo1_6) + 19 * (ymx1_lo1_6 * ymx2_lo1_5) + 19 * (ymx1_lo1_7 * ymx2_lo1_4) + 19 * (ymx1_lo1_8 * ymx2_lo1_3) + 19 * (ymx1_lo1_9 * ymx2_lo1_2)
+    let A_a2 = (ymx1_w1 * ymx2_lo1_2) + 2 * (ymx1_lo1_1 * ymx2_lo1_1) + (ymx1_lo1_2 * ymx2_w1) + 38 * (ymx1_lo1_3 * ymx2_lo1_9) + 19 * (ymx1_lo1_4 * ymx2_lo1_8) + 38 * (ymx1_lo1_5 * ymx2_lo1_7) + 19 * (ymx1_lo1_6 * ymx2_lo1_6) + 38 * (ymx1_lo1_7 * ymx2_lo1_5) + 19 * (ymx1_lo1_8 * ymx2_lo1_4) + 38 * (ymx1_lo1_9 * ymx2_lo1_3)
+    let A_a3 = (ymx1_w1 * ymx2_lo1_3) + (ymx1_lo1_1 * ymx2_lo1_2) + (ymx1_lo1_2 * ymx2_lo1_1) + (ymx1_lo1_3 * ymx2_w1) + 19 * (ymx1_lo1_4 * ymx2_lo1_9) + 19 * (ymx1_lo1_5 * ymx2_lo1_8) + 19 * (ymx1_lo1_6 * ymx2_lo1_7) + 19 * (ymx1_lo1_7 * ymx2_lo1_6) + 19 * (ymx1_lo1_8 * ymx2_lo1_5) + 19 * (ymx1_lo1_9 * ymx2_lo1_4)
+    let A_a4 = (ymx1_w1 * ymx2_lo1_4) + 2 * (ymx1_lo1_1 * ymx2_lo1_3) + (ymx1_lo1_2 * ymx2_lo1_2) + 2 * (ymx1_lo1_3 * ymx2_lo1_1) + (ymx1_lo1_4 * ymx2_w1) + 38 * (ymx1_lo1_5 * ymx2_lo1_9) + 19 * (ymx1_lo1_6 * ymx2_lo1_8) + 38 * (ymx1_lo1_7 * ymx2_lo1_7) + 19 * (ymx1_lo1_8 * ymx2_lo1_6) + 38 * (ymx1_lo1_9 * ymx2_lo1_5)
+    let A_a5 = (ymx1_w1 * ymx2_lo1_5) + (ymx1_lo1_1 * ymx2_lo1_4) + (ymx1_lo1_2 * ymx2_lo1_3) + (ymx1_lo1_3 * ymx2_lo1_2) + (ymx1_lo1_4 * ymx2_lo1_1) + (ymx1_lo1_5 * ymx2_w1) + 19 * (ymx1_lo1_6 * ymx2_lo1_9) + 19 * (ymx1_lo1_7 * ymx2_lo1_8) + 19 * (ymx1_lo1_8 * ymx2_lo1_7) + 19 * (ymx1_lo1_9 * ymx2_lo1_6)
+    let A_a6 = (ymx1_w1 * ymx2_lo1_6) + 2 * (ymx1_lo1_1 * ymx2_lo1_5) + (ymx1_lo1_2 * ymx2_lo1_4) + 2 * (ymx1_lo1_3 * ymx2_lo1_3) + (ymx1_lo1_4 * ymx2_lo1_2) + 2 * (ymx1_lo1_5 * ymx2_lo1_1) + (ymx1_lo1_6 * ymx2_w1) + 38 * (ymx1_lo1_7 * ymx2_lo1_9) + 19 * (ymx1_lo1_8 * ymx2_lo1_8) + 38 * (ymx1_lo1_9 * ymx2_lo1_7)
+    let A_a7 = (ymx1_w1 * ymx2_lo1_7) + (ymx1_lo1_1 * ymx2_lo1_6) + (ymx1_lo1_2 * ymx2_lo1_5) + (ymx1_lo1_3 * ymx2_lo1_4) + (ymx1_lo1_4 * ymx2_lo1_3) + (ymx1_lo1_5 * ymx2_lo1_2) + (ymx1_lo1_6 * ymx2_lo1_1) + (ymx1_lo1_7 * ymx2_w1) + 19 * (ymx1_lo1_8 * ymx2_lo1_9) + 19 * (ymx1_lo1_9 * ymx2_lo1_8)
+    let A_a8 = (ymx1_w1 * ymx2_lo1_8) + 2 * (ymx1_lo1_1 * ymx2_lo1_7) + (ymx1_lo1_2 * ymx2_lo1_6) + 2 * (ymx1_lo1_3 * ymx2_lo1_5) + (ymx1_lo1_4 * ymx2_lo1_4) + 2 * (ymx1_lo1_5 * ymx2_lo1_3) + (ymx1_lo1_6 * ymx2_lo1_2) + 2 * (ymx1_lo1_7 * ymx2_lo1_1) + (ymx1_lo1_8 * ymx2_w1) + 38 * (ymx1_lo1_9 * ymx2_lo1_9)
+    let A_a9 = (ymx1_w1 * ymx2_lo1_9) + (ymx1_lo1_1 * ymx2_lo1_8) + (ymx1_lo1_2 * ymx2_lo1_7) + (ymx1_lo1_3 * ymx2_lo1_6) + (ymx1_lo1_4 * ymx2_lo1_5) + (ymx1_lo1_5 * ymx2_lo1_4) + (ymx1_lo1_6 * ymx2_lo1_3) + (ymx1_lo1_7 * ymx2_lo1_2) + (ymx1_lo1_8 * ymx2_lo1_1) + (ymx1_lo1_9 * ymx2_w1)
+    let A_c0_0 = shr(A_a0, 26)
+    let A_lo0_0 = band(A_a0, 67108863)
+    let A_s0_0 = A_a1 + A_c0_0
+    let A_c0_1 = shr(A_s0_0, 25)
+    let A_lo0_1 = band(A_s0_0, 33554431)
+    let A_s0_1 = A_a2 + A_c0_1
+    let A_c0_2 = shr(A_s0_1, 26)
+    let A_lo0_2 = band(A_s0_1, 67108863)
+    let A_s0_2 = A_a3 + A_c0_2
+    let A_c0_3 = shr(A_s0_2, 25)
+    let A_lo0_3 = band(A_s0_2, 33554431)
+    let A_s0_3 = A_a4 + A_c0_3
+    let A_c0_4 = shr(A_s0_3, 26)
+    let A_lo0_4 = band(A_s0_3, 67108863)
+    let A_s0_4 = A_a5 + A_c0_4
+    let A_c0_5 = shr(A_s0_4, 25)
+    let A_lo0_5 = band(A_s0_4, 33554431)
+    let A_s0_5 = A_a6 + A_c0_5
+    let A_c0_6 = shr(A_s0_5, 26)
+    let A_lo0_6 = band(A_s0_5, 67108863)
+    let A_s0_6 = A_a7 + A_c0_6
+    let A_c0_7 = shr(A_s0_6, 25)
+    let A_lo0_7 = band(A_s0_6, 33554431)
+    let A_s0_7 = A_a8 + A_c0_7
+    let A_c0_8 = shr(A_s0_7, 26)
+    let A_lo0_8 = band(A_s0_7, 67108863)
+    let A_s0_8 = A_a9 + A_c0_8
+    let A_c0_9 = shr(A_s0_8, 25)
+    let A_lo0_9 = band(A_s0_8, 33554431)
+    let A_w0 = A_lo0_0 + 19 * A_c0_9
+    let A_c1_0 = shr(A_w0, 26)
+    let A_lo1_0 = band(A_w0, 67108863)
+    let A_s1_0 = A_lo0_1 + A_c1_0
+    let A_c1_1 = shr(A_s1_0, 25)
+    let A_lo1_1 = band(A_s1_0, 33554431)
+    let A_s1_1 = A_lo0_2 + A_c1_1
+    let A_c1_2 = shr(A_s1_1, 26)
+    let A_lo1_2 = band(A_s1_1, 67108863)
+    let A_s1_2 = A_lo0_3 + A_c1_2
+    let A_c1_3 = shr(A_s1_2, 25)
+    let A_lo1_3 = band(A_s1_2, 33554431)
+    let A_s1_3 = A_lo0_4 + A_c1_3
+    let A_c1_4 = shr(A_s1_3, 26)
+    let A_lo1_4 = band(A_s1_3, 67108863)
+    let A_s1_4 = A_lo0_5 + A_c1_4
+    let A_c1_5 = shr(A_s1_4, 25)
+    let A_lo1_5 = band(A_s1_4, 33554431)
+    let A_s1_5 = A_lo0_6 + A_c1_5
+    let A_c1_6 = shr(A_s1_5, 26)
+    let A_lo1_6 = band(A_s1_5, 67108863)
+    let A_s1_6 = A_lo0_7 + A_c1_6
+    let A_c1_7 = shr(A_s1_6, 25)
+    let A_lo1_7 = band(A_s1_6, 33554431)
+    let A_s1_7 = A_lo0_8 + A_c1_7
+    let A_c1_8 = shr(A_s1_7, 26)
+    let A_lo1_8 = band(A_s1_7, 67108863)
+    let A_s1_8 = A_lo0_9 + A_c1_8
+    let A_c1_9 = shr(A_s1_8, 25)
+    let A_lo1_9 = band(A_s1_8, 33554431)
+    let A_w1 = A_lo1_0 + 19 * A_c1_9
+    let ypx1_a0 = g.y1_0 + g.x1_0
+    let ypx1_a1 = g.y1_1 + g.x1_1
+    let ypx1_a2 = g.y1_2 + g.x1_2
+    let ypx1_a3 = g.y1_3 + g.x1_3
+    let ypx1_a4 = g.y1_4 + g.x1_4
+    let ypx1_a5 = g.y1_5 + g.x1_5
+    let ypx1_a6 = g.y1_6 + g.x1_6
+    let ypx1_a7 = g.y1_7 + g.x1_7
+    let ypx1_a8 = g.y1_8 + g.x1_8
+    let ypx1_a9 = g.y1_9 + g.x1_9
+    let ypx1_c0_0 = shr(ypx1_a0, 26)
+    let ypx1_lo0_0 = band(ypx1_a0, 67108863)
+    let ypx1_s0_0 = ypx1_a1 + ypx1_c0_0
+    let ypx1_c0_1 = shr(ypx1_s0_0, 25)
+    let ypx1_lo0_1 = band(ypx1_s0_0, 33554431)
+    let ypx1_s0_1 = ypx1_a2 + ypx1_c0_1
+    let ypx1_c0_2 = shr(ypx1_s0_1, 26)
+    let ypx1_lo0_2 = band(ypx1_s0_1, 67108863)
+    let ypx1_s0_2 = ypx1_a3 + ypx1_c0_2
+    let ypx1_c0_3 = shr(ypx1_s0_2, 25)
+    let ypx1_lo0_3 = band(ypx1_s0_2, 33554431)
+    let ypx1_s0_3 = ypx1_a4 + ypx1_c0_3
+    let ypx1_c0_4 = shr(ypx1_s0_3, 26)
+    let ypx1_lo0_4 = band(ypx1_s0_3, 67108863)
+    let ypx1_s0_4 = ypx1_a5 + ypx1_c0_4
+    let ypx1_c0_5 = shr(ypx1_s0_4, 25)
+    let ypx1_lo0_5 = band(ypx1_s0_4, 33554431)
+    let ypx1_s0_5 = ypx1_a6 + ypx1_c0_5
+    let ypx1_c0_6 = shr(ypx1_s0_5, 26)
+    let ypx1_lo0_6 = band(ypx1_s0_5, 67108863)
+    let ypx1_s0_6 = ypx1_a7 + ypx1_c0_6
+    let ypx1_c0_7 = shr(ypx1_s0_6, 25)
+    let ypx1_lo0_7 = band(ypx1_s0_6, 33554431)
+    let ypx1_s0_7 = ypx1_a8 + ypx1_c0_7
+    let ypx1_c0_8 = shr(ypx1_s0_7, 26)
+    let ypx1_lo0_8 = band(ypx1_s0_7, 67108863)
+    let ypx1_s0_8 = ypx1_a9 + ypx1_c0_8
+    let ypx1_c0_9 = shr(ypx1_s0_8, 25)
+    let ypx1_lo0_9 = band(ypx1_s0_8, 33554431)
+    let ypx1_w0 = ypx1_lo0_0 + 19 * ypx1_c0_9
+    let ypx1_c1_0 = shr(ypx1_w0, 26)
+    let ypx1_lo1_0 = band(ypx1_w0, 67108863)
+    let ypx1_s1_0 = ypx1_lo0_1 + ypx1_c1_0
+    let ypx1_c1_1 = shr(ypx1_s1_0, 25)
+    let ypx1_lo1_1 = band(ypx1_s1_0, 33554431)
+    let ypx1_s1_1 = ypx1_lo0_2 + ypx1_c1_1
+    let ypx1_c1_2 = shr(ypx1_s1_1, 26)
+    let ypx1_lo1_2 = band(ypx1_s1_1, 67108863)
+    let ypx1_s1_2 = ypx1_lo0_3 + ypx1_c1_2
+    let ypx1_c1_3 = shr(ypx1_s1_2, 25)
+    let ypx1_lo1_3 = band(ypx1_s1_2, 33554431)
+    let ypx1_s1_3 = ypx1_lo0_4 + ypx1_c1_3
+    let ypx1_c1_4 = shr(ypx1_s1_3, 26)
+    let ypx1_lo1_4 = band(ypx1_s1_3, 67108863)
+    let ypx1_s1_4 = ypx1_lo0_5 + ypx1_c1_4
+    let ypx1_c1_5 = shr(ypx1_s1_4, 25)
+    let ypx1_lo1_5 = band(ypx1_s1_4, 33554431)
+    let ypx1_s1_5 = ypx1_lo0_6 + ypx1_c1_5
+    let ypx1_c1_6 = shr(ypx1_s1_5, 26)
+    let ypx1_lo1_6 = band(ypx1_s1_5, 67108863)
+    let ypx1_s1_6 = ypx1_lo0_7 + ypx1_c1_6
+    let ypx1_c1_7 = shr(ypx1_s1_6, 25)
+    let ypx1_lo1_7 = band(ypx1_s1_6, 33554431)
+    let ypx1_s1_7 = ypx1_lo0_8 + ypx1_c1_7
+    let ypx1_c1_8 = shr(ypx1_s1_7, 26)
+    let ypx1_lo1_8 = band(ypx1_s1_7, 67108863)
+    let ypx1_s1_8 = ypx1_lo0_9 + ypx1_c1_8
+    let ypx1_c1_9 = shr(ypx1_s1_8, 25)
+    let ypx1_lo1_9 = band(ypx1_s1_8, 33554431)
+    let ypx1_w1 = ypx1_lo1_0 + 19 * ypx1_c1_9
+    let ypx2_a0 = g.y2_0 + g.x2_0
+    let ypx2_a1 = g.y2_1 + g.x2_1
+    let ypx2_a2 = g.y2_2 + g.x2_2
+    let ypx2_a3 = g.y2_3 + g.x2_3
+    let ypx2_a4 = g.y2_4 + g.x2_4
+    let ypx2_a5 = g.y2_5 + g.x2_5
+    let ypx2_a6 = g.y2_6 + g.x2_6
+    let ypx2_a7 = g.y2_7 + g.x2_7
+    let ypx2_a8 = g.y2_8 + g.x2_8
+    let ypx2_a9 = g.y2_9 + g.x2_9
+    let ypx2_c0_0 = shr(ypx2_a0, 26)
+    let ypx2_lo0_0 = band(ypx2_a0, 67108863)
+    let ypx2_s0_0 = ypx2_a1 + ypx2_c0_0
+    let ypx2_c0_1 = shr(ypx2_s0_0, 25)
+    let ypx2_lo0_1 = band(ypx2_s0_0, 33554431)
+    let ypx2_s0_1 = ypx2_a2 + ypx2_c0_1
+    let ypx2_c0_2 = shr(ypx2_s0_1, 26)
+    let ypx2_lo0_2 = band(ypx2_s0_1, 67108863)
+    let ypx2_s0_2 = ypx2_a3 + ypx2_c0_2
+    let ypx2_c0_3 = shr(ypx2_s0_2, 25)
+    let ypx2_lo0_3 = band(ypx2_s0_2, 33554431)
+    let ypx2_s0_3 = ypx2_a4 + ypx2_c0_3
+    let ypx2_c0_4 = shr(ypx2_s0_3, 26)
+    let ypx2_lo0_4 = band(ypx2_s0_3, 67108863)
+    let ypx2_s0_4 = ypx2_a5 + ypx2_c0_4
+    let ypx2_c0_5 = shr(ypx2_s0_4, 25)
+    let ypx2_lo0_5 = band(ypx2_s0_4, 33554431)
+    let ypx2_s0_5 = ypx2_a6 + ypx2_c0_5
+    let ypx2_c0_6 = shr(ypx2_s0_5, 26)
+    let ypx2_lo0_6 = band(ypx2_s0_5, 67108863)
+    let ypx2_s0_6 = ypx2_a7 + ypx2_c0_6
+    let ypx2_c0_7 = shr(ypx2_s0_6, 25)
+    let ypx2_lo0_7 = band(ypx2_s0_6, 33554431)
+    let ypx2_s0_7 = ypx2_a8 + ypx2_c0_7
+    let ypx2_c0_8 = shr(ypx2_s0_7, 26)
+    let ypx2_lo0_8 = band(ypx2_s0_7, 67108863)
+    let ypx2_s0_8 = ypx2_a9 + ypx2_c0_8
+    let ypx2_c0_9 = shr(ypx2_s0_8, 25)
+    let ypx2_lo0_9 = band(ypx2_s0_8, 33554431)
+    let ypx2_w0 = ypx2_lo0_0 + 19 * ypx2_c0_9
+    let ypx2_c1_0 = shr(ypx2_w0, 26)
+    let ypx2_lo1_0 = band(ypx2_w0, 67108863)
+    let ypx2_s1_0 = ypx2_lo0_1 + ypx2_c1_0
+    let ypx2_c1_1 = shr(ypx2_s1_0, 25)
+    let ypx2_lo1_1 = band(ypx2_s1_0, 33554431)
+    let ypx2_s1_1 = ypx2_lo0_2 + ypx2_c1_1
+    let ypx2_c1_2 = shr(ypx2_s1_1, 26)
+    let ypx2_lo1_2 = band(ypx2_s1_1, 67108863)
+    let ypx2_s1_2 = ypx2_lo0_3 + ypx2_c1_2
+    let ypx2_c1_3 = shr(ypx2_s1_2, 25)
+    let ypx2_lo1_3 = band(ypx2_s1_2, 33554431)
+    let ypx2_s1_3 = ypx2_lo0_4 + ypx2_c1_3
+    let ypx2_c1_4 = shr(ypx2_s1_3, 26)
+    let ypx2_lo1_4 = band(ypx2_s1_3, 67108863)
+    let ypx2_s1_4 = ypx2_lo0_5 + ypx2_c1_4
+    let ypx2_c1_5 = shr(ypx2_s1_4, 25)
+    let ypx2_lo1_5 = band(ypx2_s1_4, 33554431)
+    let ypx2_s1_5 = ypx2_lo0_6 + ypx2_c1_5
+    let ypx2_c1_6 = shr(ypx2_s1_5, 26)
+    let ypx2_lo1_6 = band(ypx2_s1_5, 67108863)
+    let ypx2_s1_6 = ypx2_lo0_7 + ypx2_c1_6
+    let ypx2_c1_7 = shr(ypx2_s1_6, 25)
+    let ypx2_lo1_7 = band(ypx2_s1_6, 33554431)
+    let ypx2_s1_7 = ypx2_lo0_8 + ypx2_c1_7
+    let ypx2_c1_8 = shr(ypx2_s1_7, 26)
+    let ypx2_lo1_8 = band(ypx2_s1_7, 67108863)
+    let ypx2_s1_8 = ypx2_lo0_9 + ypx2_c1_8
+    let ypx2_c1_9 = shr(ypx2_s1_8, 25)
+    let ypx2_lo1_9 = band(ypx2_s1_8, 33554431)
+    let ypx2_w1 = ypx2_lo1_0 + 19 * ypx2_c1_9
+    let B_a0 = (ypx1_w1 * ypx2_w1) + 38 * (ypx1_lo1_1 * ypx2_lo1_9) + 19 * (ypx1_lo1_2 * ypx2_lo1_8) + 38 * (ypx1_lo1_3 * ypx2_lo1_7) + 19 * (ypx1_lo1_4 * ypx2_lo1_6) + 38 * (ypx1_lo1_5 * ypx2_lo1_5) + 19 * (ypx1_lo1_6 * ypx2_lo1_4) + 38 * (ypx1_lo1_7 * ypx2_lo1_3) + 19 * (ypx1_lo1_8 * ypx2_lo1_2) + 38 * (ypx1_lo1_9 * ypx2_lo1_1)
+    let B_a1 = (ypx1_w1 * ypx2_lo1_1) + (ypx1_lo1_1 * ypx2_w1) + 19 * (ypx1_lo1_2 * ypx2_lo1_9) + 19 * (ypx1_lo1_3 * ypx2_lo1_8) + 19 * (ypx1_lo1_4 * ypx2_lo1_7) + 19 * (ypx1_lo1_5 * ypx2_lo1_6) + 19 * (ypx1_lo1_6 * ypx2_lo1_5) + 19 * (ypx1_lo1_7 * ypx2_lo1_4) + 19 * (ypx1_lo1_8 * ypx2_lo1_3) + 19 * (ypx1_lo1_9 * ypx2_lo1_2)
+    let B_a2 = (ypx1_w1 * ypx2_lo1_2) + 2 * (ypx1_lo1_1 * ypx2_lo1_1) + (ypx1_lo1_2 * ypx2_w1) + 38 * (ypx1_lo1_3 * ypx2_lo1_9) + 19 * (ypx1_lo1_4 * ypx2_lo1_8) + 38 * (ypx1_lo1_5 * ypx2_lo1_7) + 19 * (ypx1_lo1_6 * ypx2_lo1_6) + 38 * (ypx1_lo1_7 * ypx2_lo1_5) + 19 * (ypx1_lo1_8 * ypx2_lo1_4) + 38 * (ypx1_lo1_9 * ypx2_lo1_3)
+    let B_a3 = (ypx1_w1 * ypx2_lo1_3) + (ypx1_lo1_1 * ypx2_lo1_2) + (ypx1_lo1_2 * ypx2_lo1_1) + (ypx1_lo1_3 * ypx2_w1) + 19 * (ypx1_lo1_4 * ypx2_lo1_9) + 19 * (ypx1_lo1_5 * ypx2_lo1_8) + 19 * (ypx1_lo1_6 * ypx2_lo1_7) + 19 * (ypx1_lo1_7 * ypx2_lo1_6) + 19 * (ypx1_lo1_8 * ypx2_lo1_5) + 19 * (ypx1_lo1_9 * ypx2_lo1_4)
+    let B_a4 = (ypx1_w1 * ypx2_lo1_4) + 2 * (ypx1_lo1_1 * ypx2_lo1_3) + (ypx1_lo1_2 * ypx2_lo1_2) + 2 * (ypx1_lo1_3 * ypx2_lo1_1) + (ypx1_lo1_4 * ypx2_w1) + 38 * (ypx1_lo1_5 * ypx2_lo1_9) + 19 * (ypx1_lo1_6 * ypx2_lo1_8) + 38 * (ypx1_lo1_7 * ypx2_lo1_7) + 19 * (ypx1_lo1_8 * ypx2_lo1_6) + 38 * (ypx1_lo1_9 * ypx2_lo1_5)
+    let B_a5 = (ypx1_w1 * ypx2_lo1_5) + (ypx1_lo1_1 * ypx2_lo1_4) + (ypx1_lo1_2 * ypx2_lo1_3) + (ypx1_lo1_3 * ypx2_lo1_2) + (ypx1_lo1_4 * ypx2_lo1_1) + (ypx1_lo1_5 * ypx2_w1) + 19 * (ypx1_lo1_6 * ypx2_lo1_9) + 19 * (ypx1_lo1_7 * ypx2_lo1_8) + 19 * (ypx1_lo1_8 * ypx2_lo1_7) + 19 * (ypx1_lo1_9 * ypx2_lo1_6)
+    let B_a6 = (ypx1_w1 * ypx2_lo1_6) + 2 * (ypx1_lo1_1 * ypx2_lo1_5) + (ypx1_lo1_2 * ypx2_lo1_4) + 2 * (ypx1_lo1_3 * ypx2_lo1_3) + (ypx1_lo1_4 * ypx2_lo1_2) + 2 * (ypx1_lo1_5 * ypx2_lo1_1) + (ypx1_lo1_6 * ypx2_w1) + 38 * (ypx1_lo1_7 * ypx2_lo1_9) + 19 * (ypx1_lo1_8 * ypx2_lo1_8) + 38 * (ypx1_lo1_9 * ypx2_lo1_7)
+    let B_a7 = (ypx1_w1 * ypx2_lo1_7) + (ypx1_lo1_1 * ypx2_lo1_6) + (ypx1_lo1_2 * ypx2_lo1_5) + (ypx1_lo1_3 * ypx2_lo1_4) + (ypx1_lo1_4 * ypx2_lo1_3) + (ypx1_lo1_5 * ypx2_lo1_2) + (ypx1_lo1_6 * ypx2_lo1_1) + (ypx1_lo1_7 * ypx2_w1) + 19 * (ypx1_lo1_8 * ypx2_lo1_9) + 19 * (ypx1_lo1_9 * ypx2_lo1_8)
+    let B_a8 = (ypx1_w1 * ypx2_lo1_8) + 2 * (ypx1_lo1_1 * ypx2_lo1_7) + (ypx1_lo1_2 * ypx2_lo1_6) + 2 * (ypx1_lo1_3 * ypx2_lo1_5) + (ypx1_lo1_4 * ypx2_lo1_4) + 2 * (ypx1_lo1_5 * ypx2_lo1_3) + (ypx1_lo1_6 * ypx2_lo1_2) + 2 * (ypx1_lo1_7 * ypx2_lo1_1) + (ypx1_lo1_8 * ypx2_w1) + 38 * (ypx1_lo1_9 * ypx2_lo1_9)
+    let B_a9 = (ypx1_w1 * ypx2_lo1_9) + (ypx1_lo1_1 * ypx2_lo1_8) + (ypx1_lo1_2 * ypx2_lo1_7) + (ypx1_lo1_3 * ypx2_lo1_6) + (ypx1_lo1_4 * ypx2_lo1_5) + (ypx1_lo1_5 * ypx2_lo1_4) + (ypx1_lo1_6 * ypx2_lo1_3) + (ypx1_lo1_7 * ypx2_lo1_2) + (ypx1_lo1_8 * ypx2_lo1_1) + (ypx1_lo1_9 * ypx2_w1)
+    let B_c0_0 = shr(B_a0, 26)
+    let B_lo0_0 = band(B_a0, 67108863)
+    let B_s0_0 = B_a1 + B_c0_0
+    let B_c0_1 = shr(B_s0_0, 25)
+    let B_lo0_1 = band(B_s0_0, 33554431)
+    let B_s0_1 = B_a2 + B_c0_1
+    let B_c0_2 = shr(B_s0_1, 26)
+    let B_lo0_2 = band(B_s0_1, 67108863)
+    let B_s0_2 = B_a3 + B_c0_2
+    let B_c0_3 = shr(B_s0_2, 25)
+    let B_lo0_3 = band(B_s0_2, 33554431)
+    let B_s0_3 = B_a4 + B_c0_3
+    let B_c0_4 = shr(B_s0_3, 26)
+    let B_lo0_4 = band(B_s0_3, 67108863)
+    let B_s0_4 = B_a5 + B_c0_4
+    let B_c0_5 = shr(B_s0_4, 25)
+    let B_lo0_5 = band(B_s0_4, 33554431)
+    let B_s0_5 = B_a6 + B_c0_5
+    let B_c0_6 = shr(B_s0_5, 26)
+    let B_lo0_6 = band(B_s0_5, 67108863)
+    let B_s0_6 = B_a7 + B_c0_6
+    let B_c0_7 = shr(B_s0_6, 25)
+    let B_lo0_7 = band(B_s0_6, 33554431)
+    let B_s0_7 = B_a8 + B_c0_7
+    let B_c0_8 = shr(B_s0_7, 26)
+    let B_lo0_8 = band(B_s0_7, 67108863)
+    let B_s0_8 = B_a9 + B_c0_8
+    let B_c0_9 = shr(B_s0_8, 25)
+    let B_lo0_9 = band(B_s0_8, 33554431)
+    let B_w0 = B_lo0_0 + 19 * B_c0_9
+    let B_c1_0 = shr(B_w0, 26)
+    let B_lo1_0 = band(B_w0, 67108863)
+    let B_s1_0 = B_lo0_1 + B_c1_0
+    let B_c1_1 = shr(B_s1_0, 25)
+    let B_lo1_1 = band(B_s1_0, 33554431)
+    let B_s1_1 = B_lo0_2 + B_c1_1
+    let B_c1_2 = shr(B_s1_1, 26)
+    let B_lo1_2 = band(B_s1_1, 67108863)
+    let B_s1_2 = B_lo0_3 + B_c1_2
+    let B_c1_3 = shr(B_s1_2, 25)
+    let B_lo1_3 = band(B_s1_2, 33554431)
+    let B_s1_3 = B_lo0_4 + B_c1_3
+    let B_c1_4 = shr(B_s1_3, 26)
+    let B_lo1_4 = band(B_s1_3, 67108863)
+    let B_s1_4 = B_lo0_5 + B_c1_4
+    let B_c1_5 = shr(B_s1_4, 25)
+    let B_lo1_5 = band(B_s1_4, 33554431)
+    let B_s1_5 = B_lo0_6 + B_c1_5
+    let B_c1_6 = shr(B_s1_5, 26)
+    let B_lo1_6 = band(B_s1_5, 67108863)
+    let B_s1_6 = B_lo0_7 + B_c1_6
+    let B_c1_7 = shr(B_s1_6, 25)
+    let B_lo1_7 = band(B_s1_6, 33554431)
+    let B_s1_7 = B_lo0_8 + B_c1_7
+    let B_c1_8 = shr(B_s1_7, 26)
+    let B_lo1_8 = band(B_s1_7, 67108863)
+    let B_s1_8 = B_lo0_9 + B_c1_8
+    let B_c1_9 = shr(B_s1_8, 25)
+    let B_lo1_9 = band(B_s1_8, 33554431)
+    let B_w1 = B_lo1_0 + 19 * B_c1_9
+    let t1d_a0 = (g.t1_0 * 45281625) + 38 * (g.t1_1 * 9444199) + 19 * (g.t1_2 * 29715967) + 38 * (g.t1_3 * 27058993) + 19 * (g.t1_4 * 54557047) + 38 * (g.t1_5 * 15978800) + 19 * (g.t1_6 * 229458) + 38 * (g.t1_7 * 13898781) + 19 * (g.t1_8 * 36363642) + 38 * (g.t1_9 * 27714825)
+    let t1d_a1 = (g.t1_0 * 27714825) + (g.t1_1 * 45281625) + 19 * (g.t1_2 * 9444199) + 19 * (g.t1_3 * 29715967) + 19 * (g.t1_4 * 27058993) + 19 * (g.t1_5 * 54557047) + 19 * (g.t1_6 * 15978800) + 19 * (g.t1_7 * 229458) + 19 * (g.t1_8 * 13898781) + 19 * (g.t1_9 * 36363642)
+    let t1d_a2 = (g.t1_0 * 36363642) + 2 * (g.t1_1 * 27714825) + (g.t1_2 * 45281625) + 38 * (g.t1_3 * 9444199) + 19 * (g.t1_4 * 29715967) + 38 * (g.t1_5 * 27058993) + 19 * (g.t1_6 * 54557047) + 38 * (g.t1_7 * 15978800) + 19 * (g.t1_8 * 229458) + 38 * (g.t1_9 * 13898781)
+    let t1d_a3 = (g.t1_0 * 13898781) + (g.t1_1 * 36363642) + (g.t1_2 * 27714825) + (g.t1_3 * 45281625) + 19 * (g.t1_4 * 9444199) + 19 * (g.t1_5 * 29715967) + 19 * (g.t1_6 * 27058993) + 19 * (g.t1_7 * 54557047) + 19 * (g.t1_8 * 15978800) + 19 * (g.t1_9 * 229458)
+    let t1d_a4 = (g.t1_0 * 229458) + 2 * (g.t1_1 * 13898781) + (g.t1_2 * 36363642) + 2 * (g.t1_3 * 27714825) + (g.t1_4 * 45281625) + 38 * (g.t1_5 * 9444199) + 19 * (g.t1_6 * 29715967) + 38 * (g.t1_7 * 27058993) + 19 * (g.t1_8 * 54557047) + 38 * (g.t1_9 * 15978800)
+    let t1d_a5 = (g.t1_0 * 15978800) + (g.t1_1 * 229458) + (g.t1_2 * 13898781) + (g.t1_3 * 36363642) + (g.t1_4 * 27714825) + (g.t1_5 * 45281625) + 19 * (g.t1_6 * 9444199) + 19 * (g.t1_7 * 29715967) + 19 * (g.t1_8 * 27058993) + 19 * (g.t1_9 * 54557047)
+    let t1d_a6 = (g.t1_0 * 54557047) + 2 * (g.t1_1 * 15978800) + (g.t1_2 * 229458) + 2 * (g.t1_3 * 13898781) + (g.t1_4 * 36363642) + 2 * (g.t1_5 * 27714825) + (g.t1_6 * 45281625) + 38 * (g.t1_7 * 9444199) + 19 * (g.t1_8 * 29715967) + 38 * (g.t1_9 * 27058993)
+    let t1d_a7 = (g.t1_0 * 27058993) + (g.t1_1 * 54557047) + (g.t1_2 * 15978800) + (g.t1_3 * 229458) + (g.t1_4 * 13898781) + (g.t1_5 * 36363642) + (g.t1_6 * 27714825) + (g.t1_7 * 45281625) + 19 * (g.t1_8 * 9444199) + 19 * (g.t1_9 * 29715967)
+    let t1d_a8 = (g.t1_0 * 29715967) + 2 * (g.t1_1 * 27058993) + (g.t1_2 * 54557047) + 2 * (g.t1_3 * 15978800) + (g.t1_4 * 229458) + 2 * (g.t1_5 * 13898781) + (g.t1_6 * 36363642) + 2 * (g.t1_7 * 27714825) + (g.t1_8 * 45281625) + 38 * (g.t1_9 * 9444199)
+    let t1d_a9 = (g.t1_0 * 9444199) + (g.t1_1 * 29715967) + (g.t1_2 * 27058993) + (g.t1_3 * 54557047) + (g.t1_4 * 15978800) + (g.t1_5 * 229458) + (g.t1_6 * 13898781) + (g.t1_7 * 36363642) + (g.t1_8 * 27714825) + (g.t1_9 * 45281625)
+    let t1d_c0_0 = shr(t1d_a0, 26)
+    let t1d_lo0_0 = band(t1d_a0, 67108863)
+    let t1d_s0_0 = t1d_a1 + t1d_c0_0
+    let t1d_c0_1 = shr(t1d_s0_0, 25)
+    let t1d_lo0_1 = band(t1d_s0_0, 33554431)
+    let t1d_s0_1 = t1d_a2 + t1d_c0_1
+    let t1d_c0_2 = shr(t1d_s0_1, 26)
+    let t1d_lo0_2 = band(t1d_s0_1, 67108863)
+    let t1d_s0_2 = t1d_a3 + t1d_c0_2
+    let t1d_c0_3 = shr(t1d_s0_2, 25)
+    let t1d_lo0_3 = band(t1d_s0_2, 33554431)
+    let t1d_s0_3 = t1d_a4 + t1d_c0_3
+    let t1d_c0_4 = shr(t1d_s0_3, 26)
+    let t1d_lo0_4 = band(t1d_s0_3, 67108863)
+    let t1d_s0_4 = t1d_a5 + t1d_c0_4
+    let t1d_c0_5 = shr(t1d_s0_4, 25)
+    let t1d_lo0_5 = band(t1d_s0_4, 33554431)
+    let t1d_s0_5 = t1d_a6 + t1d_c0_5
+    let t1d_c0_6 = shr(t1d_s0_5, 26)
+    let t1d_lo0_6 = band(t1d_s0_5, 67108863)
+    let t1d_s0_6 = t1d_a7 + t1d_c0_6
+    let t1d_c0_7 = shr(t1d_s0_6, 25)
+    let t1d_lo0_7 = band(t1d_s0_6, 33554431)
+    let t1d_s0_7 = t1d_a8 + t1d_c0_7
+    let t1d_c0_8 = shr(t1d_s0_7, 26)
+    let t1d_lo0_8 = band(t1d_s0_7, 67108863)
+    let t1d_s0_8 = t1d_a9 + t1d_c0_8
+    let t1d_c0_9 = shr(t1d_s0_8, 25)
+    let t1d_lo0_9 = band(t1d_s0_8, 33554431)
+    let t1d_w0 = t1d_lo0_0 + 19 * t1d_c0_9
+    let t1d_c1_0 = shr(t1d_w0, 26)
+    let t1d_lo1_0 = band(t1d_w0, 67108863)
+    let t1d_s1_0 = t1d_lo0_1 + t1d_c1_0
+    let t1d_c1_1 = shr(t1d_s1_0, 25)
+    let t1d_lo1_1 = band(t1d_s1_0, 33554431)
+    let t1d_s1_1 = t1d_lo0_2 + t1d_c1_1
+    let t1d_c1_2 = shr(t1d_s1_1, 26)
+    let t1d_lo1_2 = band(t1d_s1_1, 67108863)
+    let t1d_s1_2 = t1d_lo0_3 + t1d_c1_2
+    let t1d_c1_3 = shr(t1d_s1_2, 25)
+    let t1d_lo1_3 = band(t1d_s1_2, 33554431)
+    let t1d_s1_3 = t1d_lo0_4 + t1d_c1_3
+    let t1d_c1_4 = shr(t1d_s1_3, 26)
+    let t1d_lo1_4 = band(t1d_s1_3, 67108863)
+    let t1d_s1_4 = t1d_lo0_5 + t1d_c1_4
+    let t1d_c1_5 = shr(t1d_s1_4, 25)
+    let t1d_lo1_5 = band(t1d_s1_4, 33554431)
+    let t1d_s1_5 = t1d_lo0_6 + t1d_c1_5
+    let t1d_c1_6 = shr(t1d_s1_5, 26)
+    let t1d_lo1_6 = band(t1d_s1_5, 67108863)
+    let t1d_s1_6 = t1d_lo0_7 + t1d_c1_6
+    let t1d_c1_7 = shr(t1d_s1_6, 25)
+    let t1d_lo1_7 = band(t1d_s1_6, 33554431)
+    let t1d_s1_7 = t1d_lo0_8 + t1d_c1_7
+    let t1d_c1_8 = shr(t1d_s1_7, 26)
+    let t1d_lo1_8 = band(t1d_s1_7, 67108863)
+    let t1d_s1_8 = t1d_lo0_9 + t1d_c1_8
+    let t1d_c1_9 = shr(t1d_s1_8, 25)
+    let t1d_lo1_9 = band(t1d_s1_8, 33554431)
+    let t1d_w1 = t1d_lo1_0 + 19 * t1d_c1_9
+    let C_a0 = (t1d_w1 * g.t2_0) + 38 * (t1d_lo1_1 * g.t2_9) + 19 * (t1d_lo1_2 * g.t2_8) + 38 * (t1d_lo1_3 * g.t2_7) + 19 * (t1d_lo1_4 * g.t2_6) + 38 * (t1d_lo1_5 * g.t2_5) + 19 * (t1d_lo1_6 * g.t2_4) + 38 * (t1d_lo1_7 * g.t2_3) + 19 * (t1d_lo1_8 * g.t2_2) + 38 * (t1d_lo1_9 * g.t2_1)
+    let C_a1 = (t1d_w1 * g.t2_1) + (t1d_lo1_1 * g.t2_0) + 19 * (t1d_lo1_2 * g.t2_9) + 19 * (t1d_lo1_3 * g.t2_8) + 19 * (t1d_lo1_4 * g.t2_7) + 19 * (t1d_lo1_5 * g.t2_6) + 19 * (t1d_lo1_6 * g.t2_5) + 19 * (t1d_lo1_7 * g.t2_4) + 19 * (t1d_lo1_8 * g.t2_3) + 19 * (t1d_lo1_9 * g.t2_2)
+    let C_a2 = (t1d_w1 * g.t2_2) + 2 * (t1d_lo1_1 * g.t2_1) + (t1d_lo1_2 * g.t2_0) + 38 * (t1d_lo1_3 * g.t2_9) + 19 * (t1d_lo1_4 * g.t2_8) + 38 * (t1d_lo1_5 * g.t2_7) + 19 * (t1d_lo1_6 * g.t2_6) + 38 * (t1d_lo1_7 * g.t2_5) + 19 * (t1d_lo1_8 * g.t2_4) + 38 * (t1d_lo1_9 * g.t2_3)
+    let C_a3 = (t1d_w1 * g.t2_3) + (t1d_lo1_1 * g.t2_2) + (t1d_lo1_2 * g.t2_1) + (t1d_lo1_3 * g.t2_0) + 19 * (t1d_lo1_4 * g.t2_9) + 19 * (t1d_lo1_5 * g.t2_8) + 19 * (t1d_lo1_6 * g.t2_7) + 19 * (t1d_lo1_7 * g.t2_6) + 19 * (t1d_lo1_8 * g.t2_5) + 19 * (t1d_lo1_9 * g.t2_4)
+    let C_a4 = (t1d_w1 * g.t2_4) + 2 * (t1d_lo1_1 * g.t2_3) + (t1d_lo1_2 * g.t2_2) + 2 * (t1d_lo1_3 * g.t2_1) + (t1d_lo1_4 * g.t2_0) + 38 * (t1d_lo1_5 * g.t2_9) + 19 * (t1d_lo1_6 * g.t2_8) + 38 * (t1d_lo1_7 * g.t2_7) + 19 * (t1d_lo1_8 * g.t2_6) + 38 * (t1d_lo1_9 * g.t2_5)
+    let C_a5 = (t1d_w1 * g.t2_5) + (t1d_lo1_1 * g.t2_4) + (t1d_lo1_2 * g.t2_3) + (t1d_lo1_3 * g.t2_2) + (t1d_lo1_4 * g.t2_1) + (t1d_lo1_5 * g.t2_0) + 19 * (t1d_lo1_6 * g.t2_9) + 19 * (t1d_lo1_7 * g.t2_8) + 19 * (t1d_lo1_8 * g.t2_7) + 19 * (t1d_lo1_9 * g.t2_6)
+    let C_a6 = (t1d_w1 * g.t2_6) + 2 * (t1d_lo1_1 * g.t2_5) + (t1d_lo1_2 * g.t2_4) + 2 * (t1d_lo1_3 * g.t2_3) + (t1d_lo1_4 * g.t2_2) + 2 * (t1d_lo1_5 * g.t2_1) + (t1d_lo1_6 * g.t2_0) + 38 * (t1d_lo1_7 * g.t2_9) + 19 * (t1d_lo1_8 * g.t2_8) + 38 * (t1d_lo1_9 * g.t2_7)
+    let C_a7 = (t1d_w1 * g.t2_7) + (t1d_lo1_1 * g.t2_6) + (t1d_lo1_2 * g.t2_5) + (t1d_lo1_3 * g.t2_4) + (t1d_lo1_4 * g.t2_3) + (t1d_lo1_5 * g.t2_2) + (t1d_lo1_6 * g.t2_1) + (t1d_lo1_7 * g.t2_0) + 19 * (t1d_lo1_8 * g.t2_9) + 19 * (t1d_lo1_9 * g.t2_8)
+    let C_a8 = (t1d_w1 * g.t2_8) + 2 * (t1d_lo1_1 * g.t2_7) + (t1d_lo1_2 * g.t2_6) + 2 * (t1d_lo1_3 * g.t2_5) + (t1d_lo1_4 * g.t2_4) + 2 * (t1d_lo1_5 * g.t2_3) + (t1d_lo1_6 * g.t2_2) + 2 * (t1d_lo1_7 * g.t2_1) + (t1d_lo1_8 * g.t2_0) + 38 * (t1d_lo1_9 * g.t2_9)
+    let C_a9 = (t1d_w1 * g.t2_9) + (t1d_lo1_1 * g.t2_8) + (t1d_lo1_2 * g.t2_7) + (t1d_lo1_3 * g.t2_6) + (t1d_lo1_4 * g.t2_5) + (t1d_lo1_5 * g.t2_4) + (t1d_lo1_6 * g.t2_3) + (t1d_lo1_7 * g.t2_2) + (t1d_lo1_8 * g.t2_1) + (t1d_lo1_9 * g.t2_0)
+    let C_c0_0 = shr(C_a0, 26)
+    let C_lo0_0 = band(C_a0, 67108863)
+    let C_s0_0 = C_a1 + C_c0_0
+    let C_c0_1 = shr(C_s0_0, 25)
+    let C_lo0_1 = band(C_s0_0, 33554431)
+    let C_s0_1 = C_a2 + C_c0_1
+    let C_c0_2 = shr(C_s0_1, 26)
+    let C_lo0_2 = band(C_s0_1, 67108863)
+    let C_s0_2 = C_a3 + C_c0_2
+    let C_c0_3 = shr(C_s0_2, 25)
+    let C_lo0_3 = band(C_s0_2, 33554431)
+    let C_s0_3 = C_a4 + C_c0_3
+    let C_c0_4 = shr(C_s0_3, 26)
+    let C_lo0_4 = band(C_s0_3, 67108863)
+    let C_s0_4 = C_a5 + C_c0_4
+    let C_c0_5 = shr(C_s0_4, 25)
+    let C_lo0_5 = band(C_s0_4, 33554431)
+    let C_s0_5 = C_a6 + C_c0_5
+    let C_c0_6 = shr(C_s0_5, 26)
+    let C_lo0_6 = band(C_s0_5, 67108863)
+    let C_s0_6 = C_a7 + C_c0_6
+    let C_c0_7 = shr(C_s0_6, 25)
+    let C_lo0_7 = band(C_s0_6, 33554431)
+    let C_s0_7 = C_a8 + C_c0_7
+    let C_c0_8 = shr(C_s0_7, 26)
+    let C_lo0_8 = band(C_s0_7, 67108863)
+    let C_s0_8 = C_a9 + C_c0_8
+    let C_c0_9 = shr(C_s0_8, 25)
+    let C_lo0_9 = band(C_s0_8, 33554431)
+    let C_w0 = C_lo0_0 + 19 * C_c0_9
+    let C_c1_0 = shr(C_w0, 26)
+    let C_lo1_0 = band(C_w0, 67108863)
+    let C_s1_0 = C_lo0_1 + C_c1_0
+    let C_c1_1 = shr(C_s1_0, 25)
+    let C_lo1_1 = band(C_s1_0, 33554431)
+    let C_s1_1 = C_lo0_2 + C_c1_1
+    let C_c1_2 = shr(C_s1_1, 26)
+    let C_lo1_2 = band(C_s1_1, 67108863)
+    let C_s1_2 = C_lo0_3 + C_c1_2
+    let C_c1_3 = shr(C_s1_2, 25)
+    let C_lo1_3 = band(C_s1_2, 33554431)
+    let C_s1_3 = C_lo0_4 + C_c1_3
+    let C_c1_4 = shr(C_s1_3, 26)
+    let C_lo1_4 = band(C_s1_3, 67108863)
+    let C_s1_4 = C_lo0_5 + C_c1_4
+    let C_c1_5 = shr(C_s1_4, 25)
+    let C_lo1_5 = band(C_s1_4, 33554431)
+    let C_s1_5 = C_lo0_6 + C_c1_5
+    let C_c1_6 = shr(C_s1_5, 26)
+    let C_lo1_6 = band(C_s1_5, 67108863)
+    let C_s1_6 = C_lo0_7 + C_c1_6
+    let C_c1_7 = shr(C_s1_6, 25)
+    let C_lo1_7 = band(C_s1_6, 33554431)
+    let C_s1_7 = C_lo0_8 + C_c1_7
+    let C_c1_8 = shr(C_s1_7, 26)
+    let C_lo1_8 = band(C_s1_7, 67108863)
+    let C_s1_8 = C_lo0_9 + C_c1_8
+    let C_c1_9 = shr(C_s1_8, 25)
+    let C_lo1_9 = band(C_s1_8, 33554431)
+    let C_w1 = C_lo1_0 + 19 * C_c1_9
+    let zz_a0 = (g.z1_0 * g.z2_0) + 38 * (g.z1_1 * g.z2_9) + 19 * (g.z1_2 * g.z2_8) + 38 * (g.z1_3 * g.z2_7) + 19 * (g.z1_4 * g.z2_6) + 38 * (g.z1_5 * g.z2_5) + 19 * (g.z1_6 * g.z2_4) + 38 * (g.z1_7 * g.z2_3) + 19 * (g.z1_8 * g.z2_2) + 38 * (g.z1_9 * g.z2_1)
+    let zz_a1 = (g.z1_0 * g.z2_1) + (g.z1_1 * g.z2_0) + 19 * (g.z1_2 * g.z2_9) + 19 * (g.z1_3 * g.z2_8) + 19 * (g.z1_4 * g.z2_7) + 19 * (g.z1_5 * g.z2_6) + 19 * (g.z1_6 * g.z2_5) + 19 * (g.z1_7 * g.z2_4) + 19 * (g.z1_8 * g.z2_3) + 19 * (g.z1_9 * g.z2_2)
+    let zz_a2 = (g.z1_0 * g.z2_2) + 2 * (g.z1_1 * g.z2_1) + (g.z1_2 * g.z2_0) + 38 * (g.z1_3 * g.z2_9) + 19 * (g.z1_4 * g.z2_8) + 38 * (g.z1_5 * g.z2_7) + 19 * (g.z1_6 * g.z2_6) + 38 * (g.z1_7 * g.z2_5) + 19 * (g.z1_8 * g.z2_4) + 38 * (g.z1_9 * g.z2_3)
+    let zz_a3 = (g.z1_0 * g.z2_3) + (g.z1_1 * g.z2_2) + (g.z1_2 * g.z2_1) + (g.z1_3 * g.z2_0) + 19 * (g.z1_4 * g.z2_9) + 19 * (g.z1_5 * g.z2_8) + 19 * (g.z1_6 * g.z2_7) + 19 * (g.z1_7 * g.z2_6) + 19 * (g.z1_8 * g.z2_5) + 19 * (g.z1_9 * g.z2_4)
+    let zz_a4 = (g.z1_0 * g.z2_4) + 2 * (g.z1_1 * g.z2_3) + (g.z1_2 * g.z2_2) + 2 * (g.z1_3 * g.z2_1) + (g.z1_4 * g.z2_0) + 38 * (g.z1_5 * g.z2_9) + 19 * (g.z1_6 * g.z2_8) + 38 * (g.z1_7 * g.z2_7) + 19 * (g.z1_8 * g.z2_6) + 38 * (g.z1_9 * g.z2_5)
+    let zz_a5 = (g.z1_0 * g.z2_5) + (g.z1_1 * g.z2_4) + (g.z1_2 * g.z2_3) + (g.z1_3 * g.z2_2) + (g.z1_4 * g.z2_1) + (g.z1_5 * g.z2_0) + 19 * (g.z1_6 * g.z2_9) + 19 * (g.z1_7 * g.z2_8) + 19 * (g.z1_8 * g.z2_7) + 19 * (g.z1_9 * g.z2_6)
+    let zz_a6 = (g.z1_0 * g.z2_6) + 2 * (g.z1_1 * g.z2_5) + (g.z1_2 * g.z2_4) + 2 * (g.z1_3 * g.z2_3) + (g.z1_4 * g.z2_2) + 2 * (g.z1_5 * g.z2_1) + (g.z1_6 * g.z2_0) + 38 * (g.z1_7 * g.z2_9) + 19 * (g.z1_8 * g.z2_8) + 38 * (g.z1_9 * g.z2_7)
+    let zz_a7 = (g.z1_0 * g.z2_7) + (g.z1_1 * g.z2_6) + (g.z1_2 * g.z2_5) + (g.z1_3 * g.z2_4) + (g.z1_4 * g.z2_3) + (g.z1_5 * g.z2_2) + (g.z1_6 * g.z2_1) + (g.z1_7 * g.z2_0) + 19 * (g.z1_8 * g.z2_9) + 19 * (g.z1_9 * g.z2_8)
+    let zz_a8 = (g.z1_0 * g.z2_8) + 2 * (g.z1_1 * g.z2_7) + (g.z1_2 * g.z2_6) + 2 * (g.z1_3 * g.z2_5) + (g.z1_4 * g.z2_4) + 2 * (g.z1_5 * g.z2_3) + (g.z1_6 * g.z2_2) + 2 * (g.z1_7 * g.z2_1) + (g.z1_8 * g.z2_0) + 38 * (g.z1_9 * g.z2_9)
+    let zz_a9 = (g.z1_0 * g.z2_9) + (g.z1_1 * g.z2_8) + (g.z1_2 * g.z2_7) + (g.z1_3 * g.z2_6) + (g.z1_4 * g.z2_5) + (g.z1_5 * g.z2_4) + (g.z1_6 * g.z2_3) + (g.z1_7 * g.z2_2) + (g.z1_8 * g.z2_1) + (g.z1_9 * g.z2_0)
+    let zz_c0_0 = shr(zz_a0, 26)
+    let zz_lo0_0 = band(zz_a0, 67108863)
+    let zz_s0_0 = zz_a1 + zz_c0_0
+    let zz_c0_1 = shr(zz_s0_0, 25)
+    let zz_lo0_1 = band(zz_s0_0, 33554431)
+    let zz_s0_1 = zz_a2 + zz_c0_1
+    let zz_c0_2 = shr(zz_s0_1, 26)
+    let zz_lo0_2 = band(zz_s0_1, 67108863)
+    let zz_s0_2 = zz_a3 + zz_c0_2
+    let zz_c0_3 = shr(zz_s0_2, 25)
+    let zz_lo0_3 = band(zz_s0_2, 33554431)
+    let zz_s0_3 = zz_a4 + zz_c0_3
+    let zz_c0_4 = shr(zz_s0_3, 26)
+    let zz_lo0_4 = band(zz_s0_3, 67108863)
+    let zz_s0_4 = zz_a5 + zz_c0_4
+    let zz_c0_5 = shr(zz_s0_4, 25)
+    let zz_lo0_5 = band(zz_s0_4, 33554431)
+    let zz_s0_5 = zz_a6 + zz_c0_5
+    let zz_c0_6 = shr(zz_s0_5, 26)
+    let zz_lo0_6 = band(zz_s0_5, 67108863)
+    let zz_s0_6 = zz_a7 + zz_c0_6
+    let zz_c0_7 = shr(zz_s0_6, 25)
+    let zz_lo0_7 = band(zz_s0_6, 33554431)
+    let zz_s0_7 = zz_a8 + zz_c0_7
+    let zz_c0_8 = shr(zz_s0_7, 26)
+    let zz_lo0_8 = band(zz_s0_7, 67108863)
+    let zz_s0_8 = zz_a9 + zz_c0_8
+    let zz_c0_9 = shr(zz_s0_8, 25)
+    let zz_lo0_9 = band(zz_s0_8, 33554431)
+    let zz_w0 = zz_lo0_0 + 19 * zz_c0_9
+    let zz_c1_0 = shr(zz_w0, 26)
+    let zz_lo1_0 = band(zz_w0, 67108863)
+    let zz_s1_0 = zz_lo0_1 + zz_c1_0
+    let zz_c1_1 = shr(zz_s1_0, 25)
+    let zz_lo1_1 = band(zz_s1_0, 33554431)
+    let zz_s1_1 = zz_lo0_2 + zz_c1_1
+    let zz_c1_2 = shr(zz_s1_1, 26)
+    let zz_lo1_2 = band(zz_s1_1, 67108863)
+    let zz_s1_2 = zz_lo0_3 + zz_c1_2
+    let zz_c1_3 = shr(zz_s1_2, 25)
+    let zz_lo1_3 = band(zz_s1_2, 33554431)
+    let zz_s1_3 = zz_lo0_4 + zz_c1_3
+    let zz_c1_4 = shr(zz_s1_3, 26)
+    let zz_lo1_4 = band(zz_s1_3, 67108863)
+    let zz_s1_4 = zz_lo0_5 + zz_c1_4
+    let zz_c1_5 = shr(zz_s1_4, 25)
+    let zz_lo1_5 = band(zz_s1_4, 33554431)
+    let zz_s1_5 = zz_lo0_6 + zz_c1_5
+    let zz_c1_6 = shr(zz_s1_5, 26)
+    let zz_lo1_6 = band(zz_s1_5, 67108863)
+    let zz_s1_6 = zz_lo0_7 + zz_c1_6
+    let zz_c1_7 = shr(zz_s1_6, 25)
+    let zz_lo1_7 = band(zz_s1_6, 33554431)
+    let zz_s1_7 = zz_lo0_8 + zz_c1_7
+    let zz_c1_8 = shr(zz_s1_7, 26)
+    let zz_lo1_8 = band(zz_s1_7, 67108863)
+    let zz_s1_8 = zz_lo0_9 + zz_c1_8
+    let zz_c1_9 = shr(zz_s1_8, 25)
+    let zz_lo1_9 = band(zz_s1_8, 33554431)
+    let zz_w1 = zz_lo1_0 + 19 * zz_c1_9
+    let D_a0 = zz_w1 + zz_w1
+    let D_a1 = zz_lo1_1 + zz_lo1_1
+    let D_a2 = zz_lo1_2 + zz_lo1_2
+    let D_a3 = zz_lo1_3 + zz_lo1_3
+    let D_a4 = zz_lo1_4 + zz_lo1_4
+    let D_a5 = zz_lo1_5 + zz_lo1_5
+    let D_a6 = zz_lo1_6 + zz_lo1_6
+    let D_a7 = zz_lo1_7 + zz_lo1_7
+    let D_a8 = zz_lo1_8 + zz_lo1_8
+    let D_a9 = zz_lo1_9 + zz_lo1_9
+    let D_c0_0 = shr(D_a0, 26)
+    let D_lo0_0 = band(D_a0, 67108863)
+    let D_s0_0 = D_a1 + D_c0_0
+    let D_c0_1 = shr(D_s0_0, 25)
+    let D_lo0_1 = band(D_s0_0, 33554431)
+    let D_s0_1 = D_a2 + D_c0_1
+    let D_c0_2 = shr(D_s0_1, 26)
+    let D_lo0_2 = band(D_s0_1, 67108863)
+    let D_s0_2 = D_a3 + D_c0_2
+    let D_c0_3 = shr(D_s0_2, 25)
+    let D_lo0_3 = band(D_s0_2, 33554431)
+    let D_s0_3 = D_a4 + D_c0_3
+    let D_c0_4 = shr(D_s0_3, 26)
+    let D_lo0_4 = band(D_s0_3, 67108863)
+    let D_s0_4 = D_a5 + D_c0_4
+    let D_c0_5 = shr(D_s0_4, 25)
+    let D_lo0_5 = band(D_s0_4, 33554431)
+    let D_s0_5 = D_a6 + D_c0_5
+    let D_c0_6 = shr(D_s0_5, 26)
+    let D_lo0_6 = band(D_s0_5, 67108863)
+    let D_s0_6 = D_a7 + D_c0_6
+    let D_c0_7 = shr(D_s0_6, 25)
+    let D_lo0_7 = band(D_s0_6, 33554431)
+    let D_s0_7 = D_a8 + D_c0_7
+    let D_c0_8 = shr(D_s0_7, 26)
+    let D_lo0_8 = band(D_s0_7, 67108863)
+    let D_s0_8 = D_a9 + D_c0_8
+    let D_c0_9 = shr(D_s0_8, 25)
+    let D_lo0_9 = band(D_s0_8, 33554431)
+    let D_w0 = D_lo0_0 + 19 * D_c0_9
+    let D_c1_0 = shr(D_w0, 26)
+    let D_lo1_0 = band(D_w0, 67108863)
+    let D_s1_0 = D_lo0_1 + D_c1_0
+    let D_c1_1 = shr(D_s1_0, 25)
+    let D_lo1_1 = band(D_s1_0, 33554431)
+    let D_s1_1 = D_lo0_2 + D_c1_1
+    let D_c1_2 = shr(D_s1_1, 26)
+    let D_lo1_2 = band(D_s1_1, 67108863)
+    let D_s1_2 = D_lo0_3 + D_c1_2
+    let D_c1_3 = shr(D_s1_2, 25)
+    let D_lo1_3 = band(D_s1_2, 33554431)
+    let D_s1_3 = D_lo0_4 + D_c1_3
+    let D_c1_4 = shr(D_s1_3, 26)
+    let D_lo1_4 = band(D_s1_3, 67108863)
+    let D_s1_4 = D_lo0_5 + D_c1_4
+    let D_c1_5 = shr(D_s1_4, 25)
+    let D_lo1_5 = band(D_s1_4, 33554431)
+    let D_s1_5 = D_lo0_6 + D_c1_5
+    let D_c1_6 = shr(D_s1_5, 26)
+    let D_lo1_6 = band(D_s1_5, 67108863)
+    let D_s1_6 = D_lo0_7 + D_c1_6
+    let D_c1_7 = shr(D_s1_6, 25)
+    let D_lo1_7 = band(D_s1_6, 33554431)
+    let D_s1_7 = D_lo0_8 + D_c1_7
+    let D_c1_8 = shr(D_s1_7, 26)
+    let D_lo1_8 = band(D_s1_7, 67108863)
+    let D_s1_8 = D_lo0_9 + D_c1_8
+    let D_c1_9 = shr(D_s1_8, 25)
+    let D_lo1_9 = band(D_s1_8, 33554431)
+    let D_w1 = D_lo1_0 + 19 * D_c1_9
+    let E_a0 = B_w1 + 134217690 - A_w1
+    let E_a1 = B_lo1_1 + 67108862 - A_lo1_1
+    let E_a2 = B_lo1_2 + 134217726 - A_lo1_2
+    let E_a3 = B_lo1_3 + 67108862 - A_lo1_3
+    let E_a4 = B_lo1_4 + 134217726 - A_lo1_4
+    let E_a5 = B_lo1_5 + 67108862 - A_lo1_5
+    let E_a6 = B_lo1_6 + 134217726 - A_lo1_6
+    let E_a7 = B_lo1_7 + 67108862 - A_lo1_7
+    let E_a8 = B_lo1_8 + 134217726 - A_lo1_8
+    let E_a9 = B_lo1_9 + 67108862 - A_lo1_9
+    let E_c0_0 = shr(E_a0, 26)
+    let E_lo0_0 = band(E_a0, 67108863)
+    let E_s0_0 = E_a1 + E_c0_0
+    let E_c0_1 = shr(E_s0_0, 25)
+    let E_lo0_1 = band(E_s0_0, 33554431)
+    let E_s0_1 = E_a2 + E_c0_1
+    let E_c0_2 = shr(E_s0_1, 26)
+    let E_lo0_2 = band(E_s0_1, 67108863)
+    let E_s0_2 = E_a3 + E_c0_2
+    let E_c0_3 = shr(E_s0_2, 25)
+    let E_lo0_3 = band(E_s0_2, 33554431)
+    let E_s0_3 = E_a4 + E_c0_3
+    let E_c0_4 = shr(E_s0_3, 26)
+    let E_lo0_4 = band(E_s0_3, 67108863)
+    let E_s0_4 = E_a5 + E_c0_4
+    let E_c0_5 = shr(E_s0_4, 25)
+    let E_lo0_5 = band(E_s0_4, 33554431)
+    let E_s0_5 = E_a6 + E_c0_5
+    let E_c0_6 = shr(E_s0_5, 26)
+    let E_lo0_6 = band(E_s0_5, 67108863)
+    let E_s0_6 = E_a7 + E_c0_6
+    let E_c0_7 = shr(E_s0_6, 25)
+    let E_lo0_7 = band(E_s0_6, 33554431)
+    let E_s0_7 = E_a8 + E_c0_7
+    let E_c0_8 = shr(E_s0_7, 26)
+    let E_lo0_8 = band(E_s0_7, 67108863)
+    let E_s0_8 = E_a9 + E_c0_8
+    let E_c0_9 = shr(E_s0_8, 25)
+    let E_lo0_9 = band(E_s0_8, 33554431)
+    let E_w0 = E_lo0_0 + 19 * E_c0_9
+    let E_c1_0 = shr(E_w0, 26)
+    let E_lo1_0 = band(E_w0, 67108863)
+    let E_s1_0 = E_lo0_1 + E_c1_0
+    let E_c1_1 = shr(E_s1_0, 25)
+    let E_lo1_1 = band(E_s1_0, 33554431)
+    let E_s1_1 = E_lo0_2 + E_c1_1
+    let E_c1_2 = shr(E_s1_1, 26)
+    let E_lo1_2 = band(E_s1_1, 67108863)
+    let E_s1_2 = E_lo0_3 + E_c1_2
+    let E_c1_3 = shr(E_s1_2, 25)
+    let E_lo1_3 = band(E_s1_2, 33554431)
+    let E_s1_3 = E_lo0_4 + E_c1_3
+    let E_c1_4 = shr(E_s1_3, 26)
+    let E_lo1_4 = band(E_s1_3, 67108863)
+    let E_s1_4 = E_lo0_5 + E_c1_4
+    let E_c1_5 = shr(E_s1_4, 25)
+    let E_lo1_5 = band(E_s1_4, 33554431)
+    let E_s1_5 = E_lo0_6 + E_c1_5
+    let E_c1_6 = shr(E_s1_5, 26)
+    let E_lo1_6 = band(E_s1_5, 67108863)
+    let E_s1_6 = E_lo0_7 + E_c1_6
+    let E_c1_7 = shr(E_s1_6, 25)
+    let E_lo1_7 = band(E_s1_6, 33554431)
+    let E_s1_7 = E_lo0_8 + E_c1_7
+    let E_c1_8 = shr(E_s1_7, 26)
+    let E_lo1_8 = band(E_s1_7, 67108863)
+    let E_s1_8 = E_lo0_9 + E_c1_8
+    let E_c1_9 = shr(E_s1_8, 25)
+    let E_lo1_9 = band(E_s1_8, 33554431)
+    let E_w1 = E_lo1_0 + 19 * E_c1_9
+    let F_a0 = D_w1 + 134217690 - C_w1
+    let F_a1 = D_lo1_1 + 67108862 - C_lo1_1
+    let F_a2 = D_lo1_2 + 134217726 - C_lo1_2
+    let F_a3 = D_lo1_3 + 67108862 - C_lo1_3
+    let F_a4 = D_lo1_4 + 134217726 - C_lo1_4
+    let F_a5 = D_lo1_5 + 67108862 - C_lo1_5
+    let F_a6 = D_lo1_6 + 134217726 - C_lo1_6
+    let F_a7 = D_lo1_7 + 67108862 - C_lo1_7
+    let F_a8 = D_lo1_8 + 134217726 - C_lo1_8
+    let F_a9 = D_lo1_9 + 67108862 - C_lo1_9
+    let F_c0_0 = shr(F_a0, 26)
+    let F_lo0_0 = band(F_a0, 67108863)
+    let F_s0_0 = F_a1 + F_c0_0
+    let F_c0_1 = shr(F_s0_0, 25)
+    let F_lo0_1 = band(F_s0_0, 33554431)
+    let F_s0_1 = F_a2 + F_c0_1
+    let F_c0_2 = shr(F_s0_1, 26)
+    let F_lo0_2 = band(F_s0_1, 67108863)
+    let F_s0_2 = F_a3 + F_c0_2
+    let F_c0_3 = shr(F_s0_2, 25)
+    let F_lo0_3 = band(F_s0_2, 33554431)
+    let F_s0_3 = F_a4 + F_c0_3
+    let F_c0_4 = shr(F_s0_3, 26)
+    let F_lo0_4 = band(F_s0_3, 67108863)
+    let F_s0_4 = F_a5 + F_c0_4
+    let F_c0_5 = shr(F_s0_4, 25)
+    let F_lo0_5 = band(F_s0_4, 33554431)
+    let F_s0_5 = F_a6 + F_c0_5
+    let F_c0_6 = shr(F_s0_5, 26)
+    let F_lo0_6 = band(F_s0_5, 67108863)
+    let F_s0_6 = F_a7 + F_c0_6
+    let F_c0_7 = shr(F_s0_6, 25)
+    let F_lo0_7 = band(F_s0_6, 33554431)
+    let F_s0_7 = F_a8 + F_c0_7
+    let F_c0_8 = shr(F_s0_7, 26)
+    let F_lo0_8 = band(F_s0_7, 67108863)
+    let F_s0_8 = F_a9 + F_c0_8
+    let F_c0_9 = shr(F_s0_8, 25)
+    let F_lo0_9 = band(F_s0_8, 33554431)
+    let F_w0 = F_lo0_0 + 19 * F_c0_9
+    let F_c1_0 = shr(F_w0, 26)
+    let F_lo1_0 = band(F_w0, 67108863)
+    let F_s1_0 = F_lo0_1 + F_c1_0
+    let F_c1_1 = shr(F_s1_0, 25)
+    let F_lo1_1 = band(F_s1_0, 33554431)
+    let F_s1_1 = F_lo0_2 + F_c1_1
+    let F_c1_2 = shr(F_s1_1, 26)
+    let F_lo1_2 = band(F_s1_1, 67108863)
+    let F_s1_2 = F_lo0_3 + F_c1_2
+    let F_c1_3 = shr(F_s1_2, 25)
+    let F_lo1_3 = band(F_s1_2, 33554431)
+    let F_s1_3 = F_lo0_4 + F_c1_3
+    let F_c1_4 = shr(F_s1_3, 26)
+    let F_lo1_4 = band(F_s1_3, 67108863)
+    let F_s1_4 = F_lo0_5 + F_c1_4
+    let F_c1_5 = shr(F_s1_4, 25)
+    let F_lo1_5 = band(F_s1_4, 33554431)
+    let F_s1_5 = F_lo0_6 + F_c1_5
+    let F_c1_6 = shr(F_s1_5, 26)
+    let F_lo1_6 = band(F_s1_5, 67108863)
+    let F_s1_6 = F_lo0_7 + F_c1_6
+    let F_c1_7 = shr(F_s1_6, 25)
+    let F_lo1_7 = band(F_s1_6, 33554431)
+    let F_s1_7 = F_lo0_8 + F_c1_7
+    let F_c1_8 = shr(F_s1_7, 26)
+    let F_lo1_8 = band(F_s1_7, 67108863)
+    let F_s1_8 = F_lo0_9 + F_c1_8
+    let F_c1_9 = shr(F_s1_8, 25)
+    let F_lo1_9 = band(F_s1_8, 33554431)
+    let F_w1 = F_lo1_0 + 19 * F_c1_9
+    let G_a0 = D_w1 + C_w1
+    let G_a1 = D_lo1_1 + C_lo1_1
+    let G_a2 = D_lo1_2 + C_lo1_2
+    let G_a3 = D_lo1_3 + C_lo1_3
+    let G_a4 = D_lo1_4 + C_lo1_4
+    let G_a5 = D_lo1_5 + C_lo1_5
+    let G_a6 = D_lo1_6 + C_lo1_6
+    let G_a7 = D_lo1_7 + C_lo1_7
+    let G_a8 = D_lo1_8 + C_lo1_8
+    let G_a9 = D_lo1_9 + C_lo1_9
+    let G_c0_0 = shr(G_a0, 26)
+    let G_lo0_0 = band(G_a0, 67108863)
+    let G_s0_0 = G_a1 + G_c0_0
+    let G_c0_1 = shr(G_s0_0, 25)
+    let G_lo0_1 = band(G_s0_0, 33554431)
+    let G_s0_1 = G_a2 + G_c0_1
+    let G_c0_2 = shr(G_s0_1, 26)
+    let G_lo0_2 = band(G_s0_1, 67108863)
+    let G_s0_2 = G_a3 + G_c0_2
+    let G_c0_3 = shr(G_s0_2, 25)
+    let G_lo0_3 = band(G_s0_2, 33554431)
+    let G_s0_3 = G_a4 + G_c0_3
+    let G_c0_4 = shr(G_s0_3, 26)
+    let G_lo0_4 = band(G_s0_3, 67108863)
+    let G_s0_4 = G_a5 + G_c0_4
+    let G_c0_5 = shr(G_s0_4, 25)
+    let G_lo0_5 = band(G_s0_4, 33554431)
+    let G_s0_5 = G_a6 + G_c0_5
+    let G_c0_6 = shr(G_s0_5, 26)
+    let G_lo0_6 = band(G_s0_5, 67108863)
+    let G_s0_6 = G_a7 + G_c0_6
+    let G_c0_7 = shr(G_s0_6, 25)
+    let G_lo0_7 = band(G_s0_6, 33554431)
+    let G_s0_7 = G_a8 + G_c0_7
+    let G_c0_8 = shr(G_s0_7, 26)
+    let G_lo0_8 = band(G_s0_7, 67108863)
+    let G_s0_8 = G_a9 + G_c0_8
+    let G_c0_9 = shr(G_s0_8, 25)
+    let G_lo0_9 = band(G_s0_8, 33554431)
+    let G_w0 = G_lo0_0 + 19 * G_c0_9
+    let G_c1_0 = shr(G_w0, 26)
+    let G_lo1_0 = band(G_w0, 67108863)
+    let G_s1_0 = G_lo0_1 + G_c1_0
+    let G_c1_1 = shr(G_s1_0, 25)
+    let G_lo1_1 = band(G_s1_0, 33554431)
+    let G_s1_1 = G_lo0_2 + G_c1_1
+    let G_c1_2 = shr(G_s1_1, 26)
+    let G_lo1_2 = band(G_s1_1, 67108863)
+    let G_s1_2 = G_lo0_3 + G_c1_2
+    let G_c1_3 = shr(G_s1_2, 25)
+    let G_lo1_3 = band(G_s1_2, 33554431)
+    let G_s1_3 = G_lo0_4 + G_c1_3
+    let G_c1_4 = shr(G_s1_3, 26)
+    let G_lo1_4 = band(G_s1_3, 67108863)
+    let G_s1_4 = G_lo0_5 + G_c1_4
+    let G_c1_5 = shr(G_s1_4, 25)
+    let G_lo1_5 = band(G_s1_4, 33554431)
+    let G_s1_5 = G_lo0_6 + G_c1_5
+    let G_c1_6 = shr(G_s1_5, 26)
+    let G_lo1_6 = band(G_s1_5, 67108863)
+    let G_s1_6 = G_lo0_7 + G_c1_6
+    let G_c1_7 = shr(G_s1_6, 25)
+    let G_lo1_7 = band(G_s1_6, 33554431)
+    let G_s1_7 = G_lo0_8 + G_c1_7
+    let G_c1_8 = shr(G_s1_7, 26)
+    let G_lo1_8 = band(G_s1_7, 67108863)
+    let G_s1_8 = G_lo0_9 + G_c1_8
+    let G_c1_9 = shr(G_s1_8, 25)
+    let G_lo1_9 = band(G_s1_8, 33554431)
+    let G_w1 = G_lo1_0 + 19 * G_c1_9
+    let H_a0 = B_w1 + A_w1
+    let H_a1 = B_lo1_1 + A_lo1_1
+    let H_a2 = B_lo1_2 + A_lo1_2
+    let H_a3 = B_lo1_3 + A_lo1_3
+    let H_a4 = B_lo1_4 + A_lo1_4
+    let H_a5 = B_lo1_5 + A_lo1_5
+    let H_a6 = B_lo1_6 + A_lo1_6
+    let H_a7 = B_lo1_7 + A_lo1_7
+    let H_a8 = B_lo1_8 + A_lo1_8
+    let H_a9 = B_lo1_9 + A_lo1_9
+    let H_c0_0 = shr(H_a0, 26)
+    let H_lo0_0 = band(H_a0, 67108863)
+    let H_s0_0 = H_a1 + H_c0_0
+    let H_c0_1 = shr(H_s0_0, 25)
+    let H_lo0_1 = band(H_s0_0, 33554431)
+    let H_s0_1 = H_a2 + H_c0_1
+    let H_c0_2 = shr(H_s0_1, 26)
+    let H_lo0_2 = band(H_s0_1, 67108863)
+    let H_s0_2 = H_a3 + H_c0_2
+    let H_c0_3 = shr(H_s0_2, 25)
+    let H_lo0_3 = band(H_s0_2, 33554431)
+    let H_s0_3 = H_a4 + H_c0_3
+    let H_c0_4 = shr(H_s0_3, 26)
+    let H_lo0_4 = band(H_s0_3, 67108863)
+    let H_s0_4 = H_a5 + H_c0_4
+    let H_c0_5 = shr(H_s0_4, 25)
+    let H_lo0_5 = band(H_s0_4, 33554431)
+    let H_s0_5 = H_a6 + H_c0_5
+    let H_c0_6 = shr(H_s0_5, 26)
+    let H_lo0_6 = band(H_s0_5, 67108863)
+    let H_s0_6 = H_a7 + H_c0_6
+    let H_c0_7 = shr(H_s0_6, 25)
+    let H_lo0_7 = band(H_s0_6, 33554431)
+    let H_s0_7 = H_a8 + H_c0_7
+    let H_c0_8 = shr(H_s0_7, 26)
+    let H_lo0_8 = band(H_s0_7, 67108863)
+    let H_s0_8 = H_a9 + H_c0_8
+    let H_c0_9 = shr(H_s0_8, 25)
+    let H_lo0_9 = band(H_s0_8, 33554431)
+    let H_w0 = H_lo0_0 + 19 * H_c0_9
+    let H_c1_0 = shr(H_w0, 26)
+    let H_lo1_0 = band(H_w0, 67108863)
+    let H_s1_0 = H_lo0_1 + H_c1_0
+    let H_c1_1 = shr(H_s1_0, 25)
+    let H_lo1_1 = band(H_s1_0, 33554431)
+    let H_s1_1 = H_lo0_2 + H_c1_1
+    let H_c1_2 = shr(H_s1_1, 26)
+    let H_lo1_2 = band(H_s1_1, 67108863)
+    let H_s1_2 = H_lo0_3 + H_c1_2
+    let H_c1_3 = shr(H_s1_2, 25)
+    let H_lo1_3 = band(H_s1_2, 33554431)
+    let H_s1_3 = H_lo0_4 + H_c1_3
+    let H_c1_4 = shr(H_s1_3, 26)
+    let H_lo1_4 = band(H_s1_3, 67108863)
+    let H_s1_4 = H_lo0_5 + H_c1_4
+    let H_c1_5 = shr(H_s1_4, 25)
+    let H_lo1_5 = band(H_s1_4, 33554431)
+    let H_s1_5 = H_lo0_6 + H_c1_5
+    let H_c1_6 = shr(H_s1_5, 26)
+    let H_lo1_6 = band(H_s1_5, 67108863)
+    let H_s1_6 = H_lo0_7 + H_c1_6
+    let H_c1_7 = shr(H_s1_6, 25)
+    let H_lo1_7 = band(H_s1_6, 33554431)
+    let H_s1_7 = H_lo0_8 + H_c1_7
+    let H_c1_8 = shr(H_s1_7, 26)
+    let H_lo1_8 = band(H_s1_7, 67108863)
+    let H_s1_8 = H_lo0_9 + H_c1_8
+    let H_c1_9 = shr(H_s1_8, 25)
+    let H_lo1_9 = band(H_s1_8, 33554431)
+    let H_w1 = H_lo1_0 + 19 * H_c1_9
+    let X3_a0 = (E_w1 * F_w1) + 38 * (E_lo1_1 * F_lo1_9) + 19 * (E_lo1_2 * F_lo1_8) + 38 * (E_lo1_3 * F_lo1_7) + 19 * (E_lo1_4 * F_lo1_6) + 38 * (E_lo1_5 * F_lo1_5) + 19 * (E_lo1_6 * F_lo1_4) + 38 * (E_lo1_7 * F_lo1_3) + 19 * (E_lo1_8 * F_lo1_2) + 38 * (E_lo1_9 * F_lo1_1)
+    let X3_a1 = (E_w1 * F_lo1_1) + (E_lo1_1 * F_w1) + 19 * (E_lo1_2 * F_lo1_9) + 19 * (E_lo1_3 * F_lo1_8) + 19 * (E_lo1_4 * F_lo1_7) + 19 * (E_lo1_5 * F_lo1_6) + 19 * (E_lo1_6 * F_lo1_5) + 19 * (E_lo1_7 * F_lo1_4) + 19 * (E_lo1_8 * F_lo1_3) + 19 * (E_lo1_9 * F_lo1_2)
+    let X3_a2 = (E_w1 * F_lo1_2) + 2 * (E_lo1_1 * F_lo1_1) + (E_lo1_2 * F_w1) + 38 * (E_lo1_3 * F_lo1_9) + 19 * (E_lo1_4 * F_lo1_8) + 38 * (E_lo1_5 * F_lo1_7) + 19 * (E_lo1_6 * F_lo1_6) + 38 * (E_lo1_7 * F_lo1_5) + 19 * (E_lo1_8 * F_lo1_4) + 38 * (E_lo1_9 * F_lo1_3)
+    let X3_a3 = (E_w1 * F_lo1_3) + (E_lo1_1 * F_lo1_2) + (E_lo1_2 * F_lo1_1) + (E_lo1_3 * F_w1) + 19 * (E_lo1_4 * F_lo1_9) + 19 * (E_lo1_5 * F_lo1_8) + 19 * (E_lo1_6 * F_lo1_7) + 19 * (E_lo1_7 * F_lo1_6) + 19 * (E_lo1_8 * F_lo1_5) + 19 * (E_lo1_9 * F_lo1_4)
+    let X3_a4 = (E_w1 * F_lo1_4) + 2 * (E_lo1_1 * F_lo1_3) + (E_lo1_2 * F_lo1_2) + 2 * (E_lo1_3 * F_lo1_1) + (E_lo1_4 * F_w1) + 38 * (E_lo1_5 * F_lo1_9) + 19 * (E_lo1_6 * F_lo1_8) + 38 * (E_lo1_7 * F_lo1_7) + 19 * (E_lo1_8 * F_lo1_6) + 38 * (E_lo1_9 * F_lo1_5)
+    let X3_a5 = (E_w1 * F_lo1_5) + (E_lo1_1 * F_lo1_4) + (E_lo1_2 * F_lo1_3) + (E_lo1_3 * F_lo1_2) + (E_lo1_4 * F_lo1_1) + (E_lo1_5 * F_w1) + 19 * (E_lo1_6 * F_lo1_9) + 19 * (E_lo1_7 * F_lo1_8) + 19 * (E_lo1_8 * F_lo1_7) + 19 * (E_lo1_9 * F_lo1_6)
+    let X3_a6 = (E_w1 * F_lo1_6) + 2 * (E_lo1_1 * F_lo1_5) + (E_lo1_2 * F_lo1_4) + 2 * (E_lo1_3 * F_lo1_3) + (E_lo1_4 * F_lo1_2) + 2 * (E_lo1_5 * F_lo1_1) + (E_lo1_6 * F_w1) + 38 * (E_lo1_7 * F_lo1_9) + 19 * (E_lo1_8 * F_lo1_8) + 38 * (E_lo1_9 * F_lo1_7)
+    let X3_a7 = (E_w1 * F_lo1_7) + (E_lo1_1 * F_lo1_6) + (E_lo1_2 * F_lo1_5) + (E_lo1_3 * F_lo1_4) + (E_lo1_4 * F_lo1_3) + (E_lo1_5 * F_lo1_2) + (E_lo1_6 * F_lo1_1) + (E_lo1_7 * F_w1) + 19 * (E_lo1_8 * F_lo1_9) + 19 * (E_lo1_9 * F_lo1_8)
+    let X3_a8 = (E_w1 * F_lo1_8) + 2 * (E_lo1_1 * F_lo1_7) + (E_lo1_2 * F_lo1_6) + 2 * (E_lo1_3 * F_lo1_5) + (E_lo1_4 * F_lo1_4) + 2 * (E_lo1_5 * F_lo1_3) + (E_lo1_6 * F_lo1_2) + 2 * (E_lo1_7 * F_lo1_1) + (E_lo1_8 * F_w1) + 38 * (E_lo1_9 * F_lo1_9)
+    let X3_a9 = (E_w1 * F_lo1_9) + (E_lo1_1 * F_lo1_8) + (E_lo1_2 * F_lo1_7) + (E_lo1_3 * F_lo1_6) + (E_lo1_4 * F_lo1_5) + (E_lo1_5 * F_lo1_4) + (E_lo1_6 * F_lo1_3) + (E_lo1_7 * F_lo1_2) + (E_lo1_8 * F_lo1_1) + (E_lo1_9 * F_w1)
+    let X3_c0_0 = shr(X3_a0, 26)
+    let X3_lo0_0 = band(X3_a0, 67108863)
+    let X3_s0_0 = X3_a1 + X3_c0_0
+    let X3_c0_1 = shr(X3_s0_0, 25)
+    let X3_lo0_1 = band(X3_s0_0, 33554431)
+    let X3_s0_1 = X3_a2 + X3_c0_1
+    let X3_c0_2 = shr(X3_s0_1, 26)
+    let X3_lo0_2 = band(X3_s0_1, 67108863)
+    let X3_s0_2 = X3_a3 + X3_c0_2
+    let X3_c0_3 = shr(X3_s0_2, 25)
+    let X3_lo0_3 = band(X3_s0_2, 33554431)
+    let X3_s0_3 = X3_a4 + X3_c0_3
+    let X3_c0_4 = shr(X3_s0_3, 26)
+    let X3_lo0_4 = band(X3_s0_3, 67108863)
+    let X3_s0_4 = X3_a5 + X3_c0_4
+    let X3_c0_5 = shr(X3_s0_4, 25)
+    let X3_lo0_5 = band(X3_s0_4, 33554431)
+    let X3_s0_5 = X3_a6 + X3_c0_5
+    let X3_c0_6 = shr(X3_s0_5, 26)
+    let X3_lo0_6 = band(X3_s0_5, 67108863)
+    let X3_s0_6 = X3_a7 + X3_c0_6
+    let X3_c0_7 = shr(X3_s0_6, 25)
+    let X3_lo0_7 = band(X3_s0_6, 33554431)
+    let X3_s0_7 = X3_a8 + X3_c0_7
+    let X3_c0_8 = shr(X3_s0_7, 26)
+    let X3_lo0_8 = band(X3_s0_7, 67108863)
+    let X3_s0_8 = X3_a9 + X3_c0_8
+    let X3_c0_9 = shr(X3_s0_8, 25)
+    let X3_lo0_9 = band(X3_s0_8, 33554431)
+    let X3_w0 = X3_lo0_0 + 19 * X3_c0_9
+    let X3_c1_0 = shr(X3_w0, 26)
+    let X3_lo1_0 = band(X3_w0, 67108863)
+    let X3_s1_0 = X3_lo0_1 + X3_c1_0
+    let X3_c1_1 = shr(X3_s1_0, 25)
+    let X3_lo1_1 = band(X3_s1_0, 33554431)
+    let X3_s1_1 = X3_lo0_2 + X3_c1_1
+    let X3_c1_2 = shr(X3_s1_1, 26)
+    let X3_lo1_2 = band(X3_s1_1, 67108863)
+    let X3_s1_2 = X3_lo0_3 + X3_c1_2
+    let X3_c1_3 = shr(X3_s1_2, 25)
+    let X3_lo1_3 = band(X3_s1_2, 33554431)
+    let X3_s1_3 = X3_lo0_4 + X3_c1_3
+    let X3_c1_4 = shr(X3_s1_3, 26)
+    let X3_lo1_4 = band(X3_s1_3, 67108863)
+    let X3_s1_4 = X3_lo0_5 + X3_c1_4
+    let X3_c1_5 = shr(X3_s1_4, 25)
+    let X3_lo1_5 = band(X3_s1_4, 33554431)
+    let X3_s1_5 = X3_lo0_6 + X3_c1_5
+    let X3_c1_6 = shr(X3_s1_5, 26)
+    let X3_lo1_6 = band(X3_s1_5, 67108863)
+    let X3_s1_6 = X3_lo0_7 + X3_c1_6
+    let X3_c1_7 = shr(X3_s1_6, 25)
+    let X3_lo1_7 = band(X3_s1_6, 33554431)
+    let X3_s1_7 = X3_lo0_8 + X3_c1_7
+    let X3_c1_8 = shr(X3_s1_7, 26)
+    let X3_lo1_8 = band(X3_s1_7, 67108863)
+    let X3_s1_8 = X3_lo0_9 + X3_c1_8
+    let X3_c1_9 = shr(X3_s1_8, 25)
+    let X3_lo1_9 = band(X3_s1_8, 33554431)
+    let X3_w1 = X3_lo1_0 + 19 * X3_c1_9
+    let Y3_a0 = (G_w1 * H_w1) + 38 * (G_lo1_1 * H_lo1_9) + 19 * (G_lo1_2 * H_lo1_8) + 38 * (G_lo1_3 * H_lo1_7) + 19 * (G_lo1_4 * H_lo1_6) + 38 * (G_lo1_5 * H_lo1_5) + 19 * (G_lo1_6 * H_lo1_4) + 38 * (G_lo1_7 * H_lo1_3) + 19 * (G_lo1_8 * H_lo1_2) + 38 * (G_lo1_9 * H_lo1_1)
+    let Y3_a1 = (G_w1 * H_lo1_1) + (G_lo1_1 * H_w1) + 19 * (G_lo1_2 * H_lo1_9) + 19 * (G_lo1_3 * H_lo1_8) + 19 * (G_lo1_4 * H_lo1_7) + 19 * (G_lo1_5 * H_lo1_6) + 19 * (G_lo1_6 * H_lo1_5) + 19 * (G_lo1_7 * H_lo1_4) + 19 * (G_lo1_8 * H_lo1_3) + 19 * (G_lo1_9 * H_lo1_2)
+    let Y3_a2 = (G_w1 * H_lo1_2) + 2 * (G_lo1_1 * H_lo1_1) + (G_lo1_2 * H_w1) + 38 * (G_lo1_3 * H_lo1_9) + 19 * (G_lo1_4 * H_lo1_8) + 38 * (G_lo1_5 * H_lo1_7) + 19 * (G_lo1_6 * H_lo1_6) + 38 * (G_lo1_7 * H_lo1_5) + 19 * (G_lo1_8 * H_lo1_4) + 38 * (G_lo1_9 * H_lo1_3)
+    let Y3_a3 = (G_w1 * H_lo1_3) + (G_lo1_1 * H_lo1_2) + (G_lo1_2 * H_lo1_1) + (G_lo1_3 * H_w1) + 19 * (G_lo1_4 * H_lo1_9) + 19 * (G_lo1_5 * H_lo1_8) + 19 * (G_lo1_6 * H_lo1_7) + 19 * (G_lo1_7 * H_lo1_6) + 19 * (G_lo1_8 * H_lo1_5) + 19 * (G_lo1_9 * H_lo1_4)
+    let Y3_a4 = (G_w1 * H_lo1_4) + 2 * (G_lo1_1 * H_lo1_3) + (G_lo1_2 * H_lo1_2) + 2 * (G_lo1_3 * H_lo1_1) + (G_lo1_4 * H_w1) + 38 * (G_lo1_5 * H_lo1_9) + 19 * (G_lo1_6 * H_lo1_8) + 38 * (G_lo1_7 * H_lo1_7) + 19 * (G_lo1_8 * H_lo1_6) + 38 * (G_lo1_9 * H_lo1_5)
+    let Y3_a5 = (G_w1 * H_lo1_5) + (G_lo1_1 * H_lo1_4) + (G_lo1_2 * H_lo1_3) + (G_lo1_3 * H_lo1_2) + (G_lo1_4 * H_lo1_1) + (G_lo1_5 * H_w1) + 19 * (G_lo1_6 * H_lo1_9) + 19 * (G_lo1_7 * H_lo1_8) + 19 * (G_lo1_8 * H_lo1_7) + 19 * (G_lo1_9 * H_lo1_6)
+    let Y3_a6 = (G_w1 * H_lo1_6) + 2 * (G_lo1_1 * H_lo1_5) + (G_lo1_2 * H_lo1_4) + 2 * (G_lo1_3 * H_lo1_3) + (G_lo1_4 * H_lo1_2) + 2 * (G_lo1_5 * H_lo1_1) + (G_lo1_6 * H_w1) + 38 * (G_lo1_7 * H_lo1_9) + 19 * (G_lo1_8 * H_lo1_8) + 38 * (G_lo1_9 * H_lo1_7)
+    let Y3_a7 = (G_w1 * H_lo1_7) + (G_lo1_1 * H_lo1_6) + (G_lo1_2 * H_lo1_5) + (G_lo1_3 * H_lo1_4) + (G_lo1_4 * H_lo1_3) + (G_lo1_5 * H_lo1_2) + (G_lo1_6 * H_lo1_1) + (G_lo1_7 * H_w1) + 19 * (G_lo1_8 * H_lo1_9) + 19 * (G_lo1_9 * H_lo1_8)
+    let Y3_a8 = (G_w1 * H_lo1_8) + 2 * (G_lo1_1 * H_lo1_7) + (G_lo1_2 * H_lo1_6) + 2 * (G_lo1_3 * H_lo1_5) + (G_lo1_4 * H_lo1_4) + 2 * (G_lo1_5 * H_lo1_3) + (G_lo1_6 * H_lo1_2) + 2 * (G_lo1_7 * H_lo1_1) + (G_lo1_8 * H_w1) + 38 * (G_lo1_9 * H_lo1_9)
+    let Y3_a9 = (G_w1 * H_lo1_9) + (G_lo1_1 * H_lo1_8) + (G_lo1_2 * H_lo1_7) + (G_lo1_3 * H_lo1_6) + (G_lo1_4 * H_lo1_5) + (G_lo1_5 * H_lo1_4) + (G_lo1_6 * H_lo1_3) + (G_lo1_7 * H_lo1_2) + (G_lo1_8 * H_lo1_1) + (G_lo1_9 * H_w1)
+    let Y3_c0_0 = shr(Y3_a0, 26)
+    let Y3_lo0_0 = band(Y3_a0, 67108863)
+    let Y3_s0_0 = Y3_a1 + Y3_c0_0
+    let Y3_c0_1 = shr(Y3_s0_0, 25)
+    let Y3_lo0_1 = band(Y3_s0_0, 33554431)
+    let Y3_s0_1 = Y3_a2 + Y3_c0_1
+    let Y3_c0_2 = shr(Y3_s0_1, 26)
+    let Y3_lo0_2 = band(Y3_s0_1, 67108863)
+    let Y3_s0_2 = Y3_a3 + Y3_c0_2
+    let Y3_c0_3 = shr(Y3_s0_2, 25)
+    let Y3_lo0_3 = band(Y3_s0_2, 33554431)
+    let Y3_s0_3 = Y3_a4 + Y3_c0_3
+    let Y3_c0_4 = shr(Y3_s0_3, 26)
+    let Y3_lo0_4 = band(Y3_s0_3, 67108863)
+    let Y3_s0_4 = Y3_a5 + Y3_c0_4
+    let Y3_c0_5 = shr(Y3_s0_4, 25)
+    let Y3_lo0_5 = band(Y3_s0_4, 33554431)
+    let Y3_s0_5 = Y3_a6 + Y3_c0_5
+    let Y3_c0_6 = shr(Y3_s0_5, 26)
+    let Y3_lo0_6 = band(Y3_s0_5, 67108863)
+    let Y3_s0_6 = Y3_a7 + Y3_c0_6
+    let Y3_c0_7 = shr(Y3_s0_6, 25)
+    let Y3_lo0_7 = band(Y3_s0_6, 33554431)
+    let Y3_s0_7 = Y3_a8 + Y3_c0_7
+    let Y3_c0_8 = shr(Y3_s0_7, 26)
+    let Y3_lo0_8 = band(Y3_s0_7, 67108863)
+    let Y3_s0_8 = Y3_a9 + Y3_c0_8
+    let Y3_c0_9 = shr(Y3_s0_8, 25)
+    let Y3_lo0_9 = band(Y3_s0_8, 33554431)
+    let Y3_w0 = Y3_lo0_0 + 19 * Y3_c0_9
+    let Y3_c1_0 = shr(Y3_w0, 26)
+    let Y3_lo1_0 = band(Y3_w0, 67108863)
+    let Y3_s1_0 = Y3_lo0_1 + Y3_c1_0
+    let Y3_c1_1 = shr(Y3_s1_0, 25)
+    let Y3_lo1_1 = band(Y3_s1_0, 33554431)
+    let Y3_s1_1 = Y3_lo0_2 + Y3_c1_1
+    let Y3_c1_2 = shr(Y3_s1_1, 26)
+    let Y3_lo1_2 = band(Y3_s1_1, 67108863)
+    let Y3_s1_2 = Y3_lo0_3 + Y3_c1_2
+    let Y3_c1_3 = shr(Y3_s1_2, 25)
+    let Y3_lo1_3 = band(Y3_s1_2, 33554431)
+    let Y3_s1_3 = Y3_lo0_4 + Y3_c1_3
+    let Y3_c1_4 = shr(Y3_s1_3, 26)
+    let Y3_lo1_4 = band(Y3_s1_3, 67108863)
+    let Y3_s1_4 = Y3_lo0_5 + Y3_c1_4
+    let Y3_c1_5 = shr(Y3_s1_4, 25)
+    let Y3_lo1_5 = band(Y3_s1_4, 33554431)
+    let Y3_s1_5 = Y3_lo0_6 + Y3_c1_5
+    let Y3_c1_6 = shr(Y3_s1_5, 26)
+    let Y3_lo1_6 = band(Y3_s1_5, 67108863)
+    let Y3_s1_6 = Y3_lo0_7 + Y3_c1_6
+    let Y3_c1_7 = shr(Y3_s1_6, 25)
+    let Y3_lo1_7 = band(Y3_s1_6, 33554431)
+    let Y3_s1_7 = Y3_lo0_8 + Y3_c1_7
+    let Y3_c1_8 = shr(Y3_s1_7, 26)
+    let Y3_lo1_8 = band(Y3_s1_7, 67108863)
+    let Y3_s1_8 = Y3_lo0_9 + Y3_c1_8
+    let Y3_c1_9 = shr(Y3_s1_8, 25)
+    let Y3_lo1_9 = band(Y3_s1_8, 33554431)
+    let Y3_w1 = Y3_lo1_0 + 19 * Y3_c1_9
+    let Z3_a0 = (F_w1 * G_w1) + 38 * (F_lo1_1 * G_lo1_9) + 19 * (F_lo1_2 * G_lo1_8) + 38 * (F_lo1_3 * G_lo1_7) + 19 * (F_lo1_4 * G_lo1_6) + 38 * (F_lo1_5 * G_lo1_5) + 19 * (F_lo1_6 * G_lo1_4) + 38 * (F_lo1_7 * G_lo1_3) + 19 * (F_lo1_8 * G_lo1_2) + 38 * (F_lo1_9 * G_lo1_1)
+    let Z3_a1 = (F_w1 * G_lo1_1) + (F_lo1_1 * G_w1) + 19 * (F_lo1_2 * G_lo1_9) + 19 * (F_lo1_3 * G_lo1_8) + 19 * (F_lo1_4 * G_lo1_7) + 19 * (F_lo1_5 * G_lo1_6) + 19 * (F_lo1_6 * G_lo1_5) + 19 * (F_lo1_7 * G_lo1_4) + 19 * (F_lo1_8 * G_lo1_3) + 19 * (F_lo1_9 * G_lo1_2)
+    let Z3_a2 = (F_w1 * G_lo1_2) + 2 * (F_lo1_1 * G_lo1_1) + (F_lo1_2 * G_w1) + 38 * (F_lo1_3 * G_lo1_9) + 19 * (F_lo1_4 * G_lo1_8) + 38 * (F_lo1_5 * G_lo1_7) + 19 * (F_lo1_6 * G_lo1_6) + 38 * (F_lo1_7 * G_lo1_5) + 19 * (F_lo1_8 * G_lo1_4) + 38 * (F_lo1_9 * G_lo1_3)
+    let Z3_a3 = (F_w1 * G_lo1_3) + (F_lo1_1 * G_lo1_2) + (F_lo1_2 * G_lo1_1) + (F_lo1_3 * G_w1) + 19 * (F_lo1_4 * G_lo1_9) + 19 * (F_lo1_5 * G_lo1_8) + 19 * (F_lo1_6 * G_lo1_7) + 19 * (F_lo1_7 * G_lo1_6) + 19 * (F_lo1_8 * G_lo1_5) + 19 * (F_lo1_9 * G_lo1_4)
+    let Z3_a4 = (F_w1 * G_lo1_4) + 2 * (F_lo1_1 * G_lo1_3) + (F_lo1_2 * G_lo1_2) + 2 * (F_lo1_3 * G_lo1_1) + (F_lo1_4 * G_w1) + 38 * (F_lo1_5 * G_lo1_9) + 19 * (F_lo1_6 * G_lo1_8) + 38 * (F_lo1_7 * G_lo1_7) + 19 * (F_lo1_8 * G_lo1_6) + 38 * (F_lo1_9 * G_lo1_5)
+    let Z3_a5 = (F_w1 * G_lo1_5) + (F_lo1_1 * G_lo1_4) + (F_lo1_2 * G_lo1_3) + (F_lo1_3 * G_lo1_2) + (F_lo1_4 * G_lo1_1) + (F_lo1_5 * G_w1) + 19 * (F_lo1_6 * G_lo1_9) + 19 * (F_lo1_7 * G_lo1_8) + 19 * (F_lo1_8 * G_lo1_7) + 19 * (F_lo1_9 * G_lo1_6)
+    let Z3_a6 = (F_w1 * G_lo1_6) + 2 * (F_lo1_1 * G_lo1_5) + (F_lo1_2 * G_lo1_4) + 2 * (F_lo1_3 * G_lo1_3) + (F_lo1_4 * G_lo1_2) + 2 * (F_lo1_5 * G_lo1_1) + (F_lo1_6 * G_w1) + 38 * (F_lo1_7 * G_lo1_9) + 19 * (F_lo1_8 * G_lo1_8) + 38 * (F_lo1_9 * G_lo1_7)
+    let Z3_a7 = (F_w1 * G_lo1_7) + (F_lo1_1 * G_lo1_6) + (F_lo1_2 * G_lo1_5) + (F_lo1_3 * G_lo1_4) + (F_lo1_4 * G_lo1_3) + (F_lo1_5 * G_lo1_2) + (F_lo1_6 * G_lo1_1) + (F_lo1_7 * G_w1) + 19 * (F_lo1_8 * G_lo1_9) + 19 * (F_lo1_9 * G_lo1_8)
+    let Z3_a8 = (F_w1 * G_lo1_8) + 2 * (F_lo1_1 * G_lo1_7) + (F_lo1_2 * G_lo1_6) + 2 * (F_lo1_3 * G_lo1_5) + (F_lo1_4 * G_lo1_4) + 2 * (F_lo1_5 * G_lo1_3) + (F_lo1_6 * G_lo1_2) + 2 * (F_lo1_7 * G_lo1_1) + (F_lo1_8 * G_w1) + 38 * (F_lo1_9 * G_lo1_9)
+    let Z3_a9 = (F_w1 * G_lo1_9) + (F_lo1_1 * G_lo1_8) + (F_lo1_2 * G_lo1_7) + (F_lo1_3 * G_lo1_6) + (F_lo1_4 * G_lo1_5) + (F_lo1_5 * G_lo1_4) + (F_lo1_6 * G_lo1_3) + (F_lo1_7 * G_lo1_2) + (F_lo1_8 * G_lo1_1) + (F_lo1_9 * G_w1)
+    let Z3_c0_0 = shr(Z3_a0, 26)
+    let Z3_lo0_0 = band(Z3_a0, 67108863)
+    let Z3_s0_0 = Z3_a1 + Z3_c0_0
+    let Z3_c0_1 = shr(Z3_s0_0, 25)
+    let Z3_lo0_1 = band(Z3_s0_0, 33554431)
+    let Z3_s0_1 = Z3_a2 + Z3_c0_1
+    let Z3_c0_2 = shr(Z3_s0_1, 26)
+    let Z3_lo0_2 = band(Z3_s0_1, 67108863)
+    let Z3_s0_2 = Z3_a3 + Z3_c0_2
+    let Z3_c0_3 = shr(Z3_s0_2, 25)
+    let Z3_lo0_3 = band(Z3_s0_2, 33554431)
+    let Z3_s0_3 = Z3_a4 + Z3_c0_3
+    let Z3_c0_4 = shr(Z3_s0_3, 26)
+    let Z3_lo0_4 = band(Z3_s0_3, 67108863)
+    let Z3_s0_4 = Z3_a5 + Z3_c0_4
+    let Z3_c0_5 = shr(Z3_s0_4, 25)
+    let Z3_lo0_5 = band(Z3_s0_4, 33554431)
+    let Z3_s0_5 = Z3_a6 + Z3_c0_5
+    let Z3_c0_6 = shr(Z3_s0_5, 26)
+    let Z3_lo0_6 = band(Z3_s0_5, 67108863)
+    let Z3_s0_6 = Z3_a7 + Z3_c0_6
+    let Z3_c0_7 = shr(Z3_s0_6, 25)
+    let Z3_lo0_7 = band(Z3_s0_6, 33554431)
+    let Z3_s0_7 = Z3_a8 + Z3_c0_7
+    let Z3_c0_8 = shr(Z3_s0_7, 26)
+    let Z3_lo0_8 = band(Z3_s0_7, 67108863)
+    let Z3_s0_8 = Z3_a9 + Z3_c0_8
+    let Z3_c0_9 = shr(Z3_s0_8, 25)
+    let Z3_lo0_9 = band(Z3_s0_8, 33554431)
+    let Z3_w0 = Z3_lo0_0 + 19 * Z3_c0_9
+    let Z3_c1_0 = shr(Z3_w0, 26)
+    let Z3_lo1_0 = band(Z3_w0, 67108863)
+    let Z3_s1_0 = Z3_lo0_1 + Z3_c1_0
+    let Z3_c1_1 = shr(Z3_s1_0, 25)
+    let Z3_lo1_1 = band(Z3_s1_0, 33554431)
+    let Z3_s1_1 = Z3_lo0_2 + Z3_c1_1
+    let Z3_c1_2 = shr(Z3_s1_1, 26)
+    let Z3_lo1_2 = band(Z3_s1_1, 67108863)
+    let Z3_s1_2 = Z3_lo0_3 + Z3_c1_2
+    let Z3_c1_3 = shr(Z3_s1_2, 25)
+    let Z3_lo1_3 = band(Z3_s1_2, 33554431)
+    let Z3_s1_3 = Z3_lo0_4 + Z3_c1_3
+    let Z3_c1_4 = shr(Z3_s1_3, 26)
+    let Z3_lo1_4 = band(Z3_s1_3, 67108863)
+    let Z3_s1_4 = Z3_lo0_5 + Z3_c1_4
+    let Z3_c1_5 = shr(Z3_s1_4, 25)
+    let Z3_lo1_5 = band(Z3_s1_4, 33554431)
+    let Z3_s1_5 = Z3_lo0_6 + Z3_c1_5
+    let Z3_c1_6 = shr(Z3_s1_5, 26)
+    let Z3_lo1_6 = band(Z3_s1_5, 67108863)
+    let Z3_s1_6 = Z3_lo0_7 + Z3_c1_6
+    let Z3_c1_7 = shr(Z3_s1_6, 25)
+    let Z3_lo1_7 = band(Z3_s1_6, 33554431)
+    let Z3_s1_7 = Z3_lo0_8 + Z3_c1_7
+    let Z3_c1_8 = shr(Z3_s1_7, 26)
+    let Z3_lo1_8 = band(Z3_s1_7, 67108863)
+    let Z3_s1_8 = Z3_lo0_9 + Z3_c1_8
+    let Z3_c1_9 = shr(Z3_s1_8, 25)
+    let Z3_lo1_9 = band(Z3_s1_8, 33554431)
+    let Z3_w1 = Z3_lo1_0 + 19 * Z3_c1_9
+    let T3_a0 = (E_w1 * H_w1) + 38 * (E_lo1_1 * H_lo1_9) + 19 * (E_lo1_2 * H_lo1_8) + 38 * (E_lo1_3 * H_lo1_7) + 19 * (E_lo1_4 * H_lo1_6) + 38 * (E_lo1_5 * H_lo1_5) + 19 * (E_lo1_6 * H_lo1_4) + 38 * (E_lo1_7 * H_lo1_3) + 19 * (E_lo1_8 * H_lo1_2) + 38 * (E_lo1_9 * H_lo1_1)
+    let T3_a1 = (E_w1 * H_lo1_1) + (E_lo1_1 * H_w1) + 19 * (E_lo1_2 * H_lo1_9) + 19 * (E_lo1_3 * H_lo1_8) + 19 * (E_lo1_4 * H_lo1_7) + 19 * (E_lo1_5 * H_lo1_6) + 19 * (E_lo1_6 * H_lo1_5) + 19 * (E_lo1_7 * H_lo1_4) + 19 * (E_lo1_8 * H_lo1_3) + 19 * (E_lo1_9 * H_lo1_2)
+    let T3_a2 = (E_w1 * H_lo1_2) + 2 * (E_lo1_1 * H_lo1_1) + (E_lo1_2 * H_w1) + 38 * (E_lo1_3 * H_lo1_9) + 19 * (E_lo1_4 * H_lo1_8) + 38 * (E_lo1_5 * H_lo1_7) + 19 * (E_lo1_6 * H_lo1_6) + 38 * (E_lo1_7 * H_lo1_5) + 19 * (E_lo1_8 * H_lo1_4) + 38 * (E_lo1_9 * H_lo1_3)
+    let T3_a3 = (E_w1 * H_lo1_3) + (E_lo1_1 * H_lo1_2) + (E_lo1_2 * H_lo1_1) + (E_lo1_3 * H_w1) + 19 * (E_lo1_4 * H_lo1_9) + 19 * (E_lo1_5 * H_lo1_8) + 19 * (E_lo1_6 * H_lo1_7) + 19 * (E_lo1_7 * H_lo1_6) + 19 * (E_lo1_8 * H_lo1_5) + 19 * (E_lo1_9 * H_lo1_4)
+    let T3_a4 = (E_w1 * H_lo1_4) + 2 * (E_lo1_1 * H_lo1_3) + (E_lo1_2 * H_lo1_2) + 2 * (E_lo1_3 * H_lo1_1) + (E_lo1_4 * H_w1) + 38 * (E_lo1_5 * H_lo1_9) + 19 * (E_lo1_6 * H_lo1_8) + 38 * (E_lo1_7 * H_lo1_7) + 19 * (E_lo1_8 * H_lo1_6) + 38 * (E_lo1_9 * H_lo1_5)
+    let T3_a5 = (E_w1 * H_lo1_5) + (E_lo1_1 * H_lo1_4) + (E_lo1_2 * H_lo1_3) + (E_lo1_3 * H_lo1_2) + (E_lo1_4 * H_lo1_1) + (E_lo1_5 * H_w1) + 19 * (E_lo1_6 * H_lo1_9) + 19 * (E_lo1_7 * H_lo1_8) + 19 * (E_lo1_8 * H_lo1_7) + 19 * (E_lo1_9 * H_lo1_6)
+    let T3_a6 = (E_w1 * H_lo1_6) + 2 * (E_lo1_1 * H_lo1_5) + (E_lo1_2 * H_lo1_4) + 2 * (E_lo1_3 * H_lo1_3) + (E_lo1_4 * H_lo1_2) + 2 * (E_lo1_5 * H_lo1_1) + (E_lo1_6 * H_w1) + 38 * (E_lo1_7 * H_lo1_9) + 19 * (E_lo1_8 * H_lo1_8) + 38 * (E_lo1_9 * H_lo1_7)
+    let T3_a7 = (E_w1 * H_lo1_7) + (E_lo1_1 * H_lo1_6) + (E_lo1_2 * H_lo1_5) + (E_lo1_3 * H_lo1_4) + (E_lo1_4 * H_lo1_3) + (E_lo1_5 * H_lo1_2) + (E_lo1_6 * H_lo1_1) + (E_lo1_7 * H_w1) + 19 * (E_lo1_8 * H_lo1_9) + 19 * (E_lo1_9 * H_lo1_8)
+    let T3_a8 = (E_w1 * H_lo1_8) + 2 * (E_lo1_1 * H_lo1_7) + (E_lo1_2 * H_lo1_6) + 2 * (E_lo1_3 * H_lo1_5) + (E_lo1_4 * H_lo1_4) + 2 * (E_lo1_5 * H_lo1_3) + (E_lo1_6 * H_lo1_2) + 2 * (E_lo1_7 * H_lo1_1) + (E_lo1_8 * H_w1) + 38 * (E_lo1_9 * H_lo1_9)
+    let T3_a9 = (E_w1 * H_lo1_9) + (E_lo1_1 * H_lo1_8) + (E_lo1_2 * H_lo1_7) + (E_lo1_3 * H_lo1_6) + (E_lo1_4 * H_lo1_5) + (E_lo1_5 * H_lo1_4) + (E_lo1_6 * H_lo1_3) + (E_lo1_7 * H_lo1_2) + (E_lo1_8 * H_lo1_1) + (E_lo1_9 * H_w1)
+    let T3_c0_0 = shr(T3_a0, 26)
+    let T3_lo0_0 = band(T3_a0, 67108863)
+    let T3_s0_0 = T3_a1 + T3_c0_0
+    let T3_c0_1 = shr(T3_s0_0, 25)
+    let T3_lo0_1 = band(T3_s0_0, 33554431)
+    let T3_s0_1 = T3_a2 + T3_c0_1
+    let T3_c0_2 = shr(T3_s0_1, 26)
+    let T3_lo0_2 = band(T3_s0_1, 67108863)
+    let T3_s0_2 = T3_a3 + T3_c0_2
+    let T3_c0_3 = shr(T3_s0_2, 25)
+    let T3_lo0_3 = band(T3_s0_2, 33554431)
+    let T3_s0_3 = T3_a4 + T3_c0_3
+    let T3_c0_4 = shr(T3_s0_3, 26)
+    let T3_lo0_4 = band(T3_s0_3, 67108863)
+    let T3_s0_4 = T3_a5 + T3_c0_4
+    let T3_c0_5 = shr(T3_s0_4, 25)
+    let T3_lo0_5 = band(T3_s0_4, 33554431)
+    let T3_s0_5 = T3_a6 + T3_c0_5
+    let T3_c0_6 = shr(T3_s0_5, 26)
+    let T3_lo0_6 = band(T3_s0_5, 67108863)
+    let T3_s0_6 = T3_a7 + T3_c0_6
+    let T3_c0_7 = shr(T3_s0_6, 25)
+    let T3_lo0_7 = band(T3_s0_6, 33554431)
+    let T3_s0_7 = T3_a8 + T3_c0_7
+    let T3_c0_8 = shr(T3_s0_7, 26)
+    let T3_lo0_8 = band(T3_s0_7, 67108863)
+    let T3_s0_8 = T3_a9 + T3_c0_8
+    let T3_c0_9 = shr(T3_s0_8, 25)
+    let T3_lo0_9 = band(T3_s0_8, 33554431)
+    let T3_w0 = T3_lo0_0 + 19 * T3_c0_9
+    let T3_c1_0 = shr(T3_w0, 26)
+    let T3_lo1_0 = band(T3_w0, 67108863)
+    let T3_s1_0 = T3_lo0_1 + T3_c1_0
+    let T3_c1_1 = shr(T3_s1_0, 25)
+    let T3_lo1_1 = band(T3_s1_0, 33554431)
+    let T3_s1_1 = T3_lo0_2 + T3_c1_1
+    let T3_c1_2 = shr(T3_s1_1, 26)
+    let T3_lo1_2 = band(T3_s1_1, 67108863)
+    let T3_s1_2 = T3_lo0_3 + T3_c1_2
+    let T3_c1_3 = shr(T3_s1_2, 25)
+    let T3_lo1_3 = band(T3_s1_2, 33554431)
+    let T3_s1_3 = T3_lo0_4 + T3_c1_3
+    let T3_c1_4 = shr(T3_s1_3, 26)
+    let T3_lo1_4 = band(T3_s1_3, 67108863)
+    let T3_s1_4 = T3_lo0_5 + T3_c1_4
+    let T3_c1_5 = shr(T3_s1_4, 25)
+    let T3_lo1_5 = band(T3_s1_4, 33554431)
+    let T3_s1_5 = T3_lo0_6 + T3_c1_5
+    let T3_c1_6 = shr(T3_s1_5, 26)
+    let T3_lo1_6 = band(T3_s1_5, 67108863)
+    let T3_s1_6 = T3_lo0_7 + T3_c1_6
+    let T3_c1_7 = shr(T3_s1_6, 25)
+    let T3_lo1_7 = band(T3_s1_6, 33554431)
+    let T3_s1_7 = T3_lo0_8 + T3_c1_7
+    let T3_c1_8 = shr(T3_s1_7, 26)
+    let T3_lo1_8 = band(T3_s1_7, 67108863)
+    let T3_s1_8 = T3_lo0_9 + T3_c1_8
+    let T3_c1_9 = shr(T3_s1_8, 25)
+    let T3_lo1_9 = band(T3_s1_8, 33554431)
+    let T3_w1 = T3_lo1_0 + 19 * T3_c1_9
+    out = if g.which == 0 then X3_w1
+      else if g.which == 1 then X3_lo1_1
+      else if g.which == 2 then X3_lo1_2
+      else if g.which == 3 then X3_lo1_3
+      else if g.which == 4 then X3_lo1_4
+      else if g.which == 5 then X3_lo1_5
+      else if g.which == 6 then X3_lo1_6
+      else if g.which == 7 then X3_lo1_7
+      else if g.which == 8 then X3_lo1_8
+      else if g.which == 9 then X3_lo1_9
+      else if g.which == 10 then Y3_w1
+      else if g.which == 11 then Y3_lo1_1
+      else if g.which == 12 then Y3_lo1_2
+      else if g.which == 13 then Y3_lo1_3
+      else if g.which == 14 then Y3_lo1_4
+      else if g.which == 15 then Y3_lo1_5
+      else if g.which == 16 then Y3_lo1_6
+      else if g.which == 17 then Y3_lo1_7
+      else if g.which == 18 then Y3_lo1_8
+      else if g.which == 19 then Y3_lo1_9
+      else if g.which == 20 then Z3_w1
+      else if g.which == 21 then Z3_lo1_1
+      else if g.which == 22 then Z3_lo1_2
+      else if g.which == 23 then Z3_lo1_3
+      else if g.which == 24 then Z3_lo1_4
+      else if g.which == 25 then Z3_lo1_5
+      else if g.which == 26 then Z3_lo1_6
+      else if g.which == 27 then Z3_lo1_7
+      else if g.which == 28 then Z3_lo1_8
+      else if g.which == 29 then Z3_lo1_9
+      else if g.which == 30 then T3_w1
+      else if g.which == 31 then T3_lo1_1
+      else if g.which == 32 then T3_lo1_2
+      else if g.which == 33 then T3_lo1_3
+      else if g.which == 34 then T3_lo1_4
+      else if g.which == 35 then T3_lo1_5
+      else if g.which == 36 then T3_lo1_6
+      else if g.which == 37 then T3_lo1_7
+      else if g.which == 38 then T3_lo1_8
+      else T3_lo1_9
+  proofs:
+    purity:
+      reads : [g.x1_0, g.x1_1, g.x1_2, g.x1_3, g.x1_4, g.x1_5, g.x1_6, g.x1_7, g.x1_8, g.x1_9, g.y1_0, g.y1_1, g.y1_2, g.y1_3, g.y1_4, g.y1_5, g.y1_6, g.y1_7, g.y1_8, g.y1_9, g.z1_0, g.z1_1, g.z1_2, g.z1_3, g.z1_4, g.z1_5, g.z1_6, g.z1_7, g.z1_8, g.z1_9, g.t1_0, g.t1_1, g.t1_2, g.t1_3, g.t1_4, g.t1_5, g.t1_6, g.t1_7, g.t1_8, g.t1_9, g.x2_0, g.x2_1, g.x2_2, g.x2_3, g.x2_4, g.x2_5, g.x2_6, g.x2_7, g.x2_8, g.x2_9, g.y2_0, g.y2_1, g.y2_2, g.y2_3, g.y2_4, g.y2_5, g.y2_6, g.y2_7, g.y2_8, g.y2_9, g.z2_0, g.z2_1, g.z2_2, g.z2_3, g.z2_4, g.z2_5, g.z2_6, g.z2_7, g.z2_8, g.z2_9, g.t2_0, g.t2_1, g.t2_2, g.t2_3, g.t2_4, g.t2_5, g.t2_6, g.t2_7, g.t2_8, g.t2_9, g.which]
+      calls : []
+    termination:
+      bound : 200000

@@ -1,0 +1,10 @@
+AES-128 KeyExpansion: 16-byte master key → 11 round keys (176 bytes).
+Round 0 = master key; rounds 1..10 computed iteratively.
+For word i (i=4..43) at round r = i/4:
+  if i % 4 == 0:
+    temp = SubWord(RotWord(W[i-1])) XOR Rcon[r]
+  else:
+    temp = W[i-1]
+  W[i] = W[i-4] XOR temp
+Rcon[1..10] = 01 02 04 08 10 20 40 80 1b 36 (round constants in GF(2^8)).
+Single rule round_key(master, round, which) returns one byte.

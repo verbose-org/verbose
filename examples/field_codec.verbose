@@ -1,0 +1,141 @@
+@verbose 0.1.0
+
+concept DecodeInput
+  @intention: "32-byte little-endian field element + which limb (0..9)"
+  @source: invoices.intent:1
+  fields:
+    s : text
+    which : number [0, 9]
+
+
+concept EncodeInput
+  @intention: "10 reduced 26/25-bit limbs + which output byte (0..31)"
+  @source: invoices.intent:1
+  fields:
+    l0 : number [0, 67108863]
+    l1 : number [0, 67108863]
+    l2 : number [0, 67108863]
+    l3 : number [0, 67108863]
+    l4 : number [0, 67108863]
+    l5 : number [0, 67108863]
+    l6 : number [0, 67108863]
+    l7 : number [0, 67108863]
+    l8 : number [0, 67108863]
+    l9 : number [0, 67108863]
+    which : number [0, 31]
+
+
+rule decode
+  @intention: "decode 32 little-endian bytes to limb `which` of a field element"
+  @source: invoices.intent:1
+  input:
+    g : DecodeInput
+  output:
+    out : number
+  logic:
+    let d0 = band(shr(band(bor(bor(bor(byte_at(g.s, 0), shl(byte_at(g.s, 1), 8)), shl(byte_at(g.s, 2), 16)), shl(byte_at(g.s, 3), 24)), 4294967295), 0), 67108863)
+    let d1 = band(shr(band(bor(bor(bor(byte_at(g.s, 3), shl(byte_at(g.s, 4), 8)), shl(byte_at(g.s, 5), 16)), shl(byte_at(g.s, 6), 24)), 4294967295), 2), 33554431)
+    let d2 = band(shr(band(bor(bor(bor(byte_at(g.s, 6), shl(byte_at(g.s, 7), 8)), shl(byte_at(g.s, 8), 16)), shl(byte_at(g.s, 9), 24)), 4294967295), 3), 67108863)
+    let d3 = band(shr(band(bor(bor(bor(byte_at(g.s, 9), shl(byte_at(g.s, 10), 8)), shl(byte_at(g.s, 11), 16)), shl(byte_at(g.s, 12), 24)), 4294967295), 5), 33554431)
+    let d4 = band(shr(band(bor(bor(bor(byte_at(g.s, 12), shl(byte_at(g.s, 13), 8)), shl(byte_at(g.s, 14), 16)), shl(byte_at(g.s, 15), 24)), 4294967295), 6), 67108863)
+    let d5 = band(shr(band(bor(bor(bor(byte_at(g.s, 16), shl(byte_at(g.s, 17), 8)), shl(byte_at(g.s, 18), 16)), shl(byte_at(g.s, 19), 24)), 4294967295), 0), 33554431)
+    let d6 = band(shr(band(bor(bor(bor(byte_at(g.s, 19), shl(byte_at(g.s, 20), 8)), shl(byte_at(g.s, 21), 16)), shl(byte_at(g.s, 22), 24)), 4294967295), 1), 67108863)
+    let d7 = band(shr(band(bor(bor(bor(byte_at(g.s, 22), shl(byte_at(g.s, 23), 8)), shl(byte_at(g.s, 24), 16)), shl(byte_at(g.s, 25), 24)), 4294967295), 3), 33554431)
+    let d8 = band(shr(band(bor(bor(bor(byte_at(g.s, 25), shl(byte_at(g.s, 26), 8)), shl(byte_at(g.s, 27), 16)), shl(byte_at(g.s, 28), 24)), 4294967295), 4), 67108863)
+    let d9 = band(shr(band(bor(bor(bor(byte_at(g.s, 28), shl(byte_at(g.s, 29), 8)), shl(byte_at(g.s, 30), 16)), shl(byte_at(g.s, 31), 24)), 4294967295), 6), 33554431)
+    out = if g.which == 0 then d0
+      else if g.which == 1 then d1
+      else if g.which == 2 then d2
+      else if g.which == 3 then d3
+      else if g.which == 4 then d4
+      else if g.which == 5 then d5
+      else if g.which == 6 then d6
+      else if g.which == 7 then d7
+      else if g.which == 8 then d8
+      else d9
+  proofs:
+    purity:
+      reads : [g.s, g.which]
+      calls : []
+    termination:
+      bound : 2000
+
+
+rule encode
+  @intention: "encode 10 limbs to little-endian byte `which` (0..31) of the reduced field element"
+  @source: invoices.intent:1
+  input:
+    g : EncodeInput
+  output:
+    out : number
+  logic:
+    let e0 = band(g.l0, 255)
+    let e1 = band(shr(g.l0, 8), 255)
+    let e2 = band(shr(g.l0, 16), 255)
+    let e3 = band(bor(shr(g.l0, 24), shl(g.l1, 2)), 255)
+    let e4 = band(shr(g.l1, 6), 255)
+    let e5 = band(shr(g.l1, 14), 255)
+    let e6 = band(bor(shr(g.l1, 22), shl(g.l2, 3)), 255)
+    let e7 = band(shr(g.l2, 5), 255)
+    let e8 = band(shr(g.l2, 13), 255)
+    let e9 = band(bor(shr(g.l2, 21), shl(g.l3, 5)), 255)
+    let e10 = band(shr(g.l3, 3), 255)
+    let e11 = band(shr(g.l3, 11), 255)
+    let e12 = band(bor(shr(g.l3, 19), shl(g.l4, 6)), 255)
+    let e13 = band(shr(g.l4, 2), 255)
+    let e14 = band(shr(g.l4, 10), 255)
+    let e15 = band(shr(g.l4, 18), 255)
+    let e16 = band(g.l5, 255)
+    let e17 = band(shr(g.l5, 8), 255)
+    let e18 = band(shr(g.l5, 16), 255)
+    let e19 = band(bor(shr(g.l5, 24), shl(g.l6, 1)), 255)
+    let e20 = band(shr(g.l6, 7), 255)
+    let e21 = band(shr(g.l6, 15), 255)
+    let e22 = band(bor(shr(g.l6, 23), shl(g.l7, 3)), 255)
+    let e23 = band(shr(g.l7, 5), 255)
+    let e24 = band(shr(g.l7, 13), 255)
+    let e25 = band(bor(shr(g.l7, 21), shl(g.l8, 4)), 255)
+    let e26 = band(shr(g.l8, 4), 255)
+    let e27 = band(shr(g.l8, 12), 255)
+    let e28 = band(bor(shr(g.l8, 20), shl(g.l9, 6)), 255)
+    let e29 = band(shr(g.l9, 2), 255)
+    let e30 = band(shr(g.l9, 10), 255)
+    let e31 = band(shr(g.l9, 18), 255)
+    out = if g.which == 0 then e0
+      else if g.which == 1 then e1
+      else if g.which == 2 then e2
+      else if g.which == 3 then e3
+      else if g.which == 4 then e4
+      else if g.which == 5 then e5
+      else if g.which == 6 then e6
+      else if g.which == 7 then e7
+      else if g.which == 8 then e8
+      else if g.which == 9 then e9
+      else if g.which == 10 then e10
+      else if g.which == 11 then e11
+      else if g.which == 12 then e12
+      else if g.which == 13 then e13
+      else if g.which == 14 then e14
+      else if g.which == 15 then e15
+      else if g.which == 16 then e16
+      else if g.which == 17 then e17
+      else if g.which == 18 then e18
+      else if g.which == 19 then e19
+      else if g.which == 20 then e20
+      else if g.which == 21 then e21
+      else if g.which == 22 then e22
+      else if g.which == 23 then e23
+      else if g.which == 24 then e24
+      else if g.which == 25 then e25
+      else if g.which == 26 then e26
+      else if g.which == 27 then e27
+      else if g.which == 28 then e28
+      else if g.which == 29 then e29
+      else if g.which == 30 then e30
+      else e31
+  proofs:
+    purity:
+      reads : [g.l0, g.l1, g.l2, g.l3, g.l4, g.l5, g.l6, g.l7, g.l8, g.l9, g.which]
+      calls : []
+    termination:
+      bound : 2000

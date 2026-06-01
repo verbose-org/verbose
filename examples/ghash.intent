@@ -1,0 +1,7 @@
+GHASH over 2 blocks under the GCM field (NIST SP 800-38D §6.4).
+GHASH folds the GF(2^128) multiply by the hash subkey H over a block
+sequence: Y=0; for each block B: Y = (Y XOR B) * H.
+This minimal instance covers the simplest GCM authentication input:
+one ciphertext block (blk0) followed by the length block (blk1), with
+empty AAD. Result Y2 = ((blk0 * H) XOR blk1) * H feeds the GCM tag.
+Single rule ghash(H, blk0, blk1, which) returns one byte of Y2.

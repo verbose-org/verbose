@@ -1,0 +1,8 @@
+GF(2^128) multiplication under the GCM reduction polynomial
+x^128 + x^7 + x^2 + x + 1 (NIST SP 800-38D, Algorithm 1).
+128-bit operands X, Y as 16 big-endian bytes each.
+Shift-and-add: Z=0, V=X; for each bit of Y (MSB-first, byte 0 first)
+conditionally XOR V into Z, then shift V right one bit and reduce by
+R = 0xe1 || 0^120 when the bit shifted out is set.
+This is the core multiply of GHASH (GCM authentication).
+Single rule gf128_mul(X, Y, which) returns one product byte.

@@ -1,0 +1,11 @@
+AES-128-GCM authenticated encryption (AEAD): one 16-byte plaintext
+block, 96-bit IV, empty AAD. Composes every prior crypto brick:
+  H   = AES-128(key, 0^128)          (hash subkey)
+  J0  = IV || 0x00000001             (pre-counter block, 96-bit IV)
+  C   = P XOR AES-128(key, inc32(J0)) (CTR encryption of the block)
+  S   = GHASH_H(C || lengths)         (GF(2^128) authentication)
+  tag = S XOR AES-128(key, J0)
+Output is C || tag (32 bytes). The single key schedule is shared by
+all three AES block calls. Validated bit-for-bit against NIST GCM
+Test Case 2 and a Python GCM reference.
+Single rule gcm_encrypt(key, iv, plaintext, which) returns one byte.

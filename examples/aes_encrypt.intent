@@ -1,0 +1,9 @@
+AES-128 single-block ECB encrypt: 16-byte plaintext + 16-byte key → 16-byte ciphertext.
+Composes KeyExpansion + the four round transforms into the full cipher:
+  state = plaintext XOR roundkey[0]
+  for round 1..9:
+    state = AddRoundKey(MixColumns(ShiftRows(SubBytes(state))), roundkey[round])
+  state = AddRoundKey(ShiftRows(SubBytes(state)), roundkey[10])   # no MixColumns
+  ciphertext = state
+Single rule encrypt(plaintext, key, which) returns one ciphertext byte.
+Validated against FIPS-197 Appendix C.1 and `openssl enc -aes-128-ecb`.
