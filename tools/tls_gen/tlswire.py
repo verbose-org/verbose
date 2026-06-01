@@ -9,11 +9,91 @@ import struct
 def u16(b,o): return (b[o]<<8)|b[o+1]
 def u24(b,o): return (b[o]<<16)|(b[o+1]<<8)|b[o+2]
 
+
+def read_handshake_message(conn, leftover: bytes = b""):
+    """Reassemble ONE handshake message from one or more consecutive TLS records.
+
+    A browser ClientHello can be fragmented across multiple 0x16 (handshake)
+    TLS records (RFC 8446 §5.1: handshake messages MAY span record boundaries).
+    This reads records off the socket, concatenates their *fragments* (the bytes
+    after the 5-byte record header), and stops once the leading handshake
+    message's 3-byte length is satisfied.
+
+    Returns (hs_message_bytes, leftover_record_bytes):
+      - hs_message_bytes: a single handshake message = type(1) + len(3) + body.
+        (Exactly the bytes tls semantics call the "handshake-message bytes".)
+      - leftover_record_bytes: any unconsumed raw record bytes already pulled
+        off the socket (caller passes them back in on the next call).
+
+    Raises ConnectionError if the peer closes before a full message arrives.
+    """
+    rec_buf = leftover           # raw record bytes (may hold >1 record)
+    hs_buf = b""                 # reassembled handshake fragments
+    while True:
+        # Drain any whole records currently buffered into hs_buf.
+        while len(rec_buf) >= 5:
+            ctype = rec_buf[0]
+            rlen = u16(rec_buf, 3)
+            if len(rec_buf) < 5 + rlen:
+                break  # partial record, need more bytes
+            frag = rec_buf[5:5 + rlen]
+            rec_buf = rec_buf[5 + rlen:]
+            if ctype == 0x16:
+                hs_buf += frag
+            elif ctype == 0x14:
+                # ChangeCipherSpec interleaved (middlebox compat) — ignore it,
+                # it is not part of the handshake transcript.
+                continue
+            else:
+                # Anything else (alert, app data) before the handshake message
+                # is complete is unexpected at this point; surface it.
+                raise ConnectionError(f"unexpected record type 0x{ctype:02x} "
+                                      f"while reassembling handshake message")
+            # Do we now hold a complete handshake message?
+            if len(hs_buf) >= 4:
+                hlen = u24(hs_buf, 1)
+                if len(hs_buf) >= 4 + hlen:
+                    msg = hs_buf[:4 + hlen]
+                    # Stash any handshake bytes past this message back into hs?
+                    # In practice a ClientHello is the only message in its
+                    # records, so trailing hs bytes are unexpected; keep them
+                    # for safety by re-prepending as a synthetic record is not
+                    # possible, so assert none remain.
+                    assert len(hs_buf) == 4 + hlen, \
+                        "trailing handshake bytes after ClientHello unsupported"
+                    return msg, rec_buf
+        # Need more bytes off the wire.
+        chunk = conn.recv(4096)
+        if not chunk:
+            raise ConnectionError("connection closed during handshake reassembly")
+        rec_buf += chunk
+
+
 class ClientHello:
     def __init__(self, record: bytes):
+        # Accept EITHER a raw TLS record (starts with 0x16, the original API)
+        # OR a bare handshake message (starts with 0x01 ClientHello). The latter
+        # lets callers feed a reassembled multi-record message directly.
+        if record and record[0] == 0x01:
+            self._from_handshake(record)
+            return
         assert record[0]==0x16, "not a handshake record"
         rlen=u16(record,3)
         self.handshake = record[5:5+rlen]
+        self._parse_body()
+
+    @classmethod
+    def from_handshake(cls, hs: bytes):
+        """Build from a reassembled handshake message (type 0x01 + len + body)."""
+        self = cls.__new__(cls)
+        self._from_handshake(hs)
+        return self
+
+    def _from_handshake(self, hs: bytes):
+        self.handshake = hs
+        self._parse_body()
+
+    def _parse_body(self):
         hs=self.handshake
         assert hs[0]==0x01, "not ClientHello"
         hlen=u24(hs,1)
@@ -40,18 +120,33 @@ class ClientHello:
             self.ext_offsets[et]=(o+eo, o+eo+4+el)
             eo+=4+el
         self._parse_key_share()
+        self._parse_supported_groups()
         self._parse_psk()
 
     def _parse_key_share(self):
         self.x25519_pub=None
+        self.key_share_groups=set()   # groups the client sent a key_share for
         ks=self.extensions.get(0x0033)
         if not ks: return
         total=u16(ks,0); p=2
         while p+4<=2+total:
             grp=u16(ks,p); kl=u16(ks,p+2)
+            self.key_share_groups.add(grp)
             if grp==0x001d:  # x25519
                 self.x25519_pub=ks[p+4:p+4+kl]
             p+=4+kl
+
+    def _parse_supported_groups(self):
+        # supported_groups (a.k.a. NamedGroupList), extension type 0x000a.
+        # The client lists every group it is WILLING to use, in preference
+        # order, even ones for which it did not send a key_share.
+        self.supported_groups=[]
+        sg=self.extensions.get(0x000a)
+        if not sg: return
+        total=u16(sg,0); p=2
+        while p+2<=2+total:
+            self.supported_groups.append(u16(sg,p))
+            p+=2
 
     def _parse_psk(self):
         self.psk_identity=None; self.psk_binder=None; self.binders_offset=None
