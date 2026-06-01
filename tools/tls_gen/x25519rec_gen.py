@@ -197,7 +197,7 @@ for slot in SAVED:
 for inp in INPUTS:
     for i in range(10): rf.append(f"{inp}_{i}: s.{inp}_{i}")
 rf += ["j: s.j - 1", "which: s.which"]
-rec = "x25519_finish_rec(X25519RecState { " + ", ".join(rf) + " })"
+rec = "x25519_finish(X25519RecState { " + ", ".join(rf) + " })"
 body = f"if s.j == 0 then {finalize} else {rec}"
 
 # ---- assemble .verbose text ----
@@ -212,7 +212,7 @@ for slot in ALL_SLOTS:
 L.append(f"    j : number [0, {NSTEPS}]")
 L.append("    which : number [0, 31]")
 
-L += ["", "", "rule x25519_finish_rec",
+L += ["", "", "rule x25519_finish",
       '  @intention: "X25519 finish via the curve25519 Fermat inverse addition chain, recursive: EXACTLY ONE conditional field multiply per frame (operand muxed by step counter — square or junction, never both), 265 step-frames (decreasing j); base case multiplies x2 by z^(p-2), little-endian encodes, returns byte which. Same algorithm and same 266-fmul count as the unrolled emit_finv; bit-for-bit identical result, zero extra field multiplies."',
       "  @source: invoices.intent:1", "  input:", "    s : X25519RecState",
       "  output:", "    out : number", "  logic:"]
@@ -224,7 +224,7 @@ for slot in ALL_SLOTS:
     reads += [f"s.{slot}_{i}" for i in range(10)]
 reads += ["s.j", "s.which"]
 L += ["  proofs:", "    purity:", f"      reads : [{', '.join(reads)}]",
-      "      calls : [x25519_finish_rec]",
+      "      calls : [x25519_finish]",
       "    termination:", "      bound : 2000000", "      decreasing : j"]
 
 out_path = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "..",

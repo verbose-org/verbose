@@ -67,9 +67,28 @@ def x25519(scalar32: bytes, u32: bytes) -> bytes:
         return _one(binp, a, w) if False else int(subprocess.run([binp]+a,capture_output=True,text=True,timeout=600).stdout.strip())
     futs = {w:_POOL.submit(lad,w) for w in range(20)}
     limbs = [futs[w].result() for w in range(20)]
-    # finish takes x2[10]+z2[10], returns 32 output bytes
-    fin_args = [str(v) for v in limbs]
-    return run_bytes("x25519_finish", fin_args, 32)
+    x2 = limbs[0:10]; z2 = limbs[10:20]
+    # Recursive finish (x25519_rec.verbose): state seeded by the host —
+    # t = z = z2, the 8 saved-intermediate slots = 0, x2 = ladder numerator,
+    # j = 265. Same 266 field-muls as the unrolled finish, 31x smaller binary.
+    zero = [0]*10
+    # State groups in order: t, z2, z9, z11, z2_5_0, z2_10_0, z2_20_0,
+    # z2_50_0, z2_100_0, z, x2, then j.
+    fin_state = (
+        [str(v) for v in z2]          # t
+        + [str(v) for v in z2]        # z2
+        + [str(v) for v in zero]      # z9
+        + [str(v) for v in zero]      # z11
+        + [str(v) for v in zero]      # z2_5_0
+        + [str(v) for v in zero]      # z2_10_0
+        + [str(v) for v in zero]      # z2_20_0
+        + [str(v) for v in zero]      # z2_50_0
+        + [str(v) for v in zero]      # z2_100_0
+        + [str(v) for v in z2]        # z (== z2 input)
+        + [str(v) for v in x2]        # x2
+        + ["265"]                     # j
+    )
+    return run_bytes("x25519_finish", fin_state, 32)
 
 # ---- SHA-256 (pure Verbose) of arbitrary bytes ----
 H0=[0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19]
@@ -160,7 +179,7 @@ def aead_decrypt(key16, iv12, seq, record):
     return (plain[i], bytes(plain[:i]))
 
 ALL_RULES = [
-    ("ladder","ladder_recursive.verbose"), ("x25519_finish","x25519.verbose"),
+    ("ladder","ladder_recursive.verbose"), ("x25519_finish","x25519_rec.verbose"),
     ("sha256_fold","sha256_fold.verbose"),
     ("handshake_secret","handshake_secret.verbose"),
     ("derive_s_hs_traffic","derive_secret.verbose"),
