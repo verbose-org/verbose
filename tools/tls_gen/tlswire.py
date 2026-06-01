@@ -121,7 +121,18 @@ class ClientHello:
             eo+=4+el
         self._parse_key_share()
         self._parse_supported_groups()
+        self._parse_alpn()
+        self._parse_sig_algs()
         self._parse_psk()
+
+    def _parse_sig_algs(self):
+        # signature_algorithms (ext 0x000d): u16 list_len then u16 SignatureScheme entries.
+        self.sig_algs=[]
+        sa=self.extensions.get(0x000d)
+        if not sa or len(sa)<2: return
+        total=u16(sa,0); p=2
+        while p+2<=2+total:
+            self.sig_algs.append(u16(sa,p)); p+=2
 
     def _parse_key_share(self):
         self.x25519_pub=None
@@ -147,6 +158,23 @@ class ClientHello:
         while p+2<=2+total:
             self.supported_groups.append(u16(sg,p))
             p+=2
+
+    def _parse_alpn(self):
+        # application_layer_protocol_negotiation (RFC 7301), extension 0x0010.
+        # ext body: ProtocolNameList = u16(list_len) then a sequence of
+        #   u8(name_len) || name bytes. We only need the offered protocol names
+        #   so the server can echo http/1.1 back in EncryptedExtensions.
+        self.alpn_protocols = []
+        a = self.extensions.get(0x0010)
+        if not a or len(a) < 2:
+            return
+        total = u16(a, 0); p = 2
+        while p + 1 <= 2 + total and p < len(a):
+            nlen = a[p]; p += 1
+            if p + nlen > len(a):
+                break
+            self.alpn_protocols.append(a[p:p + nlen])
+            p += nlen
 
     def _parse_psk(self):
         self.psk_identity=None; self.psk_binder=None; self.binders_offset=None
