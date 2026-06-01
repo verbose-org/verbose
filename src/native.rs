@@ -1402,6 +1402,21 @@ fn callable_let_is_text(expr: &Expr, rule: &Rule, concepts: &[&Concept]) -> bool
 }
 
 fn callable_let_is_text_for_frame(expr: &Expr, concept: &Concept) -> bool {
+    callable_let_is_text_for_frame_ctx(expr, concept, &HashSet::new())
+}
+
+/// Order-aware text classification for a callable's let RHS. An `Ident` is
+/// text ONLY when it names a known text binding (`text_lets`) or a text input
+/// field — NOT for every Ident. The old blanket `Ident => true` broke on a
+/// number let whose RHS the optimizer folded to a bare Ident (e.g.
+/// `let v = 0 + cc` → `let v = cc`, with cc a number let): it sized v as text,
+/// then the eval loop's text branch had no handler for a number-aliasing Ident
+/// and silently skipped registering v, leaving it unresolved downstream.
+fn callable_let_is_text_for_frame_ctx(
+    expr: &Expr,
+    concept: &Concept,
+    text_lets: &HashSet<&str>,
+) -> bool {
     match expr {
         Expr::Text(_) | Expr::Concat(_) | Expr::Substring(_, _, _) => true,
         Expr::Field(base, fname) => {
@@ -1410,7 +1425,11 @@ fn callable_let_is_text_for_frame(expr: &Expr, concept: &Concept) -> bool {
             } else { false }
         }
         Expr::Read(_) | Expr::Fetch(_, _) => true,
-        Expr::Ident(_) => true, // conservative: might be text binding
+        Expr::Ident(name) => {
+            // text iff it aliases a prior text let or a text input field
+            text_lets.contains(name.as_str())
+                || concept.fields.iter().any(|f| &f.name == name && matches!(f.ty, Type::Text))
+        }
         _ => false,
     }
 }
@@ -3772,10 +3791,22 @@ fn emit_callable_into<'a>(
     } else {
         0
     };
-    // Classify let bindings for frame sizing.
-    let callable_binding_is_text: Vec<bool> = rule.logic.bindings.iter()
-        .map(|(_, expr)| callable_let_is_text_for_frame(expr, concept))
-        .collect();
+    // Classify let bindings for frame sizing. Order-aware: an `Ident` RHS is
+    // text ONLY when it names a prior TEXT let or a text input field —
+    // otherwise it's a number alias (e.g. the optimizer folds
+    // `let x = 0 + y` to `let x = y` where y is a number let). The previous
+    // blanket `Ident => true` mis-sized those as text and then dropped them
+    // in the eval loop's `_ => {}` text no-op, leaving the name unresolved.
+    let callable_binding_is_text: Vec<bool> = {
+        let mut seen_text: HashSet<&str> = HashSet::new();
+        rule.logic.bindings.iter()
+            .map(|(name, expr)| {
+                let is_text = callable_let_is_text_for_frame_ctx(expr, concept, &seen_text);
+                if is_text { seen_text.insert(name.as_str()); }
+                is_text
+            })
+            .collect()
+    };
     let n_let_slots: usize = callable_binding_is_text.iter()
         .map(|b| if *b { 2 } else { 1 })
         .sum();
