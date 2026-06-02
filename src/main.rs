@@ -15,13 +15,15 @@ mod verifier;
 mod wasm;
 
 fn main() {
-    // Run the real main on a dedicated 16 MiB stack — examples with deeply
-    // nested if/else chains (256-way AES S-box, 64-way SHA-256 K/W lookups)
-    // recurse through the parser/verifier/emitter tree walkers and overflow
-    // the 2 MiB default stack. 16 MiB covers every example in the repo with
-    // generous headroom.
+    // Run the real main on a dedicated 64 MiB stack — examples with deeply
+    // nested if/else chains (256-way AES S-box, 64-way SHA-256 K/W lookups) and
+    // the large recursive crypto emitters (p256_scalarmult/ninv, x25519) recurse
+    // through the parser/verifier/emitter tree walkers and overflow smaller
+    // stacks. 64 MiB covers every example with headroom — note debug builds and
+    // musl (Alpine CI) use bigger frames than a glibc release build, so the
+    // bound must hold for the worst case, not the local one.
     let handle = std::thread::Builder::new()
-        .stack_size(16 * 1024 * 1024)
+        .stack_size(64 * 1024 * 1024)
         .spawn(real_main)
         .expect("spawn main thread");
     match handle.join() {

@@ -27835,7 +27835,7 @@ rule extract_word
     #[test]
     fn sha256_abc_matches_sha256sum() {
         let handle = std::thread::Builder::new()
-            .stack_size(16 * 1024 * 1024)
+            .stack_size(64 * 1024 * 1024)
             .spawn(sha256_abc_test_body)
             .expect("spawn test thread");
         handle.join().expect("test thread panicked");
@@ -27874,7 +27874,7 @@ rule extract_word
     #[test]
     fn sha256_full_256bit_matches_sha256sum() {
         let handle = std::thread::Builder::new()
-            .stack_size(16 * 1024 * 1024)
+            .stack_size(64 * 1024 * 1024)
             .spawn(sha256_full_test_body)
             .expect("spawn test thread");
         handle.join().expect("test thread panicked");
@@ -27938,7 +27938,7 @@ rule extract_word
     #[test]
     fn sha256_text_matches_sha256sum_for_multiple_inputs() {
         let handle = std::thread::Builder::new()
-            .stack_size(16 * 1024 * 1024)
+            .stack_size(64 * 1024 * 1024)
             .spawn(sha256_text_test_body)
             .expect("spawn test thread");
         handle.join().expect("test thread panicked");
@@ -27989,7 +27989,7 @@ rule extract_word
     #[test]
     fn sha256_multi_2blocks_matches_sha256sum() {
         let handle = std::thread::Builder::new()
-            .stack_size(16 * 1024 * 1024)
+            .stack_size(64 * 1024 * 1024)
             .spawn(sha256_multi_test_body)
             .expect("spawn test thread");
         handle.join().expect("test thread panicked");
@@ -28053,7 +28053,7 @@ rule extract_word
     #[test]
     fn sha256_nblocks_8block_boundaries() {
         let handle = std::thread::Builder::new()
-            .stack_size(16 * 1024 * 1024)
+            .stack_size(64 * 1024 * 1024)
             .spawn(sha256_nblocks_test_body)
             .expect("spawn test thread");
         handle.join().expect("test thread panicked");
@@ -28106,7 +28106,7 @@ rule extract_word
     #[test]
     fn sha256_big_64blocks() {
         let handle = std::thread::Builder::new()
-            .stack_size(16 * 1024 * 1024)
+            .stack_size(64 * 1024 * 1024)
             .spawn(sha256_big_test_body)
             .expect("spawn test thread");
         handle.join().expect("test thread panicked");
@@ -28158,7 +28158,7 @@ rule extract_word
     #[test]
     fn aes_sbox_exhaustive_matches_fips197() {
         let handle = std::thread::Builder::new()
-            .stack_size(16 * 1024 * 1024)
+            .stack_size(64 * 1024 * 1024)
             .spawn(aes_sbox_test_body)
             .expect("spawn test thread");
         handle.join().expect("test thread panicked");
@@ -28220,7 +28220,7 @@ rule extract_word
         // a column-major 4x4 state, so b[i] = matrix[i % 4][i / 4]. Each
         // rule returns the byte at output position `which` (0..15).
         let handle = std::thread::Builder::new()
-            .stack_size(16 * 1024 * 1024)
+            .stack_size(64 * 1024 * 1024)
             .spawn(aes_transforms_test_body)
             .expect("spawn test thread");
         handle.join().expect("test thread panicked");
@@ -28324,7 +28324,7 @@ rule extract_word
         // example) and "2b 7e 15 ... 3c" (FIPS-197 Appendix B). Each of
         // the 11 round keys × 16 bytes = 176 dispatches must match.
         let handle = std::thread::Builder::new()
-            .stack_size(16 * 1024 * 1024)
+            .stack_size(64 * 1024 * 1024)
             .spawn(aes_key_expansion_test_body)
             .expect("spawn test thread");
         handle.join().expect("test thread panicked");
@@ -28429,7 +28429,7 @@ rule extract_word
         //   - FIPS-197 Appendix C.1
         //   - NIST SP 800-38A F.1.1 block 1
         let handle = std::thread::Builder::new()
-            .stack_size(16 * 1024 * 1024)
+            .stack_size(64 * 1024 * 1024)
             .spawn(aes128_encrypt_test_body)
             .expect("spawn test thread");
         handle.join().expect("test thread panicked");
@@ -28489,7 +28489,7 @@ rule extract_word
         // (zero operands, the GCM multiplicative identity 0x80..00, and the
         // all-ones reduction-heavy case).
         let handle = std::thread::Builder::new()
-            .stack_size(16 * 1024 * 1024)
+            .stack_size(64 * 1024 * 1024)
             .spawn(ghash_gf128_mul_test_body)
             .expect("spawn test thread");
         handle.join().expect("test thread panicked");
@@ -28573,7 +28573,7 @@ rule extract_word
         // against NIST SP 800-38A F.5.1 blocks 1 and 2 (block 2 uses counter IV+1),
         // plus a CTR-is-its-own-inverse round-trip.
         let handle = std::thread::Builder::new()
-            .stack_size(16 * 1024 * 1024)
+            .stack_size(64 * 1024 * 1024)
             .spawn(aes128_ctr_test_body)
             .expect("spawn test thread");
         handle.join().expect("test thread panicked");
@@ -28648,7 +28648,7 @@ rule extract_word
         // large-frame path (~9000 lets) that surfaced and fixed the broken
         // machine-code peephole.
         let handle = std::thread::Builder::new()
-            .stack_size(16 * 1024 * 1024)
+            .stack_size(64 * 1024 * 1024)
             .spawn(ghash_two_blocks_test_body)
             .expect("spawn test thread");
         handle.join().expect("test thread panicked");
@@ -28799,7 +28799,7 @@ rule extract_word
         // vector (NIST Test Case 3's key/IV, whose first ciphertext block is
         // the published 42831ec2..) against a self-contained Rust GCM reference.
         let handle = std::thread::Builder::new()
-            .stack_size(16 * 1024 * 1024)
+            .stack_size(64 * 1024 * 1024)
             .spawn(aes128_gcm_test_body)
             .expect("spawn test thread");
         handle.join().expect("test thread panicked");
@@ -28932,7 +28932,7 @@ rule extract_word
         // b0344c61.. is published) and cross-checked on an alternate key via a
         // self-contained Rust SHA-256/HMAC reference.
         let handle = std::thread::Builder::new()
-            .stack_size(16 * 1024 * 1024)
+            .stack_size(64 * 1024 * 1024)
             .spawn(hmac_sha256_test_body)
             .expect("spawn test thread");
         handle.join().expect("test thread panicked");
@@ -29001,7 +29001,7 @@ rule extract_word
         // T(i)=HMAC(PRK, T(i-1)||info||i)). Anchored on RFC 5869 Test Case 1,
         // whose PRK and OKM are both published.
         let handle = std::thread::Builder::new()
-            .stack_size(16 * 1024 * 1024)
+            .stack_size(64 * 1024 * 1024)
             .spawn(hkdf_test_body)
             .expect("spawn test thread");
         handle.join().expect("test thread panicked");
@@ -29112,7 +29112,7 @@ rule extract_word
     #[test]
     fn x25519_field_arith_matches_reference() {
         let h = std::thread::Builder::new()
-            .stack_size(16 * 1024 * 1024)
+            .stack_size(64 * 1024 * 1024)
             .spawn(x25519_field_arith_test_body)
             .expect("spawn");
         h.join().expect("test thread panicked");
@@ -29176,7 +29176,7 @@ rule extract_word
     #[test]
     fn x25519_codec_matches_reference() {
         let h = std::thread::Builder::new()
-            .stack_size(16 * 1024 * 1024)
+            .stack_size(64 * 1024 * 1024)
             .spawn(x25519_codec_test_body)
             .expect("spawn");
         h.join().expect("test thread panicked");
@@ -29298,7 +29298,7 @@ rule extract_word
     #[test]
     fn x25519_ladder_step_matches_reference() {
         let h = std::thread::Builder::new()
-            .stack_size(16 * 1024 * 1024)
+            .stack_size(64 * 1024 * 1024)
             .spawn(x25519_ladder_step_test_body)
             .expect("spawn");
         h.join().expect("test thread panicked");
@@ -29378,7 +29378,7 @@ rule extract_word
         // the entire ladder (~5s); the full 20-limb + inversion + RFC sweep is
         // covered by the out-of-band validation.
         let h = std::thread::Builder::new()
-            .stack_size(16 * 1024 * 1024)
+            .stack_size(64 * 1024 * 1024)
             .spawn(x25519_ladder_recursive_test_body)
             .expect("spawn");
         h.join().expect("test thread panicked");
@@ -29421,7 +29421,7 @@ rule extract_word
         // 32-byte sweep + vector 2 are covered out-of-band (each run re-does the
         // ~281-field-op inversion).
         let h = std::thread::Builder::new()
-            .stack_size(16 * 1024 * 1024)
+            .stack_size(64 * 1024 * 1024)
             .spawn(x25519_finish_test_body)
             .expect("spawn");
         h.join().expect("test thread panicked");
@@ -29465,7 +29465,7 @@ rule extract_word
         // block). Validated against the GCM GHASH reference: GCM test-case-2
         // (2 blocks, f38cbb..) and a 4-block deterministic case.
         let h = std::thread::Builder::new()
-            .stack_size(16 * 1024 * 1024)
+            .stack_size(64 * 1024 * 1024)
             .spawn(ghash_nblocks_test_body)
             .expect("spawn");
         h.join().expect("test thread panicked");
@@ -29525,7 +29525,7 @@ rule extract_word
         // Validated against the FIPS-checked aes128_ref (also matches openssl
         // aes-128-ctr with iv = IV||00000002 — verified out-of-band).
         let h = std::thread::Builder::new()
-            .stack_size(16 * 1024 * 1024)
+            .stack_size(64 * 1024 * 1024)
             .spawn(aes_gctr_test_body)
             .expect("spawn");
         h.join().expect("test thread panicked");

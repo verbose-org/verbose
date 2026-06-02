@@ -31,10 +31,8 @@ jobs:
         # --test-threads=1: native tests compile a binary to a shared temp path
         # then exec it; in parallel they race (Text-file-busy, or a
         # stack-overflow abort that downs the whole process). Serial = 390/390.
-        # RUST_MIN_STACK: deep recursive emit (compile_native) overflows small
-        # default thread stacks (esp. musl); 32 MB covers the heaviest.
-        env:
-          RUST_MIN_STACK: "33554432"
+        # (Each test thread sets its own 64 MiB stack via Builder::stack_size,
+        # so deep recursive emit doesn't overflow even on debug/musl.)
         run: cargo test --verbose -- --test-threads=1
 
       - name: Verify examples

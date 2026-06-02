@@ -4568,7 +4568,7 @@ rule layered_caller
     #[test]
     fn all_examples_with_json_run_without_panicking() {
         let handle = std::thread::Builder::new()
-            .stack_size(16 * 1024 * 1024)
+            .stack_size(64 * 1024 * 1024)
             .spawn(all_examples_with_json_body)
             .expect("spawn test thread");
         handle.join().expect("test thread panicked");
@@ -4671,7 +4671,7 @@ rule layered_caller
         // have 64-deep nested if/else chains that recurse through the
         // verifier's tree walkers and overflow the 2 MiB default test stack.
         let handle = std::thread::Builder::new()
-            .stack_size(16 * 1024 * 1024)
+            .stack_size(64 * 1024 * 1024)
             .spawn(all_example_verbose_files_parse_and_verify_body)
             .expect("spawn test thread");
         handle.join().expect("test thread panicked");
