@@ -29336,7 +29336,15 @@ rule extract_word
         let to_limbs = |x: u128| -> [i64;10] {
             const OFF: [u32;10] = [0,26,51,77,102,128,153,179,204,230];
             let mut l=[0i64;10];
-            for i in 0..10 { l[i] = ((x >> OFF[i]) as i64) & x_mask(i); }
+            // x is u128, so any limb whose offset is >= 128 is 0. Guard the
+            // shift (a u128 >> 128+ panics on debug builds) and mask in u128
+            // before narrowing (a bare `as i64` panics on debug when bit 63+
+            // is still set). Both panics only bite debug; release wrapped them,
+            // which is why this surfaced only in CI's debug test run.
+            for i in 0..10 {
+                l[i] = if OFF[i] >= 128 { 0 }
+                       else { ((x >> OFF[i]) & (x_mask(i) as u128)) as i64 };
+            }
             l
         };
 
