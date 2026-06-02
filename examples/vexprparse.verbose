@@ -1,0 +1,911 @@
+@verbose 0.1.0
+
+-- Verbose-in-Verbose expression PARSER, brick 3 of the self-hosting arc.
+--
+-- Brick 2 (vtokenstream.verbose) materialized the token stream as a cons-list.
+-- Brick 3 consumes that stream and builds an arithmetic-expression AST in the
+-- arena, WITH operator precedence, then evaluates it. The grammar subset:
+--
+--   add_expr = mul_expr (('+' | '-') mul_expr)*
+--   mul_expr = primary (('*' | '/') primary)*
+--   primary  = '(' add_expr ')' | NUMBER
+--
+-- '*' and '/' bind tighter than '+' and '-'. Operators are LEFT-associative
+-- (10-2-3 = 5, not 11). The full grammar (or/and/comparison, calls, fields,
+-- strings) is later bricks; this is the precedence CORE only.
+--
+-- ============================================================================
+-- POSITION THREADING (the hard part) — option (c): Parsed{node, next}.
+-- ============================================================================
+-- A recursive-descent function conceptually returns (ast, new_position): the
+-- parsed node AND how far it consumed. A Verbose rule returns ONE value, so
+-- each parse rule returns a `Parsed` arena node = { node: Ast, next: number }.
+-- The caller reads `.next` to know where to resume and `.node` for the subtree.
+-- This threads position cleanly through the arena and uses the group-field ABI
+-- shipped in 9529277 (a recursive native rule can take a group-concept field).
+--
+-- ============================================================================
+-- LEFT-ASSOCIATIVITY with single-return rules (no loops in Verbose).
+-- ============================================================================
+-- Classic recursive descent loops: `lhs = mul(); while op in {+,-}: lhs =
+-- Bin(op, lhs, mul())`. Verbose has no loops — only recursion. The loop becomes
+-- an accumulator recursion: parse_add parses the FIRST mul operand, then hands
+-- (acc = that node, pos = after it) to add_rest. add_rest peeks the operator;
+-- if it's +/-, it parses the next mul operand, folds Bin(op, acc, rhs) — acc on
+-- the LEFT — and recurses with the new acc and new pos. Folding the accumulator
+-- on the left at each step is exactly what makes the tree left-associative.
+-- mul_rest does the same for * and /.
+--
+-- ============================================================================
+-- TERMINATION
+-- ============================================================================
+-- The precedence rules form a cycle: parse_add -> parse_mul -> parse_primary
+-- -> parse_add (through parentheses). No `decreasing`/`increasing`/`structural`
+-- proof fits a precedence parser (position advances but not by a literal k, and
+-- the input is a plain group-field record, not a structurally-shrinking group
+-- value at every call). So these rules declare bound-only termination and
+-- ACCEPT the mandatory native recursion breadcrumb — same posture as brick 2's
+-- tokenize. Runtime backstops: the token list is FINITE (every parse step that
+-- recurses has consumed at least one token, so pos strictly grows toward Eof),
+-- the arena `max_nodes` is bounded, and every list access is Eof-guarded.
+--
+-- Oracle: src/parser.rs's parse_add_expr / parse_mul_expr / parse_primary.
+
+-- ============================================================================
+-- Arena sizing (the cap). The arena holds EVERY node: the token stream from
+-- brick 2 (Token values + TokenList cons cells, ~2N+3 nodes for N tokens) AND
+-- the AST (Parsed wrappers + Ast nodes). For an expression of N tokens the AST
+-- has ~N/2 leaves and ~N/2 internal nodes plus a Parsed wrapper per parse-rule
+-- return. max_nodes: 4000 covers the deepest test ("1+2+3+...+15" style and
+-- "(((1+2)*3))" nesting) with wide headroom; max_depth: 256 matches brick 2.
+-- Over the cap a VariantConstruct hits the arena bounds-check and the binary
+-- exits 1 (fail-closed) rather than corrupting memory.
+-- ============================================================================
+concept_group VExpr [max_depth: 256, max_nodes: 4000]
+  @intention: "Tokens, a token cons-list, an arithmetic AST, and a parse result"
+  @source: vexprparse.intent:1
+
+  concept Token
+    @intention: "One classified lexeme: kind + source span / value"
+    @source: vexprparse.intent:1
+    variants:
+      Ident of (start : number, len : number)
+      Keyword of (start : number, len : number, kw : number)
+      Num of (value : number, len : number)
+      Op of (code : number, len : number)
+      Eof
+
+  concept TokenList
+    @intention: "Cons-list of tokens: the materialized token stream"
+    @source: vexprparse.intent:1
+    variants:
+      Cons of (head : Token, tail : TokenList)
+      Nil
+
+  concept Ast
+    @intention: "Arithmetic expression AST: number leaf or binary op node"
+    @source: vexprparse.intent:1
+    variants:
+      -- A numeric literal leaf
+      AstNum of (value : number)
+      -- A binary operator node: op is the brick-2 operator code
+      -- (13=+, 14=-, 15=*, 16=/), lhs/rhs are sub-expressions
+      AstBin of (op : number, lhs : Ast, rhs : Ast)
+      -- An error/placeholder leaf (unexpected token); evaluates to 0
+      AstErr
+
+  concept Parsed
+    @intention: "A parse result: the AST built plus the index where it ended"
+    @source: vexprparse.intent:1
+    variants:
+      -- node = the subtree parsed; next = token index just past it
+      Mk of (node : Ast, next : number)
+
+
+-- ============================================================================
+-- Brick 2 reused verbatim: the tokenizer. (Copied so bricks 1-2 stay pristine;
+-- the Token/TokenList concepts above are identical to brick 2's, just sharing
+-- this program's single concept_group as the native one-group cap requires.)
+-- ============================================================================
+
+concept ScanState
+  @intention: "Scanner position in source text"
+  @source: vexprparse.intent:2
+  fields:
+    source : text [..256]
+    pos : number [0, 256]
+
+
+rule skip_spaces
+  @intention: "Advance past spaces"
+  @source: vexprparse.intent:3
+  input:
+    s : ScanState
+  output:
+    out : number
+  logic:
+    let len = length(s.source)
+    out = if s.pos >= len then s.pos else if byte_at(s.source, s.pos) == 32 then skip_spaces(ScanState { source: s.source, pos: s.pos + 1 }) else s.pos
+  proofs:
+    purity:
+      reads : [s.source, s.pos]
+      calls : [skip_spaces]
+    termination:
+      bound : 256
+      increasing : pos
+
+
+rule digit_run
+  @intention: "Count consecutive [0-9] bytes from pos"
+  @source: vexprparse.intent:4
+  input:
+    s : ScanState
+  output:
+    out : number
+  logic:
+    let len = length(s.source)
+    out = if s.pos >= len then 0 else if byte_at(s.source, s.pos) >= 48 and byte_at(s.source, s.pos) <= 57 then 1 + digit_run(ScanState { source: s.source, pos: s.pos + 1 }) else 0
+  proofs:
+    purity:
+      reads : [s.source, s.pos]
+      calls : [digit_run]
+    termination:
+      bound : 256
+      increasing : pos
+
+
+rule pow10
+  @intention: "10^n for small n (digit-position weight)"
+  @source: vexprparse.intent:5
+  input:
+    s : ScanState
+  output:
+    out : number
+  logic:
+    out = if s.pos == 0 then 1 else 10 * pow10(ScanState { source: s.source, pos: s.pos - 1 })
+  proofs:
+    purity:
+      reads : [s.source, s.pos]
+      calls : [pow10]
+    termination:
+      bound : 256
+      decreasing : pos
+
+
+rule num_value
+  @intention: "Decode the decimal value of the digit run starting at pos"
+  @source: vexprparse.intent:6
+  input:
+    s : ScanState
+  output:
+    out : number
+  logic:
+    let len = length(s.source)
+    let rl = digit_run(s)
+    out = if rl == 0 then 0 else (byte_at(s.source, s.pos) - 48) * pow10(ScanState { source: s.source, pos: rl - 1 }) + num_value(ScanState { source: s.source, pos: s.pos + 1 })
+  proofs:
+    purity:
+      reads : [s.source, s.pos, s]
+      calls : [digit_run, pow10, num_value]
+    termination:
+      bound : 256
+      increasing : pos
+
+
+rule op_code
+  @intention: "Operator/punct class code at pos; two-char before one-char"
+  @source: vexprparse.intent:7
+  input:
+    s : ScanState
+  output:
+    out : number
+  logic:
+    let len = length(s.source)
+    let c0 = if s.pos >= len then 0 else byte_at(s.source, s.pos)
+    let hasnext = if s.pos + 1 < len then 1 else 0
+    let c1 = if hasnext == 1 then byte_at(s.source, s.pos + 1) else 0
+    out = if c0 == 61 and (hasnext == 1 and c1 == 61) then 1 else if c0 == 61 and (hasnext == 1 and c1 == 62) then 2 else if c0 == 58 and (hasnext == 1 and c1 == 58) then 3 else if c0 == 62 and (hasnext == 1 and c1 == 61) then 4 else if c0 == 60 and (hasnext == 1 and c1 == 61) then 5 else if c0 == 33 and (hasnext == 1 and c1 == 61) then 6 else if c0 == 58 then 10 else if c0 == 44 then 11 else if c0 == 46 then 12 else if c0 == 43 then 13 else if c0 == 45 then 14 else if c0 == 42 then 15 else if c0 == 47 then 16 else if c0 == 37 then 17 else if c0 == 61 then 18 else if c0 == 60 then 19 else if c0 == 62 then 20 else if c0 == 40 then 21 else if c0 == 41 then 22 else if c0 == 123 then 23 else if c0 == 125 then 24 else if c0 == 91 then 25 else if c0 == 93 then 26 else 0
+  proofs:
+    purity:
+      reads : [s.source, s.pos]
+      calls : []
+    termination:
+      bound : 80
+
+
+rule op_len
+  @intention: "Byte length of an operator code (2 for two-char ops, 1 otherwise)"
+  @source: vexprparse.intent:8
+  input:
+    s : ScanState
+  output:
+    out : number
+  logic:
+    let code = op_code(s)
+    out = if code >= 1 and code <= 6 then 2 else 1
+  proofs:
+    purity:
+      reads : [s]
+      calls : [op_code]
+    termination:
+      bound : 8
+
+
+rule next_token
+  @intention: "Recognize and classify the next core lexeme at the position"
+  @source: vexprparse.intent:9
+  input:
+    s : ScanState
+  output:
+    out : Token
+  logic:
+    let len = length(s.source)
+    let p = skip_spaces(s)
+    let isdigit = if p >= len then 0 else if byte_at(s.source, p) >= 48 and byte_at(s.source, p) <= 57 then 1 else 0
+    let drun = digit_run(ScanState { source: s.source, pos: p })
+    let opc = op_code(ScanState { source: s.source, pos: p })
+    let opl = op_len(ScanState { source: s.source, pos: p })
+    let nval = num_value(ScanState { source: s.source, pos: p })
+    out = if p >= len then Token::Eof else if isdigit == 1 then Token::Num { value: nval, len: drun } else if opc > 0 then Token::Op { code: opc, len: opl } else Token::Eof
+  proofs:
+    purity:
+      reads : [s.source, s]
+      calls : [skip_spaces, digit_run, op_code, op_len, num_value]
+    termination:
+      bound : 256
+
+
+rule token_end
+  @intention: "Byte offset just past the next token (post-skip start + width)"
+  @source: vexprparse.intent:10
+  input:
+    s : ScanState
+  output:
+    out : number
+  logic:
+    let len = length(s.source)
+    let p = skip_spaces(s)
+    let isdigit = if p >= len then 0 else if byte_at(s.source, p) >= 48 and byte_at(s.source, p) <= 57 then 1 else 0
+    let drun = digit_run(ScanState { source: s.source, pos: p })
+    let opc = op_code(ScanState { source: s.source, pos: p })
+    let opl = op_len(ScanState { source: s.source, pos: p })
+    out = if p >= len then p else if isdigit == 1 then p + drun else if opc > 0 then p + opl else p
+  proofs:
+    purity:
+      reads : [s.source, s]
+      calls : [skip_spaces, digit_run, op_code, op_len]
+    termination:
+      bound : 256
+
+
+rule tokenize
+  @intention: "Scan the whole source into a cons-list of tokens (trailing Eof)"
+  @source: vexprparse.intent:11
+  input:
+    s : ScanState
+  output:
+    out : TokenList
+  logic:
+    let len = length(s.source)
+    let p = skip_spaces(s)
+    let endp = token_end(s)
+    out = if p >= len then TokenList::Cons { head: Token::Eof, tail: TokenList::Nil } else if endp <= p then TokenList::Cons { head: Token::Eof, tail: TokenList::Nil } else TokenList::Cons { head: next_token(s), tail: tokenize(ScanState { source: s.source, pos: endp }) }
+  proofs:
+    purity:
+      reads : [s.source, s]
+      calls : [skip_spaces, token_end, next_token, tokenize]
+    termination:
+      bound : 256
+
+
+-- ============================================================================
+-- Token-stream access helpers (brick 2's drop_cells / head_tok generalized to
+-- the parser's needs). The parser peeks tokens by absolute index into the full
+-- token list.
+-- ============================================================================
+
+concept Nth
+  @intention: "A token list plus an index into it"
+  @source: vexprparse.intent:12
+  fields:
+    lst : TokenList
+    n : number [0, 512]
+
+
+rule drop_cells
+  @intention: "The token list with its first arg.n cons cells removed"
+  @source: vexprparse.intent:12
+  input:
+    arg : Nth
+  output:
+    out : TokenList
+  logic:
+    out = match arg.lst:
+      Cons(head, tail) => if arg.n == 0 then arg.lst else drop_cells(Nth { lst: tail, n: arg.n - 1 })
+      Nil => TokenList::Nil
+  proofs:
+    purity:
+      reads : [arg.lst, arg.n]
+      calls : [drop_cells]
+    termination:
+      bound : 512
+      decreasing : n
+
+
+rule head_tok
+  @intention: "Head token of a list (Eof for Nil)"
+  @source: vexprparse.intent:13
+  input:
+    lst : TokenList
+  output:
+    out : Token
+  logic:
+    out = match lst:
+      Cons(head, tail) => head
+      Nil => Token::Eof
+  proofs:
+    purity:
+      reads : [lst]
+      calls : []
+    termination:
+      bound : 16
+
+
+-- Kind code of one token, mirroring brick 2: Eof=>0, Ident=>100,
+-- Keyword=>200+kw, Num=>300+value, Op=>400+code.
+rule tok_kind
+  @intention: "Kind code of one token"
+  @source: vexprparse.intent:13
+  input:
+    t : Token
+  output:
+    out : number
+  logic:
+    out = match t:
+      Ident(start, len) => 100
+      Keyword(start, len, kw) => 200 + kw
+      Num(value, len) => 300 + value
+      Op(code, len) => 400 + code
+      Eof => 0
+  proofs:
+    purity:
+      reads : [t]
+      calls : []
+    termination:
+      bound : 16
+
+
+-- The numeric value carried by a token (the literal value for Num, else 0).
+-- Used so a NUMBER leaf gets its real value, not the kind code.
+rule tok_value
+  @intention: "The literal value of a Num token (0 for any other token)"
+  @source: vexprparse.intent:13
+  input:
+    t : Token
+  output:
+    out : number
+  logic:
+    out = match t:
+      Ident(start, len) => 0
+      Keyword(start, len, kw) => 0
+      Num(value, len) => value
+      Op(code, len) => 0
+      Eof => 0
+  proofs:
+    purity:
+      reads : [t]
+      calls : []
+    termination:
+      bound : 16
+
+
+-- 1 iff the token IS a Num, structurally (independent of its value). The kind
+-- code packs Num as 300+value, which OVERFLOWS into the Op kind band (400+code)
+-- once value >= 100; so a magnitude-based `300 <= k <= 399` test would misread
+-- a literal like 100. This structural test matches the Num variant directly.
+rule tok_is_num
+  @intention: "1 if the token is a number literal, 0 otherwise (value-independent)"
+  @source: vexprparse.intent:13
+  input:
+    t : Token
+  output:
+    out : number
+  logic:
+    out = match t:
+      Ident(start, len) => 0
+      Keyword(start, len, kw) => 0
+      Num(value, len) => 1
+      Op(code, len) => 0
+      Eof => 0
+  proofs:
+    purity:
+      reads : [t]
+      calls : []
+    termination:
+      bound : 16
+
+
+-- 1 iff the token IS an Op, structurally. Same value/kind-band overflow
+-- hazard as tok_is_num: a Num literal whose value lands in 13..16 packs to a
+-- kind (413..416) that aliases the +,-,*,/ operator kinds. The fold rules use
+-- this structural test to decide "is the next token an operator" before reading
+-- its code, so a number is never mistaken for an operator.
+rule tok_is_op
+  @intention: "1 if the token is an operator/punctuation, 0 otherwise"
+  @source: vexprparse.intent:13
+  input:
+    t : Token
+  output:
+    out : number
+  logic:
+    out = match t:
+      Ident(start, len) => 0
+      Keyword(start, len, kw) => 0
+      Num(value, len) => 0
+      Op(code, len) => 1
+      Eof => 0
+  proofs:
+    purity:
+      reads : [t]
+      calls : []
+    termination:
+      bound : 16
+
+
+-- The operator code carried by an Op token (0 for any other token).
+rule tok_op_code
+  @intention: "The operator code of an Op token (0 for any other token)"
+  @source: vexprparse.intent:13
+  input:
+    t : Token
+  output:
+    out : number
+  logic:
+    out = match t:
+      Ident(start, len) => 0
+      Keyword(start, len, kw) => 0
+      Num(value, len) => 0
+      Op(code, len) => code
+      Eof => 0
+  proofs:
+    purity:
+      reads : [t]
+      calls : []
+    termination:
+      bound : 16
+
+
+-- Peek the kind code of the token at absolute index `arg.n` in `arg.lst`.
+rule peek_kind
+  @intention: "Kind code of the token at index n (0 = Eof / past end)"
+  @source: vexprparse.intent:14
+  input:
+    arg : Nth
+  output:
+    out : number
+  logic:
+    out = tok_kind(head_tok(drop_cells(arg)))
+  proofs:
+    purity:
+      reads : [arg]
+      calls : [tok_kind, head_tok, drop_cells]
+    termination:
+      bound : 16
+
+
+-- Peek the literal value of the token at absolute index `arg.n`.
+rule peek_value
+  @intention: "Literal value of the token at index n (0 if not a Num)"
+  @source: vexprparse.intent:14
+  input:
+    arg : Nth
+  output:
+    out : number
+  logic:
+    out = tok_value(head_tok(drop_cells(arg)))
+  proofs:
+    purity:
+      reads : [arg]
+      calls : [tok_value, head_tok, drop_cells]
+    termination:
+      bound : 16
+
+
+-- Peek whether the token at index `arg.n` is a number literal (structural).
+rule peek_is_num
+  @intention: "1 if the token at index n is a number literal, 0 otherwise"
+  @source: vexprparse.intent:14
+  input:
+    arg : Nth
+  output:
+    out : number
+  logic:
+    out = tok_is_num(head_tok(drop_cells(arg)))
+  proofs:
+    purity:
+      reads : [arg]
+      calls : [tok_is_num, head_tok, drop_cells]
+    termination:
+      bound : 16
+
+
+-- Peek whether the token at index `arg.n` is an operator (structural).
+rule peek_is_op
+  @intention: "1 if the token at index n is an operator, 0 otherwise"
+  @source: vexprparse.intent:14
+  input:
+    arg : Nth
+  output:
+    out : number
+  logic:
+    out = tok_is_op(head_tok(drop_cells(arg)))
+  proofs:
+    purity:
+      reads : [arg]
+      calls : [tok_is_op, head_tok, drop_cells]
+    termination:
+      bound : 16
+
+
+-- Peek the operator code of the token at absolute index `arg.n` (0 if not Op).
+rule peek_op_code
+  @intention: "Operator code of the token at index n (0 if not an operator)"
+  @source: vexprparse.intent:14
+  input:
+    arg : Nth
+  output:
+    out : number
+  logic:
+    out = tok_op_code(head_tok(drop_cells(arg)))
+  proofs:
+    purity:
+      reads : [arg]
+      calls : [tok_op_code, head_tok, drop_cells]
+    termination:
+      bound : 16
+
+
+-- ============================================================================
+-- THE PARSER. Precedence recursive descent over the token list.
+-- ParseState carries the FULL token list `toks` plus the current index `pos`.
+-- Each parse rule returns a Parsed{node, next}.
+-- ============================================================================
+
+concept ParseState
+  @intention: "The whole token list plus the current parse index"
+  @source: vexprparse.intent:15
+  fields:
+    toks : TokenList
+    pos : number [0, 512]
+
+
+-- Accessors for a Parsed result. A block-form `match` is only legal in the
+-- FINAL `out = match ...` position (not as a `let` RHS — see the language gap
+-- noted in vexprparse.intent), so destructuring a Parsed is factored into these
+-- two tiny rules and called wherever a parse rule needs the node or the index.
+rule parsed_node
+  @intention: "The AST subtree from a parse result"
+  @source: vexprparse.intent:15
+  input:
+    p : Parsed
+  output:
+    out : Ast
+  logic:
+    out = match p:
+      Mk(node, next) => node
+  proofs:
+    purity:
+      reads : [p]
+      calls : []
+    termination:
+      bound : 16
+
+
+rule parsed_next
+  @intention: "The token index just past a parse result"
+  @source: vexprparse.intent:15
+  input:
+    p : Parsed
+  output:
+    out : number
+  logic:
+    out = match p:
+      Mk(node, next) => next
+  proofs:
+    purity:
+      reads : [p]
+      calls : []
+    termination:
+      bound : 16
+
+
+-- A fold-step state: the token list, the current index, and the accumulated
+-- left-hand AST node built so far. add_rest / mul_rest carry this.
+concept FoldState
+  @intention: "Token list + current index + the left-associative accumulator"
+  @source: vexprparse.intent:15
+  fields:
+    toks : TokenList
+    pos : number [0, 512]
+    acc : Ast
+
+
+-- A join state: a fold accumulator plus the operator and the freshly-parsed
+-- right operand (as a Parsed). add_join / mul_join consume this to fold the
+-- accumulator one step left-associatively, then continue the fold.
+--
+-- WHY a separate join rule (and not a let): Verbose `let` bindings are EAGER,
+-- but `if` only evaluates the TAKEN branch. The recursive descent into the next
+-- operand MUST be guarded — if it ran eagerly (in a let) it would fire even
+-- when there is no operator, recursing forever (parse_add -> parse_mul ->
+-- parse_primary -> parse_add ...). So the next-operand parse is placed inside
+-- the `then` branch (lazy), and its Parsed result is handed to a join rule that
+-- extracts node+next ONCE. add_join <-> add_rest and mul_join <-> mul_rest are
+-- mutually recursive; both live in the parser's recursion cycle, so the Parsed
+-- group-field input compiles natively (the group-field ABI, commit 9529277).
+concept JoinState
+  @intention: "Fold accumulator + operator + the parsed right operand"
+  @source: vexprparse.intent:15
+  fields:
+    toks : TokenList
+    acc : Ast
+    opcode : number [0, 64]
+    rhs : Parsed
+
+
+-- A paren-close state: the token list plus the Parsed inner expression. Used to
+-- consume an optional ')' after a parenthesized sub-expression. In the parser
+-- cycle (called only from parse_primary's paren branch), so the Parsed field
+-- compiles natively.
+concept ParenState
+  @intention: "Token list + the parsed inner expression of a parenthesis"
+  @source: vexprparse.intent:15
+  fields:
+    toks : TokenList
+    inner : Parsed
+
+
+-- Consume the optional ')' after a '(' add_expr. Reads where the inner
+-- expression ended; if the next token is ')' (kind 422) it is consumed
+-- (next = inner_end + 1), otherwise the position is left as-is (a missing ')'
+-- is tolerated rather than aborting — error recovery is a later brick).
+rule paren_close
+  @intention: "Consume a closing paren after a parenthesized sub-expression"
+  @source: vexprparse.intent:16
+  input:
+    ps : ParenState
+  output:
+    out : Parsed
+  logic:
+    let inner_next = parsed_next(ps.inner)
+    let inner_node = parsed_node(ps.inner)
+    let after_op = peek_op_code(Nth { lst: ps.toks, n: inner_next })
+    let close_pos = if after_op == 22 then inner_next + 1 else inner_next
+    out = Parsed::Mk { node: inner_node, next: close_pos }
+  proofs:
+    purity:
+      reads : [ps.toks, ps.inner]
+      calls : [parsed_next, parsed_node, peek_op_code]
+    termination:
+      bound : 512
+
+
+-- primary = '(' add_expr ')' | NUMBER | <error leaf>
+-- Peeks the token at pos. A '(' (op code 21 => kind 421) opens a sub-expr:
+-- parse_add inside (LAZILY, only in this branch), then paren_close consumes the
+-- ')'. A Num (kind 300+value) becomes an AstNum leaf consuming one token.
+-- Anything else is an AstErr leaf that consumes nothing (the position does not
+-- advance, which the higher levels read as "stop").
+--
+-- The recursive parse_add call lives INSIDE the `then isparen` branch so eager
+-- let evaluation does not descend on a non-paren token (the loop trap).
+rule parse_primary
+  @intention: "Parse a primary: parenthesized expr or a number literal"
+  @source: vexprparse.intent:16
+  input:
+    st : ParseState
+  output:
+    out : Parsed
+  logic:
+    let isnum = peek_is_num(Nth { lst: st.toks, n: st.pos })
+    let opc = peek_op_code(Nth { lst: st.toks, n: st.pos })
+    let isparen = if opc == 21 then 1 else 0
+    let numval = peek_value(Nth { lst: st.toks, n: st.pos })
+    out = if isnum == 1 then Parsed::Mk { node: Ast::AstNum { value: numval }, next: st.pos + 1 } else if isparen == 1 then paren_close(ParenState { toks: st.toks, inner: parse_add(ParseState { toks: st.toks, pos: st.pos + 1 }) }) else Parsed::Mk { node: Ast::AstErr, next: st.pos }
+  proofs:
+    purity:
+      reads : [st.toks, st.pos]
+      calls : [peek_is_num, peek_op_code, peek_value, paren_close, parse_add]
+    termination:
+      bound : 512
+
+
+-- mul_join: fold one * or / step. Given the parsed right primary, build
+-- AstBin(op, acc, rhs) — acc on the LEFT for left-associativity — and continue
+-- folding from just past the right operand via mul_rest.
+rule mul_join
+  @intention: "Fold one multiplicative step then continue the fold"
+  @source: vexprparse.intent:17
+  input:
+    js : JoinState
+  output:
+    out : Parsed
+  logic:
+    let rhs_node = parsed_node(js.rhs)
+    let rhs_next = parsed_next(js.rhs)
+    out = mul_rest(FoldState { toks: js.toks, pos: rhs_next, acc: Ast::AstBin { op: js.opcode, lhs: js.acc, rhs: rhs_node } })
+  proofs:
+    purity:
+      reads : [js.toks, js.acc, js.opcode, js.rhs]
+      calls : [parsed_node, parsed_next, mul_rest]
+    termination:
+      bound : 512
+
+
+-- mul_rest: left-associative fold of ('*' | '/') primary onto an accumulator.
+-- Peeks the op at fs.pos. If it is '*' (kind 415) or '/' (kind 416), parse the
+-- next primary (LAZILY, in the then-branch) and hand it to mul_join. Otherwise
+-- return the accumulator unchanged at the current position.
+rule mul_rest
+  @intention: "Fold * and / onto the accumulator, left-associatively"
+  @source: vexprparse.intent:17
+  input:
+    fs : FoldState
+  output:
+    out : Parsed
+  logic:
+    let opcode = peek_op_code(Nth { lst: fs.toks, n: fs.pos })
+    let ismul = if opcode == 15 or opcode == 16 then 1 else 0
+    out = if ismul == 1 then mul_join(JoinState { toks: fs.toks, acc: fs.acc, opcode: opcode, rhs: parse_primary(ParseState { toks: fs.toks, pos: fs.pos + 1 }) }) else Parsed::Mk { node: fs.acc, next: fs.pos }
+  proofs:
+    purity:
+      reads : [fs.toks, fs.pos, fs.acc]
+      calls : [peek_op_code, mul_join, parse_primary]
+    termination:
+      bound : 512
+
+
+-- mul_expr = primary (('*' | '/') primary)*
+-- Parse the first primary, then fold the rest via mul_rest with that primary as
+-- the initial accumulator. The first descent is unconditional (a primary is
+-- always required) and bounded (parse_primary only recurses on '(').
+rule parse_mul
+  @intention: "Parse a multiplicative expression (* and /, left-associative)"
+  @source: vexprparse.intent:18
+  input:
+    st : ParseState
+  output:
+    out : Parsed
+  logic:
+    let first = parse_primary(st)
+    let first_node = parsed_node(first)
+    let first_next = parsed_next(first)
+    out = mul_rest(FoldState { toks: st.toks, pos: first_next, acc: first_node })
+  proofs:
+    purity:
+      reads : [st, st.toks]
+      calls : [parse_primary, mul_rest, parsed_node, parsed_next]
+    termination:
+      bound : 512
+
+
+-- add_join: fold one + or - step. Given the parsed right mul_expr, build
+-- AstBin(op, acc, rhs) — acc on the LEFT — and continue folding via add_rest.
+rule add_join
+  @intention: "Fold one additive step then continue the fold"
+  @source: vexprparse.intent:19
+  input:
+    js : JoinState
+  output:
+    out : Parsed
+  logic:
+    let rhs_node = parsed_node(js.rhs)
+    let rhs_next = parsed_next(js.rhs)
+    out = add_rest(FoldState { toks: js.toks, pos: rhs_next, acc: Ast::AstBin { op: js.opcode, lhs: js.acc, rhs: rhs_node } })
+  proofs:
+    purity:
+      reads : [js.toks, js.acc, js.opcode, js.rhs]
+      calls : [parsed_node, parsed_next, add_rest]
+    termination:
+      bound : 512
+
+
+-- add_rest: left-associative fold of ('+' | '-') mul_expr onto an accumulator.
+-- Symmetric to mul_rest but for '+' (kind 413) and '-' (kind 414); the next
+-- operand is a full mul_expr (so * / bind tighter). The descent is LAZY (in the
+-- then-branch) and handed to add_join.
+rule add_rest
+  @intention: "Fold + and - onto the accumulator, left-associatively"
+  @source: vexprparse.intent:19
+  input:
+    fs : FoldState
+  output:
+    out : Parsed
+  logic:
+    let opcode = peek_op_code(Nth { lst: fs.toks, n: fs.pos })
+    let isadd = if opcode == 13 or opcode == 14 then 1 else 0
+    out = if isadd == 1 then add_join(JoinState { toks: fs.toks, acc: fs.acc, opcode: opcode, rhs: parse_mul(ParseState { toks: fs.toks, pos: fs.pos + 1 }) }) else Parsed::Mk { node: fs.acc, next: fs.pos }
+  proofs:
+    purity:
+      reads : [fs.toks, fs.pos, fs.acc]
+      calls : [peek_op_code, add_join, parse_mul]
+    termination:
+      bound : 512
+
+
+-- add_expr = mul_expr (('+' | '-') mul_expr)*
+-- The top of the precedence ladder. Parse the first mul_expr, then fold the
+-- rest via add_rest.
+rule parse_add
+  @intention: "Parse an additive expression (+ and -, left-associative)"
+  @source: vexprparse.intent:20
+  input:
+    st : ParseState
+  output:
+    out : Parsed
+  logic:
+    let first = parse_mul(st)
+    let first_node = parsed_node(first)
+    let first_next = parsed_next(first)
+    out = add_rest(FoldState { toks: st.toks, pos: first_next, acc: first_node })
+  proofs:
+    purity:
+      reads : [st, st.toks]
+      calls : [parse_mul, add_rest, parsed_node, parsed_next]
+    termination:
+      bound : 512
+
+
+-- ============================================================================
+-- EVALUATOR. Recursive walk over the Ast group, computing the number.
+-- AstBin dispatches on the operator code (13=+, 14=-, 15=*, 16=/). Verbose
+-- itself has NO operator precedence, so every non-leftmost product in this
+-- body is parenthesized — note: that is the LANGUAGE's left-to-right rule, a
+-- different level entirely from the precedence this program PARSES.
+-- ============================================================================
+rule eval_ast
+  @intention: "Evaluate an arithmetic AST to a number"
+  @source: vexprparse.intent:21
+  input:
+    e : Ast
+  output:
+    out : number
+  logic:
+    out = match e:
+      AstNum(value) => value
+      AstBin(op, lhs, rhs) => if op == 13 then eval_ast(lhs) + eval_ast(rhs) else if op == 14 then eval_ast(lhs) - eval_ast(rhs) else if op == 15 then eval_ast(lhs) * eval_ast(rhs) else if op == 16 then eval_ast(lhs) / eval_ast(rhs) else 0
+      AstErr => 0
+  proofs:
+    purity:
+      reads : [e]
+      calls : [eval_ast]
+    termination:
+      bound : 4000
+      structural : e
+
+
+-- ============================================================================
+-- DRIVER (observable, end-to-end): text -> tokens -> AST -> value.
+-- Tokenize the source, parse an add_expr from index 0, evaluate the AST.
+-- This is the money shot: eval_expr("2+3*4") must be 14 (precedence!), NOT 20.
+-- Entry rule takes a TEXT input (ScanState), so argv can supply it — the
+-- group-field parse rules are reached internally, never as _start's input.
+-- ============================================================================
+rule eval_expr
+  @intention: "Tokenize, parse with precedence, and evaluate an arithmetic expression"
+  @source: vexprparse.intent:22
+  input:
+    s : ScanState
+  output:
+    out : number
+  logic:
+    let toks = tokenize(ScanState { source: s.source, pos: 0 })
+    let parsed = parse_add(ParseState { toks: toks, pos: 0 })
+    let root = parsed_node(parsed)
+    out = eval_ast(root)
+  proofs:
+    purity:
+      reads : [s.source]
+      calls : [tokenize, parse_add, eval_ast, parsed_node]
+    termination:
+      bound : 256

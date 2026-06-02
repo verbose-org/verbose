@@ -1,0 +1,17 @@
+[
+  {"source": "2+3*4", "pos": 0},
+  {"source": "(2+3)*4", "pos": 0},
+  {"source": "10-2-3", "pos": 0},
+  {"source": "2*3+4", "pos": 0},
+  {"source": "1+2+3", "pos": 0},
+  {"source": "100", "pos": 0},
+  {"source": "2*3*4", "pos": 0},
+  {"source": "20/2/5", "pos": 0},
+  {"source": "(1+2)*(3+4)", "pos": 0},
+  {"source": "1+2*3-4", "pos": 0},
+  {"source": "((5))", "pos": 0},
+  {"source": "8-3+1", "pos": 0},
+  {"source": "100+23", "pos": 0},
+  {"source": "1000-1", "pos": 0},
+  {"source": "6/2*3", "pos": 0}
+]

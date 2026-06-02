@@ -1,0 +1,67 @@
+Brick 3 of the self-hosting arc: an arithmetic-expression PARSER written in
+Verbose, with operator precedence, consuming the brick-2 token stream.
+
+1. Declare a concept group holding the token types from brick 2 (a classified
+   Token and a cons-list TokenList), an arithmetic AST (a numeric leaf, a
+   binary-operator node, and an error leaf), and a parse result that pairs an
+   AST node with the token index where parsing of it ended.
+
+2. A scanner state holds the source text and a byte position.
+
+3. Skip spaces: advance the position past ASCII spaces.
+
+4. Count the run of decimal digits starting at the position.
+
+5. Compute ten to the power n for small n (digit-position weight).
+
+6. Decode the decimal value of the digit run at the position.
+
+7. Classify the operator or punctuation at the position (two-char operators
+   before one-char ones).
+
+8. The byte length of an operator (two for two-char operators, one otherwise).
+
+9. Recognize the next core lexeme at the position: a number, an operator, or
+   end of input.
+
+10. The byte offset just past the next token.
+
+11. Scan the whole source into a cons-list of tokens with a trailing end-of-input
+    sentinel.
+
+12. Drop the first n cons cells of a token list (a list plus an index).
+
+13. Token accessors: the head token of a list, the kind code of a token, and the
+    literal value carried by a number token.
+
+14. Peek the kind code and the literal value of the token at a given index.
+
+15. The parser carries the whole token list plus the current index. A fold state
+    additionally carries the left-associative accumulator AST. Two accessors pull
+    the node and the next-index out of a parse result. (Language note: a
+    block-form match cannot currently be the right-hand side of a let binding —
+    it is only legal in the final assignment position — so destructuring a parse
+    result is factored into these two tiny rules.)
+
+16. Parse a primary: a parenthesized expression, or a number literal, or an error
+    leaf. A primary is the highest-precedence form.
+
+17. Fold multiplication and division onto an accumulator, left-associatively, by
+    parsing the next primary and recursing.
+
+18. Parse a multiplicative expression: a primary followed by any number of times
+    or divide operations.
+
+19. Fold addition and subtraction onto an accumulator, left-associatively, by
+    parsing the next multiplicative expression and recursing.
+
+20. Parse an additive expression: a multiplicative expression followed by any
+    number of plus or minus operations. Multiply and divide bind tighter than
+    plus and minus.
+
+21. Evaluate an arithmetic AST to a number, recursing on the tree and dispatching
+    each binary node on its operator.
+
+22. End to end: tokenize the source, parse an additive expression from the start,
+    and evaluate the resulting AST. This proves precedence parsing: two plus
+    three times four is fourteen, not twenty.
