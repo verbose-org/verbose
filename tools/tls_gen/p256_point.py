@@ -252,6 +252,66 @@ def _safe_add(A, Bp):
     return _point_add_core(A, Bp)
 
 
+# ---------------------------------------------------------------------------
+# EXACT-MIRROR reference ladder for BRICK 3 (k*P). This is the algorithm the
+# Verbose let-chain emits, computed with the same primitives, so the Python
+# can be validated against point_mul_ref / the oracle BEFORE any Verbose is
+# generated. NO Python conditionals on point structure inside the loop body:
+# every step computes the SAME shape (one raw core add of Q+P, one double of
+# P), and chooses the new accumulator by a FIELD-WISE select — exactly what
+# Verbose's `if bit==1 then ... else ...` over each limb compiles to.
+#
+# Scheme: LSB-first double-and-add with a running point P (= 2^pos * base) and
+# an INFINITY FLAG `inf` (1 while the accumulator Q is still the identity).
+#   for pos in 0..255 (bit = (k >> pos) & 1):
+#       Qadd = core_add(Q, P)                # raw add-2007-bl, ALWAYS computed
+#       # new Q (field-wise select):
+#       #   bit==0            -> Q unchanged
+#       #   bit==1 and inf==1 -> Q := P      (first set bit: O + P, flag makes it safe)
+#       #   bit==1 and inf==0 -> Q := Qadd   (genuine add of two DISTINCT non-O points)
+#       Q   = select(bit, select(inf, P, Qadd), Q)
+#       inf = (bit==1) ? 0 : inf
+#       P   = double(P)
+# The raw core add result Qadd is CONSUMED only when bit==1 and inf==0, i.e.
+# Q = m*base (a non-zero multiple) and P = 2^pos*base, two distinct non-O
+# points whose sum the add-2007-bl formula computes correctly. The O+P first
+# add is routed around the broken formula by the inf flag (Q := P). The
+# "P==Q would give spurious O" hazard is what we VERIFY empirically below
+# (the assertion in _ladder_inf_ref) holds for every tested k < n.
+# ---------------------------------------------------------------------------
+def _fe_select(bit, a_fe, b_fe):
+    """Return a_fe if bit else b_fe (field element = 10 limbs). Mirrors the
+    per-limb `if bit==1 then a else b` the Verbose emits."""
+    return [a_fe[i] if bit else b_fe[i] for i in range(N_LIMBS)]
+
+def point_mul_inf_ref(k, base_xy, check_invariant=True):
+    """k * base via the exact infinity-flag ladder Verbose will emit.
+    base_xy is affine integer (x, y). Returns affine (x, y) or None (k==0)."""
+    P_run = to_jacobian(*base_xy)           # running point, starts at base
+    Q = jac_infinity()                      # accumulator, starts at O
+    inf = 1                                 # Q is the identity
+    for pos in range(256):
+        bit = (k >> pos) & 1
+        Qadd = _point_add_core(Q, P_run)    # raw core, always computed
+        if check_invariant and bit == 1 and inf == 0:
+            # Q and P_run must be DISTINCT non-infinity points for the raw
+            # add-2007-bl to be valid (else it returns a spurious infinity).
+            aff_q = to_affine(Q)
+            aff_p = to_affine(P_run)
+            assert aff_q is not None and aff_p is not None, "raw add on infinity operand"
+            assert aff_q != aff_p, f"raw add on EQUAL points at pos={pos} (k={k})"
+        # build the new Q field-wise (X|Y|Z), nested select mirroring Verbose:
+        #   bit==1 -> (inf==1 ? P_run : Qadd) ; bit==0 -> Q
+        newX = _fe_select(bit, (P_run[0] if inf else Qadd[0]), Q[0])
+        newY = _fe_select(bit, (P_run[1] if inf else Qadd[1]), Q[1])
+        newZ = _fe_select(bit, (P_run[2] if inf else Qadd[2]), Q[2])
+        Q = (newX, newY, newZ)
+        if bit == 1:
+            inf = 0
+        P_run = point_double(P_run)
+    return to_affine(Q)
+
+
 # ===========================================================================
 # VERBOSE EMIT HELPERS — the real payload. Compose brick 1's emit_* helpers
 # in the SAME SSA let-chain discipline. A,B,X1,... are lists of 10 limb NAMES.

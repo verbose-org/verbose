@@ -18,6 +18,7 @@ import sys, os
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import ed25519 as E
+import ecdsa_p256 as EC
 
 # --- length-prefix helpers (same as tls_server.py) ---
 def b16(x): return x.to_bytes(2, 'big')
@@ -31,6 +32,7 @@ def hs_msg(t, body):
 HS_CERTIFICATE = 0x0b          # RFC 8446 §4.4.2
 HS_CERTIFICATE_VERIFY = 0x0f   # RFC 8446 §4.4.3
 SIG_SCHEME_ED25519 = 0x0807    # RFC 8446 §4.2.3 ("ed25519")
+SIG_SCHEME_ECDSA_P256 = 0x0403 # RFC 8446 §4.2.3 ("ecdsa_secp256r1_sha256")
 
 # RFC 8446 §4.4.3: the context string for a server-side CertificateVerify.
 # ASCII, NO trailing NUL inside the string; a single 0x00 separator byte follows.
@@ -91,6 +93,32 @@ def build_certificate_verify(seed: bytes, transcript_hash: bytes) -> bytes:
     if len(sig) != 64:
         raise ValueError(f"expected 64-byte Ed25519 signature, got {len(sig)}")
     body = b16(SIG_SCHEME_ED25519) + b16(len(sig)) + sig
+    return hs_msg(HS_CERTIFICATE_VERIFY, body)
+
+
+def build_certificate_verify_ecdsa_p256(priv_d: int, transcript_hash: bytes) -> bytes:
+    """Build a TLS 1.3 CertificateVerify handshake message (type 15) signed with
+    ECDSA-P256-SHA256 (SignatureScheme ecdsa_secp256r1_sha256 = 0x0403).
+
+    This is the scheme Chrome offers (it never offers ed25519). Signs
+    certverify_signed_content(transcript_hash) with the Verbose ECDSA impl.
+    `priv_d` is the P-256 private scalar (= the cert's signing key).
+
+    Body (RFC 8446 §4.4.3):
+      SignatureScheme algorithm;     -- 2 bytes, ecdsa_secp256r1_sha256 = 0x0403
+      opaque signature<0..2^16-1>;   -- 2-byte length prefix + signature
+
+    IMPORTANT: for ecdsa_* schemes the TLS signature field carries the ECDSA
+    *DER* encoding SEQUENCE{INTEGER r, INTEGER s} (RFC 8446 §4.2.3 references the
+    ANSI X9.62 / SEC1 DER form), NOT a raw r||s. ecdsa_p256.sign already returns
+    that DER form (low-s normalized), so the field is used verbatim.
+    """
+    signed = certverify_signed_content(transcript_hash)
+    sig = EC.sign(priv_d, signed)  # DER SEQUENCE{INTEGER r, INTEGER s}, low-s
+    # DER ECDSA-P256 sigs are 70-72 bytes typically (r,s each ~32B + framing).
+    if not (8 <= len(sig) <= 72):
+        raise ValueError(f"unexpected ECDSA DER signature length {len(sig)}")
+    body = b16(SIG_SCHEME_ECDSA_P256) + b16(len(sig)) + sig
     return hs_msg(HS_CERTIFICATE_VERIFY, body)
 
 

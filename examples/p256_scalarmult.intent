@@ -1,0 +1,36 @@
+NIST P-256 scalar multiplication [scalar]P (ECDSA-over-P-256 brick 3) — the
+recursive double-and-add over 256 scalar bits, the first NATIVE consumer of
+brick 2's point add/double. Threads the Jacobian accumulator Q and the running
+point P (X|Y|Z, 30 limbs each), an infinity flag, a bit counter j, and the
+64-hex-char BIG-ENDIAN scalar through a recursive callable, terminating by
+decreasing:j over j:[0,256].
+
+Per step (LSB-first; integer bit pos = 256-j maps to big-endian byte 31-(pos>>3)):
+extract the scalar bit; compute Qadd = point_add_core(Q, P) (raw EFD add-2007-bl,
+ALWAYS evaluated — constant shape); then a field-wise select sets the new Q:
+  bit==0            -> Q unchanged
+  bit==1 and inf==1 -> Q := P     (first set bit: O+P, routed around the
+                                   incomplete add by the infinity flag)
+  bit==1 and inf==0 -> Q := Qadd  (genuine add of two DISTINCT non-O points)
+inf clears on the first set bit; P := point_double(P); recurse j-1. At j==0
+return limb which (0..29) of Q (X|Y|Z). The raw add result is consumed only when
+Q = m*P (a non-zero multiple) and P = 2^pos*P, two distinct non-infinity points
+the formula computes correctly — the P==Q exceptional case never occurs for
+k < n (verified empirically over k incl. 1, 2, n-1, and random 256-bit k).
+
+WHY THE INFINITY FLAG: short-Weierstrass add-2007-bl is INCOMPLETE (returns a
+spurious infinity on P==Q, broken on an infinity operand) — unlike the complete
+Edwards add the Ed25519 ladder used. The flag + the constant-shape masked-select
+make the O+P first add safe without any data-dependent control flow in the
+crypto path.
+
+Validated against the `cryptography` library oracle (k*G) AND a Python mirror of
+the exact emitted ladder for k = 1, 2, n-1 and random 256-bit k, comparing the
+full affine (x,y) reconstructed from all 30 Jacobian output limbs.
+
+STACK NOTE: P-256 CIOS fmul is ~8x heavier than 25519's (~20.9k lets vs ~2.6k),
+so each recursive frame is ~167 KB and the 256-deep recursion needs ~43 MB of
+stack — beyond the default 8 MB. The consuming brick (or any caller) must raise
+RLIMIT_STACK (e.g. `ulimit -s unlimited`) before invoking the binary. The depth
+is bounded (j:[0,256]) and the per-frame size is fixed, so the maximum stack is
+statically known — an audit-defensible bound, just a large one.

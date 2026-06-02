@@ -1,0 +1,398 @@
+@verbose 0.1.0
+
+concept X25519RecState
+  @intention: "X25519 inverse-chain state: running accumulator t (10 limbs) + 8 saved intermediates (z2, z9, z11, z2_5_0, z2_10_0, z2_20_0, z2_50_0, z2_100_0; 10 limbs each) + inputs z and x2 (10 limbs each) + step counter j (265..0) + which output byte (0..31)"
+  @source: invoices.intent:1
+  fields:
+    t_0 : number [0, 67108863]
+    t_1 : number [0, 33554431]
+    t_2 : number [0, 67108863]
+    t_3 : number [0, 33554431]
+    t_4 : number [0, 67108863]
+    t_5 : number [0, 33554431]
+    t_6 : number [0, 67108863]
+    t_7 : number [0, 33554431]
+    t_8 : number [0, 67108863]
+    t_9 : number [0, 33554431]
+    z2_0 : number [0, 67108863]
+    z2_1 : number [0, 33554431]
+    z2_2 : number [0, 67108863]
+    z2_3 : number [0, 33554431]
+    z2_4 : number [0, 67108863]
+    z2_5 : number [0, 33554431]
+    z2_6 : number [0, 67108863]
+    z2_7 : number [0, 33554431]
+    z2_8 : number [0, 67108863]
+    z2_9 : number [0, 33554431]
+    z9_0 : number [0, 67108863]
+    z9_1 : number [0, 33554431]
+    z9_2 : number [0, 67108863]
+    z9_3 : number [0, 33554431]
+    z9_4 : number [0, 67108863]
+    z9_5 : number [0, 33554431]
+    z9_6 : number [0, 67108863]
+    z9_7 : number [0, 33554431]
+    z9_8 : number [0, 67108863]
+    z9_9 : number [0, 33554431]
+    z11_0 : number [0, 67108863]
+    z11_1 : number [0, 33554431]
+    z11_2 : number [0, 67108863]
+    z11_3 : number [0, 33554431]
+    z11_4 : number [0, 67108863]
+    z11_5 : number [0, 33554431]
+    z11_6 : number [0, 67108863]
+    z11_7 : number [0, 33554431]
+    z11_8 : number [0, 67108863]
+    z11_9 : number [0, 33554431]
+    z2_5_0_0 : number [0, 67108863]
+    z2_5_0_1 : number [0, 33554431]
+    z2_5_0_2 : number [0, 67108863]
+    z2_5_0_3 : number [0, 33554431]
+    z2_5_0_4 : number [0, 67108863]
+    z2_5_0_5 : number [0, 33554431]
+    z2_5_0_6 : number [0, 67108863]
+    z2_5_0_7 : number [0, 33554431]
+    z2_5_0_8 : number [0, 67108863]
+    z2_5_0_9 : number [0, 33554431]
+    z2_10_0_0 : number [0, 67108863]
+    z2_10_0_1 : number [0, 33554431]
+    z2_10_0_2 : number [0, 67108863]
+    z2_10_0_3 : number [0, 33554431]
+    z2_10_0_4 : number [0, 67108863]
+    z2_10_0_5 : number [0, 33554431]
+    z2_10_0_6 : number [0, 67108863]
+    z2_10_0_7 : number [0, 33554431]
+    z2_10_0_8 : number [0, 67108863]
+    z2_10_0_9 : number [0, 33554431]
+    z2_20_0_0 : number [0, 67108863]
+    z2_20_0_1 : number [0, 33554431]
+    z2_20_0_2 : number [0, 67108863]
+    z2_20_0_3 : number [0, 33554431]
+    z2_20_0_4 : number [0, 67108863]
+    z2_20_0_5 : number [0, 33554431]
+    z2_20_0_6 : number [0, 67108863]
+    z2_20_0_7 : number [0, 33554431]
+    z2_20_0_8 : number [0, 67108863]
+    z2_20_0_9 : number [0, 33554431]
+    z2_50_0_0 : number [0, 67108863]
+    z2_50_0_1 : number [0, 33554431]
+    z2_50_0_2 : number [0, 67108863]
+    z2_50_0_3 : number [0, 33554431]
+    z2_50_0_4 : number [0, 67108863]
+    z2_50_0_5 : number [0, 33554431]
+    z2_50_0_6 : number [0, 67108863]
+    z2_50_0_7 : number [0, 33554431]
+    z2_50_0_8 : number [0, 67108863]
+    z2_50_0_9 : number [0, 33554431]
+    z2_100_0_0 : number [0, 67108863]
+    z2_100_0_1 : number [0, 33554431]
+    z2_100_0_2 : number [0, 67108863]
+    z2_100_0_3 : number [0, 33554431]
+    z2_100_0_4 : number [0, 67108863]
+    z2_100_0_5 : number [0, 33554431]
+    z2_100_0_6 : number [0, 67108863]
+    z2_100_0_7 : number [0, 33554431]
+    z2_100_0_8 : number [0, 67108863]
+    z2_100_0_9 : number [0, 33554431]
+    z_0 : number [0, 67108863]
+    z_1 : number [0, 33554431]
+    z_2 : number [0, 67108863]
+    z_3 : number [0, 33554431]
+    z_4 : number [0, 67108863]
+    z_5 : number [0, 33554431]
+    z_6 : number [0, 67108863]
+    z_7 : number [0, 33554431]
+    z_8 : number [0, 67108863]
+    z_9 : number [0, 33554431]
+    x2_0 : number [0, 67108863]
+    x2_1 : number [0, 33554431]
+    x2_2 : number [0, 67108863]
+    x2_3 : number [0, 33554431]
+    x2_4 : number [0, 67108863]
+    x2_5 : number [0, 33554431]
+    x2_6 : number [0, 67108863]
+    x2_7 : number [0, 33554431]
+    x2_8 : number [0, 67108863]
+    x2_9 : number [0, 33554431]
+    j : number [0, 265]
+    which : number [0, 31]
+
+
+rule x25519_finish
+  @intention: "X25519 finish via the curve25519 Fermat inverse addition chain, recursive: EXACTLY ONE conditional field multiply per frame (operand muxed by step counter — square or junction, never both), 265 step-frames (decreasing j); base case multiplies x2 by z^(p-2), little-endian encodes, returns byte which. Same algorithm and same 266-fmul count as the unrolled emit_finv; bit-for-bit identical result, zero extra field multiplies."
+  @source: invoices.intent:1
+  input:
+    s : X25519RecState
+  output:
+    out : number
+  logic:
+    let op_0 = if (265 - s.j) == 3 then s.z_0 else if (265 - s.j) == 4 then s.z2_0 else if (265 - s.j) == 6 then s.z9_0 else if (265 - s.j) == 12 then s.z2_5_0_0 else if (265 - s.j) == 23 then s.z2_10_0_0 else if (265 - s.j) == 44 then s.z2_20_0_0 else if (265 - s.j) == 55 then s.z2_10_0_0 else if (265 - s.j) == 106 then s.z2_50_0_0 else if (265 - s.j) == 207 then s.z2_100_0_0 else if (265 - s.j) == 258 then s.z2_50_0_0 else if (265 - s.j) == 264 then s.z11_0 else s.t_0
+    let op_1 = if (265 - s.j) == 3 then s.z_1 else if (265 - s.j) == 4 then s.z2_1 else if (265 - s.j) == 6 then s.z9_1 else if (265 - s.j) == 12 then s.z2_5_0_1 else if (265 - s.j) == 23 then s.z2_10_0_1 else if (265 - s.j) == 44 then s.z2_20_0_1 else if (265 - s.j) == 55 then s.z2_10_0_1 else if (265 - s.j) == 106 then s.z2_50_0_1 else if (265 - s.j) == 207 then s.z2_100_0_1 else if (265 - s.j) == 258 then s.z2_50_0_1 else if (265 - s.j) == 264 then s.z11_1 else s.t_1
+    let op_2 = if (265 - s.j) == 3 then s.z_2 else if (265 - s.j) == 4 then s.z2_2 else if (265 - s.j) == 6 then s.z9_2 else if (265 - s.j) == 12 then s.z2_5_0_2 else if (265 - s.j) == 23 then s.z2_10_0_2 else if (265 - s.j) == 44 then s.z2_20_0_2 else if (265 - s.j) == 55 then s.z2_10_0_2 else if (265 - s.j) == 106 then s.z2_50_0_2 else if (265 - s.j) == 207 then s.z2_100_0_2 else if (265 - s.j) == 258 then s.z2_50_0_2 else if (265 - s.j) == 264 then s.z11_2 else s.t_2
+    let op_3 = if (265 - s.j) == 3 then s.z_3 else if (265 - s.j) == 4 then s.z2_3 else if (265 - s.j) == 6 then s.z9_3 else if (265 - s.j) == 12 then s.z2_5_0_3 else if (265 - s.j) == 23 then s.z2_10_0_3 else if (265 - s.j) == 44 then s.z2_20_0_3 else if (265 - s.j) == 55 then s.z2_10_0_3 else if (265 - s.j) == 106 then s.z2_50_0_3 else if (265 - s.j) == 207 then s.z2_100_0_3 else if (265 - s.j) == 258 then s.z2_50_0_3 else if (265 - s.j) == 264 then s.z11_3 else s.t_3
+    let op_4 = if (265 - s.j) == 3 then s.z_4 else if (265 - s.j) == 4 then s.z2_4 else if (265 - s.j) == 6 then s.z9_4 else if (265 - s.j) == 12 then s.z2_5_0_4 else if (265 - s.j) == 23 then s.z2_10_0_4 else if (265 - s.j) == 44 then s.z2_20_0_4 else if (265 - s.j) == 55 then s.z2_10_0_4 else if (265 - s.j) == 106 then s.z2_50_0_4 else if (265 - s.j) == 207 then s.z2_100_0_4 else if (265 - s.j) == 258 then s.z2_50_0_4 else if (265 - s.j) == 264 then s.z11_4 else s.t_4
+    let op_5 = if (265 - s.j) == 3 then s.z_5 else if (265 - s.j) == 4 then s.z2_5 else if (265 - s.j) == 6 then s.z9_5 else if (265 - s.j) == 12 then s.z2_5_0_5 else if (265 - s.j) == 23 then s.z2_10_0_5 else if (265 - s.j) == 44 then s.z2_20_0_5 else if (265 - s.j) == 55 then s.z2_10_0_5 else if (265 - s.j) == 106 then s.z2_50_0_5 else if (265 - s.j) == 207 then s.z2_100_0_5 else if (265 - s.j) == 258 then s.z2_50_0_5 else if (265 - s.j) == 264 then s.z11_5 else s.t_5
+    let op_6 = if (265 - s.j) == 3 then s.z_6 else if (265 - s.j) == 4 then s.z2_6 else if (265 - s.j) == 6 then s.z9_6 else if (265 - s.j) == 12 then s.z2_5_0_6 else if (265 - s.j) == 23 then s.z2_10_0_6 else if (265 - s.j) == 44 then s.z2_20_0_6 else if (265 - s.j) == 55 then s.z2_10_0_6 else if (265 - s.j) == 106 then s.z2_50_0_6 else if (265 - s.j) == 207 then s.z2_100_0_6 else if (265 - s.j) == 258 then s.z2_50_0_6 else if (265 - s.j) == 264 then s.z11_6 else s.t_6
+    let op_7 = if (265 - s.j) == 3 then s.z_7 else if (265 - s.j) == 4 then s.z2_7 else if (265 - s.j) == 6 then s.z9_7 else if (265 - s.j) == 12 then s.z2_5_0_7 else if (265 - s.j) == 23 then s.z2_10_0_7 else if (265 - s.j) == 44 then s.z2_20_0_7 else if (265 - s.j) == 55 then s.z2_10_0_7 else if (265 - s.j) == 106 then s.z2_50_0_7 else if (265 - s.j) == 207 then s.z2_100_0_7 else if (265 - s.j) == 258 then s.z2_50_0_7 else if (265 - s.j) == 264 then s.z11_7 else s.t_7
+    let op_8 = if (265 - s.j) == 3 then s.z_8 else if (265 - s.j) == 4 then s.z2_8 else if (265 - s.j) == 6 then s.z9_8 else if (265 - s.j) == 12 then s.z2_5_0_8 else if (265 - s.j) == 23 then s.z2_10_0_8 else if (265 - s.j) == 44 then s.z2_20_0_8 else if (265 - s.j) == 55 then s.z2_10_0_8 else if (265 - s.j) == 106 then s.z2_50_0_8 else if (265 - s.j) == 207 then s.z2_100_0_8 else if (265 - s.j) == 258 then s.z2_50_0_8 else if (265 - s.j) == 264 then s.z11_8 else s.t_8
+    let op_9 = if (265 - s.j) == 3 then s.z_9 else if (265 - s.j) == 4 then s.z2_9 else if (265 - s.j) == 6 then s.z9_9 else if (265 - s.j) == 12 then s.z2_5_0_9 else if (265 - s.j) == 23 then s.z2_10_0_9 else if (265 - s.j) == 44 then s.z2_20_0_9 else if (265 - s.j) == 55 then s.z2_10_0_9 else if (265 - s.j) == 106 then s.z2_50_0_9 else if (265 - s.j) == 207 then s.z2_100_0_9 else if (265 - s.j) == 258 then s.z2_50_0_9 else if (265 - s.j) == 264 then s.z11_9 else s.t_9
+    let nt_a0 = (s.t_0 * op_0) + 38 * (s.t_1 * op_9) + 19 * (s.t_2 * op_8) + 38 * (s.t_3 * op_7) + 19 * (s.t_4 * op_6) + 38 * (s.t_5 * op_5) + 19 * (s.t_6 * op_4) + 38 * (s.t_7 * op_3) + 19 * (s.t_8 * op_2) + 38 * (s.t_9 * op_1)
+    let nt_a1 = (s.t_0 * op_1) + (s.t_1 * op_0) + 19 * (s.t_2 * op_9) + 19 * (s.t_3 * op_8) + 19 * (s.t_4 * op_7) + 19 * (s.t_5 * op_6) + 19 * (s.t_6 * op_5) + 19 * (s.t_7 * op_4) + 19 * (s.t_8 * op_3) + 19 * (s.t_9 * op_2)
+    let nt_a2 = (s.t_0 * op_2) + 2 * (s.t_1 * op_1) + (s.t_2 * op_0) + 38 * (s.t_3 * op_9) + 19 * (s.t_4 * op_8) + 38 * (s.t_5 * op_7) + 19 * (s.t_6 * op_6) + 38 * (s.t_7 * op_5) + 19 * (s.t_8 * op_4) + 38 * (s.t_9 * op_3)
+    let nt_a3 = (s.t_0 * op_3) + (s.t_1 * op_2) + (s.t_2 * op_1) + (s.t_3 * op_0) + 19 * (s.t_4 * op_9) + 19 * (s.t_5 * op_8) + 19 * (s.t_6 * op_7) + 19 * (s.t_7 * op_6) + 19 * (s.t_8 * op_5) + 19 * (s.t_9 * op_4)
+    let nt_a4 = (s.t_0 * op_4) + 2 * (s.t_1 * op_3) + (s.t_2 * op_2) + 2 * (s.t_3 * op_1) + (s.t_4 * op_0) + 38 * (s.t_5 * op_9) + 19 * (s.t_6 * op_8) + 38 * (s.t_7 * op_7) + 19 * (s.t_8 * op_6) + 38 * (s.t_9 * op_5)
+    let nt_a5 = (s.t_0 * op_5) + (s.t_1 * op_4) + (s.t_2 * op_3) + (s.t_3 * op_2) + (s.t_4 * op_1) + (s.t_5 * op_0) + 19 * (s.t_6 * op_9) + 19 * (s.t_7 * op_8) + 19 * (s.t_8 * op_7) + 19 * (s.t_9 * op_6)
+    let nt_a6 = (s.t_0 * op_6) + 2 * (s.t_1 * op_5) + (s.t_2 * op_4) + 2 * (s.t_3 * op_3) + (s.t_4 * op_2) + 2 * (s.t_5 * op_1) + (s.t_6 * op_0) + 38 * (s.t_7 * op_9) + 19 * (s.t_8 * op_8) + 38 * (s.t_9 * op_7)
+    let nt_a7 = (s.t_0 * op_7) + (s.t_1 * op_6) + (s.t_2 * op_5) + (s.t_3 * op_4) + (s.t_4 * op_3) + (s.t_5 * op_2) + (s.t_6 * op_1) + (s.t_7 * op_0) + 19 * (s.t_8 * op_9) + 19 * (s.t_9 * op_8)
+    let nt_a8 = (s.t_0 * op_8) + 2 * (s.t_1 * op_7) + (s.t_2 * op_6) + 2 * (s.t_3 * op_5) + (s.t_4 * op_4) + 2 * (s.t_5 * op_3) + (s.t_6 * op_2) + 2 * (s.t_7 * op_1) + (s.t_8 * op_0) + 38 * (s.t_9 * op_9)
+    let nt_a9 = (s.t_0 * op_9) + (s.t_1 * op_8) + (s.t_2 * op_7) + (s.t_3 * op_6) + (s.t_4 * op_5) + (s.t_5 * op_4) + (s.t_6 * op_3) + (s.t_7 * op_2) + (s.t_8 * op_1) + (s.t_9 * op_0)
+    let nt_c0_0 = shr(nt_a0, 26)
+    let nt_lo0_0 = band(nt_a0, 67108863)
+    let nt_s0_0 = nt_a1 + nt_c0_0
+    let nt_c0_1 = shr(nt_s0_0, 25)
+    let nt_lo0_1 = band(nt_s0_0, 33554431)
+    let nt_s0_1 = nt_a2 + nt_c0_1
+    let nt_c0_2 = shr(nt_s0_1, 26)
+    let nt_lo0_2 = band(nt_s0_1, 67108863)
+    let nt_s0_2 = nt_a3 + nt_c0_2
+    let nt_c0_3 = shr(nt_s0_2, 25)
+    let nt_lo0_3 = band(nt_s0_2, 33554431)
+    let nt_s0_3 = nt_a4 + nt_c0_3
+    let nt_c0_4 = shr(nt_s0_3, 26)
+    let nt_lo0_4 = band(nt_s0_3, 67108863)
+    let nt_s0_4 = nt_a5 + nt_c0_4
+    let nt_c0_5 = shr(nt_s0_4, 25)
+    let nt_lo0_5 = band(nt_s0_4, 33554431)
+    let nt_s0_5 = nt_a6 + nt_c0_5
+    let nt_c0_6 = shr(nt_s0_5, 26)
+    let nt_lo0_6 = band(nt_s0_5, 67108863)
+    let nt_s0_6 = nt_a7 + nt_c0_6
+    let nt_c0_7 = shr(nt_s0_6, 25)
+    let nt_lo0_7 = band(nt_s0_6, 33554431)
+    let nt_s0_7 = nt_a8 + nt_c0_7
+    let nt_c0_8 = shr(nt_s0_7, 26)
+    let nt_lo0_8 = band(nt_s0_7, 67108863)
+    let nt_s0_8 = nt_a9 + nt_c0_8
+    let nt_c0_9 = shr(nt_s0_8, 25)
+    let nt_lo0_9 = band(nt_s0_8, 33554431)
+    let nt_w0 = nt_lo0_0 + 19 * nt_c0_9
+    let nt_c1_0 = shr(nt_w0, 26)
+    let nt_lo1_0 = band(nt_w0, 67108863)
+    let nt_s1_0 = nt_lo0_1 + nt_c1_0
+    let nt_c1_1 = shr(nt_s1_0, 25)
+    let nt_lo1_1 = band(nt_s1_0, 33554431)
+    let nt_s1_1 = nt_lo0_2 + nt_c1_1
+    let nt_c1_2 = shr(nt_s1_1, 26)
+    let nt_lo1_2 = band(nt_s1_1, 67108863)
+    let nt_s1_2 = nt_lo0_3 + nt_c1_2
+    let nt_c1_3 = shr(nt_s1_2, 25)
+    let nt_lo1_3 = band(nt_s1_2, 33554431)
+    let nt_s1_3 = nt_lo0_4 + nt_c1_3
+    let nt_c1_4 = shr(nt_s1_3, 26)
+    let nt_lo1_4 = band(nt_s1_3, 67108863)
+    let nt_s1_4 = nt_lo0_5 + nt_c1_4
+    let nt_c1_5 = shr(nt_s1_4, 25)
+    let nt_lo1_5 = band(nt_s1_4, 33554431)
+    let nt_s1_5 = nt_lo0_6 + nt_c1_5
+    let nt_c1_6 = shr(nt_s1_5, 26)
+    let nt_lo1_6 = band(nt_s1_5, 67108863)
+    let nt_s1_6 = nt_lo0_7 + nt_c1_6
+    let nt_c1_7 = shr(nt_s1_6, 25)
+    let nt_lo1_7 = band(nt_s1_6, 33554431)
+    let nt_s1_7 = nt_lo0_8 + nt_c1_7
+    let nt_c1_8 = shr(nt_s1_7, 26)
+    let nt_lo1_8 = band(nt_s1_7, 67108863)
+    let nt_s1_8 = nt_lo0_9 + nt_c1_8
+    let nt_c1_9 = shr(nt_s1_8, 25)
+    let nt_lo1_9 = band(nt_s1_8, 33554431)
+    let nt_w1 = nt_lo1_0 + 19 * nt_c1_9
+    let ns_z2_0 = if (265 - s.j) == 0 then nt_w1 else s.z2_0
+    let ns_z2_1 = if (265 - s.j) == 0 then nt_lo1_1 else s.z2_1
+    let ns_z2_2 = if (265 - s.j) == 0 then nt_lo1_2 else s.z2_2
+    let ns_z2_3 = if (265 - s.j) == 0 then nt_lo1_3 else s.z2_3
+    let ns_z2_4 = if (265 - s.j) == 0 then nt_lo1_4 else s.z2_4
+    let ns_z2_5 = if (265 - s.j) == 0 then nt_lo1_5 else s.z2_5
+    let ns_z2_6 = if (265 - s.j) == 0 then nt_lo1_6 else s.z2_6
+    let ns_z2_7 = if (265 - s.j) == 0 then nt_lo1_7 else s.z2_7
+    let ns_z2_8 = if (265 - s.j) == 0 then nt_lo1_8 else s.z2_8
+    let ns_z2_9 = if (265 - s.j) == 0 then nt_lo1_9 else s.z2_9
+    let ns_z9_0 = if (265 - s.j) == 3 then nt_w1 else s.z9_0
+    let ns_z9_1 = if (265 - s.j) == 3 then nt_lo1_1 else s.z9_1
+    let ns_z9_2 = if (265 - s.j) == 3 then nt_lo1_2 else s.z9_2
+    let ns_z9_3 = if (265 - s.j) == 3 then nt_lo1_3 else s.z9_3
+    let ns_z9_4 = if (265 - s.j) == 3 then nt_lo1_4 else s.z9_4
+    let ns_z9_5 = if (265 - s.j) == 3 then nt_lo1_5 else s.z9_5
+    let ns_z9_6 = if (265 - s.j) == 3 then nt_lo1_6 else s.z9_6
+    let ns_z9_7 = if (265 - s.j) == 3 then nt_lo1_7 else s.z9_7
+    let ns_z9_8 = if (265 - s.j) == 3 then nt_lo1_8 else s.z9_8
+    let ns_z9_9 = if (265 - s.j) == 3 then nt_lo1_9 else s.z9_9
+    let ns_z11_0 = if (265 - s.j) == 4 then nt_w1 else s.z11_0
+    let ns_z11_1 = if (265 - s.j) == 4 then nt_lo1_1 else s.z11_1
+    let ns_z11_2 = if (265 - s.j) == 4 then nt_lo1_2 else s.z11_2
+    let ns_z11_3 = if (265 - s.j) == 4 then nt_lo1_3 else s.z11_3
+    let ns_z11_4 = if (265 - s.j) == 4 then nt_lo1_4 else s.z11_4
+    let ns_z11_5 = if (265 - s.j) == 4 then nt_lo1_5 else s.z11_5
+    let ns_z11_6 = if (265 - s.j) == 4 then nt_lo1_6 else s.z11_6
+    let ns_z11_7 = if (265 - s.j) == 4 then nt_lo1_7 else s.z11_7
+    let ns_z11_8 = if (265 - s.j) == 4 then nt_lo1_8 else s.z11_8
+    let ns_z11_9 = if (265 - s.j) == 4 then nt_lo1_9 else s.z11_9
+    let ns_z2_5_0_0 = if (265 - s.j) == 6 then nt_w1 else s.z2_5_0_0
+    let ns_z2_5_0_1 = if (265 - s.j) == 6 then nt_lo1_1 else s.z2_5_0_1
+    let ns_z2_5_0_2 = if (265 - s.j) == 6 then nt_lo1_2 else s.z2_5_0_2
+    let ns_z2_5_0_3 = if (265 - s.j) == 6 then nt_lo1_3 else s.z2_5_0_3
+    let ns_z2_5_0_4 = if (265 - s.j) == 6 then nt_lo1_4 else s.z2_5_0_4
+    let ns_z2_5_0_5 = if (265 - s.j) == 6 then nt_lo1_5 else s.z2_5_0_5
+    let ns_z2_5_0_6 = if (265 - s.j) == 6 then nt_lo1_6 else s.z2_5_0_6
+    let ns_z2_5_0_7 = if (265 - s.j) == 6 then nt_lo1_7 else s.z2_5_0_7
+    let ns_z2_5_0_8 = if (265 - s.j) == 6 then nt_lo1_8 else s.z2_5_0_8
+    let ns_z2_5_0_9 = if (265 - s.j) == 6 then nt_lo1_9 else s.z2_5_0_9
+    let ns_z2_10_0_0 = if (265 - s.j) == 12 then nt_w1 else s.z2_10_0_0
+    let ns_z2_10_0_1 = if (265 - s.j) == 12 then nt_lo1_1 else s.z2_10_0_1
+    let ns_z2_10_0_2 = if (265 - s.j) == 12 then nt_lo1_2 else s.z2_10_0_2
+    let ns_z2_10_0_3 = if (265 - s.j) == 12 then nt_lo1_3 else s.z2_10_0_3
+    let ns_z2_10_0_4 = if (265 - s.j) == 12 then nt_lo1_4 else s.z2_10_0_4
+    let ns_z2_10_0_5 = if (265 - s.j) == 12 then nt_lo1_5 else s.z2_10_0_5
+    let ns_z2_10_0_6 = if (265 - s.j) == 12 then nt_lo1_6 else s.z2_10_0_6
+    let ns_z2_10_0_7 = if (265 - s.j) == 12 then nt_lo1_7 else s.z2_10_0_7
+    let ns_z2_10_0_8 = if (265 - s.j) == 12 then nt_lo1_8 else s.z2_10_0_8
+    let ns_z2_10_0_9 = if (265 - s.j) == 12 then nt_lo1_9 else s.z2_10_0_9
+    let ns_z2_20_0_0 = if (265 - s.j) == 23 then nt_w1 else s.z2_20_0_0
+    let ns_z2_20_0_1 = if (265 - s.j) == 23 then nt_lo1_1 else s.z2_20_0_1
+    let ns_z2_20_0_2 = if (265 - s.j) == 23 then nt_lo1_2 else s.z2_20_0_2
+    let ns_z2_20_0_3 = if (265 - s.j) == 23 then nt_lo1_3 else s.z2_20_0_3
+    let ns_z2_20_0_4 = if (265 - s.j) == 23 then nt_lo1_4 else s.z2_20_0_4
+    let ns_z2_20_0_5 = if (265 - s.j) == 23 then nt_lo1_5 else s.z2_20_0_5
+    let ns_z2_20_0_6 = if (265 - s.j) == 23 then nt_lo1_6 else s.z2_20_0_6
+    let ns_z2_20_0_7 = if (265 - s.j) == 23 then nt_lo1_7 else s.z2_20_0_7
+    let ns_z2_20_0_8 = if (265 - s.j) == 23 then nt_lo1_8 else s.z2_20_0_8
+    let ns_z2_20_0_9 = if (265 - s.j) == 23 then nt_lo1_9 else s.z2_20_0_9
+    let ns_z2_50_0_0 = if (265 - s.j) == 55 then nt_w1 else s.z2_50_0_0
+    let ns_z2_50_0_1 = if (265 - s.j) == 55 then nt_lo1_1 else s.z2_50_0_1
+    let ns_z2_50_0_2 = if (265 - s.j) == 55 then nt_lo1_2 else s.z2_50_0_2
+    let ns_z2_50_0_3 = if (265 - s.j) == 55 then nt_lo1_3 else s.z2_50_0_3
+    let ns_z2_50_0_4 = if (265 - s.j) == 55 then nt_lo1_4 else s.z2_50_0_4
+    let ns_z2_50_0_5 = if (265 - s.j) == 55 then nt_lo1_5 else s.z2_50_0_5
+    let ns_z2_50_0_6 = if (265 - s.j) == 55 then nt_lo1_6 else s.z2_50_0_6
+    let ns_z2_50_0_7 = if (265 - s.j) == 55 then nt_lo1_7 else s.z2_50_0_7
+    let ns_z2_50_0_8 = if (265 - s.j) == 55 then nt_lo1_8 else s.z2_50_0_8
+    let ns_z2_50_0_9 = if (265 - s.j) == 55 then nt_lo1_9 else s.z2_50_0_9
+    let ns_z2_100_0_0 = if (265 - s.j) == 106 then nt_w1 else s.z2_100_0_0
+    let ns_z2_100_0_1 = if (265 - s.j) == 106 then nt_lo1_1 else s.z2_100_0_1
+    let ns_z2_100_0_2 = if (265 - s.j) == 106 then nt_lo1_2 else s.z2_100_0_2
+    let ns_z2_100_0_3 = if (265 - s.j) == 106 then nt_lo1_3 else s.z2_100_0_3
+    let ns_z2_100_0_4 = if (265 - s.j) == 106 then nt_lo1_4 else s.z2_100_0_4
+    let ns_z2_100_0_5 = if (265 - s.j) == 106 then nt_lo1_5 else s.z2_100_0_5
+    let ns_z2_100_0_6 = if (265 - s.j) == 106 then nt_lo1_6 else s.z2_100_0_6
+    let ns_z2_100_0_7 = if (265 - s.j) == 106 then nt_lo1_7 else s.z2_100_0_7
+    let ns_z2_100_0_8 = if (265 - s.j) == 106 then nt_lo1_8 else s.z2_100_0_8
+    let ns_z2_100_0_9 = if (265 - s.j) == 106 then nt_lo1_9 else s.z2_100_0_9
+    let fin_a0 = (s.x2_0 * s.t_0) + 38 * (s.x2_1 * s.t_9) + 19 * (s.x2_2 * s.t_8) + 38 * (s.x2_3 * s.t_7) + 19 * (s.x2_4 * s.t_6) + 38 * (s.x2_5 * s.t_5) + 19 * (s.x2_6 * s.t_4) + 38 * (s.x2_7 * s.t_3) + 19 * (s.x2_8 * s.t_2) + 38 * (s.x2_9 * s.t_1)
+    let fin_a1 = (s.x2_0 * s.t_1) + (s.x2_1 * s.t_0) + 19 * (s.x2_2 * s.t_9) + 19 * (s.x2_3 * s.t_8) + 19 * (s.x2_4 * s.t_7) + 19 * (s.x2_5 * s.t_6) + 19 * (s.x2_6 * s.t_5) + 19 * (s.x2_7 * s.t_4) + 19 * (s.x2_8 * s.t_3) + 19 * (s.x2_9 * s.t_2)
+    let fin_a2 = (s.x2_0 * s.t_2) + 2 * (s.x2_1 * s.t_1) + (s.x2_2 * s.t_0) + 38 * (s.x2_3 * s.t_9) + 19 * (s.x2_4 * s.t_8) + 38 * (s.x2_5 * s.t_7) + 19 * (s.x2_6 * s.t_6) + 38 * (s.x2_7 * s.t_5) + 19 * (s.x2_8 * s.t_4) + 38 * (s.x2_9 * s.t_3)
+    let fin_a3 = (s.x2_0 * s.t_3) + (s.x2_1 * s.t_2) + (s.x2_2 * s.t_1) + (s.x2_3 * s.t_0) + 19 * (s.x2_4 * s.t_9) + 19 * (s.x2_5 * s.t_8) + 19 * (s.x2_6 * s.t_7) + 19 * (s.x2_7 * s.t_6) + 19 * (s.x2_8 * s.t_5) + 19 * (s.x2_9 * s.t_4)
+    let fin_a4 = (s.x2_0 * s.t_4) + 2 * (s.x2_1 * s.t_3) + (s.x2_2 * s.t_2) + 2 * (s.x2_3 * s.t_1) + (s.x2_4 * s.t_0) + 38 * (s.x2_5 * s.t_9) + 19 * (s.x2_6 * s.t_8) + 38 * (s.x2_7 * s.t_7) + 19 * (s.x2_8 * s.t_6) + 38 * (s.x2_9 * s.t_5)
+    let fin_a5 = (s.x2_0 * s.t_5) + (s.x2_1 * s.t_4) + (s.x2_2 * s.t_3) + (s.x2_3 * s.t_2) + (s.x2_4 * s.t_1) + (s.x2_5 * s.t_0) + 19 * (s.x2_6 * s.t_9) + 19 * (s.x2_7 * s.t_8) + 19 * (s.x2_8 * s.t_7) + 19 * (s.x2_9 * s.t_6)
+    let fin_a6 = (s.x2_0 * s.t_6) + 2 * (s.x2_1 * s.t_5) + (s.x2_2 * s.t_4) + 2 * (s.x2_3 * s.t_3) + (s.x2_4 * s.t_2) + 2 * (s.x2_5 * s.t_1) + (s.x2_6 * s.t_0) + 38 * (s.x2_7 * s.t_9) + 19 * (s.x2_8 * s.t_8) + 38 * (s.x2_9 * s.t_7)
+    let fin_a7 = (s.x2_0 * s.t_7) + (s.x2_1 * s.t_6) + (s.x2_2 * s.t_5) + (s.x2_3 * s.t_4) + (s.x2_4 * s.t_3) + (s.x2_5 * s.t_2) + (s.x2_6 * s.t_1) + (s.x2_7 * s.t_0) + 19 * (s.x2_8 * s.t_9) + 19 * (s.x2_9 * s.t_8)
+    let fin_a8 = (s.x2_0 * s.t_8) + 2 * (s.x2_1 * s.t_7) + (s.x2_2 * s.t_6) + 2 * (s.x2_3 * s.t_5) + (s.x2_4 * s.t_4) + 2 * (s.x2_5 * s.t_3) + (s.x2_6 * s.t_2) + 2 * (s.x2_7 * s.t_1) + (s.x2_8 * s.t_0) + 38 * (s.x2_9 * s.t_9)
+    let fin_a9 = (s.x2_0 * s.t_9) + (s.x2_1 * s.t_8) + (s.x2_2 * s.t_7) + (s.x2_3 * s.t_6) + (s.x2_4 * s.t_5) + (s.x2_5 * s.t_4) + (s.x2_6 * s.t_3) + (s.x2_7 * s.t_2) + (s.x2_8 * s.t_1) + (s.x2_9 * s.t_0)
+    let fin_c0_0 = shr(fin_a0, 26)
+    let fin_lo0_0 = band(fin_a0, 67108863)
+    let fin_s0_0 = fin_a1 + fin_c0_0
+    let fin_c0_1 = shr(fin_s0_0, 25)
+    let fin_lo0_1 = band(fin_s0_0, 33554431)
+    let fin_s0_1 = fin_a2 + fin_c0_1
+    let fin_c0_2 = shr(fin_s0_1, 26)
+    let fin_lo0_2 = band(fin_s0_1, 67108863)
+    let fin_s0_2 = fin_a3 + fin_c0_2
+    let fin_c0_3 = shr(fin_s0_2, 25)
+    let fin_lo0_3 = band(fin_s0_2, 33554431)
+    let fin_s0_3 = fin_a4 + fin_c0_3
+    let fin_c0_4 = shr(fin_s0_3, 26)
+    let fin_lo0_4 = band(fin_s0_3, 67108863)
+    let fin_s0_4 = fin_a5 + fin_c0_4
+    let fin_c0_5 = shr(fin_s0_4, 25)
+    let fin_lo0_5 = band(fin_s0_4, 33554431)
+    let fin_s0_5 = fin_a6 + fin_c0_5
+    let fin_c0_6 = shr(fin_s0_5, 26)
+    let fin_lo0_6 = band(fin_s0_5, 67108863)
+    let fin_s0_6 = fin_a7 + fin_c0_6
+    let fin_c0_7 = shr(fin_s0_6, 25)
+    let fin_lo0_7 = band(fin_s0_6, 33554431)
+    let fin_s0_7 = fin_a8 + fin_c0_7
+    let fin_c0_8 = shr(fin_s0_7, 26)
+    let fin_lo0_8 = band(fin_s0_7, 67108863)
+    let fin_s0_8 = fin_a9 + fin_c0_8
+    let fin_c0_9 = shr(fin_s0_8, 25)
+    let fin_lo0_9 = band(fin_s0_8, 33554431)
+    let fin_w0 = fin_lo0_0 + 19 * fin_c0_9
+    let fin_c1_0 = shr(fin_w0, 26)
+    let fin_lo1_0 = band(fin_w0, 67108863)
+    let fin_s1_0 = fin_lo0_1 + fin_c1_0
+    let fin_c1_1 = shr(fin_s1_0, 25)
+    let fin_lo1_1 = band(fin_s1_0, 33554431)
+    let fin_s1_1 = fin_lo0_2 + fin_c1_1
+    let fin_c1_2 = shr(fin_s1_1, 26)
+    let fin_lo1_2 = band(fin_s1_1, 67108863)
+    let fin_s1_2 = fin_lo0_3 + fin_c1_2
+    let fin_c1_3 = shr(fin_s1_2, 25)
+    let fin_lo1_3 = band(fin_s1_2, 33554431)
+    let fin_s1_3 = fin_lo0_4 + fin_c1_3
+    let fin_c1_4 = shr(fin_s1_3, 26)
+    let fin_lo1_4 = band(fin_s1_3, 67108863)
+    let fin_s1_4 = fin_lo0_5 + fin_c1_4
+    let fin_c1_5 = shr(fin_s1_4, 25)
+    let fin_lo1_5 = band(fin_s1_4, 33554431)
+    let fin_s1_5 = fin_lo0_6 + fin_c1_5
+    let fin_c1_6 = shr(fin_s1_5, 26)
+    let fin_lo1_6 = band(fin_s1_5, 67108863)
+    let fin_s1_6 = fin_lo0_7 + fin_c1_6
+    let fin_c1_7 = shr(fin_s1_6, 25)
+    let fin_lo1_7 = band(fin_s1_6, 33554431)
+    let fin_s1_7 = fin_lo0_8 + fin_c1_7
+    let fin_c1_8 = shr(fin_s1_7, 26)
+    let fin_lo1_8 = band(fin_s1_7, 67108863)
+    let fin_s1_8 = fin_lo0_9 + fin_c1_8
+    let fin_c1_9 = shr(fin_s1_8, 25)
+    let fin_lo1_9 = band(fin_s1_8, 33554431)
+    let fin_w1 = fin_lo1_0 + 19 * fin_c1_9
+    let enc_ob0 = band(fin_w1, 255)
+    let enc_ob1 = band(shr(fin_w1, 8), 255)
+    let enc_ob2 = band(shr(fin_w1, 16), 255)
+    let enc_ob3 = band(bor(shr(fin_w1, 24), shl(fin_lo1_1, 2)), 255)
+    let enc_ob4 = band(shr(fin_lo1_1, 6), 255)
+    let enc_ob5 = band(shr(fin_lo1_1, 14), 255)
+    let enc_ob6 = band(bor(shr(fin_lo1_1, 22), shl(fin_lo1_2, 3)), 255)
+    let enc_ob7 = band(shr(fin_lo1_2, 5), 255)
+    let enc_ob8 = band(shr(fin_lo1_2, 13), 255)
+    let enc_ob9 = band(bor(shr(fin_lo1_2, 21), shl(fin_lo1_3, 5)), 255)
+    let enc_ob10 = band(shr(fin_lo1_3, 3), 255)
+    let enc_ob11 = band(shr(fin_lo1_3, 11), 255)
+    let enc_ob12 = band(bor(shr(fin_lo1_3, 19), shl(fin_lo1_4, 6)), 255)
+    let enc_ob13 = band(shr(fin_lo1_4, 2), 255)
+    let enc_ob14 = band(shr(fin_lo1_4, 10), 255)
+    let enc_ob15 = band(shr(fin_lo1_4, 18), 255)
+    let enc_ob16 = band(fin_lo1_5, 255)
+    let enc_ob17 = band(shr(fin_lo1_5, 8), 255)
+    let enc_ob18 = band(shr(fin_lo1_5, 16), 255)
+    let enc_ob19 = band(bor(shr(fin_lo1_5, 24), shl(fin_lo1_6, 1)), 255)
+    let enc_ob20 = band(shr(fin_lo1_6, 7), 255)
+    let enc_ob21 = band(shr(fin_lo1_6, 15), 255)
+    let enc_ob22 = band(bor(shr(fin_lo1_6, 23), shl(fin_lo1_7, 3)), 255)
+    let enc_ob23 = band(shr(fin_lo1_7, 5), 255)
+    let enc_ob24 = band(shr(fin_lo1_7, 13), 255)
+    let enc_ob25 = band(bor(shr(fin_lo1_7, 21), shl(fin_lo1_8, 4)), 255)
+    let enc_ob26 = band(shr(fin_lo1_8, 4), 255)
+    let enc_ob27 = band(shr(fin_lo1_8, 12), 255)
+    let enc_ob28 = band(bor(shr(fin_lo1_8, 20), shl(fin_lo1_9, 6)), 255)
+    let enc_ob29 = band(shr(fin_lo1_9, 2), 255)
+    let enc_ob30 = band(shr(fin_lo1_9, 10), 255)
+    let enc_ob31 = band(shr(fin_lo1_9, 18), 255)
+    out = if s.j == 0 then if s.which == 0 then enc_ob0 else if s.which == 1 then enc_ob1 else if s.which == 2 then enc_ob2 else if s.which == 3 then enc_ob3 else if s.which == 4 then enc_ob4 else if s.which == 5 then enc_ob5 else if s.which == 6 then enc_ob6 else if s.which == 7 then enc_ob7 else if s.which == 8 then enc_ob8 else if s.which == 9 then enc_ob9 else if s.which == 10 then enc_ob10 else if s.which == 11 then enc_ob11 else if s.which == 12 then enc_ob12 else if s.which == 13 then enc_ob13 else if s.which == 14 then enc_ob14 else if s.which == 15 then enc_ob15 else if s.which == 16 then enc_ob16 else if s.which == 17 then enc_ob17 else if s.which == 18 then enc_ob18 else if s.which == 19 then enc_ob19 else if s.which == 20 then enc_ob20 else if s.which == 21 then enc_ob21 else if s.which == 22 then enc_ob22 else if s.which == 23 then enc_ob23 else if s.which == 24 then enc_ob24 else if s.which == 25 then enc_ob25 else if s.which == 26 then enc_ob26 else if s.which == 27 then enc_ob27 else if s.which == 28 then enc_ob28 else if s.which == 29 then enc_ob29 else if s.which == 30 then enc_ob30 else enc_ob31 else x25519_finish(X25519RecState { t_0: nt_w1, t_1: nt_lo1_1, t_2: nt_lo1_2, t_3: nt_lo1_3, t_4: nt_lo1_4, t_5: nt_lo1_5, t_6: nt_lo1_6, t_7: nt_lo1_7, t_8: nt_lo1_8, t_9: nt_lo1_9, z2_0: ns_z2_0, z2_1: ns_z2_1, z2_2: ns_z2_2, z2_3: ns_z2_3, z2_4: ns_z2_4, z2_5: ns_z2_5, z2_6: ns_z2_6, z2_7: ns_z2_7, z2_8: ns_z2_8, z2_9: ns_z2_9, z9_0: ns_z9_0, z9_1: ns_z9_1, z9_2: ns_z9_2, z9_3: ns_z9_3, z9_4: ns_z9_4, z9_5: ns_z9_5, z9_6: ns_z9_6, z9_7: ns_z9_7, z9_8: ns_z9_8, z9_9: ns_z9_9, z11_0: ns_z11_0, z11_1: ns_z11_1, z11_2: ns_z11_2, z11_3: ns_z11_3, z11_4: ns_z11_4, z11_5: ns_z11_5, z11_6: ns_z11_6, z11_7: ns_z11_7, z11_8: ns_z11_8, z11_9: ns_z11_9, z2_5_0_0: ns_z2_5_0_0, z2_5_0_1: ns_z2_5_0_1, z2_5_0_2: ns_z2_5_0_2, z2_5_0_3: ns_z2_5_0_3, z2_5_0_4: ns_z2_5_0_4, z2_5_0_5: ns_z2_5_0_5, z2_5_0_6: ns_z2_5_0_6, z2_5_0_7: ns_z2_5_0_7, z2_5_0_8: ns_z2_5_0_8, z2_5_0_9: ns_z2_5_0_9, z2_10_0_0: ns_z2_10_0_0, z2_10_0_1: ns_z2_10_0_1, z2_10_0_2: ns_z2_10_0_2, z2_10_0_3: ns_z2_10_0_3, z2_10_0_4: ns_z2_10_0_4, z2_10_0_5: ns_z2_10_0_5, z2_10_0_6: ns_z2_10_0_6, z2_10_0_7: ns_z2_10_0_7, z2_10_0_8: ns_z2_10_0_8, z2_10_0_9: ns_z2_10_0_9, z2_20_0_0: ns_z2_20_0_0, z2_20_0_1: ns_z2_20_0_1, z2_20_0_2: ns_z2_20_0_2, z2_20_0_3: ns_z2_20_0_3, z2_20_0_4: ns_z2_20_0_4, z2_20_0_5: ns_z2_20_0_5, z2_20_0_6: ns_z2_20_0_6, z2_20_0_7: ns_z2_20_0_7, z2_20_0_8: ns_z2_20_0_8, z2_20_0_9: ns_z2_20_0_9, z2_50_0_0: ns_z2_50_0_0, z2_50_0_1: ns_z2_50_0_1, z2_50_0_2: ns_z2_50_0_2, z2_50_0_3: ns_z2_50_0_3, z2_50_0_4: ns_z2_50_0_4, z2_50_0_5: ns_z2_50_0_5, z2_50_0_6: ns_z2_50_0_6, z2_50_0_7: ns_z2_50_0_7, z2_50_0_8: ns_z2_50_0_8, z2_50_0_9: ns_z2_50_0_9, z2_100_0_0: ns_z2_100_0_0, z2_100_0_1: ns_z2_100_0_1, z2_100_0_2: ns_z2_100_0_2, z2_100_0_3: ns_z2_100_0_3, z2_100_0_4: ns_z2_100_0_4, z2_100_0_5: ns_z2_100_0_5, z2_100_0_6: ns_z2_100_0_6, z2_100_0_7: ns_z2_100_0_7, z2_100_0_8: ns_z2_100_0_8, z2_100_0_9: ns_z2_100_0_9, z_0: s.z_0, z_1: s.z_1, z_2: s.z_2, z_3: s.z_3, z_4: s.z_4, z_5: s.z_5, z_6: s.z_6, z_7: s.z_7, z_8: s.z_8, z_9: s.z_9, x2_0: s.x2_0, x2_1: s.x2_1, x2_2: s.x2_2, x2_3: s.x2_3, x2_4: s.x2_4, x2_5: s.x2_5, x2_6: s.x2_6, x2_7: s.x2_7, x2_8: s.x2_8, x2_9: s.x2_9, j: s.j - 1, which: s.which })
+  proofs:
+    purity:
+      reads : [s.t_0, s.t_1, s.t_2, s.t_3, s.t_4, s.t_5, s.t_6, s.t_7, s.t_8, s.t_9, s.z2_0, s.z2_1, s.z2_2, s.z2_3, s.z2_4, s.z2_5, s.z2_6, s.z2_7, s.z2_8, s.z2_9, s.z9_0, s.z9_1, s.z9_2, s.z9_3, s.z9_4, s.z9_5, s.z9_6, s.z9_7, s.z9_8, s.z9_9, s.z11_0, s.z11_1, s.z11_2, s.z11_3, s.z11_4, s.z11_5, s.z11_6, s.z11_7, s.z11_8, s.z11_9, s.z2_5_0_0, s.z2_5_0_1, s.z2_5_0_2, s.z2_5_0_3, s.z2_5_0_4, s.z2_5_0_5, s.z2_5_0_6, s.z2_5_0_7, s.z2_5_0_8, s.z2_5_0_9, s.z2_10_0_0, s.z2_10_0_1, s.z2_10_0_2, s.z2_10_0_3, s.z2_10_0_4, s.z2_10_0_5, s.z2_10_0_6, s.z2_10_0_7, s.z2_10_0_8, s.z2_10_0_9, s.z2_20_0_0, s.z2_20_0_1, s.z2_20_0_2, s.z2_20_0_3, s.z2_20_0_4, s.z2_20_0_5, s.z2_20_0_6, s.z2_20_0_7, s.z2_20_0_8, s.z2_20_0_9, s.z2_50_0_0, s.z2_50_0_1, s.z2_50_0_2, s.z2_50_0_3, s.z2_50_0_4, s.z2_50_0_5, s.z2_50_0_6, s.z2_50_0_7, s.z2_50_0_8, s.z2_50_0_9, s.z2_100_0_0, s.z2_100_0_1, s.z2_100_0_2, s.z2_100_0_3, s.z2_100_0_4, s.z2_100_0_5, s.z2_100_0_6, s.z2_100_0_7, s.z2_100_0_8, s.z2_100_0_9, s.z_0, s.z_1, s.z_2, s.z_3, s.z_4, s.z_5, s.z_6, s.z_7, s.z_8, s.z_9, s.x2_0, s.x2_1, s.x2_2, s.x2_3, s.x2_4, s.x2_5, s.x2_6, s.x2_7, s.x2_8, s.x2_9, s.j, s.which]
+      calls : [x25519_finish]
+    termination:
+      bound : 2000000
+      decreasing : j
