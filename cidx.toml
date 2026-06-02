@@ -48,11 +48,14 @@ env = { RUSTUP_HOME = "/usr/local/rustup", CARGO_HOME = "/usr/local/cargo" }
 
 [containers.cargo-test]
 image = "rust:alpine"
-# Run the test binary single-threaded. Many native tests compile a binary to a
-# shared temp path then exec it; in parallel they race (one test overwrites the
-# executable another is mid-exec -> Text-file-busy, or a stack-overflow abort
-# that takes the whole process down). Serial is deterministic (390/390).
-env = { RUST_TEST_THREADS = "1" }
+# RUST_MIN_STACK: this image is Alpine/musl, whose default THREAD stack is tiny
+# (~128 KB) vs glibc's 8 MB. Tests that call compile_native (deep recursive
+# emit) on a cargo worker thread overflow that musl stack — green on a glibc
+# host, red here. 32 MB matches what the heaviest emit needs.
+# RUST_TEST_THREADS=1: many native tests compile a binary to a shared temp path
+# then exec it; in parallel they race (Text-file-busy, or a stack-overflow
+# abort that takes the whole process down). Serial is deterministic (390/390).
+env = { RUST_TEST_THREADS = "1", RUST_MIN_STACK = "33554432" }
 
 [containers.cargo-build]
 image = "rust:alpine"

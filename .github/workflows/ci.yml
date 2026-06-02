@@ -28,11 +28,13 @@ jobs:
         run: cargo build --verbose
 
       - name: Run tests
-        # Single-threaded: many native tests compile a binary to a shared temp
-        # path then exec it; in parallel they race (one test overwrites the
-        # executable another is running -> Text-file-busy, or a stack-overflow
-        # abort that takes the whole process down). Serial is deterministic
-        # (390/390) — these tests spawn subprocesses and aren't thread-safe.
+        # --test-threads=1: native tests compile a binary to a shared temp path
+        # then exec it; in parallel they race (Text-file-busy, or a
+        # stack-overflow abort that downs the whole process). Serial = 390/390.
+        # RUST_MIN_STACK: deep recursive emit (compile_native) overflows small
+        # default thread stacks (esp. musl); 32 MB covers the heaviest.
+        env:
+          RUST_MIN_STACK: "33554432"
         run: cargo test --verbose -- --test-threads=1
 
       - name: Verify examples
