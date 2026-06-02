@@ -28059,8 +28059,24 @@ rule extract_word
         handle.join().expect("test thread panicked");
     }
 
+    // python3 is an oracle of convenience; some CI images (rust:alpine/musl)
+    // don't ship it. Skip the python-oracle tests there instead of failing —
+    // their job is cross-checking against hashlib, not gating the build on the
+    // image having python.
+    fn python3_available() -> bool {
+        std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
     fn sha256_nblocks_test_body() {
         use std::process::Command;
+        if !python3_available() {
+            eprintln!("skipping sha256_nblocks: python3 not available");
+            return;
+        }
         let src = std::fs::read_to_string("examples/sha256_nblocks.verbose")
             .expect("examples/sha256_nblocks.verbose must exist");
         let tokens = crate::lexer::Lexer::new(&src).tokenize().expect("tokenize");
@@ -28114,6 +28130,10 @@ rule extract_word
 
     fn sha256_big_test_body() {
         use std::process::Command;
+        if !python3_available() {
+            eprintln!("skipping sha256_big: python3 not available");
+            return;
+        }
         let src = std::fs::read_to_string("examples/sha256_big.verbose")
             .expect("examples/sha256_big.verbose must exist");
         let tokens = crate::lexer::Lexer::new(&src).tokenize().expect("tokenize");
