@@ -28,7 +28,12 @@ jobs:
         run: cargo build --verbose
 
       - name: Run tests
-        run: cargo test --verbose
+        # Single-threaded: many native tests compile a binary to a shared temp
+        # path then exec it; in parallel they race (one test overwrites the
+        # executable another is running -> Text-file-busy, or a stack-overflow
+        # abort that takes the whole process down). Serial is deterministic
+        # (390/390) — these tests spawn subprocesses and aren't thread-safe.
+        run: cargo test --verbose -- --test-threads=1
 
       - name: Verify examples
         run: |

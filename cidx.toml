@@ -48,6 +48,11 @@ env = { RUSTUP_HOME = "/usr/local/rustup", CARGO_HOME = "/usr/local/cargo" }
 
 [containers.cargo-test]
 image = "rust:alpine"
+# Run the test binary single-threaded. Many native tests compile a binary to a
+# shared temp path then exec it; in parallel they race (one test overwrites the
+# executable another is mid-exec -> Text-file-busy, or a stack-overflow abort
+# that takes the whole process down). Serial is deterministic (390/390).
+env = { RUST_TEST_THREADS = "1" }
 
 [containers.cargo-build]
 image = "rust:alpine"
