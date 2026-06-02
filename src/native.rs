@@ -430,12 +430,20 @@ fn compile_native_code(
                     });
                 }
                 for f in &c.fields {
-                    match f.ty {
+                    match &f.ty {
                         Type::Number | Type::Text => {}
+                        // A group-concept-typed field is an i64 arena index
+                        // at the ABI level — it marshals identically to a
+                        // Number field (one 8-byte struct slot). The arena it
+                        // indexes is reachable from the callee via r11 (set
+                        // once in _start, preserved across call/ret). See
+                        // docs/group-field-abi-design.md. A plain record
+                        // concept is NOT index-shaped, so keep it refused.
+                        Type::Named(n) if group_concept_names.contains(n) => {}
                         _ => {
                             return Err(NativeError {
                                 message: format!(
-                                    "recursive rule '{}' input field '{}' must be Number or Text (got {:?})",
+                                    "recursive rule '{}' input field '{}' must be Number, Text, or a group-concept type (got {:?}); plain record concepts aren't index-shaped.",
                                     r.name, f.name, f.ty
                                 ),
                             });
@@ -4118,13 +4126,22 @@ fn count_max_match_arm_binder_slots(expr: &Expr, concept_group: Option<&ConceptG
         match e {
             Expr::MatchVariant(_, arms) => {
                 for a in arms {
+                    // Search ALL concepts in the group for the matched
+                    // variant, not just the first. A multi-concept group
+                    // (e.g. Token + TokenList) puts a variant like
+                    // TokenList::Cons in a NON-first concept; searching only
+                    // the first concept misses it and falls back to a binder
+                    // COUNT, which mis-sizes the frame when an arm binds a
+                    // TEXT payload (text binder = 2 slots) in a non-first
+                    // concept. See docs/group-field-abi-design.md §2.
                     let slots: u32 = if let Some(g) = cg {
-                        if let Some(concept) = g.concepts.first() {
-                            if let Some(variant) = concept.variants.iter().find(|v| v.name == a.variant_name) {
-                                variant.fields.iter().take(a.binders.len())
-                                    .map(|f| if matches!(f.ty, Type::Text) { 2u32 } else { 1u32 })
-                                    .sum()
-                            } else { a.binders.len() as u32 }
+                        let found = g.concepts.iter()
+                            .flat_map(|c| c.variants.iter())
+                            .find(|v| v.name == a.variant_name);
+                        if let Some(variant) = found {
+                            variant.fields.iter().take(a.binders.len())
+                                .map(|f| if matches!(f.ty, Type::Text) { 2u32 } else { 1u32 })
+                                .sum()
                         } else { a.binders.len() as u32 }
                     } else { a.binders.len() as u32 };
                     if slots > *m { *m = slots; }
@@ -27142,6 +27159,197 @@ rule label_len
             assert_eq!(
                 stdout.as_ref(), *expected,
                 "measure({}) output mismatch: expected {:?}, got {:?}",
+                arg, expected, stdout
+            );
+        }
+        let _ = std::fs::remove_file(&out);
+    }
+
+    #[test]
+    fn group_field_recursion_drop_cells_via_nth_kind_runtime() {
+        // Group-field ABI: drop_cells takes `Nth { lst: TokenList, n: number }`
+        // — a recursive rule whose input concept has a GROUP-CONCEPT-typed
+        // field (lst : TokenList). Before the type-check widening this was
+        // refused at native codegen ("input field 'lst' must be Number or
+        // Text"). drop_cells is a callee (the entry rule's argv can't supply
+        // an arena index), so drive it through nth_kind, which tokenizes a
+        // source into a TokenList arena and threads it through drop_cells.
+        // Cross-checked against the interpreter on the same inputs.
+        let src = std::fs::read_to_string("examples/vtokenstream.verbose")
+            .expect("examples/vtokenstream.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+        let out = std::env::temp_dir().join("verbosec_test_group_field_nth_kind");
+        compile_native(&program, "nth_kind", out.to_str().unwrap(), false, false)
+            .expect("nth_kind (drives drop_cells with a group-typed field) must compile");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o755));
+        }
+        // (source, pos) -> kind code, verified identical to `--run nth_kind`.
+        // For "rule foo if x" the stream is
+        //   [Keyword(rule)=209, Ident(foo)=100, Keyword(if)=201, Ident(x)=100, Eof=0]
+        // dropping `pos` cells leaves L-pos cells; the head's kind is read.
+        let cases: &[(&str, &str, &str)] = &[
+            ("rule foo if x", "0", "209\n"),
+            ("rule foo if x", "1", "100\n"),
+            ("rule foo if x", "2", "201\n"),
+            ("rule foo if x", "3", "100\n"),
+            ("rule foo if x", "4", "0\n"),
+            ("42 + foo", "0", "342\n"),
+            ("42 + foo", "1", "413\n"),
+            ("42 + foo", "2", "100\n"),
+            ("x == y", "0", "100\n"),
+            ("x == y", "1", "401\n"),
+            ("a b c", "0", "100\n"),
+            ("", "0", "0\n"),
+        ];
+        for (source, pos, expected) in cases {
+            let output = std::process::Command::new(&out)
+                .arg(source)
+                .arg(pos)
+                .output()
+                .expect("native binary must run");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert_eq!(
+                stdout.as_ref(), *expected,
+                "nth_kind({:?}, {}) mismatch: expected {:?}, got {:?}",
+                source, pos, expected, stdout
+            );
+        }
+        let _ = std::fs::remove_file(&out);
+    }
+
+    #[test]
+    fn binder_slots_text_payload_in_non_first_concept_runtime() {
+        // Regression for the count_max_match_arm_binder_slots bug: it searched
+        // only `g.concepts.first()` for the matched variant. For a MULTI-CONCEPT
+        // group whose TEXT-payload variant lives in a NON-FIRST concept, that
+        // lookup misses and falls back to a binder COUNT (not type-aware slot
+        // count). A text binder needs 2 slots (ptr, len) but counts as 1 in the
+        // fallback, so the frame is under-sized by one slot per text binder —
+        // corrupting the binder area at runtime.
+        //
+        // Here `First` is concept 0 (no matching variant for the match below);
+        // `Second::Lab(name: text, value: number)` lives in concept 1. The match
+        // binds BOTH name (text, 2 slots) and value (number, 1 slot) = 3 slots,
+        // but the pre-fix fallback would reserve only 2 (binder count). The arm
+        // uses `length(name)` AND `value`, so a mis-sized frame produces wrong
+        // output (or corrupts the value slot).
+        let src = r#"@verbose 0.1.0
+
+concept_group Pair [max_depth: 5, max_nodes: 20]
+  @intention: "two-concept group; text payload in the second concept"
+  @source: p.intent:1
+
+  concept First
+    @intention: "first concept (matched variant is NOT here)"
+    @source: p.intent:1
+    variants:
+      Aaa of (x : number)
+      Bbb of (y : number)
+
+  concept Second
+    @intention: "second concept; carries the text-payload variant"
+    @source: p.intent:1
+    variants:
+      Lab of (name : text, value : number)
+      Bare of (value : number)
+
+concept Seed
+  @intention: "seed"
+  @source: p.intent:1
+  fields:
+    n : number [0, 5]
+
+rule make_pair
+  @intention: "construct a Second value"
+  @source: p.intent:1
+  input:
+    s : Seed
+  output:
+    out : Second
+  logic:
+    out = if s.n > 0 then Second::Lab { name: "hello", value: s.n } else Second::Bare { value: 0 }
+  proofs:
+    purity:
+      reads : [s]
+      calls : [make_pair]
+    termination:
+      bound : 5
+
+rule probe
+  @intention: "bind both a text payload and a number payload in a non-first concept's variant"
+  @source: p.intent:1
+  input:
+    s : Seed
+  output:
+    out : number
+  logic:
+    out = match make_pair(s):
+      Lab(name, value) => length(name) + value
+      Bare(value) => value
+  proofs:
+    purity:
+      reads : [s]
+      calls : [make_pair, probe]
+    termination:
+      bound : 5
+"#;
+        let tokens = crate::lexer::Lexer::new(src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+
+        // Direct assertion on the buggy function — this is the unambiguous
+        // bug-catcher. With the first-concept-only search (pre-fix), the
+        // `Lab` variant lives in the SECOND group concept, so the lookup
+        // misses and falls back to a binder COUNT of 2. With the fix
+        // (search ALL concepts) it finds Lab(name:text, value:number) and
+        // returns the type-aware slot count: text(2) + number(1) = 3.
+        // Confirmed: reverting only the fix makes this assert fail
+        // (got 2, expected 3).
+        let group: Option<&crate::ast::ConceptGroup> = program.items.iter().find_map(|i| match i {
+            crate::ast::Item::ConceptGroup(g) => Some(g),
+            _ => None,
+        });
+        let probe_rule = program.items.iter().find_map(|i| match i {
+            crate::ast::Item::Rule(r) if r.name == "probe" => Some(r),
+            _ => None,
+        }).expect("probe rule must exist");
+        let slots = count_max_match_arm_binder_slots(&probe_rule.logic.value, group);
+        assert_eq!(
+            slots, 3,
+            "binder-slot count for Lab(name: text, value: number) in a NON-FIRST \
+             group concept must be 3 (text=2 + number=1), not the binder COUNT of 2; \
+             got {} (the first-concept-only search bug under-sizes the frame)",
+            slots
+        );
+
+        let out = std::env::temp_dir().join("verbosec_test_binder_slots_nonfirst_text");
+        compile_native(&program, "probe", out.to_str().unwrap(), false, false)
+            .expect("text-payload variant in a non-first concept must compile");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o755));
+        }
+        // n>0 → Lab("hello", n) → length("hello") + n = 5 + n
+        // n=0 → Bare(0) → 0
+        let cases: &[(&str, &str)] = &[
+            ("0", "0\n"),
+            ("1", "6\n"),
+            ("3", "8\n"),
+            ("5", "10\n"),
+        ];
+        for (arg, expected) in cases {
+            let output = std::process::Command::new(&out)
+                .arg(arg)
+                .output()
+                .expect("native binary must run");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert_eq!(
+                stdout.as_ref(), *expected,
+                "probe({}) mismatch: expected {:?}, got {:?} (frame mis-sized if binder-slot bug present)",
                 arg, expected, stdout
             );
         }
