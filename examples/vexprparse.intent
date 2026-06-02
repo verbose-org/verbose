@@ -1,10 +1,14 @@
-Brick 3 of the self-hosting arc: an arithmetic-expression PARSER written in
-Verbose, with operator precedence, consuming the brick-2 token stream.
+Brick 4 of the self-hosting arc: a full-precedence expression PARSER written in
+Verbose, consuming the brick-2 token stream. Brick 3 covered the arithmetic
+core (+ - * / and parens with precedence); brick 4 extends the ladder upward to
+the full expression grammar — logical or/and, comparisons, and prefix unary
+(not / negation) — and downward by adding modulo to the multiplicative level.
 
 1. Declare a concept group holding the token types from brick 2 (a classified
-   Token and a cons-list TokenList), an arithmetic AST (a numeric leaf, a
-   binary-operator node, and an error leaf), and a parse result that pairs an
-   AST node with the token index where parsing of it ended.
+   Token and a cons-list TokenList), an expression AST (a numeric leaf, a
+   binary-operator node, a unary-not node, a unary-negation node, and an error
+   leaf), and a parse result that pairs an AST node with the token index where
+   parsing of it ended.
 
 2. A scanner state holds the source text and a byte position.
 
@@ -16,13 +20,14 @@ Verbose, with operator precedence, consuming the brick-2 token stream.
 
 6. Decode the decimal value of the digit run at the position.
 
-7. Classify the operator or punctuation at the position (two-char operators
-   before one-char ones).
+7. Recognize identifiers and the logical keywords (and / or / not), classify the
+   operator or punctuation at the position (two-char operators before one-char
+   ones), and report an operator's byte length.
 
 8. The byte length of an operator (two for two-char operators, one otherwise).
 
-9. Recognize the next core lexeme at the position: a number, an operator, or
-   end of input.
+9. Recognize the next core lexeme at the position: an identifier or keyword, a
+   number, an operator, or end of input.
 
 10. The byte offset just past the next token.
 
@@ -37,31 +42,46 @@ Verbose, with operator precedence, consuming the brick-2 token stream.
 14. Peek the kind code and the literal value of the token at a given index.
 
 15. The parser carries the whole token list plus the current index. A fold state
-    additionally carries the left-associative accumulator AST. Two accessors pull
-    the node and the next-index out of a parse result. (Language note: a
-    block-form match cannot currently be the right-hand side of a let binding —
-    it is only legal in the final assignment position — so destructuring a parse
-    result is factored into these two tiny rules.)
+    additionally carries the left-associative accumulator AST; a unary-wrap state
+    carries the parsed operand and which prefix it was. Two accessors pull the
+    node and the next-index out of a parse result. (Language note: a block-form
+    match cannot currently be the right-hand side of a let binding — it is only
+    legal in the final assignment position — so destructuring a parse result is
+    factored into these two tiny rules.)
 
-16. Parse a primary: a parenthesized expression, or a number literal, or an error
-    leaf. A primary is the highest-precedence form.
+16. Parse a primary: a parenthesized expression (which reopens the grammar at the
+    top, so a full or/and/comparison expression may appear in parentheses), or a
+    number literal, or an error leaf. A primary is the highest-precedence form.
 
-17. Fold multiplication and division onto an accumulator, left-associatively, by
-    parsing the next primary and recursing.
+17. Fold multiplication, division, and modulo onto an accumulator, left-
+    associatively, by parsing the next unary operand and recursing.
 
-18. Parse a multiplicative expression: a primary followed by any number of times
-    or divide operations.
+18. Parse a prefix-unary expression: a 'not' keyword or a leading '-' wraps the
+    rest in the corresponding unary node (right-recursive); otherwise it is a
+    primary. Then parse a multiplicative expression: a unary operand followed by
+    any number of times, divide, or modulo operations.
 
-19. Fold addition and subtraction onto an accumulator, left-associatively, by
-    parsing the next multiplicative expression and recursing.
+19. Fold addition and subtraction onto an accumulator, left-associatively. Then
+    parse a comparison: an additive expression optionally followed by ONE
+    comparison operator (equal, not-equal, less, greater, less-equal,
+    greater-equal) and another additive expression. Comparison is non-associative
+    and binds looser than the arithmetic operators.
 
-20. Parse an additive expression: a multiplicative expression followed by any
-    number of plus or minus operations. Multiply and divide bind tighter than
-    plus and minus.
+20. Fold the 'and' keyword onto an accumulator, left-associatively, by parsing the
+    next comparison and recursing. Parse an 'and' expression: a comparison
+    followed by any number of 'and's. 'and' binds looser than comparisons.
 
-21. Evaluate an arithmetic AST to a number, recursing on the tree and dispatching
-    each binary node on its operator.
+21. Fold the 'or' keyword onto an accumulator, left-associatively, by parsing the
+    next 'and' expression and recursing. Parse the full expression: an 'and'
+    expression followed by any number of 'or's. 'or' binds looser than 'and'.
 
-22. End to end: tokenize the source, parse an additive expression from the start,
-    and evaluate the resulting AST. This proves precedence parsing: two plus
-    three times four is fourteen, not twenty.
+22. Evaluate an expression AST to a number, recursing on the tree and dispatching
+    each binary node on its operator (arithmetic to its value, comparisons and
+    logical and/or to one or zero), negating or logically-negating each unary
+    node.
+
+23. End to end: tokenize the source, parse the full expression from the start,
+    and evaluate the resulting AST. This proves precedence ordering across all
+    levels: one plus two equals three is one (addition binds tighter than the
+    comparison), and two less-than three and four less-than five is one (the
+    comparisons bind tighter than 'and').
