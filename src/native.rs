@@ -12146,6 +12146,27 @@ fn emit_eval_expr(
                     let mut extended_ranges = field_ranges.clone();
                     let _ = &mut extended_ranges;
                     let mut extended_text_bindings: TextBindings<'_> = text_bindings.clone();
+                    // Arm binders live in a key namespace distinct from input
+                    // field accesses: a binder named `width` must NOT overwrite
+                    // the input field `pa.width` in extended_offsets (the field
+                    // access `Expr::Field(Ident(input), "width")` and a bare
+                    // binder reference `Expr::Ident("width")` would otherwise
+                    // collapse onto the same key, silently aliasing the field to
+                    // the binder slot — a miscompile). We key binders under
+                    // `__bind_<name>` (mirroring the established `__state_`
+                    // convention); the bare-Ident resolution arm consults the
+                    // `__bind_` key FIRST, so a binder shadows correctly WITHIN
+                    // its arm while leaving the input field's bare-key entry
+                    // intact for `Expr::Field` to find. The `__bind_` strings
+                    // are pre-built into this arena so their `&str` views live
+                    // as long as `extended_offsets` (consumed by emit_eval_expr
+                    // for this arm's body below).
+                    let binder_keys: Vec<String> = arm.binders.iter().map(|b| {
+                        match b {
+                            Some(name) => format!("__bind_{}", name),
+                            None => String::new(),
+                        }
+                    }).collect();
                     let mut binder_cursor = binder_base;
                     for (i, binder_opt) in arm.binders.iter().enumerate() {
                         let field_ty = &declared_fields[i].1;
@@ -12188,6 +12209,21 @@ fn emit_eval_expr(
                                     code.extend_from_slice(&[0x48, 0x89, 0x95]);
                                     code.extend_from_slice(&len_slot.to_le_bytes());
                                 }
+                                // NOTE: text binders stay keyed by their BARE
+                                // name (unlike number binders, which use the
+                                // `__bind_` namespace below). The text-binding
+                                // lookup paths (emit_length, emit_text_write_to_fd,
+                                // the BoundText Ident arms) resolve binder
+                                // references by bare name across many sites; a
+                                // `__bind_` rename would require rerouting all of
+                                // them and is out of scope here. The proven,
+                                // in-scope defect is the NUMBER binder/field
+                                // collision (a same-named text binder shadowing a
+                                // text input field is the untested symmetric case;
+                                // no current program exercises it). Keeping the
+                                // bare key here preserves byte-identical codegen
+                                // for existing text-binder group rules
+                                // (e.g. label_tree's `Leaf(label) => length(label)`).
                                 extended_text_bindings.insert(binder_name.as_str(), (ptr_slot, len_slot));
                             } else {
                                 // mov rdx, [rax + arena_off]
@@ -12206,7 +12242,8 @@ fn emit_eval_expr(
                                     code.extend_from_slice(&[0x48, 0x89, 0x95]);
                                     code.extend_from_slice(&binder_cursor.to_le_bytes());
                                 }
-                                extended_offsets.insert(binder_name.as_str(), binder_cursor);
+                                let _ = binder_name;
+                                extended_offsets.insert(binder_keys[i].as_str(), binder_cursor);
                             }
                         }
                         binder_cursor -= if is_text { 16 } else { 8 };
@@ -12321,8 +12358,17 @@ fn emit_eval_expr(
             })
         }
         Expr::Ident(name) => {
-            // Let-bound variable — load from rbp-relative slot
-            if let Some(offset) = offsets.get(name.as_str()) {
+            // Let-bound variable or match-arm binder — load from rbp-relative
+            // slot. Arm binders are keyed under `__bind_<name>` (see the arena
+            // MatchVariant path) so they can't collide with an input field of
+            // the same name; consult that key FIRST so a binder shadows
+            // correctly within its arm, then fall back to the bare name (let
+            // bindings, group-input index).
+            let bind_key = format!("__bind_{}", name);
+            if let Some(offset) = offsets.get(bind_key.as_str()) {
+                load_rax_from_rbp(code, *offset);
+                Ok(())
+            } else if let Some(offset) = offsets.get(name.as_str()) {
                 load_rax_from_rbp(code, *offset);
                 Ok(())
             } else {
@@ -29794,6 +29840,132 @@ rule extract_word
                 .unwrap_or_else(|_| panic!("parse w={}", w)) as u8;
             assert_eq!(got, expect(w), "gctr byte {} mismatch", w);
         }
+        let _ = std::fs::remove_file(&out);
+    }
+
+    /// Regression: a `match` arm payload binder that shares a name with an
+    /// input record field read in the SAME arm must NOT shadow that field in
+    /// the native arena MatchVariant path.
+    ///
+    /// `popcount` takes a record input `pa : PArg { stk, width }` and matches
+    /// `pa.stk`. The `Push(width, rest)` arm's binder is named `width`, which
+    /// collides with the input field `pa.width` read in the recursion guard
+    /// `width > pa.width`. Pre-fix, both the binder (`Expr::Ident("width")`)
+    /// and the field access (`Expr::Field(Ident("pa"), "width")`) keyed the
+    /// same bare name "width" in the offsets map, so the binder insert
+    /// overwrote the field slot: the guard compiled to `width > width`
+    /// (always false), the recursive `+1` arm was dead, and the rule returned
+    /// the base value (9) instead of the correct 10. The fix keys arm binders
+    /// under `__bind_<name>`, so `pa.width` resolves to the real field slot
+    /// again while the binder shadows correctly within its arm.
+    ///
+    /// Correct result depends on READING THE FIELD: base case `count = 9`,
+    /// one recursion (Push(2) popped down to width 0, since 2 > 0) adds +1
+    /// ⇒ 10. Matches the interpreter.
+    ///
+    /// Confirmed FAIL-BEFORE / PASS-AFTER: with the binder insert keyed by the
+    /// bare name (pre-fix), the native binary prints 9; with the `__bind_`
+    /// namespace fix it prints 10.
+    #[test]
+    fn native_match_binder_does_not_shadow_input_field() {
+        let src = r#"@verbose 0.1.0
+
+concept_group G [max_depth: 4096, max_nodes: 65535]
+  @intention: "g"
+  @source: t.intent:1
+
+  concept Stack
+    @intention: "stack"
+    @source: t.intent:1
+    variants:
+      Push of (width : number, rest : Stack)
+      Empty
+
+  concept Res
+    @intention: "res"
+    @source: t.intent:1
+    variants:
+      MkRes of (count : number)
+
+concept PArg
+  @intention: "arg"
+  @source: t.intent:1
+  fields:
+    stk : Stack
+    width : number [0, 100000]
+
+rule popcount
+  @intention: "popcount"
+  @source: t.intent:1
+  input:
+    pa : PArg
+  output:
+    out : Res
+  logic:
+    out = match pa.stk:
+      Push(width, rest) => if width > pa.width then Res::MkRes { count: res_count(popcount(PArg { stk: rest, width: pa.width })) + 1 } else Res::MkRes { count: 9 }
+      Empty => Res::MkRes { count: 9 }
+  proofs:
+    purity:
+      reads : [pa.stk, pa.width]
+      calls : [popcount, res_count]
+    termination:
+      bound : 4096
+
+rule res_count
+  @intention: "count"
+  @source: t.intent:1
+  input:
+    r : Res
+  output:
+    out : number
+  logic:
+    out = match r:
+      MkRes(count) => count
+  proofs:
+    purity:
+      reads : [r]
+      calls : []
+    termination:
+      bound : 16
+
+concept ProbeArg
+  @intention: "probe"
+  @source: t.intent:1
+  fields:
+    seed : number [0, 100]
+
+rule probe
+  @intention: "probe"
+  @source: t.intent:1
+  input:
+    pb : ProbeArg
+  output:
+    out : number
+  logic:
+    out = res_count(popcount(PArg { stk: Stack::Push { width: 2, rest: Stack::Empty }, width: 0 }))
+  proofs:
+    purity:
+      reads : []
+      calls : [res_count, popcount]
+    termination:
+      bound : 16
+"#;
+        let tokens = crate::lexer::Lexer::new(src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+        let out = std::env::temp_dir().join("verbosec_test_binder_field_collision");
+        compile_native(&program, "probe", out.to_str().unwrap(), false, false)
+            .expect("recursive group rule with binder/field collision must compile");
+        let r = std::process::Command::new(&out).args(["0"]).output()
+            .expect("spawn probe");
+        assert!(r.status.success(), "probe must exit 0; got {:?}", r.status);
+        assert_eq!(
+            String::from_utf8_lossy(&r.stdout).trim(),
+            "10",
+            "Push(2) popped to width 0 must take the recursive +1 arm (9 + 1 = 10); \
+             returning 9 means the binder 'width' shadowed the input field 'pa.width' \
+             so the guard 'width > pa.width' compiled to 'width > width' (always false)"
+        );
         let _ = std::fs::remove_file(&out);
     }
 
