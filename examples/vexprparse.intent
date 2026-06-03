@@ -1,14 +1,40 @@
-Brick 4 of the self-hosting arc: a full-precedence expression PARSER written in
-Verbose, consuming the brick-2 token stream. Brick 3 covered the arithmetic
-core (+ - * / and parens with precedence); brick 4 extends the ladder upward to
-the full expression grammar — logical or/and, comparisons, and prefix unary
-(not / negation) — and downward by adding modulo to the multiplicative level.
+Brick 5 of the self-hosting arc: extend the brick-4 full-precedence expression
+PARSER's `primary` to identifiers, function calls, and field access. Brick 3
+covered the arithmetic core (+ - * / and parens with precedence); brick 4
+extended the ladder to the full expression grammar — logical or/and,
+comparisons, and prefix unary (not / negation). Brick 5 grows the highest-
+precedence form (a primary) so an identifier becomes a bare variable, a function
+call, or a field-access chain:
+
+  primary = '(' parse_or ')' | NUMBER | IDENT trailer
+  trailer = '(' arglist ')'    -- function call
+          | ('.' IDENT)*       -- field-access chain (left-deep)
+          | (nothing)          -- a bare variable reference
+  arglist = (parse_or (',' parse_or)*)?   -- zero or more comma-separated exprs
+
+After lexing an identifier the parser peeks the next token: a '(' opens a
+comma-separated argument list (a call), a '.' opens a field-access chain, and
+anything else leaves a bare variable. Calls and fields nest: f(g(x)) and a.b.c
+both parse, the latter left-deep. The argument list is itself a recursive
+cons-list builder over the token stream, exactly like the tokenizer building the
+token list.
+
+Validation is STRUCTURAL, not numeric: a variable / call / field node has no
+value without an environment, so brick 5's `shape` driver tokenizes + parses and
+returns a kind-count fingerprint of the AST (10000*calls + 1000*fields +
+100*vars + 10*bins + unaries) whose value is hand-derivable and distinct per
+test input. The brick-3/4 evaluator (`eval_expr`) is unchanged and still
+computes variable-free expressions (2+3*4 = 14); the new nodes evaluate to 0
+there (out of the arithmetic evaluator's scope).
 
 1. Declare a concept group holding the token types from brick 2 (a classified
    Token and a cons-list TokenList), an expression AST (a numeric leaf, a
-   binary-operator node, a unary-not node, a unary-negation node, and an error
-   leaf), and a parse result that pairs an AST node with the token index where
-   parsing of it ended.
+   binary-operator node, a unary-not node, a unary-negation node, a bare-
+   variable node carrying a source span, a field-access node, a function-call
+   node carrying a callee span and an argument cons-list, and an error leaf), an
+   argument cons-list, a parse result pairing an AST node with the token index
+   where parsing ended, and a call-argument parse result pairing an argument
+   cons-list with its end index.
 
 2. A scanner state holds the source text and a byte position.
 
@@ -51,7 +77,13 @@ the full expression grammar — logical or/and, comparisons, and prefix unary
 
 16. Parse a primary: a parenthesized expression (which reopens the grammar at the
     top, so a full or/and/comparison expression may appear in parentheses), or a
-    number literal, or an error leaf. A primary is the highest-precedence form.
+    number literal, or an identifier — which is a function call when followed by a
+    parenthesized argument list, a field-access chain when followed by one or more
+    dotted field names, or otherwise a bare variable reference identified by its
+    source span; or an error leaf. Parse a (possibly empty) comma-separated
+    argument list as a cons-list, consuming the closing parenthesis; fold a chain
+    of dotted field accesses onto a base, left-deep. A primary is the highest-
+    precedence form.
 
 17. Fold multiplication, division, and modulo onto an accumulator, left-
     associatively, by parsing the next unary operand and recursing.
@@ -80,8 +112,19 @@ the full expression grammar — logical or/and, comparisons, and prefix unary
     logical and/or to one or zero), negating or logically-negating each unary
     node.
 
-23. End to end: tokenize the source, parse the full expression from the start,
-    and evaluate the resulting AST. This proves precedence ordering across all
-    levels: one plus two equals three is one (addition binds tighter than the
-    comparison), and two less-than three and four less-than five is one (the
-    comparisons bind tighter than 'and').
+23. Compute a STRUCTURAL signature of an AST: a kind-count fingerprint summing a
+    large weight per function call, a smaller weight per field access, a smaller
+    one per variable, a smaller one per binary node, and one per unary node, while
+    recursing into a call's arguments. End to end (the structural driver):
+    tokenize the source, parse the full expression from the start, and return the
+    signature — proving that a call with two arguments builds a call node over a
+    two-element argument list and that a.b.c builds nested field accesses, by a
+    number predictable by hand.
+
+24. End to end (the numeric driver, unchanged from brick 4): tokenize the source,
+    parse the full expression from the start, and evaluate the resulting AST. This
+    proves precedence ordering across all levels: one plus two equals three is one
+    (addition binds tighter than the comparison), and two less-than three and four
+    less-than five is one (the comparisons bind tighter than 'and'). Variable,
+    call, and field nodes have no value without an environment and evaluate to
+    zero here — their correctness is proven by the structural signature above.

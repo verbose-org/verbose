@@ -115,8 +115,33 @@ concept_group VExpr [max_depth: 256, max_nodes: 4000]
       AstNeg of (inner : Ast)
       -- Prefix logical not: not inner (-> 1 if inner == 0 else 0)
       AstNot of (inner : Ast)
+      -- A bare variable reference, identified by its source SPAN (start byte
+      -- offset + byte length). The span is the node's identity: two different
+      -- identifiers necessarily occupy different (start) offsets, and carrying
+      -- len as well distinguishes a short ident from a longer one that happens
+      -- to start at the same place (impossible in one source, but the pair is
+      -- the honest identity and what src/parser.rs's Expr::Ident name stands in
+      -- for). Brick 5 does not resolve the name to bytes — that needs an
+      -- environment; here the span IS the variable, proven structurally.
+      AstVar of (start : number, len : number)
+      -- Field access: base.field. The accessed field is a span (fstart, flen);
+      -- base is the sub-expression being accessed. Chains nest left-deep:
+      -- a.b.c parses to AstField(AstField(AstVar(a), b), c).
+      AstField of (base : Ast, fstart : number, flen : number)
+      -- A function call: callee identified by its span (callee_start,
+      -- callee_len), args a cons-list (ArgList) of argument sub-expressions.
+      -- f() has args = ArgNil; f(x) = ArgCons(AstVar(x), ArgNil); f(x, y) =
+      -- ArgCons(AstVar(x), ArgCons(AstVar(y), ArgNil)).
+      AstCall of (callee_start : number, callee_len : number, args : ArgList)
       -- An error/placeholder leaf (unexpected token); evaluates to 0
       AstErr
+
+  concept ArgList
+    @intention: "Cons-list of call-argument AST nodes (like TokenList but for args)"
+    @source: vexprparse.intent:1
+    variants:
+      ArgCons of (head : Ast, tail : ArgList)
+      ArgNil
 
   concept Parsed
     @intention: "A parse result: the AST built plus the index where it ended"
@@ -124,6 +149,13 @@ concept_group VExpr [max_depth: 256, max_nodes: 4000]
     variants:
       -- node = the subtree parsed; next = token index just past it
       Mk of (node : Ast, next : number)
+
+  concept ParsedArgs
+    @intention: "A call-argument parse result: the ArgList built plus the end index"
+    @source: vexprparse.intent:1
+    variants:
+      -- args = the argument cons-list parsed; next = token index just past ')'
+      MkArgs of (args : ArgList, next : number)
 
 
 -- ============================================================================
@@ -585,6 +617,77 @@ rule tok_op_code
       bound : 16
 
 
+-- 1 iff the token IS an Ident, structurally (kind 100). The keyword tokens
+-- and/or/not pack to 200+kw, so they are NOT idents here — exactly what brick 5
+-- wants (a primary IDENT is a variable/callee name, never a logical keyword).
+rule tok_is_ident
+  @intention: "1 if the token is an identifier, 0 otherwise"
+  @source: vexprparse.intent:13
+  input:
+    t : Token
+  output:
+    out : number
+  logic:
+    out = match t:
+      Ident(start, len) => 1
+      Keyword(start, len, kw) => 0
+      Num(value, len) => 0
+      Op(code, len) => 0
+      Eof => 0
+  proofs:
+    purity:
+      reads : [t]
+      calls : []
+    termination:
+      bound : 16
+
+
+-- The source-span START offset of an Ident token (0 for any other token).
+rule tok_start
+  @intention: "The start byte offset of an Ident token (0 for any other token)"
+  @source: vexprparse.intent:13
+  input:
+    t : Token
+  output:
+    out : number
+  logic:
+    out = match t:
+      Ident(start, len) => start
+      Keyword(start, len, kw) => 0
+      Num(value, len) => 0
+      Op(code, len) => 0
+      Eof => 0
+  proofs:
+    purity:
+      reads : [t]
+      calls : []
+    termination:
+      bound : 16
+
+
+-- The source-span LENGTH of an Ident token (0 for any other token).
+rule tok_len
+  @intention: "The byte length of an Ident token (0 for any other token)"
+  @source: vexprparse.intent:13
+  input:
+    t : Token
+  output:
+    out : number
+  logic:
+    out = match t:
+      Ident(start, len) => len
+      Keyword(start, len, kw) => 0
+      Num(value, len) => 0
+      Op(code, len) => 0
+      Eof => 0
+  proofs:
+    purity:
+      reads : [t]
+      calls : []
+    termination:
+      bound : 16
+
+
 -- Peek the kind code of the token at absolute index `arg.n` in `arg.lst`.
 rule peek_kind
   @intention: "Kind code of the token at index n (0 = Eof / past end)"
@@ -671,6 +774,60 @@ rule peek_op_code
     purity:
       reads : [arg]
       calls : [tok_op_code, head_tok, drop_cells]
+    termination:
+      bound : 16
+
+
+-- Peek whether the token at index `arg.n` is an identifier (structural).
+rule peek_is_ident
+  @intention: "1 if the token at index n is an identifier, 0 otherwise"
+  @source: vexprparse.intent:14
+  input:
+    arg : Nth
+  output:
+    out : number
+  logic:
+    out = tok_is_ident(head_tok(drop_cells(arg)))
+  proofs:
+    purity:
+      reads : [arg]
+      calls : [tok_is_ident, head_tok, drop_cells]
+    termination:
+      bound : 16
+
+
+-- Peek the Ident source-span start offset of the token at index `arg.n`.
+rule peek_start
+  @intention: "Source-span start offset of the Ident token at index n (0 if not an Ident)"
+  @source: vexprparse.intent:14
+  input:
+    arg : Nth
+  output:
+    out : number
+  logic:
+    out = tok_start(head_tok(drop_cells(arg)))
+  proofs:
+    purity:
+      reads : [arg]
+      calls : [tok_start, head_tok, drop_cells]
+    termination:
+      bound : 16
+
+
+-- Peek the Ident source-span length of the token at index `arg.n`.
+rule peek_len
+  @intention: "Source-span length of the Ident token at index n (0 if not an Ident)"
+  @source: vexprparse.intent:14
+  input:
+    arg : Nth
+  output:
+    out : number
+  logic:
+    out = tok_len(head_tok(drop_cells(arg)))
+  proofs:
+    purity:
+      reads : [arg]
+      calls : [tok_len, head_tok, drop_cells]
     termination:
       bound : 16
 
@@ -789,6 +946,100 @@ concept ParenState
     inner : Parsed
 
 
+-- An arg-cons state: the token list plus a freshly-parsed argument (as a
+-- Parsed). args_cons consumes this — extracts the arg node + its end index —
+-- peeks for a ',' (continue: parse the next arg via parse_args) or ')' (stop),
+-- and prepends the arg to the resulting ArgList. Lives in the parser cycle
+-- (called only from parse_args), so the Parsed group-field input compiles
+-- natively (the group-field ABI, commit 9529277).
+concept ArgConsState
+  @intention: "Token list + one parsed call argument (continuing the arg cons-list)"
+  @source: vexprparse.intent:15
+  fields:
+    toks : TokenList
+    first : Parsed
+
+
+-- An arg-prepend state: the head argument's AST node plus the already-parsed
+-- REST of the argument list (as a ParsedArgs). args_prepend consumes this —
+-- conses the head onto the rest's ArgList, carrying the rest's end index. A
+-- single-input rule (the language allows one input per rule), so the head node
+-- and the rest are packed into this one state. In the parser cycle (called only
+-- from args_cons), so the ParsedArgs group-field input compiles natively.
+concept ArgPrependState
+  @intention: "Head argument AST + the parsed rest of the argument list"
+  @source: vexprparse.intent:15
+  fields:
+    head_node : Ast
+    rest : ParsedArgs
+
+
+-- A call-build state: the callee span (start, len) plus the parsed argument
+-- list (as a ParsedArgs). call_build extracts the ArgList + its end index and
+-- builds the AstCall node. In the parser cycle (called only from
+-- parse_primary's call branch), so the ParsedArgs group-field input compiles
+-- natively.
+concept CallState
+  @intention: "Callee span + the parsed argument list of a function call"
+  @source: vexprparse.intent:15
+  fields:
+    toks : TokenList
+    cstart : number [0, 512]
+    clen : number [0, 512]
+    pargs : ParsedArgs
+
+
+-- A field-chain state: the token list, the current index, and the accumulated
+-- base AST (the expression whose field is being accessed). field_rest folds
+-- successive '.IDENT' steps onto the base, left-deep (a.b.c => AstField(
+-- AstField(AstVar(a), b), c)).
+concept FieldState
+  @intention: "Token list + current index + the accumulated field-access base"
+  @source: vexprparse.intent:15
+  fields:
+    toks : TokenList
+    pos : number [0, 512]
+    base : Ast
+
+
+-- Pull the ArgList out of a ParsedArgs result.
+rule parsed_args_list
+  @intention: "The argument cons-list from a call-argument parse result"
+  @source: vexprparse.intent:15
+  input:
+    p : ParsedArgs
+  output:
+    out : ArgList
+  logic:
+    out = match p:
+      MkArgs(args, next) => args
+  proofs:
+    purity:
+      reads : [p]
+      calls : []
+    termination:
+      bound : 16
+
+
+-- Pull the end index out of a ParsedArgs result.
+rule parsed_args_next
+  @intention: "The token index just past a call-argument parse result"
+  @source: vexprparse.intent:15
+  input:
+    p : ParsedArgs
+  output:
+    out : number
+  logic:
+    out = match p:
+      MkArgs(args, next) => next
+  proofs:
+    purity:
+      reads : [p]
+      calls : []
+    termination:
+      bound : 16
+
+
 -- Consume the optional ')' after a '(' add_expr. Reads where the inner
 -- expression ended; if the next token is ')' (kind 422) it is consumed
 -- (next = inner_end + 1), otherwise the position is left as-is (a missing ')'
@@ -814,17 +1065,165 @@ rule paren_close
       bound : 512
 
 
--- primary = '(' add_expr ')' | NUMBER | <error leaf>
+-- ============================================================================
+-- BRICK 5: identifiers, function calls, field access. Mirrors src/parser.rs's
+-- parse_primary ident path:
+--   primary = '(' parse_or ')' | NUMBER | IDENT trailer
+--   trailer = '(' arglist ')'   -- function call
+--           | ('.' IDENT)*      -- field access chain (left-deep)
+--           | (nothing)         -- a bare variable reference
+--   arglist = (parse_or (',' parse_or)*)?   -- zero or more comma-separated exprs
+-- An IDENT here is a Token::Ident (kind 100); the logical keywords and/or/not
+-- lex as Keyword (kind 200+kw) so they never reach this path.
+-- ============================================================================
+
+-- arglist parsing — itself a recursive cons-list builder (like tokenize builds
+-- TokenList). parse_args is entered at the token index of the FIRST argument
+-- (just past the '('). Zero-arg case: if the very next token is ')' (op 22) the
+-- list is empty and we consume the ')'. Otherwise parse one argument (parse_or,
+-- LAZILY in the else branch so a non-call ident never descends here) and hand
+-- it to args_cons, which decides comma-continue vs ')'-stop.
+rule parse_args
+  @intention: "Parse a (possibly empty) comma-separated call-argument list, consuming the ')'"
+  @source: vexprparse.intent:16
+  input:
+    st : ParseState
+  output:
+    out : ParsedArgs
+  logic:
+    let opc = peek_op_code(Nth { lst: st.toks, n: st.pos })
+    let isclose = if opc == 22 then 1 else 0
+    out = if isclose == 1 then ParsedArgs::MkArgs { args: ArgList::ArgNil, next: st.pos + 1 } else args_cons(ArgConsState { toks: st.toks, first: parse_or(st) })
+  proofs:
+    purity:
+      reads : [st.toks, st.pos, st]
+      calls : [peek_op_code, parse_or, args_cons]
+    termination:
+      bound : 512
+
+
+-- args_cons: given a freshly-parsed argument (Parsed), fold it into the arg
+-- cons-list. Extract the arg node + its end index, peek the next token: a ','
+-- (op 11) continues — parse the REST of the list (LAZILY, in the then branch)
+-- from just past the comma and prepend this arg; a ')' (op 22) stops, consuming
+-- it (next = arg_end + 1); anything else stops too (missing ')' tolerated, like
+-- paren_close — error recovery is a later brick), leaving next = arg_end.
+rule args_cons
+  @intention: "Fold one parsed argument into the cons-list, continuing on ',' or stopping on ')'"
+  @source: vexprparse.intent:16
+  input:
+    cs : ArgConsState
+  output:
+    out : ParsedArgs
+  logic:
+    let arg_node = parsed_node(cs.first)
+    let arg_next = parsed_next(cs.first)
+    let opc = peek_op_code(Nth { lst: cs.toks, n: arg_next })
+    let iscomma = if opc == 11 then 1 else 0
+    let close_next = if opc == 22 then arg_next + 1 else arg_next
+    out = if iscomma == 1 then args_prepend(ArgPrependState { head_node: arg_node, rest: parse_args(ParseState { toks: cs.toks, pos: arg_next + 1 }) }) else ParsedArgs::MkArgs { args: ArgList::ArgCons { head: arg_node, tail: ArgList::ArgNil }, next: close_next }
+  proofs:
+    purity:
+      reads : [cs.toks, cs.first]
+      calls : [parsed_node, parsed_next, peek_op_code, args_prepend, parse_args]
+    termination:
+      bound : 512
+
+
+-- args_prepend: cons the head argument onto the front of the already-parsed
+-- REST of the argument list, carrying the rest's end index through. Splitting
+-- this out of args_cons keeps the recursive parse_args call lazily inside the
+-- comma branch (a let would force it eagerly). Reached only from args_cons in
+-- the parser cycle, so the ParsedArgs group-field input compiles natively.
+rule args_prepend
+  @intention: "Cons the head argument onto the front of the parsed rest of the list"
+  @source: vexprparse.intent:16
+  input:
+    aps : ArgPrependState
+  output:
+    out : ParsedArgs
+  logic:
+    let rest_list = parsed_args_list(aps.rest)
+    let rest_next = parsed_args_next(aps.rest)
+    out = ParsedArgs::MkArgs { args: ArgList::ArgCons { head: aps.head_node, tail: rest_list }, next: rest_next }
+  proofs:
+    purity:
+      reads : [aps.head_node, aps.rest]
+      calls : [parsed_args_list, parsed_args_next]
+    termination:
+      bound : 16
+
+
+-- call_build: given the callee span and the parsed argument list, build the
+-- AstCall node carrying the arg cons-list and the index just past the ')'.
+-- In the parser cycle (called only from parse_primary's call branch).
+rule call_build
+  @intention: "Build an AstCall node from the callee span and the parsed argument list"
+  @source: vexprparse.intent:16
+  input:
+    cs : CallState
+  output:
+    out : Parsed
+  logic:
+    let arglist = parsed_args_list(cs.pargs)
+    let argnext = parsed_args_next(cs.pargs)
+    out = Parsed::Mk { node: Ast::AstCall { callee_start: cs.cstart, callee_len: cs.clen, args: arglist }, next: argnext }
+  proofs:
+    purity:
+      reads : [cs.cstart, cs.clen, cs.pargs]
+      calls : [parsed_args_list, parsed_args_next]
+    termination:
+      bound : 16
+
+
+-- field_rest: fold a chain of '.IDENT' field accesses onto a base AST, left-deep
+-- (a.b.c => AstField(AstField(AstVar(a), b), c)). Peeks the op at fs.pos: a '.'
+-- (op 12) followed by an IDENT consumes both, wraps the base in AstField with
+-- the field's span, and recurses with the new base at pos+2. Anything else
+-- stops, returning the base unchanged at the current position. The recursion is
+-- in the then branch (LAZY); each step consumes at least two tokens so pos
+-- strictly grows toward Eof.
+rule field_rest
+  @intention: "Fold a chain of '.field' accesses onto a base, left-deep"
+  @source: vexprparse.intent:16
+  input:
+    fs : FieldState
+  output:
+    out : Parsed
+  logic:
+    let opc = peek_op_code(Nth { lst: fs.toks, n: fs.pos })
+    let isdot = if opc == 12 then 1 else 0
+    let fstart = peek_start(Nth { lst: fs.toks, n: fs.pos + 1 })
+    let flen = peek_len(Nth { lst: fs.toks, n: fs.pos + 1 })
+    let isident = peek_is_ident(Nth { lst: fs.toks, n: fs.pos + 1 })
+    let isfield = if isdot == 1 and isident == 1 then 1 else 0
+    out = if isfield == 1 then field_rest(FieldState { toks: fs.toks, pos: fs.pos + 2, base: Ast::AstField { base: fs.base, fstart: fstart, flen: flen } }) else Parsed::Mk { node: fs.base, next: fs.pos }
+  proofs:
+    purity:
+      reads : [fs.toks, fs.pos, fs.base]
+      calls : [peek_op_code, peek_start, peek_len, peek_is_ident, field_rest]
+    termination:
+      bound : 512
+
+
+-- primary = '(' parse_or ')' | NUMBER | IDENT trailer | <error leaf>
 -- Peeks the token at pos. A '(' (op code 21 => kind 421) opens a sub-expr:
--- parse_add inside (LAZILY, only in this branch), then paren_close consumes the
--- ')'. A Num (kind 300+value) becomes an AstNum leaf consuming one token.
--- Anything else is an AstErr leaf that consumes nothing (the position does not
--- advance, which the higher levels read as "stop").
+-- parse_or inside (LAZILY, only in this branch), then paren_close consumes the
+-- ')'. A Num (kind 300+value) becomes an AstNum leaf consuming one token. An
+-- IDENT (kind 100) takes the brick-5 trailer path: look at the NEXT token —
+-- '(' (op 21) => a function call (parse_args from pos+2, build AstCall); '.'
+-- (op 12) => a field-access chain (AstVar base folded by field_rest from pos+1);
+-- anything else => a bare AstVar consuming one token. Any other lead token is an
+-- AstErr leaf that consumes nothing (position does not advance => higher levels
+-- read it as "stop").
 --
--- The recursive parse_add call lives INSIDE the `then isparen` branch so eager
--- let evaluation does not descend on a non-paren token (the loop trap).
+-- All recursive descents (parse_or for parens, parse_args for a call) live
+-- INSIDE their guarded branch so eager let evaluation never descends on the
+-- wrong lead token (the loop trap). The trailer dispatch is on op codes of the
+-- token at pos+1, computed up front in lets (those peeks are pure/total — they
+-- only READ the token list, never recurse), but each descent stays lazy.
 rule parse_primary
-  @intention: "Parse a primary: parenthesized expr or a number literal"
+  @intention: "Parse a primary: parenthesized expr, number, or identifier (var / call / field)"
   @source: vexprparse.intent:16
   input:
     st : ParseState
@@ -834,12 +1233,17 @@ rule parse_primary
     let isnum = peek_is_num(Nth { lst: st.toks, n: st.pos })
     let opc = peek_op_code(Nth { lst: st.toks, n: st.pos })
     let isparen = if opc == 21 then 1 else 0
+    let isident = peek_is_ident(Nth { lst: st.toks, n: st.pos })
     let numval = peek_value(Nth { lst: st.toks, n: st.pos })
-    out = if isnum == 1 then Parsed::Mk { node: Ast::AstNum { value: numval }, next: st.pos + 1 } else if isparen == 1 then paren_close(ParenState { toks: st.toks, inner: parse_or(ParseState { toks: st.toks, pos: st.pos + 1 }) }) else Parsed::Mk { node: Ast::AstErr, next: st.pos }
+    let idstart = peek_start(Nth { lst: st.toks, n: st.pos })
+    let idlen = peek_len(Nth { lst: st.toks, n: st.pos })
+    let next_opc = peek_op_code(Nth { lst: st.toks, n: st.pos + 1 })
+    let iscall = if next_opc == 21 then 1 else 0
+    out = if isnum == 1 then Parsed::Mk { node: Ast::AstNum { value: numval }, next: st.pos + 1 } else if isparen == 1 then paren_close(ParenState { toks: st.toks, inner: parse_or(ParseState { toks: st.toks, pos: st.pos + 1 }) }) else if isident == 1 then (if iscall == 1 then call_build(CallState { toks: st.toks, cstart: idstart, clen: idlen, pargs: parse_args(ParseState { toks: st.toks, pos: st.pos + 2 }) }) else field_rest(FieldState { toks: st.toks, pos: st.pos + 1, base: Ast::AstVar { start: idstart, len: idlen } })) else Parsed::Mk { node: Ast::AstErr, next: st.pos }
   proofs:
     purity:
       reads : [st.toks, st.pos]
-      calls : [peek_is_num, peek_op_code, peek_value, paren_close, parse_or]
+      calls : [peek_is_num, peek_op_code, peek_is_ident, peek_value, peek_start, peek_len, paren_close, parse_or, call_build, parse_args, field_rest]
     termination:
       bound : 512
 
@@ -1239,6 +1643,14 @@ rule eval_ast
       AstBin(op, lhs, rhs) => if op == 13 then eval_ast(lhs) + eval_ast(rhs) else if op == 14 then eval_ast(lhs) - eval_ast(rhs) else if op == 15 then eval_ast(lhs) * eval_ast(rhs) else if op == 16 then eval_ast(lhs) / eval_ast(rhs) else if op == 17 then eval_ast(lhs) % eval_ast(rhs) else if op == 1 then (if eval_ast(lhs) == eval_ast(rhs) then 1 else 0) else if op == 6 then (if eval_ast(lhs) != eval_ast(rhs) then 1 else 0) else if op == 19 then (if eval_ast(lhs) < eval_ast(rhs) then 1 else 0) else if op == 20 then (if eval_ast(lhs) > eval_ast(rhs) then 1 else 0) else if op == 5 then (if eval_ast(lhs) <= eval_ast(rhs) then 1 else 0) else if op == 4 then (if eval_ast(lhs) >= eval_ast(rhs) then 1 else 0) else if op == 30 then (if eval_ast(lhs) != 0 and eval_ast(rhs) != 0 then 1 else 0) else if op == 31 then (if eval_ast(lhs) != 0 or eval_ast(rhs) != 0 then 1 else 0) else 0
       AstNeg(inner) => 0 - eval_ast(inner)
       AstNot(inner) => if eval_ast(inner) == 0 then 1 else 0
+      -- Brick 5's variable / field / call nodes have NO numeric value without an
+      -- environment to resolve names; they are out of the arithmetic evaluator's
+      -- scope and evaluate to 0. (Brick 5's correctness is proven by `shape`, the
+      -- STRUCTURAL signature walk below — not by eval_ast.) eval_ast stays the
+      -- brick-3/4 evaluator for variable-free expressions: 2+3*4 = 14 still.
+      AstVar(start, len) => 0
+      AstField(base, fstart, flen) => 0
+      AstCall(callee_start, callee_len, args) => 0
       AstErr => 0
   proofs:
     purity:
@@ -1247,6 +1659,97 @@ rule eval_ast
     termination:
       bound : 4000
       structural : e
+
+
+-- ============================================================================
+-- STRUCTURAL SIGNATURE (the brick-5 oracle). Unlike bricks 3/4, a variable /
+-- call / field node has no numeric value (no environment), so brick 5's parser
+-- is validated by the SHAPE of the AST it builds, not by an evaluated number.
+--
+-- shape_ast walks the tree and returns a signature that counts node kinds:
+--
+--     10000 * (#AstCall) + 1000 * (#AstField) + 100 * (#AstVar)
+--       + 10 * (#AstBin) + (#AstNot + #AstNeg)
+--
+-- The five count bands are spaced by powers of ten wide enough that no test
+-- input overflows a lower band into a higher one (the deepest test has at most
+-- a handful of each kind). AstNum and AstErr contribute 0 — they are not part
+-- of the brick-5 surface being proven. Each test input's signature is
+-- hand-derivable and distinct, so a single number certifies the exact shape.
+--
+-- shape_ast and shape_args are mutually recursive (a call's signature includes
+-- its arguments' signatures). Both walk a strictly-shrinking group value at
+-- every recursive step (a sub-Ast or the tail ArgList), so they declare the
+-- structural termination proof — same posture as eval_ast.
+-- ============================================================================
+rule shape_args
+  @intention: "Sum the structural signatures of every argument in a call-argument list"
+  @source: vexprparse.intent:23
+  input:
+    a : ArgList
+  output:
+    out : number
+  logic:
+    out = match a:
+      ArgCons(head, tail) => shape_ast(head) + shape_args(tail)
+      ArgNil => 0
+  proofs:
+    purity:
+      reads : [a]
+      calls : [shape_ast, shape_args]
+    termination:
+      bound : 4000
+      structural : a
+
+
+rule shape_ast
+  @intention: "Structural signature of an AST: a kind-count fingerprint of its shape"
+  @source: vexprparse.intent:23
+  input:
+    e : Ast
+  output:
+    out : number
+  logic:
+    out = match e:
+      AstNum(value) => 0
+      AstBin(op, lhs, rhs) => 10 + shape_ast(lhs) + shape_ast(rhs)
+      AstNeg(inner) => 1 + shape_ast(inner)
+      AstNot(inner) => 1 + shape_ast(inner)
+      AstVar(start, len) => 100
+      AstField(base, fstart, flen) => 1000 + shape_ast(base)
+      AstCall(callee_start, callee_len, args) => 10000 + shape_args(args)
+      AstErr => 0
+  proofs:
+    purity:
+      reads : [e]
+      calls : [shape_ast, shape_args]
+    termination:
+      bound : 4000
+      structural : e
+
+
+-- shape: the brick-5 driver. Tokenize the source, parse the full expression
+-- from index 0, and return the STRUCTURAL signature of the resulting AST. This
+-- is the observable that proves f(x, y) builds an AstCall with a 2-element
+-- ArgList and a.b.c builds nested AstField — by a number we can predict by hand.
+rule shape
+  @intention: "Tokenize, parse, and return the AST's structural signature"
+  @source: vexprparse.intent:23
+  input:
+    s : ScanState
+  output:
+    out : number
+  logic:
+    let toks = tokenize(ScanState { source: s.source, pos: 0 })
+    let parsed = parse_or(ParseState { toks: toks, pos: 0 })
+    let root = parsed_node(parsed)
+    out = shape_ast(root)
+  proofs:
+    purity:
+      reads : [s.source]
+      calls : [tokenize, parse_or, shape_ast, parsed_node]
+    termination:
+      bound : 256
 
 
 -- ============================================================================
