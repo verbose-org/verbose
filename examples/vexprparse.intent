@@ -1,3 +1,42 @@
+Brick 7 of the self-hosting arc: extend the parser's `primary` with two LITERAL
+kinds — boolean literals (`true` / `false`) and string literals (`"..."`).
+Brick 6 added the conditional expression; brick 7 adds the remaining leaf forms.
+
+Boolean literals lex as keywords (the keyword classifier gains `true` = code 9
+in the four-letter band and `false` = code 10 in a new five-letter band), parse
+to a boolean-literal node carrying 1 for true / 0 for false, and DO carry an
+arithmetic value — they evaluate to 1/0 and compose in and / or / not /
+comparisons exactly as a 1/0 number would (true and false = 0, true or false = 1,
+not false = 1, if true then 7 else 8 = 7).
+
+String literals are the tokenizer-reopening part. A new string-length scanner
+recognizes a `"`...`"` token with the closed escape set (\n \r \t \\ \"). Inside
+the string a backslash starts a TWO-byte escape and is skipped unconditionally,
+so an escaped quote (\") does NOT terminate the string; the string ends at the
+first UNESCAPED closing quote. Escape handling is LENIENT — this is a token-
+BOUNDARY scanner, not an escape validator, so an unknown escape \x is simply two
+literal bytes (the reference lexer rejects unknown escapes, but finding where the
+token ends is all this brick needs). An UNTERMINATED string (no closing quote
+before end-of-source) runs to the end and is still a string token (fail-closed:
+every byte index is guarded, and a trailing lone backslash counts as one byte and
+stops). The string token carries its source span (opening-quote offset + total
+length including both quotes), and the parser builds a string-literal node
+identified by that span. A string has no arithmetic value without an environment
+to decode its bytes, so it evaluates to zero — its correctness is proven
+STRUCTURALLY by the shape signature (a dedicated top band per literal kind:
+booleans and strings each get their own weight above the conditional's band).
+Because the interpreter's JSON input reader cannot deliver a `"`-containing
+source string (it strips outer quotes naively and does not decode escapes), the
+string-literal cases are validated NATIVE-ONLY via argv, exactly like brick 5's
+comma cases. The boolean and the non-string shape cases cross-check native
+against the interpreter through the JSON fixture as before.
+
+  primary = 'if' parse_or 'then' parse_or 'else' parse_or   -- brick 6
+          | 'true' | 'false'    -- brick 7 boolean literal
+          | STRING               -- brick 7 string literal
+          | '(' parse_or ')' | NUMBER | IDENT trailer
+
+----------------------------------------------------------------------------
 Brick 6 of the self-hosting arc: extend the parser's `primary` with a
 conditional expression — `if cond then thn else els`, the single-line form.
 Bricks 3-5 built the full-precedence parser (arithmetic core, logical or/and,

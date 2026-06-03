@@ -47,5 +47,15 @@
   {"source": "if 1 then 2 else 3 + 100", "pos": 0},
   {"source": "if 1 then (if 0 then 5 else 6) else 7", "pos": 0},
   {"source": "1 + (if 1 then 2 else 3)", "pos": 0},
-  {"source": "if 2 > 1 and 3 > 2 then 1 else 0", "pos": 0}
+  {"source": "if 2 > 1 and 3 > 2 then 1 else 0", "pos": 0},
+  {"source": "true", "pos": 0},
+  {"source": "false", "pos": 0},
+  {"source": "true and false", "pos": 0},
+  {"source": "true or false", "pos": 0},
+  {"source": "not false", "pos": 0},
+  {"source": "not true", "pos": 0},
+  {"source": "if true then 7 else 8", "pos": 0},
+  {"source": "if false then 7 else 8", "pos": 0},
+  {"source": "(1 < 2) == true", "pos": 0},
+  {"source": "true and true and false", "pos": 0}
 ]
