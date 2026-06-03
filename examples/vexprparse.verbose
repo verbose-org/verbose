@@ -101,7 +101,7 @@
 -- Over the cap a VariantConstruct hits the arena bounds-check and the binary
 -- exits 1 (fail-closed) rather than corrupting memory.
 -- ============================================================================
-concept_group VExpr [max_depth: 256, max_nodes: 4000]
+concept_group VExpr [max_depth: 4096, max_nodes: 65535]
   @intention: "Tokens, a token cons-list, an arithmetic AST, and a parse result"
   @source: vexprparse.intent:1
 
@@ -133,6 +133,19 @@ concept_group VExpr [max_depth: 256, max_nodes: 4000]
       -- INDENT/DEDENT column-stack logic are brick 8b. Brick 8a computes NO
       -- indentation, columns, INDENT, or DEDENT.
       Newline of (pos : number)
+      -- Brick 8b: structural block tokens woven into the stream by the line
+      -- driver (tokenize_indent). Indent marks entering a deeper block (one per
+      -- deeper level, pushed onto the column stack); Dedent marks leaving a block
+      -- (one per popped level, emitted on a shallower line AND flushed at EOF for
+      -- every still-open level). IndentErr is the fail-closed error token: a
+      -- Verbose rule is TOTAL (it cannot abort mid-evaluation the way
+      -- src/lexer.rs returns a LexError), so the reference's tab-rejection and
+      -- inconsistent-indentation errors become a distinguished token in the
+      -- stream that the downstream self-hosting parser treats as a hard stop.
+      -- pos = the byte offset of the offending line's content start.
+      Indent
+      Dedent
+      IndentErr of (pos : number)
       Eof
 
   concept TokenList
@@ -215,6 +228,33 @@ concept_group VExpr [max_depth: 256, max_nodes: 4000]
     variants:
       -- args = the argument cons-list parsed; next = token index just past ')'
       MkArgs of (args : ArgList, next : number)
+
+  -- Brick 8b: the column stack. A cons-list of open-block indentation widths,
+  -- mirroring src/lexer.rs's `indent_stack: Vec<usize>`. Push(width, rest) is a
+  -- level opened at column `width`; Empty is the file's outermost (column-0)
+  -- sentinel level that is never popped (top_width returns 0 for it). The stack
+  -- lives in the arena exactly like TokenList; the line driver threads it as one
+  -- of its two group-concept fields (the multi-group-field recursive ABI,
+  -- commit 9529277 — verified to compile by the design note's probe).
+  concept ColStack
+    @intention: "Indentation column stack: open-block widths (Empty = column-0 sentinel)"
+    @source: vexprparse.intent:27
+    variants:
+      Push of (width : number, rest : ColStack)
+      Empty
+
+  -- Brick 8b: the multi-DEDENT result. The shallower-width pop is a recursion
+  -- over ColStack that must return THREE things at once (a Verbose rule returns
+  -- one value): the stack AFTER popping every level whose width > the target
+  -- (`popped`), the NUMBER of levels popped (`count` = the number of Dedent
+  -- tokens to emit), and an inconsistency FLAG (`err` = 1 iff after popping the
+  -- new top width does not exactly equal the target — i.e. the line's width
+  -- matches no enclosing block, src/lexer.rs:227-236). Packed into one concept.
+  concept DedentResult
+    @intention: "Result of a multi-DEDENT pop: new stack + dedent count + inconsistency flag"
+    @source: vexprparse.intent:27
+    variants:
+      MkDed of (popped : ColStack, count : number, err : number)
 
 
 -- ============================================================================
@@ -682,6 +722,9 @@ rule tok_kind
       Op(code, len) => 400 + code
       Str(start, len) => 500
       Newline(pos) => 600
+      Indent => 700
+      Dedent => 800
+      IndentErr(pos) => 900
       Eof => 0
   proofs:
     purity:
@@ -708,6 +751,9 @@ rule tok_value
       Op(code, len) => 0
       Str(start, len) => 0
       Newline(pos) => 0
+      Indent => 0
+      Dedent => 0
+      IndentErr(pos) => 0
       Eof => 0
   proofs:
     purity:
@@ -736,6 +782,9 @@ rule tok_is_num
       Op(code, len) => 0
       Str(start, len) => 0
       Newline(pos) => 0
+      Indent => 0
+      Dedent => 0
+      IndentErr(pos) => 0
       Eof => 0
   proofs:
     purity:
@@ -765,6 +814,9 @@ rule tok_is_op
       Op(code, len) => 1
       Str(start, len) => 0
       Newline(pos) => 0
+      Indent => 0
+      Dedent => 0
+      IndentErr(pos) => 0
       Eof => 0
   proofs:
     purity:
@@ -790,6 +842,9 @@ rule tok_op_code
       Op(code, len) => code
       Str(start, len) => 0
       Newline(pos) => 0
+      Indent => 0
+      Dedent => 0
+      IndentErr(pos) => 0
       Eof => 0
   proofs:
     purity:
@@ -817,6 +872,9 @@ rule tok_is_ident
       Op(code, len) => 0
       Str(start, len) => 0
       Newline(pos) => 0
+      Indent => 0
+      Dedent => 0
+      IndentErr(pos) => 0
       Eof => 0
   proofs:
     purity:
@@ -842,6 +900,9 @@ rule tok_start
       Op(code, len) => 0
       Str(start, len) => 0
       Newline(pos) => 0
+      Indent => 0
+      Dedent => 0
+      IndentErr(pos) => 0
       Eof => 0
   proofs:
     purity:
@@ -867,6 +928,9 @@ rule tok_len
       Op(code, len) => 0
       Str(start, len) => 0
       Newline(pos) => 0
+      Indent => 0
+      Dedent => 0
+      IndentErr(pos) => 0
       Eof => 0
   proofs:
     purity:
@@ -895,6 +959,9 @@ rule tok_is_str
       Op(code, len) => 0
       Str(start, len) => 1
       Newline(pos) => 0
+      Indent => 0
+      Dedent => 0
+      IndentErr(pos) => 0
       Eof => 0
   proofs:
     purity:
@@ -921,6 +988,9 @@ rule tok_str_start
       Op(code, len) => 0
       Str(start, len) => start
       Newline(pos) => 0
+      Indent => 0
+      Dedent => 0
+      IndentErr(pos) => 0
       Eof => 0
   proofs:
     purity:
@@ -947,6 +1017,9 @@ rule tok_str_len
       Op(code, len) => 0
       Str(start, len) => len
       Newline(pos) => 0
+      Indent => 0
+      Dedent => 0
+      IndentErr(pos) => 0
       Eof => 0
   proofs:
     purity:
@@ -2296,6 +2369,9 @@ rule tok_is_newline
       Op(code, len) => 0
       Str(start, len) => 0
       Newline(pos) => 1
+      Indent => 0
+      Dedent => 0
+      IndentErr(pos) => 0
       Eof => 0
   proofs:
     purity:
@@ -2358,6 +2434,542 @@ rule kind_at
     purity:
       reads : [arg.source, arg.idx]
       calls : [tokenize, peek_kind]
+    termination:
+      bound : 256
+
+
+-- ============================================================================
+-- BRICK 8b: INDENT / DEDENT via a column stack (design (a), docs/indent-dedent-
+-- design.md). Turns the flat-plus-Newline stream of brick 8a into a block-
+-- structured stream by weaving Indent / Dedent tokens at line starts, driven by
+-- a column stack (ColStack) threaded alongside the output token list through a
+-- line-by-line driver recursion. Mirrors src/lexer.rs::handle_line_start +
+-- tokenize one-to-one. The two errors the reference returns as a LexError
+-- (tab-in-indent, inconsistent indentation) become Token::IndentErr in the
+-- stream, because a Verbose rule is TOTAL (cannot abort mid-evaluation).
+--
+-- Faithful simplifications vs the reference (documented, not silent):
+--  * BLANK lines (whitespace only, to the newline or EOF) are SKIPPED entirely
+--    — no Indent/Dedent and no Newline. They carry no block structure; the
+--    reference's main loop would emit a Newline for them but suppresses it after
+--    a prior Newline. Skipping keeps the observable hand-derivable (test 7).
+--  * The TAB sentinel (line_width returns 99999 on a tab in leading whitespace)
+--    is well above any real width (source is <= 256 bytes), so it never aliases
+--    a genuine indentation level.
+-- ============================================================================
+
+-- line_width: from a line-start position `pos`, count consecutive leading
+-- spaces (byte 32). If a TAB (byte 9) appears in the leading whitespace, return
+-- the sentinel 99999 (> any real width, since source <= 256) so the driver can
+-- turn it into a Token::IndentErr — the faithful translation of src/lexer.rs's
+-- tab rejection (:193-199). byte_at is fail-closed OOB, so at end-of-source the
+-- count so far is returned. Termination: pos strictly increases toward len.
+rule line_width
+  @intention: "Count leading spaces at a line start; 99999 sentinel if a tab is seen"
+  @source: vexprparse.intent:27
+  input:
+    s : ScanState
+  output:
+    out : number
+  logic:
+    let len = length(s.source)
+    out = if s.pos >= len then 0 else if byte_at(s.source, s.pos) == 9 then 99999 else if byte_at(s.source, s.pos) == 32 then 1 + line_width(ScanState { source: s.source, pos: s.pos + 1 }) else 0
+  proofs:
+    purity:
+      reads : [s.source, s.pos]
+      calls : [line_width]
+    termination:
+      bound : 256
+      increasing : pos
+
+
+-- next_line_start: from anywhere on a line, scan forward to the byte AFTER the
+-- next newline (byte 10), or to length(source) at end-of-source. This is how the
+-- driver steps from one line to the next — it replaces the brick-2 scanner's
+-- "a newline stops tokenize" behaviour. Termination: pos strictly increases.
+rule next_line_start
+  @intention: "Index just past the next newline, or end-of-source"
+  @source: vexprparse.intent:27
+  input:
+    s : ScanState
+  output:
+    out : number
+  logic:
+    let len = length(s.source)
+    out = if s.pos >= len then len else if byte_at(s.source, s.pos) == 10 then s.pos + 1 else next_line_start(ScanState { source: s.source, pos: s.pos + 1 })
+  proofs:
+    purity:
+      reads : [s.source, s.pos]
+      calls : [next_line_start]
+    termination:
+      bound : 256
+      increasing : pos
+
+
+-- top_width: the head width of the column stack (0 for Empty, the column-0
+-- sentinel). Trivial match — no recursion.
+rule top_width
+  @intention: "Head width of the column stack (0 for the Empty sentinel)"
+  @source: vexprparse.intent:27
+  input:
+    cs : ColStack
+  output:
+    out : number
+  logic:
+    out = match cs:
+      Push(width, rest) => width
+      Empty => 0
+  proofs:
+    purity:
+      reads : [cs]
+      calls : []
+    termination:
+      bound : 16
+
+
+-- A multi-DEDENT pop argument: the column stack and the target width.
+concept PopArg
+  @intention: "Column stack + the line's width to pop down to"
+  @source: vexprparse.intent:27
+  fields:
+    stk : ColStack
+    width : number [0, 100000]
+
+
+-- dedents_to: the multi-DEDENT recursion (src/lexer.rs:223-236). Pop every level
+-- whose width is STRICTLY GREATER than the target `width`, counting one Dedent
+-- per pop. Stops when the top width is <= the target (or the stack is the Empty
+-- sentinel). Returns the popped stack, the pop count, AND an inconsistency flag:
+-- err = 1 iff after popping the new top width does NOT exactly equal the target
+-- (the line's width matches no enclosing block). The sentinel Empty has width 0,
+-- so a target of 0 pops everything and lands exactly (err = 0). Termination: the
+-- ColStack strictly shrinks (one Push removed per recursive step), so it is a
+-- structural recursion on `stk`.
+rule dedents_to
+  @intention: "Pop the column stack down to a width, returning new stack + dedent count + inconsistency flag"
+  @source: vexprparse.intent:27
+  input:
+    pa : PopArg
+  output:
+    out : DedentResult
+  logic:
+    out = match pa.stk:
+      Push(width, rest) => if width > pa.width then dedent_bump(dedents_to(PopArg { stk: rest, width: pa.width })) else (if width == pa.width then DedentResult::MkDed { popped: pa.stk, count: 0, err: 0 } else DedentResult::MkDed { popped: pa.stk, count: 0, err: 1 })
+      Empty => if pa.width == 0 then DedentResult::MkDed { popped: ColStack::Empty, count: 0, err: 0 } else DedentResult::MkDed { popped: ColStack::Empty, count: 0, err: 1 }
+  proofs:
+    purity:
+      reads : [pa.stk, pa.width]
+      calls : [dedents_to, dedent_bump]
+    termination:
+      bound : 4096
+
+
+-- dedent_bump: add one to the pop count of a DedentResult, carrying the popped
+-- stack and the err flag through unchanged. Used by dedents_to to fold "+1
+-- Dedent" onto the result of the deeper pop. A trivial wrapper so dedents_to's
+-- recursive arm stays a single constructor expression.
+rule dedent_bump
+  @intention: "Increment a DedentResult's pop count by one (stack + err unchanged)"
+  @source: vexprparse.intent:27
+  input:
+    dr : DedentResult
+  output:
+    out : DedentResult
+  logic:
+    out = match dr:
+      MkDed(popped, count, err) => DedentResult::MkDed { popped: popped, count: count + 1, err: err }
+  proofs:
+    purity:
+      reads : [dr]
+      calls : []
+    termination:
+      bound : 16
+
+
+-- Accessors for a DedentResult. A block-form `match` is only legal in the FINAL
+-- `out = match ...` position (not as a `let` RHS, and a sum-typed value cannot be
+-- field-accessed with `.field`), so destructuring a DedentResult is factored into
+-- these three tiny rules — exactly the parsed_node / parsed_next pattern.
+rule dr_popped
+  @intention: "The popped column stack from a DedentResult"
+  @source: vexprparse.intent:27
+  input:
+    dr : DedentResult
+  output:
+    out : ColStack
+  logic:
+    out = match dr:
+      MkDed(popped, count, err) => popped
+  proofs:
+    purity:
+      reads : [dr]
+      calls : []
+    termination:
+      bound : 16
+
+
+rule dr_count
+  @intention: "The dedent count from a DedentResult"
+  @source: vexprparse.intent:27
+  input:
+    dr : DedentResult
+  output:
+    out : number
+  logic:
+    out = match dr:
+      MkDed(popped, count, err) => count
+  proofs:
+    purity:
+      reads : [dr]
+      calls : []
+    termination:
+      bound : 16
+
+
+rule dr_err
+  @intention: "The inconsistency flag from a DedentResult"
+  @source: vexprparse.intent:27
+  input:
+    dr : DedentResult
+  output:
+    out : number
+  logic:
+    out = match dr:
+      MkDed(popped, count, err) => err
+  proofs:
+    purity:
+      reads : [dr]
+      calls : []
+    termination:
+      bound : 16
+
+
+-- A cons-dedents argument: how many Dedent tokens to prepend, and the tail list
+-- they prepend onto (the already-built continuation).
+concept ConsDedArg
+  @intention: "A dedent count plus the tail list to prepend the Dedent tokens onto"
+  @source: vexprparse.intent:27
+  fields:
+    count : number [0, 4096]
+    tail : TokenList
+
+
+-- cons_dedents: prepend `count` Token::Dedent cells onto the front of `tail`.
+-- The tail is the already-computed continuation (the rest of the stream); each
+-- recursive step conses ONE Dedent and decrements the count, so the result is
+-- count Dedents followed by tail. Termination: count strictly decreases.
+rule cons_dedents
+  @intention: "Prepend `count` Dedent tokens onto a tail token list"
+  @source: vexprparse.intent:27
+  input:
+    cda : ConsDedArg
+  output:
+    out : TokenList
+  logic:
+    out = if cda.count <= 0 then cda.tail else TokenList::Cons { head: Token::Dedent, tail: cons_dedents(ConsDedArg { count: cda.count - 1, tail: cda.tail }) }
+  proofs:
+    purity:
+      reads : [cda.count, cda.tail]
+      calls : [cons_dedents]
+    termination:
+      bound : 4096
+      decreasing : count
+
+
+-- tokenize_line: tokenize ONE line's lexemes, starting at `pos`, stopping at (and
+-- NOT consuming) the line's newline (byte 10) or end-of-source. Returns a
+-- Nil-terminated list of the line's lexeme tokens — no Newline, no Eof. This is
+-- brick 2's `tokenize` bounded to a single line: it conses next_token / advances
+-- by token_end exactly as `tokenize` does, but the stop condition is "reached a
+-- newline or end-of-source" instead of "reached end-of-source". A Newline token
+-- is never produced here (the driver conses the line's Newline itself); if the
+-- next lexeme would be a Newline we stop. Termination: pos strictly advances by
+-- at least one byte each step (endp > p), bounded by source length.
+rule tokenize_line
+  @intention: "Tokenize one line's lexemes up to (not including) its newline; Nil-terminated"
+  @source: vexprparse.intent:27
+  input:
+    s : ScanState
+  output:
+    out : TokenList
+  logic:
+    let len = length(s.source)
+    let p = skip_spaces(s)
+    let endp = token_end(s)
+    let atnl = if p >= len then 1 else if byte_at(s.source, p) == 10 then 1 else 0
+    out = if atnl == 1 then TokenList::Nil else if endp <= p then TokenList::Nil else TokenList::Cons { head: next_token(s), tail: tokenize_line(ScanState { source: s.source, pos: endp }) }
+  proofs:
+    purity:
+      reads : [s.source, s]
+      calls : [skip_spaces, token_end, next_token, tokenize_line]
+    termination:
+      bound : 256
+
+
+-- An append argument: a front list and a back list to append onto it.
+concept AppendArg
+  @intention: "A front token list and a back token list to append onto its end"
+  @source: vexprparse.intent:27
+  fields:
+    front : TokenList
+    back : TokenList
+
+
+-- append_toks: append `back` onto the end of `front`, returning front ++ back.
+-- Walks `front` to its Nil and splices `back` there. Used by the driver to put a
+-- line's lexeme list (front) in front of the continuation (back = Newline + the
+-- rest of the stream). Termination: structural recursion on `front`.
+rule append_toks
+  @intention: "Append the back token list onto the end of the front token list"
+  @source: vexprparse.intent:27
+  input:
+    aa : AppendArg
+  output:
+    out : TokenList
+  logic:
+    out = match aa.front:
+      Cons(head, tail) => TokenList::Cons { head: head, tail: append_toks(AppendArg { front: tail, back: aa.back }) }
+      Nil => aa.back
+  proofs:
+    purity:
+      reads : [aa.front, aa.back]
+      calls : [append_toks]
+    termination:
+      bound : 65535
+
+
+-- The line-driver state: the source text, the column stack, and the current
+-- byte position (always a LINE START by invariant). Two group-concept fields
+-- (ColStack, and the output is built as the return value so it is NOT a field —
+-- the driver returns a TokenList and threads the stack forward). Note: unlike
+-- the design note's first sketch, the output list is the RETURN value (built
+-- front-to-back, like brick 2's tokenize), so the state carries only ONE group
+-- field (the stack) plus the text and position. This still exercises the
+-- text + group-field recursive ABI (text input in a recursive callable, PR #52,
+-- composed with a group-concept field).
+concept LineState
+  @intention: "Line driver state: source text + column stack + line-start position"
+  @source: vexprparse.intent:27
+  fields:
+    src : text [..256]
+    stack : ColStack
+    pos : number [0, 256]
+
+
+-- tokenize_indent: THE line driver. Processes the source line by line from a
+-- line-start `pos`, threading the column stack, and returns the full block-
+-- structured token stream (Indent/Dedent/Newline woven in, trailing Eof).
+--
+-- At each line start:
+--  * EOF (pos >= len): flush a Dedent per still-open level (dedents_to to width
+--    0 pops every Push), then cons the trailing Eof. This is src/lexer.rs's EOF
+--    flush (:176-179).
+--  * TAB in indent (width == 99999): cons a Token::IndentErr, then skip the rest
+--    of this line and continue at the next line with the stack UNCHANGED (the
+--    error token is the hard-stop signal for the downstream parser).
+--  * BLANK line (content start at newline or EOF): skip entirely — recurse to the
+--    next line with no structural token (documented simplification).
+--  * width > top: ONE Indent, push width, then the line's lexemes + Newline +
+--    recurse with the deeper stack.
+--  * width < top: dedents_to pops to width; cons that many Dedents; if the pop
+--    landed inconsistently (err == 1) weave a Token::IndentErr; then the line's
+--    lexemes + Newline + recurse with the popped stack.
+--  * width == top: no structural token; the line's lexemes + Newline + recurse.
+--
+-- LAZINESS: every recursive call to tokenize_indent sits inside an if-branch (or
+-- as a constructor/call arg reached only within a branch), NEVER in a `let`, so
+-- the forward recursion fires only along the taken path and pos strictly advances
+-- to next_line_start each step (the eager-let trap, vexprparse.verbose:1198-1210).
+-- Termination: bound-only + the mandatory recursion breadcrumb (a line scanner
+-- has no structural/decreasing field that fits — the backstop is the finite
+-- source length: pos advances to next_line_start, strictly greater, each step).
+rule tokenize_indent
+  @intention: "Line-by-line driver: weave Indent/Dedent/Newline into the token stream"
+  @source: vexprparse.intent:27
+  input:
+    ls : LineState
+  output:
+    out : TokenList
+  logic:
+    let len = length(ls.src)
+    let width = line_width(ScanState { source: ls.src, pos: ls.pos })
+    let cstart = ls.pos + width
+    let nls = next_line_start(ScanState { source: ls.src, pos: ls.pos })
+    let tw = top_width(ls.stack)
+    let istab = if width == 99999 then 1 else 0
+    let isblank = if istab == 1 then 0 else if cstart >= len then 1 else if byte_at(ls.src, cstart) == 10 then 1 else 0
+    let dr = dedents_to(PopArg { stk: ls.stack, width: width })
+    let dr_c = dr_count(dr)
+    let dr_e = dr_err(dr)
+    let dr_p = dr_popped(dr)
+    let flush_c = dr_count(dedents_to(PopArg { stk: ls.stack, width: 0 }))
+    out = if ls.pos >= len then cons_dedents(ConsDedArg { count: flush_c, tail: TokenList::Cons { head: Token::Eof, tail: TokenList::Nil } }) else if istab == 1 then TokenList::Cons { head: Token::IndentErr { pos: ls.pos }, tail: tokenize_indent(LineState { src: ls.src, stack: ls.stack, pos: nls }) } else if isblank == 1 then tokenize_indent(LineState { src: ls.src, stack: ls.stack, pos: nls }) else if width > tw then TokenList::Cons { head: Token::Indent, tail: append_toks(AppendArg { front: tokenize_line(ScanState { source: ls.src, pos: cstart }), back: TokenList::Cons { head: Token::Newline { pos: nls }, tail: tokenize_indent(LineState { src: ls.src, stack: ColStack::Push { width: width, rest: ls.stack }, pos: nls }) } }) } else if width < tw then cons_dedents(ConsDedArg { count: dr_c, tail: (if dr_e == 1 then TokenList::Cons { head: Token::IndentErr { pos: cstart }, tail: append_toks(AppendArg { front: tokenize_line(ScanState { source: ls.src, pos: cstart }), back: TokenList::Cons { head: Token::Newline { pos: nls }, tail: tokenize_indent(LineState { src: ls.src, stack: dr_p, pos: nls }) } }) } else append_toks(AppendArg { front: tokenize_line(ScanState { source: ls.src, pos: cstart }), back: TokenList::Cons { head: Token::Newline { pos: nls }, tail: tokenize_indent(LineState { src: ls.src, stack: dr_p, pos: nls }) } })) }) else append_toks(AppendArg { front: tokenize_line(ScanState { source: ls.src, pos: cstart }), back: TokenList::Cons { head: Token::Newline { pos: nls }, tail: tokenize_indent(LineState { src: ls.src, stack: ls.stack, pos: nls }) } })
+  proofs:
+    purity:
+      reads : [ls.src, ls.stack, ls.pos]
+      calls : [line_width, next_line_start, top_width, dedents_to, dr_count, dr_err, dr_popped, cons_dedents, tokenize_line, append_toks, tokenize_indent]
+    termination:
+      bound : 65535
+
+
+-- shape_toks: the brick-8b structural observable. Walks a block-structured token
+-- list and returns a kind-count fingerprint with a dedicated band per structural
+-- token kind, so each test input's signature is a single number predictable by
+-- hand (the shape_ast technique, brick 7):
+--
+--   1000000 * (#IndentErr) + 10000 * (#Newline) + 100 * (#Dedent) + (#Indent)
+--
+-- The bands are spaced wide enough that no test input overflows a lower band
+-- (the deepest test has a handful of each). Lexeme tokens (Ident/Keyword/Num/
+-- Op/Str) and Eof contribute 0 — they are brick 2/8a's surface, not 8b's.
+-- Structural recursion on the tail.
+rule shape_toks
+  @intention: "Structural signature of a token list: a kind-count fingerprint of its block tokens"
+  @source: vexprparse.intent:27
+  input:
+    lst : TokenList
+  output:
+    out : number
+  logic:
+    out = match lst:
+      Cons(head, tail) => tok_band(head) + shape_toks(tail)
+      Nil => 0
+  proofs:
+    purity:
+      reads : [lst]
+      calls : [tok_band, shape_toks]
+    termination:
+      bound : 65535
+      structural : lst
+
+
+-- tok_band: the per-token contribution to shape_toks. Indent=1, Dedent=100,
+-- Newline=10000, IndentErr=1000000; every other token (lexemes + Eof) = 0.
+rule tok_band
+  @intention: "shape_toks band contribution of one token (block tokens only)"
+  @source: vexprparse.intent:27
+  input:
+    t : Token
+  output:
+    out : number
+  logic:
+    out = match t:
+      Ident(start, len) => 0
+      Keyword(start, len, kw) => 0
+      Num(value, len) => 0
+      Op(code, len) => 0
+      Str(start, len) => 0
+      Newline(pos) => 10000
+      Indent => 1
+      Dedent => 100
+      IndentErr(pos) => 1000000
+      Eof => 0
+  proofs:
+    purity:
+      reads : [t]
+      calls : []
+    termination:
+      bound : 16
+
+
+-- begin_tokenize: a thin entry into the line driver that builds the initial
+-- empty column stack INSIDE a callable body (the final-position call), so the
+-- ColStack::Empty VariantConstruct sees the arena context. (A group-variant
+-- construction in a `let` RHS at an entry rule's frame has no arena context in
+-- the native emitter — the let-eval path runs without it — so the construction
+-- is pushed down into this callable, whose body emit does thread the arena. The
+-- entry drivers below therefore call begin_tokenize instead of constructing
+-- ColStack::Empty themselves.) Returns the full block-structured token stream.
+rule begin_tokenize
+  @intention: "Start the line driver from an empty column stack at line 0"
+  @source: vexprparse.intent:27
+  input:
+    s : ScanState
+  output:
+    out : TokenList
+  logic:
+    out = tokenize_indent(LineState { src: s.source, stack: ColStack::Empty, pos: 0 })
+  proofs:
+    purity:
+      reads : [s.source]
+      calls : [tokenize_indent]
+    termination:
+      bound : 256
+
+
+-- An entry concept for the brick-8b drivers: a source text (argv) to tokenize
+-- with indentation. (pos always starts at 0 — the file's first line start.)
+concept IndentSrc
+  @intention: "Source text for the block-structured (INDENT/DEDENT) tokenizer"
+  @source: vexprparse.intent:27
+  fields:
+    source : text [..256]
+
+
+-- shape_indent_src: the brick-8b money-shot observable. Tokenize the source with
+-- indentation (tokenize_indent from line start 0, empty column stack) and return
+-- the structural signature of the resulting block-structured stream. A single
+-- number, hand-derivable per input, certifies the exact Indent/Dedent/Newline/
+-- IndentErr shape. NATIVE-ONLY for newline-bearing sources (the interpreter's
+-- JSON reader does not decode \n into a real byte 10 — see count_cells_src).
+rule shape_indent_src
+  @intention: "Tokenize a source with INDENT/DEDENT and return its block-structure signature"
+  @source: vexprparse.intent:27
+  input:
+    a : IndentSrc
+  output:
+    out : number
+  logic:
+    let toks = begin_tokenize(ScanState { source: a.source, pos: 0 })
+    out = shape_toks(toks)
+  proofs:
+    purity:
+      reads : [a.source]
+      calls : [begin_tokenize, shape_toks]
+    termination:
+      bound : 256
+
+
+-- kind_at_indent: like kind_at (brick 8a) but over the block-structured stream.
+-- Tokenize with indentation and return the KIND code of the token at index
+-- `arg.idx` (… Newline=600, Indent=700, Dedent=800, IndentErr=900). Confirms a
+-- structural token appears at the expected position. Native-only for newline
+-- sources. Reuses KindAtState (source + idx).
+rule kind_at_indent
+  @intention: "Tokenize a source with INDENT/DEDENT and return the kind of the token at an index"
+  @source: vexprparse.intent:27
+  input:
+    arg : KindAtState
+  output:
+    out : number
+  logic:
+    let toks = begin_tokenize(ScanState { source: arg.source, pos: 0 })
+    out = peek_kind(Nth { lst: toks, n: arg.idx })
+  proofs:
+    purity:
+      reads : [arg.source, arg.idx]
+      calls : [begin_tokenize, peek_kind]
+    termination:
+      bound : 256
+
+
+-- count_cells_indent: count every cons cell of the block-structured stream
+-- (lexemes + Indent + Dedent + Newline + IndentErr + trailing Eof). A coarser
+-- companion to shape_indent_src. Native-only for newline sources.
+rule count_cells_indent
+  @intention: "Tokenize a source with INDENT/DEDENT and count its token cons cells"
+  @source: vexprparse.intent:27
+  input:
+    a : IndentSrc
+  output:
+    out : number
+  logic:
+    let toks = begin_tokenize(ScanState { source: a.source, pos: 0 })
+    out = count_cells(toks)
+  proofs:
+    purity:
+      reads : [a.source]
+      calls : [begin_tokenize, count_cells]
     termination:
       bound : 256
 
