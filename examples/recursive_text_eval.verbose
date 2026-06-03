@@ -1,0 +1,60 @@
+@verbose 0.1.0
+
+concept_group G [max_depth: 30, max_nodes: 100]
+  @intention: "expr tree with var refs into a source text"
+  @source: recursive_text_eval.intent:1
+  concept E
+    @intention: "tiny expr: Lit or Add of two E, or Var(byte offset into src)"
+    @source: recursive_text_eval.intent:2
+    variants:
+      Lit of (v : number)
+      Add of (l : E, r : E)
+      Var of (off : number)
+
+concept EvalArg
+  @intention: "an E node plus the source text for resolving Var"
+  @source: recursive_text_eval.intent:3
+  fields:
+    node : E
+    src : text [..64]
+
+concept Seed
+  @intention: "entry"
+  @source: recursive_text_eval.intent:4
+  fields:
+    k : number [0, 10]
+
+rule eval_e
+  @intention: "evaluate E; Var(off) reads byte_at(src, off); Add makes TWO sibling recursive calls"
+  @source: recursive_text_eval.intent:5
+  input:
+    ea : EvalArg
+  output:
+    out : number
+  logic:
+    out = match ea.node:
+      Lit(v) => v
+      Var(off) => byte_at(ea.src, off)
+      Add(l, r) => eval_e(EvalArg { node: l, src: ea.src }) + eval_e(EvalArg { node: r, src: ea.src })
+  proofs:
+    purity:
+      reads : [ea.node, ea.src]
+      calls : [eval_e]
+    termination:
+      bound : 100
+
+rule go
+  @intention: "build Add(Var(0), Var(1)) over src 'AB' -> byte_at('AB',0)+byte_at('AB',1) = 65+66 = 131"
+  @source: recursive_text_eval.intent:1
+  input:
+    s : Seed
+  output:
+    out : number
+  logic:
+    out = eval_e(EvalArg { node: E::Add { l: E::Var { off: 0 }, r: E::Var { off: 1 } }, src: "AB" })
+  proofs:
+    purity:
+      reads : []
+      calls : [eval_e]
+    termination:
+      bound : 10

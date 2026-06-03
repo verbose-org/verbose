@@ -10091,6 +10091,18 @@ fn emit_store_rax_to_rsp(code: &mut Vec<u8>, rsp_off: i32) {
     }
 }
 
+fn emit_store_rdx_to_rsp(code: &mut Vec<u8>, rsp_off: i32) {
+    if rsp_off == 0 {
+        code.extend_from_slice(&[0x48, 0x89, 0x14, 0x24]);
+    } else if rsp_off <= 127 {
+        code.extend_from_slice(&[0x48, 0x89, 0x54, 0x24]);
+        code.push(rsp_off as u8);
+    } else {
+        code.extend_from_slice(&[0x48, 0x89, 0x94, 0x24]);
+        code.extend_from_slice(&rsp_off.to_le_bytes());
+    }
+}
+
 fn load_rax_from_rbp(code: &mut Vec<u8>, offset: i32) {
     if offset >= -128 {
         code.extend_from_slice(&[0x48, 0x8B, 0x45]);
@@ -11376,11 +11388,44 @@ fn emit_eval_expr(
                                                 emit_copy_rbp_to_rsp(code, ptr_slot, *s_off);
                                                 emit_copy_rbp_to_rsp(code, len_slot, s_off + 8);
                                             }
+                                            // Text literal as a Record-constructor field of a
+                                            // call into a callable (e.g. the entry rule `go`
+                                            // calling `eval_e(EvalArg { ..., src: "AB" })`).
+                                            // Materialize the literal bytes inline (jmp over
+                                            // data; lea rax, [rip+data]; mov rdx, len) — the
+                                            // pointer targets the binary's executable region,
+                                            // so it stays valid for the callee's lifetime —
+                                            // then store (ptr, len) into the two struct slots.
+                                            // Mirrors emit_text_produce_ptrlen's Expr::Text arm.
+                                            Expr::Text(s) => {
+                                                let bytes = s.as_bytes();
+                                                let n = bytes.len() as i32;
+                                                if n <= 127 {
+                                                    code.push(0xEB);
+                                                    code.push(n as u8);
+                                                } else {
+                                                    code.push(0xE9);
+                                                    code.extend_from_slice(&n.to_le_bytes());
+                                                }
+                                                let addr = code.len();
+                                                code.extend_from_slice(bytes);
+                                                // lea rax, [rip + rel32]
+                                                let end = code.len() + 7;
+                                                let rel32 = addr as i32 - end as i32;
+                                                code.extend_from_slice(&[0x48, 0x8D, 0x05]);
+                                                code.extend_from_slice(&rel32.to_le_bytes());
+                                                // mov rdx, n
+                                                code.extend_from_slice(&[0x48, 0xC7, 0xC2]);
+                                                code.extend_from_slice(&n.to_le_bytes());
+                                                // store ptr (rax) and len (rdx) into struct slots
+                                                emit_store_rax_to_rsp(code, *s_off);
+                                                emit_store_rdx_to_rsp(code, s_off + 8);
+                                            }
                                             _ => {
                                                 return Err(NativeError {
                                                     message: format!(
                                                         "text field '{}' in Record constructor for recursive call to '{}': \
-                                                         only input field pass-through and BoundText are supported",
+                                                         only input field pass-through, BoundText, and text literals are supported",
                                                         fname, name
                                                     ),
                                                 });
@@ -12101,7 +12146,22 @@ fn emit_eval_expr(
                 // from the offsets map's smallest (most-negative) value
                 // for the input identifier(s). Simpler: scan offsets, find
                 // the most-negative existing slot, place binders below it.
-                let lowest_offset: i32 = offsets.values().copied().min().unwrap_or(-8);
+                // The binder pool must sit below EVERY live frame slot, not
+                // just the ones in `offsets`. Text-typed input fields (and any
+                // BoundText: let bindings, read/fetch results) live in
+                // `text_bindings` as (ptr_slot, len_slot) pairs — they are NOT
+                // in `offsets`. Deriving the base from `offsets` alone places
+                // binders on top of a text input field's slots (e.g. a record
+                // input `EvalArg { node: E, src: text }`: `offsets` only holds
+                // `node` at -8, so a match-arm binder would clobber `src`'s
+                // ptr at -16). Scan both maps for the most-negative slot.
+                let lowest_in_offsets: i32 = offsets.values().copied().min().unwrap_or(-8);
+                let lowest_in_text: i32 = text_bindings
+                    .values()
+                    .flat_map(|&(p, l)| [p, l])
+                    .min()
+                    .unwrap_or(0);
+                let lowest_offset: i32 = lowest_in_offsets.min(lowest_in_text);
                 // First binder slot is 8 bytes below the lowest existing
                 // offset. binder i sits at first - 8*i.
                 let binder_base = lowest_offset - 8;
@@ -27399,6 +27459,84 @@ rule probe
                 arg, expected, stdout
             );
         }
+        let _ = std::fs::remove_file(&out);
+    }
+
+    #[test]
+    fn recursive_record_input_text_field_beside_group_field_runtime() {
+        // Regression for TWO bugs surfaced by `examples/recursive_text_eval.verbose`:
+        //
+        // A record-concept input that carries BOTH a group-concept field
+        // (`node : E`) and a text field (`src : text`), feeding a recursive
+        // rule whose body matches on the group field and reads the text field.
+        //
+        // Bug 1 (binder/text-field slot collision): MatchVariant binder slots
+        //   were derived from `offsets` only (which holds the group field at
+        //   -8 but NOT the text field, which lives in `text_bindings`). So an
+        //   arm binder landed at -16, clobbering `src`'s ptr slot, segfaulting
+        //   at runtime. Fixed by deriving the binder base from the min of both
+        //   `offsets` and `text_bindings` slots.
+        //
+        // Bug 2 (text literal in a call's Record arg): the entry rule
+        //   `eval_e(EvalArg { node: ..., src: "AB" })` passes a TEXT LITERAL
+        //   as a Record-constructor text field into a callable. The marshal
+        //   path only recognized input-field pass-through and BoundText, and
+        //   refused the literal at codegen. Fixed by materializing the literal
+        //   inline (ptr in the binary's executable region, len immediate) and
+        //   storing (ptr, len) into the two struct slots.
+        //
+        // The recursive arm `eval_e(EvalArg { node: l, src: ea.src })` passes
+        // the text field THROUGH unchanged while advancing the group field.
+        // Expected: byte_at("AB",0) + byte_at("AB",1) = 'A' + 'B' = 65 + 66 = 131.
+        let src = std::fs::read_to_string("examples/recursive_text_eval.verbose")
+            .expect("examples/recursive_text_eval.verbose must exist (minimal reproducer)");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+
+        // 1) Interpreter oracle.
+        let all_rules: Vec<&crate::ast::Rule> = program.items.iter()
+            .filter_map(|i| match i { crate::ast::Item::Rule(r) => Some(r), _ => None })
+            .collect();
+        let all_concepts: Vec<&crate::ast::Concept> =
+            crate::ast::iter_all_concepts(&program.items).collect();
+        let go_rule = *all_rules.iter().find(|r| r.name == "go").expect("rule 'go' must exist");
+        let seed = {
+            let mut m = std::collections::HashMap::new();
+            m.insert("k".to_string(), crate::interpreter::Value::Number(0));
+            crate::interpreter::Value::Record(m)
+        };
+        let interp = crate::interpreter::eval_rule_with_value(go_rule, &all_rules, &all_concepts, seed)
+            .expect("interpreter must evaluate 'go'");
+        let interp_num = match interp {
+            crate::interpreter::Value::Number(n) => n,
+            other => panic!("expected Number from interpreter, got {:?}", other),
+        };
+        assert_eq!(interp_num, 131, "interpreter oracle must yield 131");
+
+        // 2) Native: must compile (pre-fix it errored at codegen) and run == interp.
+        let out = std::env::temp_dir().join("verbosec_test_b3_group_plus_text");
+        compile_native(&program, "go", out.to_str().unwrap(), false, false)
+            .expect("recursive rule with group field + text field must compile natively");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o755));
+        }
+        let output = std::process::Command::new(&out)
+            .arg("0")
+            .output()
+            .expect("native binary must run");
+        assert!(
+            output.status.success(),
+            "native binary must exit 0 (was segfaulting on the binder/text-slot collision); status={:?}",
+            output.status
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert_eq!(
+            stdout.trim(), interp_num.to_string(),
+            "native output must equal the interpreter oracle (131); got {:?}",
+            stdout
+        );
         let _ = std::fs::remove_file(&out);
     }
 
