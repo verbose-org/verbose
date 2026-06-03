@@ -256,6 +256,40 @@ concept_group VExpr [max_depth: 4096, max_nodes: 65535]
     variants:
       MkDed of (popped : ColStack, count : number, err : number)
 
+  -- Brick 9: a cons-list of let-bindings in the arena. Each cell carries the
+  -- bound name as a SOURCE SPAN (name_start, name_len) — the same identity model
+  -- as AstVar / a Str token (brick 9 does not resolve the name to bytes; that
+  -- needs an environment, which is the OPTIONAL bonus eval below). `value` is the
+  -- binding's right-hand-side expression (a full parse_or subtree). `rest` chains
+  -- to the next binding; BNil terminates the list. Mirrors src/parser.rs's
+  -- ordered `lets: Vec<(name, expr)>` on a logic block, in arena cons-list form.
+  concept Binding
+    @intention: "Cons-list of let-bindings: bound name span + RHS expression + rest"
+    @source: vexprparse.intent:28
+    variants:
+      BCons of (name_start : number, name_len : number, value : Ast, rest : Binding)
+      BNil
+
+  -- Brick 9: a parsed statement block — the ordered binding list plus the final
+  -- out-expression. Mirrors src/parser.rs's logic block (a sequence of let
+  -- bindings followed by `out = <expr>`): `binds` is the BCons chain in source
+  -- order, `result` is the final out-statement's RHS expression subtree.
+  concept Block
+    @intention: "A parsed statement block: ordered let-bindings + the final out-expression"
+    @source: vexprparse.intent:28
+    variants:
+      MkBlock of (binds : Binding, result : Ast)
+
+  -- Brick 9: a block parse result — the Block built plus the token index just
+  -- past it. Same Parsed-threading shape as `Parsed` (Mk) / `ParsedArgs`
+  -- (MkArgs), one level up: parse_block / parse_stmts thread `next` so a caller
+  -- could continue after the block (e.g. a sibling block at the same level).
+  concept ParsedBlock
+    @intention: "A block parse result: the Block built plus the end token index"
+    @source: vexprparse.intent:28
+    variants:
+      MkPB of (block : Block, next : number)
+
 
 -- ============================================================================
 -- Brick 2 reused verbatim: the tokenizer. (Copied so bricks 1-2 stay pristine;
@@ -1329,6 +1363,22 @@ concept WrapState
     toks : TokenList
     isnot : number [0, 1]
     inner : Parsed
+
+
+-- Brick 9: the let-statement continuation state. Carries the token list, the
+-- bound name SPAN (name_start, name_len), and the already-parsed RHS value (as a
+-- Parsed). stmt_let_join consumes this — extracts the value node + its end index,
+-- recurses parse_stmts on the rest of the block, and conses the binding. Lives in
+-- the brick-9 parse cycle (called only from parse_stmts's let-branch), so its
+-- Parsed group-field input compiles natively (the group-field recursive ABI).
+concept LetJoinState
+  @intention: "Token list + bound name span + the parsed let-RHS value"
+  @source: vexprparse.intent:28
+  fields:
+    toks : TokenList
+    name_start : number [0, 256]
+    name_len : number [0, 256]
+    value : Parsed
 
 
 -- A paren-close state: the token list plus the Parsed inner expression. Used to
@@ -2970,6 +3020,332 @@ rule count_cells_indent
     purity:
       reads : [a.source]
       calls : [begin_tokenize, count_cells]
+    termination:
+      bound : 256
+
+
+-- ============================================================================
+-- BRICK 9: parse a statement BLOCK (let-bindings + a final out value). The first
+-- PROGRAM-grammar parse that consumes the block-structured tokens (Indent /
+-- Dedent / Newline) brick 8b weaves in. The grammar mirrors src/parser.rs's
+-- logic-block shape:
+--
+--   <block>  = Indent stmt_seq Dedent
+--   stmt_seq = (let_stmt Newline)* out_stmt Newline?
+--   let_stmt = 'let' IDENT '=' expr
+--   out_stmt = IDENT '=' expr          (conventionally `out = expr`)
+--
+-- BLOCK FRAMING (documented invariant). The brick-9 test sources are the block
+-- BODY lines, written at COLUMN 0 (no leading indentation). begin_tokenize then
+-- produces a stream of the shape `[lexemes Newline]* Eof` with NO Indent/Dedent
+-- (every line sits at width 0 == the column-0 sentinel top, so the line driver
+-- weaves neither). parse_stmts is nonetheless written to be framing-AGNOSTIC: at
+-- each step it first SKIPS any leading Newline / Indent tokens (skip_seps), so a
+-- genuinely-indented block (a leading Indent, statements separated by Newline,
+-- closed by a Dedent) parses identically — the leading Indent is skipped, each
+-- statement's trailing Newline is skipped before the next, and a Dedent or Eof
+-- ends the binding scan exactly like the column-0 Eof does. The parser STOPS the
+-- binding sweep at a Dedent (800) or Eof (0): in the column-0 framing the final
+-- out-statement is followed by Newline then Eof, so after the out value parse the
+-- block is complete.
+--
+-- The let-vs-out distinction is purely the leading token of the (sep-skipped)
+-- line: kind 204 (the `let` keyword, kw=4) => a let_stmt; otherwise a bare IDENT
+-- (kind 100) followed by `=` (op 18) => the out_stmt. Each statement's `=` is the
+-- op-code-18 token; each RHS is a full parse_or expression. parse_or already
+-- stops at a Newline (kind 600 is not an operator at any precedence level), so an
+-- expression never bleeds across a line boundary.
+--
+-- RECURSION / LAZINESS. parse_stmts is self-recursive THROUGH a continuation
+-- (stmt_let_join), exactly like the expression fold rules (add_rest <-> add_join).
+-- The eager-let trap (vexprparse.verbose: the parse-fold comment) applies: the
+-- recursive descent into the next statement must be GUARDED, so it sits inside the
+-- let-branch's continuation, never in a bare `let`. parse_stmts only ever parses
+-- the CURRENT statement eagerly; the tail recursion is reached only along the
+-- let-branch, via stmt_let_join, after the value's `next` index is known. Both
+-- live in the brick-9 parse cycle, so their TokenList / Parsed group-field inputs
+-- compile natively (the group-field recursive ABI).
+-- ============================================================================
+
+-- Accessors for a Block (a match-block is only legal in final position, so
+-- destructuring is factored into tiny rules, like parsed_node / parsed_next).
+rule block_binds
+  @intention: "The binding list of a parsed block"
+  @source: vexprparse.intent:28
+  input:
+    b : Block
+  output:
+    out : Binding
+  logic:
+    out = match b:
+      MkBlock(binds, result) => binds
+  proofs:
+    purity:
+      reads : [b]
+      calls : []
+    termination:
+      bound : 16
+
+
+rule block_result
+  @intention: "The final out-expression of a parsed block"
+  @source: vexprparse.intent:28
+  input:
+    b : Block
+  output:
+    out : Ast
+  logic:
+    out = match b:
+      MkBlock(binds, result) => result
+  proofs:
+    purity:
+      reads : [b]
+      calls : []
+    termination:
+      bound : 16
+
+
+-- Accessors for a ParsedBlock parse result.
+rule pb_block
+  @intention: "The Block from a block parse result"
+  @source: vexprparse.intent:28
+  input:
+    p : ParsedBlock
+  output:
+    out : Block
+  logic:
+    out = match p:
+      MkPB(block, next) => block
+  proofs:
+    purity:
+      reads : [p]
+      calls : []
+    termination:
+      bound : 16
+
+
+rule pb_next
+  @intention: "The token index just past a block parse result"
+  @source: vexprparse.intent:28
+  input:
+    p : ParsedBlock
+  output:
+    out : number
+  logic:
+    out = match p:
+      MkPB(block, next) => next
+  proofs:
+    purity:
+      reads : [p]
+      calls : []
+    termination:
+      bound : 16
+
+
+-- skip_seps: advance past any leading separator tokens (Newline kind 600 OR
+-- Indent kind 700) starting at `st.pos`, returning the index of the first
+-- non-separator token. Stops at a Dedent (800), Eof (0), or any lexeme. Used at
+-- the head of each statement so parse_stmts dispatches on the real leading token
+-- regardless of the framing (column-0: skip the inter-statement Newline; indented
+-- block: skip the leading Indent too). Recursion advances `pos` strictly toward
+-- the finite end of the token list; no structural/decreasing FIELD fits a forward
+-- index scan, so it carries the bound + the mandatory recursion breadcrumb (the
+-- backstop is the finite token-list length, bounded by max_nodes).
+rule skip_seps
+  @intention: "Index of the first non-separator token at/after pos (skips Newline/Indent)"
+  @source: vexprparse.intent:28
+  input:
+    st : ParseState
+  output:
+    out : number
+  logic:
+    let knd = peek_kind(Nth { lst: st.toks, n: st.pos })
+    let issep = if knd == 600 then 1 else if knd == 700 then 1 else 0
+    out = if issep == 1 then skip_seps(ParseState { toks: st.toks, pos: st.pos + 1 }) else st.pos
+  proofs:
+    purity:
+      reads : [st.toks, st.pos]
+      calls : [peek_kind, skip_seps]
+    termination:
+      bound : 512
+
+
+-- stmt_let_join: the continuation that threads a parsed let-value's `next` index
+-- into the recursive scan of the REST of the block, then conses the binding onto
+-- the front of the rest's binding list. Called ONLY from parse_stmts's let-branch
+-- (so the recursion stays guarded, never eager). It:
+--   * extracts the value node + next index from the already-parsed RHS (jl.value),
+--   * recurses parse_stmts at that next index (which re-skips the trailing
+--     Newline before the next statement),
+--   * conses BCons(name span, value, rest.binds) and keeps rest.result + rest.next.
+-- In the brick-9 parse cycle, so its Parsed / TokenList group-field inputs compile
+-- natively.
+rule stmt_let_join
+  @intention: "Cons a parsed let-binding onto the recursively-parsed rest of the block"
+  @source: vexprparse.intent:28
+  input:
+    jl : LetJoinState
+  output:
+    out : ParsedBlock
+  logic:
+    let vnode = parsed_node(jl.value)
+    let vnext = parsed_next(jl.value)
+    let rest = parse_stmts(ParseState { toks: jl.toks, pos: vnext })
+    let rblock = pb_block(rest)
+    let rbinds = block_binds(rblock)
+    let rresult = block_result(rblock)
+    let rnext = pb_next(rest)
+    out = ParsedBlock::MkPB { block: Block::MkBlock { binds: Binding::BCons { name_start: jl.name_start, name_len: jl.name_len, value: vnode, rest: rbinds }, result: rresult }, next: rnext }
+  proofs:
+    purity:
+      reads : [jl.toks, jl.name_start, jl.name_len, jl.value]
+      calls : [parsed_node, parsed_next, parse_stmts, pb_block, block_binds, block_result, pb_next]
+    termination:
+      bound : 512
+
+
+-- parse_stmts: parse a statement sequence starting at st.pos. Skips leading
+-- separators, then:
+--   * if the leading token is `let` (kind 204): it is a let_stmt. The bound name
+--     is the IDENT at headp+1 (its span via peek_start / peek_len); the `=` is at
+--     headp+2 (op 18, not re-checked here — the grammar is fixed); the RHS is a
+--     full parse_or from headp+3. The RHS parse is handed to stmt_let_join, which
+--     recurses on the rest and conses this binding. The recursion is reached ONLY
+--     on this branch, keeping it guarded (the eager-let discipline).
+--   * otherwise (a bare IDENT `=` expr, the out_stmt): the RHS is a full parse_or
+--     from headp+2 (IDENT at headp, `=` at headp+1). The block terminates here:
+--     return MkBlock(BNil, value) with next = the value's end index. A Dedent or
+--     Eof leading token would also land here (peek_kind != 204) and produce an
+--     empty-result block — but in the brick-9 column-0 framing the out_stmt always
+--     precedes the Eof, so this is the normal terminator.
+-- Self-recursive THROUGH stmt_let_join; both in the parse cycle. Bound + recursion
+-- breadcrumb (the backstop: each step's RHS parse consumes >=1 token, and the
+-- finite token list is bounded by max_nodes).
+rule parse_stmts
+  @intention: "Parse a (let_stmt Newline)* out_stmt sequence into a Block + end index"
+  @source: vexprparse.intent:28
+  input:
+    st : ParseState
+  output:
+    out : ParsedBlock
+  logic:
+    let headp = skip_seps(ParseState { toks: st.toks, pos: st.pos })
+    let knd = peek_kind(Nth { lst: st.toks, n: headp })
+    let islet = if knd == 204 then 1 else 0
+    let name_start = if islet == 1 then peek_start(Nth { lst: st.toks, n: headp + 1 }) else peek_start(Nth { lst: st.toks, n: headp })
+    let name_len = if islet == 1 then peek_len(Nth { lst: st.toks, n: headp + 1 }) else peek_len(Nth { lst: st.toks, n: headp })
+    out = if islet == 1 then stmt_let_join(LetJoinState { toks: st.toks, name_start: name_start, name_len: name_len, value: parse_or(ParseState { toks: st.toks, pos: headp + 3 }) }) else ParsedBlock::MkPB { block: Block::MkBlock { binds: Binding::BNil, result: parsed_node(parse_or(ParseState { toks: st.toks, pos: headp + 2 })) }, next: parsed_next(parse_or(ParseState { toks: st.toks, pos: headp + 2 })) }
+  proofs:
+    purity:
+      reads : [st.toks, st.pos]
+      calls : [skip_seps, peek_kind, peek_start, peek_len, stmt_let_join, parse_or, parsed_node, parsed_next]
+    termination:
+      bound : 512
+
+
+-- parse_block: the brick-9 block entry. The documented framing makes the source
+-- the block BODY (column-0 lines); parse_stmts is framing-agnostic, so this is a
+-- thin wrapper that starts the sweep at index 0. (A future brick that nests a
+-- block under a header would start parse_stmts after the header's Newline+Indent;
+-- the skip_seps head makes that a position change only.)
+rule parse_block
+  @intention: "Parse a statement block from token index 0 into a Block + end index"
+  @source: vexprparse.intent:28
+  input:
+    st : ParseState
+  output:
+    out : ParsedBlock
+  logic:
+    out = parse_stmts(st)
+  proofs:
+    purity:
+      reads : [st]
+      calls : [parse_stmts]
+    termination:
+      bound : 16
+
+
+-- ============================================================================
+-- BRICK 9 STRUCTURAL ORACLE. A block with name-bearing bindings has no numeric
+-- value without an environment (the bonus eval below adds one), so the parser is
+-- validated by the SHAPE of the Block it builds, like brick 5/7's shape_ast. The
+-- signature is hand-derivable per input:
+--
+--   block_shape = 1000000 * (#bindings) + shape_binds(binds) + shape_ast(result)
+--
+-- where shape_binds sums shape_ast over every binding's RHS expression. The
+-- 1000000 band counts bindings (each test has <100); shape_binds + shape_ast(result)
+-- both stay well under 1000000 for every test input, so a single number certifies
+-- the exact (#bindings, per-binding RHS shapes, result shape) triple.
+-- ============================================================================
+
+-- count_binds: number of bindings in a Binding cons-list. Structural recursion.
+rule count_binds
+  @intention: "Number of let-bindings in a binding cons-list"
+  @source: vexprparse.intent:28
+  input:
+    b : Binding
+  output:
+    out : number
+  logic:
+    out = match b:
+      BCons(name_start, name_len, value, rest) => 1 + count_binds(rest)
+      BNil => 0
+  proofs:
+    purity:
+      reads : [b]
+      calls : [count_binds]
+    termination:
+      bound : 4000
+      structural : b
+
+
+-- shape_binds: sum of shape_ast over every binding's RHS expression. Structural
+-- recursion on the binding tail; shape_ast (the brick-5/7 oracle) supplies each
+-- value's structural signature.
+rule shape_binds
+  @intention: "Sum of the structural signatures of every binding's RHS expression"
+  @source: vexprparse.intent:28
+  input:
+    b : Binding
+  output:
+    out : number
+  logic:
+    out = match b:
+      BCons(name_start, name_len, value, rest) => shape_ast(value) + shape_binds(rest)
+      BNil => 0
+  proofs:
+    purity:
+      reads : [b]
+      calls : [shape_ast, shape_binds]
+    termination:
+      bound : 4000
+      structural : b
+
+
+-- block_shape: tokenize a block-body source (column-0 lines) with indentation,
+-- parse a statement block from index 0, and return its structural signature.
+-- The brick-9 money-shot observable. NATIVE-ONLY for newline-bearing sources
+-- (the interpreter's JSON reader does not decode \n into a real byte 10 — see
+-- count_cells_src). Reuses IndentSrc (source text).
+rule block_shape
+  @intention: "Parse a statement block and return 1000000*#binds + binding-shapes + result-shape"
+  @source: vexprparse.intent:28
+  input:
+    a : IndentSrc
+  output:
+    out : number
+  logic:
+    let toks = begin_tokenize(ScanState { source: a.source, pos: 0 })
+    let pb = parse_block(ParseState { toks: toks, pos: 0 })
+    let blk = pb_block(pb)
+    let binds = block_binds(blk)
+    let result = block_result(blk)
+    out = 1000000 * count_binds(binds) + (shape_binds(binds) + shape_ast(result))
+  proofs:
+    purity:
+      reads : [a.source]
+      calls : [begin_tokenize, parse_block, pb_block, block_binds, block_result, count_binds, shape_binds, shape_ast]
     termination:
       bound : 256
 

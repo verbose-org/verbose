@@ -253,3 +253,65 @@ there (out of the arithmetic evaluator's scope).
     kind code of the token at a given index, confirming the line-boundary token
     lands at the right position. No indentation, columns, or block-structure
     tokens are computed — that is brick 8b's column stack.
+
+27. Indentation and block-structure tokens (brick 8b). A column stack records the
+    indentation width of every open block (a cons-list of widths, with a column-0
+    sentinel that is never popped). A line driver processes the source line by
+    line, threading the stack: it measures each line's leading-space width,
+    compares it to the stack's top, and weaves block tokens into the stream — one
+    indent token (and a push) when the line is deeper, one dedent token per closed
+    level (and the matching pops) when it is shallower, and nothing when it is the
+    same. Tabs in the indentation and a width that matches no enclosing block both
+    produce a distinguished error token (a Verbose rule is total, so an error is a
+    token, not an abort). Blank lines are skipped. At end of input a dedent token
+    is flushed for every still-open level, then the trailing end-of-input token.
+    A structural-signature driver tokenizes a source with indentation and returns
+    a kind-count fingerprint (a dedicated band per block-token kind) so each test
+    input's block structure is a single hand-derivable number; newline-bearing
+    sources are native-only (the interpreter's data reader does not decode an
+    escaped newline into a real newline byte).
+
+28. Parse a statement BLOCK (brick 9): the first PROGRAM-grammar parse that
+    consumes the block-structure tokens. A block body is a sequence of zero or
+    more let-statements followed by a final out-statement:
+
+        let_stmt = 'let' IDENT '=' expr
+        out_stmt = IDENT '=' expr            (conventionally `out = expr`)
+
+    where each expr is a full precedence-aware expression (the brick 1-8 parser).
+    A binding is a cons-list cell carrying the bound name as a source span plus its
+    right-hand-side expression subtree; a block is the binding list plus the final
+    out-expression. The block parser skips any leading separators (line-boundary
+    and indent tokens), then dispatches on the leading token: the `let` keyword
+    starts a let-statement (the name is the following identifier, the value a full
+    expression after `=`), and a continuation threads the value's end index into
+    the recursive parse of the rest of the block, consing the binding; a bare
+    identifier followed by `=` is the final out-statement, ending the block with
+    the accumulated bindings and the out-expression. The recursion into the rest
+    of the block sits inside the let-branch's continuation (never an eager
+    binding), so it fires only along the taken path.
+
+    BLOCK FRAMING (documented): the brick-9 test sources are the block BODY lines
+    written at column 0, so the token stream is lexemes-and-line-boundaries with no
+    indent/dedent; the block parser is nonetheless framing-agnostic (it skips a
+    leading indent and each statement's trailing line-boundary, and stops the
+    binding sweep at a dedent or end-of-input), so a genuinely-indented block would
+    parse identically. Validation is STRUCTURAL: a signature driver parses a block
+    and returns `1000000 * (#bindings) + sum-of-binding-RHS-shapes +
+    result-shape`, a single hand-derivable number per input certifying the exact
+    (binding count, per-binding RHS shape, result shape) triple. Newline-bearing
+    sources are native-only (escaped-newline decoding, as in brick 8a/8b).
+
+    EVAL-WITH-ENVIRONMENT IS A FOLLOW-UP (not in this brick). A logic block whose
+    bindings and result are arithmetic over the bound names is semantically
+    evaluable: an environment maps each name to its value, the bindings fold in
+    left-to-right, and the result evaluates with name lookup. Name resolution must
+    compare name BYTES (two occurrences of the same name sit at different source
+    spans), which requires threading the source text into a recursive evaluator
+    over the AST. That recursive evaluator carries a text field in its input record
+    and makes two sibling recursive calls within one arithmetic node; the current
+    native backend clobbers the caller's text-field slots across the first of the
+    two sibling calls, so the second sub-evaluation reads a corrupted source
+    pointer and the binary fails closed. Until that native-backend gap is fixed,
+    block semantics are proven structurally (the signature above), and
+    eval-with-environment is deferred.
