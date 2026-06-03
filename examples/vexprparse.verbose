@@ -120,6 +120,19 @@ concept_group VExpr [max_depth: 256, max_nodes: 4000]
       -- bytes — that needs an environment — so a Str node's correctness is proven
       -- STRUCTURALLY by the shape walk, never by an evaluated value.
       Str of (start : number, len : number)
+      -- A line-boundary token (brick 8a). pos = the byte offset of the newline
+      -- byte (10) in the source. The tokenizer no longer STOPS at a newline (the
+      -- pre-8a flat scanner classified byte 10 as Eof and tokenize halted at the
+      -- first line break); instead next_token recognizes byte 10 — after skipping
+      -- INLINE spaces (byte 32 only) — as a Newline token, token_end advances
+      -- exactly 1 past it, and tokenize conses it like any other token and keeps
+      -- scanning the next line. This lifts the "stops at first newline" limit so a
+      -- multi-line source tokenizes into a flat stream WITH Newline tokens marking
+      -- line boundaries. Brick 8a emits Newline FAITHFULLY: consecutive newlines
+      -- (blank lines) emit consecutive Newline tokens — collapsing blanks and the
+      -- INDENT/DEDENT column-stack logic are brick 8b. Brick 8a computes NO
+      -- indentation, columns, INDENT, or DEDENT.
+      Newline of (pos : number)
       Eof
 
   concept TokenList
@@ -527,6 +540,7 @@ rule next_token
   logic:
     let len = length(s.source)
     let p = skip_spaces(s)
+    let isnl = if p >= len then 0 else if byte_at(s.source, p) == 10 then 1 else 0
     let isalpha = if p >= len then 0 else if byte_at(s.source, p) == 95 then 1 else if byte_at(s.source, p) >= 65 and byte_at(s.source, p) <= 90 then 1 else if byte_at(s.source, p) >= 97 and byte_at(s.source, p) <= 122 then 1 else 0
     let isdigit = if p >= len then 0 else if byte_at(s.source, p) >= 48 and byte_at(s.source, p) <= 57 then 1 else 0
     let isstr = if p >= len then 0 else if byte_at(s.source, p) == 34 then 1 else 0
@@ -537,7 +551,7 @@ rule next_token
     let opc = op_code(ScanState { source: s.source, pos: p })
     let opl = op_len(ScanState { source: s.source, pos: p })
     let nval = num_value(ScanState { source: s.source, pos: p })
-    out = if p >= len then Token::Eof else if isalpha == 1 then (if kwc > 0 then Token::Keyword { start: p, len: irun, kw: kwc } else Token::Ident { start: p, len: irun }) else if isdigit == 1 then Token::Num { value: nval, len: drun } else if isstr == 1 then Token::Str { start: p, len: srun } else if opc > 0 then Token::Op { code: opc, len: opl } else Token::Eof
+    out = if p >= len then Token::Eof else if isnl == 1 then Token::Newline { pos: p } else if isalpha == 1 then (if kwc > 0 then Token::Keyword { start: p, len: irun, kw: kwc } else Token::Ident { start: p, len: irun }) else if isdigit == 1 then Token::Num { value: nval, len: drun } else if isstr == 1 then Token::Str { start: p, len: srun } else if opc > 0 then Token::Op { code: opc, len: opl } else Token::Eof
   proofs:
     purity:
       reads : [s.source, s]
@@ -556,6 +570,7 @@ rule token_end
   logic:
     let len = length(s.source)
     let p = skip_spaces(s)
+    let isnl = if p >= len then 0 else if byte_at(s.source, p) == 10 then 1 else 0
     let isalpha = if p >= len then 0 else if byte_at(s.source, p) == 95 then 1 else if byte_at(s.source, p) >= 65 and byte_at(s.source, p) <= 90 then 1 else if byte_at(s.source, p) >= 97 and byte_at(s.source, p) <= 122 then 1 else 0
     let isdigit = if p >= len then 0 else if byte_at(s.source, p) >= 48 and byte_at(s.source, p) <= 57 then 1 else 0
     let isstr = if p >= len then 0 else if byte_at(s.source, p) == 34 then 1 else 0
@@ -564,7 +579,7 @@ rule token_end
     let srun = string_run(ScanState { source: s.source, pos: p })
     let opc = op_code(ScanState { source: s.source, pos: p })
     let opl = op_len(ScanState { source: s.source, pos: p })
-    out = if p >= len then p else if isalpha == 1 then p + irun else if isdigit == 1 then p + drun else if isstr == 1 then p + srun else if opc > 0 then p + opl else p
+    out = if p >= len then p else if isnl == 1 then p + 1 else if isalpha == 1 then p + irun else if isdigit == 1 then p + drun else if isstr == 1 then p + srun else if opc > 0 then p + opl else p
   proofs:
     purity:
       reads : [s.source, s]
@@ -666,6 +681,7 @@ rule tok_kind
       Num(value, len) => 300 + value
       Op(code, len) => 400 + code
       Str(start, len) => 500
+      Newline(pos) => 600
       Eof => 0
   proofs:
     purity:
@@ -691,6 +707,7 @@ rule tok_value
       Num(value, len) => value
       Op(code, len) => 0
       Str(start, len) => 0
+      Newline(pos) => 0
       Eof => 0
   proofs:
     purity:
@@ -718,6 +735,7 @@ rule tok_is_num
       Num(value, len) => 1
       Op(code, len) => 0
       Str(start, len) => 0
+      Newline(pos) => 0
       Eof => 0
   proofs:
     purity:
@@ -746,6 +764,7 @@ rule tok_is_op
       Num(value, len) => 0
       Op(code, len) => 1
       Str(start, len) => 0
+      Newline(pos) => 0
       Eof => 0
   proofs:
     purity:
@@ -770,6 +789,7 @@ rule tok_op_code
       Num(value, len) => 0
       Op(code, len) => code
       Str(start, len) => 0
+      Newline(pos) => 0
       Eof => 0
   proofs:
     purity:
@@ -796,6 +816,7 @@ rule tok_is_ident
       Num(value, len) => 0
       Op(code, len) => 0
       Str(start, len) => 0
+      Newline(pos) => 0
       Eof => 0
   proofs:
     purity:
@@ -820,6 +841,7 @@ rule tok_start
       Num(value, len) => 0
       Op(code, len) => 0
       Str(start, len) => 0
+      Newline(pos) => 0
       Eof => 0
   proofs:
     purity:
@@ -844,6 +866,7 @@ rule tok_len
       Num(value, len) => 0
       Op(code, len) => 0
       Str(start, len) => 0
+      Newline(pos) => 0
       Eof => 0
   proofs:
     purity:
@@ -871,6 +894,7 @@ rule tok_is_str
       Num(value, len) => 0
       Op(code, len) => 0
       Str(start, len) => 1
+      Newline(pos) => 0
       Eof => 0
   proofs:
     purity:
@@ -896,6 +920,7 @@ rule tok_str_start
       Num(value, len) => 0
       Op(code, len) => 0
       Str(start, len) => start
+      Newline(pos) => 0
       Eof => 0
   proofs:
     purity:
@@ -921,6 +946,7 @@ rule tok_str_len
       Num(value, len) => 0
       Op(code, len) => 0
       Str(start, len) => len
+      Newline(pos) => 0
       Eof => 0
   proofs:
     purity:
@@ -2233,3 +2259,134 @@ rule eval_expr
       calls : [tokenize, parse_or, eval_ast, parsed_node]
     termination:
       bound : 256
+
+
+-- ============================================================================
+-- BRICK 8a VALIDATION DRIVERS (structural — multi-line eval is not meaningful
+-- yet, so these certify the token STREAM shape, like brick 7's shape_ast).
+--
+-- count_cells walks the materialized TokenList and counts every cons cell —
+-- including the Newline cells brick 8a now emits and the trailing Eof cell. The
+-- count is a single number predictable by hand for each multi-line source, so
+-- it certifies "the tokenizer traversed every line and emitted a Newline at each
+-- line boundary" without needing to evaluate anything.
+--
+-- Trailing-Eof convention (stated): tokenize always appends ONE Cons{Eof, Nil}
+-- at end of source (brick 2's convention, unchanged). So an N-real-token source
+-- with K newlines produces N + K + 1 cells: N lexeme cells + K Newline cells +
+-- 1 trailing Eof cell. Blank lines contribute an extra Newline cell each (8a
+-- emits newlines faithfully; collapsing blanks is brick 8b).
+-- ============================================================================
+
+-- 1 iff the token IS a Newline, structurally (brick 8a). Mirrors tok_is_str /
+-- tok_is_num: a magnitude test on tok_kind (== 600) would misread a Num literal
+-- whose value is 300 (kind 600), so the position check uses this structural test.
+rule tok_is_newline
+  @intention: "1 if the token is a line-boundary Newline, 0 otherwise (value-independent)"
+  @source: vexprparse.intent:26
+  input:
+    t : Token
+  output:
+    out : number
+  logic:
+    out = match t:
+      Ident(start, len) => 0
+      Keyword(start, len, kw) => 0
+      Num(value, len) => 0
+      Op(code, len) => 0
+      Str(start, len) => 0
+      Newline(pos) => 1
+      Eof => 0
+  proofs:
+    purity:
+      reads : [t]
+      calls : []
+    termination:
+      bound : 16
+
+
+-- Count every cons cell of a token list (lexeme cells + Newline cells + the
+-- trailing Eof cell). Walks a strictly-shrinking group value (the tail) at each
+-- step, so it declares the structural termination proof — same posture as
+-- shape_ast / eval_ast.
+rule count_cells
+  @intention: "Number of cons cells in a token list (every token incl. Newline and trailing Eof)"
+  @source: vexprparse.intent:26
+  input:
+    lst : TokenList
+  output:
+    out : number
+  logic:
+    out = match lst:
+      Cons(head, tail) => 1 + count_cells(tail)
+      Nil => 0
+  proofs:
+    purity:
+      reads : [lst]
+      calls : [count_cells]
+    termination:
+      bound : 4000
+      structural : lst
+
+
+-- An entry concept carrying a source text plus a token index, so a single-input
+-- entry rule can tokenize then peek the kind of the token at that index.
+concept KindAtState
+  @intention: "Source text plus a token index to peek the kind of"
+  @source: vexprparse.intent:26
+  fields:
+    source : text [..256]
+    idx : number [0, 512]
+
+
+-- Entry driver: tokenize the source (from argv) and return the KIND code of the
+-- token at index `arg.idx` (Eof=0, Ident=100, Keyword=200+kw, Num=300+value,
+-- Op=400+code, Str=500, Newline=600). Confirms the Newline appears at the right
+-- position in the stream: kind_at("a\nb", 1) = 600. Native-only for newline
+-- sources (same JSON \n limit as count_cells_src).
+rule kind_at
+  @intention: "Tokenize a source and return the kind code of the token at the given index"
+  @source: vexprparse.intent:26
+  input:
+    arg : KindAtState
+  output:
+    out : number
+  logic:
+    let toks = tokenize(ScanState { source: arg.source, pos: 0 })
+    out = peek_kind(Nth { lst: toks, n: arg.idx })
+  proofs:
+    purity:
+      reads : [arg.source, arg.idx]
+      calls : [tokenize, peek_kind]
+    termination:
+      bound : 256
+
+
+-- Entry driver: tokenize the source (from argv) and count the cons cells. The
+-- money-shot observable for brick 8a: count_cells_src("1 + 2\n3 * 4") = 8
+-- (tokens 1 + 2 Newline 3 * 4 then trailing Eof). Newline-bearing sources are
+-- NATIVE-ONLY (the interpreter's JSON reader does not decode \n into a real
+-- byte 10 — it passes the two bytes backslash-n verbatim), so multi-line counts
+-- are checked via argv $'a\nb'; single-line counts cross-check native vs the
+-- interpreter through the JSON fixture, exactly like brick 5/7's comma/string
+-- cases. count_cells_src takes a ScanState (matching the .json fixture shape),
+-- so it is the LAST rule in the file — the conventional "primary" the example
+-- sweep test (all_examples_with_json_run_without_panicking) exercises against
+-- the JSON records.
+rule count_cells_src
+  @intention: "Tokenize a source and count its token cons cells (multi-line aware)"
+  @source: vexprparse.intent:26
+  input:
+    s : ScanState
+  output:
+    out : number
+  logic:
+    let toks = tokenize(ScanState { source: s.source, pos: 0 })
+    out = count_cells(toks)
+  proofs:
+    purity:
+      reads : [s.source]
+      calls : [tokenize, count_cells]
+    termination:
+      bound : 256
+

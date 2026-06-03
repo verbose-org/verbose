@@ -1,3 +1,45 @@
+Brick 8a of the self-hosting arc: teach the tokenizer to TRAVERSE MULTIPLE LINES
+and emit a line-boundary token, WITHOUT yet computing indentation. This is the
+first half of the INDENT/DEDENT work (brick 8b adds the column stack and the
+INDENT/DEDENT tokens next).
+
+The problem: the pre-8a flat tokenizer STOPPED at the first newline. `skip_spaces`
+advances over inline spaces (byte 32) only, not a newline (byte 10); the newline
+fell through to the operator classifier, which returned 0, so the scanner read it
+as end-of-input and the token list ended at the first line break. A multi-line
+source could not even be traversed.
+
+Brick 8a adds a line-boundary token kind (Newline, carrying the byte offset of
+the newline). The next-lexeme recognizer, after skipping inline spaces, now
+recognizes byte 10 as a Newline token; the token-end helper advances exactly one
+byte past it; and the whole-source scanner conses the Newline like any other
+token and keeps scanning the next line. Brick 8a emits newlines FAITHFULLY:
+consecutive newlines (blank lines) emit consecutive Newline tokens — collapsing
+blanks and the column-stack INDENT/DEDENT logic are brick 8b. Brick 8a computes
+NO indentation, columns, INDENT, or DEDENT.
+
+The trailing-end convention is unchanged from brick 2: the scanner always
+appends one end-of-input cell, so a source with N real lexemes and K newlines
+produces N + K + 1 token cells.
+
+Validation is STRUCTURAL (multi-line evaluation is not meaningful yet): a
+cell-counting driver tokenizes a source and counts every token cons cell, and a
+kind-at-index driver tokenizes a source and returns the kind code of the token at
+a given index (confirming the Newline appears at the right position). Both are
+hand-derivable single numbers. Newline-bearing sources are checked NATIVE-ONLY
+via argv (a real byte-10 newline), because the interpreter's JSON input reader
+does not decode an escaped newline into a real newline byte — it passes the two
+bytes backslash-n verbatim — exactly the same limit that made brick 5's comma
+cases and brick 7's string cases native-only. Single-line cell counts cross-check
+native against the interpreter through the JSON fixture. Bricks 1-7 are unchanged
+on single-line input (a line with no newline byte takes the identical scan path),
+which the unchanged eval and shape drivers certify.
+
+  next lexeme = (skip inline spaces) then
+                  Newline      if at a newline byte    -- brick 8a
+                | Keyword | Ident | Number | String | Operator | Eof
+
+----------------------------------------------------------------------------
 Brick 7 of the self-hosting arc: extend the parser's `primary` with two LITERAL
 kinds — boolean literals (`true` / `false`) and string literals (`"..."`).
 Brick 6 added the conditional expression; brick 7 adds the remaining leaf forms.
@@ -198,3 +240,16 @@ there (out of the arithmetic evaluator's scope).
     classifier additionally recognizes the four-letter keywords 'then' and 'else'.
     Evaluation walks a conditional by evaluating its condition and then only the
     selected branch.
+
+26. Line traversal and the line-boundary token (brick 8a). A line-boundary token
+    kind carries the byte offset of a newline. The next-lexeme recognizer, after
+    skipping inline spaces, recognizes a newline byte as that token; the token-end
+    helper advances exactly one byte past it; the whole-source scanner conses it
+    like any other token and continues onto the next line, lifting the old "stops
+    at the first newline" limit. A structural test reports whether a token is a
+    line-boundary token. A cell-counting driver tokenizes a source and counts
+    every token cons cell (lexeme cells plus line-boundary cells plus the trailing
+    end-of-input cell). A kind-at-index driver tokenizes a source and returns the
+    kind code of the token at a given index, confirming the line-boundary token
+    lands at the right position. No indentation, columns, or block-structure
+    tokens are computed — that is brick 8b's column stack.
