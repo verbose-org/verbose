@@ -1,13 +1,16 @@
 @verbose 0.1.0
 
--- Verbose-in-Verbose expression PARSER, brick 4 of the self-hosting arc.
+-- Verbose-in-Verbose expression PARSER, brick 6 of the self-hosting arc.
 --
 -- Brick 2 (vtokenstream.verbose) materialized the token stream as a cons-list.
 -- Brick 3 consumed that stream and built an arithmetic-expression AST in the
--- arena, WITH operator precedence, then evaluated it. Brick 4 EXTENDS that
+-- arena, WITH operator precedence, then evaluated it. Brick 4 EXTENDED that
 -- ladder to the FULL expression precedence: logical or/and, comparisons, and
--- prefix unary (not / negation) wrapping the arithmetic core. The grammar
--- (mirroring src/parser.rs, lowest to highest precedence):
+-- prefix unary (not / negation). Brick 5 grew `primary` to identifiers, function
+-- calls, and field access. Brick 6 adds a CONDITIONAL EXPRESSION as the highest-
+-- level alternative in `primary`: `if cond then thn else els`, the single-line
+-- form (there is no INDENT/DEDENT in this tokenizer, so the multi-line block is a
+-- later brick). The grammar (mirroring src/parser.rs, lowest to highest):
 --
 --   parse_expr = or_expr
 --   or_expr    = and_expr ('or'  and_expr)*                 -- left-assoc, kw 'or'
@@ -16,7 +19,13 @@
 --   add_expr   = mul_expr (('+' | '-') mul_expr)*           -- left-assoc  [brick 3]
 --   mul_expr   = unary    (('*' | '/' | '%') unary)*        -- left-assoc  [brick 3 + %]
 --   unary      = ('not' | '-') unary | primary              -- prefix, right-recursive
---   primary    = '(' parse_expr ')' | NUMBER                -- parens now reopen at the top
+--   primary    = 'if' parse_or 'then' parse_or 'else' parse_or  -- brick 6, single-line
+--              | '(' parse_or ')' | NUMBER | IDENT trailer       -- bricks 3 + 5
+--
+-- Each of the conditional's three sub-expressions is a FULL parse_or, so the
+-- else-branch absorbs trailing operators: `if 1 then 2 else 3 + 100` parses the
+-- else as `3 + 100` (and evaluates to 2, the then-branch). The if-expression is a
+-- primary, so it nests in arithmetic via parens: `1 + (if 1 then 2 else 3)` = 3.
 --
 -- '*' '/' '%' bind tighter than '+' '-', which bind tighter than comparisons,
 -- which bind tighter than 'and', which binds tighter than 'or'. Binary operators
@@ -133,6 +142,12 @@ concept_group VExpr [max_depth: 256, max_nodes: 4000]
       -- f() has args = ArgNil; f(x) = ArgCons(AstVar(x), ArgNil); f(x, y) =
       -- ArgCons(AstVar(x), ArgCons(AstVar(y), ArgNil)).
       AstCall of (callee_start : number, callee_len : number, args : ArgList)
+      -- A conditional expression: if cond then thn else els. All three are
+      -- sub-expressions (each a full parse_or). eval_ast evaluates cond, then
+      -- the SELECTED branch only (the language's lazy if, so the dead branch's
+      -- eval_ast never runs). Brick 6: single-line form only — there is no
+      -- INDENT/DEDENT in this tokenizer, so the multi-line form is a later brick.
+      AstIf of (cond : Ast, thn : Ast, els : Ast)
       -- An error/placeholder leaf (unexpected token); evaluates to 0
       AstErr
 
@@ -308,9 +323,31 @@ rule kw3
       bound : 48
 
 
--- Dispatch keyword classification by identifier-run length. Brick 4 only
--- recognizes 2- and 3-byte keywords (or / and / not); longer keywords lex as
--- plain identifiers here (kw == 0) and are handled by later bricks.
+-- four-letter keywords: then=7, else=8 (brick 6 — `if`/`then`/`else` as an
+-- expression). Codes 7/8 don't collide with the existing 1-6 (if/or/of/let/
+-- and/not). `then` = t(116) h(104) e(101) n(110); `else` = e(101) l(108)
+-- s(115) e(101).
+rule kw4
+  @intention: "Classify a 4-byte identifier run as a keyword (0 if none)"
+  @source: vexprparse.intent:7
+  input:
+    s : ScanState
+  output:
+    out : number
+  logic:
+    out = if byte_at(s.source, s.pos) == 116 and (byte_at(s.source, s.pos + 1) == 104 and (byte_at(s.source, s.pos + 2) == 101 and byte_at(s.source, s.pos + 3) == 110)) then 7 else if byte_at(s.source, s.pos) == 101 and (byte_at(s.source, s.pos + 1) == 108 and (byte_at(s.source, s.pos + 2) == 115 and byte_at(s.source, s.pos + 3) == 101)) then 8 else 0
+  proofs:
+    purity:
+      reads : [s.source, s.pos]
+      calls : []
+    termination:
+      bound : 64
+
+
+-- Dispatch keyword classification by identifier-run length. Brick 6 adds the
+-- 4-byte keywords (then / else) alongside the 2- and 3-byte keywords (or / and /
+-- not); longer keywords lex as plain identifiers here (kw == 0) and are handled
+-- by later bricks.
 rule keyword_code
   @intention: "Numeric keyword code for the identifier run at pos (0 = plain ident)"
   @source: vexprparse.intent:7
@@ -320,11 +357,11 @@ rule keyword_code
     out : number
   logic:
     let rl = ident_run(s)
-    out = if rl == 2 then kw2(s) else if rl == 3 then kw3(s) else 0
+    out = if rl == 2 then kw2(s) else if rl == 3 then kw3(s) else if rl == 4 then kw4(s) else 0
   proofs:
     purity:
       reads : [s]
-      calls : [ident_run, kw2, kw3]
+      calls : [ident_run, kw2, kw3, kw4]
     termination:
       bound : 16
 
@@ -1002,6 +1039,55 @@ concept FieldState
     base : Ast
 
 
+-- ============================================================================
+-- BRICK 6: `if cond then thn else els` as an expression. The single-line form
+-- only — there is no INDENT/DEDENT in this tokenizer. parse_primary detects the
+-- `if` keyword (kind 201) and threads three sub-parses (cond / thn / els, each a
+-- full parse_or) through a chain of continuation rules, because a Verbose rule
+-- has ONE input and `let` is EAGER (a let-bound parse_or would fire on every
+-- parse_primary call, recursing forever). Each continuation carries the partial
+-- state in a single concept and parses its sub-expression LAZILY (only when
+-- reached from the if-branch). The chain: parse_primary --(cond Parsed)-->
+-- if_then --(thn Parsed)--> if_else --(els Parsed)--> if_build (assembles AstIf).
+-- All three continuations live in the parser recursion cycle (they call
+-- parse_or), so their Parsed group-field inputs compile natively (group-field
+-- ABI, commit 9529277).
+-- ============================================================================
+
+-- if_then: given the parsed condition, locate the `then` keyword (kind 207),
+-- step over it, and parse the then-branch (a full parse_or). The cond's AST node
+-- is carried forward; the thn parse is handed to if_else.
+concept IfThenState
+  @intention: "Token list + the parsed condition of an if-expression"
+  @source: vexprparse.intent:25
+  fields:
+    toks : TokenList
+    cond : Parsed
+
+
+-- if_else: given the cond node and the parsed then-branch, locate the `else`
+-- keyword (kind 208), step over it, and parse the else-branch. The cond and thn
+-- nodes are carried forward; the els parse is handed to if_build.
+concept IfElseState
+  @intention: "Token list + the if-expression condition node + the parsed then-branch"
+  @source: vexprparse.intent:25
+  fields:
+    toks : TokenList
+    cond_node : Ast
+    thn : Parsed
+
+
+-- if_build: given the cond and thn nodes and the parsed else-branch, assemble the
+-- AstIf node carrying the else-branch's end index.
+concept IfBuildState
+  @intention: "The if-expression cond + then nodes + the parsed else-branch"
+  @source: vexprparse.intent:25
+  fields:
+    cond_node : Ast
+    thn_node : Ast
+    els : Parsed
+
+
 -- Pull the ArgList out of a ParsedArgs result.
 rule parsed_args_list
   @intention: "The argument cons-list from a call-argument parse result"
@@ -1206,7 +1292,84 @@ rule field_rest
       bound : 512
 
 
--- primary = '(' parse_or ')' | NUMBER | IDENT trailer | <error leaf>
+-- if_then: the parsed condition arrives as cs.cond. Extract its node + end
+-- index. The `then` keyword (kind 207) should sit at cond_next; if it does, step
+-- over it (then_pos = cond_next + 1), otherwise tolerate its absence (then_pos =
+-- cond_next) — error recovery is a later brick, like paren_close's missing ')'.
+-- Parse the then-branch (a full parse_or) from then_pos and hand it, with the
+-- cond node, to if_else. The parse_or is unconditional (a then-branch is always
+-- required once we are in an if-expression) and strictly advances position.
+rule if_then
+  @intention: "Consume 'then' after the condition, parse the then-branch, continue to if_else"
+  @source: vexprparse.intent:25
+  input:
+    cs : IfThenState
+  output:
+    out : Parsed
+  logic:
+    let cond_node = parsed_node(cs.cond)
+    let cond_next = parsed_next(cs.cond)
+    let knd = peek_kind(Nth { lst: cs.toks, n: cond_next })
+    let then_pos = if knd == 207 then cond_next + 1 else cond_next
+    out = if_else(IfElseState { toks: cs.toks, cond_node: cond_node, thn: parse_or(ParseState { toks: cs.toks, pos: then_pos }) })
+  proofs:
+    purity:
+      reads : [cs.toks, cs.cond]
+      calls : [parsed_node, parsed_next, peek_kind, if_else, parse_or]
+    termination:
+      bound : 512
+
+
+-- if_else: the parsed then-branch arrives as cs.thn (cond node carried in
+-- cs.cond_node). Extract the thn node + end index. The `else` keyword (kind 208)
+-- should sit at thn_next; step over it if present (else_pos = thn_next + 1),
+-- tolerate its absence otherwise. Parse the else-branch from else_pos and hand
+-- it, with the cond + thn nodes, to if_build.
+rule if_else
+  @intention: "Consume 'else' after the then-branch, parse the else-branch, continue to if_build"
+  @source: vexprparse.intent:25
+  input:
+    cs : IfElseState
+  output:
+    out : Parsed
+  logic:
+    let thn_node = parsed_node(cs.thn)
+    let thn_next = parsed_next(cs.thn)
+    let knd = peek_kind(Nth { lst: cs.toks, n: thn_next })
+    let else_pos = if knd == 208 then thn_next + 1 else thn_next
+    out = if_build(IfBuildState { cond_node: cs.cond_node, thn_node: thn_node, els: parse_or(ParseState { toks: cs.toks, pos: else_pos }) })
+  proofs:
+    purity:
+      reads : [cs.toks, cs.cond_node, cs.thn]
+      calls : [parsed_node, parsed_next, peek_kind, if_build, parse_or]
+    termination:
+      bound : 512
+
+
+-- if_build: the parsed else-branch arrives as cs.els (cond + thn nodes carried).
+-- Extract the els node + end index and assemble the AstIf node, carrying the
+-- else-branch's end index as the conditional's `next`.
+rule if_build
+  @intention: "Assemble the AstIf node from the cond, then, and else sub-expressions"
+  @source: vexprparse.intent:25
+  input:
+    cs : IfBuildState
+  output:
+    out : Parsed
+  logic:
+    let els_node = parsed_node(cs.els)
+    let els_next = parsed_next(cs.els)
+    out = Parsed::Mk { node: Ast::AstIf { cond: cs.cond_node, thn: cs.thn_node, els: els_node }, next: els_next }
+  proofs:
+    purity:
+      reads : [cs.cond_node, cs.thn_node, cs.els]
+      calls : [parsed_node, parsed_next]
+    termination:
+      bound : 16
+
+
+-- primary = 'if' parse_or 'then' parse_or 'else' parse_or
+--         | '(' parse_or ')' | NUMBER | IDENT trailer | <error leaf>
 -- Peeks the token at pos. A '(' (op code 21 => kind 421) opens a sub-expr:
 -- parse_or inside (LAZILY, only in this branch), then paren_close consumes the
 -- ')'. A Num (kind 300+value) becomes an AstNum leaf consuming one token. An
@@ -1230,6 +1393,8 @@ rule parse_primary
   output:
     out : Parsed
   logic:
+    let lead_kind = peek_kind(Nth { lst: st.toks, n: st.pos })
+    let isif = if lead_kind == 201 then 1 else 0
     let isnum = peek_is_num(Nth { lst: st.toks, n: st.pos })
     let opc = peek_op_code(Nth { lst: st.toks, n: st.pos })
     let isparen = if opc == 21 then 1 else 0
@@ -1239,11 +1404,11 @@ rule parse_primary
     let idlen = peek_len(Nth { lst: st.toks, n: st.pos })
     let next_opc = peek_op_code(Nth { lst: st.toks, n: st.pos + 1 })
     let iscall = if next_opc == 21 then 1 else 0
-    out = if isnum == 1 then Parsed::Mk { node: Ast::AstNum { value: numval }, next: st.pos + 1 } else if isparen == 1 then paren_close(ParenState { toks: st.toks, inner: parse_or(ParseState { toks: st.toks, pos: st.pos + 1 }) }) else if isident == 1 then (if iscall == 1 then call_build(CallState { toks: st.toks, cstart: idstart, clen: idlen, pargs: parse_args(ParseState { toks: st.toks, pos: st.pos + 2 }) }) else field_rest(FieldState { toks: st.toks, pos: st.pos + 1, base: Ast::AstVar { start: idstart, len: idlen } })) else Parsed::Mk { node: Ast::AstErr, next: st.pos }
+    out = if isif == 1 then if_then(IfThenState { toks: st.toks, cond: parse_or(ParseState { toks: st.toks, pos: st.pos + 1 }) }) else if isnum == 1 then Parsed::Mk { node: Ast::AstNum { value: numval }, next: st.pos + 1 } else if isparen == 1 then paren_close(ParenState { toks: st.toks, inner: parse_or(ParseState { toks: st.toks, pos: st.pos + 1 }) }) else if isident == 1 then (if iscall == 1 then call_build(CallState { toks: st.toks, cstart: idstart, clen: idlen, pargs: parse_args(ParseState { toks: st.toks, pos: st.pos + 2 }) }) else field_rest(FieldState { toks: st.toks, pos: st.pos + 1, base: Ast::AstVar { start: idstart, len: idlen } })) else Parsed::Mk { node: Ast::AstErr, next: st.pos }
   proofs:
     purity:
       reads : [st.toks, st.pos]
-      calls : [peek_is_num, peek_op_code, peek_is_ident, peek_value, peek_start, peek_len, paren_close, parse_or, call_build, parse_args, field_rest]
+      calls : [peek_kind, peek_is_num, peek_op_code, peek_is_ident, peek_value, peek_start, peek_len, if_then, paren_close, parse_or, call_build, parse_args, field_rest]
     termination:
       bound : 512
 
@@ -1651,6 +1816,10 @@ rule eval_ast
       AstVar(start, len) => 0
       AstField(base, fstart, flen) => 0
       AstCall(callee_start, callee_len, args) => 0
+      -- The language's lazy if: cond is evaluated, then ONLY the selected
+      -- branch's eval_ast runs — the dead branch is never walked. Truthiness is
+      -- "non-zero is true" (matching AstNot / and / or above).
+      AstIf(cond, thn, els) => if eval_ast(cond) != 0 then eval_ast(thn) else eval_ast(els)
       AstErr => 0
   proofs:
     purity:
@@ -1718,6 +1887,10 @@ rule shape_ast
       AstVar(start, len) => 100
       AstField(base, fstart, flen) => 1000 + shape_ast(base)
       AstCall(callee_start, callee_len, args) => 10000 + shape_args(args)
+      -- An AstIf contributes a dedicated top band (100000) plus the signatures of
+      -- its three sub-expressions, so a conditional's shape is hand-derivable and
+      -- distinct from every other kind. (Brick 6.)
+      AstIf(cond, thn, els) => 100000 + shape_ast(cond) + shape_ast(thn) + shape_ast(els)
       AstErr => 0
   proofs:
     purity:

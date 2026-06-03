@@ -40,5 +40,12 @@
   {"source": "a.b.c", "pos": 0},
   {"source": "f(x) + g(y)", "pos": 0},
   {"source": "a.b + 1", "pos": 0},
-  {"source": "not f(x)", "pos": 0}
+  {"source": "not f(x)", "pos": 0},
+  {"source": "if 1 then 2 else 3", "pos": 0},
+  {"source": "if 0 then 2 else 3", "pos": 0},
+  {"source": "if 2 < 3 then 10 else 20", "pos": 0},
+  {"source": "if 1 then 2 else 3 + 100", "pos": 0},
+  {"source": "if 1 then (if 0 then 5 else 6) else 7", "pos": 0},
+  {"source": "1 + (if 1 then 2 else 3)", "pos": 0},
+  {"source": "if 2 > 1 and 3 > 2 then 1 else 0", "pos": 0}
 ]

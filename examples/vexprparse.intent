@@ -1,16 +1,31 @@
-Brick 5 of the self-hosting arc: extend the brick-4 full-precedence expression
-PARSER's `primary` to identifiers, function calls, and field access. Brick 3
-covered the arithmetic core (+ - * / and parens with precedence); brick 4
-extended the ladder to the full expression grammar — logical or/and,
-comparisons, and prefix unary (not / negation). Brick 5 grows the highest-
-precedence form (a primary) so an identifier becomes a bare variable, a function
-call, or a field-access chain:
+Brick 6 of the self-hosting arc: extend the parser's `primary` with a
+conditional expression — `if cond then thn else els`, the single-line form.
+Bricks 3-5 built the full-precedence parser (arithmetic core, logical or/and,
+comparisons, prefix unary, then identifiers / calls / field access). Brick 6
+adds the highest-level alternative to a primary: an `if` keyword opens a
+conditional whose condition, then-branch, and else-branch are each a full
+expression (parse_or). There is NO INDENT/DEDENT in this tokenizer, so only the
+single-line form exists — the multi-line `if`/`then`/`else` block is a later
+brick once a column-stack tokenizer ships.
 
-  primary = '(' parse_or ')' | NUMBER | IDENT trailer
+  primary = 'if' parse_or 'then' parse_or 'else' parse_or   -- brick 6
+          | '(' parse_or ')' | NUMBER | IDENT trailer
   trailer = '(' arglist ')'    -- function call
           | ('.' IDENT)*       -- field-access chain (left-deep)
           | (nothing)          -- a bare variable reference
   arglist = (parse_or (',' parse_or)*)?   -- zero or more comma-separated exprs
+
+The else-branch is a full parse_or, so `if 1 then 2 else 3 + 100` parses the
+else as `3 + 100` (= 103) and evaluates to 2 (the then-branch, since cond is
+true) — the conditional does NOT stop the else at `3`. An if-expression is the
+highest-precedence form, so it nests inside arithmetic only via parentheses:
+`1 + (if 1 then 2 else 3)` = 3; a bare `1 + if ...` would parse the `if` as the
+right operand of `+` (since parse_primary handles `if`), which is consistent but
+the parenthesized form is the readable one tested here.
+
+The tokenizer gains a four-letter-keyword classifier (`then` = code 7, `else` =
+code 8) wired alongside the existing two- and three-letter ones (if / or / of /
+let / and / not). The keyword `if` already lexes as code 1.
 
 After lexing an identifier the parser peeks the next token: a '(' opens a
 comma-separated argument list (a call), a '.' opens a field-access chain, and
@@ -127,4 +142,20 @@ there (out of the arithmetic evaluator's scope).
     (addition binds tighter than the comparison), and two less-than three and four
     less-than five is one (the comparisons bind tighter than 'and'). Variable,
     call, and field nodes have no value without an environment and evaluate to
-    zero here — their correctness is proven by the structural signature above.
+    zero here — their correctness is proven by the structural signature above. A
+    conditional expression evaluates its condition, then ONLY the selected branch
+    (the language's lazy if): if two less-than three then ten else twenty is ten.
+
+25. The conditional expression (brick 6). The parser carries the partial state of
+    an if-expression through a small chain of single-input continuation rules,
+    because a rule has one input and let bindings are eager: a state holding the
+    token list and the parsed condition (then-state), one holding the token list,
+    the condition node, and the parsed then-branch (else-state), and one holding
+    the condition and then nodes and the parsed else-branch (build-state). The
+    then-state continuation consumes the 'then' keyword and parses the then-branch;
+    the else-state continuation consumes the 'else' keyword and parses the
+    else-branch; the build-state continuation assembles the conditional node from
+    the three sub-expressions, carrying the else-branch's end index. The keyword
+    classifier additionally recognizes the four-letter keywords 'then' and 'else'.
+    Evaluation walks a conditional by evaluating its condition and then only the
+    selected branch.
