@@ -290,6 +290,25 @@ concept_group VExpr [max_depth: 4096, max_nodes: 65535]
     variants:
       MkPB of (block : Block, next : number)
 
+  -- Brick 10: the evaluation ENVIRONMENT. A cons-list mapping a bound name —
+  -- carried as a SOURCE SPAN (name_start, name_len) exactly like a Binding cell
+  -- or an AstVar — to its ALREADY-COMPUTED numeric value `val`. Distinct from
+  -- Binding (which carries the unevaluated RHS Ast): Env carries the resolved
+  -- number, so a variable reference is one byte-compare + one slot read, with no
+  -- re-evaluation of the binding's expression on each lookup. `rest` chains to
+  -- the enclosing scope; ENil is the empty environment. build_env conses the
+  -- newest binding onto the FRONT, and env_lookup walks front-to-back, so the
+  -- MOST RECENT binding of a name wins (shadowing: `let x = 1` then `let x = 2`
+  -- resolves x to 2). The name's identity is its bytes in the source text, so
+  -- env_lookup byte-compares the query span against each entry's span via the
+  -- shared `src`.
+  concept Env
+    @intention: "Evaluation environment: name span -> already-computed number, innermost first"
+    @source: vexprparse.intent:29
+    variants:
+      ECons of (name_start : number, name_len : number, val : number, rest : Env)
+      ENil
+
 
 -- ============================================================================
 -- Brick 2 reused verbatim: the tokenizer. (Copied so bricks 1-2 stay pristine;
@@ -3346,6 +3365,262 @@ rule block_shape
     purity:
       reads : [a.source]
       calls : [begin_tokenize, parse_block, pb_block, block_binds, block_result, count_binds, shape_binds, shape_ast]
+    termination:
+      bound : 256
+
+
+-- ============================================================================
+-- BRICK 10: EVALUATING A LET-BLOCK WITH AN ENVIRONMENT (name resolution).
+--
+-- Brick 9 PARSED a let-block into a Block { binds, result } and proved the parse
+-- structurally (block_shape). Brick 10 RUNS it to a number, resolving variable
+-- references by BYTES against the source text. The pieces:
+--
+--   * name_eq      — are two source spans byte-for-byte equal? (recursion over a
+--                    byte range, bounded by the span length).
+--   * env_lookup   — find a name in the Env by byte-comparing its span against
+--                    each entry's span; return the bound value (recursion over
+--                    the Env list, innermost-first so the latest binding wins).
+--   * eval_ast_env — eval_ast EXTENDED with an Env + src: AstVar(start, len) now
+--                    resolves to env_lookup(...) instead of 0. This rule carries
+--                    BOTH a group field (node : Ast) AND a text field (src) and
+--                    recurses with sibling calls (AstBin lhs/rhs) — the shape the
+--                    2b052a7 compiler fix unblocked (cf. recursive_text_eval).
+--   * build_env    — walk the binding list IN ORDER, evaluating each binding's
+--                    RHS against the env built SO FAR (so `let y = x + 1` sees an
+--                    earlier `let x = 1`), consing (name span, value) on the front.
+--   * eval_block   — the entry: tokenize -> parse_block -> build_env -> eval the
+--                    result against the populated env. The money shot.
+--
+-- NAME RESOLUTION BY BYTES. A variable's identity is its bytes in the source, not
+-- a symbol-table index: two `x` at different spans ARE the same variable. So both
+-- the binding name (recorded as a span by parse_stmts) and the AstVar reference
+-- (recorded as a span by parse_primary) are resolved by comparing the actual
+-- source bytes. eval_ast_env and build_env therefore both carry the source text
+-- alongside the AST/Env — exactly the "group field + text field, recursive" shape.
+--
+-- OUT OF SCOPE FOR THIS BRICK (documented, evaluate to 0 like brick 7's eval_ast):
+-- AstField / AstCall / AstStr — they need a richer environment (records, function
+-- values, decoded string bytes). The point of brick 10 is VARIABLE resolution in
+-- arithmetic/logic let-blocks; those three stay 0 and are proven by shape_ast.
+--
+-- TERMINATION. name_eq recurses over a byte range with `increasing : off` bounded
+-- by the span length (a Number field of its packed input — same shape as the
+-- tokenizer's scanners, so the proof verifies mechanically). env_lookup,
+-- build_env, and eval_ast_env recurse over a strictly-shrinking cons-list tail /
+-- Ast sub-node, but that shrinking value is a FIELD of a packed input concept,
+-- not the input itself; the `structural` proof requires the input to BE a group
+-- concept, so it does not fit. Like the parser's packed-state rules (parse_add,
+-- stmt_let_join, ...) these carry bound-only termination and ACCEPT the mandatory
+-- native recursion breadcrumb. Backstops: the Env / binding lists are finite
+-- (built by a finite binding sweep) and the AST is finite (bounded by max_nodes),
+-- so every recursion strictly shrinks toward a leaf / Nil. byte_at is fail-closed
+-- OOB (returns 0), so an out-of-range span never reads past the buffer.
+-- ============================================================================
+
+-- A name-equality probe: the source text, the two span starts, the common length
+-- to compare, and the current byte offset within the spans. name_eq compares
+-- src[a_start+off] vs src[b_start+off] for off in [0, len).
+concept NameEqState
+  @intention: "Source text + two span starts + length + current offset, for byte-comparing two names"
+  @source: vexprparse.intent:29
+  fields:
+    src : text [..256]
+    a_start : number [0, 256]
+    b_start : number [0, 256]
+    len : number [0, 256]
+    off : number [0, 256]
+
+
+-- name_eq: 1 iff the byte ranges src[a_start..a_start+len] and
+-- src[b_start..b_start+len] are equal. Compares byte by byte from `off` up to
+-- `len`; equal when off reaches len. The caller checks the two LENGTHS are equal
+-- BEFORE calling (env_lookup does this), so this rule assumes a common len and
+-- only walks the bytes. Recursion advances `off` toward `len`; bounded by 256.
+rule name_eq
+  @intention: "1 if two source spans of equal length are byte-for-byte identical, 0 otherwise"
+  @source: vexprparse.intent:29
+  input:
+    st : NameEqState
+  output:
+    out : number
+  logic:
+    out = if st.off >= st.len then 1 else if byte_at(st.src, st.a_start + st.off) == byte_at(st.src, st.b_start + st.off) then name_eq(NameEqState { src: st.src, a_start: st.a_start, b_start: st.b_start, len: st.len, off: st.off + 1 }) else 0
+  proofs:
+    purity:
+      reads : [st.src, st.a_start, st.b_start, st.len, st.off]
+      calls : [name_eq]
+    termination:
+      bound : 256
+      increasing : off
+
+
+-- The environment-lookup probe: the Env to search, the source text (for byte
+-- comparison), and the query name's span (q_start, q_len).
+concept EnvLookState
+  @intention: "An Env to search + the source text + the query name's span"
+  @source: vexprparse.intent:29
+  fields:
+    env : Env
+    src : text [..256]
+    q_start : number [0, 256]
+    q_len : number [0, 256]
+
+
+-- env_lookup: find the query name in the Env and return its bound value, or 0 if
+-- the name is unbound (an unbound variable evaluates to 0 — the same default as a
+-- brick-7 AstVar, just now reachable through the environment). Walks the Env
+-- innermost-first: at each ECons it checks the entry's LENGTH equals the query
+-- length AND the bytes match (name_eq); on a match it returns the entry's `val`,
+-- otherwise it recurses into `rest`. Because build_env conses the newest binding
+-- on the front, the FIRST match is the most recent binding — shadowing wins.
+-- Bound-only termination + the native recursion breadcrumb (packed input concept;
+-- the shrinking Env tail is a field, not the input — see the header).
+rule env_lookup
+  @intention: "Value bound to a name in the environment (0 if unbound); innermost binding wins"
+  @source: vexprparse.intent:29
+  input:
+    st : EnvLookState
+  output:
+    out : number
+  logic:
+    out = match st.env:
+      ECons(name_start, name_len, val, rest) => if name_len == st.q_len and name_eq(NameEqState { src: st.src, a_start: name_start, b_start: st.q_start, len: name_len, off: 0 }) == 1 then val else env_lookup(EnvLookState { env: rest, src: st.src, q_start: st.q_start, q_len: st.q_len })
+      ENil => 0
+  proofs:
+    purity:
+      reads : [st.env, st.src, st.q_start, st.q_len]
+      calls : [name_eq, env_lookup]
+    termination:
+      bound : 4000
+
+
+-- eval_ast_env's input: the AST node to evaluate, the environment to resolve
+-- variable references against, and the source text the spans index into. Carries
+-- a group field (node : Ast) AND a text field (src) — the 2b052a7 shape.
+concept EvalEnvArg
+  @intention: "An Ast node + the environment + the source text, for evaluating with name resolution"
+  @source: vexprparse.intent:29
+  fields:
+    node : Ast
+    env : Env
+    src : text [..256]
+
+
+-- eval_ast_env: eval_ast EXTENDED with an environment. Identical to eval_ast for
+-- every variable-free node (the same arithmetic / comparison / logical / unary /
+-- if / bool dispatch), but AstVar(start, len) now RESOLVES the name: it looks the
+-- span up in the env by byte comparison and returns the bound value. Every
+-- recursive call threads the SAME env and src down, so a nested sub-expression
+-- sees the same bindings. AstBin makes TWO sibling recursive calls (lhs and rhs)
+-- while carrying the text field src — exactly the shape the 2b052a7 fix unblocked.
+-- AstField / AstCall / AstStr stay 0 (out of scope for this brick — see header).
+-- Bound-only termination + the native recursion breadcrumb: each recursive call
+-- walks a strict sub-node of ea.node, but ea.node is a FIELD of the packed input
+-- (not the input), so the `structural` proof does not fit — see the header.
+rule eval_ast_env
+  @intention: "Evaluate an AST to a number, resolving variable references against an environment"
+  @source: vexprparse.intent:29
+  input:
+    ea : EvalEnvArg
+  output:
+    out : number
+  logic:
+    out = match ea.node:
+      AstNum(value) => value
+      AstBin(op, lhs, rhs) => if op == 13 then eval_ast_env(EvalEnvArg { node: lhs, env: ea.env, src: ea.src }) + eval_ast_env(EvalEnvArg { node: rhs, env: ea.env, src: ea.src }) else if op == 14 then eval_ast_env(EvalEnvArg { node: lhs, env: ea.env, src: ea.src }) - eval_ast_env(EvalEnvArg { node: rhs, env: ea.env, src: ea.src }) else if op == 15 then eval_ast_env(EvalEnvArg { node: lhs, env: ea.env, src: ea.src }) * eval_ast_env(EvalEnvArg { node: rhs, env: ea.env, src: ea.src }) else if op == 16 then eval_ast_env(EvalEnvArg { node: lhs, env: ea.env, src: ea.src }) / eval_ast_env(EvalEnvArg { node: rhs, env: ea.env, src: ea.src }) else if op == 17 then eval_ast_env(EvalEnvArg { node: lhs, env: ea.env, src: ea.src }) % eval_ast_env(EvalEnvArg { node: rhs, env: ea.env, src: ea.src }) else if op == 1 then (if eval_ast_env(EvalEnvArg { node: lhs, env: ea.env, src: ea.src }) == eval_ast_env(EvalEnvArg { node: rhs, env: ea.env, src: ea.src }) then 1 else 0) else if op == 6 then (if eval_ast_env(EvalEnvArg { node: lhs, env: ea.env, src: ea.src }) != eval_ast_env(EvalEnvArg { node: rhs, env: ea.env, src: ea.src }) then 1 else 0) else if op == 19 then (if eval_ast_env(EvalEnvArg { node: lhs, env: ea.env, src: ea.src }) < eval_ast_env(EvalEnvArg { node: rhs, env: ea.env, src: ea.src }) then 1 else 0) else if op == 20 then (if eval_ast_env(EvalEnvArg { node: lhs, env: ea.env, src: ea.src }) > eval_ast_env(EvalEnvArg { node: rhs, env: ea.env, src: ea.src }) then 1 else 0) else if op == 5 then (if eval_ast_env(EvalEnvArg { node: lhs, env: ea.env, src: ea.src }) <= eval_ast_env(EvalEnvArg { node: rhs, env: ea.env, src: ea.src }) then 1 else 0) else if op == 4 then (if eval_ast_env(EvalEnvArg { node: lhs, env: ea.env, src: ea.src }) >= eval_ast_env(EvalEnvArg { node: rhs, env: ea.env, src: ea.src }) then 1 else 0) else if op == 30 then (if eval_ast_env(EvalEnvArg { node: lhs, env: ea.env, src: ea.src }) != 0 and eval_ast_env(EvalEnvArg { node: rhs, env: ea.env, src: ea.src }) != 0 then 1 else 0) else if op == 31 then (if eval_ast_env(EvalEnvArg { node: lhs, env: ea.env, src: ea.src }) != 0 or eval_ast_env(EvalEnvArg { node: rhs, env: ea.env, src: ea.src }) != 0 then 1 else 0) else 0
+      AstNeg(inner) => 0 - eval_ast_env(EvalEnvArg { node: inner, env: ea.env, src: ea.src })
+      AstNot(inner) => if eval_ast_env(EvalEnvArg { node: inner, env: ea.env, src: ea.src }) == 0 then 1 else 0
+      AstVar(start, len) => env_lookup(EnvLookState { env: ea.env, src: ea.src, q_start: start, q_len: len })
+      AstField(base, fstart, flen) => 0
+      AstCall(callee_start, callee_len, args) => 0
+      AstIf(cond, thn, els) => if eval_ast_env(EvalEnvArg { node: cond, env: ea.env, src: ea.src }) != 0 then eval_ast_env(EvalEnvArg { node: thn, env: ea.env, src: ea.src }) else eval_ast_env(EvalEnvArg { node: els, env: ea.env, src: ea.src })
+      AstBool(value) => value
+      AstStr(start, len) => 0
+      AstErr => 0
+  proofs:
+    purity:
+      reads : [ea.node, ea.env, ea.src]
+      calls : [eval_ast_env, env_lookup]
+    termination:
+      bound : 4000
+
+
+-- build_env's input: the remaining binding list, the env built so far, and the
+-- source text (each binding's RHS is evaluated against env_so_far, and AstVar
+-- references in it resolve via src).
+concept BuildEnvArg
+  @intention: "Remaining bindings + the env built so far + the source text"
+  @source: vexprparse.intent:29
+  fields:
+    binds : Binding
+    env : Env
+    src : text [..256]
+
+
+-- build_env: fold the binding list (in source order) into an Env. For each
+-- BCons, evaluate the binding's RHS Ast against the env built SO FAR (so a later
+-- binding can reference an earlier one — `let x = 1` then `let y = x + 1` makes y
+-- see x = 1), then cons (name span, computed value) onto the FRONT of the env and
+-- recurse on the rest with the extended env. BNil returns the accumulated env
+-- unchanged. Consing on the front means env_lookup finds the most-recent binding
+-- first, which gives last-binding-wins shadowing. Bound-only termination + the
+-- native recursion breadcrumb (packed input; the shrinking binding tail is a
+-- field, not the input — see the header).
+rule build_env
+  @intention: "Fold a binding list into an environment, evaluating each RHS against the env so far"
+  @source: vexprparse.intent:29
+  input:
+    ba : BuildEnvArg
+  output:
+    out : Env
+  logic:
+    out = match ba.binds:
+      BCons(name_start, name_len, value, rest) => build_env(BuildEnvArg { binds: rest, env: Env::ECons { name_start: name_start, name_len: name_len, val: eval_ast_env(EvalEnvArg { node: value, env: ba.env, src: ba.src }), rest: ba.env }, src: ba.src })
+      BNil => ba.env
+  proofs:
+    purity:
+      reads : [ba.binds, ba.env, ba.src]
+      calls : [build_env, eval_ast_env]
+    termination:
+      bound : 4000
+
+
+-- eval_block: the brick-10 money-shot driver. Tokenize the block-body source
+-- (column-0 lines) with indentation, parse a statement block from index 0, build
+-- the environment from its bindings (in order, each RHS resolved against the env
+-- so far), then evaluate the block's final out-expression against that env. The
+-- result is a real NUMBER — a let-block interpreter written in Verbose.
+--
+--   eval_block("let x = 1\nlet y = x + 1\nout = y") = 2
+--
+-- NATIVE-ONLY for newline-bearing sources (the interpreter's JSON reader does not
+-- decode \n into a real byte 10 — see count_cells_src). Single-line, zero-binding
+-- sources (e.g. "out = 2 + 3 * 4" — but a bare expression like "2 + 3 * 4" also
+-- works: parse_stmts treats the leading non-`let` token as the out_stmt's IDENT
+-- and parses the value from headp+2, so a single expression with no `name =`
+-- prefix lands as the result with an empty binding list) cross-check native vs
+-- interpreter. eval_block takes a ScanState (source + pos) like eval_expr, so the
+-- source is argv arg 1 and pos is argv arg 2 (always 0).
+rule eval_block
+  @intention: "Tokenize, parse, build the environment, and evaluate a let-block to a number"
+  @source: vexprparse.intent:29
+  input:
+    s : ScanState
+  output:
+    out : number
+  logic:
+    let toks = begin_tokenize(ScanState { source: s.source, pos: 0 })
+    let pb = parse_block(ParseState { toks: toks, pos: 0 })
+    let blk = pb_block(pb)
+    let binds = block_binds(blk)
+    let result = block_result(blk)
+    let env = build_env(BuildEnvArg { binds: binds, env: Env::ENil, src: s.source })
+    out = eval_ast_env(EvalEnvArg { node: result, env: env, src: s.source })
+  proofs:
+    purity:
+      reads : [s.source]
+      calls : [begin_tokenize, parse_block, pb_block, block_binds, block_result, build_env, eval_ast_env]
     termination:
       bound : 256
 
