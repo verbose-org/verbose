@@ -4330,6 +4330,343 @@ rule eval_nth_rule
       bound : 256
 
 
+-- ============================================================================
+-- BRICK 13: a LINTER in Verbose — detect undefined-variable references. This is
+-- the FIRST static analysis written in Verbose that consumes a parsed Verbose
+-- program (brick 12's RuleList) and reports a diagnostic count. It turns the
+-- parser front end into a TOOL: lint_program(source) = the total number of
+-- undefined-variable references across every rule in the program. 0 = clean.
+--
+-- THE LINT. For each rule, every variable referenced in the rule's body (the
+-- `out =` result expression AND every let-binding's RHS) must be bound by a
+-- `let` in that same rule. A reference is an AstVar(start, len); it is DEFINED
+-- iff its source span byte-equals SOME binding name in the rule's `binds` list.
+-- An AstVar whose name matches no binding name is a LINT ERROR.
+--
+-- SCOPING RULE CHOSEN (the SIMPLE, whole-rule rule). A variable is defined iff
+-- it appears as ANY binding name in the rule's `binds` list — the WHOLE rule's
+-- bindings are treated as mutually in scope. So in
+--     let x = 1
+--     out = x + y
+-- x is defined, y is undefined -> 1 error. This deliberately ignores let-order
+-- (it does not flag use-before-def within a let RHS): it is a SOUND
+-- over-approximation of "defined somewhere in the rule". Order-sensitivity
+-- (a let RHS sees only EARLIER lets) is a later refinement, not built here.
+-- Documented trade-off: the simple rule never reports a false UNDEF (every
+-- name that IS a binding is accepted), but it does not catch forward references.
+--
+-- WHAT COUNTS AS A VARIABLE REFERENCE (and what does NOT):
+--   * AstVar(start, len) is the only variable reference. It is checked.
+--   * AstCall callee names are RULE names, not variables — IGNORED. Only the
+--     call's ARGUMENT expressions (its ArgList) are walked for AstVar refs.
+--   * AstField field names (the .b in a.b) are RECORD field names, not
+--     variables — IGNORED. Only the field-access BASE expression is walked
+--     (so the `a` in a.b IS checked as an AstVar, the `.b` is not).
+--   * AstStr / AstBool / AstNum / AstErr carry no variable reference -> 0.
+--
+-- NATIVE-ONLY (multi-line program source, as in bricks 10/12): the interpreter's
+-- JSON reader does not decode \n into a real byte 10. The lint drivers take a
+-- ScanState (source + pos) so the source is argv arg 1 and pos is argv arg 2
+-- (always 0). The supporting structural rules (name_bound, count_undef_binds,
+-- the program fold) ARE cross-checkable on hand-built inputs, but the headline
+-- driver runs on multi-line source and is native-only.
+--
+-- RECURSION SHAPES.
+-- ALL FIVE recursive lint rules pack the cons-list (Binding / ArgList / RuleList)
+-- as a FIELD of their input concept (so they can carry the scope + src alongside),
+-- so they recurse over a field, NOT over the input itself. Phase C's structural
+-- proof requires the input to BE the group cons-list (structural_param ==
+-- input_name); a field-borne list does not fit. They therefore use bound + the
+-- mandatory native recursion breadcrumb — exactly like env_lookup / build_env /
+-- eval_ast_env, which recurse over a field-borne Env / Binding / Ast for the same
+-- reason. The shrinking is real (each step recurses on the list tail), just not
+-- expressible as a structural FIELD proof.
+--   * name_bound      — walks the Binding cons-list, returns 1/0 membership.
+--                       Mirrors env_lookup's byte compare (length-guard then
+--                       name_eq) but yields presence, not value.
+--   * count_undef_ast — walks an Ast (a FIELD of the packed input, like
+--                       eval_ast_env). Mutually recursive with count_undef_args
+--                       (over ArgList).
+--   * count_undef_binds — walks the Binding cons-list (the bindings being
+--                       iterated), checking each binding's RHS against the WHOLE
+--                       rule's scope.
+--   * lint_list       — walks the RuleList tail (like rule_list_len, but over a
+--                       field, so bound + breadcrumb not structural).
+-- ============================================================================
+
+-- name_bound's probe: the Binding list to search + the source text + the query
+-- name's span (q_start, q_len). The membership analogue of EnvLookState.
+concept NameBoundState
+  @intention: "A binding list to search + the source text + the query name's span"
+  @source: vexprparse.intent:32
+  fields:
+    binds : Binding
+    src : text [..256]
+    q_start : number [0, 256]
+    q_len : number [0, 256]
+
+
+-- name_bound: 1 iff the query span byte-equals some binding NAME in the list, 0
+-- otherwise. Walks the Binding cons-list; at each BCons it checks the binding
+-- name's LENGTH equals the query length AND the bytes match (name_eq); on a match
+-- it returns 1, otherwise it recurses into `rest`. BNil (end of list) returns 0
+-- (not found). Mirrors env_lookup's structure but returns presence (1/0) — the
+-- distinct found/not-found a lint needs, where env_lookup's 0 is ambiguous (an
+-- unbound var and a var bound to 0 both look like 0). Recurses over the binding
+-- tail, which is a FIELD of the input (not the input), so bound + breadcrumb,
+-- like env_lookup (the structural proof needs the input to BE the cons-list).
+rule name_bound
+  @intention: "1 if a name span matches some binding name in the list, 0 otherwise"
+  @source: vexprparse.intent:32
+  input:
+    st : NameBoundState
+  output:
+    out : number
+  logic:
+    out = match st.binds:
+      BCons(name_start, name_len, value, rest) => if name_len == st.q_len and name_eq(NameEqState { src: st.src, a_start: name_start, b_start: st.q_start, len: name_len, off: 0 }) == 1 then 1 else name_bound(NameBoundState { binds: rest, src: st.src, q_start: st.q_start, q_len: st.q_len })
+      BNil => 0
+  proofs:
+    purity:
+      reads : [st.binds, st.src, st.q_start, st.q_len]
+      calls : [name_eq, name_bound]
+    termination:
+      bound : 4000
+
+
+-- count_undef_args's input: the argument list to walk + the rule's binding list
+-- (the SCOPE every AstVar is checked against) + the source text.
+concept UndefArgsState
+  @intention: "A call-argument list + the rule's bindings (scope) + the source text"
+  @source: vexprparse.intent:32
+  fields:
+    args : ArgList
+    binds : Binding
+    src : text [..256]
+
+
+-- The Ast-walking input: the AST node + the rule's binding list (scope) + src.
+-- Carries a group field (node : Ast) AND a text field (src) — the 2b052a7 shape,
+-- same as EvalEnvArg. The node is a FIELD of the packed input (not the input
+-- itself), so the recursion uses bound + breadcrumb, not a structural FIELD proof.
+concept UndefAstState
+  @intention: "An Ast node + the rule's bindings (scope) + the source text"
+  @source: vexprparse.intent:32
+  fields:
+    node : Ast
+    binds : Binding
+    src : text [..256]
+
+
+-- count_undef_args: sum count_undef_ast over every argument of a call's ArgList.
+-- Mutually recursive with count_undef_ast (a call's arguments are themselves Asts
+-- that may contain variable references). Recurses over the ArgList tail (a field
+-- of the input), so bound + breadcrumb. Threads the same binds (scope) + src down.
+rule count_undef_args
+  @intention: "Total undefined-variable references across every argument of a call"
+  @source: vexprparse.intent:32
+  input:
+    a : UndefArgsState
+  output:
+    out : number
+  logic:
+    out = match a.args:
+      ArgCons(head, tail) => count_undef_ast(UndefAstState { node: head, binds: a.binds, src: a.src }) + count_undef_args(UndefArgsState { args: tail, binds: a.binds, src: a.src })
+      ArgNil => 0
+  proofs:
+    purity:
+      reads : [a.args, a.binds, a.src]
+      calls : [count_undef_ast, count_undef_args]
+    termination:
+      bound : 4000
+
+
+-- count_undef_ast: walk an Ast and count the AstVar references whose name is NOT
+-- name_bound in the rule's scope. Mirrors shape_ast's structural walk, but each
+-- node contributes its UNDEFINED-variable count instead of a shape signature:
+--   * AstVar(start, len) => 1 if name_bound == 0 (undefined), else 0.
+--   * AstBin sums lhs + rhs; AstNeg / AstNot descend into the single child;
+--     AstIf sums cond + thn + els.
+--   * AstCall walks its ARGUMENT list (count_undef_args). The callee name is a
+--     RULE name, not a variable — it is NOT checked (see the brick header).
+--   * AstField walks its BASE expression. The field name (.b) is a record field
+--     name, not a variable — it is NOT checked (only the `a` in a.b counts).
+--   * AstNum / AstStr / AstBool / AstErr carry no reference -> 0.
+-- Every recursive call threads the same binds (scope) + src. Like eval_ast_env,
+-- the recursion walks a strict sub-node of a.node, but a.node is a FIELD of the
+-- packed input (not the input), so the structural proof does not fit — this
+-- carries the bound + the mandatory native recursion breadcrumb.
+rule count_undef_ast
+  @intention: "Total undefined-variable references in an AST, given the rule's binding scope"
+  @source: vexprparse.intent:32
+  input:
+    a : UndefAstState
+  output:
+    out : number
+  logic:
+    out = match a.node:
+      AstNum(value) => 0
+      AstBin(op, lhs, rhs) => count_undef_ast(UndefAstState { node: lhs, binds: a.binds, src: a.src }) + count_undef_ast(UndefAstState { node: rhs, binds: a.binds, src: a.src })
+      AstNeg(inner) => count_undef_ast(UndefAstState { node: inner, binds: a.binds, src: a.src })
+      AstNot(inner) => count_undef_ast(UndefAstState { node: inner, binds: a.binds, src: a.src })
+      AstVar(start, len) => if name_bound(NameBoundState { binds: a.binds, src: a.src, q_start: start, q_len: len }) == 0 then 1 else 0
+      AstField(base, fstart, flen) => count_undef_ast(UndefAstState { node: base, binds: a.binds, src: a.src })
+      AstCall(callee_start, callee_len, args) => count_undef_args(UndefArgsState { args: args, binds: a.binds, src: a.src })
+      AstIf(cond, thn, els) => count_undef_ast(UndefAstState { node: cond, binds: a.binds, src: a.src }) + count_undef_ast(UndefAstState { node: thn, binds: a.binds, src: a.src }) + count_undef_ast(UndefAstState { node: els, binds: a.binds, src: a.src })
+      AstBool(value) => 0
+      AstStr(start, len) => 0
+      AstErr => 0
+  proofs:
+    purity:
+      reads : [a.node, a.binds, a.src]
+      calls : [count_undef_ast, count_undef_args, name_bound]
+    termination:
+      bound : 4000
+
+
+-- count_undef_binds's input: the binding list being ITERATED (each binding's RHS
+-- is lint-checked), the rule's FULL binding list (the scope every AstVar is
+-- checked against — under the whole-rule rule, every binding name is in scope for
+-- every RHS), and the source text. `iter` shrinks each step; `scope` stays fixed.
+concept UndefBindsState
+  @intention: "The bindings being iterated + the rule's full binding scope + the source text"
+  @source: vexprparse.intent:32
+  fields:
+    iter : Binding
+    scope : Binding
+    src : text [..256]
+
+
+-- count_undef_binds: for each binding in `iter`, count_undef_ast on its RHS
+-- `value` against the rule's `scope`, summed over the list. A `let y = z + 1`
+-- with undefined z is an error too — this is what walks the let RHSes (the
+-- result expression is walked separately by lint_rule). Recurses over the
+-- iterated binding tail (a field of the input), so bound + breadcrumb; the fixed
+-- `scope` and `src` are threaded unchanged.
+rule count_undef_binds
+  @intention: "Total undefined-variable references across every binding's RHS expression"
+  @source: vexprparse.intent:32
+  input:
+    b : UndefBindsState
+  output:
+    out : number
+  logic:
+    out = match b.iter:
+      BCons(name_start, name_len, value, rest) => count_undef_ast(UndefAstState { node: value, binds: b.scope, src: b.src }) + count_undef_binds(UndefBindsState { iter: rest, scope: b.scope, src: b.src })
+      BNil => 0
+  proofs:
+    purity:
+      reads : [b.iter, b.scope, b.src]
+      calls : [count_undef_ast, count_undef_binds]
+    termination:
+      bound : 4000
+
+
+-- lint_rule's input: one rule declaration + the program source text (the spans
+-- index into it). RuleDecl carries no src of its own, so the program source is
+-- threaded alongside.
+concept LintRuleState
+  @intention: "A rule declaration + the program source text"
+  @source: vexprparse.intent:32
+  fields:
+    rd : RuleDecl
+    src : text [..256]
+
+
+-- lint_rule: the undefined-variable count for ONE rule. Take the rule's body
+-- Block, split it into its binding list and result expression, then sum:
+--   * count_undef_binds over the bindings (every let RHS, scoped to the rule's
+--     whole binding list), PLUS
+--   * count_undef_ast over the result expression (scoped to the same binds).
+-- 0 = the rule is clean (every variable it references is bound by one of its own
+-- lets). Per-rule scope: a rule's bindings are NOT visible to any other rule —
+-- block_binds(body) is this rule's binding list and nothing else.
+rule lint_rule
+  @intention: "Number of undefined-variable references in one rule (0 if clean)"
+  @source: vexprparse.intent:32
+  input:
+    lr : LintRuleState
+  output:
+    out : number
+  logic:
+    let body = rd_body(lr.rd)
+    let binds = block_binds(body)
+    let result = block_result(body)
+    let undef_in_binds = count_undef_binds(UndefBindsState { iter: binds, scope: binds, src: lr.src })
+    out = undef_in_binds + count_undef_ast(UndefAstState { node: result, binds: binds, src: lr.src })
+  proofs:
+    purity:
+      reads : [lr.rd, lr.src]
+      calls : [rd_body, block_binds, block_result, count_undef_binds, count_undef_ast]
+    termination:
+      bound : 16
+
+
+-- lint_list's input: the rule list being folded + the program source text.
+concept LintListState
+  @intention: "A rule list + the program source text"
+  @source: vexprparse.intent:32
+  fields:
+    rl : RuleList
+    src : text [..256]
+
+
+-- lint_list: sum lint_rule over every rule in the program. Recurses over the
+-- RuleList tail (a field of the input), so bound + breadcrumb; the program source is
+-- threaded unchanged so every rule's spans resolve against the same buffer. This
+-- is the per-rule scoping check made whole: each rule contributes only its OWN
+-- undefined references, because lint_rule reads only that rule's own bindings.
+rule lint_list
+  @intention: "Total undefined-variable references across every rule in a program"
+  @source: vexprparse.intent:32
+  input:
+    ll : LintListState
+  output:
+    out : number
+  logic:
+    out = match ll.rl:
+      RCons(head, tail) => lint_rule(LintRuleState { rd: head, src: ll.src }) + lint_list(LintListState { rl: tail, src: ll.src })
+      RNil => 0
+  proofs:
+    purity:
+      reads : [ll.rl, ll.src]
+      calls : [lint_rule, lint_list]
+    termination:
+      bound : 4000
+
+
+-- lint_program: the brick-13 money-shot driver. Tokenize the program source (with
+-- indentation), parse the whole rule-decl sequence, and fold lint_rule over it,
+-- returning the TOTAL number of undefined-variable references in the program.
+-- 0 = the whole program is clean — a real static check written in Verbose, run
+-- as native machine code over a parsed Verbose program.
+--
+--   lint_program("rule f\n  logic:\n    let x = 5\n    out = x + 1") = 0   (x defined)
+--   lint_program("rule f\n  logic:\n    let x = 5\n    out = x + y") = 1   (y undefined)
+--   lint_program("rule f\n  logic:\n    let x = 1\n    out = x\nrule g\n  logic:\n    out = w") = 1
+--                                                  (only g's w; f is clean — per-rule scope)
+--
+-- NATIVE-ONLY (multi-line source). Takes a ScanState (source + pos) so the source
+-- is argv arg 1 and pos is argv arg 2 (always 0).
+rule lint_program
+  @intention: "Tokenize, parse, and count all undefined-variable references in a program"
+  @source: vexprparse.intent:32
+  input:
+    s : ScanState
+  output:
+    out : number
+  logic:
+    let toks = begin_tokenize(ScanState { source: s.source, pos: 0 })
+    let prog = parse_program(ProgramState { toks: toks, src: s.source, pos: 0 })
+    out = lint_list(LintListState { rl: prog, src: s.source })
+  proofs:
+    purity:
+      reads : [s.source]
+      calls : [begin_tokenize, parse_program, lint_list]
+    termination:
+      bound : 256
+
+
 -- Entry driver: tokenize the source (from argv) and count the cons cells. The
 -- money-shot observable for brick 8a: count_cells_src("1 + 2\n3 * 4") = 8
 -- (tokens 1 + 2 Newline 3 * 4 then trailing Eof). Newline-bearing sources are

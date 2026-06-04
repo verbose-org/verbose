@@ -395,3 +395,62 @@ there (out of the arithmetic evaluator's scope).
     source plus n as two arguments. The money shot: a two-rule program whose
     bodies compute 5 and 8 parses to a length-2 program list whose first and
     second declarations evaluate to exactly 5 and 8.
+
+32. A LINTER written in Verbose = a static check that consumes a parsed program
+    (item 31) and reports a diagnostic count. This turns the parser front end
+    into a TOOL: the headline driver returns the total number of undefined-
+    variable references across every rule in the program (0 = clean). It does
+    not evaluate anything — it analyzes the parsed AST shape.
+
+    THE LINT: undefined variable references. For each rule, every variable
+    referenced in its body — the `out =` result expression AND every let-
+    binding's right-hand side — must be bound by a `let` in that same rule. A
+    reference is an AST variable node (a name span); it is DEFINED iff that span
+    is byte-equal to SOME binding name in the rule's binding list. A variable
+    that matches no binding name is a lint error, counted once per occurrence.
+
+    SCOPING RULE (the simple, whole-rule rule). A variable is defined iff it
+    appears as ANY binding name in the rule's binding list — all of a rule's
+    lets are treated as mutually in scope. So `let x = 1 / out = x + y` reports
+    one error (y), and `let x = 1 / let y = x + 1 / out = y` reports zero (x is
+    in scope for y's RHS). This deliberately ignores let-order: it is a sound
+    over-approximation of "defined somewhere in the rule" and never raises a
+    false positive on a name that is genuinely a binding; it simply does not
+    catch use-before-definition within a let RHS. Order-sensitivity (a let RHS
+    sees only earlier lets) is a later refinement, not built here.
+
+    WHAT IS A VARIABLE (and what is not). Only an AST variable node counts. A
+    call's callee name is a RULE name, not a variable — ignored; only the call's
+    ARGUMENT expressions are walked. A field-access field name (the `.b` in a.b)
+    is a record field name, not a variable — ignored; only the field-access BASE
+    (`a`) is walked. Numbers, strings, booleans, and error nodes carry no
+    reference.
+
+    PER-RULE SCOPE. Each rule contributes only its own undefined references,
+    because the check reads only that rule's own binding list — one rule's lets
+    are never visible to another rule. A two-rule program where the first rule
+    uses its own `let` and the second references an unbound name reports exactly
+    one error (the second rule's), proving rule scopes do not leak.
+
+    The membership probe walks the binding list comparing each binding name's
+    span (length guard, then byte compare) against the queried name. The AST
+    walker mirrors the structural-signature walker (item 23) but contributes
+    each variable's undefined count instead of a shape band, descending into
+    both children of a binary node, the single child of a negation/logical-not,
+    all three sub-expressions of a conditional, the argument list of a call, and
+    the base of a field access. The binding walker checks every let RHS against
+    the rule scope; the rule check sums RHS errors plus result errors; the
+    program fold sums over the rule list. Because every recursive lint rule
+    packs its cons-list as a FIELD of its input (so it can carry the scope and
+    source text alongside), it recurses over a field rather than over the input
+    itself, so it uses the bound + recursion breadcrumb form (item 29's
+    env-walker shape), not the structural FIELD proof (item 31's length form,
+    which needs the input to BE the cons-list).
+
+    NATIVE-ONLY (multi-line program source, as in items 30/31): the headline
+    driver takes a scan state (source + position) so the source is the first
+    argument and the position is the second (always 0). The money shot: a two-
+    rule program whose second rule references an undefined `w` lints to exactly
+    1 (and the first rule, which uses its own `let x`, is clean) — a real static
+    check written in Verbose, run as native machine code over a parsed Verbose
+    program.
