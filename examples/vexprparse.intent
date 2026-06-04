@@ -409,15 +409,15 @@ there (out of the arithmetic evaluator's scope).
     is byte-equal to SOME binding name in the rule's binding list. A variable
     that matches no binding name is a lint error, counted once per occurrence.
 
-    SCOPING RULE (the simple, whole-rule rule). A variable is defined iff it
-    appears as ANY binding name in the rule's binding list — all of a rule's
-    lets are treated as mutually in scope. So `let x = 1 / out = x + y` reports
-    one error (y), and `let x = 1 / let y = x + 1 / out = y` reports zero (x is
-    in scope for y's RHS). This deliberately ignores let-order: it is a sound
-    over-approximation of "defined somewhere in the rule" and never raises a
-    false positive on a name that is genuinely a binding; it simply does not
-    catch use-before-definition within a let RHS. Order-sensitivity (a let RHS
-    sees only earlier lets) is a later refinement, not built here.
+    SCOPING RULE (whole-rule — the brick-13 baseline, refined in item 33). The
+    first version treats a variable as defined iff it appears as ANY binding name
+    in the rule's binding list — all of a rule's lets mutually in scope. So
+    `let x = 1 / out = x + y` reports one error (y), and `let x = 1 / let y = x +
+    1 / out = y` reports zero (x is in scope for y's RHS). This deliberately
+    ignores let-order: a sound over-approximation of "defined somewhere in the
+    rule" that never raises a false positive on a genuine binding, but does NOT
+    catch use-before-definition within a let RHS. Item 33 refines exactly this:
+    a let RHS sees only EARLIER lets.
 
     WHAT IS A VARIABLE (and what is not). Only an AST variable node counts. A
     call's callee name is a RULE name, not a variable — ignored; only the call's
@@ -454,3 +454,33 @@ there (out of the arithmetic evaluator's scope).
     1 (and the first rule, which uses its own `let x`, is clean) — a real static
     check written in Verbose, run as native machine code over a parsed Verbose
     program.
+
+33. USE-BEFORE-DEF refinement of the linter (item 32). Sharpen the whole-rule
+    scoping into proper let-ordering: a let binding's right-hand side may only
+    reference bindings that appear EARLIER in the source order (and not itself),
+    while the `out =` result expression still sees ALL of the rule's lets. So
+    `let a = b + 1 / let b = 2 / out = a` now reports one error — a's RHS uses b
+    before b is defined — where the whole-rule baseline (item 32) reported zero.
+    A self-reference `let x = x + 1` reports one error: x is not yet in scope for
+    its own RHS. A legitimate later reference `let x = 1 / let y = x + 1 / out =
+    y` stays zero, because x is earlier than y. The result expression is
+    unaffected: `let p = 1 / let q = 2 / out = p + q` stays zero (the result
+    legitimately sees every binding).
+
+    HOW THE SCOPE IS THREADED. Instead of checking every let RHS against the
+    whole binding list, the binding walker threads a PREFIX — the set of bindings
+    already seen earlier in the list. At each binding it checks the RHS against
+    the prefix ONLY, then recurses on the tail with the prefix extended by THIS
+    binding. Because membership is order-agnostic (the probe asks "is this name
+    one of the earlier binding names", not "where"), the prefix is built by
+    consing the current binding onto the front of the accumulated prefix — that
+    front-consed list is exactly the set of earlier bindings. The walk seeds the
+    prefix empty. A self-reference is caught for free: the current binding is
+    consed onto the prefix only when descending into the tail, AFTER its own RHS
+    has been checked against a prefix that does not yet contain it.
+
+    The money shot: `let a = b + 1 / let b = 2 / out = a` lints to 1
+    (use-before-def caught) while `let x = 1 / let y = x + 1 / out = y` stays 0
+    (proper let-ordering) — order-sensitive scope analysis, written in Verbose,
+    run as native machine code. NATIVE-ONLY (multi-line source), same scan-state
+    invocation as items 31/32.

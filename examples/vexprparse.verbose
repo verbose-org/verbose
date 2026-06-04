@@ -4367,8 +4367,9 @@ rule eval_nth_rule
 -- NATIVE-ONLY (multi-line program source, as in bricks 10/12): the interpreter's
 -- JSON reader does not decode \n into a real byte 10. The lint drivers take a
 -- ScanState (source + pos) so the source is argv arg 1 and pos is argv arg 2
--- (always 0). The supporting structural rules (name_bound, count_undef_binds,
--- the program fold) ARE cross-checkable on hand-built inputs, but the headline
+-- (always 0). The supporting structural rules (name_bound,
+-- count_undef_binds_ordered, the program fold) ARE cross-checkable on hand-built
+-- inputs, but the headline
 -- driver runs on multi-line source and is native-only.
 --
 -- RECURSION SHAPES.
@@ -4387,9 +4388,10 @@ rule eval_nth_rule
 --   * count_undef_ast — walks an Ast (a FIELD of the packed input, like
 --                       eval_ast_env). Mutually recursive with count_undef_args
 --                       (over ArgList).
---   * count_undef_binds — walks the Binding cons-list (the bindings being
---                       iterated), checking each binding's RHS against the WHOLE
---                       rule's scope.
+--   * count_undef_binds_ordered — walks the Binding cons-list (the bindings being
+--                       iterated), checking each binding's RHS against the PREFIX
+--                       of earlier bindings only (proper let-ordering — catches
+--                       use-before-def and self-reference).
 --   * lint_list       — walks the RuleList tail (like rule_list_len, but over a
 --                       field, so bound + breadcrumb not structural).
 -- ============================================================================
@@ -4524,40 +4526,57 @@ rule count_undef_ast
       bound : 4000
 
 
--- count_undef_binds's input: the binding list being ITERATED (each binding's RHS
--- is lint-checked), the rule's FULL binding list (the scope every AstVar is
--- checked against — under the whole-rule rule, every binding name is in scope for
--- every RHS), and the source text. `iter` shrinks each step; `scope` stays fixed.
-concept UndefBindsState
-  @intention: "The bindings being iterated + the rule's full binding scope + the source text"
+-- count_undef_binds_ordered's input: the binding list being ITERATED (each
+-- binding's RHS is lint-checked) + the PREFIX of bindings already seen earlier in
+-- source order (the only scope a RHS may legitimately reference) + the source
+-- text. `iter` shrinks each step; `prefix` GROWS each step (front-consed). This is
+-- the brick-14 refinement of brick-13's UndefBindsState: brick-13 checked every
+-- RHS against the WHOLE binding list (`scope`), which silently accepted
+-- use-before-def. Here each RHS is checked against `prefix` (earlier lets only).
+concept UndefBindsOrderedState
+  @intention: "The bindings being iterated + the prefix of earlier bindings + the source text"
   @source: vexprparse.intent:32
   fields:
     iter : Binding
-    scope : Binding
+    prefix : Binding
     src : text [..256]
 
 
--- count_undef_binds: for each binding in `iter`, count_undef_ast on its RHS
--- `value` against the rule's `scope`, summed over the list. A `let y = z + 1`
--- with undefined z is an error too — this is what walks the let RHSes (the
--- result expression is walked separately by lint_rule). Recurses over the
--- iterated binding tail (a field of the input), so bound + breadcrumb; the fixed
--- `scope` and `src` are threaded unchanged.
-rule count_undef_binds
-  @intention: "Total undefined-variable references across every binding's RHS expression"
+-- count_undef_binds_ordered: for each binding in `iter`, count_undef_ast on its
+-- RHS `value` against `prefix` ONLY (the bindings that appear EARLIER in the
+-- list), then recurse on `rest` with `prefix` EXTENDED by THIS binding. Because
+-- name_bound checks membership (order-agnostic), the prefix can be built by
+-- front-consing the current binding onto `prefix` — that yields exactly the SET of
+-- earlier bindings, which is all name_bound needs. lint_rule seeds the walk with
+-- `prefix = BNil`.
+--
+-- This catches USE-BEFORE-DEF that brick-13 missed: `let a = b + 1\nlet b = 2`
+-- now flags `b` in a's RHS because `b` is NOT yet in the prefix when a is checked
+-- (b is only consed onto the prefix when descending into `rest`, AFTER a's RHS is
+-- checked). A SELF-REFERENCE `let x = x + 1` is also flagged: `x` is added to the
+-- prefix only on the recursion into `rest`, so x's OWN RHS is checked against a
+-- prefix that does NOT contain x -> x is unbound -> counted. A legitimate
+-- later-let reference (`let y = x + 1` with x earlier) stays 0 because x is in the
+-- prefix by the time y is checked. The final `result` expression still sees ALL
+-- bindings (lint_rule passes the full list there, unchanged).
+--
+-- Recurses over the iterated binding tail (a field of the input), so bound +
+-- breadcrumb; `prefix` is rebuilt and `src` threaded unchanged.
+rule count_undef_binds_ordered
+  @intention: "Undefined-OR-use-before-def references across every binding's RHS (earlier-only scope)"
   @source: vexprparse.intent:32
   input:
-    b : UndefBindsState
+    b : UndefBindsOrderedState
   output:
     out : number
   logic:
     out = match b.iter:
-      BCons(name_start, name_len, value, rest) => count_undef_ast(UndefAstState { node: value, binds: b.scope, src: b.src }) + count_undef_binds(UndefBindsState { iter: rest, scope: b.scope, src: b.src })
+      BCons(name_start, name_len, value, rest) => count_undef_ast(UndefAstState { node: value, binds: b.prefix, src: b.src }) + count_undef_binds_ordered(UndefBindsOrderedState { iter: rest, prefix: Binding::BCons { name_start: name_start, name_len: name_len, value: value, rest: b.prefix }, src: b.src })
       BNil => 0
   proofs:
     purity:
-      reads : [b.iter, b.scope, b.src]
-      calls : [count_undef_ast, count_undef_binds]
+      reads : [b.iter, b.prefix, b.src]
+      calls : [count_undef_ast, count_undef_binds_ordered]
     termination:
       bound : 4000
 
@@ -4573,16 +4592,20 @@ concept LintRuleState
     src : text [..256]
 
 
--- lint_rule: the undefined-variable count for ONE rule. Take the rule's body
--- Block, split it into its binding list and result expression, then sum:
---   * count_undef_binds over the bindings (every let RHS, scoped to the rule's
---     whole binding list), PLUS
---   * count_undef_ast over the result expression (scoped to the same binds).
--- 0 = the rule is clean (every variable it references is bound by one of its own
--- lets). Per-rule scope: a rule's bindings are NOT visible to any other rule —
--- block_binds(body) is this rule's binding list and nothing else.
+-- lint_rule: the undefined-OR-use-before-def count for ONE rule. Take the rule's
+-- body Block, split it into its binding list and result expression, then sum:
+--   * count_undef_binds_ordered over the bindings, seeded with prefix = BNil so
+--     each let's RHS is scoped to the lets that appear EARLIER (proper
+--     let-ordering: a forward or self reference in a let RHS is flagged), PLUS
+--   * count_undef_ast over the result expression, scoped to the FULL binding list
+--     (the result legitimately sees every let in the rule).
+-- 0 = the rule is clean (every variable it references is bound by an earlier let,
+-- or by any let for the result). Per-rule scope: a rule's bindings are NOT visible
+-- to any other rule — block_binds(body) is this rule's binding list and nothing
+-- else. Brick-14 refinement of brick-13: the bindings part now threads a growing
+-- prefix instead of the whole list, so use-before-def is caught.
 rule lint_rule
-  @intention: "Number of undefined-variable references in one rule (0 if clean)"
+  @intention: "Number of undefined-OR-use-before-def references in one rule (0 if clean)"
   @source: vexprparse.intent:32
   input:
     lr : LintRuleState
@@ -4592,12 +4615,12 @@ rule lint_rule
     let body = rd_body(lr.rd)
     let binds = block_binds(body)
     let result = block_result(body)
-    let undef_in_binds = count_undef_binds(UndefBindsState { iter: binds, scope: binds, src: lr.src })
+    let undef_in_binds = count_undef_binds_ordered(UndefBindsOrderedState { iter: binds, prefix: Binding::BNil, src: lr.src })
     out = undef_in_binds + count_undef_ast(UndefAstState { node: result, binds: binds, src: lr.src })
   proofs:
     purity:
       reads : [lr.rd, lr.src]
-      calls : [rd_body, block_binds, block_result, count_undef_binds, count_undef_ast]
+      calls : [rd_body, block_binds, block_result, count_undef_binds_ordered, count_undef_ast]
     termination:
       bound : 16
 
