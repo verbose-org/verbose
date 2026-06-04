@@ -355,3 +355,43 @@ there (out of the arithmetic evaluator's scope).
     the interpreter uses a JSON fixture whose string contains LITERAL newline
     bytes (the gap is only about backslash-n ESCAPES, which neither argv nor
     literal-byte JSON involve), and native equals interpreter for every input.
+
+31. Parse a whole PROGRAM = a SEQUENCE of top-level rule declarations. This lifts
+    the parser from ONE rule declaration (item 30) to a list of them, mirroring
+    the reference compiler's top-level item loop (parse a rule, push it, repeat
+    until end-of-input). The grammar is
+
+        program = rule_decl*
+
+    where each rule_decl is exactly item 30's shape. Consecutive declarations are
+    separated, in the token stream, by the line-boundary plus the one-or-more
+    DEDENT tokens that close the previous rule's logic body and rule body, after
+    which the next `rule` identifier appears at column 0. To walk a sequence the
+    parser must know where each declaration ENDS: the rule-decl parser is given a
+    position-returning form that takes a start index and returns both the parsed
+    declaration AND the token index just past its body (the body block's end
+    index, item 28's threaded `next`). The program loop then, from that end index,
+    skips ALL separator tokens — line-boundary, indent, AND dedent — to reach the
+    next significant token; item 28's separator-skipper stops at a dedent (inside
+    a block the dedent is the terminator), so the program level adds a wider
+    skipper that also crosses dedents (between two sibling rules the closing
+    dedents are mere noise). If that token's source span spells `rule` the loop
+    parses one declaration there and conses it onto the recursively-parsed rest
+    starting from its end index; otherwise (end-of-input or any non-`rule` token)
+    the program ends with the empty list. Each consing step advances the cursor by
+    at least a whole rule body, so the scan strictly approaches the finite end of
+    the token list.
+
+    A parsed program is a cons-list of rule declarations, the same shape as the
+    token list / binding list / environment, so the same structural-recursion
+    proof applies to its length. Two drivers validate it. The count driver returns
+    the list length, proving the program split into the right number of
+    declarations. The eval-nth driver takes the source plus an index n, drops the
+    first n declarations to land on the n-th, takes its body block, folds its
+    bindings into an environment, and evaluates the result — proving each
+    declaration parsed AND its body is intact and evaluable (the n-th rule's `out`
+    value). Both are NATIVE-ONLY (multi-line source, as in item 30): the count
+    driver takes the source as its single argument, the eval-nth driver takes the
+    source plus n as two arguments. The money shot: a two-rule program whose
+    bodies compute 5 and 8 parses to a length-2 program list whose first and
+    second declarations evaluate to exactly 5 and 8.

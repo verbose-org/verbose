@@ -324,6 +324,33 @@ concept_group VExpr [max_depth: 4096, max_nodes: 65535]
     variants:
       MkRule of (name_start : number, name_len : number, body : Block)
 
+  -- Brick 12: a parsed PROGRAM — a cons-list of top-level rule declarations in
+  -- source order. RCons carries one RuleDecl head and the rest; RNil is the empty
+  -- program (end-of-input). Same cons shape as TokenList / Binding / Env, so the
+  -- same arena machinery and the same structural-recursion proof apply. Mirrors
+  -- src/parser.rs's Program = Vec<Rule> restricted to rule-only items (no
+  -- concept / use / @attributes — those are later bricks).
+  concept RuleList
+    @intention: "A parsed program: a cons-list of top-level rule declarations"
+    @source: vexprparse.intent:31
+    variants:
+      RCons of (head : RuleDecl, tail : RuleList)
+      RNil
+
+  -- Brick 12: a rule-declaration parse result that THREADS its end position — the
+  -- RuleDecl built plus the token index just past its body (the same Parsed-
+  -- threading shape as ParsedBlock's MkPB). parse_rule_decl_pos returns this so
+  -- the program loop knows where one rule decl ends and can resume scanning for
+  -- the next `rule` keyword. `next` comes from the body block's pb_next (just past
+  -- the final out-expression); the trailing DEDENT(s) that close the logic + rule
+  -- bodies sit at/after `next` and are consumed by the program loop's separator
+  -- skip, not by the rule-decl parser.
+  concept ParsedRule
+    @intention: "A rule-decl parse result: the RuleDecl built plus its end token index"
+    @source: vexprparse.intent:31
+    variants:
+      MkPR of (rule : RuleDecl, next : number)
+
 
 -- ============================================================================
 -- Brick 2 reused verbatim: the tokenizer. (Copied so bricks 1-2 stay pristine;
@@ -3932,6 +3959,373 @@ rule rule_shape
     purity:
       reads : [a.source]
       calls : [begin_tokenize, parse_rule_decl, rd_name_len, rd_body, block_binds, block_result, count_binds, shape_binds, shape_ast]
+    termination:
+      bound : 256
+
+
+-- ============================================================================
+-- BRICK 12: parse a PROGRAM = a SEQUENCE of top-level rule declarations.
+--
+-- This lifts the parser from ONE rule decl (brick 11) to a whole (rule-only)
+-- program. The grammar:
+--
+--   program   = rule_decl*
+--   rule_decl = 'rule' IDENT Newline Indent 'logic' ':' Newline Indent <stmts> Dedent Dedent
+--
+-- TOKEN STREAM at a rule boundary (hand-traced for two rules whose bodies are at
+-- column 4, logic: at column 2, rule at column 0):
+--
+--   rule f          rule(0) f(1) Nl(2)
+--     logic:        Indent(3) logic(4) :(5) Nl(6)
+--       out = 2+3   Indent(7) out(8) =(9) 2(10) +(11) 3(12) Nl(13)
+--   rule g          Dedent(14) Dedent(15) rule(16) g(17) Nl(18)
+--     logic:        Indent(19) logic(20) :(21) Nl(22)
+--       ...         Indent(23) ... Nl  ...  Dedent Dedent Eof
+--
+-- So rule f's body parse (parse_stmts from idx 8) parses `out = 2 + 3` and STOPS
+-- at the Dedent(14) — its pb_next is 13 (just past the `3` at idx 12, before the
+-- Newline). Between that end position and the next `rule` keyword (idx 16) sit:
+-- Newline(13) Dedent(14) Dedent(15). The program loop must skip ALL of these
+-- (Newline + Indent + Dedent) to reach the next `rule`. skip_seps (brick 9) stops
+-- at a Dedent (it only skips Newline 600 / Indent 700), so brick 12 adds
+-- skip_seps_dedent, which ALSO skips Dedent 800 — landing on the next lexeme
+-- (`rule`) or the trailing Eof.
+--
+-- POSITION THREADING (option a). parse_rule_decl (brick 11) returns a RuleDecl
+-- but NOT where it stopped; to parse a sequence we need both. Brick 12 adds
+-- parse_rule_decl_pos, which takes a ProgramState (toks + src + a START position
+-- p) and returns a ParsedRule = MkPR(rule, next). It generalizes the brick-11
+-- offsets — which assumed the `rule` keyword sits at index 0 — to start at p:
+-- keyword at p, name at p+1, skip_seps from p+2 to `logic`, `:` at logic_idx+1,
+-- skip_seps from logic_idx+2 to the first body token, parse_stmts from there.
+-- `next` is the body block's pb_next. Brick 11's parse_rule_decl stays untouched
+-- (the p=0 special case) so its drivers (eval_rule_decl / rule_shape) do not
+-- regress.
+--
+-- VALIDATION DRIVERS:
+--   * count_rules(source)         = length of the parsed RuleList (the program
+--                                   split into the right number of rule decls).
+--   * eval_nth_rule(source, n)    = evaluate the body of the n-th rule decl
+--                                   (build_env + eval its Block result), proving
+--                                   each rule parsed AND its body is intact.
+-- Both NATIVE-ONLY (multi-line source — the interpreter's JSON reader does not
+-- decode \n; see count_cells_src).
+--
+-- Oracle: src/parser.rs's top-level item loop (parse a `rule`, push, repeat).
+-- ============================================================================
+
+-- The program-parse entry/cursor state: the whole token list, the source text
+-- (backs the byte recognition of the `rule` keyword), and the current scan index.
+-- A group field (toks) + a text field (src) + a number (pos) — the supported
+-- multi-field shape (same as RuleParseState plus a cursor).
+concept ProgramState
+  @intention: "The token list, source text, and current index, for parsing a program"
+  @source: vexprparse.intent:31
+  fields:
+    toks : TokenList
+    src : text [..256]
+    pos : number [0, 512]
+
+
+-- The eval-nth-rule driver state: a multi-line source plus the rule index n.
+concept EvalNthState
+  @intention: "A program source plus the index of the rule decl to evaluate"
+  @source: vexprparse.intent:31
+  fields:
+    source : text [..256]
+    n : number [0, 512]
+
+
+-- skip_seps_dedent: advance past any leading SEPARATOR token — Newline (600),
+-- Indent (700), OR Dedent (800) — starting at st.pos, returning the index of the
+-- first non-separator token (a lexeme such as `rule`, or the trailing Eof 0).
+-- Brick 9's skip_seps stops at a Dedent because INSIDE a block the Dedent is the
+-- block terminator; at the PROGRAM level the Dedents that close one rule's body
+-- are just noise between two sibling rule decls, so the program loop skips them
+-- too. Same forward-index recursion as skip_seps (strictly advancing toward the
+-- finite end of the token list); bound + the mandatory recursion breadcrumb (the
+-- backstop is the finite token-list length, bounded by max_nodes).
+rule skip_seps_dedent
+  @intention: "Index of the first non-separator token at/after pos (skips Newline/Indent/Dedent)"
+  @source: vexprparse.intent:31
+  input:
+    st : ParseState
+  output:
+    out : number
+  logic:
+    let knd = peek_kind(Nth { lst: st.toks, n: st.pos })
+    let issep = if knd == 600 then 1 else if knd == 700 then 1 else if knd == 800 then 1 else 0
+    out = if issep == 1 then skip_seps_dedent(ParseState { toks: st.toks, pos: st.pos + 1 }) else st.pos
+  proofs:
+    purity:
+      reads : [st.toks, st.pos]
+      calls : [peek_kind, skip_seps_dedent]
+    termination:
+      bound : 512
+
+
+-- Accessors for a ParsedRule (a block-form match is only legal in final position,
+-- so destructuring is factored into tiny rules — like pb_block / pb_next).
+rule pr_rule
+  @intention: "The RuleDecl from a rule-decl parse result"
+  @source: vexprparse.intent:31
+  input:
+    p : ParsedRule
+  output:
+    out : RuleDecl
+  logic:
+    out = match p:
+      MkPR(rule, next) => rule
+  proofs:
+    purity:
+      reads : [p]
+      calls : []
+    termination:
+      bound : 16
+
+
+rule pr_next
+  @intention: "The token index just past a rule-decl parse result"
+  @source: vexprparse.intent:31
+  input:
+    p : ParsedRule
+  output:
+    out : number
+  logic:
+    out = match p:
+      MkPR(rule, next) => next
+  proofs:
+    purity:
+      reads : [p]
+      calls : []
+    termination:
+      bound : 16
+
+
+-- parse_rule_decl_pos: parse ONE top-level rule declaration STARTING at ps.pos,
+-- returning a ParsedRule (the RuleDecl + the end index). The position-aware
+-- generalization of brick 11's parse_rule_decl: every fixed offset (0, 1, 2)
+-- becomes relative to the start position p = ps.pos.
+--   * the `rule` keyword is at index p, recognized by byte-comparing its span to
+--     "rule" (span_is_rule, reading ps.src).
+--   * the NAME is the Ident at p+1; its span is (peek_start p+1, peek_len p+1).
+--   * skip_seps from p+2 skips the Newline + the rule-body Indent, landing on the
+--     `logic` Ident, recognized by byte-comparing its span to "logic".
+--   * the `:` is at logic_idx+1; skip_seps from logic_idx+2 skips the Newline +
+--     the logic-body Indent, landing on the first body statement token.
+--   * parse_stmts parses the body block from there; it stops at the trailing
+--     Dedent/Eof, and pb_next is the index just past the body's final expression.
+-- FAIL-GRACEFUL like brick 11: when both byte checks pass the body is the parsed
+-- block, else an empty block (BNil result AstErr). `next` is always the body's
+-- pb_next, so the program loop advances even on a malformed header. One-shot
+-- (delegates body recursion to parse_stmts); bound-only termination.
+rule parse_rule_decl_pos
+  @intention: "Parse a `rule NAME` + `logic:` block starting at ps.pos into a RuleDecl + end index"
+  @source: vexprparse.intent:31
+  input:
+    ps : ProgramState
+  output:
+    out : ParsedRule
+  logic:
+    let kw_start = peek_start(Nth { lst: ps.toks, n: ps.pos })
+    let kw_len = peek_len(Nth { lst: ps.toks, n: ps.pos })
+    let is_rule = span_is_rule(SpanCheck { src: ps.src, start: kw_start, len: kw_len })
+    let name_start = peek_start(Nth { lst: ps.toks, n: ps.pos + 1 })
+    let name_len = peek_len(Nth { lst: ps.toks, n: ps.pos + 1 })
+    let logic_idx = skip_seps(ParseState { toks: ps.toks, pos: ps.pos + 2 })
+    let logic_start = peek_start(Nth { lst: ps.toks, n: logic_idx })
+    let logic_len = peek_len(Nth { lst: ps.toks, n: logic_idx })
+    let is_logic = span_is_logic(SpanCheck { src: ps.src, start: logic_start, len: logic_len })
+    let hdr_ok = if is_rule == 1 and is_logic == 1 then 1 else 0
+    let body_idx = skip_seps(ParseState { toks: ps.toks, pos: logic_idx + 2 })
+    let pb = parse_stmts(ParseState { toks: ps.toks, pos: body_idx })
+    let goodblk = pb_block(pb)
+    let endp = pb_next(pb)
+    out = ParsedRule::MkPR { rule: RuleDecl::MkRule { name_start: name_start, name_len: name_len, body: if hdr_ok == 1 then goodblk else Block::MkBlock { binds: Binding::BNil, result: Ast::AstErr } }, next: endp }
+  proofs:
+    purity:
+      reads : [ps.toks, ps.src, ps.pos]
+      calls : [peek_start, peek_len, span_is_rule, span_is_logic, skip_seps, parse_stmts, pb_block, pb_next]
+    termination:
+      bound : 64
+
+
+-- parse_program: parse a SEQUENCE of rule declarations starting at ps.pos into a
+-- RuleList. The loop:
+--   * skip_seps_dedent from ps.pos to the first significant token (a lexeme or
+--     Eof), past any leftover Newline / Indent / Dedent that closes a prior rule.
+--   * if that token's span spells `rule` (span_is_rule), parse one rule decl there
+--     via parse_rule_decl_pos, then RCons it onto the recursive parse of the rest
+--     starting at the rule decl's `next` index — which the next iteration's
+--     skip_seps_dedent will advance past the body's closing Dedents to the next
+--     `rule` (or Eof).
+--   * else (Eof, or any non-`rule` token) the program ends: RNil.
+-- TERMINATION: each iteration that conses a rule advances the cursor by at least
+-- the rule decl's whole body (parse_rule_decl_pos's `next` is strictly past the
+-- starting `rule` token), so pos grows strictly toward the finite end of the
+-- token list. No structural/decreasing FIELD fits a forward token-index scan, so
+-- this carries the bound + the mandatory recursion breadcrumb (the backstop is
+-- the finite token list, bounded by max_nodes).
+rule parse_program
+  @intention: "Parse a sequence of top-level rule declarations into a RuleList"
+  @source: vexprparse.intent:31
+  input:
+    ps : ProgramState
+  output:
+    out : RuleList
+  logic:
+    let hp = skip_seps_dedent(ParseState { toks: ps.toks, pos: ps.pos })
+    let kw_start = peek_start(Nth { lst: ps.toks, n: hp })
+    let kw_len = peek_len(Nth { lst: ps.toks, n: hp })
+    let is_rule = span_is_rule(SpanCheck { src: ps.src, start: kw_start, len: kw_len })
+    let pr = parse_rule_decl_pos(ProgramState { toks: ps.toks, src: ps.src, pos: hp })
+    let rd = pr_rule(pr)
+    let endp = pr_next(pr)
+    out = if is_rule == 1 then RuleList::RCons { head: rd, tail: parse_program(ProgramState { toks: ps.toks, src: ps.src, pos: endp }) } else RuleList::RNil
+  proofs:
+    purity:
+      reads : [ps.toks, ps.src, ps.pos]
+      calls : [skip_seps_dedent, peek_start, peek_len, span_is_rule, parse_rule_decl_pos, pr_rule, pr_next, parse_program]
+    termination:
+      bound : 512
+
+
+-- rule_list_len: the number of rule declarations in a parsed program. Structural
+-- recursion on the RuleList tail (Phase C), like count_binds on a Binding list.
+rule rule_list_len
+  @intention: "Number of rule declarations in a parsed program"
+  @source: vexprparse.intent:31
+  input:
+    rl : RuleList
+  output:
+    out : number
+  logic:
+    out = match rl:
+      RCons(head, tail) => 1 + rule_list_len(tail)
+      RNil => 0
+  proofs:
+    purity:
+      reads : [rl]
+      calls : [rule_list_len]
+    termination:
+      bound : 4000
+      structural : rl
+
+
+-- drop_rules: the RuleList with its first dr.n rule cells removed — the cons-list
+-- analogue of drop_cells on a TokenList. A decreasing number field (dr.n) drives
+-- termination: each step recurses on the tail with n - 1. RNil (or n == 0)
+-- returns the list as-is. Used by eval_nth_rule to land on the n-th rule.
+concept DropRules
+  @intention: "A rule list plus a count of leading rule cells to remove"
+  @source: vexprparse.intent:31
+  fields:
+    rl : RuleList
+    n : number [0, 512]
+
+
+rule drop_rules
+  @intention: "The rule list with its first dr.n rule cells removed"
+  @source: vexprparse.intent:31
+  input:
+    dr : DropRules
+  output:
+    out : RuleList
+  logic:
+    out = match dr.rl:
+      RCons(head, tail) => if dr.n == 0 then dr.rl else drop_rules(DropRules { rl: tail, n: dr.n - 1 })
+      RNil => RuleList::RNil
+  proofs:
+    purity:
+      reads : [dr.rl, dr.n]
+      calls : [drop_rules]
+    termination:
+      bound : 512
+      decreasing : n
+
+
+-- rl_head_body: the body Block of the HEAD rule of a rule list (an empty block —
+-- BNil result AstErr — for an empty list, so eval yields 0 rather than crashing).
+rule rl_head_body
+  @intention: "The logic block of the head rule of a rule list (empty block if none)"
+  @source: vexprparse.intent:31
+  input:
+    rl : RuleList
+  output:
+    out : Block
+  logic:
+    out = match rl:
+      RCons(head, tail) => rd_body(head)
+      RNil => Block::MkBlock { binds: Binding::BNil, result: Ast::AstErr }
+  proofs:
+    purity:
+      reads : [rl]
+      calls : [rd_body]
+    termination:
+      bound : 16
+
+
+-- count_rules: the brick-12 STRUCTURAL driver. Tokenize the program source (with
+-- indentation), parse the whole sequence of rule decls from index 0, and return
+-- the RuleList length. Proves the program splits into the right number of rule
+-- declarations.
+--
+--   count_rules("rule f\n  logic:\n    out = 7")                                   = 1
+--   count_rules("rule f\n  logic:\n    out = 2 + 3\nrule g\n  logic:\n    ...")     = 2
+--
+-- NATIVE-ONLY (multi-line source). Takes a ScanState (source + pos) so the source
+-- is argv arg 1 and pos is argv arg 2 (always 0).
+rule count_rules
+  @intention: "Tokenize a program, parse the rule-decl sequence, and count the rules"
+  @source: vexprparse.intent:31
+  input:
+    s : ScanState
+  output:
+    out : number
+  logic:
+    let toks = begin_tokenize(ScanState { source: s.source, pos: 0 })
+    let prog = parse_program(ProgramState { toks: toks, src: s.source, pos: 0 })
+    out = rule_list_len(prog)
+  proofs:
+    purity:
+      reads : [s.source]
+      calls : [begin_tokenize, parse_program, rule_list_len]
+    termination:
+      bound : 256
+
+
+-- eval_nth_rule: the brick-12 money-shot driver. Tokenize the program source,
+-- parse the whole rule-decl sequence, DROP the first n rule cells to land on the
+-- n-th rule (0-based), take its body Block, build the environment from the body's
+-- bindings (each RHS against the env so far), and evaluate the body's final
+-- out-expression. The result is the n-th rule's `out` value — proving the rule
+-- parsed AND its body is intact and evaluable.
+--
+--   eval_nth_rule("rule f\n  logic:\n    out = 2+3\nrule g\n  logic:\n    let x=4\n    out = x*2", 0) = 5
+--   eval_nth_rule(same, 1) = 8
+--
+-- NATIVE-ONLY (multi-line source). Takes an EvalNthState (source + n): source is
+-- argv arg 1 and n is argv arg 2.
+rule eval_nth_rule
+  @intention: "Parse a program, select the n-th rule, build its env, and evaluate its body to a number"
+  @source: vexprparse.intent:31
+  input:
+    e : EvalNthState
+  output:
+    out : number
+  logic:
+    let toks = begin_tokenize(ScanState { source: e.source, pos: 0 })
+    let prog = parse_program(ProgramState { toks: toks, src: e.source, pos: 0 })
+    let nth = drop_rules(DropRules { rl: prog, n: e.n })
+    let blk = rl_head_body(nth)
+    let binds = block_binds(blk)
+    let result = block_result(blk)
+    let env = build_env(BuildEnvArg { binds: binds, env: Env::ENil, src: e.source })
+    out = eval_ast_env(EvalEnvArg { node: result, env: env, src: e.source })
+  proofs:
+    purity:
+      reads : [e.source, e.n]
+      calls : [begin_tokenize, parse_program, drop_rules, rl_head_body, block_binds, block_result, build_env, eval_ast_env]
     termination:
       bound : 256
 
