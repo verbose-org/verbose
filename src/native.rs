@@ -3902,6 +3902,58 @@ fn emit_callable_into<'a>(
         }
     }
 
+    // Phase B slice 4a.3 — build ArenaCtx for the callable BEFORE the let
+    // loop. A let RHS may itself contain a `VariantConstruct` of a group
+    // concept (e.g. `let env = build_env(Arg { acc: Env::ENil })`); the
+    // number-let eval below must therefore see the arena context, exactly
+    // like the body emit does. The arena write inside a callable is
+    // rbp-independent (it addresses the arena and node_count via r11, set
+    // up once in _start and preserved across call/ret), so emitting a
+    // construct from a let RHS is byte-identical to emitting it from the
+    // body. Building the ctx here (instead of after the let loop) is the
+    // only change required.
+    let arena_holder: Option<(HashMap<&str, u8>, HashMap<&str, Vec<(String, Type)>>, HashSet<&str>, u32, i32, i32)>;
+    if let Some(g) = concept_group {
+        let mut tags: HashMap<&str, u8> = HashMap::new();
+        let mut fields_map: HashMap<&str, Vec<(String, Type)>> = HashMap::new();
+        let mut tag_idx: u8 = 0;
+        for c in &g.concepts {
+            for v in &c.variants {
+                tags.insert(v.name.as_str(), tag_idx);
+                fields_map.insert(
+                    v.name.as_str(),
+                    v.fields.iter().map(|f| (f.name.clone(), f.ty.clone())).collect(),
+                );
+                tag_idx += 1;
+            }
+        }
+        let gnames: HashSet<&str> = g.concepts.iter().map(|c| c.name.as_str()).collect();
+        let entry_size = compute_arena_entry_size(g);
+        arena_holder = Some((tags, fields_map, gnames, g.max_nodes, entry_size, tmp_slots));
+    } else {
+        arena_holder = None;
+    }
+    // Construct ArenaCtx for the callable. The in-callable shape uses an
+    // i32 sentinel for arena_rbp_offset that tells VariantConstruct to
+    // TRUST r11 instead of reloading from the (now-stale) outer rbp. The
+    // MatchVariant arena dispatch uses entry_size + tag/field maps directly.
+    let arena_ctx_owned = arena_holder.as_ref().map(|(tags, fields_map, gnames, max_nodes, entry_size, tmp_slots_val)| {
+        ArenaCtx {
+            arena_rbp_offset: i32::MAX,
+            node_count_slot: 0,
+            entry_size: *entry_size,
+            max_nodes: *max_nodes,
+            tmp_slot_base: tmp_slot_base_local,
+            variant_tags: tags,
+            variant_fields: fields_map,
+            group_concept_names: gnames.clone(),
+            arena_abort_patches: std::cell::RefCell::new(Vec::new()),
+            in_callable: true,
+            callable_node_count_seed: *tmp_slots_val,
+        }
+    });
+    let arena_ctx_ref = arena_ctx_owned.as_ref();
+
     // Evaluate let bindings into successive rbp slots after input fields.
     {
         let mut let_slot_idx = nfields;
@@ -3954,11 +4006,14 @@ fn emit_callable_into<'a>(
                 }
                 let_slot_idx += 2;
             } else {
-                // Number let: evaluate → rax → store.
+                // Number let: evaluate → rax → store. Pass arena_ctx_ref so
+                // a VariantConstruct of a group concept inside the let RHS
+                // (e.g. `let env = build_env(Arg { acc: Env::ENil })`) reaches
+                // the arena path instead of being refused for lack of a group.
                 emit_eval_expr(
                     code, expr, &rule.input_name, &callable_offsets,
                     all_rules, &callable_field_ranges, &callable_text_bindings,
-                    Some(self_call), None,
+                    Some(self_call), arena_ctx_ref,
                 )?;
                 let slot = -(((let_slot_idx) as i32 + 1) * 8);
                 if slot >= -128 {
@@ -3974,33 +4029,6 @@ fn emit_callable_into<'a>(
         }
     }
 
-    // Phase B slice 4a.3 — build ArenaCtx for the callable's body when
-    // a concept_group is declared. The arena's rbp_offset is invalid
-    // inside the callable (different rbp); the in-callable variant
-    // skips the reload and TRUSTS r11 (caller set it up; no syscalls
-    // in recursive bodies). Tag/field maps come from the group.
-    let arena_holder: Option<(HashMap<&str, u8>, HashMap<&str, Vec<(String, Type)>>, HashSet<&str>, u32, i32, i32)>;
-    if let Some(g) = concept_group {
-        let mut tags: HashMap<&str, u8> = HashMap::new();
-        let mut fields_map: HashMap<&str, Vec<(String, Type)>> = HashMap::new();
-        let mut tag_idx: u8 = 0;
-        for c in &g.concepts {
-            for v in &c.variants {
-                tags.insert(v.name.as_str(), tag_idx);
-                fields_map.insert(
-                    v.name.as_str(),
-                    v.fields.iter().map(|f| (f.name.clone(), f.ty.clone())).collect(),
-                );
-                tag_idx += 1;
-            }
-        }
-        let gnames: HashSet<&str> = g.concepts.iter().map(|c| c.name.as_str()).collect();
-        let entry_size = compute_arena_entry_size(g);
-        arena_holder = Some((tags, fields_map, gnames, g.max_nodes, entry_size, tmp_slots));
-    } else {
-        arena_holder = None;
-    }
-
     // Body.
     if is_text {
         // Slice 4a.3 doesn't extend the text-recursive path; same as A.5.2.
@@ -4009,38 +4037,24 @@ fn emit_callable_into<'a>(
             all_rules, &callable_field_ranges, &callable_text_bindings, self_call,
         )?;
     } else {
-        // Construct ArenaCtx for the body. The in-callable shape uses
-        // an i32 sentinel for arena_rbp_offset that tells VariantConstruct
-        // to TRUST r11 instead of reloading from the (now-stale) outer
-        // rbp. The MatchVariant arena dispatch uses entry_size + tag/
-        // field maps directly.
-        let arena_ctx_owned = arena_holder.as_ref().map(|(tags, fields_map, gnames, max_nodes, entry_size, tmp_slots_val)| {
-            ArenaCtx {
-                arena_rbp_offset: i32::MAX,
-                node_count_slot: 0,
-                entry_size: *entry_size,
-                max_nodes: *max_nodes,
-                tmp_slot_base: tmp_slot_base_local,
-                variant_tags: tags,
-                variant_fields: fields_map,
-                group_concept_names: gnames.clone(),
-                arena_abort_patches: std::cell::RefCell::new(Vec::new()),
-                in_callable: true,
-                callable_node_count_seed: *tmp_slots_val,
-            }
-        });
-        let arena_ctx_ref = arena_ctx_owned.as_ref();
+        // Body emit reuses the SAME arena_ctx built before the let loop, so
+        // arena_abort_patches accumulated by let-RHS constructs AND body
+        // constructs all converge on the single inline abort tail below.
         emit_eval_expr(
             code, &rule.logic.value, &rule.input_name, &callable_offsets,
             all_rules, &callable_field_ranges, &callable_text_bindings,
             Some(self_call),
             arena_ctx_ref,
         )?;
-        // Slice 4a.3: arena_abort_patches accumulated inside the callable
-        // must be resolved to a sys_exit(1) target. The callable doesn't
-        // own a per-rule abort label; we emit one inline (jmp-over) so
-        // the abort path is local to this callable. Cost: ~12 bytes only
-        // when at least one VariantConstruct site exists.
+    }
+    // Slice 4a.3: arena_abort_patches accumulated inside the callable
+    // (from let-RHS constructs and/or body constructs) must be resolved to
+    // a sys_exit(1) target. The callable doesn't own a per-rule abort
+    // label; we emit one inline (jmp-over) so the abort path is local to
+    // this callable. Cost: ~12 bytes only when at least one
+    // VariantConstruct site exists. The borrow `arena_ctx_ref` ends here so
+    // we can move the owned ctx out and drain its RefCell of patch sites.
+    {
         if let Some(ac) = arena_ctx_owned {
             let patches = ac.arena_abort_patches.into_inner();
             if !patches.is_empty() {
@@ -27536,6 +27550,73 @@ rule probe
             stdout.trim(), interp_num.to_string(),
             "native output must equal the interpreter oracle (131); got {:?}",
             stdout
+        );
+        let _ = std::fs::remove_file(&out);
+    }
+
+    #[test]
+    fn callable_let_rhs_group_variant_construct_runtime() {
+        // Regression for the bug surfaced by self-hosting brick 10 (eval_block /
+        // build_env): a RECURSIVE CALLABLE whose let RHS contains a
+        // `VariantConstruct` of a group concept was refused at codegen —
+        // "native VariantConstruct for concept 'X' requires a concept_group
+        // declaration; top-level variant concepts have no arena yet".
+        //
+        // Root cause: emit_callable_into built the callable's ArenaCtx AFTER the
+        // let-eval loop, so a let RHS that constructs a group value
+        // (`let pushed = Stk::Push { ... }`) was emitted with arena_ctx = None
+        // and hit the no-arena refusal. The body emit had the ctx; the let loop
+        // didn't. Fix: build the ArenaCtx BEFORE the let loop and pass it to the
+        // let-RHS emit (the arena write is rbp-independent — addresses the arena
+        // and node_count via r11, set up once in _start and preserved across
+        // call/ret — so emitting a construct from a let RHS is byte-identical to
+        // emitting it from the body).
+        //
+        // examples/callable_let_variant.verbose: `build` is a recursive callable
+        // that does `let pushed = Stk::Push { v: ca.n, rest: ca.acc }` then
+        // recurses; `go` builds a stack of depth k and returns its depth = k.
+        let src = std::fs::read_to_string("examples/callable_let_variant.verbose")
+            .expect("examples/callable_let_variant.verbose must exist (minimal reproducer)");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+
+        // Interpreter oracle: go(5) == 5.
+        let all_rules: Vec<&crate::ast::Rule> = program.items.iter()
+            .filter_map(|i| match i { crate::ast::Item::Rule(r) => Some(r), _ => None })
+            .collect();
+        let all_concepts: Vec<&crate::ast::Concept> =
+            crate::ast::iter_all_concepts(&program.items).collect();
+        let go_rule = *all_rules.iter().find(|r| r.name == "go").expect("rule 'go' must exist");
+        let seed = {
+            let mut m = std::collections::HashMap::new();
+            m.insert("k".to_string(), crate::interpreter::Value::Number(5));
+            crate::interpreter::Value::Record(m)
+        };
+        let interp = crate::interpreter::eval_rule_with_value(go_rule, &all_rules, &all_concepts, seed)
+            .expect("interpreter must evaluate 'go'");
+        let interp_num = match interp {
+            crate::interpreter::Value::Number(n) => n,
+            other => panic!("expected Number from interpreter, got {:?}", other),
+        };
+        assert_eq!(interp_num, 5, "interpreter oracle must yield 5");
+
+        // Native: must compile (pre-fix it errored at codegen) and run == interp.
+        let out = std::env::temp_dir().join("verbosec_test_callable_let_variant");
+        compile_native(&program, "go", out.to_str().unwrap(), false, false)
+            .expect("recursive callable with a group VariantConstruct in a let RHS must compile natively");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o755));
+        }
+        let output = std::process::Command::new(&out)
+            .arg("5")
+            .output()
+            .expect("native binary must run");
+        let native_str = String::from_utf8_lossy(&output.stdout);
+        assert_eq!(
+            native_str.trim(), "5",
+            "native go(5) must equal the interpreter (5); got {:?}", native_str
         );
         let _ = std::fs::remove_file(&out);
     }
