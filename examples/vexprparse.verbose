@@ -309,6 +309,21 @@ concept_group VExpr [max_depth: 4096, max_nodes: 65535]
       ECons of (name_start : number, name_len : number, val : number, rest : Env)
       ENil
 
+  -- Brick 11: a parsed top-level RULE declaration. `name_start` / `name_len` are
+  -- the rule NAME's source span (the same identity model as a Binding name or an
+  -- AstVar — brick 11 does not decode the name to bytes; it is proven by the span
+  -- length in rule_shape). `body` is the rule's `logic:` block, reusing the
+  -- brick-9 Block exactly (a binding list + the final out-expression). Mirrors
+  -- src/parser.rs's Rule { name, logic } restricted to the tractable subset:
+  -- name + logic block only (no intention / source / input / output / proofs —
+  -- those are later bricks). RuleDecl lives in this group because it carries a
+  -- group-typed field (body : Block), and cross-group references are rejected.
+  concept RuleDecl
+    @intention: "A parsed top-level rule declaration: its name span + its logic block"
+    @source: vexprparse.intent:30
+    variants:
+      MkRule of (name_start : number, name_len : number, body : Block)
+
 
 -- ============================================================================
 -- Brick 2 reused verbatim: the tokenizer. (Copied so bricks 1-2 stay pristine;
@@ -3621,6 +3636,302 @@ rule eval_block
     purity:
       reads : [s.source]
       calls : [begin_tokenize, parse_block, pb_block, block_binds, block_result, build_env, eval_ast_env]
+    termination:
+      bound : 256
+
+
+-- ============================================================================
+-- BRICK 11: parse a top-level `rule` declaration with a `logic:` block. This
+-- lifts the parser from a bare statement-block (brick 9/10) to a real top-level
+-- PROGRAM item: a named rule whose body is a logic block. The grammar mirrors
+-- src/parser.rs's parse_rule, restricted to the tractable subset:
+--
+--   rule_decl = 'rule' IDENT Newline Indent
+--                 'logic' ':' Newline Indent
+--                   <stmt_seq>          -- the brick-9 (let ...)* out = ... body
+--                 Dedent Dedent
+--
+-- WHAT IS PARSED (the subset). Only the `rule` keyword, the rule NAME, and the
+-- `logic:` section. No @intention / @source / input: / output: / proofs: — those
+-- are later bricks. The point of brick 11 is the HEADER (the `rule NAME` line and
+-- the nested `logic:` indent framing) plus delegating the body to the brick-9
+-- block parser.
+--
+-- `rule` AND `logic` ARE PLAIN IDENTS (no keyword code). The tokenizer's
+-- keyword_code only classifies if/or/of/let/and/not/then/else/true/false; `rule`
+-- and `logic` lex as ordinary Ident tokens (kind 100). So the parser recognizes
+-- them by BYTE COMPARISON of the Ident's source span against the literal bytes
+-- "rule" (r=114 u=117 l=108 e=101) and "logic" (l=108 o=111 g=103 i=105 c=99).
+-- This is why the rule-parsing rules carry `src` (the source text) ALONGSIDE the
+-- token list: the byte comparison reads the actual source bytes the Ident's span
+-- points at. span_is_rule / span_is_logic are flat fixed-width byte checks (like
+-- the tokenizer's kw4 / kw5), not recursions.
+--
+-- THE NESTED INDENT/DEDENT. The token stream for `rule f\n  logic:\n    out=...`
+-- is (verified via kind_at_indent):
+--   0 Ident"rule"  1 Ident"f"  2 Newline  3 Indent      <- enter rule body
+--   4 Ident"logic" 5 Op`:`(10) 6 Newline  7 Indent      <- enter logic body
+--   8 <first stmt token> ...  Newline  Dedent Dedent Eof
+-- parse_rule_decl consumes the two nested INDENTs by SKIPPING separators
+-- (skip_seps skips Newline 600 AND Indent 700): after the name at index 1 it
+-- skip_seps from 2 to land on `logic` (index 4); after the `:` at index 5 it
+-- skip_seps from 6 to land on the first statement (index 8). The trailing two
+-- DEDENTs need no explicit consumption — parse_stmts already STOPS its binding
+-- sweep at a Dedent (800) or Eof (0), so the block body ends exactly there. This
+-- reuses the framing-agnostic block parser unchanged (brick 9's design payoff).
+--
+-- HOW src IS THREADED. The brick-9 block parser threads only the TokenList. The
+-- rule-header recognition needs the source text too, so parse_rule_decl takes a
+-- RuleParseState { toks : TokenList, src : text } — a group field (the token
+-- list) ALONGSIDE a text field (the source) — exactly the multi-field recursive
+-- shape the 2b052a7 / 9529277 compiler fixes support. parse_rule_decl itself is
+-- NOT recursive (it is a one-shot fixed-grammar parse delegating the body to the
+-- self-recursive parse_stmts), so it carries bound-only termination with no
+-- recursion breadcrumb.
+--
+-- VALIDATION. A RuleDecl carries a Block, so it is BOTH evaluable (brick 10) and
+-- structurally checkable (brick 9):
+--   * eval_rule_decl(source) parses the rule decl, extracts its body Block,
+--     build_env's the bindings, and evaluates the result — proving the HEADER
+--     parsed AND the body still evaluates correctly (the rule's `out` value).
+--   * rule_shape(source) = 1000 * name_len + block_shape(body), proving the name
+--     span length AND the body's structural signature (brick 9's block_shape).
+-- Both are NATIVE-ONLY (the source is multi-line — the interpreter's JSON reader
+-- does not decode \n into a real byte 10; see count_cells_src). Multi-line argv
+-- via $'rule f\n  logic:\n    out = 2 + 3'.
+--
+-- Oracle: src/parser.rs's parse_rule (the `rule NAME` + `logic:` block shape).
+-- ============================================================================
+
+-- The rule-parse entry state: the whole token list plus the source text. The
+-- token list drives the structural parse; the source text backs the byte
+-- comparison that recognizes the `rule` / `logic` idents (which have no keyword
+-- code). A group field (toks) + a text field (src) — the supported multi-field
+-- shape.
+concept RuleParseState
+  @intention: "The token list plus the source text, for parsing a rule declaration"
+  @source: vexprparse.intent:30
+  fields:
+    toks : TokenList
+    src : text [..256]
+
+
+-- A fixed-width span byte-check probe: the source text plus an Ident token's
+-- span (start, len). span_is_rule / span_is_logic compare the span against a
+-- fixed literal word, length first then each byte.
+concept SpanCheck
+  @intention: "Source text + an Ident span, for byte-comparing it to a fixed keyword"
+  @source: vexprparse.intent:30
+  fields:
+    src : text [..256]
+    start : number [0, 256]
+    len : number [0, 256]
+
+
+-- span_is_rule: 1 iff the span src[start..start+len] is exactly the 4 bytes
+-- "rule" (r=114 u=117 l=108 e=101). Flat fixed-width check (like the tokenizer's
+-- kw4), length-guarded first so a shorter/longer ident never reads past its span.
+rule span_is_rule
+  @intention: "1 if an Ident span spells exactly \"rule\", 0 otherwise"
+  @source: vexprparse.intent:30
+  input:
+    sc : SpanCheck
+  output:
+    out : number
+  logic:
+    out = if sc.len == 4 and (byte_at(sc.src, sc.start) == 114 and (byte_at(sc.src, sc.start + 1) == 117 and (byte_at(sc.src, sc.start + 2) == 108 and byte_at(sc.src, sc.start + 3) == 101))) then 1 else 0
+  proofs:
+    purity:
+      reads : [sc.src, sc.start, sc.len]
+      calls : []
+    termination:
+      bound : 64
+
+
+-- span_is_logic: 1 iff the span src[start..start+len] is exactly the 5 bytes
+-- "logic" (l=108 o=111 g=103 i=105 c=99). Flat fixed-width check (like kw5).
+rule span_is_logic
+  @intention: "1 if an Ident span spells exactly \"logic\", 0 otherwise"
+  @source: vexprparse.intent:30
+  input:
+    sc : SpanCheck
+  output:
+    out : number
+  logic:
+    out = if sc.len == 5 and (byte_at(sc.src, sc.start) == 108 and (byte_at(sc.src, sc.start + 1) == 111 and (byte_at(sc.src, sc.start + 2) == 103 and (byte_at(sc.src, sc.start + 3) == 105 and byte_at(sc.src, sc.start + 4) == 99)))) then 1 else 0
+  proofs:
+    purity:
+      reads : [sc.src, sc.start, sc.len]
+      calls : []
+    termination:
+      bound : 64
+
+
+-- Accessors for a RuleDecl (a block-form match is only legal in final position,
+-- so destructuring is factored into tiny rules — like block_binds / pb_block).
+rule rd_name_start
+  @intention: "The name-span start offset of a parsed rule declaration"
+  @source: vexprparse.intent:30
+  input:
+    r : RuleDecl
+  output:
+    out : number
+  logic:
+    out = match r:
+      MkRule(name_start, name_len, body) => name_start
+  proofs:
+    purity:
+      reads : [r]
+      calls : []
+    termination:
+      bound : 16
+
+
+rule rd_name_len
+  @intention: "The name-span length of a parsed rule declaration"
+  @source: vexprparse.intent:30
+  input:
+    r : RuleDecl
+  output:
+    out : number
+  logic:
+    out = match r:
+      MkRule(name_start, name_len, body) => name_len
+  proofs:
+    purity:
+      reads : [r]
+      calls : []
+    termination:
+      bound : 16
+
+
+rule rd_body
+  @intention: "The logic block of a parsed rule declaration"
+  @source: vexprparse.intent:30
+  input:
+    r : RuleDecl
+  output:
+    out : Block
+  logic:
+    out = match r:
+      MkRule(name_start, name_len, body) => body
+  proofs:
+    purity:
+      reads : [r]
+      calls : []
+    termination:
+      bound : 16
+
+
+-- parse_rule_decl: parse ONE top-level rule declaration into a RuleDecl. The
+-- grammar is fixed, so positions are computed by skipping separators rather than
+-- re-validated token by token:
+--   * index 0 is the `rule` Ident, RECOGNIZED by byte-comparing its span against
+--     "rule" (span_is_rule, reading rp.src). The keyword `rule` has no keyword
+--     code, so this byte check is how the header is recognized at all.
+--   * the NAME is the Ident at index 1; its span is (peek_start 1, peek_len 1).
+--   * skip_seps from index 2 skips Newline + the rule-body Indent, landing on the
+--     `logic` Ident (index 4 in the canonical stream), RECOGNIZED by byte-
+--     comparing its span against "logic" (span_is_logic, also via rp.src).
+--   * the `:` is at logic_idx + 1; skip_seps from logic_idx + 2 skips Newline +
+--     the logic-body Indent, landing on the first statement token (index 8).
+--   * parse_stmts parses the body block from there; it stops at the trailing
+--     Dedent/Eof, so the two closing DEDENTs need no explicit consumption.
+-- FAIL-GRACEFUL: a Verbose rule is total, so a malformed header cannot abort.
+-- When BOTH byte checks pass (`hdr_ok == 1`) the body is the parsed block;
+-- otherwise the body is an empty block (BNil result AstErr) — eval_rule_decl
+-- then yields 0 and rule_shape yields name-band-only, a distinguishable signal
+-- rather than a crash. One-shot (not self-recursive); delegates the body to the
+-- self-recursive parse_stmts. Bound-only termination, no recursion breadcrumb.
+rule parse_rule_decl
+  @intention: "Parse a `rule NAME` + `logic:` block into a RuleDecl (byte-recognizing the rule/logic idents)"
+  @source: vexprparse.intent:30
+  input:
+    rp : RuleParseState
+  output:
+    out : RuleDecl
+  logic:
+    let name_start = peek_start(Nth { lst: rp.toks, n: 1 })
+    let name_len = peek_len(Nth { lst: rp.toks, n: 1 })
+    let kw_start = peek_start(Nth { lst: rp.toks, n: 0 })
+    let kw_len = peek_len(Nth { lst: rp.toks, n: 0 })
+    let is_rule = span_is_rule(SpanCheck { src: rp.src, start: kw_start, len: kw_len })
+    let logic_idx = skip_seps(ParseState { toks: rp.toks, pos: 2 })
+    let logic_start = peek_start(Nth { lst: rp.toks, n: logic_idx })
+    let logic_len = peek_len(Nth { lst: rp.toks, n: logic_idx })
+    let is_logic = span_is_logic(SpanCheck { src: rp.src, start: logic_start, len: logic_len })
+    let hdr_ok = if is_rule == 1 and is_logic == 1 then 1 else 0
+    let body_idx = skip_seps(ParseState { toks: rp.toks, pos: logic_idx + 2 })
+    let pb = parse_stmts(ParseState { toks: rp.toks, pos: body_idx })
+    let goodblk = pb_block(pb)
+    out = RuleDecl::MkRule { name_start: name_start, name_len: name_len, body: if hdr_ok == 1 then goodblk else Block::MkBlock { binds: Binding::BNil, result: Ast::AstErr } }
+  proofs:
+    purity:
+      reads : [rp.toks, rp.src]
+      calls : [peek_start, peek_len, span_is_rule, span_is_logic, skip_seps, parse_stmts, pb_block]
+    termination:
+      bound : 64
+
+
+-- eval_rule_decl: the brick-11 money-shot driver. Tokenize the rule-declaration
+-- source (with indentation), parse the rule decl, extract its body Block, build
+-- the environment from the body's bindings (in order, each RHS against the env so
+-- far), and evaluate the body's final out-expression against that env. The result
+-- is the rule's `out` value — proving the HEADER parsed AND the body evaluates.
+--
+--   eval_rule_decl("rule add\n  logic:\n    let x = 5\n    out = x + 1") = 6
+--
+-- NATIVE-ONLY (multi-line source — the interpreter's JSON reader does not decode
+-- \n; see count_cells_src). Takes a ScanState (source + pos) like eval_block, so
+-- the source is argv arg 1 and pos is argv arg 2 (always 0).
+rule eval_rule_decl
+  @intention: "Tokenize, parse a rule decl, build the environment, and evaluate its body to a number"
+  @source: vexprparse.intent:30
+  input:
+    s : ScanState
+  output:
+    out : number
+  logic:
+    let toks = begin_tokenize(ScanState { source: s.source, pos: 0 })
+    let rd = parse_rule_decl(RuleParseState { toks: toks, src: s.source })
+    let blk = rd_body(rd)
+    let binds = block_binds(blk)
+    let result = block_result(blk)
+    let env = build_env(BuildEnvArg { binds: binds, env: Env::ENil, src: s.source })
+    out = eval_ast_env(EvalEnvArg { node: result, env: env, src: s.source })
+  proofs:
+    purity:
+      reads : [s.source]
+      calls : [begin_tokenize, parse_rule_decl, rd_body, block_binds, block_result, build_env, eval_ast_env]
+    termination:
+      bound : 256
+
+
+-- rule_shape: the brick-11 STRUCTURAL oracle. Tokenize, parse the rule decl, and
+-- return 1000 * name_len + block_shape(body). The 1000 band carries the rule
+-- NAME's span length (every test name is < 1000 chars and block_shape's smallest
+-- nonzero contribution is shape_ast >= 0, with the binding-count band at 1000000
+-- well clear), so a single number certifies the name length AND the full body
+-- structure (binding count, per-binding RHS shapes, result shape). NATIVE-ONLY.
+rule rule_shape
+  @intention: "Parse a rule decl and return 1000*name_len + block_shape(body)"
+  @source: vexprparse.intent:30
+  input:
+    a : IndentSrc
+  output:
+    out : number
+  logic:
+    let toks = begin_tokenize(ScanState { source: a.source, pos: 0 })
+    let rd = parse_rule_decl(RuleParseState { toks: toks, src: a.source })
+    let nlen = rd_name_len(rd)
+    let blk = rd_body(rd)
+    let binds = block_binds(blk)
+    let result = block_result(blk)
+    out = 1000 * nlen + (1000000 * count_binds(binds) + (shape_binds(binds) + shape_ast(result)))
+  proofs:
+    purity:
+      reads : [a.source]
+      calls : [begin_tokenize, parse_rule_decl, rd_name_len, rd_body, block_binds, block_result, count_binds, shape_binds, shape_ast]
     termination:
       bound : 256
 

@@ -315,3 +315,43 @@ there (out of the arithmetic evaluator's scope).
     pointer and the binary fails closed. Until that native-backend gap is fixed,
     block semantics are proven structurally (the signature above), and
     eval-with-environment is deferred.
+
+30. Parse a top-level RULE declaration with a logic block. This lifts the parser
+    from a bare statement-block (item 28/29) to a real program ITEM: a named rule
+    whose body is a logic block. The grammar, mirroring the reference compiler's
+    rule parser restricted to a tractable subset, is
+
+        rule_decl = 'rule' NAME newline indent
+                      'logic' ':' newline indent
+                        <statement-sequence>     -- the let-bindings + out value
+                      dedent dedent
+
+    Only the `rule` keyword, the rule NAME, and the `logic:` section are parsed;
+    intention / source / input / output / proofs are later bricks. The words
+    `rule` and `logic` have NO keyword code (the tokenizer classifies only
+    if/or/of/let/and/not/then/else/true/false), so they lex as ordinary
+    identifiers and are RECOGNIZED by byte-comparing each identifier's source span
+    against the literal bytes "rule" / "logic". Because that comparison reads the
+    actual source bytes, the rule-parsing entry carries the source text ALONGSIDE
+    the token list (a record with both the token list and the source). The two
+    nested block openings (entering the rule body, then the logic body) are
+    consumed by skipping separator tokens (line-boundary AND indent): after the
+    name the parser skips to the `logic` identifier, after the `:` it skips to the
+    first statement; the two closing dedents need no explicit consumption because
+    the block parser (item 28) already stops its sweep at a dedent or end-of-input.
+    A Verbose rule is total, so a malformed header cannot abort: when both byte
+    checks pass the body is the parsed block, otherwise the body is an empty block
+    (a distinguishable signal, not a crash).
+
+    A parsed rule declaration carries its name span plus its logic block, so it is
+    BOTH evaluable and structurally checkable. The eval driver parses the rule
+    decl, extracts its body block, folds the bindings into an environment, and
+    evaluates the result — proving the header parsed AND the body still evaluates
+    (the rule's `out` value). The structural driver returns
+    `1000 * name_len + block_shape(body)`, a single hand-derivable number
+    certifying the name length AND the body's full structural signature. Both are
+    NATIVE-ONLY (the source is multi-line — escaped-newline decoding, as in items
+    26/27/29; multi-line argv supplies the real newline bytes). Cross-check with
+    the interpreter uses a JSON fixture whose string contains LITERAL newline
+    bytes (the gap is only about backslash-n ESCAPES, which neither argv nor
+    literal-byte JSON involve), and native equals interpreter for every input.
