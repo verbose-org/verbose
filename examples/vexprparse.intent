@@ -484,3 +484,55 @@ there (out of the arithmetic evaluator's scope).
     (proper let-ordering) — order-sensitive scope analysis, written in Verbose,
     run as native machine code. NATIVE-ONLY (multi-line source), same scan-state
     invocation as items 31/32.
+
+34. UNDEFINED-CALLEE detection: the linter's first INTER-rule pass (brick 15).
+    The variable lint (items 32/33) is INTRA-rule — a variable resolves against
+    the current rule's own bindings, so each rule is linted in isolation. A
+    function call is different: it names a RULE, and a rule may be defined ANYWHERE
+    in the program. So resolving a callee needs the WHOLE program's rule list, not
+    just one rule's bindings. The headline driver returns the total number of
+    calls that name a rule which does not exist. 0 = every call in the program
+    resolves to a real rule.
+
+    THE LINT: undefined callee references. For each rule, every function call
+    `name(args...)` anywhere in the body (every let RHS AND the result) must name
+    a rule that EXISTS in the program. A call to a non-existent rule is one error.
+    The call's arguments are themselves expressions that may contain more calls, so
+    a nested call `g(h(1))` is checked at both the outer callee (g) and the inner
+    callee (h) — that is how nested-call resolution falls out of the recursion.
+
+    PROGRAM-WIDE, ORDER-AGNOSTIC SCOPE. Unlike the let-ordering of item 33, callee
+    scope has no order: a rule may call ITSELF (self-reference of a callee is legal
+    — it is existence, not termination, that is checked here), and any other rule
+    regardless of where it appears (forward calls, mutual recursion). So there is
+    no prefix trick — every rule resolves its callees against the FULL program rule
+    list. The fold over the program threads two rule lists: an `iter` that advances
+    (one rule checked per step) and an `all` that stays fixed (the whole program),
+    so badcall checking always sees every rule.
+
+    A SEPARATE PASS, PROVABLY INDEPENDENT. The callee lint is kept distinct from
+    the var/use-before-def walk: it carries the program's rule list where the var
+    walk carries the rule's bindings. This separation is observable: a call
+    `g(y)` where `g` exists but `y` is an undefined variable lints to 0 under the
+    callee pass (the callee resolves) and 1 under the variable pass (y is unbound).
+    The mirror case `g(h(1))` (no undefined variables, but `h` is not a rule) lints
+    to 1 under the callee pass and 0 under the variable pass. The two passes never
+    see each other's concern.
+
+    HOW IT WALKS. A membership probe asks "does some rule in the program have a
+    name span byte-equal to this callee span?" (the rule-name analogue of the
+    binding-membership probe). The AST walker descends every node, and at each
+    function-call node it adds 1 when the callee is not a known rule, then recurses
+    into the call's arguments (catching nested calls). Variable references, numbers,
+    strings, booleans, and the error node contribute nothing — they carry no
+    callee. The per-rule checker sums the bad-callee counts of every let RHS and the
+    result, all resolved against the full program rule list.
+
+    The money shot: `rule f / logic: / out = g(h(1)) / rule g / logic: / out = 2`
+    lints to 1 — g exists, h does not, the nested callee resolved across the whole
+    program — a cross-rule static check, written in Verbose, run as native machine
+    code over a parsed Verbose program. A clean self-call (`out = f(1)` inside f)
+    and a clean mutual call (`out = g(1)` with g defined) both stay 0. NATIVE-ONLY
+    (multi-line source), same scan-state invocation as items 31/32/33. The two
+    driver passes (item 32/33's variable lint and this callee lint) are intended to
+    be summed by a future combined linter; for now each is its own headline driver.

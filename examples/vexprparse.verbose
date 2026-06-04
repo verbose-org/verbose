@@ -4690,6 +4690,325 @@ rule lint_program
       bound : 256
 
 
+-- ============================================================================
+-- BRICK 15 — linter pass #2: undefined-CALLEE detection (INTER-rule).
+--
+-- The variable lint (lint_program, brick 13/14) is INTRA-rule: a variable
+-- reference resolves against the current rule's own bindings, so each rule is
+-- linted in isolation. The callee lint is INTER-rule: an AstCall names a RULE,
+-- and a rule may be DEFINED anywhere in the program. Resolving a callee therefore
+-- needs the WHOLE program's RuleList, not just the current rule's bindings.
+--
+-- So this is a SEPARATE pass with its own state shapes (it carries the program's
+-- RuleList alongside the source text, NOT the current rule's binds). Keeping it
+-- separate from the var/use-before-def walk keeps each pass single-purpose and
+-- proves their independence: an arg that is an undefined VARIABLE but a valid
+-- CALLEE is counted by lint_program and NOT by lint_callees, and vice versa.
+--
+-- Callee scope is program-wide and ORDER-AGNOSTIC: a rule may call itself
+-- (self-reference of a CALLEE is legal — it is existence, not termination, that
+-- is checked) and any other rule regardless of source position (forward calls,
+-- mutual recursion). So unlike the let-prefix trick in count_undef_binds_ordered,
+-- there is no prefix here: every rule sees the FULL program RuleList.
+--
+-- The rules:
+--   * rule_named        — 1 iff some RuleDecl in the list has a name span
+--                         byte-equal to the query span. Mirrors name_bound but
+--                         over RuleList + rd name spans.
+--   * count_badcall_args — sum count_badcall_ast over an ArgList (nested calls).
+--   * count_badcall_ast — walk an Ast, count AstCall whose callee is not rule_named.
+--   * count_badcall_binds — sum count_badcall_ast over each binding's RHS.
+--   * badcall_rule      — one rule's bad-callee count (binds RHSes + result).
+--   * lint_callees_list — fold badcall_rule over the program (iter advances, the
+--                         full list `all` stays fixed so every rule sees every rule).
+--   * lint_callees      — the driver: tokenize -> parse_program -> lint_callees_list.
+-- ============================================================================
+
+-- rule_named's probe: the program's RuleList to search + the source text + the
+-- query name's span (q_start, q_len). The callee-resolution analogue of
+-- NameBoundState (which searches a Binding list); here the search space is the
+-- program's rule declarations.
+concept RuleNamedState
+  @intention: "A rule list to search + the source text + the query callee name's span"
+  @source: vexprparse.intent:33
+  fields:
+    rules : RuleList
+    src : text [..256]
+    q_start : number [0, 256]
+    q_len : number [0, 256]
+
+
+-- rule_named: 1 iff the query span byte-equals some RuleDecl's NAME span in the
+-- list, 0 otherwise. Walks the RuleList cons-list; at each RCons it checks the
+-- rule name's LENGTH equals the query length AND the bytes match (name_eq); on a
+-- match it returns 1, else recurses into `tail`. RNil (end) returns 0 (no rule of
+-- that name). Mirrors name_bound, but reads the rule head's name span via
+-- rd_name_start / rd_name_len instead of a binding's name fields. Recurses over
+-- the RuleList tail, which is a FIELD of the input (not the input), so bound +
+-- breadcrumb, like name_bound / lint_list.
+rule rule_named
+  @intention: "1 if a callee name span matches some rule's name in the program, 0 otherwise"
+  @source: vexprparse.intent:33
+  input:
+    st : RuleNamedState
+  output:
+    out : number
+  logic:
+    out = match st.rules:
+      RCons(head, tail) => if rd_name_len(head) == st.q_len and name_eq(NameEqState { src: st.src, a_start: rd_name_start(head), b_start: st.q_start, len: st.q_len, off: 0 }) == 1 then 1 else rule_named(RuleNamedState { rules: tail, src: st.src, q_start: st.q_start, q_len: st.q_len })
+      RNil => 0
+  proofs:
+    purity:
+      reads : [st.rules, st.src, st.q_start, st.q_len]
+      calls : [rd_name_len, rd_name_start, name_eq, rule_named]
+    termination:
+      bound : 4000
+
+
+-- count_badcall_args's input: the argument list to walk + the program's RuleList
+-- (the scope every AstCall callee is resolved against) + the source text. Mirrors
+-- UndefArgsState but carries `rules` instead of `binds`.
+concept BadCallArgsState
+  @intention: "A call-argument list + the program rule list (callee scope) + the source text"
+  @source: vexprparse.intent:33
+  fields:
+    args : ArgList
+    rules : RuleList
+    src : text [..256]
+
+
+-- The Ast-walking input: the AST node + the program's RuleList (callee scope) +
+-- src. Same shape as UndefAstState but carries `rules` instead of `binds` — this
+-- is the load-bearing difference between the two passes: var-lint carries the
+-- rule's bindings, callee-lint carries the whole program's rules.
+concept BadCallState
+  @intention: "An Ast node + the program rule list (callee scope) + the source text"
+  @source: vexprparse.intent:33
+  fields:
+    node : Ast
+    rules : RuleList
+    src : text [..256]
+
+
+-- count_badcall_args: sum count_badcall_ast over every argument of a call's
+-- ArgList. Mutually recursive with count_badcall_ast (a call's arguments are
+-- themselves Asts that may contain more calls — this is how NESTED calls like
+-- g(h(1)) get walked: g's existence is checked at the AstCall node, then its
+-- argument h(1) is recursed into here). Recurses over the ArgList tail (a field of
+-- the input), so bound + breadcrumb. Threads the same rules (scope) + src down.
+rule count_badcall_args
+  @intention: "Total undefined-callee references across every argument of a call"
+  @source: vexprparse.intent:33
+  input:
+    a : BadCallArgsState
+  output:
+    out : number
+  logic:
+    out = match a.args:
+      ArgCons(head, tail) => count_badcall_ast(BadCallState { node: head, rules: a.rules, src: a.src }) + count_badcall_args(BadCallArgsState { args: tail, rules: a.rules, src: a.src })
+      ArgNil => 0
+  proofs:
+    purity:
+      reads : [a.args, a.rules, a.src]
+      calls : [count_badcall_ast, count_badcall_args]
+    termination:
+      bound : 4000
+
+
+-- count_badcall_ast: walk an Ast and count the AstCall references whose callee
+-- name is NOT rule_named in the program. Mirrors count_undef_ast's structural
+-- walk, but the node that contributes is AstCall (not AstVar), checked against the
+-- program's rules (not the rule's bindings):
+--   * AstCall(callee_start, callee_len, args) => (1 if rule_named == 0, the callee
+--     does not exist) PLUS count_badcall_args over the arguments (so a nested call
+--     inside an argument — g(h(1)) — is also checked). Parenthesized because there
+--     is no operator precedence in Verbose: the `if ... then 1 else 0` is the
+--     leftmost summand, the args walk the second.
+--   * AstBin sums lhs + rhs; AstNeg / AstNot descend; AstIf sums cond + thn + els;
+--     AstField walks its base (the field name is not a callee).
+--   * AstVar / AstNum / AstStr / AstBool / AstErr carry no callee -> 0. (An AstVar
+--     is a VARIABLE reference; that is the other pass's concern.)
+-- Every recursive call threads the same rules (scope) + src. a.node is a FIELD of
+-- the packed input (not the input), so bound + mandatory native recursion breadcrumb.
+rule count_badcall_ast
+  @intention: "Total undefined-callee references in an AST, given the program's rule list"
+  @source: vexprparse.intent:33
+  input:
+    a : BadCallState
+  output:
+    out : number
+  logic:
+    out = match a.node:
+      AstNum(value) => 0
+      AstBin(op, lhs, rhs) => count_badcall_ast(BadCallState { node: lhs, rules: a.rules, src: a.src }) + count_badcall_ast(BadCallState { node: rhs, rules: a.rules, src: a.src })
+      AstNeg(inner) => count_badcall_ast(BadCallState { node: inner, rules: a.rules, src: a.src })
+      AstNot(inner) => count_badcall_ast(BadCallState { node: inner, rules: a.rules, src: a.src })
+      AstVar(start, len) => 0
+      AstField(base, fstart, flen) => count_badcall_ast(BadCallState { node: base, rules: a.rules, src: a.src })
+      AstCall(callee_start, callee_len, args) => (if rule_named(RuleNamedState { rules: a.rules, src: a.src, q_start: callee_start, q_len: callee_len }) == 0 then 1 else 0) + count_badcall_args(BadCallArgsState { args: args, rules: a.rules, src: a.src })
+      AstIf(cond, thn, els) => count_badcall_ast(BadCallState { node: cond, rules: a.rules, src: a.src }) + count_badcall_ast(BadCallState { node: thn, rules: a.rules, src: a.src }) + count_badcall_ast(BadCallState { node: els, rules: a.rules, src: a.src })
+      AstBool(value) => 0
+      AstStr(start, len) => 0
+      AstErr => 0
+  proofs:
+    purity:
+      reads : [a.node, a.rules, a.src]
+      calls : [count_badcall_ast, count_badcall_args, rule_named]
+    termination:
+      bound : 4000
+
+
+-- count_badcall_binds's input: the binding list whose RHSes are walked + the
+-- program's RuleList (callee scope) + the source text. Unlike the var pass there
+-- is no prefix: callee scope is program-wide and order-agnostic, so EVERY RHS sees
+-- the FULL program rule list. (A let RHS may legitimately call a rule defined
+-- later in the file, or call the rule it lives in.)
+concept BadCallBindsState
+  @intention: "A binding list + the program rule list (callee scope) + the source text"
+  @source: vexprparse.intent:33
+  fields:
+    binds : Binding
+    rules : RuleList
+    src : text [..256]
+
+
+-- count_badcall_binds: for each binding in the list, count_badcall_ast on its RHS
+-- `value` against the FULL program rule list, then recurse on `rest`. The whole
+-- program's rules are visible to every RHS (no prefix trick — callees are not
+-- ordered like lets). Recurses over the binding tail (a field of the input), so
+-- bound + breadcrumb; rules + src threaded unchanged.
+rule count_badcall_binds
+  @intention: "Total undefined-callee references across every binding's RHS"
+  @source: vexprparse.intent:33
+  input:
+    b : BadCallBindsState
+  output:
+    out : number
+  logic:
+    out = match b.binds:
+      BCons(name_start, name_len, value, rest) => count_badcall_ast(BadCallState { node: value, rules: b.rules, src: b.src }) + count_badcall_binds(BadCallBindsState { binds: rest, rules: b.rules, src: b.src })
+      BNil => 0
+  proofs:
+    purity:
+      reads : [b.binds, b.rules, b.src]
+      calls : [count_badcall_ast, count_badcall_binds]
+    termination:
+      bound : 4000
+
+
+-- badcall_rule's input: ONE rule declaration being checked + the FULL program
+-- RuleList (so the checked rule may call itself or any other rule) + the source
+-- text. The full list is threaded here, not the iterating tail — every rule
+-- resolves its callees against every rule.
+concept BadCallRuleState
+  @intention: "A rule declaration + the full program rule list + the source text"
+  @source: vexprparse.intent:33
+  fields:
+    rd : RuleDecl
+    rules : RuleList
+    src : text [..256]
+
+
+-- badcall_rule: the undefined-callee count for ONE rule. Split the body Block into
+-- its binding list and result expression, then sum:
+--   * count_badcall_binds over the bindings (every let RHS's calls), PLUS
+--   * count_badcall_ast over the result expression's calls.
+-- Both halves resolve callees against the SAME full program RuleList `br.rules` —
+-- callee scope is program-wide, so there is no per-let ordering and no prefix.
+-- 0 = the rule calls only rules that exist. A rule calling ITSELF is clean (the
+-- rule's own name is in `br.rules`). A rule calling a rule defined later is clean.
+rule badcall_rule
+  @intention: "Number of undefined-callee references in one rule (0 if all callees exist)"
+  @source: vexprparse.intent:33
+  input:
+    br : BadCallRuleState
+  output:
+    out : number
+  logic:
+    let body = rd_body(br.rd)
+    let binds = block_binds(body)
+    let result = block_result(body)
+    let bad_in_binds = count_badcall_binds(BadCallBindsState { binds: binds, rules: br.rules, src: br.src })
+    out = bad_in_binds + count_badcall_ast(BadCallState { node: result, rules: br.rules, src: br.src })
+  proofs:
+    purity:
+      reads : [br.rd, br.rules, br.src]
+      calls : [rd_body, block_binds, block_result, count_badcall_binds, count_badcall_ast]
+    termination:
+      bound : 16
+
+
+-- lint_callees_list's input: the rule list being ITERATED (`iter` advances each
+-- step, one rule checked per step) + the FULL program rule list (`all`, fixed, so
+-- every rule resolves callees against every rule) + the source text. The split
+-- between `iter` and `all` is what makes callee scope program-wide: badcall_rule
+-- always receives `all`, never the shrinking `iter`.
+concept LintCalleesState
+  @intention: "The rule list being iterated + the full program rule list + the source text"
+  @source: vexprparse.intent:33
+  fields:
+    iter : RuleList
+    all : RuleList
+    src : text [..256]
+
+
+-- lint_callees_list: sum badcall_rule over every rule in the program. Recurses
+-- over `iter` (a field of the input), so bound + breadcrumb; `all` and `src` are
+-- threaded unchanged so every rule sees the same full program rule list and the
+-- same source buffer. Total undefined-callee references across the program.
+rule lint_callees_list
+  @intention: "Total undefined-callee references across every rule in a program"
+  @source: vexprparse.intent:33
+  input:
+    lc : LintCalleesState
+  output:
+    out : number
+  logic:
+    out = match lc.iter:
+      RCons(head, tail) => badcall_rule(BadCallRuleState { rd: head, rules: lc.all, src: lc.src }) + lint_callees_list(LintCalleesState { iter: tail, all: lc.all, src: lc.src })
+      RNil => 0
+  proofs:
+    purity:
+      reads : [lc.iter, lc.all, lc.src]
+      calls : [badcall_rule, lint_callees_list]
+    termination:
+      bound : 4000
+
+
+-- lint_callees: the brick-15 money-shot driver. Tokenize the program source (with
+-- indentation), parse the whole rule-decl sequence into a RuleList, then fold
+-- badcall_rule over it with `iter = all = the parsed program` so every rule
+-- resolves its callees against the entire program. Returns the TOTAL number of
+-- undefined-callee references (calls to rules that do not exist). 0 = every call
+-- in the program names a rule that exists.
+--
+--   lint_callees("rule f\n  logic:\n    out = f(1)") = 0   (f calls itself; f exists)
+--   lint_callees("rule f\n  logic:\n    out = h(1)") = 1   (h is not a rule)
+--   lint_callees("rule f\n  logic:\n    out = g(h(1))\nrule g\n  logic:\n    out = 2") = 1
+--                                          (g exists; h does not — nested-call resolution)
+--
+-- NATIVE-ONLY (multi-line source). Takes a ScanState (source + pos): source is
+-- argv arg 1, pos is argv arg 2 (always 0). Independent of lint_program: an arg
+-- that is an undefined VAR but a valid callee is 0 here, 1 there.
+rule lint_callees
+  @intention: "Tokenize, parse, and count all undefined-callee references in a program"
+  @source: vexprparse.intent:33
+  input:
+    s : ScanState
+  output:
+    out : number
+  logic:
+    let toks = begin_tokenize(ScanState { source: s.source, pos: 0 })
+    let prog = parse_program(ProgramState { toks: toks, src: s.source, pos: 0 })
+    out = lint_callees_list(LintCalleesState { iter: prog, all: prog, src: s.source })
+  proofs:
+    purity:
+      reads : [s.source]
+      calls : [begin_tokenize, parse_program, lint_callees_list]
+    termination:
+      bound : 256
+
+
 -- Entry driver: tokenize the source (from argv) and count the cons cells. The
 -- money-shot observable for brick 8a: count_cells_src("1 + 2\n3 * 4") = 8
 -- (tokens 1 + 2 Newline 3 * 4 then trailing Eof). Newline-bearing sources are
