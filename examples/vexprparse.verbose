@@ -322,7 +322,7 @@ concept_group VExpr [max_depth: 4096, max_nodes: 65535]
     @intention: "A parsed top-level rule declaration: its name span + its logic block"
     @source: vexprparse.intent:30
     variants:
-      MkRule of (name_start : number, name_len : number, body : Block)
+      MkRule of (name_start : number, name_len : number, params : ParamList, body : Block)
 
   -- Brick 12: a parsed PROGRAM — a cons-list of top-level rule declarations in
   -- source order. RCons carries one RuleDecl head and the rest; RNil is the empty
@@ -350,6 +350,29 @@ concept_group VExpr [max_depth: 4096, max_nodes: 65535]
     @source: vexprparse.intent:31
     variants:
       MkPR of (rule : RuleDecl, next : number)
+
+  -- Brick 16: a rule's PARAMETER list — a cons-list of parameter NAMES, each a
+  -- source span (name_start, name_len), in source order. Same identity model as a
+  -- Binding name or an AstVar (the param is its bytes in the source text, never
+  -- decoded). PNil terminates the list (zero params — `rule f()` or `rule f`).
+  -- Mirrors src/parser.rs's Rule.params (the formal parameter names) restricted to
+  -- bare names (no per-param type / default — those are later bricks). Lives in the
+  -- group because it is the same cons-list family as ArgList / Binding.
+  concept ParamList
+    @intention: "Cons-list of a rule's formal parameter names (each a source span)"
+    @source: vexprparse.intent:34
+    variants:
+      PCons of (name_start : number, name_len : number, rest : ParamList)
+      PNil
+
+  -- Brick 16: a parameter-list parse result — the ParamList built plus the token
+  -- index just past the closing ')' (or the unchanged start index when there are
+  -- no parens at all). Same Parsed-threading shape as ParsedArgs's MkArgs.
+  concept ParsedParams
+    @intention: "A parameter-list parse result: the ParamList built plus the end index"
+    @source: vexprparse.intent:34
+    variants:
+      MkPP of (params : ParamList, next : number)
 
 
 -- ============================================================================
@@ -3743,6 +3766,19 @@ concept RuleParseState
     src : text [..256]
 
 
+-- Brick 16: the parameter-list parse cursor — the token list plus the index at
+-- which the parameter list (or its absence) begins. Same shape as ParseState; a
+-- distinct name keeps parse_params's input self-documenting. parse_params reads
+-- the token at `pos`: a '(' opens a comma-separated IDENT list; anything else
+-- means "no parameters".
+concept ParamParseState
+  @intention: "The token list plus the index where a parameter list may begin"
+  @source: vexprparse.intent:34
+  fields:
+    toks : TokenList
+    pos : number [0, 512]
+
+
 -- A fixed-width span byte-check probe: the source text plus an Ident token's
 -- span (start, len). span_is_rule / span_is_logic compare the span against a
 -- fixed literal word, length first then each byte.
@@ -3805,7 +3841,7 @@ rule rd_name_start
     out : number
   logic:
     out = match r:
-      MkRule(name_start, name_len, body) => name_start
+      MkRule(name_start, name_len, params, body) => name_start
   proofs:
     purity:
       reads : [r]
@@ -3823,7 +3859,7 @@ rule rd_name_len
     out : number
   logic:
     out = match r:
-      MkRule(name_start, name_len, body) => name_len
+      MkRule(name_start, name_len, params, body) => name_len
   proofs:
     purity:
       reads : [r]
@@ -3841,11 +3877,161 @@ rule rd_body
     out : Block
   logic:
     out = match r:
-      MkRule(name_start, name_len, body) => body
+      MkRule(name_start, name_len, params, body) => body
   proofs:
     purity:
       reads : [r]
       calls : []
+    termination:
+      bound : 16
+
+
+rule rd_params
+  @intention: "The formal parameter list of a parsed rule declaration"
+  @source: vexprparse.intent:34
+  input:
+    r : RuleDecl
+  output:
+    out : ParamList
+  logic:
+    out = match r:
+      MkRule(name_start, name_len, params, body) => params
+  proofs:
+    purity:
+      reads : [r]
+      calls : []
+    termination:
+      bound : 16
+
+
+-- Accessors for a ParsedParams result (block-form match only legal in final
+-- position, so destructuring is factored into tiny rules — like parsed_args_*).
+rule pp_params
+  @intention: "The ParamList from a parameter-list parse result"
+  @source: vexprparse.intent:34
+  input:
+    p : ParsedParams
+  output:
+    out : ParamList
+  logic:
+    out = match p:
+      MkPP(params, next) => params
+  proofs:
+    purity:
+      reads : [p]
+      calls : []
+    termination:
+      bound : 16
+
+
+rule pp_next
+  @intention: "The token index just past a parameter-list parse result"
+  @source: vexprparse.intent:34
+  input:
+    p : ParsedParams
+  output:
+    out : number
+  logic:
+    out = match p:
+      MkPP(params, next) => next
+  proofs:
+    purity:
+      reads : [p]
+      calls : []
+    termination:
+      bound : 16
+
+
+-- params_prepend: cons the head parameter span onto the front of the already-
+-- parsed REST of the parameter list, carrying the rest's end index through.
+-- Splitting this out keeps the recursive params_scan call lazily inside the comma
+-- branch (a let would force it eagerly) — the same shape as args_prepend.
+concept ParamPrependState
+  @intention: "A head parameter span plus the parsed rest of the parameter list"
+  @source: vexprparse.intent:34
+  fields:
+    head_start : number
+    head_len : number
+    rest : ParsedParams
+
+
+rule params_prepend
+  @intention: "Cons a parameter span onto the front of the parsed rest of the list"
+  @source: vexprparse.intent:34
+  input:
+    pps : ParamPrependState
+  output:
+    out : ParsedParams
+  logic:
+    let rest_list = pp_params(pps.rest)
+    let rest_next = pp_next(pps.rest)
+    out = ParsedParams::MkPP { params: ParamList::PCons { name_start: pps.head_start, name_len: pps.head_len, rest: rest_list }, next: rest_next }
+  proofs:
+    purity:
+      reads : [pps.head_start, pps.head_len, pps.rest]
+      calls : [pp_params, pp_next]
+    termination:
+      bound : 16
+
+
+-- params_scan: parse a NON-EMPTY comma-separated IDENT list starting at the FIRST
+-- parameter's token index `ps.pos`. Read the IDENT span at ps.pos, peek the next
+-- token: a ',' (op 11) continues — parse the REST (LAZILY, in the then branch)
+-- from just past the comma and prepend this param; a ')' (op 22) stops, consuming
+-- it (next = pos + 2); anything else stops too (missing ')' tolerated, like
+-- args_cons), leaving next = pos + 1. Recurses over a forward token scan (no
+-- structural FIELD fits), so bound + the mandatory recursion breadcrumb (the
+-- backstop is the finite token list, bounded by max_nodes). Every peek is
+-- OOB-guarded by the token-list accessors (Eof past the end).
+rule params_scan
+  @intention: "Parse a non-empty comma-separated parameter-name list, consuming the ')'"
+  @source: vexprparse.intent:34
+  input:
+    ps : ParamParseState
+  output:
+    out : ParsedParams
+  logic:
+    let name_start = peek_start(Nth { lst: ps.toks, n: ps.pos })
+    let name_len = peek_len(Nth { lst: ps.toks, n: ps.pos })
+    let opc = peek_op_code(Nth { lst: ps.toks, n: ps.pos + 1 })
+    let iscomma = if opc == 11 then 1 else 0
+    let close_next = if opc == 22 then ps.pos + 2 else ps.pos + 1
+    out = if iscomma == 1 then params_prepend(ParamPrependState { head_start: name_start, head_len: name_len, rest: params_scan(ParamParseState { toks: ps.toks, pos: ps.pos + 2 }) }) else ParsedParams::MkPP { params: ParamList::PCons { name_start: name_start, name_len: name_len, rest: ParamList::PNil }, next: close_next }
+  proofs:
+    purity:
+      reads : [ps.toks, ps.pos]
+      calls : [peek_start, peek_len, peek_op_code, params_prepend, params_scan]
+    termination:
+      bound : 512
+
+
+-- parse_params: parse an OPTIONAL parameter list starting at ps.pos (the token
+-- right AFTER a rule's name). Three cases, in order:
+--   * token at pos is NOT '(' (op 21): no parens at all -> PNil, next = pos
+--     unchanged (the caller continues to `logic:` from there).
+--   * token at pos IS '(' and the next token is ')' (op 22): empty param list
+--     `()` -> PNil, next = pos + 2 (past both parens).
+--   * otherwise: a non-empty list -> params_scan from pos + 1 (the first IDENT).
+-- Mirrors parse_args's '(' / ')' / first-arg dispatch, but builds a ParamList of
+-- bare name spans instead of an ArgList of AST nodes. One-shot dispatch (the
+-- recursion lives in params_scan); bound-only termination.
+rule parse_params
+  @intention: "Parse an optional '(' name, name, ... ')' parameter list into a ParamList + end index"
+  @source: vexprparse.intent:34
+  input:
+    ps : ParamParseState
+  output:
+    out : ParsedParams
+  logic:
+    let opc = peek_op_code(Nth { lst: ps.toks, n: ps.pos })
+    let isopen = if opc == 21 then 1 else 0
+    let next_opc = peek_op_code(Nth { lst: ps.toks, n: ps.pos + 1 })
+    let isempty = if next_opc == 22 then 1 else 0
+    out = if isopen == 0 then ParsedParams::MkPP { params: ParamList::PNil, next: ps.pos } else (if isempty == 1 then ParsedParams::MkPP { params: ParamList::PNil, next: ps.pos + 2 } else params_scan(ParamParseState { toks: ps.toks, pos: ps.pos + 1 }))
+  proofs:
+    purity:
+      reads : [ps.toks, ps.pos]
+      calls : [peek_op_code, params_scan]
     termination:
       bound : 16
 
@@ -3883,7 +4069,10 @@ rule parse_rule_decl
     let kw_start = peek_start(Nth { lst: rp.toks, n: 0 })
     let kw_len = peek_len(Nth { lst: rp.toks, n: 0 })
     let is_rule = span_is_rule(SpanCheck { src: rp.src, start: kw_start, len: kw_len })
-    let logic_idx = skip_seps(ParseState { toks: rp.toks, pos: 2 })
+    let pp = parse_params(ParamParseState { toks: rp.toks, pos: 2 })
+    let params = pp_params(pp)
+    let after_params = pp_next(pp)
+    let logic_idx = skip_seps(ParseState { toks: rp.toks, pos: after_params })
     let logic_start = peek_start(Nth { lst: rp.toks, n: logic_idx })
     let logic_len = peek_len(Nth { lst: rp.toks, n: logic_idx })
     let is_logic = span_is_logic(SpanCheck { src: rp.src, start: logic_start, len: logic_len })
@@ -3891,11 +4080,11 @@ rule parse_rule_decl
     let body_idx = skip_seps(ParseState { toks: rp.toks, pos: logic_idx + 2 })
     let pb = parse_stmts(ParseState { toks: rp.toks, pos: body_idx })
     let goodblk = pb_block(pb)
-    out = RuleDecl::MkRule { name_start: name_start, name_len: name_len, body: if hdr_ok == 1 then goodblk else Block::MkBlock { binds: Binding::BNil, result: Ast::AstErr } }
+    out = RuleDecl::MkRule { name_start: name_start, name_len: name_len, params: params, body: if hdr_ok == 1 then goodblk else Block::MkBlock { binds: Binding::BNil, result: Ast::AstErr } }
   proofs:
     purity:
       reads : [rp.toks, rp.src]
-      calls : [peek_start, peek_len, span_is_rule, span_is_logic, skip_seps, parse_stmts, pb_block]
+      calls : [peek_start, peek_len, span_is_rule, parse_params, pp_params, pp_next, span_is_logic, skip_seps, parse_stmts, pb_block]
     termination:
       bound : 64
 
@@ -4132,7 +4321,10 @@ rule parse_rule_decl_pos
     let is_rule = span_is_rule(SpanCheck { src: ps.src, start: kw_start, len: kw_len })
     let name_start = peek_start(Nth { lst: ps.toks, n: ps.pos + 1 })
     let name_len = peek_len(Nth { lst: ps.toks, n: ps.pos + 1 })
-    let logic_idx = skip_seps(ParseState { toks: ps.toks, pos: ps.pos + 2 })
+    let pp = parse_params(ParamParseState { toks: ps.toks, pos: ps.pos + 2 })
+    let params = pp_params(pp)
+    let after_params = pp_next(pp)
+    let logic_idx = skip_seps(ParseState { toks: ps.toks, pos: after_params })
     let logic_start = peek_start(Nth { lst: ps.toks, n: logic_idx })
     let logic_len = peek_len(Nth { lst: ps.toks, n: logic_idx })
     let is_logic = span_is_logic(SpanCheck { src: ps.src, start: logic_start, len: logic_len })
@@ -4141,11 +4333,11 @@ rule parse_rule_decl_pos
     let pb = parse_stmts(ParseState { toks: ps.toks, pos: body_idx })
     let goodblk = pb_block(pb)
     let endp = pb_next(pb)
-    out = ParsedRule::MkPR { rule: RuleDecl::MkRule { name_start: name_start, name_len: name_len, body: if hdr_ok == 1 then goodblk else Block::MkBlock { binds: Binding::BNil, result: Ast::AstErr } }, next: endp }
+    out = ParsedRule::MkPR { rule: RuleDecl::MkRule { name_start: name_start, name_len: name_len, params: params, body: if hdr_ok == 1 then goodblk else Block::MkBlock { binds: Binding::BNil, result: Ast::AstErr } }, next: endp }
   proofs:
     purity:
       reads : [ps.toks, ps.src, ps.pos]
-      calls : [peek_start, peek_len, span_is_rule, span_is_logic, skip_seps, parse_stmts, pb_block, pb_next]
+      calls : [peek_start, peek_len, span_is_rule, parse_params, pp_params, pp_next, span_is_logic, skip_seps, parse_stmts, pb_block, pb_next]
     termination:
       bound : 64
 
@@ -4212,6 +4404,28 @@ rule rule_list_len
       structural : rl
 
 
+-- param_list_len: the number of formal parameters in a rule's ParamList.
+-- Structural recursion on the PCons tail (Phase C), like count_binds / rule_list_len.
+rule param_list_len
+  @intention: "Number of formal parameters in a rule's parameter list"
+  @source: vexprparse.intent:34
+  input:
+    pl : ParamList
+  output:
+    out : number
+  logic:
+    out = match pl:
+      PCons(name_start, name_len, rest) => 1 + param_list_len(rest)
+      PNil => 0
+  proofs:
+    purity:
+      reads : [pl]
+      calls : [param_list_len]
+    termination:
+      bound : 512
+      structural : pl
+
+
 -- drop_rules: the RuleList with its first dr.n rule cells removed — the cons-list
 -- analogue of drop_cells on a TokenList. A decreasing number field (dr.n) drives
 -- termination: each step recurses on the tail with n - 1. RNil (or n == 0)
@@ -4265,6 +4479,27 @@ rule rl_head_body
       bound : 16
 
 
+-- rl_head_params: the parameter list of the head rule of a rule list (empty list
+-- if none). Mirror of rl_head_body for brick 16's parameters.
+rule rl_head_params
+  @intention: "The formal parameter list of the head rule of a rule list (PNil if none)"
+  @source: vexprparse.intent:34
+  input:
+    rl : RuleList
+  output:
+    out : ParamList
+  logic:
+    out = match rl:
+      RCons(head, tail) => rd_params(head)
+      RNil => ParamList::PNil
+  proofs:
+    purity:
+      reads : [rl]
+      calls : [rd_params]
+    termination:
+      bound : 16
+
+
 -- count_rules: the brick-12 STRUCTURAL driver. Tokenize the program source (with
 -- indentation), parse the whole sequence of rule decls from index 0, and return
 -- the RuleList length. Proves the program splits into the right number of rule
@@ -4290,6 +4525,36 @@ rule count_rules
     purity:
       reads : [s.source]
       calls : [begin_tokenize, parse_program, rule_list_len]
+    termination:
+      bound : 256
+
+
+-- rule_param_count: the brick-16 PARSE money-shot driver. Tokenize the program
+-- source, parse the whole rule-decl sequence, and return the number of formal
+-- parameters of the FIRST rule.
+--
+--   rule_param_count("rule add(x, y)\n  logic:\n    out = x + y") = 2
+--   rule_param_count("rule f()\n  logic:\n    out = 1")          = 0   (empty parens)
+--   rule_param_count("rule g\n  logic:\n    out = 1")            = 0   (no parens)
+--
+-- NATIVE-ONLY (multi-line source). Takes a ScanState: source is argv arg 1, pos
+-- is argv arg 2 (always 0).
+rule rule_param_count
+  @intention: "Parse a program and return the number of parameters of its first rule"
+  @source: vexprparse.intent:34
+  input:
+    s : ScanState
+  output:
+    out : number
+  logic:
+    let toks = begin_tokenize(ScanState { source: s.source, pos: 0 })
+    let prog = parse_program(ProgramState { toks: toks, src: s.source, pos: 0 })
+    let params = rl_head_params(prog)
+    out = param_list_len(params)
+  proofs:
+    purity:
+      reads : [s.source]
+      calls : [begin_tokenize, parse_program, rl_head_params, param_list_len]
     termination:
       bound : 256
 
@@ -4581,6 +4846,71 @@ rule count_undef_binds_ordered
       bound : 4000
 
 
+-- Brick 16: convert a rule's ParamList into a Binding list so the existing scope
+-- machinery (name_bound, count_undef_*) treats every parameter as already-bound.
+-- A parameter has no RHS expression, but name_bound only ever reads a binding's
+-- NAME span (name_start, name_len) — never its `value` — so each param is consed
+-- as a BCons carrying a DUMMY value (AstNum 0). The resulting list is the rule's
+-- INITIAL scope: a param `x` is in scope for every let RHS and for the result,
+-- exactly like a let that is always already-defined. Structural recursion on the
+-- ParamList tail (Phase C), like count_binds on a Binding list.
+rule param_to_binding
+  @intention: "Convert a parameter list into a Binding list (params as already-bound names)"
+  @source: vexprparse.intent:34
+  input:
+    pl : ParamList
+  output:
+    out : Binding
+  logic:
+    out = match pl:
+      PCons(name_start, name_len, rest) => Binding::BCons { name_start: name_start, name_len: name_len, value: Ast::AstNum { value: 0 }, rest: param_to_binding(rest) }
+      PNil => Binding::BNil
+  proofs:
+    purity:
+      reads : [pl]
+      calls : [param_to_binding]
+    termination:
+      bound : 512
+      structural : pl
+
+
+-- Brick 16: append_bindings's input — the binding list `a` to prepend onto `b`.
+concept BindAppendState
+  @intention: "Two binding lists: `a` to be prepended onto `b`"
+  @source: vexprparse.intent:34
+  fields:
+    a : Binding
+    b : Binding
+
+
+-- append_bindings: the binding list with every cell of `a` consed (in order) onto
+-- the front of `b`. Used to combine the params-as-bindings with a rule's own let
+-- bindings into one scope for the result expression. Because name_bound checks
+-- membership (order-agnostic), the relative order of the two lists is irrelevant —
+-- the only requirement is that every name from BOTH lists is present. Recurses on
+-- the tail of `a` (a FIELD of the packed input, not the input itself), so the
+-- structural proof does not fit — this carries the bound + the mandatory native
+-- recursion breadcrumb, like count_undef_binds_ordered. The backstop is the finite
+-- binding list (bounded by max_nodes).
+rule append_bindings
+  @intention: "Prepend every binding of `a` onto the front of `b`"
+  @source: vexprparse.intent:34
+  input:
+    ba : BindAppendState
+  output:
+    out : Binding
+  logic:
+    out = match ba.a:
+      BCons(name_start, name_len, value, rest) => Binding::BCons { name_start: name_start, name_len: name_len, value: value, rest: append_bindings(BindAppendState { a: rest, b: ba.b }) }
+      BNil => ba.b
+  proofs:
+    purity:
+      reads : [ba.a, ba.b]
+      calls : [append_bindings]
+    termination:
+      bound : 4000
+
+
 -- lint_rule's input: one rule declaration + the program source text (the spans
 -- index into it). RuleDecl carries no src of its own, so the program source is
 -- threaded alongside.
@@ -4604,8 +4934,17 @@ concept LintRuleState
 -- to any other rule — block_binds(body) is this rule's binding list and nothing
 -- else. Brick-14 refinement of brick-13: the bindings part now threads a growing
 -- prefix instead of the whole list, so use-before-def is caught.
+--
+-- Brick 16 — PARAMETERS as the INITIAL scope. The rule's formal parameters
+-- (rd_params) are converted to Bindings (param_to_binding) and used as the BASE
+-- scope: a param is in scope for EVERY let RHS (so count_undef_binds_ordered is
+-- seeded with prefix = the params, not BNil) AND for the result (so the result's
+-- scope is the params APPENDED to the full binding list). A param `x` is therefore
+-- treated as already-defined everywhere in the body — like a let that is always
+-- already-bound. Note: params are added as the use-before-def prefix BASE, so a
+-- later let cannot "use-before-def" a parameter (a param precedes all lets).
 rule lint_rule
-  @intention: "Number of undefined-OR-use-before-def references in one rule (0 if clean)"
+  @intention: "Number of undefined-OR-use-before-def references in one rule (params in scope; 0 if clean)"
   @source: vexprparse.intent:32
   input:
     lr : LintRuleState
@@ -4615,12 +4954,14 @@ rule lint_rule
     let body = rd_body(lr.rd)
     let binds = block_binds(body)
     let result = block_result(body)
-    let undef_in_binds = count_undef_binds_ordered(UndefBindsOrderedState { iter: binds, prefix: Binding::BNil, src: lr.src })
-    out = undef_in_binds + count_undef_ast(UndefAstState { node: result, binds: binds, src: lr.src })
+    let pbinds = param_to_binding(rd_params(lr.rd))
+    let scope = append_bindings(BindAppendState { a: pbinds, b: binds })
+    let undef_in_binds = count_undef_binds_ordered(UndefBindsOrderedState { iter: binds, prefix: pbinds, src: lr.src })
+    out = undef_in_binds + count_undef_ast(UndefAstState { node: result, binds: scope, src: lr.src })
   proofs:
     purity:
       reads : [lr.rd, lr.src]
-      calls : [rd_body, block_binds, block_result, count_undef_binds_ordered, count_undef_ast]
+      calls : [rd_body, block_binds, block_result, rd_params, param_to_binding, append_bindings, count_undef_binds_ordered, count_undef_ast]
     termination:
       bound : 16
 

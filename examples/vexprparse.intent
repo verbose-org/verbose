@@ -536,3 +536,58 @@ there (out of the arithmetic evaluator's scope).
     (multi-line source), same scan-state invocation as items 31/32/33. The two
     driver passes (item 32/33's variable lint and this callee lint) are intended to
     be summed by a future combined linter; for now each is its own headline driver.
+
+
+34. Brick 16 of the self-hosting arc: RULE PARAMETERS. The toy grammar so far had
+    rules of the shape `rule NAME` then `logic:` — a name and a body, no formal
+    parameters. Real Verbose rules take parameters: `rule add(x, y)` declares two
+    formals x and y that are in scope throughout the body. Brick 16 parses the
+    optional parameter list and makes the parameter names a first-class part of the
+    rule declaration AND of the linter's scope.
+
+    THE GRAMMAR. After the rule NAME, the next token MAY be `(`. If so, a
+    comma-separated list of bare identifiers follows, closed by `)`:
+    `rule add(x, y)` -> params [x, y]; `rule f()` -> no params (empty parens);
+    `rule f` (no parens) -> no params (the parameter list is optional). The list is
+    parsed exactly like a call's argument list (the same `(` / `,` / `)` token
+    dispatch) but it collects bare NAME spans (a cons-list of (start, len) pairs)
+    instead of argument AST nodes. After the list (or the name when there are no
+    parens) the parser continues to `logic:` from the index just past the `)`.
+
+    PARAMETERS ARE NAMES. A parameter is its bytes in the source text — the same
+    identity model as a let-binding name or a variable reference. The parser does
+    not decode the name; it stores the span. The rule declaration grows one field:
+    its parameter list, carried alongside the name span and the logic block. Adding
+    that field touches every place the declaration is built or destructured (the
+    two header parsers and the field accessors); the verifier enforces that the
+    field is supplied everywhere, which keeps the change mechanical and complete.
+
+    PARAMETERS ARE THE INITIAL SCOPE. This is the linter half of the brick. A
+    parameter is a DEFINED variable everywhere in the body: a let RHS may reference
+    it, and the result may reference it, with no `let` introducing it. The cleanest
+    way to make the existing scope machinery honor this is to convert the parameter
+    list into a binding list (each parameter becomes a binding whose NAME is the
+    parameter span and whose value is a dummy — the membership check only ever
+    reads the name, never the value) and use that list as the BASE scope. The
+    use-before-def walk over the lets is then seeded with the parameters as its
+    starting prefix (so a parameter is "already seen" before the first let), and
+    the result is checked against the parameters appended to the full binding list.
+    Because membership is order-agnostic, appending the two lists in any order is
+    correct; the only requirement is that every name from both is present.
+
+    EVALUATION is unchanged and orthogonal: there is no call mechanism yet, so a
+    parameter has no value at evaluation time (like a free variable). A rule with
+    parameters whose body uses only literals and lets still evaluates correctly;
+    evaluating a body that references a parameter yields the unbound-variable value
+    (0), exactly as a variable with no binding does. Brick 16 is a PARSE + LINT
+    brick, not an eval brick — the eval drivers are verified to still produce the
+    right number when the body does not depend on a parameter's value.
+
+    THE MONEY SHOT: `rule add(x, y) / logic: / out = x + y` parses with 2
+    parameters and lints to 0 (x and y are in scope as parameters), while the same
+    rule with `out = x + z` lints to 1 (z is neither a parameter nor a let). A
+    parse driver returns the parameter count of the first rule (2 for `add(x, y)`,
+    0 for `f()` and for the no-paren form); the lint driver counts undefined
+    references with parameters treated as the initial scope. Both are NATIVE-ONLY
+    (multi-line source), same scan-state invocation as items 30-33. Rule parameters
+    parsed and scoped, in pure Verbose, run as native machine code.
