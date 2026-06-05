@@ -5350,6 +5350,398 @@ rule lint_callees
       bound : 256
 
 
+-- ============================================================================
+-- BRICK 17: CALL-ARITY checking — the linter's SECOND inter-rule pass.
+--
+-- The callee pass (brick 15) asks "does the called rule EXIST?". This pass asks
+-- the next question: "does the call pass the RIGHT NUMBER OF ARGUMENTS?". A call
+-- `add(1)` to a rule `rule add(x, y)` is well-formed for the callee pass (add
+-- exists) but WRONG here (1 argument supplied, 2 parameters declared). The
+-- headline driver returns the total number of call sites whose argument count
+-- does not match the called rule's parameter count.
+--
+-- ONLY EXISTING RULES ARE CHECKED. An undefined callee is the callee pass's
+-- concern, not this one: if a call names a rule that does not exist, this pass
+-- contributes 0 for that call (you cannot compare against an arity that is not
+-- there). So the two passes are PROVABLY INDEPENDENT — `g(1, 2)` with g
+-- undefined lints 1 under the callee pass and 0 here; `add(1)` with add a real
+-- 2-param rule lints 0 under the callee pass and 1 here.
+--
+-- PROGRAM-WIDE, ORDER-AGNOSTIC SCOPE — identical to the callee pass: a call may
+-- target a rule defined anywhere (forward, self, mutual). So the structure
+-- mirrors the callee pass exactly: a membership-style probe over the program's
+-- RuleList, an Ast/ArgList mutual walk, a per-rule split (binds + result), and
+-- an iter/all fold over the program.
+--
+-- THE SENTINEL. rule_arity returns a NOT-FOUND sentinel of 1000000 (one million)
+-- when no rule of the query name exists. A negative sentinel would be wrong: a
+-- `number` field defaults to the range [0, i32::MAX], and the optimizer's
+-- interval arithmetic could dead-eliminate a branch testing a negative value.
+-- 1000000 is safely inside the field range, far above any real parameter count,
+-- and the `found == 1000000` test is exact.
+--
+-- The rules:
+--   * arg_list_len      — the number of arguments in a call's ArgList (mirrors
+--                         param_list_len over ParamList).
+--   * rule_arity        — the parameter count of the FIRST rule whose name span
+--                         byte-equals the query span, or the 1000000 sentinel.
+--                         Mirrors rule_named's RuleList walk but returns the arity.
+--   * arity_mismatch    — 0/1 for ONE call: 0 if the callee is undefined OR the
+--                         arg count matches; 1 if the callee exists and the count
+--                         differs. A helper so the AstCall arm evaluates rule_arity
+--                         exactly once (no inline double-evaluation).
+--   * count_badarity_args — sum count_badarity_ast over an ArgList (nested calls).
+--   * count_badarity_ast  — walk an Ast; at AstCall add arity_mismatch for THIS
+--                           call, then recurse into the arguments.
+--   * count_badarity_binds — sum count_badarity_ast over each binding's RHS.
+--   * badarity_rule     — one rule's arity-mismatch count (binds RHSes + result).
+--   * lint_arity_list   — fold badarity_rule over the program (iter advances,
+--                         the full list `all` stays fixed).
+--   * lint_arity        — the driver: tokenize -> parse_program -> lint_arity_list.
+-- ============================================================================
+
+-- arg_list_len: the number of arguments in a call's ArgList. Structural recursion
+-- on the ArgCons tail (Phase C), the exact mirror of param_list_len over ParamList:
+-- ArgCons contributes 1 + the tail's length, ArgNil is 0. Takes the bare ArgList
+-- as input (no wrapper state) — same shape as param_list_len.
+rule arg_list_len
+  @intention: "Number of arguments in a call's argument list"
+  @source: vexprparse.intent:35
+  input:
+    al : ArgList
+  output:
+    out : number
+  logic:
+    out = match al:
+      ArgCons(head, tail) => 1 + arg_list_len(tail)
+      ArgNil => 0
+  proofs:
+    purity:
+      reads : [al]
+      calls : [arg_list_len]
+    termination:
+      bound : 512
+      structural : al
+
+
+-- rule_arity's probe: the program's RuleList to search + the source text + the
+-- query callee name's span (q_start, q_len). The arity-resolution analogue of
+-- RuleNamedState — same fields, different return (an arity instead of a 0/1
+-- membership flag).
+concept RuleArityState
+  @intention: "A rule list to search + the source text + the query callee name's span"
+  @source: vexprparse.intent:35
+  fields:
+    rules : RuleList
+    src : text [..256]
+    q_start : number [0, 256]
+    q_len : number [0, 256]
+
+
+-- rule_arity: the parameter count of the FIRST rule whose NAME span byte-equals
+-- the query span, or the 1000000 NOT-FOUND sentinel if no rule matches. Walks the
+-- RuleList exactly like rule_named (same RCons/RNil cons-walk, same length-then-
+-- bytes name_eq guard), but on a match it returns param_list_len(rd_params(head))
+-- instead of 1, and on RNil it returns the sentinel instead of 0. The sentinel is
+-- 1000000 (NOT -1) so the optimizer's interval arithmetic over the default
+-- [0, i32::MAX] field range cannot dead-eliminate a negative-test branch. Recurses
+-- over the RuleList tail (a field of the input), so bound + native breadcrumb.
+rule rule_arity
+  @intention: "Parameter count of the rule matching a callee name span, or 1000000 if none"
+  @source: vexprparse.intent:35
+  input:
+    st : RuleArityState
+  output:
+    out : number
+  logic:
+    out = match st.rules:
+      RCons(head, tail) => if rd_name_len(head) == st.q_len and name_eq(NameEqState { src: st.src, a_start: rd_name_start(head), b_start: st.q_start, len: st.q_len, off: 0 }) == 1 then param_list_len(rd_params(head)) else rule_arity(RuleArityState { rules: tail, src: st.src, q_start: st.q_start, q_len: st.q_len })
+      RNil => 1000000
+  proofs:
+    purity:
+      reads : [st.rules, st.src, st.q_start, st.q_len]
+      calls : [rd_name_len, rd_name_start, name_eq, param_list_len, rd_params, rule_arity]
+    termination:
+      bound : 4000
+
+
+-- arity_mismatch's input: ONE call's callee name span (callee_start, callee_len)
+-- + that call's ArgList + the program's RuleList (the scope the callee is resolved
+-- against) + the source text. Packs everything the per-call arity decision needs.
+concept MismatchState
+  @intention: "A call's callee span + its argument list + the program rule list + the source text"
+  @source: vexprparse.intent:35
+  fields:
+    rules : RuleList
+    src : text [..256]
+    callee_start : number [0, 256]
+    callee_len : number [0, 256]
+    args : ArgList
+
+
+-- arity_mismatch: 0/1 for ONE call. Resolve the callee's declared arity via
+-- rule_arity (evaluated ONCE here, then bound to `found` — this is why this is a
+-- helper rule and not an inline expression in the AstCall arm: an inline form
+-- would have to call rule_arity twice). Then:
+--   * found == 1000000 (callee does not exist) => 0. An undefined callee is the
+--     callee pass's job; arity skips it.
+--   * else compare the supplied argument count (arg_list_len) to `found`: equal
+--     => 0 (well-formed call), different => 1 (arity mismatch).
+-- No recursion of its own; it is a leaf decision summed by count_badarity_ast.
+rule arity_mismatch
+  @intention: "1 if a call to an existing rule supplies the wrong number of arguments, else 0"
+  @source: vexprparse.intent:35
+  input:
+    m : MismatchState
+  output:
+    out : number
+  logic:
+    let found = rule_arity(RuleArityState { rules: m.rules, src: m.src, q_start: m.callee_start, q_len: m.callee_len })
+    out = if found == 1000000 then 0 else (if arg_list_len(m.args) == found then 0 else 1)
+  proofs:
+    purity:
+      reads : [m.rules, m.src, m.callee_start, m.callee_len, m.args]
+      calls : [rule_arity, arg_list_len]
+    termination:
+      bound : 16
+
+
+-- count_badarity_args's input: the argument list to walk + the program's RuleList
+-- (callee scope) + the source text. Mirrors BadCallArgsState exactly.
+concept BadArityArgsState
+  @intention: "A call-argument list + the program rule list (callee scope) + the source text"
+  @source: vexprparse.intent:35
+  fields:
+    args : ArgList
+    rules : RuleList
+    src : text [..256]
+
+
+-- The Ast-walking input: the AST node + the program's RuleList (callee scope) +
+-- src. Mirrors BadCallState exactly.
+concept BadArityState
+  @intention: "An Ast node + the program rule list (callee scope) + the source text"
+  @source: vexprparse.intent:35
+  fields:
+    node : Ast
+    rules : RuleList
+    src : text [..256]
+
+
+-- count_badarity_args: sum count_badarity_ast over every argument of a call's
+-- ArgList. Mutually recursive with count_badarity_ast — a nested call like h(1)
+-- inside g(h(1)) is recursed into here (h's own arity is then checked at its
+-- AstCall node). Recurses over the ArgList tail (a field of the input), so bound +
+-- breadcrumb; rules (scope) + src threaded unchanged. Mirrors count_badcall_args.
+rule count_badarity_args
+  @intention: "Total arity-mismatch references across every argument of a call"
+  @source: vexprparse.intent:35
+  input:
+    a : BadArityArgsState
+  output:
+    out : number
+  logic:
+    out = match a.args:
+      ArgCons(head, tail) => count_badarity_ast(BadArityState { node: head, rules: a.rules, src: a.src }) + count_badarity_args(BadArityArgsState { args: tail, rules: a.rules, src: a.src })
+      ArgNil => 0
+  proofs:
+    purity:
+      reads : [a.args, a.rules, a.src]
+      calls : [count_badarity_ast, count_badarity_args]
+    termination:
+      bound : 4000
+
+
+-- count_badarity_ast: walk an Ast and count the AstCall sites whose argument count
+-- does not match the called rule's parameter count. Mirrors count_badcall_ast's
+-- structural walk; the ONLY behavioral difference is the AstCall arm:
+--   * AstCall(callee_start, callee_len, args) => arity_mismatch for THIS call (0 if
+--     the callee is undefined or the count matches, 1 if it exists and differs)
+--     PLUS count_badarity_args over the arguments (so a nested call's own arity is
+--     also checked). The two summands are the per-call decision and the args walk.
+--   * AstBin sums lhs + rhs; AstNeg / AstNot descend; AstIf sums cond + thn + els;
+--     AstField walks its base. AstVar / AstNum / AstStr / AstBool / AstErr carry no
+--     call -> 0.
+-- a.node is a FIELD of the packed input (not the input), so bound + native breadcrumb.
+rule count_badarity_ast
+  @intention: "Total arity-mismatch references in an AST, given the program's rule list"
+  @source: vexprparse.intent:35
+  input:
+    a : BadArityState
+  output:
+    out : number
+  logic:
+    out = match a.node:
+      AstNum(value) => 0
+      AstBin(op, lhs, rhs) => count_badarity_ast(BadArityState { node: lhs, rules: a.rules, src: a.src }) + count_badarity_ast(BadArityState { node: rhs, rules: a.rules, src: a.src })
+      AstNeg(inner) => count_badarity_ast(BadArityState { node: inner, rules: a.rules, src: a.src })
+      AstNot(inner) => count_badarity_ast(BadArityState { node: inner, rules: a.rules, src: a.src })
+      AstVar(start, len) => 0
+      AstField(base, fstart, flen) => count_badarity_ast(BadArityState { node: base, rules: a.rules, src: a.src })
+      AstCall(callee_start, callee_len, args) => arity_mismatch(MismatchState { rules: a.rules, src: a.src, callee_start: callee_start, callee_len: callee_len, args: args }) + count_badarity_args(BadArityArgsState { args: args, rules: a.rules, src: a.src })
+      AstIf(cond, thn, els) => count_badarity_ast(BadArityState { node: cond, rules: a.rules, src: a.src }) + count_badarity_ast(BadArityState { node: thn, rules: a.rules, src: a.src }) + count_badarity_ast(BadArityState { node: els, rules: a.rules, src: a.src })
+      AstBool(value) => 0
+      AstStr(start, len) => 0
+      AstErr => 0
+  proofs:
+    purity:
+      reads : [a.node, a.rules, a.src]
+      calls : [count_badarity_ast, count_badarity_args, arity_mismatch]
+    termination:
+      bound : 4000
+
+
+-- count_badarity_binds's input: the binding list whose RHSes are walked + the
+-- program's RuleList (callee scope) + the source text. No prefix — callee scope is
+-- program-wide and order-agnostic, so every RHS sees the FULL program rule list.
+-- Mirrors BadCallBindsState exactly.
+concept BadArityBindsState
+  @intention: "A binding list + the program rule list (callee scope) + the source text"
+  @source: vexprparse.intent:35
+  fields:
+    binds : Binding
+    rules : RuleList
+    src : text [..256]
+
+
+-- count_badarity_binds: for each binding in the list, count_badarity_ast on its
+-- RHS `value` against the FULL program rule list, then recurse on `rest`. Recurses
+-- over the binding tail (a field of the input), so bound + breadcrumb; rules + src
+-- threaded unchanged. Mirrors count_badcall_binds.
+rule count_badarity_binds
+  @intention: "Total arity-mismatch references across every binding's RHS"
+  @source: vexprparse.intent:35
+  input:
+    b : BadArityBindsState
+  output:
+    out : number
+  logic:
+    out = match b.binds:
+      BCons(name_start, name_len, value, rest) => count_badarity_ast(BadArityState { node: value, rules: b.rules, src: b.src }) + count_badarity_binds(BadArityBindsState { binds: rest, rules: b.rules, src: b.src })
+      BNil => 0
+  proofs:
+    purity:
+      reads : [b.binds, b.rules, b.src]
+      calls : [count_badarity_ast, count_badarity_binds]
+    termination:
+      bound : 4000
+
+
+-- badarity_rule's input: ONE rule declaration being checked + the FULL program
+-- RuleList (so the checked rule's calls resolve against every rule) + the source
+-- text. Mirrors BadCallRuleState exactly.
+concept BadArityRuleState
+  @intention: "A rule declaration + the full program rule list + the source text"
+  @source: vexprparse.intent:35
+  fields:
+    rd : RuleDecl
+    rules : RuleList
+    src : text [..256]
+
+
+-- badarity_rule: the arity-mismatch count for ONE rule. Split the body Block into
+-- its binding list and result expression, then sum:
+--   * count_badarity_binds over the bindings (every let RHS's calls), PLUS
+--   * count_badarity_ast over the result expression's calls.
+-- Both halves resolve callees against the SAME full program RuleList `br.rules`.
+-- 0 = every call in this rule supplies the right number of arguments (or names a
+-- rule that does not exist, which arity skips). Mirrors badcall_rule.
+rule badarity_rule
+  @intention: "Number of arity-mismatch references in one rule (0 if every call's arity is right)"
+  @source: vexprparse.intent:35
+  input:
+    br : BadArityRuleState
+  output:
+    out : number
+  logic:
+    let body = rd_body(br.rd)
+    let binds = block_binds(body)
+    let result = block_result(body)
+    let bad_in_binds = count_badarity_binds(BadArityBindsState { binds: binds, rules: br.rules, src: br.src })
+    out = bad_in_binds + count_badarity_ast(BadArityState { node: result, rules: br.rules, src: br.src })
+  proofs:
+    purity:
+      reads : [br.rd, br.rules, br.src]
+      calls : [rd_body, block_binds, block_result, count_badarity_binds, count_badarity_ast]
+    termination:
+      bound : 16
+
+
+-- lint_arity_list's input: the rule list being ITERATED (`iter` advances each step,
+-- one rule checked per step) + the FULL program rule list (`all`, fixed, so every
+-- rule resolves its calls against every rule) + the source text. The iter/all split
+-- makes callee scope program-wide, exactly like LintCalleesState.
+concept LintArityState
+  @intention: "The rule list being iterated + the full program rule list + the source text"
+  @source: vexprparse.intent:35
+  fields:
+    iter : RuleList
+    all : RuleList
+    src : text [..256]
+
+
+-- lint_arity_list: sum badarity_rule over every rule in the program. Recurses over
+-- `iter` (a field of the input), so bound + breadcrumb; `all` and `src` are threaded
+-- unchanged so every rule sees the same full program rule list and the same source
+-- buffer. Total arity-mismatch references across the program. Mirrors lint_callees_list.
+rule lint_arity_list
+  @intention: "Total arity-mismatch references across every rule in a program"
+  @source: vexprparse.intent:35
+  input:
+    la : LintArityState
+  output:
+    out : number
+  logic:
+    out = match la.iter:
+      RCons(head, tail) => badarity_rule(BadArityRuleState { rd: head, rules: la.all, src: la.src }) + lint_arity_list(LintArityState { iter: tail, all: la.all, src: la.src })
+      RNil => 0
+  proofs:
+    purity:
+      reads : [la.iter, la.all, la.src]
+      calls : [badarity_rule, lint_arity_list]
+    termination:
+      bound : 4000
+
+
+-- lint_arity: the brick-17 money-shot driver. Tokenize the program source (with
+-- indentation), parse the whole rule-decl sequence into a RuleList, then fold
+-- badarity_rule over it with `iter = all = the parsed program` so every rule
+-- resolves its calls' arities against the entire program. Returns the TOTAL number
+-- of call sites whose argument count does not match the called rule's parameter
+-- count (calls to non-existent rules are skipped — the callee pass's job). 0 =
+-- every call to an existing rule supplies the right number of arguments.
+--
+--   lint_arity("rule add(x, y)\n  logic:\n    out = x + y\nrule f\n  logic:\n    out = add(1, 2)") = 0
+--                                          (2 args supplied, 2 params declared)
+--   lint_arity("rule add(x, y)\n  logic:\n    out = x + y\nrule f\n  logic:\n    out = add(1)") = 1
+--                                          (1 arg supplied, 2 params declared)
+--   lint_arity("rule f\n  logic:\n    out = g(1, 2)") = 0
+--                                          (g undefined — arity skips it; the callee pass counts it)
+--   lint_arity("rule f(n)\n  logic:\n    out = f(n)") = 0   (self-call, correct arity)
+--   lint_arity("rule f(n)\n  logic:\n    out = f(n, n)") = 1 (self-call, wrong arity)
+--
+-- NATIVE-ONLY (multi-line source). Takes a ScanState (source + pos): source is
+-- argv arg 1, pos is argv arg 2 (always 0). Independent of lint_callees and
+-- lint_program: a call to a missing rule is counted there, not here.
+rule lint_arity
+  @intention: "Tokenize, parse, and count all arity-mismatch references in a program"
+  @source: vexprparse.intent:35
+  input:
+    s : ScanState
+  output:
+    out : number
+  logic:
+    let toks = begin_tokenize(ScanState { source: s.source, pos: 0 })
+    let prog = parse_program(ProgramState { toks: toks, src: s.source, pos: 0 })
+    out = lint_arity_list(LintArityState { iter: prog, all: prog, src: s.source })
+  proofs:
+    purity:
+      reads : [s.source]
+      calls : [begin_tokenize, parse_program, lint_arity_list]
+    termination:
+      bound : 256
+
+
 -- Entry driver: tokenize the source (from argv) and count the cons cells. The
 -- money-shot observable for brick 8a: count_cells_src("1 + 2\n3 * 4") = 8
 -- (tokens 1 + 2 Newline 3 * 4 then trailing Eof). Newline-bearing sources are

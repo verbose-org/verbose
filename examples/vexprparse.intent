@@ -591,3 +591,55 @@ there (out of the arithmetic evaluator's scope).
     references with parameters treated as the initial scope. Both are NATIVE-ONLY
     (multi-line source), same scan-state invocation as items 30-33. Rule parameters
     parsed and scoped, in pure Verbose, run as native machine code.
+
+
+35. Brick 17 of the self-hosting arc: CALL-ARITY checking — the linter's SECOND
+    inter-rule pass. The callee pass (item 34, brick 15) asks "does the called
+    rule EXIST?". This pass asks the next question down: "does the call pass the
+    RIGHT NUMBER OF ARGUMENTS?". A call `add(1)` to a rule `rule add(x, y)` is
+    well-formed for the callee pass (add exists) but WRONG here — one argument
+    supplied, two parameters declared. The headline driver returns the total
+    number of call sites whose argument count does not match the called rule's
+    parameter count. 0 = every call to an existing rule is well-arged.
+
+    ONLY EXISTING RULES ARE CHECKED. An undefined callee is the callee pass's
+    concern, not this one: if a call names a rule that does not exist, this pass
+    contributes 0 for that call — you cannot compare against an arity that is not
+    there. This makes the two passes PROVABLY INDEPENDENT and complementary:
+    `g(1, 2)` with g undefined lints 1 under the callee pass and 0 here; `add(1)`
+    with add a real 2-parameter rule lints 0 under the callee pass and 1 here.
+    The arity pass needs the callee to exist before it has anything to say; the
+    callee pass needs the callee to NOT exist before it has anything to say.
+
+    PROGRAM-WIDE, ORDER-AGNOSTIC SCOPE — identical to the callee pass. A call may
+    target a rule defined anywhere (forward, self, mutual), so the structure
+    mirrors the callee pass exactly: a probe over the program's rule list that
+    returns the matched rule's parameter count (instead of a 0/1 membership flag),
+    an Ast/ArgList mutual walk, a per-rule split (every let RHS plus the result),
+    and an iter/all fold over the program (iter advances one rule per step, all
+    stays fixed so every rule resolves its calls against every rule).
+
+    THE NOT-FOUND SENTINEL. The arity probe returns 1000000 (one million) when no
+    rule of the queried name exists — deliberately NOT -1. A `number` field
+    defaults to the range [0, i32::MAX], and the optimizer's interval arithmetic
+    could dead-eliminate a branch that tests a negative value. 1000000 is safely
+    inside the field range, far above any real parameter count, and the
+    `found == 1000000` skip test is exact. Counting the arguments of a call and
+    the parameters of a rule are the same structural-recursion shape over their
+    respective cons-lists (the argument-count rule is the exact mirror of the
+    parameter-count rule from brick 16). The per-call decision is factored into a
+    tiny helper so the arity probe is evaluated exactly once per call (no inline
+    double-evaluation): 0 if the callee is undefined or the counts match, 1 if the
+    callee exists and the counts differ.
+
+    THE MONEY SHOT: `rule add(x, y) / logic: / out = x + y` plus a caller doing
+    `out = add(1, 2)` lints to 0 (2 args, 2 params), while the same caller doing
+    `out = add(1)` lints to 1 (1 arg, 2 params). A call to an undefined `g(1, 2)`
+    lints to 0 here (arity skips it — the callee pass counts it). A self-call with
+    correct arity (`rule f(n) / out = f(n)`) stays 0; the same with a wrong arity
+    (`out = f(n, n)`) lints to 1 — a rule mis-calling itself, caught across the
+    whole program. NATIVE-ONLY (multi-line source), same scan-state invocation as
+    items 30-34. A second cross-rule static check, written in Verbose, run as
+    native machine code over a parsed Verbose program — independent of both the
+    variable lint and the callee lint, intended to be summed by a future combined
+    linter; for now each is its own headline driver.
