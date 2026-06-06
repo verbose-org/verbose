@@ -3564,12 +3564,13 @@ rule env_lookup
 -- variable references against, and the source text the spans index into. Carries
 -- a group field (node : Ast) AND a text field (src) — the 2b052a7 shape.
 concept EvalEnvArg
-  @intention: "An Ast node + the environment + the source text, for evaluating with name resolution"
-  @source: vexprparse.intent:29
+  @intention: "An Ast node + the environment + the source text + the program, for evaluating with name resolution and calls"
+  @source: vexprparse.intent:36
   fields:
     node : Ast
     env : Env
     src : text [..256]
+    prog : RuleList
 
 
 -- eval_ast_env: eval_ast EXTENDED with an environment. Identical to eval_ast for
@@ -3593,20 +3594,20 @@ rule eval_ast_env
   logic:
     out = match ea.node:
       AstNum(value) => value
-      AstBin(op, lhs, rhs) => if op == 13 then eval_ast_env(EvalEnvArg { node: lhs, env: ea.env, src: ea.src }) + eval_ast_env(EvalEnvArg { node: rhs, env: ea.env, src: ea.src }) else if op == 14 then eval_ast_env(EvalEnvArg { node: lhs, env: ea.env, src: ea.src }) - eval_ast_env(EvalEnvArg { node: rhs, env: ea.env, src: ea.src }) else if op == 15 then eval_ast_env(EvalEnvArg { node: lhs, env: ea.env, src: ea.src }) * eval_ast_env(EvalEnvArg { node: rhs, env: ea.env, src: ea.src }) else if op == 16 then eval_ast_env(EvalEnvArg { node: lhs, env: ea.env, src: ea.src }) / eval_ast_env(EvalEnvArg { node: rhs, env: ea.env, src: ea.src }) else if op == 17 then eval_ast_env(EvalEnvArg { node: lhs, env: ea.env, src: ea.src }) % eval_ast_env(EvalEnvArg { node: rhs, env: ea.env, src: ea.src }) else if op == 1 then (if eval_ast_env(EvalEnvArg { node: lhs, env: ea.env, src: ea.src }) == eval_ast_env(EvalEnvArg { node: rhs, env: ea.env, src: ea.src }) then 1 else 0) else if op == 6 then (if eval_ast_env(EvalEnvArg { node: lhs, env: ea.env, src: ea.src }) != eval_ast_env(EvalEnvArg { node: rhs, env: ea.env, src: ea.src }) then 1 else 0) else if op == 19 then (if eval_ast_env(EvalEnvArg { node: lhs, env: ea.env, src: ea.src }) < eval_ast_env(EvalEnvArg { node: rhs, env: ea.env, src: ea.src }) then 1 else 0) else if op == 20 then (if eval_ast_env(EvalEnvArg { node: lhs, env: ea.env, src: ea.src }) > eval_ast_env(EvalEnvArg { node: rhs, env: ea.env, src: ea.src }) then 1 else 0) else if op == 5 then (if eval_ast_env(EvalEnvArg { node: lhs, env: ea.env, src: ea.src }) <= eval_ast_env(EvalEnvArg { node: rhs, env: ea.env, src: ea.src }) then 1 else 0) else if op == 4 then (if eval_ast_env(EvalEnvArg { node: lhs, env: ea.env, src: ea.src }) >= eval_ast_env(EvalEnvArg { node: rhs, env: ea.env, src: ea.src }) then 1 else 0) else if op == 30 then (if eval_ast_env(EvalEnvArg { node: lhs, env: ea.env, src: ea.src }) != 0 and eval_ast_env(EvalEnvArg { node: rhs, env: ea.env, src: ea.src }) != 0 then 1 else 0) else if op == 31 then (if eval_ast_env(EvalEnvArg { node: lhs, env: ea.env, src: ea.src }) != 0 or eval_ast_env(EvalEnvArg { node: rhs, env: ea.env, src: ea.src }) != 0 then 1 else 0) else 0
-      AstNeg(inner) => 0 - eval_ast_env(EvalEnvArg { node: inner, env: ea.env, src: ea.src })
-      AstNot(inner) => if eval_ast_env(EvalEnvArg { node: inner, env: ea.env, src: ea.src }) == 0 then 1 else 0
+      AstBin(op, lhs, rhs) => if op == 13 then eval_ast_env(EvalEnvArg { node: lhs, env: ea.env, src: ea.src, prog: ea.prog }) + eval_ast_env(EvalEnvArg { node: rhs, env: ea.env, src: ea.src, prog: ea.prog }) else if op == 14 then eval_ast_env(EvalEnvArg { node: lhs, env: ea.env, src: ea.src, prog: ea.prog }) - eval_ast_env(EvalEnvArg { node: rhs, env: ea.env, src: ea.src, prog: ea.prog }) else if op == 15 then eval_ast_env(EvalEnvArg { node: lhs, env: ea.env, src: ea.src, prog: ea.prog }) * eval_ast_env(EvalEnvArg { node: rhs, env: ea.env, src: ea.src, prog: ea.prog }) else if op == 16 then eval_ast_env(EvalEnvArg { node: lhs, env: ea.env, src: ea.src, prog: ea.prog }) / eval_ast_env(EvalEnvArg { node: rhs, env: ea.env, src: ea.src, prog: ea.prog }) else if op == 17 then eval_ast_env(EvalEnvArg { node: lhs, env: ea.env, src: ea.src, prog: ea.prog }) % eval_ast_env(EvalEnvArg { node: rhs, env: ea.env, src: ea.src, prog: ea.prog }) else if op == 1 then (if eval_ast_env(EvalEnvArg { node: lhs, env: ea.env, src: ea.src, prog: ea.prog }) == eval_ast_env(EvalEnvArg { node: rhs, env: ea.env, src: ea.src, prog: ea.prog }) then 1 else 0) else if op == 6 then (if eval_ast_env(EvalEnvArg { node: lhs, env: ea.env, src: ea.src, prog: ea.prog }) != eval_ast_env(EvalEnvArg { node: rhs, env: ea.env, src: ea.src, prog: ea.prog }) then 1 else 0) else if op == 19 then (if eval_ast_env(EvalEnvArg { node: lhs, env: ea.env, src: ea.src, prog: ea.prog }) < eval_ast_env(EvalEnvArg { node: rhs, env: ea.env, src: ea.src, prog: ea.prog }) then 1 else 0) else if op == 20 then (if eval_ast_env(EvalEnvArg { node: lhs, env: ea.env, src: ea.src, prog: ea.prog }) > eval_ast_env(EvalEnvArg { node: rhs, env: ea.env, src: ea.src, prog: ea.prog }) then 1 else 0) else if op == 5 then (if eval_ast_env(EvalEnvArg { node: lhs, env: ea.env, src: ea.src, prog: ea.prog }) <= eval_ast_env(EvalEnvArg { node: rhs, env: ea.env, src: ea.src, prog: ea.prog }) then 1 else 0) else if op == 4 then (if eval_ast_env(EvalEnvArg { node: lhs, env: ea.env, src: ea.src, prog: ea.prog }) >= eval_ast_env(EvalEnvArg { node: rhs, env: ea.env, src: ea.src, prog: ea.prog }) then 1 else 0) else if op == 30 then (if eval_ast_env(EvalEnvArg { node: lhs, env: ea.env, src: ea.src, prog: ea.prog }) != 0 and eval_ast_env(EvalEnvArg { node: rhs, env: ea.env, src: ea.src, prog: ea.prog }) != 0 then 1 else 0) else if op == 31 then (if eval_ast_env(EvalEnvArg { node: lhs, env: ea.env, src: ea.src, prog: ea.prog }) != 0 or eval_ast_env(EvalEnvArg { node: rhs, env: ea.env, src: ea.src, prog: ea.prog }) != 0 then 1 else 0) else 0
+      AstNeg(inner) => 0 - eval_ast_env(EvalEnvArg { node: inner, env: ea.env, src: ea.src, prog: ea.prog })
+      AstNot(inner) => if eval_ast_env(EvalEnvArg { node: inner, env: ea.env, src: ea.src, prog: ea.prog }) == 0 then 1 else 0
       AstVar(start, len) => env_lookup(EnvLookState { env: ea.env, src: ea.src, q_start: start, q_len: len })
       AstField(base, fstart, flen) => 0
-      AstCall(callee_start, callee_len, args) => 0
-      AstIf(cond, thn, els) => if eval_ast_env(EvalEnvArg { node: cond, env: ea.env, src: ea.src }) != 0 then eval_ast_env(EvalEnvArg { node: thn, env: ea.env, src: ea.src }) else eval_ast_env(EvalEnvArg { node: els, env: ea.env, src: ea.src })
+      AstCall(callee_start, callee_len, args) => eval_call(EvalCallState { callee_start: callee_start, callee_len: callee_len, args: args, env: ea.env, src: ea.src, prog: ea.prog })
+      AstIf(cond, thn, els) => if eval_ast_env(EvalEnvArg { node: cond, env: ea.env, src: ea.src, prog: ea.prog }) != 0 then eval_ast_env(EvalEnvArg { node: thn, env: ea.env, src: ea.src, prog: ea.prog }) else eval_ast_env(EvalEnvArg { node: els, env: ea.env, src: ea.src, prog: ea.prog })
       AstBool(value) => value
       AstStr(start, len) => 0
       AstErr => 0
   proofs:
     purity:
-      reads : [ea.node, ea.env, ea.src]
-      calls : [eval_ast_env, env_lookup]
+      reads : [ea.node, ea.env, ea.src, ea.prog]
+      calls : [eval_ast_env, env_lookup, eval_call]
     termination:
       bound : 4000
 
@@ -3615,12 +3616,100 @@ rule eval_ast_env
 -- source text (each binding's RHS is evaluated against env_so_far, and AstVar
 -- references in it resolve via src).
 concept BuildEnvArg
-  @intention: "Remaining bindings + the env built so far + the source text"
-  @source: vexprparse.intent:29
+  @intention: "Remaining bindings + the env built so far + the source text + the program (for calls in RHSes)"
+  @source: vexprparse.intent:36
   fields:
     binds : Binding
     env : Env
     src : text [..256]
+    prog : RuleList
+
+
+-- ============================================================================
+-- BRICK 18: call/apply in the evaluator. The evaluator resolved VARIABLES
+-- (brick 10) but returned 0 for CALLS. Brick 18 makes AstCall actually EXECUTE
+-- a rule: find the called rule by NAME in the program, evaluate the argument
+-- expressions against the CALLER's env, bind them to the callee's params in a
+-- FRESH env (lexical scoping — the callee does NOT see the caller's locals),
+-- build the callee's let-env on top of that, then evaluate the callee's result.
+-- Calls recurse naturally: a `fact` that calls itself just works if it
+-- terminates. This closes the loop from source text to a real computed call
+-- result — the file is now a (toy) INTERPRETER, not just a parser + var-resolver.
+--
+-- THE SCC. eval_ast_env, eval_call, bind_params, and build_env now form one
+-- mutual-recursion cluster (eval_ast_env -> eval_call -> bind_params/build_env ->
+-- eval_ast_env). Like the brick-10 evaluator rules they carry bound-only
+-- termination and ACCEPT the mandatory native recursion breadcrumb: each
+-- recursive call walks a strict sub-node / shorter tail, but that shrinking
+-- value is a FIELD of a packed input concept (not the input itself), so the
+-- `structural` proof does not fit. The backstops are the same as brick 10 (finite
+-- Env / binding / arg / param lists and a finite AST bounded by max_nodes) PLUS:
+-- a call chain is bounded only by the source program's own termination — an
+-- infinite Verbose program (no base case) would not terminate here either, which
+-- is the honest interpreter semantics, not a soundness gap in this brick.
+-- ============================================================================
+
+-- The call-evaluation probe: the callee's name span (callee_start, callee_len),
+-- the call's argument AST list, the CALLER's environment (arg expressions are
+-- evaluated against it), the source text (for name byte-comparison), and the
+-- whole program (the scope the callee name is resolved against, and threaded so
+-- the callee body can itself call other rules).
+concept EvalCallState
+  @intention: "A callee name span + the call's args + the caller env + the source text + the program"
+  @source: vexprparse.intent:36
+  fields:
+    callee_start : number [0, 256]
+    callee_len : number [0, 256]
+    args : ArgList
+    env : Env
+    src : text [..256]
+    prog : RuleList
+
+
+-- The parameter-binding probe: the callee's remaining formal parameter list, the
+-- remaining call-argument AST list (positional, in lock-step with params), the
+-- CALLER's environment (each arg expression is evaluated against it), the source
+-- text, and the program (threaded because an argument can itself be a call).
+concept BindParamsState
+  @intention: "Callee params + call args + the caller env + the source text + the program"
+  @source: vexprparse.intent:36
+  fields:
+    params : ParamList
+    args : ArgList
+    env : Env
+    src : text [..256]
+    prog : RuleList
+
+
+-- The rule-lookup probe: the program's rule list to search, the source text (for
+-- byte-comparison), and the query name's span (q_start, q_len). Same shape as the
+-- arity pass's RuleNamedState, but returns the matched RuleDecl rather than 0/1.
+concept FindRuleState
+  @intention: "A program rule list to search + the source text + the query name's span"
+  @source: vexprparse.intent:36
+  fields:
+    rules : RuleList
+    src : text [..256]
+    q_start : number [0, 256]
+    q_len : number [0, 256]
+
+
+-- A one-field probe to read the HEAD of an argument list (block-form match is only
+-- legal in final position, so destructuring an ArgList is factored into a tiny
+-- rule — same idiom as parsed_args_* / pp_params).
+concept AHeadState
+  @intention: "A call-argument list, for reading its head node"
+  @source: vexprparse.intent:36
+  fields:
+    args : ArgList
+
+
+-- A one-field probe to read the TAIL of an argument list (mirror of AHeadState).
+concept ATailState
+  @intention: "A call-argument list, for reading its tail"
+  @source: vexprparse.intent:36
+  fields:
+    args : ArgList
 
 
 -- build_env: fold the binding list (in source order) into an Env. For each
@@ -3641,12 +3730,152 @@ rule build_env
     out : Env
   logic:
     out = match ba.binds:
-      BCons(name_start, name_len, value, rest) => build_env(BuildEnvArg { binds: rest, env: Env::ECons { name_start: name_start, name_len: name_len, val: eval_ast_env(EvalEnvArg { node: value, env: ba.env, src: ba.src }), rest: ba.env }, src: ba.src })
+      BCons(name_start, name_len, value, rest) => build_env(BuildEnvArg { binds: rest, env: Env::ECons { name_start: name_start, name_len: name_len, val: eval_ast_env(EvalEnvArg { node: value, env: ba.env, src: ba.src, prog: ba.prog }), rest: ba.env }, src: ba.src, prog: ba.prog })
       BNil => ba.env
   proofs:
     purity:
-      reads : [ba.binds, ba.env, ba.src]
+      reads : [ba.binds, ba.env, ba.src, ba.prog]
       calls : [build_env, eval_ast_env]
+    termination:
+      bound : 4000
+
+
+-- arg_head: the HEAD argument AST of a call's ArgList (an AstNum(0) placeholder
+-- when the list is empty). bind_params reads one argument per parameter via this;
+-- a call with fewer args than params binds the surplus params to 0 (the same
+-- "missing -> 0" default the rest of the evaluator uses, e.g. an unbound variable
+-- or an out-of-scope callee). Factored into a tiny rule because block-form match
+-- is only legal in final position (same idiom as parsed_args_head / pp_params).
+rule arg_head
+  @intention: "The head argument AST of a call's argument list (AstNum 0 if empty)"
+  @source: vexprparse.intent:36
+  input:
+    a : AHeadState
+  output:
+    out : Ast
+  logic:
+    out = match a.args:
+      ArgCons(head, tail) => head
+      ArgNil => Ast::AstNum { value: 0 }
+  proofs:
+    purity:
+      reads : [a.args]
+      calls : []
+    termination:
+      bound : 16
+
+
+-- arg_tail: the TAIL of a call's ArgList (ArgNil when already empty). bind_params
+-- consumes one argument per parameter and recurses on this tail in lock-step with
+-- the parameter list's tail. Mirror of arg_head.
+rule arg_tail
+  @intention: "The tail of a call's argument list (ArgNil if empty)"
+  @source: vexprparse.intent:36
+  input:
+    a : ATailState
+  output:
+    out : ArgList
+  logic:
+    out = match a.args:
+      ArgCons(head, tail) => tail
+      ArgNil => ArgList::ArgNil
+  proofs:
+    purity:
+      reads : [a.args]
+      calls : []
+    termination:
+      bound : 16
+
+
+-- find_rule: locate the rule whose NAME span byte-equals the query span and return
+-- its RuleDecl, walking the program rule list front-to-back. Same name-matching
+-- idiom as the arity pass's rule_named (length equality first, then name_eq on the
+-- bytes), but returns the matched RuleDecl instead of 0/1. On no match it returns
+-- a SENTINEL MkRule(0, 0, PNil, MkBlock(BNil, AstErr)) — an empty-param rule whose
+-- body is AstErr, so eval_call on a nonexistent callee evaluates to 0, preserving
+-- the pre-brick-18 "AstCall => 0" behavior (the undefined-callee lint pass flags
+-- the missing rule separately). Bound-only termination + the native recursion
+-- breadcrumb (the shrinking rule-list tail is a field of the packed input).
+rule find_rule
+  @intention: "The RuleDecl whose name matches the query span (sentinel empty rule if none)"
+  @source: vexprparse.intent:36
+  input:
+    st : FindRuleState
+  output:
+    out : RuleDecl
+  logic:
+    out = match st.rules:
+      RCons(head, tail) => if rd_name_len(head) == st.q_len and name_eq(NameEqState { src: st.src, a_start: rd_name_start(head), b_start: st.q_start, len: st.q_len, off: 0 }) == 1 then head else find_rule(FindRuleState { rules: tail, src: st.src, q_start: st.q_start, q_len: st.q_len })
+      RNil => RuleDecl::MkRule { name_start: 0, name_len: 0, params: ParamList::PNil, body: Block::MkBlock { binds: Binding::BNil, result: Ast::AstErr } }
+  proofs:
+    purity:
+      reads : [st.rules, st.src, st.q_start, st.q_len]
+      calls : [rd_name_len, rd_name_start, name_eq, find_rule]
+    termination:
+      bound : 4000
+
+
+-- bind_params: build the callee's PARAMETER environment by walking the callee's
+-- formal parameter list and the call's argument list in lock-step. For each
+-- PCons(name span, rest), evaluate the corresponding argument AST (arg_head) against
+-- the CALLER's environment bp.env (threading bp.prog, since an argument can itself
+-- be a call), cons (param name span, computed value) onto a FRESH env, and recurse
+-- on the param tail with the argument tail (arg_tail). PNil returns ENil — the
+-- accumulation base is the EMPTY environment, NOT the caller env, which is exactly
+-- lexical scoping: the callee body sees only its parameters (and its own lets,
+-- added later by build_env on top of this), never the caller's locals. Bound-only
+-- termination + the native recursion breadcrumb (the shrinking param/arg tails are
+-- fields of the packed input).
+rule bind_params
+  @intention: "Bind a callee's params to its call's args (each evaluated in the caller env) onto a fresh env"
+  @source: vexprparse.intent:36
+  input:
+    bp : BindParamsState
+  output:
+    out : Env
+  logic:
+    out = match bp.params:
+      PCons(name_start, name_len, rest) => Env::ECons { name_start: name_start, name_len: name_len, val: eval_ast_env(EvalEnvArg { node: arg_head(AHeadState { args: bp.args }), env: bp.env, src: bp.src, prog: bp.prog }), rest: bind_params(BindParamsState { params: rest, args: arg_tail(ATailState { args: bp.args }), env: bp.env, src: bp.src, prog: bp.prog }) }
+      PNil => Env::ENil
+  proofs:
+    purity:
+      reads : [bp.params, bp.args, bp.env, bp.src, bp.prog]
+      calls : [eval_ast_env, arg_head, arg_tail, bind_params]
+    termination:
+      bound : 4000
+
+
+-- eval_call: APPLY a rule. (1) find_rule resolves the callee name span against the
+-- program; (2) bind_params evaluates each argument in the CALLER env and binds it
+-- to the callee's parameters in a FRESH env (penv) — lexical scoping, no leak of
+-- caller locals; (3) build_env folds the callee's own let-bindings on TOP of penv
+-- (so a let RHS sees both the parameters and earlier lets) into cenv; (4)
+-- eval_ast_env evaluates the callee's result expression against cenv. Plain rule
+-- (not a match arm) so it can use `let` bindings. Recurses through eval_ast_env ->
+-- AstCall -> eval_call for nested / self / mutual calls; a Verbose `fact` that
+-- calls itself terminates iff the source program terminates (honest interpreter
+-- semantics). Bound-only termination + the native recursion breadcrumb: this rule
+-- is in the eval SCC, and a call chain's length is the source program's own depth,
+-- not a structurally-shrinking field of this input.
+rule eval_call
+  @intention: "Evaluate a function call: find the rule, bind params in a fresh env, build its lets, evaluate its body"
+  @source: vexprparse.intent:36
+  input:
+    ec : EvalCallState
+  output:
+    out : number
+  logic:
+    let callee = find_rule(FindRuleState { rules: ec.prog, src: ec.src, q_start: ec.callee_start, q_len: ec.callee_len })
+    let penv = bind_params(BindParamsState { params: rd_params(callee), args: ec.args, env: ec.env, src: ec.src, prog: ec.prog })
+    let cbody = rd_body(callee)
+    let cbinds = block_binds(cbody)
+    let cresult = block_result(cbody)
+    let cenv = build_env(BuildEnvArg { binds: cbinds, env: penv, src: ec.src, prog: ec.prog })
+    out = eval_ast_env(EvalEnvArg { node: cresult, env: cenv, src: ec.src, prog: ec.prog })
+  proofs:
+    purity:
+      reads : [ec.callee_start, ec.callee_len, ec.args, ec.env, ec.src, ec.prog]
+      calls : [find_rule, bind_params, rd_params, rd_body, block_binds, block_result, build_env, eval_ast_env]
     termination:
       bound : 4000
 
@@ -3680,8 +3909,8 @@ rule eval_block
     let blk = pb_block(pb)
     let binds = block_binds(blk)
     let result = block_result(blk)
-    let env = build_env(BuildEnvArg { binds: binds, env: Env::ENil, src: s.source })
-    out = eval_ast_env(EvalEnvArg { node: result, env: env, src: s.source })
+    let env = build_env(BuildEnvArg { binds: binds, env: Env::ENil, src: s.source, prog: RuleList::RNil })
+    out = eval_ast_env(EvalEnvArg { node: result, env: env, src: s.source, prog: RuleList::RNil })
   proofs:
     purity:
       reads : [s.source]
@@ -4113,8 +4342,8 @@ rule eval_rule_decl
     let blk = rd_body(rd)
     let binds = block_binds(blk)
     let result = block_result(blk)
-    let env = build_env(BuildEnvArg { binds: binds, env: Env::ENil, src: s.source })
-    out = eval_ast_env(EvalEnvArg { node: result, env: env, src: s.source })
+    let env = build_env(BuildEnvArg { binds: binds, env: Env::ENil, src: s.source, prog: RuleList::RNil })
+    out = eval_ast_env(EvalEnvArg { node: result, env: env, src: s.source, prog: RuleList::RNil })
   proofs:
     purity:
       reads : [s.source]
@@ -4585,12 +4814,90 @@ rule eval_nth_rule
     let blk = rl_head_body(nth)
     let binds = block_binds(blk)
     let result = block_result(blk)
-    let env = build_env(BuildEnvArg { binds: binds, env: Env::ENil, src: e.source })
-    out = eval_ast_env(EvalEnvArg { node: result, env: env, src: e.source })
+    let env = build_env(BuildEnvArg { binds: binds, env: Env::ENil, src: e.source, prog: prog })
+    out = eval_ast_env(EvalEnvArg { node: result, env: env, src: e.source, prog: prog })
   proofs:
     purity:
       reads : [e.source, e.n]
       calls : [begin_tokenize, parse_program, drop_rules, rl_head_body, block_binds, block_result, build_env, eval_ast_env]
+    termination:
+      bound : 256
+
+
+-- ============================================================================
+-- BRICK 18 driver: eval_main — run a whole PROGRAM. Tokenize, parse the entire
+-- rule sequence, then evaluate the FIRST rule's body with the program threaded so
+-- its calls resolve against the other rules. This is the brick-18 money-shot: a
+-- multi-rule Verbose program whose entry rule CALLS the others, evaluated to a
+-- real number by an interpreter that is itself written in Verbose.
+--
+-- Convention: the FIRST rule in the source is the entry point (like `main`), and
+-- the rest are its (possibly recursive) callees. The entry's `out =` result is
+-- evaluated; calls in it dispatch through eval_ast_env -> eval_call -> find_rule.
+--
+-- Worked examples (all NATIVE-ONLY — multi-line sources; the interpreter's JSON
+-- reader does not decode \n into a real byte 10):
+--
+--   rule main
+--     logic:
+--       out = double(21)
+--   rule double(x)
+--     logic:
+--       out = x * 2                                   = 42
+--
+--   rule main
+--     logic:
+--       out = add(20, 22)
+--   rule add(x, y)
+--     logic:
+--       out = x + y                                   = 42   (two params)
+--
+--   rule main
+--     logic:
+--       out = f(10)
+--   rule f(n)
+--     logic:
+--       let d = n * 2
+--       out = d + 1                                   = 21   (callee has a let)
+--
+--   rule main
+--     logic:
+--       out = double(inc(20))
+--   rule double(x)
+--     logic:
+--       out = x * 2
+--   rule inc(n)
+--     logic:
+--       out = n + 1                                   = 42   (nested call as arg)
+--
+--   rule main
+--     logic:
+--       out = fact(5)
+--   rule fact(n)
+--     logic:
+--       out = if n == 0 then 1 else n * fact(n - 1)   = 120  (RECURSIVE)
+--
+-- eval_main takes a ScanState (source + pos) like eval_block, so the source is
+-- argv arg 1 and pos is argv arg 2 (always 0).
+rule eval_main
+  @intention: "Tokenize, parse a program, and evaluate the FIRST rule's body with calls resolving against the program"
+  @source: vexprparse.intent:36
+  input:
+    s : ScanState
+  output:
+    out : number
+  logic:
+    let toks = begin_tokenize(ScanState { source: s.source, pos: 0 })
+    let prog = parse_program(ProgramState { toks: toks, src: s.source, pos: 0 })
+    let body = rl_head_body(prog)
+    let binds = block_binds(body)
+    let result = block_result(body)
+    let env = build_env(BuildEnvArg { binds: binds, env: Env::ENil, src: s.source, prog: prog })
+    out = eval_ast_env(EvalEnvArg { node: result, env: env, src: s.source, prog: prog })
+  proofs:
+    purity:
+      reads : [s.source]
+      calls : [begin_tokenize, parse_program, rl_head_body, block_binds, block_result, build_env, eval_ast_env]
     termination:
       bound : 256
 

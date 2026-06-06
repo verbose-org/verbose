@@ -643,3 +643,57 @@ there (out of the arithmetic evaluator's scope).
     native machine code over a parsed Verbose program — independent of both the
     variable lint and the callee lint, intended to be summed by a future combined
     linter; for now each is its own headline driver.
+
+36. Brick 18 of the self-hosting arc: CALL/APPLY in the evaluator — make the
+    interpreter actually EXECUTE function calls. Through brick 17 the evaluator
+    (item 22, brick 10) resolved VARIABLES against an environment but returned 0
+    for every CALL. Brick 18 closes that gap: an AstCall now (1) finds the called
+    rule by NAME in the program, (2) evaluates the argument expressions against
+    the CALLER's environment, (3) binds them positionally to the callee's formal
+    parameters in a FRESH environment (lexical scoping — the callee does NOT see
+    the caller's locals), (4) folds the callee's own let-bindings on top of that,
+    and (5) evaluates the callee's result expression. The whole front end is now a
+    (toy) INTERPRETER: source text -> tokens -> AST -> a real computed call result.
+
+    THE THREADING. The program's parsed rule list is threaded through the
+    evaluator so a call can resolve its callee. The two evaluator inputs
+    (eval_ast_env's and build_env's) each gain a `prog` field carrying the rule
+    list, and every recursive construction of those inputs passes it down. A new
+    eval_call probe carries the callee name span + the call's argument list + the
+    caller env + the source + the program; a new bind_params probe walks the
+    callee's parameter list and the call's argument list in lock-step, evaluating
+    each argument in the caller env and consing (param name span, computed value)
+    onto a fresh empty environment; a new find_rule probe walks the program's rule
+    list and returns the RuleDecl whose name span byte-matches (the same name
+    matching idiom as the arity / callee passes), with a SENTINEL empty rule whose
+    body is AstErr on no match — so a call to a nonexistent rule evaluates to 0,
+    preserving the pre-brick-18 "AstCall => 0" behavior (the undefined-callee lint
+    flags it separately). Two tiny arg_head / arg_tail probes read the head and
+    tail of an argument list (block-form match is only legal in final position, so
+    destructuring an ArgList is factored out — the same idiom as the parsed_args
+    accessors). A call with fewer args than params binds the surplus params to 0,
+    the same "missing -> 0" default the rest of the evaluator already uses.
+
+    THE SCC. eval_ast_env, eval_call, bind_params, and build_env now form one
+    mutual-recursion cluster. Like the brick-10 evaluator rules they carry
+    bound-only termination and ACCEPT the mandatory native recursion breadcrumb:
+    each recursive call walks a strict sub-node / shorter tail, but that shrinking
+    value is a FIELD of a packed input concept (not the input itself), so the
+    structural proof does not fit. The honest backstop is that a call chain's
+    length is the SOURCE program's own recursion depth — an interpreter for a
+    non-terminating program does not terminate either, which is correct semantics,
+    not a soundness gap in this brick.
+
+    THE MONEY SHOTS (all NATIVE-ONLY, multi-line sources, same scan-state
+    invocation as items 24/30/31/34/35). A new eval_main driver evaluates the
+    FIRST rule's body (the entry point, like `main`) with the program threaded so
+    its calls resolve: `main: out = double(21)` + `double(x): out = x * 2` -> 42;
+    `add(20, 22)` + `add(x, y): out = x + y` -> 42 (two params); `f(10)` +
+    `f(n): let d = n * 2 / out = d + 1` -> 21 (callee with a let); `double(inc(20))`
+    -> 42 (a call as an argument, evaluated in the caller env); and the proof it is
+    a real interpreter — `fact(5)` + `fact(n): out = if n == 0 then 1 else n *
+    fact(n - 1)` -> 120 (RECURSIVE, the call chain firing through eval_call ->
+    eval_ast_env -> AstCall -> eval_call until the base case). The existing
+    eval_block / eval_nth_rule / eval_rule_decl drivers thread an empty program
+    (RuleList::RNil), so a bare block or single rule with a call hits the find_rule
+    sentinel -> 0, exactly the old behavior — fully backward compatible.
