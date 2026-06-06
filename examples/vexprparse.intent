@@ -745,3 +745,43 @@ there (out of the arithmetic evaluator's scope).
     number, used as a condition -> error); `out = (1 < 2) and (3 < 4)` -> 0
     (bool and bool) vs `out = (1 < 2) and 3` -> 1 (and with a number operand);
     and a two-rule program with one good and one bad rule -> 1.
+
+38. Brick 20 of the self-hosting arc: TYPED PARAMETERS. Brick 16 parsed a rule's
+    formals as bare name spans (PCons of name_start, name_len, rest); brick 20
+    teaches the parameter parser the OPTIONAL type annotation `IDENT : TYPENAME`,
+    recording each parameter's declared TYPE alongside its name. There is no `->`
+    token in the tokenizer, so the annotation uses a `:` colon (op code 10) — the
+    same colon the header `logic:` uses — never a return-type arrow.
+
+    THE GRAMMAR. A parameter is `IDENT` (untyped) OR `IDENT : TYPENAME`. In the
+    token stream the typed form is THREE tokens (name, `:`, typename) before the
+    `,` (op 11) or `)` (op 22) separator; the untyped form is ONE token. TYPENAME
+    is an Ident mapped to a TYPE CODE by type_code_of_span: "number" -> 0, "bool"
+    -> 1, "text" -> 2 (the SAME codes brick 19 assigns), and anything else -> 0
+    (default number) — so an unrecognized type name degrades gracefully to number,
+    matching the rest of the header parse's fail-graceful posture. An untyped
+    parameter also defaults to ty = 0, so `rule f(x)` and `rule f(x : number)`
+    carry the IDENTICAL ParamList.
+
+    THE CONCEPT CHANGE. ParamList's PCons gains a `ty : number` field
+    (name_start, name_len, ty, rest). Every PCons construct/match site is updated:
+    params_prepend / params_scan (build), bind_params / param_list_len /
+    param_to_binding (match). params_scan is rewritten to detect the colon at
+    pos+1, read the typename at pos+2, and dispatch the separator from pos+3 (typed)
+    or pos+1 (untyped); the untyped path reduces EXACTLY to brick 16's behavior, so
+    untyped lists parse byte-identically and every downstream consumer (the
+    arity-count linter, the call/apply evaluator's parameter binding) is unchanged.
+    type_code_of_span is the flat fixed-width byte-check sibling of span_is_rule /
+    span_is_logic.
+
+    THE MONEY SHOTS (NATIVE-ONLY, multi-line sources, same scan-state invocation
+    as items 24/30/31/34-37). nth_param_type(source, n) tokenizes, parses the
+    program, takes the FIRST rule's parameter list, and returns the type code of
+    its n-th parameter (0-based; the index n is carried in the scan state's pos),
+    sentinel 9 when n runs past the end: `rule add(x : number, y : bool)` at n=0
+    -> 0, n=1 -> 1; `rule f(a : text, b : number, c : bool)` at n=0 -> 2, n=1 -> 0,
+    n=2 -> 1; `rule g(x)` (untyped) at n=0 -> 0 (default number); `rule h()` (no
+    params) at n=0 -> 9 (sentinel); `rule m(a : bool, b)` (mixed) at n=0 -> 1,
+    n=1 -> 0. param_nth_type walks the PCons tail via a DECREASING Number field
+    (n -> n - 1), so its termination is proved mechanically (Phase C), like
+    drop_rules over a RuleList.

@@ -355,14 +355,16 @@ concept_group VExpr [max_depth: 4096, max_nodes: 65535]
   -- source span (name_start, name_len), in source order. Same identity model as a
   -- Binding name or an AstVar (the param is its bytes in the source text, never
   -- decoded). PNil terminates the list (zero params — `rule f()` or `rule f`).
-  -- Mirrors src/parser.rs's Rule.params (the formal parameter names) restricted to
-  -- bare names (no per-param type / default — those are later bricks). Lives in the
+  -- Mirrors src/parser.rs's Rule.params (the formal parameter names). Brick 20 adds
+  -- a `ty` field per param: the declared type code (0=number, 1=bool, 2=text — the
+  -- same codes brick 19 uses), defaulting to 0 (number) when a param is untyped.
+  -- An untyped `x` carries ty=0; a typed `x : bool` carries ty=1. Lives in the
   -- group because it is the same cons-list family as ArgList / Binding.
   concept ParamList
-    @intention: "Cons-list of a rule's formal parameter names (each a source span)"
+    @intention: "Cons-list of a rule's formal parameters (each a source span + declared type code)"
     @source: vexprparse.intent:34
     variants:
-      PCons of (name_start : number, name_len : number, rest : ParamList)
+      PCons of (name_start : number, name_len : number, ty : number, rest : ParamList)
       PNil
 
   -- Brick 16: a parameter-list parse result — the ParamList built plus the token
@@ -3835,7 +3837,7 @@ rule bind_params
     out : Env
   logic:
     out = match bp.params:
-      PCons(name_start, name_len, rest) => Env::ECons { name_start: name_start, name_len: name_len, val: eval_ast_env(EvalEnvArg { node: arg_head(AHeadState { args: bp.args }), env: bp.env, src: bp.src, prog: bp.prog }), rest: bind_params(BindParamsState { params: rest, args: arg_tail(ATailState { args: bp.args }), env: bp.env, src: bp.src, prog: bp.prog }) }
+      PCons(name_start, name_len, ty, rest) => Env::ECons { name_start: name_start, name_len: name_len, val: eval_ast_env(EvalEnvArg { node: arg_head(AHeadState { args: bp.args }), env: bp.env, src: bp.src, prog: bp.prog }), rest: bind_params(BindParamsState { params: rest, args: arg_tail(ATailState { args: bp.args }), env: bp.env, src: bp.src, prog: bp.prog }) }
       PNil => Env::ENil
   proofs:
     purity:
@@ -4000,11 +4002,14 @@ concept RuleParseState
 -- distinct name keeps parse_params's input self-documenting. parse_params reads
 -- the token at `pos`: a '(' opens a comma-separated IDENT list; anything else
 -- means "no parameters".
+-- Brick 20: ParamParseState also carries the SOURCE TEXT so params_scan can read a
+-- type-name Ident span (after a `:`) and map it to a type code via type_code_of_span.
 concept ParamParseState
-  @intention: "The token list plus the index where a parameter list may begin"
+  @intention: "The token list, the source text, plus the index where a parameter list may begin"
   @source: vexprparse.intent:34
   fields:
     toks : TokenList
+    src : text [..256]
     pos : number [0, 512]
 
 
@@ -4051,6 +4056,34 @@ rule span_is_logic
     out : number
   logic:
     out = if sc.len == 5 and (byte_at(sc.src, sc.start) == 108 and (byte_at(sc.src, sc.start + 1) == 111 and (byte_at(sc.src, sc.start + 2) == 103 and (byte_at(sc.src, sc.start + 3) == 105 and byte_at(sc.src, sc.start + 4) == 99)))) then 1 else 0
+  proofs:
+    purity:
+      reads : [sc.src, sc.start, sc.len]
+      calls : []
+    termination:
+      bound : 64
+
+
+-- type_code_of_span (Brick 20): map a TYPE-NAME Ident span to its type code, using
+-- the SAME codes brick 19 assigns (0=number, 1=bool, 2=text). The param parser
+-- reads the typename token after a `:` and calls this to record the param's
+-- declared type. Three flat fixed-width byte checks (mirroring span_is_rule /
+-- span_is_logic), length-guarded first so a wrong-length ident never reads past its
+-- span: "number" = n,u,m,b,e,r (110,117,109,98,101,114) len 6; "bool" = b,o,o,l
+-- (98,111,111,108) len 4; "text" = t,e,x,t (116,101,120,116) len 4. Anything else
+-- (including the `len 4` non-bool/non-text case and any other length) falls through
+-- to 0 — the same DEFAULT an untyped param gets, so an unrecognized type name is
+-- treated as `number`, never an error (parser stays fail-graceful like the rest of
+-- the header parse).
+rule type_code_of_span
+  @intention: "Map a type-name Ident span to its type code (0=number, 1=bool, 2=text, else 0)"
+  @source: vexprparse.intent:38
+  input:
+    sc : SpanCheck
+  output:
+    out : number
+  logic:
+    out = if sc.len == 6 and (byte_at(sc.src, sc.start) == 110 and (byte_at(sc.src, sc.start + 1) == 117 and (byte_at(sc.src, sc.start + 2) == 109 and (byte_at(sc.src, sc.start + 3) == 98 and (byte_at(sc.src, sc.start + 4) == 101 and byte_at(sc.src, sc.start + 5) == 114))))) then 0 else (if sc.len == 4 and (byte_at(sc.src, sc.start) == 98 and (byte_at(sc.src, sc.start + 1) == 111 and (byte_at(sc.src, sc.start + 2) == 111 and byte_at(sc.src, sc.start + 3) == 108))) then 1 else (if sc.len == 4 and (byte_at(sc.src, sc.start) == 116 and (byte_at(sc.src, sc.start + 1) == 101 and (byte_at(sc.src, sc.start + 2) == 120 and byte_at(sc.src, sc.start + 3) == 116))) then 2 else 0))
   proofs:
     purity:
       reads : [sc.src, sc.start, sc.len]
@@ -4175,17 +4208,20 @@ rule pp_next
 -- parsed REST of the parameter list, carrying the rest's end index through.
 -- Splitting this out keeps the recursive params_scan call lazily inside the comma
 -- branch (a let would force it eagerly) — the same shape as args_prepend.
+-- Brick 20: ParamPrependState also carries head_ty — the head parameter's declared
+-- type code — so params_prepend can cons it into the PCons it builds.
 concept ParamPrependState
-  @intention: "A head parameter span plus the parsed rest of the parameter list"
+  @intention: "A head parameter span + its type code, plus the parsed rest of the parameter list"
   @source: vexprparse.intent:34
   fields:
     head_start : number
     head_len : number
+    head_ty : number
     rest : ParsedParams
 
 
 rule params_prepend
-  @intention: "Cons a parameter span onto the front of the parsed rest of the list"
+  @intention: "Cons a parameter span (with its type code) onto the front of the parsed rest of the list"
   @source: vexprparse.intent:34
   input:
     pps : ParamPrependState
@@ -4194,27 +4230,38 @@ rule params_prepend
   logic:
     let rest_list = pp_params(pps.rest)
     let rest_next = pp_next(pps.rest)
-    out = ParsedParams::MkPP { params: ParamList::PCons { name_start: pps.head_start, name_len: pps.head_len, rest: rest_list }, next: rest_next }
+    out = ParsedParams::MkPP { params: ParamList::PCons { name_start: pps.head_start, name_len: pps.head_len, ty: pps.head_ty, rest: rest_list }, next: rest_next }
   proofs:
     purity:
-      reads : [pps.head_start, pps.head_len, pps.rest]
+      reads : [pps.head_start, pps.head_len, pps.head_ty, pps.rest]
       calls : [pp_params, pp_next]
     termination:
       bound : 16
 
 
--- params_scan: parse a NON-EMPTY comma-separated IDENT list starting at the FIRST
--- parameter's token index `ps.pos`. Read the IDENT span at ps.pos, peek the next
--- token: a ',' (op 11) continues — parse the REST (LAZILY, in the then branch)
--- from just past the comma and prepend this param; a ')' (op 22) stops, consuming
--- it (next = pos + 2); anything else stops too (missing ')' tolerated, like
--- args_cons), leaving next = pos + 1. Recurses over a forward token scan (no
--- structural FIELD fits), so bound + the mandatory recursion breadcrumb (the
--- backstop is the finite token list, bounded by max_nodes). Every peek is
--- OOB-guarded by the token-list accessors (Eof past the end).
+-- params_scan: parse a NON-EMPTY comma-separated parameter list starting at the
+-- FIRST parameter's token index `ps.pos`. Brick 20 makes each parameter OPTIONALLY
+-- TYPED: `IDENT` (untyped) OR `IDENT : TYPENAME` (typed). In the token stream a
+-- typed param is THREE tokens (name, `:` op-10, typename-IDENT) before the
+-- separator; an untyped param is ONE token before it.
+--
+-- Read the name IDENT span at ps.pos. Peek ps.pos+1: if it is `:` (op 10) the param
+-- is typed — read the TYPENAME span at ps.pos+2 and map it to a code via
+-- type_code_of_span (reading ps.src); the separator is at ps.pos+3. Otherwise the
+-- param is untyped (ty defaults to 0 = number) and the separator is at ps.pos+1.
+-- Then the brick-16 separator dispatch on that separator position: a ',' (op 11)
+-- continues — parse the REST (LAZILY, in the then branch) from just past the comma
+-- and prepend this param; a ')' (op 22) stops, consuming it (next = sep_pos + 1);
+-- anything else stops too (missing ')' tolerated, like args_cons), leaving
+-- next = sep_pos. When UNTYPED, sep_pos = ps.pos + 1 and this reduces EXACTLY to the
+-- brick-16 behavior (close_next = pos+2 on ')', else pos+1; comma-continue from
+-- pos+2), so untyped lists parse byte-identically to before. Recurses over a forward
+-- token scan (no structural FIELD fits), so bound + the mandatory recursion
+-- breadcrumb (the backstop is the finite token list, bounded by max_nodes). Every
+-- peek is OOB-guarded by the token-list accessors (Eof past the end).
 rule params_scan
-  @intention: "Parse a non-empty comma-separated parameter-name list, consuming the ')'"
-  @source: vexprparse.intent:34
+  @intention: "Parse a non-empty comma-separated list of optionally-typed params, consuming the ')'"
+  @source: vexprparse.intent:38
   input:
     ps : ParamParseState
   output:
@@ -4222,14 +4269,20 @@ rule params_scan
   logic:
     let name_start = peek_start(Nth { lst: ps.toks, n: ps.pos })
     let name_len = peek_len(Nth { lst: ps.toks, n: ps.pos })
-    let opc = peek_op_code(Nth { lst: ps.toks, n: ps.pos + 1 })
-    let iscomma = if opc == 11 then 1 else 0
-    let close_next = if opc == 22 then ps.pos + 2 else ps.pos + 1
-    out = if iscomma == 1 then params_prepend(ParamPrependState { head_start: name_start, head_len: name_len, rest: params_scan(ParamParseState { toks: ps.toks, pos: ps.pos + 2 }) }) else ParsedParams::MkPP { params: ParamList::PCons { name_start: name_start, name_len: name_len, rest: ParamList::PNil }, next: close_next }
+    let colon_opc = peek_op_code(Nth { lst: ps.toks, n: ps.pos + 1 })
+    let typed = if colon_opc == 10 then 1 else 0
+    let ty_start = peek_start(Nth { lst: ps.toks, n: ps.pos + 2 })
+    let ty_len = peek_len(Nth { lst: ps.toks, n: ps.pos + 2 })
+    let ty = if typed == 1 then type_code_of_span(SpanCheck { src: ps.src, start: ty_start, len: ty_len }) else 0
+    let sep_pos = if typed == 1 then ps.pos + 3 else ps.pos + 1
+    let sep_opc = peek_op_code(Nth { lst: ps.toks, n: sep_pos })
+    let iscomma = if sep_opc == 11 then 1 else 0
+    let close_next = if sep_opc == 22 then sep_pos + 1 else sep_pos
+    out = if iscomma == 1 then params_prepend(ParamPrependState { head_start: name_start, head_len: name_len, head_ty: ty, rest: params_scan(ParamParseState { toks: ps.toks, src: ps.src, pos: sep_pos + 1 }) }) else ParsedParams::MkPP { params: ParamList::PCons { name_start: name_start, name_len: name_len, ty: ty, rest: ParamList::PNil }, next: close_next }
   proofs:
     purity:
-      reads : [ps.toks, ps.pos]
-      calls : [peek_start, peek_len, peek_op_code, params_prepend, params_scan]
+      reads : [ps.toks, ps.src, ps.pos]
+      calls : [peek_start, peek_len, peek_op_code, type_code_of_span, params_prepend, params_scan]
     termination:
       bound : 512
 
@@ -4256,10 +4309,10 @@ rule parse_params
     let isopen = if opc == 21 then 1 else 0
     let next_opc = peek_op_code(Nth { lst: ps.toks, n: ps.pos + 1 })
     let isempty = if next_opc == 22 then 1 else 0
-    out = if isopen == 0 then ParsedParams::MkPP { params: ParamList::PNil, next: ps.pos } else (if isempty == 1 then ParsedParams::MkPP { params: ParamList::PNil, next: ps.pos + 2 } else params_scan(ParamParseState { toks: ps.toks, pos: ps.pos + 1 }))
+    out = if isopen == 0 then ParsedParams::MkPP { params: ParamList::PNil, next: ps.pos } else (if isempty == 1 then ParsedParams::MkPP { params: ParamList::PNil, next: ps.pos + 2 } else params_scan(ParamParseState { toks: ps.toks, src: ps.src, pos: ps.pos + 1 }))
   proofs:
     purity:
-      reads : [ps.toks, ps.pos]
+      reads : [ps.toks, ps.src, ps.pos]
       calls : [peek_op_code, params_scan]
     termination:
       bound : 16
@@ -4298,7 +4351,7 @@ rule parse_rule_decl
     let kw_start = peek_start(Nth { lst: rp.toks, n: 0 })
     let kw_len = peek_len(Nth { lst: rp.toks, n: 0 })
     let is_rule = span_is_rule(SpanCheck { src: rp.src, start: kw_start, len: kw_len })
-    let pp = parse_params(ParamParseState { toks: rp.toks, pos: 2 })
+    let pp = parse_params(ParamParseState { toks: rp.toks, src: rp.src, pos: 2 })
     let params = pp_params(pp)
     let after_params = pp_next(pp)
     let logic_idx = skip_seps(ParseState { toks: rp.toks, pos: after_params })
@@ -4550,7 +4603,7 @@ rule parse_rule_decl_pos
     let is_rule = span_is_rule(SpanCheck { src: ps.src, start: kw_start, len: kw_len })
     let name_start = peek_start(Nth { lst: ps.toks, n: ps.pos + 1 })
     let name_len = peek_len(Nth { lst: ps.toks, n: ps.pos + 1 })
-    let pp = parse_params(ParamParseState { toks: ps.toks, pos: ps.pos + 2 })
+    let pp = parse_params(ParamParseState { toks: ps.toks, src: ps.src, pos: ps.pos + 2 })
     let params = pp_params(pp)
     let after_params = pp_next(pp)
     let logic_idx = skip_seps(ParseState { toks: ps.toks, pos: after_params })
@@ -4644,7 +4697,7 @@ rule param_list_len
     out : number
   logic:
     out = match pl:
-      PCons(name_start, name_len, rest) => 1 + param_list_len(rest)
+      PCons(name_start, name_len, ty, rest) => 1 + param_list_len(rest)
       PNil => 0
   proofs:
     purity:
@@ -4784,6 +4837,75 @@ rule rule_param_count
     purity:
       reads : [s.source]
       calls : [begin_tokenize, parse_program, rl_head_params, param_list_len]
+    termination:
+      bound : 256
+
+
+-- ParamNthState (Brick 20): a ParamList plus a 0-based index n, the input to
+-- param_nth_type. The decreasing `n` field drives termination as the list is walked.
+concept ParamNthState
+  @intention: "A parameter list plus a 0-based index, for reading the n-th param's type code"
+  @source: vexprparse.intent:38
+  fields:
+    params : ParamList
+    n : number [0, 512]
+
+
+-- param_nth_type (Brick 20): the declared type code of the n-th parameter (0-based)
+-- of a ParamList. Walk the PCons tail n times, then return that cell's `ty`. A
+-- sentinel of 9 is returned when n runs past the end (PNil) — distinguishable from
+-- every real type code (0/1/2). Recursion is driven by the decreasing Number field
+-- `n` (each step recurses on the tail with n - 1), which mechanically proves
+-- termination (Phase C decreasing proof), exactly like drop_rules over a RuleList.
+rule param_nth_type
+  @intention: "The declared type code of the n-th parameter (0-based), sentinel 9 if out of range"
+  @source: vexprparse.intent:38
+  input:
+    q : ParamNthState
+  output:
+    out : number
+  logic:
+    out = match q.params:
+      PCons(name_start, name_len, ty, rest) => if q.n == 0 then ty else param_nth_type(ParamNthState { params: rest, n: q.n - 1 })
+      PNil => 9
+  proofs:
+    purity:
+      reads : [q.params, q.n]
+      calls : [param_nth_type]
+    termination:
+      bound : 512
+      decreasing : n
+
+
+-- nth_param_type (Brick 20): the BRICK-20 money-shot driver. Tokenize the program
+-- source, parse the whole rule-decl sequence, take the FIRST rule's parameter list,
+-- and return the type code of its s.pos-th parameter (0-based — s.pos doubles as the
+-- index n). This proves the type ANNOTATION on each parameter parsed correctly:
+--
+--   nth_param_type("rule add(x : number, y : bool)\n  logic:\n    out = x + 1", 0) = 0  (number)
+--   nth_param_type("rule add(x : number, y : bool)\n  logic:\n    out = x + 1", 1) = 1  (bool)
+--   nth_param_type("rule f(a : text, b : number, c : bool)\n  logic:\n    out = b + 1", 0) = 2  (text)
+--   nth_param_type("rule g(x)\n  logic:\n    out = x + 1", 0)                       = 0  (untyped -> number)
+--   nth_param_type("rule h()\n  logic:\n    out = 1", 0)                            = 9  (no params -> sentinel)
+--
+-- NATIVE-ONLY (multi-line source). Takes a ScanState: source is argv arg 1, the
+-- index n is argv arg 2 (carried in s.pos).
+rule nth_param_type
+  @intention: "Parse a program and return the declared type code of the n-th param of its first rule"
+  @source: vexprparse.intent:38
+  input:
+    s : ScanState
+  output:
+    out : number
+  logic:
+    let toks = begin_tokenize(ScanState { source: s.source, pos: 0 })
+    let prog = parse_program(ProgramState { toks: toks, src: s.source, pos: 0 })
+    let params = rl_head_params(prog)
+    out = param_nth_type(ParamNthState { params: params, n: s.pos })
+  proofs:
+    purity:
+      reads : [s.source, s.pos]
+      calls : [begin_tokenize, parse_program, rl_head_params, param_nth_type]
     termination:
       bound : 256
 
@@ -5170,7 +5292,7 @@ rule param_to_binding
     out : Binding
   logic:
     out = match pl:
-      PCons(name_start, name_len, rest) => Binding::BCons { name_start: name_start, name_len: name_len, value: Ast::AstNum { value: 0 }, rest: param_to_binding(rest) }
+      PCons(name_start, name_len, ty, rest) => Binding::BCons { name_start: name_start, name_len: name_len, value: Ast::AstNum { value: 0 }, rest: param_to_binding(rest) }
       PNil => Binding::BNil
   proofs:
     purity:
