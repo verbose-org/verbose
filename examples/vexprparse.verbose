@@ -6539,6 +6539,407 @@ rule type_check
       bound : 256
 
 
+-- ============================================================================
+-- BRICK 21: CALL-SITE ARGUMENT TYPE checking — where the parser (brick 20 typed
+-- params) and the type checker (brick 19) finally meet.
+--
+-- The callee pass (brick 15) asks "does the called rule EXIST?". The arity pass
+-- (brick 17) asks "does it pass the RIGHT NUMBER of arguments?". This pass asks
+-- the next question: "does each argument's TYPE match the callee's DECLARED
+-- parameter type?". A call `f(1 < 2)` to a rule `rule f(x : number)` is well-formed
+-- for the callee pass (f exists) and the arity pass (1 arg, 1 param) but WRONG
+-- here — a bool argument flows into a number parameter.
+--
+-- ORTHOGONAL to brick 19's type_check. An argument whose OWN type is already
+-- ERROR (3) is brick 19's concern and is SKIPPED here (no double-counting — the
+-- same discipline that keeps lint_arity from re-flagging what lint_callees flags).
+-- A WELL-typed argument of the WRONG type (a bool where a number is declared) is
+-- exactly what this pass catches.
+--
+-- TYPING THE ARGUMENT. The caller's type env is seeded with the caller's OWN
+-- params' declared types (param_to_tenv) THEN extended with its let bindings
+-- (build_tenv), so an argument that references a typed param of the caller is
+-- typed correctly. THE SHOWCASE: `rule g(b : bool) ... out = f(b)` with
+-- `rule f(x : number)` flags `b` — b is bool by g's declaration, passed to f's
+-- number param.
+--
+-- THE LOCKSTEP. Per call, walk the argument list and the callee's parameter list
+-- together (argtype_args). For each (arg, param) pair, count a mismatch iff the
+-- param EXISTS (phead_ty != 9) AND the arg's type differs from the param's type
+-- AND the arg's type is not ERROR (3). When one list runs out, pairing stops —
+-- count mismatches are lint_arity's concern, not this pass's. Untyped params
+-- default to number (0) — brick 20's convention — so a bool passed to an untyped
+-- param IS flagged (documented behaviour).
+--
+-- CALLEE RESOLUTION. find_rule (brick 18) resolves the callee name span against
+-- the whole program; on no match it returns the SENTINEL MkRule with PNil params,
+-- so an undefined callee yields no pairs and no arg-type errors (lint_callees
+-- flags the missing callee separately). A call's RESULT type stays number (0):
+-- there is no return-type syntax yet, so type_of_env's AstCall arm is unchanged —
+-- this brick adds a SEPARATE counting pass, it does NOT touch type_of_env.
+--
+-- TERMINATION. argtype_ast + argtype_args + argtype_binds form a recursive
+-- group/text SCC (like the interpreter's eval_ast_env + the type checker's
+-- type_of_env), calling into type_of_env. Each recursive call walks a strict
+-- sub-node / shorter tail, but that shrinking value is a FIELD of a packed input
+-- concept (not the input itself), so the `structural` proof does not fit — they
+-- carry bound-only termination and ACCEPT the mandatory native recursion
+-- breadcrumb. The backstops are the same: finite Env / binding / param / rule
+-- lists and a finite AST bounded by max_nodes.
+-- ============================================================================
+
+-- param_to_tenv: convert a rule's ParamList into a TYPE env (Env), storing each
+-- parameter's DECLARED type code in the entry's `val` slot. Mirror of brick 16's
+-- param_to_binding, but for the type checker: where param_to_binding consed a
+-- dummy AstNum value (it only ever needed the NAME span), this carries the type
+-- code so an argument referencing a typed param of the CALLER resolves to that
+-- param's declared type via env_lookup. The resulting env is the rule's INITIAL
+-- type scope, then build_tenv extends it with the lets. Structural recursion on
+-- the PCons tail (Phase C), like param_to_binding / param_list_len.
+rule param_to_tenv
+  @intention: "Convert a parameter list into a type environment (params at their declared types)"
+  @source: vexprparse.intent:39
+  input:
+    pl : ParamList
+  output:
+    out : Env
+  logic:
+    out = match pl:
+      PCons(name_start, name_len, ty, rest) => Env::ECons { name_start: name_start, name_len: name_len, val: ty, rest: param_to_tenv(rest) }
+      PNil => Env::ENil
+  proofs:
+    purity:
+      reads : [pl]
+      calls : [param_to_tenv]
+    termination:
+      bound : 4000
+      structural : pl
+
+
+-- phead_ty: the DECLARED type code of the HEAD parameter of a ParamList — or the
+-- sentinel 9 (no such param) when the list is empty. The lockstep walk in
+-- argtype_args uses 9 to detect "the callee has no more parameters", so the extra
+-- arguments of an over-long call are NOT paired (their count mismatch is
+-- lint_arity's concern). Distinguishable from every real type code (0/1/2).
+-- Non-recursive accessor, like rl_head_params.
+rule phead_ty
+  @intention: "The declared type code of a parameter list's head param (sentinel 9 if empty)"
+  @source: vexprparse.intent:39
+  input:
+    pl : ParamList
+  output:
+    out : number
+  logic:
+    out = match pl:
+      PCons(name_start, name_len, ty, rest) => ty
+      PNil => 9
+  proofs:
+    purity:
+      reads : [pl]
+      calls : []
+    termination:
+      bound : 16
+
+
+-- ptail: the TAIL of a ParamList (the parameters after the head) — or PNil when
+-- the list is empty. The other half of the lockstep: argtype_args advances the
+-- param list with ptail in step with the argument tail, so the n-th argument is
+-- paired with the n-th parameter. Non-recursive accessor, like rl_head_params.
+rule ptail
+  @intention: "The tail of a parameter list (PNil if empty)"
+  @source: vexprparse.intent:39
+  input:
+    pl : ParamList
+  output:
+    out : ParamList
+  logic:
+    out = match pl:
+      PCons(name_start, name_len, ty, rest) => rest
+      PNil => ParamList::PNil
+  proofs:
+    purity:
+      reads : [pl]
+      calls : []
+    termination:
+      bound : 16
+
+
+-- argtype_args's input: the call's argument list to walk in LOCKSTEP with the
+-- callee's parameter list, plus the caller's type env (so each argument is typed
+-- in the caller's scope), the source text, and the program rule list (so a nested
+-- call inside an argument resolves its own callee). The two lists advance together
+-- (args via the ArgCons tail, params via ptail).
+concept ArgTypeArgsState
+  @intention: "A call's argument list + the callee's param list + caller type env + source + program"
+  @source: vexprparse.intent:39
+  fields:
+    args : ArgList
+    params : ParamList
+    tenv : Env
+    src : text [..256]
+    prog : RuleList
+
+
+-- The Ast-walking input: the AST node to walk for call sites, the caller's type
+-- env (used to type each argument), the source text, and the program rule list
+-- (callee scope for find_rule). Same shape as brick 19's TypeArg plus a `prog`
+-- field — argtype needs the program to resolve each call's callee, where the
+-- type checker only ever typed calls to number.
+concept ArgTypeState
+  @intention: "An Ast node + caller type env + source text + program rule list, for the arg-type walk"
+  @source: vexprparse.intent:39
+  fields:
+    node : Ast
+    tenv : Env
+    src : text [..256]
+    prog : RuleList
+
+
+-- argtype_binds's input: the binding list whose RHSes are walked for call sites,
+-- the type env built so far (each RHS is typed against it, and a later let's RHS
+-- sees an earlier let's type), the source text, and the program rule list. Mirror
+-- of brick 19's BuildTArg/TCheckBindsState shape plus `prog`.
+concept ArgTypeBindsState
+  @intention: "A binding list + the type env so far + source text + program rule list, for the arg-type walk"
+  @source: vexprparse.intent:39
+  fields:
+    binds : Binding
+    tenv : Env
+    src : text [..256]
+    prog : RuleList
+
+
+-- argtype_rule's input: ONE parsed rule declaration + the FULL program rule list
+-- (so each call resolves its callee against every rule) + the program source text.
+concept ArgTypeRuleState
+  @intention: "A rule declaration + the full program rule list + the source text, for arg-type checking it"
+  @source: vexprparse.intent:39
+  fields:
+    rd : RuleDecl
+    prog : RuleList
+    src : text [..256]
+
+
+-- argtype_list's input: the rule list being ITERATED (`iter` advances each step,
+-- one rule checked per step) + the FULL program rule list (`all`, fixed, so every
+-- call resolves its callee against every rule) + the source text. The iter/all
+-- split mirrors lint_callees_list: argtype_rule always receives `all`, never the
+-- shrinking `iter`, so callee resolution stays program-wide.
+concept ArgTypeListState
+  @intention: "The rule list being iterated + the full program rule list + the source text"
+  @source: vexprparse.intent:39
+  fields:
+    iter : RuleList
+    all : RuleList
+    src : text [..256]
+
+
+-- argtype_args: walk a call's argument list in LOCKSTEP with the callee's
+-- parameter list, summing three contributions per (arg, param) pair:
+--   * the MISMATCH count for this pair: 1 iff the param exists (phead_ty != 9)
+--     AND the argument's type (typed against the caller's env) differs from the
+--     param's declared type AND the argument's type is not ERROR (3 — that is
+--     brick 19's concern, skipped here to avoid double-counting). Parenthesized
+--     because Verbose has no operator precedence: the `if ... then 1 else 0` is
+--     the leftmost summand. type_of_env(head) appears three times — it is pure,
+--     so the repetition is correctness-neutral.
+--   * argtype_ast over the argument itself, so a NESTED call inside an argument
+--     (f(g(1 < 2))) has its own call sites checked.
+--   * argtype_args over the tails: the argument tail paired with ptail(params),
+--     advancing both lists one step.
+-- ArgNil ends the walk (0). When the param list runs out first, phead_ty returns
+-- 9, so the extra arguments contribute no mismatch (their count is lint_arity's
+-- concern). a.args is a FIELD of the packed input, so bound + native breadcrumb.
+rule argtype_args
+  @intention: "Total arg-type mismatches across a call's arguments, paired against the callee's params"
+  @source: vexprparse.intent:39
+  input:
+    a : ArgTypeArgsState
+  output:
+    out : number
+  logic:
+    out = match a.args:
+      ArgCons(head, tail) => (if phead_ty(a.params) != 9 and type_of_env(TypeArg { node: head, tenv: a.tenv, src: a.src }) != phead_ty(a.params) and type_of_env(TypeArg { node: head, tenv: a.tenv, src: a.src }) != 3 then 1 else 0) + argtype_ast(ArgTypeState { node: head, tenv: a.tenv, src: a.src, prog: a.prog }) + argtype_args(ArgTypeArgsState { args: tail, params: ptail(a.params), tenv: a.tenv, src: a.src, prog: a.prog })
+      ArgNil => 0
+  proofs:
+    purity:
+      reads : [a.args, a.params, a.tenv, a.src, a.prog]
+      calls : [phead_ty, type_of_env, argtype_ast, ptail, argtype_args]
+    termination:
+      bound : 4000
+
+
+-- argtype_ast: walk an Ast and count, at EVERY call site, the arguments whose type
+-- mismatches the callee's declared parameter type. Mirrors count_badcall_ast's
+-- structural walk, but the load-bearing arm is AstCall:
+--   * AstCall(callee_start, callee_len, args) => argtype_args over the call's
+--     arguments, paired against the callee's params. The callee is resolved with
+--     find_rule (the sentinel MkRule on no match has PNil params -> no pairs ->
+--     no errors, so an undefined callee is silently skipped here — lint_callees
+--     flags it). rd_params reads the matched rule's parameter list.
+--   * AstBin sums lhs + rhs; AstNeg / AstNot descend; AstIf sums cond + thn + els;
+--     AstField walks its base (the field name carries no call).
+--   * AstVar / AstNum / AstStr / AstBool / AstErr carry no call site -> 0.
+-- Every recursive call threads the same tenv (caller scope) + src + prog. a.node
+-- is a FIELD of the packed input, so bound + the mandatory native breadcrumb.
+rule argtype_ast
+  @intention: "Total arg-type mismatches in an AST, resolving each call's callee against the program"
+  @source: vexprparse.intent:39
+  input:
+    a : ArgTypeState
+  output:
+    out : number
+  logic:
+    out = match a.node:
+      AstNum(value) => 0
+      AstBool(value) => 0
+      AstVar(start, len) => 0
+      AstStr(start, len) => 0
+      AstErr => 0
+      AstBin(op, lhs, rhs) => argtype_ast(ArgTypeState { node: lhs, tenv: a.tenv, src: a.src, prog: a.prog }) + argtype_ast(ArgTypeState { node: rhs, tenv: a.tenv, src: a.src, prog: a.prog })
+      AstNeg(inner) => argtype_ast(ArgTypeState { node: inner, tenv: a.tenv, src: a.src, prog: a.prog })
+      AstNot(inner) => argtype_ast(ArgTypeState { node: inner, tenv: a.tenv, src: a.src, prog: a.prog })
+      AstField(base, fstart, flen) => argtype_ast(ArgTypeState { node: base, tenv: a.tenv, src: a.src, prog: a.prog })
+      AstIf(cond, thn, els) => argtype_ast(ArgTypeState { node: cond, tenv: a.tenv, src: a.src, prog: a.prog }) + argtype_ast(ArgTypeState { node: thn, tenv: a.tenv, src: a.src, prog: a.prog }) + argtype_ast(ArgTypeState { node: els, tenv: a.tenv, src: a.src, prog: a.prog })
+      AstCall(callee_start, callee_len, args) => argtype_args(ArgTypeArgsState { args: args, params: rd_params(find_rule(FindRuleState { rules: a.prog, src: a.src, q_start: callee_start, q_len: callee_len })), tenv: a.tenv, src: a.src, prog: a.prog })
+  proofs:
+    purity:
+      reads : [a.node, a.tenv, a.src, a.prog]
+      calls : [argtype_ast, argtype_args, rd_params, find_rule]
+    termination:
+      bound : 4000
+
+
+-- argtype_binds: for each binding in the list, walk its RHS for call sites
+-- (argtype_ast against the type env built SO FAR), then recurse on the rest with
+-- the env extended by (name span, RHS type) — so a later let's RHS references an
+-- earlier let at its inferred type, exactly build_tenv's extension step. The RHS
+-- type for the env extension is computed via type_of_env (pure). BNil contributes
+-- 0. b.binds is a FIELD of the packed input, so bound + native breadcrumb.
+rule argtype_binds
+  @intention: "Total arg-type mismatches across every binding's RHS, threading the growing type env"
+  @source: vexprparse.intent:39
+  input:
+    a : ArgTypeBindsState
+  output:
+    out : number
+  logic:
+    out = match a.binds:
+      BCons(name_start, name_len, value, rest) => argtype_ast(ArgTypeState { node: value, tenv: a.tenv, src: a.src, prog: a.prog }) + argtype_binds(ArgTypeBindsState { binds: rest, tenv: Env::ECons { name_start: name_start, name_len: name_len, val: type_of_env(TypeArg { node: value, tenv: a.tenv, src: a.src }), rest: a.tenv }, src: a.src, prog: a.prog })
+      BNil => 0
+  proofs:
+    purity:
+      reads : [a.binds, a.tenv, a.src, a.prog]
+      calls : [argtype_ast, type_of_env, argtype_binds]
+    termination:
+      bound : 4000
+
+
+-- argtype_rule: the arg-type mismatch count for ONE rule. Seed the type env with
+-- the rule's OWN params at their declared types (param_to_tenv), so an argument
+-- referencing a caller param is typed correctly. Split the body into its bindings
+-- and result; build the FULL env from the lets on top of the param env
+-- (build_tenv); count call-site arg-type mismatches in the let RHSs (argtype_binds
+-- threading the same growing env starting from the param env) PLUS in the result
+-- expression (argtype_ast against the full env). Both halves resolve callees
+-- against the FULL program list `a.prog`. Plain rule (uses `let`), mirroring
+-- tcheck_rule's body-split shape. bound 4000 (it calls into the recursive SCC).
+rule argtype_rule
+  @intention: "Number of call-site arg-type mismatches in one rule (0 if every argument fits its param)"
+  @source: vexprparse.intent:39
+  input:
+    a : ArgTypeRuleState
+  output:
+    out : number
+  logic:
+    let params = rd_params(a.rd)
+    let ptenv = param_to_tenv(params)
+    let body = rd_body(a.rd)
+    let binds = block_binds(body)
+    let result = block_result(body)
+    let full_tenv = build_tenv(BuildTArg { binds: binds, tenv: ptenv, src: a.src })
+    let in_binds = argtype_binds(ArgTypeBindsState { binds: binds, tenv: ptenv, src: a.src, prog: a.prog })
+    out = in_binds + argtype_ast(ArgTypeState { node: result, tenv: full_tenv, src: a.src, prog: a.prog })
+  proofs:
+    purity:
+      reads : [a.rd, a.prog, a.src]
+      calls : [rd_params, param_to_tenv, rd_body, block_binds, block_result, build_tenv, argtype_binds, argtype_ast]
+    termination:
+      bound : 4000
+
+
+-- argtype_list: fold argtype_rule over the program, summing each rule's arg-type
+-- mismatch count. Mirror of lint_callees_list: `iter` advances each step (a field
+-- of the packed input, so bound + breadcrumb), while `all` and `src` are threaded
+-- unchanged so every rule resolves its callees against the same full program.
+rule argtype_list
+  @intention: "Total call-site arg-type mismatches across every rule in a program"
+  @source: vexprparse.intent:39
+  input:
+    a : ArgTypeListState
+  output:
+    out : number
+  logic:
+    out = match a.iter:
+      RCons(head, tail) => argtype_rule(ArgTypeRuleState { rd: head, prog: a.all, src: a.src }) + argtype_list(ArgTypeListState { iter: tail, all: a.all, src: a.src })
+      RNil => 0
+  proofs:
+    purity:
+      reads : [a.iter, a.all, a.src]
+      calls : [argtype_rule, argtype_list]
+    termination:
+      bound : 4000
+
+
+-- argtype_check: the brick-21 money-shot driver. Tokenize the program source (with
+-- indentation), parse the whole rule-decl sequence into a RuleList, then fold the
+-- arg-type check over it with `iter = all = the parsed program` so every call
+-- resolves its callee against the entire program. Returns the TOTAL number of
+-- call-site arguments whose type does NOT match the callee's declared parameter
+-- type. 0 = every argument fits its parameter's type.
+--
+--   argtype_check("rule main\n  logic:\n    out = f(5)\nrule f(x : number)\n  logic:\n    out = x")       = 0
+--            (number arg to number param)
+--   argtype_check("rule main\n  logic:\n    out = f(1 < 2)\nrule f(x : number)\n  logic:\n    out = x")    = 1
+--            (bool arg to number param)
+--   argtype_check("rule main\n  logic:\n    out = f(1 < 2)\nrule f(x : bool)\n  logic:\n    out = if x then 1 else 0") = 0
+--            (bool arg to bool param)
+--   argtype_check("rule g(b : bool)\n  logic:\n    out = f(b)\nrule f(x : number)\n  logic:\n    out = x") = 1
+--            (THE SHOWCASE: b is bool by g's declaration, passed to f's number param)
+--   argtype_check("rule g(b : number)\n  logic:\n    out = f(b)\nrule f(x : number)\n  logic:\n    out = x") = 0
+--            (b is number — the well-typed version of the showcase)
+--   argtype_check("rule main\n  logic:\n    out = add(5, 1 < 2)\nrule add(x : number, y : number)\n  logic:\n    out = x + y") = 1
+--            (two args, the second a bool against a number param)
+--   argtype_check("rule main\n  logic:\n    out = add(1 < 2, 3 < 4)\nrule add(x : number, y : number)\n  logic:\n    out = x + y") = 2
+--            (both args bool against number params)
+--   argtype_check("rule main\n  logic:\n    out = f(g(1 < 2))\nrule f(x : number)\n  logic:\n    out = x\nrule g(y : number)\n  logic:\n    out = y") = 1
+--            (g's arg 1<2 is bool vs g's number param; f's arg g(...) is number(0) -> ok)
+--   argtype_check("rule main\n  logic:\n    out = h(1 < 2)")                                              = 0
+--            (h does not exist -> sentinel PNil params -> no pair; lint_callees flags h)
+--
+-- NATIVE-ONLY (multi-line source). Takes a ScanState (source + pos): source is
+-- argv arg 1, pos is argv arg 2 (always 0). Orthogonal to brick 19's type_check —
+-- an argument that is itself ill-typed is type_check's concern (skipped here), a
+-- well-typed argument of the wrong type is this pass's concern (skipped there).
+rule argtype_check
+  @intention: "Tokenize, parse, and count all call-site arguments whose type mismatches the callee's param"
+  @source: vexprparse.intent:39
+  input:
+    s : ScanState
+  output:
+    out : number
+  logic:
+    let toks = begin_tokenize(ScanState { source: s.source, pos: 0 })
+    let prog = parse_program(ProgramState { toks: toks, src: s.source, pos: 0 })
+    out = argtype_list(ArgTypeListState { iter: prog, all: prog, src: s.source })
+  proofs:
+    purity:
+      reads : [s.source]
+      calls : [begin_tokenize, parse_program, argtype_list]
+    termination:
+      bound : 256
+
+
 -- Entry driver: tokenize the source (from argv) and count the cons cells. The
 -- money-shot observable for brick 8a: count_cells_src("1 + 2\n3 * 4") = 8
 -- (tokens 1 + 2 Newline 3 * 4 then trailing Eof). Newline-bearing sources are

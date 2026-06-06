@@ -785,3 +785,48 @@ there (out of the arithmetic evaluator's scope).
     n=1 -> 0. param_nth_type walks the PCons tail via a DECREASING Number field
     (n -> n - 1), so its termination is proved mechanically (Phase C), like
     drop_rules over a RuleList.
+
+39. Brick 21 of the self-hosting arc: CALL-SITE ARGUMENT TYPE checking — where
+    the parser (brick 20 typed params) and the type checker (brick 19) finally
+    meet. The callee pass (brick 15) asks "does the called rule EXIST?"; the arity
+    pass (brick 17) asks "does it pass the RIGHT NUMBER of arguments?"; this pass
+    asks "does each argument's TYPE match the callee's DECLARED parameter type?".
+    A call f(1 < 2) to a rule `rule f(x : number)` is fine for the callee pass (f
+    exists) and the arity pass (1 arg, 1 param) but WRONG here — a bool flows into
+    a number parameter.
+
+    ORTHOGONAL to brick 19's type_check, with the same no-double-counting discipline
+    that separates lint_arity from lint_callees: an argument whose OWN type is
+    already ERROR (3) is brick 19's concern and is SKIPPED here; a WELL-typed
+    argument of the WRONG type is what this pass flags. argtype_check(source) sums,
+    over the whole program, the count of call-site arguments whose type mismatches
+    the callee's param.
+
+    TYPING THE ARGUMENT. The caller's type env is seeded with the caller's OWN
+    params at their declared types (param_to_tenv — the type-env sibling of brick
+    16's param_to_binding) THEN extended with its let bindings (brick 19's
+    build_tenv). So an argument referencing a typed param of the caller is typed
+    correctly. THE SHOWCASE: `rule g(b : bool) ... out = f(b)` with `rule f(x :
+    number)` flags `b` (bool by g's declaration, passed to f's number param); the
+    `b : number` version flags nothing.
+
+    THE LOCKSTEP. Per call, walk the argument list (ArgCons tail) and the callee's
+    param list (ptail) together; for each (arg, param) pair count a mismatch iff
+    the param exists (phead_ty != 9) AND arg type != param type AND arg type != 3.
+    When one list runs out, pairing stops (count mismatches are lint_arity's
+    concern). Untyped params default to number (0), so a bool to an untyped param
+    IS flagged (documented). The callee is resolved with find_rule (brick 18); on
+    no match the sentinel MkRule has PNil params -> no pairs -> no arg-type errors
+    (lint_callees flags the missing callee). A call's RESULT type stays number (0)
+    — no return-type syntax yet — so type_of_env is unchanged; this is a SEPARATE
+    counting pass (argtype_ast / argtype_args / argtype_binds, mirroring the
+    count_badcall_* walk and the iter/all split of lint_callees_list).
+
+    THE MONEY SHOTS (NATIVE-ONLY, multi-line sources, same scan-state invocation
+    as items 24/30/31/34-38): f(5)->f(x:number) -> 0; f(1<2)->f(x:number) -> 1;
+    f(1<2)->f(x:bool) -> 0; g(b:bool)->f(x:number) -> 1 (showcase);
+    g(b:number)->f(x:number) -> 0; add(5, 1<2) with two number params -> 1;
+    add(1<2, 3<4) -> 2; f(g(1<2)) with both rules number-param'd -> 1 (g's inner
+    bool arg flagged, f's call-typed arg is number); h(1<2) with h undefined -> 0
+    (sentinel skip). The recursive walk SCC (argtype_ast/args/binds) carries
+    bound-only termination + the native recursion breadcrumb, like type_of_env.
