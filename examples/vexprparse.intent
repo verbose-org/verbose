@@ -697,3 +697,51 @@ there (out of the arithmetic evaluator's scope).
     eval_block / eval_nth_rule / eval_rule_decl drivers thread an empty program
     (RuleList::RNil), so a bare block or single rule with a call hits the find_rule
     sentinel -> 0, exactly the old behavior — fully backward compatible.
+
+37. Brick 19 of the self-hosting arc: a TYPE CHECKER in Verbose — the static
+    pendant of item 36's interpreter. Where the interpreter computes a VALUE for
+    an AST, the type checker computes a TYPE: a small lattice {number, bool,
+    ERROR} encoded as non-negative codes (0 = number, 1 = bool, 3 = ERROR; 2 is
+    reserved for a future text brick). type_check(source) returns the total
+    number of type errors (ill-typed let RHSs + ill-typed rule results) across
+    the whole program; 0 = well-typed.
+
+    NON-NEGATIVE CODES. A -1 sentinel would let the optimizer (default field
+    range [0, i32::MAX]) dead-eliminate any `x < 0` branch, so every type code is
+    >= 0 and the classifiers compare against the literal codes 0/1/3 directly.
+
+    THE TYPE ENVIRONMENT. The brick-10 Env concept is REUSED as the type env:
+    each ECons stores a name span and, in `val`, the bound name's TYPE code.
+    env_lookup works UNCHANGED — it returns the stored type code on a match, 0
+    (= number) on an unbound name, which is the right default for an unannotated
+    parameter (the interpreter's all-numbers world). build_tenv mirrors build_env:
+    fold the lets in source order, typing each RHS against the env built so far,
+    consing (name span, RHS type) on the front so later lets see earlier ones.
+
+    TYPING RULES (v1). AstNum => number; AstBool => bool; AstErr/AstField/AstStr
+    => ERROR; AstVar => env_lookup; AstCall => number. AstNeg requires a number
+    operand, AstNot a bool operand. AstBin: arithmetic (+ - * / %) needs both
+    number => number; comparison (== != < > <= >=) needs both number => bool (v1:
+    numeric comparison only — bool comparison is a future brick); logic (and/or)
+    needs both bool => bool. AstIf: bool condition AND both branches the same
+    non-ERROR type => that type, else ERROR. Any mismatch => ERROR.
+
+    THE SCC. type_of_env + build_tenv (+ the per-rule tcheck_binds) form a
+    recursive group/text cluster exactly like the interpreter's eval_ast_env +
+    build_env: each recursive call walks a strict sub-node / shorter tail, but
+    that shrinking value is a FIELD of a packed input concept, so the structural
+    proof does not fit — bound-only termination + the native recursion breadcrumb,
+    same as item 36. Backstops: finite Env / binding / rule lists and a finite
+    AST bounded by max_nodes.
+
+    THE MONEY SHOTS (all NATIVE-ONLY, multi-line sources, same scan-state
+    invocation as items 24/30/31/34/35/36). A type_check driver folds the check
+    over the parsed program: `out = 1 + 2` -> 0; `out = 1 + (2 < 3)` -> 1
+    (number + bool); `out = if 5 then 1 else 2` -> 1 (non-bool condition);
+    `out = if 1 < 2 then 3 else 4` -> 0 (bool condition, number branches); the
+    showcase `let b = 1 < 2 / out = if b then 1 else 2` -> 0 (b inferred bool
+    from its RHS, so using it as a condition is well-typed — proves the type
+    environment works) vs `let n = 5 / out = if n then 1 else 2` -> 1 (n is
+    number, used as a condition -> error); `out = (1 < 2) and (3 < 4)` -> 0
+    (bool and bool) vs `out = (1 < 2) and 3` -> 1 (and with a number operand);
+    and a two-rule program with one good and one bad rule -> 1.

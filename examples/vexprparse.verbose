@@ -6049,6 +6049,374 @@ rule lint_arity
       bound : 256
 
 
+-- ============================================================================
+-- BRICK 19: a TYPE CHECKER in Verbose — the static pendant of brick 18's
+-- interpreter. Where eval_ast_env computes a VALUE for an AST, type_of_env
+-- computes a TYPE for it: a small type lattice {number, bool, ERROR} encoded as
+-- non-negative codes (0 = number, 1 = bool, 3 = ERROR; 2 is reserved for a future
+-- `text` brick). The checker MIRRORS the interpreter's recursive shape exactly —
+-- same dispatch over the Ast variants, same per-rule fold over the program, same
+-- type-environment threading through let-blocks — but propagates type codes
+-- instead of numbers. type_check(source) returns the total number of type errors
+-- (ill-typed let RHSs + ill-typed rule results) across the whole program.
+--
+-- WHY NON-NEGATIVE CODES. The optimizer's default field range is [0, i32::MAX],
+-- so a -1 sentinel would let interval arithmetic dead-eliminate any `x < 0`
+-- branch. Every type code here is >= 0, and the bin/if classifiers compare
+-- against the literal codes 0/1/3 directly, never against a negative marker.
+--
+-- THE TYPE ENVIRONMENT. We REUSE the brick-10 Env concept as the TYPE env: each
+-- ECons stores a name span and, in `val`, the bound name's TYPE code (instead of
+-- its numeric value). env_lookup works UNCHANGED — it returns the stored `val`
+-- (now a type code) on a match, or 0 on an unbound name. 0 = number is exactly
+-- the right default: an unannotated PARAMETER is treated as number, matching the
+-- interpreter's all-numbers world. build_tenv mirrors build_env: it folds the
+-- let-bindings in source order, typing each RHS against the env built so far (so
+-- `let b = 1 < 2` then `out = if b ...` sees b : bool), consing (name span, RHS
+-- type) onto the front.
+--
+-- TYPING RULES (v1).
+--   AstNum  => number ; AstBool => bool ; AstErr / AstField / AstStr => ERROR.
+--   AstVar  => env_lookup (the stored type code; 0 = number for unbound params).
+--   AstCall => number (every rule returns number in the interpreter's world).
+--   AstNeg(e)  => number if type(e) = number, else ERROR.
+--   AstNot(e)  => bool   if type(e) = bool,   else ERROR.
+--   AstBin(op, l, r) with lt = type(l), rt = type(r):
+--     arithmetic (+ - * / %): number if lt = rt = number, else ERROR.
+--     comparison (== != < > <= >=): bool if lt = rt = number, else ERROR.
+--        (v1: numbers only; bool comparison is a FUTURE brick.)
+--     logic (and / or): bool if lt = rt = bool, else ERROR.
+--   AstIf(c, t, e): if type(c) = bool AND type(t) = type(e) AND type(t) != ERROR
+--                   then type(t), else ERROR.
+--
+-- TERMINATION. type_of_env + build_tenv (and the per-rule tcheck_binds) form a
+-- recursive group/text SCC exactly like the interpreter's eval_ast_env +
+-- build_env: each recursive call walks a strict sub-node / shorter tail, but that
+-- shrinking value is a FIELD of a packed input concept (not the input itself), so
+-- the `structural` proof does not fit. Like the interpreter rules they carry
+-- bound-only termination and ACCEPT the mandatory native recursion breadcrumb.
+-- The backstops are identical: finite Env / binding / rule lists and a finite AST
+-- bounded by max_nodes, so every recursion strictly shrinks toward a leaf / Nil.
+-- ============================================================================
+
+-- type_of_env's input: the AST node to type, the TYPE environment (name span ->
+-- type code) to resolve variable references against, and the source text the
+-- name spans index into. Mirrors the interpreter's EvalEnvArg minus the program
+-- (calls type to number unconditionally here, so no program threading is needed).
+concept TypeArg
+  @intention: "An Ast node + the type environment + the source text, for computing its type code"
+  @source: vexprparse.intent:37
+  fields:
+    node : Ast
+    tenv : Env
+    src : text [..256]
+
+
+-- bin_type's input: the binary operator code plus the ALREADY-COMPUTED type codes
+-- of the two operands. A flat number-classifier (no recursion, no group field):
+-- type_of_env types lhs and rhs first, then hands the (op, lt, rt) triple here.
+concept BinTypeState
+  @intention: "A binary op code + the two operand type codes, for classifying the result type"
+  @source: vexprparse.intent:37
+  fields:
+    op : number [0, 64]
+    lt : number [0, 8]
+    rt : number [0, 8]
+
+
+-- if_type's input: the type codes of an if's condition, then-branch, and
+-- else-branch. A flat classifier (no recursion): type_of_env types all three
+-- sub-expressions first, then hands the triple here for the well-typedness check.
+concept IfTypeState
+  @intention: "The condition/then/else type codes of an if, for classifying the result type"
+  @source: vexprparse.intent:37
+  fields:
+    ct : number [0, 8]
+    tt : number [0, 8]
+    et : number [0, 8]
+
+
+-- bin_type: classify the result type of a binary operation from its op code and
+-- its two operand type codes (computed by type_of_env before the call). Arithmetic
+-- ops require both operands number and yield number; comparisons require both
+-- number and yield bool (v1: numeric comparison only — bool == bool is a future
+-- brick); logic ops require both bool and yield bool. Any mismatch => ERROR (3),
+-- and an unknown op also => ERROR. NON-recursive: a flat nested-if classifier,
+-- bounded by 8 (it never recurses; the bound is the trivial leaf budget).
+rule bin_type
+  @intention: "Result type code of a binary op given its operand type codes (3 = ill-typed)"
+  @source: vexprparse.intent:37
+  input:
+    b : BinTypeState
+  output:
+    out : number
+  logic:
+    out = if b.op == 13 then (if b.lt == 0 and b.rt == 0 then 0 else 3) else if b.op == 14 then (if b.lt == 0 and b.rt == 0 then 0 else 3) else if b.op == 15 then (if b.lt == 0 and b.rt == 0 then 0 else 3) else if b.op == 16 then (if b.lt == 0 and b.rt == 0 then 0 else 3) else if b.op == 17 then (if b.lt == 0 and b.rt == 0 then 0 else 3) else if b.op == 1 then (if b.lt == 0 and b.rt == 0 then 1 else 3) else if b.op == 6 then (if b.lt == 0 and b.rt == 0 then 1 else 3) else if b.op == 19 then (if b.lt == 0 and b.rt == 0 then 1 else 3) else if b.op == 20 then (if b.lt == 0 and b.rt == 0 then 1 else 3) else if b.op == 5 then (if b.lt == 0 and b.rt == 0 then 1 else 3) else if b.op == 4 then (if b.lt == 0 and b.rt == 0 then 1 else 3) else if b.op == 30 then (if b.lt == 1 and b.rt == 1 then 1 else 3) else if b.op == 31 then (if b.lt == 1 and b.rt == 1 then 1 else 3) else 3
+  proofs:
+    purity:
+      reads : [b.op, b.lt, b.rt]
+      calls : []
+    termination:
+      bound : 128
+
+
+-- if_type: classify the result type of a conditional from the type codes of its
+-- condition, then-branch, and else-branch. Well-typed iff the condition is bool
+-- (ct == 1), both branches have the SAME type (tt == et), and that type is not
+-- ERROR (tt != 3); the result type is then that branch type. Any failure => ERROR
+-- (3). NON-recursive flat classifier, bounded by 8.
+rule if_type
+  @intention: "Result type code of an if given its sub-expression type codes (3 = ill-typed)"
+  @source: vexprparse.intent:37
+  input:
+    i : IfTypeState
+  output:
+    out : number
+  logic:
+    out = if i.ct == 1 and i.tt == i.et and i.tt != 3 then i.tt else 3
+  proofs:
+    purity:
+      reads : [i.ct, i.tt, i.et]
+      calls : []
+    termination:
+      bound : 8
+
+
+-- type_of_env: the dispatch. Mirrors eval_ast_env's match STRUCTURE arm-for-arm
+-- but returns a TYPE code instead of a value. Leaves: AstNum => number (0),
+-- AstBool => bool (1), AstErr / AstField / AstStr => ERROR (3), AstCall => number
+-- (0, every rule returns number here). AstVar resolves its name in the type env
+-- via env_lookup (the stored type code; 0 = number for unbound params). The unary
+-- and binary forms recurse on their sub-nodes, threading the same tenv + src down,
+-- then classify: AstNeg requires a number operand (else ERROR), AstNot a bool
+-- operand (else ERROR), AstBin delegates to bin_type with the two recursively
+-- computed operand types, AstIf delegates to if_type with the three recursively
+-- computed sub-types. Bound-only termination + the native recursion breadcrumb:
+-- each recursive call walks a strict sub-node of t.node, but t.node is a FIELD of
+-- the packed input (not the input), so the `structural` proof does not fit — same
+-- as eval_ast_env (see the header).
+rule type_of_env
+  @intention: "Compute an AST's type code, resolving variable references against a type environment"
+  @source: vexprparse.intent:37
+  input:
+    t : TypeArg
+  output:
+    out : number
+  logic:
+    out = match t.node:
+      AstNum(value) => 0
+      AstBin(op, lhs, rhs) => bin_type(BinTypeState { op: op, lt: type_of_env(TypeArg { node: lhs, tenv: t.tenv, src: t.src }), rt: type_of_env(TypeArg { node: rhs, tenv: t.tenv, src: t.src }) })
+      AstNeg(inner) => if type_of_env(TypeArg { node: inner, tenv: t.tenv, src: t.src }) == 0 then 0 else 3
+      AstNot(inner) => if type_of_env(TypeArg { node: inner, tenv: t.tenv, src: t.src }) == 1 then 1 else 3
+      AstVar(start, len) => env_lookup(EnvLookState { env: t.tenv, src: t.src, q_start: start, q_len: len })
+      AstField(base, fstart, flen) => 3
+      AstCall(callee_start, callee_len, args) => 0
+      AstIf(cond, thn, els) => if_type(IfTypeState { ct: type_of_env(TypeArg { node: cond, tenv: t.tenv, src: t.src }), tt: type_of_env(TypeArg { node: thn, tenv: t.tenv, src: t.src }), et: type_of_env(TypeArg { node: els, tenv: t.tenv, src: t.src }) })
+      AstBool(value) => 1
+      AstStr(start, len) => 3
+      AstErr => 3
+  proofs:
+    purity:
+      reads : [t.node, t.tenv, t.src]
+      calls : [type_of_env, env_lookup, bin_type, if_type]
+    termination:
+      bound : 4000
+
+
+-- build_tenv's input: the remaining binding list, the type env built so far, and
+-- the source text (each binding's RHS is TYPED against tenv_so_far, and AstVar
+-- references in it resolve via src). Mirror of the interpreter's BuildEnvArg minus
+-- the program field (type_of_env types calls to number without it).
+concept BuildTArg
+  @intention: "Remaining bindings + the type env built so far + the source text"
+  @source: vexprparse.intent:37
+  fields:
+    binds : Binding
+    tenv : Env
+    src : text [..256]
+
+
+-- build_tenv: fold the binding list (in source order) into a TYPE env. For each
+-- BCons, compute the binding's RHS TYPE (type_of_env against the env built so far,
+-- so `let b = 1 < 2` then `let c = b` sees b : bool), cons (name span, RHS type)
+-- onto the FRONT, and recurse on the rest with the extended env. BNil returns the
+-- accumulated env unchanged. Front-consing gives last-binding-wins shadowing in
+-- env_lookup, exactly as build_env does for values. Bound-only termination + the
+-- native recursion breadcrumb (packed input; the shrinking binding tail is a
+-- field, not the input — see the header).
+rule build_tenv
+  @intention: "Fold a binding list into a type environment, typing each RHS against the env so far"
+  @source: vexprparse.intent:37
+  input:
+    bt : BuildTArg
+  output:
+    out : Env
+  logic:
+    out = match bt.binds:
+      BCons(name_start, name_len, value, rest) => build_tenv(BuildTArg { binds: rest, tenv: Env::ECons { name_start: name_start, name_len: name_len, val: type_of_env(TypeArg { node: value, tenv: bt.tenv, src: bt.src }), rest: bt.tenv }, src: bt.src })
+      BNil => bt.tenv
+  proofs:
+    purity:
+      reads : [bt.binds, bt.tenv, bt.src]
+      calls : [build_tenv, type_of_env]
+    termination:
+      bound : 4000
+
+
+-- tcheck_binds's input: the remaining binding list, the type env built so far, and
+-- the source text. Mirrors build_tenv's threading but counts ill-typed RHSs rather
+-- than accumulating an env.
+concept TCheckBindsState
+  @intention: "Remaining bindings + the type env built so far + the source text, for counting ill-typed RHSs"
+  @source: vexprparse.intent:37
+  fields:
+    binds : Binding
+    tenv : Env
+    src : text [..256]
+
+
+-- tcheck_binds: count the let RHSs whose TYPE is ERROR (3), threading the GROWING
+-- type env so a let referencing an earlier one sees its type (e.g. `let b = 1 < 2`
+-- then `let c = b and (2 < 3)` — c sees b : bool). For each BCons: type the RHS
+-- against the env so far, add 1 to the count iff that type is ERROR, then recurse
+-- on the rest with the env extended by (name span, RHS type) — exactly build_tenv's
+-- extension step. The RHS type is computed twice (once for the count, once to
+-- extend the env); type_of_env is pure, so the duplicate is correctness-neutral.
+-- BNil contributes 0. Bound-only termination + the native recursion breadcrumb.
+rule tcheck_binds
+  @intention: "Count the let RHSs in a binding list whose type is ill-typed (ERROR)"
+  @source: vexprparse.intent:37
+  input:
+    tb : TCheckBindsState
+  output:
+    out : number
+  logic:
+    out = match tb.binds:
+      BCons(name_start, name_len, value, rest) => (if type_of_env(TypeArg { node: value, tenv: tb.tenv, src: tb.src }) == 3 then 1 else 0) + tcheck_binds(TCheckBindsState { binds: rest, tenv: Env::ECons { name_start: name_start, name_len: name_len, val: type_of_env(TypeArg { node: value, tenv: tb.tenv, src: tb.src }), rest: tb.tenv }, src: tb.src })
+      BNil => 0
+  proofs:
+    purity:
+      reads : [tb.binds, tb.tenv, tb.src]
+      calls : [type_of_env, tcheck_binds]
+    termination:
+      bound : 4000
+
+
+-- tcheck_rule's input: one parsed rule declaration + the program source text.
+concept TCheckRuleState
+  @intention: "A parsed rule declaration + the program source text, for type-checking it"
+  @source: vexprparse.intent:37
+  fields:
+    rd : RuleDecl
+    src : text [..256]
+
+
+-- tcheck_rule: type-check ONE rule. Split the body into its binding list and final
+-- out-expression; build the FULL type env from all the lets (build_tenv over an
+-- empty start env); count the ill-typed let RHSs (tcheck_binds, which threads the
+-- same growing env so each RHS is typed in the right scope); type the result
+-- expression against the full env; the rule's error count is the bad-bind count
+-- plus 1 iff the result itself is ill-typed. Plain rule (uses `let`), mirroring
+-- lint_rule's body-split shape. bound 4000 (it calls into the recursive checker
+-- SCC, so it carries the SCC's bound rather than a trivial leaf budget).
+rule tcheck_rule
+  @intention: "Number of type errors in one rule (ill-typed let RHSs + ill-typed result; 0 if well-typed)"
+  @source: vexprparse.intent:37
+  input:
+    tr : TCheckRuleState
+  output:
+    out : number
+  logic:
+    let body = rd_body(tr.rd)
+    let binds = block_binds(body)
+    let result = block_result(body)
+    let tenv = build_tenv(BuildTArg { binds: binds, tenv: Env::ENil, src: tr.src })
+    let bad_binds = tcheck_binds(TCheckBindsState { binds: binds, tenv: Env::ENil, src: tr.src })
+    let result_ty = type_of_env(TypeArg { node: result, tenv: tenv, src: tr.src })
+    out = bad_binds + (if result_ty == 3 then 1 else 0)
+  proofs:
+    purity:
+      reads : [tr.rd, tr.src]
+      calls : [rd_body, block_binds, block_result, build_tenv, tcheck_binds, type_of_env]
+    termination:
+      bound : 4000
+
+
+-- tcheck_list's input: the rule list being folded + the program source text.
+-- Mirrors LintCalleesState minus the `all` program field (this pass needs no
+-- inter-rule resolution — each rule is type-checked in isolation).
+concept TCheckListState
+  @intention: "A rule list + the program source text, for folding the type check over the program"
+  @source: vexprparse.intent:37
+  fields:
+    iter : RuleList
+    src : text [..256]
+
+
+-- tcheck_list: fold tcheck_rule over the program, summing each rule's type-error
+-- count. Mirror of lint_callees_list. Bound-only termination + the native
+-- recursion breadcrumb (the shrinking rule-list tail is a field of the packed
+-- input, not the input itself).
+rule tcheck_list
+  @intention: "Total number of type errors across every rule in a program"
+  @source: vexprparse.intent:37
+  input:
+    tl : TCheckListState
+  output:
+    out : number
+  logic:
+    out = match tl.iter:
+      RCons(head, tail) => tcheck_rule(TCheckRuleState { rd: head, src: tl.src }) + tcheck_list(TCheckListState { iter: tail, src: tl.src })
+      RNil => 0
+  proofs:
+    purity:
+      reads : [tl.iter, tl.src]
+      calls : [tcheck_rule, tcheck_list]
+    termination:
+      bound : 4000
+
+
+-- type_check: the brick-19 money-shot driver. Tokenize the program source (with
+-- indentation), parse the whole rule-decl sequence into a RuleList, then fold the
+-- type check over it. Returns the TOTAL number of type errors (ill-typed let RHSs
+-- + ill-typed rule results) in the program. 0 = every let RHS and every rule
+-- result is well-typed.
+--
+--   type_check("rule f\n  logic:\n    out = 1 + 2")          = 0  (number + number)
+--   type_check("rule f\n  logic:\n    out = 1 + (2 < 3)")    = 1  (number + bool)
+--   type_check("rule f\n  logic:\n    out = if 5 then 1 else 2")        = 1 (non-bool cond)
+--   type_check("rule f\n  logic:\n    out = if 1 < 2 then 3 else 4")    = 0 (bool cond, num branches)
+--   type_check("rule f\n  logic:\n    let b = 1 < 2\n    out = if b then 1 else 2") = 0
+--            (THE SHOWCASE: b is inferred bool from its RHS, so using it as a
+--             condition is well-typed — proves the TYPE ENVIRONMENT works)
+--   type_check("rule f\n  logic:\n    let n = 5\n    out = if n then 1 else 2")     = 1
+--            (n is number, used as condition -> error: the type env distinguishes
+--             it from the bool case above)
+--   type_check("rule f\n  logic:\n    out = (1 < 2) and (3 < 4)")       = 0  (bool and bool)
+--   type_check("rule f\n  logic:\n    out = (1 < 2) and 3")             = 1  (and with a number)
+--
+-- NATIVE-ONLY (multi-line source). Takes a ScanState (source + pos): source is
+-- argv arg 1, pos is argv arg 2 (always 0). Independent of the lint passes — a
+-- type-correct program with an undefined callee lints 1 there and 0 here.
+rule type_check
+  @intention: "Tokenize, parse, and count all type errors in a program"
+  @source: vexprparse.intent:37
+  input:
+    s : ScanState
+  output:
+    out : number
+  logic:
+    let toks = begin_tokenize(ScanState { source: s.source, pos: 0 })
+    let prog = parse_program(ProgramState { toks: toks, src: s.source, pos: 0 })
+    out = tcheck_list(TCheckListState { iter: prog, src: s.source })
+  proofs:
+    purity:
+      reads : [s.source]
+      calls : [begin_tokenize, parse_program, tcheck_list]
+    termination:
+      bound : 256
+
+
 -- Entry driver: tokenize the source (from argv) and count the cons cells. The
 -- money-shot observable for brick 8a: count_cells_src("1 + 2\n3 * 4") = 8
 -- (tokens 1 + 2 Newline 3 * 4 then trailing Eof). Newline-bearing sources are
