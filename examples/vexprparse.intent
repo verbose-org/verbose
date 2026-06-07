@@ -883,3 +883,38 @@ there (out of the arithmetic evaluator's scope).
     main's arg-type at index 1 -> (0, 1); ordering — a/b clean, c's body `out = w`
     -> (2, 1). first_bad_rule/_category reuse the five per-rule analyses unchanged,
     composing them the way check_program composes the five list-rules.
+
+42. all_diags_count(source) / nth_diag_at_rule(source, n) / nth_diag_at_cat(source, n)
+    -> the COMPLETE diagnostic report (brick 24). Brick 23's find_diag stops at the
+    FIRST failing rule and returns one Diag; this brick walks the WHOLE program and
+    builds a DiagList — a cons-list with ONE Diag per (rule, failing-category) pair.
+    A rule that is undefined-AND-ill-typed yields TWO entries (category 1 then 4); a
+    clean rule contributes nothing. Within a rule the categories appear in ascending
+    order (1..5); rules in source order. The five per-rule analyses (lint_rule=1,
+    badcall_rule=2, badarity_rule=3, tcheck_rule=4, argtype_rule=5) are reused
+    verbatim — the same five rule_category composes in brick 23, but here EVERY
+    nonzero category is kept, not just the first.
+      rule_diags(rule, idx) -> the DiagList of one rule, ascending order, built by a
+        non-recursive let-chain (tail first: d5, then d4..d1, so category 1 ends at
+        the front). diag_append(a, b) -> standard cons-list append (a's diags in front
+        of b's). prog_diags(prog) -> walk the program, appending each rule's diags
+        before the rest's, threading the running 0-based index. diag_count(list) -> the
+        list LENGTH. nth_diag_rule(list, n) / nth_diag_cat(list, n) -> the n-th diag's
+        rule index (sentinel 9999) / category (sentinel 0).
+    DiagList is a 2-variant group cons-list (DCons|DNil) — like Binding/ArgList/RuleList
+    — returned through the same group-return ABI as build_env returning an Env.
+
+    GRANULARITY (the headline distinction from brick 22): diag_count counts (rule,
+    category) PAIRS, NOT individual problems. A rule with TWO undefined variables is
+    ONE diag (category 1 present once), whereas check_program counts it as 2. So
+    all_diags_count <= check_program in general; they coincide only when no rule has
+    multiple instances of one category. DiagList is a CATEGORIZED report (where +
+    what-kind); check_program is a raw problem TALLY.
+
+    THE MONEY SHOTS (NATIVE-ONLY, multi-line; pairs are (rule_index, category)):
+    clean add+main -> count 0; `out = x + y` (two undef vars, one rule) -> count 1,
+    nth(0)=(0,1) [check_program on the same = 2 — the granularity contrast];
+    `out = z + (1 < 2)` -> count 2, nth(0)=(0,1), nth(1)=(0,4); a/b with bodies
+    `out = x` / `out = y` -> count 2, nth(0)=(0,1), nth(1)=(1,1); QUAD —
+    f(a:number) body `out = z + 1` AND main body `out = f(1 < 2, 3) + g(9)` -> count
+    4, nth(0)=(0,1), nth(1)=(1,2), nth(2)=(1,3), nth(3)=(1,5).

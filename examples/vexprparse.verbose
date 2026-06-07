@@ -396,6 +396,25 @@ concept_group VExpr [max_depth: 4096, max_nodes: 65535]
     variants:
       MkDiag of (rule_index : number, category : number)
 
+  -- Brick 24: a cons-list of Diags — the COMPLETE diagnostic report. Brick 23's
+  -- find_diag returns ONE Diag (the first failure). This brick generalizes it to a
+  -- list: one Diag per (rule, failing-category) pair, in program order, ascending
+  -- category within a rule. DCons carries one Diag head + the rest; DNil is the
+  -- empty report (a fully clean program yields DNil, NOT MkDiag(9999,0) — the
+  -- sentinel was brick 23's single-Diag convention; an empty LIST needs no
+  -- sentinel). Same 2-variant cons shape as Binding (BCons|BNil) / ArgList
+  -- (ArgCons|ArgNil) / RuleList (RCons|RNil), so the same arena machinery and the
+  -- same structural-recursion proof apply. It lives in the group because rule_diags
+  -- / diag_append / prog_diags are recursive rules that RETURN one (same group-return
+  -- ABI as build_env returning an Env), and the number drivers read off it via
+  -- diag_count / nth_diag_rule / nth_diag_cat (the cons-walk idiom).
+  concept DiagList
+    @intention: "A cons-list of Diags: the complete diagnostic report (one Diag per rule-category pair)"
+    @source: vexprparse.intent:42
+    variants:
+      DCons of (diag : Diag, rest : DiagList)
+      DNil
+
 
 -- ============================================================================
 -- Brick 2 reused verbatim: the tokenizer. (Copied so bricks 1-2 stay pristine;
@@ -7219,6 +7238,338 @@ rule first_bad_category
     purity:
       reads : [s.source]
       calls : [begin_tokenize, parse_program, find_diag, diag_cat]
+    termination:
+      bound : 256
+
+
+-- ============================================================================
+-- BRICK 24: report ALL diagnostics, not just the first. Brick 23's find_diag stops
+-- at the FIRST failing rule and returns one Diag. This brick walks the WHOLE program
+-- and builds a DiagList — a cons-list with ONE Diag per (rule, failing-category)
+-- pair. A rule that is undefined-AND-ill-typed yields TWO entries (category 1 then
+-- category 4); a clean rule contributes nothing. Within a rule the categories appear
+-- in ascending order (1..5); rules appear in source order. The result is the full
+-- categorized report.
+--
+-- The five per-rule analyses (each takes one RuleDecl, returns a count; >0 means that
+-- category is present in that rule) are reused verbatim from bricks 13-21 — the same
+-- five rule_category composes in brick 23, but here EVERY nonzero category is kept,
+-- not just the first:
+--   1 = undef-var/use-before-def   (lint_rule)
+--   2 = undef-callee               (badcall_rule)
+--   3 = arity                      (badarity_rule)
+--   4 = ill-typed                  (tcheck_rule)
+--   5 = arg-type-mismatch          (argtype_rule)
+--
+-- GRANULARITY (document carefully — this is the key distinction from brick 22):
+-- diag_count counts (rule, category) PAIRS, NOT individual problems. A rule with TWO
+-- undefined variables is ONE diag (category 1 is present once), whereas brick 22's
+-- check_program counts it as 2 (it sums the raw per-analysis counts). So
+-- all_diags_count <= check_program in general; they coincide only when no rule has
+-- multiple instances of one category. This is intentional: DiagList is a CATEGORIZED
+-- report (where + what-kind), check_program is a raw problem TALLY.
+-- ============================================================================
+
+-- rule_diags's input: ONE parsed rule declaration + the FULL program rule list
+-- (`prog`, so the rule's calls resolve against every rule for the callee / arity /
+-- arg-type passes) + the source text + the rule's 0-based index (`idx`, stamped into
+-- each Diag this rule produces). Same shape as RuleCatState (brick 23) but carries
+-- the index so rule_diags can construct Diags directly instead of leaving the index
+-- to the caller.
+concept RuleDiagsState
+  @intention: "A rule declaration + the full program + the source + the rule's 0-based index, for listing all its diagnostics"
+  @source: vexprparse.intent:42
+  fields:
+    rd : RuleDecl
+    prog : RuleList
+    src : text [..256]
+    idx : number [0, 4096]
+
+
+-- prog_diags's input: the rule list being ITERATED (`iter` advances each step, one
+-- rule's diags appended per step) + the FULL program rule list (`all`, fixed, so each
+-- rule's calls resolve against every rule) + the source + the running 0-based index of
+-- the rule at the head of `iter`. The iter/all split mirrors find_diag's FindDiagState
+-- and lint_callees_list / argtype_list: rule_diags always receives `all`, never the
+-- shrinking `iter` tail.
+concept ProgDiagsState
+  @intention: "The rule list being walked + the full program + the source + the running rule index, for the whole-program diagnostic list"
+  @source: vexprparse.intent:42
+  fields:
+    iter : RuleList
+    all : RuleList
+    src : text [..256]
+    idx : number [0, 4096]
+
+
+-- diag_append's input: two DiagLists. Standard cons-list append concatenates the
+-- diags of one rule (`a`) in front of the diags of the rest of the program (`b`),
+-- preserving order. Same shape as any binary list operation.
+concept DiagAppendState
+  @intention: "Two diagnostic lists to concatenate (the head rule's diags in front of the rest's)"
+  @source: vexprparse.intent:42
+  fields:
+    a : DiagList
+    b : DiagList
+
+
+-- diag_nth's input: a DiagList + a 0-based index `n`. nth_diag_rule / nth_diag_cat
+-- walk `n` cells in and read one field off the head Diag (rule index / category),
+-- returning a sentinel when n runs past the end of the list.
+concept DiagNthState
+  @intention: "A diagnostic list + a 0-based index, for reading the n-th diagnostic's rule index or category"
+  @source: vexprparse.intent:42
+  fields:
+    list : DiagList
+    n : number [0, 4096]
+
+
+-- rule_diags: the DiagList of ALL failing categories for ONE rule, in ASCENDING
+-- category order (1,2,3,4,5). NON-recursive — it just calls the five per-rule
+-- analyses and conses a Diag for each nonzero one. The trick to get ascending order
+-- out of a head-conses-onto-front cons-list is to build the TAIL FIRST: d5 is the
+-- innermost (category 5), then d4 conses category 4 onto d5, ... d1 conses category 1
+-- onto d2. So when category 1 is present it ends up at the FRONT and category 5 at the
+-- back — exactly source/ascending order. Each per-rule analysis returns a COUNT; >0
+-- means that category is present (once, regardless of how many instances — see the
+-- granularity note above). bound is a termination BUDGET for the non-recursive
+-- let-chain (the verifier counts the chain's actual operation count, which is large
+-- here because each guard calls a recursive analysis); start at 1024 and raise if the
+-- verifier reports the bound is short.
+rule rule_diags
+  @intention: "The diagnostic list of one rule: one Diag per failing category, ascending order (1..5), empty if clean"
+  @source: vexprparse.intent:42
+  input:
+    rds : RuleDiagsState
+  output:
+    out : DiagList
+  logic:
+    let d5 = if argtype_rule(ArgTypeRuleState { rd: rds.rd, prog: rds.prog, src: rds.src }) > 0 then DiagList::DCons { diag: Diag::MkDiag { rule_index: rds.idx, category: 5 }, rest: DiagList::DNil } else DiagList::DNil
+    let d4 = if tcheck_rule(TCheckRuleState { rd: rds.rd, src: rds.src }) > 0 then DiagList::DCons { diag: Diag::MkDiag { rule_index: rds.idx, category: 4 }, rest: d5 } else d5
+    let d3 = if badarity_rule(BadArityRuleState { rd: rds.rd, rules: rds.prog, src: rds.src }) > 0 then DiagList::DCons { diag: Diag::MkDiag { rule_index: rds.idx, category: 3 }, rest: d4 } else d4
+    let d2 = if badcall_rule(BadCallRuleState { rd: rds.rd, rules: rds.prog, src: rds.src }) > 0 then DiagList::DCons { diag: Diag::MkDiag { rule_index: rds.idx, category: 2 }, rest: d3 } else d3
+    let d1 = if lint_rule(LintRuleState { rd: rds.rd, src: rds.src }) > 0 then DiagList::DCons { diag: Diag::MkDiag { rule_index: rds.idx, category: 1 }, rest: d2 } else d2
+    out = d1
+  proofs:
+    purity:
+      reads : [rds.rd, rds.prog, rds.src, rds.idx]
+      calls : [argtype_rule, tcheck_rule, badarity_rule, badcall_rule, lint_rule]
+    termination:
+      bound : 1024
+
+
+-- diag_append: standard cons-list append. Walks `a`, re-consing each diag in order
+-- onto the result of appending the rest of `a` to `b`; when `a` is exhausted (DNil)
+-- the result is `b`. Preserves order: a's diags come out before b's. Recurses on a's
+-- tail. Bound-only termination + the native recursion breadcrumb (the shrinking `a`
+-- tail is a field of the packed input, not the input itself).
+rule diag_append
+  @intention: "Concatenate two diagnostic lists, the first's diags in front of the second's, order-preserving"
+  @source: vexprparse.intent:42
+  input:
+    da : DiagAppendState
+  output:
+    out : DiagList
+  logic:
+    out = match da.a:
+      DCons(diag, rest) => DiagList::DCons { diag: diag, rest: diag_append(DiagAppendState { a: rest, b: da.b }) }
+      DNil => da.b
+  proofs:
+    purity:
+      reads : [da.a, da.b]
+      calls : [diag_append]
+    termination:
+      bound : 4000
+
+
+-- prog_diags: walk the whole program, building each rule's DiagList (rule_diags) and
+-- appending it IN FRONT of the diags of the rest of the program (prog_diags on the
+-- tail). The running index `idx` is the 0-based source position of the head rule; it
+-- advances by 1 on each tail recursion so each rule's Diags carry the right index.
+-- The append-then-recurse shape keeps program order: rule 0's diags first, then rule
+-- 1's, etc. On RNil (no more rules) the report is DNil. Recurses on the tail; calls
+-- diag_append + rule_diags per step. Bound-only termination + the native recursion
+-- breadcrumb.
+rule prog_diags
+  @intention: "The whole program's diagnostic list: each rule's diags in source order, ascending category within a rule"
+  @source: vexprparse.intent:42
+  input:
+    pds : ProgDiagsState
+  output:
+    out : DiagList
+  logic:
+    out = match pds.iter:
+      RCons(head, tail) => diag_append(DiagAppendState { a: rule_diags(RuleDiagsState { rd: head, prog: pds.all, src: pds.src, idx: pds.idx }), b: prog_diags(ProgDiagsState { iter: tail, all: pds.all, src: pds.src, idx: pds.idx + 1 }) })
+      RNil => DiagList::DNil
+  proofs:
+    purity:
+      reads : [pds.iter, pds.all, pds.src, pds.idx]
+      calls : [diag_append, rule_diags, prog_diags]
+    termination:
+      bound : 4000
+
+
+-- diag_count: the LENGTH of a DiagList — the number of (rule, category) pairs in the
+-- report. 0 = a fully clean program. NOT the same as check_program's count (which
+-- tallies raw problems): a rule with two undefined variables adds 1 here (category 1
+-- present once) but 2 to check_program. Bare-group input (`dl : DiagList`), same idiom
+-- as count_cells over a TokenList. Recurses on the tail; bound-only termination + the
+-- native recursion breadcrumb.
+rule diag_count
+  @intention: "The number of diagnostics in a report (rule-category pairs, not raw problem instances)"
+  @source: vexprparse.intent:42
+  input:
+    dl : DiagList
+  output:
+    out : number
+  logic:
+    out = match dl:
+      DCons(diag, rest) => 1 + diag_count(rest)
+      DNil => 0
+  proofs:
+    purity:
+      reads : [dl]
+      calls : [diag_count]
+    termination:
+      bound : 4000
+
+
+-- nth_diag_rule: the rule index of the n-th diagnostic (0-based), or the sentinel
+-- 9999 if n runs past the end of the report. Walks n cells in: when n reaches 0,
+-- read diag_index off the head; otherwise recurse on the tail with n-1. The 9999
+-- sentinel matches brick 23's "no bad rule" convention. Recurses on the tail; calls
+-- diag_index at the base. Bound-only termination + the native recursion breadcrumb.
+rule nth_diag_rule
+  @intention: "The rule index of the n-th diagnostic in a report (sentinel 9999 if out of bounds)"
+  @source: vexprparse.intent:42
+  input:
+    dn : DiagNthState
+  output:
+    out : number
+  logic:
+    out = match dn.list:
+      DCons(diag, rest) => if dn.n == 0 then diag_index(diag) else nth_diag_rule(DiagNthState { list: rest, n: dn.n - 1 })
+      DNil => 9999
+  proofs:
+    purity:
+      reads : [dn.list, dn.n]
+      calls : [diag_index, nth_diag_rule]
+    termination:
+      bound : 4000
+
+
+-- nth_diag_cat: the category of the n-th diagnostic (0-based), or the sentinel 0 if
+-- n runs past the end of the report (0 = "clean / no category", matching brick 23's
+-- category convention). Mirror of nth_diag_rule, reading diag_cat instead. Recurses
+-- on the tail; calls diag_cat at the base. Bound-only termination + the native
+-- recursion breadcrumb.
+rule nth_diag_cat
+  @intention: "The error category of the n-th diagnostic in a report (sentinel 0 if out of bounds)"
+  @source: vexprparse.intent:42
+  input:
+    dn : DiagNthState
+  output:
+    out : number
+  logic:
+    out = match dn.list:
+      DCons(diag, rest) => if dn.n == 0 then diag_cat(diag) else nth_diag_cat(DiagNthState { list: rest, n: dn.n - 1 })
+      DNil => 0
+  proofs:
+    purity:
+      reads : [dn.list, dn.n]
+      calls : [diag_cat, nth_diag_cat]
+    termination:
+      bound : 4000
+
+
+-- ----------------------------------------------------------------------------
+-- BRICK 24 DRIVERS. All three tokenize + parse the source ONCE (same front end as
+-- check_program / first_bad_rule), build the whole-program DiagList via prog_diags,
+-- and expose one observable to argv. NATIVE-ONLY (multi-line source). Take a ScanState
+-- (source + pos): source is argv arg 1, pos is argv arg 2. For all_diags_count, pos is
+-- ignored (always 0); for the nth_diag_at_* drivers, pos DOUBLES as the index n.
+--
+-- Category codes (a rule may carry SEVERAL, in ascending order):
+--   1 = undef-var/use-before-def   2 = undef-callee   3 = arity
+--   4 = ill-typed                  5 = arg-type-mismatch
+--
+-- WORKED EXAMPLES (granularity is the headline — counts are rule-category PAIRS):
+--   clean       "rule add(x : number, y : number)\n  logic:\n    out = x + y\nrule main\n  logic:\n    out = add(1, 2)"
+--                 all_diags_count = 0   (every rule clean)
+--   granularity "rule f\n  logic:\n    out = x + y"
+--                 all_diags_count = 1   (TWO undefined vars, but ONE category-1 diag);
+--                 nth_diag_at_rule n=0 -> 0, nth_diag_at_cat n=0 -> 1.
+--                 CONTRAST: check_program on the SAME source = 2 (it tallies x and y
+--                 separately). all_diags_count <= check_program, always.
+--   two-cats    "rule f\n  logic:\n    out = z + (1 < 2)"
+--                 all_diags_count = 2   (undef z => cat 1, number+bool => cat 4, ONE rule);
+--                 nth(0) = (rule 0, cat 1), nth(1) = (rule 0, cat 4).
+--   two-rules   "rule a\n  logic:\n    out = x\nrule b\n  logic:\n    out = y"
+--                 all_diags_count = 2; nth(0) = (0, 1), nth(1) = (1, 1).
+--   quad        "rule f(a : number)\n  logic:\n    out = z + 1\nrule main\n  logic:\n    out = f(1 < 2, 3) + g(9)"
+--                 all_diags_count = 4 (undef z in rule 0 => (0,1); rule 1 has undefined
+--                 callee g => (1,2), arity 2-vs-1 on f => (1,3), bool arg to f's number
+--                 param => (1,5)); nth(0)=(0,1), nth(1)=(1,2), nth(2)=(1,3), nth(3)=(1,5).
+rule all_diags_count
+  @intention: "Tokenize, parse once, and return the number of diagnostics (rule-category pairs) in the whole program"
+  @source: vexprparse.intent:42
+  input:
+    s : ScanState
+  output:
+    out : number
+  logic:
+    let toks = begin_tokenize(ScanState { source: s.source, pos: 0 })
+    let prog = parse_program(ProgramState { toks: toks, src: s.source, pos: 0 })
+    out = diag_count(prog_diags(ProgDiagsState { iter: prog, all: prog, src: s.source, idx: 0 }))
+  proofs:
+    purity:
+      reads : [s.source]
+      calls : [begin_tokenize, parse_program, diag_count, prog_diags]
+    termination:
+      bound : 256
+
+
+-- nth_diag_at_rule: the rule index of the n-th diagnostic, where n is taken from
+-- argv arg 2 (s.pos doubles as the index). Front end + prog_diags identical to
+-- all_diags_count; nth_diag_rule reads the n-th cell. 9999 if n is out of bounds.
+rule nth_diag_at_rule
+  @intention: "Tokenize, parse, build the diagnostic list, and return the n-th diagnostic's rule index (n from argv)"
+  @source: vexprparse.intent:42
+  input:
+    s : ScanState
+  output:
+    out : number
+  logic:
+    let toks = begin_tokenize(ScanState { source: s.source, pos: 0 })
+    let prog = parse_program(ProgramState { toks: toks, src: s.source, pos: 0 })
+    out = nth_diag_rule(DiagNthState { list: prog_diags(ProgDiagsState { iter: prog, all: prog, src: s.source, idx: 0 }), n: s.pos })
+  proofs:
+    purity:
+      reads : [s.source, s.pos]
+      calls : [begin_tokenize, parse_program, nth_diag_rule, prog_diags]
+    termination:
+      bound : 256
+
+
+-- nth_diag_at_cat: the companion of nth_diag_at_rule — same front end and same
+-- prog_diags, but returns the n-th diagnostic's CATEGORY (0 if n is out of bounds).
+-- Together the two drivers expose the (where, what-kind) pair of any diagnostic in the
+-- complete report, indexed by n from argv.
+rule nth_diag_at_cat
+  @intention: "Tokenize, parse, build the diagnostic list, and return the n-th diagnostic's error category (n from argv)"
+  @source: vexprparse.intent:42
+  input:
+    s : ScanState
+  output:
+    out : number
+  logic:
+    let toks = begin_tokenize(ScanState { source: s.source, pos: 0 })
+    let prog = parse_program(ProgramState { toks: toks, src: s.source, pos: 0 })
+    out = nth_diag_cat(DiagNthState { list: prog_diags(ProgDiagsState { iter: prog, all: prog, src: s.source, idx: 0 }), n: s.pos })
+  proofs:
+    purity:
+      reads : [s.source, s.pos]
+      calls : [begin_tokenize, parse_program, nth_diag_cat, prog_diags]
     termination:
       bound : 256
 
