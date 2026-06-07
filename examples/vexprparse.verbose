@@ -376,6 +376,26 @@ concept_group VExpr [max_depth: 4096, max_nodes: 65535]
     variants:
       MkPP of (params : ParamList, next : number)
 
+  -- Brick 23: a STRUCTURED diagnostic. Brick 22's check_program collapses the whole
+  -- program to a single error COUNT — useful as a pass/fail gate, useless for
+  -- telling the operator WHERE the program is wrong. A Diag localizes the first
+  -- failure: `rule_index` is the 0-based position (in source order) of the first
+  -- rule that fails any analysis, and `category` is WHICH analysis failed first
+  -- (1=undef-var/use-before-def, 2=undef-callee, 3=arity, 4=ill-typed, 5=arg-type;
+  -- 0=clean). A fully clean program is reported as MkDiag(9999, 0) — 9999 is the
+  -- sentinel "no bad rule" index (no real program here reaches 9999 rules, the
+  -- ProgramState pos field caps at 512). Single-variant "record-like" group concept,
+  -- exactly like RuleDecl (MkRule) / Block (MkBlock) / Parsed (Mk): it lives in the
+  -- group because find_diag is a recursive rule that RETURNS one (same group-return
+  -- ABI as find_rule returning a RuleDecl, or build_env returning an Env), and a
+  -- number driver reads a field off it via the bare-group accessors diag_index /
+  -- diag_cat (same idiom as rd_body / block_binds).
+  concept Diag
+    @intention: "A structured diagnostic: the first failing rule's 0-based index + its error category"
+    @source: vexprparse.intent:41
+    variants:
+      MkDiag of (rule_index : number, category : number)
+
 
 -- ============================================================================
 -- Brick 2 reused verbatim: the tokenizer. (Copied so bricks 1-2 stay pristine;
@@ -6993,6 +7013,212 @@ rule check_program
     purity:
       reads : [s.source]
       calls : [begin_tokenize, parse_program, lint_list, lint_callees_list, lint_arity_list, tcheck_list, argtype_list]
+    termination:
+      bound : 256
+
+
+-- ============================================================================
+-- BRICK 23: a STRUCTURED diagnostic. Brick 22's check_program returns the TOTAL
+-- error count over the whole program — a single number. This brick LOCALIZES the
+-- first failure: which rule (by 0-based index, source order) and which CATEGORY of
+-- error it is. The category is decided per rule by `rule_category`, in a fixed
+-- precedence order (the FIRST failing analysis wins, so a rule with several
+-- problems reports exactly one — the earliest in this list):
+--   0 = clean (no diagnostics)
+--   1 = undefined variable / use-before-def      (lint_rule)
+--   2 = undefined callee                          (badcall_rule)
+--   3 = wrong arity                               (badarity_rule)
+--   4 = ill-typed expression                      (tcheck_rule)
+--   5 = call-argument type mismatch               (argtype_rule)
+-- `find_diag` then walks the program with a running index and returns the FIRST
+-- rule whose category != 0, as a Diag { rule_index, category }. A clean program
+-- yields Diag { rule_index: 9999, category: 0 } (9999 = "no bad rule"). The two
+-- drivers `first_bad_rule` / `first_bad_category` expose the two fields to argv.
+-- The five per-rule analyses are reused verbatim from bricks 13-21; this brick
+-- only composes them, the same way check_program composes the five list-rules.
+-- ============================================================================
+
+-- rule_category's input: ONE parsed rule declaration + the FULL program rule list
+-- (`prog`, so the rule's calls resolve against every rule for the callee / arity /
+-- arg-type passes) + the source text. Same shape as BadCallRuleState / ArgTypeRuleState
+-- but named generically because it feeds ALL five per-rule analyses, not one.
+concept RuleCatState
+  @intention: "A rule declaration + the full program rule list + the source text, for categorizing its first error"
+  @source: vexprparse.intent:41
+  fields:
+    rd : RuleDecl
+    prog : RuleList
+    src : text [..256]
+
+
+-- find_diag's input: the rule list being ITERATED (`iter` advances each step, one
+-- rule categorized per step) + the FULL program rule list (`all`, fixed, so each
+-- rule's calls resolve against every rule) + the source text + the running 0-based
+-- index of the rule at the head of `iter`. The iter/all split mirrors
+-- lint_callees_list / argtype_list: rule_category always receives `all`, never the
+-- shrinking `iter` tail. `idx` is the source position reported in the Diag.
+concept FindDiagState
+  @intention: "The rule list being walked + the full program + the source + the running rule index"
+  @source: vexprparse.intent:41
+  fields:
+    iter : RuleList
+    all : RuleList
+    src : text [..256]
+    idx : number [0, 4096]
+
+
+-- rule_category: the FIRST failing category of ONE rule, in the fixed precedence
+-- order documented above. A flat if/else chain of calls to the five per-rule
+-- analyses — NON-recursive (each per-rule rule is itself recursive, but this rule
+-- just calls them in order and returns the first nonzero category's code). The
+-- precedence is purely the source order of the chain: lint (1) before callee (2)
+-- before arity (3) before type (4) before arg-type (5). bound is a termination
+-- BUDGET for the non-recursive if-chain (the verifier counts the actual operation
+-- count of the chain, not a recursion depth); 1024 comfortably exceeds it.
+rule rule_category
+  @intention: "The first failing analysis category of one rule (precedence-ordered), 0 if clean"
+  @source: vexprparse.intent:41
+  input:
+    rc : RuleCatState
+  output:
+    out : number
+  logic:
+    out = if lint_rule(LintRuleState { rd: rc.rd, src: rc.src }) > 0 then 1 else if badcall_rule(BadCallRuleState { rd: rc.rd, rules: rc.prog, src: rc.src }) > 0 then 2 else if badarity_rule(BadArityRuleState { rd: rc.rd, rules: rc.prog, src: rc.src }) > 0 then 3 else if tcheck_rule(TCheckRuleState { rd: rc.rd, src: rc.src }) > 0 then 4 else if argtype_rule(ArgTypeRuleState { rd: rc.rd, prog: rc.prog, src: rc.src }) > 0 then 5 else 0
+  proofs:
+    purity:
+      reads : [rc.rd, rc.prog, rc.src]
+      calls : [lint_rule, badcall_rule, badarity_rule, tcheck_rule, argtype_rule]
+    termination:
+      bound : 1024
+
+
+-- find_diag: walk the program rule list, categorizing each rule, and return the
+-- FIRST one whose category > 0 as MkDiag(idx, category); on RNil (every rule
+-- clean) return the sentinel MkDiag(9999, 0). Recurses on the tail with idx+1,
+-- mirroring find_rule's front-to-back walk but returning a Diag GROUP VALUE rather
+-- than a RuleDecl (same group-return ABI). rule_category is called twice per
+-- failing head — once for the guard, once for the reported value — which is fine
+-- because it is pure (no effects, same inputs => same number). Bound-only
+-- termination + the native recursion breadcrumb (the shrinking `iter` tail is a
+-- field of the packed input, not the input itself).
+rule find_diag
+  @intention: "The first rule (by index) whose category is nonzero, as a Diag; sentinel MkDiag(9999,0) if all clean"
+  @source: vexprparse.intent:41
+  input:
+    fd : FindDiagState
+  output:
+    out : Diag
+  logic:
+    out = match fd.iter:
+      RCons(head, tail) => if rule_category(RuleCatState { rd: head, prog: fd.all, src: fd.src }) > 0 then Diag::MkDiag { rule_index: fd.idx, category: rule_category(RuleCatState { rd: head, prog: fd.all, src: fd.src }) } else find_diag(FindDiagState { iter: tail, all: fd.all, src: fd.src, idx: fd.idx + 1 })
+      RNil => Diag::MkDiag { rule_index: 9999, category: 0 }
+  proofs:
+    purity:
+      reads : [fd.iter, fd.all, fd.src, fd.idx]
+      calls : [rule_category, find_diag]
+    termination:
+      bound : 4000
+
+
+-- diag_index: the rule index of a Diag. Bare-group accessor, same idiom as
+-- rd_body / block_binds (input is a bare group value `d : Diag`).
+rule diag_index
+  @intention: "The 0-based rule index carried by a Diag"
+  @source: vexprparse.intent:41
+  input:
+    d : Diag
+  output:
+    out : number
+  logic:
+    out = match d:
+      MkDiag(rule_index, category) => rule_index
+  proofs:
+    purity:
+      reads : [d]
+      calls : []
+    termination:
+      bound : 16
+
+
+-- diag_cat: the error category of a Diag. Mirror of diag_index.
+rule diag_cat
+  @intention: "The error category code carried by a Diag"
+  @source: vexprparse.intent:41
+  input:
+    d : Diag
+  output:
+    out : number
+  logic:
+    out = match d:
+      MkDiag(rule_index, category) => category
+  proofs:
+    purity:
+      reads : [d]
+      calls : []
+    termination:
+      bound : 16
+
+
+-- ----------------------------------------------------------------------------
+-- BRICK 23 DRIVERS. Both tokenize + parse the source ONCE (same front end as
+-- check_program), run find_diag over the parsed program, and expose ONE field of
+-- the resulting Diag to argv. NATIVE-ONLY (multi-line source). Take a ScanState
+-- (source + pos): source is argv arg 1, pos is argv arg 2 (always 0).
+--
+-- Category codes (precedence order — first failing analysis wins per rule):
+--   0 = clean   1 = undef-var/use-before-def   2 = undef-callee
+--   3 = arity   4 = ill-typed                  5 = arg-type-mismatch
+--
+-- Worked examples (index, category):
+--   clean      "rule add(x : number, y : number)\n  logic:\n    out = x + y\nrule main\n  logic:\n    out = add(1, 2)" -> 9999, 0
+--   undef r1   "rule a\n  logic:\n    out = 1\nrule b\n  logic:\n    out = x"          -> 1, 1
+--   callee r0  "rule main\n  logic:\n    out = g(1)"                                   -> 0, 2
+--   arity r1   "rule f(a)\n  logic:\n    out = 1\nrule main\n  logic:\n    out = f(1, 2)" -> 1, 3
+--   type r0    "rule f\n  logic:\n    out = 1 + (2 < 3)"                               -> 0, 4
+--   argtype r0 "rule main\n  logic:\n    out = f(1 < 2)\nrule f(x : number)\n  logic:\n    out = x" -> 0, 5
+--   precedence "rule f(x : number)\n  logic:\n    out = z\nrule main\n  logic:\n    out = f(1 < 2)" -> 0, 1
+--              (rule f at index 0 has undefined z => category 1 wins over main's arg-type at index 1)
+--   ordering   "rule a\n  logic:\n    out = 1\nrule b\n  logic:\n    out = 2\nrule c\n  logic:\n    out = w" -> 2, 1
+rule first_bad_rule
+  @intention: "Tokenize, parse, find the first diagnostic, and return its 0-based rule index (9999 if clean)"
+  @source: vexprparse.intent:41
+  input:
+    s : ScanState
+  output:
+    out : number
+  logic:
+    let toks = begin_tokenize(ScanState { source: s.source, pos: 0 })
+    let prog = parse_program(ProgramState { toks: toks, src: s.source, pos: 0 })
+    let d = find_diag(FindDiagState { iter: prog, all: prog, src: s.source, idx: 0 })
+    out = diag_index(d)
+  proofs:
+    purity:
+      reads : [s.source]
+      calls : [begin_tokenize, parse_program, find_diag, diag_index]
+    termination:
+      bound : 256
+
+
+-- first_bad_category: the companion of first_bad_rule — same front end and same
+-- find_diag walk, but returns the Diag's CATEGORY rather than its index (0 if the
+-- program is clean). Together the two drivers report the (where, what) pair of the
+-- program's first diagnostic.
+rule first_bad_category
+  @intention: "Tokenize, parse, find the first diagnostic, and return its error category (0 if clean)"
+  @source: vexprparse.intent:41
+  input:
+    s : ScanState
+  output:
+    out : number
+  logic:
+    let toks = begin_tokenize(ScanState { source: s.source, pos: 0 })
+    let prog = parse_program(ProgramState { toks: toks, src: s.source, pos: 0 })
+    let d = find_diag(FindDiagState { iter: prog, all: prog, src: s.source, idx: 0 })
+    out = diag_cat(d)
+  proofs:
+    purity:
+      reads : [s.source]
+      calls : [begin_tokenize, parse_program, find_diag, diag_cat]
     termination:
       bound : 256
 

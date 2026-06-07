@@ -852,3 +852,34 @@ there (out of the arithmetic evaluator's scope).
     is the closest thing yet to verbosec written in Verbose: lex, parse, and verify
     in one call. check_program reuses every list-rule unchanged (one parse, all
     checks) — bound 256, calls the five list-rules over the shared prog.
+
+41. first_bad_rule(source) / first_bad_category(source) -> a STRUCTURED diagnostic
+    (brick 23). check_program collapses the whole program to a single error COUNT —
+    a pass/fail gate that cannot say WHERE the program is wrong. This brick localizes
+    the FIRST failure: rule_category(rule) returns which analysis fails first for one
+    rule, in a fixed precedence order (the earliest failing analysis wins, so a rule
+    with several problems reports exactly one):
+      0 = clean
+      1 = undefined variable / use-before-def   (lint_rule)
+      2 = undefined callee                       (badcall_rule)
+      3 = wrong arity                            (badarity_rule)
+      4 = ill-typed expression                   (tcheck_rule)
+      5 = call-argument type mismatch            (argtype_rule)
+    find_diag(prog) then walks the rule list with a running 0-based index and returns
+    the FIRST rule whose category is nonzero, as a Diag { rule_index, category }; a
+    fully clean program yields Diag { rule_index: 9999, category: 0 } (9999 = "no bad
+    rule"). Diag is a single-variant group concept (MkDiag) — like RuleDecl/Block —
+    so find_diag returns it through the SAME group-return ABI as find_rule (returns a
+    RuleDecl) and build_env (returns an Env); the bare-group accessors diag_index /
+    diag_cat read one field off it (same idiom as rd_body / block_binds). The two
+    drivers expose the two fields to argv.
+
+    THE MONEY SHOTS (NATIVE-ONLY, multi-line; pairs are (rule_index, category)):
+    clean add+main -> (9999, 0); a/b where b's body is `out = x` -> (1, 1);
+    `out = g(1)` (g undefined) in rule 0 -> (0, 2); f(a) then main calls f(1,2)
+    -> (1, 3); `out = 1 + (2 < 3)` in rule 0 -> (0, 4); main calls f(1<2) with f a
+    number-param rule -> (0, 5); precedence — f(x:number) whose body is `out = z`
+    AND main calls f(1<2): the undefined z in rule 0 (category 1) is reported BEFORE
+    main's arg-type at index 1 -> (0, 1); ordering — a/b clean, c's body `out = w`
+    -> (2, 1). first_bad_rule/_category reuse the five per-rule analyses unchanged,
+    composing them the way check_program composes the five list-rules.
