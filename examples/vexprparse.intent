@@ -830,3 +830,25 @@ there (out of the arithmetic evaluator's scope).
     bool arg flagged, f's call-typed arg is number); h(1<2) with h undefined -> 0
     (sentinel skip). The recursive walk SCC (argtype_ast/args/binds) carries
     bound-only termination + the native recursion breadcrumb, like type_of_env.
+
+40. check_program(source) -> total diagnostic count across ALL analyses (brick 22).
+    THE FULL PIPELINE — the self-hosting compiler's main(). Every prior driver
+    re-tokenizes and re-parses on its own; this one tokenizes and parses EXACTLY
+    ONCE, then runs all five analyses over the single shared RuleList and sums
+    their diagnostics. The five: lint_list (undefined vars + use-before-def,
+    bricks 13/14), lint_callees_list (undefined callees, brick 15), lint_arity_list
+    (wrong arg count, brick 17), tcheck_list (ill-typed expressions, brick 19),
+    argtype_list (call-arg type mismatches, brick 21). The categories are
+    orthogonal by construction (an undefined callee is not an arity error; an arg
+    that is itself ill-typed is type_check's concern, not argtype's), so the sum
+    double-counts nothing — every diagnostic is one unit. 0 iff the program passes
+    every check the compiler knows how to make.
+
+    THE MONEY SHOTS (NATIVE-ONLY, multi-line, same scan-state invocation as the
+    other drivers): clean add+main program -> 0; `out = x + y` (x,y undefined) -> 2;
+    `out = 1 + (2 < 3)` -> 1; `out = g(1)` (g undefined) -> 1; f(a) called f(1,2)
+    -> 1 (arity); f(x:number) whose body is `out = z` AND called with f(1<2) -> 2
+    (undefined z + bool arg to number param — two categories in one program). This
+    is the closest thing yet to verbosec written in Verbose: lex, parse, and verify
+    in one call. check_program reuses every list-rule unchanged (one parse, all
+    checks) — bound 256, calls the five list-rules over the shared prog.

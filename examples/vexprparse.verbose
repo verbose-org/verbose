@@ -6940,6 +6940,63 @@ rule argtype_check
       bound : 256
 
 
+-- ============================================================================
+-- BRICK 22: the FULL PIPELINE — the self-hosting compiler's main(). Every prior
+-- driver (lint_program, lint_callees, lint_arity, type_check, argtype_check)
+-- tokenizes and parses the source on its OWN, then runs one analysis. This driver
+-- tokenizes and parses the program EXACTLY ONCE, then runs ALL of them over the
+-- single shared RuleList. That is the consolidation: one front end, every check,
+-- in one pass over one AST. The return value is the TOTAL diagnostic count across
+-- all five analyses — 0 iff the program passes every check the compiler knows how
+-- to make.
+--
+-- The five analyses, summed over the same parsed `prog`:
+--   * lint_list           — undefined variables AND use-before-def (brick 13/14).
+--   * lint_callees_list   — calls to rules that do not exist (brick 15).
+--   * lint_arity_list     — calls with the wrong number of arguments (brick 17).
+--   * tcheck_list         — ill-typed expressions, {number,bool} system (brick 19).
+--   * argtype_list        — call args whose type mismatches the declared param (brick 21).
+-- Each list-rule already takes a RuleList; check_program just hands them all the
+-- same one. The categories are orthogonal by construction (an undefined callee is
+-- not an arity error; an arg that is itself ill-typed is type_check's, not
+-- argtype's) so the sum double-counts nothing — every diagnostic is one unit.
+--
+--   check_program("rule add(x : number, y : number)\n  logic:\n    out = x + y\nrule main\n  logic:\n    out = add(1, 2)") = 0
+--            (clean: callee exists, arity 2/2, args number/number, no undef, well-typed)
+--   check_program("rule f\n  logic:\n    out = x + y")                = 2   (x and y undefined)
+--   check_program("rule f\n  logic:\n    out = 1 + (2 < 3)")          = 1   (number + bool)
+--   check_program("rule main\n  logic:\n    out = g(1)")              = 1   (g does not exist)
+--   check_program("rule f(a)\n  logic:\n    out = 1\nrule main\n  logic:\n    out = f(1, 2)") = 1  (arity 1 vs 2)
+--   check_program("rule f(x : number)\n  logic:\n    out = z\nrule main\n  logic:\n    out = f(1 < 2)") = 2
+--            (z undefined in f, AND a bool arg to f's number param — two categories at once)
+--
+-- NATIVE-ONLY (multi-line source). Takes a ScanState (source + pos): source is
+-- argv arg 1, pos is argv arg 2 (always 0). This is the closest thing yet to a
+-- "verbosec written in Verbose" entry point — lex, parse, and verify, in one call.
+rule check_program
+  @intention: "Tokenize, parse once, run all five analyses, and return the total diagnostic count"
+  @source: vexprparse.intent:40
+  input:
+    s : ScanState
+  output:
+    out : number
+  logic:
+    let toks = begin_tokenize(ScanState { source: s.source, pos: 0 })
+    let prog = parse_program(ProgramState { toks: toks, src: s.source, pos: 0 })
+    let e_undef = lint_list(LintListState { rl: prog, src: s.source })
+    let e_callee = lint_callees_list(LintCalleesState { iter: prog, all: prog, src: s.source })
+    let e_arity = lint_arity_list(LintArityState { iter: prog, all: prog, src: s.source })
+    let e_type = tcheck_list(TCheckListState { iter: prog, src: s.source })
+    let e_argtype = argtype_list(ArgTypeListState { iter: prog, all: prog, src: s.source })
+    out = e_undef + e_callee + e_arity + e_type + e_argtype
+  proofs:
+    purity:
+      reads : [s.source]
+      calls : [begin_tokenize, parse_program, lint_list, lint_callees_list, lint_arity_list, tcheck_list, argtype_list]
+    termination:
+      bound : 256
+
+
 -- Entry driver: tokenize the source (from argv) and count the cons cells. The
 -- money-shot observable for brick 8a: count_cells_src("1 + 2\n3 * 4") = 8
 -- (tokens 1 + 2 Newline 3 * 4 then trailing Eof). Newline-bearing sources are
