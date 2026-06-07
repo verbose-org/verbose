@@ -415,6 +415,23 @@ concept_group VExpr [max_depth: 4096, max_nodes: 65535]
       DCons of (diag : Diag, rest : DiagList)
       DNil
 
+  -- Brick 25: a source SPAN — the (start, len) byte range of a token in the source
+  -- buffer. Where brick 13/14 COUNTED undefined-variable references, this brick
+  -- finds the FIRST one and returns its name span, so a diagnostic can point AT the
+  -- offending token instead of merely tallying. Single-variant "record-like" group
+  -- concept, exactly like Diag (MkDiag) / RuleDecl (MkRule) / Block (MkBlock): it
+  -- lives in the group because the undef_span_* family are recursive rules that
+  -- RETURN one (same group-return ABI as find_diag returning a Diag), and the number
+  -- drivers read a field off it via the bare-group accessors span_start / span_len
+  -- (same idiom as diag_index / diag_cat). The sentinel "no undefined variable" span
+  -- is MkSpan(9999, 0) — 9999 is the same out-of-range marker find_diag uses for the
+  -- rule index, so span_or recognizes "no result" by testing span_start == 9999.
+  concept Span
+    @intention: "A source byte range: the (start, len) span of a token's name in the source text"
+    @source: vexprparse.intent:43
+    variants:
+      MkSpan of (start : number, len : number)
+
 
 -- ============================================================================
 -- Brick 2 reused verbatim: the tokenizer. (Copied so bricks 1-2 stay pristine;
@@ -7570,6 +7587,405 @@ rule nth_diag_at_cat
     purity:
       reads : [s.source, s.pos]
       calls : [begin_tokenize, parse_program, nth_diag_cat, prog_diags]
+    termination:
+      bound : 256
+
+
+-- ============================================================================
+-- BRICK 25: column-level location for undefined variables. Bricks 13/14 COUNTED
+-- undefined-variable references (lint_rule -> a number); this brick walks the SAME
+-- traversal in the SAME scope discipline but returns the (start, len) SPAN of the
+-- FIRST unbound AstVar — the byte range a diagnostic points at. The undef_span_*
+-- family mirrors count_undef_* arm-for-arm, swapping "+ (sum)" for span_or
+-- ("first non-sentinel wins"). The sentinel for "no undefined variable here" is
+-- MkSpan(9999, 0); span_or treats start == 9999 as "empty".
+--
+-- TRAVERSAL ORDER (must match count_undef exactly so the FIRST span found is the
+-- first count_undef would have tallied):
+--   * within a rule: the let-bindings' RHSs (source order, ordered/prefix scope)
+--     come BEFORE the result expression — undef_span_rule does in_binds first.
+--   * within an expression: left-to-right — AstBin lhs before rhs, AstIf cond
+--     before thn before els, AstCall args head before tail. span_or(a, b) returns
+--     a unless a is the sentinel, so the leftmost real span wins.
+--   * across rules: program order (undef_span_list head before tail).
+--
+-- The observables the drivers expose:
+--   * undef_span_start_of -> the byte offset of the first unbound name (9999 if none)
+--   * undef_span_len_of   -> its byte length (0 if none)
+--   * undef_span_char     -> byte_at(source, start) = the first character of the name
+--     ('x'=120, 'y'=121, 'z'=122, 'w'=119, 'a'=97, 'b'=98, 'f'=102, 'q'=113); on the
+--     sentinel start 9999, byte_at is out of bounds and ABORTS (sys_exit(1)) — the
+--     native byte_at is fail-closed on OOB, so a clean program has no first byte to
+--     point at. Test cleanliness via undef_span_start_of (== 9999), not the char.
+-- ============================================================================
+
+-- span_start: the start byte offset of a Span. Bare-group accessor, same idiom as
+-- diag_index / rd_body (input is a bare group value `s : Span`).
+rule span_start
+  @intention: "The start byte offset carried by a Span"
+  @source: vexprparse.intent:43
+  input:
+    s : Span
+  output:
+    out : number
+  logic:
+    out = match s:
+      MkSpan(start, len) => start
+  proofs:
+    purity:
+      reads : [s]
+      calls : []
+    termination:
+      bound : 16
+
+
+-- span_len: the byte length of a Span. Mirror of span_start.
+rule span_len
+  @intention: "The byte length carried by a Span"
+  @source: vexprparse.intent:43
+  input:
+    s : Span
+  output:
+    out : number
+  logic:
+    out = match s:
+      MkSpan(start, len) => len
+  proofs:
+    purity:
+      reads : [s]
+      calls : []
+    termination:
+      bound : 16
+
+
+-- span_or's input: two candidate Spans. The "first non-sentinel" combinator that
+-- replaces the "+ (sum)" of the count version: in count_undef, two subtrees'
+-- counts ADD; here the first subtree's span WINS unless it is the empty sentinel,
+-- in which case the second is taken. This is what makes the leftmost undefined
+-- variable the reported one.
+concept SpanOrState
+  @intention: "Two candidate Spans, to pick the first non-sentinel"
+  @source: vexprparse.intent:43
+  fields:
+    a : Span
+    b : Span
+
+
+-- span_or: pick the first non-sentinel Span. The sentinel is MkSpan(9999, 0); a
+-- start of 9999 means "no span here", so when so.a is the sentinel we fall through
+-- to so.b (which may itself be the sentinel — span_or composes associatively).
+rule span_or
+  @intention: "The first of two Spans that is not the no-result sentinel (start 9999)"
+  @source: vexprparse.intent:43
+  input:
+    so : SpanOrState
+  output:
+    out : Span
+  logic:
+    out = if span_start(so.a) == 9999 then so.b else so.a
+  proofs:
+    purity:
+      reads : [so.a, so.b]
+      calls : [span_start]
+    termination:
+      bound : 32
+
+
+-- undef_span_ast's input: one Ast node + the rule's binding scope + the source
+-- text (spans index into it). Same triple as UndefAstState (the count version);
+-- the only difference is the RETURN type (Span, not number).
+concept UndefSpanAstState
+  @intention: "An Ast node + the binding scope + the source text, for locating its first undefined variable"
+  @source: vexprparse.intent:43
+  fields:
+    node : Ast
+    binds : Binding
+    src : text [..256]
+
+
+-- undef_span_ast: walk an Ast and return the SPAN of the first AstVar reference
+-- whose name is NOT name_bound in the scope. Mirrors count_undef_ast arm-for-arm:
+--   * AstVar(start, len) => the span (start, len) if unbound, else the sentinel.
+--   * AstBin walks lhs THEN rhs via span_or (lhs wins on a tie — left-to-right).
+--   * AstNeg/AstNot/AstField recurse into their single child.
+--   * AstCall walks its ARGUMENT list (undef_span_args); the callee name is a
+--     callee-resolution concern (brick 15), not a variable reference, so it is
+--     not probed here — identical to count_undef_ast.
+--   * AstIf walks cond, thn, els left-to-right via nested span_or.
+--   * leaves (AstNum/AstBool/AstStr/AstErr) have no variable => the sentinel.
+-- Mutually recursive with undef_span_args. Bound-only termination + the mandatory
+-- native recursion breadcrumb (the shrinking node is a FIELD of the packed input,
+-- not the input itself — same posture as count_undef_ast / shape_ast).
+rule undef_span_ast
+  @intention: "The span of the first undefined-variable reference inside an Ast (sentinel MkSpan(9999,0) if none)"
+  @source: vexprparse.intent:43
+  input:
+    a : UndefSpanAstState
+  output:
+    out : Span
+  logic:
+    out = match a.node:
+      AstNum(value) => Span::MkSpan { start: 9999, len: 0 }
+      AstBool(value) => Span::MkSpan { start: 9999, len: 0 }
+      AstStr(start, len) => Span::MkSpan { start: 9999, len: 0 }
+      AstErr => Span::MkSpan { start: 9999, len: 0 }
+      AstVar(start, len) => if name_bound(NameBoundState { binds: a.binds, src: a.src, q_start: start, q_len: len }) == 0 then Span::MkSpan { start: start, len: len } else Span::MkSpan { start: 9999, len: 0 }
+      AstBin(op, lhs, rhs) => span_or(SpanOrState { a: undef_span_ast(UndefSpanAstState { node: lhs, binds: a.binds, src: a.src }), b: undef_span_ast(UndefSpanAstState { node: rhs, binds: a.binds, src: a.src }) })
+      AstNeg(inner) => undef_span_ast(UndefSpanAstState { node: inner, binds: a.binds, src: a.src })
+      AstNot(inner) => undef_span_ast(UndefSpanAstState { node: inner, binds: a.binds, src: a.src })
+      AstField(base, fstart, flen) => undef_span_ast(UndefSpanAstState { node: base, binds: a.binds, src: a.src })
+      AstCall(callee_start, callee_len, args) => undef_span_args(UndefSpanArgsState { args: args, binds: a.binds, src: a.src })
+      AstIf(cond, thn, els) => span_or(SpanOrState { a: span_or(SpanOrState { a: undef_span_ast(UndefSpanAstState { node: cond, binds: a.binds, src: a.src }), b: undef_span_ast(UndefSpanAstState { node: thn, binds: a.binds, src: a.src }) }), b: undef_span_ast(UndefSpanAstState { node: els, binds: a.binds, src: a.src }) })
+  proofs:
+    purity:
+      reads : [a.node, a.binds, a.src]
+      calls : [name_bound, span_or, undef_span_ast, undef_span_args]
+    termination:
+      bound : 4000
+
+
+-- undef_span_args's input: a call's argument list + the rule's binding scope + the
+-- source text. Same triple as UndefArgsState (the count version), Span return.
+concept UndefSpanArgsState
+  @intention: "A call's argument list + the binding scope + the source text, for locating its first undefined variable"
+  @source: vexprparse.intent:43
+  fields:
+    args : ArgList
+    binds : Binding
+    src : text [..256]
+
+
+-- undef_span_args: walk a call's ArgList, returning the span of the first undefined
+-- variable found across its arguments (head before tail, via span_or). Mirrors
+-- count_undef_args; mutually recursive with undef_span_ast (a call's arguments are
+-- themselves Asts). Bound-only termination + the native recursion breadcrumb (the
+-- shrinking `args` tail is a field of the packed input).
+rule undef_span_args
+  @intention: "The span of the first undefined-variable reference across a call's arguments (sentinel if none)"
+  @source: vexprparse.intent:43
+  input:
+    a : UndefSpanArgsState
+  output:
+    out : Span
+  logic:
+    out = match a.args:
+      ArgCons(head, tail) => span_or(SpanOrState { a: undef_span_ast(UndefSpanAstState { node: head, binds: a.binds, src: a.src }), b: undef_span_args(UndefSpanArgsState { args: tail, binds: a.binds, src: a.src }) })
+      ArgNil => Span::MkSpan { start: 9999, len: 0 }
+  proofs:
+    purity:
+      reads : [a.args, a.binds, a.src]
+      calls : [span_or, undef_span_ast, undef_span_args]
+    termination:
+      bound : 4000
+
+
+-- undef_span_binds's input: the binding list being ITERATED + the PREFIX of earlier
+-- bindings (the use-before-def scope) + the source text. Same triple as
+-- UndefBindsOrderedState (the count version), Span return.
+concept UndefSpanBindsState
+  @intention: "The binding list being walked + the prefix of earlier bindings + the source text, for use-before-def location"
+  @source: vexprparse.intent:43
+  fields:
+    iter : Binding
+    prefix : Binding
+    src : text [..256]
+
+
+-- undef_span_binds: for each binding in `iter`, locate the first undefined variable
+-- in its RHS expression scoped to the PREFIX of bindings that appear EARLIER (proper
+-- let-ordering: a forward or self reference in a let RHS is flagged). Mirrors
+-- count_undef_binds_ordered: the prefix grows by the current binding before
+-- recursing on the tail, so the next binding sees this one but not vice versa. The
+-- current binding's RHS is checked BEFORE the tail (source order), via span_or.
+-- Bound-only termination + the native recursion breadcrumb (the shrinking `iter`
+-- tail is a field of the packed input).
+rule undef_span_binds
+  @intention: "The span of the first undefined-OR-use-before-def variable across a binding list's RHSs (sentinel if none)"
+  @source: vexprparse.intent:43
+  input:
+    a : UndefSpanBindsState
+  output:
+    out : Span
+  logic:
+    out = match a.iter:
+      BCons(name_start, name_len, value, rest) => span_or(SpanOrState { a: undef_span_ast(UndefSpanAstState { node: value, binds: a.prefix, src: a.src }), b: undef_span_binds(UndefSpanBindsState { iter: rest, prefix: Binding::BCons { name_start: name_start, name_len: name_len, value: value, rest: a.prefix }, src: a.src }) })
+      BNil => Span::MkSpan { start: 9999, len: 0 }
+  proofs:
+    purity:
+      reads : [a.iter, a.prefix, a.src]
+      calls : [span_or, undef_span_ast, undef_span_binds]
+    termination:
+      bound : 4000
+
+
+-- undef_span_rule's input: one rule declaration + the program source text. Same
+-- shape as LintRuleState (the count version), Span return.
+concept UndefSpanRuleState
+  @intention: "A rule declaration + the program source text, for locating its first undefined variable"
+  @source: vexprparse.intent:43
+  fields:
+    rd : RuleDecl
+    src : text [..256]
+
+
+-- undef_span_rule: the span of the first undefined-OR-use-before-def variable in ONE
+-- rule. Mirrors lint_rule: build the scope (params as the base prefix; params
+-- appended to the full binding list for the result), then check the bindings'
+-- ordered RHSs FIRST, then the result expression — span_or keeps the in_binds span
+-- if there is one (the let RHSs precede the result in source order). Bound-only
+-- termination + the native recursion breadcrumb.
+rule undef_span_rule
+  @intention: "The span of the first undefined-OR-use-before-def reference in one rule (params in scope; sentinel if clean)"
+  @source: vexprparse.intent:43
+  input:
+    a : UndefSpanRuleState
+  output:
+    out : Span
+  logic:
+    let body = rd_body(a.rd)
+    let binds = block_binds(body)
+    let result = block_result(body)
+    let pbinds = param_to_binding(rd_params(a.rd))
+    let scope = append_bindings(BindAppendState { a: pbinds, b: binds })
+    let in_binds = undef_span_binds(UndefSpanBindsState { iter: binds, prefix: pbinds, src: a.src })
+    out = span_or(SpanOrState { a: in_binds, b: undef_span_ast(UndefSpanAstState { node: result, binds: scope, src: a.src }) })
+  proofs:
+    purity:
+      reads : [a.rd, a.src]
+      calls : [rd_body, block_binds, block_result, rd_params, param_to_binding, append_bindings, undef_span_binds, span_or, undef_span_ast]
+    termination:
+      bound : 4000
+
+
+-- undef_span_list's input: the rule list being folded + the program source text.
+-- Same shape as LintListState (the count version), Span return.
+concept UndefSpanListState
+  @intention: "A rule list + the program source text, for locating the program's first undefined variable"
+  @source: vexprparse.intent:43
+  fields:
+    rl : RuleList
+    src : text [..256]
+
+
+-- undef_span_list: the span of the first undefined-OR-use-before-def variable across
+-- every rule in the program, in program order. Mirrors lint_list: the head rule is
+-- checked BEFORE the tail (via span_or), so the earliest rule's earliest undefined
+-- variable wins. Bound-only termination + the native recursion breadcrumb (the
+-- shrinking `rl` tail is a field of the packed input).
+rule undef_span_list
+  @intention: "The span of the program's first undefined-variable reference, in program order (sentinel if clean)"
+  @source: vexprparse.intent:43
+  input:
+    a : UndefSpanListState
+  output:
+    out : Span
+  logic:
+    out = match a.rl:
+      RCons(head, tail) => span_or(SpanOrState { a: undef_span_rule(UndefSpanRuleState { rd: head, src: a.src }), b: undef_span_list(UndefSpanListState { rl: tail, src: a.src }) })
+      RNil => Span::MkSpan { start: 9999, len: 0 }
+  proofs:
+    purity:
+      reads : [a.rl, a.src]
+      calls : [span_or, undef_span_rule, undef_span_list]
+    termination:
+      bound : 4000
+
+
+-- ----------------------------------------------------------------------------
+-- BRICK 25 DRIVERS. All three tokenize + parse the source ONCE (same front end as
+-- lint_program), run undef_span_list over the parsed program, and expose ONE
+-- observable of the resulting Span to argv. NATIVE-ONLY (multi-line source). Take a
+-- ScanState (source + pos): source is argv arg 1, pos is argv arg 2 (always 0).
+--
+-- The sentinel: a clean program yields MkSpan(9999, 0). Reading span_start gives
+-- 9999 and span_len gives 0 — both are stable "nothing here" values. undef_span_char
+-- does byte_at(source, 9999): the native byte_at is FAIL-CLOSED on an out-of-bounds
+-- index (jae .abort -> sys_exit(1)), so on a clean program undef_span_char ABORTS
+-- with exit status 1 and no stdout rather than printing a value. That is the correct
+-- posture for a char accessor: there is no first byte of a name that does not exist,
+-- so the only honest answers are "the byte" (a real undefined variable) or "abort"
+-- (no undefined variable to point at). Use span_start == 9999 (undef_span_start_of)
+-- to test cleanliness; undef_span_char is meaningful ONLY when there IS a diagnostic.
+--
+-- The char observable: undef_span_char returns byte_at(source, start), i.e. the
+-- FIRST byte of the offending name. Worked examples:
+--   clean       "rule add(x : number, y : number)\n  logic:\n    out = x + y\nrule main\n  logic:\n    out = add(1, 2)" -> start 9999, len 0, char ABORTS (exit 1, no first byte)
+--   undef x     "rule f\n  logic:\n    out = x + y"                  -> char 120 ('x'), len 1 (lhs of +, leftmost)
+--   undef y     "rule f\n  logic:\n    out = 1 + y"                  -> char 121 ('y'), len 1 (1 is a leaf, y is the first var)
+--   multi-char  "rule f\n  logic:\n    out = foo + 1"               -> char 102 ('f'), len 3 (name "foo")
+--   use-bef-def "rule f\n  logic:\n    let p = q + 1\n    let q = 2\n    out = p" -> char 113 ('q'), len 1
+--               (q is unbound in p's RHS; binding RHSs are checked before the result)
+--   across      "rule a\n  logic:\n    out = 1\nrule b\n  logic:\n    out = zzz"  -> char 122 ('z'), len 3 (rule 1's zzz; rule 0 clean)
+--   in arg      "rule main\n  logic:\n    out = f(w)\nrule f(x : number)\n  logic:\n    out = x" -> char 119 ('w'), len 1
+--               (w undefined in main; f's param x is in scope only inside f)
+-- ----------------------------------------------------------------------------
+
+-- undef_span_start_of: the byte offset of the program's first undefined variable
+-- (9999 if clean). Front end + undef_span_list identical to the other two drivers;
+-- span_start reads the field off the resulting Span.
+rule undef_span_start_of
+  @intention: "Tokenize, parse, find the first undefined variable, and return its start byte offset (9999 if clean)"
+  @source: vexprparse.intent:43
+  input:
+    s : ScanState
+  output:
+    out : number
+  logic:
+    let toks = begin_tokenize(ScanState { source: s.source, pos: 0 })
+    let prog = parse_program(ProgramState { toks: toks, src: s.source, pos: 0 })
+    out = span_start(undef_span_list(UndefSpanListState { rl: prog, src: s.source }))
+  proofs:
+    purity:
+      reads : [s.source]
+      calls : [begin_tokenize, parse_program, span_start, undef_span_list]
+    termination:
+      bound : 256
+
+
+-- undef_span_len_of: the byte length of the program's first undefined variable's
+-- name (0 if clean). Same front end and undef_span_list as undef_span_start_of;
+-- span_len reads the length field.
+rule undef_span_len_of
+  @intention: "Tokenize, parse, find the first undefined variable, and return its name byte length (0 if clean)"
+  @source: vexprparse.intent:43
+  input:
+    s : ScanState
+  output:
+    out : number
+  logic:
+    let toks = begin_tokenize(ScanState { source: s.source, pos: 0 })
+    let prog = parse_program(ProgramState { toks: toks, src: s.source, pos: 0 })
+    out = span_len(undef_span_list(UndefSpanListState { rl: prog, src: s.source }))
+  proofs:
+    purity:
+      reads : [s.source]
+      calls : [begin_tokenize, parse_program, span_len, undef_span_list]
+    termination:
+      bound : 256
+
+
+-- undef_span_char: the FIRST byte of the offending name — byte_at(source, start).
+-- This is the stable, source-independent observable: it does not depend on the byte
+-- offset of the name (which shifts with whitespace), only on the name's first
+-- character. On the sentinel start 9999, byte_at is out of bounds and the native
+-- byte_at ABORTS (sys_exit(1)) rather than returning a value — so this driver is
+-- meaningful only when there IS an undefined variable; test cleanliness via
+-- undef_span_start_of. Same front end and undef_span_list as the other two drivers.
+rule undef_span_char
+  @intention: "Tokenize, parse, find the first undefined variable, and return its name's first byte (aborts if clean)"
+  @source: vexprparse.intent:43
+  input:
+    s : ScanState
+  output:
+    out : number
+  logic:
+    let toks = begin_tokenize(ScanState { source: s.source, pos: 0 })
+    let prog = parse_program(ProgramState { toks: toks, src: s.source, pos: 0 })
+    out = byte_at(s.source, span_start(undef_span_list(UndefSpanListState { rl: prog, src: s.source })))
+  proofs:
+    purity:
+      reads : [s.source]
+      calls : [begin_tokenize, parse_program, span_start, undef_span_list]
     termination:
       bound : 256
 

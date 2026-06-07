@@ -918,3 +918,41 @@ there (out of the arithmetic evaluator's scope).
     `out = x` / `out = y` -> count 2, nth(0)=(0,1), nth(1)=(1,1); QUAD —
     f(a:number) body `out = z + 1` AND main body `out = f(1 < 2, 3) + g(9)` -> count
     4, nth(0)=(0,1), nth(1)=(1,2), nth(2)=(1,3), nth(3)=(1,5).
+
+43. undef_span_start_of(source) / undef_span_len_of(source) / undef_span_char(source)
+    -> COLUMN-LEVEL location for undefined variables (brick 25). Bricks 13/14 COUNTED
+    undefined-variable references (lint_rule -> a number); this brick walks the SAME
+    traversal in the SAME scope discipline but returns the (start, len) SPAN of the
+    FIRST unbound variable — the byte range a diagnostic points AT, instead of a tally.
+    The undef_span_* family mirrors count_undef_* arm-for-arm, swapping the count's
+    "+ (sum)" for span_or ("first non-sentinel wins"): in the count, two subtrees'
+    counts ADD; here the leftmost real span WINS. The sentinel "no undefined variable"
+    span is MkSpan(9999, 0).
+      Span is a single-variant group concept (MkSpan(start, len)) — like Diag (MkDiag)
+        — returned through the same group-return ABI as find_diag returning a Diag.
+      span_start(s) / span_len(s) -> bare-group accessors (like diag_index / diag_cat).
+      span_or(a, b) -> the first Span whose start is not 9999 (the no-result sentinel).
+      undef_span_ast / undef_span_args -> mutually recursive AST walk; AstVar(start,len)
+        yields its span when name_bound == 0, else the sentinel; children combine
+        left-to-right via span_or (AstBin lhs before rhs, AstIf cond/thn/els, call args
+        head before tail). undef_span_binds -> each let RHS checked against the PREFIX
+        of earlier bindings (use-before-def), RHS before the tail. undef_span_rule ->
+        bindings (params as base prefix) checked BEFORE the result (params appended to
+        the full scope). undef_span_list -> head rule before tail (program order).
+    TRAVERSAL ORDER matches count_undef exactly, so the first span found is the first
+    the count would have tallied: within a rule the let RHSs precede the result; within
+    an expression left-to-right; across rules program order.
+
+    THE MONEY SHOTS (NATIVE-ONLY, multi-line; reported as (start, len, char), char =
+    byte_at(source, start) = the offending name's first byte):
+    clean add+main -> start 9999, len 0, char ABORTS (native byte_at is fail-closed on
+    an OOB index — there is no first byte of a name that does not exist; test
+    cleanliness via undef_span_start_of == 9999, not the char);
+    `out = x + y` -> char 120 ('x'), len 1 (lhs of +, leftmost);
+    `out = 1 + y` -> char 121 ('y'), len 1 (1 is a leaf, y is the first var);
+    `out = foo + 1` -> char 102 ('f'), len 3 (name "foo");
+    `let p = q + 1` / `let q = 2` / `out = p` -> char 113 ('q'), len 1 (q unbound in p's
+    RHS; binding RHSs checked before the result, q not yet in the prefix);
+    a `out = 1` / b `out = zzz` -> char 122 ('z'), len 3 (rule 1's zzz; rule 0 clean);
+    main `out = f(w)` / f(x:number) `out = x` -> char 119 ('w'), len 1 (w undefined in
+    main; f's param x is in scope only inside f).
