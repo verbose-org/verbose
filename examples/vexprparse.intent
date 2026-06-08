@@ -701,8 +701,8 @@ there (out of the arithmetic evaluator's scope).
 37. Brick 19 of the self-hosting arc: a TYPE CHECKER in Verbose — the static
     pendant of item 36's interpreter. Where the interpreter computes a VALUE for
     an AST, the type checker computes a TYPE: a small lattice {number, bool,
-    ERROR} encoded as non-negative codes (0 = number, 1 = bool, 3 = ERROR; 2 is
-    reserved for a future text brick). type_check(source) returns the total
+    text, ERROR} encoded as non-negative codes (0 = number, 1 = bool, 2 = text
+    since brick 30, 3 = ERROR). type_check(source) returns the total
     number of type errors (ill-typed let RHSs + ill-typed rule results) across
     the whole program; 0 = well-typed.
 
@@ -718,13 +718,14 @@ there (out of the arithmetic evaluator's scope).
     fold the lets in source order, typing each RHS against the env built so far,
     consing (name span, RHS type) on the front so later lets see earlier ones.
 
-    TYPING RULES (v1). AstNum => number; AstBool => bool; AstErr/AstField/AstStr
-    => ERROR; AstVar => env_lookup; AstCall => number. AstNeg requires a number
+    TYPING RULES (v1). AstNum => number; AstBool => bool; AstStr => text (brick
+    30); AstErr/AstField => ERROR; AstVar => env_lookup; AstCall => number. AstNeg requires a number
     operand, AstNot a bool operand. AstBin: arithmetic (+ - * / %) needs both
     number => number; ORDERING (< > <= >=) needs both number => bool (ordering
     booleans is not meaningful); EQUALITY (== !=) accepts two operands of the SAME
     comparable type — number==number OR bool==bool — and yields bool (brick 29;
-    text==text is still ERROR, text not yet typed); logic (and/or) needs both
+    text==text is still ERROR — a string literal types as text since brick 30, but
+    text supports no operations); logic (and/or) needs both
     bool => bool. AstIf: bool condition AND both branches the same non-ERROR type
     => that type, else ERROR. Any mismatch => ERROR.
 
@@ -1068,3 +1069,16 @@ there (out of the arithmetic evaluator's scope).
     new concepts/rules. Money shots: (1 < 2) == (3 < 4) => bool (0, was ill-typed before); 1 == 2
     => number==number (0); 1 == (2 < 3) => still ERROR (1); (1 < 2) < (3 < 4) => still ERROR (1,
     ordering on bools); 1 + (2 < 3) => still ERROR (1).
+
+48. Brick 30 of the self-hosting arc: TEXT LITERALS TYPE AS text. Brick 19 typed a
+    string-literal expression AstStr as ERROR (3, "text not yet typed"), so a string
+    literal passed to a `text` parameter (brick 20 already maps the `text` annotation
+    to code 2) was wrongly flagged as a mismatch. This brick changes ONLY the AstStr
+    arm of type_of_env from 3 to 2: a string literal is now a first-class text value.
+    Text supports no operations — arithmetic/ordering/logic/equality on text all stay
+    ERROR via bin_type (unchanged) — so this is a minimal but coherent text type.
+    AstField stays ERROR (3, fields still not typed). In-place one-arm logic tweak —
+    no new concepts/rules. Money shots: a rule whose body is "hello" => text (0, was
+    1 before); a string literal passed to a `text` param => well-typed (argtype 0, was
+    1 before); a string literal to a NUMBER param => mismatch (1); a number to a TEXT
+    param => mismatch (1); 1 + "x" => still ERROR (1); "a" == "b" => still ERROR (1).

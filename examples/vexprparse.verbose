@@ -6259,7 +6259,8 @@ rule lint_arity
 -- type) onto the front.
 --
 -- TYPING RULES (v1).
---   AstNum  => number ; AstBool => bool ; AstErr / AstField / AstStr => ERROR.
+--   AstNum  => number ; AstBool => bool ; AstStr => text (brick 30) ;
+--   AstErr / AstField => ERROR.
 --   AstVar  => env_lookup (the stored type code; 0 = number for unbound params).
 --   AstCall => number (every rule returns number in the interpreter's world).
 --   AstNeg(e)  => number if type(e) = number, else ERROR.
@@ -6325,7 +6326,8 @@ concept IfTypeState
 -- (<, >, <=, >=) require both number and yield bool (ordering booleans is not
 -- meaningful); EQUALITY (==, !=) accepts two operands of the SAME comparable type
 -- — number==number OR bool==bool — and yields bool (brick 29; text==text is still
--- ERROR, text not yet typed); logic ops require both bool and yield bool. Any
+-- ERROR — a string literal is typed text since brick 30, but text supports no
+-- operations); logic ops require both bool and yield bool. Any
 -- mismatch => ERROR (3), and an unknown op also => ERROR. NON-recursive: a flat
 -- nested-if classifier, bounded by 8 (it never recurses; the bound is the trivial
 -- leaf budget).
@@ -6370,8 +6372,11 @@ rule if_type
 
 -- type_of_env: the dispatch. Mirrors eval_ast_env's match STRUCTURE arm-for-arm
 -- but returns a TYPE code instead of a value. Leaves: AstNum => number (0),
--- AstBool => bool (1), AstErr / AstField / AstStr => ERROR (3), AstCall => number
--- (0, every rule returns number here). AstVar resolves its name in the type env
+-- AstBool => bool (1), AstStr => text (2, brick 30 — a string literal is a
+-- first-class text value, so a `text` parameter accepts it; text supports no
+-- operations, so arithmetic/ordering/logic/equality on text all remain ERROR via
+-- bin_type), AstErr / AstField => ERROR (3, fields still not typed), AstCall =>
+-- number (0, every rule returns number here). AstVar resolves its name in the type env
 -- via env_lookup (the stored type code; 0 = number for unbound params). The unary
 -- and binary forms recurse on their sub-nodes, threading the same tenv + src down,
 -- then classify: AstNeg requires a number operand (else ERROR), AstNot a bool
@@ -6399,7 +6404,7 @@ rule type_of_env
       AstCall(callee_start, callee_len, args) => 0
       AstIf(cond, thn, els) => if_type(IfTypeState { ct: type_of_env(TypeArg { node: cond, tenv: t.tenv, src: t.src }), tt: type_of_env(TypeArg { node: thn, tenv: t.tenv, src: t.src }), et: type_of_env(TypeArg { node: els, tenv: t.tenv, src: t.src }) })
       AstBool(value) => 1
-      AstStr(start, len) => 3
+      AstStr(start, len) => 2
       AstErr => 3
   proofs:
     purity:
