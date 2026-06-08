@@ -1082,3 +1082,21 @@ there (out of the arithmetic evaluator's scope).
     1 before); a string literal passed to a `text` param => well-typed (argtype 0, was
     1 before); a string literal to a NUMBER param => mismatch (1); a number to a TEXT
     param => mismatch (1); 1 + "x" => still ERROR (1); "a" == "b" => still ERROR (1).
+
+49. Brick 31 of the self-hosting arc: PARSE RETURN-TYPE ANNOTATIONS. After the
+    parameter list and before the `logic:` line, a rule header may carry an OPTIONAL
+    `: TYPENAME` declaring its return type — `rule add(x : number, y : number) : number`.
+    Both header parsers (parse_rule_decl / parse_rule_decl_pos) look at the token right
+    after the params: if it is a `:` (op code 10) the next Ident is the return type-name,
+    mapped via type_code_of_span (0=number / 1=bool / 2=text); otherwise (a Newline, op 0)
+    there is no annotation and the default return type is 0 (number), matching the type
+    checker's current "calls yield number" assumption. The parsed code is stored in a new
+    RuleDecl.MkRule field `return_type` (inserted after params, before body). PARSER-ONLY:
+    the return type is recorded but NOT yet consumed by the type checker — feeding it into
+    type_of_env needs the whole program threaded through, a later/bigger brick. Mirrors
+    brick 20 (typed params). New rules: rd_return_type (accessor), rl_head_return_type
+    (head accessor), rule_return_type (money-shot driver). Existing programs without an
+    annotation parse byte-identically (after_ret == after_params when there is no `:`).
+    Money shots: rule add(x : number, y : number) : number => 0 (number); rule p(x : number)
+    : bool => 1 (bool); rule q(x : number) : text => 2 (text); rule r(x : number) (no
+    annotation) => 0 (default number); rule s() : bool (no params, return type) => 1.

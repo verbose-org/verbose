@@ -322,7 +322,7 @@ concept_group VExpr [max_depth: 4096, max_nodes: 65535]
     @intention: "A parsed top-level rule declaration: its name span + its logic block"
     @source: vexprparse.intent:30
     variants:
-      MkRule of (name_start : number, name_len : number, params : ParamList, body : Block)
+      MkRule of (name_start : number, name_len : number, params : ParamList, return_type : number, body : Block)
 
   -- Brick 12: a parsed PROGRAM — a cons-list of top-level rule declarations in
   -- source order. RCons carries one RuleDecl head and the rest; RNil is the empty
@@ -3869,7 +3869,7 @@ rule find_rule
   logic:
     out = match st.rules:
       RCons(head, tail) => if rd_name_len(head) == st.q_len and name_eq(NameEqState { src: st.src, a_start: rd_name_start(head), b_start: st.q_start, len: st.q_len, off: 0 }) == 1 then head else find_rule(FindRuleState { rules: tail, src: st.src, q_start: st.q_start, q_len: st.q_len })
-      RNil => RuleDecl::MkRule { name_start: 0, name_len: 0, params: ParamList::PNil, body: Block::MkBlock { binds: Binding::BNil, result: Ast::AstErr } }
+      RNil => RuleDecl::MkRule { name_start: 0, name_len: 0, params: ParamList::PNil, return_type: 0, body: Block::MkBlock { binds: Binding::BNil, result: Ast::AstErr } }
   proofs:
     purity:
       reads : [st.rules, st.src, st.q_start, st.q_len]
@@ -4164,7 +4164,7 @@ rule rd_name_start
     out : number
   logic:
     out = match r:
-      MkRule(name_start, name_len, params, body) => name_start
+      MkRule(name_start, name_len, params, return_type, body) => name_start
   proofs:
     purity:
       reads : [r]
@@ -4182,7 +4182,7 @@ rule rd_name_len
     out : number
   logic:
     out = match r:
-      MkRule(name_start, name_len, params, body) => name_len
+      MkRule(name_start, name_len, params, return_type, body) => name_len
   proofs:
     purity:
       reads : [r]
@@ -4200,7 +4200,7 @@ rule rd_body
     out : Block
   logic:
     out = match r:
-      MkRule(name_start, name_len, params, body) => body
+      MkRule(name_start, name_len, params, return_type, body) => body
   proofs:
     purity:
       reads : [r]
@@ -4218,7 +4218,29 @@ rule rd_params
     out : ParamList
   logic:
     out = match r:
-      MkRule(name_start, name_len, params, body) => params
+      MkRule(name_start, name_len, params, return_type, body) => params
+  proofs:
+    purity:
+      reads : [r]
+      calls : []
+    termination:
+      bound : 16
+
+
+-- Brick 31: the declared return-type code of a parsed rule (0=number / 1=bool /
+-- 2=text). When the header has no `: TYPENAME` annotation the parser stores 0
+-- (number), matching the type checker's current "calls yield number" assumption.
+-- Same tiny-destructuring shape as rd_params / rd_body.
+rule rd_return_type
+  @intention: "The declared return-type code of a parsed rule declaration"
+  @source: vexprparse.intent:49
+  input:
+    r : RuleDecl
+  output:
+    out : number
+  logic:
+    out = match r:
+      MkRule(name_start, name_len, params, return_type, body) => return_type
   proofs:
     purity:
       reads : [r]
@@ -4415,7 +4437,13 @@ rule parse_rule_decl
     let pp = parse_params(ParamParseState { toks: rp.toks, src: rp.src, pos: 2 })
     let params = pp_params(pp)
     let after_params = pp_next(pp)
-    let logic_idx = skip_seps(ParseState { toks: rp.toks, pos: after_params })
+    let ret_colon = peek_op_code(Nth { lst: rp.toks, n: after_params })
+    let typed_ret = if ret_colon == 10 then 1 else 0
+    let ret_ty_start = peek_start(Nth { lst: rp.toks, n: after_params + 1 })
+    let ret_ty_len = peek_len(Nth { lst: rp.toks, n: after_params + 1 })
+    let return_type = if typed_ret == 1 then type_code_of_span(SpanCheck { src: rp.src, start: ret_ty_start, len: ret_ty_len }) else 0
+    let after_ret = if typed_ret == 1 then after_params + 2 else after_params
+    let logic_idx = skip_seps(ParseState { toks: rp.toks, pos: after_ret })
     let logic_start = peek_start(Nth { lst: rp.toks, n: logic_idx })
     let logic_len = peek_len(Nth { lst: rp.toks, n: logic_idx })
     let is_logic = span_is_logic(SpanCheck { src: rp.src, start: logic_start, len: logic_len })
@@ -4423,11 +4451,11 @@ rule parse_rule_decl
     let body_idx = skip_seps(ParseState { toks: rp.toks, pos: logic_idx + 2 })
     let pb = parse_stmts(ParseState { toks: rp.toks, pos: body_idx })
     let goodblk = pb_block(pb)
-    out = RuleDecl::MkRule { name_start: name_start, name_len: name_len, params: params, body: if hdr_ok == 1 then goodblk else Block::MkBlock { binds: Binding::BNil, result: Ast::AstErr } }
+    out = RuleDecl::MkRule { name_start: name_start, name_len: name_len, params: params, return_type: return_type, body: if hdr_ok == 1 then goodblk else Block::MkBlock { binds: Binding::BNil, result: Ast::AstErr } }
   proofs:
     purity:
       reads : [rp.toks, rp.src]
-      calls : [peek_start, peek_len, span_is_rule, parse_params, pp_params, pp_next, span_is_logic, skip_seps, parse_stmts, pb_block]
+      calls : [peek_start, peek_len, span_is_rule, parse_params, pp_params, pp_next, peek_op_code, type_code_of_span, span_is_logic, skip_seps, parse_stmts, pb_block]
     termination:
       bound : 64
 
@@ -4667,7 +4695,13 @@ rule parse_rule_decl_pos
     let pp = parse_params(ParamParseState { toks: ps.toks, src: ps.src, pos: ps.pos + 2 })
     let params = pp_params(pp)
     let after_params = pp_next(pp)
-    let logic_idx = skip_seps(ParseState { toks: ps.toks, pos: after_params })
+    let ret_colon = peek_op_code(Nth { lst: ps.toks, n: after_params })
+    let typed_ret = if ret_colon == 10 then 1 else 0
+    let ret_ty_start = peek_start(Nth { lst: ps.toks, n: after_params + 1 })
+    let ret_ty_len = peek_len(Nth { lst: ps.toks, n: after_params + 1 })
+    let return_type = if typed_ret == 1 then type_code_of_span(SpanCheck { src: ps.src, start: ret_ty_start, len: ret_ty_len }) else 0
+    let after_ret = if typed_ret == 1 then after_params + 2 else after_params
+    let logic_idx = skip_seps(ParseState { toks: ps.toks, pos: after_ret })
     let logic_start = peek_start(Nth { lst: ps.toks, n: logic_idx })
     let logic_len = peek_len(Nth { lst: ps.toks, n: logic_idx })
     let is_logic = span_is_logic(SpanCheck { src: ps.src, start: logic_start, len: logic_len })
@@ -4676,11 +4710,11 @@ rule parse_rule_decl_pos
     let pb = parse_stmts(ParseState { toks: ps.toks, pos: body_idx })
     let goodblk = pb_block(pb)
     let endp = pb_next(pb)
-    out = ParsedRule::MkPR { rule: RuleDecl::MkRule { name_start: name_start, name_len: name_len, params: params, body: if hdr_ok == 1 then goodblk else Block::MkBlock { binds: Binding::BNil, result: Ast::AstErr } }, next: endp }
+    out = ParsedRule::MkPR { rule: RuleDecl::MkRule { name_start: name_start, name_len: name_len, params: params, return_type: return_type, body: if hdr_ok == 1 then goodblk else Block::MkBlock { binds: Binding::BNil, result: Ast::AstErr } }, next: endp }
   proofs:
     purity:
       reads : [ps.toks, ps.src, ps.pos]
-      calls : [peek_start, peek_len, span_is_rule, parse_params, pp_params, pp_next, span_is_logic, skip_seps, parse_stmts, pb_block, pb_next]
+      calls : [peek_start, peek_len, span_is_rule, parse_params, pp_params, pp_next, peek_op_code, type_code_of_span, span_is_logic, skip_seps, parse_stmts, pb_block, pb_next]
     termination:
       bound : 64
 
@@ -4843,6 +4877,27 @@ rule rl_head_params
       bound : 16
 
 
+-- rl_head_return_type: the declared return-type code of the head rule of a rule
+-- list (0=number default if none). Mirror of rl_head_params for brick 31.
+rule rl_head_return_type
+  @intention: "The declared return-type code of the head rule of a rule list (0 if none)"
+  @source: vexprparse.intent:49
+  input:
+    rl : RuleList
+  output:
+    out : number
+  logic:
+    out = match rl:
+      RCons(head, tail) => rd_return_type(head)
+      RNil => 0
+  proofs:
+    purity:
+      reads : [rl]
+      calls : [rd_return_type]
+    termination:
+      bound : 16
+
+
 -- count_rules: the brick-12 STRUCTURAL driver. Tokenize the program source (with
 -- indentation), parse the whole sequence of rule decls from index 0, and return
 -- the RuleList length. Proves the program splits into the right number of rule
@@ -4898,6 +4953,42 @@ rule rule_param_count
     purity:
       reads : [s.source]
       calls : [begin_tokenize, parse_program, rl_head_params, param_list_len]
+    termination:
+      bound : 256
+
+
+-- rule_return_type: the brick-31 PARSE money-shot driver. Tokenize the program
+-- source, parse the whole rule-decl sequence, and return the declared return-type
+-- code of the FIRST rule. An optional `: TYPENAME` after the parameter list (and
+-- before the `logic:` line) declares the return type — 0=number / 1=bool / 2=text;
+-- when absent the default is 0 (number), matching the type checker's current
+-- "calls yield number" assumption. PARSER-ONLY: this brick stores the return type
+-- in RuleDecl but does NOT yet feed it into the type checker (that needs threading
+-- the program through type_of_env, a later brick).
+--
+--   rule_return_type("rule add(x : number, y : number) : number\n  logic:\n    out = x + y") = 0  (number)
+--   rule_return_type("rule p(x : number) : bool\n  logic:\n    out = x > 0")                  = 1  (bool)
+--   rule_return_type("rule q(x : number) : text\n  logic:\n    out = \"hi\"")                  = 2  (text)
+--   rule_return_type("rule r(x : number)\n  logic:\n    out = x")                              = 0  (no annotation -> number)
+--   rule_return_type("rule s() : bool\n  logic:\n    out = 1 < 2")                             = 1  (no params, return type)
+--
+-- NATIVE-ONLY (multi-line source). Takes a ScanState: source is argv arg 1, pos
+-- is argv arg 2 (always 0).
+rule rule_return_type
+  @intention: "Parse a program and return the declared return-type code of its first rule"
+  @source: vexprparse.intent:49
+  input:
+    s : ScanState
+  output:
+    out : number
+  logic:
+    let toks = begin_tokenize(ScanState { source: s.source, pos: 0 })
+    let prog = parse_program(ProgramState { toks: toks, src: s.source, pos: 0 })
+    out = rl_head_return_type(prog)
+  proofs:
+    purity:
+      reads : [s.source]
+      calls : [begin_tokenize, parse_program, rl_head_return_type]
     termination:
       bound : 256
 
