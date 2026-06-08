@@ -956,3 +956,34 @@ there (out of the arithmetic evaluator's scope).
     a `out = 1` / b `out = zzz` -> char 122 ('z'), len 3 (rule 1's zzz; rule 0 clean);
     main `out = f(w)` / f(x:number) `out = x` -> char 119 ('w'), len 1 (w undefined in
     main; f's param x is in scope only inside f).
+
+44. nth_diag_at_span_start(source, n) / nth_diag_at_span_len(source, n) -> the LOCATED
+    full report (brick 26). Brick 24 reported the COMPLETE diagnostic list (one Diag per
+    rule-category pair) but every Diag only said WHICH rule and WHAT KIND; brick 25
+    found the SPAN of the first undefined variable but only as a standalone driver, not
+    threaded into the report. This brick joins the two: the Diag record (MkDiag) is
+    WIDENED with two number fields — span_start / span_len — and rule_diags POPULATES
+    them for the undefined-variable category (1) via undef_span_rule. So the full report
+    now points AT the offending token, not just at the rule.
+      MkDiag(rule_index, category, span_start, span_len) -> brick 23's two fields plus
+        the new span. diag_span_start(d) / diag_span_len(d) -> the matching bare-group
+        accessors (mirrors of diag_index / diag_cat).
+      LOCATED ONLY FOR UNDEF: only category 1 (undef-var) carries a real span. Every
+        other category (2=undef-callee, 3=arity, 4=ill-typed, 5=arg-type) is a
+        whole-rule property, not a name span, so it carries the sentinel (start 9999,
+        len 0): "not located". find_diag's summary Diag also stays sentinel-spanned —
+        the located report is the DiagList, not the single-Diag summary.
+      rule_diags computes usp = undef_span_rule(...) ONCE above the d5..d1 chain (cheap +
+        pure; only USED when category 1 fires), then d1's MkDiag fills its span from
+        span_start(usp) / span_len(usp); d2..d5 keep the sentinel.
+      nth_diag_span_start / nth_diag_span_len -> walk the DiagList to the n-th cell and
+        read diag_span_start / diag_span_len off it (cons-walk idiom, like nth_diag_rule
+        / nth_diag_cat); the empty/out-of-bounds case reads the sentinel (9999 / 0).
+    THE MONEY SHOTS (NATIVE-ONLY, multi-line; spans are whitespace-dependent — the LEN
+    and the sentinel are the stable checks):
+    `rule f\n  logic:\n    out = foo + 1` -> diag 0 span_start n=0 = 26 (offset of foo),
+    span_len n=0 = 3; cross-check undef_span_start_of on the same source = 26;
+    quad (undef z in rule 0; callee/arity/argtype in rule 1) -> diag 0 = (rule 0, cat 1,
+    LOCATED): span_len n=0 = 1 (z is one char); diags 1/2/3 = cats 2/3/5, span SENTINEL:
+    span_start n=1 = 9999, span_len n=1 = 0 (only undef carries a span);
+    clean add+main -> empty list: span_start n=0 = 9999, span_len n=0 = 0.

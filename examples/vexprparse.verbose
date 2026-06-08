@@ -389,12 +389,17 @@ concept_group VExpr [max_depth: 4096, max_nodes: 65535]
   -- group because find_diag is a recursive rule that RETURNS one (same group-return
   -- ABI as find_rule returning a RuleDecl, or build_env returning an Env), and a
   -- number driver reads a field off it via the bare-group accessors diag_index /
-  -- diag_cat (same idiom as rd_body / block_binds).
+  -- diag_cat (same idiom as rd_body / block_binds). Brick 26 widens MkDiag with two
+  -- more number fields — span_start / span_len — so the located full report points AT
+  -- the offending token for undefined-variable diagnostics (category 1). For every
+  -- other category (2-5) and every sentinel, the span is MkSpan(9999, 0)'s shape
+  -- (span_start 9999, span_len 0): "not located". diag_span_start / diag_span_len are
+  -- the matching bare-group accessors.
   concept Diag
-    @intention: "A structured diagnostic: the first failing rule's 0-based index + its error category"
+    @intention: "A structured diagnostic: the failing rule's 0-based index, its error category, and the offending name's source span"
     @source: vexprparse.intent:41
     variants:
-      MkDiag of (rule_index : number, category : number)
+      MkDiag of (rule_index : number, category : number, span_start : number, span_len : number)
 
   -- Brick 24: a cons-list of Diags — the COMPLETE diagnostic report. Brick 23's
   -- find_diag returns ONE Diag (the first failure). This brick generalizes it to a
@@ -7146,8 +7151,8 @@ rule find_diag
     out : Diag
   logic:
     out = match fd.iter:
-      RCons(head, tail) => if rule_category(RuleCatState { rd: head, prog: fd.all, src: fd.src }) > 0 then Diag::MkDiag { rule_index: fd.idx, category: rule_category(RuleCatState { rd: head, prog: fd.all, src: fd.src }) } else find_diag(FindDiagState { iter: tail, all: fd.all, src: fd.src, idx: fd.idx + 1 })
-      RNil => Diag::MkDiag { rule_index: 9999, category: 0 }
+      RCons(head, tail) => if rule_category(RuleCatState { rd: head, prog: fd.all, src: fd.src }) > 0 then Diag::MkDiag { rule_index: fd.idx, category: rule_category(RuleCatState { rd: head, prog: fd.all, src: fd.src }), span_start: 9999, span_len: 0 } else find_diag(FindDiagState { iter: tail, all: fd.all, src: fd.src, idx: fd.idx + 1 })
+      RNil => Diag::MkDiag { rule_index: 9999, category: 0, span_start: 9999, span_len: 0 }
   proofs:
     purity:
       reads : [fd.iter, fd.all, fd.src, fd.idx]
@@ -7167,7 +7172,7 @@ rule diag_index
     out : number
   logic:
     out = match d:
-      MkDiag(rule_index, category) => rule_index
+      MkDiag(rule_index, category, span_start, span_len) => rule_index
   proofs:
     purity:
       reads : [d]
@@ -7186,7 +7191,48 @@ rule diag_cat
     out : number
   logic:
     out = match d:
-      MkDiag(rule_index, category) => category
+      MkDiag(rule_index, category, span_start, span_len) => category
+  proofs:
+    purity:
+      reads : [d]
+      calls : []
+    termination:
+      bound : 16
+
+
+-- diag_span_start: the offending name's start byte offset carried by a Diag (brick
+-- 26). 9999 for non-located diagnostics (categories 2-5, every sentinel). Mirror of
+-- diag_index, reading the third field.
+rule diag_span_start
+  @intention: "The offending name's start byte offset carried by a Diag (9999 if not located)"
+  @source: vexprparse.intent:44
+  input:
+    d : Diag
+  output:
+    out : number
+  logic:
+    out = match d:
+      MkDiag(rule_index, category, span_start, span_len) => span_start
+  proofs:
+    purity:
+      reads : [d]
+      calls : []
+    termination:
+      bound : 16
+
+
+-- diag_span_len: the offending name's byte length carried by a Diag (brick 26). 0
+-- for non-located diagnostics. Mirror of diag_span_start, reading the fourth field.
+rule diag_span_len
+  @intention: "The offending name's byte length carried by a Diag (0 if not located)"
+  @source: vexprparse.intent:44
+  input:
+    d : Diag
+  output:
+    out : number
+  logic:
+    out = match d:
+      MkDiag(rule_index, category, span_start, span_len) => span_len
   proofs:
     purity:
       reads : [d]
@@ -7353,6 +7399,12 @@ concept DiagNthState
 -- let-chain (the verifier counts the chain's actual operation count, which is large
 -- here because each guard calls a recursive analysis); start at 1024 and raise if the
 -- verifier reports the bound is short.
+-- Brick 26: the category-1 (undef-var) Diag now carries the offending name's SPAN.
+-- usp = undef_span_rule(...) is computed ONCE above the d5..d1 chain (cheap + pure;
+-- only USED when category 1 fires); d1's MkDiag fills span_start/span_len from usp via
+-- span_start(usp) / span_len(usp). The other four categories (d2..d5) and every
+-- sentinel keep span_start: 9999, span_len: 0 ("not located") — only undef diagnostics
+-- point at a token, since the other analyses are whole-rule properties, not name spans.
 rule rule_diags
   @intention: "The diagnostic list of one rule: one Diag per failing category, ascending order (1..5), empty if clean"
   @source: vexprparse.intent:42
@@ -7361,16 +7413,17 @@ rule rule_diags
   output:
     out : DiagList
   logic:
-    let d5 = if argtype_rule(ArgTypeRuleState { rd: rds.rd, prog: rds.prog, src: rds.src }) > 0 then DiagList::DCons { diag: Diag::MkDiag { rule_index: rds.idx, category: 5 }, rest: DiagList::DNil } else DiagList::DNil
-    let d4 = if tcheck_rule(TCheckRuleState { rd: rds.rd, src: rds.src }) > 0 then DiagList::DCons { diag: Diag::MkDiag { rule_index: rds.idx, category: 4 }, rest: d5 } else d5
-    let d3 = if badarity_rule(BadArityRuleState { rd: rds.rd, rules: rds.prog, src: rds.src }) > 0 then DiagList::DCons { diag: Diag::MkDiag { rule_index: rds.idx, category: 3 }, rest: d4 } else d4
-    let d2 = if badcall_rule(BadCallRuleState { rd: rds.rd, rules: rds.prog, src: rds.src }) > 0 then DiagList::DCons { diag: Diag::MkDiag { rule_index: rds.idx, category: 2 }, rest: d3 } else d3
-    let d1 = if lint_rule(LintRuleState { rd: rds.rd, src: rds.src }) > 0 then DiagList::DCons { diag: Diag::MkDiag { rule_index: rds.idx, category: 1 }, rest: d2 } else d2
+    let usp = undef_span_rule(UndefSpanRuleState { rd: rds.rd, src: rds.src })
+    let d5 = if argtype_rule(ArgTypeRuleState { rd: rds.rd, prog: rds.prog, src: rds.src }) > 0 then DiagList::DCons { diag: Diag::MkDiag { rule_index: rds.idx, category: 5, span_start: 9999, span_len: 0 }, rest: DiagList::DNil } else DiagList::DNil
+    let d4 = if tcheck_rule(TCheckRuleState { rd: rds.rd, src: rds.src }) > 0 then DiagList::DCons { diag: Diag::MkDiag { rule_index: rds.idx, category: 4, span_start: 9999, span_len: 0 }, rest: d5 } else d5
+    let d3 = if badarity_rule(BadArityRuleState { rd: rds.rd, rules: rds.prog, src: rds.src }) > 0 then DiagList::DCons { diag: Diag::MkDiag { rule_index: rds.idx, category: 3, span_start: 9999, span_len: 0 }, rest: d4 } else d4
+    let d2 = if badcall_rule(BadCallRuleState { rd: rds.rd, rules: rds.prog, src: rds.src }) > 0 then DiagList::DCons { diag: Diag::MkDiag { rule_index: rds.idx, category: 2, span_start: 9999, span_len: 0 }, rest: d3 } else d3
+    let d1 = if lint_rule(LintRuleState { rd: rds.rd, src: rds.src }) > 0 then DiagList::DCons { diag: Diag::MkDiag { rule_index: rds.idx, category: 1, span_start: span_start(usp), span_len: span_len(usp) }, rest: d2 } else d2
     out = d1
   proofs:
     purity:
       reads : [rds.rd, rds.prog, rds.src, rds.idx]
-      calls : [argtype_rule, tcheck_rule, badarity_rule, badcall_rule, lint_rule]
+      calls : [argtype_rule, tcheck_rule, badarity_rule, badcall_rule, lint_rule, undef_span_rule, span_start, span_len]
     termination:
       bound : 1024
 
@@ -7499,6 +7552,51 @@ rule nth_diag_cat
       bound : 4000
 
 
+-- nth_diag_span_start: the offending name's start byte offset of the n-th diagnostic
+-- (brick 26), or the sentinel 9999 if n runs past the end of the report (matching the
+-- "not located" convention). Mirror of nth_diag_rule, reading diag_span_start instead.
+-- Recurses on the tail; calls diag_span_start at the base.
+rule nth_diag_span_start
+  @intention: "The offending name's start byte offset of the n-th diagnostic (sentinel 9999 if out of bounds)"
+  @source: vexprparse.intent:44
+  input:
+    dn : DiagNthState
+  output:
+    out : number
+  logic:
+    out = match dn.list:
+      DCons(diag, rest) => if dn.n == 0 then diag_span_start(diag) else nth_diag_span_start(DiagNthState { list: rest, n: dn.n - 1 })
+      DNil => 9999
+  proofs:
+    purity:
+      reads : [dn.list, dn.n]
+      calls : [diag_span_start, nth_diag_span_start]
+    termination:
+      bound : 4000
+
+
+-- nth_diag_span_len: the offending name's byte length of the n-th diagnostic (brick
+-- 26), or 0 if n runs past the end of the report. Mirror of nth_diag_span_start,
+-- reading diag_span_len. Recurses on the tail; calls diag_span_len at the base.
+rule nth_diag_span_len
+  @intention: "The offending name's byte length of the n-th diagnostic (0 if out of bounds)"
+  @source: vexprparse.intent:44
+  input:
+    dn : DiagNthState
+  output:
+    out : number
+  logic:
+    out = match dn.list:
+      DCons(diag, rest) => if dn.n == 0 then diag_span_len(diag) else nth_diag_span_len(DiagNthState { list: rest, n: dn.n - 1 })
+      DNil => 0
+  proofs:
+    purity:
+      reads : [dn.list, dn.n]
+      calls : [diag_span_len, nth_diag_span_len]
+    termination:
+      bound : 4000
+
+
 -- ----------------------------------------------------------------------------
 -- BRICK 24 DRIVERS. All three tokenize + parse the source ONCE (same front end as
 -- check_program / first_bad_rule), build the whole-program DiagList via prog_diags,
@@ -7587,6 +7685,66 @@ rule nth_diag_at_cat
     purity:
       reads : [s.source, s.pos]
       calls : [begin_tokenize, parse_program, nth_diag_cat, prog_diags]
+    termination:
+      bound : 256
+
+
+-- ----------------------------------------------------------------------------
+-- BRICK 26 DRIVERS. The LOCATED full report. Same front end + prog_diags as the
+-- brick-24 nth_diag_at_* drivers, but expose the n-th diagnostic's SOURCE SPAN so the
+-- report says WHERE, not just which-rule / what-kind. Only undefined-variable
+-- diagnostics (category 1) carry a real span; every other category (2-5) and every
+-- out-of-bounds n reads the sentinel (start 9999, len 0): "not located". NATIVE-ONLY
+-- (multi-line source). ScanState: source is argv arg 1, n is argv arg 2 (s.pos).
+--
+-- WORKED EXAMPLES (spans are whitespace-dependent; the LEN and the sentinel are stable):
+--   single undef "rule f\n  logic:\n    out = foo + 1"
+--                 nth_diag_at_span_start n=0 -> 26 (offset of foo), n=0 len -> 3.
+--                 Cross-check: undef_span_start_of on the SAME source = 26 too.
+--   quad         "rule f(a : number)\n  logic:\n    out = z + 1\nrule main\n  logic:\n    out = f(1 < 2, 3) + g(9)"
+--                 diag 0 = (rule 0, cat 1, LOCATED): span_len n=0 -> 1 (z is one char),
+--                 span_start n=0 -> offset of z. diag 1/2/3 = cats 2/3/5, span SENTINEL:
+--                 span_start n=1 -> 9999, span_len n=1 -> 0 (NOT located).
+--   clean        "rule add(x : number, y : number)\n  logic:\n    out = x + y\nrule main\n  logic:\n    out = add(1, 2)"
+--                 empty list: span_start n=0 -> 9999, span_len n=0 -> 0.
+rule nth_diag_at_span_start
+  @intention: "Tokenize, parse, build the diagnostic list, and return the n-th diagnostic's offending-name start offset (n from argv)"
+  @source: vexprparse.intent:44
+  input:
+    s : ScanState
+  output:
+    out : number
+  logic:
+    let toks = begin_tokenize(ScanState { source: s.source, pos: 0 })
+    let prog = parse_program(ProgramState { toks: toks, src: s.source, pos: 0 })
+    out = nth_diag_span_start(DiagNthState { list: prog_diags(ProgDiagsState { iter: prog, all: prog, src: s.source, idx: 0 }), n: s.pos })
+  proofs:
+    purity:
+      reads : [s.source, s.pos]
+      calls : [begin_tokenize, parse_program, nth_diag_span_start, prog_diags]
+    termination:
+      bound : 256
+
+
+-- nth_diag_at_span_len: companion of nth_diag_at_span_start — same front end and same
+-- prog_diags, but returns the n-th diagnostic's offending-name byte LENGTH (0 if n is
+-- out of bounds or the diagnostic is not located). Together the two drivers expose the
+-- (start, len) span of any located diagnostic in the complete report, indexed by n.
+rule nth_diag_at_span_len
+  @intention: "Tokenize, parse, build the diagnostic list, and return the n-th diagnostic's offending-name byte length (n from argv)"
+  @source: vexprparse.intent:44
+  input:
+    s : ScanState
+  output:
+    out : number
+  logic:
+    let toks = begin_tokenize(ScanState { source: s.source, pos: 0 })
+    let prog = parse_program(ProgramState { toks: toks, src: s.source, pos: 0 })
+    out = nth_diag_span_len(DiagNthState { list: prog_diags(ProgDiagsState { iter: prog, all: prog, src: s.source, idx: 0 }), n: s.pos })
+  proofs:
+    purity:
+      reads : [s.source, s.pos]
+      calls : [begin_tokenize, parse_program, nth_diag_span_len, prog_diags]
     termination:
       bound : 256
 
