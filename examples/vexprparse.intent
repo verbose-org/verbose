@@ -987,3 +987,36 @@ there (out of the arithmetic evaluator's scope).
     LOCATED): span_len n=0 = 1 (z is one char); diags 1/2/3 = cats 2/3/5, span SENTINEL:
     span_start n=1 = 9999, span_len n=1 = 0 (only undef carries a span);
     clean add+main -> empty list: span_start n=0 = 9999, span_len n=0 = 0.
+
+45. badcall_span_rule(rule, program, source) -> the LOCATED undefined-CALLEE diagnostic
+    (brick 27). Brick 26 gave the category-1 (undef-var) Diag a real span; every other
+    category still said only WHICH rule and WHAT KIND. This brick extends the located
+    report to category 2 (undef-callee): the category-2 Diag now points AT the offending
+    callee NAME, exactly as category 1 points at the offending variable name.
+      badcall_span_ast / badcall_span_args / badcall_span_binds / badcall_span_rule ->
+        the Span-returning analogue of the count_badcall_* family (brick "category 2").
+        Each mirrors its count twin arm-for-arm, swapping "+ (sum)" for span_or and
+        returning the first bad callee's NAME span instead of a count. Traversal order
+        matches count_badcall: binds before result, left-to-right within an expression,
+        and the OUTER call's callee BEFORE its args (so for g(h(1)) with g undefined, g's
+        span wins; with g defined and h undefined, the args walk reports h's span).
+      SIMPLER THAN undef_span_rule: undefined-callee scope is program-wide, so
+        badcall_span_rule builds NO param scope and threads NO binding prefix — it just
+        checks the binds then the result, both against the same program rule list (the
+        same shape as badcall_rule for the count). The AstCall arm reports the callee
+        span IMMEDIATELY when rule_named == 0; it only descends into the args when the
+        callee exists.
+      rule_diags computes csp = badcall_span_rule(...) ONCE above the d5..d1 chain (same
+        cheap + pure shape as brick 26's usp; only USED when category 2 fires), then d2's
+        MkDiag fills its span from span_start(csp) / span_len(csp); d3/d4/d5 keep the
+        sentinel (9999 / 0), and d1 stays as brick 26 left it.
+    THE MONEY SHOTS (NATIVE-ONLY, multi-line; the LEN and the sentinel are the stable
+    checks since spans are whitespace-dependent):
+    `rule main\n  logic:\n    out = g(1)` -> all_diags_count 1; cat n=0 = 2; span_len n=0 = 1
+    (g is one char); span_start n=0 = offset of g.
+    `rule main\n  logic:\n    out = foobar(1)` -> cat n=0 = 2; span_len n=0 = 6.
+    quad (undef z in rule 0; f(...) clean + undefined g in rule 1) -> diag 1 (cat 2) now
+    LOCATED: cat n=1 = 2, span_len n=1 = 1 (was 0 before this brick — g is one char),
+    span_start n=1 = offset of g (was 9999); diag 0 (undef z) UNCHANGED: cat n=0 = 1,
+    span_len n=0 = 1; diag 2 (cat 3 arity) STILL sentinel: span_len n=2 = 0,
+    span_start n=2 = 9999.

@@ -7402,9 +7402,14 @@ concept DiagNthState
 -- Brick 26: the category-1 (undef-var) Diag now carries the offending name's SPAN.
 -- usp = undef_span_rule(...) is computed ONCE above the d5..d1 chain (cheap + pure;
 -- only USED when category 1 fires); d1's MkDiag fills span_start/span_len from usp via
--- span_start(usp) / span_len(usp). The other four categories (d2..d5) and every
--- sentinel keep span_start: 9999, span_len: 0 ("not located") — only undef diagnostics
--- point at a token, since the other analyses are whole-rule properties, not name spans.
+-- span_start(usp) / span_len(usp).
+-- Brick 27: the category-2 (undef-callee) Diag now ALSO carries the offending callee
+-- name's SPAN. csp = badcall_span_rule(...) is computed ONCE above the chain (same
+-- cheap + pure shape as usp; only USED when category 2 fires); d2's MkDiag fills its
+-- span from span_start(csp) / span_len(csp). Categories 3/4/5 (d3..d5) and every
+-- sentinel keep span_start: 9999, span_len: 0 ("not located") — those analyses are
+-- whole-rule properties, not name spans, so only undef-var and undef-callee point at
+-- a token (a later brick may locate the rest).
 rule rule_diags
   @intention: "The diagnostic list of one rule: one Diag per failing category, ascending order (1..5), empty if clean"
   @source: vexprparse.intent:42
@@ -7414,16 +7419,17 @@ rule rule_diags
     out : DiagList
   logic:
     let usp = undef_span_rule(UndefSpanRuleState { rd: rds.rd, src: rds.src })
+    let csp = badcall_span_rule(BadCallSpanRuleState { rd: rds.rd, rules: rds.prog, src: rds.src })
     let d5 = if argtype_rule(ArgTypeRuleState { rd: rds.rd, prog: rds.prog, src: rds.src }) > 0 then DiagList::DCons { diag: Diag::MkDiag { rule_index: rds.idx, category: 5, span_start: 9999, span_len: 0 }, rest: DiagList::DNil } else DiagList::DNil
     let d4 = if tcheck_rule(TCheckRuleState { rd: rds.rd, src: rds.src }) > 0 then DiagList::DCons { diag: Diag::MkDiag { rule_index: rds.idx, category: 4, span_start: 9999, span_len: 0 }, rest: d5 } else d5
     let d3 = if badarity_rule(BadArityRuleState { rd: rds.rd, rules: rds.prog, src: rds.src }) > 0 then DiagList::DCons { diag: Diag::MkDiag { rule_index: rds.idx, category: 3, span_start: 9999, span_len: 0 }, rest: d4 } else d4
-    let d2 = if badcall_rule(BadCallRuleState { rd: rds.rd, rules: rds.prog, src: rds.src }) > 0 then DiagList::DCons { diag: Diag::MkDiag { rule_index: rds.idx, category: 2, span_start: 9999, span_len: 0 }, rest: d3 } else d3
+    let d2 = if badcall_rule(BadCallRuleState { rd: rds.rd, rules: rds.prog, src: rds.src }) > 0 then DiagList::DCons { diag: Diag::MkDiag { rule_index: rds.idx, category: 2, span_start: span_start(csp), span_len: span_len(csp) }, rest: d3 } else d3
     let d1 = if lint_rule(LintRuleState { rd: rds.rd, src: rds.src }) > 0 then DiagList::DCons { diag: Diag::MkDiag { rule_index: rds.idx, category: 1, span_start: span_start(usp), span_len: span_len(usp) }, rest: d2 } else d2
     out = d1
   proofs:
     purity:
       reads : [rds.rd, rds.prog, rds.src, rds.idx]
-      calls : [argtype_rule, tcheck_rule, badarity_rule, badcall_rule, lint_rule, undef_span_rule, span_start, span_len]
+      calls : [argtype_rule, tcheck_rule, badarity_rule, badcall_rule, lint_rule, undef_span_rule, badcall_span_rule, span_start, span_len]
     termination:
       bound : 1024
 
@@ -8045,6 +8051,201 @@ rule undef_span_list
     purity:
       reads : [a.rl, a.src]
       calls : [span_or, undef_span_rule, undef_span_list]
+    termination:
+      bound : 4000
+
+
+-- ----------------------------------------------------------------------------
+-- BRICK 27: the undefined-CALLEE span family. Mirrors the count_badcall_* family
+-- (brick "category 2") arm-for-arm, swapping "+ (sum)" for span_or and returning
+-- the offending callee NAME span instead of a count. Where count_badcall returns
+-- "how many call sites name a rule that does not exist", badcall_span returns the
+-- SPAN of the FIRST such callee — in the same traversal order count_badcall sums:
+-- binds before result, left-to-right within an expression, and (the load-bearing
+-- arm) the OUTER call's callee BEFORE descending into its args. The sentinel for
+-- "no bad callee here" is MkSpan(9999, 0); span_or treats start == 9999 as empty.
+--
+-- This is the analogue of the brick-25 undef_span_* family, but SIMPLER on the
+-- rule level: undefined-callee scope is program-wide, so badcall_span_rule does
+-- NOT build a param scope or thread a binding prefix — it just checks the binds
+-- then the result, both against the same program RuleList (exactly as badcall_rule
+-- does for the count). The Ast/args/binds walkers mirror their count_badcall twins.
+-- ----------------------------------------------------------------------------
+
+
+-- badcall_span_ast's input: one Ast node + the program's RuleList (callee scope) +
+-- the source text (spans index into it). Same triple as BadCallState (the count
+-- version); the only difference is the RETURN type (Span, not number).
+concept BadCallSpanState
+  @intention: "An Ast node + the program rule list (callee scope) + the source text, for locating its first undefined callee"
+  @source: vexprparse.intent:45
+  fields:
+    node : Ast
+    rules : RuleList
+    src : text [..256]
+
+
+-- badcall_span_args's input: a call's argument list + the program's RuleList
+-- (callee scope) + the source text. Mirrors BadCallArgsState; Span return.
+concept BadCallSpanArgsState
+  @intention: "A call-argument list + the program rule list (callee scope) + the source text, for locating its first undefined callee"
+  @source: vexprparse.intent:45
+  fields:
+    args : ArgList
+    rules : RuleList
+    src : text [..256]
+
+
+-- badcall_span_binds's input: the binding list whose RHSes are walked + the
+-- program's RuleList (callee scope) + the source text. Mirrors BadCallBindsState;
+-- Span return. As with the count version there is no prefix — callee scope is
+-- program-wide, so every RHS sees the FULL program rule list.
+concept BadCallSpanBindsState
+  @intention: "A binding list + the program rule list (callee scope) + the source text, for locating its first undefined callee"
+  @source: vexprparse.intent:45
+  fields:
+    binds : Binding
+    rules : RuleList
+    src : text [..256]
+
+
+-- badcall_span_rule's input: ONE rule declaration + the FULL program RuleList (the
+-- checked rule may call itself or any other rule) + the source text. Mirrors
+-- BadCallRuleState; Span return.
+concept BadCallSpanRuleState
+  @intention: "A rule declaration + the full program rule list + the source text, for locating its first undefined callee"
+  @source: vexprparse.intent:45
+  fields:
+    rd : RuleDecl
+    rules : RuleList
+    src : text [..256]
+
+
+-- badcall_span_ast: walk an Ast and return the SPAN of the first AstCall whose
+-- callee name is NOT rule_named in the program. Mirrors count_badcall_ast's
+-- structural walk, swapping "+ (sum)" for span_or:
+--   * AstCall(callee_start, callee_len, args) => if the callee does NOT exist
+--     (rule_named == 0) report ITS name span IMMEDIATELY (MkSpan(callee_start,
+--     callee_len)); only if the callee EXISTS descend into the args via
+--     badcall_span_args. This "callee before args" order matches count_badcall and
+--     reports the OUTER/first undefined callee (e.g. in g(h(1)) with g undefined,
+--     g's span wins; with g defined and h undefined, we descend and h's span wins).
+--   * AstBin walks lhs THEN rhs via span_or (lhs wins on a tie — left-to-right).
+--   * AstNeg / AstNot / AstField descend into their single child.
+--   * AstIf walks cond, thn, els left-to-right via nested span_or.
+--   * AstVar / AstNum / AstStr / AstBool / AstErr carry no callee -> sentinel.
+-- Mutually recursive with badcall_span_args. a.node is a FIELD of the packed input
+-- (not the input), so bound + the mandatory native recursion breadcrumb.
+rule badcall_span_ast
+  @intention: "The span of the first undefined-callee reference in an AST, given the program's rule list (sentinel if clean)"
+  @source: vexprparse.intent:45
+  input:
+    a : BadCallSpanState
+  output:
+    out : Span
+  logic:
+    out = match a.node:
+      AstNum(value) => Span::MkSpan { start: 9999, len: 0 }
+      AstBool(value) => Span::MkSpan { start: 9999, len: 0 }
+      AstVar(start, len) => Span::MkSpan { start: 9999, len: 0 }
+      AstStr(start, len) => Span::MkSpan { start: 9999, len: 0 }
+      AstErr => Span::MkSpan { start: 9999, len: 0 }
+      AstBin(op, lhs, rhs) => span_or(SpanOrState { a: badcall_span_ast(BadCallSpanState { node: lhs, rules: a.rules, src: a.src }), b: badcall_span_ast(BadCallSpanState { node: rhs, rules: a.rules, src: a.src }) })
+      AstNeg(inner) => badcall_span_ast(BadCallSpanState { node: inner, rules: a.rules, src: a.src })
+      AstNot(inner) => badcall_span_ast(BadCallSpanState { node: inner, rules: a.rules, src: a.src })
+      AstField(base, fstart, flen) => badcall_span_ast(BadCallSpanState { node: base, rules: a.rules, src: a.src })
+      AstCall(callee_start, callee_len, args) => if rule_named(RuleNamedState { rules: a.rules, src: a.src, q_start: callee_start, q_len: callee_len }) == 0 then Span::MkSpan { start: callee_start, len: callee_len } else badcall_span_args(BadCallSpanArgsState { args: args, rules: a.rules, src: a.src })
+      AstIf(cond, thn, els) => span_or(SpanOrState { a: span_or(SpanOrState { a: badcall_span_ast(BadCallSpanState { node: cond, rules: a.rules, src: a.src }), b: badcall_span_ast(BadCallSpanState { node: thn, rules: a.rules, src: a.src }) }), b: badcall_span_ast(BadCallSpanState { node: els, rules: a.rules, src: a.src }) })
+  proofs:
+    purity:
+      reads : [a.node, a.rules, a.src]
+      calls : [rule_named, span_or, badcall_span_ast, badcall_span_args]
+    termination:
+      bound : 4000
+
+
+-- badcall_span_args: walk a call's ArgList, returning the span of the first
+-- undefined callee found across its arguments (head before tail, via span_or).
+-- Mirrors count_badcall_args; mutually recursive with badcall_span_ast (a call's
+-- arguments are themselves Asts that may contain more calls). Recurses over the
+-- tail (a field of the input), so bound + breadcrumb; rules + src threaded down.
+rule badcall_span_args
+  @intention: "The span of the first undefined callee across every argument of a call (sentinel if clean)"
+  @source: vexprparse.intent:45
+  input:
+    a : BadCallSpanArgsState
+  output:
+    out : Span
+  logic:
+    out = match a.args:
+      ArgCons(head, tail) => span_or(SpanOrState { a: badcall_span_ast(BadCallSpanState { node: head, rules: a.rules, src: a.src }), b: badcall_span_args(BadCallSpanArgsState { args: tail, rules: a.rules, src: a.src }) })
+      ArgNil => Span::MkSpan { start: 9999, len: 0 }
+  proofs:
+    purity:
+      reads : [a.args, a.rules, a.src]
+      calls : [span_or, badcall_span_ast, badcall_span_args]
+    termination:
+      bound : 4000
+
+
+-- badcall_span_binds: for each binding in the list, locate the first undefined
+-- callee in its RHS `value` (against the FULL program rule list), then recurse on
+-- `rest`. The current binding's RHS is checked BEFORE the tail (source order), via
+-- span_or. Mirrors count_badcall_binds; no prefix (callee scope is program-wide).
+-- Recurses over the binding tail (a field of the input), so bound + breadcrumb.
+rule badcall_span_binds
+  @intention: "The span of the first undefined callee across every binding's RHS (sentinel if clean)"
+  @source: vexprparse.intent:45
+  input:
+    a : BadCallSpanBindsState
+  output:
+    out : Span
+  logic:
+    out = match a.binds:
+      BCons(name_start, name_len, value, rest) => span_or(SpanOrState { a: badcall_span_ast(BadCallSpanState { node: value, rules: a.rules, src: a.src }), b: badcall_span_binds(BadCallSpanBindsState { binds: rest, rules: a.rules, src: a.src }) })
+      BNil => Span::MkSpan { start: 9999, len: 0 }
+  proofs:
+    purity:
+      reads : [a.binds, a.rules, a.src]
+      calls : [span_or, badcall_span_ast, badcall_span_binds]
+    termination:
+      bound : 4000
+
+
+-- badcall_span_rule: the span of the first undefined callee in ONE rule. Mirrors
+-- badcall_rule (the count), but SIMPLER than undef_span_rule (the var-span version)
+-- because callee scope is program-wide — there is no param scope and no binding
+-- prefix to thread. Split the body Block into its binding list and result, then:
+--   * badcall_span_binds over the bindings (every let RHS's callees), THEN
+--   * badcall_span_ast over the result expression's callees.
+-- span_or keeps the in_binds span if there is one (the let RHSs precede the result
+-- in source order). Both halves resolve callees against the SAME full program
+-- RuleList `a.rules`. Bound-only termination.
+--
+-- Worked examples (offsets into the source text, 0-based bytes):
+--   `rule main\n  logic:\n    out = g(1)`         -> MkSpan(<offset of g>, 1)
+--   `rule main\n  logic:\n    out = foobar(1)`    -> MkSpan(<offset of foobar>, 6)
+--   `rule f\n  logic:\n    out = z + 1\nrule main\n  logic:\n    out = f(1, 2) + g(9)`
+--                                                  -> for rule main: MkSpan(<offset of g>, 1)
+--                                                     (f is defined, so f(1, 2) is clean;
+--                                                      the result walk descends past f into g)
+--   a rule whose every callee exists (incl. self / forward refs) -> MkSpan(9999, 0).
+rule badcall_span_rule
+  @intention: "The span of the first undefined-callee reference in one rule (callees resolved program-wide; sentinel if clean)"
+  @source: vexprparse.intent:45
+  input:
+    a : BadCallSpanRuleState
+  output:
+    out : Span
+  logic:
+    let body = rd_body(a.rd)
+    let binds = block_binds(body)
+    let result = block_result(body)
+    out = span_or(SpanOrState { a: badcall_span_binds(BadCallSpanBindsState { binds: binds, rules: a.rules, src: a.src }), b: badcall_span_ast(BadCallSpanState { node: result, rules: a.rules, src: a.src }) })
+  proofs:
+    purity:
+      reads : [a.rd, a.rules, a.src]
+      calls : [rd_body, block_binds, block_result, badcall_span_binds, span_or, badcall_span_ast]
     termination:
       bound : 4000
 
