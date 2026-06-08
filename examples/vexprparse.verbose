@@ -6321,11 +6321,14 @@ concept IfTypeState
 
 -- bin_type: classify the result type of a binary operation from its op code and
 -- its two operand type codes (computed by type_of_env before the call). Arithmetic
--- ops require both operands number and yield number; comparisons require both
--- number and yield bool (v1: numeric comparison only — bool == bool is a future
--- brick); logic ops require both bool and yield bool. Any mismatch => ERROR (3),
--- and an unknown op also => ERROR. NON-recursive: a flat nested-if classifier,
--- bounded by 8 (it never recurses; the bound is the trivial leaf budget).
+-- ops require both operands number and yield number; ORDERING comparisons
+-- (<, >, <=, >=) require both number and yield bool (ordering booleans is not
+-- meaningful); EQUALITY (==, !=) accepts two operands of the SAME comparable type
+-- — number==number OR bool==bool — and yields bool (brick 29; text==text is still
+-- ERROR, text not yet typed); logic ops require both bool and yield bool. Any
+-- mismatch => ERROR (3), and an unknown op also => ERROR. NON-recursive: a flat
+-- nested-if classifier, bounded by 8 (it never recurses; the bound is the trivial
+-- leaf budget).
 rule bin_type
   @intention: "Result type code of a binary op given its operand type codes (3 = ill-typed)"
   @source: vexprparse.intent:37
@@ -6334,7 +6337,7 @@ rule bin_type
   output:
     out : number
   logic:
-    out = if b.op == 13 then (if b.lt == 0 and b.rt == 0 then 0 else 3) else if b.op == 14 then (if b.lt == 0 and b.rt == 0 then 0 else 3) else if b.op == 15 then (if b.lt == 0 and b.rt == 0 then 0 else 3) else if b.op == 16 then (if b.lt == 0 and b.rt == 0 then 0 else 3) else if b.op == 17 then (if b.lt == 0 and b.rt == 0 then 0 else 3) else if b.op == 1 then (if b.lt == 0 and b.rt == 0 then 1 else 3) else if b.op == 6 then (if b.lt == 0 and b.rt == 0 then 1 else 3) else if b.op == 19 then (if b.lt == 0 and b.rt == 0 then 1 else 3) else if b.op == 20 then (if b.lt == 0 and b.rt == 0 then 1 else 3) else if b.op == 5 then (if b.lt == 0 and b.rt == 0 then 1 else 3) else if b.op == 4 then (if b.lt == 0 and b.rt == 0 then 1 else 3) else if b.op == 30 then (if b.lt == 1 and b.rt == 1 then 1 else 3) else if b.op == 31 then (if b.lt == 1 and b.rt == 1 then 1 else 3) else 3
+    out = if b.op == 13 then (if b.lt == 0 and b.rt == 0 then 0 else 3) else if b.op == 14 then (if b.lt == 0 and b.rt == 0 then 0 else 3) else if b.op == 15 then (if b.lt == 0 and b.rt == 0 then 0 else 3) else if b.op == 16 then (if b.lt == 0 and b.rt == 0 then 0 else 3) else if b.op == 17 then (if b.lt == 0 and b.rt == 0 then 0 else 3) else if b.op == 1 then (if b.lt == b.rt and (b.lt == 0 or b.lt == 1) then 1 else 3) else if b.op == 6 then (if b.lt == b.rt and (b.lt == 0 or b.lt == 1) then 1 else 3) else if b.op == 19 then (if b.lt == 0 and b.rt == 0 then 1 else 3) else if b.op == 20 then (if b.lt == 0 and b.rt == 0 then 1 else 3) else if b.op == 5 then (if b.lt == 0 and b.rt == 0 then 1 else 3) else if b.op == 4 then (if b.lt == 0 and b.rt == 0 then 1 else 3) else if b.op == 30 then (if b.lt == 1 and b.rt == 1 then 1 else 3) else if b.op == 31 then (if b.lt == 1 and b.rt == 1 then 1 else 3) else 3
   proofs:
     purity:
       reads : [b.op, b.lt, b.rt]

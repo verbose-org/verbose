@@ -721,10 +721,12 @@ there (out of the arithmetic evaluator's scope).
     TYPING RULES (v1). AstNum => number; AstBool => bool; AstErr/AstField/AstStr
     => ERROR; AstVar => env_lookup; AstCall => number. AstNeg requires a number
     operand, AstNot a bool operand. AstBin: arithmetic (+ - * / %) needs both
-    number => number; comparison (== != < > <= >=) needs both number => bool (v1:
-    numeric comparison only — bool comparison is a future brick); logic (and/or)
-    needs both bool => bool. AstIf: bool condition AND both branches the same
-    non-ERROR type => that type, else ERROR. Any mismatch => ERROR.
+    number => number; ORDERING (< > <= >=) needs both number => bool (ordering
+    booleans is not meaningful); EQUALITY (== !=) accepts two operands of the SAME
+    comparable type — number==number OR bool==bool — and yields bool (brick 29;
+    text==text is still ERROR, text not yet typed); logic (and/or) needs both
+    bool => bool. AstIf: bool condition AND both branches the same non-ERROR type
+    => that type, else ERROR. Any mismatch => ERROR.
 
     THE SCC. type_of_env + build_tenv (+ the per-rule tcheck_binds) form a
     recursive group/text cluster exactly like the interpreter's eval_ast_env +
@@ -1055,3 +1057,14 @@ there (out of the arithmetic evaluator's scope).
     span_start n=2 = offset of f (was 9999); diags 0/1 (cat 1 undef z / cat 2 callee g)
     UNCHANGED located; diag 3 (cat 5 argtype) STILL sentinel: span_len n=3 = 0,
     span_start n=3 = 9999.
+
+47. Brick 29 of the self-hosting arc: EQUALITY ON BOOLEANS in the type system. Brick 19's
+    bin_type classified == (op 1) and != (op 6) as number-only (both operands number => bool),
+    which wrongly rejected (1 < 2) == (3 < 4). This brick refines ONLY the two equality clauses
+    to accept two operands of the SAME comparable type — number==number OR bool==bool — yielding
+    bool; anything else (number==bool, or text/ERROR operands) => ERROR. text==text stays ERROR
+    (text not yet typed). The ORDERING ops (< > <= >=) stay numeric-only (ordering booleans is
+    not meaningful); arithmetic and logic are unchanged. In-place logic tweak to one rule — no
+    new concepts/rules. Money shots: (1 < 2) == (3 < 4) => bool (0, was ill-typed before); 1 == 2
+    => number==number (0); 1 == (2 < 3) => still ERROR (1); (1 < 2) < (3 < 4) => still ERROR (1,
+    ordering on bools); 1 + (2 < 3) => still ERROR (1).
