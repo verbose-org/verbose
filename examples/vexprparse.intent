@@ -1020,3 +1020,38 @@ there (out of the arithmetic evaluator's scope).
     span_start n=1 = offset of g (was 9999); diag 0 (undef z) UNCHANGED: cat n=0 = 1,
     span_len n=0 = 1; diag 2 (cat 3 arity) STILL sentinel: span_len n=2 = 0,
     span_start n=2 = 9999.
+
+46. badarity_span_rule(rule, program, source) -> the LOCATED arity-mismatch diagnostic
+    (brick 28). Bricks 26/27 located categories 1 (undef-var) and 2 (undef-callee); this
+    brick extends the located report to category 3 (arity): the category-3 Diag now points
+    AT the offending CALL's callee NAME, exactly as category 2 points at an undefined callee.
+      badarity_span_ast / badarity_span_args / badarity_span_binds / badarity_span_rule ->
+        the Span-returning analogue of the count_badarity_* family. Each mirrors its count
+        twin arm-for-arm, swapping "+ (sum)" for span_or and returning the first arity-
+        mismatched call's callee NAME span instead of a count. The per-call decision reuses
+        arity_mismatch directly (1 iff the callee EXISTS and its declared param count !=
+        this call's arg count). Traversal order matches count_badarity: binds before
+        result, left-to-right within an expression, and the OUTER call's own arity BEFORE
+        descending into its args.
+      SIMPLER THAN undef_span_rule (like badcall_span_rule): arity scope is program-wide,
+        so badarity_span_rule builds NO param scope and threads NO binding prefix — it just
+        checks the binds then the result, both against the same program rule list (the same
+        shape as badarity_rule for the count). The AstCall arm reports the callee span
+        IMMEDIATELY when arity_mismatch == 1; it only descends into the args otherwise.
+      rule_diags computes asp = badarity_span_rule(...) ONCE above the d5..d1 chain (same
+        cheap + pure shape as bricks 26/27's usp/csp; only USED when category 3 fires),
+        then d3's MkDiag fills its span from span_start(asp) / span_len(asp); d4/d5 keep the
+        sentinel (9999 / 0), and d1/d2 stay as bricks 26/27 left them. Categories 4/5 have
+        no single-token name span (AstBin / AstNum carry no source span), so they remain
+        unlocated.
+    THE MONEY SHOTS (NATIVE-ONLY, multi-line; the LEN and the sentinel are the stable
+    checks since spans are whitespace-dependent):
+    `rule f(a)\n  logic:\n    out = 1\nrule main\n  logic:\n    out = f(1, 2)` ->
+    all_diags_count 1; cat n=0 = 3; span_len n=0 = 1 (f is one char); span_start n=0 = offset
+    of the f in the call.
+    `rule foobar(a)\n  ...\n    out = foobar(1, 2)` -> cat n=0 = 3; span_len n=0 = 6.
+    quad (undef z in rule 0; f(2 args vs 1 param) + undefined g in rule 1) -> diag 2 (cat 3)
+    now LOCATED: cat n=2 = 3, span_len n=2 = 1 (was 0 before this brick — f is one char),
+    span_start n=2 = offset of f (was 9999); diags 0/1 (cat 1 undef z / cat 2 callee g)
+    UNCHANGED located; diag 3 (cat 5 argtype) STILL sentinel: span_len n=3 = 0,
+    span_start n=3 = 9999.
