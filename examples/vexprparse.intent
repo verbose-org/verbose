@@ -1100,3 +1100,26 @@ there (out of the arithmetic evaluator's scope).
     Money shots: rule add(x : number, y : number) : number => 0 (number); rule p(x : number)
     : bool => 1 (bool); rule q(x : number) : text => 2 (text); rule r(x : number) (no
     annotation) => 0 (default number); rule s() : bool (no params, return type) => 1.
+
+50. Brick 32 of the self-hosting arc: USE RETURN TYPES IN THE TYPE CHECKER. Brick 31
+    parsed and stored a rule's declared return type; this brick consumes it. The whole
+    program (RuleList) is now threaded through the type checker — TypeArg, BuildTArg,
+    TCheckBindsState, TCheckRuleState and TCheckListState each gain a `prog` field, passed
+    down every recursive call (the argtype_* family already carried prog since brick 21, so
+    its type_of_env / build_tenv calls just pass it). The one behavioral change: type_of_env's
+    AstCall arm, which used to yield 0 (assumed number), now yields the callee's DECLARED
+    return type via rd_return_type(find_rule(...)). No new recursion is created — find_rule
+    walks the RuleList and never calls type_of_env, so the checker's recursion structure is
+    unchanged; prog is pure threaded data. An undefined or unannotated callee resolves to the
+    find_rule sentinel / default 0 (number), so such calls still type as number (the
+    undefined-callee is reported separately by lint_callees). Scope: this brick only makes a
+    call's RESULT type correct; it does NOT add a "declared return vs body's inferred type"
+    check (that would change diagnostic counts — a later brick). Two payoffs: (1) type errors
+    INVOLVING call results are now caught — `rule b() : bool ... out = 1 < 2` then `out = 1 +
+    b()` is 1 + bool => type error (was MISSED, since b() used to type as number); (2) false
+    positives disappear — `out = if b() then 1 else 2` with b():bool is now well-typed (was a
+    false error when b() typed as number, a non-bool condition). Money shots: 1 + b() with
+    b():bool => 1; 1 + n() with n():number => 0; if b() with b():bool => 0; 1 + c() with c
+    unannotated => 0 (number default); 1 + t() with t():text => 1 (number + text). No new
+    concepts or rules (in-place field threading); the existing non-call type checks, the QUAD
+    diagnostic report, argtype, check_program and eval are all unchanged.
