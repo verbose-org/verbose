@@ -3757,6 +3757,21 @@ concept FindRuleState
     q_len : number [0, 256]
 
 
+-- CallRetState (brick 33): the inputs to type a CALL's result — the program rule
+-- list (callee scope), the source text, and the callee name's span. Drives
+-- call_result_type, which resolves the callee's DECLARED return type and maps the
+-- "unannotated" sentinel (9) back to number (0) so a call to an unannotated rule
+-- still types as number (preserving brick 32).
+concept CallRetState
+  @intention: "A program rule list + source text + the callee name's span, for typing a call result"
+  @source: vexprparse.intent:51
+  fields:
+    prog : RuleList
+    src : text [..256]
+    callee_start : number [0, 256]
+    callee_len : number [0, 256]
+
+
 -- A one-field probe to read the HEAD of an argument list (block-form match is only
 -- legal in final position, so destructuring an ArgList is factored into a tiny
 -- rule — same idiom as parsed_args_* / pp_params).
@@ -4441,7 +4456,7 @@ rule parse_rule_decl
     let typed_ret = if ret_colon == 10 then 1 else 0
     let ret_ty_start = peek_start(Nth { lst: rp.toks, n: after_params + 1 })
     let ret_ty_len = peek_len(Nth { lst: rp.toks, n: after_params + 1 })
-    let return_type = if typed_ret == 1 then type_code_of_span(SpanCheck { src: rp.src, start: ret_ty_start, len: ret_ty_len }) else 0
+    let return_type = if typed_ret == 1 then type_code_of_span(SpanCheck { src: rp.src, start: ret_ty_start, len: ret_ty_len }) else 9
     let after_ret = if typed_ret == 1 then after_params + 2 else after_params
     let logic_idx = skip_seps(ParseState { toks: rp.toks, pos: after_ret })
     let logic_start = peek_start(Nth { lst: rp.toks, n: logic_idx })
@@ -4699,7 +4714,7 @@ rule parse_rule_decl_pos
     let typed_ret = if ret_colon == 10 then 1 else 0
     let ret_ty_start = peek_start(Nth { lst: ps.toks, n: after_params + 1 })
     let ret_ty_len = peek_len(Nth { lst: ps.toks, n: after_params + 1 })
-    let return_type = if typed_ret == 1 then type_code_of_span(SpanCheck { src: ps.src, start: ret_ty_start, len: ret_ty_len }) else 0
+    let return_type = if typed_ret == 1 then type_code_of_span(SpanCheck { src: ps.src, start: ret_ty_start, len: ret_ty_len }) else 9
     let after_ret = if typed_ret == 1 then after_params + 2 else after_params
     let logic_idx = skip_seps(ParseState { toks: ps.toks, pos: after_ret })
     let logic_start = peek_start(Nth { lst: ps.toks, n: logic_idx })
@@ -4961,15 +4976,16 @@ rule rule_param_count
 -- source, parse the whole rule-decl sequence, and return the declared return-type
 -- code of the FIRST rule. An optional `: TYPENAME` after the parameter list (and
 -- before the `logic:` line) declares the return type — 0=number / 1=bool / 2=text;
--- when absent the default is 0 (number), matching the type checker's current
--- "calls yield number" assumption. PARSER-ONLY: this brick stores the return type
+-- when absent the default is the sentinel 9 ("unannotated", brick 33 — was 0 in
+-- brick 31). call_result_type maps 9 -> number when typing a call; tcheck_rule's
+-- return-vs-body check skips unannotated rules. PARSER-ONLY: this brick stores the return type
 -- in RuleDecl but does NOT yet feed it into the type checker (that needs threading
 -- the program through type_of_env, a later brick).
 --
 --   rule_return_type("rule add(x : number, y : number) : number\n  logic:\n    out = x + y") = 0  (number)
 --   rule_return_type("rule p(x : number) : bool\n  logic:\n    out = x > 0")                  = 1  (bool)
 --   rule_return_type("rule q(x : number) : text\n  logic:\n    out = \"hi\"")                  = 2  (text)
---   rule_return_type("rule r(x : number)\n  logic:\n    out = x")                              = 0  (no annotation -> number)
+--   rule_return_type("rule r(x : number)\n  logic:\n    out = x")                              = 9  (no annotation -> sentinel 9, brick 33)
 --   rule_return_type("rule s() : bool\n  logic:\n    out = 1 < 2")                             = 1  (no params, return type)
 --
 -- NATIVE-ONLY (multi-line source). Takes a ScanState: source is argv arg 1, pos
@@ -6462,15 +6478,42 @@ rule if_type
       bound : 8
 
 
+-- call_result_type (brick 33): the TYPE of a call's RESULT. Resolves the callee's
+-- declared return type (rd_return_type(find_rule(...))) and maps the brick-33
+-- "unannotated" sentinel (9) back to number (0). So a call to an annotated rule
+-- types as that rule's declared type (0/1/2), and a call to an unannotated or
+-- undefined rule (find_rule's RNil sentinel has return_type 0) types as number.
+-- This is exactly brick 32's behavior once the sentinel is accounted for; it lives
+-- in its own rule so the return-vs-body check (brick 33, in tcheck_rule) can read
+-- the RAW sentinel (9) while type_of_env keeps typing calls as number.
+rule call_result_type
+  @intention: "The result type code of a call, mapping the unannotated sentinel to number"
+  @source: vexprparse.intent:51
+  input:
+    c : CallRetState
+  output:
+    out : number
+  logic:
+    let rt = rd_return_type(find_rule(FindRuleState { rules: c.prog, src: c.src, q_start: c.callee_start, q_len: c.callee_len }))
+    out = if rt == 9 then 0 else rt
+  proofs:
+    purity:
+      reads : [c.prog, c.src, c.callee_start, c.callee_len]
+      calls : [rd_return_type, find_rule]
+    termination:
+      bound : 64
+
+
 -- type_of_env: the dispatch. Mirrors eval_ast_env's match STRUCTURE arm-for-arm
 -- but returns a TYPE code instead of a value. Leaves: AstNum => number (0),
 -- AstBool => bool (1), AstStr => text (2, brick 30 — a string literal is a
 -- first-class text value, so a `text` parameter accepts it; text supports no
 -- operations, so arithmetic/ordering/logic/equality on text all remain ERROR via
 -- bin_type), AstErr / AstField => ERROR (3, fields still not typed), AstCall =>
--- the callee's DECLARED return type (brick 32: rd_return_type(find_rule(prog, callee
--- span)); an undefined or unannotated callee resolves to number via the sentinel /
--- default 0). AstVar resolves its name in the type env
+-- the callee's DECLARED return type via call_result_type (brick 32/33:
+-- rd_return_type(find_rule(prog, callee span)) with the brick-33 "unannotated"
+-- sentinel 9 mapped back to number 0, so an undefined or unannotated callee
+-- resolves to number). AstVar resolves its name in the type env
 -- via env_lookup (the stored type code; 0 = number for unbound params). The unary
 -- and binary forms recurse on their sub-nodes, threading the same tenv + src down,
 -- then classify: AstNeg requires a number operand (else ERROR), AstNot a bool
@@ -6495,7 +6538,7 @@ rule type_of_env
       AstNot(inner) => if type_of_env(TypeArg { node: inner, tenv: t.tenv, src: t.src, prog: t.prog }) == 1 then 1 else 3
       AstVar(start, len) => env_lookup(EnvLookState { env: t.tenv, src: t.src, q_start: start, q_len: len })
       AstField(base, fstart, flen) => 3
-      AstCall(callee_start, callee_len, args) => rd_return_type(find_rule(FindRuleState { rules: t.prog, src: t.src, q_start: callee_start, q_len: callee_len }))
+      AstCall(callee_start, callee_len, args) => call_result_type(CallRetState { prog: t.prog, src: t.src, callee_start: callee_start, callee_len: callee_len })
       AstIf(cond, thn, els) => if_type(IfTypeState { ct: type_of_env(TypeArg { node: cond, tenv: t.tenv, src: t.src, prog: t.prog }), tt: type_of_env(TypeArg { node: thn, tenv: t.tenv, src: t.src, prog: t.prog }), et: type_of_env(TypeArg { node: els, tenv: t.tenv, src: t.src, prog: t.prog }) })
       AstBool(value) => 1
       AstStr(start, len) => 2
@@ -6503,7 +6546,7 @@ rule type_of_env
   proofs:
     purity:
       reads : [t.node, t.tenv, t.src, t.prog]
-      calls : [type_of_env, env_lookup, bin_type, if_type, rd_return_type, find_rule]
+      calls : [type_of_env, env_lookup, bin_type, if_type, call_result_type]
     termination:
       bound : 4000
 
@@ -6604,9 +6647,13 @@ concept TCheckRuleState
 -- empty start env); count the ill-typed let RHSs (tcheck_binds, which threads the
 -- same growing env so each RHS is typed in the right scope); type the result
 -- expression against the full env; the rule's error count is the bad-bind count
--- plus 1 iff the result itself is ill-typed. Plain rule (uses `let`), mirroring
--- lint_rule's body-split shape. bound 4000 (it calls into the recursive checker
--- SCC, so it carries the SCC's bound rather than a trivial leaf budget).
+-- plus 1 iff the result itself is ill-typed. Brick 33 adds a return-vs-body check:
+-- if the rule DECLARES a return type (ret != 9, the "unannotated" sentinel) and the
+-- body is well-typed (result_ty != 3) but its type disagrees with the declared
+-- return (ret != result_ty), that's +1. An UNANNOTATED rule (ret == 9) is never
+-- flagged for a non-number body, preserving bricks 29/30. Plain rule (uses `let`),
+-- mirroring lint_rule's body-split shape. bound 4000 (it calls into the recursive
+-- checker SCC, so it carries the SCC's bound rather than a trivial leaf budget).
 rule tcheck_rule
   @intention: "Number of type errors in one rule (ill-typed let RHSs + ill-typed result; 0 if well-typed)"
   @source: vexprparse.intent:37
@@ -6621,11 +6668,12 @@ rule tcheck_rule
     let tenv = build_tenv(BuildTArg { binds: binds, tenv: Env::ENil, src: tr.src, prog: tr.prog })
     let bad_binds = tcheck_binds(TCheckBindsState { binds: binds, tenv: Env::ENil, src: tr.src, prog: tr.prog })
     let result_ty = type_of_env(TypeArg { node: result, tenv: tenv, src: tr.src, prog: tr.prog })
-    out = bad_binds + (if result_ty == 3 then 1 else 0)
+    let ret = rd_return_type(tr.rd)
+    out = bad_binds + (if result_ty == 3 then 1 else 0) + (if ret != 9 and result_ty != 3 and ret != result_ty then 1 else 0)
   proofs:
     purity:
       reads : [tr.rd, tr.src, tr.prog]
-      calls : [rd_body, block_binds, block_result, build_tenv, tcheck_binds, type_of_env]
+      calls : [rd_body, block_binds, block_result, build_tenv, tcheck_binds, type_of_env, rd_return_type]
     termination:
       bound : 4000
 

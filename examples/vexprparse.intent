@@ -1089,8 +1089,11 @@ there (out of the arithmetic evaluator's scope).
     Both header parsers (parse_rule_decl / parse_rule_decl_pos) look at the token right
     after the params: if it is a `:` (op code 10) the next Ident is the return type-name,
     mapped via type_code_of_span (0=number / 1=bool / 2=text); otherwise (a Newline, op 0)
-    there is no annotation and the default return type is 0 (number), matching the type
-    checker's current "calls yield number" assumption. The parsed code is stored in a new
+    there is no annotation and the default return type is the sentinel 9 ("unannotated").
+    NOTE: brick 31 originally stored the no-annotation default as 0, but brick 33 changed
+    it to the sentinel 9 so "no annotation" and explicit ": number" are distinguishable;
+    call_result_type maps 9 -> number when typing a call and tcheck_rule's return-vs-body
+    check skips unannotated rules. The parsed code is stored in a new
     RuleDecl.MkRule field `return_type` (inserted after params, before body). PARSER-ONLY:
     the return type is recorded but NOT yet consumed by the type checker — feeding it into
     type_of_env needs the whole program threaded through, a later/bigger brick. Mirrors
@@ -1099,7 +1102,8 @@ there (out of the arithmetic evaluator's scope).
     annotation parse byte-identically (after_ret == after_params when there is no `:`).
     Money shots: rule add(x : number, y : number) : number => 0 (number); rule p(x : number)
     : bool => 1 (bool); rule q(x : number) : text => 2 (text); rule r(x : number) (no
-    annotation) => 0 (default number); rule s() : bool (no params, return type) => 1.
+    annotation) => 9 (unannotated sentinel — was 0 in brick 31, changed by brick 33);
+    rule s() : bool (no params, return type) => 1.
 
 50. Brick 32 of the self-hosting arc: USE RETURN TYPES IN THE TYPE CHECKER. Brick 31
     parsed and stored a rule's declared return type; this brick consumes it. The whole
@@ -1123,3 +1127,25 @@ there (out of the arithmetic evaluator's scope).
     unannotated => 0 (number default); 1 + t() with t():text => 1 (number + text). No new
     concepts or rules (in-place field threading); the existing non-call type checks, the QUAD
     diagnostic report, argtype, check_program and eval are all unchanged.
+
+51. Brick 33 of the self-hosting arc: CHECK A RULE'S DECLARED RETURN TYPE AGAINST ITS
+    BODY. Brick 32 made a call's RESULT type correct but deliberately did NOT flag a rule
+    whose declared return type disagrees with its body. This brick adds that check. The
+    blocker was that brick 31 stored both "no annotation" and explicit ": number" as 0 —
+    indistinguishable, so a check would wrongly flag an unannotated rule whose body is
+    bool/text (breaking bricks 29/30). Fix: introduce a sentinel — the parser default for
+    no annotation becomes 9 ("unannotated"), distinct from explicit ": number" (0). Then
+    (a) typing a CALL maps 9 -> number so calls to unannotated rules still type as number
+    (preserving brick 32) — done in a new rule call_result_type (input: new concept
+    CallRetState) which type_of_env's AstCall arm now delegates to; (b) the return-vs-body
+    check fires ONLY when the declared return is explicit (!= 9). In tcheck_rule, after
+    typing the result, read the raw declared return (ret = rd_return_type) and add +1 iff
+    ret != 9 AND the body is well-typed (result_ty != 3, to avoid double-counting an
+    already-ERROR body) AND ret != result_ty. rule_return_type now returns 9 for an
+    unannotated rule (was 0). New concept: CallRetState; new rule: call_result_type.
+    Money shots: rule b() : bool ... out = 1 < 2 => 0 (matches); rule b() : number ...
+    out = 1 < 2 => 1 (declares number, body bool); rule t() : text ... out = 5 => 1;
+    rule g() : number ... out = 5 => 0; UNANNOTATED rule f ... out = 1 < 2 => 0 (sentinel
+    protects bricks 29/30); UNANNOTATED out = "hello" => 0; src():bool then main():bool
+    out = src() => 0 (call result typing + return check compose); same but main():number
+    => 1.
