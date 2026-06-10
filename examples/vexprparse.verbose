@@ -8899,6 +8899,275 @@ rule print_source
       bound : 256
 
 
+-- ============================================================================
+-- BRICK 35 — PRINT A WHOLE PROGRAM (the full-file emitter half). Brick 34
+-- printed one EXPRESSION; this brick prints every layer above it: rule headers
+-- (name, typed parameter list, return-type annotation), the `logic:` line, the
+-- `let` bindings, and the `out =` result line — with the 2-space / 4-space
+-- indentation re-synthesized as text LITERALS ("  logic:\n", "    let ",
+-- "    out = "). The target property is the FULL-FILE round-trip: the printed
+-- program REPARSES to the same analyses (check_program, count_rules) and the
+-- same evaluation (eval_main) as the original source.
+--
+-- NORMALIZATIONS (deliberate, all semantics-preserving — the printed form is
+-- the parse's canonical spelling, not the original bytes):
+--   * Untyped params print with an explicit type: brick 20 stores an untyped
+--     parameter as ty=0, indistinguishable from an explicit `: number`, so the
+--     printer always prints `name : <type>` — `rule f(n)` prints as
+--     `rule f(n : number)`. Semantically identical (untyped defaults to
+--     number), so every analysis and evaluation round-trips.
+--   * Return type: the brick-33 sentinel 9 (UNANNOTATED) prints NOTHING;
+--     0/1/2 print ` : number` / ` : bool` / ` : text`.
+--   * PNil prints NO parens: `rule f()` normalizes to `rule f` (the parser
+--     stores both as PNil, so the distinction is already gone at parse time).
+--   * Expressions print fully parenthesized (brick 34's printer, reused).
+--   * A bare final expression prints in the `out = ` form (the parser already
+--     normalizes: block_result is the result expression either way).
+--   * Indentation is re-synthesized: `logic:` at 2 spaces, statements at 4.
+-- IDEMPOTENCE follows: print(parse(print(parse(s)))) == print(parse(s)),
+-- because the printed form is already in canonical spelling.
+--
+-- Streaming posture: this grows the brick-34 text member set (print_expr /
+-- print_args / print_args_rest / op_text) by six more members. Every text-SCC
+-- call sits in a tail concat position; the lets in print_rule and the driver
+-- build number/group values only (accessor calls — rd_*, block_*,
+-- begin_tokenize, parse_program — none of which are text members), as the
+-- streaming v1 grammar requires. ty_text / ret_text are non-recursive leaf
+-- helpers like op_text; print_binds / print_params_rest / print_program are
+-- cons-walk recursions like print_args_rest; print_rule / print_params are
+-- non-recursive composers. Termination: bound-only + the accepted native
+-- recursion breadcrumb (the list is a FIELD of the packed input, so
+-- `structural` does not fit — print_expr's posture).
+-- ============================================================================
+
+concept TySpell
+  @intention: "A declared type code, to be spelled as surface text"
+  @source: vexprparse.intent:53
+  fields:
+    ty : number [0, 16]
+
+
+concept PrintParamsState
+  @intention: "A parameter list to print plus the source text its spans index into"
+  @source: vexprparse.intent:53
+  fields:
+    params : ParamList
+    src : text [..256]
+
+
+concept PrintBindsState
+  @intention: "A let-binding list to print plus the source text its spans index into"
+  @source: vexprparse.intent:53
+  fields:
+    binds : Binding
+    src : text [..256]
+
+
+concept PrintRuleState
+  @intention: "A rule declaration to print plus the source text its spans index into"
+  @source: vexprparse.intent:53
+  fields:
+    rd : RuleDecl
+    src : text [..256]
+
+
+concept PrintProgState
+  @intention: "A rule list to print plus the source text its spans index into"
+  @source: vexprparse.intent:53
+  fields:
+    rules : RuleList
+    src : text [..256]
+
+
+-- ty_text: spell a type code as its surface text — the sibling of op_text
+-- (flat if/else over the brick-19 code map: 0=number, 1=bool, 2=text).
+-- Unknown code spells "?" (unreachable for parser-built params).
+rule ty_text
+  @intention: "Spell a declared type code as its surface text"
+  @source: vexprparse.intent:53
+  input:
+    t : TySpell
+  output:
+    out : text
+  logic:
+    out = if t.ty == 0 then "number" else if t.ty == 1 then "bool" else if t.ty == 2 then "text" else "?"
+  proofs:
+    purity:
+      reads : [t.ty]
+      calls : []
+    termination:
+      bound : 64
+
+
+-- ret_text: the return-type annotation, or nothing. The brick-33 sentinel 9
+-- (UNANNOTATED) contributes the empty text; an explicit code prints
+-- " : <type>". The ty_text call inside concat is a tail text position —
+-- legal under the streaming v1 grammar, like op_text in print_expr's AstBin.
+rule ret_text
+  @intention: "Spell a rule's return-type annotation, empty for the unannotated sentinel"
+  @source: vexprparse.intent:53
+  input:
+    t : TySpell
+  output:
+    out : text
+  logic:
+    out = if t.ty == 9 then "" else concat(" : ", ty_text(TySpell { ty: t.ty }))
+  proofs:
+    purity:
+      reads : [t.ty]
+      calls : [ty_text]
+    termination:
+      bound : 64
+
+
+-- print_params: the full parameter list including parens. PNil prints NOTHING
+-- (no parens — `rule f()` normalizes to `rule f`); PCons opens the paren,
+-- prints the first param as `name : <type>` (ALWAYS typed — brick 20 stores
+-- untyped params as ty=0, indistinguishable from explicit `: number`), then
+-- hands the rest to print_params_rest, then closes. Same bare-first /
+-- comma-rest split as print_args / print_args_rest.
+rule print_params
+  @intention: "Print a rule's parameter list with parens, each parameter explicitly typed"
+  @source: vexprparse.intent:53
+  input:
+    pp : PrintParamsState
+  output:
+    out : text
+  logic:
+    out = match pp.params:
+      PCons(name_start, name_len, ty, rest) => concat("(", substring(pp.src, name_start, name_start + name_len), " : ", ty_text(TySpell { ty: ty }), print_params_rest(PrintParamsState { params: rest, src: pp.src }), ")")
+      PNil => ""
+  proofs:
+    purity:
+      reads : [pp.params, pp.src]
+      calls : [ty_text, print_params_rest]
+    termination:
+      bound : 4000
+
+
+rule print_params_rest
+  @intention: "Print the remaining parameters, each prefixed with a comma-space and explicitly typed"
+  @source: vexprparse.intent:53
+  input:
+    pp : PrintParamsState
+  output:
+    out : text
+  logic:
+    out = match pp.params:
+      PCons(name_start, name_len, ty, rest) => concat(", ", substring(pp.src, name_start, name_start + name_len), " : ", ty_text(TySpell { ty: ty }), print_params_rest(PrintParamsState { params: rest, src: pp.src }))
+      PNil => ""
+  proofs:
+    purity:
+      reads : [pp.params, pp.src]
+      calls : [ty_text, print_params_rest]
+    termination:
+      bound : 4000
+
+
+-- print_binds: one `    let name = expr` line per binding, each terminated by
+-- a newline, indentation re-synthesized as the 4-space literal prefix. The
+-- value expression goes through brick 34's print_expr (fully parenthesized).
+rule print_binds
+  @intention: "Print a rule's let bindings, one 4-space-indented line per binding"
+  @source: vexprparse.intent:53
+  input:
+    pb : PrintBindsState
+  output:
+    out : text
+  logic:
+    out = match pb.binds:
+      BCons(name_start, name_len, value, rest) => concat("    let ", substring(pb.src, name_start, name_start + name_len), " = ", print_expr(PrintState { node: value, src: pb.src }), "\n", print_binds(PrintBindsState { binds: rest, src: pb.src }))
+      BNil => ""
+  proofs:
+    purity:
+      reads : [pb.binds, pb.src]
+      calls : [print_expr, print_binds]
+    termination:
+      bound : 4000
+
+
+-- print_rule: one whole rule declaration — header line (`rule NAME(params)`
+-- plus the optional return annotation), the `  logic:` line, the let lines,
+-- and the `    out = expr` line, each layer delegated to its printer. The
+-- lets build number/group values only (rd_* / block_* accessors — none are
+-- text members), so the streaming v1 let constraint holds; the single big
+-- concat in the body tail carries every text-SCC call in a direct-element
+-- position. A bare final expression prints in the `out = ` form (the parser
+-- already normalized it into block_result).
+rule print_rule
+  @intention: "Print one rule declaration: typed header, logic line, let lines, out line"
+  @source: vexprparse.intent:53
+  input:
+    pr : PrintRuleState
+  output:
+    out : text
+  logic:
+    let ns = rd_name_start(pr.rd)
+    let nl = rd_name_len(pr.rd)
+    let blk = rd_body(pr.rd)
+    let binds = block_binds(blk)
+    let result = block_result(blk)
+    out = concat("rule ", substring(pr.src, ns, ns + nl), print_params(PrintParamsState { params: rd_params(pr.rd), src: pr.src }), ret_text(TySpell { ty: rd_return_type(pr.rd) }), "\n  logic:\n", print_binds(PrintBindsState { binds: binds, src: pr.src }), "    out = ", print_expr(PrintState { node: result, src: pr.src }), "\n")
+  proofs:
+    purity:
+      reads : [pr.rd, pr.src]
+      calls : [rd_name_start, rd_name_len, rd_body, block_binds, block_result, rd_params, rd_return_type, print_params, ret_text, print_binds, print_expr]
+    termination:
+      bound : 4000
+
+
+-- print_program: the whole RuleList, one printed rule after another in source
+-- order (each print_rule output already ends with its own newline, so rules
+-- abut directly — exactly the shape parse_program accepts back). RNil is the
+-- empty program: empty text.
+rule print_program
+  @intention: "Print a parsed program: every rule declaration in source order"
+  @source: vexprparse.intent:53
+  input:
+    pg : PrintProgState
+  output:
+    out : text
+  logic:
+    out = match pg.rules:
+      RCons(head, tail) => concat(print_rule(PrintRuleState { rd: head, src: pg.src }), print_program(PrintProgState { rules: tail, src: pg.src }))
+      RNil => ""
+  proofs:
+    purity:
+      reads : [pg.rules, pg.src]
+      calls : [print_rule, print_program]
+    termination:
+      bound : 4000
+
+
+-- print_program_src: the brick-35 driver. Same front end as check_program /
+-- count_rules / eval_main (begin_tokenize — a PROGRAM is multi-line, so the
+-- printer must see the same INDENT/DEDENT stream parse_program consumes),
+-- then hand the parsed RuleList + the source to the program printer. The lets
+-- build group values only; the single text-producing call sits in the body
+-- tail, as the streaming v1 grammar requires. Round-trip property (validated
+-- externally, two binary invocations): for every program source s,
+--   eval_main(print_program_src(s))     == eval_main(s)
+--   check_program(print_program_src(s)) == check_program(s)
+--   count_rules(print_program_src(s))   == count_rules(s)
+rule print_program_src
+  @intention: "Tokenize, parse a whole program, and print it back as canonical source"
+  @source: vexprparse.intent:53
+  input:
+    s : ScanState
+  output:
+    out : text
+  logic:
+    let toks = begin_tokenize(ScanState { source: s.source, pos: 0 })
+    let prog = parse_program(ProgramState { toks: toks, src: s.source, pos: 0 })
+    out = print_program(PrintProgState { rules: prog, src: s.source })
+  proofs:
+    purity:
+      reads : [s.source]
+      calls : [begin_tokenize, parse_program, print_program]
+    termination:
+      bound : 256
+
+
 -- Entry driver: tokenize the source (from argv) and count the cons cells. The
 -- money-shot observable for brick 8a: count_cells_src("1 + 2\n3 * 4") = 8
 -- (tokens 1 + 2 Newline 3 * 4 then trailing Eof). Newline-bearing sources are

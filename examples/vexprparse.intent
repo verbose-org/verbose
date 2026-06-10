@@ -1175,3 +1175,30 @@ there (out of the arithmetic evaluator's scope).
     and shape(print_source(s)) == shape(s) (20 / 10100 / 100010 for "1 + 2 * 3", "f(1, x)",
     "if 1 < 2 then 3 else 4"). New concepts: PrintState, PrintArgsState, OpSpell; new rules:
     op_text, print_expr, print_args, print_args_rest, print_source.
+
+53. Brick 35 of the self-hosting arc: PRINT A WHOLE PROGRAM — the full-file emitter half.
+    Brick 34 printed one expression; this brick prints every layer above it: rule headers
+    (name span, typed parameter list, return-type annotation), the `logic:` line, the let
+    bindings, and the `out =` result line, with the 2-space / 4-space indentation
+    re-synthesized as text literals. Target property: the FULL-FILE round-trip — the printed
+    program REPARSES to the same analyses and the same evaluation as the original source:
+    eval_main(print_program_src(s)) == eval_main(s), check_program(...) == check_program(s),
+    count_rules(...) == count_rules(s). NORMALIZATIONS (deliberate, semantics-preserving —
+    the printed form is the parse's canonical spelling): (a) untyped params print with an
+    explicit type — brick 20 stores an untyped parameter as ty=0, indistinguishable from an
+    explicit `: number`, so the printer always prints `name : <type>` and `rule f(n)` prints
+    as `rule f(n : number)` (untyped defaults to number, so every analysis and evaluation
+    round-trips); (b) return type: the brick-33 sentinel 9 (UNANNOTATED) prints NOTHING,
+    0/1/2 print ` : number` / ` : bool` / ` : text`; (c) PNil prints NO parens — `rule f()`
+    normalizes to `rule f` (the parser stores both as PNil); (d) expressions print fully
+    parenthesized (brick 34's printer reused); (e) a bare final expression prints in the
+    `out = ` form (block_result is the result either way); (f) indentation re-synthesized at
+    logic:=2 / statements=4 spaces. IDEMPOTENCE follows: print(parse(print(parse(s)))) ==
+    print(parse(s)). Driver print_program_src = the check_program/count_rules/eval_main front
+    end (begin_tokenize — a program needs the INDENT/DEDENT stream) with the program printer
+    as body tail. Six new text members join brick 34's streaming set (ty_text, ret_text,
+    print_params, print_params_rest, print_binds, print_rule, print_program — all text-SCC
+    calls in tail concat positions; print_rule's and the driver's lets build number/group
+    values only). New concepts: TySpell, PrintParamsState, PrintBindsState, PrintRuleState,
+    PrintProgState; new rules: ty_text, ret_text, print_params, print_params_rest,
+    print_binds, print_rule, print_program, print_program_src. max_nodes unchanged.
