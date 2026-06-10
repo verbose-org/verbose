@@ -8703,6 +8703,202 @@ rule undef_span_char
       bound : 256
 
 
+-- ============================================================================
+-- BRICK 34 — THE PRETTY-PRINTER (the FIRST EMITTER over the real vexpr AST).
+--
+-- Every brick so far CONSUMED the AST (eval, shape, lint, type check); this one
+-- EMITS it back as source text. print_expr walks an Ast and reconstructs a
+-- fully-parenthesized rendering — parens are emitted around EVERY AstBin /
+-- AstNeg / AstNot / AstIf node, so the parse's precedence and associativity
+-- decisions become VISIBLE bytes ("1 + 2 * 3" prints as "(1 + (2 * 3))",
+-- "10 - 2 - 3" as "((10 - 2) - 3)"). No precedence-aware minimal-paren logic
+-- in v1: the printer's job is to make structure explicit, not pretty-minimal.
+--
+-- This is the first consumer of the native STREAMING text lowering (the
+-- emitter slice, 2026-06-10): print_expr's body is the exact shape that slice
+-- exists for — concat(print_expr(lhs), ..., print_expr(rhs)) inside a
+-- MatchVariant arm. Natively, NO string is ever materialized: each leaf's
+-- bytes are written to stdout in order during the tree walk. The interpreter
+-- materializes the same bytes; both agree.
+--
+-- Span-printing: AstVar / AstField / AstCall names and AstStr literals live as
+-- (start, len) SPANS into the original source, so the printer carries the
+-- source text alongside the node — PrintState{node, src} — and prints a name
+-- via substring(src, start, start + len), an allocation-free pointer slice.
+-- AstStr spans INCLUDE both quotes (the Str token records start = opening
+-- quote, len = total bytes including both quotes — see the Token declaration),
+-- so substring reproduces the literal's source bytes verbatim, quotes and all.
+--
+-- Operator spelling is factored into op_text (a flat if/else over the AST
+-- op-code map at the top of this file) rather than inlined 13 ways in the
+-- AstBin arm: a non-recursive text helper called in a tail concat position is
+-- legal under the streaming v1 grammar (it joins the callable set as a text
+-- member; its bytes stream in order like any other concat arg).
+--
+-- Argument lists print without extra parens (only Bin/Neg/Not/If parenthesize):
+-- f(1, x) round-trips as "f(1, x)". The comma logic needs no lookahead:
+-- print_args prints the first argument bare, print_args_rest prefixes every
+-- later one with ", "; ArgNil contributes the empty text.
+--
+-- Termination: print_expr / print_args / print_args_rest walk a strict
+-- sub-node at every recursive call, but the node is a FIELD of the packed
+-- input (PrintState / PrintArgsState), not the input itself, so the
+-- `structural` proof does not fit — bound-only termination + the accepted
+-- native recursion breadcrumb, same posture as eval_ast_env (see the
+-- TERMINATION section at the top).
+--
+-- Round-trip property (validated externally, two binary invocations, since
+-- the streamed text never exists in memory): for every expression source s,
+--   eval_expr(print_source(s)) == eval_expr(s)   (value round-trip)
+--   shape(print_source(s))     == shape(s)       (structure round-trip)
+-- ============================================================================
+
+concept PrintState
+  @intention: "An AST node to print plus the source text its spans index into"
+  @source: vexprparse.intent:52
+  fields:
+    node : Ast
+    src : text [..256]
+
+
+concept PrintArgsState
+  @intention: "A call-argument list to print plus the source text its spans index into"
+  @source: vexprparse.intent:52
+  fields:
+    args : ArgList
+    src : text [..256]
+
+
+concept OpSpell
+  @intention: "An AST binary-operator code, to be spelled as surface text"
+  @source: vexprparse.intent:52
+  fields:
+    op : number [0, 64]
+
+
+-- op_text: spell an AST op-code as its surface text, padded with one space on
+-- each side (the file's op-code map: arithmetic 13..17, comparison
+-- 1/4/5/6/19/20, logical 30/31). Flat if/else over the 13 codes — the same
+-- dispatch idiom as eval_ast's AstBin arm, but each leaf is a text literal
+-- instead of an arithmetic expression. Unknown code spells "?" (AstErr-style),
+-- unreachable for parser-built nodes.
+rule op_text
+  @intention: "Spell an AST binary-operator code as its space-padded surface text"
+  @source: vexprparse.intent:52
+  input:
+    o : OpSpell
+  output:
+    out : text
+  logic:
+    out = if o.op == 13 then " + " else if o.op == 14 then " - " else if o.op == 15 then " * " else if o.op == 16 then " / " else if o.op == 17 then " % " else if o.op == 1 then " == " else if o.op == 6 then " != " else if o.op == 19 then " < " else if o.op == 20 then " > " else if o.op == 5 then " <= " else if o.op == 4 then " >= " else if o.op == 30 then " and " else if o.op == 31 then " or " else "?"
+  proofs:
+    purity:
+      reads : [o.op]
+      calls : []
+    termination:
+      bound : 64
+
+
+-- print_expr: the emitter. One arm per Ast variant; recursive arms re-wrap the
+-- sub-node in a fresh PrintState threading the SAME src down (the eval_ast_env
+-- pattern). Number leaves itoa via concat(value); bool leaves spell true/false;
+-- span-carrying leaves slice the source; structural nodes parenthesize.
+rule print_expr
+  @intention: "Reconstruct an AST's source text, fully parenthesized, by recursing on the tree"
+  @source: vexprparse.intent:52
+  input:
+    ps : PrintState
+  output:
+    out : text
+  logic:
+    out = match ps.node:
+      AstNum(value) => concat(value)
+      AstBool(value) => if value == 1 then "true" else "false"
+      AstVar(start, len) => substring(ps.src, start, start + len)
+      AstStr(start, len) => substring(ps.src, start, start + len)
+      AstBin(op, lhs, rhs) => concat("(", print_expr(PrintState { node: lhs, src: ps.src }), op_text(OpSpell { op: op }), print_expr(PrintState { node: rhs, src: ps.src }), ")")
+      AstNeg(inner) => concat("(-", print_expr(PrintState { node: inner, src: ps.src }), ")")
+      AstNot(inner) => concat("(not ", print_expr(PrintState { node: inner, src: ps.src }), ")")
+      AstField(base, fstart, flen) => concat(print_expr(PrintState { node: base, src: ps.src }), ".", substring(ps.src, fstart, fstart + flen))
+      AstCall(callee_start, callee_len, args) => concat(substring(ps.src, callee_start, callee_start + callee_len), "(", print_args(PrintArgsState { args: args, src: ps.src }), ")")
+      AstIf(cond, thn, els) => concat("(if ", print_expr(PrintState { node: cond, src: ps.src }), " then ", print_expr(PrintState { node: thn, src: ps.src }), " else ", print_expr(PrintState { node: els, src: ps.src }), ")")
+      AstErr => "?"
+  proofs:
+    purity:
+      reads : [ps.node, ps.src]
+      calls : [print_expr, print_args, op_text]
+    termination:
+      bound : 4000
+
+
+-- print_args: comma-separated argument list, no surrounding parens (the
+-- AstCall arm supplies those). First argument prints bare; the rest go
+-- through print_args_rest which prefixes each with ", ". ArgNil is the
+-- empty text — f() prints as "f()".
+rule print_args
+  @intention: "Print a call-argument list, comma-separated, first argument bare"
+  @source: vexprparse.intent:52
+  input:
+    pa : PrintArgsState
+  output:
+    out : text
+  logic:
+    out = match pa.args:
+      ArgCons(head, tail) => concat(print_expr(PrintState { node: head, src: pa.src }), print_args_rest(PrintArgsState { args: tail, src: pa.src }))
+      ArgNil => ""
+  proofs:
+    purity:
+      reads : [pa.args, pa.src]
+      calls : [print_expr, print_args_rest]
+    termination:
+      bound : 4000
+
+
+rule print_args_rest
+  @intention: "Print the remaining call arguments, each prefixed with a comma-space"
+  @source: vexprparse.intent:52
+  input:
+    pa : PrintArgsState
+  output:
+    out : text
+  logic:
+    out = match pa.args:
+      ArgCons(head, tail) => concat(", ", print_expr(PrintState { node: head, src: pa.src }), print_args_rest(PrintArgsState { args: tail, src: pa.src }))
+      ArgNil => ""
+  proofs:
+    purity:
+      reads : [pa.args, pa.src]
+      calls : [print_expr, print_args_rest]
+    termination:
+      bound : 4000
+
+
+-- print_source: the brick-34 driver. Same front end as eval_expr / shape
+-- (tokenize, NOT begin_tokenize — an expression is single-line, and sharing
+-- the flat tokenizer makes the round-trip checks compare like with like),
+-- then hand the root node + the source to the printer. The lets build
+-- group/number values only; the single text-producing call sits in the body
+-- tail, as the streaming v1 grammar requires.
+rule print_source
+  @intention: "Tokenize, parse with precedence, and print the AST back as fully-parenthesized source"
+  @source: vexprparse.intent:52
+  input:
+    s : ScanState
+  output:
+    out : text
+  logic:
+    let toks = tokenize(ScanState { source: s.source, pos: 0 })
+    let parsed = parse_or(ParseState { toks: toks, pos: 0 })
+    let root = parsed_node(parsed)
+    out = print_expr(PrintState { node: root, src: s.source })
+  proofs:
+    purity:
+      reads : [s.source]
+      calls : [tokenize, parse_or, parsed_node, print_expr]
+    termination:
+      bound : 256
+
+
 -- Entry driver: tokenize the source (from argv) and count the cons cells. The
 -- money-shot observable for brick 8a: count_cells_src("1 + 2\n3 * 4") = 8
 -- (tokens 1 + 2 Newline 3 * 4 then trailing Eof). Newline-bearing sources are

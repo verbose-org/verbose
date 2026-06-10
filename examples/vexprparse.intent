@@ -1149,3 +1149,29 @@ there (out of the arithmetic evaluator's scope).
     protects bricks 29/30); UNANNOTATED out = "hello" => 0; src():bool then main():bool
     out = src() => 0 (call result typing + return check compose); same but main():number
     => 1.
+
+52. Brick 34 of the self-hosting arc: THE PRETTY-PRINTER — the FIRST EMITTER over the real
+    vexpr AST. Every prior brick CONSUMED the AST (eval, shape, lint, type check); this one
+    EMITS it back as source text. print_expr(PrintState{node: Ast, src: text}) walks the tree
+    and reconstructs a FULLY-PARENTHESIZED rendering: parens around every AstBin / AstNeg /
+    AstNot / AstIf node make the parse's precedence and associativity decisions visible bytes
+    ("1 + 2 * 3" prints as "(1 + (2 * 3))", "10 - 2 - 3" as "((10 - 2) - 3)"); no minimal-paren
+    logic in v1. Span-carrying leaves (AstVar, AstField's field, AstCall's callee, AstStr)
+    print their own source bytes via substring(src, start, start + len) — allocation-free
+    pointer slices; AstStr spans include both quotes so string literals reproduce verbatim.
+    Number leaves itoa via concat(value); AstBool spells true/false. Operator spelling is
+    factored into op_text(OpSpell{op}) — a flat if/else over the 13-code op map, a
+    non-recursive text helper legal as a tail concat arg under the streaming v1 grammar.
+    Argument lists print without extra parens (print_args bare-first + print_args_rest
+    comma-prefixing the rest; ArgNil contributes the empty text — f(1, x) round-trips as
+    "f(1, x)", f() as "f()"). Driver print_source = the eval_expr/shape front end (tokenize,
+    parse_or from 0, parsed_node) with the printer as body tail. This is the FIRST consumer
+    of the native streaming text lowering beyond its acceptance example: natively no string is
+    ever materialized — each leaf's bytes stream to stdout in tree-walk order. Termination:
+    bound-only + accepted native recursion breadcrumb (node is a FIELD of the packed input,
+    so `structural` does not fit — eval_ast_env's posture). Round-trip property, validated
+    EXTERNALLY across two binary invocations (the streamed text never exists in memory):
+    eval_expr(print_source(s)) == eval_expr(s) (7/5/1 for precedence, left-assoc, comparison)
+    and shape(print_source(s)) == shape(s) (20 / 10100 / 100010 for "1 + 2 * 3", "f(1, x)",
+    "if 1 < 2 then 3 else 4"). New concepts: PrintState, PrintArgsState, OpSpell; new rules:
+    op_text, print_expr, print_args, print_args_rest, print_source.
