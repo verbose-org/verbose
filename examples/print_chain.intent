@@ -1,0 +1,5 @@
+1. An expression is either an integer literal or the sum of two sub-expressions.
+2. A seed holds a non-negative integer between 0 and 20.
+3. To build a chain expression from a seed: when the seed integer is 0 the chain is the integer literal 0; otherwise the chain is the sum of the integer literal of the seed integer and the chain built from one less.
+4. To print an expression: if it is an integer literal the text is its decimal digits; if it is a sum the text is the printed left sub-expression, then a plus sign, then the printed right sub-expression.
+5. To show the chain for a seed: build the chain from the seed and print it.

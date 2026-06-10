@@ -540,6 +540,18 @@ examples/
                    "hello world"/0 → 2, "42 abc"/0 → 3, "a b c"/0 → 3.
                    First Verbose binary that loops through a complete
                    text input scanning multiple tokens.
+  print_chain.*    FIRST EMITTER (streaming text, 2026-06-10): a recursive
+                   text-returning rule whose body builds FRESH text —
+                   `print_expr(e) = match e: Int(v) => concat(v) ;
+                   Add(l, r) => concat(print_expr(l), "+", print_expr(r))`
+                   — compiles natively via the STREAMING lowering: bytes
+                   are written to stdout in order during the tree walk,
+                   no string materialized, no arena, no dangling pointer.
+                   `show(s) = print_expr(build_chain(s))` builds the
+                   sum_chain AST then prints it: seed 3 → "3+2+1+0".
+                   1088 B native binary, byte-identical to --run. The
+                   design arc (arena proposal → adversarial review →
+                   streaming probe) is docs/emitter-streaming-design.md.
 
   ── TLS 1.3 crypto arc (symmetric + KDF half of TLS_AES_128_GCM_SHA256) ──
   Each brick is a standalone native binary, validated byte-for-byte against
@@ -755,6 +767,7 @@ Tracking what native emits today, what it still rejects, and the design rules th
 | text input | **Text input fields in recursive callables** (PR #52). Lifts the Number-only constraint. Text fields flow through the multi-field pointer-in-rdi ABI as `(ptr, len)` pairs: 16 B per text field in the struct, 2 rbp slots in the callee's frame, registered in `callable_text_bindings`. `SelfCallCtx` grows `struct_layouts` for type-aware marshalling. | ~920 B | `scan_word.verbose::word_length` (921 B) |
 | let in callable | **Let bindings in recursive callables** (PR #54). Number lets fully supported; text lets allowed for allocation-free shapes. Frame layout extended with let slots between input fields and binder slots. Caveat: lets are evaluated eagerly (before the body), so they must not depend on the recursion guard. | ~1.3–1.7 KB | `first_word.verbose::first_word_len` (1293 B), `count_tokens.verbose::count_tokens` (1691 B) |
 | callable routing | **Transitive callable extension unconditional** (PR #56). Non-recursive callees with let bindings are now emitted as callables instead of inlined (the inline path ignores callee let bindings). Entry rule's let bindings stripped from _start prologue (the callable handles its own). Constraint walk's same-input/output check scoped to the entry's SCC, not transitive callees. | n/a | `token_scan.verbose::classify` (2260 B, 4 callables) |
+| streaming emit | **Streaming lowering for recursive text-returning rules** (2026-06-10) — the FIRST EMITTER slice of the self-hosting arc. When the entry rule's output is text, the rule is recursive, and a body uses text shapes beyond slice 5.2's literal-leaf grammar (concat of fresh text, MatchVariant), native lowers the whole SCC to WRITER mode: each callable writes its bytes to fd 1 in order during the walk (literal → guarded write; text field/BoundText/substring → slot load + write; number expr → itoa, no newline; concat → per-arg in order, no buffer, no sizing pass; if/match → branch + stream arms; tail call to a text SCC member → `call`, callee streams). `_start` writes only the trailing newline. EVERY streamed write is wrapped `push r11 … pop r11` (20 B, size-stable) because syscalls clobber r11 = the arena base that in-callable code TRUSTS (the node arena's unspoken no-syscall precondition — first consumer to break it). Mode is a whole-SCC ABI property decided once in compile_native_code; bodies passing the old literal-leaf grammar keep the materializing path, so all existing examples compile BYTE-IDENTICALLY (10-binary SHA-256 gate at b214fb1). v1 restrictions: text-SCC calls in tail text positions only (refused in conds/scrutinees/value positions with a streaming breadcrumb); lets keep callable rules + no text-SCC references. Verifier untouched. Documented divergence: on mid-tree abort the binary has already written a stdout prefix (interpreter: nothing); exit codes agree. Design arc: docs/emitter-streaming-design.md. | ~1.1 KB | `print_chain.verbose::show` (1088 B; seed 3 → `3+2+1+0`, == --run) |
 
 *Locked designs for each phase (3, 4, 5b, 2F, 2G, 2H-b) are in [docs/native-designs.md](docs/native-designs.md). They're frozen after implementation — consult them for rationale, not for the current state.*
 

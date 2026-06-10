@@ -492,6 +492,40 @@ fn compile_native_code(
         // post-emit pipeline (stdin/stream prepend, etc.) still runs.
     }
 
+    // Streaming text emit (self-hosting emitter slice, 2026-06-10).
+    //
+    // A text-returning recursive callable could historically return ONLY
+    // static bytes (literal leaves — slice 5.2): a `concat(...)` built in
+    // a recursive frame dies at `ret` (the buffer lives below that frame's
+    // rsp), so the pretty-printer shape
+    //   emit(node) = concat(emit(lhs), "+", emit(rhs))
+    // was refused at emit_recursive_text_body's catch-all. Instead of
+    // materializing the string (arena design, rejected for the first
+    // slice — see docs/emitter-text-arena-design-DRAFT.md §6b–6d), we
+    // LOWER the whole text SCC to a streaming walk: each leaf's bytes
+    // are written to fd 1 in order during the recursion, and the
+    // returned (rax, rdx) pair is ignored. No buffer, no arena, no
+    // r11-lifetime hazard beyond the per-write push/pop guard.
+    //
+    // The mode is a whole-SCC ABI property, decided ONCE here:
+    //   - entry output must be Text;
+    //   - at least one text-output SCC member's body uses a shape
+    //     beyond today's literal-leaf grammar (Concat / MatchVariant
+    //     in text position) — bodies that pass the old grammar keep
+    //     the materializing path BYTE-FOR-BYTE (recursive_label etc.);
+    //   - every SCC member passes the purely syntactic v1 shape check
+    //     (text-SCC calls in tail text positions only; no text-SCC
+    //     references from lets, if-conditions, scrutinees, or value
+    //     positions; non-text members never call text members).
+    // No guessing: the check is a syntactic walk, and the optimizer
+    // (which runs before native) can only collapse all-literal concats
+    // — it cannot reorder a tree out of shape.
+    let streaming_text = if needs_callable_path && matches!(rule.output_ty, Type::Text) {
+        decide_streaming_text_mode(&scc_rules_owned)?
+    } else {
+        false
+    };
+
     // Look up the context concept (if multi-input rule).
     let context_concept: Option<&Concept> = match &rule.context_ty {
         Some(Type::Named(n)) => Some(
@@ -559,7 +593,7 @@ fn compile_native_code(
         // Slice 5.1a-5.4: emit the rule (or SCC) as real callables.
         // scc_rules_owned was populated above when recursion was detected;
         // for single self-recursion it has one entry, for mutual it has N.
-        emit_self_recursive_program(rule, &scc_rules_owned, concept, &rules, &resources, &connections, concept_group, &concepts)?
+        emit_self_recursive_program(rule, &scc_rules_owned, concept, &rules, &resources, &connections, concept_group, &concepts, streaming_text)?
     } else if let Some(rx) = reaction {
         emit_reaction_program(rx, rule, concept, &rules, &resources, &connections, concept_group)?
     } else if is_result_output {
@@ -1563,6 +1597,175 @@ fn reaches_target(
         }
     }
     false
+}
+
+/// Streaming text emit — does this text-output body use a shape BEYOND
+/// today's literal-leaf grammar (emit_recursive_text_body: literal,
+/// self-call, if/else, BoundText Ident, Field, substring)? `Concat` and
+/// `MatchVariant` in text position are the two shapes that die at the
+/// legacy catch-all; their presence is what flips the SCC to streaming.
+/// Anything ELSE the legacy path refuses (Read, Fetch, ...) keeps
+/// refusing exactly as before — streaming only triggers on the two
+/// shapes this slice lowers. The walk follows text positions only:
+/// if/else arms and a substring's inner text. (An if-condition or a
+/// substring bound is a number position; concat is illegal there and
+/// the verifier already rejected it.)
+fn text_body_beyond_legacy_grammar(e: &Expr) -> bool {
+    match e {
+        Expr::Concat(_) | Expr::MatchVariant(_, _) => true,
+        Expr::If(_, t, el) => {
+            text_body_beyond_legacy_grammar(t) || text_body_beyond_legacy_grammar(el)
+        }
+        Expr::Substring(inner, _, _) => text_body_beyond_legacy_grammar(inner),
+        _ => false,
+    }
+}
+
+/// Streaming text emit — true iff `e` contains, ANYWHERE in its tree, a
+/// call to a text-returning SCC member. Used to refuse text-SCC calls in
+/// value positions (if-conditions, scrutinees, call arguments, number
+/// expressions, let RHSes): a streaming callee WRITES its bytes to fd 1
+/// during the walk, so its "return value" is meaningless — consuming it
+/// as a value would both emit bytes out of order and compute garbage.
+fn expr_references_text_scc(e: &Expr, text_scc: &HashSet<&str>) -> bool {
+    let mut callees: Vec<String> = Vec::new();
+    collect_native_callees(e, &mut callees);
+    callees.iter().any(|n| text_scc.contains(n.as_str()))
+}
+
+/// Streaming text emit — the v1 shape check for one text-output SCC
+/// member's body. Purely syntactic (compiler axiom: no guessing). A
+/// call to a text-returning SCC member is legal ONLY as a direct
+/// element of the tail-text chain: the body itself, a concat arg, an
+/// if arm, a match arm. Everything else (if-conditions, scrutinees,
+/// the call's own arguments, and any value-position expression like
+/// length(...) / parse_int(...) / arithmetic) must be free of text-SCC
+/// references — checked via the catch-all scan at the bottom.
+fn check_streaming_text_shape(
+    rule_name: &str,
+    e: &Expr,
+    text_scc: &HashSet<&str>,
+) -> Result<(), NativeError> {
+    match e {
+        Expr::Text(_) => Ok(()),
+        // Concat args are each a tail text position themselves: the
+        // streaming emitter writes them left to right, so a text-SCC
+        // call as a direct arg streams its bytes exactly in order.
+        Expr::Concat(args) => {
+            for a in args {
+                check_streaming_text_shape(rule_name, a, text_scc)?;
+            }
+            Ok(())
+        }
+        Expr::If(cond, then_e, else_e) => {
+            if expr_references_text_scc(cond, text_scc) {
+                return Err(NativeError {
+                    message: format!(
+                        "streaming text emit: rule '{}' calls a text-returning recursive rule inside an if CONDITION; a text-SCC call may only appear in a tail text position (body / concat arg / if arm / match arm) because its bytes stream to stdout during the walk.",
+                        rule_name
+                    ),
+                });
+            }
+            check_streaming_text_shape(rule_name, then_e, text_scc)?;
+            check_streaming_text_shape(rule_name, else_e, text_scc)
+        }
+        Expr::MatchVariant(scrutinee, arms) => {
+            if expr_references_text_scc(scrutinee, text_scc) {
+                return Err(NativeError {
+                    message: format!(
+                        "streaming text emit: rule '{}' calls a text-returning recursive rule inside a match SCRUTINEE; a text-SCC call may only appear in a tail text position (body / concat arg / if arm / match arm).",
+                        rule_name
+                    ),
+                });
+            }
+            for arm in arms {
+                check_streaming_text_shape(rule_name, &arm.body, text_scc)?;
+            }
+            Ok(())
+        }
+        // A tail-position text-SCC call: legal — but its ARGUMENTS are
+        // value positions (they become the next recursion's input), so
+        // they must not themselves reference a text-SCC member.
+        Expr::Call(name, args) if text_scc.contains(name.as_str()) => {
+            for a in args {
+                if expr_references_text_scc(a, text_scc) {
+                    return Err(NativeError {
+                        message: format!(
+                            "streaming text emit: rule '{}' passes a text-returning recursive call as an ARGUMENT to '{}'; arguments are value positions — a text-SCC call may only appear in a tail text position (body / concat arg / if arm / match arm).",
+                            rule_name, name
+                        ),
+                    });
+                }
+            }
+            Ok(())
+        }
+        // Everything else — number expressions, Field/Ident/Substring
+        // leaves, non-text calls — is a value position from the
+        // streaming emitter's point of view. Any text-SCC reference
+        // buried inside (e.g. length(print_expr(x))) is out of order
+        // by construction: refuse with the slice breadcrumb.
+        other => {
+            if expr_references_text_scc(other, text_scc) {
+                return Err(NativeError {
+                    message: format!(
+                        "streaming text emit: rule '{}' uses a text-returning recursive call in a non-tail position ({:?}); a text-SCC call may only appear as a direct element of the body / concat args / if arms / match arms, because the callee streams its bytes to stdout during the walk. Workaround: restructure so the call's bytes are emitted in output order, or use --run (interpreter).",
+                        rule_name,
+                        other
+                    ),
+                });
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Streaming text emit — whole-SCC mode decision. Returns Ok(true) when
+/// the SCC must be lowered as a streaming walk, Ok(false) when every
+/// text body fits today's literal-leaf grammar (old materializing path,
+/// byte-for-byte preserved), Err when a body needs streaming but fails
+/// the v1 shape check.
+fn decide_streaming_text_mode(scc_rules: &[&Rule]) -> Result<bool, NativeError> {
+    let text_scc: HashSet<&str> = scc_rules
+        .iter()
+        .filter(|r| r.output_ty == Type::Text)
+        .map(|r| r.name.as_str())
+        .collect();
+    let beyond = scc_rules.iter().any(|r| {
+        r.output_ty == Type::Text && text_body_beyond_legacy_grammar(&r.logic.value)
+    });
+    if !beyond {
+        return Ok(false);
+    }
+    for r in scc_rules {
+        // Lets keep today's callable rules (number lets + allocation-free
+        // text lets, gated upstream); ADDITIONALLY no let RHS may reference
+        // a text-SCC member — its bytes would stream at let-eval time,
+        // BEFORE the body's earlier output (out-of-order bytes).
+        for (bname, bexpr) in &r.logic.bindings {
+            if expr_references_text_scc(bexpr, &text_scc) {
+                return Err(NativeError {
+                    message: format!(
+                        "streaming text emit: rule '{}' let '{}' references a text-returning recursive rule; let RHSes are evaluated before the body, so the callee's bytes would stream out of order. Inline the call in a tail text position instead.",
+                        r.name, bname
+                    ),
+                });
+            }
+        }
+        if r.output_ty == Type::Text {
+            check_streaming_text_shape(&r.name, &r.logic.value, &text_scc)?;
+        } else if expr_references_text_scc(&r.logic.value, &text_scc) {
+            // A number/group-returning member consuming a text member's
+            // "value" is non-tail by definition (the bytes stream, the
+            // register pair is garbage).
+            return Err(NativeError {
+                message: format!(
+                    "streaming text emit: non-text rule '{}' calls a text-returning recursive rule; in streaming mode a text-SCC member writes its bytes to stdout and returns no usable value, so only text-output rules may call it (in tail text positions).",
+                    r.name
+                ),
+            });
+        }
+    }
+    Ok(true)
 }
 
 /// Phase B slice 4a.3 — collect every rule transitively reachable from
@@ -3512,6 +3715,7 @@ fn emit_self_recursive_program<'a>(
     all_connections: &HashMap<&str, &'a Connection>,
     concept_group: Option<&'a ConceptGroup>,
     all_concepts: &[&'a Concept],
+    streaming: bool,
 ) -> Result<Vec<u8>, NativeError> {
     let is_bool = entry_rule.output_ty == Type::Bool;
     let is_text = entry_rule.output_ty == Type::Text;
@@ -3590,7 +3794,7 @@ fn emit_self_recursive_program<'a>(
     for &r in scc_rules {
         let mut scratch = Vec::new();
         let r_concept = lookup_concept(r)?;
-        emit_callable_into(&mut scratch, r, r_concept, all_rules, placeholder_ctx, cg)?;
+        emit_callable_into(&mut scratch, r, r_concept, all_rules, placeholder_ctx, cg, streaming)?;
         sizes.push(scratch.len());
     }
     let leading_size = code.len(); // = 5
@@ -3605,7 +3809,7 @@ fn emit_self_recursive_program<'a>(
     // Pass 2: emit each callable with real labels.
     for &r in scc_rules {
         let r_concept = lookup_concept(r)?;
-        emit_callable_into(&mut code, r, r_concept, all_rules, final_ctx, cg)?;
+        emit_callable_into(&mut code, r, r_concept, all_rules, final_ctx, cg, streaming)?;
     }
 
     // Patch the leading jmp to skip past all callables.
@@ -3717,18 +3921,28 @@ fn emit_self_recursive_program<'a>(
         let ap_pos = code.len();
         code[ap_patch] = (ap_pos - ap_patch - 1) as u8;
     } else if is_text {
-        // Write (rax, rdx) to stdout via sys_write(1, rax, rdx),
-        // then a newline. The callable left ptr in rax, len in rdx.
-        // mov rsi, rax — buffer
-        code.extend_from_slice(&[0x48, 0x89, 0xC6]);
-        // mov rdi, 1 — fd=stdout
-        code.extend_from_slice(&[0x48, 0xC7, 0xC7, 0x01, 0x00, 0x00, 0x00]);
-        // mov rax, 1 — sys_write
-        code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x01, 0x00, 0x00, 0x00]);
-        // syscall
-        code.extend_from_slice(&[0x0F, 0x05]);
-        // newline
-        emit_write_newline(&mut code, 1);
+        if streaming {
+            // Streaming mode: the callable already wrote every byte to
+            // fd 1 IN ORDER during the tree walk; the (rax, rdx) pair it
+            // left behind is meaningless and must NOT be written (it
+            // would re-emit the last leaf's bytes, or worse). Emit just
+            // the trailing newline so the output keeps the same
+            // one-line-per-record convention as every text driver.
+            emit_write_newline(&mut code, 1);
+        } else {
+            // Write (rax, rdx) to stdout via sys_write(1, rax, rdx),
+            // then a newline. The callable left ptr in rax, len in rdx.
+            // mov rsi, rax — buffer
+            code.extend_from_slice(&[0x48, 0x89, 0xC6]);
+            // mov rdi, 1 — fd=stdout
+            code.extend_from_slice(&[0x48, 0xC7, 0xC7, 0x01, 0x00, 0x00, 0x00]);
+            // mov rax, 1 — sys_write
+            code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x01, 0x00, 0x00, 0x00]);
+            // syscall
+            code.extend_from_slice(&[0x0F, 0x05]);
+            // newline
+            emit_write_newline(&mut code, 1);
+        }
     } else {
         emit_itoa_inline(&mut code);
     }
@@ -3764,6 +3978,7 @@ fn emit_callable_into<'a>(
     all_rules: &HashMap<&str, &Rule>,
     self_call: SelfCallCtx<'_>,
     concept_group: Option<&'a ConceptGroup>,
+    streaming: bool,
 ) -> Result<(), NativeError> {
     let is_text = rule.output_ty == Type::Text;
     // Phase B slice 4a.3: group-concept input has no `fields` (sum
@@ -4031,11 +4246,26 @@ fn emit_callable_into<'a>(
 
     // Body.
     if is_text {
-        // Slice 4a.3 doesn't extend the text-recursive path; same as A.5.2.
-        emit_recursive_text_body(
-            code, &rule.logic.value, &rule.input_name, &callable_offsets,
-            all_rules, &callable_field_ranges, &callable_text_bindings, self_call,
-        )?;
+        if streaming {
+            // Streaming text emit (self-hosting emitter slice): the body
+            // WRITES its bytes to fd 1 in order during the walk instead
+            // of materializing a (rax, rdx) pair. arena_ctx is threaded
+            // so MatchVariant dispatch (and any VariantConstruct in a
+            // number subexpression) reaches the arena; every streamed
+            // write push/pops r11 so the in-callable "trust r11" arena
+            // invariant survives the syscalls.
+            emit_streaming_text_body(
+                code, &rule.logic.value, &rule.input_name, &callable_offsets,
+                all_rules, &callable_field_ranges, &callable_text_bindings,
+                self_call, arena_ctx_ref,
+            )?;
+        } else {
+            // Slice 4a.3 doesn't extend the text-recursive path; same as A.5.2.
+            emit_recursive_text_body(
+                code, &rule.logic.value, &rule.input_name, &callable_offsets,
+                all_rules, &callable_field_ranges, &callable_text_bindings, self_call,
+            )?;
+        }
     } else {
         // Body emit reuses the SAME arena_ctx built before the let loop, so
         // arena_abort_patches accumulated by let-RHS constructs AND body
@@ -4485,6 +4715,435 @@ fn emit_recursive_text_body(
                 other
             ),
         }),
+    }
+}
+
+/// Streaming text emit — write(1, rsi, rdx) with the r11 guard.
+///
+/// Inside a recursive callable the arena ctx TRUSTS r11 (the sentinel
+/// `arena_rbp_offset == i32::MAX` means "do NOT reload from rbp — the
+/// outer prologue's r11 is still live"). That invariant held because no
+/// syscall ever ran inside a callable; Linux syscalls clobber rcx and
+/// r11 by ABI. A streaming body exists to make write syscalls, so EVERY
+/// streamed write must preserve r11 across the syscall — push/pop is
+/// 4 bytes total and harmless when no concept_group is declared, so we
+/// guard unconditionally rather than thread a "has group" flag.
+///
+/// Sequence (20 bytes, size-stable across the two-pass label resolution):
+///   push r11            ; 41 53
+///   mov rdi, 1          ; 48 C7 C7 01 00 00 00   fd = stdout
+///   mov rax, 1          ; 48 C7 C0 01 00 00 00   sys_write
+///   syscall             ; 0F 05                  clobbers rcx, r11
+///   pop r11             ; 41 5B
+fn emit_streamed_write_rsi_rdx(code: &mut Vec<u8>) {
+    code.extend_from_slice(&[0x41, 0x53]);                         // push r11
+    code.extend_from_slice(&[0x48, 0xC7, 0xC7, 0x01, 0x00, 0x00, 0x00]); // mov rdi, 1
+    code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x01, 0x00, 0x00, 0x00]); // mov rax, 1
+    code.extend_from_slice(&[0x0F, 0x05]);                         // syscall
+    code.extend_from_slice(&[0x41, 0x5B]);                         // pop r11
+}
+
+/// Streaming text emit — load a BoundText (ptr_slot, len_slot) pair into
+/// (rsi, rdx) ready for emit_streamed_write_rsi_rdx.
+fn emit_load_rsi_rdx_from_slots(code: &mut Vec<u8>, ptr_slot: i32, len_slot: i32) {
+    // mov rsi, [rbp + ptr_slot]
+    if ptr_slot >= -128 {
+        code.extend_from_slice(&[0x48, 0x8B, 0x75]);
+        code.push(ptr_slot as u8);
+    } else {
+        code.extend_from_slice(&[0x48, 0x8B, 0xB5]);
+        code.extend_from_slice(&ptr_slot.to_le_bytes());
+    }
+    // mov rdx, [rbp + len_slot]
+    if len_slot >= -128 {
+        code.extend_from_slice(&[0x48, 0x8B, 0x55]);
+        code.push(len_slot as u8);
+    } else {
+        code.extend_from_slice(&[0x48, 0x8B, 0x95]);
+        code.extend_from_slice(&len_slot.to_le_bytes());
+    }
+}
+
+/// Streaming lowering of a text-returning recursive body (self-hosting
+/// emitter slice, 2026-06-10). Sibling of `emit_recursive_text_body`,
+/// with the OPPOSITE contract: instead of leaving (rax = ptr, rdx = len)
+/// for the caller to consume, the emitted code WRITES the expression's
+/// bytes to fd 1 in output order during the walk and leaves nothing
+/// meaningful in registers. This is what makes the pretty-printer shape
+///   emit(node) = concat(emit(lhs), "+", emit(rhs))
+/// expressible natively: no level ever materializes a string, so there
+/// is no buffer whose lifetime would have to survive `ret`.
+///
+/// Grammar (enforced syntactically by `decide_streaming_text_mode`
+/// before emit — by the time we are here every shape is legal):
+///   - text literal                  → jmp-over-data + guarded write
+///   - BoundText Ident / text Field  → load (ptr, len) slots + write
+///   - substring(...)                → legacy (ptr, len) producer + write
+///   - number expression             → emit_eval_expr + guarded itoa
+///   - concat(a, b, ...)             → stream each arg in order (no
+///                                     buffer, no sizing pass)
+///   - if c then S1 else S2          → eval cond, branch, stream arms
+///   - match scrut: arms             → arena tag dispatch (port of
+///                                     emit_eval_expr's MatchVariant
+///                                     arena arm), stream arm bodies
+///   - Call(text SCC member, args)   → marshal via emit_eval_expr's
+///                                     Call arm (real `call <label>`),
+///                                     callee streams its own bytes;
+///                                     returned (rax, rdx) ignored
+///
+/// Register discipline: every write syscall is wrapped in push/pop r11
+/// (see emit_streamed_write_rsi_rdx) so the in-callable arena ctx can
+/// keep trusting r11 across the whole walk. rdi is dead after the
+/// callable prologue (all inputs are spilled to rbp slots), so loading
+/// rdi = 1 for the writes never conflicts with input access.
+fn emit_streaming_text_body(
+    code: &mut Vec<u8>,
+    expr: &Expr,
+    input_name: &str,
+    offsets: &HashMap<&str, i32>,
+    all_rules: &HashMap<&str, &Rule>,
+    field_ranges: &HashMap<&str, (i64, i64)>,
+    text_bindings: &TextBindings<'_>,
+    self_call: SelfCallCtx<'_>,
+    arena_ctx: Option<&ArenaCtx>,
+) -> Result<(), NativeError> {
+    match expr {
+        Expr::Text(s) => {
+            // Literal leaf: embed the bytes inline via jmp-over-data
+            // (same shape as the legacy literal arm), load (rsi, rdx),
+            // guarded write. The data lives in the binary's executable
+            // region; no allocation.
+            let bytes = s.as_bytes();
+            let n = bytes.len() as i32;
+            if n <= 127 {
+                code.push(0xEB);
+                code.push(n as u8);
+            } else {
+                code.push(0xE9);
+                code.extend_from_slice(&n.to_le_bytes());
+            }
+            let data_addr = code.len();
+            code.extend_from_slice(bytes);
+            // lea rsi, [rip + rel32]
+            let lea_end = code.len() + 7;
+            let rel32 = data_addr as i32 - lea_end as i32;
+            code.extend_from_slice(&[0x48, 0x8D, 0x35]);
+            code.extend_from_slice(&rel32.to_le_bytes());
+            // mov rdx, n
+            code.extend_from_slice(&[0x48, 0xC7, 0xC2]);
+            code.extend_from_slice(&n.to_le_bytes());
+            emit_streamed_write_rsi_rdx(code);
+            Ok(())
+        }
+        Expr::Concat(args) => {
+            // THE shape this slice exists for. No buffer, no sizing
+            // pass: each arg streams its own bytes left to right.
+            for a in args {
+                emit_streaming_text_body(
+                    code, a, input_name, offsets, all_rules,
+                    field_ranges, text_bindings, self_call, arena_ctx,
+                )?;
+            }
+            Ok(())
+        }
+        Expr::If(cond, then_e, else_e) => {
+            // Mirror the legacy If dispatch (no static elimination —
+            // parity with emit_recursive_text_body). Cond is a value
+            // position; the shape check guaranteed it is text-SCC-free.
+            emit_eval_expr(
+                code, cond, input_name, offsets, all_rules,
+                field_ranges, text_bindings, Some(self_call), arena_ctx,
+            )?;
+            code.extend_from_slice(&[0x84, 0xC0]); // test al, al
+            code.push(0x0F);
+            code.push(0x84);                       // jz .else (long form)
+            let else_patch = code.len();
+            code.extend_from_slice(&[0x00; 4]);
+            emit_streaming_text_body(
+                code, then_e, input_name, offsets, all_rules,
+                field_ranges, text_bindings, self_call, arena_ctx,
+            )?;
+            code.push(0xE9);
+            let end_patch = code.len();
+            code.extend_from_slice(&[0x00; 4]);
+            let else_pos = code.len();
+            let else_off = else_pos as i32 - (else_patch as i32 + 4);
+            code[else_patch..else_patch + 4].copy_from_slice(&else_off.to_le_bytes());
+            emit_streaming_text_body(
+                code, else_e, input_name, offsets, all_rules,
+                field_ranges, text_bindings, self_call, arena_ctx,
+            )?;
+            let end_pos = code.len();
+            let end_off = end_pos as i32 - (end_patch as i32 + 4);
+            code[end_patch..end_patch + 4].copy_from_slice(&end_off.to_le_bytes());
+            Ok(())
+        }
+        Expr::MatchVariant(scrutinee, arms) => {
+            // Port of emit_eval_expr's arena MatchVariant dispatch
+            // (the B.4a.3/4c shape) into the streaming context: same
+            // entry-pointer computation, same tag compare chain, same
+            // binder extraction — only the arm BODIES differ (streamed
+            // instead of evaluated to rax).
+            //
+            // r11 is TRUSTED here (no reload path exists inside a
+            // callable — the outer frame's rbp is unreachable), which
+            // is exactly why every streamed write above and below
+            // preserves it via push/pop.
+            let ac = arena_ctx.ok_or_else(|| NativeError {
+                message: "streaming text emit: match on a variant value requires a concept_group (arena ctx missing)".into(),
+            })?;
+            // Step 1: scrutinee → rax (the arena INDEX). Value
+            // position; shape check guaranteed no text-SCC call.
+            emit_eval_expr(
+                code, scrutinee, input_name, offsets, all_rules,
+                field_ranges, text_bindings, Some(self_call), Some(ac),
+            )?;
+            // Step 2: entry ptr: rax = r11 + idx * entry_size.
+            // mov r10, entry_size_imm
+            code.push(0x49);
+            code.push(0xBA);
+            code.extend_from_slice(&(ac.entry_size as i64).to_le_bytes());
+            // imul rax, r10
+            code.extend_from_slice(&[0x49, 0x0F, 0xAF, 0xC2]);
+            // add rax, r11
+            code.extend_from_slice(&[0x4C, 0x01, 0xD8]);
+            // Step 3: tag byte → rcx.
+            code.extend_from_slice(&[0x48, 0x0F, 0xB6, 0x08]); // movzx rcx, byte [rax]
+            // Step 4: per-arm compare + binder extraction + streamed
+            // body. Binder pool sits below every live frame slot —
+            // scan BOTH maps (offsets and text_bindings) for the
+            // most-negative slot, same derivation as the eval-context
+            // dispatch (see the comment there about text input fields
+            // living only in text_bindings).
+            let lowest_in_offsets: i32 = offsets.values().copied().min().unwrap_or(-8);
+            let lowest_in_text: i32 = text_bindings
+                .values()
+                .flat_map(|&(p, l)| [p, l])
+                .min()
+                .unwrap_or(0);
+            let lowest_offset: i32 = lowest_in_offsets.min(lowest_in_text);
+            let binder_base = lowest_offset - 8;
+
+            let mut end_patches: Vec<usize> = Vec::new();
+            for arm in arms.iter() {
+                let tag = *ac.variant_tags.get(arm.variant_name.as_str()).ok_or_else(|| NativeError {
+                    message: format!(
+                        "streaming MatchVariant: arm references unknown variant '{}' for group {:?}",
+                        arm.variant_name, ac.group_concept_names
+                    ),
+                })?;
+                let declared_fields = ac.variant_fields.get(arm.variant_name.as_str()).ok_or_else(|| NativeError {
+                    message: format!(
+                        "streaming MatchVariant: missing field metadata for variant '{}'",
+                        arm.variant_name
+                    ),
+                })?;
+                if arm.binders.len() != declared_fields.len() {
+                    return Err(NativeError {
+                        message: format!(
+                            "streaming MatchVariant: arm '{}' has {} binders but variant declares {} fields",
+                            arm.variant_name, arm.binders.len(), declared_fields.len()
+                        ),
+                    });
+                }
+                // cmp rcx, tag_imm
+                code.extend_from_slice(&[0x48, 0x83, 0xF9]);
+                code.push(tag);
+                // jne .next_arm (rel32 placeholder)
+                code.push(0x0F);
+                code.push(0x85);
+                let next_arm_patch = code.len();
+                code.extend_from_slice(&[0x00; 4]);
+                // Binder extraction — rax still points at the entry
+                // (no streamed write can have happened since step 2).
+                // Number binders go under the `__bind_` namespace so a
+                // binder can't alias a same-named input field; text
+                // binders keep their bare name in text_bindings (the
+                // BoundText lookup paths resolve bare names). Same
+                // conventions as the eval-context dispatch.
+                let mut extended_offsets = offsets.clone();
+                let extended_ranges = field_ranges.clone();
+                let mut extended_text_bindings: TextBindings<'_> = text_bindings.clone();
+                let binder_keys: Vec<String> = arm.binders.iter().map(|b| {
+                    match b {
+                        Some(name) => format!("__bind_{}", name),
+                        None => String::new(),
+                    }
+                }).collect();
+                let mut binder_cursor = binder_base;
+                for (i, binder_opt) in arm.binders.iter().enumerate() {
+                    let field_ty = &declared_fields[i].1;
+                    let is_text = matches!(field_ty, Type::Text);
+                    let arena_off = arena_field_offset(declared_fields, i, &ac.group_concept_names);
+                    if let Some(binder_name) = binder_opt {
+                        if is_text {
+                            // (ptr, len) pair from the type-aware arena
+                            // entry layout (slice 4c) into two slots.
+                            if arena_off <= 127 {
+                                code.extend_from_slice(&[0x48, 0x8B, 0x50]);
+                                code.push(arena_off as u8);
+                            } else {
+                                code.extend_from_slice(&[0x48, 0x8B, 0x90]);
+                                code.extend_from_slice(&arena_off.to_le_bytes());
+                            }
+                            let ptr_slot = binder_cursor;
+                            if ptr_slot >= -128 {
+                                code.extend_from_slice(&[0x48, 0x89, 0x55]);
+                                code.push(ptr_slot as u8);
+                            } else {
+                                code.extend_from_slice(&[0x48, 0x89, 0x95]);
+                                code.extend_from_slice(&ptr_slot.to_le_bytes());
+                            }
+                            let arena_len_off = arena_off + 8;
+                            if arena_len_off <= 127 {
+                                code.extend_from_slice(&[0x48, 0x8B, 0x50]);
+                                code.push(arena_len_off as u8);
+                            } else {
+                                code.extend_from_slice(&[0x48, 0x8B, 0x90]);
+                                code.extend_from_slice(&arena_len_off.to_le_bytes());
+                            }
+                            let len_slot = binder_cursor - 8;
+                            if len_slot >= -128 {
+                                code.extend_from_slice(&[0x48, 0x89, 0x55]);
+                                code.push(len_slot as u8);
+                            } else {
+                                code.extend_from_slice(&[0x48, 0x89, 0x95]);
+                                code.extend_from_slice(&len_slot.to_le_bytes());
+                            }
+                            extended_text_bindings.insert(binder_name.as_str(), (ptr_slot, len_slot));
+                        } else {
+                            // mov rdx, [rax + arena_off]
+                            if arena_off <= 127 {
+                                code.extend_from_slice(&[0x48, 0x8B, 0x50]);
+                                code.push(arena_off as u8);
+                            } else {
+                                code.extend_from_slice(&[0x48, 0x8B, 0x90]);
+                                code.extend_from_slice(&arena_off.to_le_bytes());
+                            }
+                            // mov [rbp + binder_cursor], rdx
+                            if binder_cursor >= -128 {
+                                code.extend_from_slice(&[0x48, 0x89, 0x55]);
+                                code.push(binder_cursor as u8);
+                            } else {
+                                code.extend_from_slice(&[0x48, 0x89, 0x95]);
+                                code.extend_from_slice(&binder_cursor.to_le_bytes());
+                            }
+                            let _ = binder_name;
+                            extended_offsets.insert(binder_keys[i].as_str(), binder_cursor);
+                        }
+                    }
+                    binder_cursor -= if is_text { 16 } else { 8 };
+                }
+                // Arm body: STREAMED (the one divergence from the
+                // eval-context port). The extended maps make binders
+                // resolvable both as values (number exprs → itoa) and
+                // as BoundText (text payloads → direct write).
+                emit_streaming_text_body(
+                    code, &arm.body, input_name, &extended_offsets,
+                    all_rules, &extended_ranges, &extended_text_bindings,
+                    self_call, Some(ac),
+                )?;
+                // jmp .match_end (rel32 forward)
+                code.push(0xE9);
+                let end_patch = code.len();
+                code.extend_from_slice(&[0x00; 4]);
+                end_patches.push(end_patch);
+                // Patch the jne to the next arm.
+                let next_arm_pos = code.len();
+                let next_off = next_arm_pos as i32 - (next_arm_patch as i32 + 4);
+                code[next_arm_patch..next_arm_patch + 4].copy_from_slice(&next_off.to_le_bytes());
+            }
+            // Tag-corruption trap: exit(2) — reached only if no arm's
+            // tag compared equal (verifier guarantees exhaustiveness,
+            // so this fires only on arena corruption).
+            code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x3C, 0x00, 0x00, 0x00]);
+            code.extend_from_slice(&[0x48, 0xC7, 0xC7, 0x02, 0x00, 0x00, 0x00]);
+            code.extend_from_slice(&[0x0F, 0x05]);
+            let match_end = code.len();
+            for patch in end_patches {
+                let off = match_end as i32 - (patch as i32 + 4);
+                code[patch..patch + 4].copy_from_slice(&off.to_le_bytes());
+            }
+            Ok(())
+        }
+        // Tail call to a text-returning SCC member: marshal the args and
+        // `call <label>` exactly like the eval-context Call arm (single-
+        // field rdi-value, multi-field pointer-in-rdi struct, group-index
+        // args as i64 — all shapes already live there). The callee is a
+        // streaming callable: it writes its own bytes during its walk,
+        // and the (rax, rdx) it leaves is deliberately ignored.
+        Expr::Call(name, _args)
+            if self_call.labels.contains_key(name.as_str())
+                && all_rules.get(name.as_str()).map_or(false, |r| r.output_ty == Type::Text) =>
+        {
+            emit_eval_expr(
+                code, expr, input_name, offsets, all_rules,
+                field_ranges, text_bindings, Some(self_call), arena_ctx,
+            )
+        }
+        // A text-returning call OUTSIDE the labels map cannot stream
+        // (no callable exists to call) and cannot be inlined as a value
+        // (its concat would be the very buffer-lifetime bug this slice
+        // routes around). The shape check refuses this upstream; this
+        // is the defensive emit-time catch.
+        Expr::Call(name, _)
+            if all_rules.get(name.as_str()).map_or(false, |r| r.output_ty == Type::Text) =>
+        {
+            Err(NativeError {
+                message: format!(
+                    "streaming text emit: call to text-returning rule '{}' which is not in the recursion's callable set; only SCC members stream.",
+                    name
+                ),
+            })
+        }
+        Expr::Ident(name) if text_bindings.contains_key(name.as_str()) => {
+            // BoundText (text input field via callable_text_bindings,
+            // match-arm text binder, allocation-free text let): load
+            // the (ptr, len) slots and write.
+            let &(ptr_slot, len_slot) = &text_bindings[name.as_str()];
+            emit_load_rsi_rdx_from_slots(code, ptr_slot, len_slot);
+            emit_streamed_write_rsi_rdx(code);
+            Ok(())
+        }
+        Expr::Field(base, field_name)
+            if matches!(base.as_ref(), Expr::Ident(ref n) if n == input_name)
+                && text_bindings.contains_key(field_name.as_str()) =>
+        {
+            // Text input field: the callable prologue stored (ptr, len)
+            // — stored length, no strlen rescan needed.
+            let &(ptr_slot, len_slot) = &text_bindings[field_name.as_str()];
+            emit_load_rsi_rdx_from_slots(code, ptr_slot, len_slot);
+            emit_streamed_write_rsi_rdx(code);
+            Ok(())
+        }
+        Expr::Substring(_, _, _) => {
+            // Reuse the legacy (ptr, len) producer — substring is
+            // allocation-free (a pointer slice into the input buffer),
+            // so the materializing path is exactly right here; we just
+            // add the write the legacy contract leaves to the caller.
+            emit_recursive_text_body(
+                code, expr, input_name, offsets, all_rules,
+                field_ranges, text_bindings, self_call,
+            )?;
+            code.extend_from_slice(&[0x48, 0x89, 0xC6]); // mov rsi, rax
+            emit_streamed_write_rsi_rdx(code);
+            Ok(())
+        }
+        // Everything else is a Number-typed expression appearing in a
+        // text position (a concat arg like `concat(value)`, a number
+        // match-arm body, a number field): evaluate to rax, then itoa
+        // straight to stdout without a newline. The itoa helper's write
+        // syscall clobbers r11 like any other — same push/pop guard.
+        other => {
+            emit_eval_expr(
+                code, other, input_name, offsets, all_rules,
+                field_ranges, text_bindings, Some(self_call), arena_ctx,
+            )?;
+            code.extend_from_slice(&[0x41, 0x53]); // push r11
+            emit_itoa_to_stdout_no_newline(code);
+            code.extend_from_slice(&[0x41, 0x5B]); // pop r11
+            Ok(())
+        }
     }
 }
 
@@ -26003,6 +26662,169 @@ rule rec
         assert_eq!(run("3\n"),  "0");
         assert_eq!(run("5\n"),  "0");
         assert_eq!(run("10\n"), "1");
+        let _ = std::fs::remove_file(&out);
+    }
+
+    /// Streaming text emit (self-hosting emitter slice, 2026-06-10) —
+    /// the FIRST native pretty-printer over a recursive AST. The body
+    /// shape `Add(lhs, rhs) => concat(print_expr(lhs), "+",
+    /// print_expr(rhs))` was refused by every prior slice (a concat
+    /// built in a recursive frame dies at `ret`); the streaming
+    /// lowering writes each leaf's bytes to stdout IN ORDER during the
+    /// walk, so no string is ever materialized.
+    ///
+    /// The oracle is the interpreter: for each seed the native binary's
+    /// stdout must equal `--run show`'s text result byte-for-byte
+    /// (modulo the shared trailing-newline convention, stripped by
+    /// trim on both sides here).
+    #[test]
+    fn streaming_print_chain_native_matches_interpreter() {
+        use std::io::Write;
+        let src = std::fs::read_to_string("examples/print_chain.verbose")
+            .expect("examples/print_chain.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+        let out = std::env::temp_dir().join("verbosec_test_streaming_print_chain");
+        compile_native(&program, "show", out.to_str().unwrap(), true, false)
+            .expect("streaming print_chain must compile natively");
+
+        // Interpreter oracle — same parse, same rule, evaluated in-process.
+        let all_rules: Vec<&crate::ast::Rule> = program.items.iter().filter_map(|i| match i {
+            crate::ast::Item::Rule(r) => Some(r),
+            _ => None,
+        }).collect();
+        let concepts: Vec<&crate::ast::Concept> =
+            crate::ast::iter_all_concepts(&program.items).collect();
+        let show = *all_rules.iter().find(|r| r.name == "show").unwrap();
+
+        let run = |input: &str| -> String {
+            let mut child = std::process::Command::new(&out)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .expect("spawn print_chain show");
+            child.stdin.as_mut().unwrap().write_all(input.as_bytes()).unwrap();
+            drop(child.stdin.take());
+            let r = child.wait_with_output().expect("wait print_chain show");
+            assert!(r.status.success(), "show({}) must exit 0; got {:?}", input.trim(), r.status);
+            String::from_utf8_lossy(&r.stdout).trim().to_string()
+        };
+
+        for &n in &[0i64, 3, 5] {
+            let mut input = std::collections::HashMap::new();
+            input.insert("n".to_string(), crate::interpreter::Value::Number(n));
+            let expected = match crate::interpreter::eval_rule(show, &all_rules, &concepts, &input) {
+                Ok(crate::interpreter::Value::Text(s)) => s,
+                other => panic!("interpreter must return text for show({}); got {:?}", n, other),
+            };
+            assert_eq!(
+                run(&format!("{}\n", n)),
+                expected,
+                "native streamed stdout must equal interpreter output for n={}",
+                n
+            );
+        }
+        // Money-shots pinned explicitly too, so a simultaneous
+        // interpreter+native regression can't cancel out.
+        assert_eq!(run("0\n"), "0");
+        assert_eq!(run("3\n"), "3+2+1+0");
+        assert_eq!(run("5\n"), "5+4+3+2+1+0");
+        let _ = std::fs::remove_file(&out);
+    }
+
+    /// Streaming text emit — the mode is decided per SCC, and a body
+    /// that fits today's literal-leaf grammar (recursive_label: if/else
+    /// with literal and self-call leaves) must KEEP the materializing
+    /// (rax = ptr, rdx = len) path byte-for-byte. Pinned the way the
+    /// existing slice tests pin: exact binary size (739 B with the
+    /// stdin reader, the documented recursive_label size) + behavior.
+    /// The full SHA-256 byte-identity sweep across all 10 recursive
+    /// examples is part of the slice's validation protocol.
+    #[test]
+    fn streaming_mode_does_not_change_literal_leaf_path() {
+        use std::io::Write;
+        let src = std::fs::read_to_string("examples/recursive_label.verbose")
+            .expect("examples/recursive_label.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+        let out = std::env::temp_dir().join("verbosec_test_streaming_literal_leaf_unchanged");
+        compile_native(&program, "label_of", out.to_str().unwrap(), true, false)
+            .expect("literal-leaf text recursion must keep compiling");
+        let size = std::fs::metadata(&out).expect("binary must exist").len();
+        assert_eq!(
+            size, 739,
+            "recursive_label (--stdin) must stay at its pinned 739 bytes; \
+             a size change means the streaming predicate leaked into the \
+             literal-leaf materializing path"
+        );
+
+        let run = |input: &str| -> String {
+            let mut child = std::process::Command::new(&out)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .expect("spawn label_of");
+            child.stdin.as_mut().unwrap().write_all(input.as_bytes()).unwrap();
+            drop(child.stdin.take());
+            let r = child.wait_with_output().expect("wait label_of");
+            assert!(r.status.success());
+            String::from_utf8_lossy(&r.stdout).trim().to_string()
+        };
+        assert_eq!(run("0\n"),  "done");
+        assert_eq!(run("10\n"), "done");
+        let _ = std::fs::remove_file(&out);
+    }
+
+    /// Streaming text emit — a call to a text-returning SCC member is
+    /// legal ONLY in tail text positions (body / concat arg / if arm /
+    /// match arm), because the callee streams its bytes to stdout
+    /// during the walk. Consuming its "value" (here: length(...) of a
+    /// recursive call, inside a concat) is out-of-order by construction
+    /// and must be refused with the streaming breadcrumb.
+    #[test]
+    fn streaming_refuses_text_scc_call_in_non_tail_position() {
+        let src = r#"@verbose 0.1.0
+
+concept N
+  @intention: "wrapper"
+  @source: invoices.intent:1
+  fields:
+    v : number [0, 10]
+
+rule bad
+  @intention: "text recursion that measures its own recursive output"
+  @source: invoices.intent:1
+  input:
+    n : N
+  output:
+    out : text
+  logic:
+    out = if n.v == 0 then "x" else concat("len=", length(bad(N { v: n.v - 1 })))
+  proofs:
+    purity:
+      reads : [n.v]
+      calls : [bad]
+    termination:
+      bound : 100
+"#;
+        let tokens = crate::lexer::Lexer::new(src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+        let out = std::env::temp_dir().join("verbosec_test_streaming_non_tail_refusal");
+        let err = compile_native(&program, "bad", out.to_str().unwrap(), false, false)
+            .expect_err("text-SCC call in a value position must be refused");
+        let msg = format!("{:?}", err);
+        assert!(
+            msg.contains("streaming text emit"),
+            "refusal must carry the streaming-slice breadcrumb; got: {}",
+            msg
+        );
+        assert!(
+            msg.contains("non-tail position"),
+            "refusal must name the non-tail position constraint; got: {}",
+            msg
+        );
         let _ = std::fs::remove_file(&out);
     }
 

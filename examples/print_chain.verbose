@@ -1,0 +1,115 @@
+@verbose 0.1.0
+
+-- Streaming text emit worked example (self-hosting emitter slice,
+-- 2026-06-10): the FIRST native pretty-printer over a recursive AST.
+--
+-- `print_expr` is the shape every prior native slice refused:
+--   Add(lhs, rhs) => concat(print_expr(lhs), "+", print_expr(rhs))
+-- A concat built inside a recursive frame dies at `ret` (its buffer
+-- lives below that frame's rsp), so returning it up the recursion is
+-- a dangling pointer by construction. Instead of materializing the
+-- string (the arena design was reviewed and deferred — see
+-- docs/emitter-text-arena-design-DRAFT.md §6b–6d), the native backend
+-- lowers the whole text recursion to a STREAMING walk: each leaf's
+-- bytes are written to stdout in order during the tree walk, and no
+-- string ever exists in memory. The interpreter still materializes;
+-- both produce the same bytes.
+--
+-- Declarations mirror sum_chain.verbose (same Expr = Int | Add group,
+-- same build_chain), swapping the evaluator for a printer. The seed
+-- field declares an explicit range [0, 20] — the optimizer's default
+-- field range is [0, i32::MAX], and an explicit bound both keeps the
+-- interval arithmetic honest and gives the recursion an audit-
+-- defensible depth ceiling (≤ 21 frames per rule).
+--
+-- Run with: --run show --input print_chain.json
+-- Expected: 0, 3+2+1+0, 5+4+3+2+1+0 (for n ∈ {0, 3, 5}).
+-- Native: --native /tmp/pc --run show, then `/tmp/pc 3` → 3+2+1+0.
+
+
+concept_group AST [max_depth: 30, max_nodes: 100]
+  @intention: "A tiny expression AST: Int literals and Add nodes"
+  @source: print_chain.intent:1
+
+  concept Expr
+    @intention: "An expression: integer literal or sum of two sub-expressions"
+    @source: print_chain.intent:1
+    variants:
+      Int of (value : number)
+      Add of (lhs : Expr, rhs : Expr)
+
+
+concept Seed
+  @intention: "A seed holds a non-negative integer between 0 and 20"
+  @source: print_chain.intent:2
+
+  fields:
+    n : number [0, 20]
+
+
+rule build_chain
+  @intention: "Build Add(Int(n), Add(Int(n-1), ... Int(0))) from a seed"
+  @source: print_chain.intent:3
+
+  input:
+    s : Seed
+
+  output:
+    e : Expr
+
+  logic:
+    e = if s.n == 0 then Expr::Int { value: 0 } else Expr::Add { lhs: Expr::Int { value: s.n }, rhs: build_chain(Seed { n: s.n - 1 }) }
+
+  proofs:
+    purity:
+      reads   : [s.n]
+      calls   : [build_chain]
+    termination:
+      bound : 100
+      decreasing : n
+
+
+rule print_expr
+  @intention: "Reconstruct an Expr's source text by recursing on the tree"
+  @source: print_chain.intent:4
+
+  input:
+    e : Expr
+
+  output:
+    out : text
+
+  logic:
+    out = match e:
+      Int(value) => concat(value)
+      Add(lhs, rhs) => concat(print_expr(lhs), "+", print_expr(rhs))
+
+
+  proofs:
+    purity:
+      reads   : [e]
+      calls   : [print_expr]
+    termination:
+      bound : 100
+      structural : e
+
+
+rule show
+  @intention: "Compose: build the chain then print it"
+  @source: print_chain.intent:5
+
+  input:
+    s : Seed
+
+  output:
+    out : text
+
+  logic:
+    out = print_expr(build_chain(s))
+
+  proofs:
+    purity:
+      reads   : [s]
+      calls   : [build_chain, print_expr]
+    termination:
+      bound : 20
