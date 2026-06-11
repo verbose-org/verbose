@@ -10,6 +10,12 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    env:
+      # Mirror the ci.yml hardening (2026-06-02): the native suite writes ELF
+      # binaries to /tmp and spawns them; parallel test threads race on
+      # ETXTBSY ("Text file busy"), and musl debug builds overflow the default
+      # stack on recursive emit. Single-threaded + 32MB stack fixes both.
+      RUST_MIN_STACK: "32000000"
     steps:
       - uses: actions/checkout@v4
 
@@ -20,7 +26,7 @@ jobs:
         run: cargo build --release
 
       - name: Run tests
-        run: cargo test
+        run: cargo test -- --test-threads=1
 
       - name: Package binary
         run: |
