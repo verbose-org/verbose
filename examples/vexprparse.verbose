@@ -9028,6 +9028,106 @@ rule lower_expr_src
 
 
 -- ============================================================================
+-- BACKEND BRICK b3 — LOWER A CLOSED EXPRESSION TO REAL x86-64 MACHINE CODE.
+-- ============================================================================
+-- Brick 36 (lower_expr) lowered an expression to a TEXT RPN stream. b3 lowers
+-- the SAME tree to BYTES — actual x86-64 instructions that a CPU executes. It
+-- reuses PrintState (node + src) and the same post-order recursion, but each
+-- arm emits b"..." opcodes (brick b1) composed with concat / le64 (brick b2)
+-- instead of mnemonic text.
+--
+-- The emitted bytes are a function `fn() -> i64`. It evaluates the expression
+-- onto the CPU's own stack (push/pop balanced), leaving the result in rax, and
+-- `ret`s — no prologue, no rbp frame. The hardware stack IS the RPN stack.
+--
+-- Verified subset (branchless + fault-free): AstNum, AstBin with op in
+-- {13 `+`, 14 `-`, 15 `*`}, and AstNeg. NO div/mod (idiv can fault), NO
+-- comparisons/logic (need setcc), NO `if` (needs computed relative offsets —
+-- hard in a streaming byte emitter), NO vars/calls. Those are b3-followups.
+-- Any out-of-subset op (16/17/comparisons/logic) or AST variant emits a single
+-- int3 trap byte (b"\xcc") so a miscompile faults loudly instead of silently
+-- producing wrong bytes. The verified test never feeds an out-of-subset node.
+--
+-- Instruction selection:
+--   AstNum(v)         => mov rax, <v:imm64> (48 B8 + le64 v) ; push rax (50)
+--   AstBin(op,l,r)    => <code l> <code r> ; pop rcx (59) ; pop rax (58) ;
+--                          op 13 +: add rax, rcx (48 01 C8) ; push rax (50)
+--                          op 14 -: sub rax, rcx (48 29 C8) ; push rax
+--                          op 15 *: imul rax, rcx (48 0F AF C1) ; push rax
+--                          other  : int3 (CC) — trap
+--   AstNeg(inner)     => <code inner> ; pop rax (58) ; neg rax (48 F7 D8) ;
+--                          push rax (50)
+-- pop rcx ; pop rax puts the RIGHT operand in rcx and the LEFT in rax — the
+-- right was pushed last, so it is on top. add/sub/imul are non-commutative-safe
+-- with this ordering (sub: rax-rcx = left-right, the source order).
+--
+-- The b1/b2 streaming-bytes path already provides everything: no src/ change.
+-- Verified end-to-end externally (streaming_x86_expr_executes): the bytes are
+-- mmap'd RWX, called as fn() -> i64, and the returned value == eval_expr(e).
+
+-- x86_expr: the byte-emitting code generator. Same shape as lower_expr (reuses
+-- PrintState), but post-order emits x86-64 bytes. The AstBin arm factors the
+-- two operand sub-trees out front, then an if/else over the op picks the
+-- per-op pop+arith+push byte literal (or the int3 trap for out-of-subset ops).
+rule x86_expr
+  @intention: "Lower a closed arithmetic AST (num, +/-/*, neg) to executable x86-64 machine code bytes"
+  @source: vexprparse.intent:56
+  input:
+    ps : PrintState
+  output:
+    out : bytes
+  logic:
+    out = match ps.node:
+      AstNum(value) => concat(b"\x48\xb8", le64(value), b"\x50")
+      AstBin(op, lhs, rhs) => concat(x86_expr(PrintState { node: lhs, src: ps.src }), x86_expr(PrintState { node: rhs, src: ps.src }), if op == 13 then b"\x59\x58\x48\x01\xc8\x50" else if op == 14 then b"\x59\x58\x48\x29\xc8\x50" else if op == 15 then b"\x59\x58\x48\x0f\xaf\xc1\x50" else b"\xcc")
+      AstNeg(inner) => concat(x86_expr(PrintState { node: inner, src: ps.src }), b"\x58\x48\xf7\xd8\x50")
+      AstNot(inner) => b"\xcc"
+      AstVar(start, len) => b"\xcc"
+      AstField(base, fstart, flen) => b"\xcc"
+      AstCall(callee_start, callee_len, args) => b"\xcc"
+      AstStr(start, len) => b"\xcc"
+      AstBool(value) => b"\xcc"
+      AstIf(cond, thn, els) => b"\xcc"
+      AstErr => b"\xcc"
+  proofs:
+    purity:
+      reads : [ps.node, ps.src]
+      calls : [x86_expr]
+    termination:
+      bound : 4000
+
+
+-- x86_expr_src: the b3 money-shot driver. Tokenize, parse with precedence, lower
+-- the root AST to x86-64 bytes, then append `pop rax (58) ; ret (C3)` so the
+-- function returns its top-of-stack value in rax. Mirrors lower_expr_src's
+-- driver exactly, swapping lower_expr (text) for x86_expr (bytes).
+--
+--   x86_expr_src("1 + 2") =
+--     48 b8 01 ..      mov rax,1 ; push
+--     48 b8 02 ..      mov rax,2 ; push
+--     59 58 48 01 c8 50  pop rcx ; pop rax ; add rax,rcx ; push
+--     58 c3            pop rax ; ret   -> 3
+rule x86_expr_src
+  @intention: "Tokenize, parse, and lower a closed arithmetic expression to executable x86-64 machine code"
+  @source: vexprparse.intent:56
+  input:
+    s : ScanState
+  output:
+    out : bytes
+  logic:
+    let toks = tokenize(ScanState { source: s.source, pos: 0 })
+    let parsed = parse_or(ParseState { toks: toks, pos: 0 })
+    let root = parsed_node(parsed)
+    out = concat(x86_expr(PrintState { node: root, src: s.source }), b"\x58\xc3")
+  proofs:
+    purity:
+      reads : [s.source]
+      calls : [tokenize, parse_or, parsed_node, x86_expr]
+    termination:
+      bound : 256
+
+
+-- ============================================================================
 -- BRICK 37 — LOWER A WHOLE PROGRAM to the stack IL (a function -> a routine).
 -- Brick 36 lowered one EXPRESSION; this brick lowers every rule to a named
 -- routine the IL VM can call. The calling convention: a routine is `proc NAME

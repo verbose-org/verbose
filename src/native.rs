@@ -453,7 +453,9 @@ fn compile_native_code(
             }
             // Per-rule output check. Group-concept output is allowed
             // (single i64 index in rax, populated by VariantConstruct
-            // emit). Otherwise must be Number/Bool/Text.
+            // emit). Otherwise must be Number/Bool/Text/Bytes — Bytes
+            // (brick b3-native) streams through the same recursive
+            // streaming machinery as Text (emit_streaming_bytes_body).
             let is_group_output = match &r.output_ty {
                 Type::Named(n) => concepts
                     .iter()
@@ -462,11 +464,11 @@ fn compile_native_code(
                 _ => false,
             };
             if !is_group_output
-                && !matches!(&r.output_ty, Type::Number | Type::Bool | Type::Text)
+                && !matches!(&r.output_ty, Type::Number | Type::Bool | Type::Text | Type::Bytes)
             {
                 return Err(NativeError {
                     message: format!(
-                        "recursive rule '{}' output must be Number, Bool, or Text (got {:?}); Result/Record returns are later slices.",
+                        "recursive rule '{}' output must be Number, Bool, Text, or Bytes (got {:?}); Result/Record returns are later slices.",
                         r.name, r.output_ty
                     ),
                 });
@@ -525,6 +527,27 @@ fn compile_native_code(
     } else {
         false
     };
+
+    // Streaming BYTES emit (brick b3-native, 2026-06-12). The bytes
+    // analogue of the streaming-text path above: a recursive `bytes`-
+    // returning entry (the x86-64 machine-code emitter) lowers to a
+    // streaming walk — each leaf's raw bytes are written to fd 1 IN
+    // ORDER during the recursion, and the (rax, rdx) return pair is
+    // ignored. No buffer, no arena. Unlike text there is NO legacy
+    // materializing path for recursive bytes (brick b1/b2 only handled
+    // the non-recursive `emit_bytes_program`), so any recursive
+    // bytes SCC unconditionally enters streaming mode; the shape check
+    // (`check_streaming_bytes_shape`) refuses non-tail SCC calls.
+    let streaming_bytes = if needs_callable_path && matches!(rule.output_ty, Type::Bytes) {
+        decide_streaming_bytes_mode(&scc_rules_owned)?;
+        true
+    } else {
+        false
+    };
+    // Whole-SCC streaming flag threaded into emit_self_recursive_program.
+    // Text vs bytes is disambiguated inside by the entry rule's output_ty,
+    // so a single bool suffices.
+    let streaming = streaming_text || streaming_bytes;
 
     // Look up the context concept (if multi-input rule).
     let context_concept: Option<&Concept> = match &rule.context_ty {
@@ -593,7 +616,7 @@ fn compile_native_code(
         // Slice 5.1a-5.4: emit the rule (or SCC) as real callables.
         // scc_rules_owned was populated above when recursion was detected;
         // for single self-recursion it has one entry, for mutual it has N.
-        emit_self_recursive_program(rule, &scc_rules_owned, concept, &rules, &resources, &connections, concept_group, &concepts, streaming_text)?
+        emit_self_recursive_program(rule, &scc_rules_owned, concept, &rules, &resources, &connections, concept_group, &concepts, streaming)?
     } else if let Some(rx) = reaction {
         emit_reaction_program(rx, rule, concept, &rules, &resources, &connections, concept_group)?
     } else if is_result_output {
@@ -1769,6 +1792,151 @@ fn decide_streaming_text_mode(scc_rules: &[&Rule]) -> Result<bool, NativeError> 
         }
     }
     Ok(true)
+}
+
+/// Brick b3-native — syntactic shape check for one bytes streaming SCC
+/// member's body. The bytes analogue of `check_streaming_text_shape`:
+/// a call to a bytes-returning SCC member is legal ONLY as a direct
+/// element of a tail-bytes chain (the body itself, a concat arg, an if
+/// arm, a match arm). Everything else (if-conditions, scrutinees, the
+/// call's own arguments, and any value-position expression) must be
+/// free of bytes-SCC references — checked via the catch-all scan.
+/// Mirrors the text constraints 1-for-1 because the streaming emitter's
+/// ordering guarantee (bytes written left-to-right during the walk) is
+/// identical.
+fn check_streaming_bytes_shape(
+    rule_name: &str,
+    e: &Expr,
+    bytes_scc: &HashSet<&str>,
+) -> Result<(), NativeError> {
+    match e {
+        // Bytes leaves: a literal, or a number → little-endian encoding.
+        // Their subexpressions are value positions; le32/le64's inner is
+        // a number and may not reference a bytes-SCC call (caught below).
+        Expr::Bytes(_) => Ok(()),
+        Expr::Le32(inner) | Expr::Le64(inner) => {
+            if expr_references_bytes_scc(inner, bytes_scc) {
+                return Err(NativeError {
+                    message: format!(
+                        "streaming bytes emit: rule '{}' calls a bytes-returning recursive rule inside le32/le64 (a number position); a bytes-SCC call may only appear in a tail bytes position (body / concat arg / if arm / match arm).",
+                        rule_name
+                    ),
+                });
+            }
+            Ok(())
+        }
+        // Concat args are each a tail bytes position themselves.
+        Expr::Concat(args) => {
+            for a in args {
+                check_streaming_bytes_shape(rule_name, a, bytes_scc)?;
+            }
+            Ok(())
+        }
+        Expr::If(cond, then_e, else_e) => {
+            if expr_references_bytes_scc(cond, bytes_scc) {
+                return Err(NativeError {
+                    message: format!(
+                        "streaming bytes emit: rule '{}' calls a bytes-returning recursive rule inside an if CONDITION; a bytes-SCC call may only appear in a tail bytes position (body / concat arg / if arm / match arm).",
+                        rule_name
+                    ),
+                });
+            }
+            check_streaming_bytes_shape(rule_name, then_e, bytes_scc)?;
+            check_streaming_bytes_shape(rule_name, else_e, bytes_scc)
+        }
+        Expr::MatchVariant(scrutinee, arms) => {
+            if expr_references_bytes_scc(scrutinee, bytes_scc) {
+                return Err(NativeError {
+                    message: format!(
+                        "streaming bytes emit: rule '{}' calls a bytes-returning recursive rule inside a match SCRUTINEE; a bytes-SCC call may only appear in a tail bytes position.",
+                        rule_name
+                    ),
+                });
+            }
+            for arm in arms {
+                check_streaming_bytes_shape(rule_name, &arm.body, bytes_scc)?;
+            }
+            Ok(())
+        }
+        // A tail-position bytes-SCC call: legal — but its ARGUMENTS are
+        // value positions (they become the next recursion's input), so
+        // they must not themselves reference a bytes-SCC member.
+        Expr::Call(name, args) if bytes_scc.contains(name.as_str()) => {
+            for a in args {
+                if expr_references_bytes_scc(a, bytes_scc) {
+                    return Err(NativeError {
+                        message: format!(
+                            "streaming bytes emit: rule '{}' passes a bytes-returning recursive call as an ARGUMENT to '{}'; arguments are value positions — a bytes-SCC call may only appear in a tail bytes position (body / concat arg / if arm / match arm).",
+                            rule_name, name
+                        ),
+                    });
+                }
+            }
+            Ok(())
+        }
+        // Everything else is a value position. Any bytes-SCC reference
+        // buried inside is out of order by construction: refuse.
+        other => {
+            if expr_references_bytes_scc(other, bytes_scc) {
+                return Err(NativeError {
+                    message: format!(
+                        "streaming bytes emit: rule '{}' uses a bytes-returning recursive call in a non-tail position ({:?}); a bytes-SCC call may only appear as a direct element of the body / concat args / if arms / match arms.",
+                        rule_name,
+                        other
+                    ),
+                });
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Brick b3-native — true iff `e` contains, anywhere, a call to a
+/// bytes-returning SCC member. Mirrors `expr_references_text_scc`.
+fn expr_references_bytes_scc(e: &Expr, bytes_scc: &HashSet<&str>) -> bool {
+    let mut callees: Vec<String> = Vec::new();
+    collect_native_callees(e, &mut callees);
+    callees.iter().any(|c| bytes_scc.contains(c.as_str()))
+}
+
+/// Brick b3-native — whole-SCC bytes streaming check. Unlike the text
+/// path there is no legacy materializing fallback (recursive bytes never
+/// compiled before this brick), so the SCC ALWAYS streams; this function
+/// only validates the v1 shape and returns Err on any violation. Every
+/// bytes-output SCC member's body must pass `check_streaming_bytes_shape`;
+/// no let RHS may reference a bytes-SCC member (its bytes would stream at
+/// let-eval time, before the body's earlier output); a non-bytes member
+/// may not call a bytes-SCC member (the callee streams and returns no
+/// usable value).
+fn decide_streaming_bytes_mode(scc_rules: &[&Rule]) -> Result<(), NativeError> {
+    let bytes_scc: HashSet<&str> = scc_rules
+        .iter()
+        .filter(|r| r.output_ty == Type::Bytes)
+        .map(|r| r.name.as_str())
+        .collect();
+    for r in scc_rules {
+        for (bname, bexpr) in &r.logic.bindings {
+            if expr_references_bytes_scc(bexpr, &bytes_scc) {
+                return Err(NativeError {
+                    message: format!(
+                        "streaming bytes emit: rule '{}' let '{}' references a bytes-returning recursive rule; let RHSes are evaluated before the body, so the callee's bytes would stream out of order. Inline the call in a tail bytes position instead.",
+                        r.name, bname
+                    ),
+                });
+            }
+        }
+        if r.output_ty == Type::Bytes {
+            check_streaming_bytes_shape(&r.name, &r.logic.value, &bytes_scc)?;
+        } else if expr_references_bytes_scc(&r.logic.value, &bytes_scc) {
+            return Err(NativeError {
+                message: format!(
+                    "streaming bytes emit: non-bytes rule '{}' calls a bytes-returning recursive rule; in streaming mode a bytes-SCC member writes its bytes to stdout and returns no usable value, so only bytes-output rules may call it (in tail bytes positions).",
+                    r.name
+                ),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Phase B slice 4a.3 — collect every rule transitively reachable from
@@ -3722,6 +3890,7 @@ fn emit_self_recursive_program<'a>(
 ) -> Result<Vec<u8>, NativeError> {
     let is_bool = entry_rule.output_ty == Type::Bool;
     let is_text = entry_rule.output_ty == Type::Text;
+    let is_bytes = entry_rule.output_ty == Type::Bytes;
     let nslots: usize = concept.fields.iter()
         .map(|f| if matches!(f.ty, Type::Text) { 2usize } else { 1 })
         .sum();
@@ -3923,6 +4092,14 @@ fn emit_self_recursive_program<'a>(
         code.extend_from_slice(&[0x01, 0x00, 0x00, 0x00]);
         let ap_pos = code.len();
         code[ap_patch] = (ap_pos - ap_patch - 1) as u8;
+    } else if is_bytes {
+        // Brick b3-native: streaming bytes. The callable already wrote
+        // every machine-code byte to fd 1 IN ORDER during the walk; the
+        // (rax, rdx) pair is meaningless and must NOT be written.
+        // Critically, emit NO trailing newline — raw machine code must be
+        // byte-exact (a stray 0x0a would corrupt the emitted program).
+        // (A recursive bytes entry always streams; there is no
+        // materializing fallback, so this branch needs no `if streaming`.)
     } else if is_text {
         if streaming {
             // Streaming mode: the callable already wrote every byte to
@@ -3984,6 +4161,7 @@ fn emit_callable_into<'a>(
     streaming: bool,
 ) -> Result<(), NativeError> {
     let is_text = rule.output_ty == Type::Text;
+    let is_bytes = rule.output_ty == Type::Bytes;
     // Phase B slice 4a.3: group-concept input has no `fields` (sum
     // type). The callable's ABI degenerates to single i64 in rdi
     // (the arena INDEX), spilled to `[rbp - 8]`. The input name (e.g.
@@ -4248,7 +4426,20 @@ fn emit_callable_into<'a>(
     }
 
     // Body.
-    if is_text {
+    if is_bytes {
+        // Brick b3-native: streaming bytes body — the recursive bytes
+        // analogue of emit_streaming_text_body. WRITES raw machine-code
+        // bytes to fd 1 in order during the walk; the (rax, rdx) return
+        // pair is ignored. arena_ctx is threaded so MatchVariant
+        // dispatch (x86_expr matches on the Ast variant) reaches the
+        // arena. A recursive bytes rule ALWAYS streams (no materializing
+        // fallback), so no `if streaming` guard is needed here.
+        emit_streaming_bytes_body(
+            code, &rule.logic.value, &rule.input_name, &callable_offsets,
+            all_rules, &callable_field_ranges, &callable_text_bindings,
+            self_call, arena_ctx_ref,
+        )?;
+    } else if is_text {
         if streaming {
             // Streaming text emit (self-hosting emitter slice): the body
             // WRITES its bytes to fd 1 in order during the walk instead
@@ -5224,9 +5415,16 @@ fn emit_write_bytes_literal(code: &mut Vec<u8>, bytes: &[u8], fd: i32) {
     // mov rdi, fd
     code.extend_from_slice(&[0x48, 0xC7, 0xC7]);
     code.extend_from_slice(&fd.to_le_bytes());
-    // mov rax, 1 (sys_write) ; syscall
+    // mov rax, 1 (sys_write)
     code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x01, 0x00, 0x00, 0x00]);
-    code.extend_from_slice(&[0x0F, 0x05]);
+    // Preserve r11 across the syscall. In the recursive streaming-bytes
+    // context (brick b3-native) r11 holds the concept_group arena base and
+    // MUST survive every write — Linux syscalls clobber rcx and r11 by ABI.
+    // For the non-recursive b1/b2 caller r11 is dead, so the push/pop is a
+    // harmless 4 extra bytes. (Mirrors emit_streamed_write_rsi_rdx.)
+    code.extend_from_slice(&[0x41, 0x53]); // push r11
+    code.extend_from_slice(&[0x0F, 0x05]); // syscall
+    code.extend_from_slice(&[0x41, 0x5B]); // pop r11
 }
 
 /// Backend brick b1: a rule `output: bytes` whose logic is a `b"..."`
@@ -5267,13 +5465,27 @@ fn emit_bytes_program<'a>(
     // a future le32(<field>) can read a field. r11 is not live here (no arena),
     // but emit_streamed_write_rsi_rdx push/pops it anyway — harmless.
     let offsets: HashMap<&str, i32> = ctx.binding_offsets.clone();
+    // Non-recursive bytes (brick b1/b2): no callable labels, no arena.
+    // Build an empty SelfCallCtx so the shared streaming-bytes body's
+    // Call/le arms have a context to consult (they never find a label here).
+    let empty_labels: HashMap<&str, i32> = HashMap::new();
+    let empty_arities: HashMap<&str, usize> = HashMap::new();
+    let empty_layouts: HashMap<&str, Vec<(String, i32, bool)>> = HashMap::new();
+    let empty_self_call = SelfCallCtx {
+        labels: &empty_labels,
+        arities: &empty_arities,
+        struct_layouts: &empty_layouts,
+    };
     emit_streaming_bytes_body(
         &mut code,
         &rule.logic.value,
         &rule.input_name,
-        &ctx,
         &offsets,
         all_rules,
+        &ctx.field_ranges,
+        &ctx.text_bindings,
+        empty_self_call,
+        None,
     )?;
 
     // jmp loop_top
@@ -5297,9 +5509,12 @@ fn emit_streaming_bytes_body(
     code: &mut Vec<u8>,
     expr: &Expr,
     input_name: &str,
-    ctx: &RecordLoopCtx<'_>,
     offsets: &HashMap<&str, i32>,
     all_rules: &HashMap<&str, &Rule>,
+    field_ranges: &HashMap<&str, (i64, i64)>,
+    text_bindings: &TextBindings<'_>,
+    self_call: SelfCallCtx<'_>,
+    arena_ctx: Option<&ArenaCtx>,
 ) -> Result<(), NativeError> {
     match expr {
         Expr::Bytes(b) => {
@@ -5307,17 +5522,24 @@ fn emit_streaming_bytes_body(
             Ok(())
         }
         Expr::Concat(args) => {
+            // THE shape brick b2 exists for. No buffer, no sizing pass:
+            // each arg streams its own bytes left to right.
             for a in args {
-                emit_streaming_bytes_body(code, a, input_name, ctx, offsets, all_rules)?;
+                emit_streaming_bytes_body(
+                    code, a, input_name, offsets, all_rules,
+                    field_ranges, text_bindings, self_call, arena_ctx,
+                )?;
             }
             Ok(())
         }
         Expr::Le32(inner) | Expr::Le64(inner) => {
             let width: i32 = if matches!(expr, Expr::Le64(_)) { 8 } else { 4 };
-            // eval n → rax (no self-call context — b2 is non-recursive)
+            // eval n → rax. self_call is threaded so a recursive driver's
+            // le-encoded number could itself reference a callable's value,
+            // though the shape check forbids a bytes-SCC call here.
             emit_eval_expr(
                 code, inner, input_name, offsets, all_rules,
-                &ctx.field_ranges, &ctx.text_bindings, None, None,
+                field_ranges, text_bindings, Some(self_call), arena_ctx,
             )?;
             // sub rsp, 8 ; mov [rsp], rax  (x86 stores little-endian, so the
             // first `width` bytes at [rsp] are the LE low bytes of rax)
@@ -5332,10 +5554,232 @@ fn emit_streaming_bytes_body(
             code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x08]);
             Ok(())
         }
+        Expr::If(cond, then_e, else_e) => {
+            // Mirror emit_streaming_text_body's If: eval cond (value
+            // position, bytes-SCC-free by the shape check), branch, stream
+            // each arm. x86_expr's op-dispatch is an if/else chain of
+            // bytes literals — this is the arm that lowers it.
+            emit_eval_expr(
+                code, cond, input_name, offsets, all_rules,
+                field_ranges, text_bindings, Some(self_call), arena_ctx,
+            )?;
+            code.extend_from_slice(&[0x84, 0xC0]); // test al, al
+            code.push(0x0F);
+            code.push(0x84);                       // jz .else (long form)
+            let else_patch = code.len();
+            code.extend_from_slice(&[0x00; 4]);
+            emit_streaming_bytes_body(
+                code, then_e, input_name, offsets, all_rules,
+                field_ranges, text_bindings, self_call, arena_ctx,
+            )?;
+            code.push(0xE9);
+            let end_patch = code.len();
+            code.extend_from_slice(&[0x00; 4]);
+            let else_pos = code.len();
+            let else_off = else_pos as i32 - (else_patch as i32 + 4);
+            code[else_patch..else_patch + 4].copy_from_slice(&else_off.to_le_bytes());
+            emit_streaming_bytes_body(
+                code, else_e, input_name, offsets, all_rules,
+                field_ranges, text_bindings, self_call, arena_ctx,
+            )?;
+            let end_pos = code.len();
+            let end_off = end_pos as i32 - (end_patch as i32 + 4);
+            code[end_patch..end_patch + 4].copy_from_slice(&end_off.to_le_bytes());
+            Ok(())
+        }
+        Expr::MatchVariant(scrutinee, arms) => {
+            // Port of emit_streaming_text_body's MatchVariant arena
+            // dispatch into the bytes context: same arena entry-pointer
+            // computation, same tag-compare chain, same binder extraction
+            // — only the arm BODIES differ (streamed as bytes). r11 is
+            // TRUSTED here (in-callable); every streamed write push/pops
+            // it, so it survives the walk.
+            let ac = arena_ctx.ok_or_else(|| NativeError {
+                message: "streaming bytes emit: match on a variant value requires a concept_group (arena ctx missing)".into(),
+            })?;
+            // Step 1: scrutinee → rax (the arena INDEX).
+            emit_eval_expr(
+                code, scrutinee, input_name, offsets, all_rules,
+                field_ranges, text_bindings, Some(self_call), Some(ac),
+            )?;
+            // Step 2: entry ptr: rax = r11 + idx * entry_size.
+            code.push(0x49); code.push(0xBA);                 // mov r10, entry_size_imm
+            code.extend_from_slice(&(ac.entry_size as i64).to_le_bytes());
+            code.extend_from_slice(&[0x49, 0x0F, 0xAF, 0xC2]); // imul rax, r10
+            code.extend_from_slice(&[0x4C, 0x01, 0xD8]);       // add rax, r11
+            // Step 3: tag byte → rcx.
+            code.extend_from_slice(&[0x48, 0x0F, 0xB6, 0x08]); // movzx rcx, byte [rax]
+            // Step 4: per-arm compare + binder extraction + streamed body.
+            let lowest_in_offsets: i32 = offsets.values().copied().min().unwrap_or(-8);
+            let lowest_in_text: i32 = text_bindings
+                .values()
+                .flat_map(|&(p, l)| [p, l])
+                .min()
+                .unwrap_or(0);
+            let lowest_offset: i32 = lowest_in_offsets.min(lowest_in_text);
+            let binder_base = lowest_offset - 8;
+
+            let mut end_patches: Vec<usize> = Vec::new();
+            for arm in arms.iter() {
+                let tag = *ac.variant_tags.get(arm.variant_name.as_str()).ok_or_else(|| NativeError {
+                    message: format!(
+                        "streaming bytes MatchVariant: arm references unknown variant '{}' for group {:?}",
+                        arm.variant_name, ac.group_concept_names
+                    ),
+                })?;
+                let declared_fields = ac.variant_fields.get(arm.variant_name.as_str()).ok_or_else(|| NativeError {
+                    message: format!(
+                        "streaming bytes MatchVariant: missing field metadata for variant '{}'",
+                        arm.variant_name
+                    ),
+                })?;
+                if arm.binders.len() != declared_fields.len() {
+                    return Err(NativeError {
+                        message: format!(
+                            "streaming bytes MatchVariant: arm '{}' has {} binders but variant declares {} fields",
+                            arm.variant_name, arm.binders.len(), declared_fields.len()
+                        ),
+                    });
+                }
+                // cmp rcx, tag_imm
+                code.extend_from_slice(&[0x48, 0x83, 0xF9]);
+                code.push(tag);
+                // jne .next_arm
+                code.push(0x0F); code.push(0x85);
+                let next_arm_patch = code.len();
+                code.extend_from_slice(&[0x00; 4]);
+                // Binder extraction — rax still points at the entry.
+                let mut extended_offsets = offsets.clone();
+                let extended_ranges = field_ranges.clone();
+                let mut extended_text_bindings: TextBindings<'_> = text_bindings.clone();
+                let binder_keys: Vec<String> = arm.binders.iter().map(|b| {
+                    match b {
+                        Some(name) => format!("__bind_{}", name),
+                        None => String::new(),
+                    }
+                }).collect();
+                let mut binder_cursor = binder_base;
+                for (i, binder_opt) in arm.binders.iter().enumerate() {
+                    let field_ty = &declared_fields[i].1;
+                    let is_text = matches!(field_ty, Type::Text);
+                    let arena_off = arena_field_offset(declared_fields, i, &ac.group_concept_names);
+                    if let Some(binder_name) = binder_opt {
+                        if is_text {
+                            // (ptr, len) pair from the type-aware arena entry.
+                            if arena_off <= 127 {
+                                code.extend_from_slice(&[0x48, 0x8B, 0x50]);
+                                code.push(arena_off as u8);
+                            } else {
+                                code.extend_from_slice(&[0x48, 0x8B, 0x90]);
+                                code.extend_from_slice(&arena_off.to_le_bytes());
+                            }
+                            let ptr_slot = binder_cursor;
+                            if ptr_slot >= -128 {
+                                code.extend_from_slice(&[0x48, 0x89, 0x55]);
+                                code.push(ptr_slot as u8);
+                            } else {
+                                code.extend_from_slice(&[0x48, 0x89, 0x95]);
+                                code.extend_from_slice(&ptr_slot.to_le_bytes());
+                            }
+                            let arena_len_off = arena_off + 8;
+                            if arena_len_off <= 127 {
+                                code.extend_from_slice(&[0x48, 0x8B, 0x50]);
+                                code.push(arena_len_off as u8);
+                            } else {
+                                code.extend_from_slice(&[0x48, 0x8B, 0x90]);
+                                code.extend_from_slice(&arena_len_off.to_le_bytes());
+                            }
+                            let len_slot = binder_cursor - 8;
+                            if len_slot >= -128 {
+                                code.extend_from_slice(&[0x48, 0x89, 0x55]);
+                                code.push(len_slot as u8);
+                            } else {
+                                code.extend_from_slice(&[0x48, 0x89, 0x95]);
+                                code.extend_from_slice(&len_slot.to_le_bytes());
+                            }
+                            extended_text_bindings.insert(binder_name.as_str(), (ptr_slot, len_slot));
+                        } else {
+                            // mov rdx, [rax + arena_off]
+                            if arena_off <= 127 {
+                                code.extend_from_slice(&[0x48, 0x8B, 0x50]);
+                                code.push(arena_off as u8);
+                            } else {
+                                code.extend_from_slice(&[0x48, 0x8B, 0x90]);
+                                code.extend_from_slice(&arena_off.to_le_bytes());
+                            }
+                            // mov [rbp + binder_cursor], rdx
+                            if binder_cursor >= -128 {
+                                code.extend_from_slice(&[0x48, 0x89, 0x55]);
+                                code.push(binder_cursor as u8);
+                            } else {
+                                code.extend_from_slice(&[0x48, 0x89, 0x95]);
+                                code.extend_from_slice(&binder_cursor.to_le_bytes());
+                            }
+                            let _ = binder_name;
+                            extended_offsets.insert(binder_keys[i].as_str(), binder_cursor);
+                        }
+                    }
+                    binder_cursor -= if is_text { 16 } else { 8 };
+                }
+                // Arm body: STREAMED as bytes.
+                emit_streaming_bytes_body(
+                    code, &arm.body, input_name, &extended_offsets,
+                    all_rules, &extended_ranges, &extended_text_bindings,
+                    self_call, Some(ac),
+                )?;
+                // jmp .match_end
+                code.push(0xE9);
+                let end_patch = code.len();
+                code.extend_from_slice(&[0x00; 4]);
+                end_patches.push(end_patch);
+                // Patch the jne to the next arm.
+                let next_arm_pos = code.len();
+                let next_off = next_arm_pos as i32 - (next_arm_patch as i32 + 4);
+                code[next_arm_patch..next_arm_patch + 4].copy_from_slice(&next_off.to_le_bytes());
+            }
+            // Tag-corruption trap: exit(2).
+            code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x3C, 0x00, 0x00, 0x00]);
+            code.extend_from_slice(&[0x48, 0xC7, 0xC7, 0x02, 0x00, 0x00, 0x00]);
+            code.extend_from_slice(&[0x0F, 0x05]);
+            let match_end = code.len();
+            for patch in end_patches {
+                let off = match_end as i32 - (patch as i32 + 4);
+                code[patch..patch + 4].copy_from_slice(&off.to_le_bytes());
+            }
+            Ok(())
+        }
+        // Tail call to a bytes-returning SCC member: marshal the args and
+        // `call <label>` exactly like emit_eval_expr's Call arm (single-
+        // field rdi-value, multi-field pointer-in-rdi struct, group-index
+        // args as i64). The callee streams its own bytes during its walk;
+        // the (rax, rdx) it leaves is deliberately ignored.
+        Expr::Call(name, _args)
+            if self_call.labels.contains_key(name.as_str())
+                && all_rules.get(name.as_str()).map_or(false, |r| r.output_ty == Type::Bytes) =>
+        {
+            emit_eval_expr(
+                code, expr, input_name, offsets, all_rules,
+                field_ranges, text_bindings, Some(self_call), arena_ctx,
+            )
+        }
+        // A bytes-returning call outside the labels map cannot stream (no
+        // callable exists) — the shape check refuses this upstream; this
+        // is the defensive emit-time catch.
+        Expr::Call(name, _)
+            if all_rules.get(name.as_str()).map_or(false, |r| r.output_ty == Type::Bytes) =>
+        {
+            Err(NativeError {
+                message: format!(
+                    "streaming bytes emit: call to bytes-returning rule '{}' which is not in the recursion's callable set; only SCC members stream.",
+                    name
+                ),
+            })
+        }
         other => Err(NativeError {
             message: format!(
-                "native bytes streaming (brick b2) supports `b\"...\"`, bytes `concat(...)`, \
-                 and `le32`/`le64`, got {:?}",
+                "native bytes streaming (brick b3) supports `b\"...\"`, bytes `concat(...)`, \
+                 `le32`/`le64`, `if`/`else` (bytes arms), `match` (bytes arms), and tail \
+                 calls to bytes-returning recursive rules, got {:?}",
                 other
             ),
         }),
@@ -19053,6 +19497,112 @@ rule le64_neg
         let _ = fs::remove_file(out1);
         let _ = fs::remove_file(out2);
         let _ = fs::remove_file(out3);
+    }
+
+    /// Brick b3-native — THE milestone test. `x86_expr_src` is a recursive
+    /// `bytes`-returning rule (the x86-64 machine-code emitter): it
+    /// tokenizes, parses with precedence, lowers the AST to executable
+    /// x86-64 bytes via the recursive streaming-bytes path, and appends
+    /// `pop rax ; ret` so the emitted function returns its top-of-stack
+    /// value in rax.
+    ///
+    /// For each expression we:
+    ///   1. run x86_expr_src(expr, "0") → the machine-code bytes,
+    ///   2. mmap those bytes RWX and CALL them as `extern "C" fn() -> i64`,
+    ///   3. assert the executed result == eval_expr(expr) == the hand value.
+    /// This proves the bytes the recursive emitter streamed are REAL,
+    /// runnable x86-64 — the whole point of the backend arc.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn streaming_x86_expr_executes() {
+        use std::fs;
+        use std::process::Command;
+
+        let src = fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let x86 = std::env::temp_dir().join("verbosec_test_x86_expr_src");
+        let eval = std::env::temp_dir().join("verbosec_test_eval_expr_for_x86");
+        compile_native(&program, "x86_expr_src", x86.to_str().unwrap(), false, false)
+            .expect("x86_expr_src (recursive bytes streaming) must compile natively");
+        compile_native(&program, "eval_expr", eval.to_str().unwrap(), false, false)
+            .expect("eval_expr must compile natively");
+
+        // (expression, hand-computed value)
+        let cases: &[(&str, i64)] = &[
+            ("1 + 2", 3),
+            ("1 + 2 * 3", 7),
+            ("10 - 2 - 3", 5),
+            ("2 * 3 * 4", 24),
+            ("- 5 + 2", -3),
+            ("(1 + 2) * (3 + 4)", 21),
+            ("100 - 50 * 2", 0),
+            ("7", 7),
+        ];
+
+        for &(expr, expected) in cases {
+            // 1. emit machine code via the recursive streaming-bytes emitter.
+            let mc = Command::new(&x86)
+                .args([expr, "0"])
+                .output()
+                .expect("spawn x86_expr_src");
+            assert!(
+                mc.status.success(),
+                "x86_expr_src must exit 0 for {:?}; got {:?}",
+                expr, mc.status
+            );
+            let code = mc.stdout;
+            assert!(
+                !code.is_empty(),
+                "x86_expr_src emitted no bytes for {:?}",
+                expr
+            );
+
+            // 2. mmap RWX, copy the emitted bytes in, call as fn() -> i64.
+            let x86_result = unsafe {
+                let page = 4096usize;
+                let alloc = libc_mmap(page);
+                assert!(!alloc.is_null(), "mmap failed");
+                std::ptr::copy_nonoverlapping(code.as_ptr(), alloc as *mut u8, code.len());
+                let f: extern "C" fn() -> i64 = std::mem::transmute(alloc);
+                let r = f();
+                libc_munmap(alloc, page);
+                r
+            };
+
+            // 3. cross-check against eval_expr (the interpreter-parity native
+            //    evaluator of the SAME parse) and the hand value.
+            let ev = Command::new(&eval)
+                .args([expr, "0"])
+                .output()
+                .expect("spawn eval_expr");
+            assert!(ev.status.success(), "eval_expr must exit 0 for {:?}", expr);
+            let eval_val: i64 = String::from_utf8_lossy(&ev.stdout)
+                .trim()
+                .parse()
+                .unwrap_or_else(|_| panic!("eval_expr produced non-number for {:?}: {:?}", expr, ev.stdout));
+
+            assert_eq!(
+                x86_result, expected,
+                "x86 machine code for {:?} returned {} (expected {})",
+                expr, x86_result, expected
+            );
+            assert_eq!(
+                eval_val, expected,
+                "eval_expr for {:?} returned {} (expected {})",
+                expr, eval_val, expected
+            );
+            assert_eq!(
+                x86_result, eval_val,
+                "x86 ({}) and eval_expr ({}) disagree for {:?}",
+                x86_result, eval_val, expr
+            );
+        }
+
+        let _ = fs::remove_file(x86);
+        let _ = fs::remove_file(eval);
     }
 
     /// Minimal mmap(PROT_READ|WRITE|EXEC, MAP_PRIVATE|ANON) via raw syscall —

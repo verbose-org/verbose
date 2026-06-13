@@ -1257,3 +1257,34 @@ there (out of the arithmetic evaluator's scope).
     streaming body hits emit_eval_expr's "MatchVariant A.4.1 scrutinee = Call only" limit;
     dropped argc from the IL (the VM infers arity from the proc header), which also made
     the IL cleaner.
+
+56. Backend brick b3 (milestone of the backend arc): LOWER A CLOSED EXPRESSION TO REAL
+    x86-64 MACHINE CODE. Brick 36's lower_expr lowered an AST to a TEXT RPN stream; b3
+    lowers the SAME tree to BYTES — actual x86-64 instructions a CPU executes. Reuses
+    PrintState (node + src) and the same post-order recursion, but each arm emits b"..."
+    opcodes (brick b1) composed with concat / le64 (brick b2) instead of mnemonic text.
+    The emitted bytes are a function fn() -> i64: it evaluates the expression onto the
+    CPU's own hardware stack (push/pop balanced), leaves the result in rax, and ret's —
+    no prologue, no rbp frame. The hardware stack IS the RPN stack. Verified subset
+    (branchless + fault-free): AstNum, AstBin with op in {13 +, 14 -, 15 *}, AstNeg. NO
+    div/mod (idiv faults), NO comparisons/logic (need setcc), NO if (computed offsets),
+    NO vars/calls — b3-followups. Out-of-subset ops/variants emit a single int3 trap byte
+    (CC) so a miscompile faults loudly. Instruction selection: AstNum(v) => mov rax,
+    <v:imm64> (48 B8 + le64 v) ; push rax (50). AstBin(op,l,r) => <code l> <code r> ; pop
+    rcx (59) ; pop rax (58) ; {add 48 01 C8 | sub 48 29 C8 | imul 48 0F AF C1} ; push rax
+    (50). AstNeg(inner) => <code inner> ; pop rax (58) ; neg rax (48 F7 D8) ; push rax
+    (50). pop rcx ; pop rax puts the RIGHT operand (pushed last, on top) in rcx and LEFT
+    in rax, so sub computes left-right in source order. Rules: x86_expr (the byte code
+    generator, same shape as lower_expr but bytes leaves), x86_expr_src (driver: tokenize
+    -> parse_or -> parsed_node -> x86_expr, then append pop rax (58) ; ret (C3)).
+    STATUS: both rules added and the verifier accepts them (119 concepts / 261 rules, all
+    proofs check). NATIVE LOWERING IS NOT YET BUILT: x86_expr is recursive (over the AST,
+    plus the driver chain through skip_spaces / parse_or), and the recursive native path
+    refuses Bytes output ("recursive rule output must be Number, Bool, or Text"). The
+    streaming-emit machinery that lets the recursive TEXT twin (lower_expr_src) compile is
+    wired for Type::Text only; an emit_streaming_*_body path for Bytes leaves (Expr::Bytes,
+    le32/le64, bytes-concat) plus lifting the recursive-output gate to Bytes is needed —
+    a src change in the native backend, deferred pending scope confirmation. Intended
+    end-to-end verification (streaming_x86_expr_executes): mmap the emitted bytes RWX, call
+    as fn() -> i64, assert == eval_expr(e) for "1 + 2"(3), "1 + 2 * 3"(7), "10 - 2 - 3"(5),
+    "2 * 3 * 4"(24), "- 5 + 2"(-3), "(1 + 2) * (3 + 4)"(21), "100 - 50 * 2"(0), "7"(7).
