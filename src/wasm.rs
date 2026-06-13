@@ -303,6 +303,11 @@ pub fn compile_wasm(
                 ),
             }),
         },
+        Type::Bytes => {
+            return Err(WasmError {
+                message: "bytes not supported in the WASM backend (bytes is native/interpreter only)".into(),
+            });
+        }
         other => {
             return Err(WasmError {
                 message: format!("unsupported output type {:?} in the WASM backend", other),

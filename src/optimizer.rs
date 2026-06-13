@@ -38,7 +38,7 @@ impl std::fmt::Display for OptStats {
 
 fn count_nodes(expr: &Expr) -> usize {
     match expr {
-        Expr::Number(_) | Expr::Text(_) | Expr::Ident(_) => 1,
+        Expr::Number(_) | Expr::Text(_) | Expr::Bytes(_) | Expr::Ident(_) => 1,
         Expr::Field(base, _) => 1 + count_nodes(base),
         Expr::Binary(_, l, r) => 1 + count_nodes(l) + count_nodes(r),
         Expr::Not(i) | Expr::Neg(i) => 1 + count_nodes(i),
@@ -291,7 +291,7 @@ fn inline_text_literal_lets(
 pub fn substitute_ident(expr: &Expr, name: &str, replacement: &Expr) -> Expr {
     match expr {
         Expr::Ident(n) if n == name => replacement.clone(),
-        Expr::Ident(_) | Expr::Number(_) | Expr::Text(_) => expr.clone(),
+        Expr::Ident(_) | Expr::Number(_) | Expr::Text(_) | Expr::Bytes(_) => expr.clone(),
         Expr::Field(base, f) => Expr::Field(
             Box::new(substitute_ident(base, name, replacement)),
             f.clone(),
@@ -530,7 +530,7 @@ pub fn optimize_expr(
     field_ranges: &HashMap<&str, (i64, i64)>,
 ) -> Expr {
     match expr {
-        Expr::Number(_) | Expr::Text(_) | Expr::Ident(_) => expr.clone(),
+        Expr::Number(_) | Expr::Text(_) | Expr::Bytes(_) | Expr::Ident(_) => expr.clone(),
 
         Expr::Field(base, field) => {
             Expr::Field(Box::new(optimize_expr(base, input_name, field_ranges)), field.clone())

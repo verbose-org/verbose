@@ -310,7 +310,7 @@ fn collect_read_names(expr: &Expr, out: &mut Vec<String>) {
                 out.push(name.clone());
             }
         }
-        Expr::Number(_) | Expr::Text(_) | Expr::Ident(_) => {}
+        Expr::Number(_) | Expr::Text(_) | Expr::Bytes(_) | Expr::Ident(_) => {}
         Expr::Field(base, _) => collect_read_names(base, out),
         Expr::Binary(_, l, r) => {
             collect_read_names(l, out);
@@ -475,7 +475,7 @@ fn collect_fetch_names(expr: &Expr, out: &mut Vec<String>) {
             }
             collect_fetch_names(req, out);
         }
-        Expr::Number(_) | Expr::Text(_) | Expr::Ident(_) => {}
+        Expr::Number(_) | Expr::Text(_) | Expr::Bytes(_) | Expr::Ident(_) => {}
         Expr::Read(_) => {}
         Expr::Field(base, _) => collect_fetch_names(base, out),
         Expr::Binary(_, l, r) => {
@@ -595,7 +595,7 @@ fn collect_fetch_names_with_dups(expr: &Expr, out: &mut Vec<String>) {
             out.push(name.clone());
             collect_fetch_names_with_dups(req, out);
         }
-        Expr::Number(_) | Expr::Text(_) | Expr::Ident(_) => {}
+        Expr::Number(_) | Expr::Text(_) | Expr::Bytes(_) | Expr::Ident(_) => {}
         Expr::Read(_) => {}
         Expr::Field(base, _) => collect_fetch_names_with_dups(base, out),
         Expr::Binary(_, l, r) => {
@@ -1232,6 +1232,7 @@ fn describe_expr_kind(e: &Expr) -> &'static str {
     match e {
         Expr::Number(_) => "number",
         Expr::Text(_) => "text",
+        Expr::Bytes(_) => "bytes",
         Expr::Ident(_) => "identifier",
         Expr::Field(_, _) => "field access",
         Expr::Binary(_, _, _) => "binary op",
@@ -2454,6 +2455,10 @@ fn infer_expr_type(
     match expr {
         Expr::Number(_) => Some(Type::Number),
         Expr::Text(_) => Some(Type::Text),
+        // Backend brick b1: a `b"..."` byte-string literal has type bytes.
+        // Bytes participates in nothing else yet (no arithmetic, concat, or
+        // coercion), so this is the only inference path that produces it.
+        Expr::Bytes(_) => Some(Type::Bytes),
         // Phase 9 slice 1: read(<resource>) returns text. Existence of the
         // resource is checked separately by verify_rule via a dedicated
         // walk; this inference path only needs the type.
@@ -2861,7 +2866,7 @@ fn walk_for_match_result_callees(
                 walk_for_match_result_callees(&a.body, rules_by_name, all_resources, all_connections, visited, out_reads);
             }
         }
-        Expr::Number(_) | Expr::Text(_) | Expr::Field(_, _) | Expr::Ident(_)
+        Expr::Number(_) | Expr::Text(_) | Expr::Bytes(_) | Expr::Field(_, _) | Expr::Ident(_)
         | Expr::Read(_) | Expr::NowUnix => {}
     }
 }
@@ -2886,7 +2891,7 @@ fn collect_expr_facts(
     calls: &mut HashSet<Vec<String>>,
 ) {
     match expr {
-        Expr::Number(_) | Expr::Text(_) => {}
+        Expr::Number(_) | Expr::Text(_) | Expr::Bytes(_) => {}
         Expr::If(cond, then_e, else_e) => {
             collect_expr_facts(cond, reads, calls);
             collect_expr_facts(then_e, reads, calls);
@@ -3315,7 +3320,7 @@ fn collect_lambda_bound_names(expr: &Expr) -> std::collections::HashSet<String> 
             | Expr::Shl(a, b) | Expr::Shr(a, b) => { walk(a, out); walk(b, out); }
             Expr::BitNot(i) => walk(i, out),
             // Leaves
-            Expr::Number(_) | Expr::Text(_) | Expr::Field(_, _) | Expr::Ident(_)
+            Expr::Number(_) | Expr::Text(_) | Expr::Bytes(_) | Expr::Field(_, _) | Expr::Ident(_)
             | Expr::Read(_) | Expr::NowUnix => {}
         }
     }
@@ -3528,7 +3533,7 @@ fn collect_recursive_call_args(expr: &Expr, rule_name: &str, out: &mut Vec<Strin
                 }
             }
         }
-        Expr::Number(_) | Expr::Text(_) | Expr::Ident(_) | Expr::Read(_) | Expr::NowUnix => {}
+        Expr::Number(_) | Expr::Text(_) | Expr::Bytes(_) | Expr::Ident(_) | Expr::Read(_) | Expr::NowUnix => {}
         Expr::Field(b, _) => collect_recursive_call_args(b, rule_name, out),
         Expr::Binary(_, l, r) => { collect_recursive_call_args(l, rule_name, out); collect_recursive_call_args(r, rule_name, out); }
         Expr::Not(i) | Expr::Neg(i) | Expr::Ok(i) | Expr::Err(i)
@@ -3780,7 +3785,7 @@ fn collect_recursive_call_record_args(expr: &Expr, rule_name: &str, out: &mut Ve
                 out.push((name.clone(), arg.clone()));
             }
         }
-        Expr::Number(_) | Expr::Text(_) | Expr::Ident(_) | Expr::Read(_) | Expr::NowUnix => {}
+        Expr::Number(_) | Expr::Text(_) | Expr::Bytes(_) | Expr::Ident(_) | Expr::Read(_) | Expr::NowUnix => {}
         Expr::Field(b, _) => collect_recursive_call_record_args(b, rule_name, out),
         Expr::Binary(_, l, r) => { collect_recursive_call_record_args(l, rule_name, out); collect_recursive_call_record_args(r, rule_name, out); }
         Expr::Not(i) | Expr::Neg(i) | Expr::Ok(i) | Expr::Err(i)
@@ -3808,7 +3813,7 @@ fn collect_recursive_call_record_args(expr: &Expr, rule_name: &str, out: &mut Ve
 
 fn count_operations(expr: &Expr) -> usize {
     match expr {
-        Expr::Number(_) | Expr::Text(_) | Expr::Ident(_) => 0,
+        Expr::Number(_) | Expr::Text(_) | Expr::Bytes(_) | Expr::Ident(_) => 0,
         Expr::If(c, t, e) => 1 + count_operations(c) + count_operations(t) + count_operations(e),
         Expr::Not(inner) | Expr::Neg(inner) => 1 + count_operations(inner),
         Expr::Field(base, _) => count_operations(base),

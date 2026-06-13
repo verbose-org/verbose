@@ -616,6 +616,9 @@ fn compile_native_code(
         emit_fold_bytes_program(rule, concept, &rules, &resources)?
     } else if matches!(&rule.output_ty, Type::Text) {
         emit_text_program(rule, concept, &rules, &resources, &connections, concept_group)?
+    } else if matches!(&rule.output_ty, Type::Bytes) {
+        // Backend brick b1: `output: bytes` with a `b"..."` literal body.
+        emit_bytes_program(rule, concept, &rules, &resources, &connections, concept_group)?
     } else if let Some(rec_concept) = record_output_concept {
         emit_record_program(rule, rec_concept, concept, &concepts, &rules, &resources, &connections, concept_group)?
     } else if matches!(&rule.output_ty, Type::Number | Type::Bool) && contains_quantifier(&rule.logic.value) {
@@ -963,7 +966,7 @@ fn collect_read_names_native(expr: &Expr, out: &mut Vec<String>) {
                 out.push(name.clone());
             }
         }
-        Expr::Number(_) | Expr::Text(_) | Expr::Ident(_) => {}
+        Expr::Number(_) | Expr::Text(_) | Expr::Bytes(_) | Expr::Ident(_) => {}
         Expr::Field(base, _) => collect_read_names_native(base, out),
         Expr::Binary(_, l, r) => {
             collect_read_names_native(l, out);
@@ -1095,7 +1098,7 @@ fn collect_read_names_native(expr: &Expr, out: &mut Vec<String>) {
 fn expr_uses_now_unix(e: &Expr) -> bool {
     match e {
         Expr::NowUnix => true,
-        Expr::Number(_) | Expr::Text(_) | Expr::Ident(_) | Expr::Read(_) => false,
+        Expr::Number(_) | Expr::Text(_) | Expr::Bytes(_) | Expr::Ident(_) | Expr::Read(_) => false,
         Expr::Field(b, _) => expr_uses_now_unix(b),
         Expr::Binary(_, l, r) => expr_uses_now_unix(l) || expr_uses_now_unix(r),
         Expr::Not(i) | Expr::Neg(i) | Expr::Ok(i) | Expr::Err(i) => expr_uses_now_unix(i),
@@ -1265,7 +1268,7 @@ fn count_match_result_max_depth(expr: &Expr) -> usize {
             scrut_depth.max(arms_depth)
         }
         // Leaves: no inner expression to recurse into.
-        Expr::Number(_) | Expr::Text(_) | Expr::Field(_, _) | Expr::Ident(_)
+        Expr::Number(_) | Expr::Text(_) | Expr::Bytes(_) | Expr::Field(_, _) | Expr::Ident(_)
         | Expr::Read(_) | Expr::NowUnix => 0,
     }
 }
@@ -1282,7 +1285,7 @@ fn expr_uses_field(e: &Expr, input_name: &str, field_name: &str) -> bool {
             (matches!(base.as_ref(), Expr::Ident(n) if n == input_name) && fname == field_name)
                 || expr_uses_field(base, input_name, field_name)
         }
-        Expr::Number(_) | Expr::Text(_) | Expr::Ident(_) | Expr::Read(_) | Expr::NowUnix => false,
+        Expr::Number(_) | Expr::Text(_) | Expr::Bytes(_) | Expr::Ident(_) | Expr::Read(_) | Expr::NowUnix => false,
         Expr::Binary(_, l, r) => {
             expr_uses_field(l, input_name, field_name)
                 || expr_uses_field(r, input_name, field_name)
@@ -1919,7 +1922,7 @@ fn collect_native_callees(expr: &Expr, out: &mut Vec<String>) {
             collect_native_callees(request, out);
         }
         // Leaves
-        Expr::Number(_) | Expr::Text(_)
+        Expr::Number(_) | Expr::Text(_) | Expr::Bytes(_)
         | Expr::Ident(_) | Expr::Field(_, _) | Expr::Read(_) | Expr::NowUnix => {}
     }
 }
@@ -2054,7 +2057,7 @@ fn gather_transitive_callee_reads(
                 gather_transitive_callee_reads(&a.body, all_rules, visited, out);
             }
         }
-        Expr::Number(_) | Expr::Text(_) | Expr::Field(_, _) | Expr::Ident(_)
+        Expr::Number(_) | Expr::Text(_) | Expr::Bytes(_) | Expr::Field(_, _) | Expr::Ident(_)
         | Expr::Read(_) | Expr::NowUnix => {}
     }
 }
@@ -2176,7 +2179,7 @@ fn collect_fetch_names_native(expr: &Expr, out: &mut Vec<String>) {
             }
             collect_fetch_names_native(req, out);
         }
-        Expr::Number(_) | Expr::Text(_) | Expr::Ident(_) => {}
+        Expr::Number(_) | Expr::Text(_) | Expr::Bytes(_) | Expr::Ident(_) => {}
         Expr::Read(_) => {}
         Expr::Field(base, _) => collect_fetch_names_native(base, out),
         Expr::Binary(_, l, r) => {
@@ -2522,7 +2525,7 @@ fn emit_connection_fetch_sequence(
     fn first_fetch_for<'a>(expr: &'a Expr, name: &str) -> Option<&'a Expr> {
         match expr {
             Expr::Fetch(n, req) if n == name => Some(req),
-            Expr::Number(_) | Expr::Text(_) | Expr::Ident(_) | Expr::Read(_) => None,
+            Expr::Number(_) | Expr::Text(_) | Expr::Bytes(_) | Expr::Ident(_) | Expr::Read(_) => None,
             Expr::Field(b, _) => first_fetch_for(b, name),
             Expr::Binary(_, l, r) => first_fetch_for(l, name).or_else(|| first_fetch_for(r, name)),
             Expr::Not(i) | Expr::Neg(i) | Expr::Ok(i) | Expr::Err(i) => first_fetch_for(i, name),
@@ -2776,7 +2779,7 @@ fn find_group_variant_construct_in_expr(
             }
             None
         }
-        Expr::Number(_) | Expr::Text(_) | Expr::Ident(_) | Expr::Read(_) | Expr::NowUnix => None,
+        Expr::Number(_) | Expr::Text(_) | Expr::Bytes(_) | Expr::Ident(_) | Expr::Read(_) | Expr::NowUnix => None,
         Expr::Field(b, _) => find_group_variant_construct_in_expr(b, group_concepts),
         Expr::Binary(_, l, r) => find_group_variant_construct_in_expr(l, group_concepts)
             .or_else(|| find_group_variant_construct_in_expr(r, group_concepts)),
@@ -2883,7 +2886,7 @@ fn find_group_match_variant_in_expr(
             }
             None
         }
-        Expr::Number(_) | Expr::Text(_) | Expr::Ident(_) | Expr::Read(_) | Expr::NowUnix => None,
+        Expr::Number(_) | Expr::Text(_) | Expr::Bytes(_) | Expr::Ident(_) | Expr::Read(_) | Expr::NowUnix => None,
         Expr::Field(b, _) => find_group_match_variant_in_expr(b, group_concepts, rule_input_name, rule_input_ty, all_rules),
         Expr::Binary(_, l, r) => find_group_match_variant_in_expr(l, group_concepts, rule_input_name, rule_input_ty, all_rules)
             .or_else(|| find_group_match_variant_in_expr(r, group_concepts, rule_input_name, rule_input_ty, all_rules)),
@@ -4333,7 +4336,7 @@ fn count_max_match_arm_binders(expr: &Expr) -> u32 {
                     walk(&a.body, m);
                 }
             }
-            Expr::Number(_) | Expr::Text(_) | Expr::Ident(_) | Expr::Read(_) | Expr::NowUnix => {}
+            Expr::Number(_) | Expr::Text(_) | Expr::Bytes(_) | Expr::Ident(_) | Expr::Read(_) | Expr::NowUnix => {}
             Expr::Field(b, _) => walk(b, m),
             Expr::Binary(_, l, r) => { walk(l, m); walk(r, m); }
             Expr::Not(i) | Expr::Neg(i) | Expr::Ok(i) | Expr::Err(i)
@@ -4392,7 +4395,7 @@ fn count_max_match_arm_binder_slots(expr: &Expr, concept_group: Option<&ConceptG
                     walk(&a.body, m, cg);
                 }
             }
-            Expr::Number(_) | Expr::Text(_) | Expr::Ident(_) | Expr::Read(_) | Expr::NowUnix => {}
+            Expr::Number(_) | Expr::Text(_) | Expr::Bytes(_) | Expr::Ident(_) | Expr::Read(_) | Expr::NowUnix => {}
             Expr::Field(b, _) => walk(b, m, cg),
             Expr::Binary(_, l, r) => { walk(l, m, cg); walk(r, m, cg); }
             Expr::Not(i) | Expr::Neg(i) | Expr::Ok(i) | Expr::Err(i)
@@ -4424,7 +4427,7 @@ fn count_max_match_arm_binder_slots(expr: &Expr, concept_group: Option<&ConceptG
 fn body_contains_variant_construct(expr: &Expr) -> bool {
     match expr {
         Expr::VariantConstruct(_, _, _) => true,
-        Expr::Number(_) | Expr::Text(_) | Expr::Ident(_) | Expr::Read(_) | Expr::NowUnix => false,
+        Expr::Number(_) | Expr::Text(_) | Expr::Bytes(_) | Expr::Ident(_) | Expr::Read(_) | Expr::NowUnix => false,
         Expr::Field(b, _) => body_contains_variant_construct(b),
         Expr::Binary(_, l, r) => body_contains_variant_construct(l) || body_contains_variant_construct(r),
         Expr::Not(i) | Expr::Neg(i) | Expr::Ok(i) | Expr::Err(i)
@@ -5186,6 +5189,76 @@ fn emit_text_program<'a>(
         &ctx.text_bindings,
     )?;
     emit_write_newline(&mut code, 1);
+
+    // jmp loop_top
+    code.push(0xE9);
+    let loop_offset = ctx.loop_top as i32 - (code.len() + 4) as i32;
+    code.extend_from_slice(&loop_offset.to_le_bytes());
+
+    emit_record_loop_epilogue(&mut code, &ctx);
+    Ok(code)
+}
+
+/// Backend brick b1: emit a literal byte blob to `fd` via a single
+/// write(fd, ptr, len), with the bytes embedded inline in the code section
+/// via a jmp-over-data block. Unlike `emit_write_string` (8-bit `EB` jump,
+/// caps the blob at 255 bytes and hardcodes fd=1), this uses a near `E9`
+/// jump (rel32), so the blob length is bounded only by i32 — appropriate for
+/// machine-code payloads that may exceed 255 bytes in later bricks. No
+/// trailing newline: raw bytes, exact.
+fn emit_write_bytes_literal(code: &mut Vec<u8>, bytes: &[u8], fd: i32) {
+    let len = bytes.len();
+    // jmp rel32 over the data
+    code.push(0xE9);
+    code.extend_from_slice(&(len as i32).to_le_bytes());
+    let data_offset = code.len();
+    code.extend_from_slice(bytes);
+    // lea rsi, [rip + disp] — point rsi at the blob.
+    let after_lea = code.len() + 7;
+    let rip_offset = data_offset as i32 - after_lea as i32;
+    code.extend_from_slice(&[0x48, 0x8D, 0x35]);
+    code.extend_from_slice(&rip_offset.to_le_bytes());
+    // mov rdx, len
+    code.extend_from_slice(&[0x48, 0xC7, 0xC2]);
+    code.extend_from_slice(&(len as i32).to_le_bytes());
+    // mov rdi, fd
+    code.extend_from_slice(&[0x48, 0xC7, 0xC7]);
+    code.extend_from_slice(&fd.to_le_bytes());
+    // mov rax, 1 (sys_write) ; syscall
+    code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x01, 0x00, 0x00, 0x00]);
+    code.extend_from_slice(&[0x0F, 0x05]);
+}
+
+/// Backend brick b1: a rule `output: bytes` whose logic is a `b"..."`
+/// literal emits exactly those raw bytes to stdout (no trailing newline),
+/// once per input record. Mirrors `emit_text_program`'s record-loop shape so
+/// stdin/argv input modes work unchanged, but writes the raw byte blob
+/// instead of a text value and skips the newline. Non-literal bytes bodies
+/// (concat, number→bytes, lowering) are later bricks — refused here.
+fn emit_bytes_program<'a>(
+    rule: &'a Rule,
+    concept: &'a Concept,
+    all_rules: &HashMap<&str, &Rule>,
+    all_resources: &HashMap<&str, &'a Resource>,
+    all_connections: &HashMap<&str, &'a Connection>,
+    concept_group: Option<&'a ConceptGroup>,
+) -> Result<Vec<u8>, NativeError> {
+    let bytes = match &rule.logic.value {
+        Expr::Bytes(b) => b.clone(),
+        other => {
+            return Err(NativeError {
+                message: format!(
+                    "native bytes output (brick b1) only supports a `b\"...\"` literal body, \
+                     got {:?}; bytes concat / number→bytes / lowering are later bricks — use --run (interpreter)",
+                    other
+                ),
+            });
+        }
+    };
+    let mut code = Vec::new();
+    let ctx = emit_record_loop_prologue(&mut code, rule, concept, None, all_rules, all_resources, all_connections, concept_group)?;
+
+    emit_write_bytes_literal(&mut code, &bytes, 1);
 
     // jmp loop_top
     code.push(0xE9);
@@ -11157,7 +11230,7 @@ fn emit_reaction_program<'a>(
 /// This prevents the native backend from emitting code that would overflow the stack.
 fn max_stack_depth(expr: &Expr) -> usize {
     match expr {
-        Expr::Number(_) | Expr::Text(_) | Expr::Ident(_) => 0,
+        Expr::Number(_) | Expr::Text(_) | Expr::Bytes(_) | Expr::Ident(_) => 0,
         Expr::Field(base, _) => max_stack_depth(base),
         Expr::Binary(_, left, right) => {
             // Left is evaluated first and pushed, then right is evaluated
@@ -11546,6 +11619,15 @@ fn emit_eval_expr(
         Expr::Text(_) => {
             Err(NativeError {
                 message: "text literals not supported in native backend (use --compile for Rust transpiler)".into(),
+            })
+        }
+        Expr::Bytes(_) => {
+            // Backend brick b1: a `b"..."` literal is only valid as the whole
+            // body of an `output: bytes` rule (handled by emit_bytes_program).
+            // It has no scalar (rax) representation, so reaching the generic
+            // expression evaluator means it was used in an unsupported context.
+            Err(NativeError {
+                message: "bytes literal cannot be used as a scalar expression (brick b1 supports `b\"...\"` only as the whole body of an `output: bytes` rule)".into(),
             })
         }
         Expr::Field(base, field_name) => {
@@ -16356,6 +16438,7 @@ fn expr_kind(e: &Expr) -> &'static str {
     match e {
         Expr::Number(_) => "Number",
         Expr::Text(_) => "Text",
+        Expr::Bytes(_) => "Bytes",
         Expr::Ident(_) => "Ident",
         Expr::Field(_, _) => "Field",
         Expr::Binary(_, _, _) => "Binary",
@@ -18656,6 +18739,104 @@ rule discount_purchase
         );
 
         let _ = fs::remove_file(out);
+    }
+
+    /// Backend brick b1: a rule `output: bytes` whose body is a `b"..."`
+    /// literal must emit EXACTLY those raw bytes to stdout — no trailing
+    /// newline, no extra bytes. Covers the basic blob (`mov rbx, rax`
+    /// encoding) and the full-range escape blob (00 0f ff 80) to prove every
+    /// byte 0x00..=0xFF round-trips through the lexer's `\xNN` escape and the
+    /// native data-section embedding.
+    #[test]
+    fn bytes_literal_emits_raw_bytes() {
+        use std::fs;
+        use std::process::Command;
+        let src = r#"@verbose 0.1.0
+
+concept Trigger
+  @intention: "Trivial trigger"
+  @source: machine_bytes.intent:1
+
+  fields:
+    n : number [0, 1]
+
+
+rule mov_rbx_rax
+  @intention: "Emit `mov rbx, rax`"
+  @source: machine_bytes.intent:2
+
+  input:
+    t : Trigger
+
+  output:
+    code : bytes
+
+  logic:
+    code = b"\x48\x89\xc3"
+
+  proofs:
+    purity:
+      reads   : []
+      calls   : []
+    termination:
+      bound : 1
+
+
+rule full_range
+  @intention: "Emit a full-range blob"
+  @source: machine_bytes.intent:3
+
+  input:
+    t : Trigger
+
+  output:
+    code : bytes
+
+  logic:
+    code = b"\x00\x0f\xff\x80"
+
+  proofs:
+    purity:
+      reads   : []
+      calls   : []
+    termination:
+      bound : 1
+"#;
+        let tokens = crate::lexer::Lexer::new(src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        // Rule 1: `mov rbx, rax` → exactly 48 89 c3, nothing else.
+        let out1 = std::env::temp_dir().join("verbosec_test_bytes_mov");
+        compile_native(&program, "mov_rbx_rax", out1.to_str().unwrap(), false, false)
+            .expect("bytes output rule must compile natively");
+        let run1 = Command::new(&out1)
+            .args(["1"])
+            .output()
+            .expect("spawn mov_rbx_rax");
+        assert_eq!(
+            run1.stdout,
+            vec![0x48u8, 0x89, 0xc3],
+            "bytes literal must emit exactly the raw bytes with no newline; got {:?}",
+            run1.stdout,
+        );
+
+        // Rule 2: full-range escapes → exactly 00 0f ff 80.
+        let out2 = std::env::temp_dir().join("verbosec_test_bytes_full");
+        compile_native(&program, "full_range", out2.to_str().unwrap(), false, false)
+            .expect("full-range bytes literal must compile natively");
+        let run2 = Command::new(&out2)
+            .args(["1"])
+            .output()
+            .expect("spawn full_range");
+        assert_eq!(
+            run2.stdout,
+            vec![0x00u8, 0x0f, 0xff, 0x80],
+            "full-range bytes literal must emit exactly 00 0f ff 80; got {:?}",
+            run2.stdout,
+        );
+
+        let _ = fs::remove_file(out1);
+        let _ = fs::remove_file(out2);
     }
 
     /// Nested match_result: an outer match_result whose Ok arm itself

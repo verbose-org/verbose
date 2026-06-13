@@ -10,6 +10,10 @@ pub enum Value {
     Number(i64),
     Bool(bool),
     Text(String),
+    /// Raw bytes — the runtime counterpart to Expr::Bytes / Type::Bytes.
+    /// Carries arbitrary 0x00..=0xFF content, never coerced to/from Text.
+    /// Printed raw (no escaping, no newline) by the --run output path.
+    Bytes(Vec<u8>),
     List(Vec<Value>),
     Record(HashMap<String, Value>),
     /// Ok(inner) — the success arm of a Result-typed output.
@@ -32,6 +36,10 @@ impl fmt::Display for Value {
             Value::Number(n) => write!(f, "{}", n),
             Value::Bool(b) => write!(f, "{}", b),
             Value::Text(s) => write!(f, "{}", s),
+            // Display is for diagnostics; the raw-byte output path is handled
+            // separately at the --run print site. Render lossily here so error
+            // messages stay readable.
+            Value::Bytes(b) => write!(f, "{}", String::from_utf8_lossy(b)),
             Value::List(items) => {
                 write!(f, "[")?;
                 for (i, v) in items.iter().enumerate() {
@@ -262,6 +270,7 @@ fn eval_expr(
     match expr {
         Expr::Number(n) => Ok(Value::Number(*n)),
         Expr::Text(s) => Ok(Value::Text(s.clone())),
+        Expr::Bytes(b) => Ok(Value::Bytes(b.clone())),
         Expr::Ident(name) => env.get(name).cloned().ok_or_else(|| RuntimeError {
             message: format!("undefined binding '{}'", name),
         }),

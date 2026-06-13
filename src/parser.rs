@@ -837,8 +837,18 @@ impl Parser {
         }
         let is_number = matches!(self.peek_kind(), Some(TokenKind::Number(_)));
         let is_string = matches!(self.peek_kind(), Some(TokenKind::StringLit(_)));
+        let is_bytes = matches!(self.peek_kind(), Some(TokenKind::BytesLit(_)));
         let is_ident = matches!(self.peek_kind(), Some(TokenKind::Ident(_)));
-        if is_string {
+        if is_bytes {
+            // `b"..."` byte-string literal → Expr::Bytes. Mirrors the StringLit
+            // → Expr::Text arm above, carrying raw bytes instead of a String.
+            let b = match self.peek_kind() {
+                Some(TokenKind::BytesLit(b)) => b.clone(),
+                _ => unreachable!("is_bytes guard"),
+            };
+            self.advance();
+            Ok(Expr::Bytes(b))
+        } else if is_string {
             let s = self.expect_string()?;
             Ok(Expr::Text(s))
         } else if is_number {

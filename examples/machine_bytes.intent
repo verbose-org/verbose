@@ -1,0 +1,3 @@
+1. A trivial trigger with a single number field.
+2. Emit the raw x86-64 machine-code bytes for `mov rbx, rax` (0x48 0x89 0xc3).
+3. Emit a full-range byte blob (0x00 0x0f 0xff 0x80) to prove every byte 0x00-0xff round-trips.

@@ -527,6 +527,12 @@ pub enum QuantifierKind {
 pub enum Expr {
     Number(i64),
     Text(String),
+    /// Raw byte-string literal `b"..."` — the arbitrary-content counterpart to
+    /// Text. Carries a Vec<u8> (bytes 0x00..=0xFF), never coerced to/from a
+    /// UTF-8 String. Backend (b1): a rule `output: bytes` whose body is one of
+    /// these emits the raw bytes to stdout, no trailing newline. The first
+    /// brick of the "emit arbitrary machine code" arc.
+    Bytes(Vec<u8>),
     Ident(String),
     Field(Box<Expr>, String),
     Binary(BinOp, Box<Expr>, Box<Expr>),

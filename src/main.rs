@@ -638,6 +638,16 @@ fn real_main() {
             );
             for (idx, record) in records.iter().enumerate() {
                 match interpreter::eval_rule(rule, &all_rules, &all_concepts, record) {
+                    // Backend brick b1: a bytes-typed result is written RAW to
+                    // stdout (no label, no escaping, no trailing newline) so the
+                    // interpreter output is byte-for-byte comparable with the
+                    // native backend's raw write(1, ...). All other value kinds
+                    // keep the human-readable labelled form.
+                    Ok(interpreter::Value::Bytes(b)) => {
+                        use std::io::Write;
+                        std::io::stdout().write_all(&b).unwrap();
+                        std::io::stdout().flush().unwrap();
+                    }
                     Ok(val) => {
                         println!("  [{}] {} = {}", idx, rule.output_name, val);
                     }
@@ -661,6 +671,12 @@ fn value_to_json(val: &interpreter::Value) -> String {
         interpreter::Value::Text(s) => {
             let escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
             format!("\"{}\"", escaped)
+        }
+        // Bytes have no canonical JSON representation (arbitrary 0x00..=0xFF);
+        // emit a "\xNN" string form for the --json path so it doesn't crash.
+        interpreter::Value::Bytes(b) => {
+            let hex: String = b.iter().map(|byte| format!("\\x{:02x}", byte)).collect();
+            format!("\"{}\"", hex)
         }
         interpreter::Value::List(items) => {
             let parts: Vec<String> = items.iter().map(value_to_json).collect();

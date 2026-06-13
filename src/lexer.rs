@@ -5,6 +5,7 @@ pub enum TokenKind {
     Ident(String),
     Number(i64),
     StringLit(String),
+    BytesLit(Vec<u8>),
     Attribute(String),
 
     Colon,
@@ -50,6 +51,7 @@ impl fmt::Display for TokenKind {
             TokenKind::Ident(s) => write!(f, "Ident({})", s),
             TokenKind::Number(n) => write!(f, "Number({})", n),
             TokenKind::StringLit(s) => write!(f, "String({:?})", s),
+            TokenKind::BytesLit(b) => write!(f, "Bytes({:?})", b),
             TokenKind::Attribute(s) => write!(f, "Attribute(@{})", s),
             TokenKind::Colon => write!(f, "':'"),
             TokenKind::Comma => write!(f, "','"),
@@ -345,6 +347,97 @@ impl<'a> Lexer<'a> {
             return Ok(());
         }
 
+        // Byte-string literal: `b"..."`. Only when `b` is IMMEDIATELY followed by
+        // a `"` — a bare `b` (or `bar`, `b + 1`) stays an identifier. Distinct from
+        // the regular `"..."` text path: a byte string carries raw bytes (Vec<u8>),
+        // not UTF-8, and additionally supports `\xNN` (two hex digits → one byte
+        // 0..=255). This is the only place `\xNN` is legal — text stays a closed
+        // UTF-8 escape set, untouched.
+        if c == b'b' && self.peek(1) == Some(b'"') {
+            self.advance(); // consume the `b`
+            self.advance(); // consume the opening `"`
+            let mut bytes: Vec<u8> = Vec::new();
+            while self.pos < self.src.len() && self.src[self.pos] != b'"' {
+                let ch = self.src[self.pos];
+                if ch == b'\n' {
+                    return Err(LexError {
+                        line: start_line,
+                        col: start_col,
+                        message: "unterminated byte-string literal".into(),
+                    });
+                }
+                if ch == b'\\' {
+                    self.advance();
+                    if self.pos >= self.src.len() {
+                        return Err(LexError {
+                            line: start_line,
+                            col: start_col,
+                            message: "unterminated byte-string literal after '\\'".into(),
+                        });
+                    }
+                    let esc = self.src[self.pos];
+                    match esc {
+                        b'n' => bytes.push(b'\n'),
+                        b't' => bytes.push(b'\t'),
+                        b'r' => bytes.push(b'\r'),
+                        b'\\' => bytes.push(b'\\'),
+                        b'"' => bytes.push(b'"'),
+                        b'x' | b'X' => {
+                            // \xNN — exactly two hex digits → one byte 0..=255.
+                            let hi = self.peek(1);
+                            let lo = self.peek(2);
+                            let (hi, lo) = match (hi, lo) {
+                                (Some(h), Some(l))
+                                    if (h as char).is_ascii_hexdigit()
+                                        && (l as char).is_ascii_hexdigit() =>
+                                {
+                                    (h, l)
+                                }
+                                _ => {
+                                    return Err(LexError {
+                                        line: self.line,
+                                        col: self.col,
+                                        message: "invalid \\x escape: expected two hex digits"
+                                            .into(),
+                                    });
+                                }
+                            };
+                            let val = (hex_val(hi) << 4) | hex_val(lo);
+                            bytes.push(val);
+                            // Consume the two hex digits (the `x` itself is
+                            // consumed by the shared advance below).
+                            self.advance();
+                            self.advance();
+                        }
+                        other => {
+                            return Err(LexError {
+                                line: self.line,
+                                col: self.col,
+                                message: format!(
+                                    "unknown escape '\\{}' in byte string (supported: \\n, \\r, \\t, \\\\, \\\", \\xNN)",
+                                    other as char
+                                ),
+                            });
+                        }
+                    }
+                    self.advance();
+                } else {
+                    bytes.push(ch);
+                    self.advance();
+                }
+            }
+            if self.pos >= self.src.len() {
+                return Err(LexError {
+                    line: start_line,
+                    col: start_col,
+                    message: "unterminated byte-string literal".into(),
+                });
+            }
+            self.advance(); // consume closing `"`
+            self.emit_token(TokenKind::BytesLit(bytes), start_line, start_col);
+            return Ok(());
+        }
+
         if is_ident_start(c) {
             let start = self.pos;
             while self.pos < self.src.len() && is_ident_continue(self.src[self.pos]) {
@@ -528,6 +621,18 @@ fn is_ident_start(c: u8) -> bool {
 
 fn is_ident_continue(c: u8) -> bool {
     c.is_ascii_alphanumeric() || c == b'_'
+}
+
+// Map a single ASCII hex digit (0-9, a-f, A-F) to its 0..=15 value. Callers
+// guarantee the byte is a hex digit (checked via is_ascii_hexdigit) before
+// calling, so the fallthrough is unreachable in practice.
+fn hex_val(c: u8) -> u8 {
+    match c {
+        b'0'..=b'9' => c - b'0',
+        b'a'..=b'f' => c - b'a' + 10,
+        b'A'..=b'F' => c - b'A' + 10,
+        _ => 0,
+    }
 }
 
 #[cfg(test)]
