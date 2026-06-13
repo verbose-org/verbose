@@ -1202,3 +1202,23 @@ there (out of the arithmetic evaluator's scope).
     values only). New concepts: TySpell, PrintParamsState, PrintBindsState, PrintRuleState,
     PrintProgState; new rules: ty_text, ret_text, print_params, print_params_rest,
     print_binds, print_rule, print_program, print_program_src. max_nodes unchanged.
+
+54. Brick 36 of the self-hosting arc: THE FIRST REAL LOWERING (pretty-printer becomes
+    code generator). Bricks 34/35 printed the AST back as SOURCE; this brick emits a
+    DIFFERENT target — a stack-machine intermediate language in postfix / RPN form.
+    `1 + 2 * 3` lowers to `1 2 3 * +`: the canonical first IR of a compiler backend,
+    post-order (operands before operator, the opposite of in-order source), requiring a
+    stack to evaluate. Reuses the streaming machinery exactly (post-order concat of
+    self-calls; same PrintState input = node + src). Rules: op_instr (the postfix
+    mnemonic for a binary-op code — bare + trailing space, vs op_text's infix padding),
+    lower_expr (post-order: AstBin emits both operands then op_instr; AstNeg/AstNot are
+    unary postfix; AstIf -> a 3-operand `select`; AstNum/AstBool push; AstVar -> a named
+    `load`; AstCall/AstField/AstStr -> `?`), lower_expr_src (driver: tokenize -> parse_or
+    -> lower_expr). VERIFIED END-TO-END by an external RPN/stack evaluator (the
+    streaming_lower_rpn_matches_eval_expr test): for the integer-closed subset
+    (arithmetic, comparison, logical, neg, not, if->select), run_rpn(lower_expr_src(e))
+    == eval_expr(e) — the lowered target computes the SAME value as the interpreter.
+    15/15 round-trips incl. division, modulo, and/or, neg, left-assoc, if->select.
+    Money shots: lower_expr_src("1 + 2 * 3") = "1 2 3 * + "; "10 - 2 - 3" = "10 2 - 3 - ";
+    "if 1 < 2 then 10 else 20" = "1 2 < 10 20 select ". The first Verbose program that
+    compiles an expression to a target OTHER than its source. Native-only (streaming).

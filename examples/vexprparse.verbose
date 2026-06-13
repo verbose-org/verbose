@@ -8900,6 +8900,111 @@ rule print_source
 
 
 -- ============================================================================
+-- BRICK 36 — THE FIRST REAL LOWERING (pretty-printer -> code generator). Bricks
+-- 34/35 printed the AST back as SOURCE. This brick emits a DIFFERENT target: a
+-- stack-machine intermediate language in postfix / RPN form. `1 + 2 * 3` lowers
+-- to `1 2 3 * +` — the canonical first IR of a compiler backend: post-order
+-- traversal (operands before their operator, the opposite of in-order source),
+-- and a form that REQUIRES a stack to evaluate. The streaming lowering carries
+-- it exactly as it carried the pretty-printer (post-order concat of self-calls),
+-- so this is "the same machine, a new target". Verified end-to-end externally:
+-- a stack/RPN evaluator over lower_expr_src(e) yields the SAME number as
+-- eval_expr(e) (see the streaming_lower_rpn test). The round-trip-verified
+-- subset is the integer-closed grammar: AstNum, AstBool, AstBin (arithmetic /
+-- comparison / logical), AstNeg, AstNot, AstIf (lowered to a 3-operand `select`
+-- — eager, pushes cond/thn/els). AstVar emits a best-effort `load <name>` token
+-- and AstCall/AstField/AstStr emit `?` — valid IL tokens but outside the pure-
+-- number RPN evaluator's domain, so the verified inputs avoid them.
+-- ============================================================================
+
+-- op_instr: the RPN operator token for an AST binary-operator code — the bare
+-- mnemonic plus a trailing space (postfix, no leading space, unlike op_text's
+-- infix padding). Arithmetic + - * / %, comparison == != < > <= >=, logical
+-- and / or. Unknown code => "? " (unreachable for parser-built nodes).
+rule op_instr
+  @intention: "Emit the postfix stack-machine mnemonic for an AST binary-operator code"
+  @source: vexprparse.intent:54
+  input:
+    o : OpSpell
+  output:
+    out : text
+  logic:
+    out = if o.op == 13 then "+ " else if o.op == 14 then "- " else if o.op == 15 then "* " else if o.op == 16 then "/ " else if o.op == 17 then "% " else if o.op == 1 then "== " else if o.op == 6 then "!= " else if o.op == 19 then "< " else if o.op == 20 then "> " else if o.op == 5 then "<= " else if o.op == 4 then ">= " else if o.op == 30 then "and " else if o.op == 31 then "or " else "? "
+  proofs:
+    purity:
+      reads : [o.op]
+      calls : []
+    termination:
+      bound : 64
+
+
+-- lower_expr: the code generator. Same shape as print_expr (it reuses PrintState
+-- = node + src), but emits POSTFIX stack code instead of parenthesized source.
+-- The key difference is ORDER: a binary node emits both operands FIRST, then the
+-- operator mnemonic (post-order), so the result is a valid RPN stream a stack
+-- machine runs left to right. Number/bool leaves push their literal; AstNeg/AstNot
+-- are unary postfix ops; AstIf becomes a 3-operand `select` (cond, thn, els all
+-- pushed, then select picks). AstVar lowers to a named `load`; the remaining
+-- variants emit `?` (outside the verified integer-closed subset — see the brick
+-- header). Streamed by the native backend exactly like print_expr.
+rule lower_expr
+  @intention: "Lower an AST expression to a postfix stack-machine instruction stream (RPN)"
+  @source: vexprparse.intent:54
+  input:
+    ps : PrintState
+  output:
+    out : text
+  logic:
+    out = match ps.node:
+      AstNum(value) => concat(value, " ")
+      AstBool(value) => concat(value, " ")
+      AstBin(op, lhs, rhs) => concat(lower_expr(PrintState { node: lhs, src: ps.src }), lower_expr(PrintState { node: rhs, src: ps.src }), op_instr(OpSpell { op: op }))
+      AstNeg(inner) => concat(lower_expr(PrintState { node: inner, src: ps.src }), "neg ")
+      AstNot(inner) => concat(lower_expr(PrintState { node: inner, src: ps.src }), "not ")
+      AstIf(cond, thn, els) => concat(lower_expr(PrintState { node: cond, src: ps.src }), lower_expr(PrintState { node: thn, src: ps.src }), lower_expr(PrintState { node: els, src: ps.src }), "select ")
+      AstVar(start, len) => concat("load ", substring(ps.src, start, start + len), " ")
+      AstField(base, fstart, flen) => "? "
+      AstCall(callee_start, callee_len, args) => "? "
+      AstStr(start, len) => "? "
+      AstErr => "? "
+  proofs:
+    purity:
+      reads : [ps.node, ps.src]
+      calls : [lower_expr, op_instr]
+    termination:
+      bound : 4000
+
+
+-- lower_expr_src: the brick-36 money-shot driver. Tokenize, parse with precedence,
+-- and emit the postfix stack-machine stream for the whole expression. The first
+-- Verbose program that compiles an expression to a target OTHER than its source.
+--
+--   lower_expr_src("1 + 2 * 3")  = "1 2 3 * + "    (push 1, push 2, push 3, mul, add -> 7)
+--   lower_expr_src("10 - 2 - 3") = "10 2 - 3 - "   (left-assoc: ((10-2)-3) -> 5)
+--
+-- NATIVE-ONLY (streaming text). Verified end-to-end: an RPN evaluator over this
+-- output yields eval_expr's number (the streaming_lower_rpn test).
+rule lower_expr_src
+  @intention: "Tokenize, parse, and lower an expression to a postfix stack-machine stream"
+  @source: vexprparse.intent:54
+  input:
+    s : ScanState
+  output:
+    out : text
+  logic:
+    let toks = tokenize(ScanState { source: s.source, pos: 0 })
+    let parsed = parse_or(ParseState { toks: toks, pos: 0 })
+    let root = parsed_node(parsed)
+    out = lower_expr(PrintState { node: root, src: s.source })
+  proofs:
+    purity:
+      reads : [s.source]
+      calls : [tokenize, parse_or, parsed_node, lower_expr]
+    termination:
+      bound : 256
+
+
+-- ============================================================================
 -- BRICK 35 — PRINT A WHOLE PROGRAM (the full-file emitter half). Brick 34
 -- printed one EXPRESSION; this brick prints every layer above it: rule headers
 -- (name, typed parameter list, return-type annotation), the `logic:` line, the

@@ -26828,6 +26828,105 @@ rule bad
         let _ = std::fs::remove_file(&out);
     }
 
+    /// Brick 36 — the first real LOWERING (pretty-printer -> code generator).
+    /// vexprparse's `lower_expr_src` compiles an expression to a postfix
+    /// stack-machine stream (RPN); this test is the external oracle that
+    /// proves the lowering is CORRECT: a stack/RPN evaluator over the
+    /// lowered output yields the same number as `eval_expr` (the
+    /// interpreter) for the integer-closed subset. `1 + 2 * 3` lowers to
+    /// `1 2 3 * +` and both compute 7.
+    #[test]
+    fn streaming_lower_rpn_matches_eval_expr() {
+        let src = std::fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+        let lo = std::env::temp_dir().join("verbosec_test_lower_expr_src");
+        let ev = std::env::temp_dir().join("verbosec_test_eval_expr_for_lower");
+        compile_native(&program, "lower_expr_src", lo.to_str().unwrap(), false, false)
+            .expect("lower_expr_src must compile natively (streaming)");
+        compile_native(&program, "eval_expr", ev.to_str().unwrap(), false, false)
+            .expect("eval_expr must compile natively");
+
+        // A minimal RPN / stack-machine evaluator — the oracle. Integer
+        // domain, matching eval_expr's semantics (comparisons -> 1/0,
+        // and/or on operands != 0, division/modulo truncating toward zero,
+        // `select` = ternary picking thn when cond != 0).
+        fn run_rpn(s: &str) -> i64 {
+            let mut st: Vec<i64> = Vec::new();
+            for t in s.split_whitespace() {
+                if let Ok(n) = t.parse::<i64>() {
+                    st.push(n);
+                    continue;
+                }
+                match t {
+                    "neg" => { let a = st.pop().unwrap(); st.push(-a); }
+                    "not" => { let a = st.pop().unwrap(); st.push(if a == 0 { 1 } else { 0 }); }
+                    "select" => {
+                        let els = st.pop().unwrap();
+                        let thn = st.pop().unwrap();
+                        let cond = st.pop().unwrap();
+                        st.push(if cond != 0 { thn } else { els });
+                    }
+                    _ => {
+                        let b = st.pop().unwrap();
+                        let a = st.pop().unwrap();
+                        let r = match t {
+                            "+" => a + b,
+                            "-" => a - b,
+                            "*" => a * b,
+                            "/" => if b != 0 { a / b } else { 0 },
+                            "%" => if b != 0 { a % b } else { 0 },
+                            "==" => (a == b) as i64,
+                            "!=" => (a != b) as i64,
+                            "<" => (a < b) as i64,
+                            ">" => (a > b) as i64,
+                            "<=" => (a <= b) as i64,
+                            ">=" => (a >= b) as i64,
+                            "and" => ((a != 0) && (b != 0)) as i64,
+                            "or" => ((a != 0) || (b != 0)) as i64,
+                            other => panic!("RPN: unknown token {:?}", other),
+                        };
+                        st.push(r);
+                    }
+                }
+            }
+            *st.last().expect("RPN stack non-empty")
+        }
+
+        let run = |bin: &std::path::Path, expr: &str| -> String {
+            let r = std::process::Command::new(bin)
+                .arg(expr)
+                .arg("0")
+                .output()
+                .expect("spawn driver");
+            assert!(r.status.success(), "{:?}({}) must exit 0; got {:?}", bin, expr, r.status);
+            String::from_utf8_lossy(&r.stdout).trim().to_string()
+        };
+
+        // The integer-closed verified subset: arithmetic, comparison,
+        // logical, neg, not, and if->select. (Vars/calls/strings are out
+        // of the RPN evaluator's domain and excluded here by construction.)
+        let exprs = [
+            "1 + 2 * 3", "10 - 2 - 3", "2 * 3 > 5", "1 + 2 == 3",
+            "not (1 < 2)", "if 1 < 2 then 10 else 20", "100 / 7", "100 % 7",
+            "2 < 3 and 4 < 5", "1 > 2 or 3 < 4", "- 5 + 2", "if 0 then 1 else 2",
+            "(1 + 2) * (3 + 4)", "10 >= 10", "7 != 7",
+        ];
+        for e in exprs {
+            let lowered = run(&lo, e);
+            let expected: i64 = run(&ev, e).parse().expect("eval_expr returns an integer");
+            let got = run_rpn(&lowered);
+            assert_eq!(
+                got, expected,
+                "lower(e) must compute eval_expr(e): e={:?} rpn={:?} run_rpn={} eval_expr={}",
+                e, lowered, got, expected
+            );
+        }
+        let _ = std::fs::remove_file(&lo);
+        let _ = std::fs::remove_file(&ev);
+    }
+
     /// Phase A slice 5.3 — multi-field recursive native callable.
     /// First Verbose binary that passes a multi-field record across
     /// `call`/`ret` via the Option A ABI: rdi = pointer to a fields
