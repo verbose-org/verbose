@@ -1222,3 +1222,38 @@ there (out of the arithmetic evaluator's scope).
     Money shots: lower_expr_src("1 + 2 * 3") = "1 2 3 * + "; "10 - 2 - 3" = "10 2 - 3 - ";
     "if 1 < 2 then 10 else 20" = "1 2 < 10 20 select ". The first Verbose program that
     compiles an expression to a target OTHER than its source. Native-only (streaming).
+
+55. Brick 37 of the self-hosting arc: LOWER A WHOLE PROGRAM to the stack IL (a function
+    becomes a callable routine). Brick 36 lowered one expression; this lowers every rule.
+    Calling convention: a routine is `proc NAME p1 p2 ... <body ops> ret`; a call site
+    emits its argument ops (left to right) then `call NAME` (NO argc — the VM reads the
+    callee proc's param count); the VM pops that many values, binds them to the callee's
+    params by position into a fresh frame, runs the routine, and `ret` leaves the return
+    value on the stack. `let NAME = expr` lowers to `<value ops> store NAME` sharing the
+    frame's name->value map with the params, so `load NAME` resolves either.
+    IMPORTANT — brick 37 GENERALIZES brick 36's eager 3-operand `select` to the structured
+    LAZY `if`/`else`/`endif` (only the taken branch runs; the VM skips regions with
+    nesting-aware depth matching, no labels). This is what makes RECURSION terminate:
+    factorial's `else n * fact(n-1)` is NOT evaluated when n == 0, so `select` (which
+    evaluates both arms) would have looped forever. lower_expr's AstIf and AstCall arms
+    changed accordingly; the brick-36 expression round-trip test's VM was updated to the
+    if/else/endif form (still 15/15). New rules: lower_args (call args, no separators —
+    the stack carries the boundary), lower_params (bare param names for the proc header),
+    lower_binds (let -> store), lower_rule (proc header + binds + body + ret; accessors
+    hoisted into lets exactly like print_rule, since inline nested accessor calls in a
+    streaming concat hit the recursive-match number-emit limitation), lower_program (one
+    proc per rule), lower_program_src (driver: begin_tokenize -> parse_program ->
+    lower_program). VERIFIED END-TO-END by an IL VM (named procs, a call stack with
+    per-frame param/let bindings, structured lazy if/else/endif) — the
+    streaming_lower_program_matches_eval_main test: run_il(lower_program_src(p), first_proc)
+    == eval_main(p). 4/4 incl. recursive factorial -> 120, double(add(3,4)) -> 14 (nested
+    calls), sq(5) with a let -> 26, fib(10) -> 55 (double recursion). Money shot:
+    lower_program_src(factorial) = "proc main \n5 call fact ret\nproc fact n \nload n 0 ==
+    if 1 else load n load n 1 - call fact * endif ret\n". The first Verbose program that
+    compiles a multi-rule PROGRAM to a target other than its source. Native-only (streaming).
+    Existing binaries byte-identical (the if/else/endif change + new rules leak into no
+    non-streaming path). Streaming gap found + worked around (not a compiler change): a
+    recursive number-returning rule (arg_list_len) used as a concat number arg in a
+    streaming body hits emit_eval_expr's "MatchVariant A.4.1 scrutinee = Call only" limit;
+    dropped argc from the IL (the VM infers arity from the proc header), which also made
+    the IL cleaner.

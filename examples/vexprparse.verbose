@@ -8961,16 +8961,39 @@ rule lower_expr
       AstBin(op, lhs, rhs) => concat(lower_expr(PrintState { node: lhs, src: ps.src }), lower_expr(PrintState { node: rhs, src: ps.src }), op_instr(OpSpell { op: op }))
       AstNeg(inner) => concat(lower_expr(PrintState { node: inner, src: ps.src }), "neg ")
       AstNot(inner) => concat(lower_expr(PrintState { node: inner, src: ps.src }), "not ")
-      AstIf(cond, thn, els) => concat(lower_expr(PrintState { node: cond, src: ps.src }), lower_expr(PrintState { node: thn, src: ps.src }), lower_expr(PrintState { node: els, src: ps.src }), "select ")
+      AstIf(cond, thn, els) => concat(lower_expr(PrintState { node: cond, src: ps.src }), "if ", lower_expr(PrintState { node: thn, src: ps.src }), "else ", lower_expr(PrintState { node: els, src: ps.src }), "endif ")
       AstVar(start, len) => concat("load ", substring(ps.src, start, start + len), " ")
       AstField(base, fstart, flen) => "? "
-      AstCall(callee_start, callee_len, args) => "? "
+      AstCall(callee_start, callee_len, args) => concat(lower_args(PrintArgsState { args: args, src: ps.src }), "call ", substring(ps.src, callee_start, callee_start + callee_len), " ")
       AstStr(start, len) => "? "
       AstErr => "? "
   proofs:
     purity:
       reads : [ps.node, ps.src]
-      calls : [lower_expr, op_instr]
+      calls : [lower_expr, op_instr, lower_args]
+    termination:
+      bound : 4000
+
+
+-- lower_args: stream a call's argument list as IL, in left-to-right order — each
+-- argument lowers to ops that leave its value on the stack; the caller then emits
+-- `call NAME argc`. No separators (unlike print_args' commas): the stack carries
+-- the boundary. ArgNil contributes nothing.
+rule lower_args
+  @intention: "Lower a call-argument list to IL ops, left to right, one value per arg on the stack"
+  @source: vexprparse.intent:54
+  input:
+    pa : PrintArgsState
+  output:
+    out : text
+  logic:
+    out = match pa.args:
+      ArgCons(head, tail) => concat(lower_expr(PrintState { node: head, src: pa.src }), lower_args(PrintArgsState { args: tail, src: pa.src }))
+      ArgNil => ""
+  proofs:
+    purity:
+      reads : [pa.args, pa.src]
+      calls : [lower_expr, lower_args]
     termination:
       bound : 4000
 
@@ -9000,6 +9023,143 @@ rule lower_expr_src
     purity:
       reads : [s.source]
       calls : [tokenize, parse_or, parsed_node, lower_expr]
+    termination:
+      bound : 256
+
+
+-- ============================================================================
+-- BRICK 37 — LOWER A WHOLE PROGRAM to the stack IL (a function -> a routine).
+-- Brick 36 lowered one EXPRESSION; this brick lowers every rule to a named
+-- routine the IL VM can call. The calling convention: a routine is `proc NAME
+-- p1 p2 ... <body ops> ret`; a call site emits its argument ops (left to right,
+-- one value each) then `call NAME argc`; the VM pops argc values, binds them to
+-- the callee's params by position into a fresh frame, runs the routine, and `ret`
+-- pops the frame leaving the return value on the stack. `let` bindings lower to
+-- `<value ops> store NAME`, sharing the frame's name->value map with the params,
+-- so `load NAME` resolves either. Control flow is the brick-36 structured
+-- `if`/`else`/`endif` (lazy — only the taken branch runs), which is what makes
+-- RECURSION terminate: factorial's `else n * fact(n-1)` is NOT evaluated when
+-- n == 0. Verified end-to-end: an IL VM (frames + call stack + structured if)
+-- over lower_program_src(p) yields the SAME number as eval_main(p) — including
+-- recursive factorial -> 120 (the streaming_lower_program test).
+-- ============================================================================
+
+-- lower_params: the routine header's parameter names, space-separated and bare
+-- (the VM binds call args to these by position). PNil -> empty.
+rule lower_params
+  @intention: "Emit a routine's parameter names, space-separated, for the IL proc header"
+  @source: vexprparse.intent:55
+  input:
+    pp : PrintParamsState
+  output:
+    out : text
+  logic:
+    out = match pp.params:
+      PCons(name_start, name_len, ty, rest) => concat(substring(pp.src, name_start, name_start + name_len), " ", lower_params(PrintParamsState { params: rest, src: pp.src }))
+      PNil => ""
+  proofs:
+    purity:
+      reads : [pp.params, pp.src]
+      calls : [lower_params]
+    termination:
+      bound : 4000
+
+
+-- lower_binds: each `let NAME = expr` lowers to the value's ops followed by
+-- `store NAME` (the VM pops and binds NAME in the current frame, so a later
+-- `load NAME` finds it). Bindings stream in source order, so an earlier let is
+-- bound before a later one references it. BNil -> empty.
+rule lower_binds
+  @intention: "Lower a rule's let-bindings to `<value ops> store NAME` sequences in source order"
+  @source: vexprparse.intent:55
+  input:
+    pb : PrintBindsState
+  output:
+    out : text
+  logic:
+    out = match pb.binds:
+      BCons(name_start, name_len, value, rest) => concat(lower_expr(PrintState { node: value, src: pb.src }), "store ", substring(pb.src, name_start, name_start + name_len), " ", lower_binds(PrintBindsState { binds: rest, src: pb.src }))
+      BNil => ""
+  proofs:
+    purity:
+      reads : [pb.binds, pb.src]
+      calls : [lower_expr, lower_binds]
+    termination:
+      bound : 4000
+
+
+-- lower_rule: one rule -> one IL routine. `proc NAME <params>` header, then the
+-- let-bindings (as store ops), then the out-expression's ops, then `ret`. The
+-- `\n` separators keep routines line-delimited so the VM can scan proc headers.
+rule lower_rule
+  @intention: "Lower one rule declaration to a named IL routine (proc header, body ops, ret)"
+  @source: vexprparse.intent:55
+  input:
+    pr : PrintRuleState
+  output:
+    out : text
+  logic:
+    let ns = rd_name_start(pr.rd)
+    let nl = rd_name_len(pr.rd)
+    let blk = rd_body(pr.rd)
+    let binds = block_binds(blk)
+    let result = block_result(blk)
+    out = concat("proc ", substring(pr.src, ns, ns + nl), " ", lower_params(PrintParamsState { params: rd_params(pr.rd), src: pr.src }), "\n", lower_binds(PrintBindsState { binds: binds, src: pr.src }), lower_expr(PrintState { node: result, src: pr.src }), "ret\n")
+  proofs:
+    purity:
+      reads : [pr.rd, pr.src]
+      calls : [rd_name_start, rd_name_len, rd_body, block_binds, block_result, rd_params, lower_params, lower_binds, lower_expr]
+    termination:
+      bound : 4000
+
+
+-- lower_program: every rule, in source order, as its IL routine.
+rule lower_program
+  @intention: "Lower a whole program to its stack-IL routines, one proc per rule"
+  @source: vexprparse.intent:55
+  input:
+    pg : PrintProgState
+  output:
+    out : text
+  logic:
+    out = match pg.rules:
+      RCons(head, tail) => concat(lower_rule(PrintRuleState { rd: head, src: pg.src }), lower_program(PrintProgState { rules: tail, src: pg.src }))
+      RNil => ""
+  proofs:
+    purity:
+      reads : [pg.rules, pg.src]
+      calls : [lower_rule, lower_program]
+    termination:
+      bound : 4000
+
+
+-- lower_program_src: the brick-37 money-shot driver. Tokenize (with INDENT/DEDENT),
+-- parse the whole program, and lower every rule to its IL routine. The first
+-- Verbose program that compiles a multi-rule PROGRAM to a target other than its
+-- source — a function becomes a callable routine, with params, frames, and
+-- recursion-safe control flow.
+--
+--   lower_program_src("rule main\n  logic:\n    out = fact(5)\nrule fact(n)\n  logic:\n    out = if n == 0 then 1 else n * fact(n - 1)")
+--     = "proc main \n5 call fact ret\nproc fact n \nload n 0 == if 1 else load n load n 1 - call fact * endif ret\n"
+--   (a call carries no argc — the VM reads the callee proc's param count.) An IL
+--   VM running proc main -> 120 (== eval_main of the same program).
+--
+-- NATIVE-ONLY (streaming text). Verified by the IL VM in streaming_lower_program.
+rule lower_program_src
+  @intention: "Tokenize, parse, and lower a whole program to its stack-IL routines"
+  @source: vexprparse.intent:55
+  input:
+    s : ScanState
+  output:
+    out : text
+  logic:
+    let toks = begin_tokenize(ScanState { source: s.source, pos: 0 })
+    let prog = parse_program(ProgramState { toks: toks, src: s.source, pos: 0 })
+    out = lower_program(PrintProgState { rules: prog, src: s.source })
+  proofs:
+    purity:
+      reads : [s.source]
+      calls : [begin_tokenize, parse_program, lower_program]
     termination:
       bound : 256
 

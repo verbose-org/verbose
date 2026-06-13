@@ -26848,50 +26848,66 @@ rule bad
         compile_native(&program, "eval_expr", ev.to_str().unwrap(), false, false)
             .expect("eval_expr must compile natively");
 
-        // A minimal RPN / stack-machine evaluator — the oracle. Integer
-        // domain, matching eval_expr's semantics (comparisons -> 1/0,
-        // and/or on operands != 0, division/modulo truncating toward zero,
-        // `select` = ternary picking thn when cond != 0).
-        fn run_rpn(s: &str) -> i64 {
-            let mut st: Vec<i64> = Vec::new();
-            for t in s.split_whitespace() {
-                if let Ok(n) = t.parse::<i64>() {
-                    st.push(n);
-                    continue;
+        // A small stack-IL evaluator — the oracle. Integer domain matching
+        // eval_expr (comparisons -> 1/0, and/or on operands != 0, division /
+        // modulo toward zero). `if`/`else`/`endif` is the structured lazy
+        // conditional (only the taken branch runs); region-skipping is
+        // nesting-aware. No labels, no calls (expression subset).
+        fn match_if(toks: &[&str], start: usize) -> (usize, usize) {
+            let (mut depth, mut i, mut els) = (0i32, start, usize::MAX);
+            while i < toks.len() {
+                match toks[i] {
+                    "if" => depth += 1,
+                    "endif" => { if depth == 0 { return (els, i); } depth -= 1; }
+                    "else" => { if depth == 0 { els = i; } }
+                    _ => {}
                 }
+                i += 1;
+            }
+            panic!("unmatched if in IL");
+        }
+        fn exec(toks: &[&str], lo: usize, hi: usize, st: &mut Vec<i64>) {
+            let mut i = lo;
+            while i < hi {
+                let t = toks[i];
+                if let Ok(n) = t.parse::<i64>() { st.push(n); i += 1; continue; }
                 match t {
-                    "neg" => { let a = st.pop().unwrap(); st.push(-a); }
-                    "not" => { let a = st.pop().unwrap(); st.push(if a == 0 { 1 } else { 0 }); }
-                    "select" => {
-                        let els = st.pop().unwrap();
-                        let thn = st.pop().unwrap();
+                    "neg" => { let a = st.pop().unwrap(); st.push(-a); i += 1; }
+                    "not" => { let a = st.pop().unwrap(); st.push((a == 0) as i64); i += 1; }
+                    "if" => {
                         let cond = st.pop().unwrap();
-                        st.push(if cond != 0 { thn } else { els });
+                        let (els, end) = match_if(toks, i + 1);
+                        if cond != 0 {
+                            exec(toks, i + 1, if els != usize::MAX { els } else { end }, st);
+                        } else if els != usize::MAX {
+                            exec(toks, els + 1, end, st);
+                        }
+                        i = end + 1;
                     }
                     _ => {
                         let b = st.pop().unwrap();
                         let a = st.pop().unwrap();
-                        let r = match t {
-                            "+" => a + b,
-                            "-" => a - b,
-                            "*" => a * b,
+                        st.push(match t {
+                            "+" => a + b, "-" => a - b, "*" => a * b,
                             "/" => if b != 0 { a / b } else { 0 },
                             "%" => if b != 0 { a % b } else { 0 },
-                            "==" => (a == b) as i64,
-                            "!=" => (a != b) as i64,
-                            "<" => (a < b) as i64,
-                            ">" => (a > b) as i64,
-                            "<=" => (a <= b) as i64,
-                            ">=" => (a >= b) as i64,
+                            "==" => (a == b) as i64, "!=" => (a != b) as i64,
+                            "<" => (a < b) as i64, ">" => (a > b) as i64,
+                            "<=" => (a <= b) as i64, ">=" => (a >= b) as i64,
                             "and" => ((a != 0) && (b != 0)) as i64,
                             "or" => ((a != 0) || (b != 0)) as i64,
-                            other => panic!("RPN: unknown token {:?}", other),
-                        };
-                        st.push(r);
+                            other => panic!("IL: unknown token {:?}", other),
+                        });
+                        i += 1;
                     }
                 }
             }
-            *st.last().expect("RPN stack non-empty")
+        }
+        fn run_rpn(s: &str) -> i64 {
+            let toks: Vec<&str> = s.split_whitespace().collect();
+            let mut st: Vec<i64> = Vec::new();
+            exec(&toks, 0, toks.len(), &mut st);
+            *st.last().expect("IL stack non-empty")
         }
 
         let run = |bin: &std::path::Path, expr: &str| -> String {
@@ -26905,8 +26921,8 @@ rule bad
         };
 
         // The integer-closed verified subset: arithmetic, comparison,
-        // logical, neg, not, and if->select. (Vars/calls/strings are out
-        // of the RPN evaluator's domain and excluded here by construction.)
+        // logical, neg, not, and if/else/endif. (Vars/calls/strings are out
+        // of the evaluator's domain and excluded here by construction.)
         let exprs = [
             "1 + 2 * 3", "10 - 2 - 3", "2 * 3 > 5", "1 + 2 == 3",
             "not (1 < 2)", "if 1 < 2 then 10 else 20", "100 / 7", "100 % 7",
@@ -26925,6 +26941,160 @@ rule bad
         }
         let _ = std::fs::remove_file(&lo);
         let _ = std::fs::remove_file(&ev);
+    }
+
+    /// Brick 37 — lower a whole PROGRAM to the stack IL (a function -> a
+    /// routine). The external oracle: an IL VM (named procs, a call stack
+    /// with per-frame param/let bindings, structured lazy if/else/endif)
+    /// runs lower_program_src(p)'s output and yields the SAME number as
+    /// eval_main(p) — including recursive factorial -> 120. Proves the
+    /// program-level code generator is correct.
+    #[test]
+    fn streaming_lower_program_matches_eval_main() {
+        use std::collections::HashMap;
+        type Procs = HashMap<String, (Vec<String>, Vec<String>)>;
+
+        let src = std::fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+        let lp = std::env::temp_dir().join("verbosec_test_lower_program_src");
+        let em = std::env::temp_dir().join("verbosec_test_eval_main_for_lower");
+        compile_native(&program, "lower_program_src", lp.to_str().unwrap(), false, false)
+            .expect("lower_program_src must compile natively (streaming)");
+        compile_native(&program, "eval_main", em.to_str().unwrap(), false, false)
+            .expect("eval_main must compile natively");
+
+        // Parse the IL: each routine is `proc NAME params...` then body
+        // tokens through the closing `ret`.
+        fn parse_procs(il: &str) -> Procs {
+            let lines: Vec<&str> = il.lines().filter(|l| !l.trim().is_empty()).collect();
+            let mut procs: Procs = HashMap::new();
+            let mut i = 0;
+            while i < lines.len() {
+                let hdr: Vec<&str> = lines[i].split_whitespace().collect();
+                assert_eq!(hdr[0], "proc", "routine must start with proc: {:?}", lines[i]);
+                let name = hdr[1].to_string();
+                let params: Vec<String> = hdr[2..].iter().map(|s| s.to_string()).collect();
+                let mut body: Vec<String> = Vec::new();
+                i += 1;
+                while i < lines.len() {
+                    let bt: Vec<&str> = lines[i].split_whitespace().collect();
+                    let has_ret = bt.iter().any(|t| *t == "ret");
+                    body.extend(bt.iter().map(|s| s.to_string()));
+                    i += 1;
+                    if has_ret { break; }
+                }
+                assert_eq!(body.last().map(|s| s.as_str()), Some("ret"), "routine must end with ret");
+                body.pop();
+                procs.insert(name, (params, body));
+            }
+            procs
+        }
+        fn match_if(body: &[String], start: usize) -> (usize, usize) {
+            let (mut depth, mut i, mut els) = (0i32, start, usize::MAX);
+            while i < body.len() {
+                match body[i].as_str() {
+                    "if" => depth += 1,
+                    "endif" => { if depth == 0 { return (els, i); } depth -= 1; }
+                    "else" => { if depth == 0 { els = i; } }
+                    _ => {}
+                }
+                i += 1;
+            }
+            panic!("unmatched if in IL");
+        }
+        fn run(procs: &Procs, name: &str, args: &[i64]) -> i64 {
+            let (params, body) = procs.get(name).unwrap_or_else(|| panic!("no proc {}", name));
+            let mut frame: HashMap<String, i64> =
+                params.iter().cloned().zip(args.iter().cloned()).collect();
+            let mut st: Vec<i64> = Vec::new();
+            exec(procs, body, 0, body.len(), &mut frame, &mut st);
+            *st.last().expect("IL stack non-empty at ret")
+        }
+        fn exec(procs: &Procs, body: &[String], lo: usize, hi: usize,
+                frame: &mut HashMap<String, i64>, st: &mut Vec<i64>) {
+            let mut i = lo;
+            while i < hi {
+                let t = body[i].as_str();
+                if let Ok(n) = t.parse::<i64>() { st.push(n); i += 1; continue; }
+                match t {
+                    "load" => { let v = frame[&body[i + 1]]; st.push(v); i += 2; }
+                    "store" => { let v = st.pop().unwrap(); frame.insert(body[i + 1].clone(), v); i += 2; }
+                    "call" => {
+                        let callee = &body[i + 1];
+                        let n = procs.get(callee).unwrap_or_else(|| panic!("no proc {}", callee)).0.len();
+                        let mut popped = Vec::with_capacity(n);
+                        for _ in 0..n { popped.push(st.pop().unwrap()); }
+                        let cargs: Vec<i64> = (0..n).map(|k| popped[n - 1 - k]).collect();
+                        st.push(run(procs, callee, &cargs));
+                        i += 2;
+                    }
+                    "neg" => { let a = st.pop().unwrap(); st.push(-a); i += 1; }
+                    "not" => { let a = st.pop().unwrap(); st.push((a == 0) as i64); i += 1; }
+                    "if" => {
+                        let cond = st.pop().unwrap();
+                        let (els, end) = match_if(body, i + 1);
+                        if cond != 0 {
+                            exec(procs, body, i + 1, if els != usize::MAX { els } else { end }, frame, st);
+                        } else if els != usize::MAX {
+                            exec(procs, body, els + 1, end, frame, st);
+                        }
+                        i = end + 1;
+                    }
+                    _ => {
+                        let b = st.pop().unwrap();
+                        let a = st.pop().unwrap();
+                        st.push(match t {
+                            "+" => a + b, "-" => a - b, "*" => a * b,
+                            "/" => if b != 0 { a / b } else { 0 },
+                            "%" => if b != 0 { a % b } else { 0 },
+                            "==" => (a == b) as i64, "!=" => (a != b) as i64,
+                            "<" => (a < b) as i64, ">" => (a > b) as i64,
+                            "<=" => (a <= b) as i64, ">=" => (a >= b) as i64,
+                            "and" => ((a != 0) && (b != 0)) as i64,
+                            "or" => ((a != 0) || (b != 0)) as i64,
+                            other => panic!("IL: unknown token {:?}", other),
+                        });
+                        i += 1;
+                    }
+                }
+            }
+        }
+
+        let run_native = |bin: &std::path::Path, prog_src: &str| -> String {
+            let r = std::process::Command::new(bin)
+                .arg(prog_src)
+                .arg("0")
+                .output()
+                .expect("spawn driver");
+            assert!(r.status.success(), "{:?} must exit 0; got {:?}", bin, r.status);
+            String::from_utf8_lossy(&r.stdout).trim().to_string()
+        };
+
+        // Programs whose first rule is the entry (run with no args), covering
+        // recursion (fact, fib), nested calls (double(add(..))), and lets (sq).
+        let progs = [
+            "rule main\n  logic:\n    out = fact(5)\nrule fact(n)\n  logic:\n    out = if n == 0 then 1 else n * fact(n - 1)",
+            "rule main\n  logic:\n    out = double(add(3, 4))\nrule add(x, y)\n  logic:\n    out = x + y\nrule double(x)\n  logic:\n    out = x * 2",
+            "rule main\n  logic:\n    out = sq(5)\nrule sq(n)\n  logic:\n    let d = n * n\n    out = d + 1",
+            "rule main\n  logic:\n    out = fib(10)\nrule fib(n)\n  logic:\n    out = if n < 2 then n else fib(n - 1) + fib(n - 2)",
+        ];
+        for p in progs {
+            let il = run_native(&lp, p);
+            let procs = parse_procs(&il);
+            // entry = the first proc in the IL = the first rule.
+            let first = il.split_whitespace().nth(1).expect("at least one proc").to_string();
+            let got = run(&procs, &first, &[]);
+            let expected: i64 = run_native(&em, p).parse().expect("eval_main returns an integer");
+            assert_eq!(
+                got, expected,
+                "run_il(lower_program(p)) must equal eval_main(p): entry={} il={:?} got={} eval_main={}",
+                first, il, got, expected
+            );
+        }
+        let _ = std::fs::remove_file(&lp);
+        let _ = std::fs::remove_file(&em);
     }
 
     /// Phase A slice 5.3 — multi-field recursive native callable.
