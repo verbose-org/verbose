@@ -1043,7 +1043,7 @@ fn collect_read_names_native(expr: &Expr, out: &mut Vec<String>) {
         // `length(<text_expr>)` — pure pass-through.
         Expr::Length(inner) => collect_read_names_native(inner, out),
         // `abs(<number_expr>)` — pure pass-through.
-        Expr::Abs(inner) | Expr::BitNot(inner) => collect_read_names_native(inner, out),
+        Expr::Abs(inner) | Expr::BitNot(inner) | Expr::Le32(inner) | Expr::Le64(inner) => collect_read_names_native(inner, out),
         // `min(a, b)` / `max(a, b)` — recurse into both children; either
         // side may carry a `read(...)` reference.
         Expr::Min(l, r) | Expr::Max(l, r) | Expr::BitAnd(l, r) | Expr::BitOr(l, r) | Expr::BitXor(l, r) | Expr::Shl(l, r) | Expr::Shr(l, r) => {
@@ -1102,7 +1102,7 @@ fn expr_uses_now_unix(e: &Expr) -> bool {
         Expr::Field(b, _) => expr_uses_now_unix(b),
         Expr::Binary(_, l, r) => expr_uses_now_unix(l) || expr_uses_now_unix(r),
         Expr::Not(i) | Expr::Neg(i) | Expr::Ok(i) | Expr::Err(i) => expr_uses_now_unix(i),
-        Expr::JsonEscape(i) | Expr::ParseInt(i) | Expr::Length(i) | Expr::Abs(i) | Expr::BitNot(i) => expr_uses_now_unix(i),
+        Expr::JsonEscape(i) | Expr::ParseInt(i) | Expr::Length(i) | Expr::Abs(i) | Expr::BitNot(i) | Expr::Le32(i) | Expr::Le64(i) => expr_uses_now_unix(i),
         Expr::If(c, t, el) => {
             expr_uses_now_unix(c) || expr_uses_now_unix(t) || expr_uses_now_unix(el)
         }
@@ -1205,7 +1205,7 @@ fn count_match_result_max_depth(expr: &Expr) -> usize {
                 .max(count_match_result_max_depth(e))
         }
         Expr::Ok(i) | Expr::Err(i) | Expr::Not(i) | Expr::Neg(i) | Expr::Abs(i) | Expr::BitNot(i)
-        | Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i) | Expr::BitNot(i) => {
+        | Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i) | Expr::Le32(i) | Expr::Le64(i) => {
             count_match_result_max_depth(i)
         }
         Expr::Binary(_, l, r) => {
@@ -1293,7 +1293,7 @@ fn expr_uses_field(e: &Expr, input_name: &str, field_name: &str) -> bool {
         Expr::Not(i) | Expr::Neg(i) | Expr::Ok(i) | Expr::Err(i) => {
             expr_uses_field(i, input_name, field_name)
         }
-        Expr::JsonEscape(i) | Expr::ParseInt(i) | Expr::Length(i) | Expr::Abs(i) | Expr::BitNot(i) => {
+        Expr::JsonEscape(i) | Expr::ParseInt(i) | Expr::Length(i) | Expr::Abs(i) | Expr::BitNot(i) | Expr::Le32(i) | Expr::Le64(i) => {
             expr_uses_field(i, input_name, field_name)
         }
         Expr::If(c, t, el) => {
@@ -1862,7 +1862,7 @@ fn collect_native_callees(expr: &Expr, out: &mut Vec<String>) {
             collect_native_callees(r, out);
         }
         Expr::Ok(i) | Expr::Err(i) | Expr::Not(i) | Expr::Neg(i) | Expr::Abs(i) | Expr::BitNot(i)
-        | Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i) | Expr::BitNot(i) => {
+        | Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i) | Expr::Le32(i) | Expr::Le64(i) => {
             collect_native_callees(i, out);
         }
         Expr::Min(a, b) | Expr::Max(a, b) | Expr::BitAnd(a, b) | Expr::BitOr(a, b) | Expr::BitXor(a, b) | Expr::Shl(a, b) | Expr::Shr(a, b) | Expr::StartsWith(a, b)
@@ -1990,7 +1990,7 @@ fn gather_transitive_callee_reads(
             gather_transitive_callee_reads(e, all_rules, visited, out);
         }
         Expr::Ok(i) | Expr::Err(i) | Expr::Not(i) | Expr::Neg(i) | Expr::Abs(i) | Expr::BitNot(i)
-        | Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i) | Expr::BitNot(i) => {
+        | Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i) | Expr::Le32(i) | Expr::Le64(i) => {
             gather_transitive_callee_reads(i, all_rules, visited, out);
         }
         Expr::Binary(_, l, r) => {
@@ -2249,7 +2249,7 @@ fn collect_fetch_names_native(expr: &Expr, out: &mut Vec<String>) {
         // `length(<text_expr>)` — pure pass-through.
         Expr::Length(inner) => collect_fetch_names_native(inner, out),
         // `abs(<number_expr>)` — pure pass-through.
-        Expr::Abs(inner) | Expr::BitNot(inner) => collect_fetch_names_native(inner, out),
+        Expr::Abs(inner) | Expr::BitNot(inner) | Expr::Le32(inner) | Expr::Le64(inner) => collect_fetch_names_native(inner, out),
         // `min(a, b)` / `max(a, b)` — recurse into both children.
         Expr::Min(l, r) | Expr::Max(l, r) | Expr::BitAnd(l, r) | Expr::BitOr(l, r) | Expr::BitXor(l, r) | Expr::Shl(l, r) | Expr::Shr(l, r) => {
             collect_fetch_names_native(l, out);
@@ -2559,7 +2559,7 @@ fn emit_connection_fetch_sequence(
             // `length(<text_expr>)` — pass-through.
             Expr::Length(inner) => first_fetch_for(inner, name),
             // `abs(<number_expr>)` — pass-through.
-            Expr::Abs(inner) | Expr::BitNot(inner) => first_fetch_for(inner, name),
+            Expr::Abs(inner) | Expr::BitNot(inner) | Expr::Le32(inner) | Expr::Le64(inner) => first_fetch_for(inner, name),
             // `min(a, b)` / `max(a, b)` — recurse into both children.
             Expr::Min(l, r) | Expr::Max(l, r) | Expr::BitAnd(l, r) | Expr::BitOr(l, r) | Expr::BitXor(l, r) | Expr::Shl(l, r) | Expr::Shr(l, r) => {
                 first_fetch_for(l, name).or_else(|| first_fetch_for(r, name))
@@ -2784,7 +2784,7 @@ fn find_group_variant_construct_in_expr(
         Expr::Binary(_, l, r) => find_group_variant_construct_in_expr(l, group_concepts)
             .or_else(|| find_group_variant_construct_in_expr(r, group_concepts)),
         Expr::Not(i) | Expr::Neg(i) | Expr::Ok(i) | Expr::Err(i)
-        | Expr::Abs(i) | Expr::BitNot(i) | Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i) | Expr::BitNot(i) => {
+        | Expr::Abs(i) | Expr::BitNot(i) | Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i) | Expr::Le32(i) | Expr::Le64(i) => {
             find_group_variant_construct_in_expr(i, group_concepts)
         }
         Expr::If(c, t, e) => find_group_variant_construct_in_expr(c, group_concepts)
@@ -2891,7 +2891,7 @@ fn find_group_match_variant_in_expr(
         Expr::Binary(_, l, r) => find_group_match_variant_in_expr(l, group_concepts, rule_input_name, rule_input_ty, all_rules)
             .or_else(|| find_group_match_variant_in_expr(r, group_concepts, rule_input_name, rule_input_ty, all_rules)),
         Expr::Not(i) | Expr::Neg(i) | Expr::Ok(i) | Expr::Err(i)
-        | Expr::Abs(i) | Expr::BitNot(i) | Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i) | Expr::BitNot(i) => {
+        | Expr::Abs(i) | Expr::BitNot(i) | Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i) | Expr::Le32(i) | Expr::Le64(i) => {
             find_group_match_variant_in_expr(i, group_concepts, rule_input_name, rule_input_ty, all_rules)
         }
         Expr::If(c, t, e) => find_group_match_variant_in_expr(c, group_concepts, rule_input_name, rule_input_ty, all_rules)
@@ -4340,7 +4340,7 @@ fn count_max_match_arm_binders(expr: &Expr) -> u32 {
             Expr::Field(b, _) => walk(b, m),
             Expr::Binary(_, l, r) => { walk(l, m); walk(r, m); }
             Expr::Not(i) | Expr::Neg(i) | Expr::Ok(i) | Expr::Err(i)
-            | Expr::Abs(i) | Expr::BitNot(i) | Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i) => walk(i, m),
+            | Expr::Abs(i) | Expr::BitNot(i) | Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i) | Expr::Le32(i) | Expr::Le64(i) => walk(i, m),
             Expr::If(c, t, ee) => { walk(c, m); walk(t, m); walk(ee, m); }
             Expr::Call(_, args) | Expr::Concat(args) => { for a in args { walk(a, m); } }
             Expr::Quantifier(_, c, _, body) => { walk(c, m); walk(body, m); }
@@ -4399,7 +4399,7 @@ fn count_max_match_arm_binder_slots(expr: &Expr, concept_group: Option<&ConceptG
             Expr::Field(b, _) => walk(b, m, cg),
             Expr::Binary(_, l, r) => { walk(l, m, cg); walk(r, m, cg); }
             Expr::Not(i) | Expr::Neg(i) | Expr::Ok(i) | Expr::Err(i)
-            | Expr::Abs(i) | Expr::BitNot(i) | Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i) | Expr::BitNot(i) => walk(i, m, cg),
+            | Expr::Abs(i) | Expr::BitNot(i) | Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i) | Expr::Le32(i) | Expr::Le64(i) => walk(i, m, cg),
             Expr::If(c, t, ee) => { walk(c, m, cg); walk(t, m, cg); walk(ee, m, cg); }
             Expr::Call(_, args) | Expr::Concat(args) => { for a in args { walk(a, m, cg); } }
             Expr::Quantifier(_, c, _, body) => { walk(c, m, cg); walk(body, m, cg); }
@@ -4431,7 +4431,7 @@ fn body_contains_variant_construct(expr: &Expr) -> bool {
         Expr::Field(b, _) => body_contains_variant_construct(b),
         Expr::Binary(_, l, r) => body_contains_variant_construct(l) || body_contains_variant_construct(r),
         Expr::Not(i) | Expr::Neg(i) | Expr::Ok(i) | Expr::Err(i)
-        | Expr::Abs(i) | Expr::BitNot(i) | Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i) | Expr::BitNot(i) => {
+        | Expr::Abs(i) | Expr::BitNot(i) | Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i) | Expr::Le32(i) | Expr::Le64(i) => {
             body_contains_variant_construct(i)
         }
         Expr::If(c, t, e) => body_contains_variant_construct(c) || body_contains_variant_construct(t) || body_contains_variant_construct(e),
@@ -5243,22 +5243,38 @@ fn emit_bytes_program<'a>(
     all_connections: &HashMap<&str, &'a Connection>,
     concept_group: Option<&'a ConceptGroup>,
 ) -> Result<Vec<u8>, NativeError> {
-    let bytes = match &rule.logic.value {
-        Expr::Bytes(b) => b.clone(),
+    // Backend brick b2: accept a `b"..."` literal (b1) OR a `concat(...)` of
+    // bytes args OR an le32/le64 at the top level. All are emitted by the
+    // streaming bytes body — each piece writes its raw bytes to fd 1 in order,
+    // no buffer, no trailing newline. Anything else stays a later brick.
+    match &rule.logic.value {
+        Expr::Bytes(_) | Expr::Concat(_) | Expr::Le32(_) | Expr::Le64(_) => {}
         other => {
             return Err(NativeError {
                 message: format!(
-                    "native bytes output (brick b1) only supports a `b\"...\"` literal body, \
-                     got {:?}; bytes concat / number→bytes / lowering are later bricks — use --run (interpreter)",
+                    "native bytes output supports a `b\"...\"` literal, a bytes `concat(...)`, \
+                     or `le32`/`le64` at the top level (brick b2), got {:?}; \
+                     other bytes shapes are later bricks — use --run (interpreter)",
                     other
                 ),
             });
         }
-    };
+    }
     let mut code = Vec::new();
     let ctx = emit_record_loop_prologue(&mut code, rule, concept, None, all_rules, all_resources, all_connections, concept_group)?;
 
-    emit_write_bytes_literal(&mut code, &bytes, 1);
+    // The streaming body needs the in-scope bindings the prologue populated so
+    // a future le32(<field>) can read a field. r11 is not live here (no arena),
+    // but emit_streamed_write_rsi_rdx push/pops it anyway — harmless.
+    let offsets: HashMap<&str, i32> = ctx.binding_offsets.clone();
+    emit_streaming_bytes_body(
+        &mut code,
+        &rule.logic.value,
+        &rule.input_name,
+        &ctx,
+        &offsets,
+        all_rules,
+    )?;
 
     // jmp loop_top
     code.push(0xE9);
@@ -5267,6 +5283,63 @@ fn emit_bytes_program<'a>(
 
     emit_record_loop_epilogue(&mut code, &ctx);
     Ok(code)
+}
+
+/// Backend brick b2: stream a bytes-typed expression to fd 1, raw, no newline.
+/// Each piece writes its own bytes left-to-right — no buffer, no sizing pass,
+/// the same shape as `emit_streaming_text_body` but with raw bytes:
+///   - `Bytes(b)`   → emit the literal blob (jmp-over-data + guarded write)
+///   - `Concat(..)` → stream each arg in order
+///   - `Le32`/`Le64`→ eval n → rax, store to an 8-byte stack scratch (x86 is
+///     little-endian, so the low `width` bytes ARE the LE encoding), then one
+///     guarded `write(1, rsp, width)`.
+fn emit_streaming_bytes_body(
+    code: &mut Vec<u8>,
+    expr: &Expr,
+    input_name: &str,
+    ctx: &RecordLoopCtx<'_>,
+    offsets: &HashMap<&str, i32>,
+    all_rules: &HashMap<&str, &Rule>,
+) -> Result<(), NativeError> {
+    match expr {
+        Expr::Bytes(b) => {
+            emit_write_bytes_literal(code, b, 1);
+            Ok(())
+        }
+        Expr::Concat(args) => {
+            for a in args {
+                emit_streaming_bytes_body(code, a, input_name, ctx, offsets, all_rules)?;
+            }
+            Ok(())
+        }
+        Expr::Le32(inner) | Expr::Le64(inner) => {
+            let width: i32 = if matches!(expr, Expr::Le64(_)) { 8 } else { 4 };
+            // eval n → rax (no self-call context — b2 is non-recursive)
+            emit_eval_expr(
+                code, inner, input_name, offsets, all_rules,
+                &ctx.field_ranges, &ctx.text_bindings, None, None,
+            )?;
+            // sub rsp, 8 ; mov [rsp], rax  (x86 stores little-endian, so the
+            // first `width` bytes at [rsp] are the LE low bytes of rax)
+            code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x08]); // sub rsp, 8
+            code.extend_from_slice(&[0x48, 0x89, 0x04, 0x24]); // mov [rsp], rax
+            // rsi = rsp ; rdx = width
+            code.extend_from_slice(&[0x48, 0x89, 0xE6]);        // mov rsi, rsp
+            code.extend_from_slice(&[0x48, 0xC7, 0xC2]);        // mov rdx, width
+            code.extend_from_slice(&width.to_le_bytes());
+            emit_streamed_write_rsi_rdx(code);
+            // add rsp, 8 (free the scratch)
+            code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x08]);
+            Ok(())
+        }
+        other => Err(NativeError {
+            message: format!(
+                "native bytes streaming (brick b2) supports `b\"...\"`, bytes `concat(...)`, \
+                 and `le32`/`le64`, got {:?}",
+                other
+            ),
+        }),
+    }
 }
 
 /// Classify a concat argument's runtime type — native supports Text (bytes
@@ -11297,7 +11370,7 @@ fn max_stack_depth(expr: &Expr) -> usize {
         Expr::Length(inner) => max_stack_depth(inner),
         // `abs(<number_expr>)` — 5-byte inline (cqo; xor rax, rdx; sub rax, rdx),
         // no eval-stack push, the inner's depth dominates.
-        Expr::Abs(inner) | Expr::BitNot(inner) => max_stack_depth(inner),
+        Expr::Abs(inner) | Expr::BitNot(inner) | Expr::Le32(inner) | Expr::Le64(inner) => max_stack_depth(inner),
         // `min(a, b)` / `max(a, b)` — branch-free cmp + cmov; left is
         // evaluated and pushed, right is evaluated, so same shape as Binary.
         Expr::Min(l, r) | Expr::Max(l, r) | Expr::BitAnd(l, r) | Expr::BitOr(l, r) | Expr::BitXor(l, r) | Expr::Shl(l, r) | Expr::Shr(l, r) => {
@@ -11628,6 +11701,15 @@ fn emit_eval_expr(
             // expression evaluator means it was used in an unsupported context.
             Err(NativeError {
                 message: "bytes literal cannot be used as a scalar expression (brick b1 supports `b\"...\"` only as the whole body of an `output: bytes` rule)".into(),
+            })
+        }
+        Expr::Le32(_) | Expr::Le64(_) => {
+            // Backend brick b2: le32/le64 produce bytes, not a scalar (rax)
+            // value. They are only valid inside a bytes concat (handled by
+            // emit_bytes_program's streaming path). Reaching the scalar
+            // evaluator means an unsupported context.
+            Err(NativeError {
+                message: "le32/le64 produce bytes, not a scalar value (brick b2 supports them only inside a bytes `concat(...)` in an `output: bytes` rule)".into(),
             })
         }
         Expr::Field(base, field_name) => {
@@ -16465,6 +16547,8 @@ fn expr_kind(e: &Expr) -> &'static str {
         Expr::EndsWith(_, _) => "EndsWith",
         Expr::Length(_) => "Length",
         Expr::Abs(_) => "Abs",
+        Expr::Le32(_) => "Le32",
+        Expr::Le64(_) => "Le64",
         Expr::Min(_, _) => "Min",
         Expr::Max(_, _) => "Max",
         Expr::Substring(_, _, _) => "Substring",
@@ -18837,6 +18921,172 @@ rule full_range
 
         let _ = fs::remove_file(out1);
         let _ = fs::remove_file(out2);
+    }
+
+    /// Backend brick b2: compose byte sequences with `concat(...)` over bytes
+    /// args and `le32`/`le64` (number → little-endian bytes). The worked
+    /// example `mov_rax_imm` = concat(b"\x48\xb8", le64(42), b"\xc3") must emit
+    /// exactly the x86-64 encoding of `mov rax, 42 ; ret`:
+    ///   48 b8 2a 00 00 00 00 00 00 00 c3   (11 bytes)
+    /// We assert the exact byte sequence AND, as a strong check, mmap those
+    /// bytes as executable and call them as `extern "C" fn() -> i64`, asserting
+    /// the result is 42 — proving the emitted bytes are REAL machine code.
+    #[test]
+    fn bytes_concat_and_le_emit_machine_code() {
+        use std::fs;
+        use std::process::Command;
+        let src = r#"@verbose 0.1.0
+
+concept Trigger
+  @intention: "Trivial trigger"
+  @source: bytes_concat.intent:1
+
+  fields:
+    n : number [0, 1]
+
+
+rule mov_rax_imm
+  @intention: "Emit `mov rax, 42 ; ret`"
+  @source: bytes_concat.intent:2
+
+  input:
+    t : Trigger
+
+  output:
+    code : bytes
+
+  logic:
+    code = concat(b"\x48\xb8", le64(42), b"\xc3")
+
+  proofs:
+    purity:
+      reads   : []
+      calls   : []
+    termination:
+      bound : 4
+
+
+rule le32_demo
+  @intention: "Emit le32(258) = 02 01 00 00"
+  @source: bytes_concat.intent:3
+
+  input:
+    t : Trigger
+
+  output:
+    code : bytes
+
+  logic:
+    code = le32(258)
+
+  proofs:
+    purity:
+      reads   : []
+      calls   : []
+    termination:
+      bound : 4
+
+
+rule le64_neg
+  @intention: "Emit le64(-1) = ff*8"
+  @source: bytes_concat.intent:4
+
+  input:
+    t : Trigger
+
+  output:
+    code : bytes
+
+  logic:
+    code = le64(-1)
+
+  proofs:
+    purity:
+      reads   : []
+      calls   : []
+    termination:
+      bound : 4
+"#;
+        let tokens = crate::lexer::Lexer::new(src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        // --- mov_rax_imm: exact bytes ---
+        let out1 = std::env::temp_dir().join("verbosec_test_b2_mov");
+        compile_native(&program, "mov_rax_imm", out1.to_str().unwrap(), false, false)
+            .expect("bytes concat + le64 rule must compile natively");
+        let run1 = Command::new(&out1).args(["1"]).output().expect("spawn mov_rax_imm");
+        let expected_mov = vec![0x48u8, 0xb8, 0x2a, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xc3];
+        assert_eq!(
+            run1.stdout, expected_mov,
+            "concat(b\"\\x48\\xb8\", le64(42), b\"\\xc3\") must emit `mov rax,42; ret`; got {:?}",
+            run1.stdout,
+        );
+
+        // --- le32(258) = 02 01 00 00 ---
+        let out2 = std::env::temp_dir().join("verbosec_test_b2_le32");
+        compile_native(&program, "le32_demo", out2.to_str().unwrap(), false, false)
+            .expect("le32 rule must compile natively");
+        let run2 = Command::new(&out2).args(["1"]).output().expect("spawn le32_demo");
+        assert_eq!(run2.stdout, vec![0x02u8, 0x01, 0x00, 0x00], "le32(258); got {:?}", run2.stdout);
+
+        // --- le64(-1) = ff * 8 ---
+        let out3 = std::env::temp_dir().join("verbosec_test_b2_le64");
+        compile_native(&program, "le64_neg", out3.to_str().unwrap(), false, false)
+            .expect("le64 rule must compile natively");
+        let run3 = Command::new(&out3).args(["1"]).output().expect("spawn le64_neg");
+        assert_eq!(run3.stdout, vec![0xffu8; 8], "le64(-1); got {:?}", run3.stdout);
+
+        // --- STRONG: the emitted machine code REALLY runs. mmap RWX, copy the
+        // 11 bytes in, call as fn() -> i64, assert 42. ---
+        unsafe {
+            let len = expected_mov.len();
+            let page = 4096usize;
+            let alloc = libc_mmap(page);
+            assert!(!alloc.is_null(), "mmap failed");
+            std::ptr::copy_nonoverlapping(expected_mov.as_ptr(), alloc as *mut u8, len);
+            let f: extern "C" fn() -> i64 = std::mem::transmute(alloc);
+            let r = f();
+            libc_munmap(alloc, page);
+            assert_eq!(r, 42, "emitted `mov rax,42; ret` must return 42 when executed, got {}", r);
+        }
+
+        let _ = fs::remove_file(out1);
+        let _ = fs::remove_file(out2);
+        let _ = fs::remove_file(out3);
+    }
+
+    /// Minimal mmap(PROT_READ|WRITE|EXEC, MAP_PRIVATE|ANON) via raw syscall —
+    /// the project is zero-dependency, so we go straight to the kernel ABI
+    /// instead of pulling in the `libc` crate. mmap is syscall 9 on x86-64.
+    #[cfg(target_arch = "x86_64")]
+    unsafe fn libc_mmap(len: usize) -> *mut std::ffi::c_void {
+        // addr=0, len, prot=PROT_READ|PROT_WRITE|PROT_EXEC (7),
+        // flags=MAP_PRIVATE|MAP_ANONYMOUS (0x22), fd=-1, off=0
+        let ret: i64;
+        std::arch::asm!(
+            "syscall",
+            inlateout("rax") 9i64 => ret,
+            in("rdi") 0usize,
+            in("rsi") len,
+            in("rdx") 7i64,
+            in("r10") 0x22i64,
+            in("r8") -1i64,
+            in("r9") 0i64,
+            lateout("rcx") _, lateout("r11") _,
+        );
+        ret as *mut std::ffi::c_void
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    unsafe fn libc_munmap(addr: *mut std::ffi::c_void, len: usize) {
+        // munmap is syscall 11.
+        std::arch::asm!(
+            "syscall",
+            inlateout("rax") 11i64 => _,
+            in("rdi") addr,
+            in("rsi") len,
+            lateout("rcx") _, lateout("r11") _,
+        );
     }
 
     /// Nested match_result: an outer match_result whose Ok arm itself

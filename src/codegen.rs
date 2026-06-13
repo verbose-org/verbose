@@ -249,8 +249,10 @@ fn emit_expr(expr: &Expr, input_name: &str, concept: Option<&Concept>) -> String
         | Expr::Max(_, _)
         | Expr::Substring(_, _, _)
         | Expr::Bytes(_)
+        | Expr::Le32(_)
+        | Expr::Le64(_)
         | Expr::ByteAt(_, _) => {
-            "(/* collection/result/record/variant/match/concat/read/fetch/json_escape/parse_int/now_unix/starts_with/contains/ends_with/length/abs/min/max/substring/byte_at/bytes/fold_bytes op: use --run interpreter or --native */false)".to_string()
+            "(/* collection/result/record/variant/match/concat/read/fetch/json_escape/parse_int/now_unix/starts_with/contains/ends_with/length/abs/min/max/substring/byte_at/bytes/le32/le64/fold_bytes op: use --run interpreter or --native */false)".to_string()
         }
         Expr::BitAnd(a, b) => format!("({} & {})", emit_expr(a, input_name, concept), emit_expr(b, input_name, concept)),
         Expr::BitOr(a, b) => format!("({} | {})", emit_expr(a, input_name, concept), emit_expr(b, input_name, concept)),

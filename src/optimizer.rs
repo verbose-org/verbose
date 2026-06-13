@@ -75,6 +75,8 @@ fn count_nodes(expr: &Expr) -> usize {
         Expr::Length(inner) => 1 + count_nodes(inner),
         // `abs(<number_expr>)` — same shape as Neg: one node + recurse.
         Expr::Abs(inner) | Expr::BitNot(inner) => 1 + count_nodes(inner),
+        // `le32(n)` / `le64(n)` — one node + recurse (same shape as Abs).
+        Expr::Le32(inner) | Expr::Le64(inner) => 1 + count_nodes(inner),
         // `min(a, b)` / `max(a, b)` — same shape as Binary: count this node
         // + recurse into both children.
         Expr::Min(l, r) | Expr::Max(l, r) | Expr::BitAnd(l, r) | Expr::BitOr(l, r) | Expr::BitXor(l, r) | Expr::Shl(l, r) | Expr::Shr(l, r) => 1 + count_nodes(l) + count_nodes(r),
@@ -428,6 +430,13 @@ pub fn substitute_ident(expr: &Expr, name: &str, replacement: &Expr) -> Expr {
         ),
         // `abs(<number_expr>)` — substitute through the inner expression.
         Expr::Abs(inner) => Expr::Abs(
+            Box::new(substitute_ident(inner, name, replacement)),
+        ),
+        // `le32(n)` / `le64(n)` — substitute through the inner expression.
+        Expr::Le32(inner) => Expr::Le32(
+            Box::new(substitute_ident(inner, name, replacement)),
+        ),
+        Expr::Le64(inner) => Expr::Le64(
             Box::new(substitute_ident(inner, name, replacement)),
         ),
         // `min(a, b)` — substitute through both children.
@@ -826,6 +835,18 @@ pub fn optimize_expr(
                 return Expr::Number(n.wrapping_abs());
             }
             Expr::Abs(Box::new(inner))
+        }
+        // `le32(n)` / `le64(n)` — when the inner folds to a number literal,
+        // fold to a `b"..."` bytes literal at compile time (little-endian low
+        // 4 / 8 bytes). Otherwise recurse and keep the wrapper for the backend.
+        Expr::Le32(inner) | Expr::Le64(inner) => {
+            let width = if matches!(expr, Expr::Le64(_)) { 8 } else { 4 };
+            let inner = optimize_expr(inner, input_name, field_ranges);
+            if let Expr::Number(n) = &inner {
+                let le = n.to_le_bytes();
+                return Expr::Bytes(le[..width].to_vec());
+            }
+            if width == 8 { Expr::Le64(Box::new(inner)) } else { Expr::Le32(Box::new(inner)) }
         }
         // `min(a, b)` — recurse into both children. When both collapse to
         // number literals, fold to the smaller at compile time. Otherwise

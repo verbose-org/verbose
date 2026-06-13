@@ -1,0 +1,106 @@
+@verbose 0.1.0
+
+-- Backend brick b2: COMPOSE byte sequences.
+--   (1) `concat(...)` over bytes-typed args (b"..." literals, le32/le64),
+--   (2) `le32(n)` / `le64(n)` — a number → its little-endian low 4 / 8 bytes.
+--
+-- These are the building blocks for emitting x86-64 instruction streams: an
+-- opcode is a `b"..."` literal, an immediate operand is `le32`/`le64` of a
+-- number, and the whole instruction is their `concat`. The bytes are streamed
+-- raw to stdout (no buffer, no trailing newline), each piece in source order.
+--
+-- bytes never implicitly converts to/from text: a bytes `concat` accepts ONLY
+-- bytes arguments. A number that should become bytes goes through le32/le64
+-- explicitly — there is no implicit itoa in a bytes concat.
+
+
+concept Trigger
+  @intention: "A trivial input that triggers the byte emission"
+  @source: bytes_concat.intent:1
+
+  fields:
+    n : number [0, 1]
+
+
+rule mov_rax_imm
+  @intention: "Emit x86-64 `mov rax, 42 ; ret` — opcode + le64 immediate + ret"
+  @source: bytes_concat.intent:2
+
+  input:
+    t : Trigger
+
+  output:
+    code : bytes
+
+  logic:
+    code = concat(b"\x48\xb8", le64(42), b"\xc3")
+
+  proofs:
+    purity:
+      reads   : []
+      calls   : []
+    termination:
+      bound : 4
+
+
+rule le32_demo
+  @intention: "Emit le32(258) — should be 02 01 00 00 (258 = 0x0102)"
+  @source: bytes_concat.intent:3
+
+  input:
+    t : Trigger
+
+  output:
+    code : bytes
+
+  logic:
+    code = le32(258)
+
+  proofs:
+    purity:
+      reads   : []
+      calls   : []
+    termination:
+      bound : 4
+
+
+rule le64_neg
+  @intention: "Emit le64(-1) — two's-complement low 8 bytes: ff ff ff ff ff ff ff ff"
+  @source: bytes_concat.intent:4
+
+  input:
+    t : Trigger
+
+  output:
+    code : bytes
+
+  logic:
+    code = le64(-1)
+
+  proofs:
+    purity:
+      reads   : []
+      calls   : []
+    termination:
+      bound : 4
+
+
+rule lit_le_lit
+  @intention: "Emit concat of two literals with an le32 in the middle: aa | 0100 (=256) | bb"
+  @source: bytes_concat.intent:5
+
+  input:
+    t : Trigger
+
+  output:
+    code : bytes
+
+  logic:
+    code = concat(b"\xaa", le32(256), b"\xbb")
+
+  proofs:
+    purity:
+      reads   : []
+      calls   : []
+    termination:
+      bound : 4

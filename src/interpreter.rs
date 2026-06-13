@@ -356,6 +356,24 @@ fn eval_expr(
                 }),
             }
         }
+        // `le32(n)` / `le64(n)` — number → little-endian bytes (4 / 8 bytes).
+        // Negative n uses the two's-complement low bytes (mask the bits).
+        Expr::Le32(inner) | Expr::Le64(inner) => {
+            let width = if matches!(expr, Expr::Le64(_)) { 8 } else { 4 };
+            match eval_expr(inner, env, all_rules, concepts)? {
+                Value::Number(n) => {
+                    let le = (n as i64).to_le_bytes();
+                    Ok(Value::Bytes(le[..width].to_vec()))
+                }
+                other => Err(RuntimeError {
+                    message: format!(
+                        "'{}' requires number, got {}",
+                        if width == 8 { "le64" } else { "le32" },
+                        other
+                    ),
+                }),
+            }
+        }
         Expr::Quantifier(kind, collection, var_name, predicate) => {
             let coll_val = eval_expr(collection, env, all_rules, concepts)?;
             let items = match coll_val {
@@ -528,27 +546,53 @@ fn eval_expr(
             })
         }
         Expr::Concat(args) => {
-            // Variadic text builder. Each argument is converted to its text
-            // form; non-scalar arguments trigger a runtime error (the verifier
-            // should have caught them at compile time, but the interpreter
-            // stays defensive — defence in depth).
-            let mut out = String::new();
-            for arg in args {
-                match eval_expr(arg, env, all_rules, concepts)? {
-                    Value::Text(s) => out.push_str(&s),
-                    Value::Number(n) => out.push_str(&n.to_string()),
-                    Value::Bool(b) => out.push_str(if b { "true" } else { "false" }),
-                    other => {
-                        return Err(RuntimeError {
-                            message: format!(
-                                "concat argument must be scalar (number/bool/text), got {}",
-                                other
-                            ),
-                        });
+            // Variadic builder. Evaluate every argument first, then decide the
+            // result type: if ANY argument is bytes, this is a BYTES concat
+            // (backend brick b2) — every argument must then be bytes (the
+            // verifier rejects mixing, but the interpreter stays defensive).
+            // Otherwise it is the usual TEXT concat (number → decimal, bool →
+            // true/false, text as-is).
+            let vals: Vec<Value> = args
+                .iter()
+                .map(|a| eval_expr(a, env, all_rules, concepts))
+                .collect::<Result<_, _>>()?;
+            let any_bytes = vals.iter().any(|v| matches!(v, Value::Bytes(_)));
+            if any_bytes {
+                let mut out: Vec<u8> = Vec::new();
+                for v in vals {
+                    match v {
+                        Value::Bytes(b) => out.extend_from_slice(&b),
+                        other => {
+                            return Err(RuntimeError {
+                                message: format!(
+                                    "concat mixes bytes and non-bytes: a bytes concat only accepts bytes \
+                                     arguments (b\"...\" / le32 / le64), got {}",
+                                    other
+                                ),
+                            });
+                        }
                     }
                 }
+                Ok(Value::Bytes(out))
+            } else {
+                let mut out = String::new();
+                for v in vals {
+                    match v {
+                        Value::Text(s) => out.push_str(&s),
+                        Value::Number(n) => out.push_str(&n.to_string()),
+                        Value::Bool(b) => out.push_str(if b { "true" } else { "false" }),
+                        other => {
+                            return Err(RuntimeError {
+                                message: format!(
+                                    "concat argument must be scalar (number/bool/text), got {}",
+                                    other
+                                ),
+                            });
+                        }
+                    }
+                }
+                Ok(Value::Text(out))
             }
-            Ok(Value::Text(out))
         }
         Expr::MatchResult(target, ok_var, ok_body, err_var, err_body) => {
             // Evaluate the target, dispatch on its Ok/Err tag. Exactly one

@@ -1320,6 +1320,26 @@ impl Parser {
                 }
                 self.expect_kind(TokenKind::RParen)?;
                 Ok(Expr::Abs(Box::new(inner)))
+            } else if (name == "le32" || name == "le64") && self.check_kind(&TokenKind::LParen) {
+                // `le32(<number_expr>)` / `le64(<number_expr>)` — number → bytes
+                // in little-endian order (4 / 8 bytes). Exactly one argument;
+                // same arity shape as abs. The verifier checks the inner is
+                // number-typed and the result is `bytes`. Backend brick b2.
+                let is64 = name == "le64";
+                self.advance(); // (
+                if self.check_kind(&TokenKind::RParen) {
+                    return Err(self.error(&format!("{} requires exactly one argument, got zero", name)));
+                }
+                let inner = self.parse_expr()?;
+                if self.check_kind(&TokenKind::Comma) {
+                    return Err(self.error(&format!("{} requires exactly one argument, got more than one", name)));
+                }
+                self.expect_kind(TokenKind::RParen)?;
+                if is64 {
+                    Ok(Expr::Le64(Box::new(inner)))
+                } else {
+                    Ok(Expr::Le32(Box::new(inner)))
+                }
             } else if (name == "band" || name == "bor" || name == "bxor"
                        || name == "shl" || name == "shr")
                       && self.check_kind(&TokenKind::LParen) {

@@ -689,6 +689,15 @@ pub enum Expr {
     /// -1 for negative), then xor + sub flips the bits and adds 1 only
     /// when negative. No branch.
     Abs(Box<Expr>),
+    /// `le32(<number_expr>)` — the low 4 bytes of a number, little-endian,
+    /// as `bytes`. byte0 = n & 0xFF, byte1 = (n>>8)&0xFF, byte2, byte3.
+    /// Negative n uses the two's-complement low bytes (just the masked
+    /// bits). Backend brick b2: composes inside a bytes `concat(...)` to
+    /// build machine-code immediate operands. Arg must be number-typed.
+    Le32(Box<Expr>),
+    /// `le64(<number_expr>)` — the low 8 bytes of a number, little-endian,
+    /// as `bytes`. Same semantics as `le32` over all 8 bytes.
+    Le64(Box<Expr>),
     /// `ends_with(<haystack>, <needle>)` — symmetric of `starts_with`.
     /// Returns `bool`: true iff `haystack`'s LAST `length(needle)` bytes
     /// match `needle` byte-for-byte. Empty needle is always true (every
