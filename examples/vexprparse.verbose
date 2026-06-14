@@ -9219,13 +9219,14 @@ rule x86_expr_src
 -- frame slot), `prog` the whole program (to resolve a callee name to its proc
 -- offset).
 concept ByteGenState
-  @intention: "A subtree to lower to machine code + source + absolute offset + the current proc's params + the program"
+  @intention: "A subtree to lower to machine code + source + absolute offset + the current proc's params + lets + the program"
   @source: vexprparse.intent:56
   fields:
     node : Ast
     src : text [..256]
     off : number
     params : ParamList
+    lets : Binding
     prog : RuleList
 
 
@@ -9234,13 +9235,14 @@ concept ByteGenState
 -- offset just past arg(0)..arg(k-1)'s code (so a nested call inside an arg lands
 -- its rel32 correctly).
 concept ByteGenArgs
-  @intention: "A call's argument list to lower + source + running offset + the current proc's params + the program"
+  @intention: "A call's argument list to lower + source + running offset + the current proc's params + lets + the program"
   @source: vexprparse.intent:56
   fields:
     args : ArgList
     src : text [..256]
     off : number
     params : ParamList
+    lets : Binding
     prog : RuleList
 
 
@@ -9253,6 +9255,21 @@ concept ParamIndexState
   @source: vexprparse.intent:56
   fields:
     params : ParamList
+    src : text [..256]
+    q_start : number [0, 256]
+    q_len : number [0, 256]
+    idx : number
+
+
+-- LetIndexState: a binding list to scan for a name span, plus the source and the
+-- query span (a var reference) and the index reached so far. Returns the 0-based
+-- source-order index of the matching let binding, or -1 if the name is not a let
+-- of the current proc. Same shape as ParamIndexState but over a Binding cons-list.
+concept LetIndexState
+  @intention: "A binding list + source + a query name span + the index reached, to find a let's position"
+  @source: vexprparse.intent:56
+  fields:
+    binds : Binding
     src : text [..256]
     q_start : number [0, 256]
     q_len : number [0, 256]
@@ -9319,6 +9336,31 @@ rule param_index
       bound : 512
 
 
+-- let_index: the 0-based source-order index of the let binding whose name span
+-- byte-matches the query span, or -1 if none. The length check guards name_eq
+-- (which assumes equal lengths), exactly like param_index / name_bound. A let at
+-- index j lives in the frame slot [rbp - 8*(j+1)] (below rbp; the params are at
+-- positive disp above rbp), so the codegen uses this index to compute the let's
+-- negative displacement.
+rule let_index
+  @intention: "The 0-based index of the let binding matching a name span, or -1 if not a let"
+  @source: vexprparse.intent:56
+  input:
+    li : LetIndexState
+  output:
+    out : number
+  logic:
+    out = match li.binds:
+      BCons(name_start, name_len, value, rest) => if name_len == li.q_len and name_eq(NameEqState { src: li.src, a_start: name_start, b_start: li.q_start, len: li.q_len, off: 0 }) == 1 then li.idx else let_index(LetIndexState { binds: rest, src: li.src, q_start: li.q_start, q_len: li.q_len, idx: li.idx + 1 })
+      BNil => 0 - 1
+  proofs:
+    purity:
+      reads : [li.binds, li.src, li.q_start, li.q_len, li.idx]
+      calls : [name_eq, let_index]
+    termination:
+      bound : 512
+
+
 -- code_size_node: the EXACT byte count x86_node(bg) emits for a subtree, the
 -- program-aware sibling of code_size_expr. Must match x86_node arm-for-arm so
 -- the `if` rel32 offsets and call rel32 offsets are correct. New arms vs b4a:
@@ -9335,19 +9377,19 @@ rule code_size_node
   logic:
     out = match bg.node:
       AstNum(value) => 11
-      AstBin(op, lhs, rhs) => code_size_node(ByteGenState { node: lhs, src: bg.src, off: bg.off, params: bg.params, prog: bg.prog }) + code_size_node(ByteGenState { node: rhs, src: bg.src, off: bg.off, params: bg.params, prog: bg.prog }) + (if op == 13 then 6 else if op == 14 then 6 else if op == 15 then 7 else if op == 16 then 8 else if op == 17 then 11 else if op == 30 then 20 else if op == 31 then 20 else if op == 1 then 12 else if op == 6 then 12 else if op == 19 then 12 else if op == 20 then 12 else if op == 5 then 12 else if op == 4 then 12 else 1)
-      AstNeg(inner) => code_size_node(ByteGenState { node: inner, src: bg.src, off: bg.off, params: bg.params, prog: bg.prog }) + 5
+      AstBin(op, lhs, rhs) => code_size_node(ByteGenState { node: lhs, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog }) + code_size_node(ByteGenState { node: rhs, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog }) + (if op == 13 then 6 else if op == 14 then 6 else if op == 15 then 7 else if op == 16 then 8 else if op == 17 then 11 else if op == 30 then 20 else if op == 31 then 20 else if op == 1 then 12 else if op == 6 then 12 else if op == 19 then 12 else if op == 20 then 12 else if op == 5 then 12 else if op == 4 then 12 else 1)
+      AstNeg(inner) => code_size_node(ByteGenState { node: inner, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog }) + 5
       AstNot(inner) => 1
       AstVar(start, len) => 6
       AstField(base, fstart, flen) => 1
-      AstCall(callee_start, callee_len, args) => code_size_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, prog: bg.prog }) + 13
+      AstCall(callee_start, callee_len, args) => code_size_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog }) + 13
       AstStr(start, len) => 1
       AstBool(value) => 1
-      AstIf(cond, thn, els) => code_size_node(ByteGenState { node: cond, src: bg.src, off: bg.off, params: bg.params, prog: bg.prog }) + 15 + code_size_node(ByteGenState { node: thn, src: bg.src, off: bg.off, params: bg.params, prog: bg.prog }) + code_size_node(ByteGenState { node: els, src: bg.src, off: bg.off, params: bg.params, prog: bg.prog })
+      AstIf(cond, thn, els) => code_size_node(ByteGenState { node: cond, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog }) + 15 + code_size_node(ByteGenState { node: thn, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog }) + code_size_node(ByteGenState { node: els, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog })
       AstErr => 1
   proofs:
     purity:
-      reads : [bg.node, bg.src, bg.off, bg.params, bg.prog]
+      reads : [bg.node, bg.src, bg.off, bg.params, bg.lets, bg.prog]
       calls : [code_size_node, code_size_args]
     termination:
       bound : 8000
@@ -9364,12 +9406,84 @@ rule code_size_args
     out : number
   logic:
     out = match ag.args:
-      ArgCons(head, tail) => code_size_node(ByteGenState { node: head, src: ag.src, off: ag.off, params: ag.params, prog: ag.prog }) + code_size_args(ByteGenArgs { args: tail, src: ag.src, off: ag.off, params: ag.params, prog: ag.prog })
+      ArgCons(head, tail) => code_size_node(ByteGenState { node: head, src: ag.src, off: ag.off, params: ag.params, lets: ag.lets, prog: ag.prog }) + code_size_args(ByteGenArgs { args: tail, src: ag.src, off: ag.off, params: ag.params, lets: ag.lets, prog: ag.prog })
       ArgNil => 0
   proofs:
     purity:
-      reads : [ag.args, ag.src, ag.off, ag.params, ag.prog]
+      reads : [ag.args, ag.src, ag.off, ag.params, ag.lets, ag.prog]
       calls : [code_size_node, code_size_args]
+    termination:
+      bound : 8000
+
+
+-- LetGenState: drives the let-store prologue. `rem` is the suffix of bindings
+-- still to emit (walked structurally); `all_binds` is the proc's FULL binding list
+-- (the unchanging name-resolution env — so a value referencing an EARLIER let
+-- resolves correctly, and `let_index` against `all_binds` yields the right
+-- absolute source-order slot). `off` is the absolute byte position where the next
+-- store sequence begins (threaded so a value's nested call lands its rel32). idx
+-- is the source-order index of `rem`'s head (its frame slot is [rbp - 8*(idx+1)]).
+concept LetGenState
+  @intention: "The remaining lets to emit + the full binding env + source + offset + params + index + the program"
+  @source: vexprparse.intent:56
+  fields:
+    rem : Binding
+    all_binds : Binding
+    src : text [..256]
+    off : number
+    params : ParamList
+    idx : number
+    prog : RuleList
+
+
+-- code_size_let_stores: the EXACT byte count the let-store prologue emits for a
+-- proc's binding list — for each `let NAME = e` it's code_size_node(e) (the value
+-- ops) + 1 (pop rax, 58) + 7 (mov [rbp-disp], rax — always-disp32 form 48 89 85
+-- + le32). Each value is sized with the FULL binding env (lg.all_binds) so an
+-- earlier-let reference resolves identically to the emit pass (a var load is 6 B
+-- whether it resolves to a param or a let, so the size is slot-independent). BNil
+-- -> 0. Sizes ignore `off`, so 0 is threaded.
+rule code_size_let_stores
+  @intention: "Exact byte count of the let-store prologue: per let, code_size_node(value) + 8"
+  @source: vexprparse.intent:56
+  input:
+    lg : LetGenState
+  output:
+    out : number
+  logic:
+    out = match lg.rem:
+      BCons(name_start, name_len, value, rest) => code_size_node(ByteGenState { node: value, src: lg.src, off: 0, params: lg.params, lets: lg.all_binds, prog: lg.prog }) + 8 + code_size_let_stores(LetGenState { rem: rest, all_binds: lg.all_binds, src: lg.src, off: 0, params: lg.params, idx: lg.idx + 1, prog: lg.prog })
+      BNil => 0
+  proofs:
+    purity:
+      reads : [lg.rem, lg.all_binds, lg.src, lg.params, lg.idx, lg.prog]
+      calls : [code_size_node, code_size_let_stores]
+    termination:
+      bound : 8000
+
+
+-- x86_let_stores: emit the let-store prologue. For each `let NAME = e` in source
+-- order: <x86_node(e)> (value pushed) ; pop rax (58) ; mov [rbp - 8*(idx+1)], rax
+-- (always-disp32: 48 89 85 + le32 of the NEGATIVE displacement). Each value is
+-- lowered against the FULL binding env (lg.all_binds) so an earlier let resolves;
+-- `off` is threaded so a value's nested call computes its rel32 against the right
+-- site (off advances by code_size_node(value) + 8 per let). The mov's disp is
+-- 0 - 8*(idx+1) (a negative slot below rbp), emitted via le32 (two's complement).
+rule x86_let_stores
+  @intention: "Emit the let-store prologue: per let, value ops + pop rax + mov to its negative frame slot"
+  @source: vexprparse.intent:56
+  input:
+    lg : LetGenState
+  output:
+    out : bytes
+  logic:
+    out = match lg.rem:
+      BCons(name_start, name_len, value, rest) => concat(x86_node(ByteGenState { node: value, src: lg.src, off: lg.off, params: lg.params, lets: lg.all_binds, prog: lg.prog }), b"\x58\x48\x89\x85", le32(0 - 8 * (lg.idx + 1)), x86_let_stores(LetGenState { rem: rest, all_binds: lg.all_binds, src: lg.src, off: lg.off + code_size_node(ByteGenState { node: value, src: lg.src, off: lg.off, params: lg.params, lets: lg.all_binds, prog: lg.prog }) + 8, params: lg.params, idx: lg.idx + 1, prog: lg.prog }))
+      BNil => b""
+  proofs:
+    purity:
+      reads : [lg.rem, lg.all_binds, lg.src, lg.off, lg.params, lg.idx, lg.prog]
+      calls : [x86_node, code_size_node, x86_let_stores]
     termination:
       bound : 8000
 
@@ -9389,12 +9503,16 @@ rule proc_size
     out : number
   logic:
     let blk = rd_body(pg.rd)
+    let binds = block_binds(blk)
     let result = block_result(blk)
-    out = 4 + code_size_node(ByteGenState { node: result, src: pg.src, off: 0, params: rd_params(pg.rd), prog: pg.prog }) + 6
+    let nlets = count_binds(binds)
+    let subsize = if nlets > 0 then 7 else 0
+    let storesize = code_size_let_stores(LetGenState { rem: binds, all_binds: binds, src: pg.src, off: 0, params: rd_params(pg.rd), idx: 0, prog: pg.prog })
+    out = 4 + subsize + storesize + code_size_node(ByteGenState { node: result, src: pg.src, off: 0, params: rd_params(pg.rd), lets: binds, prog: pg.prog }) + 6
   proofs:
     purity:
       reads : [pg.rd, pg.src, pg.prog]
-      calls : [rd_body, block_result, code_size_node, rd_params]
+      calls : [rd_body, block_binds, block_result, count_binds, code_size_let_stores, code_size_node, rd_params]
     termination:
       bound : 8000
 
@@ -9443,20 +9561,20 @@ rule x86_node
   logic:
     out = match bg.node:
       AstNum(value) => concat(b"\x48\xb8", le64(value), b"\x50")
-      AstBin(op, lhs, rhs) => concat(x86_node(ByteGenState { node: lhs, src: bg.src, off: bg.off, params: bg.params, prog: bg.prog }), x86_node(ByteGenState { node: rhs, src: bg.src, off: bg.off + code_size_node(ByteGenState { node: lhs, src: bg.src, off: bg.off, params: bg.params, prog: bg.prog }), params: bg.params, prog: bg.prog }), if op == 13 then b"\x59\x58\x48\x01\xc8\x50" else if op == 14 then b"\x59\x58\x48\x29\xc8\x50" else if op == 15 then b"\x59\x58\x48\x0f\xaf\xc1\x50" else if op == 16 then b"\x59\x58\x48\x99\x48\xf7\xf9\x50" else if op == 17 then b"\x59\x58\x48\x99\x48\xf7\xf9\x48\x89\xd0\x50" else if op == 30 then b"\x59\x58\x48\x85\xc0\x0f\x95\xc0\x48\x85\xc9\x0f\x95\xc1\x20\xc8\x0f\xb6\xc0\x50" else if op == 31 then b"\x59\x58\x48\x85\xc0\x0f\x95\xc0\x48\x85\xc9\x0f\x95\xc1\x08\xc8\x0f\xb6\xc0\x50" else if op == 1 then b"\x59\x58\x48\x39\xc8\x0f\x94\xc0\x0f\xb6\xc0\x50" else if op == 6 then b"\x59\x58\x48\x39\xc8\x0f\x95\xc0\x0f\xb6\xc0\x50" else if op == 19 then b"\x59\x58\x48\x39\xc8\x0f\x9c\xc0\x0f\xb6\xc0\x50" else if op == 20 then b"\x59\x58\x48\x39\xc8\x0f\x9f\xc0\x0f\xb6\xc0\x50" else if op == 5 then b"\x59\x58\x48\x39\xc8\x0f\x9e\xc0\x0f\xb6\xc0\x50" else if op == 4 then b"\x59\x58\x48\x39\xc8\x0f\x9d\xc0\x0f\xb6\xc0\x50" else b"\xcc")
-      AstNeg(inner) => concat(x86_node(ByteGenState { node: inner, src: bg.src, off: bg.off, params: bg.params, prog: bg.prog }), b"\x58\x48\xf7\xd8\x50")
+      AstBin(op, lhs, rhs) => concat(x86_node(ByteGenState { node: lhs, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog }), x86_node(ByteGenState { node: rhs, src: bg.src, off: bg.off + code_size_node(ByteGenState { node: lhs, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog }), params: bg.params, lets: bg.lets, prog: bg.prog }), if op == 13 then b"\x59\x58\x48\x01\xc8\x50" else if op == 14 then b"\x59\x58\x48\x29\xc8\x50" else if op == 15 then b"\x59\x58\x48\x0f\xaf\xc1\x50" else if op == 16 then b"\x59\x58\x48\x99\x48\xf7\xf9\x50" else if op == 17 then b"\x59\x58\x48\x99\x48\xf7\xf9\x48\x89\xd0\x50" else if op == 30 then b"\x59\x58\x48\x85\xc0\x0f\x95\xc0\x48\x85\xc9\x0f\x95\xc1\x20\xc8\x0f\xb6\xc0\x50" else if op == 31 then b"\x59\x58\x48\x85\xc0\x0f\x95\xc0\x48\x85\xc9\x0f\x95\xc1\x08\xc8\x0f\xb6\xc0\x50" else if op == 1 then b"\x59\x58\x48\x39\xc8\x0f\x94\xc0\x0f\xb6\xc0\x50" else if op == 6 then b"\x59\x58\x48\x39\xc8\x0f\x95\xc0\x0f\xb6\xc0\x50" else if op == 19 then b"\x59\x58\x48\x39\xc8\x0f\x9c\xc0\x0f\xb6\xc0\x50" else if op == 20 then b"\x59\x58\x48\x39\xc8\x0f\x9f\xc0\x0f\xb6\xc0\x50" else if op == 5 then b"\x59\x58\x48\x39\xc8\x0f\x9e\xc0\x0f\xb6\xc0\x50" else if op == 4 then b"\x59\x58\x48\x39\xc8\x0f\x9d\xc0\x0f\xb6\xc0\x50" else b"\xcc")
+      AstNeg(inner) => concat(x86_node(ByteGenState { node: inner, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog }), b"\x58\x48\xf7\xd8\x50")
       AstNot(inner) => b"\xcc"
-      AstVar(start, len) => (if param_index(ParamIndexState { params: bg.params, src: bg.src, q_start: start, q_len: len, idx: 0 }) < 0 then b"\xcc" else concat(b"\xff\xb5", le32(16 + 8 * (param_list_len(bg.params) - 1 - param_index(ParamIndexState { params: bg.params, src: bg.src, q_start: start, q_len: len, idx: 0 })))))
+      AstVar(start, len) => (if param_index(ParamIndexState { params: bg.params, src: bg.src, q_start: start, q_len: len, idx: 0 }) >= 0 then concat(b"\xff\xb5", le32(16 + 8 * (param_list_len(bg.params) - 1 - param_index(ParamIndexState { params: bg.params, src: bg.src, q_start: start, q_len: len, idx: 0 })))) else if let_index(LetIndexState { binds: bg.lets, src: bg.src, q_start: start, q_len: len, idx: 0 }) >= 0 then concat(b"\xff\xb5", le32(0 - 8 * (let_index(LetIndexState { binds: bg.lets, src: bg.src, q_start: start, q_len: len, idx: 0 }) + 1))) else b"\xcc")
       AstField(base, fstart, flen) => b"\xcc"
-      AstCall(callee_start, callee_len, args) => concat(x86_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, prog: bg.prog }), b"\xe8", le32(proc_offset(ProcOffState { rules: bg.prog, src: bg.src, acc: 0, q_start: callee_start, q_len: callee_len }) - (bg.off + code_size_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, prog: bg.prog }) + 5)), b"\x48\x81\xc4", le32(8 * arg_list_len(args)), b"\x50")
+      AstCall(callee_start, callee_len, args) => concat(x86_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog }), b"\xe8", le32(proc_offset(ProcOffState { rules: bg.prog, src: bg.src, acc: 0, q_start: callee_start, q_len: callee_len }) - (bg.off + code_size_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog }) + 5)), b"\x48\x81\xc4", le32(8 * arg_list_len(args)), b"\x50")
       AstStr(start, len) => b"\xcc"
       AstBool(value) => b"\xcc"
-      AstIf(cond, thn, els) => concat(x86_node(ByteGenState { node: cond, src: bg.src, off: bg.off, params: bg.params, prog: bg.prog }), b"\x58\x48\x85\xc0\x0f\x84", le32(code_size_node(ByteGenState { node: thn, src: bg.src, off: bg.off, params: bg.params, prog: bg.prog }) + 5), x86_node(ByteGenState { node: thn, src: bg.src, off: bg.off + code_size_node(ByteGenState { node: cond, src: bg.src, off: bg.off, params: bg.params, prog: bg.prog }) + 15, params: bg.params, prog: bg.prog }), b"\xe9", le32(code_size_node(ByteGenState { node: els, src: bg.src, off: bg.off, params: bg.params, prog: bg.prog })), x86_node(ByteGenState { node: els, src: bg.src, off: bg.off + code_size_node(ByteGenState { node: cond, src: bg.src, off: bg.off, params: bg.params, prog: bg.prog }) + 15 + code_size_node(ByteGenState { node: thn, src: bg.src, off: bg.off, params: bg.params, prog: bg.prog }), params: bg.params, prog: bg.prog }))
+      AstIf(cond, thn, els) => concat(x86_node(ByteGenState { node: cond, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog }), b"\x58\x48\x85\xc0\x0f\x84", le32(code_size_node(ByteGenState { node: thn, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog }) + 5), x86_node(ByteGenState { node: thn, src: bg.src, off: bg.off + code_size_node(ByteGenState { node: cond, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog }) + 15, params: bg.params, lets: bg.lets, prog: bg.prog }), b"\xe9", le32(code_size_node(ByteGenState { node: els, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog })), x86_node(ByteGenState { node: els, src: bg.src, off: bg.off + code_size_node(ByteGenState { node: cond, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog }) + 15 + code_size_node(ByteGenState { node: thn, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog }), params: bg.params, lets: bg.lets, prog: bg.prog }))
       AstErr => b"\xcc"
   proofs:
     purity:
-      reads : [bg.node, bg.src, bg.off, bg.params, bg.prog]
-      calls : [x86_node, code_size_node, x86_args, code_size_args, param_index, param_list_len, proc_offset, arg_list_len]
+      reads : [bg.node, bg.src, bg.off, bg.params, bg.lets, bg.prog]
+      calls : [x86_node, code_size_node, x86_args, code_size_args, param_index, let_index, param_list_len, proc_offset, arg_list_len]
     termination:
       bound : 8000
 
@@ -9473,11 +9591,11 @@ rule x86_args
     out : bytes
   logic:
     out = match ag.args:
-      ArgCons(head, tail) => concat(x86_node(ByteGenState { node: head, src: ag.src, off: ag.off, params: ag.params, prog: ag.prog }), x86_args(ByteGenArgs { args: tail, src: ag.src, off: ag.off + code_size_node(ByteGenState { node: head, src: ag.src, off: ag.off, params: ag.params, prog: ag.prog }), params: ag.params, prog: ag.prog }))
+      ArgCons(head, tail) => concat(x86_node(ByteGenState { node: head, src: ag.src, off: ag.off, params: ag.params, lets: ag.lets, prog: ag.prog }), x86_args(ByteGenArgs { args: tail, src: ag.src, off: ag.off + code_size_node(ByteGenState { node: head, src: ag.src, off: ag.off, params: ag.params, lets: ag.lets, prog: ag.prog }), params: ag.params, lets: ag.lets, prog: ag.prog }))
       ArgNil => b""
   proofs:
     purity:
-      reads : [ag.args, ag.src, ag.off, ag.params, ag.prog]
+      reads : [ag.args, ag.src, ag.off, ag.params, ag.lets, ag.prog]
       calls : [x86_node, code_size_node, x86_args]
     termination:
       bound : 8000
@@ -9518,12 +9636,16 @@ rule x86_proc
     out : bytes
   logic:
     let blk = rd_body(pg.rd)
+    let binds = block_binds(blk)
     let result = block_result(blk)
-    out = concat(b"\x55\x48\x89\xe5", x86_node(ByteGenState { node: result, src: pg.src, off: pg.off + 4, params: rd_params(pg.rd), prog: pg.prog }), b"\x58\x48\x89\xec\x5d\xc3")
+    let nlets = count_binds(binds)
+    let subsize = if nlets > 0 then 7 else 0
+    let storesize = code_size_let_stores(LetGenState { rem: binds, all_binds: binds, src: pg.src, off: 0, params: rd_params(pg.rd), idx: 0, prog: pg.prog })
+    out = concat(b"\x55\x48\x89\xe5", (if nlets > 0 then concat(b"\x48\x81\xec", le32(8 * nlets)) else b""), x86_let_stores(LetGenState { rem: binds, all_binds: binds, src: pg.src, off: pg.off + 4 + subsize, params: rd_params(pg.rd), idx: 0, prog: pg.prog }), x86_node(ByteGenState { node: result, src: pg.src, off: pg.off + 4 + subsize + storesize, params: rd_params(pg.rd), lets: binds, prog: pg.prog }), b"\x58\x48\x89\xec\x5d\xc3")
   proofs:
     purity:
       reads : [pg.rd, pg.src, pg.off, pg.prog]
-      calls : [rd_body, block_result, x86_node, rd_params]
+      calls : [rd_body, block_binds, block_result, count_binds, code_size_let_stores, x86_let_stores, x86_node, rd_params]
     termination:
       bound : 8000
 

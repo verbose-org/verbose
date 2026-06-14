@@ -20036,6 +20036,98 @@ rule le64_neg
         let _ = fs::remove_file(em);
     }
 
+    /// Brick b7 — `let` bindings in the machine-code generator. A proc with L
+    /// lets reserves L stack slots below rbp (`sub rsp, 8*L`, gated on L>0 so
+    /// no-let procs stay byte-identical); each `let NAME = e` lowers to the
+    /// value ops + `pop rax` + `mov [rbp - 8*(j+1)], rax` (always-disp32). A
+    /// var referencing a let loads `push [rbp - 8*(j+1)]`. This mmap+exec test
+    /// pins the let-blob's value == eval_main == the hand value. A wrong let
+    /// slot / store / load size would shift every following call/if rel32 and
+    /// crash, so it doubles as a byte-count check on the let machinery.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn streaming_x86_lets_execute() {
+        use std::fs;
+        use std::process::Command;
+
+        let src = fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let x86 = std::env::temp_dir().join("verbosec_test_x86_lets");
+        let em = std::env::temp_dir().join("verbosec_test_eval_main_lets");
+        compile_native(&program, "x86_program_src", x86.to_str().unwrap(), false, false)
+            .expect("x86_program_src must compile natively");
+        compile_native(&program, "eval_main", em.to_str().unwrap(), false, false)
+            .expect("eval_main must compile natively");
+
+        // (program source, hand value). Entry = first rule, 0 params. Covers:
+        //   - single let referencing a param, used in the result (sq);
+        //   - let CHAINING (b references a, both used) — a later let reads an
+        //     earlier let's slot;
+        //   - a let used TWICE in the result (d + d);
+        //   - a let in a RECURSIVE proc, referencing the param and passed into
+        //     the recursive call (the let slot survives across the call because
+        //     the callee has its own frame).
+        let cases: &[(&str, i64)] = &[
+            // sq(5): let d = n*n ; out = d + 1 -> 26
+            ("rule main\n  logic:\n    out = sq(5)\nrule sq(n)\n  logic:\n    let d = n * n\n    out = d + 1", 26),
+            // f(4): let a = n+1 (=5) ; let b = a*a (=25) ; out = b - n -> 21
+            ("rule main\n  logic:\n    out = f(4)\nrule f(n)\n  logic:\n    let a = n + 1\n    let b = a * a\n    out = b - n", 21),
+            // g(7): let d = n*2 (=14) ; out = d + d -> 28
+            ("rule main\n  logic:\n    out = g(7)\nrule g(n)\n  logic:\n    let d = n * 2\n    out = d + d", 28),
+            // fa(5): let m = n-1 ; out = if n==0 then 1 else n * fa(m) -> 5! = 120
+            ("rule main\n  logic:\n    out = fa(5)\nrule fa(n)\n  logic:\n    let m = n - 1\n    out = if n == 0 then 1 else n * fa(m)", 120),
+        ];
+
+        for &(prog_src, expected) in cases {
+            // 1. emit the program blob via the recursive streaming-bytes emitter.
+            let mc = Command::new(&x86)
+                .args([prog_src, "0"])
+                .output()
+                .expect("spawn x86_program_src");
+            assert!(
+                mc.status.success(),
+                "x86_program_src must exit 0 for {:?}; got {:?}",
+                prog_src, mc.status
+            );
+            let code = mc.stdout;
+            assert!(!code.is_empty(), "x86_program_src emitted no bytes for {:?}", prog_src);
+
+            // 2. mmap RWX, copy the blob in, call at offset 0 (the entry proc).
+            let x86_result = unsafe {
+                let page = 4096usize;
+                let alloc = libc_mmap(page);
+                assert!(!alloc.is_null(), "mmap failed");
+                std::ptr::copy_nonoverlapping(code.as_ptr(), alloc as *mut u8, code.len());
+                let f: extern "C" fn() -> i64 = std::mem::transmute(alloc);
+                let r = f();
+                libc_munmap(alloc, page);
+                r
+            };
+
+            // 3. cross-check against eval_main (interpreter-parity native
+            //    evaluator of the SAME program) and the hand value.
+            let ev = Command::new(&em)
+                .args([prog_src, "0"])
+                .output()
+                .expect("spawn eval_main");
+            assert!(ev.status.success(), "eval_main must exit 0 for {:?}", prog_src);
+            let eval_val: i64 = String::from_utf8_lossy(&ev.stdout)
+                .trim()
+                .parse()
+                .unwrap_or_else(|_| panic!("eval_main produced non-number for {:?}: {:?}", prog_src, ev.stdout));
+
+            assert_eq!(x86_result, expected, "x86 let-blob for {:?} returned {} (expected {})", prog_src, x86_result, expected);
+            assert_eq!(eval_val, expected, "eval_main for {:?} returned {} (expected {})", prog_src, eval_val, expected);
+            assert_eq!(x86_result, eval_val, "x86 ({}) and eval_main ({}) disagree for {:?}", x86_result, eval_val, prog_src);
+        }
+
+        let _ = fs::remove_file(x86);
+        let _ = fs::remove_file(em);
+    }
+
     /// Brick b5 — WRAP THE BLOB IN A STANDALONE ELF EXECUTABLE. `elf_program_src`
     /// tokenizes + parses a whole program, lowers it to the x86_program blob
     /// (b4b), and wraps that blob in a minimal static ELF64 + a 17-byte `_start`
