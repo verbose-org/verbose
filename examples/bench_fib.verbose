@@ -1,0 +1,44 @@
+@verbose 0.1.0
+
+-- Benchmark program B: "compute" — the throughput axis.
+--
+-- Naive recursive Fibonacci is a real compute load (exponential call
+-- tree, no memoization) that stresses the code generator's quality:
+-- call/ret overhead, arithmetic, comparison, branch. This is the axis
+-- where verbosec's hand-written emitter LOSES to gcc -O3 / rustc -O
+-- today, because it has no register allocator and no instruction
+-- scheduling — every recursive call spills through the stack.
+--
+-- `n : number [0, 45]` is wide so the runtime bounds-check accepts the
+-- benchmark N (35), and the explicit range dodges the optimizer's
+-- interval-arithmetic dead-branch trap (a bare `number` would default
+-- to [0, i32::MAX] and could fold the `n.v < 2` predicate's arms).
+
+concept N
+  @intention: "A wrapper holding one non-negative integer 0..=45"
+  @source: bench_fib.intent:1
+
+  fields:
+    v : number [0, 45]
+
+
+rule fib
+  @intention: "Fibonacci: fib(n)=n for n<2, else fib(n-1)+fib(n-2)"
+  @source: bench_fib.intent:2
+
+  input:
+    n : N
+
+  output:
+    out : number
+
+  logic:
+    out = if n.v < 2 then n.v else fib(N { v: n.v - 1 }) + fib(N { v: n.v - 2 })
+
+  proofs:
+    purity:
+      reads : [n.v]
+      calls : [fib]
+    termination:
+      bound : 100
+      decreasing : v

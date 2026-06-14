@@ -1,0 +1,40 @@
+@verbose 0.1.0
+
+-- Benchmark program A: "trivial" — the no-runtime axis.
+--
+-- Does almost nothing: ignores its input, computes a constant, prints
+-- one number, exits. This isolates startup latency, binary size, RSS,
+-- and syscall count — the costs a libc/runtime/GC pays before any user
+-- code runs. Verbose emits a direct ELF with no runtime, so the binary
+-- IS essentially just this print + exit.
+--
+-- A trivial 1-field input concept is required so the native emitter's
+-- argv machinery has something to bind; the field is never read.
+
+concept Unit
+  @intention: "A placeholder one-field input; its value is ignored"
+  @source: bench_trivial.intent:1
+
+  fields:
+    dummy : number [0, 1000000000]
+
+
+rule out_constant
+  @intention: "Compute the constant 42 regardless of input"
+  @source: bench_trivial.intent:2
+
+  input:
+    u : Unit
+
+  output:
+    out : number
+
+  logic:
+    out = 42
+
+  proofs:
+    purity:
+      reads : []
+      calls : []
+    termination:
+      bound : 1
