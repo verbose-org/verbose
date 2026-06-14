@@ -19817,6 +19817,81 @@ rule le64_neg
         let _ = fs::remove_file(em);
     }
 
+    /// Brick b4b-2 — RECURSION in Verbose-emitted x86-64 machine code. The
+    /// program-level generator (b4b-1: proc layout, frame ABI, call/ret) +
+    /// b4a's if/comparison compose to give recursion for free: a proc's
+    /// self-call resolves to its own offset (proc_offset returns the current
+    /// proc), so the `call rel32` is a backward jump. No new Verbose code —
+    /// this pins that factorial/fib/mutual-recursion blobs mmap+exec to the
+    /// same value eval_main computes. THE backend-arc milestone: a compiler
+    /// written in Verbose emits native machine code for recursive programs.
+    #[test]
+    fn streaming_x86_program_recursion_executes() {
+        use std::fs;
+        use std::process::Command;
+
+        let src = fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let x86 = std::env::temp_dir().join("verbosec_test_x86_prog_rec");
+        let em = std::env::temp_dir().join("verbosec_test_eval_main_rec");
+        compile_native(&program, "x86_program_src", x86.to_str().unwrap(), false, false)
+            .expect("x86_program_src must compile natively");
+        compile_native(&program, "eval_main", em.to_str().unwrap(), false, false)
+            .expect("eval_main must compile natively");
+
+        // Recursive programs (entry = first rule, 0 params). Cover: direct
+        // recursion (factorial), deeper recursion, double recursion (fib),
+        // mutual recursion (even/odd), and a linear accumulator (sum).
+        let cases: &[(&str, i64)] = &[
+            ("rule main\n  logic:\n    out = fact(5)\nrule fact(n)\n  logic:\n    out = if n == 0 then 1 else n * fact(n - 1)", 120),
+            ("rule main\n  logic:\n    out = fact(10)\nrule fact(n)\n  logic:\n    out = if n == 0 then 1 else n * fact(n - 1)", 3628800),
+            ("rule main\n  logic:\n    out = fib(10)\nrule fib(n)\n  logic:\n    out = if n < 2 then n else fib(n - 1) + fib(n - 2)", 55),
+            ("rule main\n  logic:\n    out = ev(10)\nrule ev(n)\n  logic:\n    out = if n == 0 then 1 else od(n - 1)\nrule od(n)\n  logic:\n    out = if n == 0 then 0 else ev(n - 1)", 1),
+            ("rule main\n  logic:\n    out = rec(5)\nrule rec(n)\n  logic:\n    out = if n == 0 then 0 else n + rec(n - 1)", 15),
+        ];
+
+        for &(prog_src, expected) in cases {
+            let mc = Command::new(&x86)
+                .args([prog_src, "0"])
+                .output()
+                .expect("spawn x86_program_src");
+            assert!(mc.status.success(), "x86_program_src must exit 0 for {:?}", prog_src);
+            let code = mc.stdout;
+            assert!(!code.is_empty(), "x86_program_src emitted no bytes for {:?}", prog_src);
+
+            let x86_result = unsafe {
+                let page = 4096usize;
+                let alloc = libc_mmap(page);
+                assert!(!alloc.is_null(), "mmap failed");
+                std::ptr::copy_nonoverlapping(code.as_ptr(), alloc as *mut u8, code.len());
+                let f: extern "C" fn() -> i64 = std::mem::transmute(alloc);
+                let r = f();
+                libc_munmap(alloc, page);
+                r
+            };
+
+            let ev = Command::new(&em)
+                .args([prog_src, "0"])
+                .output()
+                .expect("spawn eval_main");
+            assert!(ev.status.success(), "eval_main must exit 0 for {:?}", prog_src);
+            let eval_val: i64 = String::from_utf8_lossy(&ev.stdout)
+                .trim()
+                .parse()
+                .unwrap_or_else(|_| panic!("eval_main produced non-number for {:?}", prog_src));
+
+            assert_eq!(x86_result, expected, "x86 blob for {:?} returned {} (expected {})", prog_src, x86_result, expected);
+            assert_eq!(eval_val, expected, "eval_main for {:?} returned {} (expected {})", prog_src, eval_val, expected);
+            assert_eq!(x86_result, eval_val, "x86 ({}) and eval_main ({}) disagree for {:?}", x86_result, eval_val, prog_src);
+        }
+
+        let _ = fs::remove_file(x86);
+        let _ = fs::remove_file(em);
+    }
+
     /// Minimal mmap(PROT_READ|WRITE|EXEC, MAP_PRIVATE|ANON) via raw syscall —
     /// the project is zero-dependency, so we go straight to the kernel ABI
     /// instead of pulling in the `libc` crate. mmap is syscall 9 on x86-64.

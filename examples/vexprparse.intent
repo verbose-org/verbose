@@ -1350,3 +1350,13 @@ there (out of the arithmetic evaluator's scope).
     sub(10,3)=a-b ->7 (param order, non-commutative); h(n)=n*n on 5 ->25 (same param twice);
     if cmp(2,3) then 100 else 200, cmp(a,b)=a<b ->100 (call result inside a b4a if). NEXT
     (b4b-2): recursion — a proc calling itself (factorial) -> 120, composing this + b4a's if.
+
+59. Brick b4b-2 of the backend arc: RECURSION in Verbose-emitted x86-64 machine code — the
+    backend-arc milestone. No new Verbose code: b4b-1's program lowering (proc layout, frame
+    ABI, real call/ret) composes with b4a's if/comparison to give recursion for FREE. A proc's
+    self-call resolves through proc_offset to its OWN offset, so the `call rel32` is a backward
+    jump; the if/else base case terminates it; the frame ABI holds the param per recursion
+    level. Verified (streaming_x86_program_recursion_executes): each blob mmap+exec == eval_main:
+    fact(5)->120, fact(10)->3628800, fib(10)->55 (double recursion), mutual even/odd ev(10)->1,
+    linear sum rec(5)->15. A compiler written in Verbose emits native machine code for recursive
+    AND mutually-recursive programs, and it runs. (div/mod/logic/lets still out — followups.)
