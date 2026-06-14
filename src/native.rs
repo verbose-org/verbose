@@ -19817,6 +19817,150 @@ rule le64_neg
         let _ = fs::remove_file(em);
     }
 
+    /// Brick b6 — the four missing binary operators in the machine-code
+    /// generator: division `/` (op 16), modulo `%` (op 17), logical `and`
+    /// (op 30), logical `or` (op 31). Both the closed-expression path
+    /// (x86_expr / code_size_expr) and the program path (x86_node /
+    /// code_size_node) grow these arms. div/mod are signed x86 idiv (truncate
+    /// toward zero, matching the interpreter oracle's Rust i64 / and %); div/mod
+    /// by zero is UNGUARDED — idiv #DE (SIGFPE) matches eval_expr's runtime
+    /// error (so both fault; not value-compared here). and/or are branchless on
+    /// the operand-!=0 semantics. This mmap+exec test pins x86 == eval_expr ==
+    /// hand value; a wrong div/mod/and/or code_size would shift every following
+    /// jump offset and crash, so it doubles as a byte-count check.
+    #[test]
+    fn streaming_x86_divmod_logic() {
+        use std::fs;
+        use std::process::Command;
+
+        let src = fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        // ---- expression path (x86_expr / code_size_expr) ----
+        let x86 = std::env::temp_dir().join("verbosec_test_x86_divmod_expr");
+        let eval = std::env::temp_dir().join("verbosec_test_eval_divmod_expr");
+        compile_native(&program, "x86_expr_src", x86.to_str().unwrap(), false, false)
+            .expect("x86_expr_src must compile natively");
+        compile_native(&program, "eval_expr", eval.to_str().unwrap(), false, false)
+            .expect("eval_expr must compile natively");
+
+        // (expression, hand-computed value). Covers div/mod (incl. negative,
+        // truncate-toward-zero), and/or (operand-!=0 semantics), and the
+        // composition of `and` with comparisons and `if`.
+        let cases: &[(&str, i64)] = &[
+            ("10 / 3", 3),
+            ("10 % 3", 1),
+            ("100 / 7", 14),
+            ("100 % 7", 2),
+            ("- 7 / 2", -3),  // idiv truncates toward zero, matching Rust i64 /
+            ("- 7 % 2", -1),  // Rust i64 % sign follows the dividend
+            ("5 and 0", 0),
+            ("5 and 3", 1),
+            ("0 or 0", 0),
+            ("0 or 7", 1),
+            ("(2 < 3) and (4 < 5)", 1),
+            ("1 and (if 1 < 2 then 1 else 0)", 1),
+        ];
+
+        for &(expr, expected) in cases {
+            let mc = Command::new(&x86)
+                .args([expr, "0"])
+                .output()
+                .expect("spawn x86_expr_src");
+            assert!(mc.status.success(), "x86_expr_src must exit 0 for {:?}", expr);
+            let code = mc.stdout;
+            assert!(!code.is_empty(), "x86_expr_src emitted no bytes for {:?}", expr);
+
+            let x86_result = unsafe {
+                let page = 4096usize;
+                let alloc = libc_mmap(page);
+                assert!(!alloc.is_null(), "mmap failed");
+                std::ptr::copy_nonoverlapping(code.as_ptr(), alloc as *mut u8, code.len());
+                let f: extern "C" fn() -> i64 = std::mem::transmute(alloc);
+                let r = f();
+                libc_munmap(alloc, page);
+                r
+            };
+
+            let ev = Command::new(&eval)
+                .args([expr, "0"])
+                .output()
+                .expect("spawn eval_expr");
+            assert!(ev.status.success(), "eval_expr must exit 0 for {:?}", expr);
+            let eval_val: i64 = String::from_utf8_lossy(&ev.stdout)
+                .trim()
+                .parse()
+                .unwrap_or_else(|_| panic!("eval_expr produced non-number for {:?}: {:?}", expr, ev.stdout));
+
+            assert_eq!(x86_result, expected, "x86 for {:?} = {} (expected {})", expr, x86_result, expected);
+            assert_eq!(eval_val, expected, "eval_expr for {:?} = {} (expected {})", expr, eval_val, expected);
+            assert_eq!(x86_result, eval_val, "x86 ({}) and eval_expr ({}) disagree for {:?}", x86_result, eval_val, expr);
+        }
+
+        let _ = fs::remove_file(&x86);
+        let _ = fs::remove_file(&eval);
+
+        // ---- program path (x86_node / code_size_node): div in a proc, and `%`
+        //      / `and` flowing across a real call ----
+        let xp = std::env::temp_dir().join("verbosec_test_x86_divmod_prog");
+        let em = std::env::temp_dir().join("verbosec_test_eval_divmod_prog");
+        compile_native(&program, "x86_program_src", xp.to_str().unwrap(), false, false)
+            .expect("x86_program_src must compile natively");
+        compile_native(&program, "eval_main", em.to_str().unwrap(), false, false)
+            .expect("eval_main must compile natively");
+
+        let prog_cases: &[(&str, i64)] = &[
+            // q(20, 6) -> 20 / 6 -> 3 (div inside a proc, params)
+            ("rule main\n  logic:\n    out = q(20, 6)\nrule q(a, b)\n  logic:\n    out = a / b", 3),
+            // r(17, 5) -> 17 % 5 -> 2 (mod across a call)
+            ("rule main\n  logic:\n    out = r(17, 5)\nrule r(a, b)\n  logic:\n    out = a % b", 2),
+            // band(6, 0) -> (6 != 0) and (0 != 0) -> 0 (logical and across a call)
+            ("rule main\n  logic:\n    out = band(6, 0)\nrule band(a, b)\n  logic:\n    out = a and b", 0),
+            // band(6, 9) -> 1
+            ("rule main\n  logic:\n    out = band(6, 9)\nrule band(a, b)\n  logic:\n    out = a and b", 1),
+        ];
+
+        for &(prog_src, expected) in prog_cases {
+            let mc = Command::new(&xp)
+                .args([prog_src, "0"])
+                .output()
+                .expect("spawn x86_program_src");
+            assert!(mc.status.success(), "x86_program_src must exit 0 for {:?}", prog_src);
+            let code = mc.stdout;
+            assert!(!code.is_empty(), "x86_program_src emitted no bytes for {:?}", prog_src);
+
+            let x86_result = unsafe {
+                let page = 4096usize;
+                let alloc = libc_mmap(page);
+                assert!(!alloc.is_null(), "mmap failed");
+                std::ptr::copy_nonoverlapping(code.as_ptr(), alloc as *mut u8, code.len());
+                let f: extern "C" fn() -> i64 = std::mem::transmute(alloc);
+                let r = f();
+                libc_munmap(alloc, page);
+                r
+            };
+
+            let ev = Command::new(&em)
+                .args([prog_src, "0"])
+                .output()
+                .expect("spawn eval_main");
+            assert!(ev.status.success(), "eval_main must exit 0 for {:?}", prog_src);
+            let eval_val: i64 = String::from_utf8_lossy(&ev.stdout)
+                .trim()
+                .parse()
+                .unwrap_or_else(|_| panic!("eval_main produced non-number for {:?}: {:?}", prog_src, ev.stdout));
+
+            assert_eq!(x86_result, expected, "x86 prog for {:?} = {} (expected {})", prog_src, x86_result, expected);
+            assert_eq!(eval_val, expected, "eval_main for {:?} = {} (expected {})", prog_src, eval_val, expected);
+            assert_eq!(x86_result, eval_val, "x86 ({}) and eval_main ({}) disagree for {:?}", x86_result, eval_val, prog_src);
+        }
+
+        let _ = fs::remove_file(&xp);
+        let _ = fs::remove_file(&em);
+    }
+
     /// Brick b4b-2 — RECURSION in Verbose-emitted x86-64 machine code. The
     /// program-level generator (b4b-1: proc layout, frame ABI, call/ret) +
     /// b4a's if/comparison compose to give recursion for free: a proc's

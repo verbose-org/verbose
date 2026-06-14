@@ -1379,3 +1379,24 @@ there (out of the arithmetic evaluator's scope).
     itoa-in-machine-code, a later brick). Verified (streaming_elf_program_runs): the emitted
     file's CHILD EXIT CODE == eval_main(program) for fact(5)->120, fib(10)->55, sum rec(5)->15,
     mutual even/odd ev(10)->1, double(add(3,4))->14, and the constant `out = 7`->7.
+
+61. Brick b6 of the backend arc: the FOUR MISSING BINARY OPERATORS in the machine-code generator
+    — division `/` (op 16), modulo `%` (op 17), logical `and` (op 30), logical `or` (op 31).
+    b3/b4a/b4b emitted +,-,*,neg, the 6 comparisons, if/else, calls and recursion; b6 fills the
+    arithmetic/logic gap. Both codegen paths grow these four arms: the closed-expression path
+    (x86_expr / code_size_expr) AND the program path with params/calls (x86_node / code_size_node).
+    After the two operands are lowered (left then right pushed), each op pops rcx=right, rax=left.
+    div: cqo (48 99) ; idiv rcx (48 f7 f9) ; push rax (50) -> quotient (8 bytes incl. the 59 58 pops).
+    mod: cqo ; idiv rcx ; mov rax, rdx (48 89 d0) ; push rax -> remainder (11 bytes). Division is
+    SIGNED, x86 idiv truncates toward zero, matching the interpreter oracle (Rust i64 /, %):
+    -7/2 = -3, -7%2 = -1. Division/modulo by ZERO is UNGUARDED — idiv on a 0 divisor raises #DE
+    (SIGFPE), which matches eval_expr: the interpreter returns a runtime error on `a/0` / `a%0`
+    (it does NOT guard to 0). So both backends fault on a zero divisor — same observable contract.
+    and/or are branchless on the eval (operand != 0) semantics: test rax,rax ; setne al ; test
+    rcx,rcx ; setne cl ; and al,cl (or `or al,cl` = 08 c8) ; movzx eax,al ; push rax (20 bytes each).
+    code_size arms: div +8, mod +11, and +20, or +20 — counted byte-for-byte against the emit arms
+    so the program path's call/if rel32 offsets stay exact. VERBOSE-ONLY: four new op arms in each of
+    x86_expr / code_size_expr / x86_node / code_size_node; no src change. Verified end-to-end
+    (streaming_x86_divmod_logic, mmap+exec == eval_expr): 10/3->3, 10%3->1, 100/7->14, 100%7->2,
+    -7/2->-3, -7%2->-1, 5 and 0->0, 5 and 3->1, 0 or 0->0, 0 or 7->1, (2<3) and (4<5)->1,
+    1 and (if 1<2 then 1 else 0)->1; plus the program path (div in a proc, `and`/`%` across a call).
