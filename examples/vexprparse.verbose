@@ -9172,6 +9172,418 @@ rule x86_expr_src
 
 
 -- ============================================================================
+-- BRICK b4b-1 — LOWER A WHOLE NON-RECURSIVE PROGRAM to ONE callable machine-code
+-- blob. Brick b3/b4a lowered one closed EXPRESSION (no vars, no calls); this
+-- brick lowers a multi-rule PROGRAM to real x86-64: every rule becomes a `proc`
+-- with a real `push rbp ; mov rbp, rsp` frame, params loaded from the frame, and
+-- real `call rel32` / `ret` between procs. The entry proc (the first rule, 0
+-- params) is laid first at offset 0, so the blob mmap'd and called as
+-- `fn() -> i64` runs main and returns its result in rax.
+--
+-- ABI (the contract the test mmap+execs):
+--   * Caller at AstCall(callee, args): lower each arg in source order (each
+--     leaves its value on the CPU stack), so after the args the top N slots hold
+--     arg0 (deepest) .. arg(N-1) (top). Then:
+--        call rel32      e8 + le32(rel)   -- rel = procOffset(callee) - (after-call)
+--        add rsp, 8*N    48 81 c4 + le32  -- pop the args the caller pushed
+--        push rax        50               -- result onto the caller's stack-machine
+--   * Proc prologue:  push rbp ; mov rbp, rsp = 55 48 89 e5. After it,
+--     [rbp+16] = arg(N-1) (last pushed), arg(N-1-k) at [rbp+16+8*k]. So param i
+--     (declaration order, 0-indexed) lives at [rbp + 16 + 8*(N-1-i)].
+--   * AstVar(start,len) = load param: push qword [rbp+disp] = ff b5 + le32(disp),
+--     disp = 16 + 8*(N-1-i), i = the param index whose name span byte-matches.
+--     A var not among the params -> int3 trap (no lets in this brick).
+--   * Proc epilogue (body has left its result on the stack):
+--        pop rax ; mov rsp, rbp ; pop rbp ; ret = 58 48 89 ec 5d c3.
+--
+-- Position threading: the ONLY thing needing an absolute offset is a call's
+-- rel32. `off` = the absolute byte offset where the current subtree's code
+-- begins. AstBin/AstNeg/AstIf thread off to children so a nested call inside a
+-- branch reaches its own site; the jz/jmp inside `if` stay self-relative
+-- (unchanged from b4a). AstCall computes rel32 = procOffset(callee) -
+-- (off + code_size(args) + 5).
+--
+-- NON-RECURSIVE only (a proc calling itself or a cycle is b4b-2). Lets are a
+-- later brick (a let-bearing body traps via the AstVar path — a let-bound name
+-- is not a param). div/mod/logic stay out (same trap byte as b4a).
+-- VERBOSE-ONLY: reuses the b1/b2 streaming-bytes path (bytes concat + le32/le64);
+-- no src/ change. Verified end-to-end by streaming_x86_program_executes: the
+-- blob is mmap'd RWX, called at offset 0 (the entry proc), and the returned i64
+-- == eval_main(program) == the hand value.
+-- ============================================================================
+
+-- ByteGenState: the program-aware codegen state. `node` is the subtree to lower,
+-- `src` the source text (for resolving var/callee name spans), `off` the absolute
+-- byte offset where this subtree's code begins (only consumed to compute a call's
+-- rel32), `params` the CURRENT proc's formal parameters (to map a var name to its
+-- frame slot), `prog` the whole program (to resolve a callee name to its proc
+-- offset).
+concept ByteGenState
+  @intention: "A subtree to lower to machine code + source + absolute offset + the current proc's params + the program"
+  @source: vexprparse.intent:56
+  fields:
+    node : Ast
+    src : text [..256]
+    off : number
+    params : ParamList
+    prog : RuleList
+
+
+-- ByteGenArgs: the same codegen state but over a call's ARGUMENT list. Each arg
+-- is lowered with x86_node in source order; `off` threads so arg(k) starts at the
+-- offset just past arg(0)..arg(k-1)'s code (so a nested call inside an arg lands
+-- its rel32 correctly).
+concept ByteGenArgs
+  @intention: "A call's argument list to lower + source + running offset + the current proc's params + the program"
+  @source: vexprparse.intent:56
+  fields:
+    args : ArgList
+    src : text [..256]
+    off : number
+    params : ParamList
+    prog : RuleList
+
+
+-- ParamIndexState: a parameter list to scan for a name span, plus the source and
+-- the query span (a var reference) and the index reached so far. Returns the
+-- 0-based declaration-order index of the matching parameter, or -1 if the name is
+-- not a parameter of the current proc.
+concept ParamIndexState
+  @intention: "A parameter list + source + a query name span + the index reached, to find a param's position"
+  @source: vexprparse.intent:56
+  fields:
+    params : ParamList
+    src : text [..256]
+    q_start : number [0, 256]
+    q_len : number [0, 256]
+    idx : number
+
+
+-- ProcOffState: the program to walk + a running byte offset + the callee name
+-- span being resolved. proc_offset accumulates proc_size over the procs BEFORE
+-- the named one; the entry proc is at 0.
+concept ProcOffState
+  @intention: "A rule list + running byte offset + a callee name span, to resolve a proc's blob offset"
+  @source: vexprparse.intent:56
+  fields:
+    rules : RuleList
+    src : text [..256]
+    acc : number
+    q_start : number [0, 256]
+    q_len : number [0, 256]
+
+
+-- ProcGenState: one rule to lower to a proc + its absolute blob offset + the
+-- whole program (so the body's calls resolve other procs).
+concept ProcGenState
+  @intention: "A rule to lower to a proc + its blob offset + the program"
+  @source: vexprparse.intent:56
+  fields:
+    rd : RuleDecl
+    src : text [..256]
+    off : number
+    prog : RuleList
+
+
+-- ProgGenState: the whole program to lower to a blob + the running blob offset of
+-- the next proc + the program itself (callees resolve against it).
+concept ProgGenState
+  @intention: "A rule list to lower to a blob + the running blob offset + the program for callee resolution"
+  @source: vexprparse.intent:56
+  fields:
+    rules : RuleList
+    src : text [..256]
+    off : number
+    prog : RuleList
+
+
+-- param_index: the 0-based declaration-order index of the parameter whose name
+-- span byte-matches the query span, or -1 if none. The length check guards
+-- name_eq (which assumes equal lengths), exactly like find_rule / env_lookup.
+rule param_index
+  @intention: "The 0-based index of the parameter matching a name span, or -1 if not a parameter"
+  @source: vexprparse.intent:56
+  input:
+    pi : ParamIndexState
+  output:
+    out : number
+  logic:
+    out = match pi.params:
+      PCons(name_start, name_len, ty, rest) => if name_len == pi.q_len and name_eq(NameEqState { src: pi.src, a_start: name_start, b_start: pi.q_start, len: pi.q_len, off: 0 }) == 1 then pi.idx else param_index(ParamIndexState { params: rest, src: pi.src, q_start: pi.q_start, q_len: pi.q_len, idx: pi.idx + 1 })
+      PNil => 0 - 1
+  proofs:
+    purity:
+      reads : [pi.params, pi.src, pi.q_start, pi.q_len, pi.idx]
+      calls : [name_eq, param_index]
+    termination:
+      bound : 512
+
+
+-- code_size_node: the EXACT byte count x86_node(bg) emits for a subtree, the
+-- program-aware sibling of code_size_expr. Must match x86_node arm-for-arm so
+-- the `if` rel32 offsets and call rel32 offsets are correct. New arms vs b4a:
+--   AstVar  => 6   (ff b5 + le32 disp)
+--   AstCall => code_size_args(args) + 13  (call 5 + add rsp,imm32 7 + push rax 1)
+-- AstNum/AstBin/AstNeg/AstIf reproduce code_size_expr byte-for-byte.
+rule code_size_node
+  @intention: "Exact byte count x86_node emits for a subtree (program-aware: vars load 6 B, calls args+13 B)"
+  @source: vexprparse.intent:56
+  input:
+    bg : ByteGenState
+  output:
+    out : number
+  logic:
+    out = match bg.node:
+      AstNum(value) => 11
+      AstBin(op, lhs, rhs) => code_size_node(ByteGenState { node: lhs, src: bg.src, off: bg.off, params: bg.params, prog: bg.prog }) + code_size_node(ByteGenState { node: rhs, src: bg.src, off: bg.off, params: bg.params, prog: bg.prog }) + (if op == 13 then 6 else if op == 14 then 6 else if op == 15 then 7 else if op == 1 then 12 else if op == 6 then 12 else if op == 19 then 12 else if op == 20 then 12 else if op == 5 then 12 else if op == 4 then 12 else 1)
+      AstNeg(inner) => code_size_node(ByteGenState { node: inner, src: bg.src, off: bg.off, params: bg.params, prog: bg.prog }) + 5
+      AstNot(inner) => 1
+      AstVar(start, len) => 6
+      AstField(base, fstart, flen) => 1
+      AstCall(callee_start, callee_len, args) => code_size_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, prog: bg.prog }) + 13
+      AstStr(start, len) => 1
+      AstBool(value) => 1
+      AstIf(cond, thn, els) => code_size_node(ByteGenState { node: cond, src: bg.src, off: bg.off, params: bg.params, prog: bg.prog }) + 15 + code_size_node(ByteGenState { node: thn, src: bg.src, off: bg.off, params: bg.params, prog: bg.prog }) + code_size_node(ByteGenState { node: els, src: bg.src, off: bg.off, params: bg.params, prog: bg.prog })
+      AstErr => 1
+  proofs:
+    purity:
+      reads : [bg.node, bg.src, bg.off, bg.params, bg.prog]
+      calls : [code_size_node, code_size_args]
+    termination:
+      bound : 8000
+
+
+-- code_size_args: the total byte count of lowering a call's argument list (the
+-- sum of each arg's code_size_node). Empty list -> 0.
+rule code_size_args
+  @intention: "Total byte count of lowering a call's argument list"
+  @source: vexprparse.intent:56
+  input:
+    ag : ByteGenArgs
+  output:
+    out : number
+  logic:
+    out = match ag.args:
+      ArgCons(head, tail) => code_size_node(ByteGenState { node: head, src: ag.src, off: ag.off, params: ag.params, prog: ag.prog }) + code_size_args(ByteGenArgs { args: tail, src: ag.src, off: ag.off, params: ag.params, prog: ag.prog })
+      ArgNil => 0
+  proofs:
+    purity:
+      reads : [ag.args, ag.src, ag.off, ag.params, ag.prog]
+      calls : [code_size_node, code_size_args]
+    termination:
+      bound : 8000
+
+
+-- proc_size: the exact byte length of one rule's emitted proc =
+--   prologue 4 (55 48 89 e5) + body's result-expr code + epilogue 6
+--   (58 48 89 ec 5d c3). The body's let-bindings are NOT lowered in this brick
+-- (a let-bound name traps via the var path), so the body is the block result only.
+-- The `off` passed to code_size_node is irrelevant to a SIZE (sizes don't depend
+-- on absolute position), so 0 is used.
+rule proc_size
+  @intention: "Exact byte length of one rule's emitted proc (prologue 4 + body code + epilogue 6)"
+  @source: vexprparse.intent:56
+  input:
+    pg : ProcGenState
+  output:
+    out : number
+  logic:
+    let blk = rd_body(pg.rd)
+    let result = block_result(blk)
+    out = 4 + code_size_node(ByteGenState { node: result, src: pg.src, off: 0, params: rd_params(pg.rd), prog: pg.prog }) + 6
+  proofs:
+    purity:
+      reads : [pg.rd, pg.src, pg.prog]
+      calls : [rd_body, block_result, code_size_node, rd_params]
+    termination:
+      bound : 8000
+
+
+-- proc_offset: the absolute blob offset of the proc whose name span matches the
+-- query — the sum of proc_size over the procs BEFORE it (the entry proc is at 0).
+-- Walks the program accumulating each proc_size into `acc` until the named proc
+-- is reached, then returns acc. A missing callee returns acc (never reached for a
+-- well-formed non-recursive program; rel32 would be wrong, caught by mmap+exec).
+rule proc_offset
+  @intention: "Absolute blob offset of a named proc = sum of proc_size over the procs before it"
+  @source: vexprparse.intent:56
+  input:
+    po : ProcOffState
+  output:
+    out : number
+  logic:
+    out = match po.rules:
+      RCons(head, tail) => if rd_name_len(head) == po.q_len and name_eq(NameEqState { src: po.src, a_start: rd_name_start(head), b_start: po.q_start, len: po.q_len, off: 0 }) == 1 then po.acc else proc_offset(ProcOffState { rules: tail, src: po.src, acc: po.acc + proc_size(ProcGenState { rd: head, src: po.src, off: 0, prog: po.rules }), q_start: po.q_start, q_len: po.q_len })
+      RNil => po.acc
+  proofs:
+    purity:
+      reads : [po.rules, po.src, po.acc, po.q_start, po.q_len]
+      calls : [rd_name_len, name_eq, rd_name_start, proc_offset, proc_size]
+    termination:
+      bound : 8000
+
+
+-- x86_node: the program-aware byte-emitting code generator. Same post-order shape
+-- as x86_expr, but it now lowers AstVar (a frame param load) and AstCall (a real
+-- call rel32 + arg cleanup + push result), threading `off` so a nested call's
+-- rel32 is computed against its own emission site. AstBin/AstNeg/AstIf reproduce
+-- x86_expr's bytes exactly, just over ByteGenState; the if's jz/jmp stay
+-- self-relative (computed from code_size_node, the program-aware size).
+--   AstVar: push qword [rbp+disp] (ff b5 + le32 disp), disp = 16 + 8*(N-1-i).
+--           Not a param -> int3 (cc) — out of subset (no lets here).
+--   AstCall: <args in order> ; call rel32 (e8 + le32) ; add rsp,8N (48 81 c4 +
+--           le32) ; push rax (50). rel32 = procOffset(callee) - (off + argsize + 5).
+rule x86_node
+  @intention: "Lower a program AST subtree (num, +/-/*, neg, cmp, if, var, call) to executable x86-64 machine code"
+  @source: vexprparse.intent:56
+  input:
+    bg : ByteGenState
+  output:
+    out : bytes
+  logic:
+    out = match bg.node:
+      AstNum(value) => concat(b"\x48\xb8", le64(value), b"\x50")
+      AstBin(op, lhs, rhs) => concat(x86_node(ByteGenState { node: lhs, src: bg.src, off: bg.off, params: bg.params, prog: bg.prog }), x86_node(ByteGenState { node: rhs, src: bg.src, off: bg.off + code_size_node(ByteGenState { node: lhs, src: bg.src, off: bg.off, params: bg.params, prog: bg.prog }), params: bg.params, prog: bg.prog }), if op == 13 then b"\x59\x58\x48\x01\xc8\x50" else if op == 14 then b"\x59\x58\x48\x29\xc8\x50" else if op == 15 then b"\x59\x58\x48\x0f\xaf\xc1\x50" else if op == 1 then b"\x59\x58\x48\x39\xc8\x0f\x94\xc0\x0f\xb6\xc0\x50" else if op == 6 then b"\x59\x58\x48\x39\xc8\x0f\x95\xc0\x0f\xb6\xc0\x50" else if op == 19 then b"\x59\x58\x48\x39\xc8\x0f\x9c\xc0\x0f\xb6\xc0\x50" else if op == 20 then b"\x59\x58\x48\x39\xc8\x0f\x9f\xc0\x0f\xb6\xc0\x50" else if op == 5 then b"\x59\x58\x48\x39\xc8\x0f\x9e\xc0\x0f\xb6\xc0\x50" else if op == 4 then b"\x59\x58\x48\x39\xc8\x0f\x9d\xc0\x0f\xb6\xc0\x50" else b"\xcc")
+      AstNeg(inner) => concat(x86_node(ByteGenState { node: inner, src: bg.src, off: bg.off, params: bg.params, prog: bg.prog }), b"\x58\x48\xf7\xd8\x50")
+      AstNot(inner) => b"\xcc"
+      AstVar(start, len) => (if param_index(ParamIndexState { params: bg.params, src: bg.src, q_start: start, q_len: len, idx: 0 }) < 0 then b"\xcc" else concat(b"\xff\xb5", le32(16 + 8 * (param_list_len(bg.params) - 1 - param_index(ParamIndexState { params: bg.params, src: bg.src, q_start: start, q_len: len, idx: 0 })))))
+      AstField(base, fstart, flen) => b"\xcc"
+      AstCall(callee_start, callee_len, args) => concat(x86_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, prog: bg.prog }), b"\xe8", le32(proc_offset(ProcOffState { rules: bg.prog, src: bg.src, acc: 0, q_start: callee_start, q_len: callee_len }) - (bg.off + code_size_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, prog: bg.prog }) + 5)), b"\x48\x81\xc4", le32(8 * arg_list_len(args)), b"\x50")
+      AstStr(start, len) => b"\xcc"
+      AstBool(value) => b"\xcc"
+      AstIf(cond, thn, els) => concat(x86_node(ByteGenState { node: cond, src: bg.src, off: bg.off, params: bg.params, prog: bg.prog }), b"\x58\x48\x85\xc0\x0f\x84", le32(code_size_node(ByteGenState { node: thn, src: bg.src, off: bg.off, params: bg.params, prog: bg.prog }) + 5), x86_node(ByteGenState { node: thn, src: bg.src, off: bg.off + code_size_node(ByteGenState { node: cond, src: bg.src, off: bg.off, params: bg.params, prog: bg.prog }) + 15, params: bg.params, prog: bg.prog }), b"\xe9", le32(code_size_node(ByteGenState { node: els, src: bg.src, off: bg.off, params: bg.params, prog: bg.prog })), x86_node(ByteGenState { node: els, src: bg.src, off: bg.off + code_size_node(ByteGenState { node: cond, src: bg.src, off: bg.off, params: bg.params, prog: bg.prog }) + 15 + code_size_node(ByteGenState { node: thn, src: bg.src, off: bg.off, params: bg.params, prog: bg.prog }), params: bg.params, prog: bg.prog }))
+      AstErr => b"\xcc"
+  proofs:
+    purity:
+      reads : [bg.node, bg.src, bg.off, bg.params, bg.prog]
+      calls : [x86_node, code_size_node, x86_args, code_size_args, param_index, param_list_len, proc_offset, arg_list_len]
+    termination:
+      bound : 8000
+
+
+-- x86_args: lower a call's argument list in source order, threading `off` so each
+-- arg's nested calls land their rel32 against the right site. arg(k) begins at
+-- off + sum(code_size of arg(0)..arg(k-1)). Empty list -> empty bytes.
+rule x86_args
+  @intention: "Lower a call's argument list in source order, each value left on the stack"
+  @source: vexprparse.intent:56
+  input:
+    ag : ByteGenArgs
+  output:
+    out : bytes
+  logic:
+    out = match ag.args:
+      ArgCons(head, tail) => concat(x86_node(ByteGenState { node: head, src: ag.src, off: ag.off, params: ag.params, prog: ag.prog }), x86_args(ByteGenArgs { args: tail, src: ag.src, off: ag.off + code_size_node(ByteGenState { node: head, src: ag.src, off: ag.off, params: ag.params, prog: ag.prog }), params: ag.params, prog: ag.prog }))
+      ArgNil => b""
+  proofs:
+    purity:
+      reads : [ag.args, ag.src, ag.off, ag.params, ag.prog]
+      calls : [x86_node, code_size_node, x86_args]
+    termination:
+      bound : 8000
+
+
+-- arg_list_len: the number of arguments in a call's ArgList (cons-walk like
+-- param_list_len). Used to size the caller's `add rsp, 8*N` arg cleanup.
+rule arg_list_len
+  @intention: "Number of arguments in a call's argument list"
+  @source: vexprparse.intent:56
+  input:
+    al : ArgList
+  output:
+    out : number
+  logic:
+    out = match al:
+      ArgCons(head, tail) => 1 + arg_list_len(tail)
+      ArgNil => 0
+  proofs:
+    purity:
+      reads : [al]
+      calls : [arg_list_len]
+    termination:
+      bound : 512
+      structural : al
+
+
+-- x86_proc: one rule -> one machine-code proc. prologue (push rbp ; mov rbp, rsp)
+-- + the body result expr lowered at off+4 (the body begins 4 bytes into the proc,
+-- after the prologue) with the rule's own params + the program + epilogue
+-- (pop rax ; mov rsp, rbp ; pop rbp ; ret). Lets are not lowered in this brick.
+rule x86_proc
+  @intention: "Lower one rule to a machine-code proc: frame prologue, body, epilogue"
+  @source: vexprparse.intent:56
+  input:
+    pg : ProcGenState
+  output:
+    out : bytes
+  logic:
+    let blk = rd_body(pg.rd)
+    let result = block_result(blk)
+    out = concat(b"\x55\x48\x89\xe5", x86_node(ByteGenState { node: result, src: pg.src, off: pg.off + 4, params: rd_params(pg.rd), prog: pg.prog }), b"\x58\x48\x89\xec\x5d\xc3")
+  proofs:
+    purity:
+      reads : [pg.rd, pg.src, pg.off, pg.prog]
+      calls : [rd_body, block_result, x86_node, rd_params]
+    termination:
+      bound : 8000
+
+
+-- x86_program: every rule, in source order, as its machine-code proc. Threads a
+-- running blob offset (`off`) so each proc knows its own absolute start (needed
+-- for its calls' rel32). The entry (first rule) is laid first at offset 0, so the
+-- blob called at byte 0 runs main. The next proc's offset = this proc's offset +
+-- its proc_size.
+rule x86_program
+  @intention: "Lower a whole program to one callable machine-code blob, one proc per rule, entry first at offset 0"
+  @source: vexprparse.intent:56
+  input:
+    pg : ProgGenState
+  output:
+    out : bytes
+  logic:
+    out = match pg.rules:
+      RCons(head, tail) => concat(x86_proc(ProcGenState { rd: head, src: pg.src, off: pg.off, prog: pg.prog }), x86_program(ProgGenState { rules: tail, src: pg.src, off: pg.off + proc_size(ProcGenState { rd: head, src: pg.src, off: 0, prog: pg.prog }), prog: pg.prog }))
+      RNil => b""
+  proofs:
+    purity:
+      reads : [pg.rules, pg.src, pg.off, pg.prog]
+      calls : [x86_proc, x86_program, proc_size]
+    termination:
+      bound : 8000
+
+
+-- x86_program_src: the b4b-1 money-shot driver. Tokenize (INDENT/DEDENT — a
+-- program is multi-line), parse the whole program, and lower every rule to its
+-- machine-code proc, entry first at offset 0. The blob is real x86-64: mmap'd
+-- RWX and called as `fn() -> i64` at byte 0, it runs main and returns its result.
+--
+--   x86_program_src("rule main\n  logic:\n    out = double(add(3, 4))\n
+--                    rule add(x, y)\n  logic:\n    out = x + y\n
+--                    rule double(x)\n  logic:\n    out = x * 2")
+--     -> a blob whose entry (main) computes double(add(3, 4)) = 14.
+--
+-- NATIVE-ONLY (streaming bytes). Verified by streaming_x86_program_executes:
+-- mmap+exec(blob) == eval_main(program).
+rule x86_program_src
+  @intention: "Tokenize, parse a whole program, and lower it to one callable x86-64 machine-code blob"
+  @source: vexprparse.intent:56
+  input:
+    s : ScanState
+  output:
+    out : bytes
+  logic:
+    let toks = begin_tokenize(ScanState { source: s.source, pos: 0 })
+    let prog = parse_program(ProgramState { toks: toks, src: s.source, pos: 0 })
+    out = x86_program(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog })
+  proofs:
+    purity:
+      reads : [s.source]
+      calls : [begin_tokenize, parse_program, x86_program]
+    termination:
+      bound : 256
+
+
+-- ============================================================================
 -- BRICK 37 — LOWER A WHOLE PROGRAM to the stack IL (a function -> a routine).
 -- Brick 36 lowered one EXPRESSION; this brick lowers every rule to a named
 -- routine the IL VM can call. The calling convention: a routine is `proc NAME

@@ -19707,6 +19707,116 @@ rule le64_neg
         let _ = fs::remove_file(eval);
     }
 
+    /// Brick b4b-1 — THE program-level machine-code milestone. `x86_program_src`
+    /// lowers a whole NON-RECURSIVE multi-rule program to ONE callable x86-64
+    /// blob: every rule becomes a `proc` with a real `push rbp ; mov rbp, rsp`
+    /// frame, params loaded from the frame via `push qword [rbp+disp]`, and real
+    /// `call rel32` / `ret` between procs. The entry proc (the first rule, 0
+    /// params) is laid first at offset 0.
+    ///
+    /// For each program we:
+    ///   1. run x86_program_src(prog_src, "0") → the machine-code blob,
+    ///   2. mmap that blob RWX and CALL it at offset 0 as `extern "C" fn() -> i64`,
+    ///   3. assert the executed result == eval_main(prog_src) == the hand value.
+    /// This proves the program-level emitter produces REAL, runnable x86-64 with
+    /// a correct calling convention (frames, params, call/ret rel32 offsets).
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn streaming_x86_program_executes() {
+        use std::fs;
+        use std::process::Command;
+
+        let src = fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let x86 = std::env::temp_dir().join("verbosec_test_x86_program_src");
+        let em = std::env::temp_dir().join("verbosec_test_eval_main_for_x86prog");
+        compile_native(&program, "x86_program_src", x86.to_str().unwrap(), false, false)
+            .expect("x86_program_src (recursive bytes streaming) must compile natively");
+        compile_native(&program, "eval_main", em.to_str().unwrap(), false, false)
+            .expect("eval_main must compile natively");
+
+        // (program source, hand-computed value). Entry = the FIRST rule, 0 params.
+        // Covers: nested calls, multi-arg + chained calls, params used twice / out
+        // of order, and a comparison-returning call composed inside an `if`.
+        let cases: &[(&str, i64)] = &[
+            // double(add(3, 4)) -> double(7) -> 14
+            ("rule main\n  logic:\n    out = double(add(3, 4))\nrule add(x, y)\n  logic:\n    out = x + y\nrule double(x)\n  logic:\n    out = x * 2", 14),
+            // f(2, g(3)) -> f(2, 4) -> 2*4 -> 8 (2-arg + 1-arg chain, nested call as arg)
+            ("rule main\n  logic:\n    out = f(2, g(3))\nrule f(a, b)\n  logic:\n    out = a * b\nrule g(n)\n  logic:\n    out = n + 1", 8),
+            // sub(10, 3) -> 10 - 3 -> 7 (param order matters for non-commutative -)
+            ("rule main\n  logic:\n    out = sub(10, 3)\nrule sub(a, b)\n  logic:\n    out = a - b", 7),
+            // h(5) -> 5 * 5 -> 25 (same param loaded twice)
+            ("rule main\n  logic:\n    out = h(5)\nrule h(n)\n  logic:\n    out = n * n", 25),
+            // if cmp(2, 3) then 100 else 200 -> cmp(2,3)=1 -> 100 (call result in if)
+            ("rule main\n  logic:\n    out = if cmp(2, 3) then 100 else 200\nrule cmp(a, b)\n  logic:\n    out = a < b", 100),
+        ];
+
+        for &(prog_src, expected) in cases {
+            // 1. emit the program blob via the recursive streaming-bytes emitter.
+            let mc = Command::new(&x86)
+                .args([prog_src, "0"])
+                .output()
+                .expect("spawn x86_program_src");
+            assert!(
+                mc.status.success(),
+                "x86_program_src must exit 0 for {:?}; got {:?}",
+                prog_src, mc.status
+            );
+            let code = mc.stdout;
+            assert!(
+                !code.is_empty(),
+                "x86_program_src emitted no bytes for {:?}",
+                prog_src
+            );
+
+            // 2. mmap RWX, copy the blob in, call at offset 0 (the entry proc).
+            let x86_result = unsafe {
+                let page = 4096usize;
+                let alloc = libc_mmap(page);
+                assert!(!alloc.is_null(), "mmap failed");
+                std::ptr::copy_nonoverlapping(code.as_ptr(), alloc as *mut u8, code.len());
+                let f: extern "C" fn() -> i64 = std::mem::transmute(alloc);
+                let r = f();
+                libc_munmap(alloc, page);
+                r
+            };
+
+            // 3. cross-check against eval_main (the interpreter-parity native
+            //    evaluator of the SAME program) and the hand value.
+            let ev = Command::new(&em)
+                .args([prog_src, "0"])
+                .output()
+                .expect("spawn eval_main");
+            assert!(ev.status.success(), "eval_main must exit 0 for {:?}", prog_src);
+            let eval_val: i64 = String::from_utf8_lossy(&ev.stdout)
+                .trim()
+                .parse()
+                .unwrap_or_else(|_| panic!("eval_main produced non-number for {:?}: {:?}", prog_src, ev.stdout));
+
+            assert_eq!(
+                x86_result, expected,
+                "x86 program blob for {:?} returned {} (expected {})",
+                prog_src, x86_result, expected
+            );
+            assert_eq!(
+                eval_val, expected,
+                "eval_main for {:?} returned {} (expected {})",
+                prog_src, eval_val, expected
+            );
+            assert_eq!(
+                x86_result, eval_val,
+                "x86 ({}) and eval_main ({}) disagree for {:?}",
+                x86_result, eval_val, prog_src
+            );
+        }
+
+        let _ = fs::remove_file(x86);
+        let _ = fs::remove_file(em);
+    }
+
     /// Minimal mmap(PROT_READ|WRITE|EXEC, MAP_PRIVATE|ANON) via raw syscall —
     /// the project is zero-dependency, so we go straight to the kernel ABI
     /// instead of pulling in the `libc` crate. mmap is syscall 9 on x86-64.

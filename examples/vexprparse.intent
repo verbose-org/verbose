@@ -1320,3 +1320,33 @@ there (out of the arithmetic evaluator's scope).
     "if 0 then 1 else 2"(2), "if 2 * 3 == 6 then 100 else 200"(100), "if (1 + 1) < 2 then 7
     else if 3 > 2 then 8 else 9"(8, nested if in else — exercises offset math), and
     "(if 1 < 2 then 3 else 4) * 10"(30, if as a sub-expression).
+
+58. Brick b4b-1 of the backend arc: lower a whole NON-RECURSIVE multi-rule PROGRAM to ONE
+    callable x86-64 machine-code blob. b3/b4a lowered a closed expression (with control flow);
+    this lowers procs that CALL each other, with a frame ABI for params and real call/ret.
+    The blob is mmap'd executable and called at the entry proc (first rule, offset 0) as
+    fn()->i64; mmap+exec == eval_main. VERBOSE-ONLY (no native streaming-core change — reuses
+    the b1/b2 streaming-bytes path).
+
+    Calling convention: caller lowers each arg (left to right, value on the CPU stack), then
+    `call rel32` (e8) ; `add rsp, 8*N` (48 81 c4, pop args) ; `push rax` (callee result).
+    Proc prologue `push rbp ; mov rbp,rsp` (55 48 89 e5); param i (decl order) at
+    [rbp + 16 + 8*(N-1-i)], loaded `push qword [rbp+disp]` (ff b5 + disp32); epilogue
+    `pop rax ; mov rsp,rbp ; pop rbp ; ret` (58 48 89 ec 5d c3). Entry proc has 0 params.
+
+    The cross-proc `call rel32` needs absolute positions, which a streaming emitter can't
+    backpatch — solved with a POSITION-THREADED codegen: a new ByteGenState{ node, src, off,
+    params, prog } carries `off` = the absolute byte offset where this subtree's code begins;
+    siblings advance off by code_size_node (the byte-exact size rule, mirror of code_size_expr
+    incl. AstVar=6, AstCall=args+13). proc_size(rule)=4+code_size(body)+6; proc_offset walks
+    the RuleList summing earlier proc_sizes; a call's rel32 = proc_offset(callee) - (off +
+    code_size_args + 5). New rules: x86_node/x86_args/code_size_node/code_size_args/param_index/
+    proc_size/proc_offset/x86_proc/x86_program/x86_program_src (the closed-expr x86_expr path is
+    kept separate + unchanged). AstVar not among params, lets, div/mod/logic -> int3 trap
+    (out of subset).
+
+    Verified (streaming_x86_program_executes, all blob mmap+exec == eval_main == hand value):
+    double(add(3,4))->14; f(2,g(3)) with f(a,b)=a*b,g(n)=n+1 ->8 (nested call as arg);
+    sub(10,3)=a-b ->7 (param order, non-commutative); h(n)=n*n on 5 ->25 (same param twice);
+    if cmp(2,3) then 100 else 200, cmp(a,b)=a<b ->100 (call result inside a b4a if). NEXT
+    (b4b-2): recursion — a proc calling itself (factorial) -> 120, composing this + b4a's if.
