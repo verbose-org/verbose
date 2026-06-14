@@ -19892,6 +19892,121 @@ rule le64_neg
         let _ = fs::remove_file(em);
     }
 
+    /// Brick b5 — WRAP THE BLOB IN A STANDALONE ELF EXECUTABLE. `elf_program_src`
+    /// tokenizes + parses a whole program, lowers it to the x86_program blob
+    /// (b4b), and wraps that blob in a minimal static ELF64 + a 17-byte `_start`
+    /// trampoline. The output is a RUNNABLE FILE: the entry proc's value comes
+    /// back as the process exit code.
+    ///
+    /// For each program we:
+    ///   1. run elf_program_src(prog_src, "0") → the ELF bytes,
+    ///   2. write them to a temp file, chmod 0o755, execute it as a child,
+    ///   3. assert the child's EXIT CODE == eval_main(prog_src) == the hand value.
+    /// Exit codes are 0..255, so every case's result is < 256. This proves the
+    /// Verbose-written compiler emits a standalone native binary that runs.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn streaming_elf_program_runs() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        let src = fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let elf = std::env::temp_dir().join("verbosec_test_elf_program_src");
+        let em = std::env::temp_dir().join("verbosec_test_eval_main_for_elf");
+        compile_native(&program, "elf_program_src", elf.to_str().unwrap(), false, false)
+            .expect("elf_program_src (recursive bytes streaming) must compile natively");
+        compile_native(&program, "eval_main", em.to_str().unwrap(), false, false)
+            .expect("eval_main must compile natively");
+
+        // (program source, hand value). Entry = the FIRST rule, 0 params. All
+        // results < 256 (exit codes are a byte). Covers: direct recursion
+        // (factorial), double recursion (fib), linear accumulator (sum),
+        // mutual recursion (even/odd), nested calls, and a constant.
+        let cases: &[(&str, i32)] = &[
+            ("rule main\n  logic:\n    out = fact(5)\nrule fact(n)\n  logic:\n    out = if n == 0 then 1 else n * fact(n - 1)", 120),
+            ("rule main\n  logic:\n    out = fib(10)\nrule fib(n)\n  logic:\n    out = if n < 2 then n else fib(n - 1) + fib(n - 2)", 55),
+            ("rule main\n  logic:\n    out = rec(5)\nrule rec(n)\n  logic:\n    out = if n == 0 then 0 else n + rec(n - 1)", 15),
+            ("rule main\n  logic:\n    out = ev(10)\nrule ev(n)\n  logic:\n    out = if n == 0 then 1 else od(n - 1)\nrule od(n)\n  logic:\n    out = if n == 0 then 0 else ev(n - 1)", 1),
+            ("rule main\n  logic:\n    out = double(add(3, 4))\nrule add(x, y)\n  logic:\n    out = x + y\nrule double(x)\n  logic:\n    out = x * 2", 14),
+            ("rule main\n  logic:\n    out = 7", 7),
+        ];
+
+        for (i, &(prog_src, expected)) in cases.iter().enumerate() {
+            // 1. emit the ELF bytes via the recursive streaming-bytes emitter.
+            let mc = Command::new(&elf)
+                .args([prog_src, "0"])
+                .output()
+                .expect("spawn elf_program_src");
+            assert!(
+                mc.status.success(),
+                "elf_program_src must exit 0 for {:?}; got {:?}",
+                prog_src, mc.status
+            );
+            let elf_bytes = mc.stdout;
+            assert!(
+                elf_bytes.len() > 137,
+                "elf_program_src emitted too few bytes ({}) for {:?}",
+                elf_bytes.len(), prog_src
+            );
+            // ELF magic sanity.
+            assert_eq!(
+                &elf_bytes[0..4], &[0x7f, 0x45, 0x4c, 0x46],
+                "emitted file is not ELF for {:?}", prog_src
+            );
+
+            // 2. write to a temp file, chmod +x.
+            let out_path = std::env::temp_dir()
+                .join(format!("verbosec_test_elf_a_out_{}", i));
+            fs::write(&out_path, &elf_bytes).expect("write a.out");
+            let mut perms = fs::metadata(&out_path).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&out_path, perms).expect("chmod +x");
+
+            // 3. execute the file; the entry proc's value is the exit code.
+            let child = Command::new(&out_path)
+                .status()
+                .expect("execute emitted ELF");
+            let child_code = child.code().expect("child terminated by signal");
+
+            // cross-check against eval_main (interpreter-parity native evaluator).
+            let ev = Command::new(&em)
+                .args([prog_src, "0"])
+                .output()
+                .expect("spawn eval_main");
+            assert!(ev.status.success(), "eval_main must exit 0 for {:?}", prog_src);
+            let eval_val: i32 = String::from_utf8_lossy(&ev.stdout)
+                .trim()
+                .parse()
+                .unwrap_or_else(|_| panic!("eval_main produced non-number for {:?}: {:?}", prog_src, ev.stdout));
+
+            assert_eq!(
+                child_code, expected,
+                "emitted ELF for {:?} exited {} (expected {})",
+                prog_src, child_code, expected
+            );
+            assert_eq!(
+                eval_val, expected,
+                "eval_main for {:?} returned {} (expected {})",
+                prog_src, eval_val, expected
+            );
+            assert_eq!(
+                child_code, eval_val,
+                "ELF exit ({}) and eval_main ({}) disagree for {:?}",
+                child_code, eval_val, prog_src
+            );
+
+            let _ = fs::remove_file(&out_path);
+        }
+
+        let _ = fs::remove_file(elf);
+        let _ = fs::remove_file(em);
+    }
+
     /// Minimal mmap(PROT_READ|WRITE|EXEC, MAP_PRIVATE|ANON) via raw syscall —
     /// the project is zero-dependency, so we go straight to the kernel ABI
     /// instead of pulling in the `libc` crate. mmap is syscall 9 on x86-64.

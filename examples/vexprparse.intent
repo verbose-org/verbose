@@ -1360,3 +1360,22 @@ there (out of the arithmetic evaluator's scope).
     fact(5)->120, fact(10)->3628800, fib(10)->55 (double recursion), mutual even/odd ev(10)->1,
     linear sum rec(5)->15. A compiler written in Verbose emits native machine code for recursive
     AND mutually-recursive programs, and it runs. (div/mod/logic/lets still out — followups.)
+
+60. Brick b5 of the backend arc: WRAP THE BLOB IN A STANDALONE ELF EXECUTABLE. b4b lowered a
+    program to a position-independent machine-code blob (entry proc at offset 0, value in rax).
+    b5 wraps that blob in a minimal static ELF64 + a 17-byte `_start` trampoline so the OUTPUT
+    IS A RUNNABLE FILE: `elf_program_src "...prog..." 0 > a.out ; chmod +x a.out ; ./a.out ;
+    echo $?` prints the entry proc's value as the process exit code. A compiler written in
+    Verbose that produces a runnable native binary. Layout (load-from-offset-0 static ELF, base
+    0x400000): [ELF64 header 64 B] [one PT_LOAD program header 56 B] [_start trampoline 17 B]
+    [program blob]. The single PT_LOAD maps the whole file at 0x400000 R+X; entry = base + 120
+    (the trampoline, right after the 120 header bytes); the blob starts at file offset 137
+    (120 + 17). The trampoline is `call rel32 = 12` (reaches the first proc at 137 - 125),
+    `mov rdi, rax` (returned value -> exit-code register), `mov rax, 60` (sys_exit), `syscall`.
+    The ONLY computed header field is p_filesz = p_memsz = 137 + program_total_size(prog),
+    emitted via le64 — every other header byte is a fixed b"..." literal. New Verbose:
+    program_total_size (sum of proc_size over every rule) + elf_program_src (the driver). Exit
+    codes are 0..255, so the milestone tests results < 256 (printing arbitrary i64 needs
+    itoa-in-machine-code, a later brick). Verified (streaming_elf_program_runs): the emitted
+    file's CHILD EXIT CODE == eval_main(program) for fact(5)->120, fib(10)->55, sum rec(5)->15,
+    mutual even/odd ev(10)->1, double(add(3,4))->14, and the constant `out = 7`->7.

@@ -9584,6 +9584,77 @@ rule x86_program_src
 
 
 -- ============================================================================
+-- BRICK b5 — WRAP THE BLOB IN A STANDALONE ELF EXECUTABLE.
+-- x86_program (b4b-1) lowers a program to a position-independent machine-code
+-- blob whose entry proc is at offset 0 and returns its value in rax. This brick
+-- wraps that blob in a minimal static ELF64 + a 17-byte `_start` trampoline so
+-- the output is a runnable file: emit it, `chmod +x`, `./a.out`, and the entry
+-- proc's value comes back as the process exit code (0..255 — printing arbitrary
+-- i64 needs itoa-in-machine-code, a later brick).
+-- ============================================================================
+
+-- program_total_size: the TOTAL byte length of the whole x86_program blob =
+-- sum of proc_size over every rule. Needed to fill the one computed ELF field
+-- (p_filesz = p_memsz = 137 + this). Walks the RuleList exactly like x86_program,
+-- threading the program (`prog`) so proc_size resolves callees for sizing; off is
+-- irrelevant to a size so 0 is used per proc.
+rule program_total_size
+  @intention: "Total byte length of the whole x86_program blob = sum of proc_size over every rule"
+  @source: vexprparse.intent:60
+  input:
+    pg : ProgGenState
+  output:
+    out : number
+  logic:
+    out = match pg.rules:
+      RCons(head, tail) => proc_size(ProcGenState { rd: head, src: pg.src, off: 0, prog: pg.prog }) + program_total_size(ProgGenState { rules: tail, src: pg.src, off: 0, prog: pg.prog })
+      RNil => 0
+  proofs:
+    purity:
+      reads : [pg.rules, pg.src, pg.prog]
+      calls : [proc_size, program_total_size]
+    termination:
+      bound : 8000
+
+
+-- elf_program_src: the b5 money-shot driver. Tokenize + parse a whole program,
+-- then emit a STANDALONE static ELF64 executable wrapping the x86_program blob:
+--   [ELF64 header 64 B] [one PT_LOAD program header 56 B] [_start trampoline 17 B]
+--   [program blob].
+-- Load base = 0x400000; the single PT_LOAD maps the whole file (offset 0) at
+-- 0x400000 R+X. Entry = 0x400000 + 120 (the trampoline, right after the 120 bytes
+-- of headers). The blob starts at file offset 137 (120 + 17). The only computed
+-- field is p_filesz = p_memsz = 137 + program_total_size(prog), emitted via le64.
+-- The trampoline `call rel32 = 12` reaches the first proc (137 - 125), `mov rdi,
+-- rax` moves the returned value into the exit-code register, then sys_exit(60).
+--
+--   elf_program_src("rule main\n  logic:\n    out = fact(5)\n
+--                    rule fact(n)\n  logic:\n    out = if n == 0 then 1 else n * fact(n - 1)")
+--     -> ELF bytes; written to a file, chmod +x, run -> exit code 120.
+--
+-- NATIVE-ONLY (streaming bytes). Verified by streaming_elf_program_runs: the
+-- emitted file's child exit code == eval_main(program) for results in 0..256.
+rule elf_program_src
+  @intention: "Tokenize, parse a whole program, and wrap its x86-64 blob in a standalone static ELF64 executable"
+  @source: vexprparse.intent:60
+  input:
+    s : ScanState
+  output:
+    out : bytes
+  logic:
+    let toks = begin_tokenize(ScanState { source: s.source, pos: 0 })
+    let prog = parse_program(ProgramState { toks: toks, src: s.source, pos: 0 })
+    let fsz = 137 + program_total_size(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog })
+    out = concat(b"\x7f\x45\x4c\x46\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\x3e\x00\x01\x00\x00\x00\x78\x00\x40\x00\x00\x00\x00\x00\x40\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x40\x00\x38\x00\x01\x00\x00\x00\x00\x00\x00\x00", b"\x01\x00\x00\x00\x05\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x40\x00\x00\x00\x00\x00\x00\x00\x40\x00\x00\x00\x00\x00", le64(fsz), le64(fsz), b"\x00\x10\x00\x00\x00\x00\x00\x00", b"\xe8\x0c\x00\x00\x00\x48\x89\xc7\x48\xc7\xc0\x3c\x00\x00\x00\x0f\x05", x86_program(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog }))
+  proofs:
+    purity:
+      reads : [s.source]
+      calls : [begin_tokenize, parse_program, program_total_size, x86_program]
+    termination:
+      bound : 256
+
+
+-- ============================================================================
 -- BRICK 37 — LOWER A WHOLE PROGRAM to the stack IL (a function -> a routine).
 -- Brick 36 lowered one EXPRESSION; this brick lowers every rule to a named
 -- routine the IL VM can call. The calling convention: a routine is `proc NAME
