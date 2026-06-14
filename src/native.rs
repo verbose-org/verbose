@@ -19605,6 +19605,108 @@ rule le64_neg
         let _ = fs::remove_file(eval);
     }
 
+    /// Brick b4a: COMPARISONS + `if`/`else` in the machine-code generator.
+    /// The streaming emitter cannot backpatch, so `code_size_expr` computes
+    /// each branch's exact byte length ahead of time and `if` emits its
+    /// `jz`/`jmp` with rel32 offsets derived from those sizes. Any mismatch
+    /// between code_size_expr and x86_expr's byte output = wrong offset =
+    /// crash/wrong result — which is exactly what this mmap+exec test catches.
+    #[test]
+    fn streaming_x86_if_cmp_executes() {
+        use std::fs;
+        use std::process::Command;
+
+        let src = fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let x86 = std::env::temp_dir().join("verbosec_test_x86_if_cmp_src");
+        let eval = std::env::temp_dir().join("verbosec_test_eval_for_x86_if_cmp");
+        compile_native(&program, "x86_expr_src", x86.to_str().unwrap(), false, false)
+            .expect("x86_expr_src (recursive bytes streaming) must compile natively");
+        compile_native(&program, "eval_expr", eval.to_str().unwrap(), false, false)
+            .expect("eval_expr must compile natively");
+
+        // (expression, hand-computed value) — comparisons + if/else, including
+        // a nested if in the else (offset math) and an if as a sub-expression.
+        let cases: &[(&str, i64)] = &[
+            ("1 < 2", 1),
+            ("2 < 1", 0),
+            ("3 == 3", 1),
+            ("3 != 3", 0),
+            ("5 >= 5", 1),
+            ("2 * 3 > 5", 1),
+            ("if 1 < 2 then 10 else 20", 10),
+            ("if 0 then 1 else 2", 2),
+            ("if 2 * 3 == 6 then 100 else 200", 100),
+            ("if (1 + 1) < 2 then 7 else if 3 > 2 then 8 else 9", 8),
+            ("(if 1 < 2 then 3 else 4) * 10", 30),
+        ];
+
+        for &(expr, expected) in cases {
+            // 1. emit machine code via the recursive streaming-bytes emitter.
+            let mc = Command::new(&x86)
+                .args([expr, "0"])
+                .output()
+                .expect("spawn x86_expr_src");
+            assert!(
+                mc.status.success(),
+                "x86_expr_src must exit 0 for {:?}; got {:?}",
+                expr, mc.status
+            );
+            let code = mc.stdout;
+            assert!(
+                !code.is_empty(),
+                "x86_expr_src emitted no bytes for {:?}",
+                expr
+            );
+
+            // 2. mmap RWX, copy the emitted bytes in, call as fn() -> i64.
+            let x86_result = unsafe {
+                let page = 4096usize;
+                let alloc = libc_mmap(page);
+                assert!(!alloc.is_null(), "mmap failed");
+                std::ptr::copy_nonoverlapping(code.as_ptr(), alloc as *mut u8, code.len());
+                let f: extern "C" fn() -> i64 = std::mem::transmute(alloc);
+                let r = f();
+                libc_munmap(alloc, page);
+                r
+            };
+
+            // 3. cross-check against eval_expr (interpreter-parity native
+            //    evaluator of the SAME parse) and the hand value.
+            let ev = Command::new(&eval)
+                .args([expr, "0"])
+                .output()
+                .expect("spawn eval_expr");
+            assert!(ev.status.success(), "eval_expr must exit 0 for {:?}", expr);
+            let eval_val: i64 = String::from_utf8_lossy(&ev.stdout)
+                .trim()
+                .parse()
+                .unwrap_or_else(|_| panic!("eval_expr produced non-number for {:?}: {:?}", expr, ev.stdout));
+
+            assert_eq!(
+                x86_result, expected,
+                "x86 machine code for {:?} returned {} (expected {})",
+                expr, x86_result, expected
+            );
+            assert_eq!(
+                eval_val, expected,
+                "eval_expr for {:?} returned {} (expected {})",
+                expr, eval_val, expected
+            );
+            assert_eq!(
+                x86_result, eval_val,
+                "x86 ({}) and eval_expr ({}) disagree for {:?}",
+                x86_result, eval_val, expr
+            );
+        }
+
+        let _ = fs::remove_file(x86);
+        let _ = fs::remove_file(eval);
+    }
+
     /// Minimal mmap(PROT_READ|WRITE|EXEC, MAP_PRIVATE|ANON) via raw syscall —
     /// the project is zero-dependency, so we go straight to the kernel ABI
     /// instead of pulling in the `libc` crate. mmap is syscall 9 on x86-64.

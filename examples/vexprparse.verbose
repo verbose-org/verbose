@@ -9079,7 +9079,7 @@ rule x86_expr
   logic:
     out = match ps.node:
       AstNum(value) => concat(b"\x48\xb8", le64(value), b"\x50")
-      AstBin(op, lhs, rhs) => concat(x86_expr(PrintState { node: lhs, src: ps.src }), x86_expr(PrintState { node: rhs, src: ps.src }), if op == 13 then b"\x59\x58\x48\x01\xc8\x50" else if op == 14 then b"\x59\x58\x48\x29\xc8\x50" else if op == 15 then b"\x59\x58\x48\x0f\xaf\xc1\x50" else b"\xcc")
+      AstBin(op, lhs, rhs) => concat(x86_expr(PrintState { node: lhs, src: ps.src }), x86_expr(PrintState { node: rhs, src: ps.src }), if op == 13 then b"\x59\x58\x48\x01\xc8\x50" else if op == 14 then b"\x59\x58\x48\x29\xc8\x50" else if op == 15 then b"\x59\x58\x48\x0f\xaf\xc1\x50" else if op == 1 then b"\x59\x58\x48\x39\xc8\x0f\x94\xc0\x0f\xb6\xc0\x50" else if op == 6 then b"\x59\x58\x48\x39\xc8\x0f\x95\xc0\x0f\xb6\xc0\x50" else if op == 19 then b"\x59\x58\x48\x39\xc8\x0f\x9c\xc0\x0f\xb6\xc0\x50" else if op == 20 then b"\x59\x58\x48\x39\xc8\x0f\x9f\xc0\x0f\xb6\xc0\x50" else if op == 5 then b"\x59\x58\x48\x39\xc8\x0f\x9e\xc0\x0f\xb6\xc0\x50" else if op == 4 then b"\x59\x58\x48\x39\xc8\x0f\x9d\xc0\x0f\xb6\xc0\x50" else b"\xcc")
       AstNeg(inner) => concat(x86_expr(PrintState { node: inner, src: ps.src }), b"\x58\x48\xf7\xd8\x50")
       AstNot(inner) => b"\xcc"
       AstVar(start, len) => b"\xcc"
@@ -9087,12 +9087,56 @@ rule x86_expr
       AstCall(callee_start, callee_len, args) => b"\xcc"
       AstStr(start, len) => b"\xcc"
       AstBool(value) => b"\xcc"
-      AstIf(cond, thn, els) => b"\xcc"
+      AstIf(cond, thn, els) => concat(x86_expr(PrintState { node: cond, src: ps.src }), b"\x58\x48\x85\xc0\x0f\x84", le32(code_size_expr(PrintState { node: thn, src: ps.src }) + 5), x86_expr(PrintState { node: thn, src: ps.src }), b"\xe9", le32(code_size_expr(PrintState { node: els, src: ps.src })), x86_expr(PrintState { node: els, src: ps.src }))
       AstErr => b"\xcc"
   proofs:
     purity:
       reads : [ps.node, ps.src]
-      calls : [x86_expr]
+      calls : [x86_expr, code_size_expr]
+    termination:
+      bound : 4000
+
+
+-- code_size_expr: the EXACT byte count x86_expr(ps) emits for this subtree,
+-- computed structurally over the AST (it never calls x86_expr or le32 — pure
+-- arithmetic). The `if` arm needs this ahead of time because a streaming
+-- emitter writes left-to-right and cannot backpatch a jcc/jmp rel32: it must
+-- KNOW the size of each branch to compute the forward jump distance. Every arm
+-- below MUST equal the byte length of the corresponding x86_expr arm:
+--   AstNum     => 11  (48 b8 + 8-byte imm + 50)
+--   +/- op     => l + r + 6   (59 58 48 01/29 c8 50)
+--   * op       => l + r + 7   (59 58 48 0f af c1 50)
+--   cmp op     => l + r + 12  (59 58 48 39 c8 + setcc 3 + 0f b6 c0 50)
+--   unknown op => l + r + 1   (the int3 trap byte b"\xcc")
+--   AstNeg     => inner + 5   (58 48 f7 d8 50)
+--   AstIf      => cond + 15 + thn + els  (pop 1 + test 3 + jz 6 + jmp 5)
+--   out-of-subset leaves => 1  (the int3 trap byte b"\xcc")
+-- A mismatch HERE means a wrong jump offset = crash/wrong result, caught by
+-- the mmap+exec test (streaming_x86_if_cmp_executes).
+rule code_size_expr
+  @intention: "Exact byte count x86_expr emits for a subtree (for computing jcc/jmp rel32 offsets)"
+  @source: vexprparse.intent:57
+  input:
+    ps : PrintState
+  output:
+    out : number
+  logic:
+    out = match ps.node:
+      AstNum(value) => 11
+      AstBin(op, lhs, rhs) => code_size_expr(PrintState { node: lhs, src: ps.src }) + code_size_expr(PrintState { node: rhs, src: ps.src }) + (if op == 13 then 6 else if op == 14 then 6 else if op == 15 then 7 else if op == 1 then 12 else if op == 6 then 12 else if op == 19 then 12 else if op == 20 then 12 else if op == 5 then 12 else if op == 4 then 12 else 1)
+      AstNeg(inner) => code_size_expr(PrintState { node: inner, src: ps.src }) + 5
+      AstNot(inner) => 1
+      AstVar(start, len) => 1
+      AstField(base, fstart, flen) => 1
+      AstCall(callee_start, callee_len, args) => 1
+      AstStr(start, len) => 1
+      AstBool(value) => 1
+      AstIf(cond, thn, els) => code_size_expr(PrintState { node: cond, src: ps.src }) + 15 + code_size_expr(PrintState { node: thn, src: ps.src }) + code_size_expr(PrintState { node: els, src: ps.src })
+      AstErr => 1
+  proofs:
+    purity:
+      reads : [ps.node, ps.src]
+      calls : [code_size_expr]
     termination:
       bound : 4000
 
