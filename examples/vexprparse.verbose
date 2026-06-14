@@ -9739,23 +9739,27 @@ rule program_total_size
       bound : 8000
 
 
--- elf_program_src: the b5 money-shot driver. Tokenize + parse a whole program,
--- then emit a STANDALONE static ELF64 executable wrapping the x86_program blob:
---   [ELF64 header 64 B] [one PT_LOAD program header 56 B] [_start trampoline 17 B]
+-- elf_program_src: the b5 money-shot driver (b8 prints the result). Tokenize +
+-- parse a whole program, then emit a STANDALONE static ELF64 executable wrapping
+-- the x86_program blob:
+--   [ELF64 header 64 B] [one PT_LOAD program header 56 B] [_start trampoline 101 B]
 --   [program blob].
 -- Load base = 0x400000; the single PT_LOAD maps the whole file (offset 0) at
 -- 0x400000 R+X. Entry = 0x400000 + 120 (the trampoline, right after the 120 bytes
--- of headers). The blob starts at file offset 137 (120 + 17). The only computed
--- field is p_filesz = p_memsz = 137 + program_total_size(prog), emitted via le64.
--- The trampoline `call rel32 = 12` reaches the first proc (137 - 125), `mov rdi,
--- rax` moves the returned value into the exit-code register, then sys_exit(60).
+-- of headers). The blob starts at file offset 221 (120 + 101). The only computed
+-- field is p_filesz = p_memsz = 221 + program_total_size(prog), emitted via le64.
+-- b8: the trampoline `call rel32 = 96` reaches the first proc (221 - 125); the
+-- returned i64 in rax is converted to decimal ASCII (with '-' for negatives, "0"
+-- for zero) plus a trailing newline into a 32-byte stack buffer via an unsigned
+-- div-by-10 loop, written to stdout (sys_write), then sys_exit(0). So ANY i64
+-- result is observable on stdout (e.g. fact(10) = 3628800), not just exit codes.
 --
 --   elf_program_src("rule main\n  logic:\n    out = fact(5)\n
 --                    rule fact(n)\n  logic:\n    out = if n == 0 then 1 else n * fact(n - 1)")
---     -> ELF bytes; written to a file, chmod +x, run -> exit code 120.
+--     -> ELF bytes; written to a file, chmod +x, run -> prints "120\n", exits 0.
 --
--- NATIVE-ONLY (streaming bytes). Verified by streaming_elf_program_runs: the
--- emitted file's child exit code == eval_main(program) for results in 0..256.
+-- NATIVE-ONLY (streaming bytes). Verified by streaming_elf_prints_result: the
+-- emitted file's STDOUT (trimmed) == eval_main(program) for arbitrary i64 results.
 rule elf_program_src
   @intention: "Tokenize, parse a whole program, and wrap its x86-64 blob in a standalone static ELF64 executable"
   @source: vexprparse.intent:60
@@ -9766,8 +9770,8 @@ rule elf_program_src
   logic:
     let toks = begin_tokenize(ScanState { source: s.source, pos: 0 })
     let prog = parse_program(ProgramState { toks: toks, src: s.source, pos: 0 })
-    let fsz = 137 + program_total_size(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog })
-    out = concat(b"\x7f\x45\x4c\x46\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\x3e\x00\x01\x00\x00\x00\x78\x00\x40\x00\x00\x00\x00\x00\x40\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x40\x00\x38\x00\x01\x00\x00\x00\x00\x00\x00\x00", b"\x01\x00\x00\x00\x05\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x40\x00\x00\x00\x00\x00\x00\x00\x40\x00\x00\x00\x00\x00", le64(fsz), le64(fsz), b"\x00\x10\x00\x00\x00\x00\x00\x00", b"\xe8\x0c\x00\x00\x00\x48\x89\xc7\x48\xc7\xc0\x3c\x00\x00\x00\x0f\x05", x86_program(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog }))
+    let fsz = 221 + program_total_size(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog })
+    out = concat(b"\x7f\x45\x4c\x46\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\x3e\x00\x01\x00\x00\x00\x78\x00\x40\x00\x00\x00\x00\x00\x40\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x40\x00\x38\x00\x01\x00\x00\x00\x00\x00\x00\x00", b"\x01\x00\x00\x00\x05\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x40\x00\x00\x00\x00\x00\x00\x00\x40\x00\x00\x00\x00\x00", le64(fsz), le64(fsz), b"\x00\x10\x00\x00\x00\x00\x00\x00", b"\xe8\x60\x00\x00\x00\x48\x83\xec\x20\x49\x89\xc1\x48\x8d\x74\x24\x1f\xc6\x06\x0a\x48\x85\xc0\x79\x03\x48\xf7\xd8\x48\xc7\xc1\x0a\x00\x00\x00\x48\x31\xd2\x48\xf7\xf1\x80\xc2\x30\x48\xff\xce\x88\x16\x48\x85\xc0\x75\xed\x4d\x85\xc9\x79\x06\x48\xff\xce\xc6\x06\x2d\x48\x8d\x54\x24\x20\x48\x29\xf2\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05", x86_program(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog }))
   proofs:
     purity:
       reads : [s.source]

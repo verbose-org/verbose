@@ -20128,21 +20128,26 @@ rule le64_neg
         let _ = fs::remove_file(em);
     }
 
-    /// Brick b5 — WRAP THE BLOB IN A STANDALONE ELF EXECUTABLE. `elf_program_src`
-    /// tokenizes + parses a whole program, lowers it to the x86_program blob
-    /// (b4b), and wraps that blob in a minimal static ELF64 + a 17-byte `_start`
-    /// trampoline. The output is a RUNNABLE FILE: the entry proc's value comes
-    /// back as the process exit code.
+    /// Brick b8 — THE ELF PRINTS ITS RESULT. `elf_program_src` tokenizes +
+    /// parses a whole program, lowers it to the x86_program blob (b4b), and
+    /// wraps that blob in a minimal static ELF64 + a 101-byte `_start`
+    /// trampoline. The trampoline `call`s the entry proc, converts the returned
+    /// i64 in rax to decimal ASCII (with '-' for negatives, "0" for zero) plus
+    /// a trailing newline, writes it to stdout, then sys_exit(0). The output is
+    /// a RUNNABLE FILE whose STDOUT carries the full i64 result — so values
+    /// beyond the 0..255 exit-code range (e.g. fact(10) = 3628800) are now
+    /// observable, which b5's exit-code trampoline could not express.
     ///
     /// For each program we:
     ///   1. run elf_program_src(prog_src, "0") → the ELF bytes,
     ///   2. write them to a temp file, chmod 0o755, execute it as a child,
-    ///   3. assert the child's EXIT CODE == eval_main(prog_src) == the hand value.
-    /// Exit codes are 0..255, so every case's result is < 256. This proves the
-    /// Verbose-written compiler emits a standalone native binary that runs.
+    ///   3. assert the child's STDOUT (trimmed) == eval_main(prog_src) == the
+    ///      hand value, and that the child exits 0.
+    /// Covers values > 255 (fact(10), fib(20)), a negative (5 - 9 = -4), and
+    /// zero (7 - 7 = 0) — the cases the exit-code trampoline could not express.
     #[test]
     #[cfg(target_arch = "x86_64")]
-    fn streaming_elf_program_runs() {
+    fn streaming_elf_prints_result() {
         use std::fs;
         use std::os::unix::fs::PermissionsExt;
         use std::process::Command;
@@ -20159,17 +20164,19 @@ rule le64_neg
         compile_native(&program, "eval_main", em.to_str().unwrap(), false, false)
             .expect("eval_main must compile natively");
 
-        // (program source, hand value). Entry = the FIRST rule, 0 params. All
-        // results < 256 (exit codes are a byte). Covers: direct recursion
-        // (factorial), double recursion (fib), linear accumulator (sum),
-        // mutual recursion (even/odd), nested calls, and a constant.
-        let cases: &[(&str, i32)] = &[
+        // (program source, hand value). Entry = the FIRST rule, 0 params. The
+        // i64 result is now printed to stdout, so values are NOT bounded by the
+        // 0..255 exit-code byte. Covers: direct recursion (factorial) BOTH
+        // in-range (fact(5)=120) and out-of-range (fact(10)=3628800), double
+        // recursion (fib(20)=6765), a NEGATIVE result (5 - 9 = -4), ZERO
+        // (7 - 7 = 0), and nested calls (double(add(3,4))=14).
+        let cases: &[(&str, i64)] = &[
             ("rule main\n  logic:\n    out = fact(5)\nrule fact(n)\n  logic:\n    out = if n == 0 then 1 else n * fact(n - 1)", 120),
-            ("rule main\n  logic:\n    out = fib(10)\nrule fib(n)\n  logic:\n    out = if n < 2 then n else fib(n - 1) + fib(n - 2)", 55),
-            ("rule main\n  logic:\n    out = rec(5)\nrule rec(n)\n  logic:\n    out = if n == 0 then 0 else n + rec(n - 1)", 15),
-            ("rule main\n  logic:\n    out = ev(10)\nrule ev(n)\n  logic:\n    out = if n == 0 then 1 else od(n - 1)\nrule od(n)\n  logic:\n    out = if n == 0 then 0 else ev(n - 1)", 1),
+            ("rule main\n  logic:\n    out = fact(10)\nrule fact(n)\n  logic:\n    out = if n == 0 then 1 else n * fact(n - 1)", 3628800),
+            ("rule main\n  logic:\n    out = fib(20)\nrule fib(n)\n  logic:\n    out = if n < 2 then n else fib(n - 1) + fib(n - 2)", 6765),
+            ("rule main\n  logic:\n    out = 5 - 9", -4),
+            ("rule main\n  logic:\n    out = 7 - 7", 0),
             ("rule main\n  logic:\n    out = double(add(3, 4))\nrule add(x, y)\n  logic:\n    out = x + y\nrule double(x)\n  logic:\n    out = x * 2", 14),
-            ("rule main\n  logic:\n    out = 7", 7),
         ];
 
         for (i, &(prog_src, expected)) in cases.iter().enumerate() {
@@ -20185,7 +20192,7 @@ rule le64_neg
             );
             let elf_bytes = mc.stdout;
             assert!(
-                elf_bytes.len() > 137,
+                elf_bytes.len() > 221,
                 "elf_program_src emitted too few bytes ({}) for {:?}",
                 elf_bytes.len(), prog_src
             );
@@ -20203,11 +20210,20 @@ rule le64_neg
             perms.set_mode(0o755);
             fs::set_permissions(&out_path, perms).expect("chmod +x");
 
-            // 3. execute the file; the entry proc's value is the exit code.
+            // 3. execute the file; the entry proc's value is PRINTED to stdout,
+            //    then the binary exits 0.
             let child = Command::new(&out_path)
-                .status()
+                .output()
                 .expect("execute emitted ELF");
-            let child_code = child.code().expect("child terminated by signal");
+            assert!(
+                child.status.success(),
+                "emitted ELF for {:?} did not exit 0; got {:?}",
+                prog_src, child.status
+            );
+            let child_out: i64 = String::from_utf8_lossy(&child.stdout)
+                .trim()
+                .parse()
+                .unwrap_or_else(|_| panic!("emitted ELF produced non-number for {:?}: {:?}", prog_src, child.stdout));
 
             // cross-check against eval_main (interpreter-parity native evaluator).
             let ev = Command::new(&em)
@@ -20215,15 +20231,15 @@ rule le64_neg
                 .output()
                 .expect("spawn eval_main");
             assert!(ev.status.success(), "eval_main must exit 0 for {:?}", prog_src);
-            let eval_val: i32 = String::from_utf8_lossy(&ev.stdout)
+            let eval_val: i64 = String::from_utf8_lossy(&ev.stdout)
                 .trim()
                 .parse()
                 .unwrap_or_else(|_| panic!("eval_main produced non-number for {:?}: {:?}", prog_src, ev.stdout));
 
             assert_eq!(
-                child_code, expected,
-                "emitted ELF for {:?} exited {} (expected {})",
-                prog_src, child_code, expected
+                child_out, expected,
+                "emitted ELF for {:?} printed {} (expected {})",
+                prog_src, child_out, expected
             );
             assert_eq!(
                 eval_val, expected,
@@ -20231,9 +20247,9 @@ rule le64_neg
                 prog_src, eval_val, expected
             );
             assert_eq!(
-                child_code, eval_val,
-                "ELF exit ({}) and eval_main ({}) disagree for {:?}",
-                child_code, eval_val, prog_src
+                child_out, eval_val,
+                "ELF stdout ({}) and eval_main ({}) disagree for {:?}",
+                child_out, eval_val, prog_src
             );
 
             let _ = fs::remove_file(&out_path);
