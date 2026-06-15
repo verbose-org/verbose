@@ -12117,6 +12117,37 @@ impl<'a> ArenaCtx<'a> {
     }
 }
 
+/// Register-allocation brick #1 (peephole-at-emission): is `e` an operand
+/// whose `emit_eval_expr` lowering transiently uses ONLY rax — never rcx,
+/// never the CPU stack, never a recursion into another operand evaluation?
+///
+/// When the RHS of a binary operator satisfies this, the general-case
+/// `push rax (spill lhs) / eval rhs / pop rcx` stack dance is wasteful: we
+/// can keep the lhs in rcx with a single `mov rcx, rax` because evaluating
+/// the RHS leaf cannot disturb rcx. This removes two memory ops per binop.
+///
+/// CONSERVATIVE BY DESIGN: returns true ONLY for the handful of leaves whose
+/// emit is a single rax-targeting load with no scratch register beyond rax:
+///   - Number literal  → `emit_mov_rax_imm` (rax only)
+///   - Field(input.x)  → `load_rax_from_rbp` (rax only)
+///   - NowUnix         → loads the captured clock slot into rax (rax only)
+/// Everything else — Binary, If, Call, Concat, MatchVariant, Substring,
+/// ParseInt, Length, Read/Fetch, Not/Neg, etc. — returns false so the safe
+/// push/pop path is kept. When in doubt, false (correctness first).
+fn is_simple_operand(e: &Expr) -> bool {
+    match e {
+        Expr::Number(_) => true,
+        // Field access on the input record is a plain `mov rax, [rbp+disp]`.
+        // Restrict to the `input.field` shape (base is an Ident) — nested
+        // field access is rejected by the emitter anyway, but be explicit.
+        Expr::Field(base, _) => matches!(base.as_ref(), Expr::Ident(_)),
+        // now_unix() loads the once-per-invocation captured value from its
+        // dedicated rbp slot into rax — no rcx, no stack.
+        Expr::NowUnix => true,
+        _ => false,
+    }
+}
+
 fn emit_eval_expr(
     code: &mut Vec<u8>,
     expr: &Expr,
@@ -12486,10 +12517,24 @@ fn emit_eval_expr(
             }
 
             // === General case: evaluate both sides, apply operator ===
+            //
+            // Register-allocation brick #1: when the RHS is a simple leaf
+            // (constant / input-field load / now_unix) its evaluation clobbers
+            // ONLY rax, so we can keep the lhs in rcx with a register move
+            // instead of spilling it to the CPU stack. Both paths leave the
+            // post-condition the operator code below relies on: lhs in rcx,
+            // rhs in rax.
             emit_eval_expr(code, left, input_name, offsets, all_rules, field_ranges, text_bindings, self_call, arena_ctx)?;
-            code.push(0x50); // push rax
-            emit_eval_expr(code, right, input_name, offsets, all_rules, field_ranges, text_bindings, self_call, arena_ctx)?;
-            code.push(0x59); // pop rcx — now rcx=left, rax=right
+            if is_simple_operand(right) {
+                // mov rcx, rax — keep lhs in rcx (no memory traffic)
+                code.extend_from_slice(&[0x48, 0x89, 0xC1]);
+                // eval rhs → rax (leaf: clobbers rax only, leaves rcx intact)
+                emit_eval_expr(code, right, input_name, offsets, all_rules, field_ranges, text_bindings, self_call, arena_ctx)?;
+            } else {
+                code.push(0x50); // push rax — spill lhs (rhs may clobber rcx/stack)
+                emit_eval_expr(code, right, input_name, offsets, all_rules, field_ranges, text_bindings, self_call, arena_ctx)?;
+                code.push(0x59); // pop rcx — now rcx=left, rax=right
+            }
 
             match op {
                 BinOp::Add => {
@@ -28372,10 +28417,18 @@ rule rec
     /// that fits today's literal-leaf grammar (recursive_label: if/else
     /// with literal and self-call leaves) must KEEP the materializing
     /// (rax = ptr, rdx = len) path byte-for-byte. Pinned the way the
-    /// existing slice tests pin: exact binary size (739 B with the
-    /// stdin reader, the documented recursive_label size) + behavior.
-    /// The full SHA-256 byte-identity sweep across all 10 recursive
-    /// examples is part of the slice's validation protocol.
+    /// existing slice tests pin: exact binary size (741 B with the
+    /// stdin reader) + behavior. The full SHA-256 byte-identity sweep
+    /// across all 10 recursive examples is part of the slice's
+    /// validation protocol.
+    ///
+    /// Size note: was 739 B until the register-allocation brick #1
+    /// (push/pop → `mov rcx, rax` for simple-operand binops). The
+    /// `n.v == 0` comparison in `label_of` now keeps the lhs in rcx
+    /// via a 3-byte `mov` instead of the 2-byte push/pop pair (+2 B),
+    /// trading a memory round-trip for one extra instruction byte.
+    /// Behavior is unchanged (still emits "done"); the streaming
+    /// predicate still does NOT leak into the literal-leaf path.
     #[test]
     fn streaming_mode_does_not_change_literal_leaf_path() {
         use std::io::Write;
@@ -28388,10 +28441,12 @@ rule rec
             .expect("literal-leaf text recursion must keep compiling");
         let size = std::fs::metadata(&out).expect("binary must exist").len();
         assert_eq!(
-            size, 739,
-            "recursive_label (--stdin) must stay at its pinned 739 bytes; \
+            size, 741,
+            "recursive_label (--stdin) must stay at its pinned 741 bytes; \
              a size change means the streaming predicate leaked into the \
-             literal-leaf materializing path"
+             literal-leaf materializing path (741 since regalloc brick #1: \
+             the n.v == 0 binop keeps lhs in rcx via mov, +2 B over the \
+             old push/pop 739)"
         );
 
         let run = |input: &str| -> String {
