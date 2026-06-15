@@ -3961,7 +3961,7 @@ fn emit_self_recursive_program<'a>(
     let placeholder_labels: HashMap<&str, i32> = scc_rules.iter()
         .map(|r| (r.name.as_str(), 0_i32))
         .collect();
-    let placeholder_ctx = SelfCallCtx { labels: &placeholder_labels, arities: &arities, struct_layouts: &struct_layouts };
+    let placeholder_ctx = SelfCallCtx { labels: &placeholder_labels, arities: &arities, struct_layouts: &struct_layouts, param_in_rbx: None };
     let mut sizes: Vec<usize> = Vec::with_capacity(scc_rules.len());
     for &r in scc_rules {
         let mut scratch = Vec::new();
@@ -3976,7 +3976,7 @@ fn emit_self_recursive_program<'a>(
         labels.insert(r.name.as_str(), next_offset);
         next_offset += sizes[i] as i32;
     }
-    let final_ctx = SelfCallCtx { labels: &labels, arities: &arities, struct_layouts: &struct_layouts };
+    let final_ctx = SelfCallCtx { labels: &labels, arities: &arities, struct_layouts: &struct_layouts, param_in_rbx: None };
 
     // Pass 2: emit each callable with real labels.
     for &r in scc_rules {
@@ -4151,6 +4151,53 @@ fn emit_self_recursive_program<'a>(
 /// The `self_call` ctx routes any Call to a rule in `labels` to a real
 /// `call <target_offset>` instead of inlining. For slice 5.4 the labels
 /// map contains every SCC member, so cross-rule calls resolve correctly.
+/// Register-allocation brick A2 — conservative whitelist: does this expression
+/// tree consist ONLY of shapes that compile to pure number/bool arithmetic
+/// which never touches rbx (the concat write pointer, Phase 1B) or r11 (the
+/// arena base, Phase B)? A `true` result means the input parameter can safely
+/// live in rbx across the whole body. Anything not explicitly listed → `false`
+/// (the slot path stays). The list mirrors the scalar arithmetic surface a
+/// recursive number/bool rule body can use: literals, the single input field,
+/// arithmetic / comparison / boolean ops, branches, and self-calls.
+fn body_is_pure_scalar_arith(expr: &Expr) -> bool {
+    match expr {
+        Expr::Number(_) => true,
+        // Field access on the input ident — the read site is what A2 redirects.
+        Expr::Field(base, _) => matches!(base.as_ref(), Expr::Ident(_)),
+        Expr::Binary(_, l, r) => body_is_pure_scalar_arith(l) && body_is_pure_scalar_arith(r),
+        Expr::If(c, t, e) => {
+            body_is_pure_scalar_arith(c)
+                && body_is_pure_scalar_arith(t)
+                && body_is_pure_scalar_arith(e)
+        }
+        Expr::Not(x) | Expr::Neg(x) | Expr::Abs(x) | Expr::BitNot(x) => {
+            body_is_pure_scalar_arith(x)
+        }
+        Expr::Min(a, b)
+        | Expr::Max(a, b)
+        | Expr::BitAnd(a, b)
+        | Expr::BitOr(a, b)
+        | Expr::BitXor(a, b)
+        | Expr::Shl(a, b)
+        | Expr::Shr(a, b) => {
+            body_is_pure_scalar_arith(a) && body_is_pure_scalar_arith(b)
+        }
+        // Recursive call: the args are evaluated into a fresh value (rax) and
+        // marshalled into rdi; rbx (our param) survives because the callee
+        // preserves it. Both the pass-through `Ident(input)` and the
+        // `Record(concept, { f: expr })` constructor shapes are fine as long
+        // as every constructor field expression is itself pure-scalar.
+        Expr::Call(_, args) => args.iter().all(body_is_pure_scalar_arith),
+        Expr::Record(_, fields) => fields.iter().all(|(_, e)| body_is_pure_scalar_arith(e)),
+        // The recursive-call argument is an Ident(input) pass-through.
+        Expr::Ident(_) => true,
+        // Everything else (text, bytes, concat, read, fetch, group/variant,
+        // result, collection, quantifier, fold, parse_int, now_unix, json,
+        // string/byte primitives, …) → NOT eligible. Stay on the slot path.
+        _ => false,
+    }
+}
+
 fn emit_callable_into<'a>(
     code: &mut Vec<u8>,
     rule: &'a Rule,
@@ -4225,9 +4272,41 @@ fn emit_callable_into<'a>(
     let total_slots = nfields + n_let_slots + (max_arm_binder_slots as usize) + (tmp_slots as usize);
     let frame_bytes = (total_slots * 8) as i32;
 
+    // Register-allocation brick A2 — decide whether this callable can keep its
+    // single input parameter in rbx (callee-saved) for the whole body instead
+    // of spilling to `[rbp - 8]` and reloading on every field read. ALL must
+    // hold (any failure ⇒ slot path, byte-for-byte the pre-A2 emit):
+    //   - single scalar field input (rdi = value, not the multi-field
+    //     pointer-in-rdi struct, not a group-concept arena index),
+    //   - the field is Number/Bool (not Text — text takes 2 slots),
+    //   - no let bindings (their frame slots would interact with dropping the
+    //     `sub rsp`),
+    //   - Number/Bool output (text/bytes bodies use rbx/r11 paths),
+    //   - no concept_group (r11 arena), and
+    //   - a pure number/bool arithmetic body (nothing claiming rbx or r11).
+    // When eligible the single slot is unused (no lets, param in rbx), so we
+    // drop the `sub rsp, 8`; `push rbp` + `push rbx` already keeps rsp aligned.
+    let single_scalar_field = !is_group_input
+        && !is_multi_field
+        && concept.fields.len() == 1
+        && matches!(concept.fields[0].ty, Type::Number | Type::Bool);
+    let scalar_output = !is_text && !is_bytes;
+    let qualifies_rbx = single_scalar_field
+        && rule.logic.bindings.is_empty()
+        && scalar_output
+        && concept_group.is_none()
+        && body_is_pure_scalar_arith(&rule.logic.value);
+
     // Prologue.
     code.push(0x55);                                       // push rbp
     code.extend_from_slice(&[0x48, 0x89, 0xE5]);           // mov rbp, rsp
+    if qualifies_rbx {
+        // A2 path: preserve the caller's rbx (callee-saved), then load the
+        // param into rbx. No frame slot needed (single param, no lets), so no
+        // `sub rsp`. Stack: push rbp (8) + push rbx (8) = 16, aligned.
+        code.push(0x53);                                   // push rbx
+        code.extend_from_slice(&[0x48, 0x89, 0xFB]);       // mov rbx, rdi
+    } else {
     if frame_bytes <= 127 {
         code.extend_from_slice(&[0x48, 0x83, 0xEC]);
         code.push(frame_bytes as u8);
@@ -4271,6 +4350,7 @@ fn emit_callable_into<'a>(
             slot_idx += n_copies;
         }
     }
+    } // end `else` of qualifies_rbx prologue branch
 
     // Build offsets / field_ranges maps for the body.
     let mut callable_offsets: HashMap<&str, i32> = HashMap::new();
@@ -4464,10 +4544,19 @@ fn emit_callable_into<'a>(
         // Body emit reuses the SAME arena_ctx built before the let loop, so
         // arena_abort_patches accumulated by let-RHS constructs AND body
         // constructs all converge on the single inline abort tail below.
+        // A2: when the param lives in rbx, hand the body a ctx that names the
+        // field so `Field(Ident(input), field)` reads emit `mov rax, rbx`.
+        let body_self_call = if qualifies_rbx {
+            let mut sc = self_call;
+            sc.param_in_rbx = Some(concept.fields[0].name.as_str());
+            sc
+        } else {
+            self_call
+        };
         emit_eval_expr(
             code, &rule.logic.value, &rule.input_name, &callable_offsets,
             all_rules, &callable_field_ranges, &callable_text_bindings,
-            Some(self_call),
+            Some(body_self_call),
             arena_ctx_ref,
         )?;
     }
@@ -4504,9 +4593,23 @@ fn emit_callable_into<'a>(
     }
 
     // Epilogue.
-    code.extend_from_slice(&[0x48, 0x89, 0xEC]);           // mov rsp, rbp
-    code.push(0x5D);                                       // pop rbp
-    code.push(0xC3);                                       // ret
+    if qualifies_rbx {
+        // A2: the qualifying frame is `push rbp ; mov rbp,rsp ; push rbx`
+        // (no `sub rsp` — single param in rbx, no lets). The body's only
+        // stack motion is balanced push/pop pairs (e.g. the binop lhs spill
+        // around a recursive call), so at this point rsp points exactly at
+        // the saved rbx. Restore it directly: `pop rbx ; pop rbp ; ret`.
+        // (A `mov rsp, rbp` here would be WRONG — it would skip past the
+        // pushed rbx, so the pops would unwind the saved rbp and the return
+        // address into the wrong registers.)
+        code.push(0x5B);                                   // pop rbx
+        code.push(0x5D);                                   // pop rbp
+        code.push(0xC3);                                   // ret
+    } else {
+        code.extend_from_slice(&[0x48, 0x89, 0xEC]);       // mov rsp, rbp
+        code.push(0x5D);                                   // pop rbp
+        code.push(0xC3);                                   // ret
+    }
     Ok(())
 }
 
@@ -5475,6 +5578,7 @@ fn emit_bytes_program<'a>(
         labels: &empty_labels,
         arities: &empty_arities,
         struct_layouts: &empty_layouts,
+        param_in_rbx: None,
     };
     emit_streaming_bytes_body(
         &mut code,
@@ -11975,6 +12079,15 @@ struct SelfCallCtx<'a> {
     /// Drives type-aware marshalling in the Call arm. Empty for legacy
     /// Phase A paths; consumers fall back to the uniform-8B shortcut.
     struct_layouts: &'a HashMap<&'a str, Vec<(String, i32, bool)>>,
+    /// Register-allocation brick A2: name of the single input field that the
+    /// CURRENTLY-EMITTING callable holds in rbx (callee-saved) instead of
+    /// spilling to `[rbp - 8]`. `Some(field)` only for a qualifying callable
+    /// (single Number/Bool field, no lets, pure arithmetic body — nothing
+    /// that claims rbx or r11). The `Field(Ident(input), field)` read site
+    /// emits `mov rax, rbx` instead of `mov rax, [rbp - 8]`. `None` keeps the
+    /// slot path. Per-callable: each `emit_callable_into` sets it on its own
+    /// COPY of the ctx before emitting that callable's body.
+    param_in_rbx: Option<&'a str>,
 }
 
 /// Phase B slice 4a.2 — arena context for `VariantConstruct` emission.
@@ -12207,6 +12320,20 @@ fn emit_eval_expr(
                 }
                 _ => field_name.clone(),
             };
+            // Register-allocation brick A2: a qualifying recursive callable
+            // keeps its single input field in rbx. The read site becomes a
+            // register move instead of a memory reload. Guard on BOTH the
+            // base being the input ident AND the field name matching, so a
+            // hypothetical other field (there are none in the qualifying
+            // single-field case) never mis-resolves to rbx.
+            if let Some(sc) = self_call {
+                if sc.param_in_rbx == Some(field_name.as_str())
+                    && matches!(base.as_ref(), Expr::Ident(n) if n == input_name)
+                {
+                    code.extend_from_slice(&[0x48, 0x89, 0xD8]); // mov rax, rbx
+                    return Ok(());
+                }
+            }
             let offset = *offsets.get(lookup_key.as_str()).ok_or_else(|| NativeError {
                 message: format!("unknown field '{}' in native codegen", field_name),
             })?;
@@ -12807,6 +12934,12 @@ fn emit_eval_expr(
                     // unchanged.
                     match &args[0] {
                         Expr::Ident(n) if n == input_name => {
+                            // A2: when the param lives in rbx, the [rbp-8] slot
+                            // is never written — load the pass-through arg from
+                            // rbx directly (`mov rdi, rbx`).
+                            if ctx.param_in_rbx.is_some() {
+                                code.extend_from_slice(&[0x48, 0x89, 0xDF]); // mov rdi, rbx
+                            } else {
                             // Phase A path: offsets keys = field names of
                             // the single-Number-field input, so the only
                             // entry's value IS the field slot (held in
@@ -12828,6 +12961,7 @@ fn emit_eval_expr(
                             } else {
                                 code.extend_from_slice(&[0x48, 0x8B, 0xBD]);
                                 code.extend_from_slice(&field_offset.to_le_bytes());
+                            }
                             }
                         }
                         Expr::Record(_concept_name, fields) => {
