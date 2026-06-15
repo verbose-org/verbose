@@ -21,9 +21,9 @@ parsed program back to source, **lowers programs to a stack-machine IL, and emit
 x86-64 ELF executable** for the FULL closed grammar — arithmetic, `/`/`%`, the six
 comparisons, `and`/`or`, unary-neg, `if/then/else`, `let` bindings, calls, and recursion. The
 printed source reparses to the same analyses and the same evaluation (the round-trip, §3.K),
-and the emitted machine code, when wrapped in an ELF and run directly (`./a.out`), delivers
-the **same value as the Verbose-written interpreter** (`eval_main`) as its process **exit
-code** — including recursive factorial, fibonacci, mutual recursion, and `let`-bearing procs
+and the emitted machine code, when wrapped in an ELF and run directly (`./a.out`), **prints the
+same value as the Verbose-written interpreter** (`eval_main`) to stdout — including recursive
+factorial, fibonacci, mutual recursion, and `let`-bearing procs
 (§3.M).
 
 It is **not** verbosec compiling its own full source: the real compiler (`src/`, Rust)
@@ -40,7 +40,7 @@ program passed on `argv`. The front end is not interpreted by a host language at
 is machine code. And `elf_program_src` is itself a ~55 KB ELF that *reads a vexpr program as
 text and writes out a complete, runnable x86-64 ELF* — a compiler, written in Verbose, compiled
 to native, whose output is itself a standalone executable file: `elf_program_src "...prog..." >
-a.out ; chmod +x a.out ; ./a.out` runs it, and the program's result is `a.out`'s exit code.
+a.out ; chmod +x a.out ; ./a.out` runs it, and the program's result is **printed to stdout**.
 
 What it does NOW that the 25-brick version did not: declared **return types** (bricks 31–33);
 a `{number, bool, text}` type system where **calls type as their declared return type**
@@ -48,9 +48,10 @@ a `{number, bool, text}` type system where **calls type as their declared return
 errors (bricks 26–28); a **streaming source emitter** (bricks 34–35); a **stack-machine IL
 lowering** of expressions and whole programs (bricks 36–37); and — the headline — a
 **back end that emits a STANDALONE RUNNABLE x86-64 ELF** for the FULL closed grammar
-(bricks b1–b7): not just the callable blob of the first back-end bricks, but a file you run
-directly (`./a.out`) whose exit code is the program's result — and the machine-code subset now
-covers `/`/`%`, `and`/`or`, and `let` bindings, closing the gap with the front-end grammar.
+(bricks b1–b8): not just the callable blob of the first back-end bricks, but a file you run
+directly (`./a.out`) that **prints the program's result to stdout** (b8) — and the machine-code
+subset now covers `/`/`%`, `and`/`or`, and `let` bindings, closing the gap with the front-end
+grammar.
 
 Honest limitations, stated up front (expanded in §6):
 
@@ -68,16 +69,18 @@ Honest limitations, stated up front (expanded in §6):
 - **The interpreter's value domain is integers.** `eval_main` evaluates arithmetic,
   comparison (as 0/1), `if`, and recursive calls over integers; the *type checker* is
   richer than the *evaluator*.
-- **The result is delivered as a process EXIT CODE.** The back end now emits a standalone
+- **The result is PRINTED to stdout (b8).** The back end now emits a standalone
   ELF (`elf_program_src "...prog..." > a.out ; chmod +x a.out ; ./a.out`), and the machine-code
   subset is now the FULL closed grammar — `+`/`-`/`*`/`/`/`%`/unary-neg, the six comparisons,
   `and`/`or`, `if/then/else` (computed jump offsets), `let` bindings (rbp frame slots),
-  parameter loads, `call`/`ret`, and recursion. The honest remaining limit is **output**: the
-  ELF's `_start` trampoline puts the entry proc's return value in the exit status, so the result
-  is an integer in `0..255` — values ≥ 256 wrap (factorial 5 = 120 fits; 6! = 720 would show as
-  `720 mod 256 = 208`). Printing an arbitrary i64 needs an itoa-in-machine-code brick (not yet
-  built). And `/`/`%` use unguarded `cqo; idiv`, so division by zero **faults** (SIGFPE) — this
-  matches the interpreter, whose `eval_expr` also faults on `/0`.
+  parameter loads, `call`/`ret`, and recursion. The ELF's `_start` trampoline `call`s the entry
+  proc, converts the returned i64 in `rax` to decimal ASCII (with `-` for negatives, `"0"` for
+  zero) plus a trailing newline via an unsigned div-by-10 loop into a 32-byte stack buffer, and
+  `sys_write`s it to stdout before `sys_exit(0)`. So **any i64 result is observable on stdout**,
+  not just exit codes in `0..255` — `fact(10) = 3628800` prints in full (b8 closed the
+  exit-code-wrapping limit). The one honest caveat that remains: `/`/`%` use unguarded
+  `cqo; idiv`, so division by zero **faults** (SIGFPE) — this matches the interpreter, whose
+  `eval_expr` also faults on `/0`.
 
 Companion files: the grammar's intent prose is in
 [`examples/vexprparse.intent`](../examples/vexprparse.intent); the source emitter's design
@@ -108,7 +111,7 @@ one group, linked by arena indices (cons-lists by index, not pointers).
 | **Source emitter** | `print_source`, `print_expr`, `print_args` / `_rest`, `op_text`, `print_program_src`, `print_rule`, `print_params` / `_rest`, `print_binds`, `ty_text`, `ret_text` | A **streaming** pretty-printer: `print_expr` walks the `Ast` and writes its bytes to stdout in order (fully parenthesized); `print_program_src` prints an entire multi-rule program — headers, typed params, return types, `logic:` blocks, lets, out-lines, 2/4-space indentation. Round-trips to the same analyses and the same evaluation (bricks 34–35, on the native streaming lowering). |
 | **Stack-IL lowering** | `lower_expr`, `lower_expr_src`, `lower_params`, `lower_binds`, `lower_rule`, `lower_program`, `lower_program_src` | The first **real lowering** — emits a *different* target than source. `lower_expr` lowers an expression to a postfix (RPN) stack-machine IL (`1 + 2 * 3` → `1 2 3 * +`); `lower_program` lowers a whole multi-rule program to named `proc … ret` routines with `call`, `load`/`store`, and structured `if/else/endif` (lazy, so recursion terminates). Verified: an IL VM running `lower_program_src(p)` yields the same number as `eval_main(p)`, including recursive factorial (bricks 36–37). |
 | **`bytes` type** | (language primitive) `Type::Bytes`, `b"\xNN"` literals, `concat(bytes…)`, `le32` / `le64` | A first-class `bytes` type carrying a `Vec<u8>` — a separate type from `text` because UTF-8 text cannot hold a lone `0xC3`. `b"\x48\xb8…"` literals embed full-range bytes; `concat` composes byte sequences; `le32`/`le64` turn a number into its little-endian bytes. Additive: `text` is untouched and every prior native binary stays byte-identical (b1–b2). |
-| **x86-64 generator** | `x86_expr`, `code_size_expr`, `x86_node`, `x86_program`, `x86_program_src`, `x86_expr_src`, `elf_program_src` | The **back end**: lowers the AST to a **standalone runnable x86-64 ELF**. `x86_expr` post-order-emits opcodes for the closed expression grammar — `mov rax,imm`/`push`/`pop`/`add`/`imul`/`setcc`, and (b6) `cqo;idiv` for `/`/`%` (unguarded, faults on `/0` like the interpreter) plus branchless `and`/`or`; `code_size_expr` computes the exact byte length of a subtree so the streaming emitter can fill in `jcc`/`jmp` rel32 offsets without backpatching; `x86_program` lowers a whole program to one callable blob — `push rbp ; mov rbp, rsp` frames, `sub rsp, 8*L` for `let` slots (b7, gated on L>0 so let-free procs are byte-identical to before; store `48 89 85`, load `ff b5`), params at `[rbp+16+8*(N-1-i)]`, real `call rel32`/`ret`, position-threading for cross-proc call distances, and recursion as a backward self-call. `elf_program_src` (b5) wraps that blob in a minimal static ELF64 — a 64 B ELF header, one PT_LOAD R+X program header, and a 17 B `_start` trampoline that `call`s the entry proc then `sys_exit(rax)`, making the result the process **exit code** (bricks b3, b4a, b4b-1, b4b-2, b5, b6, b7). |
+| **x86-64 generator** | `x86_expr`, `code_size_expr`, `x86_node`, `x86_program`, `x86_program_src`, `x86_expr_src`, `elf_program_src` | The **back end**: lowers the AST to a **standalone runnable x86-64 ELF**. `x86_expr` post-order-emits opcodes for the closed expression grammar — `mov rax,imm`/`push`/`pop`/`add`/`imul`/`setcc`, and (b6) `cqo;idiv` for `/`/`%` (unguarded, faults on `/0` like the interpreter) plus branchless `and`/`or`; `code_size_expr` computes the exact byte length of a subtree so the streaming emitter can fill in `jcc`/`jmp` rel32 offsets without backpatching; `x86_program` lowers a whole program to one callable blob — `push rbp ; mov rbp, rsp` frames, `sub rsp, 8*L` for `let` slots (b7, gated on L>0 so let-free procs are byte-identical to before; store `48 89 85`, load `ff b5`), params at `[rbp+16+8*(N-1-i)]`, real `call rel32`/`ret`, position-threading for cross-proc call distances, and recursion as a backward self-call. `elf_program_src` (b5) wraps that blob in a minimal static ELF64 — a 64 B ELF header, one PT_LOAD R+X program header, and (b8) a 101 B `_start` trampoline that `call`s the entry proc, converts the returned i64 to decimal ASCII (unsigned div-by-10 into a 32-byte stack buffer, `-` sign, trailing newline) and `sys_write`s it to **stdout**, then `sys_exit(0)` — so the result is **printed**, any i64 (bricks b3, b4a, b4b-1, b4b-2, b5, b6, b7, b8). |
 
 ## 3. A live session
 
@@ -441,21 +444,21 @@ Rust test holds this, including recursive factorial).
 
 ### M — Machine code: the back end (the headline)
 
-Bricks b1–b7 lower the AST to a **standalone runnable x86-64 ELF**. The headline upgrade since
+Bricks b1–b8 lower the AST to a **standalone runnable x86-64 ELF**. The headline upgrade since
 the IL lowering: the back end no longer just produces a callable blob you have to `mmap` from a
 host — `elf_program_src` wraps the program in a complete ELF64 file you run directly, and the
-program's result comes back as the **process exit code**.
+program's result is **printed to stdout** (b8 — any i64, not just an exit-code byte).
 
 ```
 SRC='rule main
   logic:
-    out = fact(5)
+    out = fact(10)
 rule fact(n)
   logic:
     out = if n == 0 then 1 else n * fact(n - 1)'
 
-$ /tmp/elf "$SRC" 0 > /tmp/a.out ; chmod +x /tmp/a.out ; /tmp/a.out ; echo "exit=$?"
-exit=120
+$ /tmp/elf "$SRC" 0 > /tmp/a.out ; chmod +x /tmp/a.out ; /tmp/a.out
+3628800
 
 $ file /tmp/a.out
 /tmp/a.out: ELF 64-bit LSB executable, x86-64, version 1 (SYSV), statically linked, no section header
@@ -466,7 +469,8 @@ $ od -An -tx1 /tmp/a.out | head -1
 
 `/tmp/elf` is `elf_program_src` compiled native. The output `/tmp/a.out` opens with the ELF
 magic `7f 45 4c 46` (`\x7fELF`), `file` confirms a statically-linked x86-64 executable, and
-running it computes `fact(5) = 120` — delivered as the exit status. **A Verbose program emitted
+running it computes `fact(10) = 3628800` — **printed to stdout** (the i64 is itoa'd in machine
+code, so values past `255` print in full, not wrapped). **A Verbose program emitted
 a runnable executable; recursion in the *emitted* program drives recursion in the emitted
 `call`/`ret`.**
 
@@ -498,7 +502,7 @@ $ /tmp/eval_expr "0 or 7" 0   →  1       (branchless or)
 
 **`let` bindings in machine code (b7).** Lets get rbp frame slots (`sub rsp, 8*L` gated on
 L>0; store `48 89 85`, load `ff b5`); `AstVar` resolves params first, then lets. They work in
-recursive procs too. Both examples run as standalone ELFs whose exit code is the result:
+recursive procs too. Both examples run as standalone ELFs that print the result to stdout:
 
 ```
 # a non-recursive let:
@@ -509,8 +513,8 @@ rule sq(n)
   logic:
     let d = n * n
     out = d + 1'
-$ /tmp/elf "$SQ" 0 > /tmp/sq.out ; chmod +x /tmp/sq.out ; /tmp/sq.out ; echo "exit=$?"
-exit=26                                   # sq(5) = 5*5 + 1 = 26
+$ /tmp/elf "$SQ" 0 > /tmp/sq.out ; chmod +x /tmp/sq.out ; /tmp/sq.out
+26                                        # sq(5) = 5*5 + 1 = 26
 
 # a let inside a RECURSIVE proc:
 FA='rule main
@@ -520,17 +524,19 @@ rule fa(n)
   logic:
     let m = n - 1
     out = if n == 0 then 1 else n * fa(m)'
-$ /tmp/elf "$FA" 0 > /tmp/fa.out ; chmod +x /tmp/fa.out ; /tmp/fa.out ; echo "exit=$?"
-exit=120                                  # fa(5) = 120, the let `m = n - 1` recomputed per frame
+$ /tmp/elf "$FA" 0 > /tmp/fa.out ; chmod +x /tmp/fa.out ; /tmp/fa.out
+120                                       # fa(5) = 120, the let `m = n - 1` recomputed per frame
 ```
 
 These ARE the headline: **a Verbose program emits a standalone executable**, run on the bare
-CPU, whose exit code is exactly what the Verbose-written interpreter computes — across
-recursion, division, and `let`-bearing frames. (The exit-code transport is the convenience
-view; the *durable* proofs are the Rust tests `streaming_elf_program_runs`,
-`streaming_x86_divmod_logic`, `streaming_x86_lets_execute`, and
-`streaming_x86_program_recursion_executes`, which build the ELF / `mmap` the blob and assert
-`== eval_main` in-process.)
+CPU, that prints exactly what the Verbose-written interpreter computes — across
+recursion, division, and `let`-bearing frames. (The *durable* proof is the Rust test
+`streaming_elf_prints_result`, which builds the ELF, runs the file, and asserts its **stdout
+(trimmed) == `eval_main`** for arbitrary i64 results — `fact(5)=120`, `fact(10)=3628800`,
+`fib(20)=6765`, a negative `5 - 9 = -4`, zero `7 - 7 = 0`, and nested calls — alongside the
+blob-level tests `streaming_x86_divmod_logic`, `streaming_x86_lets_execute`, and
+`streaming_x86_program_recursion_executes` that `mmap` the blob and assert `== eval_main`
+in-process.)
 
 ## 4. How it works under the hood
 
@@ -600,13 +606,19 @@ Terse notes an auditor would want:
   proves every pre-back-end native binary compiles bit-for-bit unchanged, because `bytes` and
   the x86 generator are purely additive — and that discipline held across the whole b5–b7
   widening too (the ELF wrapper, div/mod/and/or, and lets are all purely additive).
-- **The ELF wrapper (b5) is minimal and loads from offset 0.** `elf_program_src` prepends a
-  64 B ELF64 header and one PT_LOAD program header that maps the whole file R+X at virtual
-  address `0x400000` from file offset 0 (so the ELF header itself is mapped — simplest possible
-  layout, no separate `.text` section, no section header table). The entry point is
-  `0x400078` — a 17 B `_start` trampoline that `call`s the entry proc, then issues
-  `sys_exit(rax)` so the proc's return value becomes the process exit status. There is no libc,
-  no dynamic loader, no relocations: a single self-contained R+X segment.
+- **The ELF wrapper (b5) is minimal and loads from offset 0; b8 made it print.** `elf_program_src`
+  prepends a 64 B ELF64 header and one PT_LOAD program header that maps the whole file R+X at
+  virtual address `0x400000` from file offset 0 (so the ELF header itself is mapped — simplest
+  possible layout, no separate `.text` section, no section header table). The entry point is
+  `0x400000 + 120` — the trampoline sits right after the 120 bytes of headers (64 B ELF header +
+  56 B program header), and the program blob starts at file offset `221` (`120 + 101`). The one
+  computed field, `p_filesz = p_memsz = 221 + program_total_size(prog)`, is emitted via `le64`.
+  b8 grew the `_start` trampoline from 17 B to **101 B**: a `call rel32 = 96` reaches the first
+  proc (`221 - 125`); the returned i64 in `rax` is converted to decimal ASCII (with `-` for
+  negatives, `"0"` for zero) plus a trailing newline into a 32-byte stack buffer via an unsigned
+  div-by-10 loop, written to **stdout** via `sys_write`, then `sys_exit(0)`. So the result is
+  printed — any i64 — rather than transported as an exit-code byte. There is no libc, no dynamic
+  loader, no relocations: a single self-contained R+X segment.
 - **div/mod use unguarded `idiv` to match the oracle.** `/` and `%` (b6) emit `cqo ; idiv rcx`
   with no zero check — division by zero faults (SIGFPE). This is deliberate parity with the
   interpreter: `eval_expr` also faults on `/0`, so both back ends and the front end agree on
@@ -632,7 +644,7 @@ Terse notes an auditor would want:
 
 Derived from `git log --oneline` on `feat/self-hosting`. One line per brick, with the
 commit sha. The front-end + emitter arc (bricks 1–35) is followed by the IL lowering (bricks
-36–37) and the machine-code back end (bricks b1–b7). Three entries are `src/`
+36–37) and the machine-code back end (bricks b1–b8). Three entries are `src/`
 native-backend changes, not Verbose bricks — flagged inline.
 
 ```
@@ -682,26 +694,28 @@ b3ef369  36   the first real LOWERING — pretty-printer becomes code generator 
 0291a86  b4a  comparisons + if/else in the x86-64 generator (computed jump offsets)
 673c4c2  b4b-1 lower a NON-RECURSIVE program to one callable machine-code blob (frame ABI, call/ret)
 c56d7fb  b4b-2 RECURSION in Verbose-emitted x86-64 machine code (factorial/fib/mutual — the milestone)
-f9deca6  b5   emit a STANDALONE ELF executable — `elf_program_src > a.out ; ./a.out` runs (exit code = result)
+f9deca6  b5   emit a STANDALONE ELF executable — `elf_program_src > a.out ; ./a.out` runs (result in rax)
 d836ff9  b6   div / mod / and / or in the x86-64 generator (unguarded idiv == eval_expr, branchless and/or)
 9f1d9f9  b7   let bindings in the x86-64 generator (rbp frame slots; work in recursive procs)
+42582b0  b8   itoa in machine code — the ELF PRINTS its result (any i64) to stdout, not an exit code
 ```
 
 (`9529277` and `0ad5794` are native-backend changes in `src/`, not bricks: the first
 unblocked the parser by adding a group-concept field to the recursive-callable ABI; the
 second is the streaming lowering that the emitter bricks 34–35 — and the byte-streaming back
-end b1–b7 — consume. The whole back end b1–b7 is pure Verbose: no `src/` change was
+end b1–b8 — consume. The whole back end b1–b8 is pure Verbose: no `src/` change was
 needed, since b3 fixed only a latent `r11` byte-write bug, and b4b-2 introduced *no new
 Verbose code at all* — recursion composes b4b-1's call/ret with b4a's `if`. b5 (the ELF
-wrapper), b6 (div/mod/and/or), and b7 (let frame slots) are likewise written entirely as
-Verbose rules emitting bytes through the `bytes`/`concat`/`le32`/`le64` path.)
+wrapper), b6 (div/mod/and/or), b7 (let frame slots), and b8 (the itoa-printing `_start`
+trampoline) are likewise written entirely as Verbose rules emitting bytes through the
+`bytes`/`concat`/`le32`/`le64` path.)
 
 Grouped: bricks 1–2 + 8a–8b are the **lexer**; 3–12 + 16 + 20 + 31 the **parser**; 13–17 +
 19 + 21 + 26–30 + 32–33 the **analyses + type checker + located report**; 10 + 18 the
 **interpreter**; 22 the **unified pipeline**; 23–28 the **diagnostic report**; 34–35 the
-**source emitter**; 36–37 the **stack-IL lowering**; b1–b2 the **`bytes` type**; b3–b7 the
+**source emitter**; 36–37 the **stack-IL lowering**; b1–b2 the **`bytes` type**; b3–b8 the
 **x86-64 back end** (b3–b4b-2 the callable blob + recursion, b5 the standalone-ELF wrapper, b6
-div/mod/and/or, b7 lets).
+div/mod/and/or, b7 lets, b8 the itoa-printing trampoline).
 
 ## 6. Limitations & what's next
 
@@ -719,15 +733,15 @@ Honest scope, restated from §1:
   AST nodes (a parser + every-construct-site change).
 - **Integer-domain interpreter.** `eval_main` evaluates over integers (comparisons as
   `0`/`1`); the type checker is richer than the evaluator.
-- **The machine-code subset is now COMPLETE for the closed grammar, and wrapped in a runnable
-  ELF.** The x86-64 generator covers arithmetic (`+`/`-`/`*`/`/`/`%`/neg), the six comparisons,
-  `and`/`or`, `if/then/else`, `let` bindings, parameter loads, `call`/`ret`, and recursion —
-  the full front-end grammar, no longer trailing it (b6 added div/mod/and/or, b7 added lets).
-  And `elf_program_src` (b5) wraps the blob in a standalone ELF you run directly. Two honest
-  limits remain: (1) **output is the exit code** — the result is an integer in `0..255`, so
-  values ≥ 256 wrap (printing an arbitrary i64 needs an itoa-in-machine-code brick, not yet
-  built); (2) `/`/`%` use unguarded `idiv`, so `/0` faults (SIGFPE) — by design, matching the
-  interpreter.
+- **The machine-code subset is now COMPLETE for the closed grammar, wrapped in a runnable
+  ELF, and PRINTS its result.** The x86-64 generator covers arithmetic (`+`/`-`/`*`/`/`/`%`/neg),
+  the six comparisons, `and`/`or`, `if/then/else`, `let` bindings, parameter loads, `call`/`ret`,
+  and recursion — the full front-end grammar, no longer trailing it (b6 added div/mod/and/or, b7
+  added lets). `elf_program_src` (b5) wraps the blob in a standalone ELF you run directly, and
+  (b8) its `_start` trampoline itoa's the entry proc's i64 return value and `sys_write`s it to
+  **stdout** — so any i64 result prints in full, with no `0..255` exit-code wrapping. The one
+  honest limit that remains: `/`/`%` use unguarded `idiv`, so `/0` faults (SIGFPE) — by design,
+  matching the interpreter.
 
 The north star remains a Verbose compiler written in Verbose. What this arc has now shown:
 the front-end *shape* — lexer, parser, five analyses, type checker, interpreter, located
@@ -735,25 +749,23 @@ diagnostics — **its inverse**, a streaming source emitter that round-trips com
 **a stack-machine IL lowering**, AND **a back end that emits a standalone runnable x86-64 ELF**,
 are all expressible and verifiable in Verbose, and verbosec compiles the whole thing to
 standalone native binaries. The front end reads, the emitter writes, and the back end emits a
-runnable executable — verified `./a.out` exit code == the Verbose-written interpreter. **The
+runnable executable — verified `./a.out` **stdout** == the Verbose-written interpreter. **The
 line in the previous version of this document — "needs a backend in Verbose that emits
 something executable, the hardest part, the actual meaning of a compiler in Verbose" — is
-DONE**: the back end now emits a file you run directly, and the machine-code subset is the FULL
-closed grammar (the two items the previous version listed as "still to go" — widen the subset,
-and a standalone ELF wrapper — both landed in b5–b7).
+DONE**: the back end now emits a file you run directly, the machine-code subset is the FULL
+closed grammar, and the executable **prints any i64 result to stdout** (the three items the
+previous version listed as "still to go" — widen the subset, a standalone ELF wrapper, and
+printing results instead of an exit code — all landed in b5–b8).
 
 The distance still to go, named plainly:
 
-1. **Print results instead of an exit code (itoa-in-machine-code).** Today the entry proc's
-   return value is the process exit status, an integer in `0..255` that wraps above 255.
-   Emitting an itoa loop + `sys_write` makes the executable print an arbitrary i64 to stdout —
-   the same `bytes`-streaming path the source emitter already uses, but generated *into* the
-   target program rather than emitted by the compiler.
-2. **The full language surface.** Records, `match`, `Result`, collections, effects — parsed in
+1. **The full language surface.** Records, `match`, `Result`, collections, effects — parsed in
    the *source* grammar, not just consumed internally by the front end's own rules. The
    machine-code subset already matches the front-end grammar; widening both toward real Verbose
    is the next frontier.
 
-Each is a milestone on the path, not the destination. But the two halves that did not exist
-when this document was first written — emitting source, and emitting a *runnable executable* —
-now both do, and the back end's machine-code subset is complete for the grammar it parses.
+This is a milestone on the path, not the destination. But the three halves that did not exist
+when this document was first written — emitting source, emitting a *runnable executable*, and
+**printing its result** — now all do, and the back end's machine-code subset is complete for
+the grammar it parses. (The one intentional caveat that stays: `/`/`%` use unguarded `idiv`, so
+`/0` faults like the interpreter.)
