@@ -11480,6 +11480,90 @@ fn load_rax_from_rbp(code: &mut Vec<u8>, offset: i32) {
     }
 }
 
+/// `mov rcx, [rbp+offset]` — the rcx mirror of `load_rax_from_rbp`.
+fn load_rcx_from_rbp(code: &mut Vec<u8>, offset: i32) {
+    if offset >= -128 {
+        code.extend_from_slice(&[0x48, 0x8B, 0x4D]);
+        code.push(offset as u8);
+    } else {
+        code.extend_from_slice(&[0x48, 0x8B, 0x8D]);
+        code.extend_from_slice(&offset.to_le_bytes());
+    }
+}
+
+/// `mov rcx, imm` — the rcx mirror of `emit_mov_rax_imm`.
+fn emit_mov_rcx_imm(code: &mut Vec<u8>, value: i64) {
+    if value >= i32::MIN as i64 && value <= i32::MAX as i64 {
+        // mov rcx, imm32 (sign-extended)
+        code.extend_from_slice(&[0x48, 0xC7, 0xC1]);
+        code.extend_from_slice(&(value as i32).to_le_bytes());
+    } else {
+        // movabs rcx, imm64
+        code.extend_from_slice(&[0x48, 0xB9]);
+        code.extend_from_slice(&value.to_le_bytes());
+    }
+}
+
+/// Register-allocation brick A3: evaluate a SIMPLE operand (one whitelisted by
+/// `is_simple_operand`) DIRECTLY into rcx instead of rax. This is the rcx
+/// mirror of the rax leaf-load done inside `emit_eval_expr`. Used by the
+/// simple-RHS binop path so the operator can compute `op rax, rcx` and leave
+/// the result in rax with NO register-shuffle moves.
+///
+/// MUST stay in lockstep with `is_simple_operand`'s whitelist AND with the
+/// corresponding rax-targeting arms of `emit_eval_expr`:
+///   - Number literal → `emit_mov_rcx_imm`        (mirror of emit_mov_rax_imm)
+///   - Field(input.x) → `mov rcx, rbx` (A2 param) or `load_rcx_from_rbp`
+///   - NowUnix        → `load_rcx_from_rbp(now_slot)`
+fn emit_eval_simple_into_rcx(
+    code: &mut Vec<u8>,
+    expr: &Expr,
+    input_name: &str,
+    offsets: &HashMap<&str, i32>,
+    self_call: Option<&SelfCallCtx>,
+) -> Result<(), NativeError> {
+    match expr {
+        Expr::Number(n) => {
+            emit_mov_rcx_imm(code, *n);
+            Ok(())
+        }
+        Expr::Field(base, field_name) => {
+            // Mirror the input-field load, including the A2 rbx fast path.
+            let lookup_key = match base.as_ref() {
+                Expr::Ident(base_name) if base_name == "state" => {
+                    format!("__state_{}", field_name)
+                }
+                _ => field_name.clone(),
+            };
+            if let Some(sc) = self_call {
+                if sc.param_in_rbx == Some(field_name.as_str())
+                    && matches!(base.as_ref(), Expr::Ident(n) if n == input_name)
+                {
+                    code.extend_from_slice(&[0x48, 0x89, 0xD9]); // mov rcx, rbx
+                    return Ok(());
+                }
+            }
+            let offset = *offsets.get(lookup_key.as_str()).ok_or_else(|| NativeError {
+                message: format!("unknown field '{}' in native codegen", field_name),
+            })?;
+            load_rcx_from_rbp(code, offset);
+            Ok(())
+        }
+        Expr::NowUnix => {
+            let slot = *offsets.get("now").ok_or_else(|| NativeError {
+                message: "now_unix() reached emit_eval_simple_into_rcx without a captured \
+                          clock slot".into(),
+            })?;
+            load_rcx_from_rbp(code, slot);
+            Ok(())
+        }
+        _ => Err(NativeError {
+            message: "emit_eval_simple_into_rcx called on a non-simple operand (is_simple_operand \
+                      and this helper are out of sync)".into(),
+        }),
+    }
+}
+
 /// Walk an expression in record context. Each leaf is a Record constructor
 /// that emits its own JSON line + jmp loop_top. Structural If/else branches
 /// recurse; each arm plants its own terminator.
@@ -12645,24 +12729,91 @@ fn emit_eval_expr(
 
             // === General case: evaluate both sides, apply operator ===
             //
-            // Register-allocation brick #1: when the RHS is a simple leaf
+            // Register-allocation brick A3: when the RHS is a simple leaf
             // (constant / input-field load / now_unix) its evaluation clobbers
-            // ONLY rax, so we can keep the lhs in rcx with a register move
-            // instead of spilling it to the CPU stack. Both paths leave the
-            // post-condition the operator code below relies on: lhs in rcx,
-            // rhs in rax.
+            // ONLY rax/rcx targets, so we place lhs in rax and rhs DIRECTLY in
+            // rcx. Then `op rax, rcx` leaves the result in rax for free — no
+            // `mov rcx, rax` shuffle (A1's spill→rcx is gone) and no result
+            // normalization `mov rax, rcx` afterwards.
+            //
+            //   simple_rhs  : lhs in rax, rhs in rcx → op writes rax
+            //   !simple_rhs : lhs in rcx, rhs in rax (push/pop) → operator
+            //                 encodings below the `if` handle that convention.
+            //
+            // The two conventions are mirror images for the operator; we branch
+            // the operator encoding on `simple_rhs`.
+            let simple_rhs = is_simple_operand(right);
             emit_eval_expr(code, left, input_name, offsets, all_rules, field_ranges, text_bindings, self_call, arena_ctx)?;
-            if is_simple_operand(right) {
-                // mov rcx, rax — keep lhs in rcx (no memory traffic)
-                code.extend_from_slice(&[0x48, 0x89, 0xC1]);
-                // eval rhs → rax (leaf: clobbers rax only, leaves rcx intact)
-                emit_eval_expr(code, right, input_name, offsets, all_rules, field_ranges, text_bindings, self_call, arena_ctx)?;
+            if simple_rhs {
+                // lhs already in rax; eval rhs DIRECTLY into rcx (leaf load).
+                emit_eval_simple_into_rcx(code, right, input_name, offsets, self_call.as_ref())?;
             } else {
                 code.push(0x50); // push rax — spill lhs (rhs may clobber rcx/stack)
                 emit_eval_expr(code, right, input_name, offsets, all_rules, field_ranges, text_bindings, self_call, arena_ctx)?;
                 code.push(0x59); // pop rcx — now rcx=left, rax=right
             }
 
+            if simple_rhs {
+                // A3 convention: rax = lhs, rcx = rhs. Result lands in rax.
+                match op {
+                    BinOp::Add => {
+                        code.extend_from_slice(&[0x48, 0x01, 0xC8]); // add rax, rcx
+                    }
+                    BinOp::Sub => {
+                        code.extend_from_slice(&[0x48, 0x29, 0xC8]); // sub rax, rcx (lhs - rhs)
+                    }
+                    BinOp::Mul => {
+                        code.extend_from_slice(&[0x48, 0x0F, 0xAF, 0xC1]); // imul rax, rcx
+                    }
+                    BinOp::Div => {
+                        // dividend rax = lhs, divisor rcx = rhs → quotient in rax
+                        code.extend_from_slice(&[0x48, 0x99]); // cqo
+                        code.extend_from_slice(&[0x48, 0xF7, 0xF9]); // idiv rcx
+                    }
+                    BinOp::Mod => {
+                        // remainder in rdx → move to rax
+                        code.extend_from_slice(&[0x48, 0x99]); // cqo
+                        code.extend_from_slice(&[0x48, 0xF7, 0xF9]); // idiv rcx
+                        code.extend_from_slice(&[0x48, 0x89, 0xD0]); // mov rax, rdx
+                    }
+                    BinOp::Eq => {
+                        code.extend_from_slice(&[0x48, 0x39, 0xC8]); // cmp rax, rcx
+                        code.extend_from_slice(&[0x0F, 0x94, 0xC0]); // sete al
+                        code.extend_from_slice(&[0x48, 0x0F, 0xB6, 0xC0]); // movzx rax, al
+                    }
+                    BinOp::NotEq => {
+                        code.extend_from_slice(&[0x48, 0x39, 0xC8]); // cmp rax, rcx
+                        code.extend_from_slice(&[0x0F, 0x95, 0xC0]); // setne al
+                        code.extend_from_slice(&[0x48, 0x0F, 0xB6, 0xC0]); // movzx rax, al
+                    }
+                    BinOp::Gt => {
+                        code.extend_from_slice(&[0x48, 0x39, 0xC8]); // cmp rax, rcx (lhs vs rhs)
+                        code.extend_from_slice(&[0x0F, 0x9F, 0xC0]); // setg al (lhs > rhs)
+                        code.extend_from_slice(&[0x48, 0x0F, 0xB6, 0xC0]); // movzx rax, al
+                    }
+                    BinOp::Lt => {
+                        code.extend_from_slice(&[0x48, 0x39, 0xC8]); // cmp rax, rcx
+                        code.extend_from_slice(&[0x0F, 0x9C, 0xC0]); // setl al (lhs < rhs)
+                        code.extend_from_slice(&[0x48, 0x0F, 0xB6, 0xC0]); // movzx rax, al
+                    }
+                    BinOp::GtEq => {
+                        code.extend_from_slice(&[0x48, 0x39, 0xC8]); // cmp rax, rcx
+                        code.extend_from_slice(&[0x0F, 0x9D, 0xC0]); // setge al
+                        code.extend_from_slice(&[0x48, 0x0F, 0xB6, 0xC0]); // movzx rax, al
+                    }
+                    BinOp::LtEq => {
+                        code.extend_from_slice(&[0x48, 0x39, 0xC8]); // cmp rax, rcx
+                        code.extend_from_slice(&[0x0F, 0x9E, 0xC0]); // setle al
+                        code.extend_from_slice(&[0x48, 0x0F, 0xB6, 0xC0]); // movzx rax, al
+                    }
+                    BinOp::And | BinOp::Or => {
+                        unreachable!("And/Or are short-circuited; should not reach the general case");
+                    }
+                }
+                return Ok(());
+            }
+
+            // Non-simple-RHS convention: rcx = lhs, rax = rhs (unchanged from A1).
             match op {
                 BinOp::Add => {
                     // rax = left + right = rcx + rax
@@ -28575,12 +28726,14 @@ rule rec
             .expect("literal-leaf text recursion must keep compiling");
         let size = std::fs::metadata(&out).expect("binary must exist").len();
         assert_eq!(
-            size, 741,
-            "recursive_label (--stdin) must stay at its pinned 741 bytes; \
+            size, 732,
+            "recursive_label (--stdin) must stay at its pinned 732 bytes; \
              a size change means the streaming predicate leaked into the \
-             literal-leaf materializing path (741 since regalloc brick #1: \
-             the n.v == 0 binop keeps lhs in rcx via mov, +2 B over the \
-             old push/pop 739)"
+             literal-leaf materializing path (732 since regalloc brick A3: \
+             the n.v == 0 binop now places lhs in rax / rhs in rcx and the \
+             op writes rax directly — A1's mov rcx,rax and the result \
+             normalization mov rax,rcx are both gone, -9 B from the 741 of \
+             brick A1/A2)"
         );
 
         let run = |input: &str| -> String {
