@@ -4297,6 +4297,11 @@ fn emit_callable_into<'a>(
         && concept_group.is_none()
         && body_is_pure_scalar_arith(&rule.logic.value);
 
+    // Register-allocation brick A4: within a qualifying callable, does the body
+    // have at least one binop site that will take the r15 fast path? Only then
+    // do we pay the `push r15` / `pop r15` prologue/epilogue cost.
+    let qualifies_r15 = qualifies_rbx && body_uses_r15_save(&rule.logic.value);
+
     // Prologue.
     code.push(0x55);                                       // push rbp
     code.extend_from_slice(&[0x48, 0x89, 0xE5]);           // mov rbp, rsp
@@ -4305,6 +4310,14 @@ fn emit_callable_into<'a>(
         // param into rbx. No frame slot needed (single param, no lets), so no
         // `sub rsp`. Stack: push rbp (8) + push rbx (8) = 16, aligned.
         code.push(0x53);                                   // push rbx
+        if qualifies_r15 {
+            // A4: also preserve r15 (callee-saved) — the binop emitter uses it
+            // to hold a binop's LHS across a sibling recursive call without a
+            // stack spill. Pushed AFTER rbx; the epilogue pops it FIRST (exact
+            // reverse order). Stack now rbp, rbx, r15 (24 bytes pushed) — see
+            // the epilogue's alignment note.
+            code.extend_from_slice(&[0x41, 0x57]);         // push r15
+        }
         code.extend_from_slice(&[0x48, 0x89, 0xFB]);       // mov rbx, rdi
     } else {
     if frame_bytes <= 127 {
@@ -4602,6 +4615,13 @@ fn emit_callable_into<'a>(
         // (A `mov rsp, rbp` here would be WRONG — it would skip past the
         // pushed rbx, so the pops would unwind the saved rbp and the return
         // address into the wrong registers.)
+        //
+        // A4: when r15 was pushed (prologue order rbp, rbx, r15), it MUST be
+        // popped FIRST — exact reverse order — or rsp would be off by 8 and the
+        // following pops would land in the wrong registers (segfault on ret).
+        if qualifies_r15 {
+            code.extend_from_slice(&[0x41, 0x5F]);          // pop r15
+        }
         code.push(0x5B);                                   // pop rbx
         code.push(0x5D);                                   // pop rbp
         code.push(0xC3);                                   // ret
@@ -12345,6 +12365,100 @@ fn is_simple_operand(e: &Expr) -> bool {
     }
 }
 
+/// Register-allocation brick A4 — does `expr`'s subtree contain a binop whose
+/// own RHS is non-simple (i.e. a binop that itself would want to hold a value
+/// across a sibling call)? Used by `use_r15_save` to refuse the r15 fast path
+/// when the RHS we're about to evaluate would itself claim r15 — they'd
+/// collide on the single callee-saved scratch register.
+///
+/// Only structural arithmetic shapes that the binop emitter actually recurses
+/// through are walked (Binary / If / unary / Min/Max / Call args). A "call-
+/// crossing binop" is one where `!is_simple_operand(rhs)`.
+fn subtree_has_call_crossing_binop(expr: &Expr) -> bool {
+    match expr {
+        Expr::Binary(op, l, r) => {
+            // And/Or short-circuit and never spill across a call (no push/pop
+            // path), so they don't claim r15 — exclude them from the test.
+            let this_crosses = !matches!(op, BinOp::And | BinOp::Or)
+                && !is_simple_operand(r);
+            this_crosses
+                || subtree_has_call_crossing_binop(l)
+                || subtree_has_call_crossing_binop(r)
+        }
+        Expr::If(c, t, e) => {
+            subtree_has_call_crossing_binop(c)
+                || subtree_has_call_crossing_binop(t)
+                || subtree_has_call_crossing_binop(e)
+        }
+        Expr::Not(x) | Expr::Neg(x) | Expr::Abs(x) | Expr::BitNot(x) => {
+            subtree_has_call_crossing_binop(x)
+        }
+        Expr::Min(a, b)
+        | Expr::Max(a, b)
+        | Expr::BitAnd(a, b)
+        | Expr::BitOr(a, b)
+        | Expr::BitXor(a, b)
+        | Expr::Shl(a, b)
+        | Expr::Shr(a, b) => {
+            subtree_has_call_crossing_binop(a) || subtree_has_call_crossing_binop(b)
+        }
+        Expr::Call(_, args) => args.iter().any(subtree_has_call_crossing_binop),
+        Expr::Record(_, fields) => {
+            fields.iter().any(|(_, e)| subtree_has_call_crossing_binop(e))
+        }
+        // Leaves (Number, Field, Ident, NowUnix, …) carry no binop.
+        _ => false,
+    }
+}
+
+/// Register-allocation brick A4 — per-binop-site predicate. True iff the LHS
+/// can be held in r15 (callee-saved) across the RHS evaluation instead of
+/// spilled to the stack via push/pop. Requires:
+///   - the RHS is non-simple (contains a call) — otherwise the A3 simple-RHS
+///     path already avoids any spill, and
+///   - the RHS subtree contains NO nested call-crossing binop — otherwise that
+///     inner binop would also want r15 to hold ITS lhs across ITS sibling
+///     call, colliding with ours. In that (rare, nested) case we fall through
+///     to push/pop, which the stack handles to arbitrary depth.
+///
+/// fib's outer `+` has RHS = `fib(n-2)` (a single call, no nested call-
+/// crossing binop) → r15 fast path. The pattern A4 optimizes is exactly "one
+/// value across one sibling call."
+fn use_r15_save(_left: &Expr, right: &Expr) -> bool {
+    !is_simple_operand(right) && !subtree_has_call_crossing_binop(right)
+}
+
+/// Register-allocation brick A4 — does the qualifying-callable body contain at
+/// least one binop site that will take the r15 fast path? Drives the per-
+/// callable `push r15` / `pop r15` decision: only pay the prologue/epilogue
+/// cost when a site actually uses r15. Walks the same arithmetic shapes the
+/// binop emitter recurses through.
+fn body_uses_r15_save(expr: &Expr) -> bool {
+    match expr {
+        Expr::Binary(op, l, r) => {
+            let this_site = !matches!(op, BinOp::And | BinOp::Or)
+                && use_r15_save(l, r);
+            this_site || body_uses_r15_save(l) || body_uses_r15_save(r)
+        }
+        Expr::If(c, t, e) => {
+            body_uses_r15_save(c) || body_uses_r15_save(t) || body_uses_r15_save(e)
+        }
+        Expr::Not(x) | Expr::Neg(x) | Expr::Abs(x) | Expr::BitNot(x) => {
+            body_uses_r15_save(x)
+        }
+        Expr::Min(a, b)
+        | Expr::Max(a, b)
+        | Expr::BitAnd(a, b)
+        | Expr::BitOr(a, b)
+        | Expr::BitXor(a, b)
+        | Expr::Shl(a, b)
+        | Expr::Shr(a, b) => body_uses_r15_save(a) || body_uses_r15_save(b),
+        Expr::Call(_, args) => args.iter().any(body_uses_r15_save),
+        Expr::Record(_, fields) => fields.iter().any(|(_, e)| body_uses_r15_save(e)),
+        _ => false,
+    }
+}
+
 fn emit_eval_expr(
     code: &mut Vec<u8>,
     expr: &Expr,
@@ -12748,9 +12862,29 @@ fn emit_eval_expr(
                 // lhs already in rax; eval rhs DIRECTLY into rcx (leaf load).
                 emit_eval_simple_into_rcx(code, right, input_name, offsets, self_call.as_ref())?;
             } else {
-                code.push(0x50); // push rax — spill lhs (rhs may clobber rcx/stack)
-                emit_eval_expr(code, right, input_name, offsets, all_rules, field_ranges, text_bindings, self_call, arena_ctx)?;
-                code.push(0x59); // pop rcx — now rcx=left, rax=right
+                // Register-allocation brick A4: inside a qualifying scalar-
+                // recursive callable (the A2 `param_in_rbx` path), the LHS can
+                // be held in r15 (callee-saved — the System-V ABI guarantees
+                // the RHS call preserves it) across the RHS evaluation instead
+                // of spilled to the stack. This removes one push/pop pair PER
+                // recursive level. `use_r15_save` refuses the trick when the
+                // RHS subtree contains its own call-crossing binop (it would
+                // want r15 too); that nested case falls through to push/pop,
+                // which the stack handles to arbitrary depth.
+                let in_qualifying_callable =
+                    self_call.as_ref().map_or(false, |sc| sc.param_in_rbx.is_some());
+                if in_qualifying_callable && use_r15_save(left, right) {
+                    // mov r15, rax — stash lhs in callee-saved r15
+                    code.extend_from_slice(&[0x49, 0x89, 0xC7]);
+                    emit_eval_expr(code, right, input_name, offsets, all_rules, field_ranges, text_bindings, self_call, arena_ctx)?;
+                    // mov rcx, r15 — now rcx=left, rax=right (same convention
+                    // as the push/pop path below)
+                    code.extend_from_slice(&[0x4C, 0x89, 0xF9]);
+                } else {
+                    code.push(0x50); // push rax — spill lhs (rhs may clobber rcx/stack)
+                    emit_eval_expr(code, right, input_name, offsets, all_rules, field_ranges, text_bindings, self_call, arena_ctx)?;
+                    code.push(0x59); // pop rcx — now rcx=left, rax=right
+                }
             }
 
             if simple_rhs {
