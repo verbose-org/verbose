@@ -177,12 +177,42 @@ Not the allocator location — the **data-structure + recursion model**:
 2. **Iteration instead of deep native recursion** for the linear walks (`tokenize` and list
    consumption): an explicit index loop / work-stack rather than one call frame per token.
 
-This is a real arc of its own, design+review-gated like the rest. A cheap probe to characterize it
-empirically before designing (per the review): raise ONLY the position field bounds to a few
-thousand, keep the arena on-stack, feed a growing synthetic input, and measure whether SIGSEGV
-(call depth) or arena-full hits first and how wall-time scales (expect ~quadratic). mmap-backed
-arena (A1) remains legitimate as a *follow-on* once the recursion model is fixed and a real large
-self-input exists — sequencing it first was the error.
+This is a real arc of its own, design+review-gated like the rest. mmap-backed arena (A1) remains
+legitimate as a *follow-on* once the recursion model is fixed and a real large self-input exists —
+sequencing it first was the error.
+
+### Probe results (MEASURED 2026-06-16, throwaway copy, arena left at 65535 on-stack)
+
+Ran the cheap probe: raised the position/index field bounds on a copy of vexprparse.verbose, kept
+the arena unchanged, fed a growing synthetic program (`rule rN \ logic: \ out = 1`, ~12 tokens
+each) to the `count_rules` driver, measured exit code + wall-time.
+
+| rules | ~tokens | exit | wall | result |
+|---|---|---|---|---|
+| 200 | 2,400 | 0 | 0.37 s | 200 ✓ |
+| 400 | 4,800 | 0 | 1.12 s | 400 ✓ |
+| 500 | 6,000 | 0 | 2.98 s | 500 ✓ |
+| 700 | 8,400 | 0 | ~3–5 s | 700 ✓ |
+| 800 | 9,600 | **1 (abort)** | 13 s | — |
+| 1,600 | 19,200 | 1 | 26 s | — |
+| 2,400 | 28,800 | 1 | 69 s | — |
+
+Findings, decisive:
+1. **Time is quadratic.** 200→500 rules: 0.37 s → 2.98 s (~8× for 2.5× input). The per-peek
+   O(position) `drop_cells` over the cons-list is the cause — confirmed empirically.
+2. **It walls at ~700–800 rules / ~9k tokens**, EVEN with the position field bounds raised — a
+   thicket of small `[0,256]/[0,512]/[0,4096]` bounds bite in sequence, and lifting them is not a
+   single knob. The abort at 800 is NOT the arena (≈22k nodes, well under 65535) — confirming the
+   arena ceiling is not the operative limit.
+3. **vexprparse's own source is ~6,000 rules / ~57k tokens — ~8× beyond the wall**, and at O(N²)
+   the time would be ~60×+ the already-multi-second runs (minutes-to-hours) even if every bound
+   were lifted. The arena cap is irrelevant at this scale.
+
+The probe confirms the verdict: the binding constraints are the **quadratic cons-list access model**
+and the **pervasive small position/index field bounds**, not arena capacity. The real fix is
+architectural (O(1) indexed token access to kill the O(N²) + the deep peeks; a coherent story for
+the index/position field bounds; iteration over deep native recursion), and it is the actual
+self-hosting-capacity arc.
 
 ## What this arc is NOT
 
