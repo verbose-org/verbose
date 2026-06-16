@@ -1400,3 +1400,27 @@ there (out of the arithmetic evaluator's scope).
     (streaming_x86_divmod_logic, mmap+exec == eval_expr): 10/3->3, 10%3->1, 100/7->14, 100%7->2,
     -7/2->-3, -7%2->-1, 5 and 0->0, 5 and 3->1, 0 or 0->0, 0 or 7->1, (2<3) and (4<5)->1,
     1 and (if 1<2 then 1 else 0)->1; plus the program path (div in a proc, `and`/`%` across a call).
+
+62. Records-arc brick R1: ACCEPT top-level `concept` declarations in the self-hosted
+    parser. Before R1, parse_program (brick 12) walked top-level items recognizing only
+    `rule` (span_is_rule) and STOPPED (RNil) on anything else — so a program containing a
+    `concept` declaration silently DROPPED every rule after it. R1 teaches parse_program to
+    SKIP concept blocks (so rules after a concept are still parsed), and adds a SEPARATE
+    parse_concepts entry point that CAPTURES the concepts into a ConceptList. parse_program's
+    return type stays RuleList (all call sites untouched); only its loop gains a skip-concept
+    branch. New concepts (inside the VExpr group): Concept (MkConcept of name span + FieldList),
+    FieldList (FCons of name span + type code + rest | FNil), ConceptList (CCons | CNil), and
+    ParsedConcept (MkPC of Concept + end index) for position threading. New rules: span_is_concept
+    / span_is_fields (byte-recognize `concept`/`fields`, mirroring span_is_rule/span_is_logic),
+    parse_field / parse_fields (a field line is `IDENT : TYPE`, type via type_code_of_span; FNil at
+    the dedent/end of the fields block), parse_concept_decl / parse_concept_decl_pos (header is
+    `concept NAME` then a `fields:` block, mirroring parse_rule_decl / parse_rule_decl_pos),
+    parse_concepts (the new top-level walk: at each item, if `concept` -> parse + CCons + recurse
+    from its end; if `rule` -> SKIP past it + recurse; else CNil), concept_list_len / find_concept,
+    and the drivers count_concepts / concept_field_count. CRITICAL INVARIANT: a rule-only program
+    never takes parse_program's is_concept branch, so its RuleList is byte-identical to before. R1
+    is parser+AST ONLY — no type checker change, no emitter change, no new lattice (AstField stays
+    type code 3, deferred to R2). Fields are parsed for their name span and scalar type code; a
+    concept-named field type just gets whatever type_code_of_span returns today (0). Validated by
+    three orderings (concept->rule, rule->concept, two-concepts+rule) and the full existing suite
+    staying byte-identical on the rule-only path.

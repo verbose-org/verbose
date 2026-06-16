@@ -33390,4 +33390,96 @@ rule probe
         let _ = std::fs::remove_file(&out);
     }
 
+    /// Records-arc brick R1: the self-hosted parser (examples/vexprparse.verbose)
+    /// now ACCEPTS top-level `concept` declarations. Two observable contracts:
+    ///   1. parse_program SKIPS concept blocks instead of stopping on them, so a
+    ///      `rule` declared AFTER a `concept` is still found (count_rules == 1).
+    ///      Before R1 the concept silently truncated the program to RNil.
+    ///   2. a SEPARATE parse_concepts walk CAPTURES the concepts into a
+    ///      ConceptList (count_concepts), and concept_field_count returns the
+    ///      first concept's field count.
+    /// All three drivers are NATIVE-ONLY (multi-line indented source — the
+    /// interpreter's indent tokenizer truncates at the first indented block, the
+    /// same reason eval_rule_decl / count_rules are native-only). The source
+    /// program is passed as ONE argv arg (argv[1]); pos is argv[2] = "0"; the
+    /// result number is printed to stdout (Phase 0 scalar emitter).
+    ///
+    /// Orderings exercised: concept->rule, rule->concept (the DEDENT-alignment
+    /// flush risk), two-concepts+rule. Field types span number/bool/text so
+    /// type_code_of_span is exercised. The full pre-existing suite staying green
+    /// on rule-only programs is the byte-identical gate; this test pins the new
+    /// capability.
+    #[test]
+    fn records_r1_parse_concepts_and_skip_in_program() {
+        let src = std::fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let cr = std::env::temp_dir().join("verbosec_test_r1_count_rules");
+        let cc = std::env::temp_dir().join("verbosec_test_r1_count_concepts");
+        let cf = std::env::temp_dir().join("verbosec_test_r1_concept_field_count");
+        compile_native(&program, "count_rules", cr.to_str().unwrap(), false, false)
+            .expect("count_rules must compile natively");
+        compile_native(&program, "count_concepts", cc.to_str().unwrap(), false, false)
+            .expect("count_concepts must compile natively");
+        compile_native(&program, "concept_field_count", cf.to_str().unwrap(), false, false)
+            .expect("concept_field_count must compile natively");
+
+        let run = |bin: &std::path::Path, prog: &str| -> i64 {
+            let r = std::process::Command::new(bin)
+                .arg(prog)
+                .arg("0")
+                .output()
+                .expect("spawn R1 driver");
+            assert!(r.status.success(), "{:?} must exit 0; got {:?}", bin, r.status);
+            String::from_utf8_lossy(&r.stdout)
+                .trim()
+                .parse::<i64>()
+                .expect("R1 driver prints an integer")
+        };
+
+        // (1) concept -> rule: the rule AFTER the concept is found, the concept is
+        // captured, and its two number fields are counted. Field types: number.
+        let concept_then_rule = "concept Pair\n  fields:\n    a : number\n    b : number\nrule main\n  logic:\n    out = 1";
+        assert_eq!(
+            run(&cr, concept_then_rule),
+            1,
+            "the rule AFTER the concept must be found (parse_program skips the concept, \
+             does not stop on it)"
+        );
+        assert_eq!(run(&cc, concept_then_rule), 1, "one concept captured");
+        assert_eq!(run(&cf, concept_then_rule), 2, "the concept has two fields");
+
+        // (2) rule -> concept: flushes the skip_seps_dedent DEDENT-alignment across
+        // the reverse ordering (the known risk). Field types: bool/text exercise
+        // type_code_of_span beyond `number`.
+        let rule_then_concept = "rule main\n  logic:\n    out = 1\nconcept Flags\n  fields:\n    ok : bool\n    label : text";
+        assert_eq!(
+            run(&cr, rule_then_concept),
+            1,
+            "the rule before the concept is parsed; the concept does not truncate it"
+        );
+        assert_eq!(run(&cc, rule_then_concept), 1, "one concept captured after a rule");
+        assert_eq!(run(&cf, rule_then_concept), 2, "the trailing concept has two fields");
+
+        // (3) two concepts + a rule: both concepts captured, the rule still found,
+        // and the FIRST concept's field count (2) is returned. Mixed field types.
+        let two_concepts = "concept Pair\n  fields:\n    a : number\n    b : bool\nconcept Trip\n  fields:\n    x : number\n    y : number\n    z : text\nrule main\n  logic:\n    out = 1";
+        assert_eq!(run(&cr, two_concepts), 1, "the rule after two concepts is found");
+        assert_eq!(run(&cc, two_concepts), 2, "two concepts captured");
+        assert_eq!(run(&cf, two_concepts), 2, "the FIRST concept has two fields");
+
+        // (4) rule-only: the byte-identical path — count_rules unchanged, no
+        // concepts. This is the per-binary witness that the is_concept branch is
+        // never taken when no concept is present.
+        let rule_only = "rule f\n  logic:\n    out = 7";
+        assert_eq!(run(&cr, rule_only), 1, "rule-only: one rule");
+        assert_eq!(run(&cc, rule_only), 0, "rule-only: zero concepts");
+
+        let _ = std::fs::remove_file(&cr);
+        let _ = std::fs::remove_file(&cc);
+        let _ = std::fs::remove_file(&cf);
+    }
+
 }

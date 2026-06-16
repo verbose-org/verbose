@@ -437,6 +437,56 @@ concept_group VExpr [max_depth: 4096, max_nodes: 65535]
     variants:
       MkSpan of (start : number, len : number)
 
+  -- Records-arc brick R1: a parsed `fields:` line — one field NAME span plus its
+  -- declared TYPE code (the same 0=number/1=bool/2=text codes type_code_of_span
+  -- assigns; a concept-named field type also falls through to 0 in R1 since R1 does
+  -- not add record type codes). Same cons-list family as ParamList (PCons/PNil):
+  -- FCons carries one field's (name_start, name_len, ty) and the rest; FNil ends
+  -- the list. Lives in the group because it is the same cons-list shape as ArgList
+  -- / Binding / ParamList.
+  concept FieldList
+    @intention: "Cons-list of a concept's fields (each a name span + declared type code)"
+    @source: vexprparse.intent:62
+    variants:
+      FCons of (name_start : number, name_len : number, ty : number, rest : FieldList)
+      FNil
+
+  -- Records-arc brick R1: a parsed top-level CONCEPT declaration. `name_start` /
+  -- `name_len` are the concept NAME's source span (the same identity model as a
+  -- RuleDecl name — R1 does not decode the name to bytes). `fields` is the parsed
+  -- `fields:` block, a FieldList. Single-variant record-like group concept, exactly
+  -- like RuleDecl (MkRule) / Block (MkBlock): it lives in the group because
+  -- find_concept is a recursive rule that RETURNS one (same group-return ABI as
+  -- find_rule returning a RuleDecl), and a number driver reads a field off it via
+  -- the bare-group accessors (same idiom as rd_body / block_binds).
+  concept Concept
+    @intention: "A parsed top-level concept declaration: its name span + its field list"
+    @source: vexprparse.intent:62
+    variants:
+      MkConcept of (name_start : number, name_len : number, fields : FieldList)
+
+  -- Records-arc brick R1: a parsed CONCEPT program slice — a cons-list of top-level
+  -- concept declarations in source order. CCons carries one Concept head and the
+  -- rest; CNil is the empty list (no concepts). Same cons shape as RuleList
+  -- (RCons/RNil), so the same arena machinery and structural-recursion proof apply.
+  concept ConceptList
+    @intention: "A cons-list of top-level concept declarations"
+    @source: vexprparse.intent:62
+    variants:
+      CCons of (head : Concept, tail : ConceptList)
+      CNil
+
+  -- Records-arc brick R1: a concept-declaration parse result that THREADS its end
+  -- position — the Concept built plus the token index just past its `fields:` block
+  -- (the same Parsed-threading shape as ParsedRule's MkPR). parse_concept_decl_pos
+  -- returns this so the concept walk (parse_concepts) knows where one concept decl
+  -- ends and can resume scanning for the next top-level keyword.
+  concept ParsedConcept
+    @intention: "A concept-decl parse result: the Concept built plus its end token index"
+    @source: vexprparse.intent:62
+    variants:
+      MkPC of (concept : Concept, next : number)
+
 
 -- ============================================================================
 -- Brick 2 reused verbatim: the tokenizer. (Copied so bricks 1-2 stay pristine;
@@ -4168,6 +4218,50 @@ rule type_code_of_span
       bound : 64
 
 
+-- span_is_concept (records-arc brick R1): 1 iff the span src[start..start+len] is
+-- exactly the 7 bytes "concept" (c=99 o=111 n=110 c=99 e=101 p=112 t=116). Flat
+-- fixed-width check (mirroring span_is_rule / span_is_logic), length-guarded first
+-- so a wrong-length ident never reads past its span. This is how the concept header
+-- is recognized at all — `concept` has no keyword code, just like `rule` / `logic`.
+rule span_is_concept
+  @intention: "1 if an Ident span spells exactly \"concept\", 0 otherwise"
+  @source: vexprparse.intent:62
+  input:
+    sc : SpanCheck
+  output:
+    out : number
+  logic:
+    out = if sc.len == 7 and (byte_at(sc.src, sc.start) == 99 and (byte_at(sc.src, sc.start + 1) == 111 and (byte_at(sc.src, sc.start + 2) == 110 and (byte_at(sc.src, sc.start + 3) == 99 and (byte_at(sc.src, sc.start + 4) == 101 and (byte_at(sc.src, sc.start + 5) == 112 and byte_at(sc.src, sc.start + 6) == 116)))))) then 1 else 0
+  proofs:
+    purity:
+      reads : [sc.src, sc.start, sc.len]
+      calls : []
+    termination:
+      bound : 64
+
+
+-- span_is_fields (records-arc brick R1): 1 iff the span src[start..start+len] is
+-- exactly the 6 bytes "fields" (f=102 i=105 e=101 l=108 d=100 s=115). Flat
+-- fixed-width check (mirroring span_is_logic), length-guarded first. Recognizes the
+-- `fields:` block header inside a concept declaration, the analogue of `logic:`
+-- inside a rule.
+rule span_is_fields
+  @intention: "1 if an Ident span spells exactly \"fields\", 0 otherwise"
+  @source: vexprparse.intent:62
+  input:
+    sc : SpanCheck
+  output:
+    out : number
+  logic:
+    out = if sc.len == 6 and (byte_at(sc.src, sc.start) == 102 and (byte_at(sc.src, sc.start + 1) == 105 and (byte_at(sc.src, sc.start + 2) == 101 and (byte_at(sc.src, sc.start + 3) == 108 and (byte_at(sc.src, sc.start + 4) == 100 and byte_at(sc.src, sc.start + 5) == 115))))) then 1 else 0
+  proofs:
+    purity:
+      reads : [sc.src, sc.start, sc.len]
+      calls : []
+    termination:
+      bound : 64
+
+
 -- Accessors for a RuleDecl (a block-form match is only legal in final position,
 -- so destructuring is factored into tiny rules — like block_binds / pb_block).
 rule rd_name_start
@@ -4750,8 +4844,17 @@ rule parse_rule_decl_pos
 -- token list. No structural/decreasing FIELD fits a forward token-index scan, so
 -- this carries the bound + the mandatory recursion breadcrumb (the backstop is
 -- the finite token list, bounded by max_nodes).
+-- Records-arc brick R1 extends parse_program's loop from a 2-way (rule | stop) to
+-- a 3-way (rule | skip-concept | stop). The is_rule branch is UNCHANGED (cons +
+-- recurse from the rule's end). A NEW is_concept branch SKIPS the concept block —
+-- advances past it via parse_concept_decl_pos's `next` and recurses WITHOUT consing
+-- — so rules AFTER a concept are still found (before R1 the loop stopped on the
+-- concept, silently dropping them). Anything else still ends the list (RNil).
+-- CRITICAL INVARIANT: a rule-only program never spells `concept` at a top-level
+-- item, so is_concept is always 0 and the RuleList it produces is BYTE-IDENTICAL to
+-- the pre-R1 loop. parse_program's return type stays RuleList — no call site changes.
 rule parse_program
-  @intention: "Parse a sequence of top-level rule declarations into a RuleList"
+  @intention: "Parse a sequence of top-level rule declarations into a RuleList (skipping concept blocks)"
   @source: vexprparse.intent:31
   input:
     ps : ProgramState
@@ -4762,14 +4865,17 @@ rule parse_program
     let kw_start = peek_start(Nth { lst: ps.toks, n: hp })
     let kw_len = peek_len(Nth { lst: ps.toks, n: hp })
     let is_rule = span_is_rule(SpanCheck { src: ps.src, start: kw_start, len: kw_len })
+    let is_concept = span_is_concept(SpanCheck { src: ps.src, start: kw_start, len: kw_len })
     let pr = parse_rule_decl_pos(ProgramState { toks: ps.toks, src: ps.src, pos: hp })
     let rd = pr_rule(pr)
     let endp = pr_next(pr)
-    out = if is_rule == 1 then RuleList::RCons { head: rd, tail: parse_program(ProgramState { toks: ps.toks, src: ps.src, pos: endp }) } else RuleList::RNil
+    let pc = parse_concept_decl_pos(ProgramState { toks: ps.toks, src: ps.src, pos: hp })
+    let cend = pc_next(pc)
+    out = if is_rule == 1 then RuleList::RCons { head: rd, tail: parse_program(ProgramState { toks: ps.toks, src: ps.src, pos: endp }) } else (if is_concept == 1 then parse_program(ProgramState { toks: ps.toks, src: ps.src, pos: cend }) else RuleList::RNil)
   proofs:
     purity:
       reads : [ps.toks, ps.src, ps.pos]
-      calls : [skip_seps_dedent, peek_start, peek_len, span_is_rule, parse_rule_decl_pos, pr_rule, pr_next, parse_program]
+      calls : [skip_seps_dedent, peek_start, peek_len, span_is_rule, span_is_concept, parse_rule_decl_pos, pr_rule, pr_next, parse_concept_decl_pos, pc_next, parse_program]
     termination:
       bound : 512
 
@@ -4794,6 +4900,452 @@ rule rule_list_len
     termination:
       bound : 4000
       structural : rl
+
+
+-- ============================================================================
+-- RECORDS-ARC BRICK R1: parse top-level `concept` declarations.
+--
+-- Before R1 parse_program (brick 12) recognized only `rule` at a top-level item
+-- and STOPPED (RNil) on anything else — so a `concept` declaration silently
+-- dropped every rule after it. R1:
+--   * teaches parse_program to SKIP concept blocks (rules after a concept are
+--     still found) WITHOUT changing its return type (stays RuleList);
+--   * adds a SEPARATE parse_concepts walk that CAPTURES the concepts.
+--
+-- TOKEN STREAM at a concept boundary (concept at col 0, fields: at col 2,
+-- field lines at col 4):
+--
+--   concept Pair    concept(0) Pair(1) Nl(2)
+--     fields:       Indent(3) fields(4) :(5) Nl(6)
+--       a : number  Indent(7) a(8) :(9) number(10) Nl(11)
+--       b : number  b(12) :(13) number(14) Nl(15)
+--   rule main       Dedent(16) Dedent(17) rule(18) ...
+--
+-- A field line is `IDENT : TYPE` — name at fp, `:` (op 10) at fp+1, type IDENT at
+-- fp+2, then a Newline. parse_fields skips leading separators (skip_seps: Newline
+-- 600 / Indent 700), and while the landed token is an Ident (kind 100) it parses
+-- one field and recurses from fp+3 (skip_seps eats the trailing Newline); a Dedent
+-- (800) / Eof (0) / non-Ident ends the list (FNil). This is R1 parser+AST ONLY: no
+-- type checker change, no emitter change, no new lattice.
+-- ============================================================================
+
+-- The field-list parse cursor: the token list, the source text (backs the type-
+-- name byte recognition via type_code_of_span), and the current scan index. Same
+-- multi-field shape as ProgramState.
+concept FieldParseState
+  @intention: "The token list, source text, and current index, for parsing a fields block"
+  @source: vexprparse.intent:62
+  fields:
+    toks : TokenList
+    src : text [..256]
+    pos : number [0, 512]
+
+
+-- parse_fields: parse the body of a `fields:` block into a FieldList, starting at
+-- fp.pos. skip_seps lands on the next significant token: if it is an Ident (kind
+-- 100) it is a field NAME — read its span, read the TYPE Ident span two tokens on
+-- (after the `:` op-10), map it to a code via type_code_of_span (reading fp.src),
+-- and recurse from name_idx + 3 (skip_seps will eat the trailing Newline before the
+-- next field). A Dedent (800) / Eof (0) / any non-Ident ends the block (FNil). The
+-- recursive call is LAZY (inside the then branch of the Ident dispatch), like
+-- parse_program's RCons tail. Recurses over a forward token scan (no structural
+-- FIELD fits), so bound + the mandatory recursion breadcrumb (the backstop is the
+-- finite token list, bounded by max_nodes). Every peek is OOB-guarded by the
+-- token-list accessors (Eof past the end).
+rule parse_fields
+  @intention: "Parse the body of a fields: block into a FieldList (one FCons per IDENT : TYPE line)"
+  @source: vexprparse.intent:62
+  input:
+    fp : FieldParseState
+  output:
+    out : FieldList
+  logic:
+    let hp = skip_seps(ParseState { toks: fp.toks, pos: fp.pos })
+    let knd = peek_kind(Nth { lst: fp.toks, n: hp })
+    let is_field = if knd == 100 then 1 else 0
+    let name_start = peek_start(Nth { lst: fp.toks, n: hp })
+    let name_len = peek_len(Nth { lst: fp.toks, n: hp })
+    let ty_start = peek_start(Nth { lst: fp.toks, n: hp + 2 })
+    let ty_len = peek_len(Nth { lst: fp.toks, n: hp + 2 })
+    let ty = type_code_of_span(SpanCheck { src: fp.src, start: ty_start, len: ty_len })
+    out = if is_field == 1 then FieldList::FCons { name_start: name_start, name_len: name_len, ty: ty, rest: parse_fields(FieldParseState { toks: fp.toks, src: fp.src, pos: hp + 3 }) } else FieldList::FNil
+  proofs:
+    purity:
+      reads : [fp.toks, fp.src, fp.pos]
+      calls : [skip_seps, peek_kind, peek_start, peek_len, type_code_of_span, parse_fields]
+    termination:
+      bound : 512
+
+
+-- Accessors for a ParsedConcept (a block-form match is only legal in final
+-- position, so destructuring is factored into tiny rules — like pr_rule / pr_next).
+rule pc_concept
+  @intention: "The Concept from a concept-decl parse result"
+  @source: vexprparse.intent:62
+  input:
+    p : ParsedConcept
+  output:
+    out : Concept
+  logic:
+    out = match p:
+      MkPC(concept, next) => concept
+  proofs:
+    purity:
+      reads : [p]
+      calls : []
+    termination:
+      bound : 16
+
+
+rule pc_next
+  @intention: "The token index just past a concept-decl parse result"
+  @source: vexprparse.intent:62
+  input:
+    p : ParsedConcept
+  output:
+    out : number
+  logic:
+    out = match p:
+      MkPC(concept, next) => next
+  proofs:
+    purity:
+      reads : [p]
+      calls : []
+    termination:
+      bound : 16
+
+
+-- Accessors for a Concept (same tiny-destructuring shape as rd_name_start / rd_body).
+rule cd_name_start
+  @intention: "The name-span start offset of a parsed concept declaration"
+  @source: vexprparse.intent:62
+  input:
+    c : Concept
+  output:
+    out : number
+  logic:
+    out = match c:
+      MkConcept(name_start, name_len, fields) => name_start
+  proofs:
+    purity:
+      reads : [c]
+      calls : []
+    termination:
+      bound : 16
+
+
+rule cd_name_len
+  @intention: "The name-span length of a parsed concept declaration"
+  @source: vexprparse.intent:62
+  input:
+    c : Concept
+  output:
+    out : number
+  logic:
+    out = match c:
+      MkConcept(name_start, name_len, fields) => name_len
+  proofs:
+    purity:
+      reads : [c]
+      calls : []
+    termination:
+      bound : 16
+
+
+rule cd_fields
+  @intention: "The field list of a parsed concept declaration"
+  @source: vexprparse.intent:62
+  input:
+    c : Concept
+  output:
+    out : FieldList
+  logic:
+    out = match c:
+      MkConcept(name_start, name_len, fields) => fields
+  proofs:
+    purity:
+      reads : [c]
+      calls : []
+    termination:
+      bound : 16
+
+
+-- field_list_len: the number of fields in a concept's FieldList. Structural
+-- recursion on the FCons tail (Phase C), like rule_list_len / param_list_len.
+rule field_list_len
+  @intention: "Number of fields in a concept's field list"
+  @source: vexprparse.intent:62
+  input:
+    fl : FieldList
+  output:
+    out : number
+  logic:
+    out = match fl:
+      FCons(name_start, name_len, ty, rest) => 1 + field_list_len(rest)
+      FNil => 0
+  proofs:
+    purity:
+      reads : [fl]
+      calls : [field_list_len]
+    termination:
+      bound : 512
+      structural : fl
+
+
+-- parse_concept_decl_pos: parse ONE top-level concept declaration STARTING at
+-- ps.pos, returning a ParsedConcept (the Concept + the end index). The
+-- position-aware analogue of parse_rule_decl_pos:
+--   * the `concept` keyword is at index p, recognized by byte-comparing its span to
+--     "concept" (span_is_concept, reading ps.src).
+--   * the NAME is the Ident at p+1; its span is (peek_start p+1, peek_len p+1).
+--   * skip_seps from p+2 skips the Newline + the concept-body Indent, landing on the
+--     `fields` Ident, recognized by byte-comparing its span to "fields".
+--   * the `:` is at fields_idx+1; skip_seps from fields_idx+2 skips the Newline +
+--     the fields-body Indent, landing on the first field-line token.
+--   * parse_fields parses the field list from there; FNil at the trailing Dedent.
+-- FAIL-GRACEFUL like the rule parsers: when both byte checks pass the fields are the
+-- parsed list, else an empty list (FNil). `next` is the index just past the last
+-- field line (name_idx + 3 of the final field, or the fields-body start when the
+-- block is empty) — computed by walking parse_fields' span via a length count is
+-- not needed: the program walk's skip_seps_dedent will advance from `next` past the
+-- trailing Dedents to the next top-level keyword. We thread `next` as the index of
+-- the first non-field token AFTER the block by re-scanning: end_of_fields advances
+-- field by field. To keep this one-shot, `next` is computed as the fields-body start
+-- plus 4 * (number of fields) — each field line is exactly 4 tokens (name, `:`,
+-- type, Newline) in the canonical stream. The trailing Dedents past that are
+-- swallowed by the caller's skip_seps_dedent, so an off-by-a-separator never drops a
+-- sibling item.
+rule parse_concept_decl_pos
+  @intention: "Parse a `concept NAME` + `fields:` block starting at ps.pos into a Concept + end index"
+  @source: vexprparse.intent:62
+  input:
+    ps : ProgramState
+  output:
+    out : ParsedConcept
+  logic:
+    let kw_start = peek_start(Nth { lst: ps.toks, n: ps.pos })
+    let kw_len = peek_len(Nth { lst: ps.toks, n: ps.pos })
+    let is_concept = span_is_concept(SpanCheck { src: ps.src, start: kw_start, len: kw_len })
+    let name_start = peek_start(Nth { lst: ps.toks, n: ps.pos + 1 })
+    let name_len = peek_len(Nth { lst: ps.toks, n: ps.pos + 1 })
+    let fields_idx = skip_seps(ParseState { toks: ps.toks, pos: ps.pos + 2 })
+    let fields_start = peek_start(Nth { lst: ps.toks, n: fields_idx })
+    let fields_len = peek_len(Nth { lst: ps.toks, n: fields_idx })
+    let is_fields = span_is_fields(SpanCheck { src: ps.src, start: fields_start, len: fields_len })
+    let hdr_ok = if is_concept == 1 and is_fields == 1 then 1 else 0
+    let body_idx = skip_seps(ParseState { toks: ps.toks, pos: fields_idx + 2 })
+    let fl = parse_fields(FieldParseState { toks: ps.toks, src: ps.src, pos: body_idx })
+    let nfields = field_list_len(fl)
+    let endp = body_idx + 4 * nfields
+    out = ParsedConcept::MkPC { concept: Concept::MkConcept { name_start: name_start, name_len: name_len, fields: if hdr_ok == 1 then fl else FieldList::FNil }, next: endp }
+  proofs:
+    purity:
+      reads : [ps.toks, ps.src, ps.pos]
+      calls : [peek_start, peek_len, span_is_concept, skip_seps, span_is_fields, parse_fields, field_list_len]
+    termination:
+      bound : 64
+
+
+-- parse_concept_decl: parse ONE top-level concept declaration at index 0 into a
+-- Concept (the p=0 special case of parse_concept_decl_pos, mirroring brick 11's
+-- parse_rule_decl vs brick 12's parse_rule_decl_pos). Drops the threaded `next`.
+rule parse_concept_decl
+  @intention: "Parse a `concept NAME` + `fields:` block at index 0 into a Concept"
+  @source: vexprparse.intent:62
+  input:
+    rp : RuleParseState
+  output:
+    out : Concept
+  logic:
+    let pc = parse_concept_decl_pos(ProgramState { toks: rp.toks, src: rp.src, pos: 0 })
+    out = pc_concept(pc)
+  proofs:
+    purity:
+      reads : [rp.toks, rp.src]
+      calls : [parse_concept_decl_pos, pc_concept]
+    termination:
+      bound : 64
+
+
+-- parse_concepts: the NEW top-level walk that CAPTURES concept declarations into a
+-- ConceptList, starting at ps.pos. The loop:
+--   * skip_seps_dedent from ps.pos to the first significant token, past any leftover
+--     Newline / Indent / Dedent that closes a prior item.
+--   * if that token spells `concept` (span_is_concept): parse one concept decl via
+--     parse_concept_decl_pos, CCons it onto the recursive parse of the rest from its
+--     `next`.
+--   * else if it spells `rule` (span_is_rule): SKIP that rule decl — advance past it
+--     via parse_rule_decl_pos's `next` — and recurse (so concepts AFTER a rule are
+--     still captured), DO NOT cons.
+--   * else (Eof or any other token): the walk ends — CNil.
+-- TERMINATION: each iteration advances the cursor by at least one whole declaration
+-- (parse_concept_decl_pos / parse_rule_decl_pos `next` is strictly past the starting
+-- keyword), so pos grows strictly toward the finite end of the token list. No
+-- structural/decreasing FIELD fits a forward token scan, so bound + the mandatory
+-- recursion breadcrumb (the backstop is the finite token list, bounded by max_nodes).
+rule parse_concepts
+  @intention: "Walk top-level items capturing concept declarations into a ConceptList (skipping rules)"
+  @source: vexprparse.intent:62
+  input:
+    ps : ProgramState
+  output:
+    out : ConceptList
+  logic:
+    let hp = skip_seps_dedent(ParseState { toks: ps.toks, pos: ps.pos })
+    let kw_start = peek_start(Nth { lst: ps.toks, n: hp })
+    let kw_len = peek_len(Nth { lst: ps.toks, n: hp })
+    let is_concept = span_is_concept(SpanCheck { src: ps.src, start: kw_start, len: kw_len })
+    let is_rule = span_is_rule(SpanCheck { src: ps.src, start: kw_start, len: kw_len })
+    let pc = parse_concept_decl_pos(ProgramState { toks: ps.toks, src: ps.src, pos: hp })
+    let cd = pc_concept(pc)
+    let cend = pc_next(pc)
+    let pr = parse_rule_decl_pos(ProgramState { toks: ps.toks, src: ps.src, pos: hp })
+    let rend = pr_next(pr)
+    out = if is_concept == 1 then ConceptList::CCons { head: cd, tail: parse_concepts(ProgramState { toks: ps.toks, src: ps.src, pos: cend }) } else (if is_rule == 1 then parse_concepts(ProgramState { toks: ps.toks, src: ps.src, pos: rend }) else ConceptList::CNil)
+  proofs:
+    purity:
+      reads : [ps.toks, ps.src, ps.pos]
+      calls : [skip_seps_dedent, peek_start, peek_len, span_is_concept, span_is_rule, parse_concept_decl_pos, pc_concept, pc_next, parse_rule_decl_pos, pr_next, parse_concepts]
+    termination:
+      bound : 512
+
+
+-- concept_list_len: the number of concept declarations in a parsed ConceptList.
+-- Structural recursion on the CCons tail (Phase C), like rule_list_len.
+rule concept_list_len
+  @intention: "Number of concept declarations in a parsed concept list"
+  @source: vexprparse.intent:62
+  input:
+    cl : ConceptList
+  output:
+    out : number
+  logic:
+    out = match cl:
+      CCons(head, tail) => 1 + concept_list_len(tail)
+      CNil => 0
+  proofs:
+    purity:
+      reads : [cl]
+      calls : [concept_list_len]
+    termination:
+      bound : 4000
+      structural : cl
+
+
+-- The concept-lookup probe: the concept list to search, the source text (for
+-- byte-comparison), and the query name's span (q_start, q_len). Same shape as
+-- FindRuleState but over a ConceptList.
+concept FindConceptState
+  @intention: "A concept list to search + the source text + the query name's span"
+  @source: vexprparse.intent:62
+  fields:
+    concepts : ConceptList
+    src : text [..256]
+    q_start : number [0, 256]
+    q_len : number [0, 256]
+
+
+-- find_concept: locate the concept whose NAME span byte-equals the query span and
+-- return its Concept, walking the list front-to-back. Mirror of find_rule. On no
+-- match it returns a SENTINEL MkConcept(0, 0, FNil) — an empty concept, so a number
+-- driver reading off it yields 0 fields rather than crashing. Bound-only
+-- termination + the native recursion breadcrumb (the shrinking list tail is a field
+-- of the packed input).
+rule find_concept
+  @intention: "The Concept whose name matches the query span (sentinel empty concept if none)"
+  @source: vexprparse.intent:62
+  input:
+    st : FindConceptState
+  output:
+    out : Concept
+  logic:
+    out = match st.concepts:
+      CCons(head, tail) => if cd_name_len(head) == st.q_len and name_eq(NameEqState { src: st.src, a_start: cd_name_start(head), b_start: st.q_start, len: st.q_len, off: 0 }) == 1 then head else find_concept(FindConceptState { concepts: tail, src: st.src, q_start: st.q_start, q_len: st.q_len })
+      CNil => Concept::MkConcept { name_start: 0, name_len: 0, fields: FieldList::FNil }
+  proofs:
+    purity:
+      reads : [st.concepts, st.src, st.q_start, st.q_len]
+      calls : [cd_name_len, cd_name_start, name_eq, find_concept]
+    termination:
+      bound : 4000
+
+
+-- cl_head_fields: the FieldList of the HEAD concept of a concept list (an empty
+-- list — FNil — for an empty list). Mirror of rl_head_body for concepts.
+rule cl_head_fields
+  @intention: "The field list of the head concept of a concept list (FNil if none)"
+  @source: vexprparse.intent:62
+  input:
+    cl : ConceptList
+  output:
+    out : FieldList
+  logic:
+    out = match cl:
+      CCons(head, tail) => cd_fields(head)
+      CNil => FieldList::FNil
+  proofs:
+    purity:
+      reads : [cl]
+      calls : [cd_fields]
+    termination:
+      bound : 16
+
+
+-- count_concepts: the records-arc R1 STRUCTURAL driver. Tokenize the program
+-- source (with indentation), walk the whole top-level item sequence from index 0
+-- CAPTURING concepts, and return the ConceptList length. Proves the program's
+-- concept declarations are found (and that rules between/around them are skipped,
+-- not mistaken for concepts).
+--
+--   count_concepts("concept Pair\n  fields:\n    a : number\n    b : number\nrule main\n  logic:\n    out = 1") = 1
+--
+-- NATIVE-ONLY (multi-line source). Takes a ScanState: source is argv arg 1, pos is
+-- argv arg 2 (always 0).
+rule count_concepts
+  @intention: "Tokenize a program, walk top-level items, and count the concept declarations"
+  @source: vexprparse.intent:62
+  input:
+    s : ScanState
+  output:
+    out : number
+  logic:
+    let toks = begin_tokenize(ScanState { source: s.source, pos: 0 })
+    let cl = parse_concepts(ProgramState { toks: toks, src: s.source, pos: 0 })
+    out = concept_list_len(cl)
+  proofs:
+    purity:
+      reads : [s.source]
+      calls : [begin_tokenize, parse_concepts, concept_list_len]
+    termination:
+      bound : 256
+
+
+-- concept_field_count: the records-arc R1 FIELD driver. Tokenize the program
+-- source, walk the top-level items capturing concepts, and return the number of
+-- fields of the FIRST concept. Proves the `fields:` block parsed into the right
+-- number of fields.
+--
+--   concept_field_count("concept Pair\n  fields:\n    a : number\n    b : number\nrule main\n  logic:\n    out = 1") = 2
+--
+-- NATIVE-ONLY (multi-line source).
+rule concept_field_count
+  @intention: "Parse a program and return the number of fields of its first concept"
+  @source: vexprparse.intent:62
+  input:
+    s : ScanState
+  output:
+    out : number
+  logic:
+    let toks = begin_tokenize(ScanState { source: s.source, pos: 0 })
+    let cl = parse_concepts(ProgramState { toks: toks, src: s.source, pos: 0 })
+    let fields = cl_head_fields(cl)
+    out = field_list_len(fields)
+  proofs:
+    purity:
+      reads : [s.source]
+      calls : [begin_tokenize, parse_concepts, cl_head_fields, field_list_len]
+    termination:
+      bound : 256
 
 
 -- param_list_len: the number of formal parameters in a rule's ParamList.
