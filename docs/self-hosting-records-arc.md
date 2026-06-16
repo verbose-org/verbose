@@ -99,3 +99,60 @@ self-hosted compiler is itself written in — the minimum the parsed grammar nee
 before "a Verbose compiler in Verbose" is more than a shape. Each brick is a milestone on that
 path, not the destination, and R1+R2 stand on their own (real field-access diagnostics) even if
 the arc pauses there.
+
+---
+
+## Review outcome (2026-06-16) — decisive, two errors of commitment caught
+
+This design went through a fresh-context strategic review (the discipline that just declined the
+IR arc). It caught two errors of commitment in the design above, both confirmed against the code.
+**The design above is retained as the record; this section is the verdict and the revised plan.**
+
+### Finding 1 — the arena ceiling is a WALL, not the "open question" §"review should pressure-test" #4 framed it as.
+
+Probe (run from disk, reproducible): the self-hosted tokenizer arena-allocates `~2N+3` nodes for
+N tokens, holding the token stream AND the AST, bounded by `concept_group [max_nodes: 65535]` —
+and **65535 is the 16-bit architectural max, not a tunable** (the index width is part of the
+self-hosted back end's ABI). `vexprparse.verbose`'s own non-comment source is **~57,615 tokens →
+~115,233 arena nodes**, i.e. **~49,700 nodes OVER the ceiling**. The token stream alone (~2N =
+115k) blows the cap before a single AST node is built. **The self-hosted compiler cannot represent
+its own source in its own arena.** Widening the parsed grammar does nothing to change this; the
+real self-hosting wall is the arena-index ABI (16-bit → wider), an entirely separate arc that
+needs its own design + review.
+
+### Finding 2 — R5's "not green-field" claim was FALSE (it conflated two compilers).
+
+The design said R5 "reuses the concept_group arena + match machine code verbosec already emits."
+That conflates **verbosec** (the Rust compiler, `src/native.rs`, which DOES emit arenas + tag
+dispatch) with **the self-hosted emitter** (`x86_node` in `vexprparse.verbose`, which R5 must
+extend). The self-hosted emitter is a **flat scalar stack machine**: every node computes a value
+and `push rax`; `AstField`, `AstStr`, `AstBool` emit `b"\xcc"` (int3 — explicit not-implemented
+traps). It has **no arena, no node-count slot, no r11 base, no tag compare, no match dispatch** in
+generated code. R5 would have to build, in Verbose, the entire arena+tag-dispatch machine-code
+emitter that took verbosec many Phase-B/native slices to build in Rust — **plausibly larger than
+R1–R4 combined.** The arc was back-loaded with its real difficulty, mis-sold as reuse.
+
+### Revised plan (review bottom line (b), adopted)
+
+1. **Ship R1 + R2 ONLY, reframed honestly as a CHECKER improvement** — not "the gateway to a
+   Verbose compiler in Verbose." Verified value: `type_of_env` returns `3` (ERROR) for `AstField`
+   today, and `AstField` is already parsed; R1+R2 turn "field access is always a type error" into
+   real field-access diagnostics resolved against the concept list. This improves the **checker**,
+   the project's durable artifact ([[project_verbose_thesis]]), is testable against the existing
+   rule-only corpus, and has a natural stop point.
+2. **R1 changes named by the review:** (a) the two-side-list loop is a real reshape of
+   `parse_program`'s recursion (inline tail-cons → let-bound recursion + cons onto `pa_rules` of a
+   `ProgramAst{concepts, rules}` composite — cite `MkBlock{binds, result}` as the two-structure
+   record precedent), not a "downstream byte-identical" no-op; (b) the R1 acceptance test MUST
+   include both concept→rule AND rule→concept orderings to flush the `skip_seps_dedent`
+   DEDENT-alignment risk at the heterogeneous top level (untested territory); (c) keep
+   "`pa_rules(parse_program(p))` byte-identical to old `parse_program(p)` over the rule-only
+   corpus" as a hard gate.
+3. **Do NOT open R3–R5 in this arc.** Two prerequisites must each be designed + reviewed on their
+   own merits BEFORE R5 is scoped: (i) widening the self-hosted arena index beyond 16-bit (Finding
+   1's wall — the actual self-hosting unblock), and (ii) an honest standalone design for an
+   arena+tag-dispatch emitter written in Verbose (the real R5). Bundling either under "the records
+   arc" would repeat the exact error-of-commitment the IR review caught.
+
+The reframe: **records+match in the parsed grammar is a checker win, not a self-hosting unblock.**
+Self-hosting-at-scale is gated by the arena-index ABI, which this arc was wrongly sold as advancing.
