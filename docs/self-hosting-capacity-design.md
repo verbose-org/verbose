@@ -154,6 +154,44 @@ Replaced by the real probe below.
 Targets right (time → depth → bounds); first tools corrected (memoization not cursor; Verbose-side
 tail-recursion not backend-TCO-first). Design above retained as the record.
 
+---
+
+## C1 scoping outcome (2026-06-16) — there is NO lean version; the O(N²) fix is the full cursor rewrite
+
+Scoped C1 (incremental memoization) before implementing, per the review's de-risking. Result, from
+disk: **incremental memoization is NOT leaner than the full cursor — same blast radius.** Why: every
+peek is `peek_X(Nth { lst: <state>.toks, n: <abs> })` — `lst` is always the list HEAD; positions
+flow as **bare numbers** reconstructed by arithmetic (`pos + 1`, `lhs_next + 1`, `first_next`), and
+`Parsed.next` carries only a number, so the cons-cell at a position is DISCARDED when a sub-parse
+returns. To set `cursor_cell` for a new `pos` you must walk to it — the exact `drop_cells` cost C1
+exists to kill. The only escape is to make the cell TRAVEL with the position: add a cell field to all
+**12 `Parsed::Mk`** sites, add a cursor to all **16 `toks`-carrying concepts**, convert ~30
+`+k`-arithmetic sites — i.e. the full cursor rewrite (measured: **16 concepts, 42 `ParseState{` +
+35 `ProgramState{` + … = 118 construction sites, 76 `Nth` sites, 12 result-type sites**). Multi-day,
+not a slice. **Killing the O(N²) has no shortcut.**
+
+Two corrections this scoping established:
+- **`append_toks` is O(N) total, not O(N²)** (it walks each line's lexemes once; sum = total tokens).
+  It contributes DEPTH (non-tail, per-line-deep), not quadratic time.
+- **The measured O(N²) TIME is the parser peeks** (`drop_cells`-from-head in the expression parser
+  AND in `parse_program`/`parse_rule_decl_pos`) — C1's target. So **C2 (tail builders + `append_toks`)
+  fixes the DEPTH wall but NOT the primary TIME wall.** Only the full cursor (C1) flattens the O(N²)
+  the probe measured. C2-first gives no observable end-to-end speedup (large inputs stay O(N²) slow).
+
+### Honest sizing of the whole capacity arc (the real takeaway)
+
+There is **no cheap first slice that delivers an observable self-hosting-capacity win.** The chantier:
+- **Full cursor rewrite** (O(N²)→O(N) parser time) — 16 concepts / 118 sites / 12 result-types,
+  multi-day, with a dual-representation invariant to hold at every site. The load-bearing piece.
+- **Tail-recursive builders + drop `append_toks`** (O(N) call depth → O(1)) — contained to ~6 builder
+  rules; a real prerequisite for deep inputs, but no speedup without the cursor.
+- **Bounds story** (raise position/index fields to self-scale + dead-branch re-audit) — small.
+- (then a transversal backend-TCO slice, once the builders are tail-recursive).
+
+The method's value here: it sized the capacity arc accurately as a **multi-day parser-representation
+rewrite with no shortcut**, rather than letting it be mistaken for a quick win. Whether/when to invest
+is a deliberate call — the arc is real and correct, but it is not small, and none of its pieces are.
+
 ## What this arc is NOT
 
 - Not the arena-allocation arc (declined) — that fixed capacity nobody was hitting. This fixes the
