@@ -155,6 +155,45 @@ Corrected scope: 6 result types + 6 accessors + **15** concepts + **2** skip-pro
 sites + 27 advance + 11 pass-through + 15 bounds + 1 hard case ≈ 118 construction sites (matches the
 scoping doc). Pre-test (item 5) lands FIRST. Otherwise the plan stands.
 
+## Implementation attempt outcome (2026-06-18) — language-level DONE, blocked by a native backend bug
+
+First implementation pass executed the FULL transform per the corrected plan. Result:
+- **The language-level rewrite is COMPLETE and interpreter-VERIFIED.** Verifier accepts it (all
+  proofs check out), and the interpreter produces correct results — `count_concepts` on a 1-field
+  concept → 1, `shape "1+2*3"` → 20, `eval_expr "2+3*4"` → 14 via `--run` — **proving the ASTs are
+  byte-identical** (the transform preserved behavior). All buckets/concepts/sites/hard-case done.
+  One refinement to the review's scope: `RuleParseState.toks` was NOT dead (parse_rule_decl
+  navigates absolute indices 0/1 from it) — renamed `toks`→`cell` rather than deleted. So 14 concepts
+  edited (6 pos→cell, 8 toks-deleted, RuleParseState renamed), not "9 deleted."
+- **BLOCKED by a NATIVE backend codegen bug (out of the rewrite's scope).** 10 vexprparse-driven
+  NATIVE tests abort (exit 2, in `_start` prologue, before any syscall); verifier + interpreter
+  confirm logic/ASTs are correct, so it is purely native codegen. Isolated: a throwaway probe
+  replacing the recursive `advance` with inline `tl(tl(...))` FLIPPED which programs abort — pinning
+  the defect to **a recursive helper callable that takes/returns a `TokenList` group-ref and is
+  pulled into the parser's ENTRY SCC** (the `(group-ref, number)` ptr-in-rdi shape the old
+  `drop_cells` also had — but `drop_cells` was only called from non-recursive leaf peeks, so it never
+  entered the SCC; the cursor model puts the forward-walk helper deep inside the recursion cycle).
+  The SCC detection / `emit_self_recursive_program` two-pass labels / pointer-in-rdi marshalling
+  mis-compile it.
+- Tree reverted clean (back to the pre-test checkpoint, suite green) — the verified transform is
+  re-derivable (mechanical) once the native bug is fixed.
+
+**Corrected sequencing (the native bug is the true blocker):**
+1. **Native backend fix FIRST, as its own slice/PR, on the current tree.** Minimal repro: add a
+   recursive `rule advance(Advance{lst:TokenList, k:number})` and CALL it from inside an existing
+   recursive parser rule (e.g. parse_primary), then `--native --run shape` → exit(2). Debug
+   `collect_scc_containing` (is `advance` wrongly pulled into / wrongly excluded from the entry SCC?),
+   the two-pass label sizing in `emit_self_recursive_program`, and the group-ref ptr-in-rdi
+   marshalling for a callable that is BOTH recursive AND called from other SCC members. Land it + a
+   native regression test.
+2. **Re-apply the cursor rewrite** (mechanical, proven AST-identical by the interpreter this pass).
+3. **Perf measurement** (count_rules K=200/400/800/1600 on the raised-bounds harness) — only
+   meaningful once native binaries run.
+
+The rewrite is no longer the unknown; the **native recursive-group-ref-helper-in-SCC bug** is the
+real remaining blocker, and it is a backend fix worth landing on its own merits (it generalizes the
+SCC/callable machinery).
+
 ## Bottom line
 
 The full cursor is a **bounded, mechanical, self-contained 2–3 day rewrite** of the parser's
