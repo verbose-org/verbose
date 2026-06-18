@@ -115,10 +115,52 @@ total edits. NOT recommended; the big-bang with the suite gate is cleaner for a 
   self-source still needs C2 (depth) + C3 (bounds, partly dissolved since token-position number
   fields disappear). Sequencing unchanged: C1 (this plan) → C2 → C3.
 
+## Review outcome (2026-06-18) — core sound, surface undercounted. Corrections below.
+
+Fresh-context strategic review (6th method pass of the session). Core thesis VALIDATED against the
+code: **no dual representation needed** (0 backward token refs, 0 position-vs-position comparisons,
+0 token positions stored into the AST — only source-byte spans are stored), advance is always
+small-fixed-forward (`tail^k`, k≤3) except the one count site, the hard case is the ONLY one
+(`parse_rule_decl_pos` correctly threads `pb_next`, doesn't count), and the suite is a real
+end-to-end gate. **No fatal flaw.** But the plan undercounts its own surface — corrections (verdict
+(b), implement-with-changes):
+
+1. **15 threading concepts, not 6.** The plan listed only the 6 with an explicit `pos : number`
+   field and silently omitted **9** that carry `toks : TokenList` and derive their position from a
+   child via `parsed_next`: `JoinState`, `WrapState`, `LetJoinState`, `ParenState`, `ArgConsState`,
+   `CallState`, `IfThenState`, `IfElseState`, `RuleParseState`. Once navigation is by cell, their
+   `toks` field goes DEAD — and a dead field violates CLAUDE.md's anti-decoration rule, so it must be
+   DELETED (recommended) — adding their ~21 construction sites + re-proofs to the surface. Not zero-edit.
+2. **Two position-PRODUCER rules unaccounted for:** `skip_seps` (3351) and `skip_seps_dedent` (4717)
+   return `out : number` token positions (used pervasively, e.g. `skip_seps(...) + 2` at 5131/5136).
+   They are a third category the buckets don't name; each must be rewritten to RETURN a cell and walk
+   forward over cells. Straightforward but real.
+3. **~75 token-`Nth` peek sites, not ~60** (`grep "lst: …toks"` = 75). The ~124 position-usage total
+   is roughly right; the per-bucket lookahead count was ~25% low.
+4. **The `parse_fields` end-cell fix is a small rule rewrite, not trivial:** thread the end cell UP
+   through every `FCons` (today the cell exists only in the `FNil` arm) + a 7th result concept +
+   accessor. Low risk (mirrors `parse_stmts`), but real. Reassurance: the current `4*nfields` is
+   deliberately approximate (trailing Dedents absorbed by the caller's `skip_seps_dedent`); the exact
+   end cell lands identically after that absorption — AST stays identical.
+5. **Suite gate has one thin spot:** the `4*nfields`-sensitive path can't currently diverge (the
+   self-hosted `type_code_of_span` only knows single-token types `number`/`bool`/`text`, so no
+   multi-token field type exists to expose a `parse_fields`-cell bug). Moot today, but **ADD one test
+   BEFORE starting**: drive `concept_field_count` on a 3-field AND an empty-`fields:` concept to pin
+   the FCons-recursive and FNil-base end-cell threading explicitly.
+6. **Re-estimate: 2–3 days, not 1–2** — the 9 vestigial-`toks` concepts each force a
+   proof/`@source`/construction-site sweep, and a big-bang red-mid-flight over ~118 sites usually
+   needs 2+ debugging passes.
+
+Corrected scope: 6 result types + 6 accessors + **15** concepts + **2** skip-producers + **75** peek
+sites + 27 advance + 11 pass-through + 15 bounds + 1 hard case ≈ 118 construction sites (matches the
+scoping doc). Pre-test (item 5) lands FIRST. Otherwise the plan stands.
+
 ## Bottom line
 
-The full cursor is a **bounded, mechanical, self-contained 1–2 day rewrite** of the parser's
-position layer — ~124 tagged sites, one structurally-removed hard case, a sharp identical-AST suite
-gate, and a measured perf win on the probe harness. No language change, no backend change, no
-downstream ripple. It is the load-bearing piece of self-hosting capacity; this plan makes it a
-known quantity to schedule rather than an open-ended risk.
+The full cursor is a **bounded, mechanical, self-contained 2–3 day rewrite** of the parser's
+position layer — ~118 construction sites across 15 threading concepts + 6 result types + 2
+position-producers, one structurally-removed hard case, a sharp identical-AST suite gate (plus one
+pre-test to add), and a measured perf win on the probe harness. No language change, no backend
+change, no downstream ripple (verified: 0 position reads past the parser, spans are source-byte).
+It is the load-bearing piece of self-hosting capacity; this plan + review make it a **known,
+correctly-sized quantity to schedule** rather than an open-ended risk.
