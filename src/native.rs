@@ -33482,4 +33482,63 @@ rule probe
         let _ = std::fs::remove_file(&cf);
     }
 
+    // Pre-test for the cursor rewrite (docs/cursor-rewrite-plan.md review item 5):
+    // pin parse_fields' end-position handling at the two recursion boundaries the
+    // rewrite changes most — the FCons-recursive case (a multi-field concept) and
+    // the FNil-base case (an empty `fields:` block). Today parse_concept_decl_pos
+    // computes the end by counting (`body_idx + 4*nfields`); the cursor rewrite
+    // replaces that with parse_fields returning its end CELL, threaded up through
+    // every FCons. This test locks the observable behavior (field counts + that the
+    // rule AFTER the concept is still found) so that rewrite is provably AST-identical.
+    #[test]
+    fn cursor_pretest_parse_fields_field_count_edges() {
+        let src = std::fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let cr = std::env::temp_dir().join("verbosec_test_cursorpre_count_rules");
+        let cc = std::env::temp_dir().join("verbosec_test_cursorpre_count_concepts");
+        let cf = std::env::temp_dir().join("verbosec_test_cursorpre_field_count");
+        compile_native(&program, "count_rules", cr.to_str().unwrap(), false, false)
+            .expect("count_rules must compile natively");
+        compile_native(&program, "count_concepts", cc.to_str().unwrap(), false, false)
+            .expect("count_concepts must compile natively");
+        compile_native(&program, "concept_field_count", cf.to_str().unwrap(), false, false)
+            .expect("concept_field_count must compile natively");
+
+        let run = |bin: &std::path::Path, prog: &str| -> i64 {
+            let r = std::process::Command::new(bin)
+                .arg(prog)
+                .arg("0")
+                .output()
+                .expect("spawn cursor-pretest driver");
+            assert!(r.status.success(), "{:?} must exit 0; got {:?}", bin, r.status);
+            String::from_utf8_lossy(&r.stdout)
+                .trim()
+                .parse::<i64>()
+                .expect("driver prints an integer")
+        };
+
+        // FCons-recursive: a 3-field concept (mixed types) then a rule. The end
+        // cell after `fields:` must land on `rule`, so the rule is found AND the
+        // field count is exactly 3.
+        let three_fields =
+            "concept Trip\n  fields:\n    x : number\n    y : bool\n    z : text\nrule main\n  logic:\n    out = 1";
+        assert_eq!(run(&cf, three_fields), 3, "three-field concept: field count 3 (FCons recursion)");
+        assert_eq!(run(&cc, three_fields), 1, "three-field concept captured");
+        assert_eq!(run(&cr, three_fields), 1, "the rule after a 3-field concept is found");
+
+        // FNil-base: an EMPTY `fields:` block then a rule. The end cell must land
+        // on `rule` immediately (zero fields), so field count 0 and the rule is found.
+        let empty_fields = "concept Empty\n  fields:\nrule main\n  logic:\n    out = 1";
+        assert_eq!(run(&cf, empty_fields), 0, "empty fields: block: field count 0 (FNil base)");
+        assert_eq!(run(&cc, empty_fields), 1, "empty-fields concept captured");
+        assert_eq!(run(&cr, empty_fields), 1, "the rule after an empty-fields concept is found");
+
+        let _ = std::fs::remove_file(&cr);
+        let _ = std::fs::remove_file(&cc);
+        let _ = std::fs::remove_file(&cf);
+    }
+
 }
