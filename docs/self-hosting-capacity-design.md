@@ -300,6 +300,35 @@ self-limiting (they stop at the first non-matching byte), so `string_run` was th
 by this fix. `count_cells_src` handles K=3200 fine. The depth ceiling is the next wall, secondary to
 the time win delivered here.
 
+## C-depth bisection (2026-06-21) — the remaining wall is the ARENA, not call depth. The declined arena arc is now VALIDATED.
+
+With the O(N²) gone (cursor + string_run fix), bisected what makes `count_rules` abort at K≥800.
+Method: raised ALL position/index field bounds on a throwaway copy, measured exit codes.
+- K=400/600/700: exit 0, correct, FAST (0.003–0.010 s, linear). K=800+: exit 1 (clean abort), FAST
+  (~0.007 s — early abort, NOT deep work, NOT SIGSEGV).
+- Remaining small bounds ([0,1]/[0,8]/[0,16]/[0,64]) are enum/kind codes, not positions — ruled out.
+- **Direct test:** temporarily raised the arena cap (verifier `PHASE_B1_MAX_BOUND` + the `.verbose`
+  `max_nodes`) 65535→120000. **count_rules then CLEARS 800 (exit 0, "800"); 1600 aborts (needs
+  >120000).** So the wall is unambiguously the **arena `max_nodes`**, scaling ~85 nodes/rule
+  (count_cells_src gives 8001 token cells at K=800; the indent tokenizer + AST push total nodes past
+  65535 around K≈770). NOT call depth — no SIGSEGV at these K once the tokenizer is linear (the
+  earlier 3200 SIGSEGV was the old tokenizer's stack use; now a clean arena-full abort). (Verifier
+  hack reverted; cap is back at 65535.)
+
+**This VALIDATES the arena-allocation arc (docs/arena-allocation-design.md) that was DECLINED as
+mis-aimed.** It was correctly declined THEN — the O(N²) time walled first, so an off-stack arena
+would have moved a wall nobody was hitting. Now that O(N²) is fixed, the arena IS the operative wall,
+exactly as that design's "follow-on" note predicted. The fix is that arc, revived:
+- **Raise the arena cap** (PHASE_B1_MAX_BOUND) — but it can't just be raised: the arena is
+  STACK-allocated (`max_nodes × entry_size`). Self-source scale (~6000 rules × ~85 = ~500k nodes ×
+  48 B ≈ 24 MB) blows the 8 MB stack. So:
+- **Move the arena OFF the stack (mmap)** — the option-(b) design in arena-allocation-design.md
+  (mmap above a threshold, base in a slot reloaded after syscalls, r9/r11 discipline). THIS is now
+  the validated next slice for self-hosting capacity, no longer premature.
+
+The walls fell in the right order once measured: O(N²) time (fixed) → arena capacity (now). The
+arena arc's decline + revival is the cleanest vindication of "measure each wall in order."
+
 ## What this arc is NOT
 
 - Not the arena-allocation arc (declined) — that fixed capacity nobody was hitting. This fixes the
