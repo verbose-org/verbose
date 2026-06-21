@@ -219,15 +219,15 @@ concept_group VExpr [max_depth: 4096, max_nodes: 65535]
     @intention: "A parse result: the AST built plus the index where it ended"
     @source: vexprparse.intent:1
     variants:
-      -- node = the subtree parsed; next = token index just past it
-      Mk of (node : Ast, next : number)
+      -- node = the subtree parsed; next = the token list CELL just past it
+      Mk of (node : Ast, next : TokenList)
 
   concept ParsedArgs
     @intention: "A call-argument parse result: the ArgList built plus the end index"
     @source: vexprparse.intent:1
     variants:
-      -- args = the argument cons-list parsed; next = token index just past ')'
-      MkArgs of (args : ArgList, next : number)
+      -- args = the argument cons-list parsed; next = the cell just past ')'
+      MkArgs of (args : ArgList, next : TokenList)
 
   -- Brick 8b: the column stack. A cons-list of open-block indentation widths,
   -- mirroring src/lexer.rs's `indent_stack: Vec<usize>`. Push(width, rest) is a
@@ -288,7 +288,7 @@ concept_group VExpr [max_depth: 4096, max_nodes: 65535]
     @intention: "A block parse result: the Block built plus the end token index"
     @source: vexprparse.intent:28
     variants:
-      MkPB of (block : Block, next : number)
+      MkPB of (block : Block, next : TokenList)
 
   -- Brick 10: the evaluation ENVIRONMENT. A cons-list mapping a bound name —
   -- carried as a SOURCE SPAN (name_start, name_len) exactly like a Binding cell
@@ -349,7 +349,7 @@ concept_group VExpr [max_depth: 4096, max_nodes: 65535]
     @intention: "A rule-decl parse result: the RuleDecl built plus its end token index"
     @source: vexprparse.intent:31
     variants:
-      MkPR of (rule : RuleDecl, next : number)
+      MkPR of (rule : RuleDecl, next : TokenList)
 
   -- Brick 16: a rule's PARAMETER list — a cons-list of parameter NAMES, each a
   -- source span (name_start, name_len), in source order. Same identity model as a
@@ -374,7 +374,7 @@ concept_group VExpr [max_depth: 4096, max_nodes: 65535]
     @intention: "A parameter-list parse result: the ParamList built plus the end index"
     @source: vexprparse.intent:34
     variants:
-      MkPP of (params : ParamList, next : number)
+      MkPP of (params : ParamList, next : TokenList)
 
   -- Brick 23: a STRUCTURED diagnostic. Brick 22's check_program collapses the whole
   -- program to a single error COUNT — useful as a pass/fail gate, useless for
@@ -485,7 +485,19 @@ concept_group VExpr [max_depth: 4096, max_nodes: 65535]
     @intention: "A concept-decl parse result: the Concept built plus its end token index"
     @source: vexprparse.intent:62
     variants:
-      MkPC of (concept : Concept, next : number)
+      MkPC of (concept : Concept, next : TokenList)
+
+  -- Cursor rewrite: a `fields:` block parse result — the FieldList built plus the
+  -- token list CELL just past the last field. Mirrors ParsedParams's MkPP exactly.
+  -- parse_fields threads this end cell up through every FCons so the caller
+  -- (parse_concept_decl_pos) reads the end position structurally rather than
+  -- computing it by counting fields (the old `body_idx + 4 * nfields` arithmetic
+  -- has no cell analogue).
+  concept ParsedFields
+    @intention: "A fields-block parse result: the FieldList built plus its end cell"
+    @source: vexprparse.intent:62
+    variants:
+      MkPF of (fields : FieldList, next : TokenList)
 
 
 -- ============================================================================
@@ -885,32 +897,35 @@ rule tokenize
 -- token list.
 -- ============================================================================
 
-concept Nth
-  @intention: "A token list plus an index into it"
+-- The cursor walk argument: a token list cell plus how many cons cells to step
+-- forward. advance returns the CELL k steps ahead (the cursor model's O(k)
+-- forward walk), replacing the O(n)-from-head drop_cells indexing.
+concept Advance
+  @intention: "A token list cell plus how many cons cells to step forward"
   @source: vexprparse.intent:12
   fields:
     lst : TokenList
-    n : number [0, 512]
+    k : number [0, 512]
 
 
-rule drop_cells
-  @intention: "The token list with its first arg.n cons cells removed"
+rule advance
+  @intention: "The token list cell arg.k cons cells forward from arg.lst"
   @source: vexprparse.intent:12
   input:
-    arg : Nth
+    arg : Advance
   output:
     out : TokenList
   logic:
     out = match arg.lst:
-      Cons(head, tail) => if arg.n == 0 then arg.lst else drop_cells(Nth { lst: tail, n: arg.n - 1 })
+      Cons(head, tail) => if arg.k == 0 then arg.lst else advance(Advance { lst: tail, k: arg.k - 1 })
       Nil => TokenList::Nil
   proofs:
     purity:
-      reads : [arg.lst, arg.n]
-      calls : [drop_cells]
+      reads : [arg.lst, arg.k]
+      calls : [advance]
     termination:
       bound : 512
-      decreasing : n
+      decreasing : k
 
 
 rule head_tok
@@ -1265,15 +1280,15 @@ rule peek_kind
   @intention: "Kind code of the token at index n (0 = Eof / past end)"
   @source: vexprparse.intent:14
   input:
-    arg : Nth
+    cell : TokenList
   output:
     out : number
   logic:
-    out = tok_kind(head_tok(drop_cells(arg)))
+    out = tok_kind(head_tok(cell))
   proofs:
     purity:
-      reads : [arg]
-      calls : [tok_kind, head_tok, drop_cells]
+      reads : [cell]
+      calls : [tok_kind, head_tok]
     termination:
       bound : 16
 
@@ -1283,15 +1298,15 @@ rule peek_value
   @intention: "Literal value of the token at index n (0 if not a Num)"
   @source: vexprparse.intent:14
   input:
-    arg : Nth
+    cell : TokenList
   output:
     out : number
   logic:
-    out = tok_value(head_tok(drop_cells(arg)))
+    out = tok_value(head_tok(cell))
   proofs:
     purity:
-      reads : [arg]
-      calls : [tok_value, head_tok, drop_cells]
+      reads : [cell]
+      calls : [tok_value, head_tok]
     termination:
       bound : 16
 
@@ -1301,15 +1316,15 @@ rule peek_is_num
   @intention: "1 if the token at index n is a number literal, 0 otherwise"
   @source: vexprparse.intent:14
   input:
-    arg : Nth
+    cell : TokenList
   output:
     out : number
   logic:
-    out = tok_is_num(head_tok(drop_cells(arg)))
+    out = tok_is_num(head_tok(cell))
   proofs:
     purity:
-      reads : [arg]
-      calls : [tok_is_num, head_tok, drop_cells]
+      reads : [cell]
+      calls : [tok_is_num, head_tok]
     termination:
       bound : 16
 
@@ -1319,15 +1334,15 @@ rule peek_is_op
   @intention: "1 if the token at index n is an operator, 0 otherwise"
   @source: vexprparse.intent:14
   input:
-    arg : Nth
+    cell : TokenList
   output:
     out : number
   logic:
-    out = tok_is_op(head_tok(drop_cells(arg)))
+    out = tok_is_op(head_tok(cell))
   proofs:
     purity:
-      reads : [arg]
-      calls : [tok_is_op, head_tok, drop_cells]
+      reads : [cell]
+      calls : [tok_is_op, head_tok]
     termination:
       bound : 16
 
@@ -1337,15 +1352,15 @@ rule peek_op_code
   @intention: "Operator code of the token at index n (0 if not an operator)"
   @source: vexprparse.intent:14
   input:
-    arg : Nth
+    cell : TokenList
   output:
     out : number
   logic:
-    out = tok_op_code(head_tok(drop_cells(arg)))
+    out = tok_op_code(head_tok(cell))
   proofs:
     purity:
-      reads : [arg]
-      calls : [tok_op_code, head_tok, drop_cells]
+      reads : [cell]
+      calls : [tok_op_code, head_tok]
     termination:
       bound : 16
 
@@ -1355,15 +1370,15 @@ rule peek_is_ident
   @intention: "1 if the token at index n is an identifier, 0 otherwise"
   @source: vexprparse.intent:14
   input:
-    arg : Nth
+    cell : TokenList
   output:
     out : number
   logic:
-    out = tok_is_ident(head_tok(drop_cells(arg)))
+    out = tok_is_ident(head_tok(cell))
   proofs:
     purity:
-      reads : [arg]
-      calls : [tok_is_ident, head_tok, drop_cells]
+      reads : [cell]
+      calls : [tok_is_ident, head_tok]
     termination:
       bound : 16
 
@@ -1373,15 +1388,15 @@ rule peek_start
   @intention: "Source-span start offset of the Ident token at index n (0 if not an Ident)"
   @source: vexprparse.intent:14
   input:
-    arg : Nth
+    cell : TokenList
   output:
     out : number
   logic:
-    out = tok_start(head_tok(drop_cells(arg)))
+    out = tok_start(head_tok(cell))
   proofs:
     purity:
-      reads : [arg]
-      calls : [tok_start, head_tok, drop_cells]
+      reads : [cell]
+      calls : [tok_start, head_tok]
     termination:
       bound : 16
 
@@ -1391,15 +1406,15 @@ rule peek_len
   @intention: "Source-span length of the Ident token at index n (0 if not an Ident)"
   @source: vexprparse.intent:14
   input:
-    arg : Nth
+    cell : TokenList
   output:
     out : number
   logic:
-    out = tok_len(head_tok(drop_cells(arg)))
+    out = tok_len(head_tok(cell))
   proofs:
     purity:
-      reads : [arg]
-      calls : [tok_len, head_tok, drop_cells]
+      reads : [cell]
+      calls : [tok_len, head_tok]
     termination:
       bound : 16
 
@@ -1409,15 +1424,15 @@ rule peek_is_str
   @intention: "1 if the token at index n is a string literal, 0 otherwise"
   @source: vexprparse.intent:14
   input:
-    arg : Nth
+    cell : TokenList
   output:
     out : number
   logic:
-    out = tok_is_str(head_tok(drop_cells(arg)))
+    out = tok_is_str(head_tok(cell))
   proofs:
     purity:
-      reads : [arg]
-      calls : [tok_is_str, head_tok, drop_cells]
+      reads : [cell]
+      calls : [tok_is_str, head_tok]
     termination:
       bound : 16
 
@@ -1428,15 +1443,15 @@ rule peek_str_start
   @intention: "Source-span start offset of the Str token at index n (0 if not a Str)"
   @source: vexprparse.intent:14
   input:
-    arg : Nth
+    cell : TokenList
   output:
     out : number
   logic:
-    out = tok_str_start(head_tok(drop_cells(arg)))
+    out = tok_str_start(head_tok(cell))
   proofs:
     purity:
-      reads : [arg]
-      calls : [tok_str_start, head_tok, drop_cells]
+      reads : [cell]
+      calls : [tok_str_start, head_tok]
     termination:
       bound : 16
 
@@ -1447,15 +1462,15 @@ rule peek_str_len
   @intention: "Source-span length of the Str token at index n (0 if not a Str)"
   @source: vexprparse.intent:14
   input:
-    arg : Nth
+    cell : TokenList
   output:
     out : number
   logic:
-    out = tok_str_len(head_tok(drop_cells(arg)))
+    out = tok_str_len(head_tok(cell))
   proofs:
     purity:
-      reads : [arg]
-      calls : [tok_str_len, head_tok, drop_cells]
+      reads : [cell]
+      calls : [tok_str_len, head_tok]
     termination:
       bound : 16
 
@@ -1467,11 +1482,10 @@ rule peek_str_len
 -- ============================================================================
 
 concept ParseState
-  @intention: "The whole token list plus the current parse index"
+  @intention: "The token list cell at the current parse position (the cursor)"
   @source: vexprparse.intent:15
   fields:
-    toks : TokenList
-    pos : number [0, 512]
+    cell : TokenList
 
 
 -- Accessors for a Parsed result. A block-form `match` is only legal in the
@@ -1502,7 +1516,7 @@ rule parsed_next
   input:
     p : Parsed
   output:
-    out : number
+    out : TokenList
   logic:
     out = match p:
       Mk(node, next) => next
@@ -1517,11 +1531,10 @@ rule parsed_next
 -- A fold-step state: the token list, the current index, and the accumulated
 -- left-hand AST node built so far. add_rest / mul_rest carry this.
 concept FoldState
-  @intention: "Token list + current index + the left-associative accumulator"
+  @intention: "Token list cursor cell + the left-associative accumulator"
   @source: vexprparse.intent:15
   fields:
-    toks : TokenList
-    pos : number [0, 512]
+    cell : TokenList
     acc : Ast
 
 
@@ -1542,7 +1555,6 @@ concept JoinState
   @intention: "Fold accumulator + operator + the parsed right operand"
   @source: vexprparse.intent:15
   fields:
-    toks : TokenList
     acc : Ast
     opcode : number [0, 64]
     rhs : Parsed
@@ -1554,10 +1566,9 @@ concept JoinState
 -- In the parser cycle (called only from parse_unary), so the Parsed field
 -- compiles natively.
 concept WrapState
-  @intention: "Token list + not/neg selector + the parsed unary operand"
+  @intention: "not/neg selector + the parsed unary operand"
   @source: vexprparse.intent:18
   fields:
-    toks : TokenList
     isnot : number [0, 1]
     inner : Parsed
 
@@ -1569,10 +1580,9 @@ concept WrapState
 -- the brick-9 parse cycle (called only from parse_stmts's let-branch), so its
 -- Parsed group-field input compiles natively (the group-field recursive ABI).
 concept LetJoinState
-  @intention: "Token list + bound name span + the parsed let-RHS value"
+  @intention: "Bound name span + the parsed let-RHS value"
   @source: vexprparse.intent:28
   fields:
-    toks : TokenList
     name_start : number [0, 256]
     name_len : number [0, 256]
     value : Parsed
@@ -1583,10 +1593,9 @@ concept LetJoinState
 -- cycle (called only from parse_primary's paren branch), so the Parsed field
 -- compiles natively.
 concept ParenState
-  @intention: "Token list + the parsed inner expression of a parenthesis"
+  @intention: "The parsed inner expression of a parenthesis"
   @source: vexprparse.intent:15
   fields:
-    toks : TokenList
     inner : Parsed
 
 
@@ -1597,10 +1606,9 @@ concept ParenState
 -- (called only from parse_args), so the Parsed group-field input compiles
 -- natively (the group-field ABI, commit 9529277).
 concept ArgConsState
-  @intention: "Token list + one parsed call argument (continuing the arg cons-list)"
+  @intention: "One parsed call argument (continuing the arg cons-list)"
   @source: vexprparse.intent:15
   fields:
-    toks : TokenList
     first : Parsed
 
 
@@ -1627,7 +1635,6 @@ concept CallState
   @intention: "Callee span + the parsed argument list of a function call"
   @source: vexprparse.intent:15
   fields:
-    toks : TokenList
     cstart : number [0, 512]
     clen : number [0, 512]
     pargs : ParsedArgs
@@ -1638,11 +1645,10 @@ concept CallState
 -- successive '.IDENT' steps onto the base, left-deep (a.b.c => AstField(
 -- AstField(AstVar(a), b), c)).
 concept FieldState
-  @intention: "Token list + current index + the accumulated field-access base"
+  @intention: "Token list cursor cell + the accumulated field-access base"
   @source: vexprparse.intent:15
   fields:
-    toks : TokenList
-    pos : number [0, 512]
+    cell : TokenList
     base : Ast
 
 
@@ -1665,10 +1671,9 @@ concept FieldState
 -- step over it, and parse the then-branch (a full parse_or). The cond's AST node
 -- is carried forward; the thn parse is handed to if_else.
 concept IfThenState
-  @intention: "Token list + the parsed condition of an if-expression"
+  @intention: "The parsed condition of an if-expression"
   @source: vexprparse.intent:25
   fields:
-    toks : TokenList
     cond : Parsed
 
 
@@ -1676,10 +1681,9 @@ concept IfThenState
 -- keyword (kind 208), step over it, and parse the else-branch. The cond and thn
 -- nodes are carried forward; the els parse is handed to if_build.
 concept IfElseState
-  @intention: "Token list + the if-expression condition node + the parsed then-branch"
+  @intention: "The if-expression condition node + the parsed then-branch"
   @source: vexprparse.intent:25
   fields:
-    toks : TokenList
     cond_node : Ast
     thn : Parsed
 
@@ -1721,7 +1725,7 @@ rule parsed_args_next
   input:
     p : ParsedArgs
   output:
-    out : number
+    out : TokenList
   logic:
     out = match p:
       MkArgs(args, next) => next
@@ -1747,13 +1751,13 @@ rule paren_close
   logic:
     let inner_next = parsed_next(ps.inner)
     let inner_node = parsed_node(ps.inner)
-    let after_op = peek_op_code(Nth { lst: ps.toks, n: inner_next })
-    let close_pos = if after_op == 22 then inner_next + 1 else inner_next
+    let after_op = peek_op_code(inner_next)
+    let close_pos = if after_op == 22 then advance(Advance { lst: inner_next, k: 1 }) else inner_next
     out = Parsed::Mk { node: inner_node, next: close_pos }
   proofs:
     purity:
-      reads : [ps.toks, ps.inner]
-      calls : [parsed_next, parsed_node, peek_op_code]
+      reads : [ps.inner]
+      calls : [parsed_next, parsed_node, peek_op_code, advance]
     termination:
       bound : 512
 
@@ -1784,13 +1788,13 @@ rule parse_args
   output:
     out : ParsedArgs
   logic:
-    let opc = peek_op_code(Nth { lst: st.toks, n: st.pos })
+    let opc = peek_op_code(st.cell)
     let isclose = if opc == 22 then 1 else 0
-    out = if isclose == 1 then ParsedArgs::MkArgs { args: ArgList::ArgNil, next: st.pos + 1 } else args_cons(ArgConsState { toks: st.toks, first: parse_or(st) })
+    out = if isclose == 1 then ParsedArgs::MkArgs { args: ArgList::ArgNil, next: advance(Advance { lst: st.cell, k: 1 }) } else args_cons(ArgConsState { first: parse_or(st) })
   proofs:
     purity:
-      reads : [st.toks, st.pos, st]
-      calls : [peek_op_code, parse_or, args_cons]
+      reads : [st.cell, st]
+      calls : [peek_op_code, parse_or, args_cons, advance]
     termination:
       bound : 512
 
@@ -1811,14 +1815,14 @@ rule args_cons
   logic:
     let arg_node = parsed_node(cs.first)
     let arg_next = parsed_next(cs.first)
-    let opc = peek_op_code(Nth { lst: cs.toks, n: arg_next })
+    let opc = peek_op_code(arg_next)
     let iscomma = if opc == 11 then 1 else 0
-    let close_next = if opc == 22 then arg_next + 1 else arg_next
-    out = if iscomma == 1 then args_prepend(ArgPrependState { head_node: arg_node, rest: parse_args(ParseState { toks: cs.toks, pos: arg_next + 1 }) }) else ParsedArgs::MkArgs { args: ArgList::ArgCons { head: arg_node, tail: ArgList::ArgNil }, next: close_next }
+    let close_next = if opc == 22 then advance(Advance { lst: arg_next, k: 1 }) else arg_next
+    out = if iscomma == 1 then args_prepend(ArgPrependState { head_node: arg_node, rest: parse_args(ParseState { cell: advance(Advance { lst: arg_next, k: 1 }) }) }) else ParsedArgs::MkArgs { args: ArgList::ArgCons { head: arg_node, tail: ArgList::ArgNil }, next: close_next }
   proofs:
     purity:
-      reads : [cs.toks, cs.first]
-      calls : [parsed_node, parsed_next, peek_op_code, args_prepend, parse_args]
+      reads : [cs.first]
+      calls : [parsed_node, parsed_next, peek_op_code, args_prepend, parse_args, advance]
     termination:
       bound : 512
 
@@ -1884,17 +1888,17 @@ rule field_rest
   output:
     out : Parsed
   logic:
-    let opc = peek_op_code(Nth { lst: fs.toks, n: fs.pos })
+    let opc = peek_op_code(fs.cell)
     let isdot = if opc == 12 then 1 else 0
-    let fstart = peek_start(Nth { lst: fs.toks, n: fs.pos + 1 })
-    let flen = peek_len(Nth { lst: fs.toks, n: fs.pos + 1 })
-    let isident = peek_is_ident(Nth { lst: fs.toks, n: fs.pos + 1 })
+    let fstart = peek_start(advance(Advance { lst: fs.cell, k: 1 }))
+    let flen = peek_len(advance(Advance { lst: fs.cell, k: 1 }))
+    let isident = peek_is_ident(advance(Advance { lst: fs.cell, k: 1 }))
     let isfield = if isdot == 1 and isident == 1 then 1 else 0
-    out = if isfield == 1 then field_rest(FieldState { toks: fs.toks, pos: fs.pos + 2, base: Ast::AstField { base: fs.base, fstart: fstart, flen: flen } }) else Parsed::Mk { node: fs.base, next: fs.pos }
+    out = if isfield == 1 then field_rest(FieldState { cell: advance(Advance { lst: fs.cell, k: 2 }), base: Ast::AstField { base: fs.base, fstart: fstart, flen: flen } }) else Parsed::Mk { node: fs.base, next: fs.cell }
   proofs:
     purity:
-      reads : [fs.toks, fs.pos, fs.base]
-      calls : [peek_op_code, peek_start, peek_len, peek_is_ident, field_rest]
+      reads : [fs.cell, fs.base]
+      calls : [peek_op_code, peek_start, peek_len, peek_is_ident, field_rest, advance]
     termination:
       bound : 512
 
@@ -1916,13 +1920,13 @@ rule if_then
   logic:
     let cond_node = parsed_node(cs.cond)
     let cond_next = parsed_next(cs.cond)
-    let knd = peek_kind(Nth { lst: cs.toks, n: cond_next })
-    let then_pos = if knd == 207 then cond_next + 1 else cond_next
-    out = if_else(IfElseState { toks: cs.toks, cond_node: cond_node, thn: parse_or(ParseState { toks: cs.toks, pos: then_pos }) })
+    let knd = peek_kind(cond_next)
+    let then_pos = if knd == 207 then advance(Advance { lst: cond_next, k: 1 }) else cond_next
+    out = if_else(IfElseState { cond_node: cond_node, thn: parse_or(ParseState { cell: then_pos }) })
   proofs:
     purity:
-      reads : [cs.toks, cs.cond]
-      calls : [parsed_node, parsed_next, peek_kind, if_else, parse_or]
+      reads : [cs.cond]
+      calls : [parsed_node, parsed_next, peek_kind, if_else, parse_or, advance]
     termination:
       bound : 512
 
@@ -1942,13 +1946,13 @@ rule if_else
   logic:
     let thn_node = parsed_node(cs.thn)
     let thn_next = parsed_next(cs.thn)
-    let knd = peek_kind(Nth { lst: cs.toks, n: thn_next })
-    let else_pos = if knd == 208 then thn_next + 1 else thn_next
-    out = if_build(IfBuildState { cond_node: cs.cond_node, thn_node: thn_node, els: parse_or(ParseState { toks: cs.toks, pos: else_pos }) })
+    let knd = peek_kind(thn_next)
+    let else_pos = if knd == 208 then advance(Advance { lst: thn_next, k: 1 }) else thn_next
+    out = if_build(IfBuildState { cond_node: cs.cond_node, thn_node: thn_node, els: parse_or(ParseState { cell: else_pos }) })
   proofs:
     purity:
-      reads : [cs.toks, cs.cond_node, cs.thn]
-      calls : [parsed_node, parsed_next, peek_kind, if_build, parse_or]
+      reads : [cs.cond_node, cs.thn]
+      calls : [parsed_node, parsed_next, peek_kind, if_build, parse_or, advance]
     termination:
       bound : 512
 
@@ -2000,27 +2004,27 @@ rule parse_primary
   output:
     out : Parsed
   logic:
-    let lead_kind = peek_kind(Nth { lst: st.toks, n: st.pos })
+    let lead_kind = peek_kind(st.cell)
     let isif = if lead_kind == 201 then 1 else 0
     let istrue = if lead_kind == 209 then 1 else 0
     let isfalse = if lead_kind == 210 then 1 else 0
-    let isnum = peek_is_num(Nth { lst: st.toks, n: st.pos })
-    let isstr = peek_is_str(Nth { lst: st.toks, n: st.pos })
-    let opc = peek_op_code(Nth { lst: st.toks, n: st.pos })
+    let isnum = peek_is_num(st.cell)
+    let isstr = peek_is_str(st.cell)
+    let opc = peek_op_code(st.cell)
     let isparen = if opc == 21 then 1 else 0
-    let isident = peek_is_ident(Nth { lst: st.toks, n: st.pos })
-    let numval = peek_value(Nth { lst: st.toks, n: st.pos })
-    let sstart = peek_str_start(Nth { lst: st.toks, n: st.pos })
-    let slen = peek_str_len(Nth { lst: st.toks, n: st.pos })
-    let idstart = peek_start(Nth { lst: st.toks, n: st.pos })
-    let idlen = peek_len(Nth { lst: st.toks, n: st.pos })
-    let next_opc = peek_op_code(Nth { lst: st.toks, n: st.pos + 1 })
+    let isident = peek_is_ident(st.cell)
+    let numval = peek_value(st.cell)
+    let sstart = peek_str_start(st.cell)
+    let slen = peek_str_len(st.cell)
+    let idstart = peek_start(st.cell)
+    let idlen = peek_len(st.cell)
+    let next_opc = peek_op_code(advance(Advance { lst: st.cell, k: 1 }))
     let iscall = if next_opc == 21 then 1 else 0
-    out = if isif == 1 then if_then(IfThenState { toks: st.toks, cond: parse_or(ParseState { toks: st.toks, pos: st.pos + 1 }) }) else if istrue == 1 then Parsed::Mk { node: Ast::AstBool { value: 1 }, next: st.pos + 1 } else if isfalse == 1 then Parsed::Mk { node: Ast::AstBool { value: 0 }, next: st.pos + 1 } else if isnum == 1 then Parsed::Mk { node: Ast::AstNum { value: numval }, next: st.pos + 1 } else if isstr == 1 then Parsed::Mk { node: Ast::AstStr { start: sstart, len: slen }, next: st.pos + 1 } else if isparen == 1 then paren_close(ParenState { toks: st.toks, inner: parse_or(ParseState { toks: st.toks, pos: st.pos + 1 }) }) else if isident == 1 then (if iscall == 1 then call_build(CallState { toks: st.toks, cstart: idstart, clen: idlen, pargs: parse_args(ParseState { toks: st.toks, pos: st.pos + 2 }) }) else field_rest(FieldState { toks: st.toks, pos: st.pos + 1, base: Ast::AstVar { start: idstart, len: idlen } })) else Parsed::Mk { node: Ast::AstErr, next: st.pos }
+    out = if isif == 1 then if_then(IfThenState { cond: parse_or(ParseState { cell: advance(Advance { lst: st.cell, k: 1 }) }) }) else if istrue == 1 then Parsed::Mk { node: Ast::AstBool { value: 1 }, next: advance(Advance { lst: st.cell, k: 1 }) } else if isfalse == 1 then Parsed::Mk { node: Ast::AstBool { value: 0 }, next: advance(Advance { lst: st.cell, k: 1 }) } else if isnum == 1 then Parsed::Mk { node: Ast::AstNum { value: numval }, next: advance(Advance { lst: st.cell, k: 1 }) } else if isstr == 1 then Parsed::Mk { node: Ast::AstStr { start: sstart, len: slen }, next: advance(Advance { lst: st.cell, k: 1 }) } else if isparen == 1 then paren_close(ParenState { inner: parse_or(ParseState { cell: advance(Advance { lst: st.cell, k: 1 }) }) }) else if isident == 1 then (if iscall == 1 then call_build(CallState { cstart: idstart, clen: idlen, pargs: parse_args(ParseState { cell: advance(Advance { lst: st.cell, k: 2 }) }) }) else field_rest(FieldState { cell: advance(Advance { lst: st.cell, k: 1 }), base: Ast::AstVar { start: idstart, len: idlen } })) else Parsed::Mk { node: Ast::AstErr, next: st.cell }
   proofs:
     purity:
-      reads : [st.toks, st.pos]
-      calls : [peek_kind, peek_is_num, peek_is_str, peek_op_code, peek_is_ident, peek_value, peek_str_start, peek_str_len, peek_start, peek_len, if_then, paren_close, parse_or, call_build, parse_args, field_rest]
+      reads : [st.cell]
+      calls : [peek_kind, peek_is_num, peek_is_str, peek_op_code, peek_is_ident, peek_value, peek_str_start, peek_str_len, peek_start, peek_len, if_then, paren_close, parse_or, call_build, parse_args, field_rest, advance]
     termination:
       bound : 512
 
@@ -2041,15 +2045,15 @@ rule parse_unary
   output:
     out : Parsed
   logic:
-    let knd = peek_kind(Nth { lst: st.toks, n: st.pos })
-    let opc = peek_op_code(Nth { lst: st.toks, n: st.pos })
+    let knd = peek_kind(st.cell)
+    let opc = peek_op_code(st.cell)
     let isnot = if knd == 206 then 1 else 0
     let isneg = if opc == 14 then 1 else 0
-    out = if isnot == 1 then unary_wrap(WrapState { toks: st.toks, isnot: 1, inner: parse_unary(ParseState { toks: st.toks, pos: st.pos + 1 }) }) else if isneg == 1 then unary_wrap(WrapState { toks: st.toks, isnot: 0, inner: parse_unary(ParseState { toks: st.toks, pos: st.pos + 1 }) }) else parse_primary(st)
+    out = if isnot == 1 then unary_wrap(WrapState { isnot: 1, inner: parse_unary(ParseState { cell: advance(Advance { lst: st.cell, k: 1 }) }) }) else if isneg == 1 then unary_wrap(WrapState { isnot: 0, inner: parse_unary(ParseState { cell: advance(Advance { lst: st.cell, k: 1 }) }) }) else parse_primary(st)
   proofs:
     purity:
-      reads : [st.toks, st.pos, st]
-      calls : [peek_kind, peek_op_code, unary_wrap, parse_unary, parse_primary]
+      reads : [st.cell, st]
+      calls : [peek_kind, peek_op_code, unary_wrap, parse_unary, parse_primary, advance]
     termination:
       bound : 512
 
@@ -2091,10 +2095,10 @@ rule mul_join
   logic:
     let rhs_node = parsed_node(js.rhs)
     let rhs_next = parsed_next(js.rhs)
-    out = mul_rest(FoldState { toks: js.toks, pos: rhs_next, acc: Ast::AstBin { op: js.opcode, lhs: js.acc, rhs: rhs_node } })
+    out = mul_rest(FoldState { cell: rhs_next, acc: Ast::AstBin { op: js.opcode, lhs: js.acc, rhs: rhs_node } })
   proofs:
     purity:
-      reads : [js.toks, js.acc, js.opcode, js.rhs]
+      reads : [js.acc, js.opcode, js.rhs]
       calls : [parsed_node, parsed_next, mul_rest]
     termination:
       bound : 512
@@ -2113,13 +2117,13 @@ rule mul_rest
   output:
     out : Parsed
   logic:
-    let opcode = peek_op_code(Nth { lst: fs.toks, n: fs.pos })
+    let opcode = peek_op_code(fs.cell)
     let ismul = if opcode == 15 or (opcode == 16 or opcode == 17) then 1 else 0
-    out = if ismul == 1 then mul_join(JoinState { toks: fs.toks, acc: fs.acc, opcode: opcode, rhs: parse_unary(ParseState { toks: fs.toks, pos: fs.pos + 1 }) }) else Parsed::Mk { node: fs.acc, next: fs.pos }
+    out = if ismul == 1 then mul_join(JoinState { acc: fs.acc, opcode: opcode, rhs: parse_unary(ParseState { cell: advance(Advance { lst: fs.cell, k: 1 }) }) }) else Parsed::Mk { node: fs.acc, next: fs.cell }
   proofs:
     purity:
-      reads : [fs.toks, fs.pos, fs.acc]
-      calls : [peek_op_code, mul_join, parse_unary]
+      reads : [fs.cell, fs.acc]
+      calls : [peek_op_code, mul_join, parse_unary, advance]
     termination:
       bound : 512
 
@@ -2139,10 +2143,10 @@ rule parse_mul
     let first = parse_unary(st)
     let first_node = parsed_node(first)
     let first_next = parsed_next(first)
-    out = mul_rest(FoldState { toks: st.toks, pos: first_next, acc: first_node })
+    out = mul_rest(FoldState { cell: first_next, acc: first_node })
   proofs:
     purity:
-      reads : [st, st.toks]
+      reads : [st]
       calls : [parse_unary, mul_rest, parsed_node, parsed_next]
     termination:
       bound : 512
@@ -2160,10 +2164,10 @@ rule add_join
   logic:
     let rhs_node = parsed_node(js.rhs)
     let rhs_next = parsed_next(js.rhs)
-    out = add_rest(FoldState { toks: js.toks, pos: rhs_next, acc: Ast::AstBin { op: js.opcode, lhs: js.acc, rhs: rhs_node } })
+    out = add_rest(FoldState { cell: rhs_next, acc: Ast::AstBin { op: js.opcode, lhs: js.acc, rhs: rhs_node } })
   proofs:
     purity:
-      reads : [js.toks, js.acc, js.opcode, js.rhs]
+      reads : [js.acc, js.opcode, js.rhs]
       calls : [parsed_node, parsed_next, add_rest]
     termination:
       bound : 512
@@ -2181,13 +2185,13 @@ rule add_rest
   output:
     out : Parsed
   logic:
-    let opcode = peek_op_code(Nth { lst: fs.toks, n: fs.pos })
+    let opcode = peek_op_code(fs.cell)
     let isadd = if opcode == 13 or opcode == 14 then 1 else 0
-    out = if isadd == 1 then add_join(JoinState { toks: fs.toks, acc: fs.acc, opcode: opcode, rhs: parse_mul(ParseState { toks: fs.toks, pos: fs.pos + 1 }) }) else Parsed::Mk { node: fs.acc, next: fs.pos }
+    out = if isadd == 1 then add_join(JoinState { acc: fs.acc, opcode: opcode, rhs: parse_mul(ParseState { cell: advance(Advance { lst: fs.cell, k: 1 }) }) }) else Parsed::Mk { node: fs.acc, next: fs.cell }
   proofs:
     purity:
-      reads : [fs.toks, fs.pos, fs.acc]
-      calls : [peek_op_code, add_join, parse_mul]
+      reads : [fs.cell, fs.acc]
+      calls : [peek_op_code, add_join, parse_mul, advance]
     termination:
       bound : 512
 
@@ -2206,10 +2210,10 @@ rule parse_add
     let first = parse_mul(st)
     let first_node = parsed_node(first)
     let first_next = parsed_next(first)
-    out = add_rest(FoldState { toks: st.toks, pos: first_next, acc: first_node })
+    out = add_rest(FoldState { cell: first_next, acc: first_node })
   proofs:
     purity:
-      reads : [st, st.toks]
+      reads : [st]
       calls : [parse_mul, add_rest, parsed_node, parsed_next]
     termination:
       bound : 512
@@ -2258,13 +2262,13 @@ rule parse_cmp
     let lhs = parse_add(st)
     let lhs_node = parsed_node(lhs)
     let lhs_next = parsed_next(lhs)
-    let opcode = peek_op_code(Nth { lst: st.toks, n: lhs_next })
+    let opcode = peek_op_code(lhs_next)
     let iscmp = if opcode == 1 or (opcode == 4 or (opcode == 5 or (opcode == 6 or (opcode == 19 or opcode == 20)))) then 1 else 0
-    out = if iscmp == 1 then cmp_join(JoinState { toks: st.toks, acc: lhs_node, opcode: opcode, rhs: parse_add(ParseState { toks: st.toks, pos: lhs_next + 1 }) }) else Parsed::Mk { node: lhs_node, next: lhs_next }
+    out = if iscmp == 1 then cmp_join(JoinState { acc: lhs_node, opcode: opcode, rhs: parse_add(ParseState { cell: advance(Advance { lst: lhs_next, k: 1 }) }) }) else Parsed::Mk { node: lhs_node, next: lhs_next }
   proofs:
     purity:
-      reads : [st, st.toks]
-      calls : [parse_add, parsed_node, parsed_next, peek_op_code, cmp_join]
+      reads : [st]
+      calls : [parse_add, parsed_node, parsed_next, peek_op_code, cmp_join, advance]
     termination:
       bound : 512
 
@@ -2286,10 +2290,10 @@ rule and_join
   logic:
     let rhs_node = parsed_node(js.rhs)
     let rhs_next = parsed_next(js.rhs)
-    out = and_rest(FoldState { toks: js.toks, pos: rhs_next, acc: Ast::AstBin { op: 30, lhs: js.acc, rhs: rhs_node } })
+    out = and_rest(FoldState { cell: rhs_next, acc: Ast::AstBin { op: 30, lhs: js.acc, rhs: rhs_node } })
   proofs:
     purity:
-      reads : [js.toks, js.acc, js.rhs]
+      reads : [js.acc, js.rhs]
       calls : [parsed_node, parsed_next, and_rest]
     termination:
       bound : 512
@@ -2303,13 +2307,13 @@ rule and_rest
   output:
     out : Parsed
   logic:
-    let knd = peek_kind(Nth { lst: fs.toks, n: fs.pos })
+    let knd = peek_kind(fs.cell)
     let isand = if knd == 205 then 1 else 0
-    out = if isand == 1 then and_join(JoinState { toks: fs.toks, acc: fs.acc, opcode: 30, rhs: parse_cmp(ParseState { toks: fs.toks, pos: fs.pos + 1 }) }) else Parsed::Mk { node: fs.acc, next: fs.pos }
+    out = if isand == 1 then and_join(JoinState { acc: fs.acc, opcode: 30, rhs: parse_cmp(ParseState { cell: advance(Advance { lst: fs.cell, k: 1 }) }) }) else Parsed::Mk { node: fs.acc, next: fs.cell }
   proofs:
     purity:
-      reads : [fs.toks, fs.pos, fs.acc]
-      calls : [peek_kind, and_join, parse_cmp]
+      reads : [fs.cell, fs.acc]
+      calls : [peek_kind, and_join, parse_cmp, advance]
     termination:
       bound : 512
 
@@ -2325,10 +2329,10 @@ rule parse_and
     let first = parse_cmp(st)
     let first_node = parsed_node(first)
     let first_next = parsed_next(first)
-    out = and_rest(FoldState { toks: st.toks, pos: first_next, acc: first_node })
+    out = and_rest(FoldState { cell: first_next, acc: first_node })
   proofs:
     purity:
-      reads : [st, st.toks]
+      reads : [st]
       calls : [parse_cmp, and_rest, parsed_node, parsed_next]
     termination:
       bound : 512
@@ -2352,10 +2356,10 @@ rule or_join
   logic:
     let rhs_node = parsed_node(js.rhs)
     let rhs_next = parsed_next(js.rhs)
-    out = or_rest(FoldState { toks: js.toks, pos: rhs_next, acc: Ast::AstBin { op: 31, lhs: js.acc, rhs: rhs_node } })
+    out = or_rest(FoldState { cell: rhs_next, acc: Ast::AstBin { op: 31, lhs: js.acc, rhs: rhs_node } })
   proofs:
     purity:
-      reads : [js.toks, js.acc, js.rhs]
+      reads : [js.acc, js.rhs]
       calls : [parsed_node, parsed_next, or_rest]
     termination:
       bound : 512
@@ -2369,13 +2373,13 @@ rule or_rest
   output:
     out : Parsed
   logic:
-    let knd = peek_kind(Nth { lst: fs.toks, n: fs.pos })
+    let knd = peek_kind(fs.cell)
     let isor = if knd == 202 then 1 else 0
-    out = if isor == 1 then or_join(JoinState { toks: fs.toks, acc: fs.acc, opcode: 31, rhs: parse_and(ParseState { toks: fs.toks, pos: fs.pos + 1 }) }) else Parsed::Mk { node: fs.acc, next: fs.pos }
+    out = if isor == 1 then or_join(JoinState { acc: fs.acc, opcode: 31, rhs: parse_and(ParseState { cell: advance(Advance { lst: fs.cell, k: 1 }) }) }) else Parsed::Mk { node: fs.acc, next: fs.cell }
   proofs:
     purity:
-      reads : [fs.toks, fs.pos, fs.acc]
-      calls : [peek_kind, or_join, parse_and]
+      reads : [fs.cell, fs.acc]
+      calls : [peek_kind, or_join, parse_and, advance]
     termination:
       bound : 512
 
@@ -2391,10 +2395,10 @@ rule parse_or
     let first = parse_and(st)
     let first_node = parsed_node(first)
     let first_next = parsed_next(first)
-    out = or_rest(FoldState { toks: st.toks, pos: first_next, acc: first_node })
+    out = or_rest(FoldState { cell: first_next, acc: first_node })
   proofs:
     purity:
-      reads : [st, st.toks]
+      reads : [st]
       calls : [parse_and, or_rest, parsed_node, parsed_next]
     termination:
       bound : 512
@@ -2543,7 +2547,7 @@ rule shape
     out : number
   logic:
     let toks = tokenize(ScanState { source: s.source, pos: 0 })
-    let parsed = parse_or(ParseState { toks: toks, pos: 0 })
+    let parsed = parse_or(ParseState { cell: toks })
     let root = parsed_node(parsed)
     out = shape_ast(root)
   proofs:
@@ -2570,7 +2574,7 @@ rule eval_expr
     out : number
   logic:
     let toks = tokenize(ScanState { source: s.source, pos: 0 })
-    let parsed = parse_or(ParseState { toks: toks, pos: 0 })
+    let parsed = parse_or(ParseState { cell: toks })
     let root = parsed_node(parsed)
     out = eval_ast(root)
   proofs:
@@ -2676,11 +2680,11 @@ rule kind_at
     out : number
   logic:
     let toks = tokenize(ScanState { source: arg.source, pos: 0 })
-    out = peek_kind(Nth { lst: toks, n: arg.idx })
+    out = peek_kind(advance(Advance { lst: toks, k: arg.idx }))
   proofs:
     purity:
       reads : [arg.source, arg.idx]
-      calls : [tokenize, peek_kind]
+      calls : [tokenize, peek_kind, advance]
     termination:
       bound : 256
 
@@ -3191,11 +3195,11 @@ rule kind_at_indent
     out : number
   logic:
     let toks = begin_tokenize(ScanState { source: arg.source, pos: 0 })
-    out = peek_kind(Nth { lst: toks, n: arg.idx })
+    out = peek_kind(advance(Advance { lst: toks, k: arg.idx }))
   proofs:
     purity:
       reads : [arg.source, arg.idx]
-      calls : [begin_tokenize, peek_kind]
+      calls : [begin_tokenize, peek_kind, advance]
     termination:
       bound : 256
 
@@ -3327,7 +3331,7 @@ rule pb_next
   input:
     p : ParsedBlock
   output:
-    out : number
+    out : TokenList
   logic:
     out = match p:
       MkPB(block, next) => next
@@ -3349,20 +3353,20 @@ rule pb_next
 -- index scan, so it carries the bound + the mandatory recursion breadcrumb (the
 -- backstop is the finite token-list length, bounded by max_nodes).
 rule skip_seps
-  @intention: "Index of the first non-separator token at/after pos (skips Newline/Indent)"
+  @intention: "The cell at the first non-separator token at/after the cursor (skips Newline/Indent)"
   @source: vexprparse.intent:28
   input:
     st : ParseState
   output:
-    out : number
+    out : TokenList
   logic:
-    let knd = peek_kind(Nth { lst: st.toks, n: st.pos })
+    let knd = peek_kind(st.cell)
     let issep = if knd == 600 then 1 else if knd == 700 then 1 else 0
-    out = if issep == 1 then skip_seps(ParseState { toks: st.toks, pos: st.pos + 1 }) else st.pos
+    out = if issep == 1 then skip_seps(ParseState { cell: advance(Advance { lst: st.cell, k: 1 }) }) else st.cell
   proofs:
     purity:
-      reads : [st.toks, st.pos]
-      calls : [peek_kind, skip_seps]
+      reads : [st.cell]
+      calls : [peek_kind, skip_seps, advance]
     termination:
       bound : 512
 
@@ -3387,7 +3391,7 @@ rule stmt_let_join
   logic:
     let vnode = parsed_node(jl.value)
     let vnext = parsed_next(jl.value)
-    let rest = parse_stmts(ParseState { toks: jl.toks, pos: vnext })
+    let rest = parse_stmts(ParseState { cell: vnext })
     let rblock = pb_block(rest)
     let rbinds = block_binds(rblock)
     let rresult = block_result(rblock)
@@ -3395,7 +3399,7 @@ rule stmt_let_join
     out = ParsedBlock::MkPB { block: Block::MkBlock { binds: Binding::BCons { name_start: jl.name_start, name_len: jl.name_len, value: vnode, rest: rbinds }, result: rresult }, next: rnext }
   proofs:
     purity:
-      reads : [jl.toks, jl.name_start, jl.name_len, jl.value]
+      reads : [jl.name_start, jl.name_len, jl.value]
       calls : [parsed_node, parsed_next, parse_stmts, pb_block, block_binds, block_result, pb_next]
     termination:
       bound : 512
@@ -3426,16 +3430,16 @@ rule parse_stmts
   output:
     out : ParsedBlock
   logic:
-    let headp = skip_seps(ParseState { toks: st.toks, pos: st.pos })
-    let knd = peek_kind(Nth { lst: st.toks, n: headp })
+    let headp = skip_seps(ParseState { cell: st.cell })
+    let knd = peek_kind(headp)
     let islet = if knd == 204 then 1 else 0
-    let name_start = if islet == 1 then peek_start(Nth { lst: st.toks, n: headp + 1 }) else peek_start(Nth { lst: st.toks, n: headp })
-    let name_len = if islet == 1 then peek_len(Nth { lst: st.toks, n: headp + 1 }) else peek_len(Nth { lst: st.toks, n: headp })
-    out = if islet == 1 then stmt_let_join(LetJoinState { toks: st.toks, name_start: name_start, name_len: name_len, value: parse_or(ParseState { toks: st.toks, pos: headp + 3 }) }) else ParsedBlock::MkPB { block: Block::MkBlock { binds: Binding::BNil, result: parsed_node(parse_or(ParseState { toks: st.toks, pos: headp + 2 })) }, next: parsed_next(parse_or(ParseState { toks: st.toks, pos: headp + 2 })) }
+    let name_start = if islet == 1 then peek_start(advance(Advance { lst: headp, k: 1 })) else peek_start(headp)
+    let name_len = if islet == 1 then peek_len(advance(Advance { lst: headp, k: 1 })) else peek_len(headp)
+    out = if islet == 1 then stmt_let_join(LetJoinState { name_start: name_start, name_len: name_len, value: parse_or(ParseState { cell: advance(Advance { lst: headp, k: 3 }) }) }) else ParsedBlock::MkPB { block: Block::MkBlock { binds: Binding::BNil, result: parsed_node(parse_or(ParseState { cell: advance(Advance { lst: headp, k: 2 }) })) }, next: parsed_next(parse_or(ParseState { cell: advance(Advance { lst: headp, k: 2 }) })) }
   proofs:
     purity:
-      reads : [st.toks, st.pos]
-      calls : [skip_seps, peek_kind, peek_start, peek_len, stmt_let_join, parse_or, parsed_node, parsed_next]
+      reads : [st.cell]
+      calls : [skip_seps, peek_kind, peek_start, peek_len, stmt_let_join, parse_or, parsed_node, parsed_next, advance]
     termination:
       bound : 512
 
@@ -3534,7 +3538,7 @@ rule block_shape
     out : number
   logic:
     let toks = begin_tokenize(ScanState { source: a.source, pos: 0 })
-    let pb = parse_block(ParseState { toks: toks, pos: 0 })
+    let pb = parse_block(ParseState { cell: toks })
     let blk = pb_block(pb)
     let binds = block_binds(blk)
     let result = block_result(blk)
@@ -4033,7 +4037,7 @@ rule eval_block
     out : number
   logic:
     let toks = begin_tokenize(ScanState { source: s.source, pos: 0 })
-    let pb = parse_block(ParseState { toks: toks, pos: 0 })
+    let pb = parse_block(ParseState { cell: toks })
     let blk = pb_block(pb)
     let binds = block_binds(blk)
     let result = block_result(blk)
@@ -4116,10 +4120,10 @@ rule eval_block
 -- code). A group field (toks) + a text field (src) — the supported multi-field
 -- shape.
 concept RuleParseState
-  @intention: "The token list plus the source text, for parsing a rule declaration"
+  @intention: "The token list cursor cell plus the source text, for parsing a rule declaration"
   @source: vexprparse.intent:30
   fields:
-    toks : TokenList
+    cell : TokenList
     src : text [..256]
 
 
@@ -4131,12 +4135,11 @@ concept RuleParseState
 -- Brick 20: ParamParseState also carries the SOURCE TEXT so params_scan can read a
 -- type-name Ident span (after a `:`) and map it to a type code via type_code_of_span.
 concept ParamParseState
-  @intention: "The token list, the source text, plus the index where a parameter list may begin"
+  @intention: "The token list cursor cell plus the source text, where a parameter list may begin"
   @source: vexprparse.intent:34
   fields:
-    toks : TokenList
+    cell : TokenList
     src : text [..256]
-    pos : number [0, 512]
 
 
 -- A fixed-width span byte-check probe: the source text plus an Ident token's
@@ -4384,7 +4387,7 @@ rule pp_next
   input:
     p : ParsedParams
   output:
-    out : number
+    out : TokenList
   logic:
     out = match p:
       MkPP(params, next) => next
@@ -4459,22 +4462,22 @@ rule params_scan
   output:
     out : ParsedParams
   logic:
-    let name_start = peek_start(Nth { lst: ps.toks, n: ps.pos })
-    let name_len = peek_len(Nth { lst: ps.toks, n: ps.pos })
-    let colon_opc = peek_op_code(Nth { lst: ps.toks, n: ps.pos + 1 })
+    let name_start = peek_start(ps.cell)
+    let name_len = peek_len(ps.cell)
+    let colon_opc = peek_op_code(advance(Advance { lst: ps.cell, k: 1 }))
     let typed = if colon_opc == 10 then 1 else 0
-    let ty_start = peek_start(Nth { lst: ps.toks, n: ps.pos + 2 })
-    let ty_len = peek_len(Nth { lst: ps.toks, n: ps.pos + 2 })
+    let ty_start = peek_start(advance(Advance { lst: ps.cell, k: 2 }))
+    let ty_len = peek_len(advance(Advance { lst: ps.cell, k: 2 }))
     let ty = if typed == 1 then type_code_of_span(SpanCheck { src: ps.src, start: ty_start, len: ty_len }) else 0
-    let sep_pos = if typed == 1 then ps.pos + 3 else ps.pos + 1
-    let sep_opc = peek_op_code(Nth { lst: ps.toks, n: sep_pos })
+    let sep_pos = if typed == 1 then advance(Advance { lst: ps.cell, k: 3 }) else advance(Advance { lst: ps.cell, k: 1 })
+    let sep_opc = peek_op_code(sep_pos)
     let iscomma = if sep_opc == 11 then 1 else 0
-    let close_next = if sep_opc == 22 then sep_pos + 1 else sep_pos
-    out = if iscomma == 1 then params_prepend(ParamPrependState { head_start: name_start, head_len: name_len, head_ty: ty, rest: params_scan(ParamParseState { toks: ps.toks, src: ps.src, pos: sep_pos + 1 }) }) else ParsedParams::MkPP { params: ParamList::PCons { name_start: name_start, name_len: name_len, ty: ty, rest: ParamList::PNil }, next: close_next }
+    let close_next = if sep_opc == 22 then advance(Advance { lst: sep_pos, k: 1 }) else sep_pos
+    out = if iscomma == 1 then params_prepend(ParamPrependState { head_start: name_start, head_len: name_len, head_ty: ty, rest: params_scan(ParamParseState { cell: advance(Advance { lst: sep_pos, k: 1 }), src: ps.src }) }) else ParsedParams::MkPP { params: ParamList::PCons { name_start: name_start, name_len: name_len, ty: ty, rest: ParamList::PNil }, next: close_next }
   proofs:
     purity:
-      reads : [ps.toks, ps.src, ps.pos]
-      calls : [peek_start, peek_len, peek_op_code, type_code_of_span, params_prepend, params_scan]
+      reads : [ps.cell, ps.src]
+      calls : [peek_start, peek_len, peek_op_code, type_code_of_span, params_prepend, params_scan, advance]
     termination:
       bound : 512
 
@@ -4497,15 +4500,15 @@ rule parse_params
   output:
     out : ParsedParams
   logic:
-    let opc = peek_op_code(Nth { lst: ps.toks, n: ps.pos })
+    let opc = peek_op_code(ps.cell)
     let isopen = if opc == 21 then 1 else 0
-    let next_opc = peek_op_code(Nth { lst: ps.toks, n: ps.pos + 1 })
+    let next_opc = peek_op_code(advance(Advance { lst: ps.cell, k: 1 }))
     let isempty = if next_opc == 22 then 1 else 0
-    out = if isopen == 0 then ParsedParams::MkPP { params: ParamList::PNil, next: ps.pos } else (if isempty == 1 then ParsedParams::MkPP { params: ParamList::PNil, next: ps.pos + 2 } else params_scan(ParamParseState { toks: ps.toks, src: ps.src, pos: ps.pos + 1 }))
+    out = if isopen == 0 then ParsedParams::MkPP { params: ParamList::PNil, next: ps.cell } else (if isempty == 1 then ParsedParams::MkPP { params: ParamList::PNil, next: advance(Advance { lst: ps.cell, k: 2 }) } else params_scan(ParamParseState { cell: advance(Advance { lst: ps.cell, k: 1 }), src: ps.src }))
   proofs:
     purity:
-      reads : [ps.toks, ps.src, ps.pos]
-      calls : [peek_op_code, params_scan]
+      reads : [ps.cell, ps.src]
+      calls : [peek_op_code, params_scan, advance]
     termination:
       bound : 16
 
@@ -4538,33 +4541,33 @@ rule parse_rule_decl
   output:
     out : RuleDecl
   logic:
-    let name_start = peek_start(Nth { lst: rp.toks, n: 1 })
-    let name_len = peek_len(Nth { lst: rp.toks, n: 1 })
-    let kw_start = peek_start(Nth { lst: rp.toks, n: 0 })
-    let kw_len = peek_len(Nth { lst: rp.toks, n: 0 })
+    let name_start = peek_start(advance(Advance { lst: rp.cell, k: 1 }))
+    let name_len = peek_len(advance(Advance { lst: rp.cell, k: 1 }))
+    let kw_start = peek_start(rp.cell)
+    let kw_len = peek_len(rp.cell)
     let is_rule = span_is_rule(SpanCheck { src: rp.src, start: kw_start, len: kw_len })
-    let pp = parse_params(ParamParseState { toks: rp.toks, src: rp.src, pos: 2 })
+    let pp = parse_params(ParamParseState { cell: advance(Advance { lst: rp.cell, k: 2 }), src: rp.src })
     let params = pp_params(pp)
     let after_params = pp_next(pp)
-    let ret_colon = peek_op_code(Nth { lst: rp.toks, n: after_params })
+    let ret_colon = peek_op_code(after_params)
     let typed_ret = if ret_colon == 10 then 1 else 0
-    let ret_ty_start = peek_start(Nth { lst: rp.toks, n: after_params + 1 })
-    let ret_ty_len = peek_len(Nth { lst: rp.toks, n: after_params + 1 })
+    let ret_ty_start = peek_start(advance(Advance { lst: after_params, k: 1 }))
+    let ret_ty_len = peek_len(advance(Advance { lst: after_params, k: 1 }))
     let return_type = if typed_ret == 1 then type_code_of_span(SpanCheck { src: rp.src, start: ret_ty_start, len: ret_ty_len }) else 9
-    let after_ret = if typed_ret == 1 then after_params + 2 else after_params
-    let logic_idx = skip_seps(ParseState { toks: rp.toks, pos: after_ret })
-    let logic_start = peek_start(Nth { lst: rp.toks, n: logic_idx })
-    let logic_len = peek_len(Nth { lst: rp.toks, n: logic_idx })
+    let after_ret = if typed_ret == 1 then advance(Advance { lst: after_params, k: 2 }) else after_params
+    let logic_idx = skip_seps(ParseState { cell: after_ret })
+    let logic_start = peek_start(logic_idx)
+    let logic_len = peek_len(logic_idx)
     let is_logic = span_is_logic(SpanCheck { src: rp.src, start: logic_start, len: logic_len })
     let hdr_ok = if is_rule == 1 and is_logic == 1 then 1 else 0
-    let body_idx = skip_seps(ParseState { toks: rp.toks, pos: logic_idx + 2 })
-    let pb = parse_stmts(ParseState { toks: rp.toks, pos: body_idx })
+    let body_idx = skip_seps(ParseState { cell: advance(Advance { lst: logic_idx, k: 2 }) })
+    let pb = parse_stmts(ParseState { cell: body_idx })
     let goodblk = pb_block(pb)
     out = RuleDecl::MkRule { name_start: name_start, name_len: name_len, params: params, return_type: return_type, body: if hdr_ok == 1 then goodblk else Block::MkBlock { binds: Binding::BNil, result: Ast::AstErr } }
   proofs:
     purity:
-      reads : [rp.toks, rp.src]
-      calls : [peek_start, peek_len, span_is_rule, parse_params, pp_params, pp_next, peek_op_code, type_code_of_span, span_is_logic, skip_seps, parse_stmts, pb_block]
+      reads : [rp.cell, rp.src]
+      calls : [peek_start, peek_len, span_is_rule, parse_params, pp_params, pp_next, peek_op_code, type_code_of_span, span_is_logic, skip_seps, parse_stmts, pb_block, advance]
     termination:
       bound : 64
 
@@ -4589,7 +4592,7 @@ rule eval_rule_decl
     out : number
   logic:
     let toks = begin_tokenize(ScanState { source: s.source, pos: 0 })
-    let rd = parse_rule_decl(RuleParseState { toks: toks, src: s.source })
+    let rd = parse_rule_decl(RuleParseState { cell: toks, src: s.source })
     let blk = rd_body(rd)
     let binds = block_binds(blk)
     let result = block_result(blk)
@@ -4618,7 +4621,7 @@ rule rule_shape
     out : number
   logic:
     let toks = begin_tokenize(ScanState { source: a.source, pos: 0 })
-    let rd = parse_rule_decl(RuleParseState { toks: toks, src: a.source })
+    let rd = parse_rule_decl(RuleParseState { cell: toks, src: a.source })
     let nlen = rd_name_len(rd)
     let blk = rd_body(rd)
     let binds = block_binds(blk)
@@ -4688,12 +4691,11 @@ rule rule_shape
 -- A group field (toks) + a text field (src) + a number (pos) — the supported
 -- multi-field shape (same as RuleParseState plus a cursor).
 concept ProgramState
-  @intention: "The token list, source text, and current index, for parsing a program"
+  @intention: "The token list cursor cell plus the source text, for parsing a program"
   @source: vexprparse.intent:31
   fields:
-    toks : TokenList
+    cell : TokenList
     src : text [..256]
-    pos : number [0, 512]
 
 
 -- The eval-nth-rule driver state: a multi-line source plus the rule index n.
@@ -4715,20 +4717,20 @@ concept EvalNthState
 -- finite end of the token list); bound + the mandatory recursion breadcrumb (the
 -- backstop is the finite token-list length, bounded by max_nodes).
 rule skip_seps_dedent
-  @intention: "Index of the first non-separator token at/after pos (skips Newline/Indent/Dedent)"
+  @intention: "The cell at the first non-separator token at/after the cursor (skips Newline/Indent/Dedent)"
   @source: vexprparse.intent:31
   input:
     st : ParseState
   output:
-    out : number
+    out : TokenList
   logic:
-    let knd = peek_kind(Nth { lst: st.toks, n: st.pos })
+    let knd = peek_kind(st.cell)
     let issep = if knd == 600 then 1 else if knd == 700 then 1 else if knd == 800 then 1 else 0
-    out = if issep == 1 then skip_seps_dedent(ParseState { toks: st.toks, pos: st.pos + 1 }) else st.pos
+    out = if issep == 1 then skip_seps_dedent(ParseState { cell: advance(Advance { lst: st.cell, k: 1 }) }) else st.cell
   proofs:
     purity:
-      reads : [st.toks, st.pos]
-      calls : [peek_kind, skip_seps_dedent]
+      reads : [st.cell]
+      calls : [peek_kind, skip_seps_dedent, advance]
     termination:
       bound : 512
 
@@ -4759,7 +4761,7 @@ rule pr_next
   input:
     p : ParsedRule
   output:
-    out : number
+    out : TokenList
   logic:
     out = match p:
       MkPR(rule, next) => next
@@ -4796,34 +4798,34 @@ rule parse_rule_decl_pos
   output:
     out : ParsedRule
   logic:
-    let kw_start = peek_start(Nth { lst: ps.toks, n: ps.pos })
-    let kw_len = peek_len(Nth { lst: ps.toks, n: ps.pos })
+    let kw_start = peek_start(ps.cell)
+    let kw_len = peek_len(ps.cell)
     let is_rule = span_is_rule(SpanCheck { src: ps.src, start: kw_start, len: kw_len })
-    let name_start = peek_start(Nth { lst: ps.toks, n: ps.pos + 1 })
-    let name_len = peek_len(Nth { lst: ps.toks, n: ps.pos + 1 })
-    let pp = parse_params(ParamParseState { toks: ps.toks, src: ps.src, pos: ps.pos + 2 })
+    let name_start = peek_start(advance(Advance { lst: ps.cell, k: 1 }))
+    let name_len = peek_len(advance(Advance { lst: ps.cell, k: 1 }))
+    let pp = parse_params(ParamParseState { cell: advance(Advance { lst: ps.cell, k: 2 }), src: ps.src })
     let params = pp_params(pp)
     let after_params = pp_next(pp)
-    let ret_colon = peek_op_code(Nth { lst: ps.toks, n: after_params })
+    let ret_colon = peek_op_code(after_params)
     let typed_ret = if ret_colon == 10 then 1 else 0
-    let ret_ty_start = peek_start(Nth { lst: ps.toks, n: after_params + 1 })
-    let ret_ty_len = peek_len(Nth { lst: ps.toks, n: after_params + 1 })
+    let ret_ty_start = peek_start(advance(Advance { lst: after_params, k: 1 }))
+    let ret_ty_len = peek_len(advance(Advance { lst: after_params, k: 1 }))
     let return_type = if typed_ret == 1 then type_code_of_span(SpanCheck { src: ps.src, start: ret_ty_start, len: ret_ty_len }) else 9
-    let after_ret = if typed_ret == 1 then after_params + 2 else after_params
-    let logic_idx = skip_seps(ParseState { toks: ps.toks, pos: after_ret })
-    let logic_start = peek_start(Nth { lst: ps.toks, n: logic_idx })
-    let logic_len = peek_len(Nth { lst: ps.toks, n: logic_idx })
+    let after_ret = if typed_ret == 1 then advance(Advance { lst: after_params, k: 2 }) else after_params
+    let logic_idx = skip_seps(ParseState { cell: after_ret })
+    let logic_start = peek_start(logic_idx)
+    let logic_len = peek_len(logic_idx)
     let is_logic = span_is_logic(SpanCheck { src: ps.src, start: logic_start, len: logic_len })
     let hdr_ok = if is_rule == 1 and is_logic == 1 then 1 else 0
-    let body_idx = skip_seps(ParseState { toks: ps.toks, pos: logic_idx + 2 })
-    let pb = parse_stmts(ParseState { toks: ps.toks, pos: body_idx })
+    let body_idx = skip_seps(ParseState { cell: advance(Advance { lst: logic_idx, k: 2 }) })
+    let pb = parse_stmts(ParseState { cell: body_idx })
     let goodblk = pb_block(pb)
     let endp = pb_next(pb)
     out = ParsedRule::MkPR { rule: RuleDecl::MkRule { name_start: name_start, name_len: name_len, params: params, return_type: return_type, body: if hdr_ok == 1 then goodblk else Block::MkBlock { binds: Binding::BNil, result: Ast::AstErr } }, next: endp }
   proofs:
     purity:
-      reads : [ps.toks, ps.src, ps.pos]
-      calls : [peek_start, peek_len, span_is_rule, parse_params, pp_params, pp_next, peek_op_code, type_code_of_span, span_is_logic, skip_seps, parse_stmts, pb_block, pb_next]
+      reads : [ps.cell, ps.src]
+      calls : [peek_start, peek_len, span_is_rule, parse_params, pp_params, pp_next, peek_op_code, type_code_of_span, span_is_logic, skip_seps, parse_stmts, pb_block, pb_next, advance]
     termination:
       bound : 64
 
@@ -4861,20 +4863,20 @@ rule parse_program
   output:
     out : RuleList
   logic:
-    let hp = skip_seps_dedent(ParseState { toks: ps.toks, pos: ps.pos })
-    let kw_start = peek_start(Nth { lst: ps.toks, n: hp })
-    let kw_len = peek_len(Nth { lst: ps.toks, n: hp })
+    let hp = skip_seps_dedent(ParseState { cell: ps.cell })
+    let kw_start = peek_start(hp)
+    let kw_len = peek_len(hp)
     let is_rule = span_is_rule(SpanCheck { src: ps.src, start: kw_start, len: kw_len })
     let is_concept = span_is_concept(SpanCheck { src: ps.src, start: kw_start, len: kw_len })
-    let pr = parse_rule_decl_pos(ProgramState { toks: ps.toks, src: ps.src, pos: hp })
+    let pr = parse_rule_decl_pos(ProgramState { cell: hp, src: ps.src })
     let rd = pr_rule(pr)
     let endp = pr_next(pr)
-    let pc = parse_concept_decl_pos(ProgramState { toks: ps.toks, src: ps.src, pos: hp })
+    let pc = parse_concept_decl_pos(ProgramState { cell: hp, src: ps.src })
     let cend = pc_next(pc)
-    out = if is_rule == 1 then RuleList::RCons { head: rd, tail: parse_program(ProgramState { toks: ps.toks, src: ps.src, pos: endp }) } else (if is_concept == 1 then parse_program(ProgramState { toks: ps.toks, src: ps.src, pos: cend }) else RuleList::RNil)
+    out = if is_rule == 1 then RuleList::RCons { head: rd, tail: parse_program(ProgramState { cell: endp, src: ps.src }) } else (if is_concept == 1 then parse_program(ProgramState { cell: cend, src: ps.src }) else RuleList::RNil)
   proofs:
     purity:
-      reads : [ps.toks, ps.src, ps.pos]
+      reads : [ps.cell, ps.src]
       calls : [skip_seps_dedent, peek_start, peek_len, span_is_rule, span_is_concept, parse_rule_decl_pos, pr_rule, pr_next, parse_concept_decl_pos, pc_next, parse_program]
     termination:
       bound : 512
@@ -4933,12 +4935,11 @@ rule rule_list_len
 -- name byte recognition via type_code_of_span), and the current scan index. Same
 -- multi-field shape as ProgramState.
 concept FieldParseState
-  @intention: "The token list, source text, and current index, for parsing a fields block"
+  @intention: "The token list cursor cell plus the source text, for parsing a fields block"
   @source: vexprparse.intent:62
   fields:
-    toks : TokenList
+    cell : TokenList
     src : text [..256]
-    pos : number [0, 512]
 
 
 -- parse_fields: parse the body of a `fields:` block into a FieldList, starting at
@@ -4952,27 +4953,99 @@ concept FieldParseState
 -- FIELD fits), so bound + the mandatory recursion breadcrumb (the backstop is the
 -- finite token list, bounded by max_nodes). Every peek is OOB-guarded by the
 -- token-list accessors (Eof past the end).
+-- Accessors for a ParsedFields result (block-form match only in final position).
+rule pf_fields
+  @intention: "The FieldList from a fields-block parse result"
+  @source: vexprparse.intent:62
+  input:
+    p : ParsedFields
+  output:
+    out : FieldList
+  logic:
+    out = match p:
+      MkPF(fields, next) => fields
+  proofs:
+    purity:
+      reads : [p]
+      calls : []
+    termination:
+      bound : 16
+
+
+rule pf_next
+  @intention: "The end cell just past a fields-block parse result"
+  @source: vexprparse.intent:62
+  input:
+    p : ParsedFields
+  output:
+    out : TokenList
+  logic:
+    out = match p:
+      MkPF(fields, next) => next
+  proofs:
+    purity:
+      reads : [p]
+      calls : []
+    termination:
+      bound : 16
+
+
+-- A field-cons continuation state: the head field's span + type plus the parsed
+-- REST of the field list (as a ParsedFields). fields_cons consumes this — conses
+-- the head onto the rest's FieldList, carrying the rest's end cell through.
+-- Splitting this out of parse_fields keeps the recursive parse_fields call lazily
+-- inside the Ident branch (a let would force it eagerly), exactly like args_cons /
+-- args_prepend in the call-argument parser.
+concept FieldConsState
+  @intention: "Head field span + type + the parsed rest of the field list"
+  @source: vexprparse.intent:62
+  fields:
+    head_start : number [0, 256]
+    head_len : number [0, 256]
+    head_ty : number [0, 64]
+    rest : ParsedFields
+
+
+rule fields_cons
+  @intention: "Cons the head field onto the front of the parsed rest of the field list"
+  @source: vexprparse.intent:62
+  input:
+    fc : FieldConsState
+  output:
+    out : ParsedFields
+  logic:
+    let rest_list = pf_fields(fc.rest)
+    let rest_next = pf_next(fc.rest)
+    out = ParsedFields::MkPF { fields: FieldList::FCons { name_start: fc.head_start, name_len: fc.head_len, ty: fc.head_ty, rest: rest_list }, next: rest_next }
+  proofs:
+    purity:
+      reads : [fc.head_start, fc.head_len, fc.head_ty, fc.rest]
+      calls : [pf_fields, pf_next]
+    termination:
+      bound : 16
+
+
 rule parse_fields
-  @intention: "Parse the body of a fields: block into a FieldList (one FCons per IDENT : TYPE line)"
+  @intention: "Parse the body of a fields: block into a FieldList + its end cell (one FCons per IDENT : TYPE line)"
   @source: vexprparse.intent:62
   input:
     fp : FieldParseState
   output:
-    out : FieldList
+    out : ParsedFields
   logic:
-    let hp = skip_seps(ParseState { toks: fp.toks, pos: fp.pos })
-    let knd = peek_kind(Nth { lst: fp.toks, n: hp })
+    let hp = skip_seps(ParseState { cell: fp.cell })
+    let knd = peek_kind(hp)
     let is_field = if knd == 100 then 1 else 0
-    let name_start = peek_start(Nth { lst: fp.toks, n: hp })
-    let name_len = peek_len(Nth { lst: fp.toks, n: hp })
-    let ty_start = peek_start(Nth { lst: fp.toks, n: hp + 2 })
-    let ty_len = peek_len(Nth { lst: fp.toks, n: hp + 2 })
+    let name_start = peek_start(hp)
+    let name_len = peek_len(hp)
+    let ty_start = peek_start(advance(Advance { lst: hp, k: 2 }))
+    let ty_len = peek_len(advance(Advance { lst: hp, k: 2 }))
     let ty = type_code_of_span(SpanCheck { src: fp.src, start: ty_start, len: ty_len })
-    out = if is_field == 1 then FieldList::FCons { name_start: name_start, name_len: name_len, ty: ty, rest: parse_fields(FieldParseState { toks: fp.toks, src: fp.src, pos: hp + 3 }) } else FieldList::FNil
+    out = if is_field == 1 then fields_cons(FieldConsState { head_start: name_start, head_len: name_len, head_ty: ty, rest: parse_fields(FieldParseState { cell: advance(Advance { lst: hp, k: 3 }), src: fp.src }) }) else ParsedFields::MkPF { fields: FieldList::FNil, next: hp }
   proofs:
     purity:
-      reads : [fp.toks, fp.src, fp.pos]
-      calls : [skip_seps, peek_kind, peek_start, peek_len, type_code_of_span, parse_fields]
+      reads : [fp.cell, fp.src]
+      calls : [skip_seps, peek_kind, peek_start, peek_len, type_code_of_span, parse_fields, fields_cons, advance]
     termination:
       bound : 512
 
@@ -5003,7 +5076,7 @@ rule pc_next
   input:
     p : ParsedConcept
   output:
-    out : number
+    out : TokenList
   logic:
     out = match p:
       MkPC(concept, next) => next
@@ -5123,25 +5196,25 @@ rule parse_concept_decl_pos
   output:
     out : ParsedConcept
   logic:
-    let kw_start = peek_start(Nth { lst: ps.toks, n: ps.pos })
-    let kw_len = peek_len(Nth { lst: ps.toks, n: ps.pos })
+    let kw_start = peek_start(ps.cell)
+    let kw_len = peek_len(ps.cell)
     let is_concept = span_is_concept(SpanCheck { src: ps.src, start: kw_start, len: kw_len })
-    let name_start = peek_start(Nth { lst: ps.toks, n: ps.pos + 1 })
-    let name_len = peek_len(Nth { lst: ps.toks, n: ps.pos + 1 })
-    let fields_idx = skip_seps(ParseState { toks: ps.toks, pos: ps.pos + 2 })
-    let fields_start = peek_start(Nth { lst: ps.toks, n: fields_idx })
-    let fields_len = peek_len(Nth { lst: ps.toks, n: fields_idx })
+    let name_start = peek_start(advance(Advance { lst: ps.cell, k: 1 }))
+    let name_len = peek_len(advance(Advance { lst: ps.cell, k: 1 }))
+    let fields_idx = skip_seps(ParseState { cell: advance(Advance { lst: ps.cell, k: 2 }) })
+    let fields_start = peek_start(fields_idx)
+    let fields_len = peek_len(fields_idx)
     let is_fields = span_is_fields(SpanCheck { src: ps.src, start: fields_start, len: fields_len })
     let hdr_ok = if is_concept == 1 and is_fields == 1 then 1 else 0
-    let body_idx = skip_seps(ParseState { toks: ps.toks, pos: fields_idx + 2 })
-    let fl = parse_fields(FieldParseState { toks: ps.toks, src: ps.src, pos: body_idx })
-    let nfields = field_list_len(fl)
-    let endp = body_idx + 4 * nfields
+    let body_idx = skip_seps(ParseState { cell: advance(Advance { lst: fields_idx, k: 2 }) })
+    let pfields = parse_fields(FieldParseState { cell: body_idx, src: ps.src })
+    let fl = pf_fields(pfields)
+    let endp = pf_next(pfields)
     out = ParsedConcept::MkPC { concept: Concept::MkConcept { name_start: name_start, name_len: name_len, fields: if hdr_ok == 1 then fl else FieldList::FNil }, next: endp }
   proofs:
     purity:
-      reads : [ps.toks, ps.src, ps.pos]
-      calls : [peek_start, peek_len, span_is_concept, skip_seps, span_is_fields, parse_fields, field_list_len]
+      reads : [ps.cell, ps.src]
+      calls : [peek_start, peek_len, span_is_concept, skip_seps, span_is_fields, parse_fields, pf_fields, pf_next, advance]
     termination:
       bound : 64
 
@@ -5157,11 +5230,11 @@ rule parse_concept_decl
   output:
     out : Concept
   logic:
-    let pc = parse_concept_decl_pos(ProgramState { toks: rp.toks, src: rp.src, pos: 0 })
+    let pc = parse_concept_decl_pos(ProgramState { cell: rp.cell, src: rp.src })
     out = pc_concept(pc)
   proofs:
     purity:
-      reads : [rp.toks, rp.src]
+      reads : [rp.cell, rp.src]
       calls : [parse_concept_decl_pos, pc_concept]
     termination:
       bound : 64
@@ -5191,20 +5264,20 @@ rule parse_concepts
   output:
     out : ConceptList
   logic:
-    let hp = skip_seps_dedent(ParseState { toks: ps.toks, pos: ps.pos })
-    let kw_start = peek_start(Nth { lst: ps.toks, n: hp })
-    let kw_len = peek_len(Nth { lst: ps.toks, n: hp })
+    let hp = skip_seps_dedent(ParseState { cell: ps.cell })
+    let kw_start = peek_start(hp)
+    let kw_len = peek_len(hp)
     let is_concept = span_is_concept(SpanCheck { src: ps.src, start: kw_start, len: kw_len })
     let is_rule = span_is_rule(SpanCheck { src: ps.src, start: kw_start, len: kw_len })
-    let pc = parse_concept_decl_pos(ProgramState { toks: ps.toks, src: ps.src, pos: hp })
+    let pc = parse_concept_decl_pos(ProgramState { cell: hp, src: ps.src })
     let cd = pc_concept(pc)
     let cend = pc_next(pc)
-    let pr = parse_rule_decl_pos(ProgramState { toks: ps.toks, src: ps.src, pos: hp })
+    let pr = parse_rule_decl_pos(ProgramState { cell: hp, src: ps.src })
     let rend = pr_next(pr)
-    out = if is_concept == 1 then ConceptList::CCons { head: cd, tail: parse_concepts(ProgramState { toks: ps.toks, src: ps.src, pos: cend }) } else (if is_rule == 1 then parse_concepts(ProgramState { toks: ps.toks, src: ps.src, pos: rend }) else ConceptList::CNil)
+    out = if is_concept == 1 then ConceptList::CCons { head: cd, tail: parse_concepts(ProgramState { cell: cend, src: ps.src }) } else (if is_rule == 1 then parse_concepts(ProgramState { cell: rend, src: ps.src }) else ConceptList::CNil)
   proofs:
     purity:
-      reads : [ps.toks, ps.src, ps.pos]
+      reads : [ps.cell, ps.src]
       calls : [skip_seps_dedent, peek_start, peek_len, span_is_concept, span_is_rule, parse_concept_decl_pos, pc_concept, pc_next, parse_rule_decl_pos, pr_next, parse_concepts]
     termination:
       bound : 512
@@ -5310,7 +5383,7 @@ rule count_concepts
     out : number
   logic:
     let toks = begin_tokenize(ScanState { source: s.source, pos: 0 })
-    let cl = parse_concepts(ProgramState { toks: toks, src: s.source, pos: 0 })
+    let cl = parse_concepts(ProgramState { cell: toks, src: s.source })
     out = concept_list_len(cl)
   proofs:
     purity:
@@ -5337,7 +5410,7 @@ rule concept_field_count
     out : number
   logic:
     let toks = begin_tokenize(ScanState { source: s.source, pos: 0 })
-    let cl = parse_concepts(ProgramState { toks: toks, src: s.source, pos: 0 })
+    let cl = parse_concepts(ProgramState { cell: toks, src: s.source })
     let fields = cl_head_fields(cl)
     out = field_list_len(fields)
   proofs:
@@ -5484,7 +5557,7 @@ rule count_rules
     out : number
   logic:
     let toks = begin_tokenize(ScanState { source: s.source, pos: 0 })
-    let prog = parse_program(ProgramState { toks: toks, src: s.source, pos: 0 })
+    let prog = parse_program(ProgramState { cell: toks, src: s.source })
     out = rule_list_len(prog)
   proofs:
     purity:
@@ -5513,7 +5586,7 @@ rule rule_param_count
     out : number
   logic:
     let toks = begin_tokenize(ScanState { source: s.source, pos: 0 })
-    let prog = parse_program(ProgramState { toks: toks, src: s.source, pos: 0 })
+    let prog = parse_program(ProgramState { cell: toks, src: s.source })
     let params = rl_head_params(prog)
     out = param_list_len(params)
   proofs:
@@ -5551,7 +5624,7 @@ rule rule_return_type
     out : number
   logic:
     let toks = begin_tokenize(ScanState { source: s.source, pos: 0 })
-    let prog = parse_program(ProgramState { toks: toks, src: s.source, pos: 0 })
+    let prog = parse_program(ProgramState { cell: toks, src: s.source })
     out = rl_head_return_type(prog)
   proofs:
     purity:
@@ -5619,7 +5692,7 @@ rule nth_param_type
     out : number
   logic:
     let toks = begin_tokenize(ScanState { source: s.source, pos: 0 })
-    let prog = parse_program(ProgramState { toks: toks, src: s.source, pos: 0 })
+    let prog = parse_program(ProgramState { cell: toks, src: s.source })
     let params = rl_head_params(prog)
     out = param_nth_type(ParamNthState { params: params, n: s.pos })
   proofs:
@@ -5651,7 +5724,7 @@ rule eval_nth_rule
     out : number
   logic:
     let toks = begin_tokenize(ScanState { source: e.source, pos: 0 })
-    let prog = parse_program(ProgramState { toks: toks, src: e.source, pos: 0 })
+    let prog = parse_program(ProgramState { cell: toks, src: e.source })
     let nth = drop_rules(DropRules { rl: prog, n: e.n })
     let blk = rl_head_body(nth)
     let binds = block_binds(blk)
@@ -5730,7 +5803,7 @@ rule eval_main
     out : number
   logic:
     let toks = begin_tokenize(ScanState { source: s.source, pos: 0 })
-    let prog = parse_program(ProgramState { toks: toks, src: s.source, pos: 0 })
+    let prog = parse_program(ProgramState { cell: toks, src: s.source })
     let body = rl_head_body(prog)
     let binds = block_binds(body)
     let result = block_result(body)
@@ -6170,7 +6243,7 @@ rule lint_program
     out : number
   logic:
     let toks = begin_tokenize(ScanState { source: s.source, pos: 0 })
-    let prog = parse_program(ProgramState { toks: toks, src: s.source, pos: 0 })
+    let prog = parse_program(ProgramState { cell: toks, src: s.source })
     out = lint_list(LintListState { rl: prog, src: s.source })
   proofs:
     purity:
@@ -6489,7 +6562,7 @@ rule lint_callees
     out : number
   logic:
     let toks = begin_tokenize(ScanState { source: s.source, pos: 0 })
-    let prog = parse_program(ProgramState { toks: toks, src: s.source, pos: 0 })
+    let prog = parse_program(ProgramState { cell: toks, src: s.source })
     out = lint_callees_list(LintCalleesState { iter: prog, all: prog, src: s.source })
   proofs:
     purity:
@@ -6881,7 +6954,7 @@ rule lint_arity
     out : number
   logic:
     let toks = begin_tokenize(ScanState { source: s.source, pos: 0 })
-    let prog = parse_program(ProgramState { toks: toks, src: s.source, pos: 0 })
+    let prog = parse_program(ProgramState { cell: toks, src: s.source })
     out = lint_arity_list(LintArityState { iter: prog, all: prog, src: s.source })
   proofs:
     purity:
@@ -7296,7 +7369,7 @@ rule type_check
     out : number
   logic:
     let toks = begin_tokenize(ScanState { source: s.source, pos: 0 })
-    let prog = parse_program(ProgramState { toks: toks, src: s.source, pos: 0 })
+    let prog = parse_program(ProgramState { cell: toks, src: s.source })
     out = tcheck_list(TCheckListState { iter: prog, prog: prog, src: s.source })
   proofs:
     purity:
@@ -7697,7 +7770,7 @@ rule argtype_check
     out : number
   logic:
     let toks = begin_tokenize(ScanState { source: s.source, pos: 0 })
-    let prog = parse_program(ProgramState { toks: toks, src: s.source, pos: 0 })
+    let prog = parse_program(ProgramState { cell: toks, src: s.source })
     out = argtype_list(ArgTypeListState { iter: prog, all: prog, src: s.source })
   proofs:
     purity:
@@ -7749,7 +7822,7 @@ rule check_program
     out : number
   logic:
     let toks = begin_tokenize(ScanState { source: s.source, pos: 0 })
-    let prog = parse_program(ProgramState { toks: toks, src: s.source, pos: 0 })
+    let prog = parse_program(ProgramState { cell: toks, src: s.source })
     let e_undef = lint_list(LintListState { rl: prog, src: s.source })
     let e_callee = lint_callees_list(LintCalleesState { iter: prog, all: prog, src: s.source })
     let e_arity = lint_arity_list(LintArityState { iter: prog, all: prog, src: s.source })
@@ -7976,7 +8049,7 @@ rule first_bad_rule
     out : number
   logic:
     let toks = begin_tokenize(ScanState { source: s.source, pos: 0 })
-    let prog = parse_program(ProgramState { toks: toks, src: s.source, pos: 0 })
+    let prog = parse_program(ProgramState { cell: toks, src: s.source })
     let d = find_diag(FindDiagState { iter: prog, all: prog, src: s.source, idx: 0 })
     out = diag_index(d)
   proofs:
@@ -8000,7 +8073,7 @@ rule first_bad_category
     out : number
   logic:
     let toks = begin_tokenize(ScanState { source: s.source, pos: 0 })
-    let prog = parse_program(ProgramState { toks: toks, src: s.source, pos: 0 })
+    let prog = parse_program(ProgramState { cell: toks, src: s.source })
     let d = find_diag(FindDiagState { iter: prog, all: prog, src: s.source, idx: 0 })
     out = diag_cat(d)
   proofs:
@@ -8351,7 +8424,7 @@ rule all_diags_count
     out : number
   logic:
     let toks = begin_tokenize(ScanState { source: s.source, pos: 0 })
-    let prog = parse_program(ProgramState { toks: toks, src: s.source, pos: 0 })
+    let prog = parse_program(ProgramState { cell: toks, src: s.source })
     out = diag_count(prog_diags(ProgDiagsState { iter: prog, all: prog, src: s.source, idx: 0 }))
   proofs:
     purity:
@@ -8373,7 +8446,7 @@ rule nth_diag_at_rule
     out : number
   logic:
     let toks = begin_tokenize(ScanState { source: s.source, pos: 0 })
-    let prog = parse_program(ProgramState { toks: toks, src: s.source, pos: 0 })
+    let prog = parse_program(ProgramState { cell: toks, src: s.source })
     out = nth_diag_rule(DiagNthState { list: prog_diags(ProgDiagsState { iter: prog, all: prog, src: s.source, idx: 0 }), n: s.pos })
   proofs:
     purity:
@@ -8396,7 +8469,7 @@ rule nth_diag_at_cat
     out : number
   logic:
     let toks = begin_tokenize(ScanState { source: s.source, pos: 0 })
-    let prog = parse_program(ProgramState { toks: toks, src: s.source, pos: 0 })
+    let prog = parse_program(ProgramState { cell: toks, src: s.source })
     out = nth_diag_cat(DiagNthState { list: prog_diags(ProgDiagsState { iter: prog, all: prog, src: s.source, idx: 0 }), n: s.pos })
   proofs:
     purity:
@@ -8433,7 +8506,7 @@ rule nth_diag_at_span_start
     out : number
   logic:
     let toks = begin_tokenize(ScanState { source: s.source, pos: 0 })
-    let prog = parse_program(ProgramState { toks: toks, src: s.source, pos: 0 })
+    let prog = parse_program(ProgramState { cell: toks, src: s.source })
     out = nth_diag_span_start(DiagNthState { list: prog_diags(ProgDiagsState { iter: prog, all: prog, src: s.source, idx: 0 }), n: s.pos })
   proofs:
     purity:
@@ -8456,7 +8529,7 @@ rule nth_diag_at_span_len
     out : number
   logic:
     let toks = begin_tokenize(ScanState { source: s.source, pos: 0 })
-    let prog = parse_program(ProgramState { toks: toks, src: s.source, pos: 0 })
+    let prog = parse_program(ProgramState { cell: toks, src: s.source })
     out = nth_diag_span_len(DiagNthState { list: prog_diags(ProgDiagsState { iter: prog, all: prog, src: s.source, idx: 0 }), n: s.pos })
   proofs:
     purity:
@@ -9197,7 +9270,7 @@ rule undef_span_start_of
     out : number
   logic:
     let toks = begin_tokenize(ScanState { source: s.source, pos: 0 })
-    let prog = parse_program(ProgramState { toks: toks, src: s.source, pos: 0 })
+    let prog = parse_program(ProgramState { cell: toks, src: s.source })
     out = span_start(undef_span_list(UndefSpanListState { rl: prog, src: s.source }))
   proofs:
     purity:
@@ -9219,7 +9292,7 @@ rule undef_span_len_of
     out : number
   logic:
     let toks = begin_tokenize(ScanState { source: s.source, pos: 0 })
-    let prog = parse_program(ProgramState { toks: toks, src: s.source, pos: 0 })
+    let prog = parse_program(ProgramState { cell: toks, src: s.source })
     out = span_len(undef_span_list(UndefSpanListState { rl: prog, src: s.source }))
   proofs:
     purity:
@@ -9245,7 +9318,7 @@ rule undef_span_char
     out : number
   logic:
     let toks = begin_tokenize(ScanState { source: s.source, pos: 0 })
-    let prog = parse_program(ProgramState { toks: toks, src: s.source, pos: 0 })
+    let prog = parse_program(ProgramState { cell: toks, src: s.source })
     out = byte_at(s.source, span_start(undef_span_list(UndefSpanListState { rl: prog, src: s.source })))
   proofs:
     purity:
@@ -9440,7 +9513,7 @@ rule print_source
     out : text
   logic:
     let toks = tokenize(ScanState { source: s.source, pos: 0 })
-    let parsed = parse_or(ParseState { toks: toks, pos: 0 })
+    let parsed = parse_or(ParseState { cell: toks })
     let root = parsed_node(parsed)
     out = print_expr(PrintState { node: root, src: s.source })
   proofs:
@@ -9568,7 +9641,7 @@ rule lower_expr_src
     out : text
   logic:
     let toks = tokenize(ScanState { source: s.source, pos: 0 })
-    let parsed = parse_or(ParseState { toks: toks, pos: 0 })
+    let parsed = parse_or(ParseState { cell: toks })
     let root = parsed_node(parsed)
     out = lower_expr(PrintState { node: root, src: s.source })
   proofs:
@@ -9712,7 +9785,7 @@ rule x86_expr_src
     out : bytes
   logic:
     let toks = tokenize(ScanState { source: s.source, pos: 0 })
-    let parsed = parse_or(ParseState { toks: toks, pos: 0 })
+    let parsed = parse_or(ParseState { cell: toks })
     let root = parsed_node(parsed)
     out = concat(x86_expr(PrintState { node: root, src: s.source }), b"\x58\xc3")
   proofs:
@@ -10247,7 +10320,7 @@ rule x86_program_src
     out : bytes
   logic:
     let toks = begin_tokenize(ScanState { source: s.source, pos: 0 })
-    let prog = parse_program(ProgramState { toks: toks, src: s.source, pos: 0 })
+    let prog = parse_program(ProgramState { cell: toks, src: s.source })
     out = x86_program(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog })
   proofs:
     purity:
@@ -10321,7 +10394,7 @@ rule elf_program_src
     out : bytes
   logic:
     let toks = begin_tokenize(ScanState { source: s.source, pos: 0 })
-    let prog = parse_program(ProgramState { toks: toks, src: s.source, pos: 0 })
+    let prog = parse_program(ProgramState { cell: toks, src: s.source })
     let fsz = 221 + program_total_size(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog })
     out = concat(b"\x7f\x45\x4c\x46\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\x3e\x00\x01\x00\x00\x00\x78\x00\x40\x00\x00\x00\x00\x00\x40\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x40\x00\x38\x00\x01\x00\x00\x00\x00\x00\x00\x00", b"\x01\x00\x00\x00\x05\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x40\x00\x00\x00\x00\x00\x00\x00\x40\x00\x00\x00\x00\x00", le64(fsz), le64(fsz), b"\x00\x10\x00\x00\x00\x00\x00\x00", b"\xe8\x60\x00\x00\x00\x48\x83\xec\x20\x49\x89\xc1\x48\x8d\x74\x24\x1f\xc6\x06\x0a\x48\x85\xc0\x79\x03\x48\xf7\xd8\x48\xc7\xc1\x0a\x00\x00\x00\x48\x31\xd2\x48\xf7\xf1\x80\xc2\x30\x48\xff\xce\x88\x16\x48\x85\xc0\x75\xed\x4d\x85\xc9\x79\x06\x48\xff\xce\xc6\x06\x2d\x48\x8d\x54\x24\x20\x48\x29\xf2\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05", x86_program(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog }))
   proofs:
@@ -10459,7 +10532,7 @@ rule lower_program_src
     out : text
   logic:
     let toks = begin_tokenize(ScanState { source: s.source, pos: 0 })
-    let prog = parse_program(ProgramState { toks: toks, src: s.source, pos: 0 })
+    let prog = parse_program(ProgramState { cell: toks, src: s.source })
     out = lower_program(PrintProgState { rules: prog, src: s.source })
   proofs:
     purity:
@@ -10728,7 +10801,7 @@ rule print_program_src
     out : text
   logic:
     let toks = begin_tokenize(ScanState { source: s.source, pos: 0 })
-    let prog = parse_program(ProgramState { toks: toks, src: s.source, pos: 0 })
+    let prog = parse_program(ProgramState { cell: toks, src: s.source })
     out = print_program(PrintProgState { rules: prog, src: s.source })
   proofs:
     purity:

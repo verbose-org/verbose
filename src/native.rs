@@ -4896,10 +4896,20 @@ fn emit_recursive_text_body(
             }
             match &args[0] {
                 Expr::Ident(n) if n == input_name => {
+                    // DETERMINISM: see the matching fix in emit_eval_expr's Call
+                    // arm. `offsets.values().next()` picked an arbitrary HashMap
+                    // entry (nondeterministic; wrong when match-arm `__bind_*`
+                    // binders coexist). The single input field is the
+                    // least-negative (max) NON-binder slot.
                     let field_offset = if let Some(&o) = offsets.get(input_name) {
                         o
                     } else {
-                        *offsets.values().next().unwrap()
+                        offsets
+                            .iter()
+                            .filter(|(k, _)| !k.starts_with("__bind_"))
+                            .map(|(_, v)| *v)
+                            .max()
+                            .expect("single-field pass-through: no input field slot in offsets")
                     };
                     if field_offset >= -128 {
                         code.extend_from_slice(&[0x48, 0x8B, 0x7D]);
@@ -6311,7 +6321,9 @@ fn emit_concat_to_buffer_impl(
         code.extend_from_slice(&[0x48, 0x89, 0xE3]);
         // mov r10, rbx  — buffer base for final length calc
         code.extend_from_slice(&[0x49, 0x89, 0xDA]);
-        emit_concat_fill(code, args, &kinds, &call_slot_idx, input_name, concept, all_rules, offsets, field_ranges, text_bindings)?;
+        // Fast path has no CallText args (those force has_dynamic), so the
+        // slot-array base is unused — pass 0.
+        emit_concat_fill(code, args, &kinds, &call_slot_idx, input_name, concept, all_rules, offsets, field_ranges, text_bindings, 0)?;
         // rax = buffer base, rdx = length (rbx - r10)
         code.extend_from_slice(&[0x4C, 0x89, 0xD0]); // mov rax, r10
         code.extend_from_slice(&[0x48, 0x89, 0xDA]); // mov rdx, rbx
@@ -6330,37 +6342,54 @@ fn emit_concat_to_buffer_impl(
         code.extend_from_slice(&[0x49, 0x89, 0xE1]);
     }
 
-    // Phase 2H-b: pre-evaluate Call args into an r11-indexed slot array.
-    // Only the outermost concat does pre-eval (nested is CallText-free).
+    // Phase 2H-b: pre-evaluate Call args into a slot array.
+    //
+    // The slot array is addressed RELATIVE TO r9 (the saved pre-concat
+    // rsp), NOT via a dedicated base register. The previous design did
+    // `mov r11, rsp` to use r11 as the slot base — but `r11` is the
+    // concept_group ARENA BASE (set once in `_start`, trusted across
+    // call/ret by every callable's arena access; see the register-
+    // conventions table). Clobbering it here permanently destroyed the
+    // arena base for the rest of the callable AND for every deeper
+    // callable that trusts r11 — so any `concat(... Call ...)` inside a
+    // concept_group program corrupted subsequent MatchVariant/
+    // VariantConstruct arena addressing (wrong tag → exit(2) trap).
+    // Worse, the callee evaluated by `emit_text_produce_ptrlen` below may
+    // itself build arena nodes (a recursive parser rule), so r11 MUST
+    // stay the arena base across the arg eval. r9 is already saved (the
+    // Dynamic cleanup register), is not otherwise touched here, and the
+    // pre-eval path has no syscalls, so r9-relative addressing is stable.
+    // Slot array layout: top of array = r9 - 16*n_calls; slot i lives at
+    // `[r9 - 16*n_calls + 16*i (+8 for len)]`. The slot displacement from
+    // r9 is therefore `(16*slot_idx) - 16*n_calls` (always negative).
+    let slot_base_from_r9 = -(16 * n_calls);
     if n_calls > 0 {
         // sub rsp, 16*n_calls
         let slots_bytes = 16 * n_calls;
         code.extend_from_slice(&[0x48, 0x81, 0xEC]);
         code.extend_from_slice(&slots_bytes.to_le_bytes());
-        // mov r11, rsp  — slot base
-        code.extend_from_slice(&[0x49, 0x89, 0xE3]);
 
         // For each Call arg, emit callee into (rax, rdx) and store at the slot.
         // The inner (nested) emit_concat_to_buffer skips the r9 save and
-        // refuses CallText args, so outer's r9 and r11 both survive as
-        // register values across the inner evaluation. No push/pop dance
-        // needed — the whole point of the is_nested flag.
+        // refuses CallText args, so outer's r9 survives as a register value
+        // across the inner evaluation. No push/pop dance needed — the whole
+        // point of the is_nested flag. r11 (arena base) is left untouched.
         for (arg, kind) in args.iter().zip(kinds.iter()) {
             if *kind != ConcatArgKind::CallText {
                 continue;
             }
             let slot_idx = call_slot_idx[args.iter().position(|a| std::ptr::eq(a, arg)).unwrap()];
-            let disp_ptr = 16 * slot_idx;
+            let disp_ptr = slot_base_from_r9 + 16 * slot_idx;
             let disp_len = disp_ptr + 8;
 
             emit_text_produce_ptrlen(
                 code, arg, input_name, concept, all_rules, offsets, field_ranges, text_bindings,
             )?;
 
-            // mov [r11 + disp_ptr], rax
-            emit_mov_r11_disp_from_reg(code, disp_ptr, /* is_rax= */ true);
-            // mov [r11 + disp_len], rdx
-            emit_mov_r11_disp_from_reg(code, disp_len, /* is_rax= */ false);
+            // mov [r9 + disp_ptr], rax
+            emit_mov_r9_disp_from_reg(code, disp_ptr, /* is_rax= */ true);
+            // mov [r9 + disp_len], rdx
+            emit_mov_r9_disp_from_reg(code, disp_len, /* is_rax= */ false);
         }
     }
 
@@ -6419,15 +6448,18 @@ fn emit_concat_to_buffer_impl(
                 }
             }
             ConcatArgKind::CallText => {
-                // add rax, [r11 + 16*slot_idx + 8]  (the len)
+                // add rax, [r9 + slot_base + 16*slot_idx + 8]  (the len)
+                // r9-relative (the slot array sits below the saved pre-concat
+                // rsp); r11 stays the arena base. See the pre-eval comment.
                 let slot_idx = call_slot_idx[args.iter().position(|a| std::ptr::eq(a, arg)).unwrap()];
-                let disp = 16 * slot_idx + 8;
-                // 49 03 ModRM(01 000 011 = 0x43) disp8  or  49 03 ModRM(10 000 011 = 0x83) disp32
-                if disp <= 127 {
-                    code.extend_from_slice(&[0x49, 0x03, 0x43]);
+                let disp = slot_base_from_r9 + 16 * slot_idx + 8;
+                // add rax, [r9 + disp]  — REX.WB (r9 needs REX.B), opcode 0x03,
+                // ModRM reg=rax(000) r/m=r9(001 with REX.B).
+                if disp >= -128 && disp <= 127 {
+                    code.extend_from_slice(&[0x49, 0x03, 0x41]);
                     code.push(disp as u8);
                 } else {
-                    code.extend_from_slice(&[0x49, 0x03, 0x83]);
+                    code.extend_from_slice(&[0x49, 0x03, 0x81]);
                     code.extend_from_slice(&disp.to_le_bytes());
                 }
             }
@@ -6510,7 +6542,7 @@ fn emit_concat_to_buffer_impl(
     code.extend_from_slice(&[0x48, 0x89, 0xE3]);
     code.extend_from_slice(&[0x49, 0x89, 0xDA]);
 
-    emit_concat_fill(code, args, &kinds, &call_slot_idx, input_name, concept, all_rules, offsets, field_ranges, text_bindings)?;
+    emit_concat_fill(code, args, &kinds, &call_slot_idx, input_name, concept, all_rules, offsets, field_ranges, text_bindings, slot_base_from_r9)?;
 
     // rax = buffer base, rdx = length
     code.extend_from_slice(&[0x4C, 0x89, 0xD0]); // mov rax, r10
@@ -6529,17 +6561,21 @@ fn emit_concat_to_buffer_impl(
     Ok(ConcatBufResult::Dynamic)
 }
 
-/// Emit `mov [r11 + disp], reg` where reg is rax (is_rax=true) or rdx.
+/// Emit `mov [r9 + disp], reg` where reg is rax (is_rax=true) or rdx.
 /// Used by Phase 2H-b to populate Call-arg slots in the pre-eval array.
-fn emit_mov_r11_disp_from_reg(code: &mut Vec<u8>, disp: i32, is_rax: bool) {
-    // REX.WB + 0x89 + ModRM(reg = rax(000) or rdx(010), r/m = r11 (011, with REX.B))
+/// r9 (the saved pre-concat rsp) is the slot-array anchor; `r11` is left
+/// untouched because it is the concept_group arena base (see the pre-eval
+/// comment in emit_concat_to_buffer_impl). `disp` is negative (the slot
+/// array sits below r9).
+fn emit_mov_r9_disp_from_reg(code: &mut Vec<u8>, disp: i32, is_rax: bool) {
+    // REX.WB + 0x89 + ModRM(reg = rax(000) or rdx(010), r/m = r9 (001, with REX.B))
     let reg_field: u8 = if is_rax { 0b000 } else { 0b010 };
     if disp >= -128 && disp <= 127 {
-        let modrm = 0b01_000_000 | (reg_field << 3) | 0b011;
+        let modrm = 0b01_000_000 | (reg_field << 3) | 0b001;
         code.extend_from_slice(&[0x49, 0x89, modrm]);
         code.push(disp as u8);
     } else {
-        let modrm = 0b10_000_000 | (reg_field << 3) | 0b011;
+        let modrm = 0b10_000_000 | (reg_field << 3) | 0b001;
         code.extend_from_slice(&[0x49, 0x89, modrm]);
         code.extend_from_slice(&disp.to_le_bytes());
     }
@@ -6915,6 +6951,12 @@ fn emit_concat_fill(
     offsets: &HashMap<&str, i32>,
     field_ranges: &HashMap<&str, (i64, i64)>,
     text_bindings: &TextBindings<'_>,
+    // Displacement of the CallText pre-eval slot array's base from r9
+    // (the saved pre-concat rsp). Always `-(16 * n_calls)`. The slot
+    // array is addressed r9-relative so r11 stays the arena base; see
+    // the pre-eval comment in emit_concat_to_buffer_impl. Callers with
+    // no CallText args pass 0 (the CallText branch never fires).
+    slot_base_from_r9: i32,
 ) -> Result<(), NativeError> {
 
     for (i, arg) in args.iter().enumerate() {
@@ -7003,26 +7045,28 @@ fn emit_concat_fill(
                 }
             }
             ConcatArgKind::CallText => {
-                // Pre-eval has already stored (ptr, len) at [r11 + 16*idx + {0,8}].
-                // mov rsi, [r11 + disp_ptr]  ; mov rcx, [r11 + disp_len]
+                // Pre-eval stored (ptr, len) at [r9 + slot_base + 16*idx + {0,8}].
+                // r9-relative (r11 stays the arena base — see the pre-eval
+                // comment in emit_concat_to_buffer_impl).
+                // mov rsi, [r9 + disp_ptr]  ; mov rcx, [r9 + disp_len]
                 // mov rdi, rbx ; rep movsb ; mov rbx, rdi
                 let slot_idx = call_slot_idx[i];
-                let disp_ptr = 16 * slot_idx;
+                let disp_ptr = slot_base_from_r9 + 16 * slot_idx;
                 let disp_len = disp_ptr + 8;
-                // mov rsi, [r11 + disp_ptr]  (REX.B, ModRM reg=rsi(110) r/m=r11(011))
-                if disp_ptr <= 127 {
-                    code.extend_from_slice(&[0x49, 0x8B, 0x73]);
+                // mov rsi, [r9 + disp_ptr]  (REX.B, ModRM reg=rsi(110) r/m=r9(001))
+                if disp_ptr >= -128 && disp_ptr <= 127 {
+                    code.extend_from_slice(&[0x49, 0x8B, 0x71]);
                     code.push(disp_ptr as u8);
                 } else {
-                    code.extend_from_slice(&[0x49, 0x8B, 0xB3]);
+                    code.extend_from_slice(&[0x49, 0x8B, 0xB1]);
                     code.extend_from_slice(&disp_ptr.to_le_bytes());
                 }
-                // mov rcx, [r11 + disp_len]  (ModRM reg=rcx(001) r/m=r11(011))
-                if disp_len <= 127 {
-                    code.extend_from_slice(&[0x49, 0x8B, 0x4B]);
+                // mov rcx, [r9 + disp_len]  (ModRM reg=rcx(001) r/m=r9(001))
+                if disp_len >= -128 && disp_len <= 127 {
+                    code.extend_from_slice(&[0x49, 0x8B, 0x49]);
                     code.push(disp_len as u8);
                 } else {
-                    code.extend_from_slice(&[0x49, 0x8B, 0x8B]);
+                    code.extend_from_slice(&[0x49, 0x8B, 0x89]);
                     code.extend_from_slice(&disp_len.to_le_bytes());
                 }
                 // mov rdi, rbx ; rep movsb ; mov rbx, rdi
@@ -11366,6 +11410,7 @@ fn emit_text_fold_program(
         &elem_offsets,
         &field_ranges,
         &text_bindings,
+        0, // Phase 5b has no CallText args (rejected above) — slot base unused.
     )?;
 
     // dec r15 ; jmp fill_loop_top
@@ -13235,10 +13280,26 @@ fn emit_eval_expr(
                             // pick the input_name entry if present, else
                             // the first (which for single-field rules is
                             // the only one).
+                            // DETERMINISM: when `input_name` isn't itself a key
+                            // (single-field RECORD callee — offsets is keyed by
+                            // the FIELD name, e.g. `cell`, not the input ident
+                            // `st`), pass the input FIELD's value. The previous
+                            // `offsets.values().next()` picked an ARBITRARY
+                            // HashMap entry — nondeterministic across compiles,
+                            // and WRONG when match-arm binders (keyed
+                            // `__bind_*`, at lower/more-negative slots) coexist
+                            // with the field. The input field of a single-field
+                            // record is the first-allocated slot = the
+                            // least-negative (max) NON-binder offset.
                             let field_offset = if let Some(&o) = offsets.get(input_name) {
                                 o
                             } else {
-                                *offsets.values().next().unwrap()
+                                offsets
+                                    .iter()
+                                    .filter(|(k, _)| !k.starts_with("__bind_"))
+                                    .map(|(_, v)| *v)
+                                    .max()
+                                    .expect("single-field pass-through: no input field slot in offsets")
                             };
                             if field_offset >= -128 {
                                 code.extend_from_slice(&[0x48, 0x8B, 0x7D]);
