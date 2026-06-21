@@ -192,6 +192,57 @@ The method's value here: it sized the capacity arc accurately as a **multi-day p
 rewrite with no shortcut**, rather than letting it be mistaken for a quick win. Whether/when to invest
 is a deliberate call — the arc is real and correct, but it is not small, and none of its pieces are.
 
+## DISCOVERY (2026-06-21) — the O(N²) was the TOKENIZER, not the parser. The whole arc mis-attributed it.
+
+The cursor rewrite (C1) was implemented and LANDED (commit 4d5c14e): the parser now navigates by
+cons CELL, peeks are O(1), `drop_cells`/`Nth`-from-head are gone, suite 411 green, runs natively
+(after fixing two native backend bugs it exposed — an r11/arena-base clobber in the concat-with-Call
+path, and a HashMap-iteration nondeterminism; both real, both general, both in src/native.rs).
+
+**But the perf goal was NOT met — and profiling revealed why the entire arc (and every strategic
+review) had mis-attributed the wall.** Measured curve after the cursor rewrite, all bounds raised:
+
+| K rules | tokenize-only (`count_cells_src`) | full `count_rules` |
+|---|---|---|
+| 100 | 0.023 s | 0.021 s |
+| 200 | 0.098 s (4.3×) | 0.084 s (4.0×) |
+| 400 | 0.404 s (4.1×) | 0.377 s (4.5×) |
+| 800 | 1.778 s (4.4×) | 1.454 s |
+
+**Tokenize-ONLY is equally quadratic** (~4× per doubling) — essentially the entire cost. So the
+dominant O(N²) is the **tokenizer**, which the cursor never touched. The parser peeks (what C1, the
+records-arc review, the arena-arc review, and the capacity design ALL fingered as the wall) were
+never the dominant term.
+
+**Root cause:** 12 per-character recursive scan rules (`skip_spaces`, `digit_run`, `ident_run`,
+`num_value`, `str_content_len`, the scanners, `tokenize`, `tokenize_line`, `line_width`,
+`next_line_start`) each do `let len = length(s.source)` — and `length(<text input field>)` is an
+**O(N) `emit_strlen` scan** (native.rs:914 "length is recovered at read sites via emit_strlen"). Each
+of these rules RECURSES per character, recomputing `length(source)` every step → **N chars × O(N)
+per char = O(N²)**. This O(N²) was in the tokenizer the WHOLE time, pre- and post-cursor.
+
+**The lesson (the article): profile, don't assume.** Five strategic-review/scoping passes correctly
+killed three mis-aimed arcs — but all of them, and I, reasoned the O(N²) was the parser's
+`drop_cells`. It took isolating tokenize-only with a profiler-grade measurement to see the truth.
+Static reasoning about asymptotics is not a substitute for measuring each phase. The parser's
+`drop_cells` IS O(N²) by construction (so the cursor is a real, necessary fix — its O(N²) would
+resurface once the tokenizer is linear), but it was MASKED by the tokenizer's larger constant +
+equal asymptotic, so fixing the parser alone moved nothing observable.
+
+### The real capacity arc, corrected
+
+- **C1 (cursor) — DONE/LANDED.** The parser HALF. Necessary but not sufficient.
+- **C-tok (NEW, the actual dominant win) — make the tokenizer's `length(source)` not O(N)-per-char.**
+  Two options: (a) **Verbose-level** — thread the precomputed `len` through `ScanState`/`LineState`
+  (compute `length(source)` ONCE, carry it; ~68 ScanState construction sites — mechanical but
+  pervasive); (b) **native-level** — make `length(<text input field>)` O(1) by computing the field's
+  strlen ONCE at load and carrying `(ptr, len)` through the recursive ABI (like BoundText already
+  does for read/fetch/lets) — zero Verbose change, fixes EVERY `length(field)` call program-wide, but
+  a real backend ABI change. (b) is the elegant general fix and likely the right one; it also makes
+  the cursor's own arena-cell reads cheaper.
+- **C-depth — tail-recursive tokenizer builders + bounds** (the earlier C2/C3), still needed for the
+  3200-rule SIGSEGV (call depth) and the arena/position ceilings, but secondary to C-tok for time.
+
 ## What this arc is NOT
 
 - Not the arena-allocation arc (declined) — that fixed capacity nobody was hitting. This fixes the
