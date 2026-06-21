@@ -190,9 +190,36 @@ First implementation pass executed the FULL transform per the corrected plan. Re
 3. **Perf measurement** (count_rules K=200/400/800/1600 on the raised-bounds harness) — only
    meaningful once native binaries run.
 
-The rewrite is no longer the unknown; the **native recursive-group-ref-helper-in-SCC bug** is the
-real remaining blocker, and it is a backend fix worth landing on its own merits (it generalizes the
-SCC/callable machinery).
+The rewrite is no longer the unknown; the **native backend bug** is the real remaining blocker.
+
+### Diagnosis refinement (2026-06-18 isolation pass) — root cause NOT yet definitively pinned; needs the failing binary
+
+Tried to reproduce the native abort in ISOLATION (minimal concept_group programs) to fix it. **Five
+faithful-looking repros ALL compiled and ran correctly** natively: (1) recursive group-ref-returning
+helper (`advance`-shape); (2) mutual-recursion SCC (`ping↔pong`) passing a group-ref, calling the
+helper from inside the SCC; (3) read-only recursive walk (`sum_lst`); (4) build-only recursive
+(`build`); (5) read+build+recurse in one body (`maplist` — MatchVariant + VariantConstruct +
+recursion, the parser shape). None abort. So the trigger is specific to the FULL cursor parser's
+structure, not any simple shape.
+
+Confirmed facts (from disk): `exit(2)` is the **MatchVariant tag-corruption trap** (native.rs:5373/
+5858) — it fires NATIVELY but the interpreter runs the same ASTs correctly, so it's a native-only
+**wrong-tag read** (reads an arena entry whose tag matches no arm). The earlier **r11-clobber theory
+is WEAKENED**: grep shows r11 is **never used as scratch** (only `add rax, r11` arena-base reads at
+:5733/:13866), and the comments confirm r11 is clobbered **only by syscalls** — but the cursor parser
+makes **no syscall mid-parse** (it returns a number, printed in `_start` after the rule returns). So
+there is no mid-parse r11 clobber to corrupt the base. The wrong-tag read is therefore more likely a
+**cell-index marshalling bug** (a group-ref index passed wrong through a specific recursive-call
+shape) or an **arena-write ordering bug** unique to the cursor parser — NOT a generic r11 loss.
+
+**The fix needs the actual failing binary.** Next-slice plan: re-derive the cursor rewrite on a
+throwaway branch and KEEP the red state (do NOT revert this time) → disassemble one failing entry
+(`count_rules`) → find the exact MatchVariant site reading a wrong tag and trace back whether the
+arena INDEX or r11 or the entry's written tag is wrong → fix in src/native.rs + a native regression
+test (built from whatever minimal shape the disassembly reveals actually triggers it) → re-apply the
+cursor rewrite (mechanical, proven AST-identical) → perf measurement. The diagnosis is precise enough
+to know it's a native arena/marshalling codegen bug exposed by the cursor parser; pinning the exact
+defect requires the binary, which the isolation repros could not produce.
 
 ## Bottom line
 
