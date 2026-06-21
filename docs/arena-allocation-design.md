@@ -214,6 +214,92 @@ architectural (O(1) indexed token access to kill the O(N²) + the deep peeks; a 
 the index/position field bounds; iteration over deep native recursion), and it is the actual
 self-hosting-capacity arc.
 
+---
+
+## Implementation spec — off-stack mmap arena (REVIVED + validated, 2026-06-21)
+
+The C-depth bisection (docs/self-hosting-capacity-design.md) confirmed the operative wall is the
+arena `max_nodes` (raising the cap 65535→120000 cleared count_rules K=800; 1600 then needs more;
+~85 nodes/rule; no SIGSEGV — not call depth). So this arc is no longer premature. Below is the
+implementation-ready spec, grounded in the current code.
+
+### Current mechanism (what changes)
+- `arena_size = max_nodes × entry_size` is added to `arena_extra_bytes` → `frame_size` → reserved by
+  `sub rsp, frame_size` (native.rs ~3266 / ~3296 / ~3316). **Stack-allocated.**
+- `arena_rbp_offset = node_count_slot − arena_size`; `r11 = lea [rbp + arena_rbp_offset]` once
+  (native.rs ~3468). Arena reads/writes address `[r11 + index*entry_size + field_off]`.
+- Callables use the sentinel `arena_rbp_offset == i32::MAX` (native.rs 4431/5051) = "DON'T recompute
+  r11 from rbp — trust the r11 the entry/_start set." (Callables have their own rbp, can't reach the
+  entry frame's arena.)
+- `node_count_slot` is a small frame slot (the running counter).
+
+### The change (threshold-gated; small groups stay byte-identical)
+Decide per program at compile time: `use_mmap = arena_size > THRESHOLD` (THRESHOLD ≈ 64 KiB — covers
+all existing small-group examples on the stack; vexprparse's 3 MB+ arena → mmap). When `use_mmap`:
+
+1. **Exclude `arena_size` from `frame_size`** (the `sub rsp` shrinks back to the small fixed frame —
+   also removes the multi-MB-`sub rsp` guard-page hazard). Keep `node_count_slot` + tmp slots in the
+   frame. Add one new frame slot: `arena_base_slot` (8 B, holds the mmap pointer).
+2. **mmap in the _start/entry prologue**, right where `lea r11` is today:
+   ```
+   mmap(NULL, arena_bytes, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0)
+     ; rax=9 ; rdi=0 ; rsi=arena_bytes(page-rounded) ; rdx=3 ; r10=0x22 ; r8=-1 ; r9=0 ; syscall
+     ; (kernel ABI: arg4 in r10, NOT rcx; syscall clobbers rcx, r11)
+   cmp rax, -4095 (unsigned-above test) → jae .arena_mmap_fail   ; MAP_FAILED / -errno → abort(1)
+   mov [rbp + arena_base_slot], rax    ; stash base for reload
+   mov r11, rax                        ; r11 = arena base (replaces the lea)
+   ```
+   `arena_bytes` rounds up to a page (4096). Reuse the shared sys_exit(1) abort tail for the failure.
+3. **r11 discipline (sharper than the stack case — state it as an invariant):** r11 is the arena base
+   and is **NOT rbp-recomputable** under mmap (the old failsafe `lea [rbp+arena_rbp_offset]` is gone).
+   So: (a) the callable sentinel stays `i32::MAX` = "trust r11" (UNCHANGED — callables don't recompute
+   it either way); (b) **every syscall in a group program must preserve r11** — push r11 / syscall /
+   pop r11, exactly as `emit_streamed_write_rsi_rdx` (native.rs:5055) already does, and as the recent
+   concat-Call fix (base its slot array on r9 not r11) established. Entry-level code MAY instead reload
+   `mov r11, [rbp + arena_base_slot]` after a syscall (the slot is reachable at entry rbp). Callables
+   can't reach that slot, so callable syscalls MUST push/pop r11. The parser's recursive callables make
+   no syscalls (pure parse), so in practice r11 survives all call/ret; the guard matters only for the
+   effect/streaming paths, which already guard. **Net new rule: never emit a syscall in a group
+   program without a surrounding r11 guard or an entry-level reload.**
+4. **Cleanup:** none — rely on process-exit reclamation (no munmap), consistent with no-runtime ethos.
+   Documented scope line; a munmap-at-exit slice can follow if a group ever lands in a service loop.
+5. **Stack (non-mmap) path UNCHANGED** for `arena_size ≤ THRESHOLD` — byte-for-byte identical to
+   today (sum_chain/label_tree/factorial-with-group/token_* keep their exact binaries).
+
+### Cap raise (coupled — only safe because the arena is now off-stack)
+Raise the verifier cap `PHASE_B1_MAX_BOUND` (verifier.rs:1418) for `max_nodes` (and `max_depth`) from
+65535 to a generous documented ceiling — proposed **4_000_000** (covers self-source ~500k–1M nodes
+with headroom; worst-case arena 4M×48 B ≈ 192 MB mmap, which fails gracefully via the MAP_FAILED
+abort if the host can't back it). Reword the "16-bit index budget" message (storage was always
+64-bit; the index path needs no change — confirmed in the earlier recon). `max_depth`: raising it is
+still a FALSE EXPLICITATION unless runtime depth is enforced — so RAISE `max_nodes` now, leave
+`max_depth` at a defensible value (or tie it to a real check) per the no-guessing axiom.
+
+### Gate
+- Suite green (currently 412). **Byte-identical for every non-mmap (small-group) program** — the
+  SHA/size-pinned group examples (sum_chain etc.) must not shift (threshold guarantees this).
+- The native==interpreter cross-check (just restored) holds on a large multi-line source.
+- **Scale test:** count_rules clears K=800/1600/3200 (was arena-walled at 800) and scales linearly in
+  time; push toward a meaningful self-input. Measure peak RSS (mmap arena is now heap, not stack).
+- mmap failure path tested (e.g. an absurd max_nodes → MAP_FAILED → clean exit 1, not a crash).
+
+### Risks
+1. **r11-after-syscall** is the sharp edge (the recent r11-clobber bug is the cautionary tale). The
+   invariant in §3 must hold at EVERY syscall site in a group program — audit them (streaming write,
+   append_file, read, fetch, mmap itself). A missed guard = arena corruption = the exit(2) MatchVariant
+   trap. Mitigation: a single `emit_syscall_in_group` helper that wraps push/pop r11, used everywhere.
+2. **mmap arg4 in r10** (kernel ABI), not rcx — easy to get wrong; the syscall clobbers rcx+r11.
+3. **Threshold value** — 64 KiB is a guess; confirm all existing group examples' arenas are below it
+   (they are tiny) so none flips to mmap unexpectedly (which would break their byte-identity pins).
+4. **Depth is the NEXT wall after this**, not solved here: at true self-source scale the parser/
+   tokenizer recursion depth (parse_program ~per-rule, tokenize_indent ~per-line) may eventually
+   exceed the 8 MB stack. The bisection showed no SIGSEGV at tested K (arena walls first), so depth is
+   deferred — but note it so the next bisection expects it.
+
+This is the validated, implementation-ready next slice. Suggested execution: worktree subagent (like
+the C-tok fix), strong gate (byte-identity for small groups + cross-check + scale test), commit-don't-
+revert, monitored via worktree state.
+
 ## What this arc is NOT
 
 - Not a general allocator / GC. One mmap'd region per process, freed at exit.
