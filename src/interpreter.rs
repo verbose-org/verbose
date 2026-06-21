@@ -157,6 +157,47 @@ fn parse_json_object(src: &str) -> Result<HashMap<String, Value>, RuntimeError> 
     Ok(fields)
 }
 
+/// Decode JSON string escapes in a (quotes-already-stripped) string body.
+/// The hand-written zero-deps JSON reader previously took the bytes verbatim,
+/// so `"a\nb"` in --input arrived as literal backslash-n (2 chars) instead of
+/// a newline — which made multi-line source fed to the interpreter tokenize
+/// DIFFERENT bytes than the native binary gets via argv (real newlines). That
+/// is why count_cells_src etc. were "native-only" and why native vs interpreter
+/// counts diverged on multi-line input. Decoding the closed escape set the
+/// language's own lexer uses (\n \t \r \\ \" \/) makes the two backends receive
+/// IDENTICAL bytes, restoring the native==interpreter cross-check on multi-line.
+/// Unknown escapes pass through verbatim (backslash kept) — lenient by design,
+/// since this is an input reader, not the source lexer.
+fn unescape_json_string(body: &str) -> String {
+    if !body.contains('\\') {
+        return body.to_string();
+    }
+    let mut out = String::with_capacity(body.len());
+    let mut chars = body.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push('\n'),
+            Some('t') => out.push('\t'),
+            Some('r') => out.push('\r'),
+            Some('\\') => out.push('\\'),
+            Some('"') => out.push('"'),
+            Some('/') => out.push('/'),
+            // Unknown escape: keep the backslash and the following char as-is.
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+            // Trailing backslash: keep it.
+            None => out.push('\\'),
+        }
+    }
+    out
+}
+
 fn parse_json_value(s: &str) -> Result<Value, RuntimeError> {
     let s = s.trim();
     if s == "true" {
@@ -166,7 +207,7 @@ fn parse_json_value(s: &str) -> Result<Value, RuntimeError> {
         return Ok(Value::Bool(false));
     }
     if s.starts_with('"') && s.ends_with('"') && s.len() >= 2 {
-        return Ok(Value::Text(s[1..s.len() - 1].to_string()));
+        return Ok(Value::Text(unescape_json_string(&s[1..s.len() - 1])));
     }
     if s.starts_with('[') && s.ends_with(']') {
         let inner = &s[1..s.len() - 1];
@@ -1031,6 +1072,29 @@ fn eval_expr(
 mod tests {
     use super::*;
     use crate::ast::*;
+
+    #[test]
+    fn json_string_escapes_decode_so_interpreter_matches_native() {
+        // The zero-deps JSON reader used to take string bytes verbatim, so a
+        // multi-line `--input` source ("a\nb") arrived as literal backslash-n
+        // and the interpreter tokenized DIFFERENT bytes than the native binary
+        // (which gets real newlines via argv) — the count_cells_src 10-vs-3
+        // divergence. Decoding the closed escape set restores identical input.
+        assert_eq!(unescape_json_string("a\\nb"), "a\nb");
+        assert_eq!(unescape_json_string("x\\ty"), "x\ty");
+        assert_eq!(unescape_json_string("a\\r\\nb"), "a\r\nb");
+        assert_eq!(unescape_json_string("q\\\"q"), "q\"q");
+        assert_eq!(unescape_json_string("back\\\\slash"), "back\\slash");
+        // No backslash: untouched (fast path).
+        assert_eq!(unescape_json_string("plain"), "plain");
+        // Unknown escape: backslash kept verbatim (lenient input reader).
+        assert_eq!(unescape_json_string("a\\zb"), "a\\zb");
+        // Parsed as a JSON value, a \n string decodes to a real newline.
+        match parse_json_value("\"rule\\n  logic:\"").unwrap() {
+            Value::Text(t) => assert_eq!(t, "rule\n  logic:"),
+            other => panic!("expected Text, got {:?}", other),
+        }
+    }
 
     fn make_rule() -> Rule {
         Rule {
