@@ -765,7 +765,8 @@ rule string_run
   output:
     out : number
   logic:
-    out = 1 + str_content_len(ScanState { source: s.source, pos: s.pos + 1 })
+    let len = length(s.source)
+    out = if s.pos >= len then 0 else if byte_at(s.source, s.pos) == 34 then 1 + str_content_len(ScanState { source: s.source, pos: s.pos + 1 }) else 0
   proofs:
     purity:
       reads : [s.source, s.pos]

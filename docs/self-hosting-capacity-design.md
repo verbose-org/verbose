@@ -243,6 +243,63 @@ equal asymptotic, so fixing the parser alone moved nothing observable.
 - **C-depth — tail-recursive tokenizer builders + bounds** (the earlier C2/C3), still needed for the
   3200-rule SIGSEGV (call depth) and the arena/position ceilings, but secondary to C-tok for time.
 
+### CORRECTION (2026-06-21, second profiling pass) — the dominant O(N²) was NOT length(), it was string_run
+
+C-tok above fingered `length(<text input field>)` as the O(N)-per-char term. **A disassembly +
+bisection pass on `8b9c361` showed that diagnosis was already stale.** At that HEAD the native
+backend ALREADY carries `(ptr, len)` for text input fields through the recursive ABI
+(`callable_text_bindings` + the multi-field struct copy in `emit_callable_into`, and the marshalling
+in `emit_eval_expr`'s Call arm), so `length(s.source)` reads a precomputed len slot in O(1). The
+disassembly of `count_cells_src` (bounds raised) showed exactly **ONE** `repnz scasb` in the whole
+binary, not the 81 the first DISCOVERY pass reported. The `length()` strlen was therefore NOT the
+dominant term anymore; option (b) was effectively already done.
+
+The real dominant O(N²), found by bisecting source shape (single-line dense → linear; multi-line →
+quadratic; quadratic scales with **token count**, independent of indentation and of `length()`):
+
+- `next_token` and `token_end` **eagerly** evaluate `let srun = string_run(...)` for EVERY token
+  (eager-let trap — all lets in a callable run before the body regardless of which branch is taken).
+- `string_run` → `str_content_len(pos+1)`, which scans forward looking for the **closing quote**.
+- For a NON-string token there is no closing quote, so `str_content_len` scanned to **end of source**.
+- N tokens × O(remaining source) per token = **O(N²)**.
+
+**Fix (this session): guard `string_run` to be O(1) when the start byte is not `"` (34).** One rule
+changed in `examples/vexprparse.verbose`:
+
+```
+rule string_run
+  logic:
+    let len = length(s.source)
+    out = if s.pos >= len then 0 else if byte_at(s.source, s.pos) == 34 then 1 + str_content_len(...) else 0
+```
+
+Now `string_run` only scans when it's actually at a string opener; for the common non-string token it
+returns 0 immediately. Measured (`count_cells_src`, bounds raised, best of 3):
+
+| K rules | BEFORE (O(N²)) | AFTER (O(N)) |
+|---|---|---|
+| 200  | 0.099 s | 0.0029 s |
+| 400  | 0.472 s (4.8×) | 0.0049 s (1.7×) |
+| 800  | 2.355 s (5.0×) | 0.0064 s (1.3×) |
+| 1600 | 9.06 s  (3.8×) | 0.0095 s (1.5×) |
+
+Curve flattened from ~4-5×/doubling to ~1.3-1.7×/doubling. K=1600 dropped from 9.06 s to 9.5 ms
+(~950×). Behaviour is byte-identical to the pre-fix tokenizer on every tested source (no-string,
+with-string, unterminated-string, string-heavy) — the guard only removes the wasted scan, it never
+changes a string token's measured boundary. Suite stays 411 green; no native binary sizes shifted
+(the change is in an example, not the emitter).
+
+**Lesson reinforced:** profile each phase, AND re-profile after each landed fix. The C-tok diagnosis
+was correct as of the FIRST DISCOVERY snapshot but the recursive-text-field (ptr, len) ABI had since
+made `length()` O(1); the wall had moved to the next eager-let scan. The `length()` ABI work the
+design called "option (b)" turned out to already be in the backend — the remaining O(N²) was purely a
+source-level eager-evaluation bug. The other eager scanners (`ident_run`, `digit_run`) are
+self-limiting (they stop at the first non-matching byte), so `string_run` was the sole offender.
+
+**Still open (C-depth):** `count_rules` exits rc=1 at ~K≥800 (arena / call-depth ceiling), unchanged
+by this fix. `count_cells_src` handles K=3200 fine. The depth ceiling is the next wall, secondary to
+the time win delivered here.
+
 ## What this arc is NOT
 
 - Not the arena-allocation arc (declined) — that fixed capacity nobody was hitting. This fixes the
