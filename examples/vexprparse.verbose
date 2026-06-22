@@ -101,7 +101,7 @@
 -- Over the cap a VariantConstruct hits the arena bounds-check and the binary
 -- exits 1 (fail-closed) rather than corrupting memory.
 -- ============================================================================
-concept_group VExpr [max_depth: 4096, max_nodes: 65535]
+concept_group VExpr [max_depth: 4096, max_nodes: 2000000]
   @intention: "Tokens, a token cons-list, an arithmetic AST, and a parse result"
   @source: vexprparse.intent:1
 

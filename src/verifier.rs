@@ -1410,12 +1410,20 @@ fn verify_concept(c: &Concept, base_dir: &StdPath, errors: &mut Vec<VerifyError>
     }
 }
 
-/// Phase B slice 1: bounds ceiling on `max_depth` and `max_nodes`. Picked
-/// at 65535 (16-bit) so the future arena-emitter (B.4+) can use 16-bit
-/// indices unconditionally — see docs/recursive-types-design.md §6 / Q2.
-/// The actual emitter exploitation lands in B.4; B.1 just refuses
-/// declarations that would later force a wider index width.
-const PHASE_B1_MAX_BOUND: u32 = 65535;
+/// Off-stack mmap arena (2026-06-22): the arena emitter stores node
+/// indices as 64-bit values (the 16-bit-index reasoning never constrained
+/// storage — confirmed in the B.4 recon), so the `max_nodes` ceiling can
+/// rise well past 65535 now that the arena is mmap-backed (off-stack). At
+/// 4_000_000 a worst-case wide-variant arena is ~96–192 MB, which fails
+/// gracefully via the MAP_FAILED abort if the host can't back it.
+const PHASE_B1_MAX_NODES: u32 = 4_000_000;
+
+/// `max_depth` stays at the 16-bit ceiling. Raising it would be FALSE
+/// EXPLICITATION: there is no runtime recursion-depth check yet (the 8 MB
+/// stack is the real wall — see docs/self-hosting-capacity-design.md), so a
+/// declared `max_depth` above what the stack can actually hold is an
+/// unbacked promise. Tie this to a real runtime check before raising it.
+const PHASE_B1_MAX_DEPTH: u32 = 65535;
 
 /// Phase B slice 1: verify a `concept_group` block. Checks the @source
 /// ref, the `max_depth` / `max_nodes` bounds, and the inner concepts'
@@ -1447,12 +1455,12 @@ fn verify_concept_group(
             message: "max_depth must be greater than zero — a recursive tree must allow at least one level".into(),
         });
     }
-    if g.max_depth > PHASE_B1_MAX_BOUND {
+    if g.max_depth > PHASE_B1_MAX_DEPTH {
         errors.push(VerifyError {
             context: format!("concept_group '{}' / max_depth", g.name),
             message: format!(
-                "max_depth {} exceeds the slice-1 ceiling of {} (16-bit index budget — see docs/recursive-types-design.md §6 / Q2)",
-                g.max_depth, PHASE_B1_MAX_BOUND
+                "max_depth {} exceeds the ceiling of {} (no runtime recursion-depth check exists yet — raising this would be an unbacked promise; see docs/self-hosting-capacity-design.md)",
+                g.max_depth, PHASE_B1_MAX_DEPTH
             ),
         });
     }
@@ -1462,14 +1470,50 @@ fn verify_concept_group(
             message: "max_nodes must be greater than zero — a recursive tree must allow at least one node".into(),
         });
     }
-    if g.max_nodes > PHASE_B1_MAX_BOUND {
+    if g.max_nodes > PHASE_B1_MAX_NODES {
         errors.push(VerifyError {
             context: format!("concept_group '{}' / max_nodes", g.name),
             message: format!(
-                "max_nodes {} exceeds the slice-1 ceiling of {} (16-bit index budget — see docs/recursive-types-design.md §6 / Q2)",
-                g.max_nodes, PHASE_B1_MAX_BOUND
+                "max_nodes {} exceeds the ceiling of {} (the mmap arena is off-stack but still bounded; an absurd count would mmap-fail at runtime — see docs/arena-allocation-design.md)",
+                g.max_nodes, PHASE_B1_MAX_NODES
             ),
         });
+    }
+    // Off-stack mmap arena (2026-06-22): `arena_size = max_nodes *
+    // entry_size` is held as an i32 in the native emitter (the disp32
+    // node_count offset and the `sub rsp` / mmap-size math all use i32). A
+    // wide-variant group at the raised max_nodes ceiling could overflow
+    // i32 and wrap to a nonsensical (possibly negative) size. Refuse it
+    // here so the emitter never sees a wrapped arena_size. entry_size is
+    // computed with the same per-field byte widths the native arena layout
+    // uses (Text = 16 B, everything else 8 B, +1 tag byte, padded to 8).
+    {
+        let group_names: std::collections::HashSet<&str> =
+            g.concepts.iter().map(|c| c.name.as_str()).collect();
+        let field_width = |ty: &Type| -> i64 {
+            match ty {
+                Type::Text => 16,
+                _ => 8,
+            }
+        };
+        let max_payload: i64 = g.concepts.iter()
+            .flat_map(|c| c.variants.iter())
+            .map(|v| v.fields.iter().map(|f| field_width(&f.ty)).sum::<i64>())
+            .max()
+            .unwrap_or(0);
+        let _ = &group_names; // (group_names kept for clarity of intent)
+        let raw_entry = 1 + max_payload;
+        let entry_size = (raw_entry + 7) & !7; // round up to 8
+        let arena_size = (g.max_nodes as i64) * entry_size;
+        if arena_size > i32::MAX as i64 {
+            errors.push(VerifyError {
+                context: format!("concept_group '{}' / max_nodes", g.name),
+                message: format!(
+                    "arena size = max_nodes ({}) × entry_size ({}) = {} bytes exceeds i32::MAX; lower max_nodes (the native arena size is an i32)",
+                    g.max_nodes, entry_size, arena_size
+                ),
+            });
+        }
     }
 
     // Build the set of concept names this group owns. Used to admit
@@ -6123,10 +6167,11 @@ concept_group AST [max_depth: 10, max_nodes: 0]
     }
 
     #[test]
-    fn phase_b1_rejects_max_nodes_over_65535() {
-        // Verifier refuses node counts past 16-bit so the future
-        // arena emitter can use 16-bit indices unconditionally
-        // (docs/recursive-types-design.md §6 / Q2).
+    fn phase_b1_accepts_max_nodes_over_65535_now_mmap_backed() {
+        // Off-stack mmap arena (2026-06-22): the 16-bit ceiling is lifted.
+        // 100000 nodes (was rejected pre-mmap) is now accepted — the arena
+        // is mmap-backed, indices are 64-bit, and 100000 is well under the
+        // new 4_000_000 ceiling.
         let src = r#"@verbose 0.1.0
 
 concept_group AST [max_depth: 10, max_nodes: 100000]
@@ -6141,9 +6186,33 @@ concept_group AST [max_depth: 10, max_nodes: 100000]
 "#;
         let errs = verify_str(src);
         assert!(
+            !errs.iter().any(|e| e.context.contains("max_nodes")),
+            "expected max_nodes=100000 to be ACCEPTED now (mmap-backed), got {:#?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn phase_b1_rejects_max_nodes_over_4m() {
+        // The mmap arena is off-stack but still bounded — node counts past
+        // the 4_000_000 ceiling are refused.
+        let src = r#"@verbose 0.1.0
+
+concept_group AST [max_depth: 10, max_nodes: 5000000]
+  @intention: "x"
+  @source: invoices.intent:1
+
+  concept Expr
+    @intention: "e"
+    @source: invoices.intent:1
+    variants:
+      Int of (n : number)
+"#;
+        let errs = verify_str(src);
+        assert!(
             errs.iter().any(|e| e.context.contains("max_nodes")
-                && e.message.contains("16-bit")),
-            "expected max_nodes=100000 rejection with 16-bit breadcrumb, got {:#?}",
+                && e.message.contains("ceiling")),
+            "expected max_nodes=5000000 rejection, got {:#?}",
             errs
         );
     }

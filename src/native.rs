@@ -880,6 +880,18 @@ struct RecordLoopCtx<'a> {
     /// Phase B slice 4a.2: cap on arena entries (`max_nodes` from the
     /// group declaration). 0 when no group is declared.
     arena_max_nodes: u32,
+    /// Off-stack mmap arena (2026-06-22): true when the program's
+    /// `arena_size` exceeds the mmap threshold (64 KiB). When true the arena
+    /// lives in an anonymous mmap region (NOT the stack frame), node_count
+    /// lives INSIDE that region at `[r11 + arena_size]` (so the entry path
+    /// must NOT use `node_count_slot`), and r11 is reloaded from
+    /// `arena_base_slot` (NOT `lea [rbp+arena_rbp_offset]`) at every
+    /// entry-level arena access. False keeps the stack path byte-identical.
+    use_mmap: bool,
+    /// Off-stack mmap arena: rbp-relative offset of the 8-byte frame slot
+    /// holding the mmap base pointer (the value `r11` is reloaded from at
+    /// entry level). Only meaningful when `use_mmap` is true; 0 otherwise.
+    arena_base_slot: i32,
 }
 
 /// Emit an argc guard: if r12 (argc) < min_argc, write an error message
@@ -3144,6 +3156,15 @@ fn arena_field_offset(fields: &[(String, Type)], field_index: usize, group_names
     off
 }
 
+/// Off-stack mmap arena threshold (2026-06-22). A concept_group program
+/// whose `arena_size = max_nodes * entry_size` exceeds this byte count
+/// allocates its runtime arena via anonymous `mmap` (so it can be >8 MB
+/// without exhausting the 8 MB stack). Small-group arenas (≤ this) stay
+/// stack-allocated, byte-for-byte identical to the pre-mmap path. The value
+/// is insensitive between ~20 KiB and 3 MB (every existing small-group
+/// example is ≤19 KiB; vexprparse's ~3 MB arena is the only one above).
+const ARENA_MMAP_THRESHOLD: i32 = 64 * 1024;
+
 fn compute_arena_entry_size(group: &ConceptGroup) -> i32 {
     let gnames: HashSet<&str> = group.concepts.iter().map(|c| c.name.as_str()).collect();
     let max_payload_bytes: i32 = group.concepts.iter()
@@ -3282,8 +3303,24 @@ fn emit_record_loop_prologue<'a>(
         } else { 0 },
         None => 0,
     };
+    // Off-stack mmap arena (2026-06-22): decide per-program whether the
+    // arena lives on the stack (small groups, byte-identical to the
+    // pre-mmap path) or in an anonymous mmap region (large groups —
+    // vexprparse and any future self-hosting-scale group).
+    let use_mmap = arena_size > ARENA_MMAP_THRESHOLD;
     let arena_extra_bytes: i32 = if arena_size > 0 {
-        arena_size + 8 + tmp_slot_extra_bytes
+        if use_mmap {
+            // Off-stack: the frame holds only an 8-byte slot for the mmap
+            // base pointer plus the VariantConstruct tmp pool. The arena
+            // bytes AND the node_count counter live inside the mmap region
+            // (node_count at `[r11 + arena_size]`), NOT the stack frame —
+            // this is the correction to the spec's fatal split-brain bug.
+            8 + tmp_slot_extra_bytes
+        } else {
+            // On-stack (unchanged): arena bytes + 8-byte node_count counter
+            // + tmp pool, all in the frame.
+            arena_size + 8 + tmp_slot_extra_bytes
+        }
     } else {
         0
     };
@@ -3447,39 +3484,108 @@ fn emit_record_loop_prologue<'a>(
     // reserved but never written. r11 is set up so 4a.2's VariantConstruct
     // emit can land directly on it (when called immediately after the
     // prologue, before any syscall).
-    let (node_count_slot, arena_rbp_offset, tmp_slot_base): (i32, i32, i32) = if arena_size > 0 {
-        let nc_slot = post_now_next_slot - 8;
-        let arena_off = nc_slot - arena_size;
-        // Phase B slice 4a.2 — tmp slot pool sits BELOW the arena
-        // (deeper, more-negative addresses) so node_count_slot and
-        // arena_rbp_offset keep their slice-4a.1 layout. The first tmp
-        // is the i64 just below the arena's bottom byte.
-        let tmp_base = arena_off - 8;
-        // mov qword [rbp + nc_slot], 0  — initialize node_count to 0.
-        if nc_slot >= -128 {
-            code.extend_from_slice(&[0x48, 0xC7, 0x45]);
-            code.push(nc_slot as u8);
+    // Off-stack mmap arena: patch sites for the MAP_FAILED `jae` jump,
+    // drained into the ctx's arena_abort_patches so the epilogue's
+    // sys_exit(1) tail catches an allocation failure (fail-closed).
+    let mut mmap_fail_patches: Vec<usize> = Vec::new();
+    let (node_count_slot, arena_rbp_offset, tmp_slot_base, arena_base_slot): (i32, i32, i32, i32) = if arena_size > 0 {
+        if use_mmap {
+            // ─── Off-stack mmap arena ───────────────────────────────────
+            // The arena does NOT live in the rbp frame. The frame holds one
+            // 8-byte slot for the mmap base pointer (`arena_base_slot`),
+            // then the VariantConstruct tmp pool below it. node_count lives
+            // INSIDE the mmap region at `[r11 + arena_size]` — both the
+            // entry path and callable path address it identically, so the
+            // counter can never split-brain.
+            let base_slot = post_now_next_slot - 8;
+            let tmp_base = base_slot - 8;
+            // arena_bytes = arena_size + 8 (node_count), rounded up to a
+            // page (4096). The +8 keeps node_count inside the region.
+            let raw_bytes = (arena_size as i64) + 8;
+            let page_bytes = (raw_bytes + 4095) & !4095;
+            // mmap(NULL, page_bytes, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0)
+            //   rax=9 (sys_mmap)
+            code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x09, 0x00, 0x00, 0x00]); // mov rax, 9
+            //   rdi=0 (NULL addr): xor edi, edi
+            code.extend_from_slice(&[0x31, 0xFF]);
+            //   rsi=page_bytes: mov rsi, imm64
+            code.extend_from_slice(&[0x48, 0xBE]);
+            code.extend_from_slice(&page_bytes.to_le_bytes());
+            //   rdx=3 (PROT_READ|PROT_WRITE): mov edx, 3
+            code.extend_from_slice(&[0xBA, 0x03, 0x00, 0x00, 0x00]);
+            //   r10=0x22 (MAP_PRIVATE|MAP_ANONYMOUS) — kernel ABI arg4 in r10, NOT rcx
+            //   mov r10d, 0x22
+            code.extend_from_slice(&[0x41, 0xBA, 0x22, 0x00, 0x00, 0x00]);
+            //   r8=-1 (fd): mov r8, -1  (REX.WB 0x49, 0xC7, 0xC0, imm32 sign-ext)
+            code.extend_from_slice(&[0x49, 0xC7, 0xC0, 0xFF, 0xFF, 0xFF, 0xFF]);
+            //   r9=0 (offset): xor r9d, r9d
+            code.extend_from_slice(&[0x45, 0x31, 0xC9]);
+            //   syscall  (clobbers rcx, r11)
+            code.extend_from_slice(&[0x0F, 0x05]);
+            // MAP_FAILED check: mmap returns -errno in [-4095, -1] on error.
+            //   cmp rax, -4095  (REX.W 0x48, 0x3D, imm32 sign-ext)
+            code.extend_from_slice(&[0x48, 0x3D]);
+            code.extend_from_slice(&(-4095i32).to_le_bytes());
+            //   jae .arena_abort  (unsigned-above catches the whole error range)
+            code.push(0x0F);
+            code.push(0x83);
+            mmap_fail_patches.push(code.len());
             code.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
-        } else {
-            code.extend_from_slice(&[0x48, 0xC7, 0x85]);
-            code.extend_from_slice(&nc_slot.to_le_bytes());
+            // mov [rbp + base_slot], rax  — stash base for entry-level reloads.
+            if base_slot >= -128 {
+                code.extend_from_slice(&[0x48, 0x89, 0x45]);
+                code.push(base_slot as u8);
+            } else {
+                code.extend_from_slice(&[0x48, 0x89, 0x85]);
+                code.extend_from_slice(&base_slot.to_le_bytes());
+            }
+            // mov r11, rax  — r11 = arena base (replaces the lea). REX.WB.
+            code.extend_from_slice(&[0x49, 0x89, 0xC3]);
+            // init node_count to 0: mov qword [r11 + arena_size], 0
+            //   REX.WB 0x49, 0xC7, /0; ModRM 10.000.011 = 0x83 (disp32) since
+            //   arena_size is large; imm32=0.
+            code.extend_from_slice(&[0x49, 0xC7, 0x83]);
+            code.extend_from_slice(&arena_size.to_le_bytes());
             code.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
-        }
-        // lea r11, [rbp + arena_off]  — set r11 to the start of the arena.
-        // REX.WR (0x4C) + LEA opcode 0x8D + ModRM disp32 form (0x9D)
-        // when arena_off doesn't fit in disp8; disp8 form (0x5D) when
-        // it does. arena_off is highly negative (frame is large when
-        // arena is present), so disp32 is the realistic case.
-        if arena_off >= -128 {
-            code.extend_from_slice(&[0x4C, 0x8D, 0x5D]);
-            code.push(arena_off as u8);
+            // node_count_slot / arena_rbp_offset are NOT used for addressing
+            // under mmap (entry uses [r11 + arena_size], callables already
+            // do). Set to 0 so any accidental rbp-relative use is obvious.
+            (0, 0, tmp_base, base_slot)
         } else {
-            code.extend_from_slice(&[0x4C, 0x8D, 0x9D]);
-            code.extend_from_slice(&arena_off.to_le_bytes());
+            // ─── On-stack arena (unchanged — byte-for-byte identical) ────
+            let nc_slot = post_now_next_slot - 8;
+            let arena_off = nc_slot - arena_size;
+            // Phase B slice 4a.2 — tmp slot pool sits BELOW the arena
+            // (deeper, more-negative addresses) so node_count_slot and
+            // arena_rbp_offset keep their slice-4a.1 layout. The first tmp
+            // is the i64 just below the arena's bottom byte.
+            let tmp_base = arena_off - 8;
+            // mov qword [rbp + nc_slot], 0  — initialize node_count to 0.
+            if nc_slot >= -128 {
+                code.extend_from_slice(&[0x48, 0xC7, 0x45]);
+                code.push(nc_slot as u8);
+                code.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+            } else {
+                code.extend_from_slice(&[0x48, 0xC7, 0x85]);
+                code.extend_from_slice(&nc_slot.to_le_bytes());
+                code.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+            }
+            // lea r11, [rbp + arena_off]  — set r11 to the start of the arena.
+            // REX.WR (0x4C) + LEA opcode 0x8D + ModRM disp32 form (0x9D)
+            // when arena_off doesn't fit in disp8; disp8 form (0x5D) when
+            // it does. arena_off is highly negative (frame is large when
+            // arena is present), so disp32 is the realistic case.
+            if arena_off >= -128 {
+                code.extend_from_slice(&[0x4C, 0x8D, 0x5D]);
+                code.push(arena_off as u8);
+            } else {
+                code.extend_from_slice(&[0x4C, 0x8D, 0x9D]);
+                code.extend_from_slice(&arena_off.to_le_bytes());
+            }
+            (nc_slot, arena_off, tmp_base, 0)
         }
-        (nc_slot, arena_off, tmp_base)
     } else {
-        (0, 0, 0)
+        (0, 0, 0, 0)
     };
 
     let loop_top = code.len();
@@ -3701,12 +3807,16 @@ fn emit_record_loop_prologue<'a>(
         arena_rbp_offset,
         node_count_slot,
         entry_size: arena_entry_size,
-        arena_abort_patches: Vec::new(),
+        // Off-stack mmap arena: route the MAP_FAILED jae through the shared
+        // sys_exit(1) arena abort tail (fail-closed on allocation failure).
+        arena_abort_patches: mmap_fail_patches,
         tmp_slot_base,
         variant_tags,
         variant_fields,
         group_concept_names: group_concept_names_owned,
         arena_max_nodes,
+        use_mmap,
+        arena_base_slot,
     })
 }
 
@@ -4439,6 +4549,11 @@ fn emit_callable_into<'a>(
             arena_abort_patches: std::cell::RefCell::new(Vec::new()),
             in_callable: true,
             callable_node_count_seed: *tmp_slots_val,
+            // Callables address node_count via [r11 + arena_size] and trust
+            // r11 across call/ret — they never reach the entry frame's
+            // arena_base_slot, so these are inert in the callable path.
+            use_mmap: false,
+            arena_base_slot: 0,
         }
     });
     let arena_ctx_ref = arena_ctx_owned.as_ref();
@@ -12343,6 +12458,50 @@ struct ArenaCtx<'a> {
     /// Slice 4a.3 placeholder (unused in current emit but reserved for
     /// future per-rule node_count seeding).
     callable_node_count_seed: i32,
+    /// Off-stack mmap arena (2026-06-22): true when the arena was allocated
+    /// via mmap (large group). At ENTRY level (in_callable=false) this flips
+    /// r11 reloads from `lea [rbp+arena_rbp_offset]` to `mov r11, [rbp+
+    /// arena_base_slot]`, and node_count addressing from `[rbp+
+    /// node_count_slot]` to `[r11+arena_size]`. Callables (in_callable=true)
+    /// already use `[r11+arena_size]` and trust r11 across call/ret, so they
+    /// are unaffected by this flag.
+    use_mmap: bool,
+    /// Off-stack mmap arena: rbp offset of the frame slot holding the mmap
+    /// base pointer. Only meaningful at entry level when `use_mmap` is true.
+    arena_base_slot: i32,
+}
+
+/// Off-stack mmap arena (2026-06-22): emit "r11 = arena base" at an
+/// ENTRY-level arena-access site. Under mmap the base is reloaded from the
+/// frame slot (`mov r11, [rbp+arena_base_slot]`); on the stack it is the
+/// `lea r11, [rbp+arena_rbp_offset]` of the pre-mmap path. This is the
+/// single discipline point for corrections #2 (VariantConstruct) and #3
+/// (MatchVariant) — every entry-level arena access reloads r11 here so a
+/// preceding syscall (which clobbers r11) cannot corrupt the base.
+/// Callables (in_callable=true) keep trusting the r11 register and must NOT
+/// call this (they cannot reach the rbp slot).
+fn emit_arena_base_into_r11(code: &mut Vec<u8>, ac: &ArenaCtx) {
+    if ac.use_mmap {
+        // mov r11, [rbp + arena_base_slot]  (REX.WR 0x4C, 0x8B, /3)
+        let s = ac.arena_base_slot;
+        if s >= -128 {
+            code.extend_from_slice(&[0x4C, 0x8B, 0x5D]);
+            code.push(s as u8);
+        } else {
+            code.extend_from_slice(&[0x4C, 0x8B, 0x9D]);
+            code.extend_from_slice(&s.to_le_bytes());
+        }
+    } else {
+        // lea r11, [rbp + arena_rbp_offset]  (pre-mmap stack path)
+        let aro = ac.arena_rbp_offset;
+        if aro >= -128 {
+            code.extend_from_slice(&[0x4C, 0x8D, 0x5D]);
+            code.push(aro as u8);
+        } else {
+            code.extend_from_slice(&[0x4C, 0x8D, 0x9D]);
+            code.extend_from_slice(&aro.to_le_bytes());
+        }
+    }
 }
 
 impl<'a> ArenaCtx<'a> {
@@ -12366,6 +12525,8 @@ impl<'a> ArenaCtx<'a> {
             arena_abort_patches: std::cell::RefCell::new(Vec::new()),
             in_callable: false,
             callable_node_count_seed: 0,
+            use_mmap: ctx.use_mmap,
+            arena_base_slot: ctx.arena_base_slot,
         })
     }
 
@@ -13720,7 +13881,21 @@ fn emit_eval_expr(
             // When in_callable=false (slice 4a.2 path), the existing
             // rbp-relative load runs byte-for-byte unchanged.
             let arena_size_bytes = (ac.max_nodes as i32) * ac.entry_size;
-            if ac.in_callable {
+            // Off-stack mmap arena (correction #1 + #2): under mmap the
+            // node_count lives INSIDE the mmap region at [r11 + arena_size]
+            // (same address as the callable path), so the entry path must
+            // (a) reload r11 from arena_base_slot FIRST — a per-record
+            // syscall before this construct may have clobbered r11 — and
+            // (b) read node_count via [r11 + arena_size], NOT
+            // [rbp + node_count_slot] (which doesn't exist under mmap).
+            if ac.use_mmap && !ac.in_callable {
+                emit_arena_base_into_r11(code, ac);
+            }
+            // node_count lives at [r11 + arena_size] for both the callable
+            // path AND the entry mmap path; only the stack entry path uses
+            // the rbp slot.
+            let nc_via_r11 = ac.in_callable || ac.use_mmap;
+            if nc_via_r11 {
                 // mov rax, [r11 + arena_size_bytes]
                 //   r11-indirect needs REX.B; disp32 form when offset > 127.
                 if arena_size_bytes <= 127 {
@@ -13766,7 +13941,12 @@ fn emit_eval_expr(
             // no longer addressable from the callable's rbp. Recursive
             // bodies have no syscalls (slice constraint), so r11
             // survives across `call`/`ret` and we trust it.
-            if !ac.in_callable {
+            // Stack entry path: lea r11 from arena_rbp_offset (byte-for-byte
+            // unchanged). Mmap entry path: r11 was already reloaded from the
+            // base slot before Step 2, and nothing between Steps 2-4 emits a
+            // syscall (slice-4c field exprs are allocation-free), so no
+            // re-reload is needed. Callables trust r11 across call/ret.
+            if !ac.in_callable && !ac.use_mmap {
                 let aro = ac.arena_rbp_offset;
                 if aro >= -128 {
                     code.extend_from_slice(&[0x4C, 0x8D, 0x5D]);
@@ -13840,8 +14020,11 @@ fn emit_eval_expr(
             // inc qword [rbp + node_count_slot]  (REX.W 0x48, 0xFF, /0 = 0x45 disp8)
             //
             // Slice 4a.3: when in_callable, address node_count via r11 +
-            // arena_size (rbp-independent — see Step 2 rationale).
-            if ac.in_callable {
+            // arena_size (rbp-independent — see Step 2 rationale). Off-stack
+            // mmap (correction #1): the entry path ALSO bumps via
+            // [r11 + arena_size] — node_count lives in the mmap region, and
+            // r11 is still the (un-clobbered) base from Step 2's reload.
+            if nc_via_r11 {
                 // inc qword [r11 + arena_size_bytes]  (REX.WB 0x49, 0xFF, /0 = 0x43)
                 if arena_size_bytes <= 127 {
                     code.extend_from_slice(&[0x49, 0xFF, 0x43]);
@@ -13917,6 +14100,20 @@ fn emit_eval_expr(
                     field_ranges, text_bindings, self_call,
                     Some(ac),
                 )?;
+                // Off-stack mmap arena (correction #3): at ENTRY level the
+                // r11 register may have been clobbered by a per-record
+                // syscall (text write / append_file) before this dispatch.
+                // The Step-2 `add rax, r11` below trusts r11 as the arena
+                // base, so under mmap reload it from arena_base_slot first.
+                // Callables (in_callable=true) trust r11 across call/ret and
+                // must NOT reload (they cannot reach the rbp slot). On the
+                // stack the pre-mmap path also trusted the register, but the
+                // entry-level dispatch ran before any per-record syscall in
+                // every existing example — keep that path byte-identical by
+                // only reloading under mmap.
+                if ac.use_mmap && !ac.in_callable {
+                    emit_arena_base_into_r11(code, ac);
+                }
                 // Step 2: compute entry pointer in rax = r11 + idx * entry_size.
                 // mov r10, entry_size_imm
                 code.push(0x49);
