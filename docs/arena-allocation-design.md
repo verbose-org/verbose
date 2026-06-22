@@ -300,6 +300,58 @@ This is the validated, implementation-ready next slice. Suggested execution: wor
 the C-tok fix), strong gate (byte-identity for small groups + cross-check + scale test), commit-don't-
 revert, monitored via worktree state.
 
+### Review corrections (2026-06-21) — REQUIRED before implementation; the spec above has a FATAL bug
+
+Strategic review audited this spec against the emitter. The arc is correctly aimed and the mmap
+mechanics / MAP_FAILED check / 4M index path are sound, BUT the r11 discipline was aimed at the wrong
+target: the syscalls are already guarded (streaming push/pop r11 at 5066) or gated out of group
+programs (effects refused by the recursion-constraint walk, compile_native_code:418-475). The real
+dangers are THREE register-trust paths the spec missed, one fatal. Fix ALL before implementing:
+
+1. **FATAL — node_count split-brain (the spec's "keep node_count_slot in the frame" is WRONG).**
+   node_count is deliberately at `arena_base + arena_size`, addressed `[r11 + arena_size]` inside
+   callables (native.rs:13722-13732, 13844-13852; rationale at 12325-12341) and `[rbp +
+   node_count_slot]` at entry. In the STACK case these are the SAME byte (`node_count_slot =
+   arena_rbp_offset + arena_size`, `r11 = rbp + arena_rbp_offset`). Under mmap, `r11 = mmap_base` but
+   the frame slot is elsewhere → the counter SPLITS (callable bumps the mmap-tail counter, entry the
+   frame slot) → wrong index → wrong tag → exit(2). **Fix: under mmap allocate `arena_bytes =
+   arena_size + 8` (then page-round) and route BOTH paths through `[r11 + arena_size]` — node_count
+   lives INSIDE the mmap region; the entry path stops using `[rbp + node_count_slot]`.**
+2. **Gap — VariantConstruct entry-level r11 reload is `lea [rbp + arena_rbp_offset]`** (native.rs:
+   13769-13778), which under mmap points into the STACK FRAME, not the arena → silent write-to-frame
+   corruption, no syscall involved. **Fix: under mmap, reload `mov r11, [rbp + arena_base_slot]`.**
+3. **Gap — MatchVariant trusts the r11 register with no reload, even at entry** (native.rs:
+   13913-13928: `imul rax,r10; add rax,r11`). A per-record write (emit_text_write_to_fd 7924+,
+   emit_text_fold_program 11433) clobbers r11, then a later MatchVariant reads a corrupted base.
+   Latent today, LIVE under mmap. **Fix: MatchVariant reloads r11 from arena_base_slot at entry
+   (trust across call/ret in callables, as today).**
+   → The unifying fix for 1-3: at ENTRY level under mmap, treat r11 as reloadable from
+   `arena_base_slot` before every arena access; in CALLABLES keep "trust r11" (they can't reach the
+   slot, and the parser callables don't clobber it). Consider a single `emit_arena_base_into_r11`
+   helper used at every entry-level arena-access site instead of the current `lea`/trust mix.
+
+4. **Threshold premise was FALSE: vexprparse (~3.1 MB arena: max_nodes 65535 × entry 48) ALREADY
+   flips to mmap.** Every OTHER group example is tiny (sum_chain ~3KB, vtokenstream ~19KB, all ≤64KiB
+   → stay on stack, byte-identical). So vexprparse is the mmap CANARY — its ~8 behavior-asserting
+   native tests (native.rs:20040+, 29004+) ARE the mmap correctness gate, not a stack survivor. The
+   threshold value 64KiB is fine (insensitive between ~20KiB and 3MB); only the prose claim was wrong.
+   (The review floated "always-mmap-for-groups / single r11-relative discipline" as safer-one-path;
+   acceptable to keep the threshold IF the mmap path implements 1-3 correctly and the stack path is
+   left byte-identical — but a single addressing discipline collapses 1+2, worth considering.)
+5. **Cap raise needs TWO additions:** (a) **split `PHASE_B1_MAX_BOUND`** (verifier.rs:1418, gates BOTH
+   max_depth at 1450 and max_nodes at 1465) into `PHASE_B1_MAX_NODES = 4_000_000` and
+   `PHASE_B1_MAX_DEPTH` (keep 65535 — raising depth without a runtime check is false explicitation);
+   (b) **add a verifier check `max_nodes × entry_size ≤ i32::MAX`** — `arena_size: i32` (native.rs:830)
+   and the disp32 node_count offset would WRAP for a future wide-variant group at 4M (no check today).
+6. **Scale-test gate must measure STACK high-water**, not just arena RSS — the mmap arena unlocks ~500k
+   nodes on the heap while parse_program/tokenize_indent recursion still drives the 8 MB stack; depth
+   (the next wall) could co-bite at the unlocked scale and must be observed, not discovered post-merge.
+
+Bottom line from review: **(b) implement with these additions** — the node_count split-brain (1) is
+fatal as the spec is written. Suggested execution unchanged: worktree subagent, gate = small-group
+byte-identity + vexprparse's 8 runtime tests (the mmap canary) + native==interpreter cross-check +
+scale test (count_rules clears 800/1600/3200 + stack high-water) + mmap-fail path.
+
 ## What this arc is NOT
 
 - Not a general allocator / GC. One mmap'd region per process, freed at exit.
