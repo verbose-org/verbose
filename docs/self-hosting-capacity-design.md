@@ -329,6 +329,39 @@ exactly as that design's "follow-on" note predicted. The fix is that arc, revive
 The walls fell in the right order once measured: O(N²) time (fixed) → arena capacity (now). The
 arena arc's decline + revival is the cleanest vindication of "measure each wall in order."
 
+## Call-depth bisection (2026-06-21) — NOT a wall for real source. Capacity arc effectively COMPLETE.
+
+With time (cursor + string_run) and arena (mmap off-stack) fixed, bisected the "next wall" — call
+depth (the non-tail recursion: tokenize_indent per line, tokenize_line per token, parse_program per
+rule, parse_add per operator, all driving the 8 MB stack). Three depth dimensions, measured on the
+mmap-arena + bounds-raised binary:
+
+| dimension | what recurses | SIGSEGV threshold | real vexprparse source |
+|---|---|---|---|
+| one huge expression / single long line | tokenize_line (per token) + parse_add (per op) | **~29,000 operators** (28k ok, 29k crash) | **max 56 operators on any line** (~500× margin) |
+| many short lines | tokenize_indent (per line) | >9,000 lines OK (argv-limited test) | ~6,024 non-comment lines (under) |
+| many rules | parse_program (per rule) | >3,000 rules OK (argv-limited) | ~300 rules (10× under) |
+
+**Call depth does NOT block self-hosting the real vexprparse source.** The SIGSEGV is purely
+pathological — a single ~29k-operator expression, which real Verbose never contains (max 56). Real
+source's depth (6k lines / 300 rules / 56-op max expr) sits comfortably under all three thresholds on
+the default 8 MB stack. (Deep tail-recursion / TCO would only matter for pathological inputs; deferred
+indefinitely — not on the self-hosting path.)
+
+### Capacity arc — status
+
+| wall | status |
+|---|---|
+| O(N²) time (cursor parser O(1) + string_run tokenizer O(N)) | ✅ fixed, linear, ~900× |
+| arena capacity (off-stack mmap) | ✅ fixed, clears 800/1600/3200, linear |
+| call depth | ✅ non-issue for real source (29k-op threshold ≫ real max 56) |
+| 2 native bugs (r11 clobber, nondeterminism) + JSON \n decode | ✅ fixed (cross-check restored) |
+
+**The only remaining step to actually parse vexprparse's own source = the position field bounds (C3):**
+[0,256]/[0,512]/[0,4096] must be raised to cover ~57k-token-scale positions. Now MECHANICAL and safe
+(arena is mmap-backed, time linear, depth fine) — modulo the optimizer-default-range dead-branch
+re-audit (keep explicit ranges). That's the capstone slice; the structural walls are all down.
+
 ## What this arc is NOT
 
 - Not the arena-allocation arc (declined) — that fixed capacity nobody was hitting. This fixes the
