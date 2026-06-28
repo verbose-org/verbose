@@ -33958,6 +33958,86 @@ rule two
         let _ = std::fs::remove_file(&cc);
     }
 
+    /// Records-arc brick R3: the self-hosted parser (examples/vexprparse.verbose)
+    /// now PARSES the two rule-body forms R2 only SKIPPED — `::` variant
+    /// construction and block-form `match` — into real AST instead of AstErr.
+    /// PARSER-ONLY (downstream eval/type/checker/codegen get stub arms; real
+    /// handling is R6/R7). The observable is `shape_ast`'s fingerprint: AstVariant
+    /// has a dedicated band (1000000000) and AstMatch (100000000), both ABOVE the
+    /// brick-7 AstStr band (10000000), so a parsed variant/match body returns a
+    /// hand-derivable number DISTINCT from the AstErr fingerprint (0).
+    ///
+    /// The driver is the brick-5 `shape` rule (tokenize → parse_or → shape_ast),
+    /// compiled natively and run argv-style: argv[1] = source, argv[2] = pos (0).
+    /// Cases:
+    ///   - `Token::Eof`                         → AstVariant, no fields      → 1000000000
+    ///   - `TokenList::Cons { head: x, tail: y }` → AstVariant + 2 AstVar    → 1000000200
+    ///   - `match x: Cons(h, t) => Token::Eof  Nil => Token::Eof`
+    ///         → AstMatch (1e8) + scrut AstVar (100) + 2 arm bodies AstVariant (2e9)
+    ///         → 2100000100   (also verified in block form with newlines)
+    /// Regression guard: pre-R3 toy-grammar shapes are UNCHANGED — `x` → 100 (AstVar),
+    /// `1 + 2` → 10 (AstBin) — proving the stub arms don't perturb existing AST shapes.
+    #[test]
+    fn records_r3_variant_and_match_parse_to_ast() {
+        let src = std::fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let bin = std::env::temp_dir().join("verbosec_test_r3_shape");
+        compile_native(&program, "shape", bin.to_str().unwrap(), false, false)
+            .expect("shape must compile natively (R3 parse rules included)");
+
+        let run = |source: &str| -> i64 {
+            let r = std::process::Command::new(&bin)
+                .arg(source)
+                .arg("0")
+                .output()
+                .expect("spawn R3 shape driver");
+            assert!(
+                r.status.success(),
+                "shape must exit 0 for {:?}; got {:?}",
+                source, r.status
+            );
+            String::from_utf8_lossy(&r.stdout)
+                .trim()
+                .parse::<i64>()
+                .unwrap_or_else(|_| panic!("shape produced non-number for {:?}: {:?}", source, r.stdout))
+        };
+
+        // Variant construction parses to AstVariant (band present), NOT AstErr (0).
+        assert_eq!(
+            run("Token::Eof"),
+            1_000_000_000,
+            "braceless variant `Token::Eof` parses to AstVariant (band 1e9), not AstErr (0)"
+        );
+        assert_eq!(
+            run("TokenList::Cons { head: x, tail: y }"),
+            1_000_000_200,
+            "variant with two field values parses to AstVariant + 2 AstVar (1e9 + 200)"
+        );
+
+        // Block-form match (flat single-line arm sequence) parses to AstMatch.
+        assert_eq!(
+            run("match x: Cons(h, t) => Token::Eof  Nil => Token::Eof"),
+            2_100_000_100,
+            "match parses to AstMatch (1e8) + scrut AstVar (100) + 2 arm-body AstVariant (2e9), \
+             NOT the AstErr fingerprint (0)"
+        );
+        // Same match, multi-line block form (Newline-separated arms) — same fingerprint.
+        assert_eq!(
+            run("match x:\n  Cons(h, t) => Token::Eof\n  Nil => Token::Eof\n"),
+            2_100_000_100,
+            "block-form match (newline-separated arms) parses to the same AstMatch fingerprint"
+        );
+
+        // Regression: pre-R3 toy-grammar shapes are byte-for-byte unchanged.
+        assert_eq!(run("x"), 100, "AstVar shape unchanged by R3 stub arms");
+        assert_eq!(run("1 + 2"), 10, "AstBin shape unchanged by R3 stub arms");
+
+        let _ = std::fs::remove_file(&bin);
+    }
+
     /// Full-file companion to the R2 milestone: count_rules on the WHOLE real
     /// self-source (examples/vexprparse.verbose, ~500 KB > the 128 KB single-argv
     /// limit) via the INTERPRETER path, called directly with a constructed

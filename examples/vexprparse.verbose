@@ -207,6 +207,83 @@ concept_group VExpr [max_depth: 4096, max_nodes: 2000000]
       AstStr of (start : number, len : number)
       -- An error/placeholder leaf (unexpected token); evaluates to 0
       AstErr
+      -- Records-arc brick R3: a VARIANT construction `Concept::Variant { f: e, ... }`.
+      -- cstart/clen = the concept-name source span; vstart/vlen = the variant-name
+      -- source span (both identified by span, like AstVar — R3 does not decode the
+      -- names to bytes). `fields` is the (possibly empty) cons-list of named field
+      -- initializers (VFieldList); a braceless form like `Token::Eof` has fields =
+      -- VFNil. R3 is PARSER-ONLY: eval / type / codegen get STUB arms (real handling
+      -- is R6/R7); shape_ast gives it a dedicated band so a parsed variant body has a
+      -- predictable fingerprint.
+      AstVariant of (cstart : number, clen : number, vstart : number, vlen : number, fields : VFieldList)
+      -- Records-arc brick R3: a block-form `match scrut: Variant(binders) => body ...`.
+      -- `scrut` is the scrutinee sub-expression (a full parse_or); `arms` is the
+      -- cons-list of arms (ArmList), each carrying the variant-name span, its binder
+      -- list, and the arm body sub-expression. R3 is PARSER-ONLY: eval / type / codegen
+      -- get STUB arms (real handling is R6/R7); shape_ast gives it a dedicated band.
+      AstMatch of (scrut : Ast, arms : ArmList)
+
+  -- Records-arc brick R3: a cons-list of a variant-construction's named field
+  -- initializers. Each cell carries the field NAME span (name_start, name_len) and
+  -- the RHS expression `val` (a full parse_or subtree); `rest` chains to the next
+  -- field, VFNil terminates. Same cons family as ArgList (ArgCons/ArgNil) — built
+  -- by parse_vfields, the field-list analogue of parse_args.
+  concept VFieldList
+    @intention: "Cons-list of a variant construction's named field initializers (name span + value)"
+    @source: vexprparse.intent:64
+    variants:
+      VFCons of (name_start : number, name_len : number, val : Ast, rest : VFieldList)
+      VFNil
+
+  -- Records-arc brick R3: a cons-list of `match` arms. Each ArmCons carries the
+  -- arm's variant-name span (vstart, vlen), its positional binder list (BinderList),
+  -- the arm body expression (a full parse_or), and the rest of the arms; ArmNil ends
+  -- the list. Same cons family as ArgList / VFieldList. Built by parse_arms.
+  concept ArmList
+    @intention: "Cons-list of match arms (variant-name span + binders + body expression)"
+    @source: vexprparse.intent:64
+    variants:
+      ArmCons of (vstart : number, vlen : number, binders : BinderList, body : Ast, rest : ArmList)
+      ArmNil
+
+  -- Records-arc brick R3: a cons-list of an arm's POSITIONAL binders — each a source
+  -- span (start, len) for the binder name, in source order (e.g. `Cons(head, tail)`
+  -- yields two BindCons). BindNil terminates (a zero-binder arm like `Nil` or
+  -- `Eof`). Same identity model as AstVar / a Binding name (R3 does not decode the
+  -- binder name to bytes). Built by parse_binders.
+  concept BinderList
+    @intention: "Cons-list of a match arm's positional binders (each a source span)"
+    @source: vexprparse.intent:64
+    variants:
+      BindCons of (start : number, len : number, rest : BinderList)
+      BindNil
+
+  -- Records-arc brick R3: a variant-field-list parse result — the VFieldList built
+  -- plus the token cell just past the closing '}'. Same Parsed-threading shape as
+  -- ParsedArgs's MkArgs.
+  concept ParsedVFields
+    @intention: "A variant-field-list parse result: the VFieldList built plus the end cell"
+    @source: vexprparse.intent:64
+    variants:
+      MkVF of (fields : VFieldList, next : TokenList)
+
+  -- Records-arc brick R3: a match-arm-list parse result — the ArmList built plus the
+  -- token cell just past the last arm (at the closing DEDENT / Eof). Same
+  -- Parsed-threading shape as ParsedArgs's MkArgs.
+  concept ParsedArms
+    @intention: "A match-arm-list parse result: the ArmList built plus the end cell"
+    @source: vexprparse.intent:64
+    variants:
+      MkAL of (arms : ArmList, next : TokenList)
+
+  -- Records-arc brick R3: a binder-list parse result — the BinderList built plus the
+  -- token cell just past the closing ')' (or the unchanged cell when an arm has no
+  -- parenthesized binders). Same Parsed-threading shape as ParsedArgs's MkArgs.
+  concept ParsedBinders
+    @intention: "A binder-list parse result: the BinderList built plus the end cell"
+    @source: vexprparse.intent:64
+    variants:
+      MkBL of (binders : BinderList, next : TokenList)
 
   concept ArgList
     @intention: "Cons-list of call-argument AST nodes (like TokenList but for args)"
@@ -672,9 +749,12 @@ rule kw4
       bound : 64
 
 
--- five-letter keywords: false=10 (brick 7 — boolean literal). The only 5-byte
--- keyword so far; longer-or-other 5-byte identifier runs stay plain idents
--- (kw == 0). `false` = f(102) a(97) l(108) s(115) e(101).
+-- five-letter keywords: false=10 (brick 7 — boolean literal); match=11 (brick R3 —
+-- block-form pattern match). The parse layer is source-free (ParseState carries only
+-- the token cell), so `match` MUST be a keyword recognized by token kind, exactly as
+-- `false` / `then` / `else` are — there is no span check available in parse_primary.
+-- longer-or-other 5-byte identifier runs stay plain idents (kw == 0). `false` = f(102)
+-- a(97) l(108) s(115) e(101); `match` = m(109) a(97) t(116) c(99) h(104).
 rule kw5
   @intention: "Classify a 5-byte identifier run as a keyword (0 if none)"
   @source: vexprparse.intent:7
@@ -683,7 +763,7 @@ rule kw5
   output:
     out : number
   logic:
-    out = if byte_at(s.source, s.pos) == 102 and (byte_at(s.source, s.pos + 1) == 97 and (byte_at(s.source, s.pos + 2) == 108 and (byte_at(s.source, s.pos + 3) == 115 and byte_at(s.source, s.pos + 4) == 101))) then 10 else 0
+    out = if byte_at(s.source, s.pos) == 102 and (byte_at(s.source, s.pos + 1) == 97 and (byte_at(s.source, s.pos + 2) == 108 and (byte_at(s.source, s.pos + 3) == 115 and byte_at(s.source, s.pos + 4) == 101))) then 10 else if byte_at(s.source, s.pos) == 109 and (byte_at(s.source, s.pos + 1) == 97 and (byte_at(s.source, s.pos + 2) == 116 and (byte_at(s.source, s.pos + 3) == 99 and byte_at(s.source, s.pos + 4) == 104))) then 11 else 0
   proofs:
     purity:
       reads : [s.source, s.pos]
@@ -1700,6 +1780,68 @@ concept IfBuildState
     els : Parsed
 
 
+-- Records-arc brick R3: variant-construction states. A VariantState carries the
+-- concept span + variant span + the parsed field list; variant_build extracts the
+-- VFieldList + end cell and builds the AstVariant node. Same shape as CallState.
+concept VariantState
+  @intention: "Concept span + variant span + the parsed field list of a variant construction"
+  @source: vexprparse.intent:64
+  fields:
+    cstart : number [0, 4000000]
+    clen : number [0, 4000000]
+    vstart : number [0, 4000000]
+    vlen : number [0, 4000000]
+    pfields : ParsedVFields
+
+
+-- Records-arc brick R3: a vfield-cons state — one field's name span plus its parsed
+-- value (as a Parsed). vfields_cons extracts the value node + end cell, peeks for a
+-- ',' (continue) or '}' (stop). Mirror of ArgConsState.
+concept VFieldConsState
+  @intention: "One parsed variant field (name span + value) continuing the field cons-list"
+  @source: vexprparse.intent:64
+  fields:
+    name_start : number [0, 4000000]
+    name_len : number [0, 4000000]
+    value : Parsed
+
+
+-- Records-arc brick R3: a vfield-prepend state — the head field's name span + value
+-- node + the parsed rest of the field list. Mirror of ArgPrependState.
+concept VFieldPrependState
+  @intention: "Head variant field (name span + value) + the parsed rest of the field list"
+  @source: vexprparse.intent:64
+  fields:
+    name_start : number [0, 4000000]
+    name_len : number [0, 4000000]
+    val : Ast
+    rest : ParsedVFields
+
+
+-- Records-arc brick R3: a binder-prepend state — the head binder span + the parsed
+-- rest of the binder list. Mirror of ArgPrependState (binders carry no sub-AST).
+concept BinderPrependState
+  @intention: "Head binder span + the parsed rest of the binder list"
+  @source: vexprparse.intent:64
+  fields:
+    start : number [0, 4000000]
+    len : number [0, 4000000]
+    rest : ParsedBinders
+
+
+-- Records-arc brick R3: an arm-join state — one arm's variant span + its parsed
+-- binder list. arm_join skips the '=>', parses the body, recurses parse_arms on the
+-- rest, and conses the arm. Analogue of LetJoinState (carries a parsed sub-result
+-- and continues the recursion).
+concept ArmJoinState
+  @intention: "An arm's variant span + its parsed binder list (continuing the arm list)"
+  @source: vexprparse.intent:64
+  fields:
+    vstart : number [0, 4000000]
+    vlen : number [0, 4000000]
+    binders : ParsedBinders
+
+
 -- Pull the ArgList out of a ParsedArgs result.
 rule parsed_args_list
   @intention: "The argument cons-list from a call-argument parse result"
@@ -1874,6 +2016,382 @@ rule call_build
       bound : 16
 
 
+-- ============================================================================
+-- Records-arc brick R3: VARIANT CONSTRUCTION and block-form MATCH parsing.
+-- ============================================================================
+
+-- pvf_fields / pvf_next: destructure a ParsedVFields result (the VFieldList +
+-- end cell). Mirror of parsed_args_list / parsed_args_next.
+rule pvf_fields
+  @intention: "The VFieldList from a variant-field-list parse result"
+  @source: vexprparse.intent:64
+  input:
+    p : ParsedVFields
+  output:
+    out : VFieldList
+  logic:
+    out = match p:
+      MkVF(fields, next) => fields
+  proofs:
+    purity:
+      reads : [p]
+      calls : []
+    termination:
+      bound : 16
+
+
+rule pvf_next
+  @intention: "The end cell from a variant-field-list parse result"
+  @source: vexprparse.intent:64
+  input:
+    p : ParsedVFields
+  output:
+    out : TokenList
+  logic:
+    out = match p:
+      MkVF(fields, next) => next
+  proofs:
+    purity:
+      reads : [p]
+      calls : []
+    termination:
+      bound : 16
+
+
+-- pal_arms / pal_next: destructure a ParsedArms result (the ArmList + end cell).
+rule pal_arms
+  @intention: "The ArmList from a match-arm-list parse result"
+  @source: vexprparse.intent:64
+  input:
+    p : ParsedArms
+  output:
+    out : ArmList
+  logic:
+    out = match p:
+      MkAL(arms, next) => arms
+  proofs:
+    purity:
+      reads : [p]
+      calls : []
+    termination:
+      bound : 16
+
+
+rule pal_next
+  @intention: "The end cell from a match-arm-list parse result"
+  @source: vexprparse.intent:64
+  input:
+    p : ParsedArms
+  output:
+    out : TokenList
+  logic:
+    out = match p:
+      MkAL(arms, next) => next
+  proofs:
+    purity:
+      reads : [p]
+      calls : []
+    termination:
+      bound : 16
+
+
+-- pbl_binders / pbl_next: destructure a ParsedBinders result (the BinderList +
+-- end cell).
+rule pbl_binders
+  @intention: "The BinderList from a binder-list parse result"
+  @source: vexprparse.intent:64
+  input:
+    p : ParsedBinders
+  output:
+    out : BinderList
+  logic:
+    out = match p:
+      MkBL(binders, next) => binders
+  proofs:
+    purity:
+      reads : [p]
+      calls : []
+    termination:
+      bound : 16
+
+
+rule pbl_next
+  @intention: "The end cell from a binder-list parse result"
+  @source: vexprparse.intent:64
+  input:
+    p : ParsedBinders
+  output:
+    out : TokenList
+  logic:
+    out = match p:
+      MkBL(binders, next) => next
+  proofs:
+    purity:
+      reads : [p]
+      calls : []
+    termination:
+      bound : 16
+
+
+-- parse_vfields: parse a (possibly empty) comma-separated `name : expr` field list
+-- inside `{ ... }`, consuming the '}'. Cursor positioned just past the '{'. Mirror
+-- of parse_args. '}' (op 24) immediately => empty VFNil. Otherwise the leading
+-- token is the field NAME (IDENT at st.cell), the ':' is at st.cell+1 (grammar is
+-- fixed), and the value parse is a full parse_or from st.cell+2 (LAZILY, in the
+-- else branch), handed to vfields_cons.
+rule parse_vfields
+  @intention: "Parse a comma-separated variant field list, consuming the '}'"
+  @source: vexprparse.intent:64
+  input:
+    st : ParseState
+  output:
+    out : ParsedVFields
+  logic:
+    let opc = peek_op_code(st.cell)
+    let isclose = if opc == 24 then 1 else 0
+    let name_start = peek_start(st.cell)
+    let name_len = peek_len(st.cell)
+    out = if isclose == 1 then ParsedVFields::MkVF { fields: VFieldList::VFNil, next: advance(Advance { lst: st.cell, k: 1 }) } else vfields_cons(VFieldConsState { name_start: name_start, name_len: name_len, value: parse_or(ParseState { cell: advance(Advance { lst: st.cell, k: 2 }) }) })
+  proofs:
+    purity:
+      reads : [st.cell]
+      calls : [peek_op_code, peek_start, peek_len, parse_or, vfields_cons, advance]
+    termination:
+      bound : 512
+
+
+-- vfields_cons: fold one parsed field initializer into the VFieldList. Extract the
+-- value node + end cell, peek the next token: a ',' (op 11) continues — parse the
+-- REST (LAZILY) and prepend this field; a '}' (op 24) stops, consuming it; anything
+-- else stops too (missing '}' tolerated, like args_cons). Mirror of args_cons.
+rule vfields_cons
+  @intention: "Fold one parsed variant field into the cons-list, continuing on ',' or stopping on '}'"
+  @source: vexprparse.intent:64
+  input:
+    cs : VFieldConsState
+  output:
+    out : ParsedVFields
+  logic:
+    let val_node = parsed_node(cs.value)
+    let val_next = parsed_next(cs.value)
+    let opc = peek_op_code(val_next)
+    let iscomma = if opc == 11 then 1 else 0
+    let close_next = if opc == 24 then advance(Advance { lst: val_next, k: 1 }) else val_next
+    out = if iscomma == 1 then vfields_prepend(VFieldPrependState { name_start: cs.name_start, name_len: cs.name_len, val: val_node, rest: parse_vfields(ParseState { cell: advance(Advance { lst: val_next, k: 1 }) }) }) else ParsedVFields::MkVF { fields: VFieldList::VFCons { name_start: cs.name_start, name_len: cs.name_len, val: val_node, rest: VFieldList::VFNil }, next: close_next }
+  proofs:
+    purity:
+      reads : [cs.name_start, cs.name_len, cs.value]
+      calls : [parsed_node, parsed_next, peek_op_code, vfields_prepend, parse_vfields, advance]
+    termination:
+      bound : 512
+
+
+-- vfields_prepend: cons the head field onto the front of the parsed rest of the
+-- field list, carrying the rest's end cell through. Mirror of args_prepend.
+rule vfields_prepend
+  @intention: "Cons the head variant field onto the front of the parsed rest of the list"
+  @source: vexprparse.intent:64
+  input:
+    ps : VFieldPrependState
+  output:
+    out : ParsedVFields
+  logic:
+    let rest_list = pvf_fields(ps.rest)
+    let rest_next = pvf_next(ps.rest)
+    out = ParsedVFields::MkVF { fields: VFieldList::VFCons { name_start: ps.name_start, name_len: ps.name_len, val: ps.val, rest: rest_list }, next: rest_next }
+  proofs:
+    purity:
+      reads : [ps.name_start, ps.name_len, ps.val, ps.rest]
+      calls : [pvf_fields, pvf_next]
+    termination:
+      bound : 16
+
+
+-- variant_build: given the concept span, variant span, and parsed field list, build
+-- the AstVariant node carrying the VFieldList and the end cell. Mirror of call_build.
+rule variant_build
+  @intention: "Build an AstVariant node from the concept/variant spans and the parsed field list"
+  @source: vexprparse.intent:64
+  input:
+    vs : VariantState
+  output:
+    out : Parsed
+  logic:
+    let flist = pvf_fields(vs.pfields)
+    let fnext = pvf_next(vs.pfields)
+    out = Parsed::Mk { node: Ast::AstVariant { cstart: vs.cstart, clen: vs.clen, vstart: vs.vstart, vlen: vs.vlen, fields: flist }, next: fnext }
+  proofs:
+    purity:
+      reads : [vs.cstart, vs.clen, vs.vstart, vs.vlen, vs.pfields]
+      calls : [pvf_fields, pvf_next]
+    termination:
+      bound : 16
+
+
+-- parse_binders: parse an arm's OPTIONAL parenthesized positional binder list.
+-- Cursor positioned at the token right after the arm's variant-name IDENT. A '('
+-- (op 21) opens the list — binders_scan from just past it (LAZILY). Anything else
+-- means a zero-binder arm (e.g. `Nil =>` / `Eof =>`): BindNil, cursor unchanged.
+rule parse_binders
+  @intention: "Parse an arm's optional parenthesized binder list (BindNil if no parens)"
+  @source: vexprparse.intent:64
+  input:
+    st : ParseState
+  output:
+    out : ParsedBinders
+  logic:
+    let opc = peek_op_code(st.cell)
+    let isparen = if opc == 21 then 1 else 0
+    out = if isparen == 1 then binders_scan(ParseState { cell: advance(Advance { lst: st.cell, k: 1 }) }) else ParsedBinders::MkBL { binders: BinderList::BindNil, next: st.cell }
+  proofs:
+    purity:
+      reads : [st.cell]
+      calls : [peek_op_code, binders_scan, advance]
+    termination:
+      bound : 16
+
+
+-- binders_scan: scan the comma-separated IDENT binder names inside '( ... )',
+-- consuming the ')'. Cursor positioned just past the '('. A ')' (op 22) immediately
+-- => empty BindNil. Otherwise the leading token is a binder IDENT (span at st.cell);
+-- peek the token after it: a ',' (op 11) continues (LAZILY) from st.cell+2, a ')'
+-- (op 22) stops consuming it (next = st.cell+2), anything else stops at st.cell+1.
+-- Binders carry no sub-expression, so the recursion is a plain forward scan.
+rule binders_scan
+  @intention: "Scan the comma-separated binder names inside parens, consuming the ')'"
+  @source: vexprparse.intent:64
+  input:
+    st : ParseState
+  output:
+    out : ParsedBinders
+  logic:
+    let opc = peek_op_code(st.cell)
+    let isclose = if opc == 22 then 1 else 0
+    let bstart = peek_start(st.cell)
+    let blen = peek_len(st.cell)
+    let after_opc = peek_op_code(advance(Advance { lst: st.cell, k: 1 }))
+    let iscomma = if after_opc == 11 then 1 else 0
+    let close_next = if after_opc == 22 then advance(Advance { lst: st.cell, k: 2 }) else advance(Advance { lst: st.cell, k: 1 })
+    out = if isclose == 1 then ParsedBinders::MkBL { binders: BinderList::BindNil, next: advance(Advance { lst: st.cell, k: 1 }) } else if iscomma == 1 then binders_prepend(BinderPrependState { start: bstart, len: blen, rest: binders_scan(ParseState { cell: advance(Advance { lst: st.cell, k: 2 }) }) }) else ParsedBinders::MkBL { binders: BinderList::BindCons { start: bstart, len: blen, rest: BinderList::BindNil }, next: close_next }
+  proofs:
+    purity:
+      reads : [st.cell]
+      calls : [peek_op_code, peek_start, peek_len, binders_prepend, binders_scan, advance]
+    termination:
+      bound : 512
+
+
+-- binders_prepend: cons the head binder span onto the front of the parsed rest of
+-- the binder list, carrying the rest's end cell through. Mirror of args_prepend.
+rule binders_prepend
+  @intention: "Cons the head binder onto the front of the parsed rest of the binder list"
+  @source: vexprparse.intent:64
+  input:
+    ps : BinderPrependState
+  output:
+    out : ParsedBinders
+  logic:
+    let rest_list = pbl_binders(ps.rest)
+    let rest_next = pbl_next(ps.rest)
+    out = ParsedBinders::MkBL { binders: BinderList::BindCons { start: ps.start, len: ps.len, rest: rest_list }, next: rest_next }
+  proofs:
+    purity:
+      reads : [ps.start, ps.len, ps.rest]
+      calls : [pbl_binders, pbl_next]
+    termination:
+      bound : 16
+
+
+-- parse_arms: parse the arm sequence of a block-form match. Reuses R2's separator
+-- skipping (skip_seps swallows the Newline + Indent before the first arm and the
+-- Newline between arms); the sweep stops at a Dedent (kind 800) or Eof (kind 0),
+-- returning ArmNil at that cell. Otherwise the leading token is the arm's
+-- variant-name IDENT (span at headp); its optional binder list is parsed from
+-- headp+1 and handed to arm_join, which skips '=>', parses the body, and recurses.
+-- A flat single-line arm sequence (no Newline/Indent/Dedent) also parses: skip_seps
+-- is a no-op and the sweep stops at Eof. Forward scan; bound + recursion breadcrumb.
+rule parse_arms
+  @intention: "Parse a match's arm sequence (Variant(binders) => body)* up to the closing DEDENT/Eof"
+  @source: vexprparse.intent:64
+  input:
+    st : ParseState
+  output:
+    out : ParsedArms
+  logic:
+    let headp = skip_seps(ParseState { cell: st.cell })
+    let knd = peek_kind(headp)
+    let isdedent = if knd == 800 then 1 else 0
+    let iseof = if knd == 0 then 1 else 0
+    let isend = if isdedent == 1 then 1 else iseof
+    let vstart = peek_start(headp)
+    let vlen = peek_len(headp)
+    out = if isend == 1 then ParsedArms::MkAL { arms: ArmList::ArmNil, next: headp } else arm_join(ArmJoinState { vstart: vstart, vlen: vlen, binders: parse_binders(ParseState { cell: advance(Advance { lst: headp, k: 1 }) }) })
+  proofs:
+    purity:
+      reads : [st.cell]
+      calls : [skip_seps, peek_kind, peek_start, peek_len, arm_join, parse_binders, advance]
+    termination:
+      bound : 512
+
+
+-- arm_join: the arm continuation. Given the arm's variant span + its parsed binder
+-- list, extract the binder list + the cell at '=>' (op 2), parse the body (a full
+-- parse_or from just past '=>'), recurse parse_arms on the body's end cell, and cons
+-- ArmCons(span, binders, body, rest). Analogue of stmt_let_join: the recursion is
+-- reached ONLY here (parse_arms gates entry on not-end), so the cycle terminates.
+rule arm_join
+  @intention: "Cons one parsed arm (span + binders + body) onto the recursively-parsed rest"
+  @source: vexprparse.intent:64
+  input:
+    aj : ArmJoinState
+  output:
+    out : ParsedArms
+  logic:
+    let blist = pbl_binders(aj.binders)
+    let bnext = pbl_next(aj.binders)
+    let body_parsed = parse_or(ParseState { cell: advance(Advance { lst: bnext, k: 1 }) })
+    let body_node = parsed_node(body_parsed)
+    let body_next = parsed_next(body_parsed)
+    let rest = parse_arms(ParseState { cell: body_next })
+    let rest_arms = pal_arms(rest)
+    let rest_next = pal_next(rest)
+    out = ParsedArms::MkAL { arms: ArmList::ArmCons { vstart: aj.vstart, vlen: aj.vlen, binders: blist, body: body_node, rest: rest_arms }, next: rest_next }
+  proofs:
+    purity:
+      reads : [aj.vstart, aj.vlen, aj.binders]
+      calls : [pbl_binders, pbl_next, parse_or, parsed_node, parsed_next, parse_arms, pal_arms, pal_next, advance]
+    termination:
+      bound : 512
+
+
+-- parse_match: build an AstMatch node. Cursor positioned at the `match` keyword.
+-- The scrutinee is a full parse_or from st.cell+1; it stops at the ':' (op 10).
+-- Skip the ':' and start the arm sweep at scrut_next+1 (parse_arms re-skips the
+-- Newline + Indent). Reached only from parse_primary's match branch (guarded by the
+-- match keyword), so the eager scrut/arms parses are safe (committed).
+rule parse_match
+  @intention: "Parse a block-form match into an AstMatch node (scrutinee + arm list)"
+  @source: vexprparse.intent:64
+  input:
+    st : ParseState
+  output:
+    out : Parsed
+  logic:
+    let scrut_parsed = parse_or(ParseState { cell: advance(Advance { lst: st.cell, k: 1 }) })
+    let scrut_node = parsed_node(scrut_parsed)
+    let scrut_next = parsed_next(scrut_parsed)
+    let parsed_arms = parse_arms(ParseState { cell: advance(Advance { lst: scrut_next, k: 1 }) })
+    let armlist = pal_arms(parsed_arms)
+    let arms_next = pal_next(parsed_arms)
+    out = Parsed::Mk { node: Ast::AstMatch { scrut: scrut_node, arms: armlist }, next: arms_next }
+  proofs:
+    purity:
+      reads : [st.cell]
+      calls : [parse_or, parsed_node, parsed_next, parse_arms, pal_arms, pal_next, advance]
+    termination:
+      bound : 512
+
+
 -- field_rest: fold a chain of '.IDENT' field accesses onto a base AST, left-deep
 -- (a.b.c => AstField(AstField(AstVar(a), b), c)). Peeks the op at fs.pos: a '.'
 -- (op 12) followed by an IDENT consumes both, wraps the base in AstField with
@@ -2021,11 +2539,16 @@ rule parse_primary
     let idlen = peek_len(st.cell)
     let next_opc = peek_op_code(advance(Advance { lst: st.cell, k: 1 }))
     let iscall = if next_opc == 21 then 1 else 0
-    out = if isif == 1 then if_then(IfThenState { cond: parse_or(ParseState { cell: advance(Advance { lst: st.cell, k: 1 }) }) }) else if istrue == 1 then Parsed::Mk { node: Ast::AstBool { value: 1 }, next: advance(Advance { lst: st.cell, k: 1 }) } else if isfalse == 1 then Parsed::Mk { node: Ast::AstBool { value: 0 }, next: advance(Advance { lst: st.cell, k: 1 }) } else if isnum == 1 then Parsed::Mk { node: Ast::AstNum { value: numval }, next: advance(Advance { lst: st.cell, k: 1 }) } else if isstr == 1 then Parsed::Mk { node: Ast::AstStr { start: sstart, len: slen }, next: advance(Advance { lst: st.cell, k: 1 }) } else if isparen == 1 then paren_close(ParenState { inner: parse_or(ParseState { cell: advance(Advance { lst: st.cell, k: 1 }) }) }) else if isident == 1 then (if iscall == 1 then call_build(CallState { cstart: idstart, clen: idlen, pargs: parse_args(ParseState { cell: advance(Advance { lst: st.cell, k: 2 }) }) }) else field_rest(FieldState { cell: advance(Advance { lst: st.cell, k: 1 }), base: Ast::AstVar { start: idstart, len: idlen } })) else Parsed::Mk { node: Ast::AstErr, next: st.cell }
+    let ismatch = if lead_kind == 211 then 1 else 0
+    let isvariant = if next_opc == 3 then 1 else 0
+    let vstart = peek_start(advance(Advance { lst: st.cell, k: 2 }))
+    let vlen = peek_len(advance(Advance { lst: st.cell, k: 2 }))
+    let has_braces = if peek_op_code(advance(Advance { lst: st.cell, k: 3 })) == 23 then 1 else 0
+    out = if ismatch == 1 then parse_match(st) else if isif == 1 then if_then(IfThenState { cond: parse_or(ParseState { cell: advance(Advance { lst: st.cell, k: 1 }) }) }) else if istrue == 1 then Parsed::Mk { node: Ast::AstBool { value: 1 }, next: advance(Advance { lst: st.cell, k: 1 }) } else if isfalse == 1 then Parsed::Mk { node: Ast::AstBool { value: 0 }, next: advance(Advance { lst: st.cell, k: 1 }) } else if isnum == 1 then Parsed::Mk { node: Ast::AstNum { value: numval }, next: advance(Advance { lst: st.cell, k: 1 }) } else if isstr == 1 then Parsed::Mk { node: Ast::AstStr { start: sstart, len: slen }, next: advance(Advance { lst: st.cell, k: 1 }) } else if isparen == 1 then paren_close(ParenState { inner: parse_or(ParseState { cell: advance(Advance { lst: st.cell, k: 1 }) }) }) else if isident == 1 then (if isvariant == 1 then (if has_braces == 1 then variant_build(VariantState { cstart: idstart, clen: idlen, vstart: vstart, vlen: vlen, pfields: parse_vfields(ParseState { cell: advance(Advance { lst: st.cell, k: 4 }) }) }) else variant_build(VariantState { cstart: idstart, clen: idlen, vstart: vstart, vlen: vlen, pfields: ParsedVFields::MkVF { fields: VFieldList::VFNil, next: advance(Advance { lst: st.cell, k: 3 }) } })) else if iscall == 1 then call_build(CallState { cstart: idstart, clen: idlen, pargs: parse_args(ParseState { cell: advance(Advance { lst: st.cell, k: 2 }) }) }) else field_rest(FieldState { cell: advance(Advance { lst: st.cell, k: 1 }), base: Ast::AstVar { start: idstart, len: idlen } })) else Parsed::Mk { node: Ast::AstErr, next: st.cell }
   proofs:
     purity:
-      reads : [st.cell]
-      calls : [peek_kind, peek_is_num, peek_is_str, peek_op_code, peek_is_ident, peek_value, peek_str_start, peek_str_len, peek_start, peek_len, if_then, paren_close, parse_or, call_build, parse_args, field_rest, advance]
+      reads : [st.cell, st]
+      calls : [peek_kind, peek_is_num, peek_is_str, peek_op_code, peek_is_ident, peek_value, peek_str_start, peek_str_len, peek_start, peek_len, if_then, paren_close, parse_or, call_build, parse_args, field_rest, parse_match, variant_build, parse_vfields, advance]
     termination:
       bound : 512
 
@@ -2447,6 +2970,15 @@ rule eval_ast
       -- STRUCTURALLY by shape_ast. (Brick 7.)
       AstStr(start, len) => 0
       AstErr => 0
+      -- R3 stub: real handling in R6/R7. A variant construction has no arithmetic
+      -- value without an environment (it is a typed value, not a number) — like
+      -- AstVar / AstCall it evaluates to 0; its correctness is proven structurally
+      -- by shape_ast. Field values are not walked here (no number to extract).
+      AstVariant(cstart, clen, vstart, vlen, fields) => 0
+      -- R3 stub: real handling in R6/R7. A match has no arithmetic value here (the
+      -- scrutinee is a typed value and arm dispatch needs the R6 evaluator); it
+      -- evaluates to 0, proven structurally by shape_ast.
+      AstMatch(scrut, arms) => 0
   proofs:
     purity:
       reads : [e]
@@ -2526,13 +3058,67 @@ rule shape_ast
       AstBool(value) => 1000000
       AstStr(start, len) => 10000000
       AstErr => 0
+      -- R3: dedicated bands ABOVE AstStr's 10000000 so a parsed variant / match body
+      -- has a hand-derivable fingerprint distinct from the AstErr fingerprint (0).
+      -- AstVariant adds 1000000000 plus the signatures of its field values
+      -- (shape_vfields); AstMatch adds 100000000 plus the scrutinee's signature and
+      -- the sum of every arm body's signature (shape_arms). Recursing into the
+      -- sub-ASTs makes nested structure count, exactly like AstIf / AstCall.
+      AstVariant(cstart, clen, vstart, vlen, fields) => 1000000000 + shape_vfields(fields)
+      AstMatch(scrut, arms) => 100000000 + shape_ast(scrut) + shape_arms(arms)
   proofs:
     purity:
       reads : [e]
-      calls : [shape_ast, shape_args]
+      calls : [shape_ast, shape_args, shape_vfields, shape_arms]
     termination:
       bound : 4000
       structural : e
+
+
+-- shape_vfields (brick R3): sum the structural signatures of every field value in a
+-- variant construction's field list. Mirror of shape_args. Walks a strictly-shrinking
+-- group value (the tail) at each step, so it declares the structural proof.
+rule shape_vfields
+  @intention: "Sum the structural signatures of every field value in a variant field list"
+  @source: vexprparse.intent:64
+  input:
+    a : VFieldList
+  output:
+    out : number
+  logic:
+    out = match a:
+      VFCons(name_start, name_len, val, rest) => shape_ast(val) + shape_vfields(rest)
+      VFNil => 0
+  proofs:
+    purity:
+      reads : [a]
+      calls : [shape_ast, shape_vfields]
+    termination:
+      bound : 4000
+      structural : a
+
+
+-- shape_arms (brick R3): sum the structural signatures of every arm BODY in a match's
+-- arm list. Mirror of shape_args. The binder list carries no sub-AST, so only the
+-- arm body recurses. Structural proof over the shrinking arm-list tail.
+rule shape_arms
+  @intention: "Sum the structural signatures of every arm body in a match arm list"
+  @source: vexprparse.intent:64
+  input:
+    a : ArmList
+  output:
+    out : number
+  logic:
+    out = match a:
+      ArmCons(vstart, vlen, binders, body, rest) => shape_ast(body) + shape_arms(rest)
+      ArmNil => 0
+  proofs:
+    purity:
+      reads : [a]
+      calls : [shape_ast, shape_arms]
+    termination:
+      bound : 4000
+      structural : a
 
 
 -- shape: the brick-5 driver. Tokenize the source, parse the full expression
@@ -3726,6 +4312,9 @@ rule eval_ast_env
       AstBool(value) => value
       AstStr(start, len) => 0
       AstErr => 0
+      -- R3 stub: real handling in R6/R7 (no value without the R6 environment).
+      AstVariant(cstart, clen, vstart, vlen, fields) => 0
+      AstMatch(scrut, arms) => 0
   proofs:
     purity:
       reads : [ea.node, ea.env, ea.src, ea.prog]
@@ -6170,6 +6759,9 @@ rule count_undef_ast
       AstBool(value) => 0
       AstStr(start, len) => 0
       AstErr => 0
+      -- R3 stub: real handling in R6/R7 (no value without the R6 environment).
+      AstVariant(cstart, clen, vstart, vlen, fields) => 0
+      AstMatch(scrut, arms) => 0
   proofs:
     purity:
       reads : [a.node, a.binds, a.src]
@@ -6578,6 +7170,9 @@ rule count_badcall_ast
       AstBool(value) => 0
       AstStr(start, len) => 0
       AstErr => 0
+      -- R3 stub: real handling in R6/R7 (no value without the R6 environment).
+      AstVariant(cstart, clen, vstart, vlen, fields) => 0
+      AstMatch(scrut, arms) => 0
   proofs:
     purity:
       reads : [a.node, a.rules, a.src]
@@ -6970,6 +7565,9 @@ rule count_badarity_ast
       AstBool(value) => 0
       AstStr(start, len) => 0
       AstErr => 0
+      -- R3 stub: real handling in R6/R7 (no value without the R6 environment).
+      AstVariant(cstart, clen, vstart, vlen, fields) => 0
+      AstMatch(scrut, arms) => 0
   proofs:
     purity:
       reads : [a.node, a.rules, a.src]
@@ -7333,6 +7931,9 @@ rule type_of_env
       AstBool(value) => 1
       AstStr(start, len) => 2
       AstErr => 3
+      -- R3 stub: real handling in R6/R7. 3 is the ERROR type code (mirror AstErr).
+      AstVariant(cstart, clen, vstart, vlen, fields) => 3
+      AstMatch(scrut, arms) => 3
   proofs:
     purity:
       reads : [t.node, t.tenv, t.src, t.prog]
@@ -7801,6 +8402,9 @@ rule argtype_ast
       AstVar(start, len) => 0
       AstStr(start, len) => 0
       AstErr => 0
+      -- R3 stub: real handling in R6/R7 (no arg-type mismatch counted without R6).
+      AstVariant(cstart, clen, vstart, vlen, fields) => 0
+      AstMatch(scrut, arms) => 0
       AstBin(op, lhs, rhs) => argtype_ast(ArgTypeState { node: lhs, tenv: a.tenv, src: a.src, prog: a.prog }) + argtype_ast(ArgTypeState { node: rhs, tenv: a.tenv, src: a.src, prog: a.prog })
       AstNeg(inner) => argtype_ast(ArgTypeState { node: inner, tenv: a.tenv, src: a.src, prog: a.prog })
       AstNot(inner) => argtype_ast(ArgTypeState { node: inner, tenv: a.tenv, src: a.src, prog: a.prog })
@@ -8842,6 +9446,9 @@ rule undef_span_ast
       AstBool(value) => Span::MkSpan { start: 9999, len: 0 }
       AstStr(start, len) => Span::MkSpan { start: 9999, len: 0 }
       AstErr => Span::MkSpan { start: 9999, len: 0 }
+      -- R3 stub: real handling in R6/R7. The "not located" sentinel span.
+      AstVariant(cstart, clen, vstart, vlen, fields) => Span::MkSpan { start: 9999, len: 0 }
+      AstMatch(scrut, arms) => Span::MkSpan { start: 9999, len: 0 }
       AstVar(start, len) => if name_bound(NameBoundState { binds: a.binds, src: a.src, q_start: start, q_len: len }) == 0 then Span::MkSpan { start: start, len: len } else Span::MkSpan { start: 9999, len: 0 }
       AstBin(op, lhs, rhs) => span_or(SpanOrState { a: undef_span_ast(UndefSpanAstState { node: lhs, binds: a.binds, src: a.src }), b: undef_span_ast(UndefSpanAstState { node: rhs, binds: a.binds, src: a.src }) })
       AstNeg(inner) => undef_span_ast(UndefSpanAstState { node: inner, binds: a.binds, src: a.src })
@@ -9099,6 +9706,9 @@ rule badcall_span_ast
       AstVar(start, len) => Span::MkSpan { start: 9999, len: 0 }
       AstStr(start, len) => Span::MkSpan { start: 9999, len: 0 }
       AstErr => Span::MkSpan { start: 9999, len: 0 }
+      -- R3 stub: real handling in R6/R7. The "not located" sentinel span.
+      AstVariant(cstart, clen, vstart, vlen, fields) => Span::MkSpan { start: 9999, len: 0 }
+      AstMatch(scrut, arms) => Span::MkSpan { start: 9999, len: 0 }
       AstBin(op, lhs, rhs) => span_or(SpanOrState { a: badcall_span_ast(BadCallSpanState { node: lhs, rules: a.rules, src: a.src }), b: badcall_span_ast(BadCallSpanState { node: rhs, rules: a.rules, src: a.src }) })
       AstNeg(inner) => badcall_span_ast(BadCallSpanState { node: inner, rules: a.rules, src: a.src })
       AstNot(inner) => badcall_span_ast(BadCallSpanState { node: inner, rules: a.rules, src: a.src })
@@ -9294,6 +9904,9 @@ rule badarity_span_ast
       AstVar(start, len) => Span::MkSpan { start: 9999, len: 0 }
       AstStr(start, len) => Span::MkSpan { start: 9999, len: 0 }
       AstErr => Span::MkSpan { start: 9999, len: 0 }
+      -- R3 stub: real handling in R6/R7. The "not located" sentinel span.
+      AstVariant(cstart, clen, vstart, vlen, fields) => Span::MkSpan { start: 9999, len: 0 }
+      AstMatch(scrut, arms) => Span::MkSpan { start: 9999, len: 0 }
       AstBin(op, lhs, rhs) => span_or(SpanOrState { a: badarity_span_ast(BadAritySpanState { node: lhs, rules: a.rules, src: a.src }), b: badarity_span_ast(BadAritySpanState { node: rhs, rules: a.rules, src: a.src }) })
       AstNeg(inner) => badarity_span_ast(BadAritySpanState { node: inner, rules: a.rules, src: a.src })
       AstNot(inner) => badarity_span_ast(BadAritySpanState { node: inner, rules: a.rules, src: a.src })
@@ -9613,6 +10226,9 @@ rule print_expr
       AstCall(callee_start, callee_len, args) => concat(substring(ps.src, callee_start, callee_start + callee_len), "(", print_args(PrintArgsState { args: args, src: ps.src }), ")")
       AstIf(cond, thn, els) => concat("(if ", print_expr(PrintState { node: cond, src: ps.src }), " then ", print_expr(PrintState { node: thn, src: ps.src }), " else ", print_expr(PrintState { node: els, src: ps.src }), ")")
       AstErr => "?"
+      -- R3 stub: real handling in R6/R7. "?" placeholder (mirror AstErr).
+      AstVariant(cstart, clen, vstart, vlen, fields) => "?"
+      AstMatch(scrut, arms) => "?"
   proofs:
     purity:
       reads : [ps.node, ps.src]
@@ -9757,6 +10373,9 @@ rule lower_expr
       AstCall(callee_start, callee_len, args) => concat(lower_args(PrintArgsState { args: args, src: ps.src }), "call ", substring(ps.src, callee_start, callee_start + callee_len), " ")
       AstStr(start, len) => "? "
       AstErr => "? "
+      -- R3 stub: real handling in R6/R7. "? " placeholder instruction (mirror AstErr).
+      AstVariant(cstart, clen, vstart, vlen, fields) => "? "
+      AstMatch(scrut, arms) => "? "
   proofs:
     purity:
       reads : [ps.node, ps.src]
@@ -9879,6 +10498,9 @@ rule x86_expr
       AstBool(value) => b"\xcc"
       AstIf(cond, thn, els) => concat(x86_expr(PrintState { node: cond, src: ps.src }), b"\x58\x48\x85\xc0\x0f\x84", le32(code_size_expr(PrintState { node: thn, src: ps.src }) + 5), x86_expr(PrintState { node: thn, src: ps.src }), b"\xe9", le32(code_size_expr(PrintState { node: els, src: ps.src })), x86_expr(PrintState { node: els, src: ps.src }))
       AstErr => b"\xcc"
+      -- R3 stub: real handling in R6/R7. 0xCC (int3 trap) placeholder (mirror AstErr).
+      AstVariant(cstart, clen, vstart, vlen, fields) => b"\xcc"
+      AstMatch(scrut, arms) => b"\xcc"
   proofs:
     purity:
       reads : [ps.node, ps.src]
@@ -9923,6 +10545,9 @@ rule code_size_expr
       AstBool(value) => 1
       AstIf(cond, thn, els) => code_size_expr(PrintState { node: cond, src: ps.src }) + 15 + code_size_expr(PrintState { node: thn, src: ps.src }) + code_size_expr(PrintState { node: els, src: ps.src })
       AstErr => 1
+      -- R3 stub: real handling in R6/R7. 1 byte (matches the b"\xcc" trap stub above).
+      AstVariant(cstart, clen, vstart, vlen, fields) => 1
+      AstMatch(scrut, arms) => 1
   proofs:
     purity:
       reads : [ps.node, ps.src]
@@ -10177,6 +10802,9 @@ rule code_size_node
       AstBool(value) => 1
       AstIf(cond, thn, els) => code_size_node(ByteGenState { node: cond, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog }) + 15 + code_size_node(ByteGenState { node: thn, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog }) + code_size_node(ByteGenState { node: els, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog })
       AstErr => 1
+      -- R3 stub: real handling in R6/R7. 1 byte (matches the b"\xcc" trap stub above).
+      AstVariant(cstart, clen, vstart, vlen, fields) => 1
+      AstMatch(scrut, arms) => 1
   proofs:
     purity:
       reads : [bg.node, bg.src, bg.off, bg.params, bg.lets, bg.prog]
@@ -10361,6 +10989,9 @@ rule x86_node
       AstBool(value) => b"\xcc"
       AstIf(cond, thn, els) => concat(x86_node(ByteGenState { node: cond, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog }), b"\x58\x48\x85\xc0\x0f\x84", le32(code_size_node(ByteGenState { node: thn, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog }) + 5), x86_node(ByteGenState { node: thn, src: bg.src, off: bg.off + code_size_node(ByteGenState { node: cond, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog }) + 15, params: bg.params, lets: bg.lets, prog: bg.prog }), b"\xe9", le32(code_size_node(ByteGenState { node: els, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog })), x86_node(ByteGenState { node: els, src: bg.src, off: bg.off + code_size_node(ByteGenState { node: cond, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog }) + 15 + code_size_node(ByteGenState { node: thn, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog }), params: bg.params, lets: bg.lets, prog: bg.prog }))
       AstErr => b"\xcc"
+      -- R3 stub: real handling in R6/R7. 0xCC (int3 trap) placeholder (mirror AstErr).
+      AstVariant(cstart, clen, vstart, vlen, fields) => b"\xcc"
+      AstMatch(scrut, arms) => b"\xcc"
   proofs:
     purity:
       reads : [bg.node, bg.src, bg.off, bg.params, bg.lets, bg.prog]

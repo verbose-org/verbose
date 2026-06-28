@@ -1449,3 +1449,29 @@ there (out of the arithmetic evaluator's scope).
     the first header, no proofs) keep byte-identical behavior: seek_logic returns immediately and the
     structural `next` resolves to the same next-rule cell the old pb_next did after skip_seps_dedent.
     THE MILESTONE: count_rules on real self-source went 0 -> the actual `rule ` count.
+
+64. Records-arc brick R3: PARSE the rule-body forms the self-source actually uses that R2 only
+    SKIPPED — `::` variant construction and block-form `match` — into real AST instead of AstErr.
+    PARSER-ONLY (downstream eval / type / checker / codegen get STUB arms; real handling is R6/R7).
+    Two new Ast variants: AstVariant (a `Concept::Variant { field: expr, ... }` construction,
+    concept-name span + variant-name span + a VFieldList of named initializers; the braceless form
+    `Token::Eof` carries VFNil) and AstMatch (a `match scrut: Variant(binders) => body ...` with the
+    scrutinee sub-expression and an ArmList). Three new cons-list group concepts mirror ArgList:
+    VFieldList (VFCons/VFNil), ArmList (ArmCons/ArmNil), BinderList (BindCons/BindNil), plus three
+    Parsed-threading results (ParsedVFields/MkVF, ParsedArms/MkAL, ParsedBinders/MkBL). `match` is
+    lexed as a 5-byte keyword (kw5 code 11, kind 211) — the parse layer is source-free (ParseState
+    carries only the token cell, no source bytes), so match is recognized by token kind exactly as
+    `if` / `then` / `else` / `let` / `true` / `false` are, NOT by a span check. New parser rules:
+    variant construction in parse_primary (an IDENT followed by `::` op 3 parses IDENT :: IDENT then
+    an OPTIONAL `{ ... }`) via parse_vfields / vfields_cons / vfields_prepend / variant_build; and
+    block-form match via parse_match / parse_arms / arm_join / parse_binders / binders_scan /
+    binders_prepend (parse_arms reuses R2's INDENT/DEDENT separator skipping — skip_seps over Newline
+    /Indent, stopping at Dedent/Eof — so both the indented self-source form and a flat single-line
+    arm sequence parse). Adding the two Ast variants makes every `match` on an Ast value non-exhaustive,
+    so all Ast-matching rules (eval_ast, eval_ast_env, shape_ast, type_of_env, the count_/span_
+    analyses, print_expr, lower_expr/_src, x86_expr/_node, code_size_expr/_node) gain stub arms.
+    shape_ast gives AstMatch (band 100000000) and AstVariant (band 1000000000) dedicated bands above
+    AstStr's 10000000, with helpers shape_arms / shape_vfields recursing into arm bodies and field
+    values — so a parsed match/variant body has a hand-derivable fingerprint distinct from the AstErr
+    fingerprint (0). THE OBSERVABLE: the brick-5 `shape` driver on a body using both forms returns the
+    predicted AstMatch + AstVariant fingerprint, proving the bodies now parse into real AST.
