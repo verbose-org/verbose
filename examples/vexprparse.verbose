@@ -511,7 +511,7 @@ concept ScanState
   @source: vexprparse.intent:2
   fields:
     source : text [..256]
-    pos : number [0, 256]
+    pos : number [0, 4000000]
 
 
 rule skip_spaces
@@ -906,7 +906,7 @@ concept Advance
   @source: vexprparse.intent:12
   fields:
     lst : TokenList
-    k : number [0, 512]
+    k : number [0, 4000000]
 
 
 rule advance
@@ -1584,8 +1584,8 @@ concept LetJoinState
   @intention: "Bound name span + the parsed let-RHS value"
   @source: vexprparse.intent:28
   fields:
-    name_start : number [0, 256]
-    name_len : number [0, 256]
+    name_start : number [0, 4000000]
+    name_len : number [0, 4000000]
     value : Parsed
 
 
@@ -1636,8 +1636,8 @@ concept CallState
   @intention: "Callee span + the parsed argument list of a function call"
   @source: vexprparse.intent:15
   fields:
-    cstart : number [0, 512]
-    clen : number [0, 512]
+    cstart : number [0, 4000000]
+    clen : number [0, 4000000]
     pargs : ParsedArgs
 
 
@@ -2664,7 +2664,7 @@ concept KindAtState
   @source: vexprparse.intent:26
   fields:
     source : text [..256]
-    idx : number [0, 512]
+    idx : number [0, 4000000]
 
 
 -- Entry driver: tokenize the source (from argv) and return the KIND code of the
@@ -2785,7 +2785,7 @@ concept PopArg
   @source: vexprparse.intent:27
   fields:
     stk : ColStack
-    width : number [0, 100000]
+    width : number [0, 4000000]
 
 
 -- dedents_to: the multi-DEDENT recursion (src/lexer.rs:223-236). Pop every level
@@ -2902,7 +2902,7 @@ concept ConsDedArg
   @intention: "A dedent count plus the tail list to prepend the Dedent tokens onto"
   @source: vexprparse.intent:27
   fields:
-    count : number [0, 4096]
+    count : number [0, 4000000]
     tail : TokenList
 
 
@@ -3005,7 +3005,7 @@ concept LineState
   fields:
     src : text [..256]
     stack : ColStack
-    pos : number [0, 256]
+    pos : number [0, 4000000]
 
 
 -- tokenize_indent: THE line driver. Processes the source line by line from a
@@ -3609,10 +3609,10 @@ concept NameEqState
   @source: vexprparse.intent:29
   fields:
     src : text [..256]
-    a_start : number [0, 256]
-    b_start : number [0, 256]
-    len : number [0, 256]
-    off : number [0, 256]
+    a_start : number [0, 4000000]
+    b_start : number [0, 4000000]
+    len : number [0, 4000000]
+    off : number [0, 4000000]
 
 
 -- name_eq: 1 iff the byte ranges src[a_start..a_start+len] and
@@ -3646,8 +3646,8 @@ concept EnvLookState
   fields:
     env : Env
     src : text [..256]
-    q_start : number [0, 256]
-    q_len : number [0, 256]
+    q_start : number [0, 4000000]
+    q_len : number [0, 4000000]
 
 
 -- env_lookup: find the query name in the Env and return its bound value, or 0 if
@@ -3776,8 +3776,8 @@ concept EvalCallState
   @intention: "A callee name span + the call's args + the caller env + the source text + the program"
   @source: vexprparse.intent:36
   fields:
-    callee_start : number [0, 256]
-    callee_len : number [0, 256]
+    callee_start : number [0, 4000000]
+    callee_len : number [0, 4000000]
     args : ArgList
     env : Env
     src : text [..256]
@@ -3808,8 +3808,8 @@ concept FindRuleState
   fields:
     rules : RuleList
     src : text [..256]
-    q_start : number [0, 256]
-    q_len : number [0, 256]
+    q_start : number [0, 4000000]
+    q_len : number [0, 4000000]
 
 
 -- CallRetState (brick 33): the inputs to type a CALL's result — the program rule
@@ -3823,8 +3823,8 @@ concept CallRetState
   fields:
     prog : RuleList
     src : text [..256]
-    callee_start : number [0, 256]
-    callee_len : number [0, 256]
+    callee_start : number [0, 4000000]
+    callee_len : number [0, 4000000]
 
 
 -- A one-field probe to read the HEAD of an argument list (block-form match is only
@@ -4151,8 +4151,8 @@ concept SpanCheck
   @source: vexprparse.intent:30
   fields:
     src : text [..256]
-    start : number [0, 256]
-    len : number [0, 256]
+    start : number [0, 4000000]
+    len : number [0, 4000000]
 
 
 -- span_is_rule: 1 iff the span src[start..start+len] is exactly the 4 bytes
@@ -4705,7 +4705,7 @@ concept EvalNthState
   @source: vexprparse.intent:31
   fields:
     source : text [..256]
-    n : number [0, 512]
+    n : number [0, 4000000]
 
 
 -- skip_seps_dedent: advance past any leading SEPARATOR token — Newline (600),
@@ -5001,8 +5001,8 @@ concept FieldConsState
   @intention: "Head field span + type + the parsed rest of the field list"
   @source: vexprparse.intent:62
   fields:
-    head_start : number [0, 256]
-    head_len : number [0, 256]
+    head_start : number [0, 4000000]
+    head_len : number [0, 4000000]
     head_ty : number [0, 64]
     rest : ParsedFields
 
@@ -5315,8 +5315,8 @@ concept FindConceptState
   fields:
     concepts : ConceptList
     src : text [..256]
-    q_start : number [0, 256]
-    q_len : number [0, 256]
+    q_start : number [0, 4000000]
+    q_len : number [0, 4000000]
 
 
 -- find_concept: locate the concept whose NAME span byte-equals the query span and
@@ -5453,7 +5453,7 @@ concept DropRules
   @source: vexprparse.intent:31
   fields:
     rl : RuleList
-    n : number [0, 512]
+    n : number [0, 4000000]
 
 
 rule drop_rules
@@ -5642,7 +5642,7 @@ concept ParamNthState
   @source: vexprparse.intent:38
   fields:
     params : ParamList
-    n : number [0, 512]
+    n : number [0, 4000000]
 
 
 -- param_nth_type (Brick 20): the declared type code of the n-th parameter (0-based)
@@ -5892,8 +5892,8 @@ concept NameBoundState
   fields:
     binds : Binding
     src : text [..256]
-    q_start : number [0, 256]
-    q_len : number [0, 256]
+    q_start : number [0, 4000000]
+    q_len : number [0, 4000000]
 
 
 -- name_bound: 1 iff the query span byte-equals some binding NAME in the list, 0
@@ -6298,8 +6298,8 @@ concept RuleNamedState
   fields:
     rules : RuleList
     src : text [..256]
-    q_start : number [0, 256]
-    q_len : number [0, 256]
+    q_start : number [0, 4000000]
+    q_len : number [0, 4000000]
 
 
 -- rule_named: 1 iff the query span byte-equals some RuleDecl's NAME span in the
@@ -6657,8 +6657,8 @@ concept RuleArityState
   fields:
     rules : RuleList
     src : text [..256]
-    q_start : number [0, 256]
-    q_len : number [0, 256]
+    q_start : number [0, 4000000]
+    q_len : number [0, 4000000]
 
 
 -- rule_arity: the parameter count of the FIRST rule whose NAME span byte-equals
@@ -6697,8 +6697,8 @@ concept MismatchState
   fields:
     rules : RuleList
     src : text [..256]
-    callee_start : number [0, 256]
-    callee_len : number [0, 256]
+    callee_start : number [0, 4000000]
+    callee_len : number [0, 4000000]
     args : ArgList
 
 
@@ -7885,7 +7885,7 @@ concept FindDiagState
     iter : RuleList
     all : RuleList
     src : text [..256]
-    idx : number [0, 4096]
+    idx : number [0, 4000000]
 
 
 -- rule_category: the FIRST failing category of ONE rule, in the fixed precedence
@@ -8126,7 +8126,7 @@ concept RuleDiagsState
     rd : RuleDecl
     prog : RuleList
     src : text [..256]
-    idx : number [0, 4096]
+    idx : number [0, 4000000]
 
 
 -- prog_diags's input: the rule list being ITERATED (`iter` advances each step, one
@@ -8142,7 +8142,7 @@ concept ProgDiagsState
     iter : RuleList
     all : RuleList
     src : text [..256]
-    idx : number [0, 4096]
+    idx : number [0, 4000000]
 
 
 -- diag_append's input: two DiagLists. Standard cons-list append concatenates the
@@ -8164,7 +8164,7 @@ concept DiagNthState
   @source: vexprparse.intent:42
   fields:
     list : DiagList
-    n : number [0, 4096]
+    n : number [0, 4000000]
 
 
 -- rule_diags: the DiagList of ALL failing categories for ONE rule, in ASCENDING
@@ -9882,8 +9882,8 @@ concept ParamIndexState
   fields:
     params : ParamList
     src : text [..256]
-    q_start : number [0, 256]
-    q_len : number [0, 256]
+    q_start : number [0, 4000000]
+    q_len : number [0, 4000000]
     idx : number
 
 
@@ -9897,8 +9897,8 @@ concept LetIndexState
   fields:
     binds : Binding
     src : text [..256]
-    q_start : number [0, 256]
-    q_len : number [0, 256]
+    q_start : number [0, 4000000]
+    q_len : number [0, 4000000]
     idx : number
 
 
@@ -9912,8 +9912,8 @@ concept ProcOffState
     rules : RuleList
     src : text [..256]
     acc : number
-    q_start : number [0, 256]
-    q_len : number [0, 256]
+    q_start : number [0, 4000000]
+    q_len : number [0, 4000000]
 
 
 -- ProcGenState: one rule to lower to a proc + its absolute blob offset + the
