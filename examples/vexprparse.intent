@@ -1424,3 +1424,28 @@ there (out of the arithmetic evaluator's scope).
     concept-named field type just gets whatever type_code_of_span returns today (0). Validated by
     three orderings (concept->rule, rule->concept, two-concepts+rule) and the full existing suite
     staying byte-identical on the rule-only path.
+
+63. Records-arc brick R2: SKIP what the self-hosted parser does not yet model, so count_rules works
+    on REAL Verbose source (its own kind). Three skip-to-unblock changes, no new AST nodes. (R2.a)
+    The line-driver tokenizer (tokenize_indent) now treats a line whose content starts with `--`
+    (a full-line comment) or `@` (an attribute line like @intention / @source / @verbose) as BLANK
+    — the same column-stack-untouched path as an empty line — so comments and attributes emit NO
+    tokens and never perturb the INDENT/DEDENT structure. Full-line only: the self-source has no
+    trailing comments on code lines (grep-verified). (R2.b) parse_program (and the sister capture
+    walk parse_concepts) recognize a top-level `concept_group` header (span_is_concept_group, the
+    13-byte ident, mutually exclusive with span_is_concept's 7-byte check) and SKIP its whole
+    indented block via skip_indented_block, then recurse — so the rules declared AFTER the group
+    are still found (before R2 the walk RNil'd on the group, the reason count_rules was 0 on real
+    source). (R2.c) parse_rule_decl / parse_rule_decl_pos no longer require `logic:` immediately
+    after the header: seek_logic scans forward over the rule's pre-logic blocks (input: / output:,
+    whatever is not `logic`), skipping each whole via skip_indented_block until the `logic` header;
+    and parse_rule_decl_pos computes its `next` STRUCTURALLY (skip the logic block, then if the next
+    sibling is `proofs:`, skip that block too) so the program walk lands on the following top-level
+    item independent of whether parse_stmts understood the (possibly rich) body. New concept
+    SkipBlockState (cell + indent depth + seen flag). New rules: span_is_concept_group, span_is_proofs,
+    skip_indented_block (depth-counted INDENT/DEDENT block skip), seek_logic. The heavy walks are
+    gated behind the relevant span check (`if is_rule == 1 then ... else ...`, native lazy-if) so
+    eager evaluation on a non-rule/non-group item stays cheap. Toy single-line grammars (logic: is
+    the first header, no proofs) keep byte-identical behavior: seek_logic returns immediately and the
+    structural `next` resolves to the same next-rule cell the old pb_next did after skip_seps_dedent.
+    THE MILESTONE: count_rules on real self-source went 0 -> the actual `rule ` count.

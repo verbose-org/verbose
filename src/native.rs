@@ -33799,4 +33799,216 @@ rule probe
         let _ = std::fs::remove_file(&cf);
     }
 
+    /// Records-arc brick R2: the self-hosted parser (examples/vexprparse.verbose)
+    /// no longer chokes on REAL Verbose source. Three skip-to-unblock changes are
+    /// pinned together here:
+    ///   R2.a — the line-driver tokenizer treats a full-line `--` comment or an `@`
+    ///          attribute line as BLANK (no tokens, column stack untouched).
+    ///   R2.b — parse_program (and parse_concepts) recognize a top-level
+    ///          `concept_group` header and SKIP its whole indented block, so rules
+    ///          AFTER the group are found (before R2 the walk RNil'd on the group).
+    ///   R2.c — parse_rule_decl_pos scans past a rule's `input:` / `output:`
+    ///          pre-logic blocks to reach `logic:`, and computes its end position
+    ///          STRUCTURALLY so the trailing `proofs:` block is skipped — the walk
+    ///          lands on the next top-level item regardless of body shape.
+    /// Plain concepts are now skipped STRUCTURALLY too (via skip_indented_block),
+    /// so concepts whose fields carry range annotations (`text [..256]`,
+    /// `number [0, N]`) — which R1's 3-tokens-per-field counter mis-measured — no
+    /// longer desync the walk.
+    ///
+    /// Part 1 (regression, native via argv): a small source composing a `--`
+    /// comment, an `@intention` line, a one-concept `concept_group`, a plain
+    /// `concept` with a range-annotated field, and TWO full rules
+    /// (@intention/@source/input:/output:/logic:/proofs:). count_rules == 2 and
+    /// count_concepts == 1 (the plain concept). Pins R2.a/b/c together.
+    ///
+    /// Part 2 (THE MILESTONE, native via argv): a ~120 KB chunk of the REAL
+    /// examples/vexprparse.verbose — including the concept_group header and the
+    /// first N real `rule` blocks with their comments / @attributes / input /
+    /// output / logic / proofs — parses to exactly the chunk's `^rule ` count.
+    /// Before R2 this was 0 (the walk stopped at the concept_group). The chunk is
+    /// cut at a `rule` boundary just under the 128 KB single-argv kernel limit.
+    #[test]
+    fn records_r2_skip_comments_attrs_group_and_proofs() {
+        let src = std::fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let cr = std::env::temp_dir().join("verbosec_test_r2_count_rules");
+        let cc = std::env::temp_dir().join("verbosec_test_r2_count_concepts");
+        compile_native(&program, "count_rules", cr.to_str().unwrap(), false, false)
+            .expect("count_rules must compile natively");
+        compile_native(&program, "count_concepts", cc.to_str().unwrap(), false, false)
+            .expect("count_concepts must compile natively");
+
+        let run = |bin: &std::path::Path, prog: &str| -> i64 {
+            let r = std::process::Command::new(bin)
+                .arg(prog)
+                .arg("0")
+                .output()
+                .expect("spawn R2 driver");
+            assert!(r.status.success(), "{:?} must exit 0; got {:?}", bin, r.status);
+            String::from_utf8_lossy(&r.stdout)
+                .trim()
+                .parse::<i64>()
+                .expect("R2 driver prints an integer")
+        };
+
+        // Part 1 — regression: comment + @attr + concept_group(1 concept, variants:)
+        // + a range-annotated plain concept + two FULL rules.
+        let real_shaped = "\
+-- a leading full-line comment (R2.a: skipped at tokenization)
+@intention: \"a stray top-level attribute line (R2.a)\"
+concept_group G [max_depth: 4, max_nodes: 10]
+  concept Tok
+    variants:
+      A of (x : number)
+      B
+
+concept Thing
+  fields:
+    a : number [0, 10]
+
+rule one
+  @intention: \"first\"
+  @source: f:1
+  input:
+    s : ScanState
+  output:
+    out : number
+  logic:
+    out = 1
+  proofs:
+    purity:
+      reads : [s]
+      calls : []
+    termination:
+      bound : 16
+
+rule two
+  @intention: \"second\"
+  @source: f:2
+  input:
+    s : ScanState
+  output:
+    out : number
+  logic:
+    out = 2
+  proofs:
+    purity:
+      reads : [s]
+      calls : []
+    termination:
+      bound : 16
+";
+        assert_eq!(
+            run(&cr, real_shaped),
+            2,
+            "R2.a/b/c: both full rules found past the comment, @attr, concept_group, \
+             and the range-annotated plain concept (and past each rule's proofs block)"
+        );
+        assert_eq!(
+            run(&cc, real_shaped),
+            1,
+            "the plain `concept Thing` is still captured (skipped structurally, not \
+             mis-counted by its range-annotated field); the group's inner concept is \
+             not a top-level concept"
+        );
+
+        // Part 2 — THE MILESTONE: count_rules on a ~120 KB chunk of the REAL
+        // self-source, cut at a `rule` boundary under the 128 KB single-argv limit.
+        let mut cut = 0usize;
+        let mut counted = 0i64;
+        let mut at_line_start = true;
+        let mut i = 0usize;
+        let bytes = src.as_bytes();
+        while i < bytes.len() {
+            // Record a cut point at every line that begins exactly with "rule ".
+            if at_line_start && src[i..].starts_with("rule ") {
+                if i > 122_000 {
+                    break;
+                }
+                cut = i;
+                counted += 1;
+            }
+            at_line_start = bytes[i] == b'\n';
+            i += 1;
+        }
+        assert!(cut > 0 && counted > 1, "must find several rule boundaries in the real source");
+        let chunk = &src[..cut];
+        let grep_rules = chunk
+            .lines()
+            .filter(|l| l.starts_with("rule "))
+            .count() as i64;
+        assert!(
+            chunk.contains("concept_group "),
+            "the chunk must include the concept_group header (the pre-R2 wall)"
+        );
+        assert!(chunk.len() < 131_000, "chunk must fit one argv arg (kernel 128 KB cap)");
+        assert_eq!(
+            run(&cr, chunk),
+            grep_rules,
+            "MILESTONE: count_rules on a real ~120 KB self-source chunk equals its \
+             `^rule ` count ({}); was 0 before R2 (the walk stopped at concept_group)",
+            grep_rules
+        );
+
+        let _ = std::fs::remove_file(&cr);
+        let _ = std::fs::remove_file(&cc);
+    }
+
+    /// Full-file companion to the R2 milestone: count_rules on the WHOLE real
+    /// self-source (examples/vexprparse.verbose, ~500 KB > the 128 KB single-argv
+    /// limit) via the INTERPRETER path, called directly with a constructed
+    /// `Value::Text` so the CLI JSON reader (which chokes on the source's non-ASCII
+    /// comment characters) is bypassed. Runs in a big-stack thread because the
+    /// interpreter recurses once per source line + once per skipped token.
+    /// `#[ignore]` because it is slow (tree-walking the whole file); run with
+    /// `cargo test --release records_r2_full_file_count_rules -- --ignored`.
+    #[test]
+    #[ignore]
+    fn records_r2_full_file_count_rules() {
+        let handle = std::thread::Builder::new()
+            .stack_size(4 * 1024 * 1024 * 1024)
+            .spawn(|| {
+                let src = std::fs::read_to_string("examples/vexprparse.verbose")
+                    .expect("examples/vexprparse.verbose must exist");
+                let grep_rules =
+                    src.lines().filter(|l| l.starts_with("rule ")).count() as i64;
+                let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+                let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+                let all_rules: Vec<&crate::ast::Rule> = program
+                    .items
+                    .iter()
+                    .filter_map(|i| match i {
+                        crate::ast::Item::Rule(r) => Some(r),
+                        _ => None,
+                    })
+                    .collect();
+                let all_concepts: Vec<&crate::ast::Concept> =
+                    crate::ast::iter_all_concepts(&program.items).collect();
+                let count_rules = all_rules
+                    .iter()
+                    .copied()
+                    .find(|r| r.name == "count_rules")
+                    .expect("count_rules rule must exist");
+                let mut input = std::collections::HashMap::new();
+                input.insert("source".to_string(), crate::interpreter::Value::Text(src.clone()));
+                input.insert("pos".to_string(), crate::interpreter::Value::Number(0));
+                let result =
+                    crate::interpreter::eval_rule(count_rules, &all_rules, &all_concepts, &input)
+                        .expect("count_rules must evaluate");
+                match result {
+                    crate::interpreter::Value::Number(n) => assert_eq!(
+                        n, grep_rules,
+                        "count_rules on the WHOLE real self-source must equal its `^rule ` count"
+                    ),
+                    other => panic!("count_rules must return a Number, got {:?}", other),
+                }
+            })
+            .expect("spawn big-stack thread");
+        handle.join().expect("full-file count_rules thread");
+    }
+
 }
