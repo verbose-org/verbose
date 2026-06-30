@@ -395,11 +395,16 @@ concept_group VExpr [max_depth: 4096, max_nodes: 2000000]
   -- name + logic block only (no intention / source / input / output / proofs —
   -- those are later bricks). RuleDecl lives in this group because it carries a
   -- group-typed field (body : Block), and cross-group references are rejected.
+  -- Records-arc brick R5 widens MkRule with the VERIFICATION SURFACE R2's seek_logic
+  -- used to SKIP: `input` (the rule's input fields, reusing R1's FieldList), the single
+  -- output field (out_name_start / out_name_len / out_ty), and `proofs` (purity
+  -- reads/calls + termination). PARSED, not checked — the AST now REPRESENTS what the
+  -- R6 checker will consume.
   concept RuleDecl
-    @intention: "A parsed top-level rule declaration: its name span + its logic block"
+    @intention: "A parsed top-level rule declaration: name + params + input/output types + body + proofs"
     @source: vexprparse.intent:30
     variants:
-      MkRule of (name_start : number, name_len : number, params : ParamList, return_type : number, body : Block)
+      MkRule of (name_start : number, name_len : number, params : ParamList, return_type : number, body : Block, input : FieldList, out_name_start : number, out_name_len : number, out_ty : number, proofs : Proofs)
 
   -- Brick 12: a parsed PROGRAM — a cons-list of top-level rule declarations in
   -- source order. RCons carries one RuleDecl head and the rest; RNil is the empty
@@ -591,6 +596,44 @@ concept_group VExpr [max_depth: 4096, max_nodes: 2000000]
     @source: vexprparse.intent:62
     variants:
       MkPF of (fields : FieldList, next : TokenList)
+
+  -- Records-arc brick R5: a parsed reads/calls entry list — a cons-list of NAME
+  -- spans (each `reads`/`calls` list entry's HEAD identifier span). A reads entry
+  -- like `s.source` captures the span of its head ident `s` (head-ident-only, the
+  -- simpler choice the task permits — it is enough to COUNT entries and identify the
+  -- root binder; the `.field` suffix is skipped by skip_path and not stored). Same
+  -- cons-list family as FieldList (NmCons carries one entry's span + the rest, NmNil
+  -- ends the list). Lives in the group because Proofs (also in the group) carries a
+  -- NameList, and the same arena machinery / structural-recursion proof apply.
+  concept NameList
+    @intention: "Cons-list of a purity reads/calls list (each entry's head-ident span)"
+    @source: vexprparse.intent:30
+    variants:
+      NmCons of (start : number, len : number, rest : NameList)
+      NmNil
+
+  -- Records-arc brick R5: a parsed `proofs:` block — the VERIFICATION SURFACE. `reads`
+  -- / `calls` are the purity lists (NameList); `term_kind` codes the termination kind
+  -- (0=bound-only, 1=structural, 2=decreasing, 3=increasing); `term_bound` is the
+  -- declared `bound :` number; `term_field_start` / `term_field_len` are the span of
+  -- the structural/decreasing/increasing FIELD name (0/0 for bound-only). Single-
+  -- variant record-like group concept (like Concept's MkConcept), in the group because
+  -- RuleDecl (in the group) carries a Proofs.
+  concept Proofs
+    @intention: "A parsed proofs block: purity reads/calls + the termination kind/bound/field"
+    @source: vexprparse.intent:30
+    variants:
+      MkProofs of (reads : NameList, calls : NameList, term_kind : number, term_bound : number, term_field_start : number, term_field_len : number)
+
+  -- Records-arc brick R5: a name-list parse result that THREADS its end cell — the
+  -- NameList built plus the token cell AT the closing `]`. Same Parsed-threading shape
+  -- as ParsedFields's MkPF, so parse_proofs reads the position after one list and
+  -- resumes scanning for the next (`calls` after `reads`, `termination` after `calls`).
+  concept ParsedNames
+    @intention: "A name-list parse result: the NameList built plus its end cell (at the closing bracket)"
+    @source: vexprparse.intent:30
+    variants:
+      MkNames of (names : NameList, next : TokenList)
 
 
 -- ============================================================================
@@ -4548,7 +4591,7 @@ rule find_rule
   logic:
     out = match st.rules:
       RCons(head, tail) => if rd_name_len(head) == st.q_len and name_eq(NameEqState { src: st.src, a_start: rd_name_start(head), b_start: st.q_start, len: st.q_len, off: 0 }) == 1 then head else find_rule(FindRuleState { rules: tail, src: st.src, q_start: st.q_start, q_len: st.q_len })
-      RNil => RuleDecl::MkRule { name_start: 0, name_len: 0, params: ParamList::PNil, return_type: 0, body: Block::MkBlock { binds: Binding::BNil, result: Ast::AstErr } }
+      RNil => RuleDecl::MkRule { name_start: 0, name_len: 0, params: ParamList::PNil, return_type: 0, body: Block::MkBlock { binds: Binding::BNil, result: Ast::AstErr }, input: FieldList::FNil, out_name_start: 0, out_name_len: 0, out_ty: 0, proofs: Proofs::MkProofs { reads: NameList::NmNil, calls: NameList::NmNil, term_kind: 0, term_bound: 0, term_field_start: 0, term_field_len: 0 } }
   proofs:
     purity:
       reads : [st.rules, st.src, st.q_start, st.q_len]
@@ -4897,6 +4940,103 @@ rule span_is_variants
       bound : 64
 
 
+-- span_is_input (records-arc brick R5): 1 iff the span is exactly the 5 bytes
+-- "input" (i=105 n=110 p=112 u=117 t=116). Recognizes the `input:` block header so
+-- parse_rule_decl_pos parses the input field list rather than R2's seek_logic SKIP.
+rule span_is_input
+  @intention: "1 if an Ident span spells exactly \"input\", 0 otherwise"
+  @source: vexprparse.intent:30
+  input:
+    sc : SpanCheck
+  output:
+    out : number
+  logic:
+    out = if sc.len == 5 and (byte_at(sc.src, sc.start) == 105 and (byte_at(sc.src, sc.start + 1) == 110 and (byte_at(sc.src, sc.start + 2) == 112 and (byte_at(sc.src, sc.start + 3) == 117 and byte_at(sc.src, sc.start + 4) == 116)))) then 1 else 0
+  proofs:
+    purity:
+      reads : [sc.src, sc.start, sc.len]
+      calls : []
+    termination:
+      bound : 64
+
+
+-- span_is_output (records-arc brick R5): 1 iff the span is exactly the 6 bytes
+-- "output" (o=111 u=117 t=116 p=112 u=117 t=116). Recognizes the `output:` header.
+rule span_is_output
+  @intention: "1 if an Ident span spells exactly \"output\", 0 otherwise"
+  @source: vexprparse.intent:30
+  input:
+    sc : SpanCheck
+  output:
+    out : number
+  logic:
+    out = if sc.len == 6 and (byte_at(sc.src, sc.start) == 111 and (byte_at(sc.src, sc.start + 1) == 117 and (byte_at(sc.src, sc.start + 2) == 116 and (byte_at(sc.src, sc.start + 3) == 112 and (byte_at(sc.src, sc.start + 4) == 117 and byte_at(sc.src, sc.start + 5) == 116))))) then 1 else 0
+  proofs:
+    purity:
+      reads : [sc.src, sc.start, sc.len]
+      calls : []
+    termination:
+      bound : 64
+
+
+-- span_is_structural (records-arc brick R5): 1 iff the span is exactly the 10 bytes
+-- "structural" (s=115 t=116 r=114 u=117 c=99 t=116 u=117 r=114 a=97 l=108). Recognizes
+-- the termination kind keyword `structural :` (term_kind 1).
+rule span_is_structural
+  @intention: "1 if an Ident span spells exactly \"structural\", 0 otherwise"
+  @source: vexprparse.intent:30
+  input:
+    sc : SpanCheck
+  output:
+    out : number
+  logic:
+    out = if sc.len == 10 and (byte_at(sc.src, sc.start) == 115 and (byte_at(sc.src, sc.start + 1) == 116 and (byte_at(sc.src, sc.start + 2) == 114 and (byte_at(sc.src, sc.start + 3) == 117 and (byte_at(sc.src, sc.start + 4) == 99 and (byte_at(sc.src, sc.start + 5) == 116 and (byte_at(sc.src, sc.start + 6) == 117 and (byte_at(sc.src, sc.start + 7) == 114 and (byte_at(sc.src, sc.start + 8) == 97 and byte_at(sc.src, sc.start + 9) == 108)))))))))then 1 else 0
+  proofs:
+    purity:
+      reads : [sc.src, sc.start, sc.len]
+      calls : []
+    termination:
+      bound : 64
+
+
+-- span_is_decreasing (records-arc brick R5): 1 iff the span is exactly the 10 bytes
+-- "decreasing" (d=100 e=101 c=99 r=114 e=101 a=97 s=115 i=105 n=110 g=103). term_kind 2.
+rule span_is_decreasing
+  @intention: "1 if an Ident span spells exactly \"decreasing\", 0 otherwise"
+  @source: vexprparse.intent:30
+  input:
+    sc : SpanCheck
+  output:
+    out : number
+  logic:
+    out = if sc.len == 10 and (byte_at(sc.src, sc.start) == 100 and (byte_at(sc.src, sc.start + 1) == 101 and (byte_at(sc.src, sc.start + 2) == 99 and (byte_at(sc.src, sc.start + 3) == 114 and (byte_at(sc.src, sc.start + 4) == 101 and (byte_at(sc.src, sc.start + 5) == 97 and (byte_at(sc.src, sc.start + 6) == 115 and (byte_at(sc.src, sc.start + 7) == 105 and (byte_at(sc.src, sc.start + 8) == 110 and byte_at(sc.src, sc.start + 9) == 103)))))))))then 1 else 0
+  proofs:
+    purity:
+      reads : [sc.src, sc.start, sc.len]
+      calls : []
+    termination:
+      bound : 64
+
+
+-- span_is_increasing (records-arc brick R5): 1 iff the span is exactly the 10 bytes
+-- "increasing" (i=105 n=110 c=99 r=114 e=101 a=97 s=115 i=105 n=110 g=103). term_kind 3.
+rule span_is_increasing
+  @intention: "1 if an Ident span spells exactly \"increasing\", 0 otherwise"
+  @source: vexprparse.intent:30
+  input:
+    sc : SpanCheck
+  output:
+    out : number
+  logic:
+    out = if sc.len == 10 and (byte_at(sc.src, sc.start) == 105 and (byte_at(sc.src, sc.start + 1) == 110 and (byte_at(sc.src, sc.start + 2) == 99 and (byte_at(sc.src, sc.start + 3) == 114 and (byte_at(sc.src, sc.start + 4) == 101 and (byte_at(sc.src, sc.start + 5) == 97 and (byte_at(sc.src, sc.start + 6) == 115 and (byte_at(sc.src, sc.start + 7) == 105 and (byte_at(sc.src, sc.start + 8) == 110 and byte_at(sc.src, sc.start + 9) == 103)))))))))then 1 else 0
+  proofs:
+    purity:
+      reads : [sc.src, sc.start, sc.len]
+      calls : []
+    termination:
+      bound : 64
+
+
 -- span_is_concept_group (records-arc brick R2): 1 iff the span src[start..start+len]
 -- is exactly the 13 bytes "concept_group" (c o n c e p t _ g r o u p =
 -- 99 111 110 99 101 112 116 95 103 114 111 117 112). Flat fixed-width check
@@ -4958,7 +5098,7 @@ rule rd_name_start
     out : number
   logic:
     out = match r:
-      MkRule(name_start, name_len, params, return_type, body) => name_start
+      MkRule(name_start, name_len, params, return_type, body, input, out_name_start, out_name_len, out_ty, proofs) => name_start
   proofs:
     purity:
       reads : [r]
@@ -4976,7 +5116,7 @@ rule rd_name_len
     out : number
   logic:
     out = match r:
-      MkRule(name_start, name_len, params, return_type, body) => name_len
+      MkRule(name_start, name_len, params, return_type, body, input, out_name_start, out_name_len, out_ty, proofs) => name_len
   proofs:
     purity:
       reads : [r]
@@ -4994,7 +5134,7 @@ rule rd_body
     out : Block
   logic:
     out = match r:
-      MkRule(name_start, name_len, params, return_type, body) => body
+      MkRule(name_start, name_len, params, return_type, body, input, out_name_start, out_name_len, out_ty, proofs) => body
   proofs:
     purity:
       reads : [r]
@@ -5012,7 +5152,7 @@ rule rd_params
     out : ParamList
   logic:
     out = match r:
-      MkRule(name_start, name_len, params, return_type, body) => params
+      MkRule(name_start, name_len, params, return_type, body, input, out_name_start, out_name_len, out_ty, proofs) => params
   proofs:
     purity:
       reads : [r]
@@ -5034,10 +5174,260 @@ rule rd_return_type
     out : number
   logic:
     out = match r:
-      MkRule(name_start, name_len, params, return_type, body) => return_type
+      MkRule(name_start, name_len, params, return_type, body, input, out_name_start, out_name_len, out_ty, proofs) => return_type
   proofs:
     purity:
       reads : [r]
+      calls : []
+    termination:
+      bound : 16
+
+
+-- rd_input (records-arc brick R5): the input field list of a parsed rule declaration.
+rule rd_input
+  @intention: "The input field list of a parsed rule declaration"
+  @source: vexprparse.intent:30
+  input:
+    r : RuleDecl
+  output:
+    out : FieldList
+  logic:
+    out = match r:
+      MkRule(name_start, name_len, params, return_type, body, input, out_name_start, out_name_len, out_ty, proofs) => input
+  proofs:
+    purity:
+      reads : [r]
+      calls : []
+    termination:
+      bound : 16
+
+
+-- rd_out_ty (records-arc brick R5): the output field's declared type code.
+rule rd_out_ty
+  @intention: "The output field type code of a parsed rule declaration"
+  @source: vexprparse.intent:30
+  input:
+    r : RuleDecl
+  output:
+    out : number
+  logic:
+    out = match r:
+      MkRule(name_start, name_len, params, return_type, body, input, out_name_start, out_name_len, out_ty, proofs) => out_ty
+  proofs:
+    purity:
+      reads : [r]
+      calls : []
+    termination:
+      bound : 16
+
+
+-- rd_proofs (records-arc brick R5): the parsed proofs block of a rule declaration.
+rule rd_proofs
+  @intention: "The parsed proofs block of a parsed rule declaration"
+  @source: vexprparse.intent:30
+  input:
+    r : RuleDecl
+  output:
+    out : Proofs
+  logic:
+    out = match r:
+      MkRule(name_start, name_len, params, return_type, body, input, out_name_start, out_name_len, out_ty, proofs) => proofs
+  proofs:
+    purity:
+      reads : [r]
+      calls : []
+    termination:
+      bound : 16
+
+
+-- Accessors for a Proofs (records-arc brick R5): block-form match only legal in
+-- final position, so each field read is a tiny rule (like rd_params / cd_fields).
+rule prf_reads
+  @intention: "The purity reads name-list of a parsed proofs block"
+  @source: vexprparse.intent:30
+  input:
+    p : Proofs
+  output:
+    out : NameList
+  logic:
+    out = match p:
+      MkProofs(reads, calls, term_kind, term_bound, term_field_start, term_field_len) => reads
+  proofs:
+    purity:
+      reads : [p]
+      calls : []
+    termination:
+      bound : 16
+
+
+rule prf_calls
+  @intention: "The purity calls name-list of a parsed proofs block"
+  @source: vexprparse.intent:30
+  input:
+    p : Proofs
+  output:
+    out : NameList
+  logic:
+    out = match p:
+      MkProofs(reads, calls, term_kind, term_bound, term_field_start, term_field_len) => calls
+  proofs:
+    purity:
+      reads : [p]
+      calls : []
+    termination:
+      bound : 16
+
+
+rule prf_term_kind
+  @intention: "The termination-kind code of a parsed proofs block (0 bound / 1 structural / 2 decreasing / 3 increasing)"
+  @source: vexprparse.intent:30
+  input:
+    p : Proofs
+  output:
+    out : number
+  logic:
+    out = match p:
+      MkProofs(reads, calls, term_kind, term_bound, term_field_start, term_field_len) => term_kind
+  proofs:
+    purity:
+      reads : [p]
+      calls : []
+    termination:
+      bound : 16
+
+
+rule prf_term_bound
+  @intention: "The declared termination bound of a parsed proofs block"
+  @source: vexprparse.intent:30
+  input:
+    p : Proofs
+  output:
+    out : number
+  logic:
+    out = match p:
+      MkProofs(reads, calls, term_kind, term_bound, term_field_start, term_field_len) => term_bound
+  proofs:
+    purity:
+      reads : [p]
+      calls : []
+    termination:
+      bound : 16
+
+
+-- name_list_len (records-arc brick R5): the number of entries in a NameList.
+-- Structural recursion on the NmCons tail (Phase C), like field_list_len.
+rule name_list_len
+  @intention: "Number of entries in a purity reads/calls name-list"
+  @source: vexprparse.intent:30
+  input:
+    nl : NameList
+  output:
+    out : number
+  logic:
+    out = match nl:
+      NmCons(start, len, rest) => 1 + name_list_len(rest)
+      NmNil => 0
+  proofs:
+    purity:
+      reads : [nl]
+      calls : [name_list_len]
+    termination:
+      bound : 4000
+      structural : nl
+
+
+-- Accessors for a ParsedNames result (block-form match only legal in final position).
+rule pn_names
+  @intention: "The NameList from a name-list parse result"
+  @source: vexprparse.intent:30
+  input:
+    p : ParsedNames
+  output:
+    out : NameList
+  logic:
+    out = match p:
+      MkNames(names, next) => names
+  proofs:
+    purity:
+      reads : [p]
+      calls : []
+    termination:
+      bound : 16
+
+
+rule pn_next
+  @intention: "The end cell (at the closing bracket) of a name-list parse result"
+  @source: vexprparse.intent:30
+  input:
+    p : ParsedNames
+  output:
+    out : TokenList
+  logic:
+    out = match p:
+      MkNames(names, next) => next
+  proofs:
+    purity:
+      reads : [p]
+      calls : []
+    termination:
+      bound : 16
+
+
+-- fl_head_start / fl_head_len / fl_head_ty (records-arc brick R5): the span + type
+-- code of the HEAD field of a FieldList (0 for an empty list). Used to extract the
+-- single `output:` field into the RuleDecl's out_name_start / out_name_len / out_ty.
+rule fl_head_start
+  @intention: "The name-span start of the head field of a field list (0 if empty)"
+  @source: vexprparse.intent:30
+  input:
+    fl : FieldList
+  output:
+    out : number
+  logic:
+    out = match fl:
+      FCons(name_start, name_len, ty, rest) => name_start
+      FNil => 0
+  proofs:
+    purity:
+      reads : [fl]
+      calls : []
+    termination:
+      bound : 16
+
+
+rule fl_head_len
+  @intention: "The name-span length of the head field of a field list (0 if empty)"
+  @source: vexprparse.intent:30
+  input:
+    fl : FieldList
+  output:
+    out : number
+  logic:
+    out = match fl:
+      FCons(name_start, name_len, ty, rest) => name_len
+      FNil => 0
+  proofs:
+    purity:
+      reads : [fl]
+      calls : []
+    termination:
+      bound : 16
+
+
+rule fl_head_ty
+  @intention: "The declared type code of the head field of a field list (0 if empty)"
+  @source: vexprparse.intent:30
+  input:
+    fl : FieldList
+  output:
+    out : number
+  logic:
+    out = match fl:
+      FCons(name_start, name_len, ty, rest) => ty
+      FNil => 0
+  proofs:
+    purity:
+      reads : [fl]
       calls : []
     termination:
       bound : 16
@@ -5246,7 +5636,7 @@ rule parse_rule_decl
     let body_idx = skip_seps(ParseState { cell: advance(Advance { lst: logic_idx, k: 2 }) })
     let pb = parse_stmts(ParseState { cell: body_idx })
     let goodblk = pb_block(pb)
-    out = RuleDecl::MkRule { name_start: name_start, name_len: name_len, params: params, return_type: return_type, body: if hdr_ok == 1 then goodblk else Block::MkBlock { binds: Binding::BNil, result: Ast::AstErr } }
+    out = RuleDecl::MkRule { name_start: name_start, name_len: name_len, params: params, return_type: return_type, body: if hdr_ok == 1 then goodblk else Block::MkBlock { binds: Binding::BNil, result: Ast::AstErr }, input: FieldList::FNil, out_name_start: 0, out_name_len: 0, out_ty: 0, proofs: Proofs::MkProofs { reads: NameList::NmNil, calls: NameList::NmNil, term_kind: 0, term_bound: 0, term_field_start: 0, term_field_len: 0 } }
   proofs:
     purity:
       reads : [rp.cell, rp.src]
@@ -5587,6 +5977,22 @@ rule parse_rule_decl_pos
     let return_type = if typed_ret == 1 then type_code_of_span(SpanCheck { src: ps.src, start: ret_ty_start, len: ret_ty_len }) else 9
     let after_ret = if typed_ret == 1 then advance(Advance { lst: after_params, k: 2 }) else after_params
     let scan0 = skip_seps(ParseState { cell: after_ret })
+    let in_kw_start = peek_start(scan0)
+    let in_kw_len = peek_len(scan0)
+    let is_input = span_is_input(SpanCheck { src: ps.src, start: in_kw_start, len: in_kw_len })
+    let in_body = skip_seps(ParseState { cell: advance(Advance { lst: scan0, k: 2 }) })
+    let pin = parse_fields(FieldParseState { cell: in_body, src: ps.src })
+    let input_fl = if is_input == 1 then pf_fields(pin) else FieldList::FNil
+    let out_hdr = if is_input == 1 then skip_seps_dedent(ParseState { cell: pf_next(pin) }) else scan0
+    let out_kw_start = peek_start(out_hdr)
+    let out_kw_len = peek_len(out_hdr)
+    let is_output = span_is_output(SpanCheck { src: ps.src, start: out_kw_start, len: out_kw_len })
+    let out_body = skip_seps(ParseState { cell: advance(Advance { lst: out_hdr, k: 2 }) })
+    let pout = parse_fields(FieldParseState { cell: out_body, src: ps.src })
+    let out_fl = if is_output == 1 then pf_fields(pout) else FieldList::FNil
+    let out_name_start = fl_head_start(out_fl)
+    let out_name_len = fl_head_len(out_fl)
+    let out_ty = fl_head_ty(out_fl)
     let logic_idx = if is_rule == 1 then seek_logic(ProgramState { cell: scan0, src: ps.src }) else scan0
     let logic_start = peek_start(logic_idx)
     let logic_len = peek_len(logic_idx)
@@ -5600,12 +6006,13 @@ rule parse_rule_decl_pos
     let p2start = peek_start(after_logic)
     let p2len = peek_len(after_logic)
     let is_proofs = span_is_proofs(SpanCheck { src: ps.src, start: p2start, len: p2len })
+    let proofs_parsed = if is_proofs == 1 then parse_proofs(ProgramState { cell: after_logic, src: ps.src }) else Proofs::MkProofs { reads: NameList::NmNil, calls: NameList::NmNil, term_kind: 0, term_bound: 0, term_field_start: 0, term_field_len: 0 }
     let endp = if is_proofs == 1 then skip_indented_block(SkipBlockState { cell: after_logic, depth: 0, seen: 0 }) else after_logic
-    out = ParsedRule::MkPR { rule: RuleDecl::MkRule { name_start: name_start, name_len: name_len, params: params, return_type: return_type, body: if hdr_ok == 1 then goodblk else Block::MkBlock { binds: Binding::BNil, result: Ast::AstErr } }, next: endp }
+    out = ParsedRule::MkPR { rule: RuleDecl::MkRule { name_start: name_start, name_len: name_len, params: params, return_type: return_type, body: if hdr_ok == 1 then goodblk else Block::MkBlock { binds: Binding::BNil, result: Ast::AstErr }, input: input_fl, out_name_start: out_name_start, out_name_len: out_name_len, out_ty: out_ty, proofs: proofs_parsed }, next: endp }
   proofs:
     purity:
       reads : [ps.cell, ps.src]
-      calls : [peek_start, peek_len, span_is_rule, parse_params, pp_params, pp_next, peek_op_code, type_code_of_span, span_is_logic, skip_seps, seek_logic, parse_stmts, pb_block, pb_next, skip_indented_block, skip_seps_dedent, span_is_proofs, advance]
+      calls : [peek_start, peek_len, span_is_rule, parse_params, pp_params, pp_next, peek_op_code, type_code_of_span, span_is_input, span_is_output, parse_fields, pf_fields, pf_next, fl_head_start, fl_head_len, fl_head_ty, span_is_logic, skip_seps, seek_logic, parse_stmts, pb_block, pb_next, skip_indented_block, skip_seps_dedent, span_is_proofs, parse_proofs, advance]
     termination:
       bound : 64
 
@@ -5947,6 +6354,167 @@ rule skip_to_newline
       calls : [peek_kind, skip_to_newline, advance]
     termination:
       bound : 512
+
+
+-- ============================================================================
+-- RECORDS-ARC BRICK R5: parse the rule's `input:`/`output:` TYPES + `proofs:`
+-- (purity reads/calls + termination) into the RuleDecl AST.
+--
+-- Before R5 parse_rule_decl_pos SKIPPED these whole blocks (seek_logic walked past
+-- input/output to find logic; the trailing proofs block was skipped to compute the
+-- end position). R5 PARSES them — the AST now REPRESENTS the verification surface the
+-- R6 checker will consume. PARSER-ONLY: no checking, no codegen.
+--
+-- A `reads`/`calls` list is `[ entry , entry , ... ]` where each entry is an ident-
+-- path `ident (.ident)*` (e.g. `s.source`). parse_name_list captures each entry's
+-- HEAD-IDENT span (the simpler choice the task allows — enough to COUNT entries and
+-- name the root binder; skip_path skips the `.field` suffix). The proofs sub-blocks
+-- (purity / reads / calls / termination / bound / structural|decreasing|increasing)
+-- are reached POSITIONALLY (fixed token offsets + skip_seps), so the only new span
+-- helpers are the optional-block detectors (input/output) and the termination-kind
+-- keyword detectors (structural/decreasing/increasing).
+-- ============================================================================
+
+-- A name-cons continuation: the head entry's span plus the parsed REST of the list.
+-- names_cons conses the head onto the rest's NameList, threading the rest's end cell.
+-- Mirrors FieldConsState exactly, keeping the recursive parse_name_list call lazily
+-- inside the entry branch (a let would force it eagerly).
+concept NameConsState
+  @intention: "Head name-list entry span + the parsed rest of the name list"
+  @source: vexprparse.intent:30
+  fields:
+    head_start : number [0, 4000000]
+    head_len : number [0, 4000000]
+    rest : ParsedNames
+
+
+rule names_cons
+  @intention: "Cons the head entry onto the front of the parsed rest of the name list"
+  @source: vexprparse.intent:30
+  input:
+    nc : NameConsState
+  output:
+    out : ParsedNames
+  logic:
+    let rest_list = pn_names(nc.rest)
+    let rest_next = pn_next(nc.rest)
+    out = ParsedNames::MkNames { names: NameList::NmCons { start: nc.head_start, len: nc.head_len, rest: rest_list }, next: rest_next }
+  proofs:
+    purity:
+      reads : [nc.head_start, nc.head_len, nc.rest]
+      calls : [pn_names, pn_next]
+    termination:
+      bound : 16
+
+
+-- skip_path (records-arc brick R5): from a cell AT an entry's head ident, advance
+-- past the ident and any trailing `.ident` pairs (op 12 = `.`), returning the cell
+-- AT the following `,` (op 11) or `]` (op 26). For a bare entry (`s`) it returns the
+-- cell right after the ident; for `s.source` it skips `.` `source` and lands on the
+-- separator. Forward-index recursion (each step advances by 2 toward the finite token
+-- end); bound + the mandatory recursion breadcrumb.
+rule skip_path
+  @intention: "Skip an ident-path entry (ident then any .field pairs), landing on the separator cell"
+  @source: vexprparse.intent:30
+  input:
+    st : ParseState
+  output:
+    out : TokenList
+  logic:
+    let after_id = advance(Advance { lst: st.cell, k: 1 })
+    let isdot = if peek_op_code(after_id) == 12 then 1 else 0
+    out = if isdot == 1 then skip_path(ParseState { cell: advance(Advance { lst: st.cell, k: 2 }) }) else after_id
+  proofs:
+    purity:
+      reads : [st.cell]
+      calls : [peek_op_code, skip_path, advance]
+    termination:
+      bound : 512
+
+
+-- parse_name_list (records-arc brick R5): parse the body of a bracketed `[ a, b.c,
+-- ... ]` list into a NameList, starting at the cell of the FIRST entry token (right
+-- after the `[`). If that token is an Ident (kind 100) it is an entry head — capture
+-- its span, skip the rest of the entry (skip_path), then if the separator is `,` (op
+-- 11) advance past it and recurse on the next entry; a `]` (op 26) or any non-ident
+-- ends the list (NmNil) and threads the closing-`]` cell as `next`. The recursive
+-- call is LAZY (inside names_cons, exactly like parse_fields' FCons tail). Forward
+-- token scan; bound + the mandatory recursion breadcrumb (the backstop is the finite
+-- token list, bounded by max_nodes). Empty list `[]` lands on `]` immediately => NmNil.
+rule parse_name_list
+  @intention: "Parse a bracketed reads/calls list into a NameList + its end cell (one NmCons per entry)"
+  @source: vexprparse.intent:30
+  input:
+    st : ParseState
+  output:
+    out : ParsedNames
+  logic:
+    let knd = peek_kind(st.cell)
+    let is_entry = if knd == 100 then 1 else 0
+    let name_start = peek_start(st.cell)
+    let name_len = peek_len(st.cell)
+    let after_path = skip_path(ParseState { cell: st.cell })
+    let nextop = peek_op_code(after_path)
+    let rest_cell = if nextop == 11 then advance(Advance { lst: after_path, k: 1 }) else after_path
+    out = if is_entry == 1 then names_cons(NameConsState { head_start: name_start, head_len: name_len, rest: parse_name_list(ParseState { cell: rest_cell }) }) else ParsedNames::MkNames { names: NameList::NmNil, next: st.cell }
+  proofs:
+    purity:
+      reads : [st.cell]
+      calls : [peek_kind, peek_start, peek_len, skip_path, peek_op_code, names_cons, parse_name_list, advance]
+    termination:
+      bound : 512
+
+
+-- parse_proofs (records-arc brick R5): parse a rule's `proofs:` block into a Proofs,
+-- starting at the `proofs` header cell. The grammar is fixed, so every sub-block is
+-- reached POSITIONALLY (no span checks for purity/reads/calls/termination/bound):
+--   proofs:                       cell+0 `proofs` cell+1 `:` then Nl, Indent
+--     purity:                     skip_seps(cell+2) => `purity`; +2 then Nl, Indent
+--       reads : [ ... ]           skip_seps(purity+2) => `reads`; reads+2 = `[`, +3 = first entry
+--       calls : [ ... ]           skip_seps(after `]` Nl) => `calls`
+--     termination:                skip_seps_dedent(after `]` Nl Dedent) => `termination`
+--       bound : N                 skip_seps(termination+2) => `bound`; bound+2 = the Num
+--       structural : x            optional: skip_seps(bound+3) => kw ident OR a Dedent
+-- The termination kind is the one keyword present after `bound : N` (structural=1,
+-- decreasing=2, increasing=3, none=0); its field name is two tokens on (`kw` `:` field).
+-- One-shot (delegates the list recursion to parse_name_list); bound-only termination.
+rule parse_proofs
+  @intention: "Parse a proofs block into a Proofs (purity reads/calls + termination kind/bound/field)"
+  @source: vexprparse.intent:30
+  input:
+    ps : ProgramState
+  output:
+    out : Proofs
+  logic:
+    let purity_hdr = skip_seps(ParseState { cell: advance(Advance { lst: ps.cell, k: 2 }) })
+    let reads_hdr = skip_seps(ParseState { cell: advance(Advance { lst: purity_hdr, k: 2 }) })
+    let pnreads = parse_name_list(ParseState { cell: advance(Advance { lst: reads_hdr, k: 3 }) })
+    let reads_names = pn_names(pnreads)
+    let after_reads = pn_next(pnreads)
+    let calls_hdr = skip_seps(ParseState { cell: advance(Advance { lst: after_reads, k: 1 }) })
+    let pncalls = parse_name_list(ParseState { cell: advance(Advance { lst: calls_hdr, k: 3 }) })
+    let calls_names = pn_names(pncalls)
+    let after_calls = pn_next(pncalls)
+    let term_hdr = skip_seps_dedent(ParseState { cell: advance(Advance { lst: after_calls, k: 1 }) })
+    let bound_hdr = skip_seps(ParseState { cell: advance(Advance { lst: term_hdr, k: 2 }) })
+    let term_bound = peek_value(advance(Advance { lst: bound_hdr, k: 2 }))
+    let extra_hdr = skip_seps(ParseState { cell: advance(Advance { lst: bound_hdr, k: 3 }) })
+    let ek_start = peek_start(extra_hdr)
+    let ek_len = peek_len(extra_hdr)
+    let is_struct = span_is_structural(SpanCheck { src: ps.src, start: ek_start, len: ek_len })
+    let is_decr = span_is_decreasing(SpanCheck { src: ps.src, start: ek_start, len: ek_len })
+    let is_incr = span_is_increasing(SpanCheck { src: ps.src, start: ek_start, len: ek_len })
+    let term_kind = if is_struct == 1 then 1 else if is_decr == 1 then 2 else if is_incr == 1 then 3 else 0
+    let tf = advance(Advance { lst: extra_hdr, k: 2 })
+    let term_field_start = if term_kind == 0 then 0 else peek_start(tf)
+    let term_field_len = if term_kind == 0 then 0 else peek_len(tf)
+    out = Proofs::MkProofs { reads: reads_names, calls: calls_names, term_kind: term_kind, term_bound: term_bound, term_field_start: term_field_start, term_field_len: term_field_len }
+  proofs:
+    purity:
+      reads : [ps.cell, ps.src]
+      calls : [skip_seps, skip_seps_dedent, parse_name_list, pn_names, pn_next, peek_value, peek_start, peek_len, span_is_structural, span_is_decreasing, span_is_increasing, advance]
+    termination:
+      bound : 64
 
 
 -- Accessors for a ParsedConcept (a block-form match is only legal in final
@@ -6545,6 +7113,117 @@ rule rl_head_return_type
       calls : [rd_return_type]
     termination:
       bound : 16
+
+
+-- rl_head_proofs (records-arc brick R5): the parsed proofs block of the head rule of
+-- a rule list (an empty proofs block for an empty list). Mirror of rl_head_body.
+rule rl_head_proofs
+  @intention: "The parsed proofs block of the head rule of a rule list (empty if none)"
+  @source: vexprparse.intent:30
+  input:
+    rl : RuleList
+  output:
+    out : Proofs
+  logic:
+    out = match rl:
+      RCons(head, tail) => rd_proofs(head)
+      RNil => Proofs::MkProofs { reads: NameList::NmNil, calls: NameList::NmNil, term_kind: 0, term_bound: 0, term_field_start: 0, term_field_len: 0 }
+  proofs:
+    purity:
+      reads : [rl]
+      calls : [rd_proofs]
+    termination:
+      bound : 16
+
+
+-- count_reads (records-arc brick R5 driver): tokenize a program, parse it, and
+-- return the number of `reads` entries in the FIRST rule's proofs. Proves the purity
+-- reads list parses into the right number of NameList entries (e.g. `reads : [s.source,
+-- s]` => 2). NATIVE-ONLY (multi-line indented source); source is argv arg 1, pos is 0.
+rule count_reads
+  @intention: "Parse a program and return the number of reads entries of its first rule's proofs"
+  @source: vexprparse.intent:30
+  input:
+    s : ScanState
+  output:
+    out : number
+  logic:
+    let toks = begin_tokenize(ScanState { source: s.source, pos: 0 })
+    let prog = parse_program(ProgramState { cell: toks, src: s.source })
+    let pf = rl_head_proofs(prog)
+    out = name_list_len(prf_reads(pf))
+  proofs:
+    purity:
+      reads : [s.source]
+      calls : [begin_tokenize, parse_program, rl_head_proofs, prf_reads, name_list_len]
+    termination:
+      bound : 256
+
+
+-- count_calls (records-arc brick R5 driver): like count_reads but the `calls` list
+-- (e.g. `calls : [skip_spaces, token_end, next_token, tokenize]` => 4; `calls : []` => 0).
+rule count_calls
+  @intention: "Parse a program and return the number of calls entries of its first rule's proofs"
+  @source: vexprparse.intent:30
+  input:
+    s : ScanState
+  output:
+    out : number
+  logic:
+    let toks = begin_tokenize(ScanState { source: s.source, pos: 0 })
+    let prog = parse_program(ProgramState { cell: toks, src: s.source })
+    let pf = rl_head_proofs(prog)
+    out = name_list_len(prf_calls(pf))
+  proofs:
+    purity:
+      reads : [s.source]
+      calls : [begin_tokenize, parse_program, rl_head_proofs, prf_calls, name_list_len]
+    termination:
+      bound : 256
+
+
+-- rule_term_bound (records-arc brick R5 driver): the declared `bound :` number of the
+-- first rule's termination proof (e.g. `bound : 256` => 256). NATIVE-ONLY.
+rule rule_term_bound
+  @intention: "Parse a program and return the declared termination bound of its first rule"
+  @source: vexprparse.intent:30
+  input:
+    s : ScanState
+  output:
+    out : number
+  logic:
+    let toks = begin_tokenize(ScanState { source: s.source, pos: 0 })
+    let prog = parse_program(ProgramState { cell: toks, src: s.source })
+    let pf = rl_head_proofs(prog)
+    out = prf_term_bound(pf)
+  proofs:
+    purity:
+      reads : [s.source]
+      calls : [begin_tokenize, parse_program, rl_head_proofs, prf_term_bound]
+    termination:
+      bound : 256
+
+
+-- rule_term_kind (records-arc brick R5 driver): the termination-kind code of the
+-- first rule's proofs (0=bound-only, 1=structural, 2=decreasing, 3=increasing). NATIVE-ONLY.
+rule rule_term_kind
+  @intention: "Parse a program and return the termination-kind code of its first rule"
+  @source: vexprparse.intent:30
+  input:
+    s : ScanState
+  output:
+    out : number
+  logic:
+    let toks = begin_tokenize(ScanState { source: s.source, pos: 0 })
+    let prog = parse_program(ProgramState { cell: toks, src: s.source })
+    let pf = rl_head_proofs(prog)
+    out = prf_term_kind(pf)
+  proofs:
+    purity:
+      reads : [s.source]
+      calls : [begin_tokenize, parse_program, rl_head_proofs, prf_term_kind]
+    termination:
+      bound : 256
 
 
 -- count_rules: the brick-12 STRUCTURAL driver. Tokenize the program source (with

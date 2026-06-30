@@ -34178,6 +34178,108 @@ rule two
         let _ = std::fs::remove_file(&cv);
     }
 
+    /// Records-arc brick R5: the self-hosted parser (examples/vexprparse.verbose) now
+    /// PARSES the rule's `input:`/`output:` types and `proofs:` (purity reads/calls +
+    /// termination) into the RuleDecl AST, where R2's seek_logic used to SKIP them.
+    /// This is the VERIFICATION SURFACE the R6 checker will consume — PARSER-ONLY here.
+    ///
+    /// Four new drivers read the FIRST rule's proofs off the parsed program:
+    ///   * count_reads     — number of `reads` entries (NameList length)
+    ///   * count_calls     — number of `calls` entries
+    ///   * rule_term_bound — the declared `bound :` number
+    ///   * rule_term_kind  — termination kind (0 bound-only / 1 structural / 2 decreasing / 3 increasing)
+    /// All NATIVE-ONLY (multi-line indented source). Source is argv[1], pos is argv[2]="0".
+    ///
+    /// Part 1 (THE MILESTONE, real-shaped rule): a `tokenize`-shaped rule with
+    /// `reads : [s.source, s]` (=> 2), `calls : [skip_spaces, token_end, next_token,
+    /// tokenize]` (=> 4), `bound : 256` (=> 256), bound-only termination (kind 0).
+    /// This is the exact proof shape of the real self-source's `tokenize` — the reads
+    /// (ident-path entries) and calls (4 callees incl. self) are extracted for real.
+    ///
+    /// Part 2 (regression, decreasing variant): one full rule
+    /// (input a:number / output out:number / logic out=1 / proofs reads:[a] calls:[]
+    /// termination: bound 100, decreasing a) => count_reads 1, count_calls 0,
+    /// rule_term_bound 100, rule_term_kind 2, and count_rules still 1.
+    #[test]
+    fn records_r5_parse_input_output_and_proofs() {
+        let src = std::fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let crd = std::env::temp_dir().join("verbosec_test_r5_count_reads");
+        let ccl = std::env::temp_dir().join("verbosec_test_r5_count_calls");
+        let ctb = std::env::temp_dir().join("verbosec_test_r5_term_bound");
+        let ctk = std::env::temp_dir().join("verbosec_test_r5_term_kind");
+        let cru = std::env::temp_dir().join("verbosec_test_r5_count_rules");
+        compile_native(&program, "count_reads", crd.to_str().unwrap(), false, false)
+            .expect("count_reads must compile natively");
+        compile_native(&program, "count_calls", ccl.to_str().unwrap(), false, false)
+            .expect("count_calls must compile natively");
+        compile_native(&program, "rule_term_bound", ctb.to_str().unwrap(), false, false)
+            .expect("rule_term_bound must compile natively");
+        compile_native(&program, "rule_term_kind", ctk.to_str().unwrap(), false, false)
+            .expect("rule_term_kind must compile natively");
+        compile_native(&program, "count_rules", cru.to_str().unwrap(), false, false)
+            .expect("count_rules must compile natively");
+
+        let run = |bin: &std::path::Path, prog: &str| -> i64 {
+            let r = std::process::Command::new(bin)
+                .arg(prog)
+                .arg("0")
+                .output()
+                .expect("spawn R5 driver");
+            assert!(r.status.success(), "{:?} must exit 0; got {:?}", bin, r.status);
+            String::from_utf8_lossy(&r.stdout)
+                .trim()
+                .parse::<i64>()
+                .expect("R5 driver prints an integer")
+        };
+
+        // Part 1 — THE MILESTONE: a real-shaped `tokenize` rule. The reads list has
+        // two ident-path entries (`s.source`, `s`); the calls list has four callees
+        // (three helpers + the self-recursive `tokenize`); the termination is
+        // bound-only at 256.
+        let tokenize = "rule tokenize\n  input:\n    s : ScanState\n  output:\n    out : TokenList\n  logic:\n    out = 1\n  proofs:\n    purity:\n      reads : [s.source, s]\n      calls : [skip_spaces, token_end, next_token, tokenize]\n    termination:\n      bound : 256";
+        assert_eq!(
+            run(&crd, tokenize), 2,
+            "MILESTONE: count_reads on a tokenize-shaped rule = 2 (`s.source`, `s`)"
+        );
+        assert_eq!(
+            run(&ccl, tokenize), 4,
+            "MILESTONE: count_calls = 4 (skip_spaces, token_end, next_token, tokenize)"
+        );
+        assert_eq!(
+            run(&ctb, tokenize), 256,
+            "MILESTONE: rule_term_bound = 256 (the declared `bound :`)"
+        );
+        assert_eq!(
+            run(&ctk, tokenize), 0,
+            "MILESTONE: rule_term_kind = 0 (bound-only termination, no structural/decreasing/increasing)"
+        );
+        assert_eq!(
+            run(&cru, tokenize), 1,
+            "count_rules unchanged — the source declares exactly one rule"
+        );
+
+        // Part 2 — regression: a full rule with a `decreasing` termination variant.
+        let decreasing = "rule fac\n  input:\n    a : number\n  output:\n    out : number\n  logic:\n    out = 1\n  proofs:\n    purity:\n      reads : [a]\n      calls : []\n    termination:\n      bound : 100\n      decreasing : a";
+        assert_eq!(run(&crd, decreasing), 1, "R5: reads:[a] => 1");
+        assert_eq!(run(&ccl, decreasing), 0, "R5: calls:[] => 0 (empty list)");
+        assert_eq!(run(&ctb, decreasing), 100, "R5: bound : 100 => 100");
+        assert_eq!(
+            run(&ctk, decreasing), 2,
+            "R5: `decreasing : a` => term_kind 2 (exercises term_kind != 0)"
+        );
+        assert_eq!(run(&cru, decreasing), 1, "R5: count_rules still 1");
+
+        let _ = std::fs::remove_file(&crd);
+        let _ = std::fs::remove_file(&ccl);
+        let _ = std::fs::remove_file(&ctb);
+        let _ = std::fs::remove_file(&ctk);
+        let _ = std::fs::remove_file(&cru);
+    }
+
     /// Full-file companion to the R2 milestone: count_rules on the WHOLE real
     /// self-source (examples/vexprparse.verbose, ~500 KB > the 128 KB single-argv
     /// limit) via the INTERPRETER path, called directly with a constructed
