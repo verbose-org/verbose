@@ -528,6 +528,22 @@ concept_group VExpr [max_depth: 4096, max_nodes: 2000000]
       FCons of (name_start : number, name_len : number, ty : number, rest : FieldList)
       FNil
 
+  -- Records-arc brick R4: a parsed `variants:` line — one variant NAME span plus its
+  -- payload field list. A SUM-type concept (a `variants:` block) is a list of these:
+  -- a bare variant like `Eof` / `Nil` / `Indent` has payload = FNil; a payload variant
+  -- like `Cons of (head : Token, tail : TokenList)` carries a FieldList parsed from the
+  -- parenthesized `of ( name : type , ... )` list (REUSING the FieldList shape brick R1
+  -- already built for `fields:`). Same cons-list family as FieldList (FCons/FNil):
+  -- VarCons carries one variant's (name_start, name_len, payload) and the rest; VarNil
+  -- ends the list. Lives in the group because it is the same cons-list shape as
+  -- FieldList and is reachable from Concept (MkConcept now also carries a VariantList).
+  concept VariantList
+    @intention: "Cons-list of a concept's variants (each a name span + its payload field list)"
+    @source: vexprparse.intent:65
+    variants:
+      VarCons of (name_start : number, name_len : number, payload : FieldList, rest : VariantList)
+      VarNil
+
   -- Records-arc brick R1: a parsed top-level CONCEPT declaration. `name_start` /
   -- `name_len` are the concept NAME's source span (the same identity model as a
   -- RuleDecl name — R1 does not decode the name to bytes). `fields` is the parsed
@@ -537,10 +553,10 @@ concept_group VExpr [max_depth: 4096, max_nodes: 2000000]
   -- find_rule returning a RuleDecl), and a number driver reads a field off it via
   -- the bare-group accessors (same idiom as rd_body / block_binds).
   concept Concept
-    @intention: "A parsed top-level concept declaration: its name span + its field list"
+    @intention: "A parsed top-level concept declaration: its name span + its field list + its variant list"
     @source: vexprparse.intent:62
     variants:
-      MkConcept of (name_start : number, name_len : number, fields : FieldList)
+      MkConcept of (name_start : number, name_len : number, fields : FieldList, variants : VariantList)
 
   -- Records-arc brick R1: a parsed CONCEPT program slice — a cons-list of top-level
   -- concept declarations in source order. CCons carries one Concept head and the
@@ -4859,6 +4875,28 @@ rule span_is_fields
       bound : 64
 
 
+-- span_is_variants (records-arc brick R4): 1 iff the span src[start..start+len] is
+-- exactly the 8 bytes "variants" (v=118 a=97 r=114 i=105 a=97 n=110 t=116 s=115).
+-- Flat fixed-width check (mirroring span_is_fields), length-guarded first. Recognizes
+-- the `variants:` block header inside a SUM-type concept declaration — the analogue
+-- of `fields:` for record concepts.
+rule span_is_variants
+  @intention: "1 if an Ident span spells exactly \"variants\", 0 otherwise"
+  @source: vexprparse.intent:65
+  input:
+    sc : SpanCheck
+  output:
+    out : number
+  logic:
+    out = if sc.len == 8 and (byte_at(sc.src, sc.start) == 118 and (byte_at(sc.src, sc.start + 1) == 97 and (byte_at(sc.src, sc.start + 2) == 114 and (byte_at(sc.src, sc.start + 3) == 105 and (byte_at(sc.src, sc.start + 4) == 97 and (byte_at(sc.src, sc.start + 5) == 110 and (byte_at(sc.src, sc.start + 6) == 116 and byte_at(sc.src, sc.start + 7) == 115)))))) ) then 1 else 0
+  proofs:
+    purity:
+      reads : [sc.src, sc.start, sc.len]
+      calls : []
+    termination:
+      bound : 64
+
+
 -- span_is_concept_group (records-arc brick R2): 1 iff the span src[start..start+len]
 -- is exactly the 13 bytes "concept_group" (c o n c e p t _ g r o u p =
 -- 99 111 110 99 101 112 116 95 103 114 111 117 112). Flat fixed-width check
@@ -5694,6 +5732,17 @@ concept FieldParseState
     src : text [..256]
 
 
+-- Records-arc brick R4: the variant-list parse cursor — the token list cell plus the
+-- source text (backs the payload type-name byte recognition via type_code_of_span).
+-- Same multi-field shape as FieldParseState, just driving parse_variants.
+concept VariantParseState
+  @intention: "The token list cursor cell plus the source text, for parsing a variants block"
+  @source: vexprparse.intent:65
+  fields:
+    cell : TokenList
+    src : text [..256]
+
+
 -- parse_fields: parse the body of a `fields:` block into a FieldList, starting at
 -- fp.pos. skip_seps lands on the next significant token: if it is an Ident (kind
 -- 100) it is a field NAME — read its span, read the TYPE Ident span two tokens on
@@ -5802,6 +5851,104 @@ rule parse_fields
       bound : 512
 
 
+-- params_to_fields (records-arc brick R4): convert a ParamList (built by the proven
+-- brick-20 params_scan / parse_params, which parses a comma-separated `( name : type ,
+-- ... )` list) into the structurally-identical FieldList. A variant payload `of (a : T,
+-- b : T)` has EXACTLY the parenthesized comma shape parse_params already handles, so
+-- parse_variants reuses parse_params for the payload and converts its ParamList result
+-- to the FieldList the AST stores. PCons -> FCons one-for-one; PNil -> FNil. Structural
+-- recursion on the cons tail (Phase C), like field_list_len.
+rule params_to_fields
+  @intention: "Convert a parsed ParamList into the structurally-identical FieldList"
+  @source: vexprparse.intent:65
+  input:
+    pl : ParamList
+  output:
+    out : FieldList
+  logic:
+    out = match pl:
+      PCons(name_start, name_len, ty, rest) => FieldList::FCons { name_start: name_start, name_len: name_len, ty: ty, rest: params_to_fields(rest) }
+      PNil => FieldList::FNil
+  proofs:
+    purity:
+      reads : [pl]
+      calls : [params_to_fields]
+    termination:
+      bound : 512
+      structural : pl
+
+
+-- parse_variants (records-arc brick R4): parse the body of a `variants:` block into a
+-- VariantList, starting at vp.cell. skip_seps lands on the next significant token: if
+-- it is an Ident (kind 100) it is a variant NAME — read its span. A payload follows
+-- iff the token two on (name+2) is `(` (op 21): the shape is `NAME of ( ... )`, so
+-- name+1 is `of` and name+2 is the open paren. When present, parse_params (brick 20)
+-- parses the parenthesized `( name : type , ... )` payload, CONSUMING the `)`, and its
+-- ParamList is converted to a FieldList via params_to_fields; the recursion resumes
+-- from parse_params' end cell. A bare variant (`Eof` / `Nil` / `Indent`) has payload
+-- FNil and the recursion resumes from name+1. A Dedent (800) / Eof (0) / any non-Ident
+-- ends the block (VarNil). The recursive call is LAZY (inside the then branch of the
+-- Ident dispatch, exactly like parse_program's RCons tail / parse_fields' FCons), so
+-- it only fires on a real variant line. Recurses over a forward token scan (no
+-- structural FIELD fits), so bound + the mandatory recursion breadcrumb (the backstop
+-- is the finite token list, bounded by max_nodes). Every peek is OOB-guarded by the
+-- token-list accessors (Eof past the end), and parse_params on a non-`(` token returns
+-- PNil immediately (no recursion) so the eager pre-eval is safe on bare variants.
+rule parse_variants
+  @intention: "Parse the body of a variants: block into a VariantList (one VarCons per variant line)"
+  @source: vexprparse.intent:65
+  input:
+    vp : VariantParseState
+  output:
+    out : VariantList
+  logic:
+    let hp = skip_seps(ParseState { cell: vp.cell })
+    let knd = peek_kind(hp)
+    let is_variant = if knd == 100 then 1 else 0
+    let name_start = peek_start(hp)
+    let name_len = peek_len(hp)
+    let after_name = advance(Advance { lst: hp, k: 1 })
+    let open_cell = advance(Advance { lst: hp, k: 2 })
+    let has_payload = if peek_op_code(open_cell) == 21 then 1 else 0
+    let pp = parse_params(ParamParseState { cell: open_cell, src: vp.src })
+    let payload_fields = params_to_fields(pp_params(pp))
+    let rest_cell = if has_payload == 1 then pp_next(pp) else after_name
+    out = if is_variant == 1 then VariantList::VarCons { name_start: name_start, name_len: name_len, payload: payload_fields, rest: parse_variants(VariantParseState { cell: rest_cell, src: vp.src }) } else VariantList::VarNil
+  proofs:
+    purity:
+      reads : [vp.cell, vp.src]
+      calls : [skip_seps, peek_kind, peek_start, peek_len, peek_op_code, parse_params, pp_params, pp_next, params_to_fields, parse_variants, advance]
+    termination:
+      bound : 512
+
+
+-- skip_to_newline (records-arc brick R4): advance the cursor forward until the first
+-- Newline (kind 600) or Eof (kind 0), returning that cell. Used by parse_concepts to
+-- DESCEND into a `concept_group`: the group header (`concept_group NAME [ ... ]`) is
+-- one line, so skipping to its Newline — then skip_seps over the Newline + the group-
+-- body Indent — lands on the first nested concept. The `[max_depth: …, max_nodes: …]`
+-- bounds on the header are passed through untouched (parser-only brick R4 does not
+-- need them). Forward-index recursion (strictly toward the finite token end); bound +
+-- the mandatory recursion breadcrumb (the backstop is the finite token list).
+rule skip_to_newline
+  @intention: "The cell at the first Newline (or Eof) at/after the cursor"
+  @source: vexprparse.intent:65
+  input:
+    st : ParseState
+  output:
+    out : TokenList
+  logic:
+    let knd = peek_kind(st.cell)
+    let stop = if knd == 600 then 1 else if knd == 0 then 1 else 0
+    out = if stop == 1 then st.cell else skip_to_newline(ParseState { cell: advance(Advance { lst: st.cell, k: 1 }) })
+  proofs:
+    purity:
+      reads : [st.cell]
+      calls : [peek_kind, skip_to_newline, advance]
+    termination:
+      bound : 512
+
+
 -- Accessors for a ParsedConcept (a block-form match is only legal in final
 -- position, so destructuring is factored into tiny rules — like pr_rule / pr_next).
 rule pc_concept
@@ -5850,7 +5997,7 @@ rule cd_name_start
     out : number
   logic:
     out = match c:
-      MkConcept(name_start, name_len, fields) => name_start
+      MkConcept(name_start, name_len, fields, variants) => name_start
   proofs:
     purity:
       reads : [c]
@@ -5868,7 +6015,7 @@ rule cd_name_len
     out : number
   logic:
     out = match c:
-      MkConcept(name_start, name_len, fields) => name_len
+      MkConcept(name_start, name_len, fields, variants) => name_len
   proofs:
     purity:
       reads : [c]
@@ -5886,7 +6033,27 @@ rule cd_fields
     out : FieldList
   logic:
     out = match c:
-      MkConcept(name_start, name_len, fields) => fields
+      MkConcept(name_start, name_len, fields, variants) => fields
+  proofs:
+    purity:
+      reads : [c]
+      calls : []
+    termination:
+      bound : 16
+
+
+-- cd_variants (records-arc brick R4): the variant list of a parsed concept
+-- declaration (VarNil for a record-shape concept). Mirror of cd_fields.
+rule cd_variants
+  @intention: "The variant list of a parsed concept declaration"
+  @source: vexprparse.intent:65
+  input:
+    c : Concept
+  output:
+    out : VariantList
+  logic:
+    out = match c:
+      MkConcept(name_start, name_len, fields, variants) => variants
   proofs:
     purity:
       reads : [c]
@@ -5915,6 +6082,28 @@ rule field_list_len
     termination:
       bound : 512
       structural : fl
+
+
+-- variant_list_len (records-arc brick R4): the number of variants in a concept's
+-- VariantList. Structural recursion on the VarCons tail (Phase C), like field_list_len.
+rule variant_list_len
+  @intention: "Number of variants in a concept's variant list"
+  @source: vexprparse.intent:65
+  input:
+    vl : VariantList
+  output:
+    out : number
+  logic:
+    out = match vl:
+      VarCons(name_start, name_len, payload, rest) => 1 + variant_list_len(rest)
+      VarNil => 0
+  proofs:
+    purity:
+      reads : [vl]
+      calls : [variant_list_len]
+    termination:
+      bound : 4000
+      structural : vl
 
 
 -- parse_concept_decl_pos: parse ONE top-level concept declaration STARTING at
@@ -5953,20 +6142,23 @@ rule parse_concept_decl_pos
     let is_concept = span_is_concept(SpanCheck { src: ps.src, start: kw_start, len: kw_len })
     let name_start = peek_start(advance(Advance { lst: ps.cell, k: 1 }))
     let name_len = peek_len(advance(Advance { lst: ps.cell, k: 1 }))
-    let fields_idx = skip_seps(ParseState { cell: advance(Advance { lst: ps.cell, k: 2 }) })
-    let fields_start = peek_start(fields_idx)
-    let fields_len = peek_len(fields_idx)
-    let is_fields = span_is_fields(SpanCheck { src: ps.src, start: fields_start, len: fields_len })
-    let hdr_ok = if is_concept == 1 and is_fields == 1 then 1 else 0
-    let body_idx = skip_seps(ParseState { cell: advance(Advance { lst: fields_idx, k: 2 }) })
+    let block_idx = skip_seps(ParseState { cell: advance(Advance { lst: ps.cell, k: 2 }) })
+    let block_start = peek_start(block_idx)
+    let block_len = peek_len(block_idx)
+    let is_fields = span_is_fields(SpanCheck { src: ps.src, start: block_start, len: block_len })
+    let is_variants = span_is_variants(SpanCheck { src: ps.src, start: block_start, len: block_len })
+    let fields_ok = if is_concept == 1 and is_fields == 1 then 1 else 0
+    let variants_ok = if is_concept == 1 and is_variants == 1 then 1 else 0
+    let body_idx = skip_seps(ParseState { cell: advance(Advance { lst: block_idx, k: 2 }) })
     let pfields = parse_fields(FieldParseState { cell: body_idx, src: ps.src })
     let fl = pf_fields(pfields)
     let endp = pf_next(pfields)
-    out = ParsedConcept::MkPC { concept: Concept::MkConcept { name_start: name_start, name_len: name_len, fields: if hdr_ok == 1 then fl else FieldList::FNil }, next: endp }
+    let vl = parse_variants(VariantParseState { cell: body_idx, src: ps.src })
+    out = ParsedConcept::MkPC { concept: Concept::MkConcept { name_start: name_start, name_len: name_len, fields: if fields_ok == 1 then fl else FieldList::FNil, variants: if variants_ok == 1 then vl else VariantList::VarNil }, next: endp }
   proofs:
     purity:
       reads : [ps.cell, ps.src]
-      calls : [peek_start, peek_len, span_is_concept, skip_seps, span_is_fields, parse_fields, pf_fields, pf_next, advance]
+      calls : [peek_start, peek_len, span_is_concept, skip_seps, span_is_fields, span_is_variants, parse_fields, pf_fields, pf_next, parse_variants, advance]
     termination:
       bound : 64
 
@@ -6002,6 +6194,16 @@ rule parse_concept_decl
 --   * else if it spells `rule` (span_is_rule): SKIP that rule decl — advance past it
 --     via parse_rule_decl_pos's `next` — and recurse (so concepts AFTER a rule are
 --     still captured), DO NOT cons.
+--   * else if it spells `concept_group` (span_is_concept_group): records-arc brick R4
+--     DESCENDS into the group instead of skipping it (R2 skipped the whole block).
+--     skip_to_newline walks past the `concept_group NAME [ ... ]` header line; skip_seps
+--     then eats the header Newline + the group-body Indent, landing on the FIRST nested
+--     `concept`. The recursion continues from there, so each nested concept is captured
+--     via the is_concept branch (its `variants:` block parsed by parse_variants), and
+--     after the last nested concept the trailing Dedents flow back out to the top level
+--     through the next iteration's skip_seps_dedent — no nesting-depth bookkeeping needed.
+--     parse_program's rule walk STILL skips the group (count_rules unchanged): types and
+--     rules stay separate side-lists per the records design.
 --   * else (Eof or any other token): the walk ends — CNil.
 -- TERMINATION: each iteration advances the cursor by at least one whole declaration
 -- (parse_concept_decl_pos / parse_rule_decl_pos `next` is strictly past the starting
@@ -6022,17 +6224,19 @@ rule parse_concepts
     let is_concept = span_is_concept(SpanCheck { src: ps.src, start: kw_start, len: kw_len })
     let is_rule = span_is_rule(SpanCheck { src: ps.src, start: kw_start, len: kw_len })
     let is_concept_group = span_is_concept_group(SpanCheck { src: ps.src, start: kw_start, len: kw_len })
-    let need_skip = if is_concept == 1 then 1 else if is_concept_group == 1 then 1 else 0
+    let need_skip = if is_concept == 1 then 1 else 0
     let pc = parse_concept_decl_pos(ProgramState { cell: hp, src: ps.src })
     let cd = pc_concept(pc)
     let pr = parse_rule_decl_pos(ProgramState { cell: hp, src: ps.src })
     let rend = pr_next(pr)
     let blk_end = if need_skip == 1 then skip_indented_block(SkipBlockState { cell: hp, depth: 0, seen: 0 }) else hp
-    out = if is_concept == 1 then ConceptList::CCons { head: cd, tail: parse_concepts(ProgramState { cell: blk_end, src: ps.src }) } else (if is_rule == 1 then parse_concepts(ProgramState { cell: rend, src: ps.src }) else (if is_concept_group == 1 then parse_concepts(ProgramState { cell: blk_end, src: ps.src }) else ConceptList::CNil))
+    let grp_nl = skip_to_newline(ParseState { cell: hp })
+    let grp_body = skip_seps(ParseState { cell: grp_nl })
+    out = if is_concept == 1 then ConceptList::CCons { head: cd, tail: parse_concepts(ProgramState { cell: blk_end, src: ps.src }) } else (if is_rule == 1 then parse_concepts(ProgramState { cell: rend, src: ps.src }) else (if is_concept_group == 1 then parse_concepts(ProgramState { cell: grp_body, src: ps.src }) else ConceptList::CNil))
   proofs:
     purity:
       reads : [ps.cell, ps.src]
-      calls : [skip_seps_dedent, peek_start, peek_len, span_is_concept, span_is_rule, span_is_concept_group, parse_concept_decl_pos, pc_concept, parse_rule_decl_pos, pr_next, skip_indented_block, parse_concepts]
+      calls : [skip_seps_dedent, skip_seps, peek_start, peek_len, span_is_concept, span_is_rule, span_is_concept_group, parse_concept_decl_pos, pc_concept, parse_rule_decl_pos, pr_next, skip_indented_block, skip_to_newline, parse_concepts]
     termination:
       bound : 512
 
@@ -6088,7 +6292,7 @@ rule find_concept
   logic:
     out = match st.concepts:
       CCons(head, tail) => if cd_name_len(head) == st.q_len and name_eq(NameEqState { src: st.src, a_start: cd_name_start(head), b_start: st.q_start, len: st.q_len, off: 0 }) == 1 then head else find_concept(FindConceptState { concepts: tail, src: st.src, q_start: st.q_start, q_len: st.q_len })
-      CNil => Concept::MkConcept { name_start: 0, name_len: 0, fields: FieldList::FNil }
+      CNil => Concept::MkConcept { name_start: 0, name_len: 0, fields: FieldList::FNil, variants: VariantList::VarNil }
   proofs:
     purity:
       reads : [st.concepts, st.src, st.q_start, st.q_len]
@@ -6114,6 +6318,27 @@ rule cl_head_fields
     purity:
       reads : [cl]
       calls : [cd_fields]
+    termination:
+      bound : 16
+
+
+-- cl_head_variants (records-arc brick R4): the VariantList of the HEAD concept of a
+-- concept list (VarNil for an empty list). Mirror of cl_head_fields for variants.
+rule cl_head_variants
+  @intention: "The variant list of the head concept of a concept list (VarNil if none)"
+  @source: vexprparse.intent:65
+  input:
+    cl : ConceptList
+  output:
+    out : VariantList
+  logic:
+    out = match cl:
+      CCons(head, tail) => cd_variants(head)
+      CNil => VariantList::VarNil
+  proofs:
+    purity:
+      reads : [cl]
+      calls : [cd_variants]
     termination:
       bound : 16
 
@@ -6171,6 +6396,36 @@ rule concept_field_count
     purity:
       reads : [s.source]
       calls : [begin_tokenize, parse_concepts, cl_head_fields, field_list_len]
+    termination:
+      bound : 256
+
+
+-- count_variants: the records-arc R4 VARIANT driver. Tokenize the program source,
+-- walk the top-level items (DESCENDING into the concept_group) capturing concepts,
+-- and return the number of variants of the FIRST concept. Proves the group's nested
+-- sum-type concepts and their `variants:` blocks parse — e.g. on the real self-source
+-- the first concept is the group's `Token` (10 variants), and a `TokenList` (Cons/Nil)
+-- has 2. A record-shape first concept (a `fields:` concept) returns 0.
+--
+--   count_variants("concept_group G [max_depth: 4, max_nodes: 10]\n  concept Foo\n    variants:\n      A of (x : number)\n      B\nrule main\n  logic:\n    out = 1") = 2
+--
+-- NATIVE-ONLY (multi-line indented source).
+rule count_variants
+  @intention: "Parse a program and return the number of variants of its first concept"
+  @source: vexprparse.intent:65
+  input:
+    s : ScanState
+  output:
+    out : number
+  logic:
+    let toks = begin_tokenize(ScanState { source: s.source, pos: 0 })
+    let cl = parse_concepts(ProgramState { cell: toks, src: s.source })
+    let vs = cl_head_variants(cl)
+    out = variant_list_len(vs)
+  proofs:
+    purity:
+      reads : [s.source]
+      calls : [begin_tokenize, parse_concepts, cl_head_variants, variant_list_len]
     termination:
       bound : 256
 

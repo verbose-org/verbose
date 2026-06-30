@@ -33908,12 +33908,19 @@ rule two
             "R2.a/b/c: both full rules found past the comment, @attr, concept_group, \
              and the range-annotated plain concept (and past each rule's proofs block)"
         );
+        // Records-arc brick R4 update: parse_concepts now DESCENDS into the
+        // concept_group instead of skipping it, so the group's inner concept
+        // `Tok` is captured ALONGSIDE the plain `concept Thing` → 2 (was 1
+        // under R2's skip-the-group behaviour). The new count is verified
+        // correct: the source declares exactly two concepts — `Tok` (in the
+        // group) and `Thing` (top-level). R2's other invariants are unchanged
+        // (the range-annotated `Thing` field is still not mis-counted, and the
+        // group descent flows back out to the trailing top-level rules).
         assert_eq!(
             run(&cc, real_shaped),
-            1,
-            "the plain `concept Thing` is still captured (skipped structurally, not \
-             mis-counted by its range-annotated field); the group's inner concept is \
-             not a top-level concept"
+            2,
+            "R4: the group's inner concept `Tok` is now captured (parse_concepts \
+             descends into the group) alongside the top-level `concept Thing` → 2"
         );
 
         // Part 2 — THE MILESTONE: count_rules on a ~120 KB chunk of the REAL
@@ -34036,6 +34043,139 @@ rule two
         assert_eq!(run("1 + 2"), 10, "AstBin shape unchanged by R3 stub arms");
 
         let _ = std::fs::remove_file(&bin);
+    }
+
+    /// Records-arc brick R4: the self-hosted parser (examples/vexprparse.verbose)
+    /// now DESCENDS into a `concept_group` and parses its nested concepts'
+    /// `variants:` blocks into a real `VariantList` AST. Two new capabilities are
+    /// pinned together:
+    ///   1. `parse_concepts` no longer SKIPS a `concept_group` (R2 behaviour); it
+    ///      walks past the group header line and captures every nested `concept`
+    ///      INCLUDING its variants. `count_concepts` therefore now counts
+    ///      top-level + group-nested concepts. `parse_program`'s rule walk STILL
+    ///      skips the group, so `count_rules` is unchanged (types and rules stay
+    ///      separate side-lists).
+    ///   2. a new `count_variants` driver returns the variant count of the FIRST
+    ///      captured concept — proving each variant line (bare `Eof`/`Nil`/`Indent`
+    ///      AND payload `Name of (a : T, ...)`) parses to a `VarCons`.
+    /// All drivers are NATIVE-ONLY (multi-line indented source). Source is argv[1],
+    /// pos is argv[2] = "0", result printed to stdout (Phase 0 scalar emitter).
+    ///
+    /// Part 1 (regression, native via argv): a small source with a one-concept
+    /// `concept_group` whose `Foo` is a SUM type (`A of (x : number)` + bare `B`),
+    /// a top-level record `concept Bar`, and two rules. count_concepts == 2
+    /// (Foo descended + Bar), count_variants == 2 (Foo's A + B), count_rules == 2.
+    ///
+    /// Part 2 (THE MILESTONE, native via argv): a real chunk of
+    /// examples/vexprparse.verbose cut at the first top-level `rule ` boundary —
+    /// the chunk contains the WHOLE `concept_group VExpr` plus the top-level
+    /// concepts before the first rule. count_concepts equals the chunk's actual
+    /// concept count (`^  concept ` nested + `^concept ` top-level); before R4
+    /// only the top-level concepts were found (the group was skipped). And
+    /// count_variants on the chunk (whose first concept is the group's `Token`)
+    /// equals 10 — Token's ten variants (Ident/Keyword/Num/Op/Str/Newline/Indent/
+    /// Dedent/IndentErr/Eof).
+    #[test]
+    fn records_r4_descend_group_and_parse_variants() {
+        let src = std::fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let cr = std::env::temp_dir().join("verbosec_test_r4_count_rules");
+        let cc = std::env::temp_dir().join("verbosec_test_r4_count_concepts");
+        let cv = std::env::temp_dir().join("verbosec_test_r4_count_variants");
+        compile_native(&program, "count_rules", cr.to_str().unwrap(), false, false)
+            .expect("count_rules must compile natively");
+        compile_native(&program, "count_concepts", cc.to_str().unwrap(), false, false)
+            .expect("count_concepts must compile natively");
+        compile_native(&program, "count_variants", cv.to_str().unwrap(), false, false)
+            .expect("count_variants must compile natively");
+
+        let run = |bin: &std::path::Path, prog: &str| -> i64 {
+            let r = std::process::Command::new(bin)
+                .arg(prog)
+                .arg("0")
+                .output()
+                .expect("spawn R4 driver");
+            assert!(r.status.success(), "{:?} must exit 0; got {:?}", bin, r.status);
+            String::from_utf8_lossy(&r.stdout)
+                .trim()
+                .parse::<i64>()
+                .expect("R4 driver prints an integer")
+        };
+
+        // Part 1 — regression: concept_group { concept Foo variants: A of (x:number) / B }
+        // + top-level concept Bar fields: y:number + two rules.
+        let regression = "concept_group G [max_depth: 4, max_nodes: 10]\n  concept Foo\n    variants:\n      A of (x : number)\n      B\nconcept Bar\n  fields:\n    y : number\nrule one\n  logic:\n    out = 1\nrule two\n  logic:\n    out = 2";
+        assert_eq!(
+            run(&cc, regression),
+            2,
+            "R4: parse_concepts descends into the group — Foo (nested) + Bar (top-level) = 2"
+        );
+        assert_eq!(
+            run(&cv, regression),
+            2,
+            "R4: Foo is a sum type with two variants — `A of (x:number)` (payload) and bare `B`"
+        );
+        assert_eq!(
+            run(&cr, regression),
+            2,
+            "R4: count_rules unchanged — parse_program still skips the group, finds `one` and `two`"
+        );
+
+        // Part 2 — THE MILESTONE: cut the real self-source at the first top-level
+        // `rule ` boundary. The chunk holds the whole concept_group plus the
+        // top-level concepts that precede the first rule.
+        let bytes = src.as_bytes();
+        let mut cut = 0usize;
+        let mut at_line_start = true;
+        let mut i = 0usize;
+        while i < bytes.len() {
+            if at_line_start && src[i..].starts_with("rule ") {
+                cut = i;
+                break;
+            }
+            at_line_start = bytes[i] == b'\n';
+            i += 1;
+        }
+        assert!(cut > 0, "must find the first top-level rule boundary in the real source");
+        let chunk = &src[..cut];
+        assert!(
+            chunk.contains("concept_group "),
+            "the chunk must include the concept_group header (the pre-R4 skip wall)"
+        );
+        assert!(chunk.len() < 131_000, "chunk must fit one argv arg (kernel 128 KB cap)");
+
+        let grep_nested = chunk.lines().filter(|l| l.starts_with("  concept ")).count() as i64;
+        let grep_top = chunk.lines().filter(|l| l.starts_with("concept ")).count() as i64;
+        let grep_concepts = grep_nested + grep_top;
+        assert!(
+            grep_nested > 1,
+            "the chunk must contain several group-nested concepts (got {})",
+            grep_nested
+        );
+        assert_eq!(
+            run(&cc, chunk),
+            grep_concepts,
+            "MILESTONE: count_concepts on a real self-source chunk equals its actual \
+             concept count ({} nested + {} top-level = {}); before R4 only the {} \
+             top-level concepts were found (the group was skipped)",
+            grep_nested, grep_top, grep_concepts, grep_top
+        );
+        // The chunk's FIRST concept is the group's `Token` (the group is the first
+        // concept-bearing item in the file). Token declares exactly 10 variants.
+        assert_eq!(
+            run(&cv, chunk),
+            10,
+            "MILESTONE: count_variants on the chunk = 10 — the group's first concept \
+             Token has ten variants (Ident/Keyword/Num/Op/Str/Newline/Indent/Dedent/\
+             IndentErr/Eof)"
+        );
+
+        let _ = std::fs::remove_file(&cr);
+        let _ = std::fs::remove_file(&cc);
+        let _ = std::fs::remove_file(&cv);
     }
 
     /// Full-file companion to the R2 milestone: count_rules on the WHOLE real
