@@ -34403,4 +34403,108 @@ rule two
         let _ = std::fs::remove_file(&bin);
     }
 
+    /// Records-arc brick R6b: the self-hosted type checker (examples/vexprparse.verbose)
+    /// is now CONCEPT-AWARE. type_code_of_span collapses every non-scalar type name to
+    /// 0 (number); R6b stores type SPANS (FCons/PCons/MkRule widened) and resolves them
+    /// against the parsed ConceptList at check time, so a `head : Token` payload field
+    /// types as the Token concept code (1000 + index), NOT number.
+    ///
+    /// `body_type` returns the concept-aware type code of the first rule's body:
+    /// scalar 0/1/2, ERROR 3, or a concept code >= 1000. The SOUNDNESS gate is
+    /// `Cons(h, t) => h + 1`: h is a Token, so `h + 1` is ERROR — the naive-unsound
+    /// "type the binder by the lossy stored code (=number)" path is correctly rejected.
+    /// `type_check` (extended with the declared-output concept check) returns the error
+    /// count; a concept-returning rule whose body matches its `output:` type checks
+    /// clean, a mismatch is flagged.
+    #[test]
+    fn records_r6b_concept_aware_type_checker_is_sound() {
+        let src = std::fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let bt = std::env::temp_dir().join("verbosec_test_r6b_body_type");
+        let tc = std::env::temp_dir().join("verbosec_test_r6b_type_check");
+        compile_native(&program, "body_type", bt.to_str().unwrap(), false, false)
+            .expect("body_type must compile natively (R6b concept-aware type_of_env SCC)");
+        compile_native(&program, "type_check", tc.to_str().unwrap(), false, false)
+            .expect("type_check must compile natively (R6b declared-output concept check)");
+
+        let run = |bin: &std::path::Path, source: &str| -> i64 {
+            let r = std::process::Command::new(bin)
+                .arg(source)
+                .arg("0")
+                .output()
+                .expect("spawn R6b driver");
+            assert!(
+                r.status.success(),
+                "driver must exit 0 for {:?}; got {:?}",
+                source, r.status
+            );
+            String::from_utf8_lossy(&r.stdout)
+                .trim()
+                .parse::<i64>()
+                .unwrap_or_else(|_| panic!("driver produced non-number for {:?}: {:?}", source, r.stdout))
+        };
+
+        // The group declares Token (index 0 -> code 1000) and TokenList (index 1 ->
+        // code 1001). TokenList::Cons carries `head : Token` — the payload field whose
+        // type R6b must recover from its stored span.
+        let grp = "concept_group G [max_depth: 8, max_nodes: 64]\n  concept Token\n    variants:\n      Eof\n  concept TokenList\n    variants:\n      Cons of (head : Token, tail : TokenList)\n      Nil\n";
+
+        // A variant value's type is its concept — not the R3 stub 0.
+        let eof = "concept_group G [max_depth: 8, max_nodes: 64]\n  concept Token\n    variants:\n      Eof\nrule f\n  logic:\n    out = Token::Eof";
+        assert!(
+            run(&bt, eof) >= 1000,
+            "R6b: `out = Token::Eof` types as Token's concept code (>= 1000), not 0/number"
+        );
+
+        // BINDER TYPING: h binds to Cons's `head : Token` payload field -> Token; both
+        // arms are Token, so the match types as Token (a concept code), NOT ERROR/number.
+        let binder_ok = format!("{grp}rule f\n  input:\n    toks : TokenList\n  logic:\n    out = match toks: Cons(h, t) => h  Nil => Token::Eof");
+        assert!(
+            run(&bt, &binder_ok) >= 1000,
+            "R6b: match binder h types as Token (payload type); both arms Token -> match type is a concept code"
+        );
+
+        // SOUNDNESS (the thesis): h is a Token, so `h + 1` is ill-typed -> ERROR (3).
+        // The naive-unsound case (type h by its lossy stored code = number, accept h+1)
+        // MUST be rejected.
+        let unsound = format!("{grp}rule f\n  input:\n    toks : TokenList\n  logic:\n    out = match toks: Cons(h, t) => h + 1  Nil => 0");
+        assert_eq!(
+            run(&bt, &unsound), 3,
+            "R6b SOUNDNESS: `Cons(h, t) => h + 1` is ERROR — h is a Token, not a number"
+        );
+
+        // Arm disagreement: one arm Token, the other number -> ERROR (3).
+        let disagree = format!("{grp}rule f\n  input:\n    toks : TokenList\n  logic:\n    out = match toks: Cons(h, t) => Token::Eof  Nil => 0");
+        assert_eq!(
+            run(&bt, &disagree), 3,
+            "R6b: arms of different types (Token vs number) -> match is ERROR"
+        );
+
+        // Declared-output payoff: a concept-returning rule whose body matches its
+        // `output:` type checks clean; a mismatch (declared Token, body returns a
+        // number) is flagged.
+        let decl_ok = format!("{grp}rule f\n  input:\n    toks : TokenList\n  output:\n    out : Token\n  logic:\n    out = match toks: Cons(h, t) => Token::Eof  Nil => Token::Eof");
+        assert_eq!(
+            run(&tc, &decl_ok), 0,
+            "R6b: a rule declared `output: out : Token` whose body types as Token checks clean"
+        );
+        let decl_bad = format!("{grp}rule f\n  input:\n    toks : TokenList\n  output:\n    out : Token\n  logic:\n    out = 5");
+        assert_eq!(
+            run(&tc, &decl_bad), 1,
+            "R6b: a rule declared `output: out : Token` whose body returns a number is flagged"
+        );
+
+        // Scalar regression: the {number,bool} type system is byte-identical to pre-R6b
+        // (resolve_type's scalar path mirrors type_code_of_span exactly).
+        assert_eq!(run(&tc, "rule f\n  logic:\n    out = 1 + 2"), 0, "R6b: number + number is clean");
+        assert_eq!(run(&tc, "rule f\n  logic:\n    out = 1 + (2 < 3)"), 1, "R6b: number + bool is ill-typed");
+        assert_eq!(run(&tc, "rule f\n  logic:\n    let b = 1 < 2\n    out = if b then 1 else 2"), 0, "R6b: inferred-bool condition is clean");
+
+        let _ = std::fs::remove_file(&bt);
+        let _ = std::fs::remove_file(&tc);
+    }
+
 }

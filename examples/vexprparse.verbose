@@ -404,7 +404,7 @@ concept_group VExpr [max_depth: 4096, max_nodes: 2000000]
     @intention: "A parsed top-level rule declaration: name + params + input/output types + body + proofs"
     @source: vexprparse.intent:30
     variants:
-      MkRule of (name_start : number, name_len : number, params : ParamList, return_type : number, body : Block, input : FieldList, out_name_start : number, out_name_len : number, out_ty : number, proofs : Proofs)
+      MkRule of (name_start : number, name_len : number, params : ParamList, return_type : number, body : Block, input : FieldList, out_name_start : number, out_name_len : number, out_ty : number, out_ty_start : number, out_ty_len : number, proofs : Proofs)
 
   -- Brick 12: a parsed PROGRAM — a cons-list of top-level rule declarations in
   -- source order. RCons carries one RuleDecl head and the rest; RNil is the empty
@@ -446,7 +446,7 @@ concept_group VExpr [max_depth: 4096, max_nodes: 2000000]
     @intention: "Cons-list of a rule's formal parameters (each a source span + declared type code)"
     @source: vexprparse.intent:34
     variants:
-      PCons of (name_start : number, name_len : number, ty : number, rest : ParamList)
+      PCons of (name_start : number, name_len : number, ty : number, ty_start : number, ty_len : number, rest : ParamList)
       PNil
 
   -- Brick 16: a parameter-list parse result — the ParamList built plus the token
@@ -530,7 +530,7 @@ concept_group VExpr [max_depth: 4096, max_nodes: 2000000]
     @intention: "Cons-list of a concept's fields (each a name span + declared type code)"
     @source: vexprparse.intent:62
     variants:
-      FCons of (name_start : number, name_len : number, ty : number, rest : FieldList)
+      FCons of (name_start : number, name_len : number, ty : number, ty_start : number, ty_len : number, rest : FieldList)
       FNil
 
   -- Records-arc brick R4: a parsed `variants:` line — one variant NAME span plus its
@@ -4591,7 +4591,7 @@ rule find_rule
   logic:
     out = match st.rules:
       RCons(head, tail) => if rd_name_len(head) == st.q_len and name_eq(NameEqState { src: st.src, a_start: rd_name_start(head), b_start: st.q_start, len: st.q_len, off: 0 }) == 1 then head else find_rule(FindRuleState { rules: tail, src: st.src, q_start: st.q_start, q_len: st.q_len })
-      RNil => RuleDecl::MkRule { name_start: 0, name_len: 0, params: ParamList::PNil, return_type: 0, body: Block::MkBlock { binds: Binding::BNil, result: Ast::AstErr }, input: FieldList::FNil, out_name_start: 0, out_name_len: 0, out_ty: 0, proofs: Proofs::MkProofs { reads: NameList::NmNil, calls: NameList::NmNil, term_kind: 0, term_bound: 0, term_field_start: 0, term_field_len: 0 } }
+      RNil => RuleDecl::MkRule { name_start: 0, name_len: 0, params: ParamList::PNil, return_type: 0, body: Block::MkBlock { binds: Binding::BNil, result: Ast::AstErr }, input: FieldList::FNil, out_name_start: 0, out_name_len: 0, out_ty: 0, out_ty_start: 0, out_ty_len: 0, proofs: Proofs::MkProofs { reads: NameList::NmNil, calls: NameList::NmNil, term_kind: 0, term_bound: 0, term_field_start: 0, term_field_len: 0 } }
   proofs:
     purity:
       reads : [st.rules, st.src, st.q_start, st.q_len]
@@ -4620,7 +4620,7 @@ rule bind_params
     out : Env
   logic:
     out = match bp.params:
-      PCons(name_start, name_len, ty, rest) => Env::ECons { name_start: name_start, name_len: name_len, val: eval_ast_env(EvalEnvArg { node: arg_head(AHeadState { args: bp.args }), env: bp.env, src: bp.src, prog: bp.prog }), rest: bind_params(BindParamsState { params: rest, args: arg_tail(ATailState { args: bp.args }), env: bp.env, src: bp.src, prog: bp.prog }) }
+      PCons(name_start, name_len, ty, ty_start, ty_len, rest) => Env::ECons { name_start: name_start, name_len: name_len, val: eval_ast_env(EvalEnvArg { node: arg_head(AHeadState { args: bp.args }), env: bp.env, src: bp.src, prog: bp.prog }), rest: bind_params(BindParamsState { params: rest, args: arg_tail(ATailState { args: bp.args }), env: bp.env, src: bp.src, prog: bp.prog }) }
       PNil => Env::ENil
   proofs:
     purity:
@@ -5098,7 +5098,7 @@ rule rd_name_start
     out : number
   logic:
     out = match r:
-      MkRule(name_start, name_len, params, return_type, body, input, out_name_start, out_name_len, out_ty, proofs) => name_start
+      MkRule(name_start, name_len, params, return_type, body, input, out_name_start, out_name_len, out_ty, out_ty_start, out_ty_len, proofs) => name_start
   proofs:
     purity:
       reads : [r]
@@ -5116,7 +5116,7 @@ rule rd_name_len
     out : number
   logic:
     out = match r:
-      MkRule(name_start, name_len, params, return_type, body, input, out_name_start, out_name_len, out_ty, proofs) => name_len
+      MkRule(name_start, name_len, params, return_type, body, input, out_name_start, out_name_len, out_ty, out_ty_start, out_ty_len, proofs) => name_len
   proofs:
     purity:
       reads : [r]
@@ -5134,7 +5134,7 @@ rule rd_body
     out : Block
   logic:
     out = match r:
-      MkRule(name_start, name_len, params, return_type, body, input, out_name_start, out_name_len, out_ty, proofs) => body
+      MkRule(name_start, name_len, params, return_type, body, input, out_name_start, out_name_len, out_ty, out_ty_start, out_ty_len, proofs) => body
   proofs:
     purity:
       reads : [r]
@@ -5152,7 +5152,7 @@ rule rd_params
     out : ParamList
   logic:
     out = match r:
-      MkRule(name_start, name_len, params, return_type, body, input, out_name_start, out_name_len, out_ty, proofs) => params
+      MkRule(name_start, name_len, params, return_type, body, input, out_name_start, out_name_len, out_ty, out_ty_start, out_ty_len, proofs) => params
   proofs:
     purity:
       reads : [r]
@@ -5174,7 +5174,7 @@ rule rd_return_type
     out : number
   logic:
     out = match r:
-      MkRule(name_start, name_len, params, return_type, body, input, out_name_start, out_name_len, out_ty, proofs) => return_type
+      MkRule(name_start, name_len, params, return_type, body, input, out_name_start, out_name_len, out_ty, out_ty_start, out_ty_len, proofs) => return_type
   proofs:
     purity:
       reads : [r]
@@ -5193,7 +5193,7 @@ rule rd_input
     out : FieldList
   logic:
     out = match r:
-      MkRule(name_start, name_len, params, return_type, body, input, out_name_start, out_name_len, out_ty, proofs) => input
+      MkRule(name_start, name_len, params, return_type, body, input, out_name_start, out_name_len, out_ty, out_ty_start, out_ty_len, proofs) => input
   proofs:
     purity:
       reads : [r]
@@ -5212,7 +5212,46 @@ rule rd_out_ty
     out : number
   logic:
     out = match r:
-      MkRule(name_start, name_len, params, return_type, body, input, out_name_start, out_name_len, out_ty, proofs) => out_ty
+      MkRule(name_start, name_len, params, return_type, body, input, out_name_start, out_name_len, out_ty, out_ty_start, out_ty_len, proofs) => out_ty
+  proofs:
+    purity:
+      reads : [r]
+      calls : []
+    termination:
+      bound : 16
+
+
+-- R6b: the output field's declared type-NAME SPAN (start/len). Where rd_out_ty gives
+-- the lossy CODE (a concept name collapses to 0), these give the span so the R6b
+-- declared-output check can resolve the concept identity against the ConceptList.
+rule rd_out_ty_start
+  @intention: "The output field type-name span start of a parsed rule declaration"
+  @source: vexprparse.intent:62
+  input:
+    r : RuleDecl
+  output:
+    out : number
+  logic:
+    out = match r:
+      MkRule(name_start, name_len, params, return_type, body, input, out_name_start, out_name_len, out_ty, out_ty_start, out_ty_len, proofs) => out_ty_start
+  proofs:
+    purity:
+      reads : [r]
+      calls : []
+    termination:
+      bound : 16
+
+
+rule rd_out_ty_len
+  @intention: "The output field type-name span length of a parsed rule declaration"
+  @source: vexprparse.intent:62
+  input:
+    r : RuleDecl
+  output:
+    out : number
+  logic:
+    out = match r:
+      MkRule(name_start, name_len, params, return_type, body, input, out_name_start, out_name_len, out_ty, out_ty_start, out_ty_len, proofs) => out_ty_len
   proofs:
     purity:
       reads : [r]
@@ -5231,7 +5270,7 @@ rule rd_proofs
     out : Proofs
   logic:
     out = match r:
-      MkRule(name_start, name_len, params, return_type, body, input, out_name_start, out_name_len, out_ty, proofs) => proofs
+      MkRule(name_start, name_len, params, return_type, body, input, out_name_start, out_name_len, out_ty, out_ty_start, out_ty_len, proofs) => proofs
   proofs:
     purity:
       reads : [r]
@@ -5385,7 +5424,7 @@ rule fl_head_start
     out : number
   logic:
     out = match fl:
-      FCons(name_start, name_len, ty, rest) => name_start
+      FCons(name_start, name_len, ty, ty_start, ty_len, rest) => name_start
       FNil => 0
   proofs:
     purity:
@@ -5404,7 +5443,7 @@ rule fl_head_len
     out : number
   logic:
     out = match fl:
-      FCons(name_start, name_len, ty, rest) => name_len
+      FCons(name_start, name_len, ty, ty_start, ty_len, rest) => name_len
       FNil => 0
   proofs:
     purity:
@@ -5423,8 +5462,72 @@ rule fl_head_ty
     out : number
   logic:
     out = match fl:
-      FCons(name_start, name_len, ty, rest) => ty
+      FCons(name_start, name_len, ty, ty_start, ty_len, rest) => ty
       FNil => 0
+  proofs:
+    purity:
+      reads : [fl]
+      calls : []
+    termination:
+      bound : 16
+
+
+-- R6b: the type-NAME SPAN (start/len) of the head field of a field list (0 if
+-- empty). Where fl_head_ty gives the lossy type CODE (concept names collapse to 0),
+-- these give the SPAN so resolve_type can recover the concept identity against the
+-- ConceptList at check time. Mirror of fl_head_start/len for the type span.
+rule fl_head_ty_start
+  @intention: "The type-name span start of the head field of a field list (0 if empty)"
+  @source: vexprparse.intent:62
+  input:
+    fl : FieldList
+  output:
+    out : number
+  logic:
+    out = match fl:
+      FCons(name_start, name_len, ty, ty_start, ty_len, rest) => ty_start
+      FNil => 0
+  proofs:
+    purity:
+      reads : [fl]
+      calls : []
+    termination:
+      bound : 16
+
+
+rule fl_head_ty_len
+  @intention: "The type-name span length of the head field of a field list (0 if empty)"
+  @source: vexprparse.intent:62
+  input:
+    fl : FieldList
+  output:
+    out : number
+  logic:
+    out = match fl:
+      FCons(name_start, name_len, ty, ty_start, ty_len, rest) => ty_len
+      FNil => 0
+  proofs:
+    purity:
+      reads : [fl]
+      calls : []
+    termination:
+      bound : 16
+
+
+-- R6b: the TAIL of a field list (the fields after the head), or FNil when empty.
+-- Used by bind_binders to walk a variant payload's FieldList in step with the arm's
+-- positional BinderList. Mirror of ptail for parameters.
+rule fl_tail
+  @intention: "The tail of a field list (FNil if empty)"
+  @source: vexprparse.intent:62
+  input:
+    fl : FieldList
+  output:
+    out : FieldList
+  logic:
+    out = match fl:
+      FCons(name_start, name_len, ty, ty_start, ty_len, rest) => rest
+      FNil => FieldList::FNil
   proofs:
     purity:
       reads : [fl]
@@ -5484,6 +5587,8 @@ concept ParamPrependState
     head_start : number
     head_len : number
     head_ty : number
+    head_ty_start : number
+    head_ty_len : number
     rest : ParsedParams
 
 
@@ -5497,10 +5602,10 @@ rule params_prepend
   logic:
     let rest_list = pp_params(pps.rest)
     let rest_next = pp_next(pps.rest)
-    out = ParsedParams::MkPP { params: ParamList::PCons { name_start: pps.head_start, name_len: pps.head_len, ty: pps.head_ty, rest: rest_list }, next: rest_next }
+    out = ParsedParams::MkPP { params: ParamList::PCons { name_start: pps.head_start, name_len: pps.head_len, ty: pps.head_ty, ty_start: pps.head_ty_start, ty_len: pps.head_ty_len, rest: rest_list }, next: rest_next }
   proofs:
     purity:
-      reads : [pps.head_start, pps.head_len, pps.head_ty, pps.rest]
+      reads : [pps.head_start, pps.head_len, pps.head_ty, pps.head_ty_start, pps.head_ty_len, pps.rest]
       calls : [pp_params, pp_next]
     termination:
       bound : 16
@@ -5538,14 +5643,14 @@ rule params_scan
     let name_len = peek_len(ps.cell)
     let colon_opc = peek_op_code(advance(Advance { lst: ps.cell, k: 1 }))
     let typed = if colon_opc == 10 then 1 else 0
-    let ty_start = peek_start(advance(Advance { lst: ps.cell, k: 2 }))
-    let ty_len = peek_len(advance(Advance { lst: ps.cell, k: 2 }))
+    let ty_start = if typed == 1 then peek_start(advance(Advance { lst: ps.cell, k: 2 })) else 0
+    let ty_len = if typed == 1 then peek_len(advance(Advance { lst: ps.cell, k: 2 })) else 0
     let ty = if typed == 1 then type_code_of_span(SpanCheck { src: ps.src, start: ty_start, len: ty_len }) else 0
     let sep_pos = if typed == 1 then advance(Advance { lst: ps.cell, k: 3 }) else advance(Advance { lst: ps.cell, k: 1 })
     let sep_opc = peek_op_code(sep_pos)
     let iscomma = if sep_opc == 11 then 1 else 0
     let close_next = if sep_opc == 22 then advance(Advance { lst: sep_pos, k: 1 }) else sep_pos
-    out = if iscomma == 1 then params_prepend(ParamPrependState { head_start: name_start, head_len: name_len, head_ty: ty, rest: params_scan(ParamParseState { cell: advance(Advance { lst: sep_pos, k: 1 }), src: ps.src }) }) else ParsedParams::MkPP { params: ParamList::PCons { name_start: name_start, name_len: name_len, ty: ty, rest: ParamList::PNil }, next: close_next }
+    out = if iscomma == 1 then params_prepend(ParamPrependState { head_start: name_start, head_len: name_len, head_ty: ty, head_ty_start: ty_start, head_ty_len: ty_len, rest: params_scan(ParamParseState { cell: advance(Advance { lst: sep_pos, k: 1 }), src: ps.src }) }) else ParsedParams::MkPP { params: ParamList::PCons { name_start: name_start, name_len: name_len, ty: ty, ty_start: ty_start, ty_len: ty_len, rest: ParamList::PNil }, next: close_next }
   proofs:
     purity:
       reads : [ps.cell, ps.src]
@@ -5636,7 +5741,7 @@ rule parse_rule_decl
     let body_idx = skip_seps(ParseState { cell: advance(Advance { lst: logic_idx, k: 2 }) })
     let pb = parse_stmts(ParseState { cell: body_idx })
     let goodblk = pb_block(pb)
-    out = RuleDecl::MkRule { name_start: name_start, name_len: name_len, params: params, return_type: return_type, body: if hdr_ok == 1 then goodblk else Block::MkBlock { binds: Binding::BNil, result: Ast::AstErr }, input: FieldList::FNil, out_name_start: 0, out_name_len: 0, out_ty: 0, proofs: Proofs::MkProofs { reads: NameList::NmNil, calls: NameList::NmNil, term_kind: 0, term_bound: 0, term_field_start: 0, term_field_len: 0 } }
+    out = RuleDecl::MkRule { name_start: name_start, name_len: name_len, params: params, return_type: return_type, body: if hdr_ok == 1 then goodblk else Block::MkBlock { binds: Binding::BNil, result: Ast::AstErr }, input: FieldList::FNil, out_name_start: 0, out_name_len: 0, out_ty: 0, out_ty_start: 0, out_ty_len: 0, proofs: Proofs::MkProofs { reads: NameList::NmNil, calls: NameList::NmNil, term_kind: 0, term_bound: 0, term_field_start: 0, term_field_len: 0 } }
   proofs:
     purity:
       reads : [rp.cell, rp.src]
@@ -5993,6 +6098,8 @@ rule parse_rule_decl_pos
     let out_name_start = fl_head_start(out_fl)
     let out_name_len = fl_head_len(out_fl)
     let out_ty = fl_head_ty(out_fl)
+    let out_ty_start = fl_head_ty_start(out_fl)
+    let out_ty_len = fl_head_ty_len(out_fl)
     let logic_idx = if is_rule == 1 then seek_logic(ProgramState { cell: scan0, src: ps.src }) else scan0
     let logic_start = peek_start(logic_idx)
     let logic_len = peek_len(logic_idx)
@@ -6008,11 +6115,11 @@ rule parse_rule_decl_pos
     let is_proofs = span_is_proofs(SpanCheck { src: ps.src, start: p2start, len: p2len })
     let proofs_parsed = if is_proofs == 1 then parse_proofs(ProgramState { cell: after_logic, src: ps.src }) else Proofs::MkProofs { reads: NameList::NmNil, calls: NameList::NmNil, term_kind: 0, term_bound: 0, term_field_start: 0, term_field_len: 0 }
     let endp = if is_proofs == 1 then skip_indented_block(SkipBlockState { cell: after_logic, depth: 0, seen: 0 }) else after_logic
-    out = ParsedRule::MkPR { rule: RuleDecl::MkRule { name_start: name_start, name_len: name_len, params: params, return_type: return_type, body: if hdr_ok == 1 then goodblk else Block::MkBlock { binds: Binding::BNil, result: Ast::AstErr }, input: input_fl, out_name_start: out_name_start, out_name_len: out_name_len, out_ty: out_ty, proofs: proofs_parsed }, next: endp }
+    out = ParsedRule::MkPR { rule: RuleDecl::MkRule { name_start: name_start, name_len: name_len, params: params, return_type: return_type, body: if hdr_ok == 1 then goodblk else Block::MkBlock { binds: Binding::BNil, result: Ast::AstErr }, input: input_fl, out_name_start: out_name_start, out_name_len: out_name_len, out_ty: out_ty, out_ty_start: out_ty_start, out_ty_len: out_ty_len, proofs: proofs_parsed }, next: endp }
   proofs:
     purity:
       reads : [ps.cell, ps.src]
-      calls : [peek_start, peek_len, span_is_rule, parse_params, pp_params, pp_next, peek_op_code, type_code_of_span, span_is_input, span_is_output, parse_fields, pf_fields, pf_next, fl_head_start, fl_head_len, fl_head_ty, span_is_logic, skip_seps, seek_logic, parse_stmts, pb_block, pb_next, skip_indented_block, skip_seps_dedent, span_is_proofs, parse_proofs, advance]
+      calls : [peek_start, peek_len, span_is_rule, parse_params, pp_params, pp_next, peek_op_code, type_code_of_span, span_is_input, span_is_output, parse_fields, pf_fields, pf_next, fl_head_start, fl_head_len, fl_head_ty, fl_head_ty_start, fl_head_ty_len, span_is_logic, skip_seps, seek_logic, parse_stmts, pb_block, pb_next, skip_indented_block, skip_seps_dedent, span_is_proofs, parse_proofs, advance]
     termination:
       bound : 64
 
@@ -6211,6 +6318,8 @@ concept FieldConsState
     head_start : number [0, 4000000]
     head_len : number [0, 4000000]
     head_ty : number [0, 64]
+    head_ty_start : number [0, 4000000]
+    head_ty_len : number [0, 4000000]
     rest : ParsedFields
 
 
@@ -6224,10 +6333,10 @@ rule fields_cons
   logic:
     let rest_list = pf_fields(fc.rest)
     let rest_next = pf_next(fc.rest)
-    out = ParsedFields::MkPF { fields: FieldList::FCons { name_start: fc.head_start, name_len: fc.head_len, ty: fc.head_ty, rest: rest_list }, next: rest_next }
+    out = ParsedFields::MkPF { fields: FieldList::FCons { name_start: fc.head_start, name_len: fc.head_len, ty: fc.head_ty, ty_start: fc.head_ty_start, ty_len: fc.head_ty_len, rest: rest_list }, next: rest_next }
   proofs:
     purity:
-      reads : [fc.head_start, fc.head_len, fc.head_ty, fc.rest]
+      reads : [fc.head_start, fc.head_len, fc.head_ty, fc.head_ty_start, fc.head_ty_len, fc.rest]
       calls : [pf_fields, pf_next]
     termination:
       bound : 16
@@ -6249,7 +6358,7 @@ rule parse_fields
     let ty_start = peek_start(advance(Advance { lst: hp, k: 2 }))
     let ty_len = peek_len(advance(Advance { lst: hp, k: 2 }))
     let ty = type_code_of_span(SpanCheck { src: fp.src, start: ty_start, len: ty_len })
-    out = if is_field == 1 then fields_cons(FieldConsState { head_start: name_start, head_len: name_len, head_ty: ty, rest: parse_fields(FieldParseState { cell: advance(Advance { lst: hp, k: 3 }), src: fp.src }) }) else ParsedFields::MkPF { fields: FieldList::FNil, next: hp }
+    out = if is_field == 1 then fields_cons(FieldConsState { head_start: name_start, head_len: name_len, head_ty: ty, head_ty_start: ty_start, head_ty_len: ty_len, rest: parse_fields(FieldParseState { cell: advance(Advance { lst: hp, k: 3 }), src: fp.src }) }) else ParsedFields::MkPF { fields: FieldList::FNil, next: hp }
   proofs:
     purity:
       reads : [fp.cell, fp.src]
@@ -6274,7 +6383,7 @@ rule params_to_fields
     out : FieldList
   logic:
     out = match pl:
-      PCons(name_start, name_len, ty, rest) => FieldList::FCons { name_start: name_start, name_len: name_len, ty: ty, rest: params_to_fields(rest) }
+      PCons(name_start, name_len, ty, ty_start, ty_len, rest) => FieldList::FCons { name_start: name_start, name_len: name_len, ty: ty, ty_start: ty_start, ty_len: ty_len, rest: params_to_fields(rest) }
       PNil => FieldList::FNil
   proofs:
     purity:
@@ -6641,7 +6750,7 @@ rule field_list_len
     out : number
   logic:
     out = match fl:
-      FCons(name_start, name_len, ty, rest) => 1 + field_list_len(rest)
+      FCons(name_start, name_len, ty, ty_start, ty_len, rest) => 1 + field_list_len(rest)
       FNil => 0
   proofs:
     purity:
@@ -7009,7 +7118,7 @@ rule param_list_len
     out : number
   logic:
     out = match pl:
-      PCons(name_start, name_len, ty, rest) => 1 + param_list_len(rest)
+      PCons(name_start, name_len, ty, ty_start, ty_len, rest) => 1 + param_list_len(rest)
       PNil => 0
   proofs:
     purity:
@@ -7090,6 +7199,28 @@ rule rl_head_params
     purity:
       reads : [rl]
       calls : [rd_params]
+    termination:
+      bound : 16
+
+
+-- R6b: the input FieldList of the head rule of a rule list (FNil if none). Mirror of
+-- rl_head_params; lets the R6b body-type driver seed the type env from a rule's
+-- declared input fields (the real self-source shape: `input:` block, no params).
+rule rl_head_input
+  @intention: "The input field list of the head rule of a rule list (FNil if none)"
+  @source: vexprparse.intent:62
+  input:
+    rl : RuleList
+  output:
+    out : FieldList
+  logic:
+    out = match rl:
+      RCons(head, tail) => rd_input(head)
+      RNil => FieldList::FNil
+  proofs:
+    purity:
+      reads : [rl]
+      calls : [rd_input]
     termination:
       bound : 16
 
@@ -7347,7 +7478,7 @@ rule param_nth_type
     out : number
   logic:
     out = match q.params:
-      PCons(name_start, name_len, ty, rest) => if q.n == 0 then ty else param_nth_type(ParamNthState { params: rest, n: q.n - 1 })
+      PCons(name_start, name_len, ty, ty_start, ty_len, rest) => if q.n == 0 then ty else param_nth_type(ParamNthState { params: rest, n: q.n - 1 })
       PNil => 9
   proofs:
     purity:
@@ -7884,7 +8015,7 @@ rule param_to_binding
     out : Binding
   logic:
     out = match pl:
-      PCons(name_start, name_len, ty, rest) => Binding::BCons { name_start: name_start, name_len: name_len, value: Ast::AstNum { value: 0 }, rest: param_to_binding(rest) }
+      PCons(name_start, name_len, ty, ty_start, ty_len, rest) => Binding::BCons { name_start: name_start, name_len: name_len, value: Ast::AstNum { value: 0 }, rest: param_to_binding(rest) }
       PNil => Binding::BNil
   proofs:
     purity:
@@ -8957,13 +9088,14 @@ rule lint_arity
 -- name spans index into. Mirrors the interpreter's EvalEnvArg minus the program
 -- (calls type to number unconditionally here, so no program threading is needed).
 concept TypeArg
-  @intention: "An Ast node + the type environment + the source text + the program, for computing its type code"
+  @intention: "An Ast node + the type environment + the source text + the program + the concept list, for computing its type code"
   @source: vexprparse.intent:37
   fields:
     node : Ast
     tenv : Env
     src : text [..256]
     prog : RuleList
+    concepts : ConceptList
 
 
 -- bin_type's input: the binary operator code plus the ALREADY-COMPUTED type codes
@@ -8974,8 +9106,8 @@ concept BinTypeState
   @source: vexprparse.intent:37
   fields:
     op : number [0, 64]
-    lt : number [0, 8]
-    rt : number [0, 8]
+    lt : number [0, 4000000]
+    rt : number [0, 4000000]
 
 
 -- if_type's input: the type codes of an if's condition, then-branch, and
@@ -8985,9 +9117,9 @@ concept IfTypeState
   @intention: "The condition/then/else type codes of an if, for classifying the result type"
   @source: vexprparse.intent:37
   fields:
-    ct : number [0, 8]
-    tt : number [0, 8]
-    et : number [0, 8]
+    ct : number [0, 4000000]
+    tt : number [0, 4000000]
+    et : number [0, 4000000]
 
 
 -- bin_type: classify the result type of a binary operation from its op code and
@@ -9095,23 +9227,28 @@ rule type_of_env
   logic:
     out = match t.node:
       AstNum(value) => 0
-      AstBin(op, lhs, rhs) => bin_type(BinTypeState { op: op, lt: type_of_env(TypeArg { node: lhs, tenv: t.tenv, src: t.src, prog: t.prog }), rt: type_of_env(TypeArg { node: rhs, tenv: t.tenv, src: t.src, prog: t.prog }) })
-      AstNeg(inner) => if type_of_env(TypeArg { node: inner, tenv: t.tenv, src: t.src, prog: t.prog }) == 0 then 0 else 3
-      AstNot(inner) => if type_of_env(TypeArg { node: inner, tenv: t.tenv, src: t.src, prog: t.prog }) == 1 then 1 else 3
+      AstBin(op, lhs, rhs) => bin_type(BinTypeState { op: op, lt: type_of_env(TypeArg { node: lhs, tenv: t.tenv, src: t.src, prog: t.prog, concepts: t.concepts }), rt: type_of_env(TypeArg { node: rhs, tenv: t.tenv, src: t.src, prog: t.prog, concepts: t.concepts }) })
+      AstNeg(inner) => if type_of_env(TypeArg { node: inner, tenv: t.tenv, src: t.src, prog: t.prog, concepts: t.concepts }) == 0 then 0 else 3
+      AstNot(inner) => if type_of_env(TypeArg { node: inner, tenv: t.tenv, src: t.src, prog: t.prog, concepts: t.concepts }) == 1 then 1 else 3
       AstVar(start, len) => env_lookup(EnvLookState { env: t.tenv, src: t.src, q_start: start, q_len: len })
       AstField(base, fstart, flen) => 3
       AstCall(callee_start, callee_len, args) => call_result_type(CallRetState { prog: t.prog, src: t.src, callee_start: callee_start, callee_len: callee_len })
-      AstIf(cond, thn, els) => if_type(IfTypeState { ct: type_of_env(TypeArg { node: cond, tenv: t.tenv, src: t.src, prog: t.prog }), tt: type_of_env(TypeArg { node: thn, tenv: t.tenv, src: t.src, prog: t.prog }), et: type_of_env(TypeArg { node: els, tenv: t.tenv, src: t.src, prog: t.prog }) })
+      AstIf(cond, thn, els) => if_type(IfTypeState { ct: type_of_env(TypeArg { node: cond, tenv: t.tenv, src: t.src, prog: t.prog, concepts: t.concepts }), tt: type_of_env(TypeArg { node: thn, tenv: t.tenv, src: t.src, prog: t.prog, concepts: t.concepts }), et: type_of_env(TypeArg { node: els, tenv: t.tenv, src: t.src, prog: t.prog, concepts: t.concepts }) })
       AstBool(value) => 1
       AstStr(start, len) => 2
       AstErr => 3
-      -- R3 stub: real handling in R6/R7. 3 is the ERROR type code (mirror AstErr).
-      AstVariant(cstart, clen, vstart, vlen, fields) => 3
-      AstMatch(scrut, arms) => 3
+      -- R6b: a variant construction's type is its CONCEPT (resolve the concept-name
+      -- span against the ConceptList -> 1000+index, or ERROR if the concept is unknown).
+      AstVariant(cstart, clen, vstart, vlen, fields) => resolve_type(ResolveTypeState { concepts: t.concepts, src: t.src, ty_start: cstart, ty_len: clen })
+      -- R6b: a match types its scrutinee (must be a concept code >= 1000, else ERROR),
+      -- reads that concept's VariantList (concept_at_index on code - 1000), then folds
+      -- the arm-body types via arms_type. `code - 1000` is computed only on the >= 1000
+      -- branch, so the ConceptAtState index is always >= 0. 7777 (no arms) -> ERROR.
+      AstMatch(scrut, arms) => if type_of_env(TypeArg { node: scrut, tenv: t.tenv, src: t.src, prog: t.prog, concepts: t.concepts }) < 1000 then 3 else (if arms_type(ArmsTypeState { arms: arms, vlist: cd_variants(concept_at_index(ConceptAtState { concepts: t.concepts, idx: type_of_env(TypeArg { node: scrut, tenv: t.tenv, src: t.src, prog: t.prog, concepts: t.concepts }) - 1000 })), tenv: t.tenv, src: t.src, prog: t.prog, concepts: t.concepts }) == 7777 then 3 else arms_type(ArmsTypeState { arms: arms, vlist: cd_variants(concept_at_index(ConceptAtState { concepts: t.concepts, idx: type_of_env(TypeArg { node: scrut, tenv: t.tenv, src: t.src, prog: t.prog, concepts: t.concepts }) - 1000 })), tenv: t.tenv, src: t.src, prog: t.prog, concepts: t.concepts }))
   proofs:
     purity:
-      reads : [t.node, t.tenv, t.src, t.prog]
-      calls : [type_of_env, env_lookup, bin_type, if_type, call_result_type]
+      reads : [t.node, t.tenv, t.src, t.prog, t.concepts]
+      calls : [type_of_env, env_lookup, bin_type, if_type, call_result_type, resolve_type, arms_type, cd_variants, concept_at_index]
     termination:
       bound : 4000
 
@@ -9121,13 +9258,14 @@ rule type_of_env
 -- references in it resolve via src). Mirror of the interpreter's BuildEnvArg minus
 -- the program field (type_of_env types calls to number without it).
 concept BuildTArg
-  @intention: "Remaining bindings + the type env built so far + the source text + the program"
+  @intention: "Remaining bindings + the type env built so far + the source text + the program + the concept list"
   @source: vexprparse.intent:37
   fields:
     binds : Binding
     tenv : Env
     src : text [..256]
     prog : RuleList
+    concepts : ConceptList
 
 
 -- build_tenv: fold the binding list (in source order) into a TYPE env. For each
@@ -9147,11 +9285,11 @@ rule build_tenv
     out : Env
   logic:
     out = match bt.binds:
-      BCons(name_start, name_len, value, rest) => build_tenv(BuildTArg { binds: rest, tenv: Env::ECons { name_start: name_start, name_len: name_len, val: type_of_env(TypeArg { node: value, tenv: bt.tenv, src: bt.src, prog: bt.prog }), rest: bt.tenv }, src: bt.src, prog: bt.prog })
+      BCons(name_start, name_len, value, rest) => build_tenv(BuildTArg { binds: rest, tenv: Env::ECons { name_start: name_start, name_len: name_len, val: type_of_env(TypeArg { node: value, tenv: bt.tenv, src: bt.src, prog: bt.prog, concepts: bt.concepts }), rest: bt.tenv }, src: bt.src, prog: bt.prog, concepts: bt.concepts })
       BNil => bt.tenv
   proofs:
     purity:
-      reads : [bt.binds, bt.tenv, bt.src, bt.prog]
+      reads : [bt.binds, bt.tenv, bt.src, bt.prog, bt.concepts]
       calls : [build_tenv, type_of_env]
     termination:
       bound : 4000
@@ -9161,13 +9299,14 @@ rule build_tenv
 -- the source text. Mirrors build_tenv's threading but counts ill-typed RHSs rather
 -- than accumulating an env.
 concept TCheckBindsState
-  @intention: "Remaining bindings + the type env built so far + the source text + the program, for counting ill-typed RHSs"
+  @intention: "Remaining bindings + the type env built so far + the source text + the program + the concept list, for counting ill-typed RHSs"
   @source: vexprparse.intent:37
   fields:
     binds : Binding
     tenv : Env
     src : text [..256]
     prog : RuleList
+    concepts : ConceptList
 
 
 -- tcheck_binds: count the let RHSs whose TYPE is ERROR (3), threading the GROWING
@@ -9187,11 +9326,11 @@ rule tcheck_binds
     out : number
   logic:
     out = match tb.binds:
-      BCons(name_start, name_len, value, rest) => (if type_of_env(TypeArg { node: value, tenv: tb.tenv, src: tb.src, prog: tb.prog }) == 3 then 1 else 0) + tcheck_binds(TCheckBindsState { binds: rest, tenv: Env::ECons { name_start: name_start, name_len: name_len, val: type_of_env(TypeArg { node: value, tenv: tb.tenv, src: tb.src, prog: tb.prog }), rest: tb.tenv }, src: tb.src, prog: tb.prog })
+      BCons(name_start, name_len, value, rest) => (if type_of_env(TypeArg { node: value, tenv: tb.tenv, src: tb.src, prog: tb.prog, concepts: tb.concepts }) == 3 then 1 else 0) + tcheck_binds(TCheckBindsState { binds: rest, tenv: Env::ECons { name_start: name_start, name_len: name_len, val: type_of_env(TypeArg { node: value, tenv: tb.tenv, src: tb.src, prog: tb.prog, concepts: tb.concepts }), rest: tb.tenv }, src: tb.src, prog: tb.prog, concepts: tb.concepts })
       BNil => 0
   proofs:
     purity:
-      reads : [tb.binds, tb.tenv, tb.src, tb.prog]
+      reads : [tb.binds, tb.tenv, tb.src, tb.prog, tb.concepts]
       calls : [type_of_env, tcheck_binds]
     termination:
       bound : 4000
@@ -9199,12 +9338,13 @@ rule tcheck_binds
 
 -- tcheck_rule's input: one parsed rule declaration + the program source text.
 concept TCheckRuleState
-  @intention: "A parsed rule declaration + the program source text + the program, for type-checking it"
+  @intention: "A parsed rule declaration + the program source text + the program + the concept list, for type-checking it"
   @source: vexprparse.intent:37
   fields:
     rd : RuleDecl
     src : text [..256]
     prog : RuleList
+    concepts : ConceptList
 
 
 -- tcheck_rule: type-check ONE rule. Split the body into its binding list and final
@@ -9230,15 +9370,17 @@ rule tcheck_rule
     let body = rd_body(tr.rd)
     let binds = block_binds(body)
     let result = block_result(body)
-    let tenv = build_tenv(BuildTArg { binds: binds, tenv: Env::ENil, src: tr.src, prog: tr.prog })
-    let bad_binds = tcheck_binds(TCheckBindsState { binds: binds, tenv: Env::ENil, src: tr.src, prog: tr.prog })
-    let result_ty = type_of_env(TypeArg { node: result, tenv: tenv, src: tr.src, prog: tr.prog })
+    let start_env = field_concept_tenv(FieldConceptTenvState { fields: rd_input(tr.rd), concepts: tr.concepts, src: tr.src })
+    let tenv = build_tenv(BuildTArg { binds: binds, tenv: start_env, src: tr.src, prog: tr.prog, concepts: tr.concepts })
+    let bad_binds = tcheck_binds(TCheckBindsState { binds: binds, tenv: start_env, src: tr.src, prog: tr.prog, concepts: tr.concepts })
+    let result_ty = type_of_env(TypeArg { node: result, tenv: tenv, src: tr.src, prog: tr.prog, concepts: tr.concepts })
     let ret = rd_return_type(tr.rd)
-    out = bad_binds + (if result_ty == 3 then 1 else 0) + (if ret != 9 and result_ty != 3 and ret != result_ty then 1 else 0)
+    let declared_out = resolve_type(ResolveTypeState { concepts: tr.concepts, src: tr.src, ty_start: rd_out_ty_start(tr.rd), ty_len: rd_out_ty_len(tr.rd) })
+    out = bad_binds + (if result_ty == 3 then 1 else 0) + (if ret != 9 and result_ty != 3 and ret != result_ty then 1 else 0) + (if declared_out >= 1000 and result_ty != 3 and declared_out != result_ty then 1 else 0)
   proofs:
     purity:
-      reads : [tr.rd, tr.src, tr.prog]
-      calls : [rd_body, block_binds, block_result, build_tenv, tcheck_binds, type_of_env, rd_return_type]
+      reads : [tr.rd, tr.src, tr.prog, tr.concepts]
+      calls : [rd_body, block_binds, block_result, rd_input, field_concept_tenv, build_tenv, tcheck_binds, type_of_env, rd_return_type, resolve_type, rd_out_ty_start, rd_out_ty_len]
     termination:
       bound : 4000
 
@@ -9247,12 +9389,13 @@ rule tcheck_rule
 -- Mirrors LintCalleesState minus the `all` program field (this pass needs no
 -- inter-rule resolution — each rule is type-checked in isolation).
 concept TCheckListState
-  @intention: "A rule list (iterated) + the program source text + the full program, for folding the type check"
+  @intention: "A rule list (iterated) + the program source text + the full program + the concept list, for folding the type check"
   @source: vexprparse.intent:37
   fields:
     iter : RuleList
     src : text [..256]
     prog : RuleList
+    concepts : ConceptList
 
 
 -- tcheck_list: fold tcheck_rule over the program, summing each rule's type-error
@@ -9268,11 +9411,11 @@ rule tcheck_list
     out : number
   logic:
     out = match tl.iter:
-      RCons(head, tail) => tcheck_rule(TCheckRuleState { rd: head, src: tl.src, prog: tl.prog }) + tcheck_list(TCheckListState { iter: tail, src: tl.src, prog: tl.prog })
+      RCons(head, tail) => tcheck_rule(TCheckRuleState { rd: head, src: tl.src, prog: tl.prog, concepts: tl.concepts }) + tcheck_list(TCheckListState { iter: tail, src: tl.src, prog: tl.prog, concepts: tl.concepts })
       RNil => 0
   proofs:
     purity:
-      reads : [tl.iter, tl.src, tl.prog]
+      reads : [tl.iter, tl.src, tl.prog, tl.concepts]
       calls : [tcheck_rule, tcheck_list]
     termination:
       bound : 4000
@@ -9310,13 +9453,346 @@ rule type_check
   logic:
     let toks = begin_tokenize(ScanState { source: s.source, pos: 0 })
     let prog = parse_program(ProgramState { cell: toks, src: s.source })
-    out = tcheck_list(TCheckListState { iter: prog, prog: prog, src: s.source })
+    let concepts = parse_concepts(ProgramState { cell: toks, src: s.source })
+    out = tcheck_list(TCheckListState { iter: prog, prog: prog, src: s.source, concepts: concepts })
   proofs:
     purity:
       reads : [s.source]
-      calls : [begin_tokenize, parse_program, tcheck_list]
+      calls : [begin_tokenize, parse_program, parse_concepts, tcheck_list]
     termination:
       bound : 256
+
+
+-- ============================================================================
+-- BRICK R6b: the CONCEPT-AWARE type lattice. type_code_of_span maps every
+-- non-scalar type NAME to 0 (lossy), so a `head : Token` payload field would type
+-- as number and the checker would unsoundly accept `head + 1`. R6b stores type
+-- SPANS (FCons/PCons/MkRule, the representation fix above) and resolves them here,
+-- at check time, against the parsed ConceptList. A type code is now scalar {0,1,2},
+-- ERROR 3, OR a CONCEPT code 1000 + concept_index (CONCEPT_BASE = 1000, clear of
+-- the scalar codes). resolve_type is the ONE place a type NAME becomes a code.
+-- ============================================================================
+
+-- resolve_type's input: the parsed concept list + the source + a type-name span.
+concept ResolveTypeState
+  @intention: "A concept list + the source text + a type-name span, for resolving it to a type code"
+  @source: vexprparse.intent:62
+  fields:
+    concepts : ConceptList
+    src : text [..256]
+    ty_start : number [0, 4000000]
+    ty_len : number [0, 4000000]
+
+
+-- find_concept_index's input: a concept list + source + a query name span + the
+-- running 0-based index. Mirror of find_concept (R1) but RETURNS the position so the
+-- concept code 1000 + index can be recovered back to the concept at match time.
+concept FindConceptIdxState
+  @intention: "A concept list + the source + a query name span + the running index, for finding a concept's position"
+  @source: vexprparse.intent:62
+  fields:
+    concepts : ConceptList
+    src : text [..256]
+    q_start : number [0, 4000000]
+    q_len : number [0, 4000000]
+    idx : number [0, 4000000]
+
+
+-- concept_at_index's input: a concept list + a 0-based index. The inverse of
+-- find_concept_index: from a concept CODE's index back to its Concept (so AstMatch
+-- can read the scrutinee concept's VariantList).
+concept ConceptAtState
+  @intention: "A concept list + a 0-based index, for fetching the concept at that position"
+  @source: vexprparse.intent:62
+  fields:
+    concepts : ConceptList
+    idx : number [0, 4000000]
+
+
+-- find a variant by name within a concept's VariantList (the scrutinee concept's
+-- variants), to read its payload field list / confirm the arm's variant exists.
+concept FindVariantState
+  @intention: "A variant list + the source + a query variant-name span, for locating one variant"
+  @source: vexprparse.intent:65
+  fields:
+    variants : VariantList
+    src : text [..256]
+    q_start : number [0, 4000000]
+    q_len : number [0, 4000000]
+
+
+-- bind_binders's input: an arm's positional binder list + the matched variant's
+-- payload field list (walked in step) + the type env to extend + the concept list +
+-- the source. Each binder binds to its payload field's RESOLVED type — so a `Token`
+-- payload field gives the binder the Token concept code, not number.
+concept BindBindersState
+  @intention: "An arm's binders + the variant payload fields + the env to extend + the concept list + the source"
+  @source: vexprparse.intent:65
+  fields:
+    binders : BinderList
+    fields : FieldList
+    tenv : Env
+    concepts : ConceptList
+    src : text [..256]
+
+
+-- field_concept_tenv's input: a field list (a rule's declared input fields) + the
+-- concept list + the source. Seeds the type env with the CONCEPT-typed input fields
+-- (a `toks : TokenList` input becomes toks -> TokenList code) so a match scrutinee
+-- that reads an input field resolves to its concept. Scalar fields are skipped
+-- (they keep env_lookup's number default), so scalar-only rules seed an EMPTY env —
+-- byte-identical to the pre-R6b behaviour.
+concept FieldConceptTenvState
+  @intention: "A rule's input field list + the concept list + the source, for seeding the type env with concept-typed fields"
+  @source: vexprparse.intent:62
+  fields:
+    fields : FieldList
+    concepts : ConceptList
+    src : text [..256]
+
+
+-- arm_body_type's input: one match arm (variant-name span + binders + body) + the
+-- scrutinee concept's VariantList + the enclosing type env + source + program +
+-- concept list. Types ONE arm body with the binders bound to their payload types.
+concept ArmBodyTypeState
+  @intention: "One match arm + the scrutinee concept's variants + the type env + source + program + concept list"
+  @source: vexprparse.intent:65
+  fields:
+    vstart : number [0, 4000000]
+    vlen : number [0, 4000000]
+    binders : BinderList
+    body : Ast
+    vlist : VariantList
+    tenv : Env
+    src : text [..256]
+    prog : RuleList
+    concepts : ConceptList
+
+
+-- arms_type's input: a match arm list + the scrutinee concept's VariantList + the
+-- type env + source + program + concept list. Folds the per-arm types into the
+-- common arm type (all equal and non-ERROR -> that code; otherwise ERROR).
+concept ArmsTypeState
+  @intention: "A match arm list + the scrutinee concept's variants + the type env + source + program + concept list"
+  @source: vexprparse.intent:65
+  fields:
+    arms : ArmList
+    vlist : VariantList
+    tenv : Env
+    src : text [..256]
+    prog : RuleList
+    concepts : ConceptList
+
+
+-- resolve_type: map a type-name span to a code. number/bool/text resolve to 0/1/2
+-- EXACTLY as type_code_of_span did (the scalar fast-path stays byte-identical: tc is
+-- type_code_of_span's result, isnum is its own "number" byte check so a concept name
+-- — which type_code_of_span also returns 0 for — is NOT mistaken for number). Any
+-- other name is looked up in the ConceptList: found -> 1000 + index (a concept code),
+-- not found -> 3 (ERROR). This is the ONLY name->code site; everything downstream
+-- compares codes. byte_at is a primitive (not a callee), like type_code_of_span.
+rule resolve_type
+  @intention: "Resolve a type-name span to a code: number/bool/text -> 0/1/2, known concept -> 1000+index, else ERROR (3)"
+  @source: vexprparse.intent:62
+  input:
+    r : ResolveTypeState
+  output:
+    out : number
+  logic:
+    let tc = type_code_of_span(SpanCheck { src: r.src, start: r.ty_start, len: r.ty_len })
+    let isnum = if r.ty_len == 6 and (byte_at(r.src, r.ty_start) == 110 and (byte_at(r.src, r.ty_start + 1) == 117 and (byte_at(r.src, r.ty_start + 2) == 109 and (byte_at(r.src, r.ty_start + 3) == 98 and (byte_at(r.src, r.ty_start + 4) == 101 and byte_at(r.src, r.ty_start + 5) == 114))))) then 1 else 0
+    let idx = find_concept_index(FindConceptIdxState { concepts: r.concepts, src: r.src, q_start: r.ty_start, q_len: r.ty_len, idx: 0 })
+    out = if isnum == 1 then 0 else (if tc == 1 then 1 else (if tc == 2 then 2 else (if idx == 999999 then 3 else 1000 + idx)))
+  proofs:
+    purity:
+      reads : [r.concepts, r.src, r.ty_start, r.ty_len]
+      calls : [type_code_of_span, find_concept_index]
+    termination:
+      bound : 64
+
+
+-- find_concept_index: the 0-based position of the concept whose name byte-equals the
+-- query span, walking front-to-back with a running index; 999999 ("not found") at
+-- CNil. Mirror of find_concept but returning the position. Bound-only termination +
+-- the native recursion breadcrumb (the shrinking list tail is a field of the input).
+rule find_concept_index
+  @intention: "The 0-based position of the concept whose name matches the query span (999999 if none)"
+  @source: vexprparse.intent:62
+  input:
+    fci : FindConceptIdxState
+  output:
+    out : number
+  logic:
+    out = match fci.concepts:
+      CCons(head, tail) => if cd_name_len(head) == fci.q_len and name_eq(NameEqState { src: fci.src, a_start: cd_name_start(head), b_start: fci.q_start, len: fci.q_len, off: 0 }) == 1 then fci.idx else find_concept_index(FindConceptIdxState { concepts: tail, src: fci.src, q_start: fci.q_start, q_len: fci.q_len, idx: fci.idx + 1 })
+      CNil => 999999
+  proofs:
+    purity:
+      reads : [fci.concepts, fci.src, fci.q_start, fci.q_len, fci.idx]
+      calls : [cd_name_len, cd_name_start, name_eq, find_concept_index]
+    termination:
+      bound : 4000
+
+
+-- concept_at_index: the Concept at the given 0-based position (walk the tail idx
+-- times). idx is always >= 0 at every call: the entry value is `code - 1000` computed
+-- only on the >= 1000 branch (so >= 0), and the recursive `idx - 1` is reached only
+-- when idx != 0 (so idx >= 1). Out-of-range walks to CNil -> sentinel empty concept
+-- (VarNil variants) — the AstMatch guard then yields ERROR. Bound-only + breadcrumb.
+rule concept_at_index
+  @intention: "The concept at the given 0-based position of a concept list (sentinel empty concept if out of range)"
+  @source: vexprparse.intent:62
+  input:
+    ca : ConceptAtState
+  output:
+    out : Concept
+  logic:
+    out = match ca.concepts:
+      CCons(head, tail) => if ca.idx == 0 then head else concept_at_index(ConceptAtState { concepts: tail, idx: ca.idx - 1 })
+      CNil => Concept::MkConcept { name_start: 0, name_len: 0, fields: FieldList::FNil, variants: VariantList::VarNil }
+  proofs:
+    purity:
+      reads : [ca.concepts, ca.idx]
+      calls : [concept_at_index]
+    termination:
+      bound : 4000
+
+
+-- variant_present: 1 iff a variant whose name byte-equals the query span exists in
+-- the list. Lets arm_body_type distinguish "found, empty payload" (a bare variant
+-- like Eof) from "variant not found" (an ill-formed arm -> ERROR). Bound + breadcrumb.
+rule variant_present
+  @intention: "1 if a variant whose name matches the query span exists in the list, 0 otherwise"
+  @source: vexprparse.intent:65
+  input:
+    fv : FindVariantState
+  output:
+    out : number
+  logic:
+    out = match fv.variants:
+      VarCons(name_start, name_len, payload, rest) => if name_len == fv.q_len and name_eq(NameEqState { src: fv.src, a_start: name_start, b_start: fv.q_start, len: fv.q_len, off: 0 }) == 1 then 1 else variant_present(FindVariantState { variants: rest, src: fv.src, q_start: fv.q_start, q_len: fv.q_len })
+      VarNil => 0
+  proofs:
+    purity:
+      reads : [fv.variants, fv.src, fv.q_start, fv.q_len]
+      calls : [name_eq, variant_present]
+    termination:
+      bound : 4000
+
+
+-- variant_payload: the payload FieldList of the variant whose name matches the query
+-- span (FNil if none / a bare variant). Mirror of variant_present. Bound + breadcrumb.
+rule variant_payload
+  @intention: "The payload field list of the variant whose name matches the query span (FNil if none)"
+  @source: vexprparse.intent:65
+  input:
+    fv : FindVariantState
+  output:
+    out : FieldList
+  logic:
+    out = match fv.variants:
+      VarCons(name_start, name_len, payload, rest) => if name_len == fv.q_len and name_eq(NameEqState { src: fv.src, a_start: name_start, b_start: fv.q_start, len: fv.q_len, off: 0 }) == 1 then payload else variant_payload(FindVariantState { variants: rest, src: fv.src, q_start: fv.q_start, q_len: fv.q_len })
+      VarNil => FieldList::FNil
+  proofs:
+    purity:
+      reads : [fv.variants, fv.src, fv.q_start, fv.q_len]
+      calls : [name_eq, variant_payload]
+    termination:
+      bound : 4000
+
+
+-- bind_binders: extend the type env by binding each positional arm binder to its
+-- payload field's RESOLVED type (walking binders and payload fields in step). A
+-- `Cons(h, t)` arm over payload `(head : Token, tail : TokenList)` binds h -> Token
+-- code, t -> TokenList code, so the arm body types soundly (h + 1 is then ERROR).
+-- BindNil returns the env unchanged. Bound-only termination + breadcrumb (the
+-- shrinking binder/field tails are fields of the packed input).
+rule bind_binders
+  @intention: "Extend a type env by binding each match-arm binder to its payload field's resolved type"
+  @source: vexprparse.intent:65
+  input:
+    bb : BindBindersState
+  output:
+    out : Env
+  logic:
+    out = match bb.binders:
+      BindCons(start, len, rest) => Env::ECons { name_start: start, name_len: len, val: resolve_type(ResolveTypeState { concepts: bb.concepts, src: bb.src, ty_start: fl_head_ty_start(bb.fields), ty_len: fl_head_ty_len(bb.fields) }), rest: bind_binders(BindBindersState { binders: rest, fields: fl_tail(bb.fields), tenv: bb.tenv, concepts: bb.concepts, src: bb.src }) }
+      BindNil => bb.tenv
+  proofs:
+    purity:
+      reads : [bb.binders, bb.fields, bb.tenv, bb.concepts, bb.src]
+      calls : [resolve_type, fl_head_ty_start, fl_head_ty_len, bind_binders, fl_tail]
+    termination:
+      bound : 4000
+
+
+-- field_concept_tenv: fold a rule's input field list into a START type env holding
+-- ONLY the concept-typed fields (resolve_type >= 1000). Scalar fields are skipped, so
+-- a scalar-only rule produces ENil — the pre-R6b start env — keeping every existing
+-- type-check result unchanged. Bound-only termination + breadcrumb.
+rule field_concept_tenv
+  @intention: "Seed a type env from a rule's input fields, binding only the concept-typed ones to their concept code"
+  @source: vexprparse.intent:62
+  input:
+    fct : FieldConceptTenvState
+  output:
+    out : Env
+  logic:
+    out = match fct.fields:
+      FCons(name_start, name_len, ty, ty_start, ty_len, rest) => if resolve_type(ResolveTypeState { concepts: fct.concepts, src: fct.src, ty_start: ty_start, ty_len: ty_len }) >= 1000 then Env::ECons { name_start: name_start, name_len: name_len, val: resolve_type(ResolveTypeState { concepts: fct.concepts, src: fct.src, ty_start: ty_start, ty_len: ty_len }), rest: field_concept_tenv(FieldConceptTenvState { fields: rest, concepts: fct.concepts, src: fct.src }) } else field_concept_tenv(FieldConceptTenvState { fields: rest, concepts: fct.concepts, src: fct.src })
+      FNil => Env::ENil
+  proofs:
+    purity:
+      reads : [fct.fields, fct.concepts, fct.src]
+      calls : [resolve_type, field_concept_tenv]
+    termination:
+      bound : 4000
+
+
+-- arm_body_type: the type code of ONE match arm body. If the arm's variant is not in
+-- the scrutinee concept's VariantList -> ERROR (3, an ill-formed arm). Otherwise bind
+-- the arm's binders to the variant payload's field types and type the body against
+-- that extended env. Part of the type_of_env SCC (it calls type_of_env). Bound-only.
+rule arm_body_type
+  @intention: "The type code of one match arm body (binders bound to payload types; ERROR if variant absent)"
+  @source: vexprparse.intent:65
+  input:
+    ab : ArmBodyTypeState
+  output:
+    out : number
+  logic:
+    out = if variant_present(FindVariantState { variants: ab.vlist, src: ab.src, q_start: ab.vstart, q_len: ab.vlen }) == 0 then 3 else type_of_env(TypeArg { node: ab.body, tenv: bind_binders(BindBindersState { binders: ab.binders, fields: variant_payload(FindVariantState { variants: ab.vlist, src: ab.src, q_start: ab.vstart, q_len: ab.vlen }), tenv: ab.tenv, concepts: ab.concepts, src: ab.src }), src: ab.src, prog: ab.prog, concepts: ab.concepts })
+  proofs:
+    purity:
+      reads : [ab.vstart, ab.vlen, ab.binders, ab.body, ab.vlist, ab.tenv, ab.src, ab.prog, ab.concepts]
+      calls : [variant_present, type_of_env, bind_binders, variant_payload]
+    termination:
+      bound : 4000
+
+
+-- arms_type: the COMMON type code across every arm of a match (the match's type). For
+-- each arm, type its body (arm_body_type); the match types iff every arm has the SAME
+-- non-ERROR type, else ERROR (3). 7777 is the "no arm seen yet" sentinel (clear of
+-- every real type code) returned at ArmNil; the caller maps a leftover 7777 (empty
+-- match) to ERROR. Folds right: the last arm seeds the expected type, earlier arms
+-- must agree. Part of the type_of_env SCC; bound-only termination + breadcrumb.
+rule arms_type
+  @intention: "The common type code across all match arms (that code if all agree and non-ERROR, else ERROR; 7777 if no arms)"
+  @source: vexprparse.intent:65
+  input:
+    at : ArmsTypeState
+  output:
+    out : number
+  logic:
+    out = match at.arms:
+      ArmCons(vstart, vlen, binders, body, rest) => if arms_type(ArmsTypeState { arms: rest, vlist: at.vlist, tenv: at.tenv, src: at.src, prog: at.prog, concepts: at.concepts }) == 7777 then arm_body_type(ArmBodyTypeState { vstart: vstart, vlen: vlen, binders: binders, body: body, vlist: at.vlist, tenv: at.tenv, src: at.src, prog: at.prog, concepts: at.concepts }) else (if arm_body_type(ArmBodyTypeState { vstart: vstart, vlen: vlen, binders: binders, body: body, vlist: at.vlist, tenv: at.tenv, src: at.src, prog: at.prog, concepts: at.concepts }) == arms_type(ArmsTypeState { arms: rest, vlist: at.vlist, tenv: at.tenv, src: at.src, prog: at.prog, concepts: at.concepts }) and arm_body_type(ArmBodyTypeState { vstart: vstart, vlen: vlen, binders: binders, body: body, vlist: at.vlist, tenv: at.tenv, src: at.src, prog: at.prog, concepts: at.concepts }) != 3 then arm_body_type(ArmBodyTypeState { vstart: vstart, vlen: vlen, binders: binders, body: body, vlist: at.vlist, tenv: at.tenv, src: at.src, prog: at.prog, concepts: at.concepts }) else 3)
+      ArmNil => 7777
+  proofs:
+    purity:
+      reads : [at.arms, at.vlist, at.tenv, at.src, at.prog, at.concepts]
+      calls : [arms_type, arm_body_type]
+    termination:
+      bound : 4000
 
 
 -- ============================================================================
@@ -9385,7 +9861,7 @@ rule param_to_tenv
     out : Env
   logic:
     out = match pl:
-      PCons(name_start, name_len, ty, rest) => Env::ECons { name_start: name_start, name_len: name_len, val: ty, rest: param_to_tenv(rest) }
+      PCons(name_start, name_len, ty, ty_start, ty_len, rest) => Env::ECons { name_start: name_start, name_len: name_len, val: ty, rest: param_to_tenv(rest) }
       PNil => Env::ENil
   proofs:
     purity:
@@ -9411,7 +9887,7 @@ rule phead_ty
     out : number
   logic:
     out = match pl:
-      PCons(name_start, name_len, ty, rest) => ty
+      PCons(name_start, name_len, ty, ty_start, ty_len, rest) => ty
       PNil => 9
   proofs:
     purity:
@@ -9434,7 +9910,7 @@ rule ptail
     out : ParamList
   logic:
     out = match pl:
-      PCons(name_start, name_len, ty, rest) => rest
+      PCons(name_start, name_len, ty, ty_start, ty_len, rest) => rest
       PNil => ParamList::PNil
   proofs:
     purity:
@@ -9539,7 +10015,7 @@ rule argtype_args
     out : number
   logic:
     out = match a.args:
-      ArgCons(head, tail) => (if phead_ty(a.params) != 9 and type_of_env(TypeArg { node: head, tenv: a.tenv, src: a.src, prog: a.prog }) != phead_ty(a.params) and type_of_env(TypeArg { node: head, tenv: a.tenv, src: a.src, prog: a.prog }) != 3 then 1 else 0) + argtype_ast(ArgTypeState { node: head, tenv: a.tenv, src: a.src, prog: a.prog }) + argtype_args(ArgTypeArgsState { args: tail, params: ptail(a.params), tenv: a.tenv, src: a.src, prog: a.prog })
+      ArgCons(head, tail) => (if phead_ty(a.params) != 9 and type_of_env(TypeArg { node: head, tenv: a.tenv, src: a.src, prog: a.prog, concepts: ConceptList::CNil }) != phead_ty(a.params) and type_of_env(TypeArg { node: head, tenv: a.tenv, src: a.src, prog: a.prog, concepts: ConceptList::CNil }) != 3 then 1 else 0) + argtype_ast(ArgTypeState { node: head, tenv: a.tenv, src: a.src, prog: a.prog }) + argtype_args(ArgTypeArgsState { args: tail, params: ptail(a.params), tenv: a.tenv, src: a.src, prog: a.prog })
       ArgNil => 0
   proofs:
     purity:
@@ -9608,7 +10084,7 @@ rule argtype_binds
     out : number
   logic:
     out = match a.binds:
-      BCons(name_start, name_len, value, rest) => argtype_ast(ArgTypeState { node: value, tenv: a.tenv, src: a.src, prog: a.prog }) + argtype_binds(ArgTypeBindsState { binds: rest, tenv: Env::ECons { name_start: name_start, name_len: name_len, val: type_of_env(TypeArg { node: value, tenv: a.tenv, src: a.src, prog: a.prog }), rest: a.tenv }, src: a.src, prog: a.prog })
+      BCons(name_start, name_len, value, rest) => argtype_ast(ArgTypeState { node: value, tenv: a.tenv, src: a.src, prog: a.prog }) + argtype_binds(ArgTypeBindsState { binds: rest, tenv: Env::ECons { name_start: name_start, name_len: name_len, val: type_of_env(TypeArg { node: value, tenv: a.tenv, src: a.src, prog: a.prog, concepts: ConceptList::CNil }), rest: a.tenv }, src: a.src, prog: a.prog })
       BNil => 0
   proofs:
     purity:
@@ -9640,7 +10116,7 @@ rule argtype_rule
     let body = rd_body(a.rd)
     let binds = block_binds(body)
     let result = block_result(body)
-    let full_tenv = build_tenv(BuildTArg { binds: binds, tenv: ptenv, src: a.src, prog: a.prog })
+    let full_tenv = build_tenv(BuildTArg { binds: binds, tenv: ptenv, src: a.src, prog: a.prog, concepts: ConceptList::CNil })
     let in_binds = argtype_binds(ArgTypeBindsState { binds: binds, tenv: ptenv, src: a.src, prog: a.prog })
     out = in_binds + argtype_ast(ArgTypeState { node: result, tenv: full_tenv, src: a.src, prog: a.prog })
   proofs:
@@ -9766,16 +10242,17 @@ rule check_program
   logic:
     let toks = begin_tokenize(ScanState { source: s.source, pos: 0 })
     let prog = parse_program(ProgramState { cell: toks, src: s.source })
+    let concepts = parse_concepts(ProgramState { cell: toks, src: s.source })
     let e_undef = lint_list(LintListState { rl: prog, src: s.source })
     let e_callee = lint_callees_list(LintCalleesState { iter: prog, all: prog, src: s.source })
     let e_arity = lint_arity_list(LintArityState { iter: prog, all: prog, src: s.source })
-    let e_type = tcheck_list(TCheckListState { iter: prog, prog: prog, src: s.source })
+    let e_type = tcheck_list(TCheckListState { iter: prog, prog: prog, src: s.source, concepts: concepts })
     let e_argtype = argtype_list(ArgTypeListState { iter: prog, all: prog, src: s.source })
     out = e_undef + e_callee + e_arity + e_type + e_argtype
   proofs:
     purity:
       reads : [s.source]
-      calls : [begin_tokenize, parse_program, lint_list, lint_callees_list, lint_arity_list, tcheck_list, argtype_list]
+      calls : [begin_tokenize, parse_program, parse_concepts, lint_list, lint_callees_list, lint_arity_list, tcheck_list, argtype_list]
     termination:
       bound : 256
 
@@ -9806,12 +10283,13 @@ rule check_program
 -- arg-type passes) + the source text. Same shape as BadCallRuleState / ArgTypeRuleState
 -- but named generically because it feeds ALL five per-rule analyses, not one.
 concept RuleCatState
-  @intention: "A rule declaration + the full program rule list + the source text, for categorizing its first error"
+  @intention: "A rule declaration + the full program rule list + the source text + the concept list, for categorizing its first error"
   @source: vexprparse.intent:41
   fields:
     rd : RuleDecl
     prog : RuleList
     src : text [..256]
+    concepts : ConceptList
 
 
 -- find_diag's input: the rule list being ITERATED (`iter` advances each step, one
@@ -9821,13 +10299,14 @@ concept RuleCatState
 -- lint_callees_list / argtype_list: rule_category always receives `all`, never the
 -- shrinking `iter` tail. `idx` is the source position reported in the Diag.
 concept FindDiagState
-  @intention: "The rule list being walked + the full program + the source + the running rule index"
+  @intention: "The rule list being walked + the full program + the source + the running rule index + the concept list"
   @source: vexprparse.intent:41
   fields:
     iter : RuleList
     all : RuleList
     src : text [..256]
     idx : number [0, 4000000]
+    concepts : ConceptList
 
 
 -- rule_category: the FIRST failing category of ONE rule, in the fixed precedence
@@ -9846,10 +10325,10 @@ rule rule_category
   output:
     out : number
   logic:
-    out = if lint_rule(LintRuleState { rd: rc.rd, src: rc.src }) > 0 then 1 else if badcall_rule(BadCallRuleState { rd: rc.rd, rules: rc.prog, src: rc.src }) > 0 then 2 else if badarity_rule(BadArityRuleState { rd: rc.rd, rules: rc.prog, src: rc.src }) > 0 then 3 else if tcheck_rule(TCheckRuleState { rd: rc.rd, src: rc.src, prog: rc.prog }) > 0 then 4 else if argtype_rule(ArgTypeRuleState { rd: rc.rd, prog: rc.prog, src: rc.src }) > 0 then 5 else 0
+    out = if lint_rule(LintRuleState { rd: rc.rd, src: rc.src }) > 0 then 1 else if badcall_rule(BadCallRuleState { rd: rc.rd, rules: rc.prog, src: rc.src }) > 0 then 2 else if badarity_rule(BadArityRuleState { rd: rc.rd, rules: rc.prog, src: rc.src }) > 0 then 3 else if tcheck_rule(TCheckRuleState { rd: rc.rd, src: rc.src, prog: rc.prog, concepts: rc.concepts }) > 0 then 4 else if argtype_rule(ArgTypeRuleState { rd: rc.rd, prog: rc.prog, src: rc.src }) > 0 then 5 else 0
   proofs:
     purity:
-      reads : [rc.rd, rc.prog, rc.src]
+      reads : [rc.rd, rc.prog, rc.src, rc.concepts]
       calls : [lint_rule, badcall_rule, badarity_rule, tcheck_rule, argtype_rule]
     termination:
       bound : 1024
@@ -9873,11 +10352,11 @@ rule find_diag
     out : Diag
   logic:
     out = match fd.iter:
-      RCons(head, tail) => if rule_category(RuleCatState { rd: head, prog: fd.all, src: fd.src }) > 0 then Diag::MkDiag { rule_index: fd.idx, category: rule_category(RuleCatState { rd: head, prog: fd.all, src: fd.src }), span_start: 9999, span_len: 0 } else find_diag(FindDiagState { iter: tail, all: fd.all, src: fd.src, idx: fd.idx + 1 })
+      RCons(head, tail) => if rule_category(RuleCatState { rd: head, prog: fd.all, src: fd.src, concepts: fd.concepts }) > 0 then Diag::MkDiag { rule_index: fd.idx, category: rule_category(RuleCatState { rd: head, prog: fd.all, src: fd.src, concepts: fd.concepts }), span_start: 9999, span_len: 0 } else find_diag(FindDiagState { iter: tail, all: fd.all, src: fd.src, idx: fd.idx + 1, concepts: fd.concepts })
       RNil => Diag::MkDiag { rule_index: 9999, category: 0, span_start: 9999, span_len: 0 }
   proofs:
     purity:
-      reads : [fd.iter, fd.all, fd.src, fd.idx]
+      reads : [fd.iter, fd.all, fd.src, fd.idx, fd.concepts]
       calls : [rule_category, find_diag]
     termination:
       bound : 4000
@@ -9993,12 +10472,13 @@ rule first_bad_rule
   logic:
     let toks = begin_tokenize(ScanState { source: s.source, pos: 0 })
     let prog = parse_program(ProgramState { cell: toks, src: s.source })
-    let d = find_diag(FindDiagState { iter: prog, all: prog, src: s.source, idx: 0 })
+    let concepts = parse_concepts(ProgramState { cell: toks, src: s.source })
+    let d = find_diag(FindDiagState { iter: prog, all: prog, src: s.source, idx: 0, concepts: concepts })
     out = diag_index(d)
   proofs:
     purity:
       reads : [s.source]
-      calls : [begin_tokenize, parse_program, find_diag, diag_index]
+      calls : [begin_tokenize, parse_program, parse_concepts, find_diag, diag_index]
     termination:
       bound : 256
 
@@ -10017,12 +10497,13 @@ rule first_bad_category
   logic:
     let toks = begin_tokenize(ScanState { source: s.source, pos: 0 })
     let prog = parse_program(ProgramState { cell: toks, src: s.source })
-    let d = find_diag(FindDiagState { iter: prog, all: prog, src: s.source, idx: 0 })
+    let concepts = parse_concepts(ProgramState { cell: toks, src: s.source })
+    let d = find_diag(FindDiagState { iter: prog, all: prog, src: s.source, idx: 0, concepts: concepts })
     out = diag_cat(d)
   proofs:
     purity:
       reads : [s.source]
-      calls : [begin_tokenize, parse_program, find_diag, diag_cat]
+      calls : [begin_tokenize, parse_program, parse_concepts, find_diag, diag_cat]
     termination:
       bound : 256
 
@@ -10062,13 +10543,14 @@ rule first_bad_category
 -- the index so rule_diags can construct Diags directly instead of leaving the index
 -- to the caller.
 concept RuleDiagsState
-  @intention: "A rule declaration + the full program + the source + the rule's 0-based index, for listing all its diagnostics"
+  @intention: "A rule declaration + the full program + the source + the rule's 0-based index + the concept list, for listing all its diagnostics"
   @source: vexprparse.intent:42
   fields:
     rd : RuleDecl
     prog : RuleList
     src : text [..256]
     idx : number [0, 4000000]
+    concepts : ConceptList
 
 
 -- prog_diags's input: the rule list being ITERATED (`iter` advances each step, one
@@ -10078,13 +10560,14 @@ concept RuleDiagsState
 -- and lint_callees_list / argtype_list: rule_diags always receives `all`, never the
 -- shrinking `iter` tail.
 concept ProgDiagsState
-  @intention: "The rule list being walked + the full program + the source + the running rule index, for the whole-program diagnostic list"
+  @intention: "The rule list being walked + the full program + the source + the running rule index + the concept list, for the whole-program diagnostic list"
   @source: vexprparse.intent:42
   fields:
     iter : RuleList
     all : RuleList
     src : text [..256]
     idx : number [0, 4000000]
+    concepts : ConceptList
 
 
 -- diag_append's input: two DiagLists. Standard cons-list append concatenates the
@@ -10148,14 +10631,14 @@ rule rule_diags
     let csp = badcall_span_rule(BadCallSpanRuleState { rd: rds.rd, rules: rds.prog, src: rds.src })
     let asp = badarity_span_rule(BadAritySpanRuleState { rd: rds.rd, rules: rds.prog, src: rds.src })
     let d5 = if argtype_rule(ArgTypeRuleState { rd: rds.rd, prog: rds.prog, src: rds.src }) > 0 then DiagList::DCons { diag: Diag::MkDiag { rule_index: rds.idx, category: 5, span_start: 9999, span_len: 0 }, rest: DiagList::DNil } else DiagList::DNil
-    let d4 = if tcheck_rule(TCheckRuleState { rd: rds.rd, src: rds.src, prog: rds.prog }) > 0 then DiagList::DCons { diag: Diag::MkDiag { rule_index: rds.idx, category: 4, span_start: 9999, span_len: 0 }, rest: d5 } else d5
+    let d4 = if tcheck_rule(TCheckRuleState { rd: rds.rd, src: rds.src, prog: rds.prog, concepts: rds.concepts }) > 0 then DiagList::DCons { diag: Diag::MkDiag { rule_index: rds.idx, category: 4, span_start: 9999, span_len: 0 }, rest: d5 } else d5
     let d3 = if badarity_rule(BadArityRuleState { rd: rds.rd, rules: rds.prog, src: rds.src }) > 0 then DiagList::DCons { diag: Diag::MkDiag { rule_index: rds.idx, category: 3, span_start: span_start(asp), span_len: span_len(asp) }, rest: d4 } else d4
     let d2 = if badcall_rule(BadCallRuleState { rd: rds.rd, rules: rds.prog, src: rds.src }) > 0 then DiagList::DCons { diag: Diag::MkDiag { rule_index: rds.idx, category: 2, span_start: span_start(csp), span_len: span_len(csp) }, rest: d3 } else d3
     let d1 = if lint_rule(LintRuleState { rd: rds.rd, src: rds.src }) > 0 then DiagList::DCons { diag: Diag::MkDiag { rule_index: rds.idx, category: 1, span_start: span_start(usp), span_len: span_len(usp) }, rest: d2 } else d2
     out = d1
   proofs:
     purity:
-      reads : [rds.rd, rds.prog, rds.src, rds.idx]
+      reads : [rds.rd, rds.prog, rds.src, rds.idx, rds.concepts]
       calls : [argtype_rule, tcheck_rule, badarity_rule, badcall_rule, lint_rule, undef_span_rule, badcall_span_rule, badarity_span_rule, span_start, span_len]
     termination:
       bound : 1024
@@ -10202,11 +10685,11 @@ rule prog_diags
     out : DiagList
   logic:
     out = match pds.iter:
-      RCons(head, tail) => diag_append(DiagAppendState { a: rule_diags(RuleDiagsState { rd: head, prog: pds.all, src: pds.src, idx: pds.idx }), b: prog_diags(ProgDiagsState { iter: tail, all: pds.all, src: pds.src, idx: pds.idx + 1 }) })
+      RCons(head, tail) => diag_append(DiagAppendState { a: rule_diags(RuleDiagsState { rd: head, prog: pds.all, src: pds.src, idx: pds.idx, concepts: pds.concepts }), b: prog_diags(ProgDiagsState { iter: tail, all: pds.all, src: pds.src, idx: pds.idx + 1, concepts: pds.concepts }) })
       RNil => DiagList::DNil
   proofs:
     purity:
-      reads : [pds.iter, pds.all, pds.src, pds.idx]
+      reads : [pds.iter, pds.all, pds.src, pds.idx, pds.concepts]
       calls : [diag_append, rule_diags, prog_diags]
     termination:
       bound : 4000
@@ -10368,11 +10851,12 @@ rule all_diags_count
   logic:
     let toks = begin_tokenize(ScanState { source: s.source, pos: 0 })
     let prog = parse_program(ProgramState { cell: toks, src: s.source })
-    out = diag_count(prog_diags(ProgDiagsState { iter: prog, all: prog, src: s.source, idx: 0 }))
+    let concepts = parse_concepts(ProgramState { cell: toks, src: s.source })
+    out = diag_count(prog_diags(ProgDiagsState { iter: prog, all: prog, src: s.source, idx: 0, concepts: concepts }))
   proofs:
     purity:
       reads : [s.source]
-      calls : [begin_tokenize, parse_program, diag_count, prog_diags]
+      calls : [begin_tokenize, parse_program, parse_concepts, diag_count, prog_diags]
     termination:
       bound : 256
 
@@ -10390,11 +10874,12 @@ rule nth_diag_at_rule
   logic:
     let toks = begin_tokenize(ScanState { source: s.source, pos: 0 })
     let prog = parse_program(ProgramState { cell: toks, src: s.source })
-    out = nth_diag_rule(DiagNthState { list: prog_diags(ProgDiagsState { iter: prog, all: prog, src: s.source, idx: 0 }), n: s.pos })
+    let concepts = parse_concepts(ProgramState { cell: toks, src: s.source })
+    out = nth_diag_rule(DiagNthState { list: prog_diags(ProgDiagsState { iter: prog, all: prog, src: s.source, idx: 0, concepts: concepts }), n: s.pos })
   proofs:
     purity:
       reads : [s.source, s.pos]
-      calls : [begin_tokenize, parse_program, nth_diag_rule, prog_diags]
+      calls : [begin_tokenize, parse_program, parse_concepts, nth_diag_rule, prog_diags]
     termination:
       bound : 256
 
@@ -10413,11 +10898,12 @@ rule nth_diag_at_cat
   logic:
     let toks = begin_tokenize(ScanState { source: s.source, pos: 0 })
     let prog = parse_program(ProgramState { cell: toks, src: s.source })
-    out = nth_diag_cat(DiagNthState { list: prog_diags(ProgDiagsState { iter: prog, all: prog, src: s.source, idx: 0 }), n: s.pos })
+    let concepts = parse_concepts(ProgramState { cell: toks, src: s.source })
+    out = nth_diag_cat(DiagNthState { list: prog_diags(ProgDiagsState { iter: prog, all: prog, src: s.source, idx: 0, concepts: concepts }), n: s.pos })
   proofs:
     purity:
       reads : [s.source, s.pos]
-      calls : [begin_tokenize, parse_program, nth_diag_cat, prog_diags]
+      calls : [begin_tokenize, parse_program, parse_concepts, nth_diag_cat, prog_diags]
     termination:
       bound : 256
 
@@ -10450,11 +10936,12 @@ rule nth_diag_at_span_start
   logic:
     let toks = begin_tokenize(ScanState { source: s.source, pos: 0 })
     let prog = parse_program(ProgramState { cell: toks, src: s.source })
-    out = nth_diag_span_start(DiagNthState { list: prog_diags(ProgDiagsState { iter: prog, all: prog, src: s.source, idx: 0 }), n: s.pos })
+    let concepts = parse_concepts(ProgramState { cell: toks, src: s.source })
+    out = nth_diag_span_start(DiagNthState { list: prog_diags(ProgDiagsState { iter: prog, all: prog, src: s.source, idx: 0, concepts: concepts }), n: s.pos })
   proofs:
     purity:
       reads : [s.source, s.pos]
-      calls : [begin_tokenize, parse_program, nth_diag_span_start, prog_diags]
+      calls : [begin_tokenize, parse_program, parse_concepts, nth_diag_span_start, prog_diags]
     termination:
       bound : 256
 
@@ -10473,11 +10960,12 @@ rule nth_diag_at_span_len
   logic:
     let toks = begin_tokenize(ScanState { source: s.source, pos: 0 })
     let prog = parse_program(ProgramState { cell: toks, src: s.source })
-    out = nth_diag_span_len(DiagNthState { list: prog_diags(ProgDiagsState { iter: prog, all: prog, src: s.source, idx: 0 }), n: s.pos })
+    let concepts = parse_concepts(ProgramState { cell: toks, src: s.source })
+    out = nth_diag_span_len(DiagNthState { list: prog_diags(ProgDiagsState { iter: prog, all: prog, src: s.source, idx: 0, concepts: concepts }), n: s.pos })
   proofs:
     purity:
       reads : [s.source, s.pos]
-      calls : [begin_tokenize, parse_program, nth_diag_span_len, prog_diags]
+      calls : [begin_tokenize, parse_program, parse_concepts, nth_diag_span_len, prog_diags]
     termination:
       bound : 256
 
@@ -12106,7 +12594,7 @@ rule param_index
     out : number
   logic:
     out = match pi.params:
-      PCons(name_start, name_len, ty, rest) => if name_len == pi.q_len and name_eq(NameEqState { src: pi.src, a_start: name_start, b_start: pi.q_start, len: pi.q_len, off: 0 }) == 1 then pi.idx else param_index(ParamIndexState { params: rest, src: pi.src, q_start: pi.q_start, q_len: pi.q_len, idx: pi.idx + 1 })
+      PCons(name_start, name_len, ty, ty_start, ty_len, rest) => if name_len == pi.q_len and name_eq(NameEqState { src: pi.src, a_start: name_start, b_start: pi.q_start, len: pi.q_len, off: 0 }) == 1 then pi.idx else param_index(ParamIndexState { params: rest, src: pi.src, q_start: pi.q_start, q_len: pi.q_len, idx: pi.idx + 1 })
       PNil => 0 - 1
   proofs:
     purity:
@@ -12594,7 +13082,7 @@ rule lower_params
     out : text
   logic:
     out = match pp.params:
-      PCons(name_start, name_len, ty, rest) => concat(substring(pp.src, name_start, name_start + name_len), " ", lower_params(PrintParamsState { params: rest, src: pp.src }))
+      PCons(name_start, name_len, ty, ty_start, ty_len, rest) => concat(substring(pp.src, name_start, name_start + name_len), " ", lower_params(PrintParamsState { params: rest, src: pp.src }))
       PNil => ""
   proofs:
     purity:
@@ -12839,7 +13327,7 @@ rule print_params
     out : text
   logic:
     out = match pp.params:
-      PCons(name_start, name_len, ty, rest) => concat("(", substring(pp.src, name_start, name_start + name_len), " : ", ty_text(TySpell { ty: ty }), print_params_rest(PrintParamsState { params: rest, src: pp.src }), ")")
+      PCons(name_start, name_len, ty, ty_start, ty_len, rest) => concat("(", substring(pp.src, name_start, name_start + name_len), " : ", ty_text(TySpell { ty: ty }), print_params_rest(PrintParamsState { params: rest, src: pp.src }), ")")
       PNil => ""
   proofs:
     purity:
@@ -12858,7 +13346,7 @@ rule print_params_rest
     out : text
   logic:
     out = match pp.params:
-      PCons(name_start, name_len, ty, rest) => concat(", ", substring(pp.src, name_start, name_start + name_len), " : ", ty_text(TySpell { ty: ty }), print_params_rest(PrintParamsState { params: rest, src: pp.src }))
+      PCons(name_start, name_len, ty, ty_start, ty_len, rest) => concat(", ", substring(pp.src, name_start, name_start + name_len), " : ", ty_text(TySpell { ty: ty }), print_params_rest(PrintParamsState { params: rest, src: pp.src }))
       PNil => ""
   proofs:
     purity:
@@ -12968,6 +13456,42 @@ rule print_program_src
     purity:
       reads : [s.source]
       calls : [begin_tokenize, parse_program, print_program]
+    termination:
+      bound : 256
+
+
+-- R6b money-shot driver: the TYPE CODE of the FIRST rule's body expression. Tokenize
+-- + parse the program AND capture its ConceptList (parse_concepts), seed the type env
+-- from the head rule's concept-typed INPUT fields (field_concept_tenv, so a `toks :
+-- TokenList` input resolves the scrutinee), build the let-binding tenv on top, and
+-- type the body via the concept-aware type_of_env. Returns a SCALAR code (0/1/2),
+-- ERROR (3), or a CONCEPT code (1000 + index). The R6b soundness gate:
+--   body_type("...group Token{Eof}... rule f\n  logic:\n    out = Token::Eof")            >= 1000 (Token, not 0)
+--   body_type("... match toks: Cons(h, t) => h  Nil => Token::Eof")                       >= 1000 (h : Token; both arms Token)
+--   body_type("... match toks: Cons(h, t) => h + 1  Nil => 0")                            = 3 (h is Token, not a number — UNSOUND case rejected)
+--   body_type("... match toks: Cons(h, t) => Token::Eof  Nil => 0")                       = 3 (arms disagree: Token vs number)
+-- NATIVE-ONLY (multi-line source). Source is argv arg 1, pos is argv arg 2 (always 0).
+rule body_type
+  @intention: "Tokenize, parse, and compute the concept-aware type code of the first rule's body expression"
+  @source: vexprparse.intent:37
+  input:
+    s : ScanState
+  output:
+    out : number
+  logic:
+    let toks = begin_tokenize(ScanState { source: s.source, pos: 0 })
+    let prog = parse_program(ProgramState { cell: toks, src: s.source })
+    let concepts = parse_concepts(ProgramState { cell: toks, src: s.source })
+    let body = rl_head_body(prog)
+    let binds = block_binds(body)
+    let result = block_result(body)
+    let start_env = field_concept_tenv(FieldConceptTenvState { fields: rl_head_input(prog), concepts: concepts, src: s.source })
+    let tenv = build_tenv(BuildTArg { binds: binds, tenv: start_env, src: s.source, prog: prog, concepts: concepts })
+    out = type_of_env(TypeArg { node: result, tenv: tenv, src: s.source, prog: prog, concepts: concepts })
+  proofs:
+    purity:
+      reads : [s.source]
+      calls : [begin_tokenize, parse_program, parse_concepts, rl_head_body, block_binds, block_result, field_concept_tenv, rl_head_input, build_tenv, type_of_env]
     termination:
       bound : 256
 
