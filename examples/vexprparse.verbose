@@ -7693,13 +7693,121 @@ rule count_undef_ast
       AstBool(value) => 0
       AstStr(start, len) => 0
       AstErr => 0
-      -- R3 stub: real handling in R6/R7 (no value without the R6 environment).
-      AstVariant(cstart, clen, vstart, vlen, fields) => 0
-      AstMatch(scrut, arms) => 0
+      -- R6a: a variant CONSTRUCT contributes no variable reference of its own
+      -- (the concept/variant names are TYPE references, not vars), but each field
+      -- VALUE expression is a sub-Ast walked with the SAME binds (scope unchanged).
+      AstVariant(cstart, clen, vstart, vlen, fields) => count_undef_vfields(UndefVFieldsState { fields: fields, binds: a.binds, src: a.src })
+      -- R6a: a match walks its scrutinee with the current binds, then EACH arm body
+      -- with binds EXTENDED by that arm's binders (count_undef_arms scopes them in).
+      AstMatch(scrut, arms) => count_undef_ast(UndefAstState { node: scrut, binds: a.binds, src: a.src }) + count_undef_arms(UndefArmsState { arms: arms, binds: a.binds, src: a.src })
   proofs:
     purity:
       reads : [a.node, a.binds, a.src]
-      calls : [count_undef_ast, count_undef_args, name_bound]
+      calls : [count_undef_ast, count_undef_args, name_bound, count_undef_vfields, count_undef_arms]
+    termination:
+      bound : 4000
+
+
+-- R6a: binds_with_binders prepends every binder of a match arm onto the rule's
+-- binding scope, so a binder (e.g. the `head` / `tail` of `Cons(head, tail)`) is
+-- treated as already-bound WITHIN that arm's body. Each binder carries only a
+-- source span (start, len) — exactly the identity model name_bound reads — so it
+-- is consed as a BCons with a DUMMY value (AstNum 0), identical to how
+-- param_to_binding conses a parameter that has no RHS. name_bound checks
+-- membership order-agnostically, so consing onto the front of `binds` yields
+-- exactly the SET {arm binders} ∪ {enclosing scope}. Recurses on the BinderList
+-- tail (a field of the packed input), so bound + the native recursion breadcrumb.
+concept BindsWithBindersState
+  @intention: "A binding scope + a match arm's binder list, to extend the scope with the binders"
+  @source: vexprparse.intent:32
+  fields:
+    binds : Binding
+    bs : BinderList
+
+
+rule binds_with_binders
+  @intention: "Extend a binding scope with a match arm's binders (each binder as an already-bound name)"
+  @source: vexprparse.intent:32
+  input:
+    bw : BindsWithBindersState
+  output:
+    out : Binding
+  logic:
+    out = match bw.bs:
+      BindCons(start, len, rest) => Binding::BCons { name_start: start, name_len: len, value: Ast::AstNum { value: 0 }, rest: binds_with_binders(BindsWithBindersState { binds: bw.binds, bs: rest }) }
+      BindNil => bw.binds
+  proofs:
+    purity:
+      reads : [bw.binds, bw.bs]
+      calls : [binds_with_binders]
+    termination:
+      bound : 512
+
+
+-- R6a: count_undef_vfields — sum count_undef_ast over every field VALUE of a
+-- variant construct's VFieldList. The field NAMEs are record-field labels, not
+-- variables, so only the `val` Ast of each VFCons is walked. The scope `binds` is
+-- threaded UNCHANGED (a variant construct introduces no new bindings). Mutually
+-- recursive with count_undef_ast (a field value is itself an Ast). Recurses over
+-- the VFieldList tail (a field of the packed input), so bound + breadcrumb.
+concept UndefVFieldsState
+  @intention: "A variant construct's field list + the rule's bindings (scope) + the source text"
+  @source: vexprparse.intent:32
+  fields:
+    fields : VFieldList
+    binds : Binding
+    src : text [..256]
+
+
+rule count_undef_vfields
+  @intention: "Total undefined-variable references across every field value of a variant construct"
+  @source: vexprparse.intent:32
+  input:
+    a : UndefVFieldsState
+  output:
+    out : number
+  logic:
+    out = match a.fields:
+      VFCons(name_start, name_len, val, rest) => count_undef_ast(UndefAstState { node: val, binds: a.binds, src: a.src }) + count_undef_vfields(UndefVFieldsState { fields: rest, binds: a.binds, src: a.src })
+      VFNil => 0
+  proofs:
+    purity:
+      reads : [a.fields, a.binds, a.src]
+      calls : [count_undef_ast, count_undef_vfields]
+    termination:
+      bound : 4000
+
+
+-- R6a: count_undef_arms — for each arm of a match, walk the arm BODY with the
+-- scope EXTENDED by that arm's binders (binds_with_binders), then recurse on the
+-- rest with the ORIGINAL scope (an arm's binders are in scope ONLY in its own
+-- body). This is the load-bearing scoping: `Cons(head, tail) => head + zzz` flags
+-- zzz but NOT head/tail. Mutually recursive with count_undef_ast. Recurses over
+-- the ArmList tail (a field of the packed input), so bound + breadcrumb.
+concept UndefArmsState
+  @intention: "A match arm list + the rule's bindings (enclosing scope) + the source text"
+  @source: vexprparse.intent:32
+  fields:
+    arms : ArmList
+    binds : Binding
+    src : text [..256]
+
+
+rule count_undef_arms
+  @intention: "Total undefined-variable references across every match arm body (arm binders in scope per arm)"
+  @source: vexprparse.intent:32
+  input:
+    a : UndefArmsState
+  output:
+    out : number
+  logic:
+    out = match a.arms:
+      ArmCons(vstart, vlen, binders, body, rest) => count_undef_ast(UndefAstState { node: body, binds: binds_with_binders(BindsWithBindersState { binds: a.binds, bs: binders }), src: a.src }) + count_undef_arms(UndefArmsState { arms: rest, binds: a.binds, src: a.src })
+      ArmNil => 0
+  proofs:
+    purity:
+      reads : [a.arms, a.binds, a.src]
+      calls : [count_undef_ast, count_undef_arms, binds_with_binders]
     termination:
       bound : 4000
 
@@ -8104,13 +8212,80 @@ rule count_badcall_ast
       AstBool(value) => 0
       AstStr(start, len) => 0
       AstErr => 0
-      -- R3 stub: real handling in R6/R7 (no value without the R6 environment).
-      AstVariant(cstart, clen, vstart, vlen, fields) => 0
-      AstMatch(scrut, arms) => 0
+      -- R6a: a variant construct names a TYPE, not a callee — only its field VALUE
+      -- expressions can contain calls, so walk them via count_badcall_vfields.
+      AstVariant(cstart, clen, vstart, vlen, fields) => count_badcall_vfields(BadCallVFieldsState { fields: fields, rules: a.rules, src: a.src })
+      -- R6a: a match has no callee of its own — walk the scrutinee then every arm
+      -- body. Arm binders don't affect callee resolution (callees are program-wide),
+      -- so count_badcall_arms just threads the same rules into each arm body.
+      AstMatch(scrut, arms) => count_badcall_ast(BadCallState { node: scrut, rules: a.rules, src: a.src }) + count_badcall_arms(BadCallArmsState { arms: arms, rules: a.rules, src: a.src })
   proofs:
     purity:
       reads : [a.node, a.rules, a.src]
-      calls : [count_badcall_ast, count_badcall_args, rule_named]
+      calls : [count_badcall_ast, count_badcall_args, rule_named, count_badcall_vfields, count_badcall_arms]
+    termination:
+      bound : 4000
+
+
+-- R6a: count_badcall_vfields — sum count_badcall_ast over every field value of a
+-- variant construct (a nested call in a field value is checked). Threads the same
+-- program RuleList (callee scope). Mutually recursive with count_badcall_ast.
+concept BadCallVFieldsState
+  @intention: "A variant construct's field list + the program rule list (callee scope) + the source text"
+  @source: vexprparse.intent:33
+  fields:
+    fields : VFieldList
+    rules : RuleList
+    src : text [..256]
+
+
+rule count_badcall_vfields
+  @intention: "Total undefined-callee references across every field value of a variant construct"
+  @source: vexprparse.intent:33
+  input:
+    a : BadCallVFieldsState
+  output:
+    out : number
+  logic:
+    out = match a.fields:
+      VFCons(name_start, name_len, val, rest) => count_badcall_ast(BadCallState { node: val, rules: a.rules, src: a.src }) + count_badcall_vfields(BadCallVFieldsState { fields: rest, rules: a.rules, src: a.src })
+      VFNil => 0
+  proofs:
+    purity:
+      reads : [a.fields, a.rules, a.src]
+      calls : [count_badcall_ast, count_badcall_vfields]
+    termination:
+      bound : 4000
+
+
+-- R6a: count_badcall_arms — sum count_badcall_ast over every match arm body. Arm
+-- binders are variable bindings, not callee names, so callee scope (the program
+-- RuleList) is threaded unchanged into each arm body. Mutually recursive with
+-- count_badcall_ast. Recurses over the ArmList tail (a field of the input).
+concept BadCallArmsState
+  @intention: "A match arm list + the program rule list (callee scope) + the source text"
+  @source: vexprparse.intent:33
+  fields:
+    arms : ArmList
+    rules : RuleList
+    src : text [..256]
+
+
+rule count_badcall_arms
+  @intention: "Total undefined-callee references across every match arm body"
+  @source: vexprparse.intent:33
+  input:
+    a : BadCallArmsState
+  output:
+    out : number
+  logic:
+    out = match a.arms:
+      ArmCons(vstart, vlen, binders, body, rest) => count_badcall_ast(BadCallState { node: body, rules: a.rules, src: a.src }) + count_badcall_arms(BadCallArmsState { arms: rest, rules: a.rules, src: a.src })
+      ArmNil => 0
+  proofs:
+    purity:
+      reads : [a.arms, a.rules, a.src]
+      calls : [count_badcall_ast, count_badcall_arms]
     termination:
       bound : 4000
 
@@ -8499,13 +8674,78 @@ rule count_badarity_ast
       AstBool(value) => 0
       AstStr(start, len) => 0
       AstErr => 0
-      -- R3 stub: real handling in R6/R7 (no value without the R6 environment).
-      AstVariant(cstart, clen, vstart, vlen, fields) => 0
-      AstMatch(scrut, arms) => 0
+      -- R6a: a variant construct is not a call — only its field VALUE expressions
+      -- can contain arity-checked calls, so walk them via count_badarity_vfields.
+      AstVariant(cstart, clen, vstart, vlen, fields) => count_badarity_vfields(BadArityVFieldsState { fields: fields, rules: a.rules, src: a.src })
+      -- R6a: a match has no call of its own — walk the scrutinee then every arm
+      -- body. Arm binders don't affect arity resolution (callees are program-wide).
+      AstMatch(scrut, arms) => count_badarity_ast(BadArityState { node: scrut, rules: a.rules, src: a.src }) + count_badarity_arms(BadArityArmsState { arms: arms, rules: a.rules, src: a.src })
   proofs:
     purity:
       reads : [a.node, a.rules, a.src]
-      calls : [count_badarity_ast, count_badarity_args, arity_mismatch]
+      calls : [count_badarity_ast, count_badarity_args, arity_mismatch, count_badarity_vfields, count_badarity_arms]
+    termination:
+      bound : 4000
+
+
+-- R6a: count_badarity_vfields — sum count_badarity_ast over every field value of a
+-- variant construct (a nested call's arity is checked). Threads the same program
+-- RuleList. Mutually recursive with count_badarity_ast. Mirrors count_badcall_vfields.
+concept BadArityVFieldsState
+  @intention: "A variant construct's field list + the program rule list (callee scope) + the source text"
+  @source: vexprparse.intent:35
+  fields:
+    fields : VFieldList
+    rules : RuleList
+    src : text [..256]
+
+
+rule count_badarity_vfields
+  @intention: "Total arity-mismatch references across every field value of a variant construct"
+  @source: vexprparse.intent:35
+  input:
+    a : BadArityVFieldsState
+  output:
+    out : number
+  logic:
+    out = match a.fields:
+      VFCons(name_start, name_len, val, rest) => count_badarity_ast(BadArityState { node: val, rules: a.rules, src: a.src }) + count_badarity_vfields(BadArityVFieldsState { fields: rest, rules: a.rules, src: a.src })
+      VFNil => 0
+  proofs:
+    purity:
+      reads : [a.fields, a.rules, a.src]
+      calls : [count_badarity_ast, count_badarity_vfields]
+    termination:
+      bound : 4000
+
+
+-- R6a: count_badarity_arms — sum count_badarity_ast over every match arm body. Arm
+-- binders don't affect arity resolution, so the program RuleList is threaded
+-- unchanged into each arm body. Mirrors count_badcall_arms.
+concept BadArityArmsState
+  @intention: "A match arm list + the program rule list (callee scope) + the source text"
+  @source: vexprparse.intent:35
+  fields:
+    arms : ArmList
+    rules : RuleList
+    src : text [..256]
+
+
+rule count_badarity_arms
+  @intention: "Total arity-mismatch references across every match arm body"
+  @source: vexprparse.intent:35
+  input:
+    a : BadArityArmsState
+  output:
+    out : number
+  logic:
+    out = match a.arms:
+      ArmCons(vstart, vlen, binders, body, rest) => count_badarity_ast(BadArityState { node: body, rules: a.rules, src: a.src }) + count_badarity_arms(BadArityArmsState { arms: rest, rules: a.rules, src: a.src })
+      ArmNil => 0
+  proofs:
+    purity:
+      reads : [a.arms, a.rules, a.src]
+      calls : [count_badarity_ast, count_badarity_arms]
     termination:
       bound : 4000
 
@@ -10380,9 +10620,12 @@ rule undef_span_ast
       AstBool(value) => Span::MkSpan { start: 9999, len: 0 }
       AstStr(start, len) => Span::MkSpan { start: 9999, len: 0 }
       AstErr => Span::MkSpan { start: 9999, len: 0 }
-      -- R3 stub: real handling in R6/R7. The "not located" sentinel span.
-      AstVariant(cstart, clen, vstart, vlen, fields) => Span::MkSpan { start: 9999, len: 0 }
-      AstMatch(scrut, arms) => Span::MkSpan { start: 9999, len: 0 }
+      -- R6a: locate the first undefined variable inside a variant construct's field
+      -- VALUES (the names are type references, not vars), scope unchanged.
+      AstVariant(cstart, clen, vstart, vlen, fields) => undef_span_vfields(UndefSpanVFieldsState { fields: fields, binds: a.binds, src: a.src })
+      -- R6a: scrutinee first, then each arm body with the scope EXTENDED by the
+      -- arm's binders (a binder is never "undefined" inside its own arm).
+      AstMatch(scrut, arms) => span_or(SpanOrState { a: undef_span_ast(UndefSpanAstState { node: scrut, binds: a.binds, src: a.src }), b: undef_span_arms(UndefSpanArmsState { arms: arms, binds: a.binds, src: a.src }) })
       AstVar(start, len) => if name_bound(NameBoundState { binds: a.binds, src: a.src, q_start: start, q_len: len }) == 0 then Span::MkSpan { start: start, len: len } else Span::MkSpan { start: 9999, len: 0 }
       AstBin(op, lhs, rhs) => span_or(SpanOrState { a: undef_span_ast(UndefSpanAstState { node: lhs, binds: a.binds, src: a.src }), b: undef_span_ast(UndefSpanAstState { node: rhs, binds: a.binds, src: a.src }) })
       AstNeg(inner) => undef_span_ast(UndefSpanAstState { node: inner, binds: a.binds, src: a.src })
@@ -10393,7 +10636,70 @@ rule undef_span_ast
   proofs:
     purity:
       reads : [a.node, a.binds, a.src]
-      calls : [name_bound, span_or, undef_span_ast, undef_span_args]
+      calls : [name_bound, span_or, undef_span_ast, undef_span_args, undef_span_vfields, undef_span_arms]
+    termination:
+      bound : 4000
+
+
+-- R6a: undef_span_vfields — the span of the first undefined variable across a
+-- variant construct's field VALUES (head field before tail, via span_or). Span
+-- mirror of count_undef_vfields. Mutually recursive with undef_span_ast.
+concept UndefSpanVFieldsState
+  @intention: "A variant construct's field list + the binding scope + the source text, for locating its first undefined variable"
+  @source: vexprparse.intent:43
+  fields:
+    fields : VFieldList
+    binds : Binding
+    src : text [..256]
+
+
+rule undef_span_vfields
+  @intention: "The span of the first undefined-variable reference across a variant construct's field values (sentinel if none)"
+  @source: vexprparse.intent:43
+  input:
+    a : UndefSpanVFieldsState
+  output:
+    out : Span
+  logic:
+    out = match a.fields:
+      VFCons(name_start, name_len, val, rest) => span_or(SpanOrState { a: undef_span_ast(UndefSpanAstState { node: val, binds: a.binds, src: a.src }), b: undef_span_vfields(UndefSpanVFieldsState { fields: rest, binds: a.binds, src: a.src }) })
+      VFNil => Span::MkSpan { start: 9999, len: 0 }
+  proofs:
+    purity:
+      reads : [a.fields, a.binds, a.src]
+      calls : [span_or, undef_span_ast, undef_span_vfields]
+    termination:
+      bound : 4000
+
+
+-- R6a: undef_span_arms — the span of the first undefined variable across a match's
+-- arm bodies (each scoped with its own binders via binds_with_binders; the first
+-- arm wins via span_or). Span mirror of count_undef_arms. The binder scoping is
+-- load-bearing: an arm binder is never reported as undefined inside its own body.
+concept UndefSpanArmsState
+  @intention: "A match arm list + the enclosing binding scope + the source text, for locating its first undefined variable"
+  @source: vexprparse.intent:43
+  fields:
+    arms : ArmList
+    binds : Binding
+    src : text [..256]
+
+
+rule undef_span_arms
+  @intention: "The span of the first undefined-variable reference across a match's arm bodies (arm binders in scope; sentinel if none)"
+  @source: vexprparse.intent:43
+  input:
+    a : UndefSpanArmsState
+  output:
+    out : Span
+  logic:
+    out = match a.arms:
+      ArmCons(vstart, vlen, binders, body, rest) => span_or(SpanOrState { a: undef_span_ast(UndefSpanAstState { node: body, binds: binds_with_binders(BindsWithBindersState { binds: a.binds, bs: binders }), src: a.src }), b: undef_span_arms(UndefSpanArmsState { arms: rest, binds: a.binds, src: a.src }) })
+      ArmNil => Span::MkSpan { start: 9999, len: 0 }
+  proofs:
+    purity:
+      reads : [a.arms, a.binds, a.src]
+      calls : [span_or, undef_span_ast, undef_span_arms, binds_with_binders]
     termination:
       bound : 4000
 
@@ -10640,9 +10946,11 @@ rule badcall_span_ast
       AstVar(start, len) => Span::MkSpan { start: 9999, len: 0 }
       AstStr(start, len) => Span::MkSpan { start: 9999, len: 0 }
       AstErr => Span::MkSpan { start: 9999, len: 0 }
-      -- R3 stub: real handling in R6/R7. The "not located" sentinel span.
-      AstVariant(cstart, clen, vstart, vlen, fields) => Span::MkSpan { start: 9999, len: 0 }
-      AstMatch(scrut, arms) => Span::MkSpan { start: 9999, len: 0 }
+      -- R6a: locate the first undefined callee inside a variant construct's field
+      -- VALUES (a variant names a type, not a callee).
+      AstVariant(cstart, clen, vstart, vlen, fields) => badcall_span_vfields(BadCallSpanVFieldsState { fields: fields, rules: a.rules, src: a.src })
+      -- R6a: scrutinee first, then arm bodies (binders don't affect callee scope).
+      AstMatch(scrut, arms) => span_or(SpanOrState { a: badcall_span_ast(BadCallSpanState { node: scrut, rules: a.rules, src: a.src }), b: badcall_span_arms(BadCallSpanArmsState { arms: arms, rules: a.rules, src: a.src }) })
       AstBin(op, lhs, rhs) => span_or(SpanOrState { a: badcall_span_ast(BadCallSpanState { node: lhs, rules: a.rules, src: a.src }), b: badcall_span_ast(BadCallSpanState { node: rhs, rules: a.rules, src: a.src }) })
       AstNeg(inner) => badcall_span_ast(BadCallSpanState { node: inner, rules: a.rules, src: a.src })
       AstNot(inner) => badcall_span_ast(BadCallSpanState { node: inner, rules: a.rules, src: a.src })
@@ -10652,7 +10960,67 @@ rule badcall_span_ast
   proofs:
     purity:
       reads : [a.node, a.rules, a.src]
-      calls : [rule_named, span_or, badcall_span_ast, badcall_span_args]
+      calls : [rule_named, span_or, badcall_span_ast, badcall_span_args, badcall_span_vfields, badcall_span_arms]
+    termination:
+      bound : 4000
+
+
+-- R6a: badcall_span_vfields — the span of the first undefined callee across a
+-- variant construct's field values. Span mirror of count_badcall_vfields.
+concept BadCallSpanVFieldsState
+  @intention: "A variant construct's field list + the program rule list (callee scope) + the source text, for locating its first undefined callee"
+  @source: vexprparse.intent:45
+  fields:
+    fields : VFieldList
+    rules : RuleList
+    src : text [..256]
+
+
+rule badcall_span_vfields
+  @intention: "The span of the first undefined callee across a variant construct's field values (sentinel if clean)"
+  @source: vexprparse.intent:45
+  input:
+    a : BadCallSpanVFieldsState
+  output:
+    out : Span
+  logic:
+    out = match a.fields:
+      VFCons(name_start, name_len, val, rest) => span_or(SpanOrState { a: badcall_span_ast(BadCallSpanState { node: val, rules: a.rules, src: a.src }), b: badcall_span_vfields(BadCallSpanVFieldsState { fields: rest, rules: a.rules, src: a.src }) })
+      VFNil => Span::MkSpan { start: 9999, len: 0 }
+  proofs:
+    purity:
+      reads : [a.fields, a.rules, a.src]
+      calls : [span_or, badcall_span_ast, badcall_span_vfields]
+    termination:
+      bound : 4000
+
+
+-- R6a: badcall_span_arms — the span of the first undefined callee across a match's
+-- arm bodies. Span mirror of count_badcall_arms (binders don't affect callee scope).
+concept BadCallSpanArmsState
+  @intention: "A match arm list + the program rule list (callee scope) + the source text, for locating its first undefined callee"
+  @source: vexprparse.intent:45
+  fields:
+    arms : ArmList
+    rules : RuleList
+    src : text [..256]
+
+
+rule badcall_span_arms
+  @intention: "The span of the first undefined callee across a match's arm bodies (sentinel if clean)"
+  @source: vexprparse.intent:45
+  input:
+    a : BadCallSpanArmsState
+  output:
+    out : Span
+  logic:
+    out = match a.arms:
+      ArmCons(vstart, vlen, binders, body, rest) => span_or(SpanOrState { a: badcall_span_ast(BadCallSpanState { node: body, rules: a.rules, src: a.src }), b: badcall_span_arms(BadCallSpanArmsState { arms: rest, rules: a.rules, src: a.src }) })
+      ArmNil => Span::MkSpan { start: 9999, len: 0 }
+  proofs:
+    purity:
+      reads : [a.arms, a.rules, a.src]
+      calls : [span_or, badcall_span_ast, badcall_span_arms]
     termination:
       bound : 4000
 
@@ -10838,9 +11206,11 @@ rule badarity_span_ast
       AstVar(start, len) => Span::MkSpan { start: 9999, len: 0 }
       AstStr(start, len) => Span::MkSpan { start: 9999, len: 0 }
       AstErr => Span::MkSpan { start: 9999, len: 0 }
-      -- R3 stub: real handling in R6/R7. The "not located" sentinel span.
-      AstVariant(cstart, clen, vstart, vlen, fields) => Span::MkSpan { start: 9999, len: 0 }
-      AstMatch(scrut, arms) => Span::MkSpan { start: 9999, len: 0 }
+      -- R6a: locate the first arity-mismatched call inside a variant construct's
+      -- field VALUES (a variant is not a call).
+      AstVariant(cstart, clen, vstart, vlen, fields) => badarity_span_vfields(BadAritySpanVFieldsState { fields: fields, rules: a.rules, src: a.src })
+      -- R6a: scrutinee first, then arm bodies (binders don't affect arity scope).
+      AstMatch(scrut, arms) => span_or(SpanOrState { a: badarity_span_ast(BadAritySpanState { node: scrut, rules: a.rules, src: a.src }), b: badarity_span_arms(BadAritySpanArmsState { arms: arms, rules: a.rules, src: a.src }) })
       AstBin(op, lhs, rhs) => span_or(SpanOrState { a: badarity_span_ast(BadAritySpanState { node: lhs, rules: a.rules, src: a.src }), b: badarity_span_ast(BadAritySpanState { node: rhs, rules: a.rules, src: a.src }) })
       AstNeg(inner) => badarity_span_ast(BadAritySpanState { node: inner, rules: a.rules, src: a.src })
       AstNot(inner) => badarity_span_ast(BadAritySpanState { node: inner, rules: a.rules, src: a.src })
@@ -10850,7 +11220,7 @@ rule badarity_span_ast
   proofs:
     purity:
       reads : [a.node, a.rules, a.src]
-      calls : [arity_mismatch, span_or, badarity_span_ast, badarity_span_args]
+      calls : [arity_mismatch, span_or, badarity_span_ast, badarity_span_args, badarity_span_vfields, badarity_span_arms]
     termination:
       bound : 4000
 
@@ -10875,6 +11245,67 @@ rule badarity_span_args
     purity:
       reads : [a.args, a.rules, a.src]
       calls : [span_or, badarity_span_ast, badarity_span_args]
+    termination:
+      bound : 4000
+
+
+-- R6a: badarity_span_vfields — the span of the first arity-mismatched call across a
+-- variant construct's field values. Span mirror of count_badarity_vfields.
+concept BadAritySpanVFieldsState
+  @intention: "A variant construct's field list + the program rule list (callee scope) + the source text, for locating its first arity-mismatched call"
+  @source: vexprparse.intent:46
+  fields:
+    fields : VFieldList
+    rules : RuleList
+    src : text [..256]
+
+
+rule badarity_span_vfields
+  @intention: "The span of the first arity-mismatched call across a variant construct's field values (sentinel if clean)"
+  @source: vexprparse.intent:46
+  input:
+    a : BadAritySpanVFieldsState
+  output:
+    out : Span
+  logic:
+    out = match a.fields:
+      VFCons(name_start, name_len, val, rest) => span_or(SpanOrState { a: badarity_span_ast(BadAritySpanState { node: val, rules: a.rules, src: a.src }), b: badarity_span_vfields(BadAritySpanVFieldsState { fields: rest, rules: a.rules, src: a.src }) })
+      VFNil => Span::MkSpan { start: 9999, len: 0 }
+  proofs:
+    purity:
+      reads : [a.fields, a.rules, a.src]
+      calls : [span_or, badarity_span_ast, badarity_span_vfields]
+    termination:
+      bound : 4000
+
+
+-- R6a: badarity_span_arms — the span of the first arity-mismatched call across a
+-- match's arm bodies. Span mirror of count_badarity_arms (binders don't affect
+-- arity scope).
+concept BadAritySpanArmsState
+  @intention: "A match arm list + the program rule list (callee scope) + the source text, for locating its first arity-mismatched call"
+  @source: vexprparse.intent:46
+  fields:
+    arms : ArmList
+    rules : RuleList
+    src : text [..256]
+
+
+rule badarity_span_arms
+  @intention: "The span of the first arity-mismatched call across a match's arm bodies (sentinel if clean)"
+  @source: vexprparse.intent:46
+  input:
+    a : BadAritySpanArmsState
+  output:
+    out : Span
+  logic:
+    out = match a.arms:
+      ArmCons(vstart, vlen, binders, body, rest) => span_or(SpanOrState { a: badarity_span_ast(BadAritySpanState { node: body, rules: a.rules, src: a.src }), b: badarity_span_arms(BadAritySpanArmsState { arms: rest, rules: a.rules, src: a.src }) })
+      ArmNil => Span::MkSpan { start: 9999, len: 0 }
+  proofs:
+    purity:
+      reads : [a.arms, a.rules, a.src]
+      calls : [span_or, badarity_span_ast, badarity_span_arms]
     termination:
       bound : 4000
 

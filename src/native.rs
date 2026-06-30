@@ -34333,4 +34333,74 @@ rule two
         handle.join().expect("full-file count_rules thread");
     }
 
+    /// Records-arc brick R6a: the self-hosted checker's undefined-variable lint
+    /// (`lint_program`) now RECURSES into `match` and variant-construct bodies and
+    /// SCOPES match-arm binders. Pre-R6a the `AstVariant`/`AstMatch` arms of
+    /// `count_undef_ast` were `=> 0` stubs, so a match/variant body linted 0 no
+    /// matter what it referenced. R6a replaces those stubs with real walks
+    /// (count_undef_vfields / count_undef_arms + binds_with_binders).
+    ///
+    /// Driver: `lint_program` (tokenize → parse_program → fold lint_rule), compiled
+    /// natively and run argv-style: argv[1] = program source, argv[2] = pos (0).
+    /// It returns the TOTAL undefined-variable count over the program.
+    /// Cases (each a single `rule f`):
+    ///   - `let x = 0  out = match x: Cons(h, t) => h + zzz  Nil => 0` → 1
+    ///       (only zzz; the scrutinee `x` is a let, and the arm binders h/t are
+    ///        bound WITHIN the arm by binds_with_binders, so neither is flagged)
+    ///   - `let x = 0  out = match x: Cons(h, t) => h  Nil => 0`       → 0
+    ///       (binder-only body — proves binders are scoped, not flagged)
+    ///   - `out = Token::Num { value: www }`                           → 1
+    ///       (the variant field VALUE www is an undefined var; the concept/variant
+    ///        names are type refs, not vars)
+    /// Each was 0 under the R3 stub regardless of content.
+    #[test]
+    fn records_r6a_lint_recurses_into_match_and_variant() {
+        let src = std::fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let bin = std::env::temp_dir().join("verbosec_test_r6a_lint_program");
+        compile_native(&program, "lint_program", bin.to_str().unwrap(), false, false)
+            .expect("lint_program must compile natively (R6a match/variant walk included)");
+
+        let run = |source: &str| -> i64 {
+            let r = std::process::Command::new(&bin)
+                .arg(source)
+                .arg("0")
+                .output()
+                .expect("spawn R6a lint_program driver");
+            assert!(
+                r.status.success(),
+                "lint_program must exit 0 for {:?}; got {:?}",
+                source, r.status
+            );
+            String::from_utf8_lossy(&r.stdout)
+                .trim()
+                .parse::<i64>()
+                .unwrap_or_else(|_| panic!("lint_program produced non-number for {:?}: {:?}", source, r.stdout))
+        };
+
+        // match arm with an undefined var (zzz); the arm binders h/t are NOT flagged.
+        assert_eq!(
+            run("rule f\n  logic:\n    let x = 0\n    out = match x: Cons(h, t) => h + zzz  Nil => 0"),
+            1,
+            "R6a: lint walks into the match arm and flags zzz; binders h/t are scoped in (was 0 under the R3 stub)"
+        );
+        // binder-only body: head is bound by the arm, so 0 undefined.
+        assert_eq!(
+            run("rule f\n  logic:\n    let x = 0\n    out = match x: Cons(h, t) => h  Nil => 0"),
+            0,
+            "R6a: a match arm binder (h) is in scope within its own arm body — not flagged undefined"
+        );
+        // variant construct field value referencing an undefined var.
+        assert_eq!(
+            run("rule f\n  logic:\n    out = Token::Num { value: www }"),
+            1,
+            "R6a: lint walks a variant construct's field VALUE and flags the undefined var www (was 0 under the R3 stub)"
+        );
+
+        let _ = std::fs::remove_file(&bin);
+    }
+
 }
