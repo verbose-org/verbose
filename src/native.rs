@@ -20981,6 +20981,112 @@ rule le64_neg
         let _ = fs::remove_file(em);
     }
 
+    /// R7a — THE SELF-HOSTED ARENA. `elf_program_src` now emits, for a program that
+    /// declares a variant (sum-type) concept, an mmap'd node arena in the ELF `_start`
+    /// trampoline (base in r15, count in r14) and REAL machine code for every
+    /// `Concept::Variant { ... }` construction: allocate a node at r15 + r14*entry_size,
+    /// write its tag, pop each field value into a payload slot, leave the node INDEX on
+    /// the stack (the variant's value), and bump r14. The R7a observable is the INDEX
+    /// the entry rule returns.
+    ///
+    /// We check, from CLEAN disk (emit ELF → chmod +x → run → read stdout):
+    ///   * `out = Lst::Nil`                              → prints 0 (first node).
+    ///   * `out = Lst::Cons { head: 42, tail: Lst::Nil }` → builds Nil (0) then Cons (1)
+    ///                                                       → prints 1 (the Cons index).
+    ///   * a variant construct inside an `if` branch      → prints 1, and would CRASH if
+    ///     code_size_node's AstVariant arm disagreed with x86_node (the jz rel32 depends
+    ///     on it) — the "compounding offsets" drift catcher.
+    ///   * a SCALAR program (`out = 2 + 3`)               → still prints 5, byte-identical
+    ///     path (no mmap prologue: the trampoline's first instruction is still the
+    ///     entry `call`, not `mov eax, 9`).
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn r7a_variant_construct_arena_index() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        let src = fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let elf = std::env::temp_dir().join("verbosec_test_r7a_elf_program_src");
+        compile_native(&program, "elf_program_src", elf.to_str().unwrap(), false, false)
+            .expect("elf_program_src must compile natively");
+
+        // The single-concept L group + a `main` rule whose body is the case under test.
+        let grp = "concept_group L [max_depth: 8, max_nodes: 64]\n  concept Lst\n    variants:\n      Cons of (head : number, tail : Lst)\n      Nil\nrule main\n  logic:\n    out = ";
+        // (program source, expected printed value, uses_variants?)
+        let cases: &[(String, i64, bool)] = &[
+            (format!("{}Lst::Nil", grp), 0, true),
+            (format!("{}Lst::Cons {{ head: 42, tail: Lst::Nil }}", grp), 1, true),
+            (format!("{}if 1 == 1 then Lst::Cons {{ head: 7, tail: Lst::Nil }} else Lst::Nil", grp), 1, true),
+            ("rule main\n  logic:\n    out = 2 + 3".to_string(), 5, false),
+        ];
+
+        for (i, (prog_src, expected, uses_var)) in cases.iter().enumerate() {
+            let mc = Command::new(&elf)
+                .args([prog_src.as_str(), "0"])
+                .output()
+                .expect("spawn elf_program_src");
+            assert!(
+                mc.status.success(),
+                "elf_program_src must exit 0 for {:?}; got {:?}",
+                prog_src, mc.status
+            );
+            let elf_bytes = mc.stdout;
+            assert_eq!(
+                &elf_bytes[0..4], &[0x7f, 0x45, 0x4c, 0x46],
+                "emitted file is not ELF for {:?}", prog_src
+            );
+            // Byte-identity guard: the 120 bytes of ELF+program headers are followed by
+            // the trampoline. A variant program gets the 61-byte mmap prologue first
+            // (mov eax, 9 = b8 09 00 00 00); a scalar program's trampoline still starts
+            // with the entry `call` (e8 60 00 00 00) — unchanged from pre-R7a.
+            if *uses_var {
+                assert_eq!(
+                    &elf_bytes[120..125], &[0xb8, 0x09, 0x00, 0x00, 0x00],
+                    "variant program {:?} must have the mmap arena prologue", prog_src
+                );
+            } else {
+                assert_eq!(
+                    &elf_bytes[120..125], &[0xe8, 0x60, 0x00, 0x00, 0x00],
+                    "scalar program {:?} must be byte-identical (no mmap prologue)", prog_src
+                );
+            }
+
+            let out_path = std::env::temp_dir()
+                .join(format!("verbosec_test_r7a_a_out_{}", i));
+            fs::write(&out_path, &elf_bytes).expect("write a.out");
+            let mut perms = fs::metadata(&out_path).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&out_path, perms).expect("chmod +x");
+
+            let child = Command::new(&out_path)
+                .output()
+                .expect("execute emitted ELF");
+            assert!(
+                child.status.success(),
+                "emitted ELF for {:?} did not exit 0; got {:?}",
+                prog_src, child.status
+            );
+            let child_out: i64 = String::from_utf8_lossy(&child.stdout)
+                .trim()
+                .parse()
+                .unwrap_or_else(|_| panic!("emitted ELF produced non-number for {:?}: {:?}", prog_src, child.stdout));
+            assert_eq!(
+                child_out, *expected,
+                "R7a ELF for {:?} printed {} (expected {})",
+                prog_src, child_out, expected
+            );
+
+            let _ = fs::remove_file(&out_path);
+        }
+
+        let _ = fs::remove_file(elf);
+    }
+
     /// Minimal mmap(PROT_READ|WRITE|EXEC, MAP_PRIVATE|ANON) via raw syscall —
     /// the project is zero-dependency, so we go straight to the kernel ABI
     /// instead of pulling in the `libc` crate. mmap is syscall 9 on x86-64.
