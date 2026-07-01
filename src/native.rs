@@ -21087,6 +21087,106 @@ rule le64_neg
         let _ = fs::remove_file(elf);
     }
 
+    /// R7b — THE SELF-HOSTED MATCH. `elf_program_src` now emits, for a program with a
+    /// `match` on a variant, REAL machine code for tag dispatch + payload binding: the
+    /// scrutinee leaves an arena INDEX (R7a); AstMatch pops it, computes
+    /// node_addr = r15 + index*entry_size, loads the 8-byte tag, chains cmp/je over the
+    /// arm tags (resolved from the ConceptList), and at the matched arm copies the
+    /// payload fields into the binders' rbp slots before running the arm body.
+    ///
+    /// The R7b observable is the number the matched arm returns. We check from CLEAN
+    /// disk (emit ELF → chmod +x → run → read stdout) AND cross-check the SAME program
+    /// against the R6c interpreter oracle (`--run eval_main`):
+    ///   * `match build(): Cons(h, t) => h  Nil => 0` with `build() = Cons(5, Nil)`
+    ///        → dispatches to the Cons arm, binds h from payload slot 0 → prints 5.
+    ///   * same match with `build() = Nil`             → dispatches to the Nil arm → 0.
+    ///   * a TWO-arm match whose Cons arm body itself contains a `call`
+    ///        (`Cons(h, t) => h + take100()`) → 105; the arm block's call rel32 depends
+    ///        on the match prefix + dispatch-chain sizes, so a code_size_node/x86_node
+    ///        disagreement would CRASH / misprint — the compounding-offset drift catcher.
+    ///   * a SCALAR program stays byte-identical (no frame widening without a match).
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn r7b_match_variant_dispatch_and_bind() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        let src = fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let elf = std::env::temp_dir().join("verbosec_test_r7b_elf_program_src");
+        compile_native(&program, "elf_program_src", elf.to_str().unwrap(), false, false)
+            .expect("elf_program_src must compile natively");
+        // The R6c interpreter, our oracle: the emitted ELF must print what --run does.
+        let em = std::env::temp_dir().join("verbosec_test_r7b_eval_main");
+        compile_native(&program, "eval_main", em.to_str().unwrap(), false, false)
+            .expect("eval_main must compile natively");
+
+        let oracle = |source: &str| -> i64 {
+            let r = Command::new(&em).arg(source).arg("0").output().expect("spawn eval_main");
+            assert!(r.status.success(), "eval_main must exit 0 for {:?}", source);
+            String::from_utf8_lossy(&r.stdout).trim().parse::<i64>()
+                .unwrap_or_else(|_| panic!("eval_main non-number for {:?}: {:?}", source, r.stdout))
+        };
+
+        let grp = "concept_group L [max_depth: 8, max_nodes: 64]\n  concept Lst\n    variants:\n      Cons of (head : number, tail : Lst)\n      Nil\n";
+        let cons = format!("{grp}rule main\n  logic:\n    out = match build(): Cons(h, t) => h  Nil => 0\nrule build()\n  logic:\n    out = Lst::Cons {{ head: 5, tail: Lst::Nil }}");
+        let nil = format!("{grp}rule main\n  logic:\n    out = match build(): Cons(h, t) => h  Nil => 0\nrule build()\n  logic:\n    out = Lst::Nil");
+        // TWO-arm match whose Cons arm body contains a call (offset drift catcher).
+        let after = format!("{grp}rule main\n  logic:\n    out = match build(): Cons(h, t) => h + take100()  Nil => 0\nrule build()\n  logic:\n    out = Lst::Cons {{ head: 5, tail: Lst::Nil }}\nrule take100()\n  logic:\n    out = 100");
+        let scalar = "rule main\n  logic:\n    out = 2 + 3".to_string();
+
+        // (program source, expected printed value, uses_variants?)
+        let cases: &[(String, i64, bool)] = &[
+            (cons, 5, true),
+            (nil, 0, true),
+            (after, 105, true),
+            (scalar, 5, false),
+        ];
+
+        for (i, (prog_src, expected, uses_var)) in cases.iter().enumerate() {
+            // Cross-check the interpreter oracle agrees with the expected value.
+            assert_eq!(
+                oracle(prog_src), *expected,
+                "R6c oracle disagreement for {:?}", prog_src
+            );
+
+            let mc = Command::new(&elf).args([prog_src.as_str(), "0"]).output()
+                .expect("spawn elf_program_src");
+            assert!(mc.status.success(), "elf_program_src must exit 0 for {:?}; got {:?}", prog_src, mc.status);
+            let elf_bytes = mc.stdout;
+            assert_eq!(&elf_bytes[0..4], &[0x7f, 0x45, 0x4c, 0x46], "emitted file is not ELF for {:?}", prog_src);
+            // Byte-identity guard: a scalar (match-free) program keeps the pre-R7 trampoline.
+            if *uses_var {
+                assert_eq!(&elf_bytes[120..125], &[0xb8, 0x09, 0x00, 0x00, 0x00],
+                    "variant program {:?} must have the mmap arena prologue", prog_src);
+            } else {
+                assert_eq!(&elf_bytes[120..125], &[0xe8, 0x60, 0x00, 0x00, 0x00],
+                    "scalar program {:?} must be byte-identical (no mmap prologue)", prog_src);
+            }
+
+            let out_path = std::env::temp_dir().join(format!("verbosec_test_r7b_a_out_{}", i));
+            fs::write(&out_path, &elf_bytes).expect("write a.out");
+            let mut perms = fs::metadata(&out_path).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&out_path, perms).expect("chmod +x");
+
+            let child = Command::new(&out_path).output().expect("execute emitted ELF");
+            assert!(child.status.success(), "emitted ELF for {:?} did not exit 0; got {:?}", prog_src, child.status);
+            let child_out: i64 = String::from_utf8_lossy(&child.stdout).trim().parse()
+                .unwrap_or_else(|_| panic!("emitted ELF produced non-number for {:?}: {:?}", prog_src, child.stdout));
+            assert_eq!(child_out, *expected, "R7b ELF for {:?} printed {} (expected {})", prog_src, child_out, expected);
+
+            let _ = fs::remove_file(&out_path);
+        }
+
+        let _ = fs::remove_file(elf);
+        let _ = fs::remove_file(em);
+    }
+
     /// Minimal mmap(PROT_READ|WRITE|EXEC, MAP_PRIVATE|ANON) via raw syscall —
     /// the project is zero-dependency, so we go straight to the kernel ABI
     /// instead of pulling in the `libc` crate. mmap is syscall 9 on x86-64.

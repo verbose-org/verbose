@@ -13810,6 +13810,417 @@ rule x86_vpops
       bound : 4000
 
 
+-- ============================================================================
+-- BRICK R7b — MatchVariant machine-code emit (tag dispatch + payload bind). The
+-- scrutinee leaves an arena INDEX on the stack (R7a). AstMatch pops it, computes
+-- node_addr = r15 + index*entry_size, loads the 8-byte tag, and chains cmp/je over
+-- the arm tags (resolved from the ConceptList via arm_tag_by_name). At the matched
+-- arm, the payload fields at [node_addr + 8 + 8*j] are copied into the arm binders'
+-- rbp LET slots; then the arm body runs with those binders in scope, then jmp end.
+-- Binders become LOCALS: they are APPENDED to the proc's binding list (after the
+-- real lets), so they resolve via let_index to slots BELOW the lets — the real lets
+-- keep their slots 0..nlets-1, binders take nlets.. . x86_proc / proc_size widen
+-- the frame's `sub rsp` by the TOTAL binder count of the rule body (safe over-reserve;
+-- the epilogue's `mov rsp, rbp` frees it). A match-free program is byte-identical.
+-- ============================================================================
+
+-- binder_list_len: the number of positional binders in a match arm's BinderList
+-- (cons-walk like arg_list_len). The payload arity the arm binds.
+rule binder_list_len
+  @intention: "Number of positional binders in a match arm's binder list"
+  @source: vexprparse.intent:64
+  input:
+    bl : BinderList
+  output:
+    out : number
+  logic:
+    out = match bl:
+      BindCons(start, len, rest) => 1 + binder_list_len(rest)
+      BindNil => 0
+  proofs:
+    purity:
+      reads : [bl]
+      calls : [binder_list_len]
+    termination:
+      bound : 512
+      structural : bl
+
+
+-- arm_list_len: the number of arms in a match's ArmList (cons-walk). N in the
+-- dispatch chain (N cmp/je pairs, 13 bytes each).
+rule arm_list_len
+  @intention: "Number of arms in a match's arm list"
+  @source: vexprparse.intent:64
+  input:
+    al : ArmList
+  output:
+    out : number
+  logic:
+    out = match al:
+      ArmCons(vstart, vlen, binders, body, rest) => 1 + arm_list_len(rest)
+      ArmNil => 0
+  proofs:
+    purity:
+      reads : [al]
+      calls : [arm_list_len]
+    termination:
+      bound : 512
+      structural : al
+
+
+-- mb_ast: the TOTAL number of match-arm binders anywhere inside an AST subtree
+-- (walking every arm of every match, plus recursing into scrutinees / bodies /
+-- args / variant fields). x86_proc / proc_size reserve nlets + this many slots for
+-- the frame — a safe over-reservation (the maximum simultaneously-live binders
+-- along any nesting path never exceeds the total). Mutually recursive with
+-- mb_args / mb_vfields / mb_arms (each sub-list carries Ast nodes).
+rule mb_ast
+  @intention: "Total number of match-arm binders anywhere inside an AST subtree"
+  @source: vexprparse.intent:64
+  input:
+    n : Ast
+  output:
+    out : number
+  logic:
+    out = match n:
+      AstNum(value) => 0
+      AstBin(op, lhs, rhs) => mb_ast(lhs) + mb_ast(rhs)
+      AstNeg(inner) => mb_ast(inner)
+      AstNot(inner) => mb_ast(inner)
+      AstVar(start, len) => 0
+      AstField(base, fstart, flen) => 0
+      AstCall(callee_start, callee_len, args) => mb_args(args)
+      AstStr(start, len) => 0
+      AstBool(value) => 0
+      AstIf(cond, thn, els) => mb_ast(cond) + mb_ast(thn) + mb_ast(els)
+      AstErr => 0
+      AstVariant(cstart, clen, vstart, vlen, fields) => mb_vfields(fields)
+      AstMatch(scrut, arms) => mb_ast(scrut) + mb_arms(arms)
+  proofs:
+    purity:
+      reads : [n]
+      calls : [mb_ast, mb_args, mb_vfields, mb_arms]
+    termination:
+      bound : 8000
+
+
+-- mb_args: total match binders across a call's argument list (sum of mb_ast).
+rule mb_args
+  @intention: "Total match-arm binders across a call's argument list"
+  @source: vexprparse.intent:64
+  input:
+    al : ArgList
+  output:
+    out : number
+  logic:
+    out = match al:
+      ArgCons(head, tail) => mb_ast(head) + mb_args(tail)
+      ArgNil => 0
+  proofs:
+    purity:
+      reads : [al]
+      calls : [mb_ast, mb_args]
+    termination:
+      bound : 8000
+
+
+-- mb_vfields: total match binders across a variant construction's field values.
+rule mb_vfields
+  @intention: "Total match-arm binders across a variant construction's field values"
+  @source: vexprparse.intent:64
+  input:
+    fl : VFieldList
+  output:
+    out : number
+  logic:
+    out = match fl:
+      VFCons(name_start, name_len, val, rest) => mb_ast(val) + mb_vfields(rest)
+      VFNil => 0
+  proofs:
+    purity:
+      reads : [fl]
+      calls : [mb_ast, mb_vfields]
+    termination:
+      bound : 8000
+
+
+-- mb_arms: total match binders across a match's arms = each arm's own binder count
+-- PLUS the binders inside its body, summed over all arms.
+rule mb_arms
+  @intention: "Total match-arm binders across a match's arms (this arm's binders + body binders)"
+  @source: vexprparse.intent:64
+  input:
+    al : ArmList
+  output:
+    out : number
+  logic:
+    out = match al:
+      ArmCons(vstart, vlen, binders, body, rest) => binder_list_len(binders) + mb_ast(body) + mb_arms(rest)
+      ArmNil => 0
+  proofs:
+    purity:
+      reads : [al]
+      calls : [binder_list_len, mb_ast, mb_arms]
+    termination:
+      bound : 8000
+
+
+-- mb_binds: total match binders across every let-binding's RHS value (a let value
+-- may itself contain a match). Added to mb_ast(result) to size a proc's frame.
+rule mb_binds
+  @intention: "Total match-arm binders across every let-binding's RHS value"
+  @source: vexprparse.intent:64
+  input:
+    b : Binding
+  output:
+    out : number
+  logic:
+    out = match b:
+      BCons(name_start, name_len, value, rest) => mb_ast(value) + mb_binds(rest)
+      BNil => 0
+  proofs:
+    purity:
+      reads : [b]
+      calls : [mb_ast, mb_binds]
+    termination:
+      bound : 8000
+
+
+-- AppendBindersState: a binding list + a match arm's binders, to APPEND the binders
+-- at the TAIL of the list. Unlike binds_with_binders (the checker's PREPEND, which
+-- is order-agnostic for name membership), codegen needs the binders AFTER the real
+-- lets so let_index gives the real lets indices 0..nlets-1 (their emitted slots) and
+-- the binders indices nlets.. (fresh slots reserved by the widened `sub rsp`).
+concept AppendBindersState
+  @intention: "A binding list + a match arm's binders, to append the binders at the tail"
+  @source: vexprparse.intent:64
+  fields:
+    lets : Binding
+    bs : BinderList
+
+
+-- lets_append_binders: walk `lets` to its end and append `bs` (each binder as a
+-- BCons with a dummy AstNum-0 value, reusing binds_with_binders to convert the
+-- BinderList tail). The result's name-resolution order is [real lets, then binders],
+-- so a binder resolves to slot nlets + its position (below the lets).
+rule lets_append_binders
+  @intention: "Append a match arm's binders at the tail of a binding list (binders get slots after the lets)"
+  @source: vexprparse.intent:64
+  input:
+    ab : AppendBindersState
+  output:
+    out : Binding
+  logic:
+    out = match ab.lets:
+      BCons(name_start, name_len, value, rest) => Binding::BCons { name_start: name_start, name_len: name_len, value: value, rest: lets_append_binders(AppendBindersState { lets: rest, bs: ab.bs }) }
+      BNil => binds_with_binders(BindsWithBindersState { binds: Binding::BNil, bs: ab.bs })
+  proofs:
+    purity:
+      reads : [ab.lets, ab.bs]
+      calls : [lets_append_binders, binds_with_binders]
+    termination:
+      bound : 4000
+
+
+-- ArmTagState: the ConceptList + source + an arm's variant-name span + the running
+-- concept index. arm_tag_by_name searches every concept for one declaring a variant
+-- with that name; the first hit yields cidx*256 + vidx. The interpreter recovers
+-- cidx from the scrutinee's tag at runtime (stag/256); at EMIT time we resolve the
+-- name against the ConceptList directly (arm variant names are unique per group).
+concept ArmTagState
+  @intention: "The concept list + source + an arm variant-name span + the running concept index, to resolve an arm's tag"
+  @source: vexprparse.intent:64
+  fields:
+    concepts : ConceptList
+    src : text [..256]
+    vstart : number [0, 4000000]
+    vlen : number [0, 4000000]
+    cidx : number
+
+
+-- arm_tag_by_name: the full identity tag (concept_index*256 + variant_index) of the
+-- variant whose name matches the arm's span, searching every concept in order. A
+-- variant found in the current concept's list (find_variant_index < 999999) yields
+-- the tag; otherwise recurse to the next concept with cidx+1. -1 if no concept
+-- declares the name (never reached for a checked program; the cmp would just never hit).
+rule arm_tag_by_name
+  @intention: "The identity tag of the variant matching an arm's name, searched across all concepts"
+  @source: vexprparse.intent:64
+  input:
+    at : ArmTagState
+  output:
+    out : number
+  logic:
+    out = match at.concepts:
+      CCons(head, tail) => if find_variant_index(FindVarIdxState { variants: cd_variants(head), src: at.src, q_start: at.vstart, q_len: at.vlen, idx: 0 }) < 999999 then at.cidx * 256 + find_variant_index(FindVarIdxState { variants: cd_variants(head), src: at.src, q_start: at.vstart, q_len: at.vlen, idx: 0 }) else arm_tag_by_name(ArmTagState { concepts: tail, src: at.src, vstart: at.vstart, vlen: at.vlen, cidx: at.cidx + 1 })
+      CNil => 0 - 1
+  proofs:
+    purity:
+      reads : [at.concepts, at.src, at.vstart, at.vlen, at.cidx]
+      calls : [find_variant_index, cd_variants, arm_tag_by_name]
+    termination:
+      bound : 4000
+
+
+-- ArmSizeState: a match arm list + the ByteGen context (src/params/lets/prog/concepts),
+-- to sum the arm BLOCK sizes. Each arm block = 14*nbinders (the binder loads) +
+-- code_size_node(body, lets-extended-with-binders) + 5 (the jmp end). code_size_arms
+-- is the total; the default block's jmp end skips over all of it, and each arm's jmp
+-- end skips over the arm blocks AFTER it (= code_size_arms of the rest).
+concept ArmSizeState
+  @intention: "A match arm list + the ByteGen context, to sum the arm block sizes (binder loads + body + jmp)"
+  @source: vexprparse.intent:64
+  fields:
+    arms : ArmList
+    src : text [..256]
+    params : ParamList
+    lets : Binding
+    prog : RuleList
+    concepts : ConceptList
+
+
+-- code_size_arms: total bytes of all arm blocks. Per arm: 14 bytes per binder (a
+-- mov-from-arena + mov-to-slot pair) + the body's code_size_node (sized with the
+-- binders appended to the scope so a binder's AstVar is a 6-byte load) + 5 (jmp end).
+rule code_size_arms
+  @intention: "Total byte count of all match arm blocks (binder loads + body + jmp end)"
+  @source: vexprparse.intent:64
+  input:
+    az : ArmSizeState
+  output:
+    out : number
+  logic:
+    out = match az.arms:
+      ArmCons(vstart, vlen, binders, body, rest) => 14 * binder_list_len(binders) + code_size_node(ByteGenState { node: body, src: az.src, off: 0, params: az.params, lets: lets_append_binders(AppendBindersState { lets: az.lets, bs: binders }), prog: az.prog, concepts: az.concepts }) + 5 + code_size_arms(ArmSizeState { arms: rest, src: az.src, params: az.params, lets: az.lets, prog: az.prog, concepts: az.concepts })
+      ArmNil => 0
+  proofs:
+    purity:
+      reads : [az.arms, az.src, az.params, az.lets, az.prog, az.concepts]
+      calls : [binder_list_len, code_size_node, lets_append_binders, code_size_arms]
+    termination:
+      bound : 8000
+
+
+-- DispatchState: the arm list + the ByteGen context + the running dispatch/arm
+-- accounting for the cmp/je chain. `rest_disp` = the dispatch bytes for the arms
+-- AFTER the head (13 each), `pre_arms` = the cumulative arm block bytes BEFORE the
+-- head. je rel32 for the head = rest_disp + 9 (the default block) + pre_arms (jump
+-- forward past the remaining chain, the default, and the earlier arm blocks to the
+-- head arm's block).
+concept DispatchState
+  @intention: "The match arm list + ByteGen context + remaining dispatch bytes + preceding arm block bytes, for the cmp/je chain"
+  @source: vexprparse.intent:64
+  fields:
+    arms : ArmList
+    src : text [..256]
+    params : ParamList
+    lets : Binding
+    prog : RuleList
+    concepts : ConceptList
+    rest_disp : number
+    pre_arms : number
+
+
+-- x86_dispatch: emit the tag-dispatch chain. Per arm: cmp rcx, arm_tag (48 81 f9 +
+-- le32 = 7) ; je arm_block (0f 84 + le32 = 6). rcx holds the scrutinee tag (loaded
+-- once by the AstMatch prefix). The je jumps forward to the arm's block; rel is
+-- computed self-relatively from rest_disp / pre_arms so it is independent of the
+-- match's absolute position.
+rule x86_dispatch
+  @intention: "Emit a match's tag-dispatch cmp/je chain (one cmp+je per arm, jumping to its block)"
+  @source: vexprparse.intent:64
+  input:
+    ds : DispatchState
+  output:
+    out : bytes
+  logic:
+    out = match ds.arms:
+      ArmCons(vstart, vlen, binders, body, rest) => concat(b"\x48\x81\xf9", le32(arm_tag_by_name(ArmTagState { concepts: ds.concepts, src: ds.src, vstart: vstart, vlen: vlen, cidx: 0 })), b"\x0f\x84", le32(ds.rest_disp + 9 + ds.pre_arms), x86_dispatch(DispatchState { arms: rest, src: ds.src, params: ds.params, lets: ds.lets, prog: ds.prog, concepts: ds.concepts, rest_disp: ds.rest_disp - 13, pre_arms: ds.pre_arms + 14 * binder_list_len(binders) + code_size_node(ByteGenState { node: body, src: ds.src, off: 0, params: ds.params, lets: lets_append_binders(AppendBindersState { lets: ds.lets, bs: binders }), prog: ds.prog, concepts: ds.concepts }) + 5 }))
+      ArmNil => b""
+  proofs:
+    purity:
+      reads : [ds.arms, ds.src, ds.params, ds.lets, ds.prog, ds.concepts, ds.rest_disp, ds.pre_arms]
+      calls : [arm_tag_by_name, x86_dispatch, binder_list_len, code_size_node, lets_append_binders]
+    termination:
+      bound : 8000
+
+
+-- BinderLoadState: a match arm's binders + the payload index j (0-based, for the
+-- arena offset 8+8*j) + the base slot (= binding length before the binders, so a
+-- binder's frame slot is base_slot + j). Emits the per-binder copy from the arena
+-- payload into the binder's rbp let slot.
+concept BinderLoadState
+  @intention: "A match arm's binders + payload index + base slot, to copy each payload field into its binder slot"
+  @source: vexprparse.intent:64
+  fields:
+    binders : BinderList
+    j : number
+    base_slot : number
+
+
+-- x86_binder_loads: for each positional binder, copy the arena payload field into
+-- the binder's frame slot. rax holds node_addr (the AstMatch prefix left it there).
+-- Per binder: mov rdx, [rax + 8 + 8*j] (48 8b 90 + le32 = 7) ; mov [rbp - 8*(slot+1)],
+-- rdx (48 89 95 + le32 = 7), slot = base_slot + j. 14 bytes per binder.
+rule x86_binder_loads
+  @intention: "Copy each match-arm payload field from the arena into its binder's frame slot"
+  @source: vexprparse.intent:64
+  input:
+    bl : BinderLoadState
+  output:
+    out : bytes
+  logic:
+    out = match bl.binders:
+      BindCons(start, len, rest) => concat(b"\x48\x8b\x90", le32(8 + 8 * bl.j), b"\x48\x89\x95", le32(0 - 8 * (bl.base_slot + bl.j + 1)), x86_binder_loads(BinderLoadState { binders: rest, j: bl.j + 1, base_slot: bl.base_slot }))
+      BindNil => b""
+  proofs:
+    purity:
+      reads : [bl.binders, bl.j, bl.base_slot]
+      calls : [x86_binder_loads]
+    termination:
+      bound : 4000
+
+
+-- ArmGenState: a match arm list + source + the absolute offset of the current arm
+-- block's start (for the arm body's nested-call rel32) + the ByteGen context. Emits
+-- each arm block: binder loads, the arm body (with binders in scope), then jmp end.
+concept ArmGenState
+  @intention: "A match arm list + source + the current arm block's absolute offset + ByteGen context, to emit the arm blocks"
+  @source: vexprparse.intent:64
+  fields:
+    arms : ArmList
+    src : text [..256]
+    off : number
+    params : ParamList
+    lets : Binding
+    prog : RuleList
+    concepts : ConceptList
+
+
+-- x86_arms: emit the arm blocks in order. Each block: the binder loads (base_slot =
+-- count_binds(ag.lets), so binders land in the slots reserved after the real lets),
+-- the arm body lowered with the binders APPENDED to the scope (so its AstVar loads
+-- resolve to those slots) and `off` threaded past the binder loads, then jmp end
+-- (rel = code_size_arms of the REMAINING arms = the arm blocks after this one).
+rule x86_arms
+  @intention: "Emit a match's arm blocks: per arm the binder loads, the body, and the jmp to the match end"
+  @source: vexprparse.intent:64
+  input:
+    ag : ArmGenState
+  output:
+    out : bytes
+  logic:
+    out = match ag.arms:
+      ArmCons(vstart, vlen, binders, body, rest) => concat(x86_binder_loads(BinderLoadState { binders: binders, j: 0, base_slot: count_binds(ag.lets) }), x86_node(ByteGenState { node: body, src: ag.src, off: ag.off + 14 * binder_list_len(binders), params: ag.params, lets: lets_append_binders(AppendBindersState { lets: ag.lets, bs: binders }), prog: ag.prog, concepts: ag.concepts }), b"\xe9", le32(code_size_arms(ArmSizeState { arms: rest, src: ag.src, params: ag.params, lets: ag.lets, prog: ag.prog, concepts: ag.concepts })), x86_arms(ArmGenState { arms: rest, src: ag.src, off: ag.off + 14 * binder_list_len(binders) + code_size_node(ByteGenState { node: body, src: ag.src, off: 0, params: ag.params, lets: lets_append_binders(AppendBindersState { lets: ag.lets, bs: binders }), prog: ag.prog, concepts: ag.concepts }) + 5, params: ag.params, lets: ag.lets, prog: ag.prog, concepts: ag.concepts }))
+      ArmNil => b""
+  proofs:
+    purity:
+      reads : [ag.arms, ag.src, ag.off, ag.params, ag.lets, ag.prog, ag.concepts]
+      calls : [x86_binder_loads, x86_node, code_size_node, code_size_arms, lets_append_binders, binder_list_len, count_binds, x86_arms]
+    termination:
+      bound : 8000
+
+
 -- code_size_node: the EXACT byte count x86_node(bg) emits for a subtree, the
 -- program-aware sibling of code_size_expr. Must match x86_node arm-for-arm so
 -- the `if` rel32 offsets and call rel32 offsets are correct. New arms vs b4a:
@@ -13840,12 +14251,14 @@ rule code_size_node
       -- a fixed 25-byte arena-write suffix (mov rax,r14 3 + imul 7 + add rax,r15 3 +
       -- mov qword[rax],tag 7 + push r14 2 + inc r14 3) + 8 bytes per field pop+store.
       AstVariant(cstart, clen, vstart, vlen, fields) => code_size_vfields(ByteGenVFields { fields: fields, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }) + 25 + 8 * vfield_len(fields)
-      -- R7b stub: match dispatch. 1 byte (int3 trap) placeholder for now.
-      AstMatch(scrut, arms) => 1
+      -- R7b: match = scrut code + 14 (pop rax ; imul rax,rax,E ; add rax,r15 ;
+      -- mov rcx,[rax]) + 13 per arm (cmp rcx,tag 7 + je 6) + 9 (default: xor rax,rax 3
+      -- + push rax 1 + jmp end 5) + code_size_arms (the arm blocks). Must match x86_node.
+      AstMatch(scrut, arms) => code_size_node(ByteGenState { node: scrut, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }) + 14 + 13 * arm_list_len(arms) + 9 + code_size_arms(ArmSizeState { arms: arms, src: bg.src, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts })
   proofs:
     purity:
       reads : [bg.node, bg.src, bg.off, bg.params, bg.lets, bg.prog, bg.concepts]
-      calls : [code_size_node, code_size_args, code_size_vfields, vfield_len]
+      calls : [code_size_node, code_size_args, code_size_vfields, vfield_len, arm_list_len, code_size_arms]
     termination:
       bound : 8000
 
@@ -13962,13 +14375,14 @@ rule proc_size
     let binds = block_binds(blk)
     let result = block_result(blk)
     let nlets = count_binds(binds)
-    let subsize = if nlets > 0 then 7 else 0
+    let nbind = mb_ast(result) + mb_binds(binds)
+    let subsize = if nlets + nbind > 0 then 7 else 0
     let storesize = code_size_let_stores(LetGenState { rem: binds, all_binds: binds, src: pg.src, off: 0, params: rd_params(pg.rd), idx: 0, prog: pg.prog, concepts: pg.concepts })
     out = 4 + subsize + storesize + code_size_node(ByteGenState { node: result, src: pg.src, off: 0, params: rd_params(pg.rd), lets: binds, prog: pg.prog, concepts: pg.concepts }) + 6
   proofs:
     purity:
       reads : [pg.rd, pg.src, pg.prog, pg.concepts]
-      calls : [rd_body, block_binds, block_result, count_binds, code_size_let_stores, code_size_node, rd_params]
+      calls : [rd_body, block_binds, block_result, count_binds, mb_ast, mb_binds, code_size_let_stores, code_size_node, rd_params]
     termination:
       bound : 8000
 
@@ -14036,12 +14450,17 @@ rule x86_node
       -- (push r14 = the variant value); inc r14 (bump the node count). entry_size and
       -- tag are self-computed from the ConceptList threaded through bg.concepts.
       AstVariant(cstart, clen, vstart, vlen, fields) => concat(x86_vfields(ByteGenVFields { fields: fields, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }), b"\x4c\x89\xf0\x48\x69\xc0", le32(8 * (max_payload_fields(bg.concepts) + 1)), b"\x4c\x01\xf8\x48\xc7\x00", le32(variant_tag(VariantTagState { concepts: bg.concepts, src: bg.src, cstart: cstart, clen: clen, vstart: vstart, vlen: vlen })), x86_vpops(VPopState { rem: fields, slot: vfield_len(fields) - 1 }), b"\x41\x56\x49\xff\xc6")
-      -- R7b stub: match dispatch. 0xCC (int3 trap) placeholder for now.
-      AstMatch(scrut, arms) => b"\xcc"
+      -- R7b: match dispatch. Emit scrut (pushes index); pop rax (58); node_addr =
+      -- r15 + index*entry_size (imul rax,rax,E 48 69 c0+le32 ; add rax,r15 4c 01 f8);
+      -- load tag mov rcx,[rax] (48 8b 08); the cmp/je dispatch chain (x86_dispatch);
+      -- the default block xor rax,rax (48 31 c0) ; push rax (50) ; jmp end (e9+le32,
+      -- skips all arm blocks); then the arm blocks (x86_arms). Each arm binds its
+      -- payload into the reserved binder slots, runs its body, and jmps to end.
+      AstMatch(scrut, arms) => concat(x86_node(ByteGenState { node: scrut, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }), b"\x58\x48\x69\xc0", le32(8 * (max_payload_fields(bg.concepts) + 1)), b"\x4c\x01\xf8\x48\x8b\x08", x86_dispatch(DispatchState { arms: arms, src: bg.src, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, rest_disp: 13 * (arm_list_len(arms) - 1), pre_arms: 0 }), b"\x48\x31\xc0\x50\xe9", le32(code_size_arms(ArmSizeState { arms: arms, src: bg.src, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts })), x86_arms(ArmGenState { arms: arms, src: bg.src, off: bg.off + code_size_node(ByteGenState { node: scrut, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }) + 14 + 13 * arm_list_len(arms) + 9, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }))
   proofs:
     purity:
       reads : [bg.node, bg.src, bg.off, bg.params, bg.lets, bg.prog, bg.concepts]
-      calls : [x86_node, code_size_node, x86_args, code_size_args, param_index, let_index, param_list_len, proc_offset, arg_list_len, x86_vfields, x86_vpops, vfield_len, max_payload_fields, variant_tag]
+      calls : [x86_node, code_size_node, x86_args, code_size_args, param_index, let_index, param_list_len, proc_offset, arg_list_len, x86_vfields, x86_vpops, vfield_len, max_payload_fields, variant_tag, x86_dispatch, x86_arms, code_size_arms, arm_list_len]
     termination:
       bound : 8000
 
@@ -14106,13 +14525,14 @@ rule x86_proc
     let binds = block_binds(blk)
     let result = block_result(blk)
     let nlets = count_binds(binds)
-    let subsize = if nlets > 0 then 7 else 0
+    let nbind = mb_ast(result) + mb_binds(binds)
+    let subsize = if nlets + nbind > 0 then 7 else 0
     let storesize = code_size_let_stores(LetGenState { rem: binds, all_binds: binds, src: pg.src, off: 0, params: rd_params(pg.rd), idx: 0, prog: pg.prog, concepts: pg.concepts })
-    out = concat(b"\x55\x48\x89\xe5", (if nlets > 0 then concat(b"\x48\x81\xec", le32(8 * nlets)) else b""), x86_let_stores(LetGenState { rem: binds, all_binds: binds, src: pg.src, off: pg.off + 4 + subsize, params: rd_params(pg.rd), idx: 0, prog: pg.prog, concepts: pg.concepts }), x86_node(ByteGenState { node: result, src: pg.src, off: pg.off + 4 + subsize + storesize, params: rd_params(pg.rd), lets: binds, prog: pg.prog, concepts: pg.concepts }), b"\x58\x48\x89\xec\x5d\xc3")
+    out = concat(b"\x55\x48\x89\xe5", (if nlets + nbind > 0 then concat(b"\x48\x81\xec", le32(8 * (nlets + nbind))) else b""), x86_let_stores(LetGenState { rem: binds, all_binds: binds, src: pg.src, off: pg.off + 4 + subsize, params: rd_params(pg.rd), idx: 0, prog: pg.prog, concepts: pg.concepts }), x86_node(ByteGenState { node: result, src: pg.src, off: pg.off + 4 + subsize + storesize, params: rd_params(pg.rd), lets: binds, prog: pg.prog, concepts: pg.concepts }), b"\x58\x48\x89\xec\x5d\xc3")
   proofs:
     purity:
       reads : [pg.rd, pg.src, pg.off, pg.prog, pg.concepts]
-      calls : [rd_body, block_binds, block_result, count_binds, code_size_let_stores, x86_let_stores, x86_node, rd_params]
+      calls : [rd_body, block_binds, block_result, count_binds, mb_ast, mb_binds, code_size_let_stores, x86_let_stores, x86_node, rd_params]
     termination:
       bound : 8000
 
