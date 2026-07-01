@@ -1475,3 +1475,20 @@ there (out of the arithmetic evaluator's scope).
     values — so a parsed match/variant body has a hand-derivable fingerprint distinct from the AstErr
     fingerprint (0). THE OBSERVABLE: the brick-5 `shape` driver on a body using both forms returns the
     predicted AstMatch + AstVariant fingerprint, proving the bodies now parse into real AST.
+
+R6c — the interpreter evaluates match/variant (runtime Value model).
+The evaluator was number-valued (eval_ast_env : number, and the whole call
+machinery: venv_lookup / build_env / bind_params / eval_call). To evaluate a
+match/variant program it must return a value that is a number OR a variant
+(a tag + a payload); a number cannot hold a variant. So the eval subsystem
+becomes Value-valued. Value = VNum(n) | VData(tag, payload); ValueList is the
+payload cons-list; VEnv is the interpreter's runtime environment (name span ->
+Value), kept separate from the R6b type checker's Env (which stores number type
+codes). A variant's identity tag is self-computed from the parsed ConceptList of
+the interpreted source: concept_index * 256 + variant_index (no global table).
+A match recovers concept_index = tag / 256 from the scrutinee's tag, resolves
+each arm's variant name to a tag, dispatches to the first equal arm, and binds
+the arm's binders positionally to the scrutinee's payload. eval_ast becomes a
+thin wrapper over eval_ast_env (unwrapping via vnum_of). Strings stay VNum 0
+(deferred). eval_main threads the ConceptList so a program with a concept_group
+and match/variant rules evaluates end to end (recursive list-sum -> the total).

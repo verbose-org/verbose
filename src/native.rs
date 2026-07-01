@@ -34507,4 +34507,78 @@ rule two
         let _ = std::fs::remove_file(&tc);
     }
 
+    /// Records-arc brick R6c: the self-hosted interpreter (examples/vexprparse.verbose)
+    /// now EVALUATES match/variant programs. The eval subsystem became Value-valued:
+    /// `eval_ast_env : Value` (VNum | VData{tag, payload}), and the whole call
+    /// machinery (venv_lookup / build_env / bind_params / eval_call) threads Values and
+    /// the parsed ConceptList. `eval_main` tokenizes a program (source via argv),
+    /// parses its rules AND concepts, and evaluates the first rule — dispatching a
+    /// `match` by comparing a runtime variant tag (concept_index * 256 + variant_index,
+    /// self-computed from the ConceptList) and binding an arm's binders positionally to
+    /// the scrutinee's payload.
+    ///
+    /// Three gates, all cross-checked against the hand value:
+    ///   1. NON-RECURSIVE match/variant: build `Cons(5, Nil)`, `match it: Cons(h,t)=>h
+    ///      Nil=>0` -> 5 (constructs a VData, dispatches, binds h, returns it).
+    ///   2. RECURSIVE list-sum: a recursive rule builds `Cons(3,Cons(2,Cons(1,Nil)))`
+    ///      via variant construction, a recursive match rule sums it -> 6 (Values flow
+    ///      through calls + recursion + payload binding).
+    ///   3. SCALAR no-regression: recursive factorial(5) -> 120, IDENTICAL to pre-R6c
+    ///      (the Value-of-number path is behavior-identical to the old number path).
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn records_r6c_interpreter_evaluates_match_variant() {
+        let src = std::fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let em = std::env::temp_dir().join("verbosec_test_r6c_eval_main");
+        compile_native(&program, "eval_main", em.to_str().unwrap(), false, false)
+            .expect("eval_main must compile natively (R6c Value-valued eval SCC)");
+
+        let run = |source: &str| -> i64 {
+            let r = std::process::Command::new(&em)
+                .arg(source)
+                .arg("0")
+                .output()
+                .expect("spawn eval_main");
+            assert!(
+                r.status.success(),
+                "eval_main must exit 0 for {:?}; got {:?}",
+                source, r.status
+            );
+            String::from_utf8_lossy(&r.stdout)
+                .trim()
+                .parse::<i64>()
+                .unwrap_or_else(|_| panic!("eval_main produced non-number for {:?}: {:?}", source, r.stdout))
+        };
+
+        // 1. NON-RECURSIVE match/variant -> 5. build() returns Lst::Cons{5, Nil}; main
+        //    matches it, binds h to the head payload (5), returns h.
+        let m = "concept_group L [max_depth: 8, max_nodes: 64]\n  concept Lst\n    variants:\n      Cons of (head : number, tail : Lst)\n      Nil\nrule main\n  logic:\n    out = match build(): Cons(h, t) => h  Nil => 0\nrule build()\n  logic:\n    out = Lst::Cons { head: 5, tail: Lst::Nil }";
+        assert_eq!(run(m), 5, "R6c: non-recursive match on Cons(5, Nil) binds h -> 5");
+
+        // 2. RECURSIVE list-sum -> 6. build(3) constructs Cons(3,Cons(2,Cons(1,Nil)))
+        //    across a recursive rule; lsum sums it via a recursive match. Values flow
+        //    through calls + recursion + positional payload binding.
+        let ls = "concept_group L [max_depth: 64, max_nodes: 4096]\n  concept Lst\n    variants:\n      Cons of (head : number, tail : Lst)\n      Nil\nrule main\n  logic:\n    out = lsum(build(3))\nrule build(n)\n  logic:\n    out = if n == 0 then Lst::Nil else Lst::Cons { head: n, tail: build(n - 1) }\nrule lsum(xs)\n  logic:\n    out = match xs: Cons(h, t) => h + lsum(t)  Nil => 0";
+        assert_eq!(run(ls), 6, "R6c: recursive list-sum of [3,2,1,0] -> 6");
+        // deeper: build(5) -> 5+4+3+2+1+0 = 15 (really recursive, not a fixed depth).
+        let ls5 = ls.replace("lsum(build(3))", "lsum(build(5))");
+        assert_eq!(run(&ls5), 15, "R6c: recursive list-sum of [5..0] -> 15");
+
+        // 3. SCALAR no-regression: recursive factorial(5) -> 120, IDENTICAL to pre-R6c.
+        let fact = "rule main\n  logic:\n    out = fact(5)\nrule fact(n)\n  logic:\n    out = if n == 0 then 1 else n * fact(n - 1)";
+        assert_eq!(run(fact), 120, "R6c: scalar recursion unchanged (Value-of-number is behavior-identical)");
+        // and a plain arithmetic / let program stays exact.
+        assert_eq!(
+            run("rule main\n  logic:\n    let d = 10 * 2\n    out = d + 1"),
+            21,
+            "R6c: scalar let-block unchanged"
+        );
+
+        let _ = std::fs::remove_file(&em);
+    }
+
 }

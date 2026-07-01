@@ -386,6 +386,50 @@ concept_group VExpr [max_depth: 4096, max_nodes: 2000000]
       ECons of (name_start : number, name_len : number, val : number, rest : Env)
       ENil
 
+  -- Records-arc brick R6c: the interpreter's runtime VALUE. Pre-R6c the evaluator
+  -- was number-valued (eval_ast_env : number, and the whole call machinery). To
+  -- EVALUATE a match/variant program the evaluator must return either a number OR a
+  -- variant value (a tag + a payload) — a number cannot hold a variant. Value is that
+  -- one return type across the mutually-recursive eval subsystem. VNum wraps a plain
+  -- number; VData carries a variant IDENTITY `tag` (concept_index * 256 +
+  -- variant_index, self-computed from the parsed ConceptList of the INTERPRETED source
+  -- — no global table) plus its evaluated field values as a ValueList. Strings are NOT
+  -- evaluated in this number interpreter (deferred, R7): an AstStr evaluates to VNum 0,
+  -- the same placeholder brick 7's eval_ast used. Lives in this group (the native
+  -- one-group cap requires ONE concept_group per program, and VExpr's [max_depth: 4096,
+  -- max_nodes: 2000000] bounds give the runtime Value arena the generous, mmap-backed
+  -- headroom a recursive list-sum needs).
+  concept Value
+    @intention: "A runtime interpreter value: a number, or a variant (identity tag + evaluated payload)"
+    @source: vexprparse.intent:36
+    variants:
+      VNum of (n : number)
+      VData of (tag : number, payload : ValueList)
+
+  -- Records-arc brick R6c: a cons-list of runtime Values — a variant construction's
+  -- evaluated field values in source order, and the carrier a match reads positionally
+  -- when binding an arm's binders. Same cons family as ArgList (ArgCons/ArgNil).
+  concept ValueList
+    @intention: "Cons-list of runtime interpreter values (a variant's evaluated payload)"
+    @source: vexprparse.intent:36
+    variants:
+      VLCons of (head : Value, tail : ValueList)
+      VLNil
+
+  -- Records-arc brick R6c: the interpreter's runtime ENVIRONMENT — a name span mapped
+  -- to its already-computed Value. DISTINCT from `Env` (which the R6b type checker
+  -- reuses, storing a NUMBER type-code in its `val` slot): a field has one declared
+  -- type, and the type checker's number-codes and the interpreter's runtime Values
+  -- cannot share it — so R6c gives the interpreter its own VEnv rather than touching
+  -- the R6b type checker. Same innermost-first cons shape as Env (VECons on the front,
+  -- VENil empty); venv_lookup walks front-to-back so the most recent binding wins.
+  concept VEnv
+    @intention: "Interpreter runtime environment: name span -> already-computed Value, innermost first"
+    @source: vexprparse.intent:36
+    variants:
+      VECons of (name_start : number, name_len : number, val : Value, rest : VEnv)
+      VENil
+
   -- Brick 11: a parsed top-level RULE declaration. `name_start` / `name_len` are
   -- the rule NAME's source span (the same identity model as a Binding name or an
   -- AstVar — brick 11 does not decode the name to bytes; it is proven by the span
@@ -3002,49 +3046,21 @@ rule eval_ast
   output:
     out : number
   logic:
-    out = match e:
-      AstNum(value) => value
-      AstBin(op, lhs, rhs) => if op == 13 then eval_ast(lhs) + eval_ast(rhs) else if op == 14 then eval_ast(lhs) - eval_ast(rhs) else if op == 15 then eval_ast(lhs) * eval_ast(rhs) else if op == 16 then eval_ast(lhs) / eval_ast(rhs) else if op == 17 then eval_ast(lhs) % eval_ast(rhs) else if op == 1 then (if eval_ast(lhs) == eval_ast(rhs) then 1 else 0) else if op == 6 then (if eval_ast(lhs) != eval_ast(rhs) then 1 else 0) else if op == 19 then (if eval_ast(lhs) < eval_ast(rhs) then 1 else 0) else if op == 20 then (if eval_ast(lhs) > eval_ast(rhs) then 1 else 0) else if op == 5 then (if eval_ast(lhs) <= eval_ast(rhs) then 1 else 0) else if op == 4 then (if eval_ast(lhs) >= eval_ast(rhs) then 1 else 0) else if op == 30 then (if eval_ast(lhs) != 0 and eval_ast(rhs) != 0 then 1 else 0) else if op == 31 then (if eval_ast(lhs) != 0 or eval_ast(rhs) != 0 then 1 else 0) else 0
-      AstNeg(inner) => 0 - eval_ast(inner)
-      AstNot(inner) => if eval_ast(inner) == 0 then 1 else 0
-      -- Brick 5's variable / field / call nodes have NO numeric value without an
-      -- environment to resolve names; they are out of the arithmetic evaluator's
-      -- scope and evaluate to 0. (Brick 5's correctness is proven by `shape`, the
-      -- STRUCTURAL signature walk below — not by eval_ast.) eval_ast stays the
-      -- brick-3/4 evaluator for variable-free expressions: 2+3*4 = 14 still.
-      AstVar(start, len) => 0
-      AstField(base, fstart, flen) => 0
-      AstCall(callee_start, callee_len, args) => 0
-      -- The language's lazy if: cond is evaluated, then ONLY the selected
-      -- branch's eval_ast runs — the dead branch is never walked. Truthiness is
-      -- "non-zero is true" (matching AstNot / and / or above).
-      AstIf(cond, thn, els) => if eval_ast(cond) != 0 then eval_ast(thn) else eval_ast(els)
-      -- A boolean literal carries its arithmetic value directly (true -> 1,
-      -- false -> 0), so it participates in and / or / not / comparisons as a 1/0
-      -- number would. (Brick 7.)
-      AstBool(value) => value
-      -- A string literal has no arithmetic value without an environment to decode
-      -- its bytes; like AstVar / AstCall / AstField it is out of the arithmetic
-      -- evaluator's scope and evaluates to 0. Its correctness is proven
-      -- STRUCTURALLY by shape_ast. (Brick 7.)
-      AstStr(start, len) => 0
-      AstErr => 0
-      -- R3 stub: real handling in R6/R7. A variant construction has no arithmetic
-      -- value without an environment (it is a typed value, not a number) — like
-      -- AstVar / AstCall it evaluates to 0; its correctness is proven structurally
-      -- by shape_ast. Field values are not walked here (no number to extract).
-      AstVariant(cstart, clen, vstart, vlen, fields) => 0
-      -- R3 stub: real handling in R6/R7. A match has no arithmetic value here (the
-      -- scrutinee is a typed value and arm dispatch needs the R6 evaluator); it
-      -- evaluates to 0, proven structurally by shape_ast.
-      AstMatch(scrut, arms) => 0
+    -- R6c: eval_ast is now a THIN WRAPPER over eval_ast_env (the Value-valued
+    -- evaluator), unwrapping the result via vnum_of. It no longer duplicates the
+    -- arithmetic arm set. The empty env (VENil), empty program (RNil) and empty
+    -- concept list (CNil) make it byte-identical to the pre-R6c arithmetic evaluator
+    -- for variable-free / call-free expressions (an AstVar / AstCall / AstStr / a
+    -- variant / a match all resolve to VNum 0 with no env / program / concepts, then
+    -- vnum_of extracts 0 — exactly the old stub values). src is "" because eval_ast
+    -- carries no source text (its env is empty, so name_eq is never reached).
+    out = vnum_of(eval_ast_env(EvalEnvArg { node: e, env: VEnv::VENil, src: "", prog: RuleList::RNil, concepts: ConceptList::CNil }))
   proofs:
     purity:
       reads : [e]
-      calls : [eval_ast]
+      calls : [vnum_of, eval_ast_env]
     termination:
       bound : 4000
-      structural : e
 
 
 -- ============================================================================
@@ -4331,13 +4347,14 @@ rule env_lookup
 -- variable references against, and the source text the spans index into. Carries
 -- a group field (node : Ast) AND a text field (src) — the 2b052a7 shape.
 concept EvalEnvArg
-  @intention: "An Ast node + the environment + the source text + the program, for evaluating with name resolution and calls"
+  @intention: "An Ast node + the environment + the source text + the program + the concept list, for evaluating with name resolution, calls, and variant tagging"
   @source: vexprparse.intent:36
   fields:
     node : Ast
-    env : Env
+    env : VEnv
     src : text [..256]
     prog : RuleList
+    concepts : ConceptList
 
 
 -- eval_ast_env: eval_ast EXTENDED with an environment. Identical to eval_ast for
@@ -4357,27 +4374,32 @@ rule eval_ast_env
   input:
     ea : EvalEnvArg
   output:
-    out : number
+    out : Value
   logic:
     out = match ea.node:
-      AstNum(value) => value
-      AstBin(op, lhs, rhs) => if op == 13 then eval_ast_env(EvalEnvArg { node: lhs, env: ea.env, src: ea.src, prog: ea.prog }) + eval_ast_env(EvalEnvArg { node: rhs, env: ea.env, src: ea.src, prog: ea.prog }) else if op == 14 then eval_ast_env(EvalEnvArg { node: lhs, env: ea.env, src: ea.src, prog: ea.prog }) - eval_ast_env(EvalEnvArg { node: rhs, env: ea.env, src: ea.src, prog: ea.prog }) else if op == 15 then eval_ast_env(EvalEnvArg { node: lhs, env: ea.env, src: ea.src, prog: ea.prog }) * eval_ast_env(EvalEnvArg { node: rhs, env: ea.env, src: ea.src, prog: ea.prog }) else if op == 16 then eval_ast_env(EvalEnvArg { node: lhs, env: ea.env, src: ea.src, prog: ea.prog }) / eval_ast_env(EvalEnvArg { node: rhs, env: ea.env, src: ea.src, prog: ea.prog }) else if op == 17 then eval_ast_env(EvalEnvArg { node: lhs, env: ea.env, src: ea.src, prog: ea.prog }) % eval_ast_env(EvalEnvArg { node: rhs, env: ea.env, src: ea.src, prog: ea.prog }) else if op == 1 then (if eval_ast_env(EvalEnvArg { node: lhs, env: ea.env, src: ea.src, prog: ea.prog }) == eval_ast_env(EvalEnvArg { node: rhs, env: ea.env, src: ea.src, prog: ea.prog }) then 1 else 0) else if op == 6 then (if eval_ast_env(EvalEnvArg { node: lhs, env: ea.env, src: ea.src, prog: ea.prog }) != eval_ast_env(EvalEnvArg { node: rhs, env: ea.env, src: ea.src, prog: ea.prog }) then 1 else 0) else if op == 19 then (if eval_ast_env(EvalEnvArg { node: lhs, env: ea.env, src: ea.src, prog: ea.prog }) < eval_ast_env(EvalEnvArg { node: rhs, env: ea.env, src: ea.src, prog: ea.prog }) then 1 else 0) else if op == 20 then (if eval_ast_env(EvalEnvArg { node: lhs, env: ea.env, src: ea.src, prog: ea.prog }) > eval_ast_env(EvalEnvArg { node: rhs, env: ea.env, src: ea.src, prog: ea.prog }) then 1 else 0) else if op == 5 then (if eval_ast_env(EvalEnvArg { node: lhs, env: ea.env, src: ea.src, prog: ea.prog }) <= eval_ast_env(EvalEnvArg { node: rhs, env: ea.env, src: ea.src, prog: ea.prog }) then 1 else 0) else if op == 4 then (if eval_ast_env(EvalEnvArg { node: lhs, env: ea.env, src: ea.src, prog: ea.prog }) >= eval_ast_env(EvalEnvArg { node: rhs, env: ea.env, src: ea.src, prog: ea.prog }) then 1 else 0) else if op == 30 then (if eval_ast_env(EvalEnvArg { node: lhs, env: ea.env, src: ea.src, prog: ea.prog }) != 0 and eval_ast_env(EvalEnvArg { node: rhs, env: ea.env, src: ea.src, prog: ea.prog }) != 0 then 1 else 0) else if op == 31 then (if eval_ast_env(EvalEnvArg { node: lhs, env: ea.env, src: ea.src, prog: ea.prog }) != 0 or eval_ast_env(EvalEnvArg { node: rhs, env: ea.env, src: ea.src, prog: ea.prog }) != 0 then 1 else 0) else 0
-      AstNeg(inner) => 0 - eval_ast_env(EvalEnvArg { node: inner, env: ea.env, src: ea.src, prog: ea.prog })
-      AstNot(inner) => if eval_ast_env(EvalEnvArg { node: inner, env: ea.env, src: ea.src, prog: ea.prog }) == 0 then 1 else 0
-      AstVar(start, len) => env_lookup(EnvLookState { env: ea.env, src: ea.src, q_start: start, q_len: len })
-      AstField(base, fstart, flen) => 0
-      AstCall(callee_start, callee_len, args) => eval_call(EvalCallState { callee_start: callee_start, callee_len: callee_len, args: args, env: ea.env, src: ea.src, prog: ea.prog })
-      AstIf(cond, thn, els) => if eval_ast_env(EvalEnvArg { node: cond, env: ea.env, src: ea.src, prog: ea.prog }) != 0 then eval_ast_env(EvalEnvArg { node: thn, env: ea.env, src: ea.src, prog: ea.prog }) else eval_ast_env(EvalEnvArg { node: els, env: ea.env, src: ea.src, prog: ea.prog })
-      AstBool(value) => value
-      AstStr(start, len) => 0
-      AstErr => 0
-      -- R3 stub: real handling in R6/R7 (no value without the R6 environment).
-      AstVariant(cstart, clen, vstart, vlen, fields) => 0
-      AstMatch(scrut, arms) => 0
+      AstNum(value) => Value::VNum { n: value }
+      AstBin(op, lhs, rhs) => Value::VNum { n: if op == 13 then vnum_of(eval_ast_env(EvalEnvArg { node: lhs, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts })) + vnum_of(eval_ast_env(EvalEnvArg { node: rhs, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts })) else if op == 14 then vnum_of(eval_ast_env(EvalEnvArg { node: lhs, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts })) - vnum_of(eval_ast_env(EvalEnvArg { node: rhs, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts })) else if op == 15 then vnum_of(eval_ast_env(EvalEnvArg { node: lhs, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts })) * vnum_of(eval_ast_env(EvalEnvArg { node: rhs, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts })) else if op == 16 then vnum_of(eval_ast_env(EvalEnvArg { node: lhs, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts })) / vnum_of(eval_ast_env(EvalEnvArg { node: rhs, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts })) else if op == 17 then vnum_of(eval_ast_env(EvalEnvArg { node: lhs, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts })) % vnum_of(eval_ast_env(EvalEnvArg { node: rhs, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts })) else if op == 1 then (if vnum_of(eval_ast_env(EvalEnvArg { node: lhs, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts })) == vnum_of(eval_ast_env(EvalEnvArg { node: rhs, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts })) then 1 else 0) else if op == 6 then (if vnum_of(eval_ast_env(EvalEnvArg { node: lhs, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts })) != vnum_of(eval_ast_env(EvalEnvArg { node: rhs, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts })) then 1 else 0) else if op == 19 then (if vnum_of(eval_ast_env(EvalEnvArg { node: lhs, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts })) < vnum_of(eval_ast_env(EvalEnvArg { node: rhs, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts })) then 1 else 0) else if op == 20 then (if vnum_of(eval_ast_env(EvalEnvArg { node: lhs, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts })) > vnum_of(eval_ast_env(EvalEnvArg { node: rhs, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts })) then 1 else 0) else if op == 5 then (if vnum_of(eval_ast_env(EvalEnvArg { node: lhs, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts })) <= vnum_of(eval_ast_env(EvalEnvArg { node: rhs, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts })) then 1 else 0) else if op == 4 then (if vnum_of(eval_ast_env(EvalEnvArg { node: lhs, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts })) >= vnum_of(eval_ast_env(EvalEnvArg { node: rhs, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts })) then 1 else 0) else if op == 30 then (if vnum_of(eval_ast_env(EvalEnvArg { node: lhs, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts })) != 0 and vnum_of(eval_ast_env(EvalEnvArg { node: rhs, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts })) != 0 then 1 else 0) else if op == 31 then (if vnum_of(eval_ast_env(EvalEnvArg { node: lhs, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts })) != 0 or vnum_of(eval_ast_env(EvalEnvArg { node: rhs, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts })) != 0 then 1 else 0) else 0 }
+      AstNeg(inner) => Value::VNum { n: 0 - vnum_of(eval_ast_env(EvalEnvArg { node: inner, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts })) }
+      AstNot(inner) => Value::VNum { n: if vnum_of(eval_ast_env(EvalEnvArg { node: inner, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts })) == 0 then 1 else 0 }
+      AstVar(start, len) => venv_lookup(VEnvLookState { env: ea.env, src: ea.src, q_start: start, q_len: len })
+      AstField(base, fstart, flen) => Value::VNum { n: 0 }
+      AstCall(callee_start, callee_len, args) => eval_call(EvalCallState { callee_start: callee_start, callee_len: callee_len, args: args, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts })
+      AstIf(cond, thn, els) => if vnum_of(eval_ast_env(EvalEnvArg { node: cond, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts })) != 0 then eval_ast_env(EvalEnvArg { node: thn, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts }) else eval_ast_env(EvalEnvArg { node: els, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts })
+      AstBool(value) => Value::VNum { n: value }
+      AstStr(start, len) => Value::VNum { n: 0 }
+      AstErr => Value::VNum { n: 0 }
+      -- R6c: construct a runtime variant value. `tag` is the variant's identity
+      -- (variant_tag resolves the concept/variant name spans against the ConceptList);
+      -- `payload` is the cons-list of evaluated field values (eval_vfields).
+      AstVariant(cstart, clen, vstart, vlen, fields) => Value::VData { tag: variant_tag(VariantTagState { concepts: ea.concepts, src: ea.src, cstart: cstart, clen: clen, vstart: vstart, vlen: vlen }), payload: eval_vfields(EvalVFieldsState { fields: fields, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts }) }
+      -- R6c: evaluate the scrutinee to a Value, then dispatch to the arm whose variant
+      -- tag equals the scrutinee's, binding the arm's binders positionally to the
+      -- scrutinee's payload (eval_match).
+      AstMatch(scrut, arms) => eval_match(EvalMatchState { scrutval: eval_ast_env(EvalEnvArg { node: scrut, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts }), arms: arms, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts })
   proofs:
     purity:
-      reads : [ea.node, ea.env, ea.src, ea.prog]
-      calls : [eval_ast_env, env_lookup, eval_call]
+      reads : [ea.node, ea.env, ea.src, ea.prog, ea.concepts]
+      calls : [eval_ast_env, venv_lookup, eval_call, vnum_of, variant_tag, eval_vfields, eval_match]
     termination:
       bound : 4000
 
@@ -4386,13 +4408,14 @@ rule eval_ast_env
 -- source text (each binding's RHS is evaluated against env_so_far, and AstVar
 -- references in it resolve via src).
 concept BuildEnvArg
-  @intention: "Remaining bindings + the env built so far + the source text + the program (for calls in RHSes)"
+  @intention: "Remaining bindings + the env built so far + the source text + the program + the concept list (for calls / variants in RHSes)"
   @source: vexprparse.intent:36
   fields:
     binds : Binding
-    env : Env
+    env : VEnv
     src : text [..256]
     prog : RuleList
+    concepts : ConceptList
 
 
 -- ============================================================================
@@ -4425,15 +4448,16 @@ concept BuildEnvArg
 -- whole program (the scope the callee name is resolved against, and threaded so
 -- the callee body can itself call other rules).
 concept EvalCallState
-  @intention: "A callee name span + the call's args + the caller env + the source text + the program"
+  @intention: "A callee name span + the call's args + the caller env + the source text + the program + the concept list"
   @source: vexprparse.intent:36
   fields:
     callee_start : number [0, 4000000]
     callee_len : number [0, 4000000]
     args : ArgList
-    env : Env
+    env : VEnv
     src : text [..256]
     prog : RuleList
+    concepts : ConceptList
 
 
 -- The parameter-binding probe: the callee's remaining formal parameter list, the
@@ -4441,14 +4465,15 @@ concept EvalCallState
 -- CALLER's environment (each arg expression is evaluated against it), the source
 -- text, and the program (threaded because an argument can itself be a call).
 concept BindParamsState
-  @intention: "Callee params + call args + the caller env + the source text + the program"
+  @intention: "Callee params + call args + the caller env + the source text + the program + the concept list"
   @source: vexprparse.intent:36
   fields:
     params : ParamList
     args : ArgList
-    env : Env
+    env : VEnv
     src : text [..256]
     prog : RuleList
+    concepts : ConceptList
 
 
 -- The rule-lookup probe: the program's rule list to search, the source text (for
@@ -4512,14 +4537,14 @@ rule build_env
   input:
     ba : BuildEnvArg
   output:
-    out : Env
+    out : VEnv
   logic:
     out = match ba.binds:
-      BCons(name_start, name_len, value, rest) => build_env(BuildEnvArg { binds: rest, env: Env::ECons { name_start: name_start, name_len: name_len, val: eval_ast_env(EvalEnvArg { node: value, env: ba.env, src: ba.src, prog: ba.prog }), rest: ba.env }, src: ba.src, prog: ba.prog })
+      BCons(name_start, name_len, value, rest) => build_env(BuildEnvArg { binds: rest, env: VEnv::VECons { name_start: name_start, name_len: name_len, val: eval_ast_env(EvalEnvArg { node: value, env: ba.env, src: ba.src, prog: ba.prog, concepts: ba.concepts }), rest: ba.env }, src: ba.src, prog: ba.prog, concepts: ba.concepts })
       BNil => ba.env
   proofs:
     purity:
-      reads : [ba.binds, ba.env, ba.src, ba.prog]
+      reads : [ba.binds, ba.env, ba.src, ba.prog, ba.concepts]
       calls : [build_env, eval_ast_env]
     termination:
       bound : 4000
@@ -4617,14 +4642,14 @@ rule bind_params
   input:
     bp : BindParamsState
   output:
-    out : Env
+    out : VEnv
   logic:
     out = match bp.params:
-      PCons(name_start, name_len, ty, ty_start, ty_len, rest) => Env::ECons { name_start: name_start, name_len: name_len, val: eval_ast_env(EvalEnvArg { node: arg_head(AHeadState { args: bp.args }), env: bp.env, src: bp.src, prog: bp.prog }), rest: bind_params(BindParamsState { params: rest, args: arg_tail(ATailState { args: bp.args }), env: bp.env, src: bp.src, prog: bp.prog }) }
-      PNil => Env::ENil
+      PCons(name_start, name_len, ty, ty_start, ty_len, rest) => VEnv::VECons { name_start: name_start, name_len: name_len, val: eval_ast_env(EvalEnvArg { node: arg_head(AHeadState { args: bp.args }), env: bp.env, src: bp.src, prog: bp.prog, concepts: bp.concepts }), rest: bind_params(BindParamsState { params: rest, args: arg_tail(ATailState { args: bp.args }), env: bp.env, src: bp.src, prog: bp.prog, concepts: bp.concepts }) }
+      PNil => VEnv::VENil
   proofs:
     purity:
-      reads : [bp.params, bp.args, bp.env, bp.src, bp.prog]
+      reads : [bp.params, bp.args, bp.env, bp.src, bp.prog, bp.concepts]
       calls : [eval_ast_env, arg_head, arg_tail, bind_params]
     termination:
       bound : 4000
@@ -4648,19 +4673,348 @@ rule eval_call
   input:
     ec : EvalCallState
   output:
-    out : number
+    out : Value
   logic:
     let callee = find_rule(FindRuleState { rules: ec.prog, src: ec.src, q_start: ec.callee_start, q_len: ec.callee_len })
-    let penv = bind_params(BindParamsState { params: rd_params(callee), args: ec.args, env: ec.env, src: ec.src, prog: ec.prog })
+    let penv = bind_params(BindParamsState { params: rd_params(callee), args: ec.args, env: ec.env, src: ec.src, prog: ec.prog, concepts: ec.concepts })
     let cbody = rd_body(callee)
     let cbinds = block_binds(cbody)
     let cresult = block_result(cbody)
-    let cenv = build_env(BuildEnvArg { binds: cbinds, env: penv, src: ec.src, prog: ec.prog })
-    out = eval_ast_env(EvalEnvArg { node: cresult, env: cenv, src: ec.src, prog: ec.prog })
+    let cenv = build_env(BuildEnvArg { binds: cbinds, env: penv, src: ec.src, prog: ec.prog, concepts: ec.concepts })
+    out = eval_ast_env(EvalEnvArg { node: cresult, env: cenv, src: ec.src, prog: ec.prog, concepts: ec.concepts })
   proofs:
     purity:
-      reads : [ec.callee_start, ec.callee_len, ec.args, ec.env, ec.src, ec.prog]
+      reads : [ec.callee_start, ec.callee_len, ec.args, ec.env, ec.src, ec.prog, ec.concepts]
       calls : [find_rule, bind_params, rd_params, rd_body, block_binds, block_result, build_env, eval_ast_env]
+    termination:
+      bound : 4000
+
+
+-- ============================================================================
+-- R6c: the runtime Value machinery — the pieces eval_ast_env's variant / match
+-- arms + the Value-valued call machinery need. venv_lookup mirrors env_lookup but
+-- over VEnv (Values, not type codes); vnum_of / vdata_tag / vdata_payload destructure
+-- a Value; variant_tag self-computes a variant identity from the ConceptList;
+-- bind_val_binders binds a match arm's binders to a scrutinee's payload; eval_vfields
+-- and eval_match are in the eval SCC (they call eval_ast_env).
+-- ============================================================================
+
+-- The interpreter env-lookup probe: the VEnv to search + the source (for byte
+-- comparison) + the query name's span. Mirror of EnvLookState but over VEnv.
+concept VEnvLookState
+  @intention: "A VEnv to search + the source text + the query name's span"
+  @source: vexprparse.intent:36
+  fields:
+    env : VEnv
+    src : text [..256]
+    q_start : number [0, 4000000]
+    q_len : number [0, 4000000]
+
+
+-- venv_lookup: the Value bound to a name in the interpreter environment (VNum 0 if
+-- unbound). Innermost-first walk (the most recent VECons wins — shadowing). Mirror of
+-- env_lookup but returns a Value. Bound-only termination + the native recursion
+-- breadcrumb (the shrinking VEnv tail is a field of the packed input).
+rule venv_lookup
+  @intention: "Value bound to a name in the interpreter environment (VNum 0 if unbound); innermost binding wins"
+  @source: vexprparse.intent:36
+  input:
+    st : VEnvLookState
+  output:
+    out : Value
+  logic:
+    out = match st.env:
+      VECons(name_start, name_len, val, rest) => if name_len == st.q_len and name_eq(NameEqState { src: st.src, a_start: name_start, b_start: st.q_start, len: name_len, off: 0 }) == 1 then val else venv_lookup(VEnvLookState { env: rest, src: st.src, q_start: st.q_start, q_len: st.q_len })
+      VENil => Value::VNum { n: 0 }
+  proofs:
+    purity:
+      reads : [st.env, st.src, st.q_start, st.q_len]
+      calls : [name_eq, venv_lookup]
+    termination:
+      bound : 4000
+
+
+-- vnum_of: the number a Value carries (0 for a variant value). The unwrap the number
+-- drivers apply to a Value result, and the arithmetic arms apply to each operand.
+rule vnum_of
+  @intention: "The number carried by a Value (0 for a variant value)"
+  @source: vexprparse.intent:36
+  input:
+    v : Value
+  output:
+    out : number
+  logic:
+    out = match v:
+      VNum(n) => n
+      VData(tag, payload) => 0
+  proofs:
+    purity:
+      reads : [v]
+      calls : []
+    termination:
+      bound : 16
+
+
+-- vdata_tag: the identity tag of a variant Value (-1 for a VNum — a non-variant
+-- scrutinee that matches no arm, since every real tag is >= 0).
+rule vdata_tag
+  @intention: "The identity tag of a variant Value (-1 for a non-variant value)"
+  @source: vexprparse.intent:36
+  input:
+    v : Value
+  output:
+    out : number
+  logic:
+    out = match v:
+      VNum(n) => 0 - 1
+      VData(tag, payload) => tag
+  proofs:
+    purity:
+      reads : [v]
+      calls : []
+    termination:
+      bound : 16
+
+
+-- vdata_payload: the evaluated payload of a variant Value (VLNil for a VNum).
+rule vdata_payload
+  @intention: "The payload value-list of a variant Value (empty for a non-variant value)"
+  @source: vexprparse.intent:36
+  input:
+    v : Value
+  output:
+    out : ValueList
+  logic:
+    out = match v:
+      VNum(n) => ValueList::VLNil
+      VData(tag, payload) => payload
+  proofs:
+    purity:
+      reads : [v]
+      calls : []
+    termination:
+      bound : 16
+
+
+-- vl_head: the head Value of a ValueList (VNum 0 if empty). Mirror of arg_head, over
+-- the runtime payload list — a match arm's k-th binder reads the k-th payload Value.
+rule vl_head
+  @intention: "The head value of a value-list (VNum 0 if empty)"
+  @source: vexprparse.intent:36
+  input:
+    p : ValueList
+  output:
+    out : Value
+  logic:
+    out = match p:
+      VLCons(head, tail) => head
+      VLNil => Value::VNum { n: 0 }
+  proofs:
+    purity:
+      reads : [p]
+      calls : []
+    termination:
+      bound : 16
+
+
+-- vl_tail: the tail of a ValueList (VLNil if empty). Mirror of arg_tail.
+rule vl_tail
+  @intention: "The tail of a value-list (VLNil if empty)"
+  @source: vexprparse.intent:36
+  input:
+    p : ValueList
+  output:
+    out : ValueList
+  logic:
+    out = match p:
+      VLCons(head, tail) => tail
+      VLNil => ValueList::VLNil
+  proofs:
+    purity:
+      reads : [p]
+      calls : []
+    termination:
+      bound : 16
+
+
+-- find_variant_index's input: a variant list + source + a query variant-name span +
+-- the running 0-based index. Mirror of FindConceptIdxState but over a VariantList.
+concept FindVarIdxState
+  @intention: "A variant list + the source + a query variant-name span + the running index"
+  @source: vexprparse.intent:36
+  fields:
+    variants : VariantList
+    src : text [..256]
+    q_start : number [0, 4000000]
+    q_len : number [0, 4000000]
+    idx : number [0, 4000000]
+
+
+-- find_variant_index: the 0-based position of the variant whose name byte-equals the
+-- query span (999999 if none). Mirror of find_concept_index over a VariantList.
+rule find_variant_index
+  @intention: "The 0-based position of the variant whose name matches the query span (999999 if none)"
+  @source: vexprparse.intent:36
+  input:
+    fvi : FindVarIdxState
+  output:
+    out : number
+  logic:
+    out = match fvi.variants:
+      VarCons(name_start, name_len, payload, rest) => if name_len == fvi.q_len and name_eq(NameEqState { src: fvi.src, a_start: name_start, b_start: fvi.q_start, len: fvi.q_len, off: 0 }) == 1 then fvi.idx else find_variant_index(FindVarIdxState { variants: rest, src: fvi.src, q_start: fvi.q_start, q_len: fvi.q_len, idx: fvi.idx + 1 })
+      VarNil => 999999
+  proofs:
+    purity:
+      reads : [fvi.variants, fvi.src, fvi.q_start, fvi.q_len, fvi.idx]
+      calls : [name_eq, find_variant_index]
+    termination:
+      bound : 4000
+
+
+-- variant_tag's input: the concept list + source + the concept-name span + the
+-- variant-name span of a construction `Concept::Variant`.
+concept VariantTagState
+  @intention: "The concept list + source + a concept-name span + a variant-name span, for computing a variant identity tag"
+  @source: vexprparse.intent:36
+  fields:
+    concepts : ConceptList
+    src : text [..256]
+    cstart : number [0, 4000000]
+    clen : number [0, 4000000]
+    vstart : number [0, 4000000]
+    vlen : number [0, 4000000]
+
+
+-- variant_tag: a variant construction's identity tag = concept_index * 256 +
+-- variant_index, both resolved against the parsed ConceptList of the interpreted
+-- source (no global table). At a match, the scrutinee VData carries this tag; the
+-- dispatch recovers concept_index = tag / 256 and recomputes each arm's tag to
+-- compare. Non-recursive (bound-only). 256 > the max variants of any one concept.
+rule variant_tag
+  @intention: "A variant construction's identity tag: concept_index * 256 + variant_index"
+  @source: vexprparse.intent:36
+  input:
+    vt : VariantTagState
+  output:
+    out : number
+  logic:
+    let cidx = find_concept_index(FindConceptIdxState { concepts: vt.concepts, src: vt.src, q_start: vt.cstart, q_len: vt.clen, idx: 0 })
+    let vidx = find_variant_index(FindVarIdxState { variants: cd_variants(concept_at_index(ConceptAtState { concepts: vt.concepts, idx: cidx })), src: vt.src, q_start: vt.vstart, q_len: vt.vlen, idx: 0 })
+    out = cidx * 256 + vidx
+  proofs:
+    purity:
+      reads : [vt.concepts, vt.src, vt.cstart, vt.clen, vt.vstart, vt.vlen]
+      calls : [find_concept_index, find_variant_index, cd_variants, concept_at_index]
+    termination:
+      bound : 64
+
+
+-- bind_val_binders's input: a match arm's positional binder list + the scrutinee's
+-- payload value-list (walked in step) + the enclosing VEnv to extend.
+concept BindValState
+  @intention: "A match arm's binders + the scrutinee payload values + the env to extend"
+  @source: vexprparse.intent:36
+  fields:
+    binders : BinderList
+    payload : ValueList
+    env : VEnv
+
+
+-- bind_val_binders: extend the interpreter env by binding each positional arm binder
+-- to the corresponding payload Value (walking binders and payload in step). Mirror of
+-- the type checker's bind_binders, but binds VALUES not type codes. BindNil returns
+-- the env unchanged. Bound-only termination + breadcrumb.
+rule bind_val_binders
+  @intention: "Extend an interpreter env by binding each match-arm binder to its scrutinee payload value"
+  @source: vexprparse.intent:36
+  input:
+    bv : BindValState
+  output:
+    out : VEnv
+  logic:
+    out = match bv.binders:
+      BindCons(start, len, rest) => VEnv::VECons { name_start: start, name_len: len, val: vl_head(bv.payload), rest: bind_val_binders(BindValState { binders: rest, payload: vl_tail(bv.payload), env: bv.env }) }
+      BindNil => bv.env
+  proofs:
+    purity:
+      reads : [bv.binders, bv.payload, bv.env]
+      calls : [vl_head, vl_tail, bind_val_binders]
+    termination:
+      bound : 4000
+
+
+-- eval_vfields's input: a variant construction's field list + the env + source +
+-- program + concept list. Evaluates each field's RHS to a Value in source order.
+concept EvalVFieldsState
+  @intention: "A variant's field-init list + the env + source + program + concept list, for evaluating the payload"
+  @source: vexprparse.intent:36
+  fields:
+    fields : VFieldList
+    env : VEnv
+    src : text [..256]
+    prog : RuleList
+    concepts : ConceptList
+
+
+-- eval_vfields: evaluate a variant construction's field initializers into a ValueList
+-- (in source order). In the eval SCC (calls eval_ast_env). Bound-only + breadcrumb.
+rule eval_vfields
+  @intention: "Evaluate a variant construction's field initializers into a value-list"
+  @source: vexprparse.intent:36
+  input:
+    ev : EvalVFieldsState
+  output:
+    out : ValueList
+  logic:
+    out = match ev.fields:
+      VFCons(name_start, name_len, val, rest) => ValueList::VLCons { head: eval_ast_env(EvalEnvArg { node: val, env: ev.env, src: ev.src, prog: ev.prog, concepts: ev.concepts }), tail: eval_vfields(EvalVFieldsState { fields: rest, env: ev.env, src: ev.src, prog: ev.prog, concepts: ev.concepts }) }
+      VFNil => ValueList::VLNil
+  proofs:
+    purity:
+      reads : [ev.fields, ev.env, ev.src, ev.prog, ev.concepts]
+      calls : [eval_ast_env, eval_vfields]
+    termination:
+      bound : 4000
+
+
+-- eval_match's input: the already-evaluated scrutinee Value + the arm list + the env
+-- + source + program + concept list.
+concept EvalMatchState
+  @intention: "The scrutinee value + the match arms + the env + source + program + concept list"
+  @source: vexprparse.intent:36
+  fields:
+    scrutval : Value
+    arms : ArmList
+    env : VEnv
+    src : text [..256]
+    prog : RuleList
+    concepts : ConceptList
+
+
+-- eval_match: dispatch a match. Recover the scrutinee's tag (stag) and its concept
+-- index (stag / 256); the concept's VariantList resolves each arm's variant name to a
+-- tag (cidx * 256 + variant_index). The FIRST arm whose tag equals stag wins: bind
+-- its binders positionally to the scrutinee's payload (bind_val_binders) and evaluate
+-- its body against the extended env. No arm matches (or a non-variant scrutinee) ->
+-- VNum 0 (total). In the eval SCC (calls eval_ast_env). Bound-only + breadcrumb.
+rule eval_match
+  @intention: "Dispatch a match to the arm whose variant tag equals the scrutinee's, binding binders to the payload"
+  @source: vexprparse.intent:36
+  input:
+    em : EvalMatchState
+  output:
+    out : Value
+  logic:
+    let stag = vdata_tag(em.scrutval)
+    let cidx = stag / 256
+    let variants = cd_variants(concept_at_index(ConceptAtState { concepts: em.concepts, idx: cidx }))
+    out = match em.arms:
+      ArmCons(vstart, vlen, binders, body, rest) => if cidx * 256 + find_variant_index(FindVarIdxState { variants: variants, src: em.src, q_start: vstart, q_len: vlen, idx: 0 }) == stag then eval_ast_env(EvalEnvArg { node: body, env: bind_val_binders(BindValState { binders: binders, payload: vdata_payload(em.scrutval), env: em.env }), src: em.src, prog: em.prog, concepts: em.concepts }) else eval_match(EvalMatchState { scrutval: em.scrutval, arms: rest, env: em.env, src: em.src, prog: em.prog, concepts: em.concepts })
+      ArmNil => Value::VNum { n: 0 }
+  proofs:
+    purity:
+      reads : [em.scrutval, em.arms, em.env, em.src, em.prog, em.concepts]
+      calls : [vdata_tag, cd_variants, concept_at_index, find_variant_index, eval_ast_env, bind_val_binders, vdata_payload, eval_match]
     termination:
       bound : 4000
 
@@ -4694,12 +5048,12 @@ rule eval_block
     let blk = pb_block(pb)
     let binds = block_binds(blk)
     let result = block_result(blk)
-    let env = build_env(BuildEnvArg { binds: binds, env: Env::ENil, src: s.source, prog: RuleList::RNil })
-    out = eval_ast_env(EvalEnvArg { node: result, env: env, src: s.source, prog: RuleList::RNil })
+    let env = build_env(BuildEnvArg { binds: binds, env: VEnv::VENil, src: s.source, prog: RuleList::RNil, concepts: ConceptList::CNil })
+    out = vnum_of(eval_ast_env(EvalEnvArg { node: result, env: env, src: s.source, prog: RuleList::RNil, concepts: ConceptList::CNil }))
   proofs:
     purity:
       reads : [s.source]
-      calls : [begin_tokenize, parse_block, pb_block, block_binds, block_result, build_env, eval_ast_env]
+      calls : [begin_tokenize, parse_block, pb_block, block_binds, block_result, build_env, eval_ast_env, vnum_of]
     termination:
       bound : 256
 
@@ -5774,12 +6128,12 @@ rule eval_rule_decl
     let blk = rd_body(rd)
     let binds = block_binds(blk)
     let result = block_result(blk)
-    let env = build_env(BuildEnvArg { binds: binds, env: Env::ENil, src: s.source, prog: RuleList::RNil })
-    out = eval_ast_env(EvalEnvArg { node: result, env: env, src: s.source, prog: RuleList::RNil })
+    let env = build_env(BuildEnvArg { binds: binds, env: VEnv::VENil, src: s.source, prog: RuleList::RNil, concepts: ConceptList::CNil })
+    out = vnum_of(eval_ast_env(EvalEnvArg { node: result, env: env, src: s.source, prog: RuleList::RNil, concepts: ConceptList::CNil }))
   proofs:
     purity:
       reads : [s.source]
-      calls : [begin_tokenize, parse_rule_decl, rd_body, block_binds, block_result, build_env, eval_ast_env]
+      calls : [begin_tokenize, parse_rule_decl, rd_body, block_binds, block_result, build_env, eval_ast_env, vnum_of]
     termination:
       bound : 256
 
@@ -7548,12 +7902,12 @@ rule eval_nth_rule
     let blk = rl_head_body(nth)
     let binds = block_binds(blk)
     let result = block_result(blk)
-    let env = build_env(BuildEnvArg { binds: binds, env: Env::ENil, src: e.source, prog: prog })
-    out = eval_ast_env(EvalEnvArg { node: result, env: env, src: e.source, prog: prog })
+    let env = build_env(BuildEnvArg { binds: binds, env: VEnv::VENil, src: e.source, prog: prog, concepts: ConceptList::CNil })
+    out = vnum_of(eval_ast_env(EvalEnvArg { node: result, env: env, src: e.source, prog: prog, concepts: ConceptList::CNil }))
   proofs:
     purity:
       reads : [e.source, e.n]
-      calls : [begin_tokenize, parse_program, drop_rules, rl_head_body, block_binds, block_result, build_env, eval_ast_env]
+      calls : [begin_tokenize, parse_program, drop_rules, rl_head_body, block_binds, block_result, build_env, eval_ast_env, vnum_of]
     termination:
       bound : 256
 
@@ -7623,15 +7977,16 @@ rule eval_main
   logic:
     let toks = begin_tokenize(ScanState { source: s.source, pos: 0 })
     let prog = parse_program(ProgramState { cell: toks, src: s.source })
+    let concepts = parse_concepts(ProgramState { cell: toks, src: s.source })
     let body = rl_head_body(prog)
     let binds = block_binds(body)
     let result = block_result(body)
-    let env = build_env(BuildEnvArg { binds: binds, env: Env::ENil, src: s.source, prog: prog })
-    out = eval_ast_env(EvalEnvArg { node: result, env: env, src: s.source, prog: prog })
+    let env = build_env(BuildEnvArg { binds: binds, env: VEnv::VENil, src: s.source, prog: prog, concepts: concepts })
+    out = vnum_of(eval_ast_env(EvalEnvArg { node: result, env: env, src: s.source, prog: prog, concepts: concepts }))
   proofs:
     purity:
       reads : [s.source]
-      calls : [begin_tokenize, parse_program, rl_head_body, block_binds, block_result, build_env, eval_ast_env]
+      calls : [begin_tokenize, parse_program, parse_concepts, rl_head_body, block_binds, block_result, build_env, eval_ast_env, vnum_of]
     termination:
       bound : 256
 
