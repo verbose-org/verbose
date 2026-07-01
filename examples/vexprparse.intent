@@ -1492,3 +1492,30 @@ the arm's binders positionally to the scrutinee's payload. eval_ast becomes a
 thin wrapper over eval_ast_env (unwrapping via vnum_of). Strings stay VNum 0
 (deferred). eval_main threads the ConceptList so a program with a concept_group
 and match/variant rules evaluates end to end (recursive list-sum -> the total).
+
+----------------------------------------------------------------------------
+Brick R6d of the self-hosting arc: the PURITY VERIFIER. R5 parsed each rule's
+`proofs:` into a Proofs { reads : NameList, calls : NameList, ... }. R6d makes the
+self-hosted checker VERIFY the purity half of that proof against the rule body:
+a rule may only CALL rules it declares in `calls:` and only READ inputs it
+declares in `reads:`. Two per-rule counts of violations, wired into a
+count_purity_errors driver.
+
+Calls check: walk the body's AstCall nodes (through match/variant, like R6a). A
+callee that RESOLVES to a defined rule (rule_named == 1) yet is absent from the
+declared `calls:` list (name_in_namelist == 0) is one undeclared call. Primitives
+(length / byte_at / ...) don't resolve to a defined rule, so they are naturally
+exempt; self-recursion resolves, so it must be declared.
+
+Reads check: walk the body threading the INPUT NAME (the first `input:` field) and
+the local scope (params + lets, extended per match arm with the arm's binders). An
+AstVar whose head-ident byte-equals the input name, is not a local, and is not in
+the declared `reads:` list is one undeclared read. A field access `s.source`
+reaches its head-ident `s` through AstField -> AstVar(s), so descending the base is
+the head-ident test; declared `[s]` (head-ident spans, R5's storage) admits
+`s.anything` (exact-path reads are a finer check, deferred).
+
+Termination verification (checking `decreasing : n` passes `n - k`, `structural : f`
+recurses on a match-binder sub-part) is genuinely harder and is DEFERRED to a
+follow-on brick. name_in_namelist is the one new membership helper — the NameList
+analogue of name_bound / rule_named.

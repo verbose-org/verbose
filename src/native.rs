@@ -34581,4 +34581,83 @@ rule two
         let _ = std::fs::remove_file(&em);
     }
 
+    /// Records-arc brick R6d: the self-hosted PURITY VERIFIER
+    /// (examples/vexprparse.verbose) now VERIFIES the purity half of each rule's
+    /// parsed proofs. `count_purity_errors` tokenizes + parses a program (source via
+    /// argv) and folds two per-rule checks over it:
+    ///   * calls — an AstCall whose callee RESOLVES to a defined rule but is absent
+    ///     from the rule's declared `calls:` list is one violation. Primitives don't
+    ///     resolve to a defined rule (exempt); self-recursion resolves (must be
+    ///     declared).
+    ///   * reads — an AstVar whose head-ident is the rule's `input:` name, is not a
+    ///     local (let/param/binder), and is not in the declared `reads:` list is one
+    ///     violation. Head-ident membership: declared `[s]` admits `s.anything`.
+    /// Termination verification is DEFERRED (harder arg-pattern analysis) — R6d is
+    /// the purity half only.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn records_r6d_purity_verifier_checks_reads_and_calls() {
+        let src = std::fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let bin = std::env::temp_dir().join("verbosec_test_r6d_count_purity_errors");
+        compile_native(&program, "count_purity_errors", bin.to_str().unwrap(), false, false)
+            .expect("count_purity_errors must compile natively (R6d purity walk over match/variant)");
+
+        let run = |source: &str| -> i64 {
+            let r = std::process::Command::new(&bin)
+                .arg(source)
+                .arg("0")
+                .output()
+                .expect("spawn R6d count_purity_errors driver");
+            assert!(
+                r.status.success(),
+                "count_purity_errors must exit 0 for {:?}; got {:?}",
+                source, r.status
+            );
+            String::from_utf8_lossy(&r.stdout)
+                .trim()
+                .parse::<i64>()
+                .unwrap_or_else(|_| panic!("count_purity_errors produced non-number for {:?}: {:?}", source, r.stdout))
+        };
+
+        // CALLS: r calls the DEFINED rule helper but does not declare it -> 1 violation.
+        let call_bad = "rule r\n  logic:\n    out = helper(1)\n  proofs:\n    purity:\n      reads : []\n      calls : []\n    termination:\n      bound : 1\nrule helper(x)\n  logic:\n    out = x";
+        assert_eq!(run(call_bad), 1, "R6d: undeclared call to a defined rule is flagged");
+
+        // CALLS: same body with `calls : [helper]` declared -> clean.
+        let call_ok = "rule r\n  logic:\n    out = helper(1)\n  proofs:\n    purity:\n      reads : []\n      calls : [helper]\n    termination:\n      bound : 1\nrule helper(x)\n  logic:\n    out = x";
+        assert_eq!(run(call_ok), 0, "R6d: a declared call to a defined rule checks clean");
+
+        // CALLS: a primitive (length) does not resolve to a defined rule -> exempt.
+        let prim = "rule r\n  logic:\n    out = length(s)\n  proofs:\n    purity:\n      reads : []\n      calls : []\n    termination:\n      bound : 1";
+        assert_eq!(run(prim), 0, "R6d: a primitive call (length) is exempt — not a defined rule");
+
+        // CALLS: self-recursion resolves — undeclared self is flagged, declared is clean.
+        let rec_bad = "rule r(n)\n  logic:\n    out = r(n)\n  proofs:\n    purity:\n      reads : []\n      calls : []\n    termination:\n      bound : 1";
+        assert_eq!(run(rec_bad), 1, "R6d: undeclared self-recursion is flagged");
+        let rec_ok = "rule r(n)\n  logic:\n    out = r(n)\n  proofs:\n    purity:\n      reads : []\n      calls : [r]\n    termination:\n      bound : 1";
+        assert_eq!(run(rec_ok), 0, "R6d: declared self-recursion checks clean");
+
+        // READS: r reads its input `s` (out = s) but declares `reads : []` -> 1 violation.
+        let read_bad = "rule r\n  input:\n    s : Thing\n  logic:\n    out = s\n  proofs:\n    purity:\n      reads : []\n      calls : []\n    termination:\n      bound : 1";
+        assert_eq!(run(read_bad), 1, "R6d: undeclared input read is flagged");
+
+        // READS: same body with `reads : [s]` declared -> clean (head-ident membership).
+        let read_ok = "rule r\n  input:\n    s : Thing\n  logic:\n    out = s\n  proofs:\n    purity:\n      reads : [s]\n      calls : []\n    termination:\n      bound : 1";
+        assert_eq!(run(read_ok), 0, "R6d: a declared input read checks clean");
+
+        // READS: a let-local read (d) is NOT an input read -> not flagged.
+        let local = "rule r\n  logic:\n    let d = 1\n    out = d\n  proofs:\n    purity:\n      reads : []\n      calls : []\n    termination:\n      bound : 1";
+        assert_eq!(run(local), 0, "R6d: a let-local read (d) is a local, not an input read — not flagged");
+
+        // A fully-correct tokenize-shaped rule (reads/calls match its body) -> 0.
+        let clean = "rule scan\n  input:\n    s : ScanState\n  logic:\n    out = if s.pos >= s.len then s.pos else scan(ScanState { source: s.source, pos: s.pos })\n  proofs:\n    purity:\n      reads : [s.pos, s.len, s.source]\n      calls : [scan]\n    termination:\n      bound : 1";
+        assert_eq!(run(clean), 0, "R6d: a rule whose reads/calls match its body checks clean");
+
+        let _ = std::fs::remove_file(&bin);
+    }
+
 }

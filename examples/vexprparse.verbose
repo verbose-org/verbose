@@ -10555,6 +10555,631 @@ rule argtype_check
 
 
 -- ============================================================================
+-- BRICK R6d: the PURITY VERIFIER — the self-hosted verifier's core. R5 parsed each
+-- rule's `proofs:` into a Proofs { reads : NameList, calls : NameList, ... }. R6d
+-- makes the self-hosted checker VERIFY the purity half of that proof: the body may
+-- only CALL rules it declares in `calls:` and only READ inputs it declares in
+-- `reads:`. Termination verification (arg-pattern analysis) is genuinely harder and
+-- is DEFERRED to a follow-on brick — R6d is the purity half.
+--
+-- Two per-rule checks, each a count of VIOLATIONS (0 = clean):
+--   * undeclared_calls — every AstCall whose callee RESOLVES to a defined rule
+--     (rule_named == 1) but is NOT in the rule's declared `calls:` list. Primitives
+--     (length / byte_at / concat / ...) don't resolve to a defined rule, so they are
+--     naturally exempt; self-recursion resolves, so it MUST be declared.
+--   * undeclared_reads — every AstVar whose head-ident is the rule's INPUT name (the
+--     first `input:` field), is NOT a local (let / param / match binder), and is NOT
+--     in the declared `reads:` list. A read `s.source` reaches its head-ident `s`
+--     through AstField(AstVar(s), ...) -> AstVar(s), so descending the field base is
+--     exactly the head-ident test; declared `[s]` (head-ident spans, R5's storage)
+--     admits `s.anything`.
+-- Both reuse R6a's body-walk shape (Ast / args / vfields / arms recursion, match
+-- binders scoped in per arm via binds_with_binders) and the single new membership
+-- helper name_in_namelist (the NameList analogue of name_bound).
+-- ============================================================================
+
+-- name_in_namelist's probe: the purity NameList to search + the source text + the
+-- query name's HEAD-ident span. The NameList analogue of NameBoundState (which
+-- searches a Binding) / RuleNamedState (which searches a RuleList).
+concept NameInListState
+  @intention: "A purity reads/calls name-list to search + the source text + the query name's head-ident span"
+  @source: vexprparse.intent:30
+  fields:
+    names : NameList
+    src : text [..256]
+    q_start : number [0, 4000000]
+    q_len : number [0, 4000000]
+
+
+-- name_in_namelist: 1 iff the query span byte-equals some entry's head-ident span in
+-- the NameList, 0 otherwise. Walks the NmCons cons-list; at each entry it checks the
+-- entry's LENGTH equals the query length AND the bytes match (name_eq); on a match it
+-- returns 1, else recurses into `rest`. NmNil (end) returns 0 (not declared). Exact
+-- mirror of name_bound / rule_named, reading a NameList entry's (start, len) span
+-- instead of a binding / rule name. Recurses over the NmCons tail (a field of the
+-- packed input, not the input), so bound + the native recursion breadcrumb.
+rule name_in_namelist
+  @intention: "1 if a name span matches some entry's head-ident in a purity name-list, 0 otherwise"
+  @source: vexprparse.intent:30
+  input:
+    st : NameInListState
+  output:
+    out : number
+  logic:
+    out = match st.names:
+      NmCons(start, len, rest) => if len == st.q_len and name_eq(NameEqState { src: st.src, a_start: start, b_start: st.q_start, len: len, off: 0 }) == 1 then 1 else name_in_namelist(NameInListState { names: rest, src: st.src, q_start: st.q_start, q_len: st.q_len })
+      NmNil => 0
+  proofs:
+    purity:
+      reads : [st.names, st.src, st.q_start, st.q_len]
+      calls : [name_eq, name_in_namelist]
+    termination:
+      bound : 4000
+
+
+-- ---------------------------------------------------------------------------
+-- calls check: walk the body and count AstCall callees that RESOLVE to a defined
+-- rule (rule_named == 1) yet are ABSENT from the declared `calls:` NameList. Same
+-- 5-rule walk family as count_badcall_* (ast / args / vfields / arms / binds), but
+-- each state carries the declared `calls` NameList alongside the program RuleList.
+-- ---------------------------------------------------------------------------
+
+concept UndeclCallState
+  @intention: "An Ast node + the program rule list + the declared calls list + the source text"
+  @source: vexprparse.intent:30
+  fields:
+    node : Ast
+    rules : RuleList
+    calls : NameList
+    src : text [..256]
+
+
+concept UndeclCallArgsState
+  @intention: "A call-argument list + the program rule list + the declared calls list + the source text"
+  @source: vexprparse.intent:30
+  fields:
+    args : ArgList
+    rules : RuleList
+    calls : NameList
+    src : text [..256]
+
+
+concept UndeclCallVFieldsState
+  @intention: "A variant construct's field list + the program rule list + the declared calls list + the source text"
+  @source: vexprparse.intent:30
+  fields:
+    fields : VFieldList
+    rules : RuleList
+    calls : NameList
+    src : text [..256]
+
+
+concept UndeclCallArmsState
+  @intention: "A match arm list + the program rule list + the declared calls list + the source text"
+  @source: vexprparse.intent:30
+  fields:
+    arms : ArmList
+    rules : RuleList
+    calls : NameList
+    src : text [..256]
+
+
+concept UndeclCallBindsState
+  @intention: "A binding list + the program rule list + the declared calls list + the source text"
+  @source: vexprparse.intent:30
+  fields:
+    binds : Binding
+    rules : RuleList
+    calls : NameList
+    src : text [..256]
+
+
+-- count_undecl_call_args: sum count_undecl_call_ast over every argument of a call.
+-- Mutually recursive with count_undecl_call_ast (a nested call in an argument is
+-- checked). Threads rules + declared calls + src unchanged.
+rule count_undecl_call_args
+  @intention: "Total undeclared-call references across every argument of a call"
+  @source: vexprparse.intent:30
+  input:
+    a : UndeclCallArgsState
+  output:
+    out : number
+  logic:
+    out = match a.args:
+      ArgCons(head, tail) => count_undecl_call_ast(UndeclCallState { node: head, rules: a.rules, calls: a.calls, src: a.src }) + count_undecl_call_args(UndeclCallArgsState { args: tail, rules: a.rules, calls: a.calls, src: a.src })
+      ArgNil => 0
+  proofs:
+    purity:
+      reads : [a.args, a.rules, a.calls, a.src]
+      calls : [count_undecl_call_ast, count_undecl_call_args]
+    termination:
+      bound : 4000
+
+
+-- count_undecl_call_ast: walk an Ast and count each AstCall whose callee RESOLVES to
+-- a defined rule (rule_named == 1) but is NOT in the declared `calls:` list
+-- (name_in_namelist == 0). Same structural walk as count_badcall_ast, but the
+-- AstCall predicate is "resolves AND undeclared" instead of "does not resolve".
+-- Primitives (length / byte_at / ...) fail rule_named, so they contribute 0 (exempt);
+-- self-recursion passes rule_named, so it must be declared. Threads rules + declared
+-- calls + src down every branch. a.node is a FIELD of the packed input, so bound +
+-- the native recursion breadcrumb.
+rule count_undecl_call_ast
+  @intention: "Total undeclared-call references in an AST (callee resolves but is not in `calls:`)"
+  @source: vexprparse.intent:30
+  input:
+    a : UndeclCallState
+  output:
+    out : number
+  logic:
+    out = match a.node:
+      AstNum(value) => 0
+      AstBin(op, lhs, rhs) => count_undecl_call_ast(UndeclCallState { node: lhs, rules: a.rules, calls: a.calls, src: a.src }) + count_undecl_call_ast(UndeclCallState { node: rhs, rules: a.rules, calls: a.calls, src: a.src })
+      AstNeg(inner) => count_undecl_call_ast(UndeclCallState { node: inner, rules: a.rules, calls: a.calls, src: a.src })
+      AstNot(inner) => count_undecl_call_ast(UndeclCallState { node: inner, rules: a.rules, calls: a.calls, src: a.src })
+      AstVar(start, len) => 0
+      AstField(base, fstart, flen) => count_undecl_call_ast(UndeclCallState { node: base, rules: a.rules, calls: a.calls, src: a.src })
+      AstCall(callee_start, callee_len, args) => (if rule_named(RuleNamedState { rules: a.rules, src: a.src, q_start: callee_start, q_len: callee_len }) == 1 and name_in_namelist(NameInListState { names: a.calls, src: a.src, q_start: callee_start, q_len: callee_len }) == 0 then 1 else 0) + count_undecl_call_args(UndeclCallArgsState { args: args, rules: a.rules, calls: a.calls, src: a.src })
+      AstIf(cond, thn, els) => count_undecl_call_ast(UndeclCallState { node: cond, rules: a.rules, calls: a.calls, src: a.src }) + count_undecl_call_ast(UndeclCallState { node: thn, rules: a.rules, calls: a.calls, src: a.src }) + count_undecl_call_ast(UndeclCallState { node: els, rules: a.rules, calls: a.calls, src: a.src })
+      AstBool(value) => 0
+      AstStr(start, len) => 0
+      AstErr => 0
+      AstVariant(cstart, clen, vstart, vlen, fields) => count_undecl_call_vfields(UndeclCallVFieldsState { fields: fields, rules: a.rules, calls: a.calls, src: a.src })
+      AstMatch(scrut, arms) => count_undecl_call_ast(UndeclCallState { node: scrut, rules: a.rules, calls: a.calls, src: a.src }) + count_undecl_call_arms(UndeclCallArmsState { arms: arms, rules: a.rules, calls: a.calls, src: a.src })
+  proofs:
+    purity:
+      reads : [a.node, a.rules, a.calls, a.src]
+      calls : [count_undecl_call_ast, count_undecl_call_args, rule_named, name_in_namelist, count_undecl_call_vfields, count_undecl_call_arms]
+    termination:
+      bound : 4000
+
+
+-- count_undecl_call_vfields: sum count_undecl_call_ast over every field VALUE of a
+-- variant construct. Mutually recursive with count_undecl_call_ast.
+rule count_undecl_call_vfields
+  @intention: "Total undeclared-call references across every field value of a variant construct"
+  @source: vexprparse.intent:30
+  input:
+    a : UndeclCallVFieldsState
+  output:
+    out : number
+  logic:
+    out = match a.fields:
+      VFCons(name_start, name_len, val, rest) => count_undecl_call_ast(UndeclCallState { node: val, rules: a.rules, calls: a.calls, src: a.src }) + count_undecl_call_vfields(UndeclCallVFieldsState { fields: rest, rules: a.rules, calls: a.calls, src: a.src })
+      VFNil => 0
+  proofs:
+    purity:
+      reads : [a.fields, a.rules, a.calls, a.src]
+      calls : [count_undecl_call_ast, count_undecl_call_vfields]
+    termination:
+      bound : 4000
+
+
+-- count_undecl_call_arms: sum count_undecl_call_ast over every match arm body. Arm
+-- binders don't affect callee resolution (callees are program-wide), so the program
+-- RuleList + declared calls are threaded unchanged. Mutually recursive with
+-- count_undecl_call_ast.
+rule count_undecl_call_arms
+  @intention: "Total undeclared-call references across every match arm body"
+  @source: vexprparse.intent:30
+  input:
+    a : UndeclCallArmsState
+  output:
+    out : number
+  logic:
+    out = match a.arms:
+      ArmCons(vstart, vlen, binders, body, rest) => count_undecl_call_ast(UndeclCallState { node: body, rules: a.rules, calls: a.calls, src: a.src }) + count_undecl_call_arms(UndeclCallArmsState { arms: rest, rules: a.rules, calls: a.calls, src: a.src })
+      ArmNil => 0
+  proofs:
+    purity:
+      reads : [a.arms, a.rules, a.calls, a.src]
+      calls : [count_undecl_call_ast, count_undecl_call_arms]
+    termination:
+      bound : 4000
+
+
+-- count_undecl_call_binds: for each binding, count_undecl_call_ast on its RHS `value`
+-- against the full program RuleList + declared calls, then recurse on `rest`. Every
+-- let RHS sees the same declared calls (no ordering). Recurses over the binding tail.
+rule count_undecl_call_binds
+  @intention: "Total undeclared-call references across every binding's RHS"
+  @source: vexprparse.intent:30
+  input:
+    b : UndeclCallBindsState
+  output:
+    out : number
+  logic:
+    out = match b.binds:
+      BCons(name_start, name_len, value, rest) => count_undecl_call_ast(UndeclCallState { node: value, rules: b.rules, calls: b.calls, src: b.src }) + count_undecl_call_binds(UndeclCallBindsState { binds: rest, rules: b.rules, calls: b.calls, src: b.src })
+      BNil => 0
+  proofs:
+    purity:
+      reads : [b.binds, b.rules, b.calls, b.src]
+      calls : [count_undecl_call_ast, count_undecl_call_binds]
+    termination:
+      bound : 4000
+
+
+-- undeclared_calls's input: ONE rule declaration + the FULL program RuleList (so a
+-- callee resolves against every rule, self included) + the source text. Same shape
+-- as BadCallRuleState.
+concept UndeclCallRuleState
+  @intention: "A rule declaration + the full program rule list + the source text"
+  @source: vexprparse.intent:30
+  fields:
+    rd : RuleDecl
+    rules : RuleList
+    src : text [..256]
+
+
+-- undeclared_calls: the undeclared-call count for ONE rule. Split the body into its
+-- bindings and result, read the declared `calls:` list off the rule's Proofs
+-- (prf_calls . rd_proofs), then sum count_undecl_call_binds over the let RHSes and
+-- count_undecl_call_ast over the result — both resolving callees against the full
+-- program and checking membership in the SAME declared list. 0 = every defined-rule
+-- callee the body invokes is declared.
+rule undeclared_calls
+  @intention: "Number of calls to defined rules a rule makes but does not declare in `calls:` (0 if clean)"
+  @source: vexprparse.intent:30
+  input:
+    uc : UndeclCallRuleState
+  output:
+    out : number
+  logic:
+    let body = rd_body(uc.rd)
+    let binds = block_binds(body)
+    let result = block_result(body)
+    let declared = prf_calls(rd_proofs(uc.rd))
+    let bad_in_binds = count_undecl_call_binds(UndeclCallBindsState { binds: binds, rules: uc.rules, calls: declared, src: uc.src })
+    out = bad_in_binds + count_undecl_call_ast(UndeclCallState { node: result, rules: uc.rules, calls: declared, src: uc.src })
+  proofs:
+    purity:
+      reads : [uc.rd, uc.rules, uc.src]
+      calls : [rd_body, block_binds, block_result, prf_calls, rd_proofs, count_undecl_call_binds, count_undecl_call_ast]
+    termination:
+      bound : 64
+
+
+-- ---------------------------------------------------------------------------
+-- reads check: walk the body threading the INPUT NAME (the first `input:` field) +
+-- the local scope (params + lets, extended per match arm with the arm's binders).
+-- An AstVar whose span byte-equals the input name, is NOT bound as a local, and is
+-- NOT in the declared `reads:` list is one undeclared read. A field access `s.f`
+-- reaches its head-ident `s` via AstField -> AstVar(s), so descending the base is
+-- exactly the head-ident test. Same walk family as count_undecl_call_* but the state
+-- carries the declared `reads` list + the input name span + the binding scope.
+-- ---------------------------------------------------------------------------
+
+concept UndeclReadState
+  @intention: "An Ast node + the local binding scope + the declared reads list + the input-name span + the source text"
+  @source: vexprparse.intent:30
+  fields:
+    node : Ast
+    binds : Binding
+    reads : NameList
+    in_start : number
+    in_len : number
+    src : text [..256]
+
+
+concept UndeclReadArgsState
+  @intention: "A call-argument list + the local scope + the declared reads list + the input-name span + the source text"
+  @source: vexprparse.intent:30
+  fields:
+    args : ArgList
+    binds : Binding
+    reads : NameList
+    in_start : number
+    in_len : number
+    src : text [..256]
+
+
+concept UndeclReadVFieldsState
+  @intention: "A variant construct's field list + the local scope + the declared reads list + the input-name span + the source text"
+  @source: vexprparse.intent:30
+  fields:
+    fields : VFieldList
+    binds : Binding
+    reads : NameList
+    in_start : number
+    in_len : number
+    src : text [..256]
+
+
+concept UndeclReadArmsState
+  @intention: "A match arm list + the local scope + the declared reads list + the input-name span + the source text"
+  @source: vexprparse.intent:30
+  fields:
+    arms : ArmList
+    binds : Binding
+    reads : NameList
+    in_start : number
+    in_len : number
+    src : text [..256]
+
+
+concept UndeclReadBindsState
+  @intention: "The bindings being iterated + the full local scope + the declared reads list + the input-name span + the source text"
+  @source: vexprparse.intent:30
+  fields:
+    iter : Binding
+    scope : Binding
+    reads : NameList
+    in_start : number
+    in_len : number
+    src : text [..256]
+
+
+-- count_undecl_read_args: sum count_undecl_read_ast over every argument of a call.
+-- Mutually recursive with count_undecl_read_ast. Threads scope + reads + input name
+-- + src unchanged.
+rule count_undecl_read_args
+  @intention: "Total undeclared-read references across every argument of a call"
+  @source: vexprparse.intent:30
+  input:
+    a : UndeclReadArgsState
+  output:
+    out : number
+  logic:
+    out = match a.args:
+      ArgCons(head, tail) => count_undecl_read_ast(UndeclReadState { node: head, binds: a.binds, reads: a.reads, in_start: a.in_start, in_len: a.in_len, src: a.src }) + count_undecl_read_args(UndeclReadArgsState { args: tail, binds: a.binds, reads: a.reads, in_start: a.in_start, in_len: a.in_len, src: a.src })
+      ArgNil => 0
+  proofs:
+    purity:
+      reads : [a.args, a.binds, a.reads, a.in_start, a.in_len, a.src]
+      calls : [count_undecl_read_ast, count_undecl_read_args]
+    termination:
+      bound : 4000
+
+
+-- count_undecl_read_ast: walk an Ast and count each AstVar that is an UNDECLARED
+-- input read: its span byte-equals the input name (in_start, in_len), it is NOT a
+-- local (name_bound over the scope == 0), and its head-ident is NOT in the declared
+-- `reads:` list (name_in_namelist == 0). AstField descends into its base (reaching
+-- the head-ident AstVar), so `s.source` is checked at its `s`. AstCall walks its
+-- args; a callee name is not a variable. AstMatch walks the scrutinee then each arm
+-- body with the scope EXTENDED by that arm's binders (count_undecl_read_arms).
+-- a.node is a FIELD of the packed input, so bound + the native recursion breadcrumb.
+rule count_undecl_read_ast
+  @intention: "Total undeclared input-reads in an AST (head-ident is the input, not a local, not in `reads:`)"
+  @source: vexprparse.intent:30
+  input:
+    a : UndeclReadState
+  output:
+    out : number
+  logic:
+    out = match a.node:
+      AstNum(value) => 0
+      AstBin(op, lhs, rhs) => count_undecl_read_ast(UndeclReadState { node: lhs, binds: a.binds, reads: a.reads, in_start: a.in_start, in_len: a.in_len, src: a.src }) + count_undecl_read_ast(UndeclReadState { node: rhs, binds: a.binds, reads: a.reads, in_start: a.in_start, in_len: a.in_len, src: a.src })
+      AstNeg(inner) => count_undecl_read_ast(UndeclReadState { node: inner, binds: a.binds, reads: a.reads, in_start: a.in_start, in_len: a.in_len, src: a.src })
+      AstNot(inner) => count_undecl_read_ast(UndeclReadState { node: inner, binds: a.binds, reads: a.reads, in_start: a.in_start, in_len: a.in_len, src: a.src })
+      AstVar(start, len) => if len == a.in_len and (name_eq(NameEqState { src: a.src, a_start: a.in_start, b_start: start, len: len, off: 0 }) == 1 and (name_bound(NameBoundState { binds: a.binds, src: a.src, q_start: start, q_len: len }) == 0 and name_in_namelist(NameInListState { names: a.reads, src: a.src, q_start: start, q_len: len }) == 0)) then 1 else 0
+      AstField(base, fstart, flen) => count_undecl_read_ast(UndeclReadState { node: base, binds: a.binds, reads: a.reads, in_start: a.in_start, in_len: a.in_len, src: a.src })
+      AstCall(callee_start, callee_len, args) => count_undecl_read_args(UndeclReadArgsState { args: args, binds: a.binds, reads: a.reads, in_start: a.in_start, in_len: a.in_len, src: a.src })
+      AstIf(cond, thn, els) => count_undecl_read_ast(UndeclReadState { node: cond, binds: a.binds, reads: a.reads, in_start: a.in_start, in_len: a.in_len, src: a.src }) + count_undecl_read_ast(UndeclReadState { node: thn, binds: a.binds, reads: a.reads, in_start: a.in_start, in_len: a.in_len, src: a.src }) + count_undecl_read_ast(UndeclReadState { node: els, binds: a.binds, reads: a.reads, in_start: a.in_start, in_len: a.in_len, src: a.src })
+      AstBool(value) => 0
+      AstStr(start, len) => 0
+      AstErr => 0
+      AstVariant(cstart, clen, vstart, vlen, fields) => count_undecl_read_vfields(UndeclReadVFieldsState { fields: fields, binds: a.binds, reads: a.reads, in_start: a.in_start, in_len: a.in_len, src: a.src })
+      AstMatch(scrut, arms) => count_undecl_read_ast(UndeclReadState { node: scrut, binds: a.binds, reads: a.reads, in_start: a.in_start, in_len: a.in_len, src: a.src }) + count_undecl_read_arms(UndeclReadArmsState { arms: arms, binds: a.binds, reads: a.reads, in_start: a.in_start, in_len: a.in_len, src: a.src })
+  proofs:
+    purity:
+      reads : [a.node, a.binds, a.reads, a.in_start, a.in_len, a.src]
+      calls : [count_undecl_read_ast, count_undecl_read_args, name_eq, name_bound, name_in_namelist, count_undecl_read_vfields, count_undecl_read_arms]
+    termination:
+      bound : 4000
+
+
+-- count_undecl_read_vfields: sum count_undecl_read_ast over every field VALUE of a
+-- variant construct (the scope is threaded unchanged — a variant construct binds
+-- nothing). Mutually recursive with count_undecl_read_ast.
+rule count_undecl_read_vfields
+  @intention: "Total undeclared input-reads across every field value of a variant construct"
+  @source: vexprparse.intent:30
+  input:
+    a : UndeclReadVFieldsState
+  output:
+    out : number
+  logic:
+    out = match a.fields:
+      VFCons(name_start, name_len, val, rest) => count_undecl_read_ast(UndeclReadState { node: val, binds: a.binds, reads: a.reads, in_start: a.in_start, in_len: a.in_len, src: a.src }) + count_undecl_read_vfields(UndeclReadVFieldsState { fields: rest, binds: a.binds, reads: a.reads, in_start: a.in_start, in_len: a.in_len, src: a.src })
+      VFNil => 0
+  proofs:
+    purity:
+      reads : [a.fields, a.binds, a.reads, a.in_start, a.in_len, a.src]
+      calls : [count_undecl_read_ast, count_undecl_read_vfields]
+    termination:
+      bound : 4000
+
+
+-- count_undecl_read_arms: for each match arm, walk the arm BODY with the scope
+-- EXTENDED by that arm's binders (binds_with_binders — a binder is a local, so an
+-- input-named binder shadows the input and is NOT flagged in that arm), then recurse
+-- on the rest with the ORIGINAL scope. Mutually recursive with count_undecl_read_ast.
+rule count_undecl_read_arms
+  @intention: "Total undeclared input-reads across every match arm body (arm binders scoped in as locals)"
+  @source: vexprparse.intent:30
+  input:
+    a : UndeclReadArmsState
+  output:
+    out : number
+  logic:
+    out = match a.arms:
+      ArmCons(vstart, vlen, binders, body, rest) => count_undecl_read_ast(UndeclReadState { node: body, binds: binds_with_binders(BindsWithBindersState { binds: a.binds, bs: binders }), reads: a.reads, in_start: a.in_start, in_len: a.in_len, src: a.src }) + count_undecl_read_arms(UndeclReadArmsState { arms: rest, binds: a.binds, reads: a.reads, in_start: a.in_start, in_len: a.in_len, src: a.src })
+      ArmNil => 0
+  proofs:
+    purity:
+      reads : [a.arms, a.binds, a.reads, a.in_start, a.in_len, a.src]
+      calls : [count_undecl_read_ast, count_undecl_read_arms, binds_with_binders]
+    termination:
+      bound : 4000
+
+
+-- count_undecl_read_binds: for each binding in `iter`, count_undecl_read_ast on its
+-- RHS `value` against the FULL local scope (params + all lets), then recurse on the
+-- rest. The input name is never a param or let, so scope membership never masks an
+-- input read; a let referencing another let is masked (that other let is in scope).
+-- Ordering is irrelevant to input-read detection, so the full scope is threaded.
+rule count_undecl_read_binds
+  @intention: "Total undeclared input-reads across every binding's RHS"
+  @source: vexprparse.intent:30
+  input:
+    b : UndeclReadBindsState
+  output:
+    out : number
+  logic:
+    out = match b.iter:
+      BCons(name_start, name_len, value, rest) => count_undecl_read_ast(UndeclReadState { node: value, binds: b.scope, reads: b.reads, in_start: b.in_start, in_len: b.in_len, src: b.src }) + count_undecl_read_binds(UndeclReadBindsState { iter: rest, scope: b.scope, reads: b.reads, in_start: b.in_start, in_len: b.in_len, src: b.src })
+      BNil => 0
+  proofs:
+    purity:
+      reads : [b.iter, b.scope, b.reads, b.in_start, b.in_len, b.src]
+      calls : [count_undecl_read_ast, count_undecl_read_binds]
+    termination:
+      bound : 4000
+
+
+-- undeclared_reads's input: ONE rule declaration + the source text. RuleDecl carries
+-- its own input FieldList + Proofs, so no program list is needed (reads are a local
+-- property). Same shape as LintRuleState.
+concept UndeclReadRuleState
+  @intention: "A rule declaration + the source text"
+  @source: vexprparse.intent:30
+  fields:
+    rd : RuleDecl
+    src : text [..256]
+
+
+-- undeclared_reads: the undeclared-read count for ONE rule. Build the local scope as
+-- lint_rule does — params converted to bindings (param_to_binding), appended in front
+-- of the body's own lets — read the declared `reads:` off the Proofs (prf_reads .
+-- rd_proofs), and recover the INPUT NAME span from the first `input:` field
+-- (fl_head_start / fl_head_len . rd_input). Then sum count_undecl_read_binds over the
+-- let RHSes and count_undecl_read_ast over the result, both checking each input read
+-- against the SAME declared list. 0 = every input the body reads is declared.
+rule undeclared_reads
+  @intention: "Number of input fields a rule reads but does not declare in `reads:` (0 if clean)"
+  @source: vexprparse.intent:30
+  input:
+    ur : UndeclReadRuleState
+  output:
+    out : number
+  logic:
+    let body = rd_body(ur.rd)
+    let binds = block_binds(body)
+    let result = block_result(body)
+    let pbinds = param_to_binding(rd_params(ur.rd))
+    let scope = append_bindings(BindAppendState { a: pbinds, b: binds })
+    let declared = prf_reads(rd_proofs(ur.rd))
+    let infl = rd_input(ur.rd)
+    let in_start = fl_head_start(infl)
+    let in_len = fl_head_len(infl)
+    let bad_in_binds = count_undecl_read_binds(UndeclReadBindsState { iter: binds, scope: scope, reads: declared, in_start: in_start, in_len: in_len, src: ur.src })
+    out = bad_in_binds + count_undecl_read_ast(UndeclReadState { node: result, binds: scope, reads: declared, in_start: in_start, in_len: in_len, src: ur.src })
+  proofs:
+    purity:
+      reads : [ur.rd, ur.src]
+      calls : [rd_body, block_binds, block_result, param_to_binding, rd_params, append_bindings, prf_reads, rd_proofs, rd_input, fl_head_start, fl_head_len, count_undecl_read_binds, count_undecl_read_ast]
+    termination:
+      bound : 64
+
+
+-- ---------------------------------------------------------------------------
+-- wiring + gate driver
+-- ---------------------------------------------------------------------------
+
+-- purity_errors's input: ONE rule declaration + the FULL program RuleList (for the
+-- calls check's callee resolution) + the source text.
+concept PurityRuleState
+  @intention: "A rule declaration + the full program rule list + the source text"
+  @source: vexprparse.intent:30
+  fields:
+    rd : RuleDecl
+    prog : RuleList
+    src : text [..256]
+
+
+-- purity_errors: the total purity-proof violations for ONE rule — undeclared_calls
+-- (defined-rule calls not in `calls:`) plus undeclared_reads (input fields not in
+-- `reads:`). 0 = the rule's declared purity proof matches its body.
+rule purity_errors
+  @intention: "Total purity-proof violations (undeclared calls + undeclared reads) for one rule"
+  @source: vexprparse.intent:30
+  input:
+    pr : PurityRuleState
+  output:
+    out : number
+  logic:
+    out = undeclared_calls(UndeclCallRuleState { rd: pr.rd, rules: pr.prog, src: pr.src }) + undeclared_reads(UndeclReadRuleState { rd: pr.rd, src: pr.src })
+  proofs:
+    purity:
+      reads : [pr.rd, pr.prog, pr.src]
+      calls : [undeclared_calls, undeclared_reads]
+    termination:
+      bound : 16
+
+
+-- purity_list's input: the rule list being ITERATED + the FULL program rule list
+-- (`all`, so every rule's calls resolve against every rule) + the source text. The
+-- iter/all split mirrors lint_callees_list.
+concept PurityListState
+  @intention: "The rule list being iterated + the full program rule list + the source text"
+  @source: vexprparse.intent:30
+  fields:
+    iter : RuleList
+    all : RuleList
+    src : text [..256]
+
+
+-- purity_list: sum purity_errors over every rule in the program. Recurses over `iter`
+-- (a field of the input), so bound + the native recursion breadcrumb; `all` and `src`
+-- are threaded unchanged. Total purity-proof violations across the program.
+rule purity_list
+  @intention: "Total purity-proof violations across every rule in a program"
+  @source: vexprparse.intent:30
+  input:
+    pl : PurityListState
+  output:
+    out : number
+  logic:
+    out = match pl.iter:
+      RCons(head, tail) => purity_errors(PurityRuleState { rd: head, prog: pl.all, src: pl.src }) + purity_list(PurityListState { iter: tail, all: pl.all, src: pl.src })
+      RNil => 0
+  proofs:
+    purity:
+      reads : [pl.iter, pl.all, pl.src]
+      calls : [purity_errors, purity_list]
+    termination:
+      bound : 4000
+
+
+-- count_purity_errors: the R6d money-shot driver. Tokenize the program source, parse
+-- the whole rule-decl sequence ONCE, then fold purity_errors over it with iter = all
+-- = the parsed program so every rule resolves its callees against the whole program.
+-- Returns the TOTAL number of purity-proof violations — 0 iff every rule's declared
+-- `reads:` / `calls:` matches its body. This is the self-hosted verifier's core
+-- (the durable artifact), run as native machine code over a parsed Verbose program.
+-- NATIVE-ONLY (multi-line source): source is argv arg 1, pos is argv arg 2 (0).
+rule count_purity_errors
+  @intention: "Tokenize, parse, and count all purity-proof (reads/calls) violations in a program"
+  @source: vexprparse.intent:30
+  input:
+    s : ScanState
+  output:
+    out : number
+  logic:
+    let toks = begin_tokenize(ScanState { source: s.source, pos: 0 })
+    let prog = parse_program(ProgramState { cell: toks, src: s.source })
+    out = purity_list(PurityListState { iter: prog, all: prog, src: s.source })
+  proofs:
+    purity:
+      reads : [s.source]
+      calls : [begin_tokenize, parse_program, purity_list]
+    termination:
+      bound : 256
+
+
+-- ============================================================================
 -- BRICK 22: the FULL PIPELINE — the self-hosting compiler's main(). Every prior
 -- driver (lint_program, lint_callees, lint_arity, type_check, argtype_check)
 -- tokenizes and parses the source on its OWN, then runs one analysis. This driver
