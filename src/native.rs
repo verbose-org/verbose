@@ -21187,6 +21187,121 @@ rule le64_neg
         let _ = fs::remove_file(em);
     }
 
+    /// Records-arc slice 3 — THE SELF-HOSTED FIELD ACCESS. `x86_node`'s AstField arm
+    /// was `int3` (b"\xcc"); slice 3 emits REAL machine code for a field access on a
+    /// LET-BOUND record. The crux vs eval: there is no runtime tag to read, so the
+    /// base's concept is resolved at COMPILE time — `let_rhs` looks up the let's RHS
+    /// Ast in the binding list, and when that RHS is a construction (AstVariant) its
+    /// concept-name span drives find_concept_index -> concept_at_index -> cd_fields ->
+    /// field_index_of to pick the payload slot. The emitted suffix mirrors R7b's
+    /// node-addr computation: pop rax (arena index) ; imul rax,rax,entry_size ;
+    /// add rax,r15 ; mov rax,[rax + 8 + 8*field_index] ; push rax (19 fixed bytes).
+    ///
+    /// A record `Foo { .. }` parses to AstVariant(Foo, Foo, fields) and constructs into
+    /// the SAME node arena as a variant, so slice 3 also taught `program_uses_arena`
+    /// (renamed from program_uses_variants) and `max_payload_fields` to count record
+    /// concepts — a group-less record program now gets the mmap arena + correct
+    /// entry_size. We check from CLEAN disk (emit ELF -> chmod +x -> run -> read stdout)
+    /// AND cross-check each program against the slice-2 interpreter oracle (eval_main):
+    ///   * `let s = Foo{a:42,b:7} ; out = s.a`  -> 42 (first field).
+    ///   * `... out = s.b`                       -> 7  (proves field_index, not slot 0).
+    ///   * `... out = s.a + s.b`                 -> 49 (both fields resolve).
+    ///   * field access AFTER other code (`let t = s.a + 1 ; out = t + s.b`) -> 50, the
+    ///     compounding-offset drift catcher: a code_size_node/x86_node AstField
+    ///     disagreement would shift the following ops' offsets and misprint / crash.
+    ///   * the R7 variant list-sum stays 6/15 (AstField arm never fires on it), and a
+    ///     scalar `2 + 3` stays 5 — both emit BYTE-IDENTICAL ELFs (pinned separately by
+    ///     r7a/r7b's byte-identity guards; here we pin the runtime values are unchanged).
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn records_slice3_astfield_codegen() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        let src = fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let elf = std::env::temp_dir().join("verbosec_test_r_s3_elf_program_src");
+        compile_native(&program, "elf_program_src", elf.to_str().unwrap(), false, false)
+            .expect("elf_program_src must compile natively");
+        // The slice-2 interpreter oracle: the emitted ELF must print what --run does.
+        let em = std::env::temp_dir().join("verbosec_test_r_s3_eval_main");
+        compile_native(&program, "eval_main", em.to_str().unwrap(), false, false)
+            .expect("eval_main must compile natively");
+
+        let oracle = |source: &str| -> i64 {
+            let r = Command::new(&em).arg(source).arg("0").output().expect("spawn eval_main");
+            assert!(r.status.success(), "eval_main must exit 0 for {:?}", source);
+            String::from_utf8_lossy(&r.stdout).trim().parse::<i64>()
+                .unwrap_or_else(|_| panic!("eval_main non-number for {:?}: {:?}", source, r.stdout))
+        };
+
+        // A bare record (no concept_group): construction goes through the arena
+        // exactly like a variant (Foo{..} parses to AstVariant(Foo, Foo, fields)).
+        let rec = "concept Foo\n  fields:\n    a : number\n    b : number\nrule main\n  logic:\n    let s = Foo { a: 42, b: 7 }\n    out = ";
+        let sa = format!("{rec}s.a");
+        let sb = format!("{rec}s.b");
+        let sab = format!("{rec}s.a + s.b");
+        // Field access AFTER other code — the compounding-offset drift catcher.
+        let compound = "concept Foo\n  fields:\n    a : number\n    b : number\nrule main\n  logic:\n    let s = Foo { a: 42, b: 7 }\n    let t = s.a + 1\n    out = t + s.b".to_string();
+        // R7 variant list-sum (AstField never fires) — must stay 6 / 15.
+        let lst = "concept_group L [max_depth: 30, max_nodes: 100]\n  concept Lst\n    variants:\n      Cons of (head : number, tail : Lst)\n      Nil\nrule main\n  logic:\n    out = sum_list(build(SEED))\nrule build(n)\n  logic:\n    out = if n == 0 then Lst::Cons { head: 0, tail: Lst::Nil } else Lst::Cons { head: n, tail: build(n - 1) }\nrule sum_list(l)\n  logic:\n    out = match l: Cons(h, t) => h + sum_list(t)  Nil => 0";
+        let lst3 = lst.replace("SEED", "3");
+        let lst5 = lst.replace("SEED", "5");
+        let scalar = "rule main\n  logic:\n    out = 2 + 3".to_string();
+
+        // (program source, expected printed value, uses_arena?)
+        let cases: &[(String, i64, bool)] = &[
+            (sa, 42, true),
+            (sb, 7, true),
+            (sab, 49, true),
+            (compound, 50, true),
+            (lst3, 6, true),
+            (lst5, 15, true),
+            (scalar, 5, false),
+        ];
+
+        for (i, (prog_src, expected, uses_arena)) in cases.iter().enumerate() {
+            // Cross-check the interpreter oracle agrees with the expected value.
+            assert_eq!(oracle(prog_src), *expected, "slice-2 oracle disagreement for {:?}", prog_src);
+
+            let mc = Command::new(&elf).args([prog_src.as_str(), "0"]).output()
+                .expect("spawn elf_program_src");
+            assert!(mc.status.success(), "elf_program_src must exit 0 for {:?}; got {:?}", prog_src, mc.status);
+            let elf_bytes = mc.stdout;
+            assert_eq!(&elf_bytes[0..4], &[0x7f, 0x45, 0x4c, 0x46], "emitted file is not ELF for {:?}", prog_src);
+            // Byte-identity guard: a record OR variant program gets the mmap arena
+            // prologue; a scalar (no concepts) keeps the pre-arena trampoline.
+            if *uses_arena {
+                assert_eq!(&elf_bytes[120..125], &[0xb8, 0x09, 0x00, 0x00, 0x00],
+                    "arena program {:?} must have the mmap prologue", prog_src);
+            } else {
+                assert_eq!(&elf_bytes[120..125], &[0xe8, 0x60, 0x00, 0x00, 0x00],
+                    "scalar program {:?} must be byte-identical (no mmap prologue)", prog_src);
+            }
+
+            let out_path = std::env::temp_dir().join(format!("verbosec_test_r_s3_a_out_{}", i));
+            fs::write(&out_path, &elf_bytes).expect("write a.out");
+            let mut perms = fs::metadata(&out_path).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&out_path, perms).expect("chmod +x");
+
+            let child = Command::new(&out_path).output().expect("execute emitted ELF");
+            assert!(child.status.success(), "emitted ELF for {:?} did not exit 0; got {:?}", prog_src, child.status);
+            let child_out: i64 = String::from_utf8_lossy(&child.stdout).trim().parse()
+                .unwrap_or_else(|_| panic!("emitted ELF produced non-number for {:?}: {:?}", prog_src, child.stdout));
+            assert_eq!(child_out, *expected, "slice-3 ELF for {:?} printed {} (expected {})", prog_src, child_out, expected);
+
+            let _ = fs::remove_file(&out_path);
+        }
+
+        let _ = fs::remove_file(elf);
+        let _ = fs::remove_file(em);
+    }
+
     /// Minimal mmap(PROT_READ|WRITE|EXEC, MAP_PRIVATE|ANON) via raw syscall —
     /// the project is zero-dependency, so we go straight to the kernel ABI
     /// instead of pulling in the `libc` crate. mmap is syscall 9 on x86-64.

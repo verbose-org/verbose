@@ -13698,6 +13698,225 @@ rule let_index
       bound : 512
 
 
+-- let_rhs (records-arc slice 3): the RHS VALUE Ast of the let binding whose name
+-- span byte-matches the query span, or the sentinel Ast::AstErr if the name is not
+-- a let of the current proc. Exact mirror of let_index (same BCons walk, same
+-- name_eq guard), but returns the binding's `value` Ast instead of its index. The
+-- codegen uses this to resolve a let-bound record's CONCEPT at COMPILE time: for
+-- `let s = Foo { ... }` the binding's value is AstVariant(Foo, ...), so AstField
+-- reads the concept from the RHS without any runtime tag.
+rule let_rhs
+  @intention: "The RHS value Ast of the let binding matching a name span, or AstErr if not a let of the proc"
+  @source: vexprparse.intent:56
+  input:
+    li : LetIndexState
+  output:
+    out : Ast
+  logic:
+    out = match li.binds:
+      BCons(name_start, name_len, value, rest) => if name_len == li.q_len and name_eq(NameEqState { src: li.src, a_start: name_start, b_start: li.q_start, len: li.q_len, off: 0 }) == 1 then value else let_rhs(LetIndexState { binds: rest, src: li.src, q_start: li.q_start, q_len: li.q_len, idx: li.idx + 1 })
+      BNil => Ast::AstErr
+  proofs:
+    purity:
+      reads : [li.binds, li.src, li.q_start, li.q_len, li.idx]
+      calls : [name_eq, let_rhs]
+    termination:
+      bound : 512
+
+
+-- ast_is_var / ast_var_start / ast_var_len (records-arc slice 3): shallow readers
+-- of an AstVar node. Non-recursive single-level matches (no callee, bound-only) —
+-- they inspect the top node ONLY. AstField codegen uses them to test whether the
+-- field-access base is a bare variable and to lift its (start, len) source span so
+-- let_rhs can be queried. Any non-AstVar node yields 0 (an honest "not a var" /
+-- empty span), so a non-var base falls through to the int3 fallback.
+rule ast_is_var
+  @intention: "1 if the AST node is an AstVar (a bare variable reference), 0 otherwise"
+  @source: vexprparse.intent:56
+  input:
+    n : Ast
+  output:
+    out : number
+  logic:
+    out = match n:
+      AstNum(value) => 0
+      AstBin(op, lhs, rhs) => 0
+      AstNeg(inner) => 0
+      AstNot(inner) => 0
+      AstVar(start, len) => 1
+      AstField(base, fstart, flen) => 0
+      AstCall(callee_start, callee_len, args) => 0
+      AstStr(start, len) => 0
+      AstBool(value) => 0
+      AstIf(cond, thn, els) => 0
+      AstErr => 0
+      AstVariant(cstart, clen, vstart, vlen, fields) => 0
+      AstMatch(scrut, arms) => 0
+  proofs:
+    purity:
+      reads : [n]
+      calls : []
+    termination:
+      bound : 16
+
+
+rule ast_var_start
+  @intention: "The start-byte of an AstVar node's source span, or 0 if the node is not an AstVar"
+  @source: vexprparse.intent:56
+  input:
+    n : Ast
+  output:
+    out : number
+  logic:
+    out = match n:
+      AstNum(value) => 0
+      AstBin(op, lhs, rhs) => 0
+      AstNeg(inner) => 0
+      AstNot(inner) => 0
+      AstVar(start, len) => start
+      AstField(base, fstart, flen) => 0
+      AstCall(callee_start, callee_len, args) => 0
+      AstStr(start, len) => 0
+      AstBool(value) => 0
+      AstIf(cond, thn, els) => 0
+      AstErr => 0
+      AstVariant(cstart, clen, vstart, vlen, fields) => 0
+      AstMatch(scrut, arms) => 0
+  proofs:
+    purity:
+      reads : [n]
+      calls : []
+    termination:
+      bound : 16
+
+
+rule ast_var_len
+  @intention: "The byte-length of an AstVar node's source span, or 0 if the node is not an AstVar"
+  @source: vexprparse.intent:56
+  input:
+    n : Ast
+  output:
+    out : number
+  logic:
+    out = match n:
+      AstNum(value) => 0
+      AstBin(op, lhs, rhs) => 0
+      AstNeg(inner) => 0
+      AstNot(inner) => 0
+      AstVar(start, len) => len
+      AstField(base, fstart, flen) => 0
+      AstCall(callee_start, callee_len, args) => 0
+      AstStr(start, len) => 0
+      AstBool(value) => 0
+      AstIf(cond, thn, els) => 0
+      AstErr => 0
+      AstVariant(cstart, clen, vstart, vlen, fields) => 0
+      AstMatch(scrut, arms) => 0
+  proofs:
+    purity:
+      reads : [n]
+      calls : []
+    termination:
+      bound : 16
+
+
+-- ast_is_variant / ast_variant_cstart / ast_variant_clen (records-arc slice 3):
+-- shallow readers of an AstVariant node (a `Concept::Variant { ... }` / record
+-- construction). Used by AstField codegen on the RESULT of let_rhs: if the let's
+-- RHS is a construction, its concept-name span (cstart, clen) resolves the concept
+-- at compile time (find_concept_index -> concept_at_index -> cd_fields), so the
+-- field's payload slot is known statically. A non-AstVariant RHS yields 0 / not-a-
+-- variant, so the codegen keeps the int3 fallback (the case is out of slice scope).
+rule ast_is_variant
+  @intention: "1 if the AST node is an AstVariant (a record/variant construction), 0 otherwise"
+  @source: vexprparse.intent:56
+  input:
+    n : Ast
+  output:
+    out : number
+  logic:
+    out = match n:
+      AstNum(value) => 0
+      AstBin(op, lhs, rhs) => 0
+      AstNeg(inner) => 0
+      AstNot(inner) => 0
+      AstVar(start, len) => 0
+      AstField(base, fstart, flen) => 0
+      AstCall(callee_start, callee_len, args) => 0
+      AstStr(start, len) => 0
+      AstBool(value) => 0
+      AstIf(cond, thn, els) => 0
+      AstErr => 0
+      AstVariant(cstart, clen, vstart, vlen, fields) => 1
+      AstMatch(scrut, arms) => 0
+  proofs:
+    purity:
+      reads : [n]
+      calls : []
+    termination:
+      bound : 16
+
+
+rule ast_variant_cstart
+  @intention: "The concept-name start-byte of an AstVariant node, or 0 if the node is not an AstVariant"
+  @source: vexprparse.intent:56
+  input:
+    n : Ast
+  output:
+    out : number
+  logic:
+    out = match n:
+      AstNum(value) => 0
+      AstBin(op, lhs, rhs) => 0
+      AstNeg(inner) => 0
+      AstNot(inner) => 0
+      AstVar(start, len) => 0
+      AstField(base, fstart, flen) => 0
+      AstCall(callee_start, callee_len, args) => 0
+      AstStr(start, len) => 0
+      AstBool(value) => 0
+      AstIf(cond, thn, els) => 0
+      AstErr => 0
+      AstVariant(cstart, clen, vstart, vlen, fields) => cstart
+      AstMatch(scrut, arms) => 0
+  proofs:
+    purity:
+      reads : [n]
+      calls : []
+    termination:
+      bound : 16
+
+
+rule ast_variant_clen
+  @intention: "The concept-name byte-length of an AstVariant node, or 0 if the node is not an AstVariant"
+  @source: vexprparse.intent:56
+  input:
+    n : Ast
+  output:
+    out : number
+  logic:
+    out = match n:
+      AstNum(value) => 0
+      AstBin(op, lhs, rhs) => 0
+      AstNeg(inner) => 0
+      AstNot(inner) => 0
+      AstVar(start, len) => 0
+      AstField(base, fstart, flen) => 0
+      AstCall(callee_start, callee_len, args) => 0
+      AstStr(start, len) => 0
+      AstBool(value) => 0
+      AstIf(cond, thn, els) => 0
+      AstErr => 0
+      AstVariant(cstart, clen, vstart, vlen, fields) => clen
+      AstMatch(scrut, arms) => 0
+  proofs:
+    purity:
+      reads : [n]
+      calls : []
+    termination:
+      bound : 16
+
+
 -- ============================================================================
 -- BRICK R7a — ARENA SETUP + VariantConstruct machine-code emit. The stack machine
 -- gains a heap: a variant VALUE is its arena INDEX (a Number flowing on the stack
@@ -13782,11 +14001,36 @@ rule max_variant_fields
       structural : vl
 
 
--- max_payload_fields: the maximum payload arity across EVERY variant of EVERY concept
--- in the program's ConceptList. entry_size = 8 * (this + 1): one 8-byte (padded) tag
--- slot plus one 8-byte slot per payload field, uniform for all nodes.
+-- concept_arena_arity (records-arc slice 3): the arena payload arity of ONE concept
+-- = the larger of its max variant payload arity (a sum-type) and its record field
+-- count (a bare record). A sum-type has fields = FNil (arity 0 from the record side);
+-- a record has variants = VarNil (arity 0 from the variant side); so the max is the
+-- right per-concept arena width for either shape. Records construct into the SAME
+-- node arena as variants (a record parses to AstVariant(Foo, Foo, fields)), so its
+-- fields need payload slots too — this is why max_payload_fields must count them.
+rule concept_arena_arity
+  @intention: "The arena payload arity of one concept: max of its variant payload arity and its record field count"
+  @source: vexprparse.intent:64
+  input:
+    c : Concept
+  output:
+    out : number
+  logic:
+    out = if max_variant_fields(cd_variants(c)) > field_list_len(cd_fields(c)) then max_variant_fields(cd_variants(c)) else field_list_len(cd_fields(c))
+  proofs:
+    purity:
+      reads : [c]
+      calls : [max_variant_fields, cd_variants, field_list_len, cd_fields]
+    termination:
+      bound : 16
+
+
+-- max_payload_fields: the maximum payload arity across EVERY concept in the program's
+-- ConceptList (per concept: max of its variant arity and its record field count, via
+-- concept_arena_arity). entry_size = 8 * (this + 1): one 8-byte (padded) tag slot plus
+-- one 8-byte slot per payload field, uniform for all nodes (variant AND record).
 rule max_payload_fields
-  @intention: "The maximum payload field count across all variants of all concepts"
+  @intention: "The maximum payload field count across all concepts (variant payload arity or record field count)"
   @source: vexprparse.intent:64
   input:
     cl : ConceptList
@@ -13794,22 +14038,26 @@ rule max_payload_fields
     out : number
   logic:
     out = match cl:
-      CCons(head, tail) => if max_variant_fields(cd_variants(head)) > max_payload_fields(tail) then max_variant_fields(cd_variants(head)) else max_payload_fields(tail)
+      CCons(head, tail) => if concept_arena_arity(head) > max_payload_fields(tail) then concept_arena_arity(head) else max_payload_fields(tail)
       CNil => 0
   proofs:
     purity:
       reads : [cl]
-      calls : [max_variant_fields, cd_variants, max_payload_fields]
+      calls : [concept_arena_arity, max_payload_fields]
     termination:
       bound : 4000
       structural : cl
 
 
--- program_uses_variants: 1 iff any concept in the ConceptList declares at least one
--- variant (a sum-type / concept_group concept). The ELF trampoline emits the mmap
--- arena prologue only when this is 1, so a variant-free program's ELF is byte-identical.
-rule program_uses_variants
-  @intention: "1 if the program declares any variant (sum-type) concept, 0 otherwise"
+-- program_uses_arena: 1 iff any concept in the ConceptList needs the node arena —
+-- either a sum-type (declares >0 variants) OR a bare record (declares >0 fields).
+-- Both construct into the arena (a record `Foo { .. }` parses to AstVariant(Foo, Foo,
+-- fields), which the R7a emit stores into r15+r14*entry_size just like a variant). The
+-- ELF trampoline emits the mmap arena prologue only when this is 1, so a program with
+-- NO concepts (a pure scalar rule) stays byte-identical (no mmap prologue). Renamed
+-- from program_uses_variants in records-arc slice 3 (records need the arena too).
+rule program_uses_arena
+  @intention: "1 if the program declares any concept needing the arena (a variant OR a record), 0 otherwise"
   @source: vexprparse.intent:64
   input:
     cl : ConceptList
@@ -13817,12 +14065,12 @@ rule program_uses_variants
     out : number
   logic:
     out = match cl:
-      CCons(head, tail) => if variant_list_len(cd_variants(head)) > 0 then 1 else program_uses_variants(tail)
+      CCons(head, tail) => if variant_list_len(cd_variants(head)) > 0 then 1 else if field_list_len(cd_fields(head)) > 0 then 1 else program_uses_arena(tail)
       CNil => 0
   proofs:
     purity:
       reads : [cl]
-      calls : [variant_list_len, cd_variants, program_uses_variants]
+      calls : [variant_list_len, cd_variants, field_list_len, cd_fields, program_uses_arena]
     termination:
       bound : 4000
       structural : cl
@@ -14325,7 +14573,13 @@ rule code_size_node
       AstNeg(inner) => code_size_node(ByteGenState { node: inner, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }) + 5
       AstNot(inner) => 1
       AstVar(start, len) => 6
-      AstField(base, fstart, flen) => 1
+      -- records-arc slice 3: a field access on a let-bound record (base = AstVar(s),
+      -- s's RHS an AstVariant) lowers to code_size_node(base) (the let-slot load, 6 B)
+      -- + a FIXED 19-byte suffix (pop rax 1 + imul rax,rax,E 7 + add rax,r15 3 +
+      -- mov rax,[rax+disp32] 7 + push rax 1). The suffix length is constant (imm32
+      -- forms) regardless of entry_size / field_index. Any other base (or non-record
+      -- RHS) keeps the 1-byte int3 fallback — MUST match x86_node's guard exactly.
+      AstField(base, fstart, flen) => if ast_is_var(base) == 1 and ast_is_variant(let_rhs(LetIndexState { binds: bg.lets, src: bg.src, q_start: ast_var_start(base), q_len: ast_var_len(base), idx: 0 })) == 1 then code_size_node(ByteGenState { node: base, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }) + 19 else 1
       AstCall(callee_start, callee_len, args) => code_size_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }) + 13
       AstStr(start, len) => 1
       AstBool(value) => 1
@@ -14342,7 +14596,7 @@ rule code_size_node
   proofs:
     purity:
       reads : [bg.node, bg.src, bg.off, bg.params, bg.lets, bg.prog, bg.concepts]
-      calls : [code_size_node, code_size_args, code_size_vfields, vfield_len, arm_list_len, code_size_arms]
+      calls : [code_size_node, code_size_args, code_size_vfields, vfield_len, arm_list_len, code_size_arms, ast_is_var, ast_is_variant, let_rhs, ast_var_start, ast_var_len]
     termination:
       bound : 8000
 
@@ -14519,7 +14773,15 @@ rule x86_node
       AstNeg(inner) => concat(x86_node(ByteGenState { node: inner, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }), b"\x58\x48\xf7\xd8\x50")
       AstNot(inner) => b"\xcc"
       AstVar(start, len) => (if param_index(ParamIndexState { params: bg.params, src: bg.src, q_start: start, q_len: len, idx: 0 }) >= 0 then concat(b"\xff\xb5", le32(16 + 8 * (param_list_len(bg.params) - 1 - param_index(ParamIndexState { params: bg.params, src: bg.src, q_start: start, q_len: len, idx: 0 })))) else if let_index(LetIndexState { binds: bg.lets, src: bg.src, q_start: start, q_len: len, idx: 0 }) >= 0 then concat(b"\xff\xb5", le32(0 - 8 * (let_index(LetIndexState { binds: bg.lets, src: bg.src, q_start: start, q_len: len, idx: 0 }) + 1))) else b"\xcc")
-      AstField(base, fstart, flen) => b"\xcc"
+      -- records-arc slice 3: field access on a let-bound record. When base is a bare
+      -- var s whose let RHS is a construction (AstVariant), s evaluates to the node's
+      -- arena INDEX (x86_node(base) = the let-slot load). The 19-byte suffix reads the
+      -- field's payload slot: pop rax (the index) ; imul rax,rax,entry_size (same E as
+      -- R7a/R7b) ; add rax,r15 (node addr) ; mov rax,[rax + 8 + 8*field_index] ; push.
+      -- field_index resolves the concept from the RHS's concept-name span at COMPILE
+      -- time (find_concept_index -> concept_at_index -> cd_fields -> field_index_of) —
+      -- no runtime tag. Any other base (or non-record RHS) keeps int3 (out of slice).
+      AstField(base, fstart, flen) => (if ast_is_var(base) == 1 and ast_is_variant(let_rhs(LetIndexState { binds: bg.lets, src: bg.src, q_start: ast_var_start(base), q_len: ast_var_len(base), idx: 0 })) == 1 then concat(x86_node(ByteGenState { node: base, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }), b"\x58\x48\x69\xc0", le32(8 * (max_payload_fields(bg.concepts) + 1)), b"\x4c\x01\xf8\x48\x8b\x80", le32(8 + 8 * field_index_of(FieldIdxState { fields: cd_fields(concept_at_index(ConceptAtState { concepts: bg.concepts, idx: find_concept_index(FindConceptIdxState { concepts: bg.concepts, src: bg.src, q_start: ast_variant_cstart(let_rhs(LetIndexState { binds: bg.lets, src: bg.src, q_start: ast_var_start(base), q_len: ast_var_len(base), idx: 0 })), q_len: ast_variant_clen(let_rhs(LetIndexState { binds: bg.lets, src: bg.src, q_start: ast_var_start(base), q_len: ast_var_len(base), idx: 0 })), idx: 0 }) })), src: bg.src, q_start: fstart, q_len: flen, idx: 0 })), b"\x50") else b"\xcc")
       AstCall(callee_start, callee_len, args) => concat(x86_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }), b"\xe8", le32(proc_offset(ProcOffState { rules: bg.prog, src: bg.src, acc: 0, q_start: callee_start, q_len: callee_len, concepts: bg.concepts }) - (bg.off + code_size_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }) + 5)), b"\x48\x81\xc4", le32(8 * arg_list_len(args)), b"\x50")
       AstStr(start, len) => b"\xcc"
       AstBool(value) => b"\xcc"
@@ -14544,7 +14806,7 @@ rule x86_node
   proofs:
     purity:
       reads : [bg.node, bg.src, bg.off, bg.params, bg.lets, bg.prog, bg.concepts]
-      calls : [x86_node, code_size_node, x86_args, code_size_args, param_index, let_index, param_list_len, proc_offset, arg_list_len, x86_vfields, x86_vpops, vfield_len, max_payload_fields, variant_tag, x86_dispatch, x86_arms, code_size_arms, arm_list_len]
+      calls : [x86_node, code_size_node, x86_args, code_size_args, param_index, let_index, param_list_len, proc_offset, arg_list_len, x86_vfields, x86_vpops, vfield_len, max_payload_fields, variant_tag, x86_dispatch, x86_arms, code_size_arms, arm_list_len, ast_is_var, ast_is_variant, let_rhs, ast_var_start, ast_var_len, ast_variant_cstart, ast_variant_clen, field_index_of, cd_fields, concept_at_index, find_concept_index]
     termination:
       bound : 8000
 
@@ -14743,13 +15005,13 @@ rule elf_program_src
     let toks = begin_tokenize(ScanState { source: s.source, pos: 0 })
     let prog = parse_program(ProgramState { cell: toks, src: s.source })
     let concepts = parse_concepts(ProgramState { cell: toks, src: s.source })
-    let uses_var = program_uses_variants(concepts)
+    let uses_var = program_uses_arena(concepts)
     let fsz = 221 + (if uses_var == 1 then 61 else 0) + program_total_size(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts })
     out = concat(b"\x7f\x45\x4c\x46\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\x3e\x00\x01\x00\x00\x00\x78\x00\x40\x00\x00\x00\x00\x00\x40\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x40\x00\x38\x00\x01\x00\x00\x00\x00\x00\x00\x00", b"\x01\x00\x00\x00\x05\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x40\x00\x00\x00\x00\x00\x00\x00\x40\x00\x00\x00\x00\x00", le64(fsz), le64(fsz), b"\x00\x10\x00\x00\x00\x00\x00\x00", (if uses_var == 1 then b"\xb8\x09\x00\x00\x00\x31\xff\xbe\x00\x00\x00\x08\xba\x03\x00\x00\x00\x41\xba\x22\x00\x00\x00\x49\xc7\xc0\xff\xff\xff\xff\x45\x31\xc9\x0f\x05\x48\x3d\x01\xf0\xff\xff\x72\x0c\xbf\x01\x00\x00\x00\xb8\x3c\x00\x00\x00\x0f\x05\x49\x89\xc7\x45\x31\xf6" else b""), b"\xe8\x60\x00\x00\x00\x48\x83\xec\x20\x49\x89\xc1\x48\x8d\x74\x24\x1f\xc6\x06\x0a\x48\x85\xc0\x79\x03\x48\xf7\xd8\x48\xc7\xc1\x0a\x00\x00\x00\x48\x31\xd2\x48\xf7\xf1\x80\xc2\x30\x48\xff\xce\x88\x16\x48\x85\xc0\x75\xed\x4d\x85\xc9\x79\x06\x48\xff\xce\xc6\x06\x2d\x48\x8d\x54\x24\x20\x48\x29\xf2\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05", x86_program(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts }))
   proofs:
     purity:
       reads : [s.source]
-      calls : [begin_tokenize, parse_program, parse_concepts, program_uses_variants, program_total_size, x86_program]
+      calls : [begin_tokenize, parse_program, parse_concepts, program_uses_arena, program_total_size, x86_program]
     termination:
       bound : 256
 
