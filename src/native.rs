@@ -34251,6 +34251,94 @@ rule two
         let _ = std::fs::remove_file(&bin);
     }
 
+    /// Records-arc slice 1: bare-record construction (`Name { field: e }`) now
+    /// PARSES to an AstVariant node (variant span == concept span) instead of
+    /// silently dropping the `{...}` and returning AstVar(Name). Parser-only —
+    /// reuses R3's variant_build / parse_vfields / AstVariant machinery via a new
+    /// `ident {`-without-`::` lookahead in parse_primary (next_opc == 23 for `{`),
+    /// advancing 2 tokens (`Name {`) before parse_vfields.
+    ///
+    /// The observable is the same `shape` fingerprint used by records_r3:
+    /// AstVariant = 1e9, each field VALUE contributes its own shape (AstVar = 100).
+    ///   - `Foo { a: x }`        → 1e9 + 100  (one field value captured)
+    ///   - `Foo { a: x, b: y }`  → 1e9 + 200  (both field values captured)
+    ///   - `Foo { }`             → 1e9        (empty record)
+    /// Regression (pre-slice-1 behaviour must be byte-identical):
+    ///   - `Foo::Bar { a: x }`   → 1e9 + 100  (`::` variant path UNCHANGED)
+    ///   - `x`                   → 100        (plain ident still AstVar)
+    ///   - `x.field`             → 1100       (field access still AstField)
+    ///   - `f(1)`                → 10000      (call still AstCall)
+    /// Continuation correctness (advance-k has no desync): a bare record nested as
+    /// a call argument closes cleanly and the outer call consumes exactly it:
+    ///   - `g(Foo { a: x })`     → 10000 (AstCall) + 1e9 + 100 (record arg)
+    #[test]
+    fn records_slice1_bare_record_parses_to_variant() {
+        let src = std::fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let bin = std::env::temp_dir().join("verbosec_test_records_slice1_shape");
+        compile_native(&program, "shape", bin.to_str().unwrap(), false, false)
+            .expect("shape must compile natively (bare-record parse included)");
+
+        let run = |source: &str| -> i64 {
+            let r = std::process::Command::new(&bin)
+                .arg(source)
+                .arg("0")
+                .output()
+                .expect("spawn slice-1 shape driver");
+            assert!(
+                r.status.success(),
+                "shape must exit 0 for {:?}; got {:?}",
+                source, r.status
+            );
+            String::from_utf8_lossy(&r.stdout)
+                .trim()
+                .parse::<i64>()
+                .unwrap_or_else(|_| panic!("shape produced non-number for {:?}: {:?}", source, r.stdout))
+        };
+
+        // Bare record → AstVariant band (1e9), field values captured (NOT AstVar 100).
+        assert_eq!(
+            run("Foo { a: x }"),
+            1_000_000_100,
+            "bare record `Foo {{ a: x }}` parses to AstVariant + 1 field value (AstVar), \
+             NOT AstVar(Foo)=100 with the braces dropped"
+        );
+        assert_eq!(
+            run("Foo { a: x, b: y }"),
+            1_000_000_200,
+            "multi-field bare record → AstVariant + 2 field values captured"
+        );
+        assert_eq!(
+            run("Foo { }"),
+            1_000_000_000,
+            "empty bare record `Foo {{ }}` → AstVariant band, empty field list"
+        );
+
+        // Regression: all pre-slice-1 ident routes are byte-identical.
+        assert_eq!(
+            run("Foo::Bar { a: x }"),
+            1_000_000_100,
+            "`::` variant path UNCHANGED — still AstVariant + field value"
+        );
+        assert_eq!(run("x"), 100, "plain ident still AstVar (100), no brace lookahead fires");
+        assert_eq!(run("x.field"), 1100, "field access still AstField (1000 + AstVar base)");
+        assert_eq!(run("f(1)"), 10000, "call still AstCall (10000 + AstNum arg = 0)");
+
+        // Continuation: a bare record nested as a call arg — the advance-k does not
+        // desync the surrounding parse (the outer call closes right after the record).
+        assert_eq!(
+            run("g(Foo { a: x })"),
+            1_000_010_100,
+            "bare record as a call arg → AstCall (10000) wrapping the record (1e9 + 100); \
+             proves parse_vfields consumed exactly `Foo {{ a: x }}` and `next` is correct"
+        );
+
+        let _ = std::fs::remove_file(&bin);
+    }
+
     /// Records-arc brick R4: the self-hosted parser (examples/vexprparse.verbose)
     /// now DESCENDS into a `concept_group` and parses its nested concepts'
     /// `variants:` blocks into a real `VariantList` AST. Two new capabilities are
