@@ -1519,3 +1519,32 @@ Termination verification (checking `decreasing : n` passes `n - k`, `structural 
 recurses on a match-binder sub-part) is genuinely harder and is DEFERRED to a
 follow-on brick. name_in_namelist is the one new membership helper — the NameList
 analogue of name_bound / rule_named.
+
+----------------------------------------------------------------------------
+Records-arc slice 4: RECORD PARAMS + the unified static concept resolver.
+Slice 3 compiled field access only on a LET-BOUND record, via an ad-hoc gate
+(base is an AstVar whose let RHS is an AstVariant). The self-source's real
+shape is a rule reading its INPUT record (`rule f(s : Foo)` ... `s.field`)
+and chained access (`o.inner.b`), so slice 4 replaces the gate with ONE
+recursive compile-time resolver: static_concept_of(base) -> the record
+concept's 0-based index, or -1 when unresolvable. An AstVar resolves through
+a TYPED param's declared-type span (PCons ty_start/ty_len — an UNTYPED param
+stays -1: the compiler never infers a param's concept from call sites) or,
+when not a param, through slice 3's let-RHS-construction check (that branch
+IS slice 3's gate, so let-bound cases resolve identically); an AstVariant
+resolves through its own concept-name span; an AstField recurses on its base
+and then resolves the accessed field's declared-type span (FCons
+ty_start/ty_len, R6b) — chained access. One minimal helper, field_concept_of,
+walks a FieldList by field NAME and returns the concept index the field's ty
+span resolves to (-1 for a missing field or a non-concept type);
+params_to_fields (R4) converts a ParamList one-for-one preserving ty spans,
+so the same walker serves `s : Foo` (param) and `inner : Foo` (field).
+find_concept_index's not-found sentinel (999999) is translated to -1 so
+`>= 0` is THE resolvability test. x86_node's AstField arm and code_size_node's
+arm share that resolver call VERBATIM (>= 0 -> base code + the fixed 19-byte
+payload-slot suffix; else int3 / 1 byte) — the same-expression discipline
+that keeps the two-pass sizes in lockstep. Record args through calls and
+recursion need NO new code: a record value is its arena index (a Number),
+and indices already flow through the call ABI (args pushed, params in rbp
+slots). Slice 3's ast_is_var / ast_var_start / ast_var_len readers are
+deleted (the resolver's AstVar arm binds the span directly).

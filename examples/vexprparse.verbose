@@ -13724,109 +13724,16 @@ rule let_rhs
       bound : 512
 
 
--- ast_is_var / ast_var_start / ast_var_len (records-arc slice 3): shallow readers
--- of an AstVar node. Non-recursive single-level matches (no callee, bound-only) —
--- they inspect the top node ONLY. AstField codegen uses them to test whether the
--- field-access base is a bare variable and to lift its (start, len) source span so
--- let_rhs can be queried. Any non-AstVar node yields 0 (an honest "not a var" /
--- empty span), so a non-var base falls through to the int3 fallback.
-rule ast_is_var
-  @intention: "1 if the AST node is an AstVar (a bare variable reference), 0 otherwise"
-  @source: vexprparse.intent:56
-  input:
-    n : Ast
-  output:
-    out : number
-  logic:
-    out = match n:
-      AstNum(value) => 0
-      AstBin(op, lhs, rhs) => 0
-      AstNeg(inner) => 0
-      AstNot(inner) => 0
-      AstVar(start, len) => 1
-      AstField(base, fstart, flen) => 0
-      AstCall(callee_start, callee_len, args) => 0
-      AstStr(start, len) => 0
-      AstBool(value) => 0
-      AstIf(cond, thn, els) => 0
-      AstErr => 0
-      AstVariant(cstart, clen, vstart, vlen, fields) => 0
-      AstMatch(scrut, arms) => 0
-  proofs:
-    purity:
-      reads : [n]
-      calls : []
-    termination:
-      bound : 16
-
-
-rule ast_var_start
-  @intention: "The start-byte of an AstVar node's source span, or 0 if the node is not an AstVar"
-  @source: vexprparse.intent:56
-  input:
-    n : Ast
-  output:
-    out : number
-  logic:
-    out = match n:
-      AstNum(value) => 0
-      AstBin(op, lhs, rhs) => 0
-      AstNeg(inner) => 0
-      AstNot(inner) => 0
-      AstVar(start, len) => start
-      AstField(base, fstart, flen) => 0
-      AstCall(callee_start, callee_len, args) => 0
-      AstStr(start, len) => 0
-      AstBool(value) => 0
-      AstIf(cond, thn, els) => 0
-      AstErr => 0
-      AstVariant(cstart, clen, vstart, vlen, fields) => 0
-      AstMatch(scrut, arms) => 0
-  proofs:
-    purity:
-      reads : [n]
-      calls : []
-    termination:
-      bound : 16
-
-
-rule ast_var_len
-  @intention: "The byte-length of an AstVar node's source span, or 0 if the node is not an AstVar"
-  @source: vexprparse.intent:56
-  input:
-    n : Ast
-  output:
-    out : number
-  logic:
-    out = match n:
-      AstNum(value) => 0
-      AstBin(op, lhs, rhs) => 0
-      AstNeg(inner) => 0
-      AstNot(inner) => 0
-      AstVar(start, len) => len
-      AstField(base, fstart, flen) => 0
-      AstCall(callee_start, callee_len, args) => 0
-      AstStr(start, len) => 0
-      AstBool(value) => 0
-      AstIf(cond, thn, els) => 0
-      AstErr => 0
-      AstVariant(cstart, clen, vstart, vlen, fields) => 0
-      AstMatch(scrut, arms) => 0
-  proofs:
-    purity:
-      reads : [n]
-      calls : []
-    termination:
-      bound : 16
-
-
 -- ast_is_variant / ast_variant_cstart / ast_variant_clen (records-arc slice 3):
 -- shallow readers of an AstVariant node (a `Concept::Variant { ... }` / record
--- construction). Used by AstField codegen on the RESULT of let_rhs: if the let's
--- RHS is a construction, its concept-name span (cstart, clen) resolves the concept
--- at compile time (find_concept_index -> concept_at_index -> cd_fields), so the
--- field's payload slot is known statically. A non-AstVariant RHS yields 0 / not-a-
--- variant, so the codegen keeps the int3 fallback (the case is out of slice scope).
+-- construction). Used by static_concept_of's let branch on the RESULT of let_rhs
+-- (slice 4 — the readers date from slice 3, whose AstField gate they served
+-- directly): if the let's RHS is a construction, its concept-name span (cstart,
+-- clen) resolves the concept at compile time (find_concept_index), so the field's
+-- payload slot is known statically. A non-AstVariant RHS yields 0 / not-a-variant,
+-- so the resolver returns -1 and the codegen keeps the int3 fallback. (Slice 3's
+-- ast_is_var / ast_var_start / ast_var_len readers were deleted in slice 4: the
+-- resolver's AstVar match arm binds the span directly.)
 rule ast_is_variant
   @intention: "1 if the AST node is an AstVariant (a record/variant construction), 0 otherwise"
   @source: vexprparse.intent:56
@@ -13915,6 +13822,128 @@ rule ast_variant_clen
       calls : []
     termination:
       bound : 16
+
+
+-- ============================================================================
+-- Records-arc slice 4 — the UNIFIED STATIC CONCEPT RESOLVER. Slice 3 gated
+-- AstField emission on one ad-hoc shape (base = AstVar whose LET RHS is an
+-- AstVariant). The self-source's real shape is a rule reading its INPUT record
+-- (`rule f(s : Foo)` ... `s.field`) and chained access (`o.inner.b`), so slice 4
+-- replaces the gate with ONE recursive compile-time resolver: static_concept_of
+-- maps a field-access base expression to its record concept's 0-based index
+-- (or -1 when unresolvable).
+--   * AstVar: a TYPED param resolves through its PCons declared-type span (an
+--     UNTYPED param stays -1 — the compiler NEVER infers a param's concept from
+--     call sites); not a param -> slice 3's let check (a let whose RHS is a
+--     construction resolves via the RHS's concept-name span — that branch IS
+--     slice 3's gate, so let-bound cases resolve identically).
+--   * AstVariant: a construction resolves via its own concept-name span.
+--   * AstField: recurse on the base; the accessed field's FCons declared-type
+--     span (R6b) names the field's record concept — CHAINED access.
+--   * anything else -> -1 (int3 in the emitter, the honest out-of-scope trap).
+-- find_concept_index's not-found sentinel (999999) is translated to -1, so
+-- `static_concept_of(base) >= 0` is THE resolvability test — x86_node and
+-- code_size_node share the call VERBATIM (the two-pass drift edge).
+-- ============================================================================
+
+-- FieldTyConceptState: a field list to walk by field NAME + the source + the
+-- query name span + the concept list the matched field's DECLARED-TYPE span is
+-- resolved against. Same walk shape as FieldIdxState, plus `concepts`.
+concept FieldTyConceptState
+  @intention: "A field list + source + a query field-name span + the concept list, for resolving a field's declared-type concept"
+  @source: vexprparse.intent:56
+  fields:
+    fields : FieldList
+    src : text [..256]
+    q_start : number [0, 4000000]
+    q_len : number [0, 4000000]
+    concepts : ConceptList
+
+
+-- StaticConceptState: a field-access base expression + the source + the current
+-- proc's params and lets + the concept list — everything static_concept_of needs
+-- to resolve the base's record concept at COMPILE time. Mirror of ByteGenState
+-- minus the emission-only fields (off, prog).
+concept StaticConceptState
+  @intention: "A base expression + source + the proc's params + lets + the concept list, for compile-time concept resolution"
+  @source: vexprparse.intent:56
+  fields:
+    node : Ast
+    src : text [..256]
+    params : ParamList
+    lets : Binding
+    concepts : ConceptList
+
+
+-- field_concept_of (records-arc slice 4): the minimal ty-span helper. Walk a
+-- FieldList for the field whose NAME byte-matches the query span (the
+-- field_index_of walk), but instead of the field's position return the concept
+-- INDEX its DECLARED-TYPE span (FCons ty_start/ty_len, R6b) resolves to — or -1
+-- when the field is missing OR its type is not a known concept (a scalar
+-- number/bool/text field resolves to no concept; an untyped param's empty ty
+-- span matches no concept name — both honest -1). Serves PARAMS too:
+-- params_to_fields (R4) converts a ParamList one-for-one preserving the ty
+-- spans, so this one walker covers `s : Foo` (param) and `inner : Foo` (field).
+rule field_concept_of
+  @intention: "The concept index a named field's declared-type span resolves to, or -1 (missing field / non-concept type)"
+  @source: vexprparse.intent:56
+  input:
+    ftc : FieldTyConceptState
+  output:
+    out : number
+  logic:
+    out = match ftc.fields:
+      FCons(name_start, name_len, ty, ty_start, ty_len, rest) => if name_len == ftc.q_len and name_eq(NameEqState { src: ftc.src, a_start: name_start, b_start: ftc.q_start, len: ftc.q_len, off: 0 }) == 1 then (if find_concept_index(FindConceptIdxState { concepts: ftc.concepts, src: ftc.src, q_start: ty_start, q_len: ty_len, idx: 0 }) == 999999 then 0 - 1 else find_concept_index(FindConceptIdxState { concepts: ftc.concepts, src: ftc.src, q_start: ty_start, q_len: ty_len, idx: 0 })) else field_concept_of(FieldTyConceptState { fields: rest, src: ftc.src, q_start: ftc.q_start, q_len: ftc.q_len, concepts: ftc.concepts })
+      FNil => 0 - 1
+  proofs:
+    purity:
+      reads : [ftc.fields, ftc.src, ftc.q_start, ftc.q_len, ftc.concepts]
+      calls : [name_eq, find_concept_index, field_concept_of]
+    termination:
+      bound : 4000
+
+
+-- static_concept_of (records-arc slice 4): resolve a field-access base
+-- expression to its record concept's 0-based index at COMPILE time, or -1 when
+-- the base is out of the compilable subset. The three resolving arms:
+--   AstVar — param first (typed param -> its PCons ty span via the
+--     params_to_fields + field_concept_of walk; untyped -> -1, never inferred),
+--     else the let branch (RHS a construction -> its concept span, slice 3's
+--     check verbatim).
+--   AstVariant — field access directly on a construction: its own concept span.
+--   AstField — CHAINED access: recurse on the base, then resolve the accessed
+--     field's declared-type span within the base concept's FieldList.
+-- Everything else is -1. Recursion is on a sub-part of the packed input's Ast
+-- field, so bound-only termination + the native recursion breadcrumb, exactly
+-- like the other packed-input walkers (code_size_node / let_rhs / ...).
+rule static_concept_of
+  @intention: "Resolve a field-access base expression to its record concept's 0-based index at compile time, or -1"
+  @source: vexprparse.intent:56
+  input:
+    sc : StaticConceptState
+  output:
+    out : number
+  logic:
+    out = match sc.node:
+      AstNum(value) => 0 - 1
+      AstBin(op, lhs, rhs) => 0 - 1
+      AstNeg(inner) => 0 - 1
+      AstNot(inner) => 0 - 1
+      AstVar(start, len) => if param_index(ParamIndexState { params: sc.params, src: sc.src, q_start: start, q_len: len, idx: 0 }) >= 0 then field_concept_of(FieldTyConceptState { fields: params_to_fields(sc.params), src: sc.src, q_start: start, q_len: len, concepts: sc.concepts }) else (if ast_is_variant(let_rhs(LetIndexState { binds: sc.lets, src: sc.src, q_start: start, q_len: len, idx: 0 })) == 1 then (if find_concept_index(FindConceptIdxState { concepts: sc.concepts, src: sc.src, q_start: ast_variant_cstart(let_rhs(LetIndexState { binds: sc.lets, src: sc.src, q_start: start, q_len: len, idx: 0 })), q_len: ast_variant_clen(let_rhs(LetIndexState { binds: sc.lets, src: sc.src, q_start: start, q_len: len, idx: 0 })), idx: 0 }) == 999999 then 0 - 1 else find_concept_index(FindConceptIdxState { concepts: sc.concepts, src: sc.src, q_start: ast_variant_cstart(let_rhs(LetIndexState { binds: sc.lets, src: sc.src, q_start: start, q_len: len, idx: 0 })), q_len: ast_variant_clen(let_rhs(LetIndexState { binds: sc.lets, src: sc.src, q_start: start, q_len: len, idx: 0 })), idx: 0 })) else 0 - 1)
+      AstField(base, fstart, flen) => if static_concept_of(StaticConceptState { node: base, src: sc.src, params: sc.params, lets: sc.lets, concepts: sc.concepts }) >= 0 then field_concept_of(FieldTyConceptState { fields: cd_fields(concept_at_index(ConceptAtState { concepts: sc.concepts, idx: static_concept_of(StaticConceptState { node: base, src: sc.src, params: sc.params, lets: sc.lets, concepts: sc.concepts }) })), src: sc.src, q_start: fstart, q_len: flen, concepts: sc.concepts }) else 0 - 1
+      AstCall(callee_start, callee_len, args) => 0 - 1
+      AstStr(start, len) => 0 - 1
+      AstBool(value) => 0 - 1
+      AstIf(cond, thn, els) => 0 - 1
+      AstErr => 0 - 1
+      AstVariant(cstart, clen, vstart, vlen, fields) => if find_concept_index(FindConceptIdxState { concepts: sc.concepts, src: sc.src, q_start: cstart, q_len: clen, idx: 0 }) == 999999 then 0 - 1 else find_concept_index(FindConceptIdxState { concepts: sc.concepts, src: sc.src, q_start: cstart, q_len: clen, idx: 0 })
+      AstMatch(scrut, arms) => 0 - 1
+  proofs:
+    purity:
+      reads : [sc.node, sc.src, sc.params, sc.lets, sc.concepts]
+      calls : [param_index, field_concept_of, params_to_fields, ast_is_variant, let_rhs, ast_variant_cstart, ast_variant_clen, find_concept_index, static_concept_of, cd_fields, concept_at_index]
+    termination:
+      bound : 8000
 
 
 -- ============================================================================
@@ -14573,13 +14602,15 @@ rule code_size_node
       AstNeg(inner) => code_size_node(ByteGenState { node: inner, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }) + 5
       AstNot(inner) => 1
       AstVar(start, len) => 6
-      -- records-arc slice 3: a field access on a let-bound record (base = AstVar(s),
-      -- s's RHS an AstVariant) lowers to code_size_node(base) (the let-slot load, 6 B)
-      -- + a FIXED 19-byte suffix (pop rax 1 + imul rax,rax,E 7 + add rax,r15 3 +
-      -- mov rax,[rax+disp32] 7 + push rax 1). The suffix length is constant (imm32
-      -- forms) regardless of entry_size / field_index. Any other base (or non-record
-      -- RHS) keeps the 1-byte int3 fallback — MUST match x86_node's guard exactly.
-      AstField(base, fstart, flen) => if ast_is_var(base) == 1 and ast_is_variant(let_rhs(LetIndexState { binds: bg.lets, src: bg.src, q_start: ast_var_start(base), q_len: ast_var_len(base), idx: 0 })) == 1 then code_size_node(ByteGenState { node: base, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }) + 19 else 1
+      -- records-arc slice 4: a field access on any STATICALLY-RESOLVABLE base (typed
+      -- param / let-bound construction / chained field / direct construction — the
+      -- static_concept_of arms) lowers to code_size_node(base) + a FIXED 19-byte
+      -- suffix (pop rax 1 + imul rax,rax,E 7 + add rax,r15 3 + mov rax,[rax+disp32] 7
+      -- + push rax 1). The suffix length is constant (imm32 forms) regardless of
+      -- entry_size / field_index. An unresolvable base keeps the 1-byte int3 fallback.
+      -- The resolvability test is the SAME static_concept_of call x86_node makes —
+      -- a divergence desyncs every downstream offset (the two-pass sharp edge).
+      AstField(base, fstart, flen) => if static_concept_of(StaticConceptState { node: base, src: bg.src, params: bg.params, lets: bg.lets, concepts: bg.concepts }) >= 0 then code_size_node(ByteGenState { node: base, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }) + 19 else 1
       AstCall(callee_start, callee_len, args) => code_size_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }) + 13
       AstStr(start, len) => 1
       AstBool(value) => 1
@@ -14596,7 +14627,7 @@ rule code_size_node
   proofs:
     purity:
       reads : [bg.node, bg.src, bg.off, bg.params, bg.lets, bg.prog, bg.concepts]
-      calls : [code_size_node, code_size_args, code_size_vfields, vfield_len, arm_list_len, code_size_arms, ast_is_var, ast_is_variant, let_rhs, ast_var_start, ast_var_len]
+      calls : [code_size_node, code_size_args, code_size_vfields, vfield_len, arm_list_len, code_size_arms, static_concept_of]
     termination:
       bound : 8000
 
@@ -14773,15 +14804,19 @@ rule x86_node
       AstNeg(inner) => concat(x86_node(ByteGenState { node: inner, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }), b"\x58\x48\xf7\xd8\x50")
       AstNot(inner) => b"\xcc"
       AstVar(start, len) => (if param_index(ParamIndexState { params: bg.params, src: bg.src, q_start: start, q_len: len, idx: 0 }) >= 0 then concat(b"\xff\xb5", le32(16 + 8 * (param_list_len(bg.params) - 1 - param_index(ParamIndexState { params: bg.params, src: bg.src, q_start: start, q_len: len, idx: 0 })))) else if let_index(LetIndexState { binds: bg.lets, src: bg.src, q_start: start, q_len: len, idx: 0 }) >= 0 then concat(b"\xff\xb5", le32(0 - 8 * (let_index(LetIndexState { binds: bg.lets, src: bg.src, q_start: start, q_len: len, idx: 0 }) + 1))) else b"\xcc")
-      -- records-arc slice 3: field access on a let-bound record. When base is a bare
-      -- var s whose let RHS is a construction (AstVariant), s evaluates to the node's
-      -- arena INDEX (x86_node(base) = the let-slot load). The 19-byte suffix reads the
-      -- field's payload slot: pop rax (the index) ; imul rax,rax,entry_size (same E as
-      -- R7a/R7b) ; add rax,r15 (node addr) ; mov rax,[rax + 8 + 8*field_index] ; push.
-      -- field_index resolves the concept from the RHS's concept-name span at COMPILE
-      -- time (find_concept_index -> concept_at_index -> cd_fields -> field_index_of) —
-      -- no runtime tag. Any other base (or non-record RHS) keeps int3 (out of slice).
-      AstField(base, fstart, flen) => (if ast_is_var(base) == 1 and ast_is_variant(let_rhs(LetIndexState { binds: bg.lets, src: bg.src, q_start: ast_var_start(base), q_len: ast_var_len(base), idx: 0 })) == 1 then concat(x86_node(ByteGenState { node: base, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }), b"\x58\x48\x69\xc0", le32(8 * (max_payload_fields(bg.concepts) + 1)), b"\x4c\x01\xf8\x48\x8b\x80", le32(8 + 8 * field_index_of(FieldIdxState { fields: cd_fields(concept_at_index(ConceptAtState { concepts: bg.concepts, idx: find_concept_index(FindConceptIdxState { concepts: bg.concepts, src: bg.src, q_start: ast_variant_cstart(let_rhs(LetIndexState { binds: bg.lets, src: bg.src, q_start: ast_var_start(base), q_len: ast_var_len(base), idx: 0 })), q_len: ast_variant_clen(let_rhs(LetIndexState { binds: bg.lets, src: bg.src, q_start: ast_var_start(base), q_len: ast_var_len(base), idx: 0 })), idx: 0 }) })), src: bg.src, q_start: fstart, q_len: flen, idx: 0 })), b"\x50") else b"\xcc")
+      -- records-arc slice 4: field access via the UNIFIED static resolver. The base
+      -- can be a TYPED param (`rule f(s : Foo)` ... s.field — the record-input shape),
+      -- a let-bound construction (slice 3's case, now the resolver's let branch), a
+      -- CHAINED field access (o.inner.b — the resolver recurses through FCons ty
+      -- spans), or a direct construction. x86_node(base) leaves the node's arena
+      -- INDEX on the stack; the 19-byte suffix reads the field's payload slot:
+      -- pop rax (the index) ; imul rax,rax,entry_size (same E as R7a/R7b) ;
+      -- add rax,r15 (node addr) ; mov rax,[rax + 8 + 8*field_index] ; push.
+      -- field_index resolves against static_concept_of's concept at COMPILE time
+      -- (concept_at_index -> cd_fields -> field_index_of) — no runtime tag. An
+      -- unresolvable base keeps int3 (an UNTYPED param stays out BY DESIGN — the
+      -- compiler never infers a param's concept from call sites).
+      AstField(base, fstart, flen) => (if static_concept_of(StaticConceptState { node: base, src: bg.src, params: bg.params, lets: bg.lets, concepts: bg.concepts }) >= 0 then concat(x86_node(ByteGenState { node: base, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }), b"\x58\x48\x69\xc0", le32(8 * (max_payload_fields(bg.concepts) + 1)), b"\x4c\x01\xf8\x48\x8b\x80", le32(8 + 8 * field_index_of(FieldIdxState { fields: cd_fields(concept_at_index(ConceptAtState { concepts: bg.concepts, idx: static_concept_of(StaticConceptState { node: base, src: bg.src, params: bg.params, lets: bg.lets, concepts: bg.concepts }) })), src: bg.src, q_start: fstart, q_len: flen, idx: 0 })), b"\x50") else b"\xcc")
       AstCall(callee_start, callee_len, args) => concat(x86_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }), b"\xe8", le32(proc_offset(ProcOffState { rules: bg.prog, src: bg.src, acc: 0, q_start: callee_start, q_len: callee_len, concepts: bg.concepts }) - (bg.off + code_size_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }) + 5)), b"\x48\x81\xc4", le32(8 * arg_list_len(args)), b"\x50")
       AstStr(start, len) => b"\xcc"
       AstBool(value) => b"\xcc"
@@ -14806,7 +14841,7 @@ rule x86_node
   proofs:
     purity:
       reads : [bg.node, bg.src, bg.off, bg.params, bg.lets, bg.prog, bg.concepts]
-      calls : [x86_node, code_size_node, x86_args, code_size_args, param_index, let_index, param_list_len, proc_offset, arg_list_len, x86_vfields, x86_vpops, vfield_len, max_payload_fields, variant_tag, x86_dispatch, x86_arms, code_size_arms, arm_list_len, ast_is_var, ast_is_variant, let_rhs, ast_var_start, ast_var_len, ast_variant_cstart, ast_variant_clen, field_index_of, cd_fields, concept_at_index, find_concept_index]
+      calls : [x86_node, code_size_node, x86_args, code_size_args, param_index, let_index, param_list_len, proc_offset, arg_list_len, x86_vfields, x86_vpops, vfield_len, max_payload_fields, variant_tag, x86_dispatch, x86_arms, code_size_arms, arm_list_len, static_concept_of, field_index_of, cd_fields, concept_at_index]
     termination:
       bound : 8000
 

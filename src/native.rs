@@ -21302,6 +21302,110 @@ rule le64_neg
         let _ = fs::remove_file(em);
     }
 
+    /// Records-arc slice 4 — RECORD PARAMS + the unified static concept resolver.
+    /// Slice 3 gated AstField emission on one ad-hoc shape (base = AstVar whose LET
+    /// RHS is an AstVariant). Slice 4 replaces the gate with ONE recursive compile-time
+    /// resolver (`static_concept_of`): an AstVar resolves through a TYPED param's
+    /// declared-type span (PCons ty_start/ty_len) or through the let-RHS-construction
+    /// check (slice 3's case, now the resolver's let branch); an AstVariant through its
+    /// own concept-name span; an AstField recurses on its base and resolves the accessed
+    /// field's declared-type span (FCons ty_start/ty_len) — CHAINED access. The emitted
+    /// suffix is UNCHANGED from slice 3 (pop rax ; imul rax,rax,entry_size ; add rax,r15 ;
+    /// mov rax,[rax + 8 + 8*field_index] ; push rax — 19 fixed bytes); only the
+    /// resolvability gate + the concept source generalized. Record args through calls
+    /// and recursion need NO new code: a record value is its arena index (a Number),
+    /// already flowing through the call ABI. We check from CLEAN disk (emit ELF ->
+    /// chmod +x -> run -> read stdout) AND cross-check each program against the
+    /// interpreter oracle (eval_main):
+    ///   * PARAM access — `get_a(Foo{a:42,b:7})` with `get_a(s : Foo): out = s.a + s.b`
+    ///        -> 49: the real self-source shape (a rule reading its input record).
+    ///   * RECURSION with record args — `go(St{n:5,acc:0})` with `go(s : St): out =
+    ///        if s.n == 0 then s.acc else go(St{n: s.n - 1, acc: s.acc + s.n})` -> 15:
+    ///        the arc's real target (a rule recursing on a state record).
+    ///   * CHAINED access — `Outer / inner : Foo`, `let o = Outer{inner: Foo{a:42,b:7}} ;
+    ///        out = o.inner.b` -> 7: proves the recursive resolver + the FCons ty spans
+    ///        (a concept-typed FIELD resolves the next hop).
+    ///   * slice-3 regression — `let s = Foo{a:42,b:7} ; out = s.a` -> 42: the resolver's
+    ///        let branch IS slice 3's check (pinned byte-identical during development).
+    ///   * the R7 variant list-sum stays 6 (match/variant path untouched).
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn records_slice4_static_concept_resolver() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        let src = fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let elf = std::env::temp_dir().join("verbosec_test_r_s4_elf_program_src");
+        compile_native(&program, "elf_program_src", elf.to_str().unwrap(), false, false)
+            .expect("elf_program_src must compile natively");
+        // The interpreter oracle: the emitted ELF must print what --run does.
+        let em = std::env::temp_dir().join("verbosec_test_r_s4_eval_main");
+        compile_native(&program, "eval_main", em.to_str().unwrap(), false, false)
+            .expect("eval_main must compile natively");
+
+        let oracle = |source: &str| -> i64 {
+            let r = Command::new(&em).arg(source).arg("0").output().expect("spawn eval_main");
+            assert!(r.status.success(), "eval_main must exit 0 for {:?}", source);
+            String::from_utf8_lossy(&r.stdout).trim().parse::<i64>()
+                .unwrap_or_else(|_| panic!("eval_main non-number for {:?}: {:?}", source, r.stdout))
+        };
+
+        // PARAM access: the record-input shape — a rule reads its typed input record.
+        let param_access = "concept Foo\n  fields:\n    a : number\n    b : number\nrule main\n  logic:\n    out = get_a(Foo { a: 42, b: 7 })\nrule get_a(s : Foo)\n  logic:\n    out = s.a + s.b".to_string();
+        // RECURSION with record args: a rule recursing on a state record (the arc's target).
+        let rec_state = "concept St\n  fields:\n    n : number\n    acc : number\nrule main\n  logic:\n    out = go(St { n: 5, acc: 0 })\nrule go(s : St)\n  logic:\n    out = if s.n == 0 then s.acc else go(St { n: s.n - 1, acc: s.acc + s.n })".to_string();
+        // CHAINED access: a concept-typed field (`inner : Foo`) resolves the next hop.
+        let chained = "concept Foo\n  fields:\n    a : number\n    b : number\nconcept Outer\n  fields:\n    inner : Foo\nrule main\n  logic:\n    let o = Outer { inner: Foo { a: 42, b: 7 } }\n    out = o.inner.b".to_string();
+        // Slice-3 regression: the let-bound case (the resolver's let branch).
+        let let_bound = "concept Foo\n  fields:\n    a : number\n    b : number\nrule main\n  logic:\n    let s = Foo { a: 42, b: 7 }\n    out = s.a".to_string();
+        // R7 variant list-sum: AstField never fires — the match/variant path unchanged.
+        let lst = "concept_group L [max_depth: 30, max_nodes: 100]\n  concept Lst\n    variants:\n      Cons of (head : number, tail : Lst)\n      Nil\nrule main\n  logic:\n    out = sum_list(build(3))\nrule build(n)\n  logic:\n    out = if n == 0 then Lst::Cons { head: 0, tail: Lst::Nil } else Lst::Cons { head: n, tail: build(n - 1) }\nrule sum_list(l)\n  logic:\n    out = match l: Cons(h, t) => h + sum_list(t)  Nil => 0".to_string();
+
+        let cases: &[(String, i64)] = &[
+            (param_access, 49),
+            (rec_state, 15),
+            (chained, 7),
+            (let_bound, 42),
+            (lst, 6),
+        ];
+
+        for (i, (prog_src, expected)) in cases.iter().enumerate() {
+            // Cross-check the interpreter oracle agrees with the expected value.
+            assert_eq!(oracle(prog_src), *expected, "oracle disagreement for {:?}", prog_src);
+
+            let mc = Command::new(&elf).args([prog_src.as_str(), "0"]).output()
+                .expect("spawn elf_program_src");
+            assert!(mc.status.success(), "elf_program_src must exit 0 for {:?}; got {:?}", prog_src, mc.status);
+            let elf_bytes = mc.stdout;
+            assert_eq!(&elf_bytes[0..4], &[0x7f, 0x45, 0x4c, 0x46], "emitted file is not ELF for {:?}", prog_src);
+            // Every slice-4 case declares concepts, so all get the mmap arena prologue.
+            assert_eq!(&elf_bytes[120..125], &[0xb8, 0x09, 0x00, 0x00, 0x00],
+                "arena program {:?} must have the mmap prologue", prog_src);
+
+            let out_path = std::env::temp_dir().join(format!("verbosec_test_r_s4_a_out_{}", i));
+            fs::write(&out_path, &elf_bytes).expect("write a.out");
+            let mut perms = fs::metadata(&out_path).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&out_path, perms).expect("chmod +x");
+
+            let child = Command::new(&out_path).output().expect("execute emitted ELF");
+            assert!(child.status.success(), "emitted ELF for {:?} did not exit 0; got {:?}", prog_src, child.status);
+            let child_out: i64 = String::from_utf8_lossy(&child.stdout).trim().parse()
+                .unwrap_or_else(|_| panic!("emitted ELF produced non-number for {:?}: {:?}", prog_src, child.stdout));
+            assert_eq!(child_out, *expected, "slice-4 ELF for {:?} printed {} (expected {})", prog_src, child_out, expected);
+
+            let _ = fs::remove_file(&out_path);
+        }
+
+        let _ = fs::remove_file(elf);
+        let _ = fs::remove_file(em);
+    }
+
     /// Minimal mmap(PROT_READ|WRITE|EXEC, MAP_PRIVATE|ANON) via raw syscall —
     /// the project is zero-dependency, so we go straight to the kernel ABI
     /// instead of pulling in the `libc` crate. mmap is syscall 9 on x86-64.
