@@ -4365,7 +4365,11 @@ concept EvalEnvArg
 -- recursive call threads the SAME env and src down, so a nested sub-expression
 -- sees the same bindings. AstBin makes TWO sibling recursive calls (lhs and rhs)
 -- while carrying the text field src — exactly the shape the 2b052a7 fix unblocked.
--- AstField / AstCall / AstStr stay 0 (out of scope for this brick — see header).
+-- AstCall / AstStr stay 0 (out of scope for this brick — see header). Records-arc
+-- slice 2: AstField(base, .name) now RESOLVES a record/variant field access — it
+-- evaluates base to a VData, recovers the concept from tag / 256, finds the field's
+-- position via field_index_of, and reads that slot of the payload via vlist_nth
+-- (defensive VNum 0 when base is not a VData, the field is absent, or out of range).
 -- Bound-only termination + the native recursion breadcrumb: each recursive call
 -- walks a strict sub-node of ea.node, but ea.node is a FIELD of the packed input
 -- (not the input), so the `structural` proof does not fit — see the header.
@@ -4383,7 +4387,7 @@ rule eval_ast_env
       AstNeg(inner) => Value::VNum { n: 0 - vnum_of(eval_ast_env(EvalEnvArg { node: inner, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts })) }
       AstNot(inner) => Value::VNum { n: if vnum_of(eval_ast_env(EvalEnvArg { node: inner, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts })) == 0 then 1 else 0 }
       AstVar(start, len) => venv_lookup(VEnvLookState { env: ea.env, src: ea.src, q_start: start, q_len: len })
-      AstField(base, fstart, flen) => Value::VNum { n: 0 }
+      AstField(base, fstart, flen) => vlist_nth(VListNthState { vs: vdata_payload(eval_ast_env(EvalEnvArg { node: base, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts })), k: field_index_of(FieldIdxState { fields: cd_fields(concept_at_index(ConceptAtState { concepts: ea.concepts, idx: vdata_tag(eval_ast_env(EvalEnvArg { node: base, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts })) / 256 })), src: ea.src, q_start: fstart, q_len: flen, idx: 0 }) })
       AstCall(callee_start, callee_len, args) => eval_call(EvalCallState { callee_start: callee_start, callee_len: callee_len, args: args, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts })
       AstIf(cond, thn, els) => if vnum_of(eval_ast_env(EvalEnvArg { node: cond, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts })) != 0 then eval_ast_env(EvalEnvArg { node: thn, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts }) else eval_ast_env(EvalEnvArg { node: els, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts })
       AstBool(value) => Value::VNum { n: value }
@@ -4400,7 +4404,7 @@ rule eval_ast_env
   proofs:
     purity:
       reads : [ea.node, ea.env, ea.src, ea.prog, ea.concepts]
-      calls : [eval_ast_env, venv_lookup, eval_call, vnum_of, variant_tag, eval_vfields, eval_match]
+      calls : [eval_ast_env, venv_lookup, eval_call, vnum_of, variant_tag, eval_vfields, eval_match, vdata_payload, vdata_tag, concept_at_index, cd_fields, field_index_of, vlist_nth]
     termination:
       bound : 4000
 
@@ -4838,6 +4842,78 @@ rule vl_tail
       bound : 16
 
 
+-- field_index_of's input: a concept's field list + source + a query field-name span
+-- + the running 0-based index. Mirror of FindVarIdxState but over a FieldList (used
+-- by AstField eval to resolve `s.a` to the field's position in the concept).
+concept FieldIdxState
+  @intention: "A field list + the source + a query field-name span + the running index, for finding a field's position"
+  @source: vexprparse.intent:36
+  fields:
+    fields : FieldList
+    src : text [..256]
+    q_start : number [0, 4000000]
+    q_len : number [0, 4000000]
+    idx : number [0, 4000000]
+
+
+-- field_index_of: the 0-based position of the field whose name byte-equals the query
+-- span (-1 if none). Mirror of find_variant_index over a FieldList: the k-th record
+-- field lives at the k-th payload slot, so AstField reads the payload at this index.
+-- Assumes construction field order == declaration order (records-arc slice 2). Bound-
+-- only termination (the shrinking list tail is a field of the packed input) + the
+-- native recursion breadcrumb, exactly like find_variant_index / find_concept_index.
+rule field_index_of
+  @intention: "The 0-based position of the field whose name matches the query span (-1 if none)"
+  @source: vexprparse.intent:36
+  input:
+    fi : FieldIdxState
+  output:
+    out : number
+  logic:
+    out = match fi.fields:
+      FCons(name_start, name_len, ty, ty_start, ty_len, rest) => if name_len == fi.q_len and name_eq(NameEqState { src: fi.src, a_start: name_start, b_start: fi.q_start, len: fi.q_len, off: 0 }) == 1 then fi.idx else field_index_of(FieldIdxState { fields: rest, src: fi.src, q_start: fi.q_start, q_len: fi.q_len, idx: fi.idx + 1 })
+      FNil => 0 - 1
+  proofs:
+    purity:
+      reads : [fi.fields, fi.src, fi.q_start, fi.q_len, fi.idx]
+      calls : [name_eq, field_index_of]
+    termination:
+      bound : 4000
+
+
+-- vlist_nth's input: a value-list (a variant/record's evaluated payload) + a 0-based
+-- index. Reads the k-th payload Value.
+concept VListNthState
+  @intention: "A value-list + a 0-based index, for reading the k-th payload value"
+  @source: vexprparse.intent:36
+  fields:
+    vs : ValueList
+    k : number [0, 4000000]
+
+
+-- vlist_nth: the k-th Value of a ValueList (VNum 0 if the index is out of range).
+-- Mirror of concept_at_index over a ValueList: recurses only when k != 0, so a valid
+-- k in [0, len) walks straight to its slot and an over-long / empty list falls to
+-- VLNil -> VNum 0. Bound-only termination + the native recursion breadcrumb.
+rule vlist_nth
+  @intention: "The k-th value of a value-list (VNum 0 if out of range)"
+  @source: vexprparse.intent:36
+  input:
+    vn : VListNthState
+  output:
+    out : Value
+  logic:
+    out = match vn.vs:
+      VLCons(head, tail) => if vn.k == 0 then head else vlist_nth(VListNthState { vs: tail, k: vn.k - 1 })
+      VLNil => Value::VNum { n: 0 }
+  proofs:
+    purity:
+      reads : [vn.vs, vn.k]
+      calls : [vlist_nth]
+    termination:
+      bound : 4000
+
+
 -- find_variant_index's input: a variant list + source + a query variant-name span +
 -- the running 0-based index. Mirror of FindConceptIdxState but over a VariantList.
 concept FindVarIdxState
@@ -4891,6 +4967,12 @@ concept VariantTagState
 -- source (no global table). At a match, the scrutinee VData carries this tag; the
 -- dispatch recovers concept_index = tag / 256 and recomputes each arm's tag to
 -- compare. Non-recursive (bound-only). 256 > the max variants of any one concept.
+-- Records-arc slice 2: a record construction `Foo { a, b }` parses to
+-- AstVariant(Foo, Foo, fields) — the variant span equals the concept name. Foo is a
+-- record, so its VariantList is empty and find_variant_index returns 999999 (no such
+-- variant). In that case the tag defaults to concept_index * 256 + 0 (variant-index
+-- 0 for the sole record shape), so AstField eval recovers the concept from tag / 256.
+-- Real variants always resolve (vidx < 999999), so their tag is unperturbed.
 rule variant_tag
   @intention: "A variant construction's identity tag: concept_index * 256 + variant_index"
   @source: vexprparse.intent:36
@@ -4900,12 +4982,13 @@ rule variant_tag
     out : number
   logic:
     let cidx = find_concept_index(FindConceptIdxState { concepts: vt.concepts, src: vt.src, q_start: vt.cstart, q_len: vt.clen, idx: 0 })
-    let vidx = find_variant_index(FindVarIdxState { variants: cd_variants(concept_at_index(ConceptAtState { concepts: vt.concepts, idx: cidx })), src: vt.src, q_start: vt.vstart, q_len: vt.vlen, idx: 0 })
-    out = cidx * 256 + vidx
+    let variants = cd_variants(concept_at_index(ConceptAtState { concepts: vt.concepts, idx: cidx }))
+    let vidx = find_variant_index(FindVarIdxState { variants: variants, src: vt.src, q_start: vt.vstart, q_len: vt.vlen, idx: 0 })
+    out = if vidx == 999999 and variant_list_len(variants) == 0 then cidx * 256 else cidx * 256 + vidx
   proofs:
     purity:
       reads : [vt.concepts, vt.src, vt.cstart, vt.clen, vt.vstart, vt.vlen]
-      calls : [find_concept_index, find_variant_index, cd_variants, concept_at_index]
+      calls : [find_concept_index, find_variant_index, cd_variants, concept_at_index, variant_list_len]
     termination:
       bound : 64
 

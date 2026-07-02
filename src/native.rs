@@ -34875,6 +34875,71 @@ rule two
         let _ = std::fs::remove_file(&em);
     }
 
+    /// Records-arc slice 2: the self-hosted interpreter now RESOLVES record/variant
+    /// FIELD ACCESS. `eval_ast_env`'s AstField arm (previously stubbed to VNum 0) now
+    /// evaluates the base to a VData, recovers the concept from tag / 256, finds the
+    /// field's position via `field_index_of`, and reads that payload slot via
+    /// `vlist_nth`. `variant_tag` became record-aware: a record construction
+    /// `Foo { a, b }` parses to AstVariant(Foo, Foo, fields), so the variant name is
+    /// not found among Foo's (empty) variants — the tag defaults to concept_index*256
+    /// + 0 so the field-access path recovers the concept.
+    ///
+    /// Records and variants coexist in ONE test (the record-aware `variant_tag` must
+    /// not perturb real-variant tagging): s.a -> 42, s.b -> 7, s.a + s.b -> 49, and a
+    /// recursive variant list-sum -> 6 (byte-identical to R6c).
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn records_slice2_astfield_eval() {
+        let src = std::fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let em = std::env::temp_dir().join("verbosec_test_slice2_astfield");
+        compile_native(&program, "eval_main", em.to_str().unwrap(), false, false)
+            .expect("eval_main must compile natively (records slice 2 AstField eval)");
+
+        let run = |source: &str| -> i64 {
+            let r = std::process::Command::new(&em)
+                .arg(source)
+                .arg("0")
+                .output()
+                .expect("spawn eval_main");
+            assert!(
+                r.status.success(),
+                "eval_main must exit 0 for {:?}; got {:?}",
+                source, r.status
+            );
+            String::from_utf8_lossy(&r.stdout)
+                .trim()
+                .parse::<i64>()
+                .unwrap_or_else(|_| panic!("eval_main produced non-number for {:?}: {:?}", source, r.stdout))
+        };
+
+        // A top-level record concept + a `let s = Foo { a: 42, b: 7 }` binding, then
+        // field access. field_index_of resolves .a to slot 0 and .b to slot 1, so both
+        // reads land on the right payload value (not just "first slot").
+        let rec = "concept Foo\n  fields:\n    a : number\n    b : number\nrule main\n  logic:\n    let s = Foo { a: 42, b: 7 }\n    out = s.a";
+        assert_eq!(run(rec), 42, "slice 2: record field access s.a -> 42");
+        assert_eq!(
+            run(&rec.replace("out = s.a", "out = s.b")),
+            7,
+            "slice 2: record field access s.b -> 7 (field_index resolution, not first slot)"
+        );
+        assert_eq!(
+            run(&rec.replace("out = s.a", "out = s.a + s.b")),
+            49,
+            "slice 2: s.a + s.b -> 49 (both fields resolve)"
+        );
+
+        // Coexistence: the record-aware variant_tag must NOT perturb real variants.
+        // Recursive variant list-sum build(3) -> 6, byte-identical to R6c.
+        let ls = "concept_group L [max_depth: 64, max_nodes: 4096]\n  concept Lst\n    variants:\n      Cons of (head : number, tail : Lst)\n      Nil\nrule main\n  logic:\n    out = lsum(build(3))\nrule build(n)\n  logic:\n    out = if n == 0 then Lst::Nil else Lst::Cons { head: n, tail: build(n - 1) }\nrule lsum(xs)\n  logic:\n    out = match xs: Cons(h, t) => h + lsum(t)  Nil => 0";
+        assert_eq!(run(ls), 6, "slice 2: variant list-sum still -> 6 (records + variants coexist)");
+
+        let _ = std::fs::remove_file(&em);
+    }
+
     /// Records-arc brick R6d: the self-hosted PURITY VERIFIER
     /// (examples/vexprparse.verbose) now VERIFIES the purity half of each rule's
     /// parsed proofs. `count_purity_errors` tokenizes + parses a program (source via
