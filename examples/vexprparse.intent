@@ -1548,3 +1548,35 @@ recursion need NO new code: a record value is its arena index (a Number),
 and indices already flow through the call ABI (args pushed, params in rbp
 slots). Slice 3's ast_is_var / ast_var_start / ast_var_len readers are
 deleted (the resolver's AstVar arm binds the span directly).
+
+----------------------------------------------------------------------------
+Text values arc, slice 1 (intent entry 39): give the self-hosted interpreter
+REAL text values via the SPAN model, plus the three scanner primitives.
+
+A target text value IS a span into the interpreted source: a new Value variant
+VText(start, len) indexes the same source text the AST spans already index —
+no heap, no copying. A string literal AstStr(start, len) evaluates to the span
+with the surrounding quotes stripped (the lexer's Str token span includes both
+quotes): (start + 1, len - 2).
+
+The target language's byte_at / length / substring are implemented with the
+HOST's own primitives on the interpreted source — target byte_at(t, i) is host
+byte_at(src, t.start + i). Dispatch happens in eval_ast_env's AstCall arm,
+BEFORE eval_call (whose lets are eager — find_rule runs unconditionally), by
+byte-comparing the callee span against the three primitive names (span_is_*
+checks, mirroring span_is_rule). The primitive names shadow user rules of the
+same name — reserved, exactly like verbosec.
+
+Safety: the host byte_at is fail-closed (aborts on out-of-bounds), so every
+primitive guards its bounds FIRST and returns a defensive VNum 0 on any
+out-of-range index, ill-shaped argument, or arity mismatch — a buggy TARGET
+program can never kill the interpreter. substring's guard (0 <= a <= b <=
+t.len) preserves the span invariant, so composed spans stay in bounds.
+
+Deferred, deliberately: concat (fresh text) breaks the span model and needs a
+text heap; text codegen (x86_node) is the next slice, locked against this
+interpreter as its oracle.
+
+The milestone: eval_main now RUNS a real scanner — scan_word.verbose's
+word_length logic (recursion + byte_at + length + text through a record field)
+inside the self-hosted interpreter returns 5 on "hello world".

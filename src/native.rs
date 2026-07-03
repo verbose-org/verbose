@@ -35094,6 +35094,89 @@ rule two
         let _ = std::fs::remove_file(&em);
     }
 
+    /// Text values arc slice 1: the self-hosted interpreter (examples/vexprparse.verbose)
+    /// now has REAL text values via the SPAN model. A new Value variant
+    /// `VText(start, len)` is a span into the interpreted source; `AstStr` evaluates to
+    /// it with the surrounding quotes stripped (the lexer's Str token span includes
+    /// both quotes — confirmed empirically below: byte_at("abc", 0) -> 97 ('a'), not
+    /// 34 ('"')). The target-language byte_at / length / substring are dispatched in
+    /// eval_ast_env's AstCall arm (BEFORE eval_call — its lets are eager) by
+    /// byte-comparing the callee span (span_is_byte_at / _length / _substring), and
+    /// implemented with the HOST's own primitives on the interpreted source. Every
+    /// host byte_at is bounds-guarded FIRST, so a target program's OOB index returns
+    /// a defensive VNum 0 instead of tripping the host's fail-closed abort.
+    ///
+    /// Gates:
+    ///   * MILESTONE — the interpreter RUNS a real scanner: scan_word.verbose's
+    ///     word_length logic (recursion + byte_at + length + text through a record
+    ///     field) on "hello world" -> 5.
+    ///   * length("hello") -> 5; byte_at("abc", 1) -> 98.
+    ///   * span composition: length(substring("hello world", 6, 11)) -> 5 and
+    ///     byte_at(substring("hello world", 6, 11), 0) -> 119 ('w').
+    ///   * defensive: byte_at("abc", 99) -> 0 — the interpreter does NOT abort.
+    ///   * UNCHANGED: records param access -> 49, variant list-sum -> 6.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn text_values_slice1_interpreter_runs_scanner() {
+        let src = std::fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let em = std::env::temp_dir().join("verbosec_test_tv1_eval_main");
+        compile_native(&program, "eval_main", em.to_str().unwrap(), false, false)
+            .expect("eval_main must compile natively (text values slice 1)");
+
+        let run = |source: &str| -> i64 {
+            let r = std::process::Command::new(&em)
+                .arg(source)
+                .arg("0")
+                .output()
+                .expect("spawn eval_main");
+            assert!(
+                r.status.success(),
+                "eval_main must exit 0 for {:?}; got {:?}",
+                source, r.status
+            );
+            String::from_utf8_lossy(&r.stdout)
+                .trim()
+                .parse::<i64>()
+                .unwrap_or_else(|_| panic!("eval_main produced non-number for {:?}: {:?}", source, r.stdout))
+        };
+
+        // MILESTONE: the self-hosted interpreter runs scan_word.verbose's logic —
+        // recursion + byte_at + length + a text value through a record field.
+        let scanner = "concept Sc\n  fields:\n    src : text\n    pos : number\nrule main\n  logic:\n    out = word_length(Sc { src: \"hello world\", pos: 0 })\nrule word_length(s : Sc)\n  logic:\n    out = if s.pos >= length(s.src) then 0 else if byte_at(s.src, s.pos) >= 97 then (if byte_at(s.src, s.pos) <= 122 then 1 + word_length(Sc { src: s.src, pos: s.pos + 1 }) else 0) else 0";
+        assert_eq!(run(scanner), 5, "text values 1: word_length(\"hello world\", 0) -> 5");
+
+        // Primitives on a string literal (also the empirical quote-strip probes:
+        // an unstripped span would give length 5 and byte 34 ('\"')).
+        assert_eq!(run("rule main\n  logic:\n    out = length(\"hello\")"), 5,
+            "text values 1: length(\"hello\") -> 5");
+        assert_eq!(run("rule main\n  logic:\n    out = byte_at(\"abc\", 1)"), 98,
+            "text values 1: byte_at(\"abc\", 1) -> 98");
+        assert_eq!(run("rule main\n  logic:\n    out = byte_at(\"abc\", 0)"), 97,
+            "text values 1: quote stripped — first byte is 'a' (97), not '\"' (34)");
+
+        // Span composition: substring returns a sub-span of the SAME source.
+        assert_eq!(run("rule main\n  logic:\n    out = length(substring(\"hello world\", 6, 11))"), 5,
+            "text values 1: length(substring(...)) -> 5");
+        assert_eq!(run("rule main\n  logic:\n    out = byte_at(substring(\"hello world\", 6, 11), 0)"), 119,
+            "text values 1: byte_at(substring(...), 0) -> 119 ('w')");
+
+        // Defensive: an OOB target index returns 0 — never the host's fail-closed abort.
+        assert_eq!(run("rule main\n  logic:\n    out = byte_at(\"abc\", 99)"), 0,
+            "text values 1: OOB byte_at is a defensive 0, no interpreter abort");
+
+        // UNCHANGED: records param access and the variant list-sum stay identical.
+        let param_access = "concept Foo\n  fields:\n    a : number\n    b : number\nrule main\n  logic:\n    out = get_a(Foo { a: 42, b: 7 })\nrule get_a(s : Foo)\n  logic:\n    out = s.a + s.b";
+        assert_eq!(run(param_access), 49, "text values 1: records param access unchanged -> 49");
+        let lst = "concept_group L [max_depth: 64, max_nodes: 4096]\n  concept Lst\n    variants:\n      Cons of (head : number, tail : Lst)\n      Nil\nrule main\n  logic:\n    out = lsum(build(3))\nrule build(n)\n  logic:\n    out = if n == 0 then Lst::Nil else Lst::Cons { head: n, tail: build(n - 1) }\nrule lsum(xs)\n  logic:\n    out = match xs: Cons(h, t) => h + lsum(t)  Nil => 0";
+        assert_eq!(run(lst), 6, "text values 1: variant list-sum unchanged -> 6");
+
+        let _ = std::fs::remove_file(&em);
+    }
+
     /// Records-arc slice 2: the self-hosted interpreter now RESOLVES record/variant
     /// FIELD ACCESS. `eval_ast_env`'s AstField arm (previously stubbed to VNum 0) now
     /// evaluates the base to a VData, recovers the concept from tag / 256, finds the
