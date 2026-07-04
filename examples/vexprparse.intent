@@ -1580,3 +1580,50 @@ interpreter as its oracle.
 The milestone: eval_main now RUNS a real scanner — scan_word.verbose's
 word_length logic (recursion + byte_at + length + text through a record field)
 inside the self-hosted interpreter returns 5 on "hello world".
+
+----------------------------------------------------------------------------
+Text values arc, slice 2 (intent entry 66): text CODEGEN — the self-hosted
+emitter compiles the span model to machine code, locked against slice 1's
+interpreter as its oracle.
+
+Two moves, both compile-time-constant. First, a compiled text value is ONE
+packed i64, start * 2^32 + len — a Number, so it flows through the stack
+machine, arena slots, the call ABI, and match binders with ZERO new
+machinery (the same argument as "a record value is its arena index").
+AstStr(start, len) lowers to mov rax, imm64((start+1) << 32 | (len-2)) ;
+push rax — quotes stripped, the SAME numbers as eval's VText. Second, the
+emitted ELF EMBEDS the interpreted source: when program_uses_text (an AstStr
+appears anywhere, or a call to byte_at / length / substring — the walk
+reuses span_is_* verbatim), elf_program_src appends the source bytes at the
+FILE END (src_blob: 4 bytes per le32 word, zero-padded to a 4-byte boundary
+— bytes has no 1-byte emitter, so the append rides the existing le32 path)
+and extends p_filesz so the single PT_LOAD maps them. src_base = 0x400000 +
+blob_end_off (headers 221 + optional arena prologue 61 + blob size — ONE
+rule serving both the ELF size field and byte_at's imm64, so they cannot
+drift). Compiled spans are therefore NUMERICALLY IDENTICAL to eval's spans
+into the same bytes: the oracle equivalence is exact by construction.
+
+The three primitives dispatch in x86_node's AstCall arm BEFORE the real-call
+path, on the VERBATIM same span_is_* + arg_list_len conditions as
+code_size_node (the two-pass drift edge). Constant suffixes: length(t) K=4
+(pop ; mov eax, eax ; push — low 32 bits ARE the len); byte_at(t, i) K=36
+(split span, unsigned cmp covers negative i, movabs src_base, movzx load;
+out-of-bounds pushes 0 — parity with eval's defensive VNum 0, never abort);
+substring(t, a, b) K=38 (unsigned a <= b <= len, repack (start+a) << 32 |
+(b-a) — pure span arithmetic, no memory touch). A wrong arity emits ONLY
+push 0 (2 bytes). Text-free programs stay BYTE-IDENTICAL: embedding and all
+new emits are gated on program_uses_text.
+
+The slice surfaced a LATENT off-threading bug in x86_node's AstIf arm: the
+THEN branch was emitted with off + size(cond) + 15, but its true position is
++ 10 (the 5-byte jmp-over-els sits AFTER thn; the els offset was already
+correct). Every prior program recursed in an ELSE branch, so no call rel32
+had ever been emitted inside a THEN branch — word_length's recursive call
+landed 5 bytes short, in the previous proc's epilogue, until the fix.
+
+The milestone: the COMPILER compiles a scanner — the slice-1 word_length
+program (Sc{src, pos} record, recursion, byte_at/length through record
+fields) emits an ELF that prints 5 on "hello world", byte-for-byte the value
+eval_main computes. Deferred, deliberately: concat (fresh text) still needs
+a text heap; runtime text INPUT into the closed main stays a driver-level
+slice if ever needed.

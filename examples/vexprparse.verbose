@@ -14345,6 +14345,191 @@ rule program_uses_arena
       structural : cl
 
 
+-- ============================================================================
+-- Text values arc slice 2 — program_uses_text: does the program need the
+-- embedded source? 1 iff any AstStr literal appears anywhere in any rule body
+-- (lets included), OR any AstCall whose callee spells byte_at / length /
+-- substring (the three span primitives — dispatch shares span_is_* with eval
+-- and x86_node VERBATIM). Mirror of program_uses_arena's role: the ELF appends
+-- the interpreted source bytes at the file end ONLY when this is 1, so a
+-- text-free program stays byte-identical. The walk reuses PrintState /
+-- PrintArgsState ({node, src} / {args, src}); the vfields / arms / binds /
+-- rules legs get their own thin {list, src} concepts below.
+-- ============================================================================
+
+concept UsesTextVFields
+  @intention: "A variant construction's field list plus the source, for the uses-text walk"
+  @source: vexprparse.intent:66
+  fields:
+    fields : VFieldList
+    src : text [..256]
+
+
+concept UsesTextArms
+  @intention: "A match's arm list plus the source, for the uses-text walk"
+  @source: vexprparse.intent:66
+  fields:
+    arms : ArmList
+    src : text [..256]
+
+
+concept UsesTextBinds
+  @intention: "A rule's let-binding list plus the source, for the uses-text walk"
+  @source: vexprparse.intent:66
+  fields:
+    binds : Binding
+    src : text [..256]
+
+
+concept UsesTextRules
+  @intention: "The program's rule list plus the source, for the uses-text walk"
+  @source: vexprparse.intent:66
+  fields:
+    rules : RuleList
+    src : text [..256]
+
+
+-- ast_uses_text: 1 iff the subtree contains an AstStr OR a call to one of the
+-- three text primitives. The AstCall arm checks the callee span FIRST (the
+-- same span_is_* calls eval and x86_node dispatch on), then recurses into the
+-- arguments; every other structural arm just walks its children left-to-right
+-- with early-out ifs. Leaves (num/var/bool/err) are 0.
+rule ast_uses_text
+  @intention: "1 if a subtree contains a string literal or a text-primitive call, 0 otherwise"
+  @source: vexprparse.intent:66
+  input:
+    ps : PrintState
+  output:
+    out : number
+  logic:
+    out = match ps.node:
+      AstNum(value) => 0
+      AstBool(value) => 0
+      AstVar(start, len) => 0
+      AstErr => 0
+      AstStr(start, len) => 1
+      AstBin(op, lhs, rhs) => if ast_uses_text(PrintState { node: lhs, src: ps.src }) == 1 then 1 else ast_uses_text(PrintState { node: rhs, src: ps.src })
+      AstNeg(inner) => ast_uses_text(PrintState { node: inner, src: ps.src })
+      AstNot(inner) => ast_uses_text(PrintState { node: inner, src: ps.src })
+      AstField(base, fstart, flen) => ast_uses_text(PrintState { node: base, src: ps.src })
+      AstCall(callee_start, callee_len, args) => if span_is_byte_at(SpanCheck { src: ps.src, start: callee_start, len: callee_len }) == 1 then 1 else if span_is_length(SpanCheck { src: ps.src, start: callee_start, len: callee_len }) == 1 then 1 else if span_is_substring(SpanCheck { src: ps.src, start: callee_start, len: callee_len }) == 1 then 1 else args_use_text(PrintArgsState { args: args, src: ps.src })
+      AstIf(cond, thn, els) => if ast_uses_text(PrintState { node: cond, src: ps.src }) == 1 then 1 else if ast_uses_text(PrintState { node: thn, src: ps.src }) == 1 then 1 else ast_uses_text(PrintState { node: els, src: ps.src })
+      AstVariant(cstart, clen, vstart, vlen, fields) => vfields_use_text(UsesTextVFields { fields: fields, src: ps.src })
+      AstMatch(scrut, arms) => if ast_uses_text(PrintState { node: scrut, src: ps.src }) == 1 then 1 else arms_use_text(UsesTextArms { arms: arms, src: ps.src })
+  proofs:
+    purity:
+      reads : [ps.node, ps.src]
+      calls : [ast_uses_text, args_use_text, vfields_use_text, arms_use_text, span_is_byte_at, span_is_length, span_is_substring]
+    termination:
+      bound : 8000
+
+
+-- args_use_text: the uses-text walk over a call's argument list. Early-out 1
+-- on the first argument whose subtree uses text; ArgNil -> 0.
+rule args_use_text
+  @intention: "1 if any call argument's subtree uses text, 0 otherwise"
+  @source: vexprparse.intent:66
+  input:
+    pa : PrintArgsState
+  output:
+    out : number
+  logic:
+    out = match pa.args:
+      ArgCons(head, tail) => if ast_uses_text(PrintState { node: head, src: pa.src }) == 1 then 1 else args_use_text(PrintArgsState { args: tail, src: pa.src })
+      ArgNil => 0
+  proofs:
+    purity:
+      reads : [pa.args, pa.src]
+      calls : [ast_uses_text, args_use_text]
+    termination:
+      bound : 8000
+
+
+-- vfields_use_text: the uses-text walk over a variant construction's field
+-- initializers. VFNil -> 0.
+rule vfields_use_text
+  @intention: "1 if any variant-construction field value's subtree uses text, 0 otherwise"
+  @source: vexprparse.intent:66
+  input:
+    uv : UsesTextVFields
+  output:
+    out : number
+  logic:
+    out = match uv.fields:
+      VFCons(name_start, name_len, val, rest) => if ast_uses_text(PrintState { node: val, src: uv.src }) == 1 then 1 else vfields_use_text(UsesTextVFields { fields: rest, src: uv.src })
+      VFNil => 0
+  proofs:
+    purity:
+      reads : [uv.fields, uv.src]
+      calls : [ast_uses_text, vfields_use_text]
+    termination:
+      bound : 8000
+
+
+-- arms_use_text: the uses-text walk over a match's arm bodies (binders are
+-- name spans, never text values). ArmNil -> 0.
+rule arms_use_text
+  @intention: "1 if any match arm body's subtree uses text, 0 otherwise"
+  @source: vexprparse.intent:66
+  input:
+    ua : UsesTextArms
+  output:
+    out : number
+  logic:
+    out = match ua.arms:
+      ArmCons(vstart, vlen, binders, body, rest) => if ast_uses_text(PrintState { node: body, src: ua.src }) == 1 then 1 else arms_use_text(UsesTextArms { arms: rest, src: ua.src })
+      ArmNil => 0
+  proofs:
+    purity:
+      reads : [ua.arms, ua.src]
+      calls : [ast_uses_text, arms_use_text]
+    termination:
+      bound : 8000
+
+
+-- binds_use_text: the uses-text walk over a rule's let bindings (each RHS is
+-- a full subtree). BNil -> 0.
+rule binds_use_text
+  @intention: "1 if any let binding's RHS subtree uses text, 0 otherwise"
+  @source: vexprparse.intent:66
+  input:
+    ub : UsesTextBinds
+  output:
+    out : number
+  logic:
+    out = match ub.binds:
+      BCons(name_start, name_len, value, rest) => if ast_uses_text(PrintState { node: value, src: ub.src }) == 1 then 1 else binds_use_text(UsesTextBinds { binds: rest, src: ub.src })
+      BNil => 0
+  proofs:
+    purity:
+      reads : [ub.binds, ub.src]
+      calls : [ast_uses_text, binds_use_text]
+    termination:
+      bound : 8000
+
+
+-- program_uses_text: the program-level uses-text gate. Walks every rule's
+-- body — let bindings first, then the block result — early-outing on the
+-- first hit. RNil -> 0.
+rule program_uses_text
+  @intention: "1 if any rule body in the program uses a string literal or a text primitive, 0 otherwise"
+  @source: vexprparse.intent:66
+  input:
+    ur : UsesTextRules
+  output:
+    out : number
+  logic:
+    out = match ur.rules:
+      RCons(head, tail) => if binds_use_text(UsesTextBinds { binds: block_binds(rd_body(head)), src: ur.src }) == 1 then 1 else if ast_uses_text(PrintState { node: block_result(rd_body(head)), src: ur.src }) == 1 then 1 else program_uses_text(UsesTextRules { rules: tail, src: ur.src })
+      RNil => 0
+  proofs:
+    purity:
+      reads : [ur.rules, ur.src]
+      calls : [binds_use_text, ast_uses_text, program_uses_text, block_binds, rd_body, block_result]
+    termination:
+      bound : 8000
+
+
 -- code_size_vfields: the total byte count of lowering a variant's field-value pushes
 -- (the sum of each field value's code_size_node). Mirror of code_size_args. Empty -> 0.
 rule code_size_vfields
@@ -14851,8 +15036,17 @@ rule code_size_node
       -- The resolvability test is the SAME static_concept_of call x86_node makes —
       -- a divergence desyncs every downstream offset (the two-pass sharp edge).
       AstField(base, fstart, flen) => if static_concept_of(StaticConceptState { node: base, src: bg.src, params: bg.params, lets: bg.lets, concepts: bg.concepts }) >= 0 then code_size_node(ByteGenState { node: base, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }) + 19 else 1
-      AstCall(callee_start, callee_len, args) => code_size_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }) + 13
-      AstStr(start, len) => 1
+      -- Text values slice 2: the three span primitives dispatch BEFORE the real-call
+      -- path, on the VERBATIM same span_is_* + arg_list_len conditions as x86_node
+      -- (the two-pass drift edge). Constant suffixes: byte_at = 36 (pops + split +
+      -- bounds + movabs src_base + movzx + OOB block), length = 4 (pop ; mov eax,eax ;
+      -- push), substring = 38 (pops + split + two bounds checks + repack + OOB block).
+      -- A wrong arity emits ONLY `push 0` (2 bytes) — oracle parity with eval's
+      -- defensive VNum 0, no argument code at all.
+      AstCall(callee_start, callee_len, args) => if span_is_byte_at(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then (if arg_list_len(args) == 2 then code_size_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }) + 36 else 2) else if span_is_length(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then (if arg_list_len(args) == 1 then code_size_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }) + 4 else 2) else if span_is_substring(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then (if arg_list_len(args) == 3 then code_size_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }) + 38 else 2) else code_size_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }) + 13
+      -- Text values slice 2: a string literal is one packed-span push —
+      -- mov rax, imm64 (10) + push rax (1) = 11, same shape as AstNum.
+      AstStr(start, len) => 11
       AstBool(value) => 1
       AstIf(cond, thn, els) => code_size_node(ByteGenState { node: cond, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }) + 15 + code_size_node(ByteGenState { node: thn, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }) + code_size_node(ByteGenState { node: els, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts })
       AstErr => 1
@@ -14867,7 +15061,7 @@ rule code_size_node
   proofs:
     purity:
       reads : [bg.node, bg.src, bg.off, bg.params, bg.lets, bg.prog, bg.concepts]
-      calls : [code_size_node, code_size_args, code_size_vfields, vfield_len, arm_list_len, code_size_arms, static_concept_of]
+      calls : [code_size_node, code_size_args, code_size_vfields, vfield_len, arm_list_len, code_size_arms, static_concept_of, span_is_byte_at, span_is_length, span_is_substring, arg_list_len]
     termination:
       bound : 8000
 
@@ -15057,10 +15251,39 @@ rule x86_node
       -- unresolvable base keeps int3 (an UNTYPED param stays out BY DESIGN — the
       -- compiler never infers a param's concept from call sites).
       AstField(base, fstart, flen) => (if static_concept_of(StaticConceptState { node: base, src: bg.src, params: bg.params, lets: bg.lets, concepts: bg.concepts }) >= 0 then concat(x86_node(ByteGenState { node: base, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }), b"\x58\x48\x69\xc0", le32(8 * (max_payload_fields(bg.concepts) + 1)), b"\x4c\x01\xf8\x48\x8b\x80", le32(8 + 8 * field_index_of(FieldIdxState { fields: cd_fields(concept_at_index(ConceptAtState { concepts: bg.concepts, idx: static_concept_of(StaticConceptState { node: base, src: bg.src, params: bg.params, lets: bg.lets, concepts: bg.concepts }) })), src: bg.src, q_start: fstart, q_len: flen, idx: 0 })), b"\x50") else b"\xcc")
-      AstCall(callee_start, callee_len, args) => concat(x86_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }), b"\xe8", le32(proc_offset(ProcOffState { rules: bg.prog, src: bg.src, acc: 0, q_start: callee_start, q_len: callee_len, concepts: bg.concepts }) - (bg.off + code_size_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }) + 5)), b"\x48\x81\xc4", le32(8 * arg_list_len(args)), b"\x50")
-      AstStr(start, len) => b"\xcc"
+      -- Text values slice 2: the three span primitives dispatch BEFORE the real-call
+      -- path, on the VERBATIM same span_is_* + arg_list_len conditions as
+      -- code_size_node (the two-pass drift edge). All operate on the packed-span
+      -- Number ABI (start*2^32 + len) and scratch only rax/rcx/rdx/rsi — never
+      -- r14/r15 (arena) — with no proc calls, so `off` needs no rel32 here.
+      --   byte_at(t, i), K = 36: pop rcx (i) ; pop rax (t) ; mov edx, eax (len,
+      --     zero-extended) ; shr rax, 32 (start) ; cmp rcx, rdx ; jae +20 (unsigned
+      --     covers negative i) ; add rax, rcx ; mov rdx, imm64(src_base = 0x400000 +
+      --     blob_end_off — the source bytes elf_program_src appends at the file
+      --     end) ; movzx eax, byte [rdx + rax] ; push rax ; jmp +3 ; OOB: xor eax,
+      --     eax ; push rax. Oracle parity: eval's defensive VNum 0, never abort.
+      --   length(t), K = 4: pop rax ; mov eax, eax (low 32 = len) ; push rax.
+      --   substring(t, a, b), K = 38: pop rcx (b) ; pop rdx (a) ; pop rax (t) ;
+      --     mov esi, eax (len) ; shr rax, 32 (start) ; cmp rdx, rcx ; ja +21
+      --     (a > b) ; cmp rcx, rsi ; ja +16 (b > len) ; add rax, rdx ; shl rax,
+      --     32 ; sub rcx, rdx ; or rax, rcx ; push rax ; jmp +3 ; OOB: xor eax,
+      --     eax ; push rax. Pure span arithmetic — no memory touch, no src_base.
+      -- A wrong arity emits ONLY push 0 (6a 00, 2 bytes) — eval's defensive VNum 0.
+      AstCall(callee_start, callee_len, args) => if span_is_byte_at(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then (if arg_list_len(args) == 2 then concat(x86_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }), b"\x59\x58\x89\xc2\x48\xc1\xe8\x20\x48\x39\xd1\x73\x14\x48\x01\xc8\x48\xba", le64(4194304 + blob_end_off(ProgGenState { rules: bg.prog, src: bg.src, off: 0, prog: bg.prog, concepts: bg.concepts })), b"\x0f\xb6\x04\x02\x50\xeb\x03\x31\xc0\x50") else b"\x6a\x00") else if span_is_length(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then (if arg_list_len(args) == 1 then concat(x86_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }), b"\x58\x89\xc0\x50") else b"\x6a\x00") else if span_is_substring(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then (if arg_list_len(args) == 3 then concat(x86_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }), b"\x59\x5a\x58\x89\xc6\x48\xc1\xe8\x20\x48\x39\xca\x77\x15\x48\x39\xf1\x77\x10\x48\x01\xd0\x48\xc1\xe0\x20\x48\x29\xd1\x48\x09\xc8\x50\xeb\x03\x31\xc0\x50") else b"\x6a\x00") else concat(x86_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }), b"\xe8", le32(proc_offset(ProcOffState { rules: bg.prog, src: bg.src, acc: 0, q_start: callee_start, q_len: callee_len, concepts: bg.concepts }) - (bg.off + code_size_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }) + 5)), b"\x48\x81\xc4", le32(8 * arg_list_len(args)), b"\x50")
+      -- Text values slice 2: a string literal compiles to ONE packed i64 —
+      -- (start+1) * 2^32 + (len-2), quotes stripped, the SAME numbers as eval's
+      -- VText (the token span includes both quotes; a lone-quote token packs len
+      -- 0). mov rax, imm64 ; push rax — 11 bytes, same shape as AstNum.
+      AstStr(start, len) => concat(b"\x48\xb8", le64((start + 1) * 4294967296 + (if len >= 2 then len - 2 else 0)), b"\x50")
       AstBool(value) => b"\xcc"
-      AstIf(cond, thn, els) => concat(x86_node(ByteGenState { node: cond, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }), b"\x58\x48\x85\xc0\x0f\x84", le32(code_size_node(ByteGenState { node: thn, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }) + 5), x86_node(ByteGenState { node: thn, src: bg.src, off: bg.off + code_size_node(ByteGenState { node: cond, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }) + 15, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }), b"\xe9", le32(code_size_node(ByteGenState { node: els, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts })), x86_node(ByteGenState { node: els, src: bg.src, off: bg.off + code_size_node(ByteGenState { node: cond, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }) + 15 + code_size_node(ByteGenState { node: thn, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }), params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }))
+      -- Off-threading fix (text values slice 2): the THEN branch starts 10 bytes
+      -- after the cond code (pop + test + je = 10), not 15 — the 5-byte
+      -- jmp-over-els sits AFTER thn. The els offset (cond + 15 + thn) was already
+      -- correct (= 10 + thn + 5). Latent since b4b-1: every prior program's
+      -- recursion sat in an ELSE branch, so no call rel32 was ever emitted inside
+      -- a THEN branch until word_length — its recursive call landed 5 bytes short
+      -- (into the previous proc's epilogue).
+      AstIf(cond, thn, els) => concat(x86_node(ByteGenState { node: cond, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }), b"\x58\x48\x85\xc0\x0f\x84", le32(code_size_node(ByteGenState { node: thn, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }) + 5), x86_node(ByteGenState { node: thn, src: bg.src, off: bg.off + code_size_node(ByteGenState { node: cond, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }) + 10, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }), b"\xe9", le32(code_size_node(ByteGenState { node: els, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts })), x86_node(ByteGenState { node: els, src: bg.src, off: bg.off + code_size_node(ByteGenState { node: cond, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }) + 15 + code_size_node(ByteGenState { node: thn, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }), params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }))
       AstErr => b"\xcc"
       -- R7a: a VariantConstruct = arena node allocation. First emit the field-value
       -- pushes (x86_vfields, left-to-right so field[n-1] ends on top of the stack).
@@ -15081,7 +15304,7 @@ rule x86_node
   proofs:
     purity:
       reads : [bg.node, bg.src, bg.off, bg.params, bg.lets, bg.prog, bg.concepts]
-      calls : [x86_node, code_size_node, x86_args, code_size_args, param_index, let_index, param_list_len, proc_offset, arg_list_len, x86_vfields, x86_vpops, vfield_len, max_payload_fields, variant_tag, x86_dispatch, x86_arms, code_size_arms, arm_list_len, static_concept_of, field_index_of, cd_fields, concept_at_index]
+      calls : [x86_node, code_size_node, x86_args, code_size_args, param_index, let_index, param_list_len, proc_offset, arg_list_len, x86_vfields, x86_vpops, vfield_len, max_payload_fields, variant_tag, x86_dispatch, x86_arms, code_size_arms, arm_list_len, static_concept_of, field_index_of, cd_fields, concept_at_index, span_is_byte_at, span_is_length, span_is_substring, blob_end_off]
     termination:
       bound : 8000
 
@@ -15248,6 +15471,65 @@ rule program_total_size
       bound : 8000
 
 
+-- blob_end_off: the file offset where the program blob ENDS = ELF headers +
+-- trampoline (221) + the optional 61-byte mmap arena prologue + the blob
+-- itself. Text values slice 2: this is ALSO the file offset where the embedded
+-- source begins, so `src_base = 0x400000 + blob_end_off` is the COMPILE-TIME
+-- imm64 x86_node's byte_at emit loads — and elf_program_src's pre-append
+-- p_filesz. ONE definition for both so the two can never drift.
+rule blob_end_off
+  @intention: "File offset where the program blob ends: headers 221 + optional arena prologue 61 + blob size (= the embedded-source base)"
+  @source: vexprparse.intent:66
+  input:
+    pg : ProgGenState
+  output:
+    out : number
+  logic:
+    out = 221 + (if program_uses_arena(pg.concepts) == 1 then 61 else 0) + program_total_size(ProgGenState { rules: pg.rules, src: pg.src, off: 0, prog: pg.prog, concepts: pg.concepts })
+  proofs:
+    purity:
+      reads : [pg.rules, pg.src, pg.prog, pg.concepts]
+      calls : [program_uses_arena, program_total_size]
+    termination:
+      bound : 8000
+
+
+-- SrcBlobState: the source-append cursor — the interpreted source text plus
+-- the byte position of the next 4-byte chunk to emit.
+concept SrcBlobState
+  @intention: "The interpreted source text plus the emit cursor, for appending the source bytes to the ELF"
+  @source: vexprparse.intent:66
+  fields:
+    src : text [..256]
+    pos : number [0, 4000000]
+
+
+-- src_blob: append the interpreted source BYTES to the ELF, 4 source bytes per
+-- le32 word (byte k lands at file offset base+k because le32 writes low byte
+-- first), zero-padded past the end of the source up to a 4-byte boundary (the
+-- pad is mapped but never indexed — every span keeps start+len <= length(src)).
+-- The bytes type has no 1-byte emitter, so this rides the existing le32 path:
+-- pack b0 + 256*b1 + 65536*b2 + 16777216*b3 (guards keep the host byte_at in
+-- bounds; a missing tail byte contributes 0). Recursion advances pos by 4 and
+-- stops at pos >= length(src) — the emitted byte count is exactly
+-- 4 * ((length(src) + 3) / 4), the same value elf_program_src adds to p_filesz.
+rule src_blob
+  @intention: "Append the interpreted source as bytes, one le32 word per 4 source bytes, zero-padded to a 4-byte boundary"
+  @source: vexprparse.intent:66
+  input:
+    sb : SrcBlobState
+  output:
+    out : bytes
+  logic:
+    out = if sb.pos >= length(sb.src) then b"" else concat(le32(byte_at(sb.src, sb.pos) + 256 * (if sb.pos + 1 < length(sb.src) then byte_at(sb.src, sb.pos + 1) else 0) + 65536 * (if sb.pos + 2 < length(sb.src) then byte_at(sb.src, sb.pos + 2) else 0) + 16777216 * (if sb.pos + 3 < length(sb.src) then byte_at(sb.src, sb.pos + 3) else 0)), src_blob(SrcBlobState { src: sb.src, pos: sb.pos + 4 }))
+  proofs:
+    purity:
+      reads : [sb.src, sb.pos]
+      calls : [src_blob]
+    termination:
+      bound : 8000
+
+
 -- elf_program_src: the b5 money-shot driver (b8 prints the result). Tokenize +
 -- parse a whole program, then emit a STANDALONE static ELF64 executable wrapping
 -- the x86_program blob:
@@ -15281,12 +15563,14 @@ rule elf_program_src
     let prog = parse_program(ProgramState { cell: toks, src: s.source })
     let concepts = parse_concepts(ProgramState { cell: toks, src: s.source })
     let uses_var = program_uses_arena(concepts)
-    let fsz = 221 + (if uses_var == 1 then 61 else 0) + program_total_size(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts })
-    out = concat(b"\x7f\x45\x4c\x46\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\x3e\x00\x01\x00\x00\x00\x78\x00\x40\x00\x00\x00\x00\x00\x40\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x40\x00\x38\x00\x01\x00\x00\x00\x00\x00\x00\x00", b"\x01\x00\x00\x00\x05\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x40\x00\x00\x00\x00\x00\x00\x00\x40\x00\x00\x00\x00\x00", le64(fsz), le64(fsz), b"\x00\x10\x00\x00\x00\x00\x00\x00", (if uses_var == 1 then b"\xb8\x09\x00\x00\x00\x31\xff\xbe\x00\x00\x00\x08\xba\x03\x00\x00\x00\x41\xba\x22\x00\x00\x00\x49\xc7\xc0\xff\xff\xff\xff\x45\x31\xc9\x0f\x05\x48\x3d\x01\xf0\xff\xff\x72\x0c\xbf\x01\x00\x00\x00\xb8\x3c\x00\x00\x00\x0f\x05\x49\x89\xc7\x45\x31\xf6" else b""), b"\xe8\x60\x00\x00\x00\x48\x83\xec\x20\x49\x89\xc1\x48\x8d\x74\x24\x1f\xc6\x06\x0a\x48\x85\xc0\x79\x03\x48\xf7\xd8\x48\xc7\xc1\x0a\x00\x00\x00\x48\x31\xd2\x48\xf7\xf1\x80\xc2\x30\x48\xff\xce\x88\x16\x48\x85\xc0\x75\xed\x4d\x85\xc9\x79\x06\x48\xff\xce\xc6\x06\x2d\x48\x8d\x54\x24\x20\x48\x29\xf2\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05", x86_program(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts }))
+    let uses_text = program_uses_text(UsesTextRules { rules: prog, src: s.source })
+    let fsz0 = blob_end_off(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts })
+    let fsz = fsz0 + (if uses_text == 1 then 4 * ((length(s.source) + 3) / 4) else 0)
+    out = concat(b"\x7f\x45\x4c\x46\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\x3e\x00\x01\x00\x00\x00\x78\x00\x40\x00\x00\x00\x00\x00\x40\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x40\x00\x38\x00\x01\x00\x00\x00\x00\x00\x00\x00", b"\x01\x00\x00\x00\x05\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x40\x00\x00\x00\x00\x00\x00\x00\x40\x00\x00\x00\x00\x00", le64(fsz), le64(fsz), b"\x00\x10\x00\x00\x00\x00\x00\x00", (if uses_var == 1 then b"\xb8\x09\x00\x00\x00\x31\xff\xbe\x00\x00\x00\x08\xba\x03\x00\x00\x00\x41\xba\x22\x00\x00\x00\x49\xc7\xc0\xff\xff\xff\xff\x45\x31\xc9\x0f\x05\x48\x3d\x01\xf0\xff\xff\x72\x0c\xbf\x01\x00\x00\x00\xb8\x3c\x00\x00\x00\x0f\x05\x49\x89\xc7\x45\x31\xf6" else b""), b"\xe8\x60\x00\x00\x00\x48\x83\xec\x20\x49\x89\xc1\x48\x8d\x74\x24\x1f\xc6\x06\x0a\x48\x85\xc0\x79\x03\x48\xf7\xd8\x48\xc7\xc1\x0a\x00\x00\x00\x48\x31\xd2\x48\xf7\xf1\x80\xc2\x30\x48\xff\xce\x88\x16\x48\x85\xc0\x75\xed\x4d\x85\xc9\x79\x06\x48\xff\xce\xc6\x06\x2d\x48\x8d\x54\x24\x20\x48\x29\xf2\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05", x86_program(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts }), (if uses_text == 1 then src_blob(SrcBlobState { src: s.source, pos: 0 }) else b""))
   proofs:
     purity:
       reads : [s.source]
-      calls : [begin_tokenize, parse_program, parse_concepts, program_uses_arena, program_total_size, x86_program]
+      calls : [begin_tokenize, parse_program, parse_concepts, program_uses_arena, program_uses_text, blob_end_off, x86_program, src_blob]
     termination:
       bound : 256
 

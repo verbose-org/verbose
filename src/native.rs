@@ -35177,6 +35177,131 @@ rule two
         let _ = std::fs::remove_file(&em);
     }
 
+    /// Text values arc slice 2 — text CODEGEN (packed spans + embedded source).
+    /// The self-hosted emitter now COMPILES text: an `AstStr` lowers to ONE packed
+    /// i64 push (`(start+1)*2^32 | (len-2)`, quotes stripped — the SAME numbers as
+    /// slice 1's eval VText), and the three span primitives dispatch in x86_node's
+    /// AstCall arm BEFORE the real-call path (VERBATIM the same span_is_* +
+    /// arg_list_len conditions in code_size_node): length = pop ; mov eax, eax ;
+    /// push (K=4); byte_at = split span, unsigned bounds, movabs src_base, movzx
+    /// load, OOB → push 0 (K=36); substring = split, a<=b && b<=len unsigned,
+    /// repack (start+a, b-a), OOB → push 0 (K=38). `src_base = 0x400000 +
+    /// blob_end_off` because elf_program_src APPENDS the interpreted source at the
+    /// file end (4 bytes per le32 word via src_blob, zero-padded to 4), extending
+    /// p_filesz — so compiled spans index the same bytes eval's spans do, and the
+    /// oracle equivalence is exact by construction. Embedding + emits are gated on
+    /// `program_uses_text`, so text-free programs stay BYTE-IDENTICAL (checked
+    /// against a 0286af4-built emitter during the slice: records 49/15/7, variant
+    /// list-sum 6/15, scalar 5 — all `cmp`-equal).
+    ///
+    /// The slice also surfaced and fixed a LATENT off-threading bug in x86_node's
+    /// AstIf arm: the THEN branch was emitted with `off + size(cond) + 15`, but its
+    /// true position is `+ 10` (the 5-byte jmp-over-els sits AFTER thn). Every
+    /// prior test program recursed in an ELSE branch, so no call rel32 had ever
+    /// been emitted inside a THEN branch — word_length's recursive call landed 5
+    /// bytes short (in the previous proc's epilogue) until the fix.
+    ///
+    /// Gates (each emitted ELF is executed AND cross-checked against eval_main):
+    ///   * MILESTONE — the COMPILER compiles a scanner: the slice-1 word_length
+    ///     program (Sc{src, pos} record, recursion, byte_at/length through record
+    ///     fields) → the emitted ELF prints 5.
+    ///   * length("hello") → 5; byte_at("abc", 1) → 98;
+    ///     length(substring("hello world", 6, 11)) → 5;
+    ///     byte_at(substring("hello world", 6, 11), 0) → 119 ('w').
+    ///   * OOB byte_at("abc", 99) → 0, exit 0 (oracle parity, no abort).
+    ///   * The scanner ELF EMBEDS its program source (byte-searchable in the
+    ///     file); a text-free program's ELF does NOT grow (p_filesz == file size,
+    ///     no appended source).
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn text_values_slice2_compiled_scanner_matches_oracle() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        let src = fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let elf = std::env::temp_dir().join("verbosec_test_tv2_elf_program_src");
+        compile_native(&program, "elf_program_src", elf.to_str().unwrap(), false, false)
+            .expect("elf_program_src must compile natively (text values slice 2)");
+        let em = std::env::temp_dir().join("verbosec_test_tv2_eval_main");
+        compile_native(&program, "eval_main", em.to_str().unwrap(), false, false)
+            .expect("eval_main must compile natively (text values slice 2)");
+
+        let oracle = |source: &str| -> i64 {
+            let r = Command::new(&em).arg(source).arg("0").output().expect("spawn eval_main");
+            assert!(r.status.success(), "eval_main must exit 0 for {:?}", source);
+            String::from_utf8_lossy(&r.stdout).trim().parse::<i64>()
+                .unwrap_or_else(|_| panic!("eval_main non-number for {:?}: {:?}", source, r.stdout))
+        };
+
+        // MILESTONE: the slice-1 scanner, now COMPILED — recursion + byte_at +
+        // length + a packed text span flowing through a record field.
+        let scanner = "concept Sc\n  fields:\n    src : text\n    pos : number\nrule main\n  logic:\n    out = word_length(Sc { src: \"hello world\", pos: 0 })\nrule word_length(s : Sc)\n  logic:\n    out = if s.pos >= length(s.src) then 0 else if byte_at(s.src, s.pos) >= 97 then (if byte_at(s.src, s.pos) <= 122 then 1 + word_length(Sc { src: s.src, pos: s.pos + 1 }) else 0) else 0".to_string();
+
+        let cases: &[(String, i64)] = &[
+            (scanner.clone(), 5),
+            ("rule main\n  logic:\n    out = length(\"hello\")".to_string(), 5),
+            ("rule main\n  logic:\n    out = byte_at(\"abc\", 1)".to_string(), 98),
+            ("rule main\n  logic:\n    out = length(substring(\"hello world\", 6, 11))".to_string(), 5),
+            ("rule main\n  logic:\n    out = byte_at(substring(\"hello world\", 6, 11), 0)".to_string(), 119),
+            // OOB: defensive 0 with exit 0 — parity with eval's VNum 0, no abort.
+            ("rule main\n  logic:\n    out = byte_at(\"abc\", 99)".to_string(), 0),
+        ];
+
+        for (i, (prog_src, expected)) in cases.iter().enumerate() {
+            assert_eq!(oracle(prog_src), *expected, "oracle disagreement for {:?}", prog_src);
+
+            let mc = Command::new(&elf).args([prog_src.as_str(), "0"]).output()
+                .expect("spawn elf_program_src");
+            assert!(mc.status.success(), "elf_program_src must exit 0 for {:?}; got {:?}", prog_src, mc.status);
+            let elf_bytes = mc.stdout;
+            assert_eq!(&elf_bytes[0..4], &[0x7f, 0x45, 0x4c, 0x46], "emitted file is not ELF for {:?}", prog_src);
+
+            // Every case uses text, so the interpreted source must be EMBEDDED in
+            // the emitted file (that is what compiled spans index into).
+            let src_bytes = prog_src.as_bytes();
+            assert!(
+                elf_bytes.windows(src_bytes.len()).any(|w| w == src_bytes),
+                "emitted ELF for {:?} does not embed the program source", prog_src
+            );
+
+            let out_path = std::env::temp_dir().join(format!("verbosec_test_tv2_a_out_{}", i));
+            fs::write(&out_path, &elf_bytes).expect("write a.out");
+            let mut perms = fs::metadata(&out_path).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&out_path, perms).expect("chmod +x");
+
+            let child = Command::new(&out_path).output().expect("execute emitted ELF");
+            assert!(child.status.success(), "emitted ELF for {:?} did not exit 0; got {:?}", prog_src, child.status);
+            let child_out: i64 = String::from_utf8_lossy(&child.stdout).trim().parse()
+                .unwrap_or_else(|_| panic!("emitted ELF produced non-number for {:?}: {:?}", prog_src, child.stdout));
+            assert_eq!(child_out, *expected, "slice-2 ELF for {:?} printed {} (expected {})", prog_src, child_out, expected);
+
+            let _ = fs::remove_file(&out_path);
+        }
+
+        // Text-free gate: no embedding, p_filesz covers exactly the whole file
+        // (the appended-source extension never fires without program_uses_text).
+        let text_free = "concept Foo\n  fields:\n    a : number\n    b : number\nrule main\n  logic:\n    out = get_a(Foo { a: 42, b: 7 })\nrule get_a(s : Foo)\n  logic:\n    out = s.a + s.b";
+        let mc = Command::new(&elf).args([text_free, "0"]).output().expect("spawn elf_program_src");
+        assert!(mc.status.success(), "elf_program_src must exit 0 for the text-free program");
+        let tf_bytes = mc.stdout;
+        let p_filesz = u64::from_le_bytes(tf_bytes[96..104].try_into().unwrap());
+        assert_eq!(p_filesz as usize, tf_bytes.len(),
+            "text-free ELF must not carry an appended source (p_filesz == file size)");
+        assert!(
+            !tf_bytes.windows(text_free.len()).any(|w| w == text_free.as_bytes()),
+            "text-free ELF must NOT embed the program source"
+        );
+
+        let _ = fs::remove_file(elf);
+        let _ = fs::remove_file(em);
+    }
+
     /// Records-arc slice 2: the self-hosted interpreter now RESOLVES record/variant
     /// FIELD ACCESS. `eval_ast_env`'s AstField arm (previously stubbed to VNum 0) now
     /// evaluates the base to a VData, recovers the concept from tag / 256, finds the
