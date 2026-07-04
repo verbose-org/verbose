@@ -35446,4 +35446,86 @@ rule two
         let _ = std::fs::remove_file(&bin);
     }
 
+    /// Termination verifier: the self-hosted checker's LAST proof surface
+    /// (examples/vexprparse.verbose). `count_term_errors` tokenizes + parses a
+    /// program (source via argv) and, for each rule declaring a structural /
+    /// decreasing / increasing termination proof, checks every SELF-recursive
+    /// call site's first argument against the declared pattern:
+    ///   * decreasing : f — arg is a record construction whose field f is
+    ///     literally `input.f - k` (AstBin op 14, literal k >= 1);
+    ///   * increasing : f — symmetric, `input.f + k` (op 13);
+    ///   * structural : p — arg is a binder introduced by an enclosing match arm
+    ///     whose scrutinee is the input param itself;
+    ///   * bound-only (kind 0) — never flagged (parity with verbosec's
+    ///     breadcrumb-not-refusal policy); non-recursive rules pass vacuously.
+    /// With this, all four proof surfaces (lints, sound types, purity,
+    /// termination) are verified by the self-hosted checker.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn records_termination_verifier_checks_recursive_arg_patterns() {
+        let src = std::fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let bin = std::env::temp_dir().join("verbosec_test_count_term_errors");
+        compile_native(&program, "count_term_errors", bin.to_str().unwrap(), false, false)
+            .expect("count_term_errors must compile natively (termination walk over match/variant)");
+
+        let run = |source: &str| -> i64 {
+            let r = std::process::Command::new(&bin)
+                .arg(source)
+                .arg("0")
+                .output()
+                .expect("spawn count_term_errors driver");
+            assert!(
+                r.status.success(),
+                "count_term_errors must exit 0 for {:?}; got {:?}",
+                source, r.status
+            );
+            String::from_utf8_lossy(&r.stdout)
+                .trim()
+                .parse::<i64>()
+                .unwrap_or_else(|_| panic!("count_term_errors produced non-number for {:?}: {:?}", source, r.stdout))
+        };
+
+        // DECREASING OK: go recurses with St { n: s.n - 1 } under `decreasing : n` -> clean.
+        let dec_ok = "rule go\n  input:\n    s : St\n  output:\n    out : number\n  logic:\n    out = if s.n == 0 then 0 else go(St { n: s.n - 1 })\n  proofs:\n    purity:\n      reads : [s.n]\n      calls : [go]\n    termination:\n      bound : 100\n      decreasing : n";
+        assert_eq!(run(dec_ok), 0, "termination: `input.f - k` matches `decreasing : f` — clean");
+
+        // DECREASING BROKEN (no decrease): St { n: s.n } does not step the field -> 1 violation.
+        let dec_nostep = "rule go\n  input:\n    s : St\n  output:\n    out : number\n  logic:\n    out = if s.n == 0 then 0 else go(St { n: s.n })\n  proofs:\n    purity:\n      reads : [s.n]\n      calls : [go]\n    termination:\n      bound : 100\n      decreasing : n";
+        assert_eq!(run(dec_nostep), 1, "termination: pass-through field under `decreasing : n` is flagged");
+
+        // DECREASING BROKEN (wrong direction): s.n + 1 under `decreasing : n` -> 1 violation.
+        let dec_wrongdir = "rule go\n  input:\n    s : St\n  output:\n    out : number\n  logic:\n    out = if s.n == 0 then 0 else go(St { n: s.n + 1 })\n  proofs:\n    purity:\n      reads : [s.n]\n      calls : [go]\n    termination:\n      bound : 100\n      decreasing : n";
+        assert_eq!(run(dec_wrongdir), 1, "termination: `input.f + k` under `decreasing : f` is flagged");
+
+        // INCREASING OK: scan recurses with St2 { pos: s.pos + 1 } under `increasing : pos` -> clean.
+        let inc_ok = "rule scan\n  input:\n    s : St2\n  output:\n    out : number\n  logic:\n    out = if s.pos >= 10 then 0 else scan(St2 { pos: s.pos + 1 })\n  proofs:\n    purity:\n      reads : [s.pos]\n      calls : [scan]\n    termination:\n      bound : 100\n      increasing : pos";
+        assert_eq!(run(inc_ok), 0, "termination: `input.f + k` matches `increasing : f` — clean");
+
+        // INCREASING BROKEN: s.pos - 1 under `increasing : pos` -> 1 violation.
+        let inc_broken = "rule scan\n  input:\n    s : St2\n  output:\n    out : number\n  logic:\n    out = if s.pos >= 10 then 0 else scan(St2 { pos: s.pos - 1 })\n  proofs:\n    purity:\n      reads : [s.pos]\n      calls : [scan]\n    termination:\n      bound : 100\n      increasing : pos";
+        assert_eq!(run(inc_broken), 1, "termination: `input.f - k` under `increasing : f` is flagged");
+
+        // STRUCTURAL OK: lsum recurses on t, a binder of a match whose scrutinee is the input xs.
+        let struct_ok = "concept_group L [max_depth: 64, max_nodes: 4096]\n  concept Lst\n    variants:\n      Cons of (h : number, t : Lst)\n      Nil\nrule lsum\n  input:\n    xs : Lst\n  output:\n    out : number\n  logic:\n    out = match xs: Cons(h, t) => h + lsum(t)  Nil => 0\n  proofs:\n    purity:\n      reads : [xs]\n      calls : [lsum]\n    termination:\n      bound : 4000\n      structural : xs";
+        assert_eq!(run(struct_ok), 0, "termination: recursing on a match binder of the input is structural — clean");
+
+        // STRUCTURAL BROKEN: lsum(xs) recurses on the WHOLE input (no descent) -> 1 violation.
+        let struct_broken = "concept_group L [max_depth: 64, max_nodes: 4096]\n  concept Lst\n    variants:\n      Cons of (h : number, t : Lst)\n      Nil\nrule lsum\n  input:\n    xs : Lst\n  output:\n    out : number\n  logic:\n    out = match xs: Cons(h, t) => h + lsum(xs)  Nil => 0\n  proofs:\n    purity:\n      reads : [xs]\n      calls : [lsum]\n    termination:\n      bound : 4000\n      structural : xs";
+        assert_eq!(run(struct_broken), 1, "termination: recursing on the whole input under `structural` is flagged");
+
+        // BOUND-ONLY recursive (factorial-style): never flagged — parity with verbosec's breadcrumb.
+        let bound_rec = "rule fact\n  input:\n    n : N\n  output:\n    out : number\n  logic:\n    out = if n.v == 0 then 1 else n.v * fact(N { v: n.v - 1 })\n  proofs:\n    purity:\n      reads : [n.v]\n      calls : [fact]\n    termination:\n      bound : 100";
+        assert_eq!(run(bound_rec), 0, "termination: bound-only recursive rule is never flagged (breadcrumb parity)");
+
+        // NON-RECURSIVE with a declared decreasing proof: no self-call -> vacuously clean.
+        let nonrec = "rule f\n  input:\n    s : St\n  output:\n    out : number\n  logic:\n    out = s.n + 1\n  proofs:\n    purity:\n      reads : [s.n]\n      calls : []\n    termination:\n      bound : 1\n      decreasing : n";
+        assert_eq!(run(nonrec), 0, "termination: a non-recursive rule passes any declared kind vacuously");
+
+        let _ = std::fs::remove_file(&bin);
+    }
+
 }

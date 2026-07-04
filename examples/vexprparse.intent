@@ -1627,3 +1627,45 @@ fields) emits an ELF that prints 5 on "hello world", byte-for-byte the value
 eval_main computes. Deferred, deliberately: concat (fresh text) still needs
 a text heap; runtime text INPUT into the closed main stays a driver-level
 slice if ever needed.
+
+----------------------------------------------------------------------------
+Termination-verifier brick of the self-hosting arc: the checker's LAST proof
+surface. R5 parsed each rule's termination block into Proofs (term_kind 0=bound /
+1=structural / 2=decreasing / 3=increasing, term_bound, and the field-name span
+term_field_start/len); R6d verified purity. This brick VERIFIES the three
+pattern-bearing kinds against the body's SELF-recursive call sites, closing the
+checker: lints, sound types, purity, and termination are now all verified by the
+self-hosted checker.
+
+The per-rule check: for a rule declaring kind 1/2/3, walk the body (the same
+match/variant walk family as the R6d purity checks) finding every call whose
+callee span byte-equals the rule's OWN name span. At each such site the FIRST
+argument must match the declared pattern. decreasing : f — the argument is a
+record construction (records slice 1: a bare `C { ... }` parses to a variant
+construction whose variant span equals the concept span) whose field f carries
+literally `input.f - k` with a LITERAL k >= 1; any other shape at f, or f absent
+from the construction, is one violation. increasing : f — symmetric with `+`.
+structural : p — the argument is a bare variable that is a binder introduced by
+an ENCLOSING match arm whose scrutinee is the input param itself; the binder set
+threads down the walk, extended per arm exactly the way the R6d reads-check
+scopes arm binders, so recursing on the whole input (or anything not bound by a
+match on the input) is one violation. bound-only (kind 0) is never flagged, even
+for recursive rules — parity with the reference compiler, which emits a stderr
+breadcrumb but does not refuse; a rule with no self-call passes vacuously under
+any kind.
+
+Honest scope, each bound matching the reference compiler's own Phase C shape:
+self-recursion only (the reference per-rule checks are also self-shaped; mutual
+recursion termination is deferred); single checked argument (the toy grammar's
+rules are single-arg — a self-call with NO argument is a violation for kinds
+1/2/3); the structural scrutinee must be the input param directly (nested or
+derived scrutinees deferred); the step must be a literal k >= 1 (a non-literal
+step is a violation — the checker cannot prove it positive).
+
+The driver count_term_errors mirrors count_purity_errors exactly: tokenize the
+source (argv arg 1), parse the whole rule-decl sequence once, fold the per-rule
+check over the program, return the total violation count. NATIVE-ONLY for
+multi-line sources, like every other whole-program driver. Validation: the
+decreasing/increasing/structural OK shapes count 0; the no-step, wrong-direction,
+and whole-input-recursion breakages each count 1; bound-only recursive and
+non-recursive rules count 0.

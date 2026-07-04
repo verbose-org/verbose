@@ -6031,6 +6031,46 @@ rule prf_term_bound
       bound : 16
 
 
+-- Termination-verifier brick: the FIELD-NAME span of a structural/decreasing/
+-- increasing termination proof (0/0 for bound-only). R5 parsed it into MkProofs;
+-- these two accessors expose it so the termination check can compare the declared
+-- field against the recursive call sites' argument shapes. Mirror prf_term_bound.
+rule prf_term_field_start
+  @intention: "The termination field-name span start of a parsed proofs block (0 for bound-only)"
+  @source: vexprparse.intent:67
+  input:
+    p : Proofs
+  output:
+    out : number
+  logic:
+    out = match p:
+      MkProofs(reads, calls, term_kind, term_bound, term_field_start, term_field_len) => term_field_start
+  proofs:
+    purity:
+      reads : [p]
+      calls : []
+    termination:
+      bound : 16
+
+
+rule prf_term_field_len
+  @intention: "The termination field-name span length of a parsed proofs block (0 for bound-only)"
+  @source: vexprparse.intent:67
+  input:
+    p : Proofs
+  output:
+    out : number
+  logic:
+    out = match p:
+      MkProofs(reads, calls, term_kind, term_bound, term_field_start, term_field_len) => term_field_len
+  proofs:
+    purity:
+      reads : [p]
+      calls : []
+    termination:
+      bound : 16
+
+
 -- name_list_len (records-arc brick R5): the number of entries in a NameList.
 -- Structural recursion on the NmCons tail (Phase C), like field_list_len.
 rule name_list_len
@@ -11499,6 +11539,616 @@ rule count_purity_errors
     purity:
       reads : [s.source]
       calls : [begin_tokenize, parse_program, purity_list]
+    termination:
+      bound : 256
+
+
+-- ============================================================================
+-- TERMINATION VERIFIER: the checker's LAST proof surface. R5 parsed each rule's
+-- termination block into Proofs { term_kind, term_bound, term_field_start/len };
+-- R6d verified purity; this brick VERIFIES the structural/decreasing/increasing
+-- kinds against the body's SELF-recursive call sites (self-recursion only —
+-- verbosec's Phase C per-rule checks are also self-shaped; mutual recursion is
+-- out of scope, noted). For each rule with term_kind in {1, 2, 3}, walk the body
+-- (the same match/variant walk family as count_undecl_call_*) finding every
+-- AstCall whose callee span byte-equals the rule's OWN name span. At each such
+-- site the FIRST argument must match the declared pattern:
+--   * decreasing : f (kind 2) — the arg is a record construction (slice-1 parse:
+--     AstVariant with cstart == vstart) whose field named f has value
+--     AstBin(14, AstField(AstVar(<input>), f), AstNum k) with k >= 1 — literally
+--     `<input>.f - k`. Any other shape at f, or f absent, is one violation.
+--   * increasing : f (kind 3) — symmetric with op 13 (`<input>.f + k`, k >= 1).
+--   * structural : p (kind 1) — the arg is AstVar(b) where b is a binder
+--     introduced by an ENCLOSING match arm whose scrutinee is AstVar(<input>).
+--     The binder set threads down the walk (extended per qualifying arm via
+--     binds_with_binders, like the R6d reads-check's arm scoping); recursing on
+--     the WHOLE input (or any non-binder) is one violation.
+--   * bound-only (kind 0) — never flagged, even for recursive rules: parity with
+--     verbosec, which warns (stderr breadcrumb) but does not refuse. A rule with
+--     no self-call passes vacuously under any kind.
+-- Non-literal k (e.g. `s.n - s.m`) is a violation — honest scope, matching
+-- verbosec's own literal-step Phase C check. One walker family threads
+-- (rule-name span, input-param span, term_kind, term-field span, structural
+-- binder set, src); the per-rule driver term_errors reads the input-param name
+-- from the first `input:` field (fl_head_* over rd_input — the same source the
+-- R6d reads-check used) and the field name from prf_term_field_start/len.
+-- ============================================================================
+
+-- The Ast-walk state: the node under inspection + everything the per-site check
+-- needs, threaded unchanged down the walk. rn_start/rn_len = the enclosing
+-- rule's NAME span (self-call detection); kind = the declared term_kind;
+-- in_start/in_len = the input param's name span; tf_start/tf_len = the declared
+-- termination FIELD span (0/0 for structural, unused there); sbinds = the
+-- structural binder set (binders of enclosing matches ON the input). Shared by
+-- count_term_ast (the walker) and the per-site shape helpers (term_arg_ok /
+-- term_step_ok / term_base_ok / term_var_is_input), which read subsets of it.
+concept TermAstState
+  @intention: "An Ast node + the rule-name span + termination kind/field + input span + structural binder set + source"
+  @source: vexprparse.intent:67
+  fields:
+    node : Ast
+    rn_start : number
+    rn_len : number
+    kind : number
+    in_start : number
+    in_len : number
+    tf_start : number
+    tf_len : number
+    sbinds : Binding
+    src : text [..256]
+
+
+concept TermArgsState
+  @intention: "A call-argument list + the threaded termination-check state"
+  @source: vexprparse.intent:67
+  fields:
+    args : ArgList
+    rn_start : number
+    rn_len : number
+    kind : number
+    in_start : number
+    in_len : number
+    tf_start : number
+    tf_len : number
+    sbinds : Binding
+    src : text [..256]
+
+
+concept TermVFieldsState
+  @intention: "A variant construct's field list + the threaded termination-check state"
+  @source: vexprparse.intent:67
+  fields:
+    fields : VFieldList
+    rn_start : number
+    rn_len : number
+    kind : number
+    in_start : number
+    in_len : number
+    tf_start : number
+    tf_len : number
+    sbinds : Binding
+    src : text [..256]
+
+
+-- The arm-walk state carries one extra flag: ext = 1 iff the ENCLOSING match's
+-- scrutinee is AstVar(<input>), so each arm's body walk knows whether that arm's
+-- binders enter the structural binder set (term_arm_scope).
+concept TermArmsState
+  @intention: "A match arm list + whether the match scrutinizes the input + the threaded termination-check state"
+  @source: vexprparse.intent:67
+  fields:
+    arms : ArmList
+    ext : number
+    rn_start : number
+    rn_len : number
+    kind : number
+    in_start : number
+    in_len : number
+    tf_start : number
+    tf_len : number
+    sbinds : Binding
+    src : text [..256]
+
+
+concept TermBindsState
+  @intention: "A let-binding list + the threaded termination-check state"
+  @source: vexprparse.intent:67
+  fields:
+    binds : Binding
+    rn_start : number
+    rn_len : number
+    kind : number
+    in_start : number
+    in_len : number
+    tf_start : number
+    tf_len : number
+    sbinds : Binding
+    src : text [..256]
+
+
+concept TermScopeState
+  @intention: "A structural binder set + an arm's binders + whether the arm's match scrutinizes the input"
+  @source: vexprparse.intent:67
+  fields:
+    ext : number
+    binds : Binding
+    bs : BinderList
+
+
+-- term_var_is_input: 1 iff the node is an AstVar whose span byte-equals the
+-- input param's name span. Serves two sites: the AstMatch scrutinee test (does
+-- this match scrutinize the input? -> arm binders enter the structural set) and
+-- term_base_ok's base test (is the stepped field read off the input?). Reads
+-- only node + the input span + src from the threaded state.
+rule term_var_is_input
+  @intention: "1 if the AST node is a variable reference to the input param, 0 otherwise"
+  @source: vexprparse.intent:67
+  input:
+    a : TermAstState
+  output:
+    out : number
+  logic:
+    out = match a.node:
+      AstNum(value) => 0
+      AstBin(op, lhs, rhs) => 0
+      AstNeg(inner) => 0
+      AstNot(inner) => 0
+      AstVar(start, len) => if len == a.in_len and name_eq(NameEqState { src: a.src, a_start: a.in_start, b_start: start, len: len, off: 0 }) == 1 then 1 else 0
+      AstField(base, fstart, flen) => 0
+      AstCall(callee_start, callee_len, args) => 0
+      AstIf(cond, thn, els) => 0
+      AstBool(value) => 0
+      AstStr(start, len) => 0
+      AstErr => 0
+      AstVariant(cstart, clen, vstart, vlen, fields) => 0
+      AstMatch(scrut, arms) => 0
+  proofs:
+    purity:
+      reads : [a.node, a.in_start, a.in_len, a.src]
+      calls : [name_eq]
+    termination:
+      bound : 16
+
+
+-- term_knum_ok: 1 iff the node is a LITERAL number >= 1 — the k of a valid
+-- `input.f - k` / `input.f + k` termination step. A non-literal step (another
+-- field, a call, an expression) is 0: the checker cannot prove it positive, so
+-- it is a violation — honest scope, matching verbosec's literal-step Phase C.
+rule term_knum_ok
+  @intention: "1 if the AST node is a literal number >= 1 (a provable termination step), 0 otherwise"
+  @source: vexprparse.intent:67
+  input:
+    n : Ast
+  output:
+    out : number
+  logic:
+    out = match n:
+      AstNum(value) => if value >= 1 then 1 else 0
+      AstBin(op, lhs, rhs) => 0
+      AstNeg(inner) => 0
+      AstNot(inner) => 0
+      AstVar(start, len) => 0
+      AstField(base, fstart, flen) => 0
+      AstCall(callee_start, callee_len, args) => 0
+      AstIf(cond, thn, els) => 0
+      AstBool(value) => 0
+      AstStr(start, len) => 0
+      AstErr => 0
+      AstVariant(cstart, clen, vstart, vlen, fields) => 0
+      AstMatch(scrut, arms) => 0
+  proofs:
+    purity:
+      reads : [n]
+      calls : []
+    termination:
+      bound : 16
+
+
+-- term_base_ok: 1 iff the node is AstField(AstVar(<input>), <term field>) — the
+-- `input.f` half of a decreasing/increasing step. The field span must byte-equal
+-- the declared termination field (tf_start/tf_len); the base must be the input
+-- param itself (term_var_is_input).
+rule term_base_ok
+  @intention: "1 if the AST node reads the declared termination field off the input param, 0 otherwise"
+  @source: vexprparse.intent:67
+  input:
+    a : TermAstState
+  output:
+    out : number
+  logic:
+    out = match a.node:
+      AstNum(value) => 0
+      AstBin(op, lhs, rhs) => 0
+      AstNeg(inner) => 0
+      AstNot(inner) => 0
+      AstVar(start, len) => 0
+      AstField(base, fstart, flen) => if flen == a.tf_len and name_eq(NameEqState { src: a.src, a_start: a.tf_start, b_start: fstart, len: flen, off: 0 }) == 1 then term_var_is_input(TermAstState { node: base, rn_start: a.rn_start, rn_len: a.rn_len, kind: a.kind, in_start: a.in_start, in_len: a.in_len, tf_start: a.tf_start, tf_len: a.tf_len, sbinds: a.sbinds, src: a.src }) else 0
+      AstCall(callee_start, callee_len, args) => 0
+      AstIf(cond, thn, els) => 0
+      AstBool(value) => 0
+      AstStr(start, len) => 0
+      AstErr => 0
+      AstVariant(cstart, clen, vstart, vlen, fields) => 0
+      AstMatch(scrut, arms) => 0
+  proofs:
+    purity:
+      reads : [a.node, a.rn_start, a.rn_len, a.kind, a.in_start, a.in_len, a.tf_start, a.tf_len, a.sbinds, a.src]
+      calls : [name_eq, term_var_is_input]
+    termination:
+      bound : 16
+
+
+-- term_step_ok: 1 iff the node is the full declared step — AstBin whose op
+-- matches the kind (kind 2 -> op 14 `-`, kind 3 -> op 13 `+`), whose lhs is
+-- `input.f` (term_base_ok) and whose rhs is a literal k >= 1 (term_knum_ok).
+rule term_step_ok
+  @intention: "1 if the AST node is the declared decreasing/increasing step `input.f -/+ k` with literal k >= 1"
+  @source: vexprparse.intent:67
+  input:
+    a : TermAstState
+  output:
+    out : number
+  logic:
+    out = match a.node:
+      AstNum(value) => 0
+      AstBin(op, lhs, rhs) => if ((a.kind == 2 and op == 14) or (a.kind == 3 and op == 13)) and term_base_ok(TermAstState { node: lhs, rn_start: a.rn_start, rn_len: a.rn_len, kind: a.kind, in_start: a.in_start, in_len: a.in_len, tf_start: a.tf_start, tf_len: a.tf_len, sbinds: a.sbinds, src: a.src }) == 1 then term_knum_ok(rhs) else 0
+      AstNeg(inner) => 0
+      AstNot(inner) => 0
+      AstVar(start, len) => 0
+      AstField(base, fstart, flen) => 0
+      AstCall(callee_start, callee_len, args) => 0
+      AstIf(cond, thn, els) => 0
+      AstBool(value) => 0
+      AstStr(start, len) => 0
+      AstErr => 0
+      AstVariant(cstart, clen, vstart, vlen, fields) => 0
+      AstMatch(scrut, arms) => 0
+  proofs:
+    purity:
+      reads : [a.node, a.rn_start, a.rn_len, a.kind, a.in_start, a.in_len, a.tf_start, a.tf_len, a.sbinds, a.src]
+      calls : [term_base_ok, term_knum_ok]
+    termination:
+      bound : 16
+
+
+-- term_vfield_ok: seek the DECLARED termination field in a record construction's
+-- field list; when found, its value must be the declared step (term_step_ok).
+-- Reaching VFNil means the field is ABSENT from the construction -> 0 (the
+-- recursion does not visibly step that field, so the proof does not hold).
+-- Other fields are unconstrained (skipped by the recursion on rest).
+rule term_vfield_ok
+  @intention: "1 if a record construction's declared termination field carries the declared step, 0 otherwise"
+  @source: vexprparse.intent:67
+  input:
+    a : TermVFieldsState
+  output:
+    out : number
+  logic:
+    out = match a.fields:
+      VFCons(name_start, name_len, val, rest) => if name_len == a.tf_len and name_eq(NameEqState { src: a.src, a_start: a.tf_start, b_start: name_start, len: name_len, off: 0 }) == 1 then term_step_ok(TermAstState { node: val, rn_start: a.rn_start, rn_len: a.rn_len, kind: a.kind, in_start: a.in_start, in_len: a.in_len, tf_start: a.tf_start, tf_len: a.tf_len, sbinds: a.sbinds, src: a.src }) else term_vfield_ok(TermVFieldsState { fields: rest, rn_start: a.rn_start, rn_len: a.rn_len, kind: a.kind, in_start: a.in_start, in_len: a.in_len, tf_start: a.tf_start, tf_len: a.tf_len, sbinds: a.sbinds, src: a.src })
+      VFNil => 0
+  proofs:
+    purity:
+      reads : [a.fields, a.rn_start, a.rn_len, a.kind, a.in_start, a.in_len, a.tf_start, a.tf_len, a.sbinds, a.src]
+      calls : [name_eq, term_step_ok, term_vfield_ok]
+    termination:
+      bound : 64
+
+
+-- term_arg_ok: the per-call-site argument check, dispatched on the arg's shape
+-- and the declared kind. structural (kind 1): the arg must be AstVar(b) with b
+-- in the structural binder set (name_bound over sbinds — the input itself is
+-- NOT in the set, so recursing on the whole input fails). decreasing/increasing
+-- (kinds 2/3): the arg must be a record construction whose declared field steps
+-- (term_vfield_ok). Every other shape fails the declared pattern -> 0.
+rule term_arg_ok
+  @intention: "1 if a self-recursive call's first argument matches the declared termination pattern"
+  @source: vexprparse.intent:67
+  input:
+    a : TermAstState
+  output:
+    out : number
+  logic:
+    out = match a.node:
+      AstNum(value) => 0
+      AstBin(op, lhs, rhs) => 0
+      AstNeg(inner) => 0
+      AstNot(inner) => 0
+      AstVar(start, len) => if a.kind == 1 then name_bound(NameBoundState { binds: a.sbinds, src: a.src, q_start: start, q_len: len }) else 0
+      AstField(base, fstart, flen) => 0
+      AstCall(callee_start, callee_len, args) => 0
+      AstIf(cond, thn, els) => 0
+      AstBool(value) => 0
+      AstStr(start, len) => 0
+      AstErr => 0
+      AstVariant(cstart, clen, vstart, vlen, fields) => if a.kind == 1 then 0 else term_vfield_ok(TermVFieldsState { fields: fields, rn_start: a.rn_start, rn_len: a.rn_len, kind: a.kind, in_start: a.in_start, in_len: a.in_len, tf_start: a.tf_start, tf_len: a.tf_len, sbinds: a.sbinds, src: a.src })
+      AstMatch(scrut, arms) => 0
+  proofs:
+    purity:
+      reads : [a.node, a.rn_start, a.rn_len, a.kind, a.in_start, a.in_len, a.tf_start, a.tf_len, a.sbinds, a.src]
+      calls : [name_bound, term_vfield_ok]
+    termination:
+      bound : 64
+
+
+-- term_head_ok: check the FIRST argument of a self-recursive call (the toy
+-- grammar's rules are single-arg; multi-arg checks the list head). A self-call
+-- with NO argument (ArgNil) cannot exhibit the declared descent -> 0 (violation
+-- for kinds 1/2/3; kind 0 never reaches here).
+rule term_head_ok
+  @intention: "1 if a self-recursive call's argument list head matches the declared termination pattern"
+  @source: vexprparse.intent:67
+  input:
+    a : TermArgsState
+  output:
+    out : number
+  logic:
+    out = match a.args:
+      ArgCons(head, tail) => term_arg_ok(TermAstState { node: head, rn_start: a.rn_start, rn_len: a.rn_len, kind: a.kind, in_start: a.in_start, in_len: a.in_len, tf_start: a.tf_start, tf_len: a.tf_len, sbinds: a.sbinds, src: a.src })
+      ArgNil => 0
+  proofs:
+    purity:
+      reads : [a.args, a.rn_start, a.rn_len, a.kind, a.in_start, a.in_len, a.tf_start, a.tf_len, a.sbinds, a.src]
+      calls : [term_arg_ok]
+    termination:
+      bound : 16
+
+
+-- term_arm_scope: the structural binder set an arm's BODY walks under. ext = 1
+-- (the enclosing match scrutinizes the input) extends the set with the arm's
+-- binders (binds_with_binders, the same helper the R6d reads-check scopes arms
+-- with); ext = 0 threads the set unchanged (a match on anything else introduces
+-- no structural descent).
+rule term_arm_scope
+  @intention: "Extend the structural binder set with an arm's binders iff the match scrutinizes the input"
+  @source: vexprparse.intent:67
+  input:
+    t : TermScopeState
+  output:
+    out : Binding
+  logic:
+    out = if t.ext == 1 then binds_with_binders(BindsWithBindersState { binds: t.binds, bs: t.bs }) else t.binds
+  proofs:
+    purity:
+      reads : [t.ext, t.binds, t.bs]
+      calls : [binds_with_binders]
+    termination:
+      bound : 16
+
+
+-- count_term_args: sum count_term_ast over every argument of a call (a nested
+-- self-call inside an argument is still checked). Mutually recursive with
+-- count_term_ast, like count_undecl_call_args.
+rule count_term_args
+  @intention: "Total termination-pattern violations across every argument of a call"
+  @source: vexprparse.intent:67
+  input:
+    a : TermArgsState
+  output:
+    out : number
+  logic:
+    out = match a.args:
+      ArgCons(head, tail) => count_term_ast(TermAstState { node: head, rn_start: a.rn_start, rn_len: a.rn_len, kind: a.kind, in_start: a.in_start, in_len: a.in_len, tf_start: a.tf_start, tf_len: a.tf_len, sbinds: a.sbinds, src: a.src }) + count_term_args(TermArgsState { args: tail, rn_start: a.rn_start, rn_len: a.rn_len, kind: a.kind, in_start: a.in_start, in_len: a.in_len, tf_start: a.tf_start, tf_len: a.tf_len, sbinds: a.sbinds, src: a.src })
+      ArgNil => 0
+  proofs:
+    purity:
+      reads : [a.args, a.rn_start, a.rn_len, a.kind, a.in_start, a.in_len, a.tf_start, a.tf_len, a.sbinds, a.src]
+      calls : [count_term_ast, count_term_args]
+    termination:
+      bound : 4000
+
+
+-- count_term_ast: the termination walk. Same structural walk as
+-- count_undecl_call_ast (if/bin/neg/not/field/call-args/variant-fields/
+-- match-arms), but the AstCall predicate is SELF-recursion (callee span
+-- byte-equals the enclosing rule's name span) and the per-site check is the
+-- declared arg pattern (term_head_ok): a self-call whose head arg fails the
+-- pattern is one violation. The call's arguments are still walked (a nested
+-- self-call inside the constructed record is checked too). AstMatch walks the
+-- scrutinee, then the arms with ext = "scrutinee is the input" so qualifying
+-- arms extend the structural binder set. a.node is a FIELD of the packed input,
+-- so bound + the native recursion breadcrumb.
+rule count_term_ast
+  @intention: "Total termination-pattern violations in an AST (self-calls whose argument breaks the declared descent)"
+  @source: vexprparse.intent:67
+  input:
+    a : TermAstState
+  output:
+    out : number
+  logic:
+    out = match a.node:
+      AstNum(value) => 0
+      AstBin(op, lhs, rhs) => count_term_ast(TermAstState { node: lhs, rn_start: a.rn_start, rn_len: a.rn_len, kind: a.kind, in_start: a.in_start, in_len: a.in_len, tf_start: a.tf_start, tf_len: a.tf_len, sbinds: a.sbinds, src: a.src }) + count_term_ast(TermAstState { node: rhs, rn_start: a.rn_start, rn_len: a.rn_len, kind: a.kind, in_start: a.in_start, in_len: a.in_len, tf_start: a.tf_start, tf_len: a.tf_len, sbinds: a.sbinds, src: a.src })
+      AstNeg(inner) => count_term_ast(TermAstState { node: inner, rn_start: a.rn_start, rn_len: a.rn_len, kind: a.kind, in_start: a.in_start, in_len: a.in_len, tf_start: a.tf_start, tf_len: a.tf_len, sbinds: a.sbinds, src: a.src })
+      AstNot(inner) => count_term_ast(TermAstState { node: inner, rn_start: a.rn_start, rn_len: a.rn_len, kind: a.kind, in_start: a.in_start, in_len: a.in_len, tf_start: a.tf_start, tf_len: a.tf_len, sbinds: a.sbinds, src: a.src })
+      AstVar(start, len) => 0
+      AstField(base, fstart, flen) => count_term_ast(TermAstState { node: base, rn_start: a.rn_start, rn_len: a.rn_len, kind: a.kind, in_start: a.in_start, in_len: a.in_len, tf_start: a.tf_start, tf_len: a.tf_len, sbinds: a.sbinds, src: a.src })
+      AstCall(callee_start, callee_len, args) => (if callee_len == a.rn_len and name_eq(NameEqState { src: a.src, a_start: a.rn_start, b_start: callee_start, len: callee_len, off: 0 }) == 1 then (if term_head_ok(TermArgsState { args: args, rn_start: a.rn_start, rn_len: a.rn_len, kind: a.kind, in_start: a.in_start, in_len: a.in_len, tf_start: a.tf_start, tf_len: a.tf_len, sbinds: a.sbinds, src: a.src }) == 1 then 0 else 1) else 0) + count_term_args(TermArgsState { args: args, rn_start: a.rn_start, rn_len: a.rn_len, kind: a.kind, in_start: a.in_start, in_len: a.in_len, tf_start: a.tf_start, tf_len: a.tf_len, sbinds: a.sbinds, src: a.src })
+      AstIf(cond, thn, els) => count_term_ast(TermAstState { node: cond, rn_start: a.rn_start, rn_len: a.rn_len, kind: a.kind, in_start: a.in_start, in_len: a.in_len, tf_start: a.tf_start, tf_len: a.tf_len, sbinds: a.sbinds, src: a.src }) + count_term_ast(TermAstState { node: thn, rn_start: a.rn_start, rn_len: a.rn_len, kind: a.kind, in_start: a.in_start, in_len: a.in_len, tf_start: a.tf_start, tf_len: a.tf_len, sbinds: a.sbinds, src: a.src }) + count_term_ast(TermAstState { node: els, rn_start: a.rn_start, rn_len: a.rn_len, kind: a.kind, in_start: a.in_start, in_len: a.in_len, tf_start: a.tf_start, tf_len: a.tf_len, sbinds: a.sbinds, src: a.src })
+      AstBool(value) => 0
+      AstStr(start, len) => 0
+      AstErr => 0
+      AstVariant(cstart, clen, vstart, vlen, fields) => count_term_vfields(TermVFieldsState { fields: fields, rn_start: a.rn_start, rn_len: a.rn_len, kind: a.kind, in_start: a.in_start, in_len: a.in_len, tf_start: a.tf_start, tf_len: a.tf_len, sbinds: a.sbinds, src: a.src })
+      AstMatch(scrut, arms) => count_term_ast(TermAstState { node: scrut, rn_start: a.rn_start, rn_len: a.rn_len, kind: a.kind, in_start: a.in_start, in_len: a.in_len, tf_start: a.tf_start, tf_len: a.tf_len, sbinds: a.sbinds, src: a.src }) + count_term_arms(TermArmsState { arms: arms, ext: term_var_is_input(TermAstState { node: scrut, rn_start: a.rn_start, rn_len: a.rn_len, kind: a.kind, in_start: a.in_start, in_len: a.in_len, tf_start: a.tf_start, tf_len: a.tf_len, sbinds: a.sbinds, src: a.src }), rn_start: a.rn_start, rn_len: a.rn_len, kind: a.kind, in_start: a.in_start, in_len: a.in_len, tf_start: a.tf_start, tf_len: a.tf_len, sbinds: a.sbinds, src: a.src })
+  proofs:
+    purity:
+      reads : [a.node, a.rn_start, a.rn_len, a.kind, a.in_start, a.in_len, a.tf_start, a.tf_len, a.sbinds, a.src]
+      calls : [count_term_ast, count_term_args, count_term_vfields, count_term_arms, name_eq, term_head_ok, term_var_is_input]
+    termination:
+      bound : 4000
+
+
+-- count_term_vfields: sum count_term_ast over every field VALUE of a variant
+-- construct (a nested self-call inside a constructed field is checked at its
+-- own site). Mutually recursive with count_term_ast.
+rule count_term_vfields
+  @intention: "Total termination-pattern violations across every field value of a variant construct"
+  @source: vexprparse.intent:67
+  input:
+    a : TermVFieldsState
+  output:
+    out : number
+  logic:
+    out = match a.fields:
+      VFCons(name_start, name_len, val, rest) => count_term_ast(TermAstState { node: val, rn_start: a.rn_start, rn_len: a.rn_len, kind: a.kind, in_start: a.in_start, in_len: a.in_len, tf_start: a.tf_start, tf_len: a.tf_len, sbinds: a.sbinds, src: a.src }) + count_term_vfields(TermVFieldsState { fields: rest, rn_start: a.rn_start, rn_len: a.rn_len, kind: a.kind, in_start: a.in_start, in_len: a.in_len, tf_start: a.tf_start, tf_len: a.tf_len, sbinds: a.sbinds, src: a.src })
+      VFNil => 0
+  proofs:
+    purity:
+      reads : [a.fields, a.rn_start, a.rn_len, a.kind, a.in_start, a.in_len, a.tf_start, a.tf_len, a.sbinds, a.src]
+      calls : [count_term_ast, count_term_vfields]
+    termination:
+      bound : 4000
+
+
+-- count_term_arms: for each match arm, walk the arm BODY under the binder set
+-- term_arm_scope selects (extended by this arm's binders iff the enclosing
+-- match scrutinizes the input — ext, computed once at the AstMatch site), then
+-- recurse on the rest with the ORIGINAL set and the SAME ext (every arm of one
+-- match shares the scrutinee). Mutually recursive with count_term_ast.
+rule count_term_arms
+  @intention: "Total termination-pattern violations across every match arm body (binders scoped per arm)"
+  @source: vexprparse.intent:67
+  input:
+    a : TermArmsState
+  output:
+    out : number
+  logic:
+    out = match a.arms:
+      ArmCons(vstart, vlen, binders, body, rest) => count_term_ast(TermAstState { node: body, rn_start: a.rn_start, rn_len: a.rn_len, kind: a.kind, in_start: a.in_start, in_len: a.in_len, tf_start: a.tf_start, tf_len: a.tf_len, sbinds: term_arm_scope(TermScopeState { ext: a.ext, binds: a.sbinds, bs: binders }), src: a.src }) + count_term_arms(TermArmsState { arms: rest, ext: a.ext, rn_start: a.rn_start, rn_len: a.rn_len, kind: a.kind, in_start: a.in_start, in_len: a.in_len, tf_start: a.tf_start, tf_len: a.tf_len, sbinds: a.sbinds, src: a.src })
+      ArmNil => 0
+  proofs:
+    purity:
+      reads : [a.arms, a.ext, a.rn_start, a.rn_len, a.kind, a.in_start, a.in_len, a.tf_start, a.tf_len, a.sbinds, a.src]
+      calls : [count_term_ast, count_term_arms, term_arm_scope]
+    termination:
+      bound : 4000
+
+
+-- count_term_binds: sum count_term_ast over every let-binding's RHS (a
+-- self-call in a let RHS is a call site like any other; at the top level of a
+-- rule body no match encloses it, so the structural binder set is whatever the
+-- driver seeded — the empty set).
+rule count_term_binds
+  @intention: "Total termination-pattern violations across every binding's RHS"
+  @source: vexprparse.intent:67
+  input:
+    b : TermBindsState
+  output:
+    out : number
+  logic:
+    out = match b.binds:
+      BCons(name_start, name_len, value, rest) => count_term_ast(TermAstState { node: value, rn_start: b.rn_start, rn_len: b.rn_len, kind: b.kind, in_start: b.in_start, in_len: b.in_len, tf_start: b.tf_start, tf_len: b.tf_len, sbinds: b.sbinds, src: b.src }) + count_term_binds(TermBindsState { binds: rest, rn_start: b.rn_start, rn_len: b.rn_len, kind: b.kind, in_start: b.in_start, in_len: b.in_len, tf_start: b.tf_start, tf_len: b.tf_len, sbinds: b.sbinds, src: b.src })
+      BNil => 0
+  proofs:
+    purity:
+      reads : [b.binds, b.rn_start, b.rn_len, b.kind, b.in_start, b.in_len, b.tf_start, b.tf_len, b.sbinds, b.src]
+      calls : [count_term_ast, count_term_binds]
+    termination:
+      bound : 4000
+
+
+-- term_errors's input: ONE rule declaration + the source text. Self-recursion is
+-- detected against the rule's OWN name span, so no program RuleList is needed
+-- (termination is a local property, like reads). Same shape as UndeclReadRuleState.
+concept TermRuleState
+  @intention: "A rule declaration + the source text"
+  @source: vexprparse.intent:67
+  fields:
+    rd : RuleDecl
+    src : text [..256]
+
+
+-- term_errors: the termination-proof violation count for ONE rule. Read the
+-- declared kind off the Proofs; kind 0 (bound-only) passes unconditionally —
+-- parity with verbosec, which breadcrumbs but never refuses a bound-only
+-- recursive rule. For kinds 1/2/3, walk the let RHSes and the result expression
+-- with the rule's name span (self-call detection), the input param's name span
+-- (fl_head_* over rd_input — the same source the R6d reads-check used), the
+-- declared field span, and an EMPTY structural binder set (no match encloses
+-- the body's top level). A rule with no self-call passes vacuously (the walk
+-- finds no site to flag).
+rule term_errors
+  @intention: "Total termination-proof violations for one rule (0 if the declared descent holds at every self-call)"
+  @source: vexprparse.intent:67
+  input:
+    tr : TermRuleState
+  output:
+    out : number
+  logic:
+    let prf = rd_proofs(tr.rd)
+    let kind = prf_term_kind(prf)
+    let body = rd_body(tr.rd)
+    let binds = block_binds(body)
+    let result = block_result(body)
+    let rn_start = rd_name_start(tr.rd)
+    let rn_len = rd_name_len(tr.rd)
+    let infl = rd_input(tr.rd)
+    let in_start = fl_head_start(infl)
+    let in_len = fl_head_len(infl)
+    let tf_start = prf_term_field_start(prf)
+    let tf_len = prf_term_field_len(prf)
+    let bad_in_binds = count_term_binds(TermBindsState { binds: binds, rn_start: rn_start, rn_len: rn_len, kind: kind, in_start: in_start, in_len: in_len, tf_start: tf_start, tf_len: tf_len, sbinds: Binding::BNil, src: tr.src })
+    out = if kind == 0 then 0 else bad_in_binds + count_term_ast(TermAstState { node: result, rn_start: rn_start, rn_len: rn_len, kind: kind, in_start: in_start, in_len: in_len, tf_start: tf_start, tf_len: tf_len, sbinds: Binding::BNil, src: tr.src })
+  proofs:
+    purity:
+      reads : [tr.rd, tr.src]
+      calls : [rd_proofs, prf_term_kind, rd_body, block_binds, block_result, rd_name_start, rd_name_len, rd_input, fl_head_start, fl_head_len, prf_term_field_start, prf_term_field_len, count_term_binds, count_term_ast]
+    termination:
+      bound : 64
+
+
+concept TermListState
+  @intention: "The rule list being iterated + the source text"
+  @source: vexprparse.intent:67
+  fields:
+    iter : RuleList
+    src : text [..256]
+
+
+-- term_list: sum term_errors over every rule in the program. Recurses over
+-- `iter` (a field of the input), so bound + the native recursion breadcrumb.
+rule term_list
+  @intention: "Total termination-proof violations across every rule in a program"
+  @source: vexprparse.intent:67
+  input:
+    tl : TermListState
+  output:
+    out : number
+  logic:
+    out = match tl.iter:
+      RCons(head, tail) => term_errors(TermRuleState { rd: head, src: tl.src }) + term_list(TermListState { iter: tail, src: tl.src })
+      RNil => 0
+  proofs:
+    purity:
+      reads : [tl.iter, tl.src]
+      calls : [term_errors, term_list]
+    termination:
+      bound : 4000
+
+
+-- count_term_errors: the termination-verifier gate driver. Tokenize the program
+-- source, parse the whole rule-decl sequence ONCE, then fold term_errors over
+-- it. Returns the TOTAL number of termination-proof violations — 0 iff every
+-- rule's declared structural/decreasing/increasing descent holds at every
+-- self-recursive call site (bound-only rules pass by policy). With this the
+-- self-hosted checker verifies ALL FOUR proof surfaces: lints, sound types,
+-- purity, termination. NATIVE-ONLY (multi-line source): source is argv arg 1,
+-- pos is argv arg 2 (0). Mirrors count_purity_errors.
+rule count_term_errors
+  @intention: "Tokenize, parse, and count all termination-proof violations in a program"
+  @source: vexprparse.intent:67
+  input:
+    s : ScanState
+  output:
+    out : number
+  logic:
+    let toks = begin_tokenize(ScanState { source: s.source, pos: 0 })
+    let prog = parse_program(ProgramState { cell: toks, src: s.source })
+    out = term_list(TermListState { iter: prog, src: s.source })
+  proofs:
+    purity:
+      reads : [s.source]
+      calls : [begin_tokenize, parse_program, term_list]
     termination:
       bound : 256
 
