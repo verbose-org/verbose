@@ -4704,7 +4704,7 @@ rule eval_call
     out : Value
   logic:
     let callee = find_rule(FindRuleState { rules: ec.prog, src: ec.src, q_start: ec.callee_start, q_len: ec.callee_len })
-    let penv = bind_params(BindParamsState { params: rd_params(callee), args: ec.args, env: ec.env, src: ec.src, prog: ec.prog, concepts: ec.concepts })
+    let penv = bind_params(BindParamsState { params: rule_params_of(callee), args: ec.args, env: ec.env, src: ec.src, prog: ec.prog, concepts: ec.concepts })
     let cbody = rd_body(callee)
     let cbinds = block_binds(cbody)
     let cresult = block_result(cbody)
@@ -4713,7 +4713,7 @@ rule eval_call
   proofs:
     purity:
       reads : [ec.callee_start, ec.callee_len, ec.args, ec.env, ec.src, ec.prog, ec.concepts]
-      calls : [find_rule, bind_params, rd_params, rd_body, block_binds, block_result, build_env, eval_ast_env]
+      calls : [find_rule, bind_params, rule_params_of, rd_body, block_binds, block_result, build_env, eval_ast_env]
     termination:
       bound : 4000
 
@@ -7110,6 +7110,61 @@ rule params_to_fields
     termination:
       bound : 512
       structural : pl
+
+
+-- fields_to_params (input:-block bridge): convert a FieldList (built by parse_fields
+-- from an `input:` block) into the structurally-identical ParamList — the EXACT
+-- inverse of params_to_fields. FCons -> PCons one-for-one, FNil -> PNil, preserving
+-- the name span AND the ty code + ty span. Both parse paths compute ty via the same
+-- type_code_of_span, so the copied code is exactly what the toy params_scan would
+-- have produced for the same span; the ty span itself must survive because
+-- static_concept_of resolves a param's concept from it (record params in codegen
+-- depend on that resolution). Structural recursion on the FCons tail (Phase C),
+-- like params_to_fields.
+rule fields_to_params
+  @intention: "Convert a parsed input: FieldList into the structurally-identical ParamList"
+  @source: vexprparse.intent:1673
+  input:
+    fl : FieldList
+  output:
+    out : ParamList
+  logic:
+    out = match fl:
+      FCons(name_start, name_len, ty, ty_start, ty_len, rest) => ParamList::PCons { name_start: name_start, name_len: name_len, ty: ty, ty_start: ty_start, ty_len: ty_len, rest: fields_to_params(rest) }
+      FNil => ParamList::PNil
+  proofs:
+    purity:
+      reads : [fl]
+      calls : [fields_to_params]
+    termination:
+      bound : 512
+      structural : fl
+
+
+-- rule_params_of (input:-block bridge): the EFFECTIVE parameter list of a rule for
+-- the EXECUTORS (eval_call's bind_params; proc_size / x86_proc's frame + lowering
+-- params). Toy-form rules declare `rule f(x : T)` -> rd_params is non-empty and is
+-- returned unchanged, so toy-form behavior is byte-identical. Real self-source
+-- rules declare an `input:` block instead -> rd_params is PNil and rd_input is
+-- converted via fields_to_params. If BOTH are present, params wins — the
+-- self-source never mixes the two forms; the tie-break is a note, not a supported
+-- shape. Checkers (lints, types, purity, termination) keep reading rd_params /
+-- rd_input directly — this accessor is executor-only.
+rule rule_params_of
+  @intention: "The effective executor parameter list of a rule: declared params if non-empty, else the input: block converted"
+  @source: vexprparse.intent:1673
+  input:
+    r : RuleDecl
+  output:
+    out : ParamList
+  logic:
+    out = if param_list_len(rd_params(r)) > 0 then rd_params(r) else fields_to_params(rd_input(r))
+  proofs:
+    purity:
+      reads : [r]
+      calls : [param_list_len, rd_params, fields_to_params, rd_input]
+    termination:
+      bound : 512
 
 
 -- parse_variants (records-arc brick R4): parse the body of a `variants:` block into a
@@ -15830,12 +15885,12 @@ rule proc_size
     let nlets = count_binds(binds)
     let nbind = mb_ast(result) + mb_binds(binds)
     let subsize = if nlets + nbind > 0 then 7 else 0
-    let storesize = code_size_let_stores(LetGenState { rem: binds, all_binds: binds, src: pg.src, off: 0, params: rd_params(pg.rd), idx: 0, prog: pg.prog, concepts: pg.concepts })
-    out = 4 + subsize + storesize + code_size_node(ByteGenState { node: result, src: pg.src, off: 0, params: rd_params(pg.rd), lets: binds, prog: pg.prog, concepts: pg.concepts }) + 6
+    let storesize = code_size_let_stores(LetGenState { rem: binds, all_binds: binds, src: pg.src, off: 0, params: rule_params_of(pg.rd), idx: 0, prog: pg.prog, concepts: pg.concepts })
+    out = 4 + subsize + storesize + code_size_node(ByteGenState { node: result, src: pg.src, off: 0, params: rule_params_of(pg.rd), lets: binds, prog: pg.prog, concepts: pg.concepts }) + 6
   proofs:
     purity:
       reads : [pg.rd, pg.src, pg.prog, pg.concepts]
-      calls : [rd_body, block_binds, block_result, count_binds, mb_ast, mb_binds, code_size_let_stores, code_size_node, rd_params]
+      calls : [rd_body, block_binds, block_result, count_binds, mb_ast, mb_binds, code_size_let_stores, code_size_node, rule_params_of]
     termination:
       bound : 8000
 
@@ -16021,12 +16076,12 @@ rule x86_proc
     let nlets = count_binds(binds)
     let nbind = mb_ast(result) + mb_binds(binds)
     let subsize = if nlets + nbind > 0 then 7 else 0
-    let storesize = code_size_let_stores(LetGenState { rem: binds, all_binds: binds, src: pg.src, off: 0, params: rd_params(pg.rd), idx: 0, prog: pg.prog, concepts: pg.concepts })
-    out = concat(b"\x55\x48\x89\xe5", (if nlets + nbind > 0 then concat(b"\x48\x81\xec", le32(8 * (nlets + nbind))) else b""), x86_let_stores(LetGenState { rem: binds, all_binds: binds, src: pg.src, off: pg.off + 4 + subsize, params: rd_params(pg.rd), idx: 0, prog: pg.prog, concepts: pg.concepts }), x86_node(ByteGenState { node: result, src: pg.src, off: pg.off + 4 + subsize + storesize, params: rd_params(pg.rd), lets: binds, prog: pg.prog, concepts: pg.concepts }), b"\x58\x48\x89\xec\x5d\xc3")
+    let storesize = code_size_let_stores(LetGenState { rem: binds, all_binds: binds, src: pg.src, off: 0, params: rule_params_of(pg.rd), idx: 0, prog: pg.prog, concepts: pg.concepts })
+    out = concat(b"\x55\x48\x89\xe5", (if nlets + nbind > 0 then concat(b"\x48\x81\xec", le32(8 * (nlets + nbind))) else b""), x86_let_stores(LetGenState { rem: binds, all_binds: binds, src: pg.src, off: pg.off + 4 + subsize, params: rule_params_of(pg.rd), idx: 0, prog: pg.prog, concepts: pg.concepts }), x86_node(ByteGenState { node: result, src: pg.src, off: pg.off + 4 + subsize + storesize, params: rule_params_of(pg.rd), lets: binds, prog: pg.prog, concepts: pg.concepts }), b"\x58\x48\x89\xec\x5d\xc3")
   proofs:
     purity:
       reads : [pg.rd, pg.src, pg.off, pg.prog, pg.concepts]
-      calls : [rd_body, block_binds, block_result, count_binds, mb_ast, mb_binds, code_size_let_stores, x86_let_stores, x86_node, rd_params]
+      calls : [rd_body, block_binds, block_result, count_binds, mb_ast, mb_binds, code_size_let_stores, x86_let_stores, x86_node, rule_params_of]
     termination:
       bound : 8000
 

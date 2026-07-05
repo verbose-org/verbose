@@ -1669,3 +1669,19 @@ multi-line sources, like every other whole-program driver. Validation: the
 decreasing/increasing/structural OK shapes count 0; the no-step, wrong-direction,
 and whole-input-recursion breakages each count 1; bound-only recursive and
 non-recursive rules count 0.
+
+The input:-block bridge — real self-source rule shapes execute and compile. A rule
+declared the real way (an `input:` block naming one record parameter, no toy
+`rule f(x : T)` parens) previously evaluated to 0 and trapped when compiled: the
+executors (eval's bind_params, codegen's proc frame) read the toy ParamList, which
+is empty for input:-block rules. The bridge is one accessor + one inverse
+converter. fields_to_params converts the parsed `input:` FieldList into the
+structurally-identical ParamList — the exact inverse of params_to_fields,
+preserving the name span AND the ty code + ty span (the ty span is what
+static_concept_of resolves a param's concept from). rule_params_of is the
+EFFECTIVE executor parameter list: declared params when non-empty (toy-form rules
+stay byte-identical), else the converted input: block. If both are present,
+params wins — the self-source never mixes the two forms. Only the executor call
+sites swap (eval_call's bind_params; proc_size / x86_proc's frame + lowering
+params); the checkers (lints, types, purity, termination) keep reading
+rd_params / rd_input directly.
