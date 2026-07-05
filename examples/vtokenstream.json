@@ -1,0 +1,7 @@
+[
+  {"source": "rule foo if x", "pos": 0},
+  {"source": "a b c", "pos": 0},
+  {"source": "42 + foo", "pos": 0},
+  {"source": "x == y", "pos": 0},
+  {"source": "", "pos": 0}
+]

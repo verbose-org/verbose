@@ -1,0 +1,4 @@
+1. A wrapper holds a single non-negative integer between 0 and 45.
+2. To compute the Fibonacci number of the wrapped integer: when the
+   integer is less than 2 the result is the integer itself; otherwise
+   the result is fib(n-1) + fib(n-2).

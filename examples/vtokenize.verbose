@@ -1,0 +1,397 @@
+@verbose 0.1.0
+
+-- Verbose-in-Verbose tokenizer, brick 1 of the self-hosting arc.
+-- Recognizes the NEXT core lexeme at a given position and classifies it.
+-- Oracle: src/lexer.rs. Classification + boundaries agree with the
+-- reference lexer for the lexeme classes covered here (idents/keywords,
+-- integers, one- and two-char operators, punctuation, eof). INDENT/DEDENT,
+-- strings, comments and @attributes are LATER bricks.
+
+concept_group VTok [max_depth: 1, max_nodes: 16]
+  @intention: "Token variants for the Verbose lexer, expressed in Verbose"
+  @source: vtokenize.intent:1
+
+  concept Token
+    @intention: "One classified lexeme: kind + source span / value"
+    @source: vtokenize.intent:1
+    variants:
+      -- Plain identifier: bytes [start, start+len) are [a-zA-Z_][a-zA-Z0-9_]*
+      Ident of (start : number, len : number)
+      -- Keyword: same span as an identifier, plus a numeric keyword code (kw)
+      Keyword of (start : number, len : number, kw : number)
+      -- Integer literal: decoded value + byte length consumed
+      Num of (value : number, len : number)
+      -- Operator / punctuation: numeric class code + byte length (1 or 2)
+      Op of (code : number, len : number)
+      -- End of input
+      Eof
+
+
+concept ScanState
+  @intention: "Scanner position in source text"
+  @source: vtokenize.intent:2
+  fields:
+    source : text [..256]
+    pos : number [0, 256]
+
+
+-- Skip ASCII spaces (0x20). Tabs/newlines are out of scope for this brick
+-- (the reference lexer treats line structure separately via INDENT/DEDENT).
+rule skip_spaces
+  @intention: "Advance past spaces"
+  @source: vtokenize.intent:3
+  input:
+    s : ScanState
+  output:
+    out : number
+  logic:
+    let len = length(s.source)
+    out = if s.pos >= len then s.pos else if byte_at(s.source, s.pos) == 32 then skip_spaces(ScanState { source: s.source, pos: s.pos + 1 }) else s.pos
+  proofs:
+    purity:
+      reads : [s.source, s.pos]
+      calls : [skip_spaces]
+    termination:
+      bound : 256
+      increasing : pos
+
+
+-- Length of an identifier-continue run [a-zA-Z0-9_]* starting at pos.
+-- The caller guarantees the byte at the START position is an ident-start;
+-- this counts the full continue run (ident-start chars are a subset of
+-- ident-continue chars, so the first byte is always counted).
+rule ident_run
+  @intention: "Count consecutive [a-zA-Z0-9_] bytes from pos"
+  @source: vtokenize.intent:4
+  input:
+    s : ScanState
+  output:
+    out : number
+  logic:
+    let len = length(s.source)
+    out = if s.pos >= len then 0 else if byte_at(s.source, s.pos) == 95 then 1 + ident_run(ScanState { source: s.source, pos: s.pos + 1 }) else if byte_at(s.source, s.pos) >= 48 and byte_at(s.source, s.pos) <= 57 then 1 + ident_run(ScanState { source: s.source, pos: s.pos + 1 }) else if byte_at(s.source, s.pos) >= 65 and byte_at(s.source, s.pos) <= 90 then 1 + ident_run(ScanState { source: s.source, pos: s.pos + 1 }) else if byte_at(s.source, s.pos) >= 97 and byte_at(s.source, s.pos) <= 122 then 1 + ident_run(ScanState { source: s.source, pos: s.pos + 1 }) else 0
+  proofs:
+    purity:
+      reads : [s.source, s.pos]
+      calls : [ident_run]
+    termination:
+      bound : 256
+      increasing : pos
+
+
+-- Length of a digit run [0-9]* starting at pos.
+rule digit_run
+  @intention: "Count consecutive [0-9] bytes from pos"
+  @source: vtokenize.intent:5
+  input:
+    s : ScanState
+  output:
+    out : number
+  logic:
+    let len = length(s.source)
+    out = if s.pos >= len then 0 else if byte_at(s.source, s.pos) >= 48 and byte_at(s.source, s.pos) <= 57 then 1 + digit_run(ScanState { source: s.source, pos: s.pos + 1 }) else 0
+  proofs:
+    purity:
+      reads : [s.source, s.pos]
+      calls : [digit_run]
+    termination:
+      bound : 256
+      increasing : pos
+
+
+-- Decode a decimal integer of `len` digits starting at pos (Horner).
+-- Each step: value = value_of_rest scanned recursively. We fold left by
+-- recursing on the tail and adding the leading digit weighted by 10^(len-1).
+-- Simpler: accumulate by recursing from the FRONT carrying the running
+-- value via a derived ScanState is not possible (no extra acc field), so we
+-- decode the SUFFIX value and add the head digit * pow10(len-1).
+rule pow10
+  @intention: "10^n for small n (digit-position weight)"
+  @source: vtokenize.intent:6
+  input:
+    s : ScanState
+  output:
+    out : number
+  logic:
+    out = if s.pos == 0 then 1 else 10 * pow10(ScanState { source: s.source, pos: s.pos - 1 })
+  proofs:
+    purity:
+      reads : [s.source, s.pos]
+      calls : [pow10]
+    termination:
+      bound : 256
+      decreasing : pos
+
+
+-- Value of the digit run [pos, pos+runlen). We re-derive runlen at each
+-- frame via digit_run so the recursion needs no extra carried field.
+-- value(pos) = (byte_at(pos)-48) * 10^(runlen-1) + value(pos+1)
+rule num_value
+  @intention: "Decode the decimal value of the digit run starting at pos"
+  @source: vtokenize.intent:7
+  input:
+    s : ScanState
+  output:
+    out : number
+  logic:
+    let len = length(s.source)
+    let rl = digit_run(s)
+    out = if rl == 0 then 0 else (byte_at(s.source, s.pos) - 48) * pow10(ScanState { source: s.source, pos: rl - 1 }) + num_value(ScanState { source: s.source, pos: s.pos + 1 })
+  proofs:
+    purity:
+      reads : [s.source, s.pos, s]
+      calls : [digit_run, pow10, num_value]
+    termination:
+      bound : 256
+      increasing : pos
+
+
+-- Keyword classification. Returns a numeric code, 0 = plain identifier.
+-- Recognition = compare length, then bytes. Codes:
+--   1 if      2 or      3 of      4 let     5 and     6 not
+--   7 then    8 else    9 rule   10 true   11 match  12 false  13 concept
+-- Helpers compare the run bytes at fixed offsets. The caller passes a
+-- ScanState whose pos is the run start and whose run length is `rl`.
+-- We dispatch on rl first to keep the byte compares minimal.
+
+-- two-letter keywords: if / or / of
+rule kw2
+  @intention: "Classify a 2-byte identifier run as a keyword (0 if none)"
+  @source: vtokenize.intent:8
+  input:
+    s : ScanState
+  output:
+    out : number
+  logic:
+    out = if byte_at(s.source, s.pos) == 105 and byte_at(s.source, s.pos + 1) == 102 then 1 else if byte_at(s.source, s.pos) == 111 and byte_at(s.source, s.pos + 1) == 114 then 2 else if byte_at(s.source, s.pos) == 111 and byte_at(s.source, s.pos + 1) == 102 then 3 else 0
+  proofs:
+    purity:
+      reads : [s.source, s.pos]
+      calls : []
+    termination:
+      bound : 32
+
+
+-- three-letter keywords: let / and / not
+rule kw3
+  @intention: "Classify a 3-byte identifier run as a keyword (0 if none)"
+  @source: vtokenize.intent:9
+  input:
+    s : ScanState
+  output:
+    out : number
+  logic:
+    out = if byte_at(s.source, s.pos) == 108 and (byte_at(s.source, s.pos + 1) == 101 and byte_at(s.source, s.pos + 2) == 116) then 4 else if byte_at(s.source, s.pos) == 97 and (byte_at(s.source, s.pos + 1) == 110 and byte_at(s.source, s.pos + 2) == 100) then 5 else if byte_at(s.source, s.pos) == 110 and (byte_at(s.source, s.pos + 1) == 111 and byte_at(s.source, s.pos + 2) == 116) then 6 else 0
+  proofs:
+    purity:
+      reads : [s.source, s.pos]
+      calls : []
+    termination:
+      bound : 48
+
+
+-- four-letter keywords: then / else / rule / true
+rule kw4
+  @intention: "Classify a 4-byte identifier run as a keyword (0 if none)"
+  @source: vtokenize.intent:10
+  input:
+    s : ScanState
+  output:
+    out : number
+  logic:
+    out = if byte_at(s.source, s.pos) == 116 and (byte_at(s.source, s.pos + 1) == 104 and (byte_at(s.source, s.pos + 2) == 101 and byte_at(s.source, s.pos + 3) == 110)) then 7 else if byte_at(s.source, s.pos) == 101 and (byte_at(s.source, s.pos + 1) == 108 and (byte_at(s.source, s.pos + 2) == 115 and byte_at(s.source, s.pos + 3) == 101)) then 8 else if byte_at(s.source, s.pos) == 114 and (byte_at(s.source, s.pos + 1) == 117 and (byte_at(s.source, s.pos + 2) == 108 and byte_at(s.source, s.pos + 3) == 101)) then 9 else if byte_at(s.source, s.pos) == 116 and (byte_at(s.source, s.pos + 1) == 114 and (byte_at(s.source, s.pos + 2) == 117 and byte_at(s.source, s.pos + 3) == 101)) then 10 else 0
+  proofs:
+    purity:
+      reads : [s.source, s.pos]
+      calls : []
+    termination:
+      bound : 80
+
+
+-- five-letter keywords: match / false
+rule kw5
+  @intention: "Classify a 5-byte identifier run as a keyword (0 if none)"
+  @source: vtokenize.intent:11
+  input:
+    s : ScanState
+  output:
+    out : number
+  logic:
+    out = if byte_at(s.source, s.pos) == 109 and (byte_at(s.source, s.pos + 1) == 97 and (byte_at(s.source, s.pos + 2) == 116 and (byte_at(s.source, s.pos + 3) == 99 and byte_at(s.source, s.pos + 4) == 104))) then 11 else if byte_at(s.source, s.pos) == 102 and (byte_at(s.source, s.pos + 1) == 97 and (byte_at(s.source, s.pos + 2) == 108 and (byte_at(s.source, s.pos + 3) == 115 and byte_at(s.source, s.pos + 4) == 101))) then 12 else 0
+  proofs:
+    purity:
+      reads : [s.source, s.pos]
+      calls : []
+    termination:
+      bound : 48
+
+
+-- seven-letter keyword: concept
+rule kw7
+  @intention: "Classify a 7-byte identifier run as the keyword concept (0 if none)"
+  @source: vtokenize.intent:12
+  input:
+    s : ScanState
+  output:
+    out : number
+  logic:
+    out = if byte_at(s.source, s.pos) == 99 and (byte_at(s.source, s.pos + 1) == 111 and (byte_at(s.source, s.pos + 2) == 110 and (byte_at(s.source, s.pos + 3) == 99 and (byte_at(s.source, s.pos + 4) == 101 and (byte_at(s.source, s.pos + 5) == 112 and byte_at(s.source, s.pos + 6) == 116))))) then 13 else 0
+  proofs:
+    purity:
+      reads : [s.source, s.pos]
+      calls : []
+    termination:
+      bound : 32
+
+
+-- Dispatch keyword classification by run length. The run length `rl`
+-- arrives encoded in the ScanState's pos slot is NOT how we pass it;
+-- instead the caller computes rl and we branch on it here. We reuse the
+-- ScanState (source + run start) and take rl as the pos field of a SECOND
+-- state is awkward, so keyword_code takes the run length via s.pos meaning
+-- is overloaded — to avoid confusion we keep s.pos = run START and compute
+-- rl inside via ident_run.
+rule keyword_code
+  @intention: "Numeric keyword code for the identifier run at pos (0 = plain ident)"
+  @source: vtokenize.intent:13
+  input:
+    s : ScanState
+  output:
+    out : number
+  logic:
+    let rl = ident_run(s)
+    out = if rl == 2 then kw2(s) else if rl == 3 then kw3(s) else if rl == 4 then kw4(s) else if rl == 5 then kw5(s) else if rl == 7 then kw7(s) else 0
+  proofs:
+    purity:
+      reads : [s]
+      calls : [ident_run, kw2, kw3, kw4, kw5, kw7]
+    termination:
+      bound : 16
+
+
+-- Classify the operator/punctuation at pos. Two-char operators are matched
+-- BEFORE one-char ones. Returns the operator code (see header table);
+-- returns 0 if the byte is not a recognized operator. The caller guards
+-- pos < len before calling, so byte_at(pos) is safe; the second byte is
+-- read only when pos + 1 < len (we pass `has_next` = 1 when safe).
+rule op_code
+  @intention: "Operator/punct class code at pos; two-char before one-char"
+  @source: vtokenize.intent:14
+  input:
+    s : ScanState
+  output:
+    out : number
+  logic:
+    let len = length(s.source)
+    let c0 = if s.pos >= len then 0 else byte_at(s.source, s.pos)
+    let hasnext = if s.pos + 1 < len then 1 else 0
+    let c1 = if hasnext == 1 then byte_at(s.source, s.pos + 1) else 0
+    out = if c0 == 61 and (hasnext == 1 and c1 == 61) then 1 else if c0 == 61 and (hasnext == 1 and c1 == 62) then 2 else if c0 == 58 and (hasnext == 1 and c1 == 58) then 3 else if c0 == 62 and (hasnext == 1 and c1 == 61) then 4 else if c0 == 60 and (hasnext == 1 and c1 == 61) then 5 else if c0 == 33 and (hasnext == 1 and c1 == 61) then 6 else if c0 == 58 then 10 else if c0 == 44 then 11 else if c0 == 46 then 12 else if c0 == 43 then 13 else if c0 == 45 then 14 else if c0 == 42 then 15 else if c0 == 47 then 16 else if c0 == 37 then 17 else if c0 == 61 then 18 else if c0 == 60 then 19 else if c0 == 62 then 20 else if c0 == 40 then 21 else if c0 == 41 then 22 else if c0 == 123 then 23 else if c0 == 125 then 24 else if c0 == 91 then 25 else if c0 == 93 then 26 else 0
+  proofs:
+    purity:
+      reads : [s.source, s.pos]
+      calls : []
+    termination:
+      bound : 80
+
+
+-- Byte length consumed by the operator code (2 for codes 1..6, else 1).
+rule op_len
+  @intention: "Byte length of an operator code (2 for two-char ops, 1 otherwise)"
+  @source: vtokenize.intent:15
+  input:
+    s : ScanState
+  output:
+    out : number
+  logic:
+    let code = op_code(s)
+    out = if code >= 1 and code <= 6 then 2 else 1
+  proofs:
+    purity:
+      reads : [s]
+      calls : [op_code]
+    termination:
+      bound : 8
+
+
+-- THE BRICK: recognize the NEXT token at s.pos after skipping spaces.
+rule next_token
+  @intention: "Recognize and classify the next core lexeme at the position"
+  @source: vtokenize.intent:16
+  input:
+    s : ScanState
+  output:
+    out : Token
+  logic:
+    let len = length(s.source)
+    let p = skip_spaces(s)
+    let isalpha = if p >= len then 0 else if byte_at(s.source, p) == 95 then 1 else if byte_at(s.source, p) >= 65 and byte_at(s.source, p) <= 90 then 1 else if byte_at(s.source, p) >= 97 and byte_at(s.source, p) <= 122 then 1 else 0
+    let isdigit = if p >= len then 0 else if byte_at(s.source, p) >= 48 and byte_at(s.source, p) <= 57 then 1 else 0
+    let irun = ident_run(ScanState { source: s.source, pos: p })
+    let drun = digit_run(ScanState { source: s.source, pos: p })
+    let kwc = keyword_code(ScanState { source: s.source, pos: p })
+    let opc = op_code(ScanState { source: s.source, pos: p })
+    let opl = op_len(ScanState { source: s.source, pos: p })
+    let nval = num_value(ScanState { source: s.source, pos: p })
+    out = if p >= len then Token::Eof else if isalpha == 1 then (if kwc > 0 then Token::Keyword { start: p, len: irun, kw: kwc } else Token::Ident { start: p, len: irun }) else if isdigit == 1 then Token::Num { value: nval, len: drun } else if opc > 0 then Token::Op { code: opc, len: opl } else Token::Eof
+  proofs:
+    purity:
+      reads : [s.source, s]
+      calls : [skip_spaces, ident_run, digit_run, keyword_code, op_code, op_len, num_value]
+    termination:
+      bound : 256
+
+
+-- Driver: emit one observable number that encodes the token KIND of the
+-- next token, so the example compiles native and runs. Encoding:
+--   Eof => 0
+--   Ident => 100
+--   Keyword => 200 + kw   (e.g. `if` -> 201, `let` -> 204, `rule` -> 209)
+--   Num => 300 + value    (single observable for small literals)
+--   Op => 400 + code      (e.g. `==` -> 401, `(` -> 421)
+-- This `which`-style code lets a test assert the classification matches
+-- the reference lexer for each sample input.
+rule classify
+  @intention: "Encode the next token's kind+detail as one observable number"
+  @source: vtokenize.intent:17
+  input:
+    s : ScanState
+  output:
+    out : number
+  logic:
+    out = match next_token(s):
+      Ident(start, len) => 100
+      Keyword(start, len, kw) => 200 + kw
+      Num(value, len) => 300 + value
+      Op(code, len) => 400 + code
+      Eof => 0
+  proofs:
+    purity:
+      reads : [s]
+      calls : [next_token]
+    termination:
+      bound : 256
+
+
+-- Driver: the byte length consumed by the next token (its span width).
+-- Lets a test assert token BOUNDARIES match the reference lexer.
+rule token_len
+  @intention: "Byte length consumed by the next token (0 for Eof)"
+  @source: vtokenize.intent:18
+  input:
+    s : ScanState
+  output:
+    out : number
+  logic:
+    out = match next_token(s):
+      Ident(start, len) => len
+      Keyword(start, len, kw) => len
+      Num(value, len) => len
+      Op(code, len) => len
+      Eof => 0
+  proofs:
+    purity:
+      reads : [s]
+      calls : [next_token]
+    termination:
+      bound : 256

@@ -1,0 +1,58 @@
+# vtokenize — a Verbose tokenizer written in Verbose
+
+Brick 1 of the self-hosting arc: the first piece of a Verbose compiler
+written in Verbose itself. This recognizes the NEXT core lexeme at a given
+position in a source string and classifies it, agreeing with the reference
+lexer (`src/lexer.rs`) on classification and token boundaries.
+
+## What it covers (this brick)
+
+1. Token variants. A `Token` sum type carries the lexeme KIND plus its
+   source span (start, len) or decoded value. Variants: Ident, Keyword,
+   Num, Op, Eof.
+
+2. Scanner position. A ScanState holds the source text and a byte position.
+
+3. Skip spaces. Advance past ASCII spaces before reading a token.
+
+4. Identifier / keyword run. Count the [a-zA-Z0-9_] run starting at a
+   position whose first byte is an identifier-start byte.
+
+5. Digit run. Count the [0-9] run starting at a position.
+
+6. Decimal weight (10^n) and integer decode (Horner over the digit run).
+
+7. Decode the decimal value of the digit run.
+
+8. Two-letter keywords (if, or, of).
+
+9. Three-letter keywords (let, and, not).
+
+10. Four-letter keywords (then, else, rule, true).
+
+11. Five-letter keywords (match, false).
+
+12. Seven-letter keyword (concept).
+
+13. Keyword code dispatch by run length: classify an identifier run as a
+    keyword (numeric code) or 0 for a plain identifier.
+
+14. Operator / punctuation classifier. Two-character operators (==, =>, ::,
+    >=, <=, !=) are matched before the one-character ones (: , . + - * / %
+    = < > ( ) { } [ ]).
+
+15. Operator byte length (2 for two-char ops, 1 otherwise).
+
+16. next_token: skip spaces, then recognize and classify the next lexeme.
+
+17. classify: encode the next token's kind+detail as one observable number
+    so the example compiles native and runs (driver / oracle hook).
+
+18. token_len: byte length consumed by the next token (boundary check hook).
+
+## Out of scope (later bricks)
+
+- INDENT / DEDENT (needs a column stack and line-start state).
+- String literals and @attributes (need escape handling and a sentinel scan).
+- Comments (-- to end of line).
+- A materialized token stream / list (the AST has no growable list yet).

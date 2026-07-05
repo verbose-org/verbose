@@ -1,0 +1,5 @@
+1. A trivial trigger with a single number field.
+2. Emit the x86-64 machine code for `mov rax, 42 ; ret`: the opcode bytes 0x48 0xb8, then 42 as a little-endian 64-bit immediate, then the `ret` opcode 0xc3.
+3. Emit the number 258 as a little-endian 32-bit value (expected bytes: 0x02 0x01 0x00 0x00).
+4. Emit the number -1 as a little-endian 64-bit value (two's complement: eight 0xff bytes).
+5. Emit a concat of a literal byte 0xaa, then 256 as a little-endian 32-bit value, then a literal byte 0xbb.

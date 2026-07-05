@@ -1,0 +1,77 @@
+@verbose 0.1.0
+
+concept_group G [max_depth: 30, max_nodes: 100]
+  @intention: "a number stack built inside a recursive callable's let RHS"
+  @source: callable_let_variant.intent:1
+  concept Stk
+    @intention: "number stack"
+    @source: callable_let_variant.intent:2
+    variants:
+      Push of (v : number, rest : Stk)
+      Empty
+
+concept CountArg
+  @intention: "depth + the stack so far"
+  @source: callable_let_variant.intent:3
+  fields:
+    n : number [0, 20]
+    acc : Stk
+
+concept Seed
+  @intention: "entry"
+  @source: callable_let_variant.intent:4
+  fields:
+    k : number [0, 20]
+
+rule depth
+  @intention: "stack depth"
+  @source: callable_let_variant.intent:5
+  input:
+    s : Stk
+  output:
+    out : number
+  logic:
+    out = match s:
+      Push(v, rest) => 1 + depth(rest)
+      Empty => 0
+  proofs:
+    purity:
+      reads : [s]
+      calls : [depth]
+    termination:
+      bound : 100
+      structural : s
+
+rule build
+  @intention: "recursive callable: push n onto acc via a let RHS (Stk VariantConstruct in a let), recurse"
+  @source: callable_let_variant.intent:5
+  input:
+    ca : CountArg
+  output:
+    out : number
+  logic:
+    let pushed = Stk::Push { v: ca.n, rest: ca.acc }
+    out = if ca.n == 0 then depth(ca.acc) else build(CountArg { n: ca.n - 1, acc: pushed })
+  proofs:
+    purity:
+      reads : [ca.n, ca.acc]
+      calls : [depth, build]
+    termination:
+      bound : 100
+      decreasing : n
+
+rule go
+  @intention: "entry: build a stack of depth k -> returns k"
+  @source: callable_let_variant.intent:4
+  input:
+    sd : Seed
+  output:
+    out : number
+  logic:
+    out = build(CountArg { n: sd.k, acc: Stk::Empty })
+  proofs:
+    purity:
+      reads : [sd.k]
+      calls : [build]
+    termination:
+      bound : 50

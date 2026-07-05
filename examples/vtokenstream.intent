@@ -1,0 +1,34 @@
+# vtokenstream — a materialized Verbose token stream, in Verbose
+Brick 2 of the self-hosting arc: scan an entire source string and build a
+cons-list of tokens in the arena. This is the stream the parser (brick 3)
+will consume. It reuses brick 1's lexeme recognizer verbatim and adds the
+list type, the position-threading helper, the recursive scanner, and a few
+observable drivers. Oracle: src/lexer.rs and brick 1 (vtokenize.verbose).
+Token classification and boundaries are brick 1's, reused unchanged.
+The new work here is the cons-list and the recursive position threading.
+## What it covers (this brick)
+1. Token and TokenList variants. Token is brick 1's lexeme sum type; TokenList is a cons-list Cons(head, tail) | Nil, in the SAME concept_group so it can reference Token and itself.
+2. Scanner position. A ScanState holds the source text and a byte position.
+3. Skip spaces. Advance past ASCII spaces before reading a token.
+4. Identifier / keyword run. Count the identifier-continue run at a position.
+5. Digit run. Count the digit run at a position.
+6. Decimal weight 10^n for digit-position decode.
+7. Decode the decimal value of the digit run.
+8. Two-letter keywords (if, or, of).
+9. Three-letter keywords (let, and, not).
+10. Four-letter keywords (then, else, rule, true).
+11. Five-letter keywords (match, false).
+12. Seven-letter keyword (concept).
+13. Keyword code dispatch by run length.
+14. Operator / punctuation classifier, two-char before one-char.
+15. Operator byte length.
+16. next_token: skip spaces, then recognize and classify the next lexeme.
+17. token_end: where the next token ENDS (post-skip start plus width). This is the position thread tokenize follows; an unrecognized byte yields no advance so tokenize stops.
+18. tokenize: recursively scan the whole source into a cons-list of tokens, with a trailing Eof sentinel cell. Each step consumes at least one byte, so pos strictly increases; the no-advance guard backs that at runtime.
+19. count_cells / count_tokens: walk the built list counting cons cells. count_tokens tokenizes then counts, proving the list was materialized and traversed structurally (not re-scanned).
+20. head_tok / tok_kind / drop_cells / nth_kind: read a specific token's kind by walking the list, proving tokens land in the right order.
+## Out of scope (later bricks)
+- INDENT / DEDENT (needs a column stack and line-start state).
+- String literals and @attributes (escape handling, sentinel scan).
+- Comments.
+- A growable / bounded-by-input arena beyond the declared max_nodes cap.

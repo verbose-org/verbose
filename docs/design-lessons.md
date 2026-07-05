@@ -30,3 +30,15 @@ When a concat arg is a rule call whose body is itself a concat, the inner concat
 ## Stale doc drift is a credibility issue
 
 The project's identity is "explicit + verified + optimized". If CLAUDE.md says a feature is rejected but it actually works, that's the same class of error as a false positive in the verifier — it damages trust. When you ship a feature, update the rejection list AND the phase table in the SAME commit. Don't defer the doc update "for later".
+
+## The eager-let trap (three sightings)
+
+Verbose `let` bindings evaluate BEFORE the body, unconditionally — there is no laziness, no "only if the branch that uses it is taken". This bit the self-hosting arc three separate times. First: the tokenizer was O(N²) because `string_run` was bound in a let on EVERY `next_token` call, scanning to end-of-source even when the current byte wasn't a quote — the fix (eager-let hoisting into the branch via a helper rule) made tokenization O(N). Then the same shape recurred twice more as a design constraint: primitive dispatch (`byte_at`/`length`/`substring`) had to live in the `AstCall` arm of the evaluator rather than inside `eval_call`, because `eval_call`'s lets run `find_rule` unconditionally — a primitive call would pay a whole rule-list walk it never needs. Lesson: in an eager-let language, hot-path rules must not bind expensive RHSes they might not use. When profiling a slow Verbose rule, check the let chain FIRST — the cost you're looking for is usually above the `out =` line, not in it.
+
+## Milestone diversity is coverage (the latent AstIf bug)
+
+`x86_node`'s AstIf arm threaded THEN-branch code offsets at +15 where the truth was +10 — a 5-byte error in the position-threading that every jump target downstream inherits. It survived 428 green tests, because every previously-compiled recursive program placed its recursive call in the ELSE branch (the `if base then leaf else recurse` idiom). The first milestone program whose recursion sat in the THEN branch (`word_length`'s scanner shape) landed a `call` 5 bytes short, into another proc's epilogue. Pinned tests pin the shapes you already wrote — nothing more. Lesson: each new milestone program should deliberately vary structural shape (which branch arm recurses, nesting depth, argument forms), not just exercise the feature under test. A test suite that grows by "same shape, new feature" accumulates blind spots along every axis it holds constant.
+
+## The oracle discipline (interpreter-first)
+
+Every self-hosted codegen slice landed against a previously-shipped interpreter oracle: `eval_main` ran the milestone program first, then the compiled ELF had to print the same value, and `cmp` (byte-identity on unaffected outputs) pinned everything the slice claimed not to touch. The property this buys is fail-loud: wrong emitted bytes crash or misprint at the differential gate immediately, instead of surviving as latent corruption that some later program trips over. Lesson: build `eval` first, lock codegen to it, and never land an emitter feature without a runnable differential gate. The interpreter is not a fallback backend here — it is the spec.

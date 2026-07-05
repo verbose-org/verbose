@@ -310,7 +310,7 @@ fn collect_read_names(expr: &Expr, out: &mut Vec<String>) {
                 out.push(name.clone());
             }
         }
-        Expr::Number(_) | Expr::Text(_) | Expr::Ident(_) => {}
+        Expr::Number(_) | Expr::Text(_) | Expr::Bytes(_) | Expr::Ident(_) => {}
         Expr::Field(base, _) => collect_read_names(base, out),
         Expr::Binary(_, l, r) => {
             collect_read_names(l, out);
@@ -390,7 +390,7 @@ fn collect_read_names(expr: &Expr, out: &mut Vec<String>) {
         Expr::Length(inner) => collect_read_names(inner, out),
         // `abs(<number_expr>)` — pure pass-through; the inner may carry a
         // `read(...)` via `parse_int(read(name))` etc.
-        Expr::Abs(inner) | Expr::BitNot(inner) => collect_read_names(inner, out),
+        Expr::Abs(inner) | Expr::BitNot(inner) | Expr::Le32(inner) | Expr::Le64(inner) => collect_read_names(inner, out),
         // `min(a, b)` / `max(a, b)` — recurse into both children; either
         // side may carry a `read(...)` (e.g. `min(amount, parse_int(read(cap)))`).
         Expr::Min(l, r) | Expr::Max(l, r) | Expr::BitAnd(l, r) | Expr::BitOr(l, r) | Expr::BitXor(l, r) | Expr::Shl(l, r) | Expr::Shr(l, r) => {
@@ -475,7 +475,7 @@ fn collect_fetch_names(expr: &Expr, out: &mut Vec<String>) {
             }
             collect_fetch_names(req, out);
         }
-        Expr::Number(_) | Expr::Text(_) | Expr::Ident(_) => {}
+        Expr::Number(_) | Expr::Text(_) | Expr::Bytes(_) | Expr::Ident(_) => {}
         Expr::Read(_) => {}
         Expr::Field(base, _) => collect_fetch_names(base, out),
         Expr::Binary(_, l, r) => {
@@ -542,7 +542,7 @@ fn collect_fetch_names(expr: &Expr, out: &mut Vec<String>) {
         // `length(<text_expr>)` — pure pass-through.
         Expr::Length(inner) => collect_fetch_names(inner, out),
         // `abs(<number_expr>)` — pure pass-through.
-        Expr::Abs(inner) | Expr::BitNot(inner) => collect_fetch_names(inner, out),
+        Expr::Abs(inner) | Expr::BitNot(inner) | Expr::Le32(inner) | Expr::Le64(inner) => collect_fetch_names(inner, out),
         // `min(a, b)` / `max(a, b)` — recurse into both children.
         Expr::Min(l, r) | Expr::Max(l, r) | Expr::BitAnd(l, r) | Expr::BitOr(l, r) | Expr::BitXor(l, r) | Expr::Shl(l, r) | Expr::Shr(l, r) => {
             collect_fetch_names(l, out);
@@ -595,7 +595,7 @@ fn collect_fetch_names_with_dups(expr: &Expr, out: &mut Vec<String>) {
             out.push(name.clone());
             collect_fetch_names_with_dups(req, out);
         }
-        Expr::Number(_) | Expr::Text(_) | Expr::Ident(_) => {}
+        Expr::Number(_) | Expr::Text(_) | Expr::Bytes(_) | Expr::Ident(_) => {}
         Expr::Read(_) => {}
         Expr::Field(base, _) => collect_fetch_names_with_dups(base, out),
         Expr::Binary(_, l, r) => {
@@ -662,7 +662,7 @@ fn collect_fetch_names_with_dups(expr: &Expr, out: &mut Vec<String>) {
         // `length(<text_expr>)` — pure pass-through.
         Expr::Length(inner) => collect_fetch_names_with_dups(inner, out),
         // `abs(<number_expr>)` — pure pass-through.
-        Expr::Abs(inner) | Expr::BitNot(inner) => collect_fetch_names_with_dups(inner, out),
+        Expr::Abs(inner) | Expr::BitNot(inner) | Expr::Le32(inner) | Expr::Le64(inner) => collect_fetch_names_with_dups(inner, out),
         // `min(a, b)` / `max(a, b)` — recurse into both children.
         Expr::Min(l, r) | Expr::Max(l, r) | Expr::BitAnd(l, r) | Expr::BitOr(l, r) | Expr::BitXor(l, r) | Expr::Shl(l, r) | Expr::Shr(l, r) => {
             collect_fetch_names_with_dups(l, out);
@@ -1232,6 +1232,7 @@ fn describe_expr_kind(e: &Expr) -> &'static str {
     match e {
         Expr::Number(_) => "number",
         Expr::Text(_) => "text",
+        Expr::Bytes(_) => "bytes",
         Expr::Ident(_) => "identifier",
         Expr::Field(_, _) => "field access",
         Expr::Binary(_, _, _) => "binary op",
@@ -1258,6 +1259,7 @@ fn describe_expr_kind(e: &Expr) -> &'static str {
         Expr::EndsWith(_, _) => "ends_with",
         Expr::Length(_) => "length",
         Expr::Abs(_) => "abs", Expr::BitAnd(_,_) => "band", Expr::BitOr(_,_) => "bor", Expr::BitXor(_,_) => "bxor", Expr::BitNot(_) => "bnot", Expr::Shl(_,_) => "shl", Expr::Shr(_,_) => "shr",
+        Expr::Le32(_) => "le32", Expr::Le64(_) => "le64",
         Expr::Min(_, _) => "min",
         Expr::Max(_, _) => "max",
         Expr::Substring(_, _, _) => "substring",
@@ -1408,12 +1410,20 @@ fn verify_concept(c: &Concept, base_dir: &StdPath, errors: &mut Vec<VerifyError>
     }
 }
 
-/// Phase B slice 1: bounds ceiling on `max_depth` and `max_nodes`. Picked
-/// at 65535 (16-bit) so the future arena-emitter (B.4+) can use 16-bit
-/// indices unconditionally — see docs/recursive-types-design.md §6 / Q2.
-/// The actual emitter exploitation lands in B.4; B.1 just refuses
-/// declarations that would later force a wider index width.
-const PHASE_B1_MAX_BOUND: u32 = 65535;
+/// Off-stack mmap arena (2026-06-22): the arena emitter stores node
+/// indices as 64-bit values (the 16-bit-index reasoning never constrained
+/// storage — confirmed in the B.4 recon), so the `max_nodes` ceiling can
+/// rise well past 65535 now that the arena is mmap-backed (off-stack). At
+/// 4_000_000 a worst-case wide-variant arena is ~96–192 MB, which fails
+/// gracefully via the MAP_FAILED abort if the host can't back it.
+const PHASE_B1_MAX_NODES: u32 = 4_000_000;
+
+/// `max_depth` stays at the 16-bit ceiling. Raising it would be FALSE
+/// EXPLICITATION: there is no runtime recursion-depth check yet (the 8 MB
+/// stack is the real wall — see docs/self-hosting-capacity-design.md), so a
+/// declared `max_depth` above what the stack can actually hold is an
+/// unbacked promise. Tie this to a real runtime check before raising it.
+const PHASE_B1_MAX_DEPTH: u32 = 65535;
 
 /// Phase B slice 1: verify a `concept_group` block. Checks the @source
 /// ref, the `max_depth` / `max_nodes` bounds, and the inner concepts'
@@ -1445,12 +1455,12 @@ fn verify_concept_group(
             message: "max_depth must be greater than zero — a recursive tree must allow at least one level".into(),
         });
     }
-    if g.max_depth > PHASE_B1_MAX_BOUND {
+    if g.max_depth > PHASE_B1_MAX_DEPTH {
         errors.push(VerifyError {
             context: format!("concept_group '{}' / max_depth", g.name),
             message: format!(
-                "max_depth {} exceeds the slice-1 ceiling of {} (16-bit index budget — see docs/recursive-types-design.md §6 / Q2)",
-                g.max_depth, PHASE_B1_MAX_BOUND
+                "max_depth {} exceeds the ceiling of {} (no runtime recursion-depth check exists yet — raising this would be an unbacked promise; see docs/self-hosting-capacity-design.md)",
+                g.max_depth, PHASE_B1_MAX_DEPTH
             ),
         });
     }
@@ -1460,14 +1470,50 @@ fn verify_concept_group(
             message: "max_nodes must be greater than zero — a recursive tree must allow at least one node".into(),
         });
     }
-    if g.max_nodes > PHASE_B1_MAX_BOUND {
+    if g.max_nodes > PHASE_B1_MAX_NODES {
         errors.push(VerifyError {
             context: format!("concept_group '{}' / max_nodes", g.name),
             message: format!(
-                "max_nodes {} exceeds the slice-1 ceiling of {} (16-bit index budget — see docs/recursive-types-design.md §6 / Q2)",
-                g.max_nodes, PHASE_B1_MAX_BOUND
+                "max_nodes {} exceeds the ceiling of {} (the mmap arena is off-stack but still bounded; an absurd count would mmap-fail at runtime — see docs/arena-allocation-design.md)",
+                g.max_nodes, PHASE_B1_MAX_NODES
             ),
         });
+    }
+    // Off-stack mmap arena (2026-06-22): `arena_size = max_nodes *
+    // entry_size` is held as an i32 in the native emitter (the disp32
+    // node_count offset and the `sub rsp` / mmap-size math all use i32). A
+    // wide-variant group at the raised max_nodes ceiling could overflow
+    // i32 and wrap to a nonsensical (possibly negative) size. Refuse it
+    // here so the emitter never sees a wrapped arena_size. entry_size is
+    // computed with the same per-field byte widths the native arena layout
+    // uses (Text = 16 B, everything else 8 B, +1 tag byte, padded to 8).
+    {
+        let group_names: std::collections::HashSet<&str> =
+            g.concepts.iter().map(|c| c.name.as_str()).collect();
+        let field_width = |ty: &Type| -> i64 {
+            match ty {
+                Type::Text => 16,
+                _ => 8,
+            }
+        };
+        let max_payload: i64 = g.concepts.iter()
+            .flat_map(|c| c.variants.iter())
+            .map(|v| v.fields.iter().map(|f| field_width(&f.ty)).sum::<i64>())
+            .max()
+            .unwrap_or(0);
+        let _ = &group_names; // (group_names kept for clarity of intent)
+        let raw_entry = 1 + max_payload;
+        let entry_size = (raw_entry + 7) & !7; // round up to 8
+        let arena_size = (g.max_nodes as i64) * entry_size;
+        if arena_size > i32::MAX as i64 {
+            errors.push(VerifyError {
+                context: format!("concept_group '{}' / max_nodes", g.name),
+                message: format!(
+                    "arena size = max_nodes ({}) × entry_size ({}) = {} bytes exceeds i32::MAX; lower max_nodes (the native arena size is an i32)",
+                    g.max_nodes, entry_size, arena_size
+                ),
+            });
+        }
     }
 
     // Build the set of concept names this group owns. Used to admit
@@ -2094,6 +2140,15 @@ fn check_expr_against(
                 if let Some(inferred) = infer_expr_type(arg, rule, all_rules, input_concept) {
                     match inferred {
                         Type::Number | Type::Bool | Type::Text => {}
+                        Type::Bytes => {
+                            errors.push(VerifyError {
+                                context: format!("rule '{}' / logic", rule.name),
+                                message:
+                                    "concat mixes bytes and text: a bytes argument (b\"...\" / le32 / le64) \
+                                     cannot appear in a text concat — bytes and text never implicitly convert"
+                                        .to_string(),
+                            });
+                        }
                         other => {
                             errors.push(VerifyError {
                                 context: format!("rule '{}' / logic", rule.name),
@@ -2108,11 +2163,49 @@ fn check_expr_against(
                 // Else: not inferable — conservative silence.
             }
         }
+        // Backend brick b2: a bytes concat. EVERY argument must be bytes-typed
+        // (a `b"..."` literal, le32/le64, or another bytes value). A number
+        // that should become bytes goes through le32/le64 explicitly — no
+        // implicit itoa here. Mixing bytes with text/number is a type error.
+        (Expr::Concat(args), Type::Bytes) => {
+            for arg in args {
+                // Each arg must itself check out as bytes; recurse so le32/le64
+                // arg-type errors and nested-concat errors surface.
+                check_expr_against(arg, &Type::Bytes, rule, all_rules, input_concept, all_concepts, errors);
+                if let Some(inferred) = infer_expr_type(arg, rule, all_rules, input_concept) {
+                    if inferred != Type::Bytes {
+                        errors.push(VerifyError {
+                            context: format!("rule '{}' / logic", rule.name),
+                            message: format!(
+                                "concat mixes bytes and text: a bytes concat only accepts bytes arguments \
+                                 (b\"...\" / le32 / le64), but this argument has type '{}'",
+                                type_display(&inferred),
+                            ),
+                        });
+                    }
+                }
+            }
+        }
         (Expr::Concat(_), other) => {
             errors.push(VerifyError {
                 context: format!("rule '{}' / logic", rule.name),
                 message: format!(
-                    "concat produces text but the expected type is '{}'",
+                    "concat produces text or bytes but the expected type is '{}'",
+                    type_display(other),
+                ),
+            });
+        }
+        // le32/le64: number → bytes. Inner must be number-typed; recurse with
+        // expected=Number so text/bool args are rejected through the usual
+        // channel (mirror of the Abs arms).
+        (Expr::Le32(inner), Type::Bytes) | (Expr::Le64(inner), Type::Bytes) => {
+            check_expr_against(inner, &Type::Number, rule, all_rules, input_concept, all_concepts, errors);
+        }
+        (Expr::Le32(_), other) | (Expr::Le64(_), other) => {
+            errors.push(VerifyError {
+                context: format!("rule '{}' / logic", rule.name),
+                message: format!(
+                    "le32/le64 produce bytes but the expected type is '{}'",
                     type_display(other),
                 ),
             });
@@ -2454,6 +2547,10 @@ fn infer_expr_type(
     match expr {
         Expr::Number(_) => Some(Type::Number),
         Expr::Text(_) => Some(Type::Text),
+        // Backend brick b1: a `b"..."` byte-string literal has type bytes.
+        // Bytes participates in nothing else yet (no arithmetic, concat, or
+        // coercion), so this is the only inference path that produces it.
+        Expr::Bytes(_) => Some(Type::Bytes),
         // Phase 9 slice 1: read(<resource>) returns text. Existence of the
         // resource is checked separately by verify_rule via a dedicated
         // walk; this inference path only needs the type.
@@ -2489,7 +2586,18 @@ fn infer_expr_type(
         // Phase A slice 2: variant construction yields the concept type —
         // same outer shape as record construction.
         Expr::VariantConstruct(name, _, _) => Some(Type::Named(name.clone())),
-        Expr::Concat(_) => Some(Type::Text),
+        // concat is text by default, but if ANY argument is bytes-typed the
+        // whole concat is bytes (backend brick b2). Mixing bytes with
+        // text/number is a type error, surfaced by check_expr_against; for
+        // inference we report Bytes if any inferable arg is bytes, else Text.
+        Expr::Concat(args) => {
+            let any_bytes = args.iter().any(|a| {
+                matches!(infer_expr_type(a, rule, all_rules, concept), Some(Type::Bytes))
+            });
+            if any_bytes { Some(Type::Bytes) } else { Some(Type::Text) }
+        }
+        // le32/le64 turn a number into 4/8 little-endian bytes.
+        Expr::Le32(_) | Expr::Le64(_) => Some(Type::Bytes),
         // Phase 11 slice 1: fetch(<connection>, _) returns text — same
         // inference as read(<resource>). Existence of the connection and
         // type-check of the request bytes are handled separately.
@@ -2795,7 +2903,8 @@ fn walk_for_match_result_callees(
             walk_for_match_result_callees(e, rules_by_name, all_resources, all_connections, visited, out_reads);
         }
         Expr::Ok(i) | Expr::Err(i) | Expr::Not(i) | Expr::Neg(i) | Expr::Abs(i)
-        | Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i) | Expr::BitNot(i) => {
+        | Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i) | Expr::BitNot(i)
+        | Expr::Le32(i) | Expr::Le64(i) => {
             walk_for_match_result_callees(i, rules_by_name, all_resources, all_connections, visited, out_reads);
         }
         Expr::Binary(_, l, r) => {
@@ -2861,7 +2970,7 @@ fn walk_for_match_result_callees(
                 walk_for_match_result_callees(&a.body, rules_by_name, all_resources, all_connections, visited, out_reads);
             }
         }
-        Expr::Number(_) | Expr::Text(_) | Expr::Field(_, _) | Expr::Ident(_)
+        Expr::Number(_) | Expr::Text(_) | Expr::Bytes(_) | Expr::Field(_, _) | Expr::Ident(_)
         | Expr::Read(_) | Expr::NowUnix => {}
     }
 }
@@ -2886,7 +2995,7 @@ fn collect_expr_facts(
     calls: &mut HashSet<Vec<String>>,
 ) {
     match expr {
-        Expr::Number(_) | Expr::Text(_) => {}
+        Expr::Number(_) | Expr::Text(_) | Expr::Bytes(_) => {}
         Expr::If(cond, then_e, else_e) => {
             collect_expr_facts(cond, reads, calls);
             collect_expr_facts(then_e, reads, calls);
@@ -3052,6 +3161,10 @@ fn collect_expr_facts(
         // `abs(<number_expr>)` — pure pass-through. The absolute value adds
         // no synthetic read; the inner expression's facts are the facts.
         Expr::Abs(inner) => {
+            collect_expr_facts(inner, reads, calls);
+        }
+        // `le32(n)` / `le64(n)` — pure: a number→bytes view of the inner.
+        Expr::Le32(inner) | Expr::Le64(inner) => {
             collect_expr_facts(inner, reads, calls);
         }
         // `min(a, b)` / `max(a, b)` — pure: branch-free scalar comparison
@@ -3262,7 +3375,8 @@ fn collect_lambda_bound_names(expr: &Expr) -> std::collections::HashSet<String> 
             Expr::Binary(_, l, r) => { walk(l, out); walk(r, out); }
             Expr::If(c, t, el) => { walk(c, out); walk(t, out); walk(el, out); }
             Expr::Not(i) | Expr::Neg(i) | Expr::Abs(i) | Expr::Length(i)
-            | Expr::ParseInt(i) | Expr::JsonEscape(i) | Expr::Ok(i) | Expr::Err(i) => {
+            | Expr::ParseInt(i) | Expr::JsonEscape(i) | Expr::Ok(i) | Expr::Err(i)
+            | Expr::Le32(i) | Expr::Le64(i) => {
                 walk(i, out);
             }
             Expr::Min(a, b) | Expr::Max(a, b) | Expr::BitAnd(a, b) | Expr::BitOr(a, b) | Expr::BitXor(a, b) | Expr::Shl(a, b) | Expr::Shr(a, b) | Expr::StartsWith(a, b)
@@ -3315,7 +3429,7 @@ fn collect_lambda_bound_names(expr: &Expr) -> std::collections::HashSet<String> 
             | Expr::Shl(a, b) | Expr::Shr(a, b) => { walk(a, out); walk(b, out); }
             Expr::BitNot(i) => walk(i, out),
             // Leaves
-            Expr::Number(_) | Expr::Text(_) | Expr::Field(_, _) | Expr::Ident(_)
+            Expr::Number(_) | Expr::Text(_) | Expr::Bytes(_) | Expr::Field(_, _) | Expr::Ident(_)
             | Expr::Read(_) | Expr::NowUnix => {}
         }
     }
@@ -3528,11 +3642,12 @@ fn collect_recursive_call_args(expr: &Expr, rule_name: &str, out: &mut Vec<Strin
                 }
             }
         }
-        Expr::Number(_) | Expr::Text(_) | Expr::Ident(_) | Expr::Read(_) | Expr::NowUnix => {}
+        Expr::Number(_) | Expr::Text(_) | Expr::Bytes(_) | Expr::Ident(_) | Expr::Read(_) | Expr::NowUnix => {}
         Expr::Field(b, _) => collect_recursive_call_args(b, rule_name, out),
         Expr::Binary(_, l, r) => { collect_recursive_call_args(l, rule_name, out); collect_recursive_call_args(r, rule_name, out); }
         Expr::Not(i) | Expr::Neg(i) | Expr::Ok(i) | Expr::Err(i)
-        | Expr::Abs(i) | Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i) | Expr::BitNot(i) => collect_recursive_call_args(i, rule_name, out),
+        | Expr::Abs(i) | Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i) | Expr::BitNot(i)
+        | Expr::Le32(i) | Expr::Le64(i) => collect_recursive_call_args(i, rule_name, out),
         Expr::If(c, t, e) => { collect_recursive_call_args(c, rule_name, out); collect_recursive_call_args(t, rule_name, out); collect_recursive_call_args(e, rule_name, out); }
         Expr::Call(_, args) | Expr::Concat(args) => { for a in args { collect_recursive_call_args(a, rule_name, out); } }
         Expr::Quantifier(_, c, _, body) => { collect_recursive_call_args(c, rule_name, out); collect_recursive_call_args(body, rule_name, out); }
@@ -3780,11 +3895,12 @@ fn collect_recursive_call_record_args(expr: &Expr, rule_name: &str, out: &mut Ve
                 out.push((name.clone(), arg.clone()));
             }
         }
-        Expr::Number(_) | Expr::Text(_) | Expr::Ident(_) | Expr::Read(_) | Expr::NowUnix => {}
+        Expr::Number(_) | Expr::Text(_) | Expr::Bytes(_) | Expr::Ident(_) | Expr::Read(_) | Expr::NowUnix => {}
         Expr::Field(b, _) => collect_recursive_call_record_args(b, rule_name, out),
         Expr::Binary(_, l, r) => { collect_recursive_call_record_args(l, rule_name, out); collect_recursive_call_record_args(r, rule_name, out); }
         Expr::Not(i) | Expr::Neg(i) | Expr::Ok(i) | Expr::Err(i)
-        | Expr::Abs(i) | Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i) | Expr::BitNot(i) => collect_recursive_call_record_args(i, rule_name, out),
+        | Expr::Abs(i) | Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i) | Expr::BitNot(i)
+        | Expr::Le32(i) | Expr::Le64(i) => collect_recursive_call_record_args(i, rule_name, out),
         Expr::If(c, t, e) => { collect_recursive_call_record_args(c, rule_name, out); collect_recursive_call_record_args(t, rule_name, out); collect_recursive_call_record_args(e, rule_name, out); }
         Expr::Call(_, args) | Expr::Concat(args) => { for a in args { collect_recursive_call_record_args(a, rule_name, out); } }
         Expr::Quantifier(_, c, _, body) => { collect_recursive_call_record_args(c, rule_name, out); collect_recursive_call_record_args(body, rule_name, out); }
@@ -3808,7 +3924,7 @@ fn collect_recursive_call_record_args(expr: &Expr, rule_name: &str, out: &mut Ve
 
 fn count_operations(expr: &Expr) -> usize {
     match expr {
-        Expr::Number(_) | Expr::Text(_) | Expr::Ident(_) => 0,
+        Expr::Number(_) | Expr::Text(_) | Expr::Bytes(_) | Expr::Ident(_) => 0,
         Expr::If(c, t, e) => 1 + count_operations(c) + count_operations(t) + count_operations(e),
         Expr::Not(inner) | Expr::Neg(inner) => 1 + count_operations(inner),
         Expr::Field(base, _) => count_operations(base),
@@ -3861,6 +3977,8 @@ fn count_operations(expr: &Expr) -> usize {
         Expr::Length(inner) => 1 + count_operations(inner),
         // `abs(<number_expr>)` — same shape as Neg: one op + inner cost.
         Expr::Abs(inner) => 1 + count_operations(inner),
+        // `le32(n)` / `le64(n)` — one op + inner cost (same shape as Abs).
+        Expr::Le32(inner) | Expr::Le64(inner) => 1 + count_operations(inner),
         // `min(a, b)` / `max(a, b)` — branch-free scalar; one op + each child.
         Expr::Min(l, r) | Expr::Max(l, r) | Expr::BitAnd(l, r) | Expr::BitOr(l, r) | Expr::BitXor(l, r) | Expr::Shl(l, r) | Expr::Shr(l, r) => 1 + count_operations(l) + count_operations(r),
         // `substring(text, start, end)` — one op for the slice operation
@@ -6049,10 +6167,11 @@ concept_group AST [max_depth: 10, max_nodes: 0]
     }
 
     #[test]
-    fn phase_b1_rejects_max_nodes_over_65535() {
-        // Verifier refuses node counts past 16-bit so the future
-        // arena emitter can use 16-bit indices unconditionally
-        // (docs/recursive-types-design.md §6 / Q2).
+    fn phase_b1_accepts_max_nodes_over_65535_now_mmap_backed() {
+        // Off-stack mmap arena (2026-06-22): the 16-bit ceiling is lifted.
+        // 100000 nodes (was rejected pre-mmap) is now accepted — the arena
+        // is mmap-backed, indices are 64-bit, and 100000 is well under the
+        // new 4_000_000 ceiling.
         let src = r#"@verbose 0.1.0
 
 concept_group AST [max_depth: 10, max_nodes: 100000]
@@ -6067,9 +6186,33 @@ concept_group AST [max_depth: 10, max_nodes: 100000]
 "#;
         let errs = verify_str(src);
         assert!(
+            !errs.iter().any(|e| e.context.contains("max_nodes")),
+            "expected max_nodes=100000 to be ACCEPTED now (mmap-backed), got {:#?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn phase_b1_rejects_max_nodes_over_4m() {
+        // The mmap arena is off-stack but still bounded — node counts past
+        // the 4_000_000 ceiling are refused.
+        let src = r#"@verbose 0.1.0
+
+concept_group AST [max_depth: 10, max_nodes: 5000000]
+  @intention: "x"
+  @source: invoices.intent:1
+
+  concept Expr
+    @intention: "e"
+    @source: invoices.intent:1
+    variants:
+      Int of (n : number)
+"#;
+        let errs = verify_str(src);
+        assert!(
             errs.iter().any(|e| e.context.contains("max_nodes")
-                && e.message.contains("16-bit")),
-            "expected max_nodes=100000 rejection with 16-bit breadcrumb, got {:#?}",
+                && e.message.contains("ceiling")),
+            "expected max_nodes=5000000 rejection, got {:#?}",
             errs
         );
     }

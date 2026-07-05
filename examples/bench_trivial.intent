@@ -1,0 +1,2 @@
+1. A placeholder holds a single number; its value is ignored.
+2. Compute the constant 42 regardless of the input, and print it.

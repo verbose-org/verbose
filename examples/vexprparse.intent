@@ -1,0 +1,1671 @@
+Brick 8a of the self-hosting arc: teach the tokenizer to TRAVERSE MULTIPLE LINES
+and emit a line-boundary token, WITHOUT yet computing indentation. This is the
+first half of the INDENT/DEDENT work (brick 8b adds the column stack and the
+INDENT/DEDENT tokens next).
+
+The problem: the pre-8a flat tokenizer STOPPED at the first newline. `skip_spaces`
+advances over inline spaces (byte 32) only, not a newline (byte 10); the newline
+fell through to the operator classifier, which returned 0, so the scanner read it
+as end-of-input and the token list ended at the first line break. A multi-line
+source could not even be traversed.
+
+Brick 8a adds a line-boundary token kind (Newline, carrying the byte offset of
+the newline). The next-lexeme recognizer, after skipping inline spaces, now
+recognizes byte 10 as a Newline token; the token-end helper advances exactly one
+byte past it; and the whole-source scanner conses the Newline like any other
+token and keeps scanning the next line. Brick 8a emits newlines FAITHFULLY:
+consecutive newlines (blank lines) emit consecutive Newline tokens — collapsing
+blanks and the column-stack INDENT/DEDENT logic are brick 8b. Brick 8a computes
+NO indentation, columns, INDENT, or DEDENT.
+
+The trailing-end convention is unchanged from brick 2: the scanner always
+appends one end-of-input cell, so a source with N real lexemes and K newlines
+produces N + K + 1 token cells.
+
+Validation is STRUCTURAL (multi-line evaluation is not meaningful yet): a
+cell-counting driver tokenizes a source and counts every token cons cell, and a
+kind-at-index driver tokenizes a source and returns the kind code of the token at
+a given index (confirming the Newline appears at the right position). Both are
+hand-derivable single numbers. Newline-bearing sources are checked NATIVE-ONLY
+via argv (a real byte-10 newline), because the interpreter's JSON input reader
+does not decode an escaped newline into a real newline byte — it passes the two
+bytes backslash-n verbatim — exactly the same limit that made brick 5's comma
+cases and brick 7's string cases native-only. Single-line cell counts cross-check
+native against the interpreter through the JSON fixture. Bricks 1-7 are unchanged
+on single-line input (a line with no newline byte takes the identical scan path),
+which the unchanged eval and shape drivers certify.
+
+  next lexeme = (skip inline spaces) then
+                  Newline      if at a newline byte    -- brick 8a
+                | Keyword | Ident | Number | String | Operator | Eof
+
+----------------------------------------------------------------------------
+Brick 7 of the self-hosting arc: extend the parser's `primary` with two LITERAL
+kinds — boolean literals (`true` / `false`) and string literals (`"..."`).
+Brick 6 added the conditional expression; brick 7 adds the remaining leaf forms.
+
+Boolean literals lex as keywords (the keyword classifier gains `true` = code 9
+in the four-letter band and `false` = code 10 in a new five-letter band), parse
+to a boolean-literal node carrying 1 for true / 0 for false, and DO carry an
+arithmetic value — they evaluate to 1/0 and compose in and / or / not /
+comparisons exactly as a 1/0 number would (true and false = 0, true or false = 1,
+not false = 1, if true then 7 else 8 = 7).
+
+String literals are the tokenizer-reopening part. A new string-length scanner
+recognizes a `"`...`"` token with the closed escape set (\n \r \t \\ \"). Inside
+the string a backslash starts a TWO-byte escape and is skipped unconditionally,
+so an escaped quote (\") does NOT terminate the string; the string ends at the
+first UNESCAPED closing quote. Escape handling is LENIENT — this is a token-
+BOUNDARY scanner, not an escape validator, so an unknown escape \x is simply two
+literal bytes (the reference lexer rejects unknown escapes, but finding where the
+token ends is all this brick needs). An UNTERMINATED string (no closing quote
+before end-of-source) runs to the end and is still a string token (fail-closed:
+every byte index is guarded, and a trailing lone backslash counts as one byte and
+stops). The string token carries its source span (opening-quote offset + total
+length including both quotes), and the parser builds a string-literal node
+identified by that span. A string has no arithmetic value without an environment
+to decode its bytes, so it evaluates to zero — its correctness is proven
+STRUCTURALLY by the shape signature (a dedicated top band per literal kind:
+booleans and strings each get their own weight above the conditional's band).
+Because the interpreter's JSON input reader cannot deliver a `"`-containing
+source string (it strips outer quotes naively and does not decode escapes), the
+string-literal cases are validated NATIVE-ONLY via argv, exactly like brick 5's
+comma cases. The boolean and the non-string shape cases cross-check native
+against the interpreter through the JSON fixture as before.
+
+  primary = 'if' parse_or 'then' parse_or 'else' parse_or   -- brick 6
+          | 'true' | 'false'    -- brick 7 boolean literal
+          | STRING               -- brick 7 string literal
+          | '(' parse_or ')' | NUMBER | IDENT trailer
+
+----------------------------------------------------------------------------
+Brick 6 of the self-hosting arc: extend the parser's `primary` with a
+conditional expression — `if cond then thn else els`, the single-line form.
+Bricks 3-5 built the full-precedence parser (arithmetic core, logical or/and,
+comparisons, prefix unary, then identifiers / calls / field access). Brick 6
+adds the highest-level alternative to a primary: an `if` keyword opens a
+conditional whose condition, then-branch, and else-branch are each a full
+expression (parse_or). There is NO INDENT/DEDENT in this tokenizer, so only the
+single-line form exists — the multi-line `if`/`then`/`else` block is a later
+brick once a column-stack tokenizer ships.
+
+  primary = 'if' parse_or 'then' parse_or 'else' parse_or   -- brick 6
+          | '(' parse_or ')' | NUMBER | IDENT trailer
+  trailer = '(' arglist ')'    -- function call
+          | ('.' IDENT)*       -- field-access chain (left-deep)
+          | (nothing)          -- a bare variable reference
+  arglist = (parse_or (',' parse_or)*)?   -- zero or more comma-separated exprs
+
+The else-branch is a full parse_or, so `if 1 then 2 else 3 + 100` parses the
+else as `3 + 100` (= 103) and evaluates to 2 (the then-branch, since cond is
+true) — the conditional does NOT stop the else at `3`. An if-expression is the
+highest-precedence form, so it nests inside arithmetic only via parentheses:
+`1 + (if 1 then 2 else 3)` = 3; a bare `1 + if ...` would parse the `if` as the
+right operand of `+` (since parse_primary handles `if`), which is consistent but
+the parenthesized form is the readable one tested here.
+
+The tokenizer gains a four-letter-keyword classifier (`then` = code 7, `else` =
+code 8) wired alongside the existing two- and three-letter ones (if / or / of /
+let / and / not). The keyword `if` already lexes as code 1.
+
+After lexing an identifier the parser peeks the next token: a '(' opens a
+comma-separated argument list (a call), a '.' opens a field-access chain, and
+anything else leaves a bare variable. Calls and fields nest: f(g(x)) and a.b.c
+both parse, the latter left-deep. The argument list is itself a recursive
+cons-list builder over the token stream, exactly like the tokenizer building the
+token list.
+
+Validation is STRUCTURAL, not numeric: a variable / call / field node has no
+value without an environment, so brick 5's `shape` driver tokenizes + parses and
+returns a kind-count fingerprint of the AST (10000*calls + 1000*fields +
+100*vars + 10*bins + unaries) whose value is hand-derivable and distinct per
+test input. The brick-3/4 evaluator (`eval_expr`) is unchanged and still
+computes variable-free expressions (2+3*4 = 14); the new nodes evaluate to 0
+there (out of the arithmetic evaluator's scope).
+
+1. Declare a concept group holding the token types from brick 2 (a classified
+   Token and a cons-list TokenList), an expression AST (a numeric leaf, a
+   binary-operator node, a unary-not node, a unary-negation node, a bare-
+   variable node carrying a source span, a field-access node, a function-call
+   node carrying a callee span and an argument cons-list, and an error leaf), an
+   argument cons-list, a parse result pairing an AST node with the token index
+   where parsing ended, and a call-argument parse result pairing an argument
+   cons-list with its end index.
+
+2. A scanner state holds the source text and a byte position.
+
+3. Skip spaces: advance the position past ASCII spaces.
+
+4. Count the run of decimal digits starting at the position.
+
+5. Compute ten to the power n for small n (digit-position weight).
+
+6. Decode the decimal value of the digit run at the position.
+
+7. Recognize identifiers and the logical keywords (and / or / not), classify the
+   operator or punctuation at the position (two-char operators before one-char
+   ones), and report an operator's byte length.
+
+8. The byte length of an operator (two for two-char operators, one otherwise).
+
+9. Recognize the next core lexeme at the position: an identifier or keyword, a
+   number, an operator, or end of input.
+
+10. The byte offset just past the next token.
+
+11. Scan the whole source into a cons-list of tokens with a trailing end-of-input
+    sentinel.
+
+12. Drop the first n cons cells of a token list (a list plus an index).
+
+13. Token accessors: the head token of a list, the kind code of a token, and the
+    literal value carried by a number token.
+
+14. Peek the kind code and the literal value of the token at a given index.
+
+15. The parser carries the whole token list plus the current index. A fold state
+    additionally carries the left-associative accumulator AST; a unary-wrap state
+    carries the parsed operand and which prefix it was. Two accessors pull the
+    node and the next-index out of a parse result. (Language note: a block-form
+    match cannot currently be the right-hand side of a let binding — it is only
+    legal in the final assignment position — so destructuring a parse result is
+    factored into these two tiny rules.)
+
+16. Parse a primary: a parenthesized expression (which reopens the grammar at the
+    top, so a full or/and/comparison expression may appear in parentheses), or a
+    number literal, or an identifier — which is a function call when followed by a
+    parenthesized argument list, a field-access chain when followed by one or more
+    dotted field names, or otherwise a bare variable reference identified by its
+    source span; or an error leaf. Parse a (possibly empty) comma-separated
+    argument list as a cons-list, consuming the closing parenthesis; fold a chain
+    of dotted field accesses onto a base, left-deep. A primary is the highest-
+    precedence form.
+
+17. Fold multiplication, division, and modulo onto an accumulator, left-
+    associatively, by parsing the next unary operand and recursing.
+
+18. Parse a prefix-unary expression: a 'not' keyword or a leading '-' wraps the
+    rest in the corresponding unary node (right-recursive); otherwise it is a
+    primary. Then parse a multiplicative expression: a unary operand followed by
+    any number of times, divide, or modulo operations.
+
+19. Fold addition and subtraction onto an accumulator, left-associatively. Then
+    parse a comparison: an additive expression optionally followed by ONE
+    comparison operator (equal, not-equal, less, greater, less-equal,
+    greater-equal) and another additive expression. Comparison is non-associative
+    and binds looser than the arithmetic operators.
+
+20. Fold the 'and' keyword onto an accumulator, left-associatively, by parsing the
+    next comparison and recursing. Parse an 'and' expression: a comparison
+    followed by any number of 'and's. 'and' binds looser than comparisons.
+
+21. Fold the 'or' keyword onto an accumulator, left-associatively, by parsing the
+    next 'and' expression and recursing. Parse the full expression: an 'and'
+    expression followed by any number of 'or's. 'or' binds looser than 'and'.
+
+22. Evaluate an expression AST to a number, recursing on the tree and dispatching
+    each binary node on its operator (arithmetic to its value, comparisons and
+    logical and/or to one or zero), negating or logically-negating each unary
+    node.
+
+23. Compute a STRUCTURAL signature of an AST: a kind-count fingerprint summing a
+    large weight per function call, a smaller weight per field access, a smaller
+    one per variable, a smaller one per binary node, and one per unary node, while
+    recursing into a call's arguments. End to end (the structural driver):
+    tokenize the source, parse the full expression from the start, and return the
+    signature — proving that a call with two arguments builds a call node over a
+    two-element argument list and that a.b.c builds nested field accesses, by a
+    number predictable by hand.
+
+24. End to end (the numeric driver, unchanged from brick 4): tokenize the source,
+    parse the full expression from the start, and evaluate the resulting AST. This
+    proves precedence ordering across all levels: one plus two equals three is one
+    (addition binds tighter than the comparison), and two less-than three and four
+    less-than five is one (the comparisons bind tighter than 'and'). Variable,
+    call, and field nodes have no value without an environment and evaluate to
+    zero here — their correctness is proven by the structural signature above. A
+    conditional expression evaluates its condition, then ONLY the selected branch
+    (the language's lazy if): if two less-than three then ten else twenty is ten.
+
+25. The conditional expression (brick 6). The parser carries the partial state of
+    an if-expression through a small chain of single-input continuation rules,
+    because a rule has one input and let bindings are eager: a state holding the
+    token list and the parsed condition (then-state), one holding the token list,
+    the condition node, and the parsed then-branch (else-state), and one holding
+    the condition and then nodes and the parsed else-branch (build-state). The
+    then-state continuation consumes the 'then' keyword and parses the then-branch;
+    the else-state continuation consumes the 'else' keyword and parses the
+    else-branch; the build-state continuation assembles the conditional node from
+    the three sub-expressions, carrying the else-branch's end index. The keyword
+    classifier additionally recognizes the four-letter keywords 'then' and 'else'.
+    Evaluation walks a conditional by evaluating its condition and then only the
+    selected branch.
+
+26. Line traversal and the line-boundary token (brick 8a). A line-boundary token
+    kind carries the byte offset of a newline. The next-lexeme recognizer, after
+    skipping inline spaces, recognizes a newline byte as that token; the token-end
+    helper advances exactly one byte past it; the whole-source scanner conses it
+    like any other token and continues onto the next line, lifting the old "stops
+    at the first newline" limit. A structural test reports whether a token is a
+    line-boundary token. A cell-counting driver tokenizes a source and counts
+    every token cons cell (lexeme cells plus line-boundary cells plus the trailing
+    end-of-input cell). A kind-at-index driver tokenizes a source and returns the
+    kind code of the token at a given index, confirming the line-boundary token
+    lands at the right position. No indentation, columns, or block-structure
+    tokens are computed — that is brick 8b's column stack.
+
+27. Indentation and block-structure tokens (brick 8b). A column stack records the
+    indentation width of every open block (a cons-list of widths, with a column-0
+    sentinel that is never popped). A line driver processes the source line by
+    line, threading the stack: it measures each line's leading-space width,
+    compares it to the stack's top, and weaves block tokens into the stream — one
+    indent token (and a push) when the line is deeper, one dedent token per closed
+    level (and the matching pops) when it is shallower, and nothing when it is the
+    same. Tabs in the indentation and a width that matches no enclosing block both
+    produce a distinguished error token (a Verbose rule is total, so an error is a
+    token, not an abort). Blank lines are skipped. At end of input a dedent token
+    is flushed for every still-open level, then the trailing end-of-input token.
+    A structural-signature driver tokenizes a source with indentation and returns
+    a kind-count fingerprint (a dedicated band per block-token kind) so each test
+    input's block structure is a single hand-derivable number; newline-bearing
+    sources are native-only (the interpreter's data reader does not decode an
+    escaped newline into a real newline byte).
+
+28. Parse a statement BLOCK (brick 9): the first PROGRAM-grammar parse that
+    consumes the block-structure tokens. A block body is a sequence of zero or
+    more let-statements followed by a final out-statement:
+
+        let_stmt = 'let' IDENT '=' expr
+        out_stmt = IDENT '=' expr            (conventionally `out = expr`)
+
+    where each expr is a full precedence-aware expression (the brick 1-8 parser).
+    A binding is a cons-list cell carrying the bound name as a source span plus its
+    right-hand-side expression subtree; a block is the binding list plus the final
+    out-expression. The block parser skips any leading separators (line-boundary
+    and indent tokens), then dispatches on the leading token: the `let` keyword
+    starts a let-statement (the name is the following identifier, the value a full
+    expression after `=`), and a continuation threads the value's end index into
+    the recursive parse of the rest of the block, consing the binding; a bare
+    identifier followed by `=` is the final out-statement, ending the block with
+    the accumulated bindings and the out-expression. The recursion into the rest
+    of the block sits inside the let-branch's continuation (never an eager
+    binding), so it fires only along the taken path.
+
+    BLOCK FRAMING (documented): the brick-9 test sources are the block BODY lines
+    written at column 0, so the token stream is lexemes-and-line-boundaries with no
+    indent/dedent; the block parser is nonetheless framing-agnostic (it skips a
+    leading indent and each statement's trailing line-boundary, and stops the
+    binding sweep at a dedent or end-of-input), so a genuinely-indented block would
+    parse identically. Validation is STRUCTURAL: a signature driver parses a block
+    and returns `1000000 * (#bindings) + sum-of-binding-RHS-shapes +
+    result-shape`, a single hand-derivable number per input certifying the exact
+    (binding count, per-binding RHS shape, result shape) triple. Newline-bearing
+    sources are native-only (escaped-newline decoding, as in brick 8a/8b).
+
+    EVAL-WITH-ENVIRONMENT IS A FOLLOW-UP (not in this brick). A logic block whose
+    bindings and result are arithmetic over the bound names is semantically
+    evaluable: an environment maps each name to its value, the bindings fold in
+    left-to-right, and the result evaluates with name lookup. Name resolution must
+    compare name BYTES (two occurrences of the same name sit at different source
+    spans), which requires threading the source text into a recursive evaluator
+    over the AST. That recursive evaluator carries a text field in its input record
+    and makes two sibling recursive calls within one arithmetic node; the current
+    native backend clobbers the caller's text-field slots across the first of the
+    two sibling calls, so the second sub-evaluation reads a corrupted source
+    pointer and the binary fails closed. Until that native-backend gap is fixed,
+    block semantics are proven structurally (the signature above), and
+    eval-with-environment is deferred.
+
+30. Parse a top-level RULE declaration with a logic block. This lifts the parser
+    from a bare statement-block (item 28/29) to a real program ITEM: a named rule
+    whose body is a logic block. The grammar, mirroring the reference compiler's
+    rule parser restricted to a tractable subset, is
+
+        rule_decl = 'rule' NAME newline indent
+                      'logic' ':' newline indent
+                        <statement-sequence>     -- the let-bindings + out value
+                      dedent dedent
+
+    Only the `rule` keyword, the rule NAME, and the `logic:` section are parsed;
+    intention / source / input / output / proofs are later bricks. The words
+    `rule` and `logic` have NO keyword code (the tokenizer classifies only
+    if/or/of/let/and/not/then/else/true/false), so they lex as ordinary
+    identifiers and are RECOGNIZED by byte-comparing each identifier's source span
+    against the literal bytes "rule" / "logic". Because that comparison reads the
+    actual source bytes, the rule-parsing entry carries the source text ALONGSIDE
+    the token list (a record with both the token list and the source). The two
+    nested block openings (entering the rule body, then the logic body) are
+    consumed by skipping separator tokens (line-boundary AND indent): after the
+    name the parser skips to the `logic` identifier, after the `:` it skips to the
+    first statement; the two closing dedents need no explicit consumption because
+    the block parser (item 28) already stops its sweep at a dedent or end-of-input.
+    A Verbose rule is total, so a malformed header cannot abort: when both byte
+    checks pass the body is the parsed block, otherwise the body is an empty block
+    (a distinguishable signal, not a crash).
+
+    A parsed rule declaration carries its name span plus its logic block, so it is
+    BOTH evaluable and structurally checkable. The eval driver parses the rule
+    decl, extracts its body block, folds the bindings into an environment, and
+    evaluates the result — proving the header parsed AND the body still evaluates
+    (the rule's `out` value). The structural driver returns
+    `1000 * name_len + block_shape(body)`, a single hand-derivable number
+    certifying the name length AND the body's full structural signature. Both are
+    NATIVE-ONLY (the source is multi-line — escaped-newline decoding, as in items
+    26/27/29; multi-line argv supplies the real newline bytes). Cross-check with
+    the interpreter uses a JSON fixture whose string contains LITERAL newline
+    bytes (the gap is only about backslash-n ESCAPES, which neither argv nor
+    literal-byte JSON involve), and native equals interpreter for every input.
+
+31. Parse a whole PROGRAM = a SEQUENCE of top-level rule declarations. This lifts
+    the parser from ONE rule declaration (item 30) to a list of them, mirroring
+    the reference compiler's top-level item loop (parse a rule, push it, repeat
+    until end-of-input). The grammar is
+
+        program = rule_decl*
+
+    where each rule_decl is exactly item 30's shape. Consecutive declarations are
+    separated, in the token stream, by the line-boundary plus the one-or-more
+    DEDENT tokens that close the previous rule's logic body and rule body, after
+    which the next `rule` identifier appears at column 0. To walk a sequence the
+    parser must know where each declaration ENDS: the rule-decl parser is given a
+    position-returning form that takes a start index and returns both the parsed
+    declaration AND the token index just past its body (the body block's end
+    index, item 28's threaded `next`). The program loop then, from that end index,
+    skips ALL separator tokens — line-boundary, indent, AND dedent — to reach the
+    next significant token; item 28's separator-skipper stops at a dedent (inside
+    a block the dedent is the terminator), so the program level adds a wider
+    skipper that also crosses dedents (between two sibling rules the closing
+    dedents are mere noise). If that token's source span spells `rule` the loop
+    parses one declaration there and conses it onto the recursively-parsed rest
+    starting from its end index; otherwise (end-of-input or any non-`rule` token)
+    the program ends with the empty list. Each consing step advances the cursor by
+    at least a whole rule body, so the scan strictly approaches the finite end of
+    the token list.
+
+    A parsed program is a cons-list of rule declarations, the same shape as the
+    token list / binding list / environment, so the same structural-recursion
+    proof applies to its length. Two drivers validate it. The count driver returns
+    the list length, proving the program split into the right number of
+    declarations. The eval-nth driver takes the source plus an index n, drops the
+    first n declarations to land on the n-th, takes its body block, folds its
+    bindings into an environment, and evaluates the result — proving each
+    declaration parsed AND its body is intact and evaluable (the n-th rule's `out`
+    value). Both are NATIVE-ONLY (multi-line source, as in item 30): the count
+    driver takes the source as its single argument, the eval-nth driver takes the
+    source plus n as two arguments. The money shot: a two-rule program whose
+    bodies compute 5 and 8 parses to a length-2 program list whose first and
+    second declarations evaluate to exactly 5 and 8.
+
+32. A LINTER written in Verbose = a static check that consumes a parsed program
+    (item 31) and reports a diagnostic count. This turns the parser front end
+    into a TOOL: the headline driver returns the total number of undefined-
+    variable references across every rule in the program (0 = clean). It does
+    not evaluate anything — it analyzes the parsed AST shape.
+
+    THE LINT: undefined variable references. For each rule, every variable
+    referenced in its body — the `out =` result expression AND every let-
+    binding's right-hand side — must be bound by a `let` in that same rule. A
+    reference is an AST variable node (a name span); it is DEFINED iff that span
+    is byte-equal to SOME binding name in the rule's binding list. A variable
+    that matches no binding name is a lint error, counted once per occurrence.
+
+    SCOPING RULE (whole-rule — the brick-13 baseline, refined in item 33). The
+    first version treats a variable as defined iff it appears as ANY binding name
+    in the rule's binding list — all of a rule's lets mutually in scope. So
+    `let x = 1 / out = x + y` reports one error (y), and `let x = 1 / let y = x +
+    1 / out = y` reports zero (x is in scope for y's RHS). This deliberately
+    ignores let-order: a sound over-approximation of "defined somewhere in the
+    rule" that never raises a false positive on a genuine binding, but does NOT
+    catch use-before-definition within a let RHS. Item 33 refines exactly this:
+    a let RHS sees only EARLIER lets.
+
+    WHAT IS A VARIABLE (and what is not). Only an AST variable node counts. A
+    call's callee name is a RULE name, not a variable — ignored; only the call's
+    ARGUMENT expressions are walked. A field-access field name (the `.b` in a.b)
+    is a record field name, not a variable — ignored; only the field-access BASE
+    (`a`) is walked. Numbers, strings, booleans, and error nodes carry no
+    reference.
+
+    PER-RULE SCOPE. Each rule contributes only its own undefined references,
+    because the check reads only that rule's own binding list — one rule's lets
+    are never visible to another rule. A two-rule program where the first rule
+    uses its own `let` and the second references an unbound name reports exactly
+    one error (the second rule's), proving rule scopes do not leak.
+
+    The membership probe walks the binding list comparing each binding name's
+    span (length guard, then byte compare) against the queried name. The AST
+    walker mirrors the structural-signature walker (item 23) but contributes
+    each variable's undefined count instead of a shape band, descending into
+    both children of a binary node, the single child of a negation/logical-not,
+    all three sub-expressions of a conditional, the argument list of a call, and
+    the base of a field access. The binding walker checks every let RHS against
+    the rule scope; the rule check sums RHS errors plus result errors; the
+    program fold sums over the rule list. Because every recursive lint rule
+    packs its cons-list as a FIELD of its input (so it can carry the scope and
+    source text alongside), it recurses over a field rather than over the input
+    itself, so it uses the bound + recursion breadcrumb form (item 29's
+    env-walker shape), not the structural FIELD proof (item 31's length form,
+    which needs the input to BE the cons-list).
+
+    NATIVE-ONLY (multi-line program source, as in items 30/31): the headline
+    driver takes a scan state (source + position) so the source is the first
+    argument and the position is the second (always 0). The money shot: a two-
+    rule program whose second rule references an undefined `w` lints to exactly
+    1 (and the first rule, which uses its own `let x`, is clean) — a real static
+    check written in Verbose, run as native machine code over a parsed Verbose
+    program.
+
+33. USE-BEFORE-DEF refinement of the linter (item 32). Sharpen the whole-rule
+    scoping into proper let-ordering: a let binding's right-hand side may only
+    reference bindings that appear EARLIER in the source order (and not itself),
+    while the `out =` result expression still sees ALL of the rule's lets. So
+    `let a = b + 1 / let b = 2 / out = a` now reports one error — a's RHS uses b
+    before b is defined — where the whole-rule baseline (item 32) reported zero.
+    A self-reference `let x = x + 1` reports one error: x is not yet in scope for
+    its own RHS. A legitimate later reference `let x = 1 / let y = x + 1 / out =
+    y` stays zero, because x is earlier than y. The result expression is
+    unaffected: `let p = 1 / let q = 2 / out = p + q` stays zero (the result
+    legitimately sees every binding).
+
+    HOW THE SCOPE IS THREADED. Instead of checking every let RHS against the
+    whole binding list, the binding walker threads a PREFIX — the set of bindings
+    already seen earlier in the list. At each binding it checks the RHS against
+    the prefix ONLY, then recurses on the tail with the prefix extended by THIS
+    binding. Because membership is order-agnostic (the probe asks "is this name
+    one of the earlier binding names", not "where"), the prefix is built by
+    consing the current binding onto the front of the accumulated prefix — that
+    front-consed list is exactly the set of earlier bindings. The walk seeds the
+    prefix empty. A self-reference is caught for free: the current binding is
+    consed onto the prefix only when descending into the tail, AFTER its own RHS
+    has been checked against a prefix that does not yet contain it.
+
+    The money shot: `let a = b + 1 / let b = 2 / out = a` lints to 1
+    (use-before-def caught) while `let x = 1 / let y = x + 1 / out = y` stays 0
+    (proper let-ordering) — order-sensitive scope analysis, written in Verbose,
+    run as native machine code. NATIVE-ONLY (multi-line source), same scan-state
+    invocation as items 31/32.
+
+34. UNDEFINED-CALLEE detection: the linter's first INTER-rule pass (brick 15).
+    The variable lint (items 32/33) is INTRA-rule — a variable resolves against
+    the current rule's own bindings, so each rule is linted in isolation. A
+    function call is different: it names a RULE, and a rule may be defined ANYWHERE
+    in the program. So resolving a callee needs the WHOLE program's rule list, not
+    just one rule's bindings. The headline driver returns the total number of
+    calls that name a rule which does not exist. 0 = every call in the program
+    resolves to a real rule.
+
+    THE LINT: undefined callee references. For each rule, every function call
+    `name(args...)` anywhere in the body (every let RHS AND the result) must name
+    a rule that EXISTS in the program. A call to a non-existent rule is one error.
+    The call's arguments are themselves expressions that may contain more calls, so
+    a nested call `g(h(1))` is checked at both the outer callee (g) and the inner
+    callee (h) — that is how nested-call resolution falls out of the recursion.
+
+    PROGRAM-WIDE, ORDER-AGNOSTIC SCOPE. Unlike the let-ordering of item 33, callee
+    scope has no order: a rule may call ITSELF (self-reference of a callee is legal
+    — it is existence, not termination, that is checked here), and any other rule
+    regardless of where it appears (forward calls, mutual recursion). So there is
+    no prefix trick — every rule resolves its callees against the FULL program rule
+    list. The fold over the program threads two rule lists: an `iter` that advances
+    (one rule checked per step) and an `all` that stays fixed (the whole program),
+    so badcall checking always sees every rule.
+
+    A SEPARATE PASS, PROVABLY INDEPENDENT. The callee lint is kept distinct from
+    the var/use-before-def walk: it carries the program's rule list where the var
+    walk carries the rule's bindings. This separation is observable: a call
+    `g(y)` where `g` exists but `y` is an undefined variable lints to 0 under the
+    callee pass (the callee resolves) and 1 under the variable pass (y is unbound).
+    The mirror case `g(h(1))` (no undefined variables, but `h` is not a rule) lints
+    to 1 under the callee pass and 0 under the variable pass. The two passes never
+    see each other's concern.
+
+    HOW IT WALKS. A membership probe asks "does some rule in the program have a
+    name span byte-equal to this callee span?" (the rule-name analogue of the
+    binding-membership probe). The AST walker descends every node, and at each
+    function-call node it adds 1 when the callee is not a known rule, then recurses
+    into the call's arguments (catching nested calls). Variable references, numbers,
+    strings, booleans, and the error node contribute nothing — they carry no
+    callee. The per-rule checker sums the bad-callee counts of every let RHS and the
+    result, all resolved against the full program rule list.
+
+    The money shot: `rule f / logic: / out = g(h(1)) / rule g / logic: / out = 2`
+    lints to 1 — g exists, h does not, the nested callee resolved across the whole
+    program — a cross-rule static check, written in Verbose, run as native machine
+    code over a parsed Verbose program. A clean self-call (`out = f(1)` inside f)
+    and a clean mutual call (`out = g(1)` with g defined) both stay 0. NATIVE-ONLY
+    (multi-line source), same scan-state invocation as items 31/32/33. The two
+    driver passes (item 32/33's variable lint and this callee lint) are intended to
+    be summed by a future combined linter; for now each is its own headline driver.
+
+
+34. Brick 16 of the self-hosting arc: RULE PARAMETERS. The toy grammar so far had
+    rules of the shape `rule NAME` then `logic:` — a name and a body, no formal
+    parameters. Real Verbose rules take parameters: `rule add(x, y)` declares two
+    formals x and y that are in scope throughout the body. Brick 16 parses the
+    optional parameter list and makes the parameter names a first-class part of the
+    rule declaration AND of the linter's scope.
+
+    THE GRAMMAR. After the rule NAME, the next token MAY be `(`. If so, a
+    comma-separated list of bare identifiers follows, closed by `)`:
+    `rule add(x, y)` -> params [x, y]; `rule f()` -> no params (empty parens);
+    `rule f` (no parens) -> no params (the parameter list is optional). The list is
+    parsed exactly like a call's argument list (the same `(` / `,` / `)` token
+    dispatch) but it collects bare NAME spans (a cons-list of (start, len) pairs)
+    instead of argument AST nodes. After the list (or the name when there are no
+    parens) the parser continues to `logic:` from the index just past the `)`.
+
+    PARAMETERS ARE NAMES. A parameter is its bytes in the source text — the same
+    identity model as a let-binding name or a variable reference. The parser does
+    not decode the name; it stores the span. The rule declaration grows one field:
+    its parameter list, carried alongside the name span and the logic block. Adding
+    that field touches every place the declaration is built or destructured (the
+    two header parsers and the field accessors); the verifier enforces that the
+    field is supplied everywhere, which keeps the change mechanical and complete.
+
+    PARAMETERS ARE THE INITIAL SCOPE. This is the linter half of the brick. A
+    parameter is a DEFINED variable everywhere in the body: a let RHS may reference
+    it, and the result may reference it, with no `let` introducing it. The cleanest
+    way to make the existing scope machinery honor this is to convert the parameter
+    list into a binding list (each parameter becomes a binding whose NAME is the
+    parameter span and whose value is a dummy — the membership check only ever
+    reads the name, never the value) and use that list as the BASE scope. The
+    use-before-def walk over the lets is then seeded with the parameters as its
+    starting prefix (so a parameter is "already seen" before the first let), and
+    the result is checked against the parameters appended to the full binding list.
+    Because membership is order-agnostic, appending the two lists in any order is
+    correct; the only requirement is that every name from both is present.
+
+    EVALUATION is unchanged and orthogonal: there is no call mechanism yet, so a
+    parameter has no value at evaluation time (like a free variable). A rule with
+    parameters whose body uses only literals and lets still evaluates correctly;
+    evaluating a body that references a parameter yields the unbound-variable value
+    (0), exactly as a variable with no binding does. Brick 16 is a PARSE + LINT
+    brick, not an eval brick — the eval drivers are verified to still produce the
+    right number when the body does not depend on a parameter's value.
+
+    THE MONEY SHOT: `rule add(x, y) / logic: / out = x + y` parses with 2
+    parameters and lints to 0 (x and y are in scope as parameters), while the same
+    rule with `out = x + z` lints to 1 (z is neither a parameter nor a let). A
+    parse driver returns the parameter count of the first rule (2 for `add(x, y)`,
+    0 for `f()` and for the no-paren form); the lint driver counts undefined
+    references with parameters treated as the initial scope. Both are NATIVE-ONLY
+    (multi-line source), same scan-state invocation as items 30-33. Rule parameters
+    parsed and scoped, in pure Verbose, run as native machine code.
+
+
+35. Brick 17 of the self-hosting arc: CALL-ARITY checking — the linter's SECOND
+    inter-rule pass. The callee pass (item 34, brick 15) asks "does the called
+    rule EXIST?". This pass asks the next question down: "does the call pass the
+    RIGHT NUMBER OF ARGUMENTS?". A call `add(1)` to a rule `rule add(x, y)` is
+    well-formed for the callee pass (add exists) but WRONG here — one argument
+    supplied, two parameters declared. The headline driver returns the total
+    number of call sites whose argument count does not match the called rule's
+    parameter count. 0 = every call to an existing rule is well-arged.
+
+    ONLY EXISTING RULES ARE CHECKED. An undefined callee is the callee pass's
+    concern, not this one: if a call names a rule that does not exist, this pass
+    contributes 0 for that call — you cannot compare against an arity that is not
+    there. This makes the two passes PROVABLY INDEPENDENT and complementary:
+    `g(1, 2)` with g undefined lints 1 under the callee pass and 0 here; `add(1)`
+    with add a real 2-parameter rule lints 0 under the callee pass and 1 here.
+    The arity pass needs the callee to exist before it has anything to say; the
+    callee pass needs the callee to NOT exist before it has anything to say.
+
+    PROGRAM-WIDE, ORDER-AGNOSTIC SCOPE — identical to the callee pass. A call may
+    target a rule defined anywhere (forward, self, mutual), so the structure
+    mirrors the callee pass exactly: a probe over the program's rule list that
+    returns the matched rule's parameter count (instead of a 0/1 membership flag),
+    an Ast/ArgList mutual walk, a per-rule split (every let RHS plus the result),
+    and an iter/all fold over the program (iter advances one rule per step, all
+    stays fixed so every rule resolves its calls against every rule).
+
+    THE NOT-FOUND SENTINEL. The arity probe returns 1000000 (one million) when no
+    rule of the queried name exists — deliberately NOT -1. A `number` field
+    defaults to the range [0, i32::MAX], and the optimizer's interval arithmetic
+    could dead-eliminate a branch that tests a negative value. 1000000 is safely
+    inside the field range, far above any real parameter count, and the
+    `found == 1000000` skip test is exact. Counting the arguments of a call and
+    the parameters of a rule are the same structural-recursion shape over their
+    respective cons-lists (the argument-count rule is the exact mirror of the
+    parameter-count rule from brick 16). The per-call decision is factored into a
+    tiny helper so the arity probe is evaluated exactly once per call (no inline
+    double-evaluation): 0 if the callee is undefined or the counts match, 1 if the
+    callee exists and the counts differ.
+
+    THE MONEY SHOT: `rule add(x, y) / logic: / out = x + y` plus a caller doing
+    `out = add(1, 2)` lints to 0 (2 args, 2 params), while the same caller doing
+    `out = add(1)` lints to 1 (1 arg, 2 params). A call to an undefined `g(1, 2)`
+    lints to 0 here (arity skips it — the callee pass counts it). A self-call with
+    correct arity (`rule f(n) / out = f(n)`) stays 0; the same with a wrong arity
+    (`out = f(n, n)`) lints to 1 — a rule mis-calling itself, caught across the
+    whole program. NATIVE-ONLY (multi-line source), same scan-state invocation as
+    items 30-34. A second cross-rule static check, written in Verbose, run as
+    native machine code over a parsed Verbose program — independent of both the
+    variable lint and the callee lint, intended to be summed by a future combined
+    linter; for now each is its own headline driver.
+
+36. Brick 18 of the self-hosting arc: CALL/APPLY in the evaluator — make the
+    interpreter actually EXECUTE function calls. Through brick 17 the evaluator
+    (item 22, brick 10) resolved VARIABLES against an environment but returned 0
+    for every CALL. Brick 18 closes that gap: an AstCall now (1) finds the called
+    rule by NAME in the program, (2) evaluates the argument expressions against
+    the CALLER's environment, (3) binds them positionally to the callee's formal
+    parameters in a FRESH environment (lexical scoping — the callee does NOT see
+    the caller's locals), (4) folds the callee's own let-bindings on top of that,
+    and (5) evaluates the callee's result expression. The whole front end is now a
+    (toy) INTERPRETER: source text -> tokens -> AST -> a real computed call result.
+
+    THE THREADING. The program's parsed rule list is threaded through the
+    evaluator so a call can resolve its callee. The two evaluator inputs
+    (eval_ast_env's and build_env's) each gain a `prog` field carrying the rule
+    list, and every recursive construction of those inputs passes it down. A new
+    eval_call probe carries the callee name span + the call's argument list + the
+    caller env + the source + the program; a new bind_params probe walks the
+    callee's parameter list and the call's argument list in lock-step, evaluating
+    each argument in the caller env and consing (param name span, computed value)
+    onto a fresh empty environment; a new find_rule probe walks the program's rule
+    list and returns the RuleDecl whose name span byte-matches (the same name
+    matching idiom as the arity / callee passes), with a SENTINEL empty rule whose
+    body is AstErr on no match — so a call to a nonexistent rule evaluates to 0,
+    preserving the pre-brick-18 "AstCall => 0" behavior (the undefined-callee lint
+    flags it separately). Two tiny arg_head / arg_tail probes read the head and
+    tail of an argument list (block-form match is only legal in final position, so
+    destructuring an ArgList is factored out — the same idiom as the parsed_args
+    accessors). A call with fewer args than params binds the surplus params to 0,
+    the same "missing -> 0" default the rest of the evaluator already uses.
+
+    THE SCC. eval_ast_env, eval_call, bind_params, and build_env now form one
+    mutual-recursion cluster. Like the brick-10 evaluator rules they carry
+    bound-only termination and ACCEPT the mandatory native recursion breadcrumb:
+    each recursive call walks a strict sub-node / shorter tail, but that shrinking
+    value is a FIELD of a packed input concept (not the input itself), so the
+    structural proof does not fit. The honest backstop is that a call chain's
+    length is the SOURCE program's own recursion depth — an interpreter for a
+    non-terminating program does not terminate either, which is correct semantics,
+    not a soundness gap in this brick.
+
+    THE MONEY SHOTS (all NATIVE-ONLY, multi-line sources, same scan-state
+    invocation as items 24/30/31/34/35). A new eval_main driver evaluates the
+    FIRST rule's body (the entry point, like `main`) with the program threaded so
+    its calls resolve: `main: out = double(21)` + `double(x): out = x * 2` -> 42;
+    `add(20, 22)` + `add(x, y): out = x + y` -> 42 (two params); `f(10)` +
+    `f(n): let d = n * 2 / out = d + 1` -> 21 (callee with a let); `double(inc(20))`
+    -> 42 (a call as an argument, evaluated in the caller env); and the proof it is
+    a real interpreter — `fact(5)` + `fact(n): out = if n == 0 then 1 else n *
+    fact(n - 1)` -> 120 (RECURSIVE, the call chain firing through eval_call ->
+    eval_ast_env -> AstCall -> eval_call until the base case). The existing
+    eval_block / eval_nth_rule / eval_rule_decl drivers thread an empty program
+    (RuleList::RNil), so a bare block or single rule with a call hits the find_rule
+    sentinel -> 0, exactly the old behavior — fully backward compatible.
+
+37. Brick 19 of the self-hosting arc: a TYPE CHECKER in Verbose — the static
+    pendant of item 36's interpreter. Where the interpreter computes a VALUE for
+    an AST, the type checker computes a TYPE: a small lattice {number, bool,
+    text, ERROR} encoded as non-negative codes (0 = number, 1 = bool, 2 = text
+    since brick 30, 3 = ERROR). type_check(source) returns the total
+    number of type errors (ill-typed let RHSs + ill-typed rule results) across
+    the whole program; 0 = well-typed.
+
+    NON-NEGATIVE CODES. A -1 sentinel would let the optimizer (default field
+    range [0, i32::MAX]) dead-eliminate any `x < 0` branch, so every type code is
+    >= 0 and the classifiers compare against the literal codes 0/1/3 directly.
+
+    THE TYPE ENVIRONMENT. The brick-10 Env concept is REUSED as the type env:
+    each ECons stores a name span and, in `val`, the bound name's TYPE code.
+    env_lookup works UNCHANGED — it returns the stored type code on a match, 0
+    (= number) on an unbound name, which is the right default for an unannotated
+    parameter (the interpreter's all-numbers world). build_tenv mirrors build_env:
+    fold the lets in source order, typing each RHS against the env built so far,
+    consing (name span, RHS type) on the front so later lets see earlier ones.
+
+    TYPING RULES (v1). AstNum => number; AstBool => bool; AstStr => text (brick
+    30); AstErr/AstField => ERROR; AstVar => env_lookup; AstCall => number. AstNeg requires a number
+    operand, AstNot a bool operand. AstBin: arithmetic (+ - * / %) needs both
+    number => number; ORDERING (< > <= >=) needs both number => bool (ordering
+    booleans is not meaningful); EQUALITY (== !=) accepts two operands of the SAME
+    comparable type — number==number OR bool==bool — and yields bool (brick 29;
+    text==text is still ERROR — a string literal types as text since brick 30, but
+    text supports no operations); logic (and/or) needs both
+    bool => bool. AstIf: bool condition AND both branches the same non-ERROR type
+    => that type, else ERROR. Any mismatch => ERROR.
+
+    THE SCC. type_of_env + build_tenv (+ the per-rule tcheck_binds) form a
+    recursive group/text cluster exactly like the interpreter's eval_ast_env +
+    build_env: each recursive call walks a strict sub-node / shorter tail, but
+    that shrinking value is a FIELD of a packed input concept, so the structural
+    proof does not fit — bound-only termination + the native recursion breadcrumb,
+    same as item 36. Backstops: finite Env / binding / rule lists and a finite
+    AST bounded by max_nodes.
+
+    THE MONEY SHOTS (all NATIVE-ONLY, multi-line sources, same scan-state
+    invocation as items 24/30/31/34/35/36). A type_check driver folds the check
+    over the parsed program: `out = 1 + 2` -> 0; `out = 1 + (2 < 3)` -> 1
+    (number + bool); `out = if 5 then 1 else 2` -> 1 (non-bool condition);
+    `out = if 1 < 2 then 3 else 4` -> 0 (bool condition, number branches); the
+    showcase `let b = 1 < 2 / out = if b then 1 else 2` -> 0 (b inferred bool
+    from its RHS, so using it as a condition is well-typed — proves the type
+    environment works) vs `let n = 5 / out = if n then 1 else 2` -> 1 (n is
+    number, used as a condition -> error); `out = (1 < 2) and (3 < 4)` -> 0
+    (bool and bool) vs `out = (1 < 2) and 3` -> 1 (and with a number operand);
+    and a two-rule program with one good and one bad rule -> 1.
+
+38. Brick 20 of the self-hosting arc: TYPED PARAMETERS. Brick 16 parsed a rule's
+    formals as bare name spans (PCons of name_start, name_len, rest); brick 20
+    teaches the parameter parser the OPTIONAL type annotation `IDENT : TYPENAME`,
+    recording each parameter's declared TYPE alongside its name. There is no `->`
+    token in the tokenizer, so the annotation uses a `:` colon (op code 10) — the
+    same colon the header `logic:` uses — never a return-type arrow.
+
+    THE GRAMMAR. A parameter is `IDENT` (untyped) OR `IDENT : TYPENAME`. In the
+    token stream the typed form is THREE tokens (name, `:`, typename) before the
+    `,` (op 11) or `)` (op 22) separator; the untyped form is ONE token. TYPENAME
+    is an Ident mapped to a TYPE CODE by type_code_of_span: "number" -> 0, "bool"
+    -> 1, "text" -> 2 (the SAME codes brick 19 assigns), and anything else -> 0
+    (default number) — so an unrecognized type name degrades gracefully to number,
+    matching the rest of the header parse's fail-graceful posture. An untyped
+    parameter also defaults to ty = 0, so `rule f(x)` and `rule f(x : number)`
+    carry the IDENTICAL ParamList.
+
+    THE CONCEPT CHANGE. ParamList's PCons gains a `ty : number` field
+    (name_start, name_len, ty, rest). Every PCons construct/match site is updated:
+    params_prepend / params_scan (build), bind_params / param_list_len /
+    param_to_binding (match). params_scan is rewritten to detect the colon at
+    pos+1, read the typename at pos+2, and dispatch the separator from pos+3 (typed)
+    or pos+1 (untyped); the untyped path reduces EXACTLY to brick 16's behavior, so
+    untyped lists parse byte-identically and every downstream consumer (the
+    arity-count linter, the call/apply evaluator's parameter binding) is unchanged.
+    type_code_of_span is the flat fixed-width byte-check sibling of span_is_rule /
+    span_is_logic.
+
+    THE MONEY SHOTS (NATIVE-ONLY, multi-line sources, same scan-state invocation
+    as items 24/30/31/34-37). nth_param_type(source, n) tokenizes, parses the
+    program, takes the FIRST rule's parameter list, and returns the type code of
+    its n-th parameter (0-based; the index n is carried in the scan state's pos),
+    sentinel 9 when n runs past the end: `rule add(x : number, y : bool)` at n=0
+    -> 0, n=1 -> 1; `rule f(a : text, b : number, c : bool)` at n=0 -> 2, n=1 -> 0,
+    n=2 -> 1; `rule g(x)` (untyped) at n=0 -> 0 (default number); `rule h()` (no
+    params) at n=0 -> 9 (sentinel); `rule m(a : bool, b)` (mixed) at n=0 -> 1,
+    n=1 -> 0. param_nth_type walks the PCons tail via a DECREASING Number field
+    (n -> n - 1), so its termination is proved mechanically (Phase C), like
+    drop_rules over a RuleList.
+
+39. Brick 21 of the self-hosting arc: CALL-SITE ARGUMENT TYPE checking — where
+    the parser (brick 20 typed params) and the type checker (brick 19) finally
+    meet. The callee pass (brick 15) asks "does the called rule EXIST?"; the arity
+    pass (brick 17) asks "does it pass the RIGHT NUMBER of arguments?"; this pass
+    asks "does each argument's TYPE match the callee's DECLARED parameter type?".
+    A call f(1 < 2) to a rule `rule f(x : number)` is fine for the callee pass (f
+    exists) and the arity pass (1 arg, 1 param) but WRONG here — a bool flows into
+    a number parameter.
+
+    ORTHOGONAL to brick 19's type_check, with the same no-double-counting discipline
+    that separates lint_arity from lint_callees: an argument whose OWN type is
+    already ERROR (3) is brick 19's concern and is SKIPPED here; a WELL-typed
+    argument of the WRONG type is what this pass flags. argtype_check(source) sums,
+    over the whole program, the count of call-site arguments whose type mismatches
+    the callee's param.
+
+    TYPING THE ARGUMENT. The caller's type env is seeded with the caller's OWN
+    params at their declared types (param_to_tenv — the type-env sibling of brick
+    16's param_to_binding) THEN extended with its let bindings (brick 19's
+    build_tenv). So an argument referencing a typed param of the caller is typed
+    correctly. THE SHOWCASE: `rule g(b : bool) ... out = f(b)` with `rule f(x :
+    number)` flags `b` (bool by g's declaration, passed to f's number param); the
+    `b : number` version flags nothing.
+
+    THE LOCKSTEP. Per call, walk the argument list (ArgCons tail) and the callee's
+    param list (ptail) together; for each (arg, param) pair count a mismatch iff
+    the param exists (phead_ty != 9) AND arg type != param type AND arg type != 3.
+    When one list runs out, pairing stops (count mismatches are lint_arity's
+    concern). Untyped params default to number (0), so a bool to an untyped param
+    IS flagged (documented). The callee is resolved with find_rule (brick 18); on
+    no match the sentinel MkRule has PNil params -> no pairs -> no arg-type errors
+    (lint_callees flags the missing callee). A call's RESULT type stays number (0)
+    — no return-type syntax yet — so type_of_env is unchanged; this is a SEPARATE
+    counting pass (argtype_ast / argtype_args / argtype_binds, mirroring the
+    count_badcall_* walk and the iter/all split of lint_callees_list).
+
+    THE MONEY SHOTS (NATIVE-ONLY, multi-line sources, same scan-state invocation
+    as items 24/30/31/34-38): f(5)->f(x:number) -> 0; f(1<2)->f(x:number) -> 1;
+    f(1<2)->f(x:bool) -> 0; g(b:bool)->f(x:number) -> 1 (showcase);
+    g(b:number)->f(x:number) -> 0; add(5, 1<2) with two number params -> 1;
+    add(1<2, 3<4) -> 2; f(g(1<2)) with both rules number-param'd -> 1 (g's inner
+    bool arg flagged, f's call-typed arg is number); h(1<2) with h undefined -> 0
+    (sentinel skip). The recursive walk SCC (argtype_ast/args/binds) carries
+    bound-only termination + the native recursion breadcrumb, like type_of_env.
+
+40. check_program(source) -> total diagnostic count across ALL analyses (brick 22).
+    THE FULL PIPELINE — the self-hosting compiler's main(). Every prior driver
+    re-tokenizes and re-parses on its own; this one tokenizes and parses EXACTLY
+    ONCE, then runs all five analyses over the single shared RuleList and sums
+    their diagnostics. The five: lint_list (undefined vars + use-before-def,
+    bricks 13/14), lint_callees_list (undefined callees, brick 15), lint_arity_list
+    (wrong arg count, brick 17), tcheck_list (ill-typed expressions, brick 19),
+    argtype_list (call-arg type mismatches, brick 21). The categories are
+    orthogonal by construction (an undefined callee is not an arity error; an arg
+    that is itself ill-typed is type_check's concern, not argtype's), so the sum
+    double-counts nothing — every diagnostic is one unit. 0 iff the program passes
+    every check the compiler knows how to make.
+
+    THE MONEY SHOTS (NATIVE-ONLY, multi-line, same scan-state invocation as the
+    other drivers): clean add+main program -> 0; `out = x + y` (x,y undefined) -> 2;
+    `out = 1 + (2 < 3)` -> 1; `out = g(1)` (g undefined) -> 1; f(a) called f(1,2)
+    -> 1 (arity); f(x:number) whose body is `out = z` AND called with f(1<2) -> 2
+    (undefined z + bool arg to number param — two categories in one program). This
+    is the closest thing yet to verbosec written in Verbose: lex, parse, and verify
+    in one call. check_program reuses every list-rule unchanged (one parse, all
+    checks) — bound 256, calls the five list-rules over the shared prog.
+
+41. first_bad_rule(source) / first_bad_category(source) -> a STRUCTURED diagnostic
+    (brick 23). check_program collapses the whole program to a single error COUNT —
+    a pass/fail gate that cannot say WHERE the program is wrong. This brick localizes
+    the FIRST failure: rule_category(rule) returns which analysis fails first for one
+    rule, in a fixed precedence order (the earliest failing analysis wins, so a rule
+    with several problems reports exactly one):
+      0 = clean
+      1 = undefined variable / use-before-def   (lint_rule)
+      2 = undefined callee                       (badcall_rule)
+      3 = wrong arity                            (badarity_rule)
+      4 = ill-typed expression                   (tcheck_rule)
+      5 = call-argument type mismatch            (argtype_rule)
+    find_diag(prog) then walks the rule list with a running 0-based index and returns
+    the FIRST rule whose category is nonzero, as a Diag { rule_index, category }; a
+    fully clean program yields Diag { rule_index: 9999, category: 0 } (9999 = "no bad
+    rule"). Diag is a single-variant group concept (MkDiag) — like RuleDecl/Block —
+    so find_diag returns it through the SAME group-return ABI as find_rule (returns a
+    RuleDecl) and build_env (returns an Env); the bare-group accessors diag_index /
+    diag_cat read one field off it (same idiom as rd_body / block_binds). The two
+    drivers expose the two fields to argv.
+
+    THE MONEY SHOTS (NATIVE-ONLY, multi-line; pairs are (rule_index, category)):
+    clean add+main -> (9999, 0); a/b where b's body is `out = x` -> (1, 1);
+    `out = g(1)` (g undefined) in rule 0 -> (0, 2); f(a) then main calls f(1,2)
+    -> (1, 3); `out = 1 + (2 < 3)` in rule 0 -> (0, 4); main calls f(1<2) with f a
+    number-param rule -> (0, 5); precedence — f(x:number) whose body is `out = z`
+    AND main calls f(1<2): the undefined z in rule 0 (category 1) is reported BEFORE
+    main's arg-type at index 1 -> (0, 1); ordering — a/b clean, c's body `out = w`
+    -> (2, 1). first_bad_rule/_category reuse the five per-rule analyses unchanged,
+    composing them the way check_program composes the five list-rules.
+
+42. all_diags_count(source) / nth_diag_at_rule(source, n) / nth_diag_at_cat(source, n)
+    -> the COMPLETE diagnostic report (brick 24). Brick 23's find_diag stops at the
+    FIRST failing rule and returns one Diag; this brick walks the WHOLE program and
+    builds a DiagList — a cons-list with ONE Diag per (rule, failing-category) pair.
+    A rule that is undefined-AND-ill-typed yields TWO entries (category 1 then 4); a
+    clean rule contributes nothing. Within a rule the categories appear in ascending
+    order (1..5); rules in source order. The five per-rule analyses (lint_rule=1,
+    badcall_rule=2, badarity_rule=3, tcheck_rule=4, argtype_rule=5) are reused
+    verbatim — the same five rule_category composes in brick 23, but here EVERY
+    nonzero category is kept, not just the first.
+      rule_diags(rule, idx) -> the DiagList of one rule, ascending order, built by a
+        non-recursive let-chain (tail first: d5, then d4..d1, so category 1 ends at
+        the front). diag_append(a, b) -> standard cons-list append (a's diags in front
+        of b's). prog_diags(prog) -> walk the program, appending each rule's diags
+        before the rest's, threading the running 0-based index. diag_count(list) -> the
+        list LENGTH. nth_diag_rule(list, n) / nth_diag_cat(list, n) -> the n-th diag's
+        rule index (sentinel 9999) / category (sentinel 0).
+    DiagList is a 2-variant group cons-list (DCons|DNil) — like Binding/ArgList/RuleList
+    — returned through the same group-return ABI as build_env returning an Env.
+
+    GRANULARITY (the headline distinction from brick 22): diag_count counts (rule,
+    category) PAIRS, NOT individual problems. A rule with TWO undefined variables is
+    ONE diag (category 1 present once), whereas check_program counts it as 2. So
+    all_diags_count <= check_program in general; they coincide only when no rule has
+    multiple instances of one category. DiagList is a CATEGORIZED report (where +
+    what-kind); check_program is a raw problem TALLY.
+
+    THE MONEY SHOTS (NATIVE-ONLY, multi-line; pairs are (rule_index, category)):
+    clean add+main -> count 0; `out = x + y` (two undef vars, one rule) -> count 1,
+    nth(0)=(0,1) [check_program on the same = 2 — the granularity contrast];
+    `out = z + (1 < 2)` -> count 2, nth(0)=(0,1), nth(1)=(0,4); a/b with bodies
+    `out = x` / `out = y` -> count 2, nth(0)=(0,1), nth(1)=(1,1); QUAD —
+    f(a:number) body `out = z + 1` AND main body `out = f(1 < 2, 3) + g(9)` -> count
+    4, nth(0)=(0,1), nth(1)=(1,2), nth(2)=(1,3), nth(3)=(1,5).
+
+43. undef_span_start_of(source) / undef_span_len_of(source) / undef_span_char(source)
+    -> COLUMN-LEVEL location for undefined variables (brick 25). Bricks 13/14 COUNTED
+    undefined-variable references (lint_rule -> a number); this brick walks the SAME
+    traversal in the SAME scope discipline but returns the (start, len) SPAN of the
+    FIRST unbound variable — the byte range a diagnostic points AT, instead of a tally.
+    The undef_span_* family mirrors count_undef_* arm-for-arm, swapping the count's
+    "+ (sum)" for span_or ("first non-sentinel wins"): in the count, two subtrees'
+    counts ADD; here the leftmost real span WINS. The sentinel "no undefined variable"
+    span is MkSpan(9999, 0).
+      Span is a single-variant group concept (MkSpan(start, len)) — like Diag (MkDiag)
+        — returned through the same group-return ABI as find_diag returning a Diag.
+      span_start(s) / span_len(s) -> bare-group accessors (like diag_index / diag_cat).
+      span_or(a, b) -> the first Span whose start is not 9999 (the no-result sentinel).
+      undef_span_ast / undef_span_args -> mutually recursive AST walk; AstVar(start,len)
+        yields its span when name_bound == 0, else the sentinel; children combine
+        left-to-right via span_or (AstBin lhs before rhs, AstIf cond/thn/els, call args
+        head before tail). undef_span_binds -> each let RHS checked against the PREFIX
+        of earlier bindings (use-before-def), RHS before the tail. undef_span_rule ->
+        bindings (params as base prefix) checked BEFORE the result (params appended to
+        the full scope). undef_span_list -> head rule before tail (program order).
+    TRAVERSAL ORDER matches count_undef exactly, so the first span found is the first
+    the count would have tallied: within a rule the let RHSs precede the result; within
+    an expression left-to-right; across rules program order.
+
+    THE MONEY SHOTS (NATIVE-ONLY, multi-line; reported as (start, len, char), char =
+    byte_at(source, start) = the offending name's first byte):
+    clean add+main -> start 9999, len 0, char ABORTS (native byte_at is fail-closed on
+    an OOB index — there is no first byte of a name that does not exist; test
+    cleanliness via undef_span_start_of == 9999, not the char);
+    `out = x + y` -> char 120 ('x'), len 1 (lhs of +, leftmost);
+    `out = 1 + y` -> char 121 ('y'), len 1 (1 is a leaf, y is the first var);
+    `out = foo + 1` -> char 102 ('f'), len 3 (name "foo");
+    `let p = q + 1` / `let q = 2` / `out = p` -> char 113 ('q'), len 1 (q unbound in p's
+    RHS; binding RHSs checked before the result, q not yet in the prefix);
+    a `out = 1` / b `out = zzz` -> char 122 ('z'), len 3 (rule 1's zzz; rule 0 clean);
+    main `out = f(w)` / f(x:number) `out = x` -> char 119 ('w'), len 1 (w undefined in
+    main; f's param x is in scope only inside f).
+
+44. nth_diag_at_span_start(source, n) / nth_diag_at_span_len(source, n) -> the LOCATED
+    full report (brick 26). Brick 24 reported the COMPLETE diagnostic list (one Diag per
+    rule-category pair) but every Diag only said WHICH rule and WHAT KIND; brick 25
+    found the SPAN of the first undefined variable but only as a standalone driver, not
+    threaded into the report. This brick joins the two: the Diag record (MkDiag) is
+    WIDENED with two number fields — span_start / span_len — and rule_diags POPULATES
+    them for the undefined-variable category (1) via undef_span_rule. So the full report
+    now points AT the offending token, not just at the rule.
+      MkDiag(rule_index, category, span_start, span_len) -> brick 23's two fields plus
+        the new span. diag_span_start(d) / diag_span_len(d) -> the matching bare-group
+        accessors (mirrors of diag_index / diag_cat).
+      LOCATED ONLY FOR UNDEF: only category 1 (undef-var) carries a real span. Every
+        other category (2=undef-callee, 3=arity, 4=ill-typed, 5=arg-type) is a
+        whole-rule property, not a name span, so it carries the sentinel (start 9999,
+        len 0): "not located". find_diag's summary Diag also stays sentinel-spanned —
+        the located report is the DiagList, not the single-Diag summary.
+      rule_diags computes usp = undef_span_rule(...) ONCE above the d5..d1 chain (cheap +
+        pure; only USED when category 1 fires), then d1's MkDiag fills its span from
+        span_start(usp) / span_len(usp); d2..d5 keep the sentinel.
+      nth_diag_span_start / nth_diag_span_len -> walk the DiagList to the n-th cell and
+        read diag_span_start / diag_span_len off it (cons-walk idiom, like nth_diag_rule
+        / nth_diag_cat); the empty/out-of-bounds case reads the sentinel (9999 / 0).
+    THE MONEY SHOTS (NATIVE-ONLY, multi-line; spans are whitespace-dependent — the LEN
+    and the sentinel are the stable checks):
+    `rule f\n  logic:\n    out = foo + 1` -> diag 0 span_start n=0 = 26 (offset of foo),
+    span_len n=0 = 3; cross-check undef_span_start_of on the same source = 26;
+    quad (undef z in rule 0; callee/arity/argtype in rule 1) -> diag 0 = (rule 0, cat 1,
+    LOCATED): span_len n=0 = 1 (z is one char); diags 1/2/3 = cats 2/3/5, span SENTINEL:
+    span_start n=1 = 9999, span_len n=1 = 0 (only undef carries a span);
+    clean add+main -> empty list: span_start n=0 = 9999, span_len n=0 = 0.
+
+45. badcall_span_rule(rule, program, source) -> the LOCATED undefined-CALLEE diagnostic
+    (brick 27). Brick 26 gave the category-1 (undef-var) Diag a real span; every other
+    category still said only WHICH rule and WHAT KIND. This brick extends the located
+    report to category 2 (undef-callee): the category-2 Diag now points AT the offending
+    callee NAME, exactly as category 1 points at the offending variable name.
+      badcall_span_ast / badcall_span_args / badcall_span_binds / badcall_span_rule ->
+        the Span-returning analogue of the count_badcall_* family (brick "category 2").
+        Each mirrors its count twin arm-for-arm, swapping "+ (sum)" for span_or and
+        returning the first bad callee's NAME span instead of a count. Traversal order
+        matches count_badcall: binds before result, left-to-right within an expression,
+        and the OUTER call's callee BEFORE its args (so for g(h(1)) with g undefined, g's
+        span wins; with g defined and h undefined, the args walk reports h's span).
+      SIMPLER THAN undef_span_rule: undefined-callee scope is program-wide, so
+        badcall_span_rule builds NO param scope and threads NO binding prefix — it just
+        checks the binds then the result, both against the same program rule list (the
+        same shape as badcall_rule for the count). The AstCall arm reports the callee
+        span IMMEDIATELY when rule_named == 0; it only descends into the args when the
+        callee exists.
+      rule_diags computes csp = badcall_span_rule(...) ONCE above the d5..d1 chain (same
+        cheap + pure shape as brick 26's usp; only USED when category 2 fires), then d2's
+        MkDiag fills its span from span_start(csp) / span_len(csp); d3/d4/d5 keep the
+        sentinel (9999 / 0), and d1 stays as brick 26 left it.
+    THE MONEY SHOTS (NATIVE-ONLY, multi-line; the LEN and the sentinel are the stable
+    checks since spans are whitespace-dependent):
+    `rule main\n  logic:\n    out = g(1)` -> all_diags_count 1; cat n=0 = 2; span_len n=0 = 1
+    (g is one char); span_start n=0 = offset of g.
+    `rule main\n  logic:\n    out = foobar(1)` -> cat n=0 = 2; span_len n=0 = 6.
+    quad (undef z in rule 0; f(...) clean + undefined g in rule 1) -> diag 1 (cat 2) now
+    LOCATED: cat n=1 = 2, span_len n=1 = 1 (was 0 before this brick — g is one char),
+    span_start n=1 = offset of g (was 9999); diag 0 (undef z) UNCHANGED: cat n=0 = 1,
+    span_len n=0 = 1; diag 2 (cat 3 arity) STILL sentinel: span_len n=2 = 0,
+    span_start n=2 = 9999.
+
+46. badarity_span_rule(rule, program, source) -> the LOCATED arity-mismatch diagnostic
+    (brick 28). Bricks 26/27 located categories 1 (undef-var) and 2 (undef-callee); this
+    brick extends the located report to category 3 (arity): the category-3 Diag now points
+    AT the offending CALL's callee NAME, exactly as category 2 points at an undefined callee.
+      badarity_span_ast / badarity_span_args / badarity_span_binds / badarity_span_rule ->
+        the Span-returning analogue of the count_badarity_* family. Each mirrors its count
+        twin arm-for-arm, swapping "+ (sum)" for span_or and returning the first arity-
+        mismatched call's callee NAME span instead of a count. The per-call decision reuses
+        arity_mismatch directly (1 iff the callee EXISTS and its declared param count !=
+        this call's arg count). Traversal order matches count_badarity: binds before
+        result, left-to-right within an expression, and the OUTER call's own arity BEFORE
+        descending into its args.
+      SIMPLER THAN undef_span_rule (like badcall_span_rule): arity scope is program-wide,
+        so badarity_span_rule builds NO param scope and threads NO binding prefix — it just
+        checks the binds then the result, both against the same program rule list (the same
+        shape as badarity_rule for the count). The AstCall arm reports the callee span
+        IMMEDIATELY when arity_mismatch == 1; it only descends into the args otherwise.
+      rule_diags computes asp = badarity_span_rule(...) ONCE above the d5..d1 chain (same
+        cheap + pure shape as bricks 26/27's usp/csp; only USED when category 3 fires),
+        then d3's MkDiag fills its span from span_start(asp) / span_len(asp); d4/d5 keep the
+        sentinel (9999 / 0), and d1/d2 stay as bricks 26/27 left them. Categories 4/5 have
+        no single-token name span (AstBin / AstNum carry no source span), so they remain
+        unlocated.
+    THE MONEY SHOTS (NATIVE-ONLY, multi-line; the LEN and the sentinel are the stable
+    checks since spans are whitespace-dependent):
+    `rule f(a)\n  logic:\n    out = 1\nrule main\n  logic:\n    out = f(1, 2)` ->
+    all_diags_count 1; cat n=0 = 3; span_len n=0 = 1 (f is one char); span_start n=0 = offset
+    of the f in the call.
+    `rule foobar(a)\n  ...\n    out = foobar(1, 2)` -> cat n=0 = 3; span_len n=0 = 6.
+    quad (undef z in rule 0; f(2 args vs 1 param) + undefined g in rule 1) -> diag 2 (cat 3)
+    now LOCATED: cat n=2 = 3, span_len n=2 = 1 (was 0 before this brick — f is one char),
+    span_start n=2 = offset of f (was 9999); diags 0/1 (cat 1 undef z / cat 2 callee g)
+    UNCHANGED located; diag 3 (cat 5 argtype) STILL sentinel: span_len n=3 = 0,
+    span_start n=3 = 9999.
+
+47. Brick 29 of the self-hosting arc: EQUALITY ON BOOLEANS in the type system. Brick 19's
+    bin_type classified == (op 1) and != (op 6) as number-only (both operands number => bool),
+    which wrongly rejected (1 < 2) == (3 < 4). This brick refines ONLY the two equality clauses
+    to accept two operands of the SAME comparable type — number==number OR bool==bool — yielding
+    bool; anything else (number==bool, or text/ERROR operands) => ERROR. text==text stays ERROR
+    (text not yet typed). The ORDERING ops (< > <= >=) stay numeric-only (ordering booleans is
+    not meaningful); arithmetic and logic are unchanged. In-place logic tweak to one rule — no
+    new concepts/rules. Money shots: (1 < 2) == (3 < 4) => bool (0, was ill-typed before); 1 == 2
+    => number==number (0); 1 == (2 < 3) => still ERROR (1); (1 < 2) < (3 < 4) => still ERROR (1,
+    ordering on bools); 1 + (2 < 3) => still ERROR (1).
+
+48. Brick 30 of the self-hosting arc: TEXT LITERALS TYPE AS text. Brick 19 typed a
+    string-literal expression AstStr as ERROR (3, "text not yet typed"), so a string
+    literal passed to a `text` parameter (brick 20 already maps the `text` annotation
+    to code 2) was wrongly flagged as a mismatch. This brick changes ONLY the AstStr
+    arm of type_of_env from 3 to 2: a string literal is now a first-class text value.
+    Text supports no operations — arithmetic/ordering/logic/equality on text all stay
+    ERROR via bin_type (unchanged) — so this is a minimal but coherent text type.
+    AstField stays ERROR (3, fields still not typed). In-place one-arm logic tweak —
+    no new concepts/rules. Money shots: a rule whose body is "hello" => text (0, was
+    1 before); a string literal passed to a `text` param => well-typed (argtype 0, was
+    1 before); a string literal to a NUMBER param => mismatch (1); a number to a TEXT
+    param => mismatch (1); 1 + "x" => still ERROR (1); "a" == "b" => still ERROR (1).
+
+49. Brick 31 of the self-hosting arc: PARSE RETURN-TYPE ANNOTATIONS. After the
+    parameter list and before the `logic:` line, a rule header may carry an OPTIONAL
+    `: TYPENAME` declaring its return type — `rule add(x : number, y : number) : number`.
+    Both header parsers (parse_rule_decl / parse_rule_decl_pos) look at the token right
+    after the params: if it is a `:` (op code 10) the next Ident is the return type-name,
+    mapped via type_code_of_span (0=number / 1=bool / 2=text); otherwise (a Newline, op 0)
+    there is no annotation and the default return type is the sentinel 9 ("unannotated").
+    NOTE: brick 31 originally stored the no-annotation default as 0, but brick 33 changed
+    it to the sentinel 9 so "no annotation" and explicit ": number" are distinguishable;
+    call_result_type maps 9 -> number when typing a call and tcheck_rule's return-vs-body
+    check skips unannotated rules. The parsed code is stored in a new
+    RuleDecl.MkRule field `return_type` (inserted after params, before body). PARSER-ONLY:
+    the return type is recorded but NOT yet consumed by the type checker — feeding it into
+    type_of_env needs the whole program threaded through, a later/bigger brick. Mirrors
+    brick 20 (typed params). New rules: rd_return_type (accessor), rl_head_return_type
+    (head accessor), rule_return_type (money-shot driver). Existing programs without an
+    annotation parse byte-identically (after_ret == after_params when there is no `:`).
+    Money shots: rule add(x : number, y : number) : number => 0 (number); rule p(x : number)
+    : bool => 1 (bool); rule q(x : number) : text => 2 (text); rule r(x : number) (no
+    annotation) => 9 (unannotated sentinel — was 0 in brick 31, changed by brick 33);
+    rule s() : bool (no params, return type) => 1.
+
+50. Brick 32 of the self-hosting arc: USE RETURN TYPES IN THE TYPE CHECKER. Brick 31
+    parsed and stored a rule's declared return type; this brick consumes it. The whole
+    program (RuleList) is now threaded through the type checker — TypeArg, BuildTArg,
+    TCheckBindsState, TCheckRuleState and TCheckListState each gain a `prog` field, passed
+    down every recursive call (the argtype_* family already carried prog since brick 21, so
+    its type_of_env / build_tenv calls just pass it). The one behavioral change: type_of_env's
+    AstCall arm, which used to yield 0 (assumed number), now yields the callee's DECLARED
+    return type via rd_return_type(find_rule(...)). No new recursion is created — find_rule
+    walks the RuleList and never calls type_of_env, so the checker's recursion structure is
+    unchanged; prog is pure threaded data. An undefined or unannotated callee resolves to the
+    find_rule sentinel / default 0 (number), so such calls still type as number (the
+    undefined-callee is reported separately by lint_callees). Scope: this brick only makes a
+    call's RESULT type correct; it does NOT add a "declared return vs body's inferred type"
+    check (that would change diagnostic counts — a later brick). Two payoffs: (1) type errors
+    INVOLVING call results are now caught — `rule b() : bool ... out = 1 < 2` then `out = 1 +
+    b()` is 1 + bool => type error (was MISSED, since b() used to type as number); (2) false
+    positives disappear — `out = if b() then 1 else 2` with b():bool is now well-typed (was a
+    false error when b() typed as number, a non-bool condition). Money shots: 1 + b() with
+    b():bool => 1; 1 + n() with n():number => 0; if b() with b():bool => 0; 1 + c() with c
+    unannotated => 0 (number default); 1 + t() with t():text => 1 (number + text). No new
+    concepts or rules (in-place field threading); the existing non-call type checks, the QUAD
+    diagnostic report, argtype, check_program and eval are all unchanged.
+
+51. Brick 33 of the self-hosting arc: CHECK A RULE'S DECLARED RETURN TYPE AGAINST ITS
+    BODY. Brick 32 made a call's RESULT type correct but deliberately did NOT flag a rule
+    whose declared return type disagrees with its body. This brick adds that check. The
+    blocker was that brick 31 stored both "no annotation" and explicit ": number" as 0 —
+    indistinguishable, so a check would wrongly flag an unannotated rule whose body is
+    bool/text (breaking bricks 29/30). Fix: introduce a sentinel — the parser default for
+    no annotation becomes 9 ("unannotated"), distinct from explicit ": number" (0). Then
+    (a) typing a CALL maps 9 -> number so calls to unannotated rules still type as number
+    (preserving brick 32) — done in a new rule call_result_type (input: new concept
+    CallRetState) which type_of_env's AstCall arm now delegates to; (b) the return-vs-body
+    check fires ONLY when the declared return is explicit (!= 9). In tcheck_rule, after
+    typing the result, read the raw declared return (ret = rd_return_type) and add +1 iff
+    ret != 9 AND the body is well-typed (result_ty != 3, to avoid double-counting an
+    already-ERROR body) AND ret != result_ty. rule_return_type now returns 9 for an
+    unannotated rule (was 0). New concept: CallRetState; new rule: call_result_type.
+    Money shots: rule b() : bool ... out = 1 < 2 => 0 (matches); rule b() : number ...
+    out = 1 < 2 => 1 (declares number, body bool); rule t() : text ... out = 5 => 1;
+    rule g() : number ... out = 5 => 0; UNANNOTATED rule f ... out = 1 < 2 => 0 (sentinel
+    protects bricks 29/30); UNANNOTATED out = "hello" => 0; src():bool then main():bool
+    out = src() => 0 (call result typing + return check compose); same but main():number
+    => 1.
+
+52. Brick 34 of the self-hosting arc: THE PRETTY-PRINTER — the FIRST EMITTER over the real
+    vexpr AST. Every prior brick CONSUMED the AST (eval, shape, lint, type check); this one
+    EMITS it back as source text. print_expr(PrintState{node: Ast, src: text}) walks the tree
+    and reconstructs a FULLY-PARENTHESIZED rendering: parens around every AstBin / AstNeg /
+    AstNot / AstIf node make the parse's precedence and associativity decisions visible bytes
+    ("1 + 2 * 3" prints as "(1 + (2 * 3))", "10 - 2 - 3" as "((10 - 2) - 3)"); no minimal-paren
+    logic in v1. Span-carrying leaves (AstVar, AstField's field, AstCall's callee, AstStr)
+    print their own source bytes via substring(src, start, start + len) — allocation-free
+    pointer slices; AstStr spans include both quotes so string literals reproduce verbatim.
+    Number leaves itoa via concat(value); AstBool spells true/false. Operator spelling is
+    factored into op_text(OpSpell{op}) — a flat if/else over the 13-code op map, a
+    non-recursive text helper legal as a tail concat arg under the streaming v1 grammar.
+    Argument lists print without extra parens (print_args bare-first + print_args_rest
+    comma-prefixing the rest; ArgNil contributes the empty text — f(1, x) round-trips as
+    "f(1, x)", f() as "f()"). Driver print_source = the eval_expr/shape front end (tokenize,
+    parse_or from 0, parsed_node) with the printer as body tail. This is the FIRST consumer
+    of the native streaming text lowering beyond its acceptance example: natively no string is
+    ever materialized — each leaf's bytes stream to stdout in tree-walk order. Termination:
+    bound-only + accepted native recursion breadcrumb (node is a FIELD of the packed input,
+    so `structural` does not fit — eval_ast_env's posture). Round-trip property, validated
+    EXTERNALLY across two binary invocations (the streamed text never exists in memory):
+    eval_expr(print_source(s)) == eval_expr(s) (7/5/1 for precedence, left-assoc, comparison)
+    and shape(print_source(s)) == shape(s) (20 / 10100 / 100010 for "1 + 2 * 3", "f(1, x)",
+    "if 1 < 2 then 3 else 4"). New concepts: PrintState, PrintArgsState, OpSpell; new rules:
+    op_text, print_expr, print_args, print_args_rest, print_source.
+
+53. Brick 35 of the self-hosting arc: PRINT A WHOLE PROGRAM — the full-file emitter half.
+    Brick 34 printed one expression; this brick prints every layer above it: rule headers
+    (name span, typed parameter list, return-type annotation), the `logic:` line, the let
+    bindings, and the `out =` result line, with the 2-space / 4-space indentation
+    re-synthesized as text literals. Target property: the FULL-FILE round-trip — the printed
+    program REPARSES to the same analyses and the same evaluation as the original source:
+    eval_main(print_program_src(s)) == eval_main(s), check_program(...) == check_program(s),
+    count_rules(...) == count_rules(s). NORMALIZATIONS (deliberate, semantics-preserving —
+    the printed form is the parse's canonical spelling): (a) untyped params print with an
+    explicit type — brick 20 stores an untyped parameter as ty=0, indistinguishable from an
+    explicit `: number`, so the printer always prints `name : <type>` and `rule f(n)` prints
+    as `rule f(n : number)` (untyped defaults to number, so every analysis and evaluation
+    round-trips); (b) return type: the brick-33 sentinel 9 (UNANNOTATED) prints NOTHING,
+    0/1/2 print ` : number` / ` : bool` / ` : text`; (c) PNil prints NO parens — `rule f()`
+    normalizes to `rule f` (the parser stores both as PNil); (d) expressions print fully
+    parenthesized (brick 34's printer reused); (e) a bare final expression prints in the
+    `out = ` form (block_result is the result either way); (f) indentation re-synthesized at
+    logic:=2 / statements=4 spaces. IDEMPOTENCE follows: print(parse(print(parse(s)))) ==
+    print(parse(s)). Driver print_program_src = the check_program/count_rules/eval_main front
+    end (begin_tokenize — a program needs the INDENT/DEDENT stream) with the program printer
+    as body tail. Six new text members join brick 34's streaming set (ty_text, ret_text,
+    print_params, print_params_rest, print_binds, print_rule, print_program — all text-SCC
+    calls in tail concat positions; print_rule's and the driver's lets build number/group
+    values only). New concepts: TySpell, PrintParamsState, PrintBindsState, PrintRuleState,
+    PrintProgState; new rules: ty_text, ret_text, print_params, print_params_rest,
+    print_binds, print_rule, print_program, print_program_src. max_nodes unchanged.
+
+54. Brick 36 of the self-hosting arc: THE FIRST REAL LOWERING (pretty-printer becomes
+    code generator). Bricks 34/35 printed the AST back as SOURCE; this brick emits a
+    DIFFERENT target — a stack-machine intermediate language in postfix / RPN form.
+    `1 + 2 * 3` lowers to `1 2 3 * +`: the canonical first IR of a compiler backend,
+    post-order (operands before operator, the opposite of in-order source), requiring a
+    stack to evaluate. Reuses the streaming machinery exactly (post-order concat of
+    self-calls; same PrintState input = node + src). Rules: op_instr (the postfix
+    mnemonic for a binary-op code — bare + trailing space, vs op_text's infix padding),
+    lower_expr (post-order: AstBin emits both operands then op_instr; AstNeg/AstNot are
+    unary postfix; AstIf -> a 3-operand `select`; AstNum/AstBool push; AstVar -> a named
+    `load`; AstCall/AstField/AstStr -> `?`), lower_expr_src (driver: tokenize -> parse_or
+    -> lower_expr). VERIFIED END-TO-END by an external RPN/stack evaluator (the
+    streaming_lower_rpn_matches_eval_expr test): for the integer-closed subset
+    (arithmetic, comparison, logical, neg, not, if->select), run_rpn(lower_expr_src(e))
+    == eval_expr(e) — the lowered target computes the SAME value as the interpreter.
+    15/15 round-trips incl. division, modulo, and/or, neg, left-assoc, if->select.
+    Money shots: lower_expr_src("1 + 2 * 3") = "1 2 3 * + "; "10 - 2 - 3" = "10 2 - 3 - ";
+    "if 1 < 2 then 10 else 20" = "1 2 < 10 20 select ". The first Verbose program that
+    compiles an expression to a target OTHER than its source. Native-only (streaming).
+
+55. Brick 37 of the self-hosting arc: LOWER A WHOLE PROGRAM to the stack IL (a function
+    becomes a callable routine). Brick 36 lowered one expression; this lowers every rule.
+    Calling convention: a routine is `proc NAME p1 p2 ... <body ops> ret`; a call site
+    emits its argument ops (left to right) then `call NAME` (NO argc — the VM reads the
+    callee proc's param count); the VM pops that many values, binds them to the callee's
+    params by position into a fresh frame, runs the routine, and `ret` leaves the return
+    value on the stack. `let NAME = expr` lowers to `<value ops> store NAME` sharing the
+    frame's name->value map with the params, so `load NAME` resolves either.
+    IMPORTANT — brick 37 GENERALIZES brick 36's eager 3-operand `select` to the structured
+    LAZY `if`/`else`/`endif` (only the taken branch runs; the VM skips regions with
+    nesting-aware depth matching, no labels). This is what makes RECURSION terminate:
+    factorial's `else n * fact(n-1)` is NOT evaluated when n == 0, so `select` (which
+    evaluates both arms) would have looped forever. lower_expr's AstIf and AstCall arms
+    changed accordingly; the brick-36 expression round-trip test's VM was updated to the
+    if/else/endif form (still 15/15). New rules: lower_args (call args, no separators —
+    the stack carries the boundary), lower_params (bare param names for the proc header),
+    lower_binds (let -> store), lower_rule (proc header + binds + body + ret; accessors
+    hoisted into lets exactly like print_rule, since inline nested accessor calls in a
+    streaming concat hit the recursive-match number-emit limitation), lower_program (one
+    proc per rule), lower_program_src (driver: begin_tokenize -> parse_program ->
+    lower_program). VERIFIED END-TO-END by an IL VM (named procs, a call stack with
+    per-frame param/let bindings, structured lazy if/else/endif) — the
+    streaming_lower_program_matches_eval_main test: run_il(lower_program_src(p), first_proc)
+    == eval_main(p). 4/4 incl. recursive factorial -> 120, double(add(3,4)) -> 14 (nested
+    calls), sq(5) with a let -> 26, fib(10) -> 55 (double recursion). Money shot:
+    lower_program_src(factorial) = "proc main \n5 call fact ret\nproc fact n \nload n 0 ==
+    if 1 else load n load n 1 - call fact * endif ret\n". The first Verbose program that
+    compiles a multi-rule PROGRAM to a target other than its source. Native-only (streaming).
+    Existing binaries byte-identical (the if/else/endif change + new rules leak into no
+    non-streaming path). Streaming gap found + worked around (not a compiler change): a
+    recursive number-returning rule (arg_list_len) used as a concat number arg in a
+    streaming body hits emit_eval_expr's "MatchVariant A.4.1 scrutinee = Call only" limit;
+    dropped argc from the IL (the VM infers arity from the proc header), which also made
+    the IL cleaner.
+
+56. Backend brick b3 (milestone of the backend arc): LOWER A CLOSED EXPRESSION TO REAL
+    x86-64 MACHINE CODE. Brick 36's lower_expr lowered an AST to a TEXT RPN stream; b3
+    lowers the SAME tree to BYTES — actual x86-64 instructions a CPU executes. Reuses
+    PrintState (node + src) and the same post-order recursion, but each arm emits b"..."
+    opcodes (brick b1) composed with concat / le64 (brick b2) instead of mnemonic text.
+    The emitted bytes are a function fn() -> i64: it evaluates the expression onto the
+    CPU's own hardware stack (push/pop balanced), leaves the result in rax, and ret's —
+    no prologue, no rbp frame. The hardware stack IS the RPN stack. Verified subset
+    (branchless + fault-free): AstNum, AstBin with op in {13 +, 14 -, 15 *}, AstNeg. NO
+    div/mod (idiv faults), NO comparisons/logic (need setcc), NO if (computed offsets),
+    NO vars/calls — b3-followups. Out-of-subset ops/variants emit a single int3 trap byte
+    (CC) so a miscompile faults loudly. Instruction selection: AstNum(v) => mov rax,
+    <v:imm64> (48 B8 + le64 v) ; push rax (50). AstBin(op,l,r) => <code l> <code r> ; pop
+    rcx (59) ; pop rax (58) ; {add 48 01 C8 | sub 48 29 C8 | imul 48 0F AF C1} ; push rax
+    (50). AstNeg(inner) => <code inner> ; pop rax (58) ; neg rax (48 F7 D8) ; push rax
+    (50). pop rcx ; pop rax puts the RIGHT operand (pushed last, on top) in rcx and LEFT
+    in rax, so sub computes left-right in source order. Rules: x86_expr (the byte code
+    generator, same shape as lower_expr but bytes leaves), x86_expr_src (driver: tokenize
+    -> parse_or -> parsed_node -> x86_expr, then append pop rax (58) ; ret (C3)).
+    STATUS: both rules added and the verifier accepts them (119 concepts / 261 rules, all
+    proofs check). NATIVE LOWERING IS NOT YET BUILT: x86_expr is recursive (over the AST,
+    plus the driver chain through skip_spaces / parse_or), and the recursive native path
+    refuses Bytes output ("recursive rule output must be Number, Bool, or Text"). The
+    streaming-emit machinery that lets the recursive TEXT twin (lower_expr_src) compile is
+    wired for Type::Text only; an emit_streaming_*_body path for Bytes leaves (Expr::Bytes,
+    le32/le64, bytes-concat) plus lifting the recursive-output gate to Bytes is needed —
+    a src change in the native backend, deferred pending scope confirmation. Intended
+    end-to-end verification (streaming_x86_expr_executes): mmap the emitted bytes RWX, call
+    as fn() -> i64, assert == eval_expr(e) for "1 + 2"(3), "1 + 2 * 3"(7), "10 - 2 - 3"(5),
+    "2 * 3 * 4"(24), "- 5 + 2"(-3), "(1 + 2) * (3 + 4)"(21), "100 - 50 * 2"(0), "7"(7).
+
+57. Backend brick b4a: COMPARISONS + if/else in the machine-code generator — REAL
+    CONDITIONAL BRANCHES (jcc with COMPUTED relative offsets). The control-flow
+    prerequisite for lowering recursive programs (b4b). b3 emitted only branchless,
+    fault-free arithmetic; b4a adds the six comparisons and the if construct, which
+    means the first computed jump distances in any Verbose-emitted machine code.
+    The core challenge: a jcc/jmp rel32 needs the byte distance to its target, but a
+    streaming emitter writes left-to-right and cannot backpatch. So a new rule
+    code_size_expr(ps) returns the EXACT byte count x86_expr(ps) emits for a subtree,
+    computed structurally over the AST (pure arithmetic — it never calls x86_expr or
+    le32). if emits its jz/jmp with offsets derived from code_size_expr of the
+    branches; any mismatch = wrong offset = crash/wrong result, caught by mmap+exec.
+    Instruction selection. Comparison (op 1 ==, 6 !=, 19 <, 20 >, 5 <=, 4 >=), after
+    both operands are pushed: pop rcx (59) ; pop rax (58) ; cmp rax,rcx (48 39 C8) ;
+    setcc al (0F 9X C0 — sete 94 / setne 95 / setl 9C / setg 9F / setle 9E / setge 9D) ;
+    movzx eax,al (0F B6 C0) ; push rax (50) — 12 bytes after the operands. AstIf(cond,
+    thn,els) => <code cond> (leaves 0/1) ; pop rax (58) ; test rax,rax (48 85 C0) ; jz
+    rel32 (0F 84 + le32(code_size_expr(thn)+5)) ; <code thn> ; jmp rel32 (E9 +
+    le32(code_size_expr(els))) ; <code els>. The jz skips thn + the 5-byte jmp; the jmp
+    skips els. Both branches leave exactly one value on the stack and control merges
+    after els, so an if composes as a sub-expression like any other pushed value.
+    code_size_expr arms (MUST equal x86_expr byte length): AstNum 11; +/- l+r+6; * l+r+7;
+    cmp l+r+12; unknown op l+r+1 (the int3 trap CC); AstNeg inner+5; AstIf cond+15+thn+els
+    (pop 1 + test 3 + jz 6 + jmp 5); out-of-subset leaves 1 (CC). div/mod and and/or stay
+    OUT (idiv faults; logic needs more) — later. STATUS: verified (262 rules); both new
+    arms + code_size_expr added; x86_expr_src compiles natively via b3's recursive
+    streaming-bytes path (NO src change). Verified end-to-end (streaming_x86_if_cmp_executes):
+    mmap RWX, call fn() -> i64, assert == eval_expr(e) for "1 < 2"(1), "2 < 1"(0),
+    "3 == 3"(1), "3 != 3"(0), "5 >= 5"(1), "2 * 3 > 5"(1), "if 1 < 2 then 10 else 20"(10),
+    "if 0 then 1 else 2"(2), "if 2 * 3 == 6 then 100 else 200"(100), "if (1 + 1) < 2 then 7
+    else if 3 > 2 then 8 else 9"(8, nested if in else — exercises offset math), and
+    "(if 1 < 2 then 3 else 4) * 10"(30, if as a sub-expression).
+
+58. Brick b4b-1 of the backend arc: lower a whole NON-RECURSIVE multi-rule PROGRAM to ONE
+    callable x86-64 machine-code blob. b3/b4a lowered a closed expression (with control flow);
+    this lowers procs that CALL each other, with a frame ABI for params and real call/ret.
+    The blob is mmap'd executable and called at the entry proc (first rule, offset 0) as
+    fn()->i64; mmap+exec == eval_main. VERBOSE-ONLY (no native streaming-core change — reuses
+    the b1/b2 streaming-bytes path).
+
+    Calling convention: caller lowers each arg (left to right, value on the CPU stack), then
+    `call rel32` (e8) ; `add rsp, 8*N` (48 81 c4, pop args) ; `push rax` (callee result).
+    Proc prologue `push rbp ; mov rbp,rsp` (55 48 89 e5); param i (decl order) at
+    [rbp + 16 + 8*(N-1-i)], loaded `push qword [rbp+disp]` (ff b5 + disp32); epilogue
+    `pop rax ; mov rsp,rbp ; pop rbp ; ret` (58 48 89 ec 5d c3). Entry proc has 0 params.
+
+    The cross-proc `call rel32` needs absolute positions, which a streaming emitter can't
+    backpatch — solved with a POSITION-THREADED codegen: a new ByteGenState{ node, src, off,
+    params, prog } carries `off` = the absolute byte offset where this subtree's code begins;
+    siblings advance off by code_size_node (the byte-exact size rule, mirror of code_size_expr
+    incl. AstVar=6, AstCall=args+13). proc_size(rule)=4+code_size(body)+6; proc_offset walks
+    the RuleList summing earlier proc_sizes; a call's rel32 = proc_offset(callee) - (off +
+    code_size_args + 5). New rules: x86_node/x86_args/code_size_node/code_size_args/param_index/
+    proc_size/proc_offset/x86_proc/x86_program/x86_program_src (the closed-expr x86_expr path is
+    kept separate + unchanged). AstVar not among params, lets, div/mod/logic -> int3 trap
+    (out of subset).
+
+    Verified (streaming_x86_program_executes, all blob mmap+exec == eval_main == hand value):
+    double(add(3,4))->14; f(2,g(3)) with f(a,b)=a*b,g(n)=n+1 ->8 (nested call as arg);
+    sub(10,3)=a-b ->7 (param order, non-commutative); h(n)=n*n on 5 ->25 (same param twice);
+    if cmp(2,3) then 100 else 200, cmp(a,b)=a<b ->100 (call result inside a b4a if). NEXT
+    (b4b-2): recursion — a proc calling itself (factorial) -> 120, composing this + b4a's if.
+
+59. Brick b4b-2 of the backend arc: RECURSION in Verbose-emitted x86-64 machine code — the
+    backend-arc milestone. No new Verbose code: b4b-1's program lowering (proc layout, frame
+    ABI, real call/ret) composes with b4a's if/comparison to give recursion for FREE. A proc's
+    self-call resolves through proc_offset to its OWN offset, so the `call rel32` is a backward
+    jump; the if/else base case terminates it; the frame ABI holds the param per recursion
+    level. Verified (streaming_x86_program_recursion_executes): each blob mmap+exec == eval_main:
+    fact(5)->120, fact(10)->3628800, fib(10)->55 (double recursion), mutual even/odd ev(10)->1,
+    linear sum rec(5)->15. A compiler written in Verbose emits native machine code for recursive
+    AND mutually-recursive programs, and it runs. (div/mod/logic/lets still out — followups.)
+
+60. Brick b5 of the backend arc: WRAP THE BLOB IN A STANDALONE ELF EXECUTABLE. b4b lowered a
+    program to a position-independent machine-code blob (entry proc at offset 0, value in rax).
+    b5 wraps that blob in a minimal static ELF64 + a 17-byte `_start` trampoline so the OUTPUT
+    IS A RUNNABLE FILE: `elf_program_src "...prog..." 0 > a.out ; chmod +x a.out ; ./a.out ;
+    echo $?` prints the entry proc's value as the process exit code. A compiler written in
+    Verbose that produces a runnable native binary. Layout (load-from-offset-0 static ELF, base
+    0x400000): [ELF64 header 64 B] [one PT_LOAD program header 56 B] [_start trampoline 17 B]
+    [program blob]. The single PT_LOAD maps the whole file at 0x400000 R+X; entry = base + 120
+    (the trampoline, right after the 120 header bytes); the blob starts at file offset 137
+    (120 + 17). The trampoline is `call rel32 = 12` (reaches the first proc at 137 - 125),
+    `mov rdi, rax` (returned value -> exit-code register), `mov rax, 60` (sys_exit), `syscall`.
+    The ONLY computed header field is p_filesz = p_memsz = 137 + program_total_size(prog),
+    emitted via le64 — every other header byte is a fixed b"..." literal. New Verbose:
+    program_total_size (sum of proc_size over every rule) + elf_program_src (the driver). Exit
+    codes are 0..255, so the milestone tests results < 256 (printing arbitrary i64 needs
+    itoa-in-machine-code, a later brick). Verified (streaming_elf_program_runs): the emitted
+    file's CHILD EXIT CODE == eval_main(program) for fact(5)->120, fib(10)->55, sum rec(5)->15,
+    mutual even/odd ev(10)->1, double(add(3,4))->14, and the constant `out = 7`->7.
+
+61. Brick b6 of the backend arc: the FOUR MISSING BINARY OPERATORS in the machine-code generator
+    — division `/` (op 16), modulo `%` (op 17), logical `and` (op 30), logical `or` (op 31).
+    b3/b4a/b4b emitted +,-,*,neg, the 6 comparisons, if/else, calls and recursion; b6 fills the
+    arithmetic/logic gap. Both codegen paths grow these four arms: the closed-expression path
+    (x86_expr / code_size_expr) AND the program path with params/calls (x86_node / code_size_node).
+    After the two operands are lowered (left then right pushed), each op pops rcx=right, rax=left.
+    div: cqo (48 99) ; idiv rcx (48 f7 f9) ; push rax (50) -> quotient (8 bytes incl. the 59 58 pops).
+    mod: cqo ; idiv rcx ; mov rax, rdx (48 89 d0) ; push rax -> remainder (11 bytes). Division is
+    SIGNED, x86 idiv truncates toward zero, matching the interpreter oracle (Rust i64 /, %):
+    -7/2 = -3, -7%2 = -1. Division/modulo by ZERO is UNGUARDED — idiv on a 0 divisor raises #DE
+    (SIGFPE), which matches eval_expr: the interpreter returns a runtime error on `a/0` / `a%0`
+    (it does NOT guard to 0). So both backends fault on a zero divisor — same observable contract.
+    and/or are branchless on the eval (operand != 0) semantics: test rax,rax ; setne al ; test
+    rcx,rcx ; setne cl ; and al,cl (or `or al,cl` = 08 c8) ; movzx eax,al ; push rax (20 bytes each).
+    code_size arms: div +8, mod +11, and +20, or +20 — counted byte-for-byte against the emit arms
+    so the program path's call/if rel32 offsets stay exact. VERBOSE-ONLY: four new op arms in each of
+    x86_expr / code_size_expr / x86_node / code_size_node; no src change. Verified end-to-end
+    (streaming_x86_divmod_logic, mmap+exec == eval_expr): 10/3->3, 10%3->1, 100/7->14, 100%7->2,
+    -7/2->-3, -7%2->-1, 5 and 0->0, 5 and 3->1, 0 or 0->0, 0 or 7->1, (2<3) and (4<5)->1,
+    1 and (if 1<2 then 1 else 0)->1; plus the program path (div in a proc, `and`/`%` across a call).
+
+62. Records-arc brick R1: ACCEPT top-level `concept` declarations in the self-hosted
+    parser. Before R1, parse_program (brick 12) walked top-level items recognizing only
+    `rule` (span_is_rule) and STOPPED (RNil) on anything else — so a program containing a
+    `concept` declaration silently DROPPED every rule after it. R1 teaches parse_program to
+    SKIP concept blocks (so rules after a concept are still parsed), and adds a SEPARATE
+    parse_concepts entry point that CAPTURES the concepts into a ConceptList. parse_program's
+    return type stays RuleList (all call sites untouched); only its loop gains a skip-concept
+    branch. New concepts (inside the VExpr group): Concept (MkConcept of name span + FieldList),
+    FieldList (FCons of name span + type code + rest | FNil), ConceptList (CCons | CNil), and
+    ParsedConcept (MkPC of Concept + end index) for position threading. New rules: span_is_concept
+    / span_is_fields (byte-recognize `concept`/`fields`, mirroring span_is_rule/span_is_logic),
+    parse_field / parse_fields (a field line is `IDENT : TYPE`, type via type_code_of_span; FNil at
+    the dedent/end of the fields block), parse_concept_decl / parse_concept_decl_pos (header is
+    `concept NAME` then a `fields:` block, mirroring parse_rule_decl / parse_rule_decl_pos),
+    parse_concepts (the new top-level walk: at each item, if `concept` -> parse + CCons + recurse
+    from its end; if `rule` -> SKIP past it + recurse; else CNil), concept_list_len / find_concept,
+    and the drivers count_concepts / concept_field_count. CRITICAL INVARIANT: a rule-only program
+    never takes parse_program's is_concept branch, so its RuleList is byte-identical to before. R1
+    is parser+AST ONLY — no type checker change, no emitter change, no new lattice (AstField stays
+    type code 3, deferred to R2). Fields are parsed for their name span and scalar type code; a
+    concept-named field type just gets whatever type_code_of_span returns today (0). Validated by
+    three orderings (concept->rule, rule->concept, two-concepts+rule) and the full existing suite
+    staying byte-identical on the rule-only path.
+
+63. Records-arc brick R2: SKIP what the self-hosted parser does not yet model, so count_rules works
+    on REAL Verbose source (its own kind). Three skip-to-unblock changes, no new AST nodes. (R2.a)
+    The line-driver tokenizer (tokenize_indent) now treats a line whose content starts with `--`
+    (a full-line comment) or `@` (an attribute line like @intention / @source / @verbose) as BLANK
+    — the same column-stack-untouched path as an empty line — so comments and attributes emit NO
+    tokens and never perturb the INDENT/DEDENT structure. Full-line only: the self-source has no
+    trailing comments on code lines (grep-verified). (R2.b) parse_program (and the sister capture
+    walk parse_concepts) recognize a top-level `concept_group` header (span_is_concept_group, the
+    13-byte ident, mutually exclusive with span_is_concept's 7-byte check) and SKIP its whole
+    indented block via skip_indented_block, then recurse — so the rules declared AFTER the group
+    are still found (before R2 the walk RNil'd on the group, the reason count_rules was 0 on real
+    source). (R2.c) parse_rule_decl / parse_rule_decl_pos no longer require `logic:` immediately
+    after the header: seek_logic scans forward over the rule's pre-logic blocks (input: / output:,
+    whatever is not `logic`), skipping each whole via skip_indented_block until the `logic` header;
+    and parse_rule_decl_pos computes its `next` STRUCTURALLY (skip the logic block, then if the next
+    sibling is `proofs:`, skip that block too) so the program walk lands on the following top-level
+    item independent of whether parse_stmts understood the (possibly rich) body. New concept
+    SkipBlockState (cell + indent depth + seen flag). New rules: span_is_concept_group, span_is_proofs,
+    skip_indented_block (depth-counted INDENT/DEDENT block skip), seek_logic. The heavy walks are
+    gated behind the relevant span check (`if is_rule == 1 then ... else ...`, native lazy-if) so
+    eager evaluation on a non-rule/non-group item stays cheap. Toy single-line grammars (logic: is
+    the first header, no proofs) keep byte-identical behavior: seek_logic returns immediately and the
+    structural `next` resolves to the same next-rule cell the old pb_next did after skip_seps_dedent.
+    THE MILESTONE: count_rules on real self-source went 0 -> the actual `rule ` count.
+
+64. Records-arc brick R3: PARSE the rule-body forms the self-source actually uses that R2 only
+    SKIPPED — `::` variant construction and block-form `match` — into real AST instead of AstErr.
+    PARSER-ONLY (downstream eval / type / checker / codegen get STUB arms; real handling is R6/R7).
+    Two new Ast variants: AstVariant (a `Concept::Variant { field: expr, ... }` construction,
+    concept-name span + variant-name span + a VFieldList of named initializers; the braceless form
+    `Token::Eof` carries VFNil) and AstMatch (a `match scrut: Variant(binders) => body ...` with the
+    scrutinee sub-expression and an ArmList). Three new cons-list group concepts mirror ArgList:
+    VFieldList (VFCons/VFNil), ArmList (ArmCons/ArmNil), BinderList (BindCons/BindNil), plus three
+    Parsed-threading results (ParsedVFields/MkVF, ParsedArms/MkAL, ParsedBinders/MkBL). `match` is
+    lexed as a 5-byte keyword (kw5 code 11, kind 211) — the parse layer is source-free (ParseState
+    carries only the token cell, no source bytes), so match is recognized by token kind exactly as
+    `if` / `then` / `else` / `let` / `true` / `false` are, NOT by a span check. New parser rules:
+    variant construction in parse_primary (an IDENT followed by `::` op 3 parses IDENT :: IDENT then
+    an OPTIONAL `{ ... }`) via parse_vfields / vfields_cons / vfields_prepend / variant_build; and
+    block-form match via parse_match / parse_arms / arm_join / parse_binders / binders_scan /
+    binders_prepend (parse_arms reuses R2's INDENT/DEDENT separator skipping — skip_seps over Newline
+    /Indent, stopping at Dedent/Eof — so both the indented self-source form and a flat single-line
+    arm sequence parse). Adding the two Ast variants makes every `match` on an Ast value non-exhaustive,
+    so all Ast-matching rules (eval_ast, eval_ast_env, shape_ast, type_of_env, the count_/span_
+    analyses, print_expr, lower_expr/_src, x86_expr/_node, code_size_expr/_node) gain stub arms.
+    shape_ast gives AstMatch (band 100000000) and AstVariant (band 1000000000) dedicated bands above
+    AstStr's 10000000, with helpers shape_arms / shape_vfields recursing into arm bodies and field
+    values — so a parsed match/variant body has a hand-derivable fingerprint distinct from the AstErr
+    fingerprint (0). THE OBSERVABLE: the brick-5 `shape` driver on a body using both forms returns the
+    predicted AstMatch + AstVariant fingerprint, proving the bodies now parse into real AST.
+
+R6c — the interpreter evaluates match/variant (runtime Value model).
+The evaluator was number-valued (eval_ast_env : number, and the whole call
+machinery: venv_lookup / build_env / bind_params / eval_call). To evaluate a
+match/variant program it must return a value that is a number OR a variant
+(a tag + a payload); a number cannot hold a variant. So the eval subsystem
+becomes Value-valued. Value = VNum(n) | VData(tag, payload); ValueList is the
+payload cons-list; VEnv is the interpreter's runtime environment (name span ->
+Value), kept separate from the R6b type checker's Env (which stores number type
+codes). A variant's identity tag is self-computed from the parsed ConceptList of
+the interpreted source: concept_index * 256 + variant_index (no global table).
+A match recovers concept_index = tag / 256 from the scrutinee's tag, resolves
+each arm's variant name to a tag, dispatches to the first equal arm, and binds
+the arm's binders positionally to the scrutinee's payload. eval_ast becomes a
+thin wrapper over eval_ast_env (unwrapping via vnum_of). Strings stay VNum 0
+(deferred). eval_main threads the ConceptList so a program with a concept_group
+and match/variant rules evaluates end to end (recursive list-sum -> the total).
+
+----------------------------------------------------------------------------
+Brick R6d of the self-hosting arc: the PURITY VERIFIER. R5 parsed each rule's
+`proofs:` into a Proofs { reads : NameList, calls : NameList, ... }. R6d makes the
+self-hosted checker VERIFY the purity half of that proof against the rule body:
+a rule may only CALL rules it declares in `calls:` and only READ inputs it
+declares in `reads:`. Two per-rule counts of violations, wired into a
+count_purity_errors driver.
+
+Calls check: walk the body's AstCall nodes (through match/variant, like R6a). A
+callee that RESOLVES to a defined rule (rule_named == 1) yet is absent from the
+declared `calls:` list (name_in_namelist == 0) is one undeclared call. Primitives
+(length / byte_at / ...) don't resolve to a defined rule, so they are naturally
+exempt; self-recursion resolves, so it must be declared.
+
+Reads check: walk the body threading the INPUT NAME (the first `input:` field) and
+the local scope (params + lets, extended per match arm with the arm's binders). An
+AstVar whose head-ident byte-equals the input name, is not a local, and is not in
+the declared `reads:` list is one undeclared read. A field access `s.source`
+reaches its head-ident `s` through AstField -> AstVar(s), so descending the base is
+the head-ident test; declared `[s]` (head-ident spans, R5's storage) admits
+`s.anything` (exact-path reads are a finer check, deferred).
+
+Termination verification (checking `decreasing : n` passes `n - k`, `structural : f`
+recurses on a match-binder sub-part) is genuinely harder and is DEFERRED to a
+follow-on brick. name_in_namelist is the one new membership helper — the NameList
+analogue of name_bound / rule_named.
+
+----------------------------------------------------------------------------
+Records-arc slice 4: RECORD PARAMS + the unified static concept resolver.
+Slice 3 compiled field access only on a LET-BOUND record, via an ad-hoc gate
+(base is an AstVar whose let RHS is an AstVariant). The self-source's real
+shape is a rule reading its INPUT record (`rule f(s : Foo)` ... `s.field`)
+and chained access (`o.inner.b`), so slice 4 replaces the gate with ONE
+recursive compile-time resolver: static_concept_of(base) -> the record
+concept's 0-based index, or -1 when unresolvable. An AstVar resolves through
+a TYPED param's declared-type span (PCons ty_start/ty_len — an UNTYPED param
+stays -1: the compiler never infers a param's concept from call sites) or,
+when not a param, through slice 3's let-RHS-construction check (that branch
+IS slice 3's gate, so let-bound cases resolve identically); an AstVariant
+resolves through its own concept-name span; an AstField recurses on its base
+and then resolves the accessed field's declared-type span (FCons
+ty_start/ty_len, R6b) — chained access. One minimal helper, field_concept_of,
+walks a FieldList by field NAME and returns the concept index the field's ty
+span resolves to (-1 for a missing field or a non-concept type);
+params_to_fields (R4) converts a ParamList one-for-one preserving ty spans,
+so the same walker serves `s : Foo` (param) and `inner : Foo` (field).
+find_concept_index's not-found sentinel (999999) is translated to -1 so
+`>= 0` is THE resolvability test. x86_node's AstField arm and code_size_node's
+arm share that resolver call VERBATIM (>= 0 -> base code + the fixed 19-byte
+payload-slot suffix; else int3 / 1 byte) — the same-expression discipline
+that keeps the two-pass sizes in lockstep. Record args through calls and
+recursion need NO new code: a record value is its arena index (a Number),
+and indices already flow through the call ABI (args pushed, params in rbp
+slots). Slice 3's ast_is_var / ast_var_start / ast_var_len readers are
+deleted (the resolver's AstVar arm binds the span directly).
+
+----------------------------------------------------------------------------
+Text values arc, slice 1 (intent entry 39): give the self-hosted interpreter
+REAL text values via the SPAN model, plus the three scanner primitives.
+
+A target text value IS a span into the interpreted source: a new Value variant
+VText(start, len) indexes the same source text the AST spans already index —
+no heap, no copying. A string literal AstStr(start, len) evaluates to the span
+with the surrounding quotes stripped (the lexer's Str token span includes both
+quotes): (start + 1, len - 2).
+
+The target language's byte_at / length / substring are implemented with the
+HOST's own primitives on the interpreted source — target byte_at(t, i) is host
+byte_at(src, t.start + i). Dispatch happens in eval_ast_env's AstCall arm,
+BEFORE eval_call (whose lets are eager — find_rule runs unconditionally), by
+byte-comparing the callee span against the three primitive names (span_is_*
+checks, mirroring span_is_rule). The primitive names shadow user rules of the
+same name — reserved, exactly like verbosec.
+
+Safety: the host byte_at is fail-closed (aborts on out-of-bounds), so every
+primitive guards its bounds FIRST and returns a defensive VNum 0 on any
+out-of-range index, ill-shaped argument, or arity mismatch — a buggy TARGET
+program can never kill the interpreter. substring's guard (0 <= a <= b <=
+t.len) preserves the span invariant, so composed spans stay in bounds.
+
+Deferred, deliberately: concat (fresh text) breaks the span model and needs a
+text heap; text codegen (x86_node) is the next slice, locked against this
+interpreter as its oracle.
+
+The milestone: eval_main now RUNS a real scanner — scan_word.verbose's
+word_length logic (recursion + byte_at + length + text through a record field)
+inside the self-hosted interpreter returns 5 on "hello world".
+
+----------------------------------------------------------------------------
+Text values arc, slice 2 (intent entry 66): text CODEGEN — the self-hosted
+emitter compiles the span model to machine code, locked against slice 1's
+interpreter as its oracle.
+
+Two moves, both compile-time-constant. First, a compiled text value is ONE
+packed i64, start * 2^32 + len — a Number, so it flows through the stack
+machine, arena slots, the call ABI, and match binders with ZERO new
+machinery (the same argument as "a record value is its arena index").
+AstStr(start, len) lowers to mov rax, imm64((start+1) << 32 | (len-2)) ;
+push rax — quotes stripped, the SAME numbers as eval's VText. Second, the
+emitted ELF EMBEDS the interpreted source: when program_uses_text (an AstStr
+appears anywhere, or a call to byte_at / length / substring — the walk
+reuses span_is_* verbatim), elf_program_src appends the source bytes at the
+FILE END (src_blob: 4 bytes per le32 word, zero-padded to a 4-byte boundary
+— bytes has no 1-byte emitter, so the append rides the existing le32 path)
+and extends p_filesz so the single PT_LOAD maps them. src_base = 0x400000 +
+blob_end_off (headers 221 + optional arena prologue 61 + blob size — ONE
+rule serving both the ELF size field and byte_at's imm64, so they cannot
+drift). Compiled spans are therefore NUMERICALLY IDENTICAL to eval's spans
+into the same bytes: the oracle equivalence is exact by construction.
+
+The three primitives dispatch in x86_node's AstCall arm BEFORE the real-call
+path, on the VERBATIM same span_is_* + arg_list_len conditions as
+code_size_node (the two-pass drift edge). Constant suffixes: length(t) K=4
+(pop ; mov eax, eax ; push — low 32 bits ARE the len); byte_at(t, i) K=36
+(split span, unsigned cmp covers negative i, movabs src_base, movzx load;
+out-of-bounds pushes 0 — parity with eval's defensive VNum 0, never abort);
+substring(t, a, b) K=38 (unsigned a <= b <= len, repack (start+a) << 32 |
+(b-a) — pure span arithmetic, no memory touch). A wrong arity emits ONLY
+push 0 (2 bytes). Text-free programs stay BYTE-IDENTICAL: embedding and all
+new emits are gated on program_uses_text.
+
+The slice surfaced a LATENT off-threading bug in x86_node's AstIf arm: the
+THEN branch was emitted with off + size(cond) + 15, but its true position is
++ 10 (the 5-byte jmp-over-els sits AFTER thn; the els offset was already
+correct). Every prior program recursed in an ELSE branch, so no call rel32
+had ever been emitted inside a THEN branch — word_length's recursive call
+landed 5 bytes short, in the previous proc's epilogue, until the fix.
+
+The milestone: the COMPILER compiles a scanner — the slice-1 word_length
+program (Sc{src, pos} record, recursion, byte_at/length through record
+fields) emits an ELF that prints 5 on "hello world", byte-for-byte the value
+eval_main computes. Deferred, deliberately: concat (fresh text) still needs
+a text heap; runtime text INPUT into the closed main stays a driver-level
+slice if ever needed.
+
+----------------------------------------------------------------------------
+Termination-verifier brick of the self-hosting arc: the checker's LAST proof
+surface. R5 parsed each rule's termination block into Proofs (term_kind 0=bound /
+1=structural / 2=decreasing / 3=increasing, term_bound, and the field-name span
+term_field_start/len); R6d verified purity. This brick VERIFIES the three
+pattern-bearing kinds against the body's SELF-recursive call sites, closing the
+checker: lints, sound types, purity, and termination are now all verified by the
+self-hosted checker.
+
+The per-rule check: for a rule declaring kind 1/2/3, walk the body (the same
+match/variant walk family as the R6d purity checks) finding every call whose
+callee span byte-equals the rule's OWN name span. At each such site the FIRST
+argument must match the declared pattern. decreasing : f — the argument is a
+record construction (records slice 1: a bare `C { ... }` parses to a variant
+construction whose variant span equals the concept span) whose field f carries
+literally `input.f - k` with a LITERAL k >= 1; any other shape at f, or f absent
+from the construction, is one violation. increasing : f — symmetric with `+`.
+structural : p — the argument is a bare variable that is a binder introduced by
+an ENCLOSING match arm whose scrutinee is the input param itself; the binder set
+threads down the walk, extended per arm exactly the way the R6d reads-check
+scopes arm binders, so recursing on the whole input (or anything not bound by a
+match on the input) is one violation. bound-only (kind 0) is never flagged, even
+for recursive rules — parity with the reference compiler, which emits a stderr
+breadcrumb but does not refuse; a rule with no self-call passes vacuously under
+any kind.
+
+Honest scope, each bound matching the reference compiler's own Phase C shape:
+self-recursion only (the reference per-rule checks are also self-shaped; mutual
+recursion termination is deferred); single checked argument (the toy grammar's
+rules are single-arg — a self-call with NO argument is a violation for kinds
+1/2/3); the structural scrutinee must be the input param directly (nested or
+derived scrutinees deferred); the step must be a literal k >= 1 (a non-literal
+step is a violation — the checker cannot prove it positive).
+
+The driver count_term_errors mirrors count_purity_errors exactly: tokenize the
+source (argv arg 1), parse the whole rule-decl sequence once, fold the per-rule
+check over the program, return the total violation count. NATIVE-ONLY for
+multi-line sources, like every other whole-program driver. Validation: the
+decreasing/increasing/structural OK shapes count 0; the no-step, wrong-direction,
+and whole-input-recursion breakages each count 1; bound-only recursive and
+non-recursive rules count 0.

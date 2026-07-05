@@ -430,12 +430,20 @@ fn compile_native_code(
                     });
                 }
                 for f in &c.fields {
-                    match f.ty {
+                    match &f.ty {
                         Type::Number | Type::Text => {}
+                        // A group-concept-typed field is an i64 arena index
+                        // at the ABI level — it marshals identically to a
+                        // Number field (one 8-byte struct slot). The arena it
+                        // indexes is reachable from the callee via r11 (set
+                        // once in _start, preserved across call/ret). See
+                        // docs/group-field-abi-design.md. A plain record
+                        // concept is NOT index-shaped, so keep it refused.
+                        Type::Named(n) if group_concept_names.contains(n) => {}
                         _ => {
                             return Err(NativeError {
                                 message: format!(
-                                    "recursive rule '{}' input field '{}' must be Number or Text (got {:?})",
+                                    "recursive rule '{}' input field '{}' must be Number, Text, or a group-concept type (got {:?}); plain record concepts aren't index-shaped.",
                                     r.name, f.name, f.ty
                                 ),
                             });
@@ -445,7 +453,9 @@ fn compile_native_code(
             }
             // Per-rule output check. Group-concept output is allowed
             // (single i64 index in rax, populated by VariantConstruct
-            // emit). Otherwise must be Number/Bool/Text.
+            // emit). Otherwise must be Number/Bool/Text/Bytes — Bytes
+            // (brick b3-native) streams through the same recursive
+            // streaming machinery as Text (emit_streaming_bytes_body).
             let is_group_output = match &r.output_ty {
                 Type::Named(n) => concepts
                     .iter()
@@ -454,11 +464,11 @@ fn compile_native_code(
                 _ => false,
             };
             if !is_group_output
-                && !matches!(&r.output_ty, Type::Number | Type::Bool | Type::Text)
+                && !matches!(&r.output_ty, Type::Number | Type::Bool | Type::Text | Type::Bytes)
             {
                 return Err(NativeError {
                     message: format!(
-                        "recursive rule '{}' output must be Number, Bool, or Text (got {:?}); Result/Record returns are later slices.",
+                        "recursive rule '{}' output must be Number, Bool, Text, or Bytes (got {:?}); Result/Record returns are later slices.",
                         r.name, r.output_ty
                     ),
                 });
@@ -483,6 +493,61 @@ fn compile_native_code(
         // Fall through to the slice 5.1a emit below. The standard
         // post-emit pipeline (stdin/stream prepend, etc.) still runs.
     }
+
+    // Streaming text emit (self-hosting emitter slice, 2026-06-10).
+    //
+    // A text-returning recursive callable could historically return ONLY
+    // static bytes (literal leaves — slice 5.2): a `concat(...)` built in
+    // a recursive frame dies at `ret` (the buffer lives below that frame's
+    // rsp), so the pretty-printer shape
+    //   emit(node) = concat(emit(lhs), "+", emit(rhs))
+    // was refused at emit_recursive_text_body's catch-all. Instead of
+    // materializing the string (arena design, rejected for the first
+    // slice — see docs/emitter-text-arena-design-DRAFT.md §6b–6d), we
+    // LOWER the whole text SCC to a streaming walk: each leaf's bytes
+    // are written to fd 1 in order during the recursion, and the
+    // returned (rax, rdx) pair is ignored. No buffer, no arena, no
+    // r11-lifetime hazard beyond the per-write push/pop guard.
+    //
+    // The mode is a whole-SCC ABI property, decided ONCE here:
+    //   - entry output must be Text;
+    //   - at least one text-output SCC member's body uses a shape
+    //     beyond today's literal-leaf grammar (Concat / MatchVariant
+    //     in text position) — bodies that pass the old grammar keep
+    //     the materializing path BYTE-FOR-BYTE (recursive_label etc.);
+    //   - every SCC member passes the purely syntactic v1 shape check
+    //     (text-SCC calls in tail text positions only; no text-SCC
+    //     references from lets, if-conditions, scrutinees, or value
+    //     positions; non-text members never call text members).
+    // No guessing: the check is a syntactic walk, and the optimizer
+    // (which runs before native) can only collapse all-literal concats
+    // — it cannot reorder a tree out of shape.
+    let streaming_text = if needs_callable_path && matches!(rule.output_ty, Type::Text) {
+        decide_streaming_text_mode(&scc_rules_owned)?
+    } else {
+        false
+    };
+
+    // Streaming BYTES emit (brick b3-native, 2026-06-12). The bytes
+    // analogue of the streaming-text path above: a recursive `bytes`-
+    // returning entry (the x86-64 machine-code emitter) lowers to a
+    // streaming walk — each leaf's raw bytes are written to fd 1 IN
+    // ORDER during the recursion, and the (rax, rdx) return pair is
+    // ignored. No buffer, no arena. Unlike text there is NO legacy
+    // materializing path for recursive bytes (brick b1/b2 only handled
+    // the non-recursive `emit_bytes_program`), so any recursive
+    // bytes SCC unconditionally enters streaming mode; the shape check
+    // (`check_streaming_bytes_shape`) refuses non-tail SCC calls.
+    let streaming_bytes = if needs_callable_path && matches!(rule.output_ty, Type::Bytes) {
+        decide_streaming_bytes_mode(&scc_rules_owned)?;
+        true
+    } else {
+        false
+    };
+    // Whole-SCC streaming flag threaded into emit_self_recursive_program.
+    // Text vs bytes is disambiguated inside by the entry rule's output_ty,
+    // so a single bool suffices.
+    let streaming = streaming_text || streaming_bytes;
 
     // Look up the context concept (if multi-input rule).
     let context_concept: Option<&Concept> = match &rule.context_ty {
@@ -551,7 +616,7 @@ fn compile_native_code(
         // Slice 5.1a-5.4: emit the rule (or SCC) as real callables.
         // scc_rules_owned was populated above when recursion was detected;
         // for single self-recursion it has one entry, for mutual it has N.
-        emit_self_recursive_program(rule, &scc_rules_owned, concept, &rules, &resources, &connections, concept_group, &concepts)?
+        emit_self_recursive_program(rule, &scc_rules_owned, concept, &rules, &resources, &connections, concept_group, &concepts, streaming)?
     } else if let Some(rx) = reaction {
         emit_reaction_program(rx, rule, concept, &rules, &resources, &connections, concept_group)?
     } else if is_result_output {
@@ -574,6 +639,9 @@ fn compile_native_code(
         emit_fold_bytes_program(rule, concept, &rules, &resources)?
     } else if matches!(&rule.output_ty, Type::Text) {
         emit_text_program(rule, concept, &rules, &resources, &connections, concept_group)?
+    } else if matches!(&rule.output_ty, Type::Bytes) {
+        // Backend brick b1: `output: bytes` with a `b"..."` literal body.
+        emit_bytes_program(rule, concept, &rules, &resources, &connections, concept_group)?
     } else if let Some(rec_concept) = record_output_concept {
         emit_record_program(rule, rec_concept, concept, &concepts, &rules, &resources, &connections, concept_group)?
     } else if matches!(&rule.output_ty, Type::Number | Type::Bool) && contains_quantifier(&rule.logic.value) {
@@ -812,6 +880,18 @@ struct RecordLoopCtx<'a> {
     /// Phase B slice 4a.2: cap on arena entries (`max_nodes` from the
     /// group declaration). 0 when no group is declared.
     arena_max_nodes: u32,
+    /// Off-stack mmap arena (2026-06-22): true when the program's
+    /// `arena_size` exceeds the mmap threshold (64 KiB). When true the arena
+    /// lives in an anonymous mmap region (NOT the stack frame), node_count
+    /// lives INSIDE that region at `[r11 + arena_size]` (so the entry path
+    /// must NOT use `node_count_slot`), and r11 is reloaded from
+    /// `arena_base_slot` (NOT `lea [rbp+arena_rbp_offset]`) at every
+    /// entry-level arena access. False keeps the stack path byte-identical.
+    use_mmap: bool,
+    /// Off-stack mmap arena: rbp-relative offset of the 8-byte frame slot
+    /// holding the mmap base pointer (the value `r11` is reloaded from at
+    /// entry level). Only meaningful when `use_mmap` is true; 0 otherwise.
+    arena_base_slot: i32,
 }
 
 /// Emit an argc guard: if r12 (argc) < min_argc, write an error message
@@ -921,7 +1001,7 @@ fn collect_read_names_native(expr: &Expr, out: &mut Vec<String>) {
                 out.push(name.clone());
             }
         }
-        Expr::Number(_) | Expr::Text(_) | Expr::Ident(_) => {}
+        Expr::Number(_) | Expr::Text(_) | Expr::Bytes(_) | Expr::Ident(_) => {}
         Expr::Field(base, _) => collect_read_names_native(base, out),
         Expr::Binary(_, l, r) => {
             collect_read_names_native(l, out);
@@ -998,7 +1078,7 @@ fn collect_read_names_native(expr: &Expr, out: &mut Vec<String>) {
         // `length(<text_expr>)` — pure pass-through.
         Expr::Length(inner) => collect_read_names_native(inner, out),
         // `abs(<number_expr>)` — pure pass-through.
-        Expr::Abs(inner) | Expr::BitNot(inner) => collect_read_names_native(inner, out),
+        Expr::Abs(inner) | Expr::BitNot(inner) | Expr::Le32(inner) | Expr::Le64(inner) => collect_read_names_native(inner, out),
         // `min(a, b)` / `max(a, b)` — recurse into both children; either
         // side may carry a `read(...)` reference.
         Expr::Min(l, r) | Expr::Max(l, r) | Expr::BitAnd(l, r) | Expr::BitOr(l, r) | Expr::BitXor(l, r) | Expr::Shl(l, r) | Expr::Shr(l, r) => {
@@ -1053,11 +1133,11 @@ fn collect_read_names_native(expr: &Expr, out: &mut Vec<String>) {
 fn expr_uses_now_unix(e: &Expr) -> bool {
     match e {
         Expr::NowUnix => true,
-        Expr::Number(_) | Expr::Text(_) | Expr::Ident(_) | Expr::Read(_) => false,
+        Expr::Number(_) | Expr::Text(_) | Expr::Bytes(_) | Expr::Ident(_) | Expr::Read(_) => false,
         Expr::Field(b, _) => expr_uses_now_unix(b),
         Expr::Binary(_, l, r) => expr_uses_now_unix(l) || expr_uses_now_unix(r),
         Expr::Not(i) | Expr::Neg(i) | Expr::Ok(i) | Expr::Err(i) => expr_uses_now_unix(i),
-        Expr::JsonEscape(i) | Expr::ParseInt(i) | Expr::Length(i) | Expr::Abs(i) | Expr::BitNot(i) => expr_uses_now_unix(i),
+        Expr::JsonEscape(i) | Expr::ParseInt(i) | Expr::Length(i) | Expr::Abs(i) | Expr::BitNot(i) | Expr::Le32(i) | Expr::Le64(i) => expr_uses_now_unix(i),
         Expr::If(c, t, el) => {
             expr_uses_now_unix(c) || expr_uses_now_unix(t) || expr_uses_now_unix(el)
         }
@@ -1160,7 +1240,7 @@ fn count_match_result_max_depth(expr: &Expr) -> usize {
                 .max(count_match_result_max_depth(e))
         }
         Expr::Ok(i) | Expr::Err(i) | Expr::Not(i) | Expr::Neg(i) | Expr::Abs(i) | Expr::BitNot(i)
-        | Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i) | Expr::BitNot(i) => {
+        | Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i) | Expr::Le32(i) | Expr::Le64(i) => {
             count_match_result_max_depth(i)
         }
         Expr::Binary(_, l, r) => {
@@ -1223,7 +1303,7 @@ fn count_match_result_max_depth(expr: &Expr) -> usize {
             scrut_depth.max(arms_depth)
         }
         // Leaves: no inner expression to recurse into.
-        Expr::Number(_) | Expr::Text(_) | Expr::Field(_, _) | Expr::Ident(_)
+        Expr::Number(_) | Expr::Text(_) | Expr::Bytes(_) | Expr::Field(_, _) | Expr::Ident(_)
         | Expr::Read(_) | Expr::NowUnix => 0,
     }
 }
@@ -1240,7 +1320,7 @@ fn expr_uses_field(e: &Expr, input_name: &str, field_name: &str) -> bool {
             (matches!(base.as_ref(), Expr::Ident(n) if n == input_name) && fname == field_name)
                 || expr_uses_field(base, input_name, field_name)
         }
-        Expr::Number(_) | Expr::Text(_) | Expr::Ident(_) | Expr::Read(_) | Expr::NowUnix => false,
+        Expr::Number(_) | Expr::Text(_) | Expr::Bytes(_) | Expr::Ident(_) | Expr::Read(_) | Expr::NowUnix => false,
         Expr::Binary(_, l, r) => {
             expr_uses_field(l, input_name, field_name)
                 || expr_uses_field(r, input_name, field_name)
@@ -1248,7 +1328,7 @@ fn expr_uses_field(e: &Expr, input_name: &str, field_name: &str) -> bool {
         Expr::Not(i) | Expr::Neg(i) | Expr::Ok(i) | Expr::Err(i) => {
             expr_uses_field(i, input_name, field_name)
         }
-        Expr::JsonEscape(i) | Expr::ParseInt(i) | Expr::Length(i) | Expr::Abs(i) | Expr::BitNot(i) => {
+        Expr::JsonEscape(i) | Expr::ParseInt(i) | Expr::Length(i) | Expr::Abs(i) | Expr::BitNot(i) | Expr::Le32(i) | Expr::Le64(i) => {
             expr_uses_field(i, input_name, field_name)
         }
         Expr::If(c, t, el) => {
@@ -1557,6 +1637,320 @@ fn reaches_target(
     false
 }
 
+/// Streaming text emit — does this text-output body use a shape BEYOND
+/// today's literal-leaf grammar (emit_recursive_text_body: literal,
+/// self-call, if/else, BoundText Ident, Field, substring)? `Concat` and
+/// `MatchVariant` in text position are the two shapes that die at the
+/// legacy catch-all; their presence is what flips the SCC to streaming.
+/// Anything ELSE the legacy path refuses (Read, Fetch, ...) keeps
+/// refusing exactly as before — streaming only triggers on the two
+/// shapes this slice lowers. The walk follows text positions only:
+/// if/else arms and a substring's inner text. (An if-condition or a
+/// substring bound is a number position; concat is illegal there and
+/// the verifier already rejected it.)
+fn text_body_beyond_legacy_grammar(e: &Expr) -> bool {
+    match e {
+        Expr::Concat(_) | Expr::MatchVariant(_, _) => true,
+        Expr::If(_, t, el) => {
+            text_body_beyond_legacy_grammar(t) || text_body_beyond_legacy_grammar(el)
+        }
+        Expr::Substring(inner, _, _) => text_body_beyond_legacy_grammar(inner),
+        _ => false,
+    }
+}
+
+/// Streaming text emit — true iff `e` contains, ANYWHERE in its tree, a
+/// call to a text-returning SCC member. Used to refuse text-SCC calls in
+/// value positions (if-conditions, scrutinees, call arguments, number
+/// expressions, let RHSes): a streaming callee WRITES its bytes to fd 1
+/// during the walk, so its "return value" is meaningless — consuming it
+/// as a value would both emit bytes out of order and compute garbage.
+fn expr_references_text_scc(e: &Expr, text_scc: &HashSet<&str>) -> bool {
+    let mut callees: Vec<String> = Vec::new();
+    collect_native_callees(e, &mut callees);
+    callees.iter().any(|n| text_scc.contains(n.as_str()))
+}
+
+/// Streaming text emit — the v1 shape check for one text-output SCC
+/// member's body. Purely syntactic (compiler axiom: no guessing). A
+/// call to a text-returning SCC member is legal ONLY as a direct
+/// element of the tail-text chain: the body itself, a concat arg, an
+/// if arm, a match arm. Everything else (if-conditions, scrutinees,
+/// the call's own arguments, and any value-position expression like
+/// length(...) / parse_int(...) / arithmetic) must be free of text-SCC
+/// references — checked via the catch-all scan at the bottom.
+fn check_streaming_text_shape(
+    rule_name: &str,
+    e: &Expr,
+    text_scc: &HashSet<&str>,
+) -> Result<(), NativeError> {
+    match e {
+        Expr::Text(_) => Ok(()),
+        // Concat args are each a tail text position themselves: the
+        // streaming emitter writes them left to right, so a text-SCC
+        // call as a direct arg streams its bytes exactly in order.
+        Expr::Concat(args) => {
+            for a in args {
+                check_streaming_text_shape(rule_name, a, text_scc)?;
+            }
+            Ok(())
+        }
+        Expr::If(cond, then_e, else_e) => {
+            if expr_references_text_scc(cond, text_scc) {
+                return Err(NativeError {
+                    message: format!(
+                        "streaming text emit: rule '{}' calls a text-returning recursive rule inside an if CONDITION; a text-SCC call may only appear in a tail text position (body / concat arg / if arm / match arm) because its bytes stream to stdout during the walk.",
+                        rule_name
+                    ),
+                });
+            }
+            check_streaming_text_shape(rule_name, then_e, text_scc)?;
+            check_streaming_text_shape(rule_name, else_e, text_scc)
+        }
+        Expr::MatchVariant(scrutinee, arms) => {
+            if expr_references_text_scc(scrutinee, text_scc) {
+                return Err(NativeError {
+                    message: format!(
+                        "streaming text emit: rule '{}' calls a text-returning recursive rule inside a match SCRUTINEE; a text-SCC call may only appear in a tail text position (body / concat arg / if arm / match arm).",
+                        rule_name
+                    ),
+                });
+            }
+            for arm in arms {
+                check_streaming_text_shape(rule_name, &arm.body, text_scc)?;
+            }
+            Ok(())
+        }
+        // A tail-position text-SCC call: legal — but its ARGUMENTS are
+        // value positions (they become the next recursion's input), so
+        // they must not themselves reference a text-SCC member.
+        Expr::Call(name, args) if text_scc.contains(name.as_str()) => {
+            for a in args {
+                if expr_references_text_scc(a, text_scc) {
+                    return Err(NativeError {
+                        message: format!(
+                            "streaming text emit: rule '{}' passes a text-returning recursive call as an ARGUMENT to '{}'; arguments are value positions — a text-SCC call may only appear in a tail text position (body / concat arg / if arm / match arm).",
+                            rule_name, name
+                        ),
+                    });
+                }
+            }
+            Ok(())
+        }
+        // Everything else — number expressions, Field/Ident/Substring
+        // leaves, non-text calls — is a value position from the
+        // streaming emitter's point of view. Any text-SCC reference
+        // buried inside (e.g. length(print_expr(x))) is out of order
+        // by construction: refuse with the slice breadcrumb.
+        other => {
+            if expr_references_text_scc(other, text_scc) {
+                return Err(NativeError {
+                    message: format!(
+                        "streaming text emit: rule '{}' uses a text-returning recursive call in a non-tail position ({:?}); a text-SCC call may only appear as a direct element of the body / concat args / if arms / match arms, because the callee streams its bytes to stdout during the walk. Workaround: restructure so the call's bytes are emitted in output order, or use --run (interpreter).",
+                        rule_name,
+                        other
+                    ),
+                });
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Streaming text emit — whole-SCC mode decision. Returns Ok(true) when
+/// the SCC must be lowered as a streaming walk, Ok(false) when every
+/// text body fits today's literal-leaf grammar (old materializing path,
+/// byte-for-byte preserved), Err when a body needs streaming but fails
+/// the v1 shape check.
+fn decide_streaming_text_mode(scc_rules: &[&Rule]) -> Result<bool, NativeError> {
+    let text_scc: HashSet<&str> = scc_rules
+        .iter()
+        .filter(|r| r.output_ty == Type::Text)
+        .map(|r| r.name.as_str())
+        .collect();
+    let beyond = scc_rules.iter().any(|r| {
+        r.output_ty == Type::Text && text_body_beyond_legacy_grammar(&r.logic.value)
+    });
+    if !beyond {
+        return Ok(false);
+    }
+    for r in scc_rules {
+        // Lets keep today's callable rules (number lets + allocation-free
+        // text lets, gated upstream); ADDITIONALLY no let RHS may reference
+        // a text-SCC member — its bytes would stream at let-eval time,
+        // BEFORE the body's earlier output (out-of-order bytes).
+        for (bname, bexpr) in &r.logic.bindings {
+            if expr_references_text_scc(bexpr, &text_scc) {
+                return Err(NativeError {
+                    message: format!(
+                        "streaming text emit: rule '{}' let '{}' references a text-returning recursive rule; let RHSes are evaluated before the body, so the callee's bytes would stream out of order. Inline the call in a tail text position instead.",
+                        r.name, bname
+                    ),
+                });
+            }
+        }
+        if r.output_ty == Type::Text {
+            check_streaming_text_shape(&r.name, &r.logic.value, &text_scc)?;
+        } else if expr_references_text_scc(&r.logic.value, &text_scc) {
+            // A number/group-returning member consuming a text member's
+            // "value" is non-tail by definition (the bytes stream, the
+            // register pair is garbage).
+            return Err(NativeError {
+                message: format!(
+                    "streaming text emit: non-text rule '{}' calls a text-returning recursive rule; in streaming mode a text-SCC member writes its bytes to stdout and returns no usable value, so only text-output rules may call it (in tail text positions).",
+                    r.name
+                ),
+            });
+        }
+    }
+    Ok(true)
+}
+
+/// Brick b3-native — syntactic shape check for one bytes streaming SCC
+/// member's body. The bytes analogue of `check_streaming_text_shape`:
+/// a call to a bytes-returning SCC member is legal ONLY as a direct
+/// element of a tail-bytes chain (the body itself, a concat arg, an if
+/// arm, a match arm). Everything else (if-conditions, scrutinees, the
+/// call's own arguments, and any value-position expression) must be
+/// free of bytes-SCC references — checked via the catch-all scan.
+/// Mirrors the text constraints 1-for-1 because the streaming emitter's
+/// ordering guarantee (bytes written left-to-right during the walk) is
+/// identical.
+fn check_streaming_bytes_shape(
+    rule_name: &str,
+    e: &Expr,
+    bytes_scc: &HashSet<&str>,
+) -> Result<(), NativeError> {
+    match e {
+        // Bytes leaves: a literal, or a number → little-endian encoding.
+        // Their subexpressions are value positions; le32/le64's inner is
+        // a number and may not reference a bytes-SCC call (caught below).
+        Expr::Bytes(_) => Ok(()),
+        Expr::Le32(inner) | Expr::Le64(inner) => {
+            if expr_references_bytes_scc(inner, bytes_scc) {
+                return Err(NativeError {
+                    message: format!(
+                        "streaming bytes emit: rule '{}' calls a bytes-returning recursive rule inside le32/le64 (a number position); a bytes-SCC call may only appear in a tail bytes position (body / concat arg / if arm / match arm).",
+                        rule_name
+                    ),
+                });
+            }
+            Ok(())
+        }
+        // Concat args are each a tail bytes position themselves.
+        Expr::Concat(args) => {
+            for a in args {
+                check_streaming_bytes_shape(rule_name, a, bytes_scc)?;
+            }
+            Ok(())
+        }
+        Expr::If(cond, then_e, else_e) => {
+            if expr_references_bytes_scc(cond, bytes_scc) {
+                return Err(NativeError {
+                    message: format!(
+                        "streaming bytes emit: rule '{}' calls a bytes-returning recursive rule inside an if CONDITION; a bytes-SCC call may only appear in a tail bytes position (body / concat arg / if arm / match arm).",
+                        rule_name
+                    ),
+                });
+            }
+            check_streaming_bytes_shape(rule_name, then_e, bytes_scc)?;
+            check_streaming_bytes_shape(rule_name, else_e, bytes_scc)
+        }
+        Expr::MatchVariant(scrutinee, arms) => {
+            if expr_references_bytes_scc(scrutinee, bytes_scc) {
+                return Err(NativeError {
+                    message: format!(
+                        "streaming bytes emit: rule '{}' calls a bytes-returning recursive rule inside a match SCRUTINEE; a bytes-SCC call may only appear in a tail bytes position.",
+                        rule_name
+                    ),
+                });
+            }
+            for arm in arms {
+                check_streaming_bytes_shape(rule_name, &arm.body, bytes_scc)?;
+            }
+            Ok(())
+        }
+        // A tail-position bytes-SCC call: legal — but its ARGUMENTS are
+        // value positions (they become the next recursion's input), so
+        // they must not themselves reference a bytes-SCC member.
+        Expr::Call(name, args) if bytes_scc.contains(name.as_str()) => {
+            for a in args {
+                if expr_references_bytes_scc(a, bytes_scc) {
+                    return Err(NativeError {
+                        message: format!(
+                            "streaming bytes emit: rule '{}' passes a bytes-returning recursive call as an ARGUMENT to '{}'; arguments are value positions — a bytes-SCC call may only appear in a tail bytes position (body / concat arg / if arm / match arm).",
+                            rule_name, name
+                        ),
+                    });
+                }
+            }
+            Ok(())
+        }
+        // Everything else is a value position. Any bytes-SCC reference
+        // buried inside is out of order by construction: refuse.
+        other => {
+            if expr_references_bytes_scc(other, bytes_scc) {
+                return Err(NativeError {
+                    message: format!(
+                        "streaming bytes emit: rule '{}' uses a bytes-returning recursive call in a non-tail position ({:?}); a bytes-SCC call may only appear as a direct element of the body / concat args / if arms / match arms.",
+                        rule_name,
+                        other
+                    ),
+                });
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Brick b3-native — true iff `e` contains, anywhere, a call to a
+/// bytes-returning SCC member. Mirrors `expr_references_text_scc`.
+fn expr_references_bytes_scc(e: &Expr, bytes_scc: &HashSet<&str>) -> bool {
+    let mut callees: Vec<String> = Vec::new();
+    collect_native_callees(e, &mut callees);
+    callees.iter().any(|c| bytes_scc.contains(c.as_str()))
+}
+
+/// Brick b3-native — whole-SCC bytes streaming check. Unlike the text
+/// path there is no legacy materializing fallback (recursive bytes never
+/// compiled before this brick), so the SCC ALWAYS streams; this function
+/// only validates the v1 shape and returns Err on any violation. Every
+/// bytes-output SCC member's body must pass `check_streaming_bytes_shape`;
+/// no let RHS may reference a bytes-SCC member (its bytes would stream at
+/// let-eval time, before the body's earlier output); a non-bytes member
+/// may not call a bytes-SCC member (the callee streams and returns no
+/// usable value).
+fn decide_streaming_bytes_mode(scc_rules: &[&Rule]) -> Result<(), NativeError> {
+    let bytes_scc: HashSet<&str> = scc_rules
+        .iter()
+        .filter(|r| r.output_ty == Type::Bytes)
+        .map(|r| r.name.as_str())
+        .collect();
+    for r in scc_rules {
+        for (bname, bexpr) in &r.logic.bindings {
+            if expr_references_bytes_scc(bexpr, &bytes_scc) {
+                return Err(NativeError {
+                    message: format!(
+                        "streaming bytes emit: rule '{}' let '{}' references a bytes-returning recursive rule; let RHSes are evaluated before the body, so the callee's bytes would stream out of order. Inline the call in a tail bytes position instead.",
+                        r.name, bname
+                    ),
+                });
+            }
+        }
+        if r.output_ty == Type::Bytes {
+            check_streaming_bytes_shape(&r.name, &r.logic.value, &bytes_scc)?;
+        } else if expr_references_bytes_scc(&r.logic.value, &bytes_scc) {
+            return Err(NativeError {
+                message: format!(
+                    "streaming bytes emit: non-bytes rule '{}' calls a bytes-returning recursive rule; in streaming mode a bytes-SCC member writes its bytes to stdout and returns no usable value, so only bytes-output rules may call it (in tail bytes positions).",
+                    r.name
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Phase B slice 4a.3 — collect every rule transitively reachable from
 /// `entry` via Call edges that is itself part of some cycle. Used when
 /// the program declares a `concept_group`: each recursive callee in the
@@ -1648,7 +2042,7 @@ fn collect_native_callees(expr: &Expr, out: &mut Vec<String>) {
             collect_native_callees(r, out);
         }
         Expr::Ok(i) | Expr::Err(i) | Expr::Not(i) | Expr::Neg(i) | Expr::Abs(i) | Expr::BitNot(i)
-        | Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i) | Expr::BitNot(i) => {
+        | Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i) | Expr::Le32(i) | Expr::Le64(i) => {
             collect_native_callees(i, out);
         }
         Expr::Min(a, b) | Expr::Max(a, b) | Expr::BitAnd(a, b) | Expr::BitOr(a, b) | Expr::BitXor(a, b) | Expr::Shl(a, b) | Expr::Shr(a, b) | Expr::StartsWith(a, b)
@@ -1708,7 +2102,7 @@ fn collect_native_callees(expr: &Expr, out: &mut Vec<String>) {
             collect_native_callees(request, out);
         }
         // Leaves
-        Expr::Number(_) | Expr::Text(_)
+        Expr::Number(_) | Expr::Text(_) | Expr::Bytes(_)
         | Expr::Ident(_) | Expr::Field(_, _) | Expr::Read(_) | Expr::NowUnix => {}
     }
 }
@@ -1776,7 +2170,7 @@ fn gather_transitive_callee_reads(
             gather_transitive_callee_reads(e, all_rules, visited, out);
         }
         Expr::Ok(i) | Expr::Err(i) | Expr::Not(i) | Expr::Neg(i) | Expr::Abs(i) | Expr::BitNot(i)
-        | Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i) | Expr::BitNot(i) => {
+        | Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i) | Expr::Le32(i) | Expr::Le64(i) => {
             gather_transitive_callee_reads(i, all_rules, visited, out);
         }
         Expr::Binary(_, l, r) => {
@@ -1843,7 +2237,7 @@ fn gather_transitive_callee_reads(
                 gather_transitive_callee_reads(&a.body, all_rules, visited, out);
             }
         }
-        Expr::Number(_) | Expr::Text(_) | Expr::Field(_, _) | Expr::Ident(_)
+        Expr::Number(_) | Expr::Text(_) | Expr::Bytes(_) | Expr::Field(_, _) | Expr::Ident(_)
         | Expr::Read(_) | Expr::NowUnix => {}
     }
 }
@@ -1965,7 +2359,7 @@ fn collect_fetch_names_native(expr: &Expr, out: &mut Vec<String>) {
             }
             collect_fetch_names_native(req, out);
         }
-        Expr::Number(_) | Expr::Text(_) | Expr::Ident(_) => {}
+        Expr::Number(_) | Expr::Text(_) | Expr::Bytes(_) | Expr::Ident(_) => {}
         Expr::Read(_) => {}
         Expr::Field(base, _) => collect_fetch_names_native(base, out),
         Expr::Binary(_, l, r) => {
@@ -2035,7 +2429,7 @@ fn collect_fetch_names_native(expr: &Expr, out: &mut Vec<String>) {
         // `length(<text_expr>)` — pure pass-through.
         Expr::Length(inner) => collect_fetch_names_native(inner, out),
         // `abs(<number_expr>)` — pure pass-through.
-        Expr::Abs(inner) | Expr::BitNot(inner) => collect_fetch_names_native(inner, out),
+        Expr::Abs(inner) | Expr::BitNot(inner) | Expr::Le32(inner) | Expr::Le64(inner) => collect_fetch_names_native(inner, out),
         // `min(a, b)` / `max(a, b)` — recurse into both children.
         Expr::Min(l, r) | Expr::Max(l, r) | Expr::BitAnd(l, r) | Expr::BitOr(l, r) | Expr::BitXor(l, r) | Expr::Shl(l, r) | Expr::Shr(l, r) => {
             collect_fetch_names_native(l, out);
@@ -2311,7 +2705,7 @@ fn emit_connection_fetch_sequence(
     fn first_fetch_for<'a>(expr: &'a Expr, name: &str) -> Option<&'a Expr> {
         match expr {
             Expr::Fetch(n, req) if n == name => Some(req),
-            Expr::Number(_) | Expr::Text(_) | Expr::Ident(_) | Expr::Read(_) => None,
+            Expr::Number(_) | Expr::Text(_) | Expr::Bytes(_) | Expr::Ident(_) | Expr::Read(_) => None,
             Expr::Field(b, _) => first_fetch_for(b, name),
             Expr::Binary(_, l, r) => first_fetch_for(l, name).or_else(|| first_fetch_for(r, name)),
             Expr::Not(i) | Expr::Neg(i) | Expr::Ok(i) | Expr::Err(i) => first_fetch_for(i, name),
@@ -2345,7 +2739,7 @@ fn emit_connection_fetch_sequence(
             // `length(<text_expr>)` — pass-through.
             Expr::Length(inner) => first_fetch_for(inner, name),
             // `abs(<number_expr>)` — pass-through.
-            Expr::Abs(inner) | Expr::BitNot(inner) => first_fetch_for(inner, name),
+            Expr::Abs(inner) | Expr::BitNot(inner) | Expr::Le32(inner) | Expr::Le64(inner) => first_fetch_for(inner, name),
             // `min(a, b)` / `max(a, b)` — recurse into both children.
             Expr::Min(l, r) | Expr::Max(l, r) | Expr::BitAnd(l, r) | Expr::BitOr(l, r) | Expr::BitXor(l, r) | Expr::Shl(l, r) | Expr::Shr(l, r) => {
                 first_fetch_for(l, name).or_else(|| first_fetch_for(r, name))
@@ -2565,12 +2959,12 @@ fn find_group_variant_construct_in_expr(
             }
             None
         }
-        Expr::Number(_) | Expr::Text(_) | Expr::Ident(_) | Expr::Read(_) | Expr::NowUnix => None,
+        Expr::Number(_) | Expr::Text(_) | Expr::Bytes(_) | Expr::Ident(_) | Expr::Read(_) | Expr::NowUnix => None,
         Expr::Field(b, _) => find_group_variant_construct_in_expr(b, group_concepts),
         Expr::Binary(_, l, r) => find_group_variant_construct_in_expr(l, group_concepts)
             .or_else(|| find_group_variant_construct_in_expr(r, group_concepts)),
         Expr::Not(i) | Expr::Neg(i) | Expr::Ok(i) | Expr::Err(i)
-        | Expr::Abs(i) | Expr::BitNot(i) | Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i) | Expr::BitNot(i) => {
+        | Expr::Abs(i) | Expr::BitNot(i) | Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i) | Expr::Le32(i) | Expr::Le64(i) => {
             find_group_variant_construct_in_expr(i, group_concepts)
         }
         Expr::If(c, t, e) => find_group_variant_construct_in_expr(c, group_concepts)
@@ -2672,12 +3066,12 @@ fn find_group_match_variant_in_expr(
             }
             None
         }
-        Expr::Number(_) | Expr::Text(_) | Expr::Ident(_) | Expr::Read(_) | Expr::NowUnix => None,
+        Expr::Number(_) | Expr::Text(_) | Expr::Bytes(_) | Expr::Ident(_) | Expr::Read(_) | Expr::NowUnix => None,
         Expr::Field(b, _) => find_group_match_variant_in_expr(b, group_concepts, rule_input_name, rule_input_ty, all_rules),
         Expr::Binary(_, l, r) => find_group_match_variant_in_expr(l, group_concepts, rule_input_name, rule_input_ty, all_rules)
             .or_else(|| find_group_match_variant_in_expr(r, group_concepts, rule_input_name, rule_input_ty, all_rules)),
         Expr::Not(i) | Expr::Neg(i) | Expr::Ok(i) | Expr::Err(i)
-        | Expr::Abs(i) | Expr::BitNot(i) | Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i) | Expr::BitNot(i) => {
+        | Expr::Abs(i) | Expr::BitNot(i) | Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i) | Expr::Le32(i) | Expr::Le64(i) => {
             find_group_match_variant_in_expr(i, group_concepts, rule_input_name, rule_input_ty, all_rules)
         }
         Expr::If(c, t, e) => find_group_match_variant_in_expr(c, group_concepts, rule_input_name, rule_input_ty, all_rules)
@@ -2761,6 +3155,15 @@ fn arena_field_offset(fields: &[(String, Type)], field_index: usize, group_names
     }
     off
 }
+
+/// Off-stack mmap arena threshold (2026-06-22). A concept_group program
+/// whose `arena_size = max_nodes * entry_size` exceeds this byte count
+/// allocates its runtime arena via anonymous `mmap` (so it can be >8 MB
+/// without exhausting the 8 MB stack). Small-group arenas (≤ this) stay
+/// stack-allocated, byte-for-byte identical to the pre-mmap path. The value
+/// is insensitive between ~20 KiB and 3 MB (every existing small-group
+/// example is ≤19 KiB; vexprparse's ~3 MB arena is the only one above).
+const ARENA_MMAP_THRESHOLD: i32 = 64 * 1024;
 
 fn compute_arena_entry_size(group: &ConceptGroup) -> i32 {
     let gnames: HashSet<&str> = group.concepts.iter().map(|c| c.name.as_str()).collect();
@@ -2900,8 +3303,24 @@ fn emit_record_loop_prologue<'a>(
         } else { 0 },
         None => 0,
     };
+    // Off-stack mmap arena (2026-06-22): decide per-program whether the
+    // arena lives on the stack (small groups, byte-identical to the
+    // pre-mmap path) or in an anonymous mmap region (large groups —
+    // vexprparse and any future self-hosting-scale group).
+    let use_mmap = arena_size > ARENA_MMAP_THRESHOLD;
     let arena_extra_bytes: i32 = if arena_size > 0 {
-        arena_size + 8 + tmp_slot_extra_bytes
+        if use_mmap {
+            // Off-stack: the frame holds only an 8-byte slot for the mmap
+            // base pointer plus the VariantConstruct tmp pool. The arena
+            // bytes AND the node_count counter live inside the mmap region
+            // (node_count at `[r11 + arena_size]`), NOT the stack frame —
+            // this is the correction to the spec's fatal split-brain bug.
+            8 + tmp_slot_extra_bytes
+        } else {
+            // On-stack (unchanged): arena bytes + 8-byte node_count counter
+            // + tmp pool, all in the frame.
+            arena_size + 8 + tmp_slot_extra_bytes
+        }
     } else {
         0
     };
@@ -3065,39 +3484,108 @@ fn emit_record_loop_prologue<'a>(
     // reserved but never written. r11 is set up so 4a.2's VariantConstruct
     // emit can land directly on it (when called immediately after the
     // prologue, before any syscall).
-    let (node_count_slot, arena_rbp_offset, tmp_slot_base): (i32, i32, i32) = if arena_size > 0 {
-        let nc_slot = post_now_next_slot - 8;
-        let arena_off = nc_slot - arena_size;
-        // Phase B slice 4a.2 — tmp slot pool sits BELOW the arena
-        // (deeper, more-negative addresses) so node_count_slot and
-        // arena_rbp_offset keep their slice-4a.1 layout. The first tmp
-        // is the i64 just below the arena's bottom byte.
-        let tmp_base = arena_off - 8;
-        // mov qword [rbp + nc_slot], 0  — initialize node_count to 0.
-        if nc_slot >= -128 {
-            code.extend_from_slice(&[0x48, 0xC7, 0x45]);
-            code.push(nc_slot as u8);
+    // Off-stack mmap arena: patch sites for the MAP_FAILED `jae` jump,
+    // drained into the ctx's arena_abort_patches so the epilogue's
+    // sys_exit(1) tail catches an allocation failure (fail-closed).
+    let mut mmap_fail_patches: Vec<usize> = Vec::new();
+    let (node_count_slot, arena_rbp_offset, tmp_slot_base, arena_base_slot): (i32, i32, i32, i32) = if arena_size > 0 {
+        if use_mmap {
+            // ─── Off-stack mmap arena ───────────────────────────────────
+            // The arena does NOT live in the rbp frame. The frame holds one
+            // 8-byte slot for the mmap base pointer (`arena_base_slot`),
+            // then the VariantConstruct tmp pool below it. node_count lives
+            // INSIDE the mmap region at `[r11 + arena_size]` — both the
+            // entry path and callable path address it identically, so the
+            // counter can never split-brain.
+            let base_slot = post_now_next_slot - 8;
+            let tmp_base = base_slot - 8;
+            // arena_bytes = arena_size + 8 (node_count), rounded up to a
+            // page (4096). The +8 keeps node_count inside the region.
+            let raw_bytes = (arena_size as i64) + 8;
+            let page_bytes = (raw_bytes + 4095) & !4095;
+            // mmap(NULL, page_bytes, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0)
+            //   rax=9 (sys_mmap)
+            code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x09, 0x00, 0x00, 0x00]); // mov rax, 9
+            //   rdi=0 (NULL addr): xor edi, edi
+            code.extend_from_slice(&[0x31, 0xFF]);
+            //   rsi=page_bytes: mov rsi, imm64
+            code.extend_from_slice(&[0x48, 0xBE]);
+            code.extend_from_slice(&page_bytes.to_le_bytes());
+            //   rdx=3 (PROT_READ|PROT_WRITE): mov edx, 3
+            code.extend_from_slice(&[0xBA, 0x03, 0x00, 0x00, 0x00]);
+            //   r10=0x22 (MAP_PRIVATE|MAP_ANONYMOUS) — kernel ABI arg4 in r10, NOT rcx
+            //   mov r10d, 0x22
+            code.extend_from_slice(&[0x41, 0xBA, 0x22, 0x00, 0x00, 0x00]);
+            //   r8=-1 (fd): mov r8, -1  (REX.WB 0x49, 0xC7, 0xC0, imm32 sign-ext)
+            code.extend_from_slice(&[0x49, 0xC7, 0xC0, 0xFF, 0xFF, 0xFF, 0xFF]);
+            //   r9=0 (offset): xor r9d, r9d
+            code.extend_from_slice(&[0x45, 0x31, 0xC9]);
+            //   syscall  (clobbers rcx, r11)
+            code.extend_from_slice(&[0x0F, 0x05]);
+            // MAP_FAILED check: mmap returns -errno in [-4095, -1] on error.
+            //   cmp rax, -4095  (REX.W 0x48, 0x3D, imm32 sign-ext)
+            code.extend_from_slice(&[0x48, 0x3D]);
+            code.extend_from_slice(&(-4095i32).to_le_bytes());
+            //   jae .arena_abort  (unsigned-above catches the whole error range)
+            code.push(0x0F);
+            code.push(0x83);
+            mmap_fail_patches.push(code.len());
             code.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
-        } else {
-            code.extend_from_slice(&[0x48, 0xC7, 0x85]);
-            code.extend_from_slice(&nc_slot.to_le_bytes());
+            // mov [rbp + base_slot], rax  — stash base for entry-level reloads.
+            if base_slot >= -128 {
+                code.extend_from_slice(&[0x48, 0x89, 0x45]);
+                code.push(base_slot as u8);
+            } else {
+                code.extend_from_slice(&[0x48, 0x89, 0x85]);
+                code.extend_from_slice(&base_slot.to_le_bytes());
+            }
+            // mov r11, rax  — r11 = arena base (replaces the lea). REX.WB.
+            code.extend_from_slice(&[0x49, 0x89, 0xC3]);
+            // init node_count to 0: mov qword [r11 + arena_size], 0
+            //   REX.WB 0x49, 0xC7, /0; ModRM 10.000.011 = 0x83 (disp32) since
+            //   arena_size is large; imm32=0.
+            code.extend_from_slice(&[0x49, 0xC7, 0x83]);
+            code.extend_from_slice(&arena_size.to_le_bytes());
             code.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
-        }
-        // lea r11, [rbp + arena_off]  — set r11 to the start of the arena.
-        // REX.WR (0x4C) + LEA opcode 0x8D + ModRM disp32 form (0x9D)
-        // when arena_off doesn't fit in disp8; disp8 form (0x5D) when
-        // it does. arena_off is highly negative (frame is large when
-        // arena is present), so disp32 is the realistic case.
-        if arena_off >= -128 {
-            code.extend_from_slice(&[0x4C, 0x8D, 0x5D]);
-            code.push(arena_off as u8);
+            // node_count_slot / arena_rbp_offset are NOT used for addressing
+            // under mmap (entry uses [r11 + arena_size], callables already
+            // do). Set to 0 so any accidental rbp-relative use is obvious.
+            (0, 0, tmp_base, base_slot)
         } else {
-            code.extend_from_slice(&[0x4C, 0x8D, 0x9D]);
-            code.extend_from_slice(&arena_off.to_le_bytes());
+            // ─── On-stack arena (unchanged — byte-for-byte identical) ────
+            let nc_slot = post_now_next_slot - 8;
+            let arena_off = nc_slot - arena_size;
+            // Phase B slice 4a.2 — tmp slot pool sits BELOW the arena
+            // (deeper, more-negative addresses) so node_count_slot and
+            // arena_rbp_offset keep their slice-4a.1 layout. The first tmp
+            // is the i64 just below the arena's bottom byte.
+            let tmp_base = arena_off - 8;
+            // mov qword [rbp + nc_slot], 0  — initialize node_count to 0.
+            if nc_slot >= -128 {
+                code.extend_from_slice(&[0x48, 0xC7, 0x45]);
+                code.push(nc_slot as u8);
+                code.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+            } else {
+                code.extend_from_slice(&[0x48, 0xC7, 0x85]);
+                code.extend_from_slice(&nc_slot.to_le_bytes());
+                code.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+            }
+            // lea r11, [rbp + arena_off]  — set r11 to the start of the arena.
+            // REX.WR (0x4C) + LEA opcode 0x8D + ModRM disp32 form (0x9D)
+            // when arena_off doesn't fit in disp8; disp8 form (0x5D) when
+            // it does. arena_off is highly negative (frame is large when
+            // arena is present), so disp32 is the realistic case.
+            if arena_off >= -128 {
+                code.extend_from_slice(&[0x4C, 0x8D, 0x5D]);
+                code.push(arena_off as u8);
+            } else {
+                code.extend_from_slice(&[0x4C, 0x8D, 0x9D]);
+                code.extend_from_slice(&arena_off.to_le_bytes());
+            }
+            (nc_slot, arena_off, tmp_base, 0)
         }
-        (nc_slot, arena_off, tmp_base)
     } else {
-        (0, 0, 0)
+        (0, 0, 0, 0)
     };
 
     let loop_top = code.len();
@@ -3319,12 +3807,16 @@ fn emit_record_loop_prologue<'a>(
         arena_rbp_offset,
         node_count_slot,
         entry_size: arena_entry_size,
-        arena_abort_patches: Vec::new(),
+        // Off-stack mmap arena: route the MAP_FAILED jae through the shared
+        // sys_exit(1) arena abort tail (fail-closed on allocation failure).
+        arena_abort_patches: mmap_fail_patches,
         tmp_slot_base,
         variant_tags,
         variant_fields,
         group_concept_names: group_concept_names_owned,
         arena_max_nodes,
+        use_mmap,
+        arena_base_slot,
     })
 }
 
@@ -3504,9 +3996,11 @@ fn emit_self_recursive_program<'a>(
     all_connections: &HashMap<&str, &'a Connection>,
     concept_group: Option<&'a ConceptGroup>,
     all_concepts: &[&'a Concept],
+    streaming: bool,
 ) -> Result<Vec<u8>, NativeError> {
     let is_bool = entry_rule.output_ty == Type::Bool;
     let is_text = entry_rule.output_ty == Type::Text;
+    let is_bytes = entry_rule.output_ty == Type::Bytes;
     let nslots: usize = concept.fields.iter()
         .map(|f| if matches!(f.ty, Type::Text) { 2usize } else { 1 })
         .sum();
@@ -3577,12 +4071,12 @@ fn emit_self_recursive_program<'a>(
     let placeholder_labels: HashMap<&str, i32> = scc_rules.iter()
         .map(|r| (r.name.as_str(), 0_i32))
         .collect();
-    let placeholder_ctx = SelfCallCtx { labels: &placeholder_labels, arities: &arities, struct_layouts: &struct_layouts };
+    let placeholder_ctx = SelfCallCtx { labels: &placeholder_labels, arities: &arities, struct_layouts: &struct_layouts, param_in_rbx: None };
     let mut sizes: Vec<usize> = Vec::with_capacity(scc_rules.len());
     for &r in scc_rules {
         let mut scratch = Vec::new();
         let r_concept = lookup_concept(r)?;
-        emit_callable_into(&mut scratch, r, r_concept, all_rules, placeholder_ctx, cg)?;
+        emit_callable_into(&mut scratch, r, r_concept, all_rules, placeholder_ctx, cg, streaming)?;
         sizes.push(scratch.len());
     }
     let leading_size = code.len(); // = 5
@@ -3592,12 +4086,12 @@ fn emit_self_recursive_program<'a>(
         labels.insert(r.name.as_str(), next_offset);
         next_offset += sizes[i] as i32;
     }
-    let final_ctx = SelfCallCtx { labels: &labels, arities: &arities, struct_layouts: &struct_layouts };
+    let final_ctx = SelfCallCtx { labels: &labels, arities: &arities, struct_layouts: &struct_layouts, param_in_rbx: None };
 
     // Pass 2: emit each callable with real labels.
     for &r in scc_rules {
         let r_concept = lookup_concept(r)?;
-        emit_callable_into(&mut code, r, r_concept, all_rules, final_ctx, cg)?;
+        emit_callable_into(&mut code, r, r_concept, all_rules, final_ctx, cg, streaming)?;
     }
 
     // Patch the leading jmp to skip past all callables.
@@ -3708,19 +4202,37 @@ fn emit_self_recursive_program<'a>(
         code.extend_from_slice(&[0x01, 0x00, 0x00, 0x00]);
         let ap_pos = code.len();
         code[ap_patch] = (ap_pos - ap_patch - 1) as u8;
+    } else if is_bytes {
+        // Brick b3-native: streaming bytes. The callable already wrote
+        // every machine-code byte to fd 1 IN ORDER during the walk; the
+        // (rax, rdx) pair is meaningless and must NOT be written.
+        // Critically, emit NO trailing newline — raw machine code must be
+        // byte-exact (a stray 0x0a would corrupt the emitted program).
+        // (A recursive bytes entry always streams; there is no
+        // materializing fallback, so this branch needs no `if streaming`.)
     } else if is_text {
-        // Write (rax, rdx) to stdout via sys_write(1, rax, rdx),
-        // then a newline. The callable left ptr in rax, len in rdx.
-        // mov rsi, rax — buffer
-        code.extend_from_slice(&[0x48, 0x89, 0xC6]);
-        // mov rdi, 1 — fd=stdout
-        code.extend_from_slice(&[0x48, 0xC7, 0xC7, 0x01, 0x00, 0x00, 0x00]);
-        // mov rax, 1 — sys_write
-        code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x01, 0x00, 0x00, 0x00]);
-        // syscall
-        code.extend_from_slice(&[0x0F, 0x05]);
-        // newline
-        emit_write_newline(&mut code, 1);
+        if streaming {
+            // Streaming mode: the callable already wrote every byte to
+            // fd 1 IN ORDER during the tree walk; the (rax, rdx) pair it
+            // left behind is meaningless and must NOT be written (it
+            // would re-emit the last leaf's bytes, or worse). Emit just
+            // the trailing newline so the output keeps the same
+            // one-line-per-record convention as every text driver.
+            emit_write_newline(&mut code, 1);
+        } else {
+            // Write (rax, rdx) to stdout via sys_write(1, rax, rdx),
+            // then a newline. The callable left ptr in rax, len in rdx.
+            // mov rsi, rax — buffer
+            code.extend_from_slice(&[0x48, 0x89, 0xC6]);
+            // mov rdi, 1 — fd=stdout
+            code.extend_from_slice(&[0x48, 0xC7, 0xC7, 0x01, 0x00, 0x00, 0x00]);
+            // mov rax, 1 — sys_write
+            code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x01, 0x00, 0x00, 0x00]);
+            // syscall
+            code.extend_from_slice(&[0x0F, 0x05]);
+            // newline
+            emit_write_newline(&mut code, 1);
+        }
     } else {
         emit_itoa_inline(&mut code);
     }
@@ -3749,6 +4261,53 @@ fn emit_self_recursive_program<'a>(
 /// The `self_call` ctx routes any Call to a rule in `labels` to a real
 /// `call <target_offset>` instead of inlining. For slice 5.4 the labels
 /// map contains every SCC member, so cross-rule calls resolve correctly.
+/// Register-allocation brick A2 — conservative whitelist: does this expression
+/// tree consist ONLY of shapes that compile to pure number/bool arithmetic
+/// which never touches rbx (the concat write pointer, Phase 1B) or r11 (the
+/// arena base, Phase B)? A `true` result means the input parameter can safely
+/// live in rbx across the whole body. Anything not explicitly listed → `false`
+/// (the slot path stays). The list mirrors the scalar arithmetic surface a
+/// recursive number/bool rule body can use: literals, the single input field,
+/// arithmetic / comparison / boolean ops, branches, and self-calls.
+fn body_is_pure_scalar_arith(expr: &Expr) -> bool {
+    match expr {
+        Expr::Number(_) => true,
+        // Field access on the input ident — the read site is what A2 redirects.
+        Expr::Field(base, _) => matches!(base.as_ref(), Expr::Ident(_)),
+        Expr::Binary(_, l, r) => body_is_pure_scalar_arith(l) && body_is_pure_scalar_arith(r),
+        Expr::If(c, t, e) => {
+            body_is_pure_scalar_arith(c)
+                && body_is_pure_scalar_arith(t)
+                && body_is_pure_scalar_arith(e)
+        }
+        Expr::Not(x) | Expr::Neg(x) | Expr::Abs(x) | Expr::BitNot(x) => {
+            body_is_pure_scalar_arith(x)
+        }
+        Expr::Min(a, b)
+        | Expr::Max(a, b)
+        | Expr::BitAnd(a, b)
+        | Expr::BitOr(a, b)
+        | Expr::BitXor(a, b)
+        | Expr::Shl(a, b)
+        | Expr::Shr(a, b) => {
+            body_is_pure_scalar_arith(a) && body_is_pure_scalar_arith(b)
+        }
+        // Recursive call: the args are evaluated into a fresh value (rax) and
+        // marshalled into rdi; rbx (our param) survives because the callee
+        // preserves it. Both the pass-through `Ident(input)` and the
+        // `Record(concept, { f: expr })` constructor shapes are fine as long
+        // as every constructor field expression is itself pure-scalar.
+        Expr::Call(_, args) => args.iter().all(body_is_pure_scalar_arith),
+        Expr::Record(_, fields) => fields.iter().all(|(_, e)| body_is_pure_scalar_arith(e)),
+        // The recursive-call argument is an Ident(input) pass-through.
+        Expr::Ident(_) => true,
+        // Everything else (text, bytes, concat, read, fetch, group/variant,
+        // result, collection, quantifier, fold, parse_int, now_unix, json,
+        // string/byte primitives, …) → NOT eligible. Stay on the slot path.
+        _ => false,
+    }
+}
+
 fn emit_callable_into<'a>(
     code: &mut Vec<u8>,
     rule: &'a Rule,
@@ -3756,8 +4315,10 @@ fn emit_callable_into<'a>(
     all_rules: &HashMap<&str, &Rule>,
     self_call: SelfCallCtx<'_>,
     concept_group: Option<&'a ConceptGroup>,
+    streaming: bool,
 ) -> Result<(), NativeError> {
     let is_text = rule.output_ty == Type::Text;
+    let is_bytes = rule.output_ty == Type::Bytes;
     // Phase B slice 4a.3: group-concept input has no `fields` (sum
     // type). The callable's ABI degenerates to single i64 in rdi
     // (the arena INDEX), spilled to `[rbp - 8]`. The input name (e.g.
@@ -3821,9 +4382,54 @@ fn emit_callable_into<'a>(
     let total_slots = nfields + n_let_slots + (max_arm_binder_slots as usize) + (tmp_slots as usize);
     let frame_bytes = (total_slots * 8) as i32;
 
+    // Register-allocation brick A2 — decide whether this callable can keep its
+    // single input parameter in rbx (callee-saved) for the whole body instead
+    // of spilling to `[rbp - 8]` and reloading on every field read. ALL must
+    // hold (any failure ⇒ slot path, byte-for-byte the pre-A2 emit):
+    //   - single scalar field input (rdi = value, not the multi-field
+    //     pointer-in-rdi struct, not a group-concept arena index),
+    //   - the field is Number/Bool (not Text — text takes 2 slots),
+    //   - no let bindings (their frame slots would interact with dropping the
+    //     `sub rsp`),
+    //   - Number/Bool output (text/bytes bodies use rbx/r11 paths),
+    //   - no concept_group (r11 arena), and
+    //   - a pure number/bool arithmetic body (nothing claiming rbx or r11).
+    // When eligible the single slot is unused (no lets, param in rbx), so we
+    // drop the `sub rsp, 8`; `push rbp` + `push rbx` already keeps rsp aligned.
+    let single_scalar_field = !is_group_input
+        && !is_multi_field
+        && concept.fields.len() == 1
+        && matches!(concept.fields[0].ty, Type::Number | Type::Bool);
+    let scalar_output = !is_text && !is_bytes;
+    let qualifies_rbx = single_scalar_field
+        && rule.logic.bindings.is_empty()
+        && scalar_output
+        && concept_group.is_none()
+        && body_is_pure_scalar_arith(&rule.logic.value);
+
+    // Register-allocation brick A4: within a qualifying callable, does the body
+    // have at least one binop site that will take the r15 fast path? Only then
+    // do we pay the `push r15` / `pop r15` prologue/epilogue cost.
+    let qualifies_r15 = qualifies_rbx && body_uses_r15_save(&rule.logic.value);
+
     // Prologue.
     code.push(0x55);                                       // push rbp
     code.extend_from_slice(&[0x48, 0x89, 0xE5]);           // mov rbp, rsp
+    if qualifies_rbx {
+        // A2 path: preserve the caller's rbx (callee-saved), then load the
+        // param into rbx. No frame slot needed (single param, no lets), so no
+        // `sub rsp`. Stack: push rbp (8) + push rbx (8) = 16, aligned.
+        code.push(0x53);                                   // push rbx
+        if qualifies_r15 {
+            // A4: also preserve r15 (callee-saved) — the binop emitter uses it
+            // to hold a binop's LHS across a sibling recursive call without a
+            // stack spill. Pushed AFTER rbx; the epilogue pops it FIRST (exact
+            // reverse order). Stack now rbp, rbx, r15 (24 bytes pushed) — see
+            // the epilogue's alignment note.
+            code.extend_from_slice(&[0x41, 0x57]);         // push r15
+        }
+        code.extend_from_slice(&[0x48, 0x89, 0xFB]);       // mov rbx, rdi
+    } else {
     if frame_bytes <= 127 {
         code.extend_from_slice(&[0x48, 0x83, 0xEC]);
         code.push(frame_bytes as u8);
@@ -3867,6 +4473,7 @@ fn emit_callable_into<'a>(
             slot_idx += n_copies;
         }
     }
+    } // end `else` of qualifies_rbx prologue branch
 
     // Build offsets / field_ranges maps for the body.
     let mut callable_offsets: HashMap<&str, i32> = HashMap::new();
@@ -3893,6 +4500,63 @@ fn emit_callable_into<'a>(
             }
         }
     }
+
+    // Phase B slice 4a.3 — build ArenaCtx for the callable BEFORE the let
+    // loop. A let RHS may itself contain a `VariantConstruct` of a group
+    // concept (e.g. `let env = build_env(Arg { acc: Env::ENil })`); the
+    // number-let eval below must therefore see the arena context, exactly
+    // like the body emit does. The arena write inside a callable is
+    // rbp-independent (it addresses the arena and node_count via r11, set
+    // up once in _start and preserved across call/ret), so emitting a
+    // construct from a let RHS is byte-identical to emitting it from the
+    // body. Building the ctx here (instead of after the let loop) is the
+    // only change required.
+    let arena_holder: Option<(HashMap<&str, u8>, HashMap<&str, Vec<(String, Type)>>, HashSet<&str>, u32, i32, i32)>;
+    if let Some(g) = concept_group {
+        let mut tags: HashMap<&str, u8> = HashMap::new();
+        let mut fields_map: HashMap<&str, Vec<(String, Type)>> = HashMap::new();
+        let mut tag_idx: u8 = 0;
+        for c in &g.concepts {
+            for v in &c.variants {
+                tags.insert(v.name.as_str(), tag_idx);
+                fields_map.insert(
+                    v.name.as_str(),
+                    v.fields.iter().map(|f| (f.name.clone(), f.ty.clone())).collect(),
+                );
+                tag_idx += 1;
+            }
+        }
+        let gnames: HashSet<&str> = g.concepts.iter().map(|c| c.name.as_str()).collect();
+        let entry_size = compute_arena_entry_size(g);
+        arena_holder = Some((tags, fields_map, gnames, g.max_nodes, entry_size, tmp_slots));
+    } else {
+        arena_holder = None;
+    }
+    // Construct ArenaCtx for the callable. The in-callable shape uses an
+    // i32 sentinel for arena_rbp_offset that tells VariantConstruct to
+    // TRUST r11 instead of reloading from the (now-stale) outer rbp. The
+    // MatchVariant arena dispatch uses entry_size + tag/field maps directly.
+    let arena_ctx_owned = arena_holder.as_ref().map(|(tags, fields_map, gnames, max_nodes, entry_size, tmp_slots_val)| {
+        ArenaCtx {
+            arena_rbp_offset: i32::MAX,
+            node_count_slot: 0,
+            entry_size: *entry_size,
+            max_nodes: *max_nodes,
+            tmp_slot_base: tmp_slot_base_local,
+            variant_tags: tags,
+            variant_fields: fields_map,
+            group_concept_names: gnames.clone(),
+            arena_abort_patches: std::cell::RefCell::new(Vec::new()),
+            in_callable: true,
+            callable_node_count_seed: *tmp_slots_val,
+            // Callables address node_count via [r11 + arena_size] and trust
+            // r11 across call/ret — they never reach the entry frame's
+            // arena_base_slot, so these are inert in the callable path.
+            use_mmap: false,
+            arena_base_slot: 0,
+        }
+    });
+    let arena_ctx_ref = arena_ctx_owned.as_ref();
 
     // Evaluate let bindings into successive rbp slots after input fields.
     {
@@ -3946,11 +4610,14 @@ fn emit_callable_into<'a>(
                 }
                 let_slot_idx += 2;
             } else {
-                // Number let: evaluate → rax → store.
+                // Number let: evaluate → rax → store. Pass arena_ctx_ref so
+                // a VariantConstruct of a group concept inside the let RHS
+                // (e.g. `let env = build_env(Arg { acc: Env::ENil })`) reaches
+                // the arena path instead of being refused for lack of a group.
                 emit_eval_expr(
                     code, expr, &rule.input_name, &callable_offsets,
                     all_rules, &callable_field_ranges, &callable_text_bindings,
-                    Some(self_call), None,
+                    Some(self_call), arena_ctx_ref,
                 )?;
                 let slot = -(((let_slot_idx) as i32 + 1) * 8);
                 if slot >= -128 {
@@ -3966,73 +4633,69 @@ fn emit_callable_into<'a>(
         }
     }
 
-    // Phase B slice 4a.3 — build ArenaCtx for the callable's body when
-    // a concept_group is declared. The arena's rbp_offset is invalid
-    // inside the callable (different rbp); the in-callable variant
-    // skips the reload and TRUSTS r11 (caller set it up; no syscalls
-    // in recursive bodies). Tag/field maps come from the group.
-    let arena_holder: Option<(HashMap<&str, u8>, HashMap<&str, Vec<(String, Type)>>, HashSet<&str>, u32, i32, i32)>;
-    if let Some(g) = concept_group {
-        let mut tags: HashMap<&str, u8> = HashMap::new();
-        let mut fields_map: HashMap<&str, Vec<(String, Type)>> = HashMap::new();
-        let mut tag_idx: u8 = 0;
-        for c in &g.concepts {
-            for v in &c.variants {
-                tags.insert(v.name.as_str(), tag_idx);
-                fields_map.insert(
-                    v.name.as_str(),
-                    v.fields.iter().map(|f| (f.name.clone(), f.ty.clone())).collect(),
-                );
-                tag_idx += 1;
-            }
-        }
-        let gnames: HashSet<&str> = g.concepts.iter().map(|c| c.name.as_str()).collect();
-        let entry_size = compute_arena_entry_size(g);
-        arena_holder = Some((tags, fields_map, gnames, g.max_nodes, entry_size, tmp_slots));
-    } else {
-        arena_holder = None;
-    }
-
     // Body.
-    if is_text {
-        // Slice 4a.3 doesn't extend the text-recursive path; same as A.5.2.
-        emit_recursive_text_body(
+    if is_bytes {
+        // Brick b3-native: streaming bytes body — the recursive bytes
+        // analogue of emit_streaming_text_body. WRITES raw machine-code
+        // bytes to fd 1 in order during the walk; the (rax, rdx) return
+        // pair is ignored. arena_ctx is threaded so MatchVariant
+        // dispatch (x86_expr matches on the Ast variant) reaches the
+        // arena. A recursive bytes rule ALWAYS streams (no materializing
+        // fallback), so no `if streaming` guard is needed here.
+        emit_streaming_bytes_body(
             code, &rule.logic.value, &rule.input_name, &callable_offsets,
-            all_rules, &callable_field_ranges, &callable_text_bindings, self_call,
+            all_rules, &callable_field_ranges, &callable_text_bindings,
+            self_call, arena_ctx_ref,
         )?;
+    } else if is_text {
+        if streaming {
+            // Streaming text emit (self-hosting emitter slice): the body
+            // WRITES its bytes to fd 1 in order during the walk instead
+            // of materializing a (rax, rdx) pair. arena_ctx is threaded
+            // so MatchVariant dispatch (and any VariantConstruct in a
+            // number subexpression) reaches the arena; every streamed
+            // write push/pops r11 so the in-callable "trust r11" arena
+            // invariant survives the syscalls.
+            emit_streaming_text_body(
+                code, &rule.logic.value, &rule.input_name, &callable_offsets,
+                all_rules, &callable_field_ranges, &callable_text_bindings,
+                self_call, arena_ctx_ref,
+            )?;
+        } else {
+            // Slice 4a.3 doesn't extend the text-recursive path; same as A.5.2.
+            emit_recursive_text_body(
+                code, &rule.logic.value, &rule.input_name, &callable_offsets,
+                all_rules, &callable_field_ranges, &callable_text_bindings, self_call,
+            )?;
+        }
     } else {
-        // Construct ArenaCtx for the body. The in-callable shape uses
-        // an i32 sentinel for arena_rbp_offset that tells VariantConstruct
-        // to TRUST r11 instead of reloading from the (now-stale) outer
-        // rbp. The MatchVariant arena dispatch uses entry_size + tag/
-        // field maps directly.
-        let arena_ctx_owned = arena_holder.as_ref().map(|(tags, fields_map, gnames, max_nodes, entry_size, tmp_slots_val)| {
-            ArenaCtx {
-                arena_rbp_offset: i32::MAX,
-                node_count_slot: 0,
-                entry_size: *entry_size,
-                max_nodes: *max_nodes,
-                tmp_slot_base: tmp_slot_base_local,
-                variant_tags: tags,
-                variant_fields: fields_map,
-                group_concept_names: gnames.clone(),
-                arena_abort_patches: std::cell::RefCell::new(Vec::new()),
-                in_callable: true,
-                callable_node_count_seed: *tmp_slots_val,
-            }
-        });
-        let arena_ctx_ref = arena_ctx_owned.as_ref();
+        // Body emit reuses the SAME arena_ctx built before the let loop, so
+        // arena_abort_patches accumulated by let-RHS constructs AND body
+        // constructs all converge on the single inline abort tail below.
+        // A2: when the param lives in rbx, hand the body a ctx that names the
+        // field so `Field(Ident(input), field)` reads emit `mov rax, rbx`.
+        let body_self_call = if qualifies_rbx {
+            let mut sc = self_call;
+            sc.param_in_rbx = Some(concept.fields[0].name.as_str());
+            sc
+        } else {
+            self_call
+        };
         emit_eval_expr(
             code, &rule.logic.value, &rule.input_name, &callable_offsets,
             all_rules, &callable_field_ranges, &callable_text_bindings,
-            Some(self_call),
+            Some(body_self_call),
             arena_ctx_ref,
         )?;
-        // Slice 4a.3: arena_abort_patches accumulated inside the callable
-        // must be resolved to a sys_exit(1) target. The callable doesn't
-        // own a per-rule abort label; we emit one inline (jmp-over) so
-        // the abort path is local to this callable. Cost: ~12 bytes only
-        // when at least one VariantConstruct site exists.
+    }
+    // Slice 4a.3: arena_abort_patches accumulated inside the callable
+    // (from let-RHS constructs and/or body constructs) must be resolved to
+    // a sys_exit(1) target. The callable doesn't own a per-rule abort
+    // label; we emit one inline (jmp-over) so the abort path is local to
+    // this callable. Cost: ~12 bytes only when at least one
+    // VariantConstruct site exists. The borrow `arena_ctx_ref` ends here so
+    // we can move the owned ctx out and drain its RefCell of patch sites.
+    {
         if let Some(ac) = arena_ctx_owned {
             let patches = ac.arena_abort_patches.into_inner();
             if !patches.is_empty() {
@@ -4058,9 +4721,30 @@ fn emit_callable_into<'a>(
     }
 
     // Epilogue.
-    code.extend_from_slice(&[0x48, 0x89, 0xEC]);           // mov rsp, rbp
-    code.push(0x5D);                                       // pop rbp
-    code.push(0xC3);                                       // ret
+    if qualifies_rbx {
+        // A2: the qualifying frame is `push rbp ; mov rbp,rsp ; push rbx`
+        // (no `sub rsp` — single param in rbx, no lets). The body's only
+        // stack motion is balanced push/pop pairs (e.g. the binop lhs spill
+        // around a recursive call), so at this point rsp points exactly at
+        // the saved rbx. Restore it directly: `pop rbx ; pop rbp ; ret`.
+        // (A `mov rsp, rbp` here would be WRONG — it would skip past the
+        // pushed rbx, so the pops would unwind the saved rbp and the return
+        // address into the wrong registers.)
+        //
+        // A4: when r15 was pushed (prologue order rbp, rbx, r15), it MUST be
+        // popped FIRST — exact reverse order — or rsp would be off by 8 and the
+        // following pops would land in the wrong registers (segfault on ret).
+        if qualifies_r15 {
+            code.extend_from_slice(&[0x41, 0x5F]);          // pop r15
+        }
+        code.push(0x5B);                                   // pop rbx
+        code.push(0x5D);                                   // pop rbp
+        code.push(0xC3);                                   // ret
+    } else {
+        code.extend_from_slice(&[0x48, 0x89, 0xEC]);       // mov rsp, rbp
+        code.push(0x5D);                                   // pop rbp
+        code.push(0xC3);                                   // ret
+    }
     Ok(())
 }
 
@@ -4081,11 +4765,11 @@ fn count_max_match_arm_binders(expr: &Expr) -> u32 {
                     walk(&a.body, m);
                 }
             }
-            Expr::Number(_) | Expr::Text(_) | Expr::Ident(_) | Expr::Read(_) | Expr::NowUnix => {}
+            Expr::Number(_) | Expr::Text(_) | Expr::Bytes(_) | Expr::Ident(_) | Expr::Read(_) | Expr::NowUnix => {}
             Expr::Field(b, _) => walk(b, m),
             Expr::Binary(_, l, r) => { walk(l, m); walk(r, m); }
             Expr::Not(i) | Expr::Neg(i) | Expr::Ok(i) | Expr::Err(i)
-            | Expr::Abs(i) | Expr::BitNot(i) | Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i) => walk(i, m),
+            | Expr::Abs(i) | Expr::BitNot(i) | Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i) | Expr::Le32(i) | Expr::Le64(i) => walk(i, m),
             Expr::If(c, t, ee) => { walk(c, m); walk(t, m); walk(ee, m); }
             Expr::Call(_, args) | Expr::Concat(args) => { for a in args { walk(a, m); } }
             Expr::Quantifier(_, c, _, body) => { walk(c, m); walk(body, m); }
@@ -4118,24 +4802,33 @@ fn count_max_match_arm_binder_slots(expr: &Expr, concept_group: Option<&ConceptG
         match e {
             Expr::MatchVariant(_, arms) => {
                 for a in arms {
+                    // Search ALL concepts in the group for the matched
+                    // variant, not just the first. A multi-concept group
+                    // (e.g. Token + TokenList) puts a variant like
+                    // TokenList::Cons in a NON-first concept; searching only
+                    // the first concept misses it and falls back to a binder
+                    // COUNT, which mis-sizes the frame when an arm binds a
+                    // TEXT payload (text binder = 2 slots) in a non-first
+                    // concept. See docs/group-field-abi-design.md §2.
                     let slots: u32 = if let Some(g) = cg {
-                        if let Some(concept) = g.concepts.first() {
-                            if let Some(variant) = concept.variants.iter().find(|v| v.name == a.variant_name) {
-                                variant.fields.iter().take(a.binders.len())
-                                    .map(|f| if matches!(f.ty, Type::Text) { 2u32 } else { 1u32 })
-                                    .sum()
-                            } else { a.binders.len() as u32 }
+                        let found = g.concepts.iter()
+                            .flat_map(|c| c.variants.iter())
+                            .find(|v| v.name == a.variant_name);
+                        if let Some(variant) = found {
+                            variant.fields.iter().take(a.binders.len())
+                                .map(|f| if matches!(f.ty, Type::Text) { 2u32 } else { 1u32 })
+                                .sum()
                         } else { a.binders.len() as u32 }
                     } else { a.binders.len() as u32 };
                     if slots > *m { *m = slots; }
                     walk(&a.body, m, cg);
                 }
             }
-            Expr::Number(_) | Expr::Text(_) | Expr::Ident(_) | Expr::Read(_) | Expr::NowUnix => {}
+            Expr::Number(_) | Expr::Text(_) | Expr::Bytes(_) | Expr::Ident(_) | Expr::Read(_) | Expr::NowUnix => {}
             Expr::Field(b, _) => walk(b, m, cg),
             Expr::Binary(_, l, r) => { walk(l, m, cg); walk(r, m, cg); }
             Expr::Not(i) | Expr::Neg(i) | Expr::Ok(i) | Expr::Err(i)
-            | Expr::Abs(i) | Expr::BitNot(i) | Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i) | Expr::BitNot(i) => walk(i, m, cg),
+            | Expr::Abs(i) | Expr::BitNot(i) | Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i) | Expr::Le32(i) | Expr::Le64(i) => walk(i, m, cg),
             Expr::If(c, t, ee) => { walk(c, m, cg); walk(t, m, cg); walk(ee, m, cg); }
             Expr::Call(_, args) | Expr::Concat(args) => { for a in args { walk(a, m, cg); } }
             Expr::Quantifier(_, c, _, body) => { walk(c, m, cg); walk(body, m, cg); }
@@ -4163,11 +4856,11 @@ fn count_max_match_arm_binder_slots(expr: &Expr, concept_group: Option<&ConceptG
 fn body_contains_variant_construct(expr: &Expr) -> bool {
     match expr {
         Expr::VariantConstruct(_, _, _) => true,
-        Expr::Number(_) | Expr::Text(_) | Expr::Ident(_) | Expr::Read(_) | Expr::NowUnix => false,
+        Expr::Number(_) | Expr::Text(_) | Expr::Bytes(_) | Expr::Ident(_) | Expr::Read(_) | Expr::NowUnix => false,
         Expr::Field(b, _) => body_contains_variant_construct(b),
         Expr::Binary(_, l, r) => body_contains_variant_construct(l) || body_contains_variant_construct(r),
         Expr::Not(i) | Expr::Neg(i) | Expr::Ok(i) | Expr::Err(i)
-        | Expr::Abs(i) | Expr::BitNot(i) | Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i) | Expr::BitNot(i) => {
+        | Expr::Abs(i) | Expr::BitNot(i) | Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i) | Expr::Le32(i) | Expr::Le64(i) => {
             body_contains_variant_construct(i)
         }
         Expr::If(c, t, e) => body_contains_variant_construct(c) || body_contains_variant_construct(t) || body_contains_variant_construct(e),
@@ -4318,10 +5011,20 @@ fn emit_recursive_text_body(
             }
             match &args[0] {
                 Expr::Ident(n) if n == input_name => {
+                    // DETERMINISM: see the matching fix in emit_eval_expr's Call
+                    // arm. `offsets.values().next()` picked an arbitrary HashMap
+                    // entry (nondeterministic; wrong when match-arm `__bind_*`
+                    // binders coexist). The single input field is the
+                    // least-negative (max) NON-binder slot.
                     let field_offset = if let Some(&o) = offsets.get(input_name) {
                         o
                     } else {
-                        *offsets.values().next().unwrap()
+                        offsets
+                            .iter()
+                            .filter(|(k, _)| !k.starts_with("__bind_"))
+                            .map(|(_, v)| *v)
+                            .max()
+                            .expect("single-field pass-through: no input field slot in offsets")
                     };
                     if field_offset >= -128 {
                         code.extend_from_slice(&[0x48, 0x8B, 0x7D]);
@@ -4457,6 +5160,435 @@ fn emit_recursive_text_body(
     }
 }
 
+/// Streaming text emit — write(1, rsi, rdx) with the r11 guard.
+///
+/// Inside a recursive callable the arena ctx TRUSTS r11 (the sentinel
+/// `arena_rbp_offset == i32::MAX` means "do NOT reload from rbp — the
+/// outer prologue's r11 is still live"). That invariant held because no
+/// syscall ever ran inside a callable; Linux syscalls clobber rcx and
+/// r11 by ABI. A streaming body exists to make write syscalls, so EVERY
+/// streamed write must preserve r11 across the syscall — push/pop is
+/// 4 bytes total and harmless when no concept_group is declared, so we
+/// guard unconditionally rather than thread a "has group" flag.
+///
+/// Sequence (20 bytes, size-stable across the two-pass label resolution):
+///   push r11            ; 41 53
+///   mov rdi, 1          ; 48 C7 C7 01 00 00 00   fd = stdout
+///   mov rax, 1          ; 48 C7 C0 01 00 00 00   sys_write
+///   syscall             ; 0F 05                  clobbers rcx, r11
+///   pop r11             ; 41 5B
+fn emit_streamed_write_rsi_rdx(code: &mut Vec<u8>) {
+    code.extend_from_slice(&[0x41, 0x53]);                         // push r11
+    code.extend_from_slice(&[0x48, 0xC7, 0xC7, 0x01, 0x00, 0x00, 0x00]); // mov rdi, 1
+    code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x01, 0x00, 0x00, 0x00]); // mov rax, 1
+    code.extend_from_slice(&[0x0F, 0x05]);                         // syscall
+    code.extend_from_slice(&[0x41, 0x5B]);                         // pop r11
+}
+
+/// Streaming text emit — load a BoundText (ptr_slot, len_slot) pair into
+/// (rsi, rdx) ready for emit_streamed_write_rsi_rdx.
+fn emit_load_rsi_rdx_from_slots(code: &mut Vec<u8>, ptr_slot: i32, len_slot: i32) {
+    // mov rsi, [rbp + ptr_slot]
+    if ptr_slot >= -128 {
+        code.extend_from_slice(&[0x48, 0x8B, 0x75]);
+        code.push(ptr_slot as u8);
+    } else {
+        code.extend_from_slice(&[0x48, 0x8B, 0xB5]);
+        code.extend_from_slice(&ptr_slot.to_le_bytes());
+    }
+    // mov rdx, [rbp + len_slot]
+    if len_slot >= -128 {
+        code.extend_from_slice(&[0x48, 0x8B, 0x55]);
+        code.push(len_slot as u8);
+    } else {
+        code.extend_from_slice(&[0x48, 0x8B, 0x95]);
+        code.extend_from_slice(&len_slot.to_le_bytes());
+    }
+}
+
+/// Streaming lowering of a text-returning recursive body (self-hosting
+/// emitter slice, 2026-06-10). Sibling of `emit_recursive_text_body`,
+/// with the OPPOSITE contract: instead of leaving (rax = ptr, rdx = len)
+/// for the caller to consume, the emitted code WRITES the expression's
+/// bytes to fd 1 in output order during the walk and leaves nothing
+/// meaningful in registers. This is what makes the pretty-printer shape
+///   emit(node) = concat(emit(lhs), "+", emit(rhs))
+/// expressible natively: no level ever materializes a string, so there
+/// is no buffer whose lifetime would have to survive `ret`.
+///
+/// Grammar (enforced syntactically by `decide_streaming_text_mode`
+/// before emit — by the time we are here every shape is legal):
+///   - text literal                  → jmp-over-data + guarded write
+///   - BoundText Ident / text Field  → load (ptr, len) slots + write
+///   - substring(...)                → legacy (ptr, len) producer + write
+///   - number expression             → emit_eval_expr + guarded itoa
+///   - concat(a, b, ...)             → stream each arg in order (no
+///                                     buffer, no sizing pass)
+///   - if c then S1 else S2          → eval cond, branch, stream arms
+///   - match scrut: arms             → arena tag dispatch (port of
+///                                     emit_eval_expr's MatchVariant
+///                                     arena arm), stream arm bodies
+///   - Call(text SCC member, args)   → marshal via emit_eval_expr's
+///                                     Call arm (real `call <label>`),
+///                                     callee streams its own bytes;
+///                                     returned (rax, rdx) ignored
+///
+/// Register discipline: every write syscall is wrapped in push/pop r11
+/// (see emit_streamed_write_rsi_rdx) so the in-callable arena ctx can
+/// keep trusting r11 across the whole walk. rdi is dead after the
+/// callable prologue (all inputs are spilled to rbp slots), so loading
+/// rdi = 1 for the writes never conflicts with input access.
+fn emit_streaming_text_body(
+    code: &mut Vec<u8>,
+    expr: &Expr,
+    input_name: &str,
+    offsets: &HashMap<&str, i32>,
+    all_rules: &HashMap<&str, &Rule>,
+    field_ranges: &HashMap<&str, (i64, i64)>,
+    text_bindings: &TextBindings<'_>,
+    self_call: SelfCallCtx<'_>,
+    arena_ctx: Option<&ArenaCtx>,
+) -> Result<(), NativeError> {
+    match expr {
+        Expr::Text(s) => {
+            // Literal leaf: embed the bytes inline via jmp-over-data
+            // (same shape as the legacy literal arm), load (rsi, rdx),
+            // guarded write. The data lives in the binary's executable
+            // region; no allocation.
+            let bytes = s.as_bytes();
+            let n = bytes.len() as i32;
+            if n <= 127 {
+                code.push(0xEB);
+                code.push(n as u8);
+            } else {
+                code.push(0xE9);
+                code.extend_from_slice(&n.to_le_bytes());
+            }
+            let data_addr = code.len();
+            code.extend_from_slice(bytes);
+            // lea rsi, [rip + rel32]
+            let lea_end = code.len() + 7;
+            let rel32 = data_addr as i32 - lea_end as i32;
+            code.extend_from_slice(&[0x48, 0x8D, 0x35]);
+            code.extend_from_slice(&rel32.to_le_bytes());
+            // mov rdx, n
+            code.extend_from_slice(&[0x48, 0xC7, 0xC2]);
+            code.extend_from_slice(&n.to_le_bytes());
+            emit_streamed_write_rsi_rdx(code);
+            Ok(())
+        }
+        Expr::Concat(args) => {
+            // THE shape this slice exists for. No buffer, no sizing
+            // pass: each arg streams its own bytes left to right.
+            for a in args {
+                emit_streaming_text_body(
+                    code, a, input_name, offsets, all_rules,
+                    field_ranges, text_bindings, self_call, arena_ctx,
+                )?;
+            }
+            Ok(())
+        }
+        Expr::If(cond, then_e, else_e) => {
+            // Mirror the legacy If dispatch (no static elimination —
+            // parity with emit_recursive_text_body). Cond is a value
+            // position; the shape check guaranteed it is text-SCC-free.
+            emit_eval_expr(
+                code, cond, input_name, offsets, all_rules,
+                field_ranges, text_bindings, Some(self_call), arena_ctx,
+            )?;
+            code.extend_from_slice(&[0x84, 0xC0]); // test al, al
+            code.push(0x0F);
+            code.push(0x84);                       // jz .else (long form)
+            let else_patch = code.len();
+            code.extend_from_slice(&[0x00; 4]);
+            emit_streaming_text_body(
+                code, then_e, input_name, offsets, all_rules,
+                field_ranges, text_bindings, self_call, arena_ctx,
+            )?;
+            code.push(0xE9);
+            let end_patch = code.len();
+            code.extend_from_slice(&[0x00; 4]);
+            let else_pos = code.len();
+            let else_off = else_pos as i32 - (else_patch as i32 + 4);
+            code[else_patch..else_patch + 4].copy_from_slice(&else_off.to_le_bytes());
+            emit_streaming_text_body(
+                code, else_e, input_name, offsets, all_rules,
+                field_ranges, text_bindings, self_call, arena_ctx,
+            )?;
+            let end_pos = code.len();
+            let end_off = end_pos as i32 - (end_patch as i32 + 4);
+            code[end_patch..end_patch + 4].copy_from_slice(&end_off.to_le_bytes());
+            Ok(())
+        }
+        Expr::MatchVariant(scrutinee, arms) => {
+            // Port of emit_eval_expr's arena MatchVariant dispatch
+            // (the B.4a.3/4c shape) into the streaming context: same
+            // entry-pointer computation, same tag compare chain, same
+            // binder extraction — only the arm BODIES differ (streamed
+            // instead of evaluated to rax).
+            //
+            // r11 is TRUSTED here (no reload path exists inside a
+            // callable — the outer frame's rbp is unreachable), which
+            // is exactly why every streamed write above and below
+            // preserves it via push/pop.
+            let ac = arena_ctx.ok_or_else(|| NativeError {
+                message: "streaming text emit: match on a variant value requires a concept_group (arena ctx missing)".into(),
+            })?;
+            // Step 1: scrutinee → rax (the arena INDEX). Value
+            // position; shape check guaranteed no text-SCC call.
+            emit_eval_expr(
+                code, scrutinee, input_name, offsets, all_rules,
+                field_ranges, text_bindings, Some(self_call), Some(ac),
+            )?;
+            // Step 2: entry ptr: rax = r11 + idx * entry_size.
+            // mov r10, entry_size_imm
+            code.push(0x49);
+            code.push(0xBA);
+            code.extend_from_slice(&(ac.entry_size as i64).to_le_bytes());
+            // imul rax, r10
+            code.extend_from_slice(&[0x49, 0x0F, 0xAF, 0xC2]);
+            // add rax, r11
+            code.extend_from_slice(&[0x4C, 0x01, 0xD8]);
+            // Step 3: tag byte → rcx.
+            code.extend_from_slice(&[0x48, 0x0F, 0xB6, 0x08]); // movzx rcx, byte [rax]
+            // Step 4: per-arm compare + binder extraction + streamed
+            // body. Binder pool sits below every live frame slot —
+            // scan BOTH maps (offsets and text_bindings) for the
+            // most-negative slot, same derivation as the eval-context
+            // dispatch (see the comment there about text input fields
+            // living only in text_bindings).
+            let lowest_in_offsets: i32 = offsets.values().copied().min().unwrap_or(-8);
+            let lowest_in_text: i32 = text_bindings
+                .values()
+                .flat_map(|&(p, l)| [p, l])
+                .min()
+                .unwrap_or(0);
+            let lowest_offset: i32 = lowest_in_offsets.min(lowest_in_text);
+            let binder_base = lowest_offset - 8;
+
+            let mut end_patches: Vec<usize> = Vec::new();
+            for arm in arms.iter() {
+                let tag = *ac.variant_tags.get(arm.variant_name.as_str()).ok_or_else(|| NativeError {
+                    message: format!(
+                        "streaming MatchVariant: arm references unknown variant '{}' for group {:?}",
+                        arm.variant_name, ac.group_concept_names
+                    ),
+                })?;
+                let declared_fields = ac.variant_fields.get(arm.variant_name.as_str()).ok_or_else(|| NativeError {
+                    message: format!(
+                        "streaming MatchVariant: missing field metadata for variant '{}'",
+                        arm.variant_name
+                    ),
+                })?;
+                if arm.binders.len() != declared_fields.len() {
+                    return Err(NativeError {
+                        message: format!(
+                            "streaming MatchVariant: arm '{}' has {} binders but variant declares {} fields",
+                            arm.variant_name, arm.binders.len(), declared_fields.len()
+                        ),
+                    });
+                }
+                // cmp rcx, tag_imm
+                code.extend_from_slice(&[0x48, 0x83, 0xF9]);
+                code.push(tag);
+                // jne .next_arm (rel32 placeholder)
+                code.push(0x0F);
+                code.push(0x85);
+                let next_arm_patch = code.len();
+                code.extend_from_slice(&[0x00; 4]);
+                // Binder extraction — rax still points at the entry
+                // (no streamed write can have happened since step 2).
+                // Number binders go under the `__bind_` namespace so a
+                // binder can't alias a same-named input field; text
+                // binders keep their bare name in text_bindings (the
+                // BoundText lookup paths resolve bare names). Same
+                // conventions as the eval-context dispatch.
+                let mut extended_offsets = offsets.clone();
+                let extended_ranges = field_ranges.clone();
+                let mut extended_text_bindings: TextBindings<'_> = text_bindings.clone();
+                let binder_keys: Vec<String> = arm.binders.iter().map(|b| {
+                    match b {
+                        Some(name) => format!("__bind_{}", name),
+                        None => String::new(),
+                    }
+                }).collect();
+                let mut binder_cursor = binder_base;
+                for (i, binder_opt) in arm.binders.iter().enumerate() {
+                    let field_ty = &declared_fields[i].1;
+                    let is_text = matches!(field_ty, Type::Text);
+                    let arena_off = arena_field_offset(declared_fields, i, &ac.group_concept_names);
+                    if let Some(binder_name) = binder_opt {
+                        if is_text {
+                            // (ptr, len) pair from the type-aware arena
+                            // entry layout (slice 4c) into two slots.
+                            if arena_off <= 127 {
+                                code.extend_from_slice(&[0x48, 0x8B, 0x50]);
+                                code.push(arena_off as u8);
+                            } else {
+                                code.extend_from_slice(&[0x48, 0x8B, 0x90]);
+                                code.extend_from_slice(&arena_off.to_le_bytes());
+                            }
+                            let ptr_slot = binder_cursor;
+                            if ptr_slot >= -128 {
+                                code.extend_from_slice(&[0x48, 0x89, 0x55]);
+                                code.push(ptr_slot as u8);
+                            } else {
+                                code.extend_from_slice(&[0x48, 0x89, 0x95]);
+                                code.extend_from_slice(&ptr_slot.to_le_bytes());
+                            }
+                            let arena_len_off = arena_off + 8;
+                            if arena_len_off <= 127 {
+                                code.extend_from_slice(&[0x48, 0x8B, 0x50]);
+                                code.push(arena_len_off as u8);
+                            } else {
+                                code.extend_from_slice(&[0x48, 0x8B, 0x90]);
+                                code.extend_from_slice(&arena_len_off.to_le_bytes());
+                            }
+                            let len_slot = binder_cursor - 8;
+                            if len_slot >= -128 {
+                                code.extend_from_slice(&[0x48, 0x89, 0x55]);
+                                code.push(len_slot as u8);
+                            } else {
+                                code.extend_from_slice(&[0x48, 0x89, 0x95]);
+                                code.extend_from_slice(&len_slot.to_le_bytes());
+                            }
+                            extended_text_bindings.insert(binder_name.as_str(), (ptr_slot, len_slot));
+                        } else {
+                            // mov rdx, [rax + arena_off]
+                            if arena_off <= 127 {
+                                code.extend_from_slice(&[0x48, 0x8B, 0x50]);
+                                code.push(arena_off as u8);
+                            } else {
+                                code.extend_from_slice(&[0x48, 0x8B, 0x90]);
+                                code.extend_from_slice(&arena_off.to_le_bytes());
+                            }
+                            // mov [rbp + binder_cursor], rdx
+                            if binder_cursor >= -128 {
+                                code.extend_from_slice(&[0x48, 0x89, 0x55]);
+                                code.push(binder_cursor as u8);
+                            } else {
+                                code.extend_from_slice(&[0x48, 0x89, 0x95]);
+                                code.extend_from_slice(&binder_cursor.to_le_bytes());
+                            }
+                            let _ = binder_name;
+                            extended_offsets.insert(binder_keys[i].as_str(), binder_cursor);
+                        }
+                    }
+                    binder_cursor -= if is_text { 16 } else { 8 };
+                }
+                // Arm body: STREAMED (the one divergence from the
+                // eval-context port). The extended maps make binders
+                // resolvable both as values (number exprs → itoa) and
+                // as BoundText (text payloads → direct write).
+                emit_streaming_text_body(
+                    code, &arm.body, input_name, &extended_offsets,
+                    all_rules, &extended_ranges, &extended_text_bindings,
+                    self_call, Some(ac),
+                )?;
+                // jmp .match_end (rel32 forward)
+                code.push(0xE9);
+                let end_patch = code.len();
+                code.extend_from_slice(&[0x00; 4]);
+                end_patches.push(end_patch);
+                // Patch the jne to the next arm.
+                let next_arm_pos = code.len();
+                let next_off = next_arm_pos as i32 - (next_arm_patch as i32 + 4);
+                code[next_arm_patch..next_arm_patch + 4].copy_from_slice(&next_off.to_le_bytes());
+            }
+            // Tag-corruption trap: exit(2) — reached only if no arm's
+            // tag compared equal (verifier guarantees exhaustiveness,
+            // so this fires only on arena corruption).
+            code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x3C, 0x00, 0x00, 0x00]);
+            code.extend_from_slice(&[0x48, 0xC7, 0xC7, 0x02, 0x00, 0x00, 0x00]);
+            code.extend_from_slice(&[0x0F, 0x05]);
+            let match_end = code.len();
+            for patch in end_patches {
+                let off = match_end as i32 - (patch as i32 + 4);
+                code[patch..patch + 4].copy_from_slice(&off.to_le_bytes());
+            }
+            Ok(())
+        }
+        // Tail call to a text-returning SCC member: marshal the args and
+        // `call <label>` exactly like the eval-context Call arm (single-
+        // field rdi-value, multi-field pointer-in-rdi struct, group-index
+        // args as i64 — all shapes already live there). The callee is a
+        // streaming callable: it writes its own bytes during its walk,
+        // and the (rax, rdx) it leaves is deliberately ignored.
+        Expr::Call(name, _args)
+            if self_call.labels.contains_key(name.as_str())
+                && all_rules.get(name.as_str()).map_or(false, |r| r.output_ty == Type::Text) =>
+        {
+            emit_eval_expr(
+                code, expr, input_name, offsets, all_rules,
+                field_ranges, text_bindings, Some(self_call), arena_ctx,
+            )
+        }
+        // A text-returning call OUTSIDE the labels map cannot stream
+        // (no callable exists to call) and cannot be inlined as a value
+        // (its concat would be the very buffer-lifetime bug this slice
+        // routes around). The shape check refuses this upstream; this
+        // is the defensive emit-time catch.
+        Expr::Call(name, _)
+            if all_rules.get(name.as_str()).map_or(false, |r| r.output_ty == Type::Text) =>
+        {
+            Err(NativeError {
+                message: format!(
+                    "streaming text emit: call to text-returning rule '{}' which is not in the recursion's callable set; only SCC members stream.",
+                    name
+                ),
+            })
+        }
+        Expr::Ident(name) if text_bindings.contains_key(name.as_str()) => {
+            // BoundText (text input field via callable_text_bindings,
+            // match-arm text binder, allocation-free text let): load
+            // the (ptr, len) slots and write.
+            let &(ptr_slot, len_slot) = &text_bindings[name.as_str()];
+            emit_load_rsi_rdx_from_slots(code, ptr_slot, len_slot);
+            emit_streamed_write_rsi_rdx(code);
+            Ok(())
+        }
+        Expr::Field(base, field_name)
+            if matches!(base.as_ref(), Expr::Ident(ref n) if n == input_name)
+                && text_bindings.contains_key(field_name.as_str()) =>
+        {
+            // Text input field: the callable prologue stored (ptr, len)
+            // — stored length, no strlen rescan needed.
+            let &(ptr_slot, len_slot) = &text_bindings[field_name.as_str()];
+            emit_load_rsi_rdx_from_slots(code, ptr_slot, len_slot);
+            emit_streamed_write_rsi_rdx(code);
+            Ok(())
+        }
+        Expr::Substring(_, _, _) => {
+            // Reuse the legacy (ptr, len) producer — substring is
+            // allocation-free (a pointer slice into the input buffer),
+            // so the materializing path is exactly right here; we just
+            // add the write the legacy contract leaves to the caller.
+            emit_recursive_text_body(
+                code, expr, input_name, offsets, all_rules,
+                field_ranges, text_bindings, self_call,
+            )?;
+            code.extend_from_slice(&[0x48, 0x89, 0xC6]); // mov rsi, rax
+            emit_streamed_write_rsi_rdx(code);
+            Ok(())
+        }
+        // Everything else is a Number-typed expression appearing in a
+        // text position (a concat arg like `concat(value)`, a number
+        // match-arm body, a number field): evaluate to rax, then itoa
+        // straight to stdout without a newline. The itoa helper's write
+        // syscall clobbers r11 like any other — same push/pop guard.
+        other => {
+            emit_eval_expr(
+                code, other, input_name, offsets, all_rules,
+                field_ranges, text_bindings, Some(self_call), arena_ctx,
+            )?;
+            code.extend_from_slice(&[0x41, 0x53]); // push r11
+            emit_itoa_to_stdout_no_newline(code);
+            code.extend_from_slice(&[0x41, 0x5B]); // pop r11
+            Ok(())
+        }
+    }
+}
+
 /// Phase 5a: `output: text` with a per-record body. The body is a text
 /// expression (literal, input-field-text, or concat) — evaluated by
 /// `emit_text_write_to_fd` directly to stdout, followed by a newline for
@@ -4504,6 +5636,403 @@ fn emit_text_program<'a>(
 
     emit_record_loop_epilogue(&mut code, &ctx);
     Ok(code)
+}
+
+/// Backend brick b1: emit a literal byte blob to `fd` via a single
+/// write(fd, ptr, len), with the bytes embedded inline in the code section
+/// via a jmp-over-data block. Unlike `emit_write_string` (8-bit `EB` jump,
+/// caps the blob at 255 bytes and hardcodes fd=1), this uses a near `E9`
+/// jump (rel32), so the blob length is bounded only by i32 — appropriate for
+/// machine-code payloads that may exceed 255 bytes in later bricks. No
+/// trailing newline: raw bytes, exact.
+fn emit_write_bytes_literal(code: &mut Vec<u8>, bytes: &[u8], fd: i32) {
+    let len = bytes.len();
+    // jmp rel32 over the data
+    code.push(0xE9);
+    code.extend_from_slice(&(len as i32).to_le_bytes());
+    let data_offset = code.len();
+    code.extend_from_slice(bytes);
+    // lea rsi, [rip + disp] — point rsi at the blob.
+    let after_lea = code.len() + 7;
+    let rip_offset = data_offset as i32 - after_lea as i32;
+    code.extend_from_slice(&[0x48, 0x8D, 0x35]);
+    code.extend_from_slice(&rip_offset.to_le_bytes());
+    // mov rdx, len
+    code.extend_from_slice(&[0x48, 0xC7, 0xC2]);
+    code.extend_from_slice(&(len as i32).to_le_bytes());
+    // mov rdi, fd
+    code.extend_from_slice(&[0x48, 0xC7, 0xC7]);
+    code.extend_from_slice(&fd.to_le_bytes());
+    // mov rax, 1 (sys_write)
+    code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x01, 0x00, 0x00, 0x00]);
+    // Preserve r11 across the syscall. In the recursive streaming-bytes
+    // context (brick b3-native) r11 holds the concept_group arena base and
+    // MUST survive every write — Linux syscalls clobber rcx and r11 by ABI.
+    // For the non-recursive b1/b2 caller r11 is dead, so the push/pop is a
+    // harmless 4 extra bytes. (Mirrors emit_streamed_write_rsi_rdx.)
+    code.extend_from_slice(&[0x41, 0x53]); // push r11
+    code.extend_from_slice(&[0x0F, 0x05]); // syscall
+    code.extend_from_slice(&[0x41, 0x5B]); // pop r11
+}
+
+/// Backend brick b1: a rule `output: bytes` whose logic is a `b"..."`
+/// literal emits exactly those raw bytes to stdout (no trailing newline),
+/// once per input record. Mirrors `emit_text_program`'s record-loop shape so
+/// stdin/argv input modes work unchanged, but writes the raw byte blob
+/// instead of a text value and skips the newline. Non-literal bytes bodies
+/// (concat, number→bytes, lowering) are later bricks — refused here.
+fn emit_bytes_program<'a>(
+    rule: &'a Rule,
+    concept: &'a Concept,
+    all_rules: &HashMap<&str, &Rule>,
+    all_resources: &HashMap<&str, &'a Resource>,
+    all_connections: &HashMap<&str, &'a Connection>,
+    concept_group: Option<&'a ConceptGroup>,
+) -> Result<Vec<u8>, NativeError> {
+    // Backend brick b2: accept a `b"..."` literal (b1) OR a `concat(...)` of
+    // bytes args OR an le32/le64 at the top level. All are emitted by the
+    // streaming bytes body — each piece writes its raw bytes to fd 1 in order,
+    // no buffer, no trailing newline. Anything else stays a later brick.
+    match &rule.logic.value {
+        Expr::Bytes(_) | Expr::Concat(_) | Expr::Le32(_) | Expr::Le64(_) => {}
+        other => {
+            return Err(NativeError {
+                message: format!(
+                    "native bytes output supports a `b\"...\"` literal, a bytes `concat(...)`, \
+                     or `le32`/`le64` at the top level (brick b2), got {:?}; \
+                     other bytes shapes are later bricks — use --run (interpreter)",
+                    other
+                ),
+            });
+        }
+    }
+    let mut code = Vec::new();
+    let ctx = emit_record_loop_prologue(&mut code, rule, concept, None, all_rules, all_resources, all_connections, concept_group)?;
+
+    // The streaming body needs the in-scope bindings the prologue populated so
+    // a future le32(<field>) can read a field. r11 is not live here (no arena),
+    // but emit_streamed_write_rsi_rdx push/pops it anyway — harmless.
+    let offsets: HashMap<&str, i32> = ctx.binding_offsets.clone();
+    // Non-recursive bytes (brick b1/b2): no callable labels, no arena.
+    // Build an empty SelfCallCtx so the shared streaming-bytes body's
+    // Call/le arms have a context to consult (they never find a label here).
+    let empty_labels: HashMap<&str, i32> = HashMap::new();
+    let empty_arities: HashMap<&str, usize> = HashMap::new();
+    let empty_layouts: HashMap<&str, Vec<(String, i32, bool)>> = HashMap::new();
+    let empty_self_call = SelfCallCtx {
+        labels: &empty_labels,
+        arities: &empty_arities,
+        struct_layouts: &empty_layouts,
+        param_in_rbx: None,
+    };
+    emit_streaming_bytes_body(
+        &mut code,
+        &rule.logic.value,
+        &rule.input_name,
+        &offsets,
+        all_rules,
+        &ctx.field_ranges,
+        &ctx.text_bindings,
+        empty_self_call,
+        None,
+    )?;
+
+    // jmp loop_top
+    code.push(0xE9);
+    let loop_offset = ctx.loop_top as i32 - (code.len() + 4) as i32;
+    code.extend_from_slice(&loop_offset.to_le_bytes());
+
+    emit_record_loop_epilogue(&mut code, &ctx);
+    Ok(code)
+}
+
+/// Backend brick b2: stream a bytes-typed expression to fd 1, raw, no newline.
+/// Each piece writes its own bytes left-to-right — no buffer, no sizing pass,
+/// the same shape as `emit_streaming_text_body` but with raw bytes:
+///   - `Bytes(b)`   → emit the literal blob (jmp-over-data + guarded write)
+///   - `Concat(..)` → stream each arg in order
+///   - `Le32`/`Le64`→ eval n → rax, store to an 8-byte stack scratch (x86 is
+///     little-endian, so the low `width` bytes ARE the LE encoding), then one
+///     guarded `write(1, rsp, width)`.
+fn emit_streaming_bytes_body(
+    code: &mut Vec<u8>,
+    expr: &Expr,
+    input_name: &str,
+    offsets: &HashMap<&str, i32>,
+    all_rules: &HashMap<&str, &Rule>,
+    field_ranges: &HashMap<&str, (i64, i64)>,
+    text_bindings: &TextBindings<'_>,
+    self_call: SelfCallCtx<'_>,
+    arena_ctx: Option<&ArenaCtx>,
+) -> Result<(), NativeError> {
+    match expr {
+        Expr::Bytes(b) => {
+            emit_write_bytes_literal(code, b, 1);
+            Ok(())
+        }
+        Expr::Concat(args) => {
+            // THE shape brick b2 exists for. No buffer, no sizing pass:
+            // each arg streams its own bytes left to right.
+            for a in args {
+                emit_streaming_bytes_body(
+                    code, a, input_name, offsets, all_rules,
+                    field_ranges, text_bindings, self_call, arena_ctx,
+                )?;
+            }
+            Ok(())
+        }
+        Expr::Le32(inner) | Expr::Le64(inner) => {
+            let width: i32 = if matches!(expr, Expr::Le64(_)) { 8 } else { 4 };
+            // eval n → rax. self_call is threaded so a recursive driver's
+            // le-encoded number could itself reference a callable's value,
+            // though the shape check forbids a bytes-SCC call here.
+            emit_eval_expr(
+                code, inner, input_name, offsets, all_rules,
+                field_ranges, text_bindings, Some(self_call), arena_ctx,
+            )?;
+            // sub rsp, 8 ; mov [rsp], rax  (x86 stores little-endian, so the
+            // first `width` bytes at [rsp] are the LE low bytes of rax)
+            code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x08]); // sub rsp, 8
+            code.extend_from_slice(&[0x48, 0x89, 0x04, 0x24]); // mov [rsp], rax
+            // rsi = rsp ; rdx = width
+            code.extend_from_slice(&[0x48, 0x89, 0xE6]);        // mov rsi, rsp
+            code.extend_from_slice(&[0x48, 0xC7, 0xC2]);        // mov rdx, width
+            code.extend_from_slice(&width.to_le_bytes());
+            emit_streamed_write_rsi_rdx(code);
+            // add rsp, 8 (free the scratch)
+            code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x08]);
+            Ok(())
+        }
+        Expr::If(cond, then_e, else_e) => {
+            // Mirror emit_streaming_text_body's If: eval cond (value
+            // position, bytes-SCC-free by the shape check), branch, stream
+            // each arm. x86_expr's op-dispatch is an if/else chain of
+            // bytes literals — this is the arm that lowers it.
+            emit_eval_expr(
+                code, cond, input_name, offsets, all_rules,
+                field_ranges, text_bindings, Some(self_call), arena_ctx,
+            )?;
+            code.extend_from_slice(&[0x84, 0xC0]); // test al, al
+            code.push(0x0F);
+            code.push(0x84);                       // jz .else (long form)
+            let else_patch = code.len();
+            code.extend_from_slice(&[0x00; 4]);
+            emit_streaming_bytes_body(
+                code, then_e, input_name, offsets, all_rules,
+                field_ranges, text_bindings, self_call, arena_ctx,
+            )?;
+            code.push(0xE9);
+            let end_patch = code.len();
+            code.extend_from_slice(&[0x00; 4]);
+            let else_pos = code.len();
+            let else_off = else_pos as i32 - (else_patch as i32 + 4);
+            code[else_patch..else_patch + 4].copy_from_slice(&else_off.to_le_bytes());
+            emit_streaming_bytes_body(
+                code, else_e, input_name, offsets, all_rules,
+                field_ranges, text_bindings, self_call, arena_ctx,
+            )?;
+            let end_pos = code.len();
+            let end_off = end_pos as i32 - (end_patch as i32 + 4);
+            code[end_patch..end_patch + 4].copy_from_slice(&end_off.to_le_bytes());
+            Ok(())
+        }
+        Expr::MatchVariant(scrutinee, arms) => {
+            // Port of emit_streaming_text_body's MatchVariant arena
+            // dispatch into the bytes context: same arena entry-pointer
+            // computation, same tag-compare chain, same binder extraction
+            // — only the arm BODIES differ (streamed as bytes). r11 is
+            // TRUSTED here (in-callable); every streamed write push/pops
+            // it, so it survives the walk.
+            let ac = arena_ctx.ok_or_else(|| NativeError {
+                message: "streaming bytes emit: match on a variant value requires a concept_group (arena ctx missing)".into(),
+            })?;
+            // Step 1: scrutinee → rax (the arena INDEX).
+            emit_eval_expr(
+                code, scrutinee, input_name, offsets, all_rules,
+                field_ranges, text_bindings, Some(self_call), Some(ac),
+            )?;
+            // Step 2: entry ptr: rax = r11 + idx * entry_size.
+            code.push(0x49); code.push(0xBA);                 // mov r10, entry_size_imm
+            code.extend_from_slice(&(ac.entry_size as i64).to_le_bytes());
+            code.extend_from_slice(&[0x49, 0x0F, 0xAF, 0xC2]); // imul rax, r10
+            code.extend_from_slice(&[0x4C, 0x01, 0xD8]);       // add rax, r11
+            // Step 3: tag byte → rcx.
+            code.extend_from_slice(&[0x48, 0x0F, 0xB6, 0x08]); // movzx rcx, byte [rax]
+            // Step 4: per-arm compare + binder extraction + streamed body.
+            let lowest_in_offsets: i32 = offsets.values().copied().min().unwrap_or(-8);
+            let lowest_in_text: i32 = text_bindings
+                .values()
+                .flat_map(|&(p, l)| [p, l])
+                .min()
+                .unwrap_or(0);
+            let lowest_offset: i32 = lowest_in_offsets.min(lowest_in_text);
+            let binder_base = lowest_offset - 8;
+
+            let mut end_patches: Vec<usize> = Vec::new();
+            for arm in arms.iter() {
+                let tag = *ac.variant_tags.get(arm.variant_name.as_str()).ok_or_else(|| NativeError {
+                    message: format!(
+                        "streaming bytes MatchVariant: arm references unknown variant '{}' for group {:?}",
+                        arm.variant_name, ac.group_concept_names
+                    ),
+                })?;
+                let declared_fields = ac.variant_fields.get(arm.variant_name.as_str()).ok_or_else(|| NativeError {
+                    message: format!(
+                        "streaming bytes MatchVariant: missing field metadata for variant '{}'",
+                        arm.variant_name
+                    ),
+                })?;
+                if arm.binders.len() != declared_fields.len() {
+                    return Err(NativeError {
+                        message: format!(
+                            "streaming bytes MatchVariant: arm '{}' has {} binders but variant declares {} fields",
+                            arm.variant_name, arm.binders.len(), declared_fields.len()
+                        ),
+                    });
+                }
+                // cmp rcx, tag_imm
+                code.extend_from_slice(&[0x48, 0x83, 0xF9]);
+                code.push(tag);
+                // jne .next_arm
+                code.push(0x0F); code.push(0x85);
+                let next_arm_patch = code.len();
+                code.extend_from_slice(&[0x00; 4]);
+                // Binder extraction — rax still points at the entry.
+                let mut extended_offsets = offsets.clone();
+                let extended_ranges = field_ranges.clone();
+                let mut extended_text_bindings: TextBindings<'_> = text_bindings.clone();
+                let binder_keys: Vec<String> = arm.binders.iter().map(|b| {
+                    match b {
+                        Some(name) => format!("__bind_{}", name),
+                        None => String::new(),
+                    }
+                }).collect();
+                let mut binder_cursor = binder_base;
+                for (i, binder_opt) in arm.binders.iter().enumerate() {
+                    let field_ty = &declared_fields[i].1;
+                    let is_text = matches!(field_ty, Type::Text);
+                    let arena_off = arena_field_offset(declared_fields, i, &ac.group_concept_names);
+                    if let Some(binder_name) = binder_opt {
+                        if is_text {
+                            // (ptr, len) pair from the type-aware arena entry.
+                            if arena_off <= 127 {
+                                code.extend_from_slice(&[0x48, 0x8B, 0x50]);
+                                code.push(arena_off as u8);
+                            } else {
+                                code.extend_from_slice(&[0x48, 0x8B, 0x90]);
+                                code.extend_from_slice(&arena_off.to_le_bytes());
+                            }
+                            let ptr_slot = binder_cursor;
+                            if ptr_slot >= -128 {
+                                code.extend_from_slice(&[0x48, 0x89, 0x55]);
+                                code.push(ptr_slot as u8);
+                            } else {
+                                code.extend_from_slice(&[0x48, 0x89, 0x95]);
+                                code.extend_from_slice(&ptr_slot.to_le_bytes());
+                            }
+                            let arena_len_off = arena_off + 8;
+                            if arena_len_off <= 127 {
+                                code.extend_from_slice(&[0x48, 0x8B, 0x50]);
+                                code.push(arena_len_off as u8);
+                            } else {
+                                code.extend_from_slice(&[0x48, 0x8B, 0x90]);
+                                code.extend_from_slice(&arena_len_off.to_le_bytes());
+                            }
+                            let len_slot = binder_cursor - 8;
+                            if len_slot >= -128 {
+                                code.extend_from_slice(&[0x48, 0x89, 0x55]);
+                                code.push(len_slot as u8);
+                            } else {
+                                code.extend_from_slice(&[0x48, 0x89, 0x95]);
+                                code.extend_from_slice(&len_slot.to_le_bytes());
+                            }
+                            extended_text_bindings.insert(binder_name.as_str(), (ptr_slot, len_slot));
+                        } else {
+                            // mov rdx, [rax + arena_off]
+                            if arena_off <= 127 {
+                                code.extend_from_slice(&[0x48, 0x8B, 0x50]);
+                                code.push(arena_off as u8);
+                            } else {
+                                code.extend_from_slice(&[0x48, 0x8B, 0x90]);
+                                code.extend_from_slice(&arena_off.to_le_bytes());
+                            }
+                            // mov [rbp + binder_cursor], rdx
+                            if binder_cursor >= -128 {
+                                code.extend_from_slice(&[0x48, 0x89, 0x55]);
+                                code.push(binder_cursor as u8);
+                            } else {
+                                code.extend_from_slice(&[0x48, 0x89, 0x95]);
+                                code.extend_from_slice(&binder_cursor.to_le_bytes());
+                            }
+                            let _ = binder_name;
+                            extended_offsets.insert(binder_keys[i].as_str(), binder_cursor);
+                        }
+                    }
+                    binder_cursor -= if is_text { 16 } else { 8 };
+                }
+                // Arm body: STREAMED as bytes.
+                emit_streaming_bytes_body(
+                    code, &arm.body, input_name, &extended_offsets,
+                    all_rules, &extended_ranges, &extended_text_bindings,
+                    self_call, Some(ac),
+                )?;
+                // jmp .match_end
+                code.push(0xE9);
+                let end_patch = code.len();
+                code.extend_from_slice(&[0x00; 4]);
+                end_patches.push(end_patch);
+                // Patch the jne to the next arm.
+                let next_arm_pos = code.len();
+                let next_off = next_arm_pos as i32 - (next_arm_patch as i32 + 4);
+                code[next_arm_patch..next_arm_patch + 4].copy_from_slice(&next_off.to_le_bytes());
+            }
+            // Tag-corruption trap: exit(2).
+            code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x3C, 0x00, 0x00, 0x00]);
+            code.extend_from_slice(&[0x48, 0xC7, 0xC7, 0x02, 0x00, 0x00, 0x00]);
+            code.extend_from_slice(&[0x0F, 0x05]);
+            let match_end = code.len();
+            for patch in end_patches {
+                let off = match_end as i32 - (patch as i32 + 4);
+                code[patch..patch + 4].copy_from_slice(&off.to_le_bytes());
+            }
+            Ok(())
+        }
+        // Tail call to a bytes-returning SCC member: marshal the args and
+        // `call <label>` exactly like emit_eval_expr's Call arm (single-
+        // field rdi-value, multi-field pointer-in-rdi struct, group-index
+        // args as i64). The callee streams its own bytes during its walk;
+        // the (rax, rdx) it leaves is deliberately ignored.
+        Expr::Call(name, _args)
+            if self_call.labels.contains_key(name.as_str())
+                && all_rules.get(name.as_str()).map_or(false, |r| r.output_ty == Type::Bytes) =>
+        {
+            emit_eval_expr(
+                code, expr, input_name, offsets, all_rules,
+                field_ranges, text_bindings, Some(self_call), arena_ctx,
+            )
+        }
+        // A bytes-returning call outside the labels map cannot stream (no
+        // callable exists) — the shape check refuses this upstream; this
+        // is the defensive emit-time catch.
+        Expr::Call(name, _)
+            if all_rules.get(name.as_str()).map_or(false, |r| r.output_ty == Type::Bytes) =>
+        {
+            Err(NativeError {
+                message: format!(
+                    "streaming bytes emit: call to bytes-returning rule '{}' which is not in the recursion's callable set; only SCC members stream.",
+                    name
+                ),
+            })
+        }
+        other => Err(NativeError {
+            message: format!(
+                "native bytes streaming (brick b3) supports `b\"...\"`, bytes `concat(...)`, \
+                 `le32`/`le64`, `if`/`else` (bytes arms), `match` (bytes arms), and tail \
+                 calls to bytes-returning recursive rules, got {:?}",
+                other
+            ),
+        }),
+    }
 }
 
 /// Classify a concat argument's runtime type — native supports Text (bytes
@@ -4907,7 +6436,9 @@ fn emit_concat_to_buffer_impl(
         code.extend_from_slice(&[0x48, 0x89, 0xE3]);
         // mov r10, rbx  — buffer base for final length calc
         code.extend_from_slice(&[0x49, 0x89, 0xDA]);
-        emit_concat_fill(code, args, &kinds, &call_slot_idx, input_name, concept, all_rules, offsets, field_ranges, text_bindings)?;
+        // Fast path has no CallText args (those force has_dynamic), so the
+        // slot-array base is unused — pass 0.
+        emit_concat_fill(code, args, &kinds, &call_slot_idx, input_name, concept, all_rules, offsets, field_ranges, text_bindings, 0)?;
         // rax = buffer base, rdx = length (rbx - r10)
         code.extend_from_slice(&[0x4C, 0x89, 0xD0]); // mov rax, r10
         code.extend_from_slice(&[0x48, 0x89, 0xDA]); // mov rdx, rbx
@@ -4926,37 +6457,54 @@ fn emit_concat_to_buffer_impl(
         code.extend_from_slice(&[0x49, 0x89, 0xE1]);
     }
 
-    // Phase 2H-b: pre-evaluate Call args into an r11-indexed slot array.
-    // Only the outermost concat does pre-eval (nested is CallText-free).
+    // Phase 2H-b: pre-evaluate Call args into a slot array.
+    //
+    // The slot array is addressed RELATIVE TO r9 (the saved pre-concat
+    // rsp), NOT via a dedicated base register. The previous design did
+    // `mov r11, rsp` to use r11 as the slot base — but `r11` is the
+    // concept_group ARENA BASE (set once in `_start`, trusted across
+    // call/ret by every callable's arena access; see the register-
+    // conventions table). Clobbering it here permanently destroyed the
+    // arena base for the rest of the callable AND for every deeper
+    // callable that trusts r11 — so any `concat(... Call ...)` inside a
+    // concept_group program corrupted subsequent MatchVariant/
+    // VariantConstruct arena addressing (wrong tag → exit(2) trap).
+    // Worse, the callee evaluated by `emit_text_produce_ptrlen` below may
+    // itself build arena nodes (a recursive parser rule), so r11 MUST
+    // stay the arena base across the arg eval. r9 is already saved (the
+    // Dynamic cleanup register), is not otherwise touched here, and the
+    // pre-eval path has no syscalls, so r9-relative addressing is stable.
+    // Slot array layout: top of array = r9 - 16*n_calls; slot i lives at
+    // `[r9 - 16*n_calls + 16*i (+8 for len)]`. The slot displacement from
+    // r9 is therefore `(16*slot_idx) - 16*n_calls` (always negative).
+    let slot_base_from_r9 = -(16 * n_calls);
     if n_calls > 0 {
         // sub rsp, 16*n_calls
         let slots_bytes = 16 * n_calls;
         code.extend_from_slice(&[0x48, 0x81, 0xEC]);
         code.extend_from_slice(&slots_bytes.to_le_bytes());
-        // mov r11, rsp  — slot base
-        code.extend_from_slice(&[0x49, 0x89, 0xE3]);
 
         // For each Call arg, emit callee into (rax, rdx) and store at the slot.
         // The inner (nested) emit_concat_to_buffer skips the r9 save and
-        // refuses CallText args, so outer's r9 and r11 both survive as
-        // register values across the inner evaluation. No push/pop dance
-        // needed — the whole point of the is_nested flag.
+        // refuses CallText args, so outer's r9 survives as a register value
+        // across the inner evaluation. No push/pop dance needed — the whole
+        // point of the is_nested flag. r11 (arena base) is left untouched.
         for (arg, kind) in args.iter().zip(kinds.iter()) {
             if *kind != ConcatArgKind::CallText {
                 continue;
             }
             let slot_idx = call_slot_idx[args.iter().position(|a| std::ptr::eq(a, arg)).unwrap()];
-            let disp_ptr = 16 * slot_idx;
+            let disp_ptr = slot_base_from_r9 + 16 * slot_idx;
             let disp_len = disp_ptr + 8;
 
             emit_text_produce_ptrlen(
                 code, arg, input_name, concept, all_rules, offsets, field_ranges, text_bindings,
             )?;
 
-            // mov [r11 + disp_ptr], rax
-            emit_mov_r11_disp_from_reg(code, disp_ptr, /* is_rax= */ true);
-            // mov [r11 + disp_len], rdx
-            emit_mov_r11_disp_from_reg(code, disp_len, /* is_rax= */ false);
+            // mov [r9 + disp_ptr], rax
+            emit_mov_r9_disp_from_reg(code, disp_ptr, /* is_rax= */ true);
+            // mov [r9 + disp_len], rdx
+            emit_mov_r9_disp_from_reg(code, disp_len, /* is_rax= */ false);
         }
     }
 
@@ -5015,15 +6563,18 @@ fn emit_concat_to_buffer_impl(
                 }
             }
             ConcatArgKind::CallText => {
-                // add rax, [r11 + 16*slot_idx + 8]  (the len)
+                // add rax, [r9 + slot_base + 16*slot_idx + 8]  (the len)
+                // r9-relative (the slot array sits below the saved pre-concat
+                // rsp); r11 stays the arena base. See the pre-eval comment.
                 let slot_idx = call_slot_idx[args.iter().position(|a| std::ptr::eq(a, arg)).unwrap()];
-                let disp = 16 * slot_idx + 8;
-                // 49 03 ModRM(01 000 011 = 0x43) disp8  or  49 03 ModRM(10 000 011 = 0x83) disp32
-                if disp <= 127 {
-                    code.extend_from_slice(&[0x49, 0x03, 0x43]);
+                let disp = slot_base_from_r9 + 16 * slot_idx + 8;
+                // add rax, [r9 + disp]  — REX.WB (r9 needs REX.B), opcode 0x03,
+                // ModRM reg=rax(000) r/m=r9(001 with REX.B).
+                if disp >= -128 && disp <= 127 {
+                    code.extend_from_slice(&[0x49, 0x03, 0x41]);
                     code.push(disp as u8);
                 } else {
-                    code.extend_from_slice(&[0x49, 0x03, 0x83]);
+                    code.extend_from_slice(&[0x49, 0x03, 0x81]);
                     code.extend_from_slice(&disp.to_le_bytes());
                 }
             }
@@ -5106,7 +6657,7 @@ fn emit_concat_to_buffer_impl(
     code.extend_from_slice(&[0x48, 0x89, 0xE3]);
     code.extend_from_slice(&[0x49, 0x89, 0xDA]);
 
-    emit_concat_fill(code, args, &kinds, &call_slot_idx, input_name, concept, all_rules, offsets, field_ranges, text_bindings)?;
+    emit_concat_fill(code, args, &kinds, &call_slot_idx, input_name, concept, all_rules, offsets, field_ranges, text_bindings, slot_base_from_r9)?;
 
     // rax = buffer base, rdx = length
     code.extend_from_slice(&[0x4C, 0x89, 0xD0]); // mov rax, r10
@@ -5125,17 +6676,21 @@ fn emit_concat_to_buffer_impl(
     Ok(ConcatBufResult::Dynamic)
 }
 
-/// Emit `mov [r11 + disp], reg` where reg is rax (is_rax=true) or rdx.
+/// Emit `mov [r9 + disp], reg` where reg is rax (is_rax=true) or rdx.
 /// Used by Phase 2H-b to populate Call-arg slots in the pre-eval array.
-fn emit_mov_r11_disp_from_reg(code: &mut Vec<u8>, disp: i32, is_rax: bool) {
-    // REX.WB + 0x89 + ModRM(reg = rax(000) or rdx(010), r/m = r11 (011, with REX.B))
+/// r9 (the saved pre-concat rsp) is the slot-array anchor; `r11` is left
+/// untouched because it is the concept_group arena base (see the pre-eval
+/// comment in emit_concat_to_buffer_impl). `disp` is negative (the slot
+/// array sits below r9).
+fn emit_mov_r9_disp_from_reg(code: &mut Vec<u8>, disp: i32, is_rax: bool) {
+    // REX.WB + 0x89 + ModRM(reg = rax(000) or rdx(010), r/m = r9 (001, with REX.B))
     let reg_field: u8 = if is_rax { 0b000 } else { 0b010 };
     if disp >= -128 && disp <= 127 {
-        let modrm = 0b01_000_000 | (reg_field << 3) | 0b011;
+        let modrm = 0b01_000_000 | (reg_field << 3) | 0b001;
         code.extend_from_slice(&[0x49, 0x89, modrm]);
         code.push(disp as u8);
     } else {
-        let modrm = 0b10_000_000 | (reg_field << 3) | 0b011;
+        let modrm = 0b10_000_000 | (reg_field << 3) | 0b001;
         code.extend_from_slice(&[0x49, 0x89, modrm]);
         code.extend_from_slice(&disp.to_le_bytes());
     }
@@ -5511,6 +7066,12 @@ fn emit_concat_fill(
     offsets: &HashMap<&str, i32>,
     field_ranges: &HashMap<&str, (i64, i64)>,
     text_bindings: &TextBindings<'_>,
+    // Displacement of the CallText pre-eval slot array's base from r9
+    // (the saved pre-concat rsp). Always `-(16 * n_calls)`. The slot
+    // array is addressed r9-relative so r11 stays the arena base; see
+    // the pre-eval comment in emit_concat_to_buffer_impl. Callers with
+    // no CallText args pass 0 (the CallText branch never fires).
+    slot_base_from_r9: i32,
 ) -> Result<(), NativeError> {
 
     for (i, arg) in args.iter().enumerate() {
@@ -5599,26 +7160,28 @@ fn emit_concat_fill(
                 }
             }
             ConcatArgKind::CallText => {
-                // Pre-eval has already stored (ptr, len) at [r11 + 16*idx + {0,8}].
-                // mov rsi, [r11 + disp_ptr]  ; mov rcx, [r11 + disp_len]
+                // Pre-eval stored (ptr, len) at [r9 + slot_base + 16*idx + {0,8}].
+                // r9-relative (r11 stays the arena base — see the pre-eval
+                // comment in emit_concat_to_buffer_impl).
+                // mov rsi, [r9 + disp_ptr]  ; mov rcx, [r9 + disp_len]
                 // mov rdi, rbx ; rep movsb ; mov rbx, rdi
                 let slot_idx = call_slot_idx[i];
-                let disp_ptr = 16 * slot_idx;
+                let disp_ptr = slot_base_from_r9 + 16 * slot_idx;
                 let disp_len = disp_ptr + 8;
-                // mov rsi, [r11 + disp_ptr]  (REX.B, ModRM reg=rsi(110) r/m=r11(011))
-                if disp_ptr <= 127 {
-                    code.extend_from_slice(&[0x49, 0x8B, 0x73]);
+                // mov rsi, [r9 + disp_ptr]  (REX.B, ModRM reg=rsi(110) r/m=r9(001))
+                if disp_ptr >= -128 && disp_ptr <= 127 {
+                    code.extend_from_slice(&[0x49, 0x8B, 0x71]);
                     code.push(disp_ptr as u8);
                 } else {
-                    code.extend_from_slice(&[0x49, 0x8B, 0xB3]);
+                    code.extend_from_slice(&[0x49, 0x8B, 0xB1]);
                     code.extend_from_slice(&disp_ptr.to_le_bytes());
                 }
-                // mov rcx, [r11 + disp_len]  (ModRM reg=rcx(001) r/m=r11(011))
-                if disp_len <= 127 {
-                    code.extend_from_slice(&[0x49, 0x8B, 0x4B]);
+                // mov rcx, [r9 + disp_len]  (ModRM reg=rcx(001) r/m=r9(001))
+                if disp_len >= -128 && disp_len <= 127 {
+                    code.extend_from_slice(&[0x49, 0x8B, 0x49]);
                     code.push(disp_len as u8);
                 } else {
-                    code.extend_from_slice(&[0x49, 0x8B, 0x8B]);
+                    code.extend_from_slice(&[0x49, 0x8B, 0x89]);
                     code.extend_from_slice(&disp_len.to_le_bytes());
                 }
                 // mov rdi, rbx ; rep movsb ; mov rbx, rdi
@@ -9962,6 +11525,7 @@ fn emit_text_fold_program(
         &elem_offsets,
         &field_ranges,
         &text_bindings,
+        0, // Phase 5b has no CallText args (rejected above) — slot base unused.
     )?;
 
     // dec r15 ; jmp fill_loop_top
@@ -10074,6 +11638,18 @@ fn emit_store_rax_to_rsp(code: &mut Vec<u8>, rsp_off: i32) {
     }
 }
 
+fn emit_store_rdx_to_rsp(code: &mut Vec<u8>, rsp_off: i32) {
+    if rsp_off == 0 {
+        code.extend_from_slice(&[0x48, 0x89, 0x14, 0x24]);
+    } else if rsp_off <= 127 {
+        code.extend_from_slice(&[0x48, 0x89, 0x54, 0x24]);
+        code.push(rsp_off as u8);
+    } else {
+        code.extend_from_slice(&[0x48, 0x89, 0x94, 0x24]);
+        code.extend_from_slice(&rsp_off.to_le_bytes());
+    }
+}
+
 fn load_rax_from_rbp(code: &mut Vec<u8>, offset: i32) {
     if offset >= -128 {
         code.extend_from_slice(&[0x48, 0x8B, 0x45]);
@@ -10081,6 +11657,90 @@ fn load_rax_from_rbp(code: &mut Vec<u8>, offset: i32) {
     } else {
         code.extend_from_slice(&[0x48, 0x8B, 0x85]);
         code.extend_from_slice(&offset.to_le_bytes());
+    }
+}
+
+/// `mov rcx, [rbp+offset]` — the rcx mirror of `load_rax_from_rbp`.
+fn load_rcx_from_rbp(code: &mut Vec<u8>, offset: i32) {
+    if offset >= -128 {
+        code.extend_from_slice(&[0x48, 0x8B, 0x4D]);
+        code.push(offset as u8);
+    } else {
+        code.extend_from_slice(&[0x48, 0x8B, 0x8D]);
+        code.extend_from_slice(&offset.to_le_bytes());
+    }
+}
+
+/// `mov rcx, imm` — the rcx mirror of `emit_mov_rax_imm`.
+fn emit_mov_rcx_imm(code: &mut Vec<u8>, value: i64) {
+    if value >= i32::MIN as i64 && value <= i32::MAX as i64 {
+        // mov rcx, imm32 (sign-extended)
+        code.extend_from_slice(&[0x48, 0xC7, 0xC1]);
+        code.extend_from_slice(&(value as i32).to_le_bytes());
+    } else {
+        // movabs rcx, imm64
+        code.extend_from_slice(&[0x48, 0xB9]);
+        code.extend_from_slice(&value.to_le_bytes());
+    }
+}
+
+/// Register-allocation brick A3: evaluate a SIMPLE operand (one whitelisted by
+/// `is_simple_operand`) DIRECTLY into rcx instead of rax. This is the rcx
+/// mirror of the rax leaf-load done inside `emit_eval_expr`. Used by the
+/// simple-RHS binop path so the operator can compute `op rax, rcx` and leave
+/// the result in rax with NO register-shuffle moves.
+///
+/// MUST stay in lockstep with `is_simple_operand`'s whitelist AND with the
+/// corresponding rax-targeting arms of `emit_eval_expr`:
+///   - Number literal → `emit_mov_rcx_imm`        (mirror of emit_mov_rax_imm)
+///   - Field(input.x) → `mov rcx, rbx` (A2 param) or `load_rcx_from_rbp`
+///   - NowUnix        → `load_rcx_from_rbp(now_slot)`
+fn emit_eval_simple_into_rcx(
+    code: &mut Vec<u8>,
+    expr: &Expr,
+    input_name: &str,
+    offsets: &HashMap<&str, i32>,
+    self_call: Option<&SelfCallCtx>,
+) -> Result<(), NativeError> {
+    match expr {
+        Expr::Number(n) => {
+            emit_mov_rcx_imm(code, *n);
+            Ok(())
+        }
+        Expr::Field(base, field_name) => {
+            // Mirror the input-field load, including the A2 rbx fast path.
+            let lookup_key = match base.as_ref() {
+                Expr::Ident(base_name) if base_name == "state" => {
+                    format!("__state_{}", field_name)
+                }
+                _ => field_name.clone(),
+            };
+            if let Some(sc) = self_call {
+                if sc.param_in_rbx == Some(field_name.as_str())
+                    && matches!(base.as_ref(), Expr::Ident(n) if n == input_name)
+                {
+                    code.extend_from_slice(&[0x48, 0x89, 0xD9]); // mov rcx, rbx
+                    return Ok(());
+                }
+            }
+            let offset = *offsets.get(lookup_key.as_str()).ok_or_else(|| NativeError {
+                message: format!("unknown field '{}' in native codegen", field_name),
+            })?;
+            load_rcx_from_rbp(code, offset);
+            Ok(())
+        }
+        Expr::NowUnix => {
+            let slot = *offsets.get("now").ok_or_else(|| NativeError {
+                message: "now_unix() reached emit_eval_simple_into_rcx without a captured \
+                          clock slot".into(),
+            })?;
+            load_rcx_from_rbp(code, slot);
+            Ok(())
+        }
+        _ => Err(NativeError {
+            message: "emit_eval_simple_into_rcx called on a non-simple operand (is_simple_operand \
+                      and this helper are out of sync)".into(),
+        }),
     }
 }
 
@@ -10455,7 +12115,7 @@ fn emit_reaction_program<'a>(
 /// This prevents the native backend from emitting code that would overflow the stack.
 fn max_stack_depth(expr: &Expr) -> usize {
     match expr {
-        Expr::Number(_) | Expr::Text(_) | Expr::Ident(_) => 0,
+        Expr::Number(_) | Expr::Text(_) | Expr::Bytes(_) | Expr::Ident(_) => 0,
         Expr::Field(base, _) => max_stack_depth(base),
         Expr::Binary(_, left, right) => {
             // Left is evaluated first and pushed, then right is evaluated
@@ -10522,7 +12182,7 @@ fn max_stack_depth(expr: &Expr) -> usize {
         Expr::Length(inner) => max_stack_depth(inner),
         // `abs(<number_expr>)` — 5-byte inline (cqo; xor rax, rdx; sub rax, rdx),
         // no eval-stack push, the inner's depth dominates.
-        Expr::Abs(inner) | Expr::BitNot(inner) => max_stack_depth(inner),
+        Expr::Abs(inner) | Expr::BitNot(inner) | Expr::Le32(inner) | Expr::Le64(inner) => max_stack_depth(inner),
         // `min(a, b)` / `max(a, b)` — branch-free cmp + cmov; left is
         // evaluated and pushed, right is evaluated, so same shape as Binary.
         Expr::Min(l, r) | Expr::Max(l, r) | Expr::BitAnd(l, r) | Expr::BitOr(l, r) | Expr::BitXor(l, r) | Expr::Shl(l, r) | Expr::Shr(l, r) => {
@@ -10683,6 +12343,15 @@ struct SelfCallCtx<'a> {
     /// Drives type-aware marshalling in the Call arm. Empty for legacy
     /// Phase A paths; consumers fall back to the uniform-8B shortcut.
     struct_layouts: &'a HashMap<&'a str, Vec<(String, i32, bool)>>,
+    /// Register-allocation brick A2: name of the single input field that the
+    /// CURRENTLY-EMITTING callable holds in rbx (callee-saved) instead of
+    /// spilling to `[rbp - 8]`. `Some(field)` only for a qualifying callable
+    /// (single Number/Bool field, no lets, pure arithmetic body — nothing
+    /// that claims rbx or r11). The `Field(Ident(input), field)` read site
+    /// emits `mov rax, rbx` instead of `mov rax, [rbp - 8]`. `None` keeps the
+    /// slot path. Per-callable: each `emit_callable_into` sets it on its own
+    /// COPY of the ctx before emitting that callable's body.
+    param_in_rbx: Option<&'a str>,
 }
 
 /// Phase B slice 4a.2 — arena context for `VariantConstruct` emission.
@@ -10789,6 +12458,50 @@ struct ArenaCtx<'a> {
     /// Slice 4a.3 placeholder (unused in current emit but reserved for
     /// future per-rule node_count seeding).
     callable_node_count_seed: i32,
+    /// Off-stack mmap arena (2026-06-22): true when the arena was allocated
+    /// via mmap (large group). At ENTRY level (in_callable=false) this flips
+    /// r11 reloads from `lea [rbp+arena_rbp_offset]` to `mov r11, [rbp+
+    /// arena_base_slot]`, and node_count addressing from `[rbp+
+    /// node_count_slot]` to `[r11+arena_size]`. Callables (in_callable=true)
+    /// already use `[r11+arena_size]` and trust r11 across call/ret, so they
+    /// are unaffected by this flag.
+    use_mmap: bool,
+    /// Off-stack mmap arena: rbp offset of the frame slot holding the mmap
+    /// base pointer. Only meaningful at entry level when `use_mmap` is true.
+    arena_base_slot: i32,
+}
+
+/// Off-stack mmap arena (2026-06-22): emit "r11 = arena base" at an
+/// ENTRY-level arena-access site. Under mmap the base is reloaded from the
+/// frame slot (`mov r11, [rbp+arena_base_slot]`); on the stack it is the
+/// `lea r11, [rbp+arena_rbp_offset]` of the pre-mmap path. This is the
+/// single discipline point for corrections #2 (VariantConstruct) and #3
+/// (MatchVariant) — every entry-level arena access reloads r11 here so a
+/// preceding syscall (which clobbers r11) cannot corrupt the base.
+/// Callables (in_callable=true) keep trusting the r11 register and must NOT
+/// call this (they cannot reach the rbp slot).
+fn emit_arena_base_into_r11(code: &mut Vec<u8>, ac: &ArenaCtx) {
+    if ac.use_mmap {
+        // mov r11, [rbp + arena_base_slot]  (REX.WR 0x4C, 0x8B, /3)
+        let s = ac.arena_base_slot;
+        if s >= -128 {
+            code.extend_from_slice(&[0x4C, 0x8B, 0x5D]);
+            code.push(s as u8);
+        } else {
+            code.extend_from_slice(&[0x4C, 0x8B, 0x9D]);
+            code.extend_from_slice(&s.to_le_bytes());
+        }
+    } else {
+        // lea r11, [rbp + arena_rbp_offset]  (pre-mmap stack path)
+        let aro = ac.arena_rbp_offset;
+        if aro >= -128 {
+            code.extend_from_slice(&[0x4C, 0x8D, 0x5D]);
+            code.push(aro as u8);
+        } else {
+            code.extend_from_slice(&[0x4C, 0x8D, 0x9D]);
+            code.extend_from_slice(&aro.to_le_bytes());
+        }
+    }
 }
 
 impl<'a> ArenaCtx<'a> {
@@ -10812,6 +12525,8 @@ impl<'a> ArenaCtx<'a> {
             arena_abort_patches: std::cell::RefCell::new(Vec::new()),
             in_callable: false,
             callable_node_count_seed: 0,
+            use_mmap: ctx.use_mmap,
+            arena_base_slot: ctx.arena_base_slot,
         })
     }
 
@@ -10822,6 +12537,131 @@ impl<'a> ArenaCtx<'a> {
     fn drain_patches_into(self, dest: &mut Vec<usize>) {
         let inner = self.arena_abort_patches.into_inner();
         dest.extend(inner);
+    }
+}
+
+/// Register-allocation brick #1 (peephole-at-emission): is `e` an operand
+/// whose `emit_eval_expr` lowering transiently uses ONLY rax — never rcx,
+/// never the CPU stack, never a recursion into another operand evaluation?
+///
+/// When the RHS of a binary operator satisfies this, the general-case
+/// `push rax (spill lhs) / eval rhs / pop rcx` stack dance is wasteful: we
+/// can keep the lhs in rcx with a single `mov rcx, rax` because evaluating
+/// the RHS leaf cannot disturb rcx. This removes two memory ops per binop.
+///
+/// CONSERVATIVE BY DESIGN: returns true ONLY for the handful of leaves whose
+/// emit is a single rax-targeting load with no scratch register beyond rax:
+///   - Number literal  → `emit_mov_rax_imm` (rax only)
+///   - Field(input.x)  → `load_rax_from_rbp` (rax only)
+///   - NowUnix         → loads the captured clock slot into rax (rax only)
+/// Everything else — Binary, If, Call, Concat, MatchVariant, Substring,
+/// ParseInt, Length, Read/Fetch, Not/Neg, etc. — returns false so the safe
+/// push/pop path is kept. When in doubt, false (correctness first).
+fn is_simple_operand(e: &Expr) -> bool {
+    match e {
+        Expr::Number(_) => true,
+        // Field access on the input record is a plain `mov rax, [rbp+disp]`.
+        // Restrict to the `input.field` shape (base is an Ident) — nested
+        // field access is rejected by the emitter anyway, but be explicit.
+        Expr::Field(base, _) => matches!(base.as_ref(), Expr::Ident(_)),
+        // now_unix() loads the once-per-invocation captured value from its
+        // dedicated rbp slot into rax — no rcx, no stack.
+        Expr::NowUnix => true,
+        _ => false,
+    }
+}
+
+/// Register-allocation brick A4 — does `expr`'s subtree contain a binop whose
+/// own RHS is non-simple (i.e. a binop that itself would want to hold a value
+/// across a sibling call)? Used by `use_r15_save` to refuse the r15 fast path
+/// when the RHS we're about to evaluate would itself claim r15 — they'd
+/// collide on the single callee-saved scratch register.
+///
+/// Only structural arithmetic shapes that the binop emitter actually recurses
+/// through are walked (Binary / If / unary / Min/Max / Call args). A "call-
+/// crossing binop" is one where `!is_simple_operand(rhs)`.
+fn subtree_has_call_crossing_binop(expr: &Expr) -> bool {
+    match expr {
+        Expr::Binary(op, l, r) => {
+            // And/Or short-circuit and never spill across a call (no push/pop
+            // path), so they don't claim r15 — exclude them from the test.
+            let this_crosses = !matches!(op, BinOp::And | BinOp::Or)
+                && !is_simple_operand(r);
+            this_crosses
+                || subtree_has_call_crossing_binop(l)
+                || subtree_has_call_crossing_binop(r)
+        }
+        Expr::If(c, t, e) => {
+            subtree_has_call_crossing_binop(c)
+                || subtree_has_call_crossing_binop(t)
+                || subtree_has_call_crossing_binop(e)
+        }
+        Expr::Not(x) | Expr::Neg(x) | Expr::Abs(x) | Expr::BitNot(x) => {
+            subtree_has_call_crossing_binop(x)
+        }
+        Expr::Min(a, b)
+        | Expr::Max(a, b)
+        | Expr::BitAnd(a, b)
+        | Expr::BitOr(a, b)
+        | Expr::BitXor(a, b)
+        | Expr::Shl(a, b)
+        | Expr::Shr(a, b) => {
+            subtree_has_call_crossing_binop(a) || subtree_has_call_crossing_binop(b)
+        }
+        Expr::Call(_, args) => args.iter().any(subtree_has_call_crossing_binop),
+        Expr::Record(_, fields) => {
+            fields.iter().any(|(_, e)| subtree_has_call_crossing_binop(e))
+        }
+        // Leaves (Number, Field, Ident, NowUnix, …) carry no binop.
+        _ => false,
+    }
+}
+
+/// Register-allocation brick A4 — per-binop-site predicate. True iff the LHS
+/// can be held in r15 (callee-saved) across the RHS evaluation instead of
+/// spilled to the stack via push/pop. Requires:
+///   - the RHS is non-simple (contains a call) — otherwise the A3 simple-RHS
+///     path already avoids any spill, and
+///   - the RHS subtree contains NO nested call-crossing binop — otherwise that
+///     inner binop would also want r15 to hold ITS lhs across ITS sibling
+///     call, colliding with ours. In that (rare, nested) case we fall through
+///     to push/pop, which the stack handles to arbitrary depth.
+///
+/// fib's outer `+` has RHS = `fib(n-2)` (a single call, no nested call-
+/// crossing binop) → r15 fast path. The pattern A4 optimizes is exactly "one
+/// value across one sibling call."
+fn use_r15_save(_left: &Expr, right: &Expr) -> bool {
+    !is_simple_operand(right) && !subtree_has_call_crossing_binop(right)
+}
+
+/// Register-allocation brick A4 — does the qualifying-callable body contain at
+/// least one binop site that will take the r15 fast path? Drives the per-
+/// callable `push r15` / `pop r15` decision: only pay the prologue/epilogue
+/// cost when a site actually uses r15. Walks the same arithmetic shapes the
+/// binop emitter recurses through.
+fn body_uses_r15_save(expr: &Expr) -> bool {
+    match expr {
+        Expr::Binary(op, l, r) => {
+            let this_site = !matches!(op, BinOp::And | BinOp::Or)
+                && use_r15_save(l, r);
+            this_site || body_uses_r15_save(l) || body_uses_r15_save(r)
+        }
+        Expr::If(c, t, e) => {
+            body_uses_r15_save(c) || body_uses_r15_save(t) || body_uses_r15_save(e)
+        }
+        Expr::Not(x) | Expr::Neg(x) | Expr::Abs(x) | Expr::BitNot(x) => {
+            body_uses_r15_save(x)
+        }
+        Expr::Min(a, b)
+        | Expr::Max(a, b)
+        | Expr::BitAnd(a, b)
+        | Expr::BitOr(a, b)
+        | Expr::BitXor(a, b)
+        | Expr::Shl(a, b)
+        | Expr::Shr(a, b) => body_uses_r15_save(a) || body_uses_r15_save(b),
+        Expr::Call(_, args) => args.iter().any(body_uses_r15_save),
+        Expr::Record(_, fields) => fields.iter().any(|(_, e)| body_uses_r15_save(e)),
+        _ => false,
     }
 }
 
@@ -10846,6 +12686,24 @@ fn emit_eval_expr(
                 message: "text literals not supported in native backend (use --compile for Rust transpiler)".into(),
             })
         }
+        Expr::Bytes(_) => {
+            // Backend brick b1: a `b"..."` literal is only valid as the whole
+            // body of an `output: bytes` rule (handled by emit_bytes_program).
+            // It has no scalar (rax) representation, so reaching the generic
+            // expression evaluator means it was used in an unsupported context.
+            Err(NativeError {
+                message: "bytes literal cannot be used as a scalar expression (brick b1 supports `b\"...\"` only as the whole body of an `output: bytes` rule)".into(),
+            })
+        }
+        Expr::Le32(_) | Expr::Le64(_) => {
+            // Backend brick b2: le32/le64 produce bytes, not a scalar (rax)
+            // value. They are only valid inside a bytes concat (handled by
+            // emit_bytes_program's streaming path). Reaching the scalar
+            // evaluator means an unsupported context.
+            Err(NativeError {
+                message: "le32/le64 produce bytes, not a scalar value (brick b2 supports them only inside a bytes `concat(...)` in an `output: bytes` rule)".into(),
+            })
+        }
         Expr::Field(base, field_name) => {
             // Accept field access on the input name or any other known binding
             // (e.g. context name for multi-input rules). The offsets map is the
@@ -10866,6 +12724,20 @@ fn emit_eval_expr(
                 }
                 _ => field_name.clone(),
             };
+            // Register-allocation brick A2: a qualifying recursive callable
+            // keeps its single input field in rbx. The read site becomes a
+            // register move instead of a memory reload. Guard on BOTH the
+            // base being the input ident AND the field name matching, so a
+            // hypothetical other field (there are none in the qualifying
+            // single-field case) never mis-resolves to rbx.
+            if let Some(sc) = self_call {
+                if sc.param_in_rbx == Some(field_name.as_str())
+                    && matches!(base.as_ref(), Expr::Ident(n) if n == input_name)
+                {
+                    code.extend_from_slice(&[0x48, 0x89, 0xD8]); // mov rax, rbx
+                    return Ok(());
+                }
+            }
             let offset = *offsets.get(lookup_key.as_str()).ok_or_else(|| NativeError {
                 message: format!("unknown field '{}' in native codegen", field_name),
             })?;
@@ -11176,11 +13048,112 @@ fn emit_eval_expr(
             }
 
             // === General case: evaluate both sides, apply operator ===
+            //
+            // Register-allocation brick A3: when the RHS is a simple leaf
+            // (constant / input-field load / now_unix) its evaluation clobbers
+            // ONLY rax/rcx targets, so we place lhs in rax and rhs DIRECTLY in
+            // rcx. Then `op rax, rcx` leaves the result in rax for free — no
+            // `mov rcx, rax` shuffle (A1's spill→rcx is gone) and no result
+            // normalization `mov rax, rcx` afterwards.
+            //
+            //   simple_rhs  : lhs in rax, rhs in rcx → op writes rax
+            //   !simple_rhs : lhs in rcx, rhs in rax (push/pop) → operator
+            //                 encodings below the `if` handle that convention.
+            //
+            // The two conventions are mirror images for the operator; we branch
+            // the operator encoding on `simple_rhs`.
+            let simple_rhs = is_simple_operand(right);
             emit_eval_expr(code, left, input_name, offsets, all_rules, field_ranges, text_bindings, self_call, arena_ctx)?;
-            code.push(0x50); // push rax
-            emit_eval_expr(code, right, input_name, offsets, all_rules, field_ranges, text_bindings, self_call, arena_ctx)?;
-            code.push(0x59); // pop rcx — now rcx=left, rax=right
+            if simple_rhs {
+                // lhs already in rax; eval rhs DIRECTLY into rcx (leaf load).
+                emit_eval_simple_into_rcx(code, right, input_name, offsets, self_call.as_ref())?;
+            } else {
+                // Register-allocation brick A4: inside a qualifying scalar-
+                // recursive callable (the A2 `param_in_rbx` path), the LHS can
+                // be held in r15 (callee-saved — the System-V ABI guarantees
+                // the RHS call preserves it) across the RHS evaluation instead
+                // of spilled to the stack. This removes one push/pop pair PER
+                // recursive level. `use_r15_save` refuses the trick when the
+                // RHS subtree contains its own call-crossing binop (it would
+                // want r15 too); that nested case falls through to push/pop,
+                // which the stack handles to arbitrary depth.
+                let in_qualifying_callable =
+                    self_call.as_ref().map_or(false, |sc| sc.param_in_rbx.is_some());
+                if in_qualifying_callable && use_r15_save(left, right) {
+                    // mov r15, rax — stash lhs in callee-saved r15
+                    code.extend_from_slice(&[0x49, 0x89, 0xC7]);
+                    emit_eval_expr(code, right, input_name, offsets, all_rules, field_ranges, text_bindings, self_call, arena_ctx)?;
+                    // mov rcx, r15 — now rcx=left, rax=right (same convention
+                    // as the push/pop path below)
+                    code.extend_from_slice(&[0x4C, 0x89, 0xF9]);
+                } else {
+                    code.push(0x50); // push rax — spill lhs (rhs may clobber rcx/stack)
+                    emit_eval_expr(code, right, input_name, offsets, all_rules, field_ranges, text_bindings, self_call, arena_ctx)?;
+                    code.push(0x59); // pop rcx — now rcx=left, rax=right
+                }
+            }
 
+            if simple_rhs {
+                // A3 convention: rax = lhs, rcx = rhs. Result lands in rax.
+                match op {
+                    BinOp::Add => {
+                        code.extend_from_slice(&[0x48, 0x01, 0xC8]); // add rax, rcx
+                    }
+                    BinOp::Sub => {
+                        code.extend_from_slice(&[0x48, 0x29, 0xC8]); // sub rax, rcx (lhs - rhs)
+                    }
+                    BinOp::Mul => {
+                        code.extend_from_slice(&[0x48, 0x0F, 0xAF, 0xC1]); // imul rax, rcx
+                    }
+                    BinOp::Div => {
+                        // dividend rax = lhs, divisor rcx = rhs → quotient in rax
+                        code.extend_from_slice(&[0x48, 0x99]); // cqo
+                        code.extend_from_slice(&[0x48, 0xF7, 0xF9]); // idiv rcx
+                    }
+                    BinOp::Mod => {
+                        // remainder in rdx → move to rax
+                        code.extend_from_slice(&[0x48, 0x99]); // cqo
+                        code.extend_from_slice(&[0x48, 0xF7, 0xF9]); // idiv rcx
+                        code.extend_from_slice(&[0x48, 0x89, 0xD0]); // mov rax, rdx
+                    }
+                    BinOp::Eq => {
+                        code.extend_from_slice(&[0x48, 0x39, 0xC8]); // cmp rax, rcx
+                        code.extend_from_slice(&[0x0F, 0x94, 0xC0]); // sete al
+                        code.extend_from_slice(&[0x48, 0x0F, 0xB6, 0xC0]); // movzx rax, al
+                    }
+                    BinOp::NotEq => {
+                        code.extend_from_slice(&[0x48, 0x39, 0xC8]); // cmp rax, rcx
+                        code.extend_from_slice(&[0x0F, 0x95, 0xC0]); // setne al
+                        code.extend_from_slice(&[0x48, 0x0F, 0xB6, 0xC0]); // movzx rax, al
+                    }
+                    BinOp::Gt => {
+                        code.extend_from_slice(&[0x48, 0x39, 0xC8]); // cmp rax, rcx (lhs vs rhs)
+                        code.extend_from_slice(&[0x0F, 0x9F, 0xC0]); // setg al (lhs > rhs)
+                        code.extend_from_slice(&[0x48, 0x0F, 0xB6, 0xC0]); // movzx rax, al
+                    }
+                    BinOp::Lt => {
+                        code.extend_from_slice(&[0x48, 0x39, 0xC8]); // cmp rax, rcx
+                        code.extend_from_slice(&[0x0F, 0x9C, 0xC0]); // setl al (lhs < rhs)
+                        code.extend_from_slice(&[0x48, 0x0F, 0xB6, 0xC0]); // movzx rax, al
+                    }
+                    BinOp::GtEq => {
+                        code.extend_from_slice(&[0x48, 0x39, 0xC8]); // cmp rax, rcx
+                        code.extend_from_slice(&[0x0F, 0x9D, 0xC0]); // setge al
+                        code.extend_from_slice(&[0x48, 0x0F, 0xB6, 0xC0]); // movzx rax, al
+                    }
+                    BinOp::LtEq => {
+                        code.extend_from_slice(&[0x48, 0x39, 0xC8]); // cmp rax, rcx
+                        code.extend_from_slice(&[0x0F, 0x9E, 0xC0]); // setle al
+                        code.extend_from_slice(&[0x48, 0x0F, 0xB6, 0xC0]); // movzx rax, al
+                    }
+                    BinOp::And | BinOp::Or => {
+                        unreachable!("And/Or are short-circuited; should not reach the general case");
+                    }
+                }
+                return Ok(());
+            }
+
+            // Non-simple-RHS convention: rcx = lhs, rax = rhs (unchanged from A1).
             match op {
                 BinOp::Add => {
                     // rax = left + right = rcx + rax
@@ -11359,11 +13332,44 @@ fn emit_eval_expr(
                                                 emit_copy_rbp_to_rsp(code, ptr_slot, *s_off);
                                                 emit_copy_rbp_to_rsp(code, len_slot, s_off + 8);
                                             }
+                                            // Text literal as a Record-constructor field of a
+                                            // call into a callable (e.g. the entry rule `go`
+                                            // calling `eval_e(EvalArg { ..., src: "AB" })`).
+                                            // Materialize the literal bytes inline (jmp over
+                                            // data; lea rax, [rip+data]; mov rdx, len) — the
+                                            // pointer targets the binary's executable region,
+                                            // so it stays valid for the callee's lifetime —
+                                            // then store (ptr, len) into the two struct slots.
+                                            // Mirrors emit_text_produce_ptrlen's Expr::Text arm.
+                                            Expr::Text(s) => {
+                                                let bytes = s.as_bytes();
+                                                let n = bytes.len() as i32;
+                                                if n <= 127 {
+                                                    code.push(0xEB);
+                                                    code.push(n as u8);
+                                                } else {
+                                                    code.push(0xE9);
+                                                    code.extend_from_slice(&n.to_le_bytes());
+                                                }
+                                                let addr = code.len();
+                                                code.extend_from_slice(bytes);
+                                                // lea rax, [rip + rel32]
+                                                let end = code.len() + 7;
+                                                let rel32 = addr as i32 - end as i32;
+                                                code.extend_from_slice(&[0x48, 0x8D, 0x05]);
+                                                code.extend_from_slice(&rel32.to_le_bytes());
+                                                // mov rdx, n
+                                                code.extend_from_slice(&[0x48, 0xC7, 0xC2]);
+                                                code.extend_from_slice(&n.to_le_bytes());
+                                                // store ptr (rax) and len (rdx) into struct slots
+                                                emit_store_rax_to_rsp(code, *s_off);
+                                                emit_store_rdx_to_rsp(code, s_off + 8);
+                                            }
                                             _ => {
                                                 return Err(NativeError {
                                                     message: format!(
                                                         "text field '{}' in Record constructor for recursive call to '{}': \
-                                                         only input field pass-through and BoundText are supported",
+                                                         only input field pass-through, BoundText, and text literals are supported",
                                                         fname, name
                                                     ),
                                                 });
@@ -11419,6 +13425,12 @@ fn emit_eval_expr(
                     // unchanged.
                     match &args[0] {
                         Expr::Ident(n) if n == input_name => {
+                            // A2: when the param lives in rbx, the [rbp-8] slot
+                            // is never written — load the pass-through arg from
+                            // rbx directly (`mov rdi, rbx`).
+                            if ctx.param_in_rbx.is_some() {
+                                code.extend_from_slice(&[0x48, 0x89, 0xDF]); // mov rdi, rbx
+                            } else {
                             // Phase A path: offsets keys = field names of
                             // the single-Number-field input, so the only
                             // entry's value IS the field slot (held in
@@ -11429,10 +13441,26 @@ fn emit_eval_expr(
                             // pick the input_name entry if present, else
                             // the first (which for single-field rules is
                             // the only one).
+                            // DETERMINISM: when `input_name` isn't itself a key
+                            // (single-field RECORD callee — offsets is keyed by
+                            // the FIELD name, e.g. `cell`, not the input ident
+                            // `st`), pass the input FIELD's value. The previous
+                            // `offsets.values().next()` picked an ARBITRARY
+                            // HashMap entry — nondeterministic across compiles,
+                            // and WRONG when match-arm binders (keyed
+                            // `__bind_*`, at lower/more-negative slots) coexist
+                            // with the field. The input field of a single-field
+                            // record is the first-allocated slot = the
+                            // least-negative (max) NON-binder offset.
                             let field_offset = if let Some(&o) = offsets.get(input_name) {
                                 o
                             } else {
-                                *offsets.values().next().unwrap()
+                                offsets
+                                    .iter()
+                                    .filter(|(k, _)| !k.starts_with("__bind_"))
+                                    .map(|(_, v)| *v)
+                                    .max()
+                                    .expect("single-field pass-through: no input field slot in offsets")
                             };
                             if field_offset >= -128 {
                                 code.extend_from_slice(&[0x48, 0x8B, 0x7D]);
@@ -11440,6 +13468,7 @@ fn emit_eval_expr(
                             } else {
                                 code.extend_from_slice(&[0x48, 0x8B, 0xBD]);
                                 code.extend_from_slice(&field_offset.to_le_bytes());
+                            }
                             }
                         }
                         Expr::Record(_concept_name, fields) => {
@@ -11852,7 +13881,21 @@ fn emit_eval_expr(
             // When in_callable=false (slice 4a.2 path), the existing
             // rbp-relative load runs byte-for-byte unchanged.
             let arena_size_bytes = (ac.max_nodes as i32) * ac.entry_size;
-            if ac.in_callable {
+            // Off-stack mmap arena (correction #1 + #2): under mmap the
+            // node_count lives INSIDE the mmap region at [r11 + arena_size]
+            // (same address as the callable path), so the entry path must
+            // (a) reload r11 from arena_base_slot FIRST — a per-record
+            // syscall before this construct may have clobbered r11 — and
+            // (b) read node_count via [r11 + arena_size], NOT
+            // [rbp + node_count_slot] (which doesn't exist under mmap).
+            if ac.use_mmap && !ac.in_callable {
+                emit_arena_base_into_r11(code, ac);
+            }
+            // node_count lives at [r11 + arena_size] for both the callable
+            // path AND the entry mmap path; only the stack entry path uses
+            // the rbp slot.
+            let nc_via_r11 = ac.in_callable || ac.use_mmap;
+            if nc_via_r11 {
                 // mov rax, [r11 + arena_size_bytes]
                 //   r11-indirect needs REX.B; disp32 form when offset > 127.
                 if arena_size_bytes <= 127 {
@@ -11898,7 +13941,12 @@ fn emit_eval_expr(
             // no longer addressable from the callable's rbp. Recursive
             // bodies have no syscalls (slice constraint), so r11
             // survives across `call`/`ret` and we trust it.
-            if !ac.in_callable {
+            // Stack entry path: lea r11 from arena_rbp_offset (byte-for-byte
+            // unchanged). Mmap entry path: r11 was already reloaded from the
+            // base slot before Step 2, and nothing between Steps 2-4 emits a
+            // syscall (slice-4c field exprs are allocation-free), so no
+            // re-reload is needed. Callables trust r11 across call/ret.
+            if !ac.in_callable && !ac.use_mmap {
                 let aro = ac.arena_rbp_offset;
                 if aro >= -128 {
                     code.extend_from_slice(&[0x4C, 0x8D, 0x5D]);
@@ -11972,8 +14020,11 @@ fn emit_eval_expr(
             // inc qword [rbp + node_count_slot]  (REX.W 0x48, 0xFF, /0 = 0x45 disp8)
             //
             // Slice 4a.3: when in_callable, address node_count via r11 +
-            // arena_size (rbp-independent — see Step 2 rationale).
-            if ac.in_callable {
+            // arena_size (rbp-independent — see Step 2 rationale). Off-stack
+            // mmap (correction #1): the entry path ALSO bumps via
+            // [r11 + arena_size] — node_count lives in the mmap region, and
+            // r11 is still the (un-clobbered) base from Step 2's reload.
+            if nc_via_r11 {
                 // inc qword [r11 + arena_size_bytes]  (REX.WB 0x49, 0xFF, /0 = 0x43)
                 if arena_size_bytes <= 127 {
                     code.extend_from_slice(&[0x49, 0xFF, 0x43]);
@@ -12049,6 +14100,20 @@ fn emit_eval_expr(
                     field_ranges, text_bindings, self_call,
                     Some(ac),
                 )?;
+                // Off-stack mmap arena (correction #3): at ENTRY level the
+                // r11 register may have been clobbered by a per-record
+                // syscall (text write / append_file) before this dispatch.
+                // The Step-2 `add rax, r11` below trusts r11 as the arena
+                // base, so under mmap reload it from arena_base_slot first.
+                // Callables (in_callable=true) trust r11 across call/ret and
+                // must NOT reload (they cannot reach the rbp slot). On the
+                // stack the pre-mmap path also trusted the register, but the
+                // entry-level dispatch ran before any per-record syscall in
+                // every existing example — keep that path byte-identical by
+                // only reloading under mmap.
+                if ac.use_mmap && !ac.in_callable {
+                    emit_arena_base_into_r11(code, ac);
+                }
                 // Step 2: compute entry pointer in rax = r11 + idx * entry_size.
                 // mov r10, entry_size_imm
                 code.push(0x49);
@@ -12084,7 +14149,22 @@ fn emit_eval_expr(
                 // from the offsets map's smallest (most-negative) value
                 // for the input identifier(s). Simpler: scan offsets, find
                 // the most-negative existing slot, place binders below it.
-                let lowest_offset: i32 = offsets.values().copied().min().unwrap_or(-8);
+                // The binder pool must sit below EVERY live frame slot, not
+                // just the ones in `offsets`. Text-typed input fields (and any
+                // BoundText: let bindings, read/fetch results) live in
+                // `text_bindings` as (ptr_slot, len_slot) pairs — they are NOT
+                // in `offsets`. Deriving the base from `offsets` alone places
+                // binders on top of a text input field's slots (e.g. a record
+                // input `EvalArg { node: E, src: text }`: `offsets` only holds
+                // `node` at -8, so a match-arm binder would clobber `src`'s
+                // ptr at -16). Scan both maps for the most-negative slot.
+                let lowest_in_offsets: i32 = offsets.values().copied().min().unwrap_or(-8);
+                let lowest_in_text: i32 = text_bindings
+                    .values()
+                    .flat_map(|&(p, l)| [p, l])
+                    .min()
+                    .unwrap_or(0);
+                let lowest_offset: i32 = lowest_in_offsets.min(lowest_in_text);
                 // First binder slot is 8 bytes below the lowest existing
                 // offset. binder i sits at first - 8*i.
                 let binder_base = lowest_offset - 8;
@@ -12129,6 +14209,27 @@ fn emit_eval_expr(
                     let mut extended_ranges = field_ranges.clone();
                     let _ = &mut extended_ranges;
                     let mut extended_text_bindings: TextBindings<'_> = text_bindings.clone();
+                    // Arm binders live in a key namespace distinct from input
+                    // field accesses: a binder named `width` must NOT overwrite
+                    // the input field `pa.width` in extended_offsets (the field
+                    // access `Expr::Field(Ident(input), "width")` and a bare
+                    // binder reference `Expr::Ident("width")` would otherwise
+                    // collapse onto the same key, silently aliasing the field to
+                    // the binder slot — a miscompile). We key binders under
+                    // `__bind_<name>` (mirroring the established `__state_`
+                    // convention); the bare-Ident resolution arm consults the
+                    // `__bind_` key FIRST, so a binder shadows correctly WITHIN
+                    // its arm while leaving the input field's bare-key entry
+                    // intact for `Expr::Field` to find. The `__bind_` strings
+                    // are pre-built into this arena so their `&str` views live
+                    // as long as `extended_offsets` (consumed by emit_eval_expr
+                    // for this arm's body below).
+                    let binder_keys: Vec<String> = arm.binders.iter().map(|b| {
+                        match b {
+                            Some(name) => format!("__bind_{}", name),
+                            None => String::new(),
+                        }
+                    }).collect();
                     let mut binder_cursor = binder_base;
                     for (i, binder_opt) in arm.binders.iter().enumerate() {
                         let field_ty = &declared_fields[i].1;
@@ -12171,6 +14272,21 @@ fn emit_eval_expr(
                                     code.extend_from_slice(&[0x48, 0x89, 0x95]);
                                     code.extend_from_slice(&len_slot.to_le_bytes());
                                 }
+                                // NOTE: text binders stay keyed by their BARE
+                                // name (unlike number binders, which use the
+                                // `__bind_` namespace below). The text-binding
+                                // lookup paths (emit_length, emit_text_write_to_fd,
+                                // the BoundText Ident arms) resolve binder
+                                // references by bare name across many sites; a
+                                // `__bind_` rename would require rerouting all of
+                                // them and is out of scope here. The proven,
+                                // in-scope defect is the NUMBER binder/field
+                                // collision (a same-named text binder shadowing a
+                                // text input field is the untested symmetric case;
+                                // no current program exercises it). Keeping the
+                                // bare key here preserves byte-identical codegen
+                                // for existing text-binder group rules
+                                // (e.g. label_tree's `Leaf(label) => length(label)`).
                                 extended_text_bindings.insert(binder_name.as_str(), (ptr_slot, len_slot));
                             } else {
                                 // mov rdx, [rax + arena_off]
@@ -12189,7 +14305,8 @@ fn emit_eval_expr(
                                     code.extend_from_slice(&[0x48, 0x89, 0x95]);
                                     code.extend_from_slice(&binder_cursor.to_le_bytes());
                                 }
-                                extended_offsets.insert(binder_name.as_str(), binder_cursor);
+                                let _ = binder_name;
+                                extended_offsets.insert(binder_keys[i].as_str(), binder_cursor);
                             }
                         }
                         binder_cursor -= if is_text { 16 } else { 8 };
@@ -12304,8 +14421,17 @@ fn emit_eval_expr(
             })
         }
         Expr::Ident(name) => {
-            // Let-bound variable — load from rbp-relative slot
-            if let Some(offset) = offsets.get(name.as_str()) {
+            // Let-bound variable or match-arm binder — load from rbp-relative
+            // slot. Arm binders are keyed under `__bind_<name>` (see the arena
+            // MatchVariant path) so they can't collide with an input field of
+            // the same name; consult that key FIRST so a binder shadows
+            // correctly within its arm, then fall back to the bare name (let
+            // bindings, group-input index).
+            let bind_key = format!("__bind_{}", name);
+            if let Some(offset) = offsets.get(bind_key.as_str()) {
+                load_rax_from_rbp(code, *offset);
+                Ok(())
+            } else if let Some(offset) = offsets.get(name.as_str()) {
                 load_rax_from_rbp(code, *offset);
                 Ok(())
             } else {
@@ -15560,6 +17686,7 @@ fn expr_kind(e: &Expr) -> &'static str {
     match e {
         Expr::Number(_) => "Number",
         Expr::Text(_) => "Text",
+        Expr::Bytes(_) => "Bytes",
         Expr::Ident(_) => "Ident",
         Expr::Field(_, _) => "Field",
         Expr::Binary(_, _, _) => "Binary",
@@ -15586,6 +17713,8 @@ fn expr_kind(e: &Expr) -> &'static str {
         Expr::EndsWith(_, _) => "EndsWith",
         Expr::Length(_) => "Length",
         Expr::Abs(_) => "Abs",
+        Expr::Le32(_) => "Le32",
+        Expr::Le64(_) => "Le64",
         Expr::Min(_, _) => "Min",
         Expr::Max(_, _) => "Max",
         Expr::Substring(_, _, _) => "Substring",
@@ -17860,6 +19989,1455 @@ rule discount_purchase
         );
 
         let _ = fs::remove_file(out);
+    }
+
+    /// Backend brick b1: a rule `output: bytes` whose body is a `b"..."`
+    /// literal must emit EXACTLY those raw bytes to stdout — no trailing
+    /// newline, no extra bytes. Covers the basic blob (`mov rbx, rax`
+    /// encoding) and the full-range escape blob (00 0f ff 80) to prove every
+    /// byte 0x00..=0xFF round-trips through the lexer's `\xNN` escape and the
+    /// native data-section embedding.
+    #[test]
+    fn bytes_literal_emits_raw_bytes() {
+        use std::fs;
+        use std::process::Command;
+        let src = r#"@verbose 0.1.0
+
+concept Trigger
+  @intention: "Trivial trigger"
+  @source: machine_bytes.intent:1
+
+  fields:
+    n : number [0, 1]
+
+
+rule mov_rbx_rax
+  @intention: "Emit `mov rbx, rax`"
+  @source: machine_bytes.intent:2
+
+  input:
+    t : Trigger
+
+  output:
+    code : bytes
+
+  logic:
+    code = b"\x48\x89\xc3"
+
+  proofs:
+    purity:
+      reads   : []
+      calls   : []
+    termination:
+      bound : 1
+
+
+rule full_range
+  @intention: "Emit a full-range blob"
+  @source: machine_bytes.intent:3
+
+  input:
+    t : Trigger
+
+  output:
+    code : bytes
+
+  logic:
+    code = b"\x00\x0f\xff\x80"
+
+  proofs:
+    purity:
+      reads   : []
+      calls   : []
+    termination:
+      bound : 1
+"#;
+        let tokens = crate::lexer::Lexer::new(src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        // Rule 1: `mov rbx, rax` → exactly 48 89 c3, nothing else.
+        let out1 = std::env::temp_dir().join("verbosec_test_bytes_mov");
+        compile_native(&program, "mov_rbx_rax", out1.to_str().unwrap(), false, false)
+            .expect("bytes output rule must compile natively");
+        let run1 = Command::new(&out1)
+            .args(["1"])
+            .output()
+            .expect("spawn mov_rbx_rax");
+        assert_eq!(
+            run1.stdout,
+            vec![0x48u8, 0x89, 0xc3],
+            "bytes literal must emit exactly the raw bytes with no newline; got {:?}",
+            run1.stdout,
+        );
+
+        // Rule 2: full-range escapes → exactly 00 0f ff 80.
+        let out2 = std::env::temp_dir().join("verbosec_test_bytes_full");
+        compile_native(&program, "full_range", out2.to_str().unwrap(), false, false)
+            .expect("full-range bytes literal must compile natively");
+        let run2 = Command::new(&out2)
+            .args(["1"])
+            .output()
+            .expect("spawn full_range");
+        assert_eq!(
+            run2.stdout,
+            vec![0x00u8, 0x0f, 0xff, 0x80],
+            "full-range bytes literal must emit exactly 00 0f ff 80; got {:?}",
+            run2.stdout,
+        );
+
+        let _ = fs::remove_file(out1);
+        let _ = fs::remove_file(out2);
+    }
+
+    /// Backend brick b2: compose byte sequences with `concat(...)` over bytes
+    /// args and `le32`/`le64` (number → little-endian bytes). The worked
+    /// example `mov_rax_imm` = concat(b"\x48\xb8", le64(42), b"\xc3") must emit
+    /// exactly the x86-64 encoding of `mov rax, 42 ; ret`:
+    ///   48 b8 2a 00 00 00 00 00 00 00 c3   (11 bytes)
+    /// We assert the exact byte sequence AND, as a strong check, mmap those
+    /// bytes as executable and call them as `extern "C" fn() -> i64`, asserting
+    /// the result is 42 — proving the emitted bytes are REAL machine code.
+    #[test]
+    fn bytes_concat_and_le_emit_machine_code() {
+        use std::fs;
+        use std::process::Command;
+        let src = r#"@verbose 0.1.0
+
+concept Trigger
+  @intention: "Trivial trigger"
+  @source: bytes_concat.intent:1
+
+  fields:
+    n : number [0, 1]
+
+
+rule mov_rax_imm
+  @intention: "Emit `mov rax, 42 ; ret`"
+  @source: bytes_concat.intent:2
+
+  input:
+    t : Trigger
+
+  output:
+    code : bytes
+
+  logic:
+    code = concat(b"\x48\xb8", le64(42), b"\xc3")
+
+  proofs:
+    purity:
+      reads   : []
+      calls   : []
+    termination:
+      bound : 4
+
+
+rule le32_demo
+  @intention: "Emit le32(258) = 02 01 00 00"
+  @source: bytes_concat.intent:3
+
+  input:
+    t : Trigger
+
+  output:
+    code : bytes
+
+  logic:
+    code = le32(258)
+
+  proofs:
+    purity:
+      reads   : []
+      calls   : []
+    termination:
+      bound : 4
+
+
+rule le64_neg
+  @intention: "Emit le64(-1) = ff*8"
+  @source: bytes_concat.intent:4
+
+  input:
+    t : Trigger
+
+  output:
+    code : bytes
+
+  logic:
+    code = le64(-1)
+
+  proofs:
+    purity:
+      reads   : []
+      calls   : []
+    termination:
+      bound : 4
+"#;
+        let tokens = crate::lexer::Lexer::new(src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        // --- mov_rax_imm: exact bytes ---
+        let out1 = std::env::temp_dir().join("verbosec_test_b2_mov");
+        compile_native(&program, "mov_rax_imm", out1.to_str().unwrap(), false, false)
+            .expect("bytes concat + le64 rule must compile natively");
+        let run1 = Command::new(&out1).args(["1"]).output().expect("spawn mov_rax_imm");
+        let expected_mov = vec![0x48u8, 0xb8, 0x2a, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xc3];
+        assert_eq!(
+            run1.stdout, expected_mov,
+            "concat(b\"\\x48\\xb8\", le64(42), b\"\\xc3\") must emit `mov rax,42; ret`; got {:?}",
+            run1.stdout,
+        );
+
+        // --- le32(258) = 02 01 00 00 ---
+        let out2 = std::env::temp_dir().join("verbosec_test_b2_le32");
+        compile_native(&program, "le32_demo", out2.to_str().unwrap(), false, false)
+            .expect("le32 rule must compile natively");
+        let run2 = Command::new(&out2).args(["1"]).output().expect("spawn le32_demo");
+        assert_eq!(run2.stdout, vec![0x02u8, 0x01, 0x00, 0x00], "le32(258); got {:?}", run2.stdout);
+
+        // --- le64(-1) = ff * 8 ---
+        let out3 = std::env::temp_dir().join("verbosec_test_b2_le64");
+        compile_native(&program, "le64_neg", out3.to_str().unwrap(), false, false)
+            .expect("le64 rule must compile natively");
+        let run3 = Command::new(&out3).args(["1"]).output().expect("spawn le64_neg");
+        assert_eq!(run3.stdout, vec![0xffu8; 8], "le64(-1); got {:?}", run3.stdout);
+
+        // --- STRONG: the emitted machine code REALLY runs. mmap RWX, copy the
+        // 11 bytes in, call as fn() -> i64, assert 42. ---
+        unsafe {
+            let len = expected_mov.len();
+            let page = 4096usize;
+            let alloc = libc_mmap(page);
+            assert!(!alloc.is_null(), "mmap failed");
+            std::ptr::copy_nonoverlapping(expected_mov.as_ptr(), alloc as *mut u8, len);
+            let f: extern "C" fn() -> i64 = std::mem::transmute(alloc);
+            let r = f();
+            libc_munmap(alloc, page);
+            assert_eq!(r, 42, "emitted `mov rax,42; ret` must return 42 when executed, got {}", r);
+        }
+
+        let _ = fs::remove_file(out1);
+        let _ = fs::remove_file(out2);
+        let _ = fs::remove_file(out3);
+    }
+
+    /// Brick b3-native — THE milestone test. `x86_expr_src` is a recursive
+    /// `bytes`-returning rule (the x86-64 machine-code emitter): it
+    /// tokenizes, parses with precedence, lowers the AST to executable
+    /// x86-64 bytes via the recursive streaming-bytes path, and appends
+    /// `pop rax ; ret` so the emitted function returns its top-of-stack
+    /// value in rax.
+    ///
+    /// For each expression we:
+    ///   1. run x86_expr_src(expr, "0") → the machine-code bytes,
+    ///   2. mmap those bytes RWX and CALL them as `extern "C" fn() -> i64`,
+    ///   3. assert the executed result == eval_expr(expr) == the hand value.
+    /// This proves the bytes the recursive emitter streamed are REAL,
+    /// runnable x86-64 — the whole point of the backend arc.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn streaming_x86_expr_executes() {
+        use std::fs;
+        use std::process::Command;
+
+        let src = fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let x86 = std::env::temp_dir().join("verbosec_test_x86_expr_src");
+        let eval = std::env::temp_dir().join("verbosec_test_eval_expr_for_x86");
+        compile_native(&program, "x86_expr_src", x86.to_str().unwrap(), false, false)
+            .expect("x86_expr_src (recursive bytes streaming) must compile natively");
+        compile_native(&program, "eval_expr", eval.to_str().unwrap(), false, false)
+            .expect("eval_expr must compile natively");
+
+        // (expression, hand-computed value)
+        let cases: &[(&str, i64)] = &[
+            ("1 + 2", 3),
+            ("1 + 2 * 3", 7),
+            ("10 - 2 - 3", 5),
+            ("2 * 3 * 4", 24),
+            ("- 5 + 2", -3),
+            ("(1 + 2) * (3 + 4)", 21),
+            ("100 - 50 * 2", 0),
+            ("7", 7),
+        ];
+
+        for &(expr, expected) in cases {
+            // 1. emit machine code via the recursive streaming-bytes emitter.
+            let mc = Command::new(&x86)
+                .args([expr, "0"])
+                .output()
+                .expect("spawn x86_expr_src");
+            assert!(
+                mc.status.success(),
+                "x86_expr_src must exit 0 for {:?}; got {:?}",
+                expr, mc.status
+            );
+            let code = mc.stdout;
+            assert!(
+                !code.is_empty(),
+                "x86_expr_src emitted no bytes for {:?}",
+                expr
+            );
+
+            // 2. mmap RWX, copy the emitted bytes in, call as fn() -> i64.
+            let x86_result = unsafe {
+                let page = 4096usize;
+                let alloc = libc_mmap(page);
+                assert!(!alloc.is_null(), "mmap failed");
+                std::ptr::copy_nonoverlapping(code.as_ptr(), alloc as *mut u8, code.len());
+                let f: extern "C" fn() -> i64 = std::mem::transmute(alloc);
+                let r = f();
+                libc_munmap(alloc, page);
+                r
+            };
+
+            // 3. cross-check against eval_expr (the interpreter-parity native
+            //    evaluator of the SAME parse) and the hand value.
+            let ev = Command::new(&eval)
+                .args([expr, "0"])
+                .output()
+                .expect("spawn eval_expr");
+            assert!(ev.status.success(), "eval_expr must exit 0 for {:?}", expr);
+            let eval_val: i64 = String::from_utf8_lossy(&ev.stdout)
+                .trim()
+                .parse()
+                .unwrap_or_else(|_| panic!("eval_expr produced non-number for {:?}: {:?}", expr, ev.stdout));
+
+            assert_eq!(
+                x86_result, expected,
+                "x86 machine code for {:?} returned {} (expected {})",
+                expr, x86_result, expected
+            );
+            assert_eq!(
+                eval_val, expected,
+                "eval_expr for {:?} returned {} (expected {})",
+                expr, eval_val, expected
+            );
+            assert_eq!(
+                x86_result, eval_val,
+                "x86 ({}) and eval_expr ({}) disagree for {:?}",
+                x86_result, eval_val, expr
+            );
+        }
+
+        let _ = fs::remove_file(x86);
+        let _ = fs::remove_file(eval);
+    }
+
+    /// Brick b4a: COMPARISONS + `if`/`else` in the machine-code generator.
+    /// The streaming emitter cannot backpatch, so `code_size_expr` computes
+    /// each branch's exact byte length ahead of time and `if` emits its
+    /// `jz`/`jmp` with rel32 offsets derived from those sizes. Any mismatch
+    /// between code_size_expr and x86_expr's byte output = wrong offset =
+    /// crash/wrong result — which is exactly what this mmap+exec test catches.
+    #[test]
+    fn streaming_x86_if_cmp_executes() {
+        use std::fs;
+        use std::process::Command;
+
+        let src = fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let x86 = std::env::temp_dir().join("verbosec_test_x86_if_cmp_src");
+        let eval = std::env::temp_dir().join("verbosec_test_eval_for_x86_if_cmp");
+        compile_native(&program, "x86_expr_src", x86.to_str().unwrap(), false, false)
+            .expect("x86_expr_src (recursive bytes streaming) must compile natively");
+        compile_native(&program, "eval_expr", eval.to_str().unwrap(), false, false)
+            .expect("eval_expr must compile natively");
+
+        // (expression, hand-computed value) — comparisons + if/else, including
+        // a nested if in the else (offset math) and an if as a sub-expression.
+        let cases: &[(&str, i64)] = &[
+            ("1 < 2", 1),
+            ("2 < 1", 0),
+            ("3 == 3", 1),
+            ("3 != 3", 0),
+            ("5 >= 5", 1),
+            ("2 * 3 > 5", 1),
+            ("if 1 < 2 then 10 else 20", 10),
+            ("if 0 then 1 else 2", 2),
+            ("if 2 * 3 == 6 then 100 else 200", 100),
+            ("if (1 + 1) < 2 then 7 else if 3 > 2 then 8 else 9", 8),
+            ("(if 1 < 2 then 3 else 4) * 10", 30),
+        ];
+
+        for &(expr, expected) in cases {
+            // 1. emit machine code via the recursive streaming-bytes emitter.
+            let mc = Command::new(&x86)
+                .args([expr, "0"])
+                .output()
+                .expect("spawn x86_expr_src");
+            assert!(
+                mc.status.success(),
+                "x86_expr_src must exit 0 for {:?}; got {:?}",
+                expr, mc.status
+            );
+            let code = mc.stdout;
+            assert!(
+                !code.is_empty(),
+                "x86_expr_src emitted no bytes for {:?}",
+                expr
+            );
+
+            // 2. mmap RWX, copy the emitted bytes in, call as fn() -> i64.
+            let x86_result = unsafe {
+                let page = 4096usize;
+                let alloc = libc_mmap(page);
+                assert!(!alloc.is_null(), "mmap failed");
+                std::ptr::copy_nonoverlapping(code.as_ptr(), alloc as *mut u8, code.len());
+                let f: extern "C" fn() -> i64 = std::mem::transmute(alloc);
+                let r = f();
+                libc_munmap(alloc, page);
+                r
+            };
+
+            // 3. cross-check against eval_expr (interpreter-parity native
+            //    evaluator of the SAME parse) and the hand value.
+            let ev = Command::new(&eval)
+                .args([expr, "0"])
+                .output()
+                .expect("spawn eval_expr");
+            assert!(ev.status.success(), "eval_expr must exit 0 for {:?}", expr);
+            let eval_val: i64 = String::from_utf8_lossy(&ev.stdout)
+                .trim()
+                .parse()
+                .unwrap_or_else(|_| panic!("eval_expr produced non-number for {:?}: {:?}", expr, ev.stdout));
+
+            assert_eq!(
+                x86_result, expected,
+                "x86 machine code for {:?} returned {} (expected {})",
+                expr, x86_result, expected
+            );
+            assert_eq!(
+                eval_val, expected,
+                "eval_expr for {:?} returned {} (expected {})",
+                expr, eval_val, expected
+            );
+            assert_eq!(
+                x86_result, eval_val,
+                "x86 ({}) and eval_expr ({}) disagree for {:?}",
+                x86_result, eval_val, expr
+            );
+        }
+
+        let _ = fs::remove_file(x86);
+        let _ = fs::remove_file(eval);
+    }
+
+    /// Brick b4b-1 — THE program-level machine-code milestone. `x86_program_src`
+    /// lowers a whole NON-RECURSIVE multi-rule program to ONE callable x86-64
+    /// blob: every rule becomes a `proc` with a real `push rbp ; mov rbp, rsp`
+    /// frame, params loaded from the frame via `push qword [rbp+disp]`, and real
+    /// `call rel32` / `ret` between procs. The entry proc (the first rule, 0
+    /// params) is laid first at offset 0.
+    ///
+    /// For each program we:
+    ///   1. run x86_program_src(prog_src, "0") → the machine-code blob,
+    ///   2. mmap that blob RWX and CALL it at offset 0 as `extern "C" fn() -> i64`,
+    ///   3. assert the executed result == eval_main(prog_src) == the hand value.
+    /// This proves the program-level emitter produces REAL, runnable x86-64 with
+    /// a correct calling convention (frames, params, call/ret rel32 offsets).
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn streaming_x86_program_executes() {
+        use std::fs;
+        use std::process::Command;
+
+        let src = fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let x86 = std::env::temp_dir().join("verbosec_test_x86_program_src");
+        let em = std::env::temp_dir().join("verbosec_test_eval_main_for_x86prog");
+        compile_native(&program, "x86_program_src", x86.to_str().unwrap(), false, false)
+            .expect("x86_program_src (recursive bytes streaming) must compile natively");
+        compile_native(&program, "eval_main", em.to_str().unwrap(), false, false)
+            .expect("eval_main must compile natively");
+
+        // (program source, hand-computed value). Entry = the FIRST rule, 0 params.
+        // Covers: nested calls, multi-arg + chained calls, params used twice / out
+        // of order, and a comparison-returning call composed inside an `if`.
+        let cases: &[(&str, i64)] = &[
+            // double(add(3, 4)) -> double(7) -> 14
+            ("rule main\n  logic:\n    out = double(add(3, 4))\nrule add(x, y)\n  logic:\n    out = x + y\nrule double(x)\n  logic:\n    out = x * 2", 14),
+            // f(2, g(3)) -> f(2, 4) -> 2*4 -> 8 (2-arg + 1-arg chain, nested call as arg)
+            ("rule main\n  logic:\n    out = f(2, g(3))\nrule f(a, b)\n  logic:\n    out = a * b\nrule g(n)\n  logic:\n    out = n + 1", 8),
+            // sub(10, 3) -> 10 - 3 -> 7 (param order matters for non-commutative -)
+            ("rule main\n  logic:\n    out = sub(10, 3)\nrule sub(a, b)\n  logic:\n    out = a - b", 7),
+            // h(5) -> 5 * 5 -> 25 (same param loaded twice)
+            ("rule main\n  logic:\n    out = h(5)\nrule h(n)\n  logic:\n    out = n * n", 25),
+            // if cmp(2, 3) then 100 else 200 -> cmp(2,3)=1 -> 100 (call result in if)
+            ("rule main\n  logic:\n    out = if cmp(2, 3) then 100 else 200\nrule cmp(a, b)\n  logic:\n    out = a < b", 100),
+        ];
+
+        for &(prog_src, expected) in cases {
+            // 1. emit the program blob via the recursive streaming-bytes emitter.
+            let mc = Command::new(&x86)
+                .args([prog_src, "0"])
+                .output()
+                .expect("spawn x86_program_src");
+            assert!(
+                mc.status.success(),
+                "x86_program_src must exit 0 for {:?}; got {:?}",
+                prog_src, mc.status
+            );
+            let code = mc.stdout;
+            assert!(
+                !code.is_empty(),
+                "x86_program_src emitted no bytes for {:?}",
+                prog_src
+            );
+
+            // 2. mmap RWX, copy the blob in, call at offset 0 (the entry proc).
+            let x86_result = unsafe {
+                let page = 4096usize;
+                let alloc = libc_mmap(page);
+                assert!(!alloc.is_null(), "mmap failed");
+                std::ptr::copy_nonoverlapping(code.as_ptr(), alloc as *mut u8, code.len());
+                let f: extern "C" fn() -> i64 = std::mem::transmute(alloc);
+                let r = f();
+                libc_munmap(alloc, page);
+                r
+            };
+
+            // 3. cross-check against eval_main (the interpreter-parity native
+            //    evaluator of the SAME program) and the hand value.
+            let ev = Command::new(&em)
+                .args([prog_src, "0"])
+                .output()
+                .expect("spawn eval_main");
+            assert!(ev.status.success(), "eval_main must exit 0 for {:?}", prog_src);
+            let eval_val: i64 = String::from_utf8_lossy(&ev.stdout)
+                .trim()
+                .parse()
+                .unwrap_or_else(|_| panic!("eval_main produced non-number for {:?}: {:?}", prog_src, ev.stdout));
+
+            assert_eq!(
+                x86_result, expected,
+                "x86 program blob for {:?} returned {} (expected {})",
+                prog_src, x86_result, expected
+            );
+            assert_eq!(
+                eval_val, expected,
+                "eval_main for {:?} returned {} (expected {})",
+                prog_src, eval_val, expected
+            );
+            assert_eq!(
+                x86_result, eval_val,
+                "x86 ({}) and eval_main ({}) disagree for {:?}",
+                x86_result, eval_val, prog_src
+            );
+        }
+
+        let _ = fs::remove_file(x86);
+        let _ = fs::remove_file(em);
+    }
+
+    /// Brick b6 — the four missing binary operators in the machine-code
+    /// generator: division `/` (op 16), modulo `%` (op 17), logical `and`
+    /// (op 30), logical `or` (op 31). Both the closed-expression path
+    /// (x86_expr / code_size_expr) and the program path (x86_node /
+    /// code_size_node) grow these arms. div/mod are signed x86 idiv (truncate
+    /// toward zero, matching the interpreter oracle's Rust i64 / and %); div/mod
+    /// by zero is UNGUARDED — idiv #DE (SIGFPE) matches eval_expr's runtime
+    /// error (so both fault; not value-compared here). and/or are branchless on
+    /// the operand-!=0 semantics. This mmap+exec test pins x86 == eval_expr ==
+    /// hand value; a wrong div/mod/and/or code_size would shift every following
+    /// jump offset and crash, so it doubles as a byte-count check.
+    #[test]
+    fn streaming_x86_divmod_logic() {
+        use std::fs;
+        use std::process::Command;
+
+        let src = fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        // ---- expression path (x86_expr / code_size_expr) ----
+        let x86 = std::env::temp_dir().join("verbosec_test_x86_divmod_expr");
+        let eval = std::env::temp_dir().join("verbosec_test_eval_divmod_expr");
+        compile_native(&program, "x86_expr_src", x86.to_str().unwrap(), false, false)
+            .expect("x86_expr_src must compile natively");
+        compile_native(&program, "eval_expr", eval.to_str().unwrap(), false, false)
+            .expect("eval_expr must compile natively");
+
+        // (expression, hand-computed value). Covers div/mod (incl. negative,
+        // truncate-toward-zero), and/or (operand-!=0 semantics), and the
+        // composition of `and` with comparisons and `if`.
+        let cases: &[(&str, i64)] = &[
+            ("10 / 3", 3),
+            ("10 % 3", 1),
+            ("100 / 7", 14),
+            ("100 % 7", 2),
+            ("- 7 / 2", -3),  // idiv truncates toward zero, matching Rust i64 /
+            ("- 7 % 2", -1),  // Rust i64 % sign follows the dividend
+            ("5 and 0", 0),
+            ("5 and 3", 1),
+            ("0 or 0", 0),
+            ("0 or 7", 1),
+            ("(2 < 3) and (4 < 5)", 1),
+            ("1 and (if 1 < 2 then 1 else 0)", 1),
+        ];
+
+        for &(expr, expected) in cases {
+            let mc = Command::new(&x86)
+                .args([expr, "0"])
+                .output()
+                .expect("spawn x86_expr_src");
+            assert!(mc.status.success(), "x86_expr_src must exit 0 for {:?}", expr);
+            let code = mc.stdout;
+            assert!(!code.is_empty(), "x86_expr_src emitted no bytes for {:?}", expr);
+
+            let x86_result = unsafe {
+                let page = 4096usize;
+                let alloc = libc_mmap(page);
+                assert!(!alloc.is_null(), "mmap failed");
+                std::ptr::copy_nonoverlapping(code.as_ptr(), alloc as *mut u8, code.len());
+                let f: extern "C" fn() -> i64 = std::mem::transmute(alloc);
+                let r = f();
+                libc_munmap(alloc, page);
+                r
+            };
+
+            let ev = Command::new(&eval)
+                .args([expr, "0"])
+                .output()
+                .expect("spawn eval_expr");
+            assert!(ev.status.success(), "eval_expr must exit 0 for {:?}", expr);
+            let eval_val: i64 = String::from_utf8_lossy(&ev.stdout)
+                .trim()
+                .parse()
+                .unwrap_or_else(|_| panic!("eval_expr produced non-number for {:?}: {:?}", expr, ev.stdout));
+
+            assert_eq!(x86_result, expected, "x86 for {:?} = {} (expected {})", expr, x86_result, expected);
+            assert_eq!(eval_val, expected, "eval_expr for {:?} = {} (expected {})", expr, eval_val, expected);
+            assert_eq!(x86_result, eval_val, "x86 ({}) and eval_expr ({}) disagree for {:?}", x86_result, eval_val, expr);
+        }
+
+        let _ = fs::remove_file(&x86);
+        let _ = fs::remove_file(&eval);
+
+        // ---- program path (x86_node / code_size_node): div in a proc, and `%`
+        //      / `and` flowing across a real call ----
+        let xp = std::env::temp_dir().join("verbosec_test_x86_divmod_prog");
+        let em = std::env::temp_dir().join("verbosec_test_eval_divmod_prog");
+        compile_native(&program, "x86_program_src", xp.to_str().unwrap(), false, false)
+            .expect("x86_program_src must compile natively");
+        compile_native(&program, "eval_main", em.to_str().unwrap(), false, false)
+            .expect("eval_main must compile natively");
+
+        let prog_cases: &[(&str, i64)] = &[
+            // q(20, 6) -> 20 / 6 -> 3 (div inside a proc, params)
+            ("rule main\n  logic:\n    out = q(20, 6)\nrule q(a, b)\n  logic:\n    out = a / b", 3),
+            // r(17, 5) -> 17 % 5 -> 2 (mod across a call)
+            ("rule main\n  logic:\n    out = r(17, 5)\nrule r(a, b)\n  logic:\n    out = a % b", 2),
+            // band(6, 0) -> (6 != 0) and (0 != 0) -> 0 (logical and across a call)
+            ("rule main\n  logic:\n    out = band(6, 0)\nrule band(a, b)\n  logic:\n    out = a and b", 0),
+            // band(6, 9) -> 1
+            ("rule main\n  logic:\n    out = band(6, 9)\nrule band(a, b)\n  logic:\n    out = a and b", 1),
+        ];
+
+        for &(prog_src, expected) in prog_cases {
+            let mc = Command::new(&xp)
+                .args([prog_src, "0"])
+                .output()
+                .expect("spawn x86_program_src");
+            assert!(mc.status.success(), "x86_program_src must exit 0 for {:?}", prog_src);
+            let code = mc.stdout;
+            assert!(!code.is_empty(), "x86_program_src emitted no bytes for {:?}", prog_src);
+
+            let x86_result = unsafe {
+                let page = 4096usize;
+                let alloc = libc_mmap(page);
+                assert!(!alloc.is_null(), "mmap failed");
+                std::ptr::copy_nonoverlapping(code.as_ptr(), alloc as *mut u8, code.len());
+                let f: extern "C" fn() -> i64 = std::mem::transmute(alloc);
+                let r = f();
+                libc_munmap(alloc, page);
+                r
+            };
+
+            let ev = Command::new(&em)
+                .args([prog_src, "0"])
+                .output()
+                .expect("spawn eval_main");
+            assert!(ev.status.success(), "eval_main must exit 0 for {:?}", prog_src);
+            let eval_val: i64 = String::from_utf8_lossy(&ev.stdout)
+                .trim()
+                .parse()
+                .unwrap_or_else(|_| panic!("eval_main produced non-number for {:?}: {:?}", prog_src, ev.stdout));
+
+            assert_eq!(x86_result, expected, "x86 prog for {:?} = {} (expected {})", prog_src, x86_result, expected);
+            assert_eq!(eval_val, expected, "eval_main for {:?} = {} (expected {})", prog_src, eval_val, expected);
+            assert_eq!(x86_result, eval_val, "x86 ({}) and eval_main ({}) disagree for {:?}", x86_result, eval_val, prog_src);
+        }
+
+        let _ = fs::remove_file(&xp);
+        let _ = fs::remove_file(&em);
+    }
+
+    /// Brick b4b-2 — RECURSION in Verbose-emitted x86-64 machine code. The
+    /// program-level generator (b4b-1: proc layout, frame ABI, call/ret) +
+    /// b4a's if/comparison compose to give recursion for free: a proc's
+    /// self-call resolves to its own offset (proc_offset returns the current
+    /// proc), so the `call rel32` is a backward jump. No new Verbose code —
+    /// this pins that factorial/fib/mutual-recursion blobs mmap+exec to the
+    /// same value eval_main computes. THE backend-arc milestone: a compiler
+    /// written in Verbose emits native machine code for recursive programs.
+    #[test]
+    fn streaming_x86_program_recursion_executes() {
+        use std::fs;
+        use std::process::Command;
+
+        let src = fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let x86 = std::env::temp_dir().join("verbosec_test_x86_prog_rec");
+        let em = std::env::temp_dir().join("verbosec_test_eval_main_rec");
+        compile_native(&program, "x86_program_src", x86.to_str().unwrap(), false, false)
+            .expect("x86_program_src must compile natively");
+        compile_native(&program, "eval_main", em.to_str().unwrap(), false, false)
+            .expect("eval_main must compile natively");
+
+        // Recursive programs (entry = first rule, 0 params). Cover: direct
+        // recursion (factorial), deeper recursion, double recursion (fib),
+        // mutual recursion (even/odd), and a linear accumulator (sum).
+        let cases: &[(&str, i64)] = &[
+            ("rule main\n  logic:\n    out = fact(5)\nrule fact(n)\n  logic:\n    out = if n == 0 then 1 else n * fact(n - 1)", 120),
+            ("rule main\n  logic:\n    out = fact(10)\nrule fact(n)\n  logic:\n    out = if n == 0 then 1 else n * fact(n - 1)", 3628800),
+            ("rule main\n  logic:\n    out = fib(10)\nrule fib(n)\n  logic:\n    out = if n < 2 then n else fib(n - 1) + fib(n - 2)", 55),
+            ("rule main\n  logic:\n    out = ev(10)\nrule ev(n)\n  logic:\n    out = if n == 0 then 1 else od(n - 1)\nrule od(n)\n  logic:\n    out = if n == 0 then 0 else ev(n - 1)", 1),
+            ("rule main\n  logic:\n    out = rec(5)\nrule rec(n)\n  logic:\n    out = if n == 0 then 0 else n + rec(n - 1)", 15),
+        ];
+
+        for &(prog_src, expected) in cases {
+            let mc = Command::new(&x86)
+                .args([prog_src, "0"])
+                .output()
+                .expect("spawn x86_program_src");
+            assert!(mc.status.success(), "x86_program_src must exit 0 for {:?}", prog_src);
+            let code = mc.stdout;
+            assert!(!code.is_empty(), "x86_program_src emitted no bytes for {:?}", prog_src);
+
+            let x86_result = unsafe {
+                let page = 4096usize;
+                let alloc = libc_mmap(page);
+                assert!(!alloc.is_null(), "mmap failed");
+                std::ptr::copy_nonoverlapping(code.as_ptr(), alloc as *mut u8, code.len());
+                let f: extern "C" fn() -> i64 = std::mem::transmute(alloc);
+                let r = f();
+                libc_munmap(alloc, page);
+                r
+            };
+
+            let ev = Command::new(&em)
+                .args([prog_src, "0"])
+                .output()
+                .expect("spawn eval_main");
+            assert!(ev.status.success(), "eval_main must exit 0 for {:?}", prog_src);
+            let eval_val: i64 = String::from_utf8_lossy(&ev.stdout)
+                .trim()
+                .parse()
+                .unwrap_or_else(|_| panic!("eval_main produced non-number for {:?}", prog_src));
+
+            assert_eq!(x86_result, expected, "x86 blob for {:?} returned {} (expected {})", prog_src, x86_result, expected);
+            assert_eq!(eval_val, expected, "eval_main for {:?} returned {} (expected {})", prog_src, eval_val, expected);
+            assert_eq!(x86_result, eval_val, "x86 ({}) and eval_main ({}) disagree for {:?}", x86_result, eval_val, prog_src);
+        }
+
+        let _ = fs::remove_file(x86);
+        let _ = fs::remove_file(em);
+    }
+
+    /// Brick b7 — `let` bindings in the machine-code generator. A proc with L
+    /// lets reserves L stack slots below rbp (`sub rsp, 8*L`, gated on L>0 so
+    /// no-let procs stay byte-identical); each `let NAME = e` lowers to the
+    /// value ops + `pop rax` + `mov [rbp - 8*(j+1)], rax` (always-disp32). A
+    /// var referencing a let loads `push [rbp - 8*(j+1)]`. This mmap+exec test
+    /// pins the let-blob's value == eval_main == the hand value. A wrong let
+    /// slot / store / load size would shift every following call/if rel32 and
+    /// crash, so it doubles as a byte-count check on the let machinery.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn streaming_x86_lets_execute() {
+        use std::fs;
+        use std::process::Command;
+
+        let src = fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let x86 = std::env::temp_dir().join("verbosec_test_x86_lets");
+        let em = std::env::temp_dir().join("verbosec_test_eval_main_lets");
+        compile_native(&program, "x86_program_src", x86.to_str().unwrap(), false, false)
+            .expect("x86_program_src must compile natively");
+        compile_native(&program, "eval_main", em.to_str().unwrap(), false, false)
+            .expect("eval_main must compile natively");
+
+        // (program source, hand value). Entry = first rule, 0 params. Covers:
+        //   - single let referencing a param, used in the result (sq);
+        //   - let CHAINING (b references a, both used) — a later let reads an
+        //     earlier let's slot;
+        //   - a let used TWICE in the result (d + d);
+        //   - a let in a RECURSIVE proc, referencing the param and passed into
+        //     the recursive call (the let slot survives across the call because
+        //     the callee has its own frame).
+        let cases: &[(&str, i64)] = &[
+            // sq(5): let d = n*n ; out = d + 1 -> 26
+            ("rule main\n  logic:\n    out = sq(5)\nrule sq(n)\n  logic:\n    let d = n * n\n    out = d + 1", 26),
+            // f(4): let a = n+1 (=5) ; let b = a*a (=25) ; out = b - n -> 21
+            ("rule main\n  logic:\n    out = f(4)\nrule f(n)\n  logic:\n    let a = n + 1\n    let b = a * a\n    out = b - n", 21),
+            // g(7): let d = n*2 (=14) ; out = d + d -> 28
+            ("rule main\n  logic:\n    out = g(7)\nrule g(n)\n  logic:\n    let d = n * 2\n    out = d + d", 28),
+            // fa(5): let m = n-1 ; out = if n==0 then 1 else n * fa(m) -> 5! = 120
+            ("rule main\n  logic:\n    out = fa(5)\nrule fa(n)\n  logic:\n    let m = n - 1\n    out = if n == 0 then 1 else n * fa(m)", 120),
+        ];
+
+        for &(prog_src, expected) in cases {
+            // 1. emit the program blob via the recursive streaming-bytes emitter.
+            let mc = Command::new(&x86)
+                .args([prog_src, "0"])
+                .output()
+                .expect("spawn x86_program_src");
+            assert!(
+                mc.status.success(),
+                "x86_program_src must exit 0 for {:?}; got {:?}",
+                prog_src, mc.status
+            );
+            let code = mc.stdout;
+            assert!(!code.is_empty(), "x86_program_src emitted no bytes for {:?}", prog_src);
+
+            // 2. mmap RWX, copy the blob in, call at offset 0 (the entry proc).
+            let x86_result = unsafe {
+                let page = 4096usize;
+                let alloc = libc_mmap(page);
+                assert!(!alloc.is_null(), "mmap failed");
+                std::ptr::copy_nonoverlapping(code.as_ptr(), alloc as *mut u8, code.len());
+                let f: extern "C" fn() -> i64 = std::mem::transmute(alloc);
+                let r = f();
+                libc_munmap(alloc, page);
+                r
+            };
+
+            // 3. cross-check against eval_main (interpreter-parity native
+            //    evaluator of the SAME program) and the hand value.
+            let ev = Command::new(&em)
+                .args([prog_src, "0"])
+                .output()
+                .expect("spawn eval_main");
+            assert!(ev.status.success(), "eval_main must exit 0 for {:?}", prog_src);
+            let eval_val: i64 = String::from_utf8_lossy(&ev.stdout)
+                .trim()
+                .parse()
+                .unwrap_or_else(|_| panic!("eval_main produced non-number for {:?}: {:?}", prog_src, ev.stdout));
+
+            assert_eq!(x86_result, expected, "x86 let-blob for {:?} returned {} (expected {})", prog_src, x86_result, expected);
+            assert_eq!(eval_val, expected, "eval_main for {:?} returned {} (expected {})", prog_src, eval_val, expected);
+            assert_eq!(x86_result, eval_val, "x86 ({}) and eval_main ({}) disagree for {:?}", x86_result, eval_val, prog_src);
+        }
+
+        let _ = fs::remove_file(x86);
+        let _ = fs::remove_file(em);
+    }
+
+    /// Brick b8 — THE ELF PRINTS ITS RESULT. `elf_program_src` tokenizes +
+    /// parses a whole program, lowers it to the x86_program blob (b4b), and
+    /// wraps that blob in a minimal static ELF64 + a 101-byte `_start`
+    /// trampoline. The trampoline `call`s the entry proc, converts the returned
+    /// i64 in rax to decimal ASCII (with '-' for negatives, "0" for zero) plus
+    /// a trailing newline, writes it to stdout, then sys_exit(0). The output is
+    /// a RUNNABLE FILE whose STDOUT carries the full i64 result — so values
+    /// beyond the 0..255 exit-code range (e.g. fact(10) = 3628800) are now
+    /// observable, which b5's exit-code trampoline could not express.
+    ///
+    /// For each program we:
+    ///   1. run elf_program_src(prog_src, "0") → the ELF bytes,
+    ///   2. write them to a temp file, chmod 0o755, execute it as a child,
+    ///   3. assert the child's STDOUT (trimmed) == eval_main(prog_src) == the
+    ///      hand value, and that the child exits 0.
+    /// Covers values > 255 (fact(10), fib(20)), a negative (5 - 9 = -4), and
+    /// zero (7 - 7 = 0) — the cases the exit-code trampoline could not express.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn streaming_elf_prints_result() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        let src = fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let elf = std::env::temp_dir().join("verbosec_test_elf_program_src");
+        let em = std::env::temp_dir().join("verbosec_test_eval_main_for_elf");
+        compile_native(&program, "elf_program_src", elf.to_str().unwrap(), false, false)
+            .expect("elf_program_src (recursive bytes streaming) must compile natively");
+        compile_native(&program, "eval_main", em.to_str().unwrap(), false, false)
+            .expect("eval_main must compile natively");
+
+        // (program source, hand value). Entry = the FIRST rule, 0 params. The
+        // i64 result is now printed to stdout, so values are NOT bounded by the
+        // 0..255 exit-code byte. Covers: direct recursion (factorial) BOTH
+        // in-range (fact(5)=120) and out-of-range (fact(10)=3628800), double
+        // recursion (fib(20)=6765), a NEGATIVE result (5 - 9 = -4), ZERO
+        // (7 - 7 = 0), and nested calls (double(add(3,4))=14).
+        let cases: &[(&str, i64)] = &[
+            ("rule main\n  logic:\n    out = fact(5)\nrule fact(n)\n  logic:\n    out = if n == 0 then 1 else n * fact(n - 1)", 120),
+            ("rule main\n  logic:\n    out = fact(10)\nrule fact(n)\n  logic:\n    out = if n == 0 then 1 else n * fact(n - 1)", 3628800),
+            ("rule main\n  logic:\n    out = fib(20)\nrule fib(n)\n  logic:\n    out = if n < 2 then n else fib(n - 1) + fib(n - 2)", 6765),
+            ("rule main\n  logic:\n    out = 5 - 9", -4),
+            ("rule main\n  logic:\n    out = 7 - 7", 0),
+            ("rule main\n  logic:\n    out = double(add(3, 4))\nrule add(x, y)\n  logic:\n    out = x + y\nrule double(x)\n  logic:\n    out = x * 2", 14),
+        ];
+
+        for (i, &(prog_src, expected)) in cases.iter().enumerate() {
+            // 1. emit the ELF bytes via the recursive streaming-bytes emitter.
+            let mc = Command::new(&elf)
+                .args([prog_src, "0"])
+                .output()
+                .expect("spawn elf_program_src");
+            assert!(
+                mc.status.success(),
+                "elf_program_src must exit 0 for {:?}; got {:?}",
+                prog_src, mc.status
+            );
+            let elf_bytes = mc.stdout;
+            assert!(
+                elf_bytes.len() > 221,
+                "elf_program_src emitted too few bytes ({}) for {:?}",
+                elf_bytes.len(), prog_src
+            );
+            // ELF magic sanity.
+            assert_eq!(
+                &elf_bytes[0..4], &[0x7f, 0x45, 0x4c, 0x46],
+                "emitted file is not ELF for {:?}", prog_src
+            );
+
+            // 2. write to a temp file, chmod +x.
+            let out_path = std::env::temp_dir()
+                .join(format!("verbosec_test_elf_a_out_{}", i));
+            fs::write(&out_path, &elf_bytes).expect("write a.out");
+            let mut perms = fs::metadata(&out_path).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&out_path, perms).expect("chmod +x");
+
+            // 3. execute the file; the entry proc's value is PRINTED to stdout,
+            //    then the binary exits 0.
+            let child = Command::new(&out_path)
+                .output()
+                .expect("execute emitted ELF");
+            assert!(
+                child.status.success(),
+                "emitted ELF for {:?} did not exit 0; got {:?}",
+                prog_src, child.status
+            );
+            let child_out: i64 = String::from_utf8_lossy(&child.stdout)
+                .trim()
+                .parse()
+                .unwrap_or_else(|_| panic!("emitted ELF produced non-number for {:?}: {:?}", prog_src, child.stdout));
+
+            // cross-check against eval_main (interpreter-parity native evaluator).
+            let ev = Command::new(&em)
+                .args([prog_src, "0"])
+                .output()
+                .expect("spawn eval_main");
+            assert!(ev.status.success(), "eval_main must exit 0 for {:?}", prog_src);
+            let eval_val: i64 = String::from_utf8_lossy(&ev.stdout)
+                .trim()
+                .parse()
+                .unwrap_or_else(|_| panic!("eval_main produced non-number for {:?}: {:?}", prog_src, ev.stdout));
+
+            assert_eq!(
+                child_out, expected,
+                "emitted ELF for {:?} printed {} (expected {})",
+                prog_src, child_out, expected
+            );
+            assert_eq!(
+                eval_val, expected,
+                "eval_main for {:?} returned {} (expected {})",
+                prog_src, eval_val, expected
+            );
+            assert_eq!(
+                child_out, eval_val,
+                "ELF stdout ({}) and eval_main ({}) disagree for {:?}",
+                child_out, eval_val, prog_src
+            );
+
+            let _ = fs::remove_file(&out_path);
+        }
+
+        let _ = fs::remove_file(elf);
+        let _ = fs::remove_file(em);
+    }
+
+    /// R7a — THE SELF-HOSTED ARENA. `elf_program_src` now emits, for a program that
+    /// declares a variant (sum-type) concept, an mmap'd node arena in the ELF `_start`
+    /// trampoline (base in r15, count in r14) and REAL machine code for every
+    /// `Concept::Variant { ... }` construction: allocate a node at r15 + r14*entry_size,
+    /// write its tag, pop each field value into a payload slot, leave the node INDEX on
+    /// the stack (the variant's value), and bump r14. The R7a observable is the INDEX
+    /// the entry rule returns.
+    ///
+    /// We check, from CLEAN disk (emit ELF → chmod +x → run → read stdout):
+    ///   * `out = Lst::Nil`                              → prints 0 (first node).
+    ///   * `out = Lst::Cons { head: 42, tail: Lst::Nil }` → builds Nil (0) then Cons (1)
+    ///                                                       → prints 1 (the Cons index).
+    ///   * a variant construct inside an `if` branch      → prints 1, and would CRASH if
+    ///     code_size_node's AstVariant arm disagreed with x86_node (the jz rel32 depends
+    ///     on it) — the "compounding offsets" drift catcher.
+    ///   * a SCALAR program (`out = 2 + 3`)               → still prints 5, byte-identical
+    ///     path (no mmap prologue: the trampoline's first instruction is still the
+    ///     entry `call`, not `mov eax, 9`).
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn r7a_variant_construct_arena_index() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        let src = fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let elf = std::env::temp_dir().join("verbosec_test_r7a_elf_program_src");
+        compile_native(&program, "elf_program_src", elf.to_str().unwrap(), false, false)
+            .expect("elf_program_src must compile natively");
+
+        // The single-concept L group + a `main` rule whose body is the case under test.
+        let grp = "concept_group L [max_depth: 8, max_nodes: 64]\n  concept Lst\n    variants:\n      Cons of (head : number, tail : Lst)\n      Nil\nrule main\n  logic:\n    out = ";
+        // (program source, expected printed value, uses_variants?)
+        let cases: &[(String, i64, bool)] = &[
+            (format!("{}Lst::Nil", grp), 0, true),
+            (format!("{}Lst::Cons {{ head: 42, tail: Lst::Nil }}", grp), 1, true),
+            (format!("{}if 1 == 1 then Lst::Cons {{ head: 7, tail: Lst::Nil }} else Lst::Nil", grp), 1, true),
+            ("rule main\n  logic:\n    out = 2 + 3".to_string(), 5, false),
+        ];
+
+        for (i, (prog_src, expected, uses_var)) in cases.iter().enumerate() {
+            let mc = Command::new(&elf)
+                .args([prog_src.as_str(), "0"])
+                .output()
+                .expect("spawn elf_program_src");
+            assert!(
+                mc.status.success(),
+                "elf_program_src must exit 0 for {:?}; got {:?}",
+                prog_src, mc.status
+            );
+            let elf_bytes = mc.stdout;
+            assert_eq!(
+                &elf_bytes[0..4], &[0x7f, 0x45, 0x4c, 0x46],
+                "emitted file is not ELF for {:?}", prog_src
+            );
+            // Byte-identity guard: the 120 bytes of ELF+program headers are followed by
+            // the trampoline. A variant program gets the 61-byte mmap prologue first
+            // (mov eax, 9 = b8 09 00 00 00); a scalar program's trampoline still starts
+            // with the entry `call` (e8 60 00 00 00) — unchanged from pre-R7a.
+            if *uses_var {
+                assert_eq!(
+                    &elf_bytes[120..125], &[0xb8, 0x09, 0x00, 0x00, 0x00],
+                    "variant program {:?} must have the mmap arena prologue", prog_src
+                );
+            } else {
+                assert_eq!(
+                    &elf_bytes[120..125], &[0xe8, 0x60, 0x00, 0x00, 0x00],
+                    "scalar program {:?} must be byte-identical (no mmap prologue)", prog_src
+                );
+            }
+
+            let out_path = std::env::temp_dir()
+                .join(format!("verbosec_test_r7a_a_out_{}", i));
+            fs::write(&out_path, &elf_bytes).expect("write a.out");
+            let mut perms = fs::metadata(&out_path).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&out_path, perms).expect("chmod +x");
+
+            let child = Command::new(&out_path)
+                .output()
+                .expect("execute emitted ELF");
+            assert!(
+                child.status.success(),
+                "emitted ELF for {:?} did not exit 0; got {:?}",
+                prog_src, child.status
+            );
+            let child_out: i64 = String::from_utf8_lossy(&child.stdout)
+                .trim()
+                .parse()
+                .unwrap_or_else(|_| panic!("emitted ELF produced non-number for {:?}: {:?}", prog_src, child.stdout));
+            assert_eq!(
+                child_out, *expected,
+                "R7a ELF for {:?} printed {} (expected {})",
+                prog_src, child_out, expected
+            );
+
+            let _ = fs::remove_file(&out_path);
+        }
+
+        let _ = fs::remove_file(elf);
+    }
+
+    /// R7b — THE SELF-HOSTED MATCH. `elf_program_src` now emits, for a program with a
+    /// `match` on a variant, REAL machine code for tag dispatch + payload binding: the
+    /// scrutinee leaves an arena INDEX (R7a); AstMatch pops it, computes
+    /// node_addr = r15 + index*entry_size, loads the 8-byte tag, chains cmp/je over the
+    /// arm tags (resolved from the ConceptList), and at the matched arm copies the
+    /// payload fields into the binders' rbp slots before running the arm body.
+    ///
+    /// The R7b observable is the number the matched arm returns. We check from CLEAN
+    /// disk (emit ELF → chmod +x → run → read stdout) AND cross-check the SAME program
+    /// against the R6c interpreter oracle (`--run eval_main`):
+    ///   * `match build(): Cons(h, t) => h  Nil => 0` with `build() = Cons(5, Nil)`
+    ///        → dispatches to the Cons arm, binds h from payload slot 0 → prints 5.
+    ///   * same match with `build() = Nil`             → dispatches to the Nil arm → 0.
+    ///   * a TWO-arm match whose Cons arm body itself contains a `call`
+    ///        (`Cons(h, t) => h + take100()`) → 105; the arm block's call rel32 depends
+    ///        on the match prefix + dispatch-chain sizes, so a code_size_node/x86_node
+    ///        disagreement would CRASH / misprint — the compounding-offset drift catcher.
+    ///   * a SCALAR program stays byte-identical (no frame widening without a match).
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn r7b_match_variant_dispatch_and_bind() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        let src = fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let elf = std::env::temp_dir().join("verbosec_test_r7b_elf_program_src");
+        compile_native(&program, "elf_program_src", elf.to_str().unwrap(), false, false)
+            .expect("elf_program_src must compile natively");
+        // The R6c interpreter, our oracle: the emitted ELF must print what --run does.
+        let em = std::env::temp_dir().join("verbosec_test_r7b_eval_main");
+        compile_native(&program, "eval_main", em.to_str().unwrap(), false, false)
+            .expect("eval_main must compile natively");
+
+        let oracle = |source: &str| -> i64 {
+            let r = Command::new(&em).arg(source).arg("0").output().expect("spawn eval_main");
+            assert!(r.status.success(), "eval_main must exit 0 for {:?}", source);
+            String::from_utf8_lossy(&r.stdout).trim().parse::<i64>()
+                .unwrap_or_else(|_| panic!("eval_main non-number for {:?}: {:?}", source, r.stdout))
+        };
+
+        let grp = "concept_group L [max_depth: 8, max_nodes: 64]\n  concept Lst\n    variants:\n      Cons of (head : number, tail : Lst)\n      Nil\n";
+        let cons = format!("{grp}rule main\n  logic:\n    out = match build(): Cons(h, t) => h  Nil => 0\nrule build()\n  logic:\n    out = Lst::Cons {{ head: 5, tail: Lst::Nil }}");
+        let nil = format!("{grp}rule main\n  logic:\n    out = match build(): Cons(h, t) => h  Nil => 0\nrule build()\n  logic:\n    out = Lst::Nil");
+        // TWO-arm match whose Cons arm body contains a call (offset drift catcher).
+        let after = format!("{grp}rule main\n  logic:\n    out = match build(): Cons(h, t) => h + take100()  Nil => 0\nrule build()\n  logic:\n    out = Lst::Cons {{ head: 5, tail: Lst::Nil }}\nrule take100()\n  logic:\n    out = 100");
+        let scalar = "rule main\n  logic:\n    out = 2 + 3".to_string();
+
+        // (program source, expected printed value, uses_variants?)
+        let cases: &[(String, i64, bool)] = &[
+            (cons, 5, true),
+            (nil, 0, true),
+            (after, 105, true),
+            (scalar, 5, false),
+        ];
+
+        for (i, (prog_src, expected, uses_var)) in cases.iter().enumerate() {
+            // Cross-check the interpreter oracle agrees with the expected value.
+            assert_eq!(
+                oracle(prog_src), *expected,
+                "R6c oracle disagreement for {:?}", prog_src
+            );
+
+            let mc = Command::new(&elf).args([prog_src.as_str(), "0"]).output()
+                .expect("spawn elf_program_src");
+            assert!(mc.status.success(), "elf_program_src must exit 0 for {:?}; got {:?}", prog_src, mc.status);
+            let elf_bytes = mc.stdout;
+            assert_eq!(&elf_bytes[0..4], &[0x7f, 0x45, 0x4c, 0x46], "emitted file is not ELF for {:?}", prog_src);
+            // Byte-identity guard: a scalar (match-free) program keeps the pre-R7 trampoline.
+            if *uses_var {
+                assert_eq!(&elf_bytes[120..125], &[0xb8, 0x09, 0x00, 0x00, 0x00],
+                    "variant program {:?} must have the mmap arena prologue", prog_src);
+            } else {
+                assert_eq!(&elf_bytes[120..125], &[0xe8, 0x60, 0x00, 0x00, 0x00],
+                    "scalar program {:?} must be byte-identical (no mmap prologue)", prog_src);
+            }
+
+            let out_path = std::env::temp_dir().join(format!("verbosec_test_r7b_a_out_{}", i));
+            fs::write(&out_path, &elf_bytes).expect("write a.out");
+            let mut perms = fs::metadata(&out_path).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&out_path, perms).expect("chmod +x");
+
+            let child = Command::new(&out_path).output().expect("execute emitted ELF");
+            assert!(child.status.success(), "emitted ELF for {:?} did not exit 0; got {:?}", prog_src, child.status);
+            let child_out: i64 = String::from_utf8_lossy(&child.stdout).trim().parse()
+                .unwrap_or_else(|_| panic!("emitted ELF produced non-number for {:?}: {:?}", prog_src, child.stdout));
+            assert_eq!(child_out, *expected, "R7b ELF for {:?} printed {} (expected {})", prog_src, child_out, expected);
+
+            let _ = fs::remove_file(&out_path);
+        }
+
+        let _ = fs::remove_file(elf);
+        let _ = fs::remove_file(em);
+    }
+
+    /// Records-arc slice 3 — THE SELF-HOSTED FIELD ACCESS. `x86_node`'s AstField arm
+    /// was `int3` (b"\xcc"); slice 3 emits REAL machine code for a field access on a
+    /// LET-BOUND record. The crux vs eval: there is no runtime tag to read, so the
+    /// base's concept is resolved at COMPILE time — `let_rhs` looks up the let's RHS
+    /// Ast in the binding list, and when that RHS is a construction (AstVariant) its
+    /// concept-name span drives find_concept_index -> concept_at_index -> cd_fields ->
+    /// field_index_of to pick the payload slot. The emitted suffix mirrors R7b's
+    /// node-addr computation: pop rax (arena index) ; imul rax,rax,entry_size ;
+    /// add rax,r15 ; mov rax,[rax + 8 + 8*field_index] ; push rax (19 fixed bytes).
+    ///
+    /// A record `Foo { .. }` parses to AstVariant(Foo, Foo, fields) and constructs into
+    /// the SAME node arena as a variant, so slice 3 also taught `program_uses_arena`
+    /// (renamed from program_uses_variants) and `max_payload_fields` to count record
+    /// concepts — a group-less record program now gets the mmap arena + correct
+    /// entry_size. We check from CLEAN disk (emit ELF -> chmod +x -> run -> read stdout)
+    /// AND cross-check each program against the slice-2 interpreter oracle (eval_main):
+    ///   * `let s = Foo{a:42,b:7} ; out = s.a`  -> 42 (first field).
+    ///   * `... out = s.b`                       -> 7  (proves field_index, not slot 0).
+    ///   * `... out = s.a + s.b`                 -> 49 (both fields resolve).
+    ///   * field access AFTER other code (`let t = s.a + 1 ; out = t + s.b`) -> 50, the
+    ///     compounding-offset drift catcher: a code_size_node/x86_node AstField
+    ///     disagreement would shift the following ops' offsets and misprint / crash.
+    ///   * the R7 variant list-sum stays 6/15 (AstField arm never fires on it), and a
+    ///     scalar `2 + 3` stays 5 — both emit BYTE-IDENTICAL ELFs (pinned separately by
+    ///     r7a/r7b's byte-identity guards; here we pin the runtime values are unchanged).
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn records_slice3_astfield_codegen() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        let src = fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let elf = std::env::temp_dir().join("verbosec_test_r_s3_elf_program_src");
+        compile_native(&program, "elf_program_src", elf.to_str().unwrap(), false, false)
+            .expect("elf_program_src must compile natively");
+        // The slice-2 interpreter oracle: the emitted ELF must print what --run does.
+        let em = std::env::temp_dir().join("verbosec_test_r_s3_eval_main");
+        compile_native(&program, "eval_main", em.to_str().unwrap(), false, false)
+            .expect("eval_main must compile natively");
+
+        let oracle = |source: &str| -> i64 {
+            let r = Command::new(&em).arg(source).arg("0").output().expect("spawn eval_main");
+            assert!(r.status.success(), "eval_main must exit 0 for {:?}", source);
+            String::from_utf8_lossy(&r.stdout).trim().parse::<i64>()
+                .unwrap_or_else(|_| panic!("eval_main non-number for {:?}: {:?}", source, r.stdout))
+        };
+
+        // A bare record (no concept_group): construction goes through the arena
+        // exactly like a variant (Foo{..} parses to AstVariant(Foo, Foo, fields)).
+        let rec = "concept Foo\n  fields:\n    a : number\n    b : number\nrule main\n  logic:\n    let s = Foo { a: 42, b: 7 }\n    out = ";
+        let sa = format!("{rec}s.a");
+        let sb = format!("{rec}s.b");
+        let sab = format!("{rec}s.a + s.b");
+        // Field access AFTER other code — the compounding-offset drift catcher.
+        let compound = "concept Foo\n  fields:\n    a : number\n    b : number\nrule main\n  logic:\n    let s = Foo { a: 42, b: 7 }\n    let t = s.a + 1\n    out = t + s.b".to_string();
+        // R7 variant list-sum (AstField never fires) — must stay 6 / 15.
+        let lst = "concept_group L [max_depth: 30, max_nodes: 100]\n  concept Lst\n    variants:\n      Cons of (head : number, tail : Lst)\n      Nil\nrule main\n  logic:\n    out = sum_list(build(SEED))\nrule build(n)\n  logic:\n    out = if n == 0 then Lst::Cons { head: 0, tail: Lst::Nil } else Lst::Cons { head: n, tail: build(n - 1) }\nrule sum_list(l)\n  logic:\n    out = match l: Cons(h, t) => h + sum_list(t)  Nil => 0";
+        let lst3 = lst.replace("SEED", "3");
+        let lst5 = lst.replace("SEED", "5");
+        let scalar = "rule main\n  logic:\n    out = 2 + 3".to_string();
+
+        // (program source, expected printed value, uses_arena?)
+        let cases: &[(String, i64, bool)] = &[
+            (sa, 42, true),
+            (sb, 7, true),
+            (sab, 49, true),
+            (compound, 50, true),
+            (lst3, 6, true),
+            (lst5, 15, true),
+            (scalar, 5, false),
+        ];
+
+        for (i, (prog_src, expected, uses_arena)) in cases.iter().enumerate() {
+            // Cross-check the interpreter oracle agrees with the expected value.
+            assert_eq!(oracle(prog_src), *expected, "slice-2 oracle disagreement for {:?}", prog_src);
+
+            let mc = Command::new(&elf).args([prog_src.as_str(), "0"]).output()
+                .expect("spawn elf_program_src");
+            assert!(mc.status.success(), "elf_program_src must exit 0 for {:?}; got {:?}", prog_src, mc.status);
+            let elf_bytes = mc.stdout;
+            assert_eq!(&elf_bytes[0..4], &[0x7f, 0x45, 0x4c, 0x46], "emitted file is not ELF for {:?}", prog_src);
+            // Byte-identity guard: a record OR variant program gets the mmap arena
+            // prologue; a scalar (no concepts) keeps the pre-arena trampoline.
+            if *uses_arena {
+                assert_eq!(&elf_bytes[120..125], &[0xb8, 0x09, 0x00, 0x00, 0x00],
+                    "arena program {:?} must have the mmap prologue", prog_src);
+            } else {
+                assert_eq!(&elf_bytes[120..125], &[0xe8, 0x60, 0x00, 0x00, 0x00],
+                    "scalar program {:?} must be byte-identical (no mmap prologue)", prog_src);
+            }
+
+            let out_path = std::env::temp_dir().join(format!("verbosec_test_r_s3_a_out_{}", i));
+            fs::write(&out_path, &elf_bytes).expect("write a.out");
+            let mut perms = fs::metadata(&out_path).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&out_path, perms).expect("chmod +x");
+
+            let child = Command::new(&out_path).output().expect("execute emitted ELF");
+            assert!(child.status.success(), "emitted ELF for {:?} did not exit 0; got {:?}", prog_src, child.status);
+            let child_out: i64 = String::from_utf8_lossy(&child.stdout).trim().parse()
+                .unwrap_or_else(|_| panic!("emitted ELF produced non-number for {:?}: {:?}", prog_src, child.stdout));
+            assert_eq!(child_out, *expected, "slice-3 ELF for {:?} printed {} (expected {})", prog_src, child_out, expected);
+
+            let _ = fs::remove_file(&out_path);
+        }
+
+        let _ = fs::remove_file(elf);
+        let _ = fs::remove_file(em);
+    }
+
+    /// Records-arc slice 4 — RECORD PARAMS + the unified static concept resolver.
+    /// Slice 3 gated AstField emission on one ad-hoc shape (base = AstVar whose LET
+    /// RHS is an AstVariant). Slice 4 replaces the gate with ONE recursive compile-time
+    /// resolver (`static_concept_of`): an AstVar resolves through a TYPED param's
+    /// declared-type span (PCons ty_start/ty_len) or through the let-RHS-construction
+    /// check (slice 3's case, now the resolver's let branch); an AstVariant through its
+    /// own concept-name span; an AstField recurses on its base and resolves the accessed
+    /// field's declared-type span (FCons ty_start/ty_len) — CHAINED access. The emitted
+    /// suffix is UNCHANGED from slice 3 (pop rax ; imul rax,rax,entry_size ; add rax,r15 ;
+    /// mov rax,[rax + 8 + 8*field_index] ; push rax — 19 fixed bytes); only the
+    /// resolvability gate + the concept source generalized. Record args through calls
+    /// and recursion need NO new code: a record value is its arena index (a Number),
+    /// already flowing through the call ABI. We check from CLEAN disk (emit ELF ->
+    /// chmod +x -> run -> read stdout) AND cross-check each program against the
+    /// interpreter oracle (eval_main):
+    ///   * PARAM access — `get_a(Foo{a:42,b:7})` with `get_a(s : Foo): out = s.a + s.b`
+    ///        -> 49: the real self-source shape (a rule reading its input record).
+    ///   * RECURSION with record args — `go(St{n:5,acc:0})` with `go(s : St): out =
+    ///        if s.n == 0 then s.acc else go(St{n: s.n - 1, acc: s.acc + s.n})` -> 15:
+    ///        the arc's real target (a rule recursing on a state record).
+    ///   * CHAINED access — `Outer / inner : Foo`, `let o = Outer{inner: Foo{a:42,b:7}} ;
+    ///        out = o.inner.b` -> 7: proves the recursive resolver + the FCons ty spans
+    ///        (a concept-typed FIELD resolves the next hop).
+    ///   * slice-3 regression — `let s = Foo{a:42,b:7} ; out = s.a` -> 42: the resolver's
+    ///        let branch IS slice 3's check (pinned byte-identical during development).
+    ///   * the R7 variant list-sum stays 6 (match/variant path untouched).
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn records_slice4_static_concept_resolver() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        let src = fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let elf = std::env::temp_dir().join("verbosec_test_r_s4_elf_program_src");
+        compile_native(&program, "elf_program_src", elf.to_str().unwrap(), false, false)
+            .expect("elf_program_src must compile natively");
+        // The interpreter oracle: the emitted ELF must print what --run does.
+        let em = std::env::temp_dir().join("verbosec_test_r_s4_eval_main");
+        compile_native(&program, "eval_main", em.to_str().unwrap(), false, false)
+            .expect("eval_main must compile natively");
+
+        let oracle = |source: &str| -> i64 {
+            let r = Command::new(&em).arg(source).arg("0").output().expect("spawn eval_main");
+            assert!(r.status.success(), "eval_main must exit 0 for {:?}", source);
+            String::from_utf8_lossy(&r.stdout).trim().parse::<i64>()
+                .unwrap_or_else(|_| panic!("eval_main non-number for {:?}: {:?}", source, r.stdout))
+        };
+
+        // PARAM access: the record-input shape — a rule reads its typed input record.
+        let param_access = "concept Foo\n  fields:\n    a : number\n    b : number\nrule main\n  logic:\n    out = get_a(Foo { a: 42, b: 7 })\nrule get_a(s : Foo)\n  logic:\n    out = s.a + s.b".to_string();
+        // RECURSION with record args: a rule recursing on a state record (the arc's target).
+        let rec_state = "concept St\n  fields:\n    n : number\n    acc : number\nrule main\n  logic:\n    out = go(St { n: 5, acc: 0 })\nrule go(s : St)\n  logic:\n    out = if s.n == 0 then s.acc else go(St { n: s.n - 1, acc: s.acc + s.n })".to_string();
+        // CHAINED access: a concept-typed field (`inner : Foo`) resolves the next hop.
+        let chained = "concept Foo\n  fields:\n    a : number\n    b : number\nconcept Outer\n  fields:\n    inner : Foo\nrule main\n  logic:\n    let o = Outer { inner: Foo { a: 42, b: 7 } }\n    out = o.inner.b".to_string();
+        // Slice-3 regression: the let-bound case (the resolver's let branch).
+        let let_bound = "concept Foo\n  fields:\n    a : number\n    b : number\nrule main\n  logic:\n    let s = Foo { a: 42, b: 7 }\n    out = s.a".to_string();
+        // R7 variant list-sum: AstField never fires — the match/variant path unchanged.
+        let lst = "concept_group L [max_depth: 30, max_nodes: 100]\n  concept Lst\n    variants:\n      Cons of (head : number, tail : Lst)\n      Nil\nrule main\n  logic:\n    out = sum_list(build(3))\nrule build(n)\n  logic:\n    out = if n == 0 then Lst::Cons { head: 0, tail: Lst::Nil } else Lst::Cons { head: n, tail: build(n - 1) }\nrule sum_list(l)\n  logic:\n    out = match l: Cons(h, t) => h + sum_list(t)  Nil => 0".to_string();
+
+        let cases: &[(String, i64)] = &[
+            (param_access, 49),
+            (rec_state, 15),
+            (chained, 7),
+            (let_bound, 42),
+            (lst, 6),
+        ];
+
+        for (i, (prog_src, expected)) in cases.iter().enumerate() {
+            // Cross-check the interpreter oracle agrees with the expected value.
+            assert_eq!(oracle(prog_src), *expected, "oracle disagreement for {:?}", prog_src);
+
+            let mc = Command::new(&elf).args([prog_src.as_str(), "0"]).output()
+                .expect("spawn elf_program_src");
+            assert!(mc.status.success(), "elf_program_src must exit 0 for {:?}; got {:?}", prog_src, mc.status);
+            let elf_bytes = mc.stdout;
+            assert_eq!(&elf_bytes[0..4], &[0x7f, 0x45, 0x4c, 0x46], "emitted file is not ELF for {:?}", prog_src);
+            // Every slice-4 case declares concepts, so all get the mmap arena prologue.
+            assert_eq!(&elf_bytes[120..125], &[0xb8, 0x09, 0x00, 0x00, 0x00],
+                "arena program {:?} must have the mmap prologue", prog_src);
+
+            let out_path = std::env::temp_dir().join(format!("verbosec_test_r_s4_a_out_{}", i));
+            fs::write(&out_path, &elf_bytes).expect("write a.out");
+            let mut perms = fs::metadata(&out_path).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&out_path, perms).expect("chmod +x");
+
+            let child = Command::new(&out_path).output().expect("execute emitted ELF");
+            assert!(child.status.success(), "emitted ELF for {:?} did not exit 0; got {:?}", prog_src, child.status);
+            let child_out: i64 = String::from_utf8_lossy(&child.stdout).trim().parse()
+                .unwrap_or_else(|_| panic!("emitted ELF produced non-number for {:?}: {:?}", prog_src, child.stdout));
+            assert_eq!(child_out, *expected, "slice-4 ELF for {:?} printed {} (expected {})", prog_src, child_out, expected);
+
+            let _ = fs::remove_file(&out_path);
+        }
+
+        let _ = fs::remove_file(elf);
+        let _ = fs::remove_file(em);
+    }
+
+    /// Minimal mmap(PROT_READ|WRITE|EXEC, MAP_PRIVATE|ANON) via raw syscall —
+    /// the project is zero-dependency, so we go straight to the kernel ABI
+    /// instead of pulling in the `libc` crate. mmap is syscall 9 on x86-64.
+    #[cfg(target_arch = "x86_64")]
+    unsafe fn libc_mmap(len: usize) -> *mut std::ffi::c_void {
+        // addr=0, len, prot=PROT_READ|PROT_WRITE|PROT_EXEC (7),
+        // flags=MAP_PRIVATE|MAP_ANONYMOUS (0x22), fd=-1, off=0
+        let ret: i64;
+        std::arch::asm!(
+            "syscall",
+            inlateout("rax") 9i64 => ret,
+            in("rdi") 0usize,
+            in("rsi") len,
+            in("rdx") 7i64,
+            in("r10") 0x22i64,
+            in("r8") -1i64,
+            in("r9") 0i64,
+            lateout("rcx") _, lateout("r11") _,
+        );
+        ret as *mut std::ffi::c_void
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    unsafe fn libc_munmap(addr: *mut std::ffi::c_void, len: usize) {
+        // munmap is syscall 11.
+        std::arch::asm!(
+            "syscall",
+            inlateout("rax") 11i64 => _,
+            in("rdi") addr,
+            in("rsi") len,
+            lateout("rcx") _, lateout("r11") _,
+        );
     }
 
     /// Nested match_result: an outer match_result whose Ok arm itself
@@ -25869,6 +29447,450 @@ rule rec
         let _ = std::fs::remove_file(&out);
     }
 
+    /// Streaming text emit (self-hosting emitter slice, 2026-06-10) —
+    /// the FIRST native pretty-printer over a recursive AST. The body
+    /// shape `Add(lhs, rhs) => concat(print_expr(lhs), "+",
+    /// print_expr(rhs))` was refused by every prior slice (a concat
+    /// built in a recursive frame dies at `ret`); the streaming
+    /// lowering writes each leaf's bytes to stdout IN ORDER during the
+    /// walk, so no string is ever materialized.
+    ///
+    /// The oracle is the interpreter: for each seed the native binary's
+    /// stdout must equal `--run show`'s text result byte-for-byte
+    /// (modulo the shared trailing-newline convention, stripped by
+    /// trim on both sides here).
+    #[test]
+    fn streaming_print_chain_native_matches_interpreter() {
+        use std::io::Write;
+        let src = std::fs::read_to_string("examples/print_chain.verbose")
+            .expect("examples/print_chain.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+        let out = std::env::temp_dir().join("verbosec_test_streaming_print_chain");
+        compile_native(&program, "show", out.to_str().unwrap(), true, false)
+            .expect("streaming print_chain must compile natively");
+
+        // Interpreter oracle — same parse, same rule, evaluated in-process.
+        let all_rules: Vec<&crate::ast::Rule> = program.items.iter().filter_map(|i| match i {
+            crate::ast::Item::Rule(r) => Some(r),
+            _ => None,
+        }).collect();
+        let concepts: Vec<&crate::ast::Concept> =
+            crate::ast::iter_all_concepts(&program.items).collect();
+        let show = *all_rules.iter().find(|r| r.name == "show").unwrap();
+
+        let run = |input: &str| -> String {
+            let mut child = std::process::Command::new(&out)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .expect("spawn print_chain show");
+            child.stdin.as_mut().unwrap().write_all(input.as_bytes()).unwrap();
+            drop(child.stdin.take());
+            let r = child.wait_with_output().expect("wait print_chain show");
+            assert!(r.status.success(), "show({}) must exit 0; got {:?}", input.trim(), r.status);
+            String::from_utf8_lossy(&r.stdout).trim().to_string()
+        };
+
+        for &n in &[0i64, 3, 5] {
+            let mut input = std::collections::HashMap::new();
+            input.insert("n".to_string(), crate::interpreter::Value::Number(n));
+            let expected = match crate::interpreter::eval_rule(show, &all_rules, &concepts, &input) {
+                Ok(crate::interpreter::Value::Text(s)) => s,
+                other => panic!("interpreter must return text for show({}); got {:?}", n, other),
+            };
+            assert_eq!(
+                run(&format!("{}\n", n)),
+                expected,
+                "native streamed stdout must equal interpreter output for n={}",
+                n
+            );
+        }
+        // Money-shots pinned explicitly too, so a simultaneous
+        // interpreter+native regression can't cancel out.
+        assert_eq!(run("0\n"), "0");
+        assert_eq!(run("3\n"), "3+2+1+0");
+        assert_eq!(run("5\n"), "5+4+3+2+1+0");
+        let _ = std::fs::remove_file(&out);
+    }
+
+    /// Streaming text emit — the mode is decided per SCC, and a body
+    /// that fits today's literal-leaf grammar (recursive_label: if/else
+    /// with literal and self-call leaves) must KEEP the materializing
+    /// (rax = ptr, rdx = len) path byte-for-byte. Pinned the way the
+    /// existing slice tests pin: exact binary size (741 B with the
+    /// stdin reader) + behavior. The full SHA-256 byte-identity sweep
+    /// across all 10 recursive examples is part of the slice's
+    /// validation protocol.
+    ///
+    /// Size note: was 739 B until the register-allocation brick #1
+    /// (push/pop → `mov rcx, rax` for simple-operand binops). The
+    /// `n.v == 0` comparison in `label_of` now keeps the lhs in rcx
+    /// via a 3-byte `mov` instead of the 2-byte push/pop pair (+2 B),
+    /// trading a memory round-trip for one extra instruction byte.
+    /// Behavior is unchanged (still emits "done"); the streaming
+    /// predicate still does NOT leak into the literal-leaf path.
+    #[test]
+    fn streaming_mode_does_not_change_literal_leaf_path() {
+        use std::io::Write;
+        let src = std::fs::read_to_string("examples/recursive_label.verbose")
+            .expect("examples/recursive_label.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+        let out = std::env::temp_dir().join("verbosec_test_streaming_literal_leaf_unchanged");
+        compile_native(&program, "label_of", out.to_str().unwrap(), true, false)
+            .expect("literal-leaf text recursion must keep compiling");
+        let size = std::fs::metadata(&out).expect("binary must exist").len();
+        assert_eq!(
+            size, 732,
+            "recursive_label (--stdin) must stay at its pinned 732 bytes; \
+             a size change means the streaming predicate leaked into the \
+             literal-leaf materializing path (732 since regalloc brick A3: \
+             the n.v == 0 binop now places lhs in rax / rhs in rcx and the \
+             op writes rax directly — A1's mov rcx,rax and the result \
+             normalization mov rax,rcx are both gone, -9 B from the 741 of \
+             brick A1/A2)"
+        );
+
+        let run = |input: &str| -> String {
+            let mut child = std::process::Command::new(&out)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .expect("spawn label_of");
+            child.stdin.as_mut().unwrap().write_all(input.as_bytes()).unwrap();
+            drop(child.stdin.take());
+            let r = child.wait_with_output().expect("wait label_of");
+            assert!(r.status.success());
+            String::from_utf8_lossy(&r.stdout).trim().to_string()
+        };
+        assert_eq!(run("0\n"),  "done");
+        assert_eq!(run("10\n"), "done");
+        let _ = std::fs::remove_file(&out);
+    }
+
+    /// Streaming text emit — a call to a text-returning SCC member is
+    /// legal ONLY in tail text positions (body / concat arg / if arm /
+    /// match arm), because the callee streams its bytes to stdout
+    /// during the walk. Consuming its "value" (here: length(...) of a
+    /// recursive call, inside a concat) is out-of-order by construction
+    /// and must be refused with the streaming breadcrumb.
+    #[test]
+    fn streaming_refuses_text_scc_call_in_non_tail_position() {
+        let src = r#"@verbose 0.1.0
+
+concept N
+  @intention: "wrapper"
+  @source: invoices.intent:1
+  fields:
+    v : number [0, 10]
+
+rule bad
+  @intention: "text recursion that measures its own recursive output"
+  @source: invoices.intent:1
+  input:
+    n : N
+  output:
+    out : text
+  logic:
+    out = if n.v == 0 then "x" else concat("len=", length(bad(N { v: n.v - 1 })))
+  proofs:
+    purity:
+      reads : [n.v]
+      calls : [bad]
+    termination:
+      bound : 100
+"#;
+        let tokens = crate::lexer::Lexer::new(src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+        let out = std::env::temp_dir().join("verbosec_test_streaming_non_tail_refusal");
+        let err = compile_native(&program, "bad", out.to_str().unwrap(), false, false)
+            .expect_err("text-SCC call in a value position must be refused");
+        let msg = format!("{:?}", err);
+        assert!(
+            msg.contains("streaming text emit"),
+            "refusal must carry the streaming-slice breadcrumb; got: {}",
+            msg
+        );
+        assert!(
+            msg.contains("non-tail position"),
+            "refusal must name the non-tail position constraint; got: {}",
+            msg
+        );
+        let _ = std::fs::remove_file(&out);
+    }
+
+    /// Brick 36 — the first real LOWERING (pretty-printer -> code generator).
+    /// vexprparse's `lower_expr_src` compiles an expression to a postfix
+    /// stack-machine stream (RPN); this test is the external oracle that
+    /// proves the lowering is CORRECT: a stack/RPN evaluator over the
+    /// lowered output yields the same number as `eval_expr` (the
+    /// interpreter) for the integer-closed subset. `1 + 2 * 3` lowers to
+    /// `1 2 3 * +` and both compute 7.
+    #[test]
+    fn streaming_lower_rpn_matches_eval_expr() {
+        let src = std::fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+        let lo = std::env::temp_dir().join("verbosec_test_lower_expr_src");
+        let ev = std::env::temp_dir().join("verbosec_test_eval_expr_for_lower");
+        compile_native(&program, "lower_expr_src", lo.to_str().unwrap(), false, false)
+            .expect("lower_expr_src must compile natively (streaming)");
+        compile_native(&program, "eval_expr", ev.to_str().unwrap(), false, false)
+            .expect("eval_expr must compile natively");
+
+        // A small stack-IL evaluator — the oracle. Integer domain matching
+        // eval_expr (comparisons -> 1/0, and/or on operands != 0, division /
+        // modulo toward zero). `if`/`else`/`endif` is the structured lazy
+        // conditional (only the taken branch runs); region-skipping is
+        // nesting-aware. No labels, no calls (expression subset).
+        fn match_if(toks: &[&str], start: usize) -> (usize, usize) {
+            let (mut depth, mut i, mut els) = (0i32, start, usize::MAX);
+            while i < toks.len() {
+                match toks[i] {
+                    "if" => depth += 1,
+                    "endif" => { if depth == 0 { return (els, i); } depth -= 1; }
+                    "else" => { if depth == 0 { els = i; } }
+                    _ => {}
+                }
+                i += 1;
+            }
+            panic!("unmatched if in IL");
+        }
+        fn exec(toks: &[&str], lo: usize, hi: usize, st: &mut Vec<i64>) {
+            let mut i = lo;
+            while i < hi {
+                let t = toks[i];
+                if let Ok(n) = t.parse::<i64>() { st.push(n); i += 1; continue; }
+                match t {
+                    "neg" => { let a = st.pop().unwrap(); st.push(-a); i += 1; }
+                    "not" => { let a = st.pop().unwrap(); st.push((a == 0) as i64); i += 1; }
+                    "if" => {
+                        let cond = st.pop().unwrap();
+                        let (els, end) = match_if(toks, i + 1);
+                        if cond != 0 {
+                            exec(toks, i + 1, if els != usize::MAX { els } else { end }, st);
+                        } else if els != usize::MAX {
+                            exec(toks, els + 1, end, st);
+                        }
+                        i = end + 1;
+                    }
+                    _ => {
+                        let b = st.pop().unwrap();
+                        let a = st.pop().unwrap();
+                        st.push(match t {
+                            "+" => a + b, "-" => a - b, "*" => a * b,
+                            "/" => if b != 0 { a / b } else { 0 },
+                            "%" => if b != 0 { a % b } else { 0 },
+                            "==" => (a == b) as i64, "!=" => (a != b) as i64,
+                            "<" => (a < b) as i64, ">" => (a > b) as i64,
+                            "<=" => (a <= b) as i64, ">=" => (a >= b) as i64,
+                            "and" => ((a != 0) && (b != 0)) as i64,
+                            "or" => ((a != 0) || (b != 0)) as i64,
+                            other => panic!("IL: unknown token {:?}", other),
+                        });
+                        i += 1;
+                    }
+                }
+            }
+        }
+        fn run_rpn(s: &str) -> i64 {
+            let toks: Vec<&str> = s.split_whitespace().collect();
+            let mut st: Vec<i64> = Vec::new();
+            exec(&toks, 0, toks.len(), &mut st);
+            *st.last().expect("IL stack non-empty")
+        }
+
+        let run = |bin: &std::path::Path, expr: &str| -> String {
+            let r = std::process::Command::new(bin)
+                .arg(expr)
+                .arg("0")
+                .output()
+                .expect("spawn driver");
+            assert!(r.status.success(), "{:?}({}) must exit 0; got {:?}", bin, expr, r.status);
+            String::from_utf8_lossy(&r.stdout).trim().to_string()
+        };
+
+        // The integer-closed verified subset: arithmetic, comparison,
+        // logical, neg, not, and if/else/endif. (Vars/calls/strings are out
+        // of the evaluator's domain and excluded here by construction.)
+        let exprs = [
+            "1 + 2 * 3", "10 - 2 - 3", "2 * 3 > 5", "1 + 2 == 3",
+            "not (1 < 2)", "if 1 < 2 then 10 else 20", "100 / 7", "100 % 7",
+            "2 < 3 and 4 < 5", "1 > 2 or 3 < 4", "- 5 + 2", "if 0 then 1 else 2",
+            "(1 + 2) * (3 + 4)", "10 >= 10", "7 != 7",
+        ];
+        for e in exprs {
+            let lowered = run(&lo, e);
+            let expected: i64 = run(&ev, e).parse().expect("eval_expr returns an integer");
+            let got = run_rpn(&lowered);
+            assert_eq!(
+                got, expected,
+                "lower(e) must compute eval_expr(e): e={:?} rpn={:?} run_rpn={} eval_expr={}",
+                e, lowered, got, expected
+            );
+        }
+        let _ = std::fs::remove_file(&lo);
+        let _ = std::fs::remove_file(&ev);
+    }
+
+    /// Brick 37 — lower a whole PROGRAM to the stack IL (a function -> a
+    /// routine). The external oracle: an IL VM (named procs, a call stack
+    /// with per-frame param/let bindings, structured lazy if/else/endif)
+    /// runs lower_program_src(p)'s output and yields the SAME number as
+    /// eval_main(p) — including recursive factorial -> 120. Proves the
+    /// program-level code generator is correct.
+    #[test]
+    fn streaming_lower_program_matches_eval_main() {
+        use std::collections::HashMap;
+        type Procs = HashMap<String, (Vec<String>, Vec<String>)>;
+
+        let src = std::fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+        let lp = std::env::temp_dir().join("verbosec_test_lower_program_src");
+        let em = std::env::temp_dir().join("verbosec_test_eval_main_for_lower");
+        compile_native(&program, "lower_program_src", lp.to_str().unwrap(), false, false)
+            .expect("lower_program_src must compile natively (streaming)");
+        compile_native(&program, "eval_main", em.to_str().unwrap(), false, false)
+            .expect("eval_main must compile natively");
+
+        // Parse the IL: each routine is `proc NAME params...` then body
+        // tokens through the closing `ret`.
+        fn parse_procs(il: &str) -> Procs {
+            let lines: Vec<&str> = il.lines().filter(|l| !l.trim().is_empty()).collect();
+            let mut procs: Procs = HashMap::new();
+            let mut i = 0;
+            while i < lines.len() {
+                let hdr: Vec<&str> = lines[i].split_whitespace().collect();
+                assert_eq!(hdr[0], "proc", "routine must start with proc: {:?}", lines[i]);
+                let name = hdr[1].to_string();
+                let params: Vec<String> = hdr[2..].iter().map(|s| s.to_string()).collect();
+                let mut body: Vec<String> = Vec::new();
+                i += 1;
+                while i < lines.len() {
+                    let bt: Vec<&str> = lines[i].split_whitespace().collect();
+                    let has_ret = bt.iter().any(|t| *t == "ret");
+                    body.extend(bt.iter().map(|s| s.to_string()));
+                    i += 1;
+                    if has_ret { break; }
+                }
+                assert_eq!(body.last().map(|s| s.as_str()), Some("ret"), "routine must end with ret");
+                body.pop();
+                procs.insert(name, (params, body));
+            }
+            procs
+        }
+        fn match_if(body: &[String], start: usize) -> (usize, usize) {
+            let (mut depth, mut i, mut els) = (0i32, start, usize::MAX);
+            while i < body.len() {
+                match body[i].as_str() {
+                    "if" => depth += 1,
+                    "endif" => { if depth == 0 { return (els, i); } depth -= 1; }
+                    "else" => { if depth == 0 { els = i; } }
+                    _ => {}
+                }
+                i += 1;
+            }
+            panic!("unmatched if in IL");
+        }
+        fn run(procs: &Procs, name: &str, args: &[i64]) -> i64 {
+            let (params, body) = procs.get(name).unwrap_or_else(|| panic!("no proc {}", name));
+            let mut frame: HashMap<String, i64> =
+                params.iter().cloned().zip(args.iter().cloned()).collect();
+            let mut st: Vec<i64> = Vec::new();
+            exec(procs, body, 0, body.len(), &mut frame, &mut st);
+            *st.last().expect("IL stack non-empty at ret")
+        }
+        fn exec(procs: &Procs, body: &[String], lo: usize, hi: usize,
+                frame: &mut HashMap<String, i64>, st: &mut Vec<i64>) {
+            let mut i = lo;
+            while i < hi {
+                let t = body[i].as_str();
+                if let Ok(n) = t.parse::<i64>() { st.push(n); i += 1; continue; }
+                match t {
+                    "load" => { let v = frame[&body[i + 1]]; st.push(v); i += 2; }
+                    "store" => { let v = st.pop().unwrap(); frame.insert(body[i + 1].clone(), v); i += 2; }
+                    "call" => {
+                        let callee = &body[i + 1];
+                        let n = procs.get(callee).unwrap_or_else(|| panic!("no proc {}", callee)).0.len();
+                        let mut popped = Vec::with_capacity(n);
+                        for _ in 0..n { popped.push(st.pop().unwrap()); }
+                        let cargs: Vec<i64> = (0..n).map(|k| popped[n - 1 - k]).collect();
+                        st.push(run(procs, callee, &cargs));
+                        i += 2;
+                    }
+                    "neg" => { let a = st.pop().unwrap(); st.push(-a); i += 1; }
+                    "not" => { let a = st.pop().unwrap(); st.push((a == 0) as i64); i += 1; }
+                    "if" => {
+                        let cond = st.pop().unwrap();
+                        let (els, end) = match_if(body, i + 1);
+                        if cond != 0 {
+                            exec(procs, body, i + 1, if els != usize::MAX { els } else { end }, frame, st);
+                        } else if els != usize::MAX {
+                            exec(procs, body, els + 1, end, frame, st);
+                        }
+                        i = end + 1;
+                    }
+                    _ => {
+                        let b = st.pop().unwrap();
+                        let a = st.pop().unwrap();
+                        st.push(match t {
+                            "+" => a + b, "-" => a - b, "*" => a * b,
+                            "/" => if b != 0 { a / b } else { 0 },
+                            "%" => if b != 0 { a % b } else { 0 },
+                            "==" => (a == b) as i64, "!=" => (a != b) as i64,
+                            "<" => (a < b) as i64, ">" => (a > b) as i64,
+                            "<=" => (a <= b) as i64, ">=" => (a >= b) as i64,
+                            "and" => ((a != 0) && (b != 0)) as i64,
+                            "or" => ((a != 0) || (b != 0)) as i64,
+                            other => panic!("IL: unknown token {:?}", other),
+                        });
+                        i += 1;
+                    }
+                }
+            }
+        }
+
+        let run_native = |bin: &std::path::Path, prog_src: &str| -> String {
+            let r = std::process::Command::new(bin)
+                .arg(prog_src)
+                .arg("0")
+                .output()
+                .expect("spawn driver");
+            assert!(r.status.success(), "{:?} must exit 0; got {:?}", bin, r.status);
+            String::from_utf8_lossy(&r.stdout).trim().to_string()
+        };
+
+        // Programs whose first rule is the entry (run with no args), covering
+        // recursion (fact, fib), nested calls (double(add(..))), and lets (sq).
+        let progs = [
+            "rule main\n  logic:\n    out = fact(5)\nrule fact(n)\n  logic:\n    out = if n == 0 then 1 else n * fact(n - 1)",
+            "rule main\n  logic:\n    out = double(add(3, 4))\nrule add(x, y)\n  logic:\n    out = x + y\nrule double(x)\n  logic:\n    out = x * 2",
+            "rule main\n  logic:\n    out = sq(5)\nrule sq(n)\n  logic:\n    let d = n * n\n    out = d + 1",
+            "rule main\n  logic:\n    out = fib(10)\nrule fib(n)\n  logic:\n    out = if n < 2 then n else fib(n - 1) + fib(n - 2)",
+        ];
+        for p in progs {
+            let il = run_native(&lp, p);
+            let procs = parse_procs(&il);
+            // entry = the first proc in the IL = the first rule.
+            let first = il.split_whitespace().nth(1).expect("at least one proc").to_string();
+            let got = run(&procs, &first, &[]);
+            let expected: i64 = run_native(&em, p).parse().expect("eval_main returns an integer");
+            assert_eq!(
+                got, expected,
+                "run_il(lower_program(p)) must equal eval_main(p): entry={} il={:?} got={} eval_main={}",
+                first, il, got, expected
+            );
+        }
+        let _ = std::fs::remove_file(&lp);
+        let _ = std::fs::remove_file(&em);
+    }
+
     /// Phase A slice 5.3 — multi-field recursive native callable.
     /// First Verbose binary that passes a multi-field record across
     /// `call`/`ret` via the Option A ABI: rdi = pointer to a fields
@@ -27145,6 +31167,342 @@ rule label_len
                 arg, expected, stdout
             );
         }
+        let _ = std::fs::remove_file(&out);
+    }
+
+    #[test]
+    fn group_field_recursion_drop_cells_via_nth_kind_runtime() {
+        // Group-field ABI: drop_cells takes `Nth { lst: TokenList, n: number }`
+        // — a recursive rule whose input concept has a GROUP-CONCEPT-typed
+        // field (lst : TokenList). Before the type-check widening this was
+        // refused at native codegen ("input field 'lst' must be Number or
+        // Text"). drop_cells is a callee (the entry rule's argv can't supply
+        // an arena index), so drive it through nth_kind, which tokenizes a
+        // source into a TokenList arena and threads it through drop_cells.
+        // Cross-checked against the interpreter on the same inputs.
+        let src = std::fs::read_to_string("examples/vtokenstream.verbose")
+            .expect("examples/vtokenstream.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+        let out = std::env::temp_dir().join("verbosec_test_group_field_nth_kind");
+        compile_native(&program, "nth_kind", out.to_str().unwrap(), false, false)
+            .expect("nth_kind (drives drop_cells with a group-typed field) must compile");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o755));
+        }
+        // (source, pos) -> kind code, verified identical to `--run nth_kind`.
+        // For "rule foo if x" the stream is
+        //   [Keyword(rule)=209, Ident(foo)=100, Keyword(if)=201, Ident(x)=100, Eof=0]
+        // dropping `pos` cells leaves L-pos cells; the head's kind is read.
+        let cases: &[(&str, &str, &str)] = &[
+            ("rule foo if x", "0", "209\n"),
+            ("rule foo if x", "1", "100\n"),
+            ("rule foo if x", "2", "201\n"),
+            ("rule foo if x", "3", "100\n"),
+            ("rule foo if x", "4", "0\n"),
+            ("42 + foo", "0", "342\n"),
+            ("42 + foo", "1", "413\n"),
+            ("42 + foo", "2", "100\n"),
+            ("x == y", "0", "100\n"),
+            ("x == y", "1", "401\n"),
+            ("a b c", "0", "100\n"),
+            ("", "0", "0\n"),
+        ];
+        for (source, pos, expected) in cases {
+            let output = std::process::Command::new(&out)
+                .arg(source)
+                .arg(pos)
+                .output()
+                .expect("native binary must run");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert_eq!(
+                stdout.as_ref(), *expected,
+                "nth_kind({:?}, {}) mismatch: expected {:?}, got {:?}",
+                source, pos, expected, stdout
+            );
+        }
+        let _ = std::fs::remove_file(&out);
+    }
+
+    #[test]
+    fn binder_slots_text_payload_in_non_first_concept_runtime() {
+        // Regression for the count_max_match_arm_binder_slots bug: it searched
+        // only `g.concepts.first()` for the matched variant. For a MULTI-CONCEPT
+        // group whose TEXT-payload variant lives in a NON-FIRST concept, that
+        // lookup misses and falls back to a binder COUNT (not type-aware slot
+        // count). A text binder needs 2 slots (ptr, len) but counts as 1 in the
+        // fallback, so the frame is under-sized by one slot per text binder —
+        // corrupting the binder area at runtime.
+        //
+        // Here `First` is concept 0 (no matching variant for the match below);
+        // `Second::Lab(name: text, value: number)` lives in concept 1. The match
+        // binds BOTH name (text, 2 slots) and value (number, 1 slot) = 3 slots,
+        // but the pre-fix fallback would reserve only 2 (binder count). The arm
+        // uses `length(name)` AND `value`, so a mis-sized frame produces wrong
+        // output (or corrupts the value slot).
+        let src = r#"@verbose 0.1.0
+
+concept_group Pair [max_depth: 5, max_nodes: 20]
+  @intention: "two-concept group; text payload in the second concept"
+  @source: p.intent:1
+
+  concept First
+    @intention: "first concept (matched variant is NOT here)"
+    @source: p.intent:1
+    variants:
+      Aaa of (x : number)
+      Bbb of (y : number)
+
+  concept Second
+    @intention: "second concept; carries the text-payload variant"
+    @source: p.intent:1
+    variants:
+      Lab of (name : text, value : number)
+      Bare of (value : number)
+
+concept Seed
+  @intention: "seed"
+  @source: p.intent:1
+  fields:
+    n : number [0, 5]
+
+rule make_pair
+  @intention: "construct a Second value"
+  @source: p.intent:1
+  input:
+    s : Seed
+  output:
+    out : Second
+  logic:
+    out = if s.n > 0 then Second::Lab { name: "hello", value: s.n } else Second::Bare { value: 0 }
+  proofs:
+    purity:
+      reads : [s]
+      calls : [make_pair]
+    termination:
+      bound : 5
+
+rule probe
+  @intention: "bind both a text payload and a number payload in a non-first concept's variant"
+  @source: p.intent:1
+  input:
+    s : Seed
+  output:
+    out : number
+  logic:
+    out = match make_pair(s):
+      Lab(name, value) => length(name) + value
+      Bare(value) => value
+  proofs:
+    purity:
+      reads : [s]
+      calls : [make_pair, probe]
+    termination:
+      bound : 5
+"#;
+        let tokens = crate::lexer::Lexer::new(src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+
+        // Direct assertion on the buggy function — this is the unambiguous
+        // bug-catcher. With the first-concept-only search (pre-fix), the
+        // `Lab` variant lives in the SECOND group concept, so the lookup
+        // misses and falls back to a binder COUNT of 2. With the fix
+        // (search ALL concepts) it finds Lab(name:text, value:number) and
+        // returns the type-aware slot count: text(2) + number(1) = 3.
+        // Confirmed: reverting only the fix makes this assert fail
+        // (got 2, expected 3).
+        let group: Option<&crate::ast::ConceptGroup> = program.items.iter().find_map(|i| match i {
+            crate::ast::Item::ConceptGroup(g) => Some(g),
+            _ => None,
+        });
+        let probe_rule = program.items.iter().find_map(|i| match i {
+            crate::ast::Item::Rule(r) if r.name == "probe" => Some(r),
+            _ => None,
+        }).expect("probe rule must exist");
+        let slots = count_max_match_arm_binder_slots(&probe_rule.logic.value, group);
+        assert_eq!(
+            slots, 3,
+            "binder-slot count for Lab(name: text, value: number) in a NON-FIRST \
+             group concept must be 3 (text=2 + number=1), not the binder COUNT of 2; \
+             got {} (the first-concept-only search bug under-sizes the frame)",
+            slots
+        );
+
+        let out = std::env::temp_dir().join("verbosec_test_binder_slots_nonfirst_text");
+        compile_native(&program, "probe", out.to_str().unwrap(), false, false)
+            .expect("text-payload variant in a non-first concept must compile");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o755));
+        }
+        // n>0 → Lab("hello", n) → length("hello") + n = 5 + n
+        // n=0 → Bare(0) → 0
+        let cases: &[(&str, &str)] = &[
+            ("0", "0\n"),
+            ("1", "6\n"),
+            ("3", "8\n"),
+            ("5", "10\n"),
+        ];
+        for (arg, expected) in cases {
+            let output = std::process::Command::new(&out)
+                .arg(arg)
+                .output()
+                .expect("native binary must run");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert_eq!(
+                stdout.as_ref(), *expected,
+                "probe({}) mismatch: expected {:?}, got {:?} (frame mis-sized if binder-slot bug present)",
+                arg, expected, stdout
+            );
+        }
+        let _ = std::fs::remove_file(&out);
+    }
+
+    #[test]
+    fn recursive_record_input_text_field_beside_group_field_runtime() {
+        // Regression for TWO bugs surfaced by `examples/recursive_text_eval.verbose`:
+        //
+        // A record-concept input that carries BOTH a group-concept field
+        // (`node : E`) and a text field (`src : text`), feeding a recursive
+        // rule whose body matches on the group field and reads the text field.
+        //
+        // Bug 1 (binder/text-field slot collision): MatchVariant binder slots
+        //   were derived from `offsets` only (which holds the group field at
+        //   -8 but NOT the text field, which lives in `text_bindings`). So an
+        //   arm binder landed at -16, clobbering `src`'s ptr slot, segfaulting
+        //   at runtime. Fixed by deriving the binder base from the min of both
+        //   `offsets` and `text_bindings` slots.
+        //
+        // Bug 2 (text literal in a call's Record arg): the entry rule
+        //   `eval_e(EvalArg { node: ..., src: "AB" })` passes a TEXT LITERAL
+        //   as a Record-constructor text field into a callable. The marshal
+        //   path only recognized input-field pass-through and BoundText, and
+        //   refused the literal at codegen. Fixed by materializing the literal
+        //   inline (ptr in the binary's executable region, len immediate) and
+        //   storing (ptr, len) into the two struct slots.
+        //
+        // The recursive arm `eval_e(EvalArg { node: l, src: ea.src })` passes
+        // the text field THROUGH unchanged while advancing the group field.
+        // Expected: byte_at("AB",0) + byte_at("AB",1) = 'A' + 'B' = 65 + 66 = 131.
+        let src = std::fs::read_to_string("examples/recursive_text_eval.verbose")
+            .expect("examples/recursive_text_eval.verbose must exist (minimal reproducer)");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+
+        // 1) Interpreter oracle.
+        let all_rules: Vec<&crate::ast::Rule> = program.items.iter()
+            .filter_map(|i| match i { crate::ast::Item::Rule(r) => Some(r), _ => None })
+            .collect();
+        let all_concepts: Vec<&crate::ast::Concept> =
+            crate::ast::iter_all_concepts(&program.items).collect();
+        let go_rule = *all_rules.iter().find(|r| r.name == "go").expect("rule 'go' must exist");
+        let seed = {
+            let mut m = std::collections::HashMap::new();
+            m.insert("k".to_string(), crate::interpreter::Value::Number(0));
+            crate::interpreter::Value::Record(m)
+        };
+        let interp = crate::interpreter::eval_rule_with_value(go_rule, &all_rules, &all_concepts, seed)
+            .expect("interpreter must evaluate 'go'");
+        let interp_num = match interp {
+            crate::interpreter::Value::Number(n) => n,
+            other => panic!("expected Number from interpreter, got {:?}", other),
+        };
+        assert_eq!(interp_num, 131, "interpreter oracle must yield 131");
+
+        // 2) Native: must compile (pre-fix it errored at codegen) and run == interp.
+        let out = std::env::temp_dir().join("verbosec_test_b3_group_plus_text");
+        compile_native(&program, "go", out.to_str().unwrap(), false, false)
+            .expect("recursive rule with group field + text field must compile natively");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o755));
+        }
+        let output = std::process::Command::new(&out)
+            .arg("0")
+            .output()
+            .expect("native binary must run");
+        assert!(
+            output.status.success(),
+            "native binary must exit 0 (was segfaulting on the binder/text-slot collision); status={:?}",
+            output.status
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert_eq!(
+            stdout.trim(), interp_num.to_string(),
+            "native output must equal the interpreter oracle (131); got {:?}",
+            stdout
+        );
+        let _ = std::fs::remove_file(&out);
+    }
+
+    #[test]
+    fn callable_let_rhs_group_variant_construct_runtime() {
+        // Regression for the bug surfaced by self-hosting brick 10 (eval_block /
+        // build_env): a RECURSIVE CALLABLE whose let RHS contains a
+        // `VariantConstruct` of a group concept was refused at codegen —
+        // "native VariantConstruct for concept 'X' requires a concept_group
+        // declaration; top-level variant concepts have no arena yet".
+        //
+        // Root cause: emit_callable_into built the callable's ArenaCtx AFTER the
+        // let-eval loop, so a let RHS that constructs a group value
+        // (`let pushed = Stk::Push { ... }`) was emitted with arena_ctx = None
+        // and hit the no-arena refusal. The body emit had the ctx; the let loop
+        // didn't. Fix: build the ArenaCtx BEFORE the let loop and pass it to the
+        // let-RHS emit (the arena write is rbp-independent — addresses the arena
+        // and node_count via r11, set up once in _start and preserved across
+        // call/ret — so emitting a construct from a let RHS is byte-identical to
+        // emitting it from the body).
+        //
+        // examples/callable_let_variant.verbose: `build` is a recursive callable
+        // that does `let pushed = Stk::Push { v: ca.n, rest: ca.acc }` then
+        // recurses; `go` builds a stack of depth k and returns its depth = k.
+        let src = std::fs::read_to_string("examples/callable_let_variant.verbose")
+            .expect("examples/callable_let_variant.verbose must exist (minimal reproducer)");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+
+        // Interpreter oracle: go(5) == 5.
+        let all_rules: Vec<&crate::ast::Rule> = program.items.iter()
+            .filter_map(|i| match i { crate::ast::Item::Rule(r) => Some(r), _ => None })
+            .collect();
+        let all_concepts: Vec<&crate::ast::Concept> =
+            crate::ast::iter_all_concepts(&program.items).collect();
+        let go_rule = *all_rules.iter().find(|r| r.name == "go").expect("rule 'go' must exist");
+        let seed = {
+            let mut m = std::collections::HashMap::new();
+            m.insert("k".to_string(), crate::interpreter::Value::Number(5));
+            crate::interpreter::Value::Record(m)
+        };
+        let interp = crate::interpreter::eval_rule_with_value(go_rule, &all_rules, &all_concepts, seed)
+            .expect("interpreter must evaluate 'go'");
+        let interp_num = match interp {
+            crate::interpreter::Value::Number(n) => n,
+            other => panic!("expected Number from interpreter, got {:?}", other),
+        };
+        assert_eq!(interp_num, 5, "interpreter oracle must yield 5");
+
+        // Native: must compile (pre-fix it errored at codegen) and run == interp.
+        let out = std::env::temp_dir().join("verbosec_test_callable_let_variant");
+        compile_native(&program, "go", out.to_str().unwrap(), false, false)
+            .expect("recursive callable with a group VariantConstruct in a let RHS must compile natively");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o755));
+        }
+        let output = std::process::Command::new(&out)
+            .arg("5")
+            .output()
+            .expect("native binary must run");
+        let native_str = String::from_utf8_lossy(&output.stdout);
+        assert_eq!(
+            native_str.trim(), "5",
+            "native go(5) must equal the interpreter (5); got {:?}", native_str
+        );
         let _ = std::fs::remove_file(&out);
     }
 
@@ -29587,6 +33945,1587 @@ rule extract_word
             assert_eq!(got, expect(w), "gctr byte {} mismatch", w);
         }
         let _ = std::fs::remove_file(&out);
+    }
+
+    /// Regression: a `match` arm payload binder that shares a name with an
+    /// input record field read in the SAME arm must NOT shadow that field in
+    /// the native arena MatchVariant path.
+    ///
+    /// `popcount` takes a record input `pa : PArg { stk, width }` and matches
+    /// `pa.stk`. The `Push(width, rest)` arm's binder is named `width`, which
+    /// collides with the input field `pa.width` read in the recursion guard
+    /// `width > pa.width`. Pre-fix, both the binder (`Expr::Ident("width")`)
+    /// and the field access (`Expr::Field(Ident("pa"), "width")`) keyed the
+    /// same bare name "width" in the offsets map, so the binder insert
+    /// overwrote the field slot: the guard compiled to `width > width`
+    /// (always false), the recursive `+1` arm was dead, and the rule returned
+    /// the base value (9) instead of the correct 10. The fix keys arm binders
+    /// under `__bind_<name>`, so `pa.width` resolves to the real field slot
+    /// again while the binder shadows correctly within its arm.
+    ///
+    /// Correct result depends on READING THE FIELD: base case `count = 9`,
+    /// one recursion (Push(2) popped down to width 0, since 2 > 0) adds +1
+    /// ⇒ 10. Matches the interpreter.
+    ///
+    /// Confirmed FAIL-BEFORE / PASS-AFTER: with the binder insert keyed by the
+    /// bare name (pre-fix), the native binary prints 9; with the `__bind_`
+    /// namespace fix it prints 10.
+    #[test]
+    fn native_match_binder_does_not_shadow_input_field() {
+        let src = r#"@verbose 0.1.0
+
+concept_group G [max_depth: 4096, max_nodes: 65535]
+  @intention: "g"
+  @source: t.intent:1
+
+  concept Stack
+    @intention: "stack"
+    @source: t.intent:1
+    variants:
+      Push of (width : number, rest : Stack)
+      Empty
+
+  concept Res
+    @intention: "res"
+    @source: t.intent:1
+    variants:
+      MkRes of (count : number)
+
+concept PArg
+  @intention: "arg"
+  @source: t.intent:1
+  fields:
+    stk : Stack
+    width : number [0, 100000]
+
+rule popcount
+  @intention: "popcount"
+  @source: t.intent:1
+  input:
+    pa : PArg
+  output:
+    out : Res
+  logic:
+    out = match pa.stk:
+      Push(width, rest) => if width > pa.width then Res::MkRes { count: res_count(popcount(PArg { stk: rest, width: pa.width })) + 1 } else Res::MkRes { count: 9 }
+      Empty => Res::MkRes { count: 9 }
+  proofs:
+    purity:
+      reads : [pa.stk, pa.width]
+      calls : [popcount, res_count]
+    termination:
+      bound : 4096
+
+rule res_count
+  @intention: "count"
+  @source: t.intent:1
+  input:
+    r : Res
+  output:
+    out : number
+  logic:
+    out = match r:
+      MkRes(count) => count
+  proofs:
+    purity:
+      reads : [r]
+      calls : []
+    termination:
+      bound : 16
+
+concept ProbeArg
+  @intention: "probe"
+  @source: t.intent:1
+  fields:
+    seed : number [0, 100]
+
+rule probe
+  @intention: "probe"
+  @source: t.intent:1
+  input:
+    pb : ProbeArg
+  output:
+    out : number
+  logic:
+    out = res_count(popcount(PArg { stk: Stack::Push { width: 2, rest: Stack::Empty }, width: 0 }))
+  proofs:
+    purity:
+      reads : []
+      calls : [res_count, popcount]
+    termination:
+      bound : 16
+"#;
+        let tokens = crate::lexer::Lexer::new(src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+        let out = std::env::temp_dir().join("verbosec_test_binder_field_collision");
+        compile_native(&program, "probe", out.to_str().unwrap(), false, false)
+            .expect("recursive group rule with binder/field collision must compile");
+        let r = std::process::Command::new(&out).args(["0"]).output()
+            .expect("spawn probe");
+        assert!(r.status.success(), "probe must exit 0; got {:?}", r.status);
+        assert_eq!(
+            String::from_utf8_lossy(&r.stdout).trim(),
+            "10",
+            "Push(2) popped to width 0 must take the recursive +1 arm (9 + 1 = 10); \
+             returning 9 means the binder 'width' shadowed the input field 'pa.width' \
+             so the guard 'width > pa.width' compiled to 'width > width' (always false)"
+        );
+        let _ = std::fs::remove_file(&out);
+    }
+
+    /// Records-arc brick R1: the self-hosted parser (examples/vexprparse.verbose)
+    /// now ACCEPTS top-level `concept` declarations. Two observable contracts:
+    ///   1. parse_program SKIPS concept blocks instead of stopping on them, so a
+    ///      `rule` declared AFTER a `concept` is still found (count_rules == 1).
+    ///      Before R1 the concept silently truncated the program to RNil.
+    ///   2. a SEPARATE parse_concepts walk CAPTURES the concepts into a
+    ///      ConceptList (count_concepts), and concept_field_count returns the
+    ///      first concept's field count.
+    /// All three drivers are NATIVE-ONLY (multi-line indented source — the
+    /// interpreter's indent tokenizer truncates at the first indented block, the
+    /// same reason eval_rule_decl / count_rules are native-only). The source
+    /// program is passed as ONE argv arg (argv[1]); pos is argv[2] = "0"; the
+    /// result number is printed to stdout (Phase 0 scalar emitter).
+    ///
+    /// Orderings exercised: concept->rule, rule->concept (the DEDENT-alignment
+    /// flush risk), two-concepts+rule. Field types span number/bool/text so
+    /// type_code_of_span is exercised. The full pre-existing suite staying green
+    /// on rule-only programs is the byte-identical gate; this test pins the new
+    /// capability.
+    #[test]
+    fn records_r1_parse_concepts_and_skip_in_program() {
+        let src = std::fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let cr = std::env::temp_dir().join("verbosec_test_r1_count_rules");
+        let cc = std::env::temp_dir().join("verbosec_test_r1_count_concepts");
+        let cf = std::env::temp_dir().join("verbosec_test_r1_concept_field_count");
+        compile_native(&program, "count_rules", cr.to_str().unwrap(), false, false)
+            .expect("count_rules must compile natively");
+        compile_native(&program, "count_concepts", cc.to_str().unwrap(), false, false)
+            .expect("count_concepts must compile natively");
+        compile_native(&program, "concept_field_count", cf.to_str().unwrap(), false, false)
+            .expect("concept_field_count must compile natively");
+
+        let run = |bin: &std::path::Path, prog: &str| -> i64 {
+            let r = std::process::Command::new(bin)
+                .arg(prog)
+                .arg("0")
+                .output()
+                .expect("spawn R1 driver");
+            assert!(r.status.success(), "{:?} must exit 0; got {:?}", bin, r.status);
+            String::from_utf8_lossy(&r.stdout)
+                .trim()
+                .parse::<i64>()
+                .expect("R1 driver prints an integer")
+        };
+
+        // (1) concept -> rule: the rule AFTER the concept is found, the concept is
+        // captured, and its two number fields are counted. Field types: number.
+        let concept_then_rule = "concept Pair\n  fields:\n    a : number\n    b : number\nrule main\n  logic:\n    out = 1";
+        assert_eq!(
+            run(&cr, concept_then_rule),
+            1,
+            "the rule AFTER the concept must be found (parse_program skips the concept, \
+             does not stop on it)"
+        );
+        assert_eq!(run(&cc, concept_then_rule), 1, "one concept captured");
+        assert_eq!(run(&cf, concept_then_rule), 2, "the concept has two fields");
+
+        // (2) rule -> concept: flushes the skip_seps_dedent DEDENT-alignment across
+        // the reverse ordering (the known risk). Field types: bool/text exercise
+        // type_code_of_span beyond `number`.
+        let rule_then_concept = "rule main\n  logic:\n    out = 1\nconcept Flags\n  fields:\n    ok : bool\n    label : text";
+        assert_eq!(
+            run(&cr, rule_then_concept),
+            1,
+            "the rule before the concept is parsed; the concept does not truncate it"
+        );
+        assert_eq!(run(&cc, rule_then_concept), 1, "one concept captured after a rule");
+        assert_eq!(run(&cf, rule_then_concept), 2, "the trailing concept has two fields");
+
+        // (3) two concepts + a rule: both concepts captured, the rule still found,
+        // and the FIRST concept's field count (2) is returned. Mixed field types.
+        let two_concepts = "concept Pair\n  fields:\n    a : number\n    b : bool\nconcept Trip\n  fields:\n    x : number\n    y : number\n    z : text\nrule main\n  logic:\n    out = 1";
+        assert_eq!(run(&cr, two_concepts), 1, "the rule after two concepts is found");
+        assert_eq!(run(&cc, two_concepts), 2, "two concepts captured");
+        assert_eq!(run(&cf, two_concepts), 2, "the FIRST concept has two fields");
+
+        // (4) rule-only: the byte-identical path — count_rules unchanged, no
+        // concepts. This is the per-binary witness that the is_concept branch is
+        // never taken when no concept is present.
+        let rule_only = "rule f\n  logic:\n    out = 7";
+        assert_eq!(run(&cr, rule_only), 1, "rule-only: one rule");
+        assert_eq!(run(&cc, rule_only), 0, "rule-only: zero concepts");
+
+        let _ = std::fs::remove_file(&cr);
+        let _ = std::fs::remove_file(&cc);
+        let _ = std::fs::remove_file(&cf);
+    }
+
+    // Pre-test for the cursor rewrite (docs/cursor-rewrite-plan.md review item 5):
+    // pin parse_fields' end-position handling at the two recursion boundaries the
+    // rewrite changes most — the FCons-recursive case (a multi-field concept) and
+    // the FNil-base case (an empty `fields:` block). Today parse_concept_decl_pos
+    // computes the end by counting (`body_idx + 4*nfields`); the cursor rewrite
+    // replaces that with parse_fields returning its end CELL, threaded up through
+    // every FCons. This test locks the observable behavior (field counts + that the
+    // rule AFTER the concept is still found) so that rewrite is provably AST-identical.
+    #[test]
+    fn cursor_pretest_parse_fields_field_count_edges() {
+        let src = std::fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let cr = std::env::temp_dir().join("verbosec_test_cursorpre_count_rules");
+        let cc = std::env::temp_dir().join("verbosec_test_cursorpre_count_concepts");
+        let cf = std::env::temp_dir().join("verbosec_test_cursorpre_field_count");
+        compile_native(&program, "count_rules", cr.to_str().unwrap(), false, false)
+            .expect("count_rules must compile natively");
+        compile_native(&program, "count_concepts", cc.to_str().unwrap(), false, false)
+            .expect("count_concepts must compile natively");
+        compile_native(&program, "concept_field_count", cf.to_str().unwrap(), false, false)
+            .expect("concept_field_count must compile natively");
+
+        let run = |bin: &std::path::Path, prog: &str| -> i64 {
+            let r = std::process::Command::new(bin)
+                .arg(prog)
+                .arg("0")
+                .output()
+                .expect("spawn cursor-pretest driver");
+            assert!(r.status.success(), "{:?} must exit 0; got {:?}", bin, r.status);
+            String::from_utf8_lossy(&r.stdout)
+                .trim()
+                .parse::<i64>()
+                .expect("driver prints an integer")
+        };
+
+        // FCons-recursive: a 3-field concept (mixed types) then a rule. The end
+        // cell after `fields:` must land on `rule`, so the rule is found AND the
+        // field count is exactly 3.
+        let three_fields =
+            "concept Trip\n  fields:\n    x : number\n    y : bool\n    z : text\nrule main\n  logic:\n    out = 1";
+        assert_eq!(run(&cf, three_fields), 3, "three-field concept: field count 3 (FCons recursion)");
+        assert_eq!(run(&cc, three_fields), 1, "three-field concept captured");
+        assert_eq!(run(&cr, three_fields), 1, "the rule after a 3-field concept is found");
+
+        // FNil-base: an EMPTY `fields:` block then a rule. The end cell must land
+        // on `rule` immediately (zero fields), so field count 0 and the rule is found.
+        let empty_fields = "concept Empty\n  fields:\nrule main\n  logic:\n    out = 1";
+        assert_eq!(run(&cf, empty_fields), 0, "empty fields: block: field count 0 (FNil base)");
+        assert_eq!(run(&cc, empty_fields), 1, "empty-fields concept captured");
+        assert_eq!(run(&cr, empty_fields), 1, "the rule after an empty-fields concept is found");
+
+        let _ = std::fs::remove_file(&cr);
+        let _ = std::fs::remove_file(&cc);
+        let _ = std::fs::remove_file(&cf);
+    }
+
+    /// Records-arc brick R2: the self-hosted parser (examples/vexprparse.verbose)
+    /// no longer chokes on REAL Verbose source. Three skip-to-unblock changes are
+    /// pinned together here:
+    ///   R2.a — the line-driver tokenizer treats a full-line `--` comment or an `@`
+    ///          attribute line as BLANK (no tokens, column stack untouched).
+    ///   R2.b — parse_program (and parse_concepts) recognize a top-level
+    ///          `concept_group` header and SKIP its whole indented block, so rules
+    ///          AFTER the group are found (before R2 the walk RNil'd on the group).
+    ///   R2.c — parse_rule_decl_pos scans past a rule's `input:` / `output:`
+    ///          pre-logic blocks to reach `logic:`, and computes its end position
+    ///          STRUCTURALLY so the trailing `proofs:` block is skipped — the walk
+    ///          lands on the next top-level item regardless of body shape.
+    /// Plain concepts are now skipped STRUCTURALLY too (via skip_indented_block),
+    /// so concepts whose fields carry range annotations (`text [..256]`,
+    /// `number [0, N]`) — which R1's 3-tokens-per-field counter mis-measured — no
+    /// longer desync the walk.
+    ///
+    /// Part 1 (regression, native via argv): a small source composing a `--`
+    /// comment, an `@intention` line, a one-concept `concept_group`, a plain
+    /// `concept` with a range-annotated field, and TWO full rules
+    /// (@intention/@source/input:/output:/logic:/proofs:). count_rules == 2 and
+    /// count_concepts == 1 (the plain concept). Pins R2.a/b/c together.
+    ///
+    /// Part 2 (THE MILESTONE, native via argv): a ~120 KB chunk of the REAL
+    /// examples/vexprparse.verbose — including the concept_group header and the
+    /// first N real `rule` blocks with their comments / @attributes / input /
+    /// output / logic / proofs — parses to exactly the chunk's `^rule ` count.
+    /// Before R2 this was 0 (the walk stopped at the concept_group). The chunk is
+    /// cut at a `rule` boundary just under the 128 KB single-argv kernel limit.
+    #[test]
+    fn records_r2_skip_comments_attrs_group_and_proofs() {
+        let src = std::fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let cr = std::env::temp_dir().join("verbosec_test_r2_count_rules");
+        let cc = std::env::temp_dir().join("verbosec_test_r2_count_concepts");
+        compile_native(&program, "count_rules", cr.to_str().unwrap(), false, false)
+            .expect("count_rules must compile natively");
+        compile_native(&program, "count_concepts", cc.to_str().unwrap(), false, false)
+            .expect("count_concepts must compile natively");
+
+        let run = |bin: &std::path::Path, prog: &str| -> i64 {
+            let r = std::process::Command::new(bin)
+                .arg(prog)
+                .arg("0")
+                .output()
+                .expect("spawn R2 driver");
+            assert!(r.status.success(), "{:?} must exit 0; got {:?}", bin, r.status);
+            String::from_utf8_lossy(&r.stdout)
+                .trim()
+                .parse::<i64>()
+                .expect("R2 driver prints an integer")
+        };
+
+        // Part 1 — regression: comment + @attr + concept_group(1 concept, variants:)
+        // + a range-annotated plain concept + two FULL rules.
+        let real_shaped = "\
+-- a leading full-line comment (R2.a: skipped at tokenization)
+@intention: \"a stray top-level attribute line (R2.a)\"
+concept_group G [max_depth: 4, max_nodes: 10]
+  concept Tok
+    variants:
+      A of (x : number)
+      B
+
+concept Thing
+  fields:
+    a : number [0, 10]
+
+rule one
+  @intention: \"first\"
+  @source: f:1
+  input:
+    s : ScanState
+  output:
+    out : number
+  logic:
+    out = 1
+  proofs:
+    purity:
+      reads : [s]
+      calls : []
+    termination:
+      bound : 16
+
+rule two
+  @intention: \"second\"
+  @source: f:2
+  input:
+    s : ScanState
+  output:
+    out : number
+  logic:
+    out = 2
+  proofs:
+    purity:
+      reads : [s]
+      calls : []
+    termination:
+      bound : 16
+";
+        assert_eq!(
+            run(&cr, real_shaped),
+            2,
+            "R2.a/b/c: both full rules found past the comment, @attr, concept_group, \
+             and the range-annotated plain concept (and past each rule's proofs block)"
+        );
+        // Records-arc brick R4 update: parse_concepts now DESCENDS into the
+        // concept_group instead of skipping it, so the group's inner concept
+        // `Tok` is captured ALONGSIDE the plain `concept Thing` → 2 (was 1
+        // under R2's skip-the-group behaviour). The new count is verified
+        // correct: the source declares exactly two concepts — `Tok` (in the
+        // group) and `Thing` (top-level). R2's other invariants are unchanged
+        // (the range-annotated `Thing` field is still not mis-counted, and the
+        // group descent flows back out to the trailing top-level rules).
+        assert_eq!(
+            run(&cc, real_shaped),
+            2,
+            "R4: the group's inner concept `Tok` is now captured (parse_concepts \
+             descends into the group) alongside the top-level `concept Thing` → 2"
+        );
+
+        // Part 2 — THE MILESTONE: count_rules on a ~120 KB chunk of the REAL
+        // self-source, cut at a `rule` boundary under the 128 KB single-argv limit.
+        let mut cut = 0usize;
+        let mut counted = 0i64;
+        let mut at_line_start = true;
+        let mut i = 0usize;
+        let bytes = src.as_bytes();
+        while i < bytes.len() {
+            // Record a cut point at every line that begins exactly with "rule ".
+            if at_line_start && src[i..].starts_with("rule ") {
+                if i > 122_000 {
+                    break;
+                }
+                cut = i;
+                counted += 1;
+            }
+            at_line_start = bytes[i] == b'\n';
+            i += 1;
+        }
+        assert!(cut > 0 && counted > 1, "must find several rule boundaries in the real source");
+        let chunk = &src[..cut];
+        let grep_rules = chunk
+            .lines()
+            .filter(|l| l.starts_with("rule "))
+            .count() as i64;
+        assert!(
+            chunk.contains("concept_group "),
+            "the chunk must include the concept_group header (the pre-R2 wall)"
+        );
+        assert!(chunk.len() < 131_000, "chunk must fit one argv arg (kernel 128 KB cap)");
+        assert_eq!(
+            run(&cr, chunk),
+            grep_rules,
+            "MILESTONE: count_rules on a real ~120 KB self-source chunk equals its \
+             `^rule ` count ({}); was 0 before R2 (the walk stopped at concept_group)",
+            grep_rules
+        );
+
+        let _ = std::fs::remove_file(&cr);
+        let _ = std::fs::remove_file(&cc);
+    }
+
+    /// Records-arc brick R3: the self-hosted parser (examples/vexprparse.verbose)
+    /// now PARSES the two rule-body forms R2 only SKIPPED — `::` variant
+    /// construction and block-form `match` — into real AST instead of AstErr.
+    /// PARSER-ONLY (downstream eval/type/checker/codegen get stub arms; real
+    /// handling is R6/R7). The observable is `shape_ast`'s fingerprint: AstVariant
+    /// has a dedicated band (1000000000) and AstMatch (100000000), both ABOVE the
+    /// brick-7 AstStr band (10000000), so a parsed variant/match body returns a
+    /// hand-derivable number DISTINCT from the AstErr fingerprint (0).
+    ///
+    /// The driver is the brick-5 `shape` rule (tokenize → parse_or → shape_ast),
+    /// compiled natively and run argv-style: argv[1] = source, argv[2] = pos (0).
+    /// Cases:
+    ///   - `Token::Eof`                         → AstVariant, no fields      → 1000000000
+    ///   - `TokenList::Cons { head: x, tail: y }` → AstVariant + 2 AstVar    → 1000000200
+    ///   - `match x: Cons(h, t) => Token::Eof  Nil => Token::Eof`
+    ///         → AstMatch (1e8) + scrut AstVar (100) + 2 arm bodies AstVariant (2e9)
+    ///         → 2100000100   (also verified in block form with newlines)
+    /// Regression guard: pre-R3 toy-grammar shapes are UNCHANGED — `x` → 100 (AstVar),
+    /// `1 + 2` → 10 (AstBin) — proving the stub arms don't perturb existing AST shapes.
+    #[test]
+    fn records_r3_variant_and_match_parse_to_ast() {
+        let src = std::fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let bin = std::env::temp_dir().join("verbosec_test_r3_shape");
+        compile_native(&program, "shape", bin.to_str().unwrap(), false, false)
+            .expect("shape must compile natively (R3 parse rules included)");
+
+        let run = |source: &str| -> i64 {
+            let r = std::process::Command::new(&bin)
+                .arg(source)
+                .arg("0")
+                .output()
+                .expect("spawn R3 shape driver");
+            assert!(
+                r.status.success(),
+                "shape must exit 0 for {:?}; got {:?}",
+                source, r.status
+            );
+            String::from_utf8_lossy(&r.stdout)
+                .trim()
+                .parse::<i64>()
+                .unwrap_or_else(|_| panic!("shape produced non-number for {:?}: {:?}", source, r.stdout))
+        };
+
+        // Variant construction parses to AstVariant (band present), NOT AstErr (0).
+        assert_eq!(
+            run("Token::Eof"),
+            1_000_000_000,
+            "braceless variant `Token::Eof` parses to AstVariant (band 1e9), not AstErr (0)"
+        );
+        assert_eq!(
+            run("TokenList::Cons { head: x, tail: y }"),
+            1_000_000_200,
+            "variant with two field values parses to AstVariant + 2 AstVar (1e9 + 200)"
+        );
+
+        // Block-form match (flat single-line arm sequence) parses to AstMatch.
+        assert_eq!(
+            run("match x: Cons(h, t) => Token::Eof  Nil => Token::Eof"),
+            2_100_000_100,
+            "match parses to AstMatch (1e8) + scrut AstVar (100) + 2 arm-body AstVariant (2e9), \
+             NOT the AstErr fingerprint (0)"
+        );
+        // Same match, multi-line block form (Newline-separated arms) — same fingerprint.
+        assert_eq!(
+            run("match x:\n  Cons(h, t) => Token::Eof\n  Nil => Token::Eof\n"),
+            2_100_000_100,
+            "block-form match (newline-separated arms) parses to the same AstMatch fingerprint"
+        );
+
+        // Regression: pre-R3 toy-grammar shapes are byte-for-byte unchanged.
+        assert_eq!(run("x"), 100, "AstVar shape unchanged by R3 stub arms");
+        assert_eq!(run("1 + 2"), 10, "AstBin shape unchanged by R3 stub arms");
+
+        let _ = std::fs::remove_file(&bin);
+    }
+
+    /// Records-arc slice 1: bare-record construction (`Name { field: e }`) now
+    /// PARSES to an AstVariant node (variant span == concept span) instead of
+    /// silently dropping the `{...}` and returning AstVar(Name). Parser-only —
+    /// reuses R3's variant_build / parse_vfields / AstVariant machinery via a new
+    /// `ident {`-without-`::` lookahead in parse_primary (next_opc == 23 for `{`),
+    /// advancing 2 tokens (`Name {`) before parse_vfields.
+    ///
+    /// The observable is the same `shape` fingerprint used by records_r3:
+    /// AstVariant = 1e9, each field VALUE contributes its own shape (AstVar = 100).
+    ///   - `Foo { a: x }`        → 1e9 + 100  (one field value captured)
+    ///   - `Foo { a: x, b: y }`  → 1e9 + 200  (both field values captured)
+    ///   - `Foo { }`             → 1e9        (empty record)
+    /// Regression (pre-slice-1 behaviour must be byte-identical):
+    ///   - `Foo::Bar { a: x }`   → 1e9 + 100  (`::` variant path UNCHANGED)
+    ///   - `x`                   → 100        (plain ident still AstVar)
+    ///   - `x.field`             → 1100       (field access still AstField)
+    ///   - `f(1)`                → 10000      (call still AstCall)
+    /// Continuation correctness (advance-k has no desync): a bare record nested as
+    /// a call argument closes cleanly and the outer call consumes exactly it:
+    ///   - `g(Foo { a: x })`     → 10000 (AstCall) + 1e9 + 100 (record arg)
+    #[test]
+    fn records_slice1_bare_record_parses_to_variant() {
+        let src = std::fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let bin = std::env::temp_dir().join("verbosec_test_records_slice1_shape");
+        compile_native(&program, "shape", bin.to_str().unwrap(), false, false)
+            .expect("shape must compile natively (bare-record parse included)");
+
+        let run = |source: &str| -> i64 {
+            let r = std::process::Command::new(&bin)
+                .arg(source)
+                .arg("0")
+                .output()
+                .expect("spawn slice-1 shape driver");
+            assert!(
+                r.status.success(),
+                "shape must exit 0 for {:?}; got {:?}",
+                source, r.status
+            );
+            String::from_utf8_lossy(&r.stdout)
+                .trim()
+                .parse::<i64>()
+                .unwrap_or_else(|_| panic!("shape produced non-number for {:?}: {:?}", source, r.stdout))
+        };
+
+        // Bare record → AstVariant band (1e9), field values captured (NOT AstVar 100).
+        assert_eq!(
+            run("Foo { a: x }"),
+            1_000_000_100,
+            "bare record `Foo {{ a: x }}` parses to AstVariant + 1 field value (AstVar), \
+             NOT AstVar(Foo)=100 with the braces dropped"
+        );
+        assert_eq!(
+            run("Foo { a: x, b: y }"),
+            1_000_000_200,
+            "multi-field bare record → AstVariant + 2 field values captured"
+        );
+        assert_eq!(
+            run("Foo { }"),
+            1_000_000_000,
+            "empty bare record `Foo {{ }}` → AstVariant band, empty field list"
+        );
+
+        // Regression: all pre-slice-1 ident routes are byte-identical.
+        assert_eq!(
+            run("Foo::Bar { a: x }"),
+            1_000_000_100,
+            "`::` variant path UNCHANGED — still AstVariant + field value"
+        );
+        assert_eq!(run("x"), 100, "plain ident still AstVar (100), no brace lookahead fires");
+        assert_eq!(run("x.field"), 1100, "field access still AstField (1000 + AstVar base)");
+        assert_eq!(run("f(1)"), 10000, "call still AstCall (10000 + AstNum arg = 0)");
+
+        // Continuation: a bare record nested as a call arg — the advance-k does not
+        // desync the surrounding parse (the outer call closes right after the record).
+        assert_eq!(
+            run("g(Foo { a: x })"),
+            1_000_010_100,
+            "bare record as a call arg → AstCall (10000) wrapping the record (1e9 + 100); \
+             proves parse_vfields consumed exactly `Foo {{ a: x }}` and `next` is correct"
+        );
+
+        let _ = std::fs::remove_file(&bin);
+    }
+
+    /// Records-arc brick R4: the self-hosted parser (examples/vexprparse.verbose)
+    /// now DESCENDS into a `concept_group` and parses its nested concepts'
+    /// `variants:` blocks into a real `VariantList` AST. Two new capabilities are
+    /// pinned together:
+    ///   1. `parse_concepts` no longer SKIPS a `concept_group` (R2 behaviour); it
+    ///      walks past the group header line and captures every nested `concept`
+    ///      INCLUDING its variants. `count_concepts` therefore now counts
+    ///      top-level + group-nested concepts. `parse_program`'s rule walk STILL
+    ///      skips the group, so `count_rules` is unchanged (types and rules stay
+    ///      separate side-lists).
+    ///   2. a new `count_variants` driver returns the variant count of the FIRST
+    ///      captured concept — proving each variant line (bare `Eof`/`Nil`/`Indent`
+    ///      AND payload `Name of (a : T, ...)`) parses to a `VarCons`.
+    /// All drivers are NATIVE-ONLY (multi-line indented source). Source is argv[1],
+    /// pos is argv[2] = "0", result printed to stdout (Phase 0 scalar emitter).
+    ///
+    /// Part 1 (regression, native via argv): a small source with a one-concept
+    /// `concept_group` whose `Foo` is a SUM type (`A of (x : number)` + bare `B`),
+    /// a top-level record `concept Bar`, and two rules. count_concepts == 2
+    /// (Foo descended + Bar), count_variants == 2 (Foo's A + B), count_rules == 2.
+    ///
+    /// Part 2 (THE MILESTONE, native via argv): a real chunk of
+    /// examples/vexprparse.verbose cut at the first top-level `rule ` boundary —
+    /// the chunk contains the WHOLE `concept_group VExpr` plus the top-level
+    /// concepts before the first rule. count_concepts equals the chunk's actual
+    /// concept count (`^  concept ` nested + `^concept ` top-level); before R4
+    /// only the top-level concepts were found (the group was skipped). And
+    /// count_variants on the chunk (whose first concept is the group's `Token`)
+    /// equals 10 — Token's ten variants (Ident/Keyword/Num/Op/Str/Newline/Indent/
+    /// Dedent/IndentErr/Eof).
+    #[test]
+    fn records_r4_descend_group_and_parse_variants() {
+        let src = std::fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let cr = std::env::temp_dir().join("verbosec_test_r4_count_rules");
+        let cc = std::env::temp_dir().join("verbosec_test_r4_count_concepts");
+        let cv = std::env::temp_dir().join("verbosec_test_r4_count_variants");
+        compile_native(&program, "count_rules", cr.to_str().unwrap(), false, false)
+            .expect("count_rules must compile natively");
+        compile_native(&program, "count_concepts", cc.to_str().unwrap(), false, false)
+            .expect("count_concepts must compile natively");
+        compile_native(&program, "count_variants", cv.to_str().unwrap(), false, false)
+            .expect("count_variants must compile natively");
+
+        let run = |bin: &std::path::Path, prog: &str| -> i64 {
+            let r = std::process::Command::new(bin)
+                .arg(prog)
+                .arg("0")
+                .output()
+                .expect("spawn R4 driver");
+            assert!(r.status.success(), "{:?} must exit 0; got {:?}", bin, r.status);
+            String::from_utf8_lossy(&r.stdout)
+                .trim()
+                .parse::<i64>()
+                .expect("R4 driver prints an integer")
+        };
+
+        // Part 1 — regression: concept_group { concept Foo variants: A of (x:number) / B }
+        // + top-level concept Bar fields: y:number + two rules.
+        let regression = "concept_group G [max_depth: 4, max_nodes: 10]\n  concept Foo\n    variants:\n      A of (x : number)\n      B\nconcept Bar\n  fields:\n    y : number\nrule one\n  logic:\n    out = 1\nrule two\n  logic:\n    out = 2";
+        assert_eq!(
+            run(&cc, regression),
+            2,
+            "R4: parse_concepts descends into the group — Foo (nested) + Bar (top-level) = 2"
+        );
+        assert_eq!(
+            run(&cv, regression),
+            2,
+            "R4: Foo is a sum type with two variants — `A of (x:number)` (payload) and bare `B`"
+        );
+        assert_eq!(
+            run(&cr, regression),
+            2,
+            "R4: count_rules unchanged — parse_program still skips the group, finds `one` and `two`"
+        );
+
+        // Part 2 — THE MILESTONE: cut the real self-source at the first top-level
+        // `rule ` boundary. The chunk holds the whole concept_group plus the
+        // top-level concepts that precede the first rule.
+        let bytes = src.as_bytes();
+        let mut cut = 0usize;
+        let mut at_line_start = true;
+        let mut i = 0usize;
+        while i < bytes.len() {
+            if at_line_start && src[i..].starts_with("rule ") {
+                cut = i;
+                break;
+            }
+            at_line_start = bytes[i] == b'\n';
+            i += 1;
+        }
+        assert!(cut > 0, "must find the first top-level rule boundary in the real source");
+        let chunk = &src[..cut];
+        assert!(
+            chunk.contains("concept_group "),
+            "the chunk must include the concept_group header (the pre-R4 skip wall)"
+        );
+        assert!(chunk.len() < 131_000, "chunk must fit one argv arg (kernel 128 KB cap)");
+
+        let grep_nested = chunk.lines().filter(|l| l.starts_with("  concept ")).count() as i64;
+        let grep_top = chunk.lines().filter(|l| l.starts_with("concept ")).count() as i64;
+        let grep_concepts = grep_nested + grep_top;
+        assert!(
+            grep_nested > 1,
+            "the chunk must contain several group-nested concepts (got {})",
+            grep_nested
+        );
+        assert_eq!(
+            run(&cc, chunk),
+            grep_concepts,
+            "MILESTONE: count_concepts on a real self-source chunk equals its actual \
+             concept count ({} nested + {} top-level = {}); before R4 only the {} \
+             top-level concepts were found (the group was skipped)",
+            grep_nested, grep_top, grep_concepts, grep_top
+        );
+        // The chunk's FIRST concept is the group's `Token` (the group is the first
+        // concept-bearing item in the file). Token declares exactly 10 variants.
+        assert_eq!(
+            run(&cv, chunk),
+            10,
+            "MILESTONE: count_variants on the chunk = 10 — the group's first concept \
+             Token has ten variants (Ident/Keyword/Num/Op/Str/Newline/Indent/Dedent/\
+             IndentErr/Eof)"
+        );
+
+        let _ = std::fs::remove_file(&cr);
+        let _ = std::fs::remove_file(&cc);
+        let _ = std::fs::remove_file(&cv);
+    }
+
+    /// Records-arc brick R5: the self-hosted parser (examples/vexprparse.verbose) now
+    /// PARSES the rule's `input:`/`output:` types and `proofs:` (purity reads/calls +
+    /// termination) into the RuleDecl AST, where R2's seek_logic used to SKIP them.
+    /// This is the VERIFICATION SURFACE the R6 checker will consume — PARSER-ONLY here.
+    ///
+    /// Four new drivers read the FIRST rule's proofs off the parsed program:
+    ///   * count_reads     — number of `reads` entries (NameList length)
+    ///   * count_calls     — number of `calls` entries
+    ///   * rule_term_bound — the declared `bound :` number
+    ///   * rule_term_kind  — termination kind (0 bound-only / 1 structural / 2 decreasing / 3 increasing)
+    /// All NATIVE-ONLY (multi-line indented source). Source is argv[1], pos is argv[2]="0".
+    ///
+    /// Part 1 (THE MILESTONE, real-shaped rule): a `tokenize`-shaped rule with
+    /// `reads : [s.source, s]` (=> 2), `calls : [skip_spaces, token_end, next_token,
+    /// tokenize]` (=> 4), `bound : 256` (=> 256), bound-only termination (kind 0).
+    /// This is the exact proof shape of the real self-source's `tokenize` — the reads
+    /// (ident-path entries) and calls (4 callees incl. self) are extracted for real.
+    ///
+    /// Part 2 (regression, decreasing variant): one full rule
+    /// (input a:number / output out:number / logic out=1 / proofs reads:[a] calls:[]
+    /// termination: bound 100, decreasing a) => count_reads 1, count_calls 0,
+    /// rule_term_bound 100, rule_term_kind 2, and count_rules still 1.
+    #[test]
+    fn records_r5_parse_input_output_and_proofs() {
+        let src = std::fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let crd = std::env::temp_dir().join("verbosec_test_r5_count_reads");
+        let ccl = std::env::temp_dir().join("verbosec_test_r5_count_calls");
+        let ctb = std::env::temp_dir().join("verbosec_test_r5_term_bound");
+        let ctk = std::env::temp_dir().join("verbosec_test_r5_term_kind");
+        let cru = std::env::temp_dir().join("verbosec_test_r5_count_rules");
+        compile_native(&program, "count_reads", crd.to_str().unwrap(), false, false)
+            .expect("count_reads must compile natively");
+        compile_native(&program, "count_calls", ccl.to_str().unwrap(), false, false)
+            .expect("count_calls must compile natively");
+        compile_native(&program, "rule_term_bound", ctb.to_str().unwrap(), false, false)
+            .expect("rule_term_bound must compile natively");
+        compile_native(&program, "rule_term_kind", ctk.to_str().unwrap(), false, false)
+            .expect("rule_term_kind must compile natively");
+        compile_native(&program, "count_rules", cru.to_str().unwrap(), false, false)
+            .expect("count_rules must compile natively");
+
+        let run = |bin: &std::path::Path, prog: &str| -> i64 {
+            let r = std::process::Command::new(bin)
+                .arg(prog)
+                .arg("0")
+                .output()
+                .expect("spawn R5 driver");
+            assert!(r.status.success(), "{:?} must exit 0; got {:?}", bin, r.status);
+            String::from_utf8_lossy(&r.stdout)
+                .trim()
+                .parse::<i64>()
+                .expect("R5 driver prints an integer")
+        };
+
+        // Part 1 — THE MILESTONE: a real-shaped `tokenize` rule. The reads list has
+        // two ident-path entries (`s.source`, `s`); the calls list has four callees
+        // (three helpers + the self-recursive `tokenize`); the termination is
+        // bound-only at 256.
+        let tokenize = "rule tokenize\n  input:\n    s : ScanState\n  output:\n    out : TokenList\n  logic:\n    out = 1\n  proofs:\n    purity:\n      reads : [s.source, s]\n      calls : [skip_spaces, token_end, next_token, tokenize]\n    termination:\n      bound : 256";
+        assert_eq!(
+            run(&crd, tokenize), 2,
+            "MILESTONE: count_reads on a tokenize-shaped rule = 2 (`s.source`, `s`)"
+        );
+        assert_eq!(
+            run(&ccl, tokenize), 4,
+            "MILESTONE: count_calls = 4 (skip_spaces, token_end, next_token, tokenize)"
+        );
+        assert_eq!(
+            run(&ctb, tokenize), 256,
+            "MILESTONE: rule_term_bound = 256 (the declared `bound :`)"
+        );
+        assert_eq!(
+            run(&ctk, tokenize), 0,
+            "MILESTONE: rule_term_kind = 0 (bound-only termination, no structural/decreasing/increasing)"
+        );
+        assert_eq!(
+            run(&cru, tokenize), 1,
+            "count_rules unchanged — the source declares exactly one rule"
+        );
+
+        // Part 2 — regression: a full rule with a `decreasing` termination variant.
+        let decreasing = "rule fac\n  input:\n    a : number\n  output:\n    out : number\n  logic:\n    out = 1\n  proofs:\n    purity:\n      reads : [a]\n      calls : []\n    termination:\n      bound : 100\n      decreasing : a";
+        assert_eq!(run(&crd, decreasing), 1, "R5: reads:[a] => 1");
+        assert_eq!(run(&ccl, decreasing), 0, "R5: calls:[] => 0 (empty list)");
+        assert_eq!(run(&ctb, decreasing), 100, "R5: bound : 100 => 100");
+        assert_eq!(
+            run(&ctk, decreasing), 2,
+            "R5: `decreasing : a` => term_kind 2 (exercises term_kind != 0)"
+        );
+        assert_eq!(run(&cru, decreasing), 1, "R5: count_rules still 1");
+
+        let _ = std::fs::remove_file(&crd);
+        let _ = std::fs::remove_file(&ccl);
+        let _ = std::fs::remove_file(&ctb);
+        let _ = std::fs::remove_file(&ctk);
+        let _ = std::fs::remove_file(&cru);
+    }
+
+    /// Full-file companion to the R2 milestone: count_rules on the WHOLE real
+    /// self-source (examples/vexprparse.verbose, ~500 KB > the 128 KB single-argv
+    /// limit) via the INTERPRETER path, called directly with a constructed
+    /// `Value::Text` so the CLI JSON reader (which chokes on the source's non-ASCII
+    /// comment characters) is bypassed. Runs in a big-stack thread because the
+    /// interpreter recurses once per source line + once per skipped token.
+    /// `#[ignore]` because it is slow (tree-walking the whole file); run with
+    /// `cargo test --release records_r2_full_file_count_rules -- --ignored`.
+    #[test]
+    #[ignore]
+    fn records_r2_full_file_count_rules() {
+        let handle = std::thread::Builder::new()
+            .stack_size(4 * 1024 * 1024 * 1024)
+            .spawn(|| {
+                let src = std::fs::read_to_string("examples/vexprparse.verbose")
+                    .expect("examples/vexprparse.verbose must exist");
+                let grep_rules =
+                    src.lines().filter(|l| l.starts_with("rule ")).count() as i64;
+                let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+                let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+                let all_rules: Vec<&crate::ast::Rule> = program
+                    .items
+                    .iter()
+                    .filter_map(|i| match i {
+                        crate::ast::Item::Rule(r) => Some(r),
+                        _ => None,
+                    })
+                    .collect();
+                let all_concepts: Vec<&crate::ast::Concept> =
+                    crate::ast::iter_all_concepts(&program.items).collect();
+                let count_rules = all_rules
+                    .iter()
+                    .copied()
+                    .find(|r| r.name == "count_rules")
+                    .expect("count_rules rule must exist");
+                let mut input = std::collections::HashMap::new();
+                input.insert("source".to_string(), crate::interpreter::Value::Text(src.clone()));
+                input.insert("pos".to_string(), crate::interpreter::Value::Number(0));
+                let result =
+                    crate::interpreter::eval_rule(count_rules, &all_rules, &all_concepts, &input)
+                        .expect("count_rules must evaluate");
+                match result {
+                    crate::interpreter::Value::Number(n) => assert_eq!(
+                        n, grep_rules,
+                        "count_rules on the WHOLE real self-source must equal its `^rule ` count"
+                    ),
+                    other => panic!("count_rules must return a Number, got {:?}", other),
+                }
+            })
+            .expect("spawn big-stack thread");
+        handle.join().expect("full-file count_rules thread");
+    }
+
+    /// Records-arc brick R6a: the self-hosted checker's undefined-variable lint
+    /// (`lint_program`) now RECURSES into `match` and variant-construct bodies and
+    /// SCOPES match-arm binders. Pre-R6a the `AstVariant`/`AstMatch` arms of
+    /// `count_undef_ast` were `=> 0` stubs, so a match/variant body linted 0 no
+    /// matter what it referenced. R6a replaces those stubs with real walks
+    /// (count_undef_vfields / count_undef_arms + binds_with_binders).
+    ///
+    /// Driver: `lint_program` (tokenize → parse_program → fold lint_rule), compiled
+    /// natively and run argv-style: argv[1] = program source, argv[2] = pos (0).
+    /// It returns the TOTAL undefined-variable count over the program.
+    /// Cases (each a single `rule f`):
+    ///   - `let x = 0  out = match x: Cons(h, t) => h + zzz  Nil => 0` → 1
+    ///       (only zzz; the scrutinee `x` is a let, and the arm binders h/t are
+    ///        bound WITHIN the arm by binds_with_binders, so neither is flagged)
+    ///   - `let x = 0  out = match x: Cons(h, t) => h  Nil => 0`       → 0
+    ///       (binder-only body — proves binders are scoped, not flagged)
+    ///   - `out = Token::Num { value: www }`                           → 1
+    ///       (the variant field VALUE www is an undefined var; the concept/variant
+    ///        names are type refs, not vars)
+    /// Each was 0 under the R3 stub regardless of content.
+    #[test]
+    fn records_r6a_lint_recurses_into_match_and_variant() {
+        let src = std::fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let bin = std::env::temp_dir().join("verbosec_test_r6a_lint_program");
+        compile_native(&program, "lint_program", bin.to_str().unwrap(), false, false)
+            .expect("lint_program must compile natively (R6a match/variant walk included)");
+
+        let run = |source: &str| -> i64 {
+            let r = std::process::Command::new(&bin)
+                .arg(source)
+                .arg("0")
+                .output()
+                .expect("spawn R6a lint_program driver");
+            assert!(
+                r.status.success(),
+                "lint_program must exit 0 for {:?}; got {:?}",
+                source, r.status
+            );
+            String::from_utf8_lossy(&r.stdout)
+                .trim()
+                .parse::<i64>()
+                .unwrap_or_else(|_| panic!("lint_program produced non-number for {:?}: {:?}", source, r.stdout))
+        };
+
+        // match arm with an undefined var (zzz); the arm binders h/t are NOT flagged.
+        assert_eq!(
+            run("rule f\n  logic:\n    let x = 0\n    out = match x: Cons(h, t) => h + zzz  Nil => 0"),
+            1,
+            "R6a: lint walks into the match arm and flags zzz; binders h/t are scoped in (was 0 under the R3 stub)"
+        );
+        // binder-only body: head is bound by the arm, so 0 undefined.
+        assert_eq!(
+            run("rule f\n  logic:\n    let x = 0\n    out = match x: Cons(h, t) => h  Nil => 0"),
+            0,
+            "R6a: a match arm binder (h) is in scope within its own arm body — not flagged undefined"
+        );
+        // variant construct field value referencing an undefined var.
+        assert_eq!(
+            run("rule f\n  logic:\n    out = Token::Num { value: www }"),
+            1,
+            "R6a: lint walks a variant construct's field VALUE and flags the undefined var www (was 0 under the R3 stub)"
+        );
+
+        let _ = std::fs::remove_file(&bin);
+    }
+
+    /// Records-arc brick R6b: the self-hosted type checker (examples/vexprparse.verbose)
+    /// is now CONCEPT-AWARE. type_code_of_span collapses every non-scalar type name to
+    /// 0 (number); R6b stores type SPANS (FCons/PCons/MkRule widened) and resolves them
+    /// against the parsed ConceptList at check time, so a `head : Token` payload field
+    /// types as the Token concept code (1000 + index), NOT number.
+    ///
+    /// `body_type` returns the concept-aware type code of the first rule's body:
+    /// scalar 0/1/2, ERROR 3, or a concept code >= 1000. The SOUNDNESS gate is
+    /// `Cons(h, t) => h + 1`: h is a Token, so `h + 1` is ERROR — the naive-unsound
+    /// "type the binder by the lossy stored code (=number)" path is correctly rejected.
+    /// `type_check` (extended with the declared-output concept check) returns the error
+    /// count; a concept-returning rule whose body matches its `output:` type checks
+    /// clean, a mismatch is flagged.
+    #[test]
+    fn records_r6b_concept_aware_type_checker_is_sound() {
+        let src = std::fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let bt = std::env::temp_dir().join("verbosec_test_r6b_body_type");
+        let tc = std::env::temp_dir().join("verbosec_test_r6b_type_check");
+        compile_native(&program, "body_type", bt.to_str().unwrap(), false, false)
+            .expect("body_type must compile natively (R6b concept-aware type_of_env SCC)");
+        compile_native(&program, "type_check", tc.to_str().unwrap(), false, false)
+            .expect("type_check must compile natively (R6b declared-output concept check)");
+
+        let run = |bin: &std::path::Path, source: &str| -> i64 {
+            let r = std::process::Command::new(bin)
+                .arg(source)
+                .arg("0")
+                .output()
+                .expect("spawn R6b driver");
+            assert!(
+                r.status.success(),
+                "driver must exit 0 for {:?}; got {:?}",
+                source, r.status
+            );
+            String::from_utf8_lossy(&r.stdout)
+                .trim()
+                .parse::<i64>()
+                .unwrap_or_else(|_| panic!("driver produced non-number for {:?}: {:?}", source, r.stdout))
+        };
+
+        // The group declares Token (index 0 -> code 1000) and TokenList (index 1 ->
+        // code 1001). TokenList::Cons carries `head : Token` — the payload field whose
+        // type R6b must recover from its stored span.
+        let grp = "concept_group G [max_depth: 8, max_nodes: 64]\n  concept Token\n    variants:\n      Eof\n  concept TokenList\n    variants:\n      Cons of (head : Token, tail : TokenList)\n      Nil\n";
+
+        // A variant value's type is its concept — not the R3 stub 0.
+        let eof = "concept_group G [max_depth: 8, max_nodes: 64]\n  concept Token\n    variants:\n      Eof\nrule f\n  logic:\n    out = Token::Eof";
+        assert!(
+            run(&bt, eof) >= 1000,
+            "R6b: `out = Token::Eof` types as Token's concept code (>= 1000), not 0/number"
+        );
+
+        // BINDER TYPING: h binds to Cons's `head : Token` payload field -> Token; both
+        // arms are Token, so the match types as Token (a concept code), NOT ERROR/number.
+        let binder_ok = format!("{grp}rule f\n  input:\n    toks : TokenList\n  logic:\n    out = match toks: Cons(h, t) => h  Nil => Token::Eof");
+        assert!(
+            run(&bt, &binder_ok) >= 1000,
+            "R6b: match binder h types as Token (payload type); both arms Token -> match type is a concept code"
+        );
+
+        // SOUNDNESS (the thesis): h is a Token, so `h + 1` is ill-typed -> ERROR (3).
+        // The naive-unsound case (type h by its lossy stored code = number, accept h+1)
+        // MUST be rejected.
+        let unsound = format!("{grp}rule f\n  input:\n    toks : TokenList\n  logic:\n    out = match toks: Cons(h, t) => h + 1  Nil => 0");
+        assert_eq!(
+            run(&bt, &unsound), 3,
+            "R6b SOUNDNESS: `Cons(h, t) => h + 1` is ERROR — h is a Token, not a number"
+        );
+
+        // Arm disagreement: one arm Token, the other number -> ERROR (3).
+        let disagree = format!("{grp}rule f\n  input:\n    toks : TokenList\n  logic:\n    out = match toks: Cons(h, t) => Token::Eof  Nil => 0");
+        assert_eq!(
+            run(&bt, &disagree), 3,
+            "R6b: arms of different types (Token vs number) -> match is ERROR"
+        );
+
+        // Declared-output payoff: a concept-returning rule whose body matches its
+        // `output:` type checks clean; a mismatch (declared Token, body returns a
+        // number) is flagged.
+        let decl_ok = format!("{grp}rule f\n  input:\n    toks : TokenList\n  output:\n    out : Token\n  logic:\n    out = match toks: Cons(h, t) => Token::Eof  Nil => Token::Eof");
+        assert_eq!(
+            run(&tc, &decl_ok), 0,
+            "R6b: a rule declared `output: out : Token` whose body types as Token checks clean"
+        );
+        let decl_bad = format!("{grp}rule f\n  input:\n    toks : TokenList\n  output:\n    out : Token\n  logic:\n    out = 5");
+        assert_eq!(
+            run(&tc, &decl_bad), 1,
+            "R6b: a rule declared `output: out : Token` whose body returns a number is flagged"
+        );
+
+        // Scalar regression: the {number,bool} type system is byte-identical to pre-R6b
+        // (resolve_type's scalar path mirrors type_code_of_span exactly).
+        assert_eq!(run(&tc, "rule f\n  logic:\n    out = 1 + 2"), 0, "R6b: number + number is clean");
+        assert_eq!(run(&tc, "rule f\n  logic:\n    out = 1 + (2 < 3)"), 1, "R6b: number + bool is ill-typed");
+        assert_eq!(run(&tc, "rule f\n  logic:\n    let b = 1 < 2\n    out = if b then 1 else 2"), 0, "R6b: inferred-bool condition is clean");
+
+        let _ = std::fs::remove_file(&bt);
+        let _ = std::fs::remove_file(&tc);
+    }
+
+    /// Records-arc brick R6c: the self-hosted interpreter (examples/vexprparse.verbose)
+    /// now EVALUATES match/variant programs. The eval subsystem became Value-valued:
+    /// `eval_ast_env : Value` (VNum | VData{tag, payload}), and the whole call
+    /// machinery (venv_lookup / build_env / bind_params / eval_call) threads Values and
+    /// the parsed ConceptList. `eval_main` tokenizes a program (source via argv),
+    /// parses its rules AND concepts, and evaluates the first rule — dispatching a
+    /// `match` by comparing a runtime variant tag (concept_index * 256 + variant_index,
+    /// self-computed from the ConceptList) and binding an arm's binders positionally to
+    /// the scrutinee's payload.
+    ///
+    /// Three gates, all cross-checked against the hand value:
+    ///   1. NON-RECURSIVE match/variant: build `Cons(5, Nil)`, `match it: Cons(h,t)=>h
+    ///      Nil=>0` -> 5 (constructs a VData, dispatches, binds h, returns it).
+    ///   2. RECURSIVE list-sum: a recursive rule builds `Cons(3,Cons(2,Cons(1,Nil)))`
+    ///      via variant construction, a recursive match rule sums it -> 6 (Values flow
+    ///      through calls + recursion + payload binding).
+    ///   3. SCALAR no-regression: recursive factorial(5) -> 120, IDENTICAL to pre-R6c
+    ///      (the Value-of-number path is behavior-identical to the old number path).
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn records_r6c_interpreter_evaluates_match_variant() {
+        let src = std::fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let em = std::env::temp_dir().join("verbosec_test_r6c_eval_main");
+        compile_native(&program, "eval_main", em.to_str().unwrap(), false, false)
+            .expect("eval_main must compile natively (R6c Value-valued eval SCC)");
+
+        let run = |source: &str| -> i64 {
+            let r = std::process::Command::new(&em)
+                .arg(source)
+                .arg("0")
+                .output()
+                .expect("spawn eval_main");
+            assert!(
+                r.status.success(),
+                "eval_main must exit 0 for {:?}; got {:?}",
+                source, r.status
+            );
+            String::from_utf8_lossy(&r.stdout)
+                .trim()
+                .parse::<i64>()
+                .unwrap_or_else(|_| panic!("eval_main produced non-number for {:?}: {:?}", source, r.stdout))
+        };
+
+        // 1. NON-RECURSIVE match/variant -> 5. build() returns Lst::Cons{5, Nil}; main
+        //    matches it, binds h to the head payload (5), returns h.
+        let m = "concept_group L [max_depth: 8, max_nodes: 64]\n  concept Lst\n    variants:\n      Cons of (head : number, tail : Lst)\n      Nil\nrule main\n  logic:\n    out = match build(): Cons(h, t) => h  Nil => 0\nrule build()\n  logic:\n    out = Lst::Cons { head: 5, tail: Lst::Nil }";
+        assert_eq!(run(m), 5, "R6c: non-recursive match on Cons(5, Nil) binds h -> 5");
+
+        // 2. RECURSIVE list-sum -> 6. build(3) constructs Cons(3,Cons(2,Cons(1,Nil)))
+        //    across a recursive rule; lsum sums it via a recursive match. Values flow
+        //    through calls + recursion + positional payload binding.
+        let ls = "concept_group L [max_depth: 64, max_nodes: 4096]\n  concept Lst\n    variants:\n      Cons of (head : number, tail : Lst)\n      Nil\nrule main\n  logic:\n    out = lsum(build(3))\nrule build(n)\n  logic:\n    out = if n == 0 then Lst::Nil else Lst::Cons { head: n, tail: build(n - 1) }\nrule lsum(xs)\n  logic:\n    out = match xs: Cons(h, t) => h + lsum(t)  Nil => 0";
+        assert_eq!(run(ls), 6, "R6c: recursive list-sum of [3,2,1,0] -> 6");
+        // deeper: build(5) -> 5+4+3+2+1+0 = 15 (really recursive, not a fixed depth).
+        let ls5 = ls.replace("lsum(build(3))", "lsum(build(5))");
+        assert_eq!(run(&ls5), 15, "R6c: recursive list-sum of [5..0] -> 15");
+
+        // 3. SCALAR no-regression: recursive factorial(5) -> 120, IDENTICAL to pre-R6c.
+        let fact = "rule main\n  logic:\n    out = fact(5)\nrule fact(n)\n  logic:\n    out = if n == 0 then 1 else n * fact(n - 1)";
+        assert_eq!(run(fact), 120, "R6c: scalar recursion unchanged (Value-of-number is behavior-identical)");
+        // and a plain arithmetic / let program stays exact.
+        assert_eq!(
+            run("rule main\n  logic:\n    let d = 10 * 2\n    out = d + 1"),
+            21,
+            "R6c: scalar let-block unchanged"
+        );
+
+        let _ = std::fs::remove_file(&em);
+    }
+
+    /// Text values arc slice 1: the self-hosted interpreter (examples/vexprparse.verbose)
+    /// now has REAL text values via the SPAN model. A new Value variant
+    /// `VText(start, len)` is a span into the interpreted source; `AstStr` evaluates to
+    /// it with the surrounding quotes stripped (the lexer's Str token span includes
+    /// both quotes — confirmed empirically below: byte_at("abc", 0) -> 97 ('a'), not
+    /// 34 ('"')). The target-language byte_at / length / substring are dispatched in
+    /// eval_ast_env's AstCall arm (BEFORE eval_call — its lets are eager) by
+    /// byte-comparing the callee span (span_is_byte_at / _length / _substring), and
+    /// implemented with the HOST's own primitives on the interpreted source. Every
+    /// host byte_at is bounds-guarded FIRST, so a target program's OOB index returns
+    /// a defensive VNum 0 instead of tripping the host's fail-closed abort.
+    ///
+    /// Gates:
+    ///   * MILESTONE — the interpreter RUNS a real scanner: scan_word.verbose's
+    ///     word_length logic (recursion + byte_at + length + text through a record
+    ///     field) on "hello world" -> 5.
+    ///   * length("hello") -> 5; byte_at("abc", 1) -> 98.
+    ///   * span composition: length(substring("hello world", 6, 11)) -> 5 and
+    ///     byte_at(substring("hello world", 6, 11), 0) -> 119 ('w').
+    ///   * defensive: byte_at("abc", 99) -> 0 — the interpreter does NOT abort.
+    ///   * UNCHANGED: records param access -> 49, variant list-sum -> 6.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn text_values_slice1_interpreter_runs_scanner() {
+        let src = std::fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let em = std::env::temp_dir().join("verbosec_test_tv1_eval_main");
+        compile_native(&program, "eval_main", em.to_str().unwrap(), false, false)
+            .expect("eval_main must compile natively (text values slice 1)");
+
+        let run = |source: &str| -> i64 {
+            let r = std::process::Command::new(&em)
+                .arg(source)
+                .arg("0")
+                .output()
+                .expect("spawn eval_main");
+            assert!(
+                r.status.success(),
+                "eval_main must exit 0 for {:?}; got {:?}",
+                source, r.status
+            );
+            String::from_utf8_lossy(&r.stdout)
+                .trim()
+                .parse::<i64>()
+                .unwrap_or_else(|_| panic!("eval_main produced non-number for {:?}: {:?}", source, r.stdout))
+        };
+
+        // MILESTONE: the self-hosted interpreter runs scan_word.verbose's logic —
+        // recursion + byte_at + length + a text value through a record field.
+        let scanner = "concept Sc\n  fields:\n    src : text\n    pos : number\nrule main\n  logic:\n    out = word_length(Sc { src: \"hello world\", pos: 0 })\nrule word_length(s : Sc)\n  logic:\n    out = if s.pos >= length(s.src) then 0 else if byte_at(s.src, s.pos) >= 97 then (if byte_at(s.src, s.pos) <= 122 then 1 + word_length(Sc { src: s.src, pos: s.pos + 1 }) else 0) else 0";
+        assert_eq!(run(scanner), 5, "text values 1: word_length(\"hello world\", 0) -> 5");
+
+        // Primitives on a string literal (also the empirical quote-strip probes:
+        // an unstripped span would give length 5 and byte 34 ('\"')).
+        assert_eq!(run("rule main\n  logic:\n    out = length(\"hello\")"), 5,
+            "text values 1: length(\"hello\") -> 5");
+        assert_eq!(run("rule main\n  logic:\n    out = byte_at(\"abc\", 1)"), 98,
+            "text values 1: byte_at(\"abc\", 1) -> 98");
+        assert_eq!(run("rule main\n  logic:\n    out = byte_at(\"abc\", 0)"), 97,
+            "text values 1: quote stripped — first byte is 'a' (97), not '\"' (34)");
+
+        // Span composition: substring returns a sub-span of the SAME source.
+        assert_eq!(run("rule main\n  logic:\n    out = length(substring(\"hello world\", 6, 11))"), 5,
+            "text values 1: length(substring(...)) -> 5");
+        assert_eq!(run("rule main\n  logic:\n    out = byte_at(substring(\"hello world\", 6, 11), 0)"), 119,
+            "text values 1: byte_at(substring(...), 0) -> 119 ('w')");
+
+        // Defensive: an OOB target index returns 0 — never the host's fail-closed abort.
+        assert_eq!(run("rule main\n  logic:\n    out = byte_at(\"abc\", 99)"), 0,
+            "text values 1: OOB byte_at is a defensive 0, no interpreter abort");
+
+        // UNCHANGED: records param access and the variant list-sum stay identical.
+        let param_access = "concept Foo\n  fields:\n    a : number\n    b : number\nrule main\n  logic:\n    out = get_a(Foo { a: 42, b: 7 })\nrule get_a(s : Foo)\n  logic:\n    out = s.a + s.b";
+        assert_eq!(run(param_access), 49, "text values 1: records param access unchanged -> 49");
+        let lst = "concept_group L [max_depth: 64, max_nodes: 4096]\n  concept Lst\n    variants:\n      Cons of (head : number, tail : Lst)\n      Nil\nrule main\n  logic:\n    out = lsum(build(3))\nrule build(n)\n  logic:\n    out = if n == 0 then Lst::Nil else Lst::Cons { head: n, tail: build(n - 1) }\nrule lsum(xs)\n  logic:\n    out = match xs: Cons(h, t) => h + lsum(t)  Nil => 0";
+        assert_eq!(run(lst), 6, "text values 1: variant list-sum unchanged -> 6");
+
+        let _ = std::fs::remove_file(&em);
+    }
+
+    /// Text values arc slice 2 — text CODEGEN (packed spans + embedded source).
+    /// The self-hosted emitter now COMPILES text: an `AstStr` lowers to ONE packed
+    /// i64 push (`(start+1)*2^32 | (len-2)`, quotes stripped — the SAME numbers as
+    /// slice 1's eval VText), and the three span primitives dispatch in x86_node's
+    /// AstCall arm BEFORE the real-call path (VERBATIM the same span_is_* +
+    /// arg_list_len conditions in code_size_node): length = pop ; mov eax, eax ;
+    /// push (K=4); byte_at = split span, unsigned bounds, movabs src_base, movzx
+    /// load, OOB → push 0 (K=36); substring = split, a<=b && b<=len unsigned,
+    /// repack (start+a, b-a), OOB → push 0 (K=38). `src_base = 0x400000 +
+    /// blob_end_off` because elf_program_src APPENDS the interpreted source at the
+    /// file end (4 bytes per le32 word via src_blob, zero-padded to 4), extending
+    /// p_filesz — so compiled spans index the same bytes eval's spans do, and the
+    /// oracle equivalence is exact by construction. Embedding + emits are gated on
+    /// `program_uses_text`, so text-free programs stay BYTE-IDENTICAL (checked
+    /// against a 0286af4-built emitter during the slice: records 49/15/7, variant
+    /// list-sum 6/15, scalar 5 — all `cmp`-equal).
+    ///
+    /// The slice also surfaced and fixed a LATENT off-threading bug in x86_node's
+    /// AstIf arm: the THEN branch was emitted with `off + size(cond) + 15`, but its
+    /// true position is `+ 10` (the 5-byte jmp-over-els sits AFTER thn). Every
+    /// prior test program recursed in an ELSE branch, so no call rel32 had ever
+    /// been emitted inside a THEN branch — word_length's recursive call landed 5
+    /// bytes short (in the previous proc's epilogue) until the fix.
+    ///
+    /// Gates (each emitted ELF is executed AND cross-checked against eval_main):
+    ///   * MILESTONE — the COMPILER compiles a scanner: the slice-1 word_length
+    ///     program (Sc{src, pos} record, recursion, byte_at/length through record
+    ///     fields) → the emitted ELF prints 5.
+    ///   * length("hello") → 5; byte_at("abc", 1) → 98;
+    ///     length(substring("hello world", 6, 11)) → 5;
+    ///     byte_at(substring("hello world", 6, 11), 0) → 119 ('w').
+    ///   * OOB byte_at("abc", 99) → 0, exit 0 (oracle parity, no abort).
+    ///   * The scanner ELF EMBEDS its program source (byte-searchable in the
+    ///     file); a text-free program's ELF does NOT grow (p_filesz == file size,
+    ///     no appended source).
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn text_values_slice2_compiled_scanner_matches_oracle() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        let src = fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let elf = std::env::temp_dir().join("verbosec_test_tv2_elf_program_src");
+        compile_native(&program, "elf_program_src", elf.to_str().unwrap(), false, false)
+            .expect("elf_program_src must compile natively (text values slice 2)");
+        let em = std::env::temp_dir().join("verbosec_test_tv2_eval_main");
+        compile_native(&program, "eval_main", em.to_str().unwrap(), false, false)
+            .expect("eval_main must compile natively (text values slice 2)");
+
+        let oracle = |source: &str| -> i64 {
+            let r = Command::new(&em).arg(source).arg("0").output().expect("spawn eval_main");
+            assert!(r.status.success(), "eval_main must exit 0 for {:?}", source);
+            String::from_utf8_lossy(&r.stdout).trim().parse::<i64>()
+                .unwrap_or_else(|_| panic!("eval_main non-number for {:?}: {:?}", source, r.stdout))
+        };
+
+        // MILESTONE: the slice-1 scanner, now COMPILED — recursion + byte_at +
+        // length + a packed text span flowing through a record field.
+        let scanner = "concept Sc\n  fields:\n    src : text\n    pos : number\nrule main\n  logic:\n    out = word_length(Sc { src: \"hello world\", pos: 0 })\nrule word_length(s : Sc)\n  logic:\n    out = if s.pos >= length(s.src) then 0 else if byte_at(s.src, s.pos) >= 97 then (if byte_at(s.src, s.pos) <= 122 then 1 + word_length(Sc { src: s.src, pos: s.pos + 1 }) else 0) else 0".to_string();
+
+        let cases: &[(String, i64)] = &[
+            (scanner.clone(), 5),
+            ("rule main\n  logic:\n    out = length(\"hello\")".to_string(), 5),
+            ("rule main\n  logic:\n    out = byte_at(\"abc\", 1)".to_string(), 98),
+            ("rule main\n  logic:\n    out = length(substring(\"hello world\", 6, 11))".to_string(), 5),
+            ("rule main\n  logic:\n    out = byte_at(substring(\"hello world\", 6, 11), 0)".to_string(), 119),
+            // OOB: defensive 0 with exit 0 — parity with eval's VNum 0, no abort.
+            ("rule main\n  logic:\n    out = byte_at(\"abc\", 99)".to_string(), 0),
+        ];
+
+        for (i, (prog_src, expected)) in cases.iter().enumerate() {
+            assert_eq!(oracle(prog_src), *expected, "oracle disagreement for {:?}", prog_src);
+
+            let mc = Command::new(&elf).args([prog_src.as_str(), "0"]).output()
+                .expect("spawn elf_program_src");
+            assert!(mc.status.success(), "elf_program_src must exit 0 for {:?}; got {:?}", prog_src, mc.status);
+            let elf_bytes = mc.stdout;
+            assert_eq!(&elf_bytes[0..4], &[0x7f, 0x45, 0x4c, 0x46], "emitted file is not ELF for {:?}", prog_src);
+
+            // Every case uses text, so the interpreted source must be EMBEDDED in
+            // the emitted file (that is what compiled spans index into).
+            let src_bytes = prog_src.as_bytes();
+            assert!(
+                elf_bytes.windows(src_bytes.len()).any(|w| w == src_bytes),
+                "emitted ELF for {:?} does not embed the program source", prog_src
+            );
+
+            let out_path = std::env::temp_dir().join(format!("verbosec_test_tv2_a_out_{}", i));
+            fs::write(&out_path, &elf_bytes).expect("write a.out");
+            let mut perms = fs::metadata(&out_path).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&out_path, perms).expect("chmod +x");
+
+            let child = Command::new(&out_path).output().expect("execute emitted ELF");
+            assert!(child.status.success(), "emitted ELF for {:?} did not exit 0; got {:?}", prog_src, child.status);
+            let child_out: i64 = String::from_utf8_lossy(&child.stdout).trim().parse()
+                .unwrap_or_else(|_| panic!("emitted ELF produced non-number for {:?}: {:?}", prog_src, child.stdout));
+            assert_eq!(child_out, *expected, "slice-2 ELF for {:?} printed {} (expected {})", prog_src, child_out, expected);
+
+            let _ = fs::remove_file(&out_path);
+        }
+
+        // Text-free gate: no embedding, p_filesz covers exactly the whole file
+        // (the appended-source extension never fires without program_uses_text).
+        let text_free = "concept Foo\n  fields:\n    a : number\n    b : number\nrule main\n  logic:\n    out = get_a(Foo { a: 42, b: 7 })\nrule get_a(s : Foo)\n  logic:\n    out = s.a + s.b";
+        let mc = Command::new(&elf).args([text_free, "0"]).output().expect("spawn elf_program_src");
+        assert!(mc.status.success(), "elf_program_src must exit 0 for the text-free program");
+        let tf_bytes = mc.stdout;
+        let p_filesz = u64::from_le_bytes(tf_bytes[96..104].try_into().unwrap());
+        assert_eq!(p_filesz as usize, tf_bytes.len(),
+            "text-free ELF must not carry an appended source (p_filesz == file size)");
+        assert!(
+            !tf_bytes.windows(text_free.len()).any(|w| w == text_free.as_bytes()),
+            "text-free ELF must NOT embed the program source"
+        );
+
+        let _ = fs::remove_file(elf);
+        let _ = fs::remove_file(em);
+    }
+
+    /// Records-arc slice 2: the self-hosted interpreter now RESOLVES record/variant
+    /// FIELD ACCESS. `eval_ast_env`'s AstField arm (previously stubbed to VNum 0) now
+    /// evaluates the base to a VData, recovers the concept from tag / 256, finds the
+    /// field's position via `field_index_of`, and reads that payload slot via
+    /// `vlist_nth`. `variant_tag` became record-aware: a record construction
+    /// `Foo { a, b }` parses to AstVariant(Foo, Foo, fields), so the variant name is
+    /// not found among Foo's (empty) variants — the tag defaults to concept_index*256
+    /// + 0 so the field-access path recovers the concept.
+    ///
+    /// Records and variants coexist in ONE test (the record-aware `variant_tag` must
+    /// not perturb real-variant tagging): s.a -> 42, s.b -> 7, s.a + s.b -> 49, and a
+    /// recursive variant list-sum -> 6 (byte-identical to R6c).
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn records_slice2_astfield_eval() {
+        let src = std::fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let em = std::env::temp_dir().join("verbosec_test_slice2_astfield");
+        compile_native(&program, "eval_main", em.to_str().unwrap(), false, false)
+            .expect("eval_main must compile natively (records slice 2 AstField eval)");
+
+        let run = |source: &str| -> i64 {
+            let r = std::process::Command::new(&em)
+                .arg(source)
+                .arg("0")
+                .output()
+                .expect("spawn eval_main");
+            assert!(
+                r.status.success(),
+                "eval_main must exit 0 for {:?}; got {:?}",
+                source, r.status
+            );
+            String::from_utf8_lossy(&r.stdout)
+                .trim()
+                .parse::<i64>()
+                .unwrap_or_else(|_| panic!("eval_main produced non-number for {:?}: {:?}", source, r.stdout))
+        };
+
+        // A top-level record concept + a `let s = Foo { a: 42, b: 7 }` binding, then
+        // field access. field_index_of resolves .a to slot 0 and .b to slot 1, so both
+        // reads land on the right payload value (not just "first slot").
+        let rec = "concept Foo\n  fields:\n    a : number\n    b : number\nrule main\n  logic:\n    let s = Foo { a: 42, b: 7 }\n    out = s.a";
+        assert_eq!(run(rec), 42, "slice 2: record field access s.a -> 42");
+        assert_eq!(
+            run(&rec.replace("out = s.a", "out = s.b")),
+            7,
+            "slice 2: record field access s.b -> 7 (field_index resolution, not first slot)"
+        );
+        assert_eq!(
+            run(&rec.replace("out = s.a", "out = s.a + s.b")),
+            49,
+            "slice 2: s.a + s.b -> 49 (both fields resolve)"
+        );
+
+        // Coexistence: the record-aware variant_tag must NOT perturb real variants.
+        // Recursive variant list-sum build(3) -> 6, byte-identical to R6c.
+        let ls = "concept_group L [max_depth: 64, max_nodes: 4096]\n  concept Lst\n    variants:\n      Cons of (head : number, tail : Lst)\n      Nil\nrule main\n  logic:\n    out = lsum(build(3))\nrule build(n)\n  logic:\n    out = if n == 0 then Lst::Nil else Lst::Cons { head: n, tail: build(n - 1) }\nrule lsum(xs)\n  logic:\n    out = match xs: Cons(h, t) => h + lsum(t)  Nil => 0";
+        assert_eq!(run(ls), 6, "slice 2: variant list-sum still -> 6 (records + variants coexist)");
+
+        let _ = std::fs::remove_file(&em);
+    }
+
+    /// Records-arc brick R6d: the self-hosted PURITY VERIFIER
+    /// (examples/vexprparse.verbose) now VERIFIES the purity half of each rule's
+    /// parsed proofs. `count_purity_errors` tokenizes + parses a program (source via
+    /// argv) and folds two per-rule checks over it:
+    ///   * calls — an AstCall whose callee RESOLVES to a defined rule but is absent
+    ///     from the rule's declared `calls:` list is one violation. Primitives don't
+    ///     resolve to a defined rule (exempt); self-recursion resolves (must be
+    ///     declared).
+    ///   * reads — an AstVar whose head-ident is the rule's `input:` name, is not a
+    ///     local (let/param/binder), and is not in the declared `reads:` list is one
+    ///     violation. Head-ident membership: declared `[s]` admits `s.anything`.
+    /// Termination verification is DEFERRED (harder arg-pattern analysis) — R6d is
+    /// the purity half only.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn records_r6d_purity_verifier_checks_reads_and_calls() {
+        let src = std::fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let bin = std::env::temp_dir().join("verbosec_test_r6d_count_purity_errors");
+        compile_native(&program, "count_purity_errors", bin.to_str().unwrap(), false, false)
+            .expect("count_purity_errors must compile natively (R6d purity walk over match/variant)");
+
+        let run = |source: &str| -> i64 {
+            let r = std::process::Command::new(&bin)
+                .arg(source)
+                .arg("0")
+                .output()
+                .expect("spawn R6d count_purity_errors driver");
+            assert!(
+                r.status.success(),
+                "count_purity_errors must exit 0 for {:?}; got {:?}",
+                source, r.status
+            );
+            String::from_utf8_lossy(&r.stdout)
+                .trim()
+                .parse::<i64>()
+                .unwrap_or_else(|_| panic!("count_purity_errors produced non-number for {:?}: {:?}", source, r.stdout))
+        };
+
+        // CALLS: r calls the DEFINED rule helper but does not declare it -> 1 violation.
+        let call_bad = "rule r\n  logic:\n    out = helper(1)\n  proofs:\n    purity:\n      reads : []\n      calls : []\n    termination:\n      bound : 1\nrule helper(x)\n  logic:\n    out = x";
+        assert_eq!(run(call_bad), 1, "R6d: undeclared call to a defined rule is flagged");
+
+        // CALLS: same body with `calls : [helper]` declared -> clean.
+        let call_ok = "rule r\n  logic:\n    out = helper(1)\n  proofs:\n    purity:\n      reads : []\n      calls : [helper]\n    termination:\n      bound : 1\nrule helper(x)\n  logic:\n    out = x";
+        assert_eq!(run(call_ok), 0, "R6d: a declared call to a defined rule checks clean");
+
+        // CALLS: a primitive (length) does not resolve to a defined rule -> exempt.
+        let prim = "rule r\n  logic:\n    out = length(s)\n  proofs:\n    purity:\n      reads : []\n      calls : []\n    termination:\n      bound : 1";
+        assert_eq!(run(prim), 0, "R6d: a primitive call (length) is exempt — not a defined rule");
+
+        // CALLS: self-recursion resolves — undeclared self is flagged, declared is clean.
+        let rec_bad = "rule r(n)\n  logic:\n    out = r(n)\n  proofs:\n    purity:\n      reads : []\n      calls : []\n    termination:\n      bound : 1";
+        assert_eq!(run(rec_bad), 1, "R6d: undeclared self-recursion is flagged");
+        let rec_ok = "rule r(n)\n  logic:\n    out = r(n)\n  proofs:\n    purity:\n      reads : []\n      calls : [r]\n    termination:\n      bound : 1";
+        assert_eq!(run(rec_ok), 0, "R6d: declared self-recursion checks clean");
+
+        // READS: r reads its input `s` (out = s) but declares `reads : []` -> 1 violation.
+        let read_bad = "rule r\n  input:\n    s : Thing\n  logic:\n    out = s\n  proofs:\n    purity:\n      reads : []\n      calls : []\n    termination:\n      bound : 1";
+        assert_eq!(run(read_bad), 1, "R6d: undeclared input read is flagged");
+
+        // READS: same body with `reads : [s]` declared -> clean (head-ident membership).
+        let read_ok = "rule r\n  input:\n    s : Thing\n  logic:\n    out = s\n  proofs:\n    purity:\n      reads : [s]\n      calls : []\n    termination:\n      bound : 1";
+        assert_eq!(run(read_ok), 0, "R6d: a declared input read checks clean");
+
+        // READS: a let-local read (d) is NOT an input read -> not flagged.
+        let local = "rule r\n  logic:\n    let d = 1\n    out = d\n  proofs:\n    purity:\n      reads : []\n      calls : []\n    termination:\n      bound : 1";
+        assert_eq!(run(local), 0, "R6d: a let-local read (d) is a local, not an input read — not flagged");
+
+        // A fully-correct tokenize-shaped rule (reads/calls match its body) -> 0.
+        let clean = "rule scan\n  input:\n    s : ScanState\n  logic:\n    out = if s.pos >= s.len then s.pos else scan(ScanState { source: s.source, pos: s.pos })\n  proofs:\n    purity:\n      reads : [s.pos, s.len, s.source]\n      calls : [scan]\n    termination:\n      bound : 1";
+        assert_eq!(run(clean), 0, "R6d: a rule whose reads/calls match its body checks clean");
+
+        let _ = std::fs::remove_file(&bin);
+    }
+
+    /// Termination verifier: the self-hosted checker's LAST proof surface
+    /// (examples/vexprparse.verbose). `count_term_errors` tokenizes + parses a
+    /// program (source via argv) and, for each rule declaring a structural /
+    /// decreasing / increasing termination proof, checks every SELF-recursive
+    /// call site's first argument against the declared pattern:
+    ///   * decreasing : f — arg is a record construction whose field f is
+    ///     literally `input.f - k` (AstBin op 14, literal k >= 1);
+    ///   * increasing : f — symmetric, `input.f + k` (op 13);
+    ///   * structural : p — arg is a binder introduced by an enclosing match arm
+    ///     whose scrutinee is the input param itself;
+    ///   * bound-only (kind 0) — never flagged (parity with verbosec's
+    ///     breadcrumb-not-refusal policy); non-recursive rules pass vacuously.
+    /// With this, all four proof surfaces (lints, sound types, purity,
+    /// termination) are verified by the self-hosted checker.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn records_termination_verifier_checks_recursive_arg_patterns() {
+        let src = std::fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let bin = std::env::temp_dir().join("verbosec_test_count_term_errors");
+        compile_native(&program, "count_term_errors", bin.to_str().unwrap(), false, false)
+            .expect("count_term_errors must compile natively (termination walk over match/variant)");
+
+        let run = |source: &str| -> i64 {
+            let r = std::process::Command::new(&bin)
+                .arg(source)
+                .arg("0")
+                .output()
+                .expect("spawn count_term_errors driver");
+            assert!(
+                r.status.success(),
+                "count_term_errors must exit 0 for {:?}; got {:?}",
+                source, r.status
+            );
+            String::from_utf8_lossy(&r.stdout)
+                .trim()
+                .parse::<i64>()
+                .unwrap_or_else(|_| panic!("count_term_errors produced non-number for {:?}: {:?}", source, r.stdout))
+        };
+
+        // DECREASING OK: go recurses with St { n: s.n - 1 } under `decreasing : n` -> clean.
+        let dec_ok = "rule go\n  input:\n    s : St\n  output:\n    out : number\n  logic:\n    out = if s.n == 0 then 0 else go(St { n: s.n - 1 })\n  proofs:\n    purity:\n      reads : [s.n]\n      calls : [go]\n    termination:\n      bound : 100\n      decreasing : n";
+        assert_eq!(run(dec_ok), 0, "termination: `input.f - k` matches `decreasing : f` — clean");
+
+        // DECREASING BROKEN (no decrease): St { n: s.n } does not step the field -> 1 violation.
+        let dec_nostep = "rule go\n  input:\n    s : St\n  output:\n    out : number\n  logic:\n    out = if s.n == 0 then 0 else go(St { n: s.n })\n  proofs:\n    purity:\n      reads : [s.n]\n      calls : [go]\n    termination:\n      bound : 100\n      decreasing : n";
+        assert_eq!(run(dec_nostep), 1, "termination: pass-through field under `decreasing : n` is flagged");
+
+        // DECREASING BROKEN (wrong direction): s.n + 1 under `decreasing : n` -> 1 violation.
+        let dec_wrongdir = "rule go\n  input:\n    s : St\n  output:\n    out : number\n  logic:\n    out = if s.n == 0 then 0 else go(St { n: s.n + 1 })\n  proofs:\n    purity:\n      reads : [s.n]\n      calls : [go]\n    termination:\n      bound : 100\n      decreasing : n";
+        assert_eq!(run(dec_wrongdir), 1, "termination: `input.f + k` under `decreasing : f` is flagged");
+
+        // INCREASING OK: scan recurses with St2 { pos: s.pos + 1 } under `increasing : pos` -> clean.
+        let inc_ok = "rule scan\n  input:\n    s : St2\n  output:\n    out : number\n  logic:\n    out = if s.pos >= 10 then 0 else scan(St2 { pos: s.pos + 1 })\n  proofs:\n    purity:\n      reads : [s.pos]\n      calls : [scan]\n    termination:\n      bound : 100\n      increasing : pos";
+        assert_eq!(run(inc_ok), 0, "termination: `input.f + k` matches `increasing : f` — clean");
+
+        // INCREASING BROKEN: s.pos - 1 under `increasing : pos` -> 1 violation.
+        let inc_broken = "rule scan\n  input:\n    s : St2\n  output:\n    out : number\n  logic:\n    out = if s.pos >= 10 then 0 else scan(St2 { pos: s.pos - 1 })\n  proofs:\n    purity:\n      reads : [s.pos]\n      calls : [scan]\n    termination:\n      bound : 100\n      increasing : pos";
+        assert_eq!(run(inc_broken), 1, "termination: `input.f - k` under `increasing : f` is flagged");
+
+        // STRUCTURAL OK: lsum recurses on t, a binder of a match whose scrutinee is the input xs.
+        let struct_ok = "concept_group L [max_depth: 64, max_nodes: 4096]\n  concept Lst\n    variants:\n      Cons of (h : number, t : Lst)\n      Nil\nrule lsum\n  input:\n    xs : Lst\n  output:\n    out : number\n  logic:\n    out = match xs: Cons(h, t) => h + lsum(t)  Nil => 0\n  proofs:\n    purity:\n      reads : [xs]\n      calls : [lsum]\n    termination:\n      bound : 4000\n      structural : xs";
+        assert_eq!(run(struct_ok), 0, "termination: recursing on a match binder of the input is structural — clean");
+
+        // STRUCTURAL BROKEN: lsum(xs) recurses on the WHOLE input (no descent) -> 1 violation.
+        let struct_broken = "concept_group L [max_depth: 64, max_nodes: 4096]\n  concept Lst\n    variants:\n      Cons of (h : number, t : Lst)\n      Nil\nrule lsum\n  input:\n    xs : Lst\n  output:\n    out : number\n  logic:\n    out = match xs: Cons(h, t) => h + lsum(xs)  Nil => 0\n  proofs:\n    purity:\n      reads : [xs]\n      calls : [lsum]\n    termination:\n      bound : 4000\n      structural : xs";
+        assert_eq!(run(struct_broken), 1, "termination: recursing on the whole input under `structural` is flagged");
+
+        // BOUND-ONLY recursive (factorial-style): never flagged — parity with verbosec's breadcrumb.
+        let bound_rec = "rule fact\n  input:\n    n : N\n  output:\n    out : number\n  logic:\n    out = if n.v == 0 then 1 else n.v * fact(N { v: n.v - 1 })\n  proofs:\n    purity:\n      reads : [n.v]\n      calls : [fact]\n    termination:\n      bound : 100";
+        assert_eq!(run(bound_rec), 0, "termination: bound-only recursive rule is never flagged (breadcrumb parity)");
+
+        // NON-RECURSIVE with a declared decreasing proof: no self-call -> vacuously clean.
+        let nonrec = "rule f\n  input:\n    s : St\n  output:\n    out : number\n  logic:\n    out = s.n + 1\n  proofs:\n    purity:\n      reads : [s.n]\n      calls : []\n    termination:\n      bound : 1\n      decreasing : n";
+        assert_eq!(run(nonrec), 0, "termination: a non-recursive rule passes any declared kind vacuously");
+
+        let _ = std::fs::remove_file(&bin);
     }
 
 }

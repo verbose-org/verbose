@@ -38,7 +38,7 @@ impl std::fmt::Display for OptStats {
 
 fn count_nodes(expr: &Expr) -> usize {
     match expr {
-        Expr::Number(_) | Expr::Text(_) | Expr::Ident(_) => 1,
+        Expr::Number(_) | Expr::Text(_) | Expr::Bytes(_) | Expr::Ident(_) => 1,
         Expr::Field(base, _) => 1 + count_nodes(base),
         Expr::Binary(_, l, r) => 1 + count_nodes(l) + count_nodes(r),
         Expr::Not(i) | Expr::Neg(i) => 1 + count_nodes(i),
@@ -75,6 +75,8 @@ fn count_nodes(expr: &Expr) -> usize {
         Expr::Length(inner) => 1 + count_nodes(inner),
         // `abs(<number_expr>)` — same shape as Neg: one node + recurse.
         Expr::Abs(inner) | Expr::BitNot(inner) => 1 + count_nodes(inner),
+        // `le32(n)` / `le64(n)` — one node + recurse (same shape as Abs).
+        Expr::Le32(inner) | Expr::Le64(inner) => 1 + count_nodes(inner),
         // `min(a, b)` / `max(a, b)` — same shape as Binary: count this node
         // + recurse into both children.
         Expr::Min(l, r) | Expr::Max(l, r) | Expr::BitAnd(l, r) | Expr::BitOr(l, r) | Expr::BitXor(l, r) | Expr::Shl(l, r) | Expr::Shr(l, r) => 1 + count_nodes(l) + count_nodes(r),
@@ -291,7 +293,7 @@ fn inline_text_literal_lets(
 pub fn substitute_ident(expr: &Expr, name: &str, replacement: &Expr) -> Expr {
     match expr {
         Expr::Ident(n) if n == name => replacement.clone(),
-        Expr::Ident(_) | Expr::Number(_) | Expr::Text(_) => expr.clone(),
+        Expr::Ident(_) | Expr::Number(_) | Expr::Text(_) | Expr::Bytes(_) => expr.clone(),
         Expr::Field(base, f) => Expr::Field(
             Box::new(substitute_ident(base, name, replacement)),
             f.clone(),
@@ -430,6 +432,13 @@ pub fn substitute_ident(expr: &Expr, name: &str, replacement: &Expr) -> Expr {
         Expr::Abs(inner) => Expr::Abs(
             Box::new(substitute_ident(inner, name, replacement)),
         ),
+        // `le32(n)` / `le64(n)` — substitute through the inner expression.
+        Expr::Le32(inner) => Expr::Le32(
+            Box::new(substitute_ident(inner, name, replacement)),
+        ),
+        Expr::Le64(inner) => Expr::Le64(
+            Box::new(substitute_ident(inner, name, replacement)),
+        ),
         // `min(a, b)` — substitute through both children.
         Expr::Min(l, r) => Expr::Min(
             Box::new(substitute_ident(l, name, replacement)),
@@ -530,7 +539,7 @@ pub fn optimize_expr(
     field_ranges: &HashMap<&str, (i64, i64)>,
 ) -> Expr {
     match expr {
-        Expr::Number(_) | Expr::Text(_) | Expr::Ident(_) => expr.clone(),
+        Expr::Number(_) | Expr::Text(_) | Expr::Bytes(_) | Expr::Ident(_) => expr.clone(),
 
         Expr::Field(base, field) => {
             Expr::Field(Box::new(optimize_expr(base, input_name, field_ranges)), field.clone())
@@ -826,6 +835,18 @@ pub fn optimize_expr(
                 return Expr::Number(n.wrapping_abs());
             }
             Expr::Abs(Box::new(inner))
+        }
+        // `le32(n)` / `le64(n)` — when the inner folds to a number literal,
+        // fold to a `b"..."` bytes literal at compile time (little-endian low
+        // 4 / 8 bytes). Otherwise recurse and keep the wrapper for the backend.
+        Expr::Le32(inner) | Expr::Le64(inner) => {
+            let width = if matches!(expr, Expr::Le64(_)) { 8 } else { 4 };
+            let inner = optimize_expr(inner, input_name, field_ranges);
+            if let Expr::Number(n) = &inner {
+                let le = n.to_le_bytes();
+                return Expr::Bytes(le[..width].to_vec());
+            }
+            if width == 8 { Expr::Le64(Box::new(inner)) } else { Expr::Le32(Box::new(inner)) }
         }
         // `min(a, b)` — recurse into both children. When both collapse to
         // number literals, fold to the smaller at compile time. Otherwise

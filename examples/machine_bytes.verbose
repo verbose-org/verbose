@@ -1,0 +1,61 @@
+@verbose 0.1.0
+
+-- Backend brick b1: a first-class `bytes` type with a `b"..."` byte-string
+-- literal supporting full-range `\xNN` escapes, emitted natively as RAW bytes
+-- to stdout (no trailing newline). This is the first brick of the "emit
+-- arbitrary machine code" arc — a rule whose `output: bytes` and whose body is
+-- a `b"..."` literal writes exactly those bytes.
+--
+-- `bytes` is deliberately distinct from `text`: text is UTF-8 (cannot hold a
+-- byte like 0xC3 as a single byte), whereas bytes carries arbitrary 0x00..=0xFF
+-- content. The two never implicitly convert.
+
+
+concept Trigger
+  @intention: "A trivial input that triggers the byte emission"
+  @source: machine_bytes.intent:1
+
+  fields:
+    n : number [0, 1]
+
+
+rule mov_rbx_rax
+  @intention: "Emit the x86-64 encoding of `mov rbx, rax` (48 89 c3)"
+  @source: machine_bytes.intent:2
+
+  input:
+    t : Trigger
+
+  output:
+    code : bytes
+
+  logic:
+    code = b"\x48\x89\xc3"
+
+  proofs:
+    purity:
+      reads   : []
+      calls   : []
+    termination:
+      bound : 1
+
+
+rule full_range
+  @intention: "Emit a full-range byte blob: 00 0f ff 80"
+  @source: machine_bytes.intent:3
+
+  input:
+    t : Trigger
+
+  output:
+    code : bytes
+
+  logic:
+    code = b"\x00\x0f\xff\x80"
+
+  proofs:
+    purity:
+      reads   : []
+      calls   : []
+    termination:
+      bound : 1
