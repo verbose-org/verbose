@@ -35713,4 +35713,84 @@ rule two
         for p in [cr, pur, term, em, elf] { let _ = fs::remove_file(&p); }
     }
 
+    /// The verbatim tokenizer family: the three remaining bootstrap-chain scanner
+    /// files — first_word.verbose (3 rules: lets in input:-block rules, whole-record
+    /// pass-through `skip_spaces(s)`, a let feeding a construction), token_scan.verbose
+    /// (4 rules + concept_group Token: variant construction + match dispatch), and
+    /// count_tokens.verbose (the full tokenizer loop) — each read from disk
+    /// BYTE-FOR-BYTE and run through the complete self-hosted pipeline: parse
+    /// (count_rules == the file's real rule count), purity 0, termination 0, eval,
+    /// and a compiled ELF printing the same value. All three passed FIRST TRY after
+    /// the input:-block bridge + field-range fix — this test pins that the coverage
+    /// stays.
+    #[test]
+    fn verbatim_tokenizer_family_compiles_through_self_hosted_pipeline() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        let compiler_src = fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&compiler_src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let mk = |rule: &str, tag: &str| -> std::path::PathBuf {
+            let p = std::env::temp_dir().join(format!("verbosec_test_vfam_{}", tag));
+            compile_native(&program, rule, p.to_str().unwrap(), false, false)
+                .unwrap_or_else(|e| panic!("{} must compile natively: {}", rule, e));
+            p
+        };
+        let cr = mk("count_rules", "count_rules");
+        let pur = mk("count_purity_errors", "purity");
+        let term = mk("count_term_errors", "term");
+        let em = mk("eval_main", "eval");
+        let elf = mk("elf_program_src", "elf");
+
+        let run = |bin: &std::path::Path, source: &str| -> i64 {
+            let r = Command::new(bin).arg(source).arg("0").output().expect("spawn");
+            assert!(r.status.success(), "{:?} must exit 0; got {:?}", bin, r.status);
+            String::from_utf8_lossy(&r.stdout).trim().parse::<i64>()
+                .unwrap_or_else(|_| panic!("{:?} produced non-number: {:?}", bin, r.stdout))
+        };
+        let run_compiled = |source: &str, tag: &str| -> i64 {
+            let mc = Command::new(&elf).args([source, "0"]).output().expect("spawn elf gen");
+            assert!(mc.status.success(), "elf_program_src must exit 0 for {}", tag);
+            let out_path = std::env::temp_dir().join(format!("verbosec_test_vfam_a_out_{}", tag));
+            fs::write(&out_path, &mc.stdout).expect("write a.out");
+            let mut perms = fs::metadata(&out_path).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&out_path, perms).expect("chmod +x");
+            let child = Command::new(&out_path).output().expect("execute emitted ELF");
+            assert!(child.status.success(), "emitted ELF for {} must exit 0; got {:?}", tag, child.status);
+            let v: i64 = String::from_utf8_lossy(&child.stdout).trim().parse()
+                .unwrap_or_else(|_| panic!("emitted ELF for {} produced non-number: {:?}", tag, child.stdout));
+            let _ = fs::remove_file(&out_path);
+            v
+        };
+
+        // (file, real rule count, driver call, expected value, tag)
+        let cases: [(&str, i64, &str, i64, &str); 4] = [
+            ("examples/first_word.verbose", 3,
+             "out = first_word_len(ScanState { source: \"  hello world\", pos: 0 })", 5, "fw"),
+            ("examples/count_tokens.verbose", 3,
+             "out = count_tokens(ScanState { source: \"hello world\", pos: 0 })", 2, "ct"),
+            ("examples/token_scan.verbose", 4,
+             "out = classify(ScanState { source: \"  hello\", pos: 0 })", 5, "ts_word"),
+            ("examples/token_scan.verbose", 4,
+             "out = classify(ScanState { source: \"42x\", pos: 0 })", 4, "ts_digit"),
+        ];
+        for (path, nrules, call, expect, tag) in cases {
+            let verbatim = fs::read_to_string(path)
+                .unwrap_or_else(|_| panic!("{} must exist (real self-source file)", path));
+            assert_eq!(run(&cr, &verbatim), nrules, "{}: verbatim parse rule count", path);
+            assert_eq!(run(&pur, &verbatim), 0, "{}: verbatim purity verifies", path);
+            assert_eq!(run(&term, &verbatim), 0, "{}: verbatim termination verifies", path);
+            let driven = format!("rule main\n  logic:\n    {}\n\n{}", call, verbatim);
+            assert_eq!(run(&em, &driven), expect, "{} [{}]: interprets", path, tag);
+            assert_eq!(run_compiled(&driven, tag), expect, "{} [{}]: compiled ELF matches", path, tag);
+        }
+
+        for p in [cr, pur, term, em, elf] { let _ = fs::remove_file(&p); }
+    }
+
 }
