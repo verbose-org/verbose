@@ -397,9 +397,13 @@ concept_group VExpr [max_depth: 4096, max_nodes: 2000000]
   -- slice 1: a target TEXT value is a SPAN into the interpreted source — VText carries
   -- (start, len) indexing ea.src, no heap, no copying. An AstStr(start, len) evaluates
   -- to VText with the surrounding quotes stripped (the token span includes both
-  -- quotes); substring produces a sub-span of the same source. `concat` (fresh text)
-  -- is explicitly OUT of the span model (it would need a text heap) and stays
-  -- deferred. Lives in this group (the native
+  -- quotes); substring produces a sub-span of the same source. Concat arc slice 1:
+  -- `concat` (fresh text) cannot be a span — but it doesn't need fresh STORAGE if it
+  -- is never materialized. VConcat is a ROPE: a tree value whose leaves are existing
+  -- spans (VText — zero copy) and numbers (VNum — read through its decimal
+  -- rendering); length/byte_at walk the tree (vlength / vbyte_at), no heap, no
+  -- copying, mirroring verbosec's own streaming-emitter insight applied to the
+  -- interpreter's value model. Lives in this group (the native
   -- one-group cap requires ONE concept_group per program, and VExpr's [max_depth: 4096,
   -- max_nodes: 2000000] bounds give the runtime Value arena the generous, mmap-backed
   -- headroom a recursive list-sum needs).
@@ -410,6 +414,7 @@ concept_group VExpr [max_depth: 4096, max_nodes: 2000000]
       VNum of (n : number)
       VData of (tag : number, payload : ValueList)
       VText of (start : number, len : number)
+      VConcat of (left : Value, right : Value)
 
   -- Records-arc brick R6c: a cons-list of runtime Values — a variant construction's
   -- evaluated field values in source order, and the carrier a match reads positionally
@@ -4403,9 +4408,10 @@ rule eval_ast_env
       -- Dispatch must happen HERE and not inside eval_call: eval_call's lets are
       -- EAGER (find_rule / bind_params / build_env run before any `out` if), so a
       -- primitive routed through it would drag the whole user-rule machinery along.
-      -- A user rule named byte_at / length / substring is shadowed by the primitive
-      -- (reserved names, same as verbosec).
-      AstCall(callee_start, callee_len, args) => if span_is_byte_at(SpanCheck { src: ea.src, start: callee_start, len: callee_len }) == 1 then prim_byte_at(EvalCallState { callee_start: callee_start, callee_len: callee_len, args: args, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts }) else if span_is_length(SpanCheck { src: ea.src, start: callee_start, len: callee_len }) == 1 then prim_length(EvalCallState { callee_start: callee_start, callee_len: callee_len, args: args, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts }) else if span_is_substring(SpanCheck { src: ea.src, start: callee_start, len: callee_len }) == 1 then prim_substring(EvalCallState { callee_start: callee_start, callee_len: callee_len, args: args, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts }) else eval_call(EvalCallState { callee_start: callee_start, callee_len: callee_len, args: args, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts })
+      -- A user rule named byte_at / length / substring / concat is shadowed by the
+      -- primitive (reserved names, same as verbosec). Concat arc slice 1: concat
+      -- joins the family — prim_concat folds the evaluated args into a rope value.
+      AstCall(callee_start, callee_len, args) => if span_is_byte_at(SpanCheck { src: ea.src, start: callee_start, len: callee_len }) == 1 then prim_byte_at(EvalCallState { callee_start: callee_start, callee_len: callee_len, args: args, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts }) else if span_is_length(SpanCheck { src: ea.src, start: callee_start, len: callee_len }) == 1 then prim_length(EvalCallState { callee_start: callee_start, callee_len: callee_len, args: args, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts }) else if span_is_substring(SpanCheck { src: ea.src, start: callee_start, len: callee_len }) == 1 then prim_substring(EvalCallState { callee_start: callee_start, callee_len: callee_len, args: args, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts }) else if span_is_concat(SpanCheck { src: ea.src, start: callee_start, len: callee_len }) == 1 then prim_concat(EvalCallState { callee_start: callee_start, callee_len: callee_len, args: args, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts }) else eval_call(EvalCallState { callee_start: callee_start, callee_len: callee_len, args: args, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts })
       AstIf(cond, thn, els) => if vnum_of(eval_ast_env(EvalEnvArg { node: cond, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts })) != 0 then eval_ast_env(EvalEnvArg { node: thn, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts }) else eval_ast_env(EvalEnvArg { node: els, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts })
       AstBool(value) => Value::VNum { n: value }
       -- Text values slice 1: a string literal is a SPAN into the interpreted source.
@@ -4427,7 +4433,7 @@ rule eval_ast_env
   proofs:
     purity:
       reads : [ea.node, ea.env, ea.src, ea.prog, ea.concepts]
-      calls : [eval_ast_env, venv_lookup, eval_call, vnum_of, variant_tag, eval_vfields, eval_match, vdata_payload, vdata_tag, concept_at_index, cd_fields, field_index_of, vlist_nth, span_is_byte_at, span_is_length, span_is_substring, prim_byte_at, prim_length, prim_substring]
+      calls : [eval_ast_env, venv_lookup, eval_call, vnum_of, variant_tag, eval_vfields, eval_match, vdata_payload, vdata_tag, concept_at_index, cd_fields, field_index_of, vlist_nth, span_is_byte_at, span_is_length, span_is_substring, span_is_concat, prim_byte_at, prim_length, prim_substring, prim_concat]
     termination:
       bound : 4000
 
@@ -4778,6 +4784,7 @@ rule vnum_of
       VNum(n) => n
       VData(tag, payload) => 0
       VText(start, len) => 0
+      VConcat(left, right) => 0
   proofs:
     purity:
       reads : [v]
@@ -4800,6 +4807,7 @@ rule vdata_tag
       VNum(n) => 0 - 1
       VData(tag, payload) => tag
       VText(start, len) => 0 - 1
+      VConcat(left, right) => 0 - 1
   proofs:
     purity:
       reads : [v]
@@ -4821,6 +4829,7 @@ rule vdata_payload
       VNum(n) => ValueList::VLNil
       VData(tag, payload) => payload
       VText(start, len) => ValueList::VLNil
+      VConcat(left, right) => ValueList::VLNil
   proofs:
     purity:
       reads : [v]
@@ -4854,6 +4863,10 @@ rule vtext_is
       VNum(n) => 0
       VData(tag, payload) => 0
       VText(start, len) => 1
+      -- Concat arc slice 1: a rope is NOT a span — vtext_is stays the "may I read
+      -- (start, len) directly?" gate, so rope consumers must go through
+      -- vlength / vbyte_at instead.
+      VConcat(left, right) => 0
   proofs:
     purity:
       reads : [v]
@@ -4876,6 +4889,7 @@ rule vtext_start
       VNum(n) => 0
       VData(tag, payload) => 0
       VText(start, len) => start
+      VConcat(left, right) => 0
   proofs:
     purity:
       reads : [v]
@@ -4897,12 +4911,156 @@ rule vtext_len
       VNum(n) => 0
       VData(tag, payload) => 0
       VText(start, len) => len
+      VConcat(left, right) => 0
   proofs:
     purity:
       reads : [v]
       calls : []
     termination:
       bound : 16
+
+
+-- ── Concat arc slice 1: rope helpers ─────────────────────────────────────────
+-- A rope (VConcat tree) is never materialized; length and byte_at WALK it. The
+-- shared value-level length is vlength (the one place that knows a VNum reads as
+-- its decimal rendering); vbyte_at is the shared descent. The digit math lives in
+-- two tiny recursive helpers over a nonnegative magnitude (the sign is handled at
+-- the VNum arm, where the binder is a plain Ident — deliberately NOT a ranged
+-- concept field, so the optimizer's interval arithmetic cannot fold the `n < 0`
+-- test away; see the optimizer default-field-range note in CLAUDE.md).
+
+-- mag_digits's input: a nonnegative magnitude (callers strip the sign first).
+concept MagState
+  @intention: "A nonnegative decimal magnitude, for counting its digits"
+  @source: vexprparse.intent:68
+  fields:
+    m : number [0, 4000000]
+
+-- mag_digits: the decimal digit count of a nonnegative magnitude (m = 0 -> 1).
+-- Divide-by-10 recursion; strictly shrinking but m/10 is not the `m - k` shape
+-- the `decreasing` proof checks, so bound-only + the native recursion breadcrumb.
+rule mag_digits
+  @intention: "The decimal digit count of a nonnegative magnitude (0 counts as 1 digit)"
+  @source: vexprparse.intent:68
+  input:
+    dm : MagState
+  output:
+    out : number
+  logic:
+    out = if dm.m < 10 then 1 else 1 + mag_digits(MagState { m: dm.m / 10 })
+  proofs:
+    purity:
+      reads : [dm.m]
+      calls : [mag_digits]
+    termination:
+      bound : 64
+
+
+-- mag_digit_at's input: a nonnegative magnitude + a 0-based digit position
+-- (counted from the LEFT: position 0 is the most significant digit).
+concept DigitState
+  @intention: "A nonnegative magnitude + a 0-based digit position from the left, for reading one decimal digit byte"
+  @source: vexprparse.intent:68
+  fields:
+    m : number [0, 4000000]
+    k : number [0, 4000000]
+
+-- mag_digit_at: the ASCII byte (48..57) of the k-th decimal digit of m, counted
+-- from the left. Key identity: for k < digits(m) - 1, digit k of m == digit k of
+-- m / 10 (dropping the LAST digit leaves the leading positions untouched), so the
+-- recursion peels trailing digits until k is the last position. The m < 10 base
+-- case is checked FIRST so an out-of-range k (never equal to the last position)
+-- still terminates at the single-digit floor with a defensive 0 — total even when
+-- a caller forgets the bounds guard.
+rule mag_digit_at
+  @intention: "The ASCII byte of the k-th decimal digit (from the left) of a nonnegative magnitude (defensive 0 when k is out of range)"
+  @source: vexprparse.intent:68
+  input:
+    dg : DigitState
+  output:
+    out : number
+  logic:
+    out = if dg.m < 10 then (if dg.k == 0 then dg.m + 48 else 0) else if dg.k == mag_digits(MagState { m: dg.m }) - 1 then dg.m % 10 + 48 else mag_digit_at(DigitState { m: dg.m / 10, k: dg.k })
+  proofs:
+    purity:
+      reads : [dg.m, dg.k]
+      calls : [mag_digit_at, mag_digits]
+    termination:
+      bound : 64
+
+
+-- vlength: the byte length of a Value read as text — THE shared rope walker
+-- (prim_length reports it; vbyte_at's descent steers by it). VText -> the span
+-- length; VNum -> the decimal rendering's width (digit count, +1 for '-' when
+-- negative); VConcat -> left + right, recursively; VData -> 0 (a variant value
+-- has no text reading — defensive, mirroring the accessors above). Structural
+-- recursion: both recursive calls descend into binders of the self-referential
+-- VConcat payload, exactly shape_ast's proof shape.
+rule vlength
+  @intention: "The byte length of a value read as text: span length, decimal width of a number, or the recursive sum over a rope"
+  @source: vexprparse.intent:68
+  input:
+    v : Value
+  output:
+    out : number
+  logic:
+    out = match v:
+      VNum(n) => if n < 0 then 1 + mag_digits(MagState { m: 0 - n }) else mag_digits(MagState { m: n })
+      VData(tag, payload) => 0
+      VText(start, len) => len
+      VConcat(left, right) => vlength(left) + vlength(right)
+  proofs:
+    purity:
+      reads : [v]
+      calls : [vlength, mag_digits]
+    termination:
+      bound : 4000
+      structural : v
+
+
+-- vbyte_at's input: the value to read, the byte index, and the interpreted
+-- source (VText leaves are spans into it). The index range deliberately includes
+-- negatives: a target program can ask for byte_at(t, -5), and the `bs.i >= 0`
+-- guards below must stay LIVE (a [0, N] range would let the optimizer's interval
+-- arithmetic fold them to true and reach the host byte_at with a negative index).
+concept VByteState
+  @intention: "A value + a byte index + the interpreted source, for reading one byte of the value's text reading"
+  @source: vexprparse.intent:68
+  fields:
+    v : Value
+    i : number [-4000000, 4000000]
+    src : text [..256]
+
+-- vbyte_at: the i-th byte of a Value read as text — the shared rope descent.
+-- VText -> the HOST byte_at on the interpreted source, bounds-guarded FIRST
+-- (same fail-closed-host / defensive-interpreter split as prim_byte_at pre-rope);
+-- VNum -> the i-th byte of the decimal rendering ('-' at 0 for negatives, then
+-- mag_digit_at on the magnitude); VConcat -> descend left when i falls inside
+-- the left length, else right with i shifted down (vlength recomputed per
+-- descent — O(depth * size) worst case, fine for the interpreter tier); VData ->
+-- 0. Every arm is total and defensive: any out-of-range or negative index
+-- bottoms out at a leaf guard and returns 0, never aborts. Packed input (the
+-- shrinking value is a FIELD), so bound-only termination + the native recursion
+-- breadcrumb, like the eval SCC.
+rule vbyte_at
+  @intention: "The i-th byte of a value read as text: source byte through a span, decimal-rendering byte of a number, or the recursive rope descent (defensive 0 out of bounds)"
+  @source: vexprparse.intent:68
+  input:
+    bs : VByteState
+  output:
+    out : number
+  logic:
+    out = match bs.v:
+      VNum(n) => if n < 0 then (if bs.i == 0 then 45 else if bs.i >= 1 and bs.i < 1 + mag_digits(MagState { m: 0 - n }) then mag_digit_at(DigitState { m: 0 - n, k: bs.i - 1 }) else 0) else (if bs.i >= 0 and bs.i < mag_digits(MagState { m: n }) then mag_digit_at(DigitState { m: n, k: bs.i }) else 0)
+      VData(tag, payload) => 0
+      VText(start, len) => if bs.i >= 0 and bs.i < len then byte_at(bs.src, start + bs.i) else 0
+      VConcat(left, right) => if bs.i < vlength(left) then vbyte_at(VByteState { v: left, i: bs.i, src: bs.src }) else vbyte_at(VByteState { v: right, i: bs.i - vlength(left), src: bs.src })
+  proofs:
+    purity:
+      reads : [bs.v, bs.i, bs.src]
+      calls : [vbyte_at, vlength, mag_digits, mag_digit_at]
+    termination:
+      bound : 4000
 
 
 -- span_is_byte_at: 1 iff the span src[start..start+len] is exactly the 7 bytes
@@ -4964,6 +5122,26 @@ rule span_is_substring
       bound : 64
 
 
+-- span_is_concat: 1 iff the span src[start..start+len] is exactly the 6 bytes
+-- "concat" (c=99 o=111 n=110 c=99 a=97 t=116). Flat fixed-width check, mirror of
+-- span_is_length. Concat arc slice 1.
+rule span_is_concat
+  @intention: "1 if a callee span spells exactly \"concat\", 0 otherwise"
+  @source: vexprparse.intent:68
+  input:
+    sc : SpanCheck
+  output:
+    out : number
+  logic:
+    out = if sc.len == 6 and (byte_at(sc.src, sc.start) == 99 and (byte_at(sc.src, sc.start + 1) == 111 and (byte_at(sc.src, sc.start + 2) == 110 and (byte_at(sc.src, sc.start + 3) == 99 and (byte_at(sc.src, sc.start + 4) == 97 and byte_at(sc.src, sc.start + 5) == 116))))) then 1 else 0
+  proofs:
+    purity:
+      reads : [sc.src, sc.start, sc.len]
+      calls : []
+    termination:
+      bound : 64
+
+
 -- prim_byte_at: the target-language byte_at(t, i). Both args are evaluated against
 -- the caller's env (an arg can itself be a primitive call — spans compose); t must
 -- be a VText and i a number with 0 <= i < t.len, in which case the result is the
@@ -4975,8 +5153,12 @@ rule span_is_substring
 -- fall to the same defensive VNum 0 — total. Reuses EvalCallState (the callee span
 -- fields ride along unused). In the eval SCC: bound-only termination + the native
 -- recursion breadcrumb, like eval_call.
+-- Concat arc slice 1: the whole dispatch now routes through vbyte_at — its VText
+-- arm reproduces the pre-rope semantics exactly (bounds guard FIRST, then the host
+-- byte_at on ec.src), and its VNum / VConcat arms add the decimal-rendering and
+-- rope-descent readings. One shared path, no duplicated guard.
 rule prim_byte_at
-  @intention: "Evaluate the byte_at primitive: the byte of the source at the text span's offset plus the index (defensive 0 when out of bounds or ill-shaped)"
+  @intention: "Evaluate the byte_at primitive: the i-th byte of the argument's text reading — span byte, decimal-rendering byte, or rope descent (defensive 0 when out of bounds or ill-shaped)"
   @source: vexprparse.intent:39
   input:
     ec : EvalCallState
@@ -4985,20 +5167,22 @@ rule prim_byte_at
   logic:
     let tv = eval_ast_env(EvalEnvArg { node: arg_head(AHeadState { args: ec.args }), env: ec.env, src: ec.src, prog: ec.prog, concepts: ec.concepts })
     let iv = vnum_of(eval_ast_env(EvalEnvArg { node: arg_head(AHeadState { args: arg_tail(ATailState { args: ec.args }) }), env: ec.env, src: ec.src, prog: ec.prog, concepts: ec.concepts }))
-    out = if vtext_is(tv) == 1 and (iv >= 0 and iv < vtext_len(tv)) then Value::VNum { n: byte_at(ec.src, vtext_start(tv) + iv) } else Value::VNum { n: 0 }
+    out = Value::VNum { n: vbyte_at(VByteState { v: tv, i: iv, src: ec.src }) }
   proofs:
     purity:
       reads : [ec.args, ec.env, ec.src, ec.prog, ec.concepts]
-      calls : [eval_ast_env, vnum_of, arg_head, arg_tail, vtext_is, vtext_start, vtext_len]
+      calls : [eval_ast_env, vnum_of, arg_head, arg_tail, vbyte_at]
     termination:
       bound : 4000
 
 
 -- prim_length: the target-language length(t). A VText's byte length as a VNum;
--- a non-text argument is a defensive VNum 0. No host call at all — the span
--- already carries its length.
+-- no host call at all — the span already carries its length. Concat arc slice 1:
+-- routed through vlength, which extends the reading to VNum (decimal digit count,
+-- +1 for '-' when negative) and VConcat (recursive rope sum). A VData argument
+-- stays a defensive VNum 0 (vlength's VData arm).
 rule prim_length
-  @intention: "Evaluate the length primitive: the byte length of a text-span value (defensive 0 for a non-text argument)"
+  @intention: "Evaluate the length primitive: the byte length of the argument's text reading — span length, decimal width, or recursive rope sum (defensive 0 for a variant argument)"
   @source: vexprparse.intent:39
   input:
     ec : EvalCallState
@@ -5006,11 +5190,11 @@ rule prim_length
     out : Value
   logic:
     let tv = eval_ast_env(EvalEnvArg { node: arg_head(AHeadState { args: ec.args }), env: ec.env, src: ec.src, prog: ec.prog, concepts: ec.concepts })
-    out = if vtext_is(tv) == 1 then Value::VNum { n: vtext_len(tv) } else Value::VNum { n: 0 }
+    out = Value::VNum { n: vlength(tv) }
   proofs:
     purity:
       reads : [ec.args, ec.env, ec.src, ec.prog, ec.concepts]
-      calls : [eval_ast_env, arg_head, vtext_is, vtext_len]
+      calls : [eval_ast_env, arg_head, vlength]
     termination:
       bound : 4000
 
@@ -5020,7 +5204,11 @@ rule prim_length
 -- start' = t.start + a, len' = b - a). Guard: t is a VText and 0 <= a <= b <=
 -- t.len, which preserves the span invariant (start' + len' <= start + len <=
 -- length(src)) so every later host byte_at through this span stays in bounds.
--- Anything else is a defensive VNum 0 — total, never abort.
+-- Anything else is a defensive VNum 0 — total, never abort. Concat arc slice 1:
+-- substring on a rope (VConcat) or a number stays REFUSED semantics — vtext_is
+-- gates the span path, so both fall to the defensive VNum 0 (the emitters tier
+-- never re-slices built text; slicing a rope would need materialization or a
+-- rope-splitting design, deliberately out of slice 1).
 rule prim_substring
   @intention: "Evaluate the substring primitive: a half-open sub-span of a text-span value (defensive 0 when out of bounds or ill-shaped)"
   @source: vexprparse.intent:39
@@ -5037,6 +5225,37 @@ rule prim_substring
     purity:
       reads : [ec.args, ec.env, ec.src, ec.prog, ec.concepts]
       calls : [eval_ast_env, vnum_of, arg_head, arg_tail, vtext_is, vtext_start, vtext_len]
+    termination:
+      bound : 4000
+
+
+-- prim_concat: the target-language concat(...) — n-ary, built as a ROPE, never
+-- materialized. Walk the ArgList: each argument evaluates against the caller's
+-- env (an arg can itself be a concat — ropes nest), and the results fold into
+-- RIGHT-NESTED VConcats terminated by an empty VText: 0 args -> VText(0, 0);
+-- 1 arg -> VConcat(v, VText(0, 0)); n args -> VConcat(v1, VConcat(v2, ...)).
+-- The single-arg case is deliberately WRAPPED (not returned bare) so the
+-- rope-aware readings apply uniformly — concat(42) is a TEXT value whose length
+-- is 2 and whose bytes are '4' '2', which is exactly what print_chain's
+-- `Int(v) => concat(v)` arm needs (number -> decimal text). The empty-VText
+-- terminator costs 0 bytes in every reading (vlength adds 0, vbyte_at never
+-- lands in it). In the eval SCC (each arg evaluation re-enters eval_ast_env):
+-- bound-only termination + the native recursion breadcrumb, like the other prims.
+rule prim_concat
+  @intention: "Evaluate the concat primitive: fold the evaluated arguments into a right-nested rope value (empty text for zero arguments), never materializing bytes"
+  @source: vexprparse.intent:68
+  input:
+    ec : EvalCallState
+  output:
+    out : Value
+  logic:
+    out = match ec.args:
+      ArgCons(head, tail) => Value::VConcat { left: eval_ast_env(EvalEnvArg { node: head, env: ec.env, src: ec.src, prog: ec.prog, concepts: ec.concepts }), right: prim_concat(EvalCallState { callee_start: ec.callee_start, callee_len: ec.callee_len, args: tail, env: ec.env, src: ec.src, prog: ec.prog, concepts: ec.concepts }) }
+      ArgNil => Value::VText { start: 0, len: 0 }
+  proofs:
+    purity:
+      reads : [ec.callee_start, ec.callee_len, ec.args, ec.env, ec.src, ec.prog, ec.concepts]
+      calls : [eval_ast_env, prim_concat]
     termination:
       bound : 4000
 

@@ -35177,6 +35177,127 @@ rule two
         let _ = std::fs::remove_file(&em);
     }
 
+    /// Concat arc slice 1: the self-hosted interpreter evaluates `concat(...)` as a
+    /// ROPE — a new Value variant `VConcat(left, right)` whose leaves are existing
+    /// spans (VText, zero copy) and numbers (VNum, read through their decimal
+    /// rendering). Never materialized: `length` walks the tree (vlength — VNum is
+    /// its decimal digit count, '-' included), `byte_at` descends it (vbyte_at —
+    /// left when the index falls inside the left length, else right shifted down;
+    /// a VNum leaf renders digit bytes via divide-by-10 recursion). prim_concat is
+    /// n-ary and folds the evaluated args into RIGHT-NESTED VConcats terminated by
+    /// an empty VText, so a single number arg is still wrapped and reads as decimal
+    /// text. substring on a rope stays refused semantics (defensive VNum 0). All
+    /// total, all defensive — OOB/negative indices return 0, never abort.
+    ///
+    /// Gates:
+    ///   * MILESTONE — print_chain's shape evaluates byte-exact: the sum_chain AST
+    ///     builder + recursive printer (`Int(v) => concat(v) ; Add(l, r) =>
+    ///     concat(print_expr(l), "+", print_expr(r))`) gives
+    ///     length(print_expr(build_chain(Seed{n:3}))) -> 7 ("3+2+1+0"), and byte
+    ///     probes on the same rope read 51 ('3') at 0, 43 ('+') at 1, 48 ('0') at 6.
+    ///   * basics: length/byte_at on concat of literals; number args 42 / -7 / 0 /
+    ///     345 byte-by-byte (the digit math edge cases); nesting (rope depth >= 3);
+    ///     OOB on a rope -> 0 with exit 0.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn concat_slice1_rope_values_print_chain_shape() {
+        let src = std::fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let em = std::env::temp_dir().join("verbosec_test_concat1_eval_main");
+        compile_native(&program, "eval_main", em.to_str().unwrap(), false, false)
+            .expect("eval_main must compile natively (concat arc slice 1)");
+
+        let run = |source: &str| -> i64 {
+            let r = std::process::Command::new(&em)
+                .arg(source)
+                .arg("0")
+                .output()
+                .expect("spawn eval_main");
+            assert!(
+                r.status.success(),
+                "eval_main must exit 0 for {:?}; got {:?}",
+                source, r.status
+            );
+            String::from_utf8_lossy(&r.stdout)
+                .trim()
+                .parse::<i64>()
+                .unwrap_or_else(|_| panic!("eval_main produced non-number for {:?}: {:?}", source, r.stdout))
+        };
+
+        // MILESTONE: print_chain's shape — the sum_chain AST + recursive printer,
+        // composed by a driver main. The rope for seed 3 reads "3+2+1+0" (7 bytes)
+        // without ever materializing the string.
+        let print_chain = |probe: &str| -> String {
+            format!(
+                "concept_group G [max_depth: 64, max_nodes: 4096]\n  concept Expr\n    variants:\n      Int of (v : number)\n      Add of (lhs : Expr, rhs : Expr)\nconcept Seed\n  fields:\n    n : number\nrule main\n  logic:\n    out = {probe}\nrule build_chain(s : Seed)\n  logic:\n    out = if s.n == 0 then Expr::Int {{ v: 0 }} else Expr::Add {{ lhs: Expr::Int {{ v: s.n }}, rhs: build_chain(Seed {{ n: s.n - 1 }}) }}\nrule print_expr(e : Expr)\n  logic:\n    out = match e: Int(v) => concat(v)  Add(l, r) => concat(print_expr(l), \"+\", print_expr(r))"
+            )
+        };
+        assert_eq!(
+            run(&print_chain("length(print_expr(build_chain(Seed { n: 3 })))")),
+            7,
+            "concat 1 MILESTONE: length of the seed-3 rope -> 7 (\"3+2+1+0\")"
+        );
+        assert_eq!(
+            run(&print_chain("byte_at(print_expr(build_chain(Seed { n: 3 })), 0)")),
+            51,
+            "concat 1: rope byte 0 -> '3' (51)"
+        );
+        assert_eq!(
+            run(&print_chain("byte_at(print_expr(build_chain(Seed { n: 3 })), 1)")),
+            43,
+            "concat 1: rope byte 1 -> '+' (43)"
+        );
+        assert_eq!(
+            run(&print_chain("byte_at(print_expr(build_chain(Seed { n: 3 })), 6)")),
+            48,
+            "concat 1: rope byte 6 -> '0' (48)"
+        );
+
+        // Basics: text leaves.
+        let one = |body: &str| format!("rule main\n  logic:\n    out = {body}");
+        assert_eq!(run(&one("length(concat(\"ab\", \"cd\"))")), 4,
+            "concat 1: length(concat(\"ab\", \"cd\")) -> 4");
+        assert_eq!(run(&one("byte_at(concat(\"ab\", \"cd\"), 2)")), 99,
+            "concat 1: byte 2 crosses into the right leaf -> 'c' (99)");
+
+        // Number leaves — the digit math, byte-by-byte (42, -7, 0, 345).
+        assert_eq!(run(&one("length(concat(42))")), 2, "concat 1: length(concat(42)) -> 2");
+        assert_eq!(run(&one("byte_at(concat(42), 0)")), 52, "concat 1: '4' (52)");
+        assert_eq!(run(&one("byte_at(concat(42), 1)")), 50, "concat 1: '2' (50)");
+        assert_eq!(run(&one("length(concat(0 - 7))")), 2, "concat 1: length(concat(-7)) -> 2");
+        assert_eq!(run(&one("byte_at(concat(0 - 7), 0)")), 45, "concat 1: '-' (45)");
+        assert_eq!(run(&one("byte_at(concat(0 - 7), 1)")), 55, "concat 1: '7' (55)");
+        assert_eq!(run(&one("length(concat(0))")), 1, "concat 1: length(concat(0)) -> 1");
+        assert_eq!(run(&one("byte_at(concat(0), 0)")), 48, "concat 1: '0' (48)");
+        assert_eq!(run(&one("length(concat(345))")), 3, "concat 1: length(concat(345)) -> 3");
+        assert_eq!(run(&one("byte_at(concat(345), 0)")), 51, "concat 1: '3' (51)");
+        assert_eq!(run(&one("byte_at(concat(345), 1)")), 52, "concat 1: '4' (52)");
+        assert_eq!(run(&one("byte_at(concat(345), 2)")), 53, "concat 1: '5' (53)");
+
+        // Nesting: a rope of ropes (depth >= 3) probes correctly at every position.
+        assert_eq!(run(&one("length(concat(concat(\"a\", \"bc\"), concat(\"d\")))")), 4,
+            "concat 1: nested rope length -> 4");
+        assert_eq!(run(&one("byte_at(concat(concat(\"a\", \"bc\"), concat(\"d\")), 0)")), 97,
+            "concat 1: nested byte 0 -> 'a'");
+        assert_eq!(run(&one("byte_at(concat(concat(\"a\", \"bc\"), concat(\"d\")), 1)")), 98,
+            "concat 1: nested byte 1 -> 'b'");
+        assert_eq!(run(&one("byte_at(concat(concat(\"a\", \"bc\"), concat(\"d\")), 2)")), 99,
+            "concat 1: nested byte 2 -> 'c'");
+        assert_eq!(run(&one("byte_at(concat(concat(\"a\", \"bc\"), concat(\"d\")), 3)")), 100,
+            "concat 1: nested byte 3 -> 'd' (crosses into the right sub-rope)");
+
+        // Defensive: OOB and negative indices on a rope return 0, exit 0 — no abort.
+        assert_eq!(run(&one("byte_at(concat(\"ab\"), 99)")), 0,
+            "concat 1: OOB rope index -> defensive 0, no abort");
+        assert_eq!(run(&one("byte_at(concat(\"ab\"), 0 - 3)")), 0,
+            "concat 1: negative rope index -> defensive 0, no abort");
+
+        let _ = std::fs::remove_file(&em);
+    }
+
     /// Text values arc slice 2 — text CODEGEN (packed spans + embedded source).
     /// The self-hosted emitter now COMPILES text: an `AstStr` lowers to ONE packed
     /// i64 push (`(start+1)*2^32 | (len-2)`, quotes stripped — the SAME numbers as
