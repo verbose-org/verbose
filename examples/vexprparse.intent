@@ -1737,3 +1737,36 @@ without ever materializing the string. After this slice the interpreter
 oracle covers the emitters tier's core shape; rendering a rope to stdout is
 the compiled-side STREAMING lowering (its own slice), and concat CODEGEN in
 x86_node is deferred to it.
+
+----------------------------------------------------------------------------
+Fail-closed rejection of RAW newlines in string literals. Discovered via a
+minimal repro: a string literal containing a raw line break silently corrupted
+the INDENT/DEDENT accounting of every SUBSEQUENT line — the line driver's
+next-line-start scan stops at the FIRST byte 10 (inside the string) while the
+Str token's span runs past it, so a `rule f` declared after the multi-line
+string was swallowed (count_rules saw 1 rule instead of 2). Real Verbose has a
+CLOSED escape set (\n \t \\ \") — raw newlines in strings are not a thing —
+and the compiler-never-guesses axiom says a shape the scanner cannot account
+for is REJECTED, not silently mis-tokenized.
+
+The mechanism mirrors the existing tab rejection exactly: the string-content
+scanner returns a big sentinel (99998 — distinct from the tab sentinel 99999
+so the two error sources stay tellable apart) when it meets a raw byte 10
+before the closing quote; the string-run total propagates it (plus the content
+bytes scanned on the way, hence consumers test >= 50000, never equality); and
+the next-lexeme classifier emits the fail-closed error token (IndentErr, kind
+900) at the opening quote INSTEAD of a Str. The stream then RESUMES like the
+tab path does: the token-end position lands past end-of-source, ending the
+line's lexeme list right after the error token, and the line driver conses the
+line's Newline and continues at the next line start. The ESCAPED two-byte
+sequence backslash-n is untouched (the backslash branch skips it before the
+newline check can fire).
+
+The LOUD gate is a counting driver: tokenize the source with indentation and
+count the kind-900 tokens (a structural is-error test per token, mirror of the
+is-num test, plus a plain recursive counter over the list — no banded
+fingerprint, the count IS the observable). Clean sources return 0; a
+tab-indented line or a raw-newline string each contribute >= 1. A harness runs
+this BEFORE trusting count_rules: nonzero means the stream carries error
+tokens and downstream structural counts describe a damaged stream. NATIVE-ONLY
+for newline-bearing sources, same as count_rules.
