@@ -35914,6 +35914,125 @@ rule two
         for p in [cr, pur, term, em, elf] { let _ = fs::remove_file(&p); }
     }
 
+    /// SELF-FRAGMENT milestone + the exponential-sizing fix. vexprparse compiles a
+    /// fragment of ITSELF: the VERBATIM VExpr concept_group (~40 concepts, ~588
+    /// lines) + the real shape_ast rule (the iconic 13-arm match-on-Ast), extracted
+    /// from examples/vexprparse.verbose at test time. Pre-fix this HUNG: three
+    /// emitter helpers (max_payload_fields / max_variant_fields /
+    /// concept_arena_arity) mentioned their recursive call twice (`if f(tail) > x
+    /// then f(tail) else ...`) — in an eager language double-mention is
+    /// double-eval, so the concept walk was 2^N (2^40 on the real group; every
+    /// prior test group had <= 3 concepts, 2^3 = 8 — invisible). Fixed with the
+    /// binary max(a, b) primitive (args evaluate once). This test both pins the
+    /// self-fragment milestone AND is the performance regression net: pre-fix it
+    /// times out rather than failing an assert. Also pins name_eq — vexprparse's
+    /// own bootstrap byte-comparator — as a verbatim self-fragment (eval + ELF).
+    #[test]
+    fn verbatim_vexprparse_self_fragment_compiles() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        let compiler_src = fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&compiler_src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        // Extract the verbatim fragments from the compiler's OWN source text.
+        let lines: Vec<&str> = compiler_src.lines().collect();
+        let block = |start_pred: &dyn Fn(&str) -> bool, end_pred: &dyn Fn(&str) -> bool| -> String {
+            let s = lines.iter().position(|l| start_pred(l)).expect("fragment start");
+            let e = lines[s + 1..].iter().position(|l| end_pred(l)).map(|i| s + 1 + i).unwrap_or(lines.len());
+            lines[s..e].join("\n")
+        };
+        let group = block(
+            &|l| l.starts_with("concept_group VExpr"),
+            &|l| !l.is_empty() && !l.starts_with(' ') && !l.starts_with("concept_group"),
+        );
+        let shape_ast = block(
+            &|l| l.starts_with("rule shape_ast"),
+            &|l| l.starts_with("rule ") || l.starts_with("concept ") || l.starts_with("-- "),
+        );
+        let name_eq_concept = block(
+            &|l| l.starts_with("concept NameEqState"),
+            &|l| l.starts_with("rule ") || l.starts_with("concept ") || l.starts_with("-- "),
+        );
+        let name_eq_rule = block(
+            &|l| l.starts_with("rule name_eq"),
+            &|l| l.starts_with("rule ") || l.starts_with("concept ") || l.starts_with("-- "),
+        );
+
+        let em = std::env::temp_dir().join("verbosec_test_selffrag_eval");
+        compile_native(&program, "eval_main", em.to_str().unwrap(), false, false)
+            .expect("eval_main must compile natively");
+        let elf = std::env::temp_dir().join("verbosec_test_selffrag_elf");
+        compile_native(&program, "elf_program_src", elf.to_str().unwrap(), false, false)
+            .expect("elf_program_src must compile natively");
+
+        let run = |bin: &std::path::Path, source: &str| -> i64 {
+            let r = Command::new(bin).arg(source).arg("0").output().expect("spawn");
+            assert!(r.status.success(), "{:?} must exit 0; got {:?}", bin, r.status);
+            String::from_utf8_lossy(&r.stdout).trim().parse::<i64>()
+                .unwrap_or_else(|_| panic!("{:?} produced non-number: {:?}", bin, r.stdout))
+        };
+        let run_compiled = |source: &str, tag: &str| -> i64 {
+            let mc = Command::new(&elf).args([source, "0"]).output().expect("spawn elf gen");
+            assert!(mc.status.success(), "elf_program_src must exit 0 for {} (pre-fix: 2^40 hang)", tag);
+            let out_path = std::env::temp_dir().join(format!("verbosec_test_selffrag_{}", tag));
+            fs::write(&out_path, &mc.stdout).expect("write a.out");
+            let mut perms = fs::metadata(&out_path).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&out_path, perms).expect("chmod +x");
+            let child = Command::new(&out_path).output().expect("execute emitted ELF");
+            assert!(child.status.success(), "emitted ELF for {} must exit 0; got {:?}", tag, child.status);
+            let v: i64 = String::from_utf8_lossy(&child.stdout).trim().parse()
+                .unwrap_or_else(|_| panic!("emitted ELF for {} produced non-number: {:?}", tag, child.stdout));
+            let _ = fs::remove_file(&out_path);
+            v
+        };
+
+        // name_eq — the bootstrap byte-comparator, verbatim: equal spans -> 1, unequal -> 0.
+        let ne_eq = format!(
+            "rule main\n  logic:\n    out = name_eq(NameEqState {{ src: \"hello hello\", a_start: 0, b_start: 6, len: 5, off: 0 }})\n\n{}\n\n{}",
+            name_eq_concept, name_eq_rule);
+        assert_eq!(run(&em, &ne_eq), 1, "verbatim name_eq: equal spans eval");
+        assert_eq!(run_compiled(&ne_eq, "ne_eq"), 1, "verbatim name_eq: equal spans compiled");
+        let ne_neq = ne_eq.replace("hello hello", "hello world");
+        assert_eq!(run(&em, &ne_neq), 0, "verbatim name_eq: unequal spans eval");
+        assert_eq!(run_compiled(&ne_neq, "ne_neq"), 0, "verbatim name_eq: unequal spans compiled");
+
+        // shape_ast on the full VERBATIM group — the 2^40 detonator pre-fix.
+        let sa = format!(
+            "rule main\n  logic:\n    out = shape_ast(Ast::AstBin {{ op: 13, lhs: Ast::AstNum {{ value: 2 }}, rhs: Ast::AstVar {{ start: 0, len: 1 }} }})\n\n{}\n\n{}",
+            group, shape_ast);
+        let oracle = run(&em, &sa);
+        let compiled = run_compiled(&sa, "shape_ast");
+        assert_eq!(compiled, oracle,
+            "verbatim shape_ast over the full VExpr group: compiled ELF must match the interpreter");
+
+        // Multi-rule self-fragment: let_index (matches on Binding, recursively CALLS
+        // name_eq) + name_eq, over the full group. The driver's spans index the
+        // program's OWN source text — which works compiled precisely because the
+        // text-codegen slice embeds the source in the ELF.
+        let li_concept = block(
+            &|l| l.starts_with("concept LetIndexState"),
+            &|l| l.starts_with("rule ") || l.starts_with("concept ") || l.starts_with("-- "),
+        );
+        let li_rule = block(
+            &|l| l.starts_with("rule let_index"),
+            &|l| l.starts_with("rule ") || l.starts_with("concept ") || l.starts_with("-- "),
+        );
+        let li = format!(
+            "rule main\n  logic:\n    let binds = Binding::BCons {{ name_start: 0, name_len: 2, value: Ast::AstNum {{ value: 1 }}, rest: Binding::BCons {{ name_start: 3, name_len: 2, value: Ast::AstNum {{ value: 2 }}, rest: Binding::BNil }} }}\n    out = let_index(LetIndexState {{ binds: binds, src: \"xx\", q_start: 3, q_len: 2, idx: 0 }})\n\n{}\n\n{}\n\n{}\n\n{}\n\n{}",
+            group, name_eq_concept, name_eq_rule, li_concept, li_rule);
+        assert_eq!(run(&em, &li), 1, "verbatim let_index+name_eq: second binding matches (eval)");
+        assert_eq!(run_compiled(&li, "let_index"), 1,
+            "verbatim let_index+name_eq: multi-rule self-fragment compiled ELF matches");
+
+        let _ = fs::remove_file(&em);
+        let _ = fs::remove_file(&elf);
+    }
+
     /// STREAMING slice — the self-hosted emitter's text codegen
     /// (docs/self-hosting-streaming-design.md). A texty rule (result = AstStr /
     /// concat / if-match of those / call to a directly-texty rule) now emits as a

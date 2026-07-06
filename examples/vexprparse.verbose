@@ -15233,7 +15233,7 @@ rule max_variant_fields
     out : number
   logic:
     out = match vl:
-      VarCons(name_start, name_len, payload, rest) => if field_list_len(payload) > max_variant_fields(rest) then field_list_len(payload) else max_variant_fields(rest)
+      VarCons(name_start, name_len, payload, rest) => max(field_list_len(payload), max_variant_fields(rest))
       VarNil => 0
   proofs:
     purity:
@@ -15259,7 +15259,7 @@ rule concept_arena_arity
   output:
     out : number
   logic:
-    out = if max_variant_fields(cd_variants(c)) > field_list_len(cd_fields(c)) then max_variant_fields(cd_variants(c)) else field_list_len(cd_fields(c))
+    out = max(max_variant_fields(cd_variants(c)), field_list_len(cd_fields(c)))
   proofs:
     purity:
       reads : [c]
@@ -15281,7 +15281,7 @@ rule max_payload_fields
     out : number
   logic:
     out = match cl:
-      CCons(head, tail) => if concept_arena_arity(head) > max_payload_fields(tail) then concept_arena_arity(head) else max_payload_fields(tail)
+      CCons(head, tail) => max(concept_arena_arity(head), max_payload_fields(tail))
       CNil => 0
   proofs:
     purity:
