@@ -36029,6 +36029,70 @@ rule two
         assert_eq!(run_compiled(&li, "let_index"), 1,
             "verbatim let_index+name_eq: multi-rule self-fragment compiled ELF matches");
 
+        // THE TOKENIZER CLOSURE: vexprparse's own begin_tokenize + its full call
+        // closure (~37 rules, ~1400 fragment lines), computed FROM THE PURITY PROOFS
+        // (the declared `calls :` lists — verified by the purity checker, so they're
+        // an accurate call graph). The compiled fragment tokenizes "1 + 2" and every
+        // probed token kind/span matches the interpreter: Num(1)/op(+)/Num(2)/Eof.
+        // vexprparse's own first pipeline stage, compiled by vexprparse.
+        let rule_starts: Vec<(usize, String)> = lines.iter().enumerate()
+            .filter(|(_, l)| l.starts_with("rule "))
+            .map(|(i, l)| (i, l.split_whitespace().nth(1).unwrap().split('(').next().unwrap().to_string()))
+            .collect();
+        let rule_info: std::collections::HashMap<String, (usize, usize, Vec<String>)> = rule_starts.iter().enumerate()
+            .map(|(idx, (i, name))| {
+                let end = rule_starts.get(idx + 1).map(|(j, _)| *j).unwrap_or(lines.len());
+                let calls = lines[*i..end].iter()
+                    .find_map(|l| {
+                        let t = l.trim();
+                        t.strip_prefix("calls : [").and_then(|r| r.strip_suffix("]"))
+                            .map(|inner| inner.split(',').map(|c| c.trim().to_string())
+                                .filter(|c| !c.is_empty()).collect::<Vec<_>>())
+                    }).unwrap_or_default();
+                (name.clone(), (*i, end, calls))
+            }).collect();
+        let mut seen = std::collections::BTreeSet::new();
+        let mut todo: Vec<String> = ["begin_tokenize", "peek_kind", "peek_start", "peek_len", "advance"]
+            .iter().map(|s| s.to_string()).collect();
+        while let Some(n) = todo.pop() {
+            if seen.contains(&n) || !rule_info.contains_key(&n) { continue; }
+            todo.extend(rule_info[&n].2.clone());
+            seen.insert(n);
+        }
+        assert!(seen.len() >= 30, "tokenizer closure should be ~37 rules; got {}", seen.len());
+        // top-level concepts referenced by the closure's rule text
+        let closure_text: String = seen.iter()
+            .map(|n| { let (s, e, _) = rule_info[n]; lines[s..e].join("\n") })
+            .collect::<Vec<_>>().join("\n\n");
+        let mut frag = vec![group.clone()];
+        for (i, l) in lines.iter().enumerate() {
+            if let Some(cname) = l.strip_prefix("concept ") {
+                let cname = cname.trim();
+                if closure_text.contains(cname) && !group.contains(&format!("concept {}", cname)) {
+                    let e = lines[i + 1..].iter().position(|l| l.starts_with("rule ") || l.starts_with("concept ") || l.starts_with("-- "))
+                        .map(|j| i + 1 + j).unwrap_or(lines.len());
+                    frag.push(lines[i..e].join("\n"));
+                }
+            }
+        }
+        frag.push(closure_text);
+        let tok_frag = frag.join("\n\n");
+        let probes = [
+            ("peek_kind(toks)", "tk0"),
+            ("peek_kind(advance(Advance { lst: toks, k: 1 }))", "tk1"),
+            ("peek_kind(advance(Advance { lst: toks, k: 2 }))", "tk2"),
+            ("peek_kind(advance(Advance { lst: toks, k: 3 }))", "tk3"),
+        ];
+        for (expr, tag) in probes {
+            let p = format!(
+                "rule main\n  logic:\n    let toks = begin_tokenize(ScanState {{ source: \"1 + 2\", pos: 0 }})\n    out = {}\n\n{}",
+                expr, tok_frag);
+            let oracle = run(&em, &p);
+            let compiled = run_compiled(&p, tag);
+            assert_eq!(compiled, oracle,
+                "tokenizer-closure self-fragment [{}]: compiled must match interpreter", tag);
+        }
+
         let _ = fs::remove_file(&em);
         let _ = fs::remove_file(&elf);
     }
