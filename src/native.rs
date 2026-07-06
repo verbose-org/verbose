@@ -35528,4 +35528,269 @@ rule two
         let _ = std::fs::remove_file(&bin);
     }
 
+    /// The input:-block bridge (examples/vexprparse.verbose): real self-source
+    /// rule shapes now EXECUTE and COMPILE. A rule declared the real way
+    /// (`input:\n    s : St` block, no toy `rule go(s : St)` params) previously
+    /// evaluated to 0 (the input name never bound — bind_params read rd_params,
+    /// the TOY param list, which is empty for input:-block rules) and TRAPPED
+    /// (int3) when compiled (param_index missed). The bridge is ONE accessor:
+    /// `rule_params_of(rd)` returns rd_params when non-empty (toy form,
+    /// byte-identical behavior) else `fields_to_params(rd_input(rd))` — the
+    /// exact inverse of params_to_fields, preserving name AND ty spans (the ty
+    /// span is what static_concept_of resolves param concepts from). Swapped at
+    /// the EXECUTOR call sites only (eval_call's bind_params; proc_size /
+    /// x86_proc's frame + lowering params); checkers keep rd_params / rd_input.
+    ///
+    /// Gates (each compiled ELF cross-checked against eval_main):
+    ///   * bridge repro — `go` with `input: s : St`, recursion + full proofs:
+    ///     eval 15 AND compiled ELF 15 (was 0 / SIGTRAP).
+    ///   * MILESTONE — word_length in the EXACT self-source shape (input: block,
+    ///     output:, text field, byte_at/length, purity + increasing proofs):
+    ///     eval 5 AND compiled 5, count_purity_errors 0, count_term_errors 0.
+    ///     The first real-shape rule through the whole self-hosted pipeline:
+    ///     parse + all-four-proofs + eval + compile.
+    ///   * toy-form-unchanged — the toy `rule go(s : St)` twin still evals AND
+    ///     compiles to 15 (the fallback fires only when params is PNil; emitted
+    ///     ELFs for toy programs were cmp-verified byte-identical against a
+    ///     pre-bridge build of the design-commit parent at slice time).
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn input_block_bridge_real_shape_rules_execute_and_compile() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        let src = fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let em = std::env::temp_dir().join("verbosec_test_bridge_eval_main");
+        compile_native(&program, "eval_main", em.to_str().unwrap(), false, false)
+            .expect("eval_main must compile natively (input:-block bridge)");
+        let elf = std::env::temp_dir().join("verbosec_test_bridge_elf_program_src");
+        compile_native(&program, "elf_program_src", elf.to_str().unwrap(), false, false)
+            .expect("elf_program_src must compile natively (input:-block bridge)");
+        let pur = std::env::temp_dir().join("verbosec_test_bridge_count_purity_errors");
+        compile_native(&program, "count_purity_errors", pur.to_str().unwrap(), false, false)
+            .expect("count_purity_errors must compile natively (input:-block bridge)");
+        let term = std::env::temp_dir().join("verbosec_test_bridge_count_term_errors");
+        compile_native(&program, "count_term_errors", term.to_str().unwrap(), false, false)
+            .expect("count_term_errors must compile natively (input:-block bridge)");
+
+        let run_driver = |bin: &std::path::Path, source: &str| -> i64 {
+            let r = Command::new(bin).arg(source).arg("0").output().expect("spawn driver");
+            assert!(r.status.success(), "driver {:?} must exit 0 for {:?}; got {:?}",
+                bin, source, r.status);
+            String::from_utf8_lossy(&r.stdout).trim().parse::<i64>()
+                .unwrap_or_else(|_| panic!("driver {:?} produced non-number for {:?}: {:?}", bin, source, r.stdout))
+        };
+        let run_compiled = |source: &str, tag: &str| -> i64 {
+            let mc = Command::new(&elf).args([source, "0"]).output().expect("spawn elf_program_src");
+            assert!(mc.status.success(), "elf_program_src must exit 0 for {} ({:?})", tag, mc.status);
+            let out_path = std::env::temp_dir().join(format!("verbosec_test_bridge_a_out_{}", tag));
+            fs::write(&out_path, &mc.stdout).expect("write a.out");
+            let mut perms = fs::metadata(&out_path).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&out_path, perms).expect("chmod +x");
+            let child = Command::new(&out_path).output().expect("execute emitted ELF");
+            assert!(child.status.success(),
+                "emitted ELF for {} did not exit 0 (pre-bridge this was SIGTRAP); got {:?}",
+                tag, child.status);
+            let v: i64 = String::from_utf8_lossy(&child.stdout).trim().parse()
+                .unwrap_or_else(|_| panic!("emitted ELF for {} produced non-number: {:?}", tag, child.stdout));
+            let _ = fs::remove_file(&out_path);
+            v
+        };
+
+        // Bridge repro: input:-block go with recursion + full proofs — was 0 / SIGTRAP.
+        let go = "concept St\n  fields:\n    n : number\nrule main\n  logic:\n    out = go(St { n: 5 })\nrule go\n  input:\n    s : St\n  output:\n    out : number\n  logic:\n    out = if s.n == 0 then 0 else s.n + go(St { n: s.n - 1 })\n  proofs:\n    purity:\n      reads : [s]\n      calls : [go]\n    termination:\n      bound : 100\n      decreasing : n";
+        assert_eq!(run_driver(&em, go), 15, "bridge: input:-block go must eval to 15 (was 0)");
+        assert_eq!(run_compiled(go, "go"), 15, "bridge: input:-block go must compile and print 15 (was SIGTRAP)");
+
+        // MILESTONE: word_length written EXACTLY as the self-source writes it.
+        let wl = "concept ScanState\n  fields:\n    source : text\n    pos : number\nrule main\n  logic:\n    out = word_length(ScanState { source: \"hello world\", pos: 0 })\nrule word_length\n  input:\n    s : ScanState\n  output:\n    out : number\n  logic:\n    out = if s.pos >= length(s.source) then 0 else if byte_at(s.source, s.pos) >= 97 then (if byte_at(s.source, s.pos) <= 122 then 1 + word_length(ScanState { source: s.source, pos: s.pos + 1 }) else 0) else 0\n  proofs:\n    purity:\n      reads : [s]\n      calls : [word_length]\n    termination:\n      bound : 4000\n      increasing : pos";
+        assert_eq!(run_driver(&em, wl), 5, "milestone: real-shape word_length must eval to 5");
+        assert_eq!(run_compiled(wl, "wl"), 5, "milestone: real-shape word_length must compile and print 5");
+        // The real-shape rule passes the self-hosted proof surfaces clean. The
+        // driver program's `main` carries no proofs (it calls a defined rule with
+        // no declared calls: — R6d flags that by design, pinned by call_bad), so
+        // the proof gates run on the word_length rule alone.
+        let wl_only = "concept ScanState\n  fields:\n    source : text\n    pos : number\nrule word_length\n  input:\n    s : ScanState\n  output:\n    out : number\n  logic:\n    out = if s.pos >= length(s.source) then 0 else if byte_at(s.source, s.pos) >= 97 then (if byte_at(s.source, s.pos) <= 122 then 1 + word_length(ScanState { source: s.source, pos: s.pos + 1 }) else 0) else 0\n  proofs:\n    purity:\n      reads : [s]\n      calls : [word_length]\n    termination:\n      bound : 4000\n      increasing : pos";
+        assert_eq!(run_driver(&pur, wl_only), 0, "milestone: word_length's purity proof verifies (0 errors)");
+        assert_eq!(run_driver(&term, wl_only), 0, "milestone: word_length's increasing proof verifies (0 errors)");
+
+        // Toy-form unchanged: the params-form twin still evals and compiles to 15
+        // (rule_params_of returns rd_params untouched when non-empty).
+        let toy = "concept St\n  fields:\n    n : number\nrule main\n  logic:\n    out = go(St { n: 5 })\nrule go(s : St)\n  logic:\n    out = if s.n == 0 then 0 else s.n + go(St { n: s.n - 1 })";
+        assert_eq!(run_driver(&em, toy), 15, "toy-form go must still eval to 15");
+        assert_eq!(run_compiled(toy, "toy"), 15, "toy-form go must still compile to 15");
+
+        let _ = fs::remove_file(&em);
+        let _ = fs::remove_file(&elf);
+        let _ = fs::remove_file(&pur);
+        let _ = fs::remove_file(&term);
+    }
+
+    /// THE self-hosting milestone: the VERBATIM text of examples/scan_word.verbose —
+    /// a real, shipped source file (with its @verbose header, @intention/@source
+    /// attribute lines, field ranges `text [..256]` / `number [0, 256]`, an `and`
+    /// condition, and full purity + increasing proofs) — goes through the COMPLETE
+    /// self-hosted pipeline unmodified: parse (count_rules 1), purity 0, termination
+    /// 0, eval 5, and COMPILES to a standalone ELF printing 5. The field-range fix
+    /// (skip_field_range) is what unlocked this: parse_fields previously ended the
+    /// field list at a range bracket, silently dropping later fields, and the `.`
+    /// tokens of `[..256]` drove the concept walk into a no-advance infinite
+    /// recursion (stack overflow). Eval/compile use the verbatim file with a driver
+    /// `main` PREPENDED (the drivers evaluate the first rule; the scan_word text
+    /// itself is untouched).
+    #[test]
+    fn verbatim_scan_word_source_compiles_through_self_hosted_pipeline() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        let compiler_src = fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&compiler_src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let verbatim = fs::read_to_string("examples/scan_word.verbose")
+            .expect("examples/scan_word.verbose must exist (the real self-source file)");
+
+        let mk = |rule: &str, tag: &str| -> std::path::PathBuf {
+            let p = std::env::temp_dir().join(format!("verbosec_test_verbatim_{}", tag));
+            compile_native(&program, rule, p.to_str().unwrap(), false, false)
+                .unwrap_or_else(|e| panic!("{} must compile natively: {}", rule, e));
+            p
+        };
+        let cr = mk("count_rules", "count_rules");
+        let pur = mk("count_purity_errors", "purity");
+        let term = mk("count_term_errors", "term");
+        let em = mk("eval_main", "eval");
+        let elf = mk("elf_program_src", "elf");
+
+        let run = |bin: &std::path::Path, source: &str| -> i64 {
+            let r = Command::new(bin).arg(source).arg("0").output().expect("spawn");
+            assert!(r.status.success(), "{:?} must exit 0; got {:?}", bin, r.status);
+            String::from_utf8_lossy(&r.stdout).trim().parse::<i64>()
+                .unwrap_or_else(|_| panic!("{:?} produced non-number: {:?}", bin, r.stdout))
+        };
+
+        // Stages 1-2: the verbatim file, byte-for-byte as shipped.
+        assert_eq!(run(&cr, &verbatim), 1, "verbatim scan_word: parses (1 rule)");
+        assert_eq!(run(&pur, &verbatim), 0, "verbatim scan_word: purity proof verifies");
+        assert_eq!(run(&term, &verbatim), 0, "verbatim scan_word: increasing proof verifies");
+
+        // Stages 3-4: driver main prepended; the scan_word text itself untouched.
+        let driven = format!(
+            "rule main\n  logic:\n    out = word_length(ScanState {{ source: \"hello world\", pos: 0 }})\n\n{}",
+            verbatim
+        );
+        assert_eq!(run(&em, &driven), 5, "verbatim scan_word: interprets to 5");
+
+        let mc = Command::new(&elf).args([driven.as_str(), "0"]).output().expect("spawn elf gen");
+        assert!(mc.status.success(), "elf_program_src must exit 0 on the verbatim file");
+        let out_path = std::env::temp_dir().join("verbosec_test_verbatim_a_out");
+        fs::write(&out_path, &mc.stdout).expect("write a.out");
+        let mut perms = fs::metadata(&out_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&out_path, perms).expect("chmod +x");
+        let child = Command::new(&out_path).output().expect("execute emitted ELF");
+        assert!(child.status.success(),
+            "the ELF compiled from the verbatim self-source must exit 0 (pre-fix: SIGSEGV via the [..256] range); got {:?}",
+            child.status);
+        assert_eq!(String::from_utf8_lossy(&child.stdout).trim(), "5",
+            "the ELF compiled from the verbatim self-source must print 5");
+
+        // The field-range fix in isolation: a range on the FIRST field previously
+        // truncated the field list (the second field vanished) — s.pos must resolve.
+        let range_first = "concept P\n  fields:\n    a : text [..64]\n    b : number [0, 9]\nrule main\n  logic:\n    let p = P { a: \"xy\", b: 7 }\n    out = p.b";
+        assert_eq!(run(&em, range_first), 7,
+            "a range on the first field must not truncate the field list (was: field b dropped)");
+
+        let _ = fs::remove_file(&out_path);
+        for p in [cr, pur, term, em, elf] { let _ = fs::remove_file(&p); }
+    }
+
+    /// The verbatim tokenizer family: the three remaining bootstrap-chain scanner
+    /// files — first_word.verbose (3 rules: lets in input:-block rules, whole-record
+    /// pass-through `skip_spaces(s)`, a let feeding a construction), token_scan.verbose
+    /// (4 rules + concept_group Token: variant construction + match dispatch), and
+    /// count_tokens.verbose (the full tokenizer loop) — each read from disk
+    /// BYTE-FOR-BYTE and run through the complete self-hosted pipeline: parse
+    /// (count_rules == the file's real rule count), purity 0, termination 0, eval,
+    /// and a compiled ELF printing the same value. All three passed FIRST TRY after
+    /// the input:-block bridge + field-range fix — this test pins that the coverage
+    /// stays.
+    #[test]
+    fn verbatim_tokenizer_family_compiles_through_self_hosted_pipeline() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        let compiler_src = fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&compiler_src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let mk = |rule: &str, tag: &str| -> std::path::PathBuf {
+            let p = std::env::temp_dir().join(format!("verbosec_test_vfam_{}", tag));
+            compile_native(&program, rule, p.to_str().unwrap(), false, false)
+                .unwrap_or_else(|e| panic!("{} must compile natively: {}", rule, e));
+            p
+        };
+        let cr = mk("count_rules", "count_rules");
+        let pur = mk("count_purity_errors", "purity");
+        let term = mk("count_term_errors", "term");
+        let em = mk("eval_main", "eval");
+        let elf = mk("elf_program_src", "elf");
+
+        let run = |bin: &std::path::Path, source: &str| -> i64 {
+            let r = Command::new(bin).arg(source).arg("0").output().expect("spawn");
+            assert!(r.status.success(), "{:?} must exit 0; got {:?}", bin, r.status);
+            String::from_utf8_lossy(&r.stdout).trim().parse::<i64>()
+                .unwrap_or_else(|_| panic!("{:?} produced non-number: {:?}", bin, r.stdout))
+        };
+        let run_compiled = |source: &str, tag: &str| -> i64 {
+            let mc = Command::new(&elf).args([source, "0"]).output().expect("spawn elf gen");
+            assert!(mc.status.success(), "elf_program_src must exit 0 for {}", tag);
+            let out_path = std::env::temp_dir().join(format!("verbosec_test_vfam_a_out_{}", tag));
+            fs::write(&out_path, &mc.stdout).expect("write a.out");
+            let mut perms = fs::metadata(&out_path).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&out_path, perms).expect("chmod +x");
+            let child = Command::new(&out_path).output().expect("execute emitted ELF");
+            assert!(child.status.success(), "emitted ELF for {} must exit 0; got {:?}", tag, child.status);
+            let v: i64 = String::from_utf8_lossy(&child.stdout).trim().parse()
+                .unwrap_or_else(|_| panic!("emitted ELF for {} produced non-number: {:?}", tag, child.stdout));
+            let _ = fs::remove_file(&out_path);
+            v
+        };
+
+        // (file, real rule count, driver call, expected value, tag)
+        let cases: [(&str, i64, &str, i64, &str); 4] = [
+            ("examples/first_word.verbose", 3,
+             "out = first_word_len(ScanState { source: \"  hello world\", pos: 0 })", 5, "fw"),
+            ("examples/count_tokens.verbose", 3,
+             "out = count_tokens(ScanState { source: \"hello world\", pos: 0 })", 2, "ct"),
+            ("examples/token_scan.verbose", 4,
+             "out = classify(ScanState { source: \"  hello\", pos: 0 })", 5, "ts_word"),
+            ("examples/token_scan.verbose", 4,
+             "out = classify(ScanState { source: \"42x\", pos: 0 })", 4, "ts_digit"),
+        ];
+        for (path, nrules, call, expect, tag) in cases {
+            let verbatim = fs::read_to_string(path)
+                .unwrap_or_else(|_| panic!("{} must exist (real self-source file)", path));
+            assert_eq!(run(&cr, &verbatim), nrules, "{}: verbatim parse rule count", path);
+            assert_eq!(run(&pur, &verbatim), 0, "{}: verbatim purity verifies", path);
+            assert_eq!(run(&term, &verbatim), 0, "{}: verbatim termination verifies", path);
+            let driven = format!("rule main\n  logic:\n    {}\n\n{}", call, verbatim);
+            assert_eq!(run(&em, &driven), expect, "{} [{}]: interprets", path, tag);
+            assert_eq!(run_compiled(&driven, tag), expect, "{} [{}]: compiled ELF matches", path, tag);
+        }
+
+        for p in [cr, pur, term, em, elf] { let _ = fs::remove_file(&p); }
+    }
+
 }
