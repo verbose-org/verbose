@@ -34224,6 +34224,106 @@ rule probe
         let _ = std::fs::remove_file(&cf);
     }
 
+    /// Fail-closed rejection of RAW newlines in string literals (vexprparse's
+    /// own tokenizer). Pre-fix, a string literal containing a raw byte-10
+    /// silently corrupted the INDENT/DEDENT accounting of every subsequent
+    /// line: the line driver's next_line_start stops at the FIRST newline
+    /// (inside the string) while the Str token span runs past it, so a `rule f`
+    /// declared after a raw-multi-line string was swallowed with NO signal.
+    ///
+    /// The fix mirrors the tab rejection exactly: str_content_len returns the
+    /// 99998 sentinel on a raw byte 10 before the closing quote (distinct from
+    /// line_width's tab sentinel 99999); string_run propagates it (plus scanned
+    /// content bytes, hence the >= 50000 threshold, never equality); next_token
+    /// emits Token::IndentErr at the opening quote INSTEAD of a Str; the line's
+    /// lexeme scan ends right after the error token (token_end lands past
+    /// end-of-source) and the driver resumes at the next line start.
+    ///
+    /// count_lex_errors is the LOUD gate: tokenize + count kind-900 tokens.
+    /// Contracts pinned here:
+    ///   1. the repro emits lex errors (2: the opening quote of the raw-multi-
+    ///      line string, then the orphaned closing quote opens a second
+    ///      raw-newline "string") — count_rules still reports 1 because the
+    ///      parser hard-stops on the first error token; the SWALLOWING is now
+    ///      detectable, which is the requirement.
+    ///   2. clean single-line-string sources: zero errors, rules counted.
+    ///   3. an ESCAPED \n (backslash-n, two bytes) is NOT flagged — the
+    ///      92-branch skips it before the newline check can see byte 110.
+    ///   4. tab rejection unchanged: a tab-indented line still weaves exactly
+    ///      one IndentErr, now countable through the same driver.
+    /// NATIVE-ONLY (multi-line sources), same as the other vexprparse drivers.
+    #[test]
+    fn lexer_rejects_raw_newline_in_string_literal() {
+        let src = std::fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let cr = std::env::temp_dir().join("verbosec_test_rawnl_count_rules");
+        let cl = std::env::temp_dir().join("verbosec_test_rawnl_count_lex_errors");
+        compile_native(&program, "count_rules", cr.to_str().unwrap(), false, false)
+            .expect("count_rules must compile natively");
+        compile_native(&program, "count_lex_errors", cl.to_str().unwrap(), false, false)
+            .expect("count_lex_errors must compile natively");
+
+        let run = |bin: &std::path::Path, prog: &str| -> i64 {
+            let r = std::process::Command::new(bin)
+                .arg(prog)
+                .arg("0")
+                .output()
+                .expect("spawn raw-newline driver");
+            assert!(r.status.success(), "{:?} must exit 0; got {:?}", bin, r.status);
+            String::from_utf8_lossy(&r.stdout)
+                .trim()
+                .parse::<i64>()
+                .expect("driver prints an integer")
+        };
+
+        // (1) THE REPRO: a string literal spanning lines (raw \n bytes inside
+        // the quotes), then a second rule. Pre-fix: count_lex_errors had no
+        // signal and count_rules silently reported 1. Post-fix: 2 error tokens
+        // (opening quote + the orphaned closing quote's re-opened raw-newline
+        // string), LOUD; count_rules still 1 (parser hard-stops on the first
+        // error token — documented, detectable, no longer silent).
+        let repro =
+            "rule main\n  logic:\n    out = \"rule a\n  logic:\n    out = 1\"\nrule f\n  logic:\n    out = 7";
+        assert_eq!(
+            run(&cl, repro),
+            2,
+            "raw newline in a string literal must produce lex error tokens (LOUD gate)"
+        );
+        assert_eq!(
+            run(&cr, repro),
+            1,
+            "the parser hard-stops on the first error token; the trailing rule stays \
+             uncounted but the damage is now visible via count_lex_errors"
+        );
+
+        // (2) clean single-line-string source: zero errors, the rule is counted.
+        let clean = "rule f\n  logic:\n    out = \"hi\"";
+        assert_eq!(run(&cl, clean), 0, "single-line string: no lex errors");
+        assert_eq!(run(&cr, clean), 1, "single-line string: one rule");
+
+        // (2b) two clean rules: the shape the repro SHOULD have had.
+        let two = "rule main\n  logic:\n    out = 3\nrule f\n  logic:\n    out = 7";
+        assert_eq!(run(&cl, two), 0, "two clean rules: no lex errors");
+        assert_eq!(run(&cr, two), 2, "two clean rules: both counted");
+
+        // (3) ESCAPED \n (bytes 92, 110 in the source string literal) is NOT a
+        // raw newline: the 92-branch skips the pair, no error token.
+        let escaped = "rule f\n  logic:\n    out = \"hi\\nthere\"";
+        assert_eq!(run(&cl, escaped), 0, "escaped \\n must NOT be flagged");
+        assert_eq!(run(&cr, escaped), 1, "escaped \\n: the rule still parses");
+
+        // (4) tab rejection unchanged: one IndentErr for a tab-indented line,
+        // countable through the same kind-900 walker.
+        let tab = "rule f\n\tlogic:\n    out = 1";
+        assert_eq!(run(&cl, tab), 1, "tab in indent: exactly one IndentErr, as before");
+
+        let _ = std::fs::remove_file(&cr);
+        let _ = std::fs::remove_file(&cl);
+    }
+
     /// Records-arc brick R2: the self-hosted parser (examples/vexprparse.verbose)
     /// no longer chokes on REAL Verbose source. Three skip-to-unblock changes are
     /// pinned together here:

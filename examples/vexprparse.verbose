@@ -924,10 +924,28 @@ rule keyword_code
 -- check, and the backslash branch checks pos + 1 < len before skipping the
 -- escaped byte (a trailing lone backslash counts as 1 and stops).
 --
+-- RAW NEWLINE (fail-closed, mirror of line_width's tab sentinel): a raw byte 10
+-- before the closing quote returns the sentinel 99998. Real Verbose strings
+-- cannot span lines (the reference lexer's escape set is closed — a line break
+-- inside a string is `\n`, two bytes); silently accepting a raw newline here
+-- corrupted the INDENT/DEDENT accounting of every subsequent line (the driver's
+-- next_line_start stops at the FIRST byte 10, i.e. INSIDE the string, while the
+-- token span ran past it). The sentinel is 99998 — distinct from the tab
+-- sentinel 99999 so the two error sources stay distinguishable when eyeballing
+-- a stream — and callers must test with >= 50000, NOT equality: the content
+-- bytes scanned before the newline accumulate on top of the sentinel (at most
+-- ~2x source length), and string_run adds 1 more for the opening quote. Any
+-- real content length is <= the source length (256-bounded), so >= 50000 can
+-- never misfire on a valid string. The ESCAPED two-byte sequence backslash-n
+-- is untouched: the 92-branch skips it before this check can see byte 110.
+-- (A backslash immediately followed by a raw newline still rides the lenient
+-- 2-byte escape skip — escape SEMANTICS stay out of scope for this scanner.)
+--
 -- Termination: pos strictly increases by 1 or 2 each step toward len, so the
--- `increasing : pos` proof holds; bound 256 caps the source length.
+-- `increasing : pos` proof holds; bound 256 caps the source length (the
+-- sentinel branches return constants — no recursion, proof unaffected).
 rule str_content_len
-  @intention: "Bytes from pos to the closing quote inclusive (lenient escapes, unterminated stops at end)"
+  @intention: "Bytes from pos to the closing quote inclusive (lenient escapes, unterminated stops at end, 99998 sentinel on a raw newline)"
   @source: vexprparse.intent:8
   input:
     s : ScanState
@@ -935,7 +953,7 @@ rule str_content_len
     out : number
   logic:
     let len = length(s.source)
-    out = if s.pos >= len then 0 else if byte_at(s.source, s.pos) == 34 then 1 else if byte_at(s.source, s.pos) == 92 then (if s.pos + 1 >= len then 1 else 2 + str_content_len(ScanState { source: s.source, pos: s.pos + 2 })) else 1 + str_content_len(ScanState { source: s.source, pos: s.pos + 1 })
+    out = if s.pos >= len then 0 else if byte_at(s.source, s.pos) == 34 then 1 else if byte_at(s.source, s.pos) == 10 then 99998 else if byte_at(s.source, s.pos) == 92 then (if s.pos + 1 >= len then 1 else 2 + str_content_len(ScanState { source: s.source, pos: s.pos + 2 })) else 1 + str_content_len(ScanState { source: s.source, pos: s.pos + 1 })
   proofs:
     purity:
       reads : [s.source, s.pos]
@@ -950,6 +968,10 @@ rule str_content_len
 -- to and including the closing quote (str_content_len from pos + 1). For an
 -- unterminated string the closing quote is absent, so the result is 1 + bytes-
 -- to-end — token_end then advances to the end of source and tokenize stops.
+-- A raw-newline string propagates str_content_len's 99998 sentinel as 1 + 99998
+-- + (content bytes before the newline) — still huge; next_token's >= 50000
+-- check turns it into a Token::IndentErr, and token_end's p + srun lands past
+-- end-of-source so the line's lexeme scan stops right after the error token.
 rule string_run
   @intention: "Total byte length of the string token at the opening quote (both quotes included)"
   @source: vexprparse.intent:8
@@ -1007,8 +1029,15 @@ rule op_len
       bound : 8
 
 
+-- next_token: classify the lexeme at the (space-skipped) position. FAIL-CLOSED
+-- string gate (mirror of tokenize_indent's tab path): when string_run comes back
+-- >= 50000 the string contains a raw newline (the 99998 sentinel plus scanned
+-- content — see str_content_len), so the token is a Token::IndentErr at the
+-- opening quote INSTEAD of a Str. The threshold is >=, not ==, because the
+-- sentinel accumulates content bytes on its way up; 50000 is unreachable by any
+-- real string (content <= source length <= 256-bounded).
 rule next_token
-  @intention: "Recognize and classify the next core lexeme at the position"
+  @intention: "Recognize and classify the next core lexeme at the position (IndentErr on a raw-newline string)"
   @source: vexprparse.intent:9
   input:
     s : ScanState
@@ -1028,7 +1057,7 @@ rule next_token
     let opc = op_code(ScanState { source: s.source, pos: p })
     let opl = op_len(ScanState { source: s.source, pos: p })
     let nval = num_value(ScanState { source: s.source, pos: p })
-    out = if p >= len then Token::Eof else if isnl == 1 then Token::Newline { pos: p } else if isalpha == 1 then (if kwc > 0 then Token::Keyword { start: p, len: irun, kw: kwc } else Token::Ident { start: p, len: irun }) else if isdigit == 1 then Token::Num { value: nval, len: drun } else if isstr == 1 then Token::Str { start: p, len: srun } else if opc > 0 then Token::Op { code: opc, len: opl } else Token::Eof
+    out = if p >= len then Token::Eof else if isnl == 1 then Token::Newline { pos: p } else if isalpha == 1 then (if kwc > 0 then Token::Keyword { start: p, len: irun, kw: kwc } else Token::Ident { start: p, len: irun }) else if isdigit == 1 then Token::Num { value: nval, len: drun } else if isstr == 1 then (if srun >= 50000 then Token::IndentErr { pos: p } else Token::Str { start: p, len: srun }) else if opc > 0 then Token::Op { code: opc, len: opl } else Token::Eof
   proofs:
     purity:
       reads : [s.source, s]
@@ -3898,6 +3927,88 @@ rule count_cells_indent
     purity:
       reads : [a.source]
       calls : [begin_tokenize, count_cells]
+    termination:
+      bound : 256
+
+
+-- 1 iff the token IS an IndentErr, structurally (mirror of tok_is_num). The
+-- lexer's fail-closed error token now has TWO producers — a tab in leading
+-- whitespace (line_width's 99999 sentinel) and a raw newline inside a string
+-- literal (str_content_len's 99998 sentinel via next_token) — and this test
+-- is how a driver counts them without decoding the kind band arithmetic.
+rule tok_is_err
+  @intention: "1 if the token is an IndentErr (lex error token), 0 otherwise"
+  @source: vexprparse.intent:1741
+  input:
+    t : Token
+  output:
+    out : number
+  logic:
+    out = match t:
+      Ident(start, len) => 0
+      Keyword(start, len, kw) => 0
+      Num(value, len) => 0
+      Op(code, len) => 0
+      Str(start, len) => 0
+      Newline(pos) => 0
+      Indent => 0
+      Dedent => 0
+      IndentErr(pos) => 1
+      Eof => 0
+  proofs:
+    purity:
+      reads : [t]
+      calls : []
+    termination:
+      bound : 16
+
+
+-- count_errs: count the IndentErr tokens in a token list (mirror of shape_toks'
+-- walk, but a plain count instead of a banded fingerprint — no band overflow
+-- concern, the count IS the observable). Structural recursion on the tail.
+rule count_errs
+  @intention: "Number of IndentErr (lex error) tokens in a token list"
+  @source: vexprparse.intent:1741
+  input:
+    lst : TokenList
+  output:
+    out : number
+  logic:
+    out = match lst:
+      Cons(head, tail) => tok_is_err(head) + count_errs(tail)
+      Nil => 0
+  proofs:
+    purity:
+      reads : [lst]
+      calls : [tok_is_err, count_errs]
+    termination:
+      bound : 65535
+      structural : lst
+
+
+-- count_lex_errors: the LOUD gate. Tokenize the source with indentation (same
+-- entry as count_rules) and count the kind-900 error tokens in the stream. A
+-- source that lexes cleanly returns 0; a tab-indented line or a raw newline
+-- inside a string literal each contribute >= 1. The driver a harness runs
+-- BEFORE trusting count_rules — a nonzero count means the token stream carries
+-- error tokens and downstream structural counts describe a damaged stream.
+-- NATIVE-ONLY for newline-bearing sources (same JSON-reader limit as
+-- count_rules). Takes a ScanState: source is argv arg 1, pos is argv arg 2
+-- (always 0).
+rule count_lex_errors
+  @intention: "Tokenize a program with INDENT/DEDENT and count its lex error tokens"
+  @source: vexprparse.intent:1741
+  input:
+    s : ScanState
+  output:
+    out : number
+  logic:
+    let toks = begin_tokenize(ScanState { source: s.source, pos: 0 })
+    out = count_errs(toks)
+  proofs:
+    purity:
+      reads : [s.source]
+      calls : [begin_tokenize, count_errs]
     termination:
       bound : 256
 
