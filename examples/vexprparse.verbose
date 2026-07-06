@@ -15504,6 +15504,259 @@ rule program_uses_text
       bound : 8000
 
 
+-- ============================================================================
+-- STREAMING slice — mode decision (docs/self-hosting-streaming-design.md).
+-- A rule STREAMS iff its block result is text-shaped: AstStr, a concat(...)
+-- call, an if/match with a texty arm, or a call to a defined rule whose result
+-- is DIRECTLY texty (ONE transitivity level — the callee's result is checked
+-- with the SHALLOW walk, which never follows the callee's own calls; a deeper
+-- chain degrades to the int3 refusal in x86_node's texty-callee guard, a clean
+-- SIGTRAP, never garbage). Streamed procs write their bytes to fd 1 in order
+-- during the walk; the ELF trampoline writes only the trailing newline.
+-- ============================================================================
+
+concept TextyState
+  @intention: "An AST node + source + the program, for the transitive-depth-1 texty test"
+  @source: vexprparse.intent:69
+  fields:
+    node : Ast
+    src : text [..256]
+    prog : RuleList
+
+
+concept TextyArms
+  @intention: "A match arm list + source + the program, for the texty walk over arm bodies"
+  @source: vexprparse.intent:69
+  fields:
+    arms : ArmList
+    src : text [..256]
+    prog : RuleList
+
+
+-- ast_texty_shallow: the DEPTH-0 texty test — no call following at all. AstStr
+-- and concat(...) are texty; if/match arms recurse over the same shallow
+-- grammar; every other shape (numbers, vars, fields, prims, defined-rule calls)
+-- is 0. This is the check ast_is_texty applies to a CALLEE's result: exactly
+-- one level of transitivity, verbosec's own streaming v1 bound.
+rule ast_texty_shallow
+  @intention: "1 if a subtree is text-shaped without following any call (AstStr / concat / if-match of those), 0 otherwise"
+  @source: vexprparse.intent:69
+  input:
+    ps : PrintState
+  output:
+    out : number
+  logic:
+    out = match ps.node:
+      AstNum(value) => 0
+      AstBool(value) => 0
+      AstVar(start, len) => 0
+      AstErr => 0
+      AstStr(start, len) => 1
+      AstBin(op, lhs, rhs) => 0
+      AstNeg(inner) => 0
+      AstNot(inner) => 0
+      AstField(base, fstart, flen) => 0
+      AstCall(callee_start, callee_len, args) => span_is_concat(SpanCheck { src: ps.src, start: callee_start, len: callee_len })
+      AstIf(cond, thn, els) => if ast_texty_shallow(PrintState { node: thn, src: ps.src }) == 1 then 1 else ast_texty_shallow(PrintState { node: els, src: ps.src })
+      AstVariant(cstart, clen, vstart, vlen, fields) => 0
+      AstMatch(scrut, arms) => arms_texty_shallow(UsesTextArms { arms: arms, src: ps.src })
+  proofs:
+    purity:
+      reads : [ps.node, ps.src]
+      calls : [span_is_concat, ast_texty_shallow, arms_texty_shallow]
+    termination:
+      bound : 8000
+
+
+-- arms_texty_shallow: the shallow texty walk over a match's arm bodies. Any
+-- texty arm makes the whole match texty (mixed number arms stream via itoa).
+rule arms_texty_shallow
+  @intention: "1 if any match arm body is shallow-texty, 0 otherwise"
+  @source: vexprparse.intent:69
+  input:
+    ua : UsesTextArms
+  output:
+    out : number
+  logic:
+    out = match ua.arms:
+      ArmCons(vstart, vlen, binders, body, rest) => if ast_texty_shallow(PrintState { node: body, src: ua.src }) == 1 then 1 else arms_texty_shallow(UsesTextArms { arms: rest, src: ua.src })
+      ArmNil => 0
+  proofs:
+    purity:
+      reads : [ua.arms, ua.src]
+      calls : [ast_texty_shallow, arms_texty_shallow]
+    termination:
+      bound : 8000
+
+
+-- ast_is_texty: the transitive-depth-1 texty test. Same grammar as the shallow
+-- walk PLUS one level of call transitivity: a call to a defined rule is texty
+-- iff that rule's result is SHALLOW-texty (find_rule's sentinel result is
+-- AstErr, so an unknown callee is 0). The three span primitives short-circuit:
+-- byte_at / length are numbers; substring stays a packed span (value path).
+rule ast_is_texty
+  @intention: "1 if a subtree is text-shaped with one level of call transitivity, 0 otherwise"
+  @source: vexprparse.intent:69
+  input:
+    ts : TextyState
+  output:
+    out : number
+  logic:
+    out = match ts.node:
+      AstNum(value) => 0
+      AstBool(value) => 0
+      AstVar(start, len) => 0
+      AstErr => 0
+      AstStr(start, len) => 1
+      AstBin(op, lhs, rhs) => 0
+      AstNeg(inner) => 0
+      AstNot(inner) => 0
+      AstField(base, fstart, flen) => 0
+      AstCall(callee_start, callee_len, args) => if span_is_concat(SpanCheck { src: ts.src, start: callee_start, len: callee_len }) == 1 then 1 else if span_is_byte_at(SpanCheck { src: ts.src, start: callee_start, len: callee_len }) == 1 then 0 else if span_is_length(SpanCheck { src: ts.src, start: callee_start, len: callee_len }) == 1 then 0 else if span_is_substring(SpanCheck { src: ts.src, start: callee_start, len: callee_len }) == 1 then 0 else ast_texty_shallow(PrintState { node: block_result(rd_body(find_rule(FindRuleState { rules: ts.prog, src: ts.src, q_start: callee_start, q_len: callee_len }))), src: ts.src })
+      AstIf(cond, thn, els) => if ast_is_texty(TextyState { node: thn, src: ts.src, prog: ts.prog }) == 1 then 1 else ast_is_texty(TextyState { node: els, src: ts.src, prog: ts.prog })
+      AstVariant(cstart, clen, vstart, vlen, fields) => 0
+      AstMatch(scrut, arms) => arms_is_texty(TextyArms { arms: arms, src: ts.src, prog: ts.prog })
+  proofs:
+    purity:
+      reads : [ts.node, ts.src, ts.prog]
+      calls : [span_is_concat, span_is_byte_at, span_is_length, span_is_substring, ast_texty_shallow, block_result, rd_body, find_rule, ast_is_texty, arms_is_texty]
+    termination:
+      bound : 8000
+
+
+-- arms_is_texty: the transitive-depth-1 texty walk over a match's arm bodies.
+rule arms_is_texty
+  @intention: "1 if any match arm body is texty (transitive depth 1), 0 otherwise"
+  @source: vexprparse.intent:69
+  input:
+    ta : TextyArms
+  output:
+    out : number
+  logic:
+    out = match ta.arms:
+      ArmCons(vstart, vlen, binders, body, rest) => if ast_is_texty(TextyState { node: body, src: ta.src, prog: ta.prog }) == 1 then 1 else arms_is_texty(TextyArms { arms: rest, src: ta.src, prog: ta.prog })
+      ArmNil => 0
+  proofs:
+    purity:
+      reads : [ta.arms, ta.src, ta.prog]
+      calls : [ast_is_texty, arms_is_texty]
+    termination:
+      bound : 8000
+
+
+-- callee_is_texty: is the named callee a rule that EMITS as a streaming proc?
+-- MUST equal rule_is_texty of the resolved rule — this is the ABI-consistency
+-- predicate: x86_node's value-position guard (int3) and x86_stream_node's
+-- call-and-discard dispatch both use it, so every call site either agrees with
+-- the callee's proc shape or traps cleanly. Unknown callee -> 0 (sentinel
+-- result AstErr).
+rule callee_is_texty
+  @intention: "1 if the named callee resolves to a rule that emits as a streaming (texty) proc, 0 otherwise"
+  @source: vexprparse.intent:69
+  input:
+    st : FindRuleState
+  output:
+    out : number
+  logic:
+    out = ast_is_texty(TextyState { node: block_result(rd_body(find_rule(FindRuleState { rules: st.rules, src: st.src, q_start: st.q_start, q_len: st.q_len }))), src: st.src, prog: st.rules })
+  proofs:
+    purity:
+      reads : [st.rules, st.src, st.q_start, st.q_len]
+      calls : [ast_is_texty, block_result, rd_body, find_rule]
+    termination:
+      bound : 8000
+
+
+-- rule_is_texty: the per-rule streaming-mode decision — 1 iff the rule's block
+-- result is texty (transitive depth 1). x86_proc / proc_size branch on this;
+-- a 0 keeps the materializing path byte-for-byte.
+rule rule_is_texty
+  @intention: "1 if a rule's block result is texty and its proc streams, 0 otherwise"
+  @source: vexprparse.intent:69
+  input:
+    pg : ProcGenState
+  output:
+    out : number
+  logic:
+    out = ast_is_texty(TextyState { node: block_result(rd_body(pg.rd)), src: pg.src, prog: pg.prog })
+  proofs:
+    purity:
+      reads : [pg.rd, pg.src, pg.prog]
+      calls : [ast_is_texty, block_result, rd_body]
+    termination:
+      bound : 8000
+
+
+-- entry_rule_texty: is the ENTRY rule (the first rule — the one the trampoline
+-- calls) texty? Selects the trampoline variant: texty -> call + write("\n") +
+-- exit(0) (45 B, no itoa print); number -> the b8 itoa trampoline (101 B).
+rule entry_rule_texty
+  @intention: "1 if the program's entry (first) rule is texty, 0 otherwise"
+  @source: vexprparse.intent:69
+  input:
+    pg : ProgGenState
+  output:
+    out : number
+  logic:
+    out = match pg.rules:
+      RCons(head, tail) => rule_is_texty(ProcGenState { rd: head, src: pg.src, off: 0, prog: pg.prog, concepts: pg.concepts })
+      RNil => 0
+  proofs:
+    purity:
+      reads : [pg.rules, pg.src, pg.prog, pg.concepts]
+      calls : [rule_is_texty]
+    termination:
+      bound : 8000
+
+
+-- prog_any_texty: 1 iff ANY rule in the program is texty. Gates the shared
+-- itoa_proc emission (86 B between the trampoline and the first rule proc, so
+-- rule procs see it at blob-origin offset -86) and the source-embedding
+-- extension. A texty-free program keeps blob layout byte-identical.
+rule prog_any_texty
+  @intention: "1 if any rule in the program is texty (streams), 0 otherwise"
+  @source: vexprparse.intent:69
+  input:
+    pg : ProgGenState
+  output:
+    out : number
+  logic:
+    out = match pg.rules:
+      RCons(head, tail) => if rule_is_texty(ProcGenState { rd: head, src: pg.src, off: 0, prog: pg.prog, concepts: pg.concepts }) == 1 then 1 else prog_any_texty(ProgGenState { rules: tail, src: pg.src, off: 0, prog: pg.prog, concepts: pg.concepts })
+      RNil => 0
+  proofs:
+    purity:
+      reads : [pg.rules, pg.src, pg.prog, pg.concepts]
+      calls : [rule_is_texty, prog_any_texty]
+    termination:
+      bound : 8000
+
+
+-- param_ty: the declared TYPE CODE of the parameter whose name span matches the
+-- query (0=number, 1=bool, 2=text — brick 20's codes), or -1 if not a param.
+-- Mirror of param_index returning `ty` instead of the index. The streaming
+-- AstVar arm dispatches on ty == 2: a text param's runtime value is a packed
+-- span (start*2^32 + len) that streams via unpack + write; every other var
+-- streams through the shared itoa_proc.
+rule param_ty
+  @intention: "The declared type code of the parameter matching a name span, or -1 if not a parameter"
+  @source: vexprparse.intent:69
+  input:
+    pi : ParamIndexState
+  output:
+    out : number
+  logic:
+    out = match pi.params:
+      PCons(name_start, name_len, ty, ty_start, ty_len, rest) => if name_len == pi.q_len and name_eq(NameEqState { src: pi.src, a_start: name_start, b_start: pi.q_start, len: pi.q_len, off: 0 }) == 1 then ty else param_ty(ParamIndexState { params: rest, src: pi.src, q_start: pi.q_start, q_len: pi.q_len, idx: pi.idx + 1 })
+      PNil => 0 - 1
+  proofs:
+    purity:
+      reads : [pi.params, pi.src, pi.q_start, pi.q_len, pi.idx]
+      calls : [name_eq, param_ty]
+    termination:
+      bound : 512
+
+
 -- code_size_vfields: the total byte count of lowering a variant's field-value pushes
 -- (the sum of each field value's code_size_node). Mirror of code_size_args. Empty -> 0.
 rule code_size_vfields
@@ -16017,7 +16270,7 @@ rule code_size_node
       -- push), substring = 38 (pops + split + two bounds checks + repack + OOB block).
       -- A wrong arity emits ONLY `push 0` (2 bytes) — oracle parity with eval's
       -- defensive VNum 0, no argument code at all.
-      AstCall(callee_start, callee_len, args) => if span_is_byte_at(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then (if arg_list_len(args) == 2 then code_size_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }) + 36 else 2) else if span_is_length(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then (if arg_list_len(args) == 1 then code_size_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }) + 4 else 2) else if span_is_substring(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then (if arg_list_len(args) == 3 then code_size_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }) + 38 else 2) else code_size_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }) + 13
+      AstCall(callee_start, callee_len, args) => if span_is_byte_at(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then (if arg_list_len(args) == 2 then code_size_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }) + 36 else 2) else if span_is_length(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then (if arg_list_len(args) == 1 then code_size_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }) + 4 else 2) else if span_is_substring(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then (if arg_list_len(args) == 3 then code_size_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }) + 38 else 2) else if span_is_concat(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then 1 else if callee_is_texty(FindRuleState { rules: bg.prog, src: bg.src, q_start: callee_start, q_len: callee_len }) == 1 then 1 else code_size_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }) + 13
       -- Text values slice 2: a string literal is one packed-span push —
       -- mov rax, imm64 (10) + push rax (1) = 11, same shape as AstNum.
       AstStr(start, len) => 11
@@ -16035,7 +16288,7 @@ rule code_size_node
   proofs:
     purity:
       reads : [bg.node, bg.src, bg.off, bg.params, bg.lets, bg.prog, bg.concepts]
-      calls : [code_size_node, code_size_args, code_size_vfields, vfield_len, arm_list_len, code_size_arms, static_concept_of, span_is_byte_at, span_is_length, span_is_substring, arg_list_len]
+      calls : [code_size_node, code_size_args, code_size_vfields, vfield_len, arm_list_len, code_size_arms, static_concept_of, span_is_byte_at, span_is_length, span_is_substring, span_is_concat, callee_is_texty, arg_list_len]
     termination:
       bound : 8000
 
@@ -16155,11 +16408,11 @@ rule proc_size
     let nbind = mb_ast(result) + mb_binds(binds)
     let subsize = if nlets + nbind > 0 then 7 else 0
     let storesize = code_size_let_stores(LetGenState { rem: binds, all_binds: binds, src: pg.src, off: 0, params: rule_params_of(pg.rd), idx: 0, prog: pg.prog, concepts: pg.concepts })
-    out = 4 + subsize + storesize + code_size_node(ByteGenState { node: result, src: pg.src, off: 0, params: rule_params_of(pg.rd), lets: binds, prog: pg.prog, concepts: pg.concepts }) + 6
+    out = 4 + subsize + storesize + (if rule_is_texty(pg) == 1 then code_size_stream_node(ByteGenState { node: result, src: pg.src, off: 0, params: rule_params_of(pg.rd), lets: binds, prog: pg.prog, concepts: pg.concepts }) + 2 else code_size_node(ByteGenState { node: result, src: pg.src, off: 0, params: rule_params_of(pg.rd), lets: binds, prog: pg.prog, concepts: pg.concepts })) + 6
   proofs:
     purity:
-      reads : [pg.rd, pg.src, pg.prog, pg.concepts]
-      calls : [rd_body, block_binds, block_result, count_binds, mb_ast, mb_binds, code_size_let_stores, code_size_node, rule_params_of]
+      reads : [pg, pg.rd, pg.src, pg.prog, pg.concepts]
+      calls : [rd_body, block_binds, block_result, count_binds, mb_ast, mb_binds, code_size_let_stores, code_size_node, rule_is_texty, code_size_stream_node, rule_params_of]
     termination:
       bound : 8000
 
@@ -16243,7 +16496,7 @@ rule x86_node
       --     32 ; sub rcx, rdx ; or rax, rcx ; push rax ; jmp +3 ; OOB: xor eax,
       --     eax ; push rax. Pure span arithmetic — no memory touch, no src_base.
       -- A wrong arity emits ONLY push 0 (6a 00, 2 bytes) — eval's defensive VNum 0.
-      AstCall(callee_start, callee_len, args) => if span_is_byte_at(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then (if arg_list_len(args) == 2 then concat(x86_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }), b"\x59\x58\x89\xc2\x48\xc1\xe8\x20\x48\x39\xd1\x73\x14\x48\x01\xc8\x48\xba", le64(4194304 + blob_end_off(ProgGenState { rules: bg.prog, src: bg.src, off: 0, prog: bg.prog, concepts: bg.concepts })), b"\x0f\xb6\x04\x02\x50\xeb\x03\x31\xc0\x50") else b"\x6a\x00") else if span_is_length(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then (if arg_list_len(args) == 1 then concat(x86_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }), b"\x58\x89\xc0\x50") else b"\x6a\x00") else if span_is_substring(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then (if arg_list_len(args) == 3 then concat(x86_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }), b"\x59\x5a\x58\x89\xc6\x48\xc1\xe8\x20\x48\x39\xca\x77\x15\x48\x39\xf1\x77\x10\x48\x01\xd0\x48\xc1\xe0\x20\x48\x29\xd1\x48\x09\xc8\x50\xeb\x03\x31\xc0\x50") else b"\x6a\x00") else concat(x86_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }), b"\xe8", le32(proc_offset(ProcOffState { rules: bg.prog, src: bg.src, acc: 0, q_start: callee_start, q_len: callee_len, concepts: bg.concepts }) - (bg.off + code_size_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }) + 5)), b"\x48\x81\xc4", le32(8 * arg_list_len(args)), b"\x50")
+      AstCall(callee_start, callee_len, args) => if span_is_byte_at(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then (if arg_list_len(args) == 2 then concat(x86_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }), b"\x59\x58\x89\xc2\x48\xc1\xe8\x20\x48\x39\xd1\x73\x14\x48\x01\xc8\x48\xba", le64(4194304 + blob_end_off(ProgGenState { rules: bg.prog, src: bg.src, off: 0, prog: bg.prog, concepts: bg.concepts })), b"\x0f\xb6\x04\x02\x50\xeb\x03\x31\xc0\x50") else b"\x6a\x00") else if span_is_length(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then (if arg_list_len(args) == 1 then concat(x86_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }), b"\x58\x89\xc0\x50") else b"\x6a\x00") else if span_is_substring(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then (if arg_list_len(args) == 3 then concat(x86_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }), b"\x59\x5a\x58\x89\xc6\x48\xc1\xe8\x20\x48\x39\xca\x77\x15\x48\x39\xf1\x77\x10\x48\x01\xd0\x48\xc1\xe0\x20\x48\x29\xd1\x48\x09\xc8\x50\xeb\x03\x31\xc0\x50") else b"\x6a\x00") else if span_is_concat(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then b"\xcc" else if callee_is_texty(FindRuleState { rules: bg.prog, src: bg.src, q_start: callee_start, q_len: callee_len }) == 1 then b"\xcc" else concat(x86_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }), b"\xe8", le32(proc_offset(ProcOffState { rules: bg.prog, src: bg.src, acc: 0, q_start: callee_start, q_len: callee_len, concepts: bg.concepts }) - (bg.off + code_size_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }) + 5)), b"\x48\x81\xc4", le32(8 * arg_list_len(args)), b"\x50")
       -- Text values slice 2: a string literal compiles to ONE packed i64 —
       -- (start+1) * 2^32 + (len-2), quotes stripped, the SAME numbers as eval's
       -- VText (the token span includes both quotes; a lone-quote token packs len
@@ -16278,7 +16531,7 @@ rule x86_node
   proofs:
     purity:
       reads : [bg.node, bg.src, bg.off, bg.params, bg.lets, bg.prog, bg.concepts]
-      calls : [x86_node, code_size_node, x86_args, code_size_args, param_index, let_index, param_list_len, proc_offset, arg_list_len, x86_vfields, x86_vpops, vfield_len, max_payload_fields, variant_tag, x86_dispatch, x86_arms, code_size_arms, arm_list_len, static_concept_of, field_index_of, cd_fields, concept_at_index, span_is_byte_at, span_is_length, span_is_substring, blob_end_off]
+      calls : [x86_node, code_size_node, x86_args, code_size_args, param_index, let_index, param_list_len, proc_offset, arg_list_len, x86_vfields, x86_vpops, vfield_len, max_payload_fields, variant_tag, x86_dispatch, x86_arms, code_size_arms, arm_list_len, static_concept_of, field_index_of, cd_fields, concept_at_index, span_is_byte_at, span_is_length, span_is_substring, span_is_concat, callee_is_texty, blob_end_off]
     termination:
       bound : 8000
 
@@ -16346,11 +16599,213 @@ rule x86_proc
     let nbind = mb_ast(result) + mb_binds(binds)
     let subsize = if nlets + nbind > 0 then 7 else 0
     let storesize = code_size_let_stores(LetGenState { rem: binds, all_binds: binds, src: pg.src, off: 0, params: rule_params_of(pg.rd), idx: 0, prog: pg.prog, concepts: pg.concepts })
-    out = concat(b"\x55\x48\x89\xe5", (if nlets + nbind > 0 then concat(b"\x48\x81\xec", le32(8 * (nlets + nbind))) else b""), x86_let_stores(LetGenState { rem: binds, all_binds: binds, src: pg.src, off: pg.off + 4 + subsize, params: rule_params_of(pg.rd), idx: 0, prog: pg.prog, concepts: pg.concepts }), x86_node(ByteGenState { node: result, src: pg.src, off: pg.off + 4 + subsize + storesize, params: rule_params_of(pg.rd), lets: binds, prog: pg.prog, concepts: pg.concepts }), b"\x58\x48\x89\xec\x5d\xc3")
+    out = concat(b"\x55\x48\x89\xe5", (if nlets + nbind > 0 then concat(b"\x48\x81\xec", le32(8 * (nlets + nbind))) else b""), x86_let_stores(LetGenState { rem: binds, all_binds: binds, src: pg.src, off: pg.off + 4 + subsize, params: rule_params_of(pg.rd), idx: 0, prog: pg.prog, concepts: pg.concepts }), (if rule_is_texty(pg) == 1 then concat(x86_stream_node(ByteGenState { node: result, src: pg.src, off: pg.off + 4 + subsize + storesize, params: rule_params_of(pg.rd), lets: binds, prog: pg.prog, concepts: pg.concepts }), b"\x6a\x00") else x86_node(ByteGenState { node: result, src: pg.src, off: pg.off + 4 + subsize + storesize, params: rule_params_of(pg.rd), lets: binds, prog: pg.prog, concepts: pg.concepts })), b"\x58\x48\x89\xec\x5d\xc3")
   proofs:
     purity:
-      reads : [pg.rd, pg.src, pg.off, pg.prog, pg.concepts]
-      calls : [rd_body, block_binds, block_result, count_binds, mb_ast, mb_binds, code_size_let_stores, x86_let_stores, x86_node, rule_params_of]
+      reads : [pg, pg.rd, pg.src, pg.off, pg.prog, pg.concepts]
+      calls : [rd_body, block_binds, block_result, count_binds, mb_ast, mb_binds, code_size_let_stores, x86_let_stores, x86_node, rule_is_texty, x86_stream_node, rule_params_of]
+    termination:
+      bound : 8000
+
+
+-- ============================================================================
+-- STREAMING slice — the WRITER-mode walk. x86_stream_node is the sibling of
+-- x86_node for texty rule bodies: instead of pushing a value it WRITES the
+-- node's text reading to fd 1, in order, during the walk — no rope, no buffer,
+-- no heap. AstStr -> inline write(1, src_base + start + 1, len - 2); concat ->
+-- stream each arg in order; a text param var -> unpack the packed span + write;
+-- number shapes -> x86_node eval + pop rax + call itoa_proc (the ONE shared
+-- callable elf_program_src lays at blob-origin offset -86, right before the
+-- first rule proc); if/match -> x86_node cond/scrutinee + streamed arms (the
+-- match default streams NOTHING — jmp end, 5 B, vs the value path's 9); a call
+-- to a texty rule -> x86_args + call + arg cleanup, dummy rax DISCARDED (no
+-- push). Unsupported v1 shapes (substring-in-stream, unknown vars) -> int3.
+-- code_size_stream_node mirrors x86_stream_node ARM-FOR-ARM (the drift edge).
+-- ============================================================================
+
+-- code_size_stream_node: the EXACT byte count x86_stream_node emits. The itoa
+-- path is code_size_node(node) + 6 (pop rax 1 + call rel32 5); AstStr is a
+-- fixed 33 (mov rax,1 7 + mov rdi,1 7 + movabs rsi 10 + mov rdx,imm32 7 +
+-- syscall 2); a text-param var is a fixed 42 (push var 6 + pop 1 + mov edx,eax
+-- 2 + shr rax,32 4 + movabs rsi 10 + add rsi,rax 3 + mov rax,1 7 + mov rdi,1 7
+-- + syscall 2); a texty call is args + 12 (call 5 + add rsp,imm32 7, NO push);
+-- if is cond + 15 + streamed arms; match is scrut + 14 + 13/arm + 5 (default
+-- jmp only) + the streamed arm blocks.
+rule code_size_stream_node
+  @intention: "Exact byte count x86_stream_node emits for a subtree (mirrors it arm-for-arm)"
+  @source: vexprparse.intent:69
+  input:
+    bg : ByteGenState
+  output:
+    out : number
+  logic:
+    out = match bg.node:
+      AstNum(value) => code_size_node(bg) + 6
+      AstBin(op, lhs, rhs) => code_size_node(bg) + 6
+      AstNeg(inner) => code_size_node(bg) + 6
+      AstNot(inner) => 1
+      AstVar(start, len) => (if param_index(ParamIndexState { params: bg.params, src: bg.src, q_start: start, q_len: len, idx: 0 }) >= 0 then (if param_ty(ParamIndexState { params: bg.params, src: bg.src, q_start: start, q_len: len, idx: 0 }) == 2 then 42 else code_size_node(bg) + 6) else if let_index(LetIndexState { binds: bg.lets, src: bg.src, q_start: start, q_len: len, idx: 0 }) >= 0 then code_size_node(bg) + 6 else 1)
+      AstField(base, fstart, flen) => code_size_node(bg) + 6
+      AstStr(start, len) => 33
+      AstBool(value) => 1
+      AstErr => 1
+      AstVariant(cstart, clen, vstart, vlen, fields) => code_size_node(bg) + 6
+      AstIf(cond, thn, els) => code_size_node(ByteGenState { node: cond, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }) + 15 + code_size_stream_node(ByteGenState { node: thn, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }) + code_size_stream_node(ByteGenState { node: els, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts })
+      AstMatch(scrut, arms) => code_size_node(ByteGenState { node: scrut, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }) + 14 + 13 * arm_list_len(arms) + 5 + stream_size_arms(ArmSizeState { arms: arms, src: bg.src, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts })
+      AstCall(callee_start, callee_len, args) => if span_is_concat(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then stream_size_cargs(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }) else if span_is_substring(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then 1 else if span_is_byte_at(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then code_size_node(bg) + 6 else if span_is_length(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then code_size_node(bg) + 6 else if callee_is_texty(FindRuleState { rules: bg.prog, src: bg.src, q_start: callee_start, q_len: callee_len }) == 1 then code_size_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }) + 12 else code_size_node(bg) + 6
+  proofs:
+    purity:
+      reads : [bg, bg.node, bg.src, bg.off, bg.params, bg.lets, bg.prog, bg.concepts]
+      calls : [code_size_node, code_size_stream_node, stream_size_cargs, stream_size_arms, code_size_args, param_index, param_ty, let_index, arm_list_len, span_is_concat, span_is_substring, span_is_byte_at, span_is_length, callee_is_texty]
+    termination:
+      bound : 8000
+
+
+-- stream_size_cargs: total bytes of streaming a concat's argument list — the
+-- sum of each arg's code_size_stream_node (each arg streams its own reading).
+rule stream_size_cargs
+  @intention: "Total byte count of streaming a concat's argument list in order"
+  @source: vexprparse.intent:69
+  input:
+    ag : ByteGenArgs
+  output:
+    out : number
+  logic:
+    out = match ag.args:
+      ArgCons(head, tail) => code_size_stream_node(ByteGenState { node: head, src: ag.src, off: ag.off, params: ag.params, lets: ag.lets, prog: ag.prog, concepts: ag.concepts }) + stream_size_cargs(ByteGenArgs { args: tail, src: ag.src, off: ag.off, params: ag.params, lets: ag.lets, prog: ag.prog, concepts: ag.concepts })
+      ArgNil => 0
+  proofs:
+    purity:
+      reads : [ag.args, ag.src, ag.off, ag.params, ag.lets, ag.prog, ag.concepts]
+      calls : [code_size_stream_node, stream_size_cargs]
+    termination:
+      bound : 8000
+
+
+-- stream_size_arms: total bytes of a streamed match's arm blocks. Per arm: 14
+-- per binder (the arena-payload loads, same as the value path) + the body's
+-- code_size_stream_node (sized with the binders appended to the scope) + 5
+-- (jmp end). Mirror of code_size_arms over the streaming walk.
+rule stream_size_arms
+  @intention: "Total byte count of a streamed match's arm blocks (binder loads + streamed body + jmp end)"
+  @source: vexprparse.intent:69
+  input:
+    az : ArmSizeState
+  output:
+    out : number
+  logic:
+    out = match az.arms:
+      ArmCons(vstart, vlen, binders, body, rest) => 14 * binder_list_len(binders) + code_size_stream_node(ByteGenState { node: body, src: az.src, off: 0, params: az.params, lets: lets_append_binders(AppendBindersState { lets: az.lets, bs: binders }), prog: az.prog, concepts: az.concepts }) + 5 + stream_size_arms(ArmSizeState { arms: rest, src: az.src, params: az.params, lets: az.lets, prog: az.prog, concepts: az.concepts })
+      ArmNil => 0
+  proofs:
+    purity:
+      reads : [az.arms, az.src, az.params, az.lets, az.prog, az.concepts]
+      calls : [binder_list_len, code_size_stream_node, lets_append_binders, stream_size_arms]
+    termination:
+      bound : 8000
+
+
+-- x86_stream_node: the WRITER-mode emitter. Every arm's byte count MUST equal
+-- code_size_stream_node's — the two-pass drift edge. The shared itoa call's
+-- rel32 targets blob-origin offset -86 (itoa_proc sits right before the first
+-- rule proc), so rel32 = -86 - (call_site + 5) = 0 - (off + node_size + 92)
+-- with the call at off + node_size + 1 (after the value ops and the pop).
+-- src_base for AstStr / text-param writes is the SAME 0x400000 + blob_end_off
+-- imm64 the byte_at emit loads — one definition, no drift.
+rule x86_stream_node
+  @intention: "Stream a texty subtree: write its text reading to fd 1 in order during the walk"
+  @source: vexprparse.intent:69
+  input:
+    bg : ByteGenState
+  output:
+    out : bytes
+  logic:
+    out = match bg.node:
+      AstNum(value) => concat(x86_node(bg), b"\x58\xe8", le32(0 - (bg.off + code_size_node(bg) + 92)))
+      AstBin(op, lhs, rhs) => concat(x86_node(bg), b"\x58\xe8", le32(0 - (bg.off + code_size_node(bg) + 92)))
+      AstNeg(inner) => concat(x86_node(bg), b"\x58\xe8", le32(0 - (bg.off + code_size_node(bg) + 92)))
+      AstNot(inner) => b"\xcc"
+      AstVar(start, len) => (if param_index(ParamIndexState { params: bg.params, src: bg.src, q_start: start, q_len: len, idx: 0 }) >= 0 then (if param_ty(ParamIndexState { params: bg.params, src: bg.src, q_start: start, q_len: len, idx: 0 }) == 2 then concat(b"\xff\xb5", le32(16 + 8 * (param_list_len(bg.params) - 1 - param_index(ParamIndexState { params: bg.params, src: bg.src, q_start: start, q_len: len, idx: 0 }))), b"\x58\x89\xc2\x48\xc1\xe8\x20\x48\xbe", le64(4194304 + blob_end_off(ProgGenState { rules: bg.prog, src: bg.src, off: 0, prog: bg.prog, concepts: bg.concepts })), b"\x48\x01\xc6\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05") else concat(x86_node(bg), b"\x58\xe8", le32(0 - (bg.off + code_size_node(bg) + 92)))) else if let_index(LetIndexState { binds: bg.lets, src: bg.src, q_start: start, q_len: len, idx: 0 }) >= 0 then concat(x86_node(bg), b"\x58\xe8", le32(0 - (bg.off + code_size_node(bg) + 92))) else b"\xcc")
+      AstField(base, fstart, flen) => concat(x86_node(bg), b"\x58\xe8", le32(0 - (bg.off + code_size_node(bg) + 92)))
+      AstStr(start, len) => concat(b"\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x48\xbe", le64(4194304 + blob_end_off(ProgGenState { rules: bg.prog, src: bg.src, off: 0, prog: bg.prog, concepts: bg.concepts }) + start + 1), b"\x48\xc7\xc2", le32(if len >= 2 then len - 2 else 0), b"\x0f\x05")
+      AstBool(value) => b"\xcc"
+      AstErr => b"\xcc"
+      AstVariant(cstart, clen, vstart, vlen, fields) => concat(x86_node(bg), b"\x58\xe8", le32(0 - (bg.off + code_size_node(bg) + 92)))
+      AstIf(cond, thn, els) => concat(x86_node(ByteGenState { node: cond, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }), b"\x58\x48\x85\xc0\x0f\x84", le32(code_size_stream_node(ByteGenState { node: thn, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }) + 5), x86_stream_node(ByteGenState { node: thn, src: bg.src, off: bg.off + code_size_node(ByteGenState { node: cond, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }) + 10, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }), b"\xe9", le32(code_size_stream_node(ByteGenState { node: els, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts })), x86_stream_node(ByteGenState { node: els, src: bg.src, off: bg.off + code_size_node(ByteGenState { node: cond, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }) + 15 + code_size_stream_node(ByteGenState { node: thn, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }), params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }))
+      AstMatch(scrut, arms) => concat(x86_node(ByteGenState { node: scrut, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }), b"\x58\x48\x69\xc0", le32(8 * (max_payload_fields(bg.concepts) + 1)), b"\x4c\x01\xf8\x48\x8b\x08", x86_stream_dispatch(DispatchState { arms: arms, src: bg.src, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, rest_disp: 13 * (arm_list_len(arms) - 1), pre_arms: 0 }), b"\xe9", le32(stream_size_arms(ArmSizeState { arms: arms, src: bg.src, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts })), x86_stream_arms(ArmGenState { arms: arms, src: bg.src, off: bg.off + code_size_node(ByteGenState { node: scrut, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }) + 14 + 13 * arm_list_len(arms) + 5, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }))
+      AstCall(callee_start, callee_len, args) => if span_is_concat(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then x86_stream_cargs(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }) else if span_is_substring(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then b"\xcc" else if span_is_byte_at(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then concat(x86_node(bg), b"\x58\xe8", le32(0 - (bg.off + code_size_node(bg) + 92))) else if span_is_length(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then concat(x86_node(bg), b"\x58\xe8", le32(0 - (bg.off + code_size_node(bg) + 92))) else if callee_is_texty(FindRuleState { rules: bg.prog, src: bg.src, q_start: callee_start, q_len: callee_len }) == 1 then concat(x86_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }), b"\xe8", le32(proc_offset(ProcOffState { rules: bg.prog, src: bg.src, acc: 0, q_start: callee_start, q_len: callee_len, concepts: bg.concepts }) - (bg.off + code_size_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }) + 5)), b"\x48\x81\xc4", le32(8 * arg_list_len(args))) else concat(x86_node(bg), b"\x58\xe8", le32(0 - (bg.off + code_size_node(bg) + 92)))
+  proofs:
+    purity:
+      reads : [bg, bg.node, bg.src, bg.off, bg.params, bg.lets, bg.prog, bg.concepts]
+      calls : [x86_node, code_size_node, x86_stream_node, code_size_stream_node, x86_stream_cargs, x86_stream_dispatch, x86_stream_arms, stream_size_arms, x86_args, code_size_args, param_index, param_ty, param_list_len, let_index, arm_list_len, max_payload_fields, proc_offset, arg_list_len, blob_end_off, span_is_concat, span_is_substring, span_is_byte_at, span_is_length, callee_is_texty]
+    termination:
+      bound : 8000
+
+
+-- x86_stream_cargs: stream a concat's arguments in source order — each arg
+-- writes its own text reading (text writes bytes, numbers itoa), so the concat
+-- IS just the sequence. `off` threads by each arg's stream size.
+rule x86_stream_cargs
+  @intention: "Stream a concat's argument list in source order, each arg writing its own reading"
+  @source: vexprparse.intent:69
+  input:
+    ag : ByteGenArgs
+  output:
+    out : bytes
+  logic:
+    out = match ag.args:
+      ArgCons(head, tail) => concat(x86_stream_node(ByteGenState { node: head, src: ag.src, off: ag.off, params: ag.params, lets: ag.lets, prog: ag.prog, concepts: ag.concepts }), x86_stream_cargs(ByteGenArgs { args: tail, src: ag.src, off: ag.off + code_size_stream_node(ByteGenState { node: head, src: ag.src, off: ag.off, params: ag.params, lets: ag.lets, prog: ag.prog, concepts: ag.concepts }), params: ag.params, lets: ag.lets, prog: ag.prog, concepts: ag.concepts }))
+      ArgNil => b""
+  proofs:
+    purity:
+      reads : [ag.args, ag.src, ag.off, ag.params, ag.lets, ag.prog, ag.concepts]
+      calls : [x86_stream_node, code_size_stream_node, x86_stream_cargs]
+    termination:
+      bound : 8000
+
+
+-- x86_stream_dispatch: the streamed match's cmp/je chain. Identical shape to
+-- x86_dispatch, but the default block is 5 bytes (jmp end only — a streamed
+-- default writes nothing) and the arm block sizes come from the STREAM walk:
+-- je rel = rest_disp + 5 + pre_arms.
+rule x86_stream_dispatch
+  @intention: "Emit a streamed match's tag-dispatch cmp/je chain (default block is jmp-only, 5 bytes)"
+  @source: vexprparse.intent:69
+  input:
+    ds : DispatchState
+  output:
+    out : bytes
+  logic:
+    out = match ds.arms:
+      ArmCons(vstart, vlen, binders, body, rest) => concat(b"\x48\x81\xf9", le32(arm_tag_by_name(ArmTagState { concepts: ds.concepts, src: ds.src, vstart: vstart, vlen: vlen, cidx: 0 })), b"\x0f\x84", le32(ds.rest_disp + 5 + ds.pre_arms), x86_stream_dispatch(DispatchState { arms: rest, src: ds.src, params: ds.params, lets: ds.lets, prog: ds.prog, concepts: ds.concepts, rest_disp: ds.rest_disp - 13, pre_arms: ds.pre_arms + 14 * binder_list_len(binders) + code_size_stream_node(ByteGenState { node: body, src: ds.src, off: 0, params: ds.params, lets: lets_append_binders(AppendBindersState { lets: ds.lets, bs: binders }), prog: ds.prog, concepts: ds.concepts }) + 5 }))
+      ArmNil => b""
+  proofs:
+    purity:
+      reads : [ds.arms, ds.src, ds.params, ds.lets, ds.prog, ds.concepts, ds.rest_disp, ds.pre_arms]
+      calls : [arm_tag_by_name, x86_stream_dispatch, binder_list_len, code_size_stream_node, lets_append_binders]
+    termination:
+      bound : 8000
+
+
+-- x86_stream_arms: the streamed match's arm blocks. Per arm: the binder loads
+-- (same 14-byte copies as the value path — rax still holds node_addr), the
+-- body STREAMED with the binders appended to the scope, then jmp end (rel =
+-- stream_size_arms of the remaining arms).
+rule x86_stream_arms
+  @intention: "Emit a streamed match's arm blocks: binder loads, streamed body, jmp to the match end"
+  @source: vexprparse.intent:69
+  input:
+    ag : ArmGenState
+  output:
+    out : bytes
+  logic:
+    out = match ag.arms:
+      ArmCons(vstart, vlen, binders, body, rest) => concat(x86_binder_loads(BinderLoadState { binders: binders, j: 0, base_slot: count_binds(ag.lets) }), x86_stream_node(ByteGenState { node: body, src: ag.src, off: ag.off + 14 * binder_list_len(binders), params: ag.params, lets: lets_append_binders(AppendBindersState { lets: ag.lets, bs: binders }), prog: ag.prog, concepts: ag.concepts }), b"\xe9", le32(stream_size_arms(ArmSizeState { arms: rest, src: ag.src, params: ag.params, lets: ag.lets, prog: ag.prog, concepts: ag.concepts })), x86_stream_arms(ArmGenState { arms: rest, src: ag.src, off: ag.off + 14 * binder_list_len(binders) + code_size_stream_node(ByteGenState { node: body, src: ag.src, off: 0, params: ag.params, lets: lets_append_binders(AppendBindersState { lets: ag.lets, bs: binders }), prog: ag.prog, concepts: ag.concepts }) + 5, params: ag.params, lets: ag.lets, prog: ag.prog, concepts: ag.concepts }))
+      ArmNil => b""
+  proofs:
+    purity:
+      reads : [ag.arms, ag.src, ag.off, ag.params, ag.lets, ag.prog, ag.concepts]
+      calls : [x86_binder_loads, x86_stream_node, code_size_stream_node, stream_size_arms, lets_append_binders, binder_list_len, count_binds, x86_stream_arms]
     termination:
       bound : 8000
 
@@ -16445,25 +16900,28 @@ rule program_total_size
       bound : 8000
 
 
--- blob_end_off: the file offset where the program blob ENDS = ELF headers +
--- trampoline (221) + the optional 61-byte mmap arena prologue + the blob
--- itself. Text values slice 2: this is ALSO the file offset where the embedded
--- source begins, so `src_base = 0x400000 + blob_end_off` is the COMPILE-TIME
--- imm64 x86_node's byte_at emit loads — and elf_program_src's pre-append
--- p_filesz. ONE definition for both so the two can never drift.
+-- blob_end_off: the file offset where the program blob ENDS = ELF headers (120)
+-- + the optional 61-byte mmap arena prologue + the trampoline (101 B for a
+-- number entry, 45 B for a texty entry — streaming slice) + the shared
+-- itoa_proc (86 B, present iff any rule is texty) + the blob itself. Text
+-- values slice 2: this is ALSO the file offset where the embedded source
+-- begins, so `src_base = 0x400000 + blob_end_off` is the COMPILE-TIME imm64
+-- x86_node's byte_at emit AND x86_stream_node's text writes load — and
+-- elf_program_src's pre-append p_filesz. ONE definition for all so they can
+-- never drift. A texty-free program keeps the historical 221 + arena + blob.
 rule blob_end_off
-  @intention: "File offset where the program blob ends: headers 221 + optional arena prologue 61 + blob size (= the embedded-source base)"
+  @intention: "File offset where the program blob ends: headers + arena? + trampoline variant + itoa? + blob size (= the embedded-source base)"
   @source: vexprparse.intent:66
   input:
     pg : ProgGenState
   output:
     out : number
   logic:
-    out = 221 + (if program_uses_arena(pg.concepts) == 1 then 61 else 0) + program_total_size(ProgGenState { rules: pg.rules, src: pg.src, off: 0, prog: pg.prog, concepts: pg.concepts })
+    out = 120 + (if program_uses_arena(pg.concepts) == 1 then 61 else 0) + (if entry_rule_texty(pg) == 1 then 45 else 101) + (if prog_any_texty(pg) == 1 then 86 else 0) + program_total_size(ProgGenState { rules: pg.rules, src: pg.src, off: 0, prog: pg.prog, concepts: pg.concepts })
   proofs:
     purity:
-      reads : [pg.rules, pg.src, pg.prog, pg.concepts]
-      calls : [program_uses_arena, program_total_size]
+      reads : [pg, pg.rules, pg.src, pg.prog, pg.concepts]
+      calls : [program_uses_arena, entry_rule_texty, prog_any_texty, program_total_size]
     termination:
       bound : 8000
 
@@ -16525,6 +16983,14 @@ rule src_blob
 --
 -- NATIVE-ONLY (streaming bytes). Verified by streaming_elf_prints_result: the
 -- emitted file's STDOUT (trimmed) == eval_main(program) for arbitrary i64 results.
+--
+-- STREAMING slice: when the ENTRY rule is texty (rule_is_texty), the trampoline
+-- becomes call entry ; write(1, "\n", 1) ; exit(0) — 45 B, rel32 126 (past the
+-- 86-B itoa_proc laid between the trampoline and the first rule proc). The
+-- itoa_proc (rax -> decimal on fd 1, NO newline, callee-preserves r14/r15) is
+-- emitted iff ANY rule is texty; number-only programs keep the 101-B b8
+-- trampoline with rel32 96 — byte-identical files. The embedding gate extends
+-- to `program_uses_text OR any-texty` so streamed spans always have src bytes.
 rule elf_program_src
   @intention: "Tokenize, parse a whole program, and wrap its x86-64 blob in a standalone static ELF64 executable"
   @source: vexprparse.intent:60
@@ -16537,14 +17003,16 @@ rule elf_program_src
     let prog = parse_program(ProgramState { cell: toks, src: s.source })
     let concepts = parse_concepts(ProgramState { cell: toks, src: s.source })
     let uses_var = program_uses_arena(concepts)
-    let uses_text = program_uses_text(UsesTextRules { rules: prog, src: s.source })
+    let anytx = prog_any_texty(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts })
+    let entrytx = entry_rule_texty(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts })
+    let uses_text = if program_uses_text(UsesTextRules { rules: prog, src: s.source }) == 1 then 1 else anytx
     let fsz0 = blob_end_off(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts })
     let fsz = fsz0 + (if uses_text == 1 then 4 * ((length(s.source) + 3) / 4) else 0)
-    out = concat(b"\x7f\x45\x4c\x46\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\x3e\x00\x01\x00\x00\x00\x78\x00\x40\x00\x00\x00\x00\x00\x40\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x40\x00\x38\x00\x01\x00\x00\x00\x00\x00\x00\x00", b"\x01\x00\x00\x00\x05\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x40\x00\x00\x00\x00\x00\x00\x00\x40\x00\x00\x00\x00\x00", le64(fsz), le64(fsz), b"\x00\x10\x00\x00\x00\x00\x00\x00", (if uses_var == 1 then b"\xb8\x09\x00\x00\x00\x31\xff\xbe\x00\x00\x00\x08\xba\x03\x00\x00\x00\x41\xba\x22\x00\x00\x00\x49\xc7\xc0\xff\xff\xff\xff\x45\x31\xc9\x0f\x05\x48\x3d\x01\xf0\xff\xff\x72\x0c\xbf\x01\x00\x00\x00\xb8\x3c\x00\x00\x00\x0f\x05\x49\x89\xc7\x45\x31\xf6" else b""), b"\xe8\x60\x00\x00\x00\x48\x83\xec\x20\x49\x89\xc1\x48\x8d\x74\x24\x1f\xc6\x06\x0a\x48\x85\xc0\x79\x03\x48\xf7\xd8\x48\xc7\xc1\x0a\x00\x00\x00\x48\x31\xd2\x48\xf7\xf1\x80\xc2\x30\x48\xff\xce\x88\x16\x48\x85\xc0\x75\xed\x4d\x85\xc9\x79\x06\x48\xff\xce\xc6\x06\x2d\x48\x8d\x54\x24\x20\x48\x29\xf2\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05", x86_program(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts }), (if uses_text == 1 then src_blob(SrcBlobState { src: s.source, pos: 0 }) else b""))
+    out = concat(b"\x7f\x45\x4c\x46\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\x3e\x00\x01\x00\x00\x00\x78\x00\x40\x00\x00\x00\x00\x00\x40\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x40\x00\x38\x00\x01\x00\x00\x00\x00\x00\x00\x00", b"\x01\x00\x00\x00\x05\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x40\x00\x00\x00\x00\x00\x00\x00\x40\x00\x00\x00\x00\x00", le64(fsz), le64(fsz), b"\x00\x10\x00\x00\x00\x00\x00\x00", (if uses_var == 1 then b"\xb8\x09\x00\x00\x00\x31\xff\xbe\x00\x00\x00\x08\xba\x03\x00\x00\x00\x41\xba\x22\x00\x00\x00\x49\xc7\xc0\xff\xff\xff\xff\x45\x31\xc9\x0f\x05\x48\x3d\x01\xf0\xff\xff\x72\x0c\xbf\x01\x00\x00\x00\xb8\x3c\x00\x00\x00\x0f\x05\x49\x89\xc7\x45\x31\xf6" else b""), (if entrytx == 1 then b"\xe8\x7e\x00\x00\x00\x6a\x0a\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x48\x89\xe6\x48\xc7\xc2\x01\x00\x00\x00\x0f\x05\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05" else concat(b"\xe8", le32(96 + (if anytx == 1 then 86 else 0)), b"\x48\x83\xec\x20\x49\x89\xc1\x48\x8d\x74\x24\x1f\xc6\x06\x0a\x48\x85\xc0\x79\x03\x48\xf7\xd8\x48\xc7\xc1\x0a\x00\x00\x00\x48\x31\xd2\x48\xf7\xf1\x80\xc2\x30\x48\xff\xce\x88\x16\x48\x85\xc0\x75\xed\x4d\x85\xc9\x79\x06\x48\xff\xce\xc6\x06\x2d\x48\x8d\x54\x24\x20\x48\x29\xf2\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05")), (if anytx == 1 then b"\x48\x83\xec\x28\x49\x89\xc1\x48\x8d\x74\x24\x20\x48\x85\xc0\x79\x03\x48\xf7\xd8\x48\xc7\xc1\x0a\x00\x00\x00\x48\x31\xd2\x48\xf7\xf1\x80\xc2\x30\x48\xff\xce\x88\x16\x48\x85\xc0\x75\xed\x4d\x85\xc9\x79\x06\x48\xff\xce\xc6\x06\x2d\x48\x8d\x54\x24\x20\x48\x29\xf2\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05\x48\x83\xc4\x28\xc3" else b""), x86_program(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts }), (if uses_text == 1 then src_blob(SrcBlobState { src: s.source, pos: 0 }) else b""))
   proofs:
     purity:
       reads : [s.source]
-      calls : [begin_tokenize, parse_program, parse_concepts, program_uses_arena, program_uses_text, blob_end_off, x86_program, src_blob]
+      calls : [begin_tokenize, parse_program, parse_concepts, program_uses_arena, prog_any_texty, entry_rule_texty, program_uses_text, blob_end_off, x86_program, src_blob]
     termination:
       bound : 256
 

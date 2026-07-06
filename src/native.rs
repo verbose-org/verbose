@@ -35914,4 +35914,141 @@ rule two
         for p in [cr, pur, term, em, elf] { let _ = fs::remove_file(&p); }
     }
 
+    /// STREAMING slice — the self-hosted emitter's text codegen
+    /// (docs/self-hosting-streaming-design.md). A texty rule (result = AstStr /
+    /// concat / if-match of those / call to a directly-texty rule) now emits as a
+    /// WRITER-mode proc: x86_stream_node writes bytes to fd 1 in order during the
+    /// walk (AstStr → inline write(1, src_base+start+1, len-2); number shapes →
+    /// x86_node + pop rax + call itoa_proc; text param var → unpack packed span +
+    /// write; if/match → streamed arms; texty callee → call + discard dummy), the
+    /// proc pushes a dummy 0 for the unchanged epilogue, and the ELF trampoline
+    /// for a texty ENTRY becomes call + write("\n") + exit(0) (45 B, rel32 126
+    /// past the 86-B shared itoa_proc laid before the first rule proc).
+    /// code_size_stream_node mirrors x86_stream_node arm-for-arm.
+    ///
+    /// Gates (ELF stdout vs the rope oracle's exact strings):
+    ///   * MILESTONE — compiled print_chain: seed 3 → "3+2+1+0" (the string the
+    ///     concat-slice-1 byte probes 51/43/48 spelled); seed 0 → "0"; seed 5 →
+    ///     "5+4+3+2+1+0".
+    ///   * Basics: concat("ab","cd") → abcd; concat("n=", 42) → n=42 (itoa);
+    ///     concat("t=", 0 - 7) → t=-7 (negative itoa); bare literal → lit;
+    ///     a texty rule streaming a TEXT param → hey!.
+    ///   * Refusal (v1, documented): a TEXTY callee in VALUE position
+    ///     (length(print_expr(...))) compiles to int3 — the binary traps CLEANLY
+    ///     with SIGTRAP; the SAME program still EVALS to 7 (the probe/print split).
+    ///   * Number-path pin: fact(5) still prints 120 and its ELF carries the
+    ///     original 101-byte b8 itoa trampoline byte-for-byte at offset 120 (the
+    ///     texty trampoline + itoa_proc only appear when a texty rule exists;
+    ///     byte-identity vs a 5484381 build was verified with cmp on 12 milestone
+    ///     programs during the slice).
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn streaming_text_codegen_elf_prints_bytes() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::process::ExitStatusExt;
+        use std::process::Command;
+
+        let src = fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let elf = std::env::temp_dir().join("verbosec_test_stream_elf_program_src");
+        compile_native(&program, "elf_program_src", elf.to_str().unwrap(), false, false)
+            .expect("elf_program_src must compile natively (streaming slice)");
+        let em = std::env::temp_dir().join("verbosec_test_stream_eval_main");
+        compile_native(&program, "eval_main", em.to_str().unwrap(), false, false)
+            .expect("eval_main must compile natively (streaming slice)");
+
+        // Emit the ELF for `source`, run it, return (stdout bytes, status).
+        let emit_and_run = |source: &str, tag: &str| -> (Vec<u8>, std::process::ExitStatus, Vec<u8>) {
+            let mc = Command::new(&elf).args([source, "0"]).output().expect("spawn elf_program_src");
+            assert!(mc.status.success(), "elf_program_src must exit 0 for {}; got {:?}", tag, mc.status);
+            let elf_bytes = mc.stdout;
+            assert_eq!(&elf_bytes[0..4], &[0x7f, 0x45, 0x4c, 0x46], "not ELF for {}", tag);
+            let out_path = std::env::temp_dir().join(format!("verbosec_test_stream_a_out_{}", tag));
+            fs::write(&out_path, &elf_bytes).expect("write a.out");
+            let mut perms = fs::metadata(&out_path).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&out_path, perms).expect("chmod +x");
+            let child = Command::new(&out_path).output().expect("execute emitted ELF");
+            let _ = fs::remove_file(&out_path);
+            (child.stdout, child.status, elf_bytes)
+        };
+        let expect_stdout = |source: &str, want: &str, tag: &str| {
+            let (out, status, _) = emit_and_run(source, tag);
+            assert!(status.success(), "streamed ELF for {} must exit 0; got {:?}", tag, status);
+            assert_eq!(
+                String::from_utf8_lossy(&out), want,
+                "streamed ELF stdout mismatch for {}", tag
+            );
+        };
+
+        // MILESTONE — compiled print_chain: the concat-slice-1 program with main's
+        // out swapped to the direct call. The ELF's stdout is the rope oracle's
+        // exact string, plus the trampoline's trailing newline.
+        let print_chain = |n: u32| -> String {
+            format!(
+                "concept_group G [max_depth: 64, max_nodes: 4096]\n  concept Expr\n    variants:\n      Int of (v : number)\n      Add of (lhs : Expr, rhs : Expr)\nconcept Seed\n  fields:\n    n : number\nrule main\n  logic:\n    out = print_expr(build_chain(Seed {{ n: {n} }}))\nrule build_chain(s : Seed)\n  logic:\n    out = if s.n == 0 then Expr::Int {{ v: 0 }} else Expr::Add {{ lhs: Expr::Int {{ v: s.n }}, rhs: build_chain(Seed {{ n: s.n - 1 }}) }}\nrule print_expr(e : Expr)\n  logic:\n    out = match e: Int(v) => concat(v)  Add(l, r) => concat(print_expr(l), \"+\", print_expr(r))"
+            )
+        };
+        expect_stdout(&print_chain(3), "3+2+1+0\n", "pc3");
+        expect_stdout(&print_chain(0), "0\n", "pc0");
+        expect_stdout(&print_chain(5), "5+4+3+2+1+0\n", "pc5");
+
+        // Basics: literals, itoa (incl. negative), bare literal, text param.
+        expect_stdout("rule main\n  logic:\n    out = concat(\"ab\", \"cd\")", "abcd\n", "abcd");
+        expect_stdout("rule main\n  logic:\n    out = concat(\"n=\", 42)", "n=42\n", "n42");
+        expect_stdout("rule main\n  logic:\n    out = concat(\"t=\", 0 - 7)", "t=-7\n", "tneg7");
+        expect_stdout("rule main\n  logic:\n    out = \"lit\"", "lit\n", "lit");
+        expect_stdout(
+            "rule main\n  logic:\n    out = shout(\"hey\")\nrule shout(w : text)\n  logic:\n    out = concat(w, \"!\")",
+            "hey!\n", "textparam"
+        );
+
+        // Refusal (v1): a texty callee in VALUE position compiles to int3 — the
+        // binary traps with SIGTRAP, never emits garbage. The SAME program still
+        // EVALS to 7 via eval_main (the probe/print split holds).
+        let refusal = print_chain(3).replace(
+            "out = print_expr(build_chain(Seed { n: 3 }))",
+            "out = length(print_expr(build_chain(Seed { n: 3 })))",
+        );
+        let (_, status, _) = emit_and_run(&refusal, "refusal");
+        assert_eq!(
+            status.signal(), Some(5),
+            "texty callee in value position must trap with SIGTRAP (int3); got {:?}", status
+        );
+        let ev = Command::new(&em).args([refusal.as_str(), "0"]).output().expect("spawn eval_main");
+        assert!(ev.status.success(), "eval_main must exit 0 for the refusal program");
+        assert_eq!(
+            String::from_utf8_lossy(&ev.stdout).trim(), "7",
+            "the refusal program still evals to 7 (probe/print split)"
+        );
+
+        // Number-path pin: a texty-free program keeps the original b8 itoa
+        // trampoline byte-for-byte at offset 120 (rel32 96, no itoa_proc shift).
+        const NUMBER_TRAMPOLINE: [u8; 101] = [
+            0xe8, 0x60, 0x00, 0x00, 0x00, 0x48, 0x83, 0xec, 0x20, 0x49, 0x89, 0xc1, 0x48, 0x8d,
+            0x74, 0x24, 0x1f, 0xc6, 0x06, 0x0a, 0x48, 0x85, 0xc0, 0x79, 0x03, 0x48, 0xf7, 0xd8,
+            0x48, 0xc7, 0xc1, 0x0a, 0x00, 0x00, 0x00, 0x48, 0x31, 0xd2, 0x48, 0xf7, 0xf1, 0x80,
+            0xc2, 0x30, 0x48, 0xff, 0xce, 0x88, 0x16, 0x48, 0x85, 0xc0, 0x75, 0xed, 0x4d, 0x85,
+            0xc9, 0x79, 0x06, 0x48, 0xff, 0xce, 0xc6, 0x06, 0x2d, 0x48, 0x8d, 0x54, 0x24, 0x20,
+            0x48, 0x29, 0xf2, 0x48, 0xc7, 0xc0, 0x01, 0x00, 0x00, 0x00, 0x48, 0xc7, 0xc7, 0x01,
+            0x00, 0x00, 0x00, 0x0f, 0x05, 0x48, 0xc7, 0xc0, 0x3c, 0x00, 0x00, 0x00, 0x48, 0x31,
+            0xff, 0x0f, 0x05,
+        ];
+        let fact = "rule main\n  logic:\n    out = fact(5)\nrule fact(n)\n  logic:\n    out = if n == 0 then 1 else n * fact(n - 1)";
+        let (out, status, elf_bytes) = emit_and_run(fact, "fact5pin");
+        assert!(status.success(), "fact(5) ELF must still exit 0");
+        assert_eq!(String::from_utf8_lossy(&out), "120\n", "fact(5) ELF must still print 120");
+        assert_eq!(
+            &elf_bytes[120..221], &NUMBER_TRAMPOLINE[..],
+            "texty-free ELF must keep the original 101-byte number trampoline at offset 120"
+        );
+
+        let _ = fs::remove_file(elf);
+        let _ = fs::remove_file(em);
+    }
+
 }
