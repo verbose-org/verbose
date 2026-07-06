@@ -35177,6 +35177,127 @@ rule two
         let _ = std::fs::remove_file(&em);
     }
 
+    /// Concat arc slice 1: the self-hosted interpreter evaluates `concat(...)` as a
+    /// ROPE — a new Value variant `VConcat(left, right)` whose leaves are existing
+    /// spans (VText, zero copy) and numbers (VNum, read through their decimal
+    /// rendering). Never materialized: `length` walks the tree (vlength — VNum is
+    /// its decimal digit count, '-' included), `byte_at` descends it (vbyte_at —
+    /// left when the index falls inside the left length, else right shifted down;
+    /// a VNum leaf renders digit bytes via divide-by-10 recursion). prim_concat is
+    /// n-ary and folds the evaluated args into RIGHT-NESTED VConcats terminated by
+    /// an empty VText, so a single number arg is still wrapped and reads as decimal
+    /// text. substring on a rope stays refused semantics (defensive VNum 0). All
+    /// total, all defensive — OOB/negative indices return 0, never abort.
+    ///
+    /// Gates:
+    ///   * MILESTONE — print_chain's shape evaluates byte-exact: the sum_chain AST
+    ///     builder + recursive printer (`Int(v) => concat(v) ; Add(l, r) =>
+    ///     concat(print_expr(l), "+", print_expr(r))`) gives
+    ///     length(print_expr(build_chain(Seed{n:3}))) -> 7 ("3+2+1+0"), and byte
+    ///     probes on the same rope read 51 ('3') at 0, 43 ('+') at 1, 48 ('0') at 6.
+    ///   * basics: length/byte_at on concat of literals; number args 42 / -7 / 0 /
+    ///     345 byte-by-byte (the digit math edge cases); nesting (rope depth >= 3);
+    ///     OOB on a rope -> 0 with exit 0.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn concat_slice1_rope_values_print_chain_shape() {
+        let src = std::fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let em = std::env::temp_dir().join("verbosec_test_concat1_eval_main");
+        compile_native(&program, "eval_main", em.to_str().unwrap(), false, false)
+            .expect("eval_main must compile natively (concat arc slice 1)");
+
+        let run = |source: &str| -> i64 {
+            let r = std::process::Command::new(&em)
+                .arg(source)
+                .arg("0")
+                .output()
+                .expect("spawn eval_main");
+            assert!(
+                r.status.success(),
+                "eval_main must exit 0 for {:?}; got {:?}",
+                source, r.status
+            );
+            String::from_utf8_lossy(&r.stdout)
+                .trim()
+                .parse::<i64>()
+                .unwrap_or_else(|_| panic!("eval_main produced non-number for {:?}: {:?}", source, r.stdout))
+        };
+
+        // MILESTONE: print_chain's shape — the sum_chain AST + recursive printer,
+        // composed by a driver main. The rope for seed 3 reads "3+2+1+0" (7 bytes)
+        // without ever materializing the string.
+        let print_chain = |probe: &str| -> String {
+            format!(
+                "concept_group G [max_depth: 64, max_nodes: 4096]\n  concept Expr\n    variants:\n      Int of (v : number)\n      Add of (lhs : Expr, rhs : Expr)\nconcept Seed\n  fields:\n    n : number\nrule main\n  logic:\n    out = {probe}\nrule build_chain(s : Seed)\n  logic:\n    out = if s.n == 0 then Expr::Int {{ v: 0 }} else Expr::Add {{ lhs: Expr::Int {{ v: s.n }}, rhs: build_chain(Seed {{ n: s.n - 1 }}) }}\nrule print_expr(e : Expr)\n  logic:\n    out = match e: Int(v) => concat(v)  Add(l, r) => concat(print_expr(l), \"+\", print_expr(r))"
+            )
+        };
+        assert_eq!(
+            run(&print_chain("length(print_expr(build_chain(Seed { n: 3 })))")),
+            7,
+            "concat 1 MILESTONE: length of the seed-3 rope -> 7 (\"3+2+1+0\")"
+        );
+        assert_eq!(
+            run(&print_chain("byte_at(print_expr(build_chain(Seed { n: 3 })), 0)")),
+            51,
+            "concat 1: rope byte 0 -> '3' (51)"
+        );
+        assert_eq!(
+            run(&print_chain("byte_at(print_expr(build_chain(Seed { n: 3 })), 1)")),
+            43,
+            "concat 1: rope byte 1 -> '+' (43)"
+        );
+        assert_eq!(
+            run(&print_chain("byte_at(print_expr(build_chain(Seed { n: 3 })), 6)")),
+            48,
+            "concat 1: rope byte 6 -> '0' (48)"
+        );
+
+        // Basics: text leaves.
+        let one = |body: &str| format!("rule main\n  logic:\n    out = {body}");
+        assert_eq!(run(&one("length(concat(\"ab\", \"cd\"))")), 4,
+            "concat 1: length(concat(\"ab\", \"cd\")) -> 4");
+        assert_eq!(run(&one("byte_at(concat(\"ab\", \"cd\"), 2)")), 99,
+            "concat 1: byte 2 crosses into the right leaf -> 'c' (99)");
+
+        // Number leaves — the digit math, byte-by-byte (42, -7, 0, 345).
+        assert_eq!(run(&one("length(concat(42))")), 2, "concat 1: length(concat(42)) -> 2");
+        assert_eq!(run(&one("byte_at(concat(42), 0)")), 52, "concat 1: '4' (52)");
+        assert_eq!(run(&one("byte_at(concat(42), 1)")), 50, "concat 1: '2' (50)");
+        assert_eq!(run(&one("length(concat(0 - 7))")), 2, "concat 1: length(concat(-7)) -> 2");
+        assert_eq!(run(&one("byte_at(concat(0 - 7), 0)")), 45, "concat 1: '-' (45)");
+        assert_eq!(run(&one("byte_at(concat(0 - 7), 1)")), 55, "concat 1: '7' (55)");
+        assert_eq!(run(&one("length(concat(0))")), 1, "concat 1: length(concat(0)) -> 1");
+        assert_eq!(run(&one("byte_at(concat(0), 0)")), 48, "concat 1: '0' (48)");
+        assert_eq!(run(&one("length(concat(345))")), 3, "concat 1: length(concat(345)) -> 3");
+        assert_eq!(run(&one("byte_at(concat(345), 0)")), 51, "concat 1: '3' (51)");
+        assert_eq!(run(&one("byte_at(concat(345), 1)")), 52, "concat 1: '4' (52)");
+        assert_eq!(run(&one("byte_at(concat(345), 2)")), 53, "concat 1: '5' (53)");
+
+        // Nesting: a rope of ropes (depth >= 3) probes correctly at every position.
+        assert_eq!(run(&one("length(concat(concat(\"a\", \"bc\"), concat(\"d\")))")), 4,
+            "concat 1: nested rope length -> 4");
+        assert_eq!(run(&one("byte_at(concat(concat(\"a\", \"bc\"), concat(\"d\")), 0)")), 97,
+            "concat 1: nested byte 0 -> 'a'");
+        assert_eq!(run(&one("byte_at(concat(concat(\"a\", \"bc\"), concat(\"d\")), 1)")), 98,
+            "concat 1: nested byte 1 -> 'b'");
+        assert_eq!(run(&one("byte_at(concat(concat(\"a\", \"bc\"), concat(\"d\")), 2)")), 99,
+            "concat 1: nested byte 2 -> 'c'");
+        assert_eq!(run(&one("byte_at(concat(concat(\"a\", \"bc\"), concat(\"d\")), 3)")), 100,
+            "concat 1: nested byte 3 -> 'd' (crosses into the right sub-rope)");
+
+        // Defensive: OOB and negative indices on a rope return 0, exit 0 — no abort.
+        assert_eq!(run(&one("byte_at(concat(\"ab\"), 99)")), 0,
+            "concat 1: OOB rope index -> defensive 0, no abort");
+        assert_eq!(run(&one("byte_at(concat(\"ab\"), 0 - 3)")), 0,
+            "concat 1: negative rope index -> defensive 0, no abort");
+
+        let _ = std::fs::remove_file(&em);
+    }
+
     /// Text values arc slice 2 — text CODEGEN (packed spans + embedded source).
     /// The self-hosted emitter now COMPILES text: an `AstStr` lowers to ONE packed
     /// i64 push (`(start+1)*2^32 | (len-2)`, quotes stripped — the SAME numbers as
@@ -35791,6 +35912,143 @@ rule two
         }
 
         for p in [cr, pur, term, em, elf] { let _ = fs::remove_file(&p); }
+    }
+
+    /// STREAMING slice — the self-hosted emitter's text codegen
+    /// (docs/self-hosting-streaming-design.md). A texty rule (result = AstStr /
+    /// concat / if-match of those / call to a directly-texty rule) now emits as a
+    /// WRITER-mode proc: x86_stream_node writes bytes to fd 1 in order during the
+    /// walk (AstStr → inline write(1, src_base+start+1, len-2); number shapes →
+    /// x86_node + pop rax + call itoa_proc; text param var → unpack packed span +
+    /// write; if/match → streamed arms; texty callee → call + discard dummy), the
+    /// proc pushes a dummy 0 for the unchanged epilogue, and the ELF trampoline
+    /// for a texty ENTRY becomes call + write("\n") + exit(0) (45 B, rel32 126
+    /// past the 86-B shared itoa_proc laid before the first rule proc).
+    /// code_size_stream_node mirrors x86_stream_node arm-for-arm.
+    ///
+    /// Gates (ELF stdout vs the rope oracle's exact strings):
+    ///   * MILESTONE — compiled print_chain: seed 3 → "3+2+1+0" (the string the
+    ///     concat-slice-1 byte probes 51/43/48 spelled); seed 0 → "0"; seed 5 →
+    ///     "5+4+3+2+1+0".
+    ///   * Basics: concat("ab","cd") → abcd; concat("n=", 42) → n=42 (itoa);
+    ///     concat("t=", 0 - 7) → t=-7 (negative itoa); bare literal → lit;
+    ///     a texty rule streaming a TEXT param → hey!.
+    ///   * Refusal (v1, documented): a TEXTY callee in VALUE position
+    ///     (length(print_expr(...))) compiles to int3 — the binary traps CLEANLY
+    ///     with SIGTRAP; the SAME program still EVALS to 7 (the probe/print split).
+    ///   * Number-path pin: fact(5) still prints 120 and its ELF carries the
+    ///     original 101-byte b8 itoa trampoline byte-for-byte at offset 120 (the
+    ///     texty trampoline + itoa_proc only appear when a texty rule exists;
+    ///     byte-identity vs a 5484381 build was verified with cmp on 12 milestone
+    ///     programs during the slice).
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn streaming_text_codegen_elf_prints_bytes() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::process::ExitStatusExt;
+        use std::process::Command;
+
+        let src = fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let elf = std::env::temp_dir().join("verbosec_test_stream_elf_program_src");
+        compile_native(&program, "elf_program_src", elf.to_str().unwrap(), false, false)
+            .expect("elf_program_src must compile natively (streaming slice)");
+        let em = std::env::temp_dir().join("verbosec_test_stream_eval_main");
+        compile_native(&program, "eval_main", em.to_str().unwrap(), false, false)
+            .expect("eval_main must compile natively (streaming slice)");
+
+        // Emit the ELF for `source`, run it, return (stdout bytes, status).
+        let emit_and_run = |source: &str, tag: &str| -> (Vec<u8>, std::process::ExitStatus, Vec<u8>) {
+            let mc = Command::new(&elf).args([source, "0"]).output().expect("spawn elf_program_src");
+            assert!(mc.status.success(), "elf_program_src must exit 0 for {}; got {:?}", tag, mc.status);
+            let elf_bytes = mc.stdout;
+            assert_eq!(&elf_bytes[0..4], &[0x7f, 0x45, 0x4c, 0x46], "not ELF for {}", tag);
+            let out_path = std::env::temp_dir().join(format!("verbosec_test_stream_a_out_{}", tag));
+            fs::write(&out_path, &elf_bytes).expect("write a.out");
+            let mut perms = fs::metadata(&out_path).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&out_path, perms).expect("chmod +x");
+            let child = Command::new(&out_path).output().expect("execute emitted ELF");
+            let _ = fs::remove_file(&out_path);
+            (child.stdout, child.status, elf_bytes)
+        };
+        let expect_stdout = |source: &str, want: &str, tag: &str| {
+            let (out, status, _) = emit_and_run(source, tag);
+            assert!(status.success(), "streamed ELF for {} must exit 0; got {:?}", tag, status);
+            assert_eq!(
+                String::from_utf8_lossy(&out), want,
+                "streamed ELF stdout mismatch for {}", tag
+            );
+        };
+
+        // MILESTONE — compiled print_chain: the concat-slice-1 program with main's
+        // out swapped to the direct call. The ELF's stdout is the rope oracle's
+        // exact string, plus the trampoline's trailing newline.
+        let print_chain = |n: u32| -> String {
+            format!(
+                "concept_group G [max_depth: 64, max_nodes: 4096]\n  concept Expr\n    variants:\n      Int of (v : number)\n      Add of (lhs : Expr, rhs : Expr)\nconcept Seed\n  fields:\n    n : number\nrule main\n  logic:\n    out = print_expr(build_chain(Seed {{ n: {n} }}))\nrule build_chain(s : Seed)\n  logic:\n    out = if s.n == 0 then Expr::Int {{ v: 0 }} else Expr::Add {{ lhs: Expr::Int {{ v: s.n }}, rhs: build_chain(Seed {{ n: s.n - 1 }}) }}\nrule print_expr(e : Expr)\n  logic:\n    out = match e: Int(v) => concat(v)  Add(l, r) => concat(print_expr(l), \"+\", print_expr(r))"
+            )
+        };
+        expect_stdout(&print_chain(3), "3+2+1+0\n", "pc3");
+        expect_stdout(&print_chain(0), "0\n", "pc0");
+        expect_stdout(&print_chain(5), "5+4+3+2+1+0\n", "pc5");
+
+        // Basics: literals, itoa (incl. negative), bare literal, text param.
+        expect_stdout("rule main\n  logic:\n    out = concat(\"ab\", \"cd\")", "abcd\n", "abcd");
+        expect_stdout("rule main\n  logic:\n    out = concat(\"n=\", 42)", "n=42\n", "n42");
+        expect_stdout("rule main\n  logic:\n    out = concat(\"t=\", 0 - 7)", "t=-7\n", "tneg7");
+        expect_stdout("rule main\n  logic:\n    out = \"lit\"", "lit\n", "lit");
+        expect_stdout(
+            "rule main\n  logic:\n    out = shout(\"hey\")\nrule shout(w : text)\n  logic:\n    out = concat(w, \"!\")",
+            "hey!\n", "textparam"
+        );
+
+        // Refusal (v1): a texty callee in VALUE position compiles to int3 — the
+        // binary traps with SIGTRAP, never emits garbage. The SAME program still
+        // EVALS to 7 via eval_main (the probe/print split holds).
+        let refusal = print_chain(3).replace(
+            "out = print_expr(build_chain(Seed { n: 3 }))",
+            "out = length(print_expr(build_chain(Seed { n: 3 })))",
+        );
+        let (_, status, _) = emit_and_run(&refusal, "refusal");
+        assert_eq!(
+            status.signal(), Some(5),
+            "texty callee in value position must trap with SIGTRAP (int3); got {:?}", status
+        );
+        let ev = Command::new(&em).args([refusal.as_str(), "0"]).output().expect("spawn eval_main");
+        assert!(ev.status.success(), "eval_main must exit 0 for the refusal program");
+        assert_eq!(
+            String::from_utf8_lossy(&ev.stdout).trim(), "7",
+            "the refusal program still evals to 7 (probe/print split)"
+        );
+
+        // Number-path pin: a texty-free program keeps the original b8 itoa
+        // trampoline byte-for-byte at offset 120 (rel32 96, no itoa_proc shift).
+        const NUMBER_TRAMPOLINE: [u8; 101] = [
+            0xe8, 0x60, 0x00, 0x00, 0x00, 0x48, 0x83, 0xec, 0x20, 0x49, 0x89, 0xc1, 0x48, 0x8d,
+            0x74, 0x24, 0x1f, 0xc6, 0x06, 0x0a, 0x48, 0x85, 0xc0, 0x79, 0x03, 0x48, 0xf7, 0xd8,
+            0x48, 0xc7, 0xc1, 0x0a, 0x00, 0x00, 0x00, 0x48, 0x31, 0xd2, 0x48, 0xf7, 0xf1, 0x80,
+            0xc2, 0x30, 0x48, 0xff, 0xce, 0x88, 0x16, 0x48, 0x85, 0xc0, 0x75, 0xed, 0x4d, 0x85,
+            0xc9, 0x79, 0x06, 0x48, 0xff, 0xce, 0xc6, 0x06, 0x2d, 0x48, 0x8d, 0x54, 0x24, 0x20,
+            0x48, 0x29, 0xf2, 0x48, 0xc7, 0xc0, 0x01, 0x00, 0x00, 0x00, 0x48, 0xc7, 0xc7, 0x01,
+            0x00, 0x00, 0x00, 0x0f, 0x05, 0x48, 0xc7, 0xc0, 0x3c, 0x00, 0x00, 0x00, 0x48, 0x31,
+            0xff, 0x0f, 0x05,
+        ];
+        let fact = "rule main\n  logic:\n    out = fact(5)\nrule fact(n)\n  logic:\n    out = if n == 0 then 1 else n * fact(n - 1)";
+        let (out, status, elf_bytes) = emit_and_run(fact, "fact5pin");
+        assert!(status.success(), "fact(5) ELF must still exit 0");
+        assert_eq!(String::from_utf8_lossy(&out), "120\n", "fact(5) ELF must still print 120");
+        assert_eq!(
+            &elf_bytes[120..221], &NUMBER_TRAMPOLINE[..],
+            "texty-free ELF must keep the original 101-byte number trampoline at offset 120"
+        );
+
+        let _ = fs::remove_file(elf);
+        let _ = fs::remove_file(em);
     }
 
 }

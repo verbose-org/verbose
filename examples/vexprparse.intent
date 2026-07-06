@@ -1694,3 +1694,46 @@ rd_params / rd_input directly.
 -- recursion -> stack overflow). skip_field_range + skip_range_body skip an
 -- optional bracketed range after a field's type — a faithful skip (ranges stay
 -- verifier material), guarded total on an unterminated bracket.
+
+----------------------------------------------------------------------------
+Concat arc, slice 1 (intent entry 68): concat VALUES in the self-hosted
+interpreter via ROPES — fresh text with zero heap, never materialized.
+
+concat builds FRESH text; a span (start, len) into the source cannot represent
+it — that is why every text slice so far refused it. But fresh text does not
+need fresh STORAGE if it is never materialized: a new Value variant
+VConcat(left, right) is a ROPE — a tree value whose leaves are existing spans
+(VText — zero copy) and numbers (VNum — read through its decimal rendering).
+This is verbosec's own streaming-emitter insight (never materialize, walk in
+order) applied to the interpreter's VALUE model; the rope is built of arena
+nodes the Value group already provides.
+
+Dispatch: span_is_concat joins the primitive family in eval_ast_env's AstCall
+arm (byte-compare, before eval_call, reserved name). prim_concat is n-ary:
+each argument evaluates against the caller's env, and the results fold into
+RIGHT-NESTED VConcats terminated by an empty VText(0, 0) — 0 args -> the empty
+text, 1 arg -> VConcat(v, empty) (wrapped deliberately, so a single NUMBER
+argument uniformly gets decimal-text semantics: concat(42) has length 2,
+bytes '4' '2' — exactly print_chain's `Int(v) => concat(v)`).
+
+The primitives learn ropes through two shared value-level walkers. vlength:
+VText -> len; VNum -> decimal digit count (+1 for '-' when negative);
+VConcat -> vlength(left) + vlength(right); VData -> 0. vbyte_at: VText -> the
+bounds-guarded host byte_at on the interpreted source (pre-rope semantics,
+verbatim); VNum -> the i-th byte of the decimal rendering ('-' at 0 for
+negatives, then digit-at-position via divide-by-10 recursion — mag_digits /
+mag_digit_at over a nonnegative magnitude); VConcat -> descend left when i
+falls inside the left length, else right with i shifted down (vlength
+recomputed per descent — O(depth * size) worst case, fine for the interpreter
+tier). All total, all defensive: any out-of-range or negative index bottoms
+out at a leaf guard and returns 0, never aborts. substring on a rope or a
+number stays REFUSED semantics (defensive VNum 0) — the emitters tier never
+re-slices built text.
+
+The milestone: print_chain's shape is now evaluable, byte-exact —
+length(print_expr(build_chain(Seed { n: 3 }))) -> 7 ("3+2+1+0"), and byte
+probes on the same rope read 51 ('3') at 0, 43 ('+') at 1, 48 ('0') at 6,
+without ever materializing the string. After this slice the interpreter
+oracle covers the emitters tier's core shape; rendering a rope to stdout is
+the compiled-side STREAMING lowering (its own slice), and concat CODEGEN in
+x86_node is deferred to it.
