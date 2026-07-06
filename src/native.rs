@@ -36010,6 +36010,25 @@ rule two
         assert_eq!(compiled, oracle,
             "verbatim shape_ast over the full VExpr group: compiled ELF must match the interpreter");
 
+        // Multi-rule self-fragment: let_index (matches on Binding, recursively CALLS
+        // name_eq) + name_eq, over the full group. The driver's spans index the
+        // program's OWN source text — which works compiled precisely because the
+        // text-codegen slice embeds the source in the ELF.
+        let li_concept = block(
+            &|l| l.starts_with("concept LetIndexState"),
+            &|l| l.starts_with("rule ") || l.starts_with("concept ") || l.starts_with("-- "),
+        );
+        let li_rule = block(
+            &|l| l.starts_with("rule let_index"),
+            &|l| l.starts_with("rule ") || l.starts_with("concept ") || l.starts_with("-- "),
+        );
+        let li = format!(
+            "rule main\n  logic:\n    let binds = Binding::BCons {{ name_start: 0, name_len: 2, value: Ast::AstNum {{ value: 1 }}, rest: Binding::BCons {{ name_start: 3, name_len: 2, value: Ast::AstNum {{ value: 2 }}, rest: Binding::BNil }} }}\n    out = let_index(LetIndexState {{ binds: binds, src: \"xx\", q_start: 3, q_len: 2, idx: 0 }})\n\n{}\n\n{}\n\n{}\n\n{}\n\n{}",
+            group, name_eq_concept, name_eq_rule, li_concept, li_rule);
+        assert_eq!(run(&em, &li), 1, "verbatim let_index+name_eq: second binding matches (eval)");
+        assert_eq!(run_compiled(&li, "let_index"), 1,
+            "verbatim let_index+name_eq: multi-rule self-fragment compiled ELF matches");
+
         let _ = fs::remove_file(&em);
         let _ = fs::remove_file(&elf);
     }
