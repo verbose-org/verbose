@@ -7060,8 +7060,58 @@ rule fields_cons
       bound : 16
 
 
+-- skip_field_range (verbatim-source probe, 2026-07-06): a REAL field declaration may
+-- carry a range after its type — `pos : number [0, 256]` or `source : text [..256]`.
+-- parse_fields consumed exactly `name : type` (3 tokens) per field, so a range ENDED
+-- the field list early (silently dropping later fields) and left the concept walk
+-- standing inside `[..256]`, whose `.` tokens (op 12) drove a no-advance infinite
+-- recursion -> stack overflow. This helper skips an optional bracketed range: on `[`
+-- (op 25), scan to the matching `]` (op 26) and land one past it; anything else
+-- returns the cell unchanged. Ranges stay verifier material (the toy checker does not
+-- exploit them yet) — this is a faithful SKIP, mirroring R2's attribute skipping.
+rule skip_field_range
+  @intention: "Skip an optional bracketed field range after a field's type, landing past the closing bracket"
+  @source: vexprparse.intent:1688
+  input:
+    st : ParseState
+  output:
+    out : TokenList
+  logic:
+    let isopen = if peek_op_code(st.cell) == 25 then 1 else 0
+    out = if isopen == 1 then skip_range_body(ParseState { cell: advance(Advance { lst: st.cell, k: 1 }) }) else st.cell
+  proofs:
+    purity:
+      reads : [st.cell]
+      calls : [peek_op_code, skip_range_body, advance]
+    termination:
+      bound : 512
+
+
+-- skip_range_body: advance token by token until the closing `]` (op 26), returning
+-- the cell one past it. Guarded on Eof (peek_kind 0) so an unterminated `[` is total
+-- (returns the end cell) instead of recursing forever. Forward scan; bound + the
+-- mandatory recursion breadcrumb (backstop: the finite token list).
+rule skip_range_body
+  @intention: "Scan forward to the closing bracket of a field range, landing one past it"
+  @source: vexprparse.intent:1688
+  input:
+    st : ParseState
+  output:
+    out : TokenList
+  logic:
+    let isclose = if peek_op_code(st.cell) == 26 then 1 else 0
+    let iseof = if peek_kind(st.cell) == 0 then 1 else 0
+    out = if isclose == 1 then advance(Advance { lst: st.cell, k: 1 }) else if iseof == 1 then st.cell else skip_range_body(ParseState { cell: advance(Advance { lst: st.cell, k: 1 }) })
+  proofs:
+    purity:
+      reads : [st.cell]
+      calls : [peek_op_code, peek_kind, skip_range_body, advance]
+    termination:
+      bound : 512
+
+
 rule parse_fields
-  @intention: "Parse the body of a fields: block into a FieldList + its end cell (one FCons per IDENT : TYPE line)"
+  @intention: "Parse the body of a fields: block into a FieldList + its end cell (one FCons per IDENT : TYPE line, optional [range] skipped)"
   @source: vexprparse.intent:62
   input:
     fp : FieldParseState
@@ -7076,11 +7126,11 @@ rule parse_fields
     let ty_start = peek_start(advance(Advance { lst: hp, k: 2 }))
     let ty_len = peek_len(advance(Advance { lst: hp, k: 2 }))
     let ty = type_code_of_span(SpanCheck { src: fp.src, start: ty_start, len: ty_len })
-    out = if is_field == 1 then fields_cons(FieldConsState { head_start: name_start, head_len: name_len, head_ty: ty, head_ty_start: ty_start, head_ty_len: ty_len, rest: parse_fields(FieldParseState { cell: advance(Advance { lst: hp, k: 3 }), src: fp.src }) }) else ParsedFields::MkPF { fields: FieldList::FNil, next: hp }
+    out = if is_field == 1 then fields_cons(FieldConsState { head_start: name_start, head_len: name_len, head_ty: ty, head_ty_start: ty_start, head_ty_len: ty_len, rest: parse_fields(FieldParseState { cell: skip_field_range(ParseState { cell: advance(Advance { lst: hp, k: 3 }) }), src: fp.src }) }) else ParsedFields::MkPF { fields: FieldList::FNil, next: hp }
   proofs:
     purity:
       reads : [fp.cell, fp.src]
-      calls : [skip_seps, peek_kind, peek_start, peek_len, type_code_of_span, parse_fields, fields_cons, advance]
+      calls : [skip_seps, peek_kind, peek_start, peek_len, type_code_of_span, parse_fields, fields_cons, skip_field_range, advance]
     termination:
       bound : 512
 

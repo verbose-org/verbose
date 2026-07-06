@@ -35632,4 +35632,85 @@ rule two
         let _ = fs::remove_file(&term);
     }
 
+    /// THE self-hosting milestone: the VERBATIM text of examples/scan_word.verbose —
+    /// a real, shipped source file (with its @verbose header, @intention/@source
+    /// attribute lines, field ranges `text [..256]` / `number [0, 256]`, an `and`
+    /// condition, and full purity + increasing proofs) — goes through the COMPLETE
+    /// self-hosted pipeline unmodified: parse (count_rules 1), purity 0, termination
+    /// 0, eval 5, and COMPILES to a standalone ELF printing 5. The field-range fix
+    /// (skip_field_range) is what unlocked this: parse_fields previously ended the
+    /// field list at a range bracket, silently dropping later fields, and the `.`
+    /// tokens of `[..256]` drove the concept walk into a no-advance infinite
+    /// recursion (stack overflow). Eval/compile use the verbatim file with a driver
+    /// `main` PREPENDED (the drivers evaluate the first rule; the scan_word text
+    /// itself is untouched).
+    #[test]
+    fn verbatim_scan_word_source_compiles_through_self_hosted_pipeline() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        let compiler_src = fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&compiler_src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let verbatim = fs::read_to_string("examples/scan_word.verbose")
+            .expect("examples/scan_word.verbose must exist (the real self-source file)");
+
+        let mk = |rule: &str, tag: &str| -> std::path::PathBuf {
+            let p = std::env::temp_dir().join(format!("verbosec_test_verbatim_{}", tag));
+            compile_native(&program, rule, p.to_str().unwrap(), false, false)
+                .unwrap_or_else(|e| panic!("{} must compile natively: {}", rule, e));
+            p
+        };
+        let cr = mk("count_rules", "count_rules");
+        let pur = mk("count_purity_errors", "purity");
+        let term = mk("count_term_errors", "term");
+        let em = mk("eval_main", "eval");
+        let elf = mk("elf_program_src", "elf");
+
+        let run = |bin: &std::path::Path, source: &str| -> i64 {
+            let r = Command::new(bin).arg(source).arg("0").output().expect("spawn");
+            assert!(r.status.success(), "{:?} must exit 0; got {:?}", bin, r.status);
+            String::from_utf8_lossy(&r.stdout).trim().parse::<i64>()
+                .unwrap_or_else(|_| panic!("{:?} produced non-number: {:?}", bin, r.stdout))
+        };
+
+        // Stages 1-2: the verbatim file, byte-for-byte as shipped.
+        assert_eq!(run(&cr, &verbatim), 1, "verbatim scan_word: parses (1 rule)");
+        assert_eq!(run(&pur, &verbatim), 0, "verbatim scan_word: purity proof verifies");
+        assert_eq!(run(&term, &verbatim), 0, "verbatim scan_word: increasing proof verifies");
+
+        // Stages 3-4: driver main prepended; the scan_word text itself untouched.
+        let driven = format!(
+            "rule main\n  logic:\n    out = word_length(ScanState {{ source: \"hello world\", pos: 0 }})\n\n{}",
+            verbatim
+        );
+        assert_eq!(run(&em, &driven), 5, "verbatim scan_word: interprets to 5");
+
+        let mc = Command::new(&elf).args([driven.as_str(), "0"]).output().expect("spawn elf gen");
+        assert!(mc.status.success(), "elf_program_src must exit 0 on the verbatim file");
+        let out_path = std::env::temp_dir().join("verbosec_test_verbatim_a_out");
+        fs::write(&out_path, &mc.stdout).expect("write a.out");
+        let mut perms = fs::metadata(&out_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&out_path, perms).expect("chmod +x");
+        let child = Command::new(&out_path).output().expect("execute emitted ELF");
+        assert!(child.status.success(),
+            "the ELF compiled from the verbatim self-source must exit 0 (pre-fix: SIGSEGV via the [..256] range); got {:?}",
+            child.status);
+        assert_eq!(String::from_utf8_lossy(&child.stdout).trim(), "5",
+            "the ELF compiled from the verbatim self-source must print 5");
+
+        // The field-range fix in isolation: a range on the FIRST field previously
+        // truncated the field list (the second field vanished) — s.pos must resolve.
+        let range_first = "concept P\n  fields:\n    a : text [..64]\n    b : number [0, 9]\nrule main\n  logic:\n    let p = P { a: \"xy\", b: 7 }\n    out = p.b";
+        assert_eq!(run(&em, range_first), 7,
+            "a range on the first field must not truncate the field list (was: field b dropped)");
+
+        let _ = fs::remove_file(&out_path);
+        for p in [cr, pur, term, em, elf] { let _ = fs::remove_file(&p); }
+    }
+
 }

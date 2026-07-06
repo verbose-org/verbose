@@ -1685,3 +1685,12 @@ params wins — the self-source never mixes the two forms. Only the executor cal
 sites swap (eval_call's bind_params; proc_size / x86_proc's frame + lowering
 params); the checkers (lints, types, purity, termination) keep reading
 rd_params / rd_input directly.
+
+-- ── Verbatim-source probe: field ranges (2026-07-06) ─────────────────────────
+-- Feeding the REAL examples/scan_word.verbose text to the pipeline exposed that
+-- parse_fields ended the field list at a range bracket (`pos : number [0, 256]`,
+-- `source : text [..256]`), silently dropping later fields and stranding the
+-- concept walk inside range tokens (the `.` of `..` drove a no-advance infinite
+-- recursion -> stack overflow). skip_field_range + skip_range_body skip an
+-- optional bracketed range after a field's type — a faithful skip (ranges stay
+-- verifier material), guarded total on an unterminated bracket.
