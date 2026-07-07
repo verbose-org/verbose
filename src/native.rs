@@ -20981,6 +20981,75 @@ rule le64_neg
         let _ = fs::remove_file(em);
     }
 
+    /// CODEGEN DEDUP regression — the emitter precomputes each rule's proc size
+    /// ONCE (proc_sizes) and threads the list through the codegen state, so
+    /// proc_offset sums a prefix of the CACHED sizes (walked in lockstep with the
+    /// RuleList via ps_head/ps_tail) instead of re-calling proc_size at every
+    /// call-emit site, and blob_end_off sums the list via ps_total. proc_offset
+    /// returns the SAME constant however many times it runs, so the change MUST be
+    /// byte-for-byte invisible in the emitted output. This test pins that:
+    ///   * a fixed multi-rule program whose ENTRY (main) calls rules declared
+    ///     AFTER it — so every AstCall rel32 = proc_offset(callee) is a NON-ZERO
+    ///     sum of preceding proc sizes read from the precomputed ProcSizeList. A
+    ///     wrong lockstep sum would mis-compute the rel32 and the emitted ELF would
+    ///     crash or print junk.
+    ///   * the emitted ELF byte-LENGTH is a pure function of the fragment + the
+    ///     emitter logic — pinned to the pre-dedup golden (341 B). If proc_sizes
+    ///     ever disagrees with inline proc_size, this size (and the bytes) shift.
+    ///   * the ELF EXECUTES to double(add(3,4)) = 14 — the offsets-are-correct
+    ///     spot check for the new precomputed-list proc_offset path.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn codegen_dedup_precomputed_proc_sizes_byte_stable_and_offsets_correct() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        let src = fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let elf = std::env::temp_dir().join("verbosec_test_dedup_elf_program_src");
+        compile_native(&program, "elf_program_src", elf.to_str().unwrap(), false, false)
+            .expect("elf_program_src must compile natively after the codegen dedup");
+
+        // Entry `main` calls `double(add(3, 4))`; add + double are declared AFTER
+        // main, so proc_offset(add) and proc_offset(double) are non-zero prefix
+        // sums of the precomputed ProcSizeList.
+        let prog_src = "rule main\n  logic:\n    out = double(add(3, 4))\n\
+                        rule add(x, y)\n  logic:\n    out = x + y\n\
+                        rule double(x)\n  logic:\n    out = x * 2";
+
+        let mc = Command::new(&elf).args([prog_src, "0"]).output().expect("spawn emitter");
+        assert!(mc.status.success(), "elf_program_src must exit 0; got {:?}", mc.status);
+        let elf_bytes = mc.stdout;
+        assert_eq!(&elf_bytes[0..4], &[0x7f, 0x45, 0x4c, 0x46], "emitter output must be an ELF");
+
+        // GOLDEN: the dedup must not change a single emitted byte. Pinned to the
+        // value both a pre-dedup and post-dedup emitter produce for this fragment.
+        assert_eq!(
+            elf_bytes.len(), 341,
+            "codegen dedup changed the emitted ELF size — proc_sizes must equal inline proc_size"
+        );
+
+        // EXEC: a correct proc_offset (via ps_head/ps_tail over the cached list)
+        // yields correct rel32s; a wrong one crashes or prints the wrong number.
+        let out_path = std::env::temp_dir().join("verbosec_test_dedup_a_out");
+        fs::write(&out_path, &elf_bytes).expect("write a.out");
+        let mut perms = fs::metadata(&out_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&out_path, perms).expect("chmod +x");
+        let child = Command::new(&out_path).output().expect("execute emitted ELF");
+        assert!(child.status.success(), "emitted ELF did not exit 0; got {:?}", child.status);
+        let v: i64 = String::from_utf8_lossy(&child.stdout).trim().parse()
+            .unwrap_or_else(|_| panic!("emitted ELF produced non-number: {:?}", child.stdout));
+        assert_eq!(v, 14, "double(add(3, 4)) via the precomputed-list proc_offset must be 14");
+
+        let _ = fs::remove_file(&elf);
+        let _ = fs::remove_file(&out_path);
+    }
+
     /// R7a — THE SELF-HOSTED ARENA. `elf_program_src` now emits, for a program that
     /// declares a variant (sum-type) concept, an mmap'd node arena in the ELF `_start`
     /// trampoline (base in r15, count in r14) and REAL machine code for every
