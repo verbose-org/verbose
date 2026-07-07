@@ -36393,6 +36393,155 @@ rule two
         for p in [elf, sw_oracle, cr_oracle] { let _ = fs::remove_file(&p); }
     }
 
+    /// SOURCE-EMBEDDING at self-checker scale — the emitter (elf_program_src)
+    /// must embed the WHOLE interpreted source (src_blob) in the emitted ELF for
+    /// programs as large as its own proof checkers. Pre-fix, driving the emitter
+    /// on the count_purity_errors closure (174 rules -> a ~201 KB ELF) OVERFLOWED
+    /// the VExpr node arena (`max_nodes: 2000000`) partway through x86_program
+    /// emission: parsing the 174-rule fragment alone consumes ~1.67M arena nodes,
+    /// and the codegen walk (blob_end_off / proc_offset recomputed per call site,
+    /// each allocating intermediate list nodes the bump arena never reclaims)
+    /// pushes the peak past 2M. The emitter aborted `exit(1)` mid-emit with a
+    /// TRUNCATED ELF whose header still claimed the full p_filesz -> the file was
+    /// ~84 KB on disk but mapped 201 KB, so any access into the reserved-but-
+    /// absent tail faulted SIGBUS at runtime. The fix raises the closure's arena
+    /// to the verifier's 4 000 000 ceiling (~63% headroom over the measured
+    /// ~2.45M peak). This test would `exit(1)` + truncate (then SIGBUS) pre-fix.
+    ///
+    /// Gates (against the REAL verbosec-compiled count_purity_errors oracle):
+    ///   * The emitter exits 0, and the emitted ELF's on-disk size == its own
+    ///     p_filesz header (no truncation; the src_blob tail is fully present).
+    ///   * The emitted checker ELF RUNS (exit 0, no SIGBUS) and matches the real
+    ///     count_purity_errors on two inputs: a clean rule -> 0, and a rule that
+    ///     calls an undeclared defined rule -> 1.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn self_hosted_emitter_embeds_large_checker_source_without_truncation() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        let compiler_src = fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&compiler_src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        // The self-hosted emitter + the real count_purity_errors oracle.
+        let elf = std::env::temp_dir().join("verbosec_srcblob_elf_program_src");
+        compile_native(&program, "elf_program_src", elf.to_str().unwrap(), false, false)
+            .expect("elf_program_src must compile natively");
+        let cpe_oracle = std::env::temp_dir().join("verbosec_srcblob_cpe_oracle");
+        compile_native(&program, "count_purity_errors", cpe_oracle.to_str().unwrap(), false, false)
+            .expect("real count_purity_errors must compile natively");
+
+        // Build the count_purity_errors closure from the declared purity `calls :`
+        // lists, with count_purity_errors as the head rule; strip comments /
+        // attributes / proofs so the emitter's parser accepts each rule.
+        let lines: Vec<&str> = compiler_src.lines().collect();
+        let rule_starts: Vec<(usize, String)> = lines.iter().enumerate()
+            .filter(|(_, l)| l.starts_with("rule "))
+            .map(|(i, l)| (i, l.split_whitespace().nth(1).unwrap().split('(').next().unwrap().to_string()))
+            .collect();
+        let rule_info: std::collections::HashMap<String, (usize, usize, Vec<String>)> = rule_starts.iter().enumerate()
+            .map(|(idx, (i, name))| {
+                let end = rule_starts.get(idx + 1).map(|(j, _)| *j).unwrap_or(lines.len());
+                let calls = lines[*i..end].iter().find_map(|l| {
+                    let t = l.trim();
+                    t.strip_prefix("calls : [").and_then(|r| r.strip_suffix("]"))
+                        .map(|inner| inner.split(',').map(|c| c.trim().to_string())
+                            .filter(|c| !c.is_empty()).collect::<Vec<_>>())
+                }).unwrap_or_default();
+                (name.clone(), (*i, end, calls))
+            }).collect();
+        let mut seen = std::collections::BTreeSet::new();
+        let mut todo = vec!["count_purity_errors".to_string()];
+        while let Some(n) = todo.pop() {
+            if seen.contains(&n) || !rule_info.contains_key(&n) { continue; }
+            todo.extend(rule_info[&n].2.clone());
+            seen.insert(n);
+        }
+        assert!(seen.len() >= 150,
+            "count_purity_errors closure should be ~174 rules; got {}", seen.len());
+        let strip = |blk: &str| -> String {
+            let mut out = Vec::new();
+            let mut in_proofs = false;
+            for l in blk.lines() {
+                let s = l.trim();
+                if s.starts_with("--") || s.is_empty() || s.starts_with('@') { continue; }
+                if s == "proofs:" { in_proofs = true; continue; }
+                if in_proofs {
+                    if !l.starts_with(' ') { in_proofs = false; } else { continue; }
+                }
+                out.push(l);
+            }
+            out.join("\n")
+        };
+        let mut ordered = vec!["count_purity_errors".to_string()];
+        ordered.extend(seen.iter().filter(|n| *n != "count_purity_errors").cloned());
+        let rule_text = ordered.iter()
+            .map(|n| { let (s, e, _) = &rule_info[n]; strip(&lines[*s..*e].join("\n")) })
+            .collect::<Vec<_>>().join("\n\n");
+        let is_top = |l: &str| l.starts_with("rule ") || l.starts_with("concept ")
+            || l.starts_with("concept_group ") || l.starts_with("-- ");
+        let mut concept_blocks = Vec::new();
+        for (i, l) in lines.iter().enumerate() {
+            let take = if l.starts_with("concept_group ") {
+                true
+            } else if let Some(rest) = l.strip_prefix("concept ") {
+                let cname = rest.split_whitespace().next().unwrap_or("");
+                !cname.is_empty() && rule_text.contains(cname)
+            } else { false };
+            if take {
+                let e = lines[i + 1..].iter().position(|l| is_top(l)).map(|j| i + 1 + j).unwrap_or(lines.len());
+                concept_blocks.push(strip(&lines[i..e].join("\n")));
+            }
+        }
+        let frag = format!("@verbose 0.1.0\n\n{}\n\n{}",
+            concept_blocks.iter().filter(|b| !b.trim().is_empty()).cloned().collect::<Vec<_>>().join("\n"),
+            rule_text);
+
+        // Emit the checker ELF via elf_program_src. Pre-fix: the emitter exits 1
+        // partway through, so `mc.status.success()` fails right here.
+        let mc = Command::new(&elf).args([frag.as_str(), "0"]).output().expect("spawn emitter");
+        assert!(mc.status.success(),
+            "elf_program_src must exit 0 for the count_purity_errors closure (pre-fix: exit 1 on arena overflow mid-emit)");
+        let out = mc.stdout;
+        assert_eq!(&out[0..4], &[0x7f, 0x45, 0x4c, 0x46], "emitter output must be an ELF");
+        // p_filesz lives in the single PT_LOAD program header (file offset 64),
+        // at header offset 32 -> absolute file offset 96.
+        let p_filesz = u64::from_le_bytes(out[96..104].try_into().unwrap()) as usize;
+        assert_eq!(out.len(), p_filesz,
+            "emitted ELF on-disk size ({}) must equal its p_filesz header ({}) — a shortfall means the \
+             src_blob tail is missing and the file SIGBUSes when mapped", out.len(), p_filesz);
+
+        // Run the emitted checker ELF vs the real oracle on two inputs.
+        let emitted = std::env::temp_dir().join("verbosec_srcblob_emitted_cpe");
+        fs::write(&emitted, &out).expect("write emitted ELF");
+        let mut perms = fs::metadata(&emitted).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&emitted, perms).expect("chmod");
+
+        let run = |bin: &std::path::Path, source: &str| -> (String, std::process::ExitStatus) {
+            let r = Command::new(bin).arg(source).arg("0").output().expect("spawn checker");
+            (String::from_utf8_lossy(&r.stdout).trim().to_string(), r.status)
+        };
+        // A rule calling an UNDECLARED defined rule -> 1; the declared twin -> 0.
+        let call_bad = "rule r\n  logic:\n    out = helper(1)\n  proofs:\n    purity:\n      reads : []\n      calls : []\n    termination:\n      bound : 1\nrule helper(x)\n  logic:\n    out = x";
+        let call_ok  = "rule r\n  logic:\n    out = helper(1)\n  proofs:\n    purity:\n      reads : []\n      calls : [helper]\n    termination:\n      bound : 1\nrule helper(x)\n  logic:\n    out = x";
+        for (inp, expect) in [(call_ok, "0"), (call_bad, "1")] {
+            let (got, st) = run(&emitted, inp);
+            assert!(st.success(),
+                "emitted count_purity_errors ELF must exit 0 (no SIGBUS) for {:?}; got {:?}", inp, st);
+            let (oracle, _) = run(&cpe_oracle, inp);
+            assert_eq!(oracle, expect, "oracle sanity: count_purity_errors({:?})", inp);
+            assert_eq!(got, expect,
+                "self-compiled count_purity_errors({:?}) must equal the real checker ({})", inp, expect);
+        }
+
+        let _ = fs::remove_file(&emitted);
+        for p in [elf, cpe_oracle] { let _ = fs::remove_file(&p); }
+    }
+
     /// STREAMING slice — the self-hosted emitter's text codegen
     /// (docs/self-hosting-streaming-design.md). A texty rule (result = AstStr /
     /// concat / if-match of those / call to a directly-texty rule) now emits as a

@@ -96,12 +96,30 @@
 -- brick 2 (Token values + TokenList cons cells, ~2N+3 nodes for N tokens) AND
 -- the AST (Parsed wrappers + Ast nodes). For an expression of N tokens the AST
 -- has ~N/2 leaves and ~N/2 internal nodes plus a Parsed wrapper per parse-rule
--- return. max_nodes: 4000 covers the deepest test ("1+2+3+...+15" style and
--- "(((1+2)*3))" nesting) with wide headroom; max_depth: 256 matches brick 2.
--- Over the cap a VariantConstruct hits the arena bounds-check and the binary
--- exits 1 (fail-closed) rather than corrupting memory.
+-- return. Over the cap a VariantConstruct hits the arena bounds-check and the
+-- binary exits 1 (fail-closed) rather than corrupting memory.
+--
+-- SIZING (self-hosting): when elf_program_src is compiled natively and driven
+-- on REAL vexprparse source fragments, the arena must hold the ENTIRE parse
+-- (token cons-list + full AST for every rule) PLUS every intermediate list node
+-- the codegen walk constructs (fields_to_params / params_to_fields / arg-list
+-- builds, re-run per call site because the arena never reclaims). Measured peak
+-- for the count_purity_errors closure (174 rules -> a 201 580-byte ELF) is
+-- ~2.45M nodes: ~1.67M for the parse alone, ~0.78M added by the walk. The old
+-- 2 000 000 cap fit the parse + only ~42% of the walk, so the 174-rule self-
+-- checker aborted mid-emit (exit 1, a truncated ELF whose header still claimed
+-- the full p_filesz -> SIGBUS when the truncated file was mapped and run).
+-- Raised to the verifier's hard ceiling (4 000 000, see
+-- docs/arena-allocation-design.md) -- ~63% headroom over the current largest
+-- self-host target.
+-- ponytail: 4 000 000 is the compiler's max_nodes ceiling; the FULL 509-rule
+-- self-compile (~7M nodes) needs BOTH a higher verifier ceiling AND a real fix
+-- for the O(sites x program) redundant arena allocation (thread the constant
+-- blob_end_off / proc_offset results through ByteGenState instead of
+-- recomputing per call site, or add arena reclamation). Neither is needed for
+-- the current self-checker milestone.
 -- ============================================================================
-concept_group VExpr [max_depth: 4096, max_nodes: 2000000]
+concept_group VExpr [max_depth: 4096, max_nodes: 4000000]
   @intention: "Tokens, a token cons-list, an arithmetic AST, and a parse result"
   @source: vexprparse.intent:1
 
