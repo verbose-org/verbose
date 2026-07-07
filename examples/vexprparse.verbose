@@ -17028,11 +17028,15 @@ rule blob_end_off
   output:
     out : number
   logic:
-    out = 120 + (if program_uses_arena(pg.concepts) == 1 then 61 else 0) + (if entry_rule_texty(pg) == 1 then 45 else 101) + (if prog_any_texty(pg) == 1 then 86 else 0) + program_total_size(ProgGenState { rules: pg.rules, src: pg.src, off: 0, prog: pg.prog, concepts: pg.concepts })
+    let entry_params = if param_list_len(rl_head_params(pg.rules)) > 0 then rl_head_params(pg.rules) else fields_to_params(rl_head_input(pg.rules))
+    let has_input = if param_list_len(entry_params) > 0 then 1 else 0
+    let efields = params_to_fields(entry_params)
+    let msize = if has_input == 1 and entry_rule_texty(pg) == 0 then argv_marshal_size(cd_fields(concept_at_index(ConceptAtState { concepts: pg.concepts, idx: find_concept_index(FindConceptIdxState { concepts: pg.concepts, src: pg.src, q_start: fl_head_ty_start(efields), q_len: fl_head_ty_len(efields), idx: 0 }) }))) else 0
+    out = 120 + (if program_uses_arena(pg.concepts) == 1 then 61 else 0) + (if entry_rule_texty(pg) == 1 then 45 else 101) + (if prog_any_texty(pg) == 1 then 86 else 0) + msize + program_total_size(ProgGenState { rules: pg.rules, src: pg.src, off: 0, prog: pg.prog, concepts: pg.concepts })
   proofs:
     purity:
       reads : [pg, pg.rules, pg.src, pg.prog, pg.concepts]
-      calls : [program_uses_arena, entry_rule_texty, prog_any_texty, program_total_size]
+      calls : [program_uses_arena, entry_rule_texty, prog_any_texty, program_total_size, param_list_len, rl_head_params, fields_to_params, rl_head_input, params_to_fields, argv_marshal_size, cd_fields, concept_at_index, find_concept_index, fl_head_ty_start, fl_head_ty_len]
     termination:
       bound : 8000
 
@@ -17102,6 +17106,190 @@ rule src_blob
 -- emitted iff ANY rule is texty; number-only programs keep the 101-B b8
 -- trampoline with rel32 96 — byte-identical files. The embedding gate extends
 -- to `program_uses_text OR any-texty` so streamed spans always have src bytes.
+-- ============================================================================
+-- RUNTIME TEXT INPUT — the emitted ELF reads its input from argv, the SAME
+-- convention as verbosec's own native binaries: one argv per input FIELD of the
+-- ENTRY rule (text raw, number decimal). `./elf "rule a\n..." 0` runs the
+-- compiled entry rule on real input. The entry rule takes a SINGLE record param
+-- (e.g. `s : ScanState`); the trampoline reads one argv per field of that
+-- concept, builds the record in the node arena, and passes its index — exactly
+-- the shape verbosec's --run word_length expects.
+--
+-- The FIXED-region trick keeps the packed-span model intact: argv text lives at
+-- a runtime address, so the trampoline mmaps a FIXED region at 0x20000000 and
+-- copies the argv bytes there. A text value = pack((0x20000000 - src_base) +
+-- bump, len) — the region offset is a COMPILE-TIME constant (src_base is known
+-- at emit), so byte_at / length / substring / streaming all keep working with
+-- src_base + start.
+--
+-- Register/stack choreography at _start (after the optional arena prologue,
+-- which sets r15=arena base / r14=node count and does NOT touch rsp): r12 saves
+-- the entry rsp (argc at [r12], argv[k] at [r12 + 8*(k+1)]) so argv reads stay
+-- correct across the field pushes; r13 is the fixed-region bump cursor (offset
+-- into 0x20000000). Both r12/r13 are free at _start (arena prologue uses only
+-- r15/r14). The marshalling runs BEFORE the `call entry` in the number
+-- trampoline, so the call's rel32 (96, +86 with itoa) is UNCHANGED — the call
+-- and the first proc both shift by the marshalling size.
+-- ============================================================================
+
+concept ArgvMarshalState
+  @intention: "A concept field list to marshal from argv + the current arg index + the fixed-region offsets"
+  @source: vexprparse.intent:66
+  fields:
+    fields : FieldList
+    idx : number
+    region_off : number
+    region_base : number
+
+
+concept FieldPopState
+  @intention: "The remaining concept fields to pop + the arena payload slot the next pop stores into"
+  @source: vexprparse.intent:66
+  fields:
+    fields : FieldList
+    slot : number
+
+
+concept ArgvTrampState
+  @intention: "The entry concept's fields + source + program + concepts + concept index, to emit the argv trampoline"
+  @source: vexprparse.intent:66
+  fields:
+    fields : FieldList
+    src : text [..256]
+    prog : RuleList
+    concepts : ConceptList
+    cidx : number
+
+
+-- marshal_fields_size: the exact byte length of the per-field argv marshalling.
+-- A text field is 52 B (mov rsi,[r12+disp] 8 + strlen 13 + copy&pack 31); a
+-- number field is 65 B (mov rsi,[r12+disp] 8 + atoi 57). One helper used by both
+-- the emit (via argv_marshal_size in blob_end_off) and the byte pass, so the
+-- trampoline size can never drift from the source-blob base.
+rule marshal_fields_size
+  @intention: "Byte length of the per-field argv marshalling (text field 52 B, number field 65 B)"
+  @source: vexprparse.intent:66
+  input:
+    fl : FieldList
+  output:
+    out : number
+  logic:
+    out = match fl:
+      FCons(name_start, name_len, ty, ty_start, ty_len, rest) => (if ty == 2 then 52 else 65) + marshal_fields_size(rest)
+      FNil => 0
+  proofs:
+    purity:
+      reads : [fl]
+      calls : [marshal_fields_size]
+    termination:
+      bound : 512
+      structural : fl
+
+
+-- argv_marshal_size: the TOTAL trampoline-marshalling byte length = prologue 88
+-- (save r12, argc guard, mmap fixed region, zero r13) + per-field marshalling +
+-- arena suffix 25 + 8*nfields (mov rax,r14 3 + imul 7 + add r15 3 + mov tag 7 +
+-- pop each field 8 + push r14 2 + inc r14 3). blob_end_off adds this to the
+-- source-blob base ONLY when the entry rule has an input, so texty-free /
+-- input-free programs stay byte-identical.
+rule argv_marshal_size
+  @intention: "Total byte length of the argv trampoline marshalling: prologue 88 + per-field + arena suffix 25 + 8*nfields"
+  @source: vexprparse.intent:66
+  input:
+    fl : FieldList
+  output:
+    out : number
+  logic:
+    out = 88 + marshal_fields_size(fl) + 25 + 8 * field_list_len(fl)
+  proofs:
+    purity:
+      reads : [fl]
+      calls : [marshal_fields_size, field_list_len]
+    termination:
+      bound : 64
+
+
+-- x86_marshal_fields: emit the per-field argv reads. For field k, argv[k+1] is at
+-- [r12 + 8*(k+2)] (argv[0] is the program name at [r12+8]). A TEXT field: strlen
+-- (byte loop scanning for NUL), rep movsb the bytes into the fixed region at the
+-- r13 bump, push pack((region_off + bump) << 32 | len), bump += len. A NUMBER
+-- field: inline atoi (leading '-' supported), push the value. One push per field,
+-- in declaration order, consumed by the arena suffix (x86_field_pops).
+rule x86_marshal_fields
+  @intention: "Emit per-field argv reads: text field -> strlen+copy+pack packed span; number field -> atoi; one push each"
+  @source: vexprparse.intent:66
+  input:
+    ms : ArgvMarshalState
+  output:
+    out : bytes
+  logic:
+    out = match ms.fields:
+      FCons(name_start, name_len, ty, ty_start, ty_len, rest) => concat((if ty == 2 then concat(b"\x49\x8b\xb4\x24", le32(8 * (ms.idx + 2)), b"\x31\xc9\x80\x3c\x0e\x00\x74\x05\x48\xff\xc1\xeb\xf5\x49\x8d\xbd", le32(ms.region_base), b"\x51\xf3\xa4\x59\x4c\x89\xe8\x48\x05", le32(ms.region_off), b"\x48\xc1\xe0\x20\x48\x09\xc8\x50\x49\x01\xcd") else concat(b"\x49\x8b\xb4\x24", le32(8 * (ms.idx + 2)), b"\x48\x31\xc0\x45\x31\xdb\x8a\x0e\x80\xf9\x2d\x75\x06\x41\xb3\x01\x48\xff\xc6\x0f\xb6\x0e\x80\xf9\x30\x72\x15\x80\xf9\x39\x77\x10\x48\x6b\xc0\x0a\x48\x83\xe9\x30\x48\x01\xc8\x48\xff\xc6\xeb\xe3\x4d\x85\xdb\x74\x03\x48\xf7\xd8\x50")), x86_marshal_fields(ArgvMarshalState { fields: rest, idx: ms.idx + 1, region_off: ms.region_off, region_base: ms.region_base }))
+      FNil => b""
+  proofs:
+    purity:
+      reads : [ms.fields, ms.idx, ms.region_off, ms.region_base]
+      calls : [x86_marshal_fields]
+    termination:
+      bound : 512
+
+
+-- x86_field_pops: the FieldList sibling of x86_vpops — pop each marshalled field
+-- value off the CPU stack into its arena payload slot [rax + 8 + 8*slot]. The
+-- first pop takes top-of-stack (the LAST field pushed) into the highest slot, so
+-- field j lands in slot j (matching field_index_of). Per field: pop rcx (59) ;
+-- mov [rax + 8 + 8*slot], rcx (48 89 88 + le32).
+rule x86_field_pops
+  @intention: "Emit pop+store of each marshalled field value into its arena payload slot (FieldList variant of x86_vpops)"
+  @source: vexprparse.intent:66
+  input:
+    fp : FieldPopState
+  output:
+    out : bytes
+  logic:
+    out = match fp.fields:
+      FCons(name_start, name_len, ty, ty_start, ty_len, rest) => concat(b"\x59\x48\x89\x88", le32(8 + 8 * fp.slot), x86_field_pops(FieldPopState { fields: rest, slot: fp.slot - 1 }))
+      FNil => b""
+  proofs:
+    purity:
+      reads : [fp.fields, fp.slot]
+      calls : [x86_field_pops]
+    termination:
+      bound : 512
+
+
+-- x86_argv_marshal: the whole trampoline marshalling. Prologue: mov r12,rsp (save
+-- argv base) ; argc guard (argc < 1+nfields -> exit(1)) ; mmap(0x20000000, 1 MiB,
+-- RW, MAP_FIXED|PRIVATE|ANON) with MAP_FAILED -> exit(1) ; xor r13 (bump = 0).
+-- Then x86_marshal_fields pushes one value per concept field. Then the arena
+-- suffix builds a node exactly like x86_node's AstVariant record path: node_addr =
+-- r15 + r14*entry_size, write the record tag (concept_index*256), pop each field
+-- into its payload slot, push r14 (the node index = the entry's single arg), inc
+-- r14. src_base = 0x400000 + blob_end_off is the COMPILE-TIME base; region_off =
+-- 0x20000000 - src_base makes every packed argv span resolve to 0x20000000+bump.
+rule x86_argv_marshal
+  @intention: "Emit the full argv trampoline marshalling: prologue (save argv base, argc guard, mmap fixed region), per-field reads, arena node build, push index"
+  @source: vexprparse.intent:66
+  input:
+    at : ArgvTrampState
+  output:
+    out : bytes
+  logic:
+    let src_base = 4194304 + blob_end_off(ProgGenState { rules: at.prog, src: at.src, off: 0, prog: at.prog, concepts: at.concepts })
+    let region_base = 536870912
+    let region_off = region_base - src_base
+    let nfields = field_list_len(at.fields)
+    let entry_size = 8 * (max_payload_fields(at.concepts) + 1)
+    let tag = at.cidx * 256
+    out = concat(b"\x49\x89\xe4\x49\x8b\x04\x24\x48\x3d", le32(1 + nfields), b"\x7d\x0c\xbf\x01\x00\x00\x00\xb8\x3c\x00\x00\x00\x0f\x05\xb8\x09\x00\x00\x00\xbf\x00\x00\x00\x20\xbe\x00\x00\x10\x00\xba\x03\x00\x00\x00\x41\xba\x32\x00\x00\x00\x49\xc7\xc0\xff\xff\xff\xff\x45\x31\xc9\x0f\x05\x48\x3d\x01\xf0\xff\xff\x72\x0c\xbf\x01\x00\x00\x00\xb8\x3c\x00\x00\x00\x0f\x05\x45\x31\xed", x86_marshal_fields(ArgvMarshalState { fields: at.fields, idx: 0, region_off: region_off, region_base: region_base }), b"\x4c\x89\xf0\x48\x69\xc0", le32(entry_size), b"\x4c\x01\xf8\x48\xc7\x00", le32(tag), x86_field_pops(FieldPopState { fields: at.fields, slot: nfields - 1 }), b"\x41\x56\x49\xff\xc6")
+  proofs:
+    purity:
+      reads : [at.fields, at.src, at.prog, at.concepts, at.cidx]
+      calls : [blob_end_off, field_list_len, max_payload_fields, x86_marshal_fields, x86_field_pops]
+    termination:
+      bound : 64
+
+
 rule elf_program_src
   @intention: "Tokenize, parse a whole program, and wrap its x86-64 blob in a standalone static ELF64 executable"
   @source: vexprparse.intent:60
@@ -17119,11 +17307,15 @@ rule elf_program_src
     let uses_text = if program_uses_text(UsesTextRules { rules: prog, src: s.source }) == 1 then 1 else anytx
     let fsz0 = blob_end_off(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts })
     let fsz = fsz0 + (if uses_text == 1 then 4 * ((length(s.source) + 3) / 4) else 0)
-    out = concat(b"\x7f\x45\x4c\x46\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\x3e\x00\x01\x00\x00\x00\x78\x00\x40\x00\x00\x00\x00\x00\x40\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x40\x00\x38\x00\x01\x00\x00\x00\x00\x00\x00\x00", b"\x01\x00\x00\x00\x05\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x40\x00\x00\x00\x00\x00\x00\x00\x40\x00\x00\x00\x00\x00", le64(fsz), le64(fsz), b"\x00\x10\x00\x00\x00\x00\x00\x00", (if uses_var == 1 then b"\xb8\x09\x00\x00\x00\x31\xff\xbe\x00\x00\x00\x08\xba\x03\x00\x00\x00\x41\xba\x22\x00\x00\x00\x49\xc7\xc0\xff\xff\xff\xff\x45\x31\xc9\x0f\x05\x48\x3d\x01\xf0\xff\xff\x72\x0c\xbf\x01\x00\x00\x00\xb8\x3c\x00\x00\x00\x0f\x05\x49\x89\xc7\x45\x31\xf6" else b""), (if entrytx == 1 then b"\xe8\x7e\x00\x00\x00\x6a\x0a\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x48\x89\xe6\x48\xc7\xc2\x01\x00\x00\x00\x0f\x05\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05" else concat(b"\xe8", le32(96 + (if anytx == 1 then 86 else 0)), b"\x48\x83\xec\x20\x49\x89\xc1\x48\x8d\x74\x24\x1f\xc6\x06\x0a\x48\x85\xc0\x79\x03\x48\xf7\xd8\x48\xc7\xc1\x0a\x00\x00\x00\x48\x31\xd2\x48\xf7\xf1\x80\xc2\x30\x48\xff\xce\x88\x16\x48\x85\xc0\x75\xed\x4d\x85\xc9\x79\x06\x48\xff\xce\xc6\x06\x2d\x48\x8d\x54\x24\x20\x48\x29\xf2\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05")), (if anytx == 1 then b"\x48\x83\xec\x28\x49\x89\xc1\x48\x8d\x74\x24\x20\x48\x85\xc0\x79\x03\x48\xf7\xd8\x48\xc7\xc1\x0a\x00\x00\x00\x48\x31\xd2\x48\xf7\xf1\x80\xc2\x30\x48\xff\xce\x88\x16\x48\x85\xc0\x75\xed\x4d\x85\xc9\x79\x06\x48\xff\xce\xc6\x06\x2d\x48\x8d\x54\x24\x20\x48\x29\xf2\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05\x48\x83\xc4\x28\xc3" else b""), x86_program(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts }), (if uses_text == 1 then src_blob(SrcBlobState { src: s.source, pos: 0 }) else b""))
+    let entry_params = if param_list_len(rl_head_params(prog)) > 0 then rl_head_params(prog) else fields_to_params(rl_head_input(prog))
+    let has_input = if param_list_len(entry_params) > 0 then 1 else 0
+    let efields = params_to_fields(entry_params)
+    let ecidx = find_concept_index(FindConceptIdxState { concepts: concepts, src: s.source, q_start: fl_head_ty_start(efields), q_len: fl_head_ty_len(efields), idx: 0 })
+    out = concat(b"\x7f\x45\x4c\x46\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\x3e\x00\x01\x00\x00\x00\x78\x00\x40\x00\x00\x00\x00\x00\x40\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x40\x00\x38\x00\x01\x00\x00\x00\x00\x00\x00\x00", b"\x01\x00\x00\x00\x05\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x40\x00\x00\x00\x00\x00\x00\x00\x40\x00\x00\x00\x00\x00", le64(fsz), le64(fsz), b"\x00\x10\x00\x00\x00\x00\x00\x00", (if uses_var == 1 then b"\xb8\x09\x00\x00\x00\x31\xff\xbe\x00\x00\x00\x08\xba\x03\x00\x00\x00\x41\xba\x22\x00\x00\x00\x49\xc7\xc0\xff\xff\xff\xff\x45\x31\xc9\x0f\x05\x48\x3d\x01\xf0\xff\xff\x72\x0c\xbf\x01\x00\x00\x00\xb8\x3c\x00\x00\x00\x0f\x05\x49\x89\xc7\x45\x31\xf6" else b""), (if has_input == 1 and entrytx == 0 then x86_argv_marshal(ArgvTrampState { fields: cd_fields(concept_at_index(ConceptAtState { concepts: concepts, idx: ecidx })), src: s.source, prog: prog, concepts: concepts, cidx: ecidx }) else b""), (if entrytx == 1 then b"\xe8\x7e\x00\x00\x00\x6a\x0a\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x48\x89\xe6\x48\xc7\xc2\x01\x00\x00\x00\x0f\x05\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05" else concat(b"\xe8", le32(96 + (if anytx == 1 then 86 else 0)), b"\x48\x83\xec\x20\x49\x89\xc1\x48\x8d\x74\x24\x1f\xc6\x06\x0a\x48\x85\xc0\x79\x03\x48\xf7\xd8\x48\xc7\xc1\x0a\x00\x00\x00\x48\x31\xd2\x48\xf7\xf1\x80\xc2\x30\x48\xff\xce\x88\x16\x48\x85\xc0\x75\xed\x4d\x85\xc9\x79\x06\x48\xff\xce\xc6\x06\x2d\x48\x8d\x54\x24\x20\x48\x29\xf2\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05")), (if anytx == 1 then b"\x48\x83\xec\x28\x49\x89\xc1\x48\x8d\x74\x24\x20\x48\x85\xc0\x79\x03\x48\xf7\xd8\x48\xc7\xc1\x0a\x00\x00\x00\x48\x31\xd2\x48\xf7\xf1\x80\xc2\x30\x48\xff\xce\x88\x16\x48\x85\xc0\x75\xed\x4d\x85\xc9\x79\x06\x48\xff\xce\xc6\x06\x2d\x48\x8d\x54\x24\x20\x48\x29\xf2\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05\x48\x83\xc4\x28\xc3" else b""), x86_program(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts }), (if uses_text == 1 then src_blob(SrcBlobState { src: s.source, pos: 0 }) else b""))
   proofs:
     purity:
       reads : [s.source]
-      calls : [begin_tokenize, parse_program, parse_concepts, program_uses_arena, prog_any_texty, entry_rule_texty, program_uses_text, blob_end_off, x86_program, src_blob]
+      calls : [begin_tokenize, parse_program, parse_concepts, program_uses_arena, prog_any_texty, entry_rule_texty, program_uses_text, blob_end_off, x86_program, src_blob, param_list_len, rl_head_params, fields_to_params, rl_head_input, params_to_fields, find_concept_index, fl_head_ty_start, fl_head_ty_len, x86_argv_marshal, cd_fields, concept_at_index]
     termination:
       bound : 256
 

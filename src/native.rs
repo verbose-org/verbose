@@ -36197,6 +36197,202 @@ rule two
         let _ = fs::remove_file(&elf);
     }
 
+    /// RUNTIME TEXT INPUT — the self-hosted emitter's argv trampoline. The ELF that
+    /// elf_program_src emits now reads its input from argv (verbosec's own CLI
+    /// convention: one argv per field of the entry rule's record input, text raw /
+    /// number decimal), builds the record in the node arena at a MAP_FIXED region,
+    /// and calls the entry proc. This lets self-fragments run on REAL input with NO
+    /// wrapper `main` — the front-end (count_rules) can finally be driven on its
+    /// multi-line-program input.
+    ///
+    /// Gates (all against the REAL verbosec-compiled binary as oracle):
+    ///   * Scanner on argv: verbatim examples/scan_word.verbose (entry word_length,
+    ///     no wrapper main) → "hello world" 0 → 5; "abc" 0 → 3; "  x" 0 → 0, each
+    ///     == the REAL scan_word native binary on the same argv.
+    ///   * THE MILESTONE — the self-compiled FRONT END: the count_rules closure
+    ///     (~146 rules, computed from the declared purity `calls :` lists) with
+    ///     count_rules as the ENTRY rule → a two-rule program → 2; one-rule → 1;
+    ///     "1 + 2" → 0, each == the REAL count_rules native binary. vexprparse's
+    ///     front end, compiled by vexprparse, parsing real multi-line source at
+    ///     runtime.
+    ///   * argc guard: no argv → exit 1, no output.
+    ///   * Byte-identity: a closed-main (input-free) fact ELF is byte-identical
+    ///     before/after (marshalling is emitted ONLY when the entry has an input).
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn self_hosted_argv_trampoline_runs_entry_on_real_input() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        let compiler_src = fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&compiler_src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        // The self-hosted emitter.
+        let elf = std::env::temp_dir().join("verbosec_argv_elf_program_src");
+        compile_native(&program, "elf_program_src", elf.to_str().unwrap(), false, false)
+            .expect("elf_program_src must compile natively");
+
+        // Real oracles: verbosec's OWN native word_length and count_rules.
+        let sw_src = fs::read_to_string("examples/scan_word.verbose").unwrap();
+        let sw_tokens = crate::lexer::Lexer::new(&sw_src).tokenize().unwrap();
+        let sw_program = crate::parser::Parser::new(sw_tokens).parse_program().unwrap();
+        let sw_oracle = std::env::temp_dir().join("verbosec_argv_sw_oracle");
+        compile_native(&sw_program, "word_length", sw_oracle.to_str().unwrap(), false, false)
+            .expect("real scan_word word_length must compile natively");
+        let cr_oracle = std::env::temp_dir().join("verbosec_argv_cr_oracle");
+        compile_native(&program, "count_rules", cr_oracle.to_str().unwrap(), false, false)
+            .expect("real count_rules must compile natively");
+
+        // Run a native binary on (argv1, argv2), return trimmed stdout.
+        let run_bin = |bin: &std::path::Path, a1: &str, a2: &str| -> (String, std::process::ExitStatus) {
+            let r = Command::new(bin).arg(a1).arg(a2).output().expect("spawn");
+            (String::from_utf8_lossy(&r.stdout).trim().to_string(), r.status)
+        };
+        // Emit an ELF for `source` via elf_program_src, then run it on (a1, a2).
+        let emit_then_run = |source: &str, a1: &str, a2: &str, tag: &str| -> (String, std::process::ExitStatus) {
+            let mc = Command::new(&elf).args([source, "0"]).output().expect("spawn emitter");
+            assert!(mc.status.success(), "elf_program_src must exit 0 for {}", tag);
+            assert_eq!(&mc.stdout[0..4], &[0x7f, 0x45, 0x4c, 0x46], "not ELF for {}", tag);
+            let p = std::env::temp_dir().join(format!("verbosec_argv_out_{}", tag));
+            fs::write(&p, &mc.stdout).expect("write a.out");
+            let mut perms = fs::metadata(&p).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&p, perms).expect("chmod");
+            let r = Command::new(&p).arg(a1).arg(a2).output().expect("run emitted ELF");
+            let _ = fs::remove_file(&p);
+            (String::from_utf8_lossy(&r.stdout).trim().to_string(), r.status)
+        };
+
+        // (1) Scanner on argv: verbatim scan_word (entry word_length, NO wrapper main).
+        for input in ["hello world", "abc", "  x"] {
+            let (got, st) = emit_then_run(&sw_src, input, "0", "sw");
+            assert!(st.success(), "scanner ELF must exit 0 for {:?}", input);
+            let (oracle, _) = run_bin(&sw_oracle, input, "0");
+            assert_eq!(got, oracle,
+                "self-compiled word_length({:?}) must equal the real scan_word binary", input);
+        }
+
+        // (2) THE MILESTONE — build the count_rules closure from the declared purity
+        // proofs, with count_rules as the head rule; strip comments / attributes /
+        // proofs so the source fits under Linux's 128 KB single-arg limit.
+        let lines: Vec<&str> = compiler_src.lines().collect();
+        let rule_starts: Vec<(usize, String)> = lines.iter().enumerate()
+            .filter(|(_, l)| l.starts_with("rule "))
+            .map(|(i, l)| (i, l.split_whitespace().nth(1).unwrap().split('(').next().unwrap().to_string()))
+            .collect();
+        let rule_info: std::collections::HashMap<String, (usize, usize, Vec<String>)> = rule_starts.iter().enumerate()
+            .map(|(idx, (i, name))| {
+                let end = rule_starts.get(idx + 1).map(|(j, _)| *j).unwrap_or(lines.len());
+                let calls = lines[*i..end].iter().find_map(|l| {
+                    let t = l.trim();
+                    t.strip_prefix("calls : [").and_then(|r| r.strip_suffix("]"))
+                        .map(|inner| inner.split(',').map(|c| c.trim().to_string())
+                            .filter(|c| !c.is_empty()).collect::<Vec<_>>())
+                }).unwrap_or_default();
+                (name.clone(), (*i, end, calls))
+            }).collect();
+        let mut seen = std::collections::BTreeSet::new();
+        let mut todo = vec!["count_rules".to_string()];
+        while let Some(n) = todo.pop() {
+            if seen.contains(&n) || !rule_info.contains_key(&n) { continue; }
+            todo.extend(rule_info[&n].2.clone());
+            seen.insert(n);
+        }
+        assert!(seen.len() >= 100, "count_rules closure should be ~146 rules; got {}", seen.len());
+        // Strip a block: drop full-line comments / blank lines / @attr lines / the
+        // proofs: section (the emitter's parser accepts rules without them).
+        let strip = |blk: &str| -> String {
+            let mut out = Vec::new();
+            let mut in_proofs = false;
+            for l in blk.lines() {
+                let s = l.trim();
+                if s.starts_with("--") || s.is_empty() || s.starts_with('@') { continue; }
+                if s == "proofs:" { in_proofs = true; continue; }
+                if in_proofs {
+                    if !l.starts_with(' ') { in_proofs = false; } else { continue; }
+                }
+                out.push(l);
+            }
+            out.join("\n")
+        };
+        // count_rules first, then the rest of the closure in a stable order.
+        let mut ordered = vec!["count_rules".to_string()];
+        ordered.extend(seen.iter().filter(|n| *n != "count_rules").cloned());
+        let rule_text = ordered.iter()
+            .map(|n| { let (s, e, _) = &rule_info[n]; strip(&lines[*s..*e].join("\n")) })
+            .collect::<Vec<_>>().join("\n\n");
+        // Concepts: every top-level concept_group (core types), plus any top-level
+        // concept whose name appears in the closure text.
+        let is_top = |l: &str| l.starts_with("rule ") || l.starts_with("concept ")
+            || l.starts_with("concept_group ") || l.starts_with("-- ");
+        let mut concept_blocks = Vec::new();
+        for (i, l) in lines.iter().enumerate() {
+            let take = if l.starts_with("concept_group ") {
+                true
+            } else if let Some(rest) = l.strip_prefix("concept ") {
+                let cname = rest.split_whitespace().next().unwrap_or("");
+                !cname.is_empty() && rule_text.contains(cname)
+            } else { false };
+            if take {
+                let e = lines[i + 1..].iter().position(|l| is_top(l)).map(|j| i + 1 + j).unwrap_or(lines.len());
+                concept_blocks.push(strip(&lines[i..e].join("\n")));
+            }
+        }
+        let frag = format!("@verbose 0.1.0\n\n{}\n\n{}",
+            concept_blocks.iter().filter(|b| !b.trim().is_empty()).cloned().collect::<Vec<_>>().join("\n"),
+            rule_text);
+        assert!(frag.len() < 128 * 1024,
+            "count_rules fragment must fit under the 128 KB single-arg limit; got {}", frag.len());
+
+        let two_rule = "rule a\n  logic:\n    out = 1\nrule b\n  logic:\n    out = 2";
+        let one_rule = "rule a\n  logic:\n    out = 1";
+        for (prog, expect) in [(two_rule, "2"), (one_rule, "1"), ("1 + 2", "0")] {
+            let (got, st) = emit_then_run(&frag, prog, "0", "cr");
+            assert!(st.success(), "count_rules ELF must exit 0 for {:?}", prog);
+            let (oracle, _) = run_bin(&cr_oracle, prog, "0");
+            assert_eq!(oracle, expect, "oracle sanity: count_rules({:?})", prog);
+            assert_eq!(got, expect,
+                "self-compiled count_rules({:?}) must equal the real front end ({})", prog, expect);
+        }
+
+        // (3) argc guard: the scanner ELF with NO argv exits 1, no stdout.
+        {
+            let mc = Command::new(&elf).args([sw_src.as_str(), "0"]).output().unwrap();
+            let p = std::env::temp_dir().join("verbosec_argv_out_guard");
+            fs::write(&p, &mc.stdout).unwrap();
+            let mut perms = fs::metadata(&p).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&p, perms).unwrap();
+            let r = Command::new(&p).output().expect("run scanner ELF with no argv");
+            let _ = fs::remove_file(&p);
+            assert_eq!(r.status.code(), Some(1), "no-argv scanner ELF must exit 1");
+            assert!(r.stdout.is_empty(), "no-argv scanner ELF must produce no output");
+        }
+
+        // (4) Byte-identity: a closed-main (input-free) fact ELF keeps the original
+        // number trampoline byte-for-byte — marshalling only fires when the entry
+        // has an input.
+        let fact = "rule main\n  logic:\n    out = fact(5)\nrule fact(n)\n  logic:\n    out = if n == 0 then 1 else n * fact(n - 1)";
+        const NUMBER_TRAMPOLINE: [u8; 101] = [
+            0xe8, 0x60, 0x00, 0x00, 0x00, 0x48, 0x83, 0xec, 0x20, 0x49, 0x89, 0xc1, 0x48, 0x8d,
+            0x74, 0x24, 0x1f, 0xc6, 0x06, 0x0a, 0x48, 0x85, 0xc0, 0x79, 0x03, 0x48, 0xf7, 0xd8,
+            0x48, 0xc7, 0xc1, 0x0a, 0x00, 0x00, 0x00, 0x48, 0x31, 0xd2, 0x48, 0xf7, 0xf1, 0x80,
+            0xc2, 0x30, 0x48, 0xff, 0xce, 0x88, 0x16, 0x48, 0x85, 0xc0, 0x75, 0xed, 0x4d, 0x85,
+            0xc9, 0x79, 0x06, 0x48, 0xff, 0xce, 0xc6, 0x06, 0x2d, 0x48, 0x8d, 0x54, 0x24, 0x20,
+            0x48, 0x29, 0xf2, 0x48, 0xc7, 0xc0, 0x01, 0x00, 0x00, 0x00, 0x48, 0xc7, 0xc7, 0x01,
+            0x00, 0x00, 0x00, 0x0f, 0x05, 0x48, 0xc7, 0xc0, 0x3c, 0x00, 0x00, 0x00, 0x48, 0x31,
+            0xff, 0x0f, 0x05,
+        ];
+        let mc = Command::new(&elf).args([fact, "0"]).output().unwrap();
+        assert_eq!(&mc.stdout[120..221], &NUMBER_TRAMPOLINE[..],
+            "input-free fact ELF must keep the original 101-byte number trampoline at offset 120");
+
+        for p in [elf, sw_oracle, cr_oracle] { let _ = fs::remove_file(&p); }
+    }
+
     /// STREAMING slice — the self-hosted emitter's text codegen
     /// (docs/self-hosting-streaming-design.md). A texty rule (result = AstStr /
     /// concat / if-match of those / call to a directly-texty rule) now emits as a
