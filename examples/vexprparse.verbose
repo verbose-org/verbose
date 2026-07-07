@@ -491,6 +491,19 @@ concept_group VExpr [max_depth: 4096, max_nodes: 6000000]
       RCons of (head : RuleDecl, tail : RuleList)
       RNil
 
+  -- Codegen dedup: a bare cons-list of per-rule proc SIZES, in rule order (one
+  -- entry per RuleList head). proc_sizes builds it ONCE with a single left-to-right
+  -- proc_size pass; proc_offset then sums a prefix of it (walked in lockstep with
+  -- the RuleList) instead of re-calling proc_size at every call-emit site, and
+  -- ps_total sums the whole list for blob_end_off. Same cons shape as RuleList
+  -- (RCons/RNil), so the same arena machinery and structural-recursion proof apply.
+  concept ProcSizeList
+    @intention: "A cons-list of per-rule emitted-proc byte sizes, in rule order"
+    @source: vexprparse.intent:56
+    variants:
+      PSCons of (size : number, rest : ProcSizeList)
+      PSNil
+
   -- Brick 12: a rule-declaration parse result that THREADS its end position — the
   -- RuleDecl built plus the token index just past its body (the same Parsed-
   -- threading shape as ParsedBlock's MkPB). parse_rule_decl_pos returns this so
@@ -14904,6 +14917,7 @@ concept ByteGenState
     lets : Binding
     prog : RuleList
     concepts : ConceptList
+    sizes : ProcSizeList
 
 
 -- ByteGenArgs: the same codegen state but over a call's ARGUMENT list. Each arg
@@ -14921,6 +14935,7 @@ concept ByteGenArgs
     lets : Binding
     prog : RuleList
     concepts : ConceptList
+    sizes : ProcSizeList
 
 
 -- ParamIndexState: a parameter list to scan for a name span, plus the source and
@@ -14966,6 +14981,7 @@ concept ProcOffState
     q_start : number [0, 4000000]
     q_len : number [0, 4000000]
     concepts : ConceptList
+    sizes : ProcSizeList
 
 
 -- ProcGenState: one rule to lower to a proc + its absolute blob offset + the
@@ -14979,6 +14995,7 @@ concept ProcGenState
     off : number
     prog : RuleList
     concepts : ConceptList
+    sizes : ProcSizeList
 
 
 -- ProgGenState: the whole program to lower to a blob + the running blob offset of
@@ -14992,6 +15009,7 @@ concept ProgGenState
     off : number
     prog : RuleList
     concepts : ConceptList
+    sizes : ProcSizeList
 
 
 -- param_index: the 0-based declaration-order index of the parameter whose name
@@ -15316,6 +15334,7 @@ concept ByteGenVFields
     lets : Binding
     prog : RuleList
     concepts : ConceptList
+    sizes : ProcSizeList
 
 
 -- VPopState: the remaining variant fields to pop off the CPU stack + the payload slot
@@ -15828,11 +15847,11 @@ rule entry_rule_texty
     out : number
   logic:
     out = match pg.rules:
-      RCons(head, tail) => rule_is_texty(ProcGenState { rd: head, src: pg.src, off: 0, prog: pg.prog, concepts: pg.concepts })
+      RCons(head, tail) => rule_is_texty(ProcGenState { rd: head, src: pg.src, off: 0, prog: pg.prog, concepts: pg.concepts, sizes: pg.sizes })
       RNil => 0
   proofs:
     purity:
-      reads : [pg.rules, pg.src, pg.prog, pg.concepts]
+      reads : [pg.rules, pg.src, pg.prog, pg.concepts, pg.sizes]
       calls : [rule_is_texty]
     termination:
       bound : 8000
@@ -15851,11 +15870,11 @@ rule prog_any_texty
     out : number
   logic:
     out = match pg.rules:
-      RCons(head, tail) => if rule_is_texty(ProcGenState { rd: head, src: pg.src, off: 0, prog: pg.prog, concepts: pg.concepts }) == 1 then 1 else prog_any_texty(ProgGenState { rules: tail, src: pg.src, off: 0, prog: pg.prog, concepts: pg.concepts })
+      RCons(head, tail) => if rule_is_texty(ProcGenState { rd: head, src: pg.src, off: 0, prog: pg.prog, concepts: pg.concepts, sizes: pg.sizes }) == 1 then 1 else prog_any_texty(ProgGenState { rules: tail, src: pg.src, off: 0, prog: pg.prog, concepts: pg.concepts, sizes: pg.sizes })
       RNil => 0
   proofs:
     purity:
-      reads : [pg.rules, pg.src, pg.prog, pg.concepts]
+      reads : [pg.rules, pg.src, pg.prog, pg.concepts, pg.sizes]
       calls : [rule_is_texty, prog_any_texty]
     termination:
       bound : 8000
@@ -15897,11 +15916,11 @@ rule code_size_vfields
     out : number
   logic:
     out = match bgv.fields:
-      VFCons(name_start, name_len, val, rest) => code_size_node(ByteGenState { node: val, src: bgv.src, off: bgv.off, params: bgv.params, lets: bgv.lets, prog: bgv.prog, concepts: bgv.concepts }) + code_size_vfields(ByteGenVFields { fields: rest, src: bgv.src, off: bgv.off, params: bgv.params, lets: bgv.lets, prog: bgv.prog, concepts: bgv.concepts })
+      VFCons(name_start, name_len, val, rest) => code_size_node(ByteGenState { node: val, src: bgv.src, off: bgv.off, params: bgv.params, lets: bgv.lets, prog: bgv.prog, concepts: bgv.concepts, sizes: bgv.sizes }) + code_size_vfields(ByteGenVFields { fields: rest, src: bgv.src, off: bgv.off, params: bgv.params, lets: bgv.lets, prog: bgv.prog, concepts: bgv.concepts, sizes: bgv.sizes })
       VFNil => 0
   proofs:
     purity:
-      reads : [bgv.fields, bgv.src, bgv.off, bgv.params, bgv.lets, bgv.prog, bgv.concepts]
+      reads : [bgv.fields, bgv.src, bgv.off, bgv.params, bgv.lets, bgv.prog, bgv.concepts, bgv.sizes]
       calls : [code_size_node, code_size_vfields]
     termination:
       bound : 8000
@@ -15919,11 +15938,11 @@ rule x86_vfields
     out : bytes
   logic:
     out = match bgv.fields:
-      VFCons(name_start, name_len, val, rest) => concat(x86_node(ByteGenState { node: val, src: bgv.src, off: bgv.off, params: bgv.params, lets: bgv.lets, prog: bgv.prog, concepts: bgv.concepts }), x86_vfields(ByteGenVFields { fields: rest, src: bgv.src, off: bgv.off + code_size_node(ByteGenState { node: val, src: bgv.src, off: bgv.off, params: bgv.params, lets: bgv.lets, prog: bgv.prog, concepts: bgv.concepts }), params: bgv.params, lets: bgv.lets, prog: bgv.prog, concepts: bgv.concepts }))
+      VFCons(name_start, name_len, val, rest) => concat(x86_node(ByteGenState { node: val, src: bgv.src, off: bgv.off, params: bgv.params, lets: bgv.lets, prog: bgv.prog, concepts: bgv.concepts, sizes: bgv.sizes }), x86_vfields(ByteGenVFields { fields: rest, src: bgv.src, off: bgv.off + code_size_node(ByteGenState { node: val, src: bgv.src, off: bgv.off, params: bgv.params, lets: bgv.lets, prog: bgv.prog, concepts: bgv.concepts, sizes: bgv.sizes }), params: bgv.params, lets: bgv.lets, prog: bgv.prog, concepts: bgv.concepts, sizes: bgv.sizes }))
       VFNil => b""
   proofs:
     purity:
-      reads : [bgv.fields, bgv.src, bgv.off, bgv.params, bgv.lets, bgv.prog, bgv.concepts]
+      reads : [bgv.fields, bgv.src, bgv.off, bgv.params, bgv.lets, bgv.prog, bgv.concepts, bgv.sizes]
       calls : [x86_node, code_size_node, x86_vfields]
     termination:
       bound : 8000
@@ -16219,6 +16238,7 @@ concept ArmSizeState
     lets : Binding
     prog : RuleList
     concepts : ConceptList
+    sizes : ProcSizeList
 
 
 -- code_size_arms: total bytes of all arm blocks. Per arm: 14 bytes per binder (a
@@ -16233,11 +16253,11 @@ rule code_size_arms
     out : number
   logic:
     out = match az.arms:
-      ArmCons(vstart, vlen, binders, body, rest) => 14 * binder_list_len(binders) + code_size_node(ByteGenState { node: body, src: az.src, off: 0, params: az.params, lets: lets_append_binders(AppendBindersState { lets: az.lets, bs: binders }), prog: az.prog, concepts: az.concepts }) + 5 + code_size_arms(ArmSizeState { arms: rest, src: az.src, params: az.params, lets: az.lets, prog: az.prog, concepts: az.concepts })
+      ArmCons(vstart, vlen, binders, body, rest) => 14 * binder_list_len(binders) + code_size_node(ByteGenState { node: body, src: az.src, off: 0, params: az.params, lets: lets_append_binders(AppendBindersState { lets: az.lets, bs: binders }), prog: az.prog, concepts: az.concepts, sizes: az.sizes }) + 5 + code_size_arms(ArmSizeState { arms: rest, src: az.src, params: az.params, lets: az.lets, prog: az.prog, concepts: az.concepts, sizes: az.sizes })
       ArmNil => 0
   proofs:
     purity:
-      reads : [az.arms, az.src, az.params, az.lets, az.prog, az.concepts]
+      reads : [az.arms, az.src, az.params, az.lets, az.prog, az.concepts, az.sizes]
       calls : [binder_list_len, code_size_node, lets_append_binders, code_size_arms]
     termination:
       bound : 8000
@@ -16259,6 +16279,7 @@ concept DispatchState
     lets : Binding
     prog : RuleList
     concepts : ConceptList
+    sizes : ProcSizeList
     rest_disp : number
     pre_arms : number
 
@@ -16277,11 +16298,11 @@ rule x86_dispatch
     out : bytes
   logic:
     out = match ds.arms:
-      ArmCons(vstart, vlen, binders, body, rest) => concat(b"\x48\x81\xf9", le32(arm_tag_by_name(ArmTagState { concepts: ds.concepts, src: ds.src, vstart: vstart, vlen: vlen, cidx: 0 })), b"\x0f\x84", le32(ds.rest_disp + 9 + ds.pre_arms), x86_dispatch(DispatchState { arms: rest, src: ds.src, params: ds.params, lets: ds.lets, prog: ds.prog, concepts: ds.concepts, rest_disp: ds.rest_disp - 13, pre_arms: ds.pre_arms + 14 * binder_list_len(binders) + code_size_node(ByteGenState { node: body, src: ds.src, off: 0, params: ds.params, lets: lets_append_binders(AppendBindersState { lets: ds.lets, bs: binders }), prog: ds.prog, concepts: ds.concepts }) + 5 }))
+      ArmCons(vstart, vlen, binders, body, rest) => concat(b"\x48\x81\xf9", le32(arm_tag_by_name(ArmTagState { concepts: ds.concepts, src: ds.src, vstart: vstart, vlen: vlen, cidx: 0 })), b"\x0f\x84", le32(ds.rest_disp + 9 + ds.pre_arms), x86_dispatch(DispatchState { arms: rest, src: ds.src, params: ds.params, lets: ds.lets, prog: ds.prog, concepts: ds.concepts, sizes: ds.sizes, rest_disp: ds.rest_disp - 13, pre_arms: ds.pre_arms + 14 * binder_list_len(binders) + code_size_node(ByteGenState { node: body, src: ds.src, off: 0, params: ds.params, lets: lets_append_binders(AppendBindersState { lets: ds.lets, bs: binders }), prog: ds.prog, concepts: ds.concepts, sizes: ds.sizes }) + 5 }))
       ArmNil => b""
   proofs:
     purity:
-      reads : [ds.arms, ds.src, ds.params, ds.lets, ds.prog, ds.concepts, ds.rest_disp, ds.pre_arms]
+      reads : [ds.arms, ds.src, ds.params, ds.lets, ds.prog, ds.concepts, ds.sizes, ds.rest_disp, ds.pre_arms]
       calls : [arm_tag_by_name, x86_dispatch, binder_list_len, code_size_node, lets_append_binders]
     termination:
       bound : 8000
@@ -16337,6 +16358,7 @@ concept ArmGenState
     lets : Binding
     prog : RuleList
     concepts : ConceptList
+    sizes : ProcSizeList
 
 
 -- x86_arms: emit the arm blocks in order. Each block: the binder loads (base_slot =
@@ -16353,11 +16375,11 @@ rule x86_arms
     out : bytes
   logic:
     out = match ag.arms:
-      ArmCons(vstart, vlen, binders, body, rest) => concat(x86_binder_loads(BinderLoadState { binders: binders, j: 0, base_slot: count_binds(ag.lets) }), x86_node(ByteGenState { node: body, src: ag.src, off: ag.off + 14 * binder_list_len(binders), params: ag.params, lets: lets_append_binders(AppendBindersState { lets: ag.lets, bs: binders }), prog: ag.prog, concepts: ag.concepts }), b"\xe9", le32(code_size_arms(ArmSizeState { arms: rest, src: ag.src, params: ag.params, lets: ag.lets, prog: ag.prog, concepts: ag.concepts })), x86_arms(ArmGenState { arms: rest, src: ag.src, off: ag.off + 14 * binder_list_len(binders) + code_size_node(ByteGenState { node: body, src: ag.src, off: 0, params: ag.params, lets: lets_append_binders(AppendBindersState { lets: ag.lets, bs: binders }), prog: ag.prog, concepts: ag.concepts }) + 5, params: ag.params, lets: ag.lets, prog: ag.prog, concepts: ag.concepts }))
+      ArmCons(vstart, vlen, binders, body, rest) => concat(x86_binder_loads(BinderLoadState { binders: binders, j: 0, base_slot: count_binds(ag.lets) }), x86_node(ByteGenState { node: body, src: ag.src, off: ag.off + 14 * binder_list_len(binders), params: ag.params, lets: lets_append_binders(AppendBindersState { lets: ag.lets, bs: binders }), prog: ag.prog, concepts: ag.concepts, sizes: ag.sizes }), b"\xe9", le32(code_size_arms(ArmSizeState { arms: rest, src: ag.src, params: ag.params, lets: ag.lets, prog: ag.prog, concepts: ag.concepts, sizes: ag.sizes })), x86_arms(ArmGenState { arms: rest, src: ag.src, off: ag.off + 14 * binder_list_len(binders) + code_size_node(ByteGenState { node: body, src: ag.src, off: 0, params: ag.params, lets: lets_append_binders(AppendBindersState { lets: ag.lets, bs: binders }), prog: ag.prog, concepts: ag.concepts, sizes: ag.sizes }) + 5, params: ag.params, lets: ag.lets, prog: ag.prog, concepts: ag.concepts, sizes: ag.sizes }))
       ArmNil => b""
   proofs:
     purity:
-      reads : [ag.arms, ag.src, ag.off, ag.params, ag.lets, ag.prog, ag.concepts]
+      reads : [ag.arms, ag.src, ag.off, ag.params, ag.lets, ag.prog, ag.concepts, ag.sizes]
       calls : [x86_binder_loads, x86_node, code_size_node, code_size_arms, lets_append_binders, binder_list_len, count_binds, x86_arms]
     termination:
       bound : 8000
@@ -16379,8 +16401,8 @@ rule code_size_node
   logic:
     out = match bg.node:
       AstNum(value) => 11
-      AstBin(op, lhs, rhs) => code_size_node(ByteGenState { node: lhs, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }) + code_size_node(ByteGenState { node: rhs, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }) + (if op == 13 then 6 else if op == 14 then 6 else if op == 15 then 7 else if op == 16 then 8 else if op == 17 then 11 else if op == 30 then 20 else if op == 31 then 20 else if op == 1 then 12 else if op == 6 then 12 else if op == 19 then 12 else if op == 20 then 12 else if op == 5 then 12 else if op == 4 then 12 else 1)
-      AstNeg(inner) => code_size_node(ByteGenState { node: inner, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }) + 5
+      AstBin(op, lhs, rhs) => code_size_node(ByteGenState { node: lhs, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + code_size_node(ByteGenState { node: rhs, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + (if op == 13 then 6 else if op == 14 then 6 else if op == 15 then 7 else if op == 16 then 8 else if op == 17 then 11 else if op == 30 then 20 else if op == 31 then 20 else if op == 1 then 12 else if op == 6 then 12 else if op == 19 then 12 else if op == 20 then 12 else if op == 5 then 12 else if op == 4 then 12 else 1)
+      AstNeg(inner) => code_size_node(ByteGenState { node: inner, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + 5
       AstNot(inner) => 1
       AstVar(start, len) => 6
       -- records-arc slice 4: a field access on any STATICALLY-RESOLVABLE base (typed
@@ -16391,7 +16413,7 @@ rule code_size_node
       -- entry_size / field_index. An unresolvable base keeps the 1-byte int3 fallback.
       -- The resolvability test is the SAME static_concept_of call x86_node makes —
       -- a divergence desyncs every downstream offset (the two-pass sharp edge).
-      AstField(base, fstart, flen) => if static_concept_of(StaticConceptState { node: base, src: bg.src, params: bg.params, lets: bg.lets, concepts: bg.concepts }) >= 0 then code_size_node(ByteGenState { node: base, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }) + 19 else 1
+      AstField(base, fstart, flen) => if static_concept_of(StaticConceptState { node: base, src: bg.src, params: bg.params, lets: bg.lets, concepts: bg.concepts }) >= 0 then code_size_node(ByteGenState { node: base, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + 19 else 1
       -- Text values slice 2: the three span primitives dispatch BEFORE the real-call
       -- path, on the VERBATIM same span_is_* + arg_list_len conditions as x86_node
       -- (the two-pass drift edge). Constant suffixes: byte_at = 36 (pops + split +
@@ -16399,24 +16421,24 @@ rule code_size_node
       -- push), substring = 38 (pops + split + two bounds checks + repack + OOB block).
       -- A wrong arity emits ONLY `push 0` (2 bytes) — oracle parity with eval's
       -- defensive VNum 0, no argument code at all.
-      AstCall(callee_start, callee_len, args) => if span_is_byte_at(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then (if arg_list_len(args) == 2 then code_size_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }) + 36 else 2) else if span_is_length(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then (if arg_list_len(args) == 1 then code_size_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }) + 4 else 2) else if span_is_substring(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then (if arg_list_len(args) == 3 then code_size_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }) + 38 else 2) else if span_is_concat(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then 1 else if callee_is_texty(FindRuleState { rules: bg.prog, src: bg.src, q_start: callee_start, q_len: callee_len }) == 1 then 1 else code_size_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }) + 13
+      AstCall(callee_start, callee_len, args) => if span_is_byte_at(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then (if arg_list_len(args) == 2 then code_size_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + 36 else 2) else if span_is_length(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then (if arg_list_len(args) == 1 then code_size_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + 4 else 2) else if span_is_substring(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then (if arg_list_len(args) == 3 then code_size_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + 38 else 2) else if span_is_concat(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then 1 else if callee_is_texty(FindRuleState { rules: bg.prog, src: bg.src, q_start: callee_start, q_len: callee_len }) == 1 then 1 else code_size_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + 13
       -- Text values slice 2: a string literal is one packed-span push —
       -- mov rax, imm64 (10) + push rax (1) = 11, same shape as AstNum.
       AstStr(start, len) => 11
       AstBool(value) => 1
-      AstIf(cond, thn, els) => code_size_node(ByteGenState { node: cond, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }) + 15 + code_size_node(ByteGenState { node: thn, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }) + code_size_node(ByteGenState { node: els, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts })
+      AstIf(cond, thn, els) => code_size_node(ByteGenState { node: cond, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + 15 + code_size_node(ByteGenState { node: thn, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + code_size_node(ByteGenState { node: els, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes })
       AstErr => 1
       -- R7a: a VariantConstruct emits the field-value pushes (code_size_vfields) +
       -- a fixed 25-byte arena-write suffix (mov rax,r14 3 + imul 7 + add rax,r15 3 +
       -- mov qword[rax],tag 7 + push r14 2 + inc r14 3) + 8 bytes per field pop+store.
-      AstVariant(cstart, clen, vstart, vlen, fields) => code_size_vfields(ByteGenVFields { fields: fields, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }) + 25 + 8 * vfield_len(fields)
+      AstVariant(cstart, clen, vstart, vlen, fields) => code_size_vfields(ByteGenVFields { fields: fields, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + 25 + 8 * vfield_len(fields)
       -- R7b: match = scrut code + 14 (pop rax ; imul rax,rax,E ; add rax,r15 ;
       -- mov rcx,[rax]) + 13 per arm (cmp rcx,tag 7 + je 6) + 9 (default: xor rax,rax 3
       -- + push rax 1 + jmp end 5) + code_size_arms (the arm blocks). Must match x86_node.
-      AstMatch(scrut, arms) => code_size_node(ByteGenState { node: scrut, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }) + 14 + 13 * arm_list_len(arms) + 9 + code_size_arms(ArmSizeState { arms: arms, src: bg.src, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts })
+      AstMatch(scrut, arms) => code_size_node(ByteGenState { node: scrut, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + 14 + 13 * arm_list_len(arms) + 9 + code_size_arms(ArmSizeState { arms: arms, src: bg.src, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes })
   proofs:
     purity:
-      reads : [bg.node, bg.src, bg.off, bg.params, bg.lets, bg.prog, bg.concepts]
+      reads : [bg.node, bg.src, bg.off, bg.params, bg.lets, bg.prog, bg.concepts, bg.sizes]
       calls : [code_size_node, code_size_args, code_size_vfields, vfield_len, arm_list_len, code_size_arms, static_concept_of, span_is_byte_at, span_is_length, span_is_substring, span_is_concat, callee_is_texty, arg_list_len]
     termination:
       bound : 8000
@@ -16433,11 +16455,11 @@ rule code_size_args
     out : number
   logic:
     out = match ag.args:
-      ArgCons(head, tail) => code_size_node(ByteGenState { node: head, src: ag.src, off: ag.off, params: ag.params, lets: ag.lets, prog: ag.prog, concepts: ag.concepts }) + code_size_args(ByteGenArgs { args: tail, src: ag.src, off: ag.off, params: ag.params, lets: ag.lets, prog: ag.prog, concepts: ag.concepts })
+      ArgCons(head, tail) => code_size_node(ByteGenState { node: head, src: ag.src, off: ag.off, params: ag.params, lets: ag.lets, prog: ag.prog, concepts: ag.concepts, sizes: ag.sizes }) + code_size_args(ByteGenArgs { args: tail, src: ag.src, off: ag.off, params: ag.params, lets: ag.lets, prog: ag.prog, concepts: ag.concepts, sizes: ag.sizes })
       ArgNil => 0
   proofs:
     purity:
-      reads : [ag.args, ag.src, ag.off, ag.params, ag.lets, ag.prog, ag.concepts]
+      reads : [ag.args, ag.src, ag.off, ag.params, ag.lets, ag.prog, ag.concepts, ag.sizes]
       calls : [code_size_node, code_size_args]
     termination:
       bound : 8000
@@ -16462,6 +16484,7 @@ concept LetGenState
     idx : number
     prog : RuleList
     concepts : ConceptList
+    sizes : ProcSizeList
 
 
 -- code_size_let_stores: the EXACT byte count the let-store prologue emits for a
@@ -16480,11 +16503,11 @@ rule code_size_let_stores
     out : number
   logic:
     out = match lg.rem:
-      BCons(name_start, name_len, value, rest) => code_size_node(ByteGenState { node: value, src: lg.src, off: 0, params: lg.params, lets: lg.all_binds, prog: lg.prog, concepts: lg.concepts }) + 8 + code_size_let_stores(LetGenState { rem: rest, all_binds: lg.all_binds, src: lg.src, off: 0, params: lg.params, idx: lg.idx + 1, prog: lg.prog, concepts: lg.concepts })
+      BCons(name_start, name_len, value, rest) => code_size_node(ByteGenState { node: value, src: lg.src, off: 0, params: lg.params, lets: lg.all_binds, prog: lg.prog, concepts: lg.concepts, sizes: lg.sizes }) + 8 + code_size_let_stores(LetGenState { rem: rest, all_binds: lg.all_binds, src: lg.src, off: 0, params: lg.params, idx: lg.idx + 1, prog: lg.prog, concepts: lg.concepts, sizes: lg.sizes })
       BNil => 0
   proofs:
     purity:
-      reads : [lg.rem, lg.all_binds, lg.src, lg.params, lg.idx, lg.prog, lg.concepts]
+      reads : [lg.rem, lg.all_binds, lg.src, lg.params, lg.idx, lg.prog, lg.concepts, lg.sizes]
       calls : [code_size_node, code_size_let_stores]
     termination:
       bound : 8000
@@ -16506,11 +16529,11 @@ rule x86_let_stores
     out : bytes
   logic:
     out = match lg.rem:
-      BCons(name_start, name_len, value, rest) => concat(x86_node(ByteGenState { node: value, src: lg.src, off: lg.off, params: lg.params, lets: lg.all_binds, prog: lg.prog, concepts: lg.concepts }), b"\x58\x48\x89\x85", le32(0 - 8 * (lg.idx + 1)), x86_let_stores(LetGenState { rem: rest, all_binds: lg.all_binds, src: lg.src, off: lg.off + code_size_node(ByteGenState { node: value, src: lg.src, off: lg.off, params: lg.params, lets: lg.all_binds, prog: lg.prog, concepts: lg.concepts }) + 8, params: lg.params, idx: lg.idx + 1, prog: lg.prog, concepts: lg.concepts }))
+      BCons(name_start, name_len, value, rest) => concat(x86_node(ByteGenState { node: value, src: lg.src, off: lg.off, params: lg.params, lets: lg.all_binds, prog: lg.prog, concepts: lg.concepts, sizes: lg.sizes }), b"\x58\x48\x89\x85", le32(0 - 8 * (lg.idx + 1)), x86_let_stores(LetGenState { rem: rest, all_binds: lg.all_binds, src: lg.src, off: lg.off + code_size_node(ByteGenState { node: value, src: lg.src, off: lg.off, params: lg.params, lets: lg.all_binds, prog: lg.prog, concepts: lg.concepts, sizes: lg.sizes }) + 8, params: lg.params, idx: lg.idx + 1, prog: lg.prog, concepts: lg.concepts, sizes: lg.sizes }))
       BNil => b""
   proofs:
     purity:
-      reads : [lg.rem, lg.all_binds, lg.src, lg.off, lg.params, lg.idx, lg.prog, lg.concepts]
+      reads : [lg.rem, lg.all_binds, lg.src, lg.off, lg.params, lg.idx, lg.prog, lg.concepts, lg.sizes]
       calls : [x86_node, code_size_node, x86_let_stores]
     termination:
       bound : 8000
@@ -16536,23 +16559,96 @@ rule proc_size
     let nlets = count_binds(binds)
     let nbind = mb_ast(result) + mb_binds(binds)
     let subsize = if nlets + nbind > 0 then 7 else 0
-    let storesize = code_size_let_stores(LetGenState { rem: binds, all_binds: binds, src: pg.src, off: 0, params: rule_params_of(pg.rd), idx: 0, prog: pg.prog, concepts: pg.concepts })
-    out = 4 + subsize + storesize + (if rule_is_texty(pg) == 1 then code_size_stream_node(ByteGenState { node: result, src: pg.src, off: 0, params: rule_params_of(pg.rd), lets: binds, prog: pg.prog, concepts: pg.concepts }) + 2 else code_size_node(ByteGenState { node: result, src: pg.src, off: 0, params: rule_params_of(pg.rd), lets: binds, prog: pg.prog, concepts: pg.concepts })) + 6
+    let storesize = code_size_let_stores(LetGenState { rem: binds, all_binds: binds, src: pg.src, off: 0, params: rule_params_of(pg.rd), idx: 0, prog: pg.prog, concepts: pg.concepts, sizes: pg.sizes })
+    out = 4 + subsize + storesize + (if rule_is_texty(pg) == 1 then code_size_stream_node(ByteGenState { node: result, src: pg.src, off: 0, params: rule_params_of(pg.rd), lets: binds, prog: pg.prog, concepts: pg.concepts, sizes: pg.sizes }) + 2 else code_size_node(ByteGenState { node: result, src: pg.src, off: 0, params: rule_params_of(pg.rd), lets: binds, prog: pg.prog, concepts: pg.concepts, sizes: pg.sizes })) + 6
   proofs:
     purity:
-      reads : [pg, pg.rd, pg.src, pg.prog, pg.concepts]
+      reads : [pg, pg.rd, pg.src, pg.prog, pg.concepts, pg.sizes]
       calls : [rd_body, block_binds, block_result, count_binds, mb_ast, mb_binds, code_size_let_stores, code_size_node, rule_is_texty, code_size_stream_node, rule_params_of]
     termination:
       bound : 8000
 
 
+-- proc_sizes: the per-rule proc SIZES in rule order — ONE left-to-right pass that
+-- calls proc_size exactly once per rule and conses the result. Computed ONCE at the
+-- top of x86_program_src / elf_program_src and threaded (like `concepts`) so that
+-- proc_offset and ps_total read a cached size instead of re-walking each proc body.
+-- This is what turns the emitter's offset accounting from O(N^2 * body) to O(N):
+-- proc_size's body-walk now happens N times total, not once per callee-resolution.
+-- The list is aligned 1:1 with the RuleList (same order), so proc_offset can shrink
+-- both in lockstep. Same RCons/RNil cons shape as RuleList (arena + structural).
+rule proc_sizes
+  @intention: "Per-rule emitted-proc sizes in rule order — one proc_size pass, cached as a cons-list"
+  @source: vexprparse.intent:56
+  input:
+    pg : ProgGenState
+  output:
+    out : ProcSizeList
+  logic:
+    out = match pg.rules:
+      RCons(head, tail) => ProcSizeList::PSCons { size: proc_size(ProcGenState { rd: head, src: pg.src, off: 0, prog: pg.prog, concepts: pg.concepts, sizes: pg.sizes }), rest: proc_sizes(ProgGenState { rules: tail, src: pg.src, off: 0, prog: pg.prog, concepts: pg.concepts, sizes: pg.sizes }) }
+      RNil => ProcSizeList::PSNil
+  proofs:
+    purity:
+      reads : [pg.rules, pg.src, pg.prog, pg.concepts, pg.sizes]
+      calls : [proc_size, proc_sizes]
+    termination:
+      bound : 8000
+
+
+-- ps_head: the first proc size in the list (0 for the empty list). Used by
+-- proc_offset to add the current proc's size to the running offset without
+-- re-calling proc_size.
+rule ps_head
+  @intention: "The head proc size of a ProcSizeList (0 if empty)"
+  @source: vexprparse.intent:56
+  input:
+    psl : ProcSizeList
+  output:
+    out : number
+  logic:
+    out = match psl:
+      PSCons(sz, rest) => sz
+      PSNil => 0
+  proofs:
+    purity:
+      reads : [psl]
+      calls : []
+    termination:
+      bound : 4
+
+
+-- ps_tail: the list minus its head (empty stays empty). proc_offset advances this
+-- in lockstep with the RuleList tail so the head size always matches the head rule.
+rule ps_tail
+  @intention: "The tail of a ProcSizeList (empty if already empty)"
+  @source: vexprparse.intent:56
+  input:
+    psl : ProcSizeList
+  output:
+    out : ProcSizeList
+  logic:
+    out = match psl:
+      PSCons(sz, rest) => rest
+      PSNil => ProcSizeList::PSNil
+  proofs:
+    purity:
+      reads : [psl]
+      calls : []
+    termination:
+      bound : 4
+
+
 -- proc_offset: the absolute blob offset of the proc whose name span matches the
 -- query — the sum of proc_size over the procs BEFORE it (the entry proc is at 0).
--- Walks the program accumulating each proc_size into `acc` until the named proc
--- is reached, then returns acc. A missing callee returns acc (never reached for a
--- well-formed non-recursive program; rel32 would be wrong, caught by mmap+exec).
+-- Walks the program accumulating each proc's size into `acc` until the named proc
+-- is reached, then returns acc. The size comes from the PRECOMPUTED `po.sizes` list
+-- (walked in lockstep with the RuleList via ps_head / ps_tail) — the codegen-dedup
+-- change: the same constant offset with NO per-callee-site proc_size body re-walk.
+-- A missing callee returns acc (never reached for a well-formed non-recursive
+-- program; rel32 would be wrong, caught by mmap+exec).
 rule proc_offset
-  @intention: "Absolute blob offset of a named proc = sum of proc_size over the procs before it"
+  @intention: "Absolute blob offset of a named proc = sum of the precomputed proc sizes before it"
   @source: vexprparse.intent:56
   input:
     po : ProcOffState
@@ -16560,12 +16656,12 @@ rule proc_offset
     out : number
   logic:
     out = match po.rules:
-      RCons(head, tail) => if rd_name_len(head) == po.q_len and name_eq(NameEqState { src: po.src, a_start: rd_name_start(head), b_start: po.q_start, len: po.q_len, off: 0 }) == 1 then po.acc else proc_offset(ProcOffState { rules: tail, src: po.src, acc: po.acc + proc_size(ProcGenState { rd: head, src: po.src, off: 0, prog: po.rules, concepts: po.concepts }), q_start: po.q_start, q_len: po.q_len, concepts: po.concepts })
+      RCons(head, tail) => if rd_name_len(head) == po.q_len and name_eq(NameEqState { src: po.src, a_start: rd_name_start(head), b_start: po.q_start, len: po.q_len, off: 0 }) == 1 then po.acc else proc_offset(ProcOffState { rules: tail, src: po.src, acc: po.acc + ps_head(po.sizes), q_start: po.q_start, q_len: po.q_len, concepts: po.concepts, sizes: ps_tail(po.sizes) })
       RNil => po.acc
   proofs:
     purity:
-      reads : [po.rules, po.src, po.acc, po.q_start, po.q_len, po.concepts]
-      calls : [rd_name_len, name_eq, rd_name_start, proc_offset, proc_size]
+      reads : [po.rules, po.src, po.acc, po.q_start, po.q_len, po.concepts, po.sizes]
+      calls : [rd_name_len, name_eq, rd_name_start, proc_offset, ps_head, ps_tail]
     termination:
       bound : 8000
 
@@ -16590,8 +16686,8 @@ rule x86_node
   logic:
     out = match bg.node:
       AstNum(value) => concat(b"\x48\xb8", le64(value), b"\x50")
-      AstBin(op, lhs, rhs) => concat(x86_node(ByteGenState { node: lhs, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }), x86_node(ByteGenState { node: rhs, src: bg.src, off: bg.off + code_size_node(ByteGenState { node: lhs, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }), params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }), if op == 13 then b"\x59\x58\x48\x01\xc8\x50" else if op == 14 then b"\x59\x58\x48\x29\xc8\x50" else if op == 15 then b"\x59\x58\x48\x0f\xaf\xc1\x50" else if op == 16 then b"\x59\x58\x48\x99\x48\xf7\xf9\x50" else if op == 17 then b"\x59\x58\x48\x99\x48\xf7\xf9\x48\x89\xd0\x50" else if op == 30 then b"\x59\x58\x48\x85\xc0\x0f\x95\xc0\x48\x85\xc9\x0f\x95\xc1\x20\xc8\x0f\xb6\xc0\x50" else if op == 31 then b"\x59\x58\x48\x85\xc0\x0f\x95\xc0\x48\x85\xc9\x0f\x95\xc1\x08\xc8\x0f\xb6\xc0\x50" else if op == 1 then b"\x59\x58\x48\x39\xc8\x0f\x94\xc0\x0f\xb6\xc0\x50" else if op == 6 then b"\x59\x58\x48\x39\xc8\x0f\x95\xc0\x0f\xb6\xc0\x50" else if op == 19 then b"\x59\x58\x48\x39\xc8\x0f\x9c\xc0\x0f\xb6\xc0\x50" else if op == 20 then b"\x59\x58\x48\x39\xc8\x0f\x9f\xc0\x0f\xb6\xc0\x50" else if op == 5 then b"\x59\x58\x48\x39\xc8\x0f\x9e\xc0\x0f\xb6\xc0\x50" else if op == 4 then b"\x59\x58\x48\x39\xc8\x0f\x9d\xc0\x0f\xb6\xc0\x50" else b"\xcc")
-      AstNeg(inner) => concat(x86_node(ByteGenState { node: inner, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }), b"\x58\x48\xf7\xd8\x50")
+      AstBin(op, lhs, rhs) => concat(x86_node(ByteGenState { node: lhs, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }), x86_node(ByteGenState { node: rhs, src: bg.src, off: bg.off + code_size_node(ByteGenState { node: lhs, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }), params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }), if op == 13 then b"\x59\x58\x48\x01\xc8\x50" else if op == 14 then b"\x59\x58\x48\x29\xc8\x50" else if op == 15 then b"\x59\x58\x48\x0f\xaf\xc1\x50" else if op == 16 then b"\x59\x58\x48\x99\x48\xf7\xf9\x50" else if op == 17 then b"\x59\x58\x48\x99\x48\xf7\xf9\x48\x89\xd0\x50" else if op == 30 then b"\x59\x58\x48\x85\xc0\x0f\x95\xc0\x48\x85\xc9\x0f\x95\xc1\x20\xc8\x0f\xb6\xc0\x50" else if op == 31 then b"\x59\x58\x48\x85\xc0\x0f\x95\xc0\x48\x85\xc9\x0f\x95\xc1\x08\xc8\x0f\xb6\xc0\x50" else if op == 1 then b"\x59\x58\x48\x39\xc8\x0f\x94\xc0\x0f\xb6\xc0\x50" else if op == 6 then b"\x59\x58\x48\x39\xc8\x0f\x95\xc0\x0f\xb6\xc0\x50" else if op == 19 then b"\x59\x58\x48\x39\xc8\x0f\x9c\xc0\x0f\xb6\xc0\x50" else if op == 20 then b"\x59\x58\x48\x39\xc8\x0f\x9f\xc0\x0f\xb6\xc0\x50" else if op == 5 then b"\x59\x58\x48\x39\xc8\x0f\x9e\xc0\x0f\xb6\xc0\x50" else if op == 4 then b"\x59\x58\x48\x39\xc8\x0f\x9d\xc0\x0f\xb6\xc0\x50" else b"\xcc")
+      AstNeg(inner) => concat(x86_node(ByteGenState { node: inner, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }), b"\x58\x48\xf7\xd8\x50")
       AstNot(inner) => b"\xcc"
       AstVar(start, len) => (if param_index(ParamIndexState { params: bg.params, src: bg.src, q_start: start, q_len: len, idx: 0 }) >= 0 then concat(b"\xff\xb5", le32(16 + 8 * (param_list_len(bg.params) - 1 - param_index(ParamIndexState { params: bg.params, src: bg.src, q_start: start, q_len: len, idx: 0 })))) else if let_index(LetIndexState { binds: bg.lets, src: bg.src, q_start: start, q_len: len, idx: 0 }) >= 0 then concat(b"\xff\xb5", le32(0 - 8 * (let_index(LetIndexState { binds: bg.lets, src: bg.src, q_start: start, q_len: len, idx: 0 }) + 1))) else b"\xcc")
       -- records-arc slice 4: field access via the UNIFIED static resolver. The base
@@ -16606,7 +16702,7 @@ rule x86_node
       -- (concept_at_index -> cd_fields -> field_index_of) — no runtime tag. An
       -- unresolvable base keeps int3 (an UNTYPED param stays out BY DESIGN — the
       -- compiler never infers a param's concept from call sites).
-      AstField(base, fstart, flen) => (if static_concept_of(StaticConceptState { node: base, src: bg.src, params: bg.params, lets: bg.lets, concepts: bg.concepts }) >= 0 then concat(x86_node(ByteGenState { node: base, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }), b"\x58\x48\x69\xc0", le32(8 * (max_payload_fields(bg.concepts) + 1)), b"\x4c\x01\xf8\x48\x8b\x80", le32(8 + 8 * field_index_of(FieldIdxState { fields: cd_fields(concept_at_index(ConceptAtState { concepts: bg.concepts, idx: static_concept_of(StaticConceptState { node: base, src: bg.src, params: bg.params, lets: bg.lets, concepts: bg.concepts }) })), src: bg.src, q_start: fstart, q_len: flen, idx: 0 })), b"\x50") else b"\xcc")
+      AstField(base, fstart, flen) => (if static_concept_of(StaticConceptState { node: base, src: bg.src, params: bg.params, lets: bg.lets, concepts: bg.concepts }) >= 0 then concat(x86_node(ByteGenState { node: base, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }), b"\x58\x48\x69\xc0", le32(8 * (max_payload_fields(bg.concepts) + 1)), b"\x4c\x01\xf8\x48\x8b\x80", le32(8 + 8 * field_index_of(FieldIdxState { fields: cd_fields(concept_at_index(ConceptAtState { concepts: bg.concepts, idx: static_concept_of(StaticConceptState { node: base, src: bg.src, params: bg.params, lets: bg.lets, concepts: bg.concepts }) })), src: bg.src, q_start: fstart, q_len: flen, idx: 0 })), b"\x50") else b"\xcc")
       -- Text values slice 2: the three span primitives dispatch BEFORE the real-call
       -- path, on the VERBATIM same span_is_* + arg_list_len conditions as
       -- code_size_node (the two-pass drift edge). All operate on the packed-span
@@ -16625,7 +16721,7 @@ rule x86_node
       --     32 ; sub rcx, rdx ; or rax, rcx ; push rax ; jmp +3 ; OOB: xor eax,
       --     eax ; push rax. Pure span arithmetic — no memory touch, no src_base.
       -- A wrong arity emits ONLY push 0 (6a 00, 2 bytes) — eval's defensive VNum 0.
-      AstCall(callee_start, callee_len, args) => if span_is_byte_at(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then (if arg_list_len(args) == 2 then concat(x86_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }), b"\x59\x58\x89\xc2\x48\xc1\xe8\x20\x48\x39\xd1\x73\x14\x48\x01\xc8\x48\xba", le64(4194304 + blob_end_off(ProgGenState { rules: bg.prog, src: bg.src, off: 0, prog: bg.prog, concepts: bg.concepts })), b"\x0f\xb6\x04\x02\x50\xeb\x03\x31\xc0\x50") else b"\x6a\x00") else if span_is_length(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then (if arg_list_len(args) == 1 then concat(x86_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }), b"\x58\x89\xc0\x50") else b"\x6a\x00") else if span_is_substring(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then (if arg_list_len(args) == 3 then concat(x86_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }), b"\x59\x5a\x58\x89\xc6\x48\xc1\xe8\x20\x48\x39\xca\x77\x15\x48\x39\xf1\x77\x10\x48\x01\xd0\x48\xc1\xe0\x20\x48\x29\xd1\x48\x09\xc8\x50\xeb\x03\x31\xc0\x50") else b"\x6a\x00") else if span_is_concat(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then b"\xcc" else if callee_is_texty(FindRuleState { rules: bg.prog, src: bg.src, q_start: callee_start, q_len: callee_len }) == 1 then b"\xcc" else concat(x86_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }), b"\xe8", le32(proc_offset(ProcOffState { rules: bg.prog, src: bg.src, acc: 0, q_start: callee_start, q_len: callee_len, concepts: bg.concepts }) - (bg.off + code_size_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }) + 5)), b"\x48\x81\xc4", le32(8 * arg_list_len(args)), b"\x50")
+      AstCall(callee_start, callee_len, args) => if span_is_byte_at(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then (if arg_list_len(args) == 2 then concat(x86_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }), b"\x59\x58\x89\xc2\x48\xc1\xe8\x20\x48\x39\xd1\x73\x14\x48\x01\xc8\x48\xba", le64(4194304 + blob_end_off(ProgGenState { rules: bg.prog, src: bg.src, off: 0, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes })), b"\x0f\xb6\x04\x02\x50\xeb\x03\x31\xc0\x50") else b"\x6a\x00") else if span_is_length(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then (if arg_list_len(args) == 1 then concat(x86_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }), b"\x58\x89\xc0\x50") else b"\x6a\x00") else if span_is_substring(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then (if arg_list_len(args) == 3 then concat(x86_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }), b"\x59\x5a\x58\x89\xc6\x48\xc1\xe8\x20\x48\x39\xca\x77\x15\x48\x39\xf1\x77\x10\x48\x01\xd0\x48\xc1\xe0\x20\x48\x29\xd1\x48\x09\xc8\x50\xeb\x03\x31\xc0\x50") else b"\x6a\x00") else if span_is_concat(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then b"\xcc" else if callee_is_texty(FindRuleState { rules: bg.prog, src: bg.src, q_start: callee_start, q_len: callee_len }) == 1 then b"\xcc" else concat(x86_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }), b"\xe8", le32(proc_offset(ProcOffState { rules: bg.prog, src: bg.src, acc: 0, q_start: callee_start, q_len: callee_len, concepts: bg.concepts, sizes: bg.sizes }) - (bg.off + code_size_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + 5)), b"\x48\x81\xc4", le32(8 * arg_list_len(args)), b"\x50")
       -- Text values slice 2: a string literal compiles to ONE packed i64 —
       -- (start+1) * 2^32 + (len-2), quotes stripped, the SAME numbers as eval's
       -- VText (the token span includes both quotes; a lone-quote token packs len
@@ -16639,7 +16735,7 @@ rule x86_node
       -- recursion sat in an ELSE branch, so no call rel32 was ever emitted inside
       -- a THEN branch until word_length — its recursive call landed 5 bytes short
       -- (into the previous proc's epilogue).
-      AstIf(cond, thn, els) => concat(x86_node(ByteGenState { node: cond, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }), b"\x58\x48\x85\xc0\x0f\x84", le32(code_size_node(ByteGenState { node: thn, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }) + 5), x86_node(ByteGenState { node: thn, src: bg.src, off: bg.off + code_size_node(ByteGenState { node: cond, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }) + 10, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }), b"\xe9", le32(code_size_node(ByteGenState { node: els, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts })), x86_node(ByteGenState { node: els, src: bg.src, off: bg.off + code_size_node(ByteGenState { node: cond, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }) + 15 + code_size_node(ByteGenState { node: thn, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }), params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }))
+      AstIf(cond, thn, els) => concat(x86_node(ByteGenState { node: cond, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }), b"\x58\x48\x85\xc0\x0f\x84", le32(code_size_node(ByteGenState { node: thn, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + 5), x86_node(ByteGenState { node: thn, src: bg.src, off: bg.off + code_size_node(ByteGenState { node: cond, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + 10, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }), b"\xe9", le32(code_size_node(ByteGenState { node: els, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes })), x86_node(ByteGenState { node: els, src: bg.src, off: bg.off + code_size_node(ByteGenState { node: cond, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + 15 + code_size_node(ByteGenState { node: thn, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }), params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }))
       AstErr => b"\xcc"
       -- R7a: a VariantConstruct = arena node allocation. First emit the field-value
       -- pushes (x86_vfields, left-to-right so field[n-1] ends on top of the stack).
@@ -16649,17 +16745,17 @@ rule x86_node
       -- top-of-stack into the highest slot first); leave the INDEX on the stack
       -- (push r14 = the variant value); inc r14 (bump the node count). entry_size and
       -- tag are self-computed from the ConceptList threaded through bg.concepts.
-      AstVariant(cstart, clen, vstart, vlen, fields) => concat(x86_vfields(ByteGenVFields { fields: fields, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }), b"\x4c\x89\xf0\x48\x69\xc0", le32(8 * (max_payload_fields(bg.concepts) + 1)), b"\x4c\x01\xf8\x48\xc7\x00", le32(variant_tag(VariantTagState { concepts: bg.concepts, src: bg.src, cstart: cstart, clen: clen, vstart: vstart, vlen: vlen })), x86_vpops(VPopState { rem: fields, slot: vfield_len(fields) - 1 }), b"\x41\x56\x49\xff\xc6")
+      AstVariant(cstart, clen, vstart, vlen, fields) => concat(x86_vfields(ByteGenVFields { fields: fields, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }), b"\x4c\x89\xf0\x48\x69\xc0", le32(8 * (max_payload_fields(bg.concepts) + 1)), b"\x4c\x01\xf8\x48\xc7\x00", le32(variant_tag(VariantTagState { concepts: bg.concepts, src: bg.src, cstart: cstart, clen: clen, vstart: vstart, vlen: vlen })), x86_vpops(VPopState { rem: fields, slot: vfield_len(fields) - 1 }), b"\x41\x56\x49\xff\xc6")
       -- R7b: match dispatch. Emit scrut (pushes index); pop rax (58); node_addr =
       -- r15 + index*entry_size (imul rax,rax,E 48 69 c0+le32 ; add rax,r15 4c 01 f8);
       -- load tag mov rcx,[rax] (48 8b 08); the cmp/je dispatch chain (x86_dispatch);
       -- the default block xor rax,rax (48 31 c0) ; push rax (50) ; jmp end (e9+le32,
       -- skips all arm blocks); then the arm blocks (x86_arms). Each arm binds its
       -- payload into the reserved binder slots, runs its body, and jmps to end.
-      AstMatch(scrut, arms) => concat(x86_node(ByteGenState { node: scrut, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }), b"\x58\x48\x69\xc0", le32(8 * (max_payload_fields(bg.concepts) + 1)), b"\x4c\x01\xf8\x48\x8b\x08", x86_dispatch(DispatchState { arms: arms, src: bg.src, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, rest_disp: 13 * (arm_list_len(arms) - 1), pre_arms: 0 }), b"\x48\x31\xc0\x50\xe9", le32(code_size_arms(ArmSizeState { arms: arms, src: bg.src, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts })), x86_arms(ArmGenState { arms: arms, src: bg.src, off: bg.off + code_size_node(ByteGenState { node: scrut, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }) + 14 + 13 * arm_list_len(arms) + 9, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }))
+      AstMatch(scrut, arms) => concat(x86_node(ByteGenState { node: scrut, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }), b"\x58\x48\x69\xc0", le32(8 * (max_payload_fields(bg.concepts) + 1)), b"\x4c\x01\xf8\x48\x8b\x08", x86_dispatch(DispatchState { arms: arms, src: bg.src, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, rest_disp: 13 * (arm_list_len(arms) - 1), pre_arms: 0 }), b"\x48\x31\xc0\x50\xe9", le32(code_size_arms(ArmSizeState { arms: arms, src: bg.src, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes })), x86_arms(ArmGenState { arms: arms, src: bg.src, off: bg.off + code_size_node(ByteGenState { node: scrut, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + 14 + 13 * arm_list_len(arms) + 9, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }))
   proofs:
     purity:
-      reads : [bg.node, bg.src, bg.off, bg.params, bg.lets, bg.prog, bg.concepts]
+      reads : [bg.node, bg.src, bg.off, bg.params, bg.lets, bg.prog, bg.concepts, bg.sizes]
       calls : [x86_node, code_size_node, x86_args, code_size_args, param_index, let_index, param_list_len, proc_offset, arg_list_len, x86_vfields, x86_vpops, vfield_len, max_payload_fields, variant_tag, x86_dispatch, x86_arms, code_size_arms, arm_list_len, static_concept_of, field_index_of, cd_fields, concept_at_index, span_is_byte_at, span_is_length, span_is_substring, span_is_concat, callee_is_texty, blob_end_off]
     termination:
       bound : 8000
@@ -16677,11 +16773,11 @@ rule x86_args
     out : bytes
   logic:
     out = match ag.args:
-      ArgCons(head, tail) => concat(x86_node(ByteGenState { node: head, src: ag.src, off: ag.off, params: ag.params, lets: ag.lets, prog: ag.prog, concepts: ag.concepts }), x86_args(ByteGenArgs { args: tail, src: ag.src, off: ag.off + code_size_node(ByteGenState { node: head, src: ag.src, off: ag.off, params: ag.params, lets: ag.lets, prog: ag.prog, concepts: ag.concepts }), params: ag.params, lets: ag.lets, prog: ag.prog, concepts: ag.concepts }))
+      ArgCons(head, tail) => concat(x86_node(ByteGenState { node: head, src: ag.src, off: ag.off, params: ag.params, lets: ag.lets, prog: ag.prog, concepts: ag.concepts, sizes: ag.sizes }), x86_args(ByteGenArgs { args: tail, src: ag.src, off: ag.off + code_size_node(ByteGenState { node: head, src: ag.src, off: ag.off, params: ag.params, lets: ag.lets, prog: ag.prog, concepts: ag.concepts, sizes: ag.sizes }), params: ag.params, lets: ag.lets, prog: ag.prog, concepts: ag.concepts, sizes: ag.sizes }))
       ArgNil => b""
   proofs:
     purity:
-      reads : [ag.args, ag.src, ag.off, ag.params, ag.lets, ag.prog, ag.concepts]
+      reads : [ag.args, ag.src, ag.off, ag.params, ag.lets, ag.prog, ag.concepts, ag.sizes]
       calls : [x86_node, code_size_node, x86_args]
     termination:
       bound : 8000
@@ -16727,11 +16823,11 @@ rule x86_proc
     let nlets = count_binds(binds)
     let nbind = mb_ast(result) + mb_binds(binds)
     let subsize = if nlets + nbind > 0 then 7 else 0
-    let storesize = code_size_let_stores(LetGenState { rem: binds, all_binds: binds, src: pg.src, off: 0, params: rule_params_of(pg.rd), idx: 0, prog: pg.prog, concepts: pg.concepts })
-    out = concat(b"\x55\x48\x89\xe5", (if nlets + nbind > 0 then concat(b"\x48\x81\xec", le32(8 * (nlets + nbind))) else b""), x86_let_stores(LetGenState { rem: binds, all_binds: binds, src: pg.src, off: pg.off + 4 + subsize, params: rule_params_of(pg.rd), idx: 0, prog: pg.prog, concepts: pg.concepts }), (if rule_is_texty(pg) == 1 then concat(x86_stream_node(ByteGenState { node: result, src: pg.src, off: pg.off + 4 + subsize + storesize, params: rule_params_of(pg.rd), lets: binds, prog: pg.prog, concepts: pg.concepts }), b"\x6a\x00") else x86_node(ByteGenState { node: result, src: pg.src, off: pg.off + 4 + subsize + storesize, params: rule_params_of(pg.rd), lets: binds, prog: pg.prog, concepts: pg.concepts })), b"\x58\x48\x89\xec\x5d\xc3")
+    let storesize = code_size_let_stores(LetGenState { rem: binds, all_binds: binds, src: pg.src, off: 0, params: rule_params_of(pg.rd), idx: 0, prog: pg.prog, concepts: pg.concepts, sizes: pg.sizes })
+    out = concat(b"\x55\x48\x89\xe5", (if nlets + nbind > 0 then concat(b"\x48\x81\xec", le32(8 * (nlets + nbind))) else b""), x86_let_stores(LetGenState { rem: binds, all_binds: binds, src: pg.src, off: pg.off + 4 + subsize, params: rule_params_of(pg.rd), idx: 0, prog: pg.prog, concepts: pg.concepts, sizes: pg.sizes }), (if rule_is_texty(pg) == 1 then concat(x86_stream_node(ByteGenState { node: result, src: pg.src, off: pg.off + 4 + subsize + storesize, params: rule_params_of(pg.rd), lets: binds, prog: pg.prog, concepts: pg.concepts, sizes: pg.sizes }), b"\x6a\x00") else x86_node(ByteGenState { node: result, src: pg.src, off: pg.off + 4 + subsize + storesize, params: rule_params_of(pg.rd), lets: binds, prog: pg.prog, concepts: pg.concepts, sizes: pg.sizes })), b"\x58\x48\x89\xec\x5d\xc3")
   proofs:
     purity:
-      reads : [pg, pg.rd, pg.src, pg.off, pg.prog, pg.concepts]
+      reads : [pg, pg.rd, pg.src, pg.off, pg.prog, pg.concepts, pg.sizes]
       calls : [rd_body, block_binds, block_result, count_binds, mb_ast, mb_binds, code_size_let_stores, x86_let_stores, x86_node, rule_is_texty, x86_stream_node, rule_params_of]
     termination:
       bound : 8000
@@ -16779,12 +16875,12 @@ rule code_size_stream_node
       AstBool(value) => 1
       AstErr => 1
       AstVariant(cstart, clen, vstart, vlen, fields) => code_size_node(bg) + 6
-      AstIf(cond, thn, els) => code_size_node(ByteGenState { node: cond, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }) + 15 + code_size_stream_node(ByteGenState { node: thn, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }) + code_size_stream_node(ByteGenState { node: els, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts })
-      AstMatch(scrut, arms) => code_size_node(ByteGenState { node: scrut, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }) + 14 + 13 * arm_list_len(arms) + 5 + stream_size_arms(ArmSizeState { arms: arms, src: bg.src, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts })
-      AstCall(callee_start, callee_len, args) => if span_is_concat(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then stream_size_cargs(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }) else if span_is_substring(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then 1 else if span_is_byte_at(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then code_size_node(bg) + 6 else if span_is_length(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then code_size_node(bg) + 6 else if callee_is_texty(FindRuleState { rules: bg.prog, src: bg.src, q_start: callee_start, q_len: callee_len }) == 1 then code_size_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }) + 12 else code_size_node(bg) + 6
+      AstIf(cond, thn, els) => code_size_node(ByteGenState { node: cond, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + 15 + code_size_stream_node(ByteGenState { node: thn, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + code_size_stream_node(ByteGenState { node: els, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes })
+      AstMatch(scrut, arms) => code_size_node(ByteGenState { node: scrut, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + 14 + 13 * arm_list_len(arms) + 5 + stream_size_arms(ArmSizeState { arms: arms, src: bg.src, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes })
+      AstCall(callee_start, callee_len, args) => if span_is_concat(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then stream_size_cargs(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) else if span_is_substring(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then 1 else if span_is_byte_at(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then code_size_node(bg) + 6 else if span_is_length(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then code_size_node(bg) + 6 else if callee_is_texty(FindRuleState { rules: bg.prog, src: bg.src, q_start: callee_start, q_len: callee_len }) == 1 then code_size_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + 12 else code_size_node(bg) + 6
   proofs:
     purity:
-      reads : [bg, bg.node, bg.src, bg.off, bg.params, bg.lets, bg.prog, bg.concepts]
+      reads : [bg, bg.node, bg.src, bg.off, bg.params, bg.lets, bg.prog, bg.concepts, bg.sizes]
       calls : [code_size_node, code_size_stream_node, stream_size_cargs, stream_size_arms, code_size_args, param_index, param_ty, let_index, arm_list_len, span_is_concat, span_is_substring, span_is_byte_at, span_is_length, callee_is_texty]
     termination:
       bound : 8000
@@ -16801,11 +16897,11 @@ rule stream_size_cargs
     out : number
   logic:
     out = match ag.args:
-      ArgCons(head, tail) => code_size_stream_node(ByteGenState { node: head, src: ag.src, off: ag.off, params: ag.params, lets: ag.lets, prog: ag.prog, concepts: ag.concepts }) + stream_size_cargs(ByteGenArgs { args: tail, src: ag.src, off: ag.off, params: ag.params, lets: ag.lets, prog: ag.prog, concepts: ag.concepts })
+      ArgCons(head, tail) => code_size_stream_node(ByteGenState { node: head, src: ag.src, off: ag.off, params: ag.params, lets: ag.lets, prog: ag.prog, concepts: ag.concepts, sizes: ag.sizes }) + stream_size_cargs(ByteGenArgs { args: tail, src: ag.src, off: ag.off, params: ag.params, lets: ag.lets, prog: ag.prog, concepts: ag.concepts, sizes: ag.sizes })
       ArgNil => 0
   proofs:
     purity:
-      reads : [ag.args, ag.src, ag.off, ag.params, ag.lets, ag.prog, ag.concepts]
+      reads : [ag.args, ag.src, ag.off, ag.params, ag.lets, ag.prog, ag.concepts, ag.sizes]
       calls : [code_size_stream_node, stream_size_cargs]
     termination:
       bound : 8000
@@ -16824,11 +16920,11 @@ rule stream_size_arms
     out : number
   logic:
     out = match az.arms:
-      ArmCons(vstart, vlen, binders, body, rest) => 14 * binder_list_len(binders) + code_size_stream_node(ByteGenState { node: body, src: az.src, off: 0, params: az.params, lets: lets_append_binders(AppendBindersState { lets: az.lets, bs: binders }), prog: az.prog, concepts: az.concepts }) + 5 + stream_size_arms(ArmSizeState { arms: rest, src: az.src, params: az.params, lets: az.lets, prog: az.prog, concepts: az.concepts })
+      ArmCons(vstart, vlen, binders, body, rest) => 14 * binder_list_len(binders) + code_size_stream_node(ByteGenState { node: body, src: az.src, off: 0, params: az.params, lets: lets_append_binders(AppendBindersState { lets: az.lets, bs: binders }), prog: az.prog, concepts: az.concepts, sizes: az.sizes }) + 5 + stream_size_arms(ArmSizeState { arms: rest, src: az.src, params: az.params, lets: az.lets, prog: az.prog, concepts: az.concepts, sizes: az.sizes })
       ArmNil => 0
   proofs:
     purity:
-      reads : [az.arms, az.src, az.params, az.lets, az.prog, az.concepts]
+      reads : [az.arms, az.src, az.params, az.lets, az.prog, az.concepts, az.sizes]
       calls : [binder_list_len, code_size_stream_node, lets_append_binders, stream_size_arms]
     termination:
       bound : 8000
@@ -16854,18 +16950,18 @@ rule x86_stream_node
       AstBin(op, lhs, rhs) => concat(x86_node(bg), b"\x58\xe8", le32(0 - (bg.off + code_size_node(bg) + 92)))
       AstNeg(inner) => concat(x86_node(bg), b"\x58\xe8", le32(0 - (bg.off + code_size_node(bg) + 92)))
       AstNot(inner) => b"\xcc"
-      AstVar(start, len) => (if param_index(ParamIndexState { params: bg.params, src: bg.src, q_start: start, q_len: len, idx: 0 }) >= 0 then (if param_ty(ParamIndexState { params: bg.params, src: bg.src, q_start: start, q_len: len, idx: 0 }) == 2 then concat(b"\xff\xb5", le32(16 + 8 * (param_list_len(bg.params) - 1 - param_index(ParamIndexState { params: bg.params, src: bg.src, q_start: start, q_len: len, idx: 0 }))), b"\x58\x89\xc2\x48\xc1\xe8\x20\x48\xbe", le64(4194304 + blob_end_off(ProgGenState { rules: bg.prog, src: bg.src, off: 0, prog: bg.prog, concepts: bg.concepts })), b"\x48\x01\xc6\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05") else concat(x86_node(bg), b"\x58\xe8", le32(0 - (bg.off + code_size_node(bg) + 92)))) else if let_index(LetIndexState { binds: bg.lets, src: bg.src, q_start: start, q_len: len, idx: 0 }) >= 0 then concat(x86_node(bg), b"\x58\xe8", le32(0 - (bg.off + code_size_node(bg) + 92))) else b"\xcc")
+      AstVar(start, len) => (if param_index(ParamIndexState { params: bg.params, src: bg.src, q_start: start, q_len: len, idx: 0 }) >= 0 then (if param_ty(ParamIndexState { params: bg.params, src: bg.src, q_start: start, q_len: len, idx: 0 }) == 2 then concat(b"\xff\xb5", le32(16 + 8 * (param_list_len(bg.params) - 1 - param_index(ParamIndexState { params: bg.params, src: bg.src, q_start: start, q_len: len, idx: 0 }))), b"\x58\x89\xc2\x48\xc1\xe8\x20\x48\xbe", le64(4194304 + blob_end_off(ProgGenState { rules: bg.prog, src: bg.src, off: 0, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes })), b"\x48\x01\xc6\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05") else concat(x86_node(bg), b"\x58\xe8", le32(0 - (bg.off + code_size_node(bg) + 92)))) else if let_index(LetIndexState { binds: bg.lets, src: bg.src, q_start: start, q_len: len, idx: 0 }) >= 0 then concat(x86_node(bg), b"\x58\xe8", le32(0 - (bg.off + code_size_node(bg) + 92))) else b"\xcc")
       AstField(base, fstart, flen) => concat(x86_node(bg), b"\x58\xe8", le32(0 - (bg.off + code_size_node(bg) + 92)))
-      AstStr(start, len) => concat(b"\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x48\xbe", le64(4194304 + blob_end_off(ProgGenState { rules: bg.prog, src: bg.src, off: 0, prog: bg.prog, concepts: bg.concepts }) + start + 1), b"\x48\xc7\xc2", le32(if len >= 2 then len - 2 else 0), b"\x0f\x05")
+      AstStr(start, len) => concat(b"\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x48\xbe", le64(4194304 + blob_end_off(ProgGenState { rules: bg.prog, src: bg.src, off: 0, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + start + 1), b"\x48\xc7\xc2", le32(if len >= 2 then len - 2 else 0), b"\x0f\x05")
       AstBool(value) => b"\xcc"
       AstErr => b"\xcc"
       AstVariant(cstart, clen, vstart, vlen, fields) => concat(x86_node(bg), b"\x58\xe8", le32(0 - (bg.off + code_size_node(bg) + 92)))
-      AstIf(cond, thn, els) => concat(x86_node(ByteGenState { node: cond, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }), b"\x58\x48\x85\xc0\x0f\x84", le32(code_size_stream_node(ByteGenState { node: thn, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }) + 5), x86_stream_node(ByteGenState { node: thn, src: bg.src, off: bg.off + code_size_node(ByteGenState { node: cond, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }) + 10, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }), b"\xe9", le32(code_size_stream_node(ByteGenState { node: els, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts })), x86_stream_node(ByteGenState { node: els, src: bg.src, off: bg.off + code_size_node(ByteGenState { node: cond, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }) + 15 + code_size_stream_node(ByteGenState { node: thn, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }), params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }))
-      AstMatch(scrut, arms) => concat(x86_node(ByteGenState { node: scrut, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }), b"\x58\x48\x69\xc0", le32(8 * (max_payload_fields(bg.concepts) + 1)), b"\x4c\x01\xf8\x48\x8b\x08", x86_stream_dispatch(DispatchState { arms: arms, src: bg.src, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, rest_disp: 13 * (arm_list_len(arms) - 1), pre_arms: 0 }), b"\xe9", le32(stream_size_arms(ArmSizeState { arms: arms, src: bg.src, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts })), x86_stream_arms(ArmGenState { arms: arms, src: bg.src, off: bg.off + code_size_node(ByteGenState { node: scrut, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }) + 14 + 13 * arm_list_len(arms) + 5, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }))
-      AstCall(callee_start, callee_len, args) => if span_is_concat(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then x86_stream_cargs(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }) else if span_is_substring(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then b"\xcc" else if span_is_byte_at(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then concat(x86_node(bg), b"\x58\xe8", le32(0 - (bg.off + code_size_node(bg) + 92))) else if span_is_length(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then concat(x86_node(bg), b"\x58\xe8", le32(0 - (bg.off + code_size_node(bg) + 92))) else if callee_is_texty(FindRuleState { rules: bg.prog, src: bg.src, q_start: callee_start, q_len: callee_len }) == 1 then concat(x86_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }), b"\xe8", le32(proc_offset(ProcOffState { rules: bg.prog, src: bg.src, acc: 0, q_start: callee_start, q_len: callee_len, concepts: bg.concepts }) - (bg.off + code_size_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts }) + 5)), b"\x48\x81\xc4", le32(8 * arg_list_len(args))) else concat(x86_node(bg), b"\x58\xe8", le32(0 - (bg.off + code_size_node(bg) + 92)))
+      AstIf(cond, thn, els) => concat(x86_node(ByteGenState { node: cond, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }), b"\x58\x48\x85\xc0\x0f\x84", le32(code_size_stream_node(ByteGenState { node: thn, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + 5), x86_stream_node(ByteGenState { node: thn, src: bg.src, off: bg.off + code_size_node(ByteGenState { node: cond, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + 10, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }), b"\xe9", le32(code_size_stream_node(ByteGenState { node: els, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes })), x86_stream_node(ByteGenState { node: els, src: bg.src, off: bg.off + code_size_node(ByteGenState { node: cond, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + 15 + code_size_stream_node(ByteGenState { node: thn, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }), params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }))
+      AstMatch(scrut, arms) => concat(x86_node(ByteGenState { node: scrut, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }), b"\x58\x48\x69\xc0", le32(8 * (max_payload_fields(bg.concepts) + 1)), b"\x4c\x01\xf8\x48\x8b\x08", x86_stream_dispatch(DispatchState { arms: arms, src: bg.src, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, rest_disp: 13 * (arm_list_len(arms) - 1), pre_arms: 0 }), b"\xe9", le32(stream_size_arms(ArmSizeState { arms: arms, src: bg.src, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes })), x86_stream_arms(ArmGenState { arms: arms, src: bg.src, off: bg.off + code_size_node(ByteGenState { node: scrut, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + 14 + 13 * arm_list_len(arms) + 5, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }))
+      AstCall(callee_start, callee_len, args) => if span_is_concat(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then x86_stream_cargs(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) else if span_is_substring(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then b"\xcc" else if span_is_byte_at(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then concat(x86_node(bg), b"\x58\xe8", le32(0 - (bg.off + code_size_node(bg) + 92))) else if span_is_length(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then concat(x86_node(bg), b"\x58\xe8", le32(0 - (bg.off + code_size_node(bg) + 92))) else if callee_is_texty(FindRuleState { rules: bg.prog, src: bg.src, q_start: callee_start, q_len: callee_len }) == 1 then concat(x86_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }), b"\xe8", le32(proc_offset(ProcOffState { rules: bg.prog, src: bg.src, acc: 0, q_start: callee_start, q_len: callee_len, concepts: bg.concepts, sizes: bg.sizes }) - (bg.off + code_size_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + 5)), b"\x48\x81\xc4", le32(8 * arg_list_len(args))) else concat(x86_node(bg), b"\x58\xe8", le32(0 - (bg.off + code_size_node(bg) + 92)))
   proofs:
     purity:
-      reads : [bg, bg.node, bg.src, bg.off, bg.params, bg.lets, bg.prog, bg.concepts]
+      reads : [bg, bg.node, bg.src, bg.off, bg.params, bg.lets, bg.prog, bg.concepts, bg.sizes]
       calls : [x86_node, code_size_node, x86_stream_node, code_size_stream_node, x86_stream_cargs, x86_stream_dispatch, x86_stream_arms, stream_size_arms, x86_args, code_size_args, param_index, param_ty, param_list_len, let_index, arm_list_len, max_payload_fields, proc_offset, arg_list_len, blob_end_off, span_is_concat, span_is_substring, span_is_byte_at, span_is_length, callee_is_texty]
     termination:
       bound : 8000
@@ -16883,11 +16979,11 @@ rule x86_stream_cargs
     out : bytes
   logic:
     out = match ag.args:
-      ArgCons(head, tail) => concat(x86_stream_node(ByteGenState { node: head, src: ag.src, off: ag.off, params: ag.params, lets: ag.lets, prog: ag.prog, concepts: ag.concepts }), x86_stream_cargs(ByteGenArgs { args: tail, src: ag.src, off: ag.off + code_size_stream_node(ByteGenState { node: head, src: ag.src, off: ag.off, params: ag.params, lets: ag.lets, prog: ag.prog, concepts: ag.concepts }), params: ag.params, lets: ag.lets, prog: ag.prog, concepts: ag.concepts }))
+      ArgCons(head, tail) => concat(x86_stream_node(ByteGenState { node: head, src: ag.src, off: ag.off, params: ag.params, lets: ag.lets, prog: ag.prog, concepts: ag.concepts, sizes: ag.sizes }), x86_stream_cargs(ByteGenArgs { args: tail, src: ag.src, off: ag.off + code_size_stream_node(ByteGenState { node: head, src: ag.src, off: ag.off, params: ag.params, lets: ag.lets, prog: ag.prog, concepts: ag.concepts, sizes: ag.sizes }), params: ag.params, lets: ag.lets, prog: ag.prog, concepts: ag.concepts, sizes: ag.sizes }))
       ArgNil => b""
   proofs:
     purity:
-      reads : [ag.args, ag.src, ag.off, ag.params, ag.lets, ag.prog, ag.concepts]
+      reads : [ag.args, ag.src, ag.off, ag.params, ag.lets, ag.prog, ag.concepts, ag.sizes]
       calls : [x86_stream_node, code_size_stream_node, x86_stream_cargs]
     termination:
       bound : 8000
@@ -16906,11 +17002,11 @@ rule x86_stream_dispatch
     out : bytes
   logic:
     out = match ds.arms:
-      ArmCons(vstart, vlen, binders, body, rest) => concat(b"\x48\x81\xf9", le32(arm_tag_by_name(ArmTagState { concepts: ds.concepts, src: ds.src, vstart: vstart, vlen: vlen, cidx: 0 })), b"\x0f\x84", le32(ds.rest_disp + 5 + ds.pre_arms), x86_stream_dispatch(DispatchState { arms: rest, src: ds.src, params: ds.params, lets: ds.lets, prog: ds.prog, concepts: ds.concepts, rest_disp: ds.rest_disp - 13, pre_arms: ds.pre_arms + 14 * binder_list_len(binders) + code_size_stream_node(ByteGenState { node: body, src: ds.src, off: 0, params: ds.params, lets: lets_append_binders(AppendBindersState { lets: ds.lets, bs: binders }), prog: ds.prog, concepts: ds.concepts }) + 5 }))
+      ArmCons(vstart, vlen, binders, body, rest) => concat(b"\x48\x81\xf9", le32(arm_tag_by_name(ArmTagState { concepts: ds.concepts, src: ds.src, vstart: vstart, vlen: vlen, cidx: 0 })), b"\x0f\x84", le32(ds.rest_disp + 5 + ds.pre_arms), x86_stream_dispatch(DispatchState { arms: rest, src: ds.src, params: ds.params, lets: ds.lets, prog: ds.prog, concepts: ds.concepts, sizes: ds.sizes, rest_disp: ds.rest_disp - 13, pre_arms: ds.pre_arms + 14 * binder_list_len(binders) + code_size_stream_node(ByteGenState { node: body, src: ds.src, off: 0, params: ds.params, lets: lets_append_binders(AppendBindersState { lets: ds.lets, bs: binders }), prog: ds.prog, concepts: ds.concepts, sizes: ds.sizes }) + 5 }))
       ArmNil => b""
   proofs:
     purity:
-      reads : [ds.arms, ds.src, ds.params, ds.lets, ds.prog, ds.concepts, ds.rest_disp, ds.pre_arms]
+      reads : [ds.arms, ds.src, ds.params, ds.lets, ds.prog, ds.concepts, ds.sizes, ds.rest_disp, ds.pre_arms]
       calls : [arm_tag_by_name, x86_stream_dispatch, binder_list_len, code_size_stream_node, lets_append_binders]
     termination:
       bound : 8000
@@ -16929,11 +17025,11 @@ rule x86_stream_arms
     out : bytes
   logic:
     out = match ag.arms:
-      ArmCons(vstart, vlen, binders, body, rest) => concat(x86_binder_loads(BinderLoadState { binders: binders, j: 0, base_slot: count_binds(ag.lets) }), x86_stream_node(ByteGenState { node: body, src: ag.src, off: ag.off + 14 * binder_list_len(binders), params: ag.params, lets: lets_append_binders(AppendBindersState { lets: ag.lets, bs: binders }), prog: ag.prog, concepts: ag.concepts }), b"\xe9", le32(stream_size_arms(ArmSizeState { arms: rest, src: ag.src, params: ag.params, lets: ag.lets, prog: ag.prog, concepts: ag.concepts })), x86_stream_arms(ArmGenState { arms: rest, src: ag.src, off: ag.off + 14 * binder_list_len(binders) + code_size_stream_node(ByteGenState { node: body, src: ag.src, off: 0, params: ag.params, lets: lets_append_binders(AppendBindersState { lets: ag.lets, bs: binders }), prog: ag.prog, concepts: ag.concepts }) + 5, params: ag.params, lets: ag.lets, prog: ag.prog, concepts: ag.concepts }))
+      ArmCons(vstart, vlen, binders, body, rest) => concat(x86_binder_loads(BinderLoadState { binders: binders, j: 0, base_slot: count_binds(ag.lets) }), x86_stream_node(ByteGenState { node: body, src: ag.src, off: ag.off + 14 * binder_list_len(binders), params: ag.params, lets: lets_append_binders(AppendBindersState { lets: ag.lets, bs: binders }), prog: ag.prog, concepts: ag.concepts, sizes: ag.sizes }), b"\xe9", le32(stream_size_arms(ArmSizeState { arms: rest, src: ag.src, params: ag.params, lets: ag.lets, prog: ag.prog, concepts: ag.concepts, sizes: ag.sizes })), x86_stream_arms(ArmGenState { arms: rest, src: ag.src, off: ag.off + 14 * binder_list_len(binders) + code_size_stream_node(ByteGenState { node: body, src: ag.src, off: 0, params: ag.params, lets: lets_append_binders(AppendBindersState { lets: ag.lets, bs: binders }), prog: ag.prog, concepts: ag.concepts, sizes: ag.sizes }) + 5, params: ag.params, lets: ag.lets, prog: ag.prog, concepts: ag.concepts, sizes: ag.sizes }))
       ArmNil => b""
   proofs:
     purity:
-      reads : [ag.arms, ag.src, ag.off, ag.params, ag.lets, ag.prog, ag.concepts]
+      reads : [ag.arms, ag.src, ag.off, ag.params, ag.lets, ag.prog, ag.concepts, ag.sizes]
       calls : [x86_binder_loads, x86_stream_node, code_size_stream_node, stream_size_arms, lets_append_binders, binder_list_len, count_binds, x86_stream_arms]
     termination:
       bound : 8000
@@ -16953,11 +17049,11 @@ rule x86_program
     out : bytes
   logic:
     out = match pg.rules:
-      RCons(head, tail) => concat(x86_proc(ProcGenState { rd: head, src: pg.src, off: pg.off, prog: pg.prog, concepts: pg.concepts }), x86_program(ProgGenState { rules: tail, src: pg.src, off: pg.off + proc_size(ProcGenState { rd: head, src: pg.src, off: 0, prog: pg.prog, concepts: pg.concepts }), prog: pg.prog, concepts: pg.concepts }))
+      RCons(head, tail) => concat(x86_proc(ProcGenState { rd: head, src: pg.src, off: pg.off, prog: pg.prog, concepts: pg.concepts, sizes: pg.sizes }), x86_program(ProgGenState { rules: tail, src: pg.src, off: pg.off + proc_size(ProcGenState { rd: head, src: pg.src, off: 0, prog: pg.prog, concepts: pg.concepts, sizes: pg.sizes }), prog: pg.prog, concepts: pg.concepts, sizes: pg.sizes }))
       RNil => b""
   proofs:
     purity:
-      reads : [pg.rules, pg.src, pg.off, pg.prog, pg.concepts]
+      reads : [pg.rules, pg.src, pg.off, pg.prog, pg.concepts, pg.sizes]
       calls : [x86_proc, x86_program, proc_size]
     termination:
       bound : 8000
@@ -16986,11 +17082,12 @@ rule x86_program_src
     let toks = begin_tokenize(ScanState { source: s.source, pos: 0 })
     let prog = parse_program(ProgramState { cell: toks, src: s.source })
     let concepts = parse_concepts(ProgramState { cell: toks, src: s.source })
-    out = x86_program(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts })
+    let sizes = proc_sizes(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: ProcSizeList::PSNil })
+    out = x86_program(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: sizes })
   proofs:
     purity:
       reads : [s.source]
-      calls : [begin_tokenize, parse_program, parse_concepts, x86_program]
+      calls : [begin_tokenize, parse_program, parse_concepts, proc_sizes, x86_program]
     termination:
       bound : 256
 
@@ -17005,26 +17102,27 @@ rule x86_program_src
 -- i64 needs itoa-in-machine-code, a later brick).
 -- ============================================================================
 
--- program_total_size: the TOTAL byte length of the whole x86_program blob =
--- sum of proc_size over every rule. Needed to fill the one computed ELF field
--- (p_filesz = p_memsz = 137 + this). Walks the RuleList exactly like x86_program,
--- threading the program (`prog`) so proc_size resolves callees for sizing; off is
--- irrelevant to a size so 0 is used per proc.
-rule program_total_size
-  @intention: "Total byte length of the whole x86_program blob = sum of proc_size over every rule"
+-- ps_total: the TOTAL byte length of the whole x86_program blob = sum of every
+-- entry in the PRECOMPUTED proc-size list. Replaces the old program_total_size,
+-- which re-walked (and re-sized) every proc body; ps_total just folds the cached
+-- sizes, so blob_end_off (called at ~6 sites per emit) costs a flat list sum
+-- instead of a full program re-sizing each time. Needed to fill the one computed
+-- ELF field (p_filesz = p_memsz = 137 + this).
+rule ps_total
+  @intention: "Total byte length of the whole x86_program blob = sum of the precomputed proc sizes"
   @source: vexprparse.intent:60
   input:
-    pg : ProgGenState
+    psl : ProcSizeList
   output:
     out : number
   logic:
-    out = match pg.rules:
-      RCons(head, tail) => proc_size(ProcGenState { rd: head, src: pg.src, off: 0, prog: pg.prog, concepts: pg.concepts }) + program_total_size(ProgGenState { rules: tail, src: pg.src, off: 0, prog: pg.prog, concepts: pg.concepts })
-      RNil => 0
+    out = match psl:
+      PSCons(sz, rest) => sz + ps_total(rest)
+      PSNil => 0
   proofs:
     purity:
-      reads : [pg.rules, pg.src, pg.prog, pg.concepts]
-      calls : [proc_size, program_total_size]
+      reads : [psl]
+      calls : [ps_total]
     termination:
       bound : 8000
 
@@ -17051,11 +17149,11 @@ rule blob_end_off
     let efields = params_to_fields(entry_params)
     let ecfields = cd_fields(concept_at_index(ConceptAtState { concepts: pg.concepts, idx: find_concept_index(FindConceptIdxState { concepts: pg.concepts, src: pg.src, q_start: fl_head_ty_start(efields), q_len: fl_head_ty_len(efields), idx: 0 }) }))
     let msize = if has_input == 1 and entry_rule_texty(pg) == 0 then (if field_list_has_text(ecfields) == 1 then stdin_marshal_size(ecfields) else argv_marshal_size(ecfields)) else 0
-    out = 120 + (if program_uses_arena(pg.concepts) == 1 then 61 else 0) + (if entry_rule_texty(pg) == 1 then 45 else 101) + (if prog_any_texty(pg) == 1 then 86 else 0) + msize + program_total_size(ProgGenState { rules: pg.rules, src: pg.src, off: 0, prog: pg.prog, concepts: pg.concepts })
+    out = 120 + (if program_uses_arena(pg.concepts) == 1 then 61 else 0) + (if entry_rule_texty(pg) == 1 then 45 else 101) + (if prog_any_texty(pg) == 1 then 86 else 0) + msize + ps_total(pg.sizes)
   proofs:
     purity:
-      reads : [pg, pg.rules, pg.src, pg.prog, pg.concepts]
-      calls : [program_uses_arena, entry_rule_texty, prog_any_texty, program_total_size, param_list_len, rl_head_params, fields_to_params, rl_head_input, params_to_fields, argv_marshal_size, stdin_marshal_size, field_list_has_text, cd_fields, concept_at_index, find_concept_index, fl_head_ty_start, fl_head_ty_len]
+      reads : [pg, pg.rules, pg.src, pg.concepts, pg.sizes]
+      calls : [program_uses_arena, entry_rule_texty, prog_any_texty, ps_total, param_list_len, rl_head_params, fields_to_params, rl_head_input, params_to_fields, argv_marshal_size, stdin_marshal_size, field_list_has_text, cd_fields, concept_at_index, find_concept_index, fl_head_ty_start, fl_head_ty_len]
     termination:
       bound : 8000
 
@@ -17177,6 +17275,7 @@ concept ArgvTrampState
     src : text [..256]
     prog : RuleList
     concepts : ConceptList
+    sizes : ProcSizeList
     cidx : number
 
 
@@ -17294,7 +17393,7 @@ rule x86_argv_marshal
   output:
     out : bytes
   logic:
-    let src_base = 4194304 + blob_end_off(ProgGenState { rules: at.prog, src: at.src, off: 0, prog: at.prog, concepts: at.concepts })
+    let src_base = 4194304 + blob_end_off(ProgGenState { rules: at.prog, src: at.src, off: 0, prog: at.prog, concepts: at.concepts, sizes: at.sizes })
     let region_base = 536870912
     let region_off = region_base - src_base
     let nfields = field_list_len(at.fields)
@@ -17303,7 +17402,7 @@ rule x86_argv_marshal
     out = concat(b"\x49\x89\xe4\x49\x8b\x04\x24\x48\x3d", le32(1 + nfields), b"\x7d\x0c\xbf\x01\x00\x00\x00\xb8\x3c\x00\x00\x00\x0f\x05\xb8\x09\x00\x00\x00\xbf\x00\x00\x00\x20\xbe\x00\x00\x10\x00\xba\x03\x00\x00\x00\x41\xba\x32\x00\x00\x00\x49\xc7\xc0\xff\xff\xff\xff\x45\x31\xc9\x0f\x05\x48\x3d\x01\xf0\xff\xff\x72\x0c\xbf\x01\x00\x00\x00\xb8\x3c\x00\x00\x00\x0f\x05\x45\x31\xed", x86_marshal_fields(ArgvMarshalState { fields: at.fields, idx: 0, region_off: region_off, region_base: region_base }), b"\x4c\x89\xf0\x48\x69\xc0", le32(entry_size), b"\x4c\x01\xf8\x48\xc7\x00", le32(tag), x86_field_pops(FieldPopState { fields: at.fields, slot: nfields - 1 }), b"\x41\x56\x49\xff\xc6")
   proofs:
     purity:
-      reads : [at.fields, at.src, at.prog, at.concepts, at.cidx]
+      reads : [at.fields, at.src, at.prog, at.concepts, at.sizes, at.cidx]
       calls : [blob_end_off, field_list_len, max_payload_fields, x86_marshal_fields, x86_field_pops]
     termination:
       bound : 64
@@ -17461,7 +17560,7 @@ rule x86_stdin_marshal
   output:
     out : bytes
   logic:
-    let src_base = 4194304 + blob_end_off(ProgGenState { rules: at.prog, src: at.src, off: 0, prog: at.prog, concepts: at.concepts })
+    let src_base = 4194304 + blob_end_off(ProgGenState { rules: at.prog, src: at.src, off: 0, prog: at.prog, concepts: at.concepts, sizes: at.sizes })
     let region_base = 536870912
     let region_off = region_base - src_base
     let nfields = field_list_len(at.fields)
@@ -17471,7 +17570,7 @@ rule x86_stdin_marshal
     out = concat(concat(b"\x49\x89\xe4\x49\x8b\x04\x24\x48\x3d", le32(1 + nnum), b"\x7d\x0c\xbf\x01\x00\x00\x00\xb8\x3c\x00\x00\x00\x0f\x05\xb8\x09\x00\x00\x00\xbf\x00\x00\x00\x20\xbe\x00\x00\x10\x00\xba\x03\x00\x00\x00\x41\xba\x32\x00\x00\x00\x49\xc7\xc0\xff\xff\xff\xff\x45\x31\xc9\x0f\x05\x48\x3d\x01\xf0\xff\xff\x72\x0c\xbf\x01\x00\x00\x00\xb8\x3c\x00\x00\x00\x0f\x05\x45\x31\xed\x31\xc0\x31\xff\xbe\x00\x00\x00\x20\x4c\x01\xee\xba\x00\x00\x10\x00\x4c\x29\xea\x0f\x05\x48\x85\xc0\x74\x1c\x78\x0e\x49\x01\xc5\x49\x81\xfd\x00\x00\x10\x00\x73\x02\xeb\xd5\xbf\x01\x00\x00\x00\xb8\x3c\x00\x00\x00\x0f\x05"), x86_stdin_fields(StdinMarshalState { fields: at.fields, num_idx: 0, region_off: region_off }), concat(b"\x4c\x89\xf0\x48\x69\xc0", le32(entry_size), b"\x4c\x01\xf8\x48\xc7\x00", le32(tag)), x86_field_pops(FieldPopState { fields: at.fields, slot: nfields - 1 }), b"\x41\x56\x49\xff\xc6")
   proofs:
     purity:
-      reads : [at.fields, at.src, at.prog, at.concepts, at.cidx]
+      reads : [at.fields, at.src, at.prog, at.concepts, at.sizes, at.cidx]
       calls : [blob_end_off, field_list_len, number_fields_count, max_payload_fields, x86_stdin_fields, x86_field_pops]
     termination:
       bound : 64
@@ -17488,21 +17587,22 @@ rule elf_program_src
     let toks = begin_tokenize(ScanState { source: s.source, pos: 0 })
     let prog = parse_program(ProgramState { cell: toks, src: s.source })
     let concepts = parse_concepts(ProgramState { cell: toks, src: s.source })
+    let sizes = proc_sizes(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: ProcSizeList::PSNil })
     let uses_var = program_uses_arena(concepts)
-    let anytx = prog_any_texty(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts })
-    let entrytx = entry_rule_texty(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts })
+    let anytx = prog_any_texty(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: sizes })
+    let entrytx = entry_rule_texty(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: sizes })
     let uses_text = if program_uses_text(UsesTextRules { rules: prog, src: s.source }) == 1 then 1 else anytx
-    let fsz0 = blob_end_off(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts })
+    let fsz0 = blob_end_off(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: sizes })
     let fsz = fsz0 + (if uses_text == 1 then 4 * ((length(s.source) + 3) / 4) else 0)
     let entry_params = if param_list_len(rl_head_params(prog)) > 0 then rl_head_params(prog) else fields_to_params(rl_head_input(prog))
     let has_input = if param_list_len(entry_params) > 0 then 1 else 0
     let efields = params_to_fields(entry_params)
     let ecidx = find_concept_index(FindConceptIdxState { concepts: concepts, src: s.source, q_start: fl_head_ty_start(efields), q_len: fl_head_ty_len(efields), idx: 0 })
-    out = concat(b"\x7f\x45\x4c\x46\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\x3e\x00\x01\x00\x00\x00\x78\x00\x40\x00\x00\x00\x00\x00\x40\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x40\x00\x38\x00\x01\x00\x00\x00\x00\x00\x00\x00", b"\x01\x00\x00\x00\x05\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x40\x00\x00\x00\x00\x00\x00\x00\x40\x00\x00\x00\x00\x00", le64(fsz), le64(fsz), b"\x00\x10\x00\x00\x00\x00\x00\x00", (if uses_var == 1 then b"\xb8\x09\x00\x00\x00\x31\xff\xbe\x00\x00\x00\x40\xba\x03\x00\x00\x00\x41\xba\x22\x00\x00\x00\x49\xc7\xc0\xff\xff\xff\xff\x45\x31\xc9\x0f\x05\x48\x3d\x01\xf0\xff\xff\x72\x0c\xbf\x01\x00\x00\x00\xb8\x3c\x00\x00\x00\x0f\x05\x49\x89\xc7\x45\x31\xf6" else b""), (if has_input == 1 and entrytx == 0 then (if field_list_has_text(cd_fields(concept_at_index(ConceptAtState { concepts: concepts, idx: ecidx }))) == 1 then x86_stdin_marshal(ArgvTrampState { fields: cd_fields(concept_at_index(ConceptAtState { concepts: concepts, idx: ecidx })), src: s.source, prog: prog, concepts: concepts, cidx: ecidx }) else x86_argv_marshal(ArgvTrampState { fields: cd_fields(concept_at_index(ConceptAtState { concepts: concepts, idx: ecidx })), src: s.source, prog: prog, concepts: concepts, cidx: ecidx })) else b""), (if entrytx == 1 then b"\xe8\x7e\x00\x00\x00\x6a\x0a\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x48\x89\xe6\x48\xc7\xc2\x01\x00\x00\x00\x0f\x05\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05" else concat(b"\xe8", le32(96 + (if anytx == 1 then 86 else 0)), b"\x48\x83\xec\x20\x49\x89\xc1\x48\x8d\x74\x24\x1f\xc6\x06\x0a\x48\x85\xc0\x79\x03\x48\xf7\xd8\x48\xc7\xc1\x0a\x00\x00\x00\x48\x31\xd2\x48\xf7\xf1\x80\xc2\x30\x48\xff\xce\x88\x16\x48\x85\xc0\x75\xed\x4d\x85\xc9\x79\x06\x48\xff\xce\xc6\x06\x2d\x48\x8d\x54\x24\x20\x48\x29\xf2\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05")), (if anytx == 1 then b"\x48\x83\xec\x28\x49\x89\xc1\x48\x8d\x74\x24\x20\x48\x85\xc0\x79\x03\x48\xf7\xd8\x48\xc7\xc1\x0a\x00\x00\x00\x48\x31\xd2\x48\xf7\xf1\x80\xc2\x30\x48\xff\xce\x88\x16\x48\x85\xc0\x75\xed\x4d\x85\xc9\x79\x06\x48\xff\xce\xc6\x06\x2d\x48\x8d\x54\x24\x20\x48\x29\xf2\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05\x48\x83\xc4\x28\xc3" else b""), x86_program(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts }), (if uses_text == 1 then src_blob(SrcBlobState { src: s.source, pos: 0 }) else b""))
+    out = concat(b"\x7f\x45\x4c\x46\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\x3e\x00\x01\x00\x00\x00\x78\x00\x40\x00\x00\x00\x00\x00\x40\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x40\x00\x38\x00\x01\x00\x00\x00\x00\x00\x00\x00", b"\x01\x00\x00\x00\x05\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x40\x00\x00\x00\x00\x00\x00\x00\x40\x00\x00\x00\x00\x00", le64(fsz), le64(fsz), b"\x00\x10\x00\x00\x00\x00\x00\x00", (if uses_var == 1 then b"\xb8\x09\x00\x00\x00\x31\xff\xbe\x00\x00\x00\x40\xba\x03\x00\x00\x00\x41\xba\x22\x00\x00\x00\x49\xc7\xc0\xff\xff\xff\xff\x45\x31\xc9\x0f\x05\x48\x3d\x01\xf0\xff\xff\x72\x0c\xbf\x01\x00\x00\x00\xb8\x3c\x00\x00\x00\x0f\x05\x49\x89\xc7\x45\x31\xf6" else b""), (if has_input == 1 and entrytx == 0 then (if field_list_has_text(cd_fields(concept_at_index(ConceptAtState { concepts: concepts, idx: ecidx }))) == 1 then x86_stdin_marshal(ArgvTrampState { fields: cd_fields(concept_at_index(ConceptAtState { concepts: concepts, idx: ecidx })), src: s.source, prog: prog, concepts: concepts, sizes: sizes, cidx: ecidx }) else x86_argv_marshal(ArgvTrampState { fields: cd_fields(concept_at_index(ConceptAtState { concepts: concepts, idx: ecidx })), src: s.source, prog: prog, concepts: concepts, sizes: sizes, cidx: ecidx })) else b""), (if entrytx == 1 then b"\xe8\x7e\x00\x00\x00\x6a\x0a\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x48\x89\xe6\x48\xc7\xc2\x01\x00\x00\x00\x0f\x05\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05" else concat(b"\xe8", le32(96 + (if anytx == 1 then 86 else 0)), b"\x48\x83\xec\x20\x49\x89\xc1\x48\x8d\x74\x24\x1f\xc6\x06\x0a\x48\x85\xc0\x79\x03\x48\xf7\xd8\x48\xc7\xc1\x0a\x00\x00\x00\x48\x31\xd2\x48\xf7\xf1\x80\xc2\x30\x48\xff\xce\x88\x16\x48\x85\xc0\x75\xed\x4d\x85\xc9\x79\x06\x48\xff\xce\xc6\x06\x2d\x48\x8d\x54\x24\x20\x48\x29\xf2\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05")), (if anytx == 1 then b"\x48\x83\xec\x28\x49\x89\xc1\x48\x8d\x74\x24\x20\x48\x85\xc0\x79\x03\x48\xf7\xd8\x48\xc7\xc1\x0a\x00\x00\x00\x48\x31\xd2\x48\xf7\xf1\x80\xc2\x30\x48\xff\xce\x88\x16\x48\x85\xc0\x75\xed\x4d\x85\xc9\x79\x06\x48\xff\xce\xc6\x06\x2d\x48\x8d\x54\x24\x20\x48\x29\xf2\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05\x48\x83\xc4\x28\xc3" else b""), x86_program(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: sizes }), (if uses_text == 1 then src_blob(SrcBlobState { src: s.source, pos: 0 }) else b""))
   proofs:
     purity:
       reads : [s.source]
-      calls : [begin_tokenize, parse_program, parse_concepts, program_uses_arena, prog_any_texty, entry_rule_texty, program_uses_text, blob_end_off, x86_program, src_blob, param_list_len, rl_head_params, fields_to_params, rl_head_input, params_to_fields, find_concept_index, fl_head_ty_start, fl_head_ty_len, x86_argv_marshal, x86_stdin_marshal, field_list_has_text, cd_fields, concept_at_index]
+      calls : [begin_tokenize, parse_program, parse_concepts, proc_sizes, program_uses_arena, prog_any_texty, entry_rule_texty, program_uses_text, blob_end_off, x86_program, src_blob, param_list_len, rl_head_params, fields_to_params, rl_head_input, params_to_fields, find_concept_index, fl_head_ty_start, fl_head_ty_len, x86_argv_marshal, x86_stdin_marshal, field_list_has_text, cd_fields, concept_at_index]
     termination:
       bound : 256
 
