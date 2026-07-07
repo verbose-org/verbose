@@ -1413,10 +1413,13 @@ fn verify_concept(c: &Concept, base_dir: &StdPath, errors: &mut Vec<VerifyError>
 /// Off-stack mmap arena (2026-06-22): the arena emitter stores node
 /// indices as 64-bit values (the 16-bit-index reasoning never constrained
 /// storage — confirmed in the B.4 recon), so the `max_nodes` ceiling can
-/// rise well past 65535 now that the arena is mmap-backed (off-stack). At
-/// 4_000_000 a worst-case wide-variant arena is ~96–192 MB, which fails
-/// gracefully via the MAP_FAILED abort if the host can't back it.
-const PHASE_B1_MAX_NODES: u32 = 4_000_000;
+/// rise well past 65535 now that the arena is mmap-backed (off-stack). Raised
+/// 4M -> 8M for the stdin-channel self-hosting milestone: the front end parsing
+/// its full ~850 KB self-source peaks around ~5.3M nodes (VExpr's working
+/// max_nodes is 6M). At 8_000_000 a worst-case wide-variant arena is a few
+/// hundred MB, which fails gracefully via the MAP_FAILED abort if the host
+/// can't back it.
+const PHASE_B1_MAX_NODES: u32 = 8_000_000;
 
 /// `max_depth` stays at the 16-bit ceiling. Raising it would be FALSE
 /// EXPLICITATION: there is no runtime recursion-depth check yet (the 8 MB
@@ -6171,7 +6174,7 @@ concept_group AST [max_depth: 10, max_nodes: 0]
         // Off-stack mmap arena (2026-06-22): the 16-bit ceiling is lifted.
         // 100000 nodes (was rejected pre-mmap) is now accepted — the arena
         // is mmap-backed, indices are 64-bit, and 100000 is well under the
-        // new 4_000_000 ceiling.
+        // 8_000_000 ceiling.
         let src = r#"@verbose 0.1.0
 
 concept_group AST [max_depth: 10, max_nodes: 100000]
@@ -6193,12 +6196,14 @@ concept_group AST [max_depth: 10, max_nodes: 100000]
     }
 
     #[test]
-    fn phase_b1_rejects_max_nodes_over_4m() {
+    fn phase_b1_rejects_max_nodes_over_8m() {
         // The mmap arena is off-stack but still bounded — node counts past
-        // the 4_000_000 ceiling are refused.
+        // the 8_000_000 ceiling are refused. The ceiling rose 4M -> 8M for
+        // the stdin-channel self-hosting milestone (the full self-source
+        // parse peaks ~5.3M nodes; the working VExpr max_nodes is 6M).
         let src = r#"@verbose 0.1.0
 
-concept_group AST [max_depth: 10, max_nodes: 5000000]
+concept_group AST [max_depth: 10, max_nodes: 9000000]
   @intention: "x"
   @source: invoices.intent:1
 
@@ -6212,7 +6217,7 @@ concept_group AST [max_depth: 10, max_nodes: 5000000]
         assert!(
             errs.iter().any(|e| e.context.contains("max_nodes")
                 && e.message.contains("ceiling")),
-            "expected max_nodes=5000000 rejection, got {:#?}",
+            "expected max_nodes=9000000 rejection, got {:#?}",
             errs
         );
     }

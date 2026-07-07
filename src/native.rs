@@ -36197,13 +36197,15 @@ rule two
         let _ = fs::remove_file(&elf);
     }
 
-    /// RUNTIME TEXT INPUT — the self-hosted emitter's argv trampoline. The ELF that
-    /// elf_program_src emits now reads its input from argv (verbosec's own CLI
-    /// convention: one argv per field of the entry rule's record input, text raw /
-    /// number decimal), builds the record in the node arena at a MAP_FIXED region,
-    /// and calls the entry proc. This lets self-fragments run on REAL input with NO
-    /// wrapper `main` — the front-end (count_rules) can finally be driven on its
-    /// multi-line-program input.
+    /// RUNTIME TEXT INPUT — the self-hosted emitter's input trampoline. The ELF that
+    /// elf_program_src emits reads the entry rule's record input, builds the record
+    /// in the node arena at a MAP_FIXED region, and calls the entry proc. When the
+    /// entry concept has a TEXT field (word_length / count_rules take a ScanState
+    /// whose `source` is text), that field is read from STDIN to EOF (the stdin
+    /// channel — argv's 128 KiB cap can't carry a real source); number fields keep
+    /// coming from argv in declaration order. This lets self-fragments run on REAL
+    /// input with NO wrapper `main` — the front-end (count_rules) can finally be
+    /// driven on its multi-line-program input, at any size.
     ///
     /// Gates (all against the REAL verbosec-compiled binary as oracle):
     ///   * Scanner on argv: verbatim examples/scan_word.verbose (entry word_length,
@@ -36251,8 +36253,13 @@ rule two
             let r = Command::new(bin).arg(a1).arg(a2).output().expect("spawn");
             (String::from_utf8_lossy(&r.stdout).trim().to_string(), r.status)
         };
-        // Emit an ELF for `source` via elf_program_src, then run it on (a1, a2).
+        // Emit an ELF for `source` via elf_program_src, then run it. The entry
+        // rules here (word_length / count_rules) take a ScanState whose `source`
+        // field is TEXT, so the emitted ELF now reads that text from STDIN (the
+        // stdin channel — argv can't carry >128 KiB); a1 is piped to stdin and
+        // the number field (pos) arrives on argv as a2.
         let emit_then_run = |source: &str, a1: &str, a2: &str, tag: &str| -> (String, std::process::ExitStatus) {
+            use std::io::Write;
             let mc = Command::new(&elf).args([source, "0"]).output().expect("spawn emitter");
             assert!(mc.status.success(), "elf_program_src must exit 0 for {}", tag);
             assert_eq!(&mc.stdout[0..4], &[0x7f, 0x45, 0x4c, 0x46], "not ELF for {}", tag);
@@ -36261,12 +36268,18 @@ rule two
             let mut perms = fs::metadata(&p).unwrap().permissions();
             perms.set_mode(0o755);
             fs::set_permissions(&p, perms).expect("chmod");
-            let r = Command::new(&p).arg(a1).arg(a2).output().expect("run emitted ELF");
+            let mut child = Command::new(&p).arg(a2)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn().expect("run emitted ELF");
+            child.stdin.take().unwrap().write_all(a1.as_bytes()).expect("write stdin");
+            let r = child.wait_with_output().expect("wait emitted ELF");
             let _ = fs::remove_file(&p);
             (String::from_utf8_lossy(&r.stdout).trim().to_string(), r.status)
         };
 
-        // (1) Scanner on argv: verbatim scan_word (entry word_length, NO wrapper main).
+        // (1) Scanner via stdin: verbatim scan_word (entry word_length, NO wrapper main);
+        //     source text piped to stdin, pos on argv.
         for input in ["hello world", "abc", "  x"] {
             let (got, st) = emit_then_run(&sw_src, input, "0", "sw");
             assert!(st.success(), "scanner ELF must exit 0 for {:?}", input);
@@ -36391,6 +36404,176 @@ rule two
             "input-free fact ELF must keep the original 101-byte number trampoline at offset 120");
 
         for p in [elf, sw_oracle, cr_oracle] { let _ = fs::remove_file(&p); }
+    }
+
+    /// STDIN INPUT CHANNEL — THE self-hosting milestone: the compiled front end
+    /// (count_rules) reads its ENTIRE OWN 846 KB+ source through stdin and counts
+    /// its rules. argv's 128 KiB single-arg cap can't carry the self-source, so
+    /// when the entry concept has a TEXT field the emitted ELF reads fd 0 to EOF
+    /// into the MAP_FIXED region at 0x20000000 and packs it as that field's span;
+    /// number fields keep coming from argv. The emitted arena mmap was also raised
+    /// 128 MiB -> 1 GiB so the ~5.3M-node full parse fits (entry_size 104 B; the
+    /// old 128 MiB held only ~1.29M nodes), and the verifier ceiling 4M -> 8M plus
+    /// VExpr max_nodes 4M -> 6M let the fragment + emitter verify with headroom.
+    ///
+    /// Gates:
+    ///   * THE MILESTONE — count_rules closure ELF (entry FIRST, closure from the
+    ///     declared purity `calls :` lists, <128 KiB so it emits via argv), fed the
+    ///     FULL examples/vexprparse.verbose via stdin -> the file's real `^rule `
+    ///     count (grep oracle). The self-hosted front end, compiled, processing its
+    ///     whole own source at runtime.
+    ///   * Small stdin: a 2-rule program -> 2.
+    ///   * Region overflow: >1 MiB of stdin -> exit 1 (fail-closed).
+    ///   * Byte-identity: a number-entry (input-free) fact ELF keeps the original
+    ///     101-byte number trampoline byte-for-byte at offset 120 (the stdin path
+    ///     only fires when the entry has a text field).
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn self_hosted_stdin_channel_reads_full_source() {
+        use std::fs;
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::{Command, Stdio};
+
+        let compiler_src = fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&compiler_src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        // The self-hosted emitter.
+        let elf = std::env::temp_dir().join("verbosec_stdin_elf_program_src");
+        compile_native(&program, "elf_program_src", elf.to_str().unwrap(), false, false)
+            .expect("elf_program_src must compile natively");
+
+        // Build the count_rules closure from the declared purity `calls :` lists,
+        // count_rules FIRST; strip comments / attributes / proofs so it fits under
+        // the 128 KiB single-arg limit the EMITTER's own argv input must satisfy.
+        let lines: Vec<&str> = compiler_src.lines().collect();
+        let rule_starts: Vec<(usize, String)> = lines.iter().enumerate()
+            .filter(|(_, l)| l.starts_with("rule "))
+            .map(|(i, l)| (i, l.split_whitespace().nth(1).unwrap().split('(').next().unwrap().to_string()))
+            .collect();
+        let rule_info: std::collections::HashMap<String, (usize, usize, Vec<String>)> = rule_starts.iter().enumerate()
+            .map(|(idx, (i, name))| {
+                let end = rule_starts.get(idx + 1).map(|(j, _)| *j).unwrap_or(lines.len());
+                let calls = lines[*i..end].iter().find_map(|l| {
+                    let t = l.trim();
+                    t.strip_prefix("calls : [").and_then(|r| r.strip_suffix("]"))
+                        .map(|inner| inner.split(',').map(|c| c.trim().to_string())
+                            .filter(|c| !c.is_empty()).collect::<Vec<_>>())
+                }).unwrap_or_default();
+                (name.clone(), (*i, end, calls))
+            }).collect();
+        let mut seen = std::collections::BTreeSet::new();
+        let mut todo = vec!["count_rules".to_string()];
+        while let Some(n) = todo.pop() {
+            if seen.contains(&n) || !rule_info.contains_key(&n) { continue; }
+            todo.extend(rule_info[&n].2.clone());
+            seen.insert(n);
+        }
+        let strip = |blk: &str| -> String {
+            let mut out = Vec::new();
+            let mut in_proofs = false;
+            for l in blk.lines() {
+                let s = l.trim();
+                if s.starts_with("--") || s.is_empty() || s.starts_with('@') { continue; }
+                if s == "proofs:" { in_proofs = true; continue; }
+                if in_proofs {
+                    if !l.starts_with(' ') { in_proofs = false; } else { continue; }
+                }
+                out.push(l);
+            }
+            out.join("\n")
+        };
+        let mut ordered = vec!["count_rules".to_string()];
+        ordered.extend(seen.iter().filter(|n| *n != "count_rules").cloned());
+        let rule_text = ordered.iter()
+            .map(|n| { let (s, e, _) = &rule_info[n]; strip(&lines[*s..*e].join("\n")) })
+            .collect::<Vec<_>>().join("\n\n");
+        let is_top = |l: &str| l.starts_with("rule ") || l.starts_with("concept ")
+            || l.starts_with("concept_group ") || l.starts_with("-- ");
+        let mut concept_blocks = Vec::new();
+        for (i, l) in lines.iter().enumerate() {
+            let take = if l.starts_with("concept_group ") {
+                true
+            } else if let Some(rest) = l.strip_prefix("concept ") {
+                let cname = rest.split_whitespace().next().unwrap_or("");
+                !cname.is_empty() && rule_text.contains(cname)
+            } else { false };
+            if take {
+                let e = lines[i + 1..].iter().position(|l| is_top(l)).map(|j| i + 1 + j).unwrap_or(lines.len());
+                concept_blocks.push(strip(&lines[i..e].join("\n")));
+            }
+        }
+        let frag = format!("@verbose 0.1.0\n\n{}\n\n{}",
+            concept_blocks.iter().filter(|b| !b.trim().is_empty()).cloned().collect::<Vec<_>>().join("\n"),
+            rule_text);
+        assert!(frag.len() < 128 * 1024,
+            "count_rules fragment must fit under the 128 KB single-arg limit; got {}", frag.len());
+
+        // Emit the count_rules ELF (fragment via argv — the fragment is small).
+        let mc = Command::new(&elf).args([frag.as_str(), "0"]).output().expect("spawn emitter");
+        assert!(mc.status.success(), "elf_program_src must exit 0 for the count_rules fragment");
+        assert_eq!(&mc.stdout[0..4], &[0x7f, 0x45, 0x4c, 0x46], "emitter output must be an ELF");
+        let cr_elf = std::env::temp_dir().join("verbosec_stdin_count_rules");
+        fs::write(&cr_elf, &mc.stdout).expect("write count_rules ELF");
+        let mut perms = fs::metadata(&cr_elf).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&cr_elf, perms).expect("chmod");
+
+        // Run the count_rules ELF: source via STDIN, pos ("0") via argv.
+        let run_stdin = |bin: &std::path::Path, source: &[u8]| -> (String, std::process::ExitStatus) {
+            let mut child = Command::new(bin).arg("0")
+                .stdin(Stdio::piped()).stdout(Stdio::piped())
+                .spawn().expect("spawn count_rules ELF");
+            // The child may exit(1) (region overflow) before draining stdin; a
+            // partial write then EPIPEs — tolerate it and let the exit code speak.
+            let _ = child.stdin.take().unwrap().write_all(source);
+            let r = child.wait_with_output().expect("wait count_rules ELF");
+            (String::from_utf8_lossy(&r.stdout).trim().to_string(), r.status)
+        };
+
+        // THE MILESTONE: the full self-source through stdin -> the file's real rule
+        // count (grep -c '^rule '). Oracle computed from the file itself.
+        let oracle = compiler_src.lines().filter(|l| l.starts_with("rule ")).count();
+        let (got, st) = run_stdin(&cr_elf, compiler_src.as_bytes());
+        assert!(st.success(), "count_rules ELF must exit 0 on the full self-source; got {:?}", st);
+        assert_eq!(got, oracle.to_string(),
+            "self-compiled count_rules on its OWN {} B source (via stdin) must equal grep -c '^rule ' ({})",
+            compiler_src.len(), oracle);
+
+        // Small stdin: a two-rule program -> 2.
+        let two_rule = b"rule a\n  logic:\n    out = 1\nrule b\n  logic:\n    out = 2";
+        let (got2, st2) = run_stdin(&cr_elf, two_rule);
+        assert!(st2.success(), "count_rules ELF must exit 0 on a small stdin program");
+        assert_eq!(got2, "2", "small stdin two-rule program must count 2");
+
+        // Region overflow: >1 MiB of stdin -> exit 1 (fail-closed, source bigger
+        // than the 1 MiB region).
+        let big = vec![b'x'; 1024 * 1024 + 4096];
+        let (_g, st3) = run_stdin(&cr_elf, &big);
+        assert_eq!(st3.code(), Some(1), ">1 MiB stdin must exit 1 (region overflow, fail-closed)");
+
+        // Byte-identity: a number-entry (input-free) fact ELF keeps the original
+        // 101-byte number trampoline byte-for-byte — the stdin path fires ONLY when
+        // the entry concept has a text field.
+        let fact = "rule main\n  logic:\n    out = fact(5)\nrule fact(n)\n  logic:\n    out = if n == 0 then 1 else n * fact(n - 1)";
+        const NUMBER_TRAMPOLINE: [u8; 101] = [
+            0xe8, 0x60, 0x00, 0x00, 0x00, 0x48, 0x83, 0xec, 0x20, 0x49, 0x89, 0xc1, 0x48, 0x8d,
+            0x74, 0x24, 0x1f, 0xc6, 0x06, 0x0a, 0x48, 0x85, 0xc0, 0x79, 0x03, 0x48, 0xf7, 0xd8,
+            0x48, 0xc7, 0xc1, 0x0a, 0x00, 0x00, 0x00, 0x48, 0x31, 0xd2, 0x48, 0xf7, 0xf1, 0x80,
+            0xc2, 0x30, 0x48, 0xff, 0xce, 0x88, 0x16, 0x48, 0x85, 0xc0, 0x75, 0xed, 0x4d, 0x85,
+            0xc9, 0x79, 0x06, 0x48, 0xff, 0xce, 0xc6, 0x06, 0x2d, 0x48, 0x8d, 0x54, 0x24, 0x20,
+            0x48, 0x29, 0xf2, 0x48, 0xc7, 0xc0, 0x01, 0x00, 0x00, 0x00, 0x48, 0xc7, 0xc7, 0x01,
+            0x00, 0x00, 0x00, 0x0f, 0x05, 0x48, 0xc7, 0xc0, 0x3c, 0x00, 0x00, 0x00, 0x48, 0x31,
+            0xff, 0x0f, 0x05,
+        ];
+        let fm = Command::new(&elf).args([fact, "0"]).output().unwrap();
+        assert_eq!(&fm.stdout[120..221], &NUMBER_TRAMPOLINE[..],
+            "input-free fact ELF must keep the original 101-byte number trampoline at offset 120");
+
+        let _ = fs::remove_file(&cr_elf);
+        let _ = fs::remove_file(&elf);
     }
 
     /// SOURCE-EMBEDDING at self-checker scale — the emitter (elf_program_src)
@@ -36521,18 +36704,32 @@ rule two
         perms.set_mode(0o755);
         fs::set_permissions(&emitted, perms).expect("chmod");
 
-        let run = |bin: &std::path::Path, source: &str| -> (String, std::process::ExitStatus) {
-            let r = Command::new(bin).arg(source).arg("0").output().expect("spawn checker");
+        // The emitted checker's entry (count_purity_errors) takes a ScanState whose
+        // `source` is text -> it reads the source from STDIN; the RUST-compiled
+        // oracle keeps verbosec's argv convention. So the two run differently but
+        // must agree on the number.
+        let run_stdin = |bin: &std::path::Path, source: &str| -> (String, std::process::ExitStatus) {
+            use std::io::Write;
+            let mut child = Command::new(bin).arg("0")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn().expect("spawn checker (stdin)");
+            child.stdin.take().unwrap().write_all(source.as_bytes()).expect("write stdin");
+            let r = child.wait_with_output().expect("wait checker");
+            (String::from_utf8_lossy(&r.stdout).trim().to_string(), r.status)
+        };
+        let run_argv = |bin: &std::path::Path, source: &str| -> (String, std::process::ExitStatus) {
+            let r = Command::new(bin).arg(source).arg("0").output().expect("spawn checker (argv)");
             (String::from_utf8_lossy(&r.stdout).trim().to_string(), r.status)
         };
         // A rule calling an UNDECLARED defined rule -> 1; the declared twin -> 0.
         let call_bad = "rule r\n  logic:\n    out = helper(1)\n  proofs:\n    purity:\n      reads : []\n      calls : []\n    termination:\n      bound : 1\nrule helper(x)\n  logic:\n    out = x";
         let call_ok  = "rule r\n  logic:\n    out = helper(1)\n  proofs:\n    purity:\n      reads : []\n      calls : [helper]\n    termination:\n      bound : 1\nrule helper(x)\n  logic:\n    out = x";
         for (inp, expect) in [(call_ok, "0"), (call_bad, "1")] {
-            let (got, st) = run(&emitted, inp);
+            let (got, st) = run_stdin(&emitted, inp);
             assert!(st.success(),
                 "emitted count_purity_errors ELF must exit 0 (no SIGBUS) for {:?}; got {:?}", inp, st);
-            let (oracle, _) = run(&cpe_oracle, inp);
+            let (oracle, _) = run_argv(&cpe_oracle, inp);
             assert_eq!(oracle, expect, "oracle sanity: count_purity_errors({:?})", inp);
             assert_eq!(got, expect,
                 "self-compiled count_purity_errors({:?}) must equal the real checker ({})", inp, expect);
