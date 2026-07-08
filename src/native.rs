@@ -64,7 +64,7 @@ pub fn compile_native_multi(
 
     for (i, rule_name) in rule_names.iter().enumerate() {
         let is_last = i == rule_names.len() - 1;
-        let mut code = compile_native_code(program, rule_name, false, false)?;
+        let mut code = compile_native_code(program, rule_name, false, false, false)?; // stdin_raw only for single-rule binaries
 
         // Verify the block ends with the expected exit sequence.
         if code.len() < 12 || code[code.len() - 12..] != exit_sequence {
@@ -124,6 +124,7 @@ fn compile_native_code(
     rule_name: &str,
     stdin: bool,
     stream: bool,
+    stdin_raw: bool,
 ) -> Result<Vec<u8>, NativeError> {
     // Phase B slice 4a.1: lift the blanket refusal on `concept_group`.
     // From this slice forward, a program containing a `concept_group`
@@ -699,6 +700,28 @@ fn compile_native_code(
         full[jmp_abs..jmp_abs + 4].copy_from_slice(&jmp_target.to_le_bytes());
 
         code = full;
+    } else if stdin_raw {
+        // RAW stdin: read all of fd 0 verbatim into an mmap region and hand
+        // it to the entry rule's single text field. Distinct from the token
+        // `--stdin` path — no whitespace splitting, no stack argv build, no
+        // multi-KB stack overflow. See `emit_stdin_raw_prologue`.
+        //
+        // Slice scope (docs/self-hosting-raw-stdin-design.md): the entry
+        // rule's record input must have EXACTLY ONE text field. Number
+        // fields (if any) still come from the real argv, declaration order.
+        let text_fields = concept.fields.iter().filter(|f| matches!(f.ty, Type::Text)).count();
+        if text_fields != 1 {
+            return Err(NativeError {
+                message: format!(
+                    "--stdin-raw requires the entry rule's input concept '{}' to have exactly one text field (found {}); the raw stdin blob feeds that single text field",
+                    concept.name, text_fields
+                ),
+            });
+        }
+        let mut full = Vec::new();
+        emit_stdin_raw_prologue(&mut full, concept);
+        full.extend_from_slice(&code);
+        code = full;
     } else if stdin {
         // One-shot stdin: read all, tokenize, process, exit.
         let mut full = Vec::new();
@@ -717,7 +740,29 @@ pub fn compile_native(
     stdin: bool,
     stream: bool,
 ) -> Result<(), NativeError> {
-    let code = compile_native_code(program, rule_name, stdin, stream)?;
+    compile_native_with_mode(program, rule_name, output_path, stdin, stream, false)
+}
+
+/// Same as `compile_native` but with the RAW stdin channel (`--stdin-raw`).
+/// Kept as a distinct entry so the 5-arg `compile_native` (used by ~250 test
+/// call sites) stays unchanged; only main.rs's `--stdin-raw` path reaches this.
+pub fn compile_native_stdin_raw(
+    program: &Program,
+    rule_name: &str,
+    output_path: &str,
+) -> Result<(), NativeError> {
+    compile_native_with_mode(program, rule_name, output_path, false, false, true)
+}
+
+fn compile_native_with_mode(
+    program: &Program,
+    rule_name: &str,
+    output_path: &str,
+    stdin: bool,
+    stream: bool,
+    stdin_raw: bool,
+) -> Result<(), NativeError> {
+    let code = compile_native_code(program, rule_name, stdin, stream, stdin_raw)?;
 
     // NOTE: there is deliberately NO machine-code peephole pass here. A prior
     // pass eliminated adjacent `push Rx; pop Rx` pairs from the FINISHED byte
@@ -17050,6 +17095,225 @@ fn emit_stdin_prologue(code: &mut Vec<u8>) {
     code.extend_from_slice(&[0x48, 0x89, 0xDC]);
 }
 
+/// Emit a RAW stdin reader prologue for `--stdin-raw`.
+///
+/// Distinct from `emit_stdin_prologue` (the TOKEN reader, which whitespace-
+/// splits stdin into an argc/argv on the stack). The token reader overflows
+/// the stack on multi-KB input and cannot feed a verbatim text blob. This
+/// prologue reads ALL of fd 0 into an mmap'd region VERBATIM, then sets the
+/// entry rule's single text field to that region.
+///
+/// Mirrors the self-hosted `x86_stdin_marshal` (examples/vexprparse.verbose,
+/// PR #93): mmap an anon RW region, read fd 0 to EOF in a loop, fail-closed
+/// on read<0 or buffer full. The one deviation is packing: the self-hosted
+/// emitter builds an arena node with a packed `(off<<32|len)` span; this Rust
+/// backend reuses the EXISTING argv text-field ABI instead — the text field
+/// slot stores only a pointer and the length is recovered by `emit_strlen`
+/// (repne scasb) at each read site. So we NUL-terminate the blob at
+/// `ptr + total_bytes` and hand the pointer to the rule via a synthetic argv.
+/// (.verbose source is ASCII with no embedded NULs, so strlen is exact.)
+///
+/// Buffer ceiling: 4 MiB (RAW_STDIN_CAP below). vexprparse.verbose is ~855 KB;
+/// 4 MiB leaves comfortable headroom. Larger inputs hit the fail-closed
+/// buffer-full guard (sys_exit 1) rather than corrupting memory.
+///
+/// After completion the layout at [rsp] is a synthetic argv:
+///   [rsp]      = argc (nfields + 1)
+///   [rsp+8]    = 0 (dummy argv[0])
+///   [rsp+16+8*i] = per-field entry, declaration order:
+///                    text field  → mmap region pointer (the stdin blob)
+///                    number field → the corresponding REAL argv arg
+/// so the existing rule prologue reads fields positionally, unchanged.
+///
+/// Registers clobbered: rax, rbx, rcx, rdx, rsi, rdi, r8, r11, r14, r15.
+/// All are ephemeral — the rule prologue re-reads everything from [rsp].
+fn emit_stdin_raw_prologue(code: &mut Vec<u8>, input_concept: &Concept) {
+    // 4 MiB ceiling. Named here; the read loop's buffer-full guard compares
+    // r14 (bytes read so far) against this.
+    const RAW_STDIN_CAP: u32 = 0x0040_0000; // 4 MiB
+
+    // ─── save real stack/argv base ─────────────────────────────
+    // The number fields come from the REAL argv, which the kernel placed at
+    // the entry rsp. Save it before we mmap / rewrite rsp.
+    // mov rbx, rsp
+    code.extend_from_slice(&[0x48, 0x89, 0xE3]);
+
+    // ─── argc guard: fail-closed if the number args are missing ──
+    // The stdin blob feeds the single text field, but every NUMBER field
+    // must be supplied on argv (declaration order). Real argc lives at
+    // [rbx]. Require argc >= 1 + nnum (argv[0] + one per number field).
+    // Without this, a missing number arg would atoi a NULL pointer and
+    // SIGSEGV; mirrors the self-hosted marshal's `argc < 1+nnum -> exit(1)`.
+    let nnum: i32 = input_concept
+        .fields
+        .iter()
+        .filter(|f| !matches!(f.ty, Type::Text))
+        .count() as i32;
+    // mov rax, [rbx]        (argc)
+    code.extend_from_slice(&[0x48, 0x8B, 0x03]);
+    // cmp rax, (1 + nnum)   — 48 3D imm32
+    code.extend_from_slice(&[0x48, 0x3D]);
+    code.extend_from_slice(&(1 + nnum).to_le_bytes());
+    // jge argc_ok          (signed greater-or-equal)
+    code.push(0x7D);
+    let argc_ok_patch = code.len();
+    code.push(0x00);
+    emit_exit1(code);
+    code[argc_ok_patch] = (code.len() - argc_ok_patch - 1) as u8;
+
+    // ─── mmap(0, 4MiB, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANON, -1, 0) ──
+    // mov eax, 9              (mmap)
+    code.extend_from_slice(&[0xB8, 0x09, 0x00, 0x00, 0x00]);
+    // xor edi, edi           (addr = 0, kernel picks)
+    code.extend_from_slice(&[0x31, 0xFF]);
+    // mov esi, RAW_STDIN_CAP (length)
+    code.push(0xBE);
+    code.extend_from_slice(&RAW_STDIN_CAP.to_le_bytes());
+    // mov edx, 3             (PROT_READ|PROT_WRITE)
+    code.extend_from_slice(&[0xBA, 0x03, 0x00, 0x00, 0x00]);
+    // mov r10d, 0x22         (MAP_PRIVATE|MAP_ANONYMOUS)
+    code.extend_from_slice(&[0x41, 0xBA, 0x22, 0x00, 0x00, 0x00]);
+    // mov r8, -1             (fd; REX.WB + C7 /0 imm32 sign-extended)
+    code.extend_from_slice(&[0x49, 0xC7, 0xC0, 0xFF, 0xFF, 0xFF, 0xFF]);
+    // xor r9d, r9d           (offset = 0)
+    code.extend_from_slice(&[0x45, 0x31, 0xC9]);
+    // syscall
+    code.extend_from_slice(&[0x0F, 0x05]);
+
+    // ─── MAP_FAILED guard: rax in [-4095, -1] → exit(1) ────────
+    // cmp rax, -4095  (0xFFFFFFFFFFFFF001, imm32 sign-extended)
+    code.extend_from_slice(&[0x48, 0x3D, 0x01, 0xF0, 0xFF, 0xFF]);
+    // jb ok  (unsigned below: valid pointers are < 0xFFFFF001)
+    code.push(0x72);
+    let mmap_ok_patch = code.len();
+    code.push(0x00);
+    // exit(1)
+    emit_exit1(code);
+    // ok:
+    code[mmap_ok_patch] = (code.len() - mmap_ok_patch - 1) as u8;
+
+    // mov r15, rax           (r15 = region base; survives the read loop)
+    code.extend_from_slice(&[0x49, 0x89, 0xC7]);
+    // xor r14d, r14d         (r14 = total bytes read = bump)
+    code.extend_from_slice(&[0x45, 0x31, 0xF6]);
+
+    // ═══ READ LOOP: read(0, r15+r14, CAP - r14) until EOF ══════
+    let read_top = code.len();
+    // xor edi, edi           (fd = 0)
+    code.extend_from_slice(&[0x31, 0xFF]);
+    // lea rsi, [r15 + r14]   (buf = base + bump)  — REX.WRX + 8D /r SIB
+    code.extend_from_slice(&[0x4B, 0x8D, 0x34, 0x37]);
+    // mov edx, CAP           (count start = CAP)
+    code.push(0xBA);
+    code.extend_from_slice(&RAW_STDIN_CAP.to_le_bytes());
+    // sub rdx, r14           (count = CAP - bump)  — REX.WR + 29 /r
+    code.extend_from_slice(&[0x4C, 0x29, 0xF2]);
+    // xor eax, eax           (read)
+    code.extend_from_slice(&[0x31, 0xC0]);
+    // syscall
+    code.extend_from_slice(&[0x0F, 0x05]);
+
+    // test rax, rax
+    code.extend_from_slice(&[0x48, 0x85, 0xC0]);
+    // je read_done           (rax == 0 → EOF)
+    code.push(0x74);
+    let read_done_patch = code.len();
+    code.push(0x00);
+    // js read_err            (rax < 0 → error)  (short forward, patched)
+    code.push(0x78);
+    let read_err_patch = code.len();
+    code.push(0x00);
+
+    // add r14, rax           (bump += n)  — REX.WR + 01 /r
+    code.extend_from_slice(&[0x49, 0x01, 0xC6]);
+    // cmp r14, CAP           — REX.WB + 81 /7 imm32
+    code.extend_from_slice(&[0x49, 0x81, 0xFE]);
+    code.extend_from_slice(&RAW_STDIN_CAP.to_le_bytes());
+    // jb read_top            (still room → loop)  (short backward)
+    code.push(0x72);
+    code.push((read_top as isize - code.len() as isize - 1) as u8);
+    // fall through: buffer full → exit(1) (fail-closed).
+    // read_err:
+    code[read_err_patch] = (code.len() - read_err_patch - 1) as u8;
+    emit_exit1(code);
+
+    // read_done:
+    code[read_done_patch] = (code.len() - read_done_patch - 1) as u8;
+
+    // ─── NUL-terminate at region[bump] so strlen recovers length ─
+    // mov byte [r15 + r14], 0   — REX.WRX (0x43) + C6 /0 SIB
+    code.extend_from_slice(&[0x43, 0xC6, 0x04, 0x37, 0x00]);
+
+    // ═══ BUILD SYNTHETIC ARGV BELOW THE REAL STACK ════════════
+    // nfields entries (dummy argv[0] + one per field). 4 KiB headroom is
+    // ample (max a few dozen fields); align the base to 16 bytes.
+    let nfields = input_concept.fields.len();
+    let argc = (nfields as i64) + 1;
+    // lea rax, [rbx - 4096]     (fake argv base, well below real argv)
+    code.extend_from_slice(&[0x48, 0x8D, 0x83]);
+    code.extend_from_slice(&(-4096_i32).to_le_bytes());
+    // and rax, -16              (16-byte align)
+    code.extend_from_slice(&[0x48, 0x83, 0xE0, 0xF0]);
+
+    // mov qword [rax], argc     — 48 C7 /0 imm32 (argc small)
+    code.extend_from_slice(&[0x48, 0xC7, 0x00]);
+    code.extend_from_slice(&(argc as i32).to_le_bytes());
+    // mov qword [rax+8], 0      (dummy argv[0])
+    code.extend_from_slice(&[0x48, 0xC7, 0x40, 0x08, 0x00, 0x00, 0x00, 0x00]);
+
+    // Per-field entries. Text → mmap region ptr (r15). Number → the next
+    // real argv arg, read from [rbx + 16 + 8*num_idx].
+    let mut num_idx: i32 = 0;
+    for (i, field) in input_concept.fields.iter().enumerate() {
+        let slot_disp: i32 = 16 + 8 * (i as i32); // [rax + slot_disp]
+        match field.ty {
+            Type::Text => {
+                // mov [rax + slot_disp], r15   — REX.WR (0x4C) + 89 /r disp8/32
+                if slot_disp <= 127 {
+                    code.extend_from_slice(&[0x4C, 0x89, 0x78, slot_disp as u8]);
+                } else {
+                    code.extend_from_slice(&[0x4C, 0x89, 0xB8]);
+                    code.extend_from_slice(&slot_disp.to_le_bytes());
+                }
+            }
+            _ => {
+                // Number (and any non-text): copy the real argv arg.
+                let real_disp: i32 = 16 + 8 * num_idx;
+                // mov r11, [rbx + real_disp]   — REX.WRB (0x4C) + 8B /r
+                if real_disp <= 127 {
+                    code.extend_from_slice(&[0x4C, 0x8B, 0x5B, real_disp as u8]);
+                } else {
+                    code.extend_from_slice(&[0x4C, 0x8B, 0x9B]);
+                    code.extend_from_slice(&real_disp.to_le_bytes());
+                }
+                // mov [rax + slot_disp], r11
+                if slot_disp <= 127 {
+                    code.extend_from_slice(&[0x4C, 0x89, 0x58, slot_disp as u8]);
+                } else {
+                    code.extend_from_slice(&[0x4C, 0x89, 0x98]);
+                    code.extend_from_slice(&slot_disp.to_le_bytes());
+                }
+                num_idx += 1;
+            }
+        }
+    }
+
+    // ─── point rsp at the synthetic argv → rule prologue sees it ─
+    // mov rsp, rax
+    code.extend_from_slice(&[0x48, 0x89, 0xC4]);
+}
+
+/// Emit `mov eax, 60 ; mov edi, 1 ; syscall` — sys_exit(1). Small helper
+/// shared by the raw-stdin prologue's fail-closed guards.
+fn emit_exit1(code: &mut Vec<u8>) {
+    // mov eax, 60
+    code.extend_from_slice(&[0xB8, 0x3C, 0x00, 0x00, 0x00]);
+    // mov edi, 1
+    code.extend_from_slice(&[0xBF, 0x01, 0x00, 0x00, 0x00]);
+    // syscall
+    code.extend_from_slice(&[0x0F, 0x05]);
+}
+
 /// Emit a streaming line reader prologue. Returns the offset of `stream_top`
 /// within the emitted code (always 0 — the first instruction).
 ///
@@ -19495,7 +19759,7 @@ pub fn compile_http_server(
             return Err(NativeError { message: "HTTP server mode not supported with parallel rules".into() });
         }
     }
-    let mut rule_code = compile_native_code(program, rule_name, false, false)?;
+    let mut rule_code = compile_native_code(program, rule_name, false, false, false)?;
 
     // Strip the sys_exit from the rule code — we'll return to the accept loop.
     let mov_rax_60: [u8; 7] = [0x48, 0xC7, 0xC0, 0x3C, 0x00, 0x00, 0x00];
@@ -35079,6 +35343,87 @@ rule two
             })
             .expect("spawn big-stack thread");
         handle.join().expect("full-file count_rules thread");
+    }
+
+    /// RAW-stdin channel (`--stdin-raw`): the clean large-text input path for
+    /// `--native --run`. Distinct from the token `--stdin` (whitespace-splits,
+    /// builds argv on the stack, overflows on multi-KB input). The raw channel
+    /// mmaps a 4 MiB region, reads fd 0 to EOF verbatim, and hands the blob to
+    /// the entry rule's single text field (length recovered via strlen on the
+    /// NUL terminator; .verbose source has no embedded NULs).
+    ///
+    /// Pins correctness end-to-end through the COMPILED native binary:
+    ///   - a 2-rule program piped in → count_rules == 2
+    ///   - the WHOLE 855 KB examples/vexprparse.verbose piped in → 518
+    ///     (== `grep -c '^rule '`); proves the channel feeds 855 KB correctly.
+    /// The number field `pos` comes from argv (declaration order), so each
+    /// invocation passes `0` as argv[1] — exactly the documented contract.
+    #[test]
+    fn stdin_raw_channel_count_rules_2_and_full_source() {
+        let src = std::fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let grep_rules = src.lines().filter(|l| l.starts_with("rule ")).count() as i64;
+
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let bin = std::env::temp_dir().join("verbosec_test_stdin_raw_count_rules");
+        compile_native_stdin_raw(&program, "count_rules", bin.to_str().unwrap())
+            .expect("count_rules must compile with --stdin-raw");
+
+        // Run the compiled binary with `blob` piped to stdin and `0` as the
+        // pos argv arg. Returns the integer count_rules prints.
+        let run = |blob: &[u8]| -> i64 {
+            use std::io::Write;
+            let mut child = std::process::Command::new(&bin)
+                .arg("0")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .expect("spawn --stdin-raw binary");
+            child
+                .stdin
+                .as_mut()
+                .unwrap()
+                .write_all(blob)
+                .expect("write blob to stdin");
+            drop(child.stdin.take());
+            let out = child.wait_with_output().expect("wait for --stdin-raw binary");
+            assert!(out.status.success(), "--stdin-raw binary must exit 0; got {:?}", out.status);
+            String::from_utf8_lossy(&out.stdout)
+                .trim()
+                .parse::<i64>()
+                .expect("count_rules must print an integer")
+        };
+
+        // (1) a 2-rule program → 2.
+        let two = b"rule a\n  logic:\n    out = 1\nrule b\n  logic:\n    out = 2";
+        assert_eq!(run(two), 2, "--stdin-raw: a 2-rule program must count 2 rules");
+
+        // (2) the WHOLE 855 KB self-source → its `^rule ` count (518).
+        assert_eq!(
+            run(src.as_bytes()),
+            grep_rules,
+            "--stdin-raw must feed the full 855 KB source correctly (count_rules == grep count)"
+        );
+
+        // (3) fail-closed: a missing number arg (no argv pos) must exit non-zero
+        // (argc guard), NOT SIGSEGV on a NULL-pointer atoi.
+        {
+            use std::io::Write;
+            let mut child = std::process::Command::new(&bin)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("spawn --stdin-raw binary (no argv)");
+            child.stdin.as_mut().unwrap().write_all(two).ok();
+            drop(child.stdin.take());
+            let status = child.wait().expect("wait");
+            assert!(!status.success(), "--stdin-raw with missing pos arg must fail closed (non-zero exit)");
+        }
+
+        let _ = std::fs::remove_file(&bin);
     }
 
     /// Records-arc brick R6a: the self-hosted checker's undefined-variable lint
