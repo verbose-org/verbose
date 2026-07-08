@@ -137,7 +137,9 @@ fn real_main() {
         eprintln!("  --native <output>                  Compile to native x86-64 ELF (no dependencies)");
         eprintln!("                                       Target: --run <name> (rule or service); defaults to the last");
         eprintln!("                                       declared service, else the last declared rule.");
-        eprintln!("  --native <output> --stdin           Native ELF that reads input from stdin");
+        eprintln!("  --native <output> --stdin           Native ELF that reads whitespace tokens from stdin");
+        eprintln!("  --native <output> --stdin-raw       Native ELF that reads ALL of stdin verbatim into the");
+        eprintln!("                                       entry rule's single text field (large-blob input)");
         eprintln!("  --native <output> --stream          Streaming: reads stdin line by line (long-running)");
         eprintln!("  --wasm <output>                    Compile to WebAssembly module (.wasm)");
         eprintln!("  --echo-server <port> <output>      TCP echo server — native emitter probe, NOT described in .verbose (see docs/known-gaps.md)");
@@ -337,8 +339,18 @@ fn real_main() {
         // Multi-rule: "rule1,rule2,..." compiles all into one binary.
         let native_stdin = args.iter().any(|a| a == "--stdin");
         let native_stream = args.iter().any(|a| a == "--stream");
+        // RAW stdin: read fd 0 verbatim into the entry rule's single text
+        // field (large-blob input, e.g. an 855 KB .verbose source). Distinct
+        // from the token `--stdin`. See docs/self-hosting-raw-stdin-design.md.
+        let native_stdin_raw = args.iter().any(|a| a == "--stdin-raw");
         let rule_names: Vec<&str> = native_rule_str.split(',').collect();
-        let compile_result = if rule_names.len() > 1 {
+        let compile_result = if native_stdin_raw {
+            if rule_names.len() > 1 {
+                Err(native::NativeError { message: "--stdin-raw is not supported with multi-rule binaries".into() })
+            } else {
+                native::compile_native_stdin_raw(&program, rule_names[0], &output)
+            }
+        } else if rule_names.len() > 1 {
             native::compile_native_multi(&program, &rule_names, &output, native_stdin, native_stream)
         } else {
             native::compile_native(&program, &rule_names[0], &output, native_stdin || native_stream, native_stream)
@@ -347,7 +359,7 @@ fn real_main() {
         match compile_result {
             Ok(()) => {
                 let size = std::fs::metadata(&output).map(|m| m.len()).unwrap_or(0);
-                let mode = if native_stream { "stream" } else if native_stdin { "stdin" } else { "argv" };
+                let mode = if native_stream { "stream" } else if native_stdin_raw { "stdin-raw" } else if native_stdin { "stdin" } else { "argv" };
                 println!("native: {} -> {} ({} bytes, rule '{}', input: {})", path, output, size, native_rule, mode);
                 // Report exploited hints
                 if let Some(rule) = program.items.iter().find_map(|i| match i {
