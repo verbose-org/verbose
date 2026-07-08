@@ -4076,7 +4076,7 @@ fn emit_self_recursive_program<'a>(
     for &r in scc_rules {
         let mut scratch = Vec::new();
         let r_concept = lookup_concept(r)?;
-        emit_callable_into(&mut scratch, r, r_concept, all_rules, placeholder_ctx, cg, streaming)?;
+        emit_callable_into(&mut scratch, r, r_concept, all_rules, all_resources, placeholder_ctx, cg, streaming)?;
         sizes.push(scratch.len());
     }
     let leading_size = code.len(); // = 5
@@ -4091,7 +4091,7 @@ fn emit_self_recursive_program<'a>(
     // Pass 2: emit each callable with real labels.
     for &r in scc_rules {
         let r_concept = lookup_concept(r)?;
-        emit_callable_into(&mut code, r, r_concept, all_rules, final_ctx, cg, streaming)?;
+        emit_callable_into(&mut code, r, r_concept, all_rules, all_resources, final_ctx, cg, streaming)?;
     }
 
     // Patch the leading jmp to skip past all callables.
@@ -4313,6 +4313,7 @@ fn emit_callable_into<'a>(
     rule: &'a Rule,
     concept: &'a Concept,
     all_rules: &HashMap<&str, &Rule>,
+    all_resources: &HashMap<&str, &'a Resource>,
     self_call: SelfCallCtx<'_>,
     concept_group: Option<&'a ConceptGroup>,
     streaming: bool,
@@ -4380,7 +4381,40 @@ fn emit_callable_into<'a>(
     let _ = binder_slot_base;
     let tmp_slot_base_local = -((nfields as i32 + n_let_slots as i32 + max_arm_binder_slots as i32 + 1) * 8);
     let total_slots = nfields + n_let_slots + (max_arm_binder_slots as usize) + (tmp_slots as usize);
-    let frame_bytes = (total_slots * 8) as i32;
+    // Read-let support inside a callable (2026-07): a `let s = read(<res>)`
+    // let RHS opens/reads a resource ONCE at callable entry, into a buffer
+    // that lives in THIS callable's frame (a callable has its own rbp, so
+    // it cannot reach the _start prologue's resource buffers). The read
+    // (ptr, len) live at the two let slots already reserved above; the
+    // read BUFFER lives below all regular slots. Budget it here.
+    //
+    // Only `read`-let bindings need this. `Expr::Read` in the body (not a
+    // let) is not on this path — callables reach `read` only through a
+    // text let by construction of the self-hosting driver, and the general
+    // in-body read case stays on the prologue path. We collect the
+    // referenced resources from the callable's read-lets and add their
+    // (16 + padded buffer) bytes to the frame.
+    let callable_read_resources: Vec<&Resource> = {
+        let mut out: Vec<&Resource> = Vec::new();
+        for (idx, (_name, expr)) in rule.logic.bindings.iter().enumerate() {
+            if callable_binding_is_text[idx] {
+                if let Expr::Read(rname) = expr {
+                    if let Some(&r) = all_resources.get(rname.as_str()) {
+                        out.push(r);
+                    }
+                }
+            }
+        }
+        out
+    };
+    let resource_extra_bytes: i32 = compute_resource_extra_bytes(&callable_read_resources);
+    let frame_bytes = (total_slots * 8) as i32 + resource_extra_bytes;
+    // Resource buffers descend from just below the last regular slot.
+    let mut resource_next_slot: i32 = -((total_slots as i32 + 1) * 8);
+    // Read failures (open/read returning negative) branch to a sys_exit(1)
+    // tail emitted at the end of the callable (shared with the arena abort
+    // tail path). `on_read_error: abort` is the only policy today.
+    let mut resource_abort_patches: Vec<usize> = Vec::new();
 
     // Register-allocation brick A2 — decide whether this callable can keep its
     // single input parameter in rbx (callee-saved) for the whole body instead
@@ -4604,6 +4638,34 @@ fn emit_callable_into<'a>(
                         else { code.extend_from_slice(&[0x48, 0x89, 0x85]); code.extend_from_slice(&len_dst.to_le_bytes()); }
                         callable_text_bindings.insert(name.as_str(), (ptr_dst, len_dst));
                     }
+                    // Read-let (2026-07): `let s = read(<resource>)`. Open/read
+                    // the resource ONCE into a buffer in THIS callable's frame,
+                    // then register the let name at the (ptr, len) slots that
+                    // emit_resource_read_sequence populates. This is what lets a
+                    // text `let`/`read` flow into a multi-field-record call arg
+                    // (the Ident(name) arm of the call-marshalling path resolves
+                    // it via callable_text_bindings). The two let slots reserved
+                    // above for this binding go unused (a few wasted frame bytes);
+                    // the authoritative (ptr, len) are the ones the read sequence
+                    // writes below the regular slots. r15 is clobbered by the
+                    // read sequence, but callables don't use r15 across the body,
+                    // and this runs before the body.
+                    Expr::Read(rname) => {
+                        let resource = all_resources.get(rname.as_str()).ok_or_else(|| NativeError {
+                            message: format!(
+                                "callable '{}' text let '{}' reads resource '{}' but no top-level `resource {}` was declared",
+                                rule.name, name, rname, rname
+                            ),
+                        })?;
+                        let (ptr_slot, len_slot, _buf_slot, new_next) = emit_resource_read_sequence(
+                            code,
+                            resource,
+                            resource_next_slot,
+                            &mut resource_abort_patches,
+                        );
+                        resource_next_slot = new_next;
+                        callable_text_bindings.insert(name.as_str(), (ptr_slot, len_slot));
+                    }
                     _ => {
                         // Other safe text shapes can be added later.
                     }
@@ -4696,27 +4758,31 @@ fn emit_callable_into<'a>(
     // VariantConstruct site exists. The borrow `arena_ctx_ref` ends here so
     // we can move the owned ctx out and drain its RefCell of patch sites.
     {
+        // Merge arena-construct abort patches (from VariantConstruct sites)
+        // with resource read/open abort patches (from read-lets) into ONE
+        // sys_exit(1) tail — both fail-closed paths jump to the same target.
+        let mut patches: Vec<usize> = Vec::new();
         if let Some(ac) = arena_ctx_owned {
-            let patches = ac.arena_abort_patches.into_inner();
-            if !patches.is_empty() {
-                // jmp-over the abort tail so normal control flow continues.
-                code.push(0xEB); // jmp short
-                code.push(13);   // skip 13 bytes (mov+mov+syscall = 7+7+2 = 16? let's compute)
-                // Actually: mov rax, 60 = 7 bytes; mov rdi, 1 = 7 bytes; syscall = 2 bytes => 16
-                // Patch the jmp short offset.
-                let jmp_off_patch = code.len() - 1;
-                let abort_label = code.len();
-                for site in &patches {
-                    let rel = abort_label as i32 - (*site as i32 + 4);
-                    code[*site..*site + 4].copy_from_slice(&rel.to_le_bytes());
-                }
-                code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x3C, 0x00, 0x00, 0x00]);
-                code.extend_from_slice(&[0x48, 0xC7, 0xC7, 0x01, 0x00, 0x00, 0x00]);
-                code.extend_from_slice(&[0x0F, 0x05]);
-                let after = code.len();
-                let skip = (after as i32 - (abort_label as i32)) as i32;
-                code[jmp_off_patch] = skip as u8;
+            patches.extend(ac.arena_abort_patches.into_inner());
+        }
+        patches.extend(resource_abort_patches.iter().copied());
+        if !patches.is_empty() {
+            // jmp-over the abort tail so normal control flow continues.
+            code.push(0xEB); // jmp short
+            code.push(13);   // placeholder skip, patched below
+            // (mov rax, 60 = 7 bytes; mov rdi, 1 = 7 bytes; syscall = 2 bytes)
+            let jmp_off_patch = code.len() - 1;
+            let abort_label = code.len();
+            for site in &patches {
+                let rel = abort_label as i32 - (*site as i32 + 4);
+                code[*site..*site + 4].copy_from_slice(&rel.to_le_bytes());
             }
+            code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x3C, 0x00, 0x00, 0x00]);
+            code.extend_from_slice(&[0x48, 0xC7, 0xC7, 0x01, 0x00, 0x00, 0x00]);
+            code.extend_from_slice(&[0x0F, 0x05]);
+            let after = code.len();
+            let skip = (after as i32 - (abort_label as i32)) as i32;
+            code[jmp_off_patch] = skip as u8;
         }
     }
 
@@ -36943,6 +37009,118 @@ rule two
 
         let _ = fs::remove_file(elf);
         let _ = fs::remove_file(em);
+    }
+
+    // Regression (2026-07): a text `let`/`read` (BoundText) passed as a text
+    // field of a MULTI-FIELD-RECORD call argument used to be refused with
+    // "text field '...' in Record constructor for recursive call to '...':
+    // only input field pass-through, BoundText, and text literals are
+    // supported". The caller's read-let was never opened inside the callable
+    // frame nor registered in the callable's text_bindings, so the call-arg
+    // Ident lookup failed. Fixed by reading the resource ONCE in the
+    // callable's own frame (emit_resource_read_sequence) and registering the
+    // let name at the produced (ptr, len) slots. Min repro: `let s = read(r);
+    // out = lenof(Rec { txt: s, k: 0 })` where lenof takes a 2-field record →
+    // length("hello") + 0 = 5.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn read_let_as_multi_field_record_call_arg_runs() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        let rdata = std::env::temp_dir().join("verbosec_test_readlet_rdata.txt");
+        fs::write(&rdata, "hello").expect("write resource file");
+
+        let src = format!(
+            "@verbose 0.1.0\n\
+\n\
+resource r\n  \
+@intention: \"x\"\n  \
+@source: min.intent:1\n\
+\n  \
+path: \"{}\"\n  \
+max: 64\n  \
+on_read_error: abort\n\
+\n\
+concept Rec\n  \
+@intention: \"x\"\n  \
+@source: min.intent:1\n  \
+fields:\n    \
+txt : text\n    \
+k : number\n\
+\n\
+concept U\n  \
+@intention: \"x\"\n  \
+@source: min.intent:1\n  \
+fields:\n    \
+n : number\n\
+\n\
+rule lenof\n  \
+@intention: \"x\"\n  \
+@source: min.intent:1\n  \
+input:\n    \
+rc : Rec\n  \
+output:\n    \
+out : number\n  \
+logic:\n    \
+out = length(rc.txt) + rc.k\n  \
+proofs:\n    \
+purity:\n      \
+reads : [rc.txt, rc.k]\n      \
+calls : []\n    \
+termination:\n      \
+bound : 8\n\
+\n\
+rule main\n  \
+@intention: \"x\"\n  \
+@source: min.intent:1\n  \
+input:\n    \
+u : U\n  \
+output:\n    \
+out : number\n  \
+logic:\n    \
+let s = read(r)\n    \
+out = lenof(Rec {{ txt: s, k: 0 }})\n  \
+proofs:\n    \
+purity:\n      \
+reads : [r]\n      \
+calls : [lenof]\n    \
+termination:\n      \
+bound : 8\n",
+            rdata.to_str().unwrap()
+        );
+
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let elf = std::env::temp_dir().join("verbosec_test_readlet_main");
+        compile_native(&program, "main", elf.to_str().unwrap(), false, false)
+            .expect("read-let as multi-field-record call arg must compile natively");
+
+        let mut perms = fs::metadata(&elf).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&elf, perms).expect("chmod +x");
+
+        let out = Command::new(&elf).arg("0").output().expect("run main");
+        assert!(out.status.success(), "main must exit 0; got {:?}", out.status);
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            "5",
+            "length(\"hello\") + 0 must be 5"
+        );
+
+        // Fail-closed: with the resource file removed, on_read_error: abort
+        // must exit non-zero (never emit a stale/garbage value).
+        let _ = fs::remove_file(&rdata);
+        let out2 = Command::new(&elf).arg("0").output().expect("run main (no file)");
+        assert!(
+            !out2.status.success(),
+            "missing resource must fail-close (non-zero exit); got {:?}",
+            out2.status
+        );
+
+        let _ = fs::remove_file(&elf);
     }
 
 }
