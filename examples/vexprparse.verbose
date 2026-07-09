@@ -454,6 +454,8 @@ concept_group VExpr [max_depth: 4096, max_nodes: 6000000]
       VData of (tag : number, payload : ValueList)
       VText of (start : number, len : number)
       VConcat of (left : Value, right : Value)
+      VBLit of (start : number, len : number)
+      VBLe of (value : number, width : number)
 
   -- Records-arc brick R6c: a cons-list of runtime Values — a variant construction's
   -- evaluated field values in source order, and the carrier a match reads positionally
@@ -4757,7 +4759,7 @@ rule eval_ast_env
       -- A user rule named byte_at / length / substring / concat is shadowed by the
       -- primitive (reserved names, same as verbosec). Concat arc slice 1: concat
       -- joins the family — prim_concat folds the evaluated args into a rope value.
-      AstCall(callee_start, callee_len, args) => if span_is_byte_at(SpanCheck { src: ea.src, start: callee_start, len: callee_len }) == 1 then prim_byte_at(EvalCallState { callee_start: callee_start, callee_len: callee_len, args: args, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts }) else if span_is_length(SpanCheck { src: ea.src, start: callee_start, len: callee_len }) == 1 then prim_length(EvalCallState { callee_start: callee_start, callee_len: callee_len, args: args, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts }) else if span_is_substring(SpanCheck { src: ea.src, start: callee_start, len: callee_len }) == 1 then prim_substring(EvalCallState { callee_start: callee_start, callee_len: callee_len, args: args, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts }) else if span_is_concat(SpanCheck { src: ea.src, start: callee_start, len: callee_len }) == 1 then prim_concat(EvalCallState { callee_start: callee_start, callee_len: callee_len, args: args, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts }) else eval_call(EvalCallState { callee_start: callee_start, callee_len: callee_len, args: args, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts })
+      AstCall(callee_start, callee_len, args) => if span_is_byte_at(SpanCheck { src: ea.src, start: callee_start, len: callee_len }) == 1 then prim_byte_at(EvalCallState { callee_start: callee_start, callee_len: callee_len, args: args, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts }) else if span_is_length(SpanCheck { src: ea.src, start: callee_start, len: callee_len }) == 1 then prim_length(EvalCallState { callee_start: callee_start, callee_len: callee_len, args: args, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts }) else if span_is_substring(SpanCheck { src: ea.src, start: callee_start, len: callee_len }) == 1 then prim_substring(EvalCallState { callee_start: callee_start, callee_len: callee_len, args: args, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts }) else if span_is_concat(SpanCheck { src: ea.src, start: callee_start, len: callee_len }) == 1 then prim_concat(EvalCallState { callee_start: callee_start, callee_len: callee_len, args: args, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts }) else if span_is_le32(SpanCheck { src: ea.src, start: callee_start, len: callee_len }) == 1 then prim_le32(EvalCallState { callee_start: callee_start, callee_len: callee_len, args: args, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts }) else if span_is_le64(SpanCheck { src: ea.src, start: callee_start, len: callee_len }) == 1 then prim_le64(EvalCallState { callee_start: callee_start, callee_len: callee_len, args: args, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts }) else eval_call(EvalCallState { callee_start: callee_start, callee_len: callee_len, args: args, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts })
       AstIf(cond, thn, els) => if vnum_of(eval_ast_env(EvalEnvArg { node: cond, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts })) != 0 then eval_ast_env(EvalEnvArg { node: thn, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts }) else eval_ast_env(EvalEnvArg { node: els, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts })
       AstBool(value) => Value::VNum { n: value }
       -- Text values slice 1: a string literal is a SPAN into the interpreted source.
@@ -4767,7 +4769,7 @@ rule eval_ast_env
       -- len >= 2 clamp keeps an unterminated string (lone quote at EOF, len 1) from
       -- producing a negative-length span.
       AstStr(start, len) => Value::VText { start: start + 1, len: if len >= 2 then len - 2 else 0 }
-      AstBytes(start, len) => Value::VNum { n: 0 }
+      AstBytes(start, len) => Value::VBLit { start: start, len: len }
       AstErr => Value::VNum { n: 0 }
       -- R6c: construct a runtime variant value. `tag` is the variant's identity
       -- (variant_tag resolves the concept/variant name spans against the ConceptList);
@@ -4780,7 +4782,7 @@ rule eval_ast_env
   proofs:
     purity:
       reads : [ea.node, ea.env, ea.src, ea.prog, ea.concepts]
-      calls : [eval_ast_env, venv_lookup, eval_call, vnum_of, variant_tag, eval_vfields, eval_match, vdata_payload, vdata_tag, concept_at_index, cd_fields, field_index_of, vlist_nth, span_is_byte_at, span_is_length, span_is_substring, span_is_concat, prim_byte_at, prim_length, prim_substring, prim_concat]
+      calls : [eval_ast_env, venv_lookup, eval_call, vnum_of, variant_tag, eval_vfields, eval_match, vdata_payload, vdata_tag, concept_at_index, cd_fields, field_index_of, vlist_nth, span_is_byte_at, span_is_length, span_is_substring, span_is_concat, span_is_le32, span_is_le64, prim_byte_at, prim_length, prim_substring, prim_concat, prim_le32, prim_le64]
     termination:
       bound : 4000
 
@@ -5132,6 +5134,8 @@ rule vnum_of
       VData(tag, payload) => 0
       VText(start, len) => 0
       VConcat(left, right) => 0
+      VBLit(start, len) => 0
+      VBLe(value, width) => 0
   proofs:
     purity:
       reads : [v]
@@ -5155,6 +5159,8 @@ rule vdata_tag
       VData(tag, payload) => tag
       VText(start, len) => 0 - 1
       VConcat(left, right) => 0 - 1
+      VBLit(start, len) => 0 - 1
+      VBLe(value, width) => 0 - 1
   proofs:
     purity:
       reads : [v]
@@ -5177,6 +5183,8 @@ rule vdata_payload
       VData(tag, payload) => payload
       VText(start, len) => ValueList::VLNil
       VConcat(left, right) => ValueList::VLNil
+      VBLit(start, len) => ValueList::VLNil
+      VBLe(value, width) => ValueList::VLNil
   proofs:
     purity:
       reads : [v]
@@ -5212,8 +5220,11 @@ rule vtext_is
       VText(start, len) => 1
       -- Concat arc slice 1: a rope is NOT a span — vtext_is stays the "may I read
       -- (start, len) directly?" gate, so rope consumers must go through
-      -- vlength / vbyte_at instead.
+      -- vlength / vbyte_at instead. Bytes tier B2: a bytes leaf (VBLit / VBLe) is
+      -- likewise not a directly-readable text span — 0.
       VConcat(left, right) => 0
+      VBLit(start, len) => 0
+      VBLe(value, width) => 0
   proofs:
     purity:
       reads : [v]
@@ -5237,6 +5248,8 @@ rule vtext_start
       VData(tag, payload) => 0
       VText(start, len) => start
       VConcat(left, right) => 0
+      VBLit(start, len) => 0
+      VBLe(value, width) => 0
   proofs:
     purity:
       reads : [v]
@@ -5259,6 +5272,8 @@ rule vtext_len
       VData(tag, payload) => 0
       VText(start, len) => len
       VConcat(left, right) => 0
+      VBLit(start, len) => 0
+      VBLe(value, width) => 0
   proofs:
     purity:
       reads : [v]
@@ -5336,33 +5351,205 @@ rule mag_digit_at
       bound : 64
 
 
--- vlength: the byte length of a Value read as text — THE shared rope walker
--- (prim_length reports it; vbyte_at's descent steers by it). VText -> the span
--- length; VNum -> the decimal rendering's width (digit count, +1 for '-' when
--- negative); VConcat -> left + right, recursively; VData -> 0 (a variant value
--- has no text reading — defensive, mirroring the accessors above). Structural
--- recursion: both recursive calls descend into binders of the self-referential
--- VConcat payload, exactly shape_ast's proof shape.
-rule vlength
-  @intention: "The byte length of a value read as text: span length, decimal width of a number, or the recursive sum over a rope"
+-- ── Bytes tier B2: byte-literal escape decode ────────────────────────────────
+-- A VBLit is a SPAN into the interpreted source pointing at a b"..." literal's
+-- CONTENT (the escape-encoded chars, e.g. `\x41\x42`). It is decoded ON DEMAND:
+-- length = count of decoded bytes, byte_at(i) = the i-th decoded byte. The closed
+-- escape set: `\xNN` (2 hex digits) -> 1 byte consuming 4 source chars; `\n` -> 10,
+-- `\t` -> 9, `\\` -> 92, `\"` -> 34, each consuming 2 source chars; any other char
+-- -> its own byte, consuming 1. hex_nibble decodes one hex digit (0-9/a-f/A-F).
+
+-- hex_nibble: the numeric value (0..16) of one ASCII hex digit; defensive 0 for a
+-- non-hex byte (the B1 parser already validated the literal, so this is a floor).
+rule hex_nibble
+  @intention: "The numeric value of one ASCII hex digit (0-9, a-f, A-F); defensive 0 otherwise"
   @source: vexprparse.intent:68
   input:
-    v : Value
+    b : NibbleState
   output:
     out : number
   logic:
-    out = match v:
+    out = if b.c >= 48 and b.c <= 57 then b.c - 48 else if b.c >= 97 and b.c <= 102 then b.c - 87 else if b.c >= 65 and b.c <= 70 then b.c - 55 else 0
+  proofs:
+    purity:
+      reads : [b.c]
+      calls : []
+    termination:
+      bound : 32
+
+
+-- hex_nibble's input: one candidate hex-digit byte.
+concept NibbleState
+  @intention: "One candidate ASCII byte, for hex-nibble decoding"
+  @source: vexprparse.intent:68
+  fields:
+    c : number [0, 4000000]
+
+
+-- pow256: 256 ^ k, for little-endian byte extraction of a VBLe (byte i =
+-- (value / 256^i) % 256). k is small (0..8 in practice); simple multiply
+-- recursion, strictly shrinking k so bound-only + the native breadcrumb.
+rule pow256
+  @intention: "256 raised to the k-th power, for little-endian byte extraction"
+  @source: vexprparse.intent:68
+  input:
+    p : PowState
+  output:
+    out : number
+  logic:
+    out = if p.k <= 0 then 1 else 256 * pow256(PowState { k: p.k - 1 })
+  proofs:
+    purity:
+      reads : [p.k]
+      calls : [pow256]
+    termination:
+      bound : 16
+
+
+-- pow256's input: a nonnegative exponent.
+concept PowState
+  @intention: "A nonnegative exponent for the 256-power helper"
+  @source: vexprparse.intent:68
+  fields:
+    k : number [0, 4000000]
+
+
+-- DecodeState: a scan cursor over a byte-literal content span — the source, the
+-- current absolute offset (start), the remaining source-char count (len), and a
+-- target decoded index (i, used only by bytelit_byte_at). Both walkers share it.
+concept DecodeState
+  @intention: "A scan cursor over a byte-literal content span (source + offset + remaining chars + target decoded index)"
+  @source: vexprparse.intent:68
+  fields:
+    src : text [..256]
+    start : number [-4000000, 4000000]
+    len : number [-4000000, 4000000]
+    i : number [-4000000, 4000000]
+
+
+-- bytelit_unit_width: how many SOURCE chars the decode unit starting at `start`
+-- consumes: 4 for `\xNN`, 2 for the other escapes, 1 for a plain char. The one
+-- source of truth for advancing the cursor; bytelit_unit_byte mirrors its branch
+-- structure to read the decoded byte.
+rule bytelit_unit_width
+  @intention: "Source-char width of the decode unit at the cursor: 4 for \\xNN, 2 for an escape pair, 1 for a plain char"
+  @source: vexprparse.intent:68
+  input:
+    ds : DecodeState
+  output:
+    out : number
+  logic:
+    out = if byte_at(ds.src, ds.start) == 92 then (if byte_at(ds.src, ds.start + 1) == 120 then 4 else 2) else 1
+  proofs:
+    purity:
+      reads : [ds.src, ds.start]
+      calls : []
+    termination:
+      bound : 8
+
+
+-- bytelit_unit_byte: the decoded byte value of the unit starting at `start`.
+-- `\xNN` -> nibble(hi)*16 + nibble(lo); `\n`/`\t`/`\\`/`\"` -> 10/9/92/34; an
+-- unknown escape -> its second char (defensive, consumes 2 with unit_width); a
+-- plain char -> its own byte. Mirrors bytelit_unit_width's branches exactly.
+rule bytelit_unit_byte
+  @intention: "Decoded byte value of the unit at the cursor: \\xNN hex pair, a named escape, or a plain char byte"
+  @source: vexprparse.intent:68
+  input:
+    ds : DecodeState
+  output:
+    out : number
+  logic:
+    out = if byte_at(ds.src, ds.start) == 92 then (if byte_at(ds.src, ds.start + 1) == 120 then hex_nibble(NibbleState { c: byte_at(ds.src, ds.start + 2) }) * 16 + hex_nibble(NibbleState { c: byte_at(ds.src, ds.start + 3) }) else if byte_at(ds.src, ds.start + 1) == 110 then 10 else if byte_at(ds.src, ds.start + 1) == 116 then 9 else if byte_at(ds.src, ds.start + 1) == 92 then 92 else if byte_at(ds.src, ds.start + 1) == 34 then 34 else byte_at(ds.src, ds.start + 1)) else byte_at(ds.src, ds.start)
+  proofs:
+    purity:
+      reads : [ds.src, ds.start]
+      calls : [hex_nibble]
+    termination:
+      bound : 64
+
+
+-- bytelit_decoded_len: the number of DECODED bytes in a byte-literal content span.
+-- Walk the source chars unit by unit, counting one per unit and advancing the
+-- cursor by the unit's source width. len <= 0 is the floor (0 bytes). Packed input
+-- (len shrinks by a positive width), so bound-only + the native breadcrumb.
+rule bytelit_decoded_len
+  @intention: "The number of decoded bytes in a byte-literal content span (escape-aware walk)"
+  @source: vexprparse.intent:68
+  input:
+    ds : DecodeState
+  output:
+    out : number
+  logic:
+    out = if ds.len <= 0 then 0 else 1 + bytelit_decoded_len(DecodeState { src: ds.src, start: ds.start + bytelit_unit_width(ds), len: ds.len - bytelit_unit_width(ds), i: ds.i })
+  proofs:
+    purity:
+      reads : [ds, ds.src, ds.start, ds.len, ds.i]
+      calls : [bytelit_decoded_len, bytelit_unit_width]
+    termination:
+      bound : 4000
+
+
+-- bytelit_byte_at: the i-th DECODED byte of a byte-literal content span (0 when i
+-- is out of range). Walk unit by unit, decrementing i; at i == 0 decode and return
+-- the current unit's byte. Same escape-aware advance as bytelit_decoded_len.
+rule bytelit_byte_at
+  @intention: "The i-th decoded byte of a byte-literal content span (defensive 0 out of range)"
+  @source: vexprparse.intent:68
+  input:
+    ds : DecodeState
+  output:
+    out : number
+  logic:
+    out = if ds.len <= 0 or ds.i < 0 then 0 else if ds.i == 0 then bytelit_unit_byte(ds) else bytelit_byte_at(DecodeState { src: ds.src, start: ds.start + bytelit_unit_width(ds), len: ds.len - bytelit_unit_width(ds), i: ds.i - 1 })
+  proofs:
+    purity:
+      reads : [ds, ds.src, ds.start, ds.len, ds.i]
+      calls : [bytelit_byte_at, bytelit_unit_byte, bytelit_unit_width]
+    termination:
+      bound : 4000
+
+
+-- vlength's input: the value to measure + the interpreted source (VBLit leaves are
+-- escape-encoded spans into it, decoded on demand). Bytes tier B2: the src is now
+-- carried alongside the value because VBLit's decoded length needs the source
+-- bytes — a rope of bytes leaves descends the same way a text rope does.
+concept VLenState
+  @intention: "A value + the interpreted source, for measuring the value's byte-reading length"
+  @source: vexprparse.intent:68
+  fields:
+    v : Value
+    src : text [..256]
+
+-- vlength: the byte length of a Value read as text/bytes — THE shared rope walker
+-- (prim_length reports it; vbyte_at's descent steers by it). VText -> the span
+-- length; VNum -> the decimal rendering's width (digit count, +1 for '-' when
+-- negative); VConcat -> left + right, recursively; VData -> 0 (a variant value
+-- has no text reading — defensive, mirroring the accessors above). Bytes tier B2:
+-- VBLit -> the escape-aware decoded byte count; VBLe -> the fixed le width (4/8).
+-- The value is a FIELD of VLenState (not the rule input directly), so termination
+-- is bound-only + the native recursion breadcrumb, exactly like vbyte_at.
+rule vlength
+  @intention: "The byte length of a value read as text/bytes: span length, decimal width of a number, decoded byte-literal length, le width, or the recursive sum over a rope"
+  @source: vexprparse.intent:68
+  input:
+    vl : VLenState
+  output:
+    out : number
+  logic:
+    out = match vl.v:
       VNum(n) => if n < 0 then 1 + mag_digits(MagState { m: 0 - n }) else mag_digits(MagState { m: n })
       VData(tag, payload) => 0
       VText(start, len) => len
-      VConcat(left, right) => vlength(left) + vlength(right)
+      VConcat(left, right) => vlength(VLenState { v: left, src: vl.src }) + vlength(VLenState { v: right, src: vl.src })
+      VBLit(start, len) => bytelit_decoded_len(DecodeState { src: vl.src, start: start, len: len, i: 0 })
+      VBLe(value, width) => width
   proofs:
     purity:
-      reads : [v]
-      calls : [vlength, mag_digits]
+      reads : [vl.v, vl.src]
+      calls : [vlength, mag_digits, bytelit_decoded_len]
     termination:
       bound : 4000
-      structural : v
 
 
 -- vbyte_at's input: the value to read, the byte index, and the interpreted
@@ -5401,11 +5588,13 @@ rule vbyte_at
       VNum(n) => if n < 0 then (if bs.i == 0 then 45 else if bs.i >= 1 and bs.i < 1 + mag_digits(MagState { m: 0 - n }) then mag_digit_at(DigitState { m: 0 - n, k: bs.i - 1 }) else 0) else (if bs.i >= 0 and bs.i < mag_digits(MagState { m: n }) then mag_digit_at(DigitState { m: n, k: bs.i }) else 0)
       VData(tag, payload) => 0
       VText(start, len) => if bs.i >= 0 and bs.i < len then byte_at(bs.src, start + bs.i) else 0
-      VConcat(left, right) => if bs.i < vlength(left) then vbyte_at(VByteState { v: left, i: bs.i, src: bs.src }) else vbyte_at(VByteState { v: right, i: bs.i - vlength(left), src: bs.src })
+      VConcat(left, right) => if bs.i < vlength(VLenState { v: left, src: bs.src }) then vbyte_at(VByteState { v: left, i: bs.i, src: bs.src }) else vbyte_at(VByteState { v: right, i: bs.i - vlength(VLenState { v: left, src: bs.src }), src: bs.src })
+      VBLit(start, len) => if bs.i >= 0 and bs.i < bytelit_decoded_len(DecodeState { src: bs.src, start: start, len: len, i: 0 }) then bytelit_byte_at(DecodeState { src: bs.src, start: start, len: len, i: bs.i }) else 0
+      VBLe(value, width) => if bs.i >= 0 and bs.i < width then value / pow256(PowState { k: bs.i }) % 256 else 0
   proofs:
     purity:
       reads : [bs.v, bs.i, bs.src]
-      calls : [vbyte_at, vlength, mag_digits, mag_digit_at]
+      calls : [vbyte_at, vlength, mag_digits, mag_digit_at, bytelit_decoded_len, bytelit_byte_at, pow256]
     termination:
       bound : 4000
 
@@ -5489,6 +5678,44 @@ rule span_is_concat
       bound : 64
 
 
+-- span_is_le32: 1 iff the span is exactly the 4 bytes "le32" (l=108 e=101 3=51
+-- 2=50). Bytes tier B2 — mirror of span_is_concat, dispatches the le32 primitive.
+rule span_is_le32
+  @intention: "1 if a callee span spells exactly \"le32\", 0 otherwise"
+  @source: vexprparse.intent:68
+  input:
+    sc : SpanCheck
+  output:
+    out : number
+  logic:
+    out = if sc.len == 4 and (byte_at(sc.src, sc.start) == 108 and (byte_at(sc.src, sc.start + 1) == 101 and (byte_at(sc.src, sc.start + 2) == 51 and byte_at(sc.src, sc.start + 3) == 50))) then 1 else 0
+  proofs:
+    purity:
+      reads : [sc.src, sc.start, sc.len]
+      calls : []
+    termination:
+      bound : 64
+
+
+-- span_is_le64: 1 iff the span is exactly the 4 bytes "le64" (l=108 e=101 6=54
+-- 4=52). Bytes tier B2 — sibling of span_is_le32.
+rule span_is_le64
+  @intention: "1 if a callee span spells exactly \"le64\", 0 otherwise"
+  @source: vexprparse.intent:68
+  input:
+    sc : SpanCheck
+  output:
+    out : number
+  logic:
+    out = if sc.len == 4 and (byte_at(sc.src, sc.start) == 108 and (byte_at(sc.src, sc.start + 1) == 101 and (byte_at(sc.src, sc.start + 2) == 54 and byte_at(sc.src, sc.start + 3) == 52))) then 1 else 0
+  proofs:
+    purity:
+      reads : [sc.src, sc.start, sc.len]
+      calls : []
+    termination:
+      bound : 64
+
+
 -- prim_byte_at: the target-language byte_at(t, i). Both args are evaluated against
 -- the caller's env (an arg can itself be a primitive call — spans compose); t must
 -- be a VText and i a number with 0 <= i < t.len, in which case the result is the
@@ -5537,7 +5764,7 @@ rule prim_length
     out : Value
   logic:
     let tv = eval_ast_env(EvalEnvArg { node: arg_head(AHeadState { args: ec.args }), env: ec.env, src: ec.src, prog: ec.prog, concepts: ec.concepts })
-    out = Value::VNum { n: vlength(tv) }
+    out = Value::VNum { n: vlength(VLenState { v: tv, src: ec.src }) }
   proofs:
     purity:
       reads : [ec.args, ec.env, ec.src, ec.prog, ec.concepts]
@@ -5603,6 +5830,46 @@ rule prim_concat
     purity:
       reads : [ec.callee_start, ec.callee_len, ec.args, ec.env, ec.src, ec.prog, ec.concepts]
       calls : [eval_ast_env, prim_concat]
+    termination:
+      bound : 4000
+
+
+-- prim_le32: the target-language le32(n) — a 4-byte little-endian encoding of a
+-- number, as a VBLe value (width 4). The single argument is evaluated against the
+-- caller's env and read as a number; the bytes are never materialized (vlength/
+-- vbyte_at descend the VBLe leaf). Bytes tier B2.
+rule prim_le32
+  @intention: "Evaluate the le32 primitive: the argument number as a 4-byte little-endian bytes value"
+  @source: vexprparse.intent:68
+  input:
+    ec : EvalCallState
+  output:
+    out : Value
+  logic:
+    out = Value::VBLe { value: vnum_of(eval_ast_env(EvalEnvArg { node: arg_head(AHeadState { args: ec.args }), env: ec.env, src: ec.src, prog: ec.prog, concepts: ec.concepts })), width: 4 }
+  proofs:
+    purity:
+      reads : [ec.args, ec.env, ec.src, ec.prog, ec.concepts]
+      calls : [eval_ast_env, vnum_of, arg_head]
+    termination:
+      bound : 4000
+
+
+-- prim_le64: the target-language le64(n) — an 8-byte little-endian encoding of a
+-- number, as a VBLe value (width 8). Sibling of prim_le32. Bytes tier B2.
+rule prim_le64
+  @intention: "Evaluate the le64 primitive: the argument number as an 8-byte little-endian bytes value"
+  @source: vexprparse.intent:68
+  input:
+    ec : EvalCallState
+  output:
+    out : Value
+  logic:
+    out = Value::VBLe { value: vnum_of(eval_ast_env(EvalEnvArg { node: arg_head(AHeadState { args: ec.args }), env: ec.env, src: ec.src, prog: ec.prog, concepts: ec.concepts })), width: 8 }
+  proofs:
+    purity:
+      reads : [ec.args, ec.env, ec.src, ec.prog, ec.concepts]
+      calls : [eval_ast_env, vnum_of, arg_head]
     termination:
       bound : 4000
 
