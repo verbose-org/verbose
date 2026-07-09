@@ -34969,6 +34969,96 @@ rule two
         let _ = std::fs::remove_file(&bin);
     }
 
+    /// BYTES-tier brick B1: a `b"..."` byte literal now LEXES into one ByteLit
+    /// token (not Ident(`b`) + a dangling Str) and PARSES to an AstBytes node
+    /// with its content span (between the quotes). Two observables, both driven
+    /// through the self-hosted vexprparse.verbose compiled natively:
+    ///   - `shape` (shape_ast fingerprint): AstBytes has a dedicated band
+    ///     (10_000_000_000, above AstVariant's 1e9), distinct from AstVar (100)
+    ///     and AstStr (10_000_000).
+    ///   - `print_source` (print_expr): AstBytes prints its CONTENT span, so
+    ///     `b"\x41\x42"` prints exactly `\x41\x42` — proving start/len point
+    ///     between the quotes (b + both quotes stripped).
+    /// Regression: a normal string still shapes to the AstStr band and prints
+    /// with its quotes; `x` / `f(1)` are unchanged; a byte literal as a call
+    /// argument parses (AstCall wrapping AstBytes). eval/codegen stay stubs (B2/B3).
+    #[test]
+    fn bytes_b1_byte_literal_lexes_and_parses_to_ast_bytes() {
+        let src = std::fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let shape_bin = std::env::temp_dir().join("verbosec_test_b1_shape");
+        let print_bin = std::env::temp_dir().join("verbosec_test_b1_print");
+        compile_native(&program, "shape", shape_bin.to_str().unwrap(), false, false)
+            .expect("shape must compile natively (B1 AstBytes arms included)");
+        compile_native(&program, "print_source", print_bin.to_str().unwrap(), false, false)
+            .expect("print_source must compile natively (B1 AstBytes arms included)");
+
+        let shape = |source: &str| -> i64 {
+            let r = std::process::Command::new(&shape_bin)
+                .arg(source)
+                .arg("0")
+                .output()
+                .expect("spawn B1 shape driver");
+            assert!(r.status.success(), "shape must exit 0 for {:?}; got {:?}", source, r.status);
+            String::from_utf8_lossy(&r.stdout)
+                .trim()
+                .parse::<i64>()
+                .unwrap_or_else(|_| panic!("shape produced non-number for {:?}: {:?}", source, r.stdout))
+        };
+        let print_src = |source: &str| -> String {
+            let r = std::process::Command::new(&print_bin)
+                .arg(source)
+                .arg("0")
+                .output()
+                .expect("spawn B1 print_source driver");
+            assert!(r.status.success(), "print_source must exit 0 for {:?}; got {:?}", source, r.status);
+            String::from_utf8_lossy(&r.stdout).trim_end_matches('\n').to_string()
+        };
+
+        // The new AstBytes band — distinct from AstVar (100) and AstStr (1e7).
+        const ASTBYTES_BAND: i64 = 10_000_000_000;
+        const ASTSTR_BAND: i64 = 10_000_000;
+
+        assert_eq!(
+            shape("b\"\\x41\\x42\""),
+            ASTBYTES_BAND,
+            "`b\"\\x41\\x42\"` parses to AstBytes (band 1e10), not AstVar(b) + dangling string"
+        );
+        assert_eq!(shape("b\"\\x41\""), ASTBYTES_BAND, "single-escape byte literal is AstBytes");
+        assert_eq!(shape("b\"\""), ASTBYTES_BAND, "empty byte literal is AstBytes");
+
+        // A byte literal as a call argument: AstCall (1e4) wrapping AstBytes (1e10).
+        assert_eq!(
+            shape("g(b\"\\x0a\")"),
+            10_000 + ASTBYTES_BAND,
+            "byte literal as a call arg parses (AstCall wraps AstBytes)"
+        );
+
+        // Regression: a normal string still shapes to the AstStr band, and the
+        // other leaf/compound shapes are byte-for-byte unchanged by the B1 arms.
+        assert_eq!(shape("\"abc\""), ASTSTR_BAND, "normal string still shapes to the AstStr band");
+        assert_eq!(shape("x"), 100, "AstVar shape unchanged by B1");
+        assert_eq!(shape("f(1)"), 10_000, "AstCall shape unchanged by B1");
+        assert_eq!(shape("1 + 2"), 10, "AstBin shape unchanged by B1");
+
+        // Content span: print_expr's AstBytes arm emits substring(src, start, start+len),
+        // so the printed text IS the content between the quotes (b + quotes stripped).
+        assert_eq!(
+            print_src("b\"\\x41\\x42\""),
+            "\\x41\\x42",
+            "AstBytes content span excludes the b prefix and both quotes"
+        );
+        assert_eq!(print_src("b\"\""), "", "empty byte literal has a zero-length content span");
+        // Regression: AstStr prints its span WITH quotes (unchanged).
+        assert_eq!(print_src("\"abc\""), "\"abc\"", "AstStr still prints its quote-inclusive span");
+
+        let _ = std::fs::remove_file(&shape_bin);
+        let _ = std::fs::remove_file(&print_bin);
+    }
+
     /// Records-arc slice 1: bare-record construction (`Name { field: e }`) now
     /// PARSES to an AstVariant node (variant span == concept span) instead of
     /// silently dropping the `{...}` and returning AstVar(Name). Parser-only —
@@ -35176,13 +35266,14 @@ rule two
             grep_nested, grep_top, grep_concepts, grep_top
         );
         // The chunk's FIRST concept is the group's `Token` (the group is the first
-        // concept-bearing item in the file). Token declares exactly 10 variants.
+        // concept-bearing item in the file). Token declares exactly 11 variants
+        // (BYTES-tier brick B1 added ByteLit for `b"..."` literals).
         assert_eq!(
             run(&cv, chunk),
-            10,
-            "MILESTONE: count_variants on the chunk = 10 — the group's first concept \
-             Token has ten variants (Ident/Keyword/Num/Op/Str/Newline/Indent/Dedent/\
-             IndentErr/Eof)"
+            11,
+            "MILESTONE: count_variants on the chunk = 11 — the group's first concept \
+             Token has eleven variants (Ident/Keyword/Num/Op/Str/ByteLit/Newline/\
+             Indent/Dedent/IndentErr/Eof)"
         );
 
         let _ = std::fs::remove_file(&cr);
