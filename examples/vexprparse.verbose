@@ -138,6 +138,17 @@ concept_group VExpr [max_depth: 4096, max_nodes: 6000000]
       -- bytes — that needs an environment — so a Str node's correctness is proven
       -- STRUCTURALLY by the shape walk, never by an evaluated value.
       Str of (start : number, len : number)
+      -- BYTES-tier brick B1: a byte-literal token `b"..."`. A `b` IMMEDIATELY
+      -- followed by `"` opens a byte literal (distinct from an Ident `b` next to a
+      -- string). start = the byte offset of the OPENING quote (the byte just after
+      -- the `b`); len = the TOTAL byte length of the token INCLUDING the `b`, both
+      -- quotes, and the `\xNN` escapes verbatim (so token_end advances past the
+      -- closing quote naturally). The span is the literal's identity — B1 does NOT
+      -- hex-decode the bytes (that needs an environment / a bytes value, which is
+      -- B2). parse_primary strips the `b"` prefix and closing quote into the
+      -- AstBytes content span; the raw-newline gate (like Str) turns an unterminated
+      -- byte literal into an IndentErr.
+      ByteLit of (start : number, len : number)
       -- A line-boundary token (brick 8a). pos = the byte offset of the newline
       -- byte (10) in the source. The tokenizer no longer STOPS at a newline (the
       -- pre-8a flat scanner classified byte 10 as Eof and tokenize halted at the
@@ -223,6 +234,16 @@ concept_group VExpr [max_depth: 4096, max_nodes: 6000000]
       -- is proven STRUCTURALLY by shape_ast (a dedicated band), exactly like
       -- AstVar / AstCall / AstField.
       AstStr of (start : number, len : number)
+      -- BYTES-tier brick B1: a byte-literal leaf `b"..."`, identified by its
+      -- source SPAN (start = the byte offset of the CONTENT after the `b"` prefix,
+      -- len = the content byte length between the quotes — see parse_primary /
+      -- the ByteLit token). Distinct from AstStr: a byte literal's `\xNN` escapes
+      -- hex-decode to RAW bytes (no quote-strip / text-slice semantics), and the
+      -- emitter (x86_node / le32 / le64 / bytes-concat) is BUILT of these. B1 is
+      -- PARSER-ONLY: eval / type / codegen get STUB arms (real handling is B2/B3);
+      -- shape_ast gives it a dedicated band (10^10, above AstVariant's 10^9) so a
+      -- parsed byte literal has a predictable fingerprint.
+      AstBytes of (start : number, len : number)
       -- An error/placeholder leaf (unexpected token); evaluates to 0
       AstErr
       -- Records-arc brick R3: a VARIANT construction `Concept::Variant { f: e, ... }`.
@@ -1078,6 +1099,14 @@ rule next_token
     let len = length(s.source)
     let p = skip_spaces(s)
     let isnl = if p >= len then 0 else if byte_at(s.source, p) == 10 then 1 else 0
+    -- BYTES-tier B1: a byte literal is a `b` (98) IMMEDIATELY followed by `"` (34).
+    -- Tested BEFORE isalpha (b is in the 97..122 ident range), so `b"..."` becomes
+    -- ONE ByteLit token instead of Ident(b) + Str. The token width is 1 (the `b`)
+    -- plus string_run measured at the opening quote (p + 1). A raw newline inside
+    -- the literal propagates string_run's >= 50000 sentinel (the same fail-closed
+    -- gate as Str) into an IndentErr.
+    let isbytelit = if p + 1 >= len then 0 else if byte_at(s.source, p) == 98 and byte_at(s.source, p + 1) == 34 then 1 else 0
+    let blen = 1 + string_run(ScanState { source: s.source, pos: p + 1 })
     let isalpha = if p >= len then 0 else if byte_at(s.source, p) == 95 then 1 else if byte_at(s.source, p) >= 65 and byte_at(s.source, p) <= 90 then 1 else if byte_at(s.source, p) >= 97 and byte_at(s.source, p) <= 122 then 1 else 0
     let isdigit = if p >= len then 0 else if byte_at(s.source, p) >= 48 and byte_at(s.source, p) <= 57 then 1 else 0
     let isstr = if p >= len then 0 else if byte_at(s.source, p) == 34 then 1 else 0
@@ -1088,7 +1117,7 @@ rule next_token
     let opc = op_code(ScanState { source: s.source, pos: p })
     let opl = op_len(ScanState { source: s.source, pos: p })
     let nval = num_value(ScanState { source: s.source, pos: p })
-    out = if p >= len then Token::Eof else if isnl == 1 then Token::Newline { pos: p } else if isalpha == 1 then (if kwc > 0 then Token::Keyword { start: p, len: irun, kw: kwc } else Token::Ident { start: p, len: irun }) else if isdigit == 1 then Token::Num { value: nval, len: drun } else if isstr == 1 then (if srun >= 50000 then Token::IndentErr { pos: p } else Token::Str { start: p, len: srun }) else if opc > 0 then Token::Op { code: opc, len: opl } else Token::Eof
+    out = if p >= len then Token::Eof else if isnl == 1 then Token::Newline { pos: p } else if isbytelit == 1 then (if blen >= 50000 then Token::IndentErr { pos: p } else Token::ByteLit { start: p, len: blen }) else if isalpha == 1 then (if kwc > 0 then Token::Keyword { start: p, len: irun, kw: kwc } else Token::Ident { start: p, len: irun }) else if isdigit == 1 then Token::Num { value: nval, len: drun } else if isstr == 1 then (if srun >= 50000 then Token::IndentErr { pos: p } else Token::Str { start: p, len: srun }) else if opc > 0 then Token::Op { code: opc, len: opl } else Token::Eof
   proofs:
     purity:
       reads : [s.source, s]
@@ -1108,6 +1137,11 @@ rule token_end
     let len = length(s.source)
     let p = skip_spaces(s)
     let isnl = if p >= len then 0 else if byte_at(s.source, p) == 10 then 1 else 0
+    -- BYTES-tier B1: mirror next_token's byte-literal detection so token_end
+    -- advances by the SAME width (1 for `b` + string_run at the opening quote),
+    -- keeping the tokenize walk in sync. Tested before isalpha for the same reason.
+    let isbytelit = if p + 1 >= len then 0 else if byte_at(s.source, p) == 98 and byte_at(s.source, p + 1) == 34 then 1 else 0
+    let blen = 1 + string_run(ScanState { source: s.source, pos: p + 1 })
     let isalpha = if p >= len then 0 else if byte_at(s.source, p) == 95 then 1 else if byte_at(s.source, p) >= 65 and byte_at(s.source, p) <= 90 then 1 else if byte_at(s.source, p) >= 97 and byte_at(s.source, p) <= 122 then 1 else 0
     let isdigit = if p >= len then 0 else if byte_at(s.source, p) >= 48 and byte_at(s.source, p) <= 57 then 1 else 0
     let isstr = if p >= len then 0 else if byte_at(s.source, p) == 34 then 1 else 0
@@ -1116,7 +1150,7 @@ rule token_end
     let srun = string_run(ScanState { source: s.source, pos: p })
     let opc = op_code(ScanState { source: s.source, pos: p })
     let opl = op_len(ScanState { source: s.source, pos: p })
-    out = if p >= len then p else if isnl == 1 then p + 1 else if isalpha == 1 then p + irun else if isdigit == 1 then p + drun else if isstr == 1 then p + srun else if opc > 0 then p + opl else p
+    out = if p >= len then p else if isnl == 1 then p + 1 else if isbytelit == 1 then p + blen else if isalpha == 1 then p + irun else if isdigit == 1 then p + drun else if isstr == 1 then p + srun else if opc > 0 then p + opl else p
   proofs:
     purity:
       reads : [s.source, s]
@@ -1221,6 +1255,7 @@ rule tok_kind
       Num(value, len) => 300 + value
       Op(code, len) => 400 + code
       Str(start, len) => 500
+      ByteLit(start, len) => 1000
       Newline(pos) => 600
       Indent => 700
       Dedent => 800
@@ -1250,6 +1285,7 @@ rule tok_value
       Num(value, len) => value
       Op(code, len) => 0
       Str(start, len) => 0
+      ByteLit(start, len) => 0
       Newline(pos) => 0
       Indent => 0
       Dedent => 0
@@ -1281,6 +1317,7 @@ rule tok_is_num
       Num(value, len) => 1
       Op(code, len) => 0
       Str(start, len) => 0
+      ByteLit(start, len) => 0
       Newline(pos) => 0
       Indent => 0
       Dedent => 0
@@ -1313,6 +1350,7 @@ rule tok_is_op
       Num(value, len) => 0
       Op(code, len) => 1
       Str(start, len) => 0
+      ByteLit(start, len) => 0
       Newline(pos) => 0
       Indent => 0
       Dedent => 0
@@ -1341,6 +1379,7 @@ rule tok_op_code
       Num(value, len) => 0
       Op(code, len) => code
       Str(start, len) => 0
+      ByteLit(start, len) => 0
       Newline(pos) => 0
       Indent => 0
       Dedent => 0
@@ -1371,6 +1410,7 @@ rule tok_is_ident
       Num(value, len) => 0
       Op(code, len) => 0
       Str(start, len) => 0
+      ByteLit(start, len) => 0
       Newline(pos) => 0
       Indent => 0
       Dedent => 0
@@ -1399,6 +1439,7 @@ rule tok_start
       Num(value, len) => 0
       Op(code, len) => 0
       Str(start, len) => 0
+      ByteLit(start, len) => 0
       Newline(pos) => 0
       Indent => 0
       Dedent => 0
@@ -1427,6 +1468,7 @@ rule tok_len
       Num(value, len) => 0
       Op(code, len) => 0
       Str(start, len) => 0
+      ByteLit(start, len) => 0
       Newline(pos) => 0
       Indent => 0
       Dedent => 0
@@ -1458,6 +1500,7 @@ rule tok_is_str
       Num(value, len) => 0
       Op(code, len) => 0
       Str(start, len) => 1
+      ByteLit(start, len) => 0
       Newline(pos) => 0
       Indent => 0
       Dedent => 0
@@ -1487,6 +1530,7 @@ rule tok_str_start
       Num(value, len) => 0
       Op(code, len) => 0
       Str(start, len) => start
+      ByteLit(start, len) => 0
       Newline(pos) => 0
       Indent => 0
       Dedent => 0
@@ -1516,6 +1560,99 @@ rule tok_str_len
       Num(value, len) => 0
       Op(code, len) => 0
       Str(start, len) => len
+      ByteLit(start, len) => 0
+      Newline(pos) => 0
+      Indent => 0
+      Dedent => 0
+      IndentErr(pos) => 0
+      Eof => 0
+  proofs:
+    purity:
+      reads : [t]
+      calls : []
+    termination:
+      bound : 16
+
+
+-- BYTES-tier brick B1: 1 iff the token IS a ByteLit, structurally. Mirror of
+-- tok_is_str — the parser uses this to decide "is the next token a byte literal"
+-- before reading its span, value-independent (no magnitude test on tok_kind).
+rule tok_is_bytelit
+  @intention: "1 if the token is a byte literal, 0 otherwise (value-independent)"
+  @source: vexprparse.intent:13
+  input:
+    t : Token
+  output:
+    out : number
+  logic:
+    out = match t:
+      Ident(start, len) => 0
+      Keyword(start, len, kw) => 0
+      Num(value, len) => 0
+      Op(code, len) => 0
+      Str(start, len) => 0
+      ByteLit(start, len) => 1
+      Newline(pos) => 0
+      Indent => 0
+      Dedent => 0
+      IndentErr(pos) => 0
+      Eof => 0
+  proofs:
+    purity:
+      reads : [t]
+      calls : []
+    termination:
+      bound : 16
+
+
+-- BYTES-tier brick B1: the source-span START offset of a ByteLit token (the
+-- opening-quote byte, 0 for any other token). Mirror of tok_str_start.
+rule tok_bytelit_start
+  @intention: "The start byte offset of a ByteLit token (0 for any other token)"
+  @source: vexprparse.intent:13
+  input:
+    t : Token
+  output:
+    out : number
+  logic:
+    out = match t:
+      Ident(start, len) => 0
+      Keyword(start, len, kw) => 0
+      Num(value, len) => 0
+      Op(code, len) => 0
+      Str(start, len) => 0
+      ByteLit(start, len) => start
+      Newline(pos) => 0
+      Indent => 0
+      Dedent => 0
+      IndentErr(pos) => 0
+      Eof => 0
+  proofs:
+    purity:
+      reads : [t]
+      calls : []
+    termination:
+      bound : 16
+
+
+-- BYTES-tier brick B1: the source-span LENGTH of a ByteLit token (the total
+-- byte length including the `b` prefix and both quotes, 0 for any other token).
+-- Mirror of tok_str_len.
+rule tok_bytelit_len
+  @intention: "The byte length of a ByteLit token (0 for any other token)"
+  @source: vexprparse.intent:13
+  input:
+    t : Token
+  output:
+    out : number
+  logic:
+    out = match t:
+      Ident(start, len) => 0
+      Keyword(start, len, kw) => 0
+      Num(value, len) => 0
+      Op(code, len) => 0
+      Str(start, len) => 0
+      ByteLit(start, len) => len
       Newline(pos) => 0
       Indent => 0
       Dedent => 0
@@ -1725,6 +1862,60 @@ rule peek_str_len
     purity:
       reads : [cell]
       calls : [tok_str_len, head_tok]
+    termination:
+      bound : 16
+
+
+-- BYTES-tier brick B1: peek whether the head token is a byte literal (structural).
+rule peek_is_bytelit
+  @intention: "1 if the head token is a byte literal, 0 otherwise"
+  @source: vexprparse.intent:14
+  input:
+    cell : TokenList
+  output:
+    out : number
+  logic:
+    out = tok_is_bytelit(head_tok(cell))
+  proofs:
+    purity:
+      reads : [cell]
+      calls : [tok_is_bytelit, head_tok]
+    termination:
+      bound : 16
+
+
+-- BYTES-tier brick B1: peek the ByteLit source-span start (opening-quote byte).
+rule peek_bytelit_start
+  @intention: "Source-span start offset of the ByteLit head token (0 if not a ByteLit)"
+  @source: vexprparse.intent:14
+  input:
+    cell : TokenList
+  output:
+    out : number
+  logic:
+    out = tok_bytelit_start(head_tok(cell))
+  proofs:
+    purity:
+      reads : [cell]
+      calls : [tok_bytelit_start, head_tok]
+    termination:
+      bound : 16
+
+
+-- BYTES-tier brick B1: peek the ByteLit source-span length (b prefix + quotes).
+rule peek_bytelit_len
+  @intention: "Source-span length of the ByteLit head token (0 if not a ByteLit)"
+  @source: vexprparse.intent:14
+  input:
+    cell : TokenList
+  output:
+    out : number
+  logic:
+    out = tok_bytelit_len(head_tok(cell))
+  proofs:
+    purity:
+      reads : [cell]
+      calls : [tok_bytelit_len, head_tok]
     termination:
       bound : 16
 
@@ -2702,6 +2893,15 @@ rule parse_primary
     let isfalse = if lead_kind == 210 then 1 else 0
     let isnum = peek_is_num(st.cell)
     let isstr = peek_is_str(st.cell)
+    -- BYTES-tier B1: a ByteLit head token parses to an AstBytes leaf. The token
+    -- span covers `b"..."` (bstart = the `b` byte, blen = whole token incl `b`
+    -- and both quotes); the AstBytes CONTENT span strips them: start = bstart + 2
+    -- (past `b"`), len = blen - 3 (minus `b` and the two quotes). The blen >= 3
+    -- clamp keeps an unterminated literal (`b"` at EOF, blen 2) from producing a
+    -- negative-length span — same defensive shape as the AstStr len >= 2 clamp.
+    let isbytelit = peek_is_bytelit(st.cell)
+    let bstart = peek_bytelit_start(st.cell)
+    let blen = peek_bytelit_len(st.cell)
     let opc = peek_op_code(st.cell)
     let isparen = if opc == 21 then 1 else 0
     let isident = peek_is_ident(st.cell)
@@ -2718,11 +2918,11 @@ rule parse_primary
     let vlen = peek_len(advance(Advance { lst: st.cell, k: 2 }))
     let has_braces = if peek_op_code(advance(Advance { lst: st.cell, k: 3 })) == 23 then 1 else 0
     let isrecord = if next_opc == 23 then 1 else 0
-    out = if ismatch == 1 then parse_match(st) else if isif == 1 then if_then(IfThenState { cond: parse_or(ParseState { cell: advance(Advance { lst: st.cell, k: 1 }) }) }) else if istrue == 1 then Parsed::Mk { node: Ast::AstBool { value: 1 }, next: advance(Advance { lst: st.cell, k: 1 }) } else if isfalse == 1 then Parsed::Mk { node: Ast::AstBool { value: 0 }, next: advance(Advance { lst: st.cell, k: 1 }) } else if isnum == 1 then Parsed::Mk { node: Ast::AstNum { value: numval }, next: advance(Advance { lst: st.cell, k: 1 }) } else if isstr == 1 then Parsed::Mk { node: Ast::AstStr { start: sstart, len: slen }, next: advance(Advance { lst: st.cell, k: 1 }) } else if isparen == 1 then paren_close(ParenState { inner: parse_or(ParseState { cell: advance(Advance { lst: st.cell, k: 1 }) }) }) else if isident == 1 then (if isvariant == 1 then (if has_braces == 1 then variant_build(VariantState { cstart: idstart, clen: idlen, vstart: vstart, vlen: vlen, pfields: parse_vfields(ParseState { cell: advance(Advance { lst: st.cell, k: 4 }) }) }) else variant_build(VariantState { cstart: idstart, clen: idlen, vstart: vstart, vlen: vlen, pfields: ParsedVFields::MkVF { fields: VFieldList::VFNil, next: advance(Advance { lst: st.cell, k: 3 }) } })) else if iscall == 1 then call_build(CallState { cstart: idstart, clen: idlen, pargs: parse_args(ParseState { cell: advance(Advance { lst: st.cell, k: 2 }) }) }) else if isrecord == 1 then variant_build(VariantState { cstart: idstart, clen: idlen, vstart: idstart, vlen: idlen, pfields: parse_vfields(ParseState { cell: advance(Advance { lst: st.cell, k: 2 }) }) }) else field_rest(FieldState { cell: advance(Advance { lst: st.cell, k: 1 }), base: Ast::AstVar { start: idstart, len: idlen } })) else Parsed::Mk { node: Ast::AstErr, next: st.cell }
+    out = if ismatch == 1 then parse_match(st) else if isif == 1 then if_then(IfThenState { cond: parse_or(ParseState { cell: advance(Advance { lst: st.cell, k: 1 }) }) }) else if istrue == 1 then Parsed::Mk { node: Ast::AstBool { value: 1 }, next: advance(Advance { lst: st.cell, k: 1 }) } else if isfalse == 1 then Parsed::Mk { node: Ast::AstBool { value: 0 }, next: advance(Advance { lst: st.cell, k: 1 }) } else if isnum == 1 then Parsed::Mk { node: Ast::AstNum { value: numval }, next: advance(Advance { lst: st.cell, k: 1 }) } else if isstr == 1 then Parsed::Mk { node: Ast::AstStr { start: sstart, len: slen }, next: advance(Advance { lst: st.cell, k: 1 }) } else if isbytelit == 1 then Parsed::Mk { node: Ast::AstBytes { start: bstart + 2, len: if blen >= 3 then blen - 3 else 0 }, next: advance(Advance { lst: st.cell, k: 1 }) } else if isparen == 1 then paren_close(ParenState { inner: parse_or(ParseState { cell: advance(Advance { lst: st.cell, k: 1 }) }) }) else if isident == 1 then (if isvariant == 1 then (if has_braces == 1 then variant_build(VariantState { cstart: idstart, clen: idlen, vstart: vstart, vlen: vlen, pfields: parse_vfields(ParseState { cell: advance(Advance { lst: st.cell, k: 4 }) }) }) else variant_build(VariantState { cstart: idstart, clen: idlen, vstart: vstart, vlen: vlen, pfields: ParsedVFields::MkVF { fields: VFieldList::VFNil, next: advance(Advance { lst: st.cell, k: 3 }) } })) else if iscall == 1 then call_build(CallState { cstart: idstart, clen: idlen, pargs: parse_args(ParseState { cell: advance(Advance { lst: st.cell, k: 2 }) }) }) else if isrecord == 1 then variant_build(VariantState { cstart: idstart, clen: idlen, vstart: idstart, vlen: idlen, pfields: parse_vfields(ParseState { cell: advance(Advance { lst: st.cell, k: 2 }) }) }) else field_rest(FieldState { cell: advance(Advance { lst: st.cell, k: 1 }), base: Ast::AstVar { start: idstart, len: idlen } })) else Parsed::Mk { node: Ast::AstErr, next: st.cell }
   proofs:
     purity:
       reads : [st.cell, st]
-      calls : [peek_kind, peek_is_num, peek_is_str, peek_op_code, peek_is_ident, peek_value, peek_str_start, peek_str_len, peek_start, peek_len, if_then, paren_close, parse_or, call_build, parse_args, field_rest, parse_match, variant_build, parse_vfields, advance]
+      calls : [peek_kind, peek_is_num, peek_is_str, peek_is_bytelit, peek_bytelit_start, peek_bytelit_len, peek_op_code, peek_is_ident, peek_value, peek_str_start, peek_str_len, peek_start, peek_len, if_then, paren_close, parse_or, call_build, parse_args, field_rest, parse_match, variant_build, parse_vfields, advance]
     termination:
       bound : 512
 
@@ -3203,6 +3403,7 @@ rule shape_ast
       -- sub-expressions, so neither recurses.)
       AstBool(value) => 1000000
       AstStr(start, len) => 10000000
+      AstBytes(start, len) => 10000000000
       AstErr => 0
       -- R3: dedicated bands ABOVE AstStr's 10000000 so a parsed variant / match body
       -- has a hand-derivable fingerprint distinct from the AstErr fingerprint (0).
@@ -3352,6 +3553,7 @@ rule tok_is_newline
       Num(value, len) => 0
       Op(code, len) => 0
       Str(start, len) => 0
+      ByteLit(start, len) => 0
       Newline(pos) => 1
       Indent => 0
       Dedent => 0
@@ -3847,6 +4049,7 @@ rule tok_band
       Num(value, len) => 0
       Op(code, len) => 0
       Str(start, len) => 0
+      ByteLit(start, len) => 0
       Newline(pos) => 10000
       Indent => 1
       Dedent => 100
@@ -3981,6 +4184,7 @@ rule tok_is_err
       Num(value, len) => 0
       Op(code, len) => 0
       Str(start, len) => 0
+      ByteLit(start, len) => 0
       Newline(pos) => 0
       Indent => 0
       Dedent => 0
@@ -4563,6 +4767,7 @@ rule eval_ast_env
       -- len >= 2 clamp keeps an unterminated string (lone quote at EOF, len 1) from
       -- producing a negative-length span.
       AstStr(start, len) => Value::VText { start: start + 1, len: if len >= 2 then len - 2 else 0 }
+      AstBytes(start, len) => Value::VNum { n: 0 }
       AstErr => Value::VNum { n: 0 }
       -- R6c: construct a runtime variant value. `tag` is the variant's identity
       -- (variant_tag resolves the concept/variant name spans against the ConceptList);
@@ -9008,6 +9213,7 @@ rule count_undef_ast
       AstIf(cond, thn, els) => count_undef_ast(UndefAstState { node: cond, binds: a.binds, src: a.src }) + count_undef_ast(UndefAstState { node: thn, binds: a.binds, src: a.src }) + count_undef_ast(UndefAstState { node: els, binds: a.binds, src: a.src })
       AstBool(value) => 0
       AstStr(start, len) => 0
+      AstBytes(start, len) => 0
       AstErr => 0
       -- R6a: a variant CONSTRUCT contributes no variable reference of its own
       -- (the concept/variant names are TYPE references, not vars), but each field
@@ -9527,6 +9733,7 @@ rule count_badcall_ast
       AstIf(cond, thn, els) => count_badcall_ast(BadCallState { node: cond, rules: a.rules, src: a.src }) + count_badcall_ast(BadCallState { node: thn, rules: a.rules, src: a.src }) + count_badcall_ast(BadCallState { node: els, rules: a.rules, src: a.src })
       AstBool(value) => 0
       AstStr(start, len) => 0
+      AstBytes(start, len) => 0
       AstErr => 0
       -- R6a: a variant construct names a TYPE, not a callee — only its field VALUE
       -- expressions can contain calls, so walk them via count_badcall_vfields.
@@ -9989,6 +10196,7 @@ rule count_badarity_ast
       AstIf(cond, thn, els) => count_badarity_ast(BadArityState { node: cond, rules: a.rules, src: a.src }) + count_badarity_ast(BadArityState { node: thn, rules: a.rules, src: a.src }) + count_badarity_ast(BadArityState { node: els, rules: a.rules, src: a.src })
       AstBool(value) => 0
       AstStr(start, len) => 0
+      AstBytes(start, len) => 0
       AstErr => 0
       -- R6a: a variant construct is not a call — only its field VALUE expressions
       -- can contain arity-checked calls, so walk them via count_badarity_vfields.
@@ -10421,6 +10629,7 @@ rule type_of_env
       AstIf(cond, thn, els) => if_type(IfTypeState { ct: type_of_env(TypeArg { node: cond, tenv: t.tenv, src: t.src, prog: t.prog, concepts: t.concepts }), tt: type_of_env(TypeArg { node: thn, tenv: t.tenv, src: t.src, prog: t.prog, concepts: t.concepts }), et: type_of_env(TypeArg { node: els, tenv: t.tenv, src: t.src, prog: t.prog, concepts: t.concepts }) })
       AstBool(value) => 1
       AstStr(start, len) => 2
+      AstBytes(start, len) => 4
       AstErr => 3
       -- R6b: a variant construction's type is its CONCEPT (resolve the concept-name
       -- span against the ConceptList -> 1000+index, or ERROR if the concept is unknown).
@@ -11236,6 +11445,7 @@ rule argtype_ast
       AstBool(value) => 0
       AstVar(start, len) => 0
       AstStr(start, len) => 0
+      AstBytes(start, len) => 0
       AstErr => 0
       -- R3 stub: real handling in R6/R7 (no arg-type mismatch counted without R6).
       AstVariant(cstart, clen, vstart, vlen, fields) => 0
@@ -11553,6 +11763,7 @@ rule count_undecl_call_ast
       AstIf(cond, thn, els) => count_undecl_call_ast(UndeclCallState { node: cond, rules: a.rules, calls: a.calls, src: a.src }) + count_undecl_call_ast(UndeclCallState { node: thn, rules: a.rules, calls: a.calls, src: a.src }) + count_undecl_call_ast(UndeclCallState { node: els, rules: a.rules, calls: a.calls, src: a.src })
       AstBool(value) => 0
       AstStr(start, len) => 0
+      AstBytes(start, len) => 0
       AstErr => 0
       AstVariant(cstart, clen, vstart, vlen, fields) => count_undecl_call_vfields(UndeclCallVFieldsState { fields: fields, rules: a.rules, calls: a.calls, src: a.src })
       AstMatch(scrut, arms) => count_undecl_call_ast(UndeclCallState { node: scrut, rules: a.rules, calls: a.calls, src: a.src }) + count_undecl_call_arms(UndeclCallArmsState { arms: arms, rules: a.rules, calls: a.calls, src: a.src })
@@ -11789,6 +12000,7 @@ rule count_undecl_read_ast
       AstIf(cond, thn, els) => count_undecl_read_ast(UndeclReadState { node: cond, binds: a.binds, reads: a.reads, in_start: a.in_start, in_len: a.in_len, src: a.src }) + count_undecl_read_ast(UndeclReadState { node: thn, binds: a.binds, reads: a.reads, in_start: a.in_start, in_len: a.in_len, src: a.src }) + count_undecl_read_ast(UndeclReadState { node: els, binds: a.binds, reads: a.reads, in_start: a.in_start, in_len: a.in_len, src: a.src })
       AstBool(value) => 0
       AstStr(start, len) => 0
+      AstBytes(start, len) => 0
       AstErr => 0
       AstVariant(cstart, clen, vstart, vlen, fields) => count_undecl_read_vfields(UndeclReadVFieldsState { fields: fields, binds: a.binds, reads: a.reads, in_start: a.in_start, in_len: a.in_len, src: a.src })
       AstMatch(scrut, arms) => count_undecl_read_ast(UndeclReadState { node: scrut, binds: a.binds, reads: a.reads, in_start: a.in_start, in_len: a.in_len, src: a.src }) + count_undecl_read_arms(UndeclReadArmsState { arms: arms, binds: a.binds, reads: a.reads, in_start: a.in_start, in_len: a.in_len, src: a.src })
@@ -12165,6 +12377,7 @@ rule term_var_is_input
       AstIf(cond, thn, els) => 0
       AstBool(value) => 0
       AstStr(start, len) => 0
+      AstBytes(start, len) => 0
       AstErr => 0
       AstVariant(cstart, clen, vstart, vlen, fields) => 0
       AstMatch(scrut, arms) => 0
@@ -12199,6 +12412,7 @@ rule term_knum_ok
       AstIf(cond, thn, els) => 0
       AstBool(value) => 0
       AstStr(start, len) => 0
+      AstBytes(start, len) => 0
       AstErr => 0
       AstVariant(cstart, clen, vstart, vlen, fields) => 0
       AstMatch(scrut, arms) => 0
@@ -12233,6 +12447,7 @@ rule term_base_ok
       AstIf(cond, thn, els) => 0
       AstBool(value) => 0
       AstStr(start, len) => 0
+      AstBytes(start, len) => 0
       AstErr => 0
       AstVariant(cstart, clen, vstart, vlen, fields) => 0
       AstMatch(scrut, arms) => 0
@@ -12266,6 +12481,7 @@ rule term_step_ok
       AstIf(cond, thn, els) => 0
       AstBool(value) => 0
       AstStr(start, len) => 0
+      AstBytes(start, len) => 0
       AstErr => 0
       AstVariant(cstart, clen, vstart, vlen, fields) => 0
       AstMatch(scrut, arms) => 0
@@ -12326,6 +12542,7 @@ rule term_arg_ok
       AstIf(cond, thn, els) => 0
       AstBool(value) => 0
       AstStr(start, len) => 0
+      AstBytes(start, len) => 0
       AstErr => 0
       AstVariant(cstart, clen, vstart, vlen, fields) => if a.kind == 1 then 0 else term_vfield_ok(TermVFieldsState { fields: fields, rn_start: a.rn_start, rn_len: a.rn_len, kind: a.kind, in_start: a.in_start, in_len: a.in_len, tf_start: a.tf_start, tf_len: a.tf_len, sbinds: a.sbinds, src: a.src })
       AstMatch(scrut, arms) => 0
@@ -12433,6 +12650,7 @@ rule count_term_ast
       AstIf(cond, thn, els) => count_term_ast(TermAstState { node: cond, rn_start: a.rn_start, rn_len: a.rn_len, kind: a.kind, in_start: a.in_start, in_len: a.in_len, tf_start: a.tf_start, tf_len: a.tf_len, sbinds: a.sbinds, src: a.src }) + count_term_ast(TermAstState { node: thn, rn_start: a.rn_start, rn_len: a.rn_len, kind: a.kind, in_start: a.in_start, in_len: a.in_len, tf_start: a.tf_start, tf_len: a.tf_len, sbinds: a.sbinds, src: a.src }) + count_term_ast(TermAstState { node: els, rn_start: a.rn_start, rn_len: a.rn_len, kind: a.kind, in_start: a.in_start, in_len: a.in_len, tf_start: a.tf_start, tf_len: a.tf_len, sbinds: a.sbinds, src: a.src })
       AstBool(value) => 0
       AstStr(start, len) => 0
+      AstBytes(start, len) => 0
       AstErr => 0
       AstVariant(cstart, clen, vstart, vlen, fields) => count_term_vfields(TermVFieldsState { fields: fields, rn_start: a.rn_start, rn_len: a.rn_len, kind: a.kind, in_start: a.in_start, in_len: a.in_len, tf_start: a.tf_start, tf_len: a.tf_len, sbinds: a.sbinds, src: a.src })
       AstMatch(scrut, arms) => count_term_ast(TermAstState { node: scrut, rn_start: a.rn_start, rn_len: a.rn_len, kind: a.kind, in_start: a.in_start, in_len: a.in_len, tf_start: a.tf_start, tf_len: a.tf_len, sbinds: a.sbinds, src: a.src }) + count_term_arms(TermArmsState { arms: arms, ext: term_var_is_input(TermAstState { node: scrut, rn_start: a.rn_start, rn_len: a.rn_len, kind: a.kind, in_start: a.in_start, in_len: a.in_len, tf_start: a.tf_start, tf_len: a.tf_len, sbinds: a.sbinds, src: a.src }), rn_start: a.rn_start, rn_len: a.rn_len, kind: a.kind, in_start: a.in_start, in_len: a.in_len, tf_start: a.tf_start, tf_len: a.tf_len, sbinds: a.sbinds, src: a.src })
@@ -13527,6 +13745,7 @@ rule undef_span_ast
       AstNum(value) => Span::MkSpan { start: 9999, len: 0 }
       AstBool(value) => Span::MkSpan { start: 9999, len: 0 }
       AstStr(start, len) => Span::MkSpan { start: 9999, len: 0 }
+      AstBytes(start, len) => Span::MkSpan { start: 9999, len: 0 }
       AstErr => Span::MkSpan { start: 9999, len: 0 }
       -- R6a: locate the first undefined variable inside a variant construct's field
       -- VALUES (the names are type references, not vars), scope unchanged.
@@ -13853,6 +14072,7 @@ rule badcall_span_ast
       AstBool(value) => Span::MkSpan { start: 9999, len: 0 }
       AstVar(start, len) => Span::MkSpan { start: 9999, len: 0 }
       AstStr(start, len) => Span::MkSpan { start: 9999, len: 0 }
+      AstBytes(start, len) => Span::MkSpan { start: 9999, len: 0 }
       AstErr => Span::MkSpan { start: 9999, len: 0 }
       -- R6a: locate the first undefined callee inside a variant construct's field
       -- VALUES (a variant names a type, not a callee).
@@ -14113,6 +14333,7 @@ rule badarity_span_ast
       AstBool(value) => Span::MkSpan { start: 9999, len: 0 }
       AstVar(start, len) => Span::MkSpan { start: 9999, len: 0 }
       AstStr(start, len) => Span::MkSpan { start: 9999, len: 0 }
+      AstBytes(start, len) => Span::MkSpan { start: 9999, len: 0 }
       AstErr => Span::MkSpan { start: 9999, len: 0 }
       -- R6a: locate the first arity-mismatched call inside a variant construct's
       -- field VALUES (a variant is not a call).
@@ -14492,6 +14713,7 @@ rule print_expr
       AstBool(value) => if value == 1 then "true" else "false"
       AstVar(start, len) => substring(ps.src, start, start + len)
       AstStr(start, len) => substring(ps.src, start, start + len)
+      AstBytes(start, len) => substring(ps.src, start, start + len)
       AstBin(op, lhs, rhs) => concat("(", print_expr(PrintState { node: lhs, src: ps.src }), op_text(OpSpell { op: op }), print_expr(PrintState { node: rhs, src: ps.src }), ")")
       AstNeg(inner) => concat("(-", print_expr(PrintState { node: inner, src: ps.src }), ")")
       AstNot(inner) => concat("(not ", print_expr(PrintState { node: inner, src: ps.src }), ")")
@@ -14645,6 +14867,7 @@ rule lower_expr
       AstField(base, fstart, flen) => "? "
       AstCall(callee_start, callee_len, args) => concat(lower_args(PrintArgsState { args: args, src: ps.src }), "call ", substring(ps.src, callee_start, callee_start + callee_len), " ")
       AstStr(start, len) => "? "
+      AstBytes(start, len) => "? "
       AstErr => "? "
       -- R3 stub: real handling in R6/R7. "? " placeholder instruction (mirror AstErr).
       AstVariant(cstart, clen, vstart, vlen, fields) => "? "
@@ -14768,6 +14991,7 @@ rule x86_expr
       AstField(base, fstart, flen) => b"\xcc"
       AstCall(callee_start, callee_len, args) => b"\xcc"
       AstStr(start, len) => b"\xcc"
+      AstBytes(start, len) => b"\xcc"
       AstBool(value) => b"\xcc"
       AstIf(cond, thn, els) => concat(x86_expr(PrintState { node: cond, src: ps.src }), b"\x58\x48\x85\xc0\x0f\x84", le32(code_size_expr(PrintState { node: thn, src: ps.src }) + 5), x86_expr(PrintState { node: thn, src: ps.src }), b"\xe9", le32(code_size_expr(PrintState { node: els, src: ps.src })), x86_expr(PrintState { node: els, src: ps.src }))
       AstErr => b"\xcc"
@@ -14815,6 +15039,7 @@ rule code_size_expr
       AstField(base, fstart, flen) => 1
       AstCall(callee_start, callee_len, args) => 1
       AstStr(start, len) => 1
+      AstBytes(start, len) => 1
       AstBool(value) => 1
       AstIf(cond, thn, els) => code_size_expr(PrintState { node: cond, src: ps.src }) + 15 + code_size_expr(PrintState { node: thn, src: ps.src }) + code_size_expr(PrintState { node: els, src: ps.src })
       AstErr => 1
@@ -15112,6 +15337,7 @@ rule ast_is_variant
       AstField(base, fstart, flen) => 0
       AstCall(callee_start, callee_len, args) => 0
       AstStr(start, len) => 0
+      AstBytes(start, len) => 0
       AstBool(value) => 0
       AstIf(cond, thn, els) => 0
       AstErr => 0
@@ -15142,6 +15368,7 @@ rule ast_variant_cstart
       AstField(base, fstart, flen) => 0
       AstCall(callee_start, callee_len, args) => 0
       AstStr(start, len) => 0
+      AstBytes(start, len) => 0
       AstBool(value) => 0
       AstIf(cond, thn, els) => 0
       AstErr => 0
@@ -15172,6 +15399,7 @@ rule ast_variant_clen
       AstField(base, fstart, flen) => 0
       AstCall(callee_start, callee_len, args) => 0
       AstStr(start, len) => 0
+      AstBytes(start, len) => 0
       AstBool(value) => 0
       AstIf(cond, thn, els) => 0
       AstErr => 0
@@ -15294,6 +15522,7 @@ rule static_concept_of
       AstField(base, fstart, flen) => if static_concept_of(StaticConceptState { node: base, src: sc.src, params: sc.params, lets: sc.lets, concepts: sc.concepts }) >= 0 then field_concept_of(FieldTyConceptState { fields: cd_fields(concept_at_index(ConceptAtState { concepts: sc.concepts, idx: static_concept_of(StaticConceptState { node: base, src: sc.src, params: sc.params, lets: sc.lets, concepts: sc.concepts }) })), src: sc.src, q_start: fstart, q_len: flen, concepts: sc.concepts }) else 0 - 1
       AstCall(callee_start, callee_len, args) => 0 - 1
       AstStr(start, len) => 0 - 1
+      AstBytes(start, len) => 0 - 1
       AstBool(value) => 0 - 1
       AstIf(cond, thn, els) => 0 - 1
       AstErr => 0 - 1
@@ -15530,6 +15759,7 @@ rule ast_uses_text
       AstVar(start, len) => 0
       AstErr => 0
       AstStr(start, len) => 1
+      AstBytes(start, len) => 1
       AstBin(op, lhs, rhs) => if ast_uses_text(PrintState { node: lhs, src: ps.src }) == 1 then 1 else ast_uses_text(PrintState { node: rhs, src: ps.src })
       AstNeg(inner) => ast_uses_text(PrintState { node: inner, src: ps.src })
       AstNot(inner) => ast_uses_text(PrintState { node: inner, src: ps.src })
@@ -15700,6 +15930,7 @@ rule ast_texty_shallow
       AstVar(start, len) => 0
       AstErr => 0
       AstStr(start, len) => 1
+      AstBytes(start, len) => 1
       AstBin(op, lhs, rhs) => 0
       AstNeg(inner) => 0
       AstNot(inner) => 0
@@ -15756,6 +15987,7 @@ rule ast_is_texty
       AstVar(start, len) => 0
       AstErr => 0
       AstStr(start, len) => 1
+      AstBytes(start, len) => 1
       AstBin(op, lhs, rhs) => 0
       AstNeg(inner) => 0
       AstNot(inner) => 0
@@ -16052,6 +16284,7 @@ rule mb_ast
       AstField(base, fstart, flen) => 0
       AstCall(callee_start, callee_len, args) => mb_args(args)
       AstStr(start, len) => 0
+      AstBytes(start, len) => 0
       AstBool(value) => 0
       AstIf(cond, thn, els) => mb_ast(cond) + mb_ast(thn) + mb_ast(els)
       AstErr => 0
@@ -16425,6 +16658,7 @@ rule code_size_node
       -- Text values slice 2: a string literal is one packed-span push —
       -- mov rax, imm64 (10) + push rax (1) = 11, same shape as AstNum.
       AstStr(start, len) => 11
+      AstBytes(start, len) => 1
       AstBool(value) => 1
       AstIf(cond, thn, els) => code_size_node(ByteGenState { node: cond, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + 15 + code_size_node(ByteGenState { node: thn, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + code_size_node(ByteGenState { node: els, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes })
       AstErr => 1
@@ -16727,6 +16961,7 @@ rule x86_node
       -- VText (the token span includes both quotes; a lone-quote token packs len
       -- 0). mov rax, imm64 ; push rax — 11 bytes, same shape as AstNum.
       AstStr(start, len) => concat(b"\x48\xb8", le64((start + 1) * 4294967296 + (if len >= 2 then len - 2 else 0)), b"\x50")
+      AstBytes(start, len) => b"\xcc"
       AstBool(value) => b"\xcc"
       -- Off-threading fix (text values slice 2): the THEN branch starts 10 bytes
       -- after the cond code (pop + test + je = 10), not 15 — the 5-byte
@@ -16872,6 +17107,7 @@ rule code_size_stream_node
       AstVar(start, len) => (if param_index(ParamIndexState { params: bg.params, src: bg.src, q_start: start, q_len: len, idx: 0 }) >= 0 then (if param_ty(ParamIndexState { params: bg.params, src: bg.src, q_start: start, q_len: len, idx: 0 }) == 2 then 42 else code_size_node(bg) + 6) else if let_index(LetIndexState { binds: bg.lets, src: bg.src, q_start: start, q_len: len, idx: 0 }) >= 0 then code_size_node(bg) + 6 else 1)
       AstField(base, fstart, flen) => code_size_node(bg) + 6
       AstStr(start, len) => 33
+      AstBytes(start, len) => 1
       AstBool(value) => 1
       AstErr => 1
       AstVariant(cstart, clen, vstart, vlen, fields) => code_size_node(bg) + 6
@@ -16953,6 +17189,7 @@ rule x86_stream_node
       AstVar(start, len) => (if param_index(ParamIndexState { params: bg.params, src: bg.src, q_start: start, q_len: len, idx: 0 }) >= 0 then (if param_ty(ParamIndexState { params: bg.params, src: bg.src, q_start: start, q_len: len, idx: 0 }) == 2 then concat(b"\xff\xb5", le32(16 + 8 * (param_list_len(bg.params) - 1 - param_index(ParamIndexState { params: bg.params, src: bg.src, q_start: start, q_len: len, idx: 0 }))), b"\x58\x89\xc2\x48\xc1\xe8\x20\x48\xbe", le64(4194304 + blob_end_off(ProgGenState { rules: bg.prog, src: bg.src, off: 0, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes })), b"\x48\x01\xc6\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05") else concat(x86_node(bg), b"\x58\xe8", le32(0 - (bg.off + code_size_node(bg) + 92)))) else if let_index(LetIndexState { binds: bg.lets, src: bg.src, q_start: start, q_len: len, idx: 0 }) >= 0 then concat(x86_node(bg), b"\x58\xe8", le32(0 - (bg.off + code_size_node(bg) + 92))) else b"\xcc")
       AstField(base, fstart, flen) => concat(x86_node(bg), b"\x58\xe8", le32(0 - (bg.off + code_size_node(bg) + 92)))
       AstStr(start, len) => concat(b"\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x48\xbe", le64(4194304 + blob_end_off(ProgGenState { rules: bg.prog, src: bg.src, off: 0, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + start + 1), b"\x48\xc7\xc2", le32(if len >= 2 then len - 2 else 0), b"\x0f\x05")
+      AstBytes(start, len) => b"\xcc"
       AstBool(value) => b"\xcc"
       AstErr => b"\xcc"
       AstVariant(cstart, clen, vstart, vlen, fields) => concat(x86_node(bg), b"\x58\xe8", le32(0 - (bg.off + code_size_node(bg) + 92)))
