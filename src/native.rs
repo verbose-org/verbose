@@ -37547,6 +37547,66 @@ rule two
         let _ = fs::remove_file(em);
     }
 
+    // Bytes tier B3: the self-hosted emitter (elf_program_src) emits an ELF for a
+    // BYTES-returning program; the emitted ELF's raw stdout is the exact bytes the
+    // B2 interpreter oracle reports (AstBytes decoded, le32/le64 little-endian,
+    // bytes-concat in order) — and a bytes entry has NO trailing newline (unlike
+    // the text entry, which the streaming test pins as `...\n`).
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn streaming_bytes_codegen_elf_emits_raw_bytes() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        let src = fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let elf = std::env::temp_dir().join("verbosec_test_bytes_elf_program_src");
+        compile_native(&program, "elf_program_src", elf.to_str().unwrap(), false, false)
+            .expect("elf_program_src must compile natively (bytes streaming slice)");
+
+        // Emit the ELF for `source` via the self-hosted emitter, run it, return raw stdout.
+        let emit_and_run = |source: &str, tag: &str| -> Vec<u8> {
+            let mc = Command::new(&elf).args([source, "0"]).output().expect("spawn elf_program_src");
+            assert!(mc.status.success(), "elf_program_src must exit 0 for {}; got {:?}", tag, mc.status);
+            let elf_bytes = mc.stdout;
+            assert_eq!(&elf_bytes[0..4], &[0x7f, 0x45, 0x4c, 0x46], "not ELF for {}", tag);
+            let out_path = std::env::temp_dir().join(format!("verbosec_test_bytes_a_out_{}", tag));
+            fs::write(&out_path, &elf_bytes).expect("write a.out");
+            let mut perms = fs::metadata(&out_path).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&out_path, perms).expect("chmod +x");
+            let child = Command::new(&out_path).output().expect("execute emitted ELF");
+            assert!(child.status.success(), "emitted bytes ELF for {} must exit 0; got {:?}", tag, child.status);
+            let _ = fs::remove_file(&out_path);
+            child.stdout
+        };
+        let expect_bytes = |source: &str, want: &[u8], tag: &str| {
+            let got = emit_and_run(source, tag);
+            assert_eq!(got.as_slice(), want, "bytes ELF stdout mismatch for {}", tag);
+        };
+
+        let bytes_prog = |body: &str| -> String {
+            format!("rule main\n  output:\n    out : bytes\n  logic:\n    out = {}", body)
+        };
+
+        // B3a: an AstBytes literal streams the DECODED bytes, no trailing newline.
+        expect_bytes(&bytes_prog("b\"\\x41\\x42\""), &[0x41, 0x42], "b3a_AB");
+        // NUL + high byte + a data 0x0a (NOT a trampoline newline) all preserved.
+        expect_bytes(&bytes_prog("b\"\\x00\\xff\\x0a\""), &[0x00, 0xff, 0x0a], "b3a_nul_high_nl");
+        // B3b: le32/le64 store+write, x86 little-endian.
+        expect_bytes(&bytes_prog("le32(5)"), &[0x05, 0x00, 0x00, 0x00], "b3b_le32_5");
+        expect_bytes(&bytes_prog("le32(258)"), &[0x02, 0x01, 0x00, 0x00], "b3b_le32_258");
+        expect_bytes(&bytes_prog("le64(1)"), &[0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], "b3b_le64_1");
+        // B3c: bytes-concat streams each arg in order.
+        expect_bytes(&bytes_prog("concat(b\"\\x41\", le32(5))"), &[0x41, 0x05, 0x00, 0x00, 0x00], "b3c_concat");
+
+        let _ = fs::remove_file(elf);
+    }
+
     // Regression (2026-07): a text `let`/`read` (BoundText) passed as a text
     // field of a MULTI-FIELD-RECORD call argument used to be refused with
     // "text field '...' in Record constructor for recursive call to '...':

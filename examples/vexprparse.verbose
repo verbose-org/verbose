@@ -16202,14 +16202,14 @@ rule ast_texty_shallow
       AstNeg(inner) => 0
       AstNot(inner) => 0
       AstField(base, fstart, flen) => 0
-      AstCall(callee_start, callee_len, args) => span_is_concat(SpanCheck { src: ps.src, start: callee_start, len: callee_len })
+      AstCall(callee_start, callee_len, args) => if span_is_concat(SpanCheck { src: ps.src, start: callee_start, len: callee_len }) == 1 then 1 else if span_is_le32(SpanCheck { src: ps.src, start: callee_start, len: callee_len }) == 1 then 1 else span_is_le64(SpanCheck { src: ps.src, start: callee_start, len: callee_len })
       AstIf(cond, thn, els) => if ast_texty_shallow(PrintState { node: thn, src: ps.src }) == 1 then 1 else ast_texty_shallow(PrintState { node: els, src: ps.src })
       AstVariant(cstart, clen, vstart, vlen, fields) => 0
       AstMatch(scrut, arms) => arms_texty_shallow(UsesTextArms { arms: arms, src: ps.src })
   proofs:
     purity:
       reads : [ps.node, ps.src]
-      calls : [span_is_concat, ast_texty_shallow, arms_texty_shallow]
+      calls : [span_is_concat, span_is_le32, span_is_le64, ast_texty_shallow, arms_texty_shallow]
     termination:
       bound : 8000
 
@@ -16259,14 +16259,14 @@ rule ast_is_texty
       AstNeg(inner) => 0
       AstNot(inner) => 0
       AstField(base, fstart, flen) => 0
-      AstCall(callee_start, callee_len, args) => if span_is_concat(SpanCheck { src: ts.src, start: callee_start, len: callee_len }) == 1 then 1 else if span_is_byte_at(SpanCheck { src: ts.src, start: callee_start, len: callee_len }) == 1 then 0 else if span_is_length(SpanCheck { src: ts.src, start: callee_start, len: callee_len }) == 1 then 0 else if span_is_substring(SpanCheck { src: ts.src, start: callee_start, len: callee_len }) == 1 then 0 else ast_texty_shallow(PrintState { node: block_result(rd_body(find_rule(FindRuleState { rules: ts.prog, src: ts.src, q_start: callee_start, q_len: callee_len }))), src: ts.src })
+      AstCall(callee_start, callee_len, args) => if span_is_concat(SpanCheck { src: ts.src, start: callee_start, len: callee_len }) == 1 then 1 else if span_is_le32(SpanCheck { src: ts.src, start: callee_start, len: callee_len }) == 1 then 1 else if span_is_le64(SpanCheck { src: ts.src, start: callee_start, len: callee_len }) == 1 then 1 else if span_is_byte_at(SpanCheck { src: ts.src, start: callee_start, len: callee_len }) == 1 then 0 else if span_is_length(SpanCheck { src: ts.src, start: callee_start, len: callee_len }) == 1 then 0 else if span_is_substring(SpanCheck { src: ts.src, start: callee_start, len: callee_len }) == 1 then 0 else ast_texty_shallow(PrintState { node: block_result(rd_body(find_rule(FindRuleState { rules: ts.prog, src: ts.src, q_start: callee_start, q_len: callee_len }))), src: ts.src })
       AstIf(cond, thn, els) => if ast_is_texty(TextyState { node: thn, src: ts.src, prog: ts.prog }) == 1 then 1 else ast_is_texty(TextyState { node: els, src: ts.src, prog: ts.prog })
       AstVariant(cstart, clen, vstart, vlen, fields) => 0
       AstMatch(scrut, arms) => arms_is_texty(TextyArms { arms: arms, src: ts.src, prog: ts.prog })
   proofs:
     purity:
       reads : [ts.node, ts.src, ts.prog]
-      calls : [span_is_concat, span_is_byte_at, span_is_length, span_is_substring, ast_texty_shallow, block_result, rd_body, find_rule, ast_is_texty, arms_is_texty]
+      calls : [span_is_concat, span_is_le32, span_is_le64, span_is_byte_at, span_is_length, span_is_substring, ast_texty_shallow, block_result, rd_body, find_rule, ast_is_texty, arms_is_texty]
     termination:
       bound : 8000
 
@@ -16375,6 +16375,195 @@ rule prog_any_texty
     purity:
       reads : [pg.rules, pg.src, pg.prog, pg.concepts, pg.sizes]
       calls : [rule_is_texty, prog_any_texty]
+    termination:
+      bound : 8000
+
+
+-- ast_bytes_shallow: the DEPTH-0 bytes-shape test — no call following at all.
+-- AstBytes / le32 / le64 are bytes; a concat is bytes iff any arg is shallow-bytes;
+-- if/match arms recurse over the same shallow grammar; a call to a DEFINED rule is
+-- 0 here (transitivity lives in ast_is_bytes, exactly one level — mirror of
+-- ast_texty_shallow, so the walk can never diverge through a recursive callee).
+rule ast_bytes_shallow
+  @intention: "1 if a subtree is bytes-shaped without following any call (AstBytes / le32 / le64 / shallow-bytes concat / if-match of those), 0 otherwise"
+  @source: vexprparse.intent:69
+  input:
+    ts : TextyState
+  output:
+    out : number
+  logic:
+    out = match ts.node:
+      AstNum(value) => 0
+      AstBool(value) => 0
+      AstVar(start, len) => 0
+      AstErr => 0
+      AstStr(start, len) => 0
+      AstBytes(start, len) => 1
+      AstBin(op, lhs, rhs) => 0
+      AstNeg(inner) => 0
+      AstNot(inner) => 0
+      AstField(base, fstart, flen) => 0
+      AstCall(callee_start, callee_len, args) => if span_is_le32(SpanCheck { src: ts.src, start: callee_start, len: callee_len }) == 1 then 1 else if span_is_le64(SpanCheck { src: ts.src, start: callee_start, len: callee_len }) == 1 then 1 else if span_is_concat(SpanCheck { src: ts.src, start: callee_start, len: callee_len }) == 1 then args_shallow_bytes(TextyArgs { args: args, src: ts.src, prog: ts.prog }) else 0
+      AstIf(cond, thn, els) => if ast_bytes_shallow(TextyState { node: thn, src: ts.src, prog: ts.prog }) == 1 then 1 else ast_bytes_shallow(TextyState { node: els, src: ts.src, prog: ts.prog })
+      AstVariant(cstart, clen, vstart, vlen, fields) => 0
+      AstMatch(scrut, arms) => arms_shallow_bytes(TextyArms { arms: arms, src: ts.src, prog: ts.prog })
+  proofs:
+    purity:
+      reads : [ts.node, ts.src, ts.prog]
+      calls : [span_is_le32, span_is_le64, span_is_concat, args_shallow_bytes, ast_bytes_shallow, arms_shallow_bytes]
+    termination:
+      bound : 8000
+
+
+-- ast_is_bytes: 1 iff a subtree's result is BYTES-shaped (as opposed to text-
+-- shaped) — AstBytes leaf, an le32/le64 call, a concat with any bytes arg, a call
+-- to a rule whose result is SHALLOW-bytes (one level of transitivity, like
+-- ast_is_texty), or an if/match whose arms are bytes. Following calls only via the
+-- shallow check keeps the walk finite even when a callee is recursive. Steers the
+-- ENTRY trampoline: a bytes entry must NOT append the trailing newline. Bytes tier B3.
+rule ast_is_bytes
+  @intention: "1 if a subtree's result is bytes-shaped (AstBytes / le32 / le64 / bytes-concat / bytes-returning call), 0 otherwise"
+  @source: vexprparse.intent:69
+  input:
+    ts : TextyState
+  output:
+    out : number
+  logic:
+    out = match ts.node:
+      AstNum(value) => 0
+      AstBool(value) => 0
+      AstVar(start, len) => 0
+      AstErr => 0
+      AstStr(start, len) => 0
+      AstBytes(start, len) => 1
+      AstBin(op, lhs, rhs) => 0
+      AstNeg(inner) => 0
+      AstNot(inner) => 0
+      AstField(base, fstart, flen) => 0
+      AstCall(callee_start, callee_len, args) => if span_is_le32(SpanCheck { src: ts.src, start: callee_start, len: callee_len }) == 1 then 1 else if span_is_le64(SpanCheck { src: ts.src, start: callee_start, len: callee_len }) == 1 then 1 else if span_is_concat(SpanCheck { src: ts.src, start: callee_start, len: callee_len }) == 1 then args_any_bytes(TextyArgs { args: args, src: ts.src, prog: ts.prog }) else if span_is_byte_at(SpanCheck { src: ts.src, start: callee_start, len: callee_len }) == 1 then 0 else if span_is_length(SpanCheck { src: ts.src, start: callee_start, len: callee_len }) == 1 then 0 else if span_is_substring(SpanCheck { src: ts.src, start: callee_start, len: callee_len }) == 1 then 0 else ast_bytes_shallow(TextyState { node: block_result(rd_body(find_rule(FindRuleState { rules: ts.prog, src: ts.src, q_start: callee_start, q_len: callee_len }))), src: ts.src, prog: ts.prog })
+      AstIf(cond, thn, els) => if ast_is_bytes(TextyState { node: thn, src: ts.src, prog: ts.prog }) == 1 then 1 else ast_is_bytes(TextyState { node: els, src: ts.src, prog: ts.prog })
+      AstVariant(cstart, clen, vstart, vlen, fields) => 0
+      AstMatch(scrut, arms) => arms_are_bytes(TextyArms { arms: arms, src: ts.src, prog: ts.prog })
+  proofs:
+    purity:
+      reads : [ts.node, ts.src, ts.prog]
+      calls : [span_is_le32, span_is_le64, span_is_concat, span_is_byte_at, span_is_length, span_is_substring, args_any_bytes, ast_bytes_shallow, ast_is_bytes, block_result, rd_body, find_rule, arms_are_bytes]
+    termination:
+      bound : 8000
+
+
+-- TextyArgs: an argument list + source + program, for the bytes-shape walk over a
+-- concat's arguments. Bytes tier B3.
+concept TextyArgs
+  @intention: "An argument list + source + program, for the bytes-shape walk over a concat's arguments"
+  @source: vexprparse.intent:69
+  fields:
+    args : ArgList
+    src : text [..256]
+    prog : RuleList
+
+
+-- args_shallow_bytes: 1 iff ANY concat argument is shallow-bytes (no call following).
+-- Bytes tier B3.
+rule args_shallow_bytes
+  @intention: "1 if any concat argument is shallow-bytes (no call following), 0 otherwise"
+  @source: vexprparse.intent:69
+  input:
+    ta : TextyArgs
+  output:
+    out : number
+  logic:
+    out = match ta.args:
+      ArgCons(head, tail) => if ast_bytes_shallow(TextyState { node: head, src: ta.src, prog: ta.prog }) == 1 then 1 else args_shallow_bytes(TextyArgs { args: tail, src: ta.src, prog: ta.prog })
+      ArgNil => 0
+  proofs:
+    purity:
+      reads : [ta.args, ta.src, ta.prog]
+      calls : [ast_bytes_shallow, args_shallow_bytes]
+    termination:
+      bound : 8000
+
+
+-- args_any_bytes: 1 iff ANY argument of a concat is bytes-shaped (one level of call
+-- transitivity via ast_is_bytes) — which makes the concat itself a bytes concat.
+-- Bytes tier B3.
+rule args_any_bytes
+  @intention: "1 if any concat argument is bytes-shaped, 0 otherwise"
+  @source: vexprparse.intent:69
+  input:
+    ta : TextyArgs
+  output:
+    out : number
+  logic:
+    out = match ta.args:
+      ArgCons(head, tail) => if ast_is_bytes(TextyState { node: head, src: ta.src, prog: ta.prog }) == 1 then 1 else args_any_bytes(TextyArgs { args: tail, src: ta.src, prog: ta.prog })
+      ArgNil => 0
+  proofs:
+    purity:
+      reads : [ta.args, ta.src, ta.prog]
+      calls : [ast_is_bytes, args_any_bytes]
+    termination:
+      bound : 8000
+
+
+-- arms_shallow_bytes: 1 iff any match arm body is shallow-bytes. Bytes tier B3.
+rule arms_shallow_bytes
+  @intention: "1 if any match arm body is shallow-bytes, 0 otherwise"
+  @source: vexprparse.intent:69
+  input:
+    ta : TextyArms
+  output:
+    out : number
+  logic:
+    out = match ta.arms:
+      ArmCons(vstart, vlen, binders, body, rest) => if ast_bytes_shallow(TextyState { node: body, src: ta.src, prog: ta.prog }) == 1 then 1 else arms_shallow_bytes(TextyArms { arms: rest, src: ta.src, prog: ta.prog })
+      ArmNil => 0
+  proofs:
+    purity:
+      reads : [ta.arms, ta.src, ta.prog]
+      calls : [ast_bytes_shallow, arms_shallow_bytes]
+    termination:
+      bound : 8000
+
+
+-- arms_are_bytes: 1 iff any match arm body is bytes-shaped. Bytes tier B3.
+rule arms_are_bytes
+  @intention: "1 if any match arm body is bytes-shaped, 0 otherwise"
+  @source: vexprparse.intent:69
+  input:
+    ta : TextyArms
+  output:
+    out : number
+  logic:
+    out = match ta.arms:
+      ArmCons(vstart, vlen, binders, body, rest) => if ast_is_bytes(TextyState { node: body, src: ta.src, prog: ta.prog }) == 1 then 1 else arms_are_bytes(TextyArms { arms: rest, src: ta.src, prog: ta.prog })
+      ArmNil => 0
+  proofs:
+    purity:
+      reads : [ta.arms, ta.src, ta.prog]
+      calls : [ast_is_bytes, arms_are_bytes]
+    termination:
+      bound : 8000
+
+
+-- entry_rule_bytes: 1 iff the program's ENTRY (first) rule's result is bytes-shaped.
+-- The trampoline uses this to drop the trailing newline for a bytes entry. Bytes
+-- tier B3.
+rule entry_rule_bytes
+  @intention: "1 if the program's entry (first) rule is bytes-shaped, 0 otherwise"
+  @source: vexprparse.intent:69
+  input:
+    pg : ProgGenState
+  output:
+    out : number
+  logic:
+    out = match pg.rules:
+      RCons(head, tail) => ast_is_bytes(TextyState { node: block_result(rd_body(head)), src: pg.src, prog: pg.prog })
+      RNil => 0
+  proofs:
+    purity:
+      reads : [pg.rules, pg.src, pg.prog]
+      calls : [ast_is_bytes, block_result, rd_body]
     termination:
       bound : 8000
 
@@ -17374,17 +17563,17 @@ rule code_size_stream_node
       AstVar(start, len) => (if param_index(ParamIndexState { params: bg.params, src: bg.src, q_start: start, q_len: len, idx: 0 }) >= 0 then (if param_ty(ParamIndexState { params: bg.params, src: bg.src, q_start: start, q_len: len, idx: 0 }) == 2 then 42 else code_size_node(bg) + 6) else if let_index(LetIndexState { binds: bg.lets, src: bg.src, q_start: start, q_len: len, idx: 0 }) >= 0 then code_size_node(bg) + 6 else 1)
       AstField(base, fstart, flen) => code_size_node(bg) + 6
       AstStr(start, len) => 33
-      AstBytes(start, len) => 1
+      AstBytes(start, len) => if bytelit_decoded_len(DecodeState { src: bg.src, start: start, len: len, i: 0 }) <= 0 then 0 else 35 + 4 * ((bytelit_decoded_len(DecodeState { src: bg.src, start: start, len: len, i: 0 }) + 3) / 4)
       AstBool(value) => 1
       AstErr => 1
       AstVariant(cstart, clen, vstart, vlen, fields) => code_size_node(bg) + 6
       AstIf(cond, thn, els) => code_size_node(ByteGenState { node: cond, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + 15 + code_size_stream_node(ByteGenState { node: thn, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + code_size_stream_node(ByteGenState { node: els, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes })
       AstMatch(scrut, arms) => code_size_node(ByteGenState { node: scrut, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + 14 + 13 * arm_list_len(arms) + 5 + stream_size_arms(ArmSizeState { arms: arms, src: bg.src, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes })
-      AstCall(callee_start, callee_len, args) => if span_is_concat(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then stream_size_cargs(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) else if span_is_substring(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then 1 else if span_is_byte_at(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then code_size_node(bg) + 6 else if span_is_length(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then code_size_node(bg) + 6 else if callee_is_texty(FindRuleState { rules: bg.prog, src: bg.src, q_start: callee_start, q_len: callee_len }) == 1 then code_size_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + 12 else code_size_node(bg) + 6
+      AstCall(callee_start, callee_len, args) => if span_is_concat(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then stream_size_cargs(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) else if span_is_le32(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then code_size_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + 34 else if span_is_le64(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then code_size_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + 34 else if span_is_substring(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then 1 else if span_is_byte_at(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then code_size_node(bg) + 6 else if span_is_length(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then code_size_node(bg) + 6 else if callee_is_texty(FindRuleState { rules: bg.prog, src: bg.src, q_start: callee_start, q_len: callee_len }) == 1 then code_size_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + 12 else code_size_node(bg) + 6
   proofs:
     purity:
       reads : [bg, bg.node, bg.src, bg.off, bg.params, bg.lets, bg.prog, bg.concepts, bg.sizes]
-      calls : [code_size_node, code_size_stream_node, stream_size_cargs, stream_size_arms, code_size_args, param_index, param_ty, let_index, arm_list_len, span_is_concat, span_is_substring, span_is_byte_at, span_is_length, callee_is_texty]
+      calls : [code_size_node, code_size_stream_node, stream_size_cargs, stream_size_arms, code_size_args, param_index, param_ty, let_index, arm_list_len, span_is_concat, span_is_le32, span_is_le64, span_is_substring, span_is_byte_at, span_is_length, callee_is_texty, bytelit_decoded_len]
     termination:
       bound : 8000
 
@@ -17433,6 +17622,63 @@ rule stream_size_arms
       bound : 8000
 
 
+-- BytesEmitState: cursor for embedding a byte-literal's DECODED bytes inline in
+-- the code stream. src/start/len are the content span (as parsed into AstBytes);
+-- i is the decoded-byte cursor; dlen is the total decoded length (so the tail
+-- group can pad missing bytes with 0). Bytes tier B3.
+concept BytesEmitState
+  @intention: "A cursor for embedding a byte-literal's decoded bytes inline (span + decoded cursor + decoded length)"
+  @source: vexprparse.intent:69
+  fields:
+    src : text [..256]
+    start : number [-4000000, 4000000]
+    len : number [-4000000, 4000000]
+    i : number [-4000000, 4000000]
+    dlen : number [-4000000, 4000000]
+
+
+-- bytes_dbyte: the k-th decoded byte of a content span, or 0 when k is past the
+-- decoded length (the tail-group padding value). Bytes tier B3 — reuses B2's
+-- escape-aware bytelit_byte_at.
+rule bytes_dbyte
+  @intention: "The k-th decoded byte of a byte-literal content span, or 0 when k >= dlen (tail padding)"
+  @source: vexprparse.intent:69
+  input:
+    be : BytesEmitState
+  output:
+    out : number
+  logic:
+    out = if be.i >= be.dlen then 0 else bytelit_byte_at(DecodeState { src: be.src, start: be.start, len: be.len, i: be.i })
+  proofs:
+    purity:
+      reads : [be.src, be.start, be.len, be.i, be.dlen]
+      calls : [bytelit_byte_at]
+    termination:
+      bound : 8
+
+
+-- emit_bytes_data: the inline data block for an AstBytes leaf — the decoded bytes,
+-- packed 4-at-a-time into an le32 (b0 + 256*b1 + 65536*b2 + 16777216*b3), the SAME
+-- packing src_blob uses to embed the source. Emits ceil(dlen/4) le32s = a multiple
+-- of 4 bytes; the tail group pads with 0 (bytes_dbyte returns 0 past dlen), and the
+-- write length (dlen) skips that padding. Bytes tier B3.
+rule emit_bytes_data
+  @intention: "Emit a byte-literal's decoded bytes inline, packed 4-at-a-time via le32 (tail padded with 0)"
+  @source: vexprparse.intent:69
+  input:
+    be : BytesEmitState
+  output:
+    out : bytes
+  logic:
+    out = if be.i >= be.dlen then b"" else concat(le32(bytes_dbyte(be) + 256 * bytes_dbyte(BytesEmitState { src: be.src, start: be.start, len: be.len, i: be.i + 1, dlen: be.dlen }) + 65536 * bytes_dbyte(BytesEmitState { src: be.src, start: be.start, len: be.len, i: be.i + 2, dlen: be.dlen }) + 16777216 * bytes_dbyte(BytesEmitState { src: be.src, start: be.start, len: be.len, i: be.i + 3, dlen: be.dlen })), emit_bytes_data(BytesEmitState { src: be.src, start: be.start, len: be.len, i: be.i + 4, dlen: be.dlen }))
+  proofs:
+    purity:
+      reads : [be, be.src, be.start, be.len, be.i, be.dlen]
+      calls : [bytes_dbyte, emit_bytes_data]
+    termination:
+      bound : 8000
+
+
 -- x86_stream_node: the WRITER-mode emitter. Every arm's byte count MUST equal
 -- code_size_stream_node's — the two-pass drift edge. The shared itoa call's
 -- rel32 targets blob-origin offset -86 (itoa_proc sits right before the first
@@ -17456,17 +17702,17 @@ rule x86_stream_node
       AstVar(start, len) => (if param_index(ParamIndexState { params: bg.params, src: bg.src, q_start: start, q_len: len, idx: 0 }) >= 0 then (if param_ty(ParamIndexState { params: bg.params, src: bg.src, q_start: start, q_len: len, idx: 0 }) == 2 then concat(b"\xff\xb5", le32(16 + 8 * (param_list_len(bg.params) - 1 - param_index(ParamIndexState { params: bg.params, src: bg.src, q_start: start, q_len: len, idx: 0 }))), b"\x58\x89\xc2\x48\xc1\xe8\x20\x48\xbe", le64(4194304 + blob_end_off(ProgGenState { rules: bg.prog, src: bg.src, off: 0, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes })), b"\x48\x01\xc6\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05") else concat(x86_node(bg), b"\x58\xe8", le32(0 - (bg.off + code_size_node(bg) + 92)))) else if let_index(LetIndexState { binds: bg.lets, src: bg.src, q_start: start, q_len: len, idx: 0 }) >= 0 then concat(x86_node(bg), b"\x58\xe8", le32(0 - (bg.off + code_size_node(bg) + 92))) else b"\xcc")
       AstField(base, fstart, flen) => concat(x86_node(bg), b"\x58\xe8", le32(0 - (bg.off + code_size_node(bg) + 92)))
       AstStr(start, len) => concat(b"\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x48\xbe", le64(4194304 + blob_end_off(ProgGenState { rules: bg.prog, src: bg.src, off: 0, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + start + 1), b"\x48\xc7\xc2", le32(if len >= 2 then len - 2 else 0), b"\x0f\x05")
-      AstBytes(start, len) => b"\xcc"
+      AstBytes(start, len) => if bytelit_decoded_len(DecodeState { src: bg.src, start: start, len: len, i: 0 }) <= 0 then b"" else concat(b"\xe9", le32(4 * ((bytelit_decoded_len(DecodeState { src: bg.src, start: start, len: len, i: 0 }) + 3) / 4)), emit_bytes_data(BytesEmitState { src: bg.src, start: start, len: len, i: 0, dlen: bytelit_decoded_len(DecodeState { src: bg.src, start: start, len: len, i: 0 }) }), b"\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x48\x8d\x35", le32(0 - (21 + 4 * ((bytelit_decoded_len(DecodeState { src: bg.src, start: start, len: len, i: 0 }) + 3) / 4))), b"\x48\xc7\xc2", le32(bytelit_decoded_len(DecodeState { src: bg.src, start: start, len: len, i: 0 })), b"\x0f\x05")
       AstBool(value) => b"\xcc"
       AstErr => b"\xcc"
       AstVariant(cstart, clen, vstart, vlen, fields) => concat(x86_node(bg), b"\x58\xe8", le32(0 - (bg.off + code_size_node(bg) + 92)))
       AstIf(cond, thn, els) => concat(x86_node(ByteGenState { node: cond, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }), b"\x58\x48\x85\xc0\x0f\x84", le32(code_size_stream_node(ByteGenState { node: thn, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + 5), x86_stream_node(ByteGenState { node: thn, src: bg.src, off: bg.off + code_size_node(ByteGenState { node: cond, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + 10, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }), b"\xe9", le32(code_size_stream_node(ByteGenState { node: els, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes })), x86_stream_node(ByteGenState { node: els, src: bg.src, off: bg.off + code_size_node(ByteGenState { node: cond, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + 15 + code_size_stream_node(ByteGenState { node: thn, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }), params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }))
       AstMatch(scrut, arms) => concat(x86_node(ByteGenState { node: scrut, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }), b"\x58\x48\x69\xc0", le32(8 * (max_payload_fields(bg.concepts) + 1)), b"\x4c\x01\xf8\x48\x8b\x08", x86_stream_dispatch(DispatchState { arms: arms, src: bg.src, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, rest_disp: 13 * (arm_list_len(arms) - 1), pre_arms: 0 }), b"\xe9", le32(stream_size_arms(ArmSizeState { arms: arms, src: bg.src, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes })), x86_stream_arms(ArmGenState { arms: arms, src: bg.src, off: bg.off + code_size_node(ByteGenState { node: scrut, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + 14 + 13 * arm_list_len(arms) + 5, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }))
-      AstCall(callee_start, callee_len, args) => if span_is_concat(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then x86_stream_cargs(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) else if span_is_substring(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then b"\xcc" else if span_is_byte_at(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then concat(x86_node(bg), b"\x58\xe8", le32(0 - (bg.off + code_size_node(bg) + 92))) else if span_is_length(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then concat(x86_node(bg), b"\x58\xe8", le32(0 - (bg.off + code_size_node(bg) + 92))) else if callee_is_texty(FindRuleState { rules: bg.prog, src: bg.src, q_start: callee_start, q_len: callee_len }) == 1 then concat(x86_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }), b"\xe8", le32(proc_offset(ProcOffState { rules: bg.prog, src: bg.src, acc: 0, q_start: callee_start, q_len: callee_len, concepts: bg.concepts, sizes: bg.sizes }) - (bg.off + code_size_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + 5)), b"\x48\x81\xc4", le32(8 * arg_list_len(args))) else concat(x86_node(bg), b"\x58\xe8", le32(0 - (bg.off + code_size_node(bg) + 92)))
+      AstCall(callee_start, callee_len, args) => if span_is_concat(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then x86_stream_cargs(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) else if span_is_le32(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then concat(x86_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }), b"\x58\x48\x89\x44\x24\xf8\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x48\x8d\x74\x24\xf8\x48\xc7\xc2\x04\x00\x00\x00\x0f\x05") else if span_is_le64(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then concat(x86_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }), b"\x58\x48\x89\x44\x24\xf8\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x48\x8d\x74\x24\xf8\x48\xc7\xc2\x08\x00\x00\x00\x0f\x05") else if span_is_substring(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then b"\xcc" else if span_is_byte_at(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then concat(x86_node(bg), b"\x58\xe8", le32(0 - (bg.off + code_size_node(bg) + 92))) else if span_is_length(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then concat(x86_node(bg), b"\x58\xe8", le32(0 - (bg.off + code_size_node(bg) + 92))) else if callee_is_texty(FindRuleState { rules: bg.prog, src: bg.src, q_start: callee_start, q_len: callee_len }) == 1 then concat(x86_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }), b"\xe8", le32(proc_offset(ProcOffState { rules: bg.prog, src: bg.src, acc: 0, q_start: callee_start, q_len: callee_len, concepts: bg.concepts, sizes: bg.sizes }) - (bg.off + code_size_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + 5)), b"\x48\x81\xc4", le32(8 * arg_list_len(args))) else concat(x86_node(bg), b"\x58\xe8", le32(0 - (bg.off + code_size_node(bg) + 92)))
   proofs:
     purity:
       reads : [bg, bg.node, bg.src, bg.off, bg.params, bg.lets, bg.prog, bg.concepts, bg.sizes]
-      calls : [x86_node, code_size_node, x86_stream_node, code_size_stream_node, x86_stream_cargs, x86_stream_dispatch, x86_stream_arms, stream_size_arms, x86_args, code_size_args, param_index, param_ty, param_list_len, let_index, arm_list_len, max_payload_fields, proc_offset, arg_list_len, blob_end_off, span_is_concat, span_is_substring, span_is_byte_at, span_is_length, callee_is_texty]
+      calls : [x86_node, code_size_node, x86_stream_node, code_size_stream_node, x86_stream_cargs, x86_stream_dispatch, x86_stream_arms, stream_size_arms, x86_args, code_size_args, param_index, param_ty, param_list_len, let_index, arm_list_len, max_payload_fields, proc_offset, arg_list_len, blob_end_off, span_is_concat, span_is_le32, span_is_le64, span_is_substring, span_is_byte_at, span_is_length, callee_is_texty, bytelit_decoded_len, emit_bytes_data]
     termination:
       bound : 8000
 
@@ -17653,11 +17899,11 @@ rule blob_end_off
     let efields = params_to_fields(entry_params)
     let ecfields = cd_fields(concept_at_index(ConceptAtState { concepts: pg.concepts, idx: find_concept_index(FindConceptIdxState { concepts: pg.concepts, src: pg.src, q_start: fl_head_ty_start(efields), q_len: fl_head_ty_len(efields), idx: 0 }) }))
     let msize = if has_input == 1 and entry_rule_texty(pg) == 0 then (if field_list_has_text(ecfields) == 1 then stdin_marshal_size(ecfields) else argv_marshal_size(ecfields)) else 0
-    out = 120 + (if program_uses_arena(pg.concepts) == 1 then 61 else 0) + (if entry_rule_texty(pg) == 1 then 45 else 101) + (if prog_any_texty(pg) == 1 then 86 else 0) + msize + ps_total(pg.sizes)
+    out = 120 + (if program_uses_arena(pg.concepts) == 1 then 61 else 0) + (if entry_rule_bytes(pg) == 1 then 17 else if entry_rule_texty(pg) == 1 then 45 else 101) + (if prog_any_texty(pg) == 1 then 86 else 0) + msize + ps_total(pg.sizes)
   proofs:
     purity:
       reads : [pg, pg.rules, pg.src, pg.concepts, pg.sizes]
-      calls : [program_uses_arena, entry_rule_texty, prog_any_texty, ps_total, param_list_len, rl_head_params, fields_to_params, rl_head_input, params_to_fields, argv_marshal_size, stdin_marshal_size, field_list_has_text, cd_fields, concept_at_index, find_concept_index, fl_head_ty_start, fl_head_ty_len]
+      calls : [program_uses_arena, entry_rule_texty, entry_rule_bytes, prog_any_texty, ps_total, param_list_len, rl_head_params, fields_to_params, rl_head_input, params_to_fields, argv_marshal_size, stdin_marshal_size, field_list_has_text, cd_fields, concept_at_index, find_concept_index, fl_head_ty_start, fl_head_ty_len]
     termination:
       bound : 8000
 
@@ -18095,6 +18341,7 @@ rule elf_program_src
     let uses_var = program_uses_arena(concepts)
     let anytx = prog_any_texty(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: sizes })
     let entrytx = entry_rule_texty(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: sizes })
+    let entrybytes = entry_rule_bytes(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: sizes })
     let uses_text = if program_uses_text(UsesTextRules { rules: prog, src: s.source }) == 1 then 1 else anytx
     let fsz0 = blob_end_off(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: sizes })
     let fsz = fsz0 + (if uses_text == 1 then 4 * ((length(s.source) + 3) / 4) else 0)
@@ -18102,11 +18349,11 @@ rule elf_program_src
     let has_input = if param_list_len(entry_params) > 0 then 1 else 0
     let efields = params_to_fields(entry_params)
     let ecidx = find_concept_index(FindConceptIdxState { concepts: concepts, src: s.source, q_start: fl_head_ty_start(efields), q_len: fl_head_ty_len(efields), idx: 0 })
-    out = concat(b"\x7f\x45\x4c\x46\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\x3e\x00\x01\x00\x00\x00\x78\x00\x40\x00\x00\x00\x00\x00\x40\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x40\x00\x38\x00\x01\x00\x00\x00\x00\x00\x00\x00", b"\x01\x00\x00\x00\x05\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x40\x00\x00\x00\x00\x00\x00\x00\x40\x00\x00\x00\x00\x00", le64(fsz), le64(fsz), b"\x00\x10\x00\x00\x00\x00\x00\x00", (if uses_var == 1 then b"\xb8\x09\x00\x00\x00\x31\xff\xbe\x00\x00\x00\x40\xba\x03\x00\x00\x00\x41\xba\x22\x00\x00\x00\x49\xc7\xc0\xff\xff\xff\xff\x45\x31\xc9\x0f\x05\x48\x3d\x01\xf0\xff\xff\x72\x0c\xbf\x01\x00\x00\x00\xb8\x3c\x00\x00\x00\x0f\x05\x49\x89\xc7\x45\x31\xf6" else b""), (if has_input == 1 and entrytx == 0 then (if field_list_has_text(cd_fields(concept_at_index(ConceptAtState { concepts: concepts, idx: ecidx }))) == 1 then x86_stdin_marshal(ArgvTrampState { fields: cd_fields(concept_at_index(ConceptAtState { concepts: concepts, idx: ecidx })), src: s.source, prog: prog, concepts: concepts, sizes: sizes, cidx: ecidx }) else x86_argv_marshal(ArgvTrampState { fields: cd_fields(concept_at_index(ConceptAtState { concepts: concepts, idx: ecidx })), src: s.source, prog: prog, concepts: concepts, sizes: sizes, cidx: ecidx })) else b""), (if entrytx == 1 then b"\xe8\x7e\x00\x00\x00\x6a\x0a\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x48\x89\xe6\x48\xc7\xc2\x01\x00\x00\x00\x0f\x05\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05" else concat(b"\xe8", le32(96 + (if anytx == 1 then 86 else 0)), b"\x48\x83\xec\x20\x49\x89\xc1\x48\x8d\x74\x24\x1f\xc6\x06\x0a\x48\x85\xc0\x79\x03\x48\xf7\xd8\x48\xc7\xc1\x0a\x00\x00\x00\x48\x31\xd2\x48\xf7\xf1\x80\xc2\x30\x48\xff\xce\x88\x16\x48\x85\xc0\x75\xed\x4d\x85\xc9\x79\x06\x48\xff\xce\xc6\x06\x2d\x48\x8d\x54\x24\x20\x48\x29\xf2\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05")), (if anytx == 1 then b"\x48\x83\xec\x28\x49\x89\xc1\x48\x8d\x74\x24\x20\x48\x85\xc0\x79\x03\x48\xf7\xd8\x48\xc7\xc1\x0a\x00\x00\x00\x48\x31\xd2\x48\xf7\xf1\x80\xc2\x30\x48\xff\xce\x88\x16\x48\x85\xc0\x75\xed\x4d\x85\xc9\x79\x06\x48\xff\xce\xc6\x06\x2d\x48\x8d\x54\x24\x20\x48\x29\xf2\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05\x48\x83\xc4\x28\xc3" else b""), x86_program(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: sizes }), (if uses_text == 1 then src_blob(SrcBlobState { src: s.source, pos: 0 }) else b""))
+    out = concat(b"\x7f\x45\x4c\x46\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\x3e\x00\x01\x00\x00\x00\x78\x00\x40\x00\x00\x00\x00\x00\x40\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x40\x00\x38\x00\x01\x00\x00\x00\x00\x00\x00\x00", b"\x01\x00\x00\x00\x05\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x40\x00\x00\x00\x00\x00\x00\x00\x40\x00\x00\x00\x00\x00", le64(fsz), le64(fsz), b"\x00\x10\x00\x00\x00\x00\x00\x00", (if uses_var == 1 then b"\xb8\x09\x00\x00\x00\x31\xff\xbe\x00\x00\x00\x40\xba\x03\x00\x00\x00\x41\xba\x22\x00\x00\x00\x49\xc7\xc0\xff\xff\xff\xff\x45\x31\xc9\x0f\x05\x48\x3d\x01\xf0\xff\xff\x72\x0c\xbf\x01\x00\x00\x00\xb8\x3c\x00\x00\x00\x0f\x05\x49\x89\xc7\x45\x31\xf6" else b""), (if has_input == 1 and entrytx == 0 then (if field_list_has_text(cd_fields(concept_at_index(ConceptAtState { concepts: concepts, idx: ecidx }))) == 1 then x86_stdin_marshal(ArgvTrampState { fields: cd_fields(concept_at_index(ConceptAtState { concepts: concepts, idx: ecidx })), src: s.source, prog: prog, concepts: concepts, sizes: sizes, cidx: ecidx }) else x86_argv_marshal(ArgvTrampState { fields: cd_fields(concept_at_index(ConceptAtState { concepts: concepts, idx: ecidx })), src: s.source, prog: prog, concepts: concepts, sizes: sizes, cidx: ecidx })) else b""), (if entrybytes == 1 then concat(b"\xe8", le32(12 + (if anytx == 1 then 86 else 0)), b"\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05") else if entrytx == 1 then b"\xe8\x7e\x00\x00\x00\x6a\x0a\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x48\x89\xe6\x48\xc7\xc2\x01\x00\x00\x00\x0f\x05\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05" else concat(b"\xe8", le32(96 + (if anytx == 1 then 86 else 0)), b"\x48\x83\xec\x20\x49\x89\xc1\x48\x8d\x74\x24\x1f\xc6\x06\x0a\x48\x85\xc0\x79\x03\x48\xf7\xd8\x48\xc7\xc1\x0a\x00\x00\x00\x48\x31\xd2\x48\xf7\xf1\x80\xc2\x30\x48\xff\xce\x88\x16\x48\x85\xc0\x75\xed\x4d\x85\xc9\x79\x06\x48\xff\xce\xc6\x06\x2d\x48\x8d\x54\x24\x20\x48\x29\xf2\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05")), (if anytx == 1 then b"\x48\x83\xec\x28\x49\x89\xc1\x48\x8d\x74\x24\x20\x48\x85\xc0\x79\x03\x48\xf7\xd8\x48\xc7\xc1\x0a\x00\x00\x00\x48\x31\xd2\x48\xf7\xf1\x80\xc2\x30\x48\xff\xce\x88\x16\x48\x85\xc0\x75\xed\x4d\x85\xc9\x79\x06\x48\xff\xce\xc6\x06\x2d\x48\x8d\x54\x24\x20\x48\x29\xf2\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05\x48\x83\xc4\x28\xc3" else b""), x86_program(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: sizes }), (if uses_text == 1 then src_blob(SrcBlobState { src: s.source, pos: 0 }) else b""))
   proofs:
     purity:
       reads : [s.source]
-      calls : [begin_tokenize, parse_program, parse_concepts, proc_sizes, program_uses_arena, prog_any_texty, entry_rule_texty, program_uses_text, blob_end_off, x86_program, src_blob, param_list_len, rl_head_params, fields_to_params, rl_head_input, params_to_fields, find_concept_index, fl_head_ty_start, fl_head_ty_len, x86_argv_marshal, x86_stdin_marshal, field_list_has_text, cd_fields, concept_at_index]
+      calls : [begin_tokenize, parse_program, parse_concepts, proc_sizes, program_uses_arena, prog_any_texty, entry_rule_texty, entry_rule_bytes, program_uses_text, blob_end_off, x86_program, src_blob, param_list_len, rl_head_params, fields_to_params, rl_head_input, params_to_fields, find_concept_index, fl_head_ty_start, fl_head_ty_len, x86_argv_marshal, x86_stdin_marshal, field_list_has_text, cd_fields, concept_at_index]
     termination:
       bound : 256
 
