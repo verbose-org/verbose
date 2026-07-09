@@ -35969,6 +35969,106 @@ rule two
         let _ = std::fs::remove_file(&em);
     }
 
+    /// Bytes tier B2 — the self-hosted interpreter evaluates BYTES values. Two new
+    /// Value leaves ride the concat rope: `VBLit(start, len)` (a span into a
+    /// `b"..."` literal's escape-encoded content, decoded ON DEMAND) and
+    /// `VBLe(value, width)` (a `le32`/`le64` little-endian number). `length` and
+    /// `byte_at` descend them: VBLit → escape-aware decode (`\xNN` → 1 byte,
+    /// `\n`/`\t`/`\\`/`\"` → their byte, plain char → itself); VBLe → width bytes,
+    /// byte i = (value / 256^i) % 256 (little-endian). Bytes-concat reuses VConcat
+    /// with zero new code — a concat of bytes leaves is walked by the same vlength /
+    /// vbyte_at descent. This is the ORACLE for the B3 codegen slice.
+    ///
+    /// The headline probes: length(b"\x41\x42")=2, byte 0/1 = 65/66; le32(258) reads
+    /// bytes 2,1 (little-endian 0x0102); concat(b"\x41", le32(5)) is 5 bytes reading
+    /// 65 then 5; b"\n\t" is 2 bytes reading 10 then 9. Escape edge cases (\xff, both
+    /// hex cases, \\, \") and OOB → 0 are pinned too.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn bytes_b2_value_model_oracle() {
+        let src = std::fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let em = std::env::temp_dir().join("verbosec_test_bytes_b2_eval_main");
+        compile_native(&program, "eval_main", em.to_str().unwrap(), false, false)
+            .expect("eval_main must compile natively (bytes tier B2)");
+
+        let run = |source: &str| -> i64 {
+            let r = std::process::Command::new(&em)
+                .arg(source)
+                .arg("0")
+                .output()
+                .expect("spawn eval_main");
+            assert!(
+                r.status.success(),
+                "eval_main must exit 0 for {:?}; got {:?}",
+                source, r.status
+            );
+            String::from_utf8_lossy(&r.stdout)
+                .trim()
+                .parse::<i64>()
+                .unwrap_or_else(|_| panic!("eval_main produced non-number for {:?}: {:?}", source, r.stdout))
+        };
+        // `body` is embedded verbatim into a `rule main` — the \x41 etc. reach the
+        // interpreted source as LITERAL backslash-x-4-1, exactly the B3 codegen sees.
+        let one = |body: &str| format!("rule main\n  logic:\n    out = {body}");
+
+        // MILESTONE: \x hex literal — length + byte reads.
+        assert_eq!(run(&one("length(b\"\\x41\\x42\")")), 2, "B2: length(b\"\\x41\\x42\") -> 2");
+        assert_eq!(run(&one("byte_at(b\"\\x41\\x42\", 0)")), 65, "B2: byte 0 -> 0x41");
+        assert_eq!(run(&one("byte_at(b\"\\x41\\x42\", 1)")), 66, "B2: byte 1 -> 0x42");
+        assert_eq!(run(&one("length(b\"\")")), 0, "B2: empty byte literal -> 0");
+        assert_eq!(run(&one("length(b\"\\x0a\")")), 1, "B2: length(b\"\\x0a\") -> 1");
+        assert_eq!(run(&one("byte_at(b\"\\x0a\", 0)")), 10, "B2: \\x0a -> 10");
+
+        // le32 / le64 — little-endian width + bytes.
+        assert_eq!(run(&one("length(le32(5))")), 4, "B2: length(le32(5)) -> 4");
+        assert_eq!(run(&one("byte_at(le32(5), 0)")), 5, "B2: le32(5) byte 0 -> 5");
+        assert_eq!(run(&one("byte_at(le32(5), 1)")), 0, "B2: le32(5) byte 1 -> 0");
+        assert_eq!(run(&one("byte_at(le32(5), 2)")), 0, "B2: le32(5) byte 2 -> 0");
+        assert_eq!(run(&one("byte_at(le32(5), 3)")), 0, "B2: le32(5) byte 3 -> 0");
+        assert_eq!(run(&one("length(le64(1))")), 8, "B2: length(le64(1)) -> 8");
+        assert_eq!(run(&one("byte_at(le64(1), 0)")), 1, "B2: le64(1) byte 0 -> 1");
+        // le32(258) == 0x0102 — proves little-endian byte order.
+        assert_eq!(run(&one("byte_at(le32(258), 0)")), 2, "B2: le32(258) byte 0 -> 2 (low)");
+        assert_eq!(run(&one("byte_at(le32(258), 1)")), 1, "B2: le32(258) byte 1 -> 1 (high)");
+
+        // Bytes-concat — the rope reused with bytes leaves, ZERO new code.
+        assert_eq!(run(&one("length(concat(b\"\\x41\", le32(5)))")), 5,
+            "B2: length(concat(b\"\\x41\", le32(5))) -> 5");
+        assert_eq!(run(&one("byte_at(concat(b\"\\x41\", le32(5)), 0)")), 65,
+            "B2: concat byte 0 -> 0x41 (left VBLit leaf)");
+        assert_eq!(run(&one("byte_at(concat(b\"\\x41\", le32(5)), 1)")), 5,
+            "B2: concat byte 1 -> 5 (crosses into the right VBLe leaf)");
+        // Nested bytes-concat depth >= 3.
+        assert_eq!(run(&one("length(concat(b\"\\x41\", b\"\\x42\", le32(1)))")), 6,
+            "B2: nested bytes-concat length -> 6");
+        assert_eq!(run(&one("byte_at(concat(b\"\\x41\", b\"\\x42\", le32(1)), 2)")), 1,
+            "B2: nested bytes-concat byte 2 -> 1 (le32 low byte)");
+
+        // Non-\x escapes.
+        assert_eq!(run(&one("length(b\"\\n\\t\")")), 2, "B2: length(b\"\\n\\t\") -> 2");
+        assert_eq!(run(&one("byte_at(b\"\\n\\t\", 0)")), 10, "B2: \\n -> 10");
+        assert_eq!(run(&one("byte_at(b\"\\n\\t\", 1)")), 9, "B2: \\t -> 9");
+        assert_eq!(run(&one("byte_at(b\"\\\\\", 0)")), 92, "B2: \\\\ -> 92");
+        assert_eq!(run(&one("byte_at(b\"\\\"\", 0)")), 34, "B2: \\\" -> 34");
+
+        // Hex edge cases: >127 and both letter cases.
+        assert_eq!(run(&one("byte_at(b\"\\xff\", 0)")), 255, "B2: \\xff -> 255");
+        assert_eq!(run(&one("byte_at(b\"\\xFF\", 0)")), 255, "B2: \\xFF -> 255 (uppercase hex)");
+        assert_eq!(run(&one("byte_at(b\"\\xaB\", 0)")), 171, "B2: \\xaB -> 171 (mixed case hex)");
+        // Plain (non-escape) char passes through as its own byte.
+        assert_eq!(run(&one("byte_at(b\"Z\", 0)")), 90, "B2: plain 'Z' -> 90");
+
+        // Defensive: OOB byte_at on both leaf kinds returns 0, exit 0 — no abort.
+        assert_eq!(run(&one("byte_at(b\"\\x41\", 5)")), 0, "B2: OOB VBLit index -> defensive 0");
+        assert_eq!(run(&one("byte_at(le32(5), 9)")), 0, "B2: OOB VBLe index -> defensive 0");
+
+        let _ = std::fs::remove_file(&em);
+    }
+
     /// Text values arc slice 2 — text CODEGEN (packed spans + embedded source).
     /// The self-hosted emitter now COMPILES text: an `AstStr` lowers to ONE packed
     /// i64 push (`(start+1)*2^32 | (len-2)`, quotes stripped — the SAME numbers as
