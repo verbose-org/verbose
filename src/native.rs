@@ -37607,6 +37607,39 @@ rule two
         let _ = fs::remove_file(elf);
     }
 
+    /// B4a — the entry trampoline composes input-marshal WITH bytes/streaming
+    /// output. `elf_program_src` is the first entry that is BOTH text-input AND
+    /// bytes-output; the marshal was gated `has_input && entrytx == 0`, so a
+    /// bytes-output entry skipped reading its input (self-emitted emitter ran on
+    /// no input -> empty ELF). Fixed to `has_input` regardless of entrytx. This
+    /// pins the composition directly: a text-input + bytes-output rule, compiled
+    /// --stdin-raw, reads stdin and emits bytes derived from it.
+    #[test]
+    fn bytes_output_entry_with_text_input_marshals_stdin() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+        let src = "@verbose 0.1.0\n\nconcept In\n  @intention: \"x\"\n  @source: vexprparse.intent:1\n  fields:\n    txt : text\n\nrule main\n  @intention: \"x\"\n  @source: vexprparse.intent:1\n  input:\n    i : In\n  output:\n    out : bytes\n  logic:\n    out = concat(b\"\\x6c\\x65\\x6e\\x3d\", le32(length(i.txt)))\n  proofs:\n    purity:\n      reads : [i.txt]\n      calls : []\n    termination:\n      bound : 4\n";
+        let tokens = crate::lexer::Lexer::new(src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+        let bin = std::env::temp_dir().join("verbosec_test_b4a_tio");
+        compile_native_stdin_raw(&program, "main", bin.to_str().unwrap())
+            .expect("text-input + bytes-output entry must compile --stdin-raw");
+        let mut perms = fs::metadata(&bin).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&bin, perms).unwrap();
+        let mut child = Command::new(&bin).arg("0")
+            .stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped())
+            .spawn().expect("spawn");
+        use std::io::Write;
+        child.stdin.take().unwrap().write_all(b"hello").unwrap();
+        let out = child.wait_with_output().unwrap();
+        // "len=" (6c 65 6e 3d) + le32(5) — the marshal fed stdin into i.txt.
+        assert_eq!(out.stdout, vec![0x6c, 0x65, 0x6e, 0x3d, 0x05, 0x00, 0x00, 0x00],
+            "bytes-output entry must read its text input via the marshal (B4a)");
+        let _ = fs::remove_file(&bin);
+    }
+
     // Regression (2026-07): a text `let`/`read` (BoundText) passed as a text
     // field of a MULTI-FIELD-RECORD call argument used to be refused with
     // "text field '...' in Record constructor for recursive call to '...':
