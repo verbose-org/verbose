@@ -37836,6 +37836,123 @@ rule two
         let _ = fs::remove_file(&self_elf);
     }
 
+    /// THE TWO-GENERATION BOOTSTRAP FIXED POINT (2026-07): the self-hosted
+    /// emitter reproduces its ENTIRE self, byte-for-byte, across two
+    /// generations.
+    ///
+    ///   gen0 = the Rust-compiled `elf_program_src` (the reference emitter).
+    ///   gen1 = gen0(reordered full source)   — the SELF-compiled emitter.
+    ///   gen2 = gen1(reordered full source).
+    ///
+    /// The fixed point: gen1 == gen2 byte-for-byte, i.e. the compiler emitted
+    /// by the compiler emits an identical compiler. (gen1 also == gen0(source)
+    /// by construction, so this is the full circle.)
+    ///
+    /// Before the arena-sizing fix, gen1 SIGSEGV'd emitting the elf_program_src
+    /// closure (285 rules, front end + checker + codegen backend): the
+    /// self-hosted emitter stores EVERY record and variant in one unbounded
+    /// arena (a record `Foo { .. }` parses to AstVariant and is arena-stored),
+    /// and the codegen walk's redundant per-call-site recomputation
+    /// (code_size_node / proc_offset / blob_end_off) makes that ~O(sites x
+    /// program). The FULL self-compile touches ~84M nodes where gen0 (which
+    /// STACK-passes plain-concept records) peaks at ~1.5M. The 1 GiB arena the
+    /// prologue mmap'd overflowed at ~10.3M nodes. Fix: size the self-emitted
+    /// arena at 16 GiB (MAP_NORESERVE, so only the ~8.7 GiB touched at peak
+    /// costs physical RAM) — see the `elf_program_src` arena note in
+    /// examples/vexprparse.verbose.
+    ///
+    /// IGNORED by default: this test needs ~9 GiB of RAM (the arena peak) and
+    /// an unbounded stack (the src_blob recursion over the ~900 KB source), and
+    /// runs for ~30 s. Run it explicitly with:
+    ///   cargo test --release -- --ignored --test-threads=1 two_generation
+    #[test]
+    #[ignore = "needs ~9 GiB RAM + `ulimit -s unlimited` + ~30s; run with --ignored"]
+    #[cfg(target_arch = "x86_64")]
+    fn two_generation_bootstrap_fixed_point() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        let src = fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        // gen0: the Rust-compiled reference emitter (reads program P on stdin, --stdin-raw).
+        let gen0 = std::env::temp_dir().join("verbosec_test_2gen_gen0");
+        compile_native_stdin_raw(&program, "elf_program_src", gen0.to_str().unwrap())
+            .expect("elf_program_src must compile --stdin-raw");
+        let mut perms = fs::metadata(&gen0).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&gen0, perms).unwrap();
+
+        // Reorder: move `rule elf_program_src` to be the first rule so the
+        // self-emitted emitter lays its entry proc at offset 0.
+        let lines: Vec<&str> = src.lines().collect();
+        let start = lines.iter().position(|l| l.starts_with("rule elf_program_src"))
+            .expect("elf_program_src rule");
+        let end = (start + 1..lines.len())
+            .find(|&i| lines[i].starts_with("rule ") || lines[i].starts_with("concept "))
+            .expect("a rule/concept after elf_program_src");
+        let mut block_end = end;
+        while block_end > start && lines[block_end - 1].trim().is_empty() { block_end -= 1; }
+        let block = &lines[start..block_end];
+        let mut rest: Vec<&str> = Vec::new();
+        rest.extend_from_slice(&lines[..start]);
+        rest.extend_from_slice(&lines[end..]);
+        let first_rule = rest.iter().position(|l| l.starts_with("rule ")).expect("a first rule");
+        let mut out: Vec<&str> = Vec::new();
+        out.extend_from_slice(&rest[..first_rule]);
+        out.extend_from_slice(block);
+        out.push("");
+        out.push("");
+        out.extend_from_slice(&rest[first_rule..]);
+        let reordered_src = out.join("\n") + "\n";
+        let reordered = std::env::temp_dir().join("verbosec_test_2gen_reordered.verbose");
+        fs::write(&reordered, &reordered_src).unwrap();
+
+        // Emit `emitter(reordered) -> out_path` under an unbounded stack (the
+        // src_blob recursion over the whole source needs it).
+        let emit = |emitter: &std::path::Path, out_path: &std::path::Path| {
+            let status = Command::new("sh")
+                .arg("-c")
+                .arg(format!(
+                    "ulimit -s unlimited; '{}' 0 < '{}' > '{}'",
+                    emitter.display(), reordered.display(), out_path.display()
+                ))
+                .status()
+                .expect("emit via sh");
+            assert!(status.success(),
+                "emitter {:?} must exit 0 emitting the full reordered source", emitter);
+        };
+
+        // gen1 = gen0(reordered).
+        let gen1 = std::env::temp_dir().join("verbosec_test_2gen_gen1.elf");
+        emit(&gen0, &gen1);
+        let mut perms = fs::metadata(&gen1).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&gen1, perms).unwrap();
+        let gen1_bytes = fs::read(&gen1).unwrap();
+        assert_eq!(&gen1_bytes[0..4], &[0x7f, 0x45, 0x4c, 0x46],
+            "gen1 (the self-compiled emitter) must itself be an ELF");
+
+        // gen2 = gen1(reordered) — the self-compiled emitter emitting its own self.
+        let gen2 = std::env::temp_dir().join("verbosec_test_2gen_gen2.elf");
+        emit(&gen1, &gen2);
+        let gen2_bytes = fs::read(&gen2).unwrap();
+
+        // THE FIXED POINT.
+        assert_eq!(gen1_bytes, gen2_bytes,
+            "two-generation fixed point: gen1(source) == gen2(source) byte-for-byte \
+             (gen1={} B, gen2={} B) — the compiler must reproduce its entire self",
+            gen1_bytes.len(), gen2_bytes.len());
+
+        let _ = fs::remove_file(&gen0);
+        let _ = fs::remove_file(&reordered);
+        let _ = fs::remove_file(&gen1);
+        let _ = fs::remove_file(&gen2);
+    }
+
     // Regression (2026-07): a text `let`/`read` (BoundText) passed as a text
     // field of a MULTI-FIELD-RECORD call argument used to be refused with
     // "text field '...' in Record constructor for recursive call to '...':
