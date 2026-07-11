@@ -112,12 +112,31 @@
 -- Raised to the verifier's hard ceiling (4 000 000, see
 -- docs/arena-allocation-design.md) -- ~63% headroom over the current largest
 -- self-host target.
--- ponytail: 4 000 000 is the compiler's max_nodes ceiling; the FULL 509-rule
--- self-compile (~7M nodes) needs BOTH a higher verifier ceiling AND a real fix
--- for the O(sites x program) redundant arena allocation (thread the constant
--- blob_end_off / proc_offset results through ByteGenState instead of
--- recomputing per call site, or add arena reclamation). Neither is needed for
--- the current self-checker milestone.
+-- ponytail: 6 000 000 is the RUST-backend (gen0) arena bound — the max_nodes
+-- the verifier carries and the Rust native emitter mmaps (6M * entry_size).
+-- gen0 STACK-passes plain-concept records (ByteGenState / ProgGenState / ...),
+-- so it never arena-allocates the codegen walk's transients; its peak for the
+-- FULL self-compile is ~1.5M nodes, well under 6M.
+--
+-- The SELF-HOSTED emitter (elf_program_src) uses ONE unified arena for every
+-- record AND variant (a record `Foo { .. }` parses to AstVariant(Foo, Foo, ..)
+-- and is stored in the arena just like a variant — see max_payload_fields /
+-- program_uses_arena). It therefore arena-allocates every intermediate
+-- ByteGenState the codegen walk builds, and the arena never reclaims. The
+-- redundant per-call-site recomputation (code_size_node re-walking overlapping
+-- subtrees for offset threading; proc_offset / blob_end_off re-walking the
+-- program per call site) makes that allocation O(sites x program): the FULL
+-- two-generation self-compile of the elf_program_src closure (front end +
+-- checker + codegen backend) touches ~84M nodes. The self-emitted binary's
+-- arena mmap is therefore sized at 16 GiB (0x400000000, MAP_NORESERVE so only
+-- touched pages — ~8.7 GiB at peak — cost physical RAM); the literal lives in
+-- elf_program_src's ELF prologue, and blob_end_off counts it as 66 bytes.
+-- This lets gen1 emit its ENTIRE self: gen1(reordered source) == gen0(reordered
+-- source) BYTE-FOR-BYTE (== gen1), and gen2 == gen1 — the two-generation fixed
+-- point. The REAL fix (drop the arena to ~single-digit-M by threading the
+-- constant blob_end_off / proc_offset through ByteGenState and/or adding arena
+-- reclamation between top-level procs) is the documented next chantier — it
+-- would shrink the 8.7 GiB peak, not change the byte-identical output.
 -- ============================================================================
 concept_group VExpr [max_depth: 4096, max_nodes: 6000000]
   @intention: "Tokens, a token cons-list, an arithmetic AST, and a parse result"
@@ -17924,7 +17943,7 @@ rule ps_total
 
 
 -- blob_end_off: the file offset where the program blob ENDS = ELF headers (120)
--- + the optional 61-byte mmap arena prologue + the trampoline (101 B for a
+-- + the optional 66-byte mmap arena prologue + the trampoline (101 B for a
 -- number entry, 45 B for a texty entry — streaming slice) + the shared
 -- itoa_proc (86 B, present iff any rule is texty) + the blob itself. Text
 -- values slice 2: this is ALSO the file offset where the embedded source
@@ -17945,7 +17964,7 @@ rule blob_end_off
     let efields = params_to_fields(entry_params)
     let ecfields = cd_fields(concept_at_index(ConceptAtState { concepts: pg.concepts, idx: find_concept_index(FindConceptIdxState { concepts: pg.concepts, src: pg.src, q_start: fl_head_ty_start(efields), q_len: fl_head_ty_len(efields), idx: 0 }) }))
     let msize = if has_input == 1 then (if field_list_has_text(ecfields) == 1 then stdin_marshal_size(ecfields) else argv_marshal_size(ecfields)) else 0
-    out = 120 + (if program_uses_arena(pg.concepts) == 1 then 61 else 0) + (if entry_rule_bytes(pg) == 1 then 17 else if entry_rule_texty(pg) == 1 then 45 else 101) + (if prog_any_texty(pg) == 1 then 86 else 0) + msize + ps_total(pg.sizes)
+    out = 120 + (if program_uses_arena(pg.concepts) == 1 then 66 else 0) + (if entry_rule_bytes(pg) == 1 then 17 else if entry_rule_texty(pg) == 1 then 45 else 101) + (if prog_any_texty(pg) == 1 then 86 else 0) + msize + ps_total(pg.sizes)
   proofs:
     purity:
       reads : [pg, pg.rules, pg.src, pg.concepts, pg.sizes]
@@ -18395,7 +18414,7 @@ rule elf_program_src
     let has_input = if param_list_len(entry_params) > 0 then 1 else 0
     let efields = params_to_fields(entry_params)
     let ecidx = find_concept_index(FindConceptIdxState { concepts: concepts, src: s.source, q_start: fl_head_ty_start(efields), q_len: fl_head_ty_len(efields), idx: 0 })
-    out = concat(b"\x7f\x45\x4c\x46\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\x3e\x00\x01\x00\x00\x00\x78\x00\x40\x00\x00\x00\x00\x00\x40\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x40\x00\x38\x00\x01\x00\x00\x00\x00\x00\x00\x00", b"\x01\x00\x00\x00\x05\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x40\x00\x00\x00\x00\x00\x00\x00\x40\x00\x00\x00\x00\x00", le64(fsz), le64(fsz), b"\x00\x10\x00\x00\x00\x00\x00\x00", (if uses_var == 1 then b"\xb8\x09\x00\x00\x00\x31\xff\xbe\x00\x00\x00\x40\xba\x03\x00\x00\x00\x41\xba\x22\x00\x00\x00\x49\xc7\xc0\xff\xff\xff\xff\x45\x31\xc9\x0f\x05\x48\x3d\x01\xf0\xff\xff\x72\x0c\xbf\x01\x00\x00\x00\xb8\x3c\x00\x00\x00\x0f\x05\x49\x89\xc7\x45\x31\xf6" else b""), (if has_input == 1 then (if field_list_has_text(cd_fields(concept_at_index(ConceptAtState { concepts: concepts, idx: ecidx }))) == 1 then x86_stdin_marshal(ArgvTrampState { fields: cd_fields(concept_at_index(ConceptAtState { concepts: concepts, idx: ecidx })), src: s.source, prog: prog, concepts: concepts, sizes: sizes, cidx: ecidx }) else x86_argv_marshal(ArgvTrampState { fields: cd_fields(concept_at_index(ConceptAtState { concepts: concepts, idx: ecidx })), src: s.source, prog: prog, concepts: concepts, sizes: sizes, cidx: ecidx })) else b""), (if entrybytes == 1 then concat(b"\xe8", le32(12 + (if anytx == 1 then 86 else 0)), b"\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05") else if entrytx == 1 then b"\xe8\x7e\x00\x00\x00\x6a\x0a\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x48\x89\xe6\x48\xc7\xc2\x01\x00\x00\x00\x0f\x05\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05" else concat(b"\xe8", le32(96 + (if anytx == 1 then 86 else 0)), b"\x48\x83\xec\x20\x49\x89\xc1\x48\x8d\x74\x24\x1f\xc6\x06\x0a\x48\x85\xc0\x79\x03\x48\xf7\xd8\x48\xc7\xc1\x0a\x00\x00\x00\x48\x31\xd2\x48\xf7\xf1\x80\xc2\x30\x48\xff\xce\x88\x16\x48\x85\xc0\x75\xed\x4d\x85\xc9\x79\x06\x48\xff\xce\xc6\x06\x2d\x48\x8d\x54\x24\x20\x48\x29\xf2\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05")), (if anytx == 1 then b"\x48\x83\xec\x28\x49\x89\xc1\x48\x8d\x74\x24\x20\x48\x85\xc0\x79\x03\x48\xf7\xd8\x48\xc7\xc1\x0a\x00\x00\x00\x48\x31\xd2\x48\xf7\xf1\x80\xc2\x30\x48\xff\xce\x88\x16\x48\x85\xc0\x75\xed\x4d\x85\xc9\x79\x06\x48\xff\xce\xc6\x06\x2d\x48\x8d\x54\x24\x20\x48\x29\xf2\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05\x48\x83\xc4\x28\xc3" else b""), x86_program(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: sizes }), (if uses_text == 1 then src_blob(SrcBlobState { src: s.source, pos: 0 }) else b""))
+    out = concat(b"\x7f\x45\x4c\x46\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\x3e\x00\x01\x00\x00\x00\x78\x00\x40\x00\x00\x00\x00\x00\x40\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x40\x00\x38\x00\x01\x00\x00\x00\x00\x00\x00\x00", b"\x01\x00\x00\x00\x05\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x40\x00\x00\x00\x00\x00\x00\x00\x40\x00\x00\x00\x00\x00", le64(fsz), le64(fsz), b"\x00\x10\x00\x00\x00\x00\x00\x00", (if uses_var == 1 then b"\xb8\x09\x00\x00\x00\x31\xff\x48\xbe\x00\x00\x00\x00\x04\x00\x00\x00\xba\x03\x00\x00\x00\x41\xba\x22\x40\x00\x00\x49\xc7\xc0\xff\xff\xff\xff\x45\x31\xc9\x0f\x05\x48\x3d\x01\xf0\xff\xff\x72\x0c\xbf\x01\x00\x00\x00\xb8\x3c\x00\x00\x00\x0f\x05\x49\x89\xc7\x45\x31\xf6" else b""), (if has_input == 1 then (if field_list_has_text(cd_fields(concept_at_index(ConceptAtState { concepts: concepts, idx: ecidx }))) == 1 then x86_stdin_marshal(ArgvTrampState { fields: cd_fields(concept_at_index(ConceptAtState { concepts: concepts, idx: ecidx })), src: s.source, prog: prog, concepts: concepts, sizes: sizes, cidx: ecidx }) else x86_argv_marshal(ArgvTrampState { fields: cd_fields(concept_at_index(ConceptAtState { concepts: concepts, idx: ecidx })), src: s.source, prog: prog, concepts: concepts, sizes: sizes, cidx: ecidx })) else b""), (if entrybytes == 1 then concat(b"\xe8", le32(12 + (if anytx == 1 then 86 else 0)), b"\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05") else if entrytx == 1 then b"\xe8\x7e\x00\x00\x00\x6a\x0a\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x48\x89\xe6\x48\xc7\xc2\x01\x00\x00\x00\x0f\x05\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05" else concat(b"\xe8", le32(96 + (if anytx == 1 then 86 else 0)), b"\x48\x83\xec\x20\x49\x89\xc1\x48\x8d\x74\x24\x1f\xc6\x06\x0a\x48\x85\xc0\x79\x03\x48\xf7\xd8\x48\xc7\xc1\x0a\x00\x00\x00\x48\x31\xd2\x48\xf7\xf1\x80\xc2\x30\x48\xff\xce\x88\x16\x48\x85\xc0\x75\xed\x4d\x85\xc9\x79\x06\x48\xff\xce\xc6\x06\x2d\x48\x8d\x54\x24\x20\x48\x29\xf2\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05")), (if anytx == 1 then b"\x48\x83\xec\x28\x49\x89\xc1\x48\x8d\x74\x24\x20\x48\x85\xc0\x79\x03\x48\xf7\xd8\x48\xc7\xc1\x0a\x00\x00\x00\x48\x31\xd2\x48\xf7\xf1\x80\xc2\x30\x48\xff\xce\x88\x16\x48\x85\xc0\x75\xed\x4d\x85\xc9\x79\x06\x48\xff\xce\xc6\x06\x2d\x48\x8d\x54\x24\x20\x48\x29\xf2\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05\x48\x83\xc4\x28\xc3" else b""), x86_program(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: sizes }), (if uses_text == 1 then src_blob(SrcBlobState { src: s.source, pos: 0 }) else b""))
   proofs:
     purity:
       reads : [s.source]
