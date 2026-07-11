@@ -37640,6 +37640,202 @@ rule two
         let _ = fs::remove_file(&bin);
     }
 
+    /// B4b (root-cause guard) — the self-hosted emitter lowers the `max`/`min`
+    /// binary builtin. Before B4b, `vexprparse.verbose`'s x86_node / code_size_node
+    /// had NO span dispatch for max/min, so `max(a, b)` fell through to the general
+    /// real-call path: proc_offset("max") walks the rule list, finds no "max" rule,
+    /// and returns its missing-callee fallback (the total proc size = the byte offset
+    /// of the appended source blob). The emitted `call` therefore jumped INTO the
+    /// source data and SIGSEGV'd. This bit variant/record self-emit specifically,
+    /// because the emitter's OWN arena-arity helpers (max_variant_fields /
+    /// concept_arena_arity / max_payload_fields) use max(a, b) to size the node
+    /// arena. Fix: span_is_max / span_is_min + a cmp+cmov lowering in x86_node
+    /// (mirrored in code_size_node). Here we compile the self-hosted emitter and
+    /// feed it programs that USE max/min — the emitted ELF must run and print the
+    /// right answer, not crash.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn b4b_self_hosted_emitter_lowers_max_min_builtin() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        let src = fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let elf = std::env::temp_dir().join("verbosec_test_b4b_maxmin_emitter");
+        compile_native(&program, "elf_program_src", elf.to_str().unwrap(), false, false)
+            .expect("elf_program_src must compile natively");
+
+        // Emit an ELF for `prog_src` via the self-hosted emitter, run it, return trimmed stdout.
+        let emit_and_run = |prog_src: &str, tag: &str| -> String {
+            let mc = Command::new(&elf).args([prog_src, "0"]).output().expect("spawn emitter");
+            assert!(mc.status.success(), "emitter must exit 0 for {}; got {:?}", tag, mc.status);
+            assert_eq!(&mc.stdout[0..4], &[0x7f, 0x45, 0x4c, 0x46], "not ELF for {}", tag);
+            let out_path = std::env::temp_dir().join(format!("verbosec_test_b4b_maxmin_out_{}", tag));
+            fs::write(&out_path, &mc.stdout).expect("write a.out");
+            let mut perms = fs::metadata(&out_path).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&out_path, perms).expect("chmod +x");
+            let r = Command::new(&out_path).arg("0").output().expect("run emitted ELF");
+            assert!(r.status.success(),
+                "emitted max/min ELF for {} must exit 0 (pre-B4b it SIGSEGV'd on the bad call); got {:?}",
+                tag, r.status);
+            let _ = fs::remove_file(&out_path);
+            String::from_utf8_lossy(&r.stdout).trim().to_string()
+        };
+
+        assert_eq!(emit_and_run("rule main\n  logic:\n    out = max(3, 9)", "max"), "9",
+            "self-hosted emitter must lower max(3, 9) to 9");
+        assert_eq!(emit_and_run("rule main\n  logic:\n    out = min(3, 9)", "min"), "3",
+            "self-hosted emitter must lower min(3, 9) to 3");
+        let _ = fs::remove_file(elf);
+    }
+
+    /// B4b (the fixed point) — FULL semantic self-reproduction for record /
+    /// variant / match / recursion. Reorder `elf_program_src` to be the first
+    /// rule, self-emit the WHOLE reordered source through the Rust-compiled
+    /// emitter (this is the self-compiled emitter `self.elf`), then assert that
+    /// for a spread of programs P the self-compiled emitter produces a
+    /// BYTE-IDENTICAL ELF to the Rust-compiled emitter — and that the emitted ELF
+    /// RUNS correctly. Before B4b, record/variant construction self-emitted
+    /// TRUNCATED (self.elf crashed inside its own max_payload_fields while sizing
+    /// the arena); now every covered construct reproduces bit-for-bit.
+    ///
+    /// The self-emit step feeds the ~850 KB reordered source to the emitter, whose
+    /// src_blob recursion is one native frame per 4 source bytes — deeper than the
+    /// default 8 MB stack, so that ONE step runs under `sh -c 'ulimit -s unlimited'`.
+    /// Compiling the tiny target programs P needs no such raise.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn b4b_semantic_self_reproduction_record_variant_match() {
+        use std::fs;
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::{Command, Stdio};
+
+        let src = fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        // The Rust-compiled reference emitter (reads program P from stdin --stdin-raw).
+        let emit_rust = std::env::temp_dir().join("verbosec_test_b4b_emit_rust");
+        compile_native_stdin_raw(&program, "elf_program_src", emit_rust.to_str().unwrap())
+            .expect("elf_program_src must compile --stdin-raw");
+        let mut perms = fs::metadata(&emit_rust).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&emit_rust, perms).unwrap();
+
+        // Reorder: move the `rule elf_program_src` block to be the first rule so
+        // the self-emitted emitter lays it at offset 0 (the entry proc).
+        let lines: Vec<&str> = src.lines().collect();
+        let start = lines.iter().position(|l| l.starts_with("rule elf_program_src"))
+            .expect("elf_program_src rule");
+        let end = (start + 1..lines.len())
+            .find(|&i| lines[i].starts_with("rule ") || lines[i].starts_with("concept "))
+            .expect("a rule/concept after elf_program_src");
+        let mut block_end = end;
+        while block_end > start && lines[block_end - 1].trim().is_empty() { block_end -= 1; }
+        let block = &lines[start..block_end];
+        let mut rest: Vec<&str> = Vec::new();
+        rest.extend_from_slice(&lines[..start]);
+        rest.extend_from_slice(&lines[end..]);
+        let first_rule = rest.iter().position(|l| l.starts_with("rule ")).expect("a first rule");
+        let mut out: Vec<&str> = Vec::new();
+        out.extend_from_slice(&rest[..first_rule]);
+        out.extend_from_slice(block);
+        out.push("");
+        out.push("");
+        out.extend_from_slice(&rest[first_rule..]);
+        let reordered_src = out.join("\n") + "\n";
+        let reordered = std::env::temp_dir().join("verbosec_test_b4b_reordered.verbose");
+        fs::write(&reordered, &reordered_src).unwrap();
+
+        // Self-emit: the emitter compiles the full reordered source into self.elf.
+        // Big stack for the src_blob recursion over the 850 KB source.
+        let self_elf = std::env::temp_dir().join("verbosec_test_b4b_self.elf");
+        let status = Command::new("sh")
+            .arg("-c")
+            .arg(format!(
+                "ulimit -s unlimited; '{}' 0 < '{}' > '{}'",
+                emit_rust.display(), reordered.display(), self_elf.display()
+            ))
+            .status()
+            .expect("self-emit via sh");
+        assert!(status.success(), "self-emit of the reordered emitter must succeed");
+        let mut perms = fs::metadata(&self_elf).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&self_elf, perms).unwrap();
+        assert_eq!(&fs::read(&self_elf).unwrap()[0..4], &[0x7f, 0x45, 0x4c, 0x46],
+            "self-compiled emitter must itself be an ELF");
+
+        // Compile program P through a given emitter (P fed on stdin), return the ELF bytes.
+        let compile_p = |emitter: &std::path::Path, p: &str| -> Vec<u8> {
+            let mut child = Command::new(emitter)
+                .arg("0")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .expect("spawn emitter");
+            child.stdin.take().unwrap().write_all(p.as_bytes()).unwrap();
+            let o = child.wait_with_output().unwrap();
+            assert!(o.status.success(), "emitter must exit 0 compiling P");
+            o.stdout
+        };
+
+        // Run an emitted ELF, return trimmed stdout.
+        let run_elf = |bytes: &[u8], tag: &str| -> String {
+            let path = std::env::temp_dir().join(format!("verbosec_test_b4b_run_{}", tag));
+            fs::write(&path, bytes).unwrap();
+            let mut perms = fs::metadata(&path).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&path, perms).unwrap();
+            let o = Command::new(&path).arg("0").output().expect("run emitted P");
+            assert!(o.status.success(), "self-emitted ELF for {} must exit 0", tag);
+            let _ = fs::remove_file(&path);
+            String::from_utf8_lossy(&o.stdout).trim().to_string()
+        };
+
+        // (program source, expected run output). Covers the previously-passing
+        // shapes plus the B4b targets: record construct, variant construct,
+        // recursion, and variant + match.
+        let cases: &[(&str, &str, &str)] = &[
+            ("scalar", "rule main\n  logic:\n    out = 2 + 3", "5"),
+            ("ifelse", "rule main\n  logic:\n    out = if 1 == 1 then 7 else 9", "7"),
+            ("call", "rule main\n  logic:\n    out = g(5)\nrule g(x)\n  logic:\n    out = x + 1", "6"),
+            ("record",
+             "concept St\n  fields:\n    n : number\nrule main\n  logic:\n    out = g(St { n: 5 })\nrule g(s : St)\n  logic:\n    out = s.n",
+             "5"),
+            ("variant",
+             "concept_group L [max_depth: 8, max_nodes: 64]\n  concept Lst\n    variants:\n      Cons of (head : number, tail : Lst)\n      Nil\nrule main\n  logic:\n    out = Lst::Cons { head: 42, tail: Lst::Nil }",
+             "1"),
+            ("recgo",
+             "concept St\n  fields:\n    n : number\nrule main\n  logic:\n    out = go(St { n: 5 })\nrule go(s : St)\n  logic:\n    out = if s.n == 0 then 42 else go(St { n: s.n - 1 })",
+             "42"),
+            ("match",
+             "concept_group L [max_depth: 8, max_nodes: 64]\n  concept Lst\n    variants:\n      Cons of (head : number, tail : Lst)\n      Nil\nrule main\n  logic:\n    out = sum_list(Lst::Cons { head: 10, tail: Lst::Cons { head: 20, tail: Lst::Nil } })\nrule sum_list(l : Lst)\n  logic:\n    out = match l:\n      Cons(head, tail) => head + sum_list(tail)\n      Nil => 0",
+             "30"),
+        ];
+
+        for (tag, p, expected) in cases {
+            let rust_bytes = compile_p(&emit_rust, p);
+            let self_bytes = compile_p(&self_elf, p);
+            assert_eq!(rust_bytes, self_bytes,
+                "B4b fixed point: self-compiled emitter must produce a BYTE-IDENTICAL ELF \
+                 to the Rust-compiled emitter for {} (rust={} B, self={} B)",
+                tag, rust_bytes.len(), self_bytes.len());
+            assert_eq!(run_elf(&self_bytes, tag), *expected,
+                "self-emitted ELF for {} must run correctly", tag);
+        }
+
+        let _ = fs::remove_file(&emit_rust);
+        let _ = fs::remove_file(&reordered);
+        let _ = fs::remove_file(&self_elf);
+    }
+
     // Regression (2026-07): a text `let`/`read` (BoundText) passed as a text
     // field of a MULTI-FIELD-RECORD call argument used to be refused with
     // "text field '...' in Record constructor for recursive call to '...':
