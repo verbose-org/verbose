@@ -415,6 +415,10 @@ fn eval_expr(
                 }),
             }
         }
+        // `arena_scope(inner)` — identity for the value. The interpreter has
+        // no arena, so the reclaim is a no-op; the emitted-vs-interpreted
+        // contract is that arena_scope produces exactly inner's value.
+        Expr::ArenaScope(inner) => eval_expr(inner, env, all_rules, concepts),
         Expr::Quantifier(kind, collection, var_name, predicate) => {
             let coll_val = eval_expr(collection, env, all_rules, concepts)?;
             let items = match coll_val {

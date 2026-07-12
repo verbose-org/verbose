@@ -719,6 +719,23 @@ pub enum Expr {
     /// `max(<a>, <b>)` — binary scalar maximum, returns Number. Same
     /// disambiguation rule and shape as Min. Native: `cmp + cmovl`.
     Max(Box<Expr>, Box<Expr>),
+    /// `arena_scope(<bytes_expr>)` — a declared, verified arena-reclaim
+    /// boundary for the streaming bytes emitter. In a streaming-bytes
+    /// position it saves the arena node-count, streams the inner
+    /// expression's bytes UNCHANGED, then restores the node-count —
+    /// reclaiming every arena node the inner expression allocated. The
+    /// emitted OUTPUT bytes are byte-for-byte identical to the inner
+    /// expression alone; the ONLY effect is that the inner's transient
+    /// arena allocations are released afterward. Sound because the inner
+    /// value is bytes that are streamed (consumed) before the reset, and
+    /// Verbose purity guarantees the inner allocated nothing reachable
+    /// after its return.
+    ///
+    /// Restricted to a bytes-returning (streaming) position — a stored /
+    /// let-bound result would dangle after the reset. Programs that do not
+    /// use `arena_scope` are unaffected (purely additive). See
+    /// docs/self-hosting-arena-scope-design.md.
+    ArenaScope(Box<Expr>),
     /// `band(<a>, <b>)` — bitwise AND on Number args. Native: `and rax, rcx`.
     BitAnd(Box<Expr>, Box<Expr>),
     /// `bor(<a>, <b>)` — bitwise OR on Number args. Native: `or rax, rcx`.
