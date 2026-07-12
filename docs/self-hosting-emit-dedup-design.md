@@ -1,5 +1,39 @@
 # Emit-memory dedup — the self-hosted emitter stops re-walking the program per node
 
+> **OUTCOME (2026-07-12, measured): slice 1 gave ZERO benefit — abandoned.**
+> Threading `blob_end` as a precomputed constant was byte-behavior-preserving
+> (output identical, valid new fixed point) but the self-hosted gen1 STILL peaked
+> at ~8.9 GB (baseline 8.7 GB — marginally worse, wider state records). The
+> subagent's reported "62× win" was a **measurement artifact**: it measured gen0
+> (the Rust backend, ~140 MB regardless — it *compiles* `blob_end_off`, never
+> *runs* it), not gen1 (the self-hosted binary that executes it at runtime).
+> Root cause of the mis-rank: `blob_end_off` fires only at `byte_at`/`AstStr`/
+> `AstVar`-text emit sites, which are RARE in the self-source — removing its
+> recompute saved almost nothing.
+>
+> **The real finding — it's the arena model, not any one recompute.** Verbose has
+> no loops: every list traversal is recursion, and each recursive step constructs
+> its argument record = one arena node. The arena never reclaims. So `proc_offset`
+> (scan the rule list) and `code_size_node` (walk a subtree) each allocate O(len)
+> nodes *per call site*, and a name→offset TABLE does NOT help — the table lookup
+> is itself a recursive alloc-per-step scan. Neutering either to profile is
+> invalid: they compute the call offsets IN the self-emitted binary, so any change
+> corrupts gen1's own control flow (neutering `proc_offset` sent gen1 to 26.7 GB /
+> 2 min — a broken binary looping, not a clean measurement).
+>
+> **The principled fix is arena RECLAIM between top-level procs, not per-recompute
+> dedup.** The emit streams its output bytes (`emit_bytes_program`), so once a
+> proc's bytes are written its walk-transients are dead. Reset the arena bump
+> pointer to a post-parse checkpoint after each top-level proc → working set
+> collapses to one proc's transients (≈ the 140 MB the Rust backend achieves).
+> This needs a new arena-scope primitive (native.rs runtime support + a Verbose
+> surface), i.e. a real feature, not a slice — its own design + session.
+>
+> Everything below is the (now-abandoned) slice-1 plan, kept for the record.
+
+---
+
+
 ## The waste (grounded, measured)
 gen0 (verbosec's Rust backend emitting `elf_program_src`) peaks **140 MB / 1.5 s**
 emitting the full 855 KB self-source. gen1 (the SELF-hosted emitter, same

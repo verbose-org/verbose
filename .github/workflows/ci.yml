@@ -49,3 +49,37 @@ jobs:
 
       - name: Benchmark
         run: cargo run -- examples/invoices.verbose --benchmark --run important_invoice
+
+  # The self-hosting crown jewel: the compiler emitted by the compiler reproduces
+  # its entire self byte-for-byte (R0 fixed point), emits the whole real source
+  # with no reorder (R1), and its emitted binaries run correct across the construct
+  # space (R2). Dedicated job: the self-hosted emitter (gen1) peaks ~8.7 GiB
+  # emitting the full source (arena model — see docs/self-hosting-emit-dedup-design.md),
+  # which fits the 16 GiB ubuntu-latest runner but must not share the parallel test
+  # job's memory. ~70 s in release. Runs on push to main (post-merge gate); will
+  # gate PRs once the emit-memory arena-reclaim chantier lands and it is CI-cheap.
+  self-hosting-bootstrap:
+    name: Self-hosting bootstrap validation
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Two-generation bootstrap (R0 fixed point + R1 whole-source + R2 corpus)
+        # ulimit -s unlimited: the emit recurses over the ~855 KB source (src_blob).
+        # The test's own emit shell-outs also raise it, so this is belt-and-suspenders.
+        run: |
+          ulimit -s unlimited
+          cargo test --release -- --ignored --test-threads=1 two_generation_bootstrap_fixed_point
