@@ -1340,6 +1340,23 @@ impl Parser {
                 } else {
                     Ok(Expr::Le32(Box::new(inner)))
                 }
+            } else if name == "arena_scope" && self.check_kind(&TokenKind::LParen) {
+                // `arena_scope(<bytes_expr>)` — a declared arena-reclaim
+                // boundary for the streaming bytes emitter. Exactly one
+                // argument; same arity-check shape as abs / le32. The
+                // verifier checks the inner is bytes-typed and that this
+                // sits in a bytes context; native emits save/reset of the
+                // arena node-count around the streamed inner.
+                self.advance(); // (
+                if self.check_kind(&TokenKind::RParen) {
+                    return Err(self.error("arena_scope requires exactly one argument, got zero"));
+                }
+                let inner = self.parse_expr()?;
+                if self.check_kind(&TokenKind::Comma) {
+                    return Err(self.error("arena_scope requires exactly one argument, got more than one"));
+                }
+                self.expect_kind(TokenKind::RParen)?;
+                Ok(Expr::ArenaScope(Box::new(inner)))
             } else if (name == "band" || name == "bor" || name == "bxor"
                        || name == "shl" || name == "shr")
                       && self.check_kind(&TokenKind::LParen) {

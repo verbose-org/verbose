@@ -251,6 +251,7 @@ fn emit_expr(expr: &Expr, input_name: &str, concept: Option<&Concept>) -> String
         | Expr::Bytes(_)
         | Expr::Le32(_)
         | Expr::Le64(_)
+        | Expr::ArenaScope(_)
         | Expr::ByteAt(_, _) => {
             "(/* collection/result/record/variant/match/concat/read/fetch/json_escape/parse_int/now_unix/starts_with/contains/ends_with/length/abs/min/max/substring/byte_at/bytes/le32/le64/fold_bytes op: use --run interpreter or --native */false)".to_string()
         }

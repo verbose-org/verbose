@@ -1,5 +1,19 @@
 # `arena_scope` — a declared, verified reclaim boundary for the streaming emitter
 
+> **OUTCOME (2026-07-12, measured, verified from clean disk): SHIPPED — 8.7 GB → 2.55 GB (3.43×), 20 s → 3.7 s.**
+> gen1 (the self-hosted emitter) peaks 2.55 GB emitting the full 855 KB source
+> (was 8.7 GB); gen1==gen2 byte-identical (sha `d65f9b44`); suite 450 green
+> (existing binaries byte-identical = additivity); output-preservation holds
+> (emitted ELFs run correct across arith/recursion/variant+match). The two-gen
+> test (R0+R1+R2) now runs in 10.6 s (was 71 s) — cheap enough to gate PRs.
+> The 3.43× (not the aspirational ~9×) is EXACTLY as "Honest expectation" below
+> predicted: `arena_scope` reclaims BETWEEN procs, but the biggest proc
+> (`x86_node`) still pays `code_size_node`'s O(n²) WITHIN its own scope, which a
+> proc-boundary scope cannot reclaim. The documented follow-on — a scalar-result
+> `arena_scope` around `code_size_node(x)` (the number survives a reset; its walk
+> intermediates don't) — would take it further toward the ~544 MB parse-tree floor.
+
+
 ## Why
 The self-hosted emitter (gen1) peaks **8.7 GB** emitting the full 855 KB source;
 gen0 (Rust) does the same job in 140 MB. Root cause (measured, see

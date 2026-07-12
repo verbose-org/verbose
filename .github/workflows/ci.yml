@@ -53,15 +53,13 @@ jobs:
   # The self-hosting crown jewel: the compiler emitted by the compiler reproduces
   # its entire self byte-for-byte (R0 fixed point), emits the whole real source
   # with no reorder (R1), and its emitted binaries run correct across the construct
-  # space (R2). Dedicated job: the self-hosted emitter (gen1) peaks ~8.7 GiB
-  # emitting the full source (arena model — see docs/self-hosting-emit-dedup-design.md),
-  # which fits the 16 GiB ubuntu-latest runner but must not share the parallel test
-  # job's memory. ~70 s in release. Runs on push to main (post-merge gate); will
-  # gate PRs once the emit-memory arena-reclaim chantier lands and it is CI-cheap.
+  # space (R2). Dedicated job (kept off the parallel test job so it doesn't share
+  # its memory). Since the arena_scope reclaim landed the self-hosted emitter peaks
+  # ~2.55 GiB / ~11 s (was 8.7 GiB / 70 s — see docs/self-hosting-arena-scope-design.md),
+  # cheap enough to GATE PRs, not just post-merge. Runs on push AND pull_request.
   self-hosting-bootstrap:
     name: Self-hosting bootstrap validation
     runs-on: ubuntu-latest
-    if: github.event_name == 'push'
     steps:
       - uses: actions/checkout@v4
 

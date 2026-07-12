@@ -1123,7 +1123,7 @@ fn collect_read_names_native(expr: &Expr, out: &mut Vec<String>) {
         // `length(<text_expr>)` — pure pass-through.
         Expr::Length(inner) => collect_read_names_native(inner, out),
         // `abs(<number_expr>)` — pure pass-through.
-        Expr::Abs(inner) | Expr::BitNot(inner) | Expr::Le32(inner) | Expr::Le64(inner) => collect_read_names_native(inner, out),
+        Expr::Abs(inner) | Expr::BitNot(inner) | Expr::Le32(inner) | Expr::Le64(inner) | Expr::ArenaScope(inner) => collect_read_names_native(inner, out),
         // `min(a, b)` / `max(a, b)` — recurse into both children; either
         // side may carry a `read(...)` reference.
         Expr::Min(l, r) | Expr::Max(l, r) | Expr::BitAnd(l, r) | Expr::BitOr(l, r) | Expr::BitXor(l, r) | Expr::Shl(l, r) | Expr::Shr(l, r) => {
@@ -1182,7 +1182,7 @@ fn expr_uses_now_unix(e: &Expr) -> bool {
         Expr::Field(b, _) => expr_uses_now_unix(b),
         Expr::Binary(_, l, r) => expr_uses_now_unix(l) || expr_uses_now_unix(r),
         Expr::Not(i) | Expr::Neg(i) | Expr::Ok(i) | Expr::Err(i) => expr_uses_now_unix(i),
-        Expr::JsonEscape(i) | Expr::ParseInt(i) | Expr::Length(i) | Expr::Abs(i) | Expr::BitNot(i) | Expr::Le32(i) | Expr::Le64(i) => expr_uses_now_unix(i),
+        Expr::JsonEscape(i) | Expr::ParseInt(i) | Expr::Length(i) | Expr::Abs(i) | Expr::BitNot(i) | Expr::Le32(i) | Expr::Le64(i) | Expr::ArenaScope(i) => expr_uses_now_unix(i),
         Expr::If(c, t, el) => {
             expr_uses_now_unix(c) || expr_uses_now_unix(t) || expr_uses_now_unix(el)
         }
@@ -1285,7 +1285,7 @@ fn count_match_result_max_depth(expr: &Expr) -> usize {
                 .max(count_match_result_max_depth(e))
         }
         Expr::Ok(i) | Expr::Err(i) | Expr::Not(i) | Expr::Neg(i) | Expr::Abs(i) | Expr::BitNot(i)
-        | Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i) | Expr::Le32(i) | Expr::Le64(i) => {
+        | Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i) | Expr::Le32(i) | Expr::Le64(i) | Expr::ArenaScope(i) => {
             count_match_result_max_depth(i)
         }
         Expr::Binary(_, l, r) => {
@@ -1373,7 +1373,7 @@ fn expr_uses_field(e: &Expr, input_name: &str, field_name: &str) -> bool {
         Expr::Not(i) | Expr::Neg(i) | Expr::Ok(i) | Expr::Err(i) => {
             expr_uses_field(i, input_name, field_name)
         }
-        Expr::JsonEscape(i) | Expr::ParseInt(i) | Expr::Length(i) | Expr::Abs(i) | Expr::BitNot(i) | Expr::Le32(i) | Expr::Le64(i) => {
+        Expr::JsonEscape(i) | Expr::ParseInt(i) | Expr::Length(i) | Expr::Abs(i) | Expr::BitNot(i) | Expr::Le32(i) | Expr::Le64(i) | Expr::ArenaScope(i) => {
             expr_uses_field(i, input_name, field_name)
         }
         Expr::If(c, t, el) => {
@@ -1931,6 +1931,11 @@ fn check_streaming_bytes_shape(
             }
             Ok(())
         }
+        // `arena_scope(inner)` is transparent to the shape check: inner
+        // occupies the SAME tail bytes position (its bytes are streamed
+        // unchanged), so a bytes-SCC call in inner is legal exactly where
+        // it would be legal without the wrapper.
+        Expr::ArenaScope(inner) => check_streaming_bytes_shape(rule_name, inner, bytes_scc),
         // Everything else is a value position. Any bytes-SCC reference
         // buried inside is out of order by construction: refuse.
         other => {
@@ -2087,7 +2092,8 @@ fn collect_native_callees(expr: &Expr, out: &mut Vec<String>) {
             collect_native_callees(r, out);
         }
         Expr::Ok(i) | Expr::Err(i) | Expr::Not(i) | Expr::Neg(i) | Expr::Abs(i) | Expr::BitNot(i)
-        | Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i) | Expr::Le32(i) | Expr::Le64(i) => {
+        | Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i) | Expr::Le32(i) | Expr::Le64(i)
+        | Expr::ArenaScope(i) => {
             collect_native_callees(i, out);
         }
         Expr::Min(a, b) | Expr::Max(a, b) | Expr::BitAnd(a, b) | Expr::BitOr(a, b) | Expr::BitXor(a, b) | Expr::Shl(a, b) | Expr::Shr(a, b) | Expr::StartsWith(a, b)
@@ -2215,7 +2221,7 @@ fn gather_transitive_callee_reads(
             gather_transitive_callee_reads(e, all_rules, visited, out);
         }
         Expr::Ok(i) | Expr::Err(i) | Expr::Not(i) | Expr::Neg(i) | Expr::Abs(i) | Expr::BitNot(i)
-        | Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i) | Expr::Le32(i) | Expr::Le64(i) => {
+        | Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i) | Expr::Le32(i) | Expr::Le64(i) | Expr::ArenaScope(i) => {
             gather_transitive_callee_reads(i, all_rules, visited, out);
         }
         Expr::Binary(_, l, r) => {
@@ -2474,7 +2480,7 @@ fn collect_fetch_names_native(expr: &Expr, out: &mut Vec<String>) {
         // `length(<text_expr>)` — pure pass-through.
         Expr::Length(inner) => collect_fetch_names_native(inner, out),
         // `abs(<number_expr>)` — pure pass-through.
-        Expr::Abs(inner) | Expr::BitNot(inner) | Expr::Le32(inner) | Expr::Le64(inner) => collect_fetch_names_native(inner, out),
+        Expr::Abs(inner) | Expr::BitNot(inner) | Expr::Le32(inner) | Expr::Le64(inner) | Expr::ArenaScope(inner) => collect_fetch_names_native(inner, out),
         // `min(a, b)` / `max(a, b)` — recurse into both children.
         Expr::Min(l, r) | Expr::Max(l, r) | Expr::BitAnd(l, r) | Expr::BitOr(l, r) | Expr::BitXor(l, r) | Expr::Shl(l, r) | Expr::Shr(l, r) => {
             collect_fetch_names_native(l, out);
@@ -2784,7 +2790,7 @@ fn emit_connection_fetch_sequence(
             // `length(<text_expr>)` — pass-through.
             Expr::Length(inner) => first_fetch_for(inner, name),
             // `abs(<number_expr>)` — pass-through.
-            Expr::Abs(inner) | Expr::BitNot(inner) | Expr::Le32(inner) | Expr::Le64(inner) => first_fetch_for(inner, name),
+            Expr::Abs(inner) | Expr::BitNot(inner) | Expr::Le32(inner) | Expr::Le64(inner) | Expr::ArenaScope(inner) => first_fetch_for(inner, name),
             // `min(a, b)` / `max(a, b)` — recurse into both children.
             Expr::Min(l, r) | Expr::Max(l, r) | Expr::BitAnd(l, r) | Expr::BitOr(l, r) | Expr::BitXor(l, r) | Expr::Shl(l, r) | Expr::Shr(l, r) => {
                 first_fetch_for(l, name).or_else(|| first_fetch_for(r, name))
@@ -3009,7 +3015,7 @@ fn find_group_variant_construct_in_expr(
         Expr::Binary(_, l, r) => find_group_variant_construct_in_expr(l, group_concepts)
             .or_else(|| find_group_variant_construct_in_expr(r, group_concepts)),
         Expr::Not(i) | Expr::Neg(i) | Expr::Ok(i) | Expr::Err(i)
-        | Expr::Abs(i) | Expr::BitNot(i) | Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i) | Expr::Le32(i) | Expr::Le64(i) => {
+        | Expr::Abs(i) | Expr::BitNot(i) | Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i) | Expr::Le32(i) | Expr::Le64(i) | Expr::ArenaScope(i) => {
             find_group_variant_construct_in_expr(i, group_concepts)
         }
         Expr::If(c, t, e) => find_group_variant_construct_in_expr(c, group_concepts)
@@ -3116,7 +3122,7 @@ fn find_group_match_variant_in_expr(
         Expr::Binary(_, l, r) => find_group_match_variant_in_expr(l, group_concepts, rule_input_name, rule_input_ty, all_rules)
             .or_else(|| find_group_match_variant_in_expr(r, group_concepts, rule_input_name, rule_input_ty, all_rules)),
         Expr::Not(i) | Expr::Neg(i) | Expr::Ok(i) | Expr::Err(i)
-        | Expr::Abs(i) | Expr::BitNot(i) | Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i) | Expr::Le32(i) | Expr::Le64(i) => {
+        | Expr::Abs(i) | Expr::BitNot(i) | Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i) | Expr::Le32(i) | Expr::Le64(i) | Expr::ArenaScope(i) => {
             find_group_match_variant_in_expr(i, group_concepts, rule_input_name, rule_input_ty, all_rules)
         }
         Expr::If(c, t, e) => find_group_match_variant_in_expr(c, group_concepts, rule_input_name, rule_input_ty, all_rules)
@@ -4880,7 +4886,7 @@ fn count_max_match_arm_binders(expr: &Expr) -> u32 {
             Expr::Field(b, _) => walk(b, m),
             Expr::Binary(_, l, r) => { walk(l, m); walk(r, m); }
             Expr::Not(i) | Expr::Neg(i) | Expr::Ok(i) | Expr::Err(i)
-            | Expr::Abs(i) | Expr::BitNot(i) | Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i) | Expr::Le32(i) | Expr::Le64(i) => walk(i, m),
+            | Expr::Abs(i) | Expr::BitNot(i) | Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i) | Expr::Le32(i) | Expr::Le64(i) | Expr::ArenaScope(i) => walk(i, m),
             Expr::If(c, t, ee) => { walk(c, m); walk(t, m); walk(ee, m); }
             Expr::Call(_, args) | Expr::Concat(args) => { for a in args { walk(a, m); } }
             Expr::Quantifier(_, c, _, body) => { walk(c, m); walk(body, m); }
@@ -4939,7 +4945,7 @@ fn count_max_match_arm_binder_slots(expr: &Expr, concept_group: Option<&ConceptG
             Expr::Field(b, _) => walk(b, m, cg),
             Expr::Binary(_, l, r) => { walk(l, m, cg); walk(r, m, cg); }
             Expr::Not(i) | Expr::Neg(i) | Expr::Ok(i) | Expr::Err(i)
-            | Expr::Abs(i) | Expr::BitNot(i) | Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i) | Expr::Le32(i) | Expr::Le64(i) => walk(i, m, cg),
+            | Expr::Abs(i) | Expr::BitNot(i) | Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i) | Expr::Le32(i) | Expr::Le64(i) | Expr::ArenaScope(i) => walk(i, m, cg),
             Expr::If(c, t, ee) => { walk(c, m, cg); walk(t, m, cg); walk(ee, m, cg); }
             Expr::Call(_, args) | Expr::Concat(args) => { for a in args { walk(a, m, cg); } }
             Expr::Quantifier(_, c, _, body) => { walk(c, m, cg); walk(body, m, cg); }
@@ -4971,7 +4977,7 @@ fn body_contains_variant_construct(expr: &Expr) -> bool {
         Expr::Field(b, _) => body_contains_variant_construct(b),
         Expr::Binary(_, l, r) => body_contains_variant_construct(l) || body_contains_variant_construct(r),
         Expr::Not(i) | Expr::Neg(i) | Expr::Ok(i) | Expr::Err(i)
-        | Expr::Abs(i) | Expr::BitNot(i) | Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i) | Expr::Le32(i) | Expr::Le64(i) => {
+        | Expr::Abs(i) | Expr::BitNot(i) | Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i) | Expr::Le32(i) | Expr::Le64(i) | Expr::ArenaScope(i) => {
             body_contains_variant_construct(i)
         }
         Expr::If(c, t, e) => body_contains_variant_construct(c) || body_contains_variant_construct(t) || body_contains_variant_construct(e),
@@ -6135,11 +6141,42 @@ fn emit_streaming_bytes_body(
                 ),
             })
         }
+        // `arena_scope(inner)` — save the arena node-count, stream inner's
+        // bytes UNCHANGED, then restore the node-count so every arena node
+        // inner allocated is reclaimed. In the in-callable arena scheme
+        // (streaming bytes always runs inside a callable) node_count lives
+        // at `[r11 + arena_size]` where arena_size = max_nodes * entry_size.
+        // r11 is TRUSTED here (streamed writes push/pop it), so SAVE reads it
+        // before streaming and RESET writes it after. GENERAL-correct: it
+        // reclaims any concept_group nodes inner allocates. For gen0 (whose
+        // ProcGenState-style records are stack-passed, not arena-allocated)
+        // this is a no-op — but it faithfully implements the primitive. The
+        // self-hosted emitter's OWN reclaim (save/restore r14) lives in
+        // vexprparse.verbose's x86_stream_node arm, not here.
+        Expr::ArenaScope(inner) => {
+            let ac = arena_ctx.ok_or_else(|| NativeError {
+                message: "arena_scope requires a concept_group (arena ctx missing)".into(),
+            })?;
+            let arena_size_bytes = (ac.max_nodes as i32) * ac.entry_size;
+            // SAVE: mov rax, [r11 + arena_size] ; push rax
+            code.extend_from_slice(&[0x49, 0x8B, 0x83]);
+            code.extend_from_slice(&arena_size_bytes.to_le_bytes());
+            code.push(0x50);
+            emit_streaming_bytes_body(
+                code, inner, input_name, offsets, all_rules,
+                field_ranges, text_bindings, self_call, arena_ctx,
+            )?;
+            // RESET: pop rax ; mov [r11 + arena_size], rax
+            code.push(0x58);
+            code.extend_from_slice(&[0x49, 0x89, 0x83]);
+            code.extend_from_slice(&arena_size_bytes.to_le_bytes());
+            Ok(())
+        }
         other => Err(NativeError {
             message: format!(
                 "native bytes streaming (brick b3) supports `b\"...\"`, bytes `concat(...)`, \
-                 `le32`/`le64`, `if`/`else` (bytes arms), `match` (bytes arms), and tail \
-                 calls to bytes-returning recursive rules, got {:?}",
+                 `le32`/`le64`, `if`/`else` (bytes arms), `match` (bytes arms), `arena_scope(...)`, \
+                 and tail calls to bytes-returning recursive rules, got {:?}",
                 other
             ),
         }),
@@ -12293,7 +12330,7 @@ fn max_stack_depth(expr: &Expr) -> usize {
         Expr::Length(inner) => max_stack_depth(inner),
         // `abs(<number_expr>)` — 5-byte inline (cqo; xor rax, rdx; sub rax, rdx),
         // no eval-stack push, the inner's depth dominates.
-        Expr::Abs(inner) | Expr::BitNot(inner) | Expr::Le32(inner) | Expr::Le64(inner) => max_stack_depth(inner),
+        Expr::Abs(inner) | Expr::BitNot(inner) | Expr::Le32(inner) | Expr::Le64(inner) | Expr::ArenaScope(inner) => max_stack_depth(inner),
         // `min(a, b)` / `max(a, b)` — branch-free cmp + cmov; left is
         // evaluated and pushed, right is evaluated, so same shape as Binary.
         Expr::Min(l, r) | Expr::Max(l, r) | Expr::BitAnd(l, r) | Expr::BitOr(l, r) | Expr::BitXor(l, r) | Expr::Shl(l, r) | Expr::Shr(l, r) => {
@@ -12813,6 +12850,15 @@ fn emit_eval_expr(
             // evaluator means an unsupported context.
             Err(NativeError {
                 message: "le32/le64 produce bytes, not a scalar value (brick b2 supports them only inside a bytes `concat(...)` in an `output: bytes` rule)".into(),
+            })
+        }
+        Expr::ArenaScope(_) => {
+            // arena_scope(...) is a streaming-bytes reclaim boundary; it has
+            // no scalar (rax) representation. Reaching the scalar evaluator
+            // means it was used in a value position — only valid in a
+            // bytes-streaming position (handled by emit_streaming_bytes_body).
+            Err(NativeError {
+                message: "arena_scope(...) only valid in a streaming-bytes position (the whole body / a concat arg / an if or match arm of an `output: bytes` rule), not as a scalar value".into(),
             })
         }
         Expr::Field(base, field_name) => {
@@ -18043,6 +18089,7 @@ fn expr_kind(e: &Expr) -> &'static str {
         Expr::EndsWith(_, _) => "EndsWith",
         Expr::Length(_) => "Length",
         Expr::Abs(_) => "Abs",
+        Expr::ArenaScope(_) => "ArenaScope",
         Expr::Le32(_) => "Le32",
         Expr::Le64(_) => "Le64",
         Expr::Min(_, _) => "Min",
@@ -29914,6 +29961,168 @@ rule rec
         let _ = std::fs::remove_file(&out);
     }
 
+    /// `arena_scope(...)` in a streaming-bytes position: it must (a) compile
+    /// natively when wrapping a concept_group-allocating sub-expression, and
+    /// (b) leave the emitted OUTPUT bytes UNCHANGED — the only effect is the
+    /// arena node-count save/reset around the streamed inner. We prove (b) by
+    /// compiling the SAME program with and without the wrapper and asserting
+    /// byte-identical stdout across a range of seeds; the two BINARIES differ
+    /// (the wrapped one carries the 8-byte SAVE + 8-byte RESET), which is the
+    /// point — reclaim is added, output preserved.
+    #[test]
+    fn arena_scope_streaming_bytes_compiles_and_preserves_output() {
+        use std::io::Write;
+        // A bytes-streaming recursive emitter over a concept_group AST.
+        // `show` per iteration builds a fresh chain (allocating arena nodes
+        // via build_chain) and emits it; `arena_scope(...)` reclaims those
+        // nodes after each iteration's bytes are streamed. `{SCOPE_OPEN}` /
+        // `{SCOPE_CLOSE}` toggle the wrapper so the two variants are otherwise
+        // textually identical.
+        let template = r#"@verbose 0.1.0
+
+concept_group AST [max_depth: 30, max_nodes: 100]
+  @intention: "tiny AST: Int and Add"
+  @source: as_test.intent:1
+
+  concept Expr
+    @intention: "int literal or sum"
+    @source: as_test.intent:1
+    variants:
+      Int of (value : number)
+      Add of (lhs : Expr, rhs : Expr)
+
+
+concept Seed
+  @intention: "a small seed"
+  @source: as_test.intent:2
+
+  fields:
+    n : number [0, 20]
+
+
+rule build_chain
+  @intention: "Build Add(Int(n), Add(Int(n-1), ... Int(0)))"
+  @source: as_test.intent:3
+
+  input:
+    s : Seed
+
+  output:
+    e : Expr
+
+  logic:
+    e = if s.n == 0 then Expr::Int { value: 0 } else Expr::Add { lhs: Expr::Int { value: s.n }, rhs: build_chain(Seed { n: s.n - 1 }) }
+
+  proofs:
+    purity:
+      reads   : [s.n]
+      calls   : [build_chain]
+    termination:
+      bound : 100
+      decreasing : n
+
+
+rule emit_expr
+  @intention: "Emit an Expr as little-endian bytes"
+  @source: as_test.intent:4
+
+  input:
+    e : Expr
+
+  output:
+    out : bytes
+
+  logic:
+    out = match e:
+      Int(value) => le32(value)
+      Add(lhs, rhs) => concat(emit_expr(lhs), le32(43), emit_expr(rhs))
+
+  proofs:
+    purity:
+      reads   : [e]
+      calls   : [emit_expr]
+    termination:
+      bound : 100
+      structural : e
+
+
+rule show
+  @intention: "Per iteration build+emit a chain, reclaiming its arena nodes"
+  @source: as_test.intent:5
+
+  input:
+    s : Seed
+
+  output:
+    out : bytes
+
+  logic:
+    out = if s.n == 0 then emit_expr(build_chain(s)) else concat(SCOPE_OPENemit_expr(build_chain(s))SCOPE_CLOSE, show(Seed { n: s.n - 1 }))
+
+  proofs:
+    purity:
+      reads   : [s.n, s]
+      calls   : [emit_expr, build_chain, show]
+    termination:
+      bound : 100
+      decreasing : n
+"#;
+        let with_scope = template
+            .replace("SCOPE_OPEN", "arena_scope(")
+            .replace("SCOPE_CLOSE", ")");
+        let without_scope = template
+            .replace("SCOPE_OPEN", "")
+            .replace("SCOPE_CLOSE", "");
+
+        let compile = |src: &str, tag: &str| -> std::path::PathBuf {
+            let tokens = crate::lexer::Lexer::new(src).tokenize().unwrap();
+            let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+            let out = std::env::temp_dir().join(format!("verbosec_test_arena_scope_{}", tag));
+            compile_native(&program, "show", out.to_str().unwrap(), true, false)
+                .unwrap_or_else(|e| panic!("arena_scope program ({}) must compile natively: {}", tag, e.message));
+            out
+        };
+        let scoped = compile(&with_scope, "scoped");
+        let plain = compile(&without_scope, "plain");
+
+        let run = |bin: &std::path::Path, input: &str| -> Vec<u8> {
+            let mut child = std::process::Command::new(bin)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .expect("spawn arena_scope show");
+            child.stdin.as_mut().unwrap().write_all(input.as_bytes()).unwrap();
+            drop(child.stdin.take());
+            let r = child.wait_with_output().expect("wait arena_scope show");
+            assert!(r.status.success(), "show must exit 0 for input {:?}; got {:?}", input.trim(), r.status);
+            r.stdout
+        };
+
+        for &n in &[0i64, 1, 3, 5, 7] {
+            let a = run(&scoped, &format!("{}\n", n));
+            let b = run(&plain, &format!("{}\n", n));
+            assert_eq!(
+                a, b,
+                "arena_scope must leave emitted bytes UNCHANGED for n={} (scoped {:?} vs plain {:?})",
+                n, a, b
+            );
+        }
+        // Pin the concrete money-shot for n=3: le32(3) 0x2b le32(2) 0x2b
+        // le32(1) 0x2b le32(0) | le32(2)... | le32(1)... | le32(0).
+        let n3 = run(&scoped, "3\n");
+        let expect: Vec<u8> = vec![
+            3,0,0,0, 43,0,0,0, 2,0,0,0, 43,0,0,0, 1,0,0,0, 43,0,0,0, 0,0,0,0, // chain(3)
+            2,0,0,0, 43,0,0,0, 1,0,0,0, 43,0,0,0, 0,0,0,0,                     // chain(2)
+            1,0,0,0, 43,0,0,0, 0,0,0,0,                                        // chain(1)
+            0,0,0,0,                                                            // chain(0)
+        ];
+        assert_eq!(n3, expect, "arena_scope show(3) bytes must match the expected le32 stream");
+
+        let _ = std::fs::remove_file(&scoped);
+        let _ = std::fs::remove_file(&plain);
+    }
+
     /// Streaming text emit — the mode is decided per SCC, and a body
     /// that fits today's literal-leaf grammar (recursive_label: if/else
     /// with literal and self-call leaves) must KEEP the materializing
@@ -37863,7 +38072,8 @@ rule two
     ///
     /// This test pins THREE independent self-hosting properties (measured
     /// 2026-07, gen0 peaks 140 MB / 1.5 s; gen1 — the self-hosted emitter —
-    /// peaks 8.7 GB / 22 s emitting the full source, hence the ignore):
+    /// peaks ~2.55 GB / ~3.7 s emitting the full source since the `arena_scope`
+    /// reclaim landed, was 8.7 GB / 22 s before it):
     ///
     ///   R0 — fixed point:   gen1(reordered) == gen2(reordered) byte-for-byte.
     ///   R1 — whole source:  gen0(ORIGINAL) == gen1(ORIGINAL) byte-for-byte —
@@ -37884,18 +38094,19 @@ rule two
     /// self-hosted emitter is a byte-identical, semantically-verified fixed
     /// point of the trusted reference.
     ///
-    /// IGNORED by default: gen1 (the self-hosted emitter) peaks at ~8.7 GiB of
-    /// RAM emitting the full source — the Verbose runtime arena-stores every
-    /// record/variant node in one never-reclaimed arena (a record `Foo { .. }`
-    /// parses to AstVariant and is arena-stored), so the full self-compile
-    /// touches billions of nodes where gen0 (Rust, stack-passing records)
-    /// peaks at 140 MB. The prologue mmaps the arena at 16 GiB with
-    /// MAP_NORESERVE so only touched pages cost RAM. The test also needs an
-    /// unbounded stack (the src_blob recursion over the ~855 KB source) — the
-    /// emit shell-outs raise it via `ulimit -s unlimited`. Run explicitly:
+    /// IGNORED by default: gen1 (the self-hosted emitter) peaks ~2.55 GiB
+    /// emitting the full source (the Verbose runtime arena-allocates every
+    /// record/variant; `arena_scope` reclaims each proc's walk transients at the
+    /// proc boundary — see docs/self-hosting-arena-scope-design.md — bringing the
+    /// pre-reclaim 8.7 GiB down to the ~544 MB parse-tree floor + the biggest
+    /// single proc). gen0 (Rust, stack-passing records) peaks 140 MB. The test
+    /// also needs an unbounded stack (the src_blob recursion over the ~855 KB
+    /// source) — the emit shell-outs raise it via `ulimit -s unlimited`. Kept
+    /// ignored for the default parallel dev suite (2.55 GB × parallel tests); the
+    /// dedicated `self-hosting-bootstrap` CI job runs it serially. Run explicitly:
     ///   cargo test --release -- --ignored --test-threads=1 two_generation
     #[test]
-    #[ignore = "gen1 peaks ~8.7 GiB RAM + needs `ulimit -s unlimited` + ~45s; run with --ignored"]
+    #[ignore = "gen1 peaks ~2.55 GiB RAM + needs `ulimit -s unlimited` + ~11s; run with --ignored"]
     #[cfg(target_arch = "x86_64")]
     fn two_generation_bootstrap_fixed_point() {
         use std::fs;
