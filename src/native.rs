@@ -20916,6 +20916,63 @@ rule le64_neg
         let _ = fs::remove_file(em);
     }
 
+    /// Result tier slice 1 — the SELF-HOSTED interpreter (eval_main, compiled
+    /// natively from examples/vexprparse.verbose) parses AND evaluates Ok / Err /
+    /// match_result. The entry rule `main` (first rule, 0 params) calls a helper
+    /// `check(n)` that returns `Ok(n)` when n > 0 else `Err(0)`; the surrounding
+    /// `match_result` doubles the Ok payload (5 -> 10) and yields -1 on the Err
+    /// path (0 -> -1). This pins the milestone: the self-hosted eval agrees with
+    /// verbosec's own interpreter (which returns 10 / -1 on the verbosec-grammar
+    /// equivalent of the same program).
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn result_tier_slice1_eval_main_interprets_result() {
+        use std::fs;
+        use std::process::Command;
+
+        let src = fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let em = std::env::temp_dir().join("verbosec_test_eval_main_result_tier");
+        compile_native(&program, "eval_main", em.to_str().unwrap(), false, false)
+            .expect("eval_main must compile natively");
+
+        // (program source, expected value). `main` is the FIRST rule (0 params) so
+        // eval_main evaluates it; it composes match_result over an Ok/Err-returning
+        // helper. Positive input -> Ok -> doubled; non-positive -> Err -> -1.
+        let cases: &[(&str, i64)] = &[
+            ("rule main\n  logic:\n    out = match_result(check(5), v => v * 2, e => 0 - 1)\nrule check(n)\n  logic:\n    out = if n > 0 then Ok(n) else Err(0)", 10),
+            ("rule main\n  logic:\n    out = match_result(check(0), v => v * 2, e => 0 - 1)\nrule check(n)\n  logic:\n    out = if n > 0 then Ok(n) else Err(0)", -1),
+        ];
+
+        for &(prog_src, expected) in cases {
+            let ev = Command::new(&em)
+                .args([prog_src, "0"])
+                .output()
+                .expect("spawn eval_main");
+            assert!(
+                ev.status.success(),
+                "eval_main must exit 0 for {:?}",
+                prog_src
+            );
+            let eval_val: i64 = String::from_utf8_lossy(&ev.stdout)
+                .trim()
+                .parse()
+                .unwrap_or_else(|_| {
+                    panic!("eval_main produced non-number for {:?}: {:?}", prog_src, ev.stdout)
+                });
+            assert_eq!(
+                eval_val, expected,
+                "self-hosted eval_main for {:?} = {} (expected {})",
+                prog_src, eval_val, expected
+            );
+        }
+
+        let _ = fs::remove_file(em);
+    }
+
     /// Brick b6 — the four missing binary operators in the machine-code
     /// generator: division `/` (op 16), modulo `%` (op 17), logical `and`
     /// (op 30), logical `or` (op 31). Both the closed-expression path
