@@ -20973,6 +20973,86 @@ rule le64_neg
         let _ = fs::remove_file(em);
     }
 
+    /// Result tier slice 2 — THE MILESTONE: the self-hosted emitter (elf_program_src,
+    /// compiled natively from examples/vexprparse.verbose) COMPILES a match_result
+    /// program to a runnable ELF. x86_node's AstOk / AstResErr allocate a 2-slot
+    /// arena node (tag + 1 payload, the AstVariant arena-write shape with the fixed
+    /// RESULT_OK_TAG / RESULT_ERR_TAG), and AstMatchResult is a 2-way tag dispatch
+    /// (the AstMatch prefix + binder-load machinery). The test program is CONCEPT-LESS
+    /// (closed `main`, no declared concept), so it exercises point 4: program_uses_result
+    /// appends a synthetic 1-field concept, which turns on the mmap arena prologue AND
+    /// entry_size >= 16 — without which a Result node's payload write ([node+8]) would
+    /// overlap the next arena entry. The compiled ELF must print 10 (Ok(5) doubled)
+    /// and -1 (Err(0) -> 0-1), each equal to the slice-1 interpreter oracle (eval_main).
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn result_tier_slice2_compiles_match_result_to_machine_code() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        let src = fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        // The self-hosted emitter (elf_program_src) and the slice-1 oracle (eval_main).
+        let elf = std::env::temp_dir().join("verbosec_test_r_s2_elf_program_src");
+        compile_native(&program, "elf_program_src", elf.to_str().unwrap(), false, false)
+            .expect("elf_program_src must compile natively");
+        let em = std::env::temp_dir().join("verbosec_test_r_s2_eval_main");
+        compile_native(&program, "eval_main", em.to_str().unwrap(), false, false)
+            .expect("eval_main must compile natively");
+
+        let oracle = |source: &str| -> i64 {
+            let r = Command::new(&em).arg(source).arg("0").output().expect("spawn eval_main");
+            assert!(r.status.success(), "eval_main must exit 0 for {:?}", source);
+            String::from_utf8_lossy(&r.stdout).trim().parse::<i64>()
+                .unwrap_or_else(|_| panic!("eval_main non-number for {:?}: {:?}", source, r.stdout))
+        };
+
+        // Concept-less closed-main Result programs (the task's literal example).
+        // Ok path: check(5) -> Ok(5), doubled -> 10. Err path: check(0) -> Err(0), 0-1 -> -1.
+        let pos = "rule main\n  logic:\n    out = match_result(check(5), v => v * 2, e => 0 - 1)\nrule check(n)\n  logic:\n    out = if n > 0 then Ok(n) else Err(0)";
+        let neg = "rule main\n  logic:\n    out = match_result(check(0), v => v * 2, e => 0 - 1)\nrule check(n)\n  logic:\n    out = if n > 0 then Ok(n) else Err(0)";
+        let cases: &[(&str, i64)] = &[(pos, 10), (neg, -1)];
+
+        for (i, (prog_src, expected)) in cases.iter().enumerate() {
+            // Oracle agreement (slice-1 interpreter) first.
+            assert_eq!(oracle(prog_src), *expected, "slice-1 oracle disagreement for {:?}", prog_src);
+
+            // Emit the ELF via the self-hosted emitter.
+            let mc = Command::new(&elf).args([*prog_src, "0"]).output()
+                .expect("spawn elf_program_src");
+            assert!(mc.status.success(), "elf_program_src must exit 0 for {:?}; got {:?}", prog_src, mc.status);
+            let elf_bytes = mc.stdout;
+            assert_eq!(&elf_bytes[0..4], &[0x7f, 0x45, 0x4c, 0x46], "emitted file is not ELF for {:?}", prog_src);
+            // Point 4: a concept-less Result program still gets the mmap arena prologue
+            // (the synthetic concept injected by program_uses_result / concepts_append_result).
+            assert_eq!(&elf_bytes[120..125], &[0xb8, 0x09, 0x00, 0x00, 0x00],
+                "concept-less Result program {:?} must have the mmap arena prologue", prog_src);
+
+            let out_path = std::env::temp_dir().join(format!("verbosec_test_r_s2_a_out_{}", i));
+            fs::write(&out_path, &elf_bytes).expect("write a.out");
+            let mut perms = fs::metadata(&out_path).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&out_path, perms).expect("chmod +x");
+
+            let child = Command::new(&out_path).output().expect("execute emitted ELF");
+            assert!(child.status.success(), "emitted ELF for {:?} did not exit 0; got {:?}", prog_src, child.status);
+            let child_out: i64 = String::from_utf8_lossy(&child.stdout).trim().parse()
+                .unwrap_or_else(|_| panic!("emitted ELF produced non-number for {:?}: {:?}", prog_src, child.stdout));
+            assert_eq!(child_out, *expected, "slice-2 ELF for {:?} printed {} (expected {})", prog_src, child_out, expected);
+            // The COMPILED result equals the INTERPRETER oracle — the fixed point.
+            assert_eq!(child_out, oracle(prog_src), "slice-2 compiled vs interpreter mismatch for {:?}", prog_src);
+
+            let _ = fs::remove_file(&out_path);
+        }
+
+        let _ = fs::remove_file(elf);
+        let _ = fs::remove_file(em);
+    }
+
     /// Brick b6 — the four missing binary operators in the machine-code
     /// generator: division `/` (op 16), modulo `%` (op 17), logical `and`
     /// (op 30), logical `or` (op 31). Both the closed-expression path
