@@ -37861,12 +37861,41 @@ rule two
     /// costs physical RAM) — see the `elf_program_src` arena note in
     /// examples/vexprparse.verbose.
     ///
-    /// IGNORED by default: this test needs ~9 GiB of RAM (the arena peak) and
-    /// an unbounded stack (the src_blob recursion over the ~900 KB source), and
-    /// runs for ~30 s. Run it explicitly with:
+    /// This test pins THREE independent self-hosting properties (measured
+    /// 2026-07, gen0 peaks 140 MB / 1.5 s; gen1 — the self-hosted emitter —
+    /// peaks 8.7 GB / 22 s emitting the full source, hence the ignore):
+    ///
+    ///   R0 — fixed point:   gen1(reordered) == gen2(reordered) byte-for-byte.
+    ///   R1 — whole source:  gen0(ORIGINAL) == gen1(ORIGINAL) byte-for-byte —
+    ///                       the self-compiled emitter emits the entire real
+    ///                       855 KB / 545-proc compiler identically to the
+    ///                       reference, with NO reorder caveat (the reorder in
+    ///                       R0 only moves the entry proc to offset 0).
+    ///   R2 — corpus + run:  for a spread of small programs covering the
+    ///                       construct space (arith, nested-if, call-chain,
+    ///                       multi-field record, N-arm variant/match, runtime
+    ///                       recursion, max/min, chained field), gen1(P) ==
+    ///                       gen0(P) AND the ELF gen1 emitted actually RUNS to
+    ///                       the correct value — independent run-correctness on
+    ///                       top of byte-identity to the trusted reference.
+    ///
+    /// Correctness frame: R0/R1/R2 prove byte-identity to gen0 (= verbosec's
+    /// Rust backend, the trusted base) plus the self-fixed-point. So: the
+    /// self-hosted emitter is a byte-identical, semantically-verified fixed
+    /// point of the trusted reference.
+    ///
+    /// IGNORED by default: gen1 (the self-hosted emitter) peaks at ~8.7 GiB of
+    /// RAM emitting the full source — the Verbose runtime arena-stores every
+    /// record/variant node in one never-reclaimed arena (a record `Foo { .. }`
+    /// parses to AstVariant and is arena-stored), so the full self-compile
+    /// touches billions of nodes where gen0 (Rust, stack-passing records)
+    /// peaks at 140 MB. The prologue mmaps the arena at 16 GiB with
+    /// MAP_NORESERVE so only touched pages cost RAM. The test also needs an
+    /// unbounded stack (the src_blob recursion over the ~855 KB source) — the
+    /// emit shell-outs raise it via `ulimit -s unlimited`. Run explicitly:
     ///   cargo test --release -- --ignored --test-threads=1 two_generation
     #[test]
-    #[ignore = "needs ~9 GiB RAM + `ulimit -s unlimited` + ~30s; run with --ignored"]
+    #[ignore = "gen1 peaks ~8.7 GiB RAM + needs `ulimit -s unlimited` + ~45s; run with --ignored"]
     #[cfg(target_arch = "x86_64")]
     fn two_generation_bootstrap_fixed_point() {
         use std::fs;
@@ -37911,46 +37940,94 @@ rule two
         let reordered = std::env::temp_dir().join("verbosec_test_2gen_reordered.verbose");
         fs::write(&reordered, &reordered_src).unwrap();
 
-        // Emit `emitter(reordered) -> out_path` under an unbounded stack (the
-        // src_blob recursion over the whole source needs it).
-        let emit = |emitter: &std::path::Path, out_path: &std::path::Path| {
+        // Emit `emitter(prog) -> out_path` under an unbounded stack (the
+        // src_blob recursion over a large source needs it; harmless for small).
+        let emit_prog = |emitter: &std::path::Path,
+                         prog: &std::path::Path,
+                         out_path: &std::path::Path| {
             let status = Command::new("sh")
                 .arg("-c")
                 .arg(format!(
                     "ulimit -s unlimited; '{}' 0 < '{}' > '{}'",
-                    emitter.display(), reordered.display(), out_path.display()
+                    emitter.display(), prog.display(), out_path.display()
                 ))
                 .status()
                 .expect("emit via sh");
             assert!(status.success(),
-                "emitter {:?} must exit 0 emitting the full reordered source", emitter);
+                "emitter {:?} must exit 0 emitting {:?}", emitter, prog);
+            fs::read(out_path).unwrap()
         };
 
         // gen1 = gen0(reordered).
         let gen1 = std::env::temp_dir().join("verbosec_test_2gen_gen1.elf");
-        emit(&gen0, &gen1);
+        let gen1_bytes = emit_prog(&gen0, &reordered, &gen1);
         let mut perms = fs::metadata(&gen1).unwrap().permissions();
         perms.set_mode(0o755);
         fs::set_permissions(&gen1, perms).unwrap();
-        let gen1_bytes = fs::read(&gen1).unwrap();
         assert_eq!(&gen1_bytes[0..4], &[0x7f, 0x45, 0x4c, 0x46],
             "gen1 (the self-compiled emitter) must itself be an ELF");
 
         // gen2 = gen1(reordered) — the self-compiled emitter emitting its own self.
         let gen2 = std::env::temp_dir().join("verbosec_test_2gen_gen2.elf");
-        emit(&gen1, &gen2);
-        let gen2_bytes = fs::read(&gen2).unwrap();
+        let gen2_bytes = emit_prog(&gen1, &reordered, &gen2);
 
-        // THE FIXED POINT.
+        // R0 — THE FIXED POINT.
         assert_eq!(gen1_bytes, gen2_bytes,
-            "two-generation fixed point: gen1(source) == gen2(source) byte-for-byte \
+            "R0 two-generation fixed point: gen1(source) == gen2(source) byte-for-byte \
              (gen1={} B, gen2={} B) — the compiler must reproduce its entire self",
             gen1_bytes.len(), gen2_bytes.len());
 
-        let _ = fs::remove_file(&gen0);
-        let _ = fs::remove_file(&reordered);
-        let _ = fs::remove_file(&gen1);
-        let _ = fs::remove_file(&gen2);
+        // R1 — whole real source, NO reorder. Feed the ORIGINAL (non-reordered)
+        // examples/vexprparse.verbose to both gen0 and gen1: the self-compiled
+        // emitter must emit the entire real 545-proc compiler identically to the
+        // reference. (The R0 reorder only moves the entry proc to offset 0; R1
+        // removes that caveat.)
+        let orig = std::path::Path::new("examples/vexprparse.verbose");
+        let r1_o0 = std::env::temp_dir().join("verbosec_test_2gen_r1_o0.elf");
+        let r1_o1 = std::env::temp_dir().join("verbosec_test_2gen_r1_o1.elf");
+        let r1_gen0 = emit_prog(&gen0, orig, &r1_o0);
+        let r1_gen1 = emit_prog(&gen1, orig, &r1_o1);
+        assert_eq!(r1_gen0, r1_gen1,
+            "R1 whole-source (no reorder): gen0(orig) == gen1(orig) byte-for-byte \
+             (gen0={} B, gen1={} B) — self-compiled emitter emits the whole real compiler",
+            r1_gen0.len(), r1_gen1.len());
+
+        // R2 — differential corpus + run-correctness. Each program covers a
+        // distinct construct class; gen1(P) must equal gen0(P) AND the emitted
+        // ELF must run to the expected value.
+        let corpus: &[(&str, &str)] = &[
+            ("rule main\n  logic:\n    out = 7 * 6\n", "42"),                       // arith
+            ("rule main\n  logic:\n    out = if 5 >= 5 then (if 2 < 1 then 0 else 99) else 1\n", "99"), // nested-if
+            ("rule main\n  logic:\n    out = f(g(4))\nrule f(x)\n  logic:\n    out = x * 10\nrule g(y)\n  logic:\n    out = y + 1\n", "50"), // call-chain
+            ("concept P\n  fields:\n    a : number\n    b : number\n    c : number\nrule main\n  logic:\n    out = h(P { a: 1, b: 2, c: 3 })\nrule h(p : P)\n  logic:\n    out = p.a + p.b * p.c\n", "7"), // 3-field record
+            ("concept_group G [max_depth: 8, max_nodes: 64]\n  concept T\n    variants:\n      A of (x : number)\n      B of (y : number)\n      C\nrule main\n  logic:\n    out = classify(mk())\nrule mk()\n  logic:\n    out = T::B { y: 77 }\nrule classify(t : T)\n  logic:\n    out = match t: A(x) => x  B(y) => y  C => 0\n", "77"), // 3-arm variant/match
+            ("concept N\n  fields:\n    v : number\nrule main\n  logic:\n    out = fact(N { v: 5 })\nrule fact(n : N)\n  logic:\n    out = if n.v == 0 then 1 else n.v * fact(N { v: n.v - 1 })\n", "120"), // runtime recursion
+            ("rule main\n  logic:\n    out = max(min(100, 42), 7)\n", "42"),        // max/min
+            ("concept Outer\n  fields:\n    inner : Inner\nconcept Inner\n  fields:\n    z : number\nrule main\n  logic:\n    let o = Outer { inner: Inner { z: 88 } }\n    out = o.inner.z\n", "88"), // chained field
+        ];
+        let cp = std::env::temp_dir().join("verbosec_test_2gen_corpus.verbose");
+        let c0 = std::env::temp_dir().join("verbosec_test_2gen_c0.elf");
+        let c1 = std::env::temp_dir().join("verbosec_test_2gen_c1.elf");
+        for (src_p, expect) in corpus {
+            fs::write(&cp, src_p).unwrap();
+            let e0 = emit_prog(&gen0, &cp, &c0);
+            let e1 = emit_prog(&gen1, &cp, &c1);
+            assert_eq!(e0, e1,
+                "R2 differential: gen1(P) == gen0(P) for program:\n{}\n(gen0={} B, gen1={} B)",
+                src_p, e0.len(), e1.len());
+            let mut perms = fs::metadata(&c1).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&c1, perms).unwrap();
+            let run = Command::new(&c1).output().expect("run gen1-emitted ELF");
+            let got = String::from_utf8_lossy(&run.stdout);
+            assert_eq!(got.trim(), *expect,
+                "R2 run-correctness: gen1-emitted ELF must print {} for program:\n{}\n(got {:?})",
+                expect, src_p, got);
+        }
+
+        for f in [&gen0, &reordered, &gen1, &gen2, &r1_o0, &r1_o1, &cp, &c0, &c1] {
+            let _ = fs::remove_file(f);
+        }
     }
 
     // Regression (2026-07): a text `let`/`read` (BoundText) passed as a text
