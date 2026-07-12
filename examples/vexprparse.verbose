@@ -280,6 +280,25 @@ concept_group VExpr [max_depth: 4096, max_nodes: 6000000]
       -- list, and the arm body sub-expression. R3 is PARSER-ONLY: eval / type / codegen
       -- get STUB arms (real handling is R6/R7); shape_ast gives it a dedicated band.
       AstMatch of (scrut : Ast, arms : ArmList)
+      -- Result-tier slice 1: `Ok(e)` / `Err(e)` construction. Each carries ONE inner
+      -- sub-expression (the wrapped value). REUSE the variant runtime: eval builds a
+      -- VData with a reserved Result tag (RESULT_OK_TAG / RESULT_ERR_TAG, high enough
+      -- never to collide with a real concept's cidx*256+vidx) and a single-slot
+      -- payload [inner]. NOTE the name: AstResErr, NOT AstErr — the latter is the
+      -- existing error/placeholder sentinel. Slice 1 is PARSE + INTERPRETER-EVAL:
+      -- shape_ast gives each a dedicated band above AstBytes's 10^10; codegen /
+      -- lint walks get STUB arms (real handling is a later slice).
+      AstOk of (inner : Ast)
+      AstResErr of (inner : Ast)
+      -- Result-tier slice 1: `match_result(scrut, ok_binder => ok_body, err_binder =>
+      -- err_body)`. scrut / ok_body / err_body are sub-expressions (each a full
+      -- parse_or); the two binder spans (ok_bstart/ok_blen, err_bstart/err_blen)
+      -- identify the bound names by SOURCE SPAN (same identity model as AstVar).
+      -- eval dispatches on the scrutinee's Result tag, binds the payload head to the
+      -- matching arm's binder, and evaluates that arm's body. It is NOT a normal call
+      -- (its `binder => body` arms are not argument expressions), so parse_primary
+      -- intercepts the `match_result` keyword and parses it explicitly (parse_match_result).
+      AstMatchResult of (scrut : Ast, ok_bstart : number, ok_blen : number, ok_body : Ast, err_bstart : number, err_blen : number, err_body : Ast)
 
   -- Records-arc brick R3: a cons-list of a variant-construction's named field
   -- initializers. Each cell carries the field NAME span (name_start, name_len) and
@@ -877,6 +896,9 @@ rule ident_run
 
 -- two-letter keywords (brick 4 only needs `or`, but mirror brick 1/2's codes
 -- exactly: if=1, or=2, of=3 — so a future brick lexing the rest agrees).
+-- Result tier slice 1: Ok=12 (`Ok` = O(79) k(107)). Recognized as a KEYWORD like
+-- `match`, because the parse layer is source-free (ParseState carries only the token
+-- cell) — `Ok(e)` is not a normal call, so parse_primary dispatches on token kind.
 rule kw2
   @intention: "Classify a 2-byte identifier run as a keyword (0 if none)"
   @source: vexprparse.intent:7
@@ -885,7 +907,7 @@ rule kw2
   output:
     out : number
   logic:
-    out = if byte_at(s.source, s.pos) == 105 and byte_at(s.source, s.pos + 1) == 102 then 1 else if byte_at(s.source, s.pos) == 111 and byte_at(s.source, s.pos + 1) == 114 then 2 else if byte_at(s.source, s.pos) == 111 and byte_at(s.source, s.pos + 1) == 102 then 3 else 0
+    out = if byte_at(s.source, s.pos) == 105 and byte_at(s.source, s.pos + 1) == 102 then 1 else if byte_at(s.source, s.pos) == 111 and byte_at(s.source, s.pos + 1) == 114 then 2 else if byte_at(s.source, s.pos) == 111 and byte_at(s.source, s.pos + 1) == 102 then 3 else if byte_at(s.source, s.pos) == 79 and byte_at(s.source, s.pos + 1) == 107 then 12 else 0
   proofs:
     purity:
       reads : [s.source, s.pos]
@@ -895,7 +917,8 @@ rule kw2
 
 
 -- three-letter keywords: let=4, and=5, not=6 (brick 1/2 codes; brick 4 uses
--- and=5 and not=6).
+-- and=5 and not=6). Result tier slice 1: Err=13 (`Err` = E(69) r(114) r(114)) —
+-- a keyword, same rationale as kw2's Ok (the parse layer is source-free).
 rule kw3
   @intention: "Classify a 3-byte identifier run as a keyword (0 if none)"
   @source: vexprparse.intent:7
@@ -904,7 +927,7 @@ rule kw3
   output:
     out : number
   logic:
-    out = if byte_at(s.source, s.pos) == 108 and (byte_at(s.source, s.pos + 1) == 101 and byte_at(s.source, s.pos + 2) == 116) then 4 else if byte_at(s.source, s.pos) == 97 and (byte_at(s.source, s.pos + 1) == 110 and byte_at(s.source, s.pos + 2) == 100) then 5 else if byte_at(s.source, s.pos) == 110 and (byte_at(s.source, s.pos + 1) == 111 and byte_at(s.source, s.pos + 2) == 116) then 6 else 0
+    out = if byte_at(s.source, s.pos) == 108 and (byte_at(s.source, s.pos + 1) == 101 and byte_at(s.source, s.pos + 2) == 116) then 4 else if byte_at(s.source, s.pos) == 97 and (byte_at(s.source, s.pos + 1) == 110 and byte_at(s.source, s.pos + 2) == 100) then 5 else if byte_at(s.source, s.pos) == 110 and (byte_at(s.source, s.pos + 1) == 111 and byte_at(s.source, s.pos + 2) == 116) then 6 else if byte_at(s.source, s.pos) == 69 and (byte_at(s.source, s.pos + 1) == 114 and byte_at(s.source, s.pos + 2) == 114) then 13 else 0
   proofs:
     purity:
       reads : [s.source, s.pos]
@@ -958,11 +981,35 @@ rule kw5
       bound : 80
 
 
+-- twelve-letter keywords: match_result=14 (Result tier slice 1). `match_result` =
+-- m(109) a(97) t(116) c(99) h(104) _(95) r(114) e(101) s(115) u(117) l(108) t(116).
+-- A keyword (not a call) because its `binder => body` arms are not argument
+-- expressions the call-arg parser can take — parse_primary intercepts it by token
+-- kind, exactly as `match` (kw5=11) is intercepted. `match` (5 bytes) never reaches
+-- here: keyword_code dispatches by run length, and `match_result` is a single 12-byte
+-- ident run (the `_` continues the run), so it maps to kw12 with no `match` collision.
+rule kw12
+  @intention: "Classify a 12-byte identifier run as a keyword (0 if none)"
+  @source: vexprparse.intent:7
+  input:
+    s : ScanState
+  output:
+    out : number
+  logic:
+    out = if byte_at(s.source, s.pos) == 109 and (byte_at(s.source, s.pos + 1) == 97 and (byte_at(s.source, s.pos + 2) == 116 and (byte_at(s.source, s.pos + 3) == 99 and (byte_at(s.source, s.pos + 4) == 104 and (byte_at(s.source, s.pos + 5) == 95 and (byte_at(s.source, s.pos + 6) == 114 and (byte_at(s.source, s.pos + 7) == 101 and (byte_at(s.source, s.pos + 8) == 115 and (byte_at(s.source, s.pos + 9) == 117 and (byte_at(s.source, s.pos + 10) == 108 and byte_at(s.source, s.pos + 11) == 116)))))))))) then 14 else 0
+  proofs:
+    purity:
+      reads : [s.source, s.pos]
+      calls : []
+    termination:
+      bound : 192
+
+
 -- Dispatch keyword classification by identifier-run length. Brick 6 added the
 -- 4-byte keywords (then / else); brick 7 adds the 4-byte `true` and the 5-byte
--- `false` alongside the 2- and 3-byte keywords (or / and / not). Other-length
--- identifier runs lex as plain identifiers here (kw == 0) and are handled by
--- later bricks.
+-- `false` alongside the 2- and 3-byte keywords (or / and / not). Result tier slice 1
+-- adds the 12-byte `match_result` (kw12). Other-length identifier runs lex as plain
+-- identifiers here (kw == 0) and are handled by later bricks.
 rule keyword_code
   @intention: "Numeric keyword code for the identifier run at pos (0 = plain ident)"
   @source: vexprparse.intent:7
@@ -972,11 +1019,11 @@ rule keyword_code
     out : number
   logic:
     let rl = ident_run(s)
-    out = if rl == 2 then kw2(s) else if rl == 3 then kw3(s) else if rl == 4 then kw4(s) else if rl == 5 then kw5(s) else 0
+    out = if rl == 2 then kw2(s) else if rl == 3 then kw3(s) else if rl == 4 then kw4(s) else if rl == 5 then kw5(s) else if rl == 12 then kw12(s) else 0
   proofs:
     purity:
       reads : [s]
-      calls : [ident_run, kw2, kw3, kw4, kw5]
+      calls : [ident_run, kw2, kw3, kw4, kw5, kw12]
     termination:
       bound : 16
 
@@ -2777,6 +2824,162 @@ rule parse_match
       bound : 512
 
 
+-- ============================================================================
+-- Result tier slice 1: PARSE Ok(e) / Err(e) / match_result(...).
+-- ============================================================================
+
+-- ok_close / err_close: consume a closing ')' after the single wrapped expression
+-- of an Ok(e) / Err(e), WRAPPING the inner node in AstOk / AstResErr. Mirror of
+-- paren_close, but paren_close passes the inner node through unchanged whereas these
+-- wrap it. Cursor arrives via ParenState { inner } = the parsed inner expression;
+-- the ')' (op 22) is consumed if present, tolerated if absent (same recovery posture
+-- as paren_close). Not in the parse SCC (they do not call parse_or), so a leaf callable.
+rule ok_close
+  @intention: "Consume ')' after an Ok(e)'s inner expression, wrapping it in AstOk"
+  @source: vexprparse.intent:64
+  input:
+    ps : ParenState
+  output:
+    out : Parsed
+  logic:
+    let inner_next = parsed_next(ps.inner)
+    let inner_node = parsed_node(ps.inner)
+    let after_op = peek_op_code(inner_next)
+    let close_pos = if after_op == 22 then advance(Advance { lst: inner_next, k: 1 }) else inner_next
+    out = Parsed::Mk { node: Ast::AstOk { inner: inner_node }, next: close_pos }
+  proofs:
+    purity:
+      reads : [ps.inner]
+      calls : [parsed_next, parsed_node, peek_op_code, advance]
+    termination:
+      bound : 512
+
+
+rule err_close
+  @intention: "Consume ')' after an Err(e)'s inner expression, wrapping it in AstResErr"
+  @source: vexprparse.intent:64
+  input:
+    ps : ParenState
+  output:
+    out : Parsed
+  logic:
+    let inner_next = parsed_next(ps.inner)
+    let inner_node = parsed_node(ps.inner)
+    let after_op = peek_op_code(inner_next)
+    let close_pos = if after_op == 22 then advance(Advance { lst: inner_next, k: 1 }) else inner_next
+    out = Parsed::Mk { node: Ast::AstResErr { inner: inner_node }, next: close_pos }
+  proofs:
+    purity:
+      reads : [ps.inner]
+      calls : [parsed_next, parsed_node, peek_op_code, advance]
+    termination:
+      bound : 512
+
+
+-- MrOkState / MrErrState: the two hand-off states of the match_result parse chain
+-- (parse_match_result -> mr_ok -> mr_err), analogous to the if chain's IfThenState /
+-- IfElseState / IfBuildState. MrOkState carries the parsed scrutinee; MrErrState
+-- carries the scrutinee NODE plus the ok binder span plus the parsed ok body.
+concept MrOkState
+  @intention: "The parsed scrutinee of a match_result, handed to mr_ok"
+  @source: vexprparse.intent:64
+  fields:
+    scrut : Parsed
+
+
+concept MrErrState
+  @intention: "The scrutinee node + the ok binder span + the parsed ok body of a match_result, handed to mr_err"
+  @source: vexprparse.intent:64
+  fields:
+    scrut_node : Ast
+    ok_bstart : number [0, 4000000]
+    ok_blen : number [0, 4000000]
+    ok_body : Parsed
+
+
+-- parse_match_result: build an AstMatchResult node. Cursor positioned at the
+-- `match_result` keyword. The token stream is
+--   match_result ( <scrut> , <ok_binder> => <ok_body> , <err_binder> => <err_body> )
+-- The scrutinee is a full parse_or from st.cell+2 (skipping the keyword and the '(');
+-- it stops at the ',' after the scrutinee. The rest is threaded through mr_ok / mr_err.
+-- Reached only from parse_primary's match_result branch (guarded by the keyword), so
+-- the eager parses are committed. In the parse SCC (calls parse_or), bound-only.
+rule parse_match_result
+  @intention: "Parse a match_result into an AstMatchResult node (scrutinee + two binder arms)"
+  @source: vexprparse.intent:64
+  input:
+    st : ParseState
+  output:
+    out : Parsed
+  logic:
+    let scrut_parsed = parse_or(ParseState { cell: advance(Advance { lst: st.cell, k: 2 }) })
+    out = mr_ok(MrOkState { scrut: scrut_parsed })
+  proofs:
+    purity:
+      reads : [st.cell]
+      calls : [parse_or, mr_ok, advance]
+    termination:
+      bound : 512
+
+
+-- mr_ok: after the scrutinee, skip the ',' (scrut_next+1 lands on the ok binder
+-- IDENT), read the ok binder span, skip the binder + the '=>' (op 2) and parse the
+-- ok body (a full parse_or from binder_cell+2). Hand the scrutinee node + ok binder
+-- span + parsed ok body to mr_err. Analogue of if_then. In the parse SCC, bound-only.
+rule mr_ok
+  @intention: "Parse a match_result's ok arm (binder + body) after the scrutinee, continue to mr_err"
+  @source: vexprparse.intent:64
+  input:
+    mr : MrOkState
+  output:
+    out : Parsed
+  logic:
+    let scrut_node = parsed_node(mr.scrut)
+    let scrut_next = parsed_next(mr.scrut)
+    let binder_cell = advance(Advance { lst: scrut_next, k: 1 })
+    let ok_bstart = peek_start(binder_cell)
+    let ok_blen = peek_len(binder_cell)
+    let ok_body_parsed = parse_or(ParseState { cell: advance(Advance { lst: binder_cell, k: 2 }) })
+    out = mr_err(MrErrState { scrut_node: scrut_node, ok_bstart: ok_bstart, ok_blen: ok_blen, ok_body: ok_body_parsed })
+  proofs:
+    purity:
+      reads : [mr.scrut]
+      calls : [parsed_node, parsed_next, peek_start, peek_len, parse_or, mr_err, advance]
+    termination:
+      bound : 512
+
+
+-- mr_err: after the ok body, skip the ',' (ok_next+1 lands on the err binder IDENT),
+-- read the err binder span, skip the binder + the '=>' and parse the err body. The
+-- err body's end cell should sit at the closing ')' (op 22) — consume it if present.
+-- Assemble the AstMatchResult node carrying both binder spans and all three bodies.
+-- Analogue of if_build. In the parse SCC, bound-only.
+rule mr_err
+  @intention: "Parse a match_result's err arm (binder + body) and assemble the AstMatchResult node"
+  @source: vexprparse.intent:64
+  input:
+    me : MrErrState
+  output:
+    out : Parsed
+  logic:
+    let ok_node = parsed_node(me.ok_body)
+    let ok_next = parsed_next(me.ok_body)
+    let ebinder_cell = advance(Advance { lst: ok_next, k: 1 })
+    let err_bstart = peek_start(ebinder_cell)
+    let err_blen = peek_len(ebinder_cell)
+    let err_body_parsed = parse_or(ParseState { cell: advance(Advance { lst: ebinder_cell, k: 2 }) })
+    let err_node = parsed_node(err_body_parsed)
+    let err_next = parsed_next(err_body_parsed)
+    let close_pos = if peek_op_code(err_next) == 22 then advance(Advance { lst: err_next, k: 1 }) else err_next
+    out = Parsed::Mk { node: Ast::AstMatchResult { scrut: me.scrut_node, ok_bstart: me.ok_bstart, ok_blen: me.ok_blen, ok_body: ok_node, err_bstart: err_bstart, err_blen: err_blen, err_body: err_node }, next: close_pos }
+  proofs:
+    purity:
+      reads : [me.scrut_node, me.ok_bstart, me.ok_blen, me.ok_body]
+      calls : [parsed_node, parsed_next, peek_start, peek_len, peek_op_code, parse_or, advance]
+    termination:
+      bound : 512
+
+
 -- field_rest: fold a chain of '.IDENT' field accesses onto a base AST, left-deep
 -- (a.b.c => AstField(AstField(AstVar(a), b), c)). Peeks the op at fs.pos: a '.'
 -- (op 12) followed by an IDENT consumes both, wraps the base in AstField with
@@ -2934,16 +3137,25 @@ rule parse_primary
     let next_opc = peek_op_code(advance(Advance { lst: st.cell, k: 1 }))
     let iscall = if next_opc == 21 then 1 else 0
     let ismatch = if lead_kind == 211 then 1 else 0
+    -- Result tier slice 1: Ok / Err / match_result are recognized by KEYWORD kind
+    -- (kw2/kw3/kw12 -> kinds 212/213/214), so the source-free parse layer can
+    -- dispatch on lead_kind exactly as it does for `match` (211). Ok(e) / Err(e) are
+    -- intercepted BEFORE the call path (they wrap ONE inner expr, not an arg list);
+    -- match_result is intercepted BEFORE the call path (its `binder => body` arms are
+    -- not argument expressions).
+    let isok = if lead_kind == 212 then 1 else 0
+    let iserr = if lead_kind == 213 then 1 else 0
+    let ismatchresult = if lead_kind == 214 then 1 else 0
     let isvariant = if next_opc == 3 then 1 else 0
     let vstart = peek_start(advance(Advance { lst: st.cell, k: 2 }))
     let vlen = peek_len(advance(Advance { lst: st.cell, k: 2 }))
     let has_braces = if peek_op_code(advance(Advance { lst: st.cell, k: 3 })) == 23 then 1 else 0
     let isrecord = if next_opc == 23 then 1 else 0
-    out = if ismatch == 1 then parse_match(st) else if isif == 1 then if_then(IfThenState { cond: parse_or(ParseState { cell: advance(Advance { lst: st.cell, k: 1 }) }) }) else if istrue == 1 then Parsed::Mk { node: Ast::AstBool { value: 1 }, next: advance(Advance { lst: st.cell, k: 1 }) } else if isfalse == 1 then Parsed::Mk { node: Ast::AstBool { value: 0 }, next: advance(Advance { lst: st.cell, k: 1 }) } else if isnum == 1 then Parsed::Mk { node: Ast::AstNum { value: numval }, next: advance(Advance { lst: st.cell, k: 1 }) } else if isstr == 1 then Parsed::Mk { node: Ast::AstStr { start: sstart, len: slen }, next: advance(Advance { lst: st.cell, k: 1 }) } else if isbytelit == 1 then Parsed::Mk { node: Ast::AstBytes { start: bstart + 2, len: if blen >= 3 then blen - 3 else 0 }, next: advance(Advance { lst: st.cell, k: 1 }) } else if isparen == 1 then paren_close(ParenState { inner: parse_or(ParseState { cell: advance(Advance { lst: st.cell, k: 1 }) }) }) else if isident == 1 then (if isvariant == 1 then (if has_braces == 1 then variant_build(VariantState { cstart: idstart, clen: idlen, vstart: vstart, vlen: vlen, pfields: parse_vfields(ParseState { cell: advance(Advance { lst: st.cell, k: 4 }) }) }) else variant_build(VariantState { cstart: idstart, clen: idlen, vstart: vstart, vlen: vlen, pfields: ParsedVFields::MkVF { fields: VFieldList::VFNil, next: advance(Advance { lst: st.cell, k: 3 }) } })) else if iscall == 1 then call_build(CallState { cstart: idstart, clen: idlen, pargs: parse_args(ParseState { cell: advance(Advance { lst: st.cell, k: 2 }) }) }) else if isrecord == 1 then variant_build(VariantState { cstart: idstart, clen: idlen, vstart: idstart, vlen: idlen, pfields: parse_vfields(ParseState { cell: advance(Advance { lst: st.cell, k: 2 }) }) }) else field_rest(FieldState { cell: advance(Advance { lst: st.cell, k: 1 }), base: Ast::AstVar { start: idstart, len: idlen } })) else Parsed::Mk { node: Ast::AstErr, next: st.cell }
+    out = if ismatch == 1 then parse_match(st) else if ismatchresult == 1 then parse_match_result(st) else if isok == 1 then ok_close(ParenState { inner: parse_or(ParseState { cell: advance(Advance { lst: st.cell, k: 2 }) }) }) else if iserr == 1 then err_close(ParenState { inner: parse_or(ParseState { cell: advance(Advance { lst: st.cell, k: 2 }) }) }) else if isif == 1 then if_then(IfThenState { cond: parse_or(ParseState { cell: advance(Advance { lst: st.cell, k: 1 }) }) }) else if istrue == 1 then Parsed::Mk { node: Ast::AstBool { value: 1 }, next: advance(Advance { lst: st.cell, k: 1 }) } else if isfalse == 1 then Parsed::Mk { node: Ast::AstBool { value: 0 }, next: advance(Advance { lst: st.cell, k: 1 }) } else if isnum == 1 then Parsed::Mk { node: Ast::AstNum { value: numval }, next: advance(Advance { lst: st.cell, k: 1 }) } else if isstr == 1 then Parsed::Mk { node: Ast::AstStr { start: sstart, len: slen }, next: advance(Advance { lst: st.cell, k: 1 }) } else if isbytelit == 1 then Parsed::Mk { node: Ast::AstBytes { start: bstart + 2, len: if blen >= 3 then blen - 3 else 0 }, next: advance(Advance { lst: st.cell, k: 1 }) } else if isparen == 1 then paren_close(ParenState { inner: parse_or(ParseState { cell: advance(Advance { lst: st.cell, k: 1 }) }) }) else if isident == 1 then (if isvariant == 1 then (if has_braces == 1 then variant_build(VariantState { cstart: idstart, clen: idlen, vstart: vstart, vlen: vlen, pfields: parse_vfields(ParseState { cell: advance(Advance { lst: st.cell, k: 4 }) }) }) else variant_build(VariantState { cstart: idstart, clen: idlen, vstart: vstart, vlen: vlen, pfields: ParsedVFields::MkVF { fields: VFieldList::VFNil, next: advance(Advance { lst: st.cell, k: 3 }) } })) else if iscall == 1 then call_build(CallState { cstart: idstart, clen: idlen, pargs: parse_args(ParseState { cell: advance(Advance { lst: st.cell, k: 2 }) }) }) else if isrecord == 1 then variant_build(VariantState { cstart: idstart, clen: idlen, vstart: idstart, vlen: idlen, pfields: parse_vfields(ParseState { cell: advance(Advance { lst: st.cell, k: 2 }) }) }) else field_rest(FieldState { cell: advance(Advance { lst: st.cell, k: 1 }), base: Ast::AstVar { start: idstart, len: idlen } })) else Parsed::Mk { node: Ast::AstErr, next: st.cell }
   proofs:
     purity:
       reads : [st.cell, st]
-      calls : [peek_kind, peek_is_num, peek_is_str, peek_is_bytelit, peek_bytelit_start, peek_bytelit_len, peek_op_code, peek_is_ident, peek_value, peek_str_start, peek_str_len, peek_start, peek_len, if_then, paren_close, parse_or, call_build, parse_args, field_rest, parse_match, variant_build, parse_vfields, advance]
+      calls : [peek_kind, peek_is_num, peek_is_str, peek_is_bytelit, peek_bytelit_start, peek_bytelit_len, peek_op_code, peek_is_ident, peek_value, peek_str_start, peek_str_len, peek_start, peek_len, if_then, paren_close, parse_or, call_build, parse_args, field_rest, parse_match, parse_match_result, ok_close, err_close, variant_build, parse_vfields, advance]
     termination:
       bound : 512
 
@@ -3434,6 +3646,13 @@ rule shape_ast
       -- sub-ASTs makes nested structure count, exactly like AstIf / AstCall.
       AstVariant(cstart, clen, vstart, vlen, fields) => 1000000000 + shape_vfields(fields)
       AstMatch(scrut, arms) => 100000000 + shape_ast(scrut) + shape_arms(arms)
+      -- Result tier slice 1: dedicated bands ABOVE AstBytes's 10^10, each distinct
+      -- and non-colliding (3/4/5 * 10^10), plus the signatures of the sub-ASTs
+      -- (inner for Ok/Err; scrut + both arm bodies for match_result) so nested
+      -- structure counts, exactly like AstIf / AstBin. Hand-derivable fingerprint.
+      AstOk(inner) => 30000000000 + shape_ast(inner)
+      AstResErr(inner) => 40000000000 + shape_ast(inner)
+      AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => 50000000000 + shape_ast(scrut) + shape_ast(ok_body) + shape_ast(err_body)
   proofs:
     purity:
       reads : [e]
@@ -4798,10 +5017,24 @@ rule eval_ast_env
       -- tag equals the scrutinee's, binding the arm's binders positionally to the
       -- scrutinee's payload (eval_match).
       AstMatch(scrut, arms) => eval_match(EvalMatchState { scrutval: eval_ast_env(EvalEnvArg { node: scrut, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts }), arms: arms, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts })
+      -- Result tier slice 1: Ok(e) / Err(e) build a VData with a RESERVED Result tag
+      -- (RESULT_OK_TAG = 60000*256 = 15360000, RESULT_ERR_TAG = 15360001) and a
+      -- single-slot payload [eval(inner)]. The tag is high enough never to collide
+      -- with a real concept's cidx*256+vidx (no program has 60000 concepts), so one
+      -- shape serves Result(number,text) / Result(text,text) / etc. — every value is
+      -- one i64. REUSES the VData / ValueList machinery the variant runtime built.
+      AstOk(inner) => Value::VData { tag: 15360000, payload: ValueList::VLCons { head: eval_ast_env(EvalEnvArg { node: inner, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts }), tail: ValueList::VLNil } }
+      AstResErr(inner) => Value::VData { tag: 15360001, payload: ValueList::VLCons { head: eval_ast_env(EvalEnvArg { node: inner, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts }), tail: ValueList::VLNil } }
+      -- Result tier slice 1: match_result evaluates the scrutinee to a VData, then
+      -- dispatches on its tag (eval_match_result): RESULT_OK_TAG binds the payload
+      -- head to the ok binder and evaluates ok_body; otherwise binds to the err binder
+      -- and evaluates err_body. Reuses the VEnv-extend + vdata_payload machinery
+      -- eval_match already has, specialized to the two fixed Result arms.
+      AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => eval_match_result(EvalMatchResState { scrutval: eval_ast_env(EvalEnvArg { node: scrut, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts }), ok_bstart: ok_bstart, ok_blen: ok_blen, ok_body: ok_body, err_bstart: err_bstart, err_blen: err_blen, err_body: err_body, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts })
   proofs:
     purity:
       reads : [ea.node, ea.env, ea.src, ea.prog, ea.concepts]
-      calls : [eval_ast_env, venv_lookup, eval_call, vnum_of, variant_tag, eval_vfields, eval_match, vdata_payload, vdata_tag, concept_at_index, cd_fields, field_index_of, vlist_nth, span_is_byte_at, span_is_length, span_is_substring, span_is_concat, span_is_le32, span_is_le64, span_is_arena_scope, arg_first, prim_byte_at, prim_length, prim_substring, prim_concat, prim_le32, prim_le64]
+      calls : [eval_ast_env, venv_lookup, eval_call, vnum_of, variant_tag, eval_vfields, eval_match, eval_match_result, vdata_payload, vdata_tag, concept_at_index, cd_fields, field_index_of, vlist_nth, span_is_byte_at, span_is_length, span_is_substring, span_is_concat, span_is_le32, span_is_le64, span_is_arena_scope, arg_first, prim_byte_at, prim_length, prim_substring, prim_concat, prim_le32, prim_le64]
     termination:
       bound : 4000
 
@@ -6285,6 +6518,53 @@ rule eval_match
     purity:
       reads : [em.scrutval, em.arms, em.env, em.src, em.prog, em.concepts]
       calls : [vdata_tag, cd_variants, concept_at_index, find_variant_index, eval_ast_env, bind_val_binders, vdata_payload, eval_match]
+    termination:
+      bound : 4000
+
+
+-- Result tier slice 1: eval_match_result's input — the already-evaluated scrutinee
+-- Value (a Result VData), the two arm binder spans, the two arm bodies, and the
+-- env / src / prog / concepts threaded to eval the selected arm. Mirror of
+-- EvalMatchState but for the two FIXED Result arms (no ArmList — the arms are the
+-- ok / err bodies carried directly).
+concept EvalMatchResState
+  @intention: "The evaluated scrutinee + both binder spans + both arm bodies + env/src/prog/concepts, for dispatching a match_result"
+  @source: vexprparse.intent:36
+  fields:
+    scrutval : Value
+    ok_bstart : number [0, 4000000]
+    ok_blen : number [0, 4000000]
+    ok_body : Ast
+    err_bstart : number [0, 4000000]
+    err_blen : number [0, 4000000]
+    err_body : Ast
+    env : VEnv
+    src : text [..256]
+    prog : RuleList
+    concepts : ConceptList
+
+
+-- eval_match_result: dispatch a match_result. Recover the scrutinee's tag; if it is
+-- RESULT_OK_TAG (15360000) bind the payload head to the ok binder span and evaluate
+-- ok_body; otherwise (RESULT_ERR_TAG, or any non-Ok — total fallback) bind the
+-- payload head to the err binder span and evaluate err_body. Payload head is
+-- vlist_nth(payload, 0) — Ok(x)/Err(x) always carry a single-slot payload [x]. In
+-- the eval SCC (calls eval_ast_env). Bound-only termination + the native recursion
+-- breadcrumb, same posture as eval_match.
+rule eval_match_result
+  @intention: "Dispatch a match_result: bind the payload head to the ok/err binder by the scrutinee's Result tag, eval that arm"
+  @source: vexprparse.intent:36
+  input:
+    em : EvalMatchResState
+  output:
+    out : Value
+  logic:
+    let stag = vdata_tag(em.scrutval)
+    out = if stag == 15360000 then eval_ast_env(EvalEnvArg { node: em.ok_body, env: VEnv::VECons { name_start: em.ok_bstart, name_len: em.ok_blen, val: vlist_nth(VListNthState { vs: vdata_payload(em.scrutval), k: 0 }), rest: em.env }, src: em.src, prog: em.prog, concepts: em.concepts }) else eval_ast_env(EvalEnvArg { node: em.err_body, env: VEnv::VECons { name_start: em.err_bstart, name_len: em.err_blen, val: vlist_nth(VListNthState { vs: vdata_payload(em.scrutval), k: 0 }), rest: em.env }, src: em.src, prog: em.prog, concepts: em.concepts })
+  proofs:
+    purity:
+      reads : [em.scrutval, em.ok_bstart, em.ok_blen, em.ok_body, em.err_bstart, em.err_blen, em.err_body, em.env, em.src, em.prog, em.concepts]
+      calls : [vdata_tag, eval_ast_env, vlist_nth, vdata_payload]
     termination:
       bound : 4000
 
@@ -9602,6 +9882,10 @@ rule count_undef_ast
       -- R6a: a match walks its scrutinee with the current binds, then EACH arm body
       -- with binds EXTENDED by that arm's binders (count_undef_arms scopes them in).
       AstMatch(scrut, arms) => count_undef_ast(UndefAstState { node: scrut, binds: a.binds, src: a.src }) + count_undef_arms(UndefArmsState { arms: arms, binds: a.binds, src: a.src })
+      -- Result tier slice 1 stub (parse + eval only; real handling in a later slice).
+      AstOk(inner) => 0
+      AstResErr(inner) => 0
+      AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => 0
   proofs:
     purity:
       reads : [a.node, a.binds, a.src]
@@ -10122,6 +10406,10 @@ rule count_badcall_ast
       -- body. Arm binders don't affect callee resolution (callees are program-wide),
       -- so count_badcall_arms just threads the same rules into each arm body.
       AstMatch(scrut, arms) => count_badcall_ast(BadCallState { node: scrut, rules: a.rules, src: a.src }) + count_badcall_arms(BadCallArmsState { arms: arms, rules: a.rules, src: a.src })
+      -- Result tier slice 1 stub (parse + eval only; real handling in a later slice).
+      AstOk(inner) => 0
+      AstResErr(inner) => 0
+      AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => 0
   proofs:
     purity:
       reads : [a.node, a.rules, a.src]
@@ -10584,6 +10872,10 @@ rule count_badarity_ast
       -- R6a: a match has no call of its own — walk the scrutinee then every arm
       -- body. Arm binders don't affect arity resolution (callees are program-wide).
       AstMatch(scrut, arms) => count_badarity_ast(BadArityState { node: scrut, rules: a.rules, src: a.src }) + count_badarity_arms(BadArityArmsState { arms: arms, rules: a.rules, src: a.src })
+      -- Result tier slice 1 stub (parse + eval only; real handling in a later slice).
+      AstOk(inner) => 0
+      AstResErr(inner) => 0
+      AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => 0
   proofs:
     purity:
       reads : [a.node, a.rules, a.src]
@@ -11019,6 +11311,10 @@ rule type_of_env
       -- the arm-body types via arms_type. `code - 1000` is computed only on the >= 1000
       -- branch, so the ConceptAtState index is always >= 0. 7777 (no arms) -> ERROR.
       AstMatch(scrut, arms) => if type_of_env(TypeArg { node: scrut, tenv: t.tenv, src: t.src, prog: t.prog, concepts: t.concepts }) < 1000 then 3 else (if arms_type(ArmsTypeState { arms: arms, vlist: cd_variants(concept_at_index(ConceptAtState { concepts: t.concepts, idx: type_of_env(TypeArg { node: scrut, tenv: t.tenv, src: t.src, prog: t.prog, concepts: t.concepts }) - 1000 })), tenv: t.tenv, src: t.src, prog: t.prog, concepts: t.concepts }) == 7777 then 3 else arms_type(ArmsTypeState { arms: arms, vlist: cd_variants(concept_at_index(ConceptAtState { concepts: t.concepts, idx: type_of_env(TypeArg { node: scrut, tenv: t.tenv, src: t.src, prog: t.prog, concepts: t.concepts }) - 1000 })), tenv: t.tenv, src: t.src, prog: t.prog, concepts: t.concepts }))
+      -- Result tier slice 1 stub (parse + eval only; real handling in a later slice).
+      AstOk(inner) => 3
+      AstResErr(inner) => 3
+      AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => 3
   proofs:
     purity:
       reads : [t.node, t.tenv, t.src, t.prog, t.concepts]
@@ -11830,6 +12126,10 @@ rule argtype_ast
       -- R3 stub: real handling in R6/R7 (no arg-type mismatch counted without R6).
       AstVariant(cstart, clen, vstart, vlen, fields) => 0
       AstMatch(scrut, arms) => 0
+      -- Result tier slice 1 stub (parse + eval only; real handling in a later slice).
+      AstOk(inner) => 0
+      AstResErr(inner) => 0
+      AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => 0
       AstBin(op, lhs, rhs) => argtype_ast(ArgTypeState { node: lhs, tenv: a.tenv, src: a.src, prog: a.prog }) + argtype_ast(ArgTypeState { node: rhs, tenv: a.tenv, src: a.src, prog: a.prog })
       AstNeg(inner) => argtype_ast(ArgTypeState { node: inner, tenv: a.tenv, src: a.src, prog: a.prog })
       AstNot(inner) => argtype_ast(ArgTypeState { node: inner, tenv: a.tenv, src: a.src, prog: a.prog })
@@ -12147,6 +12447,10 @@ rule count_undecl_call_ast
       AstErr => 0
       AstVariant(cstart, clen, vstart, vlen, fields) => count_undecl_call_vfields(UndeclCallVFieldsState { fields: fields, rules: a.rules, calls: a.calls, src: a.src })
       AstMatch(scrut, arms) => count_undecl_call_ast(UndeclCallState { node: scrut, rules: a.rules, calls: a.calls, src: a.src }) + count_undecl_call_arms(UndeclCallArmsState { arms: arms, rules: a.rules, calls: a.calls, src: a.src })
+      -- Result tier slice 1 stub (parse + eval only; real handling in a later slice).
+      AstOk(inner) => 0
+      AstResErr(inner) => 0
+      AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => 0
   proofs:
     purity:
       reads : [a.node, a.rules, a.calls, a.src]
@@ -12384,6 +12688,10 @@ rule count_undecl_read_ast
       AstErr => 0
       AstVariant(cstart, clen, vstart, vlen, fields) => count_undecl_read_vfields(UndeclReadVFieldsState { fields: fields, binds: a.binds, reads: a.reads, in_start: a.in_start, in_len: a.in_len, src: a.src })
       AstMatch(scrut, arms) => count_undecl_read_ast(UndeclReadState { node: scrut, binds: a.binds, reads: a.reads, in_start: a.in_start, in_len: a.in_len, src: a.src }) + count_undecl_read_arms(UndeclReadArmsState { arms: arms, binds: a.binds, reads: a.reads, in_start: a.in_start, in_len: a.in_len, src: a.src })
+      -- Result tier slice 1 stub (parse + eval only; real handling in a later slice).
+      AstOk(inner) => 0
+      AstResErr(inner) => 0
+      AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => 0
   proofs:
     purity:
       reads : [a.node, a.binds, a.reads, a.in_start, a.in_len, a.src]
@@ -12761,6 +13069,10 @@ rule term_var_is_input
       AstErr => 0
       AstVariant(cstart, clen, vstart, vlen, fields) => 0
       AstMatch(scrut, arms) => 0
+      -- Result tier slice 1 stub (parse + eval only; real handling in a later slice).
+      AstOk(inner) => 0
+      AstResErr(inner) => 0
+      AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => 0
   proofs:
     purity:
       reads : [a.node, a.in_start, a.in_len, a.src]
@@ -12796,6 +13108,10 @@ rule term_knum_ok
       AstErr => 0
       AstVariant(cstart, clen, vstart, vlen, fields) => 0
       AstMatch(scrut, arms) => 0
+      -- Result tier slice 1 stub (parse + eval only; real handling in a later slice).
+      AstOk(inner) => 0
+      AstResErr(inner) => 0
+      AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => 0
   proofs:
     purity:
       reads : [n]
@@ -12831,6 +13147,10 @@ rule term_base_ok
       AstErr => 0
       AstVariant(cstart, clen, vstart, vlen, fields) => 0
       AstMatch(scrut, arms) => 0
+      -- Result tier slice 1 stub (parse + eval only; real handling in a later slice).
+      AstOk(inner) => 0
+      AstResErr(inner) => 0
+      AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => 0
   proofs:
     purity:
       reads : [a.node, a.rn_start, a.rn_len, a.kind, a.in_start, a.in_len, a.tf_start, a.tf_len, a.sbinds, a.src]
@@ -12865,6 +13185,10 @@ rule term_step_ok
       AstErr => 0
       AstVariant(cstart, clen, vstart, vlen, fields) => 0
       AstMatch(scrut, arms) => 0
+      -- Result tier slice 1 stub (parse + eval only; real handling in a later slice).
+      AstOk(inner) => 0
+      AstResErr(inner) => 0
+      AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => 0
   proofs:
     purity:
       reads : [a.node, a.rn_start, a.rn_len, a.kind, a.in_start, a.in_len, a.tf_start, a.tf_len, a.sbinds, a.src]
@@ -12926,6 +13250,10 @@ rule term_arg_ok
       AstErr => 0
       AstVariant(cstart, clen, vstart, vlen, fields) => if a.kind == 1 then 0 else term_vfield_ok(TermVFieldsState { fields: fields, rn_start: a.rn_start, rn_len: a.rn_len, kind: a.kind, in_start: a.in_start, in_len: a.in_len, tf_start: a.tf_start, tf_len: a.tf_len, sbinds: a.sbinds, src: a.src })
       AstMatch(scrut, arms) => 0
+      -- Result tier slice 1 stub (parse + eval only; real handling in a later slice).
+      AstOk(inner) => 0
+      AstResErr(inner) => 0
+      AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => 0
   proofs:
     purity:
       reads : [a.node, a.rn_start, a.rn_len, a.kind, a.in_start, a.in_len, a.tf_start, a.tf_len, a.sbinds, a.src]
@@ -13034,6 +13362,10 @@ rule count_term_ast
       AstErr => 0
       AstVariant(cstart, clen, vstart, vlen, fields) => count_term_vfields(TermVFieldsState { fields: fields, rn_start: a.rn_start, rn_len: a.rn_len, kind: a.kind, in_start: a.in_start, in_len: a.in_len, tf_start: a.tf_start, tf_len: a.tf_len, sbinds: a.sbinds, src: a.src })
       AstMatch(scrut, arms) => count_term_ast(TermAstState { node: scrut, rn_start: a.rn_start, rn_len: a.rn_len, kind: a.kind, in_start: a.in_start, in_len: a.in_len, tf_start: a.tf_start, tf_len: a.tf_len, sbinds: a.sbinds, src: a.src }) + count_term_arms(TermArmsState { arms: arms, ext: term_var_is_input(TermAstState { node: scrut, rn_start: a.rn_start, rn_len: a.rn_len, kind: a.kind, in_start: a.in_start, in_len: a.in_len, tf_start: a.tf_start, tf_len: a.tf_len, sbinds: a.sbinds, src: a.src }), rn_start: a.rn_start, rn_len: a.rn_len, kind: a.kind, in_start: a.in_start, in_len: a.in_len, tf_start: a.tf_start, tf_len: a.tf_len, sbinds: a.sbinds, src: a.src })
+      -- Result tier slice 1 stub (parse + eval only; real handling in a later slice).
+      AstOk(inner) => 0
+      AstResErr(inner) => 0
+      AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => 0
   proofs:
     purity:
       reads : [a.node, a.rn_start, a.rn_len, a.kind, a.in_start, a.in_len, a.tf_start, a.tf_len, a.sbinds, a.src]
@@ -14133,6 +14465,10 @@ rule undef_span_ast
       -- R6a: scrutinee first, then each arm body with the scope EXTENDED by the
       -- arm's binders (a binder is never "undefined" inside its own arm).
       AstMatch(scrut, arms) => span_or(SpanOrState { a: undef_span_ast(UndefSpanAstState { node: scrut, binds: a.binds, src: a.src }), b: undef_span_arms(UndefSpanArmsState { arms: arms, binds: a.binds, src: a.src }) })
+      -- Result tier slice 1 stub (parse + eval only; real handling in a later slice).
+      AstOk(inner) => Span::MkSpan { start: 9999, len: 0 }
+      AstResErr(inner) => Span::MkSpan { start: 9999, len: 0 }
+      AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => Span::MkSpan { start: 9999, len: 0 }
       AstVar(start, len) => if name_bound(NameBoundState { binds: a.binds, src: a.src, q_start: start, q_len: len }) == 0 then Span::MkSpan { start: start, len: len } else Span::MkSpan { start: 9999, len: 0 }
       AstBin(op, lhs, rhs) => span_or(SpanOrState { a: undef_span_ast(UndefSpanAstState { node: lhs, binds: a.binds, src: a.src }), b: undef_span_ast(UndefSpanAstState { node: rhs, binds: a.binds, src: a.src }) })
       AstNeg(inner) => undef_span_ast(UndefSpanAstState { node: inner, binds: a.binds, src: a.src })
@@ -14459,6 +14795,10 @@ rule badcall_span_ast
       AstVariant(cstart, clen, vstart, vlen, fields) => badcall_span_vfields(BadCallSpanVFieldsState { fields: fields, rules: a.rules, src: a.src })
       -- R6a: scrutinee first, then arm bodies (binders don't affect callee scope).
       AstMatch(scrut, arms) => span_or(SpanOrState { a: badcall_span_ast(BadCallSpanState { node: scrut, rules: a.rules, src: a.src }), b: badcall_span_arms(BadCallSpanArmsState { arms: arms, rules: a.rules, src: a.src }) })
+      -- Result tier slice 1 stub (parse + eval only; real handling in a later slice).
+      AstOk(inner) => Span::MkSpan { start: 9999, len: 0 }
+      AstResErr(inner) => Span::MkSpan { start: 9999, len: 0 }
+      AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => Span::MkSpan { start: 9999, len: 0 }
       AstBin(op, lhs, rhs) => span_or(SpanOrState { a: badcall_span_ast(BadCallSpanState { node: lhs, rules: a.rules, src: a.src }), b: badcall_span_ast(BadCallSpanState { node: rhs, rules: a.rules, src: a.src }) })
       AstNeg(inner) => badcall_span_ast(BadCallSpanState { node: inner, rules: a.rules, src: a.src })
       AstNot(inner) => badcall_span_ast(BadCallSpanState { node: inner, rules: a.rules, src: a.src })
@@ -14720,6 +15060,10 @@ rule badarity_span_ast
       AstVariant(cstart, clen, vstart, vlen, fields) => badarity_span_vfields(BadAritySpanVFieldsState { fields: fields, rules: a.rules, src: a.src })
       -- R6a: scrutinee first, then arm bodies (binders don't affect arity scope).
       AstMatch(scrut, arms) => span_or(SpanOrState { a: badarity_span_ast(BadAritySpanState { node: scrut, rules: a.rules, src: a.src }), b: badarity_span_arms(BadAritySpanArmsState { arms: arms, rules: a.rules, src: a.src }) })
+      -- Result tier slice 1 stub (parse + eval only; real handling in a later slice).
+      AstOk(inner) => Span::MkSpan { start: 9999, len: 0 }
+      AstResErr(inner) => Span::MkSpan { start: 9999, len: 0 }
+      AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => Span::MkSpan { start: 9999, len: 0 }
       AstBin(op, lhs, rhs) => span_or(SpanOrState { a: badarity_span_ast(BadAritySpanState { node: lhs, rules: a.rules, src: a.src }), b: badarity_span_ast(BadAritySpanState { node: rhs, rules: a.rules, src: a.src }) })
       AstNeg(inner) => badarity_span_ast(BadAritySpanState { node: inner, rules: a.rules, src: a.src })
       AstNot(inner) => badarity_span_ast(BadAritySpanState { node: inner, rules: a.rules, src: a.src })
@@ -15104,6 +15448,10 @@ rule print_expr
       -- R3 stub: real handling in R6/R7. "?" placeholder (mirror AstErr).
       AstVariant(cstart, clen, vstart, vlen, fields) => "?"
       AstMatch(scrut, arms) => "?"
+      -- Result tier slice 1 stub (parse + eval only; real handling in a later slice).
+      AstOk(inner) => "?"
+      AstResErr(inner) => "?"
+      AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => "?"
   proofs:
     purity:
       reads : [ps.node, ps.src]
@@ -15252,6 +15600,10 @@ rule lower_expr
       -- R3 stub: real handling in R6/R7. "? " placeholder instruction (mirror AstErr).
       AstVariant(cstart, clen, vstart, vlen, fields) => "? "
       AstMatch(scrut, arms) => "? "
+      -- Result tier slice 1 stub (parse + eval only; real handling in a later slice).
+      AstOk(inner) => "? "
+      AstResErr(inner) => "? "
+      AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => "? "
   proofs:
     purity:
       reads : [ps.node, ps.src]
@@ -15378,6 +15730,10 @@ rule x86_expr
       -- R3 stub: real handling in R6/R7. 0xCC (int3 trap) placeholder (mirror AstErr).
       AstVariant(cstart, clen, vstart, vlen, fields) => b"\xcc"
       AstMatch(scrut, arms) => b"\xcc"
+      -- Result tier slice 1 stub (parse + eval only; real handling in a later slice).
+      AstOk(inner) => b"\xcc"
+      AstResErr(inner) => b"\xcc"
+      AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => b"\xcc"
   proofs:
     purity:
       reads : [ps.node, ps.src]
@@ -15426,6 +15782,10 @@ rule code_size_expr
       -- R3 stub: real handling in R6/R7. 1 byte (matches the b"\xcc" trap stub above).
       AstVariant(cstart, clen, vstart, vlen, fields) => 1
       AstMatch(scrut, arms) => 1
+      -- Result tier slice 1 stub (parse + eval only; real handling in a later slice).
+      AstOk(inner) => 1
+      AstResErr(inner) => 1
+      AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => 1
   proofs:
     purity:
       reads : [ps.node, ps.src]
@@ -15723,6 +16083,10 @@ rule ast_is_variant
       AstErr => 0
       AstVariant(cstart, clen, vstart, vlen, fields) => 1
       AstMatch(scrut, arms) => 0
+      -- Result tier slice 1 stub (parse + eval only; real handling in a later slice).
+      AstOk(inner) => 0
+      AstResErr(inner) => 0
+      AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => 0
   proofs:
     purity:
       reads : [n]
@@ -15754,6 +16118,10 @@ rule ast_variant_cstart
       AstErr => 0
       AstVariant(cstart, clen, vstart, vlen, fields) => cstart
       AstMatch(scrut, arms) => 0
+      -- Result tier slice 1 stub (parse + eval only; real handling in a later slice).
+      AstOk(inner) => 0
+      AstResErr(inner) => 0
+      AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => 0
   proofs:
     purity:
       reads : [n]
@@ -15785,6 +16153,10 @@ rule ast_variant_clen
       AstErr => 0
       AstVariant(cstart, clen, vstart, vlen, fields) => clen
       AstMatch(scrut, arms) => 0
+      -- Result tier slice 1 stub (parse + eval only; real handling in a later slice).
+      AstOk(inner) => 0
+      AstResErr(inner) => 0
+      AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => 0
   proofs:
     purity:
       reads : [n]
@@ -15908,6 +16280,10 @@ rule static_concept_of
       AstErr => 0 - 1
       AstVariant(cstart, clen, vstart, vlen, fields) => if find_concept_index(FindConceptIdxState { concepts: sc.concepts, src: sc.src, q_start: cstart, q_len: clen, idx: 0 }) == 999999 then 0 - 1 else find_concept_index(FindConceptIdxState { concepts: sc.concepts, src: sc.src, q_start: cstart, q_len: clen, idx: 0 })
       AstMatch(scrut, arms) => 0 - 1
+      -- Result tier slice 1 stub (parse + eval only; real handling in a later slice).
+      AstOk(inner) => 0 - 1
+      AstResErr(inner) => 0 - 1
+      AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => 0 - 1
   proofs:
     purity:
       reads : [sc.node, sc.src, sc.params, sc.lets, sc.concepts]
@@ -16148,6 +16524,10 @@ rule ast_uses_text
       AstIf(cond, thn, els) => if ast_uses_text(PrintState { node: cond, src: ps.src }) == 1 then 1 else if ast_uses_text(PrintState { node: thn, src: ps.src }) == 1 then 1 else ast_uses_text(PrintState { node: els, src: ps.src })
       AstVariant(cstart, clen, vstart, vlen, fields) => vfields_use_text(UsesTextVFields { fields: fields, src: ps.src })
       AstMatch(scrut, arms) => if ast_uses_text(PrintState { node: scrut, src: ps.src }) == 1 then 1 else arms_use_text(UsesTextArms { arms: arms, src: ps.src })
+      -- Result tier slice 1 stub (parse + eval only; real handling in a later slice).
+      AstOk(inner) => 0
+      AstResErr(inner) => 0
+      AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => 0
   proofs:
     purity:
       reads : [ps.node, ps.src]
@@ -16319,6 +16699,10 @@ rule ast_texty_shallow
       AstIf(cond, thn, els) => if ast_texty_shallow(PrintState { node: thn, src: ps.src }) == 1 then 1 else ast_texty_shallow(PrintState { node: els, src: ps.src })
       AstVariant(cstart, clen, vstart, vlen, fields) => 0
       AstMatch(scrut, arms) => arms_texty_shallow(UsesTextArms { arms: arms, src: ps.src })
+      -- Result tier slice 1 stub (parse + eval only; real handling in a later slice).
+      AstOk(inner) => 0
+      AstResErr(inner) => 0
+      AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => 0
   proofs:
     purity:
       reads : [ps.node, ps.src]
@@ -16376,6 +16760,10 @@ rule ast_is_texty
       AstIf(cond, thn, els) => if ast_is_texty(TextyState { node: thn, src: ts.src, prog: ts.prog }) == 1 then 1 else ast_is_texty(TextyState { node: els, src: ts.src, prog: ts.prog })
       AstVariant(cstart, clen, vstart, vlen, fields) => 0
       AstMatch(scrut, arms) => arms_is_texty(TextyArms { arms: arms, src: ts.src, prog: ts.prog })
+      -- Result tier slice 1 stub (parse + eval only; real handling in a later slice).
+      AstOk(inner) => 0
+      AstResErr(inner) => 0
+      AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => 0
   proofs:
     purity:
       reads : [ts.node, ts.src, ts.prog]
@@ -16520,6 +16908,10 @@ rule ast_bytes_shallow
       AstIf(cond, thn, els) => if ast_bytes_shallow(TextyState { node: thn, src: ts.src, prog: ts.prog }) == 1 then 1 else ast_bytes_shallow(TextyState { node: els, src: ts.src, prog: ts.prog })
       AstVariant(cstart, clen, vstart, vlen, fields) => 0
       AstMatch(scrut, arms) => arms_shallow_bytes(TextyArms { arms: arms, src: ts.src, prog: ts.prog })
+      -- Result tier slice 1 stub (parse + eval only; real handling in a later slice).
+      AstOk(inner) => 0
+      AstResErr(inner) => 0
+      AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => 0
   proofs:
     purity:
       reads : [ts.node, ts.src, ts.prog]
@@ -16557,6 +16949,10 @@ rule ast_is_bytes
       AstIf(cond, thn, els) => if ast_is_bytes(TextyState { node: thn, src: ts.src, prog: ts.prog }) == 1 then 1 else ast_is_bytes(TextyState { node: els, src: ts.src, prog: ts.prog })
       AstVariant(cstart, clen, vstart, vlen, fields) => 0
       AstMatch(scrut, arms) => arms_are_bytes(TextyArms { arms: arms, src: ts.src, prog: ts.prog })
+      -- Result tier slice 1 stub (parse + eval only; real handling in a later slice).
+      AstOk(inner) => 0
+      AstResErr(inner) => 0
+      AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => 0
   proofs:
     purity:
       reads : [ts.node, ts.src, ts.prog]
@@ -16859,6 +17255,10 @@ rule mb_ast
       AstErr => 0
       AstVariant(cstart, clen, vstart, vlen, fields) => mb_vfields(fields)
       AstMatch(scrut, arms) => mb_ast(scrut) + mb_arms(arms)
+      -- Result tier slice 1 stub (parse + eval only; real handling in a later slice).
+      AstOk(inner) => 0
+      AstResErr(inner) => 0
+      AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => 0
   proofs:
     purity:
       reads : [n]
@@ -17239,6 +17639,10 @@ rule code_size_node
       -- mov rcx,[rax]) + 13 per arm (cmp rcx,tag 7 + je 6) + 9 (default: xor rax,rax 3
       -- + push rax 1 + jmp end 5) + code_size_arms (the arm blocks). Must match x86_node.
       AstMatch(scrut, arms) => code_size_node(ByteGenState { node: scrut, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + 14 + 13 * arm_list_len(arms) + 9 + code_size_arms(ArmSizeState { arms: arms, src: bg.src, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes })
+      -- Result tier slice 1 stub (parse + eval only; real handling in a later slice).
+      AstOk(inner) => 1
+      AstResErr(inner) => 1
+      AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => 1
   proofs:
     purity:
       reads : [bg.node, bg.src, bg.off, bg.params, bg.lets, bg.prog, bg.concepts, bg.sizes]
@@ -17557,6 +17961,10 @@ rule x86_node
       -- skips all arm blocks); then the arm blocks (x86_arms). Each arm binds its
       -- payload into the reserved binder slots, runs its body, and jmps to end.
       AstMatch(scrut, arms) => concat(x86_node(ByteGenState { node: scrut, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }), b"\x58\x48\x69\xc0", le32(8 * (max_payload_fields(bg.concepts) + 1)), b"\x4c\x01\xf8\x48\x8b\x08", x86_dispatch(DispatchState { arms: arms, src: bg.src, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, rest_disp: 13 * (arm_list_len(arms) - 1), pre_arms: 0 }), b"\x48\x31\xc0\x50\xe9", le32(code_size_arms(ArmSizeState { arms: arms, src: bg.src, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes })), x86_arms(ArmGenState { arms: arms, src: bg.src, off: bg.off + code_size_node(ByteGenState { node: scrut, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + 14 + 13 * arm_list_len(arms) + 9, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }))
+      -- Result tier slice 1 stub (parse + eval only; real handling in a later slice).
+      AstOk(inner) => b"\xcc"
+      AstResErr(inner) => b"\xcc"
+      AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => b"\xcc"
   proofs:
     purity:
       reads : [bg.node, bg.src, bg.off, bg.params, bg.lets, bg.prog, bg.concepts, bg.sizes]
@@ -17682,6 +18090,10 @@ rule code_size_stream_node
       AstVariant(cstart, clen, vstart, vlen, fields) => code_size_node(bg) + 6
       AstIf(cond, thn, els) => code_size_node(ByteGenState { node: cond, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + 15 + code_size_stream_node(ByteGenState { node: thn, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + code_size_stream_node(ByteGenState { node: els, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes })
       AstMatch(scrut, arms) => code_size_node(ByteGenState { node: scrut, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + 14 + 13 * arm_list_len(arms) + 5 + stream_size_arms(ArmSizeState { arms: arms, src: bg.src, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes })
+      -- Result tier slice 1 stub (parse + eval only; real handling in a later slice).
+      AstOk(inner) => 1
+      AstResErr(inner) => 1
+      AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => 1
       AstCall(callee_start, callee_len, args) => if span_is_concat(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then stream_size_cargs(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) else if span_is_arena_scope(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then 2 + code_size_stream_node(ByteGenState { node: arg_first(args), src: bg.src, off: bg.off + 2, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + 2 else if span_is_le32(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then code_size_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + 34 else if span_is_le64(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then code_size_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + 34 else if span_is_substring(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then 1 else if span_is_byte_at(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then code_size_node(bg) + 6 else if span_is_length(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then code_size_node(bg) + 6 else if callee_is_texty(FindRuleState { rules: bg.prog, src: bg.src, q_start: callee_start, q_len: callee_len }) == 1 then code_size_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + 12 else code_size_node(bg) + 6
   proofs:
     purity:
@@ -17821,6 +18233,10 @@ rule x86_stream_node
       AstVariant(cstart, clen, vstart, vlen, fields) => concat(x86_node(bg), b"\x58\xe8", le32(0 - (bg.off + code_size_node(bg) + 92)))
       AstIf(cond, thn, els) => concat(x86_node(ByteGenState { node: cond, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }), b"\x58\x48\x85\xc0\x0f\x84", le32(code_size_stream_node(ByteGenState { node: thn, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + 5), x86_stream_node(ByteGenState { node: thn, src: bg.src, off: bg.off + code_size_node(ByteGenState { node: cond, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + 10, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }), b"\xe9", le32(code_size_stream_node(ByteGenState { node: els, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes })), x86_stream_node(ByteGenState { node: els, src: bg.src, off: bg.off + code_size_node(ByteGenState { node: cond, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + 15 + code_size_stream_node(ByteGenState { node: thn, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }), params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }))
       AstMatch(scrut, arms) => concat(x86_node(ByteGenState { node: scrut, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }), b"\x58\x48\x69\xc0", le32(8 * (max_payload_fields(bg.concepts) + 1)), b"\x4c\x01\xf8\x48\x8b\x08", x86_stream_dispatch(DispatchState { arms: arms, src: bg.src, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, rest_disp: 13 * (arm_list_len(arms) - 1), pre_arms: 0 }), b"\xe9", le32(stream_size_arms(ArmSizeState { arms: arms, src: bg.src, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes })), x86_stream_arms(ArmGenState { arms: arms, src: bg.src, off: bg.off + code_size_node(ByteGenState { node: scrut, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + 14 + 13 * arm_list_len(arms) + 5, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }))
+      -- Result tier slice 1 stub (parse + eval only; real handling in a later slice).
+      AstOk(inner) => b"\xcc"
+      AstResErr(inner) => b"\xcc"
+      AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => b"\xcc"
       AstCall(callee_start, callee_len, args) => if span_is_concat(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then x86_stream_cargs(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) else if span_is_arena_scope(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then concat(b"\x41\x56", x86_stream_node(ByteGenState { node: arg_first(args), src: bg.src, off: bg.off + 2, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }), b"\x41\x5e") else if span_is_le32(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then concat(x86_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }), b"\x58\x48\x89\x44\x24\xf8\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x48\x8d\x74\x24\xf8\x48\xc7\xc2\x04\x00\x00\x00\x0f\x05") else if span_is_le64(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then concat(x86_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }), b"\x58\x48\x89\x44\x24\xf8\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x48\x8d\x74\x24\xf8\x48\xc7\xc2\x08\x00\x00\x00\x0f\x05") else if span_is_substring(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then b"\xcc" else if span_is_byte_at(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then concat(x86_node(bg), b"\x58\xe8", le32(0 - (bg.off + code_size_node(bg) + 92))) else if span_is_length(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then concat(x86_node(bg), b"\x58\xe8", le32(0 - (bg.off + code_size_node(bg) + 92))) else if callee_is_texty(FindRuleState { rules: bg.prog, src: bg.src, q_start: callee_start, q_len: callee_len }) == 1 then concat(x86_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }), b"\xe8", le32(proc_offset(ProcOffState { rules: bg.prog, src: bg.src, acc: 0, q_start: callee_start, q_len: callee_len, concepts: bg.concepts, sizes: bg.sizes }) - (bg.off + code_size_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + 5)), b"\x48\x81\xc4", le32(8 * arg_list_len(args))) else concat(x86_node(bg), b"\x58\xe8", le32(0 - (bg.off + code_size_node(bg) + 92)))
   proofs:
     purity:
