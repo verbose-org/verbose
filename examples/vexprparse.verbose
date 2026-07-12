@@ -16643,6 +16643,190 @@ rule program_uses_text
 
 
 -- ============================================================================
+-- Result-tier arena gate (slice 2). Ok(e) / Err(e) compile to a 2-slot arena
+-- node (tag + 1 payload) and match_result reads it back (x86_node), so ANY
+-- program using a Result node needs the mmap arena prologue AND entry_size >= 16
+-- — exactly like a program that declares a concept. But Ok/Err carry NO concept
+-- declaration, so the ConceptList alone can't reveal the need. program_uses_result
+-- walks the rule bodies for AstOk / AstResErr / AstMatchResult (the AST node IS
+-- the usage signal). x86_program_src / elf_program_src consult it ONCE at the top
+-- and, when 1, append a synthetic 1-field concept to the ConceptList: a field
+-- lifts program_uses_arena (arena prologue) AND concept_arena_arity >= 1 lifts
+-- max_payload_fields (entry_size >= 16), at every downstream site, with ZERO
+-- per-node cost (the walk runs once; the concept rides the list already threaded).
+-- A program with no Result nodes returns 0 -> no injection -> byte-identical
+-- (vexprparse's own source uses zero Result, so the two-generation fixed point is
+-- untouched). Reuses the uses-text walk concepts (PrintState / UsesText*).
+-- ============================================================================
+
+-- ast_uses_result: 1 iff the subtree contains an AstOk / AstResErr / AstMatchResult
+-- anywhere. Same structural walk as ast_uses_text; the three Result nodes are the
+-- leaves that return 1, every other shape recurses into its children.
+rule ast_uses_result
+  @intention: "1 if a subtree contains a Result node (Ok / Err / match_result), 0 otherwise"
+  @source: vexprparse.intent:66
+  input:
+    ps : PrintState
+  output:
+    out : number
+  logic:
+    out = match ps.node:
+      AstNum(value) => 0
+      AstBool(value) => 0
+      AstVar(start, len) => 0
+      AstErr => 0
+      AstStr(start, len) => 0
+      AstBytes(start, len) => 0
+      AstBin(op, lhs, rhs) => if ast_uses_result(PrintState { node: lhs, src: ps.src }) == 1 then 1 else ast_uses_result(PrintState { node: rhs, src: ps.src })
+      AstNeg(inner) => ast_uses_result(PrintState { node: inner, src: ps.src })
+      AstNot(inner) => ast_uses_result(PrintState { node: inner, src: ps.src })
+      AstField(base, fstart, flen) => ast_uses_result(PrintState { node: base, src: ps.src })
+      AstCall(callee_start, callee_len, args) => args_use_result(PrintArgsState { args: args, src: ps.src })
+      AstIf(cond, thn, els) => if ast_uses_result(PrintState { node: cond, src: ps.src }) == 1 then 1 else if ast_uses_result(PrintState { node: thn, src: ps.src }) == 1 then 1 else ast_uses_result(PrintState { node: els, src: ps.src })
+      AstVariant(cstart, clen, vstart, vlen, fields) => vfields_use_result(UsesTextVFields { fields: fields, src: ps.src })
+      AstMatch(scrut, arms) => if ast_uses_result(PrintState { node: scrut, src: ps.src }) == 1 then 1 else arms_use_result(UsesTextArms { arms: arms, src: ps.src })
+      AstOk(inner) => 1
+      AstResErr(inner) => 1
+      AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => 1
+  proofs:
+    purity:
+      reads : [ps.node, ps.src]
+      calls : [ast_uses_result, args_use_result, vfields_use_result, arms_use_result]
+    termination:
+      bound : 8000
+
+
+-- args_use_result: the uses-result walk over a call's argument list. ArgNil -> 0.
+rule args_use_result
+  @intention: "1 if any call argument's subtree uses a Result node, 0 otherwise"
+  @source: vexprparse.intent:66
+  input:
+    pa : PrintArgsState
+  output:
+    out : number
+  logic:
+    out = match pa.args:
+      ArgCons(head, tail) => if ast_uses_result(PrintState { node: head, src: pa.src }) == 1 then 1 else args_use_result(PrintArgsState { args: tail, src: pa.src })
+      ArgNil => 0
+  proofs:
+    purity:
+      reads : [pa.args, pa.src]
+      calls : [ast_uses_result, args_use_result]
+    termination:
+      bound : 8000
+
+
+-- vfields_use_result: the uses-result walk over a variant construction's field
+-- initializers. VFNil -> 0.
+rule vfields_use_result
+  @intention: "1 if any variant-construction field value's subtree uses a Result node, 0 otherwise"
+  @source: vexprparse.intent:66
+  input:
+    uv : UsesTextVFields
+  output:
+    out : number
+  logic:
+    out = match uv.fields:
+      VFCons(name_start, name_len, val, rest) => if ast_uses_result(PrintState { node: val, src: uv.src }) == 1 then 1 else vfields_use_result(UsesTextVFields { fields: rest, src: uv.src })
+      VFNil => 0
+  proofs:
+    purity:
+      reads : [uv.fields, uv.src]
+      calls : [ast_uses_result, vfields_use_result]
+    termination:
+      bound : 8000
+
+
+-- arms_use_result: the uses-result walk over a match's arm bodies. ArmNil -> 0.
+rule arms_use_result
+  @intention: "1 if any match arm body's subtree uses a Result node, 0 otherwise"
+  @source: vexprparse.intent:66
+  input:
+    ua : UsesTextArms
+  output:
+    out : number
+  logic:
+    out = match ua.arms:
+      ArmCons(vstart, vlen, binders, body, rest) => if ast_uses_result(PrintState { node: body, src: ua.src }) == 1 then 1 else arms_use_result(UsesTextArms { arms: rest, src: ua.src })
+      ArmNil => 0
+  proofs:
+    purity:
+      reads : [ua.arms, ua.src]
+      calls : [ast_uses_result, arms_use_result]
+    termination:
+      bound : 8000
+
+
+-- binds_use_result: the uses-result walk over a rule's let bindings. BNil -> 0.
+rule binds_use_result
+  @intention: "1 if any let binding's RHS subtree uses a Result node, 0 otherwise"
+  @source: vexprparse.intent:66
+  input:
+    ub : UsesTextBinds
+  output:
+    out : number
+  logic:
+    out = match ub.binds:
+      BCons(name_start, name_len, value, rest) => if ast_uses_result(PrintState { node: value, src: ub.src }) == 1 then 1 else binds_use_result(UsesTextBinds { binds: rest, src: ub.src })
+      BNil => 0
+  proofs:
+    purity:
+      reads : [ub.binds, ub.src]
+      calls : [ast_uses_result, binds_use_result]
+    termination:
+      bound : 8000
+
+
+-- program_uses_result: the program-level gate. Walks every rule's body — let
+-- bindings first, then the block result — early-outing on the first Result node.
+-- Called ONCE per emit (x86_program_src / elf_program_src), O(program). RNil -> 0.
+rule program_uses_result
+  @intention: "1 if any rule body in the program uses a Result node (Ok / Err / match_result), 0 otherwise"
+  @source: vexprparse.intent:66
+  input:
+    ur : UsesTextRules
+  output:
+    out : number
+  logic:
+    out = match ur.rules:
+      RCons(head, tail) => if binds_use_result(UsesTextBinds { binds: block_binds(rd_body(head)), src: ur.src }) == 1 then 1 else if ast_uses_result(PrintState { node: block_result(rd_body(head)), src: ur.src }) == 1 then 1 else program_uses_result(UsesTextRules { rules: tail, src: ur.src })
+      RNil => 0
+  proofs:
+    purity:
+      reads : [ur.rules, ur.src]
+      calls : [binds_use_result, ast_uses_result, program_uses_result, block_binds, rd_body, block_result]
+    termination:
+      bound : 8000
+
+
+-- concepts_append_result: append a synthetic 1-field concept at the TAIL of a
+-- concept list. A field makes program_uses_arena return 1 (arena prologue) and
+-- concept_arena_arity 1 makes max_payload_fields >= 1 (entry_size >= 16 = one tag
+-- + one payload slot, exactly a Result node's shape). Appended at the tail so
+-- every real concept keeps its index (variant_tag / find_concept_index unchanged);
+-- the synthetic declares NO variants, so arm_tag_by_name skips it. The field's
+-- name/type spans are dummy zeros — only field_list_len / concept_arena_arity read
+-- it, and both just count. Called only when program_uses_result is 1.
+rule concepts_append_result
+  @intention: "Append a synthetic 1-field concept at the tail of a concept list (arena + entry_size >= 16 for a concept-less Result program)"
+  @source: vexprparse.intent:66
+  input:
+    cl : ConceptList
+  output:
+    out : ConceptList
+  logic:
+    out = match cl:
+      CCons(head, tail) => ConceptList::CCons { head: head, tail: concepts_append_result(tail) }
+      CNil => ConceptList::CCons { head: Concept::MkConcept { name_start: 0, name_len: 0, fields: FieldList::FCons { name_start: 0, name_len: 0, ty: 0, ty_start: 0, ty_len: 0, rest: FieldList::FNil }, variants: VariantList::VarNil }, tail: ConceptList::CNil }
+  proofs:
+    purity:
+      reads : [cl]
+      calls : [concepts_append_result]
+    termination:
+      bound : 4000
+
+
+-- ============================================================================
 -- STREAMING slice — mode decision (docs/self-hosting-streaming-design.md).
 -- A rule STREAMS iff its block result is text-shaped: AstStr, a concat(...)
 -- call, an if/match with a texty arm, or a call to a defined rule whose result
@@ -17255,10 +17439,15 @@ rule mb_ast
       AstErr => 0
       AstVariant(cstart, clen, vstart, vlen, fields) => mb_vfields(fields)
       AstMatch(scrut, arms) => mb_ast(scrut) + mb_arms(arms)
-      -- Result tier slice 1 stub (parse + eval only; real handling in a later slice).
-      AstOk(inner) => 0
-      AstResErr(inner) => 0
-      AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => 0
+      -- Result tier slice 2 (codegen): Ok/Err carry no match binders (just recurse
+      -- into the payload). A match_result binds exactly ONE binder per arm (ok + err
+      -- = 2), plus any binders nested in the scrutinee / arm bodies. x86_node's
+      -- AstMatchResult emit reserves these binder slots via the widened `sub rsp`
+      -- (proc_size / x86_proc sum mb_ast(result) + mb_binds(binds)) — a safe
+      -- over-reservation, the same discipline AstMatch uses via mb_arms.
+      AstOk(inner) => mb_ast(inner)
+      AstResErr(inner) => mb_ast(inner)
+      AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => 2 + mb_ast(scrut) + mb_ast(ok_body) + mb_ast(err_body)
   proofs:
     purity:
       reads : [n]
@@ -17639,14 +17828,20 @@ rule code_size_node
       -- mov rcx,[rax]) + 13 per arm (cmp rcx,tag 7 + je 6) + 9 (default: xor rax,rax 3
       -- + push rax 1 + jmp end 5) + code_size_arms (the arm blocks). Must match x86_node.
       AstMatch(scrut, arms) => code_size_node(ByteGenState { node: scrut, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + 14 + 13 * arm_list_len(arms) + 9 + code_size_arms(ArmSizeState { arms: arms, src: bg.src, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes })
-      -- Result tier slice 1 stub (parse + eval only; real handling in a later slice).
-      AstOk(inner) => 1
-      AstResErr(inner) => 1
-      AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => 1
+      -- Result tier slice 2 (codegen): Ok/Err = inner code + a fixed 33-byte arena
+      -- write suffix (mov rax,r14 3 + imul 7 + add rax,r15 3 + mov qword[rax],TAG 7 +
+      -- pop rcx 1 + mov [rax+8],rcx 7 + push r14 2 + inc r14 3) — byte-identical to a
+      -- 1-field AstVariant modulo the tag immediate. match_result = scrut code + 60
+      -- fixed (prefix 14 + dispatch 13 + err binder 14 + jmp end 5 + ok binder 14) +
+      -- both arm bodies (each sized with its ONE binder appended to the scope, exactly
+      -- as AstMatch sizes arms). Must match x86_node's AstMatchResult emit byte-for-byte.
+      AstOk(inner) => code_size_node(ByteGenState { node: inner, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + 33
+      AstResErr(inner) => code_size_node(ByteGenState { node: inner, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + 33
+      AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => code_size_node(ByteGenState { node: scrut, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + 60 + code_size_node(ByteGenState { node: err_body, src: bg.src, off: 0, params: bg.params, lets: lets_append_binders(AppendBindersState { lets: bg.lets, bs: BinderList::BindCons { start: err_bstart, len: err_blen, rest: BinderList::BindNil } }), prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + code_size_node(ByteGenState { node: ok_body, src: bg.src, off: 0, params: bg.params, lets: lets_append_binders(AppendBindersState { lets: bg.lets, bs: BinderList::BindCons { start: ok_bstart, len: ok_blen, rest: BinderList::BindNil } }), prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes })
   proofs:
     purity:
       reads : [bg.node, bg.src, bg.off, bg.params, bg.lets, bg.prog, bg.concepts, bg.sizes]
-      calls : [code_size_node, code_size_args, code_size_vfields, vfield_len, arm_list_len, code_size_arms, static_concept_of, span_is_byte_at, span_is_length, span_is_substring, span_is_max, span_is_min, span_is_arena_scope, span_is_concat, callee_is_texty, arg_list_len]
+      calls : [code_size_node, code_size_args, code_size_vfields, vfield_len, arm_list_len, code_size_arms, static_concept_of, span_is_byte_at, span_is_length, span_is_substring, span_is_max, span_is_min, span_is_arena_scope, span_is_concat, callee_is_texty, arg_list_len, lets_append_binders]
     termination:
       bound : 8000
 
@@ -17961,14 +18156,33 @@ rule x86_node
       -- skips all arm blocks); then the arm blocks (x86_arms). Each arm binds its
       -- payload into the reserved binder slots, runs its body, and jmps to end.
       AstMatch(scrut, arms) => concat(x86_node(ByteGenState { node: scrut, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }), b"\x58\x48\x69\xc0", le32(8 * (max_payload_fields(bg.concepts) + 1)), b"\x4c\x01\xf8\x48\x8b\x08", x86_dispatch(DispatchState { arms: arms, src: bg.src, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, rest_disp: 13 * (arm_list_len(arms) - 1), pre_arms: 0 }), b"\x48\x31\xc0\x50\xe9", le32(code_size_arms(ArmSizeState { arms: arms, src: bg.src, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes })), x86_arms(ArmGenState { arms: arms, src: bg.src, off: bg.off + code_size_node(ByteGenState { node: scrut, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + 14 + 13 * arm_list_len(arms) + 9, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }))
-      -- Result tier slice 1 stub (parse + eval only; real handling in a later slice).
-      AstOk(inner) => b"\xcc"
-      AstResErr(inner) => b"\xcc"
-      AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => b"\xcc"
+      -- Result tier slice 2 (codegen): Ok(e) / Err(e) allocate a 2-slot arena node
+      -- (tag + 1 payload), REUSING the AstVariant arena-write shape with the fixed
+      -- RESULT tags. Emit the payload value (x86_node(inner) leaves it on the stack),
+      -- then: mov rax,r14 ; imul rax,rax,entry_size ; add rax,r15 (node_addr) ;
+      -- mov qword[rax],TAG (15360000 for Ok, 15360001 for Err) ; pop rcx ;
+      -- mov [rax+8],rcx (the 1-field vpop) ; push r14 (the value = its arena index) ;
+      -- inc r14. Byte-identical to a 1-field AstVariant except the tag immediate.
+      AstOk(inner) => concat(x86_node(ByteGenState { node: inner, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }), b"\x4c\x89\xf0\x48\x69\xc0", le32(8 * (max_payload_fields(bg.concepts) + 1)), b"\x4c\x01\xf8\x48\xc7\x00", le32(15360000), b"\x59\x48\x89\x88", le32(8), b"\x41\x56\x49\xff\xc6")
+      AstResErr(inner) => concat(x86_node(ByteGenState { node: inner, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }), b"\x4c\x89\xf0\x48\x69\xc0", le32(8 * (max_payload_fields(bg.concepts) + 1)), b"\x4c\x01\xf8\x48\xc7\x00", le32(15360001), b"\x59\x48\x89\x88", le32(8), b"\x41\x56\x49\xff\xc6")
+      -- Result tier slice 2 (codegen): match_result = a FIXED 2-way tag dispatch,
+      -- REUSING the AstMatch prefix + binder-load machinery. Emit scrut (pushes the
+      -- Result node's arena index); pop rax ; imul rax,rax,entry_size ; add rax,r15
+      -- (node_addr) ; mov rcx,[rax] (load the Result tag). Dispatch: cmp rcx,OK_TAG ;
+      -- je ok_block (skips the err_block = 19 + err_body bytes). The err_block falls
+      -- through (interpreter semantics: OK -> ok arm, ANYTHING else -> err arm): bind
+      -- payload [rax+8] into the err binder slot (x86_binder_loads, base_slot =
+      -- count_binds(bg.lets)), emit err_body (scope = bg.lets + err binder), jmp end
+      -- (skips ok_block = 14 + ok_body). ok_block: bind payload into the ok binder
+      -- slot, emit ok_body (scope = bg.lets + ok binder), fall through to end. Both
+      -- arms leave their value on the stack; rax survives as node_addr because nothing
+      -- between the prefix and each arm touches it. `off` threads so nested calls in
+      -- either arm body land their rel32 (code_size_node mirrors this exactly).
+      AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => concat(x86_node(ByteGenState { node: scrut, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }), b"\x58\x48\x69\xc0", le32(8 * (max_payload_fields(bg.concepts) + 1)), b"\x4c\x01\xf8\x48\x8b\x08", b"\x48\x81\xf9", le32(15360000), b"\x0f\x84", le32(19 + code_size_node(ByteGenState { node: err_body, src: bg.src, off: 0, params: bg.params, lets: lets_append_binders(AppendBindersState { lets: bg.lets, bs: BinderList::BindCons { start: err_bstart, len: err_blen, rest: BinderList::BindNil } }), prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes })), x86_binder_loads(BinderLoadState { binders: BinderList::BindCons { start: err_bstart, len: err_blen, rest: BinderList::BindNil }, j: 0, base_slot: count_binds(bg.lets) }), x86_node(ByteGenState { node: err_body, src: bg.src, off: bg.off + code_size_node(ByteGenState { node: scrut, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + 41, params: bg.params, lets: lets_append_binders(AppendBindersState { lets: bg.lets, bs: BinderList::BindCons { start: err_bstart, len: err_blen, rest: BinderList::BindNil } }), prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }), b"\xe9", le32(14 + code_size_node(ByteGenState { node: ok_body, src: bg.src, off: 0, params: bg.params, lets: lets_append_binders(AppendBindersState { lets: bg.lets, bs: BinderList::BindCons { start: ok_bstart, len: ok_blen, rest: BinderList::BindNil } }), prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes })), x86_binder_loads(BinderLoadState { binders: BinderList::BindCons { start: ok_bstart, len: ok_blen, rest: BinderList::BindNil }, j: 0, base_slot: count_binds(bg.lets) }), x86_node(ByteGenState { node: ok_body, src: bg.src, off: bg.off + code_size_node(ByteGenState { node: scrut, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + 60 + code_size_node(ByteGenState { node: err_body, src: bg.src, off: 0, params: bg.params, lets: lets_append_binders(AppendBindersState { lets: bg.lets, bs: BinderList::BindCons { start: err_bstart, len: err_blen, rest: BinderList::BindNil } }), prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }), params: bg.params, lets: lets_append_binders(AppendBindersState { lets: bg.lets, bs: BinderList::BindCons { start: ok_bstart, len: ok_blen, rest: BinderList::BindNil } }), prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }))
   proofs:
     purity:
       reads : [bg.node, bg.src, bg.off, bg.params, bg.lets, bg.prog, bg.concepts, bg.sizes]
-      calls : [x86_node, code_size_node, x86_args, code_size_args, param_index, let_index, param_list_len, proc_offset, arg_list_len, x86_vfields, x86_vpops, vfield_len, max_payload_fields, variant_tag, x86_dispatch, x86_arms, code_size_arms, arm_list_len, static_concept_of, field_index_of, cd_fields, concept_at_index, span_is_byte_at, span_is_length, span_is_substring, span_is_max, span_is_min, span_is_arena_scope, span_is_concat, callee_is_texty, blob_end_off]
+      calls : [x86_node, code_size_node, x86_args, code_size_args, param_index, let_index, param_list_len, proc_offset, arg_list_len, x86_vfields, x86_vpops, vfield_len, max_payload_fields, variant_tag, x86_dispatch, x86_arms, code_size_arms, arm_list_len, static_concept_of, field_index_of, cd_fields, concept_at_index, span_is_byte_at, span_is_length, span_is_substring, span_is_max, span_is_min, span_is_arena_scope, span_is_concat, callee_is_texty, blob_end_off, lets_append_binders, x86_binder_loads, count_binds]
     termination:
       bound : 8000
 
@@ -18360,13 +18574,14 @@ rule x86_program_src
   logic:
     let toks = begin_tokenize(ScanState { source: s.source, pos: 0 })
     let prog = parse_program(ProgramState { cell: toks, src: s.source })
-    let concepts = parse_concepts(ProgramState { cell: toks, src: s.source })
+    let concepts0 = parse_concepts(ProgramState { cell: toks, src: s.source })
+    let concepts = if program_uses_result(UsesTextRules { rules: prog, src: s.source }) == 1 then concepts_append_result(concepts0) else concepts0
     let sizes = proc_sizes(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: ProcSizeList::PSNil })
     out = x86_program(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: sizes })
   proofs:
     purity:
       reads : [s.source]
-      calls : [begin_tokenize, parse_program, parse_concepts, proc_sizes, x86_program]
+      calls : [begin_tokenize, parse_program, parse_concepts, program_uses_result, concepts_append_result, proc_sizes, x86_program]
     termination:
       bound : 256
 
@@ -18865,7 +19080,8 @@ rule elf_program_src
   logic:
     let toks = begin_tokenize(ScanState { source: s.source, pos: 0 })
     let prog = parse_program(ProgramState { cell: toks, src: s.source })
-    let concepts = parse_concepts(ProgramState { cell: toks, src: s.source })
+    let concepts0 = parse_concepts(ProgramState { cell: toks, src: s.source })
+    let concepts = if program_uses_result(UsesTextRules { rules: prog, src: s.source }) == 1 then concepts_append_result(concepts0) else concepts0
     let sizes = proc_sizes(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: ProcSizeList::PSNil })
     let uses_var = program_uses_arena(concepts)
     let anytx = prog_any_texty(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: sizes })
@@ -18882,7 +19098,7 @@ rule elf_program_src
   proofs:
     purity:
       reads : [s.source]
-      calls : [begin_tokenize, parse_program, parse_concepts, proc_sizes, program_uses_arena, prog_any_texty, entry_rule_texty, entry_rule_bytes, program_uses_text, blob_end_off, x86_program, src_blob, param_list_len, rl_head_params, fields_to_params, rl_head_input, params_to_fields, find_concept_index, fl_head_ty_start, fl_head_ty_len, x86_argv_marshal, x86_stdin_marshal, field_list_has_text, cd_fields, concept_at_index]
+      calls : [begin_tokenize, parse_program, parse_concepts, program_uses_result, concepts_append_result, proc_sizes, program_uses_arena, prog_any_texty, entry_rule_texty, entry_rule_bytes, program_uses_text, blob_end_off, x86_program, src_blob, param_list_len, rl_head_params, fields_to_params, rl_head_input, params_to_fields, find_concept_index, fl_head_ty_start, fl_head_ty_len, x86_argv_marshal, x86_stdin_marshal, field_list_has_text, cd_fields, concept_at_index]
     termination:
       bound : 256
 
