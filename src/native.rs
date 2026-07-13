@@ -21053,6 +21053,99 @@ rule le64_neg
         let _ = fs::remove_file(em);
     }
 
+    /// Result tier slice 3 — THE MILESTONE: the self-hosted emitter (elf_program_src,
+    /// compiled natively from examples/vexprparse.verbose) compiles a TOP-LEVEL
+    /// `Result(number, text)` rule to a runnable ELF whose ENTRY TRAMPOLINE routes
+    /// the returned arena-node index: tag == RESULT_OK_TAG (15360000) -> itoa the
+    /// number payload to stdout + exit 0; otherwise -> materialize the Err text's
+    /// packed span from the embedded source and write it to stderr + exit 1. This is
+    /// the self-hosted equivalent of verbosec's native Result 2A. The emitted binary
+    /// must agree BIT-FOR-BIT (stdout / stderr / exit) with verbosec's OWN compiled
+    /// `validate`. entry_rule_result detects the shape from the DECLARED output type
+    /// span ("Result"); blob_end_off accounts for the 210-byte Result trampoline so
+    /// the Err span's src_base is correct.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn result_tier_slice3_top_level_result_routes_ok_stdout_err_stderr() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        let src = fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        // The self-hosted emitter (elf_program_src, reads program on argv[1]).
+        let elf = std::env::temp_dir().join("verbosec_test_r_s3_elf_program_src");
+        compile_native(&program, "elf_program_src", elf.to_str().unwrap(), false, false)
+            .expect("elf_program_src must compile natively");
+
+        // The Result program: entry rule `validate` has `output: r : Result(number,
+        // text)` and returns Ok(i.x) when x > 0 else Err("negative"). The self-hosted
+        // lexer stops at `@`, so its input is header-less; verbosec's Rust parser
+        // requires `@verbose`, so its input carries the header — the two are
+        // otherwise byte-identical, so the comparison stays honest.
+        let prog_src = "concept In\n  fields:\n    x : number\nrule validate\n  input:\n    i : In\n  output:\n    r : Result(number, text)\n  logic:\n    r = if i.x > 0 then Ok(i.x) else Err(\"negative\")";
+        // verbosec's Rust parser also requires @intention on every concept/rule.
+        let vprog_src = "@verbose 0.1.0\n\nconcept In\n  @intention: \"a single number input\"\n  @source: demo.intent:1\n  fields:\n    x : number\nrule validate\n  @intention: \"Ok(x) when positive, else Err(reason)\"\n  @source: demo.intent:2\n  input:\n    i : In\n  output:\n    r : Result(number, text)\n  logic:\n    r = if i.x > 0 then Ok(i.x) else Err(\"negative\")\n  proofs:\n    purity:\n      reads : [i.x]\n      calls : []\n    termination:\n      bound : 4";
+
+        // verbosec's OWN compiled `validate` — the reference oracle.
+        let vtoks = crate::lexer::Lexer::new(&vprog_src).tokenize().unwrap();
+        let vprog = crate::parser::Parser::new(vtoks).parse_program().unwrap();
+        let vref = std::env::temp_dir().join("verbosec_test_r_s3_validate_ref");
+        compile_native(&vprog, "validate", vref.to_str().unwrap(), false, false)
+            .expect("verbosec must compile `validate` natively");
+
+        // Emit the ELF via the self-hosted emitter (argv[1] = source, argv[2] = pos).
+        let mc = Command::new(&elf).args([prog_src, "0"]).output()
+            .expect("spawn elf_program_src");
+        assert!(mc.status.success(), "elf_program_src must exit 0; got {:?}", mc.status);
+        let elf_bytes = mc.stdout;
+        assert_eq!(&elf_bytes[0..4], &[0x7f, 0x45, 0x4c, 0x46], "self-emitted file is not ELF");
+
+        let a_out = std::env::temp_dir().join("verbosec_test_r_s3_a_out");
+        fs::write(&a_out, &elf_bytes).expect("write a.out");
+        let mut perms = fs::metadata(&a_out).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&a_out, perms).expect("chmod +x");
+
+        // (argv x, expected stdout, expected stderr, expected exit). Ok path prints
+        // the payload number to stdout (exit 0); Err path prints the reason to
+        // stderr (exit 1) — the self-hosted equivalent of verbosec's Result 2A.
+        let cases: &[(&str, &str, &str, i32)] = &[
+            ("5", "5\n", "", 0),
+            ("1", "1\n", "", 0),
+            ("100", "100\n", "", 0),
+            ("7", "7\n", "", 0),
+            ("0", "", "negative\n", 1),
+        ];
+
+        for (x, exp_out, exp_err, exp_code) in cases {
+            // Self-hosted-emitted ELF.
+            let s = Command::new(&a_out).arg(x).output().expect("run self ELF");
+            let s_out = String::from_utf8_lossy(&s.stdout).to_string();
+            let s_err = String::from_utf8_lossy(&s.stderr).to_string();
+            let s_code = s.status.code().unwrap_or(-1);
+            assert_eq!(s_out, *exp_out, "self ELF stdout for x={} (got {:?})", x, s_out);
+            assert_eq!(s_err, *exp_err, "self ELF stderr for x={} (got {:?})", x, s_err);
+            assert_eq!(s_code, *exp_code, "self ELF exit for x={} (got {})", x, s_code);
+
+            // verbosec's OWN compiled validate — must agree bit-for-bit.
+            let v = Command::new(&vref).arg(x).output().expect("run verbosec validate");
+            assert_eq!(String::from_utf8_lossy(&v.stdout), s_out,
+                "self vs verbosec stdout mismatch for x={}", x);
+            assert_eq!(String::from_utf8_lossy(&v.stderr), s_err,
+                "self vs verbosec stderr mismatch for x={}", x);
+            assert_eq!(v.status.code().unwrap_or(-1), s_code,
+                "self vs verbosec exit mismatch for x={}", x);
+        }
+
+        let _ = fs::remove_file(&a_out);
+        let _ = fs::remove_file(elf);
+        let _ = fs::remove_file(vref);
+    }
+
     /// Brick b6 — the four missing binary operators in the machine-code
     /// generator: division `/` (op 16), modulo `%` (op 17), logical `and`
     /// (op 30), logical `or` (op 31). Both the closed-expression path

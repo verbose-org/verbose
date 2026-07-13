@@ -16524,10 +16524,16 @@ rule ast_uses_text
       AstIf(cond, thn, els) => if ast_uses_text(PrintState { node: cond, src: ps.src }) == 1 then 1 else if ast_uses_text(PrintState { node: thn, src: ps.src }) == 1 then 1 else ast_uses_text(PrintState { node: els, src: ps.src })
       AstVariant(cstart, clen, vstart, vlen, fields) => vfields_use_text(UsesTextVFields { fields: fields, src: ps.src })
       AstMatch(scrut, arms) => if ast_uses_text(PrintState { node: scrut, src: ps.src }) == 1 then 1 else arms_use_text(UsesTextArms { arms: arms, src: ps.src })
-      -- Result tier slice 1 stub (parse + eval only; real handling in a later slice).
-      AstOk(inner) => 0
-      AstResErr(inner) => 0
-      AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => 0
+      -- Result tier slice 3: recurse into the Result nodes so an `Err("reason")`
+      -- (or any string literal in an Ok / match_result arm) turns uses_text on and
+      -- the source blob gets appended. Slice-1 stubbed these at 0, but the slice-3
+      -- Err trampoline materializes the packed span from the embedded source, so a
+      -- missing blob would read out of bounds. vexprparse itself parses no
+      -- Ok/Err/match_result EXPRESSIONS, so these arms never fire for the fixed
+      -- point — the change is inert on the self-compile.
+      AstOk(inner) => ast_uses_text(PrintState { node: inner, src: ps.src })
+      AstResErr(inner) => ast_uses_text(PrintState { node: inner, src: ps.src })
+      AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => if ast_uses_text(PrintState { node: scrut, src: ps.src }) == 1 then 1 else if ast_uses_text(PrintState { node: ok_body, src: ps.src }) == 1 then 1 else ast_uses_text(PrintState { node: err_body, src: ps.src })
   proofs:
     purity:
       reads : [ps.node, ps.src]
@@ -17257,6 +17263,60 @@ rule entry_rule_bytes
     purity:
       reads : [pg.rules, pg.src, pg.prog]
       calls : [ast_is_bytes, block_result, rd_body]
+    termination:
+      bound : 8000
+
+
+-- span_is_result (Result tier slice 3): 1 iff the span src[start..start+len] is
+-- exactly the 6 bytes "Result" (R=82 e=101 s=115 u=117 l=108 t=116). Flat
+-- fixed-width check (mirroring span_is_concept), length-guarded first so a
+-- wrong-length ident never reads past its span. This is how a rule's declared
+-- `output: r : Result(number, text)` type is recognized: the field parser stores
+-- the type-NAME token span ("Result") in the rule's out_ty_start/out_ty_len (the
+-- inner `(number, text)` is left for the field-range skip, never captured), so a
+-- name-byte match is the whole test — the ENTRY trampoline needs nothing more.
+rule span_is_result
+  @intention: "1 if an Ident span spells exactly \"Result\", 0 otherwise"
+  @source: vexprparse.intent:66
+  input:
+    sc : SpanCheck
+  output:
+    out : number
+  logic:
+    out = if sc.len == 6 and (byte_at(sc.src, sc.start) == 82 and (byte_at(sc.src, sc.start + 1) == 101 and (byte_at(sc.src, sc.start + 2) == 115 and (byte_at(sc.src, sc.start + 3) == 117 and (byte_at(sc.src, sc.start + 4) == 108 and byte_at(sc.src, sc.start + 5) == 116))))) then 1 else 0
+  proofs:
+    purity:
+      reads : [sc.src, sc.start, sc.len]
+      calls : []
+    termination:
+      bound : 64
+
+
+-- entry_rule_result (Result tier slice 3): 1 iff the program's ENTRY (first)
+-- rule's DECLARED output type is `Result` — the top-level Result output shape.
+-- Unlike entry_rule_texty / entry_rule_bytes (which walk the body's block result),
+-- this reads the declared out_ty span directly (rd_out_ty_start / rd_out_ty_len)
+-- and byte-compares it to "Result". A body-shape walk would be unreliable here:
+-- an `if cond then Ok(..) else Err(..)` body is neither texty nor bytes (both
+-- ast_is_texty and ast_is_bytes return 0 for AstOk / AstResErr), so the DECLARED
+-- type is the only sound signal. Steers the ENTRY trampoline: a Result entry must
+-- tag-dispatch the returned arena-node index (Ok -> itoa stdout exit 0 / Err ->
+-- span stderr exit 1), NOT itoa the index as a plain number.
+rule entry_rule_result
+  @intention: "1 if the program's entry (first) rule's declared output type is Result, 0 otherwise"
+  @source: vexprparse.intent:66
+  input:
+    pg : ProgGenState
+  output:
+    out : number
+  logic:
+    out = match pg.rules:
+      RCons(head, tail) => span_is_result(SpanCheck { src: pg.src, start: rd_out_ty_start(head), len: rd_out_ty_len(head) })
+      RNil => 0
+  proofs:
+    purity:
+      reads : [pg.rules, pg.src]
+      calls : [span_is_result, rd_out_ty_start, rd_out_ty_len]
     termination:
       bound : 8000
 
@@ -18643,11 +18703,11 @@ rule blob_end_off
     let efields = params_to_fields(entry_params)
     let ecfields = cd_fields(concept_at_index(ConceptAtState { concepts: pg.concepts, idx: find_concept_index(FindConceptIdxState { concepts: pg.concepts, src: pg.src, q_start: fl_head_ty_start(efields), q_len: fl_head_ty_len(efields), idx: 0 }) }))
     let msize = if has_input == 1 then (if field_list_has_text(ecfields) == 1 then stdin_marshal_size(ecfields) else argv_marshal_size(ecfields)) else 0
-    out = 120 + (if program_uses_arena(pg.concepts) == 1 then 66 else 0) + (if entry_rule_bytes(pg) == 1 then 17 else if entry_rule_texty(pg) == 1 then 45 else 101) + (if prog_any_texty(pg) == 1 then 86 else 0) + msize + ps_total(pg.sizes)
+    out = 120 + (if program_uses_arena(pg.concepts) == 1 then 66 else 0) + (if entry_rule_result(pg) == 1 then 210 else if entry_rule_bytes(pg) == 1 then 17 else if entry_rule_texty(pg) == 1 then 45 else 101) + (if prog_any_texty(pg) == 1 then 86 else 0) + msize + ps_total(pg.sizes)
   proofs:
     purity:
       reads : [pg, pg.rules, pg.src, pg.concepts, pg.sizes]
-      calls : [program_uses_arena, entry_rule_texty, entry_rule_bytes, prog_any_texty, ps_total, param_list_len, rl_head_params, fields_to_params, rl_head_input, params_to_fields, argv_marshal_size, stdin_marshal_size, field_list_has_text, cd_fields, concept_at_index, find_concept_index, fl_head_ty_start, fl_head_ty_len]
+      calls : [program_uses_arena, entry_rule_result, entry_rule_texty, entry_rule_bytes, prog_any_texty, ps_total, param_list_len, rl_head_params, fields_to_params, rl_head_input, params_to_fields, argv_marshal_size, stdin_marshal_size, field_list_has_text, cd_fields, concept_at_index, find_concept_index, fl_head_ty_start, fl_head_ty_len]
     termination:
       bound : 8000
 
@@ -19087,6 +19147,7 @@ rule elf_program_src
     let anytx = prog_any_texty(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: sizes })
     let entrytx = entry_rule_texty(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: sizes })
     let entrybytes = entry_rule_bytes(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: sizes })
+    let entryresult = entry_rule_result(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: sizes })
     let uses_text = if program_uses_text(UsesTextRules { rules: prog, src: s.source }) == 1 then 1 else anytx
     let fsz0 = blob_end_off(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: sizes })
     let fsz = fsz0 + (if uses_text == 1 then 4 * ((length(s.source) + 3) / 4) else 0)
@@ -19094,11 +19155,11 @@ rule elf_program_src
     let has_input = if param_list_len(entry_params) > 0 then 1 else 0
     let efields = params_to_fields(entry_params)
     let ecidx = find_concept_index(FindConceptIdxState { concepts: concepts, src: s.source, q_start: fl_head_ty_start(efields), q_len: fl_head_ty_len(efields), idx: 0 })
-    out = concat(b"\x7f\x45\x4c\x46\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\x3e\x00\x01\x00\x00\x00\x78\x00\x40\x00\x00\x00\x00\x00\x40\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x40\x00\x38\x00\x01\x00\x00\x00\x00\x00\x00\x00", b"\x01\x00\x00\x00\x05\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x40\x00\x00\x00\x00\x00\x00\x00\x40\x00\x00\x00\x00\x00", le64(fsz), le64(fsz), b"\x00\x10\x00\x00\x00\x00\x00\x00", (if uses_var == 1 then b"\xb8\x09\x00\x00\x00\x31\xff\x48\xbe\x00\x00\x00\x00\x04\x00\x00\x00\xba\x03\x00\x00\x00\x41\xba\x22\x40\x00\x00\x49\xc7\xc0\xff\xff\xff\xff\x45\x31\xc9\x0f\x05\x48\x3d\x01\xf0\xff\xff\x72\x0c\xbf\x01\x00\x00\x00\xb8\x3c\x00\x00\x00\x0f\x05\x49\x89\xc7\x45\x31\xf6" else b""), (if has_input == 1 then (if field_list_has_text(cd_fields(concept_at_index(ConceptAtState { concepts: concepts, idx: ecidx }))) == 1 then x86_stdin_marshal(ArgvTrampState { fields: cd_fields(concept_at_index(ConceptAtState { concepts: concepts, idx: ecidx })), src: s.source, prog: prog, concepts: concepts, sizes: sizes, cidx: ecidx }) else x86_argv_marshal(ArgvTrampState { fields: cd_fields(concept_at_index(ConceptAtState { concepts: concepts, idx: ecidx })), src: s.source, prog: prog, concepts: concepts, sizes: sizes, cidx: ecidx })) else b""), (if entrybytes == 1 then concat(b"\xe8", le32(12 + (if anytx == 1 then 86 else 0)), b"\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05") else if entrytx == 1 then b"\xe8\x7e\x00\x00\x00\x6a\x0a\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x48\x89\xe6\x48\xc7\xc2\x01\x00\x00\x00\x0f\x05\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05" else concat(b"\xe8", le32(96 + (if anytx == 1 then 86 else 0)), b"\x48\x83\xec\x20\x49\x89\xc1\x48\x8d\x74\x24\x1f\xc6\x06\x0a\x48\x85\xc0\x79\x03\x48\xf7\xd8\x48\xc7\xc1\x0a\x00\x00\x00\x48\x31\xd2\x48\xf7\xf1\x80\xc2\x30\x48\xff\xce\x88\x16\x48\x85\xc0\x75\xed\x4d\x85\xc9\x79\x06\x48\xff\xce\xc6\x06\x2d\x48\x8d\x54\x24\x20\x48\x29\xf2\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05")), (if anytx == 1 then b"\x48\x83\xec\x28\x49\x89\xc1\x48\x8d\x74\x24\x20\x48\x85\xc0\x79\x03\x48\xf7\xd8\x48\xc7\xc1\x0a\x00\x00\x00\x48\x31\xd2\x48\xf7\xf1\x80\xc2\x30\x48\xff\xce\x88\x16\x48\x85\xc0\x75\xed\x4d\x85\xc9\x79\x06\x48\xff\xce\xc6\x06\x2d\x48\x8d\x54\x24\x20\x48\x29\xf2\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05\x48\x83\xc4\x28\xc3" else b""), x86_program(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: sizes }), (if uses_text == 1 then src_blob(SrcBlobState { src: s.source, pos: 0 }) else b""))
+    out = concat(b"\x7f\x45\x4c\x46\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\x3e\x00\x01\x00\x00\x00\x78\x00\x40\x00\x00\x00\x00\x00\x40\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x40\x00\x38\x00\x01\x00\x00\x00\x00\x00\x00\x00", b"\x01\x00\x00\x00\x05\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x40\x00\x00\x00\x00\x00\x00\x00\x40\x00\x00\x00\x00\x00", le64(fsz), le64(fsz), b"\x00\x10\x00\x00\x00\x00\x00\x00", (if uses_var == 1 then b"\xb8\x09\x00\x00\x00\x31\xff\x48\xbe\x00\x00\x00\x00\x04\x00\x00\x00\xba\x03\x00\x00\x00\x41\xba\x22\x40\x00\x00\x49\xc7\xc0\xff\xff\xff\xff\x45\x31\xc9\x0f\x05\x48\x3d\x01\xf0\xff\xff\x72\x0c\xbf\x01\x00\x00\x00\xb8\x3c\x00\x00\x00\x0f\x05\x49\x89\xc7\x45\x31\xf6" else b""), (if has_input == 1 then (if field_list_has_text(cd_fields(concept_at_index(ConceptAtState { concepts: concepts, idx: ecidx }))) == 1 then x86_stdin_marshal(ArgvTrampState { fields: cd_fields(concept_at_index(ConceptAtState { concepts: concepts, idx: ecidx })), src: s.source, prog: prog, concepts: concepts, sizes: sizes, cidx: ecidx }) else x86_argv_marshal(ArgvTrampState { fields: cd_fields(concept_at_index(ConceptAtState { concepts: concepts, idx: ecidx })), src: s.source, prog: prog, concepts: concepts, sizes: sizes, cidx: ecidx })) else b""), (if entryresult == 1 then concat(b"\xe8", le32(205 + (if anytx == 1 then 86 else 0)), b"\x48\x69\xc0", le32(8 * (max_payload_fields(concepts) + 1)), b"\x4c\x01\xf8\x48\x8b\x08\x48\x8b\x40\x08\x48\x81\xf9", le32(15360000), b"\x0f\x85", le32(96), b"\x48\x83\xec\x20\x49\x89\xc1\x48\x8d\x74\x24\x1f\xc6\x06\x0a\x48\x85\xc0\x79\x03\x48\xf7\xd8\x48\xc7\xc1\x0a\x00\x00\x00\x48\x31\xd2\x48\xf7\xf1\x80\xc2\x30\x48\xff\xce\x88\x16\x48\x85\xc0\x75\xed\x4d\x85\xc9\x79\x06\x48\xff\xce\xc6\x06\x2d\x48\x8d\x54\x24\x20\x48\x29\xf2\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05", b"\x89\xc2\x48\xc1\xe8\x20\x48\xbe", le64(4194304 + blob_end_off(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: sizes })), b"\x48\x01\xc6\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x02\x00\x00\x00\x0f\x05\x6a\x0a\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x02\x00\x00\x00\x48\x89\xe6\x48\xc7\xc2\x01\x00\x00\x00\x0f\x05\x48\xc7\xc0\x3c\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05") else if entrybytes == 1 then concat(b"\xe8", le32(12 + (if anytx == 1 then 86 else 0)), b"\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05") else if entrytx == 1 then b"\xe8\x7e\x00\x00\x00\x6a\x0a\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x48\x89\xe6\x48\xc7\xc2\x01\x00\x00\x00\x0f\x05\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05" else concat(b"\xe8", le32(96 + (if anytx == 1 then 86 else 0)), b"\x48\x83\xec\x20\x49\x89\xc1\x48\x8d\x74\x24\x1f\xc6\x06\x0a\x48\x85\xc0\x79\x03\x48\xf7\xd8\x48\xc7\xc1\x0a\x00\x00\x00\x48\x31\xd2\x48\xf7\xf1\x80\xc2\x30\x48\xff\xce\x88\x16\x48\x85\xc0\x75\xed\x4d\x85\xc9\x79\x06\x48\xff\xce\xc6\x06\x2d\x48\x8d\x54\x24\x20\x48\x29\xf2\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05")), (if anytx == 1 then b"\x48\x83\xec\x28\x49\x89\xc1\x48\x8d\x74\x24\x20\x48\x85\xc0\x79\x03\x48\xf7\xd8\x48\xc7\xc1\x0a\x00\x00\x00\x48\x31\xd2\x48\xf7\xf1\x80\xc2\x30\x48\xff\xce\x88\x16\x48\x85\xc0\x75\xed\x4d\x85\xc9\x79\x06\x48\xff\xce\xc6\x06\x2d\x48\x8d\x54\x24\x20\x48\x29\xf2\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05\x48\x83\xc4\x28\xc3" else b""), x86_program(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: sizes }), (if uses_text == 1 then src_blob(SrcBlobState { src: s.source, pos: 0 }) else b""))
   proofs:
     purity:
       reads : [s.source]
-      calls : [begin_tokenize, parse_program, parse_concepts, program_uses_result, concepts_append_result, proc_sizes, program_uses_arena, prog_any_texty, entry_rule_texty, entry_rule_bytes, program_uses_text, blob_end_off, x86_program, src_blob, param_list_len, rl_head_params, fields_to_params, rl_head_input, params_to_fields, find_concept_index, fl_head_ty_start, fl_head_ty_len, x86_argv_marshal, x86_stdin_marshal, field_list_has_text, cd_fields, concept_at_index]
+      calls : [begin_tokenize, parse_program, parse_concepts, program_uses_result, concepts_append_result, proc_sizes, program_uses_arena, prog_any_texty, entry_rule_texty, entry_rule_bytes, entry_rule_result, max_payload_fields, program_uses_text, blob_end_off, x86_program, src_blob, param_list_len, rl_head_params, fields_to_params, rl_head_input, params_to_fields, find_concept_index, fl_head_ty_start, fl_head_ty_len, x86_argv_marshal, x86_stdin_marshal, field_list_has_text, cd_fields, concept_at_index]
     termination:
       bound : 256
 
