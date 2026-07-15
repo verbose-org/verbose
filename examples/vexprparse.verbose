@@ -332,6 +332,17 @@ concept_group VExpr [max_depth: 4096, max_nodes: 6000000]
       -- calls (max_payload_fields — the 2^40 fix), so they need the verbosec-style
       -- lookahead disambiguation first.
       AstFold of (coll : Ast, init : Ast, acc_start : number, acc_len : number, item_start : number, item_len : number, body : Ast)
+      -- COLLECTIONS tier slice 3: `all(coll, item => body)` / `any(coll, item => body)`
+      -- — the quantifiers, reducing to a 0/1 number (bool shape). Acc-less exactly like
+      -- AstSum/AstCount: the accumulator is the emitter-reserved rbp slot, NOT a
+      -- source-named binder (desugaring to AstFold would need a synthetic acc span —
+      -- the forbidden "__acc" problem; AstVar spans must point into real source).
+      -- Semantics mirror verbosec native's Phase 6 fold desugar: all = init 1, per
+      -- element `if body then acc else 0` (vacuously 1 on the empty collection);
+      -- any = init 0, `if body then 1 else acc` (0 on empty). Single pass, NO
+      -- short-circuit. shape_ast bands 9*10^10 / 10*10^10, above AstFold's 8*10^10.
+      AstAll of (coll : Ast, item_start : number, item_len : number, body : Ast)
+      AstAny of (coll : Ast, item_start : number, item_len : number, body : Ast)
 
   -- Records-arc brick R3: a cons-list of a variant-construction's named field
   -- initializers. Each cell carries the field NAME span (name_start, name_len) and
@@ -952,6 +963,15 @@ rule kw2
 -- three-letter keywords: let=4, and=5, not=6 (brick 1/2 codes; brick 4 uses
 -- and=5 and not=6). Result tier slice 1: Err=13 (`Err` = E(69) r(114) r(114)) —
 -- a keyword, same rationale as kw2's Ok (the parse layer is source-free).
+-- COLLECTIONS tier slice 3: all=18 (`all` = a(97) l(108) l(108)), any=19 (`any` =
+-- a(97) n(110) y(121)) — keywords for the same reason sum/count are (their
+-- `item => body` arm is not an argument expression parse_args can take).
+-- Collision check: the self-source used `all` as the fixed program-rule-list
+-- FIELD of six lint/diag state concepts (LintCalleesState, LintArityState,
+-- ArgTypeListState, PurityListState, FindDiagState, ProgDiagsState) -> renamed
+-- all -> full (the slice-1 count->cnt lesson; verbosec doesn't reserve the bare
+-- idents, so this only affects the self-source). `any` had NO identifier
+-- collision — comments and @intention strings only, which the lexer skips.
 rule kw3
   @intention: "Classify a 3-byte identifier run as a keyword (0 if none)"
   @source: vexprparse.intent:7
@@ -960,13 +980,13 @@ rule kw3
   output:
     out : number
   logic:
-    out = if byte_at(s.source, s.pos) == 108 and (byte_at(s.source, s.pos + 1) == 101 and byte_at(s.source, s.pos + 2) == 116) then 4 else if byte_at(s.source, s.pos) == 97 and (byte_at(s.source, s.pos + 1) == 110 and byte_at(s.source, s.pos + 2) == 100) then 5 else if byte_at(s.source, s.pos) == 110 and (byte_at(s.source, s.pos + 1) == 111 and byte_at(s.source, s.pos + 2) == 116) then 6 else if byte_at(s.source, s.pos) == 69 and (byte_at(s.source, s.pos + 1) == 114 and byte_at(s.source, s.pos + 2) == 114) then 13 else if byte_at(s.source, s.pos) == 115 and (byte_at(s.source, s.pos + 1) == 117 and byte_at(s.source, s.pos + 2) == 109) then 15 else 0
+    out = if byte_at(s.source, s.pos) == 108 and (byte_at(s.source, s.pos + 1) == 101 and byte_at(s.source, s.pos + 2) == 116) then 4 else if byte_at(s.source, s.pos) == 97 and (byte_at(s.source, s.pos + 1) == 110 and byte_at(s.source, s.pos + 2) == 100) then 5 else if byte_at(s.source, s.pos) == 110 and (byte_at(s.source, s.pos + 1) == 111 and byte_at(s.source, s.pos + 2) == 116) then 6 else if byte_at(s.source, s.pos) == 69 and (byte_at(s.source, s.pos + 1) == 114 and byte_at(s.source, s.pos + 2) == 114) then 13 else if byte_at(s.source, s.pos) == 115 and (byte_at(s.source, s.pos + 1) == 117 and byte_at(s.source, s.pos + 2) == 109) then 15 else if byte_at(s.source, s.pos) == 97 and (byte_at(s.source, s.pos + 1) == 108 and byte_at(s.source, s.pos + 2) == 108) then 18 else if byte_at(s.source, s.pos) == 97 and (byte_at(s.source, s.pos + 1) == 110 and byte_at(s.source, s.pos + 2) == 121) then 19 else 0
   proofs:
     purity:
       reads : [s.source, s.pos]
       calls : []
     termination:
-      bound : 64
+      bound : 96
 
 
 -- four-letter keywords: then=7, else=8 (brick 6 — `if`/`then`/`else` as an
@@ -3018,10 +3038,11 @@ rule mr_err
       bound : 512
 
 
--- COLLECTIONS tier slice 1: the parse state for a sum / count reduction. `cell` sits
--- on the `sum` / `count` keyword; `kind` selects the node built (0 = AstSum, 1 = AstCount).
+-- COLLECTIONS tier slice 1 (+3): the parse state for a sum / count / all / any
+-- reduction. `cell` sits on the reduction keyword; `kind` selects the node built
+-- (0 = AstSum, 1 = AstCount, 2 = AstAll, 3 = AstAny).
 concept ReduceState
-  @intention: "A reduction (sum/count) parse cursor + which reducer (0 = sum, 1 = count)"
+  @intention: "A reduction (sum/count/all/any) parse cursor + which reducer (0 = sum, 1 = count, 2 = all, 3 = any)"
   @source: vexprparse.intent:64
   fields:
     cell : TokenList
@@ -3030,7 +3051,7 @@ concept ReduceState
 
 -- COLLECTIONS tier slice 1: the parsed collection expression of a reduction plus the
 -- reducer kind, handed to reduce_body to finish the `item => body` arm and assemble
--- the AstSum / AstCount node.
+-- the AstSum / AstCount / AstAll / AstAny node.
 concept ReduceBodyState
   @intention: "A reduction's parsed collection + the reducer kind, handed to reduce_body"
   @source: vexprparse.intent:64
@@ -3039,15 +3060,15 @@ concept ReduceBodyState
     kind : number
 
 
--- parse_reduce: build an AstSum / AstCount node. Cursor positioned at the `sum` /
--- `count` keyword. The token stream is
+-- parse_reduce: build an AstSum / AstCount / AstAll / AstAny node. Cursor positioned
+-- at the `sum` / `count` / `all` / `any` keyword. The token stream is
 --   <kw> ( <coll> , <item ident> => <body> )
 -- Parse the collection expression (a full parse_or from cell+2, skipping the keyword
 -- and the '('); it stops at the ',' after the collection. reduce_body finishes the
 -- `item => body` arm. Mirror of parse_match_result -> mr_ok. In the parse SCC
 -- (calls parse_or), bound-only.
 rule parse_reduce
-  @intention: "Parse a sum/count reduction into an AstSum/AstCount node (collection + one item => body arm)"
+  @intention: "Parse a sum/count/all/any reduction into its Ast node (collection + one item => body arm)"
   @source: vexprparse.intent:64
   input:
     st : ReduceState
@@ -3067,11 +3088,12 @@ rule parse_reduce
 -- reduce_body: after the collection, skip the ',' (coll_next+1 lands on the item
 -- binder IDENT), read the item binder span, skip the binder + the '=>' (op 2) and
 -- parse the body (a full parse_or from binder_cell+2). The body's end cell should sit
--- at the closing ')' (op 22) — consume it if present. Assemble the AstSum (kind 0) or
--- AstCount (kind 1) node carrying the collection, the binder span, and the body.
+-- at the closing ')' (op 22) — consume it if present. Assemble the AstSum (kind 0),
+-- AstCount (kind 1), AstAll (kind 2), or AstAny (kind 3) node carrying the
+-- collection, the binder span, and the body.
 -- Mirror of mr_ok / mr_err collapsed into one arm (a reduction has ONE binder arm).
 rule reduce_body
-  @intention: "Parse a reduction's item => body arm after the collection and assemble the AstSum/AstCount node"
+  @intention: "Parse a reduction's item => body arm after the collection and assemble the AstSum/AstCount/AstAll/AstAny node"
   @source: vexprparse.intent:64
   input:
     rb : ReduceBodyState
@@ -3087,7 +3109,7 @@ rule reduce_body
     let body_node = parsed_node(body_parsed)
     let body_next = parsed_next(body_parsed)
     let close_pos = if peek_op_code(body_next) == 22 then advance(Advance { lst: body_next, k: 1 }) else body_next
-    out = Parsed::Mk { node: if rb.kind == 0 then Ast::AstSum { coll: coll_node, item_start: item_start, item_len: item_len, body: body_node } else Ast::AstCount { coll: coll_node, item_start: item_start, item_len: item_len, body: body_node }, next: close_pos }
+    out = Parsed::Mk { node: if rb.kind == 0 then Ast::AstSum { coll: coll_node, item_start: item_start, item_len: item_len, body: body_node } else if rb.kind == 1 then Ast::AstCount { coll: coll_node, item_start: item_start, item_len: item_len, body: body_node } else if rb.kind == 2 then Ast::AstAll { coll: coll_node, item_start: item_start, item_len: item_len, body: body_node } else Ast::AstAny { coll: coll_node, item_start: item_start, item_len: item_len, body: body_node }, next: close_pos }
   proofs:
     purity:
       reads : [rb.coll, rb.kind]
@@ -3379,12 +3401,17 @@ rule parse_primary
     -- exactly as sum / count are: its `acc, item => body` tail is not an argument
     -- expression parse_args can take.
     let isfold = if lead_kind == 217 then 1 else 0
+    -- COLLECTIONS tier slice 3: all / any are keywords (kw3=18 -> kind 218, kw3=19 ->
+    -- kind 219), intercepted exactly as sum / count are; parse_reduce is reused with
+    -- kinds 2 (all) / 3 (any) — same `<kw> ( <coll> , <item> => <body> )` stream.
+    let isall = if lead_kind == 218 then 1 else 0
+    let isany = if lead_kind == 219 then 1 else 0
     let isvariant = if next_opc == 3 then 1 else 0
     let vstart = peek_start(advance(Advance { lst: st.cell, k: 2 }))
     let vlen = peek_len(advance(Advance { lst: st.cell, k: 2 }))
     let has_braces = if peek_op_code(advance(Advance { lst: st.cell, k: 3 })) == 23 then 1 else 0
     let isrecord = if next_opc == 23 then 1 else 0
-    out = if ismatch == 1 then parse_match(st) else if ismatchresult == 1 then parse_match_result(st) else if issum == 1 then parse_reduce(ReduceState { cell: st.cell, kind: 0 }) else if iscount == 1 then parse_reduce(ReduceState { cell: st.cell, kind: 1 }) else if isfold == 1 then parse_fold(st) else if isok == 1 then ok_close(ParenState { inner: parse_or(ParseState { cell: advance(Advance { lst: st.cell, k: 2 }) }) }) else if iserr == 1 then err_close(ParenState { inner: parse_or(ParseState { cell: advance(Advance { lst: st.cell, k: 2 }) }) }) else if isif == 1 then if_then(IfThenState { cond: parse_or(ParseState { cell: advance(Advance { lst: st.cell, k: 1 }) }) }) else if istrue == 1 then Parsed::Mk { node: Ast::AstBool { value: 1 }, next: advance(Advance { lst: st.cell, k: 1 }) } else if isfalse == 1 then Parsed::Mk { node: Ast::AstBool { value: 0 }, next: advance(Advance { lst: st.cell, k: 1 }) } else if isnum == 1 then Parsed::Mk { node: Ast::AstNum { value: numval }, next: advance(Advance { lst: st.cell, k: 1 }) } else if isstr == 1 then Parsed::Mk { node: Ast::AstStr { start: sstart, len: slen }, next: advance(Advance { lst: st.cell, k: 1 }) } else if isbytelit == 1 then Parsed::Mk { node: Ast::AstBytes { start: bstart + 2, len: if blen >= 3 then blen - 3 else 0 }, next: advance(Advance { lst: st.cell, k: 1 }) } else if isparen == 1 then paren_close(ParenState { inner: parse_or(ParseState { cell: advance(Advance { lst: st.cell, k: 1 }) }) }) else if isident == 1 then (if isvariant == 1 then (if has_braces == 1 then variant_build(VariantState { cstart: idstart, clen: idlen, vstart: vstart, vlen: vlen, pfields: parse_vfields(ParseState { cell: advance(Advance { lst: st.cell, k: 4 }) }) }) else variant_build(VariantState { cstart: idstart, clen: idlen, vstart: vstart, vlen: vlen, pfields: ParsedVFields::MkVF { fields: VFieldList::VFNil, next: advance(Advance { lst: st.cell, k: 3 }) } })) else if iscall == 1 then call_build(CallState { cstart: idstart, clen: idlen, pargs: parse_args(ParseState { cell: advance(Advance { lst: st.cell, k: 2 }) }) }) else if isrecord == 1 then variant_build(VariantState { cstart: idstart, clen: idlen, vstart: idstart, vlen: idlen, pfields: parse_vfields(ParseState { cell: advance(Advance { lst: st.cell, k: 2 }) }) }) else field_rest(FieldState { cell: advance(Advance { lst: st.cell, k: 1 }), base: Ast::AstVar { start: idstart, len: idlen } })) else Parsed::Mk { node: Ast::AstErr, next: st.cell }
+    out = if ismatch == 1 then parse_match(st) else if ismatchresult == 1 then parse_match_result(st) else if issum == 1 then parse_reduce(ReduceState { cell: st.cell, kind: 0 }) else if iscount == 1 then parse_reduce(ReduceState { cell: st.cell, kind: 1 }) else if isall == 1 then parse_reduce(ReduceState { cell: st.cell, kind: 2 }) else if isany == 1 then parse_reduce(ReduceState { cell: st.cell, kind: 3 }) else if isfold == 1 then parse_fold(st) else if isok == 1 then ok_close(ParenState { inner: parse_or(ParseState { cell: advance(Advance { lst: st.cell, k: 2 }) }) }) else if iserr == 1 then err_close(ParenState { inner: parse_or(ParseState { cell: advance(Advance { lst: st.cell, k: 2 }) }) }) else if isif == 1 then if_then(IfThenState { cond: parse_or(ParseState { cell: advance(Advance { lst: st.cell, k: 1 }) }) }) else if istrue == 1 then Parsed::Mk { node: Ast::AstBool { value: 1 }, next: advance(Advance { lst: st.cell, k: 1 }) } else if isfalse == 1 then Parsed::Mk { node: Ast::AstBool { value: 0 }, next: advance(Advance { lst: st.cell, k: 1 }) } else if isnum == 1 then Parsed::Mk { node: Ast::AstNum { value: numval }, next: advance(Advance { lst: st.cell, k: 1 }) } else if isstr == 1 then Parsed::Mk { node: Ast::AstStr { start: sstart, len: slen }, next: advance(Advance { lst: st.cell, k: 1 }) } else if isbytelit == 1 then Parsed::Mk { node: Ast::AstBytes { start: bstart + 2, len: if blen >= 3 then blen - 3 else 0 }, next: advance(Advance { lst: st.cell, k: 1 }) } else if isparen == 1 then paren_close(ParenState { inner: parse_or(ParseState { cell: advance(Advance { lst: st.cell, k: 1 }) }) }) else if isident == 1 then (if isvariant == 1 then (if has_braces == 1 then variant_build(VariantState { cstart: idstart, clen: idlen, vstart: vstart, vlen: vlen, pfields: parse_vfields(ParseState { cell: advance(Advance { lst: st.cell, k: 4 }) }) }) else variant_build(VariantState { cstart: idstart, clen: idlen, vstart: vstart, vlen: vlen, pfields: ParsedVFields::MkVF { fields: VFieldList::VFNil, next: advance(Advance { lst: st.cell, k: 3 }) } })) else if iscall == 1 then call_build(CallState { cstart: idstart, clen: idlen, pargs: parse_args(ParseState { cell: advance(Advance { lst: st.cell, k: 2 }) }) }) else if isrecord == 1 then variant_build(VariantState { cstart: idstart, clen: idlen, vstart: idstart, vlen: idlen, pfields: parse_vfields(ParseState { cell: advance(Advance { lst: st.cell, k: 2 }) }) }) else field_rest(FieldState { cell: advance(Advance { lst: st.cell, k: 1 }), base: Ast::AstVar { start: idstart, len: idlen } })) else Parsed::Mk { node: Ast::AstErr, next: st.cell }
   proofs:
     purity:
       reads : [st.cell, st]
@@ -3889,6 +3916,8 @@ rule shape_ast
       AstSum(coll, item_start, item_len, body) => 60000000000 + shape_ast(coll) + shape_ast(body)
       AstCount(coll, item_start, item_len, body) => 70000000000 + shape_ast(coll) + shape_ast(body)
       AstFold(coll, init, acc_start, acc_len, item_start, item_len, body) => 80000000000 + shape_ast(coll) + shape_ast(init) + shape_ast(body)
+      AstAll(coll, item_start, item_len, body) => 90000000000 + shape_ast(coll) + shape_ast(body)
+      AstAny(coll, item_start, item_len, body) => 100000000000 + shape_ast(coll) + shape_ast(body)
   proofs:
     purity:
       reads : [e]
@@ -5273,6 +5302,12 @@ rule eval_ast_env
       -- value (evaluated once in the enclosing env) instead of 0, and eval_fold binds
       -- BOTH the acc span and the item span per element (the body's value replaces acc).
       AstFold(coll, init, acc_start, acc_len, item_start, item_len, body) => eval_fold(EvalFoldState { items: vdata_payload(eval_ast_env(EvalEnvArg { node: coll, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts })), acc_start: acc_start, acc_len: acc_len, item_start: item_start, item_len: item_len, body: body, acc: vnum_of(eval_ast_env(EvalEnvArg { node: init, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts })), env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts })
+      -- COLLECTIONS tier slice 3: all / any reuse eval_reduce with kinds 2 / 3. all
+      -- starts at 1 (vacuously true on the empty collection) and latches to 0 on the
+      -- first false body; any starts at 0 and saturates to 1 on the first true body.
+      -- Single pass, no short-circuit — verbosec native (Phase 6 fold desugar) parity.
+      AstAll(coll, item_start, item_len, body) => eval_reduce(EvalReduceState { items: vdata_payload(eval_ast_env(EvalEnvArg { node: coll, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts })), item_start: item_start, item_len: item_len, body: body, kind: 2, acc: 1, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts })
+      AstAny(coll, item_start, item_len, body) => eval_reduce(EvalReduceState { items: vdata_payload(eval_ast_env(EvalEnvArg { node: coll, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts })), item_start: item_start, item_len: item_len, body: body, kind: 3, acc: 0, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts })
   proofs:
     purity:
       reads : [ea.node, ea.env, ea.src, ea.prog, ea.concepts]
@@ -6813,10 +6848,13 @@ rule eval_match_result
 
 -- COLLECTIONS tier slice 1: the reduction fold state — the REMAINING element values
 -- (a ValueList), the item binder span (item_start, item_len), the per-element body,
--- the reducer kind (0 = sum, 1 = count), the running accumulator, and the enclosing
+-- the reducer kind (0 = sum, 1 = count, 2 = all, 3 = any), the running accumulator,
+-- and the enclosing
 -- env / src / prog / concepts threaded to eval each body. eval_reduce walks the list,
--- binding each element to the item span and folding vnum_of(body) (sum) or the 0/1
--- truth of the body (count) into acc. The design's collection VALUE representation is
+-- binding each element to the item span and folding vnum_of(body) (sum), the 0/1
+-- truth of the body (count), the all-latch (kind 2: acc kept while the body is
+-- true, latched to 0 on the first false), or the any-saturate (kind 3: acc becomes
+-- 1 on the first true body) into acc. The design's collection VALUE representation is
 -- a VData whose payload IS this element ValueList, so `items` is vdata_payload(coll).
 concept EvalReduceState
   @intention: "A reduction fold: remaining element values + item binder span + body + reducer kind + accumulator + env/src/prog/concepts"
@@ -6837,12 +6875,15 @@ concept EvalReduceState
 -- eval_reduce: fold the element ValueList into a number. Per element (VLCons head),
 -- bind `head` to the item binder span at the FRONT of the env (like eval_match_result
 -- binds a Result payload) and evaluate `body`: sum (kind 0) adds vnum_of(body); count
--- (kind 1) adds 1 iff vnum_of(body) != 0. Recurse on the tail with the updated acc;
+-- (kind 1) adds 1 iff vnum_of(body) != 0; all (kind 2, acc starts 1) keeps acc iff
+-- the body is true, else latches 0; any (kind 3, acc starts 0) becomes 1 on a true
+-- body, else keeps acc. Single pass, no short-circuit (verbosec Phase 6 fold-desugar
+-- parity). Recurse on the tail with the updated acc;
 -- VLNil returns VNum acc. In the eval SCC (calls eval_ast_env). Bound-only termination
 -- + the native recursion breadcrumb, same posture as eval_match / eval_match_result
 -- (this rule runs only under the interpreter --run path, never compiled natively).
 rule eval_reduce
-  @intention: "Fold a collection's element values into a number: sum (add body) or count (add body != 0), binding each element to the item span"
+  @intention: "Fold a collection's element values into a number: sum (add body), count (add body != 0), all (latch 0 on a false body), or any (saturate 1 on a true body), binding each element to the item span"
   @source: vexprparse.intent:36
   input:
     er : EvalReduceState
@@ -6850,7 +6891,7 @@ rule eval_reduce
     out : Value
   logic:
     out = match er.items:
-      VLCons(head, tail) => eval_reduce(EvalReduceState { items: tail, item_start: er.item_start, item_len: er.item_len, body: er.body, kind: er.kind, acc: er.acc + (if er.kind == 0 then vnum_of(eval_ast_env(EvalEnvArg { node: er.body, env: VEnv::VECons { name_start: er.item_start, name_len: er.item_len, val: head, rest: er.env }, src: er.src, prog: er.prog, concepts: er.concepts })) else (if vnum_of(eval_ast_env(EvalEnvArg { node: er.body, env: VEnv::VECons { name_start: er.item_start, name_len: er.item_len, val: head, rest: er.env }, src: er.src, prog: er.prog, concepts: er.concepts })) != 0 then 1 else 0)), env: er.env, src: er.src, prog: er.prog, concepts: er.concepts })
+      VLCons(head, tail) => eval_reduce(EvalReduceState { items: tail, item_start: er.item_start, item_len: er.item_len, body: er.body, kind: er.kind, acc: if er.kind == 0 then er.acc + vnum_of(eval_ast_env(EvalEnvArg { node: er.body, env: VEnv::VECons { name_start: er.item_start, name_len: er.item_len, val: head, rest: er.env }, src: er.src, prog: er.prog, concepts: er.concepts })) else (if er.kind == 1 then er.acc + (if vnum_of(eval_ast_env(EvalEnvArg { node: er.body, env: VEnv::VECons { name_start: er.item_start, name_len: er.item_len, val: head, rest: er.env }, src: er.src, prog: er.prog, concepts: er.concepts })) != 0 then 1 else 0) else (if er.kind == 2 then (if vnum_of(eval_ast_env(EvalEnvArg { node: er.body, env: VEnv::VECons { name_start: er.item_start, name_len: er.item_len, val: head, rest: er.env }, src: er.src, prog: er.prog, concepts: er.concepts })) != 0 then er.acc else 0) else (if vnum_of(eval_ast_env(EvalEnvArg { node: er.body, env: VEnv::VECons { name_start: er.item_start, name_len: er.item_len, val: head, rest: er.env }, src: er.src, prog: er.prog, concepts: er.concepts })) != 0 then 1 else er.acc))), env: er.env, src: er.src, prog: er.prog, concepts: er.concepts })
       VLNil => Value::VNum { n: er.acc }
   proofs:
     purity:
@@ -10231,6 +10272,8 @@ rule count_undef_ast
       AstSum(coll, item_start, item_len, body) => 0
       AstCount(coll, item_start, item_len, body) => 0
       AstFold(coll, init, acc_start, acc_len, item_start, item_len, body) => 0
+      AstAll(coll, item_start, item_len, body) => 0
+      AstAny(coll, item_start, item_len, body) => 0
   proofs:
     purity:
       reads : [a.node, a.binds, a.src]
@@ -10613,7 +10656,7 @@ rule lint_program
 --   * count_badcall_binds — sum count_badcall_ast over each binding's RHS.
 --   * badcall_rule      — one rule's bad-callee count (binds RHSes + result).
 --   * lint_callees_list — fold badcall_rule over the program (iter advances, the
---                         full list `all` stays fixed so every rule sees every rule).
+--                         full list `full` stays fixed so every rule sees every rule).
 --   * lint_callees      — the driver: tokenize -> parse_program -> lint_callees_list.
 -- ============================================================================
 
@@ -10758,6 +10801,8 @@ rule count_badcall_ast
       AstSum(coll, item_start, item_len, body) => 0
       AstCount(coll, item_start, item_len, body) => 0
       AstFold(coll, init, acc_start, acc_len, item_start, item_len, body) => 0
+      AstAll(coll, item_start, item_len, body) => 0
+      AstAny(coll, item_start, item_len, body) => 0
   proofs:
     purity:
       reads : [a.node, a.rules, a.src]
@@ -10910,21 +10955,21 @@ rule badcall_rule
 
 
 -- lint_callees_list's input: the rule list being ITERATED (`iter` advances each
--- step, one rule checked per step) + the FULL program rule list (`all`, fixed, so
+-- step, one rule checked per step) + the FULL program rule list (`full`, fixed, so
 -- every rule resolves callees against every rule) + the source text. The split
--- between `iter` and `all` is what makes callee scope program-wide: badcall_rule
--- always receives `all`, never the shrinking `iter`.
+-- between `iter` and `full` is what makes callee scope program-wide: badcall_rule
+-- always receives `full`, never the shrinking `iter`.
 concept LintCalleesState
   @intention: "The rule list being iterated + the full program rule list + the source text"
   @source: vexprparse.intent:33
   fields:
     iter : RuleList
-    all : RuleList
+    full : RuleList
     src : text [..256]
 
 
 -- lint_callees_list: sum badcall_rule over every rule in the program. Recurses
--- over `iter` (a field of the input), so bound + breadcrumb; `all` and `src` are
+-- over `iter` (a field of the input), so bound + breadcrumb; `full` and `src` are
 -- threaded unchanged so every rule sees the same full program rule list and the
 -- same source buffer. Total undefined-callee references across the program.
 rule lint_callees_list
@@ -10936,11 +10981,11 @@ rule lint_callees_list
     out : number
   logic:
     out = match lc.iter:
-      RCons(head, tail) => badcall_rule(BadCallRuleState { rd: head, rules: lc.all, src: lc.src }) + lint_callees_list(LintCalleesState { iter: tail, all: lc.all, src: lc.src })
+      RCons(head, tail) => badcall_rule(BadCallRuleState { rd: head, rules: lc.full, src: lc.src }) + lint_callees_list(LintCalleesState { iter: tail, full: lc.full, src: lc.src })
       RNil => 0
   proofs:
     purity:
-      reads : [lc.iter, lc.all, lc.src]
+      reads : [lc.iter, lc.full, lc.src]
       calls : [badcall_rule, lint_callees_list]
     termination:
       bound : 4000
@@ -10948,7 +10993,7 @@ rule lint_callees_list
 
 -- lint_callees: the brick-15 money-shot driver. Tokenize the program source (with
 -- indentation), parse the whole rule-decl sequence into a RuleList, then fold
--- badcall_rule over it with `iter = all = the parsed program` so every rule
+-- badcall_rule over it with `iter = full = the parsed program` so every rule
 -- resolves its callees against the entire program. Returns the TOTAL number of
 -- undefined-callee references (calls to rules that do not exist). 0 = every call
 -- in the program names a rule that exists.
@@ -10971,7 +11016,7 @@ rule lint_callees
   logic:
     let toks = begin_tokenize(ScanState { source: s.source, pos: 0 })
     let prog = parse_program(ProgramState { cell: toks, src: s.source })
-    out = lint_callees_list(LintCalleesState { iter: prog, all: prog, src: s.source })
+    out = lint_callees_list(LintCalleesState { iter: prog, full: prog, src: s.source })
   proofs:
     purity:
       reads : [s.source]
@@ -11001,7 +11046,7 @@ rule lint_callees
 -- target a rule defined anywhere (forward, self, mutual). So the structure
 -- mirrors the callee pass exactly: a membership-style probe over the program's
 -- RuleList, an Ast/ArgList mutual walk, a per-rule split (binds + result), and
--- an iter/all fold over the program.
+-- an iter/full fold over the program.
 --
 -- THE SENTINEL. rule_arity returns a NOT-FOUND sentinel of 1000000 (one million)
 -- when no rule of the query name exists. A negative sentinel would be wrong: a
@@ -11026,7 +11071,7 @@ rule lint_callees
 --   * count_badarity_binds — sum count_badarity_ast over each binding's RHS.
 --   * badarity_rule     — one rule's arity-mismatch count (binds RHSes + result).
 --   * lint_arity_list   — fold badarity_rule over the program (iter advances,
---                         the full list `all` stays fixed).
+--                         the full list `full` stays fixed).
 --   * lint_arity        — the driver: tokenize -> parse_program -> lint_arity_list.
 -- ============================================================================
 
@@ -11227,6 +11272,8 @@ rule count_badarity_ast
       AstSum(coll, item_start, item_len, body) => 0
       AstCount(coll, item_start, item_len, body) => 0
       AstFold(coll, init, acc_start, acc_len, item_start, item_len, body) => 0
+      AstAll(coll, item_start, item_len, body) => 0
+      AstAny(coll, item_start, item_len, body) => 0
   proofs:
     purity:
       reads : [a.node, a.rules, a.src]
@@ -11374,20 +11421,20 @@ rule badarity_rule
 
 
 -- lint_arity_list's input: the rule list being ITERATED (`iter` advances each step,
--- one rule checked per step) + the FULL program rule list (`all`, fixed, so every
--- rule resolves its calls against every rule) + the source text. The iter/all split
+-- one rule checked per step) + the FULL program rule list (`full`, fixed, so every
+-- rule resolves its calls against every rule) + the source text. The iter/full split
 -- makes callee scope program-wide, exactly like LintCalleesState.
 concept LintArityState
   @intention: "The rule list being iterated + the full program rule list + the source text"
   @source: vexprparse.intent:35
   fields:
     iter : RuleList
-    all : RuleList
+    full : RuleList
     src : text [..256]
 
 
 -- lint_arity_list: sum badarity_rule over every rule in the program. Recurses over
--- `iter` (a field of the input), so bound + breadcrumb; `all` and `src` are threaded
+-- `iter` (a field of the input), so bound + breadcrumb; `full` and `src` are threaded
 -- unchanged so every rule sees the same full program rule list and the same source
 -- buffer. Total arity-mismatch references across the program. Mirrors lint_callees_list.
 rule lint_arity_list
@@ -11399,11 +11446,11 @@ rule lint_arity_list
     out : number
   logic:
     out = match la.iter:
-      RCons(head, tail) => badarity_rule(BadArityRuleState { rd: head, rules: la.all, src: la.src }) + lint_arity_list(LintArityState { iter: tail, all: la.all, src: la.src })
+      RCons(head, tail) => badarity_rule(BadArityRuleState { rd: head, rules: la.full, src: la.src }) + lint_arity_list(LintArityState { iter: tail, full: la.full, src: la.src })
       RNil => 0
   proofs:
     purity:
-      reads : [la.iter, la.all, la.src]
+      reads : [la.iter, la.full, la.src]
       calls : [badarity_rule, lint_arity_list]
     termination:
       bound : 4000
@@ -11411,7 +11458,7 @@ rule lint_arity_list
 
 -- lint_arity: the brick-17 money-shot driver. Tokenize the program source (with
 -- indentation), parse the whole rule-decl sequence into a RuleList, then fold
--- badarity_rule over it with `iter = all = the parsed program` so every rule
+-- badarity_rule over it with `iter = full = the parsed program` so every rule
 -- resolves its calls' arities against the entire program. Returns the TOTAL number
 -- of call sites whose argument count does not match the called rule's parameter
 -- count (calls to non-existent rules are skipped — the callee pass's job). 0 =
@@ -11439,7 +11486,7 @@ rule lint_arity
   logic:
     let toks = begin_tokenize(ScanState { source: s.source, pos: 0 })
     let prog = parse_program(ProgramState { cell: toks, src: s.source })
-    out = lint_arity_list(LintArityState { iter: prog, all: prog, src: s.source })
+    out = lint_arity_list(LintArityState { iter: prog, full: prog, src: s.source })
   proofs:
     purity:
       reads : [s.source]
@@ -11669,6 +11716,8 @@ rule type_of_env
       AstSum(coll, item_start, item_len, body) => 3
       AstCount(coll, item_start, item_len, body) => 3
       AstFold(coll, init, acc_start, acc_len, item_start, item_len, body) => 3
+      AstAll(coll, item_start, item_len, body) => 3
+      AstAny(coll, item_start, item_len, body) => 3
   proofs:
     purity:
       reads : [t.node, t.tenv, t.src, t.prog, t.concepts]
@@ -11810,7 +11859,7 @@ rule tcheck_rule
 
 
 -- tcheck_list's input: the rule list being folded + the program source text.
--- Mirrors LintCalleesState minus the `all` program field (this pass needs no
+-- Mirrors LintCalleesState minus the `full` program field (this pass needs no
 -- inter-rule resolution — each rule is type-checked in isolation).
 concept TCheckListState
   @intention: "A rule list (iterated) + the program source text + the full program + the concept list, for folding the type check"
@@ -12401,16 +12450,16 @@ concept ArgTypeRuleState
 
 
 -- argtype_list's input: the rule list being ITERATED (`iter` advances each step,
--- one rule checked per step) + the FULL program rule list (`all`, fixed, so every
--- call resolves its callee against every rule) + the source text. The iter/all
--- split mirrors lint_callees_list: argtype_rule always receives `all`, never the
+-- one rule checked per step) + the FULL program rule list (`full`, fixed, so every
+-- call resolves its callee against every rule) + the source text. The iter/full
+-- split mirrors lint_callees_list: argtype_rule always receives `full`, never the
 -- shrinking `iter`, so callee resolution stays program-wide.
 concept ArgTypeListState
   @intention: "The rule list being iterated + the full program rule list + the source text"
   @source: vexprparse.intent:39
   fields:
     iter : RuleList
-    all : RuleList
+    full : RuleList
     src : text [..256]
 
 
@@ -12487,6 +12536,8 @@ rule argtype_ast
       AstSum(coll, item_start, item_len, body) => 0
       AstCount(coll, item_start, item_len, body) => 0
       AstFold(coll, init, acc_start, acc_len, item_start, item_len, body) => 0
+      AstAll(coll, item_start, item_len, body) => 0
+      AstAny(coll, item_start, item_len, body) => 0
       AstBin(op, lhs, rhs) => argtype_ast(ArgTypeState { node: lhs, tenv: a.tenv, src: a.src, prog: a.prog }) + argtype_ast(ArgTypeState { node: rhs, tenv: a.tenv, src: a.src, prog: a.prog })
       AstNeg(inner) => argtype_ast(ArgTypeState { node: inner, tenv: a.tenv, src: a.src, prog: a.prog })
       AstNot(inner) => argtype_ast(ArgTypeState { node: inner, tenv: a.tenv, src: a.src, prog: a.prog })
@@ -12561,7 +12612,7 @@ rule argtype_rule
 
 -- argtype_list: fold argtype_rule over the program, summing each rule's arg-type
 -- mismatch count. Mirror of lint_callees_list: `iter` advances each step (a field
--- of the packed input, so bound + breadcrumb), while `all` and `src` are threaded
+-- of the packed input, so bound + breadcrumb), while `full` and `src` are threaded
 -- unchanged so every rule resolves its callees against the same full program.
 rule argtype_list
   @intention: "Total call-site arg-type mismatches across every rule in a program"
@@ -12572,11 +12623,11 @@ rule argtype_list
     out : number
   logic:
     out = match a.iter:
-      RCons(head, tail) => argtype_rule(ArgTypeRuleState { rd: head, prog: a.all, src: a.src }) + argtype_list(ArgTypeListState { iter: tail, all: a.all, src: a.src })
+      RCons(head, tail) => argtype_rule(ArgTypeRuleState { rd: head, prog: a.full, src: a.src }) + argtype_list(ArgTypeListState { iter: tail, full: a.full, src: a.src })
       RNil => 0
   proofs:
     purity:
-      reads : [a.iter, a.all, a.src]
+      reads : [a.iter, a.full, a.src]
       calls : [argtype_rule, argtype_list]
     termination:
       bound : 4000
@@ -12584,7 +12635,7 @@ rule argtype_list
 
 -- argtype_check: the brick-21 money-shot driver. Tokenize the program source (with
 -- indentation), parse the whole rule-decl sequence into a RuleList, then fold the
--- arg-type check over it with `iter = all = the parsed program` so every call
+-- arg-type check over it with `iter = full = the parsed program` so every call
 -- resolves its callee against the entire program. Returns the TOTAL number of
 -- call-site arguments whose type does NOT match the callee's declared parameter
 -- type. 0 = every argument fits its parameter's type.
@@ -12622,7 +12673,7 @@ rule argtype_check
   logic:
     let toks = begin_tokenize(ScanState { source: s.source, pos: 0 })
     let prog = parse_program(ProgramState { cell: toks, src: s.source })
-    out = argtype_list(ArgTypeListState { iter: prog, all: prog, src: s.source })
+    out = argtype_list(ArgTypeListState { iter: prog, full: prog, src: s.source })
   proofs:
     purity:
       reads : [s.source]
@@ -12811,6 +12862,8 @@ rule count_undecl_call_ast
       AstSum(coll, item_start, item_len, body) => 0
       AstCount(coll, item_start, item_len, body) => 0
       AstFold(coll, init, acc_start, acc_len, item_start, item_len, body) => 0
+      AstAll(coll, item_start, item_len, body) => 0
+      AstAny(coll, item_start, item_len, body) => 0
   proofs:
     purity:
       reads : [a.node, a.rules, a.calls, a.src]
@@ -13055,6 +13108,8 @@ rule count_undecl_read_ast
       AstSum(coll, item_start, item_len, body) => 0
       AstCount(coll, item_start, item_len, body) => 0
       AstFold(coll, init, acc_start, acc_len, item_start, item_len, body) => 0
+      AstAll(coll, item_start, item_len, body) => 0
+      AstAny(coll, item_start, item_len, body) => 0
   proofs:
     purity:
       reads : [a.node, a.binds, a.reads, a.in_start, a.in_len, a.src]
@@ -13213,19 +13268,19 @@ rule purity_errors
 
 
 -- purity_list's input: the rule list being ITERATED + the FULL program rule list
--- (`all`, so every rule's calls resolve against every rule) + the source text. The
--- iter/all split mirrors lint_callees_list.
+-- (`full`, so every rule's calls resolve against every rule) + the source text. The
+-- iter/full split mirrors lint_callees_list.
 concept PurityListState
   @intention: "The rule list being iterated + the full program rule list + the source text"
   @source: vexprparse.intent:30
   fields:
     iter : RuleList
-    all : RuleList
+    full : RuleList
     src : text [..256]
 
 
 -- purity_list: sum purity_errors over every rule in the program. Recurses over `iter`
--- (a field of the input), so bound + the native recursion breadcrumb; `all` and `src`
+-- (a field of the input), so bound + the native recursion breadcrumb; `full` and `src`
 -- are threaded unchanged. Total purity-proof violations across the program.
 rule purity_list
   @intention: "Total purity-proof violations across every rule in a program"
@@ -13236,11 +13291,11 @@ rule purity_list
     out : number
   logic:
     out = match pl.iter:
-      RCons(head, tail) => purity_errors(PurityRuleState { rd: head, prog: pl.all, src: pl.src }) + purity_list(PurityListState { iter: tail, all: pl.all, src: pl.src })
+      RCons(head, tail) => purity_errors(PurityRuleState { rd: head, prog: pl.full, src: pl.src }) + purity_list(PurityListState { iter: tail, full: pl.full, src: pl.src })
       RNil => 0
   proofs:
     purity:
-      reads : [pl.iter, pl.all, pl.src]
+      reads : [pl.iter, pl.full, pl.src]
       calls : [purity_errors, purity_list]
     termination:
       bound : 4000
@@ -13263,7 +13318,7 @@ rule count_purity_errors
   logic:
     let toks = begin_tokenize(ScanState { source: s.source, pos: 0 })
     let prog = parse_program(ProgramState { cell: toks, src: s.source })
-    out = purity_list(PurityListState { iter: prog, all: prog, src: s.source })
+    out = purity_list(PurityListState { iter: prog, full: prog, src: s.source })
   proofs:
     purity:
       reads : [s.source]
@@ -13439,6 +13494,8 @@ rule term_var_is_input
       AstSum(coll, item_start, item_len, body) => 0
       AstCount(coll, item_start, item_len, body) => 0
       AstFold(coll, init, acc_start, acc_len, item_start, item_len, body) => 0
+      AstAll(coll, item_start, item_len, body) => 0
+      AstAny(coll, item_start, item_len, body) => 0
   proofs:
     purity:
       reads : [a.node, a.in_start, a.in_len, a.src]
@@ -13481,6 +13538,8 @@ rule term_knum_ok
       AstSum(coll, item_start, item_len, body) => 0
       AstCount(coll, item_start, item_len, body) => 0
       AstFold(coll, init, acc_start, acc_len, item_start, item_len, body) => 0
+      AstAll(coll, item_start, item_len, body) => 0
+      AstAny(coll, item_start, item_len, body) => 0
   proofs:
     purity:
       reads : [n]
@@ -13523,6 +13582,8 @@ rule term_base_ok
       AstSum(coll, item_start, item_len, body) => 0
       AstCount(coll, item_start, item_len, body) => 0
       AstFold(coll, init, acc_start, acc_len, item_start, item_len, body) => 0
+      AstAll(coll, item_start, item_len, body) => 0
+      AstAny(coll, item_start, item_len, body) => 0
   proofs:
     purity:
       reads : [a.node, a.rn_start, a.rn_len, a.kind, a.in_start, a.in_len, a.tf_start, a.tf_len, a.sbinds, a.src]
@@ -13564,6 +13625,8 @@ rule term_step_ok
       AstSum(coll, item_start, item_len, body) => 0
       AstCount(coll, item_start, item_len, body) => 0
       AstFold(coll, init, acc_start, acc_len, item_start, item_len, body) => 0
+      AstAll(coll, item_start, item_len, body) => 0
+      AstAny(coll, item_start, item_len, body) => 0
   proofs:
     purity:
       reads : [a.node, a.rn_start, a.rn_len, a.kind, a.in_start, a.in_len, a.tf_start, a.tf_len, a.sbinds, a.src]
@@ -13632,6 +13695,8 @@ rule term_arg_ok
       AstSum(coll, item_start, item_len, body) => 0
       AstCount(coll, item_start, item_len, body) => 0
       AstFold(coll, init, acc_start, acc_len, item_start, item_len, body) => 0
+      AstAll(coll, item_start, item_len, body) => 0
+      AstAny(coll, item_start, item_len, body) => 0
   proofs:
     purity:
       reads : [a.node, a.rn_start, a.rn_len, a.kind, a.in_start, a.in_len, a.tf_start, a.tf_len, a.sbinds, a.src]
@@ -13747,6 +13812,8 @@ rule count_term_ast
       AstSum(coll, item_start, item_len, body) => 0
       AstCount(coll, item_start, item_len, body) => 0
       AstFold(coll, init, acc_start, acc_len, item_start, item_len, body) => 0
+      AstAll(coll, item_start, item_len, body) => 0
+      AstAny(coll, item_start, item_len, body) => 0
   proofs:
     purity:
       reads : [a.node, a.rn_start, a.rn_len, a.kind, a.in_start, a.in_len, a.tf_start, a.tf_len, a.sbinds, a.src]
@@ -13975,10 +14042,10 @@ rule check_program
     let prog = parse_program(ProgramState { cell: toks, src: s.source })
     let concepts = parse_concepts(ProgramState { cell: toks, src: s.source })
     let e_undef = lint_list(LintListState { rl: prog, src: s.source })
-    let e_callee = lint_callees_list(LintCalleesState { iter: prog, all: prog, src: s.source })
-    let e_arity = lint_arity_list(LintArityState { iter: prog, all: prog, src: s.source })
+    let e_callee = lint_callees_list(LintCalleesState { iter: prog, full: prog, src: s.source })
+    let e_arity = lint_arity_list(LintArityState { iter: prog, full: prog, src: s.source })
     let e_type = tcheck_list(TCheckListState { iter: prog, prog: prog, src: s.source, concepts: concepts })
-    let e_argtype = argtype_list(ArgTypeListState { iter: prog, all: prog, src: s.source })
+    let e_argtype = argtype_list(ArgTypeListState { iter: prog, full: prog, src: s.source })
     out = e_undef + e_callee + e_arity + e_type + e_argtype
   proofs:
     purity:
@@ -14024,17 +14091,17 @@ concept RuleCatState
 
 
 -- find_diag's input: the rule list being ITERATED (`iter` advances each step, one
--- rule categorized per step) + the FULL program rule list (`all`, fixed, so each
+-- rule categorized per step) + the FULL program rule list (`full`, fixed, so each
 -- rule's calls resolve against every rule) + the source text + the running 0-based
--- index of the rule at the head of `iter`. The iter/all split mirrors
--- lint_callees_list / argtype_list: rule_category always receives `all`, never the
+-- index of the rule at the head of `iter`. The iter/full split mirrors
+-- lint_callees_list / argtype_list: rule_category always receives `full`, never the
 -- shrinking `iter` tail. `idx` is the source position reported in the Diag.
 concept FindDiagState
   @intention: "The rule list being walked + the full program + the source + the running rule index + the concept list"
   @source: vexprparse.intent:41
   fields:
     iter : RuleList
-    all : RuleList
+    full : RuleList
     src : text [..256]
     idx : number [0, 4000000]
     concepts : ConceptList
@@ -14083,11 +14150,11 @@ rule find_diag
     out : Diag
   logic:
     out = match fd.iter:
-      RCons(head, tail) => if rule_category(RuleCatState { rd: head, prog: fd.all, src: fd.src, concepts: fd.concepts }) > 0 then Diag::MkDiag { rule_index: fd.idx, category: rule_category(RuleCatState { rd: head, prog: fd.all, src: fd.src, concepts: fd.concepts }), span_start: 9999, span_len: 0 } else find_diag(FindDiagState { iter: tail, all: fd.all, src: fd.src, idx: fd.idx + 1, concepts: fd.concepts })
+      RCons(head, tail) => if rule_category(RuleCatState { rd: head, prog: fd.full, src: fd.src, concepts: fd.concepts }) > 0 then Diag::MkDiag { rule_index: fd.idx, category: rule_category(RuleCatState { rd: head, prog: fd.full, src: fd.src, concepts: fd.concepts }), span_start: 9999, span_len: 0 } else find_diag(FindDiagState { iter: tail, full: fd.full, src: fd.src, idx: fd.idx + 1, concepts: fd.concepts })
       RNil => Diag::MkDiag { rule_index: 9999, category: 0, span_start: 9999, span_len: 0 }
   proofs:
     purity:
-      reads : [fd.iter, fd.all, fd.src, fd.idx, fd.concepts]
+      reads : [fd.iter, fd.full, fd.src, fd.idx, fd.concepts]
       calls : [rule_category, find_diag]
     termination:
       bound : 4000
@@ -14204,7 +14271,7 @@ rule first_bad_rule
     let toks = begin_tokenize(ScanState { source: s.source, pos: 0 })
     let prog = parse_program(ProgramState { cell: toks, src: s.source })
     let concepts = parse_concepts(ProgramState { cell: toks, src: s.source })
-    let d = find_diag(FindDiagState { iter: prog, all: prog, src: s.source, idx: 0, concepts: concepts })
+    let d = find_diag(FindDiagState { iter: prog, full: prog, src: s.source, idx: 0, concepts: concepts })
     out = diag_index(d)
   proofs:
     purity:
@@ -14229,7 +14296,7 @@ rule first_bad_category
     let toks = begin_tokenize(ScanState { source: s.source, pos: 0 })
     let prog = parse_program(ProgramState { cell: toks, src: s.source })
     let concepts = parse_concepts(ProgramState { cell: toks, src: s.source })
-    let d = find_diag(FindDiagState { iter: prog, all: prog, src: s.source, idx: 0, concepts: concepts })
+    let d = find_diag(FindDiagState { iter: prog, full: prog, src: s.source, idx: 0, concepts: concepts })
     out = diag_cat(d)
   proofs:
     purity:
@@ -14285,17 +14352,17 @@ concept RuleDiagsState
 
 
 -- prog_diags's input: the rule list being ITERATED (`iter` advances each step, one
--- rule's diags appended per step) + the FULL program rule list (`all`, fixed, so each
+-- rule's diags appended per step) + the FULL program rule list (`full`, fixed, so each
 -- rule's calls resolve against every rule) + the source + the running 0-based index of
--- the rule at the head of `iter`. The iter/all split mirrors find_diag's FindDiagState
--- and lint_callees_list / argtype_list: rule_diags always receives `all`, never the
+-- the rule at the head of `iter`. The iter/full split mirrors find_diag's FindDiagState
+-- and lint_callees_list / argtype_list: rule_diags always receives `full`, never the
 -- shrinking `iter` tail.
 concept ProgDiagsState
   @intention: "The rule list being walked + the full program + the source + the running rule index + the concept list, for the whole-program diagnostic list"
   @source: vexprparse.intent:42
   fields:
     iter : RuleList
-    all : RuleList
+    full : RuleList
     src : text [..256]
     idx : number [0, 4000000]
     concepts : ConceptList
@@ -14416,11 +14483,11 @@ rule prog_diags
     out : DiagList
   logic:
     out = match pds.iter:
-      RCons(head, tail) => diag_append(DiagAppendState { a: rule_diags(RuleDiagsState { rd: head, prog: pds.all, src: pds.src, idx: pds.idx, concepts: pds.concepts }), b: prog_diags(ProgDiagsState { iter: tail, all: pds.all, src: pds.src, idx: pds.idx + 1, concepts: pds.concepts }) })
+      RCons(head, tail) => diag_append(DiagAppendState { a: rule_diags(RuleDiagsState { rd: head, prog: pds.full, src: pds.src, idx: pds.idx, concepts: pds.concepts }), b: prog_diags(ProgDiagsState { iter: tail, full: pds.full, src: pds.src, idx: pds.idx + 1, concepts: pds.concepts }) })
       RNil => DiagList::DNil
   proofs:
     purity:
-      reads : [pds.iter, pds.all, pds.src, pds.idx, pds.concepts]
+      reads : [pds.iter, pds.full, pds.src, pds.idx, pds.concepts]
       calls : [diag_append, rule_diags, prog_diags]
     termination:
       bound : 4000
@@ -14583,7 +14650,7 @@ rule all_diags_count
     let toks = begin_tokenize(ScanState { source: s.source, pos: 0 })
     let prog = parse_program(ProgramState { cell: toks, src: s.source })
     let concepts = parse_concepts(ProgramState { cell: toks, src: s.source })
-    out = diag_count(prog_diags(ProgDiagsState { iter: prog, all: prog, src: s.source, idx: 0, concepts: concepts }))
+    out = diag_count(prog_diags(ProgDiagsState { iter: prog, full: prog, src: s.source, idx: 0, concepts: concepts }))
   proofs:
     purity:
       reads : [s.source]
@@ -14606,7 +14673,7 @@ rule nth_diag_at_rule
     let toks = begin_tokenize(ScanState { source: s.source, pos: 0 })
     let prog = parse_program(ProgramState { cell: toks, src: s.source })
     let concepts = parse_concepts(ProgramState { cell: toks, src: s.source })
-    out = nth_diag_rule(DiagNthState { list: prog_diags(ProgDiagsState { iter: prog, all: prog, src: s.source, idx: 0, concepts: concepts }), n: s.pos })
+    out = nth_diag_rule(DiagNthState { list: prog_diags(ProgDiagsState { iter: prog, full: prog, src: s.source, idx: 0, concepts: concepts }), n: s.pos })
   proofs:
     purity:
       reads : [s.source, s.pos]
@@ -14630,7 +14697,7 @@ rule nth_diag_at_cat
     let toks = begin_tokenize(ScanState { source: s.source, pos: 0 })
     let prog = parse_program(ProgramState { cell: toks, src: s.source })
     let concepts = parse_concepts(ProgramState { cell: toks, src: s.source })
-    out = nth_diag_cat(DiagNthState { list: prog_diags(ProgDiagsState { iter: prog, all: prog, src: s.source, idx: 0, concepts: concepts }), n: s.pos })
+    out = nth_diag_cat(DiagNthState { list: prog_diags(ProgDiagsState { iter: prog, full: prog, src: s.source, idx: 0, concepts: concepts }), n: s.pos })
   proofs:
     purity:
       reads : [s.source, s.pos]
@@ -14668,7 +14735,7 @@ rule nth_diag_at_span_start
     let toks = begin_tokenize(ScanState { source: s.source, pos: 0 })
     let prog = parse_program(ProgramState { cell: toks, src: s.source })
     let concepts = parse_concepts(ProgramState { cell: toks, src: s.source })
-    out = nth_diag_span_start(DiagNthState { list: prog_diags(ProgDiagsState { iter: prog, all: prog, src: s.source, idx: 0, concepts: concepts }), n: s.pos })
+    out = nth_diag_span_start(DiagNthState { list: prog_diags(ProgDiagsState { iter: prog, full: prog, src: s.source, idx: 0, concepts: concepts }), n: s.pos })
   proofs:
     purity:
       reads : [s.source, s.pos]
@@ -14692,7 +14759,7 @@ rule nth_diag_at_span_len
     let toks = begin_tokenize(ScanState { source: s.source, pos: 0 })
     let prog = parse_program(ProgramState { cell: toks, src: s.source })
     let concepts = parse_concepts(ProgramState { cell: toks, src: s.source })
-    out = nth_diag_span_len(DiagNthState { list: prog_diags(ProgDiagsState { iter: prog, all: prog, src: s.source, idx: 0, concepts: concepts }), n: s.pos })
+    out = nth_diag_span_len(DiagNthState { list: prog_diags(ProgDiagsState { iter: prog, full: prog, src: s.source, idx: 0, concepts: concepts }), n: s.pos })
   proofs:
     purity:
       reads : [s.source, s.pos]
@@ -14853,6 +14920,8 @@ rule undef_span_ast
       AstSum(coll, item_start, item_len, body) => Span::MkSpan { start: 9999, len: 0 }
       AstCount(coll, item_start, item_len, body) => Span::MkSpan { start: 9999, len: 0 }
       AstFold(coll, init, acc_start, acc_len, item_start, item_len, body) => Span::MkSpan { start: 9999, len: 0 }
+      AstAll(coll, item_start, item_len, body) => Span::MkSpan { start: 9999, len: 0 }
+      AstAny(coll, item_start, item_len, body) => Span::MkSpan { start: 9999, len: 0 }
       AstVar(start, len) => if name_bound(NameBoundState { binds: a.binds, src: a.src, q_start: start, q_len: len }) == 0 then Span::MkSpan { start: start, len: len } else Span::MkSpan { start: 9999, len: 0 }
       AstBin(op, lhs, rhs) => span_or(SpanOrState { a: undef_span_ast(UndefSpanAstState { node: lhs, binds: a.binds, src: a.src }), b: undef_span_ast(UndefSpanAstState { node: rhs, binds: a.binds, src: a.src }) })
       AstNeg(inner) => undef_span_ast(UndefSpanAstState { node: inner, binds: a.binds, src: a.src })
@@ -15186,6 +15255,8 @@ rule badcall_span_ast
       AstSum(coll, item_start, item_len, body) => Span::MkSpan { start: 9999, len: 0 }
       AstCount(coll, item_start, item_len, body) => Span::MkSpan { start: 9999, len: 0 }
       AstFold(coll, init, acc_start, acc_len, item_start, item_len, body) => Span::MkSpan { start: 9999, len: 0 }
+      AstAll(coll, item_start, item_len, body) => Span::MkSpan { start: 9999, len: 0 }
+      AstAny(coll, item_start, item_len, body) => Span::MkSpan { start: 9999, len: 0 }
       AstBin(op, lhs, rhs) => span_or(SpanOrState { a: badcall_span_ast(BadCallSpanState { node: lhs, rules: a.rules, src: a.src }), b: badcall_span_ast(BadCallSpanState { node: rhs, rules: a.rules, src: a.src }) })
       AstNeg(inner) => badcall_span_ast(BadCallSpanState { node: inner, rules: a.rules, src: a.src })
       AstNot(inner) => badcall_span_ast(BadCallSpanState { node: inner, rules: a.rules, src: a.src })
@@ -15454,6 +15525,8 @@ rule badarity_span_ast
       AstSum(coll, item_start, item_len, body) => Span::MkSpan { start: 9999, len: 0 }
       AstCount(coll, item_start, item_len, body) => Span::MkSpan { start: 9999, len: 0 }
       AstFold(coll, init, acc_start, acc_len, item_start, item_len, body) => Span::MkSpan { start: 9999, len: 0 }
+      AstAll(coll, item_start, item_len, body) => Span::MkSpan { start: 9999, len: 0 }
+      AstAny(coll, item_start, item_len, body) => Span::MkSpan { start: 9999, len: 0 }
       AstBin(op, lhs, rhs) => span_or(SpanOrState { a: badarity_span_ast(BadAritySpanState { node: lhs, rules: a.rules, src: a.src }), b: badarity_span_ast(BadAritySpanState { node: rhs, rules: a.rules, src: a.src }) })
       AstNeg(inner) => badarity_span_ast(BadAritySpanState { node: inner, rules: a.rules, src: a.src })
       AstNot(inner) => badarity_span_ast(BadAritySpanState { node: inner, rules: a.rules, src: a.src })
@@ -15845,6 +15918,8 @@ rule print_expr
       AstSum(coll, item_start, item_len, body) => "?"
       AstCount(coll, item_start, item_len, body) => "?"
       AstFold(coll, init, acc_start, acc_len, item_start, item_len, body) => "?"
+      AstAll(coll, item_start, item_len, body) => "?"
+      AstAny(coll, item_start, item_len, body) => "?"
   proofs:
     purity:
       reads : [ps.node, ps.src]
@@ -16000,6 +16075,8 @@ rule lower_expr
       AstSum(coll, item_start, item_len, body) => "? "
       AstCount(coll, item_start, item_len, body) => "? "
       AstFold(coll, init, acc_start, acc_len, item_start, item_len, body) => "? "
+      AstAll(coll, item_start, item_len, body) => "? "
+      AstAny(coll, item_start, item_len, body) => "? "
   proofs:
     purity:
       reads : [ps.node, ps.src]
@@ -16133,6 +16210,8 @@ rule x86_expr
       AstSum(coll, item_start, item_len, body) => b"\xcc"
       AstCount(coll, item_start, item_len, body) => b"\xcc"
       AstFold(coll, init, acc_start, acc_len, item_start, item_len, body) => b"\xcc"
+      AstAll(coll, item_start, item_len, body) => b"\xcc"
+      AstAny(coll, item_start, item_len, body) => b"\xcc"
   proofs:
     purity:
       reads : [ps.node, ps.src]
@@ -16188,6 +16267,8 @@ rule code_size_expr
       AstSum(coll, item_start, item_len, body) => 1
       AstCount(coll, item_start, item_len, body) => 1
       AstFold(coll, init, acc_start, acc_len, item_start, item_len, body) => 1
+      AstAll(coll, item_start, item_len, body) => 1
+      AstAny(coll, item_start, item_len, body) => 1
   proofs:
     purity:
       reads : [ps.node, ps.src]
@@ -16492,6 +16573,8 @@ rule ast_is_variant
       AstSum(coll, item_start, item_len, body) => 0
       AstCount(coll, item_start, item_len, body) => 0
       AstFold(coll, init, acc_start, acc_len, item_start, item_len, body) => 0
+      AstAll(coll, item_start, item_len, body) => 0
+      AstAny(coll, item_start, item_len, body) => 0
   proofs:
     purity:
       reads : [n]
@@ -16530,6 +16613,8 @@ rule ast_variant_cstart
       AstSum(coll, item_start, item_len, body) => 0
       AstCount(coll, item_start, item_len, body) => 0
       AstFold(coll, init, acc_start, acc_len, item_start, item_len, body) => 0
+      AstAll(coll, item_start, item_len, body) => 0
+      AstAny(coll, item_start, item_len, body) => 0
   proofs:
     purity:
       reads : [n]
@@ -16568,6 +16653,8 @@ rule ast_variant_clen
       AstSum(coll, item_start, item_len, body) => 0
       AstCount(coll, item_start, item_len, body) => 0
       AstFold(coll, init, acc_start, acc_len, item_start, item_len, body) => 0
+      AstAll(coll, item_start, item_len, body) => 0
+      AstAny(coll, item_start, item_len, body) => 0
   proofs:
     purity:
       reads : [n]
@@ -16698,6 +16785,8 @@ rule static_concept_of
       AstSum(coll, item_start, item_len, body) => 0 - 1
       AstCount(coll, item_start, item_len, body) => 0 - 1
       AstFold(coll, init, acc_start, acc_len, item_start, item_len, body) => 0 - 1
+      AstAll(coll, item_start, item_len, body) => 0 - 1
+      AstAny(coll, item_start, item_len, body) => 0 - 1
   proofs:
     purity:
       reads : [sc.node, sc.src, sc.params, sc.lets, sc.concepts]
@@ -16951,6 +17040,8 @@ rule ast_uses_text
       AstSum(coll, item_start, item_len, body) => if ast_uses_text(PrintState { node: coll, src: ps.src }) == 1 then 1 else ast_uses_text(PrintState { node: body, src: ps.src })
       AstCount(coll, item_start, item_len, body) => if ast_uses_text(PrintState { node: coll, src: ps.src }) == 1 then 1 else ast_uses_text(PrintState { node: body, src: ps.src })
       AstFold(coll, init, acc_start, acc_len, item_start, item_len, body) => if ast_uses_text(PrintState { node: coll, src: ps.src }) == 1 then 1 else if ast_uses_text(PrintState { node: init, src: ps.src }) == 1 then 1 else ast_uses_text(PrintState { node: body, src: ps.src })
+      AstAll(coll, item_start, item_len, body) => if ast_uses_text(PrintState { node: coll, src: ps.src }) == 1 then 1 else ast_uses_text(PrintState { node: body, src: ps.src })
+      AstAny(coll, item_start, item_len, body) => if ast_uses_text(PrintState { node: coll, src: ps.src }) == 1 then 1 else ast_uses_text(PrintState { node: body, src: ps.src })
   proofs:
     purity:
       reads : [ps.node, ps.src]
@@ -17114,6 +17205,8 @@ rule ast_uses_result
       AstSum(coll, item_start, item_len, body) => if ast_uses_result(PrintState { node: coll, src: ps.src }) == 1 then 1 else ast_uses_result(PrintState { node: body, src: ps.src })
       AstCount(coll, item_start, item_len, body) => if ast_uses_result(PrintState { node: coll, src: ps.src }) == 1 then 1 else ast_uses_result(PrintState { node: body, src: ps.src })
       AstFold(coll, init, acc_start, acc_len, item_start, item_len, body) => if ast_uses_result(PrintState { node: coll, src: ps.src }) == 1 then 1 else if ast_uses_result(PrintState { node: init, src: ps.src }) == 1 then 1 else ast_uses_result(PrintState { node: body, src: ps.src })
+      AstAll(coll, item_start, item_len, body) => if ast_uses_result(PrintState { node: coll, src: ps.src }) == 1 then 1 else ast_uses_result(PrintState { node: body, src: ps.src })
+      AstAny(coll, item_start, item_len, body) => if ast_uses_result(PrintState { node: coll, src: ps.src }) == 1 then 1 else ast_uses_result(PrintState { node: body, src: ps.src })
   proofs:
     purity:
       reads : [ps.node, ps.src]
@@ -17316,6 +17409,8 @@ rule ast_texty_shallow
       AstSum(coll, item_start, item_len, body) => 0
       AstCount(coll, item_start, item_len, body) => 0
       AstFold(coll, init, acc_start, acc_len, item_start, item_len, body) => 0
+      AstAll(coll, item_start, item_len, body) => 0
+      AstAny(coll, item_start, item_len, body) => 0
   proofs:
     purity:
       reads : [ps.node, ps.src]
@@ -17380,6 +17475,8 @@ rule ast_is_texty
       AstSum(coll, item_start, item_len, body) => 0
       AstCount(coll, item_start, item_len, body) => 0
       AstFold(coll, init, acc_start, acc_len, item_start, item_len, body) => 0
+      AstAll(coll, item_start, item_len, body) => 0
+      AstAny(coll, item_start, item_len, body) => 0
   proofs:
     purity:
       reads : [ts.node, ts.src, ts.prog]
@@ -17531,6 +17628,8 @@ rule ast_bytes_shallow
       AstSum(coll, item_start, item_len, body) => 0
       AstCount(coll, item_start, item_len, body) => 0
       AstFold(coll, init, acc_start, acc_len, item_start, item_len, body) => 0
+      AstAll(coll, item_start, item_len, body) => 0
+      AstAny(coll, item_start, item_len, body) => 0
   proofs:
     purity:
       reads : [ts.node, ts.src, ts.prog]
@@ -17575,6 +17674,8 @@ rule ast_is_bytes
       AstSum(coll, item_start, item_len, body) => 0
       AstCount(coll, item_start, item_len, body) => 0
       AstFold(coll, init, acc_start, acc_len, item_start, item_len, body) => 0
+      AstAll(coll, item_start, item_len, body) => 0
+      AstAny(coll, item_start, item_len, body) => 0
   proofs:
     purity:
       reads : [ts.node, ts.src, ts.prog]
@@ -17951,6 +18052,11 @@ rule mb_ast
       -- coll / init / body. The remaining-count and argv-cursor live in registers
       -- (r8 / r9), not slots.
       AstFold(coll, init, acc_start, acc_len, item_start, item_len, body) => 2 + mb_ast(coll) + mb_ast(init) + mb_ast(body)
+      -- COLLECTIONS tier slice 3: all / any reserve the same 2 frame slots as
+      -- sum / count — the item binder (base+0) and the emitter-reserved accumulator
+      -- (base+1, dummy {0,0} binder entry; the acc is never source-named).
+      AstAll(coll, item_start, item_len, body) => 2 + mb_ast(coll) + mb_ast(body)
+      AstAny(coll, item_start, item_len, body) => 2 + mb_ast(coll) + mb_ast(body)
   proofs:
     purity:
       reads : [n]
@@ -18351,6 +18457,12 @@ rule code_size_node
       -- same size as sum's add-accumulate (pop 1 + add 7 = 8 B). MUST track
       -- x86_node's AstFold arm arm-for-arm — the drift edge.
       AstFold(coll, init, acc_start, acc_len, item_start, item_len, body) => code_size_node(ByteGenState { node: coll, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + code_size_node(ByteGenState { node: init, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + code_size_node(ByteGenState { node: body, src: bg.src, off: 0, params: bg.params, lets: lets_append_binders(AppendBindersState { lets: bg.lets, bs: BinderList::BindCons { start: item_start, len: item_len, rest: BinderList::BindCons { start: acc_start, len: acc_len, rest: BinderList::BindNil } } }), prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + 177
+      -- COLLECTIONS tier slice 3 (all / any): constant 189 = the shared 172-byte
+      -- loop skeleton + the 17-byte latch/saturate accumulate (sum: 172 + 8 = 180;
+      -- count: 172 + 18 = 190). MUST track x86_node's AstAll/AstAny arms arm-for-arm
+      -- — the drift edge.
+      AstAll(coll, item_start, item_len, body) => code_size_node(ByteGenState { node: coll, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + code_size_node(ByteGenState { node: body, src: bg.src, off: 0, params: bg.params, lets: lets_append_binders(AppendBindersState { lets: bg.lets, bs: BinderList::BindCons { start: item_start, len: item_len, rest: BinderList::BindCons { start: 0, len: 0, rest: BinderList::BindNil } } }), prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + 189
+      AstAny(coll, item_start, item_len, body) => code_size_node(ByteGenState { node: coll, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + code_size_node(ByteGenState { node: body, src: bg.src, off: 0, params: bg.params, lets: lets_append_binders(AppendBindersState { lets: bg.lets, bs: BinderList::BindCons { start: item_start, len: item_len, rest: BinderList::BindCons { start: 0, len: 0, rest: BinderList::BindNil } } }), prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + 189
   proofs:
     purity:
       reads : [bg.node, bg.src, bg.off, bg.params, bg.lets, bg.prog, bg.concepts, bg.sizes]
@@ -18708,6 +18820,21 @@ rule x86_node
       -- backward -(95 + body). Body offset = init + 8 + coll + 143 = init + coll +
       -- 151. r8 = remaining count, r9 = argv cursor (r14/r15 arena — never touched).
       AstFold(coll, init, acc_start, acc_len, item_start, item_len, body) => concat(x86_node(ByteGenState { node: init, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }), b"\x58\x48\x89\x85", le32(0 - 8 * (count_binds(bg.lets) + 2)), x86_node(ByteGenState { node: coll, src: bg.src, off: bg.off + code_size_node(ByteGenState { node: init, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + 8, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }), b"\x41\x59\x49\x8b\x31", b"\x48\x31\xc0\x45\x31\xdb\x8a\x0e\x80\xf9\x2d\x75\x06\x41\xb3\x01\x48\xff\xc6\x0f\xb6\x0e\x80\xf9\x30\x72\x15\x80\xf9\x39\x77\x10\x48\x6b\xc0\x0a\x48\x83\xe9\x30\x48\x01\xc8\x48\xff\xc6\xeb\xe3\x4d\x85\xdb\x74\x03\x48\xf7\xd8", b"\x49\x89\xc0\x49\x83\xc1\x08", b"\x4d\x85\xc0\x0f\x84", le32((86 + code_size_node(ByteGenState { node: body, src: bg.src, off: 0, params: bg.params, lets: lets_append_binders(AppendBindersState { lets: bg.lets, bs: BinderList::BindCons { start: item_start, len: item_len, rest: BinderList::BindCons { start: acc_start, len: acc_len, rest: BinderList::BindNil } } }), prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }))), b"\x49\x8b\x31", b"\x48\x31\xc0\x45\x31\xdb\x8a\x0e\x80\xf9\x2d\x75\x06\x41\xb3\x01\x48\xff\xc6\x0f\xb6\x0e\x80\xf9\x30\x72\x15\x80\xf9\x39\x77\x10\x48\x6b\xc0\x0a\x48\x83\xe9\x30\x48\x01\xc8\x48\xff\xc6\xeb\xe3\x4d\x85\xdb\x74\x03\x48\xf7\xd8", b"\x48\x89\x85", le32(0 - 8 * (count_binds(bg.lets) + 1)), x86_node(ByteGenState { node: body, src: bg.src, off: bg.off + code_size_node(ByteGenState { node: init, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + code_size_node(ByteGenState { node: coll, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + 151, params: bg.params, lets: lets_append_binders(AppendBindersState { lets: bg.lets, bs: BinderList::BindCons { start: item_start, len: item_len, rest: BinderList::BindCons { start: acc_start, len: acc_len, rest: BinderList::BindNil } } }), prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }), b"\x58\x48\x89\x85", le32(0 - 8 * (count_binds(bg.lets) + 2)), b"\x49\x83\xc1\x08\x49\xff\xc8\xe9", le32((0 - (95 + code_size_node(ByteGenState { node: body, src: bg.src, off: 0, params: bg.params, lets: lets_append_binders(AppendBindersState { lets: bg.lets, bs: BinderList::BindCons { start: item_start, len: item_len, rest: BinderList::BindCons { start: acc_start, len: acc_len, rest: BinderList::BindNil } } }), prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes })))), b"\xff\xb5", le32(0 - 8 * (count_binds(bg.lets) + 2)))
+      -- COLLECTIONS tier slice 3 (all / any): the AstSum loop skeleton with two deltas.
+      -- (1) INIT: all's acc slot starts at 1 (vacuous truth on the empty collection);
+      -- any keeps sum's 0 — same 11-byte mov-qword-imm32, only the imm changes.
+      -- (2) ACCUMULATE (17 B — vs sum's 8, count's 18): pop rax 58; test rax,rax
+      -- 48 85 c0; then all: jnz +11 (75 0b) over `mov qword [rbp+acc_off], 0`
+      -- (48 c7 85 disp32 imm32) — the acc LATCHES to 0 on the first false body;
+      -- any: jz +11 (74 0b) over `mov qword [rbp+acc_off], 1` — the acc SATURATES
+      -- to 1 on the first true body. Single pass, NO short-circuit — verbosec native
+      -- (Phase 6 fold desugar) parity. Loop rel32s: jz forward 95 + body (78 + 17),
+      -- jmp backward -(104 + body) (87 + 17); code_size constant 189 (172 + 17).
+      -- Body offset = coll + 154, same as sum (the pre-loop prefix is byte-identical
+      -- in length). r8 = remaining count, r9 = argv cursor (r14/r15 arena — never
+      -- touched).
+      AstAll(coll, item_start, item_len, body) => concat(x86_node(ByteGenState { node: coll, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }), b"\x41\x59\x49\x8b\x31", b"\x48\x31\xc0\x45\x31\xdb\x8a\x0e\x80\xf9\x2d\x75\x06\x41\xb3\x01\x48\xff\xc6\x0f\xb6\x0e\x80\xf9\x30\x72\x15\x80\xf9\x39\x77\x10\x48\x6b\xc0\x0a\x48\x83\xe9\x30\x48\x01\xc8\x48\xff\xc6\xeb\xe3\x4d\x85\xdb\x74\x03\x48\xf7\xd8", b"\x49\x89\xc0\x49\x83\xc1\x08", b"\x48\xc7\x85", le32(0 - 8 * (count_binds(bg.lets) + 2)), b"\x01\x00\x00\x00", b"\x4d\x85\xc0\x0f\x84", le32((95 + code_size_node(ByteGenState { node: body, src: bg.src, off: 0, params: bg.params, lets: lets_append_binders(AppendBindersState { lets: bg.lets, bs: BinderList::BindCons { start: item_start, len: item_len, rest: BinderList::BindCons { start: 0, len: 0, rest: BinderList::BindNil } } }), prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }))), b"\x49\x8b\x31", b"\x48\x31\xc0\x45\x31\xdb\x8a\x0e\x80\xf9\x2d\x75\x06\x41\xb3\x01\x48\xff\xc6\x0f\xb6\x0e\x80\xf9\x30\x72\x15\x80\xf9\x39\x77\x10\x48\x6b\xc0\x0a\x48\x83\xe9\x30\x48\x01\xc8\x48\xff\xc6\xeb\xe3\x4d\x85\xdb\x74\x03\x48\xf7\xd8", b"\x48\x89\x85", le32(0 - 8 * (count_binds(bg.lets) + 1)), x86_node(ByteGenState { node: body, src: bg.src, off: bg.off + code_size_node(ByteGenState { node: coll, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + 154, params: bg.params, lets: lets_append_binders(AppendBindersState { lets: bg.lets, bs: BinderList::BindCons { start: item_start, len: item_len, rest: BinderList::BindCons { start: 0, len: 0, rest: BinderList::BindNil } } }), prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }), b"\x58\x48\x85\xc0\x75\x0b\x48\xc7\x85", le32(0 - 8 * (count_binds(bg.lets) + 2)), b"\x00\x00\x00\x00", b"\x49\x83\xc1\x08\x49\xff\xc8\xe9", le32((0 - (104 + code_size_node(ByteGenState { node: body, src: bg.src, off: 0, params: bg.params, lets: lets_append_binders(AppendBindersState { lets: bg.lets, bs: BinderList::BindCons { start: item_start, len: item_len, rest: BinderList::BindCons { start: 0, len: 0, rest: BinderList::BindNil } } }), prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes })))), b"\xff\xb5", le32(0 - 8 * (count_binds(bg.lets) + 2)))
+      AstAny(coll, item_start, item_len, body) => concat(x86_node(ByteGenState { node: coll, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }), b"\x41\x59\x49\x8b\x31", b"\x48\x31\xc0\x45\x31\xdb\x8a\x0e\x80\xf9\x2d\x75\x06\x41\xb3\x01\x48\xff\xc6\x0f\xb6\x0e\x80\xf9\x30\x72\x15\x80\xf9\x39\x77\x10\x48\x6b\xc0\x0a\x48\x83\xe9\x30\x48\x01\xc8\x48\xff\xc6\xeb\xe3\x4d\x85\xdb\x74\x03\x48\xf7\xd8", b"\x49\x89\xc0\x49\x83\xc1\x08", b"\x48\xc7\x85", le32(0 - 8 * (count_binds(bg.lets) + 2)), b"\x00\x00\x00\x00", b"\x4d\x85\xc0\x0f\x84", le32((95 + code_size_node(ByteGenState { node: body, src: bg.src, off: 0, params: bg.params, lets: lets_append_binders(AppendBindersState { lets: bg.lets, bs: BinderList::BindCons { start: item_start, len: item_len, rest: BinderList::BindCons { start: 0, len: 0, rest: BinderList::BindNil } } }), prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }))), b"\x49\x8b\x31", b"\x48\x31\xc0\x45\x31\xdb\x8a\x0e\x80\xf9\x2d\x75\x06\x41\xb3\x01\x48\xff\xc6\x0f\xb6\x0e\x80\xf9\x30\x72\x15\x80\xf9\x39\x77\x10\x48\x6b\xc0\x0a\x48\x83\xe9\x30\x48\x01\xc8\x48\xff\xc6\xeb\xe3\x4d\x85\xdb\x74\x03\x48\xf7\xd8", b"\x48\x89\x85", le32(0 - 8 * (count_binds(bg.lets) + 1)), x86_node(ByteGenState { node: body, src: bg.src, off: bg.off + code_size_node(ByteGenState { node: coll, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + 154, params: bg.params, lets: lets_append_binders(AppendBindersState { lets: bg.lets, bs: BinderList::BindCons { start: item_start, len: item_len, rest: BinderList::BindCons { start: 0, len: 0, rest: BinderList::BindNil } } }), prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }), b"\x58\x48\x85\xc0\x74\x0b\x48\xc7\x85", le32(0 - 8 * (count_binds(bg.lets) + 2)), b"\x01\x00\x00\x00", b"\x49\x83\xc1\x08\x49\xff\xc8\xe9", le32((0 - (104 + code_size_node(ByteGenState { node: body, src: bg.src, off: 0, params: bg.params, lets: lets_append_binders(AppendBindersState { lets: bg.lets, bs: BinderList::BindCons { start: item_start, len: item_len, rest: BinderList::BindCons { start: 0, len: 0, rest: BinderList::BindNil } } }), prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes })))), b"\xff\xb5", le32(0 - 8 * (count_binds(bg.lets) + 2)))
   proofs:
     purity:
       reads : [bg.node, bg.src, bg.off, bg.params, bg.lets, bg.prog, bg.concepts, bg.sizes]
@@ -18840,6 +18967,8 @@ rule code_size_stream_node
       AstSum(coll, item_start, item_len, body) => 1
       AstCount(coll, item_start, item_len, body) => 1
       AstFold(coll, init, acc_start, acc_len, item_start, item_len, body) => 1
+      AstAll(coll, item_start, item_len, body) => 1
+      AstAny(coll, item_start, item_len, body) => 1
       AstCall(callee_start, callee_len, args) => if span_is_concat(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then stream_size_cargs(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) else if span_is_arena_scope(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then 2 + code_size_stream_node(ByteGenState { node: arg_first(args), src: bg.src, off: bg.off + 2, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + 2 else if span_is_le32(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then code_size_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + 34 else if span_is_le64(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then code_size_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + 34 else if span_is_substring(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then 1 else if span_is_byte_at(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then code_size_node(bg) + 6 else if span_is_length(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then code_size_node(bg) + 6 else if callee_is_texty(FindRuleState { rules: bg.prog, src: bg.src, q_start: callee_start, q_len: callee_len }) == 1 then code_size_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + 12 else code_size_node(bg) + 6
   proofs:
     purity:
@@ -18986,6 +19115,8 @@ rule x86_stream_node
       AstSum(coll, item_start, item_len, body) => b"\xcc"
       AstCount(coll, item_start, item_len, body) => b"\xcc"
       AstFold(coll, init, acc_start, acc_len, item_start, item_len, body) => b"\xcc"
+      AstAll(coll, item_start, item_len, body) => b"\xcc"
+      AstAny(coll, item_start, item_len, body) => b"\xcc"
       AstCall(callee_start, callee_len, args) => if span_is_concat(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then x86_stream_cargs(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) else if span_is_arena_scope(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then concat(b"\x41\x56", x86_stream_node(ByteGenState { node: arg_first(args), src: bg.src, off: bg.off + 2, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }), b"\x41\x5e") else if span_is_le32(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then concat(x86_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }), b"\x58\x48\x89\x44\x24\xf8\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x48\x8d\x74\x24\xf8\x48\xc7\xc2\x04\x00\x00\x00\x0f\x05") else if span_is_le64(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then concat(x86_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }), b"\x58\x48\x89\x44\x24\xf8\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x48\x8d\x74\x24\xf8\x48\xc7\xc2\x08\x00\x00\x00\x0f\x05") else if span_is_substring(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then b"\xcc" else if span_is_byte_at(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then concat(x86_node(bg), b"\x58\xe8", le32(0 - (bg.off + code_size_node(bg) + 92))) else if span_is_length(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then concat(x86_node(bg), b"\x58\xe8", le32(0 - (bg.off + code_size_node(bg) + 92))) else if callee_is_texty(FindRuleState { rules: bg.prog, src: bg.src, q_start: callee_start, q_len: callee_len }) == 1 then concat(x86_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }), b"\xe8", le32(proc_offset(ProcOffState { rules: bg.prog, src: bg.src, acc: 0, q_start: callee_start, q_len: callee_len, concepts: bg.concepts, sizes: bg.sizes }) - (bg.off + code_size_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + 5)), b"\x48\x81\xc4", le32(8 * arg_list_len(args))) else concat(x86_node(bg), b"\x58\xe8", le32(0 - (bg.off + code_size_node(bg) + 92)))
   proofs:
     purity:

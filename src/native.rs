@@ -21371,6 +21371,128 @@ rule le64_neg
         let _ = fs::remove_file(vref_shifty);
     }
 
+    /// COLLECTIONS tier slice 3 — THE MILESTONE: the self-hosted emitter compiles
+    /// the quantifiers `all(w.xs, x => x > 3)` / `any(w.xs, x => x > 100)` over a
+    /// `collection(number)` input field to runnable ELFs whose output matches
+    /// verbosec's OWN `--native` (Phase 6 quantifier-to-fold desugar) on the
+    /// equivalent RECORD-element program bit-for-bit. Same single-number-field
+    /// `Item` oracle trick as slices 1-2 (body `x.v` vs self's `x`).
+    ///
+    /// ORACLE FORM NOTE: verbosec DOES accept the bare `r = all(...)` as the whole
+    /// rule body natively (bool output, 551 B, prints "true"/"false") — but the
+    /// self-hosted emitter's output ABI is a decimal number print, so the bare
+    /// forms' stdout differ by FORMAT, not value. Both sides therefore use the
+    /// same `if <quantifier> then 1 else 0` embedding (verbosec's Phase 6 shape,
+    /// number output on both) so the comparison is bit-identical.
+    ///
+    /// Semantics pinned (single pass, NO short-circuit, mirroring verbosec's fold
+    /// desugar — all: init 1, `if pred then acc else 0`; any: init 0, `if pred
+    /// then 1 else acc`):
+    ///   - all(>3): [10,20,30] -> 1; [10,2,30] -> 0; [] -> 1 (VACUOUS TRUTH —
+    ///     the acc-slot init 1 flows through the skipped loop); [3,3,3] -> 0
+    ///     (boundary: > is strict).
+    ///   - any(>100): [10,200,30] -> 1; [10,20,30] -> 0; [] -> 0; [10,2,300] -> 1
+    ///     (last element true — the saturate step still runs on the final
+    ///     iteration).
+    ///
+    /// argv layout (count-prefixed, same as slices 1-2): `<binary> <N> <e0> ...`.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn collections_tier_slice3_all_any_match_verbosec() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        let src = fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        // The self-hosted emitter (elf_program_src, reads program on argv[1]).
+        let elf = std::env::temp_dir().join("verbosec_test_coll_s3_elf_program_src");
+        compile_native(&program, "elf_program_src", elf.to_str().unwrap(), false, false)
+            .expect("elf_program_src must compile natively");
+
+        // verbosec oracle: record-element collection (single-number-field Item),
+        // quantifiers embedded in `if ... then 1 else 0` (Phase 6 shape) — SAME
+        // argv layout + SAME output as the self-hosted scalar forms.
+        let vsrc = "@verbose 0.1.0\n\nconcept Item\n  @intention: \"one number\"\n  @source: d.intent:1\n  fields:\n    v : number\nconcept W\n  @intention: \"items\"\n  @source: d.intent:1\n  fields:\n    xs : collection(Item)\nrule allgt\n  @intention: \"all > 3 as 0/1\"\n  @source: d.intent:2\n  input:\n    w : W\n  output:\n    r : number\n  logic:\n    r = if all(w.xs, x => x.v > 3) then 1 else 0\n  proofs:\n    purity:\n      reads : [w.xs]\n      calls : []\n    termination:\n      bound : 4\nrule anygt\n  @intention: \"any > 100 as 0/1\"\n  @source: d.intent:2\n  input:\n    w : W\n  output:\n    r : number\n  logic:\n    r = if any(w.xs, x => x.v > 100) then 1 else 0\n  proofs:\n    purity:\n      reads : [w.xs]\n      calls : []\n    termination:\n      bound : 4";
+        let vtoks = crate::lexer::Lexer::new(&vsrc).tokenize().unwrap();
+        let vprog = crate::parser::Parser::new(vtoks).parse_program().unwrap();
+        let vref_allgt = std::env::temp_dir().join("verbosec_test_coll_s3_allgt_ref");
+        let vref_anygt = std::env::temp_dir().join("verbosec_test_coll_s3_anygt_ref");
+        compile_native(&vprog, "allgt", vref_allgt.to_str().unwrap(), false, false)
+            .expect("verbosec must compile `allgt` natively");
+        compile_native(&vprog, "anygt", vref_anygt.to_str().unwrap(), false, false)
+            .expect("verbosec must compile `anygt` natively");
+
+        // Self-hosted, header-less targets: scalar collection(number), body over `x`.
+        let prog_self_allgt = "concept W\n  fields:\n    xs : collection(number)\nrule allgt\n  input:\n    w : W\n  output:\n    r : number\n  logic:\n    r = if all(w.xs, x => x > 3) then 1 else 0";
+        let prog_self_anygt = "concept W\n  fields:\n    xs : collection(number)\nrule anygt\n  input:\n    w : W\n  output:\n    r : number\n  logic:\n    r = if any(w.xs, x => x > 100) then 1 else 0";
+
+        // Emit a target ELF via the self-hosted emitter (argv[1] = source, argv[2] = pos).
+        let emit_self = |prog_src: &str, tag: &str| -> std::path::PathBuf {
+            let mc = Command::new(&elf).args([prog_src, "0"]).output()
+                .expect("spawn elf_program_src");
+            assert!(mc.status.success(), "elf_program_src must exit 0 for {:?}; got {:?}", tag, mc.status);
+            let bytes = mc.stdout;
+            assert_eq!(&bytes[0..4], &[0x7f, 0x45, 0x4c, 0x46], "self-emitted file is not ELF for {}", tag);
+            let out = std::env::temp_dir().join(format!("verbosec_test_coll_s3_{}_self", tag));
+            fs::write(&out, &bytes).expect("write self ELF");
+            let mut perms = fs::metadata(&out).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&out, perms).expect("chmod +x");
+            out
+        };
+        let self_allgt = emit_self(prog_self_allgt, "allgt");
+        let self_anygt = emit_self(prog_self_anygt, "anygt");
+
+        // (argv after the program name, expected output). argv[0] is N, then N elements.
+        let allgt_cases: &[(&[&str], &str)] = &[
+            (&["3", "10", "20", "30"], "1\n"),
+            (&["3", "10", "2", "30"], "0\n"),
+            (&["0"], "1\n"), // vacuous truth on the empty collection
+            (&["3", "3", "3", "3"], "0\n"),
+            (&["1", "4"], "1\n"),
+            (&["4", "10", "20", "30", "1"], "0\n"), // last element false — no early exit
+        ];
+        let anygt_cases: &[(&[&str], &str)] = &[
+            (&["3", "10", "200", "30"], "1\n"),
+            (&["3", "10", "20", "30"], "0\n"),
+            (&["0"], "0\n"), // empty collection: no witness
+            (&["3", "10", "2", "300"], "1\n"), // last element true
+            (&["1", "100"], "0\n"), // boundary: > is strict
+            (&["2", "500", "600"], "1\n"),
+        ];
+
+        let run = |bin: &std::path::PathBuf, args: &[&str]| -> String {
+            let o = Command::new(bin).args(args).output().expect("run binary");
+            assert!(o.status.success(), "{:?} {:?} must exit 0; got {:?}", bin, args, o.status);
+            String::from_utf8_lossy(&o.stdout).to_string()
+        };
+
+        for (args, expected) in allgt_cases {
+            let s = run(&self_allgt, args);
+            let v = run(&vref_allgt, args);
+            assert_eq!(s, *expected, "self all(>3) for {:?} = {:?} (expected {:?})", args, s, expected);
+            assert_eq!(v, *expected, "verbosec all(>3) for {:?} = {:?} (expected {:?})", args, v, expected);
+            assert_eq!(s, v, "self ({:?}) vs verbosec ({:?}) all mismatch for {:?}", s, v, args);
+        }
+        for (args, expected) in anygt_cases {
+            let s = run(&self_anygt, args);
+            let v = run(&vref_anygt, args);
+            assert_eq!(s, *expected, "self any(>100) for {:?} = {:?} (expected {:?})", args, s, expected);
+            assert_eq!(v, *expected, "verbosec any(>100) for {:?} = {:?} (expected {:?})", args, v, expected);
+            assert_eq!(s, v, "self ({:?}) vs verbosec ({:?}) any mismatch for {:?}", s, v, args);
+        }
+
+        let _ = fs::remove_file(&self_allgt);
+        let _ = fs::remove_file(&self_anygt);
+        let _ = fs::remove_file(elf);
+        let _ = fs::remove_file(vref_allgt);
+        let _ = fs::remove_file(vref_anygt);
+    }
+
     /// Brick b6 — the four missing binary operators in the machine-code
     /// generator: division `/` (op 16), modulo `%` (op 17), logical `and`
     /// (op 30), logical `or` (op 31). Both the closed-expression path
