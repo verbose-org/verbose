@@ -21146,6 +21146,118 @@ rule le64_neg
         let _ = fs::remove_file(vref);
     }
 
+    /// COLLECTIONS tier slice 1 — THE MILESTONE: the self-hosted emitter
+    /// (elf_program_src, compiled natively from examples/vexprparse.verbose)
+    /// compiles a `sum(w.xs, x => x)` / `count(w.xs, x => x > 3)` reduction over a
+    /// `collection(number)` input field to a runnable ELF whose output matches
+    /// verbosec's OWN `--native` on the equivalent RECORD-element program bit-for-bit.
+    ///
+    /// The two forms have an IDENTICAL count-prefixed argv layout and produce the
+    /// SAME numbers, so verbosec's `collection(Item{v})` form (body `x.v`) is the
+    /// oracle for the self-hosted scalar `collection(number)` form (body `x`):
+    /// verbosec's `emit_fold_program` requires the collection element to be a named
+    /// concept, so a single-number-field `Item` is the smallest oracle that compiles.
+    ///
+    /// argv layout (count-prefixed): `<binary> <N> <e0> <e1> ... <e{N-1}>` — N and
+    /// every element are decimal argv strings, consumed inline (no cons-list built).
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn collections_tier_slice1_sum_count_match_verbosec() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        let src = fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        // The self-hosted emitter (elf_program_src, reads program on argv[1]).
+        let elf = std::env::temp_dir().join("verbosec_test_coll_s1_elf_program_src");
+        compile_native(&program, "elf_program_src", elf.to_str().unwrap(), false, false)
+            .expect("elf_program_src must compile natively");
+
+        // verbosec oracle: record-element collection (single-number-field Item),
+        // body `x.v` — SAME argv layout + SAME output as the self-hosted scalar
+        // `collection(number)` form (body `x`). @verbose header + @intention +
+        // proofs for the Rust parser; the self-hosted lexer stops at '@' so its
+        // program is header-less (see prog_self_* below).
+        let vsrc = "@verbose 0.1.0\n\nconcept Item\n  @intention: \"one number\"\n  @source: d.intent:1\n  fields:\n    v : number\nconcept W\n  @intention: \"items\"\n  @source: d.intent:1\n  fields:\n    xs : collection(Item)\nrule total\n  @intention: \"sum\"\n  @source: d.intent:2\n  input:\n    w : W\n  output:\n    r : number\n  logic:\n    r = sum(w.xs, x => x.v)\n  proofs:\n    purity:\n      reads : [w.xs]\n      calls : []\n    termination:\n      bound : 4\nrule tally\n  @intention: \"count > 3\"\n  @source: d.intent:2\n  input:\n    w : W\n  output:\n    r : number\n  logic:\n    r = count(w.xs, x => x.v > 3)\n  proofs:\n    purity:\n      reads : [w.xs]\n      calls : []\n    termination:\n      bound : 4";
+        let vtoks = crate::lexer::Lexer::new(&vsrc).tokenize().unwrap();
+        let vprog = crate::parser::Parser::new(vtoks).parse_program().unwrap();
+        let vref_total = std::env::temp_dir().join("verbosec_test_coll_s1_total_ref");
+        let vref_tally = std::env::temp_dir().join("verbosec_test_coll_s1_tally_ref");
+        compile_native(&vprog, "total", vref_total.to_str().unwrap(), false, false)
+            .expect("verbosec must compile `total` natively");
+        compile_native(&vprog, "tally", vref_tally.to_str().unwrap(), false, false)
+            .expect("verbosec must compile `tally` natively");
+
+        // Self-hosted, header-less targets: scalar collection(number), body `x`.
+        let prog_self_total = "concept W\n  fields:\n    xs : collection(number)\nrule total\n  input:\n    w : W\n  output:\n    r : number\n  logic:\n    r = sum(w.xs, x => x)";
+        let prog_self_tally = "concept W\n  fields:\n    xs : collection(number)\nrule tally\n  input:\n    w : W\n  output:\n    r : number\n  logic:\n    r = count(w.xs, x => x > 3)";
+
+        // Emit a target ELF via the self-hosted emitter (argv[1] = source, argv[2] = pos).
+        let emit_self = |prog_src: &str, tag: &str| -> std::path::PathBuf {
+            let mc = Command::new(&elf).args([prog_src, "0"]).output()
+                .expect("spawn elf_program_src");
+            assert!(mc.status.success(), "elf_program_src must exit 0 for {:?}; got {:?}", tag, mc.status);
+            let bytes = mc.stdout;
+            assert_eq!(&bytes[0..4], &[0x7f, 0x45, 0x4c, 0x46], "self-emitted file is not ELF for {}", tag);
+            let out = std::env::temp_dir().join(format!("verbosec_test_coll_s1_{}_self", tag));
+            fs::write(&out, &bytes).expect("write self ELF");
+            let mut perms = fs::metadata(&out).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&out, perms).expect("chmod +x");
+            out
+        };
+        let self_total = emit_self(prog_self_total, "total");
+        let self_tally = emit_self(prog_self_tally, "tally");
+
+        // (argv after the program name, expected output). argv[0] is N, then N elements.
+        let total_cases: &[(&[&str], &str)] = &[
+            (&["4", "10", "20", "30", "40"], "100\n"),
+            (&["3", "5", "5", "5"], "15\n"),
+            (&["0"], "0\n"),
+            (&["5", "1", "2", "3", "4", "5"], "15\n"),
+            (&["2", "100", "200"], "300\n"),
+            (&["1", "7"], "7\n"),
+        ];
+        let tally_cases: &[(&[&str], &str)] = &[
+            (&["4", "10", "2", "30", "1"], "2\n"),
+            (&["4", "10", "20", "30", "40"], "4\n"),
+            (&["0"], "0\n"),
+            (&["3", "1", "2", "3"], "0\n"),
+            (&["5", "4", "4", "4", "4", "4"], "5\n"),
+        ];
+
+        let run = |bin: &std::path::PathBuf, args: &[&str]| -> String {
+            let o = Command::new(bin).args(args).output().expect("run binary");
+            assert!(o.status.success(), "{:?} {:?} must exit 0; got {:?}", bin, args, o.status);
+            String::from_utf8_lossy(&o.stdout).to_string()
+        };
+
+        for (args, expected) in total_cases {
+            let s = run(&self_total, args);
+            let v = run(&vref_total, args);
+            assert_eq!(s, *expected, "self sum for {:?} = {:?} (expected {:?})", args, s, expected);
+            assert_eq!(v, *expected, "verbosec sum for {:?} = {:?} (expected {:?})", args, v, expected);
+            assert_eq!(s, v, "self ({:?}) vs verbosec ({:?}) sum mismatch for {:?}", s, v, args);
+        }
+        for (args, expected) in tally_cases {
+            let s = run(&self_tally, args);
+            let v = run(&vref_tally, args);
+            assert_eq!(s, *expected, "self count for {:?} = {:?} (expected {:?})", args, s, expected);
+            assert_eq!(v, *expected, "verbosec count for {:?} = {:?} (expected {:?})", args, v, expected);
+            assert_eq!(s, v, "self ({:?}) vs verbosec ({:?}) count mismatch for {:?}", s, v, args);
+        }
+
+        let _ = fs::remove_file(&self_total);
+        let _ = fs::remove_file(&self_tally);
+        let _ = fs::remove_file(elf);
+        let _ = fs::remove_file(vref_total);
+        let _ = fs::remove_file(vref_tally);
+    }
+
     /// Brick b6 — the four missing binary operators in the machine-code
     /// generator: division `/` (op 16), modulo `%` (op 17), logical `and`
     /// (op 30), logical `or` (op 31). Both the closed-expression path

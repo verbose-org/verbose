@@ -299,6 +299,21 @@ concept_group VExpr [max_depth: 4096, max_nodes: 6000000]
       -- (its `binder => body` arms are not argument expressions), so parse_primary
       -- intercepts the `match_result` keyword and parses it explicitly (parse_match_result).
       AstMatchResult of (scrut : Ast, ok_bstart : number, ok_blen : number, ok_body : Ast, err_bstart : number, err_blen : number, err_body : Ast)
+      -- COLLECTIONS tier slice 1: `sum(coll, item => body)` / `count(coll, item => body)`
+      -- over a `collection(number)` input field, reducing to a number. `coll` is the
+      -- collection expression (in slice 1 always AstField(AstVar(input), coll_field));
+      -- (item_start, item_len) is the lambda binder's SOURCE SPAN (same identity model
+      -- as AstVar / a match binder); `body` is the per-element expression (a full
+      -- parse_or). No lambda/closure value exists — the binder scopes only over `body`,
+      -- run as an inline loop in the reduction's frame (the accumulator is a reserved
+      -- rbp slot, NOT a source-named binder). sum: acc += body; count: acc += (body != 0).
+      -- Parsed like match_result (keyword-intercepted in parse_primary because the
+      -- `item => body` arm is not an argument expression). shape_ast gives each a
+      -- dedicated band above AstMatchResult's 5*10^10. Native emit mirrors verbosec's
+      -- emit_fold_program (Phase 4): a count-prefixed argv tail consumed inline, r8 =
+      -- remaining count, r9 = argv cursor (r14/r15 are the arena — never touched here).
+      AstSum of (coll : Ast, item_start : number, item_len : number, body : Ast)
+      AstCount of (coll : Ast, item_start : number, item_len : number, body : Ast)
 
   -- Records-arc brick R3: a cons-list of a variant-construction's named field
   -- initializers. Each cell carries the field NAME span (name_start, name_len) and
@@ -408,7 +423,7 @@ concept_group VExpr [max_depth: 4096, max_nodes: 6000000]
     @intention: "Result of a multi-DEDENT pop: new stack + dedent count + inconsistency flag"
     @source: vexprparse.intent:27
     variants:
-      MkDed of (popped : ColStack, count : number, err : number)
+      MkDed of (popped : ColStack, cnt : number, err : number)
 
   -- Brick 9: a cons-list of let-bindings in the arena. Each cell carries the
   -- bound name as a SOURCE SPAN (name_start, name_len) — the same identity model
@@ -927,13 +942,13 @@ rule kw3
   output:
     out : number
   logic:
-    out = if byte_at(s.source, s.pos) == 108 and (byte_at(s.source, s.pos + 1) == 101 and byte_at(s.source, s.pos + 2) == 116) then 4 else if byte_at(s.source, s.pos) == 97 and (byte_at(s.source, s.pos + 1) == 110 and byte_at(s.source, s.pos + 2) == 100) then 5 else if byte_at(s.source, s.pos) == 110 and (byte_at(s.source, s.pos + 1) == 111 and byte_at(s.source, s.pos + 2) == 116) then 6 else if byte_at(s.source, s.pos) == 69 and (byte_at(s.source, s.pos + 1) == 114 and byte_at(s.source, s.pos + 2) == 114) then 13 else 0
+    out = if byte_at(s.source, s.pos) == 108 and (byte_at(s.source, s.pos + 1) == 101 and byte_at(s.source, s.pos + 2) == 116) then 4 else if byte_at(s.source, s.pos) == 97 and (byte_at(s.source, s.pos + 1) == 110 and byte_at(s.source, s.pos + 2) == 100) then 5 else if byte_at(s.source, s.pos) == 110 and (byte_at(s.source, s.pos + 1) == 111 and byte_at(s.source, s.pos + 2) == 116) then 6 else if byte_at(s.source, s.pos) == 69 and (byte_at(s.source, s.pos + 1) == 114 and byte_at(s.source, s.pos + 2) == 114) then 13 else if byte_at(s.source, s.pos) == 115 and (byte_at(s.source, s.pos + 1) == 117 and byte_at(s.source, s.pos + 2) == 109) then 15 else 0
   proofs:
     purity:
       reads : [s.source, s.pos]
       calls : []
     termination:
-      bound : 48
+      bound : 64
 
 
 -- four-letter keywords: then=7, else=8 (brick 6 — `if`/`then`/`else` as an
@@ -972,7 +987,7 @@ rule kw5
   output:
     out : number
   logic:
-    out = if byte_at(s.source, s.pos) == 102 and (byte_at(s.source, s.pos + 1) == 97 and (byte_at(s.source, s.pos + 2) == 108 and (byte_at(s.source, s.pos + 3) == 115 and byte_at(s.source, s.pos + 4) == 101))) then 10 else if byte_at(s.source, s.pos) == 109 and (byte_at(s.source, s.pos + 1) == 97 and (byte_at(s.source, s.pos + 2) == 116 and (byte_at(s.source, s.pos + 3) == 99 and byte_at(s.source, s.pos + 4) == 104))) then 11 else 0
+    out = if byte_at(s.source, s.pos) == 102 and (byte_at(s.source, s.pos + 1) == 97 and (byte_at(s.source, s.pos + 2) == 108 and (byte_at(s.source, s.pos + 3) == 115 and byte_at(s.source, s.pos + 4) == 101))) then 10 else if byte_at(s.source, s.pos) == 109 and (byte_at(s.source, s.pos + 1) == 97 and (byte_at(s.source, s.pos + 2) == 116 and (byte_at(s.source, s.pos + 3) == 99 and byte_at(s.source, s.pos + 4) == 104))) then 11 else if byte_at(s.source, s.pos) == 99 and (byte_at(s.source, s.pos + 1) == 111 and (byte_at(s.source, s.pos + 2) == 117 and (byte_at(s.source, s.pos + 3) == 110 and byte_at(s.source, s.pos + 4) == 116))) then 16 else 0
   proofs:
     purity:
       reads : [s.source, s.pos]
@@ -2980,6 +2995,84 @@ rule mr_err
       bound : 512
 
 
+-- COLLECTIONS tier slice 1: the parse state for a sum / count reduction. `cell` sits
+-- on the `sum` / `count` keyword; `kind` selects the node built (0 = AstSum, 1 = AstCount).
+concept ReduceState
+  @intention: "A reduction (sum/count) parse cursor + which reducer (0 = sum, 1 = count)"
+  @source: vexprparse.intent:64
+  fields:
+    cell : TokenList
+    kind : number
+
+
+-- COLLECTIONS tier slice 1: the parsed collection expression of a reduction plus the
+-- reducer kind, handed to reduce_body to finish the `item => body` arm and assemble
+-- the AstSum / AstCount node.
+concept ReduceBodyState
+  @intention: "A reduction's parsed collection + the reducer kind, handed to reduce_body"
+  @source: vexprparse.intent:64
+  fields:
+    coll : Parsed
+    kind : number
+
+
+-- parse_reduce: build an AstSum / AstCount node. Cursor positioned at the `sum` /
+-- `count` keyword. The token stream is
+--   <kw> ( <coll> , <item ident> => <body> )
+-- Parse the collection expression (a full parse_or from cell+2, skipping the keyword
+-- and the '('); it stops at the ',' after the collection. reduce_body finishes the
+-- `item => body` arm. Mirror of parse_match_result -> mr_ok. In the parse SCC
+-- (calls parse_or), bound-only.
+rule parse_reduce
+  @intention: "Parse a sum/count reduction into an AstSum/AstCount node (collection + one item => body arm)"
+  @source: vexprparse.intent:64
+  input:
+    st : ReduceState
+  output:
+    out : Parsed
+  logic:
+    let coll_parsed = parse_or(ParseState { cell: advance(Advance { lst: st.cell, k: 2 }) })
+    out = reduce_body(ReduceBodyState { coll: coll_parsed, kind: st.kind })
+  proofs:
+    purity:
+      reads : [st.cell, st.kind]
+      calls : [parse_or, reduce_body, advance]
+    termination:
+      bound : 512
+
+
+-- reduce_body: after the collection, skip the ',' (coll_next+1 lands on the item
+-- binder IDENT), read the item binder span, skip the binder + the '=>' (op 2) and
+-- parse the body (a full parse_or from binder_cell+2). The body's end cell should sit
+-- at the closing ')' (op 22) — consume it if present. Assemble the AstSum (kind 0) or
+-- AstCount (kind 1) node carrying the collection, the binder span, and the body.
+-- Mirror of mr_ok / mr_err collapsed into one arm (a reduction has ONE binder arm).
+rule reduce_body
+  @intention: "Parse a reduction's item => body arm after the collection and assemble the AstSum/AstCount node"
+  @source: vexprparse.intent:64
+  input:
+    rb : ReduceBodyState
+  output:
+    out : Parsed
+  logic:
+    let coll_node = parsed_node(rb.coll)
+    let coll_next = parsed_next(rb.coll)
+    let binder_cell = advance(Advance { lst: coll_next, k: 1 })
+    let item_start = peek_start(binder_cell)
+    let item_len = peek_len(binder_cell)
+    let body_parsed = parse_or(ParseState { cell: advance(Advance { lst: binder_cell, k: 2 }) })
+    let body_node = parsed_node(body_parsed)
+    let body_next = parsed_next(body_parsed)
+    let close_pos = if peek_op_code(body_next) == 22 then advance(Advance { lst: body_next, k: 1 }) else body_next
+    out = Parsed::Mk { node: if rb.kind == 0 then Ast::AstSum { coll: coll_node, item_start: item_start, item_len: item_len, body: body_node } else Ast::AstCount { coll: coll_node, item_start: item_start, item_len: item_len, body: body_node }, next: close_pos }
+  proofs:
+    purity:
+      reads : [rb.coll, rb.kind]
+      calls : [parsed_node, parsed_next, peek_start, peek_len, peek_op_code, parse_or, advance]
+    termination:
+      bound : 512
+
+
 -- field_rest: fold a chain of '.IDENT' field accesses onto a base AST, left-deep
 -- (a.b.c => AstField(AstField(AstVar(a), b), c)). Peeks the op at fs.pos: a '.'
 -- (op 12) followed by an IDENT consumes both, wraps the base in AstField with
@@ -3146,16 +3239,21 @@ rule parse_primary
     let isok = if lead_kind == 212 then 1 else 0
     let iserr = if lead_kind == 213 then 1 else 0
     let ismatchresult = if lead_kind == 214 then 1 else 0
+    -- COLLECTIONS tier slice 1: sum / count are keywords (kw3=15 -> kind 215, kw5=16 ->
+    -- kind 216), intercepted BEFORE the call path exactly as match_result is: their
+    -- `item => body` arm is not an argument expression parse_args can take.
+    let issum = if lead_kind == 215 then 1 else 0
+    let iscount = if lead_kind == 216 then 1 else 0
     let isvariant = if next_opc == 3 then 1 else 0
     let vstart = peek_start(advance(Advance { lst: st.cell, k: 2 }))
     let vlen = peek_len(advance(Advance { lst: st.cell, k: 2 }))
     let has_braces = if peek_op_code(advance(Advance { lst: st.cell, k: 3 })) == 23 then 1 else 0
     let isrecord = if next_opc == 23 then 1 else 0
-    out = if ismatch == 1 then parse_match(st) else if ismatchresult == 1 then parse_match_result(st) else if isok == 1 then ok_close(ParenState { inner: parse_or(ParseState { cell: advance(Advance { lst: st.cell, k: 2 }) }) }) else if iserr == 1 then err_close(ParenState { inner: parse_or(ParseState { cell: advance(Advance { lst: st.cell, k: 2 }) }) }) else if isif == 1 then if_then(IfThenState { cond: parse_or(ParseState { cell: advance(Advance { lst: st.cell, k: 1 }) }) }) else if istrue == 1 then Parsed::Mk { node: Ast::AstBool { value: 1 }, next: advance(Advance { lst: st.cell, k: 1 }) } else if isfalse == 1 then Parsed::Mk { node: Ast::AstBool { value: 0 }, next: advance(Advance { lst: st.cell, k: 1 }) } else if isnum == 1 then Parsed::Mk { node: Ast::AstNum { value: numval }, next: advance(Advance { lst: st.cell, k: 1 }) } else if isstr == 1 then Parsed::Mk { node: Ast::AstStr { start: sstart, len: slen }, next: advance(Advance { lst: st.cell, k: 1 }) } else if isbytelit == 1 then Parsed::Mk { node: Ast::AstBytes { start: bstart + 2, len: if blen >= 3 then blen - 3 else 0 }, next: advance(Advance { lst: st.cell, k: 1 }) } else if isparen == 1 then paren_close(ParenState { inner: parse_or(ParseState { cell: advance(Advance { lst: st.cell, k: 1 }) }) }) else if isident == 1 then (if isvariant == 1 then (if has_braces == 1 then variant_build(VariantState { cstart: idstart, clen: idlen, vstart: vstart, vlen: vlen, pfields: parse_vfields(ParseState { cell: advance(Advance { lst: st.cell, k: 4 }) }) }) else variant_build(VariantState { cstart: idstart, clen: idlen, vstart: vstart, vlen: vlen, pfields: ParsedVFields::MkVF { fields: VFieldList::VFNil, next: advance(Advance { lst: st.cell, k: 3 }) } })) else if iscall == 1 then call_build(CallState { cstart: idstart, clen: idlen, pargs: parse_args(ParseState { cell: advance(Advance { lst: st.cell, k: 2 }) }) }) else if isrecord == 1 then variant_build(VariantState { cstart: idstart, clen: idlen, vstart: idstart, vlen: idlen, pfields: parse_vfields(ParseState { cell: advance(Advance { lst: st.cell, k: 2 }) }) }) else field_rest(FieldState { cell: advance(Advance { lst: st.cell, k: 1 }), base: Ast::AstVar { start: idstart, len: idlen } })) else Parsed::Mk { node: Ast::AstErr, next: st.cell }
+    out = if ismatch == 1 then parse_match(st) else if ismatchresult == 1 then parse_match_result(st) else if issum == 1 then parse_reduce(ReduceState { cell: st.cell, kind: 0 }) else if iscount == 1 then parse_reduce(ReduceState { cell: st.cell, kind: 1 }) else if isok == 1 then ok_close(ParenState { inner: parse_or(ParseState { cell: advance(Advance { lst: st.cell, k: 2 }) }) }) else if iserr == 1 then err_close(ParenState { inner: parse_or(ParseState { cell: advance(Advance { lst: st.cell, k: 2 }) }) }) else if isif == 1 then if_then(IfThenState { cond: parse_or(ParseState { cell: advance(Advance { lst: st.cell, k: 1 }) }) }) else if istrue == 1 then Parsed::Mk { node: Ast::AstBool { value: 1 }, next: advance(Advance { lst: st.cell, k: 1 }) } else if isfalse == 1 then Parsed::Mk { node: Ast::AstBool { value: 0 }, next: advance(Advance { lst: st.cell, k: 1 }) } else if isnum == 1 then Parsed::Mk { node: Ast::AstNum { value: numval }, next: advance(Advance { lst: st.cell, k: 1 }) } else if isstr == 1 then Parsed::Mk { node: Ast::AstStr { start: sstart, len: slen }, next: advance(Advance { lst: st.cell, k: 1 }) } else if isbytelit == 1 then Parsed::Mk { node: Ast::AstBytes { start: bstart + 2, len: if blen >= 3 then blen - 3 else 0 }, next: advance(Advance { lst: st.cell, k: 1 }) } else if isparen == 1 then paren_close(ParenState { inner: parse_or(ParseState { cell: advance(Advance { lst: st.cell, k: 1 }) }) }) else if isident == 1 then (if isvariant == 1 then (if has_braces == 1 then variant_build(VariantState { cstart: idstart, clen: idlen, vstart: vstart, vlen: vlen, pfields: parse_vfields(ParseState { cell: advance(Advance { lst: st.cell, k: 4 }) }) }) else variant_build(VariantState { cstart: idstart, clen: idlen, vstart: vstart, vlen: vlen, pfields: ParsedVFields::MkVF { fields: VFieldList::VFNil, next: advance(Advance { lst: st.cell, k: 3 }) } })) else if iscall == 1 then call_build(CallState { cstart: idstart, clen: idlen, pargs: parse_args(ParseState { cell: advance(Advance { lst: st.cell, k: 2 }) }) }) else if isrecord == 1 then variant_build(VariantState { cstart: idstart, clen: idlen, vstart: idstart, vlen: idlen, pfields: parse_vfields(ParseState { cell: advance(Advance { lst: st.cell, k: 2 }) }) }) else field_rest(FieldState { cell: advance(Advance { lst: st.cell, k: 1 }), base: Ast::AstVar { start: idstart, len: idlen } })) else Parsed::Mk { node: Ast::AstErr, next: st.cell }
   proofs:
     purity:
       reads : [st.cell, st]
-      calls : [peek_kind, peek_is_num, peek_is_str, peek_is_bytelit, peek_bytelit_start, peek_bytelit_len, peek_op_code, peek_is_ident, peek_value, peek_str_start, peek_str_len, peek_start, peek_len, if_then, paren_close, parse_or, call_build, parse_args, field_rest, parse_match, parse_match_result, ok_close, err_close, variant_build, parse_vfields, advance]
+      calls : [peek_kind, peek_is_num, peek_is_str, peek_is_bytelit, peek_bytelit_start, peek_bytelit_len, peek_op_code, peek_is_ident, peek_value, peek_str_start, peek_str_len, peek_start, peek_len, if_then, paren_close, parse_or, call_build, parse_args, field_rest, parse_match, parse_match_result, parse_reduce, ok_close, err_close, variant_build, parse_vfields, advance]
     termination:
       bound : 512
 
@@ -3653,6 +3751,8 @@ rule shape_ast
       AstOk(inner) => 30000000000 + shape_ast(inner)
       AstResErr(inner) => 40000000000 + shape_ast(inner)
       AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => 50000000000 + shape_ast(scrut) + shape_ast(ok_body) + shape_ast(err_body)
+      AstSum(coll, item_start, item_len, body) => 60000000000 + shape_ast(coll) + shape_ast(body)
+      AstCount(coll, item_start, item_len, body) => 70000000000 + shape_ast(coll) + shape_ast(body)
   proofs:
     purity:
       reads : [e]
@@ -3980,8 +4080,8 @@ rule dedents_to
     out : DedentResult
   logic:
     out = match pa.stk:
-      Push(width, rest) => if width > pa.width then dedent_bump(dedents_to(PopArg { stk: rest, width: pa.width })) else (if width == pa.width then DedentResult::MkDed { popped: pa.stk, count: 0, err: 0 } else DedentResult::MkDed { popped: pa.stk, count: 0, err: 1 })
-      Empty => if pa.width == 0 then DedentResult::MkDed { popped: ColStack::Empty, count: 0, err: 0 } else DedentResult::MkDed { popped: ColStack::Empty, count: 0, err: 1 }
+      Push(width, rest) => if width > pa.width then dedent_bump(dedents_to(PopArg { stk: rest, width: pa.width })) else (if width == pa.width then DedentResult::MkDed { popped: pa.stk, cnt: 0, err: 0 } else DedentResult::MkDed { popped: pa.stk, cnt: 0, err: 1 })
+      Empty => if pa.width == 0 then DedentResult::MkDed { popped: ColStack::Empty, cnt: 0, err: 0 } else DedentResult::MkDed { popped: ColStack::Empty, cnt: 0, err: 1 }
   proofs:
     purity:
       reads : [pa.stk, pa.width]
@@ -4003,7 +4103,7 @@ rule dedent_bump
     out : DedentResult
   logic:
     out = match dr:
-      MkDed(popped, count, err) => DedentResult::MkDed { popped: popped, count: count + 1, err: err }
+      MkDed(popped, cnt, err) => DedentResult::MkDed { popped: popped, cnt: cnt + 1, err: err }
   proofs:
     purity:
       reads : [dr]
@@ -4025,7 +4125,7 @@ rule dr_popped
     out : ColStack
   logic:
     out = match dr:
-      MkDed(popped, count, err) => popped
+      MkDed(popped, cnt, err) => popped
   proofs:
     purity:
       reads : [dr]
@@ -4043,7 +4143,7 @@ rule dr_count
     out : number
   logic:
     out = match dr:
-      MkDed(popped, count, err) => count
+      MkDed(popped, cnt, err) => cnt
   proofs:
     purity:
       reads : [dr]
@@ -4061,7 +4161,7 @@ rule dr_err
     out : number
   logic:
     out = match dr:
-      MkDed(popped, count, err) => err
+      MkDed(popped, cnt, err) => err
   proofs:
     purity:
       reads : [dr]
@@ -4076,7 +4176,7 @@ concept ConsDedArg
   @intention: "A dedent count plus the tail list to prepend the Dedent tokens onto"
   @source: vexprparse.intent:27
   fields:
-    count : number [0, 4000000]
+    cnt : number [0, 4000000]
     tail : TokenList
 
 
@@ -4092,14 +4192,14 @@ rule cons_dedents
   output:
     out : TokenList
   logic:
-    out = if cda.count <= 0 then cda.tail else TokenList::Cons { head: Token::Dedent, tail: cons_dedents(ConsDedArg { count: cda.count - 1, tail: cda.tail }) }
+    out = if cda.cnt <= 0 then cda.tail else TokenList::Cons { head: Token::Dedent, tail: cons_dedents(ConsDedArg { cnt: cda.cnt - 1, tail: cda.tail }) }
   proofs:
     purity:
-      reads : [cda.count, cda.tail]
+      reads : [cda.cnt, cda.tail]
       calls : [cons_dedents]
     termination:
       bound : 4096
-      decreasing : count
+      decreasing : cnt
 
 
 -- tokenize_line: tokenize ONE line's lexemes, starting at `pos`, stopping at (and
@@ -4233,7 +4333,7 @@ rule tokenize_indent
     let dr_e = dr_err(dr)
     let dr_p = dr_popped(dr)
     let flush_c = dr_count(dedents_to(PopArg { stk: ls.stack, width: 0 }))
-    out = if ls.pos >= len then cons_dedents(ConsDedArg { count: flush_c, tail: TokenList::Cons { head: Token::Eof, tail: TokenList::Nil } }) else if istab == 1 then TokenList::Cons { head: Token::IndentErr { pos: ls.pos }, tail: tokenize_indent(LineState { src: ls.src, stack: ls.stack, pos: nls }) } else if isblank == 1 then tokenize_indent(LineState { src: ls.src, stack: ls.stack, pos: nls }) else if width > tw then TokenList::Cons { head: Token::Indent, tail: append_toks(AppendArg { front: tokenize_line(ScanState { source: ls.src, pos: cstart }), back: TokenList::Cons { head: Token::Newline { pos: nls }, tail: tokenize_indent(LineState { src: ls.src, stack: ColStack::Push { width: width, rest: ls.stack }, pos: nls }) } }) } else if width < tw then cons_dedents(ConsDedArg { count: dr_c, tail: (if dr_e == 1 then TokenList::Cons { head: Token::IndentErr { pos: cstart }, tail: append_toks(AppendArg { front: tokenize_line(ScanState { source: ls.src, pos: cstart }), back: TokenList::Cons { head: Token::Newline { pos: nls }, tail: tokenize_indent(LineState { src: ls.src, stack: dr_p, pos: nls }) } }) } else append_toks(AppendArg { front: tokenize_line(ScanState { source: ls.src, pos: cstart }), back: TokenList::Cons { head: Token::Newline { pos: nls }, tail: tokenize_indent(LineState { src: ls.src, stack: dr_p, pos: nls }) } })) }) else append_toks(AppendArg { front: tokenize_line(ScanState { source: ls.src, pos: cstart }), back: TokenList::Cons { head: Token::Newline { pos: nls }, tail: tokenize_indent(LineState { src: ls.src, stack: ls.stack, pos: nls }) } })
+    out = if ls.pos >= len then cons_dedents(ConsDedArg { cnt: flush_c, tail: TokenList::Cons { head: Token::Eof, tail: TokenList::Nil } }) else if istab == 1 then TokenList::Cons { head: Token::IndentErr { pos: ls.pos }, tail: tokenize_indent(LineState { src: ls.src, stack: ls.stack, pos: nls }) } else if isblank == 1 then tokenize_indent(LineState { src: ls.src, stack: ls.stack, pos: nls }) else if width > tw then TokenList::Cons { head: Token::Indent, tail: append_toks(AppendArg { front: tokenize_line(ScanState { source: ls.src, pos: cstart }), back: TokenList::Cons { head: Token::Newline { pos: nls }, tail: tokenize_indent(LineState { src: ls.src, stack: ColStack::Push { width: width, rest: ls.stack }, pos: nls }) } }) } else if width < tw then cons_dedents(ConsDedArg { cnt: dr_c, tail: (if dr_e == 1 then TokenList::Cons { head: Token::IndentErr { pos: cstart }, tail: append_toks(AppendArg { front: tokenize_line(ScanState { source: ls.src, pos: cstart }), back: TokenList::Cons { head: Token::Newline { pos: nls }, tail: tokenize_indent(LineState { src: ls.src, stack: dr_p, pos: nls }) } }) } else append_toks(AppendArg { front: tokenize_line(ScanState { source: ls.src, pos: cstart }), back: TokenList::Cons { head: Token::Newline { pos: nls }, tail: tokenize_indent(LineState { src: ls.src, stack: dr_p, pos: nls }) } })) }) else append_toks(AppendArg { front: tokenize_line(ScanState { source: ls.src, pos: cstart }), back: TokenList::Cons { head: Token::Newline { pos: nls }, tail: tokenize_indent(LineState { src: ls.src, stack: ls.stack, pos: nls }) } })
   proofs:
     purity:
       reads : [ls.src, ls.stack, ls.pos]
@@ -5031,10 +5131,12 @@ rule eval_ast_env
       -- and evaluates err_body. Reuses the VEnv-extend + vdata_payload machinery
       -- eval_match already has, specialized to the two fixed Result arms.
       AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => eval_match_result(EvalMatchResState { scrutval: eval_ast_env(EvalEnvArg { node: scrut, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts }), ok_bstart: ok_bstart, ok_blen: ok_blen, ok_body: ok_body, err_bstart: err_bstart, err_blen: err_blen, err_body: err_body, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts })
+      AstSum(coll, item_start, item_len, body) => eval_reduce(EvalReduceState { items: vdata_payload(eval_ast_env(EvalEnvArg { node: coll, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts })), item_start: item_start, item_len: item_len, body: body, kind: 0, acc: 0, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts })
+      AstCount(coll, item_start, item_len, body) => eval_reduce(EvalReduceState { items: vdata_payload(eval_ast_env(EvalEnvArg { node: coll, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts })), item_start: item_start, item_len: item_len, body: body, kind: 1, acc: 0, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts })
   proofs:
     purity:
       reads : [ea.node, ea.env, ea.src, ea.prog, ea.concepts]
-      calls : [eval_ast_env, venv_lookup, eval_call, vnum_of, variant_tag, eval_vfields, eval_match, eval_match_result, vdata_payload, vdata_tag, concept_at_index, cd_fields, field_index_of, vlist_nth, span_is_byte_at, span_is_length, span_is_substring, span_is_concat, span_is_le32, span_is_le64, span_is_arena_scope, arg_first, prim_byte_at, prim_length, prim_substring, prim_concat, prim_le32, prim_le64]
+      calls : [eval_ast_env, venv_lookup, eval_call, vnum_of, variant_tag, eval_vfields, eval_match, eval_match_result, eval_reduce, vdata_payload, vdata_tag, concept_at_index, cd_fields, field_index_of, vlist_nth, span_is_byte_at, span_is_length, span_is_substring, span_is_concat, span_is_le32, span_is_le64, span_is_arena_scope, arg_first, prim_byte_at, prim_length, prim_substring, prim_concat, prim_le32, prim_le64]
     termination:
       bound : 4000
 
@@ -6569,6 +6671,55 @@ rule eval_match_result
       bound : 4000
 
 
+-- COLLECTIONS tier slice 1: the reduction fold state — the REMAINING element values
+-- (a ValueList), the item binder span (item_start, item_len), the per-element body,
+-- the reducer kind (0 = sum, 1 = count), the running accumulator, and the enclosing
+-- env / src / prog / concepts threaded to eval each body. eval_reduce walks the list,
+-- binding each element to the item span and folding vnum_of(body) (sum) or the 0/1
+-- truth of the body (count) into acc. The design's collection VALUE representation is
+-- a VData whose payload IS this element ValueList, so `items` is vdata_payload(coll).
+concept EvalReduceState
+  @intention: "A reduction fold: remaining element values + item binder span + body + reducer kind + accumulator + env/src/prog/concepts"
+  @source: vexprparse.intent:36
+  fields:
+    items : ValueList
+    item_start : number [0, 4000000]
+    item_len : number [0, 4000000]
+    body : Ast
+    kind : number
+    acc : number
+    env : VEnv
+    src : text [..256]
+    prog : RuleList
+    concepts : ConceptList
+
+
+-- eval_reduce: fold the element ValueList into a number. Per element (VLCons head),
+-- bind `head` to the item binder span at the FRONT of the env (like eval_match_result
+-- binds a Result payload) and evaluate `body`: sum (kind 0) adds vnum_of(body); count
+-- (kind 1) adds 1 iff vnum_of(body) != 0. Recurse on the tail with the updated acc;
+-- VLNil returns VNum acc. In the eval SCC (calls eval_ast_env). Bound-only termination
+-- + the native recursion breadcrumb, same posture as eval_match / eval_match_result
+-- (this rule runs only under the interpreter --run path, never compiled natively).
+rule eval_reduce
+  @intention: "Fold a collection's element values into a number: sum (add body) or count (add body != 0), binding each element to the item span"
+  @source: vexprparse.intent:36
+  input:
+    er : EvalReduceState
+  output:
+    out : Value
+  logic:
+    out = match er.items:
+      VLCons(head, tail) => eval_reduce(EvalReduceState { items: tail, item_start: er.item_start, item_len: er.item_len, body: er.body, kind: er.kind, acc: er.acc + (if er.kind == 0 then vnum_of(eval_ast_env(EvalEnvArg { node: er.body, env: VEnv::VECons { name_start: er.item_start, name_len: er.item_len, val: head, rest: er.env }, src: er.src, prog: er.prog, concepts: er.concepts })) else (if vnum_of(eval_ast_env(EvalEnvArg { node: er.body, env: VEnv::VECons { name_start: er.item_start, name_len: er.item_len, val: head, rest: er.env }, src: er.src, prog: er.prog, concepts: er.concepts })) != 0 then 1 else 0)), env: er.env, src: er.src, prog: er.prog, concepts: er.concepts })
+      VLNil => Value::VNum { n: er.acc }
+  proofs:
+    purity:
+      reads : [er.items, er.item_start, er.item_len, er.body, er.kind, er.acc, er.env, er.src, er.prog, er.concepts]
+      calls : [eval_reduce, vnum_of, eval_ast_env]
+    termination:
+      bound : 6000000
+
+
 -- eval_block: the brick-10 money-shot driver. Tokenize the block-body source
 -- (column-0 lines) with indentation, parse a statement block from index 0, build
 -- the environment from its bindings (in order, each RHS resolved against the env
@@ -6769,13 +6920,13 @@ rule type_code_of_span
   output:
     out : number
   logic:
-    out = if sc.len == 6 and (byte_at(sc.src, sc.start) == 110 and (byte_at(sc.src, sc.start + 1) == 117 and (byte_at(sc.src, sc.start + 2) == 109 and (byte_at(sc.src, sc.start + 3) == 98 and (byte_at(sc.src, sc.start + 4) == 101 and byte_at(sc.src, sc.start + 5) == 114))))) then 0 else (if sc.len == 4 and (byte_at(sc.src, sc.start) == 98 and (byte_at(sc.src, sc.start + 1) == 111 and (byte_at(sc.src, sc.start + 2) == 111 and byte_at(sc.src, sc.start + 3) == 108))) then 1 else (if sc.len == 4 and (byte_at(sc.src, sc.start) == 116 and (byte_at(sc.src, sc.start + 1) == 101 and (byte_at(sc.src, sc.start + 2) == 120 and byte_at(sc.src, sc.start + 3) == 116))) then 2 else 0))
+    out = if sc.len == 6 and (byte_at(sc.src, sc.start) == 110 and (byte_at(sc.src, sc.start + 1) == 117 and (byte_at(sc.src, sc.start + 2) == 109 and (byte_at(sc.src, sc.start + 3) == 98 and (byte_at(sc.src, sc.start + 4) == 101 and byte_at(sc.src, sc.start + 5) == 114))))) then 0 else (if sc.len == 4 and (byte_at(sc.src, sc.start) == 98 and (byte_at(sc.src, sc.start + 1) == 111 and (byte_at(sc.src, sc.start + 2) == 111 and byte_at(sc.src, sc.start + 3) == 108))) then 1 else (if sc.len == 4 and (byte_at(sc.src, sc.start) == 116 and (byte_at(sc.src, sc.start + 1) == 101 and (byte_at(sc.src, sc.start + 2) == 120 and byte_at(sc.src, sc.start + 3) == 116))) then 2 else (if sc.len == 10 and (byte_at(sc.src, sc.start) == 99 and (byte_at(sc.src, sc.start + 1) == 111 and (byte_at(sc.src, sc.start + 2) == 108 and (byte_at(sc.src, sc.start + 3) == 108 and (byte_at(sc.src, sc.start + 4) == 101 and (byte_at(sc.src, sc.start + 5) == 99 and (byte_at(sc.src, sc.start + 6) == 116 and (byte_at(sc.src, sc.start + 7) == 105 and (byte_at(sc.src, sc.start + 8) == 111 and byte_at(sc.src, sc.start + 9) == 110))))))))) then 3 else 0)))
   proofs:
     purity:
       reads : [sc.src, sc.start, sc.len]
       calls : []
     termination:
-      bound : 64
+      bound : 128
 
 
 -- span_is_concept (records-arc brick R1): 1 iff the span src[start..start+len] is
@@ -8352,7 +8503,7 @@ rule parse_fields
     let ty_start = peek_start(advance(Advance { lst: hp, k: 2 }))
     let ty_len = peek_len(advance(Advance { lst: hp, k: 2 }))
     let ty = type_code_of_span(SpanCheck { src: fp.src, start: ty_start, len: ty_len })
-    out = if is_field == 1 then fields_cons(FieldConsState { head_start: name_start, head_len: name_len, head_ty: ty, head_ty_start: ty_start, head_ty_len: ty_len, rest: parse_fields(FieldParseState { cell: skip_field_range(ParseState { cell: advance(Advance { lst: hp, k: 3 }) }), src: fp.src }) }) else ParsedFields::MkPF { fields: FieldList::FNil, next: hp }
+    out = if is_field == 1 then fields_cons(FieldConsState { head_start: name_start, head_len: name_len, head_ty: ty, head_ty_start: ty_start, head_ty_len: ty_len, rest: parse_fields(FieldParseState { cell: skip_field_range(ParseState { cell: (if ty == 3 then advance(Advance { lst: hp, k: 6 }) else advance(Advance { lst: hp, k: 3 })) }), src: fp.src }) }) else ParsedFields::MkPF { fields: FieldList::FNil, next: hp }
   proofs:
     purity:
       reads : [fp.cell, fp.src]
@@ -9886,6 +10037,8 @@ rule count_undef_ast
       AstOk(inner) => 0
       AstResErr(inner) => 0
       AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => 0
+      AstSum(coll, item_start, item_len, body) => 0
+      AstCount(coll, item_start, item_len, body) => 0
   proofs:
     purity:
       reads : [a.node, a.binds, a.src]
@@ -10410,6 +10563,8 @@ rule count_badcall_ast
       AstOk(inner) => 0
       AstResErr(inner) => 0
       AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => 0
+      AstSum(coll, item_start, item_len, body) => 0
+      AstCount(coll, item_start, item_len, body) => 0
   proofs:
     purity:
       reads : [a.node, a.rules, a.src]
@@ -10876,6 +11031,8 @@ rule count_badarity_ast
       AstOk(inner) => 0
       AstResErr(inner) => 0
       AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => 0
+      AstSum(coll, item_start, item_len, body) => 0
+      AstCount(coll, item_start, item_len, body) => 0
   proofs:
     purity:
       reads : [a.node, a.rules, a.src]
@@ -11315,6 +11472,8 @@ rule type_of_env
       AstOk(inner) => 3
       AstResErr(inner) => 3
       AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => 3
+      AstSum(coll, item_start, item_len, body) => 3
+      AstCount(coll, item_start, item_len, body) => 3
   proofs:
     purity:
       reads : [t.node, t.tenv, t.src, t.prog, t.concepts]
@@ -12130,6 +12289,8 @@ rule argtype_ast
       AstOk(inner) => 0
       AstResErr(inner) => 0
       AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => 0
+      AstSum(coll, item_start, item_len, body) => 0
+      AstCount(coll, item_start, item_len, body) => 0
       AstBin(op, lhs, rhs) => argtype_ast(ArgTypeState { node: lhs, tenv: a.tenv, src: a.src, prog: a.prog }) + argtype_ast(ArgTypeState { node: rhs, tenv: a.tenv, src: a.src, prog: a.prog })
       AstNeg(inner) => argtype_ast(ArgTypeState { node: inner, tenv: a.tenv, src: a.src, prog: a.prog })
       AstNot(inner) => argtype_ast(ArgTypeState { node: inner, tenv: a.tenv, src: a.src, prog: a.prog })
@@ -12451,6 +12612,8 @@ rule count_undecl_call_ast
       AstOk(inner) => 0
       AstResErr(inner) => 0
       AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => 0
+      AstSum(coll, item_start, item_len, body) => 0
+      AstCount(coll, item_start, item_len, body) => 0
   proofs:
     purity:
       reads : [a.node, a.rules, a.calls, a.src]
@@ -12692,6 +12855,8 @@ rule count_undecl_read_ast
       AstOk(inner) => 0
       AstResErr(inner) => 0
       AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => 0
+      AstSum(coll, item_start, item_len, body) => 0
+      AstCount(coll, item_start, item_len, body) => 0
   proofs:
     purity:
       reads : [a.node, a.binds, a.reads, a.in_start, a.in_len, a.src]
@@ -13073,6 +13238,8 @@ rule term_var_is_input
       AstOk(inner) => 0
       AstResErr(inner) => 0
       AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => 0
+      AstSum(coll, item_start, item_len, body) => 0
+      AstCount(coll, item_start, item_len, body) => 0
   proofs:
     purity:
       reads : [a.node, a.in_start, a.in_len, a.src]
@@ -13112,6 +13279,8 @@ rule term_knum_ok
       AstOk(inner) => 0
       AstResErr(inner) => 0
       AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => 0
+      AstSum(coll, item_start, item_len, body) => 0
+      AstCount(coll, item_start, item_len, body) => 0
   proofs:
     purity:
       reads : [n]
@@ -13151,6 +13320,8 @@ rule term_base_ok
       AstOk(inner) => 0
       AstResErr(inner) => 0
       AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => 0
+      AstSum(coll, item_start, item_len, body) => 0
+      AstCount(coll, item_start, item_len, body) => 0
   proofs:
     purity:
       reads : [a.node, a.rn_start, a.rn_len, a.kind, a.in_start, a.in_len, a.tf_start, a.tf_len, a.sbinds, a.src]
@@ -13189,6 +13360,8 @@ rule term_step_ok
       AstOk(inner) => 0
       AstResErr(inner) => 0
       AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => 0
+      AstSum(coll, item_start, item_len, body) => 0
+      AstCount(coll, item_start, item_len, body) => 0
   proofs:
     purity:
       reads : [a.node, a.rn_start, a.rn_len, a.kind, a.in_start, a.in_len, a.tf_start, a.tf_len, a.sbinds, a.src]
@@ -13254,6 +13427,8 @@ rule term_arg_ok
       AstOk(inner) => 0
       AstResErr(inner) => 0
       AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => 0
+      AstSum(coll, item_start, item_len, body) => 0
+      AstCount(coll, item_start, item_len, body) => 0
   proofs:
     purity:
       reads : [a.node, a.rn_start, a.rn_len, a.kind, a.in_start, a.in_len, a.tf_start, a.tf_len, a.sbinds, a.src]
@@ -13366,6 +13541,8 @@ rule count_term_ast
       AstOk(inner) => 0
       AstResErr(inner) => 0
       AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => 0
+      AstSum(coll, item_start, item_len, body) => 0
+      AstCount(coll, item_start, item_len, body) => 0
   proofs:
     purity:
       reads : [a.node, a.rn_start, a.rn_len, a.kind, a.in_start, a.in_len, a.tf_start, a.tf_len, a.sbinds, a.src]
@@ -14469,6 +14646,8 @@ rule undef_span_ast
       AstOk(inner) => Span::MkSpan { start: 9999, len: 0 }
       AstResErr(inner) => Span::MkSpan { start: 9999, len: 0 }
       AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => Span::MkSpan { start: 9999, len: 0 }
+      AstSum(coll, item_start, item_len, body) => Span::MkSpan { start: 9999, len: 0 }
+      AstCount(coll, item_start, item_len, body) => Span::MkSpan { start: 9999, len: 0 }
       AstVar(start, len) => if name_bound(NameBoundState { binds: a.binds, src: a.src, q_start: start, q_len: len }) == 0 then Span::MkSpan { start: start, len: len } else Span::MkSpan { start: 9999, len: 0 }
       AstBin(op, lhs, rhs) => span_or(SpanOrState { a: undef_span_ast(UndefSpanAstState { node: lhs, binds: a.binds, src: a.src }), b: undef_span_ast(UndefSpanAstState { node: rhs, binds: a.binds, src: a.src }) })
       AstNeg(inner) => undef_span_ast(UndefSpanAstState { node: inner, binds: a.binds, src: a.src })
@@ -14799,6 +14978,8 @@ rule badcall_span_ast
       AstOk(inner) => Span::MkSpan { start: 9999, len: 0 }
       AstResErr(inner) => Span::MkSpan { start: 9999, len: 0 }
       AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => Span::MkSpan { start: 9999, len: 0 }
+      AstSum(coll, item_start, item_len, body) => Span::MkSpan { start: 9999, len: 0 }
+      AstCount(coll, item_start, item_len, body) => Span::MkSpan { start: 9999, len: 0 }
       AstBin(op, lhs, rhs) => span_or(SpanOrState { a: badcall_span_ast(BadCallSpanState { node: lhs, rules: a.rules, src: a.src }), b: badcall_span_ast(BadCallSpanState { node: rhs, rules: a.rules, src: a.src }) })
       AstNeg(inner) => badcall_span_ast(BadCallSpanState { node: inner, rules: a.rules, src: a.src })
       AstNot(inner) => badcall_span_ast(BadCallSpanState { node: inner, rules: a.rules, src: a.src })
@@ -15064,6 +15245,8 @@ rule badarity_span_ast
       AstOk(inner) => Span::MkSpan { start: 9999, len: 0 }
       AstResErr(inner) => Span::MkSpan { start: 9999, len: 0 }
       AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => Span::MkSpan { start: 9999, len: 0 }
+      AstSum(coll, item_start, item_len, body) => Span::MkSpan { start: 9999, len: 0 }
+      AstCount(coll, item_start, item_len, body) => Span::MkSpan { start: 9999, len: 0 }
       AstBin(op, lhs, rhs) => span_or(SpanOrState { a: badarity_span_ast(BadAritySpanState { node: lhs, rules: a.rules, src: a.src }), b: badarity_span_ast(BadAritySpanState { node: rhs, rules: a.rules, src: a.src }) })
       AstNeg(inner) => badarity_span_ast(BadAritySpanState { node: inner, rules: a.rules, src: a.src })
       AstNot(inner) => badarity_span_ast(BadAritySpanState { node: inner, rules: a.rules, src: a.src })
@@ -15452,6 +15635,8 @@ rule print_expr
       AstOk(inner) => "?"
       AstResErr(inner) => "?"
       AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => "?"
+      AstSum(coll, item_start, item_len, body) => "?"
+      AstCount(coll, item_start, item_len, body) => "?"
   proofs:
     purity:
       reads : [ps.node, ps.src]
@@ -15604,6 +15789,8 @@ rule lower_expr
       AstOk(inner) => "? "
       AstResErr(inner) => "? "
       AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => "? "
+      AstSum(coll, item_start, item_len, body) => "? "
+      AstCount(coll, item_start, item_len, body) => "? "
   proofs:
     purity:
       reads : [ps.node, ps.src]
@@ -15734,6 +15921,8 @@ rule x86_expr
       AstOk(inner) => b"\xcc"
       AstResErr(inner) => b"\xcc"
       AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => b"\xcc"
+      AstSum(coll, item_start, item_len, body) => b"\xcc"
+      AstCount(coll, item_start, item_len, body) => b"\xcc"
   proofs:
     purity:
       reads : [ps.node, ps.src]
@@ -15786,6 +15975,8 @@ rule code_size_expr
       AstOk(inner) => 1
       AstResErr(inner) => 1
       AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => 1
+      AstSum(coll, item_start, item_len, body) => 1
+      AstCount(coll, item_start, item_len, body) => 1
   proofs:
     purity:
       reads : [ps.node, ps.src]
@@ -16087,6 +16278,8 @@ rule ast_is_variant
       AstOk(inner) => 0
       AstResErr(inner) => 0
       AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => 0
+      AstSum(coll, item_start, item_len, body) => 0
+      AstCount(coll, item_start, item_len, body) => 0
   proofs:
     purity:
       reads : [n]
@@ -16122,6 +16315,8 @@ rule ast_variant_cstart
       AstOk(inner) => 0
       AstResErr(inner) => 0
       AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => 0
+      AstSum(coll, item_start, item_len, body) => 0
+      AstCount(coll, item_start, item_len, body) => 0
   proofs:
     purity:
       reads : [n]
@@ -16157,6 +16352,8 @@ rule ast_variant_clen
       AstOk(inner) => 0
       AstResErr(inner) => 0
       AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => 0
+      AstSum(coll, item_start, item_len, body) => 0
+      AstCount(coll, item_start, item_len, body) => 0
   proofs:
     purity:
       reads : [n]
@@ -16284,6 +16481,8 @@ rule static_concept_of
       AstOk(inner) => 0 - 1
       AstResErr(inner) => 0 - 1
       AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => 0 - 1
+      AstSum(coll, item_start, item_len, body) => 0 - 1
+      AstCount(coll, item_start, item_len, body) => 0 - 1
   proofs:
     purity:
       reads : [sc.node, sc.src, sc.params, sc.lets, sc.concepts]
@@ -16534,6 +16733,8 @@ rule ast_uses_text
       AstOk(inner) => ast_uses_text(PrintState { node: inner, src: ps.src })
       AstResErr(inner) => ast_uses_text(PrintState { node: inner, src: ps.src })
       AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => if ast_uses_text(PrintState { node: scrut, src: ps.src }) == 1 then 1 else if ast_uses_text(PrintState { node: ok_body, src: ps.src }) == 1 then 1 else ast_uses_text(PrintState { node: err_body, src: ps.src })
+      AstSum(coll, item_start, item_len, body) => if ast_uses_text(PrintState { node: coll, src: ps.src }) == 1 then 1 else ast_uses_text(PrintState { node: body, src: ps.src })
+      AstCount(coll, item_start, item_len, body) => if ast_uses_text(PrintState { node: coll, src: ps.src }) == 1 then 1 else ast_uses_text(PrintState { node: body, src: ps.src })
   proofs:
     purity:
       reads : [ps.node, ps.src]
@@ -16694,6 +16895,8 @@ rule ast_uses_result
       AstOk(inner) => 1
       AstResErr(inner) => 1
       AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => 1
+      AstSum(coll, item_start, item_len, body) => if ast_uses_result(PrintState { node: coll, src: ps.src }) == 1 then 1 else ast_uses_result(PrintState { node: body, src: ps.src })
+      AstCount(coll, item_start, item_len, body) => if ast_uses_result(PrintState { node: coll, src: ps.src }) == 1 then 1 else ast_uses_result(PrintState { node: body, src: ps.src })
   proofs:
     purity:
       reads : [ps.node, ps.src]
@@ -16893,6 +17096,8 @@ rule ast_texty_shallow
       AstOk(inner) => 0
       AstResErr(inner) => 0
       AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => 0
+      AstSum(coll, item_start, item_len, body) => 0
+      AstCount(coll, item_start, item_len, body) => 0
   proofs:
     purity:
       reads : [ps.node, ps.src]
@@ -16954,6 +17159,8 @@ rule ast_is_texty
       AstOk(inner) => 0
       AstResErr(inner) => 0
       AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => 0
+      AstSum(coll, item_start, item_len, body) => 0
+      AstCount(coll, item_start, item_len, body) => 0
   proofs:
     purity:
       reads : [ts.node, ts.src, ts.prog]
@@ -17102,6 +17309,8 @@ rule ast_bytes_shallow
       AstOk(inner) => 0
       AstResErr(inner) => 0
       AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => 0
+      AstSum(coll, item_start, item_len, body) => 0
+      AstCount(coll, item_start, item_len, body) => 0
   proofs:
     purity:
       reads : [ts.node, ts.src, ts.prog]
@@ -17143,6 +17352,8 @@ rule ast_is_bytes
       AstOk(inner) => 0
       AstResErr(inner) => 0
       AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => 0
+      AstSum(coll, item_start, item_len, body) => 0
+      AstCount(coll, item_start, item_len, body) => 0
   proofs:
     purity:
       reads : [ts.node, ts.src, ts.prog]
@@ -17508,6 +17719,11 @@ rule mb_ast
       AstOk(inner) => mb_ast(inner)
       AstResErr(inner) => mb_ast(inner)
       AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => 2 + mb_ast(scrut) + mb_ast(ok_body) + mb_ast(err_body)
+      -- COLLECTIONS tier slice 1: a reduction reserves 2 frame slots — the item binder
+      -- (base+0) and the accumulator (base+1) — plus any binders nested in coll / body.
+      -- The remaining-count and argv-cursor live in registers (r8 / r9), not slots.
+      AstSum(coll, item_start, item_len, body) => 2 + mb_ast(coll) + mb_ast(body)
+      AstCount(coll, item_start, item_len, body) => 2 + mb_ast(coll) + mb_ast(body)
   proofs:
     purity:
       reads : [n]
@@ -17898,6 +18114,8 @@ rule code_size_node
       AstOk(inner) => code_size_node(ByteGenState { node: inner, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + 33
       AstResErr(inner) => code_size_node(ByteGenState { node: inner, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + 33
       AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => code_size_node(ByteGenState { node: scrut, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + 60 + code_size_node(ByteGenState { node: err_body, src: bg.src, off: 0, params: bg.params, lets: lets_append_binders(AppendBindersState { lets: bg.lets, bs: BinderList::BindCons { start: err_bstart, len: err_blen, rest: BinderList::BindNil } }), prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + code_size_node(ByteGenState { node: ok_body, src: bg.src, off: 0, params: bg.params, lets: lets_append_binders(AppendBindersState { lets: bg.lets, bs: BinderList::BindCons { start: ok_bstart, len: ok_blen, rest: BinderList::BindNil } }), prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes })
+      AstSum(coll, item_start, item_len, body) => code_size_node(ByteGenState { node: coll, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + code_size_node(ByteGenState { node: body, src: bg.src, off: 0, params: bg.params, lets: lets_append_binders(AppendBindersState { lets: bg.lets, bs: BinderList::BindCons { start: item_start, len: item_len, rest: BinderList::BindCons { start: 0, len: 0, rest: BinderList::BindNil } } }), prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + 180
+      AstCount(coll, item_start, item_len, body) => code_size_node(ByteGenState { node: coll, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + code_size_node(ByteGenState { node: body, src: bg.src, off: 0, params: bg.params, lets: lets_append_binders(AppendBindersState { lets: bg.lets, bs: BinderList::BindCons { start: item_start, len: item_len, rest: BinderList::BindCons { start: 0, len: 0, rest: BinderList::BindNil } } }), prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + 190
   proofs:
     purity:
       reads : [bg.node, bg.src, bg.off, bg.params, bg.lets, bg.prog, bg.concepts, bg.sizes]
@@ -18239,6 +18457,8 @@ rule x86_node
       -- between the prefix and each arm touches it. `off` threads so nested calls in
       -- either arm body land their rel32 (code_size_node mirrors this exactly).
       AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => concat(x86_node(ByteGenState { node: scrut, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }), b"\x58\x48\x69\xc0", le32(8 * (max_payload_fields(bg.concepts) + 1)), b"\x4c\x01\xf8\x48\x8b\x08", b"\x48\x81\xf9", le32(15360000), b"\x0f\x84", le32(19 + code_size_node(ByteGenState { node: err_body, src: bg.src, off: 0, params: bg.params, lets: lets_append_binders(AppendBindersState { lets: bg.lets, bs: BinderList::BindCons { start: err_bstart, len: err_blen, rest: BinderList::BindNil } }), prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes })), x86_binder_loads(BinderLoadState { binders: BinderList::BindCons { start: err_bstart, len: err_blen, rest: BinderList::BindNil }, j: 0, base_slot: count_binds(bg.lets) }), x86_node(ByteGenState { node: err_body, src: bg.src, off: bg.off + code_size_node(ByteGenState { node: scrut, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + 41, params: bg.params, lets: lets_append_binders(AppendBindersState { lets: bg.lets, bs: BinderList::BindCons { start: err_bstart, len: err_blen, rest: BinderList::BindNil } }), prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }), b"\xe9", le32(14 + code_size_node(ByteGenState { node: ok_body, src: bg.src, off: 0, params: bg.params, lets: lets_append_binders(AppendBindersState { lets: bg.lets, bs: BinderList::BindCons { start: ok_bstart, len: ok_blen, rest: BinderList::BindNil } }), prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes })), x86_binder_loads(BinderLoadState { binders: BinderList::BindCons { start: ok_bstart, len: ok_blen, rest: BinderList::BindNil }, j: 0, base_slot: count_binds(bg.lets) }), x86_node(ByteGenState { node: ok_body, src: bg.src, off: bg.off + code_size_node(ByteGenState { node: scrut, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + 60 + code_size_node(ByteGenState { node: err_body, src: bg.src, off: 0, params: bg.params, lets: lets_append_binders(AppendBindersState { lets: bg.lets, bs: BinderList::BindCons { start: err_bstart, len: err_blen, rest: BinderList::BindNil } }), prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }), params: bg.params, lets: lets_append_binders(AppendBindersState { lets: bg.lets, bs: BinderList::BindCons { start: ok_bstart, len: ok_blen, rest: BinderList::BindNil } }), prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }))
+      AstSum(coll, item_start, item_len, body) => concat(x86_node(ByteGenState { node: coll, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }), b"\x41\x59\x49\x8b\x31", b"\x48\x31\xc0\x45\x31\xdb\x8a\x0e\x80\xf9\x2d\x75\x06\x41\xb3\x01\x48\xff\xc6\x0f\xb6\x0e\x80\xf9\x30\x72\x15\x80\xf9\x39\x77\x10\x48\x6b\xc0\x0a\x48\x83\xe9\x30\x48\x01\xc8\x48\xff\xc6\xeb\xe3\x4d\x85\xdb\x74\x03\x48\xf7\xd8", b"\x49\x89\xc0\x49\x83\xc1\x08", b"\x48\xc7\x85", le32(0 - 8 * (count_binds(bg.lets) + 2)), b"\x00\x00\x00\x00", b"\x4d\x85\xc0\x0f\x84", le32((86 + code_size_node(ByteGenState { node: body, src: bg.src, off: 0, params: bg.params, lets: lets_append_binders(AppendBindersState { lets: bg.lets, bs: BinderList::BindCons { start: item_start, len: item_len, rest: BinderList::BindCons { start: 0, len: 0, rest: BinderList::BindNil } } }), prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }))), b"\x49\x8b\x31", b"\x48\x31\xc0\x45\x31\xdb\x8a\x0e\x80\xf9\x2d\x75\x06\x41\xb3\x01\x48\xff\xc6\x0f\xb6\x0e\x80\xf9\x30\x72\x15\x80\xf9\x39\x77\x10\x48\x6b\xc0\x0a\x48\x83\xe9\x30\x48\x01\xc8\x48\xff\xc6\xeb\xe3\x4d\x85\xdb\x74\x03\x48\xf7\xd8", b"\x48\x89\x85", le32(0 - 8 * (count_binds(bg.lets) + 1)), x86_node(ByteGenState { node: body, src: bg.src, off: bg.off + code_size_node(ByteGenState { node: coll, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + 154, params: bg.params, lets: lets_append_binders(AppendBindersState { lets: bg.lets, bs: BinderList::BindCons { start: item_start, len: item_len, rest: BinderList::BindCons { start: 0, len: 0, rest: BinderList::BindNil } } }), prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }), b"\x58\x48\x01\x85", le32(0 - 8 * (count_binds(bg.lets) + 2)), b"\x49\x83\xc1\x08\x49\xff\xc8\xe9", le32((0 - (95 + code_size_node(ByteGenState { node: body, src: bg.src, off: 0, params: bg.params, lets: lets_append_binders(AppendBindersState { lets: bg.lets, bs: BinderList::BindCons { start: item_start, len: item_len, rest: BinderList::BindCons { start: 0, len: 0, rest: BinderList::BindNil } } }), prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes })))), b"\xff\xb5", le32(0 - 8 * (count_binds(bg.lets) + 2)))
+      AstCount(coll, item_start, item_len, body) => concat(x86_node(ByteGenState { node: coll, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }), b"\x41\x59\x49\x8b\x31", b"\x48\x31\xc0\x45\x31\xdb\x8a\x0e\x80\xf9\x2d\x75\x06\x41\xb3\x01\x48\xff\xc6\x0f\xb6\x0e\x80\xf9\x30\x72\x15\x80\xf9\x39\x77\x10\x48\x6b\xc0\x0a\x48\x83\xe9\x30\x48\x01\xc8\x48\xff\xc6\xeb\xe3\x4d\x85\xdb\x74\x03\x48\xf7\xd8", b"\x49\x89\xc0\x49\x83\xc1\x08", b"\x48\xc7\x85", le32(0 - 8 * (count_binds(bg.lets) + 2)), b"\x00\x00\x00\x00", b"\x4d\x85\xc0\x0f\x84", le32((96 + code_size_node(ByteGenState { node: body, src: bg.src, off: 0, params: bg.params, lets: lets_append_binders(AppendBindersState { lets: bg.lets, bs: BinderList::BindCons { start: item_start, len: item_len, rest: BinderList::BindCons { start: 0, len: 0, rest: BinderList::BindNil } } }), prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }))), b"\x49\x8b\x31", b"\x48\x31\xc0\x45\x31\xdb\x8a\x0e\x80\xf9\x2d\x75\x06\x41\xb3\x01\x48\xff\xc6\x0f\xb6\x0e\x80\xf9\x30\x72\x15\x80\xf9\x39\x77\x10\x48\x6b\xc0\x0a\x48\x83\xe9\x30\x48\x01\xc8\x48\xff\xc6\xeb\xe3\x4d\x85\xdb\x74\x03\x48\xf7\xd8", b"\x48\x89\x85", le32(0 - 8 * (count_binds(bg.lets) + 1)), x86_node(ByteGenState { node: body, src: bg.src, off: bg.off + code_size_node(ByteGenState { node: coll, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + 154, params: bg.params, lets: lets_append_binders(AppendBindersState { lets: bg.lets, bs: BinderList::BindCons { start: item_start, len: item_len, rest: BinderList::BindCons { start: 0, len: 0, rest: BinderList::BindNil } } }), prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }), b"\x58\x48\x85\xc0\x0f\x95\xc0\x48\x0f\xb6\xc0\x48\x01\x85", le32(0 - 8 * (count_binds(bg.lets) + 2)), b"\x49\x83\xc1\x08\x49\xff\xc8\xe9", le32((0 - (105 + code_size_node(ByteGenState { node: body, src: bg.src, off: 0, params: bg.params, lets: lets_append_binders(AppendBindersState { lets: bg.lets, bs: BinderList::BindCons { start: item_start, len: item_len, rest: BinderList::BindCons { start: 0, len: 0, rest: BinderList::BindNil } } }), prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes })))), b"\xff\xb5", le32(0 - 8 * (count_binds(bg.lets) + 2)))
   proofs:
     purity:
       reads : [bg.node, bg.src, bg.off, bg.params, bg.lets, bg.prog, bg.concepts, bg.sizes]
@@ -18368,6 +18588,8 @@ rule code_size_stream_node
       AstOk(inner) => 1
       AstResErr(inner) => 1
       AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => 1
+      AstSum(coll, item_start, item_len, body) => 1
+      AstCount(coll, item_start, item_len, body) => 1
       AstCall(callee_start, callee_len, args) => if span_is_concat(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then stream_size_cargs(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) else if span_is_arena_scope(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then 2 + code_size_stream_node(ByteGenState { node: arg_first(args), src: bg.src, off: bg.off + 2, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + 2 else if span_is_le32(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then code_size_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + 34 else if span_is_le64(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then code_size_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + 34 else if span_is_substring(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then 1 else if span_is_byte_at(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then code_size_node(bg) + 6 else if span_is_length(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then code_size_node(bg) + 6 else if callee_is_texty(FindRuleState { rules: bg.prog, src: bg.src, q_start: callee_start, q_len: callee_len }) == 1 then code_size_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + 12 else code_size_node(bg) + 6
   proofs:
     purity:
@@ -18511,6 +18733,8 @@ rule x86_stream_node
       AstOk(inner) => b"\xcc"
       AstResErr(inner) => b"\xcc"
       AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => b"\xcc"
+      AstSum(coll, item_start, item_len, body) => b"\xcc"
+      AstCount(coll, item_start, item_len, body) => b"\xcc"
       AstCall(callee_start, callee_len, args) => if span_is_concat(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then x86_stream_cargs(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) else if span_is_arena_scope(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then concat(b"\x41\x56", x86_stream_node(ByteGenState { node: arg_first(args), src: bg.src, off: bg.off + 2, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }), b"\x41\x5e") else if span_is_le32(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then concat(x86_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }), b"\x58\x48\x89\x44\x24\xf8\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x48\x8d\x74\x24\xf8\x48\xc7\xc2\x04\x00\x00\x00\x0f\x05") else if span_is_le64(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then concat(x86_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }), b"\x58\x48\x89\x44\x24\xf8\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x48\x8d\x74\x24\xf8\x48\xc7\xc2\x08\x00\x00\x00\x0f\x05") else if span_is_substring(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then b"\xcc" else if span_is_byte_at(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then concat(x86_node(bg), b"\x58\xe8", le32(0 - (bg.off + code_size_node(bg) + 92))) else if span_is_length(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then concat(x86_node(bg), b"\x58\xe8", le32(0 - (bg.off + code_size_node(bg) + 92))) else if callee_is_texty(FindRuleState { rules: bg.prog, src: bg.src, q_start: callee_start, q_len: callee_len }) == 1 then concat(x86_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }), b"\xe8", le32(proc_offset(ProcOffState { rules: bg.prog, src: bg.src, acc: 0, q_start: callee_start, q_len: callee_len, concepts: bg.concepts, sizes: bg.sizes }) - (bg.off + code_size_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + 5)), b"\x48\x81\xc4", le32(8 * arg_list_len(args))) else concat(x86_node(bg), b"\x58\xe8", le32(0 - (bg.off + code_size_node(bg) + 92)))
   proofs:
     purity:
@@ -18835,9 +19059,12 @@ concept ArgvTrampState
 
 -- marshal_fields_size: the exact byte length of the per-field argv marshalling.
 -- A text field is 52 B (mov rsi,[r12+disp] 8 + strlen 13 + copy&pack 31); a
--- number field is 65 B (mov rsi,[r12+disp] 8 + atoi 57). One helper used by both
--- the emit (via argv_marshal_size in blob_end_off) and the byte pass, so the
--- trampoline size can never drift from the source-blob base.
+-- number field is 65 B (mov rsi,[r12+disp] 8 + atoi 57); a COLLECTION field (ty 3,
+-- collections tier slice 1) is 9 B (lea rax,[r12+8*(idx+2)] 8 + push rax 1) — it
+-- stores the ADDRESS of the count slot in the argv tail into the arena slot, so the
+-- AstSum/AstCount loop reads N + elements inline (no cons-list built). One helper
+-- used by both the emit (via argv_marshal_size in blob_end_off) and the byte pass,
+-- so the trampoline size can never drift from the source-blob base.
 rule marshal_fields_size
   @intention: "Byte length of the per-field argv marshalling (text field 52 B, number field 65 B)"
   @source: vexprparse.intent:66
@@ -18847,7 +19074,7 @@ rule marshal_fields_size
     out : number
   logic:
     out = match fl:
-      FCons(name_start, name_len, ty, ty_start, ty_len, rest) => (if ty == 2 then 52 else 65) + marshal_fields_size(rest)
+      FCons(name_start, name_len, ty, ty_start, ty_len, rest) => (if ty == 2 then 52 else if ty == 3 then 9 else 65) + marshal_fields_size(rest)
       FNil => 0
   proofs:
     purity:
@@ -18896,7 +19123,7 @@ rule x86_marshal_fields
     out : bytes
   logic:
     out = match ms.fields:
-      FCons(name_start, name_len, ty, ty_start, ty_len, rest) => concat((if ty == 2 then concat(b"\x49\x8b\xb4\x24", le32(8 * (ms.idx + 2)), b"\x31\xc9\x80\x3c\x0e\x00\x74\x05\x48\xff\xc1\xeb\xf5\x49\x8d\xbd", le32(ms.region_base), b"\x51\xf3\xa4\x59\x4c\x89\xe8\x48\x05", le32(ms.region_off), b"\x48\xc1\xe0\x20\x48\x09\xc8\x50\x49\x01\xcd") else concat(b"\x49\x8b\xb4\x24", le32(8 * (ms.idx + 2)), b"\x48\x31\xc0\x45\x31\xdb\x8a\x0e\x80\xf9\x2d\x75\x06\x41\xb3\x01\x48\xff\xc6\x0f\xb6\x0e\x80\xf9\x30\x72\x15\x80\xf9\x39\x77\x10\x48\x6b\xc0\x0a\x48\x83\xe9\x30\x48\x01\xc8\x48\xff\xc6\xeb\xe3\x4d\x85\xdb\x74\x03\x48\xf7\xd8\x50")), x86_marshal_fields(ArgvMarshalState { fields: rest, idx: ms.idx + 1, region_off: ms.region_off, region_base: ms.region_base }))
+      FCons(name_start, name_len, ty, ty_start, ty_len, rest) => concat((if ty == 2 then concat(b"\x49\x8b\xb4\x24", le32(8 * (ms.idx + 2)), b"\x31\xc9\x80\x3c\x0e\x00\x74\x05\x48\xff\xc1\xeb\xf5\x49\x8d\xbd", le32(ms.region_base), b"\x51\xf3\xa4\x59\x4c\x89\xe8\x48\x05", le32(ms.region_off), b"\x48\xc1\xe0\x20\x48\x09\xc8\x50\x49\x01\xcd") else if ty == 3 then concat(b"\x49\x8d\x84\x24", le32(8 * (ms.idx + 2)), b"\x50") else concat(b"\x49\x8b\xb4\x24", le32(8 * (ms.idx + 2)), b"\x48\x31\xc0\x45\x31\xdb\x8a\x0e\x80\xf9\x2d\x75\x06\x41\xb3\x01\x48\xff\xc6\x0f\xb6\x0e\x80\xf9\x30\x72\x15\x80\xf9\x39\x77\x10\x48\x6b\xc0\x0a\x48\x83\xe9\x30\x48\x01\xc8\x48\xff\xc6\xeb\xe3\x4d\x85\xdb\x74\x03\x48\xf7\xd8\x50")), x86_marshal_fields(ArgvMarshalState { fields: rest, idx: ms.idx + 1, region_off: ms.region_off, region_base: ms.region_base }))
       FNil => b""
   proofs:
     purity:
