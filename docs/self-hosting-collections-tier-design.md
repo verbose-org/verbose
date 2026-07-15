@@ -64,8 +64,15 @@ slot — this is why count/sum come before fold):
    output == verbosec's `--native` on the same program+input; plus eval==exec parity.
 
 ## Slice sequence after 1
-- **Slice 2** — `fold(coll, init, acc, item => body)` + fold-form `min`/`max`: same
-  loop, source-named accumulator, literal init.
+- **Slice 2** (DONE) — `fold(coll, init, acc, item => body)`: same loop, SOURCE-NAMED
+  accumulator (the real acc span goes into the binder-list slot that slice 1 reserved
+  with a dummy {0,0} entry), init emitted before the loop into the acc slot (any
+  expression; emitted before r8/r9 become live), replace-accumulate (`pop rax; mov
+  [acc_slot], rax` — same 8 B as sum's add, so the loop rel32 constants are shared).
+  Fold-form `min`/`max` are DEFERRED out of slice 2: they would have to become
+  parse-time keywords, which risks the self-source's own binary `max()` calls
+  (max_payload_fields — the 2^40 fix); they need verbosec-style lookahead
+  disambiguation (`=>` after the second argument selects the fold form) first.
 - **Slice 3** — `all`/`any`: desugar to the slice-1 fold shape (`all`: init 1, `if
   pred then acc else 0`; `any`: init 0, `if pred then 1 else acc`). Single-pass, no
   short-circuit (verbosec native parity).
