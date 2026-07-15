@@ -21258,6 +21258,119 @@ rule le64_neg
         let _ = fs::remove_file(vref_tally);
     }
 
+    /// COLLECTIONS tier slice 2 — THE MILESTONE: the self-hosted emitter compiles
+    /// `fold(w.xs, <init>, acc, x => <body>)` over a `collection(number)` input
+    /// field to a runnable ELF whose output matches verbosec's OWN `--native`
+    /// (Phase 4 `emit_fold_program`) on the equivalent RECORD-element program
+    /// bit-for-bit. Same single-number-field `Item` oracle trick as slice 1
+    /// (verbosec requires a named-concept element; body `x.v` vs self's `x`).
+    ///
+    /// Two rules pin the two fold-specific properties slice 1's sum/count could
+    /// not express:
+    ///   - `total`: init 100 (a NON-ZERO init flows through the acc slot — sum's
+    ///     hardwired 0 would give 60 for the first case, not 160), and the acc
+    ///     binder is SOURCE-NAMED (`acc + x` reads it by name via the binder
+    ///     machinery's second slot — slice 1 parked a dummy {0,0} span there);
+    ///   - `shifty`: `acc * 2 + x`, a NON-COMMUTATIVE body — ((0*2+1)*2+2)*2+3 = 11
+    ///     proves left-to-right iteration (right-to-left would give ((0*2+3)*2+2)*2+1
+    ///     = 17). Empty collections pass the init through untouched on both rules.
+    ///
+    /// argv layout (count-prefixed, same as slice 1): `<binary> <N> <e0> ... <e{N-1}>`.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn collections_tier_slice2_fold_matches_verbosec() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        let src = fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        // The self-hosted emitter (elf_program_src, reads program on argv[1]).
+        let elf = std::env::temp_dir().join("verbosec_test_coll_s2_elf_program_src");
+        compile_native(&program, "elf_program_src", elf.to_str().unwrap(), false, false)
+            .expect("elf_program_src must compile natively");
+
+        // verbosec oracle: record-element collection (single-number-field Item),
+        // bodies `acc + x.v` / `acc * 2 + x.v` — SAME argv layout + SAME output as
+        // the self-hosted scalar `collection(number)` forms. Literal inits (100 / 0)
+        // keep the oracle inside verbosec's Phase 4 literal-init restriction.
+        let vsrc = "@verbose 0.1.0\n\nconcept Item\n  @intention: \"one number\"\n  @source: d.intent:1\n  fields:\n    v : number\nconcept W\n  @intention: \"items\"\n  @source: d.intent:1\n  fields:\n    xs : collection(Item)\nrule total\n  @intention: \"fold init 100\"\n  @source: d.intent:2\n  input:\n    w : W\n  output:\n    r : number\n  logic:\n    r = fold(w.xs, 100, acc, x => acc + x.v)\n  proofs:\n    purity:\n      reads : [w.xs]\n      calls : []\n    termination:\n      bound : 4\nrule shifty\n  @intention: \"non-commutative fold\"\n  @source: d.intent:2\n  input:\n    w : W\n  output:\n    r : number\n  logic:\n    r = fold(w.xs, 0, acc, x => acc * 2 + x.v)\n  proofs:\n    purity:\n      reads : [w.xs]\n      calls : []\n    termination:\n      bound : 4";
+        let vtoks = crate::lexer::Lexer::new(&vsrc).tokenize().unwrap();
+        let vprog = crate::parser::Parser::new(vtoks).parse_program().unwrap();
+        let vref_total = std::env::temp_dir().join("verbosec_test_coll_s2_total_ref");
+        let vref_shifty = std::env::temp_dir().join("verbosec_test_coll_s2_shifty_ref");
+        compile_native(&vprog, "total", vref_total.to_str().unwrap(), false, false)
+            .expect("verbosec must compile `total` natively");
+        compile_native(&vprog, "shifty", vref_shifty.to_str().unwrap(), false, false)
+            .expect("verbosec must compile `shifty` natively");
+
+        // Self-hosted, header-less targets: scalar collection(number), body over `x`
+        // and the source-named `acc`.
+        let prog_self_total = "concept W\n  fields:\n    xs : collection(number)\nrule total\n  input:\n    w : W\n  output:\n    r : number\n  logic:\n    r = fold(w.xs, 100, acc, x => acc + x)";
+        let prog_self_shifty = "concept W\n  fields:\n    xs : collection(number)\nrule shifty\n  input:\n    w : W\n  output:\n    r : number\n  logic:\n    r = fold(w.xs, 0, acc, x => acc * 2 + x)";
+
+        // Emit a target ELF via the self-hosted emitter (argv[1] = source, argv[2] = pos).
+        let emit_self = |prog_src: &str, tag: &str| -> std::path::PathBuf {
+            let mc = Command::new(&elf).args([prog_src, "0"]).output()
+                .expect("spawn elf_program_src");
+            assert!(mc.status.success(), "elf_program_src must exit 0 for {:?}; got {:?}", tag, mc.status);
+            let bytes = mc.stdout;
+            assert_eq!(&bytes[0..4], &[0x7f, 0x45, 0x4c, 0x46], "self-emitted file is not ELF for {}", tag);
+            let out = std::env::temp_dir().join(format!("verbosec_test_coll_s2_{}_self", tag));
+            fs::write(&out, &bytes).expect("write self ELF");
+            let mut perms = fs::metadata(&out).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&out, perms).expect("chmod +x");
+            out
+        };
+        let self_total = emit_self(prog_self_total, "total");
+        let self_shifty = emit_self(prog_self_shifty, "shifty");
+
+        // (argv after the program name, expected output). argv[0] is N, then N elements.
+        let total_cases: &[(&[&str], &str)] = &[
+            (&["3", "10", "20", "30"], "160\n"),
+            (&["0"], "100\n"),
+            (&["5", "1", "2", "3", "4", "5"], "115\n"),
+            (&["1", "7"], "107\n"),
+        ];
+        let shifty_cases: &[(&[&str], &str)] = &[
+            (&["3", "1", "2", "3"], "11\n"),
+            (&["0"], "0\n"),
+            (&["4", "1", "1", "1", "1"], "15\n"),
+            (&["2", "5", "1"], "11\n"),
+        ];
+
+        let run = |bin: &std::path::PathBuf, args: &[&str]| -> String {
+            let o = Command::new(bin).args(args).output().expect("run binary");
+            assert!(o.status.success(), "{:?} {:?} must exit 0; got {:?}", bin, args, o.status);
+            String::from_utf8_lossy(&o.stdout).to_string()
+        };
+
+        for (args, expected) in total_cases {
+            let s = run(&self_total, args);
+            let v = run(&vref_total, args);
+            assert_eq!(s, *expected, "self fold(init 100) for {:?} = {:?} (expected {:?})", args, s, expected);
+            assert_eq!(v, *expected, "verbosec fold(init 100) for {:?} = {:?} (expected {:?})", args, v, expected);
+            assert_eq!(s, v, "self ({:?}) vs verbosec ({:?}) fold mismatch for {:?}", s, v, args);
+        }
+        for (args, expected) in shifty_cases {
+            let s = run(&self_shifty, args);
+            let v = run(&vref_shifty, args);
+            assert_eq!(s, *expected, "self fold(acc*2+x) for {:?} = {:?} (expected {:?})", args, s, expected);
+            assert_eq!(v, *expected, "verbosec fold(acc*2+x) for {:?} = {:?} (expected {:?})", args, v, expected);
+            assert_eq!(s, v, "self ({:?}) vs verbosec ({:?}) non-commutative fold mismatch for {:?}", s, v, args);
+        }
+
+        let _ = fs::remove_file(&self_total);
+        let _ = fs::remove_file(&self_shifty);
+        let _ = fs::remove_file(elf);
+        let _ = fs::remove_file(vref_total);
+        let _ = fs::remove_file(vref_shifty);
+    }
+
     /// Brick b6 — the four missing binary operators in the machine-code
     /// generator: division `/` (op 16), modulo `%` (op 17), logical `and`
     /// (op 30), logical `or` (op 31). Both the closed-expression path
