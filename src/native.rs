@@ -21493,6 +21493,155 @@ rule le64_neg
         let _ = fs::remove_file(vref_anygt);
     }
 
+    /// COLLECTIONS tier slice 6 — THE MILESTONE: the self-hosted emitter compiles
+    /// all five reductions over a MULTI-FIELD `collection(Concept)` input —
+    /// `sum(w.orders, o => o.amount)`, `count`, `fold` (multi-field body),
+    /// `all`, `any` — to runnable ELFs whose output matches verbosec's OWN
+    /// `--native` on the SAME program bit-for-bit. Unlike slices 1-3 (which
+    /// needed the single-field Item translation because the self-hosted side
+    /// only handled scalar elements), the oracle is now DIRECT: both compilers
+    /// take the identical concept/rule text (the self-hosted side header-less).
+    ///
+    /// argv layout (verbosec's exact flattened form): `<binary> <N> <e0.f0>
+    /// <e0.f1> <e1.f0> ...` — element fields in declaration order, N elements.
+    ///
+    /// What slice 6 wires (all inside examples/vexprparse.verbose):
+    ///   - parse_fields stores the ELEMENT type name as a collection field's ty
+    ///     span (ty code stays 3), so field_concept_of/static_concept_of resolve
+    ///     `w.orders` straight to `Order`;
+    ///   - the five reduction arms in x86_node / code_size_node gain a
+    ///     record-element per-element load: nf atois -> arena node construct
+    ///     (AstVariant shape, tag = cidx*256) -> node INDEX into the item slot;
+    ///   - the item binder is appended with a synthetic AstVariant RHS naming
+    ///     the element concept, so the body's `o.amount` flows through the
+    ///     EXISTING AstField emit with zero resolver changes.
+    ///
+    /// Also pins that a SCALAR collection(number) reduction still works through
+    /// the same build (the scalar path is the untouched else branch; its
+    /// byte-identity vs the pre-slice build was verified out-of-band via
+    /// SHA-256 on all six slice 1-3 self-emitted binaries).
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn collections_tier_slice6_record_elements_match_verbosec() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        let src = fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        // The self-hosted emitter (elf_program_src, reads program on argv[1]).
+        let elf = std::env::temp_dir().join("verbosec_test_coll_s6_elf_program_src");
+        compile_native(&program, "elf_program_src", elf.to_str().unwrap(), false, false)
+            .expect("elf_program_src must compile natively");
+
+        // verbosec oracle: the SAME two-field Order element program, all 5 rules.
+        let vsrc = "@verbose 0.1.0\n\nconcept Order\n  @intention: \"an order\"\n  @source: d.intent:1\n  fields:\n    amount : number\n    priority : number\nconcept W\n  @intention: \"orders\"\n  @source: d.intent:1\n  fields:\n    orders : collection(Order)\nrule total\n  @intention: \"sum of amounts\"\n  @source: d.intent:2\n  input:\n    w : W\n  output:\n    r : number\n  logic:\n    r = sum(w.orders, o => o.amount)\n  proofs:\n    purity:\n      reads : [w.orders]\n      calls : []\n    termination:\n      bound : 4\nrule tally\n  @intention: \"count > 60\"\n  @source: d.intent:2\n  input:\n    w : W\n  output:\n    r : number\n  logic:\n    r = count(w.orders, o => o.amount > 60)\n  proofs:\n    purity:\n      reads : [w.orders]\n      calls : []\n    termination:\n      bound : 4\nrule weighted\n  @intention: \"fold amount*priority\"\n  @source: d.intent:2\n  input:\n    w : W\n  output:\n    r : number\n  logic:\n    r = fold(w.orders, 0, acc, o => acc + o.amount * o.priority)\n  proofs:\n    purity:\n      reads : [w.orders]\n      calls : []\n    termination:\n      bound : 4\nrule allpos\n  @intention: \"all priority > 0 as 0/1\"\n  @source: d.intent:2\n  input:\n    w : W\n  output:\n    r : number\n  logic:\n    r = if all(w.orders, o => o.priority > 0) then 1 else 0\n  proofs:\n    purity:\n      reads : [w.orders]\n      calls : []\n    termination:\n      bound : 4\nrule anybig\n  @intention: \"any amount > 150 as 0/1\"\n  @source: d.intent:2\n  input:\n    w : W\n  output:\n    r : number\n  logic:\n    r = if any(w.orders, o => o.amount > 150) then 1 else 0\n  proofs:\n    purity:\n      reads : [w.orders]\n      calls : []\n    termination:\n      bound : 4";
+        let vtoks = crate::lexer::Lexer::new(&vsrc).tokenize().unwrap();
+        let vprog = crate::parser::Parser::new(vtoks).parse_program().unwrap();
+
+        let rules = ["total", "tally", "weighted", "allpos", "anybig"];
+        let mut vrefs = Vec::new();
+        for r in &rules {
+            let p = std::env::temp_dir().join(format!("verbosec_test_coll_s6_{}_ref", r));
+            compile_native(&vprog, r, p.to_str().unwrap(), false, false)
+                .unwrap_or_else(|e| panic!("verbosec must compile `{}` natively: {:?}", r, e));
+            vrefs.push(p);
+        }
+
+        // Self-hosted, header-less targets — SAME concepts + logic per rule.
+        let concepts = "concept Order\n  fields:\n    amount : number\n    priority : number\nconcept W\n  fields:\n    orders : collection(Order)\n";
+        let self_srcs: Vec<String> = [
+            ("total", "r = sum(w.orders, o => o.amount)"),
+            ("tally", "r = count(w.orders, o => o.amount > 60)"),
+            ("weighted", "r = fold(w.orders, 0, acc, o => acc + o.amount * o.priority)"),
+            ("allpos", "r = if all(w.orders, o => o.priority > 0) then 1 else 0"),
+            ("anybig", "r = if any(w.orders, o => o.amount > 150) then 1 else 0"),
+        ]
+        .iter()
+        .map(|(name, logic)| {
+            format!(
+                "{}rule {}\n  input:\n    w : W\n  output:\n    r : number\n  logic:\n    {}",
+                concepts, name, logic
+            )
+        })
+        .collect();
+
+        // Emit a target ELF via the self-hosted emitter (argv[1] = source, argv[2] = pos).
+        let emit_self = |prog_src: &str, tag: &str| -> std::path::PathBuf {
+            let mc = Command::new(&elf).args([prog_src, "0"]).output()
+                .expect("spawn elf_program_src");
+            assert!(mc.status.success(), "elf_program_src must exit 0 for {:?}; got {:?}", tag, mc.status);
+            let bytes = mc.stdout;
+            assert_eq!(&bytes[0..4], &[0x7f, 0x45, 0x4c, 0x46], "self-emitted file is not ELF for {}", tag);
+            let out = std::env::temp_dir().join(format!("verbosec_test_coll_s6_{}_self", tag));
+            fs::write(&out, &bytes).expect("write self ELF");
+            let mut perms = fs::metadata(&out).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&out, perms).expect("chmod +x");
+            out
+        };
+        let selfs: Vec<std::path::PathBuf> = rules
+            .iter()
+            .zip(self_srcs.iter())
+            .map(|(name, s)| emit_self(s, name))
+            .collect();
+
+        // (argv after the program name, expected per rule). argv[0] is N, then
+        // N flattened (amount, priority) pairs. The canonical input is
+        // [(100,1), (200,2), (50,1)]:
+        //   total    = 100+200+50            = 350
+        //   tally    = |{100, 200}| (> 60)   = 2
+        //   weighted = 100*1 + 200*2 + 50*1  = 550
+        //   allpos   = all priority > 0      = 1
+        //   anybig   = 200 > 150             = 1
+        // Edge cases: empty collection (N=0 — vacuous truth on all); a
+        // single-element boundary for anybig (150 is NOT > 150); a priority-0
+        // element for allpos (no early exit — last element false).
+        let cases: &[(&[&str], [&str; 5])] = &[
+            (&["3", "100", "1", "200", "2", "50", "1"], ["350\n", "2\n", "550\n", "1\n", "1\n"]),
+            (&["0"], ["0\n", "0\n", "0\n", "1\n", "0\n"]),
+            (&["1", "150", "1"], ["150\n", "1\n", "150\n", "1\n", "0\n"]),
+            (&["2", "70", "5", "10", "0"], ["80\n", "1\n", "350\n", "0\n", "0\n"]),
+            (&["1", "7", "3"], ["7\n", "0\n", "21\n", "1\n", "0\n"]),
+        ];
+
+        let run = |bin: &std::path::PathBuf, args: &[&str]| -> String {
+            let o = Command::new(bin).args(args).output().expect("run binary");
+            assert!(o.status.success(), "{:?} {:?} must exit 0; got {:?}", bin, args, o.status);
+            String::from_utf8_lossy(&o.stdout).to_string()
+        };
+
+        for (args, expected) in cases {
+            for (i, name) in rules.iter().enumerate() {
+                let s = run(&selfs[i], args);
+                let v = run(&vrefs[i], args);
+                assert_eq!(s, expected[i], "self {} for {:?} = {:?} (expected {:?})", name, args, s, expected[i]);
+                assert_eq!(v, expected[i], "verbosec {} for {:?} = {:?} (expected {:?})", name, args, v, expected[i]);
+                assert_eq!(s, v, "self ({:?}) vs verbosec ({:?}) {} mismatch for {:?}", s, v, name, args);
+            }
+        }
+
+        // Scalar-element regression: a collection(number) reduction through the
+        // SAME build still takes the untouched single-atoi path and computes
+        // correctly (the record-element guard resolves `number` to no concept).
+        let scalar_src = "concept W\n  fields:\n    xs : collection(number)\nrule total\n  input:\n    w : W\n  output:\n    r : number\n  logic:\n    r = sum(w.xs, x => x)";
+        let scalar = emit_self(scalar_src, "scalar_total");
+        assert_eq!(run(&scalar, &["4", "10", "20", "30", "40"]), "100\n");
+        assert_eq!(run(&scalar, &["0"]), "0\n");
+
+        let _ = fs::remove_file(&scalar);
+        for p in &selfs {
+            let _ = fs::remove_file(p);
+        }
+        for p in &vrefs {
+            let _ = fs::remove_file(p);
+        }
+        let _ = fs::remove_file(elf);
+    }
+
     /// Brick b6 — the four missing binary operators in the machine-code
     /// generator: division `/` (op 16), modulo `%` (op 17), logical `and`
     /// (op 30), logical `or` (op 31). Both the closed-expression path

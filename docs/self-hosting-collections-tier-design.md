@@ -80,8 +80,23 @@ slot — this is why count/sum come before fold):
   OR the first-class arena cons-list value if the result feeds another rule (this is
   where the collection-as-Value representation, shape B, is introduced).
 - **Slice 5** — text fold (Phase 5): append-only text accumulator.
-- **Slice 6** — multi-field `collection(Concept)` elements (flattened-argv stride,
-  `x.field` resolution).
+- **Slice 6** (DONE) — multi-field `collection(Concept)` elements (flattened-argv
+  stride, `x.field` resolution). parse_fields stores the ELEMENT type name as a
+  collection field's ty span (ty code stays 3), so `static_concept_of(coll)` IS
+  the element-concept resolver (zero new resolution machinery). The five
+  reduction arms in x86_node/code_size_node gain a record-element per-element
+  load (`x86_elem_load`, 72*nf+26 B): nf atois off the flattened argv words ->
+  arena node construct (AstVariant shape, tag = cidx*256) -> node INDEX into the
+  item binder slot; the item binder is appended with a synthetic AstVariant RHS
+  naming the element concept (`lets_append_elem_binders`), so the body's
+  `x.field` flows through the EXISTING AstField emit unchanged. Scalar
+  `collection(number)` keeps the untouched else branch — all slice 1-3 binaries
+  byte-identical (SHA-256-verified). Numbers-only element fields
+  (`field_list_all_number` gate); text element fields are a later slice.
+  Trap re-learned: the SlotPops count-down helper's base case must be
+  `slot == 0`, not `slot < 0` — the optimizer's default [0, i32::MAX] field
+  range dead-eliminates `< 0` on an unbounded number field and the recursion
+  never stops.
 
 ## Risks (carry into every slice)
 - **New loop machinery**: first runtime-conditional loop; the forward-exit +
