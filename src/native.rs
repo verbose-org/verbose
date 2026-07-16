@@ -9482,6 +9482,11 @@ fn emit_record_program<'a>(
 /// object per element, no wrapper), count-prefixed argv (`<N> <element × N>`
 /// trailing any scalar input fields), `map` or `filter` at the top of the
 /// logic, output element is a declared Record with number/text fields.
+/// Slice 4a (self-hosted collections tier byte-oracle): the INPUT collection
+/// element may also be the scalar `number` — each element is ONE decimal argv
+/// word atoi'd straight into the lambda-var slot; map bodies produce scalar
+/// output (one decimal per line), filter passes the element value through
+/// (same decimal-line format).
 ///
 /// Memory: no arena, no heap. Each element parses its fields into reused
 /// rbp slots, evaluates the map body (or filter predicate + body), writes
@@ -9570,26 +9575,49 @@ fn emit_collection_program(
         ),
     })?;
     let elem_field_concept_name = elem_field_concept_name.unwrap();
-    let input_elem_concept = all_concepts
-        .iter()
-        .find(|c| c.name == elem_field_concept_name)
-        .copied()
-        .ok_or_else(|| NativeError {
-            message: format!(
-                "unknown concept '{}' for input collection element",
-                elem_field_concept_name
-            ),
-        })?;
-    for f in &input_elem_concept.fields {
-        if !matches!(f.ty, Type::Number | Type::Text) {
+    // Input element kind: Record (declared concept) or Number scalar.
+    // Slice 4a of the self-hosted collections tier: `xs : collection(number)`
+    // is accepted — each element is ONE decimal argv word bound DIRECTLY to
+    // the lambda var (no record, stride 1). collection(text)/collection(bool)
+    // inputs stay interpreter-only for now.
+    enum InputElemKind<'a> {
+        Record(&'a Concept),
+        Number,
+    }
+    let input_elem_kind: InputElemKind = match elem_field_concept_name.as_str() {
+        "number" => InputElemKind::Number,
+        "text" | "bool" => {
             return Err(NativeError {
                 message: format!(
-                    "input collection element field '{}' has unsupported type (only number/text today)",
-                    f.name
+                    "input collection element type '{}' is not yet supported natively (slice 4a covers collection(number); use --run)",
+                    elem_field_concept_name
                 ),
             });
         }
-    }
+        name => {
+            let c = all_concepts
+                .iter()
+                .find(|c| c.name == name)
+                .copied()
+                .ok_or_else(|| NativeError {
+                    message: format!(
+                        "unknown concept '{}' for input collection element",
+                        name
+                    ),
+                })?;
+            for f in &c.fields {
+                if !matches!(f.ty, Type::Number | Type::Text) {
+                    return Err(NativeError {
+                        message: format!(
+                            "input collection element field '{}' has unsupported type (only number/text today)",
+                            f.name
+                        ),
+                    });
+                }
+            }
+            InputElemKind::Record(c)
+        }
+    };
 
     // Logic shape: Map (producing Record or scalar) or Filter over input.<coll_field>.
     enum CollectionOp<'a> {
@@ -9605,6 +9633,13 @@ fn emit_collection_program(
             verify_collection_target(coll_expr, &rule.input_name, &coll_field.name)?;
             match &output_kind {
                 OutputElemKind::Record(oec) => {
+                    // Record-constructor bodies read element FIELDS via the
+                    // elem concept's offsets; a scalar element has none.
+                    if matches!(input_elem_kind, InputElemKind::Number) {
+                        return Err(NativeError {
+                            message: "map from a scalar input collection (collection(number)) to a Record output element is not yet supported natively (slice 4a covers scalar outputs)".into(),
+                        });
+                    }
                     let (body_concept_name, body_fields) = match b.as_ref() {
                         Expr::Record(name, fields) => (name.as_str(), fields.as_slice()),
                         _ => return Err(NativeError {
@@ -9628,6 +9663,13 @@ fn emit_collection_program(
                     CollectionOp::MapScalar { lambda_var: v.as_str(), body: b.as_ref(), is_text: false }
                 }
                 OutputElemKind::Text => {
+                    // emit_text_write_to_fd needs an element CONCEPT for its
+                    // Field/Call resolution — no scalar-input path yet.
+                    if matches!(input_elem_kind, InputElemKind::Number) {
+                        return Err(NativeError {
+                            message: "map from a scalar input collection (collection(number)) to collection(text) is not yet supported natively (slice 4a covers number output)".into(),
+                        });
+                    }
                     CollectionOp::MapScalar { lambda_var: v.as_str(), body: b.as_ref(), is_text: true }
                 }
             }
@@ -9635,21 +9677,43 @@ fn emit_collection_program(
         Expr::Filter(coll_expr, v, pred) => {
             verify_collection_target(coll_expr, &rule.input_name, &coll_field.name)?;
             // Filter preserves element type — output element must match input
-            // element. Phase 3.2 allows Record inputs only (argv shape); scalar
-            // input collections (collection(number)) stay interpreter-only.
-            let oec = match &output_kind {
-                OutputElemKind::Record(c) => *c,
-                _ => return Err(NativeError {
-                    message: "filter with scalar output element requires a scalar input collection, which is not yet supported in native".into(),
-                }),
+            // element. Record→Record (Phase 3.2) and number→number (slice 4a,
+            // ONE decimal argv word per element, identity pass-through printed
+            // as one decimal per line) are supported; any mismatch is refused.
+            let output_elem_name: &str = match &output_kind {
+                OutputElemKind::Record(c) => c.name.as_str(),
+                OutputElemKind::Number => "number",
+                OutputElemKind::Text => "text",
+                OutputElemKind::Bool => "bool",
             };
-            if oec.name != input_elem_concept.name {
-                return Err(NativeError {
-                    message: format!(
-                        "filter output collection must match input element type: input is collection({}) but output is collection({})",
-                        input_elem_concept.name, oec.name
-                    ),
-                });
+            match (&output_kind, &input_elem_kind) {
+                (OutputElemKind::Record(oec), InputElemKind::Record(iec)) => {
+                    if oec.name != iec.name {
+                        return Err(NativeError {
+                            message: format!(
+                                "filter output collection must match input element type: input is collection({}) but output is collection({})",
+                                iec.name, oec.name
+                            ),
+                        });
+                    }
+                }
+                (OutputElemKind::Number, InputElemKind::Number) => {}
+                (_, InputElemKind::Number) => {
+                    return Err(NativeError {
+                        message: format!(
+                            "filter output collection must match input element type: input is collection(number) but output is collection({})",
+                            output_elem_name
+                        ),
+                    });
+                }
+                (_, InputElemKind::Record(iec)) => {
+                    return Err(NativeError {
+                        message: format!(
+                            "filter output collection must match input element type: input is collection({}) but output is collection({})",
+                            iec.name, output_elem_name
+                        ),
+                    });
+                }
             }
             CollectionOp::Filter { lambda_var: v.as_str(), predicate: pred.as_ref() }
         }
@@ -9660,7 +9724,29 @@ fn emit_collection_program(
 
     // ===== Emission =====
     let n_scalar = scalar_fields.len();
-    let n_elem_fields = input_elem_concept.fields.len();
+    // Scalar (number) elements occupy ONE slot: the lambda var binds the
+    // element VALUE directly, so the "element fields" region is one slot.
+    let n_elem_fields = match &input_elem_kind {
+        InputElemKind::Record(iec) => iec.fields.len(),
+        InputElemKind::Number => 1,
+    };
+    // The lambda var name is shared by all three op shapes; needed up front
+    // so the scalar-element slot can be keyed under it in elem_offsets.
+    let lambda_var: &str = match &op {
+        CollectionOp::MapRecord { lambda_var, .. }
+        | CollectionOp::MapScalar { lambda_var, .. }
+        | CollectionOp::Filter { lambda_var, .. } => lambda_var,
+    };
+    // For scalar elements, `Ident(x)` must resolve through the offsets map
+    // (the generic binding path in emit_eval_expr), NOT the "bare input
+    // binding not supported" refusal that fires when the name equals the
+    // emitter's input_name. Passing an empty input_name is the narrowest
+    // way to get that — no identifier can collide with "". Record elements
+    // keep the lambda var as input_name so `e.field` resolves as before.
+    let body_input_name: &str = match &input_elem_kind {
+        InputElemKind::Record(_) => lambda_var,
+        InputElemKind::Number => "",
+    };
     let n_lets = rule.logic.bindings.len();
     let frame_slots = n_scalar + n_elem_fields + n_lets;
 
@@ -9738,8 +9824,17 @@ fn emit_collection_program(
         scalar_offsets.insert(f.name.as_str(), -((i as i32 + 1) * 8));
     }
     let mut elem_offsets: HashMap<&str, i32> = HashMap::new();
-    for (i, f) in input_elem_concept.fields.iter().enumerate() {
-        elem_offsets.insert(f.name.as_str(), -(((n_scalar + i) as i32 + 1) * 8));
+    match &input_elem_kind {
+        InputElemKind::Record(iec) => {
+            for (i, f) in iec.fields.iter().enumerate() {
+                elem_offsets.insert(f.name.as_str(), -(((n_scalar + i) as i32 + 1) * 8));
+            }
+        }
+        InputElemKind::Number => {
+            // ONE slot right after the scalars, keyed under the lambda var —
+            // the var IS the element value for scalar collections.
+            elem_offsets.insert(lambda_var, -((n_scalar as i32 + 1) * 8));
+        }
     }
     if uses_now {
         elem_offsets.insert("now", now_slot);
@@ -9795,23 +9890,41 @@ fn emit_collection_program(
     code.extend_from_slice(&[0, 0, 0, 0]);
 
     // Parse element fields into rbp slots (reused each iteration).
-    for f in &input_elem_concept.fields {
-        let offset = elem_offsets[f.name.as_str()];
-        code.extend_from_slice(&[0x4B, 0x8B, 0x7C, 0xF5, 0x00]); // mov rdi, [r13+r14*8]
-        match f.ty {
-            Type::Number => {
-                emit_atoi_inline(&mut code);
-                store_rax_at_rbp(&mut code, offset);
+    match &input_elem_kind {
+        InputElemKind::Record(iec) => {
+            for f in &iec.fields {
+                let offset = elem_offsets[f.name.as_str()];
+                code.extend_from_slice(&[0x4B, 0x8B, 0x7C, 0xF5, 0x00]); // mov rdi, [r13+r14*8]
+                match f.ty {
+                    Type::Number => {
+                        emit_atoi_inline(&mut code);
+                        store_rax_at_rbp(&mut code, offset);
+                    }
+                    Type::Text => store_rdi_at_rbp(&mut code, offset),
+                    _ => unreachable!(),
+                }
+                code.extend_from_slice(&[0x49, 0xFF, 0xC6]); // inc r14
             }
-            Type::Text => store_rdi_at_rbp(&mut code, offset),
-            _ => unreachable!(),
         }
-        code.extend_from_slice(&[0x49, 0xFF, 0xC6]); // inc r14
+        InputElemKind::Number => {
+            // Slice 4a: ONE decimal argv word per element — atoi it straight
+            // into the lambda-var slot (the var binds the VALUE, stride 1).
+            let offset = elem_offsets[lambda_var];
+            code.extend_from_slice(&[0x4B, 0x8B, 0x7C, 0xF5, 0x00]); // mov rdi, [r13+r14*8]
+            emit_atoi_inline(&mut code);
+            store_rax_at_rbp(&mut code, offset);
+            code.extend_from_slice(&[0x49, 0xFF, 0xC6]); // inc r14
+        }
     }
 
-    // Evaluate the body or predicate. Lambda var is the "input name" so
-    // `e.salary` resolves to the element-field slot populated above.
-    let field_ranges = build_field_ranges(input_elem_concept);
+    // Evaluate the body or predicate. For record elements the lambda var is
+    // the "input name" so `e.salary` resolves to the element-field slot
+    // populated above; for scalar elements `Ident(x)` resolves through the
+    // offsets map directly (body_input_name is "" — see above).
+    let field_ranges = match &input_elem_kind {
+        InputElemKind::Record(iec) => build_field_ranges(iec),
+        InputElemKind::Number => HashMap::new(),
+    };
     match op {
         CollectionOp::MapRecord { lambda_var, body_fields } => {
             // Emit the constructed Record as one JSON line. The record's
@@ -9819,6 +9932,12 @@ fn emit_collection_program(
             let output_concept = match &output_kind {
                 OutputElemKind::Record(c) => *c,
                 _ => unreachable!("MapRecord built only from Record output kind"),
+            };
+            let input_elem_concept = match &input_elem_kind {
+                InputElemKind::Record(c) => *c,
+                InputElemKind::Number => {
+                    unreachable!("MapRecord refused for scalar input at analysis")
+                }
             };
             emit_record_as_json(
                 &mut code,
@@ -9836,6 +9955,12 @@ fn emit_collection_program(
             // Scalar element output: evaluate the body to rax (number/bool)
             // or emit the text directly, then one newline per element.
             if is_text {
+                let input_elem_concept = match &input_elem_kind {
+                    InputElemKind::Record(c) => *c,
+                    InputElemKind::Number => {
+                        unreachable!("text-output map refused for scalar input at analysis")
+                    }
+                };
                 emit_text_write_to_fd(
                     &mut code, body, 1, lambda_var, input_elem_concept, all_rules,
                     &elem_offsets, &field_ranges,
@@ -9844,7 +9969,7 @@ fn emit_collection_program(
                 emit_write_newline(&mut code, 1);
             } else {
                 emit_eval_expr(
-                    &mut code, body, lambda_var, &elem_offsets, all_rules, &field_ranges,
+                    &mut code, body, body_input_name, &elem_offsets, all_rules, &field_ranges,
                     &text_bindings, None,
                     None,
                 )?;
@@ -9871,7 +9996,7 @@ fn emit_collection_program(
         CollectionOp::Filter { lambda_var, predicate } => {
             // Evaluate the predicate → rax (0 = skip, non-zero = keep).
             emit_eval_expr(
-                &mut code, predicate, lambda_var, &elem_offsets, all_rules, &field_ranges,
+                &mut code, predicate, body_input_name, &elem_offsets, all_rules, &field_ranges,
                 &text_bindings, None,
                 None,
             )?;
@@ -9882,34 +10007,46 @@ fn emit_collection_program(
             let skip_patch = code.len();
             code.extend_from_slice(&[0, 0, 0, 0]);
 
-            // Emit the element as identity JSON: synthesize a Record whose
-            // fields are `e.<field>` Field accesses, reusing the same
-            // emit_record_as_json plumbing map uses. No runtime cost — the
-            // synthesis is compile-time.
-            let synthetic_fields: Vec<(String, Expr)> = input_elem_concept
-                .fields
-                .iter()
-                .map(|f| {
-                    (
-                        f.name.clone(),
-                        Expr::Field(
-                            Box::new(Expr::Ident(lambda_var.to_string())),
-                            f.name.clone(),
-                        ),
-                    )
-                })
-                .collect();
-            emit_record_as_json(
-                &mut code,
-                &synthetic_fields,
-                input_elem_concept, // output elem == input elem for filter
-                lambda_var,
-                input_elem_concept,
-                all_rules,
-                &elem_offsets,
-                &field_ranges,
-                &text_bindings,
-            )?;
+            match &input_elem_kind {
+                InputElemKind::Record(iec) => {
+                    // Emit the element as identity JSON: synthesize a Record whose
+                    // fields are `e.<field>` Field accesses, reusing the same
+                    // emit_record_as_json plumbing map uses. No runtime cost — the
+                    // synthesis is compile-time.
+                    let synthetic_fields: Vec<(String, Expr)> = iec
+                        .fields
+                        .iter()
+                        .map(|f| {
+                            (
+                                f.name.clone(),
+                                Expr::Field(
+                                    Box::new(Expr::Ident(lambda_var.to_string())),
+                                    f.name.clone(),
+                                ),
+                            )
+                        })
+                        .collect();
+                    emit_record_as_json(
+                        &mut code,
+                        &synthetic_fields,
+                        iec, // output elem == input elem for filter
+                        lambda_var,
+                        iec,
+                        all_rules,
+                        &elem_offsets,
+                        &field_ranges,
+                        &text_bindings,
+                    )?;
+                }
+                InputElemKind::Number => {
+                    // Slice 4a: identity pass-through of the ELEMENT value
+                    // (the input element, NOT the predicate result) — printed
+                    // as one decimal + '\n' per kept element via the same
+                    // itoa path the scalar-output map uses.
+                    load_rax_from_rbp(&mut code, elem_offsets[lambda_var]);
+                    emit_itoa_inline(&mut code);
+                }
+            }
 
             // skip_emit:
             let skip_pos = code.len();
@@ -23356,6 +23493,166 @@ rule num_outer
         let size = fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
         assert!(size > 400 && size < 2_500, "unexpected binary size: {}", size);
         let _ = fs::remove_file(out);
+    }
+
+    /// Source shared by the slice-4a scalar-input-collection tests below:
+    /// `xs : collection(number)` with one map rule and one filter rule.
+    const SLICE_4A_SCALAR_COLL_SRC: &str = r#"@verbose 0.1.0
+
+concept Numbers
+  @intention: "a bag of raw numbers"
+  @source: invoices.intent:1
+
+  fields:
+    xs : collection(number)
+
+
+rule doubled
+  @intention: "double each number"
+  @source: invoices.intent:1
+
+  input:
+    w : Numbers
+
+  output:
+    r : collection(number)
+
+  logic:
+    r = map(w.xs, x => x * 2)
+
+  proofs:
+    purity:
+      reads   : [w.xs]
+      calls   : []
+    termination:
+      bound : 100
+
+
+rule big_ones
+  @intention: "keep numbers above 10"
+  @source: invoices.intent:1
+
+  input:
+    w : Numbers
+
+  output:
+    r : collection(number)
+
+  logic:
+    r = filter(w.xs, x => x > 10)
+
+  proofs:
+    purity:
+      reads   : [w.xs]
+      calls   : []
+    termination:
+      bound : 100
+"#;
+
+    /// Slice 4a of the self-hosted collections tier: `xs : collection(number)`
+    /// is accepted as the INPUT collection of a Phase 3 map. Each element is
+    /// ONE decimal argv word atoi'd into the lambda-var slot (the var binds
+    /// the VALUE directly, stride 1); output reuses the Phase 3.2 scalar
+    /// print path — one decimal + '\n' per element. This binary is the
+    /// byte-oracle the self-hosted slice 4b compiles against.
+    #[test]
+    fn slice_4a_scalar_input_collection_map_runtime() {
+        use std::process::Command;
+        let tokens = crate::lexer::Lexer::new(SLICE_4A_SCALAR_COLL_SRC).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+
+        let out = std::env::temp_dir().join("verbosec_test_slice4a_scalar_map");
+        compile_native(&program, "doubled", out.to_str().unwrap(), false, false)
+            .expect("slice 4a: map over collection(number) input should compile");
+
+        // [10, 20, 30, 40] → one doubled decimal per line.
+        let run = Command::new(&out)
+            .args(["4", "10", "20", "30", "40"])
+            .output()
+            .expect("spawn scalar map");
+        assert!(run.status.success(), "map run exit: {:?}", run.status);
+        assert_eq!(String::from_utf8_lossy(&run.stdout), "20\n40\n60\n80\n");
+
+        // Empty collection → empty stdout, exit 0.
+        let empty = Command::new(&out).args(["0"]).output().expect("spawn empty map");
+        assert!(empty.status.success(), "empty run exit: {:?}", empty.status);
+        assert!(
+            empty.stdout.is_empty(),
+            "empty collection must produce empty stdout; got {:?}",
+            String::from_utf8_lossy(&empty.stdout)
+        );
+
+        // Cross-check against the interpreter (which has supported scalar
+        // input collections all along) on the same input values.
+        let all_rules: Vec<&crate::ast::Rule> = program.items.iter().filter_map(|i| match i {
+            crate::ast::Item::Rule(r) => Some(r),
+            _ => None,
+        }).collect();
+        let concepts: Vec<&crate::ast::Concept> =
+            crate::ast::iter_all_concepts(&program.items).collect();
+        let doubled = *all_rules.iter().find(|r| r.name == "doubled").unwrap();
+        let mut input = std::collections::HashMap::new();
+        input.insert(
+            "xs".to_string(),
+            crate::interpreter::Value::List(
+                [10i64, 20, 30, 40].iter().map(|&n| crate::interpreter::Value::Number(n)).collect(),
+            ),
+        );
+        let expected = match crate::interpreter::eval_rule(doubled, &all_rules, &concepts, &input) {
+            Ok(crate::interpreter::Value::List(vs)) => vs
+                .iter()
+                .map(|v| match v {
+                    crate::interpreter::Value::Number(n) => format!("{}\n", n),
+                    other => panic!("interpreter element must be a number; got {:?}", other),
+                })
+                .collect::<String>(),
+            other => panic!("interpreter must return a list; got {:?}", other),
+        };
+        assert_eq!(
+            String::from_utf8_lossy(&run.stdout),
+            expected,
+            "native decimal lines must equal the interpreter's list, element by element"
+        );
+
+        let _ = std::fs::remove_file(&out);
+    }
+
+    /// Slice 4a filter over a scalar input collection: predicate per element,
+    /// passing elements print the ELEMENT value (identity pass-through — the
+    /// input element, NOT the predicate result) as one decimal + '\n', same
+    /// format as scalar-output map.
+    #[test]
+    fn slice_4a_scalar_input_collection_filter_runtime() {
+        use std::process::Command;
+        let tokens = crate::lexer::Lexer::new(SLICE_4A_SCALAR_COLL_SRC).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+
+        let out = std::env::temp_dir().join("verbosec_test_slice4a_scalar_filter");
+        compile_native(&program, "big_ones", out.to_str().unwrap(), false, false)
+            .expect("slice 4a: filter over collection(number) input should compile");
+
+        // [5, 15, 3, 25] with pred x > 10 → the ELEMENTS 15 and 25 (a
+        // predicate-result bug would print "1\n1\n" instead).
+        let run = Command::new(&out)
+            .args(["4", "5", "15", "3", "25"])
+            .output()
+            .expect("spawn scalar filter");
+        assert!(run.status.success(), "filter run exit: {:?}", run.status);
+        assert_eq!(String::from_utf8_lossy(&run.stdout), "15\n25\n");
+
+        // Everything filtered out → empty stdout, exit 0.
+        let none = Command::new(&out)
+            .args(["3", "1", "2", "3"])
+            .output()
+            .expect("spawn all-filtered");
+        assert!(none.status.success(), "all-filtered exit: {:?}", none.status);
+        assert!(
+            none.stdout.is_empty(),
+            "all-filtered must produce empty stdout; got {:?}",
+            String::from_utf8_lossy(&none.stdout)
+        );
+
+        let _ = std::fs::remove_file(&out);
     }
 
     #[test]
