@@ -30,9 +30,10 @@ jobs:
       - name: Run tests
         # --test-threads=1: native tests compile a binary to a shared temp path
         # then exec it; in parallel they race (Text-file-busy, or a
-        # stack-overflow abort that downs the whole process). Serial = 390/390.
-        # (Each test thread sets its own 64 MiB stack via Builder::stack_size,
-        # so deep recursive emit doesn't overflow even on debug/musl.)
+        # stack-overflow abort that downs the whole process). Serial only.
+        # (Deep recursive emit over the self-source needs a 64 MiB stack in
+        # debug builds — provided repo-wide by RUST_MIN_STACK in
+        # .cargo/config.toml; some older tests also set Builder::stack_size.)
         run: cargo test --verbose -- --test-threads=1
 
       - name: Verify examples
