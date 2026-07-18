@@ -21905,6 +21905,216 @@ rule le64_neg
         let _ = fs::remove_file(vref_filter);
     }
 
+    /// COLLECTIONS tier slice 5 — THE MILESTONE: the self-hosted emitter
+    /// compiles the TEXT FOLD — `fold(w.orders, "amts:", acc, o =>
+    /// concat(acc, " ", o.amount))` over record elements with number fields,
+    /// `output: r : text` — and the emitted ELF's stdout is BYTE-IDENTICAL to
+    /// verbosec Phase 5b (`emit_text_fold_program`) on the SAME program+input.
+    ///
+    /// Design note (the slice's insight): verbosec MATERIALIZES (two-pass
+    /// sizing, stack buffer, single write); the self-hosted lowering STREAMS —
+    /// init text first, then per element each non-acc concat arg in source
+    /// order. The accumulator never exists at runtime: it IS the stream prefix
+    /// already written, so the acc binder is never bound to a readable slot
+    /// (the append-only validation guarantees no body site reads it except
+    /// concat arg 0, which the emit skips). Same bytes, different production
+    /// strategy; the trailing '\n' is the entrytx trampoline's.
+    ///
+    /// Pinned properties:
+    ///   - record fold [(100,1),(200,2),(50,1)] -> "amts: 100 200 50\n";
+    ///     empty -> "amts:\n" (init + newline ONLY); single record; a negative
+    ///     amount through the shared itoa — each byte-identical to verbosec;
+    ///   - multi-arg body `concat(acc, " [", o.amount, "x", o.priority, "]")`
+    ///     and an arithmetic arg `concat(acc, " ", o.amount * 2)` — multiple
+    ///     itoa call sites per element exercise the per-arg off threading —
+    ///     byte-identical to verbosec;
+    ///   - a let binding BEFORE the fold (storesize != 0 shifts every itoa
+    ///     rel32 site) — self-only, hand-pinned (same posture as 4b's let
+    ///     case);
+    ///   - SCALAR-element text fold `fold(w.xs, "vals:", acc, x =>
+    ///     concat(acc, " ", x))` — hand-pinned; NO verbosec oracle exists:
+    ///     Phase 5b predates the slice-4a scalar-input lift and refuses with
+    ///     "unknown concept 'number' for input collection element";
+    ///   - non-append-only body (acc referenced twice) -> the WHOLE fold
+    ///     emits int3: SIGTRAP with empty stdout even on the EMPTY input (the
+    ///     up-front fold_stream_ok walk, not a lazy per-arg refusal);
+    ///   - declared-type/body-shape mismatch (texty fold under `output:
+    ///     number`, number fold under `output: text`) -> int3 (the slice-4b
+    ///     guard extended to folds; verbosec refuses both at compile time).
+    ///
+    /// Trap runs set RLIMIT_CORE to EXACTLY 1 byte via pre_exec: with a piped
+    /// core_pattern (e.g. WSL's `|/wsl-capture-crash`) a crashing binary
+    /// otherwise streams its 16 GiB MAP_NORESERVE arena into the pipe — a
+    /// minutes-long stall; the kernel skips piped dumps only for the special
+    /// limit == 1 case (see core(5)). Normal-exit runs are unaffected.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn collections_tier_slice5_text_fold_match_verbosec() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::process::{CommandExt, ExitStatusExt};
+        use std::process::Command;
+
+        let src = fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        // The self-hosted emitter (elf_program_src, reads program on argv[1]).
+        let elf = std::env::temp_dir().join("verbosec_test_coll_s5_elf_program_src");
+        compile_native(&program, "elf_program_src", elf.to_str().unwrap(), false, false)
+            .expect("elf_program_src must compile natively");
+
+        // verbosec DIRECT oracle: Phase 5b text folds over record elements
+        // (fields deliberately unbounded so a negative amount flows through
+        // itoa instead of tripping the runtime bounds-check).
+        let vsrc = "@verbose 0.1.0\n\nconcept Order\n  @intention: \"an order\"\n  @source: t.intent:1\n  fields:\n    amount : number\n    priority : number\nconcept Warehouse\n  @intention: \"orders\"\n  @source: t.intent:1\n  fields:\n    orders : collection(Order)\nrule amounts_line\n  @intention: \"amounts line\"\n  @source: t.intent:2\n  input:\n    w : Warehouse\n  output:\n    r : text\n  logic:\n    r = fold(w.orders, \"amts:\", acc, o => concat(acc, \" \", o.amount))\n  proofs:\n    purity:\n      reads : [w.orders]\n      calls : []\n    termination:\n      bound : 1000\nrule detail_line\n  @intention: \"detail line\"\n  @source: t.intent:2\n  input:\n    w : Warehouse\n  output:\n    r : text\n  logic:\n    r = fold(w.orders, \"orders:\", acc, o => concat(acc, \" [\", o.amount, \"x\", o.priority, \"]\"))\n  proofs:\n    purity:\n      reads : [w.orders]\n      calls : []\n    termination:\n      bound : 1000\nrule scaled_line\n  @intention: \"scaled line\"\n  @source: t.intent:2\n  input:\n    w : Warehouse\n  output:\n    r : text\n  logic:\n    r = fold(w.orders, \"x2:\", acc, o => concat(acc, \" \", o.amount * 2))\n  proofs:\n    purity:\n      reads : [w.orders]\n      calls : []\n    termination:\n      bound : 1000";
+        let vtoks = crate::lexer::Lexer::new(&vsrc).tokenize().unwrap();
+        let vprog = crate::parser::Parser::new(vtoks).parse_program().unwrap();
+        let vref_amts = std::env::temp_dir().join("verbosec_test_coll_s5_amts_ref");
+        let vref_detail = std::env::temp_dir().join("verbosec_test_coll_s5_detail_ref");
+        let vref_scaled = std::env::temp_dir().join("verbosec_test_coll_s5_scaled_ref");
+        compile_native(&vprog, "amounts_line", vref_amts.to_str().unwrap(), false, false)
+            .expect("verbosec must compile `amounts_line` natively (Phase 5b)");
+        compile_native(&vprog, "detail_line", vref_detail.to_str().unwrap(), false, false)
+            .expect("verbosec must compile `detail_line` natively (Phase 5b)");
+        compile_native(&vprog, "scaled_line", vref_scaled.to_str().unwrap(), false, false)
+            .expect("verbosec must compile `scaled_line` natively (Phase 5b)");
+
+        // Self-hosted, header-less targets — the SAME rule bodies.
+        let rec_concepts = "concept Order\n  fields:\n    amount : number\n    priority : number\nconcept W\n  fields:\n    orders : collection(Order)\n";
+        let prog_rec = format!("{}rule amounts_line\n  input:\n    w : W\n  output:\n    r : text\n  logic:\n    r = fold(w.orders, \"amts:\", acc, o => concat(acc, \" \", o.amount))", rec_concepts);
+        let prog_multi = format!("{}rule detail_line\n  input:\n    w : W\n  output:\n    r : text\n  logic:\n    r = fold(w.orders, \"orders:\", acc, o => concat(acc, \" [\", o.amount, \"x\", o.priority, \"]\"))", rec_concepts);
+        let prog_scaled = format!("{}rule scaled_line\n  input:\n    w : W\n  output:\n    r : text\n  logic:\n    r = fold(w.orders, \"x2:\", acc, o => concat(acc, \" \", o.amount * 2))", rec_concepts);
+        // A let binding BEFORE the fold: storesize != 0 shifts the AstFold
+        // node's blob offset, so every per-arg itoa call-site rel32 must
+        // thread bg.off correctly.
+        let prog_let = format!("{}rule let_line\n  input:\n    w : W\n  output:\n    r : text\n  logic:\n    let k = 3\n    r = fold(w.orders, \"x3:\", acc, o => concat(acc, \" \", o.amount * k))", rec_concepts);
+        // Scalar-element text fold — NO verbosec oracle (Phase 5b refuses
+        // scalar-element input collections); hand-pinned expected bytes.
+        let prog_scalar = "concept W\n  fields:\n    xs : collection(number)\nrule vals_line\n  input:\n    w : W\n  output:\n    r : text\n  logic:\n    r = fold(w.xs, \"vals:\", acc, x => concat(acc, \" \", x))";
+        // Non-append-only: acc referenced in the rest args -> whole-fold int3.
+        let prog_bad = format!("{}rule bad_line\n  input:\n    w : W\n  output:\n    r : text\n  logic:\n    r = fold(w.orders, \"amts:\", acc, o => concat(acc, \" \", acc))", rec_concepts);
+        // Declared-type/body-shape mismatches -> int3 proc body.
+        let prog_mism_num = "concept W\n  fields:\n    xs : collection(number)\nrule mism\n  input:\n    w : W\n  output:\n    r : number\n  logic:\n    r = fold(w.xs, \"vals:\", acc, x => concat(acc, \" \", x))";
+        let prog_mism_txt = "concept W\n  fields:\n    xs : collection(number)\nrule mism2\n  input:\n    w : W\n  output:\n    r : text\n  logic:\n    r = fold(w.xs, 0, acc, x => acc + x)";
+
+        let emit_self = |prog_src: &str, tag: &str| -> std::path::PathBuf {
+            let mc = Command::new(&elf).args([prog_src, "0"]).output()
+                .expect("spawn elf_program_src");
+            assert!(mc.status.success(), "elf_program_src must exit 0 for {:?}; got {:?}", tag, mc.status);
+            let bytes = mc.stdout;
+            assert_eq!(&bytes[0..4], &[0x7f, 0x45, 0x4c, 0x46], "self-emitted file is not ELF for {}", tag);
+            let out = std::env::temp_dir().join(format!("verbosec_test_coll_s5_{}_self", tag));
+            fs::write(&out, &bytes).expect("write self ELF");
+            let mut perms = fs::metadata(&out).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&out, perms).expect("chmod +x");
+            out
+        };
+        let self_rec = emit_self(&prog_rec, "rec");
+        let self_multi = emit_self(&prog_multi, "multi");
+        let self_scaled = emit_self(&prog_scaled, "scaled");
+        let self_let = emit_self(&prog_let, "letfold");
+        let self_scalar = emit_self(prog_scalar, "scalar");
+        let self_bad = emit_self(&prog_bad, "bad");
+        let self_mism_num = emit_self(prog_mism_num, "mismnum");
+        let self_mism_txt = emit_self(prog_mism_txt, "mismtxt");
+
+        let run = |bin: &std::path::PathBuf, args: &[&str]| -> String {
+            let o = Command::new(bin).args(args).output().expect("run binary");
+            assert!(o.status.success(), "{:?} {:?} must exit 0; got {:?}", bin, args, o.status);
+            String::from_utf8_lossy(&o.stdout).to_string()
+        };
+        // Trap runs: RLIMIT_CORE = 1 byte (see the doc comment above).
+        let run_trap = |bin: &std::path::PathBuf, args: &[&str]| -> std::process::Output {
+            extern "C" {
+                fn setrlimit(resource: i32, rlim: *const [u64; 2]) -> i32;
+            }
+            let mut cmd = Command::new(bin);
+            cmd.args(args);
+            unsafe {
+                cmd.pre_exec(|| {
+                    const RLIMIT_CORE: i32 = 4;
+                    let lim: [u64; 2] = [1, 1];
+                    setrlimit(RLIMIT_CORE, &lim);
+                    Ok(())
+                });
+            }
+            cmd.output().expect("run trap binary")
+        };
+
+        // (argv after the program name, expected stdout). argv[0] is N, then
+        // N flattened (amount, priority) pairs.
+        let rec_cases: &[(&[&str], &str)] = &[
+            (&["3", "100", "1", "200", "2", "50", "1"], "amts: 100 200 50\n"),
+            (&["0"], "amts:\n"),
+            (&["1", "7", "3"], "amts: 7\n"),
+            (&["2", "-5", "9", "40", "2"], "amts: -5 40\n"),
+        ];
+        for (args, expected) in rec_cases {
+            let s = run(&self_rec, args);
+            let v = run(&vref_amts, args);
+            assert_eq!(s, *expected, "self rec for {:?} = {:?} (expected {:?})", args, s, expected);
+            assert_eq!(v, *expected, "verbosec rec for {:?} = {:?} (expected {:?})", args, v, expected);
+            assert_eq!(s, v, "self ({:?}) vs verbosec ({:?}) rec mismatch for {:?}", s, v, args);
+        }
+        let multi_cases: &[(&[&str], &str)] = &[
+            (&["3", "100", "1", "200", "2", "50", "1"], "orders: [100x1] [200x2] [50x1]\n"),
+            (&["0"], "orders:\n"),
+        ];
+        for (args, expected) in multi_cases {
+            let s = run(&self_multi, args);
+            let v = run(&vref_detail, args);
+            assert_eq!(s, *expected, "self multi for {:?} = {:?} (expected {:?})", args, s, expected);
+            assert_eq!(s, v, "self ({:?}) vs verbosec ({:?}) multi mismatch for {:?}", s, v, args);
+        }
+        let scaled_cases: &[(&[&str], &str)] = &[
+            (&["3", "100", "1", "200", "2", "50", "1"], "x2: 200 400 100\n"),
+            (&["0"], "x2:\n"),
+        ];
+        for (args, expected) in scaled_cases {
+            let s = run(&self_scaled, args);
+            let v = run(&vref_scaled, args);
+            assert_eq!(s, *expected, "self scaled for {:?} = {:?} (expected {:?})", args, s, expected);
+            assert_eq!(s, v, "self ({:?}) vs verbosec ({:?}) scaled mismatch for {:?}", s, v, args);
+        }
+
+        // Let-shifted fold (self-only, hand-pinned).
+        assert_eq!(run(&self_let, &["3", "100", "1", "200", "2", "50", "1"]), "x3: 300 600 150\n");
+        assert_eq!(run(&self_let, &["0"]), "x3:\n");
+
+        // Scalar-element fold (self-only, hand-pinned — missing oracle noted
+        // in the doc comment).
+        assert_eq!(run(&self_scalar, &["3", "10", "20", "30"]), "vals: 10 20 30\n");
+        assert_eq!(run(&self_scalar, &["0"]), "vals:\n");
+        assert_eq!(run(&self_scalar, &["2", "-5", "7"]), "vals: -5 7\n");
+
+        // Non-append-only -> SIGTRAP (int3), empty stdout, EVEN on the empty
+        // collection (the whole fold is one int3 — up-front validation).
+        for args in [&["3", "100", "1", "200", "2", "50", "1"][..], &["0"][..]] {
+            let o = run_trap(&self_bad, args);
+            assert_eq!(o.status.signal(), Some(5),
+                "non-append-only fold must SIGTRAP for {:?}; got {:?}", args, o.status);
+            assert!(o.stdout.is_empty(),
+                "non-append-only fold must write NOTHING for {:?}; got {:?}", args, o.stdout);
+        }
+        // Declared-type/body-shape mismatches -> SIGTRAP.
+        let o = run_trap(&self_mism_num, &["2", "5", "7"]);
+        assert_eq!(o.status.signal(), Some(5),
+            "texty fold under `output: number` must SIGTRAP; got {:?}", o.status);
+        let o = run_trap(&self_mism_txt, &["2", "5", "7"]);
+        assert_eq!(o.status.signal(), Some(5),
+            "number fold under `output: text` must SIGTRAP; got {:?}", o.status);
+
+        for p in [&self_rec, &self_multi, &self_scaled, &self_let, &self_scalar,
+                  &self_bad, &self_mism_num, &self_mism_txt,
+                  &vref_amts, &vref_detail, &vref_scaled] {
+            let _ = fs::remove_file(p);
+        }
+        let _ = fs::remove_file(elf);
+    }
+
     /// Brick b6 — the four missing binary operators in the machine-code
     /// generator: division `/` (op 16), modulo `%` (op 17), logical `and`
     /// (op 30), logical `or` (op 31). Both the closed-expression path

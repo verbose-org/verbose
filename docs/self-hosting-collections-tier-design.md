@@ -79,7 +79,30 @@ slot — this is why count/sum come before fold):
 - **Slice 4** — `map`/`filter` → collection OUTPUT (Phase 3): streamed per-element,
   OR the first-class arena cons-list value if the result feeds another rule (this is
   where the collection-as-Value representation, shape B, is introduced).
-- **Slice 5** — text fold (Phase 5): append-only text accumulator.
+- **Slice 5** (DONE) — text fold (Phase 5b): `output: text` rule whose body is
+  `fold(coll, "init", acc, item => concat(acc, ...rest))`. STREAMED where
+  verbosec materializes (two-pass sizing + buffer + one write): the init text
+  streams first (before r8/r9 go live), then per element each non-acc concat
+  arg streams in source order — the accumulator never materializes, it IS the
+  stream prefix already written, so the acc binder is never bound (append-only
+  validation `fold_stream_ok` guarantees no body site reads it except concat
+  arg 0, which the emit skips; violations → whole-fold int3, even on empty
+  input). Routing: ast_is_texty/ast_texty_shallow's AstFold arms follow the
+  BODY (concat body → texty stream route + entrytx '\n' + anytx itoa, all
+  free; arithmetic body → 0, slice-2 number folds byte-identical,
+  SHA-verified). Per-arg emit (`x86_fold_arg`): text literal → the 33-B AstStr
+  write (syscall clobbers rcx/r11 only); number expr → x86_node + pop rax +
+  push r9/call itoa/pop r9 (the 4b r9-save pattern), NO newline per arg; other
+  texty shapes → int3. Loop constants: scalar 155 (jz 78+R / back -(87+R)),
+  record 72*nf+115 via the slice-6 elem load (jz 72*nf+38+R / back
+  -(72*nf+47+R)); `fold_size_cargs`/`code_size_stream_node` mirror
+  byte-for-byte. Declared-type guard in x86_proc/proc_size (the 4b posture
+  extended): texty fold under non-text output, or number fold under text
+  output → int3 proc body. Eval stays NUMERIC (documented divergence at
+  eval_fold — text-fold eval deferred; no collection input path reaches it).
+  Oracle: verbosec Phase 5b on record elements — byte-identical incl. empty
+  ("amts:\n") and negatives; SCALAR elements have NO oracle (Phase 5b predates
+  the 4a scalar-input lift — refuses "unknown concept 'number'"), hand-pinned.
 - **Slice 6** (DONE) — multi-field `collection(Concept)` elements (flattened-argv
   stride, `x.field` resolution). parse_fields stores the ELEMENT type name as a
   collection field's ty span (ty code stays 3), so `static_concept_of(coll)` IS
