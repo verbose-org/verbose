@@ -11839,7 +11839,7 @@ rule type_of_env
       -- reads that concept's VariantList (concept_at_index on code - 1000), then folds
       -- the arm-body types via arms_type. `code - 1000` is computed only on the >= 1000
       -- branch, so the ConceptAtState index is always >= 0. 7777 (no arms) -> ERROR.
-      AstMatch(scrut, arms) => if type_of_env(TypeArg { node: scrut, tenv: t.tenv, src: t.src, prog: t.prog, concepts: t.concepts }) < 1000 then 3 else (if arms_type(ArmsTypeState { arms: arms, vlist: cd_variants(concept_at_index(ConceptAtState { concepts: t.concepts, idx: type_of_env(TypeArg { node: scrut, tenv: t.tenv, src: t.src, prog: t.prog, concepts: t.concepts }) - 1000 })), tenv: t.tenv, src: t.src, prog: t.prog, concepts: t.concepts }) == 7777 then 3 else arms_type(ArmsTypeState { arms: arms, vlist: cd_variants(concept_at_index(ConceptAtState { concepts: t.concepts, idx: type_of_env(TypeArg { node: scrut, tenv: t.tenv, src: t.src, prog: t.prog, concepts: t.concepts }) - 1000 })), tenv: t.tenv, src: t.src, prog: t.prog, concepts: t.concepts }))
+      AstMatch(scrut, arms) => match_arm_ty(MatchArmTyState { scrut_ty: type_of_env(TypeArg { node: scrut, tenv: t.tenv, src: t.src, prog: t.prog, concepts: t.concepts }), arms: arms, tenv: t.tenv, src: t.src, prog: t.prog, concepts: t.concepts })
       -- Result tier slice 1 stub (parse + eval only; real handling in a later slice).
       AstOk(inner) => 3
       AstResErr(inner) => 3
@@ -11854,7 +11854,7 @@ rule type_of_env
   proofs:
     purity:
       reads : [t.node, t.tenv, t.src, t.prog, t.concepts]
-      calls : [type_of_env, env_lookup, bin_type, if_type, call_result_type, resolve_type, arms_type, cd_variants, concept_at_index]
+      calls : [type_of_env, env_lookup, bin_type, if_type, call_result_type, resolve_type, match_arm_ty]
     termination:
       bound : 4000
 
@@ -12355,6 +12355,97 @@ rule field_concept_tenv
       bound : 4000
 
 
+
+-- Single-evaluation match typing (the 2^40 lesson, checker edition): arms_type's
+-- ArmCons arm used to mention arms_type(rest) TWICE and arm_body_type(head) up to
+-- 4x — eager double-mention = O(2^n) over a match's arms; the self-source's 24-arm
+-- matches made the R6a/R6b walk exhaust ANY arena cap (measured ~x2 per added arm).
+-- Fix = evaluate each subresult ONCE into a combine helper. Leaf rule, no calls.
+concept ArmsTypeCombineState
+  @intention: "The head arm's body type + the rest-of-arms common type, for the single-evaluation combine"
+  @source: vexprparse.intent:65
+  fields:
+    head_ty : number
+    rest_ty : number
+
+
+rule arms_type_combine
+  @intention: "Combine one arm body type with the rest's common type: empty rest -> head; agreeing non-ERROR -> head; else ERROR"
+  @source: vexprparse.intent:65
+  input:
+    c : ArmsTypeCombineState
+  output:
+    out : number
+  logic:
+    out = if c.rest_ty == 7777 then c.head_ty else (if c.head_ty == c.rest_ty and c.head_ty != 3 then c.head_ty else 3)
+  proofs:
+    purity:
+      reads : [c.head_ty, c.rest_ty]
+      calls : []
+    termination:
+      bound : 64
+
+
+-- Normalize an arms_type result (7777 = the empty-match sentinel -> ERROR 3).
+concept ArmsTypeNormState
+  @intention: "An arms_type result to normalize (empty-match sentinel becomes ERROR)"
+  @source: vexprparse.intent:65
+  fields:
+    t : number
+
+
+rule arms_type_norm
+  @intention: "Map the empty-match sentinel 7777 to ERROR 3, pass every other type code through"
+  @source: vexprparse.intent:65
+  input:
+    n : ArmsTypeNormState
+  output:
+    out : number
+  logic:
+    out = if n.t == 7777 then 3 else n.t
+  proofs:
+    purity:
+      reads : [n.t]
+      calls : []
+    termination:
+      bound : 64
+
+
+-- The type of a match given its ALREADY-COMPUTED scrutinee type code — the lazy
+-- guard lives here (scrut_ty < 1000 -> ERROR before concept_at_index is reached),
+-- and the scrutinee is typed exactly once by the caller.
+-- Splitting this out of type_of_env's AstMatch arm makes the scrutinee typing and
+-- the arms fold each evaluate ONCE (the old inline form re-evaluated type_of_env
+-- on the scrutinee 3x and arms_type 2x per match node).
+concept MatchArmTyState
+  @intention: "A computed scrutinee type code + the match arms + the typing context, for the single-evaluation match type"
+  @source: vexprparse.intent:65
+  fields:
+    scrut_ty : number
+    arms : ArmList
+    tenv : Env
+    src : text [..256]
+    prog : RuleList
+    concepts : ConceptList
+
+
+rule match_arm_ty
+  @intention: "The type of a match from its scrutinee code: ERROR unless a concept code; else the arms' common type, empty match -> ERROR"
+  @source: vexprparse.intent:65
+  input:
+    ma : MatchArmTyState
+  output:
+    out : number
+  logic:
+    out = if ma.scrut_ty < 1000 then 3 else arms_type_norm(ArmsTypeNormState { t: arms_type(ArmsTypeState { arms: ma.arms, vlist: cd_variants(concept_at_index(ConceptAtState { concepts: ma.concepts, idx: ma.scrut_ty - 1000 })), tenv: ma.tenv, src: ma.src, prog: ma.prog, concepts: ma.concepts }) })
+  proofs:
+    purity:
+      reads : [ma.scrut_ty, ma.arms, ma.tenv, ma.src, ma.prog, ma.concepts]
+      calls : [arms_type_norm, arms_type, cd_variants, concept_at_index]
+    termination:
+      bound : 4000
+
+
 -- arm_body_type: the type code of ONE match arm body. If the arm's variant is not in
 -- the scrutinee concept's VariantList -> ERROR (3, an ill-formed arm). Otherwise bind
 -- the arm's binders to the variant payload's field types and type the body against
@@ -12391,12 +12482,12 @@ rule arms_type
     out : number
   logic:
     out = match at.arms:
-      ArmCons(vstart, vlen, binders, body, rest) => if arms_type(ArmsTypeState { arms: rest, vlist: at.vlist, tenv: at.tenv, src: at.src, prog: at.prog, concepts: at.concepts }) == 7777 then arm_body_type(ArmBodyTypeState { vstart: vstart, vlen: vlen, binders: binders, body: body, vlist: at.vlist, tenv: at.tenv, src: at.src, prog: at.prog, concepts: at.concepts }) else (if arm_body_type(ArmBodyTypeState { vstart: vstart, vlen: vlen, binders: binders, body: body, vlist: at.vlist, tenv: at.tenv, src: at.src, prog: at.prog, concepts: at.concepts }) == arms_type(ArmsTypeState { arms: rest, vlist: at.vlist, tenv: at.tenv, src: at.src, prog: at.prog, concepts: at.concepts }) and arm_body_type(ArmBodyTypeState { vstart: vstart, vlen: vlen, binders: binders, body: body, vlist: at.vlist, tenv: at.tenv, src: at.src, prog: at.prog, concepts: at.concepts }) != 3 then arm_body_type(ArmBodyTypeState { vstart: vstart, vlen: vlen, binders: binders, body: body, vlist: at.vlist, tenv: at.tenv, src: at.src, prog: at.prog, concepts: at.concepts }) else 3)
+      ArmCons(vstart, vlen, binders, body, rest) => arms_type_combine(ArmsTypeCombineState { head_ty: arm_body_type(ArmBodyTypeState { vstart: vstart, vlen: vlen, binders: binders, body: body, vlist: at.vlist, tenv: at.tenv, src: at.src, prog: at.prog, concepts: at.concepts }), rest_ty: arms_type(ArmsTypeState { arms: rest, vlist: at.vlist, tenv: at.tenv, src: at.src, prog: at.prog, concepts: at.concepts }) })
       ArmNil => 7777
   proofs:
     purity:
       reads : [at.arms, at.vlist, at.tenv, at.src, at.prog, at.concepts]
-      calls : [arms_type, arm_body_type]
+      calls : [arms_type, arm_body_type, arms_type_combine]
     termination:
       bound : 4000
 

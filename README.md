@@ -2,24 +2,91 @@
 
 [![CI](https://github.com/verbose-org/verbose/actions/workflows/cidx.yml/badge.svg)](https://github.com/verbose-org/verbose/actions/workflows/cidx.yml)
 
-> *Formalize intention. Verify mechanically. Compile to auditable native code.*
+> *Designed to be written by AI. Designed to be challenged by humans or other AIs. Verified before it runs.*
 >
 > *"I created this not so the machine replaces us, but so the machine is held accountable to us."*
 
-Verbose is an experimental language built around a clear separation of responsibility:
+**Verbose is an experimental AI-first language for compiling declared intent into
+minimal, immutable native or WebAssembly programs.** An AI may write the program,
+but it is not trusted. The compiler mechanically checks its declarations against
+the program it actually received; a human or another AI can audit the complete
+artifact before anything is executed.
+
+AI-first does not mean human-excluded. Verbose is optimized for unambiguous machine
+generation and analysis rather than pleasant manual authorship, while deliberately
+remaining inspectable. The intended chain is:
+
+```text
+human intent
+    ↓
+AI proposes a .verbose program       nondeterministic; may be wrong
+    ↓
+compiler verifies or rejects it      deterministic; never guesses
+    ↓
+human or independent AI audits       intention, omissions, policy, capability diff
+    ↓
+specialized native binary / WASM     only the accepted program is deployed
+```
+
+Responsibility stays explicitly divided:
 
 - **The author owns the intention.** Every concept, every rule, every effect (reads, calls, file appends, network fetches, log blocks, audit chains) is declared in source. What the program is supposed to do, you write down.
-- **The compiler owns the faithfulness.** Every declared read, every termination bound, every effect path is mechanically verified against the actual AST. The binary cannot drift from the declarations.
+- **The compiler owns mechanical consistency.** Declared reads, calls, bounds, layers, and supported effect shapes are checked against the actual AST. A declaration cannot drift from that AST without rejection.
+- **The auditor owns the decision.** A human or another AI challenges what was requested, what was omitted, and whether the resulting capabilities are acceptable for the domain.
 
-When code generation is delegated — to AI, to a teammate, to anyone who is not the eventual auditor — the question stops being "did the AI hallucinate?" and becomes **"what did the author ask for, and does the binary do exactly that?"** If the delegate forgets to declare an audit log, the program won't have one — and that absence is plainly visible in source. The auditor reads the file, asks "where's the audit log?", and the author has to answer. The compiler's job is *not* to enforce that the right thing was asked — that's human accountability work, governed by the domain (regulator, stakeholder, customer, whatever). The compiler's job is to enforce that **exactly what was asked is what runs**, with no place between source and binary where either can quietly drift.
+The question therefore stops being only "did the AI hallucinate?" and becomes
+**"what was declared, what was verified, and what capabilities reached the
+artifact?"** If the generator forgets an audit log, the program will not secretly
+gain one; the omission remains visible and must be challenged during review. The
+compiler does not decide whether the author asked for the right thing. It enforces
+the mechanically checkable part of the contract and refuses inconsistency.
 
-That separation is the architectural bet. The author thinks. The compiler verifies. As a side effect, you get binaries 500 B to 2 KB, statically linked, without libc, every external effect named at the source level, all proofs mechanically checked. But the headline is the **chain of accountability** between intent and binary, not the byte count.
+That separation is the architectural bet. Small statically linked binaries, no
+libc, fast compilation and direct x86-64/WASM generation matter, but they are not
+the headline. The headline is the **chain of accountability between intent, a
+machine-authored program, its verifier, its auditor, and the deployed artifact.**
+
+## Rebuild, do not mutate
+
+Verbose does not aim to deploy a general-purpose engine containing dormant
+capabilities and then mutate its configuration forever. A Verbose program is a
+specialized artifact. Changing a route, a TLS policy, or a firewall rule means
+changing the declared intent, verifying it again, building a new binary, and
+replacing the running instance.
+
+```text
+general-purpose service                 Verbose service
+───────────────────────                 ───────────────
+engine + runtime configuration          declared intent
+capabilities disabled by policy         verified specialized program
+hot reload mutates a live process       new immutable binary replaces the old one
+unused code remains present             undeclared capability is absent
+```
+
+This is the same operational choice already made by immutable infrastructure and
+replaceable containers, pushed down to the program itself. Once an instance is
+started, its policy does not change underneath it. Reconfiguration is a rebuild.
+
+The distinction is deliberate:
+
+> A disabled capability still exists. An absent capability cannot be enabled.
+
+A TLS endpoint specialized for TLS 1.3 need not compile legacy protocol versions
+or unused algorithms. A firewall need not carry rules that are not in its policy.
+A web service need not contain routes it does not serve. Verbose explores how far
+useful infrastructure can go when absence, boundedness, and specialization are
+treated as features rather than limitations.
 
 ## The architecture's bet
 
-The compiler is small and strict by design. Its scope is deliberately **not** the whole gap between "what a human meant" and "what the machine does" — it is the inner half of that chain: from a formalized `.verbose` program to a verified binary. The outer half (natural-language intention → `.verbose`) is left to humans, AI, or both working together. **The author bears the responsibility for the intention being the right thing for the domain.** The compiler bears the responsibility for the binary being exactly the intention as declared.
+The compiler is strict by design. Its scope is deliberately **not** the whole gap between "what a human meant" and "what the machine does" — it is the mechanically checkable inner part of that chain, starting from a formalized `.verbose` program. The outer step (natural-language intention → `.verbose`) is left to humans, AI, or both working together. **The author bears responsibility for the intention being right for the domain.** The compiler bears responsibility for the properties it claims to verify.
 
-The bet is that the **floor matters, not the average**. Most AI-assisted tooling degrades gracefully as models hallucinate; here, a bad `.verbose` produces a *rejected* `.verbose`, never a wrong binary. Trust is anchored in the compiler's verification, not in whoever (or whatever) wrote the source. As AI generation quality rises over time, the same floor keeps holding — the architecture rides the curve without having to chase it.
+The bet is that the **floor matters, not the average**. Model quality can improve
+or regress without changing the verifier's acceptance rules. A malformed or
+internally inconsistent `.verbose` is rejected rather than repaired or guessed at.
+Acceptance does not prove that the author's intention was wise, or that the whole
+toolchain is free of bugs; it means the declared, mechanically checked contract
+held for that program.
 
 ## How people use it
 
@@ -42,6 +109,20 @@ compiler emits a binary              interpreter, Rust transpiler, native x86-64
 ```
 
 ## What the compiler verifies (and what it does not)
+
+"Verified" is intentionally not used as a synonym for "bug-free". The current
+trust boundary is:
+
+| Property | Current status |
+|---|---|
+| Declared `reads` / `calls` match the AST | Mechanically verified |
+| Declared ranges cover the computed interval | Mechanically verified for supported expressions |
+| Layer discipline and source references | Mechanically verified |
+| Declared effect/resource shapes satisfy the language restrictions | Mechanically verified |
+| `.intent` faithfully became `.verbose` | Human / independent-AI audit |
+| The intention asks for the right domain behavior | Author and auditor responsibility |
+| Native code generation is universally bug-free | Not claimed; tested and progressively self-hosted |
+| The accepted program has no possible vulnerability | Not claimed |
 
 Verified mechanically, against the AST:
 
@@ -67,7 +148,23 @@ See `docs/spec-proofs.md` for a field-by-field classification of *mechanical* (c
 
 - Not a general-purpose language. No ergonomic sugar; every construct has to earn its place by serving verification or optimization.
 - Not an AI replacement for programmers. The human (or the AI) still has to think carefully enough to produce a clean intent. The compiler holds the floor, not the intent.
+- Not an AI-trusting system. Model output is compiler input, never authority.
+- Not a claim of perfect safety. Verbose aims for explicit, bounded, reduced behavior and states each mechanical guarantee narrowly.
 - Not a transpilation target for existing code. Rust/Go/other source → Verbose is deliberately refused: the source has no proofs to translate, and inferring them would violate the zero-trust rule. See `CLAUDE.md` → "Transpilation Strategy".
+
+## Why self-hosting matters here
+
+Self-hosting is not pursued merely as a language milestone. The long-term goal is
+for the compiler enforcing explicit effects, bounded structures, and auditable
+behavior to be subject to the same language constraints itself. That shortens the
+trust chain and makes more of the toolchain open to the same human and independent-
+AI review as ordinary Verbose programs.
+
+This work is in progress, not a completed trust proof. Today the Verbose-written
+compiler front end parses and checks substantial real-language surface, and its
+back end emits native executables for a widening closed subset. It does not yet
+compile its entire own source end-to-end. The exact boundary, milestones, and
+remaining gaps are documented in [`docs/self-hosting.md`](docs/self-hosting.md).
 
 ## Try it in 5 minutes — the synthesis demo
 
@@ -225,8 +322,8 @@ Each binary is zero-dependency native x86-64 (`ldd` shows nothing), the `.verbos
 
 | | |
 |---|---|
-| Lines of Rust | ~17,500, zero external dependencies |
-| Tests | 183, all passing |
+| Lines of Rust | ~61,000, zero external dependencies |
+| Tests | 462 unit tests |
 | Native binary size | **~360 B – ~1.5 KB** for business logic, TCP echo, HTTP services |
 | WASM module size | **58–73 bytes** for browser execution (scalar rules) |
 | Proof checks | Zero-trust verifications against the AST — see `docs/spec-proofs.md` |
