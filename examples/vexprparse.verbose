@@ -7042,6 +7042,14 @@ concept EvalFoldState
 -- In the eval SCC (calls eval_ast_env). Bound-only termination + the native
 -- recursion breadcrumb, same posture as eval_reduce (this rule runs only under
 -- the interpreter --run path, never compiled natively).
+-- COLLECTIONS tier slice 5 NOTE (documented divergence): the accumulator here
+-- is NUMERIC (vnum_of) — the slice-5 TEXT fold (`concat(acc, ...)` body under
+-- `output: text`) is NOT modeled in eval; it would need a Value accumulator
+-- threaded through this recursion. Deferred: eval is not runtime-exercisable
+-- for collection inputs (no collection input path reaches eval_ast_env's
+-- AstFold arm at runtime), so the COMPILED path (x86_stream_node's AstFold
+-- arm, oracle = verbosec Phase 5b) is the tested one. Do not "fix" the
+-- numeric eval without also building the eval-side collection input path.
 rule eval_fold
   @intention: "Fold a collection's element values into a number with a source-named accumulator: acc starts at init, each element's body value replaces acc"
   @source: vexprparse.intent:36
@@ -17577,7 +17585,12 @@ rule ast_texty_shallow
       AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => 0
       AstSum(coll, item_start, item_len, body) => 0
       AstCount(coll, item_start, item_len, body) => 0
-      AstFold(coll, init, acc_start, acc_len, item_start, item_len, body) => 0
+      -- COLLECTIONS tier slice 5: a fold is texty iff its BODY is texty — the
+      -- append-only TEXT fold (`concat(acc, ...)` body) streams; an arithmetic
+      -- body keeps the slice-2 NUMBER fold on the materializing path (0 keeps
+      -- every slice-2 binary byte-identical). Shallow at this depth: this walk
+      -- never follows calls — the same depth discipline every arm shares.
+      AstFold(coll, init, acc_start, acc_len, item_start, item_len, body) => ast_texty_shallow(PrintState { node: body, src: ps.src })
       AstAll(coll, item_start, item_len, body) => 0
       AstAny(coll, item_start, item_len, body) => 0
       -- COLLECTIONS tier slice 4b: map / filter are texty BY DEFINITION (Package B
@@ -17652,7 +17665,14 @@ rule ast_is_texty
       AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => 0
       AstSum(coll, item_start, item_len, body) => 0
       AstCount(coll, item_start, item_len, body) => 0
-      AstFold(coll, init, acc_start, acc_len, item_start, item_len, body) => 0
+      -- COLLECTIONS tier slice 5: a fold is texty iff its BODY is texty (one
+      -- level of call transitivity INSIDE the body, like every other arm of
+      -- this walk). This ONE shared definition routes text-fold rules through
+      -- x86_stream_node + the entrytx trampoline (trailing '\n' free) + the
+      -- anytx itoa proc + blob_end_off — the Package B lesson: never force
+      -- texty locally. A NUMBER-fold body stays 0, so every slice-2 binary is
+      -- byte-identical (SHA-pinned by the slice-5 milestone test).
+      AstFold(coll, init, acc_start, acc_len, item_start, item_len, body) => ast_is_texty(TextyState { node: body, src: ts.src, prog: ts.prog })
       AstAll(coll, item_start, item_len, body) => 0
       AstAny(coll, item_start, item_len, body) => 0
       -- COLLECTIONS tier slice 4b: map / filter are texty BY DEFINITION — the
@@ -19100,11 +19120,16 @@ rule proc_size
     -- x86_proc emits in place of the body. MUST mirror x86_proc's guard.
     let is_coll_body = ast_is_collection_node(result)
     let is_coll_out = if rd_out_ty(pg.rd) == 3 then 1 else 0
-    out = 4 + subsize + storesize + (if is_coll_body != is_coll_out then 1 else if rule_is_texty(pg) == 1 then code_size_stream_node(ByteGenState { node: result, src: pg.src, off: 0, params: rule_params_of(pg.rd), lets: binds, prog: pg.prog, concepts: pg.concepts, sizes: pg.sizes }) + 2 else code_size_node(ByteGenState { node: result, src: pg.src, off: 0, params: rule_params_of(pg.rd), lets: binds, prog: pg.prog, concepts: pg.concepts, sizes: pg.sizes })) + 6
+    -- COLLECTIONS tier slice 5: the fold sibling of the 4b guard — a TEXTY
+    -- fold body (code 2) under a non-text output, or a NUMBER fold body
+    -- (code 1) under a text output, sizes as the 1-byte int3 x86_proc emits.
+    let ftc = ast_fold_texty_code(TextyState { node: result, src: pg.src, prog: pg.prog })
+    let is_text_out = if rd_out_ty(pg.rd) == 2 then 1 else 0
+    out = 4 + subsize + storesize + (if is_coll_body != is_coll_out then 1 else if ftc == 2 and is_text_out == 0 then 1 else if ftc == 1 and is_text_out == 1 then 1 else if rule_is_texty(pg) == 1 then code_size_stream_node(ByteGenState { node: result, src: pg.src, off: 0, params: rule_params_of(pg.rd), lets: binds, prog: pg.prog, concepts: pg.concepts, sizes: pg.sizes }) + 2 else code_size_node(ByteGenState { node: result, src: pg.src, off: 0, params: rule_params_of(pg.rd), lets: binds, prog: pg.prog, concepts: pg.concepts, sizes: pg.sizes })) + 6
   proofs:
     purity:
       reads : [pg, pg.rd, pg.src, pg.prog, pg.concepts, pg.sizes]
-      calls : [rd_body, block_binds, block_result, count_binds, mb_ast, mb_binds, code_size_let_stores, code_size_node, rule_is_texty, code_size_stream_node, rule_params_of, ast_is_collection_node, rd_out_ty]
+      calls : [rd_body, block_binds, block_result, count_binds, mb_ast, mb_binds, code_size_let_stores, code_size_node, rule_is_texty, code_size_stream_node, rule_params_of, ast_is_collection_node, rd_out_ty, ast_fold_texty_code]
     termination:
       bound : 8000
 
@@ -19434,11 +19459,20 @@ rule x86_proc
     -- body disagrees with it must trap, not half-work. proc_size mirrors.
     let is_coll_body = ast_is_collection_node(result)
     let is_coll_out = if rd_out_ty(pg.rd) == 3 then 1 else 0
-    out = concat(b"\x55\x48\x89\xe5", (if nlets + nbind > 0 then concat(b"\x48\x81\xec", le32(8 * (nlets + nbind))) else b""), x86_let_stores(LetGenState { rem: binds, all_binds: binds, src: pg.src, off: pg.off + 4 + subsize, params: rule_params_of(pg.rd), idx: 0, prog: pg.prog, concepts: pg.concepts, sizes: pg.sizes }), (if is_coll_body != is_coll_out then b"\xcc" else if rule_is_texty(pg) == 1 then concat(x86_stream_node(ByteGenState { node: result, src: pg.src, off: pg.off + 4 + subsize + storesize, params: rule_params_of(pg.rd), lets: binds, prog: pg.prog, concepts: pg.concepts, sizes: pg.sizes }), b"\x6a\x00") else x86_node(ByteGenState { node: result, src: pg.src, off: pg.off + 4 + subsize + storesize, params: rule_params_of(pg.rd), lets: binds, prog: pg.prog, concepts: pg.concepts, sizes: pg.sizes })), b"\x58\x48\x89\xec\x5d\xc3")
+    -- COLLECTIONS tier slice 5: the fold sibling of the 4b guard. A TEXTY fold
+    -- body (ast_fold_texty_code 2) under a non-text output would stream bytes
+    -- where the trampoline expects a number in rax; a NUMBER fold body (code
+    -- 1) under a text output would itoa an accumulator where the entrytx
+    -- trampoline expects the proc to have streamed. Both -> int3 in place of
+    -- the body (verbosec refuses both shapes at compile time). proc_size
+    -- mirrors.
+    let ftc = ast_fold_texty_code(TextyState { node: result, src: pg.src, prog: pg.prog })
+    let is_text_out = if rd_out_ty(pg.rd) == 2 then 1 else 0
+    out = concat(b"\x55\x48\x89\xe5", (if nlets + nbind > 0 then concat(b"\x48\x81\xec", le32(8 * (nlets + nbind))) else b""), x86_let_stores(LetGenState { rem: binds, all_binds: binds, src: pg.src, off: pg.off + 4 + subsize, params: rule_params_of(pg.rd), idx: 0, prog: pg.prog, concepts: pg.concepts, sizes: pg.sizes }), (if is_coll_body != is_coll_out then b"\xcc" else if ftc == 2 and is_text_out == 0 then b"\xcc" else if ftc == 1 and is_text_out == 1 then b"\xcc" else if rule_is_texty(pg) == 1 then concat(x86_stream_node(ByteGenState { node: result, src: pg.src, off: pg.off + 4 + subsize + storesize, params: rule_params_of(pg.rd), lets: binds, prog: pg.prog, concepts: pg.concepts, sizes: pg.sizes }), b"\x6a\x00") else x86_node(ByteGenState { node: result, src: pg.src, off: pg.off + 4 + subsize + storesize, params: rule_params_of(pg.rd), lets: binds, prog: pg.prog, concepts: pg.concepts, sizes: pg.sizes })), b"\x58\x48\x89\xec\x5d\xc3")
   proofs:
     purity:
       reads : [pg, pg.rd, pg.src, pg.off, pg.prog, pg.concepts, pg.sizes]
-      calls : [rd_body, block_binds, block_result, count_binds, mb_ast, mb_binds, code_size_let_stores, x86_let_stores, x86_node, rule_is_texty, x86_stream_node, rule_params_of, ast_is_collection_node, rd_out_ty]
+      calls : [rd_body, block_binds, block_result, count_binds, mb_ast, mb_binds, code_size_let_stores, x86_let_stores, x86_node, rule_is_texty, x86_stream_node, rule_params_of, ast_is_collection_node, rd_out_ty, ast_fold_texty_code]
     termination:
       bound : 8000
 
@@ -19494,7 +19528,18 @@ rule code_size_stream_node
       AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => 1
       AstSum(coll, item_start, item_len, body) => 1
       AstCount(coll, item_start, item_len, body) => 1
-      AstFold(coll, init, acc_start, acc_len, item_start, item_len, body) => 1
+      -- COLLECTIONS tier slice 5: the STREAMED text fold. Constants (MUST track
+      -- x86_stream_node's AstFold arm arm-for-arm — the drift edge): scalar
+      -- 155 = count-read 68 (pop r9 2 + mov rsi,[r9] 3 + atoi 56 + mov r8,rax 3
+      -- + add r9,8 4) + test/jz 9 + element atoi+store 66 + loop tail 12
+      -- (add r9,8 4 + dec r8 3 + jmp 5); record 72*nf + 115 = 68 + 9 + elem
+      -- load (72*nf + 26) + 12. Plus the STREAMED init (code_size_stream_node
+      -- — it writes before the loop registers go live) + the coll value ops
+      -- (code_size_node) + the rest args (fold_size_cargs, sized under the
+      -- item binder scope — the acc is NEVER bound: it is the stream prefix
+      -- already written). A non-append-only body sizes as the 1-byte int3 the
+      -- emit substitutes (fold_stream_ok — identical inputs in both passes).
+      AstFold(coll, init, acc_start, acc_len, item_start, item_len, body) => if fold_stream_ok(FoldBodyCheck { body: body, src: bg.src, acc_start: acc_start, acc_len: acc_len }) == 0 then 1 else if coll_elem_nfields(StaticConceptState { node: coll, src: bg.src, params: bg.params, lets: bg.lets, concepts: bg.concepts }) > 0 then (code_size_stream_node(ByteGenState { node: init, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + code_size_node(ByteGenState { node: coll, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + fold_size_cargs(ByteGenArgs { args: arg_rest(ast_call_args(body)), src: bg.src, off: 0, params: bg.params, lets: lets_append_elem_binders(AppendElemBindersState { lets: bg.lets, item_start: item_start, item_len: item_len, second_start: 0, second_len: 0, cstart: cd_name_start(concept_at_index(ConceptAtState { concepts: bg.concepts, idx: static_concept_of(StaticConceptState { node: coll, src: bg.src, params: bg.params, lets: bg.lets, concepts: bg.concepts }) })), clen: cd_name_len(concept_at_index(ConceptAtState { concepts: bg.concepts, idx: static_concept_of(StaticConceptState { node: coll, src: bg.src, params: bg.params, lets: bg.lets, concepts: bg.concepts }) })) }), prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + 72 * coll_elem_nfields(StaticConceptState { node: coll, src: bg.src, params: bg.params, lets: bg.lets, concepts: bg.concepts }) + 115) else (code_size_stream_node(ByteGenState { node: init, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + code_size_node(ByteGenState { node: coll, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + fold_size_cargs(ByteGenArgs { args: arg_rest(ast_call_args(body)), src: bg.src, off: 0, params: bg.params, lets: lets_append_binders(AppendBindersState { lets: bg.lets, bs: BinderList::BindCons { start: item_start, len: item_len, rest: BinderList::BindCons { start: 0, len: 0, rest: BinderList::BindNil } } }), prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + 155)
       AstAll(coll, item_start, item_len, body) => 1
       AstAny(coll, item_start, item_len, body) => 1
       -- COLLECTIONS tier slice 4b: the STREAMED map / filter loops. Fixed-byte
@@ -19520,7 +19565,7 @@ rule code_size_stream_node
   proofs:
     purity:
       reads : [bg, bg.node, bg.src, bg.off, bg.params, bg.lets, bg.prog, bg.concepts, bg.sizes]
-      calls : [code_size_node, code_size_stream_node, stream_size_cargs, stream_size_arms, code_size_args, param_index, param_ty, let_index, arm_list_len, span_is_concat, span_is_arena_scope, arg_first, span_is_le32, span_is_le64, span_is_substring, span_is_byte_at, span_is_length, callee_is_texty, bytelit_decoded_len, coll_elem_nfields, lets_append_binders]
+      calls : [code_size_node, code_size_stream_node, stream_size_cargs, stream_size_arms, code_size_args, param_index, param_ty, let_index, arm_list_len, span_is_concat, span_is_arena_scope, arg_first, span_is_le32, span_is_le64, span_is_substring, span_is_byte_at, span_is_length, callee_is_texty, bytelit_decoded_len, coll_elem_nfields, lets_append_binders, fold_stream_ok, ast_call_args, arg_rest, fold_size_cargs, lets_append_elem_binders, static_concept_of, cd_name_start, cd_name_len, concept_at_index]
     termination:
       bound : 8000
 
@@ -19661,7 +19706,29 @@ rule x86_stream_node
       AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => b"\xcc"
       AstSum(coll, item_start, item_len, body) => b"\xcc"
       AstCount(coll, item_start, item_len, body) => b"\xcc"
-      AstFold(coll, init, acc_start, acc_len, item_start, item_len, body) => b"\xcc"
+      -- COLLECTIONS tier slice 5: the STREAMED text fold. verbosec Phase 5b
+      -- materializes (two-pass sizing, buffer, single write); the streamed
+      -- lowering of the SAME append-only body — `concat(acc, ...rest)` with
+      -- acc absent from rest — is just: stream the INIT text (before the loop
+      -- registers go live, so an init itoa clobbering r9 is harmless), then
+      -- per element stream EACH rest arg in order (arg 0 = acc SKIPPED — the
+      -- accumulator never materializes, it IS the stream prefix already
+      -- written). Same stdout bytes as verbosec, different production
+      -- strategy; the trailing '\n' is the entrytx trampoline's. Loop
+      -- skeleton = slice 1's (r8 remaining count, r9 argv cursor; scalar
+      -- element via the single atoi into the item slot, record element via
+      -- the slice-6 arena load with the AstVariant-RHS binder trick so
+      -- `o.field` resolves). The item binder binds normally; the acc binder
+      -- is NOT bound — fold_stream_ok guarantees no body site reads it except
+      -- the skipped arg 0, and any out-of-shape body emits ONE int3 (verbosec
+      -- refuses the same shapes at compile time). Loop rel32s: scalar jz
+      -- forward 78 + R / jmp back -(87 + R); record jz 72*nf + 38 + R / back
+      -- -(72*nf + 47 + R), R = fold_size_cargs of the rest args. Rest args
+      -- start at bg.off + init + coll + 143 (scalar; 68 count-read + 9
+      -- test/jz + 66 element load) / + 72*nf + 103 (record; elem load is
+      -- 72*nf + 26). code_size_stream_node mirrors byte-for-byte (constants
+      -- 155 / 72*nf + 115 — the drift edge).
+      AstFold(coll, init, acc_start, acc_len, item_start, item_len, body) => if fold_stream_ok(FoldBodyCheck { body: body, src: bg.src, acc_start: acc_start, acc_len: acc_len }) == 0 then b"\xcc" else if coll_elem_nfields(StaticConceptState { node: coll, src: bg.src, params: bg.params, lets: bg.lets, concepts: bg.concepts }) > 0 then concat(x86_stream_node(ByteGenState { node: init, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }), x86_node(ByteGenState { node: coll, src: bg.src, off: bg.off + code_size_stream_node(ByteGenState { node: init, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }), params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }), b"\x41\x59\x49\x8b\x31", b"\x48\x31\xc0\x45\x31\xdb\x8a\x0e\x80\xf9\x2d\x75\x06\x41\xb3\x01\x48\xff\xc6\x0f\xb6\x0e\x80\xf9\x30\x72\x15\x80\xf9\x39\x77\x10\x48\x6b\xc0\x0a\x48\x83\xe9\x30\x48\x01\xc8\x48\xff\xc6\xeb\xe3\x4d\x85\xdb\x74\x03\x48\xf7\xd8", b"\x49\x89\xc0\x49\x83\xc1\x08", b"\x4d\x85\xc0\x0f\x84", le32(72 * coll_elem_nfields(StaticConceptState { node: coll, src: bg.src, params: bg.params, lets: bg.lets, concepts: bg.concepts }) + 38 + fold_size_cargs(ByteGenArgs { args: arg_rest(ast_call_args(body)), src: bg.src, off: 0, params: bg.params, lets: lets_append_elem_binders(AppendElemBindersState { lets: bg.lets, item_start: item_start, item_len: item_len, second_start: 0, second_len: 0, cstart: cd_name_start(concept_at_index(ConceptAtState { concepts: bg.concepts, idx: static_concept_of(StaticConceptState { node: coll, src: bg.src, params: bg.params, lets: bg.lets, concepts: bg.concepts }) })), clen: cd_name_len(concept_at_index(ConceptAtState { concepts: bg.concepts, idx: static_concept_of(StaticConceptState { node: coll, src: bg.src, params: bg.params, lets: bg.lets, concepts: bg.concepts }) })) }), prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes })), x86_elem_load(ElemLoadState { nf: coll_elem_nfields(StaticConceptState { node: coll, src: bg.src, params: bg.params, lets: bg.lets, concepts: bg.concepts }), tag: static_concept_of(StaticConceptState { node: coll, src: bg.src, params: bg.params, lets: bg.lets, concepts: bg.concepts }) * 256, esize: 8 * (max_payload_fields(bg.concepts) + 1), x_disp: 0 - 8 * (count_binds(bg.lets) + 1) }), x86_fold_cargs(ByteGenArgs { args: arg_rest(ast_call_args(body)), src: bg.src, off: bg.off + code_size_stream_node(ByteGenState { node: init, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + code_size_node(ByteGenState { node: coll, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + 72 * coll_elem_nfields(StaticConceptState { node: coll, src: bg.src, params: bg.params, lets: bg.lets, concepts: bg.concepts }) + 103, params: bg.params, lets: lets_append_elem_binders(AppendElemBindersState { lets: bg.lets, item_start: item_start, item_len: item_len, second_start: 0, second_len: 0, cstart: cd_name_start(concept_at_index(ConceptAtState { concepts: bg.concepts, idx: static_concept_of(StaticConceptState { node: coll, src: bg.src, params: bg.params, lets: bg.lets, concepts: bg.concepts }) })), clen: cd_name_len(concept_at_index(ConceptAtState { concepts: bg.concepts, idx: static_concept_of(StaticConceptState { node: coll, src: bg.src, params: bg.params, lets: bg.lets, concepts: bg.concepts }) })) }), prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }), b"\x49\x83\xc1\x08\x49\xff\xc8\xe9", le32(0 - (72 * coll_elem_nfields(StaticConceptState { node: coll, src: bg.src, params: bg.params, lets: bg.lets, concepts: bg.concepts }) + 47 + fold_size_cargs(ByteGenArgs { args: arg_rest(ast_call_args(body)), src: bg.src, off: 0, params: bg.params, lets: lets_append_elem_binders(AppendElemBindersState { lets: bg.lets, item_start: item_start, item_len: item_len, second_start: 0, second_len: 0, cstart: cd_name_start(concept_at_index(ConceptAtState { concepts: bg.concepts, idx: static_concept_of(StaticConceptState { node: coll, src: bg.src, params: bg.params, lets: bg.lets, concepts: bg.concepts }) })), clen: cd_name_len(concept_at_index(ConceptAtState { concepts: bg.concepts, idx: static_concept_of(StaticConceptState { node: coll, src: bg.src, params: bg.params, lets: bg.lets, concepts: bg.concepts }) })) }), prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes })))) else concat(x86_stream_node(ByteGenState { node: init, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }), x86_node(ByteGenState { node: coll, src: bg.src, off: bg.off + code_size_stream_node(ByteGenState { node: init, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }), params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }), b"\x41\x59\x49\x8b\x31", b"\x48\x31\xc0\x45\x31\xdb\x8a\x0e\x80\xf9\x2d\x75\x06\x41\xb3\x01\x48\xff\xc6\x0f\xb6\x0e\x80\xf9\x30\x72\x15\x80\xf9\x39\x77\x10\x48\x6b\xc0\x0a\x48\x83\xe9\x30\x48\x01\xc8\x48\xff\xc6\xeb\xe3\x4d\x85\xdb\x74\x03\x48\xf7\xd8", b"\x49\x89\xc0\x49\x83\xc1\x08", b"\x4d\x85\xc0\x0f\x84", le32(78 + fold_size_cargs(ByteGenArgs { args: arg_rest(ast_call_args(body)), src: bg.src, off: 0, params: bg.params, lets: lets_append_binders(AppendBindersState { lets: bg.lets, bs: BinderList::BindCons { start: item_start, len: item_len, rest: BinderList::BindCons { start: 0, len: 0, rest: BinderList::BindNil } } }), prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes })), b"\x49\x8b\x31", b"\x48\x31\xc0\x45\x31\xdb\x8a\x0e\x80\xf9\x2d\x75\x06\x41\xb3\x01\x48\xff\xc6\x0f\xb6\x0e\x80\xf9\x30\x72\x15\x80\xf9\x39\x77\x10\x48\x6b\xc0\x0a\x48\x83\xe9\x30\x48\x01\xc8\x48\xff\xc6\xeb\xe3\x4d\x85\xdb\x74\x03\x48\xf7\xd8", b"\x48\x89\x85", le32(0 - 8 * (count_binds(bg.lets) + 1)), x86_fold_cargs(ByteGenArgs { args: arg_rest(ast_call_args(body)), src: bg.src, off: bg.off + code_size_stream_node(ByteGenState { node: init, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + code_size_node(ByteGenState { node: coll, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + 143, params: bg.params, lets: lets_append_binders(AppendBindersState { lets: bg.lets, bs: BinderList::BindCons { start: item_start, len: item_len, rest: BinderList::BindCons { start: 0, len: 0, rest: BinderList::BindNil } } }), prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }), b"\x49\x83\xc1\x08\x49\xff\xc8\xe9", le32(0 - (87 + fold_size_cargs(ByteGenArgs { args: arg_rest(ast_call_args(body)), src: bg.src, off: 0, params: bg.params, lets: lets_append_binders(AppendBindersState { lets: bg.lets, bs: BinderList::BindCons { start: item_start, len: item_len, rest: BinderList::BindCons { start: 0, len: 0, rest: BinderList::BindNil } } }), prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }))))
       AstAll(coll, item_start, item_len, body) => b"\xcc"
       AstAny(coll, item_start, item_len, body) => b"\xcc"
       -- COLLECTIONS tier slice 4b: the STREAMED map / filter loops — the slice-1
@@ -19690,7 +19757,7 @@ rule x86_stream_node
   proofs:
     purity:
       reads : [bg, bg.node, bg.src, bg.off, bg.params, bg.lets, bg.prog, bg.concepts, bg.sizes]
-      calls : [x86_node, code_size_node, x86_stream_node, code_size_stream_node, x86_stream_cargs, x86_stream_dispatch, x86_stream_arms, stream_size_arms, x86_args, code_size_args, param_index, param_ty, param_list_len, let_index, arm_list_len, max_payload_fields, proc_offset, arg_list_len, blob_end_off, span_is_concat, span_is_arena_scope, arg_first, span_is_le32, span_is_le64, span_is_substring, span_is_byte_at, span_is_length, callee_is_texty, bytelit_decoded_len, emit_bytes_data, coll_elem_nfields, lets_append_binders, count_binds]
+      calls : [x86_node, code_size_node, x86_stream_node, code_size_stream_node, x86_stream_cargs, x86_stream_dispatch, x86_stream_arms, stream_size_arms, x86_args, code_size_args, param_index, param_ty, param_list_len, let_index, arm_list_len, max_payload_fields, proc_offset, arg_list_len, blob_end_off, span_is_concat, span_is_arena_scope, arg_first, span_is_le32, span_is_le64, span_is_substring, span_is_byte_at, span_is_length, callee_is_texty, bytelit_decoded_len, emit_bytes_data, coll_elem_nfields, lets_append_binders, count_binds, fold_stream_ok, ast_call_args, arg_rest, x86_fold_cargs, fold_size_cargs, x86_elem_load, lets_append_elem_binders, static_concept_of, cd_name_start, cd_name_len, concept_at_index]
     termination:
       bound : 8000
 
@@ -19759,6 +19826,531 @@ rule x86_stream_arms
     purity:
       reads : [ag.arms, ag.src, ag.off, ag.params, ag.lets, ag.prog, ag.concepts, ag.sizes]
       calls : [x86_binder_loads, x86_stream_node, code_size_stream_node, stream_size_arms, lets_append_binders, binder_list_len, count_binds, x86_stream_arms]
+    termination:
+      bound : 8000
+
+
+-- ============================================================================
+-- COLLECTIONS tier slice 5 — the STREAMED TEXT FOLD (verbosec Phase 5b parity).
+-- A rule whose body is `fold(coll, "init", acc, item => concat(acc, ...rest))`
+-- with `output: text` routes texty (ast_is_texty's AstFold arm follows the
+-- body) and lands in x86_stream_node's AstFold arm. The lowering STREAMS where
+-- verbosec MATERIALIZES (two-pass sizing + buffer + single write): stream the
+-- init text, then per element stream each rest arg in source order. The
+-- accumulator NEVER exists at runtime — it IS the stream prefix already
+-- written — so the acc binder is NOT bound to a readable slot (the append-only
+-- validation guarantees no body site reads it except concat arg 0, which the
+-- emit skips). Output is BYTE-IDENTICAL to verbosec's Phase 5b (same bytes,
+-- different production strategy); the trailing '\n' comes from the entrytx
+-- trampoline. Append-only violations (body not a concat, first arg not the
+-- acc var, acc referenced in the rest args) emit int3 for the whole fold —
+-- verbosec refuses the same shapes at compile time.
+-- ============================================================================
+
+-- SpanUseState: an AST node + the source + a query name span, for the
+-- does-this-subtree-reference-this-name walk (the append-only validation).
+concept SpanUseState
+  @intention: "An AST node + source + a query name span, for the uses-span walk"
+  @source: vexprparse.intent:70
+  fields:
+    node : Ast
+    src : text [..256]
+    q_start : number [0, 4000000]
+    q_len : number [0, 4000000]
+
+
+concept SpanUseArgs
+  @intention: "A call's argument list + source + a query name span, for the uses-span walk"
+  @source: vexprparse.intent:70
+  fields:
+    args : ArgList
+    src : text [..256]
+    q_start : number [0, 4000000]
+    q_len : number [0, 4000000]
+
+
+concept SpanUseArms
+  @intention: "A match's arm list + source + a query name span, for the uses-span walk"
+  @source: vexprparse.intent:70
+  fields:
+    arms : ArmList
+    src : text [..256]
+    q_start : number [0, 4000000]
+    q_len : number [0, 4000000]
+
+
+concept SpanUseVFields
+  @intention: "A variant construction's field list + source + a query name span, for the uses-span walk"
+  @source: vexprparse.intent:70
+  fields:
+    fields : VFieldList
+    src : text [..256]
+    q_start : number [0, 4000000]
+    q_len : number [0, 4000000]
+
+
+-- ast_var_is_span: 1 iff the node is EXACTLY an AstVar whose span text equals
+-- the query span (length first, then name_eq bytes). The fold_stream_ok
+-- first-arg check: concat's arg 0 must BE the accumulator variable.
+rule ast_var_is_span
+  @intention: "1 if the node is exactly an AstVar whose span text equals the query span, 0 otherwise"
+  @source: vexprparse.intent:70
+  input:
+    su : SpanUseState
+  output:
+    out : number
+  logic:
+    out = match su.node:
+      AstNum(value) => 0
+      AstBin(op, lhs, rhs) => 0
+      AstNeg(inner) => 0
+      AstNot(inner) => 0
+      AstVar(start, len) => if len == su.q_len and name_eq(NameEqState { src: su.src, a_start: start, b_start: su.q_start, len: su.q_len, off: 0 }) == 1 then 1 else 0
+      AstField(base, fstart, flen) => 0
+      AstCall(callee_start, callee_len, args) => 0
+      AstStr(start, len) => 0
+      AstBytes(start, len) => 0
+      AstBool(value) => 0
+      AstIf(cond, thn, els) => 0
+      AstErr => 0
+      AstVariant(cstart, clen, vstart, vlen, fields) => 0
+      AstMatch(scrut, arms) => 0
+      AstOk(inner) => 0
+      AstResErr(inner) => 0
+      AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => 0
+      AstSum(coll, item_start, item_len, body) => 0
+      AstCount(coll, item_start, item_len, body) => 0
+      AstFold(coll, init, acc_start, acc_len, item_start, item_len, body) => 0
+      AstAll(coll, item_start, item_len, body) => 0
+      AstAny(coll, item_start, item_len, body) => 0
+      AstMap(coll, item_start, item_len, body) => 0
+      AstFilter(coll, item_start, item_len, body) => 0
+  proofs:
+    purity:
+      reads : [su.node, su.src, su.q_start, su.q_len]
+      calls : [name_eq]
+    termination:
+      bound : 64
+
+
+-- ast_uses_span: 1 iff ANY AstVar in the subtree matches the query span text.
+-- The self-hosted sibling of verbosec's expr_mentions_ident (native.rs) — the
+-- append-only invariant's "acc appears NOWHERE in the rest args" walk. No
+-- shadow awareness (a nested binder reusing the name still counts) — the
+-- conservative direction, refusal-only, same posture as verbosec's walk.
+rule ast_uses_span
+  @intention: "1 if any variable in the subtree matches the query name span, 0 otherwise"
+  @source: vexprparse.intent:70
+  input:
+    su : SpanUseState
+  output:
+    out : number
+  logic:
+    out = match su.node:
+      AstNum(value) => 0
+      AstBin(op, lhs, rhs) => if ast_uses_span(SpanUseState { node: lhs, src: su.src, q_start: su.q_start, q_len: su.q_len }) == 1 then 1 else ast_uses_span(SpanUseState { node: rhs, src: su.src, q_start: su.q_start, q_len: su.q_len })
+      AstNeg(inner) => ast_uses_span(SpanUseState { node: inner, src: su.src, q_start: su.q_start, q_len: su.q_len })
+      AstNot(inner) => ast_uses_span(SpanUseState { node: inner, src: su.src, q_start: su.q_start, q_len: su.q_len })
+      AstVar(start, len) => if len == su.q_len and name_eq(NameEqState { src: su.src, a_start: start, b_start: su.q_start, len: su.q_len, off: 0 }) == 1 then 1 else 0
+      AstField(base, fstart, flen) => ast_uses_span(SpanUseState { node: base, src: su.src, q_start: su.q_start, q_len: su.q_len })
+      AstCall(callee_start, callee_len, args) => args_use_span(SpanUseArgs { args: args, src: su.src, q_start: su.q_start, q_len: su.q_len })
+      AstStr(start, len) => 0
+      AstBytes(start, len) => 0
+      AstBool(value) => 0
+      AstIf(cond, thn, els) => if ast_uses_span(SpanUseState { node: cond, src: su.src, q_start: su.q_start, q_len: su.q_len }) == 1 then 1 else if ast_uses_span(SpanUseState { node: thn, src: su.src, q_start: su.q_start, q_len: su.q_len }) == 1 then 1 else ast_uses_span(SpanUseState { node: els, src: su.src, q_start: su.q_start, q_len: su.q_len })
+      AstErr => 0
+      AstVariant(cstart, clen, vstart, vlen, fields) => vfields_use_span(SpanUseVFields { fields: fields, src: su.src, q_start: su.q_start, q_len: su.q_len })
+      AstMatch(scrut, arms) => if ast_uses_span(SpanUseState { node: scrut, src: su.src, q_start: su.q_start, q_len: su.q_len }) == 1 then 1 else arms_use_span(SpanUseArms { arms: arms, src: su.src, q_start: su.q_start, q_len: su.q_len })
+      AstOk(inner) => ast_uses_span(SpanUseState { node: inner, src: su.src, q_start: su.q_start, q_len: su.q_len })
+      AstResErr(inner) => ast_uses_span(SpanUseState { node: inner, src: su.src, q_start: su.q_start, q_len: su.q_len })
+      AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => if ast_uses_span(SpanUseState { node: scrut, src: su.src, q_start: su.q_start, q_len: su.q_len }) == 1 then 1 else if ast_uses_span(SpanUseState { node: ok_body, src: su.src, q_start: su.q_start, q_len: su.q_len }) == 1 then 1 else ast_uses_span(SpanUseState { node: err_body, src: su.src, q_start: su.q_start, q_len: su.q_len })
+      AstSum(coll, item_start, item_len, body) => if ast_uses_span(SpanUseState { node: coll, src: su.src, q_start: su.q_start, q_len: su.q_len }) == 1 then 1 else ast_uses_span(SpanUseState { node: body, src: su.src, q_start: su.q_start, q_len: su.q_len })
+      AstCount(coll, item_start, item_len, body) => if ast_uses_span(SpanUseState { node: coll, src: su.src, q_start: su.q_start, q_len: su.q_len }) == 1 then 1 else ast_uses_span(SpanUseState { node: body, src: su.src, q_start: su.q_start, q_len: su.q_len })
+      AstFold(coll, init, acc_start, acc_len, item_start, item_len, body) => if ast_uses_span(SpanUseState { node: coll, src: su.src, q_start: su.q_start, q_len: su.q_len }) == 1 then 1 else if ast_uses_span(SpanUseState { node: init, src: su.src, q_start: su.q_start, q_len: su.q_len }) == 1 then 1 else ast_uses_span(SpanUseState { node: body, src: su.src, q_start: su.q_start, q_len: su.q_len })
+      AstAll(coll, item_start, item_len, body) => if ast_uses_span(SpanUseState { node: coll, src: su.src, q_start: su.q_start, q_len: su.q_len }) == 1 then 1 else ast_uses_span(SpanUseState { node: body, src: su.src, q_start: su.q_start, q_len: su.q_len })
+      AstAny(coll, item_start, item_len, body) => if ast_uses_span(SpanUseState { node: coll, src: su.src, q_start: su.q_start, q_len: su.q_len }) == 1 then 1 else ast_uses_span(SpanUseState { node: body, src: su.src, q_start: su.q_start, q_len: su.q_len })
+      AstMap(coll, item_start, item_len, body) => if ast_uses_span(SpanUseState { node: coll, src: su.src, q_start: su.q_start, q_len: su.q_len }) == 1 then 1 else ast_uses_span(SpanUseState { node: body, src: su.src, q_start: su.q_start, q_len: su.q_len })
+      AstFilter(coll, item_start, item_len, body) => if ast_uses_span(SpanUseState { node: coll, src: su.src, q_start: su.q_start, q_len: su.q_len }) == 1 then 1 else ast_uses_span(SpanUseState { node: body, src: su.src, q_start: su.q_start, q_len: su.q_len })
+  proofs:
+    purity:
+      reads : [su.node, su.src, su.q_start, su.q_len]
+      calls : [ast_uses_span, args_use_span, arms_use_span, vfields_use_span, name_eq]
+    termination:
+      bound : 8000
+
+
+-- args_use_span: the uses-span walk over a call's argument list. Early-out 1
+-- on the first argument whose subtree matches; ArgNil -> 0.
+rule args_use_span
+  @intention: "1 if any call argument's subtree references the query name span, 0 otherwise"
+  @source: vexprparse.intent:70
+  input:
+    sa : SpanUseArgs
+  output:
+    out : number
+  logic:
+    out = match sa.args:
+      ArgCons(head, tail) => if ast_uses_span(SpanUseState { node: head, src: sa.src, q_start: sa.q_start, q_len: sa.q_len }) == 1 then 1 else args_use_span(SpanUseArgs { args: tail, src: sa.src, q_start: sa.q_start, q_len: sa.q_len })
+      ArgNil => 0
+  proofs:
+    purity:
+      reads : [sa.args, sa.src, sa.q_start, sa.q_len]
+      calls : [ast_uses_span, args_use_span]
+    termination:
+      bound : 8000
+
+
+-- vfields_use_span: the uses-span walk over a variant construction's field
+-- initializers. VFNil -> 0.
+rule vfields_use_span
+  @intention: "1 if any variant-construction field value references the query name span, 0 otherwise"
+  @source: vexprparse.intent:70
+  input:
+    sv : SpanUseVFields
+  output:
+    out : number
+  logic:
+    out = match sv.fields:
+      VFCons(name_start, name_len, val, rest) => if ast_uses_span(SpanUseState { node: val, src: sv.src, q_start: sv.q_start, q_len: sv.q_len }) == 1 then 1 else vfields_use_span(SpanUseVFields { fields: rest, src: sv.src, q_start: sv.q_start, q_len: sv.q_len })
+      VFNil => 0
+  proofs:
+    purity:
+      reads : [sv.fields, sv.src, sv.q_start, sv.q_len]
+      calls : [ast_uses_span, vfields_use_span]
+    termination:
+      bound : 8000
+
+
+-- arms_use_span: the uses-span walk over a match's arm bodies (binders are
+-- name spans, not values — shadowing deliberately ignored, see ast_uses_span).
+rule arms_use_span
+  @intention: "1 if any match arm body's subtree references the query name span, 0 otherwise"
+  @source: vexprparse.intent:70
+  input:
+    sm : SpanUseArms
+  output:
+    out : number
+  logic:
+    out = match sm.arms:
+      ArmCons(vstart, vlen, binders, body, rest) => if ast_uses_span(SpanUseState { node: body, src: sm.src, q_start: sm.q_start, q_len: sm.q_len }) == 1 then 1 else arms_use_span(SpanUseArms { arms: rest, src: sm.src, q_start: sm.q_start, q_len: sm.q_len })
+      ArmNil => 0
+  proofs:
+    purity:
+      reads : [sm.arms, sm.src, sm.q_start, sm.q_len]
+      calls : [ast_uses_span, arms_use_span]
+    termination:
+      bound : 8000
+
+
+-- FoldBodyCheck: a fold's body node + the source + the accumulator's name span,
+-- for the append-only shape validation.
+concept FoldBodyCheck
+  @intention: "A fold body + source + the accumulator name span, for the append-only validation"
+  @source: vexprparse.intent:70
+  fields:
+    body : Ast
+    src : text [..256]
+    acc_start : number [0, 4000000]
+    acc_len : number [0, 4000000]
+
+
+-- fold_stream_ok: 1 iff a fold body is the streamable append-only shape —
+-- `concat(acc, ...rest)` with arg 0 EXACTLY the accumulator variable and the
+-- acc span appearing NOWHERE in the rest args. Mirrors verbosec Phase 5b's
+-- refusals ("first arg of fold-body concat must be the accumulator" /
+-- "accumulator may only appear as the first arg"). 0 -> the emit is one int3
+-- (fail-graceful, the tier's out-of-subset posture). Consulted by BOTH
+-- x86_stream_node and code_size_stream_node with identical inputs — the
+-- two-pass drift edge.
+rule fold_stream_ok
+  @intention: "1 if a fold body is the append-only streamable shape concat(acc, ...rest) with acc absent from rest, 0 otherwise"
+  @source: vexprparse.intent:70
+  input:
+    fc : FoldBodyCheck
+  output:
+    out : number
+  logic:
+    out = match fc.body:
+      AstNum(value) => 0
+      AstBin(op, lhs, rhs) => 0
+      AstNeg(inner) => 0
+      AstNot(inner) => 0
+      AstVar(start, len) => 0
+      AstField(base, fstart, flen) => 0
+      AstCall(callee_start, callee_len, args) => if span_is_concat(SpanCheck { src: fc.src, start: callee_start, len: callee_len }) == 1 then (if ast_var_is_span(SpanUseState { node: arg_first(args), src: fc.src, q_start: fc.acc_start, q_len: fc.acc_len }) == 1 then (if args_use_span(SpanUseArgs { args: arg_rest(args), src: fc.src, q_start: fc.acc_start, q_len: fc.acc_len }) == 1 then 0 else 1) else 0) else 0
+      AstStr(start, len) => 0
+      AstBytes(start, len) => 0
+      AstBool(value) => 0
+      AstIf(cond, thn, els) => 0
+      AstErr => 0
+      AstVariant(cstart, clen, vstart, vlen, fields) => 0
+      AstMatch(scrut, arms) => 0
+      AstOk(inner) => 0
+      AstResErr(inner) => 0
+      AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => 0
+      AstSum(coll, item_start, item_len, body) => 0
+      AstCount(coll, item_start, item_len, body) => 0
+      AstFold(coll, init, acc_start, acc_len, item_start, item_len, body) => 0
+      AstAll(coll, item_start, item_len, body) => 0
+      AstAny(coll, item_start, item_len, body) => 0
+      AstMap(coll, item_start, item_len, body) => 0
+      AstFilter(coll, item_start, item_len, body) => 0
+  proofs:
+    purity:
+      reads : [fc.body, fc.src, fc.acc_start, fc.acc_len]
+      calls : [span_is_concat, ast_var_is_span, args_use_span, arg_first, arg_rest]
+    termination:
+      bound : 64
+
+
+-- ast_call_args: the argument list of an AstCall node (ArgNil for every other
+-- shape). The fold emit's rest-arg extractor: fold_stream_ok has already
+-- guaranteed the body IS a concat call, so the ArgNil fallback never feeds a
+-- validated emit.
+rule ast_call_args
+  @intention: "The argument list of an AstCall node, or ArgNil for any other shape"
+  @source: vexprparse.intent:70
+  input:
+    n : Ast
+  output:
+    out : ArgList
+  logic:
+    out = match n:
+      AstNum(value) => ArgList::ArgNil
+      AstBin(op, lhs, rhs) => ArgList::ArgNil
+      AstNeg(inner) => ArgList::ArgNil
+      AstNot(inner) => ArgList::ArgNil
+      AstVar(start, len) => ArgList::ArgNil
+      AstField(base, fstart, flen) => ArgList::ArgNil
+      AstCall(callee_start, callee_len, args) => args
+      AstStr(start, len) => ArgList::ArgNil
+      AstBytes(start, len) => ArgList::ArgNil
+      AstBool(value) => ArgList::ArgNil
+      AstIf(cond, thn, els) => ArgList::ArgNil
+      AstErr => ArgList::ArgNil
+      AstVariant(cstart, clen, vstart, vlen, fields) => ArgList::ArgNil
+      AstMatch(scrut, arms) => ArgList::ArgNil
+      AstOk(inner) => ArgList::ArgNil
+      AstResErr(inner) => ArgList::ArgNil
+      AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => ArgList::ArgNil
+      AstSum(coll, item_start, item_len, body) => ArgList::ArgNil
+      AstCount(coll, item_start, item_len, body) => ArgList::ArgNil
+      AstFold(coll, init, acc_start, acc_len, item_start, item_len, body) => ArgList::ArgNil
+      AstAll(coll, item_start, item_len, body) => ArgList::ArgNil
+      AstAny(coll, item_start, item_len, body) => ArgList::ArgNil
+      AstMap(coll, item_start, item_len, body) => ArgList::ArgNil
+      AstFilter(coll, item_start, item_len, body) => ArgList::ArgNil
+  proofs:
+    purity:
+      reads : [n]
+      calls : []
+    termination:
+      bound : 64
+
+
+-- arg_rest: an argument list minus its head (empty stays empty). The sibling
+-- of arg_first; the fold emit skips concat arg 0 (the accumulator) with it.
+rule arg_rest
+  @intention: "The tail of an argument list (empty if already empty)"
+  @source: vexprparse.intent:70
+  input:
+    al : ArgList
+  output:
+    out : ArgList
+  logic:
+    out = match al:
+      ArgCons(head, tail) => tail
+      ArgNil => ArgList::ArgNil
+  proofs:
+    purity:
+      reads : [al]
+      calls : []
+    termination:
+      bound : 16
+
+
+-- ast_is_str: 1 iff the node is a string literal. x86_fold_arg's dispatch: a
+-- literal streams via the AstStr write; every other texty shape is out of the
+-- fold-arg subset (int3).
+rule ast_is_str
+  @intention: "1 if the AST node is a string literal, 0 otherwise"
+  @source: vexprparse.intent:70
+  input:
+    n : Ast
+  output:
+    out : number
+  logic:
+    out = match n:
+      AstNum(value) => 0
+      AstBin(op, lhs, rhs) => 0
+      AstNeg(inner) => 0
+      AstNot(inner) => 0
+      AstVar(start, len) => 0
+      AstField(base, fstart, flen) => 0
+      AstCall(callee_start, callee_len, args) => 0
+      AstStr(start, len) => 1
+      AstBytes(start, len) => 0
+      AstBool(value) => 0
+      AstIf(cond, thn, els) => 0
+      AstErr => 0
+      AstVariant(cstart, clen, vstart, vlen, fields) => 0
+      AstMatch(scrut, arms) => 0
+      AstOk(inner) => 0
+      AstResErr(inner) => 0
+      AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => 0
+      AstSum(coll, item_start, item_len, body) => 0
+      AstCount(coll, item_start, item_len, body) => 0
+      AstFold(coll, init, acc_start, acc_len, item_start, item_len, body) => 0
+      AstAll(coll, item_start, item_len, body) => 0
+      AstAny(coll, item_start, item_len, body) => 0
+      AstMap(coll, item_start, item_len, body) => 0
+      AstFilter(coll, item_start, item_len, body) => 0
+  proofs:
+    purity:
+      reads : [n]
+      calls : []
+    termination:
+      bound : 16
+
+
+-- ast_fold_texty_code: the declared-type/body-shape mismatch probe for the
+-- slice-5 guard in x86_proc / proc_size. 0 = not a fold; 1 = fold with a
+-- NON-texty body (the slice-2 NUMBER fold); 2 = fold with a texty body (the
+-- slice-5 TEXT fold). A code-2 body under a non-text output, or a code-1 body
+-- under a text output, gets int3 in place of the proc body — the declared
+-- type picks the trampoline ABI, so a body that disagrees must trap, not
+-- half-work (the slice-4b posture, extended to folds).
+rule ast_fold_texty_code
+  @intention: "0 if not a fold, 1 if a fold with a non-texty body, 2 if a fold with a texty body"
+  @source: vexprparse.intent:70
+  input:
+    ts : TextyState
+  output:
+    out : number
+  logic:
+    out = match ts.node:
+      AstNum(value) => 0
+      AstBin(op, lhs, rhs) => 0
+      AstNeg(inner) => 0
+      AstNot(inner) => 0
+      AstVar(start, len) => 0
+      AstField(base, fstart, flen) => 0
+      AstCall(callee_start, callee_len, args) => 0
+      AstStr(start, len) => 0
+      AstBytes(start, len) => 0
+      AstBool(value) => 0
+      AstIf(cond, thn, els) => 0
+      AstErr => 0
+      AstVariant(cstart, clen, vstart, vlen, fields) => 0
+      AstMatch(scrut, arms) => 0
+      AstOk(inner) => 0
+      AstResErr(inner) => 0
+      AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => 0
+      AstSum(coll, item_start, item_len, body) => 0
+      AstCount(coll, item_start, item_len, body) => 0
+      AstFold(coll, init, acc_start, acc_len, item_start, item_len, body) => if ast_is_texty(TextyState { node: body, src: ts.src, prog: ts.prog }) == 1 then 2 else 1
+      AstAll(coll, item_start, item_len, body) => 0
+      AstAny(coll, item_start, item_len, body) => 0
+      AstMap(coll, item_start, item_len, body) => 0
+      AstFilter(coll, item_start, item_len, body) => 0
+  proofs:
+    purity:
+      reads : [ts.node, ts.src, ts.prog]
+      calls : [ast_is_texty]
+    termination:
+      bound : 64
+
+
+-- fold_size_arg: the EXACT byte count x86_fold_arg emits for ONE fold-body
+-- rest arg. A string literal is the 33-byte AstStr stream write; any OTHER
+-- shallow-texty shape is out of the fold-arg subset (1-byte int3 — nested
+-- concat / bytes / texty ifs have no streamed-in-loop lowering yet); a number
+-- expression is code_size_node + 10 (pop rax 1 + push r9 2 + call itoa 5 +
+-- pop r9 2). MUST track x86_fold_arg arm-for-arm — the drift edge.
+rule fold_size_arg
+  @intention: "Exact byte count of streaming one fold-body rest arg (literal 33, texty non-literal 1, number expr + 10)"
+  @source: vexprparse.intent:70
+  input:
+    bg : ByteGenState
+  output:
+    out : number
+  logic:
+    out = if ast_is_str(bg.node) == 1 then 33 else if ast_texty_shallow(PrintState { node: bg.node, src: bg.src }) == 1 then 1 else code_size_node(bg) + 10
+  proofs:
+    purity:
+      reads : [bg, bg.node, bg.src]
+      calls : [ast_is_str, ast_texty_shallow, code_size_node]
+    termination:
+      bound : 8000
+
+
+-- x86_fold_arg: stream ONE fold-body rest arg inside the text-fold loop. A
+-- string literal reuses x86_stream_node's AstStr write verbatim (33 B; the
+-- syscall clobbers only rcx/r11 — r8/r9 both safe). A number expression is
+-- <value ops> ; pop rax (58) ; push r9 (41 51 — MANDATORY: itoa_proc's head
+-- is mov r9,rax, the loop cursor dies on element 1 without the save — the 4b
+-- review's blocker) ; call itoa_proc (e8 rel32 targeting blob-origin -86: the
+-- e8 sits at off + size + 3, so rel32 = -(off + size + 94), the same
+-- -(site + 91) family as every other itoa call) ; pop r9 (41 59). NO newline
+-- per arg — the fold streams one continuous line; the trailing '\n' is the
+-- entrytx trampoline's. Any other shallow-texty shape -> int3 (out of the
+-- fold-arg subset). r8 is untouched by the proc.
+rule x86_fold_arg
+  @intention: "Stream one fold-body rest arg: literal via the AstStr write, number expr via r9-saved itoa, texty non-literal int3"
+  @source: vexprparse.intent:70
+  input:
+    bg : ByteGenState
+  output:
+    out : bytes
+  logic:
+    out = if ast_is_str(bg.node) == 1 then x86_stream_node(bg) else if ast_texty_shallow(PrintState { node: bg.node, src: bg.src }) == 1 then b"\xcc" else concat(x86_node(bg), b"\x58\x41\x51\xe8", le32(0 - (bg.off + code_size_node(bg) + 94)), b"\x41\x59")
+  proofs:
+    purity:
+      reads : [bg, bg.node, bg.src, bg.off]
+      calls : [ast_is_str, ast_texty_shallow, x86_stream_node, x86_node, code_size_node]
+    termination:
+      bound : 8000
+
+
+-- fold_size_cargs: total bytes of streaming a fold body's rest args in order —
+-- the sum of each arg's fold_size_arg. Empty list -> 0 (a bare `concat(acc)`
+-- body streams nothing per element: the output is init + '\n').
+rule fold_size_cargs
+  @intention: "Total byte count of streaming a fold body's rest args in source order"
+  @source: vexprparse.intent:70
+  input:
+    ag : ByteGenArgs
+  output:
+    out : number
+  logic:
+    out = match ag.args:
+      ArgCons(head, tail) => fold_size_arg(ByteGenState { node: head, src: ag.src, off: ag.off, params: ag.params, lets: ag.lets, prog: ag.prog, concepts: ag.concepts, sizes: ag.sizes }) + fold_size_cargs(ByteGenArgs { args: tail, src: ag.src, off: ag.off, params: ag.params, lets: ag.lets, prog: ag.prog, concepts: ag.concepts, sizes: ag.sizes })
+      ArgNil => 0
+  proofs:
+    purity:
+      reads : [ag.args, ag.src, ag.off, ag.params, ag.lets, ag.prog, ag.concepts, ag.sizes]
+      calls : [fold_size_arg, fold_size_cargs]
+    termination:
+      bound : 8000
+
+
+-- x86_fold_cargs: stream a fold body's rest args in source order, threading
+-- `off` by each arg's fold_size_arg so every itoa call site lands its rel32.
+rule x86_fold_cargs
+  @intention: "Stream a fold body's rest args in source order, each arg writing its own reading"
+  @source: vexprparse.intent:70
+  input:
+    ag : ByteGenArgs
+  output:
+    out : bytes
+  logic:
+    out = match ag.args:
+      ArgCons(head, tail) => concat(x86_fold_arg(ByteGenState { node: head, src: ag.src, off: ag.off, params: ag.params, lets: ag.lets, prog: ag.prog, concepts: ag.concepts, sizes: ag.sizes }), x86_fold_cargs(ByteGenArgs { args: tail, src: ag.src, off: ag.off + fold_size_arg(ByteGenState { node: head, src: ag.src, off: ag.off, params: ag.params, lets: ag.lets, prog: ag.prog, concepts: ag.concepts, sizes: ag.sizes }), params: ag.params, lets: ag.lets, prog: ag.prog, concepts: ag.concepts, sizes: ag.sizes }))
+      ArgNil => b""
+  proofs:
+    purity:
+      reads : [ag.args, ag.src, ag.off, ag.params, ag.lets, ag.prog, ag.concepts, ag.sizes]
+      calls : [x86_fold_arg, fold_size_arg, x86_fold_cargs]
     termination:
       bound : 8000
 
