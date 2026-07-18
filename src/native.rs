@@ -39407,6 +39407,75 @@ rule two
         let _ = fs::remove_file(&self_elf);
     }
 
+    /// Self-verify arc V1a (2026-07): the self-hosted LINT pass survives its own
+    /// full source. Pre-fix, `all_diags_count` (tokenize + parse + R6a/R6b
+    /// prog_diags walk) EXHAUSTED any arena cap on the full self-source: the
+    /// 2^40-class eager double-mention trap, checker edition — `arms_type`'s
+    /// ArmCons arm mentioned `arms_type(rest)` twice and `arm_body_type(head)`
+    /// up to 4x, i.e. O(2^arms) over a match; the self-source has 44 matches
+    /// with 20-24 arms (~x2 measured cost per added arm). Fixed by
+    /// single-evaluation combine helpers (arms_type_combine / arms_type_norm /
+    /// match_arm_ty), after which the full walk needs ~1.5M nodes / ~0.25 s —
+    /// comfortably inside the existing caps (no cap raise).
+    ///
+    /// The pinned count 1468 is NOT "1468 real lints": a minimal program
+    /// verbosec verifies clean still gets diags from the self-hosted linter, so
+    /// these are known checker-MODEL false positives (cat 1: rule input names
+    /// not in scope for let-RHS/constructor walks; cat 2: no primitive
+    /// allowlist; cat 3: record-constructor-arg arity; cat 4: R6b Result-node
+    /// stubs typing as ERROR). Follow-up slices fix the models and shrink this
+    /// pin toward 0 — each consciously updating it. What this test pins is:
+    /// the walk COMPLETES (exit 0, was rc=1), fast, at a deterministic count.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn self_verify_v1a_lint_walk_survives_full_self_source() {
+        use std::fs;
+        use std::process::Command;
+
+        let src = fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let bin = std::env::temp_dir().join("verbosec_test_v1a_all_diags_count");
+        compile_native_stdin_raw(&program, "all_diags_count", bin.to_str().unwrap())
+            .expect("all_diags_count must compile --stdin-raw");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&bin).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&bin, perms).unwrap();
+        }
+
+        // Feed the FULL self-source on stdin (the >128KB channel), unbounded
+        // stack for the tokenizer/parse recursion depth.
+        let out = Command::new("sh")
+            .arg("-c")
+            .arg(format!(
+                "ulimit -s unlimited; '{}' 0 < examples/vexprparse.verbose",
+                bin.display()
+            ))
+            .output()
+            .expect("run all_diags_count on the full self-source");
+        assert!(
+            out.status.success(),
+            "the lint walk must COMPLETE on the full self-source (pre-V1a it \
+             exhausted the arena and exited 1); got {:?}",
+            out.status
+        );
+        let count: i64 = String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .parse()
+            .expect("all_diags_count must print a number");
+        assert_eq!(
+            count, 1468,
+            "full-source diag count drifted — if a checker-model slice just \
+             landed, update this pin consciously (it should only SHRINK toward 0)"
+        );
+
+        let _ = fs::remove_file(&bin);
+    }
+
     /// THE TWO-GENERATION BOOTSTRAP FIXED POINT (2026-07): the self-hosted
     /// emitter reproduces its ENTIRE self, byte-for-byte, across two
     /// generations.
