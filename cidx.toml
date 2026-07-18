@@ -51,8 +51,9 @@ image = "rust:alpine"
 # RUST_TEST_THREADS=1: many native tests compile a binary to a shared temp path
 # then exec it; in parallel they race (Text-file-busy, or a stack-overflow
 # abort that takes the whole process down). Serial is deterministic (390/390).
-# (Stack sizing is handled by each test's explicit Builder::stack_size(64 MiB),
-# not RUST_MIN_STACK — the test threads set their own size.)
+# Stack sizing: RUST_MIN_STACK=64 MiB comes from .cargo/config.toml [env]
+# (cargo forwards it), covering every test thread; some older tests also set
+# their own Builder::stack_size(64 MiB).
 env = { RUST_TEST_THREADS = "1" }
 
 [containers.cargo-build]

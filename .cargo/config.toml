@@ -1,0 +1,19 @@
+# RUST_MIN_STACK = 64 MiB for every thread cargo spawns (tests included).
+#
+# Why: many native tests compile examples/vexprparse.verbose (the self-hosted
+# compiler, ~580 rules with deeply nested emitter expressions) via compile_native
+# ON THE TEST THREAD. The Rust emitter recurses over those expression trees; in
+# DEBUG builds the frames are fat enough that the default test-thread stack
+# overflows once the self-source grows past a threshold — collections slice 4b
+# crossed it (CI: "fatal runtime error: stack overflow" in
+# b4b_self_hosted_emitter_lowers_max_min_builtin, while release passed).
+#
+# The old discipline was per-test `Builder::stack_size(64 MiB)` wrappers, but
+# ~20 tests that compile the full self-source never got the wrapper and the
+# pattern keeps being missed as new tests land. This env var is the fix at the
+# single shared chokepoint: std::thread honors RUST_MIN_STACK whenever
+# stack_size isn't set explicitly, so every current and future test thread is
+# covered. Explicit Builder::stack_size calls (the existing 64 MiB wrappers)
+# are unaffected.
+[env]
+RUST_MIN_STACK = "67108864"

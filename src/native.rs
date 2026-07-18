@@ -21779,6 +21779,132 @@ rule le64_neg
         let _ = fs::remove_file(elf);
     }
 
+    /// COLLECTIONS tier slice 4b — THE MILESTONE: the self-hosted emitter
+    /// compiles `map(w.xs, x => x * 2)` and `filter(w.xs, x => x > 10)` over a
+    /// `collection(number)` input to a COLLECTION OUTPUT (`r : collection(number)`),
+    /// STREAMED — one decimal + '\n' per output element — and the emitted ELFs'
+    /// stdout is BYTE-IDENTICAL to verbosec's own `--native` on the SAME program
+    /// (slice 4a made verbosec accept scalar-element input collections, so this
+    /// is a DIRECT oracle: no single-field-record twin, no body translation).
+    ///
+    /// Pinned properties:
+    ///   - map [10,20,30] -> "20\n40\n60\n"; empty -> "" exit 0 (the collection
+    ///     trampoline is the call+exit(0) shape — an entrytx mis-route would
+    ///     print a stray trailing '\n' and the empty case would print "\n");
+    ///   - negatives flow through the itoa proc ([-5,7] -> "-10\n14\n");
+    ///   - filter emits the ELEMENT, not the predicate ([5,15,3,25] ->
+    ///     "15\n25\n" — a predicate-result bug prints "1\n1\n");
+    ///   - all-filtered -> "" exit 0;
+    ///   - a rule with a LET BINDING before the map (storesize != 0) doubles via
+    ///     the let, so the itoa call-site rel32 is exercised away from blob
+    ///     offset 0 (the off-threading edge; a mis-threaded site jumps into
+    ///     garbage instead of itoa_proc).
+    ///
+    /// argv layout (count-prefixed, same as slices 1-3/6): `<binary> <N> <e0> ...`.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn collections_tier_slice4b_map_filter_match_verbosec() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        let src = fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        // The self-hosted emitter (elf_program_src, reads program on argv[1]).
+        let elf = std::env::temp_dir().join("verbosec_test_coll_s4b_elf_program_src");
+        compile_native(&program, "elf_program_src", elf.to_str().unwrap(), false, false)
+            .expect("elf_program_src must compile natively");
+
+        // verbosec DIRECT oracle: the same collection(number) input + collection
+        // output shapes (slice 4a lifted the scalar-element input refusal).
+        // @verbose header + @intention + proofs for the Rust parser; the
+        // self-hosted programs below are the header-less equivalents.
+        let vsrc = "@verbose 0.1.0\n\nconcept Numbers\n  @intention: \"a bag of numbers\"\n  @source: d.intent:1\n  fields:\n    xs : collection(number)\nrule doubled\n  @intention: \"double each\"\n  @source: d.intent:2\n  input:\n    w : Numbers\n  output:\n    r : collection(number)\n  logic:\n    r = map(w.xs, x => x * 2)\n  proofs:\n    purity:\n      reads : [w.xs]\n      calls : []\n    termination:\n      bound : 100\nrule big_ones\n  @intention: \"keep above 10\"\n  @source: d.intent:2\n  input:\n    w : Numbers\n  output:\n    r : collection(number)\n  logic:\n    r = filter(w.xs, x => x > 10)\n  proofs:\n    purity:\n      reads : [w.xs]\n      calls : []\n    termination:\n      bound : 100";
+        let vtoks = crate::lexer::Lexer::new(&vsrc).tokenize().unwrap();
+        let vprog = crate::parser::Parser::new(vtoks).parse_program().unwrap();
+        let vref_map = std::env::temp_dir().join("verbosec_test_coll_s4b_map_ref");
+        let vref_filter = std::env::temp_dir().join("verbosec_test_coll_s4b_filter_ref");
+        compile_native(&vprog, "doubled", vref_map.to_str().unwrap(), false, false)
+            .expect("verbosec must compile `doubled` natively (slice 4a)");
+        compile_native(&vprog, "big_ones", vref_filter.to_str().unwrap(), false, false)
+            .expect("verbosec must compile `big_ones` natively (slice 4a)");
+
+        // Self-hosted, header-less targets — the SAME rule bodies.
+        let prog_self_map = "concept W\n  fields:\n    xs : collection(number)\nrule doubled\n  input:\n    w : W\n  output:\n    r : collection(number)\n  logic:\n    r = map(w.xs, x => x * 2)";
+        let prog_self_filter = "concept W\n  fields:\n    xs : collection(number)\nrule big_ones\n  input:\n    w : W\n  output:\n    r : collection(number)\n  logic:\n    r = filter(w.xs, x => x > 10)";
+        // A let binding BEFORE the map: storesize != 0 shifts the AstMap node's
+        // blob offset, so the itoa call-site rel32 must thread bg.off correctly.
+        let prog_self_let = "concept W\n  fields:\n    xs : collection(number)\nrule scaled\n  input:\n    w : W\n  output:\n    r : collection(number)\n  logic:\n    let k = 2\n    r = map(w.xs, x => x * k)";
+
+        let emit_self = |prog_src: &str, tag: &str| -> std::path::PathBuf {
+            let mc = Command::new(&elf).args([prog_src, "0"]).output()
+                .expect("spawn elf_program_src");
+            assert!(mc.status.success(), "elf_program_src must exit 0 for {:?}; got {:?}", tag, mc.status);
+            let bytes = mc.stdout;
+            assert_eq!(&bytes[0..4], &[0x7f, 0x45, 0x4c, 0x46], "self-emitted file is not ELF for {}", tag);
+            let out = std::env::temp_dir().join(format!("verbosec_test_coll_s4b_{}_self", tag));
+            fs::write(&out, &bytes).expect("write self ELF");
+            let mut perms = fs::metadata(&out).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&out, perms).expect("chmod +x");
+            out
+        };
+        let self_map = emit_self(prog_self_map, "map");
+        let self_filter = emit_self(prog_self_filter, "filter");
+        let self_let = emit_self(prog_self_let, "letmap");
+
+        let run = |bin: &std::path::PathBuf, args: &[&str]| -> String {
+            let o = Command::new(bin).args(args).output().expect("run binary");
+            assert!(o.status.success(), "{:?} {:?} must exit 0; got {:?}", bin, args, o.status);
+            String::from_utf8_lossy(&o.stdout).to_string()
+        };
+
+        // (argv after the program name, expected stdout). argv[0] is N.
+        let map_cases: &[(&[&str], &str)] = &[
+            (&["3", "10", "20", "30"], "20\n40\n60\n"),
+            (&["0"], ""),
+            (&["2", "-5", "7"], "-10\n14\n"),
+            (&["5", "1", "2", "3", "4", "5"], "2\n4\n6\n8\n10\n"),
+        ];
+        let filter_cases: &[(&[&str], &str)] = &[
+            (&["4", "5", "15", "3", "25"], "15\n25\n"),
+            (&["3", "1", "2", "3"], ""),
+            (&["0"], ""),
+            (&["4", "11", "12", "13", "14"], "11\n12\n13\n14\n"),
+        ];
+
+        for (args, expected) in map_cases {
+            let s = run(&self_map, args);
+            let v = run(&vref_map, args);
+            assert_eq!(s, *expected, "self map for {:?} = {:?} (expected {:?})", args, s, expected);
+            assert_eq!(v, *expected, "verbosec map for {:?} = {:?} (expected {:?})", args, v, expected);
+            assert_eq!(s, v, "self ({:?}) vs verbosec ({:?}) map mismatch for {:?}", s, v, args);
+        }
+        for (args, expected) in filter_cases {
+            let s = run(&self_filter, args);
+            let v = run(&vref_filter, args);
+            assert_eq!(s, *expected, "self filter for {:?} = {:?} (expected {:?})", args, s, expected);
+            assert_eq!(v, *expected, "verbosec filter for {:?} = {:?} (expected {:?})", args, v, expected);
+            assert_eq!(s, v, "self ({:?}) vs verbosec ({:?}) filter mismatch for {:?}", s, v, args);
+        }
+
+        // The let-binding off-threading case (no verbosec twin needed — the
+        // expected output is fixed; a mis-threaded itoa rel32 crashes or
+        // corrupts the decimals).
+        assert_eq!(run(&self_let, &["3", "10", "20", "30"]), "20\n40\n60\n");
+        assert_eq!(run(&self_let, &["0"]), "");
+
+        let _ = fs::remove_file(&self_map);
+        let _ = fs::remove_file(&self_filter);
+        let _ = fs::remove_file(&self_let);
+        let _ = fs::remove_file(elf);
+        let _ = fs::remove_file(vref_map);
+        let _ = fs::remove_file(vref_filter);
+    }
+
     /// Brick b6 — the four missing binary operators in the machine-code
     /// generator: division `/` (op 16), modulo `%` (op 17), logical `and`
     /// (op 30), logical `or` (op 31). Both the closed-expression path
@@ -38326,7 +38452,8 @@ rule two
     ///     count (grep oracle). The self-hosted front end, compiled, processing its
     ///     whole own source at runtime.
     ///   * Small stdin: a 2-rule program -> 2.
-    ///   * Region overflow: >1 MiB of stdin -> exit 1 (fail-closed).
+    ///   * Region overflow: >4 MiB of stdin -> exit 1 (fail-closed; 1 MiB
+    ///     until collections slice 4b grew the self-source past it).
     ///   * Byte-identity: a number-entry (input-free) fact ELF keeps the original
     ///     101-byte number trampoline byte-for-byte at offset 120 (the stdin path
     ///     only fires when the entry has a text field).
@@ -38451,11 +38578,13 @@ rule two
         assert!(st2.success(), "count_rules ELF must exit 0 on a small stdin program");
         assert_eq!(got2, "2", "small stdin two-rule program must count 2");
 
-        // Region overflow: >1 MiB of stdin -> exit 1 (fail-closed, source bigger
-        // than the 1 MiB region).
-        let big = vec![b'x'; 1024 * 1024 + 4096];
+        // Region overflow: >4 MiB of stdin -> exit 1 (fail-closed, source bigger
+        // than the region). The region was 1 MiB until collections slice 4b,
+        // when the self-source crossed 1,048,576 bytes and gen1 started
+        // fail-closing on its OWN source; the cap moved to 4 MiB, same posture.
+        let big = vec![b'x'; 4 * 1024 * 1024 + 4096];
         let (_g, st3) = run_stdin(&cr_elf, &big);
-        assert_eq!(st3.code(), Some(1), ">1 MiB stdin must exit 1 (region overflow, fail-closed)");
+        assert_eq!(st3.code(), Some(1), ">4 MiB stdin must exit 1 (region overflow, fail-closed)");
 
         // Byte-identity: a number-entry (input-free) fact ELF keeps the original
         // 101-byte number trampoline byte-for-byte — the stdin path fires ONLY when
