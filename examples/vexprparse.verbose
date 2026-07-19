@@ -5485,15 +5485,18 @@ concept FindRuleState
 -- list (callee scope), the source text, and the callee name's span. Drives
 -- call_result_type, which resolves the callee's DECLARED return type and maps the
 -- "unannotated" sentinel (9) back to number (0) so a call to an unannotated rule
--- still types as number (preserving brick 32).
+-- still types as number (preserving brick 32). V1b adds `concepts` so an
+-- unannotated (input:-block form) callee's `output:` type-NAME span can resolve to
+-- its real code (scalar or concept) instead of collapsing to number.
 concept CallRetState
-  @intention: "A program rule list + source text + the callee name's span, for typing a call result"
+  @intention: "A program rule list + source text + the callee name's span + the concept list, for typing a call result"
   @source: vexprparse.intent:51
   fields:
     prog : RuleList
     src : text [..256]
     callee_start : number [0, 4000000]
     callee_len : number [0, 4000000]
+    concepts : ConceptList
 
 
 -- A one-field probe to read the HEAD of an argument list (block-form match is only
@@ -6394,6 +6397,31 @@ rule span_is_arena_scope
       calls : []
     termination:
       bound : 64
+
+
+-- span_is_primitive (V1b, self-verify arc): 1 iff a callee span spells one of the
+-- language's expression PRIMITIVES — the exact set the span_is_* recognizers
+-- define: byte_at, length, substring, concat, le32, le64, max, min, arena_scope.
+-- The undefined-CALLEE lint (count_badcall_ast / badcall_span_ast) exempts these
+-- the same way the R6d purity checker does implicitly (primitives fail rule_named,
+-- so the purity pass never flags them); before this rule the badcall lint flagged
+-- every primitive call as an undefined callee. Chained if-else so each recognizer
+-- is mentioned (and evaluated) at most once — the single-evaluation discipline.
+rule span_is_primitive
+  @intention: "1 if a callee span spells one of the expression primitives (byte_at/length/substring/concat/le32/le64/max/min/arena_scope), 0 otherwise"
+  @source: vexprparse.intent:33
+  input:
+    sc : SpanCheck
+  output:
+    out : number
+  logic:
+    out = if span_is_byte_at(sc) == 1 then 1 else if span_is_length(sc) == 1 then 1 else if span_is_substring(sc) == 1 then 1 else if span_is_concat(sc) == 1 then 1 else if span_is_le32(sc) == 1 then 1 else if span_is_le64(sc) == 1 then 1 else if span_is_max(sc) == 1 then 1 else if span_is_min(sc) == 1 then 1 else if span_is_arena_scope(sc) == 1 then 1 else 0
+  proofs:
+    purity:
+      reads : [sc]
+      calls : [span_is_byte_at, span_is_length, span_is_substring, span_is_concat, span_is_le32, span_is_le64, span_is_max, span_is_min, span_is_arena_scope]
+    termination:
+      bound : 128
 
 
 -- arg_first: the head Ast of a call's argument list, or the AstErr sentinel when
@@ -10665,6 +10693,11 @@ concept LintRuleState
 -- treated as already-defined everywhere in the body — like a let that is always
 -- already-bound. Note: params are added as the use-before-def prefix BASE, so a
 -- later let cannot "use-before-def" a parameter (a param precedes all lets).
+-- V1b (self-verify arc): the base scope reads the EFFECTIVE params via
+-- rule_params_of — declared parens params if non-empty, else the `input:` block's
+-- fields converted. Real self-source rules declare `input:` blocks, so before
+-- this the input name (`s` in `s.source`) was NOT in scope and EVERY rule flagged
+-- category 1. rule_params_of is exactly how the executor scopes the input name.
 rule lint_rule
   @intention: "Number of undefined-OR-use-before-def references in one rule (params in scope; 0 if clean)"
   @source: vexprparse.intent:32
@@ -10676,14 +10709,14 @@ rule lint_rule
     let body = rd_body(lr.rd)
     let binds = block_binds(body)
     let result = block_result(body)
-    let pbinds = param_to_binding(rd_params(lr.rd))
+    let pbinds = param_to_binding(rule_params_of(lr.rd))
     let scope = append_bindings(BindAppendState { a: pbinds, b: binds })
     let undef_in_binds = count_undef_binds_ordered(UndefBindsOrderedState { iter: binds, prefix: pbinds, src: lr.src })
     out = undef_in_binds + count_undef_ast(UndefAstState { node: result, binds: scope, src: lr.src })
   proofs:
     purity:
       reads : [lr.rd, lr.src]
-      calls : [rd_body, block_binds, block_result, rd_params, param_to_binding, append_bindings, count_undef_binds_ordered, count_undef_ast]
+      calls : [rd_body, block_binds, block_result, rule_params_of, param_to_binding, append_bindings, count_undef_binds_ordered, count_undef_ast]
     termination:
       bound : 16
 
@@ -10882,8 +10915,10 @@ rule count_badcall_args
 -- name is NOT rule_named in the program. Mirrors count_undef_ast's structural
 -- walk, but the node that contributes is AstCall (not AstVar), checked against the
 -- program's rules (not the rule's bindings):
---   * AstCall(callee_start, callee_len, args) => (1 if rule_named == 0, the callee
---     does not exist) PLUS count_badcall_args over the arguments (so a nested call
+--   * AstCall(callee_start, callee_len, args) => (1 if rule_named == 0 AND the
+--     callee is not a recognized expression PRIMITIVE via span_is_primitive — V1b:
+--     byte_at/length/... are legal callees that never resolve to a defined rule)
+--     PLUS count_badcall_args over the arguments (so a nested call
 --     inside an argument — g(h(1)) — is also checked). Parenthesized because there
 --     is no operator precedence in Verbose: the `if ... then 1 else 0` is the
 --     leftmost summand, the args walk the second.
@@ -10908,7 +10943,7 @@ rule count_badcall_ast
       AstNot(inner) => count_badcall_ast(BadCallState { node: inner, rules: a.rules, src: a.src })
       AstVar(start, len) => 0
       AstField(base, fstart, flen) => count_badcall_ast(BadCallState { node: base, rules: a.rules, src: a.src })
-      AstCall(callee_start, callee_len, args) => (if rule_named(RuleNamedState { rules: a.rules, src: a.src, q_start: callee_start, q_len: callee_len }) == 0 then 1 else 0) + count_badcall_args(BadCallArgsState { args: args, rules: a.rules, src: a.src })
+      AstCall(callee_start, callee_len, args) => (if rule_named(RuleNamedState { rules: a.rules, src: a.src, q_start: callee_start, q_len: callee_len }) == 0 and span_is_primitive(SpanCheck { src: a.src, start: callee_start, len: callee_len }) == 0 then 1 else 0) + count_badcall_args(BadCallArgsState { args: args, rules: a.rules, src: a.src })
       AstIf(cond, thn, els) => count_badcall_ast(BadCallState { node: cond, rules: a.rules, src: a.src }) + count_badcall_ast(BadCallState { node: thn, rules: a.rules, src: a.src }) + count_badcall_ast(BadCallState { node: els, rules: a.rules, src: a.src })
       AstBool(value) => 0
       AstStr(start, len) => 0
@@ -10935,7 +10970,7 @@ rule count_badcall_ast
   proofs:
     purity:
       reads : [a.node, a.rules, a.src]
-      calls : [count_badcall_ast, count_badcall_args, rule_named, count_badcall_vfields, count_badcall_arms]
+      calls : [count_badcall_ast, count_badcall_args, rule_named, span_is_primitive, count_badcall_vfields, count_badcall_arms]
     termination:
       bound : 4000
 
@@ -11245,11 +11280,15 @@ concept RuleArityState
 -- rule_arity: the parameter count of the FIRST rule whose NAME span byte-equals
 -- the query span, or the 1000000 NOT-FOUND sentinel if no rule matches. Walks the
 -- RuleList exactly like rule_named (same RCons/RNil cons-walk, same length-then-
--- bytes name_eq guard), but on a match it returns param_list_len(rd_params(head))
--- instead of 1, and on RNil it returns the sentinel instead of 0. The sentinel is
--- 1000000 (NOT -1) so the optimizer's interval arithmetic over the default
--- [0, i32::MAX] field range cannot dead-eliminate a negative-test branch. Recurses
--- over the RuleList tail (a field of the input), so bound + native breadcrumb.
+-- bytes name_eq guard), but on a match it returns the EFFECTIVE parameter count
+-- (param_list_len over rule_params_of — declared parens params if non-empty, else
+-- the `input:` block's fields converted; V1b fix — reading rd_params alone made
+-- every input:-block rule declare arity 0, so every 1-argument call to it was a
+-- false arity mismatch) instead of 1, and on RNil it returns the sentinel instead
+-- of 0. The sentinel is 1000000 (NOT -1) so the optimizer's interval arithmetic
+-- over the default [0, i32::MAX] field range cannot dead-eliminate a negative-test
+-- branch. Recurses over the RuleList tail (a field of the input), so bound +
+-- native breadcrumb.
 rule rule_arity
   @intention: "Parameter count of the rule matching a callee name span, or 1000000 if none"
   @source: vexprparse.intent:35
@@ -11259,12 +11298,12 @@ rule rule_arity
     out : number
   logic:
     out = match st.rules:
-      RCons(head, tail) => if rd_name_len(head) == st.q_len and name_eq(NameEqState { src: st.src, a_start: rd_name_start(head), b_start: st.q_start, len: st.q_len, off: 0 }) == 1 then param_list_len(rd_params(head)) else rule_arity(RuleArityState { rules: tail, src: st.src, q_start: st.q_start, q_len: st.q_len })
+      RCons(head, tail) => if rd_name_len(head) == st.q_len and name_eq(NameEqState { src: st.src, a_start: rd_name_start(head), b_start: st.q_start, len: st.q_len, off: 0 }) == 1 then param_list_len(rule_params_of(head)) else rule_arity(RuleArityState { rules: tail, src: st.src, q_start: st.q_start, q_len: st.q_len })
       RNil => 1000000
   proofs:
     purity:
       reads : [st.rules, st.src, st.q_start, st.q_len]
-      calls : [rd_name_len, rd_name_start, name_eq, param_list_len, rd_params, rule_arity]
+      calls : [rd_name_len, rd_name_start, name_eq, param_list_len, rule_params_of, rule_arity]
     termination:
       bound : 4000
 
@@ -11652,11 +11691,15 @@ rule lint_arity
 -- `let b = 1 < 2` then `out = if b ...` sees b : bool), consing (name span, RHS
 -- type) onto the front.
 --
--- TYPING RULES (v1).
+-- TYPING RULES (v1, upgraded by V1b — see the arm comments in type_of_env).
 --   AstNum  => number ; AstBool => bool ; AstStr => text (brick 30) ;
---   AstErr / AstField => ERROR.
+--   AstBytes => bytes (4) ; AstErr => ERROR.
+--   AstField => the field's DECLARED type resolved in the base's concept
+--   (field_sel_ty; ERROR if the base is not concept-typed or the field absent).
 --   AstVar  => env_lookup (the stored type code; 0 = number for unbound params).
---   AstCall => number (every rule returns number in the interpreter's world).
+--   AstCall => primitives by what they produce (concat arg-driven text/bytes,
+--   substring text, le32/le64/arena_scope bytes, byte_at/length/max/min number);
+--   real callees by their header annotation or resolved `output:` type.
 --   AstNeg(e)  => number if type(e) = number, else ERROR.
 --   AstNot(e)  => bool   if type(e) = bool,   else ERROR.
 --   AstBin(op, l, r) with lt = type(l), rt = type(r):
@@ -11766,28 +11809,40 @@ rule if_type
       bound : 8
 
 
--- call_result_type (brick 33): the TYPE of a call's RESULT. Resolves the callee's
--- declared return type (rd_return_type(find_rule(...))) and maps the brick-33
--- "unannotated" sentinel (9) back to number (0). So a call to an annotated rule
--- types as that rule's declared type (0/1/2), and a call to an unannotated or
--- undefined rule (find_rule's RNil sentinel has return_type 0) types as number.
--- This is exactly brick 32's behavior once the sentinel is accounted for; it lives
--- in its own rule so the return-vs-body check (brick 33, in tcheck_rule) can read
--- the RAW sentinel (9) while type_of_env keeps typing calls as number.
+-- call_result_type (brick 33): the TYPE of a call's RESULT. V1b: the expression
+-- PRIMITIVES type first, by what they produce — le32/le64/arena_scope -> bytes (4),
+-- substring -> text (2), byte_at/length/max/min -> number (0); concat is NOT here
+-- (its type is arg-driven — type_of_env's AstCall arm dispatches it to
+-- concat_args_ty before reaching this rule). A real callee resolves its declared
+-- return type (rd_return_type(find_rule(...))); when the header is unannotated
+-- (the sentinel 9 — every `input:`-block rule), the callee's `output:` type-NAME
+-- span resolves instead: `out : number` -> 0, `out : bytes` -> 4, `out : DiagList`
+-- -> the concept code, so calls to concept-returning rules type as that concept
+-- and a match/field read over a call result checks soundly. An UNRESOLVABLE
+-- output span (an undefined callee's sentinel MkRule has an empty span; a
+-- collection/Result output has no code in this lattice) falls back to number (0)
+-- — the pre-V1b behavior, non-cascading (an undefined callee is the badcall
+-- pass's concern, not a type error). find_rule is evaluated ONCE (the
+-- single-evaluation discipline).
 rule call_result_type
-  @intention: "The result type code of a call, mapping the unannotated sentinel to number"
+  @intention: "The result type code of a call: primitives by what they produce, else the callee's header annotation or resolved output: type (number if unresolvable)"
   @source: vexprparse.intent:51
   input:
     c : CallRetState
   output:
     out : number
   logic:
-    let rt = rd_return_type(find_rule(FindRuleState { rules: c.prog, src: c.src, q_start: c.callee_start, q_len: c.callee_len }))
-    out = if rt == 9 then 0 else rt
+    let isb = if span_is_le32(SpanCheck { src: c.src, start: c.callee_start, len: c.callee_len }) == 1 then 1 else if span_is_le64(SpanCheck { src: c.src, start: c.callee_start, len: c.callee_len }) == 1 then 1 else if span_is_arena_scope(SpanCheck { src: c.src, start: c.callee_start, len: c.callee_len }) == 1 then 1 else 0
+    let ist = span_is_substring(SpanCheck { src: c.src, start: c.callee_start, len: c.callee_len })
+    let isn = if span_is_byte_at(SpanCheck { src: c.src, start: c.callee_start, len: c.callee_len }) == 1 then 1 else if span_is_length(SpanCheck { src: c.src, start: c.callee_start, len: c.callee_len }) == 1 then 1 else if span_is_max(SpanCheck { src: c.src, start: c.callee_start, len: c.callee_len }) == 1 then 1 else if span_is_min(SpanCheck { src: c.src, start: c.callee_start, len: c.callee_len }) == 1 then 1 else 0
+    let callee = find_rule(FindRuleState { rules: c.prog, src: c.src, q_start: c.callee_start, q_len: c.callee_len })
+    let rt = rd_return_type(callee)
+    let ot = resolve_type(ResolveTypeState { concepts: c.concepts, src: c.src, ty_start: rd_out_ty_start(callee), ty_len: rd_out_ty_len(callee) })
+    out = if isb == 1 then 4 else (if ist == 1 then 2 else (if isn == 1 then 0 else (if rt != 9 then rt else (if ot == 3 then 0 else ot))))
   proofs:
     purity:
-      reads : [c.prog, c.src, c.callee_start, c.callee_len]
-      calls : [rd_return_type, find_rule]
+      reads : [c.prog, c.src, c.callee_start, c.callee_len, c.concepts]
+      calls : [span_is_le32, span_is_le64, span_is_arena_scope, span_is_substring, span_is_byte_at, span_is_length, span_is_max, span_is_min, rd_return_type, find_rule, resolve_type, rd_out_ty_start, rd_out_ty_len]
     termination:
       bound : 64
 
@@ -11797,11 +11852,12 @@ rule call_result_type
 -- AstBool => bool (1), AstStr => text (2, brick 30 — a string literal is a
 -- first-class text value, so a `text` parameter accepts it; text supports no
 -- operations, so arithmetic/ordering/logic/equality on text all remain ERROR via
--- bin_type), AstErr / AstField => ERROR (3, fields still not typed), AstCall =>
--- the callee's DECLARED return type via call_result_type (brick 32/33:
--- rd_return_type(find_rule(prog, callee span)) with the brick-33 "unannotated"
--- sentinel 9 mapped back to number 0, so an undefined or unannotated callee
--- resolves to number). AstVar resolves its name in the type env
+-- bin_type), AstBytes => bytes (4), AstErr => ERROR (3). V1b: AstField types by
+-- FIELD SELECTION (base typed once, then field_sel_ty resolves the field's
+-- declared type in the base's concept), and AstCall dispatches concat to the
+-- arg-driven concat_args_ty, other primitives and real callees to
+-- call_result_type (header annotation, else the resolved `output:` span; an
+-- undefined callee still resolves to number). AstVar resolves its name in the type env
 -- via env_lookup (the stored type code; 0 = number for unbound params). The unary
 -- and binary forms recurse on their sub-nodes, threading the same tenv + src down,
 -- then classify: AstNeg requires a number operand (else ERROR), AstNot a bool
@@ -11825,8 +11881,15 @@ rule type_of_env
       AstNeg(inner) => if type_of_env(TypeArg { node: inner, tenv: t.tenv, src: t.src, prog: t.prog, concepts: t.concepts }) == 0 then 0 else 3
       AstNot(inner) => if type_of_env(TypeArg { node: inner, tenv: t.tenv, src: t.src, prog: t.prog, concepts: t.concepts }) == 1 then 1 else 3
       AstVar(start, len) => env_lookup(EnvLookState { env: t.tenv, src: t.src, q_start: start, q_len: len })
-      AstField(base, fstart, flen) => 3
-      AstCall(callee_start, callee_len, args) => call_result_type(CallRetState { prog: t.prog, src: t.src, callee_start: callee_start, callee_len: callee_len })
+      -- V1b: a field read types as the field's DECLARED type — type the base ONCE,
+      -- then field_sel_ty resolves the field name in the base's concept (ERROR if
+      -- the base is not concept-typed or the field is absent). Pre-V1b this arm was
+      -- a stub ERROR (3), flagging every rule that reads a packed-input field.
+      AstField(base, fstart, flen) => field_sel_ty(FieldSelTyState { base_ty: type_of_env(TypeArg { node: base, tenv: t.tenv, src: t.src, prog: t.prog, concepts: t.concepts }), fstart: fstart, flen: flen, src: t.src, concepts: t.concepts })
+      -- V1b: concat types by its ARGS (text vs bytes mode — see concat_args_ty);
+      -- every other callee goes through call_result_type (primitives by what they
+      -- produce, real rules by their declared output).
+      AstCall(callee_start, callee_len, args) => if span_is_concat(SpanCheck { src: t.src, start: callee_start, len: callee_len }) == 1 then concat_ty_final(ConcatFinalState { m: concat_args_ty(ConcatArgsTyState { args: args, tenv: t.tenv, src: t.src, prog: t.prog, concepts: t.concepts }) }) else call_result_type(CallRetState { prog: t.prog, src: t.src, callee_start: callee_start, callee_len: callee_len, concepts: t.concepts })
       AstIf(cond, thn, els) => if_type(IfTypeState { ct: type_of_env(TypeArg { node: cond, tenv: t.tenv, src: t.src, prog: t.prog, concepts: t.concepts }), tt: type_of_env(TypeArg { node: thn, tenv: t.tenv, src: t.src, prog: t.prog, concepts: t.concepts }), et: type_of_env(TypeArg { node: els, tenv: t.tenv, src: t.src, prog: t.prog, concepts: t.concepts }) })
       AstBool(value) => 1
       AstStr(start, len) => 2
@@ -11840,21 +11903,32 @@ rule type_of_env
       -- the arm-body types via arms_type. `code - 1000` is computed only on the >= 1000
       -- branch, so the ConceptAtState index is always >= 0. 7777 (no arms) -> ERROR.
       AstMatch(scrut, arms) => match_arm_ty(MatchArmTyState { scrut_ty: type_of_env(TypeArg { node: scrut, tenv: t.tenv, src: t.src, prog: t.prog, concepts: t.concepts }), arms: arms, tenv: t.tenv, src: t.src, prog: t.prog, concepts: t.concepts })
-      -- Result tier slice 1 stub (parse + eval only; real handling in a later slice).
-      AstOk(inner) => 3
-      AstResErr(inner) => 3
-      AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => 3
-      AstSum(coll, item_start, item_len, body) => 3
-      AstCount(coll, item_start, item_len, body) => 3
-      AstFold(coll, init, acc_start, acc_len, item_start, item_len, body) => 3
-      AstAll(coll, item_start, item_len, body) => 3
-      AstAny(coll, item_start, item_len, body) => 3
-      AstMap(coll, item_start, item_len, body) => 3
-      AstFilter(coll, item_start, item_len, body) => 3
+      -- V1b: the Result tier's nodes now type SOUNDLY instead of the slice-1 ERROR
+      -- stubs (which flagged every clean Result-using program). Ok/Err wrap their
+      -- inner (typed once): ill-typed inner still cascades, else the neutral RESULT
+      -- code 6. match_result mirrors AstMatch's common-arm-type rule via mres_ty,
+      -- the ok/err binders bound to the conservative non-ERROR default 0 (number —
+      -- the same default env_lookup gives an unbound name; the lattice carries no
+      -- Result component types to infer from). sum/count -> number, all/any ->
+      -- bool, fold -> its init's type (the accumulator seed, typed once in the
+      -- enclosing scope), map/filter -> the neutral COLLECTION code 5 (non-ERROR,
+      -- non-cascading; element types are outside this lattice). Reduction BODIES
+      -- are not walked (their item binder's element type is unknowable here) —
+      -- the checker stays a SUBSET of verbosec's, never a false-positive source.
+      AstOk(inner) => res_wrap_ty(ResWrapState { t: type_of_env(TypeArg { node: inner, tenv: t.tenv, src: t.src, prog: t.prog, concepts: t.concepts }) })
+      AstResErr(inner) => res_wrap_ty(ResWrapState { t: type_of_env(TypeArg { node: inner, tenv: t.tenv, src: t.src, prog: t.prog, concepts: t.concepts }) })
+      AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => mres_ty(MResTyState { scrut_ty: type_of_env(TypeArg { node: scrut, tenv: t.tenv, src: t.src, prog: t.prog, concepts: t.concepts }), ok_ty: type_of_env(TypeArg { node: ok_body, tenv: Env::ECons { name_start: ok_bstart, name_len: ok_blen, val: 0, rest: t.tenv }, src: t.src, prog: t.prog, concepts: t.concepts }), err_ty: type_of_env(TypeArg { node: err_body, tenv: Env::ECons { name_start: err_bstart, name_len: err_blen, val: 0, rest: t.tenv }, src: t.src, prog: t.prog, concepts: t.concepts }) })
+      AstSum(coll, item_start, item_len, body) => 0
+      AstCount(coll, item_start, item_len, body) => 0
+      AstFold(coll, init, acc_start, acc_len, item_start, item_len, body) => type_of_env(TypeArg { node: init, tenv: t.tenv, src: t.src, prog: t.prog, concepts: t.concepts })
+      AstAll(coll, item_start, item_len, body) => 1
+      AstAny(coll, item_start, item_len, body) => 1
+      AstMap(coll, item_start, item_len, body) => 5
+      AstFilter(coll, item_start, item_len, body) => 5
   proofs:
     purity:
       reads : [t.node, t.tenv, t.src, t.prog, t.concepts]
-      calls : [type_of_env, env_lookup, bin_type, if_type, call_result_type, resolve_type, match_arm_ty]
+      calls : [type_of_env, env_lookup, bin_type, if_type, call_result_type, resolve_type, match_arm_ty, field_sel_ty, res_wrap_ty, mres_ty, span_is_concat, concat_ty_final, concat_args_ty]
     termination:
       bound : 4000
 
@@ -12193,12 +12267,14 @@ concept ArmsTypeState
 -- resolve_type: map a type-name span to a code. number/bool/text resolve to 0/1/2
 -- EXACTLY as type_code_of_span did (the scalar fast-path stays byte-identical: tc is
 -- type_code_of_span's result, isnum is its own "number" byte check so a concept name
--- — which type_code_of_span also returns 0 for — is NOT mistaken for number). Any
+-- — which type_code_of_span also returns 0 for — is NOT mistaken for number). V1b:
+-- "bytes" resolves to 4 (its own byte check, since type_code_of_span defaults it to
+-- 0) so bytes-returning rules and bytes-typed fields type soundly. Any
 -- other name is looked up in the ConceptList: found -> 1000 + index (a concept code),
 -- not found -> 3 (ERROR). This is the ONLY name->code site; everything downstream
 -- compares codes. byte_at is a primitive (not a callee), like type_code_of_span.
 rule resolve_type
-  @intention: "Resolve a type-name span to a code: number/bool/text -> 0/1/2, known concept -> 1000+index, else ERROR (3)"
+  @intention: "Resolve a type-name span to a code: number/bool/text/bytes -> 0/1/2/4, known concept -> 1000+index, else ERROR (3)"
   @source: vexprparse.intent:62
   input:
     r : ResolveTypeState
@@ -12207,8 +12283,9 @@ rule resolve_type
   logic:
     let tc = type_code_of_span(SpanCheck { src: r.src, start: r.ty_start, len: r.ty_len })
     let isnum = if r.ty_len == 6 and (byte_at(r.src, r.ty_start) == 110 and (byte_at(r.src, r.ty_start + 1) == 117 and (byte_at(r.src, r.ty_start + 2) == 109 and (byte_at(r.src, r.ty_start + 3) == 98 and (byte_at(r.src, r.ty_start + 4) == 101 and byte_at(r.src, r.ty_start + 5) == 114))))) then 1 else 0
+    let isbytes = if r.ty_len == 5 and (byte_at(r.src, r.ty_start) == 98 and (byte_at(r.src, r.ty_start + 1) == 121 and (byte_at(r.src, r.ty_start + 2) == 116 and (byte_at(r.src, r.ty_start + 3) == 101 and byte_at(r.src, r.ty_start + 4) == 115)))) then 1 else 0
     let idx = find_concept_index(FindConceptIdxState { concepts: r.concepts, src: r.src, q_start: r.ty_start, q_len: r.ty_len, idx: 0 })
-    out = if isnum == 1 then 0 else (if tc == 1 then 1 else (if tc == 2 then 2 else (if idx == 999999 then 3 else 1000 + idx)))
+    out = if isnum == 1 then 0 else (if isbytes == 1 then 4 else (if tc == 1 then 1 else (if tc == 2 then 2 else (if idx == 999999 then 3 else 1000 + idx))))
   proofs:
     purity:
       reads : [r.concepts, r.src, r.ty_start, r.ty_len]
@@ -12354,6 +12431,265 @@ rule field_concept_tenv
     termination:
       bound : 4000
 
+
+-- V1b (self-verify arc): field_ty_of's input — a concept's FieldList to search + the
+-- source + the query field-name span + the concept list (the matched field's declared
+-- type-name span resolves against it).
+concept FieldTyOfState
+  @intention: "A concept's field list + the source + a query field-name span + the concept list, for the field's declared type"
+  @source: vexprparse.intent:62
+  fields:
+    fields : FieldList
+    src : text [..256]
+    q_start : number [0, 4000000]
+    q_len : number [0, 4000000]
+    concepts : ConceptList
+
+
+-- field_ty_of: the RESOLVED declared type code of the field whose name byte-equals
+-- the query span (number/bool/text -> 0/1/2, concept -> 1000+index), or ERROR (3)
+-- if no field of that name exists. The name-matching walk mirrors field_index_of;
+-- on a match the field's ty SPAN goes through resolve_type (the ty CODE stored in
+-- the FCons is lossy — a concept name collapses to 0 there, same reason resolve_type
+-- exists). Bound-only termination + the native recursion breadcrumb (the shrinking
+-- list tail is a field of the packed input).
+rule field_ty_of
+  @intention: "The resolved declared type code of the field whose name matches the query span (ERROR 3 if absent)"
+  @source: vexprparse.intent:62
+  input:
+    ft : FieldTyOfState
+  output:
+    out : number
+  logic:
+    out = match ft.fields:
+      FCons(name_start, name_len, ty, ty_start, ty_len, rest) => if name_len == ft.q_len and name_eq(NameEqState { src: ft.src, a_start: name_start, b_start: ft.q_start, len: ft.q_len, off: 0 }) == 1 then resolve_type(ResolveTypeState { concepts: ft.concepts, src: ft.src, ty_start: ty_start, ty_len: ty_len }) else field_ty_of(FieldTyOfState { fields: rest, src: ft.src, q_start: ft.q_start, q_len: ft.q_len, concepts: ft.concepts })
+      FNil => 3
+  proofs:
+    purity:
+      reads : [ft.fields, ft.src, ft.q_start, ft.q_len, ft.concepts]
+      calls : [name_eq, resolve_type, field_ty_of]
+    termination:
+      bound : 4000
+
+
+-- field_sel_ty's input: the ALREADY-COMPUTED base type code + the field-name span +
+-- source + concept list. The lazy guard lives here (base_ty < 1000 -> ERROR before
+-- concept_at_index is reached) and the base is typed exactly ONCE by the caller —
+-- the same single-evaluation split as match_arm_ty (the 2^40 lesson).
+concept FieldSelTyState
+  @intention: "A computed base type code + the field-name span + source + concept list, for the single-evaluation field-selection type"
+  @source: vexprparse.intent:62
+  fields:
+    base_ty : number
+    fstart : number [0, 4000000]
+    flen : number [0, 4000000]
+    src : text [..256]
+    concepts : ConceptList
+
+
+-- field_sel_ty: the type of `base.field` from base's computed type code: ERROR
+-- unless base is concept-typed (a field read on a scalar/ERROR base is ill-typed);
+-- else the field's resolved declared type via field_ty_of over that concept's
+-- FieldList (ERROR if the field is absent). `base_ty - 1000` is computed only on
+-- the >= 1000 branch, so the ConceptAtState index is always >= 0 (mirror of
+-- match_arm_ty's guard).
+rule field_sel_ty
+  @intention: "The type of a field read from its base's type code: the field's declared type if base is a concept, else ERROR"
+  @source: vexprparse.intent:62
+  input:
+    fs : FieldSelTyState
+  output:
+    out : number
+  logic:
+    out = if fs.base_ty < 1000 then 3 else field_ty_of(FieldTyOfState { fields: cd_fields(concept_at_index(ConceptAtState { concepts: fs.concepts, idx: fs.base_ty - 1000 })), src: fs.src, q_start: fs.fstart, q_len: fs.flen, concepts: fs.concepts })
+  proofs:
+    purity:
+      reads : [fs.base_ty, fs.fstart, fs.flen, fs.src, fs.concepts]
+      calls : [field_ty_of, cd_fields, concept_at_index]
+    termination:
+      bound : 4000
+
+
+-- res_wrap_ty's input: the ALREADY-COMPUTED inner type code of an Ok(...) / Err(...)
+-- constructor (typed once by the caller — single-evaluation discipline).
+concept ResWrapState
+  @intention: "A computed Ok/Err inner type code, for the single-evaluation Result-wrap type"
+  @source: vexprparse.intent:65
+  fields:
+    t : number
+
+
+-- res_wrap_ty: the type of Ok(inner) / Err(inner) from inner's computed code: an
+-- ill-typed inner still cascades (ERROR), else the neutral RESULT code 6 — clear of
+-- every other code (0/1/2 scalars, 3 ERROR, 4 bytes, 5 collection, 9 unannotated,
+-- 1000+ concepts, 7777 empty match). The lattice carries no Result component types,
+-- so 6 is deliberately payload-blind: sound for verbosec-clean programs (both arms
+-- of a Result rule type 6 and agree) without blessing an ill-typed payload.
+rule res_wrap_ty
+  @intention: "The type of an Ok/Err wrap from its inner's code: ERROR cascades, else the neutral RESULT code 6"
+  @source: vexprparse.intent:65
+  input:
+    rw : ResWrapState
+  output:
+    out : number
+  logic:
+    out = if rw.t == 3 then 3 else 6
+  proofs:
+    purity:
+      reads : [rw.t]
+      calls : []
+    termination:
+      bound : 8
+
+
+-- mres_ty's input: the ALREADY-COMPUTED scrutinee / ok-arm / err-arm type codes of a
+-- match_result (each typed exactly once by the caller, the arm bodies against the
+-- env extended with their binder — single-evaluation discipline).
+concept MResTyState
+  @intention: "Computed scrutinee + ok-arm + err-arm type codes of a match_result, for the single-evaluation common-arm type"
+  @source: vexprparse.intent:65
+  fields:
+    scrut_ty : number
+    ok_ty : number
+    err_ty : number
+
+
+-- mres_ty: the type of a match_result from its computed sub-type codes — the same
+-- common-arm rule as a match (arms_type_combine): an ill-typed scrutinee cascades;
+-- both arms must agree on a non-ERROR type, which becomes the match_result's type;
+-- disagreeing or ill-typed arms -> ERROR.
+rule mres_ty
+  @intention: "The type of a match_result: ERROR on ill-typed scrutinee; else the arms' common non-ERROR type, else ERROR"
+  @source: vexprparse.intent:65
+  input:
+    mr : MResTyState
+  output:
+    out : number
+  logic:
+    out = if mr.scrut_ty == 3 then 3 else (if mr.ok_ty == mr.err_ty and mr.ok_ty != 3 then mr.ok_ty else 3)
+  proofs:
+    purity:
+      reads : [mr.scrut_ty, mr.ok_ty, mr.err_ty]
+      calls : []
+    termination:
+      bound : 8
+
+
+-- V1b: concat's type is ARG-DRIVEN, mirroring verbosec's two concat contexts —
+-- a TEXT concat accepts scalar args (number/bool/text, numbers itoa'd) and
+-- produces text (2); a BYTES concat accepts ONLY bytes args (b"..." / le32 /
+-- le64 / bytes calls) and produces bytes (4). Mixing the modes, or an arg
+-- outside both (ERROR, concept, collection, Result), is ill-typed (3). The walk
+-- folds each argument's MODE: concat_arg_mode classifies one computed arg type,
+-- concat_mode_combine merges it with the rest's mode (8888 = "no args seen" —
+-- an empty concat closes as text). Each argument is typed exactly ONCE (the
+-- single-evaluation discipline).
+concept ConcatArgModeState
+  @intention: "One computed concat-argument type code, for classifying its concat mode"
+  @source: vexprparse.intent:65
+  fields:
+    t : number
+
+
+rule concat_arg_mode
+  @intention: "A concat argument's mode from its type code: scalar -> text (2), bytes -> bytes (4), anything else -> ill-typed (3)"
+  @source: vexprparse.intent:65
+  input:
+    cm : ConcatArgModeState
+  output:
+    out : number
+  logic:
+    out = if cm.t == 0 then 2 else (if cm.t == 1 then 2 else (if cm.t == 2 then 2 else (if cm.t == 4 then 4 else 3)))
+  proofs:
+    purity:
+      reads : [cm.t]
+      calls : []
+    termination:
+      bound : 16
+
+
+concept ConcatCombineState
+  @intention: "The head argument's mode + the rest-of-arguments mode, for the single-evaluation concat-mode combine"
+  @source: vexprparse.intent:65
+  fields:
+    head_mode : number
+    rest_mode : number
+
+
+rule concat_mode_combine
+  @intention: "Combine one concat argument's mode with the rest's: empty rest -> head; agreeing modes -> that mode; else ill-typed (3)"
+  @source: vexprparse.intent:65
+  input:
+    cc : ConcatCombineState
+  output:
+    out : number
+  logic:
+    out = if cc.rest_mode == 8888 then cc.head_mode else (if cc.head_mode == cc.rest_mode then cc.head_mode else 3)
+  proofs:
+    purity:
+      reads : [cc.head_mode, cc.rest_mode]
+      calls : []
+    termination:
+      bound : 16
+
+
+concept ConcatFinalState
+  @intention: "A folded concat mode, for closing the empty-concat sentinel to text"
+  @source: vexprparse.intent:65
+  fields:
+    m : number
+
+
+rule concat_ty_final
+  @intention: "Close a folded concat mode: the no-args sentinel 8888 becomes text (2), every other mode passes through"
+  @source: vexprparse.intent:65
+  input:
+    cf : ConcatFinalState
+  output:
+    out : number
+  logic:
+    out = if cf.m == 8888 then 2 else cf.m
+  proofs:
+    purity:
+      reads : [cf.m]
+      calls : []
+    termination:
+      bound : 8
+
+
+-- concat_args_ty: fold a concat's ArgList into its mode — each argument typed once
+-- (type_of_env, part of the checker SCC), classified (concat_arg_mode), combined
+-- with the rest (concat_mode_combine). ArgNil is the 8888 "no args" sentinel.
+-- Bound-only termination + the native recursion breadcrumb (the shrinking args
+-- tail is a field of the packed input).
+concept ConcatArgsTyState
+  @intention: "A concat's argument list + the typing context, for folding the arguments' concat mode"
+  @source: vexprparse.intent:65
+  fields:
+    args : ArgList
+    tenv : Env
+    src : text [..256]
+    prog : RuleList
+    concepts : ConceptList
+
+
+rule concat_args_ty
+  @intention: "The folded concat mode of an argument list: text (2) / bytes (4) / ill-typed (3) / 8888 if empty"
+  @source: vexprparse.intent:65
+  input:
+    ca : ConcatArgsTyState
+  output:
+    out : number
+  logic:
+    out = match ca.args:
+      ArgCons(head, tail) => concat_mode_combine(ConcatCombineState { head_mode: concat_arg_mode(ConcatArgModeState { t: type_of_env(TypeArg { node: head, tenv: ca.tenv, src: ca.src, prog: ca.prog, concepts: ca.concepts }) }), rest_mode: concat_args_ty(ConcatArgsTyState { args: tail, tenv: ca.tenv, src: ca.src, prog: ca.prog, concepts: ca.concepts }) })
+      ArgNil => 8888
+  proofs:
+    purity:
+      reads : [ca.args, ca.tenv, ca.src, ca.prog, ca.concepts]
+      calls : [concat_mode_combine, concat_arg_mode, type_of_env, concat_args_ty]
+    termination:
+      bound : 4000
 
 
 -- Single-evaluation match typing (the 2^40 lesson, checker edition): arms_type's
@@ -15345,14 +15681,14 @@ rule undef_span_rule
     let body = rd_body(a.rd)
     let binds = block_binds(body)
     let result = block_result(body)
-    let pbinds = param_to_binding(rd_params(a.rd))
+    let pbinds = param_to_binding(rule_params_of(a.rd))
     let scope = append_bindings(BindAppendState { a: pbinds, b: binds })
     let in_binds = undef_span_binds(UndefSpanBindsState { iter: binds, prefix: pbinds, src: a.src })
     out = span_or(SpanOrState { a: in_binds, b: undef_span_ast(UndefSpanAstState { node: result, binds: scope, src: a.src }) })
   proofs:
     purity:
       reads : [a.rd, a.src]
-      calls : [rd_body, block_binds, block_result, rd_params, param_to_binding, append_bindings, undef_span_binds, span_or, undef_span_ast]
+      calls : [rd_body, block_binds, block_result, rule_params_of, param_to_binding, append_bindings, undef_span_binds, span_or, undef_span_ast]
     termination:
       bound : 4000
 
@@ -15507,12 +15843,12 @@ rule badcall_span_ast
       AstNeg(inner) => badcall_span_ast(BadCallSpanState { node: inner, rules: a.rules, src: a.src })
       AstNot(inner) => badcall_span_ast(BadCallSpanState { node: inner, rules: a.rules, src: a.src })
       AstField(base, fstart, flen) => badcall_span_ast(BadCallSpanState { node: base, rules: a.rules, src: a.src })
-      AstCall(callee_start, callee_len, args) => if rule_named(RuleNamedState { rules: a.rules, src: a.src, q_start: callee_start, q_len: callee_len }) == 0 then Span::MkSpan { start: callee_start, len: callee_len } else badcall_span_args(BadCallSpanArgsState { args: args, rules: a.rules, src: a.src })
+      AstCall(callee_start, callee_len, args) => if rule_named(RuleNamedState { rules: a.rules, src: a.src, q_start: callee_start, q_len: callee_len }) == 0 and span_is_primitive(SpanCheck { src: a.src, start: callee_start, len: callee_len }) == 0 then Span::MkSpan { start: callee_start, len: callee_len } else badcall_span_args(BadCallSpanArgsState { args: args, rules: a.rules, src: a.src })
       AstIf(cond, thn, els) => span_or(SpanOrState { a: span_or(SpanOrState { a: badcall_span_ast(BadCallSpanState { node: cond, rules: a.rules, src: a.src }), b: badcall_span_ast(BadCallSpanState { node: thn, rules: a.rules, src: a.src }) }), b: badcall_span_ast(BadCallSpanState { node: els, rules: a.rules, src: a.src }) })
   proofs:
     purity:
       reads : [a.node, a.rules, a.src]
-      calls : [rule_named, span_or, badcall_span_ast, badcall_span_args, badcall_span_vfields, badcall_span_arms]
+      calls : [rule_named, span_is_primitive, span_or, badcall_span_ast, badcall_span_args, badcall_span_vfields, badcall_span_arms]
     termination:
       bound : 4000
 

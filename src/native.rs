@@ -39418,14 +39418,40 @@ rule two
     /// match_arm_ty), after which the full walk needs ~1.5M nodes / ~0.25 s —
     /// comfortably inside the existing caps (no cap raise).
     ///
-    /// The pinned count 1468 is NOT "1468 real lints": a minimal program
-    /// verbosec verifies clean still gets diags from the self-hosted linter, so
-    /// these are known checker-MODEL false positives (cat 1: rule input names
-    /// not in scope for let-RHS/constructor walks; cat 2: no primitive
-    /// allowlist; cat 3: record-constructor-arg arity; cat 4: R6b Result-node
-    /// stubs typing as ERROR). Follow-up slices fix the models and shrink this
-    /// pin toward 0 — each consciously updating it. What this test pins is:
-    /// the walk COMPLETES (exit 0, was rc=1), fast, at a deterministic count.
+    /// V1a pinned the count at 1468 — NOT "1468 real lints" but four known
+    /// checker-MODEL false-positive families, since fixed by V1b (2026-07),
+    /// which took the pin 1468 -> 871 -> 415 -> 319 -> 0 one category at a
+    /// time:
+    ///   cat 1 (597, one per rule): lint_rule / undef_span_rule built the base
+    ///     scope from rd_params only, so the `input:`-block name (`s` in
+    ///     `s.source`) was never in scope — fixed by reading the EFFECTIVE
+    ///     params via rule_params_of (parens params if non-empty, else the
+    ///     input: fields converted), the executor's own scoping.
+    ///   cat 3 (456): rule_arity read param_list_len(rd_params) — declared
+    ///     arity 0 for every input:-block rule, so every 1-argument call was a
+    ///     mismatch. Same rule_params_of fix on the DECLARED side. (A record
+    ///     constructor argument was always correctly ONE ArgList entry — the
+    ///     miscount was the declared side, not the ctor.)
+    ///   cat 2 (96): the badcall lint had no primitive allowlist — fixed by
+    ///     span_is_primitive (the exact span_is_* recognizer set: byte_at /
+    ///     length / substring / concat / le32 / le64 / max / min /
+    ///     arena_scope), mirroring how the R6d purity pass exempts primitives.
+    ///   cat 4 (319): R6b typed AstField as a stub ERROR (3) and every
+    ///     primitive call as number — fixed by real field-selection typing
+    ///     (field_sel_ty / field_ty_of over the base concept's declared field
+    ///     types), call_result_type resolving the callee's `output:` span
+    ///     (concept codes included) plus primitive result types, arg-driven
+    ///     concat typing (text vs bytes mode, mirroring verbosec's two concat
+    ///     contexts), `bytes` resolving to its own code 4, and sound non-ERROR
+    ///     typing for the Result/reduction nodes (Ok/Err wrap -> 6,
+    ///     match_result -> common arm type, sum/count -> number, all/any ->
+    ///     bool, fold -> init's type, map/filter -> 5).
+    ///
+    /// What this test pins now: the walk COMPLETES (exit 0, was rc=1), fast,
+    /// and the full self-source is CLEAN under its own linter — the V2/V3
+    /// bootstrap gate can be fail-closed on nonzero. The sibling
+    /// `self_verify_v1b_checker_models_fixed_not_vacuous` pins that the
+    /// checkers did not go vacuous.
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn self_verify_v1a_lint_walk_survives_full_self_source() {
@@ -39468,12 +39494,124 @@ rule two
             .parse()
             .expect("all_diags_count must print a number");
         assert_eq!(
-            count, 1468,
-            "full-source diag count drifted — if a checker-model slice just \
-             landed, update this pin consciously (it should only SHRINK toward 0)"
+            count, 0,
+            "the full self-source must be CLEAN under its own linter (V1b \
+             fixed the four checker-model false-positive families); a nonzero \
+             count is either a real lint introduced in the source or a checker \
+             regression — investigate, don't re-pin"
         );
 
         let _ = fs::remove_file(&bin);
+    }
+
+    /// Self-verify arc V1b (2026-07): the four checker-model fixes did NOT make
+    /// the checkers vacuous. A minimal verbosec-clean 2-rule program (input:
+    /// blocks, a record-constructor call argument, a primitive call — every
+    /// shape the V1a false positives fired on) reports 0 diagnostics, and one
+    /// seeded genuine violation per category still flags with the right
+    /// category code:
+    ///   cat 1 — a truly undefined variable in an input:-block rule (the scope
+    ///           fix must not blanket-exempt);
+    ///   cat 2 — a call to a truly undefined rule named unlike any primitive,
+    ///           both bare and nested inside a primitive's arguments (the
+    ///           allowlist must not swallow the args walk);
+    ///   cat 3 — a genuinely wrong arity WITHOUT a constructor argument, and
+    ///           WITH a constructor plus one extra argument (a ctor arg is ONE
+    ///           argument);
+    ///   cat 4 — a genuine number+bool clash, a read of an undeclared field,
+    ///           and a bytes/text concat mix (the three typing surfaces V1b
+    ///           rebuilt).
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn self_verify_v1b_checker_models_fixed_not_vacuous() {
+        use std::fs;
+        use std::process::Command;
+
+        let src = fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let count_bin = std::env::temp_dir().join("verbosec_test_v1b_all_diags_count");
+        let cat_bin = std::env::temp_dir().join("verbosec_test_v1b_nth_diag_at_cat");
+        compile_native_stdin_raw(&program, "all_diags_count", count_bin.to_str().unwrap())
+            .expect("all_diags_count must compile --stdin-raw");
+        compile_native_stdin_raw(&program, "nth_diag_at_cat", cat_bin.to_str().unwrap())
+            .expect("nth_diag_at_cat must compile --stdin-raw");
+        for bin in [&count_bin, &cat_bin] {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(bin).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(bin, perms).unwrap();
+        }
+
+        let run = |bin: &std::path::Path, arg: &str, program_src: &str| -> i64 {
+            use std::io::Write;
+            let tmp = std::env::temp_dir().join(format!(
+                "verbosec_test_v1b_probe_{}.verbose",
+                std::process::id()
+            ));
+            fs::File::create(&tmp)
+                .unwrap()
+                .write_all(program_src.as_bytes())
+                .unwrap();
+            let out = Command::new("sh")
+                .arg("-c")
+                .arg(format!(
+                    "ulimit -s unlimited; '{}' {} < '{}'",
+                    bin.display(),
+                    arg,
+                    tmp.display()
+                ))
+                .output()
+                .expect("run a v1b probe");
+            let _ = fs::remove_file(&tmp);
+            assert!(out.status.success(), "v1b probe must exit 0: {:?}", out.status);
+            String::from_utf8_lossy(&out.stdout).trim().parse().unwrap()
+        };
+
+        // A verbosec-clean 2-rule program covering every V1a false-positive
+        // shape: input: blocks (cat 1), a primitive call (cat 2), a
+        // record-constructor call argument (cat 3), field reads + a
+        // constructor + a primitive in typing positions (cat 4).
+        let clean = "concept St\n  fields:\n    n : number\nrule f\n  input:\n    s : St\n  output:\n    out : number\n  logic:\n    let m = s.n + 1\n    out = m\nrule g\n  input:\n    s : St\n  output:\n    out : number\n  logic:\n    out = f(St { n: s.n }) + length(\"ab\")\n";
+        assert_eq!(
+            run(&count_bin, "0", clean),
+            0,
+            "the minimal verbosec-clean program must report ZERO diagnostics"
+        );
+
+        // Seeded genuine violations: (program, expected first category, label).
+        let controls: &[(&str, i64, &str)] = &[
+            ("concept St\n  fields:\n    n : number\nrule f\n  input:\n    s : St\n  output:\n    out : number\n  logic:\n    let m = s.n + zzz\n    out = m\n",
+             1, "cat 1: truly undefined variable"),
+            ("concept St\n  fields:\n    n : number\nrule f\n  input:\n    s : St\n  output:\n    out : number\n  logic:\n    out = ghost_rule(s.n)\n",
+             2, "cat 2: truly undefined callee"),
+            ("concept St\n  fields:\n    n : number\nrule f\n  input:\n    s : St\n  output:\n    out : number\n  logic:\n    out = max(s.n, ghost_rule(1))\n",
+             2, "cat 2: undefined callee nested in a primitive's args"),
+            ("concept St\n  fields:\n    n : number\nrule f\n  input:\n    s : St\n  output:\n    out : number\n  logic:\n    out = s.n\nrule main\n  input:\n    s : St\n  output:\n    out : number\n  logic:\n    out = f(1, 2)\n",
+             3, "cat 3: wrong arity without a constructor"),
+            ("concept St\n  fields:\n    n : number\nrule f\n  input:\n    s : St\n  output:\n    out : number\n  logic:\n    out = s.n\nrule main\n  input:\n    s : St\n  output:\n    out : number\n  logic:\n    out = f(St { n: 1 }, 7)\n",
+             3, "cat 3: constructor plus one extra argument"),
+            ("concept St\n  fields:\n    n : number\nrule f\n  input:\n    s : St\n  output:\n    out : number\n  logic:\n    let b = 1 < 2\n    out = s.n + b\n",
+             4, "cat 4: number + bool clash"),
+            ("concept St\n  fields:\n    n : number\nrule f\n  input:\n    s : St\n  output:\n    out : number\n  logic:\n    out = s.nope\n",
+             4, "cat 4: read of an undeclared field"),
+            ("concept St\n  fields:\n    n : number\nrule f\n  input:\n    s : St\n  output:\n    out : bytes\n  logic:\n    out = concat(le32(s.n), \"x\")\n",
+             4, "cat 4: bytes/text concat mix"),
+        ];
+        for (probe, want_cat, label) in controls {
+            let n = run(&count_bin, "0", probe);
+            assert!(n >= 1, "{label}: the seeded violation must still flag (got 0 diags)");
+            let cat = run(&cat_bin, "0", probe);
+            assert_eq!(
+                cat, *want_cat,
+                "{label}: the first diagnostic must carry the seeded category"
+            );
+        }
+
+        let _ = fs::remove_file(&count_bin);
+        let _ = fs::remove_file(&cat_bin);
     }
 
     /// THE TWO-GENERATION BOOTSTRAP FIXED POINT (2026-07): the self-hosted
