@@ -78,7 +78,7 @@ fn count_nodes(expr: &Expr) -> usize {
         // `le32(n)` / `le64(n)` — one node + recurse (same shape as Abs).
         Expr::Le32(inner) | Expr::Le64(inner) => 1 + count_nodes(inner),
         // `arena_scope(inner)` — one node + recurse (transparent wrapper).
-        Expr::ArenaScope(inner) => 1 + count_nodes(inner),
+        Expr::ArenaScope(inner) | Expr::AbortIf(inner) => 1 + count_nodes(inner),
         // `min(a, b)` / `max(a, b)` — same shape as Binary: count this node
         // + recurse into both children.
         Expr::Min(l, r) | Expr::Max(l, r) | Expr::BitAnd(l, r) | Expr::BitOr(l, r) | Expr::BitXor(l, r) | Expr::Shl(l, r) | Expr::Shr(l, r) => 1 + count_nodes(l) + count_nodes(r),
@@ -443,6 +443,10 @@ pub fn substitute_ident(expr: &Expr, name: &str, replacement: &Expr) -> Expr {
         ),
         // `arena_scope(inner)` — substitute through the inner expression.
         Expr::ArenaScope(inner) => Expr::ArenaScope(
+            Box::new(substitute_ident(inner, name, replacement)),
+        ),
+        // `abort_if(inner)` — substitute through the inner expression.
+        Expr::AbortIf(inner) => Expr::AbortIf(
             Box::new(substitute_ident(inner, name, replacement)),
         ),
         // `min(a, b)` — substitute through both children.
@@ -861,6 +865,17 @@ pub fn optimize_expr(
         Expr::ArenaScope(inner) => {
             let inner = optimize_expr(inner, input_name, field_ranges);
             Expr::ArenaScope(Box::new(inner))
+        }
+        // `abort_if(inner)` — recurse into inner and KEEP the wrapper.
+        // Never fold it away, even when inner is a constant: the check is
+        // DECLARED and must execute at runtime — folding `abort_if(0)` to
+        // empty bytes would erase a declared gate from the emitted binary,
+        // and folding a nonzero constant would have to become a
+        // compile-time refusal, which is the verifier's job, not the
+        // optimizer's.
+        Expr::AbortIf(inner) => {
+            let inner = optimize_expr(inner, input_name, field_ranges);
+            Expr::AbortIf(Box::new(inner))
         }
         // `min(a, b)` — recurse into both children. When both collapse to
         // number literals, fold to the smaller at compile time. Otherwise

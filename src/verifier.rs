@@ -390,7 +390,7 @@ fn collect_read_names(expr: &Expr, out: &mut Vec<String>) {
         Expr::Length(inner) => collect_read_names(inner, out),
         // `abs(<number_expr>)` — pure pass-through; the inner may carry a
         // `read(...)` via `parse_int(read(name))` etc.
-        Expr::Abs(inner) | Expr::BitNot(inner) | Expr::Le32(inner) | Expr::Le64(inner) | Expr::ArenaScope(inner) => collect_read_names(inner, out),
+        Expr::Abs(inner) | Expr::BitNot(inner) | Expr::Le32(inner) | Expr::Le64(inner) | Expr::ArenaScope(inner) | Expr::AbortIf(inner) => collect_read_names(inner, out),
         // `min(a, b)` / `max(a, b)` — recurse into both children; either
         // side may carry a `read(...)` (e.g. `min(amount, parse_int(read(cap)))`).
         Expr::Min(l, r) | Expr::Max(l, r) | Expr::BitAnd(l, r) | Expr::BitOr(l, r) | Expr::BitXor(l, r) | Expr::Shl(l, r) | Expr::Shr(l, r) => {
@@ -542,7 +542,7 @@ fn collect_fetch_names(expr: &Expr, out: &mut Vec<String>) {
         // `length(<text_expr>)` — pure pass-through.
         Expr::Length(inner) => collect_fetch_names(inner, out),
         // `abs(<number_expr>)` — pure pass-through.
-        Expr::Abs(inner) | Expr::BitNot(inner) | Expr::Le32(inner) | Expr::Le64(inner) | Expr::ArenaScope(inner) => collect_fetch_names(inner, out),
+        Expr::Abs(inner) | Expr::BitNot(inner) | Expr::Le32(inner) | Expr::Le64(inner) | Expr::ArenaScope(inner) | Expr::AbortIf(inner) => collect_fetch_names(inner, out),
         // `min(a, b)` / `max(a, b)` — recurse into both children.
         Expr::Min(l, r) | Expr::Max(l, r) | Expr::BitAnd(l, r) | Expr::BitOr(l, r) | Expr::BitXor(l, r) | Expr::Shl(l, r) | Expr::Shr(l, r) => {
             collect_fetch_names(l, out);
@@ -662,7 +662,7 @@ fn collect_fetch_names_with_dups(expr: &Expr, out: &mut Vec<String>) {
         // `length(<text_expr>)` — pure pass-through.
         Expr::Length(inner) => collect_fetch_names_with_dups(inner, out),
         // `abs(<number_expr>)` — pure pass-through.
-        Expr::Abs(inner) | Expr::BitNot(inner) | Expr::Le32(inner) | Expr::Le64(inner) | Expr::ArenaScope(inner) => collect_fetch_names_with_dups(inner, out),
+        Expr::Abs(inner) | Expr::BitNot(inner) | Expr::Le32(inner) | Expr::Le64(inner) | Expr::ArenaScope(inner) | Expr::AbortIf(inner) => collect_fetch_names_with_dups(inner, out),
         // `min(a, b)` / `max(a, b)` — recurse into both children.
         Expr::Min(l, r) | Expr::Max(l, r) | Expr::BitAnd(l, r) | Expr::BitOr(l, r) | Expr::BitXor(l, r) | Expr::Shl(l, r) | Expr::Shr(l, r) => {
             collect_fetch_names_with_dups(l, out);
@@ -1263,6 +1263,7 @@ fn describe_expr_kind(e: &Expr) -> &'static str {
         Expr::Min(_, _) => "min",
         Expr::Max(_, _) => "max",
         Expr::ArenaScope(_) => "arena_scope",
+        Expr::AbortIf(_) => "abort_if",
         Expr::Substring(_, _, _) => "substring",
         Expr::ByteAt(_, _) => "byte_at",
         Expr::FoldBytes(_, _, _, _, _, _) => "fold_bytes",
@@ -2232,6 +2233,27 @@ fn check_expr_against(
                 ),
             });
         }
+        // `abort_if(<number>)` : bytes — V3 self-verify gate. In a bytes
+        // (streaming) position it EXECUTES a runtime check: nonzero →
+        // sys_exit(1), fail-closed, nothing streamed; zero → falls through
+        // streaming ZERO bytes, so the surrounding bytes concat is
+        // byte-identical to the ungated form. The inner must be
+        // number-typed. Restricting to a bytes context is the soundness
+        // frame it shares with arena_scope: the gate guards a bytes
+        // stream and contributes no bytes to it — a value position would
+        // have nothing meaningful to evaluate to.
+        (Expr::AbortIf(inner), Type::Bytes) => {
+            check_expr_against(inner, &Type::Number, rule, all_rules, input_concept, all_concepts, errors);
+        }
+        (Expr::AbortIf(_), other) => {
+            errors.push(VerifyError {
+                context: format!("rule '{}' / logic", rule.name),
+                message: format!(
+                    "abort_if(...) executes a fail-closed check and streams zero bytes; it is only valid in a bytes (streaming) position, but the expected type is '{}'",
+                    type_display(other),
+                ),
+            });
+        }
         // Phase A slice 2: variant construction —
         // `ConceptName::VariantName { field: expr, ... }`. Cross-check that
         // the concept is a sum-type concept, the variant exists, and the
@@ -2623,6 +2645,12 @@ fn infer_expr_type(
         // `arena_scope(inner)` is transparent: its type IS inner's type
         // (which the bytes-context check constrains to bytes).
         Expr::ArenaScope(inner) => infer_expr_type(inner, rule, all_rules, concept),
+        // `abort_if(<number>)` types as BYTES (it occupies a bytes-stream
+        // position and contributes zero bytes to it) — NOT as its inner's
+        // number type. Typing it bytes is what keeps an all-bytes concat's
+        // mixing check sound: `concat(abort_if(e), <bytes...>)` stays an
+        // all-bytes concat.
+        Expr::AbortIf(_) => Some(Type::Bytes),
         // Phase 11 slice 1: fetch(<connection>, _) returns text — same
         // inference as read(<resource>). Existence of the connection and
         // type-check of the request bytes are handled separately.
@@ -2929,7 +2957,7 @@ fn walk_for_match_result_callees(
         }
         Expr::Ok(i) | Expr::Err(i) | Expr::Not(i) | Expr::Neg(i) | Expr::Abs(i)
         | Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i) | Expr::BitNot(i)
-        | Expr::Le32(i) | Expr::Le64(i) | Expr::ArenaScope(i) => {
+        | Expr::Le32(i) | Expr::Le64(i) | Expr::ArenaScope(i) | Expr::AbortIf(i) => {
             walk_for_match_result_callees(i, rules_by_name, all_resources, all_connections, visited, out_reads);
         }
         Expr::Binary(_, l, r) => {
@@ -3197,6 +3225,13 @@ fn collect_expr_facts(
         Expr::ArenaScope(inner) => {
             collect_expr_facts(inner, reads, calls);
         }
+        // `abort_if(inner)` — a primitive, not a call: the gate itself adds
+        // no synthetic read or call fact (mirror of arena_scope); inner
+        // contributes its own reads/calls. This is what lets the
+        // self-source's `elf_program_src` declare only its REAL callees.
+        Expr::AbortIf(inner) => {
+            collect_expr_facts(inner, reads, calls);
+        }
         // `min(a, b)` / `max(a, b)` — pure: branch-free scalar comparison
         // adds no synthetic read; each child contributes its own facts.
         Expr::Min(l, r) | Expr::Max(l, r) | Expr::BitAnd(l, r) | Expr::BitOr(l, r) | Expr::BitXor(l, r) | Expr::Shl(l, r) | Expr::Shr(l, r) => {
@@ -3406,7 +3441,7 @@ fn collect_lambda_bound_names(expr: &Expr) -> std::collections::HashSet<String> 
             Expr::If(c, t, el) => { walk(c, out); walk(t, out); walk(el, out); }
             Expr::Not(i) | Expr::Neg(i) | Expr::Abs(i) | Expr::Length(i)
             | Expr::ParseInt(i) | Expr::JsonEscape(i) | Expr::Ok(i) | Expr::Err(i)
-            | Expr::Le32(i) | Expr::Le64(i) | Expr::ArenaScope(i) => {
+            | Expr::Le32(i) | Expr::Le64(i) | Expr::ArenaScope(i) | Expr::AbortIf(i) => {
                 walk(i, out);
             }
             Expr::Min(a, b) | Expr::Max(a, b) | Expr::BitAnd(a, b) | Expr::BitOr(a, b) | Expr::BitXor(a, b) | Expr::Shl(a, b) | Expr::Shr(a, b) | Expr::StartsWith(a, b)
@@ -3677,7 +3712,7 @@ fn collect_recursive_call_args(expr: &Expr, rule_name: &str, out: &mut Vec<Strin
         Expr::Binary(_, l, r) => { collect_recursive_call_args(l, rule_name, out); collect_recursive_call_args(r, rule_name, out); }
         Expr::Not(i) | Expr::Neg(i) | Expr::Ok(i) | Expr::Err(i)
         | Expr::Abs(i) | Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i) | Expr::BitNot(i)
-        | Expr::Le32(i) | Expr::Le64(i) | Expr::ArenaScope(i) => collect_recursive_call_args(i, rule_name, out),
+        | Expr::Le32(i) | Expr::Le64(i) | Expr::ArenaScope(i) | Expr::AbortIf(i) => collect_recursive_call_args(i, rule_name, out),
         Expr::If(c, t, e) => { collect_recursive_call_args(c, rule_name, out); collect_recursive_call_args(t, rule_name, out); collect_recursive_call_args(e, rule_name, out); }
         Expr::Call(_, args) | Expr::Concat(args) => { for a in args { collect_recursive_call_args(a, rule_name, out); } }
         Expr::Quantifier(_, c, _, body) => { collect_recursive_call_args(c, rule_name, out); collect_recursive_call_args(body, rule_name, out); }
@@ -3930,7 +3965,7 @@ fn collect_recursive_call_record_args(expr: &Expr, rule_name: &str, out: &mut Ve
         Expr::Binary(_, l, r) => { collect_recursive_call_record_args(l, rule_name, out); collect_recursive_call_record_args(r, rule_name, out); }
         Expr::Not(i) | Expr::Neg(i) | Expr::Ok(i) | Expr::Err(i)
         | Expr::Abs(i) | Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i) | Expr::BitNot(i)
-        | Expr::Le32(i) | Expr::Le64(i) | Expr::ArenaScope(i) => collect_recursive_call_record_args(i, rule_name, out),
+        | Expr::Le32(i) | Expr::Le64(i) | Expr::ArenaScope(i) | Expr::AbortIf(i) => collect_recursive_call_record_args(i, rule_name, out),
         Expr::If(c, t, e) => { collect_recursive_call_record_args(c, rule_name, out); collect_recursive_call_record_args(t, rule_name, out); collect_recursive_call_record_args(e, rule_name, out); }
         Expr::Call(_, args) | Expr::Concat(args) => { for a in args { collect_recursive_call_record_args(a, rule_name, out); } }
         Expr::Quantifier(_, c, _, body) => { collect_recursive_call_record_args(c, rule_name, out); collect_recursive_call_record_args(body, rule_name, out); }
@@ -4008,7 +4043,7 @@ fn count_operations(expr: &Expr) -> usize {
         // `abs(<number_expr>)` — same shape as Neg: one op + inner cost.
         Expr::Abs(inner) => 1 + count_operations(inner),
         // `le32(n)` / `le64(n)` — one op + inner cost (same shape as Abs).
-        Expr::Le32(inner) | Expr::Le64(inner) | Expr::ArenaScope(inner) => 1 + count_operations(inner),
+        Expr::Le32(inner) | Expr::Le64(inner) | Expr::ArenaScope(inner) | Expr::AbortIf(inner) => 1 + count_operations(inner),
         // `min(a, b)` / `max(a, b)` — branch-free scalar; one op + each child.
         Expr::Min(l, r) | Expr::Max(l, r) | Expr::BitAnd(l, r) | Expr::BitOr(l, r) | Expr::BitXor(l, r) | Expr::Shl(l, r) | Expr::Shr(l, r) => 1 + count_operations(l) + count_operations(r),
         // `substring(text, start, end)` — one op for the slice operation

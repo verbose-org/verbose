@@ -736,6 +736,19 @@ pub enum Expr {
     /// use `arena_scope` are unaffected (purely additive). See
     /// docs/self-hosting-arena-scope-design.md.
     ArenaScope(Box<Expr>),
+    /// `abort_if(<number_expr>)` — V3 of the self-verify arc: a declared
+    /// fail-closed gate in a STREAMING-BYTES position. At runtime the
+    /// number is evaluated; if it is nonzero the process exits with
+    /// status 1 (nothing further is streamed — fail-closed); if it is
+    /// zero, execution falls through having streamed ZERO output bytes,
+    /// so `concat(abort_if(e), <bytes...>)` is byte-identical to the
+    /// ungated concat when the check passes. The canonical use is the
+    /// self-hosted bootstrap gate: `concat(abort_if(verify_errors),
+    /// <ELF bytes...>)` — the self-compiled compiler VERIFIES before it
+    /// emits. Restricted to a bytes (streaming) position, same posture
+    /// as ArenaScope; the argument must be number-typed. The optimizer
+    /// never folds it away (the check is declared and must execute).
+    AbortIf(Box<Expr>),
     /// `band(<a>, <b>)` — bitwise AND on Number args. Native: `and rax, rcx`.
     BitAnd(Box<Expr>, Box<Expr>),
     /// `bor(<a>, <b>)` — bitwise OR on Number args. Native: `or rax, rcx`.

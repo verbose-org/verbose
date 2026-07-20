@@ -1357,6 +1357,23 @@ impl Parser {
                 }
                 self.expect_kind(TokenKind::RParen)?;
                 Ok(Expr::ArenaScope(Box::new(inner)))
+            } else if name == "abort_if" && self.check_kind(&TokenKind::LParen) {
+                // `abort_if(<number_expr>)` — V3 self-verify gate: in a
+                // streaming-bytes position, evaluates the number and
+                // sys_exit(1)s when it is nonzero; streams zero bytes when
+                // it is zero. Exactly one argument; same arity-check shape
+                // as arena_scope. The verifier checks the inner is
+                // number-typed and that this sits in a bytes context.
+                self.advance(); // (
+                if self.check_kind(&TokenKind::RParen) {
+                    return Err(self.error("abort_if requires exactly one argument, got zero"));
+                }
+                let inner = self.parse_expr()?;
+                if self.check_kind(&TokenKind::Comma) {
+                    return Err(self.error("abort_if requires exactly one argument, got more than one"));
+                }
+                self.expect_kind(TokenKind::RParen)?;
+                Ok(Expr::AbortIf(Box::new(inner)))
             } else if (name == "band" || name == "bor" || name == "bxor"
                        || name == "shl" || name == "shr")
                       && self.check_kind(&TokenKind::LParen) {
