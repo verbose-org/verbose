@@ -15237,6 +15237,38 @@ rule all_diags_count
       bound : 256
 
 
+-- verify_errors: THE AGGREGATE VERIFICATION GATE (self-verify arc V2). One
+-- tokenize + parse, then the sum of every self-hosted proof surface over the
+-- program: the R6a/R6b lint+type diagnostics (diag_count over prog_diags — the
+-- walk V1a made survive the full self-source and V1b drove to 0 on it), the
+-- R6d purity violations (purity_list: undeclared calls/reads vs the parsed
+-- proofs), and the termination violations (term_list: decreasing/increasing/
+-- structural arg-pattern checks on self-recursive calls). 0 = the program
+-- passes every check the self-hosted compiler knows how to make — the number
+-- V3 gates emission on (parse -> VERIFY -> emit, fail-closed). This is a
+-- SUBSET of verbosec's verifier (the honest framing: the four self-hosted
+-- proof surfaces, not verbosec's full check set); the self-source itself
+-- scores 0 here, pinned by self_verify_v2_aggregate_gate.
+rule verify_errors
+  @intention: "Tokenize and parse once, then sum every self-hosted verification surface: lint+type diags + purity violations + termination violations"
+  @source: vexprparse.intent:42
+  input:
+    s : ScanState
+  output:
+    out : number
+  logic:
+    let toks = begin_tokenize(ScanState { source: s.source, pos: 0 })
+    let prog = parse_program(ProgramState { cell: toks, src: s.source })
+    let concepts = parse_concepts(ProgramState { cell: toks, src: s.source })
+    out = diag_count(prog_diags(ProgDiagsState { iter: prog, full: prog, src: s.source, idx: 0, concepts: concepts })) + purity_list(PurityListState { iter: prog, full: prog, src: s.source }) + term_list(TermListState { iter: prog, src: s.source })
+  proofs:
+    purity:
+      reads : [s.source]
+      calls : [begin_tokenize, parse_program, parse_concepts, diag_count, prog_diags, purity_list, term_list]
+    termination:
+      bound : 256
+
+
 -- nth_diag_at_rule: the rule index of the n-th diagnostic, where n is taken from
 -- argv arg 2 (s.pos doubles as the index). Front end + prog_diags identical to
 -- all_diags_count; nth_diag_rule reads the n-th cell. 9999 if n is out of bounds.

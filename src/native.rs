@@ -39614,6 +39614,86 @@ rule two
         let _ = fs::remove_file(&cat_bin);
     }
 
+    /// Self-verify arc V2 (2026-07): THE AGGREGATE GATE. `verify_errors` =
+    /// one tokenize+parse, then the sum of every self-hosted proof surface:
+    /// R6a/R6B lint+type diags (diag_count over prog_diags) + R6d purity
+    /// violations (purity_list) + termination violations (term_list). 0 = the
+    /// program passes every check the self-hosted compiler knows how to make —
+    /// the number V3 gates emission on (parse → VERIFY → emit, fail-closed).
+    /// Honest framing: a SUBSET of verbosec's verifier (the four self-hosted
+    /// surfaces), and the self-source itself scores 0.
+    ///
+    /// Pins: full self-source → 0; a clean two-rule program (declared calls,
+    /// full proofs) → 0; one seeded violation per surface stays nonzero
+    /// (lint: undefined var → 1; purity: undeclared call → 1; termination:
+    /// `decreasing : n` whose recursive arg does NOT decrease → 2).
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn self_verify_v2_aggregate_gate() {
+        use std::fs;
+        use std::process::Command;
+
+        let src = fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let bin = std::env::temp_dir().join("verbosec_test_v2_verify_errors");
+        compile_native_stdin_raw(&program, "verify_errors", bin.to_str().unwrap())
+            .expect("verify_errors must compile --stdin-raw");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&bin).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&bin, perms).unwrap();
+        }
+
+        let run_on = |input_path: &str| -> i64 {
+            let out = Command::new("sh")
+                .arg("-c")
+                .arg(format!(
+                    "ulimit -s unlimited; '{}' 0 < '{}'",
+                    bin.display(),
+                    input_path
+                ))
+                .output()
+                .expect("run verify_errors");
+            assert!(out.status.success(), "verify_errors must exit 0 for {input_path}; got {:?}", out.status);
+            String::from_utf8_lossy(&out.stdout).trim().parse().expect("a number")
+        };
+
+        // The self-source passes its own aggregate verification.
+        assert_eq!(run_on("examples/vexprparse.verbose"), 0,
+            "the full self-source must score 0 on the aggregate gate");
+
+        let tmp = std::env::temp_dir();
+        let write = |name: &str, body: &str| -> String {
+            let p = tmp.join(name);
+            fs::write(&p, body).unwrap();
+            p.to_str().unwrap().to_string()
+        };
+
+        let clean = write("v2_clean.verbose",
+            "rule main\n  logic:\n    out = helper(1)\n  proofs:\n    purity:\n      reads : []\n      calls : [helper]\n    termination:\n      bound : 8\nrule helper(x)\n  logic:\n    out = x * 2\n  proofs:\n    purity:\n      reads : [x]\n      calls : []\n    termination:\n      bound : 8\n");
+        assert_eq!(run_on(&clean), 0, "a fully-declared clean program must score 0");
+
+        let lint_seed = write("v2_lint.verbose", "rule main\n  logic:\n    out = zzz + 1\n");
+        assert_eq!(run_on(&lint_seed), 1, "an undefined variable must flag (lint surface)");
+
+        let purity_seed = write("v2_pur.verbose",
+            "rule main\n  logic:\n    out = helper(1)\nrule helper(x)\n  logic:\n    out = x * 2\n  proofs:\n    purity:\n      reads : [x]\n      calls : []\n    termination:\n      bound : 8\n");
+        assert_eq!(run_on(&purity_seed), 1, "an undeclared call must flag (purity surface)");
+
+        let term_seed = write("v2_term.verbose",
+            "concept St\n  fields:\n    n : number\nrule main\n  logic:\n    out = go(St { n: 5 })\n  proofs:\n    purity:\n      reads : []\n      calls : [go]\n    termination:\n      bound : 8\nrule go(s : St)\n  logic:\n    out = if s.n == 0 then 0 else go(St { n: s.n })\n  proofs:\n    purity:\n      reads : [s.n]\n      calls : [go]\n    termination:\n      bound : 64\n      decreasing : n\n");
+        assert_eq!(run_on(&term_seed), 2, "a non-decreasing arg under `decreasing :` must flag (termination surface)");
+
+        for f in ["v2_clean.verbose", "v2_lint.verbose", "v2_pur.verbose", "v2_term.verbose"] {
+            let _ = fs::remove_file(tmp.join(f));
+        }
+        let _ = fs::remove_file(&bin);
+    }
+
     /// THE TWO-GENERATION BOOTSTRAP FIXED POINT (2026-07): the self-hosted
     /// emitter reproduces its ENTIRE self, byte-for-byte, across two
     /// generations.
