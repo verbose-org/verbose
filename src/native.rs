@@ -40155,6 +40155,143 @@ rule two
         }
     }
 
+    /// THE COMPOSITE DEMO (2026-07): examples/expense_audit.verbose — a
+    /// production-shaped program (record collection + reductions + a text-fold
+    /// report + a Result validator, FULL declarations on every rule) compiled
+    /// end-to-end by gen1, the self-compiled VERIFYING compiler. Five entries
+    /// (gen1 compiles the first rule; each entry is reordered to the front, the
+    /// two-generation recipe), plus THE REFUSAL: seed one violation and gen1
+    /// exits 1 having emitted zero bytes.
+    ///
+    /// This demo file is also the reason the tok_kind `300 + value` aliasing
+    /// bug was found (its `> 500` literal had kind 800 == Dedent and the
+    /// parser silently swallowed every rule after `flagged`) — the demo doing
+    /// exactly its job: milestone diversity is coverage.
+    ///
+    /// Named with the `two_generation` prefix so the CI self-hosting-bootstrap
+    /// job (filter `two_generation`) runs it alongside the fixed-point test.
+    /// Light next to that test: gen1 is built via gen0's cheap emit direction
+    /// (~194 MB — gen0 stack-passes) and only ever emits SMALL demo entries, so
+    /// it peaks ~200 MB / ~5 s; it needs `ulimit -s unlimited` (the src_blob
+    /// recursion while gen0 emits the full reordered source), raised internally
+    /// by the emit shell-outs.
+    #[test]
+    #[ignore = "builds a gen1 compiler binary + needs `ulimit -s unlimited`; ~5s; run with --ignored"]
+    #[cfg(target_arch = "x86_64")]
+    fn two_generation_composite_demo_expense_audit_via_gen1() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        let src = fs::read_to_string("examples/vexprparse.verbose").unwrap();
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+        let gen0 = std::env::temp_dir().join("verbosec_test_demo_gen0");
+        compile_native_stdin_raw(&program, "elf_program_src", gen0.to_str().unwrap()).unwrap();
+        let chmod = |p: &std::path::Path| {
+            let mut perms = fs::metadata(p).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(p, perms).unwrap();
+        };
+        chmod(&gen0);
+
+        // Reorder a source so `entry` is the first rule (gen1 compiles rule 0).
+        let reorder = |source: &str, entry: &str| -> String {
+            let lines: Vec<&str> = source.lines().collect();
+            let start = lines.iter().position(|l| l.starts_with(&format!("rule {entry}")))
+                .unwrap_or_else(|| panic!("rule {entry} not found"));
+            let end = (start + 1..lines.len())
+                .find(|&i| lines[i].starts_with("rule ") || lines[i].starts_with("concept "))
+                .unwrap_or(lines.len());
+            let mut be = end;
+            while be > start && lines[be - 1].trim().is_empty() { be -= 1; }
+            let block = &lines[start..be];
+            let mut rest: Vec<&str> = Vec::new();
+            rest.extend_from_slice(&lines[..start]);
+            rest.extend_from_slice(&lines[end..]);
+            let fr = rest.iter().position(|l| l.starts_with("rule ")).unwrap();
+            let mut out: Vec<&str> = Vec::new();
+            out.extend_from_slice(&rest[..fr]);
+            out.extend_from_slice(block);
+            out.push("");
+            out.push("");
+            out.extend_from_slice(&rest[fr..]);
+            out.join("\n") + "\n"
+        };
+
+        // gen1 = gen0(reordered self-source), the verifying compiler.
+        let tmp = std::env::temp_dir();
+        let reord = tmp.join("verbosec_test_demo_reord.verbose");
+        fs::write(&reord, reorder(&src, "elf_program_src")).unwrap();
+        let gen1 = tmp.join("verbosec_test_demo_gen1.elf");
+        let st = Command::new("sh").arg("-c")
+            .arg(format!("ulimit -s unlimited; '{}' 0 < '{}' > '{}'",
+                gen0.display(), reord.display(), gen1.display()))
+            .status().unwrap();
+        assert!(st.success(), "gen1 must build");
+        chmod(&gen1);
+
+        let demo = fs::read_to_string("examples/expense_audit.verbose").unwrap();
+        // gen1-compile one demo entry, return the emitted ELF path (assert success).
+        let compile_entry = |entry: &str, demo_src: &str| -> std::path::PathBuf {
+            let ep = tmp.join(format!("verbosec_test_demo_e_{entry}.verbose"));
+            fs::write(&ep, reorder(demo_src, entry)).unwrap();
+            let bp = tmp.join(format!("verbosec_test_demo_{entry}.elf"));
+            let st = Command::new("sh").arg("-c")
+                .arg(format!("ulimit -s unlimited; '{}' 0 < '{}' > '{}'",
+                    gen1.display(), ep.display(), bp.display()))
+                .status().unwrap();
+            assert!(st.success(), "gen1 must accept+compile entry {entry} (it verifies first)");
+            chmod(&bp);
+            let _ = fs::remove_file(&ep);
+            bp
+        };
+        let batch: &[&str] = &["3", "200", "1", "700", "1", "450", "0"];
+        let run = |bin: &std::path::Path, args: &[&str]| -> (String, String, i32) {
+            let o = Command::new(bin).args(args).output().unwrap();
+            (String::from_utf8_lossy(&o.stdout).trim().to_string(),
+             String::from_utf8_lossy(&o.stderr).trim().to_string(),
+             o.status.code().unwrap_or(-1))
+        };
+
+        let b = compile_entry("report_line", &demo);
+        assert_eq!(run(&b, batch).0, "audit: 200 700 450");
+        let b = compile_entry("total", &demo);
+        assert_eq!(run(&b, batch).0, "1350");
+        let b = compile_entry("flagged", &demo);
+        assert_eq!(run(&b, batch).0, "1");
+        let b = compile_entry("all_approved", &demo);
+        assert_eq!(run(&b, batch).0, "0", "third expense is unapproved");
+        let b = compile_entry("screen", &demo);
+        assert_eq!(run(&b, &["800", "1"]), ("800".into(), "".into(), 0), "Ok -> stdout, exit 0");
+        assert_eq!(run(&b, &["2000", "1"]), ("".into(), "amount over limit".into(), 1));
+        assert_eq!(run(&b, &["300", "0"]), ("".into(), "not approved".into(), 1));
+
+        // THE REFUSAL: one seeded violation (a shape the gate sees) and gen1
+        // exits 1 with ZERO bytes emitted.
+        let bad = demo.replace(
+            "    out = if all(b.expenses, e => e.approved == 1) then 1 else 0",
+            "    out = zzz + 1");
+        assert_ne!(bad, demo, "seed must apply");
+        let badp = tmp.join("verbosec_test_demo_bad.verbose");
+        fs::write(&badp, reorder(&bad, "total")).unwrap();
+        let badout = tmp.join("verbosec_test_demo_bad.elf");
+        let st = Command::new("sh").arg("-c")
+            .arg(format!("ulimit -s unlimited; '{}' 0 < '{}' > '{}'",
+                gen1.display(), badp.display(), badout.display()))
+            .status().unwrap();
+        assert_eq!(st.code(), Some(1), "gen1 must REFUSE the unverified demo");
+        assert_eq!(fs::metadata(&badout).unwrap().len(), 0, "and emit zero bytes");
+
+        for f in ["verbosec_test_demo_gen0", "verbosec_test_demo_reord.verbose",
+                  "verbosec_test_demo_gen1.elf", "verbosec_test_demo_bad.verbose",
+                  "verbosec_test_demo_bad.elf", "verbosec_test_demo_report_line.elf",
+                  "verbosec_test_demo_total.elf", "verbosec_test_demo_flagged.elf",
+                  "verbosec_test_demo_all_approved.elf", "verbosec_test_demo_screen.elf"] {
+            let _ = fs::remove_file(tmp.join(f));
+        }
+    }
+
     // Regression (2026-07): a text `let`/`read` (BoundText) passed as a text
     // field of a MULTI-FIELD-RECORD call argument used to be refused with
     // "text field '...' in Record constructor for recursive call to '...':

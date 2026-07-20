@@ -1,0 +1,111 @@
+-- expense_audit — THE COMPOSITE DEMO for the self-verifying bootstrap.
+--
+-- This file is written for gen1: the Verbose compiler that was compiled by the
+-- Verbose compiler (examples/vexprparse.verbose), which VERIFIES before it
+-- emits. Every rule below carries full declarations (purity reads/calls +
+-- termination) because gen1 refuses undeclared source — strip the `calls:`
+-- line from `screen` and gen1 exits 1 having emitted zero bytes.
+--
+-- One file, several compilable entries (gen1 compiles the FIRST rule; the
+-- pinned test reorders per entry, the same recipe as the two-generation
+-- bootstrap):
+--   report_line  — text fold: one audit line for the whole expense batch
+--   total        — sum of amounts
+--   flagged      — count of expenses over the review threshold
+--   all_approved — quantifier: 1 iff every expense is approved
+--   screen       — Result(number, text) validator with the CLI ABI
+--                  (Ok -> stdout exit 0, Err -> stderr exit 1)
+--
+-- KNOWN GAPS this demo surfaced (documented, not worked around silently):
+--   * match_result BODY under a top-level Result OUTPUT (screen delegating to
+--     a helper via match_result) SIGSEGVs in the self-hosted emitter — slice 2
+--     proved match_result -> scalar and slice 3 proved direct-if -> Result
+--     ABI; their COMPOSITION is unexercised. screen uses the direct shape.
+--   * This file is in gen1's CLOSED grammar (parenthesised params, no
+--     @verbose/@intention headers). verbosec requires input: blocks — and
+--     gen1's collection marshal only RUNS the param form: an input:-block
+--     collection entry compiles but streams empty (the marshal resolves the
+--     entry input differently). So the demo is gen1-verified (the composite
+--     test), not dual-verified — that gap is its own slice.
+--   * match_result -> scalar WITH an entry input (vs slice 2's closed main)
+--     compiles but runs to empty output — the same composition class.
+--   * The purity/lint walks stub Result-node and reduction-body INTERIORS
+--     (the documented V1b subset posture), so a violation seeded inside a
+--     match_result arm is invisible to the gate; violations in plain bodies
+--     and conditions are seen. The pinned refusal test uses a seen shape.
+--   * And the big one: this file's `> 500` exposed the day-one tok_kind
+--     `300 + value` aliasing bug (Num(500) read as kind 800 == Dedent, the
+--     parser silently swallowed every rule after `flagged`) — fixed in the
+--     same commit. Milestone diversity is coverage.
+--
+-- Input shapes (count-prefixed argv / stdin):
+--   batch entries:  <bin> <N> <e0.amount> <e0.approved> <e1.amount> ...
+--   screen:         <bin> <amount> <approved>
+
+concept Expense
+  fields:
+    amount : number
+    approved : number
+
+concept Batch
+  fields:
+    expenses : collection(Expense)
+
+concept Claim
+  fields:
+    amount : number
+    approved : number
+
+rule report_line(b : Batch)
+  output:
+    line : text
+  logic:
+    line = fold(b.expenses, "audit:", acc, e => concat(acc, " ", e.amount))
+  proofs:
+    purity:
+      reads : [b.expenses]
+      calls : []
+    termination:
+      bound : 4096
+
+rule total(b : Batch)
+  logic:
+    out = sum(b.expenses, e => e.amount)
+  proofs:
+    purity:
+      reads : [b.expenses]
+      calls : []
+    termination:
+      bound : 4096
+
+rule flagged(b : Batch)
+  logic:
+    out = count(b.expenses, e => e.amount > 500)
+  proofs:
+    purity:
+      reads : [b.expenses]
+      calls : []
+    termination:
+      bound : 4096
+
+rule all_approved(b : Batch)
+  logic:
+    out = if all(b.expenses, e => e.approved == 1) then 1 else 0
+  proofs:
+    purity:
+      reads : [b.expenses]
+      calls : []
+    termination:
+      bound : 4096
+
+rule screen(c : Claim)
+  output:
+    r : Result(number, text)
+  logic:
+    r = if c.approved == 1 then (if c.amount > 1000 then Err("amount over limit") else Ok(c.amount)) else Err("not approved")
+  proofs:
+    purity:
+      reads : [c.amount, c.approved]
+      calls : []
+    termination:
+      bound : 64

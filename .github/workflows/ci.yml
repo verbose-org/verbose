@@ -76,9 +76,14 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Two-generation bootstrap (R0 fixed point + R1 whole-source + R2 corpus)
-        # ulimit -s unlimited: the emit recurses over the ~855 KB source (src_blob).
-        # The test's own emit shell-outs also raise it, so this is belt-and-suspenders.
+      - name: Two-generation bootstrap (fixed point R0/R1/R2 + the composite demo)
+        # The `two_generation` filter runs BOTH the fixed-point test
+        # (gen1==gen2, whole-source, corpus) AND the composite-demo test
+        # (examples/expense_audit.verbose compiled end-to-end by the verifying
+        # gen1, plus the refusal of unverified source).
+        # ulimit -s unlimited: the emit recurses over the ~855 KB source
+        # (src_blob). The tests' own emit shell-outs also raise it, so this is
+        # belt-and-suspenders.
         run: |
           ulimit -s unlimited
-          cargo test --release -- --ignored --test-threads=1 two_generation_bootstrap_fixed_point
+          cargo test --release -- --ignored --test-threads=1 two_generation

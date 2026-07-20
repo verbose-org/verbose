@@ -1432,7 +1432,17 @@ rule tok_kind
     out = match t:
       Ident(start, len) => 100
       Keyword(start, len, kw) => 200 + kw
-      Num(value, len) => 300 + value
+      -- Num kind is the CONSTANT 300. It was `300 + value` from brick 7 until the
+      -- composite-demo bug (2026-07-20): the offset made a literal's KIND alias
+      -- with the structural bands — Num(500) had kind 800 == Dedent, so a bare
+      -- `500` in any rule body read as a block end and the parser silently
+      -- swallowed every following rule (200->Str, 300->Newline, 400->Indent,
+      -- 600->IndentErr, 700->ByteLit, 101..131->the Op band collide the same
+      -- way). Nothing ever consumed the offset (values are read via tok_value);
+      -- it was a day-one debugging convenience that survived because no program
+      -- fed to the self-hosted parser ever used a colliding literal — until
+      -- expense_audit.verbose wrote `> 500`. Milestone diversity is coverage.
+      Num(value, len) => 300
       Op(code, len) => 400 + code
       Str(start, len) => 500
       ByteLit(start, len) => 1000
