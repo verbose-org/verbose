@@ -419,6 +419,27 @@ fn eval_expr(
         // no arena, so the reclaim is a no-op; the emitted-vs-interpreted
         // contract is that arena_scope produces exactly inner's value.
         Expr::ArenaScope(inner) => eval_expr(inner, env, all_rules, concepts),
+        // `abort_if(<number>)` — V3 self-verify gate. The check EXECUTES:
+        // a nonzero value is the interpreter's analogue of native's
+        // sys_exit(1) — a RuntimeError (fail-closed, nothing more
+        // produced). A zero value yields EMPTY bytes, so a bytes
+        // `concat(abort_if(e), rest...)` equals `concat(rest...)` —
+        // mirroring native's zero-output-bytes contract.
+        Expr::AbortIf(inner) => {
+            let v = eval_expr(inner, env, all_rules, concepts)?;
+            match v {
+                Value::Number(0) => Ok(Value::Bytes(Vec::new())),
+                Value::Number(n) => Err(RuntimeError {
+                    message: format!(
+                        "abort_if: check failed (value {} is nonzero) — fail-closed",
+                        n
+                    ),
+                }),
+                other => Err(RuntimeError {
+                    message: format!("abort_if requires a number, got {}", other),
+                }),
+            }
+        }
         Expr::Quantifier(kind, collection, var_name, predicate) => {
             let coll_val = eval_expr(collection, env, all_rules, concepts)?;
             let items = match coll_val {

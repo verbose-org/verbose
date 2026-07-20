@@ -1123,7 +1123,7 @@ fn collect_read_names_native(expr: &Expr, out: &mut Vec<String>) {
         // `length(<text_expr>)` — pure pass-through.
         Expr::Length(inner) => collect_read_names_native(inner, out),
         // `abs(<number_expr>)` — pure pass-through.
-        Expr::Abs(inner) | Expr::BitNot(inner) | Expr::Le32(inner) | Expr::Le64(inner) | Expr::ArenaScope(inner) => collect_read_names_native(inner, out),
+        Expr::Abs(inner) | Expr::BitNot(inner) | Expr::Le32(inner) | Expr::Le64(inner) | Expr::ArenaScope(inner) | Expr::AbortIf(inner) => collect_read_names_native(inner, out),
         // `min(a, b)` / `max(a, b)` — recurse into both children; either
         // side may carry a `read(...)` reference.
         Expr::Min(l, r) | Expr::Max(l, r) | Expr::BitAnd(l, r) | Expr::BitOr(l, r) | Expr::BitXor(l, r) | Expr::Shl(l, r) | Expr::Shr(l, r) => {
@@ -1182,7 +1182,7 @@ fn expr_uses_now_unix(e: &Expr) -> bool {
         Expr::Field(b, _) => expr_uses_now_unix(b),
         Expr::Binary(_, l, r) => expr_uses_now_unix(l) || expr_uses_now_unix(r),
         Expr::Not(i) | Expr::Neg(i) | Expr::Ok(i) | Expr::Err(i) => expr_uses_now_unix(i),
-        Expr::JsonEscape(i) | Expr::ParseInt(i) | Expr::Length(i) | Expr::Abs(i) | Expr::BitNot(i) | Expr::Le32(i) | Expr::Le64(i) | Expr::ArenaScope(i) => expr_uses_now_unix(i),
+        Expr::JsonEscape(i) | Expr::ParseInt(i) | Expr::Length(i) | Expr::Abs(i) | Expr::BitNot(i) | Expr::Le32(i) | Expr::Le64(i) | Expr::ArenaScope(i) | Expr::AbortIf(i) => expr_uses_now_unix(i),
         Expr::If(c, t, el) => {
             expr_uses_now_unix(c) || expr_uses_now_unix(t) || expr_uses_now_unix(el)
         }
@@ -1285,7 +1285,7 @@ fn count_match_result_max_depth(expr: &Expr) -> usize {
                 .max(count_match_result_max_depth(e))
         }
         Expr::Ok(i) | Expr::Err(i) | Expr::Not(i) | Expr::Neg(i) | Expr::Abs(i) | Expr::BitNot(i)
-        | Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i) | Expr::Le32(i) | Expr::Le64(i) | Expr::ArenaScope(i) => {
+        | Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i) | Expr::Le32(i) | Expr::Le64(i) | Expr::ArenaScope(i) | Expr::AbortIf(i) => {
             count_match_result_max_depth(i)
         }
         Expr::Binary(_, l, r) => {
@@ -1373,7 +1373,7 @@ fn expr_uses_field(e: &Expr, input_name: &str, field_name: &str) -> bool {
         Expr::Not(i) | Expr::Neg(i) | Expr::Ok(i) | Expr::Err(i) => {
             expr_uses_field(i, input_name, field_name)
         }
-        Expr::JsonEscape(i) | Expr::ParseInt(i) | Expr::Length(i) | Expr::Abs(i) | Expr::BitNot(i) | Expr::Le32(i) | Expr::Le64(i) | Expr::ArenaScope(i) => {
+        Expr::JsonEscape(i) | Expr::ParseInt(i) | Expr::Length(i) | Expr::Abs(i) | Expr::BitNot(i) | Expr::Le32(i) | Expr::Le64(i) | Expr::ArenaScope(i) | Expr::AbortIf(i) => {
             expr_uses_field(i, input_name, field_name)
         }
         Expr::If(c, t, el) => {
@@ -1936,6 +1936,20 @@ fn check_streaming_bytes_shape(
         // unchanged), so a bytes-SCC call in inner is legal exactly where
         // it would be legal without the wrapper.
         Expr::ArenaScope(inner) => check_streaming_bytes_shape(rule_name, inner, bytes_scc),
+        // `abort_if(inner)` — the OPPOSITE of arena_scope for the shape
+        // check: its inner is a NUMBER (value position), not a bytes tail,
+        // so a bytes-SCC call inside it is refused (mirror of le32/le64).
+        Expr::AbortIf(inner) => {
+            if expr_references_bytes_scc(inner, bytes_scc) {
+                return Err(NativeError {
+                    message: format!(
+                        "streaming bytes emit: rule '{}' calls a bytes-returning recursive rule inside abort_if (a number position); a bytes-SCC call may only appear in a tail bytes position (body / concat arg / if arm / match arm).",
+                        rule_name
+                    ),
+                });
+            }
+            Ok(())
+        }
         // Everything else is a value position. Any bytes-SCC reference
         // buried inside is out of order by construction: refuse.
         other => {
@@ -2093,7 +2107,7 @@ fn collect_native_callees(expr: &Expr, out: &mut Vec<String>) {
         }
         Expr::Ok(i) | Expr::Err(i) | Expr::Not(i) | Expr::Neg(i) | Expr::Abs(i) | Expr::BitNot(i)
         | Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i) | Expr::Le32(i) | Expr::Le64(i)
-        | Expr::ArenaScope(i) => {
+        | Expr::ArenaScope(i) | Expr::AbortIf(i) => {
             collect_native_callees(i, out);
         }
         Expr::Min(a, b) | Expr::Max(a, b) | Expr::BitAnd(a, b) | Expr::BitOr(a, b) | Expr::BitXor(a, b) | Expr::Shl(a, b) | Expr::Shr(a, b) | Expr::StartsWith(a, b)
@@ -2221,7 +2235,7 @@ fn gather_transitive_callee_reads(
             gather_transitive_callee_reads(e, all_rules, visited, out);
         }
         Expr::Ok(i) | Expr::Err(i) | Expr::Not(i) | Expr::Neg(i) | Expr::Abs(i) | Expr::BitNot(i)
-        | Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i) | Expr::Le32(i) | Expr::Le64(i) | Expr::ArenaScope(i) => {
+        | Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i) | Expr::Le32(i) | Expr::Le64(i) | Expr::ArenaScope(i) | Expr::AbortIf(i) => {
             gather_transitive_callee_reads(i, all_rules, visited, out);
         }
         Expr::Binary(_, l, r) => {
@@ -2480,7 +2494,7 @@ fn collect_fetch_names_native(expr: &Expr, out: &mut Vec<String>) {
         // `length(<text_expr>)` — pure pass-through.
         Expr::Length(inner) => collect_fetch_names_native(inner, out),
         // `abs(<number_expr>)` — pure pass-through.
-        Expr::Abs(inner) | Expr::BitNot(inner) | Expr::Le32(inner) | Expr::Le64(inner) | Expr::ArenaScope(inner) => collect_fetch_names_native(inner, out),
+        Expr::Abs(inner) | Expr::BitNot(inner) | Expr::Le32(inner) | Expr::Le64(inner) | Expr::ArenaScope(inner) | Expr::AbortIf(inner) => collect_fetch_names_native(inner, out),
         // `min(a, b)` / `max(a, b)` — recurse into both children.
         Expr::Min(l, r) | Expr::Max(l, r) | Expr::BitAnd(l, r) | Expr::BitOr(l, r) | Expr::BitXor(l, r) | Expr::Shl(l, r) | Expr::Shr(l, r) => {
             collect_fetch_names_native(l, out);
@@ -2790,7 +2804,7 @@ fn emit_connection_fetch_sequence(
             // `length(<text_expr>)` — pass-through.
             Expr::Length(inner) => first_fetch_for(inner, name),
             // `abs(<number_expr>)` — pass-through.
-            Expr::Abs(inner) | Expr::BitNot(inner) | Expr::Le32(inner) | Expr::Le64(inner) | Expr::ArenaScope(inner) => first_fetch_for(inner, name),
+            Expr::Abs(inner) | Expr::BitNot(inner) | Expr::Le32(inner) | Expr::Le64(inner) | Expr::ArenaScope(inner) | Expr::AbortIf(inner) => first_fetch_for(inner, name),
             // `min(a, b)` / `max(a, b)` — recurse into both children.
             Expr::Min(l, r) | Expr::Max(l, r) | Expr::BitAnd(l, r) | Expr::BitOr(l, r) | Expr::BitXor(l, r) | Expr::Shl(l, r) | Expr::Shr(l, r) => {
                 first_fetch_for(l, name).or_else(|| first_fetch_for(r, name))
@@ -3015,7 +3029,7 @@ fn find_group_variant_construct_in_expr(
         Expr::Binary(_, l, r) => find_group_variant_construct_in_expr(l, group_concepts)
             .or_else(|| find_group_variant_construct_in_expr(r, group_concepts)),
         Expr::Not(i) | Expr::Neg(i) | Expr::Ok(i) | Expr::Err(i)
-        | Expr::Abs(i) | Expr::BitNot(i) | Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i) | Expr::Le32(i) | Expr::Le64(i) | Expr::ArenaScope(i) => {
+        | Expr::Abs(i) | Expr::BitNot(i) | Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i) | Expr::Le32(i) | Expr::Le64(i) | Expr::ArenaScope(i) | Expr::AbortIf(i) => {
             find_group_variant_construct_in_expr(i, group_concepts)
         }
         Expr::If(c, t, e) => find_group_variant_construct_in_expr(c, group_concepts)
@@ -3122,7 +3136,7 @@ fn find_group_match_variant_in_expr(
         Expr::Binary(_, l, r) => find_group_match_variant_in_expr(l, group_concepts, rule_input_name, rule_input_ty, all_rules)
             .or_else(|| find_group_match_variant_in_expr(r, group_concepts, rule_input_name, rule_input_ty, all_rules)),
         Expr::Not(i) | Expr::Neg(i) | Expr::Ok(i) | Expr::Err(i)
-        | Expr::Abs(i) | Expr::BitNot(i) | Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i) | Expr::Le32(i) | Expr::Le64(i) | Expr::ArenaScope(i) => {
+        | Expr::Abs(i) | Expr::BitNot(i) | Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i) | Expr::Le32(i) | Expr::Le64(i) | Expr::ArenaScope(i) | Expr::AbortIf(i) => {
             find_group_match_variant_in_expr(i, group_concepts, rule_input_name, rule_input_ty, all_rules)
         }
         Expr::If(c, t, e) => find_group_match_variant_in_expr(c, group_concepts, rule_input_name, rule_input_ty, all_rules)
@@ -4886,7 +4900,7 @@ fn count_max_match_arm_binders(expr: &Expr) -> u32 {
             Expr::Field(b, _) => walk(b, m),
             Expr::Binary(_, l, r) => { walk(l, m); walk(r, m); }
             Expr::Not(i) | Expr::Neg(i) | Expr::Ok(i) | Expr::Err(i)
-            | Expr::Abs(i) | Expr::BitNot(i) | Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i) | Expr::Le32(i) | Expr::Le64(i) | Expr::ArenaScope(i) => walk(i, m),
+            | Expr::Abs(i) | Expr::BitNot(i) | Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i) | Expr::Le32(i) | Expr::Le64(i) | Expr::ArenaScope(i) | Expr::AbortIf(i) => walk(i, m),
             Expr::If(c, t, ee) => { walk(c, m); walk(t, m); walk(ee, m); }
             Expr::Call(_, args) | Expr::Concat(args) => { for a in args { walk(a, m); } }
             Expr::Quantifier(_, c, _, body) => { walk(c, m); walk(body, m); }
@@ -4945,7 +4959,7 @@ fn count_max_match_arm_binder_slots(expr: &Expr, concept_group: Option<&ConceptG
             Expr::Field(b, _) => walk(b, m, cg),
             Expr::Binary(_, l, r) => { walk(l, m, cg); walk(r, m, cg); }
             Expr::Not(i) | Expr::Neg(i) | Expr::Ok(i) | Expr::Err(i)
-            | Expr::Abs(i) | Expr::BitNot(i) | Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i) | Expr::Le32(i) | Expr::Le64(i) | Expr::ArenaScope(i) => walk(i, m, cg),
+            | Expr::Abs(i) | Expr::BitNot(i) | Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i) | Expr::Le32(i) | Expr::Le64(i) | Expr::ArenaScope(i) | Expr::AbortIf(i) => walk(i, m, cg),
             Expr::If(c, t, ee) => { walk(c, m, cg); walk(t, m, cg); walk(ee, m, cg); }
             Expr::Call(_, args) | Expr::Concat(args) => { for a in args { walk(a, m, cg); } }
             Expr::Quantifier(_, c, _, body) => { walk(c, m, cg); walk(body, m, cg); }
@@ -4977,7 +4991,7 @@ fn body_contains_variant_construct(expr: &Expr) -> bool {
         Expr::Field(b, _) => body_contains_variant_construct(b),
         Expr::Binary(_, l, r) => body_contains_variant_construct(l) || body_contains_variant_construct(r),
         Expr::Not(i) | Expr::Neg(i) | Expr::Ok(i) | Expr::Err(i)
-        | Expr::Abs(i) | Expr::BitNot(i) | Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i) | Expr::Le32(i) | Expr::Le64(i) | Expr::ArenaScope(i) => {
+        | Expr::Abs(i) | Expr::BitNot(i) | Expr::Length(i) | Expr::ParseInt(i) | Expr::JsonEscape(i) | Expr::Le32(i) | Expr::Le64(i) | Expr::ArenaScope(i) | Expr::AbortIf(i) => {
             body_contains_variant_construct(i)
         }
         Expr::If(c, t, e) => body_contains_variant_construct(c) || body_contains_variant_construct(t) || body_contains_variant_construct(e),
@@ -6172,11 +6186,34 @@ fn emit_streaming_bytes_body(
             code.extend_from_slice(&arena_size_bytes.to_le_bytes());
             Ok(())
         }
+        // `abort_if(<number>)` — V3 self-verify gate: EXECUTE the check in
+        // a streaming-bytes position. Evaluate the number (a value
+        // position — the shape check's catch-all already refuses any
+        // bytes-SCC reference inside it); if nonzero, sys_exit(1) —
+        // fail-closed, nothing further streamed; if zero, fall through
+        // having streamed ZERO output bytes, so the surrounding concat's
+        // output is byte-identical to the ungated form. The canonical use
+        // is the bootstrap gate: `concat(abort_if(verify_errors), <ELF
+        // bytes...>)` — the self-compiled compiler verifies before it
+        // emits.
+        Expr::AbortIf(inner) => {
+            emit_eval_expr(
+                code, inner, input_name, offsets, all_rules,
+                field_ranges, text_bindings, Some(self_call), arena_ctx,
+            )?;
+            code.extend_from_slice(&[0x48, 0x85, 0xC0]); // test rax, rax
+            code.extend_from_slice(&[0x74, 0x10]);       // jz +16 (over the exit block)
+            // Exit code MUST be 1 (fail-closed refusal, not a clean exit):
+            code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x3C, 0x00, 0x00, 0x00]); // mov rax, 60
+            code.extend_from_slice(&[0x48, 0xC7, 0xC7, 0x01, 0x00, 0x00, 0x00]); // mov rdi, 1
+            code.extend_from_slice(&[0x0F, 0x05]);                               // syscall
+            Ok(())
+        }
         other => Err(NativeError {
             message: format!(
                 "native bytes streaming (brick b3) supports `b\"...\"`, bytes `concat(...)`, \
                  `le32`/`le64`, `if`/`else` (bytes arms), `match` (bytes arms), `arena_scope(...)`, \
-                 and tail calls to bytes-returning recursive rules, got {:?}",
+                 `abort_if(...)`, and tail calls to bytes-returning recursive rules, got {:?}",
                 other
             ),
         }),
@@ -12467,7 +12504,7 @@ fn max_stack_depth(expr: &Expr) -> usize {
         Expr::Length(inner) => max_stack_depth(inner),
         // `abs(<number_expr>)` — 5-byte inline (cqo; xor rax, rdx; sub rax, rdx),
         // no eval-stack push, the inner's depth dominates.
-        Expr::Abs(inner) | Expr::BitNot(inner) | Expr::Le32(inner) | Expr::Le64(inner) | Expr::ArenaScope(inner) => max_stack_depth(inner),
+        Expr::Abs(inner) | Expr::BitNot(inner) | Expr::Le32(inner) | Expr::Le64(inner) | Expr::ArenaScope(inner) | Expr::AbortIf(inner) => max_stack_depth(inner),
         // `min(a, b)` / `max(a, b)` — branch-free cmp + cmov; left is
         // evaluated and pushed, right is evaluated, so same shape as Binary.
         Expr::Min(l, r) | Expr::Max(l, r) | Expr::BitAnd(l, r) | Expr::BitOr(l, r) | Expr::BitXor(l, r) | Expr::Shl(l, r) | Expr::Shr(l, r) => {
@@ -12996,6 +13033,16 @@ fn emit_eval_expr(
             // bytes-streaming position (handled by emit_streaming_bytes_body).
             Err(NativeError {
                 message: "arena_scope(...) only valid in a streaming-bytes position (the whole body / a concat arg / an if or match arm of an `output: bytes` rule), not as a scalar value".into(),
+            })
+        }
+        Expr::AbortIf(_) => {
+            // abort_if(...) is a streaming-bytes fail-closed gate; it has no
+            // scalar (rax) representation (it streams zero bytes or exits).
+            // Reaching the scalar evaluator means it was used in a value
+            // position — only valid in a bytes-streaming position (handled
+            // by emit_streaming_bytes_body). Same posture as arena_scope.
+            Err(NativeError {
+                message: "abort_if(...) only valid in a streaming-bytes position (the whole body / a concat arg / an if or match arm of an `output: bytes` rule), not as a scalar value".into(),
             })
         }
         Expr::Field(base, field_name) => {
@@ -18227,6 +18274,7 @@ fn expr_kind(e: &Expr) -> &'static str {
         Expr::Length(_) => "Length",
         Expr::Abs(_) => "Abs",
         Expr::ArenaScope(_) => "ArenaScope",
+        Expr::AbortIf(_) => "AbortIf",
         Expr::Le32(_) => "Le32",
         Expr::Le64(_) => "Le64",
         Expr::Min(_, _) => "Min",
@@ -21150,8 +21198,8 @@ rule le64_neg
 
         // Concept-less closed-main Result programs (the task's literal example).
         // Ok path: check(5) -> Ok(5), doubled -> 10. Err path: check(0) -> Err(0), 0-1 -> -1.
-        let pos = "rule main\n  logic:\n    out = match_result(check(5), v => v * 2, e => 0 - 1)\nrule check(n)\n  logic:\n    out = if n > 0 then Ok(n) else Err(0)";
-        let neg = "rule main\n  logic:\n    out = match_result(check(0), v => v * 2, e => 0 - 1)\nrule check(n)\n  logic:\n    out = if n > 0 then Ok(n) else Err(0)";
+        let pos = "rule main\n  logic:\n    out = match_result(check(5), v => v * 2, e => 0 - 1)\n  proofs:\n    purity:\n      reads : []\n      calls : [check]\n    termination:\n      bound : 8\nrule check(n)\n  logic:\n    out = if n > 0 then Ok(n) else Err(0)\n  proofs:\n    purity:\n      reads : [n]\n      calls : []\n    termination:\n      bound : 8";
+        let neg = "rule main\n  logic:\n    out = match_result(check(0), v => v * 2, e => 0 - 1)\n  proofs:\n    purity:\n      reads : []\n      calls : [check]\n    termination:\n      bound : 8\nrule check(n)\n  logic:\n    out = if n > 0 then Ok(n) else Err(0)\n  proofs:\n    purity:\n      reads : [n]\n      calls : []\n    termination:\n      bound : 8";
         let cases: &[(&str, i64)] = &[(pos, 10), (neg, -1)];
 
         for (i, (prog_src, expected)) in cases.iter().enumerate() {
@@ -21223,7 +21271,7 @@ rule le64_neg
         // lexer stops at `@`, so its input is header-less; verbosec's Rust parser
         // requires `@verbose`, so its input carries the header — the two are
         // otherwise byte-identical, so the comparison stays honest.
-        let prog_src = "concept In\n  fields:\n    x : number\nrule validate\n  input:\n    i : In\n  output:\n    r : Result(number, text)\n  logic:\n    r = if i.x > 0 then Ok(i.x) else Err(\"negative\")";
+        let prog_src = "concept In\n  fields:\n    x : number\nrule validate\n  input:\n    i : In\n  output:\n    r : Result(number, text)\n  logic:\n    r = if i.x > 0 then Ok(i.x) else Err(\"negative\")\n  proofs:\n    purity:\n      reads : [i.x]\n      calls : []\n    termination:\n      bound : 4";
         // verbosec's Rust parser also requires @intention on every concept/rule.
         let vprog_src = "@verbose 0.1.0\n\nconcept In\n  @intention: \"a single number input\"\n  @source: demo.intent:1\n  fields:\n    x : number\nrule validate\n  @intention: \"Ok(x) when positive, else Err(reason)\"\n  @source: demo.intent:2\n  input:\n    i : In\n  output:\n    r : Result(number, text)\n  logic:\n    r = if i.x > 0 then Ok(i.x) else Err(\"negative\")\n  proofs:\n    purity:\n      reads : [i.x]\n      calls : []\n    termination:\n      bound : 4";
 
@@ -22469,12 +22517,12 @@ rule le64_neg
         // recursion (fib(20)=6765), a NEGATIVE result (5 - 9 = -4), ZERO
         // (7 - 7 = 0), and nested calls (double(add(3,4))=14).
         let cases: &[(&str, i64)] = &[
-            ("rule main\n  logic:\n    out = fact(5)\nrule fact(n)\n  logic:\n    out = if n == 0 then 1 else n * fact(n - 1)", 120),
-            ("rule main\n  logic:\n    out = fact(10)\nrule fact(n)\n  logic:\n    out = if n == 0 then 1 else n * fact(n - 1)", 3628800),
-            ("rule main\n  logic:\n    out = fib(20)\nrule fib(n)\n  logic:\n    out = if n < 2 then n else fib(n - 1) + fib(n - 2)", 6765),
+            ("rule main\n  logic:\n    out = fact(5)\n  proofs:\n    purity:\n      reads : []\n      calls : [fact]\n    termination:\n      bound : 8\nrule fact(n)\n  logic:\n    out = if n == 0 then 1 else n * fact(n - 1)\n  proofs:\n    purity:\n      reads : [n]\n      calls : [fact]\n    termination:\n      bound : 64", 120),
+            ("rule main\n  logic:\n    out = fact(10)\n  proofs:\n    purity:\n      reads : []\n      calls : [fact]\n    termination:\n      bound : 8\nrule fact(n)\n  logic:\n    out = if n == 0 then 1 else n * fact(n - 1)\n  proofs:\n    purity:\n      reads : [n]\n      calls : [fact]\n    termination:\n      bound : 64", 3628800),
+            ("rule main\n  logic:\n    out = fib(20)\n  proofs:\n    purity:\n      reads : []\n      calls : [fib]\n    termination:\n      bound : 8\nrule fib(n)\n  logic:\n    out = if n < 2 then n else fib(n - 1) + fib(n - 2)\n  proofs:\n    purity:\n      reads : [n]\n      calls : [fib]\n    termination:\n      bound : 64", 6765),
             ("rule main\n  logic:\n    out = 5 - 9", -4),
             ("rule main\n  logic:\n    out = 7 - 7", 0),
-            ("rule main\n  logic:\n    out = double(add(3, 4))\nrule add(x, y)\n  logic:\n    out = x + y\nrule double(x)\n  logic:\n    out = x * 2", 14),
+            ("rule main\n  logic:\n    out = double(add(3, 4))\n  proofs:\n    purity:\n      reads : []\n      calls : [double, add]\n    termination:\n      bound : 8\nrule add(x, y)\n  logic:\n    out = x + y\n  proofs:\n    purity:\n      reads : [x, y]\n      calls : []\n    termination:\n      bound : 8\nrule double(x)\n  logic:\n    out = x * 2\n  proofs:\n    purity:\n      reads : [x]\n      calls : []\n    termination:\n      bound : 8", 14),
         ];
 
         for (i, &(prog_src, expected)) in cases.iter().enumerate() {
@@ -22593,9 +22641,7 @@ rule le64_neg
         // Entry `main` calls `double(add(3, 4))`; add + double are declared AFTER
         // main, so proc_offset(add) and proc_offset(double) are non-zero prefix
         // sums of the precomputed ProcSizeList.
-        let prog_src = "rule main\n  logic:\n    out = double(add(3, 4))\n\
-                        rule add(x, y)\n  logic:\n    out = x + y\n\
-                        rule double(x)\n  logic:\n    out = x * 2";
+        let prog_src = "rule main\n  logic:\n    out = double(add(3, 4))\n  proofs:\n    purity:\n      reads : []\n      calls : [double, add]\n    termination:\n      bound : 8\nrule add(x, y)\n  logic:\n    out = x + y\n  proofs:\n    purity:\n      reads : [x, y]\n      calls : []\n    termination:\n      bound : 8\nrule double(x)\n  logic:\n    out = x * 2\n  proofs:\n    purity:\n      reads : [x]\n      calls : []\n    termination:\n      bound : 8";
 
         let mc = Command::new(&elf).args([prog_src, "0"]).output().expect("spawn emitter");
         assert!(mc.status.success(), "elf_program_src must exit 0; got {:?}", mc.status);
@@ -22778,10 +22824,10 @@ rule le64_neg
         };
 
         let grp = "concept_group L [max_depth: 8, max_nodes: 64]\n  concept Lst\n    variants:\n      Cons of (head : number, tail : Lst)\n      Nil\n";
-        let cons = format!("{grp}rule main\n  logic:\n    out = match build(): Cons(h, t) => h  Nil => 0\nrule build()\n  logic:\n    out = Lst::Cons {{ head: 5, tail: Lst::Nil }}");
-        let nil = format!("{grp}rule main\n  logic:\n    out = match build(): Cons(h, t) => h  Nil => 0\nrule build()\n  logic:\n    out = Lst::Nil");
+        let cons = format!("{grp}rule main\n  logic:\n    out = match build(): Cons(h, t) => h  Nil => 0\n  proofs:\n    purity:\n      reads : []\n      calls : [build]\n    termination:\n      bound : 8\nrule build()\n  output:\n    out : Lst\n  logic:\n    out = Lst::Cons {{ head: 5, tail: Lst::Nil }}\n  proofs:\n    purity:\n      reads : []\n      calls : []\n    termination:\n      bound : 8");
+        let nil = format!("{grp}rule main\n  logic:\n    out = match build(): Cons(h, t) => h  Nil => 0\n  proofs:\n    purity:\n      reads : []\n      calls : [build]\n    termination:\n      bound : 8\nrule build()\n  output:\n    out : Lst\n  logic:\n    out = Lst::Nil\n  proofs:\n    purity:\n      reads : []\n      calls : []\n    termination:\n      bound : 8");
         // TWO-arm match whose Cons arm body contains a call (offset drift catcher).
-        let after = format!("{grp}rule main\n  logic:\n    out = match build(): Cons(h, t) => h + take100()  Nil => 0\nrule build()\n  logic:\n    out = Lst::Cons {{ head: 5, tail: Lst::Nil }}\nrule take100()\n  logic:\n    out = 100");
+        let after = format!("{grp}rule main\n  logic:\n    out = match build(): Cons(h, t) => h + take100()  Nil => 0\n  proofs:\n    purity:\n      reads : []\n      calls : [build, take100]\n    termination:\n      bound : 8\nrule build()\n  output:\n    out : Lst\n  logic:\n    out = Lst::Cons {{ head: 5, tail: Lst::Nil }}\n  proofs:\n    purity:\n      reads : []\n      calls : []\n    termination:\n      bound : 8\nrule take100()\n  logic:\n    out = 100\n  proofs:\n    purity:\n      reads : []\n      calls : []\n    termination:\n      bound : 8");
         let scalar = "rule main\n  logic:\n    out = 2 + 3".to_string();
 
         // (program source, expected printed value, uses_variants?)
@@ -22893,7 +22939,7 @@ rule le64_neg
         // Field access AFTER other code — the compounding-offset drift catcher.
         let compound = "concept Foo\n  fields:\n    a : number\n    b : number\nrule main\n  logic:\n    let s = Foo { a: 42, b: 7 }\n    let t = s.a + 1\n    out = t + s.b".to_string();
         // R7 variant list-sum (AstField never fires) — must stay 6 / 15.
-        let lst = "concept_group L [max_depth: 30, max_nodes: 100]\n  concept Lst\n    variants:\n      Cons of (head : number, tail : Lst)\n      Nil\nrule main\n  logic:\n    out = sum_list(build(SEED))\nrule build(n)\n  logic:\n    out = if n == 0 then Lst::Cons { head: 0, tail: Lst::Nil } else Lst::Cons { head: n, tail: build(n - 1) }\nrule sum_list(l)\n  logic:\n    out = match l: Cons(h, t) => h + sum_list(t)  Nil => 0";
+        let lst = "concept_group L [max_depth: 30, max_nodes: 100]\n  concept Lst\n    variants:\n      Cons of (head : number, tail : Lst)\n      Nil\nrule main\n  logic:\n    out = sum_list(build(SEED))\n  proofs:\n    purity:\n      reads : []\n      calls : [sum_list, build]\n    termination:\n      bound : 8\nrule build(n)\n  logic:\n    out = if n == 0 then Lst::Cons { head: 0, tail: Lst::Nil } else Lst::Cons { head: n, tail: build(n - 1) }\n  proofs:\n    purity:\n      reads : [n]\n      calls : [build]\n    termination:\n      bound : 64\nrule sum_list(l : Lst)\n  logic:\n    out = match l: Cons(h, t) => h + sum_list(t)  Nil => 0\n  proofs:\n    purity:\n      reads : [l]\n      calls : [sum_list]\n    termination:\n      bound : 64";
         let lst3 = lst.replace("SEED", "3");
         let lst5 = lst.replace("SEED", "5");
         let scalar = "rule main\n  logic:\n    out = 2 + 3".to_string();
@@ -23001,15 +23047,15 @@ rule le64_neg
         };
 
         // PARAM access: the record-input shape — a rule reads its typed input record.
-        let param_access = "concept Foo\n  fields:\n    a : number\n    b : number\nrule main\n  logic:\n    out = get_a(Foo { a: 42, b: 7 })\nrule get_a(s : Foo)\n  logic:\n    out = s.a + s.b".to_string();
+        let param_access = "concept Foo\n  fields:\n    a : number\n    b : number\nrule main\n  logic:\n    out = get_a(Foo { a: 42, b: 7 })\n  proofs:\n    purity:\n      reads : []\n      calls : [get_a]\n    termination:\n      bound : 8\nrule get_a(s : Foo)\n  logic:\n    out = s.a + s.b\n  proofs:\n    purity:\n      reads : [s.a, s.b]\n      calls : []\n    termination:\n      bound : 8".to_string();
         // RECURSION with record args: a rule recursing on a state record (the arc's target).
-        let rec_state = "concept St\n  fields:\n    n : number\n    acc : number\nrule main\n  logic:\n    out = go(St { n: 5, acc: 0 })\nrule go(s : St)\n  logic:\n    out = if s.n == 0 then s.acc else go(St { n: s.n - 1, acc: s.acc + s.n })".to_string();
+        let rec_state = "concept St\n  fields:\n    n : number\n    acc : number\nrule main\n  logic:\n    out = go(St { n: 5, acc: 0 })\n  proofs:\n    purity:\n      reads : []\n      calls : [go]\n    termination:\n      bound : 8\nrule go(s : St)\n  logic:\n    out = if s.n == 0 then s.acc else go(St { n: s.n - 1, acc: s.acc + s.n })\n  proofs:\n    purity:\n      reads : [s.n, s.acc]\n      calls : [go]\n    termination:\n      bound : 64".to_string();
         // CHAINED access: a concept-typed field (`inner : Foo`) resolves the next hop.
         let chained = "concept Foo\n  fields:\n    a : number\n    b : number\nconcept Outer\n  fields:\n    inner : Foo\nrule main\n  logic:\n    let o = Outer { inner: Foo { a: 42, b: 7 } }\n    out = o.inner.b".to_string();
         // Slice-3 regression: the let-bound case (the resolver's let branch).
         let let_bound = "concept Foo\n  fields:\n    a : number\n    b : number\nrule main\n  logic:\n    let s = Foo { a: 42, b: 7 }\n    out = s.a".to_string();
         // R7 variant list-sum: AstField never fires — the match/variant path unchanged.
-        let lst = "concept_group L [max_depth: 30, max_nodes: 100]\n  concept Lst\n    variants:\n      Cons of (head : number, tail : Lst)\n      Nil\nrule main\n  logic:\n    out = sum_list(build(3))\nrule build(n)\n  logic:\n    out = if n == 0 then Lst::Cons { head: 0, tail: Lst::Nil } else Lst::Cons { head: n, tail: build(n - 1) }\nrule sum_list(l)\n  logic:\n    out = match l: Cons(h, t) => h + sum_list(t)  Nil => 0".to_string();
+        let lst = "concept_group L [max_depth: 30, max_nodes: 100]\n  concept Lst\n    variants:\n      Cons of (head : number, tail : Lst)\n      Nil\nrule main\n  logic:\n    out = sum_list(build(3))\n  proofs:\n    purity:\n      reads : []\n      calls : [sum_list, build]\n    termination:\n      bound : 8\nrule build(n)\n  logic:\n    out = if n == 0 then Lst::Cons { head: 0, tail: Lst::Nil } else Lst::Cons { head: n, tail: build(n - 1) }\n  proofs:\n    purity:\n      reads : [n]\n      calls : [build]\n    termination:\n      bound : 64\nrule sum_list(l : Lst)\n  logic:\n    out = match l: Cons(h, t) => h + sum_list(t)  Nil => 0\n  proofs:\n    purity:\n      reads : [l]\n      calls : [sum_list]\n    termination:\n      bound : 64".to_string();
 
         let cases: &[(String, i64)] = &[
             (param_access, 49),
@@ -37700,7 +37746,7 @@ rule two
 
         // MILESTONE: the slice-1 scanner, now COMPILED — recursion + byte_at +
         // length + a packed text span flowing through a record field.
-        let scanner = "concept Sc\n  fields:\n    src : text\n    pos : number\nrule main\n  logic:\n    out = word_length(Sc { src: \"hello world\", pos: 0 })\nrule word_length(s : Sc)\n  logic:\n    out = if s.pos >= length(s.src) then 0 else if byte_at(s.src, s.pos) >= 97 then (if byte_at(s.src, s.pos) <= 122 then 1 + word_length(Sc { src: s.src, pos: s.pos + 1 }) else 0) else 0".to_string();
+        let scanner = "concept Sc\n  fields:\n    src : text\n    pos : number\nrule main\n  logic:\n    out = word_length(Sc { src: \"hello world\", pos: 0 })\n  proofs:\n    purity:\n      reads : []\n      calls : [word_length]\n    termination:\n      bound : 8\nrule word_length(s : Sc)\n  logic:\n    out = if s.pos >= length(s.src) then 0 else if byte_at(s.src, s.pos) >= 97 then (if byte_at(s.src, s.pos) <= 122 then 1 + word_length(Sc { src: s.src, pos: s.pos + 1 }) else 0) else 0\n  proofs:\n    purity:\n      reads : [s.pos, s.src]\n      calls : [word_length]\n    termination:\n      bound : 64".to_string();
 
         let cases: &[(String, i64)] = &[
             (scanner.clone(), 5),
@@ -37746,7 +37792,7 @@ rule two
 
         // Text-free gate: no embedding, p_filesz covers exactly the whole file
         // (the appended-source extension never fires without program_uses_text).
-        let text_free = "concept Foo\n  fields:\n    a : number\n    b : number\nrule main\n  logic:\n    out = get_a(Foo { a: 42, b: 7 })\nrule get_a(s : Foo)\n  logic:\n    out = s.a + s.b";
+        let text_free = "concept Foo\n  fields:\n    a : number\n    b : number\nrule main\n  logic:\n    out = get_a(Foo { a: 42, b: 7 })\n  proofs:\n    purity:\n      reads : []\n      calls : [get_a]\n    termination:\n      bound : 8\nrule get_a(s : Foo)\n  logic:\n    out = s.a + s.b\n  proofs:\n    purity:\n      reads : [s.a, s.b]\n      calls : []\n    termination:\n      bound : 8";
         let mc = Command::new(&elf).args([text_free, "0"]).output().expect("spawn elf_program_src");
         assert!(mc.status.success(), "elf_program_src must exit 0 for the text-free program");
         let tf_bytes = mc.stdout;
@@ -38064,25 +38110,25 @@ rule two
         };
 
         // Bridge repro: input:-block go with recursion + full proofs — was 0 / SIGTRAP.
-        let go = "concept St\n  fields:\n    n : number\nrule main\n  logic:\n    out = go(St { n: 5 })\nrule go\n  input:\n    s : St\n  output:\n    out : number\n  logic:\n    out = if s.n == 0 then 0 else s.n + go(St { n: s.n - 1 })\n  proofs:\n    purity:\n      reads : [s]\n      calls : [go]\n    termination:\n      bound : 100\n      decreasing : n";
+        let go = "concept St\n  fields:\n    n : number\nrule main\n  logic:\n    out = go(St { n: 5 })\n  proofs:\n    purity:\n      reads : []\n      calls : [go]\n    termination:\n      bound : 8\nrule go\n  input:\n    s : St\n  output:\n    out : number\n  logic:\n    out = if s.n == 0 then 0 else s.n + go(St { n: s.n - 1 })\n  proofs:\n    purity:\n      reads : [s]\n      calls : [go]\n    termination:\n      bound : 100\n      decreasing : n";
         assert_eq!(run_driver(&em, go), 15, "bridge: input:-block go must eval to 15 (was 0)");
         assert_eq!(run_compiled(go, "go"), 15, "bridge: input:-block go must compile and print 15 (was SIGTRAP)");
 
         // MILESTONE: word_length written EXACTLY as the self-source writes it.
-        let wl = "concept ScanState\n  fields:\n    source : text\n    pos : number\nrule main\n  logic:\n    out = word_length(ScanState { source: \"hello world\", pos: 0 })\nrule word_length\n  input:\n    s : ScanState\n  output:\n    out : number\n  logic:\n    out = if s.pos >= length(s.source) then 0 else if byte_at(s.source, s.pos) >= 97 then (if byte_at(s.source, s.pos) <= 122 then 1 + word_length(ScanState { source: s.source, pos: s.pos + 1 }) else 0) else 0\n  proofs:\n    purity:\n      reads : [s]\n      calls : [word_length]\n    termination:\n      bound : 4000\n      increasing : pos";
+        let wl = "concept ScanState\n  fields:\n    source : text\n    pos : number\nrule main\n  logic:\n    out = word_length(ScanState { source: \"hello world\", pos: 0 })\n  proofs:\n    purity:\n      reads : []\n      calls : [word_length]\n    termination:\n      bound : 8\nrule word_length\n  input:\n    s : ScanState\n  output:\n    out : number\n  logic:\n    out = if s.pos >= length(s.source) then 0 else if byte_at(s.source, s.pos) >= 97 then (if byte_at(s.source, s.pos) <= 122 then 1 + word_length(ScanState { source: s.source, pos: s.pos + 1 }) else 0) else 0\n  proofs:\n    purity:\n      reads : [s]\n      calls : [word_length]\n    termination:\n      bound : 4000\n      increasing : pos";
         assert_eq!(run_driver(&em, wl), 5, "milestone: real-shape word_length must eval to 5");
         assert_eq!(run_compiled(wl, "wl"), 5, "milestone: real-shape word_length must compile and print 5");
-        // The real-shape rule passes the self-hosted proof surfaces clean. The
-        // driver program's `main` carries no proofs (it calls a defined rule with
-        // no declared calls: — R6d flags that by design, pinned by call_bad), so
-        // the proof gates run on the word_length rule alone.
+        // The real-shape rule passes the self-hosted proof surfaces clean. V3:
+        // the driver mains above carry full proofs now (the gated emitter refuses
+        // undeclared calls); wl_only pins the word_length rule's own proofs in
+        // isolation.
         let wl_only = "concept ScanState\n  fields:\n    source : text\n    pos : number\nrule word_length\n  input:\n    s : ScanState\n  output:\n    out : number\n  logic:\n    out = if s.pos >= length(s.source) then 0 else if byte_at(s.source, s.pos) >= 97 then (if byte_at(s.source, s.pos) <= 122 then 1 + word_length(ScanState { source: s.source, pos: s.pos + 1 }) else 0) else 0\n  proofs:\n    purity:\n      reads : [s]\n      calls : [word_length]\n    termination:\n      bound : 4000\n      increasing : pos";
         assert_eq!(run_driver(&pur, wl_only), 0, "milestone: word_length's purity proof verifies (0 errors)");
         assert_eq!(run_driver(&term, wl_only), 0, "milestone: word_length's increasing proof verifies (0 errors)");
 
         // Toy-form unchanged: the params-form twin still evals and compiles to 15
         // (rule_params_of returns rd_params untouched when non-empty).
-        let toy = "concept St\n  fields:\n    n : number\nrule main\n  logic:\n    out = go(St { n: 5 })\nrule go(s : St)\n  logic:\n    out = if s.n == 0 then 0 else s.n + go(St { n: s.n - 1 })";
+        let toy = "concept St\n  fields:\n    n : number\nrule main\n  logic:\n    out = go(St { n: 5 })\n  proofs:\n    purity:\n      reads : []\n      calls : [go]\n    termination:\n      bound : 8\nrule go(s : St)\n  logic:\n    out = if s.n == 0 then 0 else s.n + go(St { n: s.n - 1 })\n  proofs:\n    purity:\n      reads : [s.n]\n      calls : [go]\n    termination:\n      bound : 100";
         assert_eq!(run_driver(&em, toy), 15, "toy-form go must still eval to 15");
         assert_eq!(run_compiled(toy, "toy"), 15, "toy-form go must still compile to 15");
 
@@ -38144,7 +38190,7 @@ rule two
 
         // Stages 3-4: driver main prepended; the scan_word text itself untouched.
         let driven = format!(
-            "rule main\n  logic:\n    out = word_length(ScanState {{ source: \"hello world\", pos: 0 }})\n\n{}",
+            "rule main\n  logic:\n    out = word_length(ScanState {{ source: \"hello world\", pos: 0 }})\n  proofs:\n    purity:\n      reads : []\n      calls : [word_length]\n    termination:\n      bound : 8\n\n{}",
             verbatim
         );
         assert_eq!(run(&em, &driven), 5, "verbatim scan_word: interprets to 5");
@@ -38228,24 +38274,28 @@ rule two
             v
         };
 
-        // (file, real rule count, driver call, expected value, tag)
-        let cases: [(&str, i64, &str, i64, &str); 4] = [
+        // (file, real rule count, driver call, driver callee, expected value, tag)
+        let cases: [(&str, i64, &str, &str, i64, &str); 4] = [
             ("examples/first_word.verbose", 3,
-             "out = first_word_len(ScanState { source: \"  hello world\", pos: 0 })", 5, "fw"),
+             "out = first_word_len(ScanState { source: \"  hello world\", pos: 0 })", "first_word_len", 5, "fw"),
             ("examples/count_tokens.verbose", 3,
-             "out = count_tokens(ScanState { source: \"hello world\", pos: 0 })", 2, "ct"),
+             "out = count_tokens(ScanState { source: \"hello world\", pos: 0 })", "count_tokens", 2, "ct"),
             ("examples/token_scan.verbose", 4,
-             "out = classify(ScanState { source: \"  hello\", pos: 0 })", 5, "ts_word"),
+             "out = classify(ScanState { source: \"  hello\", pos: 0 })", "classify", 5, "ts_word"),
             ("examples/token_scan.verbose", 4,
-             "out = classify(ScanState { source: \"42x\", pos: 0 })", 4, "ts_digit"),
+             "out = classify(ScanState { source: \"42x\", pos: 0 })", "classify", 4, "ts_digit"),
         ];
-        for (path, nrules, call, expect, tag) in cases {
+        for (path, nrules, call, callee, expect, tag) in cases {
             let verbatim = fs::read_to_string(path)
                 .unwrap_or_else(|_| panic!("{} must exist (real self-source file)", path));
             assert_eq!(run(&cr, &verbatim), nrules, "{}: verbatim parse rule count", path);
             assert_eq!(run(&pur, &verbatim), 0, "{}: verbatim purity verifies", path);
             assert_eq!(run(&term, &verbatim), 0, "{}: verbatim termination verifies", path);
-            let driven = format!("rule main\n  logic:\n    {}\n\n{}", call, verbatim);
+            // V3: the gated emitter verifies the driven program, so the driver
+            // main declares its call (the verbatim file's own rules carry proofs).
+            let driven = format!(
+                "rule main\n  logic:\n    {}\n  proofs:\n    purity:\n      reads : []\n      calls : [{}]\n    termination:\n      bound : 8\n\n{}",
+                call, callee, verbatim);
             assert_eq!(run(&em, &driven), expect, "{} [{}]: interprets", path, tag);
             assert_eq!(run_compiled(&driven, tag), expect, "{} [{}]: compiled ELF matches", path, tag);
         }
@@ -38292,6 +38342,21 @@ rule two
             &|l| l.starts_with("rule shape_ast"),
             &|l| l.starts_with("rule ") || l.starts_with("concept ") || l.starts_with("-- "),
         );
+        // V3: the gated emitter LINTS the whole driven program, so shape_ast's
+        // declared callees (shape_args / shape_vfields / shape_arms) must be
+        // present — extract the full shape closure, not just shape_ast.
+        let shape_args = block(
+            &|l| l.starts_with("rule shape_args"),
+            &|l| l.starts_with("rule ") || l.starts_with("concept ") || l.starts_with("-- "),
+        );
+        let shape_vfields = block(
+            &|l| l.starts_with("rule shape_vfields"),
+            &|l| l.starts_with("rule ") || l.starts_with("concept ") || l.starts_with("-- "),
+        );
+        let shape_arms = block(
+            &|l| l.starts_with("rule shape_arms"),
+            &|l| l.starts_with("rule ") || l.starts_with("concept ") || l.starts_with("-- "),
+        );
         let name_eq_concept = block(
             &|l| l.starts_with("concept NameEqState"),
             &|l| l.starts_with("rule ") || l.starts_with("concept ") || l.starts_with("-- "),
@@ -38332,7 +38397,7 @@ rule two
 
         // name_eq — the bootstrap byte-comparator, verbatim: equal spans -> 1, unequal -> 0.
         let ne_eq = format!(
-            "rule main\n  logic:\n    out = name_eq(NameEqState {{ src: \"hello hello\", a_start: 0, b_start: 6, len: 5, off: 0 }})\n\n{}\n\n{}",
+            "rule main\n  logic:\n    out = name_eq(NameEqState {{ src: \"hello hello\", a_start: 0, b_start: 6, len: 5, off: 0 }})\n  proofs:\n    purity:\n      reads : []\n      calls : [name_eq]\n    termination:\n      bound : 8\n\n{}\n\n{}",
             name_eq_concept, name_eq_rule);
         assert_eq!(run(&em, &ne_eq), 1, "verbatim name_eq: equal spans eval");
         assert_eq!(run_compiled(&ne_eq, "ne_eq"), 1, "verbatim name_eq: equal spans compiled");
@@ -38342,8 +38407,8 @@ rule two
 
         // shape_ast on the full VERBATIM group — the 2^40 detonator pre-fix.
         let sa = format!(
-            "rule main\n  logic:\n    out = shape_ast(Ast::AstBin {{ op: 13, lhs: Ast::AstNum {{ value: 2 }}, rhs: Ast::AstVar {{ start: 0, len: 1 }} }})\n\n{}\n\n{}",
-            group, shape_ast);
+            "rule main\n  logic:\n    out = shape_ast(Ast::AstBin {{ op: 13, lhs: Ast::AstNum {{ value: 2 }}, rhs: Ast::AstVar {{ start: 0, len: 1 }} }})\n  proofs:\n    purity:\n      reads : []\n      calls : [shape_ast]\n    termination:\n      bound : 8\n\n{}\n\n{}\n\n{}\n\n{}\n\n{}",
+            group, shape_ast, shape_args, shape_vfields, shape_arms);
         let oracle = run(&em, &sa);
         let compiled = run_compiled(&sa, "shape_ast");
         assert_eq!(compiled, oracle,
@@ -38362,7 +38427,7 @@ rule two
             &|l| l.starts_with("rule ") || l.starts_with("concept ") || l.starts_with("-- "),
         );
         let li = format!(
-            "rule main\n  logic:\n    let binds = Binding::BCons {{ name_start: 0, name_len: 2, value: Ast::AstNum {{ value: 1 }}, rest: Binding::BCons {{ name_start: 3, name_len: 2, value: Ast::AstNum {{ value: 2 }}, rest: Binding::BNil }} }}\n    out = let_index(LetIndexState {{ binds: binds, src: \"xx\", q_start: 3, q_len: 2, idx: 0 }})\n\n{}\n\n{}\n\n{}\n\n{}\n\n{}",
+            "rule main\n  logic:\n    let binds = Binding::BCons {{ name_start: 0, name_len: 2, value: Ast::AstNum {{ value: 1 }}, rest: Binding::BCons {{ name_start: 3, name_len: 2, value: Ast::AstNum {{ value: 2 }}, rest: Binding::BNil }} }}\n    out = let_index(LetIndexState {{ binds: binds, src: \"xx\", q_start: 3, q_len: 2, idx: 0 }})\n  proofs:\n    purity:\n      reads : []\n      calls : [let_index]\n    termination:\n      bound : 8\n\n{}\n\n{}\n\n{}\n\n{}\n\n{}",
             group, name_eq_concept, name_eq_rule, li_concept, li_rule);
         assert_eq!(run(&em, &li), 1, "verbatim let_index+name_eq: second binding matches (eval)");
         assert_eq!(run_compiled(&li, "let_index"), 1,
@@ -38417,15 +38482,15 @@ rule two
         frag.push(closure_text);
         let tok_frag = frag.join("\n\n");
         let probes = [
-            ("peek_kind(toks)", "tk0"),
-            ("peek_kind(advance(Advance { lst: toks, k: 1 }))", "tk1"),
-            ("peek_kind(advance(Advance { lst: toks, k: 2 }))", "tk2"),
-            ("peek_kind(advance(Advance { lst: toks, k: 3 }))", "tk3"),
+            ("peek_kind(toks)", "begin_tokenize, peek_kind", "tk0"),
+            ("peek_kind(advance(Advance { lst: toks, k: 1 }))", "begin_tokenize, peek_kind, advance", "tk1"),
+            ("peek_kind(advance(Advance { lst: toks, k: 2 }))", "begin_tokenize, peek_kind, advance", "tk2"),
+            ("peek_kind(advance(Advance { lst: toks, k: 3 }))", "begin_tokenize, peek_kind, advance", "tk3"),
         ];
-        for (expr, tag) in probes {
+        for (expr, calls, tag) in probes {
             let p = format!(
-                "rule main\n  logic:\n    let toks = begin_tokenize(ScanState {{ source: \"1 + 2\", pos: 0 }})\n    out = {}\n\n{}",
-                expr, tok_frag);
+                "rule main\n  logic:\n    let toks = begin_tokenize(ScanState {{ source: \"1 + 2\", pos: 0 }})\n    out = {}\n  proofs:\n    purity:\n      reads : []\n      calls : [{}]\n    termination:\n      bound : 8\n\n{}",
+                expr, calls, tok_frag);
             let oracle = run(&em, &p);
             let compiled = run_compiled(&p, tag);
             assert_eq!(compiled, oracle,
@@ -38554,18 +38619,16 @@ rule two
             seen.insert(n);
         }
         assert!(seen.len() >= 100, "count_rules closure should be ~146 rules; got {}", seen.len());
-        // Strip a block: drop full-line comments / blank lines / @attr lines / the
-        // proofs: section (the emitter's parser accepts rules without them).
+        // Strip a block: drop full-line comments / blank lines / @attr lines
+        // (proofs are kept — V3's gate verifies them).
+        // V3: proofs are KEPT — the gated emitter verifies the fragment, so
+        // the declared `calls :` lists are load-bearing; only comments, blank
+        // lines and @attr lines are dropped.
         let strip = |blk: &str| -> String {
             let mut out = Vec::new();
-            let mut in_proofs = false;
             for l in blk.lines() {
                 let s = l.trim();
                 if s.starts_with("--") || s.is_empty() || s.starts_with('@') { continue; }
-                if s == "proofs:" { in_proofs = true; continue; }
-                if in_proofs {
-                    if !l.starts_with(' ') { in_proofs = false; } else { continue; }
-                }
                 out.push(l);
             }
             out.join("\n")
@@ -38627,7 +38690,7 @@ rule two
         // (4) Byte-identity: a closed-main (input-free) fact ELF keeps the original
         // number trampoline byte-for-byte — marshalling only fires when the entry
         // has an input.
-        let fact = "rule main\n  logic:\n    out = fact(5)\nrule fact(n)\n  logic:\n    out = if n == 0 then 1 else n * fact(n - 1)";
+        let fact = "rule main\n  logic:\n    out = fact(5)\n  proofs:\n    purity:\n      reads : []\n      calls : [fact]\n    termination:\n      bound : 8\nrule fact(n)\n  logic:\n    out = if n == 0 then 1 else n * fact(n - 1)\n  proofs:\n    purity:\n      reads : [n]\n      calls : [fact]\n    termination:\n      bound : 64";
         const NUMBER_TRAMPOLINE: [u8; 101] = [
             0xe8, 0x60, 0x00, 0x00, 0x00, 0x48, 0x83, 0xec, 0x20, 0x49, 0x89, 0xc1, 0x48, 0x8d,
             0x74, 0x24, 0x1f, 0xc6, 0x06, 0x0a, 0x48, 0x85, 0xc0, 0x79, 0x03, 0x48, 0xf7, 0xd8,
@@ -38686,8 +38749,8 @@ rule two
             .expect("elf_program_src must compile natively");
 
         // Build the count_rules closure from the declared purity `calls :` lists,
-        // count_rules FIRST; strip comments / attributes / proofs so it fits under
-        // the 128 KiB single-arg limit the EMITTER's own argv input must satisfy.
+        // count_rules FIRST; strip comments / attributes (proofs are KEPT — V3's
+        // gate verifies them; the fragment still fits the 128 KiB argv limit).
         let lines: Vec<&str> = compiler_src.lines().collect();
         let rule_starts: Vec<(usize, String)> = lines.iter().enumerate()
             .filter(|(_, l)| l.starts_with("rule "))
@@ -38711,16 +38774,14 @@ rule two
             todo.extend(rule_info[&n].2.clone());
             seen.insert(n);
         }
+        // V3: proofs are KEPT — the gated emitter verifies the fragment, so
+        // the declared `calls :` lists are load-bearing; only comments, blank
+        // lines and @attr lines are dropped.
         let strip = |blk: &str| -> String {
             let mut out = Vec::new();
-            let mut in_proofs = false;
             for l in blk.lines() {
                 let s = l.trim();
                 if s.starts_with("--") || s.is_empty() || s.starts_with('@') { continue; }
-                if s == "proofs:" { in_proofs = true; continue; }
-                if in_proofs {
-                    if !l.starts_with(' ') { in_proofs = false; } else { continue; }
-                }
                 out.push(l);
             }
             out.join("\n")
@@ -38799,7 +38860,7 @@ rule two
         // Byte-identity: a number-entry (input-free) fact ELF keeps the original
         // 101-byte number trampoline byte-for-byte — the stdin path fires ONLY when
         // the entry concept has a text field.
-        let fact = "rule main\n  logic:\n    out = fact(5)\nrule fact(n)\n  logic:\n    out = if n == 0 then 1 else n * fact(n - 1)";
+        let fact = "rule main\n  logic:\n    out = fact(5)\n  proofs:\n    purity:\n      reads : []\n      calls : [fact]\n    termination:\n      bound : 8\nrule fact(n)\n  logic:\n    out = if n == 0 then 1 else n * fact(n - 1)\n  proofs:\n    purity:\n      reads : [n]\n      calls : [fact]\n    termination:\n      bound : 64";
         const NUMBER_TRAMPOLINE: [u8; 101] = [
             0xe8, 0x60, 0x00, 0x00, 0x00, 0x48, 0x83, 0xec, 0x20, 0x49, 0x89, 0xc1, 0x48, 0x8d,
             0x74, 0x24, 0x1f, 0xc6, 0x06, 0x0a, 0x48, 0x85, 0xc0, 0x79, 0x03, 0x48, 0xf7, 0xd8,
@@ -38853,15 +38914,22 @@ rule two
 
         // The self-hosted emitter + the real count_purity_errors oracle.
         let elf = std::env::temp_dir().join("verbosec_srcblob_elf_program_src");
-        compile_native(&program, "elf_program_src", elf.to_str().unwrap(), false, false)
-            .expect("elf_program_src must compile natively");
+        compile_native_stdin_raw(&program, "elf_program_src", elf.to_str().unwrap())
+            .expect("elf_program_src must compile --stdin-raw");
+        {
+            let mut perms = fs::metadata(&elf).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&elf, perms).unwrap();
+        }
         let cpe_oracle = std::env::temp_dir().join("verbosec_srcblob_cpe_oracle");
         compile_native(&program, "count_purity_errors", cpe_oracle.to_str().unwrap(), false, false)
             .expect("real count_purity_errors must compile natively");
 
         // Build the count_purity_errors closure from the declared purity `calls :`
         // lists, with count_purity_errors as the head rule; strip comments /
-        // attributes / proofs so the emitter's parser accepts each rule.
+        // attributes (proofs are KEPT — V3's gate verifies them). With proofs the
+        // fragment exceeds the 128 KiB per-arg argv cap, so it travels via the
+        // emitter's stdin-raw channel instead.
         let lines: Vec<&str> = compiler_src.lines().collect();
         let rule_starts: Vec<(usize, String)> = lines.iter().enumerate()
             .filter(|(_, l)| l.starts_with("rule "))
@@ -38887,16 +38955,14 @@ rule two
         }
         assert!(seen.len() >= 150,
             "count_purity_errors closure should be ~174 rules; got {}", seen.len());
+        // V3: proofs are KEPT — the gated emitter verifies the fragment, so
+        // the declared `calls :` lists are load-bearing; only comments, blank
+        // lines and @attr lines are dropped.
         let strip = |blk: &str| -> String {
             let mut out = Vec::new();
-            let mut in_proofs = false;
             for l in blk.lines() {
                 let s = l.trim();
                 if s.starts_with("--") || s.is_empty() || s.starts_with('@') { continue; }
-                if s == "proofs:" { in_proofs = true; continue; }
-                if in_proofs {
-                    if !l.starts_with(' ') { in_proofs = false; } else { continue; }
-                }
                 out.push(l);
             }
             out.join("\n")
@@ -38927,10 +38993,22 @@ rule two
 
         // Emit the checker ELF via elf_program_src. Pre-fix: the emitter exits 1
         // partway through, so `mc.status.success()` fails right here.
-        let mc = Command::new(&elf).args([frag.as_str(), "0"]).output().expect("spawn emitter");
-        assert!(mc.status.success(),
+        let frag_p = std::env::temp_dir().join("verbosec_srcblob_frag.verbose");
+        fs::write(&frag_p, &frag).expect("write fragment");
+        let out_p = std::env::temp_dir().join("verbosec_srcblob_out.elf");
+        let status = Command::new("sh")
+            .arg("-c")
+            .arg(format!(
+                "ulimit -s unlimited; '{}' 0 < '{}' > '{}'",
+                elf.display(), frag_p.display(), out_p.display()
+            ))
+            .status()
+            .expect("spawn emitter (stdin-raw)");
+        assert!(status.success(),
             "elf_program_src must exit 0 for the count_purity_errors closure (pre-fix: exit 1 on arena overflow mid-emit)");
-        let out = mc.stdout;
+        let out = fs::read(&out_p).unwrap();
+        let _ = fs::remove_file(&frag_p);
+        let _ = fs::remove_file(&out_p);
         assert_eq!(&out[0..4], &[0x7f, 0x45, 0x4c, 0x46], "emitter output must be an ELF");
         // p_filesz lives in the single PT_LOAD program header (file offset 64),
         // at header offset 32 -> absolute file offset 96.
@@ -39057,7 +39135,7 @@ rule two
         // exact string, plus the trampoline's trailing newline.
         let print_chain = |n: u32| -> String {
             format!(
-                "concept_group G [max_depth: 64, max_nodes: 4096]\n  concept Expr\n    variants:\n      Int of (v : number)\n      Add of (lhs : Expr, rhs : Expr)\nconcept Seed\n  fields:\n    n : number\nrule main\n  logic:\n    out = print_expr(build_chain(Seed {{ n: {n} }}))\nrule build_chain(s : Seed)\n  logic:\n    out = if s.n == 0 then Expr::Int {{ v: 0 }} else Expr::Add {{ lhs: Expr::Int {{ v: s.n }}, rhs: build_chain(Seed {{ n: s.n - 1 }}) }}\nrule print_expr(e : Expr)\n  logic:\n    out = match e: Int(v) => concat(v)  Add(l, r) => concat(print_expr(l), \"+\", print_expr(r))"
+                "concept_group G [max_depth: 64, max_nodes: 4096]\n  concept Expr\n    variants:\n      Int of (v : number)\n      Add of (lhs : Expr, rhs : Expr)\nconcept Seed\n  fields:\n    n : number\nrule main\n  logic:\n    out = print_expr(build_chain(Seed {{ n: {n} }}))\n  proofs:\n    purity:\n      reads : []\n      calls : [print_expr, build_chain]\n    termination:\n      bound : 8\nrule build_chain(s : Seed)\n  logic:\n    out = if s.n == 0 then Expr::Int {{ v: 0 }} else Expr::Add {{ lhs: Expr::Int {{ v: s.n }}, rhs: build_chain(Seed {{ n: s.n - 1 }}) }}\n  proofs:\n    purity:\n      reads : [s.n]\n      calls : [build_chain]\n    termination:\n      bound : 64\nrule print_expr(e : Expr)\n  logic:\n    out = match e: Int(v) => concat(v)  Add(l, r) => concat(print_expr(l), \"+\", print_expr(r))\n  proofs:\n    purity:\n      reads : [e]\n      calls : [print_expr]\n    termination:\n      bound : 64"
             )
         };
         expect_stdout(&print_chain(3), "3+2+1+0\n", "pc3");
@@ -39070,7 +39148,7 @@ rule two
         expect_stdout("rule main\n  logic:\n    out = concat(\"t=\", 0 - 7)", "t=-7\n", "tneg7");
         expect_stdout("rule main\n  logic:\n    out = \"lit\"", "lit\n", "lit");
         expect_stdout(
-            "rule main\n  logic:\n    out = shout(\"hey\")\nrule shout(w : text)\n  logic:\n    out = concat(w, \"!\")",
+            "rule main\n  logic:\n    out = shout(\"hey\")\n  proofs:\n    purity:\n      reads : []\n      calls : [shout]\n    termination:\n      bound : 8\nrule shout(w : text)\n  logic:\n    out = concat(w, \"!\")\n  proofs:\n    purity:\n      reads : [w]\n      calls : []\n    termination:\n      bound : 8",
             "hey!\n", "textparam"
         );
 
@@ -39105,7 +39183,7 @@ rule two
             0x00, 0x00, 0x00, 0x0f, 0x05, 0x48, 0xc7, 0xc0, 0x3c, 0x00, 0x00, 0x00, 0x48, 0x31,
             0xff, 0x0f, 0x05,
         ];
-        let fact = "rule main\n  logic:\n    out = fact(5)\nrule fact(n)\n  logic:\n    out = if n == 0 then 1 else n * fact(n - 1)";
+        let fact = "rule main\n  logic:\n    out = fact(5)\n  proofs:\n    purity:\n      reads : []\n      calls : [fact]\n    termination:\n      bound : 8\nrule fact(n)\n  logic:\n    out = if n == 0 then 1 else n * fact(n - 1)\n  proofs:\n    purity:\n      reads : [n]\n      calls : [fact]\n    termination:\n      bound : 64";
         let (out, status, elf_bytes) = emit_and_run(fact, "fact5pin");
         assert!(status.success(), "fact(5) ELF must still exit 0");
         assert_eq!(String::from_utf8_lossy(&out), "120\n", "fact(5) ELF must still print 120");
@@ -39376,18 +39454,18 @@ rule two
         let cases: &[(&str, &str, &str)] = &[
             ("scalar", "rule main\n  logic:\n    out = 2 + 3", "5"),
             ("ifelse", "rule main\n  logic:\n    out = if 1 == 1 then 7 else 9", "7"),
-            ("call", "rule main\n  logic:\n    out = g(5)\nrule g(x)\n  logic:\n    out = x + 1", "6"),
+            ("call", "rule main\n  logic:\n    out = g(5)\n  proofs:\n    purity:\n      reads : []\n      calls : [g]\n    termination:\n      bound : 8\nrule g(x)\n  logic:\n    out = x + 1\n  proofs:\n    purity:\n      reads : [x]\n      calls : []\n    termination:\n      bound : 8", "6"),
             ("record",
-             "concept St\n  fields:\n    n : number\nrule main\n  logic:\n    out = g(St { n: 5 })\nrule g(s : St)\n  logic:\n    out = s.n",
+             "concept St\n  fields:\n    n : number\nrule main\n  logic:\n    out = g(St { n: 5 })\n  proofs:\n    purity:\n      reads : []\n      calls : [g]\n    termination:\n      bound : 8\nrule g(s : St)\n  logic:\n    out = s.n\n  proofs:\n    purity:\n      reads : [s.n]\n      calls : []\n    termination:\n      bound : 8",
              "5"),
             ("variant",
              "concept_group L [max_depth: 8, max_nodes: 64]\n  concept Lst\n    variants:\n      Cons of (head : number, tail : Lst)\n      Nil\nrule main\n  logic:\n    out = Lst::Cons { head: 42, tail: Lst::Nil }",
              "1"),
             ("recgo",
-             "concept St\n  fields:\n    n : number\nrule main\n  logic:\n    out = go(St { n: 5 })\nrule go(s : St)\n  logic:\n    out = if s.n == 0 then 42 else go(St { n: s.n - 1 })",
+             "concept St\n  fields:\n    n : number\nrule main\n  logic:\n    out = go(St { n: 5 })\n  proofs:\n    purity:\n      reads : []\n      calls : [go]\n    termination:\n      bound : 8\nrule go(s : St)\n  logic:\n    out = if s.n == 0 then 42 else go(St { n: s.n - 1 })\n  proofs:\n    purity:\n      reads : [s.n]\n      calls : [go]\n    termination:\n      bound : 64",
              "42"),
             ("match",
-             "concept_group L [max_depth: 8, max_nodes: 64]\n  concept Lst\n    variants:\n      Cons of (head : number, tail : Lst)\n      Nil\nrule main\n  logic:\n    out = sum_list(Lst::Cons { head: 10, tail: Lst::Cons { head: 20, tail: Lst::Nil } })\nrule sum_list(l : Lst)\n  logic:\n    out = match l:\n      Cons(head, tail) => head + sum_list(tail)\n      Nil => 0",
+             "concept_group L [max_depth: 8, max_nodes: 64]\n  concept Lst\n    variants:\n      Cons of (head : number, tail : Lst)\n      Nil\nrule main\n  logic:\n    out = sum_list(Lst::Cons { head: 10, tail: Lst::Cons { head: 20, tail: Lst::Nil } })\n  proofs:\n    purity:\n      reads : []\n      calls : [sum_list]\n    termination:\n      bound : 8\nrule sum_list(l : Lst)\n  logic:\n    out = match l:\n      Cons(head, tail) => head + sum_list(tail)\n      Nil => 0\n  proofs:\n    purity:\n      reads : [l]\n      calls : [sum_list]\n    termination:\n      bound : 64",
              "30"),
         ];
 
@@ -39626,7 +39704,9 @@ rule two
     /// Pins: full self-source → 0; a clean two-rule program (declared calls,
     /// full proofs) → 0; one seeded violation per surface stays nonzero
     /// (lint: undefined var → 1; purity: undeclared call → 1; termination:
-    /// `decreasing : n` whose recursive arg does NOT decrease → 2).
+    /// `decreasing : n` whose recursive arg does NOT decrease → 1 — was
+    /// pinned 2 pre-V3, which bundled a cat-4 false positive on the parens
+    /// concept param; see the inline note at the term_seed assert).
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn self_verify_v2_aggregate_gate() {
@@ -39686,12 +39766,165 @@ rule two
 
         let term_seed = write("v2_term.verbose",
             "concept St\n  fields:\n    n : number\nrule main\n  logic:\n    out = go(St { n: 5 })\n  proofs:\n    purity:\n      reads : []\n      calls : [go]\n    termination:\n      bound : 8\nrule go(s : St)\n  logic:\n    out = if s.n == 0 then 0 else go(St { n: s.n })\n  proofs:\n    purity:\n      reads : [s.n]\n      calls : [go]\n    termination:\n      bound : 64\n      decreasing : n\n");
-        assert_eq!(run_on(&term_seed), 2, "a non-decreasing arg under `decreasing :` must flag (termination surface)");
+        // V2 originally pinned 2 here — that was 1 TRUE termination violation
+        // plus 1 category-4 false positive: `go(s : St)`'s parens-annotated
+        // concept param was never seeded into the type env, so `s.n` flagged
+        // as a field-select-on-number. V3's tcheck_rule start-env fix (seed
+        // from rule_params_of via params_to_fields) removed the false
+        // positive; the count is now exactly the seeded violation.
+        assert_eq!(run_on(&term_seed), 1, "a non-decreasing arg under `decreasing :` must flag (termination surface)");
 
         for f in ["v2_clean.verbose", "v2_lint.verbose", "v2_pur.verbose", "v2_term.verbose"] {
             let _ = fs::remove_file(tmp.join(f));
         }
         let _ = fs::remove_file(&bin);
+    }
+
+    /// Self-verify arc V3 (2026-07): THE FINALE — the SELF-COMPILED compiler
+    /// verifies before it emits. `elf_program_src` computes the V2 aggregate
+    /// (`verrs` = R6a/R6B lint+type diags + R6d purity + termination) over
+    /// its parsed input, and its body is `concat(abort_if(verrs), <ELF
+    /// bytes...>)`: the `abort_if` primitive EXECUTES the check in a
+    /// streaming-bytes position — nonzero → sys_exit(1) with ZERO output
+    /// bytes (fail-closed refusal); zero → streams nothing, so the emitted
+    /// ELF is byte-identical to the ungated emitter's output.
+    ///
+    /// THE HEADLINE assertion: gen1 — the compiler EMITTED BY the compiler,
+    /// built per the two-generation recipe — is a compiler that verifies
+    /// then emits:
+    ///   * fed a program with a seeded violation (factorial with UNDECLARED
+    ///     calls — a purity violation; and an undefined variable — a lint
+    ///     violation) it exits 1 with EMPTY stdout;
+    ///   * fed a fully-declared clean program it emits a valid ELF that runs
+    ///     to the right value.
+    /// The complete bootstrap: parse → VERIFY → emit, self-applied.
+    /// (`two_generation_bootstrap_fixed_point` pins that the fixed point
+    /// still holds with the gate in the loop; this test pins the REFUSAL
+    /// side, which the fixed-point test's all-clean inputs never exercise.)
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn self_verify_v3_gen1_refuses_unverified_source() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        let src = fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        // gen0 = the Rust-compiled reference emitter (now: verifier+emitter).
+        let gen0 = std::env::temp_dir().join("verbosec_test_v3_gen0");
+        compile_native_stdin_raw(&program, "elf_program_src", gen0.to_str().unwrap())
+            .expect("elf_program_src must compile --stdin-raw");
+        let mut perms = fs::metadata(&gen0).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&gen0, perms).unwrap();
+
+        // Reorder: entry proc first (the two-generation recipe).
+        let lines: Vec<&str> = src.lines().collect();
+        let start = lines.iter().position(|l| l.starts_with("rule elf_program_src"))
+            .expect("elf_program_src rule");
+        let end = (start + 1..lines.len())
+            .find(|&i| lines[i].starts_with("rule ") || lines[i].starts_with("concept "))
+            .expect("a rule/concept after elf_program_src");
+        let mut block_end = end;
+        while block_end > start && lines[block_end - 1].trim().is_empty() { block_end -= 1; }
+        let block = &lines[start..block_end];
+        let mut rest: Vec<&str> = Vec::new();
+        rest.extend_from_slice(&lines[..start]);
+        rest.extend_from_slice(&lines[end..]);
+        let first_rule = rest.iter().position(|l| l.starts_with("rule ")).expect("a first rule");
+        let mut out: Vec<&str> = Vec::new();
+        out.extend_from_slice(&rest[..first_rule]);
+        out.extend_from_slice(block);
+        out.push("");
+        out.push("");
+        out.extend_from_slice(&rest[first_rule..]);
+        let reordered_src = out.join("\n") + "\n";
+        let reordered = std::env::temp_dir().join("verbosec_test_v3_reordered.verbose");
+        fs::write(&reordered, &reordered_src).unwrap();
+
+        // gen1 = gen0(reordered) — building gen1 ALSO exercises the gate on
+        // the full self-source (gen0 verifies its own source before emitting).
+        let gen1 = std::env::temp_dir().join("verbosec_test_v3_gen1.elf");
+        let status = Command::new("sh")
+            .arg("-c")
+            .arg(format!(
+                "ulimit -s unlimited; '{}' 0 < '{}' > '{}'",
+                gen0.display(), reordered.display(), gen1.display()
+            ))
+            .status()
+            .expect("emit gen1 via sh");
+        assert!(status.success(),
+            "gen0 must verify the full self-source (verrs = 0) and emit gen1");
+        let gen1_bytes = fs::read(&gen1).unwrap();
+        assert_eq!(&gen1_bytes[0..4], &[0x7f, 0x45, 0x4c, 0x46],
+            "gen1 (the self-compiled verifier+emitter) must itself be an ELF");
+        let mut perms = fs::metadata(&gen1).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&gen1, perms).unwrap();
+
+        // Run gen1 on a probe program; return (exit_code, stdout_bytes).
+        let probe = |program_src: &str, tag: &str| -> (i32, Vec<u8>) {
+            let p = std::env::temp_dir().join(format!("verbosec_test_v3_probe_{}.verbose", tag));
+            fs::write(&p, program_src).unwrap();
+            let out_p = std::env::temp_dir().join(format!("verbosec_test_v3_probe_{}.out", tag));
+            let status = Command::new("sh")
+                .arg("-c")
+                .arg(format!(
+                    "ulimit -s unlimited; '{}' 0 < '{}' > '{}'",
+                    gen1.display(), p.display(), out_p.display()
+                ))
+                .status()
+                .expect("run gen1 on a probe");
+            let bytes = fs::read(&out_p).unwrap();
+            let _ = fs::remove_file(&p);
+            let _ = fs::remove_file(&out_p);
+            (status.code().unwrap_or(-1), bytes)
+        };
+
+        // Seeded violation 1: factorial WITHOUT proofs — undeclared calls
+        // (purity surface). A perfectly emittable program pre-V3; the gate
+        // must now REFUSE it: exit 1, EMPTY stdout (fail-closed — no
+        // partial ELF ever escapes).
+        let (code, bytes) = probe(
+            "concept N\n  fields:\n    v : number\nrule main\n  logic:\n    out = fact(N { v: 5 })\nrule fact(n : N)\n  logic:\n    out = if n.v == 0 then 1 else n.v * fact(N { v: n.v - 1 })\n",
+            "noproofs",
+        );
+        assert_eq!(code, 1, "gen1 must exit 1 on a program with undeclared calls");
+        assert!(bytes.is_empty(),
+            "gen1 must emit ZERO bytes when it refuses (got {} bytes)", bytes.len());
+
+        // Seeded violation 2: an undefined variable (lint surface).
+        let (code, bytes) = probe("rule main\n  logic:\n    out = zzz + 1\n", "undef");
+        assert_eq!(code, 1, "gen1 must exit 1 on a program with an undefined variable");
+        assert!(bytes.is_empty(),
+            "gen1 must emit ZERO bytes when it refuses (got {} bytes)", bytes.len());
+
+        // The clean fully-declared two-rule program (the V2 clean-probe
+        // shape): gen1 verifies it (verrs = 0), emits a valid ELF, and that
+        // ELF runs to the right value.
+        let (code, bytes) = probe(
+            "rule main\n  logic:\n    out = helper(1)\n  proofs:\n    purity:\n      reads : []\n      calls : [helper]\n    termination:\n      bound : 8\nrule helper(x)\n  logic:\n    out = x * 2\n  proofs:\n    purity:\n      reads : [x]\n      calls : []\n    termination:\n      bound : 8\n",
+            "clean",
+        );
+        assert_eq!(code, 0, "gen1 must accept the fully-declared clean program");
+        assert_eq!(&bytes[0..4], &[0x7f, 0x45, 0x4c, 0x46],
+            "gen1's output for the clean program must be an ELF");
+        let clean_elf = std::env::temp_dir().join("verbosec_test_v3_clean.elf");
+        fs::write(&clean_elf, &bytes).unwrap();
+        let mut perms = fs::metadata(&clean_elf).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&clean_elf, perms).unwrap();
+        let run = Command::new(&clean_elf).output().expect("run the gen1-emitted ELF");
+        assert!(run.status.success(), "the gen1-emitted ELF must run");
+        assert_eq!(String::from_utf8_lossy(&run.stdout).trim(), "2",
+            "helper(1) = 2 — the verified-then-emitted ELF must run correctly");
+
+        for f in [&gen0, &reordered, &gen1, &clean_elf] {
+            let _ = fs::remove_file(f);
+        }
     }
 
     /// THE TWO-GENERATION BOOTSTRAP FIXED POINT (2026-07): the self-hosted
@@ -39719,10 +39952,29 @@ rule two
     /// costs physical RAM) — see the `elf_program_src` arena note in
     /// examples/vexprparse.verbose.
     ///
+    /// V3 (self-verify arc, 2026-07): the fixed point now holds WITH
+    /// VERIFICATION IN THE LOOP. `elf_program_src` computes `verrs` (the V2
+    /// aggregate: R6a/R6b diags + R6d purity + termination) over the parsed
+    /// input and gates the whole ELF stream behind `abort_if(verrs)` — every
+    /// emit below (gen1 from gen0, gen2 from gen1, R1, every R2 program)
+    /// first VERIFIES its input and would exit 1 with empty output on any
+    /// violation. `self_verify_v3_gen1_refuses_unverified_source` pins the
+    /// refusal side. Measured cost of the gate on one dev machine (WSL2,
+    /// same-machine baseline vs pre-gate source): gen0's emit 4.9 s / 179 MB
+    /// -> 4.9 s / 194 MB (the Rust-hosted verify walk is nearly free); gen1's
+    /// emit 21.5 s / 7.9 GB -> 45.9 s / 10.4 GB (the self-hosted runtime
+    /// arena-allocates every checker-walk record, so the verify pass costs
+    /// ~24 s / ~2.5 GB on top of the emit). gen1 itself grew 1,745,100 ->
+    /// 1,752,560 B (+7,460 B: the gate code + the span_is_abort_if proc —
+    /// every checker rule was ALREADY a proc in gen1, which emits all rules);
+    /// gen0 grew 250,558 -> 323,806 B (+29%: the checker closure joins the
+    /// Rust-native callable set).
+    ///
     /// This test pins THREE independent self-hosting properties (measured
     /// 2026-07, gen0 peaks 140 MB / 1.5 s; gen1 — the self-hosted emitter —
     /// peaks ~2.55 GB / ~3.7 s emitting the full source since the `arena_scope`
-    /// reclaim landed, was 8.7 GB / 22 s before it):
+    /// reclaim landed, was 8.7 GB / 22 s before it; see the V3 paragraph
+    /// above for the post-gate numbers):
     ///
     ///   R0 — fixed point:   gen1(reordered) == gen2(reordered) byte-for-byte.
     ///   R1 — whole source:  gen0(ORIGINAL) == gen1(ORIGINAL) byte-for-byte —
@@ -39755,7 +40007,7 @@ rule two
     /// dedicated `self-hosting-bootstrap` CI job runs it serially. Run explicitly:
     ///   cargo test --release -- --ignored --test-threads=1 two_generation
     #[test]
-    #[ignore = "gen1 peaks ~2.55 GiB RAM + needs `ulimit -s unlimited` + ~11s; run with --ignored"]
+    #[ignore = "gen1 peaks ~10.4 GiB RAM (verify pass + emit) + needs `ulimit -s unlimited` + ~1-2 min; run with --ignored"]
     #[cfg(target_arch = "x86_64")]
     fn two_generation_bootstrap_fixed_point() {
         use std::fs;
@@ -39855,15 +40107,28 @@ rule two
         // R2 — differential corpus + run-correctness. Each program covers a
         // distinct construct class; gen1(P) must equal gen0(P) AND the emitted
         // ELF must run to the expected value.
+        //
+        // V3 (self-verify arc): gen1 now VERIFIES before it emits, so every
+        // corpus program carries full proofs (declared reads/calls +
+        // termination bounds — the V2 aggregate-gate clean-probe shape); the
+        // pre-V3 corpus had undeclared calls, which the gate correctly
+        // REFUSES now. Callee rules with concept-typed inputs use the
+        // `input:` block dialect (the dialect the self-source itself is
+        // written in): the self-hosted R6b type surface resolves a
+        // concept-typed parameter through `input:` blocks, while a parens
+        // annotation like `h(p : P)` types the param as its raw annotation
+        // code and flags the field selection — honest checker scope, noted,
+        // not silently widened here. Parens NUMBER params stay covered by
+        // the call-chain program.
         let corpus: &[(&str, &str)] = &[
-            ("rule main\n  logic:\n    out = 7 * 6\n", "42"),                       // arith
-            ("rule main\n  logic:\n    out = if 5 >= 5 then (if 2 < 1 then 0 else 99) else 1\n", "99"), // nested-if
-            ("rule main\n  logic:\n    out = f(g(4))\nrule f(x)\n  logic:\n    out = x * 10\nrule g(y)\n  logic:\n    out = y + 1\n", "50"), // call-chain
-            ("concept P\n  fields:\n    a : number\n    b : number\n    c : number\nrule main\n  logic:\n    out = h(P { a: 1, b: 2, c: 3 })\nrule h(p : P)\n  logic:\n    out = p.a + p.b * p.c\n", "7"), // 3-field record
-            ("concept_group G [max_depth: 8, max_nodes: 64]\n  concept T\n    variants:\n      A of (x : number)\n      B of (y : number)\n      C\nrule main\n  logic:\n    out = classify(mk())\nrule mk()\n  logic:\n    out = T::B { y: 77 }\nrule classify(t : T)\n  logic:\n    out = match t: A(x) => x  B(y) => y  C => 0\n", "77"), // 3-arm variant/match
-            ("concept N\n  fields:\n    v : number\nrule main\n  logic:\n    out = fact(N { v: 5 })\nrule fact(n : N)\n  logic:\n    out = if n.v == 0 then 1 else n.v * fact(N { v: n.v - 1 })\n", "120"), // runtime recursion
-            ("rule main\n  logic:\n    out = max(min(100, 42), 7)\n", "42"),        // max/min
-            ("concept Outer\n  fields:\n    inner : Inner\nconcept Inner\n  fields:\n    z : number\nrule main\n  logic:\n    let o = Outer { inner: Inner { z: 88 } }\n    out = o.inner.z\n", "88"), // chained field
+            ("rule main\n  logic:\n    out = 7 * 6\n  proofs:\n    purity:\n      reads : []\n      calls : []\n    termination:\n      bound : 8\n", "42"), // arith
+            ("rule main\n  logic:\n    out = if 5 >= 5 then (if 2 < 1 then 0 else 99) else 1\n  proofs:\n    purity:\n      reads : []\n      calls : []\n    termination:\n      bound : 8\n", "99"), // nested-if
+            ("rule main\n  logic:\n    out = f(g(4))\n  proofs:\n    purity:\n      reads : []\n      calls : [f, g]\n    termination:\n      bound : 8\nrule f(x)\n  logic:\n    out = x * 10\n  proofs:\n    purity:\n      reads : [x]\n      calls : []\n    termination:\n      bound : 8\nrule g(y)\n  logic:\n    out = y + 1\n  proofs:\n    purity:\n      reads : [y]\n      calls : []\n    termination:\n      bound : 8\n", "50"), // call-chain (parens number params)
+            ("concept P\n  fields:\n    a : number\n    b : number\n    c : number\nrule main\n  logic:\n    out = h(P { a: 1, b: 2, c: 3 })\n  proofs:\n    purity:\n      reads : []\n      calls : [h]\n    termination:\n      bound : 8\nrule h\n  input:\n    p : P\n  output:\n    out : number\n  logic:\n    out = p.a + p.b * p.c\n  proofs:\n    purity:\n      reads : [p.a, p.b, p.c]\n      calls : []\n    termination:\n      bound : 8\n", "7"), // 3-field record
+            ("concept_group G [max_depth: 8, max_nodes: 64]\n  concept T\n    variants:\n      A of (x : number)\n      B of (y : number)\n      C\nrule main\n  logic:\n    out = classify(mk())\n  proofs:\n    purity:\n      reads : []\n      calls : [classify, mk]\n    termination:\n      bound : 8\nrule mk()\n  logic:\n    out = T::B { y: 77 }\n  proofs:\n    purity:\n      reads : []\n      calls : []\n    termination:\n      bound : 8\nrule classify\n  input:\n    t : T\n  output:\n    out : number\n  logic:\n    out = match t: A(x) => x  B(y) => y  C => 0\n  proofs:\n    purity:\n      reads : [t]\n      calls : []\n    termination:\n      bound : 8\n", "77"), // 3-arm variant/match
+            ("concept N\n  fields:\n    v : number\nrule main\n  logic:\n    out = fact(N { v: 5 })\n  proofs:\n    purity:\n      reads : []\n      calls : [fact]\n    termination:\n      bound : 8\nrule fact\n  input:\n    n : N\n  output:\n    out : number\n  logic:\n    out = if n.v == 0 then 1 else n.v * fact(N { v: n.v - 1 })\n  proofs:\n    purity:\n      reads : [n.v]\n      calls : [fact]\n    termination:\n      bound : 64\n      decreasing : v\n", "120"), // runtime recursion, decreasing proof
+            ("rule main\n  logic:\n    out = max(min(100, 42), 7)\n  proofs:\n    purity:\n      reads : []\n      calls : []\n    termination:\n      bound : 8\n", "42"), // max/min
+            ("concept Outer\n  fields:\n    inner : Inner\nconcept Inner\n  fields:\n    z : number\nrule main\n  logic:\n    let o = Outer { inner: Inner { z: 88 } }\n    out = o.inner.z\n  proofs:\n    purity:\n      reads : []\n      calls : []\n    termination:\n      bound : 8\n", "88"), // chained field
         ];
         let cp = std::env::temp_dir().join("verbosec_test_2gen_corpus.verbose");
         let c0 = std::env::temp_dir().join("verbosec_test_2gen_c0.elf");
