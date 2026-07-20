@@ -4889,18 +4889,6 @@ rule layered_caller
         );
 
         for path in &files {
-            // expense_audit.verbose is the composite demo written in the
-            // SELF-HOSTED compiler's closed grammar (parenthesised params, no
-            // @verbose/@intention headers) — a gen1 target, not a verbosec one.
-            // verbosec requires input: blocks; gen1's collection marshal only
-            // RUNS the param form (an input:-block collection entry compiles but
-            // streams empty — documented in the file's KNOWN GAPS). It is
-            // verified by two_generation_composite_demo_expense_audit_via_gen1
-            // (gen1 compiles+runs all five entries + refuses a seeded
-            // violation), not by this verbosec sweep.
-            if path.file_name().and_then(|s| s.to_str()) == Some("expense_audit.verbose") {
-                continue;
-            }
             let src = fs::read_to_string(path)
                 .unwrap_or_else(|e| panic!("cannot read {}: {}", path.display(), e));
             let tokens = Lexer::new(&src).tokenize().unwrap_or_else(|e| {

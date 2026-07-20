@@ -40157,11 +40157,22 @@ rule two
 
     /// THE COMPOSITE DEMO (2026-07): examples/expense_audit.verbose — a
     /// production-shaped program (record collection + reductions + a text-fold
-    /// report + a Result validator, FULL declarations on every rule) compiled
-    /// end-to-end by gen1, the self-compiled VERIFYING compiler. Five entries
-    /// (gen1 compiles the first rule; each entry is reordered to the front, the
-    /// two-generation recipe), plus THE REFUSAL: seed one violation and gen1
-    /// exits 1 having emitted zero bytes.
+    /// report + a Result validator + match_result composition, FULL
+    /// declarations on every rule) that is DUAL-VALID: verbosec verifies it
+    /// (the paired examples/expense_audit.intent backs every @source line, and
+    /// it is now in the `all_example_verbose_files_parse_and_verify_body`
+    /// sweep) AND gen1 — the self-compiled VERIFYING compiler — compiles and
+    /// runs every entry. Seven entries (gen1 compiles the first rule; each
+    /// entry is reordered to the front, the two-generation recipe), plus THE
+    /// REFUSAL: seed one violation gen1's gate sees (an undefined var in a
+    /// plain body) and gen1 exits 1 having emitted zero bytes.
+    ///
+    /// The composition entries — `screen` (match_result under a Result output,
+    /// Ok(v)->Ok(v)/Err(e)->Err(e)) and `discount` (match_result -> scalar
+    /// number) — are the ones the earlier revision of this demo documented as
+    /// "gaps that SIGSEGV"; they were an argv-shape confusion (a Claim scalar
+    /// takes `<amount> <approved>`, two values, not one), not a real gap. They
+    /// compile+run correctly under gen1 here.
     ///
     /// This demo file is also the reason the tok_kind `300 + value` aliasing
     /// bug was found (its `> 500` literal had kind 800 == Dedent and the
@@ -40198,7 +40209,16 @@ rule two
         // Reorder a source so `entry` is the first rule (gen1 compiles rule 0).
         let reorder = |source: &str, entry: &str| -> String {
             let lines: Vec<&str> = source.lines().collect();
-            let start = lines.iter().position(|l| l.starts_with(&format!("rule {entry}")))
+            // Input-block rules start with `rule <name>` alone on the line (no
+            // paren). Match the exact line, or `rule <name> ` / `rule <name>(`,
+            // so a name that is a prefix of another rule can't be picked by
+            // mistake and both the input-block and legacy param forms resolve.
+            let key = format!("rule {entry}");
+            let start = lines.iter().position(|l| {
+                *l == key.as_str()
+                    || l.starts_with(&format!("{key} "))
+                    || l.starts_with(&format!("{key}("))
+            })
                 .unwrap_or_else(|| panic!("rule {entry} not found"));
             let end = (start + 1..lines.len())
                 .find(|&i| lines[i].starts_with("rule ") || lines[i].starts_with("concept "))
@@ -40262,10 +40282,26 @@ rule two
         assert_eq!(run(&b, batch).0, "1");
         let b = compile_entry("all_approved", &demo);
         assert_eq!(run(&b, batch).0, "0", "third expense is unapproved");
+        // check_claim: the Result(number, text) validator itself (nested
+        // if/else). A Claim scalar takes two argv values: <amount> <approved>.
+        let b = compile_entry("check_claim", &demo);
+        assert_eq!(run(&b, &["800", "1"]), ("800".into(), "".into(), 0), "Ok -> stdout, exit 0");
+        assert_eq!(run(&b, &["2000", "1"]), ("".into(), "amount over limit".into(), 1));
+        assert_eq!(run(&b, &["300", "0"]), ("".into(), "not approved".into(), 1));
+        // screen: match_result COMPOSITION under a Result output — delegates to
+        // check_claim, then Ok(v)->Ok(v) / Err(e)->Err(e). Same observable
+        // outcome as check_claim (pure propagation). The composition that once
+        // SIGSEGV'd in the self-hosted emitter; it now runs.
         let b = compile_entry("screen", &demo);
         assert_eq!(run(&b, &["800", "1"]), ("800".into(), "".into(), 0), "Ok -> stdout, exit 0");
         assert_eq!(run(&b, &["2000", "1"]), ("".into(), "amount over limit".into(), 1));
         assert_eq!(run(&b, &["300", "0"]), ("".into(), "not approved".into(), 1));
+        // discount: match_result -> scalar number (5% off an accepted amount,
+        // -1 on any rejection). Always exit 0 (plain number output to stdout).
+        let b = compile_entry("discount", &demo);
+        assert_eq!(run(&b, &["800", "1"]).0, "760", "5% off an accepted amount");
+        assert_eq!(run(&b, &["2000", "1"]).0, "-1", "rejected (over limit) -> -1");
+        assert_eq!(run(&b, &["300", "0"]).0, "-1", "rejected (unapproved) -> -1");
 
         // THE REFUSAL: one seeded violation (a shape the gate sees) and gen1
         // exits 1 with ZERO bytes emitted.
@@ -40287,7 +40323,8 @@ rule two
                   "verbosec_test_demo_gen1.elf", "verbosec_test_demo_bad.verbose",
                   "verbosec_test_demo_bad.elf", "verbosec_test_demo_report_line.elf",
                   "verbosec_test_demo_total.elf", "verbosec_test_demo_flagged.elf",
-                  "verbosec_test_demo_all_approved.elf", "verbosec_test_demo_screen.elf"] {
+                  "verbosec_test_demo_all_approved.elf", "verbosec_test_demo_check_claim.elf",
+                  "verbosec_test_demo_screen.elf", "verbosec_test_demo_discount.elf"] {
             let _ = fs::remove_file(tmp.join(f));
         }
     }

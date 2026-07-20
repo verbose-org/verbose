@@ -1,111 +1,204 @@
+@verbose 0.1.0
+
 -- expense_audit — THE COMPOSITE DEMO for the self-verifying bootstrap.
 --
--- This file is written for gen1: the Verbose compiler that was compiled by the
--- Verbose compiler (examples/vexprparse.verbose), which VERIFIES before it
--- emits. Every rule below carries full declarations (purity reads/calls +
--- termination) because gen1 refuses undeclared source — strip the `calls:`
--- line from `screen` and gen1 exits 1 having emitted zero bytes.
+-- This file is DUAL-VALID: verbosec verifies it (every rule carries full
+-- @intention/@source declarations + purity/termination proofs, and the paired
+-- expense_audit.intent backs every @source line) AND gen1 — the Verbose
+-- compiler that was compiled by the Verbose compiler (examples/vexprparse.verbose),
+-- which VERIFIES before it emits — compiles and runs every entry below. gen1
+-- refuses undeclared source: strip a `calls:` line from `screen` and it exits 1
+-- having emitted zero bytes.
 --
--- One file, several compilable entries (gen1 compiles the FIRST rule; the
--- pinned test reorders per entry, the same recipe as the two-generation
--- bootstrap):
+-- One file, several compilable entries (gen1 compiles the FIRST rule; the pinned
+-- test reorders per entry, the same recipe as the two-generation bootstrap). It
+-- exercises collections (scalar + record reductions, a text fold), a quantifier,
+-- Result(number, text) with the CLI ABI (Ok -> stdout exit 0, Err -> stderr
+-- exit 1), and match_result COMPOSITION end-to-end:
 --   report_line  — text fold: one audit line for the whole expense batch
 --   total        — sum of amounts
 --   flagged      — count of expenses over the review threshold
 --   all_approved — quantifier: 1 iff every expense is approved
---   screen       — Result(number, text) validator with the CLI ABI
---                  (Ok -> stdout exit 0, Err -> stderr exit 1)
+--   check_claim  — Result(number, text) validator (nested if/else)
+--   screen       — match_result COMPOSITION: delegates to check_claim, then
+--                  propagates Ok(v)->Ok(v) / Err(e)->Err(e), still under a
+--                  Result output (the composition that once SIGSEGV'd — it works)
+--   discount     — match_result -> scalar: 5% off an accepted amount, -1 on reject
 --
--- KNOWN GAPS this demo surfaced (documented, not worked around silently):
---   * match_result BODY under a top-level Result OUTPUT (screen delegating to
---     a helper via match_result) SIGSEGVs in the self-hosted emitter — slice 2
---     proved match_result -> scalar and slice 3 proved direct-if -> Result
---     ABI; their COMPOSITION is unexercised. screen uses the direct shape.
---   * This file is in gen1's CLOSED grammar (parenthesised params, no
---     @verbose/@intention headers). verbosec requires input: blocks — and
---     gen1's collection marshal only RUNS the param form: an input:-block
---     collection entry compiles but streams empty (the marshal resolves the
---     entry input differently). So the demo is gen1-verified (the composite
---     test), not dual-verified — that gap is its own slice.
---   * match_result -> scalar WITH an entry input (vs slice 2's closed main)
---     compiles but runs to empty output — the same composition class.
---   * The purity/lint walks stub Result-node and reduction-body INTERIORS
---     (the documented V1b subset posture), so a violation seeded inside a
---     match_result arm is invisible to the gate; violations in plain bodies
---     and conditions are seen. The pinned refusal test uses a seen shape.
---   * And the big one: this file's `> 500` exposed the day-one tok_kind
---     `300 + value` aliasing bug (Num(500) read as kind 800 == Dedent, the
---     parser silently swallowed every rule after `flagged`) — fixed in the
---     same commit. Milestone diversity is coverage.
---
--- Input shapes (count-prefixed argv / stdin):
+-- Input shapes (count-prefixed argv / stdin). A collection(Expense) takes two
+-- values per element (amount, approved); a Claim takes (amount, approved):
 --   batch entries:  <bin> <N> <e0.amount> <e0.approved> <e1.amount> ...
---   screen:         <bin> <amount> <approved>
+--   claim entries:  <bin> <amount> <approved>
+
 
 concept Expense
+  @intention: "An expense has an amount and whether it was approved"
+  @source: expense_audit.intent:1
+
   fields:
-    amount : number
+    amount   : number
     approved : number
 
+
 concept Batch
+  @intention: "A batch is a collection of expenses"
+  @source: expense_audit.intent:2
+
   fields:
     expenses : collection(Expense)
 
+
 concept Claim
+  @intention: "A claim has an amount and whether it was approved"
+  @source: expense_audit.intent:3
+
   fields:
-    amount : number
+    amount   : number
     approved : number
 
-rule report_line(b : Batch)
+
+rule report_line
+  @intention: "Build one audit line: header then each expense amount appended"
+  @source: expense_audit.intent:4
+
+  input:
+    b : Batch
+
   output:
     line : text
+
   logic:
     line = fold(b.expenses, "audit:", acc, e => concat(acc, " ", e.amount))
+
   proofs:
     purity:
-      reads : [b.expenses]
-      calls : []
+      reads   : [b.expenses]
+      calls   : []
     termination:
       bound : 4096
 
-rule total(b : Batch)
+
+rule total
+  @intention: "Sum every expense amount in the batch"
+  @source: expense_audit.intent:5
+
+  input:
+    b : Batch
+
+  output:
+    out : number
+
   logic:
     out = sum(b.expenses, e => e.amount)
+
   proofs:
     purity:
-      reads : [b.expenses]
-      calls : []
+      reads   : [b.expenses]
+      calls   : []
     termination:
       bound : 4096
 
-rule flagged(b : Batch)
+
+rule flagged
+  @intention: "Count expenses over the review threshold of 500"
+  @source: expense_audit.intent:6
+
+  input:
+    b : Batch
+
+  output:
+    out : number
+
   logic:
     out = count(b.expenses, e => e.amount > 500)
+
   proofs:
     purity:
-      reads : [b.expenses]
-      calls : []
+      reads   : [b.expenses]
+      calls   : []
     termination:
       bound : 4096
 
-rule all_approved(b : Batch)
+
+rule all_approved
+  @intention: "Report 1 iff every expense in the batch is approved, else 0"
+  @source: expense_audit.intent:7
+
+  input:
+    b : Batch
+
+  output:
+    out : number
+
   logic:
     out = if all(b.expenses, e => e.approved == 1) then 1 else 0
+
   proofs:
     purity:
-      reads : [b.expenses]
-      calls : []
+      reads   : [b.expenses]
+      calls   : []
     termination:
       bound : 4096
 
-rule screen(c : Claim)
+
+rule check_claim
+  @intention: "Accept an approved claim's amount when at most 1000; reject over-limit or unapproved with a reason"
+  @source: expense_audit.intent:8
+
+  input:
+    c : Claim
+
   output:
     r : Result(number, text)
+
   logic:
     r = if c.approved == 1 then (if c.amount > 1000 then Err("amount over limit") else Ok(c.amount)) else Err("not approved")
+
   proofs:
     purity:
-      reads : [c.amount, c.approved]
-      calls : []
+      reads   : [c.amount, c.approved]
+      calls   : []
+    termination:
+      bound : 64
+
+
+rule screen
+  @intention: "Screen a claim via check_claim, propagating the accepted amount or the rejection reason"
+  @source: expense_audit.intent:9
+
+  input:
+    c : Claim
+
+  output:
+    r : Result(number, text)
+
+  logic:
+    r = match_result(check_claim(c), v => Ok(v), e => Err(e))
+
+  proofs:
+    purity:
+      reads   : [c]
+      calls   : [check_claim]
+    termination:
+      bound : 64
+
+
+rule discount
+  @intention: "Discount an accepted claim by 5%; report -1 when check_claim rejects it"
+  @source: expense_audit.intent:10
+
+  input:
+    c : Claim
+
+  output:
+    out : number
+
+  logic:
+    out = match_result(check_claim(c), v => v * 95 / 100, e => 0 - 1)
+
+  proofs:
+    purity:
+      reads   : [c]
+      calls   : [check_claim]
     termination:
       bound : 64
