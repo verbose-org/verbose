@@ -22163,6 +22163,143 @@ rule le64_neg
         let _ = fs::remove_file(elf);
     }
 
+    /// COLLECTIONS tier min/max FOLD-FORMS: the self-hosted emitter compiles
+    /// `min(coll, item => body)` / `max(coll, item => body)` — reduce a collection
+    /// to the minimum / maximum of `body` — to a native binary whose stdout is
+    /// BYTE-IDENTICAL to verbosec's own `--native` on the SAME record-element
+    /// program (verbosec native REFUSES `collection(number)`, so the single-field
+    /// record form is the oracle, exactly as slices 2/6 use it).
+    ///
+    /// Pinned properties:
+    ///   - min [50,10,30] -> "10\n", max -> "50\n";
+    ///   - EMPTY collection returns the SENTINEL: min = i64::MAX
+    ///     (9223372036854775807), max = i64::MIN (-9223372036854775808) —
+    ///     bit-for-bit == verbosec (a wrong init byte would print 0 or garbage);
+    ///   - negatives flow through (min [-5,7,-1] -> "-5\n", max -> "7\n");
+    ///   - a scalar `collection(number)` case is hand-pinned (NO verbosec native
+    ///     oracle — the record form is the oracle; the scalar path takes the
+    ///     untouched single-atoi loop, same as slice 6's scalar regression).
+    ///
+    /// argv layout (count-prefixed, same as slices 1-3/6): `<binary> <N> <e0> ...`.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn collections_tier_minmax_fold_matches_verbosec() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        let src = fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        // The self-hosted emitter (elf_program_src, reads program on argv[1]).
+        let elf = std::env::temp_dir().join("verbosec_test_coll_mm_elf_program_src");
+        compile_native(&program, "elf_program_src", elf.to_str().unwrap(), false, false)
+            .expect("elf_program_src must compile natively");
+
+        // verbosec oracle: the SAME single-field Order element program, min + max.
+        let vsrc = "@verbose 0.1.0\n\nconcept Order\n  @intention: \"an order\"\n  @source: d.intent:1\n  fields:\n    amount : number\nconcept W\n  @intention: \"orders\"\n  @source: d.intent:1\n  fields:\n    orders : collection(Order)\nrule mn\n  @intention: \"min amount\"\n  @source: d.intent:2\n  input:\n    w : W\n  output:\n    r : number\n  logic:\n    r = min(w.orders, o => o.amount)\n  proofs:\n    purity:\n      reads : [w.orders]\n      calls : []\n    termination:\n      bound : 4\nrule mx\n  @intention: \"max amount\"\n  @source: d.intent:2\n  input:\n    w : W\n  output:\n    r : number\n  logic:\n    r = max(w.orders, o => o.amount)\n  proofs:\n    purity:\n      reads : [w.orders]\n      calls : []\n    termination:\n      bound : 4";
+        let vtoks = crate::lexer::Lexer::new(&vsrc).tokenize().unwrap();
+        let vprog = crate::parser::Parser::new(vtoks).parse_program().unwrap();
+
+        let rules = ["mn", "mx"];
+        let mut vrefs = Vec::new();
+        for r in &rules {
+            let p = std::env::temp_dir().join(format!("verbosec_test_coll_mm_{}_ref", r));
+            compile_native(&vprog, r, p.to_str().unwrap(), false, false)
+                .unwrap_or_else(|e| panic!("verbosec must compile `{}` natively: {:?}", r, e));
+            vrefs.push(p);
+        }
+
+        // Self-hosted, header-less targets — SAME concepts + logic per rule.
+        let concepts = "concept Order\n  fields:\n    amount : number\nconcept W\n  fields:\n    orders : collection(Order)\n";
+        let self_srcs: Vec<String> = [
+            ("mn", "r = min(w.orders, o => o.amount)"),
+            ("mx", "r = max(w.orders, o => o.amount)"),
+        ]
+        .iter()
+        .map(|(name, logic)| {
+            format!(
+                "{}rule {}\n  input:\n    w : W\n  output:\n    r : number\n  logic:\n    {}",
+                concepts, name, logic
+            )
+        })
+        .collect();
+
+        // Emit a target ELF via the self-hosted emitter (argv[1] = source, argv[2] = pos).
+        let emit_self = |prog_src: &str, tag: &str| -> std::path::PathBuf {
+            let mc = Command::new(&elf).args([prog_src, "0"]).output()
+                .expect("spawn elf_program_src");
+            assert!(mc.status.success(), "elf_program_src must exit 0 for {:?}; got {:?}", tag, mc.status);
+            let bytes = mc.stdout;
+            assert_eq!(&bytes[0..4], &[0x7f, 0x45, 0x4c, 0x46], "self-emitted file is not ELF for {}", tag);
+            let out = std::env::temp_dir().join(format!("verbosec_test_coll_mm_{}_self", tag));
+            fs::write(&out, &bytes).expect("write self ELF");
+            let mut perms = fs::metadata(&out).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&out, perms).expect("chmod +x");
+            out
+        };
+        let selfs: Vec<std::path::PathBuf> = rules
+            .iter()
+            .zip(self_srcs.iter())
+            .map(|(name, s)| emit_self(s, name))
+            .collect();
+
+        let run = |bin: &std::path::PathBuf, args: &[&str]| -> String {
+            let o = Command::new(bin).args(args).output().expect("run binary");
+            assert!(o.status.success(), "{:?} {:?} must exit 0; got {:?}", bin, args, o.status);
+            String::from_utf8_lossy(&o.stdout).to_string()
+        };
+
+        // (argv after the program name, [min, max] expected). argv[0] is N, then
+        // N amounts. The EMPTY case pins the sentinels bit-for-bit.
+        let i64_max = "9223372036854775807\n";
+        let i64_min = "-9223372036854775808\n";
+        let cases: &[(&[&str], [&str; 2])] = &[
+            (&["3", "50", "10", "30"], ["10\n", "50\n"]),
+            (&["0"], [i64_max, i64_min]),
+            (&["1", "42"], ["42\n", "42\n"]),
+            (&["3", "-5", "7", "-1"], ["-5\n", "7\n"]),
+            (&["4", "-5", "-2", "-9", "-1"], ["-9\n", "-1\n"]),
+        ];
+
+        for (args, expected) in cases {
+            for (i, name) in rules.iter().enumerate() {
+                let s = run(&selfs[i], args);
+                let v = run(&vrefs[i], args);
+                assert_eq!(s, expected[i], "self {} for {:?} = {:?} (expected {:?})", name, args, s, expected[i]);
+                assert_eq!(v, expected[i], "verbosec {} for {:?} = {:?} (expected {:?})", name, args, v, expected[i]);
+                assert_eq!(s, v, "self ({:?}) vs verbosec ({:?}) {} mismatch for {:?}", s, v, name, args);
+            }
+        }
+
+        // Scalar-element case: a `collection(number)` reduction (NO verbosec native
+        // oracle — verbosec refuses collection(number); hand-pinned) takes the
+        // untouched single-atoi loop and computes correctly, incl. the sentinels.
+        let scalar_min = "concept W\n  fields:\n    xs : collection(number)\nrule mn\n  input:\n    w : W\n  output:\n    r : number\n  logic:\n    r = min(w.xs, x => x)";
+        let scalar_max = "concept W\n  fields:\n    xs : collection(number)\nrule mx\n  input:\n    w : W\n  output:\n    r : number\n  logic:\n    r = max(w.xs, x => x)";
+        let smn = emit_self(scalar_min, "scalar_min");
+        let smx = emit_self(scalar_max, "scalar_max");
+        assert_eq!(run(&smn, &["3", "50", "10", "30"]), "10\n");
+        assert_eq!(run(&smx, &["3", "50", "10", "30"]), "50\n");
+        assert_eq!(run(&smn, &["4", "-5", "7", "-1", "3"]), "-5\n");
+        assert_eq!(run(&smx, &["4", "-5", "7", "-1", "3"]), "7\n");
+        assert_eq!(run(&smn, &["0"]), i64_max);
+        assert_eq!(run(&smx, &["0"]), i64_min);
+
+        let _ = fs::remove_file(&smn);
+        let _ = fs::remove_file(&smx);
+        for p in &selfs {
+            let _ = fs::remove_file(p);
+        }
+        for p in &vrefs {
+            let _ = fs::remove_file(p);
+        }
+        let _ = fs::remove_file(elf);
+    }
+
     /// Brick b6 — the four missing binary operators in the machine-code
     /// generator: division `/` (op 16), modulo `%` (op 17), logical `and`
     /// (op 30), logical `or` (op 31). Both the closed-expression path
