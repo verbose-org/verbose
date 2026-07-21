@@ -361,6 +361,21 @@ concept_group VExpr [max_depth: 4096, max_nodes: 6000000]
       -- ABI symmetry — coll_elem_nfields > 0 emits int3).
       AstMap of (coll : Ast, item_start : number, item_len : number, body : Ast)
       AstFilter of (coll : Ast, item_start : number, item_len : number, body : Ast)
+      -- COLLECTIONS tier min/max fold-forms: `min(coll, item => body)` /
+      -- `max(coll, item => body)` — number reduction to the minimum / maximum of
+      -- `body` across the collection (verbosec parity: empty collection returns
+      -- the sentinel i64::MAX for min / i64::MIN for max). Same 4-field shape as
+      -- AstSum (item binder + an emitter-reserved acc slot). Added at the END of
+      -- the variant list so every existing variant keeps its index (the arena tag
+      -- = cidx*256 + vidx is unchanged for all prior nodes → the two-generation
+      -- fixed point is preserved). shape_ast bands 40*10^10 / 50*10^10, above
+      -- AstFilter's 30*10^10. Disambiguated from the BINARY `min(a, b)` / `max(a, b)`
+      -- primitive at parse time (parse_minmax): a 2-token lookahead after the first
+      -- argument's `,` — an Ident followed by `=>` selects the fold form; otherwise
+      -- the binary form is reconstructed as the EXACT AstCall the generic Ident-call
+      -- path builds, so the self-source's own binary max() calls emit byte-identically.
+      AstMinFold of (coll : Ast, item_start : number, item_len : number, body : Ast)
+      AstMaxFold of (coll : Ast, item_start : number, item_len : number, body : Ast)
 
   -- Records-arc brick R3: a cons-list of a variant-construction's named field
   -- initializers. Each cell carries the field NAME span (name_start, name_len) and
@@ -1001,6 +1016,19 @@ rule kw2
 -- occurrence in the self-source is inside a comment (which the lexer skips);
 -- no rule/concept/field/binder is named `map`. `filter` (6 bytes) lives in the
 -- NEW kw6 below — also collision-clean (zero occurrences).
+-- COLLECTIONS tier min/max fold: min=22 (`min` = m(109) i(105) n(110)), max=23
+-- (`max` = m(109) a(97) x(120)). These are NOT fold-only keywords: parse_primary
+-- routes both to parse_minmax, which disambiguates the fold form from the BINARY
+-- `min(a, b)` / `max(a, b)` primitive by a 2-token lookahead and reconstructs the
+-- binary form as the exact AstCall the generic path builds. A distinguishing token
+-- kind is unavoidable here: the parse layer is source-free (ParseState carries no
+-- src), so span_is_min / span_is_max cannot run in parse_primary — the kind IS the
+-- detection channel, and peek_kw_start / peek_kw_len recover the callee span for the
+-- binary reconstruction (tok_start returns 0 for Keyword tokens). Collision sweep:
+-- the only standalone 3-byte `max` runs in the self-source are its three binary
+-- max() calls (max_payload_fields etc. are 18-byte ident runs, unaffected); zero
+-- standalone `min` runs. The two-generation fixed point proves the binary max()
+-- calls still emit byte-identically.
 rule kw3
   @intention: "Classify a 3-byte identifier run as a keyword (0 if none)"
   @source: vexprparse.intent:7
@@ -1009,7 +1037,7 @@ rule kw3
   output:
     out : number
   logic:
-    out = if byte_at(s.source, s.pos) == 108 and (byte_at(s.source, s.pos + 1) == 101 and byte_at(s.source, s.pos + 2) == 116) then 4 else if byte_at(s.source, s.pos) == 97 and (byte_at(s.source, s.pos + 1) == 110 and byte_at(s.source, s.pos + 2) == 100) then 5 else if byte_at(s.source, s.pos) == 110 and (byte_at(s.source, s.pos + 1) == 111 and byte_at(s.source, s.pos + 2) == 116) then 6 else if byte_at(s.source, s.pos) == 69 and (byte_at(s.source, s.pos + 1) == 114 and byte_at(s.source, s.pos + 2) == 114) then 13 else if byte_at(s.source, s.pos) == 115 and (byte_at(s.source, s.pos + 1) == 117 and byte_at(s.source, s.pos + 2) == 109) then 15 else if byte_at(s.source, s.pos) == 97 and (byte_at(s.source, s.pos + 1) == 108 and byte_at(s.source, s.pos + 2) == 108) then 18 else if byte_at(s.source, s.pos) == 97 and (byte_at(s.source, s.pos + 1) == 110 and byte_at(s.source, s.pos + 2) == 121) then 19 else if byte_at(s.source, s.pos) == 109 and (byte_at(s.source, s.pos + 1) == 97 and byte_at(s.source, s.pos + 2) == 112) then 20 else 0
+    out = if byte_at(s.source, s.pos) == 108 and (byte_at(s.source, s.pos + 1) == 101 and byte_at(s.source, s.pos + 2) == 116) then 4 else if byte_at(s.source, s.pos) == 97 and (byte_at(s.source, s.pos + 1) == 110 and byte_at(s.source, s.pos + 2) == 100) then 5 else if byte_at(s.source, s.pos) == 110 and (byte_at(s.source, s.pos + 1) == 111 and byte_at(s.source, s.pos + 2) == 116) then 6 else if byte_at(s.source, s.pos) == 69 and (byte_at(s.source, s.pos + 1) == 114 and byte_at(s.source, s.pos + 2) == 114) then 13 else if byte_at(s.source, s.pos) == 115 and (byte_at(s.source, s.pos + 1) == 117 and byte_at(s.source, s.pos + 2) == 109) then 15 else if byte_at(s.source, s.pos) == 97 and (byte_at(s.source, s.pos + 1) == 108 and byte_at(s.source, s.pos + 2) == 108) then 18 else if byte_at(s.source, s.pos) == 97 and (byte_at(s.source, s.pos + 1) == 110 and byte_at(s.source, s.pos + 2) == 121) then 19 else if byte_at(s.source, s.pos) == 109 and (byte_at(s.source, s.pos + 1) == 97 and byte_at(s.source, s.pos + 2) == 112) then 20 else if byte_at(s.source, s.pos) == 109 and (byte_at(s.source, s.pos + 1) == 105 and byte_at(s.source, s.pos + 2) == 110) then 22 else if byte_at(s.source, s.pos) == 109 and (byte_at(s.source, s.pos + 1) == 97 and byte_at(s.source, s.pos + 2) == 120) then 23 else 0
   proofs:
     purity:
       reads : [s.source, s.pos]
@@ -1672,6 +1700,70 @@ rule tok_len
       bound : 16
 
 
+-- tok_kw_start / tok_kw_len: the source span of a KEYWORD token (start / len),
+-- falling back to the Ident span otherwise. tok_start / tok_len deliberately
+-- return 0 for Keyword tokens (a keyword's identity is its kind, not its span),
+-- but the min/max fold slice needs the span: the BINARY min(a, b) / max(a, b)
+-- form is reconstructed as an AstCall whose callee span must spell "min" / "max"
+-- for the emitter's span_is_min / span_is_max dispatch. Purely additive — no
+-- existing path calls these, so tok_start / tok_len (and every current peek) keep
+-- their 0-for-keyword behavior byte-for-byte.
+rule tok_kw_start
+  @intention: "The source-span start of a Keyword or Ident token (0 for any other token)"
+  @source: vexprparse.intent:13
+  input:
+    t : Token
+  output:
+    out : number
+  logic:
+    out = match t:
+      Ident(start, len) => start
+      Keyword(start, len, kw) => start
+      Num(value, len) => 0
+      Op(code, len) => 0
+      Str(start, len) => 0
+      ByteLit(start, len) => 0
+      Newline(pos) => 0
+      Indent => 0
+      Dedent => 0
+      IndentErr(pos) => 0
+      Eof => 0
+  proofs:
+    purity:
+      reads : [t]
+      calls : []
+    termination:
+      bound : 16
+
+
+rule tok_kw_len
+  @intention: "The source-span byte length of a Keyword or Ident token (0 for any other token)"
+  @source: vexprparse.intent:13
+  input:
+    t : Token
+  output:
+    out : number
+  logic:
+    out = match t:
+      Ident(start, len) => len
+      Keyword(start, len, kw) => len
+      Num(value, len) => 0
+      Op(code, len) => 0
+      Str(start, len) => 0
+      ByteLit(start, len) => 0
+      Newline(pos) => 0
+      Indent => 0
+      Dedent => 0
+      IndentErr(pos) => 0
+      Eof => 0
+  proofs:
+    purity:
+      reads : [t]
+      calls : []
+    termination:
+      bound : 16
+
+
 -- 1 iff the token IS a Str, structurally (brick 7). Mirrors tok_is_num /
 -- tok_is_op: a magnitude test on tok_kind (== 500) would misread a Num literal
 -- whose value is 200 (kind 500), so the parser uses this structural test to
@@ -1996,6 +2088,44 @@ rule peek_len
     purity:
       reads : [cell]
       calls : [tok_len, head_tok]
+    termination:
+      bound : 16
+
+
+-- Peek the source span of a KEYWORD (or Ident) token — the min/max fold slice's
+-- channel for recovering the "min" / "max" callee span (peek_start / peek_len
+-- return 0 on a keyword). Wrappers over tok_kw_start / tok_kw_len; used only by
+-- parse_primary's min/max branch.
+rule peek_kw_start
+  @intention: "Source-span start of the Keyword or Ident token at the cursor (0 otherwise)"
+  @source: vexprparse.intent:14
+  input:
+    cell : TokenList
+  output:
+    out : number
+  logic:
+    out = tok_kw_start(head_tok(cell))
+  proofs:
+    purity:
+      reads : [cell]
+      calls : [tok_kw_start, head_tok]
+    termination:
+      bound : 16
+
+
+rule peek_kw_len
+  @intention: "Source-span length of the Keyword or Ident token at the cursor (0 otherwise)"
+  @source: vexprparse.intent:14
+  input:
+    cell : TokenList
+  output:
+    out : number
+  logic:
+    out = tok_kw_len(head_tok(cell))
+  proofs:
+    purity:
+      reads : [cell]
+      calls : [tok_kw_len, head_tok]
     termination:
       bound : 16
 
@@ -3293,6 +3423,164 @@ rule fold_body
       bound : 512
 
 
+-- COLLECTIONS tier min/max fold: the parse cursor + which reducer (0 = min,
+-- 1 = max) + the callee source span (cstart, clen) recovered from the min/max
+-- keyword token via peek_kw_start / peek_kw_len. The span is carried through so
+-- the BINARY form can reconstruct an AstCall whose callee spells "min" / "max".
+concept MinMaxState
+  @intention: "A min/max call parse cursor + reducer (0 = min, 1 = max) + the callee span"
+  @source: vexprparse.intent:64
+  fields:
+    cell : TokenList
+    kind : number
+    cstart : number [0, 4000000]
+    clen : number [0, 4000000]
+
+
+-- min/max's parsed FIRST argument + the reducer kind + the callee span, handed to
+-- minmax_body to run the 2-token lookahead that picks the fold vs binary form.
+concept MinMaxBodyState
+  @intention: "A min/max call's parsed first argument + reducer kind + callee span, handed to minmax_body"
+  @source: vexprparse.intent:64
+  fields:
+    arg1 : Parsed
+    kind : number
+    cstart : number [0, 4000000]
+    clen : number [0, 4000000]
+
+
+-- The fold-form arm state: the collection node, the token cell sitting on the
+-- item binder IDENT, and the reducer kind (0 = min, 1 = max).
+concept MMFold
+  @intention: "min/max fold-form arm: collection node + item-binder cell + reducer kind"
+  @source: vexprparse.intent:64
+  fields:
+    coll : Ast
+    item_cell : TokenList
+    kind : number
+
+
+-- The binary-form arm state: the first argument node, the token cell sitting on
+-- the second argument, and the callee span (dispatches span_is_min/span_is_max).
+concept MMBin
+  @intention: "min/max binary-form arm: first arg node + second-arg cell + callee span"
+  @source: vexprparse.intent:64
+  fields:
+    arg1 : Ast
+    arg2_cell : TokenList
+    cstart : number [0, 4000000]
+    clen : number [0, 4000000]
+
+
+-- parse_minmax: cursor on the `min` / `max` keyword token. The stream is either
+--   min ( <a> , <item ident> => <body> )     -- fold form  -> AstMinFold / AstMaxFold
+--   min ( <a> , <b> )                          -- binary form -> AstCall (span_is_min/max)
+-- Parse the first argument (a full parse_or from cell+2, skipping the keyword and
+-- the '('); it stops at the ',' after the argument. minmax_body does the 2-token
+-- lookahead. Mirror of parse_reduce -> reduce_body with a disambiguating tail.
+rule parse_minmax
+  @intention: "Parse a min/max call: fold form (item => body) or the binary min(a,b)/max(a,b) primitive"
+  @source: vexprparse.intent:64
+  input:
+    st : MinMaxState
+  output:
+    out : Parsed
+  logic:
+    let arg1_parsed = parse_or(ParseState { cell: advance(Advance { lst: st.cell, k: 2 }) })
+    out = minmax_body(MinMaxBodyState { arg1: arg1_parsed, kind: st.kind, cstart: st.cstart, clen: st.clen })
+  proofs:
+    purity:
+      reads : [st.cell, st.kind, st.cstart, st.clen]
+      calls : [parse_or, minmax_body, advance]
+    termination:
+      bound : 512
+
+
+-- minmax_body: after the first argument, skip the ',' and peek two tokens. If the
+-- cell after the ',' is an IDENT and the cell after THAT is '=>' (op 2), the first
+-- argument was the collection and this is the FOLD form (the ident is the item
+-- binder). Otherwise it is the BINARY form and the cell after the ',' begins the
+-- second scalar argument. The two parse_or descents live inside the if branches
+-- (LAZY) so only the taken form is parsed — mirrors verbosec's semantics
+-- (src/parser.rs: parse the 2nd arg, check '=>') without the rewind (the
+-- source-free cursor can peek two cells ahead directly).
+rule minmax_body
+  @intention: "Disambiguate min/max after the first argument: an Ident then '=>' selects the fold form; otherwise the binary form"
+  @source: vexprparse.intent:64
+  input:
+    mb : MinMaxBodyState
+  output:
+    out : Parsed
+  logic:
+    let arg1_node = parsed_node(mb.arg1)
+    let arg1_next = parsed_next(mb.arg1)
+    let after_comma = advance(Advance { lst: arg1_next, k: 1 })
+    let after_binder = advance(Advance { lst: after_comma, k: 1 })
+    let is_fold = if peek_is_ident(after_comma) == 1 and peek_op_code(after_binder) == 2 then 1 else 0
+    out = if is_fold == 1 then minmax_fold(MMFold { coll: arg1_node, item_cell: after_comma, kind: mb.kind }) else minmax_binary(MMBin { arg1: arg1_node, arg2_cell: after_comma, cstart: mb.cstart, clen: mb.clen })
+  proofs:
+    purity:
+      reads : [mb.arg1, mb.kind, mb.cstart, mb.clen]
+      calls : [parsed_node, parsed_next, peek_is_ident, peek_op_code, minmax_fold, minmax_binary, advance]
+    termination:
+      bound : 512
+
+
+-- minmax_fold: the item binder cell sits at mm.item_cell; read its span, skip the
+-- binder + the '=>' (op 2) and parse the body (a full parse_or). Consume the
+-- closing ')' if present. Assemble AstMinFold (kind 0) or AstMaxFold (kind 1).
+-- Mirror of reduce_body's one-binder arm.
+rule minmax_fold
+  @intention: "Assemble AstMinFold / AstMaxFold from the collection, the item binder span, and the body"
+  @source: vexprparse.intent:64
+  input:
+    mm : MMFold
+  output:
+    out : Parsed
+  logic:
+    let item_start = peek_start(mm.item_cell)
+    let item_len = peek_len(mm.item_cell)
+    let body_parsed = parse_or(ParseState { cell: advance(Advance { lst: mm.item_cell, k: 2 }) })
+    let body_node = parsed_node(body_parsed)
+    let body_next = parsed_next(body_parsed)
+    let close_pos = if peek_op_code(body_next) == 22 then advance(Advance { lst: body_next, k: 1 }) else body_next
+    out = Parsed::Mk { node: if mm.kind == 0 then Ast::AstMinFold { coll: mm.coll, item_start: item_start, item_len: item_len, body: body_node } else Ast::AstMaxFold { coll: mm.coll, item_start: item_start, item_len: item_len, body: body_node }, next: close_pos }
+  proofs:
+    purity:
+      reads : [mm.coll, mm.item_cell, mm.kind]
+      calls : [peek_start, peek_len, peek_op_code, parse_or, parsed_node, parsed_next, advance]
+    termination:
+      bound : 512
+
+
+-- minmax_binary: parse the second scalar argument (a full parse_or from
+-- mm.arg2_cell) and consume the ')'. Reconstruct the EXACT AstCall the generic
+-- Ident-call path (call_build + args_cons) builds for min(a,b) / max(a,b):
+-- ArgCons(arg1, ArgCons(arg2, ArgNil)), callee span = the min/max span. This must
+-- be byte-identical to the pre-slice AST or the self-source's own binary max()
+-- calls would emit differently (gen1 != gen2). The emitter's span_is_min /
+-- span_is_max dispatch on the callee span, exactly as before.
+rule minmax_binary
+  @intention: "Reconstruct the binary min(a,b)/max(a,b) as the exact AstCall the generic call path builds"
+  @source: vexprparse.intent:64
+  input:
+    mm : MMBin
+  output:
+    out : Parsed
+  logic:
+    let arg2_parsed = parse_or(ParseState { cell: mm.arg2_cell })
+    let arg2_node = parsed_node(arg2_parsed)
+    let arg2_next = parsed_next(arg2_parsed)
+    let close_pos = if peek_op_code(arg2_next) == 22 then advance(Advance { lst: arg2_next, k: 1 }) else arg2_next
+    out = Parsed::Mk { node: Ast::AstCall { callee_start: mm.cstart, callee_len: mm.clen, args: ArgList::ArgCons { head: mm.arg1, tail: ArgList::ArgCons { head: arg2_node, tail: ArgList::ArgNil } } }, next: close_pos }
+  proofs:
+    purity:
+      reads : [mm.arg1, mm.arg2_cell, mm.cstart, mm.clen]
+      calls : [parse_or, parsed_node, parsed_next, peek_op_code, advance]
+    termination:
+      bound : 512
+
+
 -- field_rest: fold a chain of '.IDENT' field accesses onto a base AST, left-deep
 -- (a.b.c => AstField(AstField(AstVar(a), b), c)). Peeks the op at fs.pos: a '.'
 -- (op 12) followed by an IDENT consumes both, wraps the base in AstField with
@@ -3478,16 +3766,23 @@ rule parse_primary
     -- reused with kinds 4 (map) / 5 (filter) — same `<kw> ( <coll> , <item> => <body> )`.
     let ismap = if lead_kind == 220 then 1 else 0
     let isfilter = if lead_kind == 221 then 1 else 0
+    -- COLLECTIONS tier min/max fold: min / max lex as keyword tokens (kw3=22 ->
+    -- kind 222, kw3=23 -> kind 223) but are NOT fold-only keywords — parse_minmax
+    -- handles BOTH the fold form and the binary min(a,b)/max(a,b) primitive. The
+    -- callee span is recovered via peek_kw_start / peek_kw_len (peek_start returns
+    -- 0 on a keyword token) so the binary form rebuilds the exact AstCall.
+    let ismin = if lead_kind == 222 then 1 else 0
+    let ismax = if lead_kind == 223 then 1 else 0
     let isvariant = if next_opc == 3 then 1 else 0
     let vstart = peek_start(advance(Advance { lst: st.cell, k: 2 }))
     let vlen = peek_len(advance(Advance { lst: st.cell, k: 2 }))
     let has_braces = if peek_op_code(advance(Advance { lst: st.cell, k: 3 })) == 23 then 1 else 0
     let isrecord = if next_opc == 23 then 1 else 0
-    out = if ismatch == 1 then parse_match(st) else if ismatchresult == 1 then parse_match_result(st) else if issum == 1 then parse_reduce(ReduceState { cell: st.cell, kind: 0 }) else if iscount == 1 then parse_reduce(ReduceState { cell: st.cell, kind: 1 }) else if isall == 1 then parse_reduce(ReduceState { cell: st.cell, kind: 2 }) else if isany == 1 then parse_reduce(ReduceState { cell: st.cell, kind: 3 }) else if ismap == 1 then parse_reduce(ReduceState { cell: st.cell, kind: 4 }) else if isfilter == 1 then parse_reduce(ReduceState { cell: st.cell, kind: 5 }) else if isfold == 1 then parse_fold(st) else if isok == 1 then ok_close(ParenState { inner: parse_or(ParseState { cell: advance(Advance { lst: st.cell, k: 2 }) }) }) else if iserr == 1 then err_close(ParenState { inner: parse_or(ParseState { cell: advance(Advance { lst: st.cell, k: 2 }) }) }) else if isif == 1 then if_then(IfThenState { cond: parse_or(ParseState { cell: advance(Advance { lst: st.cell, k: 1 }) }) }) else if istrue == 1 then Parsed::Mk { node: Ast::AstBool { value: 1 }, next: advance(Advance { lst: st.cell, k: 1 }) } else if isfalse == 1 then Parsed::Mk { node: Ast::AstBool { value: 0 }, next: advance(Advance { lst: st.cell, k: 1 }) } else if isnum == 1 then Parsed::Mk { node: Ast::AstNum { value: numval }, next: advance(Advance { lst: st.cell, k: 1 }) } else if isstr == 1 then Parsed::Mk { node: Ast::AstStr { start: sstart, len: slen }, next: advance(Advance { lst: st.cell, k: 1 }) } else if isbytelit == 1 then Parsed::Mk { node: Ast::AstBytes { start: bstart + 2, len: if blen >= 3 then blen - 3 else 0 }, next: advance(Advance { lst: st.cell, k: 1 }) } else if isparen == 1 then paren_close(ParenState { inner: parse_or(ParseState { cell: advance(Advance { lst: st.cell, k: 1 }) }) }) else if isident == 1 then (if isvariant == 1 then (if has_braces == 1 then variant_build(VariantState { cstart: idstart, clen: idlen, vstart: vstart, vlen: vlen, pfields: parse_vfields(ParseState { cell: advance(Advance { lst: st.cell, k: 4 }) }) }) else variant_build(VariantState { cstart: idstart, clen: idlen, vstart: vstart, vlen: vlen, pfields: ParsedVFields::MkVF { fields: VFieldList::VFNil, next: advance(Advance { lst: st.cell, k: 3 }) } })) else if iscall == 1 then call_build(CallState { cstart: idstart, clen: idlen, pargs: parse_args(ParseState { cell: advance(Advance { lst: st.cell, k: 2 }) }) }) else if isrecord == 1 then variant_build(VariantState { cstart: idstart, clen: idlen, vstart: idstart, vlen: idlen, pfields: parse_vfields(ParseState { cell: advance(Advance { lst: st.cell, k: 2 }) }) }) else field_rest(FieldState { cell: advance(Advance { lst: st.cell, k: 1 }), base: Ast::AstVar { start: idstart, len: idlen } })) else Parsed::Mk { node: Ast::AstErr, next: st.cell }
+    out = if ismatch == 1 then parse_match(st) else if ismatchresult == 1 then parse_match_result(st) else if issum == 1 then parse_reduce(ReduceState { cell: st.cell, kind: 0 }) else if iscount == 1 then parse_reduce(ReduceState { cell: st.cell, kind: 1 }) else if isall == 1 then parse_reduce(ReduceState { cell: st.cell, kind: 2 }) else if isany == 1 then parse_reduce(ReduceState { cell: st.cell, kind: 3 }) else if ismap == 1 then parse_reduce(ReduceState { cell: st.cell, kind: 4 }) else if isfilter == 1 then parse_reduce(ReduceState { cell: st.cell, kind: 5 }) else if isfold == 1 then parse_fold(st) else if ismin == 1 then parse_minmax(MinMaxState { cell: st.cell, kind: 0, cstart: peek_kw_start(st.cell), clen: peek_kw_len(st.cell) }) else if ismax == 1 then parse_minmax(MinMaxState { cell: st.cell, kind: 1, cstart: peek_kw_start(st.cell), clen: peek_kw_len(st.cell) }) else if isok == 1 then ok_close(ParenState { inner: parse_or(ParseState { cell: advance(Advance { lst: st.cell, k: 2 }) }) }) else if iserr == 1 then err_close(ParenState { inner: parse_or(ParseState { cell: advance(Advance { lst: st.cell, k: 2 }) }) }) else if isif == 1 then if_then(IfThenState { cond: parse_or(ParseState { cell: advance(Advance { lst: st.cell, k: 1 }) }) }) else if istrue == 1 then Parsed::Mk { node: Ast::AstBool { value: 1 }, next: advance(Advance { lst: st.cell, k: 1 }) } else if isfalse == 1 then Parsed::Mk { node: Ast::AstBool { value: 0 }, next: advance(Advance { lst: st.cell, k: 1 }) } else if isnum == 1 then Parsed::Mk { node: Ast::AstNum { value: numval }, next: advance(Advance { lst: st.cell, k: 1 }) } else if isstr == 1 then Parsed::Mk { node: Ast::AstStr { start: sstart, len: slen }, next: advance(Advance { lst: st.cell, k: 1 }) } else if isbytelit == 1 then Parsed::Mk { node: Ast::AstBytes { start: bstart + 2, len: if blen >= 3 then blen - 3 else 0 }, next: advance(Advance { lst: st.cell, k: 1 }) } else if isparen == 1 then paren_close(ParenState { inner: parse_or(ParseState { cell: advance(Advance { lst: st.cell, k: 1 }) }) }) else if isident == 1 then (if isvariant == 1 then (if has_braces == 1 then variant_build(VariantState { cstart: idstart, clen: idlen, vstart: vstart, vlen: vlen, pfields: parse_vfields(ParseState { cell: advance(Advance { lst: st.cell, k: 4 }) }) }) else variant_build(VariantState { cstart: idstart, clen: idlen, vstart: vstart, vlen: vlen, pfields: ParsedVFields::MkVF { fields: VFieldList::VFNil, next: advance(Advance { lst: st.cell, k: 3 }) } })) else if iscall == 1 then call_build(CallState { cstart: idstart, clen: idlen, pargs: parse_args(ParseState { cell: advance(Advance { lst: st.cell, k: 2 }) }) }) else if isrecord == 1 then variant_build(VariantState { cstart: idstart, clen: idlen, vstart: idstart, vlen: idlen, pfields: parse_vfields(ParseState { cell: advance(Advance { lst: st.cell, k: 2 }) }) }) else field_rest(FieldState { cell: advance(Advance { lst: st.cell, k: 1 }), base: Ast::AstVar { start: idstart, len: idlen } })) else Parsed::Mk { node: Ast::AstErr, next: st.cell }
   proofs:
     purity:
       reads : [st.cell, st]
-      calls : [peek_kind, peek_is_num, peek_is_str, peek_is_bytelit, peek_bytelit_start, peek_bytelit_len, peek_op_code, peek_is_ident, peek_value, peek_str_start, peek_str_len, peek_start, peek_len, if_then, paren_close, parse_or, call_build, parse_args, field_rest, parse_match, parse_match_result, parse_reduce, parse_fold, ok_close, err_close, variant_build, parse_vfields, advance]
+      calls : [peek_kind, peek_is_num, peek_is_str, peek_is_bytelit, peek_bytelit_start, peek_bytelit_len, peek_op_code, peek_is_ident, peek_value, peek_str_start, peek_str_len, peek_start, peek_len, peek_kw_start, peek_kw_len, if_then, paren_close, parse_or, call_build, parse_args, field_rest, parse_match, parse_match_result, parse_reduce, parse_fold, parse_minmax, ok_close, err_close, variant_build, parse_vfields, advance]
     termination:
       bound : 512
 
@@ -3995,6 +4290,8 @@ rule shape_ast
       -- child sums never straddle).
       AstMap(coll, item_start, item_len, body) => 200000000000 + shape_ast(coll) + shape_ast(body)
       AstFilter(coll, item_start, item_len, body) => 300000000000 + shape_ast(coll) + shape_ast(body)
+      AstMinFold(coll, item_start, item_len, body) => 40000000000 + shape_ast(coll) + shape_ast(body)
+      AstMaxFold(coll, item_start, item_len, body) => 50000000000 + shape_ast(coll) + shape_ast(body)
   proofs:
     purity:
       reads : [e]
@@ -5403,6 +5700,8 @@ rule eval_ast_env
       -- filter) but live in eval_mapfilter (they produce a ValueList, not a number).
       AstMap(coll, item_start, item_len, body) => Value::VData { tag: 15360002, payload: eval_mapfilter(EvalReduceState { items: vdata_payload(eval_ast_env(EvalEnvArg { node: coll, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts })), item_start: item_start, item_len: item_len, body: body, kind: 4, acc: 0, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts }) }
       AstFilter(coll, item_start, item_len, body) => Value::VData { tag: 15360002, payload: eval_mapfilter(EvalReduceState { items: vdata_payload(eval_ast_env(EvalEnvArg { node: coll, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts })), item_start: item_start, item_len: item_len, body: body, kind: 5, acc: 0, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts }) }
+      AstMinFold(coll, item_start, item_len, body) => eval_reduce(EvalReduceState { items: vdata_payload(eval_ast_env(EvalEnvArg { node: coll, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts })), item_start: item_start, item_len: item_len, body: body, kind: 6, acc: 9223372036854775807, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts })
+      AstMaxFold(coll, item_start, item_len, body) => eval_reduce(EvalReduceState { items: vdata_payload(eval_ast_env(EvalEnvArg { node: coll, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts })), item_start: item_start, item_len: item_len, body: body, kind: 7, acc: 0 - 9223372036854775807 - 1, env: ea.env, src: ea.src, prog: ea.prog, concepts: ea.concepts })
   proofs:
     purity:
       reads : [ea.node, ea.env, ea.src, ea.prog, ea.concepts]
@@ -7027,12 +7326,14 @@ concept EvalReduceState
 -- (kind 1) adds 1 iff vnum_of(body) != 0; all (kind 2, acc starts 1) keeps acc iff
 -- the body is true, else latches 0; any (kind 3, acc starts 0) becomes 1 on a true
 -- body, else keeps acc. Single pass, no short-circuit (verbosec Phase 6 fold-desugar
--- parity). Recurse on the tail with the updated acc;
+-- parity). min (kind 6, acc starts i64::MAX) keeps the smaller of body and acc;
+-- max (kind 7, acc starts i64::MIN) keeps the larger — so an EMPTY collection
+-- returns the sentinel (verbosec parity). Recurse on the tail with the updated acc;
 -- VLNil returns VNum acc. In the eval SCC (calls eval_ast_env). Bound-only termination
 -- + the native recursion breadcrumb, same posture as eval_match / eval_match_result
 -- (this rule runs only under the interpreter --run path, never compiled natively).
 rule eval_reduce
-  @intention: "Fold a collection's element values into a number: sum (add body), count (add body != 0), all (latch 0 on a false body), or any (saturate 1 on a true body), binding each element to the item span"
+  @intention: "Fold a collection's element values into a number: sum (add body), count (add body != 0), all (latch 0 on a false body), any (saturate 1 on a true body), min (keep smaller body), or max (keep larger body), binding each element to the item span"
   @source: vexprparse.intent:36
   input:
     er : EvalReduceState
@@ -7040,7 +7341,7 @@ rule eval_reduce
     out : Value
   logic:
     out = match er.items:
-      VLCons(head, tail) => eval_reduce(EvalReduceState { items: tail, item_start: er.item_start, item_len: er.item_len, body: er.body, kind: er.kind, acc: if er.kind == 0 then er.acc + vnum_of(eval_ast_env(EvalEnvArg { node: er.body, env: VEnv::VECons { name_start: er.item_start, name_len: er.item_len, val: head, rest: er.env }, src: er.src, prog: er.prog, concepts: er.concepts })) else (if er.kind == 1 then er.acc + (if vnum_of(eval_ast_env(EvalEnvArg { node: er.body, env: VEnv::VECons { name_start: er.item_start, name_len: er.item_len, val: head, rest: er.env }, src: er.src, prog: er.prog, concepts: er.concepts })) != 0 then 1 else 0) else (if er.kind == 2 then (if vnum_of(eval_ast_env(EvalEnvArg { node: er.body, env: VEnv::VECons { name_start: er.item_start, name_len: er.item_len, val: head, rest: er.env }, src: er.src, prog: er.prog, concepts: er.concepts })) != 0 then er.acc else 0) else (if vnum_of(eval_ast_env(EvalEnvArg { node: er.body, env: VEnv::VECons { name_start: er.item_start, name_len: er.item_len, val: head, rest: er.env }, src: er.src, prog: er.prog, concepts: er.concepts })) != 0 then 1 else er.acc))), env: er.env, src: er.src, prog: er.prog, concepts: er.concepts })
+      VLCons(head, tail) => eval_reduce(EvalReduceState { items: tail, item_start: er.item_start, item_len: er.item_len, body: er.body, kind: er.kind, acc: if er.kind == 0 then er.acc + vnum_of(eval_ast_env(EvalEnvArg { node: er.body, env: VEnv::VECons { name_start: er.item_start, name_len: er.item_len, val: head, rest: er.env }, src: er.src, prog: er.prog, concepts: er.concepts })) else (if er.kind == 1 then er.acc + (if vnum_of(eval_ast_env(EvalEnvArg { node: er.body, env: VEnv::VECons { name_start: er.item_start, name_len: er.item_len, val: head, rest: er.env }, src: er.src, prog: er.prog, concepts: er.concepts })) != 0 then 1 else 0) else (if er.kind == 2 then (if vnum_of(eval_ast_env(EvalEnvArg { node: er.body, env: VEnv::VECons { name_start: er.item_start, name_len: er.item_len, val: head, rest: er.env }, src: er.src, prog: er.prog, concepts: er.concepts })) != 0 then er.acc else 0) else (if er.kind == 3 then (if vnum_of(eval_ast_env(EvalEnvArg { node: er.body, env: VEnv::VECons { name_start: er.item_start, name_len: er.item_len, val: head, rest: er.env }, src: er.src, prog: er.prog, concepts: er.concepts })) != 0 then 1 else er.acc) else (if er.kind == 6 then (if vnum_of(eval_ast_env(EvalEnvArg { node: er.body, env: VEnv::VECons { name_start: er.item_start, name_len: er.item_len, val: head, rest: er.env }, src: er.src, prog: er.prog, concepts: er.concepts })) < er.acc then vnum_of(eval_ast_env(EvalEnvArg { node: er.body, env: VEnv::VECons { name_start: er.item_start, name_len: er.item_len, val: head, rest: er.env }, src: er.src, prog: er.prog, concepts: er.concepts })) else er.acc) else (if vnum_of(eval_ast_env(EvalEnvArg { node: er.body, env: VEnv::VECons { name_start: er.item_start, name_len: er.item_len, val: head, rest: er.env }, src: er.src, prog: er.prog, concepts: er.concepts })) > er.acc then vnum_of(eval_ast_env(EvalEnvArg { node: er.body, env: VEnv::VECons { name_start: er.item_start, name_len: er.item_len, val: head, rest: er.env }, src: er.src, prog: er.prog, concepts: er.concepts })) else er.acc))))), env: er.env, src: er.src, prog: er.prog, concepts: er.concepts })
       VLNil => Value::VNum { n: er.acc }
   proofs:
     purity:
@@ -10472,6 +10773,8 @@ rule count_undef_ast
       AstAny(coll, item_start, item_len, body) => 0
       AstMap(coll, item_start, item_len, body) => 0
       AstFilter(coll, item_start, item_len, body) => 0
+      AstMinFold(coll, item_start, item_len, body) => 0
+      AstMaxFold(coll, item_start, item_len, body) => 0
   proofs:
     purity:
       reads : [a.node, a.binds, a.src]
@@ -11010,6 +11313,8 @@ rule count_badcall_ast
       AstAny(coll, item_start, item_len, body) => 0
       AstMap(coll, item_start, item_len, body) => 0
       AstFilter(coll, item_start, item_len, body) => 0
+      AstMinFold(coll, item_start, item_len, body) => 0
+      AstMaxFold(coll, item_start, item_len, body) => 0
   proofs:
     purity:
       reads : [a.node, a.rules, a.src]
@@ -11487,6 +11792,8 @@ rule count_badarity_ast
       AstAny(coll, item_start, item_len, body) => 0
       AstMap(coll, item_start, item_len, body) => 0
       AstFilter(coll, item_start, item_len, body) => 0
+      AstMinFold(coll, item_start, item_len, body) => 0
+      AstMaxFold(coll, item_start, item_len, body) => 0
   proofs:
     purity:
       reads : [a.node, a.rules, a.src]
@@ -11970,6 +12277,8 @@ rule type_of_env
       AstAny(coll, item_start, item_len, body) => 1
       AstMap(coll, item_start, item_len, body) => 5
       AstFilter(coll, item_start, item_len, body) => 5
+      AstMinFold(coll, item_start, item_len, body) => 0
+      AstMaxFold(coll, item_start, item_len, body) => 0
   proofs:
     purity:
       reads : [t.node, t.tenv, t.src, t.prog, t.concepts]
@@ -13153,6 +13462,8 @@ rule argtype_ast
       AstAny(coll, item_start, item_len, body) => 0
       AstMap(coll, item_start, item_len, body) => 0
       AstFilter(coll, item_start, item_len, body) => 0
+      AstMinFold(coll, item_start, item_len, body) => 0
+      AstMaxFold(coll, item_start, item_len, body) => 0
       AstBin(op, lhs, rhs) => argtype_ast(ArgTypeState { node: lhs, tenv: a.tenv, src: a.src, prog: a.prog }) + argtype_ast(ArgTypeState { node: rhs, tenv: a.tenv, src: a.src, prog: a.prog })
       AstNeg(inner) => argtype_ast(ArgTypeState { node: inner, tenv: a.tenv, src: a.src, prog: a.prog })
       AstNot(inner) => argtype_ast(ArgTypeState { node: inner, tenv: a.tenv, src: a.src, prog: a.prog })
@@ -13481,6 +13792,8 @@ rule count_undecl_call_ast
       AstAny(coll, item_start, item_len, body) => 0
       AstMap(coll, item_start, item_len, body) => 0
       AstFilter(coll, item_start, item_len, body) => 0
+      AstMinFold(coll, item_start, item_len, body) => 0
+      AstMaxFold(coll, item_start, item_len, body) => 0
   proofs:
     purity:
       reads : [a.node, a.rules, a.calls, a.src]
@@ -13729,6 +14042,8 @@ rule count_undecl_read_ast
       AstAny(coll, item_start, item_len, body) => 0
       AstMap(coll, item_start, item_len, body) => 0
       AstFilter(coll, item_start, item_len, body) => 0
+      AstMinFold(coll, item_start, item_len, body) => 0
+      AstMaxFold(coll, item_start, item_len, body) => 0
   proofs:
     purity:
       reads : [a.node, a.binds, a.reads, a.in_start, a.in_len, a.src]
@@ -14117,6 +14432,8 @@ rule term_var_is_input
       AstAny(coll, item_start, item_len, body) => 0
       AstMap(coll, item_start, item_len, body) => 0
       AstFilter(coll, item_start, item_len, body) => 0
+      AstMinFold(coll, item_start, item_len, body) => 0
+      AstMaxFold(coll, item_start, item_len, body) => 0
   proofs:
     purity:
       reads : [a.node, a.in_start, a.in_len, a.src]
@@ -14163,6 +14480,8 @@ rule term_knum_ok
       AstAny(coll, item_start, item_len, body) => 0
       AstMap(coll, item_start, item_len, body) => 0
       AstFilter(coll, item_start, item_len, body) => 0
+      AstMinFold(coll, item_start, item_len, body) => 0
+      AstMaxFold(coll, item_start, item_len, body) => 0
   proofs:
     purity:
       reads : [n]
@@ -14209,6 +14528,8 @@ rule term_base_ok
       AstAny(coll, item_start, item_len, body) => 0
       AstMap(coll, item_start, item_len, body) => 0
       AstFilter(coll, item_start, item_len, body) => 0
+      AstMinFold(coll, item_start, item_len, body) => 0
+      AstMaxFold(coll, item_start, item_len, body) => 0
   proofs:
     purity:
       reads : [a.node, a.rn_start, a.rn_len, a.kind, a.in_start, a.in_len, a.tf_start, a.tf_len, a.sbinds, a.src]
@@ -14254,6 +14575,8 @@ rule term_step_ok
       AstAny(coll, item_start, item_len, body) => 0
       AstMap(coll, item_start, item_len, body) => 0
       AstFilter(coll, item_start, item_len, body) => 0
+      AstMinFold(coll, item_start, item_len, body) => 0
+      AstMaxFold(coll, item_start, item_len, body) => 0
   proofs:
     purity:
       reads : [a.node, a.rn_start, a.rn_len, a.kind, a.in_start, a.in_len, a.tf_start, a.tf_len, a.sbinds, a.src]
@@ -14326,6 +14649,8 @@ rule term_arg_ok
       AstAny(coll, item_start, item_len, body) => 0
       AstMap(coll, item_start, item_len, body) => 0
       AstFilter(coll, item_start, item_len, body) => 0
+      AstMinFold(coll, item_start, item_len, body) => 0
+      AstMaxFold(coll, item_start, item_len, body) => 0
   proofs:
     purity:
       reads : [a.node, a.rn_start, a.rn_len, a.kind, a.in_start, a.in_len, a.tf_start, a.tf_len, a.sbinds, a.src]
@@ -14445,6 +14770,8 @@ rule count_term_ast
       AstAny(coll, item_start, item_len, body) => 0
       AstMap(coll, item_start, item_len, body) => 0
       AstFilter(coll, item_start, item_len, body) => 0
+      AstMinFold(coll, item_start, item_len, body) => 0
+      AstMaxFold(coll, item_start, item_len, body) => 0
   proofs:
     purity:
       reads : [a.node, a.rn_start, a.rn_len, a.kind, a.in_start, a.in_len, a.tf_start, a.tf_len, a.sbinds, a.src]
@@ -15587,6 +15914,8 @@ rule undef_span_ast
       AstAny(coll, item_start, item_len, body) => Span::MkSpan { start: 9999, len: 0 }
       AstMap(coll, item_start, item_len, body) => Span::MkSpan { start: 9999, len: 0 }
       AstFilter(coll, item_start, item_len, body) => Span::MkSpan { start: 9999, len: 0 }
+      AstMinFold(coll, item_start, item_len, body) => Span::MkSpan { start: 9999, len: 0 }
+      AstMaxFold(coll, item_start, item_len, body) => Span::MkSpan { start: 9999, len: 0 }
       AstVar(start, len) => if name_bound(NameBoundState { binds: a.binds, src: a.src, q_start: start, q_len: len }) == 0 then Span::MkSpan { start: start, len: len } else Span::MkSpan { start: 9999, len: 0 }
       AstBin(op, lhs, rhs) => span_or(SpanOrState { a: undef_span_ast(UndefSpanAstState { node: lhs, binds: a.binds, src: a.src }), b: undef_span_ast(UndefSpanAstState { node: rhs, binds: a.binds, src: a.src }) })
       AstNeg(inner) => undef_span_ast(UndefSpanAstState { node: inner, binds: a.binds, src: a.src })
@@ -15924,6 +16253,8 @@ rule badcall_span_ast
       AstAny(coll, item_start, item_len, body) => Span::MkSpan { start: 9999, len: 0 }
       AstMap(coll, item_start, item_len, body) => Span::MkSpan { start: 9999, len: 0 }
       AstFilter(coll, item_start, item_len, body) => Span::MkSpan { start: 9999, len: 0 }
+      AstMinFold(coll, item_start, item_len, body) => Span::MkSpan { start: 9999, len: 0 }
+      AstMaxFold(coll, item_start, item_len, body) => Span::MkSpan { start: 9999, len: 0 }
       AstBin(op, lhs, rhs) => span_or(SpanOrState { a: badcall_span_ast(BadCallSpanState { node: lhs, rules: a.rules, src: a.src }), b: badcall_span_ast(BadCallSpanState { node: rhs, rules: a.rules, src: a.src }) })
       AstNeg(inner) => badcall_span_ast(BadCallSpanState { node: inner, rules: a.rules, src: a.src })
       AstNot(inner) => badcall_span_ast(BadCallSpanState { node: inner, rules: a.rules, src: a.src })
@@ -16196,6 +16527,8 @@ rule badarity_span_ast
       AstAny(coll, item_start, item_len, body) => Span::MkSpan { start: 9999, len: 0 }
       AstMap(coll, item_start, item_len, body) => Span::MkSpan { start: 9999, len: 0 }
       AstFilter(coll, item_start, item_len, body) => Span::MkSpan { start: 9999, len: 0 }
+      AstMinFold(coll, item_start, item_len, body) => Span::MkSpan { start: 9999, len: 0 }
+      AstMaxFold(coll, item_start, item_len, body) => Span::MkSpan { start: 9999, len: 0 }
       AstBin(op, lhs, rhs) => span_or(SpanOrState { a: badarity_span_ast(BadAritySpanState { node: lhs, rules: a.rules, src: a.src }), b: badarity_span_ast(BadAritySpanState { node: rhs, rules: a.rules, src: a.src }) })
       AstNeg(inner) => badarity_span_ast(BadAritySpanState { node: inner, rules: a.rules, src: a.src })
       AstNot(inner) => badarity_span_ast(BadAritySpanState { node: inner, rules: a.rules, src: a.src })
@@ -16591,6 +16924,8 @@ rule print_expr
       AstAny(coll, item_start, item_len, body) => "?"
       AstMap(coll, item_start, item_len, body) => "?"
       AstFilter(coll, item_start, item_len, body) => "?"
+      AstMinFold(coll, item_start, item_len, body) => "?"
+      AstMaxFold(coll, item_start, item_len, body) => "?"
   proofs:
     purity:
       reads : [ps.node, ps.src]
@@ -16750,6 +17085,8 @@ rule lower_expr
       AstAny(coll, item_start, item_len, body) => "? "
       AstMap(coll, item_start, item_len, body) => "? "
       AstFilter(coll, item_start, item_len, body) => "? "
+      AstMinFold(coll, item_start, item_len, body) => "? "
+      AstMaxFold(coll, item_start, item_len, body) => "? "
   proofs:
     purity:
       reads : [ps.node, ps.src]
@@ -16887,6 +17224,8 @@ rule x86_expr
       AstAny(coll, item_start, item_len, body) => b"\xcc"
       AstMap(coll, item_start, item_len, body) => b"\xcc"
       AstFilter(coll, item_start, item_len, body) => b"\xcc"
+      AstMinFold(coll, item_start, item_len, body) => b"\xcc"
+      AstMaxFold(coll, item_start, item_len, body) => b"\xcc"
   proofs:
     purity:
       reads : [ps.node, ps.src]
@@ -16946,6 +17285,8 @@ rule code_size_expr
       AstAny(coll, item_start, item_len, body) => 1
       AstMap(coll, item_start, item_len, body) => 1
       AstFilter(coll, item_start, item_len, body) => 1
+      AstMinFold(coll, item_start, item_len, body) => 1
+      AstMaxFold(coll, item_start, item_len, body) => 1
   proofs:
     purity:
       reads : [ps.node, ps.src]
@@ -17254,6 +17595,8 @@ rule ast_is_variant
       AstAny(coll, item_start, item_len, body) => 0
       AstMap(coll, item_start, item_len, body) => 0
       AstFilter(coll, item_start, item_len, body) => 0
+      AstMinFold(coll, item_start, item_len, body) => 0
+      AstMaxFold(coll, item_start, item_len, body) => 0
   proofs:
     purity:
       reads : [n]
@@ -17296,6 +17639,8 @@ rule ast_variant_cstart
       AstAny(coll, item_start, item_len, body) => 0
       AstMap(coll, item_start, item_len, body) => 0
       AstFilter(coll, item_start, item_len, body) => 0
+      AstMinFold(coll, item_start, item_len, body) => 0
+      AstMaxFold(coll, item_start, item_len, body) => 0
   proofs:
     purity:
       reads : [n]
@@ -17338,6 +17683,8 @@ rule ast_variant_clen
       AstAny(coll, item_start, item_len, body) => 0
       AstMap(coll, item_start, item_len, body) => 0
       AstFilter(coll, item_start, item_len, body) => 0
+      AstMinFold(coll, item_start, item_len, body) => 0
+      AstMaxFold(coll, item_start, item_len, body) => 0
   proofs:
     purity:
       reads : [n]
@@ -17472,6 +17819,8 @@ rule static_concept_of
       AstAny(coll, item_start, item_len, body) => 0 - 1
       AstMap(coll, item_start, item_len, body) => 0 - 1
       AstFilter(coll, item_start, item_len, body) => 0 - 1
+      AstMinFold(coll, item_start, item_len, body) => 0 - 1
+      AstMaxFold(coll, item_start, item_len, body) => 0 - 1
   proofs:
     purity:
       reads : [sc.node, sc.src, sc.params, sc.lets, sc.concepts]
@@ -17729,6 +18078,8 @@ rule ast_uses_text
       AstAny(coll, item_start, item_len, body) => if ast_uses_text(PrintState { node: coll, src: ps.src }) == 1 then 1 else ast_uses_text(PrintState { node: body, src: ps.src })
       AstMap(coll, item_start, item_len, body) => if ast_uses_text(PrintState { node: coll, src: ps.src }) == 1 then 1 else ast_uses_text(PrintState { node: body, src: ps.src })
       AstFilter(coll, item_start, item_len, body) => if ast_uses_text(PrintState { node: coll, src: ps.src }) == 1 then 1 else ast_uses_text(PrintState { node: body, src: ps.src })
+      AstMinFold(coll, item_start, item_len, body) => if ast_uses_text(PrintState { node: coll, src: ps.src }) == 1 then 1 else ast_uses_text(PrintState { node: body, src: ps.src })
+      AstMaxFold(coll, item_start, item_len, body) => if ast_uses_text(PrintState { node: coll, src: ps.src }) == 1 then 1 else ast_uses_text(PrintState { node: body, src: ps.src })
   proofs:
     purity:
       reads : [ps.node, ps.src]
@@ -17896,6 +18247,8 @@ rule ast_uses_result
       AstAny(coll, item_start, item_len, body) => if ast_uses_result(PrintState { node: coll, src: ps.src }) == 1 then 1 else ast_uses_result(PrintState { node: body, src: ps.src })
       AstMap(coll, item_start, item_len, body) => if ast_uses_result(PrintState { node: coll, src: ps.src }) == 1 then 1 else ast_uses_result(PrintState { node: body, src: ps.src })
       AstFilter(coll, item_start, item_len, body) => if ast_uses_result(PrintState { node: coll, src: ps.src }) == 1 then 1 else ast_uses_result(PrintState { node: body, src: ps.src })
+      AstMinFold(coll, item_start, item_len, body) => if ast_uses_result(PrintState { node: coll, src: ps.src }) == 1 then 1 else ast_uses_result(PrintState { node: body, src: ps.src })
+      AstMaxFold(coll, item_start, item_len, body) => if ast_uses_result(PrintState { node: coll, src: ps.src }) == 1 then 1 else ast_uses_result(PrintState { node: body, src: ps.src })
   proofs:
     purity:
       reads : [ps.node, ps.src]
@@ -18114,6 +18467,8 @@ rule ast_texty_shallow
       -- scope, verbosec refuses them too).
       AstMap(coll, item_start, item_len, body) => 1
       AstFilter(coll, item_start, item_len, body) => 1
+      AstMinFold(coll, item_start, item_len, body) => 0
+      AstMaxFold(coll, item_start, item_len, body) => 0
   proofs:
     purity:
       reads : [ps.node, ps.src]
@@ -18195,6 +18550,8 @@ rule ast_is_texty
       -- anywhere else corrupts p_filesz by 86 (the review's proven failure mode).
       AstMap(coll, item_start, item_len, body) => 1
       AstFilter(coll, item_start, item_len, body) => 1
+      AstMinFold(coll, item_start, item_len, body) => 0
+      AstMaxFold(coll, item_start, item_len, body) => 0
   proofs:
     purity:
       reads : [ts.node, ts.src, ts.prog]
@@ -18350,6 +18707,8 @@ rule ast_bytes_shallow
       AstAny(coll, item_start, item_len, body) => 0
       AstMap(coll, item_start, item_len, body) => 0
       AstFilter(coll, item_start, item_len, body) => 0
+      AstMinFold(coll, item_start, item_len, body) => 0
+      AstMaxFold(coll, item_start, item_len, body) => 0
   proofs:
     purity:
       reads : [ts.node, ts.src, ts.prog]
@@ -18398,6 +18757,8 @@ rule ast_is_bytes
       AstAny(coll, item_start, item_len, body) => 0
       AstMap(coll, item_start, item_len, body) => 0
       AstFilter(coll, item_start, item_len, body) => 0
+      AstMinFold(coll, item_start, item_len, body) => 0
+      AstMaxFold(coll, item_start, item_len, body) => 0
   proofs:
     purity:
       reads : [ts.node, ts.src, ts.prog]
@@ -18652,6 +19013,8 @@ rule ast_is_collection_node
       AstAny(coll, item_start, item_len, body) => 0
       AstMap(coll, item_start, item_len, body) => 1
       AstFilter(coll, item_start, item_len, body) => 1
+      AstMinFold(coll, item_start, item_len, body) => 0
+      AstMaxFold(coll, item_start, item_len, body) => 0
   proofs:
     purity:
       reads : [n]
@@ -18865,6 +19228,8 @@ rule mb_ast
       AstAny(coll, item_start, item_len, body) => 2 + mb_ast(coll) + mb_ast(body)
       AstMap(coll, item_start, item_len, body) => 2 + mb_ast(coll) + mb_ast(body)
       AstFilter(coll, item_start, item_len, body) => 2 + mb_ast(coll) + mb_ast(body)
+      AstMinFold(coll, item_start, item_len, body) => 2 + mb_ast(coll) + mb_ast(body)
+      AstMaxFold(coll, item_start, item_len, body) => 2 + mb_ast(coll) + mb_ast(body)
   proofs:
     purity:
       reads : [n]
@@ -19502,6 +19867,8 @@ rule code_size_node
       -- code_size_stream_node / x86_stream_node (collection rules route texty).
       AstMap(coll, item_start, item_len, body) => 1
       AstFilter(coll, item_start, item_len, body) => 1
+      AstMinFold(coll, item_start, item_len, body) => if coll_elem_nfields(StaticConceptState { node: coll, src: bg.src, params: bg.params, lets: bg.lets, concepts: bg.concepts }) > 0 then code_size_node(ByteGenState { node: coll, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + code_size_node(ByteGenState { node: body, src: bg.src, off: 0, params: bg.params, lets: lets_append_elem_binders(AppendElemBindersState { lets: bg.lets, item_start: item_start, item_len: item_len, second_start: 0, second_len: 0, cstart: cd_name_start(concept_at_index(ConceptAtState { concepts: bg.concepts, idx: static_concept_of(StaticConceptState { node: coll, src: bg.src, params: bg.params, lets: bg.lets, concepts: bg.concepts }) })), clen: cd_name_len(concept_at_index(ConceptAtState { concepts: bg.concepts, idx: static_concept_of(StaticConceptState { node: coll, src: bg.src, params: bg.params, lets: bg.lets, concepts: bg.concepts }) })) }), prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + 72 * coll_elem_nfields(StaticConceptState { node: coll, src: bg.src, params: bg.params, lets: bg.lets, concepts: bg.concepts }) + 160 else (code_size_node(ByteGenState { node: coll, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + code_size_node(ByteGenState { node: body, src: bg.src, off: 0, params: bg.params, lets: lets_append_binders(AppendBindersState { lets: bg.lets, bs: BinderList::BindCons { start: item_start, len: item_len, rest: BinderList::BindCons { start: 0, len: 0, rest: BinderList::BindNil } } }), prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + 200)
+      AstMaxFold(coll, item_start, item_len, body) => if coll_elem_nfields(StaticConceptState { node: coll, src: bg.src, params: bg.params, lets: bg.lets, concepts: bg.concepts }) > 0 then code_size_node(ByteGenState { node: coll, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + code_size_node(ByteGenState { node: body, src: bg.src, off: 0, params: bg.params, lets: lets_append_elem_binders(AppendElemBindersState { lets: bg.lets, item_start: item_start, item_len: item_len, second_start: 0, second_len: 0, cstart: cd_name_start(concept_at_index(ConceptAtState { concepts: bg.concepts, idx: static_concept_of(StaticConceptState { node: coll, src: bg.src, params: bg.params, lets: bg.lets, concepts: bg.concepts }) })), clen: cd_name_len(concept_at_index(ConceptAtState { concepts: bg.concepts, idx: static_concept_of(StaticConceptState { node: coll, src: bg.src, params: bg.params, lets: bg.lets, concepts: bg.concepts }) })) }), prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + 72 * coll_elem_nfields(StaticConceptState { node: coll, src: bg.src, params: bg.params, lets: bg.lets, concepts: bg.concepts }) + 160 else (code_size_node(ByteGenState { node: coll, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + code_size_node(ByteGenState { node: body, src: bg.src, off: 0, params: bg.params, lets: lets_append_binders(AppendBindersState { lets: bg.lets, bs: BinderList::BindCons { start: item_start, len: item_len, rest: BinderList::BindCons { start: 0, len: 0, rest: BinderList::BindNil } } }), prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + 200)
   proofs:
     purity:
       reads : [bg.node, bg.src, bg.off, bg.params, bg.lets, bg.prog, bg.concepts, bg.sizes]
@@ -19892,6 +20259,8 @@ rule x86_node
       -- x86_stream_node's AstMap/AstFilter arms (collection rules route texty).
       AstMap(coll, item_start, item_len, body) => b"\xcc"
       AstFilter(coll, item_start, item_len, body) => b"\xcc"
+      AstMinFold(coll, item_start, item_len, body) => if coll_elem_nfields(StaticConceptState { node: coll, src: bg.src, params: bg.params, lets: bg.lets, concepts: bg.concepts }) > 0 then concat(x86_node(ByteGenState { node: coll, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }), b"\x41\x59\x49\x8b\x31", b"\x48\x31\xc0\x45\x31\xdb\x8a\x0e\x80\xf9\x2d\x75\x06\x41\xb3\x01\x48\xff\xc6\x0f\xb6\x0e\x80\xf9\x30\x72\x15\x80\xf9\x39\x77\x10\x48\x6b\xc0\x0a\x48\x83\xe9\x30\x48\x01\xc8\x48\xff\xc6\xeb\xe3\x4d\x85\xdb\x74\x03\x48\xf7\xd8", b"\x49\x89\xc0\x49\x83\xc1\x08", b"\x48\xb8", le64(9223372036854775807), b"\x48\x89\x85", le32(0 - 8 * (count_binds(bg.lets) + 2)), b"\x4d\x85\xc0\x0f\x84", le32((72 * coll_elem_nfields(StaticConceptState { node: coll, src: bg.src, params: bg.params, lets: bg.lets, concepts: bg.concepts }) + 60 + code_size_node(ByteGenState { node: body, src: bg.src, off: 0, params: bg.params, lets: lets_append_elem_binders(AppendElemBindersState { lets: bg.lets, item_start: item_start, item_len: item_len, second_start: 0, second_len: 0, cstart: cd_name_start(concept_at_index(ConceptAtState { concepts: bg.concepts, idx: static_concept_of(StaticConceptState { node: coll, src: bg.src, params: bg.params, lets: bg.lets, concepts: bg.concepts }) })), clen: cd_name_len(concept_at_index(ConceptAtState { concepts: bg.concepts, idx: static_concept_of(StaticConceptState { node: coll, src: bg.src, params: bg.params, lets: bg.lets, concepts: bg.concepts }) })) }), prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }))), x86_elem_load(ElemLoadState { nf: coll_elem_nfields(StaticConceptState { node: coll, src: bg.src, params: bg.params, lets: bg.lets, concepts: bg.concepts }), tag: static_concept_of(StaticConceptState { node: coll, src: bg.src, params: bg.params, lets: bg.lets, concepts: bg.concepts }) * 256, esize: 8 * (max_payload_fields(bg.concepts) + 1), x_disp: 0 - 8 * (count_binds(bg.lets) + 1) }), x86_node(ByteGenState { node: body, src: bg.src, off: bg.off + code_size_node(ByteGenState { node: coll, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + 72 * coll_elem_nfields(StaticConceptState { node: coll, src: bg.src, params: bg.params, lets: bg.lets, concepts: bg.concepts }) + 120, params: bg.params, lets: lets_append_elem_binders(AppendElemBindersState { lets: bg.lets, item_start: item_start, item_len: item_len, second_start: 0, second_len: 0, cstart: cd_name_start(concept_at_index(ConceptAtState { concepts: bg.concepts, idx: static_concept_of(StaticConceptState { node: coll, src: bg.src, params: bg.params, lets: bg.lets, concepts: bg.concepts }) })), clen: cd_name_len(concept_at_index(ConceptAtState { concepts: bg.concepts, idx: static_concept_of(StaticConceptState { node: coll, src: bg.src, params: bg.params, lets: bg.lets, concepts: bg.concepts }) })) }), prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }), b"\x58\x48\x8b\x8d", le32(0 - 8 * (count_binds(bg.lets) + 2)), b"\x48\x39\xc8\x48\x0f\x4f\xc1\x48\x89\x85", le32(0 - 8 * (count_binds(bg.lets) + 2)), b"\x49\x83\xc1\x08\x49\xff\xc8\xe9", le32((0 - (72 * coll_elem_nfields(StaticConceptState { node: coll, src: bg.src, params: bg.params, lets: bg.lets, concepts: bg.concepts }) + 69 + code_size_node(ByteGenState { node: body, src: bg.src, off: 0, params: bg.params, lets: lets_append_elem_binders(AppendElemBindersState { lets: bg.lets, item_start: item_start, item_len: item_len, second_start: 0, second_len: 0, cstart: cd_name_start(concept_at_index(ConceptAtState { concepts: bg.concepts, idx: static_concept_of(StaticConceptState { node: coll, src: bg.src, params: bg.params, lets: bg.lets, concepts: bg.concepts }) })), clen: cd_name_len(concept_at_index(ConceptAtState { concepts: bg.concepts, idx: static_concept_of(StaticConceptState { node: coll, src: bg.src, params: bg.params, lets: bg.lets, concepts: bg.concepts }) })) }), prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes })))), b"\xff\xb5", le32(0 - 8 * (count_binds(bg.lets) + 2))) else (concat(x86_node(ByteGenState { node: coll, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }), b"\x41\x59\x49\x8b\x31", b"\x48\x31\xc0\x45\x31\xdb\x8a\x0e\x80\xf9\x2d\x75\x06\x41\xb3\x01\x48\xff\xc6\x0f\xb6\x0e\x80\xf9\x30\x72\x15\x80\xf9\x39\x77\x10\x48\x6b\xc0\x0a\x48\x83\xe9\x30\x48\x01\xc8\x48\xff\xc6\xeb\xe3\x4d\x85\xdb\x74\x03\x48\xf7\xd8", b"\x49\x89\xc0\x49\x83\xc1\x08", b"\x48\xb8", le64(9223372036854775807), b"\x48\x89\x85", le32(0 - 8 * (count_binds(bg.lets) + 2)), b"\x4d\x85\xc0\x0f\x84", le32((100 + code_size_node(ByteGenState { node: body, src: bg.src, off: 0, params: bg.params, lets: lets_append_binders(AppendBindersState { lets: bg.lets, bs: BinderList::BindCons { start: item_start, len: item_len, rest: BinderList::BindCons { start: 0, len: 0, rest: BinderList::BindNil } } }), prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }))), b"\x49\x8b\x31", b"\x48\x31\xc0\x45\x31\xdb\x8a\x0e\x80\xf9\x2d\x75\x06\x41\xb3\x01\x48\xff\xc6\x0f\xb6\x0e\x80\xf9\x30\x72\x15\x80\xf9\x39\x77\x10\x48\x6b\xc0\x0a\x48\x83\xe9\x30\x48\x01\xc8\x48\xff\xc6\xeb\xe3\x4d\x85\xdb\x74\x03\x48\xf7\xd8", b"\x48\x89\x85", le32(0 - 8 * (count_binds(bg.lets) + 1)), x86_node(ByteGenState { node: body, src: bg.src, off: bg.off + code_size_node(ByteGenState { node: coll, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + 160, params: bg.params, lets: lets_append_binders(AppendBindersState { lets: bg.lets, bs: BinderList::BindCons { start: item_start, len: item_len, rest: BinderList::BindCons { start: 0, len: 0, rest: BinderList::BindNil } } }), prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }), b"\x58\x48\x8b\x8d", le32(0 - 8 * (count_binds(bg.lets) + 2)), b"\x48\x39\xc8\x48\x0f\x4f\xc1\x48\x89\x85", le32(0 - 8 * (count_binds(bg.lets) + 2)), b"\x49\x83\xc1\x08\x49\xff\xc8\xe9", le32((0 - (109 + code_size_node(ByteGenState { node: body, src: bg.src, off: 0, params: bg.params, lets: lets_append_binders(AppendBindersState { lets: bg.lets, bs: BinderList::BindCons { start: item_start, len: item_len, rest: BinderList::BindCons { start: 0, len: 0, rest: BinderList::BindNil } } }), prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes })))), b"\xff\xb5", le32(0 - 8 * (count_binds(bg.lets) + 2))))
+      AstMaxFold(coll, item_start, item_len, body) => if coll_elem_nfields(StaticConceptState { node: coll, src: bg.src, params: bg.params, lets: bg.lets, concepts: bg.concepts }) > 0 then concat(x86_node(ByteGenState { node: coll, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }), b"\x41\x59\x49\x8b\x31", b"\x48\x31\xc0\x45\x31\xdb\x8a\x0e\x80\xf9\x2d\x75\x06\x41\xb3\x01\x48\xff\xc6\x0f\xb6\x0e\x80\xf9\x30\x72\x15\x80\xf9\x39\x77\x10\x48\x6b\xc0\x0a\x48\x83\xe9\x30\x48\x01\xc8\x48\xff\xc6\xeb\xe3\x4d\x85\xdb\x74\x03\x48\xf7\xd8", b"\x49\x89\xc0\x49\x83\xc1\x08", b"\x48\xb8", le64(0 - 9223372036854775807 - 1), b"\x48\x89\x85", le32(0 - 8 * (count_binds(bg.lets) + 2)), b"\x4d\x85\xc0\x0f\x84", le32((72 * coll_elem_nfields(StaticConceptState { node: coll, src: bg.src, params: bg.params, lets: bg.lets, concepts: bg.concepts }) + 60 + code_size_node(ByteGenState { node: body, src: bg.src, off: 0, params: bg.params, lets: lets_append_elem_binders(AppendElemBindersState { lets: bg.lets, item_start: item_start, item_len: item_len, second_start: 0, second_len: 0, cstart: cd_name_start(concept_at_index(ConceptAtState { concepts: bg.concepts, idx: static_concept_of(StaticConceptState { node: coll, src: bg.src, params: bg.params, lets: bg.lets, concepts: bg.concepts }) })), clen: cd_name_len(concept_at_index(ConceptAtState { concepts: bg.concepts, idx: static_concept_of(StaticConceptState { node: coll, src: bg.src, params: bg.params, lets: bg.lets, concepts: bg.concepts }) })) }), prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }))), x86_elem_load(ElemLoadState { nf: coll_elem_nfields(StaticConceptState { node: coll, src: bg.src, params: bg.params, lets: bg.lets, concepts: bg.concepts }), tag: static_concept_of(StaticConceptState { node: coll, src: bg.src, params: bg.params, lets: bg.lets, concepts: bg.concepts }) * 256, esize: 8 * (max_payload_fields(bg.concepts) + 1), x_disp: 0 - 8 * (count_binds(bg.lets) + 1) }), x86_node(ByteGenState { node: body, src: bg.src, off: bg.off + code_size_node(ByteGenState { node: coll, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + 72 * coll_elem_nfields(StaticConceptState { node: coll, src: bg.src, params: bg.params, lets: bg.lets, concepts: bg.concepts }) + 120, params: bg.params, lets: lets_append_elem_binders(AppendElemBindersState { lets: bg.lets, item_start: item_start, item_len: item_len, second_start: 0, second_len: 0, cstart: cd_name_start(concept_at_index(ConceptAtState { concepts: bg.concepts, idx: static_concept_of(StaticConceptState { node: coll, src: bg.src, params: bg.params, lets: bg.lets, concepts: bg.concepts }) })), clen: cd_name_len(concept_at_index(ConceptAtState { concepts: bg.concepts, idx: static_concept_of(StaticConceptState { node: coll, src: bg.src, params: bg.params, lets: bg.lets, concepts: bg.concepts }) })) }), prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }), b"\x58\x48\x8b\x8d", le32(0 - 8 * (count_binds(bg.lets) + 2)), b"\x48\x39\xc8\x48\x0f\x4c\xc1\x48\x89\x85", le32(0 - 8 * (count_binds(bg.lets) + 2)), b"\x49\x83\xc1\x08\x49\xff\xc8\xe9", le32((0 - (72 * coll_elem_nfields(StaticConceptState { node: coll, src: bg.src, params: bg.params, lets: bg.lets, concepts: bg.concepts }) + 69 + code_size_node(ByteGenState { node: body, src: bg.src, off: 0, params: bg.params, lets: lets_append_elem_binders(AppendElemBindersState { lets: bg.lets, item_start: item_start, item_len: item_len, second_start: 0, second_len: 0, cstart: cd_name_start(concept_at_index(ConceptAtState { concepts: bg.concepts, idx: static_concept_of(StaticConceptState { node: coll, src: bg.src, params: bg.params, lets: bg.lets, concepts: bg.concepts }) })), clen: cd_name_len(concept_at_index(ConceptAtState { concepts: bg.concepts, idx: static_concept_of(StaticConceptState { node: coll, src: bg.src, params: bg.params, lets: bg.lets, concepts: bg.concepts }) })) }), prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes })))), b"\xff\xb5", le32(0 - 8 * (count_binds(bg.lets) + 2))) else (concat(x86_node(ByteGenState { node: coll, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }), b"\x41\x59\x49\x8b\x31", b"\x48\x31\xc0\x45\x31\xdb\x8a\x0e\x80\xf9\x2d\x75\x06\x41\xb3\x01\x48\xff\xc6\x0f\xb6\x0e\x80\xf9\x30\x72\x15\x80\xf9\x39\x77\x10\x48\x6b\xc0\x0a\x48\x83\xe9\x30\x48\x01\xc8\x48\xff\xc6\xeb\xe3\x4d\x85\xdb\x74\x03\x48\xf7\xd8", b"\x49\x89\xc0\x49\x83\xc1\x08", b"\x48\xb8", le64(0 - 9223372036854775807 - 1), b"\x48\x89\x85", le32(0 - 8 * (count_binds(bg.lets) + 2)), b"\x4d\x85\xc0\x0f\x84", le32((100 + code_size_node(ByteGenState { node: body, src: bg.src, off: 0, params: bg.params, lets: lets_append_binders(AppendBindersState { lets: bg.lets, bs: BinderList::BindCons { start: item_start, len: item_len, rest: BinderList::BindCons { start: 0, len: 0, rest: BinderList::BindNil } } }), prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }))), b"\x49\x8b\x31", b"\x48\x31\xc0\x45\x31\xdb\x8a\x0e\x80\xf9\x2d\x75\x06\x41\xb3\x01\x48\xff\xc6\x0f\xb6\x0e\x80\xf9\x30\x72\x15\x80\xf9\x39\x77\x10\x48\x6b\xc0\x0a\x48\x83\xe9\x30\x48\x01\xc8\x48\xff\xc6\xeb\xe3\x4d\x85\xdb\x74\x03\x48\xf7\xd8", b"\x48\x89\x85", le32(0 - 8 * (count_binds(bg.lets) + 1)), x86_node(ByteGenState { node: body, src: bg.src, off: bg.off + code_size_node(ByteGenState { node: coll, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + 160, params: bg.params, lets: lets_append_binders(AppendBindersState { lets: bg.lets, bs: BinderList::BindCons { start: item_start, len: item_len, rest: BinderList::BindCons { start: 0, len: 0, rest: BinderList::BindNil } } }), prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }), b"\x58\x48\x8b\x8d", le32(0 - 8 * (count_binds(bg.lets) + 2)), b"\x48\x39\xc8\x48\x0f\x4c\xc1\x48\x89\x85", le32(0 - 8 * (count_binds(bg.lets) + 2)), b"\x49\x83\xc1\x08\x49\xff\xc8\xe9", le32((0 - (109 + code_size_node(ByteGenState { node: body, src: bg.src, off: 0, params: bg.params, lets: lets_append_binders(AppendBindersState { lets: bg.lets, bs: BinderList::BindCons { start: item_start, len: item_len, rest: BinderList::BindCons { start: 0, len: 0, rest: BinderList::BindNil } } }), prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes })))), b"\xff\xb5", le32(0 - 8 * (count_binds(bg.lets) + 2))))
   proofs:
     purity:
       reads : [bg.node, bg.src, bg.off, bg.params, bg.lets, bg.prog, bg.concepts, bg.sizes]
@@ -20073,6 +20442,8 @@ rule code_size_stream_node
       -- guard for ABI symmetry (the slice-6 load prefix is not free here).
       AstMap(coll, item_start, item_len, body) => if coll_elem_nfields(StaticConceptState { node: coll, src: bg.src, params: bg.params, lets: bg.lets, concepts: bg.concepts }) > 0 then 1 else (code_size_node(ByteGenState { node: coll, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + code_size_node(ByteGenState { node: body, src: bg.src, off: 0, params: bg.params, lets: lets_append_binders(AppendBindersState { lets: bg.lets, bs: BinderList::BindCons { start: item_start, len: item_len, rest: BinderList::BindCons { start: 0, len: 0, rest: BinderList::BindNil } } }), prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + 197)
       AstFilter(coll, item_start, item_len, body) => if coll_elem_nfields(StaticConceptState { node: coll, src: bg.src, params: bg.params, lets: bg.lets, concepts: bg.concepts }) > 0 then 1 else (code_size_node(ByteGenState { node: coll, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + code_size_node(ByteGenState { node: body, src: bg.src, off: 0, params: bg.params, lets: lets_append_binders(AppendBindersState { lets: bg.lets, bs: BinderList::BindCons { start: item_start, len: item_len, rest: BinderList::BindCons { start: 0, len: 0, rest: BinderList::BindNil } } }), prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + 213)
+      AstMinFold(coll, item_start, item_len, body) => 1
+      AstMaxFold(coll, item_start, item_len, body) => 1
       AstCall(callee_start, callee_len, args) => if span_is_concat(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then stream_size_cargs(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) else if span_is_arena_scope(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then 2 + code_size_stream_node(ByteGenState { node: arg_first(args), src: bg.src, off: bg.off + 2, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + 2 else if span_is_abort_if(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then code_size_node(ByteGenState { node: arg_first(args), src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + 22 else if span_is_le32(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then code_size_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + 34 else if span_is_le64(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then code_size_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + 34 else if span_is_substring(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then 1 else if span_is_byte_at(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then code_size_node(bg) + 6 else if span_is_length(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then code_size_node(bg) + 6 else if callee_is_texty(FindRuleState { rules: bg.prog, src: bg.src, q_start: callee_start, q_len: callee_len }) == 1 then code_size_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + 12 else code_size_node(bg) + 6
   proofs:
     purity:
@@ -20265,6 +20636,8 @@ rule x86_stream_node
       -- before the first element — no stray newline).
       AstMap(coll, item_start, item_len, body) => if coll_elem_nfields(StaticConceptState { node: coll, src: bg.src, params: bg.params, lets: bg.lets, concepts: bg.concepts }) > 0 then b"\xcc" else concat(x86_node(ByteGenState { node: coll, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }), b"\x41\x59\x49\x8b\x31", b"\x48\x31\xc0\x45\x31\xdb\x8a\x0e\x80\xf9\x2d\x75\x06\x41\xb3\x01\x48\xff\xc6\x0f\xb6\x0e\x80\xf9\x30\x72\x15\x80\xf9\x39\x77\x10\x48\x6b\xc0\x0a\x48\x83\xe9\x30\x48\x01\xc8\x48\xff\xc6\xeb\xe3\x4d\x85\xdb\x74\x03\x48\xf7\xd8", b"\x49\x89\xc0\x49\x83\xc1\x08", b"\x4d\x85\xc0\x0f\x84", le32(120 + code_size_node(ByteGenState { node: body, src: bg.src, off: 0, params: bg.params, lets: lets_append_binders(AppendBindersState { lets: bg.lets, bs: BinderList::BindCons { start: item_start, len: item_len, rest: BinderList::BindCons { start: 0, len: 0, rest: BinderList::BindNil } } }), prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes })), b"\x49\x8b\x31", b"\x48\x31\xc0\x45\x31\xdb\x8a\x0e\x80\xf9\x2d\x75\x06\x41\xb3\x01\x48\xff\xc6\x0f\xb6\x0e\x80\xf9\x30\x72\x15\x80\xf9\x39\x77\x10\x48\x6b\xc0\x0a\x48\x83\xe9\x30\x48\x01\xc8\x48\xff\xc6\xeb\xe3\x4d\x85\xdb\x74\x03\x48\xf7\xd8", b"\x48\x89\x85", le32(0 - 8 * (count_binds(bg.lets) + 1)), x86_node(ByteGenState { node: body, src: bg.src, off: bg.off + code_size_node(ByteGenState { node: coll, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + 143, params: bg.params, lets: lets_append_binders(AppendBindersState { lets: bg.lets, bs: BinderList::BindCons { start: item_start, len: item_len, rest: BinderList::BindCons { start: 0, len: 0, rest: BinderList::BindNil } } }), prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }), b"\x58\x41\x51\xe8", le32(0 - (bg.off + code_size_node(ByteGenState { node: coll, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + code_size_node(ByteGenState { node: body, src: bg.src, off: 0, params: bg.params, lets: lets_append_binders(AppendBindersState { lets: bg.lets, bs: BinderList::BindCons { start: item_start, len: item_len, rest: BinderList::BindCons { start: 0, len: 0, rest: BinderList::BindNil } } }), prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + 237)), b"\x6a\x0a\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x48\x89\xe6\x48\xc7\xc2\x01\x00\x00\x00\x0f\x05\x48\x83\xc4\x08", b"\x41\x59", b"\x49\x83\xc1\x08\x49\xff\xc8\xe9", le32(0 - (129 + code_size_node(ByteGenState { node: body, src: bg.src, off: 0, params: bg.params, lets: lets_append_binders(AppendBindersState { lets: bg.lets, bs: BinderList::BindCons { start: item_start, len: item_len, rest: BinderList::BindCons { start: 0, len: 0, rest: BinderList::BindNil } } }), prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }))))
       AstFilter(coll, item_start, item_len, body) => if coll_elem_nfields(StaticConceptState { node: coll, src: bg.src, params: bg.params, lets: bg.lets, concepts: bg.concepts }) > 0 then b"\xcc" else concat(x86_node(ByteGenState { node: coll, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }), b"\x41\x59\x49\x8b\x31", b"\x48\x31\xc0\x45\x31\xdb\x8a\x0e\x80\xf9\x2d\x75\x06\x41\xb3\x01\x48\xff\xc6\x0f\xb6\x0e\x80\xf9\x30\x72\x15\x80\xf9\x39\x77\x10\x48\x6b\xc0\x0a\x48\x83\xe9\x30\x48\x01\xc8\x48\xff\xc6\xeb\xe3\x4d\x85\xdb\x74\x03\x48\xf7\xd8", b"\x49\x89\xc0\x49\x83\xc1\x08", b"\x4d\x85\xc0\x0f\x84", le32(136 + code_size_node(ByteGenState { node: body, src: bg.src, off: 0, params: bg.params, lets: lets_append_binders(AppendBindersState { lets: bg.lets, bs: BinderList::BindCons { start: item_start, len: item_len, rest: BinderList::BindCons { start: 0, len: 0, rest: BinderList::BindNil } } }), prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes })), b"\x49\x8b\x31", b"\x48\x31\xc0\x45\x31\xdb\x8a\x0e\x80\xf9\x2d\x75\x06\x41\xb3\x01\x48\xff\xc6\x0f\xb6\x0e\x80\xf9\x30\x72\x15\x80\xf9\x39\x77\x10\x48\x6b\xc0\x0a\x48\x83\xe9\x30\x48\x01\xc8\x48\xff\xc6\xeb\xe3\x4d\x85\xdb\x74\x03\x48\xf7\xd8", b"\x48\x89\x85", le32(0 - 8 * (count_binds(bg.lets) + 1)), x86_node(ByteGenState { node: body, src: bg.src, off: bg.off + code_size_node(ByteGenState { node: coll, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + 143, params: bg.params, lets: lets_append_binders(AppendBindersState { lets: bg.lets, bs: BinderList::BindCons { start: item_start, len: item_len, rest: BinderList::BindCons { start: 0, len: 0, rest: BinderList::BindNil } } }), prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }), b"\x58\x48\x85\xc0\x0f\x84", le32(48), b"\x48\x8b\x85", le32(0 - 8 * (count_binds(bg.lets) + 1)), b"\x41\x51\xe8", le32(0 - (bg.off + code_size_node(ByteGenState { node: coll, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + code_size_node(ByteGenState { node: body, src: bg.src, off: 0, params: bg.params, lets: lets_append_binders(AppendBindersState { lets: bg.lets, bs: BinderList::BindCons { start: item_start, len: item_len, rest: BinderList::BindCons { start: 0, len: 0, rest: BinderList::BindNil } } }), prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + 253)), b"\x6a\x0a\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x48\x89\xe6\x48\xc7\xc2\x01\x00\x00\x00\x0f\x05\x48\x83\xc4\x08", b"\x41\x59", b"\x49\x83\xc1\x08\x49\xff\xc8\xe9", le32(0 - (145 + code_size_node(ByteGenState { node: body, src: bg.src, off: 0, params: bg.params, lets: lets_append_binders(AppendBindersState { lets: bg.lets, bs: BinderList::BindCons { start: item_start, len: item_len, rest: BinderList::BindCons { start: 0, len: 0, rest: BinderList::BindNil } } }), prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }))))
+      AstMinFold(coll, item_start, item_len, body) => b"\xcc"
+      AstMaxFold(coll, item_start, item_len, body) => b"\xcc"
       AstCall(callee_start, callee_len, args) => if span_is_concat(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then x86_stream_cargs(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) else if span_is_arena_scope(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then concat(b"\x41\x56", x86_stream_node(ByteGenState { node: arg_first(args), src: bg.src, off: bg.off + 2, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }), b"\x41\x5e") else if span_is_abort_if(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then concat(x86_node(ByteGenState { node: arg_first(args), src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }), b"\x58\x48\x85\xc0\x74\x10\x48\xc7\xc0\x3c\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05") else if span_is_le32(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then concat(x86_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }), b"\x58\x48\x89\x44\x24\xf8\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x48\x8d\x74\x24\xf8\x48\xc7\xc2\x04\x00\x00\x00\x0f\x05") else if span_is_le64(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then concat(x86_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }), b"\x58\x48\x89\x44\x24\xf8\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x48\x8d\x74\x24\xf8\x48\xc7\xc2\x08\x00\x00\x00\x0f\x05") else if span_is_substring(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then b"\xcc" else if span_is_byte_at(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then concat(x86_node(bg), b"\x58\xe8", le32(0 - (bg.off + code_size_node(bg) + 92))) else if span_is_length(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then concat(x86_node(bg), b"\x58\xe8", le32(0 - (bg.off + code_size_node(bg) + 92))) else if callee_is_texty(FindRuleState { rules: bg.prog, src: bg.src, q_start: callee_start, q_len: callee_len }) == 1 then concat(x86_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }), b"\xe8", le32(proc_offset(ProcOffState { rules: bg.prog, src: bg.src, acc: 0, q_start: callee_start, q_len: callee_len, concepts: bg.concepts, sizes: bg.sizes }) - (bg.off + code_size_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes }) + 5)), b"\x48\x81\xc4", le32(8 * arg_list_len(args))) else concat(x86_node(bg), b"\x58\xe8", le32(0 - (bg.off + code_size_node(bg) + 92)))
   proofs:
     purity:
@@ -20437,6 +20810,8 @@ rule ast_var_is_span
       AstAny(coll, item_start, item_len, body) => 0
       AstMap(coll, item_start, item_len, body) => 0
       AstFilter(coll, item_start, item_len, body) => 0
+      AstMinFold(coll, item_start, item_len, body) => 0
+      AstMaxFold(coll, item_start, item_len, body) => 0
   proofs:
     purity:
       reads : [su.node, su.src, su.q_start, su.q_len]
@@ -20483,6 +20858,8 @@ rule ast_uses_span
       AstAny(coll, item_start, item_len, body) => if ast_uses_span(SpanUseState { node: coll, src: su.src, q_start: su.q_start, q_len: su.q_len }) == 1 then 1 else ast_uses_span(SpanUseState { node: body, src: su.src, q_start: su.q_start, q_len: su.q_len })
       AstMap(coll, item_start, item_len, body) => if ast_uses_span(SpanUseState { node: coll, src: su.src, q_start: su.q_start, q_len: su.q_len }) == 1 then 1 else ast_uses_span(SpanUseState { node: body, src: su.src, q_start: su.q_start, q_len: su.q_len })
       AstFilter(coll, item_start, item_len, body) => if ast_uses_span(SpanUseState { node: coll, src: su.src, q_start: su.q_start, q_len: su.q_len }) == 1 then 1 else ast_uses_span(SpanUseState { node: body, src: su.src, q_start: su.q_start, q_len: su.q_len })
+      AstMinFold(coll, item_start, item_len, body) => if ast_uses_span(SpanUseState { node: coll, src: su.src, q_start: su.q_start, q_len: su.q_len }) == 1 then 1 else ast_uses_span(SpanUseState { node: body, src: su.src, q_start: su.q_start, q_len: su.q_len })
+      AstMaxFold(coll, item_start, item_len, body) => if ast_uses_span(SpanUseState { node: coll, src: su.src, q_start: su.q_start, q_len: su.q_len }) == 1 then 1 else ast_uses_span(SpanUseState { node: body, src: su.src, q_start: su.q_start, q_len: su.q_len })
   proofs:
     purity:
       reads : [su.node, su.src, su.q_start, su.q_len]
@@ -20607,6 +20984,8 @@ rule fold_stream_ok
       AstAny(coll, item_start, item_len, body) => 0
       AstMap(coll, item_start, item_len, body) => 0
       AstFilter(coll, item_start, item_len, body) => 0
+      AstMinFold(coll, item_start, item_len, body) => 0
+      AstMaxFold(coll, item_start, item_len, body) => 0
   proofs:
     purity:
       reads : [fc.body, fc.src, fc.acc_start, fc.acc_len]
@@ -20652,6 +21031,8 @@ rule ast_call_args
       AstAny(coll, item_start, item_len, body) => ArgList::ArgNil
       AstMap(coll, item_start, item_len, body) => ArgList::ArgNil
       AstFilter(coll, item_start, item_len, body) => ArgList::ArgNil
+      AstMinFold(coll, item_start, item_len, body) => ArgList::ArgNil
+      AstMaxFold(coll, item_start, item_len, body) => ArgList::ArgNil
   proofs:
     purity:
       reads : [n]
@@ -20717,6 +21098,8 @@ rule ast_is_str
       AstAny(coll, item_start, item_len, body) => 0
       AstMap(coll, item_start, item_len, body) => 0
       AstFilter(coll, item_start, item_len, body) => 0
+      AstMinFold(coll, item_start, item_len, body) => 0
+      AstMaxFold(coll, item_start, item_len, body) => 0
   proofs:
     purity:
       reads : [n]
@@ -20765,6 +21148,8 @@ rule ast_fold_texty_code
       AstAny(coll, item_start, item_len, body) => 0
       AstMap(coll, item_start, item_len, body) => 0
       AstFilter(coll, item_start, item_len, body) => 0
+      AstMinFold(coll, item_start, item_len, body) => 0
+      AstMaxFold(coll, item_start, item_len, body) => 0
   proofs:
     purity:
       reads : [ts.node, ts.src, ts.prog]
