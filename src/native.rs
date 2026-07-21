@@ -21953,6 +21953,128 @@ rule le64_neg
         let _ = fs::remove_file(vref_filter);
     }
 
+    /// COLLECTIONS tier (record map/filter -> JSON) — THE MILESTONE: the
+    /// self-hosted emitter compiles `filter(w.orders, o => o.amount > 100)` over
+    /// a `collection(Order)` input to a `collection(Order)` output, and
+    /// `map(w.orders, o => Tagged{v: o.amount*2, p: o.priority})` to a
+    /// `collection(Tagged)` output — each STREAMED as ONE JSON OBJECT per element
+    /// (`{"name":val,...}\n`, fields in declaration order, numbers only) — and the
+    /// emitted ELFs' stdout is BYTE-IDENTICAL to verbosec's own `--native` on the
+    /// SAME program (verbosec Phase 3 record collection output is the DIRECT oracle).
+    ///
+    /// This extends slice 4b (collection(number) -> decimal-per-line): both the
+    /// filter identity pass-through and the map Out{...} constructor route through
+    /// the ONE shared x86_json_record helper (serialize an arena node of concept C).
+    /// The gen1 build is a self-VERIFYING emitter (elf_program_src's abort_if(verrs)
+    /// gate), so this also pins that gen1's own type checker accepts a
+    /// `collection(C)` output (the tcheck_rule false-positive fix).
+    ///
+    /// Pinned properties:
+    ///   - filter [3 200,1 50,2 300,3] -> `{"amount":200,"priority":1}\n{"amount":300,"priority":3}\n`;
+    ///     empty -> "" exit 0 (the collection trampoline is call+exit(0) — no stray '\n');
+    ///     all-filtered -> "" (a predicate-result bug would emit the bool, not the element);
+    ///   - map [2 100,1 50,3] -> `{"v":200,"p":1}\n{"v":100,"p":3}\n`; empty -> "".
+    ///
+    /// argv layout (count-prefixed flattened, same as slices 1-6): `<binary> <N>
+    /// <e0.amount> <e0.priority> <e1.amount> ...`.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn collections_tier_record_json_map_filter_matches_verbosec() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        let src = fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        // The self-hosted emitter (elf_program_src, reads program on argv[1]).
+        let elf = std::env::temp_dir().join("verbosec_test_coll_recjson_elf_program_src");
+        compile_native(&program, "elf_program_src", elf.to_str().unwrap(), false, false)
+            .expect("elf_program_src must compile natively");
+
+        // verbosec DIRECT oracle: record-element collection input + record
+        // collection output (Phase 3). @verbose header + @intention + proofs for
+        // the Rust parser; the self-hosted programs below are the header-less twins.
+        let vsrc_filter = "@verbose 0.1.0\n\nconcept Order\n  @intention: \"an order\"\n  @source: d.intent:1\n  fields:\n    amount : number\n    priority : number\nconcept W\n  @intention: \"orders\"\n  @source: d.intent:1\n  fields:\n    orders : collection(Order)\nrule keep\n  @intention: \"keep big orders\"\n  @source: d.intent:2\n  input:\n    w : W\n  output:\n    r : collection(Order)\n  logic:\n    r = filter(w.orders, o => o.amount > 100)\n  proofs:\n    purity:\n      reads : [w.orders]\n      calls : []\n    termination:\n      bound : 100";
+        let vsrc_map = "@verbose 0.1.0\n\nconcept Order\n  @intention: \"an order\"\n  @source: d.intent:1\n  fields:\n    amount : number\n    priority : number\nconcept Tagged\n  @intention: \"a tagged order\"\n  @source: d.intent:1\n  fields:\n    v : number\n    p : number\nconcept W\n  @intention: \"orders\"\n  @source: d.intent:1\n  fields:\n    orders : collection(Order)\nrule tag\n  @intention: \"tag orders\"\n  @source: d.intent:2\n  input:\n    w : W\n  output:\n    r : collection(Tagged)\n  logic:\n    r = map(w.orders, o => Tagged { v: o.amount * 2, p: o.priority })\n  proofs:\n    purity:\n      reads : [w.orders]\n      calls : []\n    termination:\n      bound : 100";
+
+        let vftoks = crate::lexer::Lexer::new(vsrc_filter).tokenize().unwrap();
+        let vfprog = crate::parser::Parser::new(vftoks).parse_program().unwrap();
+        let vmtoks = crate::lexer::Lexer::new(vsrc_map).tokenize().unwrap();
+        let vmprog = crate::parser::Parser::new(vmtoks).parse_program().unwrap();
+        let vref_filter = std::env::temp_dir().join("verbosec_test_coll_recjson_filter_ref");
+        let vref_map = std::env::temp_dir().join("verbosec_test_coll_recjson_map_ref");
+        compile_native(&vfprog, "keep", vref_filter.to_str().unwrap(), false, false)
+            .expect("verbosec must compile record `keep` (filter) natively");
+        compile_native(&vmprog, "tag", vref_map.to_str().unwrap(), false, false)
+            .expect("verbosec must compile record `tag` (map) natively");
+
+        // Self-hosted, header-less targets — the SAME concepts + rule bodies.
+        let self_filter_src = "concept Order\n  fields:\n    amount : number\n    priority : number\nconcept W\n  fields:\n    orders : collection(Order)\nrule keep\n  input:\n    w : W\n  output:\n    r : collection(Order)\n  logic:\n    r = filter(w.orders, o => o.amount > 100)";
+        let self_map_src = "concept Order\n  fields:\n    amount : number\n    priority : number\nconcept Tagged\n  fields:\n    v : number\n    p : number\nconcept W\n  fields:\n    orders : collection(Order)\nrule tag\n  input:\n    w : W\n  output:\n    r : collection(Tagged)\n  logic:\n    r = map(w.orders, o => Tagged { v: o.amount * 2, p: o.priority })";
+
+        let emit_self = |prog_src: &str, tag: &str| -> std::path::PathBuf {
+            let mc = Command::new(&elf).args([prog_src, "0"]).output()
+                .expect("spawn elf_program_src");
+            assert!(mc.status.success(), "elf_program_src must exit 0 for {:?}; got {:?} (self-verify gate)", tag, mc.status);
+            let bytes = mc.stdout;
+            assert_eq!(&bytes[0..4], &[0x7f, 0x45, 0x4c, 0x46], "self-emitted file is not ELF for {}", tag);
+            let out = std::env::temp_dir().join(format!("verbosec_test_coll_recjson_{}_self", tag));
+            fs::write(&out, &bytes).expect("write self ELF");
+            let mut perms = fs::metadata(&out).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&out, perms).expect("chmod +x");
+            out
+        };
+        let self_filter = emit_self(self_filter_src, "filter");
+        let self_map = emit_self(self_map_src, "map");
+
+        let run = |bin: &std::path::PathBuf, args: &[&str]| -> String {
+            let o = Command::new(bin).args(args).output().expect("run binary");
+            assert!(o.status.success(), "{:?} {:?} must exit 0; got {:?}", bin, args, o.status);
+            String::from_utf8_lossy(&o.stdout).to_string()
+        };
+
+        // (argv after the program name, expected stdout). argv[0] is N, then N
+        // flattened (amount, priority) pairs.
+        let filter_cases: &[(&[&str], &str)] = &[
+            (&["3", "200", "1", "50", "2", "300", "3"], "{\"amount\":200,\"priority\":1}\n{\"amount\":300,\"priority\":3}\n"),
+            (&["0"], ""),
+            (&["2", "50", "1", "30", "2"], ""),
+            (&["2", "200", "1", "300", "2"], "{\"amount\":200,\"priority\":1}\n{\"amount\":300,\"priority\":2}\n"),
+            (&["1", "101", "9"], "{\"amount\":101,\"priority\":9}\n"),
+        ];
+        let map_cases: &[(&[&str], &str)] = &[
+            (&["2", "100", "1", "50", "3"], "{\"v\":200,\"p\":1}\n{\"v\":100,\"p\":3}\n"),
+            (&["0"], ""),
+            (&["1", "7", "9"], "{\"v\":14,\"p\":9}\n"),
+            (&["3", "1", "2", "3", "4", "5", "6"], "{\"v\":2,\"p\":2}\n{\"v\":6,\"p\":4}\n{\"v\":10,\"p\":6}\n"),
+        ];
+
+        for (args, expected) in filter_cases {
+            let s = run(&self_filter, args);
+            let v = run(&vref_filter, args);
+            assert_eq!(s, *expected, "self filter for {:?} = {:?} (expected {:?})", args, s, expected);
+            assert_eq!(v, *expected, "verbosec filter for {:?} = {:?} (expected {:?})", args, v, expected);
+            assert_eq!(s, v, "self ({:?}) vs verbosec ({:?}) filter mismatch for {:?}", s, v, args);
+        }
+        for (args, expected) in map_cases {
+            let s = run(&self_map, args);
+            let v = run(&vref_map, args);
+            assert_eq!(s, *expected, "self map for {:?} = {:?} (expected {:?})", args, s, expected);
+            assert_eq!(v, *expected, "verbosec map for {:?} = {:?} (expected {:?})", args, v, expected);
+            assert_eq!(s, v, "self ({:?}) vs verbosec ({:?}) map mismatch for {:?}", s, v, args);
+        }
+
+        let _ = fs::remove_file(&self_filter);
+        let _ = fs::remove_file(&self_map);
+        let _ = fs::remove_file(elf);
+        let _ = fs::remove_file(vref_filter);
+        let _ = fs::remove_file(vref_map);
+    }
+
     /// COLLECTIONS tier slice 5 — THE MILESTONE: the self-hosted emitter
     /// compiles the TEXT FOLD — `fold(w.orders, "amts:", acc, o =>
     /// concat(acc, " ", o.amount))` over record elements with number fields,
