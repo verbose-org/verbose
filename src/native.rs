@@ -22075,6 +22075,164 @@ rule le64_neg
         let _ = fs::remove_file(vref_map);
     }
 
+    /// COLLECTIONS tier — TEXT ELEMENT FIELDS (the last collections gap): the
+    /// self-hosted emitter compiles `collection(Concept)` whose element concept
+    /// has a `text` field, in BOTH the text-fold body and the record-JSON output,
+    /// byte-identical to verbosec `--native`.
+    ///
+    /// THE MOTIVATING ORACLE is `examples/roster.verbose`: `Employee{name:text,
+    /// salary:number}`, `fold(w.employees, "roster: ", acc, e => concat(acc,
+    /// e.name, "=", e.salary, "; "))`. verbosec `--native roster_line` on
+    /// `2 alice 100 bob 200` -> `roster: alice=100; bob=200; \n`; empty -> `roster: \n`.
+    ///
+    /// Mechanism (all in examples/vexprparse.verbose):
+    ///   - `field_list_number_or_text` (was field_list_all_number) accepts a text
+    ///     field (ty 2), so coll_elem_nfields / map_out_nf select the record path;
+    ///   - `x86_elem_field_loads` dispatches per field TYPE: a text field copies
+    ///     its argv bytes into the MAP_FIXED region at a per-field offset and packs
+    ///     a span (start = region_base + text_off - src_base, len = strlen), padded
+    ///     to the 60-byte number-field width so every `72*nf` size mirror is
+    ///     unchanged (all-number elements are byte-identical);
+    ///   - the fold body's `e.name` routes through `x86_fold_arg`'s new
+    ///     `ast_field_is_text` branch (packed-span write, no itoa);
+    ///   - `x86_json_fields` emits a text field as a quoted raw span (no escaping,
+    ///     matching verbosec Phase-3); `json_fields_size` accounts the 215-byte
+    ///     text block vs the 119-byte number block.
+    ///
+    /// Pinned: roster text fold (non-empty + empty); JSON filter over a text-field
+    /// element (some/all/none kept + empty); JSON map building a text output field;
+    /// two-text-field element (distinct region offsets both live in one concat).
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn collections_tier_text_element_fields_matches_verbosec() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        let src = fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        // The self-hosted emitter (elf_program_src, reads program on argv[1]).
+        let elf = std::env::temp_dir().join("verbosec_test_coll_txt_elf_program_src");
+        compile_native(&program, "elf_program_src", elf.to_str().unwrap(), false, false)
+            .expect("elf_program_src must compile natively");
+
+        // verbosec DIRECT oracles (header + @intention + proofs for the Rust
+        // parser); the self-hosted programs below are the header-less twins.
+        let vsrc_roster = "@verbose 0.1.0\n\nconcept Employee\n  @intention: \"e\"\n  @source: t.intent:1\n  fields:\n    name : text\n    salary : number\nconcept Workforce\n  @intention: \"w\"\n  @source: t.intent:1\n  fields:\n    employees : collection(Employee)\nrule roster_line\n  @intention: \"roster\"\n  @source: t.intent:2\n  input:\n    w : Workforce\n  output:\n    line : text\n  logic:\n    line = fold(w.employees, \"roster: \", acc, e => concat(acc, e.name, \"=\", e.salary, \"; \"))\n  proofs:\n    purity:\n      reads : [w.employees]\n      calls : []\n    termination:\n      bound : 6";
+        let vsrc_jfilter = "@verbose 0.1.0\n\nconcept Employee\n  @intention: \"e\"\n  @source: t.intent:1\n  fields:\n    name : text\n    salary : number\nconcept Workforce\n  @intention: \"w\"\n  @source: t.intent:1\n  fields:\n    employees : collection(Employee)\nrule keep\n  @intention: \"keep\"\n  @source: t.intent:2\n  input:\n    w : Workforce\n  output:\n    r : collection(Employee)\n  logic:\n    r = filter(w.employees, e => e.salary > 100)\n  proofs:\n    purity:\n      reads : [w.employees]\n      calls : []\n    termination:\n      bound : 100";
+        let vsrc_jmap = "@verbose 0.1.0\n\nconcept Employee\n  @intention: \"e\"\n  @source: t.intent:1\n  fields:\n    name : text\n    salary : number\nconcept Tagged\n  @intention: \"t\"\n  @source: t.intent:1\n  fields:\n    who : text\n    pay : number\nconcept Workforce\n  @intention: \"w\"\n  @source: t.intent:1\n  fields:\n    employees : collection(Employee)\nrule relabel\n  @intention: \"relabel\"\n  @source: t.intent:2\n  input:\n    w : Workforce\n  output:\n    r : collection(Tagged)\n  logic:\n    r = map(w.employees, e => Tagged { who: e.name, pay: e.salary * 2 })\n  proofs:\n    purity:\n      reads : [w.employees]\n      calls : []\n    termination:\n      bound : 100";
+        let vsrc_two = "@verbose 0.1.0\n\nconcept Person\n  @intention: \"p\"\n  @source: t.intent:1\n  fields:\n    first : text\n    last : text\nconcept Crowd\n  @intention: \"c\"\n  @source: t.intent:1\n  fields:\n    people : collection(Person)\nrule names_line\n  @intention: \"names\"\n  @source: t.intent:2\n  input:\n    c : Crowd\n  output:\n    r : text\n  logic:\n    r = fold(c.people, \"names: \", acc, p => concat(acc, p.first, \" \", p.last, \"; \"))\n  proofs:\n    purity:\n      reads : [c.people]\n      calls : []\n    termination:\n      bound : 6";
+
+        let compile_ref = |vsrc: &str, rule: &str, name: &str| -> std::path::PathBuf {
+            let vt = crate::lexer::Lexer::new(vsrc).tokenize().unwrap();
+            let vp = crate::parser::Parser::new(vt).parse_program().unwrap();
+            let out = std::env::temp_dir().join(format!("verbosec_test_coll_txt_{}_ref", name));
+            compile_native(&vp, rule, out.to_str().unwrap(), false, false)
+                .unwrap_or_else(|e| panic!("verbosec must compile {} natively: {:?}", name, e));
+            out
+        };
+        let vref_roster = compile_ref(vsrc_roster, "roster_line", "roster");
+        let vref_jfilter = compile_ref(vsrc_jfilter, "keep", "jfilter");
+        let vref_jmap = compile_ref(vsrc_jmap, "relabel", "jmap");
+        let vref_two = compile_ref(vsrc_two, "names_line", "two");
+
+        // Self-hosted, header-less targets — the SAME concepts + rule bodies.
+        let self_roster_src = "concept Employee\n  fields:\n    name : text\n    salary : number\nconcept Workforce\n  fields:\n    employees : collection(Employee)\nrule roster_line\n  input:\n    w : Workforce\n  output:\n    line : text\n  logic:\n    line = fold(w.employees, \"roster: \", acc, e => concat(acc, e.name, \"=\", e.salary, \"; \"))";
+        let self_jfilter_src = "concept Employee\n  fields:\n    name : text\n    salary : number\nconcept Workforce\n  fields:\n    employees : collection(Employee)\nrule keep\n  input:\n    w : Workforce\n  output:\n    r : collection(Employee)\n  logic:\n    r = filter(w.employees, e => e.salary > 100)";
+        let self_jmap_src = "concept Employee\n  fields:\n    name : text\n    salary : number\nconcept Tagged\n  fields:\n    who : text\n    pay : number\nconcept Workforce\n  fields:\n    employees : collection(Employee)\nrule relabel\n  input:\n    w : Workforce\n  output:\n    r : collection(Tagged)\n  logic:\n    r = map(w.employees, e => Tagged { who: e.name, pay: e.salary * 2 })";
+        let self_two_src = "concept Person\n  fields:\n    first : text\n    last : text\nconcept Crowd\n  fields:\n    people : collection(Person)\nrule names_line\n  input:\n    c : Crowd\n  output:\n    r : text\n  logic:\n    r = fold(c.people, \"names: \", acc, p => concat(acc, p.first, \" \", p.last, \"; \"))";
+
+        let emit_self = |prog_src: &str, tag: &str| -> std::path::PathBuf {
+            let mc = Command::new(&elf).args([prog_src, "0"]).output()
+                .expect("spawn elf_program_src");
+            assert!(mc.status.success(), "elf_program_src must exit 0 for {:?}; got {:?} (self-verify gate)", tag, mc.status);
+            let bytes = mc.stdout;
+            assert_eq!(&bytes[0..4], &[0x7f, 0x45, 0x4c, 0x46], "self-emitted file is not ELF for {}", tag);
+            let out = std::env::temp_dir().join(format!("verbosec_test_coll_txt_{}_self", tag));
+            fs::write(&out, &bytes).expect("write self ELF");
+            let mut perms = fs::metadata(&out).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&out, perms).expect("chmod +x");
+            out
+        };
+        let self_roster = emit_self(self_roster_src, "roster");
+        let self_jfilter = emit_self(self_jfilter_src, "jfilter");
+        let self_jmap = emit_self(self_jmap_src, "jmap");
+        let self_two = emit_self(self_two_src, "two");
+
+        let run = |bin: &std::path::PathBuf, args: &[&str]| -> String {
+            let o = Command::new(bin).args(args).output().expect("run binary");
+            assert!(o.status.success(), "{:?} {:?} must exit 0; got {:?}", bin, args, o.status);
+            String::from_utf8_lossy(&o.stdout).to_string()
+        };
+
+        // roster text fold — THE motivating oracle.
+        let roster_cases: &[(&[&str], &str)] = &[
+            (&["2", "alice", "100", "bob", "200"], "roster: alice=100; bob=200; \n"),
+            (&["0"], "roster: \n"),
+            (&["1", "carol", "42"], "roster: carol=42; \n"),
+            (&["3", "a", "1", "b", "2", "c", "3"], "roster: a=1; b=2; c=3; \n"),
+        ];
+        for (args, expected) in roster_cases {
+            let s = run(&self_roster, args);
+            let v = run(&vref_roster, args);
+            assert_eq!(s, *expected, "self roster for {:?} = {:?} (expected {:?})", args, s, expected);
+            assert_eq!(v, *expected, "verbosec roster for {:?} = {:?} (expected {:?})", args, v, expected);
+            assert_eq!(s, v, "self ({:?}) vs verbosec ({:?}) roster mismatch for {:?}", s, v, args);
+        }
+
+        // JSON filter over a text-field element (identity output).
+        let jfilter_cases: &[(&[&str], &str)] = &[
+            (&["3", "alice", "200", "bob", "50", "carol", "300"], "{\"name\":\"alice\",\"salary\":200}\n{\"name\":\"carol\",\"salary\":300}\n"),
+            (&["0"], ""),
+            (&["2", "alice", "50", "bob", "30"], ""),
+            (&["2", "alice", "200", "bob", "300"], "{\"name\":\"alice\",\"salary\":200}\n{\"name\":\"bob\",\"salary\":300}\n"),
+        ];
+        for (args, expected) in jfilter_cases {
+            let s = run(&self_jfilter, args);
+            let v = run(&vref_jfilter, args);
+            assert_eq!(s, *expected, "self jfilter for {:?} = {:?} (expected {:?})", args, s, expected);
+            assert_eq!(v, *expected, "verbosec jfilter for {:?} = {:?} (expected {:?})", args, v, expected);
+            assert_eq!(s, v, "self ({:?}) vs verbosec ({:?}) jfilter mismatch for {:?}", s, v, args);
+        }
+
+        // JSON map building a text output field.
+        let jmap_cases: &[(&[&str], &str)] = &[
+            (&["2", "alice", "100", "bob", "200"], "{\"who\":\"alice\",\"pay\":200}\n{\"who\":\"bob\",\"pay\":400}\n"),
+            (&["0"], ""),
+            (&["1", "z", "7"], "{\"who\":\"z\",\"pay\":14}\n"),
+        ];
+        for (args, expected) in jmap_cases {
+            let s = run(&self_jmap, args);
+            let v = run(&vref_jmap, args);
+            assert_eq!(s, *expected, "self jmap for {:?} = {:?} (expected {:?})", args, s, expected);
+            assert_eq!(v, *expected, "verbosec jmap for {:?} = {:?} (expected {:?})", args, v, expected);
+            assert_eq!(s, v, "self ({:?}) vs verbosec ({:?}) jmap mismatch for {:?}", s, v, args);
+        }
+
+        // Two text fields per element (distinct region offsets, both live in one concat).
+        let two_cases: &[(&[&str], &str)] = &[
+            (&["2", "alice", "smith", "bob", "jones"], "names: alice smith; bob jones; \n"),
+            (&["0"], "names: \n"),
+        ];
+        for (args, expected) in two_cases {
+            let s = run(&self_two, args);
+            let v = run(&vref_two, args);
+            assert_eq!(s, *expected, "self two for {:?} = {:?} (expected {:?})", args, s, expected);
+            assert_eq!(v, *expected, "verbosec two for {:?} = {:?} (expected {:?})", args, v, expected);
+            assert_eq!(s, v, "self ({:?}) vs verbosec ({:?}) two mismatch for {:?}", s, v, args);
+        }
+
+        for p in [&self_roster, &self_jfilter, &self_jmap, &self_two,
+                  &vref_roster, &vref_jfilter, &vref_jmap, &vref_two] {
+            let _ = fs::remove_file(p);
+        }
+        let _ = fs::remove_file(elf);
+    }
+
     /// COLLECTIONS tier slice 5 — THE MILESTONE: the self-hosted emitter
     /// compiles the TEXT FOLD — `fold(w.orders, "amts:", acc, o =>
     /// concat(acc, " ", o.amount))` over record elements with number fields,
