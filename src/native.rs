@@ -9191,6 +9191,137 @@ fn emit_redirect_callee_leaves(
     }
 }
 
+/// Value-context analogue of `emit_redirect_callee_leaves` (Result output) and
+/// `emit_redirect_variant_leaves` (MatchVariant, scalar output).
+///
+/// Used when `match_result(callee(input), ok_var => ok_body, err_var => err_body)`
+/// appears in a NUMBER / BOOL position — the body of a plain `output: number`
+/// rule (e.g. `expense_audit.verbose::discount`). The callee produces a
+/// `Result(T, E)`; we inline its body (a tree of `If` / `Ok` / `Err`) and at
+/// each leaf substitute the bound variable with the (renamed) leaf payload
+/// into the matching outer arm, then emit that arm as an ordinary scalar
+/// expression leaving the result in `rax`. Every leaf ends with
+/// `jmp <common_end>`, recorded in `end_patches` for the caller to converge.
+///
+/// Substitution model (identical to slice 4.1's `emit_redirect_variant_leaves`):
+///   - `Ok(inner)`  → `substitute_ident(ok_body,  ok_var,  rename(inner))`
+///   - `Err(inner)` → `substitute_ident(err_body, err_var, rename(inner))`
+/// where `rename` maps the callee's input name to the outer rule's input name
+/// so the leaf's `Field` accesses resolve against the outer's `offsets`.
+///
+/// No frame slots are used: the substitution folds the bound value directly
+/// into the arm expression, so the emitter is fully re-entrant. A nested
+/// `match_result` inside an outer arm re-enters `emit_eval_expr`'s MatchResult
+/// arm and works for free — no depth-quartet bookkeeping needed (unlike the
+/// Result-output path, which threads `MatchSlots` through the frame).
+///
+/// Because the outer arm is a scalar expression, an `err_var` referenced in
+/// `err_body` is text-typed and only meaningful through a text→number
+/// primitive (`length(err)`, `parse_int(err)`, `byte_at(err, i)`). The
+/// substituted callee Err inner flows into that primitive via the standard
+/// text paths; the milestone shape (`e => 0 - 1`) leaves `err_var` unused, so
+/// the Err substitution is a no-op there.
+#[allow(clippy::too_many_arguments)]
+fn emit_redirect_result_leaves_to_value(
+    code: &mut Vec<u8>,
+    expr: &Expr,
+    callee: &Rule,
+    ok_var: &str,
+    ok_body: &Expr,
+    err_var: &str,
+    err_body: &Expr,
+    outer_input_name: &str,
+    offsets: &HashMap<&str, i32>,
+    all_rules: &HashMap<&str, &Rule>,
+    field_ranges: &HashMap<&str, (i64, i64)>,
+    text_bindings: &TextBindings<'_>,
+    self_call: Option<SelfCallCtx<'_>>,
+    arena_ctx: Option<&ArenaCtx<'_>>,
+    end_patches: &mut Vec<usize>,
+) -> Result<(), NativeError> {
+    match expr {
+        Expr::Ok(inner) => {
+            // Rename the callee's leaf payload into the outer input's frame,
+            // then splice it in for `ok_var` in the outer Ok arm.
+            let renamed = crate::optimizer::substitute_ident(
+                inner,
+                &callee.input_name,
+                &Expr::Ident(outer_input_name.to_string()),
+            );
+            let substituted = crate::optimizer::substitute_ident(ok_body, ok_var, &renamed);
+            emit_eval_expr(
+                code, &substituted, outer_input_name, offsets, all_rules, field_ranges,
+                text_bindings, self_call, arena_ctx,
+            )?;
+            // jmp common_end (forward; caller patches)
+            code.push(0xE9);
+            let patch = code.len();
+            code.extend_from_slice(&[0x00; 4]);
+            end_patches.push(patch);
+            Ok(())
+        }
+        Expr::Err(inner) => {
+            let renamed = crate::optimizer::substitute_ident(
+                inner,
+                &callee.input_name,
+                &Expr::Ident(outer_input_name.to_string()),
+            );
+            let substituted = crate::optimizer::substitute_ident(err_body, err_var, &renamed);
+            emit_eval_expr(
+                code, &substituted, outer_input_name, offsets, all_rules, field_ranges,
+                text_bindings, self_call, arena_ctx,
+            )?;
+            code.push(0xE9);
+            let patch = code.len();
+            code.extend_from_slice(&[0x00; 4]);
+            end_patches.push(patch);
+            Ok(())
+        }
+        Expr::If(cond, then_e, else_e) => {
+            // The cond lives in the callee's body; rename its input ident so
+            // `Field` accesses resolve against the outer's offsets.
+            let renamed_cond = crate::optimizer::substitute_ident(
+                cond,
+                &callee.input_name,
+                &Expr::Ident(outer_input_name.to_string()),
+            );
+            emit_eval_expr(
+                code, &renamed_cond, outer_input_name, offsets, all_rules, field_ranges,
+                text_bindings, self_call, arena_ctx,
+            )?;
+            // test al, al ; jz .else (rel32 so arms can be large)
+            code.extend_from_slice(&[0x84, 0xC0]);
+            code.push(0x0F);
+            code.push(0x84);
+            let else_patch = code.len();
+            code.extend_from_slice(&[0x00; 4]);
+            // then branch — every leaf inside ends with `jmp common_end`, so
+            // control never falls through to the else label.
+            emit_redirect_result_leaves_to_value(
+                code, then_e, callee, ok_var, ok_body, err_var, err_body,
+                outer_input_name, offsets, all_rules, field_ranges, text_bindings,
+                self_call, arena_ctx, end_patches,
+            )?;
+            let else_pos = code.len();
+            let eo = else_pos as i32 - (else_patch as i32 + 4);
+            code[else_patch..else_patch + 4].copy_from_slice(&eo.to_le_bytes());
+            emit_redirect_result_leaves_to_value(
+                code, else_e, callee, ok_var, ok_body, err_var, err_body,
+                outer_input_name, offsets, all_rules, field_ranges, text_bindings,
+                self_call, arena_ctx, end_patches,
+            )?;
+            Ok(())
+        }
+        other => Err(NativeError {
+            message: format!(
+                "match_result callee body has an expression not supported for number-context \
+                 inlining (expected a tree of if / Ok / Err): {:?}",
+                other
+            ),
+        }),
+    }
+}
+
 /// Phase A slice 4.1 — inline a sum-type-returning callee's body, redirecting
 /// each `VariantConstruct` leaf to the substituted body of the matching arm.
 ///
@@ -13920,13 +14051,87 @@ fn emit_eval_expr(
             code.extend_from_slice(&[0x48, 0xF7, 0xD8]); // neg rax
             Ok(())
         }
+        Expr::MatchResult(target, ok_var, ok_body, err_var, err_body) => {
+            // Number/bool-context match_result — the body of a plain
+            // `output: number` (or `bool`) rule, e.g.
+            // `expense_audit.verbose::discount`:
+            //   out = match_result(check_claim(c), v => v * 95 / 100, e => 0 - 1)
+            //
+            // The Result-OUTPUT form of match_result lives in
+            // `emit_eval_result_expr` (continuation-passing: each Ok/Err leaf
+            // writes to stdout/stderr and jmp loop_top). This is the plain-
+            // VALUE counterpart: inline the callee's Result-producing body,
+            // substitute each Ok/Err leaf's payload into the matching outer
+            // arm, and leave the arm's scalar result in rax — converging every
+            // leaf at a shared end label. Same substitution model as slice
+            // 4.1's MatchVariant value-context path (`emit_redirect_variant_leaves`),
+            // so no frame slots are consumed and nested match_result inside an
+            // outer arm re-enters this arm for free.
+            let (callee_name, arg) = match target.as_ref() {
+                Expr::Call(name, args) if args.len() == 1 => (name.as_str(), &args[0]),
+                _ => return Err(NativeError {
+                    message: "match_result target must be a rule call `callee(input)` in native number context".into(),
+                }),
+            };
+            match arg {
+                Expr::Ident(n) if n == input_name => {}
+                _ => return Err(NativeError {
+                    message: "match_result target call must pass the outer rule's input identifier".into(),
+                }),
+            }
+            let callee = all_rules.get(callee_name).ok_or_else(|| NativeError {
+                message: format!("match_result calls unknown rule '{}'", callee_name),
+            })?;
+            if !matches!(&callee.output_ty, Type::Result(_, _)) {
+                return Err(NativeError {
+                    message: format!(
+                        "match_result callee '{}' must return Result(T, E)",
+                        callee_name
+                    ),
+                });
+            }
+            if !callee.logic.bindings.is_empty() {
+                return Err(NativeError {
+                    message: format!(
+                        "match_result callee '{}' has let bindings — native number-context inlining \
+                         requires a binding-free callee (run via --run, or inline the bindings)",
+                        callee_name
+                    ),
+                });
+            }
+            let mut end_patches: Vec<usize> = Vec::new();
+            emit_redirect_result_leaves_to_value(
+                code,
+                &callee.logic.value,
+                callee,
+                ok_var,
+                ok_body,
+                err_var,
+                err_body,
+                input_name,
+                offsets,
+                all_rules,
+                field_ranges,
+                text_bindings,
+                self_call,
+                arena_ctx,
+                &mut end_patches,
+            )?;
+            // Converge every "jmp common_end" here; the caller continues with
+            // itoa / bool-print + jmp loop_top (or whatever consumes rax).
+            let end_pos = code.len();
+            for patch in end_patches {
+                let off = end_pos as i32 - (patch as i32 + 4);
+                code[patch..patch + 4].copy_from_slice(&off.to_le_bytes());
+            }
+            Ok(())
+        }
         Expr::Fold(_, _, _, _, _)
         | Expr::Quantifier(_, _, _, _)
         | Expr::Map(_, _, _)
         | Expr::Filter(_, _, _)
         | Expr::Ok(_)
         | Expr::Err(_)
-        | Expr::MatchResult(_, _, _, _, _)
         | Expr::Record(_, _)
         | Expr::Concat(_) => Err(NativeError {
             message: "rich operations (collection/result/record/concat) not supported in native backend (use --run interpreter) — see CLAUDE.md, 'Two Execution Modes'"
@@ -23685,6 +23890,123 @@ rule chained_validate
         );
 
         let _ = fs::remove_file(out);
+    }
+
+    /// `match_result(callee(input), v => <num>, e => <num>)` as the body of a
+    /// plain `output: number` rule — the value-context match_result path
+    /// (`emit_redirect_result_leaves_to_value`). The Result-OUTPUT form is
+    /// covered by `native_nested_match_result_runtime` above; this pins the
+    /// scalar counterpart that closes the `expense_audit.verbose::discount`
+    /// gap. Native output is checked against BOTH the hand-computed value AND
+    /// the interpreter (the same-AST oracle) for all three reachable paths:
+    ///   - Ok  (approved + under limit) → v * 95 / 100
+    ///   - Err (over the limit)         → 0 - 1
+    ///   - Err (not approved)           → 0 - 1
+    #[test]
+    fn native_match_result_to_number_scalar() {
+        use std::process::Command;
+        let src = r#"@verbose 0.1.0
+
+concept Claim
+  @intention: "amount + approved"
+  @source: invoices.intent:1
+
+  fields:
+    amount   : number
+    approved : number
+
+
+rule check
+  @intention: "accept an approved claim at most 1000, else reject with a reason"
+  @source: invoices.intent:1
+
+  input:
+    c : Claim
+
+  output:
+    r : Result(number, text)
+
+  logic:
+    r = if c.approved == 1 then (if c.amount > 1000 then Err("over") else Ok(c.amount)) else Err("no")
+
+  proofs:
+    purity:
+      reads   : [c.amount, c.approved]
+      calls   : []
+    termination:
+      bound : 4
+
+
+rule discount
+  @intention: "5% off an accepted amount, -1 on reject"
+  @source: invoices.intent:1
+
+  input:
+    c : Claim
+
+  output:
+    out : number
+
+  logic:
+    out = match_result(check(c), v => v * 95 / 100, e => 0 - 1)
+
+  proofs:
+    purity:
+      reads   : [c]
+      calls   : [check]
+    termination:
+      bound : 4
+"#;
+        let tokens = crate::lexer::Lexer::new(src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let out = std::env::temp_dir().join("verbosec_test_mr_to_number");
+        compile_native(&program, "discount", out.to_str().unwrap(), false, false)
+            .expect("value-context match_result must compile natively");
+
+        // Interpreter oracle — same AST, evaluated in-process.
+        let all_rules: Vec<&crate::ast::Rule> = program.items.iter().filter_map(|i| match i {
+            crate::ast::Item::Rule(r) => Some(r),
+            _ => None,
+        }).collect();
+        let concepts: Vec<&crate::ast::Concept> =
+            crate::ast::iter_all_concepts(&program.items).collect();
+        let discount = *all_rules.iter().find(|r| r.name == "discount").unwrap();
+
+        // (amount, approved) → expected. Exercises the Ok arm and both Err leaves.
+        for &(amount, approved, expected) in &[(800i64, 1i64, 760i64), (2000, 1, -1), (300, 0, -1)] {
+            // Native.
+            let r = Command::new(&out)
+                .args([amount.to_string(), approved.to_string()])
+                .output()
+                .expect("spawn discount");
+            let native_out = String::from_utf8_lossy(&r.stdout).trim().to_string();
+            assert_eq!(
+                native_out,
+                expected.to_string(),
+                "native discount({}, {}) should be {}; stdout={:?} stderr={:?}",
+                amount, approved, expected, r.stdout, r.stderr,
+            );
+            // Interpreter oracle — must agree with native.
+            let mut input = std::collections::HashMap::new();
+            input.insert("amount".to_string(), crate::interpreter::Value::Number(amount));
+            input.insert("approved".to_string(), crate::interpreter::Value::Number(approved));
+            let interp = match crate::interpreter::eval_rule(discount, &all_rules, &concepts, &input) {
+                Ok(crate::interpreter::Value::Number(n)) => n,
+                other => panic!("interpreter must return a number for discount; got {:?}", other),
+            };
+            assert_eq!(
+                interp, expected,
+                "interpreter discount({}, {}) should be {}", amount, approved, expected,
+            );
+            assert_eq!(
+                native_out,
+                interp.to_string(),
+                "native must equal interpreter for discount({}, {})", amount, approved,
+            );
+        }
+
+        let _ = std::fs::remove_file(&out);
     }
 
     /// `Result(<Record>, text)` end-to-end. Outer rule has
