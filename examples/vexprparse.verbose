@@ -889,6 +889,33 @@ concept_group VExpr [max_depth: 4096, max_nodes: 6000000]
       RsCons of (head : Resource, tail : ResourceList)
       RsNil
 
+  -- Effects tier slice 2a: a parsed top-level REACTION declaration. `name_start` /
+  -- `name_len` are the reaction NAME's source span. `trigger_start` / `trigger_len`
+  -- are the trigger rule NAME's source span (a plain rule reference, resolved by
+  -- reaction_errors against the head rule). `path_start` / `path_len` and
+  -- `content_start` / `content_len` are the append_file path and content string
+  -- literals' INNER spans (quotes stripped, raw source bytes — UNESCAPED at EMIT
+  -- time by the byte-literal decoder, so the closed escape set `\n \r \t \\ \"` is
+  -- SUPPORTED). path_len == -1 is the MALFORMED-DECL sentinel (any header line
+  -- misspelled, path/content not a string literal — e.g. a concat, which is 2b
+  -- scope); reaction_errors counts it, the gate refuses emission. Single-variant
+  -- record-like group concept, exactly like Resource (MkResource).
+  concept Reaction
+    @intention: "A parsed top-level reaction declaration: name span + trigger name span + append_file path/content inner spans"
+    @source: vexprparse.intent:72
+    variants:
+      MkReaction of (name_start : number, name_len : number, trigger_start : number, trigger_len : number, path_start : number, path_len : number, content_start : number, content_len : number)
+
+  -- Effects tier slice 2a: a cons-list of top-level reaction declarations in source
+  -- order. Same cons shape as ResourceList (RsCons/RsNil), so the same arena
+  -- machinery and structural-recursion proof apply.
+  concept ReactionList
+    @intention: "A cons-list of top-level reaction declarations"
+    @source: vexprparse.intent:72
+    variants:
+      RxCons of (head : Reaction, tail : ReactionList)
+      RxNil
+
 
 -- ============================================================================
 -- Brick 2 reused verbatim: the tokenizer. (Copied so bricks 1-2 stay pristine;
@@ -6869,6 +6896,90 @@ rule span_is_abort_word
       bound : 64
 
 
+-- span_is_reaction (effects tier slice 2a): 1 iff an Ident span spells exactly the
+-- 8 bytes "reaction" (r=114 e=101 a=97 c=99 t=116 i=105 o=111 n=110) — the
+-- top-level reaction-declaration keyword, recognized by parse_reactions (capture)
+-- and by parse_program (skip). Mirror of span_is_resource.
+rule span_is_reaction
+  @intention: "1 if an Ident span spells exactly \"reaction\", 0 otherwise"
+  @source: vexprparse.intent:72
+  input:
+    sc : SpanCheck
+  output:
+    out : number
+  logic:
+    out = if sc.len == 8 and (byte_at(sc.src, sc.start) == 114 and (byte_at(sc.src, sc.start + 1) == 101 and (byte_at(sc.src, sc.start + 2) == 97 and (byte_at(sc.src, sc.start + 3) == 99 and (byte_at(sc.src, sc.start + 4) == 116 and (byte_at(sc.src, sc.start + 5) == 105 and (byte_at(sc.src, sc.start + 6) == 111 and byte_at(sc.src, sc.start + 7) == 110))))))) then 1 else 0
+  proofs:
+    purity:
+      reads : [sc.src, sc.start, sc.len]
+      calls : []
+    termination:
+      bound : 64
+
+
+-- span_is_trigger (effects tier slice 2a): 1 iff an Ident span spells exactly
+-- "trigger" (t=116 r=114 i=105 g=103 g=103 e=101 r=114) — the first header line of
+-- a reaction block.
+rule span_is_trigger
+  @intention: "1 if an Ident span spells exactly \"trigger\", 0 otherwise"
+  @source: vexprparse.intent:72
+  input:
+    sc : SpanCheck
+  output:
+    out : number
+  logic:
+    out = if sc.len == 7 and (byte_at(sc.src, sc.start) == 116 and (byte_at(sc.src, sc.start + 1) == 114 and (byte_at(sc.src, sc.start + 2) == 105 and (byte_at(sc.src, sc.start + 3) == 103 and (byte_at(sc.src, sc.start + 4) == 103 and (byte_at(sc.src, sc.start + 5) == 101 and byte_at(sc.src, sc.start + 6) == 114)))))) then 1 else 0
+  proofs:
+    purity:
+      reads : [sc.src, sc.start, sc.len]
+      calls : []
+    termination:
+      bound : 64
+
+
+-- span_is_effects (effects tier slice 2a): 1 iff an Ident span spells exactly
+-- "effects" (e=101 f=102 f=102 e=101 c=99 t=116 s=115) — the second header line of
+-- a reaction block.
+rule span_is_effects
+  @intention: "1 if an Ident span spells exactly \"effects\", 0 otherwise"
+  @source: vexprparse.intent:72
+  input:
+    sc : SpanCheck
+  output:
+    out : number
+  logic:
+    out = if sc.len == 7 and (byte_at(sc.src, sc.start) == 101 and (byte_at(sc.src, sc.start + 1) == 102 and (byte_at(sc.src, sc.start + 2) == 102 and (byte_at(sc.src, sc.start + 3) == 101 and (byte_at(sc.src, sc.start + 4) == 99 and (byte_at(sc.src, sc.start + 5) == 116 and byte_at(sc.src, sc.start + 6) == 115)))))) then 1 else 0
+  proofs:
+    purity:
+      reads : [sc.src, sc.start, sc.len]
+      calls : []
+    termination:
+      bound : 64
+
+
+-- span_is_append_file (effects tier slice 2a): 1 iff an Ident span spells exactly
+-- the 11 bytes "append_file" (a=97 p=112 p=112 e=101 n=110 d=100 _=95 f=102 i=105
+-- l=108 e=101) — the append_file effect head. FULL-BYTE-COMPARE is load-bearing:
+-- `append_toks` is a real self-source rule sharing the `append_` prefix (they
+-- differ at byte 7: f=102 vs t=116), so a prefix check would misfire. Pinned by a
+-- test.
+rule span_is_append_file
+  @intention: "1 if an Ident span spells exactly \"append_file\", 0 otherwise"
+  @source: vexprparse.intent:72
+  input:
+    sc : SpanCheck
+  output:
+    out : number
+  logic:
+    out = if sc.len == 11 and (byte_at(sc.src, sc.start) == 97 and (byte_at(sc.src, sc.start + 1) == 112 and (byte_at(sc.src, sc.start + 2) == 112 and (byte_at(sc.src, sc.start + 3) == 101 and (byte_at(sc.src, sc.start + 4) == 110 and (byte_at(sc.src, sc.start + 5) == 100 and (byte_at(sc.src, sc.start + 6) == 95 and (byte_at(sc.src, sc.start + 7) == 102 and (byte_at(sc.src, sc.start + 8) == 105 and (byte_at(sc.src, sc.start + 9) == 108 and byte_at(sc.src, sc.start + 10) == 101)))))))))) then 1 else 0
+  proofs:
+    purity:
+      reads : [sc.src, sc.start, sc.len]
+      calls : []
+    termination:
+      bound : 64
+
+
 -- span_is_primitive (V1b, self-verify arc): 1 iff a callee span spells one of the
 -- language's expression PRIMITIVES — the exact set the span_is_* recognizers
 -- define: byte_at, length, substring, concat, le32, le64, max, min, arena_scope,
@@ -9118,7 +9229,8 @@ rule parse_program
     let is_concept = span_is_concept(SpanCheck { src: ps.src, start: kw_start, len: kw_len })
     let is_concept_group = span_is_concept_group(SpanCheck { src: ps.src, start: kw_start, len: kw_len })
     let is_resource = span_is_resource(SpanCheck { src: ps.src, start: kw_start, len: kw_len })
-    let is_skip = if is_concept == 1 then 1 else if is_concept_group == 1 then 1 else is_resource
+    let is_reaction = span_is_reaction(SpanCheck { src: ps.src, start: kw_start, len: kw_len })
+    let is_skip = if is_concept == 1 then 1 else if is_concept_group == 1 then 1 else if is_resource == 1 then 1 else is_reaction
     let pr = parse_rule_decl_pos(ProgramState { cell: hp, src: ps.src })
     let rd = pr_rule(pr)
     let endp = pr_next(pr)
@@ -9127,7 +9239,7 @@ rule parse_program
   proofs:
     purity:
       reads : [ps.cell, ps.src]
-      calls : [skip_seps_dedent, peek_start, peek_len, span_is_rule, span_is_concept, span_is_concept_group, span_is_resource, parse_rule_decl_pos, pr_rule, pr_next, skip_indented_block, parse_program]
+      calls : [skip_seps_dedent, peek_start, peek_len, span_is_rule, span_is_concept, span_is_concept_group, span_is_resource, span_is_reaction, parse_rule_decl_pos, pr_rule, pr_next, skip_indented_block, parse_program]
     termination:
       bound : 512
 
@@ -10255,6 +10367,330 @@ rule resource_index_of
       calls : [res_name_len, res_name_start, name_eq, resource_index_of]
     termination:
       bound : 64
+
+
+-- ============================================================================
+-- EFFECTS TIER slice 2a — parse: `reaction <name>` top-level declarations.
+-- Grammar (positional, fail-graceful like parse_resource_decl):
+--   reaction NAME
+--     trigger: <rule name>
+--     effects:
+--       append_file "<path literal>" "<content literal>"
+-- Any misspelled header line, or a path/content that is not a string literal
+-- (e.g. a concat — that is slice 2b), marks the decl MALFORMED (path_len = -1);
+-- reaction_errors counts it and the emit gate refuses. Path/content are
+-- quote-stripped raw source spans, UNESCAPED at EMIT time by the byte-literal
+-- decoder (the closed escape set `\n \r \t \\ \"`).
+-- ============================================================================
+
+-- Bare-group accessors for a Reaction (the res_* idiom).
+rule rx_name_start
+  @intention: "The name span start of a reaction declaration"
+  @source: vexprparse.intent:72
+  input:
+    r : Reaction
+  output:
+    out : number
+  logic:
+    out = match r:
+      MkReaction(name_start, name_len, trigger_start, trigger_len, path_start, path_len, content_start, content_len) => name_start
+  proofs:
+    purity:
+      reads : [r]
+      calls : []
+    termination:
+      bound : 16
+
+
+rule rx_name_len
+  @intention: "The name span length of a reaction declaration"
+  @source: vexprparse.intent:72
+  input:
+    r : Reaction
+  output:
+    out : number
+  logic:
+    out = match r:
+      MkReaction(name_start, name_len, trigger_start, trigger_len, path_start, path_len, content_start, content_len) => name_len
+  proofs:
+    purity:
+      reads : [r]
+      calls : []
+    termination:
+      bound : 16
+
+
+rule rx_trigger_start
+  @intention: "The trigger rule name span start of a reaction declaration"
+  @source: vexprparse.intent:72
+  input:
+    r : Reaction
+  output:
+    out : number
+  logic:
+    out = match r:
+      MkReaction(name_start, name_len, trigger_start, trigger_len, path_start, path_len, content_start, content_len) => trigger_start
+  proofs:
+    purity:
+      reads : [r]
+      calls : []
+    termination:
+      bound : 16
+
+
+rule rx_trigger_len
+  @intention: "The trigger rule name span length of a reaction declaration"
+  @source: vexprparse.intent:72
+  input:
+    r : Reaction
+  output:
+    out : number
+  logic:
+    out = match r:
+      MkReaction(name_start, name_len, trigger_start, trigger_len, path_start, path_len, content_start, content_len) => trigger_len
+  proofs:
+    purity:
+      reads : [r]
+      calls : []
+    termination:
+      bound : 16
+
+
+rule rx_path_start
+  @intention: "The append_file path inner-span start of a reaction declaration"
+  @source: vexprparse.intent:72
+  input:
+    r : Reaction
+  output:
+    out : number
+  logic:
+    out = match r:
+      MkReaction(name_start, name_len, trigger_start, trigger_len, path_start, path_len, content_start, content_len) => path_start
+  proofs:
+    purity:
+      reads : [r]
+      calls : []
+    termination:
+      bound : 16
+
+
+rule rx_path_len
+  @intention: "The append_file path inner-span length of a reaction declaration (-1 = malformed)"
+  @source: vexprparse.intent:72
+  input:
+    r : Reaction
+  output:
+    out : number
+  logic:
+    out = match r:
+      MkReaction(name_start, name_len, trigger_start, trigger_len, path_start, path_len, content_start, content_len) => path_len
+  proofs:
+    purity:
+      reads : [r]
+      calls : []
+    termination:
+      bound : 16
+
+
+rule rx_content_start
+  @intention: "The append_file content inner-span start of a reaction declaration"
+  @source: vexprparse.intent:72
+  input:
+    r : Reaction
+  output:
+    out : number
+  logic:
+    out = match r:
+      MkReaction(name_start, name_len, trigger_start, trigger_len, path_start, path_len, content_start, content_len) => content_start
+  proofs:
+    purity:
+      reads : [r]
+      calls : []
+    termination:
+      bound : 16
+
+
+rule rx_content_len
+  @intention: "The append_file content inner-span length of a reaction declaration (-1 = malformed)"
+  @source: vexprparse.intent:72
+  input:
+    r : Reaction
+  output:
+    out : number
+  logic:
+    out = match r:
+      MkReaction(name_start, name_len, trigger_start, trigger_len, path_start, path_len, content_start, content_len) => content_len
+  proofs:
+    purity:
+      reads : [r]
+      calls : []
+    termination:
+      bound : 16
+
+
+-- reaction_list_len: the number of reaction declarations. Structural recursion on
+-- the RxCons tail, like resource_list_len.
+rule reaction_list_len
+  @intention: "Number of reaction declarations in a parsed reaction list"
+  @source: vexprparse.intent:72
+  input:
+    rl : ReactionList
+  output:
+    out : number
+  logic:
+    out = match rl:
+      RxCons(head, tail) => 1 + reaction_list_len(tail)
+      RxNil => 0
+  proofs:
+    purity:
+      reads : [rl]
+      calls : [reaction_list_len]
+    termination:
+      bound : 4000
+      structural : rl
+
+
+-- rx_head: the FIRST reaction of a reaction list (a sentinel MkReaction with
+-- path_len -1 for an empty list, so accessors on it read a malformed decl rather
+-- than crashing). Mirror of rl_head_body / cl_head_fields for reactions.
+rule rx_head
+  @intention: "The head reaction of a reaction list (sentinel malformed reaction if empty)"
+  @source: vexprparse.intent:72
+  input:
+    rl : ReactionList
+  output:
+    out : Reaction
+  logic:
+    out = match rl:
+      RxCons(head, tail) => head
+      RxNil => Reaction::MkReaction { name_start: 0, name_len: 0, trigger_start: 0, trigger_len: 0, path_start: 0, path_len: 0 - 1, content_start: 0, content_len: 0 - 1 }
+  proofs:
+    purity:
+      reads : [rl]
+      calls : []
+    termination:
+      bound : 16
+
+
+-- rl_head_name_start / rl_head_name_len: the NAME span of the head rule of a rule
+-- list (0 for an empty list). Used by reaction_errors to enforce trigger == head
+-- (the marshal drives the entry from the head rule, so slice 2a requires the
+-- trigger to BE the head). Mirror of rl_head_body.
+rule rl_head_name_start
+  @intention: "The name span start of the head rule of a rule list (0 if none)"
+  @source: vexprparse.intent:72
+  input:
+    rl : RuleList
+  output:
+    out : number
+  logic:
+    out = match rl:
+      RCons(head, tail) => rd_name_start(head)
+      RNil => 0
+  proofs:
+    purity:
+      reads : [rl]
+      calls : [rd_name_start]
+    termination:
+      bound : 16
+
+
+rule rl_head_name_len
+  @intention: "The name span length of the head rule of a rule list (0 if none)"
+  @source: vexprparse.intent:72
+  input:
+    rl : RuleList
+  output:
+    out : number
+  logic:
+    out = match rl:
+      RCons(head, tail) => rd_name_len(head)
+      RNil => 0
+  proofs:
+    purity:
+      reads : [rl]
+      calls : [rd_name_len]
+    termination:
+      bound : 16
+
+
+-- parse_reaction_decl: parse ONE top-level reaction declaration STARTING at
+-- ps.cell into a Reaction. Positional walk mirroring parse_resource_decl: the
+-- `reaction` keyword at the cursor, the NAME Ident at +1, skip_seps from +2 lands
+-- on `trigger` (its `:` at +1, the rule name Ident at +2); skip_seps from +3
+-- lands on `effects` (its `:` at +1); skip_seps from +2 (past the Newline + the
+-- inner Indent) lands on `append_file`, whose path Str is at +1 and content Str
+-- at +2. Path/content INNER spans are pstart+1 / plen-2 (quotes stripped). Any
+-- shape failure marks the decl MALFORMED (path_len -1). The caller (parse_reactions)
+-- computes the end cell structurally via skip_indented_block.
+rule parse_reaction_decl
+  @intention: "Parse a `reaction NAME` block (trigger/effects/append_file) at the cursor into a Reaction"
+  @source: vexprparse.intent:72
+  input:
+    ps : ProgramState
+  output:
+    out : Reaction
+  logic:
+    let name_start = peek_kw_start(advance(Advance { lst: ps.cell, k: 1 }))
+    let name_len = peek_kw_len(advance(Advance { lst: ps.cell, k: 1 }))
+    let tp = skip_seps(ParseState { cell: advance(Advance { lst: ps.cell, k: 2 }) })
+    let is_trigger = span_is_trigger(SpanCheck { src: ps.src, start: peek_kw_start(tp), len: peek_kw_len(tp) })
+    let trig_start = peek_kw_start(advance(Advance { lst: tp, k: 2 }))
+    let trig_len = peek_kw_len(advance(Advance { lst: tp, k: 2 }))
+    let ep = skip_seps(ParseState { cell: advance(Advance { lst: tp, k: 3 }) })
+    let is_effects = span_is_effects(SpanCheck { src: ps.src, start: peek_kw_start(ep), len: peek_kw_len(ep) })
+    let ap = skip_seps(ParseState { cell: advance(Advance { lst: ep, k: 2 }) })
+    let is_append = span_is_append_file(SpanCheck { src: ps.src, start: peek_kw_start(ap), len: peek_kw_len(ap) })
+    let is_pstr = peek_is_str(advance(Advance { lst: ap, k: 1 }))
+    let pstart = peek_str_start(advance(Advance { lst: ap, k: 1 }))
+    let plen = peek_str_len(advance(Advance { lst: ap, k: 1 }))
+    let is_cstr = peek_is_str(advance(Advance { lst: ap, k: 2 }))
+    let cstart = peek_str_start(advance(Advance { lst: ap, k: 2 }))
+    let clen = peek_str_len(advance(Advance { lst: ap, k: 2 }))
+    let shape_ok = if is_trigger == 1 then (if is_effects == 1 then (if is_append == 1 then (if is_pstr == 1 then is_cstr else 0) else 0) else 0) else 0
+    out = Reaction::MkReaction { name_start: name_start, name_len: name_len, trigger_start: trig_start, trigger_len: trig_len, path_start: pstart + 1, path_len: if shape_ok == 1 then (if plen >= 2 then plen - 2 else 0 - 1) else 0 - 1, content_start: cstart + 1, content_len: if shape_ok == 1 then (if clen >= 2 then clen - 2 else 0 - 1) else 0 - 1 }
+  proofs:
+    purity:
+      reads : [ps.cell, ps.src]
+      calls : [peek_kw_start, peek_kw_len, skip_seps, span_is_trigger, span_is_effects, span_is_append_file, peek_is_str, peek_str_start, peek_str_len, advance]
+    termination:
+      bound : 64
+
+
+-- parse_reactions: the top-level walk that CAPTURES reaction declarations into a
+-- ReactionList, mirroring parse_resources. A `reaction` header conses its parsed
+-- decl and resumes past its indented block (structural skip); a `rule` skips via
+-- parse_rule_decl_pos's next; a `concept` / `concept_group` / `resource` skips its
+-- whole block. Anything else ends the list (RxNil). Forward token scan, so bound +
+-- the mandatory recursion breadcrumb (the backstop is the finite token list).
+rule parse_reactions
+  @intention: "Walk top-level items capturing reaction declarations into a ReactionList (skipping rules/concepts/resources)"
+  @source: vexprparse.intent:72
+  input:
+    ps : ProgramState
+  output:
+    out : ReactionList
+  logic:
+    let hp = skip_seps_dedent(ParseState { cell: ps.cell })
+    let kw_start = peek_start(hp)
+    let kw_len = peek_len(hp)
+    let is_rx = span_is_reaction(SpanCheck { src: ps.src, start: kw_start, len: kw_len })
+    let is_rule = span_is_rule(SpanCheck { src: ps.src, start: kw_start, len: kw_len })
+    let is_concept = span_is_concept(SpanCheck { src: ps.src, start: kw_start, len: kw_len })
+    let is_concept_group = span_is_concept_group(SpanCheck { src: ps.src, start: kw_start, len: kw_len })
+    let is_resource = span_is_resource(SpanCheck { src: ps.src, start: kw_start, len: kw_len })
+    let skip_block = if is_concept == 1 then 1 else if is_concept_group == 1 then 1 else is_resource
+    let rd = parse_reaction_decl(ProgramState { cell: hp, src: ps.src })
+    let pr = parse_rule_decl_pos(ProgramState { cell: hp, src: ps.src })
+    let rend = pr_next(pr)
+    let blk_end = skip_indented_block(SkipBlockState { cell: hp, depth: 0, seen: 0 })
+    out = if is_rx == 1 then ReactionList::RxCons { head: rd, tail: parse_reactions(ProgramState { cell: blk_end, src: ps.src }) } else (if is_rule == 1 then parse_reactions(ProgramState { cell: rend, src: ps.src }) else (if skip_block == 1 then parse_reactions(ProgramState { cell: blk_end, src: ps.src }) else ReactionList::RxNil))
+  proofs:
+    purity:
+      reads : [ps.cell, ps.src]
+      calls : [skip_seps_dedent, peek_start, peek_len, span_is_reaction, span_is_rule, span_is_concept, span_is_concept_group, span_is_resource, parse_reaction_decl, parse_rule_decl_pos, pr_next, skip_indented_block, parse_reactions]
+    termination:
+      bound : 512
 
 
 -- ============================================================================
