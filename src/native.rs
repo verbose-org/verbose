@@ -41268,7 +41268,7 @@ rule two
     /// dedicated `self-hosting-bootstrap` CI job runs it serially. Run explicitly:
     ///   cargo test --release -- --ignored --test-threads=1 two_generation
     #[test]
-    #[ignore = "gen1 peaks ~10.4 GiB RAM (verify pass + emit) + needs `ulimit -s unlimited` + ~1-2 min; run with --ignored"]
+    #[ignore = "gen1 peaks ~16 GiB RAM (verify pass + emit; ~165M non-reclaiming arena nodes) + needs `ulimit -s unlimited` + ~1-2 min; run with --ignored"]
     #[cfg(target_arch = "x86_64")]
     fn two_generation_bootstrap_fixed_point() {
         use std::fs;
