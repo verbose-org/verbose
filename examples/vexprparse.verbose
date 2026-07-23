@@ -11389,6 +11389,223 @@ rule resource_errors
       bound : 64
 
 
+-- ============================================================================
+-- EFFECTS TIER slice 2a — verify: the src_base-dependent-construct walk + the
+-- reaction declaration checks (reaction_errors, added to verrs).
+--
+-- THREADING-SOUNDNESS INVARIANT: the reaction trampoline is the ENTRY, and the
+-- deep byte_at/AstStr/read ProgGenState sites in x86_node / x86_stream_node pass
+-- RxNil (ByteGenState carries no rxs — that would be the ~400-site burden). Those
+-- sites compute src_base = 0x400000 + blob_end_off(..., RxNil) which for a reaction
+-- program omits reaction_tramp_size — a WRONG src_base. This is harmless ONLY if
+-- no such deep site ever FIRES for a reaction program, i.e. the trigger's logic
+-- (and every other rule the emitter lowers) uses NO src_base-dependent construct:
+-- AstStr / read / byte_at / substring / concat / AstBytes / le32 / le64 / any
+-- collection. program_uses_src_base walks EVERY rule (a sound superset of the
+-- trigger's transitive closure — over-refuses an unreachable byte_at helper,
+-- which is safe) and reaction_errors refuses when it hits. length / max / min /
+-- abs / parse_int / now_unix stay allowed (none reach a deep blob_end_off site).
+-- ============================================================================
+
+-- ast_uses_src_base: 1 iff the subtree contains a src_base-dependent construct.
+-- Mirror of ast_uses_text, with the AstCall arm widened to byte_at / substring /
+-- read / concat / le32 / le64 (over ast_uses_text's byte_at / length / substring)
+-- and EVERY collection node returning 1 directly (the whole class is refused).
+rule ast_uses_src_base
+  @intention: "1 if a subtree contains a src_base-dependent construct (AstStr/AstBytes/byte_at/substring/read/concat/le32/le64/collection), 0 otherwise"
+  @source: vexprparse.intent:72
+  input:
+    ps : PrintState
+  output:
+    out : number
+  logic:
+    out = match ps.node:
+      AstNum(value) => 0
+      AstBool(value) => 0
+      AstVar(start, len) => 0
+      AstErr => 0
+      AstStr(start, len) => 1
+      AstBytes(start, len) => 1
+      AstBin(op, lhs, rhs) => if ast_uses_src_base(PrintState { node: lhs, src: ps.src }) == 1 then 1 else ast_uses_src_base(PrintState { node: rhs, src: ps.src })
+      AstNeg(inner) => ast_uses_src_base(PrintState { node: inner, src: ps.src })
+      AstNot(inner) => ast_uses_src_base(PrintState { node: inner, src: ps.src })
+      AstField(base, fstart, flen) => ast_uses_src_base(PrintState { node: base, src: ps.src })
+      AstCall(callee_start, callee_len, args) => if span_is_byte_at(SpanCheck { src: ps.src, start: callee_start, len: callee_len }) == 1 then 1 else if span_is_substring(SpanCheck { src: ps.src, start: callee_start, len: callee_len }) == 1 then 1 else if span_is_read(SpanCheck { src: ps.src, start: callee_start, len: callee_len }) == 1 then 1 else if span_is_concat(SpanCheck { src: ps.src, start: callee_start, len: callee_len }) == 1 then 1 else if span_is_le32(SpanCheck { src: ps.src, start: callee_start, len: callee_len }) == 1 then 1 else if span_is_le64(SpanCheck { src: ps.src, start: callee_start, len: callee_len }) == 1 then 1 else args_use_src_base(PrintArgsState { args: args, src: ps.src })
+      AstIf(cond, thn, els) => if ast_uses_src_base(PrintState { node: cond, src: ps.src }) == 1 then 1 else if ast_uses_src_base(PrintState { node: thn, src: ps.src }) == 1 then 1 else ast_uses_src_base(PrintState { node: els, src: ps.src })
+      AstVariant(cstart, clen, vstart, vlen, fields) => vfields_use_src_base(UsesTextVFields { fields: fields, src: ps.src })
+      AstMatch(scrut, arms) => if ast_uses_src_base(PrintState { node: scrut, src: ps.src }) == 1 then 1 else arms_use_src_base(UsesTextArms { arms: arms, src: ps.src })
+      AstOk(inner) => ast_uses_src_base(PrintState { node: inner, src: ps.src })
+      AstResErr(inner) => ast_uses_src_base(PrintState { node: inner, src: ps.src })
+      AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => if ast_uses_src_base(PrintState { node: scrut, src: ps.src }) == 1 then 1 else if ast_uses_src_base(PrintState { node: ok_body, src: ps.src }) == 1 then 1 else ast_uses_src_base(PrintState { node: err_body, src: ps.src })
+      AstSum(coll, item_start, item_len, body) => 1
+      AstCount(coll, item_start, item_len, body) => 1
+      AstFold(coll, init, acc_start, acc_len, item_start, item_len, body) => 1
+      AstAll(coll, item_start, item_len, body) => 1
+      AstAny(coll, item_start, item_len, body) => 1
+      AstMap(coll, item_start, item_len, body) => 1
+      AstFilter(coll, item_start, item_len, body) => 1
+      AstMinFold(coll, item_start, item_len, body) => 1
+      AstMaxFold(coll, item_start, item_len, body) => 1
+  proofs:
+    purity:
+      reads : [ps.node, ps.src]
+      calls : [ast_uses_src_base, args_use_src_base, vfields_use_src_base, arms_use_src_base, span_is_byte_at, span_is_substring, span_is_read, span_is_concat, span_is_le32, span_is_le64]
+    termination:
+      bound : 8000
+
+
+-- args_use_src_base: the walk over a call's argument list. ArgNil -> 0.
+rule args_use_src_base
+  @intention: "1 if any call argument's subtree uses a src_base-dependent construct, 0 otherwise"
+  @source: vexprparse.intent:72
+  input:
+    pa : PrintArgsState
+  output:
+    out : number
+  logic:
+    out = match pa.args:
+      ArgCons(head, tail) => if ast_uses_src_base(PrintState { node: head, src: pa.src }) == 1 then 1 else args_use_src_base(PrintArgsState { args: tail, src: pa.src })
+      ArgNil => 0
+  proofs:
+    purity:
+      reads : [pa.args, pa.src]
+      calls : [ast_uses_src_base, args_use_src_base]
+    termination:
+      bound : 8000
+
+
+-- vfields_use_src_base: the walk over a variant construction's field initializers.
+rule vfields_use_src_base
+  @intention: "1 if any variant-construction field value uses a src_base-dependent construct, 0 otherwise"
+  @source: vexprparse.intent:72
+  input:
+    uv : UsesTextVFields
+  output:
+    out : number
+  logic:
+    out = match uv.fields:
+      VFCons(name_start, name_len, val, rest) => if ast_uses_src_base(PrintState { node: val, src: uv.src }) == 1 then 1 else vfields_use_src_base(UsesTextVFields { fields: rest, src: uv.src })
+      VFNil => 0
+  proofs:
+    purity:
+      reads : [uv.fields, uv.src]
+      calls : [ast_uses_src_base, vfields_use_src_base]
+    termination:
+      bound : 8000
+
+
+-- arms_use_src_base: the walk over a match's arm bodies.
+rule arms_use_src_base
+  @intention: "1 if any match arm body uses a src_base-dependent construct, 0 otherwise"
+  @source: vexprparse.intent:72
+  input:
+    ua : UsesTextArms
+  output:
+    out : number
+  logic:
+    out = match ua.arms:
+      ArmCons(vstart, vlen, binders, body, rest) => if ast_uses_src_base(PrintState { node: body, src: ua.src }) == 1 then 1 else arms_use_src_base(UsesTextArms { arms: rest, src: ua.src })
+      ArmNil => 0
+  proofs:
+    purity:
+      reads : [ua.arms, ua.src]
+      calls : [ast_uses_src_base, arms_use_src_base]
+    termination:
+      bound : 8000
+
+
+-- binds_use_src_base: the walk over a rule's let bindings.
+rule binds_use_src_base
+  @intention: "1 if any let binding's RHS uses a src_base-dependent construct, 0 otherwise"
+  @source: vexprparse.intent:72
+  input:
+    ub : UsesTextBinds
+  output:
+    out : number
+  logic:
+    out = match ub.binds:
+      BCons(name_start, name_len, value, rest) => if ast_uses_src_base(PrintState { node: value, src: ub.src }) == 1 then 1 else binds_use_src_base(UsesTextBinds { binds: rest, src: ub.src })
+      BNil => 0
+  proofs:
+    purity:
+      reads : [ub.binds, ub.src]
+      calls : [ast_uses_src_base, binds_use_src_base]
+    termination:
+      bound : 8000
+
+
+-- program_uses_src_base: 1 iff any rule body in the program uses a src_base-dependent
+-- construct. Walks every rule's let bindings then its block result. RNil -> 0.
+rule program_uses_src_base
+  @intention: "1 if any rule body uses a src_base-dependent construct, 0 otherwise"
+  @source: vexprparse.intent:72
+  input:
+    ur : UsesTextRules
+  output:
+    out : number
+  logic:
+    out = match ur.rules:
+      RCons(head, tail) => if binds_use_src_base(UsesTextBinds { binds: block_binds(rd_body(head)), src: ur.src }) == 1 then 1 else if ast_uses_src_base(PrintState { node: block_result(rd_body(head)), src: ur.src }) == 1 then 1 else program_uses_src_base(UsesTextRules { rules: tail, src: ur.src })
+      RNil => 0
+  proofs:
+    purity:
+      reads : [ur.rules, ur.src]
+      calls : [binds_use_src_base, ast_uses_src_base, program_uses_src_base, block_binds, rd_body, block_result]
+    termination:
+      bound : 8000
+
+
+-- RxErrState: everything the reaction verification surface needs.
+concept RxErrState
+  @intention: "The program + declared reactions + source, for the reaction verification surface"
+  @source: vexprparse.intent:72
+  fields:
+    prog : RuleList
+    rxs : ReactionList
+    src : text [..256]
+
+
+-- reaction_errors: the slice-2a verrs contribution. When the program declares a
+-- reaction (has_rx), it sums:
+--   (1) trigger != head rule (the marshal drives the entry from the HEAD rule, so
+--       slice 2a requires trigger == head — this also subsumes "trigger names a
+--       real rule": a name that matches nothing, or a non-head rule, fails);
+--   (2) path not a string literal (path_len -1 sentinel — also fires when the
+--       append_file effect head is misspelled or a `print` effect is used, since
+--       parse_reaction_decl marks the whole decl malformed then);
+--   (3) content not a string literal (content_len -1 — a concat content, which is
+--       slice 2b, lands here);
+--   (4) any src_base-dependent construct anywhere in the program (the threading
+--       soundness invariant above);
+--   (5) more than one reaction (POC shape).
+-- The expensive program-wide walk (4) is INLINED in the has_rx branch so the
+-- lazy if never runs it on the reaction-free self-source (where it would walk
+-- 680+ byte_at-using rules and return 1, but has_rx == 0 short-circuits to 0).
+-- Zero on the self-source by construction (parse_reactions -> RxNil -> has_rx 0).
+rule reaction_errors
+  @intention: "Total slice-2a verification errors: trigger==head, literal path/content, no src_base construct, single reaction"
+  @source: vexprparse.intent:72
+  input:
+    re : RxErrState
+  output:
+    out : number
+  logic:
+    let n = reaction_list_len(re.rxs)
+    let has_rx = if n > 0 then 1 else 0
+    let h = rx_head(re.rxs)
+    let trig_is_head = if rx_trigger_len(h) == rl_head_name_len(re.prog) and name_eq(NameEqState { src: re.src, a_start: rx_trigger_start(h), b_start: rl_head_name_start(re.prog), len: rx_trigger_len(h), off: 0 }) == 1 then 1 else 0
+    let path_ok = if rx_path_len(h) >= 0 then 1 else 0
+    let content_ok = if rx_content_len(h) >= 0 then 1 else 0
+    let one_reaction = if n == 1 then 1 else 0
+    out = if has_rx == 0 then 0 else ((if trig_is_head == 1 then 0 else 1) + (if path_ok == 1 then 0 else 1) + (if content_ok == 1 then 0 else 1) + program_uses_src_base(UsesTextRules { rules: re.prog, src: re.src }) + (if one_reaction == 1 then 0 else 1))
+  proofs:
+    purity:
+      reads : [re.prog, re.rxs, re.src]
+      calls : [reaction_list_len, rx_head, rx_trigger_len, rx_trigger_start, rl_head_name_len, rl_head_name_start, name_eq, rx_path_len, rx_content_len, program_uses_src_base]
+    termination:
+      bound : 64
+
+
 -- The concept-lookup probe: the concept list to search, the source text (for
 -- byte-comparison), and the query name's span (q_start, q_len). Same shape as
 -- FindRuleState but over a ConceptList.
@@ -23923,7 +24140,10 @@ rule elf_program_src
     -- shape violations, the resource/text-field caps, malformed or undeclared
     -- read( sites, and the input-less-entry refusal all refuse emission.
     let ress = parse_resources(ProgramState { cell: toks, src: s.source })
-    let verrs = diag_count(prog_diags(ProgDiagsState { iter: prog, full: prog, src: s.source, idx: 0, concepts: concepts0 })) + purity_list(PurityListState { iter: prog, full: prog, src: s.source }) + term_list(TermListState { iter: prog, src: s.source }) + resource_errors(ResErrState { prog: prog, ress: ress, concepts: concepts0, src: s.source })
+    -- Effects tier slice 2a: the reaction list — used by reaction_errors (verify)
+    -- AND by the has_reaction emit branch + blob_end_off sizing (emit).
+    let rxs = parse_reactions(ProgramState { cell: toks, src: s.source })
+    let verrs = diag_count(prog_diags(ProgDiagsState { iter: prog, full: prog, src: s.source, idx: 0, concepts: concepts0 })) + purity_list(PurityListState { iter: prog, full: prog, src: s.source }) + term_list(TermListState { iter: prog, src: s.source }) + resource_errors(ResErrState { prog: prog, ress: ress, concepts: concepts0, src: s.source }) + reaction_errors(RxErrState { prog: prog, rxs: rxs, src: s.source })
     let sizes = proc_sizes(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: ProcSizeList::PSNil, ress: ress })
     let uses_var = program_uses_arena(concepts)
     let anytx = prog_any_texty(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: sizes, ress: ress })
@@ -23958,7 +24178,7 @@ rule elf_program_src
   proofs:
     purity:
       reads : [s.source]
-      calls : [begin_tokenize, parse_program, parse_concepts, parse_resources, resource_errors, resource_marshal_size, x86_resource_marshal, program_uses_result, concepts_append_result, diag_count, prog_diags, purity_list, term_list, proc_sizes, program_uses_arena, prog_any_texty, entry_rule_texty, entry_rule_bytes, entry_rule_result, entry_rule_collection, max_payload_fields, program_uses_text, blob_end_off, x86_program, src_blob, param_list_len, rl_head_params, fields_to_params, rl_head_input, params_to_fields, find_concept_index, fl_head_ty_start, fl_head_ty_len, x86_argv_marshal, x86_stdin_marshal, field_list_has_text, cd_fields, concept_at_index]
+      calls : [begin_tokenize, parse_program, parse_concepts, parse_resources, parse_reactions, resource_errors, reaction_errors, resource_marshal_size, x86_resource_marshal, program_uses_result, concepts_append_result, diag_count, prog_diags, purity_list, term_list, proc_sizes, program_uses_arena, prog_any_texty, entry_rule_texty, entry_rule_bytes, entry_rule_result, entry_rule_collection, max_payload_fields, program_uses_text, blob_end_off, x86_program, src_blob, param_list_len, rl_head_params, fields_to_params, rl_head_input, params_to_fields, find_concept_index, fl_head_ty_start, fl_head_ty_len, x86_argv_marshal, x86_stdin_marshal, field_list_has_text, cd_fields, concept_at_index]
     termination:
       bound : 256
 
