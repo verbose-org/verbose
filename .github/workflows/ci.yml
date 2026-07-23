@@ -55,9 +55,15 @@ jobs:
   # its entire self byte-for-byte (R0 fixed point), emits the whole real source
   # with no reorder (R1), and its emitted binaries run correct across the construct
   # space (R2). Dedicated job (kept off the parallel test job so it doesn't share
-  # its memory). Since the arena_scope reclaim landed the self-hosted emitter peaks
-  # ~2.55 GiB / ~11 s (was 8.7 GiB / 70 s — see docs/self-hosting-arena-scope-design.md),
-  # cheap enough to GATE PRs, not just post-merge. Runs on push AND pull_request.
+  # its memory). MEMORY (measured 2026-07, corrected from a stale 2.55 GiB note):
+  # the self-hosted emitter's arena is non-reclaiming at runtime, so gen1's peak
+  # RSS grows superlinearly with the self-source — ~2.55 GiB at ~509 rules (the
+  # arena_scope era, PR #105) up to ~15.4 GiB at ~690 rules now. That is ~94% of a
+  # 16 GiB ubuntu-latest runner: the fixed point is at the CI memory EDGE, and the
+  # durable fix is teaching the self-hosted emitter to reclaim like native.rs does
+  # (the PR #94 analog; Rust side went 247 MB -> 32 MB). Until that chantier lands,
+  # each slice that grows the self-source nudges this test closer to OOM; if it
+  # OOM-kills here, that is the wall, not a logic failure. Runs on push AND PR.
   self-hosting-bootstrap:
     name: Self-hosting bootstrap validation
     runs-on: ubuntu-latest
