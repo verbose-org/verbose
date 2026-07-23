@@ -6886,11 +6886,11 @@ rule span_is_primitive
   output:
     out : number
   logic:
-    out = if span_is_byte_at(sc) == 1 then 1 else if span_is_length(sc) == 1 then 1 else if span_is_substring(sc) == 1 then 1 else if span_is_concat(sc) == 1 then 1 else if span_is_le32(sc) == 1 then 1 else if span_is_le64(sc) == 1 then 1 else if span_is_max(sc) == 1 then 1 else if span_is_min(sc) == 1 then 1 else if span_is_arena_scope(sc) == 1 then 1 else if span_is_abort_if(sc) == 1 then 1 else 0
+    out = if span_is_byte_at(sc) == 1 then 1 else if span_is_length(sc) == 1 then 1 else if span_is_substring(sc) == 1 then 1 else if span_is_concat(sc) == 1 then 1 else if span_is_le32(sc) == 1 then 1 else if span_is_le64(sc) == 1 then 1 else if span_is_max(sc) == 1 then 1 else if span_is_min(sc) == 1 then 1 else if span_is_arena_scope(sc) == 1 then 1 else if span_is_abort_if(sc) == 1 then 1 else span_is_read(sc)
   proofs:
     purity:
       reads : [sc]
-      calls : [span_is_byte_at, span_is_length, span_is_substring, span_is_concat, span_is_le32, span_is_le64, span_is_max, span_is_min, span_is_arena_scope, span_is_abort_if]
+      calls : [span_is_byte_at, span_is_length, span_is_substring, span_is_concat, span_is_le32, span_is_le64, span_is_max, span_is_min, span_is_arena_scope, span_is_abort_if, span_is_read]
     termination:
       bound : 128
 
@@ -10257,6 +10257,702 @@ rule resource_index_of
       bound : 64
 
 
+-- ============================================================================
+-- EFFECTS TIER slice 1 — verify: read-site walks + resource declaration checks.
+-- Two whole-Ast walk families (FULL descent, including Result nodes and
+-- reduction colls/inits/bodies — sound by construction: every read( site the
+-- emitter could reach is found, unlike the scope-tracking R6a/R6d walks whose
+-- Result stubs are a checker-scope choice):
+--   * count_reads_named_* — the sites naming ONE resource (referenced-ness; the
+--     trampoline block and resource_marshal_size are gated on it).
+--   * count_bad_reads_* — the malformed sites (arity != 1, arg not a bare name,
+--     or name not declared) — a verrs contribution, the gate refuses.
+-- Plus the declaration checks (path literal shape, escapes, max/path bounds,
+-- abort-only policy, > 16 resources, > 16 text fields per record concept, and
+-- the input-less-entry refusal). The self-source declares zero resources and
+-- has zero read( call sites, so every walk returns 0 on the fixed point BY
+-- CONSTRUCTION (there are no sites), not by luck.
+-- ============================================================================
+
+-- ast_var_start / ast_var_len: the span of a bare AstVar node (0 for any other
+-- shape). The read-site walks use them to reach `read(<name>)`'s argument name;
+-- a non-var argument yields a 0-length span, which matches no resource and no
+-- reads: entry — the malformed site stays fail-closed in every consumer.
+rule ast_var_start
+  @intention: "The name span start of a bare AstVar node, 0 for any other shape"
+  @source: vexprparse.intent:71
+  input:
+    n : Ast
+  output:
+    out : number
+  logic:
+    out = match n:
+      AstNum(value) => 0
+      AstBin(op, lhs, rhs) => 0
+      AstNeg(inner) => 0
+      AstNot(inner) => 0
+      AstVar(start, len) => start
+      AstField(base, fstart, flen) => 0
+      AstCall(callee_start, callee_len, args) => 0
+      AstStr(start, len) => 0
+      AstBytes(start, len) => 0
+      AstBool(value) => 0
+      AstIf(cond, thn, els) => 0
+      AstErr => 0
+      AstVariant(cstart, clen, vstart, vlen, fields) => 0
+      AstMatch(scrut, arms) => 0
+      AstOk(inner) => 0
+      AstResErr(inner) => 0
+      AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => 0
+      AstSum(coll, item_start, item_len, body) => 0
+      AstCount(coll, item_start, item_len, body) => 0
+      AstFold(coll, init, acc_start, acc_len, item_start, item_len, body) => 0
+      AstAll(coll, item_start, item_len, body) => 0
+      AstAny(coll, item_start, item_len, body) => 0
+      AstMap(coll, item_start, item_len, body) => 0
+      AstFilter(coll, item_start, item_len, body) => 0
+      AstMinFold(coll, item_start, item_len, body) => 0
+      AstMaxFold(coll, item_start, item_len, body) => 0
+  proofs:
+    purity:
+      reads : [n]
+      calls : []
+    termination:
+      bound : 64
+
+
+rule ast_var_len
+  @intention: "The name span length of a bare AstVar node, 0 for any other shape"
+  @source: vexprparse.intent:71
+  input:
+    n : Ast
+  output:
+    out : number
+  logic:
+    out = match n:
+      AstNum(value) => 0
+      AstBin(op, lhs, rhs) => 0
+      AstNeg(inner) => 0
+      AstNot(inner) => 0
+      AstVar(start, len) => len
+      AstField(base, fstart, flen) => 0
+      AstCall(callee_start, callee_len, args) => 0
+      AstStr(start, len) => 0
+      AstBytes(start, len) => 0
+      AstBool(value) => 0
+      AstIf(cond, thn, els) => 0
+      AstErr => 0
+      AstVariant(cstart, clen, vstart, vlen, fields) => 0
+      AstMatch(scrut, arms) => 0
+      AstOk(inner) => 0
+      AstResErr(inner) => 0
+      AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => 0
+      AstSum(coll, item_start, item_len, body) => 0
+      AstCount(coll, item_start, item_len, body) => 0
+      AstFold(coll, init, acc_start, acc_len, item_start, item_len, body) => 0
+      AstAll(coll, item_start, item_len, body) => 0
+      AstAny(coll, item_start, item_len, body) => 0
+      AstMap(coll, item_start, item_len, body) => 0
+      AstFilter(coll, item_start, item_len, body) => 0
+      AstMinFold(coll, item_start, item_len, body) => 0
+      AstMaxFold(coll, item_start, item_len, body) => 0
+  proofs:
+    purity:
+      reads : [n]
+      calls : []
+    termination:
+      bound : 64
+
+
+-- Family A states: an Ast (or list) + the source + ONE resource name's query span.
+concept RdNmState
+  @intention: "An Ast node + source + a resource name query span, for counting read sites naming that resource"
+  @source: vexprparse.intent:71
+  fields:
+    node : Ast
+    src : text [..256]
+    q_start : number [0, 4000000]
+    q_len : number [0, 4000000]
+
+
+concept RdNmArgs
+  @intention: "A call-argument list + source + a resource name query span"
+  @source: vexprparse.intent:71
+  fields:
+    args : ArgList
+    src : text [..256]
+    q_start : number [0, 4000000]
+    q_len : number [0, 4000000]
+
+
+concept RdNmVFields
+  @intention: "A variant construct's field list + source + a resource name query span"
+  @source: vexprparse.intent:71
+  fields:
+    fields : VFieldList
+    src : text [..256]
+    q_start : number [0, 4000000]
+    q_len : number [0, 4000000]
+
+
+concept RdNmArms
+  @intention: "A match arm list + source + a resource name query span"
+  @source: vexprparse.intent:71
+  fields:
+    arms : ArmList
+    src : text [..256]
+    q_start : number [0, 4000000]
+    q_len : number [0, 4000000]
+
+
+concept RdNmBinds
+  @intention: "A let-binding list + source + a resource name query span"
+  @source: vexprparse.intent:71
+  fields:
+    binds : Binding
+    src : text [..256]
+    q_start : number [0, 4000000]
+    q_len : number [0, 4000000]
+
+
+concept RdNmRules
+  @intention: "A rule list + source + a resource name query span"
+  @source: vexprparse.intent:71
+  fields:
+    rules : RuleList
+    src : text [..256]
+    q_start : number [0, 4000000]
+    q_len : number [0, 4000000]
+
+
+-- count_reads_named_ast: the number of well-formed `read(<name>)` sites in a
+-- subtree whose argument name byte-equals the query span. FULL structural
+-- descent (Result nodes and reduction colls/inits/bodies included).
+rule count_reads_named_ast
+  @intention: "Count of read sites naming the queried resource across a subtree (full descent)"
+  @source: vexprparse.intent:71
+  input:
+    a : RdNmState
+  output:
+    out : number
+  logic:
+    out = match a.node:
+      AstNum(value) => 0
+      AstBin(op, lhs, rhs) => count_reads_named_ast(RdNmState { node: lhs, src: a.src, q_start: a.q_start, q_len: a.q_len }) + count_reads_named_ast(RdNmState { node: rhs, src: a.src, q_start: a.q_start, q_len: a.q_len })
+      AstNeg(inner) => count_reads_named_ast(RdNmState { node: inner, src: a.src, q_start: a.q_start, q_len: a.q_len })
+      AstNot(inner) => count_reads_named_ast(RdNmState { node: inner, src: a.src, q_start: a.q_start, q_len: a.q_len })
+      AstVar(start, len) => 0
+      AstField(base, fstart, flen) => count_reads_named_ast(RdNmState { node: base, src: a.src, q_start: a.q_start, q_len: a.q_len })
+      AstCall(callee_start, callee_len, args) => (if span_is_read(SpanCheck { src: a.src, start: callee_start, len: callee_len }) == 1 and (arg_list_len(args) == 1 and (ast_var_len(arg_first(args)) == a.q_len and name_eq(NameEqState { src: a.src, a_start: ast_var_start(arg_first(args)), b_start: a.q_start, len: a.q_len, off: 0 }) == 1)) then 1 else 0) + count_reads_named_args(RdNmArgs { args: args, src: a.src, q_start: a.q_start, q_len: a.q_len })
+      AstIf(cond, thn, els) => count_reads_named_ast(RdNmState { node: cond, src: a.src, q_start: a.q_start, q_len: a.q_len }) + count_reads_named_ast(RdNmState { node: thn, src: a.src, q_start: a.q_start, q_len: a.q_len }) + count_reads_named_ast(RdNmState { node: els, src: a.src, q_start: a.q_start, q_len: a.q_len })
+      AstBool(value) => 0
+      AstStr(start, len) => 0
+      AstBytes(start, len) => 0
+      AstErr => 0
+      AstVariant(cstart, clen, vstart, vlen, fields) => count_reads_named_vfields(RdNmVFields { fields: fields, src: a.src, q_start: a.q_start, q_len: a.q_len })
+      AstMatch(scrut, arms) => count_reads_named_ast(RdNmState { node: scrut, src: a.src, q_start: a.q_start, q_len: a.q_len }) + count_reads_named_arms(RdNmArms { arms: arms, src: a.src, q_start: a.q_start, q_len: a.q_len })
+      AstOk(inner) => count_reads_named_ast(RdNmState { node: inner, src: a.src, q_start: a.q_start, q_len: a.q_len })
+      AstResErr(inner) => count_reads_named_ast(RdNmState { node: inner, src: a.src, q_start: a.q_start, q_len: a.q_len })
+      AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => count_reads_named_ast(RdNmState { node: scrut, src: a.src, q_start: a.q_start, q_len: a.q_len }) + count_reads_named_ast(RdNmState { node: ok_body, src: a.src, q_start: a.q_start, q_len: a.q_len }) + count_reads_named_ast(RdNmState { node: err_body, src: a.src, q_start: a.q_start, q_len: a.q_len })
+      AstSum(coll, item_start, item_len, body) => count_reads_named_ast(RdNmState { node: coll, src: a.src, q_start: a.q_start, q_len: a.q_len }) + count_reads_named_ast(RdNmState { node: body, src: a.src, q_start: a.q_start, q_len: a.q_len })
+      AstCount(coll, item_start, item_len, body) => count_reads_named_ast(RdNmState { node: coll, src: a.src, q_start: a.q_start, q_len: a.q_len }) + count_reads_named_ast(RdNmState { node: body, src: a.src, q_start: a.q_start, q_len: a.q_len })
+      AstFold(coll, init, acc_start, acc_len, item_start, item_len, body) => count_reads_named_ast(RdNmState { node: coll, src: a.src, q_start: a.q_start, q_len: a.q_len }) + count_reads_named_ast(RdNmState { node: init, src: a.src, q_start: a.q_start, q_len: a.q_len }) + count_reads_named_ast(RdNmState { node: body, src: a.src, q_start: a.q_start, q_len: a.q_len })
+      AstAll(coll, item_start, item_len, body) => count_reads_named_ast(RdNmState { node: coll, src: a.src, q_start: a.q_start, q_len: a.q_len }) + count_reads_named_ast(RdNmState { node: body, src: a.src, q_start: a.q_start, q_len: a.q_len })
+      AstAny(coll, item_start, item_len, body) => count_reads_named_ast(RdNmState { node: coll, src: a.src, q_start: a.q_start, q_len: a.q_len }) + count_reads_named_ast(RdNmState { node: body, src: a.src, q_start: a.q_start, q_len: a.q_len })
+      AstMap(coll, item_start, item_len, body) => count_reads_named_ast(RdNmState { node: coll, src: a.src, q_start: a.q_start, q_len: a.q_len }) + count_reads_named_ast(RdNmState { node: body, src: a.src, q_start: a.q_start, q_len: a.q_len })
+      AstFilter(coll, item_start, item_len, body) => count_reads_named_ast(RdNmState { node: coll, src: a.src, q_start: a.q_start, q_len: a.q_len }) + count_reads_named_ast(RdNmState { node: body, src: a.src, q_start: a.q_start, q_len: a.q_len })
+      AstMinFold(coll, item_start, item_len, body) => count_reads_named_ast(RdNmState { node: coll, src: a.src, q_start: a.q_start, q_len: a.q_len }) + count_reads_named_ast(RdNmState { node: body, src: a.src, q_start: a.q_start, q_len: a.q_len })
+      AstMaxFold(coll, item_start, item_len, body) => count_reads_named_ast(RdNmState { node: coll, src: a.src, q_start: a.q_start, q_len: a.q_len }) + count_reads_named_ast(RdNmState { node: body, src: a.src, q_start: a.q_start, q_len: a.q_len })
+  proofs:
+    purity:
+      reads : [a.node, a.src, a.q_start, a.q_len]
+      calls : [count_reads_named_ast, count_reads_named_args, count_reads_named_vfields, count_reads_named_arms, span_is_read, arg_list_len, ast_var_start, ast_var_len, arg_first, name_eq]
+    termination:
+      bound : 4000
+
+
+rule count_reads_named_args
+  @intention: "Count of read sites naming the queried resource across a call's arguments"
+  @source: vexprparse.intent:71
+  input:
+    a : RdNmArgs
+  output:
+    out : number
+  logic:
+    out = match a.args:
+      ArgCons(head, tail) => count_reads_named_ast(RdNmState { node: head, src: a.src, q_start: a.q_start, q_len: a.q_len }) + count_reads_named_args(RdNmArgs { args: tail, src: a.src, q_start: a.q_start, q_len: a.q_len })
+      ArgNil => 0
+  proofs:
+    purity:
+      reads : [a.args, a.src, a.q_start, a.q_len]
+      calls : [count_reads_named_ast, count_reads_named_args]
+    termination:
+      bound : 4000
+
+
+rule count_reads_named_vfields
+  @intention: "Count of read sites naming the queried resource across a variant construct's field values"
+  @source: vexprparse.intent:71
+  input:
+    a : RdNmVFields
+  output:
+    out : number
+  logic:
+    out = match a.fields:
+      VFCons(name_start, name_len, val, rest) => count_reads_named_ast(RdNmState { node: val, src: a.src, q_start: a.q_start, q_len: a.q_len }) + count_reads_named_vfields(RdNmVFields { fields: rest, src: a.src, q_start: a.q_start, q_len: a.q_len })
+      VFNil => 0
+  proofs:
+    purity:
+      reads : [a.fields, a.src, a.q_start, a.q_len]
+      calls : [count_reads_named_ast, count_reads_named_vfields]
+    termination:
+      bound : 4000
+
+
+rule count_reads_named_arms
+  @intention: "Count of read sites naming the queried resource across a match's arm bodies"
+  @source: vexprparse.intent:71
+  input:
+    a : RdNmArms
+  output:
+    out : number
+  logic:
+    out = match a.arms:
+      ArmCons(vstart, vlen, binders, body, rest) => count_reads_named_ast(RdNmState { node: body, src: a.src, q_start: a.q_start, q_len: a.q_len }) + count_reads_named_arms(RdNmArms { arms: rest, src: a.src, q_start: a.q_start, q_len: a.q_len })
+      ArmNil => 0
+  proofs:
+    purity:
+      reads : [a.arms, a.src, a.q_start, a.q_len]
+      calls : [count_reads_named_ast, count_reads_named_arms]
+    termination:
+      bound : 4000
+
+
+rule count_reads_named_binds
+  @intention: "Count of read sites naming the queried resource across a binding list's RHSes"
+  @source: vexprparse.intent:71
+  input:
+    a : RdNmBinds
+  output:
+    out : number
+  logic:
+    out = match a.binds:
+      BCons(name_start, name_len, value, rest) => count_reads_named_ast(RdNmState { node: value, src: a.src, q_start: a.q_start, q_len: a.q_len }) + count_reads_named_binds(RdNmBinds { binds: rest, src: a.src, q_start: a.q_start, q_len: a.q_len })
+      BNil => 0
+  proofs:
+    purity:
+      reads : [a.binds, a.src, a.q_start, a.q_len]
+      calls : [count_reads_named_ast, count_reads_named_binds]
+    termination:
+      bound : 4000
+
+
+-- prog_reads_named: the program-level fold — read sites naming the queried
+-- resource across every rule's bindings + result. > 0 means the resource is
+-- REFERENCED (its trampoline block is emitted, its slot sized into the region).
+rule prog_reads_named
+  @intention: "Count of read sites naming the queried resource across every rule body in a program"
+  @source: vexprparse.intent:71
+  input:
+    a : RdNmRules
+  output:
+    out : number
+  logic:
+    out = match a.rules:
+      RCons(head, tail) => count_reads_named_binds(RdNmBinds { binds: block_binds(rd_body(head)), src: a.src, q_start: a.q_start, q_len: a.q_len }) + count_reads_named_ast(RdNmState { node: block_result(rd_body(head)), src: a.src, q_start: a.q_start, q_len: a.q_len }) + prog_reads_named(RdNmRules { rules: tail, src: a.src, q_start: a.q_start, q_len: a.q_len })
+      RNil => 0
+  proofs:
+    purity:
+      reads : [a.rules, a.src, a.q_start, a.q_len]
+      calls : [count_reads_named_binds, count_reads_named_ast, prog_reads_named, block_binds, rd_body, block_result]
+    termination:
+      bound : 4000
+
+
+-- Family B states: an Ast (or list) + the source + the declared ResourceList.
+concept BadRdState
+  @intention: "An Ast node + source + the declared resource list, for counting malformed or undeclared read sites"
+  @source: vexprparse.intent:71
+  fields:
+    node : Ast
+    src : text [..256]
+    ress : ResourceList
+
+
+concept BadRdArgs
+  @intention: "A call-argument list + source + the declared resource list"
+  @source: vexprparse.intent:71
+  fields:
+    args : ArgList
+    src : text [..256]
+    ress : ResourceList
+
+
+concept BadRdVFields
+  @intention: "A variant construct's field list + source + the declared resource list"
+  @source: vexprparse.intent:71
+  fields:
+    fields : VFieldList
+    src : text [..256]
+    ress : ResourceList
+
+
+concept BadRdArms
+  @intention: "A match arm list + source + the declared resource list"
+  @source: vexprparse.intent:71
+  fields:
+    arms : ArmList
+    src : text [..256]
+    ress : ResourceList
+
+
+concept BadRdBinds
+  @intention: "A let-binding list + source + the declared resource list"
+  @source: vexprparse.intent:71
+  fields:
+    binds : Binding
+    src : text [..256]
+    ress : ResourceList
+
+
+concept BadRdRules
+  @intention: "A rule list + source + the declared resource list"
+  @source: vexprparse.intent:71
+  fields:
+    rules : RuleList
+    src : text [..256]
+    ress : ResourceList
+
+
+-- count_bad_reads_ast: the number of read( sites that are MALFORMED (arity != 1
+-- or arg not a bare name) or name an UNDECLARED resource. FULL descent, same
+-- shape as count_reads_named_ast. Any nonzero total refuses emission.
+rule count_bad_reads_ast
+  @intention: "Count of malformed or undeclared read sites across a subtree (full descent)"
+  @source: vexprparse.intent:71
+  input:
+    a : BadRdState
+  output:
+    out : number
+  logic:
+    out = match a.node:
+      AstNum(value) => 0
+      AstBin(op, lhs, rhs) => count_bad_reads_ast(BadRdState { node: lhs, src: a.src, ress: a.ress }) + count_bad_reads_ast(BadRdState { node: rhs, src: a.src, ress: a.ress })
+      AstNeg(inner) => count_bad_reads_ast(BadRdState { node: inner, src: a.src, ress: a.ress })
+      AstNot(inner) => count_bad_reads_ast(BadRdState { node: inner, src: a.src, ress: a.ress })
+      AstVar(start, len) => 0
+      AstField(base, fstart, flen) => count_bad_reads_ast(BadRdState { node: base, src: a.src, ress: a.ress })
+      AstCall(callee_start, callee_len, args) => (if span_is_read(SpanCheck { src: a.src, start: callee_start, len: callee_len }) == 1 then (if arg_list_len(args) == 1 and resource_index_of(ResIdxState { ress: a.ress, src: a.src, q_start: ast_var_start(arg_first(args)), q_len: ast_var_len(arg_first(args)), idx: 0 }) >= 0 then 0 else 1) else 0) + count_bad_reads_args(BadRdArgs { args: args, src: a.src, ress: a.ress })
+      AstIf(cond, thn, els) => count_bad_reads_ast(BadRdState { node: cond, src: a.src, ress: a.ress }) + count_bad_reads_ast(BadRdState { node: thn, src: a.src, ress: a.ress }) + count_bad_reads_ast(BadRdState { node: els, src: a.src, ress: a.ress })
+      AstBool(value) => 0
+      AstStr(start, len) => 0
+      AstBytes(start, len) => 0
+      AstErr => 0
+      AstVariant(cstart, clen, vstart, vlen, fields) => count_bad_reads_vfields(BadRdVFields { fields: fields, src: a.src, ress: a.ress })
+      AstMatch(scrut, arms) => count_bad_reads_ast(BadRdState { node: scrut, src: a.src, ress: a.ress }) + count_bad_reads_arms(BadRdArms { arms: arms, src: a.src, ress: a.ress })
+      AstOk(inner) => count_bad_reads_ast(BadRdState { node: inner, src: a.src, ress: a.ress })
+      AstResErr(inner) => count_bad_reads_ast(BadRdState { node: inner, src: a.src, ress: a.ress })
+      AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => count_bad_reads_ast(BadRdState { node: scrut, src: a.src, ress: a.ress }) + count_bad_reads_ast(BadRdState { node: ok_body, src: a.src, ress: a.ress }) + count_bad_reads_ast(BadRdState { node: err_body, src: a.src, ress: a.ress })
+      AstSum(coll, item_start, item_len, body) => count_bad_reads_ast(BadRdState { node: coll, src: a.src, ress: a.ress }) + count_bad_reads_ast(BadRdState { node: body, src: a.src, ress: a.ress })
+      AstCount(coll, item_start, item_len, body) => count_bad_reads_ast(BadRdState { node: coll, src: a.src, ress: a.ress }) + count_bad_reads_ast(BadRdState { node: body, src: a.src, ress: a.ress })
+      AstFold(coll, init, acc_start, acc_len, item_start, item_len, body) => count_bad_reads_ast(BadRdState { node: coll, src: a.src, ress: a.ress }) + count_bad_reads_ast(BadRdState { node: init, src: a.src, ress: a.ress }) + count_bad_reads_ast(BadRdState { node: body, src: a.src, ress: a.ress })
+      AstAll(coll, item_start, item_len, body) => count_bad_reads_ast(BadRdState { node: coll, src: a.src, ress: a.ress }) + count_bad_reads_ast(BadRdState { node: body, src: a.src, ress: a.ress })
+      AstAny(coll, item_start, item_len, body) => count_bad_reads_ast(BadRdState { node: coll, src: a.src, ress: a.ress }) + count_bad_reads_ast(BadRdState { node: body, src: a.src, ress: a.ress })
+      AstMap(coll, item_start, item_len, body) => count_bad_reads_ast(BadRdState { node: coll, src: a.src, ress: a.ress }) + count_bad_reads_ast(BadRdState { node: body, src: a.src, ress: a.ress })
+      AstFilter(coll, item_start, item_len, body) => count_bad_reads_ast(BadRdState { node: coll, src: a.src, ress: a.ress }) + count_bad_reads_ast(BadRdState { node: body, src: a.src, ress: a.ress })
+      AstMinFold(coll, item_start, item_len, body) => count_bad_reads_ast(BadRdState { node: coll, src: a.src, ress: a.ress }) + count_bad_reads_ast(BadRdState { node: body, src: a.src, ress: a.ress })
+      AstMaxFold(coll, item_start, item_len, body) => count_bad_reads_ast(BadRdState { node: coll, src: a.src, ress: a.ress }) + count_bad_reads_ast(BadRdState { node: body, src: a.src, ress: a.ress })
+  proofs:
+    purity:
+      reads : [a.node, a.src, a.ress]
+      calls : [count_bad_reads_ast, count_bad_reads_args, count_bad_reads_vfields, count_bad_reads_arms, span_is_read, arg_list_len, resource_index_of, ast_var_start, ast_var_len, arg_first]
+    termination:
+      bound : 4000
+
+
+rule count_bad_reads_args
+  @intention: "Count of malformed or undeclared read sites across a call's arguments"
+  @source: vexprparse.intent:71
+  input:
+    a : BadRdArgs
+  output:
+    out : number
+  logic:
+    out = match a.args:
+      ArgCons(head, tail) => count_bad_reads_ast(BadRdState { node: head, src: a.src, ress: a.ress }) + count_bad_reads_args(BadRdArgs { args: tail, src: a.src, ress: a.ress })
+      ArgNil => 0
+  proofs:
+    purity:
+      reads : [a.args, a.src, a.ress]
+      calls : [count_bad_reads_ast, count_bad_reads_args]
+    termination:
+      bound : 4000
+
+
+rule count_bad_reads_vfields
+  @intention: "Count of malformed or undeclared read sites across a variant construct's field values"
+  @source: vexprparse.intent:71
+  input:
+    a : BadRdVFields
+  output:
+    out : number
+  logic:
+    out = match a.fields:
+      VFCons(name_start, name_len, val, rest) => count_bad_reads_ast(BadRdState { node: val, src: a.src, ress: a.ress }) + count_bad_reads_vfields(BadRdVFields { fields: rest, src: a.src, ress: a.ress })
+      VFNil => 0
+  proofs:
+    purity:
+      reads : [a.fields, a.src, a.ress]
+      calls : [count_bad_reads_ast, count_bad_reads_vfields]
+    termination:
+      bound : 4000
+
+
+rule count_bad_reads_arms
+  @intention: "Count of malformed or undeclared read sites across a match's arm bodies"
+  @source: vexprparse.intent:71
+  input:
+    a : BadRdArms
+  output:
+    out : number
+  logic:
+    out = match a.arms:
+      ArmCons(vstart, vlen, binders, body, rest) => count_bad_reads_ast(BadRdState { node: body, src: a.src, ress: a.ress }) + count_bad_reads_arms(BadRdArms { arms: rest, src: a.src, ress: a.ress })
+      ArmNil => 0
+  proofs:
+    purity:
+      reads : [a.arms, a.src, a.ress]
+      calls : [count_bad_reads_ast, count_bad_reads_arms]
+    termination:
+      bound : 4000
+
+
+rule count_bad_reads_binds
+  @intention: "Count of malformed or undeclared read sites across a binding list's RHSes"
+  @source: vexprparse.intent:71
+  input:
+    a : BadRdBinds
+  output:
+    out : number
+  logic:
+    out = match a.binds:
+      BCons(name_start, name_len, value, rest) => count_bad_reads_ast(BadRdState { node: value, src: a.src, ress: a.ress }) + count_bad_reads_binds(BadRdBinds { binds: rest, src: a.src, ress: a.ress })
+      BNil => 0
+  proofs:
+    purity:
+      reads : [a.binds, a.src, a.ress]
+      calls : [count_bad_reads_ast, count_bad_reads_binds]
+    termination:
+      bound : 4000
+
+
+rule bad_reads_rules
+  @intention: "Count of malformed or undeclared read sites across every rule body in a program"
+  @source: vexprparse.intent:71
+  input:
+    a : BadRdRules
+  output:
+    out : number
+  logic:
+    out = match a.rules:
+      RCons(head, tail) => count_bad_reads_binds(BadRdBinds { binds: block_binds(rd_body(head)), src: a.src, ress: a.ress }) + count_bad_reads_ast(BadRdState { node: block_result(rd_body(head)), src: a.src, ress: a.ress }) + bad_reads_rules(BadRdRules { rules: tail, src: a.src, ress: a.ress })
+      RNil => 0
+  proofs:
+    purity:
+      reads : [a.rules, a.src, a.ress]
+      calls : [count_bad_reads_binds, count_bad_reads_ast, bad_reads_rules, block_binds, rd_body, block_result]
+    termination:
+      bound : 4000
+
+
+-- BsScanState: a forward byte scan over a path span looking for a backslash.
+-- `len` carries an explicit signed range so the `<= 0` base case survives the
+-- optimizer's interval arithmetic (the default-field-range scar).
+concept BsScanState
+  @intention: "A source span cursor for the path backslash scan"
+  @source: vexprparse.intent:71
+  fields:
+    src : text [..256]
+    start : number [0, 4000000]
+    len : number [-4000000, 4000000]
+
+
+-- span_has_backslash: 1 iff the span contains a backslash byte (92). Escaped
+-- chars in a resource path are REFUSED in slice 1: the self-hosted path span is
+-- raw source bytes, and an escape would diverge from verbosec's lexed path.
+rule span_has_backslash
+  @intention: "1 if the source span contains a backslash byte, 0 otherwise"
+  @source: vexprparse.intent:71
+  input:
+    bs : BsScanState
+  output:
+    out : number
+  logic:
+    out = if bs.len <= 0 then 0 else if byte_at(bs.src, bs.start) == 92 then 1 else span_has_backslash(BsScanState { src: bs.src, start: bs.start + 1, len: bs.len - 1 })
+  proofs:
+    purity:
+      reads : [bs.src, bs.start, bs.len]
+      calls : [span_has_backslash]
+    termination:
+      bound : 65536
+      decreasing : len
+
+
+-- count_text_fields: how many text-typed (ty == 2) fields a field list declares.
+rule count_text_fields
+  @intention: "Number of text-typed fields in a field list"
+  @source: vexprparse.intent:71
+  input:
+    fl : FieldList
+  output:
+    out : number
+  logic:
+    out = match fl:
+      FCons(name_start, name_len, ty, ty_start, ty_len, rest) => (if ty == 2 then 1 else 0) + count_text_fields(rest)
+      FNil => 0
+  proofs:
+    purity:
+      reads : [fl]
+      calls : [count_text_fields]
+    termination:
+      bound : 512
+      structural : fl
+
+
+-- concept_text_field_errors: 1 per concept declaring MORE than 16 text fields.
+-- The pre-existing #124 boundary made explicit: per-element text slots stride
+-- 0x10000 from region offset 0, so slot 16 would land at 0x100000 — previously
+-- an unmapped-page fault (accidental fail-closed), silently mapped once the
+-- resource region grows the mmap. Enforced for every record concept.
+rule concept_text_field_errors
+  @intention: "Count of concepts declaring more than 16 text fields (the region slot boundary)"
+  @source: vexprparse.intent:71
+  input:
+    cl : ConceptList
+  output:
+    out : number
+  logic:
+    out = match cl:
+      CCons(head, tail) => (if count_text_fields(cd_fields(head)) > 16 then 1 else 0) + concept_text_field_errors(tail)
+      CNil => 0
+  proofs:
+    purity:
+      reads : [cl]
+      calls : [count_text_fields, cd_fields, concept_text_field_errors]
+    termination:
+      bound : 4000
+      structural : cl
+
+
+-- ResDeclChkState: the resource list under validation + the source text.
+concept ResDeclChkState
+  @intention: "A resource list + the source text, for the declaration shape checks"
+  @source: vexprparse.intent:71
+  fields:
+    ress : ResourceList
+    src : text [..256]
+
+
+-- resource_decl_errors: 1 per resource declaration violating the slice-1 shape:
+-- malformed decl (path_len sentinel -1 — misspelled header, non-literal path,
+-- or non-literal max), a non-abort on_read_error policy, max outside [1, 65520]
+-- (the content must fit the 64 KiB slot after the 8-byte value cell), path + NUL
+-- longer than 65520, or an escaped char in the path literal.
+rule resource_decl_errors
+  @intention: "Count of resource declarations violating the slice-1 shape and bounds"
+  @source: vexprparse.intent:71
+  input:
+    rc : ResDeclChkState
+  output:
+    out : number
+  logic:
+    out = match rc.ress:
+      RsCons(head, tail) => (if res_path_len(head) < 0 then 1 else if res_abort_ok(head) == 0 then 1 else if res_max(head) < 1 then 1 else if res_max(head) > 65520 then 1 else if res_path_len(head) + 1 > 65520 then 1 else span_has_backslash(BsScanState { src: rc.src, start: res_path_start(head), len: res_path_len(head) })) + resource_decl_errors(ResDeclChkState { ress: tail, src: rc.src })
+      RsNil => 0
+  proofs:
+    purity:
+      reads : [rc.ress, rc.src]
+      calls : [res_path_len, res_abort_ok, res_max, res_path_start, span_has_backslash, resource_decl_errors]
+    termination:
+      bound : 64
+
+
+-- RefCntState: the declared resource list + the program + the source.
+concept RefCntState
+  @intention: "The declared resource list + the program + the source, for counting referenced resources"
+  @source: vexprparse.intent:71
+  fields:
+    ress : ResourceList
+    prog : RuleList
+    src : text [..256]
+
+
+-- resource_referenced_count: how many DECLARED resources have at least one
+-- well-formed read(<name>) site in the program. The one-truth gate input:
+-- program_uses_resources == (this > 0), and resource_marshal_size counts the
+-- same resources (a declared-but-unreferenced resource emits NO trampoline
+-- block — verbosec parity with emit_record_loop_prologue's reference walk).
+rule resource_referenced_count
+  @intention: "Number of declared resources referenced by at least one read site in the program"
+  @source: vexprparse.intent:71
+  input:
+    rf : RefCntState
+  output:
+    out : number
+  logic:
+    out = match rf.ress:
+      RsCons(head, tail) => (if prog_reads_named(RdNmRules { rules: rf.prog, src: rf.src, q_start: res_name_start(head), q_len: res_name_len(head) }) > 0 then 1 else 0) + resource_referenced_count(RefCntState { ress: tail, prog: rf.prog, src: rf.src })
+      RsNil => 0
+  proofs:
+    purity:
+      reads : [rf.ress, rf.prog, rf.src]
+      calls : [prog_reads_named, res_name_start, res_name_len, resource_referenced_count]
+    termination:
+      bound : 64
+
+
+-- ResErrState: everything the resource verification surface needs.
+concept ResErrState
+  @intention: "The program + declared resources + concepts + source, for the resource verification surface"
+  @source: vexprparse.intent:71
+  fields:
+    prog : RuleList
+    ress : ResourceList
+    concepts : ConceptList
+    src : text [..256]
+
+
+-- resource_errors: the effects-tier verrs contribution. Sums: declaration shape
+-- violations, the > 16 resources cap (region slots), the > 16 text fields per
+-- concept boundary, malformed/undeclared read sites, and the input-less-entry
+-- refusal (a program that reads resources but whose entry rule has no input has
+-- NO marshal — no region mmap exists for the slots; a standalone gated mmap is
+-- the later lift). Zero on the self-source by construction (no resources, no
+-- read sites).
+rule resource_errors
+  @intention: "Total effects-tier verification errors: declaration shapes, caps, read sites, input-less entry"
+  @source: vexprparse.intent:71
+  input:
+    re : ResErrState
+  output:
+    out : number
+  logic:
+    let decl_errs = resource_decl_errors(ResDeclChkState { ress: re.ress, src: re.src })
+    let too_many = if resource_list_len(re.ress) > 16 then 1 else 0
+    let cerrs = concept_text_field_errors(re.concepts)
+    let bad = bad_reads_rules(BadRdRules { rules: re.prog, src: re.src, ress: re.ress })
+    let refd = resource_referenced_count(RefCntState { ress: re.ress, prog: re.prog, src: re.src })
+    let entry_params = if param_list_len(rl_head_params(re.prog)) > 0 then rl_head_params(re.prog) else fields_to_params(rl_head_input(re.prog))
+    let has_input = if param_list_len(entry_params) > 0 then 1 else 0
+    out = decl_errs + too_many + cerrs + bad + (if refd > 0 and has_input == 0 then 1 else 0)
+  proofs:
+    purity:
+      reads : [re.prog, re.ress, re.concepts, re.src]
+      calls : [resource_decl_errors, resource_list_len, concept_text_field_errors, bad_reads_rules, resource_referenced_count, param_list_len, rl_head_params, fields_to_params, rl_head_input]
+    termination:
+      bound : 64
+
+
 -- The concept-lookup probe: the concept list to search, the source text (for
 -- byte-comparison), and the query name's span (q_start, q_len). Same shape as
 -- FindRuleState but over a ConceptList.
@@ -11137,7 +11833,10 @@ rule count_undef_ast
       AstNot(inner) => count_undef_ast(UndefAstState { node: inner, binds: a.binds, src: a.src })
       AstVar(start, len) => if name_bound(NameBoundState { binds: a.binds, src: a.src, q_start: start, q_len: len }) == 0 then 1 else 0
       AstField(base, fstart, flen) => count_undef_ast(UndefAstState { node: base, binds: a.binds, src: a.src })
-      AstCall(callee_start, callee_len, args) => count_undef_args(UndefArgsState { args: args, binds: a.binds, src: a.src })
+      -- Effects tier slice 1: a `read(<resource>)` call's argument is a RESOURCE
+      -- name, not a variable — it is NOT checked here (resource_errors validates
+      -- it against the declared ResourceList instead).
+      AstCall(callee_start, callee_len, args) => if span_is_read(SpanCheck { src: a.src, start: callee_start, len: callee_len }) == 1 then 0 else count_undef_args(UndefArgsState { args: args, binds: a.binds, src: a.src })
       AstIf(cond, thn, els) => count_undef_ast(UndefAstState { node: cond, binds: a.binds, src: a.src }) + count_undef_ast(UndefAstState { node: thn, binds: a.binds, src: a.src }) + count_undef_ast(UndefAstState { node: els, binds: a.binds, src: a.src })
       AstBool(value) => 0
       AstStr(start, len) => 0
@@ -11166,7 +11865,7 @@ rule count_undef_ast
   proofs:
     purity:
       reads : [a.node, a.binds, a.src]
-      calls : [count_undef_ast, count_undef_args, name_bound, count_undef_vfields, count_undef_arms]
+      calls : [count_undef_ast, count_undef_args, name_bound, count_undef_vfields, count_undef_arms, span_is_read]
     termination:
       bound : 4000
 
@@ -12573,7 +13272,7 @@ rule call_result_type
     out : number
   logic:
     let isb = if span_is_le32(SpanCheck { src: c.src, start: c.callee_start, len: c.callee_len }) == 1 then 1 else if span_is_le64(SpanCheck { src: c.src, start: c.callee_start, len: c.callee_len }) == 1 then 1 else if span_is_arena_scope(SpanCheck { src: c.src, start: c.callee_start, len: c.callee_len }) == 1 then 1 else if span_is_abort_if(SpanCheck { src: c.src, start: c.callee_start, len: c.callee_len }) == 1 then 1 else 0
-    let ist = span_is_substring(SpanCheck { src: c.src, start: c.callee_start, len: c.callee_len })
+    let ist = if span_is_substring(SpanCheck { src: c.src, start: c.callee_start, len: c.callee_len }) == 1 then 1 else span_is_read(SpanCheck { src: c.src, start: c.callee_start, len: c.callee_len })
     let isn = if span_is_byte_at(SpanCheck { src: c.src, start: c.callee_start, len: c.callee_len }) == 1 then 1 else if span_is_length(SpanCheck { src: c.src, start: c.callee_start, len: c.callee_len }) == 1 then 1 else if span_is_max(SpanCheck { src: c.src, start: c.callee_start, len: c.callee_len }) == 1 then 1 else if span_is_min(SpanCheck { src: c.src, start: c.callee_start, len: c.callee_len }) == 1 then 1 else 0
     let callee = find_rule(FindRuleState { rules: c.prog, src: c.src, q_start: c.callee_start, q_len: c.callee_len })
     let rt = rd_return_type(callee)
@@ -12582,7 +13281,7 @@ rule call_result_type
   proofs:
     purity:
       reads : [c.prog, c.src, c.callee_start, c.callee_len, c.concepts]
-      calls : [span_is_le32, span_is_le64, span_is_arena_scope, span_is_abort_if, span_is_substring, span_is_byte_at, span_is_length, span_is_max, span_is_min, rd_return_type, find_rule, resolve_type, rd_out_ty_start, rd_out_ty_len]
+      calls : [span_is_le32, span_is_le64, span_is_arena_scope, span_is_abort_if, span_is_substring, span_is_read, span_is_byte_at, span_is_length, span_is_max, span_is_min, rd_return_type, find_rule, resolve_type, rd_out_ty_start, rd_out_ty_len]
     termination:
       bound : 64
 
@@ -14418,7 +15117,13 @@ rule count_undecl_read_ast
       AstNot(inner) => count_undecl_read_ast(UndeclReadState { node: inner, binds: a.binds, reads: a.reads, in_start: a.in_start, in_len: a.in_len, src: a.src })
       AstVar(start, len) => if len == a.in_len and (name_eq(NameEqState { src: a.src, a_start: a.in_start, b_start: start, len: len, off: 0 }) == 1 and (name_bound(NameBoundState { binds: a.binds, src: a.src, q_start: start, q_len: len }) == 0 and name_in_namelist(NameInListState { names: a.reads, src: a.src, q_start: start, q_len: len }) == 0)) then 1 else 0
       AstField(base, fstart, flen) => count_undecl_read_ast(UndeclReadState { node: base, binds: a.binds, reads: a.reads, in_start: a.in_start, in_len: a.in_len, src: a.src })
-      AstCall(callee_start, callee_len, args) => count_undecl_read_args(UndeclReadArgsState { args: args, binds: a.binds, reads: a.reads, in_start: a.in_start, in_len: a.in_len, src: a.src })
+      -- Effects tier slice 1: a `read(<resource>)` call site is an INPUT READ in
+      -- the purity sense — the resource name MUST appear in the rule's declared
+      -- `reads:` list (verbosec parity: the auditor greps `reads:` and finds
+      -- every file the program touches). A malformed read (arg not a bare name)
+      -- yields a 0-length query span, matches nothing, and counts as a violation
+      -- — fail-closed, and resource_errors flags the shape separately.
+      AstCall(callee_start, callee_len, args) => (if span_is_read(SpanCheck { src: a.src, start: callee_start, len: callee_len }) == 1 then (if name_in_namelist(NameInListState { names: a.reads, src: a.src, q_start: ast_var_start(arg_first(args)), q_len: ast_var_len(arg_first(args)) }) == 0 then 1 else 0) else 0) + count_undecl_read_args(UndeclReadArgsState { args: args, binds: a.binds, reads: a.reads, in_start: a.in_start, in_len: a.in_len, src: a.src })
       AstIf(cond, thn, els) => count_undecl_read_ast(UndeclReadState { node: cond, binds: a.binds, reads: a.reads, in_start: a.in_start, in_len: a.in_len, src: a.src }) + count_undecl_read_ast(UndeclReadState { node: thn, binds: a.binds, reads: a.reads, in_start: a.in_start, in_len: a.in_len, src: a.src }) + count_undecl_read_ast(UndeclReadState { node: els, binds: a.binds, reads: a.reads, in_start: a.in_start, in_len: a.in_len, src: a.src })
       AstBool(value) => 0
       AstStr(start, len) => 0
@@ -14442,7 +15147,7 @@ rule count_undecl_read_ast
   proofs:
     purity:
       reads : [a.node, a.binds, a.reads, a.in_start, a.in_len, a.src]
-      calls : [count_undecl_read_ast, count_undecl_read_args, name_eq, name_bound, name_in_namelist, count_undecl_read_vfields, count_undecl_read_arms]
+      calls : [count_undecl_read_ast, count_undecl_read_args, name_eq, name_bound, name_in_namelist, count_undecl_read_vfields, count_undecl_read_arms, span_is_read, ast_var_start, ast_var_len, arg_first]
     termination:
       bound : 4000
 
@@ -16316,12 +17021,14 @@ rule undef_span_ast
       AstNeg(inner) => undef_span_ast(UndefSpanAstState { node: inner, binds: a.binds, src: a.src })
       AstNot(inner) => undef_span_ast(UndefSpanAstState { node: inner, binds: a.binds, src: a.src })
       AstField(base, fstart, flen) => undef_span_ast(UndefSpanAstState { node: base, binds: a.binds, src: a.src })
-      AstCall(callee_start, callee_len, args) => undef_span_args(UndefSpanArgsState { args: args, binds: a.binds, src: a.src })
+      -- Effects tier slice 1: a `read(<resource>)` argument is a resource name,
+      -- not a variable — never located as an undefined-variable span.
+      AstCall(callee_start, callee_len, args) => if span_is_read(SpanCheck { src: a.src, start: callee_start, len: callee_len }) == 1 then Span::MkSpan { start: 9999, len: 0 } else undef_span_args(UndefSpanArgsState { args: args, binds: a.binds, src: a.src })
       AstIf(cond, thn, els) => span_or(SpanOrState { a: span_or(SpanOrState { a: undef_span_ast(UndefSpanAstState { node: cond, binds: a.binds, src: a.src }), b: undef_span_ast(UndefSpanAstState { node: thn, binds: a.binds, src: a.src }) }), b: undef_span_ast(UndefSpanAstState { node: els, binds: a.binds, src: a.src }) })
   proofs:
     purity:
       reads : [a.node, a.binds, a.src]
-      calls : [name_bound, span_or, undef_span_ast, undef_span_args, undef_span_vfields, undef_span_arms]
+      calls : [name_bound, span_or, undef_span_ast, undef_span_args, undef_span_vfields, undef_span_arms, span_is_read]
     termination:
       bound : 4000
 
@@ -22609,7 +23316,11 @@ rule elf_program_src
     -- the synthetic appended concept exists for arena sizing at emit time and
     -- would skew the R6a/R6B walk on Result-using programs. x86_program_src
     -- (the exec-probe harness driver below) deliberately stays UNGATED.
-    let verrs = diag_count(prog_diags(ProgDiagsState { iter: prog, full: prog, src: s.source, idx: 0, concepts: concepts0 })) + purity_list(PurityListState { iter: prog, full: prog, src: s.source }) + term_list(TermListState { iter: prog, src: s.source })
+    -- Effects tier slice 1: resource_errors joins the aggregate — declaration
+    -- shape violations, the resource/text-field caps, malformed or undeclared
+    -- read( sites, and the input-less-entry refusal all refuse emission.
+    let ress = parse_resources(ProgramState { cell: toks, src: s.source })
+    let verrs = diag_count(prog_diags(ProgDiagsState { iter: prog, full: prog, src: s.source, idx: 0, concepts: concepts0 })) + purity_list(PurityListState { iter: prog, full: prog, src: s.source }) + term_list(TermListState { iter: prog, src: s.source }) + resource_errors(ResErrState { prog: prog, ress: ress, concepts: concepts0, src: s.source })
     let sizes = proc_sizes(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: ProcSizeList::PSNil })
     let uses_var = program_uses_arena(concepts)
     let anytx = prog_any_texty(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: sizes })
@@ -22638,7 +23349,7 @@ rule elf_program_src
   proofs:
     purity:
       reads : [s.source]
-      calls : [begin_tokenize, parse_program, parse_concepts, program_uses_result, concepts_append_result, diag_count, prog_diags, purity_list, term_list, proc_sizes, program_uses_arena, prog_any_texty, entry_rule_texty, entry_rule_bytes, entry_rule_result, entry_rule_collection, max_payload_fields, program_uses_text, blob_end_off, x86_program, src_blob, param_list_len, rl_head_params, fields_to_params, rl_head_input, params_to_fields, find_concept_index, fl_head_ty_start, fl_head_ty_len, x86_argv_marshal, x86_stdin_marshal, field_list_has_text, cd_fields, concept_at_index]
+      calls : [begin_tokenize, parse_program, parse_concepts, parse_resources, resource_errors, program_uses_result, concepts_append_result, diag_count, prog_diags, purity_list, term_list, proc_sizes, program_uses_arena, prog_any_texty, entry_rule_texty, entry_rule_bytes, entry_rule_result, entry_rule_collection, max_payload_fields, program_uses_text, blob_end_off, x86_program, src_blob, param_list_len, rl_head_params, fields_to_params, rl_head_input, params_to_fields, find_concept_index, fl_head_ty_start, fl_head_ty_len, x86_argv_marshal, x86_stdin_marshal, field_list_has_text, cd_fields, concept_at_index]
     termination:
       bound : 256
 
