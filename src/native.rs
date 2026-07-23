@@ -22785,6 +22785,326 @@ rule le64_neg
         let _ = fs::remove_file(elf);
     }
 
+    /// EFFECTS TIER slice 1 — THE MILESTONE: the self-hosted emitter compiles a
+    /// `resource` declaration + `read(<name>)` program to a runnable ELF whose
+    /// runtime behavior matches verbosec's OWN `--native` (Phase 9 slice 1)
+    /// bit-for-bit: same stdout on the same file fixture, exit 1 on a missing
+    /// file. Not ELF byte-equality across compilers (the two backends emit
+    /// different machine code) — the gate is run-output equality vs verbosec +
+    /// the fixed-point (pinned by two_generation_bootstrap_fixed_point).
+    ///
+    /// Composition probes in the same test: read inside concat (`concat("cfg=",
+    /// read(cfg))` — text output, argv entry) AND `length(read(cfg))` (number
+    /// output — the value-position read arm, distinct from the streaming one).
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn self_hosted_read_resource_matches_verbosec() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        let src = fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        // gen0: the self-hosted emitter (elf_program_src reads the program on
+        // argv[1], pos on argv[2] — the same argv channel the collections tests
+        // use; ScanState.source is a text input field).
+        let elf = std::env::temp_dir().join("verbosec_test_eff_s1_elf_program_src");
+        compile_native(&program, "elf_program_src", elf.to_str().unwrap(), false, false)
+            .expect("elf_program_src must compile natively");
+
+        // A unique fixture path shared by BOTH the self and the oracle program.
+        let fixture = std::env::temp_dir().join("verbosec_test_eff_s1_fixture.txt");
+        let fpath = fixture.to_str().unwrap();
+
+        // Emit a target ELF via gen0 (argv[1] = header-less source, argv[2] = pos).
+        let emit_self = |prog_src: &str, tag: &str| -> std::path::PathBuf {
+            let mc = Command::new(&elf).args([prog_src, "0"]).output()
+                .expect("spawn elf_program_src");
+            assert!(mc.status.success(),
+                "elf_program_src must exit 0 for {:?}; got {:?}", tag, mc.status);
+            let bytes = mc.stdout;
+            assert_eq!(&bytes[0..4], &[0x7f, 0x45, 0x4c, 0x46],
+                "self-emitted file is not ELF for {}", tag);
+            let out = std::env::temp_dir().join(format!("verbosec_test_eff_s1_{}_self", tag));
+            fs::write(&out, &bytes).expect("write self ELF");
+            let mut perms = fs::metadata(&out).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&out, perms).expect("chmod +x");
+            out
+        };
+        // Compile a header-full oracle program with verbosec's own native backend
+        // (compile_native does NOT check @source file existence — that lives in
+        // the full verify pass — so a fabricated @source is fine here, matching
+        // the collections oracle trick).
+        let emit_oracle = |vsrc: &str, rule: &str, tag: &str| -> std::path::PathBuf {
+            let vtoks = crate::lexer::Lexer::new(vsrc).tokenize().unwrap();
+            let vprog = crate::parser::Parser::new(vtoks).parse_program().unwrap();
+            let out = std::env::temp_dir().join(format!("verbosec_test_eff_s1_{}_oracle", tag));
+            compile_native(&vprog, rule, out.to_str().unwrap(), false, false)
+                .unwrap_or_else(|e| panic!("verbosec must compile {} natively: {}", rule, e.message));
+            let mut perms = fs::metadata(&out).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&out, perms).expect("chmod +x");
+            out
+        };
+
+        // Probe 1: text output, read inside concat, argv (number-field) entry.
+        let self_text_src = format!(
+            "concept Trigger\n  fields:\n    go : number\nresource cfg\n  path: \"{}\"\n  max: 256\n  on_read_error: abort\nrule main\n  input:\n    t : Trigger\n  output:\n    out : text\n  logic:\n    out = concat(\"cfg=\", read(cfg))\n  proofs:\n    purity:\n      reads : [cfg]\n      calls : []\n    termination:\n      bound : 8",
+            fpath);
+        let oracle_text_src = format!(
+            "@verbose 0.1.0\n\nresource cfg\n  @intention: \"c\"\n  @source: e.intent:1\n  path: \"{}\"\n  max: 256\n  on_read_error: abort\n\nconcept Trigger\n  @intention: \"t\"\n  @source: e.intent:1\n  fields:\n    go : number\n\nrule main\n  @intention: \"m\"\n  @source: e.intent:1\n  input:\n    t : Trigger\n  output:\n    out : text\n  logic:\n    out = concat(\"cfg=\", read(cfg))\n  proofs:\n    purity:\n      reads : [cfg]\n      calls : []\n    termination:\n      bound : 8",
+            fpath);
+
+        // Probe 2: number output, length(read(cfg)) — the value-position arm.
+        let self_num_src = format!(
+            "concept Trigger\n  fields:\n    go : number\nresource cfg\n  path: \"{}\"\n  max: 256\n  on_read_error: abort\nrule main\n  input:\n    t : Trigger\n  output:\n    out : number\n  logic:\n    out = length(read(cfg))\n  proofs:\n    purity:\n      reads : [cfg]\n      calls : []\n    termination:\n      bound : 8",
+            fpath);
+        let oracle_num_src = format!(
+            "@verbose 0.1.0\n\nresource cfg\n  @intention: \"c\"\n  @source: e.intent:1\n  path: \"{}\"\n  max: 256\n  on_read_error: abort\n\nconcept Trigger\n  @intention: \"t\"\n  @source: e.intent:1\n  fields:\n    go : number\n\nrule main\n  @intention: \"m\"\n  @source: e.intent:1\n  input:\n    t : Trigger\n  output:\n    out : number\n  logic:\n    out = length(read(cfg))\n  proofs:\n    purity:\n      reads : [cfg]\n      calls : []\n    termination:\n      bound : 8",
+            fpath);
+
+        let self_text = emit_self(&self_text_src, "text");
+        let oracle_text = emit_oracle(&oracle_text_src, "main", "text");
+        let self_num = emit_self(&self_num_src, "num");
+        let oracle_num = emit_oracle(&oracle_num_src, "main", "num");
+
+        // Fixture present: stdout must match verbosec bit-for-bit, exit 0.
+        fs::write(&fixture, b"hello-from-file").expect("write fixture");
+        let run_ok = |bin: &std::path::PathBuf| -> Vec<u8> {
+            let o = Command::new(bin).arg("0").output().expect("run target");
+            assert!(o.status.success(), "{:?} must exit 0 with fixture present; got {:?}", bin, o.status);
+            o.stdout
+        };
+        let st = run_ok(&self_text);
+        let ot = run_ok(&oracle_text);
+        assert_eq!(st, b"cfg=hello-from-file\n",
+            "self text stdout = {:?}", String::from_utf8_lossy(&st));
+        assert_eq!(st, ot,
+            "self ({:?}) vs verbosec ({:?}) text stdout mismatch",
+            String::from_utf8_lossy(&st), String::from_utf8_lossy(&ot));
+        let sn = run_ok(&self_num);
+        let on = run_ok(&oracle_num);
+        assert_eq!(sn, b"15\n", "self length(read) = {:?}", String::from_utf8_lossy(&sn));
+        assert_eq!(sn, on,
+            "self ({:?}) vs verbosec ({:?}) length(read) mismatch",
+            String::from_utf8_lossy(&sn), String::from_utf8_lossy(&on));
+
+        // Fixture missing: on_read_error: abort -> both exit 1, no stdout.
+        let _ = fs::remove_file(&fixture);
+        let run_missing = |bin: &std::path::PathBuf| {
+            let o = Command::new(bin).arg("0").output().expect("run target");
+            assert!(!o.status.success(),
+                "{:?} must exit non-zero with fixture missing; got {:?}", bin, o.status);
+            assert_eq!(o.status.code(), Some(1),
+                "{:?} must exit 1 on missing file; got {:?}", bin, o.status.code());
+            assert!(o.stdout.is_empty(),
+                "{:?} must emit nothing on missing file", bin);
+        };
+        run_missing(&self_text);
+        run_missing(&oracle_text);
+        run_missing(&self_num);
+        run_missing(&oracle_num);
+
+        for p in [&self_text, &oracle_text, &self_num, &oracle_num, &elf] {
+            let _ = fs::remove_file(p);
+        }
+    }
+
+    /// EFFECTS TIER slice 1 — stdin-channel probe. When the target's entry rule
+    /// has a TEXT input field, its source arrives on stdin (the 0..0x400000
+    /// region area), while the resource slots live at 0x400000+. This proves the
+    /// new resource base does not collide with the stdin source area: the source
+    /// (`s.data`) AND the resource content (`read(cfg)`) both survive, and the
+    /// self-emitted binary matches verbosec's --native.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn self_hosted_read_resource_stdin_channel_source_safe() {
+        use std::fs;
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::{Command, Stdio};
+
+        let src = fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+        let elf = std::env::temp_dir().join("verbosec_test_eff_s1_stdin_emitter");
+        compile_native(&program, "elf_program_src", elf.to_str().unwrap(), false, false)
+            .expect("elf_program_src must compile natively");
+
+        let fixture = std::env::temp_dir().join("verbosec_test_eff_s1_stdin_fixture.txt");
+        let fpath = fixture.to_str().unwrap();
+
+        // Entry rule takes a TEXT field `data` -> the self-hosted emitter routes
+        // the target to the STDIN channel, which reads ALL of stdin into the
+        // region area [0, 0x400000). The resource slots live at 0x400000+, so a
+        // collision would corrupt read(cfg). `data` is present only to force the
+        // stdin channel (it is intentionally unread — a text field in a concat
+        // would itoa, a separate pre-existing self-hosted limitation); the probe
+        // is that read(cfg) survives a fully-occupied source region.
+        let self_src = format!(
+            "concept Src\n  fields:\n    data : text\nresource cfg\n  path: \"{}\"\n  max: 256\n  on_read_error: abort\nrule main\n  input:\n    s : Src\n  output:\n    out : text\n  logic:\n    out = concat(\"cfg=\", read(cfg))\n  proofs:\n    purity:\n      reads : [cfg]\n      calls : []\n    termination:\n      bound : 8",
+            fpath);
+        let oracle_src = format!(
+            "@verbose 0.1.0\n\nresource cfg\n  @intention: \"c\"\n  @source: e.intent:1\n  path: \"{}\"\n  max: 256\n  on_read_error: abort\n\nconcept Src\n  @intention: \"s\"\n  @source: e.intent:1\n  fields:\n    data : text\n\nrule main\n  @intention: \"m\"\n  @source: e.intent:1\n  input:\n    s : Src\n  output:\n    out : text\n  logic:\n    out = concat(\"cfg=\", read(cfg))\n  proofs:\n    purity:\n      reads : [cfg]\n      calls : []\n    termination:\n      bound : 8",
+            fpath);
+
+        let mc = Command::new(&elf).args([self_src.as_str(), "0"]).output()
+            .expect("spawn elf_program_src");
+        assert!(mc.status.success(), "gen0 must emit the stdin-channel target; got {:?}", mc.status);
+        assert_eq!(&mc.stdout[0..4], &[0x7f, 0x45, 0x4c, 0x46], "self-emitted stdin target not ELF");
+        let self_bin = std::env::temp_dir().join("verbosec_test_eff_s1_stdin_self");
+        fs::write(&self_bin, &mc.stdout).unwrap();
+        let mut perms = fs::metadata(&self_bin).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&self_bin, perms).unwrap();
+
+        let vtoks = crate::lexer::Lexer::new(&oracle_src).tokenize().unwrap();
+        let vprog = crate::parser::Parser::new(vtoks).parse_program().unwrap();
+        let oracle_bin = std::env::temp_dir().join("verbosec_test_eff_s1_stdin_oracle");
+        compile_native(&vprog, "main", oracle_bin.to_str().unwrap(), false, false)
+            .expect("verbosec must compile the stdin-channel target");
+        let mut perms = fs::metadata(&oracle_bin).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&oracle_bin, perms).unwrap();
+
+        fs::write(&fixture, b"CFGVALUE").expect("write fixture");
+        // Feed the self target a LARGE stdin blob (fills the region source area
+        // [0, 0x400000) near-fully) so any overlap with the resource slots at
+        // 0x400000+ would corrupt read(cfg). The oracle's text field rides argv
+        // (Phase 2E) and is unread, so its argv value is immaterial.
+        let blob = vec![b'S'; 200000];
+        let mut child = Command::new(&self_bin)
+            .stdin(Stdio::piped()).stdout(Stdio::piped())
+            .spawn().expect("spawn self target");
+        child.stdin.take().unwrap().write_all(&blob).unwrap();
+        let so = child.wait_with_output().expect("wait self target");
+        assert!(so.status.success(), "self target must exit 0; got {:?}", so.status);
+        let s = so.stdout;
+        let oo = Command::new(&oracle_bin).arg("x").output().expect("run oracle target");
+        assert!(oo.status.success(), "oracle target must exit 0; got {:?}", oo.status);
+        let o = oo.stdout;
+        assert_eq!(s, b"cfg=CFGVALUE\n",
+            "self stdin-channel resource content corrupted: {:?}", String::from_utf8_lossy(&s));
+        assert_eq!(s, o,
+            "self ({:?}) vs verbosec ({:?}) stdin-channel mismatch",
+            String::from_utf8_lossy(&s), String::from_utf8_lossy(&o));
+
+        let _ = fs::remove_file(&fixture);
+        for p in [&self_bin, &oracle_bin, &elf] {
+            let _ = fs::remove_file(p);
+        }
+    }
+
+    /// EFFECTS TIER slice 1 — byte-identity of the le32 marshal-length split.
+    /// A resource-FREE texty program with an argv (number-field) entry must
+    /// still emit the historical argv-marshal mmap length constant 0x100000 as
+    /// the exact bytes `be 00 00 10 00` (mov esi, 0x100000). The split of that
+    /// immediate out of the fixed literal into `le32(region_len)` is size-stable,
+    /// so a resource-free program's marshal prefix is byte-identical to the
+    /// pre-slice emitter. (The whole-self byte-identity is pinned separately by
+    /// two_generation_bootstrap_fixed_point on the resource-free self-source.)
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn self_hosted_marshal_length_split_byte_identical_without_resources() {
+        use std::fs;
+        use std::process::Command;
+        use std::os::unix::fs::PermissionsExt;
+
+        let src = fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+        let elf = std::env::temp_dir().join("verbosec_test_eff_s1_split_emitter");
+        compile_native(&program, "elf_program_src", elf.to_str().unwrap(), false, false)
+            .expect("elf_program_src must compile natively");
+        let mut perms = fs::metadata(&elf).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&elf, perms).unwrap();
+
+        // Resource-free, argv entry, texty body -> the argv marshal runs.
+        let prog = "concept T\n  fields:\n    go : number\nrule main\n  input:\n    t : T\n  output:\n    out : text\n  logic:\n    out = concat(\"go=\", \"x\")\n  proofs:\n    purity:\n      reads : []\n      calls : []\n    termination:\n      bound : 8";
+        let mc = Command::new(&elf).args([prog, "0"]).output().expect("spawn gen0");
+        assert!(mc.status.success(), "gen0 must emit the resource-free texty program");
+        let bytes = mc.stdout;
+        // The argv marshal's mmap length: mov esi, imm32 = BE followed by the
+        // little-endian 0x100000. Exactly ONE occurrence in a resource-free
+        // program (the argv trampoline); its presence proves the le32 split
+        // reproduced the old constant bytes.
+        let needle = [0xbeu8, 0x00, 0x00, 0x10, 0x00];
+        let hits = bytes.windows(needle.len()).filter(|w| *w == needle).count();
+        assert!(hits >= 1,
+            "resource-free argv marshal must emit mov esi, 0x100000 (be 00 00 10 00) — the le32 split byte-identity");
+        let _ = fs::remove_file(&elf);
+    }
+
+    /// EFFECTS TIER slice 1 — the self-verify gate composes resource_errors.
+    /// gen0 refuses (exit 1, zero output) a program with an UNDECLARED resource
+    /// read or a `read(<name>)` whose name is missing from the rule's `reads:`,
+    /// and emits an ELF for the clean program. Also pins the self-hosted
+    /// purity driver directly: count_purity_errors > 0 for the missing-reads
+    /// program, 0 for the clean one (the design's "purity violation count"
+    /// wording; the undeclared-resource case is caught only by resource_errors,
+    /// which is exercised via the gate since no standalone driver exposes it).
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn self_hosted_resource_verify_gate() {
+        use std::fs;
+        use std::process::Command;
+
+        let src = fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let gate = std::env::temp_dir().join("verbosec_test_eff_s1_gate_emitter");
+        compile_native(&program, "elf_program_src", gate.to_str().unwrap(), false, false)
+            .expect("elf_program_src must compile natively");
+        let purity = std::env::temp_dir().join("verbosec_test_eff_s1_gate_purity");
+        compile_native(&program, "count_purity_errors", purity.to_str().unwrap(), false, false)
+            .expect("count_purity_errors must compile natively");
+
+        let run_gate = |prog: &str| -> std::process::Output {
+            Command::new(&gate).args([prog, "0"]).output().expect("spawn gate")
+        };
+        let purity_count = |prog: &str| -> i64 {
+            let o = Command::new(&purity).args([prog, "0"]).output().expect("spawn purity");
+            assert!(o.status.success(), "count_purity_errors must run");
+            String::from_utf8_lossy(&o.stdout).trim().parse::<i64>()
+                .unwrap_or_else(|_| panic!("purity count not an int: {:?}", o.stdout))
+        };
+
+        // Undeclared resource: read(cfg), no `resource cfg` decl. reads:[cfg]
+        // keeps purity clean, so ONLY resource_errors (via the gate) refuses.
+        let undeclared = "rule main\n  input:\n    t : T\n  output:\n    out : text\n  logic:\n    out = read(cfg)\n  proofs:\n    purity:\n      reads : [cfg]\n      calls : []\n    termination:\n      bound : 8\nconcept T\n  fields:\n    go : number";
+        let o = run_gate(undeclared);
+        assert!(!o.status.success() && o.stdout.is_empty(),
+            "gate must refuse an undeclared-resource read (exit 1, no output); got {:?}", o.status);
+
+        // read without cfg in reads: -> a purity violation. The gate refuses,
+        // and count_purity_errors reports > 0 directly.
+        let missing_reads = "resource cfg\n  path: \"/tmp/verbose_gate_probe.txt\"\n  max: 8\n  on_read_error: abort\nrule main\n  input:\n    t : T\n  output:\n    out : text\n  logic:\n    out = read(cfg)\n  proofs:\n    purity:\n      reads : []\n      calls : []\n    termination:\n      bound : 8\nconcept T\n  fields:\n    go : number";
+        let o = run_gate(missing_reads);
+        assert!(!o.status.success() && o.stdout.is_empty(),
+            "gate must refuse a read missing from reads: (exit 1, no output); got {:?}", o.status);
+        assert!(purity_count(missing_reads) > 0,
+            "count_purity_errors must be > 0 for the missing-reads program");
+
+        // Clean: declared + listed -> gate emits an ELF, purity count 0.
+        let clean = "resource cfg\n  path: \"/tmp/verbose_gate_probe.txt\"\n  max: 8\n  on_read_error: abort\nrule main\n  input:\n    t : T\n  output:\n    out : text\n  logic:\n    out = read(cfg)\n  proofs:\n    purity:\n      reads : [cfg]\n      calls : []\n    termination:\n      bound : 8\nconcept T\n  fields:\n    go : number";
+        let o = run_gate(clean);
+        assert!(o.status.success(), "gate must emit the clean program; got {:?}", o.status);
+        assert_eq!(&o.stdout[0..4], &[0x7f, 0x45, 0x4c, 0x46], "clean program must emit an ELF");
+        assert_eq!(purity_count(clean), 0, "count_purity_errors must be 0 for the clean program");
+
+        let _ = fs::remove_file(&gate);
+        let _ = fs::remove_file(&purity);
+    }
+
     /// Brick b6 — the four missing binary operators in the machine-code
     /// generator: division `/` (op 16), modulo `%` (op 17), logical `and`
     /// (op 30), logical `or` (op 31). Both the closed-expression path
