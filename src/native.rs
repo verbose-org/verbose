@@ -23105,6 +23105,208 @@ rule le64_neg
         let _ = fs::remove_file(&purity);
     }
 
+    /// EFFECTS TIER slice 2a — THE MILESTONE: the self-hosted emitter compiles a
+    /// `reaction` + static-content `append_file` to a runnable ELF whose FILE
+    /// effect matches verbosec's OWN `--native` reaction binary (emit_reaction_
+    /// program): same appended bytes on the same one-record input, same exit code.
+    /// Firing (`5000 17`, age < 18) appends exactly the 29 bytes "suspicious
+    /// purchase detected\n" (ending 0x0a); non-firing (`5000 25`) appends nothing.
+    /// Both compilers, exit 0 either way (reaction Drop policy).
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn self_hosted_reaction_matches_verbosec() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        let src = fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        // gen0: the self-hosted emitter (argv channel — source on argv[1], the
+        // text field via Phase 2E; pos on argv[2]).
+        let elf = std::env::temp_dir().join("verbosec_test_eff_s2_elf_program_src");
+        compile_native(&program, "elf_program_src", elf.to_str().unwrap(), false, false)
+            .expect("elf_program_src must compile natively");
+
+        // A unique audit-log path shared by the self AND the oracle reaction.
+        let logf = std::env::temp_dir().join("verbosec_test_eff_s2_audit.log");
+        let lpath = logf.to_str().unwrap();
+
+        // Header-less reaction program for gen0 (argv[1]).
+        let self_src = format!(
+            "concept Purchase\n  fields:\n    amount : number [0, 1000000]\n    customer_age : number [0, 150]\nrule is_suspicious\n  input:\n    p : Purchase\n  output:\n    suspicious : bool\n  logic:\n    suspicious = p.customer_age < 18\n  proofs:\n    purity:\n      reads : [p.customer_age]\n      calls : []\n    termination:\n      bound : 1\nreaction audit_suspicious\n  trigger: is_suspicious\n  effects:\n    append_file \"{}\" \"suspicious purchase detected\\n\"",
+            lpath);
+        // Header-full oracle for verbosec's own reaction native backend.
+        let oracle_src = format!(
+            "@verbose 0.1.0\n\nconcept Purchase\n  @intention: \"p\"\n  @source: e.intent:1\n  fields:\n    amount : number [0, 1000000]\n    customer_age : number [0, 150]\n\nrule is_suspicious\n  @intention: \"s\"\n  @source: e.intent:1\n  input:\n    p : Purchase\n  output:\n    suspicious : bool\n  logic:\n    suspicious = p.customer_age < 18\n  proofs:\n    purity:\n      reads : [p.customer_age]\n      calls : []\n    termination:\n      bound : 1\n\nreaction audit_suspicious\n  @intention: \"a\"\n  @source: e.intent:1\n  trigger: is_suspicious\n  effects:\n    append_file \"{}\" \"suspicious purchase detected\\n\"",
+            lpath);
+
+        // Emit the self reaction ELF via gen0.
+        let mc = Command::new(&elf).args([self_src.as_str(), "0"]).output()
+            .expect("spawn elf_program_src");
+        assert!(mc.status.success(), "gen0 must emit the reaction target; got {:?}", mc.status);
+        assert_eq!(&mc.stdout[0..4], &[0x7f, 0x45, 0x4c, 0x46], "self-emitted reaction not ELF");
+        let self_bin = std::env::temp_dir().join("verbosec_test_eff_s2_self");
+        fs::write(&self_bin, &mc.stdout).unwrap();
+        let mut perms = fs::metadata(&self_bin).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&self_bin, perms).unwrap();
+
+        // verbosec's own reaction binary (compile_native skips @source existence).
+        let vtoks = crate::lexer::Lexer::new(&oracle_src).tokenize().unwrap();
+        let vprog = crate::parser::Parser::new(vtoks).parse_program().unwrap();
+        let oracle_bin = std::env::temp_dir().join("verbosec_test_eff_s2_oracle");
+        compile_native(&vprog, "audit_suspicious", oracle_bin.to_str().unwrap(), false, false)
+            .expect("verbosec must compile the reaction natively");
+        let mut perms = fs::metadata(&oracle_bin).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&oracle_bin, perms).unwrap();
+
+        let expected = b"suspicious purchase detected\n";
+        // Firing case (age 17 < 18): each compiler appends the 29-byte line.
+        let run_fire = |bin: &std::path::PathBuf, who: &str| -> Vec<u8> {
+            let _ = fs::remove_file(&logf);
+            let o = Command::new(bin).args(["5000", "17"]).output().expect("run reaction");
+            assert!(o.status.success(), "{} reaction must exit 0 when firing; got {:?}", who, o.status);
+            fs::read(&logf).unwrap_or_default()
+        };
+        let self_fire = run_fire(&self_bin, "self");
+        assert_eq!(self_fire.len(), 29, "self appended {} bytes, want 29", self_fire.len());
+        assert_eq!(*self_fire.last().unwrap(), 0x0a, "self appended line must end in 0x0a");
+        assert_eq!(self_fire.as_slice(), expected, "self appended bytes mismatch");
+        let oracle_fire = run_fire(&oracle_bin, "oracle");
+        assert_eq!(self_fire, oracle_fire, "self vs verbosec appended-bytes mismatch");
+
+        // Non-firing case (age 25): nothing appended, exit 0 for both.
+        let run_nofire = |bin: &std::path::PathBuf, who: &str| {
+            let _ = fs::remove_file(&logf);
+            let o = Command::new(bin).args(["5000", "25"]).output().expect("run reaction");
+            assert!(o.status.success(), "{} reaction must exit 0 when not firing; got {:?}", who, o.status);
+            let appended = fs::read(&logf).unwrap_or_default();
+            assert!(appended.is_empty(), "{} must append nothing when not firing; got {:?}", who, appended);
+        };
+        run_nofire(&self_bin, "self");
+        run_nofire(&oracle_bin, "oracle");
+
+        let _ = fs::remove_file(&logf);
+        for p in [&self_bin, &oracle_bin, &elf] {
+            let _ = fs::remove_file(p);
+        }
+    }
+
+    /// EFFECTS TIER slice 2a — unescape pins. The reaction content span is
+    /// UNESCAPED at emit time by the byte-literal decoder (the closed string
+    /// escape set `\n \r \t \\ \"`). Content "a\nb" must emit the 3 bytes
+    /// 61 0a 62 (not 4 raw source bytes), and "a\rb" must emit 61 0d 62 (the
+    /// `\r`->13 case bytelit_unit_byte gained for this slice).
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn self_hosted_reaction_unescape_pins() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        let src = fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+        let elf = std::env::temp_dir().join("verbosec_test_eff_s2_esc_emitter");
+        compile_native(&program, "elf_program_src", elf.to_str().unwrap(), false, false)
+            .expect("elf_program_src must compile natively");
+
+        let logf = std::env::temp_dir().join("verbosec_test_eff_s2_esc.log");
+        let lpath = logf.to_str().unwrap();
+
+        // `escaped` is the two-char verbose escape (`\\n` / `\\r` in Rust -> `\n`
+        // / `\r` in the .verbose source); `want` is the decoded byte.
+        let check = |escaped: &str, want: u8| {
+            let prog_src = format!(
+                "concept P\n  fields:\n    v : number [0, 150]\nrule fire\n  input:\n    p : P\n  output:\n    o : bool\n  logic:\n    o = p.v < 18\n  proofs:\n    purity:\n      reads : [p.v]\n      calls : []\n    termination:\n      bound : 1\nreaction r\n  trigger: fire\n  effects:\n    append_file \"{}\" \"a{}b\"",
+                lpath, escaped);
+            let mc = Command::new(&elf).args([prog_src.as_str(), "0"]).output().expect("spawn gen0");
+            assert!(mc.status.success(), "gen0 must emit for escape {:?}; got {:?}", escaped, mc.status);
+            let bin = std::env::temp_dir().join("verbosec_test_eff_s2_esc_bin");
+            fs::write(&bin, &mc.stdout).unwrap();
+            let mut perms = fs::metadata(&bin).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&bin, perms).unwrap();
+            let _ = fs::remove_file(&logf);
+            let o = Command::new(&bin).args(["5"]).output().expect("run reaction");
+            assert!(o.status.success(), "escape {:?} reaction must exit 0", escaped);
+            let appended = fs::read(&logf).unwrap_or_default();
+            assert_eq!(appended, vec![0x61, want, 0x62],
+                "content a{}b must decode to [61 {:02x} 62]; got {:?}", escaped, want, appended);
+            let _ = fs::remove_file(&bin);
+        };
+        check("\\n", 0x0a);
+        check("\\r", 0x0d);
+
+        let _ = fs::remove_file(&logf);
+        let _ = fs::remove_file(&elf);
+    }
+
+    /// EFFECTS TIER slice 2a — verify gate + append_toks collision pin. gen0's
+    /// abort_if(verrs) refuses (exit 1, no ELF) every malformed reaction:
+    /// trigger naming a missing rule, trigger != head rule, concat content
+    /// (slice 2b), a src_base-dependent trigger (the threading-soundness
+    /// invariant), and an `append_toks` effect (proving span_is_append_file
+    /// full-byte-compares — a prefix check would misfire on the `append_` prefix
+    /// that append_toks shares). A clean reaction emits an ELF (exit 0).
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn self_hosted_reaction_verify_gate() {
+        use std::fs;
+        use std::process::Command;
+
+        let src = fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+        let gate = std::env::temp_dir().join("verbosec_test_eff_s2_gate");
+        compile_native(&program, "elf_program_src", gate.to_str().unwrap(), false, false)
+            .expect("elf_program_src must compile natively");
+
+        let run_gate = |prog: &str| -> std::process::Output {
+            Command::new(&gate).args([prog, "0"]).output().expect("spawn gate")
+        };
+        let refuses = |prog: &str, why: &str| {
+            let o = run_gate(prog);
+            assert!(!o.status.success() && o.stdout.is_empty(),
+                "gate must refuse {} (exit 1, no output); got {:?}", why, o.status);
+        };
+
+        // A pure-arithmetic head rule reused by every fixture.
+        let head = "concept P\n  fields:\n    v : number [0, 150]\nrule fire\n  input:\n    p : P\n  output:\n    o : bool\n  logic:\n    o = p.v < 18\n  proofs:\n    purity:\n      reads : [p.v]\n      calls : []\n    termination:\n      bound : 1\n";
+
+        // Trigger names a rule that does not exist.
+        refuses(&format!("{}reaction r\n  trigger: no_such_rule\n  effects:\n    append_file \"/tmp/vx_s2_gate.log\" \"x\"", head),
+            "a trigger naming a missing rule");
+        // Trigger names a real rule that is NOT the head (declare a second rule).
+        let two = "concept P\n  fields:\n    v : number [0, 150]\nrule fire\n  input:\n    p : P\n  output:\n    o : bool\n  logic:\n    o = p.v < 18\n  proofs:\n    purity:\n      reads : [p.v]\n      calls : []\n    termination:\n      bound : 1\nrule other\n  input:\n    p : P\n  output:\n    o : bool\n  logic:\n    o = p.v < 5\n  proofs:\n    purity:\n      reads : [p.v]\n      calls : []\n    termination:\n      bound : 1\n";
+        refuses(&format!("{}reaction r\n  trigger: other\n  effects:\n    append_file \"/tmp/vx_s2_gate.log\" \"x\"", two),
+            "a trigger that is not the head rule");
+        // Concat content (slice 2b).
+        refuses(&format!("{}reaction r\n  trigger: fire\n  effects:\n    append_file \"/tmp/vx_s2_gate.log\" concat(\"a\", \"b\")", head),
+            "a concat content (slice 2b)");
+        // src_base-dependent trigger (byte_at on a text field).
+        let sb = "concept P\n  fields:\n    v : number [0, 150]\n    label : text [..64]\nrule fire\n  input:\n    p : P\n  output:\n    o : bool\n  logic:\n    o = byte_at(p.label, 0) == 65\n  proofs:\n    purity:\n      reads : [p.label]\n      calls : []\n    termination:\n      bound : 1\n";
+        refuses(&format!("{}reaction r\n  trigger: fire\n  effects:\n    append_file \"/tmp/vx_s2_gate.log\" \"x\"", sb),
+            "a src_base-dependent trigger");
+        // append_toks effect head (must not be accepted as append_file).
+        refuses(&format!("{}reaction r\n  trigger: fire\n  effects:\n    append_toks \"/tmp/vx_s2_gate.log\" \"x\"", head),
+            "an append_toks effect (span_is_append_file collision)");
+
+        // Clean reaction: gate emits an ELF.
+        let clean = format!("{}reaction r\n  trigger: fire\n  effects:\n    append_file \"/tmp/vx_s2_gate.log\" \"x\"", head);
+        let o = run_gate(&clean);
+        assert!(o.status.success(), "gate must emit the clean reaction; got {:?}", o.status);
+        assert_eq!(&o.stdout[0..4], &[0x7f, 0x45, 0x4c, 0x46], "clean reaction must emit an ELF");
+
+        let _ = fs::remove_file(&gate);
+    }
+
     /// Brick b6 — the four missing binary operators in the machine-code
     /// generator: division `/` (op 16), modulo `%` (op 17), logical `and`
     /// (op 30), logical `or` (op 31). Both the closed-expression path
@@ -41066,7 +41268,7 @@ rule two
     /// dedicated `self-hosting-bootstrap` CI job runs it serially. Run explicitly:
     ///   cargo test --release -- --ignored --test-threads=1 two_generation
     #[test]
-    #[ignore = "gen1 peaks ~10.4 GiB RAM (verify pass + emit) + needs `ulimit -s unlimited` + ~1-2 min; run with --ignored"]
+    #[ignore = "gen1 peaks ~16 GiB RAM (verify pass + emit; ~165M non-reclaiming arena nodes) + needs `ulimit -s unlimited` + ~1-2 min; run with --ignored"]
     #[cfg(target_arch = "x86_64")]
     fn two_generation_bootstrap_fixed_point() {
         use std::fs;
