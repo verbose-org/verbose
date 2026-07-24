@@ -13157,14 +13157,27 @@ fn emit_eval_expr(
                 message: "le32/le64 produce bytes, not a scalar value (brick b2 supports them only inside a bytes `concat(...)` in an `output: bytes` rule)".into(),
             })
         }
-        Expr::ArenaScope(_) => {
-            // arena_scope(...) is a streaming-bytes reclaim boundary; it has
-            // no scalar (rax) representation. Reaching the scalar evaluator
-            // means it was used in a value position — only valid in a
-            // bytes-streaming position (handled by emit_streaming_bytes_body).
-            Err(NativeError {
-                message: "arena_scope(...) only valid in a streaming-bytes position (the whole body / a concat arg / an if or match arm of an `output: bytes` rule), not as a scalar value".into(),
-            })
+        Expr::ArenaScope(inner) => {
+            // Scalar-result arena_scope: `arena_scope(<number-expr>)` returns
+            // the inner NUMBER unchanged; its only effect is to reclaim the
+            // arena nodes the inner walk allocated. In gen0 (this Rust runner)
+            // plain-concept records are STACK-passed (slice-5.3 ABI), so the
+            // inner allocates ZERO concept_group arena nodes and there is
+            // nothing to reclaim — the reset is a genuine no-op here. So we
+            // simply evaluate the inner to rax and leave it there, PRESERVING
+            // rax. We must NOT reuse the streaming reset (emit_streaming_bytes_body's
+            // ArenaScope arm), which clobbers rax via `pop rax`. gen0's bytes are
+            // never byte-compared to gen1/gen2 (only gen1==gen2 is pinned), so
+            // this needs functional correctness (the returned number == the
+            // inner's value), not byte-identity with the self-hosted arm. The
+            // r14-reset reclaim that actually saves RSS lives in the self-hosted
+            // x86_node arm (examples/vexprparse.verbose). See
+            // docs/self-hosting-scalar-arena-scope-design.md.
+            emit_eval_expr(
+                code, inner, input_name, offsets, all_rules,
+                field_ranges, text_bindings, self_call, arena_ctx,
+            )?;
+            Ok(())
         }
         Expr::AbortIf(_) => {
             // abort_if(...) is a streaming-bytes fail-closed gate; it has no
@@ -41225,22 +41238,27 @@ rule two
     /// -> 4.9 s / 194 MB (the Rust-hosted verify walk is nearly free); gen1's
     /// emit 21.5 s / 7.9 GB -> 45.9 s / 10.4 GB (the self-hosted runtime
     /// arena-allocates every checker-walk record, so the verify pass costs
-    /// ~24 s / ~2.5 GB on top of the emit). gen1 itself grew 1,745,100 ->
+    /// ~24 s / ~2.5 GB on top of the emit; the SCALAR `arena_scope` on `verrs`
+    /// (2026-07) reclaims that verify baseline — see the IGNORED paragraph).
+    /// gen1 itself grew 1,745,100 ->
     /// 1,752,560 B (+7,460 B: the gate code + the span_is_abort_if proc —
     /// every checker rule was ALREADY a proc in gen1, which emits all rules);
     /// gen0 grew 250,558 -> 323,806 B (+29%: the checker closure joins the
     /// Rust-native callable set).
     ///
     /// This test pins THREE independent self-hosting properties (measured
-    /// 2026-07, gen0 peaks 140 MB / 1.5 s; gen1 — the self-hosted emitter —
-    /// peaks ~2.55 GB / ~3.7 s emitting the full source since the `arena_scope`
-    /// reclaim landed, was 8.7 GB / 22 s before it; see the V3 paragraph
-    /// above for the post-gate numbers):
+    /// 2026-07 on WSL2, isolated single gen1 emit of the reordered 1.32 MB
+    /// self-source via `/usr/bin/time -v`; gen0 — Rust, stack-passing records —
+    /// peaks ~140 MB; gen1 — the self-hosted emitter — peaks ~12.8 GiB / ~42 s
+    /// since the SCALAR `arena_scope` on `verrs` landed, was ~16.1 GiB / ~78 s
+    /// before it — and was ~2.55 GB / ~3.7 s back on the older 855 KB source
+    /// with only the streaming `arena_scope`; see the V3 paragraph above for the
+    /// gate-landing numbers):
     ///
     ///   R0 — fixed point:   gen1(reordered) == gen2(reordered) byte-for-byte.
     ///   R1 — whole source:  gen0(ORIGINAL) == gen1(ORIGINAL) byte-for-byte —
     ///                       the self-compiled emitter emits the entire real
-    ///                       855 KB / 545-proc compiler identically to the
+    ///                       1.32 MB / 690-rule compiler identically to the
     ///                       reference, with NO reorder caveat (the reorder in
     ///                       R0 only moves the entry proc to offset 0).
     ///   R2 — corpus + run:  for a spread of small programs covering the
@@ -41256,19 +41274,22 @@ rule two
     /// self-hosted emitter is a byte-identical, semantically-verified fixed
     /// point of the trusted reference.
     ///
-    /// IGNORED by default: gen1 (the self-hosted emitter) peaks ~2.55 GiB
-    /// emitting the full source (the Verbose runtime arena-allocates every
-    /// record/variant; `arena_scope` reclaims each proc's walk transients at the
-    /// proc boundary — see docs/self-hosting-arena-scope-design.md — bringing the
-    /// pre-reclaim 8.7 GiB down to the ~544 MB parse-tree floor + the biggest
-    /// single proc). gen0 (Rust, stack-passing records) peaks 140 MB. The test
-    /// also needs an unbounded stack (the src_blob recursion over the ~855 KB
+    /// IGNORED by default: gen1 (the self-hosted emitter) peaks ~12.8 GiB
+    /// emitting the full 1.32 MB source (the Verbose runtime arena-allocates
+    /// every record/variant; the streaming `arena_scope` reclaims each proc's
+    /// walk transients at the proc boundary — see
+    /// docs/self-hosting-arena-scope-design.md — and the scalar `arena_scope` on
+    /// `verrs` reclaims the top-level verify baseline, together bringing the
+    /// pre-reclaim peak down toward the ~840 MB parse-tree floor + the biggest
+    /// single proc's within-proc code_size_node re-walk, which a later slice
+    /// targets). gen0 (Rust, stack-passing records) peaks ~140 MB. The test
+    /// also needs an unbounded stack (the src_blob recursion over the ~1.32 MB
     /// source) — the emit shell-outs raise it via `ulimit -s unlimited`. Kept
-    /// ignored for the default parallel dev suite (2.55 GB × parallel tests); the
+    /// ignored for the default parallel dev suite (~12.8 GiB × parallel tests); the
     /// dedicated `self-hosting-bootstrap` CI job runs it serially. Run explicitly:
     ///   cargo test --release -- --ignored --test-threads=1 two_generation
     #[test]
-    #[ignore = "gen1 peaks ~16 GiB RAM (verify pass + emit; ~165M non-reclaiming arena nodes) + needs `ulimit -s unlimited` + ~1-2 min; run with --ignored"]
+    #[ignore = "gen1 peaks ~13 GiB RAM (verify pass + emit; ~165M arena nodes, verrs baseline now reclaimed via scalar arena_scope) + needs `ulimit -s unlimited` + ~1-2 min; run with --ignored"]
     #[cfg(target_arch = "x86_64")]
     fn two_generation_bootstrap_fixed_point() {
         use std::fs;
