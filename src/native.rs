@@ -13157,14 +13157,27 @@ fn emit_eval_expr(
                 message: "le32/le64 produce bytes, not a scalar value (brick b2 supports them only inside a bytes `concat(...)` in an `output: bytes` rule)".into(),
             })
         }
-        Expr::ArenaScope(_) => {
-            // arena_scope(...) is a streaming-bytes reclaim boundary; it has
-            // no scalar (rax) representation. Reaching the scalar evaluator
-            // means it was used in a value position — only valid in a
-            // bytes-streaming position (handled by emit_streaming_bytes_body).
-            Err(NativeError {
-                message: "arena_scope(...) only valid in a streaming-bytes position (the whole body / a concat arg / an if or match arm of an `output: bytes` rule), not as a scalar value".into(),
-            })
+        Expr::ArenaScope(inner) => {
+            // Scalar-result arena_scope: `arena_scope(<number-expr>)` returns
+            // the inner NUMBER unchanged; its only effect is to reclaim the
+            // arena nodes the inner walk allocated. In gen0 (this Rust runner)
+            // plain-concept records are STACK-passed (slice-5.3 ABI), so the
+            // inner allocates ZERO concept_group arena nodes and there is
+            // nothing to reclaim — the reset is a genuine no-op here. So we
+            // simply evaluate the inner to rax and leave it there, PRESERVING
+            // rax. We must NOT reuse the streaming reset (emit_streaming_bytes_body's
+            // ArenaScope arm), which clobbers rax via `pop rax`. gen0's bytes are
+            // never byte-compared to gen1/gen2 (only gen1==gen2 is pinned), so
+            // this needs functional correctness (the returned number == the
+            // inner's value), not byte-identity with the self-hosted arm. The
+            // r14-reset reclaim that actually saves RSS lives in the self-hosted
+            // x86_node arm (examples/vexprparse.verbose). See
+            // docs/self-hosting-scalar-arena-scope-design.md.
+            emit_eval_expr(
+                code, inner, input_name, offsets, all_rules,
+                field_ranges, text_bindings, self_call, arena_ctx,
+            )?;
+            Ok(())
         }
         Expr::AbortIf(_) => {
             // abort_if(...) is a streaming-bytes fail-closed gate; it has no
