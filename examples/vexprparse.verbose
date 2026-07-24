@@ -24259,7 +24259,7 @@ rule elf_program_src
     -- Effects tier slice 2a: the reaction list — used by reaction_errors (verify)
     -- AND by the has_reaction emit branch + blob_end_off sizing (emit).
     let rxs = parse_reactions(ProgramState { cell: toks, src: s.source })
-    let verrs = diag_count(prog_diags(ProgDiagsState { iter: prog, full: prog, src: s.source, idx: 0, concepts: concepts0 })) + purity_list(PurityListState { iter: prog, full: prog, src: s.source }) + term_list(TermListState { iter: prog, src: s.source }) + resource_errors(ResErrState { prog: prog, ress: ress, concepts: concepts0, src: s.source }) + reaction_errors(RxErrState { prog: prog, rxs: rxs, src: s.source })
+    let verrs = arena_scope(diag_count(prog_diags(ProgDiagsState { iter: prog, full: prog, src: s.source, idx: 0, concepts: concepts0 })) + purity_list(PurityListState { iter: prog, full: prog, src: s.source }) + term_list(TermListState { iter: prog, src: s.source }) + resource_errors(ResErrState { prog: prog, ress: ress, concepts: concepts0, src: s.source }) + reaction_errors(RxErrState { prog: prog, rxs: rxs, src: s.source }))
     let sizes = proc_sizes(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: ProcSizeList::PSNil, ress: ress, rxs: rxs })
     let uses_var = program_uses_arena(concepts)
     let anytx = prog_any_texty(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: sizes, ress: ress, rxs: rxs })
