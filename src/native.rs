@@ -23509,6 +23509,227 @@ rule le64_neg
         let _ = fs::remove_file(&gate);
     }
 
+    /// EFFECTS TIER slice 3 — THE MILESTONE: the self-hosted emitter compiles a
+    /// `connection` + `fetch(name, "literal")` program to a runnable ELF whose
+    /// STDOUT against a live TcpListener is byte-identical to verbosec's own
+    /// --native binary; with no listener both fail-closed (exit 1, empty stdout).
+    /// The ephemeral port is baked into a fresh source per scenario (parallel-safe).
+    /// Composition probes: length(fetch(...)) (value arm) and concat(..., fetch(...))
+    /// (stream arm).
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn self_hosted_fetch_matches_verbosec() {
+        use std::fs;
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+        use std::thread;
+        use std::time::Duration;
+
+        let src = fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        // gen0: the self-hosted emitter (argv channel — source on argv[1], pos on argv[2]).
+        let elf = std::env::temp_dir().join("verbosec_test_eff_s3_elf_program_src");
+        compile_native(&program, "elf_program_src", elf.to_str().unwrap(), false, false)
+            .expect("elf_program_src must compile natively");
+
+        let mk_hdrless = |port: u16, output: &str, logic: &str| -> String {
+            format!("connection upstream\n  host: \"127.0.0.1\"\n  port: {}\n  max_response: 1024\n  on_connect_error: abort\nconcept Tick\n  fields:\n    nonce : number [0, 1000000]\nrule check_health\n  input:\n    t : Tick\n  output:\n    {}\n  logic:\n    {}\n  proofs:\n    purity:\n      reads : [upstream]\n      calls : []\n    termination:\n      bound : 4", port, output, logic)
+        };
+        let mk_hdrfull = |port: u16, output: &str, logic: &str| -> String {
+            format!("@verbose 0.1.0\n\nconnection upstream\n  @intention: \"u\"\n  @source: invoices.intent:1\n  host: \"127.0.0.1\"\n  port: {}\n  max_response: 1024\n  on_connect_error: abort\n\nconcept Tick\n  @intention: \"t\"\n  @source: invoices.intent:1\n  fields:\n    nonce : number [0, 1000000]\n\nrule check_health\n  @intention: \"c\"\n  @source: invoices.intent:1\n  input:\n    t : Tick\n  output:\n    {}\n  logic:\n    {}\n  proofs:\n    purity:\n      reads : [upstream]\n      calls : []\n    termination:\n      bound : 4", port, output, logic)
+        };
+        let emit_self = |hdrless: &str, tag: &str| -> std::path::PathBuf {
+            let mc = Command::new(&elf).args([hdrless, "0"]).output().expect("spawn gen0");
+            assert!(mc.status.success() && mc.stdout.len() >= 4 && &mc.stdout[0..4] == b"\x7fELF",
+                "gen0 must emit an ELF for {}; got {:?} stderr={:?}", tag, mc.status, String::from_utf8_lossy(&mc.stderr));
+            let out = std::env::temp_dir().join(format!("verbosec_test_eff_s3_{}_self", tag));
+            fs::write(&out, &mc.stdout).unwrap();
+            let mut p = fs::metadata(&out).unwrap().permissions(); p.set_mode(0o755);
+            fs::set_permissions(&out, p).unwrap();
+            out
+        };
+        let emit_oracle = |hdrfull: &str, tag: &str| -> std::path::PathBuf {
+            let vt = crate::lexer::Lexer::new(hdrfull).tokenize().unwrap();
+            let vp = crate::parser::Parser::new(vt).parse_program().unwrap();
+            let out = std::env::temp_dir().join(format!("verbosec_test_eff_s3_{}_oracle", tag));
+            compile_native(&vp, "check_health", out.to_str().unwrap(), false, false)
+                .unwrap_or_else(|e| panic!("verbosec must compile the oracle: {}", e.message));
+            let mut p = fs::metadata(&out).unwrap().permissions(); p.set_mode(0o755);
+            fs::set_permissions(&out, p).unwrap();
+            out
+        };
+
+        let run_scenario = |output: &str, logic: &str, tag: &str, expected: &[u8]| {
+            let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind listener");
+            let port = listener.local_addr().unwrap().port();
+            listener.set_nonblocking(false).unwrap();
+            let server = thread::spawn(move || {
+                for _ in 0..2 {
+                    let (mut sock, _) = match listener.accept() { Ok(x) => x, Err(_) => return };
+                    sock.set_read_timeout(Some(Duration::from_secs(2))).ok();
+                    let mut req = [0u8; 1024];
+                    let _ = sock.read(&mut req);
+                    let _ = sock.write_all(b"HTTP/1.0 200 OK\r\n\r\nhealthy");
+                }
+            });
+            let selfb = emit_self(&mk_hdrless(port, output, logic), tag);
+            let oracleb = emit_oracle(&mk_hdrfull(port, output, logic), tag);
+            let rs = Command::new(&selfb).arg("0").output().expect("run self");
+            let ro = Command::new(&oracleb).arg("0").output().expect("run oracle");
+            let _ = server.join();
+            assert!(rs.status.success(), "self must exit 0 for {}; got {:?}", tag, rs.status);
+            assert_eq!(rs.stdout, expected,
+                "self stdout for {} = {:?}", tag, String::from_utf8_lossy(&rs.stdout));
+            assert_eq!(rs.stdout, ro.stdout,
+                "self vs verbosec stdout mismatch for {}: self={:?} oracle={:?}",
+                tag, String::from_utf8_lossy(&rs.stdout), String::from_utf8_lossy(&ro.stdout));
+            assert_eq!(rs.status.code(), ro.status.code(), "exit-code mismatch for {}", tag);
+            let _ = fs::remove_file(&selfb);
+            let _ = fs::remove_file(&oracleb);
+        };
+
+        // Milestone: bare fetch -> full response body (stream path).
+        run_scenario("body : text",
+            "body = fetch(upstream, \"GET /health HTTP/1.0\\r\\n\\r\\n\")",
+            "milestone", b"HTTP/1.0 200 OK\r\n\r\nhealthy\n");
+        // Value arm: length(fetch(...)) -> the response length (26).
+        run_scenario("n : number",
+            "n = length(fetch(upstream, \"GET /health HTTP/1.0\\r\\n\\r\\n\"))",
+            "lengthprobe", b"26\n");
+        // Stream arm: concat("body=", fetch(...)) -> prefixed body.
+        run_scenario("body : text",
+            "body = concat(\"body=\", fetch(upstream, \"GET /health HTTP/1.0\\r\\n\\r\\n\"))",
+            "concatprobe", b"body=HTTP/1.0 200 OK\r\n\r\nhealthy\n");
+
+        // Fail-closed: bind then DROP the listener so the port is closed; both exit 1.
+        let port_closed = {
+            let l = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let logic = "body = fetch(upstream, \"GET /health HTTP/1.0\\r\\n\\r\\n\")";
+        let selfb = emit_self(&mk_hdrless(port_closed, "body : text", logic), "failclosed");
+        let oracleb = emit_oracle(&mk_hdrfull(port_closed, "body : text", logic), "failclosed");
+        let rs = Command::new(&selfb).arg("0").output().expect("run self");
+        let ro = Command::new(&oracleb).arg("0").output().expect("run oracle");
+        assert!(!rs.status.success() && rs.stdout.is_empty(),
+            "self must fail-close on unreachable endpoint (exit non-zero, no stdout); got {:?}", rs.status);
+        assert_eq!(rs.status.code(), Some(1), "self must exit 1 on unreachable endpoint");
+        assert!(!ro.status.success() && ro.stdout.is_empty(),
+            "verbosec oracle must fail-close too; got {:?}", ro.status);
+        let _ = fs::remove_file(&selfb);
+        let _ = fs::remove_file(&oracleb);
+        let _ = fs::remove_file(&elf);
+    }
+
+    /// EFFECTS TIER slice 3 — verify gate pins. The self-hosted emitter's leading
+    /// abort_if(verrs) refuses (exit 1, empty stdout) every connection/fetch audit
+    /// violation; a clean health_check emits an ELF. count_purity_errors pins the
+    /// reads:-membership case directly.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn self_hosted_fetch_verify_gate() {
+        use std::fs;
+        use std::process::Command;
+
+        let src = fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let gate = std::env::temp_dir().join("verbosec_test_eff_s3_gate_emitter");
+        compile_native(&program, "elf_program_src", gate.to_str().unwrap(), false, false)
+            .expect("elf_program_src must compile natively");
+        let purity = std::env::temp_dir().join("verbosec_test_eff_s3_gate_purity");
+        compile_native(&program, "count_purity_errors", purity.to_str().unwrap(), false, false)
+            .expect("count_purity_errors must compile natively");
+
+        let run_gate = |prog: &str| -> std::process::Output {
+            Command::new(&gate).args([prog, "0"]).output().expect("spawn gate")
+        };
+        let purity_count = |prog: &str| -> i64 {
+            let o = Command::new(&purity).args([prog, "0"]).output().expect("spawn purity");
+            assert!(o.status.success(), "count_purity_errors must run");
+            String::from_utf8_lossy(&o.stdout).trim().parse::<i64>()
+                .unwrap_or_else(|_| panic!("purity count not an int: {:?}", o.stdout))
+        };
+        let refuse = |prog: &str, why: &str| {
+            let o = run_gate(prog);
+            assert!(!o.status.success() && o.stdout.is_empty(),
+                "gate must refuse ({}) with exit 1 + no output; got {:?} stdout={:?}",
+                why, o.status, String::from_utf8_lossy(&o.stdout));
+        };
+
+        let conn = "connection upstream\n  host: \"127.0.0.1\"\n  port: 8080\n  max_response: 1024\n  on_connect_error: abort\n";
+        let tick = "concept Tick\n  fields:\n    n : number\n";
+        let fetch_rule = |reads: &str, logic: &str| -> String {
+            format!("rule check\n  input:\n    t : Tick\n  output:\n    body : text\n  logic:\n    {}\n  proofs:\n    purity:\n      reads : {}\n      calls : []\n    termination:\n      bound : 4\n", logic, reads)
+        };
+        let fetch_lit = "body = fetch(upstream, \"GET /x HTTP/1.0\\r\\n\\r\\n\")";
+
+        // (a) undeclared connection: fetch(upstream, ..) with NO connection decl.
+        refuse(&format!("{}{}", tick, fetch_rule("[upstream]", fetch_lit)),
+            "undeclared connection");
+
+        // (b) fetch without upstream in reads: -> purity violation.
+        let missing_reads = format!("{}{}{}", conn, tick, fetch_rule("[]", fetch_lit));
+        refuse(&missing_reads, "fetch missing from reads:");
+        assert!(purity_count(&missing_reads) > 0,
+            "count_purity_errors must be > 0 for the fetch-missing-reads program");
+
+        // (c) non-literal request (concat, not a string literal).
+        refuse(&format!("{}{}{}", conn, tick,
+            fetch_rule("[upstream]", "body = fetch(upstream, concat(\"a\", \"b\"))")),
+            "non-literal request");
+
+        // (d) malformed host (not a dotted-quad IPv4).
+        refuse(&format!("connection upstream\n  host: \"999.0.0.1\"\n  port: 8080\n  max_response: 1024\n  on_connect_error: abort\n{}{}",
+            tick, fetch_rule("[upstream]", fetch_lit)), "malformed host");
+
+        // (e) port 0.
+        refuse(&format!("connection upstream\n  host: \"127.0.0.1\"\n  port: 0\n  max_response: 1024\n  on_connect_error: abort\n{}{}",
+            tick, fetch_rule("[upstream]", fetch_lit)), "port 0");
+
+        // (f) oversized max_response (> 65520).
+        refuse(&format!("connection upstream\n  host: \"127.0.0.1\"\n  port: 8080\n  max_response: 70000\n  on_connect_error: abort\n{}{}",
+            tick, fetch_rule("[upstream]", fetch_lit)), "oversized max_response");
+
+        // (g) duplicate connection name.
+        refuse(&format!("{}{}{}{}", conn, conn, tick, fetch_rule("[upstream]", fetch_lit)),
+            "duplicate connection name");
+
+        // (h) connection name colliding with a resource name.
+        refuse(&format!("resource upstream\n  path: \"/tmp/vx_s3_collide.txt\"\n  max: 8\n  on_read_error: abort\n{}{}{}",
+            conn, tick, fetch_rule("[upstream]", fetch_lit)),
+            "connection name == resource name");
+
+        // (i) two fetches of the same connection in one rule.
+        refuse(&format!("{}{}{}", conn, tick,
+            fetch_rule("[upstream]", "body = concat(fetch(upstream, \"a\"), fetch(upstream, \"b\"))")),
+            "two fetches same connection one rule");
+
+        // (j) fetch + reaction (refused via ast_uses_src_base -> reaction_errors).
+        let fetch_plus_reaction = format!(
+            "{}concept Tick\n  fields:\n    n : number\nrule flag\n  input:\n    t : Tick\n  output:\n    f : bool\n  logic:\n    f = t.n < 5\n  proofs:\n    purity:\n      reads : [t.n]\n      calls : []\n    termination:\n      bound : 1\nrule probe\n  input:\n    t : Tick\n  output:\n    body : text\n  logic:\n    {}\n  proofs:\n    purity:\n      reads : [upstream]\n      calls : []\n    termination:\n      bound : 4\nreaction r\n  trigger: flag\n  effects:\n    append_file \"/tmp/vx_s3_r.log\" \"y\\n\"",
+            conn, fetch_lit);
+        refuse(&fetch_plus_reaction, "fetch + reaction");
+
+        // Clean health_check: declared + listed -> gate emits an ELF.
+        let clean = format!("{}{}{}", conn, tick, fetch_rule("[upstream]", fetch_lit));
+        let o = run_gate(&clean);
+        assert!(o.status.success(),
+            "gate must emit the clean health_check; got {:?} stderr={:?}", o.status, String::from_utf8_lossy(&o.stderr));
+        assert_eq!(&o.stdout[0..4], &[0x7f, 0x45, 0x4c, 0x46], "clean health_check must emit an ELF");
+        assert_eq!(purity_count(&clean), 0, "count_purity_errors must be 0 for the clean program");
+
+        let _ = fs::remove_file(&gate);
+        let _ = fs::remove_file(&purity);
+    }
+
     /// Brick b6 — the four missing binary operators in the machine-code
     /// generator: division `/` (op 16), modulo `%` (op 17), logical `and`
     /// (op 30), logical `or` (op 31). Both the closed-expression path
@@ -38543,12 +38764,32 @@ rule two
         // pos argv arg. Returns the integer count_rules prints.
         let run = |blob: &[u8]| -> i64 {
             use std::io::Write;
-            let mut child = std::process::Command::new(&bin)
-                .arg("0")
+            use std::os::unix::process::CommandExt;
+            extern "C" {
+                fn getrlimit(resource: i32, rlim: *mut [u64; 2]) -> i32;
+                fn setrlimit(resource: i32, rlim: *const [u64; 2]) -> i32;
+            }
+            let mut cmd = std::process::Command::new(&bin);
+            cmd.arg("0")
                 .stdin(std::process::Stdio::piped())
-                .stdout(std::process::Stdio::piped())
-                .spawn()
-                .expect("spawn --stdin-raw binary");
+                .stdout(std::process::Stdio::piped());
+            unsafe {
+                // RLIMIT_STACK = 3: raise the soft stack limit to the hard limit so
+                // begin_tokenize's per-token recursion over the ~1.4 MB self-source
+                // does not overflow the default 8 MiB stack. This mirrors the
+                // `ulimit -s unlimited` convention the two_generation tests use,
+                // applied per spawned child (the self-source grows every slice).
+                cmd.pre_exec(|| {
+                    const RLIMIT_STACK: i32 = 3;
+                    let mut lim: [u64; 2] = [0, 0];
+                    if getrlimit(RLIMIT_STACK, &mut lim) == 0 {
+                        lim[0] = lim[1];
+                        setrlimit(RLIMIT_STACK, &lim);
+                    }
+                    Ok(())
+                });
+            }
+            let mut child = cmd.spawn().expect("spawn --stdin-raw binary");
             child
                 .stdin
                 .as_mut()
