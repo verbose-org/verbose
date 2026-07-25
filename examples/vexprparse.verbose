@@ -21455,7 +21455,7 @@ rule ast_is_texty
       AstNeg(inner) => 0
       AstNot(inner) => 0
       AstField(base, fstart, flen) => 0
-      AstCall(callee_start, callee_len, args) => if span_is_concat(SpanCheck { src: ts.src, start: callee_start, len: callee_len }) == 1 then 1 else if span_is_le32(SpanCheck { src: ts.src, start: callee_start, len: callee_len }) == 1 then 1 else if span_is_le64(SpanCheck { src: ts.src, start: callee_start, len: callee_len }) == 1 then 1 else if span_is_byte_at(SpanCheck { src: ts.src, start: callee_start, len: callee_len }) == 1 then 0 else if span_is_length(SpanCheck { src: ts.src, start: callee_start, len: callee_len }) == 1 then 0 else if span_is_substring(SpanCheck { src: ts.src, start: callee_start, len: callee_len }) == 1 then 0 else ast_texty_shallow(PrintState { node: block_result(rd_body(find_rule(FindRuleState { rules: ts.prog, src: ts.src, q_start: callee_start, q_len: callee_len }))), src: ts.src })
+      AstCall(callee_start, callee_len, args) => if span_is_concat(SpanCheck { src: ts.src, start: callee_start, len: callee_len }) == 1 then 1 else if span_is_fetch(SpanCheck { src: ts.src, start: callee_start, len: callee_len }) == 1 then 1 else if span_is_le32(SpanCheck { src: ts.src, start: callee_start, len: callee_len }) == 1 then 1 else if span_is_le64(SpanCheck { src: ts.src, start: callee_start, len: callee_len }) == 1 then 1 else if span_is_byte_at(SpanCheck { src: ts.src, start: callee_start, len: callee_len }) == 1 then 0 else if span_is_length(SpanCheck { src: ts.src, start: callee_start, len: callee_len }) == 1 then 0 else if span_is_substring(SpanCheck { src: ts.src, start: callee_start, len: callee_len }) == 1 then 0 else ast_texty_shallow(PrintState { node: block_result(rd_body(find_rule(FindRuleState { rules: ts.prog, src: ts.src, q_start: callee_start, q_len: callee_len }))), src: ts.src })
       AstIf(cond, thn, els) => if ast_is_texty(TextyState { node: thn, src: ts.src, prog: ts.prog }) == 1 then 1 else ast_is_texty(TextyState { node: els, src: ts.src, prog: ts.prog })
       AstVariant(cstart, clen, vstart, vlen, fields) => 0
       AstMatch(scrut, arms) => arms_is_texty(TextyArms { arms: arms, src: ts.src, prog: ts.prog })
@@ -21488,7 +21488,7 @@ rule ast_is_texty
   proofs:
     purity:
       reads : [ts.node, ts.src, ts.prog]
-      calls : [span_is_concat, span_is_le32, span_is_le64, span_is_byte_at, span_is_length, span_is_substring, ast_texty_shallow, block_result, rd_body, find_rule, ast_is_texty, arms_is_texty]
+      calls : [span_is_concat, span_is_fetch, span_is_le32, span_is_le64, span_is_byte_at, span_is_length, span_is_substring, ast_texty_shallow, block_result, rd_body, find_rule, ast_is_texty, arms_is_texty]
     termination:
       bound : 8000
 
@@ -22783,7 +22783,7 @@ rule code_size_node
       -- push), substring = 38 (pops + split + two bounds checks + repack + OOB block).
       -- A wrong arity emits ONLY `push 0` (2 bytes) — oracle parity with eval's
       -- defensive VNum 0, no argument code at all.
-      AstCall(callee_start, callee_len, args) => if span_is_byte_at(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then (if arg_list_len(args) == 2 then code_size_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}) + 36 else 2) else if span_is_length(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then (if arg_list_len(args) == 1 then code_size_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}) + 4 else 2) else if span_is_substring(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then (if arg_list_len(args) == 3 then code_size_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}) + 38 else 2) else if span_is_max(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then (if arg_list_len(args) == 2 then code_size_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}) + 10 else 2) else if span_is_min(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then (if arg_list_len(args) == 2 then code_size_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}) + 10 else 2) else if span_is_arena_scope(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then 6 + code_size_node(ByteGenState { node: arg_first(args), src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}) else if span_is_abort_if(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then 1 else if span_is_concat(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then 1 else if span_is_read(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then (if arg_list_len(args) == 1 then (if resource_index_of(ResIdxState { ress: bg.ress, src: bg.src, q_start: ast_var_start(arg_first(args)), q_len: ast_var_len(arg_first(args)), idx: 0 }) >= 0 then 14 else 1) else 2) else if callee_is_texty(FindRuleState { rules: bg.prog, src: bg.src, q_start: callee_start, q_len: callee_len }) == 1 then 1 else code_size_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}) + 13
+      AstCall(callee_start, callee_len, args) => if span_is_byte_at(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then (if arg_list_len(args) == 2 then code_size_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}) + 36 else 2) else if span_is_length(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then (if arg_list_len(args) == 1 then code_size_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}) + 4 else 2) else if span_is_substring(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then (if arg_list_len(args) == 3 then code_size_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}) + 38 else 2) else if span_is_max(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then (if arg_list_len(args) == 2 then code_size_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}) + 10 else 2) else if span_is_min(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then (if arg_list_len(args) == 2 then code_size_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}) + 10 else 2) else if span_is_arena_scope(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then 6 + code_size_node(ByteGenState { node: arg_first(args), src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}) else if span_is_abort_if(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then 1 else if span_is_concat(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then 1 else if span_is_read(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then (if arg_list_len(args) == 1 then (if resource_index_of(ResIdxState { ress: bg.ress, src: bg.src, q_start: ast_var_start(arg_first(args)), q_len: ast_var_len(arg_first(args)), idx: 0 }) >= 0 then 14 else 1) else 2) else if span_is_fetch(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then (if arg_list_len(args) == 2 then (if connection_index_of(ConnIdxState { conns: bg.conns, src: bg.src, q_start: ast_var_start(arg_first(args)), q_len: ast_var_len(arg_first(args)), idx: 0 }) >= 0 then 14 else 1) else 2) else if callee_is_texty(FindRuleState { rules: bg.prog, src: bg.src, q_start: callee_start, q_len: callee_len }) == 1 then 1 else code_size_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}) + 13
       -- Text values slice 2: a string literal is one packed-span push —
       -- mov rax, imm64 (10) + push rax (1) = 11, same shape as AstNum.
       AstStr(start, len) => 11
@@ -22836,7 +22836,7 @@ rule code_size_node
   proofs:
     purity:
       reads : [bg.node, bg.src, bg.off, bg.params, bg.lets, bg.prog, bg.concepts, bg.sizes, bg.ress, bg.conns]
-      calls : [code_size_node, code_size_args, code_size_vfields, vfield_len, arm_list_len, code_size_arms, static_concept_of, span_is_byte_at, span_is_length, span_is_substring, span_is_max, span_is_min, span_is_arena_scope, span_is_abort_if, span_is_concat, span_is_read, resource_index_of, ast_var_start, ast_var_len, arg_first, callee_is_texty, arg_list_len, lets_append_binders, coll_elem_nfields, lets_append_elem_binders, cd_name_start, cd_name_len, concept_at_index]
+      calls : [code_size_node, code_size_args, code_size_vfields, vfield_len, arm_list_len, code_size_arms, static_concept_of, span_is_byte_at, span_is_length, span_is_substring, span_is_max, span_is_min, span_is_arena_scope, span_is_abort_if, span_is_concat, span_is_read, resource_index_of, ast_var_start, ast_var_len, arg_first, callee_is_texty, arg_list_len, lets_append_binders, coll_elem_nfields, lets_append_elem_binders, cd_name_start, cd_name_len, concept_at_index, span_is_fetch, connection_index_of]
     termination:
       bound : 8000
 
@@ -23131,7 +23131,7 @@ rule x86_node
       --     32 ; sub rcx, rdx ; or rax, rcx ; push rax ; jmp +3 ; OOB: xor eax,
       --     eax ; push rax. Pure span arithmetic — no memory touch, no src_base.
       -- A wrong arity emits ONLY push 0 (6a 00, 2 bytes) — eval's defensive VNum 0.
-      AstCall(callee_start, callee_len, args) => if span_is_byte_at(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then (if arg_list_len(args) == 2 then concat(x86_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}), b"\x59\x58\x89\xc2\x48\xc1\xe8\x20\x48\x39\xd1\x73\x14\x48\x01\xc8\x48\xba", le64(4194304 + blob_end_off(ProgGenState { rules: bg.prog, src: bg.src, off: 0, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress, conns: bg.conns, rxs: ReactionList::RxNil })), b"\x0f\xb6\x04\x02\x50\xeb\x03\x31\xc0\x50") else b"\x6a\x00") else if span_is_length(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then (if arg_list_len(args) == 1 then concat(x86_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}), b"\x58\x89\xc0\x50") else b"\x6a\x00") else if span_is_substring(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then (if arg_list_len(args) == 3 then concat(x86_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}), b"\x59\x5a\x58\x89\xc6\x48\xc1\xe8\x20\x48\x39\xca\x77\x15\x48\x39\xf1\x77\x10\x48\x01\xd0\x48\xc1\xe0\x20\x48\x29\xd1\x48\x09\xc8\x50\xeb\x03\x31\xc0\x50") else b"\x6a\x00") else if span_is_max(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then (if arg_list_len(args) == 2 then concat(x86_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}), b"\x59\x58\x48\x39\xc8\x48\x0f\x4c\xc1\x50") else b"\x6a\x00") else if span_is_min(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then (if arg_list_len(args) == 2 then concat(x86_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}), b"\x59\x58\x48\x39\xc8\x48\x0f\x4f\xc1\x50") else b"\x6a\x00") else if span_is_arena_scope(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then concat(b"\x41\x56", x86_node(ByteGenState { node: arg_first(args), src: bg.src, off: bg.off + 2, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}), b"\x58\x41\x5e\x50") else if span_is_abort_if(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then b"\xcc" else if span_is_concat(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then b"\xcc" else if span_is_read(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then (if arg_list_len(args) == 1 then (if resource_index_of(ResIdxState { ress: bg.ress, src: bg.src, q_start: ast_var_start(arg_first(args)), q_len: ast_var_len(arg_first(args)), idx: 0 }) >= 0 then concat(b"\x48\xb8", le64(541065216 + 65536 * resource_index_of(ResIdxState { ress: bg.ress, src: bg.src, q_start: ast_var_start(arg_first(args)), q_len: ast_var_len(arg_first(args)), idx: 0 })), b"\x48\x8b\x00\x50") else b"\xcc") else b"\x6a\x00") else if callee_is_texty(FindRuleState { rules: bg.prog, src: bg.src, q_start: callee_start, q_len: callee_len }) == 1 then b"\xcc" else concat(x86_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}), b"\xe8", le32(proc_offset(ProcOffState { rules: bg.prog, src: bg.src, acc: 0, q_start: callee_start, q_len: callee_len, concepts: bg.concepts, sizes: bg.sizes }) - (bg.off + arena_scope(code_size_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns})) + 5)), b"\x48\x81\xc4", le32(8 * arg_list_len(args)), b"\x50")
+      AstCall(callee_start, callee_len, args) => if span_is_byte_at(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then (if arg_list_len(args) == 2 then concat(x86_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}), b"\x59\x58\x89\xc2\x48\xc1\xe8\x20\x48\x39\xd1\x73\x14\x48\x01\xc8\x48\xba", le64(4194304 + blob_end_off(ProgGenState { rules: bg.prog, src: bg.src, off: 0, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress, conns: bg.conns, rxs: ReactionList::RxNil })), b"\x0f\xb6\x04\x02\x50\xeb\x03\x31\xc0\x50") else b"\x6a\x00") else if span_is_length(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then (if arg_list_len(args) == 1 then concat(x86_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}), b"\x58\x89\xc0\x50") else b"\x6a\x00") else if span_is_substring(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then (if arg_list_len(args) == 3 then concat(x86_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}), b"\x59\x5a\x58\x89\xc6\x48\xc1\xe8\x20\x48\x39\xca\x77\x15\x48\x39\xf1\x77\x10\x48\x01\xd0\x48\xc1\xe0\x20\x48\x29\xd1\x48\x09\xc8\x50\xeb\x03\x31\xc0\x50") else b"\x6a\x00") else if span_is_max(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then (if arg_list_len(args) == 2 then concat(x86_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}), b"\x59\x58\x48\x39\xc8\x48\x0f\x4c\xc1\x50") else b"\x6a\x00") else if span_is_min(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then (if arg_list_len(args) == 2 then concat(x86_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}), b"\x59\x58\x48\x39\xc8\x48\x0f\x4f\xc1\x50") else b"\x6a\x00") else if span_is_arena_scope(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then concat(b"\x41\x56", x86_node(ByteGenState { node: arg_first(args), src: bg.src, off: bg.off + 2, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}), b"\x58\x41\x5e\x50") else if span_is_abort_if(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then b"\xcc" else if span_is_concat(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then b"\xcc" else if span_is_read(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then (if arg_list_len(args) == 1 then (if resource_index_of(ResIdxState { ress: bg.ress, src: bg.src, q_start: ast_var_start(arg_first(args)), q_len: ast_var_len(arg_first(args)), idx: 0 }) >= 0 then concat(b"\x48\xb8", le64(541065216 + 65536 * resource_index_of(ResIdxState { ress: bg.ress, src: bg.src, q_start: ast_var_start(arg_first(args)), q_len: ast_var_len(arg_first(args)), idx: 0 })), b"\x48\x8b\x00\x50") else b"\xcc") else b"\x6a\x00") else if span_is_fetch(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then (if arg_list_len(args) == 2 then (if connection_index_of(ConnIdxState { conns: bg.conns, src: bg.src, q_start: ast_var_start(arg_first(args)), q_len: ast_var_len(arg_first(args)), idx: 0 }) >= 0 then concat(b"\x48\xb8", le64(542113792 + 65536 * connection_index_of(ConnIdxState { conns: bg.conns, src: bg.src, q_start: ast_var_start(arg_first(args)), q_len: ast_var_len(arg_first(args)), idx: 0 })), b"\x48\x8b\x00\x50") else b"\xcc") else b"\x6a\x00") else if callee_is_texty(FindRuleState { rules: bg.prog, src: bg.src, q_start: callee_start, q_len: callee_len }) == 1 then b"\xcc" else concat(x86_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}), b"\xe8", le32(proc_offset(ProcOffState { rules: bg.prog, src: bg.src, acc: 0, q_start: callee_start, q_len: callee_len, concepts: bg.concepts, sizes: bg.sizes }) - (bg.off + arena_scope(code_size_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns})) + 5)), b"\x48\x81\xc4", le32(8 * arg_list_len(args)), b"\x50")
       -- Text values slice 2: a string literal compiles to ONE packed i64 —
       -- (start+1) * 2^32 + (len-2), quotes stripped, the SAME numbers as eval's
       -- VText (the token span includes both quotes; a lone-quote token packs len
@@ -23230,7 +23230,7 @@ rule x86_node
   proofs:
     purity:
       reads : [bg.node, bg.src, bg.off, bg.params, bg.lets, bg.prog, bg.concepts, bg.sizes, bg.ress, bg.conns]
-      calls : [x86_node, code_size_node, x86_args, code_size_args, param_index, let_index, param_list_len, proc_offset, arg_list_len, x86_vfields, x86_vpops, vfield_len, max_payload_fields, variant_tag, x86_dispatch, x86_arms, code_size_arms, arm_list_len, static_concept_of, field_index_of, cd_fields, concept_at_index, span_is_byte_at, span_is_length, span_is_substring, span_is_max, span_is_min, span_is_arena_scope, span_is_abort_if, span_is_concat, span_is_read, resource_index_of, ast_var_start, ast_var_len, arg_first, callee_is_texty, blob_end_off, lets_append_binders, x86_binder_loads, count_binds, coll_elem_nfields, lets_append_elem_binders, cd_name_start, cd_name_len, x86_elem_load]
+      calls : [x86_node, code_size_node, x86_args, code_size_args, param_index, let_index, param_list_len, proc_offset, arg_list_len, x86_vfields, x86_vpops, vfield_len, max_payload_fields, variant_tag, x86_dispatch, x86_arms, code_size_arms, arm_list_len, static_concept_of, field_index_of, cd_fields, concept_at_index, span_is_byte_at, span_is_length, span_is_substring, span_is_max, span_is_min, span_is_arena_scope, span_is_abort_if, span_is_concat, span_is_read, resource_index_of, ast_var_start, ast_var_len, arg_first, callee_is_texty, blob_end_off, lets_append_binders, x86_binder_loads, count_binds, coll_elem_nfields, lets_append_elem_binders, cd_name_start, cd_name_len, x86_elem_load, span_is_fetch, connection_index_of]
     termination:
       bound : 8000
 
@@ -23410,11 +23410,11 @@ rule code_size_stream_node
       AstFilter(coll, item_start, item_len, body) => if coll_elem_nfields(StaticConceptState { node: coll, src: bg.src, params: bg.params, lets: bg.lets, concepts: bg.concepts }) > 0 then code_size_filter_record(CollRecState { coll: coll, item_start: item_start, item_len: item_len, body: body, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}) else (code_size_node(ByteGenState { node: coll, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}) + code_size_node(ByteGenState { node: body, src: bg.src, off: 0, params: bg.params, lets: lets_append_binders(AppendBindersState { lets: bg.lets, bs: BinderList::BindCons { start: item_start, len: item_len, rest: BinderList::BindCons { start: 0, len: 0, rest: BinderList::BindNil } } }), prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}) + 213)
       AstMinFold(coll, item_start, item_len, body) => 1
       AstMaxFold(coll, item_start, item_len, body) => 1
-      AstCall(callee_start, callee_len, args) => if span_is_concat(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then stream_size_cargs(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}) else if span_is_arena_scope(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then 2 + code_size_stream_node(ByteGenState { node: arg_first(args), src: bg.src, off: bg.off + 2, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}) + 2 else if span_is_abort_if(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then code_size_node(ByteGenState { node: arg_first(args), src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}) + 22 else if span_is_le32(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then code_size_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}) + 34 else if span_is_le64(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then code_size_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}) + 34 else if span_is_substring(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then 1 else if span_is_byte_at(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then code_size_node(bg) + 6 else if span_is_length(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then code_size_node(bg) + 6 else if span_is_read(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then (if arg_list_len(args) == 1 then (if resource_index_of(ResIdxState { ress: bg.ress, src: bg.src, q_start: ast_var_start(arg_first(args)), q_len: ast_var_len(arg_first(args)), idx: 0 }) >= 0 then 50 else 1) else 1) else if callee_is_texty(FindRuleState { rules: bg.prog, src: bg.src, q_start: callee_start, q_len: callee_len }) == 1 then code_size_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}) + 12 else code_size_node(bg) + 6
+      AstCall(callee_start, callee_len, args) => if span_is_concat(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then stream_size_cargs(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}) else if span_is_arena_scope(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then 2 + code_size_stream_node(ByteGenState { node: arg_first(args), src: bg.src, off: bg.off + 2, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}) + 2 else if span_is_abort_if(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then code_size_node(ByteGenState { node: arg_first(args), src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}) + 22 else if span_is_le32(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then code_size_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}) + 34 else if span_is_le64(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then code_size_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}) + 34 else if span_is_substring(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then 1 else if span_is_byte_at(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then code_size_node(bg) + 6 else if span_is_length(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then code_size_node(bg) + 6 else if span_is_read(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then (if arg_list_len(args) == 1 then (if resource_index_of(ResIdxState { ress: bg.ress, src: bg.src, q_start: ast_var_start(arg_first(args)), q_len: ast_var_len(arg_first(args)), idx: 0 }) >= 0 then 50 else 1) else 1) else if span_is_fetch(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then (if arg_list_len(args) == 2 then (if connection_index_of(ConnIdxState { conns: bg.conns, src: bg.src, q_start: ast_var_start(arg_first(args)), q_len: ast_var_len(arg_first(args)), idx: 0 }) >= 0 then 50 else 1) else 1) else if callee_is_texty(FindRuleState { rules: bg.prog, src: bg.src, q_start: callee_start, q_len: callee_len }) == 1 then code_size_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}) + 12 else code_size_node(bg) + 6
   proofs:
     purity:
       reads : [bg, bg.node, bg.src, bg.off, bg.params, bg.lets, bg.prog, bg.concepts, bg.sizes, bg.ress, bg.conns]
-      calls : [code_size_node, code_size_stream_node, stream_size_cargs, stream_size_arms, code_size_args, param_index, param_ty, let_index, arm_list_len, span_is_concat, span_is_arena_scope, span_is_abort_if, arg_first, span_is_le32, span_is_le64, span_is_substring, span_is_byte_at, span_is_length, span_is_read, resource_index_of, ast_var_start, ast_var_len, arg_list_len, callee_is_texty, bytelit_decoded_len, coll_elem_nfields, lets_append_binders, fold_stream_ok, ast_call_args, arg_rest, fold_size_cargs, lets_append_elem_binders, static_concept_of, cd_name_start, cd_name_len, concept_at_index, map_out_nf, code_size_map_record, code_size_filter_record]
+      calls : [code_size_node, code_size_stream_node, stream_size_cargs, stream_size_arms, code_size_args, param_index, param_ty, let_index, arm_list_len, span_is_concat, span_is_arena_scope, span_is_abort_if, arg_first, span_is_le32, span_is_le64, span_is_substring, span_is_byte_at, span_is_length, span_is_read, resource_index_of, ast_var_start, ast_var_len, arg_list_len, callee_is_texty, bytelit_decoded_len, coll_elem_nfields, lets_append_binders, fold_stream_ok, ast_call_args, arg_rest, fold_size_cargs, lets_append_elem_binders, static_concept_of, cd_name_start, cd_name_len, concept_at_index, map_out_nf, code_size_map_record, code_size_filter_record, span_is_fetch, connection_index_of]
     termination:
       bound : 8000
 
@@ -23915,11 +23915,11 @@ rule x86_stream_node
       AstFilter(coll, item_start, item_len, body) => if coll_elem_nfields(StaticConceptState { node: coll, src: bg.src, params: bg.params, lets: bg.lets, concepts: bg.concepts }) > 0 then x86_filter_record(CollRecState { coll: coll, item_start: item_start, item_len: item_len, body: body, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}) else concat(x86_node(ByteGenState { node: coll, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}), b"\x41\x59\x49\x8b\x31", b"\x48\x31\xc0\x45\x31\xdb\x8a\x0e\x80\xf9\x2d\x75\x06\x41\xb3\x01\x48\xff\xc6\x0f\xb6\x0e\x80\xf9\x30\x72\x15\x80\xf9\x39\x77\x10\x48\x6b\xc0\x0a\x48\x83\xe9\x30\x48\x01\xc8\x48\xff\xc6\xeb\xe3\x4d\x85\xdb\x74\x03\x48\xf7\xd8", b"\x49\x89\xc0\x49\x83\xc1\x08", b"\x4d\x85\xc0\x0f\x84", le32(136 + arena_scope(code_size_node(ByteGenState { node: body, src: bg.src, off: 0, params: bg.params, lets: lets_append_binders(AppendBindersState { lets: bg.lets, bs: BinderList::BindCons { start: item_start, len: item_len, rest: BinderList::BindCons { start: 0, len: 0, rest: BinderList::BindNil } } }), prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}))), b"\x49\x8b\x31", b"\x48\x31\xc0\x45\x31\xdb\x8a\x0e\x80\xf9\x2d\x75\x06\x41\xb3\x01\x48\xff\xc6\x0f\xb6\x0e\x80\xf9\x30\x72\x15\x80\xf9\x39\x77\x10\x48\x6b\xc0\x0a\x48\x83\xe9\x30\x48\x01\xc8\x48\xff\xc6\xeb\xe3\x4d\x85\xdb\x74\x03\x48\xf7\xd8", b"\x48\x89\x85", le32(0 - 8 * (count_binds(bg.lets) + 1)), x86_node(ByteGenState { node: body, src: bg.src, off: bg.off + arena_scope(code_size_node(ByteGenState { node: coll, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns})) + 143, params: bg.params, lets: lets_append_binders(AppendBindersState { lets: bg.lets, bs: BinderList::BindCons { start: item_start, len: item_len, rest: BinderList::BindCons { start: 0, len: 0, rest: BinderList::BindNil } } }), prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}), b"\x58\x48\x85\xc0\x0f\x84", le32(48), b"\x48\x8b\x85", le32(0 - 8 * (count_binds(bg.lets) + 1)), b"\x41\x51\xe8", le32(0 - (bg.off + arena_scope(code_size_node(ByteGenState { node: coll, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns})) + arena_scope(code_size_node(ByteGenState { node: body, src: bg.src, off: 0, params: bg.params, lets: lets_append_binders(AppendBindersState { lets: bg.lets, bs: BinderList::BindCons { start: item_start, len: item_len, rest: BinderList::BindCons { start: 0, len: 0, rest: BinderList::BindNil } } }), prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns})) + 253)), b"\x6a\x0a\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x48\x89\xe6\x48\xc7\xc2\x01\x00\x00\x00\x0f\x05\x48\x83\xc4\x08", b"\x41\x59", b"\x49\x83\xc1\x08\x49\xff\xc8\xe9", le32(0 - (145 + arena_scope(code_size_node(ByteGenState { node: body, src: bg.src, off: 0, params: bg.params, lets: lets_append_binders(AppendBindersState { lets: bg.lets, bs: BinderList::BindCons { start: item_start, len: item_len, rest: BinderList::BindCons { start: 0, len: 0, rest: BinderList::BindNil } } }), prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns})))))
       AstMinFold(coll, item_start, item_len, body) => b"\xcc"
       AstMaxFold(coll, item_start, item_len, body) => b"\xcc"
-      AstCall(callee_start, callee_len, args) => if span_is_concat(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then x86_stream_cargs(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}) else if span_is_arena_scope(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then concat(b"\x41\x56", x86_stream_node(ByteGenState { node: arg_first(args), src: bg.src, off: bg.off + 2, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}), b"\x41\x5e") else if span_is_abort_if(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then concat(x86_node(ByteGenState { node: arg_first(args), src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}), b"\x58\x48\x85\xc0\x74\x10\x48\xc7\xc0\x3c\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05") else if span_is_le32(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then concat(x86_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}), b"\x58\x48\x89\x44\x24\xf8\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x48\x8d\x74\x24\xf8\x48\xc7\xc2\x04\x00\x00\x00\x0f\x05") else if span_is_le64(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then concat(x86_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}), b"\x58\x48\x89\x44\x24\xf8\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x48\x8d\x74\x24\xf8\x48\xc7\xc2\x08\x00\x00\x00\x0f\x05") else if span_is_substring(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then b"\xcc" else if span_is_byte_at(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then concat(x86_node(bg), b"\x58\xe8", le32(0 - (bg.off + arena_scope(code_size_node(bg)) + 92))) else if span_is_length(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then concat(x86_node(bg), b"\x58\xe8", le32(0 - (bg.off + arena_scope(code_size_node(bg)) + 92))) else if span_is_read(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then (if arg_list_len(args) == 1 then (if resource_index_of(ResIdxState { ress: bg.ress, src: bg.src, q_start: ast_var_start(arg_first(args)), q_len: ast_var_len(arg_first(args)), idx: 0 }) >= 0 then concat(b"\x48\xb8", le64(541065216 + 65536 * resource_index_of(ResIdxState { ress: bg.ress, src: bg.src, q_start: ast_var_start(arg_first(args)), q_len: ast_var_len(arg_first(args)), idx: 0 })), b"\x48\x8b\x00\x50", b"\x58\x89\xc2\x48\xc1\xe8\x20\x48\xbe", le64(4194304 + blob_end_off(ProgGenState { rules: bg.prog, src: bg.src, off: 0, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress, conns: bg.conns, rxs: ReactionList::RxNil })), b"\x48\x01\xc6\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05") else b"\xcc") else b"\xcc") else if callee_is_texty(FindRuleState { rules: bg.prog, src: bg.src, q_start: callee_start, q_len: callee_len }) == 1 then concat(x86_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}), b"\xe8", le32(proc_offset(ProcOffState { rules: bg.prog, src: bg.src, acc: 0, q_start: callee_start, q_len: callee_len, concepts: bg.concepts, sizes: bg.sizes }) - (bg.off + arena_scope(code_size_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns})) + 5)), b"\x48\x81\xc4", le32(8 * arg_list_len(args))) else concat(x86_node(bg), b"\x58\xe8", le32(0 - (bg.off + arena_scope(code_size_node(bg)) + 92)))
+      AstCall(callee_start, callee_len, args) => if span_is_concat(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then x86_stream_cargs(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}) else if span_is_arena_scope(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then concat(b"\x41\x56", x86_stream_node(ByteGenState { node: arg_first(args), src: bg.src, off: bg.off + 2, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}), b"\x41\x5e") else if span_is_abort_if(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then concat(x86_node(ByteGenState { node: arg_first(args), src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}), b"\x58\x48\x85\xc0\x74\x10\x48\xc7\xc0\x3c\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05") else if span_is_le32(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then concat(x86_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}), b"\x58\x48\x89\x44\x24\xf8\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x48\x8d\x74\x24\xf8\x48\xc7\xc2\x04\x00\x00\x00\x0f\x05") else if span_is_le64(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then concat(x86_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}), b"\x58\x48\x89\x44\x24\xf8\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x48\x8d\x74\x24\xf8\x48\xc7\xc2\x08\x00\x00\x00\x0f\x05") else if span_is_substring(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then b"\xcc" else if span_is_byte_at(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then concat(x86_node(bg), b"\x58\xe8", le32(0 - (bg.off + arena_scope(code_size_node(bg)) + 92))) else if span_is_length(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then concat(x86_node(bg), b"\x58\xe8", le32(0 - (bg.off + arena_scope(code_size_node(bg)) + 92))) else if span_is_read(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then (if arg_list_len(args) == 1 then (if resource_index_of(ResIdxState { ress: bg.ress, src: bg.src, q_start: ast_var_start(arg_first(args)), q_len: ast_var_len(arg_first(args)), idx: 0 }) >= 0 then concat(b"\x48\xb8", le64(541065216 + 65536 * resource_index_of(ResIdxState { ress: bg.ress, src: bg.src, q_start: ast_var_start(arg_first(args)), q_len: ast_var_len(arg_first(args)), idx: 0 })), b"\x48\x8b\x00\x50", b"\x58\x89\xc2\x48\xc1\xe8\x20\x48\xbe", le64(4194304 + blob_end_off(ProgGenState { rules: bg.prog, src: bg.src, off: 0, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress, conns: bg.conns, rxs: ReactionList::RxNil })), b"\x48\x01\xc6\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05") else b"\xcc") else b"\xcc") else if span_is_fetch(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then (if arg_list_len(args) == 2 then (if connection_index_of(ConnIdxState { conns: bg.conns, src: bg.src, q_start: ast_var_start(arg_first(args)), q_len: ast_var_len(arg_first(args)), idx: 0 }) >= 0 then concat(b"\x48\xb8", le64(542113792 + 65536 * connection_index_of(ConnIdxState { conns: bg.conns, src: bg.src, q_start: ast_var_start(arg_first(args)), q_len: ast_var_len(arg_first(args)), idx: 0 })), b"\x48\x8b\x00\x50", b"\x58\x89\xc2\x48\xc1\xe8\x20\x48\xbe", le64(4194304 + blob_end_off(ProgGenState { rules: bg.prog, src: bg.src, off: 0, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress, conns: bg.conns, rxs: ReactionList::RxNil })), b"\x48\x01\xc6\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05") else b"\xcc") else b"\xcc") else if callee_is_texty(FindRuleState { rules: bg.prog, src: bg.src, q_start: callee_start, q_len: callee_len }) == 1 then concat(x86_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}), b"\xe8", le32(proc_offset(ProcOffState { rules: bg.prog, src: bg.src, acc: 0, q_start: callee_start, q_len: callee_len, concepts: bg.concepts, sizes: bg.sizes }) - (bg.off + arena_scope(code_size_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns})) + 5)), b"\x48\x81\xc4", le32(8 * arg_list_len(args))) else concat(x86_node(bg), b"\x58\xe8", le32(0 - (bg.off + arena_scope(code_size_node(bg)) + 92)))
   proofs:
     purity:
       reads : [bg, bg.node, bg.src, bg.off, bg.params, bg.lets, bg.prog, bg.concepts, bg.sizes, bg.ress, bg.conns]
-      calls : [x86_node, code_size_node, x86_stream_node, code_size_stream_node, x86_stream_cargs, x86_stream_dispatch, x86_stream_arms, stream_size_arms, x86_args, code_size_args, param_index, param_ty, param_list_len, let_index, arm_list_len, max_payload_fields, proc_offset, arg_list_len, blob_end_off, span_is_concat, span_is_arena_scope, span_is_abort_if, arg_first, span_is_le32, span_is_le64, span_is_substring, span_is_byte_at, span_is_length, span_is_read, resource_index_of, ast_var_start, ast_var_len, callee_is_texty, bytelit_decoded_len, emit_bytes_data, coll_elem_nfields, lets_append_binders, count_binds, fold_stream_ok, ast_call_args, arg_rest, x86_fold_cargs, fold_size_cargs, x86_elem_load, lets_append_elem_binders, static_concept_of, cd_fields, cd_name_start, cd_name_len, concept_at_index, map_out_nf, x86_map_record, x86_filter_record]
+      calls : [x86_node, code_size_node, x86_stream_node, code_size_stream_node, x86_stream_cargs, x86_stream_dispatch, x86_stream_arms, stream_size_arms, x86_args, code_size_args, param_index, param_ty, param_list_len, let_index, arm_list_len, max_payload_fields, proc_offset, arg_list_len, blob_end_off, span_is_concat, span_is_arena_scope, span_is_abort_if, arg_first, span_is_le32, span_is_le64, span_is_substring, span_is_byte_at, span_is_length, span_is_read, resource_index_of, ast_var_start, ast_var_len, callee_is_texty, bytelit_decoded_len, emit_bytes_data, coll_elem_nfields, lets_append_binders, count_binds, fold_stream_ok, ast_call_args, arg_rest, x86_fold_cargs, fold_size_cargs, x86_elem_load, lets_append_elem_binders, static_concept_of, cd_fields, cd_name_start, cd_name_len, concept_at_index, map_out_nf, x86_map_record, x86_filter_record, span_is_fetch, connection_index_of]
     termination:
       bound : 8000
 
@@ -25182,11 +25182,11 @@ rule blob_end_off
     -- trampoline shape) MUST precede entry_rule_texty here EXACTLY as the
     -- emit-side dispatch in elf_program_src orders it (a map/filter body IS
     -- texty, so the 45 branch would otherwise win and desync p_filesz).
-    out = 120 + (if program_uses_arena(pg.concepts) == 1 then 66 else 0) + (if reaction_list_len(pg.rxs) > 0 then reaction_tramp_size(RxSizeState { rxs: pg.rxs, src: pg.src }) else (if entry_rule_result(pg) == 1 then 210 else if entry_rule_bytes(pg) == 1 then 17 else if entry_rule_collection(pg) == 1 then 17 else if entry_rule_texty(pg) == 1 then 45 else 101)) + (if prog_any_texty(pg) == 1 then 86 else 0) + msize + resource_marshal_size(RMarshSizeState { rem: pg.ress, src: pg.src, prog: pg.prog }) + ps_total(pg.sizes)
+    out = 120 + (if program_uses_arena(pg.concepts) == 1 then 66 else 0) + (if reaction_list_len(pg.rxs) > 0 then reaction_tramp_size(RxSizeState { rxs: pg.rxs, src: pg.src }) else (if entry_rule_result(pg) == 1 then 210 else if entry_rule_bytes(pg) == 1 then 17 else if entry_rule_collection(pg) == 1 then 17 else if entry_rule_texty(pg) == 1 then 45 else 101)) + (if prog_any_texty(pg) == 1 then 86 else 0) + msize + resource_marshal_size(RMarshSizeState { rem: pg.ress, src: pg.src, prog: pg.prog }) + connection_marshal_size(CMarshSizeState { rem: pg.conns, src: pg.src, prog: pg.prog }) + ps_total(pg.sizes)
   proofs:
     purity:
-      reads : [pg, pg.rules, pg.src, pg.concepts, pg.sizes, pg.ress, pg.prog, pg.rxs]
-      calls : [program_uses_arena, reaction_list_len, reaction_tramp_size, entry_rule_result, entry_rule_texty, entry_rule_bytes, entry_rule_collection, prog_any_texty, ps_total, resource_marshal_size, param_list_len, rl_head_params, fields_to_params, rl_head_input, params_to_fields, argv_marshal_size, stdin_marshal_size, field_list_has_text, cd_fields, concept_at_index, find_concept_index, fl_head_ty_start, fl_head_ty_len]
+      reads : [pg, pg.rules, pg.src, pg.concepts, pg.sizes, pg.ress, pg.conns, pg.prog, pg.rxs]
+      calls : [program_uses_arena, reaction_list_len, reaction_tramp_size, entry_rule_result, entry_rule_texty, entry_rule_bytes, entry_rule_collection, prog_any_texty, ps_total, resource_marshal_size, param_list_len, rl_head_params, fields_to_params, rl_head_input, params_to_fields, argv_marshal_size, stdin_marshal_size, field_list_has_text, cd_fields, concept_at_index, find_concept_index, fl_head_ty_start, fl_head_ty_len, connection_marshal_size]
     termination:
       bound : 8000
 
@@ -25505,6 +25505,494 @@ rule x86_resource_marshal
       bound : 64
 
 
+-- ============================================================================
+-- Effects tier slice 3 — emit: fetch request-extraction walker + connection
+-- trampoline block + sizing (one truth for blob_end_off and the emit walk).
+-- ============================================================================
+
+-- PickState / pick_ast: return `a` unless it is AstErr, else `b` (first-non-Err).
+concept PickState
+  @intention: "Two candidate Asts, to pick the first non-error one"
+  @source: vexprparse.intent:73
+  fields:
+    a : Ast
+    b : Ast
+
+rule ast_is_err
+  @intention: "1 if the AST node is AstErr, 0 otherwise"
+  @source: vexprparse.intent:73
+  input:
+    n : Ast
+  output:
+    out : number
+  logic:
+    out = match n:
+      AstNum(value) => 0
+      AstBin(op, lhs, rhs) => 0
+      AstNeg(inner) => 0
+      AstNot(inner) => 0
+      AstVar(start, len) => 0
+      AstField(base, fstart, flen) => 0
+      AstCall(callee_start, callee_len, args) => 0
+      AstIf(cond, thn, els) => 0
+      AstBool(value) => 0
+      AstStr(start, len) => 0
+      AstBytes(start, len) => 0
+      AstErr => 1
+      AstVariant(cstart, clen, vstart, vlen, fields) => 0
+      AstMatch(scrut, arms) => 0
+      AstOk(inner) => 0
+      AstResErr(inner) => 0
+      AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => 0
+      AstSum(coll, item_start, item_len, body) => 0
+      AstCount(coll, item_start, item_len, body) => 0
+      AstFold(coll, init, acc_start, acc_len, item_start, item_len, body) => 0
+      AstAll(coll, item_start, item_len, body) => 0
+      AstAny(coll, item_start, item_len, body) => 0
+      AstMap(coll, item_start, item_len, body) => 0
+      AstFilter(coll, item_start, item_len, body) => 0
+      AstMinFold(coll, item_start, item_len, body) => 0
+      AstMaxFold(coll, item_start, item_len, body) => 0
+  proofs:
+    purity:
+      reads : [n]
+      calls : []
+    termination:
+      bound : 16
+
+rule pick_ast
+  @intention: "The first candidate Ast unless it is AstErr, else the second"
+  @source: vexprparse.intent:73
+  input:
+    p : PickState
+  output:
+    out : Ast
+  logic:
+    out = if ast_is_err(p.a) == 0 then p.a else p.b
+  proofs:
+    purity:
+      reads : [p.a, p.b]
+      calls : [ast_is_err]
+    termination:
+      bound : 16
+
+rule req_ast_start
+  @intention: "The token-span start of a request AstStr, or 0"
+  @source: vexprparse.intent:73
+  input:
+    n : Ast
+  output:
+    out : number
+  logic:
+    out = match n:
+      AstNum(value) => 0
+      AstBin(op, lhs, rhs) => 0
+      AstNeg(inner) => 0
+      AstNot(inner) => 0
+      AstVar(start, len) => 0
+      AstField(base, fstart, flen) => 0
+      AstCall(callee_start, callee_len, args) => 0
+      AstIf(cond, thn, els) => 0
+      AstBool(value) => 0
+      AstStr(start, len) => start
+      AstBytes(start, len) => 0
+      AstErr => 0
+      AstVariant(cstart, clen, vstart, vlen, fields) => 0
+      AstMatch(scrut, arms) => 0
+      AstOk(inner) => 0
+      AstResErr(inner) => 0
+      AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => 0
+      AstSum(coll, item_start, item_len, body) => 0
+      AstCount(coll, item_start, item_len, body) => 0
+      AstFold(coll, init, acc_start, acc_len, item_start, item_len, body) => 0
+      AstAll(coll, item_start, item_len, body) => 0
+      AstAny(coll, item_start, item_len, body) => 0
+      AstMap(coll, item_start, item_len, body) => 0
+      AstFilter(coll, item_start, item_len, body) => 0
+      AstMinFold(coll, item_start, item_len, body) => 0
+      AstMaxFold(coll, item_start, item_len, body) => 0
+  proofs:
+    purity:
+      reads : [n]
+      calls : []
+    termination:
+      bound : 16
+
+rule req_ast_len
+  @intention: "The token-span length of a request AstStr, or 0"
+  @source: vexprparse.intent:73
+  input:
+    n : Ast
+  output:
+    out : number
+  logic:
+    out = match n:
+      AstNum(value) => 0
+      AstBin(op, lhs, rhs) => 0
+      AstNeg(inner) => 0
+      AstNot(inner) => 0
+      AstVar(start, len) => 0
+      AstField(base, fstart, flen) => 0
+      AstCall(callee_start, callee_len, args) => 0
+      AstIf(cond, thn, els) => 0
+      AstBool(value) => 0
+      AstStr(start, len) => len
+      AstBytes(start, len) => 0
+      AstErr => 0
+      AstVariant(cstart, clen, vstart, vlen, fields) => 0
+      AstMatch(scrut, arms) => 0
+      AstOk(inner) => 0
+      AstResErr(inner) => 0
+      AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => 0
+      AstSum(coll, item_start, item_len, body) => 0
+      AstCount(coll, item_start, item_len, body) => 0
+      AstFold(coll, init, acc_start, acc_len, item_start, item_len, body) => 0
+      AstAll(coll, item_start, item_len, body) => 0
+      AstAny(coll, item_start, item_len, body) => 0
+      AstMap(coll, item_start, item_len, body) => 0
+      AstFilter(coll, item_start, item_len, body) => 0
+      AstMinFold(coll, item_start, item_len, body) => 0
+      AstMaxFold(coll, item_start, item_len, body) => 0
+  proofs:
+    purity:
+      reads : [n]
+      calls : []
+    termination:
+      bound : 16
+
+
+-- FreqState / freq_ast: the first fetch(<name>, req) REQUEST Ast in a subtree, or
+-- AstErr. Full descent; mentions the recursion once per child via pick_ast.
+concept FreqState
+  @intention: "An Ast + source + a connection name query span, to find the fetch request literal"
+  @source: vexprparse.intent:73
+  fields:
+    node : Ast
+    src : text [..256]
+    q_start : number [0, 4000000]
+    q_len : number [0, 4000000]
+
+concept FreqArgs
+  @intention: "A call-argument list + source + a connection name query span"
+  @source: vexprparse.intent:73
+  fields:
+    args : ArgList
+    src : text [..256]
+    q_start : number [0, 4000000]
+    q_len : number [0, 4000000]
+
+concept FreqVFields
+  @intention: "A variant construct's field list + source + a connection name query span"
+  @source: vexprparse.intent:73
+  fields:
+    fields : VFieldList
+    src : text [..256]
+    q_start : number [0, 4000000]
+    q_len : number [0, 4000000]
+
+concept FreqArms
+  @intention: "A match arm list + source + a connection name query span"
+  @source: vexprparse.intent:73
+  fields:
+    arms : ArmList
+    src : text [..256]
+    q_start : number [0, 4000000]
+    q_len : number [0, 4000000]
+
+concept FreqBinds
+  @intention: "A let-binding list + source + a connection name query span"
+  @source: vexprparse.intent:73
+  fields:
+    binds : Binding
+    src : text [..256]
+    q_start : number [0, 4000000]
+    q_len : number [0, 4000000]
+
+concept FreqRules
+  @intention: "A rule list + source + a connection name query span"
+  @source: vexprparse.intent:73
+  fields:
+    rules : RuleList
+    src : text [..256]
+    q_start : number [0, 4000000]
+    q_len : number [0, 4000000]
+
+rule freq_ast
+  @intention: "The first fetch(<name>, req) request Ast in a subtree, or AstErr"
+  @source: vexprparse.intent:73
+  input:
+    a : FreqState
+  output:
+    out : Ast
+  logic:
+    out = match a.node:
+      AstNum(value) => Ast::AstErr
+      AstBin(op, lhs, rhs) => pick_ast(PickState { a: freq_ast(FreqState { node: lhs, src: a.src, q_start: a.q_start, q_len: a.q_len }), b: freq_ast(FreqState { node: rhs, src: a.src, q_start: a.q_start, q_len: a.q_len }) })
+      AstNeg(inner) => freq_ast(FreqState { node: inner, src: a.src, q_start: a.q_start, q_len: a.q_len })
+      AstNot(inner) => freq_ast(FreqState { node: inner, src: a.src, q_start: a.q_start, q_len: a.q_len })
+      AstVar(start, len) => Ast::AstErr
+      AstField(base, fstart, flen) => freq_ast(FreqState { node: base, src: a.src, q_start: a.q_start, q_len: a.q_len })
+      AstCall(callee_start, callee_len, args) => if span_is_fetch(SpanCheck { src: a.src, start: callee_start, len: callee_len }) == 1 and (arg_list_len(args) == 2 and (ast_var_len(arg_first(args)) == a.q_len and name_eq(NameEqState { src: a.src, a_start: ast_var_start(arg_first(args)), b_start: a.q_start, len: a.q_len, off: 0 }) == 1)) then arg_first(arg_rest(args)) else freq_args(FreqArgs { args: args, src: a.src, q_start: a.q_start, q_len: a.q_len })
+      AstIf(cond, thn, els) => pick_ast(PickState { a: freq_ast(FreqState { node: cond, src: a.src, q_start: a.q_start, q_len: a.q_len }), b: pick_ast(PickState { a: freq_ast(FreqState { node: thn, src: a.src, q_start: a.q_start, q_len: a.q_len }), b: freq_ast(FreqState { node: els, src: a.src, q_start: a.q_start, q_len: a.q_len }) }) })
+      AstBool(value) => Ast::AstErr
+      AstStr(start, len) => Ast::AstErr
+      AstBytes(start, len) => Ast::AstErr
+      AstErr => Ast::AstErr
+      AstVariant(cstart, clen, vstart, vlen, fields) => freq_vfields(FreqVFields { fields: fields, src: a.src, q_start: a.q_start, q_len: a.q_len })
+      AstMatch(scrut, arms) => pick_ast(PickState { a: freq_ast(FreqState { node: scrut, src: a.src, q_start: a.q_start, q_len: a.q_len }), b: freq_arms(FreqArms { arms: arms, src: a.src, q_start: a.q_start, q_len: a.q_len }) })
+      AstOk(inner) => freq_ast(FreqState { node: inner, src: a.src, q_start: a.q_start, q_len: a.q_len })
+      AstResErr(inner) => freq_ast(FreqState { node: inner, src: a.src, q_start: a.q_start, q_len: a.q_len })
+      AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => pick_ast(PickState { a: freq_ast(FreqState { node: scrut, src: a.src, q_start: a.q_start, q_len: a.q_len }), b: pick_ast(PickState { a: freq_ast(FreqState { node: ok_body, src: a.src, q_start: a.q_start, q_len: a.q_len }), b: freq_ast(FreqState { node: err_body, src: a.src, q_start: a.q_start, q_len: a.q_len }) }) })
+      AstSum(coll, item_start, item_len, body) => pick_ast(PickState { a: freq_ast(FreqState { node: coll, src: a.src, q_start: a.q_start, q_len: a.q_len }), b: freq_ast(FreqState { node: body, src: a.src, q_start: a.q_start, q_len: a.q_len }) })
+      AstCount(coll, item_start, item_len, body) => pick_ast(PickState { a: freq_ast(FreqState { node: coll, src: a.src, q_start: a.q_start, q_len: a.q_len }), b: freq_ast(FreqState { node: body, src: a.src, q_start: a.q_start, q_len: a.q_len }) })
+      AstFold(coll, init, acc_start, acc_len, item_start, item_len, body) => pick_ast(PickState { a: freq_ast(FreqState { node: coll, src: a.src, q_start: a.q_start, q_len: a.q_len }), b: pick_ast(PickState { a: freq_ast(FreqState { node: init, src: a.src, q_start: a.q_start, q_len: a.q_len }), b: freq_ast(FreqState { node: body, src: a.src, q_start: a.q_start, q_len: a.q_len }) }) })
+      AstAll(coll, item_start, item_len, body) => pick_ast(PickState { a: freq_ast(FreqState { node: coll, src: a.src, q_start: a.q_start, q_len: a.q_len }), b: freq_ast(FreqState { node: body, src: a.src, q_start: a.q_start, q_len: a.q_len }) })
+      AstAny(coll, item_start, item_len, body) => pick_ast(PickState { a: freq_ast(FreqState { node: coll, src: a.src, q_start: a.q_start, q_len: a.q_len }), b: freq_ast(FreqState { node: body, src: a.src, q_start: a.q_start, q_len: a.q_len }) })
+      AstMap(coll, item_start, item_len, body) => pick_ast(PickState { a: freq_ast(FreqState { node: coll, src: a.src, q_start: a.q_start, q_len: a.q_len }), b: freq_ast(FreqState { node: body, src: a.src, q_start: a.q_start, q_len: a.q_len }) })
+      AstFilter(coll, item_start, item_len, body) => pick_ast(PickState { a: freq_ast(FreqState { node: coll, src: a.src, q_start: a.q_start, q_len: a.q_len }), b: freq_ast(FreqState { node: body, src: a.src, q_start: a.q_start, q_len: a.q_len }) })
+      AstMinFold(coll, item_start, item_len, body) => pick_ast(PickState { a: freq_ast(FreqState { node: coll, src: a.src, q_start: a.q_start, q_len: a.q_len }), b: freq_ast(FreqState { node: body, src: a.src, q_start: a.q_start, q_len: a.q_len }) })
+      AstMaxFold(coll, item_start, item_len, body) => pick_ast(PickState { a: freq_ast(FreqState { node: coll, src: a.src, q_start: a.q_start, q_len: a.q_len }), b: freq_ast(FreqState { node: body, src: a.src, q_start: a.q_start, q_len: a.q_len }) })
+  proofs:
+    purity:
+      reads : [a.node, a.src, a.q_start, a.q_len]
+      calls : [pick_ast, freq_ast, span_is_fetch, arg_list_len, ast_var_len, name_eq, ast_var_start, arg_first, arg_rest, freq_args, freq_vfields, freq_arms]
+    termination:
+      bound : 8000
+
+rule freq_args
+  @intention: "The first fetch request Ast across a call's arguments, or AstErr"
+  @source: vexprparse.intent:73
+  input:
+    a : FreqArgs
+  output:
+    out : Ast
+  logic:
+    out = match a.args:
+      ArgCons(head, tail) => pick_ast(PickState { a: freq_ast(FreqState { node: head, src: a.src, q_start: a.q_start, q_len: a.q_len }), b: freq_args(FreqArgs { args: tail, src: a.src, q_start: a.q_start, q_len: a.q_len }) })
+      ArgNil => Ast::AstErr
+  proofs:
+    purity:
+      reads : [a.args, a.src, a.q_start, a.q_len]
+      calls : [pick_ast, freq_ast, freq_args]
+    termination:
+      bound : 8000
+
+rule freq_vfields
+  @intention: "The first fetch request Ast across a variant construct's field values, or AstErr"
+  @source: vexprparse.intent:73
+  input:
+    a : FreqVFields
+  output:
+    out : Ast
+  logic:
+    out = match a.fields:
+      VFCons(name_start, name_len, val, rest) => pick_ast(PickState { a: freq_ast(FreqState { node: val, src: a.src, q_start: a.q_start, q_len: a.q_len }), b: freq_vfields(FreqVFields { fields: rest, src: a.src, q_start: a.q_start, q_len: a.q_len }) })
+      VFNil => Ast::AstErr
+  proofs:
+    purity:
+      reads : [a.fields, a.src, a.q_start, a.q_len]
+      calls : [pick_ast, freq_ast, freq_vfields]
+    termination:
+      bound : 8000
+
+rule freq_arms
+  @intention: "The first fetch request Ast across a match's arm bodies, or AstErr"
+  @source: vexprparse.intent:73
+  input:
+    a : FreqArms
+  output:
+    out : Ast
+  logic:
+    out = match a.arms:
+      ArmCons(vstart, vlen, binders, body, rest) => pick_ast(PickState { a: freq_ast(FreqState { node: body, src: a.src, q_start: a.q_start, q_len: a.q_len }), b: freq_arms(FreqArms { arms: rest, src: a.src, q_start: a.q_start, q_len: a.q_len }) })
+      ArmNil => Ast::AstErr
+  proofs:
+    purity:
+      reads : [a.arms, a.src, a.q_start, a.q_len]
+      calls : [pick_ast, freq_ast, freq_arms]
+    termination:
+      bound : 8000
+
+rule freq_binds
+  @intention: "The first fetch request Ast across a binding list's RHSes, or AstErr"
+  @source: vexprparse.intent:73
+  input:
+    a : FreqBinds
+  output:
+    out : Ast
+  logic:
+    out = match a.binds:
+      BCons(name_start, name_len, value, rest) => pick_ast(PickState { a: freq_ast(FreqState { node: value, src: a.src, q_start: a.q_start, q_len: a.q_len }), b: freq_binds(FreqBinds { binds: rest, src: a.src, q_start: a.q_start, q_len: a.q_len }) })
+      BNil => Ast::AstErr
+  proofs:
+    purity:
+      reads : [a.binds, a.src, a.q_start, a.q_len]
+      calls : [pick_ast, freq_ast, freq_binds]
+    termination:
+      bound : 8000
+
+rule freq_rules
+  @intention: "The first fetch(<name>, req) request Ast across every rule body, or AstErr"
+  @source: vexprparse.intent:73
+  input:
+    a : FreqRules
+  output:
+    out : Ast
+  logic:
+    out = match a.rules:
+      RCons(head, tail) => pick_ast(PickState { a: pick_ast(PickState { a: freq_binds(FreqBinds { binds: block_binds(rd_body(head)), src: a.src, q_start: a.q_start, q_len: a.q_len }), b: freq_ast(FreqState { node: block_result(rd_body(head)), src: a.src, q_start: a.q_start, q_len: a.q_len }) }), b: freq_rules(FreqRules { rules: tail, src: a.src, q_start: a.q_start, q_len: a.q_len }) })
+      RNil => Ast::AstErr
+  proofs:
+    purity:
+      reads : [a.rules, a.src, a.q_start, a.q_len]
+      calls : [pick_ast, freq_binds, freq_ast, block_binds, rd_body, block_result, freq_rules]
+    termination:
+      bound : 8000
+
+
+-- CReqState / conn_req_padded: the 4-byte-padded decoded length of a connection's
+-- fetch request literal (the request bytes the trampoline write embeds).
+concept CReqState
+  @intention: "The program + source + a connection name query span, to size its fetch request"
+  @source: vexprparse.intent:73
+  fields:
+    prog : RuleList
+    src : text [..256]
+    q_start : number [0, 4000000]
+    q_len : number [0, 4000000]
+
+rule conn_req_padded
+  @intention: "The 4-padded decoded byte length of a connection's fetch request literal"
+  @source: vexprparse.intent:73
+  input:
+    cr : CReqState
+  output:
+    out : number
+  logic:
+    let r = freq_rules(FreqRules { rules: cr.prog, src: cr.src, q_start: cr.q_start, q_len: cr.q_len })
+    let dlen = bytelit_decoded_len(DecodeState { src: cr.src, start: req_ast_start(r) + 1, len: if req_ast_len(r) >= 2 then req_ast_len(r) - 2 else 0, i: 0 })
+    out = 4 * ((dlen + 3) / 4)
+  proofs:
+    purity:
+      reads : [cr.prog, cr.src, cr.q_start, cr.q_len]
+      calls : [freq_rules, bytelit_decoded_len, req_ast_start, req_ast_len]
+    termination:
+      bound : 64
+
+
+-- CMarshSizeState / connection_marshal_size: the EXACT byte length of the whole
+-- trampoline connection block = 229 fixed + the 4-padded request bytes, per
+-- REFERENCED connection. The ONE sizing truth (blob_end_off adds it; the emit walk
+-- x86_connection_marshal emits exactly these bytes). 0 when none referenced.
+concept CMarshSizeState
+  @intention: "The remaining connections + source + program (referenced-ness), to size the trampoline connection blocks"
+  @source: vexprparse.intent:73
+  fields:
+    rem : ConnectionList
+    src : text [..256]
+    prog : RuleList
+
+rule connection_marshal_size
+  @intention: "Byte length of the trampoline connection blocks: 229 fixed + 4-padded request bytes per referenced connection"
+  @source: vexprparse.intent:73
+  input:
+    cm : CMarshSizeState
+  output:
+    out : number
+  logic:
+    out = match cm.rem:
+      CnCons(head, tail) => (if prog_reads_named(RdNmRules { rules: cm.prog, src: cm.src, q_start: conn_name_start(head), q_len: conn_name_len(head) }) > 0 then 229 + conn_req_padded(CReqState { prog: cm.prog, src: cm.src, q_start: conn_name_start(head), q_len: conn_name_len(head) }) else 0) + connection_marshal_size(CMarshSizeState { rem: tail, src: cm.src, prog: cm.prog })
+      CnNil => 0
+  proofs:
+    purity:
+      reads : [cm.rem, cm.src, cm.prog]
+      calls : [prog_reads_named, conn_name_start, conn_name_len, conn_req_padded, connection_marshal_size]
+    termination:
+      bound : 64
+
+
+-- CBlockState / x86_connection_block: the per-connection trampoline block. Slot j
+-- lives at region offset 0x500000 + j*0x10000 (slot_addr = 542113792 + 65536*j);
+-- the packed value cell is [slot+0], the response bytes [slot+8]. Sequence:
+--   socket(AF_INET, SOCK_STREAM, 0) -> abort -> mov rbx,fd
+--   connect(rbx, &sockaddr_in, 16)  -> abort   (sockaddr inline via e9+le32)
+--   write(rbx, request, req_len)     -> abort   (request inline via e9+le32, unescaped)
+--   read(rbx, slot+8, max_response)  -> abort
+--   save len -> close(rbx) -> pack ((slot+8-src_base)<<32)|len -> [slot+0]
+-- Four fallible syscalls -> four 17-byte inline aborts (house shape). Fixed = 229.
+concept CBlockState
+  @intention: "One connection's host/port/max_response + request span + slot index + src_base + source, for its trampoline block"
+  @source: vexprparse.intent:73
+  fields:
+    host_start : number [0, 4000000]
+    host_len : number [0, 4000000]
+    port : number [0, 4000000]
+    max_response : number [0, 65536]
+    req_start : number [0, 4000000]
+    req_len : number [0, 4000000]
+    idx : number [0, 64]
+    src_base : number
+    src : text [..256]
+
+rule x86_connection_block
+  @intention: "Emit one connection's trampoline block: socket, connect, write request, read response, pack + store"
+  @source: vexprparse.intent:73
+  input:
+    cb : CBlockState
+  output:
+    out : bytes
+  logic:
+    let hv = (cb.port % 256) * 256 + cb.port / 256
+    let o0 = ipv4_octet(IpOctState { src: cb.src, start: cb.host_start, len: cb.host_len, which: 0 })
+    let o1 = ipv4_octet(IpOctState { src: cb.src, start: cb.host_start, len: cb.host_len, which: 1 })
+    let o2 = ipv4_octet(IpOctState { src: cb.src, start: cb.host_start, len: cb.host_len, which: 2 })
+    let o3 = ipv4_octet(IpOctState { src: cb.src, start: cb.host_start, len: cb.host_len, which: 3 })
+    let inner_start = cb.req_start + 1
+    let inner_len = if cb.req_len >= 2 then cb.req_len - 2 else 0
+    let dlen = bytelit_decoded_len(DecodeState { src: cb.src, start: inner_start, len: inner_len, i: 0 })
+    let block = 4 * ((dlen + 3) / 4)
+    out = concat(b"\xbf\x02\x00\x00\x00\xbe\x01\x00\x00\x00\x31\xd2\xb8\x29\x00\x00\x00\x0f\x05", b"\x48\x85\xc0\x79\x0c\xbf\x01\x00\x00\x00\xb8\x3c\x00\x00\x00\x0f\x05", b"\x48\x89\xc3", b"\xe9", le32(16), le32(2 + hv * 65536), le32(o0 + 256 * o1 + 65536 * o2 + 16777216 * o3), le64(0), b"\x48\x8d\x35", le32(0 - (16 + 7)), b"\x48\x89\xdf\x48\xc7\xc2\x10\x00\x00\x00\x48\xc7\xc0\x2a\x00\x00\x00\x0f\x05", b"\x48\x85\xc0\x79\x0c\xbf\x01\x00\x00\x00\xb8\x3c\x00\x00\x00\x0f\x05", b"\xe9", le32(block), emit_bytes_data(BytesEmitState { src: cb.src, start: inner_start, len: inner_len, i: 0, dlen: dlen }), b"\x48\xc7\xc0\x01\x00\x00\x00\x48\x89\xdf\x48\x8d\x35", le32(0 - (block + 17)), b"\x48\xc7\xc2", le32(dlen), b"\x0f\x05", b"\x48\x85\xc0\x79\x0c\xbf\x01\x00\x00\x00\xb8\x3c\x00\x00\x00\x0f\x05", b"\x31\xc0\x48\x89\xdf\x48\xbe", le64(542113792 + 65536 * cb.idx + 8), b"\xba", le32(cb.max_response), b"\x0f\x05", b"\x48\x85\xc0\x79\x0c\xbf\x01\x00\x00\x00\xb8\x3c\x00\x00\x00\x0f\x05", b"\x48\x89\xc2", b"\xb8\x03\x00\x00\x00\x48\x89\xdf\x0f\x05", b"\x48\xb8", le64((542113792 + 65536 * cb.idx + 8 - cb.src_base) * 4294967296), b"\x48\x09\xd0\x48\xb9", le64(542113792 + 65536 * cb.idx), b"\x48\x89\x01")
+  proofs:
+    purity:
+      reads : [cb.host_start, cb.host_len, cb.port, cb.max_response, cb.req_start, cb.req_len, cb.idx, cb.src_base, cb.src]
+      calls : [ipv4_octet, bytelit_decoded_len, emit_bytes_data]
+    termination:
+      bound : 64
+
+
+-- CMarshalState / x86_connection_marshal: emit the trampoline connection block for
+-- every REFERENCED connection, in declaration order (unreferenced declarations emit
+-- nothing but still own their slot index).
+concept CMarshalState
+  @intention: "The remaining connections + head's declared index + source + program + src_base, to emit the trampoline connection blocks"
+  @source: vexprparse.intent:73
+  fields:
+    rem : ConnectionList
+    idx : number [0, 64]
+    src : text [..256]
+    prog : RuleList
+    src_base : number
+
+rule x86_connection_marshal
+  @intention: "Emit the per-connection trampoline blocks for every referenced connection, in declaration order"
+  @source: vexprparse.intent:73
+  input:
+    cm : CMarshalState
+  output:
+    out : bytes
+  logic:
+    out = match cm.rem:
+      CnCons(head, tail) => concat(if prog_reads_named(RdNmRules { rules: cm.prog, src: cm.src, q_start: conn_name_start(head), q_len: conn_name_len(head) }) > 0 then x86_connection_block(CBlockState { host_start: conn_host_start(head), host_len: conn_host_len(head), port: conn_port(head), max_response: conn_max_response(head), req_start: req_ast_start(freq_rules(FreqRules { rules: cm.prog, src: cm.src, q_start: conn_name_start(head), q_len: conn_name_len(head) })), req_len: req_ast_len(freq_rules(FreqRules { rules: cm.prog, src: cm.src, q_start: conn_name_start(head), q_len: conn_name_len(head) })), idx: cm.idx, src_base: cm.src_base, src: cm.src }) else b"", x86_connection_marshal(CMarshalState { rem: tail, idx: cm.idx + 1, src: cm.src, prog: cm.prog, src_base: cm.src_base }))
+      CnNil => b""
+  proofs:
+    purity:
+      reads : [cm.rem, cm.idx, cm.src, cm.prog, cm.src_base]
+      calls : [prog_reads_named, conn_name_start, conn_name_len, x86_connection_block, conn_host_start, conn_host_len, conn_port, conn_max_response, req_ast_start, req_ast_len, freq_rules, x86_connection_marshal]
+    termination:
+      bound : 64
+
+
+
 -- x86_marshal_fields: emit the per-field argv reads. For field k, argv[k+1] is at
 -- [r12 + 8*(k+2)] (argv[0] is the program name at [r12+8]). A TEXT field: strlen
 -- (byte loop scanning for NUL), rep movsb the bytes into the fixed region at the
@@ -25583,12 +26071,13 @@ rule x86_argv_marshal
     -- reproduces byte-for-byte (le32(1048576) == the old inline imm bytes — the
     -- size-stable literal split, argv_marshal_size's 88 holds).
     let rms = resource_marshal_size(RMarshSizeState { rem: at.ress, src: at.src, prog: at.prog })
-    let region_len = if rms > 0 then 4194304 + 65536 * resource_list_len(at.ress) else 1048576
+    let cms = connection_marshal_size(CMarshSizeState { rem: at.conns, src: at.src, prog: at.prog })
+    let region_len = if cms > 0 then 5242880 + 65536 * connection_list_len(at.conns) else (if rms > 0 then 4194304 + 65536 * resource_list_len(at.ress) else 1048576)
     out = concat(b"\x49\x89\xe4\x49\x8b\x04\x24\x48\x3d", le32(1 + nfields), b"\x7d\x0c\xbf\x01\x00\x00\x00\xb8\x3c\x00\x00\x00\x0f\x05\xb8\x09\x00\x00\x00\xbf\x00\x00\x00\x20\xbe", le32(region_len), b"\xba\x03\x00\x00\x00\x41\xba\x32\x00\x00\x00\x49\xc7\xc0\xff\xff\xff\xff\x45\x31\xc9\x0f\x05\x48\x3d\x01\xf0\xff\xff\x72\x0c\xbf\x01\x00\x00\x00\xb8\x3c\x00\x00\x00\x0f\x05\x45\x31\xed", x86_marshal_fields(ArgvMarshalState { fields: at.fields, idx: 0, region_off: region_off, region_base: region_base }), b"\x4c\x89\xf0\x48\x69\xc0", le32(entry_size), b"\x4c\x01\xf8\x48\xc7\x00", le32(tag), x86_field_pops(FieldPopState { fields: at.fields, slot: nfields - 1 }), b"\x41\x56\x49\xff\xc6")
   proofs:
     purity:
       reads : [at.fields, at.src, at.prog, at.concepts, at.sizes, at.cidx, at.ress, at.conns, at.rxs]
-      calls : [blob_end_off, field_list_len, max_payload_fields, x86_marshal_fields, x86_field_pops, resource_marshal_size, resource_list_len]
+      calls : [blob_end_off, field_list_len, max_payload_fields, x86_marshal_fields, x86_field_pops, resource_marshal_size, resource_list_len, connection_marshal_size, connection_list_len]
     termination:
       bound : 64
 
@@ -25761,12 +26250,13 @@ rule x86_stdin_marshal
     -- 0x400000` overflow guard — bound the SOURCE area and MUST stay, so they
     -- keep their inline literal bytes below.
     let rms = resource_marshal_size(RMarshSizeState { rem: at.ress, src: at.src, prog: at.prog })
-    let region_len = 4194304 + (if rms > 0 then 65536 * resource_list_len(at.ress) else 0)
+    let cms = connection_marshal_size(CMarshSizeState { rem: at.conns, src: at.src, prog: at.prog })
+    let region_len = if cms > 0 then 5242880 + 65536 * connection_list_len(at.conns) else (4194304 + (if rms > 0 then 65536 * resource_list_len(at.ress) else 0))
     out = concat(concat(b"\x49\x89\xe4\x49\x8b\x04\x24\x48\x3d", le32(1 + nnum), b"\x7d\x0c\xbf\x01\x00\x00\x00\xb8\x3c\x00\x00\x00\x0f\x05\xb8\x09\x00\x00\x00\xbf\x00\x00\x00\x20\xbe", le32(region_len), b"\xba\x03\x00\x00\x00\x41\xba\x32\x00\x00\x00\x49\xc7\xc0\xff\xff\xff\xff\x45\x31\xc9\x0f\x05\x48\x3d\x01\xf0\xff\xff\x72\x0c\xbf\x01\x00\x00\x00\xb8\x3c\x00\x00\x00\x0f\x05\x45\x31\xed\x31\xc0\x31\xff\xbe\x00\x00\x00\x20\x4c\x01\xee\xba\x00\x00\x40\x00\x4c\x29\xea\x0f\x05\x48\x85\xc0\x74\x1c\x78\x0e\x49\x01\xc5\x49\x81\xfd\x00\x00\x40\x00\x73\x02\xeb\xd5\xbf\x01\x00\x00\x00\xb8\x3c\x00\x00\x00\x0f\x05"), x86_stdin_fields(StdinMarshalState { fields: at.fields, num_idx: 0, region_off: region_off }), concat(b"\x4c\x89\xf0\x48\x69\xc0", le32(entry_size), b"\x4c\x01\xf8\x48\xc7\x00", le32(tag)), x86_field_pops(FieldPopState { fields: at.fields, slot: nfields - 1 }), b"\x41\x56\x49\xff\xc6")
   proofs:
     purity:
       reads : [at.fields, at.src, at.prog, at.concepts, at.sizes, at.cidx, at.ress, at.conns, at.rxs]
-      calls : [blob_end_off, field_list_len, number_fields_count, max_payload_fields, x86_stdin_fields, x86_field_pops, resource_marshal_size, resource_list_len]
+      calls : [blob_end_off, field_list_len, number_fields_count, max_payload_fields, x86_stdin_fields, x86_field_pops, resource_marshal_size, resource_list_len, connection_marshal_size, connection_list_len]
     termination:
       bound : 64
 
@@ -25827,7 +26317,8 @@ rule elf_program_src
     -- program_uses_result injection precedent; "most read programs are texty
     -- anyway" is luck, not construction).
     let uses_res = if resource_marshal_size(RMarshSizeState { rem: ress, src: s.source, prog: prog }) > 0 then 1 else 0
-    let uses_text = if program_uses_text(UsesTextRules { rules: prog, src: s.source }) == 1 then 1 else (if anytx == 1 then 1 else uses_res)
+    let uses_conn = if connection_marshal_size(CMarshSizeState { rem: conns, src: s.source, prog: prog }) > 0 then 1 else 0
+    let uses_text = if program_uses_text(UsesTextRules { rules: prog, src: s.source }) == 1 then 1 else (if anytx == 1 then 1 else (if uses_res == 1 then 1 else uses_conn))
     let fsz0 = blob_end_off(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: sizes, ress: ress, conns: conns, rxs: rxs })
     let fsz = fsz0 + (if uses_text == 1 then 4 * ((length(s.source) + 3) / 4) else 0)
     let entry_params = if param_list_len(rl_head_params(prog)) > 0 then rl_head_params(prog) else fields_to_params(rl_head_input(prog))
@@ -25838,11 +26329,11 @@ rule elf_program_src
     -- trampoline REPLACES the entry_rule_* trampoline cascade (the trigger IS the
     -- head/entry proc, gated + open/write/close instead of itoa+print).
     let has_reaction = if reaction_list_len(rxs) > 0 then 1 else 0
-    out = concat(abort_if(verrs), b"\x7f\x45\x4c\x46\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\x3e\x00\x01\x00\x00\x00\x78\x00\x40\x00\x00\x00\x00\x00\x40\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x40\x00\x38\x00\x01\x00\x00\x00\x00\x00\x00\x00", b"\x01\x00\x00\x00\x05\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x40\x00\x00\x00\x00\x00\x00\x00\x40\x00\x00\x00\x00\x00", le64(fsz), le64(fsz), b"\x00\x10\x00\x00\x00\x00\x00\x00", (if uses_var == 1 then b"\xb8\x09\x00\x00\x00\x31\xff\x48\xbe\x00\x00\x00\x00\x06\x00\x00\x00\xba\x03\x00\x00\x00\x41\xba\x22\x40\x00\x00\x49\xc7\xc0\xff\xff\xff\xff\x45\x31\xc9\x0f\x05\x48\x3d\x01\xf0\xff\xff\x72\x0c\xbf\x01\x00\x00\x00\xb8\x3c\x00\x00\x00\x0f\x05\x49\x89\xc7\x45\x31\xf6" else b""), (if has_input == 1 then (if field_list_has_text(cd_fields(concept_at_index(ConceptAtState { concepts: concepts, idx: ecidx }))) == 1 then x86_stdin_marshal(ArgvTrampState { fields: cd_fields(concept_at_index(ConceptAtState { concepts: concepts, idx: ecidx })), src: s.source, prog: prog, concepts: concepts, sizes: sizes, cidx: ecidx, ress: ress, conns: conns, rxs: rxs }) else x86_argv_marshal(ArgvTrampState { fields: cd_fields(concept_at_index(ConceptAtState { concepts: concepts, idx: ecidx })), src: s.source, prog: prog, concepts: concepts, sizes: sizes, cidx: ecidx, ress: ress, conns: conns, rxs: rxs })) else b""), x86_resource_marshal(RMarshalState { rem: ress, idx: 0, src: s.source, prog: prog, src_base: 4194304 + fsz0 }), (if has_reaction == 1 then x86_reaction_tramp(RxTrampState { rxs: rxs, src: s.source, anytx: anytx, concepts: concepts, ecidx: ecidx }) else (if entryresult == 1 then concat(b"\xe8", le32(205 + (if anytx == 1 then 86 else 0)), b"\x48\x69\xc0", le32(8 * (max_payload_fields(concepts) + 1)), b"\x4c\x01\xf8\x48\x8b\x08\x48\x8b\x40\x08\x48\x81\xf9", le32(15360000), b"\x0f\x85", le32(96), b"\x48\x83\xec\x20\x49\x89\xc1\x48\x8d\x74\x24\x1f\xc6\x06\x0a\x48\x85\xc0\x79\x03\x48\xf7\xd8\x48\xc7\xc1\x0a\x00\x00\x00\x48\x31\xd2\x48\xf7\xf1\x80\xc2\x30\x48\xff\xce\x88\x16\x48\x85\xc0\x75\xed\x4d\x85\xc9\x79\x06\x48\xff\xce\xc6\x06\x2d\x48\x8d\x54\x24\x20\x48\x29\xf2\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05", b"\x89\xc2\x48\xc1\xe8\x20\x48\xbe", le64(4194304 + blob_end_off(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: sizes, ress: ress, conns: conns, rxs: rxs })), b"\x48\x01\xc6\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x02\x00\x00\x00\x0f\x05\x6a\x0a\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x02\x00\x00\x00\x48\x89\xe6\x48\xc7\xc2\x01\x00\x00\x00\x0f\x05\x48\xc7\xc0\x3c\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05") else if entrybytes == 1 then concat(b"\xe8", le32(12 + (if anytx == 1 then 86 else 0)), b"\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05") else if entrycoll == 1 then concat(b"\xe8", le32(12 + (if anytx == 1 then 86 else 0)), b"\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05") else if entrytx == 1 then b"\xe8\x7e\x00\x00\x00\x6a\x0a\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x48\x89\xe6\x48\xc7\xc2\x01\x00\x00\x00\x0f\x05\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05" else concat(b"\xe8", le32(96 + (if anytx == 1 then 86 else 0)), b"\x48\x83\xec\x20\x49\x89\xc1\x48\x8d\x74\x24\x1f\xc6\x06\x0a\x48\x85\xc0\x79\x03\x48\xf7\xd8\x48\xc7\xc1\x0a\x00\x00\x00\x48\x31\xd2\x48\xf7\xf1\x80\xc2\x30\x48\xff\xce\x88\x16\x48\x85\xc0\x75\xed\x4d\x85\xc9\x79\x06\x48\xff\xce\xc6\x06\x2d\x48\x8d\x54\x24\x20\x48\x29\xf2\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05"))), (if anytx == 1 then b"\x48\x83\xec\x28\x49\x89\xc1\x48\x8d\x74\x24\x20\x48\x85\xc0\x79\x03\x48\xf7\xd8\x48\xc7\xc1\x0a\x00\x00\x00\x48\x31\xd2\x48\xf7\xf1\x80\xc2\x30\x48\xff\xce\x88\x16\x48\x85\xc0\x75\xed\x4d\x85\xc9\x79\x06\x48\xff\xce\xc6\x06\x2d\x48\x8d\x54\x24\x20\x48\x29\xf2\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05\x48\x83\xc4\x28\xc3" else b""), x86_program(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: sizes, ress: ress, conns: conns, rxs: rxs }), (if uses_text == 1 then src_blob(SrcBlobState { src: s.source, pos: 0 }) else b""))
+    out = concat(abort_if(verrs), b"\x7f\x45\x4c\x46\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\x3e\x00\x01\x00\x00\x00\x78\x00\x40\x00\x00\x00\x00\x00\x40\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x40\x00\x38\x00\x01\x00\x00\x00\x00\x00\x00\x00", b"\x01\x00\x00\x00\x05\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x40\x00\x00\x00\x00\x00\x00\x00\x40\x00\x00\x00\x00\x00", le64(fsz), le64(fsz), b"\x00\x10\x00\x00\x00\x00\x00\x00", (if uses_var == 1 then b"\xb8\x09\x00\x00\x00\x31\xff\x48\xbe\x00\x00\x00\x00\x06\x00\x00\x00\xba\x03\x00\x00\x00\x41\xba\x22\x40\x00\x00\x49\xc7\xc0\xff\xff\xff\xff\x45\x31\xc9\x0f\x05\x48\x3d\x01\xf0\xff\xff\x72\x0c\xbf\x01\x00\x00\x00\xb8\x3c\x00\x00\x00\x0f\x05\x49\x89\xc7\x45\x31\xf6" else b""), (if has_input == 1 then (if field_list_has_text(cd_fields(concept_at_index(ConceptAtState { concepts: concepts, idx: ecidx }))) == 1 then x86_stdin_marshal(ArgvTrampState { fields: cd_fields(concept_at_index(ConceptAtState { concepts: concepts, idx: ecidx })), src: s.source, prog: prog, concepts: concepts, sizes: sizes, cidx: ecidx, ress: ress, conns: conns, rxs: rxs }) else x86_argv_marshal(ArgvTrampState { fields: cd_fields(concept_at_index(ConceptAtState { concepts: concepts, idx: ecidx })), src: s.source, prog: prog, concepts: concepts, sizes: sizes, cidx: ecidx, ress: ress, conns: conns, rxs: rxs })) else b""), x86_resource_marshal(RMarshalState { rem: ress, idx: 0, src: s.source, prog: prog, src_base: 4194304 + fsz0 }), x86_connection_marshal(CMarshalState { rem: conns, idx: 0, src: s.source, prog: prog, src_base: 4194304 + fsz0 }), (if has_reaction == 1 then x86_reaction_tramp(RxTrampState { rxs: rxs, src: s.source, anytx: anytx, concepts: concepts, ecidx: ecidx }) else (if entryresult == 1 then concat(b"\xe8", le32(205 + (if anytx == 1 then 86 else 0)), b"\x48\x69\xc0", le32(8 * (max_payload_fields(concepts) + 1)), b"\x4c\x01\xf8\x48\x8b\x08\x48\x8b\x40\x08\x48\x81\xf9", le32(15360000), b"\x0f\x85", le32(96), b"\x48\x83\xec\x20\x49\x89\xc1\x48\x8d\x74\x24\x1f\xc6\x06\x0a\x48\x85\xc0\x79\x03\x48\xf7\xd8\x48\xc7\xc1\x0a\x00\x00\x00\x48\x31\xd2\x48\xf7\xf1\x80\xc2\x30\x48\xff\xce\x88\x16\x48\x85\xc0\x75\xed\x4d\x85\xc9\x79\x06\x48\xff\xce\xc6\x06\x2d\x48\x8d\x54\x24\x20\x48\x29\xf2\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05", b"\x89\xc2\x48\xc1\xe8\x20\x48\xbe", le64(4194304 + blob_end_off(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: sizes, ress: ress, conns: conns, rxs: rxs })), b"\x48\x01\xc6\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x02\x00\x00\x00\x0f\x05\x6a\x0a\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x02\x00\x00\x00\x48\x89\xe6\x48\xc7\xc2\x01\x00\x00\x00\x0f\x05\x48\xc7\xc0\x3c\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05") else if entrybytes == 1 then concat(b"\xe8", le32(12 + (if anytx == 1 then 86 else 0)), b"\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05") else if entrycoll == 1 then concat(b"\xe8", le32(12 + (if anytx == 1 then 86 else 0)), b"\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05") else if entrytx == 1 then b"\xe8\x7e\x00\x00\x00\x6a\x0a\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x48\x89\xe6\x48\xc7\xc2\x01\x00\x00\x00\x0f\x05\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05" else concat(b"\xe8", le32(96 + (if anytx == 1 then 86 else 0)), b"\x48\x83\xec\x20\x49\x89\xc1\x48\x8d\x74\x24\x1f\xc6\x06\x0a\x48\x85\xc0\x79\x03\x48\xf7\xd8\x48\xc7\xc1\x0a\x00\x00\x00\x48\x31\xd2\x48\xf7\xf1\x80\xc2\x30\x48\xff\xce\x88\x16\x48\x85\xc0\x75\xed\x4d\x85\xc9\x79\x06\x48\xff\xce\xc6\x06\x2d\x48\x8d\x54\x24\x20\x48\x29\xf2\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05"))), (if anytx == 1 then b"\x48\x83\xec\x28\x49\x89\xc1\x48\x8d\x74\x24\x20\x48\x85\xc0\x79\x03\x48\xf7\xd8\x48\xc7\xc1\x0a\x00\x00\x00\x48\x31\xd2\x48\xf7\xf1\x80\xc2\x30\x48\xff\xce\x88\x16\x48\x85\xc0\x75\xed\x4d\x85\xc9\x79\x06\x48\xff\xce\xc6\x06\x2d\x48\x8d\x54\x24\x20\x48\x29\xf2\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05\x48\x83\xc4\x28\xc3" else b""), x86_program(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: sizes, ress: ress, conns: conns, rxs: rxs }), (if uses_text == 1 then src_blob(SrcBlobState { src: s.source, pos: 0 }) else b""))
   proofs:
     purity:
       reads : [s.source]
-      calls : [begin_tokenize, parse_program, parse_concepts, parse_resources, parse_reactions, parse_connections, resource_errors, reaction_errors, reaction_list_len, x86_reaction_tramp, resource_marshal_size, x86_resource_marshal, program_uses_result, concepts_append_result, diag_count, prog_diags, purity_list, term_list, proc_sizes, program_uses_arena, prog_any_texty, entry_rule_texty, entry_rule_bytes, entry_rule_result, entry_rule_collection, max_payload_fields, program_uses_text, blob_end_off, x86_program, src_blob, param_list_len, rl_head_params, fields_to_params, rl_head_input, params_to_fields, find_concept_index, fl_head_ty_start, fl_head_ty_len, x86_argv_marshal, x86_stdin_marshal, field_list_has_text, cd_fields, concept_at_index, connection_errors]
+      calls : [begin_tokenize, parse_program, parse_concepts, parse_resources, parse_reactions, parse_connections, resource_errors, reaction_errors, reaction_list_len, x86_reaction_tramp, resource_marshal_size, x86_resource_marshal, program_uses_result, concepts_append_result, diag_count, prog_diags, purity_list, term_list, proc_sizes, program_uses_arena, prog_any_texty, entry_rule_texty, entry_rule_bytes, entry_rule_result, entry_rule_collection, max_payload_fields, program_uses_text, blob_end_off, x86_program, src_blob, param_list_len, rl_head_params, fields_to_params, rl_head_input, params_to_fields, find_concept_index, fl_head_ty_start, fl_head_ty_len, x86_argv_marshal, x86_stdin_marshal, field_list_has_text, cd_fields, concept_at_index, connection_errors, connection_marshal_size, x86_connection_marshal]
     termination:
       bound : 256
 
