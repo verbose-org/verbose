@@ -2224,11 +2224,22 @@ fn check_expr_against(
         (Expr::ArenaScope(inner), Type::Bytes) => {
             check_expr_against(inner, &Type::Bytes, rule, all_rules, input_concept, all_concepts, errors);
         }
+        // `arena_scope(inner)` : number — the SCALAR form (slice 2). The inner
+        // walk's arena nodes are reclaimed and the inner's NUMBER is returned
+        // unchanged. Sound for exactly this expected type and no other: an i64
+        // scalar references no arena node, so nothing dangles after the reset.
+        // Deliberately NOT a catch-all — keeping every other expected type on
+        // the error arm below is the anti-dangling guard. In particular
+        // `(ArenaScope, Named(..))` must keep erroring: a concept-typed inner
+        // yields an arena INDEX, which would point into the reclaimed region.
+        (Expr::ArenaScope(inner), Type::Number) => {
+            check_expr_against(inner, &Type::Number, rule, all_rules, input_concept, all_concepts, errors);
+        }
         (Expr::ArenaScope(_), other) => {
             errors.push(VerifyError {
                 context: format!("rule '{}' / logic", rule.name),
                 message: format!(
-                    "arena_scope(...) produces bytes and is only valid in a bytes (streaming) position, but the expected type is '{}'",
+                    "arena_scope(...) is only valid in a bytes (streaming) position or a number (scalar) position, but the expected type is '{}'",
                     type_display(other),
                 ),
             });
