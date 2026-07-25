@@ -127,23 +127,37 @@
 -- subtrees for offset threading; proc_offset / blob_end_off re-walking the
 -- program per call site) makes that allocation O(sites x program): the FULL
 -- two-generation self-compile of the elf_program_src closure (front end +
--- checker + codegen backend) touches ~165M nodes and peaks at ~16 GiB RSS (each
--- slice that grows the self-source grows this — effects slice 1 pushed it toward
--- the old 16 GiB ceiling; effects slice 2a's reaction machinery tipped ~165.2M
--- past 16 GiB / 104 B-per-entry = ~165.2M capacity, overflowing mid-emit with a
--- SIGSEGV writing node #165M past the arena). The self-emitted binary's arena
--- mmap is therefore sized at 24 GiB (0x600000000, MAP_NORESERVE so only touched
--- pages — ~16 GiB at peak — cost physical RAM; ~247M-node capacity gives headroom
--- over the ~165M peak); the literal lives in elf_program_src's ELF prologue, and
+-- checker + codegen backend) once touched ~165M nodes and peaked at ~16 GiB RSS
+-- (each slice that grew the self-source grew this — effects slice 1 pushed it
+-- toward the old 16 GiB ceiling; effects slice 2a's reaction machinery tipped
+-- ~165.2M past 16 GiB / 104 B-per-entry = ~165.2M capacity, overflowing mid-emit
+-- with a SIGSEGV writing node #165M past the arena). SCALAR arena_scope slice 2
+-- (2026-07) then wrapped all 119 `code_size_*` call sites in the emit rules,
+-- which reclaims the within-proc size re-walk AND — the dominant term, measured —
+-- `proc_size`'s per-rule body walk under the unscoped `sizes` let: the peak is
+-- now ~5.5 GiB / ~57M nodes, and the emit is ~32% faster because the reclaim
+-- reuses hot arena pages. The self-emitted binary's arena
+-- mmap is sized at 24 GiB (0x600000000, MAP_NORESERVE so only touched
+-- pages — ~5.5 GiB at peak — cost physical RAM; ~247M-node capacity gives ample
+-- headroom over the ~57M peak); the literal lives in elf_program_src's ELF prologue, and
 -- blob_end_off counts it as 66 bytes. Bumping the VIRTUAL size (MAP_NORESERVE)
 -- does NOT change the physical peak — that is fixed by the actual node count — so
 -- the fix is "give the touched pages room", not "use more RAM". This lets gen1
 -- emit its ENTIRE self: gen1(reordered source) == gen0(reordered source)
 -- BYTE-FOR-BYTE (== gen1), and gen2 == gen1 — the two-generation fixed point.
--- The REAL fix (drop the arena to ~single-digit-M by threading the constant
--- blob_end_off / proc_offset through ByteGenState and/or adding arena reclamation
--- between top-level procs) is the documented next chantier — it would shrink the
--- ~16 GiB peak, not change the byte-identical output.
+-- The reclamation half of that chantier has now landed (streaming arena_scope at
+-- proc boundaries, PR #105; scalar arena_scope on `verrs`, PR #128; scalar
+-- arena_scope over the emit rules' size call sites, slice 2). What remains at
+-- ~5.5 GiB is LIVE arena-resident data — the parse tree plus the lists derived
+-- from it, interleaved with the parser's own transients — which a bump-mark
+-- reset cannot separate. Three measured probes confirmed the scoping lever is
+-- exhausted: wrapping `proc_sizes`' `size:` field, wrapping the 255 residual
+-- number-returning helper walks, and wrapping the 96 emit-recursion sites each
+-- moved the peak by under 4%, all upward. The remaining levers are
+-- REPRESENTATION (narrower arena entries; the 104 B/entry figure above is set by
+-- the widest variant's payload) and threading the constant blob_end_off /
+-- proc_offset through ByteGenState so those walks stop happening at all. Neither
+-- changes the byte-identical output.
 -- ============================================================================
 concept_group VExpr [max_depth: 4096, max_nodes: 6000000]
   @intention: "Tokens, a token cons-list, an arithmetic AST, and a parse result"
@@ -20863,7 +20877,7 @@ rule x86_vfields
     out : bytes
   logic:
     out = match bgv.fields:
-      VFCons(name_start, name_len, val, rest) => concat(x86_node(ByteGenState { node: val, src: bgv.src, off: bgv.off, params: bgv.params, lets: bgv.lets, prog: bgv.prog, concepts: bgv.concepts, sizes: bgv.sizes, ress: bgv.ress }), x86_vfields(ByteGenVFields { fields: rest, src: bgv.src, off: bgv.off + code_size_node(ByteGenState { node: val, src: bgv.src, off: bgv.off, params: bgv.params, lets: bgv.lets, prog: bgv.prog, concepts: bgv.concepts, sizes: bgv.sizes, ress: bgv.ress }), params: bgv.params, lets: bgv.lets, prog: bgv.prog, concepts: bgv.concepts, sizes: bgv.sizes, ress: bgv.ress }))
+      VFCons(name_start, name_len, val, rest) => concat(x86_node(ByteGenState { node: val, src: bgv.src, off: bgv.off, params: bgv.params, lets: bgv.lets, prog: bgv.prog, concepts: bgv.concepts, sizes: bgv.sizes, ress: bgv.ress }), x86_vfields(ByteGenVFields { fields: rest, src: bgv.src, off: bgv.off + arena_scope(code_size_node(ByteGenState { node: val, src: bgv.src, off: bgv.off, params: bgv.params, lets: bgv.lets, prog: bgv.prog, concepts: bgv.concepts, sizes: bgv.sizes, ress: bgv.ress })), params: bgv.params, lets: bgv.lets, prog: bgv.prog, concepts: bgv.concepts, sizes: bgv.sizes, ress: bgv.ress }))
       VFNil => b""
   proofs:
     purity:
@@ -21505,7 +21519,7 @@ rule x86_dispatch
     out : bytes
   logic:
     out = match ds.arms:
-      ArmCons(vstart, vlen, binders, body, rest) => concat(b"\x48\x81\xf9", le32(arm_tag_by_name(ArmTagState { concepts: ds.concepts, src: ds.src, vstart: vstart, vlen: vlen, cidx: 0 })), b"\x0f\x84", le32(ds.rest_disp + 9 + ds.pre_arms), x86_dispatch(DispatchState { arms: rest, src: ds.src, params: ds.params, lets: ds.lets, prog: ds.prog, concepts: ds.concepts, sizes: ds.sizes, rest_disp: ds.rest_disp - 13, pre_arms: ds.pre_arms + 14 * binder_list_len(binders) + code_size_node(ByteGenState { node: body, src: ds.src, off: 0, params: ds.params, lets: lets_append_binders(AppendBindersState { lets: ds.lets, bs: binders }), prog: ds.prog, concepts: ds.concepts, sizes: ds.sizes, ress: ds.ress }) + 5, ress: ds.ress }))
+      ArmCons(vstart, vlen, binders, body, rest) => concat(b"\x48\x81\xf9", le32(arm_tag_by_name(ArmTagState { concepts: ds.concepts, src: ds.src, vstart: vstart, vlen: vlen, cidx: 0 })), b"\x0f\x84", le32(ds.rest_disp + 9 + ds.pre_arms), x86_dispatch(DispatchState { arms: rest, src: ds.src, params: ds.params, lets: ds.lets, prog: ds.prog, concepts: ds.concepts, sizes: ds.sizes, rest_disp: ds.rest_disp - 13, pre_arms: ds.pre_arms + 14 * binder_list_len(binders) + arena_scope(code_size_node(ByteGenState { node: body, src: ds.src, off: 0, params: ds.params, lets: lets_append_binders(AppendBindersState { lets: ds.lets, bs: binders }), prog: ds.prog, concepts: ds.concepts, sizes: ds.sizes, ress: ds.ress })) + 5, ress: ds.ress }))
       ArmNil => b""
   proofs:
     purity:
@@ -21583,7 +21597,7 @@ rule x86_arms
     out : bytes
   logic:
     out = match ag.arms:
-      ArmCons(vstart, vlen, binders, body, rest) => concat(x86_binder_loads(BinderLoadState { binders: binders, j: 0, base_slot: count_binds(ag.lets) }), x86_node(ByteGenState { node: body, src: ag.src, off: ag.off + 14 * binder_list_len(binders), params: ag.params, lets: lets_append_binders(AppendBindersState { lets: ag.lets, bs: binders }), prog: ag.prog, concepts: ag.concepts, sizes: ag.sizes, ress: ag.ress }), b"\xe9", le32(code_size_arms(ArmSizeState { arms: rest, src: ag.src, params: ag.params, lets: ag.lets, prog: ag.prog, concepts: ag.concepts, sizes: ag.sizes, ress: ag.ress })), x86_arms(ArmGenState { arms: rest, src: ag.src, off: ag.off + 14 * binder_list_len(binders) + code_size_node(ByteGenState { node: body, src: ag.src, off: 0, params: ag.params, lets: lets_append_binders(AppendBindersState { lets: ag.lets, bs: binders }), prog: ag.prog, concepts: ag.concepts, sizes: ag.sizes, ress: ag.ress }) + 5, params: ag.params, lets: ag.lets, prog: ag.prog, concepts: ag.concepts, sizes: ag.sizes, ress: ag.ress }))
+      ArmCons(vstart, vlen, binders, body, rest) => concat(x86_binder_loads(BinderLoadState { binders: binders, j: 0, base_slot: count_binds(ag.lets) }), x86_node(ByteGenState { node: body, src: ag.src, off: ag.off + 14 * binder_list_len(binders), params: ag.params, lets: lets_append_binders(AppendBindersState { lets: ag.lets, bs: binders }), prog: ag.prog, concepts: ag.concepts, sizes: ag.sizes, ress: ag.ress }), b"\xe9", le32(arena_scope(code_size_arms(ArmSizeState { arms: rest, src: ag.src, params: ag.params, lets: ag.lets, prog: ag.prog, concepts: ag.concepts, sizes: ag.sizes, ress: ag.ress }))), x86_arms(ArmGenState { arms: rest, src: ag.src, off: ag.off + 14 * binder_list_len(binders) + arena_scope(code_size_node(ByteGenState { node: body, src: ag.src, off: 0, params: ag.params, lets: lets_append_binders(AppendBindersState { lets: ag.lets, bs: binders }), prog: ag.prog, concepts: ag.concepts, sizes: ag.sizes, ress: ag.ress })) + 5, params: ag.params, lets: ag.lets, prog: ag.prog, concepts: ag.concepts, sizes: ag.sizes, ress: ag.ress }))
       ArmNil => b""
   proofs:
     purity:
@@ -21773,7 +21787,7 @@ rule x86_let_stores
     out : bytes
   logic:
     out = match lg.rem:
-      BCons(name_start, name_len, value, rest) => concat(x86_node(ByteGenState { node: value, src: lg.src, off: lg.off, params: lg.params, lets: lg.all_binds, prog: lg.prog, concepts: lg.concepts, sizes: lg.sizes, ress: lg.ress }), b"\x58\x48\x89\x85", le32(0 - 8 * (lg.idx + 1)), x86_let_stores(LetGenState { rem: rest, all_binds: lg.all_binds, src: lg.src, off: lg.off + code_size_node(ByteGenState { node: value, src: lg.src, off: lg.off, params: lg.params, lets: lg.all_binds, prog: lg.prog, concepts: lg.concepts, sizes: lg.sizes, ress: lg.ress }) + 8, params: lg.params, idx: lg.idx + 1, prog: lg.prog, concepts: lg.concepts, sizes: lg.sizes, ress: lg.ress }))
+      BCons(name_start, name_len, value, rest) => concat(x86_node(ByteGenState { node: value, src: lg.src, off: lg.off, params: lg.params, lets: lg.all_binds, prog: lg.prog, concepts: lg.concepts, sizes: lg.sizes, ress: lg.ress }), b"\x58\x48\x89\x85", le32(0 - 8 * (lg.idx + 1)), x86_let_stores(LetGenState { rem: rest, all_binds: lg.all_binds, src: lg.src, off: lg.off + arena_scope(code_size_node(ByteGenState { node: value, src: lg.src, off: lg.off, params: lg.params, lets: lg.all_binds, prog: lg.prog, concepts: lg.concepts, sizes: lg.sizes, ress: lg.ress })) + 8, params: lg.params, idx: lg.idx + 1, prog: lg.prog, concepts: lg.concepts, sizes: lg.sizes, ress: lg.ress }))
       BNil => b""
   proofs:
     purity:
@@ -21803,7 +21817,7 @@ rule proc_size
     let nlets = count_binds(binds)
     let nbind = mb_ast(result) + mb_binds(binds)
     let subsize = if nlets + nbind > 0 then 7 else 0
-    let storesize = code_size_let_stores(LetGenState { rem: binds, all_binds: binds, src: pg.src, off: 0, params: rule_params_of(pg.rd), idx: 0, prog: pg.prog, concepts: pg.concepts, sizes: pg.sizes, ress: pg.ress })
+    let storesize = arena_scope(code_size_let_stores(LetGenState { rem: binds, all_binds: binds, src: pg.src, off: 0, params: rule_params_of(pg.rd), idx: 0, prog: pg.prog, concepts: pg.concepts, sizes: pg.sizes, ress: pg.ress }))
     -- COLLECTIONS tier slice 4b: declared-type/body-shape mismatch guard —
     -- out_ty CODE 3 (collection) without a top-level map/filter body, or a
     -- map/filter body under a non-collection output, sizes as the 1-byte int3
@@ -21815,7 +21829,7 @@ rule proc_size
     -- (code 1) under a text output, sizes as the 1-byte int3 x86_proc emits.
     let ftc = ast_fold_texty_code(TextyState { node: result, src: pg.src, prog: pg.prog })
     let is_text_out = if rd_out_ty(pg.rd) == 2 then 1 else 0
-    out = 4 + subsize + storesize + (if is_coll_body != is_coll_out then 1 else if ftc == 2 and is_text_out == 0 then 1 else if ftc == 1 and is_text_out == 1 then 1 else if rule_is_texty(pg) == 1 then code_size_stream_node(ByteGenState { node: result, src: pg.src, off: 0, params: rule_params_of(pg.rd), lets: binds, prog: pg.prog, concepts: pg.concepts, sizes: pg.sizes, ress: pg.ress }) + 2 else code_size_node(ByteGenState { node: result, src: pg.src, off: 0, params: rule_params_of(pg.rd), lets: binds, prog: pg.prog, concepts: pg.concepts, sizes: pg.sizes, ress: pg.ress })) + 6
+    out = 4 + subsize + storesize + (if is_coll_body != is_coll_out then 1 else if ftc == 2 and is_text_out == 0 then 1 else if ftc == 1 and is_text_out == 1 then 1 else if rule_is_texty(pg) == 1 then arena_scope(code_size_stream_node(ByteGenState { node: result, src: pg.src, off: 0, params: rule_params_of(pg.rd), lets: binds, prog: pg.prog, concepts: pg.concepts, sizes: pg.sizes, ress: pg.ress })) + 2 else arena_scope(code_size_node(ByteGenState { node: result, src: pg.src, off: 0, params: rule_params_of(pg.rd), lets: binds, prog: pg.prog, concepts: pg.concepts, sizes: pg.sizes, ress: pg.ress }))) + 6
   proofs:
     purity:
       reads : [pg, pg.rd, pg.src, pg.prog, pg.concepts, pg.sizes, pg.ress]
@@ -22092,7 +22106,7 @@ rule x86_args
     out : bytes
   logic:
     out = match ag.args:
-      ArgCons(head, tail) => concat(x86_node(ByteGenState { node: head, src: ag.src, off: ag.off, params: ag.params, lets: ag.lets, prog: ag.prog, concepts: ag.concepts, sizes: ag.sizes, ress: ag.ress }), x86_args(ByteGenArgs { args: tail, src: ag.src, off: ag.off + code_size_node(ByteGenState { node: head, src: ag.src, off: ag.off, params: ag.params, lets: ag.lets, prog: ag.prog, concepts: ag.concepts, sizes: ag.sizes, ress: ag.ress }), params: ag.params, lets: ag.lets, prog: ag.prog, concepts: ag.concepts, sizes: ag.sizes, ress: ag.ress }))
+      ArgCons(head, tail) => concat(x86_node(ByteGenState { node: head, src: ag.src, off: ag.off, params: ag.params, lets: ag.lets, prog: ag.prog, concepts: ag.concepts, sizes: ag.sizes, ress: ag.ress }), x86_args(ByteGenArgs { args: tail, src: ag.src, off: ag.off + arena_scope(code_size_node(ByteGenState { node: head, src: ag.src, off: ag.off, params: ag.params, lets: ag.lets, prog: ag.prog, concepts: ag.concepts, sizes: ag.sizes, ress: ag.ress })), params: ag.params, lets: ag.lets, prog: ag.prog, concepts: ag.concepts, sizes: ag.sizes, ress: ag.ress }))
       ArgNil => b""
   proofs:
     purity:
@@ -22142,7 +22156,7 @@ rule x86_proc
     let nlets = count_binds(binds)
     let nbind = mb_ast(result) + mb_binds(binds)
     let subsize = if nlets + nbind > 0 then 7 else 0
-    let storesize = code_size_let_stores(LetGenState { rem: binds, all_binds: binds, src: pg.src, off: 0, params: rule_params_of(pg.rd), idx: 0, prog: pg.prog, concepts: pg.concepts, sizes: pg.sizes, ress: pg.ress })
+    let storesize = arena_scope(code_size_let_stores(LetGenState { rem: binds, all_binds: binds, src: pg.src, off: 0, params: rule_params_of(pg.rd), idx: 0, prog: pg.prog, concepts: pg.concepts, sizes: pg.sizes, ress: pg.ress }))
     -- COLLECTIONS tier slice 4b: declared-type/body-shape mismatch guard — a
     -- rule whose out_ty CODE is 3 (collection) without a top-level map/filter
     -- body, or whose body IS a map/filter under a non-collection output, gets
@@ -22570,10 +22584,10 @@ rule x86_map_record
     let esize = 8 * (max_payload_fields(cr.concepts) + 1)
     let x_disp = 0 - 8 * (count_binds(cr.lets) + 1)
     let eb = lets_append_elem_binders(AppendElemBindersState { lets: cr.lets, item_start: cr.item_start, item_len: cr.item_len, second_start: 0, second_len: 0, cstart: cd_name_start(concept_at_index(ConceptAtState { concepts: cr.concepts, idx: cidx })), clen: cd_name_len(concept_at_index(ConceptAtState { concepts: cr.concepts, idx: cidx })) })
-    let coll_sz = code_size_node(ByteGenState { node: cr.coll, src: cr.src, off: cr.off, params: cr.params, lets: cr.lets, prog: cr.prog, concepts: cr.concepts, sizes: cr.sizes, ress: cr.ress })
-    let body_sz = code_size_node(ByteGenState { node: cr.body, src: cr.src, off: 0, params: cr.params, lets: eb, prog: cr.prog, concepts: cr.concepts, sizes: cr.sizes, ress: cr.ress })
+    let coll_sz = arena_scope(code_size_node(ByteGenState { node: cr.coll, src: cr.src, off: cr.off, params: cr.params, lets: cr.lets, prog: cr.prog, concepts: cr.concepts, sizes: cr.sizes, ress: cr.ress }))
+    let body_sz = arena_scope(code_size_node(ByteGenState { node: cr.body, src: cr.src, off: 0, params: cr.params, lets: eb, prog: cr.prog, concepts: cr.concepts, sizes: cr.sizes, ress: cr.ress }))
     let out_fields = cd_fields(concept_at_index(ConceptAtState { concepts: cr.concepts, idx: static_concept_of(StaticConceptState { node: cr.body, src: cr.src, params: cr.params, lets: cr.lets, concepts: cr.concepts }) }))
-    let json_sz = json_fields_size(out_fields) + 49
+    let json_sz = arena_scope(json_fields_size(out_fields)) + 49
     let json_off = cr.off + coll_sz + 72 * nf + 103 + body_sz
     out = concat(x86_node(ByteGenState { node: cr.coll, src: cr.src, off: cr.off, params: cr.params, lets: cr.lets, prog: cr.prog, concepts: cr.concepts, sizes: cr.sizes, ress: cr.ress }), b"\x41\x59\x49\x8b\x31", b"\x48\x31\xc0\x45\x31\xdb\x8a\x0e\x80\xf9\x2d\x75\x06\x41\xb3\x01\x48\xff\xc6\x0f\xb6\x0e\x80\xf9\x30\x72\x15\x80\xf9\x39\x77\x10\x48\x6b\xc0\x0a\x48\x83\xe9\x30\x48\x01\xc8\x48\xff\xc6\xeb\xe3\x4d\x85\xdb\x74\x03\x48\xf7\xd8", b"\x49\x89\xc0\x49\x83\xc1\x08", b"\x4d\x85\xc0\x0f\x84", le32(72 * nf + 38 + body_sz + json_sz), x86_elem_load(ElemLoadState { nf: nf, tag: cidx * 256, esize: esize, x_disp: x_disp, efields: cd_fields(concept_at_index(ConceptAtState { concepts: cr.concepts, idx: cidx })), src_base: 4194304 + blob_end_off(ProgGenState { rules: cr.prog, src: cr.src, off: 0, prog: cr.prog, concepts: cr.concepts, sizes: cr.sizes, ress: cr.ress, rxs: ReactionList::RxNil }) }), x86_node(ByteGenState { node: cr.body, src: cr.src, off: cr.off + coll_sz + 72 * nf + 103, params: cr.params, lets: eb, prog: cr.prog, concepts: cr.concepts, sizes: cr.sizes, ress: cr.ress }), x86_json_record(JsonRecState { fields: out_fields, esize: esize, off: json_off, src: cr.src, prog: cr.prog, concepts: cr.concepts, sizes: cr.sizes, ress: cr.ress }), b"\x49\x83\xc1\x08\x49\xff\xc8\xe9", le32(0 - (72 * nf + 47 + body_sz + json_sz)))
   proofs:
@@ -22634,9 +22648,9 @@ rule x86_filter_record
     let x_disp = 0 - 8 * (count_binds(cr.lets) + 1)
     let eb = lets_append_elem_binders(AppendElemBindersState { lets: cr.lets, item_start: cr.item_start, item_len: cr.item_len, second_start: 0, second_len: 0, cstart: cd_name_start(concept_at_index(ConceptAtState { concepts: cr.concepts, idx: cidx })), clen: cd_name_len(concept_at_index(ConceptAtState { concepts: cr.concepts, idx: cidx })) })
     let out_fields = cd_fields(concept_at_index(ConceptAtState { concepts: cr.concepts, idx: cidx }))
-    let coll_sz = code_size_node(ByteGenState { node: cr.coll, src: cr.src, off: cr.off, params: cr.params, lets: cr.lets, prog: cr.prog, concepts: cr.concepts, sizes: cr.sizes, ress: cr.ress })
-    let pred_sz = code_size_node(ByteGenState { node: cr.body, src: cr.src, off: 0, params: cr.params, lets: eb, prog: cr.prog, concepts: cr.concepts, sizes: cr.sizes, ress: cr.ress })
-    let json_sz = json_fields_size(out_fields) + 49
+    let coll_sz = arena_scope(code_size_node(ByteGenState { node: cr.coll, src: cr.src, off: cr.off, params: cr.params, lets: cr.lets, prog: cr.prog, concepts: cr.concepts, sizes: cr.sizes, ress: cr.ress }))
+    let pred_sz = arena_scope(code_size_node(ByteGenState { node: cr.body, src: cr.src, off: 0, params: cr.params, lets: eb, prog: cr.prog, concepts: cr.concepts, sizes: cr.sizes, ress: cr.ress }))
+    let json_sz = arena_scope(json_fields_size(out_fields)) + 49
     let json_off = cr.off + coll_sz + 72 * nf + 121 + pred_sz
     out = concat(x86_node(ByteGenState { node: cr.coll, src: cr.src, off: cr.off, params: cr.params, lets: cr.lets, prog: cr.prog, concepts: cr.concepts, sizes: cr.sizes, ress: cr.ress }), b"\x41\x59\x49\x8b\x31", b"\x48\x31\xc0\x45\x31\xdb\x8a\x0e\x80\xf9\x2d\x75\x06\x41\xb3\x01\x48\xff\xc6\x0f\xb6\x0e\x80\xf9\x30\x72\x15\x80\xf9\x39\x77\x10\x48\x6b\xc0\x0a\x48\x83\xe9\x30\x48\x01\xc8\x48\xff\xc6\xeb\xe3\x4d\x85\xdb\x74\x03\x48\xf7\xd8", b"\x49\x89\xc0\x49\x83\xc1\x08", b"\x4d\x85\xc0\x0f\x84", le32(72 * nf + 56 + pred_sz + json_sz), x86_elem_load(ElemLoadState { nf: nf, tag: cidx * 256, esize: esize, x_disp: x_disp, efields: cd_fields(concept_at_index(ConceptAtState { concepts: cr.concepts, idx: cidx })), src_base: 4194304 + blob_end_off(ProgGenState { rules: cr.prog, src: cr.src, off: 0, prog: cr.prog, concepts: cr.concepts, sizes: cr.sizes, ress: cr.ress, rxs: ReactionList::RxNil }) }), x86_node(ByteGenState { node: cr.body, src: cr.src, off: cr.off + coll_sz + 72 * nf + 103, params: cr.params, lets: eb, prog: cr.prog, concepts: cr.concepts, sizes: cr.sizes, ress: cr.ress }), b"\x58\x48\x85\xc0\x0f\x84", le32(8 + json_sz), b"\x48\x8b\x85", le32(x_disp), b"\x50", x86_json_record(JsonRecState { fields: out_fields, esize: esize, off: json_off, src: cr.src, prog: cr.prog, concepts: cr.concepts, sizes: cr.sizes, ress: cr.ress }), b"\x49\x83\xc1\x08\x49\xff\xc8\xe9", le32(0 - (72 * nf + 65 + pred_sz + json_sz)))
   proofs:
@@ -22778,7 +22792,7 @@ rule x86_stream_cargs
     out : bytes
   logic:
     out = match ag.args:
-      ArgCons(head, tail) => concat(x86_stream_node(ByteGenState { node: head, src: ag.src, off: ag.off, params: ag.params, lets: ag.lets, prog: ag.prog, concepts: ag.concepts, sizes: ag.sizes, ress: ag.ress }), x86_stream_cargs(ByteGenArgs { args: tail, src: ag.src, off: ag.off + code_size_stream_node(ByteGenState { node: head, src: ag.src, off: ag.off, params: ag.params, lets: ag.lets, prog: ag.prog, concepts: ag.concepts, sizes: ag.sizes, ress: ag.ress }), params: ag.params, lets: ag.lets, prog: ag.prog, concepts: ag.concepts, sizes: ag.sizes, ress: ag.ress }))
+      ArgCons(head, tail) => concat(x86_stream_node(ByteGenState { node: head, src: ag.src, off: ag.off, params: ag.params, lets: ag.lets, prog: ag.prog, concepts: ag.concepts, sizes: ag.sizes, ress: ag.ress }), x86_stream_cargs(ByteGenArgs { args: tail, src: ag.src, off: ag.off + arena_scope(code_size_stream_node(ByteGenState { node: head, src: ag.src, off: ag.off, params: ag.params, lets: ag.lets, prog: ag.prog, concepts: ag.concepts, sizes: ag.sizes, ress: ag.ress })), params: ag.params, lets: ag.lets, prog: ag.prog, concepts: ag.concepts, sizes: ag.sizes, ress: ag.ress }))
       ArgNil => b""
   proofs:
     purity:
@@ -22801,7 +22815,7 @@ rule x86_stream_dispatch
     out : bytes
   logic:
     out = match ds.arms:
-      ArmCons(vstart, vlen, binders, body, rest) => concat(b"\x48\x81\xf9", le32(arm_tag_by_name(ArmTagState { concepts: ds.concepts, src: ds.src, vstart: vstart, vlen: vlen, cidx: 0 })), b"\x0f\x84", le32(ds.rest_disp + 5 + ds.pre_arms), x86_stream_dispatch(DispatchState { arms: rest, src: ds.src, params: ds.params, lets: ds.lets, prog: ds.prog, concepts: ds.concepts, sizes: ds.sizes, rest_disp: ds.rest_disp - 13, pre_arms: ds.pre_arms + 14 * binder_list_len(binders) + code_size_stream_node(ByteGenState { node: body, src: ds.src, off: 0, params: ds.params, lets: lets_append_binders(AppendBindersState { lets: ds.lets, bs: binders }), prog: ds.prog, concepts: ds.concepts, sizes: ds.sizes, ress: ds.ress }) + 5, ress: ds.ress }))
+      ArmCons(vstart, vlen, binders, body, rest) => concat(b"\x48\x81\xf9", le32(arm_tag_by_name(ArmTagState { concepts: ds.concepts, src: ds.src, vstart: vstart, vlen: vlen, cidx: 0 })), b"\x0f\x84", le32(ds.rest_disp + 5 + ds.pre_arms), x86_stream_dispatch(DispatchState { arms: rest, src: ds.src, params: ds.params, lets: ds.lets, prog: ds.prog, concepts: ds.concepts, sizes: ds.sizes, rest_disp: ds.rest_disp - 13, pre_arms: ds.pre_arms + 14 * binder_list_len(binders) + arena_scope(code_size_stream_node(ByteGenState { node: body, src: ds.src, off: 0, params: ds.params, lets: lets_append_binders(AppendBindersState { lets: ds.lets, bs: binders }), prog: ds.prog, concepts: ds.concepts, sizes: ds.sizes, ress: ds.ress })) + 5, ress: ds.ress }))
       ArmNil => b""
   proofs:
     purity:
@@ -22824,7 +22838,7 @@ rule x86_stream_arms
     out : bytes
   logic:
     out = match ag.arms:
-      ArmCons(vstart, vlen, binders, body, rest) => concat(x86_binder_loads(BinderLoadState { binders: binders, j: 0, base_slot: count_binds(ag.lets) }), x86_stream_node(ByteGenState { node: body, src: ag.src, off: ag.off + 14 * binder_list_len(binders), params: ag.params, lets: lets_append_binders(AppendBindersState { lets: ag.lets, bs: binders }), prog: ag.prog, concepts: ag.concepts, sizes: ag.sizes, ress: ag.ress }), b"\xe9", le32(stream_size_arms(ArmSizeState { arms: rest, src: ag.src, params: ag.params, lets: ag.lets, prog: ag.prog, concepts: ag.concepts, sizes: ag.sizes, ress: ag.ress })), x86_stream_arms(ArmGenState { arms: rest, src: ag.src, off: ag.off + 14 * binder_list_len(binders) + code_size_stream_node(ByteGenState { node: body, src: ag.src, off: 0, params: ag.params, lets: lets_append_binders(AppendBindersState { lets: ag.lets, bs: binders }), prog: ag.prog, concepts: ag.concepts, sizes: ag.sizes, ress: ag.ress }) + 5, params: ag.params, lets: ag.lets, prog: ag.prog, concepts: ag.concepts, sizes: ag.sizes, ress: ag.ress }))
+      ArmCons(vstart, vlen, binders, body, rest) => concat(x86_binder_loads(BinderLoadState { binders: binders, j: 0, base_slot: count_binds(ag.lets) }), x86_stream_node(ByteGenState { node: body, src: ag.src, off: ag.off + 14 * binder_list_len(binders), params: ag.params, lets: lets_append_binders(AppendBindersState { lets: ag.lets, bs: binders }), prog: ag.prog, concepts: ag.concepts, sizes: ag.sizes, ress: ag.ress }), b"\xe9", le32(arena_scope(stream_size_arms(ArmSizeState { arms: rest, src: ag.src, params: ag.params, lets: ag.lets, prog: ag.prog, concepts: ag.concepts, sizes: ag.sizes, ress: ag.ress }))), x86_stream_arms(ArmGenState { arms: rest, src: ag.src, off: ag.off + 14 * binder_list_len(binders) + arena_scope(code_size_stream_node(ByteGenState { node: body, src: ag.src, off: 0, params: ag.params, lets: lets_append_binders(AppendBindersState { lets: ag.lets, bs: binders }), prog: ag.prog, concepts: ag.concepts, sizes: ag.sizes, ress: ag.ress })) + 5, params: ag.params, lets: ag.lets, prog: ag.prog, concepts: ag.concepts, sizes: ag.sizes, ress: ag.ress }))
       ArmNil => b""
   proofs:
     purity:
@@ -23374,7 +23388,7 @@ rule x86_fold_arg
   output:
     out : bytes
   logic:
-    out = if ast_is_str(bg.node) == 1 then x86_stream_node(bg) else if ast_field_is_text(StaticConceptState { node: bg.node, src: bg.src, params: bg.params, lets: bg.lets, concepts: bg.concepts }) == 1 then concat(x86_node(bg), b"\x58\x89\xc2\x48\xc1\xe8\x20\x48\xbe", le64(4194304 + blob_end_off(ProgGenState { rules: bg.prog, src: bg.src, off: 0, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress, rxs: ReactionList::RxNil })), b"\x48\x01\xc6\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05") else if ast_texty_shallow(PrintState { node: bg.node, src: bg.src }) == 1 then b"\xcc" else concat(x86_node(bg), b"\x58\x41\x51\xe8", le32(0 - (bg.off + code_size_node(bg) + 94)), b"\x41\x59")
+    out = if ast_is_str(bg.node) == 1 then x86_stream_node(bg) else if ast_field_is_text(StaticConceptState { node: bg.node, src: bg.src, params: bg.params, lets: bg.lets, concepts: bg.concepts }) == 1 then concat(x86_node(bg), b"\x58\x89\xc2\x48\xc1\xe8\x20\x48\xbe", le64(4194304 + blob_end_off(ProgGenState { rules: bg.prog, src: bg.src, off: 0, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress, rxs: ReactionList::RxNil })), b"\x48\x01\xc6\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05") else if ast_texty_shallow(PrintState { node: bg.node, src: bg.src }) == 1 then b"\xcc" else concat(x86_node(bg), b"\x58\x41\x51\xe8", le32(0 - (bg.off + arena_scope(code_size_node(bg)) + 94)), b"\x41\x59")
   proofs:
     purity:
       reads : [bg, bg.node, bg.src, bg.off, bg.params, bg.lets, bg.prog, bg.concepts, bg.sizes, bg.ress]

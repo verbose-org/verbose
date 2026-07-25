@@ -41249,11 +41249,12 @@ rule two
     /// This test pins THREE independent self-hosting properties (measured
     /// 2026-07 on WSL2, isolated single gen1 emit of the reordered 1.32 MB
     /// self-source via `/usr/bin/time -v`; gen0 — Rust, stack-passing records —
-    /// peaks ~140 MB; gen1 — the self-hosted emitter — peaks ~12.8 GiB / ~42 s
-    /// since the SCALAR `arena_scope` on `verrs` landed, was ~16.1 GiB / ~78 s
-    /// before it — and was ~2.55 GB / ~3.7 s back on the older 855 KB source
-    /// with only the streaming `arena_scope`; see the V3 paragraph above for the
-    /// gate-landing numbers):
+    /// peaks ~140 MB; gen1 — the self-hosted emitter — peaks ~5.5 GiB / ~29 s
+    /// since scalar `arena_scope` slice 2 wrapped the 119 `code_size_*` call
+    /// sites in the emit rules, was ~12.8 GiB / ~42 s with only the slice-1
+    /// `verrs` wrap, ~16.1 GiB / ~78 s before that — and was ~2.55 GB / ~3.7 s
+    /// back on the older 855 KB source with only the streaming `arena_scope`;
+    /// see the V3 paragraph above for the gate-landing numbers):
     ///
     ///   R0 — fixed point:   gen1(reordered) == gen2(reordered) byte-for-byte.
     ///   R1 — whole source:  gen0(ORIGINAL) == gen1(ORIGINAL) byte-for-byte —
@@ -41274,22 +41275,32 @@ rule two
     /// self-hosted emitter is a byte-identical, semantically-verified fixed
     /// point of the trusted reference.
     ///
-    /// IGNORED by default: gen1 (the self-hosted emitter) peaks ~12.8 GiB
+    /// IGNORED by default: gen1 (the self-hosted emitter) peaks ~5.5 GiB
     /// emitting the full 1.32 MB source (the Verbose runtime arena-allocates
-    /// every record/variant; the streaming `arena_scope` reclaims each proc's
-    /// walk transients at the proc boundary — see
-    /// docs/self-hosting-arena-scope-design.md — and the scalar `arena_scope` on
-    /// `verrs` reclaims the top-level verify baseline, together bringing the
-    /// pre-reclaim peak down toward the ~840 MB parse-tree floor + the biggest
-    /// single proc's within-proc code_size_node re-walk, which a later slice
-    /// targets). gen0 (Rust, stack-passing records) peaks ~140 MB. The test
+    /// every record/variant; three reclaim layers are now in place: the
+    /// streaming `arena_scope` reclaims each proc's walk transients at the proc
+    /// boundary — see docs/self-hosting-arena-scope-design.md — the scalar
+    /// `arena_scope` on `verrs` reclaims the top-level verify baseline, and
+    /// scalar `arena_scope` slice 2 wraps the 119 `code_size_*` call sites in
+    /// the emit rules, which reclaims both the within-proc size re-walk AND —
+    /// the dominant term, measured — `proc_size`'s per-rule body walk under the
+    /// unscoped `sizes` let: 12.8 -> 5.5 GiB, and ~32% FASTER because the
+    /// reclaim reuses hot arena pages. The residual ~5.5 GiB is LIVE
+    /// arena-resident data (the parse tree and the lists derived from it),
+    /// interleaved with the parser's own transients, so no further bump-mark
+    /// scoping reaches it — three measured probes confirmed this: wrapping
+    /// `proc_sizes`' `size:` field, wrapping the 255 residual number-returning
+    /// helper walks, and wrapping the 96 emit-recursion sites each moved the
+    /// peak by less than 4%, all in the wrong direction. The next lever is
+    /// REPRESENTATION (arena entry width / node count), not scoping).
+    /// gen0 (Rust, stack-passing records) peaks ~140 MB. The test
     /// also needs an unbounded stack (the src_blob recursion over the ~1.32 MB
     /// source) — the emit shell-outs raise it via `ulimit -s unlimited`. Kept
-    /// ignored for the default parallel dev suite (~12.8 GiB × parallel tests); the
+    /// ignored for the default parallel dev suite (~5.5 GiB × parallel tests); the
     /// dedicated `self-hosting-bootstrap` CI job runs it serially. Run explicitly:
     ///   cargo test --release -- --ignored --test-threads=1 two_generation
     #[test]
-    #[ignore = "gen1 peaks ~13 GiB RAM (verify pass + emit; ~165M arena nodes, verrs baseline now reclaimed via scalar arena_scope) + needs `ulimit -s unlimited` + ~1-2 min; run with --ignored"]
+    #[ignore = "gen1 peaks ~5.5 GiB RAM (verify pass + emit; the verrs baseline, the within-proc size re-walk and proc_size's per-rule walk are all reclaimed via scalar arena_scope) + needs `ulimit -s unlimited` + ~1-2 min; run with --ignored"]
     #[cfg(target_arch = "x86_64")]
     fn two_generation_bootstrap_fixed_point() {
         use std::fs;

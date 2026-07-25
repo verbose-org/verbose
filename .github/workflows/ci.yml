@@ -55,14 +55,18 @@ jobs:
   # its entire self byte-for-byte (R0 fixed point), emits the whole real source
   # with no reorder (R1), and its emitted binaries run correct across the construct
   # space (R2). Dedicated job (kept off the parallel test job so it doesn't share
-  # its memory). MEMORY (measured 2026-07, corrected from a stale 2.55 GiB note):
-  # the self-hosted emitter's arena is non-reclaiming at runtime, so gen1's peak
-  # RSS grows superlinearly with the self-source — ~2.55 GiB at ~509 rules (the
-  # arena_scope era, PR #105) up to ~15.4 GiB at ~690 rules now. That is ~94% of a
-  # 16 GiB ubuntu-latest runner: the fixed point is at the CI memory EDGE, and the
-  # durable fix is teaching the self-hosted emitter to reclaim like native.rs does
-  # (the PR #94 analog; Rust side went 247 MB -> 32 MB). Until that chantier lands,
-  # each slice that grows the self-source nudges this test closer to OOM; if it
+  # its memory). MEMORY (measured 2026-07): gen1's peak RSS emitting the 1.32 MB
+  # self-source is now ~5.5 GiB, down from ~15.4 GiB — the arena-reclamation
+  # chantier landed in three layers: the streaming `arena_scope` at proc
+  # boundaries (PR #105), the scalar `arena_scope` on the top-level `verrs`
+  # verify walk (16.1 -> 12.8 GiB), and scalar `arena_scope` slice 2 over the
+  # 119 `code_size_*` call sites in the emit rules (12.8 -> 5.5 GiB, and ~32%
+  # faster because the reclaim reuses hot arena pages). At ~5.5 GiB on a 16 GiB
+  # ubuntu-latest runner the fixed point is no longer at the CI memory EDGE, so
+  # a source-growing slice no longer nudges this test toward OOM. The residual
+  # is LIVE arena-resident data (the parse tree + the lists derived from it,
+  # interleaved with the parser's transients), which bump-mark scoping cannot
+  # reach — the next lever is representation, not reclaim. If it still
   # OOM-kills here, that is the wall, not a logic failure. Runs on push AND PR.
   self-hosting-bootstrap:
     name: Self-hosting bootstrap validation
