@@ -13959,7 +13959,8 @@ rule call_result_type
 -- bin_type), AstBytes => bytes (4), AstErr => ERROR (3). V1b: AstField types by
 -- FIELD SELECTION (base typed once, then field_sel_ty resolves the field's
 -- declared type in the base's concept), and AstCall dispatches concat to the
--- arg-driven concat_args_ty, other primitives and real callees to
+-- arg-driven concat_args_ty, arena_scope transparently to its argument's type,
+-- other primitives and real callees to
 -- call_result_type (header annotation, else the resolved `output:` span; an
 -- undefined callee still resolves to number). AstVar resolves its name in the type env
 -- via env_lookup (the stored type code; 0 = number for unbound params). The unary
@@ -13993,7 +13994,15 @@ rule type_of_env
       -- V1b: concat types by its ARGS (text vs bytes mode — see concat_args_ty);
       -- every other callee goes through call_result_type (primitives by what they
       -- produce, real rules by their declared output).
-      AstCall(callee_start, callee_len, args) => if span_is_concat(SpanCheck { src: t.src, start: callee_start, len: callee_len }) == 1 then concat_ty_final(ConcatFinalState { m: concat_args_ty(ConcatArgsTyState { args: args, tenv: t.tenv, src: t.src, prog: t.prog, concepts: t.concepts }) }) else call_result_type(CallRetState { prog: t.prog, src: t.src, callee_start: callee_start, callee_len: callee_len, concepts: t.concepts })
+      -- Scalar arena_scope slice 2: arena_scope is TYPE-TRANSPARENT — it returns
+      -- its argument's value unchanged (only reclaiming the arena nodes the inner
+      -- walk allocated), so its type IS its argument's type. Dispatched here (not
+      -- in call_result_type, whose CallRetState carries no args field) with the
+      -- same shape as concat's arg-driven dispatch. Without this arm
+      -- call_result_type would type it bytes(4), and `bg.off +
+      -- arena_scope(code_size_node(...))` would then fail bin_type's
+      -- both-operands-number requirement => verrs > 0 => abort_if refuses to emit.
+      AstCall(callee_start, callee_len, args) => if span_is_concat(SpanCheck { src: t.src, start: callee_start, len: callee_len }) == 1 then concat_ty_final(ConcatFinalState { m: concat_args_ty(ConcatArgsTyState { args: args, tenv: t.tenv, src: t.src, prog: t.prog, concepts: t.concepts }) }) else if span_is_arena_scope(SpanCheck { src: t.src, start: callee_start, len: callee_len }) == 1 then type_of_env(TypeArg { node: arg_first(args), tenv: t.tenv, src: t.src, prog: t.prog, concepts: t.concepts }) else call_result_type(CallRetState { prog: t.prog, src: t.src, callee_start: callee_start, callee_len: callee_len, concepts: t.concepts })
       AstIf(cond, thn, els) => if_type(IfTypeState { ct: type_of_env(TypeArg { node: cond, tenv: t.tenv, src: t.src, prog: t.prog, concepts: t.concepts }), tt: type_of_env(TypeArg { node: thn, tenv: t.tenv, src: t.src, prog: t.prog, concepts: t.concepts }), et: type_of_env(TypeArg { node: els, tenv: t.tenv, src: t.src, prog: t.prog, concepts: t.concepts }) })
       AstBool(value) => 1
       AstStr(start, len) => 2
@@ -14034,7 +14043,7 @@ rule type_of_env
   proofs:
     purity:
       reads : [t.node, t.tenv, t.src, t.prog, t.concepts]
-      calls : [type_of_env, env_lookup, bin_type, if_type, call_result_type, resolve_type, match_arm_ty, field_sel_ty, res_wrap_ty, mres_ty, span_is_concat, concat_ty_final, concat_args_ty]
+      calls : [type_of_env, env_lookup, bin_type, if_type, call_result_type, resolve_type, match_arm_ty, field_sel_ty, res_wrap_ty, mres_ty, span_is_concat, concat_ty_final, concat_args_ty, span_is_arena_scope, arg_first]
     termination:
       bound : 4000
 
