@@ -913,19 +913,22 @@ concept_group VExpr [max_depth: 4096, max_nodes: 6000000]
   -- Effects tier slice 2a: a parsed top-level REACTION declaration. `name_start` /
   -- `name_len` are the reaction NAME's source span. `trigger_start` / `trigger_len`
   -- are the trigger rule NAME's source span (a plain rule reference, resolved by
-  -- reaction_errors against the head rule). `path_start` / `path_len` and
-  -- `content_start` / `content_len` are the append_file path and content string
-  -- literals' INNER spans (quotes stripped, raw source bytes — UNESCAPED at EMIT
-  -- time by the byte-literal decoder, so the closed escape set `\n \r \t \\ \"` is
-  -- SUPPORTED). path_len == -1 is the MALFORMED-DECL sentinel (any header line
-  -- misspelled, path/content not a string literal — e.g. a concat, which is 2b
-  -- scope); reaction_errors counts it, the gate refuses emission. Single-variant
-  -- record-like group concept, exactly like Resource (MkResource).
+  -- reaction_errors against the head rule). `path_start` / `path_len` are the
+  -- append_file path string literal's INNER span (quotes stripped, raw source
+  -- bytes — UNESCAPED at EMIT time by the byte-literal decoder, so the closed
+  -- escape set `\n \r \t \\ \"` is SUPPORTED). Slice 2b: `content` is a parsed
+  -- Ast — a bare string literal parses to AstStr (whose token span INCLUDES the
+  -- quotes; use sites apply +1/-2), `concat(...)` parses to AstCall. Ast::AstErr
+  -- is the sentinel content (empty-list rx_head, or nothing parseable after the
+  -- path). path_len == -1 is the MALFORMED-DECL sentinel (any header line
+  -- misspelled, path not a string literal); reaction_errors counts it, the gate
+  -- refuses emission. Single-variant record-like group concept, exactly like
+  -- Resource (MkResource).
   concept Reaction
-    @intention: "A parsed top-level reaction declaration: name span + trigger name span + append_file path/content inner spans"
+    @intention: "A parsed top-level reaction declaration: name span + trigger name span + append_file path inner span + content Ast"
     @source: vexprparse.intent:72
     variants:
-      MkReaction of (name_start : number, name_len : number, trigger_start : number, trigger_len : number, path_start : number, path_len : number, content_start : number, content_len : number)
+      MkReaction of (name_start : number, name_len : number, trigger_start : number, trigger_len : number, path_start : number, path_len : number, content : Ast)
 
   -- Effects tier slice 2a: a cons-list of top-level reaction declarations in source
   -- order. Same cons shape as ResourceList (RsCons/RsNil), so the same arena
@@ -10419,7 +10422,7 @@ rule rx_name_start
     out : number
   logic:
     out = match r:
-      MkReaction(name_start, name_len, trigger_start, trigger_len, path_start, path_len, content_start, content_len) => name_start
+      MkReaction(name_start, name_len, trigger_start, trigger_len, path_start, path_len, content) => name_start
   proofs:
     purity:
       reads : [r]
@@ -10437,7 +10440,7 @@ rule rx_name_len
     out : number
   logic:
     out = match r:
-      MkReaction(name_start, name_len, trigger_start, trigger_len, path_start, path_len, content_start, content_len) => name_len
+      MkReaction(name_start, name_len, trigger_start, trigger_len, path_start, path_len, content) => name_len
   proofs:
     purity:
       reads : [r]
@@ -10455,7 +10458,7 @@ rule rx_trigger_start
     out : number
   logic:
     out = match r:
-      MkReaction(name_start, name_len, trigger_start, trigger_len, path_start, path_len, content_start, content_len) => trigger_start
+      MkReaction(name_start, name_len, trigger_start, trigger_len, path_start, path_len, content) => trigger_start
   proofs:
     purity:
       reads : [r]
@@ -10473,7 +10476,7 @@ rule rx_trigger_len
     out : number
   logic:
     out = match r:
-      MkReaction(name_start, name_len, trigger_start, trigger_len, path_start, path_len, content_start, content_len) => trigger_len
+      MkReaction(name_start, name_len, trigger_start, trigger_len, path_start, path_len, content) => trigger_len
   proofs:
     purity:
       reads : [r]
@@ -10491,7 +10494,7 @@ rule rx_path_start
     out : number
   logic:
     out = match r:
-      MkReaction(name_start, name_len, trigger_start, trigger_len, path_start, path_len, content_start, content_len) => path_start
+      MkReaction(name_start, name_len, trigger_start, trigger_len, path_start, path_len, content) => path_start
   proofs:
     purity:
       reads : [r]
@@ -10509,7 +10512,7 @@ rule rx_path_len
     out : number
   logic:
     out = match r:
-      MkReaction(name_start, name_len, trigger_start, trigger_len, path_start, path_len, content_start, content_len) => path_len
+      MkReaction(name_start, name_len, trigger_start, trigger_len, path_start, path_len, content) => path_len
   proofs:
     purity:
       reads : [r]
@@ -10518,34 +10521,20 @@ rule rx_path_len
       bound : 16
 
 
-rule rx_content_start
-  @intention: "The append_file content inner-span start of a reaction declaration"
+-- rx_content (slice 2b): the content Ast of a reaction declaration. AstStr for a
+-- bare string literal (token span INCLUDES quotes — use sites apply +1/-2, the
+-- established AstStr discipline), AstCall for a concat(...), AstErr for the
+-- RxNil sentinel or an unparseable content position.
+rule rx_content
+  @intention: "The append_file content expression of a reaction declaration (AstErr = sentinel/unparseable)"
   @source: vexprparse.intent:72
   input:
     r : Reaction
   output:
-    out : number
+    out : Ast
   logic:
     out = match r:
-      MkReaction(name_start, name_len, trigger_start, trigger_len, path_start, path_len, content_start, content_len) => content_start
-  proofs:
-    purity:
-      reads : [r]
-      calls : []
-    termination:
-      bound : 16
-
-
-rule rx_content_len
-  @intention: "The append_file content inner-span length of a reaction declaration (-1 = malformed)"
-  @source: vexprparse.intent:72
-  input:
-    r : Reaction
-  output:
-    out : number
-  logic:
-    out = match r:
-      MkReaction(name_start, name_len, trigger_start, trigger_len, path_start, path_len, content_start, content_len) => content_len
+      MkReaction(name_start, name_len, trigger_start, trigger_len, path_start, path_len, content) => content
   proofs:
     purity:
       reads : [r]
@@ -10589,7 +10578,7 @@ rule rx_head
   logic:
     out = match rl:
       RxCons(head, tail) => head
-      RxNil => Reaction::MkReaction { name_start: 0, name_len: 0, trigger_start: 0, trigger_len: 0, path_start: 0, path_len: 0 - 1, content_start: 0, content_len: 0 - 1 }
+      RxNil => Reaction::MkReaction { name_start: 0, name_len: 0, trigger_start: 0, trigger_len: 0, path_start: 0, path_len: 0 - 1, content: Ast::AstErr }
   proofs:
     purity:
       reads : [rl]
@@ -10645,10 +10634,15 @@ rule rl_head_name_len
 -- `reaction` keyword at the cursor, the NAME Ident at +1, skip_seps from +2 lands
 -- on `trigger` (its `:` at +1, the rule name Ident at +2); skip_seps from +3
 -- lands on `effects` (its `:` at +1); skip_seps from +2 (past the Newline + the
--- inner Indent) lands on `append_file`, whose path Str is at +1 and content Str
--- at +2. Path/content INNER spans are pstart+1 / plen-2 (quotes stripped). Any
--- shape failure marks the decl MALFORMED (path_len -1). The caller (parse_reactions)
--- computes the end cell structurally via skip_indented_block.
+-- inner Indent) lands on `append_file`, whose path Str is at +1. The path INNER
+-- span is pstart+1 / plen-2 (quotes stripped). Slice 2b: the CONTENT at +2 is
+-- parsed by parse_or (the established expression entry) — a bare string literal
+-- parses to AstStr (span INCLUDES quotes), concat(...) to AstCall; an
+-- unparseable position yields AstErr without advancing (reaction_errors refuses
+-- it). Any HEADER shape failure marks the decl MALFORMED (path_len -1 — the one
+-- consolidated malformed sentinel). parse_or's `next` needn't thread back: the
+-- caller (parse_reactions) computes the end cell structurally via
+-- skip_indented_block.
 rule parse_reaction_decl
   @intention: "Parse a `reaction NAME` block (trigger/effects/append_file) at the cursor into a Reaction"
   @source: vexprparse.intent:72
@@ -10670,15 +10664,13 @@ rule parse_reaction_decl
     let is_pstr = peek_is_str(advance(Advance { lst: ap, k: 1 }))
     let pstart = peek_str_start(advance(Advance { lst: ap, k: 1 }))
     let plen = peek_str_len(advance(Advance { lst: ap, k: 1 }))
-    let is_cstr = peek_is_str(advance(Advance { lst: ap, k: 2 }))
-    let cstart = peek_str_start(advance(Advance { lst: ap, k: 2 }))
-    let clen = peek_str_len(advance(Advance { lst: ap, k: 2 }))
-    let shape_ok = if is_trigger == 1 then (if is_effects == 1 then (if is_append == 1 then (if is_pstr == 1 then is_cstr else 0) else 0) else 0) else 0
-    out = Reaction::MkReaction { name_start: name_start, name_len: name_len, trigger_start: trig_start, trigger_len: trig_len, path_start: pstart + 1, path_len: if shape_ok == 1 then (if plen >= 2 then plen - 2 else 0 - 1) else 0 - 1, content_start: cstart + 1, content_len: if shape_ok == 1 then (if clen >= 2 then clen - 2 else 0 - 1) else 0 - 1 }
+    let cp = parse_or(ParseState { cell: advance(Advance { lst: ap, k: 2 }) })
+    let shape_ok = if is_trigger == 1 then (if is_effects == 1 then (if is_append == 1 then is_pstr else 0) else 0) else 0
+    out = Reaction::MkReaction { name_start: name_start, name_len: name_len, trigger_start: trig_start, trigger_len: trig_len, path_start: pstart + 1, path_len: if shape_ok == 1 then (if plen >= 2 then plen - 2 else 0 - 1) else 0 - 1, content: parsed_node(cp) }
   proofs:
     purity:
       reads : [ps.cell, ps.src]
-      calls : [peek_kw_start, peek_kw_len, skip_seps, span_is_trigger, span_is_effects, span_is_append_file, peek_is_str, peek_str_start, peek_str_len, advance]
+      calls : [peek_kw_start, peek_kw_len, skip_seps, span_is_trigger, span_is_effects, span_is_append_file, peek_is_str, peek_str_start, peek_str_len, parse_or, parsed_node, advance]
     termination:
       bound : 64
 
@@ -11581,35 +11573,197 @@ rule program_uses_src_base
       bound : 8000
 
 
--- RxErrState: everything the reaction verification surface needs.
+-- RxCkState (slice 2b): one content Ast node + everything the content shape
+-- check needs — the source, the trigger's input PARAM name span (an AstField
+-- arg's base must be exactly that variable), the trigger's input concept FIELD
+-- LIST (the referenced field must exist and be a NUMBER — text fields need a
+-- runtime strlen and are a later slice), and the concept list (field_ty_of
+-- resolves the declared type span through resolve_type).
+concept RxCkState
+  @intention: "A content Ast node + source + trigger input param name span + trigger concept fields + concepts, for the content shape check"
+  @source: vexprparse.intent:72
+  fields:
+    node : Ast
+    src : text [..256]
+    pn_start : number [0, 4000000]
+    pn_len : number [0, 4000000]
+    fields : FieldList
+    concepts : ConceptList
+
+
+-- rx_carg_ok: 1 iff ONE concat arg is an emit-lowerable shape — AstStr, or
+-- AstField whose base is EXACTLY the trigger's input param variable and whose
+-- field resolves to a NUMBER field (field_ty_of code 0) of the trigger's input
+-- concept. Everything else — nested concat, rule calls, text fields (code 2),
+-- bool fields (code 1), unknown fields (code 3), non-var bases — is 0, and the
+-- verify<->emit acceptance parity holds ARM-FOR-ARM with x86_rx_carg: verify
+-- accepts EXACTLY what emit lowers (the collections-tier verify-accepts-but-
+-- emit-int3s scar).
+rule rx_carg_ok
+  @intention: "1 if one reaction concat arg is a literal or a number field of the trigger's input record, 0 otherwise"
+  @source: vexprparse.intent:72
+  input:
+    rk : RxCkState
+  output:
+    out : number
+  logic:
+    out = match rk.node:
+      AstNum(value) => 0
+      AstBin(op, lhs, rhs) => 0
+      AstNeg(inner) => 0
+      AstNot(inner) => 0
+      AstVar(start, len) => 0
+      AstField(base, fstart, flen) => if ast_var_is_span(SpanUseState { node: base, src: rk.src, q_start: rk.pn_start, q_len: rk.pn_len }) == 1 and field_ty_of(FieldTyOfState { fields: rk.fields, src: rk.src, q_start: fstart, q_len: flen, concepts: rk.concepts }) == 0 then 1 else 0
+      AstCall(callee_start, callee_len, args) => 0
+      AstStr(start, len) => 1
+      AstBytes(start, len) => 0
+      AstBool(value) => 0
+      AstIf(cond, thn, els) => 0
+      AstErr => 0
+      AstVariant(cstart, clen, vstart, vlen, fields) => 0
+      AstMatch(scrut, arms) => 0
+      AstOk(inner) => 0
+      AstResErr(inner) => 0
+      AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => 0
+      AstSum(coll, item_start, item_len, body) => 0
+      AstCount(coll, item_start, item_len, body) => 0
+      AstFold(coll, init, acc_start, acc_len, item_start, item_len, body) => 0
+      AstAll(coll, item_start, item_len, body) => 0
+      AstAny(coll, item_start, item_len, body) => 0
+      AstMap(coll, item_start, item_len, body) => 0
+      AstFilter(coll, item_start, item_len, body) => 0
+      AstMinFold(coll, item_start, item_len, body) => 0
+      AstMaxFold(coll, item_start, item_len, body) => 0
+  proofs:
+    purity:
+      reads : [rk.node, rk.src, rk.pn_start, rk.pn_len, rk.fields, rk.concepts]
+      calls : [ast_var_is_span, field_ty_of]
+    termination:
+      bound : 64
+
+
+-- RxCkArgsState: the remaining concat args + the shape-check context.
+concept RxCkArgsState
+  @intention: "The remaining reaction concat args + the content shape-check context"
+  @source: vexprparse.intent:72
+  fields:
+    args : ArgList
+    src : text [..256]
+    pn_start : number [0, 4000000]
+    pn_len : number [0, 4000000]
+    fields : FieldList
+    concepts : ConceptList
+
+
+-- rx_cargs_ok: 1 iff EVERY concat arg passes rx_carg_ok. Mentions its recursion
+-- ONCE (lazy if); ArgNil -> 1 (an empty concat writes nothing — harmless).
+rule rx_cargs_ok
+  @intention: "1 if every reaction concat arg is an accepted shape, 0 otherwise"
+  @source: vexprparse.intent:72
+  input:
+    ra : RxCkArgsState
+  output:
+    out : number
+  logic:
+    out = match ra.args:
+      ArgCons(head, tail) => if rx_carg_ok(RxCkState { node: head, src: ra.src, pn_start: ra.pn_start, pn_len: ra.pn_len, fields: ra.fields, concepts: ra.concepts }) == 1 then rx_cargs_ok(RxCkArgsState { args: tail, src: ra.src, pn_start: ra.pn_start, pn_len: ra.pn_len, fields: ra.fields, concepts: ra.concepts }) else 0
+      ArgNil => 1
+  proofs:
+    purity:
+      reads : [ra.args, ra.src, ra.pn_start, ra.pn_len, ra.fields, ra.concepts]
+      calls : [rx_carg_ok, rx_cargs_ok]
+    termination:
+      bound : 512
+
+
+-- rx_content_ok: the slice-2b content shape check. 1 iff the content is an
+-- AstStr, OR an AstCall whose callee spells "concat" and whose EVERY arg passes
+-- rx_carg_ok. AstErr — the RxNil sentinel AND the unparseable-content marker —
+-- is REFUSED EXPLICITLY (its arm is 0), so malformed content can never pass.
+-- Non-concat calls, ifs, bare vars, everything else: 0 (breadcrumb posture:
+-- reaction content is a literal or a concat of literals/number fields).
+rule rx_content_ok
+  @intention: "1 if a reaction's content is a string literal or a concat of literals/number input fields, 0 otherwise (AstErr refused)"
+  @source: vexprparse.intent:72
+  input:
+    rk : RxCkState
+  output:
+    out : number
+  logic:
+    out = match rk.node:
+      AstNum(value) => 0
+      AstBin(op, lhs, rhs) => 0
+      AstNeg(inner) => 0
+      AstNot(inner) => 0
+      AstVar(start, len) => 0
+      AstField(base, fstart, flen) => 0
+      AstCall(callee_start, callee_len, args) => if span_is_concat(SpanCheck { src: rk.src, start: callee_start, len: callee_len }) == 1 then rx_cargs_ok(RxCkArgsState { args: args, src: rk.src, pn_start: rk.pn_start, pn_len: rk.pn_len, fields: rk.fields, concepts: rk.concepts }) else 0
+      AstStr(start, len) => 1
+      AstBytes(start, len) => 0
+      AstBool(value) => 0
+      AstIf(cond, thn, els) => 0
+      AstErr => 0
+      AstVariant(cstart, clen, vstart, vlen, fields) => 0
+      AstMatch(scrut, arms) => 0
+      AstOk(inner) => 0
+      AstResErr(inner) => 0
+      AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => 0
+      AstSum(coll, item_start, item_len, body) => 0
+      AstCount(coll, item_start, item_len, body) => 0
+      AstFold(coll, init, acc_start, acc_len, item_start, item_len, body) => 0
+      AstAll(coll, item_start, item_len, body) => 0
+      AstAny(coll, item_start, item_len, body) => 0
+      AstMap(coll, item_start, item_len, body) => 0
+      AstFilter(coll, item_start, item_len, body) => 0
+      AstMinFold(coll, item_start, item_len, body) => 0
+      AstMaxFold(coll, item_start, item_len, body) => 0
+  proofs:
+    purity:
+      reads : [rk.node, rk.src, rk.pn_start, rk.pn_len, rk.fields, rk.concepts]
+      calls : [span_is_concat, rx_cargs_ok]
+    termination:
+      bound : 64
+
+
+-- RxErrState: everything the reaction verification surface needs. Slice 2b
+-- widens with the concept list (the content shape check resolves the trigger's
+-- input concept + its field types through it).
 concept RxErrState
-  @intention: "The program + declared reactions + source, for the reaction verification surface"
+  @intention: "The program + declared reactions + source + concepts, for the reaction verification surface"
   @source: vexprparse.intent:72
   fields:
     prog : RuleList
     rxs : ReactionList
     src : text [..256]
+    concepts : ConceptList
 
 
--- reaction_errors: the slice-2a verrs contribution. When the program declares a
--- reaction (has_rx), it sums:
+-- reaction_errors: the slice-2a/2b verrs contribution. When the program declares
+-- a reaction (has_rx), it sums:
 --   (1) trigger != head rule (the marshal drives the entry from the HEAD rule, so
 --       slice 2a requires trigger == head — this also subsumes "trigger names a
 --       real rule": a name that matches nothing, or a non-head rule, fails);
 --   (2) path not a string literal (path_len -1 sentinel — also fires when the
 --       append_file effect head is misspelled or a `print` effect is used, since
 --       parse_reaction_decl marks the whole decl malformed then);
---   (3) content not a string literal (content_len -1 — a concat content, which is
---       slice 2b, lands here);
+--   (3) content not an accepted shape (slice 2b): AstStr, or concat(...) whose
+--       every arg is AstStr or <trigger input param>.<NUMBER field> — the
+--       rx_content_ok walk, in verify<->emit acceptance parity with
+--       x86_rx_content. AstErr (sentinel / unparseable), nested concat, text
+--       fields, rule calls all land here;
 --   (4) any src_base-dependent construct anywhere in the program (the threading
---       soundness invariant above);
+--       soundness invariant above — content literals are emitted inline and
+--       field args read the arena record, so 2b adds NO src_base dependence);
 --   (5) more than one reaction (POC shape).
 -- The expensive program-wide walk (4) is INLINED in the has_rx branch so the
 -- lazy if never runs it on the reaction-free self-source (where it would walk
 -- 680+ byte_at-using rules and return 1, but has_rx == 0 short-circuits to 0).
+-- The content-context lets (head params -> param name span, find_concept ->
+-- trigger concept fields) run under EAGER LETS on the self-source too — all
+-- tolerant walks over the sentinel (AstErr content -> 0, cheap by construction).
 -- Zero on the self-source by construction (parse_reactions -> RxNil -> has_rx 0).
 rule reaction_errors
-  @intention: "Total slice-2a verification errors: trigger==head, literal path/content, no src_base construct, single reaction"
+  @intention: "Total reaction verification errors: trigger==head, literal path, accepted content shape, no src_base construct, single reaction"
   @source: vexprparse.intent:72
   input:
     re : RxErrState
@@ -11621,13 +11775,16 @@ rule reaction_errors
     let h = rx_head(re.rxs)
     let trig_is_head = if rx_trigger_len(h) == rl_head_name_len(re.prog) and name_eq(NameEqState { src: re.src, a_start: rx_trigger_start(h), b_start: rl_head_name_start(re.prog), len: rx_trigger_len(h), off: 0 }) == 1 then 1 else 0
     let path_ok = if rx_path_len(h) >= 0 then 1 else 0
-    let content_ok = if rx_content_len(h) >= 0 then 1 else 0
+    let eparams = if param_list_len(rl_head_params(re.prog)) > 0 then rl_head_params(re.prog) else fields_to_params(rl_head_input(re.prog))
+    let efields = params_to_fields(eparams)
+    let tfields = cd_fields(find_concept(FindConceptState { concepts: re.concepts, src: re.src, q_start: fl_head_ty_start(efields), q_len: fl_head_ty_len(efields) }))
+    let content_ok = rx_content_ok(RxCkState { node: rx_content(h), src: re.src, pn_start: fl_head_start(efields), pn_len: fl_head_len(efields), fields: tfields, concepts: re.concepts })
     let one_reaction = if n == 1 then 1 else 0
     out = if has_rx == 0 then 0 else ((if trig_is_head == 1 then 0 else 1) + (if path_ok == 1 then 0 else 1) + (if content_ok == 1 then 0 else 1) + program_uses_src_base(UsesTextRules { rules: re.prog, src: re.src }) + (if one_reaction == 1 then 0 else 1))
   proofs:
     purity:
-      reads : [re.prog, re.rxs, re.src]
-      calls : [reaction_list_len, rx_head, rx_trigger_len, rx_trigger_start, rl_head_name_len, rl_head_name_start, name_eq, rx_path_len, rx_content_len, program_uses_src_base]
+      reads : [re.prog, re.rxs, re.src, re.concepts]
+      calls : [reaction_list_len, rx_head, rx_trigger_len, rx_trigger_start, rl_head_name_len, rl_head_name_start, name_eq, rx_path_len, rx_content, rx_content_ok, param_list_len, rl_head_params, fields_to_params, rl_head_input, params_to_fields, cd_fields, find_concept, fl_head_ty_start, fl_head_ty_len, fl_head_start, fl_head_len, program_uses_src_base]
     termination:
       bound : 64
 
@@ -23536,19 +23693,31 @@ rule ps_total
 
 
 -- ============================================================================
--- EFFECTS TIER slice 2a — emit: the reaction trampoline (the ENTRY when the
+-- EFFECTS TIER slice 2a+2b — emit: the reaction trampoline (the ENTRY when the
 -- program declares a reaction). Reuses the argv marshal + `call trigger` shape
 -- of the number trampoline, swapping only the TAIL: gate on the trigger's bool
--- result in rax, then open(append)/write(content)/close, then exit(0). Full Drop
--- policy — NO abort on any syscall failure (verbosec reaction parity): on an
--- unwritable path, open -> -1, write(-1)/close(-1) fail silently, exit 0.
--- Path + content bytes are UNESCAPED inline via emit_bytes_data (the AstBytes
--- idiom): the path block is sized dlen = plen+1 so it always carries a trailing
--- NUL (open needs a C string); the content block is sized clen (write length
--- skips the 4-byte padding). Layout (all offsets from the call):
---   [call 5] [test+jz 9] [open 32+P] [write 31+C] [close 10] [exit 9]
--- where P = 4*((plen+4)/4), C = 4*((clen+3)/4). Total = 96 + P + C =
--- reaction_tramp_size (the ONE sizing truth, mirrored by blob_end_off).
+-- result in rax, then open(append)/<content blocks>/close, then exit(0). Full
+-- Drop policy — NO abort on any syscall failure (verbosec reaction parity): on
+-- an unwritable path, open -> -1, write(-1)/close(-1) fail silently, exit 0.
+-- Path + literal-content bytes are UNESCAPED inline via emit_bytes_data (the
+-- AstBytes idiom): the path block is sized dlen = plen+1 so it always carries a
+-- trailing NUL (open needs a C string); a literal block is sized dlen (write
+-- length skips the 4-byte padding). Slice 2b: content is an Ast — an AstStr
+-- emits ONE literal block (byte-for-byte 2a's); a concat(...) emits ONE block
+-- PER ARG in order: AstStr arg -> the same literal block shape; AstField arg
+-- (a NUMBER field of the trigger's input record) -> the 102-byte field-itoa
+-- block (load the record's arena index from [rsp] — the marshal's push r14
+-- survives the call because the callee is caller-cleanup and the effect bytes
+-- have zero stack ops — resolve the field slot, itoa to the open fd in rbx).
+-- verbosec builds ONE buffer and issues ONE write; gen1 issues N writes — file
+-- bytes identical on the happy path (single process, O_APPEND, sequential);
+-- divergence documented in docs/self-hosting-effects-slice2b-design.md.
+-- Layout (all offsets from the call):
+--   [call 5] [test+jz 9] [open 32+P] [content blocks Σ] [close 10] [exit 9]
+-- where P = 4*((plen+4)/4), a literal block is 31 + 4*((dlen+3)/4), a field
+-- block is the constant 102. Total = 65 + P + Σ = reaction_tramp_size (the ONE
+-- sizing truth, mirrored by blob_end_off); a single-AstStr content reproduces
+-- 2a's 96 + P + C exactly (65 + P + (31 + C)).
 -- ============================================================================
 
 -- RxSizeState: the reaction list + source, to size the reaction trampoline.
@@ -23560,17 +23729,185 @@ concept RxSizeState
     src : text [..256]
 
 
+-- rx_lit_block_size (slice 2b): the byte length of ONE inline literal content
+-- block — `e9` jmp (5) + the 4-padded unescaped data + mov rax,1 (7) +
+-- mov rdi,rbx (3) + lea rsi (7) + mov rdx (7) + syscall (2) = 31 + 4*((dlen+3)/4).
+-- The input span is the AstStr TOKEN span (quotes INCLUDED — the established
+-- AstStr discipline): the decode runs on start+1 / len-2, tolerant on len < 2
+-- (the sentinel-under-eager-lets obligation — bytelit_decoded_len floors at 0).
+rule rx_lit_block_size
+  @intention: "Byte length of one inline literal content block: 31 + the 4-padded decoded length (AstStr token span in)"
+  @source: vexprparse.intent:72
+  input:
+    sc : SpanCheck
+  output:
+    out : number
+  logic:
+    let dlen = bytelit_decoded_len(DecodeState { src: sc.src, start: sc.start + 1, len: (if sc.len >= 2 then sc.len - 2 else 0), i: 0 })
+    out = 31 + 4 * ((dlen + 3) / 4)
+  proofs:
+    purity:
+      reads : [sc.src, sc.start, sc.len]
+      calls : [bytelit_decoded_len]
+    termination:
+      bound : 64
+
+
+-- RxContentState: one content Ast node + the source, for the content-block size
+-- walk. Concepts-free BY CONSTRUCTION: the field block is the CONSTANT 102 (the
+-- fixed disp32 load form keeps its size independent of the field index), so
+-- RxSizeState stays unwidened and sizing never needs the ConceptList.
+concept RxContentState
+  @intention: "A content Ast node + the source, for sizing its reaction content blocks"
+  @source: vexprparse.intent:72
+  fields:
+    node : Ast
+    src : text [..256]
+
+
+-- rx_carg_size: the block size of ONE concat arg. AstStr -> the literal block;
+-- AstField -> the constant 102 (21-byte record-slot load + the 81-byte
+-- fd-parameterized itoa); every other shape -> 0. reaction_errors refuses every
+-- 0-sized shape, so under the abort_if gate a refused arg never reaches the
+-- emitted output — and the emit walker (x86_rx_carg) mirrors this 0 with an
+-- empty byte block ARM-FOR-ARM, so size and emit cannot drift even on refused
+-- shapes evaluated under eager lets.
+rule rx_carg_size
+  @intention: "Block size of one reaction concat arg: literal block for AstStr, 102 for AstField, 0 otherwise"
+  @source: vexprparse.intent:72
+  input:
+    rc : RxContentState
+  output:
+    out : number
+  logic:
+    out = match rc.node:
+      AstNum(value) => 0
+      AstBin(op, lhs, rhs) => 0
+      AstNeg(inner) => 0
+      AstNot(inner) => 0
+      AstVar(start, len) => 0
+      AstField(base, fstart, flen) => 102
+      AstCall(callee_start, callee_len, args) => 0
+      AstStr(start, len) => rx_lit_block_size(SpanCheck { src: rc.src, start: start, len: len })
+      AstBytes(start, len) => 0
+      AstBool(value) => 0
+      AstIf(cond, thn, els) => 0
+      AstErr => 0
+      AstVariant(cstart, clen, vstart, vlen, fields) => 0
+      AstMatch(scrut, arms) => 0
+      AstOk(inner) => 0
+      AstResErr(inner) => 0
+      AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => 0
+      AstSum(coll, item_start, item_len, body) => 0
+      AstCount(coll, item_start, item_len, body) => 0
+      AstFold(coll, init, acc_start, acc_len, item_start, item_len, body) => 0
+      AstAll(coll, item_start, item_len, body) => 0
+      AstAny(coll, item_start, item_len, body) => 0
+      AstMap(coll, item_start, item_len, body) => 0
+      AstFilter(coll, item_start, item_len, body) => 0
+      AstMinFold(coll, item_start, item_len, body) => 0
+      AstMaxFold(coll, item_start, item_len, body) => 0
+  proofs:
+    purity:
+      reads : [rc.node, rc.src]
+      calls : [rx_lit_block_size]
+    termination:
+      bound : 64
+
+
+-- RxCArgsState: the remaining concat args + the source, for the per-arg size walk.
+concept RxCArgsState
+  @intention: "The remaining reaction concat args + the source, for the per-arg block size walk"
+  @source: vexprparse.intent:72
+  fields:
+    args : ArgList
+    src : text [..256]
+
+
+-- rx_cargs_size: the total block size of a concat's args, in order. Mentions its
+-- recursion ONCE (the 2^N eager-double-mention scar); ArgNil -> 0 (tolerant base).
+rule rx_cargs_size
+  @intention: "Total content-block byte length of a reaction concat's args, in order"
+  @source: vexprparse.intent:72
+  input:
+    ra : RxCArgsState
+  output:
+    out : number
+  logic:
+    out = match ra.args:
+      ArgCons(head, tail) => rx_carg_size(RxContentState { node: head, src: ra.src }) + rx_cargs_size(RxCArgsState { args: tail, src: ra.src })
+      ArgNil => 0
+  proofs:
+    purity:
+      reads : [ra.args, ra.src]
+      calls : [rx_carg_size, rx_cargs_size]
+    termination:
+      bound : 512
+
+
+-- rx_content_blocks_size: the total byte length of a reaction's CONTENT blocks —
+-- the ONE new sizing truth of slice 2b, used by BOTH reaction_tramp_size (for
+-- the total) and x86_reaction_tramp (for gate_rel), the argv_marshal_size
+-- discipline. AstStr -> one literal block (2a byte-compat: 31 + C); a concat
+-- AstCall -> the per-arg walk; anything else (AstErr sentinel included) -> 0.
+-- TOLERANT base cases throughout: the RxNil sentinel path runs this under EAGER
+-- LETS even when no reaction exists.
+rule rx_content_blocks_size
+  @intention: "Total byte length of a reaction's content blocks: one literal block for AstStr, per-arg blocks for concat, 0 otherwise"
+  @source: vexprparse.intent:72
+  input:
+    rc : RxContentState
+  output:
+    out : number
+  logic:
+    out = match rc.node:
+      AstNum(value) => 0
+      AstBin(op, lhs, rhs) => 0
+      AstNeg(inner) => 0
+      AstNot(inner) => 0
+      AstVar(start, len) => 0
+      AstField(base, fstart, flen) => 0
+      AstCall(callee_start, callee_len, args) => rx_cargs_size(RxCArgsState { args: args, src: rc.src })
+      AstStr(start, len) => rx_lit_block_size(SpanCheck { src: rc.src, start: start, len: len })
+      AstBytes(start, len) => 0
+      AstBool(value) => 0
+      AstIf(cond, thn, els) => 0
+      AstErr => 0
+      AstVariant(cstart, clen, vstart, vlen, fields) => 0
+      AstMatch(scrut, arms) => 0
+      AstOk(inner) => 0
+      AstResErr(inner) => 0
+      AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => 0
+      AstSum(coll, item_start, item_len, body) => 0
+      AstCount(coll, item_start, item_len, body) => 0
+      AstFold(coll, init, acc_start, acc_len, item_start, item_len, body) => 0
+      AstAll(coll, item_start, item_len, body) => 0
+      AstAny(coll, item_start, item_len, body) => 0
+      AstMap(coll, item_start, item_len, body) => 0
+      AstFilter(coll, item_start, item_len, body) => 0
+      AstMinFold(coll, item_start, item_len, body) => 0
+      AstMaxFold(coll, item_start, item_len, body) => 0
+  proofs:
+    purity:
+      reads : [rc.node, rc.src]
+      calls : [rx_cargs_size, rx_lit_block_size]
+    termination:
+      bound : 64
+
+
 -- reaction_tramp_size: the EXACT byte length of the reaction trampoline =
--- 96 (call 5 + gate 9 + open-fixed 32-P + write-fixed 31-C + close 10 + exit 9,
--- minus the two variable blocks) + path_block + cont_block, over the HEAD
--- reaction's UNESCAPED path/content lengths. path_block = 4*((plen+4)/4) (the
--- emit_bytes_data(dlen=plen+1) block, always NUL-terminated); cont_block =
--- 4*((clen+3)/4) (the emit_bytes_data(dlen=clen) block). 0 when no reaction is
--- declared (RxNil -> n 0). The ONE sizing truth: blob_end_off adds it to the
--- constant chain and x86_reaction_tramp emits exactly these bytes (the
--- resource_marshal_size discipline, so the two can never drift).
+-- 65 (call 5 + gate 9 + open-fixed 32-P + close 10 + exit 9, minus the path
+-- block) + path_block + content blocks, over the HEAD reaction's UNESCAPED
+-- path length and its content Ast. path_block = 4*((plen+4)/4) (the
+-- emit_bytes_data(dlen=plen+1) block, always NUL-terminated); the content
+-- term is rx_content_blocks_size (single AstStr -> 31 + 4*((clen+3)/4), so a
+-- 2a-shaped literal content reproduces the historical 96 + P + C exactly).
+-- 0 when no reaction is declared (RxNil -> n 0). The ONE sizing truth:
+-- blob_end_off adds it to the constant chain and x86_reaction_tramp emits
+-- exactly these bytes (the resource_marshal_size discipline, so the two can
+-- never drift).
 rule reaction_tramp_size
-  @intention: "Byte length of the reaction trampoline: 96 + path_block + cont_block (0 if no reaction)"
+  @intention: "Byte length of the reaction trampoline: 65 + path_block + content blocks (0 if no reaction)"
   @source: vexprparse.intent:72
   input:
     rs : RxSizeState
@@ -23580,14 +23917,200 @@ rule reaction_tramp_size
     let n = reaction_list_len(rs.rxs)
     let h = rx_head(rs.rxs)
     let plen = bytelit_decoded_len(DecodeState { src: rs.src, start: rx_path_start(h), len: rx_path_len(h), i: 0 })
-    let clen = bytelit_decoded_len(DecodeState { src: rs.src, start: rx_content_start(h), len: rx_content_len(h), i: 0 })
     let path_block = 4 * ((plen + 4) / 4)
-    let cont_block = 4 * ((clen + 3) / 4)
-    out = if n == 0 then 0 else 96 + path_block + cont_block
+    let cblocks = rx_content_blocks_size(RxContentState { node: rx_content(h), src: rs.src })
+    out = if n == 0 then 0 else 65 + path_block + cblocks
   proofs:
     purity:
       reads : [rs.rxs, rs.src]
-      calls : [reaction_list_len, rx_head, rx_path_start, rx_path_len, rx_content_start, rx_content_len, bytelit_decoded_len]
+      calls : [reaction_list_len, rx_head, rx_path_start, rx_path_len, rx_content, rx_content_blocks_size, bytelit_decoded_len]
+    termination:
+      bound : 64
+
+
+-- x86_rx_lit_block (slice 2b): emit ONE inline literal content block — the
+-- EXACT 2a encodings (the disp arithmetic only holds for these): `e9` jmp over
+-- the 4-padded unescaped data, then mov rax,1 (the 7-BYTE 48 c7 c0 form, NOT
+-- the 5-byte b8 form), mov rdi,rbx (3), lea rsi rip-rel (7, disp
+-- -(block + 17) where 17 = 7+3+7), mov rdx = dlen (7), syscall (2). The write
+-- length is dlen (decoded), skipping the 4-byte padding; no NUL (that is
+-- path-only). Input span = the AstStr TOKEN span (quotes included).
+rule x86_rx_lit_block
+  @intention: "Emit one inline literal content block: jmp-over-data + write(rbx, data, dlen), 2a's exact encodings"
+  @source: vexprparse.intent:72
+  input:
+    sc : SpanCheck
+  output:
+    out : bytes
+  logic:
+    let dlen = bytelit_decoded_len(DecodeState { src: sc.src, start: sc.start + 1, len: (if sc.len >= 2 then sc.len - 2 else 0), i: 0 })
+    let block = 4 * ((dlen + 3) / 4)
+    out = concat(b"\xe9", le32(block), emit_bytes_data(BytesEmitState { src: sc.src, start: sc.start + 1, len: (if sc.len >= 2 then sc.len - 2 else 0), i: 0, dlen: dlen }), b"\x48\xc7\xc0\x01\x00\x00\x00\x48\x89\xdf\x48\x8d\x35", le32(0 - (block + 17)), b"\x48\xc7\xc2", le32(dlen), b"\x0f\x05")
+  proofs:
+    purity:
+      reads : [sc.src, sc.start, sc.len]
+      calls : [bytelit_decoded_len, emit_bytes_data]
+    termination:
+      bound : 64
+
+
+-- RxCEmitState: one content Ast node + source + the trigger's input concept
+-- FIELD LIST + the arena entry size, for the content-block emit walk. fields /
+-- esize resolve an AstField arg to its arena payload slot: the marshal built
+-- the record with field j at [node + 8 + 8*j] (x86_field_pops), and esize is
+-- the COMPILED program's 8 * (max_payload_fields + 1) — the same values the
+-- marshal itself used, so the load and the store agree by construction.
+concept RxCEmitState
+  @intention: "A content Ast node + source + the trigger concept's fields + entry size, to emit its reaction content blocks"
+  @source: vexprparse.intent:72
+  fields:
+    node : Ast
+    src : text [..256]
+    fields : FieldList
+    esize : number
+
+
+-- x86_rx_carg: emit the block for ONE concat arg. AstStr -> the literal block;
+-- AstField -> the 102-byte field-itoa block:
+--   mov rax,[rsp] (4)            ; the record's arena index — the marshal's
+--                                ; `push r14` survives the `call trigger`
+--                                ; (caller-cleanup callee, zero stack ops in
+--                                ; the effect bytes before this point)
+--   imul rax, esize (7)          ; 48 69 c0 imm32
+--   add rax, r15 (3)             ; node_addr
+--   mov rax, [rax + 8 + 8*i] (7) ; 48 8b 80 disp32 — FIXED disp32 house form
+--   <K_itoa 81>                  ; the 86-byte shared itoa_proc with exactly
+--                                ; two deltas: mov rdi,1 (7B) -> mov rdi,rbx
+--                                ; (48 89 df, 3B) and the trailing ret dropped;
+--                                ; sub/add rsp,0x20 stay balanced so [rsp] is
+--                                ; the index again after. Scratch occupies
+--                                ; [rsp..rsp+0x20); first store at rsp+0x1f,
+--                                ; so the index slot (now [rsp+0x20]) is never
+--                                ; touched. No newline — the oracle's \n lives
+--                                ; in the last literal arg.
+-- Every other shape -> b"" (mirrors rx_carg_size's 0 arm-for-arm; refused by
+-- reaction_errors, unreachable under the abort_if gate).
+rule x86_rx_carg
+  @intention: "Emit one reaction concat arg block: literal block for AstStr, 102-byte field-itoa block for AstField, empty otherwise"
+  @source: vexprparse.intent:72
+  input:
+    rc : RxCEmitState
+  output:
+    out : bytes
+  logic:
+    out = match rc.node:
+      AstNum(value) => b""
+      AstBin(op, lhs, rhs) => b""
+      AstNeg(inner) => b""
+      AstNot(inner) => b""
+      AstVar(start, len) => b""
+      AstField(base, fstart, flen) => concat(b"\x48\x8b\x04\x24\x48\x69\xc0", le32(rc.esize), b"\x4c\x01\xf8\x48\x8b\x80", le32(8 + 8 * field_index_of(FieldIdxState { fields: rc.fields, src: rc.src, q_start: fstart, q_len: flen, idx: 0 })), b"\x48\x83\xec\x20\x49\x89\xc1\x48\x8d\x74\x24\x20\x48\x85\xc0\x79\x03\x48\xf7\xd8\x48\xc7\xc1\x0a\x00\x00\x00\x48\x31\xd2\x48\xf7\xf1\x80\xc2\x30\x48\xff\xce\x88\x16\x48\x85\xc0\x75\xed\x4d\x85\xc9\x79\x06\x48\xff\xce\xc6\x06\x2d\x48\x8d\x54\x24\x20\x48\x29\xf2\x48\xc7\xc0\x01\x00\x00\x00\x48\x89\xdf\x0f\x05\x48\x83\xc4\x20")
+      AstCall(callee_start, callee_len, args) => b""
+      AstStr(start, len) => x86_rx_lit_block(SpanCheck { src: rc.src, start: start, len: len })
+      AstBytes(start, len) => b""
+      AstBool(value) => b""
+      AstIf(cond, thn, els) => b""
+      AstErr => b""
+      AstVariant(cstart, clen, vstart, vlen, fields) => b""
+      AstMatch(scrut, arms) => b""
+      AstOk(inner) => b""
+      AstResErr(inner) => b""
+      AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => b""
+      AstSum(coll, item_start, item_len, body) => b""
+      AstCount(coll, item_start, item_len, body) => b""
+      AstFold(coll, init, acc_start, acc_len, item_start, item_len, body) => b""
+      AstAll(coll, item_start, item_len, body) => b""
+      AstAny(coll, item_start, item_len, body) => b""
+      AstMap(coll, item_start, item_len, body) => b""
+      AstFilter(coll, item_start, item_len, body) => b""
+      AstMinFold(coll, item_start, item_len, body) => b""
+      AstMaxFold(coll, item_start, item_len, body) => b""
+  proofs:
+    purity:
+      reads : [rc.node, rc.src, rc.fields, rc.esize]
+      calls : [x86_rx_lit_block, field_index_of]
+    termination:
+      bound : 64
+
+
+-- RxCArgsEmitState: the remaining concat args + source + fields/esize, for the
+-- per-arg emit walk (the emit sibling of RxCArgsState).
+concept RxCArgsEmitState
+  @intention: "The remaining reaction concat args + source + the trigger concept's fields + entry size, for the per-arg emit walk"
+  @source: vexprparse.intent:72
+  fields:
+    args : ArgList
+    src : text [..256]
+    fields : FieldList
+    esize : number
+
+
+-- x86_rx_cargs: emit each concat arg's block, in source order (one write per
+-- arg; verbosec builds one buffer + one write — file bytes identical on the
+-- happy path, divergence documented in the slice design). Mentions its
+-- recursion ONCE; ArgNil -> b"" (tolerant base).
+rule x86_rx_cargs
+  @intention: "Emit the reaction content blocks for a concat's args, in source order"
+  @source: vexprparse.intent:72
+  input:
+    ra : RxCArgsEmitState
+  output:
+    out : bytes
+  logic:
+    out = match ra.args:
+      ArgCons(head, tail) => concat(x86_rx_carg(RxCEmitState { node: head, src: ra.src, fields: ra.fields, esize: ra.esize }), x86_rx_cargs(RxCArgsEmitState { args: tail, src: ra.src, fields: ra.fields, esize: ra.esize }))
+      ArgNil => b""
+  proofs:
+    purity:
+      reads : [ra.args, ra.src, ra.fields, ra.esize]
+      calls : [x86_rx_carg, x86_rx_cargs]
+    termination:
+      bound : 512
+
+
+-- x86_rx_content: emit a reaction's CONTENT blocks. AstStr -> ONE literal block
+-- (byte-for-byte 2a's single content block — the byte-compat gate); a concat
+-- AstCall -> the per-arg walk; anything else -> b"" (mirrors
+-- rx_content_blocks_size arm-for-arm so size and emit cannot drift).
+rule x86_rx_content
+  @intention: "Emit a reaction's content blocks: one literal block for AstStr, per-arg blocks for concat, empty otherwise"
+  @source: vexprparse.intent:72
+  input:
+    rc : RxCEmitState
+  output:
+    out : bytes
+  logic:
+    out = match rc.node:
+      AstNum(value) => b""
+      AstBin(op, lhs, rhs) => b""
+      AstNeg(inner) => b""
+      AstNot(inner) => b""
+      AstVar(start, len) => b""
+      AstField(base, fstart, flen) => b""
+      AstCall(callee_start, callee_len, args) => x86_rx_cargs(RxCArgsEmitState { args: args, src: rc.src, fields: rc.fields, esize: rc.esize })
+      AstStr(start, len) => x86_rx_lit_block(SpanCheck { src: rc.src, start: start, len: len })
+      AstBytes(start, len) => b""
+      AstBool(value) => b""
+      AstIf(cond, thn, els) => b""
+      AstErr => b""
+      AstVariant(cstart, clen, vstart, vlen, fields) => b""
+      AstMatch(scrut, arms) => b""
+      AstOk(inner) => b""
+      AstResErr(inner) => b""
+      AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => b""
+      AstSum(coll, item_start, item_len, body) => b""
+      AstCount(coll, item_start, item_len, body) => b""
+      AstFold(coll, init, acc_start, acc_len, item_start, item_len, body) => b""
+      AstAll(coll, item_start, item_len, body) => b""
+      AstAny(coll, item_start, item_len, body) => b""
+      AstMap(coll, item_start, item_len, body) => b""
+      AstFilter(coll, item_start, item_len, body) => b""
+      AstMinFold(coll, item_start, item_len, body) => b""
+      AstMaxFold(coll, item_start, item_len, body) => b""
+  proofs:
+    purity:
+      reads : [rc.node, rc.src, rc.fields, rc.esize]
+      calls : [x86_rx_cargs, x86_rx_lit_block]
     termination:
       bound : 64
 
@@ -23595,25 +24118,32 @@ rule reaction_tramp_size
 -- RxTrampState: the reaction list + source + the program's anytx flag (the
 -- reaction trampoline's `call trigger` rel32 must skip the shared itoa_proc when
 -- any rule is texty — a valid trigger has anytx 0, but the term is carried for
--- robustness, exactly like the number trampoline's `+ 86`).
+-- robustness, exactly like the number trampoline's `+ 86`). Slice 2b widens with
+-- the COMPILED program's ConceptList + the entry concept index, so an AstField
+-- content arg resolves its field slot and entry size against the SAME concepts
+-- the argv marshal used (concepts here = the possibly-Result-appended list, the
+-- one max_payload_fields derives entry_size from at the marshal).
 concept RxTrampState
-  @intention: "The reaction list + source + anytx flag, to emit the reaction trampoline"
+  @intention: "The reaction list + source + anytx flag + compiled concepts + entry concept index, to emit the reaction trampoline"
   @source: vexprparse.intent:72
   fields:
     rxs : ReactionList
     src : text [..256]
     anytx : number
+    concepts : ConceptList
+    ecidx : number
 
 
 -- x86_reaction_tramp: emit the reaction trampoline for the HEAD reaction.
 -- call_rel = reaction_tramp_size - 5 (+ 86 if anytx) reaches the first proc (the
--- trigger, which is the head rule). gate_rel = 73 + P + C reaches the exit block.
--- open lea disp = -(P + 7); write lea disp = -(C + 17) (mov rdi,rbx is 4 bytes
--- shorter than the streaming write's mov rdi,1, so the disp differs from the
--- AstBytes idiom's 21). fd lives in rbx (r15/r14/r12/r13 are arena/count/argv/bump;
--- syscalls clobber only rax/rcx/r11, so rbx survives across write/close).
+-- trigger, which is the head rule). gate_rel = 42 + P + content blocks reaches
+-- the exit block (open 32+P + blocks + close 10). open lea disp = -(P + 7); a
+-- literal block's lea disp = -(block + 17) (mov rdi,rbx is 4 bytes shorter than
+-- the streaming write's mov rdi,1, so the disp differs from the AstBytes
+-- idiom's 21). fd lives in rbx (r15/r14/r12/r13 are arena/count/argv/bump;
+-- syscalls clobber only rax/rcx/r11, so rbx survives across every write/close).
 rule x86_reaction_tramp
-  @intention: "Emit the reaction trampoline: call trigger, gate on rax, open(append)/write(content)/close, exit 0"
+  @intention: "Emit the reaction trampoline: call trigger, gate on rax, open(append)/content blocks/close, exit 0"
   @source: vexprparse.intent:72
   input:
     rt : RxTrampState
@@ -23622,16 +24152,17 @@ rule x86_reaction_tramp
   logic:
     let h = rx_head(rt.rxs)
     let plen = bytelit_decoded_len(DecodeState { src: rt.src, start: rx_path_start(h), len: rx_path_len(h), i: 0 })
-    let clen = bytelit_decoded_len(DecodeState { src: rt.src, start: rx_content_start(h), len: rx_content_len(h), i: 0 })
     let path_block = 4 * ((plen + 4) / 4)
-    let cont_block = 4 * ((clen + 3) / 4)
+    let cblocks = rx_content_blocks_size(RxContentState { node: rx_content(h), src: rt.src })
     let call_rel = reaction_tramp_size(RxSizeState { rxs: rt.rxs, src: rt.src }) - 5 + (if rt.anytx == 1 then 86 else 0)
-    let gate_rel = 73 + path_block + cont_block
-    out = concat(b"\xe8", le32(call_rel), b"\x48\x85\xc0\x0f\x84", le32(gate_rel), b"\xe9", le32(path_block), emit_bytes_data(BytesEmitState { src: rt.src, start: rx_path_start(h), len: rx_path_len(h), i: 0, dlen: plen + 1 }), b"\x48\x8d\x3d", le32(0 - (path_block + 7)), b"\xb8\x02\x00\x00\x00\xbe\x41\x04\x00\x00\xba\xa4\x01\x00\x00\x0f\x05\x48\x89\xc3", b"\xe9", le32(cont_block), emit_bytes_data(BytesEmitState { src: rt.src, start: rx_content_start(h), len: rx_content_len(h), i: 0, dlen: clen }), b"\x48\xc7\xc0\x01\x00\x00\x00\x48\x89\xdf\x48\x8d\x35", le32(0 - (cont_block + 17)), b"\x48\xc7\xc2", le32(clen), b"\x0f\x05", b"\xb8\x03\x00\x00\x00\x48\x89\xdf\x0f\x05", b"\xb8\x3c\x00\x00\x00\x31\xff\x0f\x05")
+    let gate_rel = 42 + path_block + cblocks
+    let efields = cd_fields(concept_at_index(ConceptAtState { concepts: rt.concepts, idx: rt.ecidx }))
+    let esize = 8 * (max_payload_fields(rt.concepts) + 1)
+    out = concat(b"\xe8", le32(call_rel), b"\x48\x85\xc0\x0f\x84", le32(gate_rel), b"\xe9", le32(path_block), emit_bytes_data(BytesEmitState { src: rt.src, start: rx_path_start(h), len: rx_path_len(h), i: 0, dlen: plen + 1 }), b"\x48\x8d\x3d", le32(0 - (path_block + 7)), b"\xb8\x02\x00\x00\x00\xbe\x41\x04\x00\x00\xba\xa4\x01\x00\x00\x0f\x05\x48\x89\xc3", x86_rx_content(RxCEmitState { node: rx_content(h), src: rt.src, fields: efields, esize: esize }), b"\xb8\x03\x00\x00\x00\x48\x89\xdf\x0f\x05", b"\xb8\x3c\x00\x00\x00\x31\xff\x0f\x05")
   proofs:
     purity:
-      reads : [rt.rxs, rt.src, rt.anytx]
-      calls : [rx_head, bytelit_decoded_len, rx_path_start, rx_path_len, rx_content_start, rx_content_len, reaction_tramp_size, emit_bytes_data]
+      reads : [rt.rxs, rt.src, rt.anytx, rt.concepts, rt.ecidx]
+      calls : [rx_head, bytelit_decoded_len, rx_path_start, rx_path_len, rx_content, rx_content_blocks_size, reaction_tramp_size, emit_bytes_data, x86_rx_content, cd_fields, concept_at_index, max_payload_fields]
     termination:
       bound : 64
 
@@ -24282,7 +24813,7 @@ rule elf_program_src
     -- Effects tier slice 2a: the reaction list — used by reaction_errors (verify)
     -- AND by the has_reaction emit branch + blob_end_off sizing (emit).
     let rxs = parse_reactions(ProgramState { cell: toks, src: s.source })
-    let verrs = arena_scope(diag_count(prog_diags(ProgDiagsState { iter: prog, full: prog, src: s.source, idx: 0, concepts: concepts0 })) + purity_list(PurityListState { iter: prog, full: prog, src: s.source }) + term_list(TermListState { iter: prog, src: s.source }) + resource_errors(ResErrState { prog: prog, ress: ress, concepts: concepts0, src: s.source }) + reaction_errors(RxErrState { prog: prog, rxs: rxs, src: s.source }))
+    let verrs = arena_scope(diag_count(prog_diags(ProgDiagsState { iter: prog, full: prog, src: s.source, idx: 0, concepts: concepts0 })) + purity_list(PurityListState { iter: prog, full: prog, src: s.source }) + term_list(TermListState { iter: prog, src: s.source }) + resource_errors(ResErrState { prog: prog, ress: ress, concepts: concepts0, src: s.source }) + reaction_errors(RxErrState { prog: prog, rxs: rxs, src: s.source, concepts: concepts0 }))
     let sizes = proc_sizes(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: ProcSizeList::PSNil, ress: ress, rxs: rxs })
     let uses_var = program_uses_arena(concepts)
     let anytx = prog_any_texty(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: sizes, ress: ress, rxs: rxs })
@@ -24317,7 +24848,7 @@ rule elf_program_src
     -- trampoline REPLACES the entry_rule_* trampoline cascade (the trigger IS the
     -- head/entry proc, gated + open/write/close instead of itoa+print).
     let has_reaction = if reaction_list_len(rxs) > 0 then 1 else 0
-    out = concat(abort_if(verrs), b"\x7f\x45\x4c\x46\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\x3e\x00\x01\x00\x00\x00\x78\x00\x40\x00\x00\x00\x00\x00\x40\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x40\x00\x38\x00\x01\x00\x00\x00\x00\x00\x00\x00", b"\x01\x00\x00\x00\x05\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x40\x00\x00\x00\x00\x00\x00\x00\x40\x00\x00\x00\x00\x00", le64(fsz), le64(fsz), b"\x00\x10\x00\x00\x00\x00\x00\x00", (if uses_var == 1 then b"\xb8\x09\x00\x00\x00\x31\xff\x48\xbe\x00\x00\x00\x00\x06\x00\x00\x00\xba\x03\x00\x00\x00\x41\xba\x22\x40\x00\x00\x49\xc7\xc0\xff\xff\xff\xff\x45\x31\xc9\x0f\x05\x48\x3d\x01\xf0\xff\xff\x72\x0c\xbf\x01\x00\x00\x00\xb8\x3c\x00\x00\x00\x0f\x05\x49\x89\xc7\x45\x31\xf6" else b""), (if has_input == 1 then (if field_list_has_text(cd_fields(concept_at_index(ConceptAtState { concepts: concepts, idx: ecidx }))) == 1 then x86_stdin_marshal(ArgvTrampState { fields: cd_fields(concept_at_index(ConceptAtState { concepts: concepts, idx: ecidx })), src: s.source, prog: prog, concepts: concepts, sizes: sizes, cidx: ecidx, ress: ress, rxs: rxs }) else x86_argv_marshal(ArgvTrampState { fields: cd_fields(concept_at_index(ConceptAtState { concepts: concepts, idx: ecidx })), src: s.source, prog: prog, concepts: concepts, sizes: sizes, cidx: ecidx, ress: ress, rxs: rxs })) else b""), x86_resource_marshal(RMarshalState { rem: ress, idx: 0, src: s.source, prog: prog, src_base: 4194304 + fsz0 }), (if has_reaction == 1 then x86_reaction_tramp(RxTrampState { rxs: rxs, src: s.source, anytx: anytx }) else (if entryresult == 1 then concat(b"\xe8", le32(205 + (if anytx == 1 then 86 else 0)), b"\x48\x69\xc0", le32(8 * (max_payload_fields(concepts) + 1)), b"\x4c\x01\xf8\x48\x8b\x08\x48\x8b\x40\x08\x48\x81\xf9", le32(15360000), b"\x0f\x85", le32(96), b"\x48\x83\xec\x20\x49\x89\xc1\x48\x8d\x74\x24\x1f\xc6\x06\x0a\x48\x85\xc0\x79\x03\x48\xf7\xd8\x48\xc7\xc1\x0a\x00\x00\x00\x48\x31\xd2\x48\xf7\xf1\x80\xc2\x30\x48\xff\xce\x88\x16\x48\x85\xc0\x75\xed\x4d\x85\xc9\x79\x06\x48\xff\xce\xc6\x06\x2d\x48\x8d\x54\x24\x20\x48\x29\xf2\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05", b"\x89\xc2\x48\xc1\xe8\x20\x48\xbe", le64(4194304 + blob_end_off(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: sizes, ress: ress, rxs: rxs })), b"\x48\x01\xc6\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x02\x00\x00\x00\x0f\x05\x6a\x0a\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x02\x00\x00\x00\x48\x89\xe6\x48\xc7\xc2\x01\x00\x00\x00\x0f\x05\x48\xc7\xc0\x3c\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05") else if entrybytes == 1 then concat(b"\xe8", le32(12 + (if anytx == 1 then 86 else 0)), b"\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05") else if entrycoll == 1 then concat(b"\xe8", le32(12 + (if anytx == 1 then 86 else 0)), b"\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05") else if entrytx == 1 then b"\xe8\x7e\x00\x00\x00\x6a\x0a\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x48\x89\xe6\x48\xc7\xc2\x01\x00\x00\x00\x0f\x05\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05" else concat(b"\xe8", le32(96 + (if anytx == 1 then 86 else 0)), b"\x48\x83\xec\x20\x49\x89\xc1\x48\x8d\x74\x24\x1f\xc6\x06\x0a\x48\x85\xc0\x79\x03\x48\xf7\xd8\x48\xc7\xc1\x0a\x00\x00\x00\x48\x31\xd2\x48\xf7\xf1\x80\xc2\x30\x48\xff\xce\x88\x16\x48\x85\xc0\x75\xed\x4d\x85\xc9\x79\x06\x48\xff\xce\xc6\x06\x2d\x48\x8d\x54\x24\x20\x48\x29\xf2\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05"))), (if anytx == 1 then b"\x48\x83\xec\x28\x49\x89\xc1\x48\x8d\x74\x24\x20\x48\x85\xc0\x79\x03\x48\xf7\xd8\x48\xc7\xc1\x0a\x00\x00\x00\x48\x31\xd2\x48\xf7\xf1\x80\xc2\x30\x48\xff\xce\x88\x16\x48\x85\xc0\x75\xed\x4d\x85\xc9\x79\x06\x48\xff\xce\xc6\x06\x2d\x48\x8d\x54\x24\x20\x48\x29\xf2\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05\x48\x83\xc4\x28\xc3" else b""), x86_program(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: sizes, ress: ress, rxs: rxs }), (if uses_text == 1 then src_blob(SrcBlobState { src: s.source, pos: 0 }) else b""))
+    out = concat(abort_if(verrs), b"\x7f\x45\x4c\x46\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\x3e\x00\x01\x00\x00\x00\x78\x00\x40\x00\x00\x00\x00\x00\x40\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x40\x00\x38\x00\x01\x00\x00\x00\x00\x00\x00\x00", b"\x01\x00\x00\x00\x05\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x40\x00\x00\x00\x00\x00\x00\x00\x40\x00\x00\x00\x00\x00", le64(fsz), le64(fsz), b"\x00\x10\x00\x00\x00\x00\x00\x00", (if uses_var == 1 then b"\xb8\x09\x00\x00\x00\x31\xff\x48\xbe\x00\x00\x00\x00\x06\x00\x00\x00\xba\x03\x00\x00\x00\x41\xba\x22\x40\x00\x00\x49\xc7\xc0\xff\xff\xff\xff\x45\x31\xc9\x0f\x05\x48\x3d\x01\xf0\xff\xff\x72\x0c\xbf\x01\x00\x00\x00\xb8\x3c\x00\x00\x00\x0f\x05\x49\x89\xc7\x45\x31\xf6" else b""), (if has_input == 1 then (if field_list_has_text(cd_fields(concept_at_index(ConceptAtState { concepts: concepts, idx: ecidx }))) == 1 then x86_stdin_marshal(ArgvTrampState { fields: cd_fields(concept_at_index(ConceptAtState { concepts: concepts, idx: ecidx })), src: s.source, prog: prog, concepts: concepts, sizes: sizes, cidx: ecidx, ress: ress, rxs: rxs }) else x86_argv_marshal(ArgvTrampState { fields: cd_fields(concept_at_index(ConceptAtState { concepts: concepts, idx: ecidx })), src: s.source, prog: prog, concepts: concepts, sizes: sizes, cidx: ecidx, ress: ress, rxs: rxs })) else b""), x86_resource_marshal(RMarshalState { rem: ress, idx: 0, src: s.source, prog: prog, src_base: 4194304 + fsz0 }), (if has_reaction == 1 then x86_reaction_tramp(RxTrampState { rxs: rxs, src: s.source, anytx: anytx, concepts: concepts, ecidx: ecidx }) else (if entryresult == 1 then concat(b"\xe8", le32(205 + (if anytx == 1 then 86 else 0)), b"\x48\x69\xc0", le32(8 * (max_payload_fields(concepts) + 1)), b"\x4c\x01\xf8\x48\x8b\x08\x48\x8b\x40\x08\x48\x81\xf9", le32(15360000), b"\x0f\x85", le32(96), b"\x48\x83\xec\x20\x49\x89\xc1\x48\x8d\x74\x24\x1f\xc6\x06\x0a\x48\x85\xc0\x79\x03\x48\xf7\xd8\x48\xc7\xc1\x0a\x00\x00\x00\x48\x31\xd2\x48\xf7\xf1\x80\xc2\x30\x48\xff\xce\x88\x16\x48\x85\xc0\x75\xed\x4d\x85\xc9\x79\x06\x48\xff\xce\xc6\x06\x2d\x48\x8d\x54\x24\x20\x48\x29\xf2\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05", b"\x89\xc2\x48\xc1\xe8\x20\x48\xbe", le64(4194304 + blob_end_off(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: sizes, ress: ress, rxs: rxs })), b"\x48\x01\xc6\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x02\x00\x00\x00\x0f\x05\x6a\x0a\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x02\x00\x00\x00\x48\x89\xe6\x48\xc7\xc2\x01\x00\x00\x00\x0f\x05\x48\xc7\xc0\x3c\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05") else if entrybytes == 1 then concat(b"\xe8", le32(12 + (if anytx == 1 then 86 else 0)), b"\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05") else if entrycoll == 1 then concat(b"\xe8", le32(12 + (if anytx == 1 then 86 else 0)), b"\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05") else if entrytx == 1 then b"\xe8\x7e\x00\x00\x00\x6a\x0a\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x48\x89\xe6\x48\xc7\xc2\x01\x00\x00\x00\x0f\x05\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05" else concat(b"\xe8", le32(96 + (if anytx == 1 then 86 else 0)), b"\x48\x83\xec\x20\x49\x89\xc1\x48\x8d\x74\x24\x1f\xc6\x06\x0a\x48\x85\xc0\x79\x03\x48\xf7\xd8\x48\xc7\xc1\x0a\x00\x00\x00\x48\x31\xd2\x48\xf7\xf1\x80\xc2\x30\x48\xff\xce\x88\x16\x48\x85\xc0\x75\xed\x4d\x85\xc9\x79\x06\x48\xff\xce\xc6\x06\x2d\x48\x8d\x54\x24\x20\x48\x29\xf2\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05"))), (if anytx == 1 then b"\x48\x83\xec\x28\x49\x89\xc1\x48\x8d\x74\x24\x20\x48\x85\xc0\x79\x03\x48\xf7\xd8\x48\xc7\xc1\x0a\x00\x00\x00\x48\x31\xd2\x48\xf7\xf1\x80\xc2\x30\x48\xff\xce\x88\x16\x48\x85\xc0\x75\xed\x4d\x85\xc9\x79\x06\x48\xff\xce\xc6\x06\x2d\x48\x8d\x54\x24\x20\x48\x29\xf2\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05\x48\x83\xc4\x28\xc3" else b""), x86_program(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: sizes, ress: ress, rxs: rxs }), (if uses_text == 1 then src_blob(SrcBlobState { src: s.source, pos: 0 }) else b""))
   proofs:
     purity:
       reads : [s.source]

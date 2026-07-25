@@ -23262,11 +23262,14 @@ rule le64_neg
 
     /// EFFECTS TIER slice 2a — verify gate + append_toks collision pin. gen0's
     /// abort_if(verrs) refuses (exit 1, no ELF) every malformed reaction:
-    /// trigger naming a missing rule, trigger != head rule, concat content
-    /// (slice 2b), a src_base-dependent trigger (the threading-soundness
-    /// invariant), and an `append_toks` effect (proving span_is_append_file
-    /// full-byte-compares — a prefix check would misfire on the `append_` prefix
-    /// that append_toks shares). A clean reaction emits an ELF (exit 0).
+    /// trigger naming a missing rule, trigger != head rule, a src_base-dependent
+    /// trigger (the threading-soundness invariant), and an `append_toks` effect
+    /// (proving span_is_append_file full-byte-compares — a prefix check would
+    /// misfire on the `append_` prefix that append_toks shares). A clean
+    /// reaction emits an ELF (exit 0). Slice 2b: an all-literal concat content
+    /// is now ACCEPTED (was refused with the 2b breadcrumb); the 2b refusal
+    /// pins (text-field arg, nested concat, call arg, AstErr) live in
+    /// self_hosted_reaction_concat_verify_pins.
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn self_hosted_reaction_verify_gate() {
@@ -23300,9 +23303,14 @@ rule le64_neg
         let two = "concept P\n  fields:\n    v : number [0, 150]\nrule fire\n  input:\n    p : P\n  output:\n    o : bool\n  logic:\n    o = p.v < 18\n  proofs:\n    purity:\n      reads : [p.v]\n      calls : []\n    termination:\n      bound : 1\nrule other\n  input:\n    p : P\n  output:\n    o : bool\n  logic:\n    o = p.v < 5\n  proofs:\n    purity:\n      reads : [p.v]\n      calls : []\n    termination:\n      bound : 1\n";
         refuses(&format!("{}reaction r\n  trigger: other\n  effects:\n    append_file \"/tmp/vx_s2_gate.log\" \"x\"", two),
             "a trigger that is not the head rule");
-        // Concat content (slice 2b).
-        refuses(&format!("{}reaction r\n  trigger: fire\n  effects:\n    append_file \"/tmp/vx_s2_gate.log\" concat(\"a\", \"b\")", head),
-            "a concat content (slice 2b)");
+        // Concat content — slice 2b transition pin: the all-literal concat that
+        // slice 2a refused with the 2b breadcrumb now EMITS an ELF.
+        let concat_lit = format!("{}reaction r\n  trigger: fire\n  effects:\n    append_file \"/tmp/vx_s2_gate.log\" concat(\"a\", \"b\")", head);
+        let o = run_gate(&concat_lit);
+        assert!(o.status.success(),
+            "gate must emit the all-literal concat content (slice 2b); got {:?}", o.status);
+        assert_eq!(&o.stdout[0..4], &[0x7f, 0x45, 0x4c, 0x46],
+            "all-literal concat content must emit an ELF");
         // src_base-dependent trigger (byte_at on a text field).
         let sb = "concept P\n  fields:\n    v : number [0, 150]\n    label : text [..64]\nrule fire\n  input:\n    p : P\n  output:\n    o : bool\n  logic:\n    o = byte_at(p.label, 0) == 65\n  proofs:\n    purity:\n      reads : [p.label]\n      calls : []\n    termination:\n      bound : 1\n";
         refuses(&format!("{}reaction r\n  trigger: fire\n  effects:\n    append_file \"/tmp/vx_s2_gate.log\" \"x\"", sb),
@@ -23316,6 +23324,187 @@ rule le64_neg
         let o = run_gate(&clean);
         assert!(o.status.success(), "gate must emit the clean reaction; got {:?}", o.status);
         assert_eq!(&o.stdout[0..4], &[0x7f, 0x45, 0x4c, 0x46], "clean reaction must emit an ELF");
+
+        let _ = fs::remove_file(&gate);
+    }
+
+    /// EFFECTS TIER slice 2b — THE MILESTONE: the self-hosted emitter compiles a
+    /// `reaction` whose `append_file` content is a CONCAT of literals and NUMBER
+    /// input fields (the audit_log.verbose shape) to a runnable ELF whose FILE
+    /// effect matches verbosec's OWN `--native` reaction binary: same appended
+    /// bytes on the same one-record input, same exit code. Firing (`5000 17`,
+    /// age < 18) appends exactly the 40 bytes
+    /// "suspicious purchase: amount=5000 age=17\n" (ending 0x0a); non-firing
+    /// (`5000 25`) appends nothing. Edge probes in the same test: amount=0 (the
+    /// single-digit itoa path) and a content whose LAST arg is a field (no
+    /// trailing literal) with two adjacent leading literals. Both compilers,
+    /// exit 0 everywhere (reaction Drop policy). Note the documented divergence:
+    /// verbosec writes one buffer in ONE write, gen1 issues one write PER ARG —
+    /// the FILE BYTES are identical (single process, O_APPEND, sequential).
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn self_hosted_reaction_concat_matches_verbosec() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        let src = fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        // gen0: the self-hosted emitter (argv channel — source on argv[1], the
+        // text field via Phase 2E; pos on argv[2]).
+        let elf = std::env::temp_dir().join("verbosec_test_eff_s2b_elf_program_src");
+        compile_native(&program, "elf_program_src", elf.to_str().unwrap(), false, false)
+            .expect("elf_program_src must compile natively");
+
+        // A unique audit-log path shared by the self AND the oracle reaction.
+        let logf = std::env::temp_dir().join("verbosec_test_eff_s2b_audit.log");
+        let lpath = logf.to_str().unwrap();
+
+        let head = "concept Purchase\n  fields:\n    amount : number [0, 1000000]\n    customer_age : number [0, 150]\nrule is_suspicious\n  input:\n    p : Purchase\n  output:\n    suspicious : bool\n  logic:\n    suspicious = p.customer_age < 18\n  proofs:\n    purity:\n      reads : [p.customer_age]\n      calls : []\n    termination:\n      bound : 1\n";
+        let oracle_head = "@verbose 0.1.0\n\nconcept Purchase\n  @intention: \"p\"\n  @source: e.intent:1\n  fields:\n    amount : number [0, 1000000]\n    customer_age : number [0, 150]\n\nrule is_suspicious\n  @intention: \"s\"\n  @source: e.intent:1\n  input:\n    p : Purchase\n  output:\n    suspicious : bool\n  logic:\n    suspicious = p.customer_age < 18\n  proofs:\n    purity:\n      reads : [p.customer_age]\n      calls : []\n    termination:\n      bound : 1\n";
+
+        // Compile one (self, oracle) binary pair for a given content expression.
+        let build_pair = |content: &str, tag: &str| -> (std::path::PathBuf, std::path::PathBuf) {
+            let self_src = format!(
+                "{}reaction audit_suspicious\n  trigger: is_suspicious\n  effects:\n    append_file \"{}\" {}",
+                head, lpath, content);
+            let mc = Command::new(&elf).args([self_src.as_str(), "0"]).output()
+                .expect("spawn elf_program_src");
+            assert!(mc.status.success(), "gen0 must emit the {} reaction; got {:?}", tag, mc.status);
+            assert_eq!(&mc.stdout[0..4], &[0x7f, 0x45, 0x4c, 0x46],
+                "self-emitted {} reaction not ELF", tag);
+            let self_bin = std::env::temp_dir().join(format!("verbosec_test_eff_s2b_self_{}", tag));
+            fs::write(&self_bin, &mc.stdout).unwrap();
+            let mut perms = fs::metadata(&self_bin).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&self_bin, perms).unwrap();
+
+            let oracle_src = format!(
+                "{}\nreaction audit_suspicious\n  @intention: \"a\"\n  @source: e.intent:1\n  trigger: is_suspicious\n  effects:\n    append_file \"{}\" {}",
+                oracle_head, lpath, content);
+            let vtoks = crate::lexer::Lexer::new(&oracle_src).tokenize().unwrap();
+            let vprog = crate::parser::Parser::new(vtoks).parse_program().unwrap();
+            let oracle_bin = std::env::temp_dir().join(format!("verbosec_test_eff_s2b_oracle_{}", tag));
+            compile_native(&vprog, "audit_suspicious", oracle_bin.to_str().unwrap(), false, false)
+                .expect("verbosec must compile the concat reaction natively");
+            let mut perms = fs::metadata(&oracle_bin).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&oracle_bin, perms).unwrap();
+            (self_bin, oracle_bin)
+        };
+
+        // Run one binary on (amount, age); return the appended bytes.
+        let run_case = |bin: &std::path::PathBuf, amount: &str, age: &str, who: &str| -> Vec<u8> {
+            let _ = fs::remove_file(&logf);
+            let o = Command::new(bin).args([amount, age]).output().expect("run reaction");
+            assert!(o.status.success(), "{} reaction must exit 0 on ({}, {}); got {:?}",
+                who, amount, age, o.status);
+            fs::read(&logf).unwrap_or_default()
+        };
+
+        // The audit_log.verbose oracle shape.
+        let (self_bin, oracle_bin) = build_pair(
+            "concat(\"suspicious purchase: amount=\", p.amount, \" age=\", p.customer_age, \"\\n\")",
+            "main");
+
+        // Firing: exactly the 40-byte line, trailing 0x0a, self == verbosec.
+        let expected = b"suspicious purchase: amount=5000 age=17\n";
+        let self_fire = run_case(&self_bin, "5000", "17", "self");
+        assert_eq!(self_fire.len(), 40, "self appended {} bytes, want 40", self_fire.len());
+        assert_eq!(*self_fire.last().unwrap(), 0x0a, "self appended line must end in 0x0a");
+        assert_eq!(self_fire.as_slice(), expected, "self appended bytes mismatch");
+        let oracle_fire = run_case(&oracle_bin, "5000", "17", "oracle");
+        assert_eq!(self_fire, oracle_fire, "self vs verbosec appended-bytes mismatch");
+
+        // Edge: amount=0 — the single-digit itoa path.
+        let self_zero = run_case(&self_bin, "0", "17", "self");
+        assert_eq!(self_zero.as_slice(), b"suspicious purchase: amount=0 age=17\n",
+            "self amount=0 bytes mismatch");
+        let oracle_zero = run_case(&oracle_bin, "0", "17", "oracle");
+        assert_eq!(self_zero, oracle_zero, "self vs verbosec amount=0 mismatch");
+
+        // Non-firing: nothing appended, exit 0 for both.
+        for (bin, who) in [(&self_bin, "self"), (&oracle_bin, "oracle")] {
+            let _ = fs::remove_file(&logf);
+            let o = Command::new(bin).args(["5000", "25"]).output().expect("run reaction");
+            assert!(o.status.success(), "{} reaction must exit 0 when not firing; got {:?}", who, o.status);
+            let appended = fs::read(&logf).unwrap_or_default();
+            assert!(appended.is_empty(), "{} must append nothing when not firing; got {:?}", who, appended);
+        }
+
+        // Edge: two adjacent literals + content ENDING in a field (no trailing
+        // literal) — the last block is the 102-byte field-itoa block.
+        let (self_tail, oracle_tail) = build_pair("concat(\"amt\", \"=\", p.amount)", "tail");
+        let self_t = run_case(&self_tail, "7", "17", "self");
+        assert_eq!(self_t.as_slice(), b"amt=7", "self field-final content mismatch");
+        let oracle_t = run_case(&oracle_tail, "7", "17", "oracle");
+        assert_eq!(self_t, oracle_t, "self vs verbosec field-final mismatch");
+
+        let _ = fs::remove_file(&logf);
+        for p in [&self_bin, &oracle_bin, &self_tail, &oracle_tail, &elf] {
+            let _ = fs::remove_file(p);
+        }
+    }
+
+    /// EFFECTS TIER slice 2b — verify pins, both directions of the verify<->emit
+    /// acceptance parity. Refused (exit 1, no ELF): a TEXT-field concat arg
+    /// (runtime strlen is a later slice), a NESTED concat arg, a RULE-CALL arg,
+    /// and a MISSING content (parse_or yields AstErr — the shape walk refuses
+    /// AstErr explicitly, the consolidated malformed marker). Accepted: the
+    /// clean audit_log.verbose content shape emits an ELF.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn self_hosted_reaction_concat_verify_pins() {
+        use std::fs;
+        use std::process::Command;
+
+        let src = fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+        let gate = std::env::temp_dir().join("verbosec_test_eff_s2b_gate");
+        compile_native(&program, "elf_program_src", gate.to_str().unwrap(), false, false)
+            .expect("elf_program_src must compile natively");
+
+        let run_gate = |prog: &str| -> std::process::Output {
+            Command::new(&gate).args([prog, "0"]).output().expect("spawn gate")
+        };
+        let refuses = |prog: &str, why: &str| {
+            let o = run_gate(prog);
+            assert!(!o.status.success() && o.stdout.is_empty(),
+                "gate must refuse {} (exit 1, no output); got {:?}", why, o.status);
+        };
+
+        // Number-only head (the milestone fixture's).
+        let head = "concept P\n  fields:\n    v : number [0, 150]\nrule fire\n  input:\n    p : P\n  output:\n    o : bool\n  logic:\n    o = p.v < 18\n  proofs:\n    purity:\n      reads : [p.v]\n      calls : []\n    termination:\n      bound : 1\n";
+        // Head whose concept ALSO declares a text field (the trigger logic never
+        // touches it, so the program stays src_base-free — only the content does).
+        let head_tx = "concept P\n  fields:\n    v : number [0, 150]\n    label : text [..64]\nrule fire\n  input:\n    p : P\n  output:\n    o : bool\n  logic:\n    o = p.v < 18\n  proofs:\n    purity:\n      reads : [p.v]\n      calls : []\n    termination:\n      bound : 1\n";
+
+        // TEXT-field concat arg (needs a runtime strlen — a later slice).
+        refuses(&format!("{}reaction r\n  trigger: fire\n  effects:\n    append_file \"/tmp/vx_s2b_gate.log\" concat(\"x\", p.label)", head_tx),
+            "a text-field concat arg");
+        // Nested concat arg.
+        refuses(&format!("{}reaction r\n  trigger: fire\n  effects:\n    append_file \"/tmp/vx_s2b_gate.log\" concat(\"a\", concat(\"b\", \"c\"))", head),
+            "a nested concat arg");
+        // Rule-call arg.
+        refuses(&format!("{}reaction r\n  trigger: fire\n  effects:\n    append_file \"/tmp/vx_s2b_gate.log\" concat(\"a\", fire(p))", head),
+            "a rule-call concat arg");
+        // Missing content -> parse_or yields AstErr -> refused explicitly.
+        refuses(&format!("{}reaction r\n  trigger: fire\n  effects:\n    append_file \"/tmp/vx_s2b_gate.log\"", head),
+            "a missing content (AstErr)");
+
+        // Clean audit_log shape: number-field args + literals -> emits an ELF.
+        let clean = format!(
+            "{}reaction r\n  trigger: fire\n  effects:\n    append_file \"/tmp/vx_s2b_gate.log\" concat(\"v=\", p.v, \"\\n\")",
+            head);
+        let o = run_gate(&clean);
+        assert!(o.status.success(), "gate must emit the clean concat reaction; got {:?}", o.status);
+        assert_eq!(&o.stdout[0..4], &[0x7f, 0x45, 0x4c, 0x46],
+            "clean concat reaction must emit an ELF");
 
         let _ = fs::remove_file(&gate);
     }
