@@ -23262,11 +23262,14 @@ rule le64_neg
 
     /// EFFECTS TIER slice 2a — verify gate + append_toks collision pin. gen0's
     /// abort_if(verrs) refuses (exit 1, no ELF) every malformed reaction:
-    /// trigger naming a missing rule, trigger != head rule, concat content
-    /// (slice 2b), a src_base-dependent trigger (the threading-soundness
-    /// invariant), and an `append_toks` effect (proving span_is_append_file
-    /// full-byte-compares — a prefix check would misfire on the `append_` prefix
-    /// that append_toks shares). A clean reaction emits an ELF (exit 0).
+    /// trigger naming a missing rule, trigger != head rule, a src_base-dependent
+    /// trigger (the threading-soundness invariant), and an `append_toks` effect
+    /// (proving span_is_append_file full-byte-compares — a prefix check would
+    /// misfire on the `append_` prefix that append_toks shares). A clean
+    /// reaction emits an ELF (exit 0). Slice 2b: an all-literal concat content
+    /// is now ACCEPTED (was refused with the 2b breadcrumb); the 2b refusal
+    /// pins (text-field arg, nested concat, call arg, AstErr) live in
+    /// self_hosted_reaction_concat_verify_pins.
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn self_hosted_reaction_verify_gate() {
@@ -23300,9 +23303,14 @@ rule le64_neg
         let two = "concept P\n  fields:\n    v : number [0, 150]\nrule fire\n  input:\n    p : P\n  output:\n    o : bool\n  logic:\n    o = p.v < 18\n  proofs:\n    purity:\n      reads : [p.v]\n      calls : []\n    termination:\n      bound : 1\nrule other\n  input:\n    p : P\n  output:\n    o : bool\n  logic:\n    o = p.v < 5\n  proofs:\n    purity:\n      reads : [p.v]\n      calls : []\n    termination:\n      bound : 1\n";
         refuses(&format!("{}reaction r\n  trigger: other\n  effects:\n    append_file \"/tmp/vx_s2_gate.log\" \"x\"", two),
             "a trigger that is not the head rule");
-        // Concat content (slice 2b).
-        refuses(&format!("{}reaction r\n  trigger: fire\n  effects:\n    append_file \"/tmp/vx_s2_gate.log\" concat(\"a\", \"b\")", head),
-            "a concat content (slice 2b)");
+        // Concat content — slice 2b transition pin: the all-literal concat that
+        // slice 2a refused with the 2b breadcrumb now EMITS an ELF.
+        let concat_lit = format!("{}reaction r\n  trigger: fire\n  effects:\n    append_file \"/tmp/vx_s2_gate.log\" concat(\"a\", \"b\")", head);
+        let o = run_gate(&concat_lit);
+        assert!(o.status.success(),
+            "gate must emit the all-literal concat content (slice 2b); got {:?}", o.status);
+        assert_eq!(&o.stdout[0..4], &[0x7f, 0x45, 0x4c, 0x46],
+            "all-literal concat content must emit an ELF");
         // src_base-dependent trigger (byte_at on a text field).
         let sb = "concept P\n  fields:\n    v : number [0, 150]\n    label : text [..64]\nrule fire\n  input:\n    p : P\n  output:\n    o : bool\n  logic:\n    o = byte_at(p.label, 0) == 65\n  proofs:\n    purity:\n      reads : [p.label]\n      calls : []\n    termination:\n      bound : 1\n";
         refuses(&format!("{}reaction r\n  trigger: fire\n  effects:\n    append_file \"/tmp/vx_s2_gate.log\" \"x\"", sb),

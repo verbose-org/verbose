@@ -11573,35 +11573,197 @@ rule program_uses_src_base
       bound : 8000
 
 
--- RxErrState: everything the reaction verification surface needs.
+-- RxCkState (slice 2b): one content Ast node + everything the content shape
+-- check needs — the source, the trigger's input PARAM name span (an AstField
+-- arg's base must be exactly that variable), the trigger's input concept FIELD
+-- LIST (the referenced field must exist and be a NUMBER — text fields need a
+-- runtime strlen and are a later slice), and the concept list (field_ty_of
+-- resolves the declared type span through resolve_type).
+concept RxCkState
+  @intention: "A content Ast node + source + trigger input param name span + trigger concept fields + concepts, for the content shape check"
+  @source: vexprparse.intent:72
+  fields:
+    node : Ast
+    src : text [..256]
+    pn_start : number [0, 4000000]
+    pn_len : number [0, 4000000]
+    fields : FieldList
+    concepts : ConceptList
+
+
+-- rx_carg_ok: 1 iff ONE concat arg is an emit-lowerable shape — AstStr, or
+-- AstField whose base is EXACTLY the trigger's input param variable and whose
+-- field resolves to a NUMBER field (field_ty_of code 0) of the trigger's input
+-- concept. Everything else — nested concat, rule calls, text fields (code 2),
+-- bool fields (code 1), unknown fields (code 3), non-var bases — is 0, and the
+-- verify<->emit acceptance parity holds ARM-FOR-ARM with x86_rx_carg: verify
+-- accepts EXACTLY what emit lowers (the collections-tier verify-accepts-but-
+-- emit-int3s scar).
+rule rx_carg_ok
+  @intention: "1 if one reaction concat arg is a literal or a number field of the trigger's input record, 0 otherwise"
+  @source: vexprparse.intent:72
+  input:
+    rk : RxCkState
+  output:
+    out : number
+  logic:
+    out = match rk.node:
+      AstNum(value) => 0
+      AstBin(op, lhs, rhs) => 0
+      AstNeg(inner) => 0
+      AstNot(inner) => 0
+      AstVar(start, len) => 0
+      AstField(base, fstart, flen) => if ast_var_is_span(SpanUseState { node: base, src: rk.src, q_start: rk.pn_start, q_len: rk.pn_len }) == 1 and field_ty_of(FieldTyOfState { fields: rk.fields, src: rk.src, q_start: fstart, q_len: flen, concepts: rk.concepts }) == 0 then 1 else 0
+      AstCall(callee_start, callee_len, args) => 0
+      AstStr(start, len) => 1
+      AstBytes(start, len) => 0
+      AstBool(value) => 0
+      AstIf(cond, thn, els) => 0
+      AstErr => 0
+      AstVariant(cstart, clen, vstart, vlen, fields) => 0
+      AstMatch(scrut, arms) => 0
+      AstOk(inner) => 0
+      AstResErr(inner) => 0
+      AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => 0
+      AstSum(coll, item_start, item_len, body) => 0
+      AstCount(coll, item_start, item_len, body) => 0
+      AstFold(coll, init, acc_start, acc_len, item_start, item_len, body) => 0
+      AstAll(coll, item_start, item_len, body) => 0
+      AstAny(coll, item_start, item_len, body) => 0
+      AstMap(coll, item_start, item_len, body) => 0
+      AstFilter(coll, item_start, item_len, body) => 0
+      AstMinFold(coll, item_start, item_len, body) => 0
+      AstMaxFold(coll, item_start, item_len, body) => 0
+  proofs:
+    purity:
+      reads : [rk.node, rk.src, rk.pn_start, rk.pn_len, rk.fields, rk.concepts]
+      calls : [ast_var_is_span, field_ty_of]
+    termination:
+      bound : 64
+
+
+-- RxCkArgsState: the remaining concat args + the shape-check context.
+concept RxCkArgsState
+  @intention: "The remaining reaction concat args + the content shape-check context"
+  @source: vexprparse.intent:72
+  fields:
+    args : ArgList
+    src : text [..256]
+    pn_start : number [0, 4000000]
+    pn_len : number [0, 4000000]
+    fields : FieldList
+    concepts : ConceptList
+
+
+-- rx_cargs_ok: 1 iff EVERY concat arg passes rx_carg_ok. Mentions its recursion
+-- ONCE (lazy if); ArgNil -> 1 (an empty concat writes nothing — harmless).
+rule rx_cargs_ok
+  @intention: "1 if every reaction concat arg is an accepted shape, 0 otherwise"
+  @source: vexprparse.intent:72
+  input:
+    ra : RxCkArgsState
+  output:
+    out : number
+  logic:
+    out = match ra.args:
+      ArgCons(head, tail) => if rx_carg_ok(RxCkState { node: head, src: ra.src, pn_start: ra.pn_start, pn_len: ra.pn_len, fields: ra.fields, concepts: ra.concepts }) == 1 then rx_cargs_ok(RxCkArgsState { args: tail, src: ra.src, pn_start: ra.pn_start, pn_len: ra.pn_len, fields: ra.fields, concepts: ra.concepts }) else 0
+      ArgNil => 1
+  proofs:
+    purity:
+      reads : [ra.args, ra.src, ra.pn_start, ra.pn_len, ra.fields, ra.concepts]
+      calls : [rx_carg_ok, rx_cargs_ok]
+    termination:
+      bound : 512
+
+
+-- rx_content_ok: the slice-2b content shape check. 1 iff the content is an
+-- AstStr, OR an AstCall whose callee spells "concat" and whose EVERY arg passes
+-- rx_carg_ok. AstErr — the RxNil sentinel AND the unparseable-content marker —
+-- is REFUSED EXPLICITLY (its arm is 0), so malformed content can never pass.
+-- Non-concat calls, ifs, bare vars, everything else: 0 (breadcrumb posture:
+-- reaction content is a literal or a concat of literals/number fields).
+rule rx_content_ok
+  @intention: "1 if a reaction's content is a string literal or a concat of literals/number input fields, 0 otherwise (AstErr refused)"
+  @source: vexprparse.intent:72
+  input:
+    rk : RxCkState
+  output:
+    out : number
+  logic:
+    out = match rk.node:
+      AstNum(value) => 0
+      AstBin(op, lhs, rhs) => 0
+      AstNeg(inner) => 0
+      AstNot(inner) => 0
+      AstVar(start, len) => 0
+      AstField(base, fstart, flen) => 0
+      AstCall(callee_start, callee_len, args) => if span_is_concat(SpanCheck { src: rk.src, start: callee_start, len: callee_len }) == 1 then rx_cargs_ok(RxCkArgsState { args: args, src: rk.src, pn_start: rk.pn_start, pn_len: rk.pn_len, fields: rk.fields, concepts: rk.concepts }) else 0
+      AstStr(start, len) => 1
+      AstBytes(start, len) => 0
+      AstBool(value) => 0
+      AstIf(cond, thn, els) => 0
+      AstErr => 0
+      AstVariant(cstart, clen, vstart, vlen, fields) => 0
+      AstMatch(scrut, arms) => 0
+      AstOk(inner) => 0
+      AstResErr(inner) => 0
+      AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => 0
+      AstSum(coll, item_start, item_len, body) => 0
+      AstCount(coll, item_start, item_len, body) => 0
+      AstFold(coll, init, acc_start, acc_len, item_start, item_len, body) => 0
+      AstAll(coll, item_start, item_len, body) => 0
+      AstAny(coll, item_start, item_len, body) => 0
+      AstMap(coll, item_start, item_len, body) => 0
+      AstFilter(coll, item_start, item_len, body) => 0
+      AstMinFold(coll, item_start, item_len, body) => 0
+      AstMaxFold(coll, item_start, item_len, body) => 0
+  proofs:
+    purity:
+      reads : [rk.node, rk.src, rk.pn_start, rk.pn_len, rk.fields, rk.concepts]
+      calls : [span_is_concat, rx_cargs_ok]
+    termination:
+      bound : 64
+
+
+-- RxErrState: everything the reaction verification surface needs. Slice 2b
+-- widens with the concept list (the content shape check resolves the trigger's
+-- input concept + its field types through it).
 concept RxErrState
-  @intention: "The program + declared reactions + source, for the reaction verification surface"
+  @intention: "The program + declared reactions + source + concepts, for the reaction verification surface"
   @source: vexprparse.intent:72
   fields:
     prog : RuleList
     rxs : ReactionList
     src : text [..256]
+    concepts : ConceptList
 
 
--- reaction_errors: the slice-2a verrs contribution. When the program declares a
--- reaction (has_rx), it sums:
+-- reaction_errors: the slice-2a/2b verrs contribution. When the program declares
+-- a reaction (has_rx), it sums:
 --   (1) trigger != head rule (the marshal drives the entry from the HEAD rule, so
 --       slice 2a requires trigger == head — this also subsumes "trigger names a
 --       real rule": a name that matches nothing, or a non-head rule, fails);
 --   (2) path not a string literal (path_len -1 sentinel — also fires when the
 --       append_file effect head is misspelled or a `print` effect is used, since
 --       parse_reaction_decl marks the whole decl malformed then);
---   (3) content not a string literal (content_len -1 — a concat content, which is
---       slice 2b, lands here);
+--   (3) content not an accepted shape (slice 2b): AstStr, or concat(...) whose
+--       every arg is AstStr or <trigger input param>.<NUMBER field> — the
+--       rx_content_ok walk, in verify<->emit acceptance parity with
+--       x86_rx_content. AstErr (sentinel / unparseable), nested concat, text
+--       fields, rule calls all land here;
 --   (4) any src_base-dependent construct anywhere in the program (the threading
---       soundness invariant above);
+--       soundness invariant above — content literals are emitted inline and
+--       field args read the arena record, so 2b adds NO src_base dependence);
 --   (5) more than one reaction (POC shape).
 -- The expensive program-wide walk (4) is INLINED in the has_rx branch so the
 -- lazy if never runs it on the reaction-free self-source (where it would walk
 -- 680+ byte_at-using rules and return 1, but has_rx == 0 short-circuits to 0).
+-- The content-context lets (head params -> param name span, find_concept ->
+-- trigger concept fields) run under EAGER LETS on the self-source too — all
+-- tolerant walks over the sentinel (AstErr content -> 0, cheap by construction).
 -- Zero on the self-source by construction (parse_reactions -> RxNil -> has_rx 0).
 rule reaction_errors
-  @intention: "Total slice-2a verification errors: trigger==head, literal path/content, no src_base construct, single reaction"
+  @intention: "Total reaction verification errors: trigger==head, literal path, accepted content shape, no src_base construct, single reaction"
   @source: vexprparse.intent:72
   input:
     re : RxErrState
@@ -11613,13 +11775,16 @@ rule reaction_errors
     let h = rx_head(re.rxs)
     let trig_is_head = if rx_trigger_len(h) == rl_head_name_len(re.prog) and name_eq(NameEqState { src: re.src, a_start: rx_trigger_start(h), b_start: rl_head_name_start(re.prog), len: rx_trigger_len(h), off: 0 }) == 1 then 1 else 0
     let path_ok = if rx_path_len(h) >= 0 then 1 else 0
-    let content_ok = ast_is_str(rx_content(h))
+    let eparams = if param_list_len(rl_head_params(re.prog)) > 0 then rl_head_params(re.prog) else fields_to_params(rl_head_input(re.prog))
+    let efields = params_to_fields(eparams)
+    let tfields = cd_fields(find_concept(FindConceptState { concepts: re.concepts, src: re.src, q_start: fl_head_ty_start(efields), q_len: fl_head_ty_len(efields) }))
+    let content_ok = rx_content_ok(RxCkState { node: rx_content(h), src: re.src, pn_start: fl_head_start(efields), pn_len: fl_head_len(efields), fields: tfields, concepts: re.concepts })
     let one_reaction = if n == 1 then 1 else 0
     out = if has_rx == 0 then 0 else ((if trig_is_head == 1 then 0 else 1) + (if path_ok == 1 then 0 else 1) + (if content_ok == 1 then 0 else 1) + program_uses_src_base(UsesTextRules { rules: re.prog, src: re.src }) + (if one_reaction == 1 then 0 else 1))
   proofs:
     purity:
-      reads : [re.prog, re.rxs, re.src]
-      calls : [reaction_list_len, rx_head, rx_trigger_len, rx_trigger_start, rl_head_name_len, rl_head_name_start, name_eq, rx_path_len, rx_content, ast_is_str, program_uses_src_base]
+      reads : [re.prog, re.rxs, re.src, re.concepts]
+      calls : [reaction_list_len, rx_head, rx_trigger_len, rx_trigger_start, rl_head_name_len, rl_head_name_start, name_eq, rx_path_len, rx_content, rx_content_ok, param_list_len, rl_head_params, fields_to_params, rl_head_input, params_to_fields, cd_fields, find_concept, fl_head_ty_start, fl_head_ty_len, fl_head_start, fl_head_len, program_uses_src_base]
     termination:
       bound : 64
 
@@ -24648,7 +24813,7 @@ rule elf_program_src
     -- Effects tier slice 2a: the reaction list — used by reaction_errors (verify)
     -- AND by the has_reaction emit branch + blob_end_off sizing (emit).
     let rxs = parse_reactions(ProgramState { cell: toks, src: s.source })
-    let verrs = arena_scope(diag_count(prog_diags(ProgDiagsState { iter: prog, full: prog, src: s.source, idx: 0, concepts: concepts0 })) + purity_list(PurityListState { iter: prog, full: prog, src: s.source }) + term_list(TermListState { iter: prog, src: s.source }) + resource_errors(ResErrState { prog: prog, ress: ress, concepts: concepts0, src: s.source }) + reaction_errors(RxErrState { prog: prog, rxs: rxs, src: s.source }))
+    let verrs = arena_scope(diag_count(prog_diags(ProgDiagsState { iter: prog, full: prog, src: s.source, idx: 0, concepts: concepts0 })) + purity_list(PurityListState { iter: prog, full: prog, src: s.source }) + term_list(TermListState { iter: prog, src: s.source }) + resource_errors(ResErrState { prog: prog, ress: ress, concepts: concepts0, src: s.source }) + reaction_errors(RxErrState { prog: prog, rxs: rxs, src: s.source, concepts: concepts0 }))
     let sizes = proc_sizes(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: ProcSizeList::PSNil, ress: ress, rxs: rxs })
     let uses_var = program_uses_arena(concepts)
     let anytx = prog_any_texty(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: sizes, ress: ress, rxs: rxs })
