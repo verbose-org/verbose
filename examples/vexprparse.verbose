@@ -12809,6 +12809,69 @@ rule connection_errors
       bound : 64
 
 
+-- ServiceErrState: the program + declared services + PARSED concepts (concepts0, for
+-- the reserved-name check) + declared resources/connections/reactions (for the
+-- service+effects refusal) + source, for the service verification surface.
+concept ServiceErrState
+  @intention: "The program + services + parsed concepts + resources/connections/reactions + source, for the service verification surface"
+  @source: vexprparse.intent:74
+  fields:
+    prog : RuleList
+    svcs : ServiceList
+    concepts : ConceptList
+    ress : ResourceList
+    conns : ConnectionList
+    rxs : ReactionList
+    src : text [..256]
+
+
+-- service_errors: total self-hosting-service-slice-1 verification errors. Returns 0
+-- when no service is declared (byte-identity for every service-free program). For a
+-- declared service (the head — exactly one is required): malformed shape sentinel;
+-- protocol must be http_1_0 (raw_tcp = code 2 refused, unrecognized = 0 refused);
+-- port in [1, 65535]; max_request in [64, 65536] (http_1_0 needs >= 64, verbosec
+-- parity; 65536 is the drain-buffer cap); the handler must name a real rule; the
+-- handler logic must be a single `HttpResponse { status: <AstNum>, body: <AstStr> }`
+-- with NO let-bindings (the constant-response S1 shape — req.* / non-literal / let
+-- all fail this and are refused, awaiting S2+); exactly one service; the user must
+-- NOT declare HttpRequest / HttpResponse (reserved built-in names); and a service
+-- may not compose with a reaction / connection / resource in S1 (a service has no
+-- input marshal; effects-into-handlers is S5-S7).
+rule service_errors
+  @intention: "Total service verification errors: shape/protocol/port/max_request/handler-exists/handler-shape/one-service/reserved-names/no-effects"
+  @source: vexprparse.intent:74
+  input:
+    se : ServiceErrState
+  output:
+    out : number
+  logic:
+    let n = service_list_len(se.svcs)
+    let has_svc = if n > 0 then 1 else 0
+    let h = svc_head(se.svcs)
+    let malformed = if svc_handler_len(h) < 0 then 1 else 0
+    let proto_bad = if svc_protocol(h) == 1 then 0 else 1
+    let port_bad = if svc_port(h) >= 1 and svc_port(h) <= 65535 then 0 else 1
+    let maxreq_bad = if svc_max_request(h) >= 64 and svc_max_request(h) <= 65536 then 0 else 1
+    let hexists = rule_named(RuleNamedState { rules: se.prog, src: se.src, q_start: svc_handler_start(h), q_len: svc_handler_len(h) })
+    let handler = find_rule(FindRuleState { rules: se.prog, src: se.src, q_start: svc_handler_start(h), q_len: svc_handler_len(h) })
+    let hblock = rd_body(handler)
+    let hlets = count_binds(block_binds(hblock))
+    let hresult = block_result(hblock)
+    let hfields = ast_variant_fields(hresult)
+    let shape_ok = if hlets == 0 then (if ast_is_variant(hresult) == 1 then (if vfield_len(hfields) == 2 then (if ast_is_num(vf_head_val(hfields)) == 1 then ast_is_str(vf_head_val(vf_tail(hfields))) else 0) else 0) else 0) else 0
+    let req_decl = find_concept_index(FindConceptIdxState { concepts: se.concepts, src: se.src, q_start: fl_head_ty_start(rd_input(handler)), q_len: fl_head_ty_len(rd_input(handler)), idx: 0 })
+    let resp_decl = find_concept_index(FindConceptIdxState { concepts: se.concepts, src: se.src, q_start: rd_out_ty_start(handler), q_len: rd_out_ty_len(handler), idx: 0 })
+    let reserved = (if req_decl == 999999 then 0 else 1) + (if resp_decl == 999999 then 0 else 1)
+    let effects = if reaction_list_len(se.rxs) > 0 then 1 else if connection_list_len(se.conns) > 0 then 1 else if resource_list_len(se.ress) > 0 then 1 else 0
+    out = if has_svc == 0 then 0 else (malformed + proto_bad + port_bad + maxreq_bad + (if hexists == 1 then 0 else 1) + (if shape_ok == 1 then 0 else 1) + (if n == 1 then 0 else 1) + reserved + effects)
+  proofs:
+    purity:
+      reads : [se.prog, se.svcs, se.concepts, se.ress, se.conns, se.rxs, se.src]
+      calls : [service_list_len, svc_head, svc_handler_len, svc_protocol, svc_port, svc_max_request, svc_handler_start, rule_named, find_rule, rd_body, count_binds, block_binds, block_result, ast_variant_fields, ast_is_variant, vfield_len, ast_is_num, vf_head_val, vf_tail, ast_is_str, find_concept_index, fl_head_ty_start, fl_head_ty_len, rd_input, rd_out_ty_start, rd_out_ty_len, reaction_list_len, connection_list_len, resource_list_len]
+    termination:
+      bound : 64
+
+
 
 -- ============================================================================
 -- EFFECTS TIER slice 2a — verify: the src_base-dependent-construct walk + the
@@ -21052,6 +21115,266 @@ rule ast_variant_clen
       bound : 16
 
 
+-- Self-hosting service slice 1: AST accessors for the HttpResponse handler-shape
+-- check + response precompute. ast_variant_fields returns the VFieldList of an
+-- AstVariant (VFNil for any other shape); ast_is_num / ast_num_value read an
+-- AstNum leaf; ast_str_start / ast_str_len read an AstStr leaf (the token span
+-- INCLUDES the quotes — callers apply +1 / -2 as elsewhere).
+rule ast_variant_fields
+  @intention: "The VFieldList of an AstVariant node, or VFNil for any other shape"
+  @source: vexprparse.intent:74
+  input:
+    n : Ast
+  output:
+    out : VFieldList
+  logic:
+    out = match n:
+      AstNum(value) => VFieldList::VFNil
+      AstBin(op, lhs, rhs) => VFieldList::VFNil
+      AstNeg(inner) => VFieldList::VFNil
+      AstNot(inner) => VFieldList::VFNil
+      AstVar(start, len) => VFieldList::VFNil
+      AstField(base, fstart, flen) => VFieldList::VFNil
+      AstCall(callee_start, callee_len, args) => VFieldList::VFNil
+      AstStr(start, len) => VFieldList::VFNil
+      AstBytes(start, len) => VFieldList::VFNil
+      AstBool(value) => VFieldList::VFNil
+      AstIf(cond, thn, els) => VFieldList::VFNil
+      AstErr => VFieldList::VFNil
+      AstVariant(cstart, clen, vstart, vlen, fields) => fields
+      AstMatch(scrut, arms) => VFieldList::VFNil
+      AstOk(inner) => VFieldList::VFNil
+      AstResErr(inner) => VFieldList::VFNil
+      AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => VFieldList::VFNil
+      AstSum(coll, item_start, item_len, body) => VFieldList::VFNil
+      AstCount(coll, item_start, item_len, body) => VFieldList::VFNil
+      AstFold(coll, init, acc_start, acc_len, item_start, item_len, body) => VFieldList::VFNil
+      AstAll(coll, item_start, item_len, body) => VFieldList::VFNil
+      AstAny(coll, item_start, item_len, body) => VFieldList::VFNil
+      AstMap(coll, item_start, item_len, body) => VFieldList::VFNil
+      AstFilter(coll, item_start, item_len, body) => VFieldList::VFNil
+      AstMinFold(coll, item_start, item_len, body) => VFieldList::VFNil
+      AstMaxFold(coll, item_start, item_len, body) => VFieldList::VFNil
+  proofs:
+    purity:
+      reads : [n]
+      calls : []
+    termination:
+      bound : 32
+
+
+rule ast_is_num
+  @intention: "1 if the AST node is an AstNum literal, 0 otherwise"
+  @source: vexprparse.intent:74
+  input:
+    n : Ast
+  output:
+    out : number
+  logic:
+    out = match n:
+      AstNum(value) => 1
+      AstBin(op, lhs, rhs) => 0
+      AstNeg(inner) => 0
+      AstNot(inner) => 0
+      AstVar(start, len) => 0
+      AstField(base, fstart, flen) => 0
+      AstCall(callee_start, callee_len, args) => 0
+      AstStr(start, len) => 0
+      AstBytes(start, len) => 0
+      AstBool(value) => 0
+      AstIf(cond, thn, els) => 0
+      AstErr => 0
+      AstVariant(cstart, clen, vstart, vlen, fields) => 0
+      AstMatch(scrut, arms) => 0
+      AstOk(inner) => 0
+      AstResErr(inner) => 0
+      AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => 0
+      AstSum(coll, item_start, item_len, body) => 0
+      AstCount(coll, item_start, item_len, body) => 0
+      AstFold(coll, init, acc_start, acc_len, item_start, item_len, body) => 0
+      AstAll(coll, item_start, item_len, body) => 0
+      AstAny(coll, item_start, item_len, body) => 0
+      AstMap(coll, item_start, item_len, body) => 0
+      AstFilter(coll, item_start, item_len, body) => 0
+      AstMinFold(coll, item_start, item_len, body) => 0
+      AstMaxFold(coll, item_start, item_len, body) => 0
+  proofs:
+    purity:
+      reads : [n]
+      calls : []
+    termination:
+      bound : 16
+
+
+rule ast_num_value
+  @intention: "The value of an AstNum leaf, or 0 for any other shape"
+  @source: vexprparse.intent:74
+  input:
+    n : Ast
+  output:
+    out : number
+  logic:
+    out = match n:
+      AstNum(value) => value
+      AstBin(op, lhs, rhs) => 0
+      AstNeg(inner) => 0
+      AstNot(inner) => 0
+      AstVar(start, len) => 0
+      AstField(base, fstart, flen) => 0
+      AstCall(callee_start, callee_len, args) => 0
+      AstStr(start, len) => 0
+      AstBytes(start, len) => 0
+      AstBool(value) => 0
+      AstIf(cond, thn, els) => 0
+      AstErr => 0
+      AstVariant(cstart, clen, vstart, vlen, fields) => 0
+      AstMatch(scrut, arms) => 0
+      AstOk(inner) => 0
+      AstResErr(inner) => 0
+      AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => 0
+      AstSum(coll, item_start, item_len, body) => 0
+      AstCount(coll, item_start, item_len, body) => 0
+      AstFold(coll, init, acc_start, acc_len, item_start, item_len, body) => 0
+      AstAll(coll, item_start, item_len, body) => 0
+      AstAny(coll, item_start, item_len, body) => 0
+      AstMap(coll, item_start, item_len, body) => 0
+      AstFilter(coll, item_start, item_len, body) => 0
+      AstMinFold(coll, item_start, item_len, body) => 0
+      AstMaxFold(coll, item_start, item_len, body) => 0
+  proofs:
+    purity:
+      reads : [n]
+      calls : []
+    termination:
+      bound : 16
+
+
+rule ast_str_start
+  @intention: "The token span start of an AstStr leaf (quotes included), or 0 for any other shape"
+  @source: vexprparse.intent:74
+  input:
+    n : Ast
+  output:
+    out : number
+  logic:
+    out = match n:
+      AstNum(value) => 0
+      AstBin(op, lhs, rhs) => 0
+      AstNeg(inner) => 0
+      AstNot(inner) => 0
+      AstVar(start, len) => 0
+      AstField(base, fstart, flen) => 0
+      AstCall(callee_start, callee_len, args) => 0
+      AstStr(start, len) => start
+      AstBytes(start, len) => 0
+      AstBool(value) => 0
+      AstIf(cond, thn, els) => 0
+      AstErr => 0
+      AstVariant(cstart, clen, vstart, vlen, fields) => 0
+      AstMatch(scrut, arms) => 0
+      AstOk(inner) => 0
+      AstResErr(inner) => 0
+      AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => 0
+      AstSum(coll, item_start, item_len, body) => 0
+      AstCount(coll, item_start, item_len, body) => 0
+      AstFold(coll, init, acc_start, acc_len, item_start, item_len, body) => 0
+      AstAll(coll, item_start, item_len, body) => 0
+      AstAny(coll, item_start, item_len, body) => 0
+      AstMap(coll, item_start, item_len, body) => 0
+      AstFilter(coll, item_start, item_len, body) => 0
+      AstMinFold(coll, item_start, item_len, body) => 0
+      AstMaxFold(coll, item_start, item_len, body) => 0
+  proofs:
+    purity:
+      reads : [n]
+      calls : []
+    termination:
+      bound : 16
+
+
+rule ast_str_len
+  @intention: "The token span length of an AstStr leaf (quotes included), or 0 for any other shape"
+  @source: vexprparse.intent:74
+  input:
+    n : Ast
+  output:
+    out : number
+  logic:
+    out = match n:
+      AstNum(value) => 0
+      AstBin(op, lhs, rhs) => 0
+      AstNeg(inner) => 0
+      AstNot(inner) => 0
+      AstVar(start, len) => 0
+      AstField(base, fstart, flen) => 0
+      AstCall(callee_start, callee_len, args) => 0
+      AstStr(start, len) => len
+      AstBytes(start, len) => 0
+      AstBool(value) => 0
+      AstIf(cond, thn, els) => 0
+      AstErr => 0
+      AstVariant(cstart, clen, vstart, vlen, fields) => 0
+      AstMatch(scrut, arms) => 0
+      AstOk(inner) => 0
+      AstResErr(inner) => 0
+      AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => 0
+      AstSum(coll, item_start, item_len, body) => 0
+      AstCount(coll, item_start, item_len, body) => 0
+      AstFold(coll, init, acc_start, acc_len, item_start, item_len, body) => 0
+      AstAll(coll, item_start, item_len, body) => 0
+      AstAny(coll, item_start, item_len, body) => 0
+      AstMap(coll, item_start, item_len, body) => 0
+      AstFilter(coll, item_start, item_len, body) => 0
+      AstMinFold(coll, item_start, item_len, body) => 0
+      AstMaxFold(coll, item_start, item_len, body) => 0
+  proofs:
+    purity:
+      reads : [n]
+      calls : []
+    termination:
+      bound : 16
+
+
+-- VFieldList head/tail accessors for the handler-shape walk. vf_head_val yields the
+-- val Ast of the head VFCons (AstErr for VFNil); vf_tail the rest.
+rule vf_head_val
+  @intention: "The value Ast of the head field of a variant-construction field list (AstErr if empty)"
+  @source: vexprparse.intent:74
+  input:
+    vf : VFieldList
+  output:
+    out : Ast
+  logic:
+    out = match vf:
+      VFCons(name_start, name_len, val, rest) => val
+      VFNil => Ast::AstErr
+  proofs:
+    purity:
+      reads : [vf]
+      calls : []
+    termination:
+      bound : 16
+
+
+rule vf_tail
+  @intention: "The rest of a variant-construction field list (VFNil if empty)"
+  @source: vexprparse.intent:74
+  input:
+    vf : VFieldList
+  output:
+    out : VFieldList
+  logic:
+    out = match vf:
+      VFCons(name_start, name_len, val, rest) => rest
+      VFNil => VFieldList::VFNil
+  proofs:
+    purity:
+      reads : [vf]
+      calls : []
+    termination:
+      bound : 16
+
+
 -- ============================================================================
 -- Records-arc slice 4 — the UNIFIED STATIC CONCEPT RESOLVER. Slice 3 gated
 -- AstField emission on one ad-hoc shape (base = AstVar whose LET RHS is an
@@ -21744,6 +22067,50 @@ rule concepts_append_result
     purity:
       reads : [cl]
       calls : [concepts_append_result]
+    termination:
+      bound : 4000
+
+
+-- HttpAppendState: the parsed concept list + the "HttpRequest" and "HttpResponse"
+-- NAME SPANS extracted from the service handler (its input field ty span and its
+-- output ty span). concepts_append_http appends the two built-in concepts at the
+-- tail with these NAME spans so resolve_type / find_concept_index byte-match the
+-- handler's AstVariant against them (Finding 1 — the synthetic concepts must be
+-- VISIBLE to the verify walk). Field name/type spans are 0 (bogus) on purpose:
+-- the verifier only resolves the concept NAME during a record construction, never
+-- its declared field types, and arena sizing counts fields by cons length — both
+-- are unaffected by the field spans.
+concept HttpAppendState
+  @intention: "A concept list + the HttpRequest/HttpResponse name spans from the handler, to append the two built-in service concepts"
+  @source: vexprparse.intent:74
+  fields:
+    concepts : ConceptList
+    req_start : number [0, 4000000]
+    req_len : number [0, 4000000]
+    resp_start : number [0, 4000000]
+    resp_len : number [0, 4000000]
+
+
+-- concepts_append_http: append the built-in HttpRequest (3 text fields) and
+-- HttpResponse (status number + body text) concepts at the TAIL of a concept list,
+-- so a `service` handler that NAMES HttpResponse in an AstVariant resolves to a real
+-- concept code (>= 1000) instead of ERROR. The name spans come from the handler; the
+-- field spans are 0 (never resolved during construction — see the concept comment).
+rule concepts_append_http
+  @intention: "Append the built-in HttpRequest + HttpResponse concepts (with handler-sourced name spans) at the tail of a concept list"
+  @source: vexprparse.intent:74
+  input:
+    ha : HttpAppendState
+  output:
+    out : ConceptList
+  logic:
+    out = match ha.concepts:
+      CCons(head, tail) => ConceptList::CCons { head: head, tail: concepts_append_http(HttpAppendState { concepts: tail, req_start: ha.req_start, req_len: ha.req_len, resp_start: ha.resp_start, resp_len: ha.resp_len }) }
+      CNil => ConceptList::CCons { head: Concept::MkConcept { name_start: ha.req_start, name_len: ha.req_len, fields: FieldList::FCons { name_start: 0, name_len: 0, ty: 2, ty_start: 0, ty_len: 0, rest: FieldList::FCons { name_start: 0, name_len: 0, ty: 2, ty_start: 0, ty_len: 0, rest: FieldList::FCons { name_start: 0, name_len: 0, ty: 2, ty_start: 0, ty_len: 0, rest: FieldList::FNil } } }, variants: VariantList::VarNil }, tail: ConceptList::CCons { head: Concept::MkConcept { name_start: ha.resp_start, name_len: ha.resp_len, fields: FieldList::FCons { name_start: 0, name_len: 0, ty: 0, ty_start: 0, ty_len: 0, rest: FieldList::FCons { name_start: 0, name_len: 0, ty: 2, ty_start: 0, ty_len: 0, rest: FieldList::FNil } }, variants: VariantList::VarNil }, tail: ConceptList::CNil } }
+  proofs:
+    purity:
+      reads : [ha.concepts, ha.req_start, ha.req_len, ha.resp_start, ha.resp_len]
+      calls : [concepts_append_http]
     termination:
       bound : 4000
 
@@ -26700,7 +27067,20 @@ rule elf_program_src
     let toks = begin_tokenize(ScanState { source: s.source, pos: 0 })
     let prog = parse_program(ProgramState { cell: toks, src: s.source })
     let concepts0 = parse_concepts(ProgramState { cell: toks, src: s.source })
-    let concepts = if program_uses_result(UsesTextRules { rules: prog, src: s.source }) == 1 then concepts_append_result(concepts0) else concepts0
+    -- Self-hosting service slice 1: the service list + has_service gate, and the
+    -- HttpRequest / HttpResponse NAME SPANS extracted from the handler (its input
+    -- field ty span spells "HttpRequest", its output ty span spells "HttpResponse").
+    -- http_concepts appends the two built-ins so a service handler that NAMES
+    -- HttpResponse resolves (Finding 1). handler_svc / handler_rule are safe on the
+    -- SvNil sentinel (find_rule returns a sentinel rule -> zero spans -> the
+    -- appended concepts have name_len 0, harmless because service_errors already
+    -- refuses a missing/malformed handler).
+    let svcs = parse_services(ProgramState { cell: toks, src: s.source })
+    let has_service = if service_list_len(svcs) > 0 then 1 else 0
+    let handler_svc = svc_head(svcs)
+    let handler_rule = find_rule(FindRuleState { rules: prog, src: s.source, q_start: svc_handler_start(handler_svc), q_len: svc_handler_len(handler_svc) })
+    let http_concepts = concepts_append_http(HttpAppendState { concepts: concepts0, req_start: fl_head_ty_start(rd_input(handler_rule)), req_len: fl_head_ty_len(rd_input(handler_rule)), resp_start: rd_out_ty_start(handler_rule), resp_len: rd_out_ty_len(handler_rule) })
+    let concepts = if has_service == 1 then http_concepts else (if program_uses_result(UsesTextRules { rules: prog, src: s.source }) == 1 then concepts_append_result(concepts0) else concepts0)
     -- V3 (self-verify arc): the AGGREGATE VERIFICATION SCORE of the input
     -- program — the same three surfaces verify_errors sums (R6a/R6b lint+type
     -- diags + R6d purity violations + termination violations), REUSING the
@@ -26721,7 +27101,7 @@ rule elf_program_src
     -- Effects tier slice 2a: the reaction list — used by reaction_errors (verify)
     -- AND by the has_reaction emit branch + blob_end_off sizing (emit).
     let rxs = parse_reactions(ProgramState { cell: toks, src: s.source })
-    let verrs = arena_scope(diag_count(prog_diags(ProgDiagsState { iter: prog, full: prog, src: s.source, idx: 0, concepts: concepts0 })) + purity_list(PurityListState { iter: prog, full: prog, src: s.source }) + term_list(TermListState { iter: prog, src: s.source }) + resource_errors(ResErrState { prog: prog, ress: ress, concepts: concepts0, src: s.source }) + reaction_errors(RxErrState { prog: prog, rxs: rxs, src: s.source, concepts: concepts0 }) + connection_errors(ConnErrState { prog: prog, ress: ress, conns: conns, src: s.source }))
+    let verrs = arena_scope(diag_count(prog_diags(ProgDiagsState { iter: prog, full: prog, src: s.source, idx: 0, concepts: if has_service == 1 then http_concepts else concepts0 })) + purity_list(PurityListState { iter: prog, full: prog, src: s.source }) + term_list(TermListState { iter: prog, src: s.source }) + resource_errors(ResErrState { prog: prog, ress: ress, concepts: concepts0, src: s.source }) + reaction_errors(RxErrState { prog: prog, rxs: rxs, src: s.source, concepts: concepts0 }) + connection_errors(ConnErrState { prog: prog, ress: ress, conns: conns, src: s.source }) + service_errors(ServiceErrState { prog: prog, svcs: svcs, concepts: concepts0, ress: ress, conns: conns, rxs: rxs, src: s.source }))
     let sizes = proc_sizes(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: ProcSizeList::PSNil, ress: ress, conns: conns, rxs: rxs })
     let uses_var = program_uses_arena(concepts)
     let anytx = prog_any_texty(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: sizes, ress: ress, conns: conns, rxs: rxs })
@@ -26761,7 +27141,7 @@ rule elf_program_src
   proofs:
     purity:
       reads : [s.source]
-      calls : [begin_tokenize, parse_program, parse_concepts, parse_resources, parse_reactions, parse_connections, resource_errors, reaction_errors, reaction_list_len, x86_reaction_tramp, resource_marshal_size, x86_resource_marshal, program_uses_result, concepts_append_result, diag_count, prog_diags, purity_list, term_list, proc_sizes, program_uses_arena, prog_any_texty, entry_rule_texty, entry_rule_bytes, entry_rule_result, entry_rule_collection, max_payload_fields, program_uses_text, blob_end_off, x86_program, src_blob, param_list_len, rl_head_params, fields_to_params, rl_head_input, params_to_fields, find_concept_index, fl_head_ty_start, fl_head_ty_len, x86_argv_marshal, x86_stdin_marshal, field_list_has_text, cd_fields, concept_at_index, connection_errors, connection_marshal_size, x86_connection_marshal]
+      calls : [begin_tokenize, parse_program, parse_concepts, parse_resources, parse_reactions, parse_connections, parse_services, resource_errors, reaction_errors, reaction_list_len, x86_reaction_tramp, resource_marshal_size, x86_resource_marshal, program_uses_result, concepts_append_result, concepts_append_http, service_list_len, svc_head, svc_handler_start, svc_handler_len, find_rule, rd_input, rd_out_ty_start, rd_out_ty_len, service_errors, diag_count, prog_diags, purity_list, term_list, proc_sizes, program_uses_arena, prog_any_texty, entry_rule_texty, entry_rule_bytes, entry_rule_result, entry_rule_collection, max_payload_fields, program_uses_text, blob_end_off, x86_program, src_blob, param_list_len, rl_head_params, fields_to_params, rl_head_input, params_to_fields, find_concept_index, fl_head_ty_start, fl_head_ty_len, x86_argv_marshal, x86_stdin_marshal, field_list_has_text, cd_fields, concept_at_index, connection_errors, connection_marshal_size, x86_connection_marshal]
     termination:
       bound : 256
 
