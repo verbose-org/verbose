@@ -23730,6 +23730,165 @@ rule le64_neg
         let _ = fs::remove_file(&purity);
     }
 
+    /// SELF-HOSTING SERVICE slice 1 — MILESTONE. The self-hosted emitter
+    /// (elf_program_src, compiled natively from examples/vexprparse.verbose)
+    /// compiles a hello_http-shaped `.verbose` with a `service` block whose handler
+    /// returns a LITERAL HttpResponse into an ELF that LISTENS on the declared port
+    /// and returns a fixed HTTP/1.0 response. An ephemeral port is baked into a fresh
+    /// source (parallel-safe); the emitted binary is SPAWNED (the accept loop never
+    /// returns, so .output() would hang), polled for bind, sent one GET, and its
+    /// response asserted BYTE-FOR-BYTE against the oracle wire bytes.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn self_hosted_service_constant_response() {
+        use std::fs;
+        use std::io::{Read, Write};
+        use std::net::{TcpListener, TcpStream};
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+        use std::time::Duration;
+
+        let src = fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        // gen0: the self-hosted emitter (source on argv[1], pos on argv[2]).
+        let elf = std::env::temp_dir().join("verbosec_test_svc_s1_elf_program_src");
+        compile_native(&program, "elf_program_src", elf.to_str().unwrap(), false, false)
+            .expect("elf_program_src must compile natively");
+
+        // Ephemeral port: bind then drop so it is free for the emitted server to bind.
+        let port = {
+            let l = TcpListener::bind(("127.0.0.1", 0)).expect("bind ephemeral");
+            l.local_addr().unwrap().port()
+        };
+
+        let source = format!(
+            "rule hello_handler\n  input:\n    req : HttpRequest\n  output:\n    resp : HttpResponse\n  logic:\n    resp = HttpResponse {{ status: 200, body: \"Hello from Verbose over HTTP!\" }}\n  proofs:\n    purity:\n      reads : []\n      calls : []\n    termination:\n      bound : 1\nservice hello_server\n  listen:\n    protocol : http_1_0\n    port : {}\n    max_request : 4096\n  handler: hello_handler",
+            port
+        );
+
+        // Emit the server ELF via gen0 (one-shot: gen0 emits + exits).
+        let gen = Command::new(&elf).args([source.as_str(), "0"]).output()
+            .expect("spawn gen0");
+        assert!(gen.status.success() && gen.stdout.len() >= 4 && &gen.stdout[0..4] == b"\x7fELF",
+            "gen0 must emit a service ELF; got {:?} stderr={:?}",
+            gen.status, String::from_utf8_lossy(&gen.stderr));
+
+        let server = std::env::temp_dir().join("verbosec_test_svc_s1_server");
+        fs::write(&server, &gen.stdout).unwrap();
+        let mut p = fs::metadata(&server).unwrap().permissions();
+        p.set_mode(0o755);
+        fs::set_permissions(&server, p).unwrap();
+
+        // Spawn the SERVER (accept loop never returns — must NOT .output()).
+        let mut child = Command::new(&server).spawn().expect("spawn server");
+
+        // Poll for bind.
+        let addr: std::net::SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
+        let mut bound = false;
+        for _ in 0..50 {
+            if TcpStream::connect_timeout(&addr, Duration::from_millis(100)).is_ok() {
+                bound = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(bound, "self-hosted service never bound on port {}", port);
+
+        let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).expect("connect");
+        s.set_read_timeout(Some(Duration::from_secs(2))).ok();
+        s.write_all(b"GET / HTTP/1.0\r\n\r\n").expect("write GET");
+        let mut buf = Vec::new();
+        s.read_to_end(&mut buf).expect("read response");
+        drop(s);
+
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert_eq!(
+            buf,
+            b"HTTP/1.0 200 OK\r\nContent-Length: 29\r\n\r\nHello from Verbose over HTTP!",
+            "self-hosted service response = {:?}",
+            String::from_utf8_lossy(&buf)
+        );
+
+        let _ = fs::remove_file(&elf);
+        let _ = fs::remove_file(&server);
+    }
+
+    /// SELF-HOSTING SERVICE slice 1 — verify gate pins. The self-hosted emitter's
+    /// leading abort_if(verrs) refuses (exit 1, empty stdout) every service audit
+    /// violation; a clean hello_http emits an ELF.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn self_hosted_service_verify_gate() {
+        use std::fs;
+        use std::process::Command;
+
+        let src = fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let gate = std::env::temp_dir().join("verbosec_test_svc_s1_gate");
+        compile_native(&program, "elf_program_src", gate.to_str().unwrap(), false, false)
+            .expect("elf_program_src must compile natively");
+
+        let run = |prog: &str| -> std::process::Output {
+            Command::new(&gate).args([prog, "0"]).output().expect("spawn gate")
+        };
+        let refuse = |prog: &str, why: &str| {
+            let o = run(prog);
+            assert!(!o.status.success() && o.stdout.is_empty(),
+                "gate must refuse ({}) with exit 1 + no output; got {:?}", why, o.status);
+        };
+
+        // Handler + service builder (hdrless). `logic` and `svc` are spliced in.
+        let mk = |logic: &str, svc: &str| -> String {
+            format!("rule hello_handler\n  input:\n    req : HttpRequest\n  output:\n    resp : HttpResponse\n  logic:\n    {}\n  proofs:\n    purity:\n      reads : []\n      calls : []\n    termination:\n      bound : 1\n{}", logic, svc)
+        };
+        let good_logic = "resp = HttpResponse { status: 200, body: \"Hi\" }";
+        let svc = |proto: &str, port: &str, maxreq: &str, handler: &str| -> String {
+            format!("service hello_server\n  listen:\n    protocol : {}\n    port : {}\n    max_request : {}\n  handler: {}", proto, port, maxreq, handler)
+        };
+
+        // (a) clean hello_http -> emits an ELF.
+        let clean = mk(good_logic, &svc("http_1_0", "18888", "4096", "hello_handler"));
+        let o = run(&clean);
+        assert!(o.status.success() && o.stdout.len() >= 4 && &o.stdout[0..4] == b"\x7fELF",
+            "gate must emit the clean service; got {:?} stderr={:?}",
+            o.status, String::from_utf8_lossy(&o.stderr));
+
+        // (b) missing handler rule.
+        refuse(&mk(good_logic, &svc("http_1_0", "18888", "4096", "nonexistent_rule")),
+            "missing handler rule");
+        // (c) raw_tcp protocol.
+        refuse(&mk(good_logic, &svc("raw_tcp", "18888", "4096", "hello_handler")), "raw_tcp");
+        // (d) port 0.
+        refuse(&mk(good_logic, &svc("http_1_0", "0", "4096", "hello_handler")), "port 0");
+        // (e) max_request < 64.
+        refuse(&mk(good_logic, &svc("http_1_0", "18888", "32", "hello_handler")), "max_request < 64");
+        // (f) req.* in the handler body (non-literal -> S2).
+        refuse(&mk("resp = HttpResponse { status: 200, body: req.path }",
+            &svc("http_1_0", "18888", "4096", "hello_handler")), "req.* handler body");
+        // (g) non-literal (concat) body.
+        refuse(&mk("resp = HttpResponse { status: 200, body: concat(\"a\", \"b\") }",
+            &svc("http_1_0", "18888", "4096", "hello_handler")), "concat handler body");
+        // (h) let-bound handler.
+        refuse(&mk("let x = 200\n    resp = HttpResponse { status: 200, body: \"Hi\" }",
+            &svc("http_1_0", "18888", "4096", "hello_handler")), "let in handler");
+        // (i) user-declared HttpResponse (reserved built-in name).
+        let user_resp = format!("concept HttpResponse\n  fields:\n    x : number\n{}", clean);
+        refuse(&user_resp, "user-declared HttpResponse");
+        // (j) service + reaction (a service has no marshal; effects-into-handlers is S5-S7).
+        let svc_plus_reaction = format!("{}\nreaction logit\n  trigger: hello_handler\n  effects:\n    append_file \"/tmp/vx_svc_s1_r.log\" \"y\\n\"", clean);
+        refuse(&svc_plus_reaction, "service + reaction");
+
+        let _ = fs::remove_file(&gate);
+    }
+
     /// Brick b6 — the four missing binary operators in the machine-code
     /// generator: division `/` (op 16), modulo `%` (op 17), logical `and`
     /// (op 30), logical `or` (op 31). Both the closed-expression path
