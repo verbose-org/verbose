@@ -23921,6 +23921,112 @@ rule le64_neg
         let _ = fs::remove_file(&elf);
     }
 
+    /// SELF-HOSTING SERVICE slice 3 — MILESTONE. The self-hosted emitter compiles an
+    /// if/else router (`resp = if req.path == "/" then HttpResponse{200,"home"} else
+    /// HttpResponse{404,"nope"}`) into an ELF that BRANCHES per request on a text `==`
+    /// of the parsed req field against an inline decoded literal, emitting one of two
+    /// precomputed static responses. Proves runtime per-request routing (two paths ->
+    /// two responses on the SAME server) and length-first correctness (a longer path
+    /// takes the else arm — a length-first compare, not a prefix match). Byte-for-byte
+    /// wire asserts.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn self_hosted_service_router() {
+        use std::fs;
+        use std::io::{Read, Write};
+        use std::net::{TcpListener, TcpStream};
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+        use std::time::Duration;
+
+        let src = fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        // gen0: the self-hosted emitter (source on argv[1], pos on argv[2]).
+        let elf = std::env::temp_dir().join("verbosec_test_svc_s3_elf_program_src");
+        compile_native(&program, "elf_program_src", elf.to_str().unwrap(), false, false)
+            .expect("elf_program_src must compile natively");
+
+        // Emit a router server (branch on `req.<field> == "<val>"`), spawn it, probe it.
+        let run_router = |field: &str, val: &str, sa: u32, ba: &str, sb: u32, bb: &str, reqs: &[&[u8]]| -> Vec<Vec<u8>> {
+            let port = {
+                let l = TcpListener::bind(("127.0.0.1", 0)).expect("bind ephemeral");
+                l.local_addr().unwrap().port()
+            };
+            let source = format!(
+                "rule route\n  input:\n    req : HttpRequest\n  output:\n    resp : HttpResponse\n  logic:\n    resp = if req.{f} == \"{v}\" then HttpResponse {{ status: {sa}, body: \"{ba}\" }} else HttpResponse {{ status: {sb}, body: \"{bb}\" }}\n  proofs:\n    purity:\n      reads : [req.{f}]\n      calls : []\n    termination:\n      bound : 8\nservice router_srv\n  listen:\n    protocol : http_1_0\n    port : {p}\n    max_request : 4096\n  handler: route",
+                f = field, v = val, sa = sa, ba = ba, sb = sb, bb = bb, p = port
+            );
+            let gen = Command::new(&elf).args([source.as_str(), "0"]).output()
+                .expect("spawn gen0");
+            assert!(gen.status.success() && gen.stdout.len() >= 4 && &gen.stdout[0..4] == b"\x7fELF",
+                "gen0 must emit an S3 router ELF ({field}); got {:?} stderr={:?}",
+                gen.status, String::from_utf8_lossy(&gen.stderr));
+
+            let server = std::env::temp_dir().join(format!("verbosec_test_svc_s3_server_{field}"));
+            fs::write(&server, &gen.stdout).unwrap();
+            let mut p = fs::metadata(&server).unwrap().permissions();
+            p.set_mode(0o755);
+            fs::set_permissions(&server, p).unwrap();
+
+            let mut child = Command::new(&server).spawn().expect("spawn server");
+            let addr: std::net::SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
+            let mut bound = false;
+            for _ in 0..50 {
+                if TcpStream::connect_timeout(&addr, Duration::from_millis(100)).is_ok() {
+                    bound = true;
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            assert!(bound, "S3 router ({field}) never bound on port {}", port);
+
+            let mut out = Vec::new();
+            for req in reqs {
+                let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).expect("connect");
+                s.set_read_timeout(Some(Duration::from_secs(2))).ok();
+                s.write_all(req).expect("write request");
+                let mut buf = Vec::new();
+                s.read_to_end(&mut buf).expect("read response");
+                drop(s);
+                out.push(buf);
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = fs::remove_file(&server);
+            out
+        };
+
+        // (1) path router: "/" -> home (200), anything else -> nope (404). Same server,
+        // two requests, two responses -> the branch is RUNTIME, per-request. And /xy
+        // (len 3) takes the else arm -> the compare is length-first, not a prefix match.
+        let r = run_router("path", "/", 200, "home", 404, "nope", &[
+            b"GET / HTTP/1.0\r\n\r\n",
+            b"GET /x HTTP/1.0\r\n\r\n",
+            b"GET /xy HTTP/1.0\r\n\r\n",
+        ]);
+        assert_eq!(r[0], b"HTTP/1.0 200 OK\r\nContent-Length: 4\r\n\r\nhome",
+            "GET / -> {:?}", String::from_utf8_lossy(&r[0]));
+        assert_eq!(r[1], b"HTTP/1.0 404 OK\r\nContent-Length: 4\r\n\r\nnope",
+            "GET /x (same server) -> {:?}", String::from_utf8_lossy(&r[1]));
+        assert_eq!(r[2], b"HTTP/1.0 404 OK\r\nContent-Length: 4\r\n\r\nnope",
+            "GET /xy (len 3 != 1) must take the else arm -> {:?}", String::from_utf8_lossy(&r[2]));
+
+        // (2) method router: method GET -> 200, else -> 405 (the req.method field-select).
+        let m = run_router("method", "GET", 200, "getok", 405, "no", &[
+            b"GET / HTTP/1.0\r\n\r\n",
+            b"POST / HTTP/1.0\r\n\r\n",
+        ]);
+        assert_eq!(m[0], b"HTTP/1.0 200 OK\r\nContent-Length: 5\r\n\r\ngetok",
+            "GET method -> {:?}", String::from_utf8_lossy(&m[0]));
+        assert_eq!(m[1], b"HTTP/1.0 405 OK\r\nContent-Length: 2\r\n\r\nno",
+            "POST method -> {:?}", String::from_utf8_lossy(&m[1]));
+
+        let _ = fs::remove_file(&elf);
+    }
+
     /// SELF-HOSTING SERVICE slice 1 — verify gate pins. The self-hosted emitter's
     /// leading abort_if(verrs) refuses (exit 1, empty stdout) every service audit
     /// violation; a clean hello_http emits an ELF.
@@ -23955,6 +24061,12 @@ rule le64_neg
         // Same, but with a declared `reads` list (the S2 echo bodies read req fields).
         let mkr = |logic: &str, reads: &str, svc: &str| -> String {
             format!("rule hello_handler\n  input:\n    req : HttpRequest\n  output:\n    resp : HttpResponse\n  logic:\n    {}\n  proofs:\n    purity:\n      reads : {}\n      calls : []\n    termination:\n      bound : 1\n{}", logic, reads, svc)
+        };
+        // Slice 3: router handlers (if/else + text ==) have a higher op count than the
+        // S1/S2 single-record body, so they need a `bound` above 1. mkrb parameterizes it
+        // so a refuse-pin fails ONLY for the shape reason under test, never for term.
+        let mkrb = |logic: &str, reads: &str, bound: &str, svc: &str| -> String {
+            format!("rule hello_handler\n  input:\n    req : HttpRequest\n  output:\n    resp : HttpResponse\n  logic:\n    {}\n  proofs:\n    purity:\n      reads : {}\n      calls : []\n    termination:\n      bound : {}\n{}", logic, reads, bound, svc)
         };
         let good_logic = "resp = HttpResponse { status: 200, body: \"Hi\" }";
         let svc = |proto: &str, port: &str, maxreq: &str, handler: &str| -> String {
@@ -23996,9 +24108,38 @@ rule le64_neg
         // (f4) AstField base is not the handler input param -> refused.
         refuse(&mkr("resp = HttpResponse { status: 200, body: bogus.path }",
             "[bogus.path]", &svc("http_1_0", "18888", "4096", "hello_handler")), "base not input param");
-        // (f5) if/else handler -> refused (dynamic routing is S3).
-        refuse(&mkr("resp = if req.method == \"GET\" then HttpResponse { status: 200, body: req.path } else HttpResponse { status: 404, body: req.path }",
-            "[req.method, req.path]", &svc("http_1_0", "18888", "4096", "hello_handler")), "if/else handler (S3)");
+        // (f5) SLICE 3: an if/else router whose ARM body is a FIELD ECHO (`body: req.path`)
+        // stays REFUSED and is deferred to S4 — svc_arm_ok requires an AstStr literal body
+        // (a field echo has no compile-time length -> service_response_blob would emit a
+        // silent Content-Length: 0). Bound raised to 8 so the ONLY refusal cause is the
+        // arm shape (not term); previously this was labeled "if/else handler (S3)".
+        refuse(&mkrb("resp = if req.method == \"GET\" then HttpResponse { status: 200, body: req.path } else HttpResponse { status: 404, body: req.path }",
+            "[req.method, req.path]", "8", &svc("http_1_0", "18888", "4096", "hello_handler")), "field-echo arm in if/else -> S4");
+        // (f6) SLICE 3: an if/else router with LITERAL arms + a `req.path == "lit"` cond
+        // now EMITS (the S3 milestone shape).
+        let s3_router = mkrb("resp = if req.path == \"/\" then HttpResponse { status: 200, body: \"home\" } else HttpResponse { status: 404, body: \"nope\" }",
+            "[req.path]", "8", &svc("http_1_0", "18888", "4096", "hello_handler"));
+        let s3o = run(&s3_router);
+        assert!(s3o.status.success() && s3o.stdout.len() >= 4 && &s3o.stdout[0..4] == b"\x7fELF",
+            "S3 literal-arm router must emit; got {:?} stderr={:?}", s3o.status, String::from_utf8_lossy(&s3o.stderr));
+        // (f6b) the `req.method == "lit"` variant also emits.
+        let s3m = run(&mkrb("resp = if req.method == \"GET\" then HttpResponse { status: 200, body: \"a\" } else HttpResponse { status: 405, body: \"b\" }",
+            "[req.method]", "8", &svc("http_1_0", "18888", "4096", "hello_handler")));
+        assert!(s3m.status.success() && s3m.stdout.len() >= 4 && &s3m.stdout[0..4] == b"\x7fELF",
+            "S3 method router must emit; got {:?}", s3m.status);
+        // (f7) SLICE 3: a concat arm body -> refused (a computed response is S4).
+        refuse(&mkrb("resp = if req.path == \"/\" then HttpResponse { status: 200, body: concat(\"a\", req.path) } else HttpResponse { status: 404, body: \"nope\" }",
+            "[req.path]", "8", &svc("http_1_0", "18888", "4096", "hello_handler")), "concat arm body -> S4");
+        // (f8) SLICE 3: an `and`/`or` cond -> refused (two-compare routing is S3.1).
+        refuse(&mkrb("resp = if req.method == \"GET\" and req.path == \"/\" then HttpResponse { status: 200, body: \"a\" } else HttpResponse { status: 404, body: \"b\" }",
+            "[req.method, req.path]", "8", &svc("http_1_0", "18888", "4096", "hello_handler")), "and/or cond -> S3.1");
+        // (f9) SLICE 3: a non-`==` cond op (`!=`) -> refused (only Eq accepted).
+        refuse(&mkrb("resp = if req.path != \"/\" then HttpResponse { status: 200, body: \"a\" } else HttpResponse { status: 404, body: \"b\" }",
+            "[req.path]", "8", &svc("http_1_0", "18888", "4096", "hello_handler")), "non-== cond op");
+        // (f10) SLICE 3: an AstStr cond LHS (`"a" == "/"`) -> refused (the LHS must be a
+        // req field, else the field-select would run on a literal = a spurious compare).
+        refuse(&mkrb("resp = if \"a\" == \"/\" then HttpResponse { status: 200, body: \"a\" } else HttpResponse { status: 404, body: \"b\" }",
+            "[]", "8", &svc("http_1_0", "18888", "4096", "hello_handler")), "AstStr cond LHS");
         // (g) non-literal (concat) body -> refused (S4).
         refuse(&mkr("resp = HttpResponse { status: 200, body: concat(\"a\", req.path) }",
             "[req.path]", &svc("http_1_0", "18888", "4096", "hello_handler")), "concat handler body (S4)");
