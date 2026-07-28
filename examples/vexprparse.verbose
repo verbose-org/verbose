@@ -11803,6 +11803,317 @@ rule ast_field_flen
       bound : 64
 
 
+-- ast_is_if / ast_if_cond / ast_if_then / ast_if_else (self-hosting-service-slice-3):
+-- shallow readers of an AstIf node (`if cond then thn else els`). The S3 router
+-- handler result is an AstIf whose cond is a text `==`, so the emit + verify need to
+-- reach cond / then / else. AstErr / 0 for any other shape (fail-closed: a non-if body
+-- fails svc_if_shape_ok and stays refused). Mirrors of ast_field_base/fstart/flen.
+rule ast_is_if
+  @intention: "1 if the AST node is an AstIf (an if/then/else), 0 otherwise"
+  @source: vexprparse.intent:74
+  input:
+    n : Ast
+  output:
+    out : number
+  logic:
+    out = match n:
+      AstNum(value) => 0
+      AstBin(op, lhs, rhs) => 0
+      AstNeg(inner) => 0
+      AstNot(inner) => 0
+      AstVar(start, len) => 0
+      AstField(base, fstart, flen) => 0
+      AstCall(callee_start, callee_len, args) => 0
+      AstStr(start, len) => 0
+      AstBytes(start, len) => 0
+      AstBool(value) => 0
+      AstIf(cond, thn, els) => 1
+      AstErr => 0
+      AstVariant(cstart, clen, vstart, vlen, fields) => 0
+      AstMatch(scrut, arms) => 0
+      AstOk(inner) => 0
+      AstResErr(inner) => 0
+      AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => 0
+      AstSum(coll, item_start, item_len, body) => 0
+      AstCount(coll, item_start, item_len, body) => 0
+      AstFold(coll, init, acc_start, acc_len, item_start, item_len, body) => 0
+      AstAll(coll, item_start, item_len, body) => 0
+      AstAny(coll, item_start, item_len, body) => 0
+      AstMap(coll, item_start, item_len, body) => 0
+      AstFilter(coll, item_start, item_len, body) => 0
+      AstMinFold(coll, item_start, item_len, body) => 0
+      AstMaxFold(coll, item_start, item_len, body) => 0
+  proofs:
+    purity:
+      reads : [n]
+      calls : []
+    termination:
+      bound : 16
+
+
+rule ast_if_cond
+  @intention: "The condition sub-expression of an AstIf node, AstErr for any other shape"
+  @source: vexprparse.intent:74
+  input:
+    n : Ast
+  output:
+    out : Ast
+  logic:
+    out = match n:
+      AstNum(value) => Ast::AstErr
+      AstBin(op, lhs, rhs) => Ast::AstErr
+      AstNeg(inner) => Ast::AstErr
+      AstNot(inner) => Ast::AstErr
+      AstVar(start, len) => Ast::AstErr
+      AstField(base, fstart, flen) => Ast::AstErr
+      AstCall(callee_start, callee_len, args) => Ast::AstErr
+      AstStr(start, len) => Ast::AstErr
+      AstBytes(start, len) => Ast::AstErr
+      AstBool(value) => Ast::AstErr
+      AstIf(cond, thn, els) => cond
+      AstErr => Ast::AstErr
+      AstVariant(cstart, clen, vstart, vlen, fields) => Ast::AstErr
+      AstMatch(scrut, arms) => Ast::AstErr
+      AstOk(inner) => Ast::AstErr
+      AstResErr(inner) => Ast::AstErr
+      AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => Ast::AstErr
+      AstSum(coll, item_start, item_len, body) => Ast::AstErr
+      AstCount(coll, item_start, item_len, body) => Ast::AstErr
+      AstFold(coll, init, acc_start, acc_len, item_start, item_len, body) => Ast::AstErr
+      AstAll(coll, item_start, item_len, body) => Ast::AstErr
+      AstAny(coll, item_start, item_len, body) => Ast::AstErr
+      AstMap(coll, item_start, item_len, body) => Ast::AstErr
+      AstFilter(coll, item_start, item_len, body) => Ast::AstErr
+      AstMinFold(coll, item_start, item_len, body) => Ast::AstErr
+      AstMaxFold(coll, item_start, item_len, body) => Ast::AstErr
+  proofs:
+    purity:
+      reads : [n]
+      calls : []
+    termination:
+      bound : 64
+
+
+rule ast_if_then
+  @intention: "The then-branch sub-expression of an AstIf node, AstErr for any other shape"
+  @source: vexprparse.intent:74
+  input:
+    n : Ast
+  output:
+    out : Ast
+  logic:
+    out = match n:
+      AstNum(value) => Ast::AstErr
+      AstBin(op, lhs, rhs) => Ast::AstErr
+      AstNeg(inner) => Ast::AstErr
+      AstNot(inner) => Ast::AstErr
+      AstVar(start, len) => Ast::AstErr
+      AstField(base, fstart, flen) => Ast::AstErr
+      AstCall(callee_start, callee_len, args) => Ast::AstErr
+      AstStr(start, len) => Ast::AstErr
+      AstBytes(start, len) => Ast::AstErr
+      AstBool(value) => Ast::AstErr
+      AstIf(cond, thn, els) => thn
+      AstErr => Ast::AstErr
+      AstVariant(cstart, clen, vstart, vlen, fields) => Ast::AstErr
+      AstMatch(scrut, arms) => Ast::AstErr
+      AstOk(inner) => Ast::AstErr
+      AstResErr(inner) => Ast::AstErr
+      AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => Ast::AstErr
+      AstSum(coll, item_start, item_len, body) => Ast::AstErr
+      AstCount(coll, item_start, item_len, body) => Ast::AstErr
+      AstFold(coll, init, acc_start, acc_len, item_start, item_len, body) => Ast::AstErr
+      AstAll(coll, item_start, item_len, body) => Ast::AstErr
+      AstAny(coll, item_start, item_len, body) => Ast::AstErr
+      AstMap(coll, item_start, item_len, body) => Ast::AstErr
+      AstFilter(coll, item_start, item_len, body) => Ast::AstErr
+      AstMinFold(coll, item_start, item_len, body) => Ast::AstErr
+      AstMaxFold(coll, item_start, item_len, body) => Ast::AstErr
+  proofs:
+    purity:
+      reads : [n]
+      calls : []
+    termination:
+      bound : 64
+
+
+rule ast_if_else
+  @intention: "The else-branch sub-expression of an AstIf node, AstErr for any other shape"
+  @source: vexprparse.intent:74
+  input:
+    n : Ast
+  output:
+    out : Ast
+  logic:
+    out = match n:
+      AstNum(value) => Ast::AstErr
+      AstBin(op, lhs, rhs) => Ast::AstErr
+      AstNeg(inner) => Ast::AstErr
+      AstNot(inner) => Ast::AstErr
+      AstVar(start, len) => Ast::AstErr
+      AstField(base, fstart, flen) => Ast::AstErr
+      AstCall(callee_start, callee_len, args) => Ast::AstErr
+      AstStr(start, len) => Ast::AstErr
+      AstBytes(start, len) => Ast::AstErr
+      AstBool(value) => Ast::AstErr
+      AstIf(cond, thn, els) => els
+      AstErr => Ast::AstErr
+      AstVariant(cstart, clen, vstart, vlen, fields) => Ast::AstErr
+      AstMatch(scrut, arms) => Ast::AstErr
+      AstOk(inner) => Ast::AstErr
+      AstResErr(inner) => Ast::AstErr
+      AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => Ast::AstErr
+      AstSum(coll, item_start, item_len, body) => Ast::AstErr
+      AstCount(coll, item_start, item_len, body) => Ast::AstErr
+      AstFold(coll, init, acc_start, acc_len, item_start, item_len, body) => Ast::AstErr
+      AstAll(coll, item_start, item_len, body) => Ast::AstErr
+      AstAny(coll, item_start, item_len, body) => Ast::AstErr
+      AstMap(coll, item_start, item_len, body) => Ast::AstErr
+      AstFilter(coll, item_start, item_len, body) => Ast::AstErr
+      AstMinFold(coll, item_start, item_len, body) => Ast::AstErr
+      AstMaxFold(coll, item_start, item_len, body) => Ast::AstErr
+  proofs:
+    purity:
+      reads : [n]
+      calls : []
+    termination:
+      bound : 64
+
+
+-- ast_bin_op / ast_bin_lhs / ast_bin_rhs (self-hosting-service-slice-3): shallow
+-- readers of an AstBin node (`lhs <op> rhs`). ast_bin_op yields the op code (1 = Eq,
+-- the only op S3 accepts), 0 for any other shape; lhs/rhs yield the operands (AstErr
+-- otherwise). Used by svc_if_shape_ok (verify: cond is `field == "lit"`) and
+-- x86_service_tramp (emit: field-select from the lhs, decoded literal from the rhs).
+rule ast_bin_op
+  @intention: "The operator code of an AstBin node, 0 for any other shape"
+  @source: vexprparse.intent:74
+  input:
+    n : Ast
+  output:
+    out : number
+  logic:
+    out = match n:
+      AstNum(value) => 0
+      AstBin(op, lhs, rhs) => op
+      AstNeg(inner) => 0
+      AstNot(inner) => 0
+      AstVar(start, len) => 0
+      AstField(base, fstart, flen) => 0
+      AstCall(callee_start, callee_len, args) => 0
+      AstStr(start, len) => 0
+      AstBytes(start, len) => 0
+      AstBool(value) => 0
+      AstIf(cond, thn, els) => 0
+      AstErr => 0
+      AstVariant(cstart, clen, vstart, vlen, fields) => 0
+      AstMatch(scrut, arms) => 0
+      AstOk(inner) => 0
+      AstResErr(inner) => 0
+      AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => 0
+      AstSum(coll, item_start, item_len, body) => 0
+      AstCount(coll, item_start, item_len, body) => 0
+      AstFold(coll, init, acc_start, acc_len, item_start, item_len, body) => 0
+      AstAll(coll, item_start, item_len, body) => 0
+      AstAny(coll, item_start, item_len, body) => 0
+      AstMap(coll, item_start, item_len, body) => 0
+      AstFilter(coll, item_start, item_len, body) => 0
+      AstMinFold(coll, item_start, item_len, body) => 0
+      AstMaxFold(coll, item_start, item_len, body) => 0
+  proofs:
+    purity:
+      reads : [n]
+      calls : []
+    termination:
+      bound : 16
+
+
+rule ast_bin_lhs
+  @intention: "The left operand of an AstBin node, AstErr for any other shape"
+  @source: vexprparse.intent:74
+  input:
+    n : Ast
+  output:
+    out : Ast
+  logic:
+    out = match n:
+      AstNum(value) => Ast::AstErr
+      AstBin(op, lhs, rhs) => lhs
+      AstNeg(inner) => Ast::AstErr
+      AstNot(inner) => Ast::AstErr
+      AstVar(start, len) => Ast::AstErr
+      AstField(base, fstart, flen) => Ast::AstErr
+      AstCall(callee_start, callee_len, args) => Ast::AstErr
+      AstStr(start, len) => Ast::AstErr
+      AstBytes(start, len) => Ast::AstErr
+      AstBool(value) => Ast::AstErr
+      AstIf(cond, thn, els) => Ast::AstErr
+      AstErr => Ast::AstErr
+      AstVariant(cstart, clen, vstart, vlen, fields) => Ast::AstErr
+      AstMatch(scrut, arms) => Ast::AstErr
+      AstOk(inner) => Ast::AstErr
+      AstResErr(inner) => Ast::AstErr
+      AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => Ast::AstErr
+      AstSum(coll, item_start, item_len, body) => Ast::AstErr
+      AstCount(coll, item_start, item_len, body) => Ast::AstErr
+      AstFold(coll, init, acc_start, acc_len, item_start, item_len, body) => Ast::AstErr
+      AstAll(coll, item_start, item_len, body) => Ast::AstErr
+      AstAny(coll, item_start, item_len, body) => Ast::AstErr
+      AstMap(coll, item_start, item_len, body) => Ast::AstErr
+      AstFilter(coll, item_start, item_len, body) => Ast::AstErr
+      AstMinFold(coll, item_start, item_len, body) => Ast::AstErr
+      AstMaxFold(coll, item_start, item_len, body) => Ast::AstErr
+  proofs:
+    purity:
+      reads : [n]
+      calls : []
+    termination:
+      bound : 64
+
+
+rule ast_bin_rhs
+  @intention: "The right operand of an AstBin node, AstErr for any other shape"
+  @source: vexprparse.intent:74
+  input:
+    n : Ast
+  output:
+    out : Ast
+  logic:
+    out = match n:
+      AstNum(value) => Ast::AstErr
+      AstBin(op, lhs, rhs) => rhs
+      AstNeg(inner) => Ast::AstErr
+      AstNot(inner) => Ast::AstErr
+      AstVar(start, len) => Ast::AstErr
+      AstField(base, fstart, flen) => Ast::AstErr
+      AstCall(callee_start, callee_len, args) => Ast::AstErr
+      AstStr(start, len) => Ast::AstErr
+      AstBytes(start, len) => Ast::AstErr
+      AstBool(value) => Ast::AstErr
+      AstIf(cond, thn, els) => Ast::AstErr
+      AstErr => Ast::AstErr
+      AstVariant(cstart, clen, vstart, vlen, fields) => Ast::AstErr
+      AstMatch(scrut, arms) => Ast::AstErr
+      AstOk(inner) => Ast::AstErr
+      AstResErr(inner) => Ast::AstErr
+      AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => Ast::AstErr
+      AstSum(coll, item_start, item_len, body) => Ast::AstErr
+      AstCount(coll, item_start, item_len, body) => Ast::AstErr
+      AstFold(coll, init, acc_start, acc_len, item_start, item_len, body) => Ast::AstErr
+      AstAll(coll, item_start, item_len, body) => Ast::AstErr
+      AstAny(coll, item_start, item_len, body) => Ast::AstErr
+      AstMap(coll, item_start, item_len, body) => Ast::AstErr
+      AstFilter(coll, item_start, item_len, body) => Ast::AstErr
+      AstMinFold(coll, item_start, item_len, body) => Ast::AstErr
+      AstMaxFold(coll, item_start, item_len, body) => Ast::AstErr
+  proofs:
+    purity:
+      reads : [n]
+      calls : []
+    termination:
+      bound : 64
+
+
 -- Family A states: an Ast (or list) + the source + ONE resource name's query span.
 concept RdNmState
   @intention: "An Ast node + source + a resource name query span, for counting read sites naming that resource"
@@ -12977,6 +13288,34 @@ concept SvcBodyState
     pname_len : number [0, 4000000]
 
 
+-- svc_field_ok (self-hosting-service-slice-3): 1 iff `body` is AstField(AstVar(P),
+-- method|path) where P byte-matches the handler input param name. The FIELD-ONLY
+-- predicate factored out of svc_body_ok (which additionally accepts an AstStr via an
+-- is_str escape). S3 uses it for the cond LHS SPECIFICALLY — an AstStr lhs (`"a" ==
+-- "/"`) must be REFUSED (ast_field_base(AstStr) = AstErr -> base_ok 0), else the
+-- field-select would run on an AstStr and emit a spurious compare (axiom violation).
+rule svc_field_ok
+  @intention: "1 if body is AstField(AstVar(input-param), method|path), 0 otherwise"
+  @source: vexprparse.intent:74
+  input:
+    sb : SvcBodyState
+  output:
+    out : number
+  logic:
+    let fb = ast_field_base(sb.body)
+    let fstart = ast_field_fstart(sb.body)
+    let flen = ast_field_flen(sb.body)
+    let fname_ok = if span_is_method(SpanCheck { src: sb.src, start: fstart, len: flen }) == 1 then 1 else span_is_path(SpanCheck { src: sb.src, start: fstart, len: flen })
+    let base_ok = if ast_var_len(fb) == sb.pname_len and (sb.pname_len > 0 and name_eq(NameEqState { src: sb.src, a_start: ast_var_start(fb), b_start: sb.pname_start, len: sb.pname_len, off: 0 }) == 1) then 1 else 0
+    out = if fname_ok == 1 and base_ok == 1 then 1 else 0
+  proofs:
+    purity:
+      reads : [sb.body, sb.src, sb.pname_start, sb.pname_len]
+      calls : [ast_field_base, ast_field_fstart, ast_field_flen, span_is_method, span_is_path, ast_var_len, ast_var_start, name_eq]
+    termination:
+      bound : 64
+
+
 -- svc_body_ok (self-hosting-service-slice-2): 1 iff the handler response body is a
 -- valid S2 body. Two accepted shapes:
 --   (a) AstStr — the constant-response S1 body (unchanged).
@@ -12997,16 +13336,66 @@ rule svc_body_ok
     out : number
   logic:
     let is_str = ast_is_str(sb.body)
-    let fb = ast_field_base(sb.body)
-    let fstart = ast_field_fstart(sb.body)
-    let flen = ast_field_flen(sb.body)
-    let fname_ok = if span_is_method(SpanCheck { src: sb.src, start: fstart, len: flen }) == 1 then 1 else span_is_path(SpanCheck { src: sb.src, start: fstart, len: flen })
-    let base_ok = if ast_var_len(fb) == sb.pname_len and (sb.pname_len > 0 and name_eq(NameEqState { src: sb.src, a_start: ast_var_start(fb), b_start: sb.pname_start, len: sb.pname_len, off: 0 }) == 1) then 1 else 0
-    out = if is_str == 1 then 1 else (if fname_ok == 1 and base_ok == 1 then 1 else 0)
+    out = if is_str == 1 then 1 else svc_field_ok(sb)
+  proofs:
+    purity:
+      reads : [sb.body, sb]
+      calls : [ast_is_str, svc_field_ok]
+    termination:
+      bound : 64
+
+
+-- svc_arm_ok (self-hosting-service-slice-3): 1 iff an S3 router arm is a LITERAL
+-- HttpResponse — AstVariant with exactly 2 fields, an AstNum status and an AstStr
+-- body. The body check is ast_is_str ONLY (NOT svc_body_ok): an AstField echo arm
+-- (`then HttpResponse { 200, req.path }`) has no compile-time body length, so
+-- service_response_blob would emit Content-Length: 0 — REFUSE it, deferred to S4.
+rule svc_arm_ok
+  @intention: "1 if an if-arm is a literal HttpResponse (AstVariant, 2 fields, AstNum status + AstStr body), 0 otherwise"
+  @source: vexprparse.intent:74
+  input:
+    n : Ast
+  output:
+    out : number
+  logic:
+    let fields = ast_variant_fields(n)
+    out = if ast_is_variant(n) == 1 then (if vfield_len(fields) == 2 then (if ast_is_num(vf_head_val(fields)) == 1 then ast_is_str(vf_head_val(vf_tail(fields))) else 0) else 0) else 0
+  proofs:
+    purity:
+      reads : [n]
+      calls : [ast_variant_fields, ast_is_variant, vfield_len, ast_is_num, vf_head_val, vf_tail, ast_is_str]
+    termination:
+      bound : 16
+
+
+-- svc_if_shape_ok (self-hosting-service-slice-3): 1 iff the handler result is the S3
+-- router shape `if <field> == "<lit>" then RecA else RecB`. cond must be AstBin with
+-- op 1 (Eq), LHS a req field (svc_field_ok — AstField SPECIFICALLY, so an AstStr LHS
+-- is refused), RHS an AstStr literal; BOTH arms literal HttpResponses (svc_arm_ok).
+-- Refuses: non-if body (is_if 0), and/or cond (op != 1), non-== op, req.body cond,
+-- AstField echo arm, concat arm, computed status — each fails one clause -> 0.
+rule svc_if_shape_ok
+  @intention: "1 if the handler is `if req.<f> == \"lit\" then RecA else RecB` with literal arms, 0 otherwise"
+  @source: vexprparse.intent:74
+  input:
+    sb : SvcBodyState
+  output:
+    out : number
+  logic:
+    let is_if = ast_is_if(sb.body)
+    let cond = ast_if_cond(sb.body)
+    let cond_op = ast_bin_op(cond)
+    let cond_lhs = ast_bin_lhs(cond)
+    let cond_rhs = ast_bin_rhs(cond)
+    let field_ok = svc_field_ok(SvcBodyState { body: cond_lhs, src: sb.src, pname_start: sb.pname_start, pname_len: sb.pname_len })
+    let cond_ok = if cond_op == 1 and (field_ok == 1 and ast_is_str(cond_rhs) == 1) then 1 else 0
+    let then_ok = svc_arm_ok(ast_if_then(sb.body))
+    let else_ok = svc_arm_ok(ast_if_else(sb.body))
+    out = if is_if == 1 and (cond_ok == 1 and (then_ok == 1 and else_ok == 1)) then 1 else 0
   proofs:
     purity:
       reads : [sb.body, sb.src, sb.pname_start, sb.pname_len]
-      calls : [ast_is_str, ast_field_base, ast_field_fstart, ast_field_flen, span_is_method, span_is_path, ast_var_len, ast_var_start, name_eq]
+      calls : [ast_is_if, ast_if_cond, ast_bin_op, ast_bin_lhs, ast_bin_rhs, svc_field_ok, ast_is_str, svc_arm_ok, ast_if_then, ast_if_else]
     termination:
       bound : 64
 
@@ -13060,7 +13449,9 @@ rule service_errors
     let hlets = count_binds(block_binds(hblock))
     let hresult = block_result(hblock)
     let hfields = ast_variant_fields(hresult)
-    let shape_ok = if hlets == 0 then (if ast_is_variant(hresult) == 1 then (if vfield_len(hfields) == 2 then (if ast_is_num(vf_head_val(hfields)) == 1 then svc_body_ok(SvcBodyState { body: vf_head_val(vf_tail(hfields)), src: se.src, pname_start: fl_head_start(rd_input(handler)), pname_len: fl_head_len(rd_input(handler)) }) else 0) else 0) else 0) else 0
+    let variant_ok = if ast_is_variant(hresult) == 1 then (if vfield_len(hfields) == 2 then (if ast_is_num(vf_head_val(hfields)) == 1 then svc_body_ok(SvcBodyState { body: vf_head_val(vf_tail(hfields)), src: se.src, pname_start: fl_head_start(rd_input(handler)), pname_len: fl_head_len(rd_input(handler)) }) else 0) else 0) else 0
+    let if_ok = svc_if_shape_ok(SvcBodyState { body: hresult, src: se.src, pname_start: fl_head_start(rd_input(handler)), pname_len: fl_head_len(rd_input(handler)) })
+    let shape_ok = if hlets == 0 then (if variant_ok == 1 then 1 else if_ok) else 0
     let req_decl = find_concept_index(FindConceptIdxState { concepts: se.concepts, src: se.src, q_start: fl_head_ty_start(rd_input(handler)), q_len: fl_head_ty_len(rd_input(handler)), idx: 0 })
     let resp_decl = find_concept_index(FindConceptIdxState { concepts: se.concepts, src: se.src, q_start: rd_out_ty_start(handler), q_len: rd_out_ty_len(handler), idx: 0 })
     let reserved = (if req_decl == 999999 then 0 else 1) + (if resp_decl == 999999 then 0 else 1)
@@ -13069,7 +13460,7 @@ rule service_errors
   proofs:
     purity:
       reads : [se.prog, se.svcs, se.concepts, se.ress, se.conns, se.rxs, se.src]
-      calls : [service_list_len, svc_head, svc_handler_len, svc_protocol, svc_port, svc_max_request, svc_handler_start, rule_named, find_rule, rd_body, count_binds, block_binds, block_result, ast_variant_fields, ast_is_variant, vfield_len, ast_is_num, vf_head_val, vf_tail, svc_body_ok, fl_head_start, fl_head_len, find_concept_index, fl_head_ty_start, fl_head_ty_len, rd_input, rd_out_ty_start, rd_out_ty_len, reaction_list_len, connection_list_len, resource_list_len]
+      calls : [service_list_len, svc_head, svc_handler_len, svc_protocol, svc_port, svc_max_request, svc_handler_start, rule_named, find_rule, rd_body, count_binds, block_binds, block_result, ast_variant_fields, ast_is_variant, vfield_len, ast_is_num, vf_head_val, vf_tail, svc_body_ok, svc_if_shape_ok, fl_head_start, fl_head_len, find_concept_index, fl_head_ty_start, fl_head_ty_len, rd_input, rd_out_ty_start, rd_out_ty_len, reaction_list_len, connection_list_len, resource_list_len]
     termination:
       bound : 64
 
@@ -15705,9 +16096,13 @@ concept IfTypeState
 -- ops require both operands number and yield number; ORDERING comparisons
 -- (<, >, <=, >=) require both number and yield bool (ordering booleans is not
 -- meaningful); EQUALITY (==, !=) accepts two operands of the SAME comparable type
--- — number==number OR bool==bool — and yields bool (brick 29; text==text is still
--- ERROR — a string literal is typed text since brick 30, but text supports no
--- operations); logic ops require both bool and yield bool. Any
+-- — number==number, bool==bool, OR text==text — and yields bool (brick 29; text==text
+-- lifted for self-hosting-service-slice-3: an S3 router handler is fundamentally a
+-- `req.path == "\"lit\""` text comparison, which the native/WASM/interpreter backends
+-- all support via a byte-compare — so the checker must accept it, not stub it ERROR.
+-- The self-source itself never does text==text — it byte-compares via name_eq /
+-- span_is_* — so this is additive and leaves gen1==gen2 untouched); logic ops require
+-- both bool and yield bool. Any
 -- mismatch => ERROR (3), and an unknown op also => ERROR. NON-recursive: a flat
 -- nested-if classifier, bounded by 8 (it never recurses; the bound is the trivial
 -- leaf budget).
@@ -15719,7 +16114,7 @@ rule bin_type
   output:
     out : number
   logic:
-    out = if b.op == 13 then (if b.lt == 0 and b.rt == 0 then 0 else 3) else if b.op == 14 then (if b.lt == 0 and b.rt == 0 then 0 else 3) else if b.op == 15 then (if b.lt == 0 and b.rt == 0 then 0 else 3) else if b.op == 16 then (if b.lt == 0 and b.rt == 0 then 0 else 3) else if b.op == 17 then (if b.lt == 0 and b.rt == 0 then 0 else 3) else if b.op == 1 then (if b.lt == b.rt and (b.lt == 0 or b.lt == 1) then 1 else 3) else if b.op == 6 then (if b.lt == b.rt and (b.lt == 0 or b.lt == 1) then 1 else 3) else if b.op == 19 then (if b.lt == 0 and b.rt == 0 then 1 else 3) else if b.op == 20 then (if b.lt == 0 and b.rt == 0 then 1 else 3) else if b.op == 5 then (if b.lt == 0 and b.rt == 0 then 1 else 3) else if b.op == 4 then (if b.lt == 0 and b.rt == 0 then 1 else 3) else if b.op == 30 then (if b.lt == 1 and b.rt == 1 then 1 else 3) else if b.op == 31 then (if b.lt == 1 and b.rt == 1 then 1 else 3) else 3
+    out = if b.op == 13 then (if b.lt == 0 and b.rt == 0 then 0 else 3) else if b.op == 14 then (if b.lt == 0 and b.rt == 0 then 0 else 3) else if b.op == 15 then (if b.lt == 0 and b.rt == 0 then 0 else 3) else if b.op == 16 then (if b.lt == 0 and b.rt == 0 then 0 else 3) else if b.op == 17 then (if b.lt == 0 and b.rt == 0 then 0 else 3) else if b.op == 1 then (if b.lt == b.rt and (b.lt == 0 or (b.lt == 1 or b.lt == 2)) then 1 else 3) else if b.op == 6 then (if b.lt == b.rt and (b.lt == 0 or (b.lt == 1 or b.lt == 2)) then 1 else 3) else if b.op == 19 then (if b.lt == 0 and b.rt == 0 then 1 else 3) else if b.op == 20 then (if b.lt == 0 and b.rt == 0 then 1 else 3) else if b.op == 5 then (if b.lt == 0 and b.rt == 0 then 1 else 3) else if b.op == 4 then (if b.lt == 0 and b.rt == 0 then 1 else 3) else if b.op == 30 then (if b.lt == 1 and b.rt == 1 then 1 else 3) else if b.op == 31 then (if b.lt == 1 and b.rt == 1 then 1 else 3) else 3
   proofs:
     purity:
       reads : [b.op, b.lt, b.rt]
@@ -16420,8 +16815,17 @@ concept FieldTyOfState
 -- if no field of that name exists. The name-matching walk mirrors field_index_of;
 -- on a match the field's ty SPAN goes through resolve_type (the ty CODE stored in
 -- the FCons is lossy — a concept name collapses to 0 there, same reason resolve_type
--- exists). Bound-only termination + the native recursion breadcrumb (the shrinking
--- list tail is a field of the packed input).
+-- exists). SYNTHETIC-FIELD WILDCARD (self-hosting-service-slice-3): a field with
+-- name_len == 0 is a SYNTHETIC built-in field (HttpRequest/HttpResponse have bogus
+-- field name+ty spans — only the concept NAME resolves). A real parsed field always
+-- has name_len > 0, so name_len == 0 uniquely marks a built-in; it wildcard-matches
+-- any query and yields its stored ty CODE directly (bypassing the bogus ty span).
+-- This lets `req.path` type as text (2) so an S3 router cond `req.path == "lit"`
+-- type-checks; without it the read stubs ERROR and tcheck_rule falsely refuses the
+-- handler. Only fires on concepts a value can type to (HttpRequest/HttpResponse have
+-- real name spans); the synthetic Result concept's NAME span is bogus, so nothing
+-- types to it and the wildcard never fires there. Bound-only termination + the native
+-- recursion breadcrumb (the shrinking list tail is a field of the packed input).
 rule field_ty_of
   @intention: "The resolved declared type code of the field whose name matches the query span (ERROR 3 if absent)"
   @source: vexprparse.intent:62
@@ -16431,7 +16835,7 @@ rule field_ty_of
     out : number
   logic:
     out = match ft.fields:
-      FCons(name_start, name_len, ty, ty_start, ty_len, rest) => if name_len == ft.q_len and name_eq(NameEqState { src: ft.src, a_start: name_start, b_start: ft.q_start, len: ft.q_len, off: 0 }) == 1 then resolve_type(ResolveTypeState { concepts: ft.concepts, src: ft.src, ty_start: ty_start, ty_len: ty_len }) else field_ty_of(FieldTyOfState { fields: rest, src: ft.src, q_start: ft.q_start, q_len: ft.q_len, concepts: ft.concepts })
+      FCons(name_start, name_len, ty, ty_start, ty_len, rest) => if name_len == 0 then ty else if name_len == ft.q_len and name_eq(NameEqState { src: ft.src, a_start: name_start, b_start: ft.q_start, len: ft.q_len, off: 0 }) == 1 then resolve_type(ResolveTypeState { concepts: ft.concepts, src: ft.src, ty_start: ty_start, ty_len: ty_len }) else field_ty_of(FieldTyOfState { fields: rest, src: ft.src, q_start: ft.q_start, q_len: ft.q_len, concepts: ft.concepts })
       FNil => 3
   proofs:
     purity:
@@ -27152,24 +27556,48 @@ rule service_tramp_size
   logic:
     let h = svc_head(ss.svcs)
     let handler = find_rule(FindRuleState { rules: ss.prog, src: ss.src, q_start: svc_handler_start(h), q_len: svc_handler_len(h) })
-    let fields = ast_variant_fields(block_result(rd_body(handler)))
+    let hresult = block_result(rd_body(handler))
+    let fields = ast_variant_fields(hresult)
     let status = ast_num_value(vf_head_val(fields))
     let body_ast = vf_head_val(vf_tail(fields))
     let body_start = ast_str_start(body_ast) + 1
     let body_len = if ast_str_len(body_ast) >= 2 then ast_str_len(body_ast) - 2 else 0
     let rlen = response_len(ServiceRespState { status: status, body_start: body_start, body_len: body_len, src: ss.src })
-    -- Slice 2: fork on the body shape (BEFORE any use of ast_str_start's result).
-    -- AstStr -> the S1 constant-response block (224 fixed + 4-padded response).
-    -- AstField(req, method|path) -> the S2 parse + runtime-itoa serializer, a
-    -- FIXED-SIZE 607-byte accept loop (startup 137 + accept 21 + read 18 + parse 91
-    -- + serializer 323 + close 12 + loop-jmp 5) — every term a compile-time constant
-    -- (itoa'd status makes it status-magnitude independent), so x86_service_tramp's
-    -- AstField branch emits EXACTLY this many bytes. Both copies fork identically.
-    out = if ast_is_str(body_ast) == 1 then (224 + 4 * ((rlen + 3) / 4)) else 607
+    -- Slice 3 sizing (fork on the HANDLER RESULT shape, not body_ast — an AstIf result
+    -- has no variant fields so body_ast is AstErr). The S3 router accept loop = 395
+    -- fixed (PREFIX 176 + parse 91 + compare-glue 44 + then-glue 36 + else-glue 31 +
+    -- close 17) + L4 (the compare literal, 4-padded) + blockA + blockB (each arm's
+    -- 4-padded precomputed response). Every term a compile-time constant. This IS the
+    -- one-truth blob_end_off adds and x86_service_tramp emits — a one-byte drift
+    -- truncates p_filesz -> the server SIGSEGVs on spawn. See
+    -- docs/self-hosting-service-slice3-design.md.
+    let cond3 = ast_if_cond(hresult)
+    let rhs3 = ast_bin_rhs(cond3)
+    let lit_start3 = ast_str_start(rhs3) + 1
+    let lit_len3 = if ast_str_len(rhs3) >= 2 then ast_str_len(rhs3) - 2 else 0
+    let declen3 = bytelit_decoded_len(DecodeState { src: ss.src, start: lit_start3, len: lit_len3, i: 0 })
+    let l4 = 4 * ((declen3 + 3) / 4)
+    let then_rec = ast_if_then(hresult)
+    let else_rec = ast_if_else(hresult)
+    let statusA = ast_num_value(vf_head_val(ast_variant_fields(then_rec)))
+    let bodyA_ast = vf_head_val(vf_tail(ast_variant_fields(then_rec)))
+    let bodyA_start = ast_str_start(bodyA_ast) + 1
+    let bodyA_len = if ast_str_len(bodyA_ast) >= 2 then ast_str_len(bodyA_ast) - 2 else 0
+    let rlenA = response_len(ServiceRespState { status: statusA, body_start: bodyA_start, body_len: bodyA_len, src: ss.src })
+    let blockA = 4 * ((rlenA + 3) / 4)
+    let statusB = ast_num_value(vf_head_val(ast_variant_fields(else_rec)))
+    let bodyB_ast = vf_head_val(vf_tail(ast_variant_fields(else_rec)))
+    let bodyB_start = ast_str_start(bodyB_ast) + 1
+    let bodyB_len = if ast_str_len(bodyB_ast) >= 2 then ast_str_len(bodyB_ast) - 2 else 0
+    let rlenB = response_len(ServiceRespState { status: statusB, body_start: bodyB_start, body_len: bodyB_len, src: ss.src })
+    let blockB = 4 * ((rlenB + 3) / 4)
+    -- AstStr body -> S1 (224 + response). AstIf result -> S3 (395 + L4 + blockA + blockB).
+    -- Otherwise (AstField body) -> S2 (607). Both copies fork identically.
+    out = if ast_is_str(body_ast) == 1 then (224 + 4 * ((rlen + 3) / 4)) else if ast_is_if(hresult) == 1 then (395 + l4 + blockA + blockB) else 607
   proofs:
     purity:
       reads : [ss.svcs, ss.prog, ss.src]
-      calls : [svc_head, find_rule, svc_handler_start, svc_handler_len, ast_variant_fields, block_result, rd_body, ast_num_value, vf_head_val, vf_tail, ast_str_start, ast_str_len, response_len, ast_is_str]
+      calls : [svc_head, find_rule, svc_handler_start, svc_handler_len, ast_variant_fields, block_result, rd_body, ast_num_value, vf_head_val, vf_tail, ast_str_start, ast_str_len, response_len, ast_is_str, ast_is_if, ast_if_cond, ast_bin_rhs, bytelit_decoded_len, ast_if_then, ast_if_else]
     termination:
       bound : 64
 
@@ -27203,7 +27631,8 @@ rule x86_service_tramp
   logic:
     let h = svc_head(st.svcs)
     let handler = find_rule(FindRuleState { rules: st.prog, src: st.src, q_start: svc_handler_start(h), q_len: svc_handler_len(h) })
-    let fields = ast_variant_fields(block_result(rd_body(handler)))
+    let hresult = block_result(rd_body(handler))
+    let fields = ast_variant_fields(hresult)
     let status = ast_num_value(vf_head_val(fields))
     let body_ast = vf_head_val(vf_tail(fields))
     let body_start = ast_str_start(body_ast) + 1
@@ -27215,20 +27644,56 @@ rule x86_service_tramp
     let block = 4 * ((rlen + 3) / 4)
     -- Slice 2: which req field the handler echoes (method vs path), resolved by
     -- byte-match against the AstField field-name span. Only meaningful on the
-    -- AstField (S2) branch; harmless 0 on the AstStr (S1) branch.
+    -- AstField (S2) branch; harmless 0 on the AstStr (S1) / AstIf (S3) branch.
     let is_method = span_is_method(SpanCheck { src: st.src, start: ast_field_fstart(body_ast), len: ast_field_flen(body_ast) })
+    -- Slice 3 router lets. cond = `req.<f> == "lit"`, both arms literal HttpResponses.
+    -- is_method3 is driven from the COND's LHS (SHOULD 4), NOT body_ast (which is AstErr
+    -- for an AstIf result). declen3 = DECODED length of the RHS literal; L4 the 4-padded
+    -- inline literal block. blockA/blockB the two precomputed arm responses. The six
+    -- jumps are recomputed CLOSED-FORM here (S2's baked 0x18f/0x169 target the S2 close
+    -- tail, which MOVES in S3): jump1/2 = method/path parse-fail -> close; jump3/4 =
+    -- length/cmpsb mismatch -> else; jump5 = then -> close; jump6 = close -> accept_top
+    -- (negative). Every distance sourced from the SAME l4/blockA/blockB the emit uses.
+    let cond3 = ast_if_cond(hresult)
+    let cond_lhs3 = ast_bin_lhs(cond3)
+    let is_method3 = span_is_method(SpanCheck { src: st.src, start: ast_field_fstart(cond_lhs3), len: ast_field_flen(cond_lhs3) })
+    let rhs3 = ast_bin_rhs(cond3)
+    let lit_start3 = ast_str_start(rhs3) + 1
+    let lit_len3 = if ast_str_len(rhs3) >= 2 then ast_str_len(rhs3) - 2 else 0
+    let declen3 = bytelit_decoded_len(DecodeState { src: st.src, start: lit_start3, len: lit_len3, i: 0 })
+    let l4 = 4 * ((declen3 + 3) / 4)
+    let then_rec = ast_if_then(hresult)
+    let else_rec = ast_if_else(hresult)
+    let statusA = ast_num_value(vf_head_val(ast_variant_fields(then_rec)))
+    let bodyA_ast = vf_head_val(vf_tail(ast_variant_fields(then_rec)))
+    let bodyA_start = ast_str_start(bodyA_ast) + 1
+    let bodyA_len = if ast_str_len(bodyA_ast) >= 2 then ast_str_len(bodyA_ast) - 2 else 0
+    let rlenA = response_len(ServiceRespState { status: statusA, body_start: bodyA_start, body_len: bodyA_len, src: st.src })
+    let blockA = 4 * ((rlenA + 3) / 4)
+    let statusB = ast_num_value(vf_head_val(ast_variant_fields(else_rec)))
+    let bodyB_ast = vf_head_val(vf_tail(ast_variant_fields(else_rec)))
+    let bodyB_start = ast_str_start(bodyB_ast) + 1
+    let bodyB_len = if ast_str_len(bodyB_ast) >= 2 then ast_str_len(bodyB_ast) - 2 else 0
+    let rlenB = response_len(ServiceRespState { status: statusB, body_start: bodyB_start, body_len: bodyB_len, src: st.src })
+    let blockB = 4 * ((rlenB + 3) / 4)
+    let jump1 = 187 + l4 + blockA + blockB
+    let jump2 = 149 + l4 + blockA + blockB
+    let jump3 = 67 + l4 + blockA
+    let jump4 = 36 + blockA
+    let jump5 = 31 + blockB
+    let jump6 = 0 - (258 + l4 + blockA + blockB)
     -- The startup (socket/setsockopt/bind/listen/sub-rsp) + accept + read bytes are
     -- IDENTICAL in both branches; they are inlined verbatim in each `concat` (no
     -- shared bytes-let — a concat-valued let is refused inside this recursive SCC).
     -- r12 = listen fd, r13 = client fd (both callee-saved). Only the iteration tail
     -- forks: AstStr -> S1 precomputed blob; AstField -> S2 parse + itoa serializer.
-    out = if ast_is_str(body_ast) == 1 then concat(b"\xbf\x02\x00\x00\x00\xbe\x01\x00\x00\x00\x31\xd2\xb8\x29\x00\x00\x00\x0f\x05\x49\x89\xc4", b"\x6a\x01\x48\xc7\xc0\x36\x00\x00\x00\x4c\x89\xe7\x48\xc7\xc6\x01\x00\x00\x00\x48\xc7\xc2\x02\x00\x00\x00\x49\x89\xe2\x49\xc7\xc0\x04\x00\x00\x00\x0f\x05\x48\x83\xc4\x08", b"\xe9", le32(16), le32(2 + hv * 65536), le32(0), le64(0), b"\x48\x8d\x35", le32(0 - (16 + 7)), b"\x4c\x89\xe7\x48\xc7\xc2\x10\x00\x00\x00\x48\xc7\xc0\x31\x00\x00\x00\x0f\x05", b"\x4c\x89\xe7\x48\xc7\xc6\x80\x00\x00\x00\x48\xc7\xc0\x32\x00\x00\x00\x0f\x05", b"\x48\x81\xec", le32(max_req), b"\x48\xc7\xc0\x2b\x00\x00\x00\x4c\x89\xe7\x48\x31\xf6\x48\x31\xd2\x0f\x05\x49\x89\xc5", b"\x48\x31\xc0\x4c\x89\xef\x48\x89\xe6\x48\xc7\xc2", le32(max_req), b"\x0f\x05", b"\xe9", le32(block), service_response_blob(ServiceRespBlobState { status: status, body_start: body_start, body_len: body_len, src: st.src, pos: 0 }), b"\x48\xc7\xc0\x01\x00\x00\x00\x4c\x89\xef\x48\x8d\x35", le32(0 - (block + 17)), b"\x48\xc7\xc2", le32(rlen), b"\x0f\x05", b"\x48\xc7\xc0\x03\x00\x00\x00\x4c\x89\xef\x0f\x05", b"\xe9", le32(0 - (87 + block))) else concat(b"\xbf\x02\x00\x00\x00\xbe\x01\x00\x00\x00\x31\xd2\xb8\x29\x00\x00\x00\x0f\x05\x49\x89\xc4", b"\x6a\x01\x48\xc7\xc0\x36\x00\x00\x00\x4c\x89\xe7\x48\xc7\xc6\x01\x00\x00\x00\x48\xc7\xc2\x02\x00\x00\x00\x49\x89\xe2\x49\xc7\xc0\x04\x00\x00\x00\x0f\x05\x48\x83\xc4\x08", b"\xe9", le32(16), le32(2 + hv * 65536), le32(0), le64(0), b"\x48\x8d\x35", le32(0 - (16 + 7)), b"\x4c\x89\xe7\x48\xc7\xc2\x10\x00\x00\x00\x48\xc7\xc0\x31\x00\x00\x00\x0f\x05", b"\x4c\x89\xe7\x48\xc7\xc6\x80\x00\x00\x00\x48\xc7\xc0\x32\x00\x00\x00\x0f\x05", b"\x48\x81\xec", le32(max_req), b"\x48\xc7\xc0\x2b\x00\x00\x00\x4c\x89\xe7\x48\x31\xf6\x48\x31\xd2\x0f\x05\x49\x89\xc5", b"\x48\x31\xc0\x4c\x89\xef\x48\x89\xe6\x48\xc7\xc2", le32(max_req), b"\x0f\x05", b"\x48\x89\xe3\x48\x89\xe6\x48\x85\xc0\x0f\x84\x8f\x01\x00\x00\x44\x8a\x03\x41\x80\xf8\x20\x74\x08\x48\xff\xc3\x48\xff\xc8\xeb\xe6\x48\x89\xda\x48\xff\xc3\x48\xff\xc8\x48\x89\xdf\x48\x85\xc0\x0f\x84\x69\x01\x00\x00\x44\x8a\x03\x41\x80\xf8\x20\x74\x14\x41\x80\xf8\x0d\x74\x0e\x41\x80\xf8\x0a\x74\x08\x48\xff\xc3\x48\xff\xc8\xeb\xda", (if is_method == 1 then b"\x49\x89\xd6\x49\x29\xf6\x48\x89\xf3" else b"\x49\x89\xde\x49\x29\xfe\x48\x89\xfb"), b"\xe9\x0c\x00\x00\x00\x48\x54\x54\x50\x2f\x31\x2e\x30\x20\x00\x00\x00\x48\xc7\xc0\x01\x00\x00\x00\x4c\x89\xef\x48\x8d\x35\xe3\xff\xff\xff\x48\xc7\xc2\x09\x00\x00\x00\x0f\x05", b"\x48\xc7\xc0", le32(status), b"\x48\x83\xec\x20\x49\x89\xc1\x48\x8d\x74\x24\x20\x48\x85\xc0\x79\x03\x48\xf7\xd8\x48\xc7\xc1\x0a\x00\x00\x00\x48\x31\xd2\x48\xf7\xf1\x80\xc2\x30\x48\xff\xce\x88\x16\x48\x85\xc0\x75\xed\x4d\x85\xc9\x79\x06\x48\xff\xce\xc6\x06\x2d\x48\x8d\x54\x24\x20\x48\x29\xf2\x48\xc7\xc0\x01\x00\x00\x00\x4c\x89\xef\x0f\x05\x48\x83\xc4\x20", b"\xe9\x18\x00\x00\x00\x20\x4f\x4b\x0d\x0a\x43\x6f\x6e\x74\x65\x6e\x74\x2d\x4c\x65\x6e\x67\x74\x68\x3a\x20\x00\x00\x00\x48\xc7\xc0\x01\x00\x00\x00\x4c\x89\xef\x48\x8d\x35\xd7\xff\xff\xff\x48\xc7\xc2\x15\x00\x00\x00\x0f\x05", b"\x4c\x89\xf0", b"\x48\x83\xec\x20\x49\x89\xc1\x48\x8d\x74\x24\x20\x48\x85\xc0\x79\x03\x48\xf7\xd8\x48\xc7\xc1\x0a\x00\x00\x00\x48\x31\xd2\x48\xf7\xf1\x80\xc2\x30\x48\xff\xce\x88\x16\x48\x85\xc0\x75\xed\x4d\x85\xc9\x79\x06\x48\xff\xce\xc6\x06\x2d\x48\x8d\x54\x24\x20\x48\x29\xf2\x48\xc7\xc0\x01\x00\x00\x00\x4c\x89\xef\x0f\x05\x48\x83\xc4\x20", b"\xe9\x04\x00\x00\x00\x0d\x0a\x0d\x0a\x48\xc7\xc0\x01\x00\x00\x00\x4c\x89\xef\x48\x8d\x35\xeb\xff\xff\xff\x48\xc7\xc2\x04\x00\x00\x00\x0f\x05", b"\x48\xc7\xc0\x01\x00\x00\x00\x4c\x89\xef\x48\x89\xde\x4c\x89\xf2\x0f\x05", b"\x48\xc7\xc0\x03\x00\x00\x00\x4c\x89\xef\x0f\x05", b"\xe9", le32(0 - 470))
+    out = if ast_is_str(body_ast) == 1 then concat(b"\xbf\x02\x00\x00\x00\xbe\x01\x00\x00\x00\x31\xd2\xb8\x29\x00\x00\x00\x0f\x05\x49\x89\xc4", b"\x6a\x01\x48\xc7\xc0\x36\x00\x00\x00\x4c\x89\xe7\x48\xc7\xc6\x01\x00\x00\x00\x48\xc7\xc2\x02\x00\x00\x00\x49\x89\xe2\x49\xc7\xc0\x04\x00\x00\x00\x0f\x05\x48\x83\xc4\x08", b"\xe9", le32(16), le32(2 + hv * 65536), le32(0), le64(0), b"\x48\x8d\x35", le32(0 - (16 + 7)), b"\x4c\x89\xe7\x48\xc7\xc2\x10\x00\x00\x00\x48\xc7\xc0\x31\x00\x00\x00\x0f\x05", b"\x4c\x89\xe7\x48\xc7\xc6\x80\x00\x00\x00\x48\xc7\xc0\x32\x00\x00\x00\x0f\x05", b"\x48\x81\xec", le32(max_req), b"\x48\xc7\xc0\x2b\x00\x00\x00\x4c\x89\xe7\x48\x31\xf6\x48\x31\xd2\x0f\x05\x49\x89\xc5", b"\x48\x31\xc0\x4c\x89\xef\x48\x89\xe6\x48\xc7\xc2", le32(max_req), b"\x0f\x05", b"\xe9", le32(block), service_response_blob(ServiceRespBlobState { status: status, body_start: body_start, body_len: body_len, src: st.src, pos: 0 }), b"\x48\xc7\xc0\x01\x00\x00\x00\x4c\x89\xef\x48\x8d\x35", le32(0 - (block + 17)), b"\x48\xc7\xc2", le32(rlen), b"\x0f\x05", b"\x48\xc7\xc0\x03\x00\x00\x00\x4c\x89\xef\x0f\x05", b"\xe9", le32(0 - (87 + block))) else if ast_is_if(hresult) == 1 then concat(b"\xbf\x02\x00\x00\x00\xbe\x01\x00\x00\x00\x31\xd2\xb8\x29\x00\x00\x00\x0f\x05\x49\x89\xc4", b"\x6a\x01\x48\xc7\xc0\x36\x00\x00\x00\x4c\x89\xe7\x48\xc7\xc6\x01\x00\x00\x00\x48\xc7\xc2\x02\x00\x00\x00\x49\x89\xe2\x49\xc7\xc0\x04\x00\x00\x00\x0f\x05\x48\x83\xc4\x08", b"\xe9", le32(16), le32(2 + hv * 65536), le32(0), le64(0), b"\x48\x8d\x35", le32(0 - (16 + 7)), b"\x4c\x89\xe7\x48\xc7\xc2\x10\x00\x00\x00\x48\xc7\xc0\x31\x00\x00\x00\x0f\x05", b"\x4c\x89\xe7\x48\xc7\xc6\x80\x00\x00\x00\x48\xc7\xc0\x32\x00\x00\x00\x0f\x05", b"\x48\x81\xec", le32(max_req), b"\x48\xc7\xc0\x2b\x00\x00\x00\x4c\x89\xe7\x48\x31\xf6\x48\x31\xd2\x0f\x05\x49\x89\xc5", b"\x48\x31\xc0\x4c\x89\xef\x48\x89\xe6\x48\xc7\xc2", le32(max_req), b"\x0f\x05", b"\x48\x89\xe3\x48\x89\xe6\x48\x85\xc0\x0f\x84", le32(jump1), b"\x44\x8a\x03\x41\x80\xf8\x20\x74\x08\x48\xff\xc3\x48\xff\xc8\xeb\xe6\x48\x89\xda\x48\xff\xc3\x48\xff\xc8\x48\x89\xdf\x48\x85\xc0\x0f\x84", le32(jump2), b"\x44\x8a\x03\x41\x80\xf8\x20\x74\x14\x41\x80\xf8\x0d\x74\x0e\x41\x80\xf8\x0a\x74\x08\x48\xff\xc3\x48\xff\xc8\xeb\xda", (if is_method3 == 1 then b"\x49\x89\xd6\x49\x29\xf6\x48\x89\xf3" else b"\x49\x89\xde\x49\x29\xfe\x48\x89\xfb"), b"\x49\x81\xfe", le32(declen3), b"\x0f\x85", le32(jump3), b"\xfc\x48\x89\xde\xe9", le32(l4), emit_bytes_data(BytesEmitState { src: st.src, start: lit_start3, len: lit_len3, i: 0, dlen: declen3 }), b"\x48\x8d\x3d", le32(0 - (l4 + 7)), b"\x48\xc7\xc1", le32(declen3), b"\xf3\xa6\x0f\x85", le32(jump4), b"\xe9", le32(blockA), service_response_blob(ServiceRespBlobState { status: statusA, body_start: bodyA_start, body_len: bodyA_len, src: st.src, pos: 0 }), b"\x48\xc7\xc0\x01\x00\x00\x00\x4c\x89\xef\x48\x8d\x35", le32(0 - (blockA + 17)), b"\x48\xc7\xc2", le32(rlenA), b"\x0f\x05", b"\xe9", le32(jump5), b"\xe9", le32(blockB), service_response_blob(ServiceRespBlobState { status: statusB, body_start: bodyB_start, body_len: bodyB_len, src: st.src, pos: 0 }), b"\x48\xc7\xc0\x01\x00\x00\x00\x4c\x89\xef\x48\x8d\x35", le32(0 - (blockB + 17)), b"\x48\xc7\xc2", le32(rlenB), b"\x0f\x05", b"\x48\xc7\xc0\x03\x00\x00\x00\x4c\x89\xef\x0f\x05", b"\xe9", le32(jump6)) else concat(b"\xbf\x02\x00\x00\x00\xbe\x01\x00\x00\x00\x31\xd2\xb8\x29\x00\x00\x00\x0f\x05\x49\x89\xc4", b"\x6a\x01\x48\xc7\xc0\x36\x00\x00\x00\x4c\x89\xe7\x48\xc7\xc6\x01\x00\x00\x00\x48\xc7\xc2\x02\x00\x00\x00\x49\x89\xe2\x49\xc7\xc0\x04\x00\x00\x00\x0f\x05\x48\x83\xc4\x08", b"\xe9", le32(16), le32(2 + hv * 65536), le32(0), le64(0), b"\x48\x8d\x35", le32(0 - (16 + 7)), b"\x4c\x89\xe7\x48\xc7\xc2\x10\x00\x00\x00\x48\xc7\xc0\x31\x00\x00\x00\x0f\x05", b"\x4c\x89\xe7\x48\xc7\xc6\x80\x00\x00\x00\x48\xc7\xc0\x32\x00\x00\x00\x0f\x05", b"\x48\x81\xec", le32(max_req), b"\x48\xc7\xc0\x2b\x00\x00\x00\x4c\x89\xe7\x48\x31\xf6\x48\x31\xd2\x0f\x05\x49\x89\xc5", b"\x48\x31\xc0\x4c\x89\xef\x48\x89\xe6\x48\xc7\xc2", le32(max_req), b"\x0f\x05", b"\x48\x89\xe3\x48\x89\xe6\x48\x85\xc0\x0f\x84\x8f\x01\x00\x00\x44\x8a\x03\x41\x80\xf8\x20\x74\x08\x48\xff\xc3\x48\xff\xc8\xeb\xe6\x48\x89\xda\x48\xff\xc3\x48\xff\xc8\x48\x89\xdf\x48\x85\xc0\x0f\x84\x69\x01\x00\x00\x44\x8a\x03\x41\x80\xf8\x20\x74\x14\x41\x80\xf8\x0d\x74\x0e\x41\x80\xf8\x0a\x74\x08\x48\xff\xc3\x48\xff\xc8\xeb\xda", (if is_method == 1 then b"\x49\x89\xd6\x49\x29\xf6\x48\x89\xf3" else b"\x49\x89\xde\x49\x29\xfe\x48\x89\xfb"), b"\xe9\x0c\x00\x00\x00\x48\x54\x54\x50\x2f\x31\x2e\x30\x20\x00\x00\x00\x48\xc7\xc0\x01\x00\x00\x00\x4c\x89\xef\x48\x8d\x35\xe3\xff\xff\xff\x48\xc7\xc2\x09\x00\x00\x00\x0f\x05", b"\x48\xc7\xc0", le32(status), b"\x48\x83\xec\x20\x49\x89\xc1\x48\x8d\x74\x24\x20\x48\x85\xc0\x79\x03\x48\xf7\xd8\x48\xc7\xc1\x0a\x00\x00\x00\x48\x31\xd2\x48\xf7\xf1\x80\xc2\x30\x48\xff\xce\x88\x16\x48\x85\xc0\x75\xed\x4d\x85\xc9\x79\x06\x48\xff\xce\xc6\x06\x2d\x48\x8d\x54\x24\x20\x48\x29\xf2\x48\xc7\xc0\x01\x00\x00\x00\x4c\x89\xef\x0f\x05\x48\x83\xc4\x20", b"\xe9\x18\x00\x00\x00\x20\x4f\x4b\x0d\x0a\x43\x6f\x6e\x74\x65\x6e\x74\x2d\x4c\x65\x6e\x67\x74\x68\x3a\x20\x00\x00\x00\x48\xc7\xc0\x01\x00\x00\x00\x4c\x89\xef\x48\x8d\x35\xd7\xff\xff\xff\x48\xc7\xc2\x15\x00\x00\x00\x0f\x05", b"\x4c\x89\xf0", b"\x48\x83\xec\x20\x49\x89\xc1\x48\x8d\x74\x24\x20\x48\x85\xc0\x79\x03\x48\xf7\xd8\x48\xc7\xc1\x0a\x00\x00\x00\x48\x31\xd2\x48\xf7\xf1\x80\xc2\x30\x48\xff\xce\x88\x16\x48\x85\xc0\x75\xed\x4d\x85\xc9\x79\x06\x48\xff\xce\xc6\x06\x2d\x48\x8d\x54\x24\x20\x48\x29\xf2\x48\xc7\xc0\x01\x00\x00\x00\x4c\x89\xef\x0f\x05\x48\x83\xc4\x20", b"\xe9\x04\x00\x00\x00\x0d\x0a\x0d\x0a\x48\xc7\xc0\x01\x00\x00\x00\x4c\x89\xef\x48\x8d\x35\xeb\xff\xff\xff\x48\xc7\xc2\x04\x00\x00\x00\x0f\x05", b"\x48\xc7\xc0\x01\x00\x00\x00\x4c\x89\xef\x48\x89\xde\x4c\x89\xf2\x0f\x05", b"\x48\xc7\xc0\x03\x00\x00\x00\x4c\x89\xef\x0f\x05", b"\xe9", le32(0 - 470))
   proofs:
     purity:
       reads : [st.svcs, st.prog, st.src]
-      calls : [svc_head, find_rule, svc_handler_start, svc_handler_len, ast_variant_fields, block_result, rd_body, ast_num_value, vf_head_val, vf_tail, ast_str_start, ast_str_len, svc_port, svc_max_request, response_len, service_response_blob, ast_is_str, span_is_method, ast_field_fstart, ast_field_flen]
+      calls : [svc_head, find_rule, svc_handler_start, svc_handler_len, ast_variant_fields, block_result, rd_body, ast_num_value, vf_head_val, vf_tail, ast_str_start, ast_str_len, svc_port, svc_max_request, response_len, service_response_blob, ast_is_str, span_is_method, ast_field_fstart, ast_field_flen, ast_is_if, ast_if_cond, ast_bin_lhs, ast_bin_rhs, bytelit_decoded_len, ast_if_then, ast_if_else, emit_bytes_data]
     termination:
-      bound : 64
+      bound : 128
 
 
 -- x86_marshal_fields: emit the per-field argv reads. For field k, argv[k+1] is at
