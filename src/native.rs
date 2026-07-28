@@ -23818,6 +23818,109 @@ rule le64_neg
         let _ = fs::remove_file(&server);
     }
 
+    /// SELF-HOSTING SERVICE slice 2 — MILESTONE. The self-hosted emitter compiles a
+    /// handler that ECHOES a request field (`body: req.path` / `body: req.method`)
+    /// into an ELF that PARSES each request's method/path off the wire and serializes
+    /// a runtime response. Proves per-request re-parse (two paths -> two bodies /
+    /// Content-Lengths on the SAME server) and parse-fail resilience (a delimiter-free
+    /// request is dropped while the server keeps serving). Byte-for-byte wire asserts.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn self_hosted_service_echo_path() {
+        use std::fs;
+        use std::io::{Read, Write};
+        use std::net::{TcpListener, TcpStream};
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+        use std::time::Duration;
+
+        let src = fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        // gen0: the self-hosted emitter (source on argv[1], pos on argv[2]).
+        let elf = std::env::temp_dir().join("verbosec_test_svc_s2_elf_program_src");
+        compile_native(&program, "elf_program_src", elf.to_str().unwrap(), false, false)
+            .expect("elf_program_src must compile natively");
+
+        // Emit a server that echoes `req.<field>`, spawn it, and probe it. Returns
+        // the wire bytes for each request in `reqs`.
+        let run_server = |field: &str, reqs: &[&[u8]]| -> Vec<Vec<u8>> {
+            let port = {
+                let l = TcpListener::bind(("127.0.0.1", 0)).expect("bind ephemeral");
+                l.local_addr().unwrap().port()
+            };
+            let source = format!(
+                "rule echo_handler\n  input:\n    req : HttpRequest\n  output:\n    resp : HttpResponse\n  logic:\n    resp = HttpResponse {{ status: 200, body: req.{f} }}\n  proofs:\n    purity:\n      reads : [req.{f}]\n      calls : []\n    termination:\n      bound : 1\nservice echo_server\n  listen:\n    protocol : http_1_0\n    port : {p}\n    max_request : 4096\n  handler: echo_handler",
+                f = field, p = port
+            );
+            let gen = Command::new(&elf).args([source.as_str(), "0"]).output()
+                .expect("spawn gen0");
+            assert!(gen.status.success() && gen.stdout.len() >= 4 && &gen.stdout[0..4] == b"\x7fELF",
+                "gen0 must emit an S2 service ELF ({field}); got {:?} stderr={:?}",
+                gen.status, String::from_utf8_lossy(&gen.stderr));
+
+            let server = std::env::temp_dir().join(format!("verbosec_test_svc_s2_server_{field}"));
+            fs::write(&server, &gen.stdout).unwrap();
+            let mut p = fs::metadata(&server).unwrap().permissions();
+            p.set_mode(0o755);
+            fs::set_permissions(&server, p).unwrap();
+
+            let mut child = Command::new(&server).spawn().expect("spawn server");
+            let addr: std::net::SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
+            let mut bound = false;
+            for _ in 0..50 {
+                if TcpStream::connect_timeout(&addr, Duration::from_millis(100)).is_ok() {
+                    bound = true;
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            assert!(bound, "S2 service ({field}) never bound on port {}", port);
+
+            let mut out = Vec::new();
+            for req in reqs {
+                let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).expect("connect");
+                s.set_read_timeout(Some(Duration::from_secs(2))).ok();
+                s.write_all(req).expect("write request");
+                let mut buf = Vec::new();
+                s.read_to_end(&mut buf).expect("read response");
+                drop(s);
+                out.push(buf);
+            }
+
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = fs::remove_file(&server);
+            out
+        };
+
+        // (1) req.path echo — per-request re-parse + parse-fail resilience.
+        let r = run_server("path", &[
+            b"GET /foo HTTP/1.0\r\n\r\n",
+            b"GET /bar/baz HTTP/1.0\r\n\r\n",
+            b"ZZZZ\r\n\r\n",              // no space -> parse_fail -> connection dropped
+            b"GET /after HTTP/1.0\r\n\r\n", // server still serving
+        ]);
+        assert_eq!(r[0], b"HTTP/1.0 200 OK\r\nContent-Length: 4\r\n\r\n/foo",
+            "GET /foo -> {:?}", String::from_utf8_lossy(&r[0]));
+        assert_eq!(r[1], b"HTTP/1.0 200 OK\r\nContent-Length: 8\r\n\r\n/bar/baz",
+            "GET /bar/baz -> {:?}", String::from_utf8_lossy(&r[1]));
+        assert!(r[2].is_empty(),
+            "malformed request must drop the connection (empty response); got {:?}", r[2]);
+        assert_eq!(r[3], b"HTTP/1.0 200 OK\r\nContent-Length: 6\r\n\r\n/after",
+            "server must keep serving after a malformed request; got {:?}",
+            String::from_utf8_lossy(&r[3]));
+
+        // (2) req.method echo — the other field-select arm.
+        let m = run_server("method", &[b"GET /foo HTTP/1.0\r\n\r\n"]);
+        assert_eq!(m[0], b"HTTP/1.0 200 OK\r\nContent-Length: 3\r\n\r\nGET",
+            "GET method echo -> {:?}", String::from_utf8_lossy(&m[0]));
+
+        let _ = fs::remove_file(&elf);
+    }
+
     /// SELF-HOSTING SERVICE slice 1 — verify gate pins. The self-hosted emitter's
     /// leading abort_if(verrs) refuses (exit 1, empty stdout) every service audit
     /// violation; a clean hello_http emits an ELF.
@@ -23849,6 +23952,10 @@ rule le64_neg
         let mk = |logic: &str, svc: &str| -> String {
             format!("rule hello_handler\n  input:\n    req : HttpRequest\n  output:\n    resp : HttpResponse\n  logic:\n    {}\n  proofs:\n    purity:\n      reads : []\n      calls : []\n    termination:\n      bound : 1\n{}", logic, svc)
         };
+        // Same, but with a declared `reads` list (the S2 echo bodies read req fields).
+        let mkr = |logic: &str, reads: &str, svc: &str| -> String {
+            format!("rule hello_handler\n  input:\n    req : HttpRequest\n  output:\n    resp : HttpResponse\n  logic:\n    {}\n  proofs:\n    purity:\n      reads : {}\n      calls : []\n    termination:\n      bound : 1\n{}", logic, reads, svc)
+        };
         let good_logic = "resp = HttpResponse { status: 200, body: \"Hi\" }";
         let svc = |proto: &str, port: &str, maxreq: &str, handler: &str| -> String {
             format!("service hello_server\n  listen:\n    protocol : {}\n    port : {}\n    max_request : {}\n  handler: {}", proto, port, maxreq, handler)
@@ -23870,12 +23977,31 @@ rule le64_neg
         refuse(&mk(good_logic, &svc("http_1_0", "0", "4096", "hello_handler")), "port 0");
         // (e) max_request < 64.
         refuse(&mk(good_logic, &svc("http_1_0", "18888", "32", "hello_handler")), "max_request < 64");
-        // (f) req.* in the handler body (non-literal -> S2).
-        refuse(&mk("resp = HttpResponse { status: 200, body: req.path }",
-            &svc("http_1_0", "18888", "4096", "hello_handler")), "req.* handler body");
-        // (g) non-literal (concat) body.
-        refuse(&mk("resp = HttpResponse { status: 200, body: concat(\"a\", \"b\") }",
-            &svc("http_1_0", "18888", "4096", "hello_handler")), "concat handler body");
+        // (f) SLICE 2: req.path echo now EMITS (was refused in S1). The read is
+        // declared in the handler proof.
+        let echo_path = mkr("resp = HttpResponse { status: 200, body: req.path }",
+            "[req.path]", &svc("http_1_0", "18888", "4096", "hello_handler"));
+        let of = run(&echo_path);
+        assert!(of.status.success() && of.stdout.len() >= 4 && &of.stdout[0..4] == b"\x7fELF",
+            "S2 req.path echo must emit; got {:?} stderr={:?}", of.status, String::from_utf8_lossy(&of.stderr));
+        // (f2) req.method echo also EMITS (the other field-select arm).
+        let echo_method = mkr("resp = HttpResponse { status: 200, body: req.method }",
+            "[req.method]", &svc("http_1_0", "18888", "4096", "hello_handler"));
+        let om = run(&echo_method);
+        assert!(om.status.success() && om.stdout.len() >= 4 && &om.stdout[0..4] == b"\x7fELF",
+            "S2 req.method echo must emit; got {:?}", om.status);
+        // (f3) unsupported req field (req.body) -> refused (only method|path in S2).
+        refuse(&mkr("resp = HttpResponse { status: 200, body: req.body }",
+            "[req.body]", &svc("http_1_0", "18888", "4096", "hello_handler")), "unsupported req field req.body");
+        // (f4) AstField base is not the handler input param -> refused.
+        refuse(&mkr("resp = HttpResponse { status: 200, body: bogus.path }",
+            "[bogus.path]", &svc("http_1_0", "18888", "4096", "hello_handler")), "base not input param");
+        // (f5) if/else handler -> refused (dynamic routing is S3).
+        refuse(&mkr("resp = if req.method == \"GET\" then HttpResponse { status: 200, body: req.path } else HttpResponse { status: 404, body: req.path }",
+            "[req.method, req.path]", &svc("http_1_0", "18888", "4096", "hello_handler")), "if/else handler (S3)");
+        // (g) non-literal (concat) body -> refused (S4).
+        refuse(&mkr("resp = HttpResponse { status: 200, body: concat(\"a\", req.path) }",
+            "[req.path]", &svc("http_1_0", "18888", "4096", "hello_handler")), "concat handler body (S4)");
         // (h) let-bound handler.
         refuse(&mk("let x = 200\n    resp = HttpResponse { status: 200, body: \"Hi\" }",
             &svc("http_1_0", "18888", "4096", "hello_handler")), "let in handler");
