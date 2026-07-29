@@ -13715,6 +13715,113 @@ rule svc_if_shape_ok
       bound : 64
 
 
+-- svc_log_content_ok (self-hosting-service-slice-5a): 1 iff a service log block's
+-- CONTENT is an emit-lowerable shape. Slice 5a lowers exactly ONE shape — an AstStr
+-- literal — so every other arm is 0 and the verify<->emit acceptance parity holds
+-- ARM-FOR-ARM with x86_svc_log_content (the collections-tier
+-- verify-accepts-but-emit-int3s scar). AstErr — the SvNil sentinel AND the
+-- unparseable-content marker — is REFUSED EXPLICITLY (its arm is 0), so a malformed
+-- content can never pass. Breadcrumb posture: an AstCall (concat) or AstField
+-- (req.*/resp.*) content is S5b; an AstNum (resp.status) needs an itoa arm and is
+-- also S5b. Full 26-arm match, the rx_content_ok template.
+rule svc_log_content_ok
+  @intention: "1 if a service log block's content is a string literal, 0 otherwise (AstErr refused)"
+  @source: vexprparse.intent:74
+  input:
+    rc : RxContentState
+  output:
+    out : number
+  logic:
+    out = match rc.node:
+      AstNum(value) => 0
+      AstBin(op, lhs, rhs) => 0
+      AstNeg(inner) => 0
+      AstNot(inner) => 0
+      AstVar(start, len) => 0
+      AstField(base, fstart, flen) => 0
+      AstCall(callee_start, callee_len, args) => 0
+      AstStr(start, len) => 1
+      AstBytes(start, len) => 0
+      AstBool(value) => 0
+      AstIf(cond, thn, els) => 0
+      AstErr => 0
+      AstVariant(cstart, clen, vstart, vlen, fields) => 0
+      AstMatch(scrut, arms) => 0
+      AstOk(inner) => 0
+      AstResErr(inner) => 0
+      AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => 0
+      AstSum(coll, item_start, item_len, body) => 0
+      AstCount(coll, item_start, item_len, body) => 0
+      AstFold(coll, init, acc_start, acc_len, item_start, item_len, body) => 0
+      AstAll(coll, item_start, item_len, body) => 0
+      AstAny(coll, item_start, item_len, body) => 0
+      AstMap(coll, item_start, item_len, body) => 0
+      AstFilter(coll, item_start, item_len, body) => 0
+      AstMinFold(coll, item_start, item_len, body) => 0
+      AstMaxFold(coll, item_start, item_len, body) => 0
+  proofs:
+    purity:
+      reads : [rc.node]
+      calls : []
+    termination:
+      bound : 64
+
+
+-- SvcLogCkState (self-hosting-service-slice-5a): the three-state log gate's inputs —
+-- the presence flag, the path sentinel, the on_error policy code, the content Ast and
+-- the source.
+-- `path_len` MUST declare a NEGATIVE-CAPABLE range (the DecodeState / BytesEmitState
+-- idiom). A range-less `number` field defaults to [0, i32::MAX] and the optimizer's
+-- interval arithmetic then DEAD-ELIMINATES `sk.path_len < 0` — the malformed-log gate
+-- silently folds to "always fine" and a broken `log:` decl emits. Caught in this slice
+-- by the badpath / badhead probes, which emitted instead of refusing.
+concept SvcLogCkState
+  @intention: "A service's log presence flag + path sentinel + on_error code + content Ast + source, for the slice-5a log gate"
+  @source: vexprparse.intent:74
+  fields:
+    present : number [0, 4000000]
+    path_len : number [-4000000, 4000000]
+    on_error : number [0, 4000000]
+    node : Ast
+    src : text [..256]
+
+
+-- svc_log_ok (self-hosting-service-slice-5a): the THREE-STATE log gate.
+--   present == 0                  -> 1 (no log block; the byte-identity path — every
+--                                       service emitted before this slice)
+--   present == 1 && path_len < 0  -> 0 (MALFORMED log decl: the append_file head is
+--                                       misspelled, the path is not a string literal,
+--                                       or the block shape is wrong. Refused, NOT
+--                                       silently ignored — that is exactly what the
+--                                       separate log_present flag buys.)
+--   content not an AstStr         -> 0 (S5b: concat / req.* / resp.* content needs the
+--                                       post-field-select placement + the svc_carg
+--                                       write shape)
+--   on_error > 1                  -> 0 (S5c: `abort` needs a sys_exit(1) tail the
+--                                       accept loop does not have, and code 3 is an
+--                                       unrecognized policy word. Slice 5a emits DROP
+--                                       — best-effort, no syscall return checks — so
+--                                       accepting `abort` would silently downgrade the
+--                                       declared policy.)
+--   otherwise                     -> 1
+rule svc_log_ok
+  @intention: "1 if a service's optional log block is absent or is the slice-5a static-literal drop shape, 0 otherwise"
+  @source: vexprparse.intent:74
+  input:
+    sk : SvcLogCkState
+  output:
+    out : number
+  logic:
+    let cok = svc_log_content_ok(RxContentState { node: sk.node, src: sk.src })
+    out = if sk.present == 0 then 1 else (if sk.path_len < 0 then 0 else (if cok == 1 then (if sk.on_error > 1 then 0 else 1) else 0))
+  proofs:
+    purity:
+      reads : [sk.present, sk.path_len, sk.on_error, sk.node, sk.src]
+      calls : [svc_log_content_ok]
+    termination:
+      bound : 64
+
+
 -- ServiceErrState: the program + declared services + PARSED concepts (concepts0, for
 -- the reserved-name check) + declared resources/connections/reactions (for the
 -- service+effects refusal) + source, for the service verification surface.
@@ -13771,13 +13878,20 @@ rule service_errors
     let resp_decl = find_concept_index(FindConceptIdxState { concepts: se.concepts, src: se.src, q_start: rd_out_ty_start(handler), q_len: rd_out_ty_len(handler), idx: 0 })
     let reserved = (if req_decl == 999999 then 0 else 1) + (if resp_decl == 999999 then 0 else 1)
     let effects = if reaction_list_len(se.rxs) > 0 then 1 else if connection_list_len(se.conns) > 0 then 1 else if resource_list_len(se.ress) > 0 then 1 else 0
-    out = if has_svc == 0 then 0 else (malformed + proto_bad + port_bad + maxreq_bad + (if hexists == 1 then 0 else 1) + (if shape_ok == 1 then 0 else 1) + (if n == 1 then 0 else 1) + reserved + effects)
+    -- Slice 5a: the OPTIONAL per-request `log:` block, on the three-state gate
+    -- (absent -> no error; declared-but-malformed -> ERROR; declared-and-well-formed
+    -- but beyond the static-literal/drop shape -> ERROR with an S5b/S5c breadcrumb).
+    -- The `effects` term above STAYS: a service still may not compose with a
+    -- reaction / connection / resource — a `log:` block is a SERVICE-LOCAL effect,
+    -- not a top-level one.
+    let log_bad = if svc_log_ok(SvcLogCkState { present: svc_log_present(h), path_len: svc_log_path_len(h), on_error: svc_log_on_error(h), node: svc_log_content(h), src: se.src }) == 1 then 0 else 1
+    out = if has_svc == 0 then 0 else (malformed + proto_bad + port_bad + maxreq_bad + (if hexists == 1 then 0 else 1) + (if shape_ok == 1 then 0 else 1) + (if n == 1 then 0 else 1) + reserved + effects + log_bad)
   proofs:
     purity:
       reads : [se.prog, se.svcs, se.concepts, se.ress, se.conns, se.rxs, se.src]
-      calls : [service_list_len, svc_head, svc_handler_len, svc_protocol, svc_port, svc_max_request, svc_handler_start, rule_named, find_rule, rd_body, count_binds, block_binds, block_result, ast_variant_fields, ast_is_variant, vfield_len, ast_is_num, vf_head_val, vf_tail, svc_body_ok, svc_if_shape_ok, fl_head_start, fl_head_len, find_concept_index, fl_head_ty_start, fl_head_ty_len, rd_input, rd_out_ty_start, rd_out_ty_len, reaction_list_len, connection_list_len, resource_list_len]
+      calls : [service_list_len, svc_head, svc_handler_len, svc_protocol, svc_port, svc_max_request, svc_handler_start, rule_named, find_rule, rd_body, count_binds, block_binds, block_result, ast_variant_fields, ast_is_variant, vfield_len, ast_is_num, vf_head_val, vf_tail, svc_body_ok, svc_if_shape_ok, fl_head_start, fl_head_len, find_concept_index, fl_head_ty_start, fl_head_ty_len, rd_input, rd_out_ty_start, rd_out_ty_len, reaction_list_len, connection_list_len, resource_list_len, svc_log_ok, svc_log_present, svc_log_path_len, svc_log_on_error, svc_log_content]
     termination:
-      bound : 64
+      bound : 128
 
 
 
