@@ -977,11 +977,25 @@ concept_group VExpr [max_depth: 4096, max_nodes: 6000000]
   -- line misspelled, port/max_request not a number literal, protocol keyword absent);
   -- service_errors counts it, the emit gate refuses. Single-variant record-like group
   -- concept, exactly like Resource / Connection.
+  --
+  -- Slice 5a widens 7 -> 12 fields for the OPTIONAL per-request `log:` block:
+  -- `log_present` (0 = no log block, 1 = one declared), `log_path_start` /
+  -- `log_path_len` (the append_file path INNER span, quotes stripped; -1 = the
+  -- MALFORMED-LOG sentinel), `log_content` (the content Ast — AstStr for slice 5a,
+  -- anything else refused with an S5b breadcrumb) and `log_on_error` (0 = the line is
+  -- absent, 1 = `drop`, 2 = `abort`, 3 = present-but-unrecognized).
+  -- WHY `log_present` IS MANDATORY: a single -1 path sentinel cannot distinguish
+  -- "absent" (legal — every service before this slice) from "malformed" (must be
+  -- refused). parse_reaction_decl collapses the two because a reaction block is never
+  -- optional; a `log:` block IS. Without the flag a malformed log decl would be
+  -- SILENTLY IGNORED — the worst failure mode for a fail-closed audit feature.
+  -- Arena cost is ZERO: max_payload_fields is a MAX over all concepts and the
+  -- program-wide maximum is already >= 12 (MkRule), so entry_size is unchanged.
   concept Service
-    @intention: "A parsed top-level service declaration: name span + port + max_request + handler name span + protocol code"
+    @intention: "A parsed top-level service declaration: name span + port + max_request + handler name span + protocol code + optional log block"
     @source: vexprparse.intent:74
     variants:
-      MkService of (name_start : number, name_len : number, port : number, max_request : number, handler_start : number, handler_len : number, protocol : number)
+      MkService of (name_start : number, name_len : number, port : number, max_request : number, handler_start : number, handler_len : number, protocol : number, log_present : number, log_path_start : number, log_path_len : number, log_content : Ast, log_on_error : number)
 
   -- Self-hosting service slice 1: a cons-list of top-level service declarations in
   -- source order. Same cons shape as ConnectionList (CnCons/CnNil).
@@ -7211,6 +7225,71 @@ rule span_is_handler
       bound : 64
 
 
+-- span_is_log (self-hosting service slice 5a): 1 iff an Ident span spells exactly the
+-- 3 bytes "log" (l=108 o=111 g=103) — the OPTIONAL per-request log block header, a
+-- SIBLING of `handler:` at the same indent. Mirror of span_is_effects (the reaction
+-- block's second header line), full-byte-compare like every other recognizer.
+rule span_is_log
+  @intention: "1 if an Ident span spells exactly \"log\", 0 otherwise"
+  @source: vexprparse.intent:74
+  input:
+    sc : SpanCheck
+  output:
+    out : number
+  logic:
+    out = if sc.len == 3 and (byte_at(sc.src, sc.start) == 108 and (byte_at(sc.src, sc.start + 1) == 111 and byte_at(sc.src, sc.start + 2) == 103)) then 1 else 0
+  proofs:
+    purity:
+      reads : [sc.src, sc.start, sc.len]
+      calls : []
+    termination:
+      bound : 64
+
+
+-- span_is_on_error (self-hosting service slice 5a): 1 iff an Ident span spells exactly
+-- the 8 bytes "on_error" (o=111 n=110 _=95 e=101 r=114 r=114 o=111 r=114) — the
+-- OPTIONAL policy line inside a `log:` block. Slice 5a implements only the REFUSAL of
+-- `abort`, but the line is PARSED anyway: if it were left unparsed the structural
+-- skip_indented_block would swallow it and the emitted server would silently run DROP
+-- while the source declares ABORT — a silent policy downgrade on a fail-closed audit
+-- feature. Distinct from span_is_on_read_error / span_is_on_connect_error.
+rule span_is_on_error
+  @intention: "1 if an Ident span spells exactly \"on_error\", 0 otherwise"
+  @source: vexprparse.intent:74
+  input:
+    sc : SpanCheck
+  output:
+    out : number
+  logic:
+    out = if sc.len == 8 and (byte_at(sc.src, sc.start) == 111 and (byte_at(sc.src, sc.start + 1) == 110 and (byte_at(sc.src, sc.start + 2) == 95 and (byte_at(sc.src, sc.start + 3) == 101 and (byte_at(sc.src, sc.start + 4) == 114 and (byte_at(sc.src, sc.start + 5) == 114 and (byte_at(sc.src, sc.start + 6) == 111 and byte_at(sc.src, sc.start + 7) == 114))))))) then 1 else 0
+  proofs:
+    purity:
+      reads : [sc.src, sc.start, sc.len]
+      calls : []
+    termination:
+      bound : 64
+
+
+-- span_is_drop_word (self-hosting service slice 5a): 1 iff an Ident span spells exactly
+-- "drop" (d=100 r=114 o=111 p=112) — the DEFAULT log on_error policy (best-effort, no
+-- syscall return checks), the only one slice 5a emits. Sibling of span_is_abort_word.
+rule span_is_drop_word
+  @intention: "1 if an Ident span spells exactly \"drop\", 0 otherwise"
+  @source: vexprparse.intent:74
+  input:
+    sc : SpanCheck
+  output:
+    out : number
+  logic:
+    out = if sc.len == 4 and (byte_at(sc.src, sc.start) == 100 and (byte_at(sc.src, sc.start + 1) == 114 and (byte_at(sc.src, sc.start + 2) == 111 and byte_at(sc.src, sc.start + 3) == 112))) then 1 else 0
+  proofs:
+    purity:
+      reads : [sc.src, sc.start, sc.len]
+      calls : []
+    termination:
+      bound : 64
+
+
 rule span_is_http_1_0
   @intention: "1 if a callee/ident span spells exactly \"http_1_0\", 0 otherwise"
   @source: vexprparse.intent:74
@@ -10995,7 +11074,7 @@ rule svc_name_start
     out : number
   logic:
     out = match s:
-      MkService(name_start, name_len, port, max_request, handler_start, handler_len, protocol) => name_start
+      MkService(name_start, name_len, port, max_request, handler_start, handler_len, protocol, log_present, log_path_start, log_path_len, log_content, log_on_error) => name_start
   proofs:
     purity:
       reads : [s]
@@ -11013,7 +11092,7 @@ rule svc_name_len
     out : number
   logic:
     out = match s:
-      MkService(name_start, name_len, port, max_request, handler_start, handler_len, protocol) => name_len
+      MkService(name_start, name_len, port, max_request, handler_start, handler_len, protocol, log_present, log_path_start, log_path_len, log_content, log_on_error) => name_len
   proofs:
     purity:
       reads : [s]
@@ -11031,7 +11110,7 @@ rule svc_port
     out : number
   logic:
     out = match s:
-      MkService(name_start, name_len, port, max_request, handler_start, handler_len, protocol) => port
+      MkService(name_start, name_len, port, max_request, handler_start, handler_len, protocol, log_present, log_path_start, log_path_len, log_content, log_on_error) => port
   proofs:
     purity:
       reads : [s]
@@ -11049,7 +11128,7 @@ rule svc_max_request
     out : number
   logic:
     out = match s:
-      MkService(name_start, name_len, port, max_request, handler_start, handler_len, protocol) => max_request
+      MkService(name_start, name_len, port, max_request, handler_start, handler_len, protocol, log_present, log_path_start, log_path_len, log_content, log_on_error) => max_request
   proofs:
     purity:
       reads : [s]
@@ -11067,7 +11146,7 @@ rule svc_handler_start
     out : number
   logic:
     out = match s:
-      MkService(name_start, name_len, port, max_request, handler_start, handler_len, protocol) => handler_start
+      MkService(name_start, name_len, port, max_request, handler_start, handler_len, protocol, log_present, log_path_start, log_path_len, log_content, log_on_error) => handler_start
   proofs:
     purity:
       reads : [s]
@@ -11085,7 +11164,7 @@ rule svc_handler_len
     out : number
   logic:
     out = match s:
-      MkService(name_start, name_len, port, max_request, handler_start, handler_len, protocol) => handler_len
+      MkService(name_start, name_len, port, max_request, handler_start, handler_len, protocol, log_present, log_path_start, log_path_len, log_content, log_on_error) => handler_len
   proofs:
     purity:
       reads : [s]
@@ -11103,7 +11182,100 @@ rule svc_protocol
     out : number
   logic:
     out = match s:
-      MkService(name_start, name_len, port, max_request, handler_start, handler_len, protocol) => protocol
+      MkService(name_start, name_len, port, max_request, handler_start, handler_len, protocol, log_present, log_path_start, log_path_len, log_content, log_on_error) => protocol
+  proofs:
+    purity:
+      reads : [s]
+      calls : []
+    termination:
+      bound : 16
+
+
+-- Slice 5a accessors for the OPTIONAL `log:` block. Same bare-group idiom as the
+-- seven above; every one of them runs on the SvNil sentinel under eager lets, so the
+-- sentinel carries well-defined values (present 0, path_len -1, content AstErr).
+rule svc_log_present
+  @intention: "1 if the service declares a `log:` block, 0 otherwise"
+  @source: vexprparse.intent:74
+  input:
+    s : Service
+  output:
+    out : number
+  logic:
+    out = match s:
+      MkService(name_start, name_len, port, max_request, handler_start, handler_len, protocol, log_present, log_path_start, log_path_len, log_content, log_on_error) => log_present
+  proofs:
+    purity:
+      reads : [s]
+      calls : []
+    termination:
+      bound : 16
+
+
+rule svc_log_path_start
+  @intention: "The log append_file path INNER span start of a service declaration"
+  @source: vexprparse.intent:74
+  input:
+    s : Service
+  output:
+    out : number
+  logic:
+    out = match s:
+      MkService(name_start, name_len, port, max_request, handler_start, handler_len, protocol, log_present, log_path_start, log_path_len, log_content, log_on_error) => log_path_start
+  proofs:
+    purity:
+      reads : [s]
+      calls : []
+    termination:
+      bound : 16
+
+
+rule svc_log_path_len
+  @intention: "The log append_file path INNER span length of a service declaration (-1 = malformed or absent)"
+  @source: vexprparse.intent:74
+  input:
+    s : Service
+  output:
+    out : number
+  logic:
+    out = match s:
+      MkService(name_start, name_len, port, max_request, handler_start, handler_len, protocol, log_present, log_path_start, log_path_len, log_content, log_on_error) => log_path_len
+  proofs:
+    purity:
+      reads : [s]
+      calls : []
+    termination:
+      bound : 16
+
+
+rule svc_log_content
+  @intention: "The log append_file content expression of a service declaration (AstErr = sentinel/unparseable)"
+  @source: vexprparse.intent:74
+  input:
+    s : Service
+  output:
+    out : Ast
+  logic:
+    out = match s:
+      MkService(name_start, name_len, port, max_request, handler_start, handler_len, protocol, log_present, log_path_start, log_path_len, log_content, log_on_error) => log_content
+  proofs:
+    purity:
+      reads : [s]
+      calls : []
+    termination:
+      bound : 16
+
+
+rule svc_log_on_error
+  @intention: "The log on_error policy code of a service declaration (0 = absent, 1 = drop, 2 = abort, 3 = unrecognized)"
+  @source: vexprparse.intent:74
+  input:
+    s : Service
+  output:
+    out : number
+  logic:
+    out = match s:
+      MkService(name_start, name_len, port, max_request, handler_start, handler_len, protocol, log_present, log_path_start, log_path_len, log_content, log_on_error) => log_on_error
   proofs:
     purity:
       reads : [s]
@@ -11147,7 +11319,7 @@ rule svc_head
   logic:
     out = match sl:
       SvCons(head, tail) => head
-      SvNil => Service::MkService { name_start: 0, name_len: 0, port: 0, max_request: 0, handler_start: 0, handler_len: 0 - 1, protocol: 0 }
+      SvNil => Service::MkService { name_start: 0, name_len: 0, port: 0, max_request: 0, handler_start: 0, handler_len: 0 - 1, protocol: 0, log_present: 0, log_path_start: 0, log_path_len: 0 - 1, log_content: Ast::AstErr, log_on_error: 0 }
   proofs:
     purity:
       reads : [sl]
@@ -11198,13 +11370,43 @@ rule parse_service_decl
     let hnlen = peek_kw_len(advance(Advance { lst: hp, k: 2 }))
     let proto_code = if is_http == 1 then 1 else if is_raw == 1 then 2 else 0
     let shape_ok = if is_listen == 1 then (if is_protocol == 1 then (if proto_code > 0 then (if is_port == 1 then (if is_pnum == 1 then (if is_maxreq == 1 then (if is_mnum == 1 then is_handler else 0) else 0) else 0) else 0) else 0) else 0) else 0
-    out = Service::MkService { name_start: name_start, name_len: name_len, port: pval, max_request: mval, handler_start: hnstart, handler_len: if shape_ok == 1 then hnlen else 0 - 1, protocol: proto_code }
+    -- Slice 5a: the OPTIONAL `log:` block. skip_seps (NOT skip_seps_dedent) from
+    -- handler+3: `log:` is a SIBLING of `handler:` at the same indent (only a Newline
+    -- between), so skip_seps reaches it; for a service WITHOUT a log the cursor parks
+    -- on the block-closing Dedent (kind 800) — which skip_seps_dedent would skip,
+    -- walking straight into the NEXT top-level declaration and mis-parsing it as a log
+    -- block. From `log` the walk is verbatim parse_reaction_decl's tail: `:` at +1,
+    -- skip_seps from +2 (past the Newline + the inner Indent) lands on `append_file`,
+    -- its path Str at +1, the content at +2 via parse_or. The OPTIONAL `on_error:` line
+    -- sits after the content (skip_seps from parse_or's `next`).
+    -- ABSENT != MALFORMED: with no `log:` line log_present is 0 and log_path_len is the
+    -- -1 sentinel, which svc_log_ok reads as "no log, no error" — get this wrong and
+    -- EVERY existing service refuses.
+    -- The eager parse_or below runs even for a log-less service (and for every
+    -- non-service top-level item, since parse_services binds parse_service_decl in an
+    -- eager let). It is INERT — gated by log_present at both verify and emit — and
+    -- bounded, because skip_seps parks the cursor on a Dedent rather than running away.
+    let gp = skip_seps(ParseState { cell: advance(Advance { lst: hp, k: 3 }) })
+    let is_log = span_is_log(SpanCheck { src: ps.src, start: peek_kw_start(gp), len: peek_kw_len(gp) })
+    let lap = skip_seps(ParseState { cell: advance(Advance { lst: gp, k: 2 }) })
+    let is_lappend = span_is_append_file(SpanCheck { src: ps.src, start: peek_kw_start(lap), len: peek_kw_len(lap) })
+    let is_lpstr = peek_is_str(advance(Advance { lst: lap, k: 1 }))
+    let lpstart = peek_str_start(advance(Advance { lst: lap, k: 1 }))
+    let lplen = peek_str_len(advance(Advance { lst: lap, k: 1 }))
+    let lcp = parse_or(ParseState { cell: advance(Advance { lst: lap, k: 2 }) })
+    let oep = skip_seps(ParseState { cell: parsed_next(lcp) })
+    let is_oe = span_is_on_error(SpanCheck { src: ps.src, start: peek_kw_start(oep), len: peek_kw_len(oep) })
+    let oe_abort = span_is_abort_word(SpanCheck { src: ps.src, start: peek_kw_start(advance(Advance { lst: oep, k: 2 })), len: peek_kw_len(advance(Advance { lst: oep, k: 2 })) })
+    let oe_drop = span_is_drop_word(SpanCheck { src: ps.src, start: peek_kw_start(advance(Advance { lst: oep, k: 2 })), len: peek_kw_len(advance(Advance { lst: oep, k: 2 })) })
+    let oe_code = if is_oe == 0 then 0 else if oe_abort == 1 then 2 else if oe_drop == 1 then 1 else 3
+    let log_shape_ok = if is_lappend == 1 then is_lpstr else 0
+    out = Service::MkService { name_start: name_start, name_len: name_len, port: pval, max_request: mval, handler_start: hnstart, handler_len: if shape_ok == 1 then hnlen else 0 - 1, protocol: proto_code, log_present: is_log, log_path_start: lpstart + 1, log_path_len: if is_log == 1 then (if log_shape_ok == 1 then (if lplen >= 2 then lplen - 2 else 0 - 1) else 0 - 1) else 0 - 1, log_content: parsed_node(lcp), log_on_error: oe_code }
   proofs:
     purity:
       reads : [ps.cell, ps.src]
-      calls : [peek_kw_start, peek_kw_len, skip_seps, skip_seps_dedent, span_is_listen, span_is_protocol, span_is_http_1_0, span_is_raw_tcp, span_is_port, peek_is_num, peek_value, span_is_max_request, span_is_handler, advance]
+      calls : [peek_kw_start, peek_kw_len, skip_seps, skip_seps_dedent, span_is_listen, span_is_protocol, span_is_http_1_0, span_is_raw_tcp, span_is_port, peek_is_num, peek_value, span_is_max_request, span_is_handler, span_is_log, span_is_append_file, span_is_on_error, span_is_abort_word, span_is_drop_word, peek_is_str, peek_str_start, peek_str_len, parse_or, parsed_node, parsed_next, advance]
     termination:
-      bound : 64
+      bound : 256
 
 
 -- parse_services: the top-level walk that CAPTURES service declarations into a
