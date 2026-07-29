@@ -24160,6 +24160,294 @@ rule le64_neg
         let _ = fs::remove_file(&elf);
     }
 
+    /// Minimal SHA-256, test-local (this repo has zero external dependencies).
+    /// Used ONLY to pin the byte-identity of a self-emitted ELF against a value
+    /// measured with a pre-change gen0.
+    #[cfg(target_arch = "x86_64")]
+    fn sha256_hex(data: &[u8]) -> String {
+        const K: [u32; 64] = [
+            0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5,
+            0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+            0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3,
+            0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+            0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc,
+            0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+            0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+            0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+            0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13,
+            0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+            0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3,
+            0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+            0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5,
+            0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+            0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208,
+            0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+        ];
+        let mut h: [u32; 8] = [
+            0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+            0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+        ];
+        let mut msg = data.to_vec();
+        let bitlen = (data.len() as u64).wrapping_mul(8);
+        msg.push(0x80);
+        while msg.len() % 64 != 56 {
+            msg.push(0);
+        }
+        msg.extend_from_slice(&bitlen.to_be_bytes());
+        for chunk in msg.chunks(64) {
+            let mut w = [0u32; 64];
+            for i in 0..16 {
+                w[i] = u32::from_be_bytes([chunk[4 * i], chunk[4 * i + 1], chunk[4 * i + 2], chunk[4 * i + 3]]);
+            }
+            for i in 16..64 {
+                let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+                let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+                w[i] = w[i - 16].wrapping_add(s0).wrapping_add(w[i - 7]).wrapping_add(s1);
+            }
+            let (mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh) =
+                (h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7]);
+            for i in 0..64 {
+                let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+                let ch = (e & f) ^ ((!e) & g);
+                let t1 = hh.wrapping_add(s1).wrapping_add(ch).wrapping_add(K[i]).wrapping_add(w[i]);
+                let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+                let maj = (a & b) ^ (a & c) ^ (b & c);
+                let t2 = s0.wrapping_add(maj);
+                hh = g;
+                g = f;
+                f = e;
+                e = d.wrapping_add(t1);
+                d = c;
+                c = b;
+                b = a;
+                a = t1.wrapping_add(t2);
+            }
+            let upd = [a, b, c, d, e, f, g, hh];
+            for i in 0..8 {
+                h[i] = h[i].wrapping_add(upd[i]);
+            }
+        }
+        h.iter().map(|x| format!("{:08x}", x)).collect::<Vec<_>>().join("")
+    }
+
+    /// SELF-HOSTING SERVICE slice 5a — MILESTONE. A `log:` block on a service makes
+    /// the emitted server append one line per accepted connection, via the reaction
+    /// tier's append_file machinery re-emitted inside the accept loop with the fd in
+    /// **r15** (rbx has been the parsed field pointer since S2).
+    ///
+    /// THE MATRIX IS THE POINT: {S1 constant, S2 field echo, S3 router, S4 concat} ×
+    /// {log, no-log}. An S1-only milestone CANNOT catch the class of bug this slice
+    /// most risks — the log block ends with close(), which returns 0 in rax, and rax
+    /// is LIVE after the read() as the parse loop's remaining-length counter. A block
+    /// emitted after the read would send EVERY S2/S3/S4 request down the parse-fail
+    /// path while S1 (which never parses) kept working. So for each of the four body
+    /// shapes this spawns a LOGGED server, issues N=5 requests over the SAME process,
+    /// and asserts:
+    ///   (a) the log file has EXACTLY 5 lines (per-request firing, not once-at-start);
+    ///   (b) every wire response is BYTE-IDENTICAL to that branch's no-log oracle
+    ///       (this is what catches the rax class — the log must not perturb the parse);
+    ///   (c) p_filesz == the actual file size (the emitted-byte-count net: the size
+    ///       walk and the emit walk are hand-synced and a one-byte drift truncates the
+    ///       mapped segment -> the server SIGSEGVs on spawn);
+    ///   (d) a no-log service still emits a BYTE-IDENTICAL ELF (SHA-256 pinned against
+    ///       a pre-change gen0 built from origin/main).
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn self_hosted_service_log_block() {
+        use std::fs;
+        use std::io::{Read, Write};
+        use std::net::{TcpListener, TcpStream};
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+        use std::time::Duration;
+
+        let src = fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        // gen0: the self-hosted emitter (source on argv[1], pos on argv[2]).
+        let elf = std::env::temp_dir().join("verbosec_test_svc_s5a_elf_program_src");
+        compile_native(&program, "elf_program_src", elf.to_str().unwrap(), false, false)
+            .expect("elf_program_src must compile natively");
+
+        // ---------------------------------------------------------------------
+        // (d) BYTE-IDENTITY: a service with NO log block emits exactly the bytes
+        // origin/main's gen0 emitted. The source is FIXED (fixed port included) so
+        // the hash is reproducible; the server is never spawned for this check.
+        // ---------------------------------------------------------------------
+        let nolog_src = "rule hello_handler\n  input:\n    req : HttpRequest\n  output:\n    resp : HttpResponse\n  logic:\n    resp = HttpResponse { status: 200, body: \"Hello from Verbose over HTTP!\" }\n  proofs:\n    purity:\n      reads : []\n      calls : []\n    termination:\n      bound : 1\nservice hello_server\n  listen:\n    protocol : http_1_0\n    port : 18991\n    max_request : 4096\n  handler: hello_handler";
+        let nolog = Command::new(&elf).args([nolog_src, "0"]).output().expect("spawn gen0");
+        assert!(nolog.status.success(), "gen0 must emit the no-log service; got {:?}", nolog.status);
+        assert_eq!(nolog.stdout.len(), 931, "no-log service ELF size drifted");
+        assert_eq!(
+            sha256_hex(&nolog.stdout),
+            "ff8f967405f490dd22318f019d500ac1fe104d93ba46de21eead3418ea1566e8",
+            "a service WITHOUT a log block must emit BYTE-IDENTICALLY to pre-S5a gen0 \
+             (logsz is 0 by construction when no log block is declared)"
+        );
+
+        // ---------------------------------------------------------------------
+        // The matrix driver: emit a server for `handler_logic` with an optional log
+        // block, spawn it, issue N requests over the SAME process, return the wire
+        // bytes plus the log file's contents.
+        // ---------------------------------------------------------------------
+        let run = |tag: &str, logic: &str, reads: &str, bound: &str, with_log: bool,
+                   reqs: &[&[u8]]| -> (Vec<Vec<u8>>, String) {
+            let port = {
+                let l = TcpListener::bind(("127.0.0.1", 0)).expect("bind ephemeral");
+                l.local_addr().unwrap().port()
+            };
+            let logfile = std::env::temp_dir().join(format!("verbosec_test_svc_s5a_{tag}.log"));
+            let _ = fs::remove_file(&logfile);
+            let logblock = if with_log {
+                format!("\n  log:\n    append_file \"{}\" \"hit\\n\"", logfile.display())
+            } else {
+                String::new()
+            };
+            let source = format!(
+                "rule h5a\n  input:\n    req : HttpRequest\n  output:\n    resp : HttpResponse\n  logic:\n    {lg}\n  proofs:\n    purity:\n      reads : {rd}\n      calls : []\n    termination:\n      bound : {bd}\nservice s5a\n  listen:\n    protocol : http_1_0\n    port : {p}\n    max_request : 4096\n  handler: h5a{lb}",
+                lg = logic, rd = reads, bd = bound, p = port, lb = logblock
+            );
+            let gen = Command::new(&elf).args([source.as_str(), "0"]).output().expect("spawn gen0");
+            assert!(gen.status.success() && gen.stdout.len() >= 4 && &gen.stdout[0..4] == b"\x7fELF",
+                "gen0 must emit the S5a server ({tag}); got {:?} stderr={:?}",
+                gen.status, String::from_utf8_lossy(&gen.stderr));
+
+            // (c) EMITTED-BYTE-COUNT ASSERTION. p_filesz lives at offset 96 of the
+            // single PT_LOAD program header (e_phoff 64 + 32). It is computed from the
+            // SIZE walk (service_tramp_size -> blob_end_off); the file length is what
+            // the EMIT walk actually produced. Equality is the two walks agreeing to
+            // the byte — the bug class every prior service slice hit.
+            let filesz = u64::from_le_bytes(gen.stdout[96..104].try_into().unwrap());
+            assert_eq!(filesz as usize, gen.stdout.len(),
+                "({tag}) p_filesz {} != emitted byte count {} — the size walk and the \
+                 emit walk disagree; the mapped segment would be truncated",
+                filesz, gen.stdout.len());
+
+            let server = std::env::temp_dir().join(format!("verbosec_test_svc_s5a_server_{tag}"));
+            fs::write(&server, &gen.stdout).unwrap();
+            let mut perm = fs::metadata(&server).unwrap().permissions();
+            perm.set_mode(0o755);
+            fs::set_permissions(&server, perm).unwrap();
+
+            let mut child = Command::new(&server).spawn().expect("spawn server");
+            let addr: std::net::SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
+
+            // NO bare readiness probe here — slice 5a logs per ACCEPTED CONNECTION,
+            // so a throwaway connect would add a log line (and racily, since the
+            // server's write happens after connect() returns). Readiness is folded
+            // into the FIRST request instead: retry only the CONNECT, and only while
+            // listen() may still be coming up. Every accepted connection is then
+            // exactly one of `reqs`.
+            let mut out = Vec::new();
+            for (i, req) in reqs.iter().enumerate() {
+                let mut sock = None;
+                for _ in 0..100 {
+                    match TcpStream::connect_timeout(&addr, Duration::from_millis(200)) {
+                        Ok(c) => {
+                            sock = Some(c);
+                            break;
+                        }
+                        Err(_) => {
+                            if i > 0 {
+                                break;
+                            }
+                            std::thread::sleep(Duration::from_millis(20));
+                        }
+                    }
+                }
+                let mut s = sock.unwrap_or_else(|| {
+                    panic!("S5a server ({tag}) never accepted request {} on port {}", i, port)
+                });
+                s.set_read_timeout(Some(Duration::from_secs(2))).ok();
+                s.write_all(req).expect("write request");
+                let mut buf = Vec::new();
+                s.read_to_end(&mut buf).expect("read response");
+                drop(s);
+                out.push(buf);
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = fs::remove_file(&server);
+            let log = fs::read_to_string(&logfile).unwrap_or_default();
+            let _ = fs::remove_file(&logfile);
+            (out, log)
+        };
+
+        // Each row: (tag, handler logic, reads, bound, the 5 requests, the ONE expected
+        // wire response). Five identical requests per server prove per-request firing.
+        let rows: [(&str, &str, &str, &str, &[u8], &[u8]); 4] = [
+            // S1 — constant literal body. No parse at all, so rax is dead here; this
+            // row alone would NOT catch a mis-placed log block.
+            ("s1", "resp = HttpResponse { status: 200, body: \"Hi\" }", "[]", "1",
+             b"GET / HTTP/1.0\r\n\r\n",
+             b"HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nHi"),
+            // S2 — field echo. Parses method/path; rax carries the read byte count.
+            ("s2", "resp = HttpResponse { status: 200, body: req.path }", "[req.path]", "1",
+             b"GET /foo HTTP/1.0\r\n\r\n",
+             b"HTTP/1.0 200 OK\r\nContent-Length: 4\r\n\r\n/foo"),
+            // S3 — router. Parses AND compares; six recomputed jumps.
+            ("s3", "resp = if req.path == \"/\" then HttpResponse { status: 200, body: \"home\" } else HttpResponse { status: 404, body: \"nope\" }",
+             "[req.path]", "8",
+             b"GET / HTTP/1.0\r\n\r\n",
+             b"HTTP/1.0 200 OK\r\nContent-Length: 4\r\n\r\nhome"),
+            // S4 — concat body. Parses, field-selects into rbx/r14 and streams args;
+            // r14 must survive the log block (the fd goes to r15, not r14/rbx).
+            ("s4", "resp = HttpResponse { status: 200, body: concat(\"you asked for \", req.path) }",
+             "[req.path]", "8",
+             b"GET /foo HTTP/1.0\r\n\r\n",
+             b"HTTP/1.0 200 OK\r\nContent-Length: 18\r\n\r\nyou asked for /foo"),
+        ];
+
+        for (tag, logic, reads, bnd, req, want) in rows {
+            let five: Vec<&[u8]> = vec![req; 5];
+
+            // WITH a log block.
+            let (wire, log) = run(&format!("{tag}_log"), logic, reads, bnd, true, &five);
+            assert_eq!(log.lines().count(), 5,
+                "({tag}) a logged server must append EXACTLY one line per request over \
+                 5 requests on the same process; log was {:?}", log);
+            assert!(log.lines().all(|l| l == "hit"),
+                "({tag}) every log line must be the declared static content; got {:?}", log);
+            for (i, got) in wire.iter().enumerate() {
+                assert_eq!(got.as_slice(), want,
+                    "({tag}) request {} with a log block must serve the SAME wire bytes as \
+                     the no-log oracle — a log block placed after the read() would clobber \
+                     rax (the parse loop's remaining-length counter) and drop the request; \
+                     got {:?}", i, String::from_utf8_lossy(got));
+            }
+
+            // WITHOUT a log block (same shape, same assertions minus the log file).
+            let (wire0, log0) = run(&format!("{tag}_nolog"), logic, reads, bnd, false, &five);
+            assert!(log0.is_empty(), "({tag}) a log-less server must write no log file");
+            for got in &wire0 {
+                assert_eq!(got.as_slice(), want,
+                    "({tag}) no-log wire bytes regressed; got {:?}", String::from_utf8_lossy(got));
+            }
+        }
+
+        // Extra: the S3 ELSE arm still routes correctly with a log block (jump3/4/5 are
+        // forward jumps and must be UNCHANGED by the insertion), and a malformed request
+        // is still dropped — while STILL being logged, which is this slice's documented
+        // divergence from verbosec (we log per ACCEPTED CONNECTION, verbosec logs only
+        // requests that reached the handler).
+        let (wire, log) = run("s3_else", "resp = if req.path == \"/\" then HttpResponse { status: 200, body: \"home\" } else HttpResponse { status: 404, body: \"nope\" }",
+            "[req.path]", "8", true,
+            &[b"GET /other HTTP/1.0\r\n\r\n", b"ZZZZ\r\n\r\n", b"GET / HTTP/1.0\r\n\r\n"]);
+        assert_eq!(wire[0].as_slice(), b"HTTP/1.0 404 OK\r\nContent-Length: 4\r\n\r\nnope",
+            "S3 else arm with a log block -> {:?}", String::from_utf8_lossy(&wire[0]));
+        assert!(wire[1].is_empty(), "a malformed request must still be dropped; got {:?}", wire[1]);
+        assert_eq!(wire[2].as_slice(), b"HTTP/1.0 200 OK\r\nContent-Length: 4\r\n\r\nhome",
+            "the server must keep serving after a malformed request; got {:?}",
+            String::from_utf8_lossy(&wire[2]));
+        assert_eq!(log.lines().count(), 3,
+            "slice 5a logs per ACCEPTED CONNECTION — the dropped request is logged too \
+             (documented divergence from verbosec); log was {:?}", log);
+
+        let _ = fs::remove_file(&elf);
+    }
+
     /// SELF-HOSTING SERVICE slice 1 — verify gate pins. The self-hosted emitter's
     /// leading abort_if(verrs) refuses (exit 1, empty stdout) every service audit
     /// violation; a clean hello_http emits an ELF.
@@ -24318,6 +24606,54 @@ rule le64_neg
         // (j) service + reaction (a service has no marshal; effects-into-handlers is S5-S7).
         let svc_plus_reaction = format!("{}\nreaction logit\n  trigger: hello_handler\n  effects:\n    append_file \"/tmp/vx_svc_s1_r.log\" \"y\\n\"", clean);
         refuse(&svc_plus_reaction, "service + reaction");
+
+        // ------------------------------------------------------------------
+        // SLICE 5a — the optional per-request `log:` block. Three-state gate:
+        // absent -> no error; declared-but-malformed -> ERROR; declared but
+        // beyond the static-literal / drop shape -> ERROR (S5b / S5c).
+        // ------------------------------------------------------------------
+        // `withlog` appends a log block to the clean S1 service.
+        let withlog = |block: &str| -> String { format!("{}\n{}", clean, block) };
+
+        // (k) a STATIC-LITERAL log block emits (the slice 5a shape).
+        let k = run(&withlog("  log:\n    append_file \"/tmp/vx_svc_s5a.log\" \"hit\\n\""));
+        assert!(k.status.success() && k.stdout.len() >= 4 && &k.stdout[0..4] == b"\x7fELF",
+            "S5a static-literal log must emit; got {:?} stderr={:?}",
+            k.status, String::from_utf8_lossy(&k.stderr));
+        // (k2) an explicit `on_error: drop` also emits (drop IS what slice 5a lowers).
+        let k2 = run(&withlog("  log:\n    append_file \"/tmp/vx_svc_s5a.log\" \"hit\\n\"\n    on_error: drop"));
+        assert!(k2.status.success() && k2.stdout.len() >= 4 && &k2.stdout[0..4] == b"\x7fELF",
+            "S5a `on_error: drop` must emit; got {:?}", k2.status);
+        // (k3) a service with NO log block still emits — the absent != malformed case.
+        // (`clean` above already asserts this; restated here as the gate's third state.)
+        let k3 = run(&clean);
+        assert!(k3.status.success() && k3.stdout.len() >= 4 && &k3.stdout[0..4] == b"\x7fELF",
+            "a service with no log block must still emit; got {:?}", k3.status);
+        // (k4) CONCAT content -> refused (S5b: it needs the post-field-select placement
+        // and the per-arg write shape).
+        refuse(&withlog("  log:\n    append_file \"/tmp/vx_svc_s5a.log\" concat(\"hit \", req.path)"),
+            "concat log content -> S5b");
+        // (k5) FIELD content -> refused (S5b).
+        refuse(&withlog("  log:\n    append_file \"/tmp/vx_svc_s5a.log\" req.path"),
+            "req field log content -> S5b");
+        // (k6) NUMBER content -> refused (an AstNum needs an itoa arm — S5b).
+        refuse(&withlog("  log:\n    append_file \"/tmp/vx_svc_s5a.log\" 42"),
+            "number log content -> S5b");
+        // (k7) `on_error: abort` -> refused (S5c: the accept loop has no sys_exit(1)
+        // tail). CRITICAL that this REFUSES rather than being ignored: the line is
+        // PARSED, so a declared abort can never be silently downgraded to drop.
+        refuse(&withlog("  log:\n    append_file \"/tmp/vx_svc_s5a.log\" \"hit\\n\"\n    on_error: abort"),
+            "on_error: abort -> S5c");
+        // (k8) an UNRECOGNIZED on_error policy word -> refused (closed set).
+        refuse(&withlog("  log:\n    append_file \"/tmp/vx_svc_s5a.log\" \"hit\\n\"\n    on_error: yolo"),
+            "unknown on_error policy");
+        // (k9) MALFORMED log decl — a non-literal path. Refused, NOT silently ignored:
+        // this is exactly what the separate `log_present` flag buys (a single -1 path
+        // sentinel could not distinguish "absent" from "malformed").
+        refuse(&withlog("  log:\n    append_file bogus \"hit\\n\""), "non-literal log path");
+        // (k10) MALFORMED log decl — a misspelled effect head.
+        refuse(&withlog("  log:\n    print_file \"/tmp/vx_svc_s5a.log\" \"hit\\n\""),
+            "misspelled log effect head");
 
         let _ = fs::remove_file(&gate);
     }
