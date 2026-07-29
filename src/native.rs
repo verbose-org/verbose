@@ -24027,6 +24027,139 @@ rule le64_neg
         let _ = fs::remove_file(&elf);
     }
 
+    /// SELF-HOSTING SERVICE slice 4 — MILESTONE. The self-hosted emitter compiles a
+    /// handler whose response body is a CONCAT over literals + one req field
+    /// (`body: concat("you asked for ", req.path)`) into an ELF that streams the
+    /// concat args in source order to the client fd with a RUNTIME Content-Length
+    /// (compile-time literal sum + the parsed field's runtime length in r14).
+    /// Proves: per-request runtime length (two paths -> two Content-Lengths on the
+    /// SAME server), both arg orders (literal-first and field-first), the req.method
+    /// field-select, 3-arg ordering, and parse-fail resilience. Byte-for-byte wire
+    /// asserts. gen0 EMITTING these handlers also pins that tcheck_rule does NOT
+    /// refuse the concat body with a type error (the S3 field_ty_of synthetic-field
+    /// wildcard types req.path/req.method as text; concat_args_ty types the body).
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn self_hosted_service_concat_body() {
+        use std::fs;
+        use std::io::{Read, Write};
+        use std::net::{TcpListener, TcpStream};
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+        use std::time::Duration;
+
+        let src = fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        // gen0: the self-hosted emitter (source on argv[1], pos on argv[2]).
+        let elf = std::env::temp_dir().join("verbosec_test_svc_s4_elf_program_src");
+        compile_native(&program, "elf_program_src", elf.to_str().unwrap(), false, false)
+            .expect("elf_program_src must compile natively");
+
+        // Emit a concat-body server, spawn it, probe it. Returns the wire bytes for
+        // each request in `reqs`.
+        let run_concat = |tag: &str, body: &str, reads: &str, reqs: &[&[u8]]| -> Vec<Vec<u8>> {
+            let port = {
+                let l = TcpListener::bind(("127.0.0.1", 0)).expect("bind ephemeral");
+                l.local_addr().unwrap().port()
+            };
+            let source = format!(
+                "rule concat_handler\n  input:\n    req : HttpRequest\n  output:\n    resp : HttpResponse\n  logic:\n    resp = HttpResponse {{ status: 200, body: {b} }}\n  proofs:\n    purity:\n      reads : {r}\n      calls : []\n    termination:\n      bound : 8\nservice concat_server\n  listen:\n    protocol : http_1_0\n    port : {p}\n    max_request : 4096\n  handler: concat_handler",
+                b = body, r = reads, p = port
+            );
+            let gen = Command::new(&elf).args([source.as_str(), "0"]).output()
+                .expect("spawn gen0");
+            assert!(gen.status.success() && gen.stdout.len() >= 4 && &gen.stdout[0..4] == b"\x7fELF",
+                "gen0 must emit an S4 concat-body ELF ({tag}); got {:?} stderr={:?}",
+                gen.status, String::from_utf8_lossy(&gen.stderr));
+
+            let server = std::env::temp_dir().join(format!("verbosec_test_svc_s4_server_{tag}"));
+            fs::write(&server, &gen.stdout).unwrap();
+            let mut p = fs::metadata(&server).unwrap().permissions();
+            p.set_mode(0o755);
+            fs::set_permissions(&server, p).unwrap();
+
+            let mut child = Command::new(&server).spawn().expect("spawn server");
+            let addr: std::net::SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
+            let mut bound = false;
+            for _ in 0..50 {
+                if TcpStream::connect_timeout(&addr, Duration::from_millis(100)).is_ok() {
+                    bound = true;
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            assert!(bound, "S4 concat server ({tag}) never bound on port {}", port);
+
+            let mut out = Vec::new();
+            for req in reqs {
+                let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).expect("connect");
+                s.set_read_timeout(Some(Duration::from_secs(2))).ok();
+                s.write_all(req).expect("write request");
+                let mut buf = Vec::new();
+                s.read_to_end(&mut buf).expect("read response");
+                drop(s);
+                out.push(buf);
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = fs::remove_file(&server);
+            out
+        };
+
+        // (1) literal-then-field: the S4 oracle shape. Content-Length = 14 (literal,
+        // compile-time) + path length (runtime, r14) — two paths on the SAME server
+        // prove the length is per-request runtime, not precomputed.
+        let r = run_concat("litfield", "concat(\"you asked for \", req.path)", "[req.path]", &[
+            b"GET /foo HTTP/1.0\r\n\r\n",
+            b"GET /a HTTP/1.0\r\n\r\n",
+        ]);
+        assert_eq!(r[0], b"HTTP/1.0 200 OK\r\nContent-Length: 18\r\n\r\nyou asked for /foo",
+            "GET /foo -> {:?}", String::from_utf8_lossy(&r[0]));
+        assert_eq!(r[1], b"HTTP/1.0 200 OK\r\nContent-Length: 16\r\n\r\nyou asked for /a",
+            "GET /a (same server) -> {:?}", String::from_utf8_lossy(&r[1]));
+
+        // (2) field-THEN-literal: the args stream in SOURCE order, field first.
+        let f = run_concat("fieldlit", "concat(req.path, \" ok\")", "[req.path]",
+            &[b"GET /foo HTTP/1.0\r\n\r\n"]);
+        assert_eq!(f[0], b"HTTP/1.0 200 OK\r\nContent-Length: 7\r\n\r\n/foo ok",
+            "field-then-literal -> {:?}", String::from_utf8_lossy(&f[0]));
+
+        // (3) req.method variant: the other field-select arm, runtime length tracks
+        // the method (GET 3 vs POST 4).
+        let m = run_concat("method", "concat(\"m=\", req.method)", "[req.method]", &[
+            b"GET / HTTP/1.0\r\n\r\n",
+            b"POST / HTTP/1.0\r\n\r\n",
+        ]);
+        assert_eq!(m[0], b"HTTP/1.0 200 OK\r\nContent-Length: 5\r\n\r\nm=GET",
+            "GET method -> {:?}", String::from_utf8_lossy(&m[0]));
+        assert_eq!(m[1], b"HTTP/1.0 200 OK\r\nContent-Length: 6\r\n\r\nm=POST",
+            "POST method -> {:?}", String::from_utf8_lossy(&m[1]));
+
+        // (4) literal-field-literal (3 args): each AstStr arg gets its OWN
+        // jmp-over-data block; ordering and sizing must both hold.
+        let t = run_concat("threearg", "concat(\"[\", req.path, \"]\")", "[req.path]",
+            &[b"GET /x HTTP/1.0\r\n\r\n"]);
+        assert_eq!(t[0], b"HTTP/1.0 200 OK\r\nContent-Length: 4\r\n\r\n[/x]",
+            "lit-field-lit -> {:?}", String::from_utf8_lossy(&t[0]));
+
+        // (5) parse-fail resilience: the recomputed parse-fail jumps land on the S4
+        // close tail — a malformed request is dropped and the server keeps serving.
+        let z = run_concat("parsefail", "concat(\"p=\", req.path)", "[req.path]", &[
+            b"ZZZZ\r\n\r\n",
+            b"GET /ok HTTP/1.0\r\n\r\n",
+        ]);
+        assert!(z[0].is_empty(),
+            "malformed request must drop the connection (empty response); got {:?}", z[0]);
+        assert_eq!(z[1], b"HTTP/1.0 200 OK\r\nContent-Length: 5\r\n\r\np=/ok",
+            "server must keep serving after a malformed request; got {:?}",
+            String::from_utf8_lossy(&z[1]));
+
+        let _ = fs::remove_file(&elf);
+    }
+
     /// SELF-HOSTING SERVICE slice 1 — verify gate pins. The self-hosted emitter's
     /// leading abort_if(verrs) refuses (exit 1, empty stdout) every service audit
     /// violation; a clean hello_http emits an ELF.
@@ -24140,9 +24273,42 @@ rule le64_neg
         // req field, else the field-select would run on a literal = a spurious compare).
         refuse(&mkrb("resp = if \"a\" == \"/\" then HttpResponse { status: 200, body: \"a\" } else HttpResponse { status: 404, body: \"b\" }",
             "[]", "8", &svc("http_1_0", "18888", "4096", "hello_handler")), "AstStr cond LHS");
-        // (g) non-literal (concat) body -> refused (S4).
-        refuse(&mkr("resp = HttpResponse { status: 200, body: concat(\"a\", req.path) }",
-            "[req.path]", &svc("http_1_0", "18888", "4096", "hello_handler")), "concat handler body (S4)");
+        // (g) SLICE 4: a concat body of literals + EXACTLY ONE req field now EMITS
+        // (was refused pre-S4). Bound 8 (concat + field ops exceed the S1/S2 bound 1).
+        let s4_concat = mkrb("resp = HttpResponse { status: 200, body: concat(\"a\", req.path) }",
+            "[req.path]", "8", &svc("http_1_0", "18888", "4096", "hello_handler"));
+        let s4o = run(&s4_concat);
+        assert!(s4o.status.success() && s4o.stdout.len() >= 4 && &s4o.stdout[0..4] == b"\x7fELF",
+            "S4 concat body must emit; got {:?} stderr={:?}", s4o.status, String::from_utf8_lossy(&s4o.stderr));
+        // (g2) field-FIRST arg order also emits (args stream in source order).
+        let s4f = run(&mkrb("resp = HttpResponse { status: 200, body: concat(req.method, \" was used\") }",
+            "[req.method]", "8", &svc("http_1_0", "18888", "4096", "hello_handler")));
+        assert!(s4f.status.success() && s4f.stdout.len() >= 4 && &s4f.stdout[0..4] == b"\x7fELF",
+            "S4 field-first concat must emit; got {:?}", s4f.status);
+        // (g3) SLICE 4: zero-field all-literal concat -> refused (constant body ->
+        // use a string-literal body, the S1 shape; the field-select would otherwise
+        // run with no field arg -> garbage rbx/r14).
+        refuse(&mkrb("resp = HttpResponse { status: 200, body: concat(\"a\", \"b\") }",
+            "[]", "8", &svc("http_1_0", "18888", "4096", "hello_handler")), "zero-field concat -> S1");
+        // (g4) SLICE 4: a number arg -> refused (no itoa slot in the S4 body stream).
+        refuse(&mkrb("resp = HttpResponse { status: 200, body: concat(req.path, 42) }",
+            "[req.path]", "8", &svc("http_1_0", "18888", "4096", "hello_handler")), "number arg in concat");
+        // (g5) SLICE 4: nested concat -> refused.
+        refuse(&mkrb("resp = HttpResponse { status: 200, body: concat(\"a\", concat(\"b\", req.path)) }",
+            "[req.path]", "8", &svc("http_1_0", "18888", "4096", "hello_handler")), "nested concat");
+        // (g6) SLICE 4: >= 2 field args -> refused (one rbx/r14 pair; S4.1 lifts).
+        refuse(&mkrb("resp = HttpResponse { status: 200, body: concat(req.method, \" \", req.path) }",
+            "[req.method, req.path]", "8", &svc("http_1_0", "18888", "4096", "hello_handler")), ">= 2 field args -> S4.1");
+        // (g7) SLICE 4: req.body arg -> refused (only method|path parse off the wire).
+        refuse(&mkrb("resp = HttpResponse { status: 200, body: concat(\"x\", req.body) }",
+            "[req.body]", "8", &svc("http_1_0", "18888", "4096", "hello_handler")), "req.body arg in concat");
+        // (g8) SLICE 4: a non-concat call -> refused (span_is_concat callee check).
+        refuse(&mkrb("resp = HttpResponse { status: 200, body: somecall(\"a\", req.path) }",
+            "[req.path]", "8", &svc("http_1_0", "18888", "4096", "hello_handler")), "non-concat call body");
+        // (g9) SLICE 4: computed status with a concat body -> refused (status must
+        // stay an AstNum literal).
+        refuse(&mkrb("resp = HttpResponse { status: if req.path == \"/\" then 200 else 404, body: concat(\"p=\", req.path) }",
+            "[req.path]", "8", &svc("http_1_0", "18888", "4096", "hello_handler")), "computed status with concat body");
         // (h) let-bound handler.
         refuse(&mk("let x = 200\n    resp = HttpResponse { status: 200, body: \"Hi\" }",
             &svc("http_1_0", "18888", "4096", "hello_handler")), "let in handler");
