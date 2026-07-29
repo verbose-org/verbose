@@ -13316,8 +13316,118 @@ rule svc_field_ok
       bound : 64
 
 
--- svc_body_ok (self-hosting-service-slice-2): 1 iff the handler response body is a
--- valid S2 body. Two accepted shapes:
+-- SvcCArgsState (self-hosting-service-slice-4): the remaining concat args + source +
+-- the handler input param name span, for the S4 per-arg shape/count walks.
+concept SvcCArgsState
+  @intention: "The remaining handler concat args + source + the handler input param name span, for the slice-4 arg walks"
+  @source: vexprparse.intent:74
+  fields:
+    args : ArgList
+    src : text [..256]
+    pname_start : number [0, 4000000]
+    pname_len : number [0, 4000000]
+
+
+-- svc_cargs_shape_ok (self-hosting-service-slice-4): 1 iff EVERY concat arg is an
+-- AstStr literal OR a valid req field (svc_field_ok: AstField(AstVar(input-param),
+-- method|path)). Number args, nested concat, non-concat calls, req.body, non-param
+-- bases all fail both -> 0. Mentions its recursion ONCE (lazy if); ArgNil -> 1.
+rule svc_cargs_shape_ok
+  @intention: "1 if every handler concat arg is a string literal or a req method|path field, 0 otherwise"
+  @source: vexprparse.intent:74
+  input:
+    sa : SvcCArgsState
+  output:
+    out : number
+  logic:
+    out = match sa.args:
+      ArgCons(head, tail) => if (if ast_is_str(head) == 1 then 1 else svc_field_ok(SvcBodyState { body: head, src: sa.src, pname_start: sa.pname_start, pname_len: sa.pname_len })) == 1 then svc_cargs_shape_ok(SvcCArgsState { args: tail, src: sa.src, pname_start: sa.pname_start, pname_len: sa.pname_len }) else 0
+      ArgNil => 1
+  proofs:
+    purity:
+      reads : [sa.args, sa.src, sa.pname_start, sa.pname_len]
+      calls : [ast_is_str, svc_field_ok, svc_cargs_shape_ok]
+    termination:
+      bound : 512
+
+
+-- svc_cargs_field_count (self-hosting-service-slice-4): the number of concat args
+-- that ARE valid req fields (svc_field_ok). The MUST-FIX-5 field-COUNT accumulator
+-- (the rx_cargs_ok template checks every-arg-ok only — no counter): S4's emit
+-- selects EXACTLY ONE field into rbx/r14, so the shape gate demands count == 1.
+-- Zero-field all-literal concat (`concat("a","b")`) is REFUSED (constant body ->
+-- use a string-literal body, the S1 shape); >= 2 field args defer to S4.1.
+rule svc_cargs_field_count
+  @intention: "Number of handler concat args that are valid req method|path fields"
+  @source: vexprparse.intent:74
+  input:
+    sa : SvcCArgsState
+  output:
+    out : number
+  logic:
+    out = match sa.args:
+      ArgCons(head, tail) => svc_field_ok(SvcBodyState { body: head, src: sa.src, pname_start: sa.pname_start, pname_len: sa.pname_len }) + svc_cargs_field_count(SvcCArgsState { args: tail, src: sa.src, pname_start: sa.pname_start, pname_len: sa.pname_len })
+      ArgNil => 0
+  proofs:
+    purity:
+      reads : [sa.args, sa.src, sa.pname_start, sa.pname_len]
+      calls : [svc_field_ok, svc_cargs_field_count]
+    termination:
+      bound : 512
+
+
+-- svc_concat_ok (self-hosting-service-slice-4): 1 iff the handler response body is
+-- the S4 concat shape — an AstCall whose callee spells "concat" (span_is_concat: a
+-- non-concat call is refused), EVERY arg an AstStr or a req method|path field
+-- (svc_cargs_shape_ok), and EXACTLY ONE arg a field (svc_cargs_field_count == 1).
+-- AstErr — the sentinel and the unparseable marker — is refused explicitly (0 arm),
+-- as is every non-call shape. Acceptance parity with the S4 emit branch holds by
+-- construction: x86_svc_carg lowers exactly AstStr + AstField, nothing else.
+rule svc_concat_ok
+  @intention: "1 if the handler body is concat(...) of literals + exactly one req method|path field, 0 otherwise"
+  @source: vexprparse.intent:74
+  input:
+    sb : SvcBodyState
+  output:
+    out : number
+  logic:
+    out = match sb.body:
+      AstNum(value) => 0
+      AstBin(op, lhs, rhs) => 0
+      AstNeg(inner) => 0
+      AstNot(inner) => 0
+      AstVar(start, len) => 0
+      AstField(base, fstart, flen) => 0
+      AstCall(callee_start, callee_len, args) => if span_is_concat(SpanCheck { src: sb.src, start: callee_start, len: callee_len }) == 1 and (svc_cargs_shape_ok(SvcCArgsState { args: args, src: sb.src, pname_start: sb.pname_start, pname_len: sb.pname_len }) == 1 and svc_cargs_field_count(SvcCArgsState { args: args, src: sb.src, pname_start: sb.pname_start, pname_len: sb.pname_len }) == 1) then 1 else 0
+      AstStr(start, len) => 0
+      AstBytes(start, len) => 0
+      AstBool(value) => 0
+      AstIf(cond, thn, els) => 0
+      AstErr => 0
+      AstVariant(cstart, clen, vstart, vlen, fields) => 0
+      AstMatch(scrut, arms) => 0
+      AstOk(inner) => 0
+      AstResErr(inner) => 0
+      AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => 0
+      AstSum(coll, item_start, item_len, body) => 0
+      AstCount(coll, item_start, item_len, body) => 0
+      AstFold(coll, init, acc_start, acc_len, item_start, item_len, body) => 0
+      AstAll(coll, item_start, item_len, body) => 0
+      AstAny(coll, item_start, item_len, body) => 0
+      AstMap(coll, item_start, item_len, body) => 0
+      AstFilter(coll, item_start, item_len, body) => 0
+      AstMinFold(coll, item_start, item_len, body) => 0
+      AstMaxFold(coll, item_start, item_len, body) => 0
+  proofs:
+    purity:
+      reads : [sb.body, sb.src, sb.pname_start, sb.pname_len]
+      calls : [span_is_concat, svc_cargs_shape_ok, svc_cargs_field_count]
+    termination:
+      bound : 64
+
+
+-- svc_body_ok (self-hosting-service-slice-2, widened by slice-4): 1 iff the handler
+-- response body is a valid body. Three accepted shapes:
 --   (a) AstStr — the constant-response S1 body (unchanged).
 --   (b) AstField(AstVar(<input param>), method|path) — the slice-2 echo body. The
 --       base MUST be an AstVar whose span byte-matches the handler's input param name
@@ -13325,10 +13435,13 @@ rule svc_field_ok
 --       match "method" or "path" (unknown field refused, awaiting S3+). The synthetic
 --       HttpRequest fields carry bogus name spans (the verifier only resolves the
 --       concept NAME), so field resolution is by BYTE-MATCH, not field_index_of.
--- Any other body (concat -> S4, if/else -> S3, req.body, computed status) fails both
--- shapes -> 0 -> service_errors refuses with the shape-error contribution.
+--   (c) concat(...) of AstStr literals + EXACTLY ONE req method|path field — the
+--       slice-4 computed body (svc_concat_ok).
+-- Any other body (if/else arm bodies stay literal-only via svc_arm_ok, req.body,
+-- computed status) fails all three -> 0 -> service_errors refuses with the
+-- shape-error contribution.
 rule svc_body_ok
-  @intention: "1 if the handler response body is a valid slice-2 body (AstStr or AstField(req, method|path)), 0 otherwise"
+  @intention: "1 if the handler response body is a valid body (AstStr, AstField(req, method|path), or slice-4 concat), 0 otherwise"
   @source: vexprparse.intent:74
   input:
     sb : SvcBodyState
@@ -13336,11 +13449,11 @@ rule svc_body_ok
     out : number
   logic:
     let is_str = ast_is_str(sb.body)
-    out = if is_str == 1 then 1 else svc_field_ok(sb)
+    out = if is_str == 1 then 1 else if svc_field_ok(sb) == 1 then 1 else svc_concat_ok(sb)
   proofs:
     purity:
       reads : [sb.body, sb]
-      calls : [ast_is_str, svc_field_ok]
+      calls : [ast_is_str, svc_field_ok, svc_concat_ok]
     termination:
       bound : 64
 
