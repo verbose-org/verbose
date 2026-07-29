@@ -13316,8 +13316,118 @@ rule svc_field_ok
       bound : 64
 
 
--- svc_body_ok (self-hosting-service-slice-2): 1 iff the handler response body is a
--- valid S2 body. Two accepted shapes:
+-- SvcCArgsState (self-hosting-service-slice-4): the remaining concat args + source +
+-- the handler input param name span, for the S4 per-arg shape/count walks.
+concept SvcCArgsState
+  @intention: "The remaining handler concat args + source + the handler input param name span, for the slice-4 arg walks"
+  @source: vexprparse.intent:74
+  fields:
+    args : ArgList
+    src : text [..256]
+    pname_start : number [0, 4000000]
+    pname_len : number [0, 4000000]
+
+
+-- svc_cargs_shape_ok (self-hosting-service-slice-4): 1 iff EVERY concat arg is an
+-- AstStr literal OR a valid req field (svc_field_ok: AstField(AstVar(input-param),
+-- method|path)). Number args, nested concat, non-concat calls, req.body, non-param
+-- bases all fail both -> 0. Mentions its recursion ONCE (lazy if); ArgNil -> 1.
+rule svc_cargs_shape_ok
+  @intention: "1 if every handler concat arg is a string literal or a req method|path field, 0 otherwise"
+  @source: vexprparse.intent:74
+  input:
+    sa : SvcCArgsState
+  output:
+    out : number
+  logic:
+    out = match sa.args:
+      ArgCons(head, tail) => if (if ast_is_str(head) == 1 then 1 else svc_field_ok(SvcBodyState { body: head, src: sa.src, pname_start: sa.pname_start, pname_len: sa.pname_len })) == 1 then svc_cargs_shape_ok(SvcCArgsState { args: tail, src: sa.src, pname_start: sa.pname_start, pname_len: sa.pname_len }) else 0
+      ArgNil => 1
+  proofs:
+    purity:
+      reads : [sa.args, sa.src, sa.pname_start, sa.pname_len]
+      calls : [ast_is_str, svc_field_ok, svc_cargs_shape_ok]
+    termination:
+      bound : 512
+
+
+-- svc_cargs_field_count (self-hosting-service-slice-4): the number of concat args
+-- that ARE valid req fields (svc_field_ok). The MUST-FIX-5 field-COUNT accumulator
+-- (the rx_cargs_ok template checks every-arg-ok only — no counter): S4's emit
+-- selects EXACTLY ONE field into rbx/r14, so the shape gate demands count == 1.
+-- Zero-field all-literal concat (`concat("a","b")`) is REFUSED (constant body ->
+-- use a string-literal body, the S1 shape); >= 2 field args defer to S4.1.
+rule svc_cargs_field_count
+  @intention: "Number of handler concat args that are valid req method|path fields"
+  @source: vexprparse.intent:74
+  input:
+    sa : SvcCArgsState
+  output:
+    out : number
+  logic:
+    out = match sa.args:
+      ArgCons(head, tail) => svc_field_ok(SvcBodyState { body: head, src: sa.src, pname_start: sa.pname_start, pname_len: sa.pname_len }) + svc_cargs_field_count(SvcCArgsState { args: tail, src: sa.src, pname_start: sa.pname_start, pname_len: sa.pname_len })
+      ArgNil => 0
+  proofs:
+    purity:
+      reads : [sa.args, sa.src, sa.pname_start, sa.pname_len]
+      calls : [svc_field_ok, svc_cargs_field_count]
+    termination:
+      bound : 512
+
+
+-- svc_concat_ok (self-hosting-service-slice-4): 1 iff the handler response body is
+-- the S4 concat shape — an AstCall whose callee spells "concat" (span_is_concat: a
+-- non-concat call is refused), EVERY arg an AstStr or a req method|path field
+-- (svc_cargs_shape_ok), and EXACTLY ONE arg a field (svc_cargs_field_count == 1).
+-- AstErr — the sentinel and the unparseable marker — is refused explicitly (0 arm),
+-- as is every non-call shape. Acceptance parity with the S4 emit branch holds by
+-- construction: x86_svc_carg lowers exactly AstStr + AstField, nothing else.
+rule svc_concat_ok
+  @intention: "1 if the handler body is concat(...) of literals + exactly one req method|path field, 0 otherwise"
+  @source: vexprparse.intent:74
+  input:
+    sb : SvcBodyState
+  output:
+    out : number
+  logic:
+    out = match sb.body:
+      AstNum(value) => 0
+      AstBin(op, lhs, rhs) => 0
+      AstNeg(inner) => 0
+      AstNot(inner) => 0
+      AstVar(start, len) => 0
+      AstField(base, fstart, flen) => 0
+      AstCall(callee_start, callee_len, args) => if span_is_concat(SpanCheck { src: sb.src, start: callee_start, len: callee_len }) == 1 and (svc_cargs_shape_ok(SvcCArgsState { args: args, src: sb.src, pname_start: sb.pname_start, pname_len: sb.pname_len }) == 1 and svc_cargs_field_count(SvcCArgsState { args: args, src: sb.src, pname_start: sb.pname_start, pname_len: sb.pname_len }) == 1) then 1 else 0
+      AstStr(start, len) => 0
+      AstBytes(start, len) => 0
+      AstBool(value) => 0
+      AstIf(cond, thn, els) => 0
+      AstErr => 0
+      AstVariant(cstart, clen, vstart, vlen, fields) => 0
+      AstMatch(scrut, arms) => 0
+      AstOk(inner) => 0
+      AstResErr(inner) => 0
+      AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => 0
+      AstSum(coll, item_start, item_len, body) => 0
+      AstCount(coll, item_start, item_len, body) => 0
+      AstFold(coll, init, acc_start, acc_len, item_start, item_len, body) => 0
+      AstAll(coll, item_start, item_len, body) => 0
+      AstAny(coll, item_start, item_len, body) => 0
+      AstMap(coll, item_start, item_len, body) => 0
+      AstFilter(coll, item_start, item_len, body) => 0
+      AstMinFold(coll, item_start, item_len, body) => 0
+      AstMaxFold(coll, item_start, item_len, body) => 0
+  proofs:
+    purity:
+      reads : [sb.body, sb.src, sb.pname_start, sb.pname_len]
+      calls : [span_is_concat, svc_cargs_shape_ok, svc_cargs_field_count]
+    termination:
+      bound : 64
+
+
+-- svc_body_ok (self-hosting-service-slice-2, widened by slice-4): 1 iff the handler
+-- response body is a valid body. Three accepted shapes:
 --   (a) AstStr — the constant-response S1 body (unchanged).
 --   (b) AstField(AstVar(<input param>), method|path) — the slice-2 echo body. The
 --       base MUST be an AstVar whose span byte-matches the handler's input param name
@@ -13325,10 +13435,13 @@ rule svc_field_ok
 --       match "method" or "path" (unknown field refused, awaiting S3+). The synthetic
 --       HttpRequest fields carry bogus name spans (the verifier only resolves the
 --       concept NAME), so field resolution is by BYTE-MATCH, not field_index_of.
--- Any other body (concat -> S4, if/else -> S3, req.body, computed status) fails both
--- shapes -> 0 -> service_errors refuses with the shape-error contribution.
+--   (c) concat(...) of AstStr literals + EXACTLY ONE req method|path field — the
+--       slice-4 computed body (svc_concat_ok).
+-- Any other body (if/else arm bodies stay literal-only via svc_arm_ok, req.body,
+-- computed status) fails all three -> 0 -> service_errors refuses with the
+-- shape-error contribution.
 rule svc_body_ok
-  @intention: "1 if the handler response body is a valid slice-2 body (AstStr or AstField(req, method|path)), 0 otherwise"
+  @intention: "1 if the handler response body is a valid body (AstStr, AstField(req, method|path), or slice-4 concat), 0 otherwise"
   @source: vexprparse.intent:74
   input:
     sb : SvcBodyState
@@ -13336,11 +13449,11 @@ rule svc_body_ok
     out : number
   logic:
     let is_str = ast_is_str(sb.body)
-    out = if is_str == 1 then 1 else svc_field_ok(sb)
+    out = if is_str == 1 then 1 else if svc_field_ok(sb) == 1 then 1 else svc_concat_ok(sb)
   proofs:
     purity:
       reads : [sb.body, sb]
-      calls : [ast_is_str, svc_field_ok]
+      calls : [ast_is_str, svc_field_ok, svc_concat_ok]
     termination:
       bound : 64
 
@@ -27530,6 +27643,233 @@ rule service_response_blob
       bound : 8000
 
 
+-- ============================================================================
+-- SELF-HOSTING SERVICE slice 4 — the concat-body per-arg walks. TWO HAND-SYNCED
+-- WALKS (the rx_cargs_size / x86_rx_cargs precedent — "mirrors arm-for-arm so
+-- size and emit cannot drift"): svc_carg_size / svc_cargs_size (numbers, feed
+-- service_tramp_size -> blob_end_off -> p_filesz) and x86_svc_carg /
+-- x86_svc_cargs (bytes, the emitted per-arg writes). Per-arg closed forms:
+--   AstStr  -> 31 + 4*((declen+3)/4): `e9` jmp over the 4-padded decoded data
+--              (its OWN jmp-over-data, the S3 l4 shape), then write(r13, data,
+--              declen) — x86_svc_lit_block, the fd=r13 mirror of x86_rx_lit_block.
+--   AstField -> 18: write(r13, rbx, r14) — the parsed field span selected by the
+--              S4 field-select, verbatim S2's body write.
+-- Every other shape -> 0 / b"" arm-for-arm (refused by svc_concat_ok, so under
+-- the abort_if gate a refused arg never reaches the emitted output).
+-- ============================================================================
+
+-- svc_field_arg: the FIRST non-AstStr arg of a concat's argument list (AstErr when
+-- none). Under the verified S4 shape (svc_cargs_shape_ok + field count == 1) that
+-- arg IS the single req field — the emit drives is_method from ITS AstField spans
+-- (the S3 lesson: never key the field-select off a node of the wrong shape).
+rule svc_field_arg
+  @intention: "The first non-literal arg of an argument list (the S4 concat's single req field), AstErr if none"
+  @source: vexprparse.intent:74
+  input:
+    al : ArgList
+  output:
+    out : Ast
+  logic:
+    out = match al:
+      ArgCons(head, tail) => if ast_is_str(head) == 1 then svc_field_arg(tail) else head
+      ArgNil => Ast::AstErr
+  proofs:
+    purity:
+      reads : [al]
+      calls : [ast_is_str, svc_field_arg]
+    termination:
+      bound : 512
+      structural : al
+
+
+-- svc_cargs_lit_len: the compile-time Content-Length constant — the sum of the
+-- DECODED lengths of the AstStr args (non-literal args contribute 0; the single
+-- field arg's runtime length is added as r14 by the emitted `add rax, r14`).
+rule svc_cargs_lit_len
+  @intention: "Sum of decoded lengths of the literal args of a handler concat (the compile-time Content-Length term)"
+  @source: vexprparse.intent:74
+  input:
+    ra : RxCArgsState
+  output:
+    out : number
+  logic:
+    out = match ra.args:
+      ArgCons(head, tail) => (if ast_is_str(head) == 1 then bytelit_decoded_len(DecodeState { src: ra.src, start: ast_str_start(head) + 1, len: (if ast_str_len(head) >= 2 then ast_str_len(head) - 2 else 0), i: 0 }) else 0) + svc_cargs_lit_len(RxCArgsState { args: tail, src: ra.src })
+      ArgNil => 0
+  proofs:
+    purity:
+      reads : [ra.args, ra.src]
+      calls : [ast_is_str, ast_str_start, ast_str_len, bytelit_decoded_len, svc_cargs_lit_len]
+    termination:
+      bound : 512
+
+
+-- svc_carg_size: the block size of ONE handler concat arg. AstStr -> the literal
+-- block (rx_lit_block_size: 31 + the 4-padded decoded length — x86_svc_lit_block's
+-- exact closed form); AstField -> the fixed 18-byte write(r13, rbx, r14); every
+-- other shape -> 0 (mirrored by x86_svc_carg's b"" arm-for-arm).
+rule svc_carg_size
+  @intention: "Block size of one handler concat arg: literal block for AstStr, 18 for AstField, 0 otherwise"
+  @source: vexprparse.intent:74
+  input:
+    rc : RxContentState
+  output:
+    out : number
+  logic:
+    out = match rc.node:
+      AstNum(value) => 0
+      AstBin(op, lhs, rhs) => 0
+      AstNeg(inner) => 0
+      AstNot(inner) => 0
+      AstVar(start, len) => 0
+      AstField(base, fstart, flen) => 18
+      AstCall(callee_start, callee_len, args) => 0
+      AstStr(start, len) => rx_lit_block_size(SpanCheck { src: rc.src, start: start, len: len })
+      AstBytes(start, len) => 0
+      AstBool(value) => 0
+      AstIf(cond, thn, els) => 0
+      AstErr => 0
+      AstVariant(cstart, clen, vstart, vlen, fields) => 0
+      AstMatch(scrut, arms) => 0
+      AstOk(inner) => 0
+      AstResErr(inner) => 0
+      AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => 0
+      AstSum(coll, item_start, item_len, body) => 0
+      AstCount(coll, item_start, item_len, body) => 0
+      AstFold(coll, init, acc_start, acc_len, item_start, item_len, body) => 0
+      AstAll(coll, item_start, item_len, body) => 0
+      AstAny(coll, item_start, item_len, body) => 0
+      AstMap(coll, item_start, item_len, body) => 0
+      AstFilter(coll, item_start, item_len, body) => 0
+      AstMinFold(coll, item_start, item_len, body) => 0
+      AstMaxFold(coll, item_start, item_len, body) => 0
+  proofs:
+    purity:
+      reads : [rc.node, rc.src]
+      calls : [rx_lit_block_size]
+    termination:
+      bound : 64
+
+
+-- svc_cargs_size: the total block size of a handler concat's args, in order.
+-- Mentions its recursion ONCE; ArgNil -> 0 (tolerant base — the SvNil sentinel and
+-- every non-concat body reach this with ArgNil under eager lets).
+rule svc_cargs_size
+  @intention: "Total block byte length of a handler concat's args, in order"
+  @source: vexprparse.intent:74
+  input:
+    ra : RxCArgsState
+  output:
+    out : number
+  logic:
+    out = match ra.args:
+      ArgCons(head, tail) => svc_carg_size(RxContentState { node: head, src: ra.src }) + svc_cargs_size(RxCArgsState { args: tail, src: ra.src })
+      ArgNil => 0
+  proofs:
+    purity:
+      reads : [ra.args, ra.src]
+      calls : [svc_carg_size, svc_cargs_size]
+    termination:
+      bound : 512
+
+
+-- x86_svc_lit_block: emit ONE inline literal body block to the CLIENT fd — the
+-- fd=r13 mirror of x86_rx_lit_block (same encodings, `4c 89 ef` mov rdi,r13 in
+-- place of `48 89 df` mov rdi,rbx — 3 B, size-stable): `e9` jmp over the 4-padded
+-- decoded data, then mov rax,1 (7-byte form), mov rdi,r13 (3), lea rsi rip-rel
+-- (7, disp -(block + 17) where 17 = 7+3+7), mov rdx = dlen (7), syscall (2).
+-- The write length is dlen (decoded), skipping the 4-byte padding. Input span =
+-- the AstStr TOKEN span (quotes included). Size = 31 + block (rx_lit_block_size).
+rule x86_svc_lit_block
+  @intention: "Emit one inline literal body block: jmp-over-data + write(r13, data, dlen)"
+  @source: vexprparse.intent:74
+  input:
+    sc : SpanCheck
+  output:
+    out : bytes
+  logic:
+    let dlen = bytelit_decoded_len(DecodeState { src: sc.src, start: sc.start + 1, len: (if sc.len >= 2 then sc.len - 2 else 0), i: 0 })
+    let block = 4 * ((dlen + 3) / 4)
+    out = concat(b"\xe9", le32(block), emit_bytes_data(BytesEmitState { src: sc.src, start: sc.start + 1, len: (if sc.len >= 2 then sc.len - 2 else 0), i: 0, dlen: dlen }), b"\x48\xc7\xc0\x01\x00\x00\x00\x4c\x89\xef\x48\x8d\x35", le32(0 - (block + 17)), b"\x48\xc7\xc2", le32(dlen), b"\x0f\x05")
+  proofs:
+    purity:
+      reads : [sc.src, sc.start, sc.len]
+      calls : [bytelit_decoded_len, emit_bytes_data]
+    termination:
+      bound : 64
+
+
+-- x86_svc_carg: emit the block for ONE handler concat arg. AstStr -> the literal
+-- block (x86_svc_lit_block); AstField -> the 18-byte write(r13, rbx, r14) — the
+-- parsed field span the S4 field-select left in rbx/r14, verbatim S2's body write.
+-- Every other shape -> b"" (mirrors svc_carg_size's 0 arm-for-arm; refused by
+-- svc_concat_ok, unreachable under the abort_if gate).
+rule x86_svc_carg
+  @intention: "Emit one handler concat arg block: literal block for AstStr, write(r13, rbx, r14) for AstField, empty otherwise"
+  @source: vexprparse.intent:74
+  input:
+    rc : RxContentState
+  output:
+    out : bytes
+  logic:
+    out = match rc.node:
+      AstNum(value) => b""
+      AstBin(op, lhs, rhs) => b""
+      AstNeg(inner) => b""
+      AstNot(inner) => b""
+      AstVar(start, len) => b""
+      AstField(base, fstart, flen) => b"\x48\xc7\xc0\x01\x00\x00\x00\x4c\x89\xef\x48\x89\xde\x4c\x89\xf2\x0f\x05"
+      AstCall(callee_start, callee_len, args) => b""
+      AstStr(start, len) => x86_svc_lit_block(SpanCheck { src: rc.src, start: start, len: len })
+      AstBytes(start, len) => b""
+      AstBool(value) => b""
+      AstIf(cond, thn, els) => b""
+      AstErr => b""
+      AstVariant(cstart, clen, vstart, vlen, fields) => b""
+      AstMatch(scrut, arms) => b""
+      AstOk(inner) => b""
+      AstResErr(inner) => b""
+      AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => b""
+      AstSum(coll, item_start, item_len, body) => b""
+      AstCount(coll, item_start, item_len, body) => b""
+      AstFold(coll, init, acc_start, acc_len, item_start, item_len, body) => b""
+      AstAll(coll, item_start, item_len, body) => b""
+      AstAny(coll, item_start, item_len, body) => b""
+      AstMap(coll, item_start, item_len, body) => b""
+      AstFilter(coll, item_start, item_len, body) => b""
+      AstMinFold(coll, item_start, item_len, body) => b""
+      AstMaxFold(coll, item_start, item_len, body) => b""
+  proofs:
+    purity:
+      reads : [rc.node, rc.src]
+      calls : [x86_svc_lit_block]
+    termination:
+      bound : 64
+
+
+-- x86_svc_cargs: emit each handler concat arg's block, in source order (one write
+-- per arg to the client fd; verbosec builds one buffer + one write — only the
+-- observable server WIRE bytes must match, the S1 precedent). Mentions its
+-- recursion ONCE; ArgNil -> b"" (tolerant base).
+rule x86_svc_cargs
+  @intention: "Emit the handler body blocks for a concat's args, in source order"
+  @source: vexprparse.intent:74
+  input:
+    ra : RxCArgsState
+  output:
+    out : bytes
+  logic:
+    out = match ra.args:
+      ArgCons(head, tail) => concat(x86_svc_carg(RxContentState { node: head, src: ra.src }), x86_svc_cargs(RxCArgsState { args: tail, src: ra.src }))
+      ArgNil => b""
+  proofs:
+    purity:
+      reads : [ra.args, ra.src]
+      calls : [x86_svc_carg, x86_svc_cargs]
+    termination:
+      bound : 512
+
+
 -- ServiceTrampSizeState / service_tramp_size: the EXACT byte length of the accept
 -- loop = 224 fixed (startup 137 + accept 21 + read 18 + jmp-over 5 + write 26 +
 -- close 12 + back-jmp 5) + the 4-padded response block. The ONE sizing truth
@@ -27591,13 +27931,27 @@ rule service_tramp_size
     let bodyB_len = if ast_str_len(bodyB_ast) >= 2 then ast_str_len(bodyB_ast) - 2 else 0
     let rlenB = response_len(ServiceRespState { status: statusB, body_start: bodyB_start, body_len: bodyB_len, src: ss.src })
     let blockB = 4 * ((rlenB + 3) / 4)
+    -- Slice 4 sizing (concat body, discriminated by arg_list_len(ast_call_args) > 0
+    -- — 1+ for AstCall(concat), 0 for AstField whose ast_call_args is ArgNil; MUST
+    -- come AFTER the ast_is_if fork, an AstIf's body_ast is AstErr -> ArgNil). The
+    -- S4 serializer accept loop = 596 fixed (startup 137 + accept 21 + read 18 +
+    -- parse 82 + field-select 9 + "HTTP/1.0 " write 43 + status mov 7 + itoa 81 +
+    -- " OK\r\nContent-Length: " write 55 + CL mov 7 + add-r14 3 + itoa 81 +
+    -- "\r\n\r\n" write 35 + close 12 + back-jmp 5) + the per-arg blocks
+    -- (svc_cargs_size — the hand-synced sibling of x86_svc_cargs). Every term a
+    -- compile-time constant. This IS the one-truth blob_end_off adds and
+    -- x86_service_tramp emits — a one-byte drift truncates p_filesz -> the server
+    -- SIGSEGVs on spawn. See docs/self-hosting-service-slice4-design.md.
+    let cargs4 = ast_call_args(body_ast)
+    let csize4 = svc_cargs_size(RxCArgsState { args: cargs4, src: ss.src })
     -- AstStr body -> S1 (224 + response). AstIf result -> S3 (395 + L4 + blockA + blockB).
-    -- Otherwise (AstField body) -> S2 (607). Both copies fork identically.
-    out = if ast_is_str(body_ast) == 1 then (224 + 4 * ((rlen + 3) / 4)) else if ast_is_if(hresult) == 1 then (395 + l4 + blockA + blockB) else 607
+    -- Concat body -> S4 (596 + per-arg blocks). Otherwise (AstField body) -> S2 (607).
+    -- Both copies fork identically.
+    out = if ast_is_str(body_ast) == 1 then (224 + 4 * ((rlen + 3) / 4)) else if ast_is_if(hresult) == 1 then (395 + l4 + blockA + blockB) else if arg_list_len(cargs4) > 0 then (596 + csize4) else 607
   proofs:
     purity:
       reads : [ss.svcs, ss.prog, ss.src]
-      calls : [svc_head, find_rule, svc_handler_start, svc_handler_len, ast_variant_fields, block_result, rd_body, ast_num_value, vf_head_val, vf_tail, ast_str_start, ast_str_len, response_len, ast_is_str, ast_is_if, ast_if_cond, ast_bin_rhs, bytelit_decoded_len, ast_if_then, ast_if_else]
+      calls : [svc_head, find_rule, svc_handler_start, svc_handler_len, ast_variant_fields, block_result, rd_body, ast_num_value, vf_head_val, vf_tail, ast_str_start, ast_str_len, response_len, ast_is_str, ast_is_if, ast_if_cond, ast_bin_rhs, bytelit_decoded_len, ast_if_then, ast_if_else, ast_call_args, arg_list_len, svc_cargs_size]
     termination:
       bound : 64
 
@@ -27682,16 +28036,38 @@ rule x86_service_tramp
     let jump4 = 36 + blockA
     let jump5 = 31 + blockB
     let jump6 = 0 - (258 + l4 + blockA + blockB)
+    -- Slice 4 lets (concat body). cargs4 = the concat's args (ArgNil for every
+    -- non-call body — the discriminator `arg_list_len(cargs4) > 0` MUST come after
+    -- the ast_is_if fork, identically in both copies). cfield4 = the single req
+    -- field arg (svc_field_arg: first non-AstStr arg); is_method4 drives the S2
+    -- field-select from THAT AstField's spans, not a top-level body field (the S3
+    -- lesson). csum4 = the compile-time Content-Length term (sum of decoded literal
+    -- lengths; the field's runtime length is added as r14). csize4 = the per-arg
+    -- block total. The three S4 jumps are recomputed closed-form from csize4 (S2's
+    -- baked 0x18f/0x169 target the S2 close tail, which MOVES in S4): jump1_4 /
+    -- jump2_4 = method/path parse-fail -> close (close sits at 579 + csize4,
+    -- je next-instr at 191 / 229); jump6_4 = close -> accept_top (negative,
+    -- accept_top at 137, loop end at 596 + csize4). All total on garbage shapes
+    -- (accessors are defensive; span_is_method(0,0) -> 0) — eager-let safe.
+    let cargs4 = ast_call_args(body_ast)
+    let cfield4 = svc_field_arg(cargs4)
+    let is_method4 = span_is_method(SpanCheck { src: st.src, start: ast_field_fstart(cfield4), len: ast_field_flen(cfield4) })
+    let csum4 = svc_cargs_lit_len(RxCArgsState { args: cargs4, src: st.src })
+    let csize4 = svc_cargs_size(RxCArgsState { args: cargs4, src: st.src })
+    let jump1_4 = 388 + csize4
+    let jump2_4 = 350 + csize4
+    let jump6_4 = 0 - (459 + csize4)
     -- The startup (socket/setsockopt/bind/listen/sub-rsp) + accept + read bytes are
     -- IDENTICAL in both branches; they are inlined verbatim in each `concat` (no
     -- shared bytes-let — a concat-valued let is refused inside this recursive SCC).
     -- r12 = listen fd, r13 = client fd (both callee-saved). Only the iteration tail
-    -- forks: AstStr -> S1 precomputed blob; AstField -> S2 parse + itoa serializer.
-    out = if ast_is_str(body_ast) == 1 then concat(b"\xbf\x02\x00\x00\x00\xbe\x01\x00\x00\x00\x31\xd2\xb8\x29\x00\x00\x00\x0f\x05\x49\x89\xc4", b"\x6a\x01\x48\xc7\xc0\x36\x00\x00\x00\x4c\x89\xe7\x48\xc7\xc6\x01\x00\x00\x00\x48\xc7\xc2\x02\x00\x00\x00\x49\x89\xe2\x49\xc7\xc0\x04\x00\x00\x00\x0f\x05\x48\x83\xc4\x08", b"\xe9", le32(16), le32(2 + hv * 65536), le32(0), le64(0), b"\x48\x8d\x35", le32(0 - (16 + 7)), b"\x4c\x89\xe7\x48\xc7\xc2\x10\x00\x00\x00\x48\xc7\xc0\x31\x00\x00\x00\x0f\x05", b"\x4c\x89\xe7\x48\xc7\xc6\x80\x00\x00\x00\x48\xc7\xc0\x32\x00\x00\x00\x0f\x05", b"\x48\x81\xec", le32(max_req), b"\x48\xc7\xc0\x2b\x00\x00\x00\x4c\x89\xe7\x48\x31\xf6\x48\x31\xd2\x0f\x05\x49\x89\xc5", b"\x48\x31\xc0\x4c\x89\xef\x48\x89\xe6\x48\xc7\xc2", le32(max_req), b"\x0f\x05", b"\xe9", le32(block), service_response_blob(ServiceRespBlobState { status: status, body_start: body_start, body_len: body_len, src: st.src, pos: 0 }), b"\x48\xc7\xc0\x01\x00\x00\x00\x4c\x89\xef\x48\x8d\x35", le32(0 - (block + 17)), b"\x48\xc7\xc2", le32(rlen), b"\x0f\x05", b"\x48\xc7\xc0\x03\x00\x00\x00\x4c\x89\xef\x0f\x05", b"\xe9", le32(0 - (87 + block))) else if ast_is_if(hresult) == 1 then concat(b"\xbf\x02\x00\x00\x00\xbe\x01\x00\x00\x00\x31\xd2\xb8\x29\x00\x00\x00\x0f\x05\x49\x89\xc4", b"\x6a\x01\x48\xc7\xc0\x36\x00\x00\x00\x4c\x89\xe7\x48\xc7\xc6\x01\x00\x00\x00\x48\xc7\xc2\x02\x00\x00\x00\x49\x89\xe2\x49\xc7\xc0\x04\x00\x00\x00\x0f\x05\x48\x83\xc4\x08", b"\xe9", le32(16), le32(2 + hv * 65536), le32(0), le64(0), b"\x48\x8d\x35", le32(0 - (16 + 7)), b"\x4c\x89\xe7\x48\xc7\xc2\x10\x00\x00\x00\x48\xc7\xc0\x31\x00\x00\x00\x0f\x05", b"\x4c\x89\xe7\x48\xc7\xc6\x80\x00\x00\x00\x48\xc7\xc0\x32\x00\x00\x00\x0f\x05", b"\x48\x81\xec", le32(max_req), b"\x48\xc7\xc0\x2b\x00\x00\x00\x4c\x89\xe7\x48\x31\xf6\x48\x31\xd2\x0f\x05\x49\x89\xc5", b"\x48\x31\xc0\x4c\x89\xef\x48\x89\xe6\x48\xc7\xc2", le32(max_req), b"\x0f\x05", b"\x48\x89\xe3\x48\x89\xe6\x48\x85\xc0\x0f\x84", le32(jump1), b"\x44\x8a\x03\x41\x80\xf8\x20\x74\x08\x48\xff\xc3\x48\xff\xc8\xeb\xe6\x48\x89\xda\x48\xff\xc3\x48\xff\xc8\x48\x89\xdf\x48\x85\xc0\x0f\x84", le32(jump2), b"\x44\x8a\x03\x41\x80\xf8\x20\x74\x14\x41\x80\xf8\x0d\x74\x0e\x41\x80\xf8\x0a\x74\x08\x48\xff\xc3\x48\xff\xc8\xeb\xda", (if is_method3 == 1 then b"\x49\x89\xd6\x49\x29\xf6\x48\x89\xf3" else b"\x49\x89\xde\x49\x29\xfe\x48\x89\xfb"), b"\x49\x81\xfe", le32(declen3), b"\x0f\x85", le32(jump3), b"\xfc\x48\x89\xde\xe9", le32(l4), emit_bytes_data(BytesEmitState { src: st.src, start: lit_start3, len: lit_len3, i: 0, dlen: declen3 }), b"\x48\x8d\x3d", le32(0 - (l4 + 7)), b"\x48\xc7\xc1", le32(declen3), b"\xf3\xa6\x0f\x85", le32(jump4), b"\xe9", le32(blockA), service_response_blob(ServiceRespBlobState { status: statusA, body_start: bodyA_start, body_len: bodyA_len, src: st.src, pos: 0 }), b"\x48\xc7\xc0\x01\x00\x00\x00\x4c\x89\xef\x48\x8d\x35", le32(0 - (blockA + 17)), b"\x48\xc7\xc2", le32(rlenA), b"\x0f\x05", b"\xe9", le32(jump5), b"\xe9", le32(blockB), service_response_blob(ServiceRespBlobState { status: statusB, body_start: bodyB_start, body_len: bodyB_len, src: st.src, pos: 0 }), b"\x48\xc7\xc0\x01\x00\x00\x00\x4c\x89\xef\x48\x8d\x35", le32(0 - (blockB + 17)), b"\x48\xc7\xc2", le32(rlenB), b"\x0f\x05", b"\x48\xc7\xc0\x03\x00\x00\x00\x4c\x89\xef\x0f\x05", b"\xe9", le32(jump6)) else concat(b"\xbf\x02\x00\x00\x00\xbe\x01\x00\x00\x00\x31\xd2\xb8\x29\x00\x00\x00\x0f\x05\x49\x89\xc4", b"\x6a\x01\x48\xc7\xc0\x36\x00\x00\x00\x4c\x89\xe7\x48\xc7\xc6\x01\x00\x00\x00\x48\xc7\xc2\x02\x00\x00\x00\x49\x89\xe2\x49\xc7\xc0\x04\x00\x00\x00\x0f\x05\x48\x83\xc4\x08", b"\xe9", le32(16), le32(2 + hv * 65536), le32(0), le64(0), b"\x48\x8d\x35", le32(0 - (16 + 7)), b"\x4c\x89\xe7\x48\xc7\xc2\x10\x00\x00\x00\x48\xc7\xc0\x31\x00\x00\x00\x0f\x05", b"\x4c\x89\xe7\x48\xc7\xc6\x80\x00\x00\x00\x48\xc7\xc0\x32\x00\x00\x00\x0f\x05", b"\x48\x81\xec", le32(max_req), b"\x48\xc7\xc0\x2b\x00\x00\x00\x4c\x89\xe7\x48\x31\xf6\x48\x31\xd2\x0f\x05\x49\x89\xc5", b"\x48\x31\xc0\x4c\x89\xef\x48\x89\xe6\x48\xc7\xc2", le32(max_req), b"\x0f\x05", b"\x48\x89\xe3\x48\x89\xe6\x48\x85\xc0\x0f\x84\x8f\x01\x00\x00\x44\x8a\x03\x41\x80\xf8\x20\x74\x08\x48\xff\xc3\x48\xff\xc8\xeb\xe6\x48\x89\xda\x48\xff\xc3\x48\xff\xc8\x48\x89\xdf\x48\x85\xc0\x0f\x84\x69\x01\x00\x00\x44\x8a\x03\x41\x80\xf8\x20\x74\x14\x41\x80\xf8\x0d\x74\x0e\x41\x80\xf8\x0a\x74\x08\x48\xff\xc3\x48\xff\xc8\xeb\xda", (if is_method == 1 then b"\x49\x89\xd6\x49\x29\xf6\x48\x89\xf3" else b"\x49\x89\xde\x49\x29\xfe\x48\x89\xfb"), b"\xe9\x0c\x00\x00\x00\x48\x54\x54\x50\x2f\x31\x2e\x30\x20\x00\x00\x00\x48\xc7\xc0\x01\x00\x00\x00\x4c\x89\xef\x48\x8d\x35\xe3\xff\xff\xff\x48\xc7\xc2\x09\x00\x00\x00\x0f\x05", b"\x48\xc7\xc0", le32(status), b"\x48\x83\xec\x20\x49\x89\xc1\x48\x8d\x74\x24\x20\x48\x85\xc0\x79\x03\x48\xf7\xd8\x48\xc7\xc1\x0a\x00\x00\x00\x48\x31\xd2\x48\xf7\xf1\x80\xc2\x30\x48\xff\xce\x88\x16\x48\x85\xc0\x75\xed\x4d\x85\xc9\x79\x06\x48\xff\xce\xc6\x06\x2d\x48\x8d\x54\x24\x20\x48\x29\xf2\x48\xc7\xc0\x01\x00\x00\x00\x4c\x89\xef\x0f\x05\x48\x83\xc4\x20", b"\xe9\x18\x00\x00\x00\x20\x4f\x4b\x0d\x0a\x43\x6f\x6e\x74\x65\x6e\x74\x2d\x4c\x65\x6e\x67\x74\x68\x3a\x20\x00\x00\x00\x48\xc7\xc0\x01\x00\x00\x00\x4c\x89\xef\x48\x8d\x35\xd7\xff\xff\xff\x48\xc7\xc2\x15\x00\x00\x00\x0f\x05", b"\x4c\x89\xf0", b"\x48\x83\xec\x20\x49\x89\xc1\x48\x8d\x74\x24\x20\x48\x85\xc0\x79\x03\x48\xf7\xd8\x48\xc7\xc1\x0a\x00\x00\x00\x48\x31\xd2\x48\xf7\xf1\x80\xc2\x30\x48\xff\xce\x88\x16\x48\x85\xc0\x75\xed\x4d\x85\xc9\x79\x06\x48\xff\xce\xc6\x06\x2d\x48\x8d\x54\x24\x20\x48\x29\xf2\x48\xc7\xc0\x01\x00\x00\x00\x4c\x89\xef\x0f\x05\x48\x83\xc4\x20", b"\xe9\x04\x00\x00\x00\x0d\x0a\x0d\x0a\x48\xc7\xc0\x01\x00\x00\x00\x4c\x89\xef\x48\x8d\x35\xeb\xff\xff\xff\x48\xc7\xc2\x04\x00\x00\x00\x0f\x05", b"\x48\xc7\xc0\x01\x00\x00\x00\x4c\x89\xef\x48\x89\xde\x4c\x89\xf2\x0f\x05", b"\x48\xc7\xc0\x03\x00\x00\x00\x4c\x89\xef\x0f\x05", b"\xe9", le32(0 - 470))
+    -- forks: AstStr -> S1 precomputed blob; AstIf -> S3 router; concat -> S4
+    -- streaming serializer; AstField -> S2 parse + itoa serializer.
+    out = if ast_is_str(body_ast) == 1 then concat(b"\xbf\x02\x00\x00\x00\xbe\x01\x00\x00\x00\x31\xd2\xb8\x29\x00\x00\x00\x0f\x05\x49\x89\xc4", b"\x6a\x01\x48\xc7\xc0\x36\x00\x00\x00\x4c\x89\xe7\x48\xc7\xc6\x01\x00\x00\x00\x48\xc7\xc2\x02\x00\x00\x00\x49\x89\xe2\x49\xc7\xc0\x04\x00\x00\x00\x0f\x05\x48\x83\xc4\x08", b"\xe9", le32(16), le32(2 + hv * 65536), le32(0), le64(0), b"\x48\x8d\x35", le32(0 - (16 + 7)), b"\x4c\x89\xe7\x48\xc7\xc2\x10\x00\x00\x00\x48\xc7\xc0\x31\x00\x00\x00\x0f\x05", b"\x4c\x89\xe7\x48\xc7\xc6\x80\x00\x00\x00\x48\xc7\xc0\x32\x00\x00\x00\x0f\x05", b"\x48\x81\xec", le32(max_req), b"\x48\xc7\xc0\x2b\x00\x00\x00\x4c\x89\xe7\x48\x31\xf6\x48\x31\xd2\x0f\x05\x49\x89\xc5", b"\x48\x31\xc0\x4c\x89\xef\x48\x89\xe6\x48\xc7\xc2", le32(max_req), b"\x0f\x05", b"\xe9", le32(block), service_response_blob(ServiceRespBlobState { status: status, body_start: body_start, body_len: body_len, src: st.src, pos: 0 }), b"\x48\xc7\xc0\x01\x00\x00\x00\x4c\x89\xef\x48\x8d\x35", le32(0 - (block + 17)), b"\x48\xc7\xc2", le32(rlen), b"\x0f\x05", b"\x48\xc7\xc0\x03\x00\x00\x00\x4c\x89\xef\x0f\x05", b"\xe9", le32(0 - (87 + block))) else if ast_is_if(hresult) == 1 then concat(b"\xbf\x02\x00\x00\x00\xbe\x01\x00\x00\x00\x31\xd2\xb8\x29\x00\x00\x00\x0f\x05\x49\x89\xc4", b"\x6a\x01\x48\xc7\xc0\x36\x00\x00\x00\x4c\x89\xe7\x48\xc7\xc6\x01\x00\x00\x00\x48\xc7\xc2\x02\x00\x00\x00\x49\x89\xe2\x49\xc7\xc0\x04\x00\x00\x00\x0f\x05\x48\x83\xc4\x08", b"\xe9", le32(16), le32(2 + hv * 65536), le32(0), le64(0), b"\x48\x8d\x35", le32(0 - (16 + 7)), b"\x4c\x89\xe7\x48\xc7\xc2\x10\x00\x00\x00\x48\xc7\xc0\x31\x00\x00\x00\x0f\x05", b"\x4c\x89\xe7\x48\xc7\xc6\x80\x00\x00\x00\x48\xc7\xc0\x32\x00\x00\x00\x0f\x05", b"\x48\x81\xec", le32(max_req), b"\x48\xc7\xc0\x2b\x00\x00\x00\x4c\x89\xe7\x48\x31\xf6\x48\x31\xd2\x0f\x05\x49\x89\xc5", b"\x48\x31\xc0\x4c\x89\xef\x48\x89\xe6\x48\xc7\xc2", le32(max_req), b"\x0f\x05", b"\x48\x89\xe3\x48\x89\xe6\x48\x85\xc0\x0f\x84", le32(jump1), b"\x44\x8a\x03\x41\x80\xf8\x20\x74\x08\x48\xff\xc3\x48\xff\xc8\xeb\xe6\x48\x89\xda\x48\xff\xc3\x48\xff\xc8\x48\x89\xdf\x48\x85\xc0\x0f\x84", le32(jump2), b"\x44\x8a\x03\x41\x80\xf8\x20\x74\x14\x41\x80\xf8\x0d\x74\x0e\x41\x80\xf8\x0a\x74\x08\x48\xff\xc3\x48\xff\xc8\xeb\xda", (if is_method3 == 1 then b"\x49\x89\xd6\x49\x29\xf6\x48\x89\xf3" else b"\x49\x89\xde\x49\x29\xfe\x48\x89\xfb"), b"\x49\x81\xfe", le32(declen3), b"\x0f\x85", le32(jump3), b"\xfc\x48\x89\xde\xe9", le32(l4), emit_bytes_data(BytesEmitState { src: st.src, start: lit_start3, len: lit_len3, i: 0, dlen: declen3 }), b"\x48\x8d\x3d", le32(0 - (l4 + 7)), b"\x48\xc7\xc1", le32(declen3), b"\xf3\xa6\x0f\x85", le32(jump4), b"\xe9", le32(blockA), service_response_blob(ServiceRespBlobState { status: statusA, body_start: bodyA_start, body_len: bodyA_len, src: st.src, pos: 0 }), b"\x48\xc7\xc0\x01\x00\x00\x00\x4c\x89\xef\x48\x8d\x35", le32(0 - (blockA + 17)), b"\x48\xc7\xc2", le32(rlenA), b"\x0f\x05", b"\xe9", le32(jump5), b"\xe9", le32(blockB), service_response_blob(ServiceRespBlobState { status: statusB, body_start: bodyB_start, body_len: bodyB_len, src: st.src, pos: 0 }), b"\x48\xc7\xc0\x01\x00\x00\x00\x4c\x89\xef\x48\x8d\x35", le32(0 - (blockB + 17)), b"\x48\xc7\xc2", le32(rlenB), b"\x0f\x05", b"\x48\xc7\xc0\x03\x00\x00\x00\x4c\x89\xef\x0f\x05", b"\xe9", le32(jump6)) else if arg_list_len(cargs4) > 0 then concat(b"\xbf\x02\x00\x00\x00\xbe\x01\x00\x00\x00\x31\xd2\xb8\x29\x00\x00\x00\x0f\x05\x49\x89\xc4", b"\x6a\x01\x48\xc7\xc0\x36\x00\x00\x00\x4c\x89\xe7\x48\xc7\xc6\x01\x00\x00\x00\x48\xc7\xc2\x02\x00\x00\x00\x49\x89\xe2\x49\xc7\xc0\x04\x00\x00\x00\x0f\x05\x48\x83\xc4\x08", b"\xe9", le32(16), le32(2 + hv * 65536), le32(0), le64(0), b"\x48\x8d\x35", le32(0 - (16 + 7)), b"\x4c\x89\xe7\x48\xc7\xc2\x10\x00\x00\x00\x48\xc7\xc0\x31\x00\x00\x00\x0f\x05", b"\x4c\x89\xe7\x48\xc7\xc6\x80\x00\x00\x00\x48\xc7\xc0\x32\x00\x00\x00\x0f\x05", b"\x48\x81\xec", le32(max_req), b"\x48\xc7\xc0\x2b\x00\x00\x00\x4c\x89\xe7\x48\x31\xf6\x48\x31\xd2\x0f\x05\x49\x89\xc5", b"\x48\x31\xc0\x4c\x89\xef\x48\x89\xe6\x48\xc7\xc2", le32(max_req), b"\x0f\x05", b"\x48\x89\xe3\x48\x89\xe6\x48\x85\xc0\x0f\x84", le32(jump1_4), b"\x44\x8a\x03\x41\x80\xf8\x20\x74\x08\x48\xff\xc3\x48\xff\xc8\xeb\xe6\x48\x89\xda\x48\xff\xc3\x48\xff\xc8\x48\x89\xdf\x48\x85\xc0\x0f\x84", le32(jump2_4), b"\x44\x8a\x03\x41\x80\xf8\x20\x74\x14\x41\x80\xf8\x0d\x74\x0e\x41\x80\xf8\x0a\x74\x08\x48\xff\xc3\x48\xff\xc8\xeb\xda", (if is_method4 == 1 then b"\x49\x89\xd6\x49\x29\xf6\x48\x89\xf3" else b"\x49\x89\xde\x49\x29\xfe\x48\x89\xfb"), b"\xe9\x0c\x00\x00\x00\x48\x54\x54\x50\x2f\x31\x2e\x30\x20\x00\x00\x00\x48\xc7\xc0\x01\x00\x00\x00\x4c\x89\xef\x48\x8d\x35\xe3\xff\xff\xff\x48\xc7\xc2\x09\x00\x00\x00\x0f\x05", b"\x48\xc7\xc0", le32(status), b"\x48\x83\xec\x20\x49\x89\xc1\x48\x8d\x74\x24\x20\x48\x85\xc0\x79\x03\x48\xf7\xd8\x48\xc7\xc1\x0a\x00\x00\x00\x48\x31\xd2\x48\xf7\xf1\x80\xc2\x30\x48\xff\xce\x88\x16\x48\x85\xc0\x75\xed\x4d\x85\xc9\x79\x06\x48\xff\xce\xc6\x06\x2d\x48\x8d\x54\x24\x20\x48\x29\xf2\x48\xc7\xc0\x01\x00\x00\x00\x4c\x89\xef\x0f\x05\x48\x83\xc4\x20", b"\xe9\x18\x00\x00\x00\x20\x4f\x4b\x0d\x0a\x43\x6f\x6e\x74\x65\x6e\x74\x2d\x4c\x65\x6e\x67\x74\x68\x3a\x20\x00\x00\x00\x48\xc7\xc0\x01\x00\x00\x00\x4c\x89\xef\x48\x8d\x35\xd7\xff\xff\xff\x48\xc7\xc2\x15\x00\x00\x00\x0f\x05", b"\x48\xc7\xc0", le32(csum4), b"\x4c\x01\xf0", b"\x48\x83\xec\x20\x49\x89\xc1\x48\x8d\x74\x24\x20\x48\x85\xc0\x79\x03\x48\xf7\xd8\x48\xc7\xc1\x0a\x00\x00\x00\x48\x31\xd2\x48\xf7\xf1\x80\xc2\x30\x48\xff\xce\x88\x16\x48\x85\xc0\x75\xed\x4d\x85\xc9\x79\x06\x48\xff\xce\xc6\x06\x2d\x48\x8d\x54\x24\x20\x48\x29\xf2\x48\xc7\xc0\x01\x00\x00\x00\x4c\x89\xef\x0f\x05\x48\x83\xc4\x20", b"\xe9\x04\x00\x00\x00\x0d\x0a\x0d\x0a\x48\xc7\xc0\x01\x00\x00\x00\x4c\x89\xef\x48\x8d\x35\xeb\xff\xff\xff\x48\xc7\xc2\x04\x00\x00\x00\x0f\x05", x86_svc_cargs(RxCArgsState { args: cargs4, src: st.src }), b"\x48\xc7\xc0\x03\x00\x00\x00\x4c\x89\xef\x0f\x05", b"\xe9", le32(jump6_4)) else concat(b"\xbf\x02\x00\x00\x00\xbe\x01\x00\x00\x00\x31\xd2\xb8\x29\x00\x00\x00\x0f\x05\x49\x89\xc4", b"\x6a\x01\x48\xc7\xc0\x36\x00\x00\x00\x4c\x89\xe7\x48\xc7\xc6\x01\x00\x00\x00\x48\xc7\xc2\x02\x00\x00\x00\x49\x89\xe2\x49\xc7\xc0\x04\x00\x00\x00\x0f\x05\x48\x83\xc4\x08", b"\xe9", le32(16), le32(2 + hv * 65536), le32(0), le64(0), b"\x48\x8d\x35", le32(0 - (16 + 7)), b"\x4c\x89\xe7\x48\xc7\xc2\x10\x00\x00\x00\x48\xc7\xc0\x31\x00\x00\x00\x0f\x05", b"\x4c\x89\xe7\x48\xc7\xc6\x80\x00\x00\x00\x48\xc7\xc0\x32\x00\x00\x00\x0f\x05", b"\x48\x81\xec", le32(max_req), b"\x48\xc7\xc0\x2b\x00\x00\x00\x4c\x89\xe7\x48\x31\xf6\x48\x31\xd2\x0f\x05\x49\x89\xc5", b"\x48\x31\xc0\x4c\x89\xef\x48\x89\xe6\x48\xc7\xc2", le32(max_req), b"\x0f\x05", b"\x48\x89\xe3\x48\x89\xe6\x48\x85\xc0\x0f\x84\x8f\x01\x00\x00\x44\x8a\x03\x41\x80\xf8\x20\x74\x08\x48\xff\xc3\x48\xff\xc8\xeb\xe6\x48\x89\xda\x48\xff\xc3\x48\xff\xc8\x48\x89\xdf\x48\x85\xc0\x0f\x84\x69\x01\x00\x00\x44\x8a\x03\x41\x80\xf8\x20\x74\x14\x41\x80\xf8\x0d\x74\x0e\x41\x80\xf8\x0a\x74\x08\x48\xff\xc3\x48\xff\xc8\xeb\xda", (if is_method == 1 then b"\x49\x89\xd6\x49\x29\xf6\x48\x89\xf3" else b"\x49\x89\xde\x49\x29\xfe\x48\x89\xfb"), b"\xe9\x0c\x00\x00\x00\x48\x54\x54\x50\x2f\x31\x2e\x30\x20\x00\x00\x00\x48\xc7\xc0\x01\x00\x00\x00\x4c\x89\xef\x48\x8d\x35\xe3\xff\xff\xff\x48\xc7\xc2\x09\x00\x00\x00\x0f\x05", b"\x48\xc7\xc0", le32(status), b"\x48\x83\xec\x20\x49\x89\xc1\x48\x8d\x74\x24\x20\x48\x85\xc0\x79\x03\x48\xf7\xd8\x48\xc7\xc1\x0a\x00\x00\x00\x48\x31\xd2\x48\xf7\xf1\x80\xc2\x30\x48\xff\xce\x88\x16\x48\x85\xc0\x75\xed\x4d\x85\xc9\x79\x06\x48\xff\xce\xc6\x06\x2d\x48\x8d\x54\x24\x20\x48\x29\xf2\x48\xc7\xc0\x01\x00\x00\x00\x4c\x89\xef\x0f\x05\x48\x83\xc4\x20", b"\xe9\x18\x00\x00\x00\x20\x4f\x4b\x0d\x0a\x43\x6f\x6e\x74\x65\x6e\x74\x2d\x4c\x65\x6e\x67\x74\x68\x3a\x20\x00\x00\x00\x48\xc7\xc0\x01\x00\x00\x00\x4c\x89\xef\x48\x8d\x35\xd7\xff\xff\xff\x48\xc7\xc2\x15\x00\x00\x00\x0f\x05", b"\x4c\x89\xf0", b"\x48\x83\xec\x20\x49\x89\xc1\x48\x8d\x74\x24\x20\x48\x85\xc0\x79\x03\x48\xf7\xd8\x48\xc7\xc1\x0a\x00\x00\x00\x48\x31\xd2\x48\xf7\xf1\x80\xc2\x30\x48\xff\xce\x88\x16\x48\x85\xc0\x75\xed\x4d\x85\xc9\x79\x06\x48\xff\xce\xc6\x06\x2d\x48\x8d\x54\x24\x20\x48\x29\xf2\x48\xc7\xc0\x01\x00\x00\x00\x4c\x89\xef\x0f\x05\x48\x83\xc4\x20", b"\xe9\x04\x00\x00\x00\x0d\x0a\x0d\x0a\x48\xc7\xc0\x01\x00\x00\x00\x4c\x89\xef\x48\x8d\x35\xeb\xff\xff\xff\x48\xc7\xc2\x04\x00\x00\x00\x0f\x05", b"\x48\xc7\xc0\x01\x00\x00\x00\x4c\x89\xef\x48\x89\xde\x4c\x89\xf2\x0f\x05", b"\x48\xc7\xc0\x03\x00\x00\x00\x4c\x89\xef\x0f\x05", b"\xe9", le32(0 - 470))
   proofs:
     purity:
       reads : [st.svcs, st.prog, st.src]
-      calls : [svc_head, find_rule, svc_handler_start, svc_handler_len, ast_variant_fields, block_result, rd_body, ast_num_value, vf_head_val, vf_tail, ast_str_start, ast_str_len, svc_port, svc_max_request, response_len, service_response_blob, ast_is_str, span_is_method, ast_field_fstart, ast_field_flen, ast_is_if, ast_if_cond, ast_bin_lhs, ast_bin_rhs, bytelit_decoded_len, ast_if_then, ast_if_else, emit_bytes_data]
+      calls : [svc_head, find_rule, svc_handler_start, svc_handler_len, ast_variant_fields, block_result, rd_body, ast_num_value, vf_head_val, vf_tail, ast_str_start, ast_str_len, svc_port, svc_max_request, response_len, service_response_blob, ast_is_str, span_is_method, ast_field_fstart, ast_field_flen, ast_is_if, ast_if_cond, ast_bin_lhs, ast_bin_rhs, bytelit_decoded_len, ast_if_then, ast_if_else, emit_bytes_data, ast_call_args, arg_list_len, svc_field_arg, svc_cargs_lit_len, svc_cargs_size, x86_svc_cargs]
     termination:
       bound : 128
 
