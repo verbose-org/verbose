@@ -24230,6 +24230,80 @@ rule le64_neg
         h.iter().map(|x| format!("{:08x}", x)).collect::<Vec<_>>().join("")
     }
 
+    /// The emitted log block's body: the bytes STRICTLY between the `open` sequence
+    /// and the `close` sequence of a self-hosted service's per-request `log:` block.
+    ///
+    /// Markers (both fixed-length, both unique in every service ELF the tests emit):
+    ///   open  = `mov eax,2 ; mov esi,0x441 ; mov edx,0x1A4 ; syscall ; mov r15,rax`
+    ///   close = `mov eax,3 ; mov rdi,r15 ; syscall`
+    #[cfg(target_arch = "x86_64")]
+    fn log_block_window(elf: &[u8]) -> &[u8] {
+        fn find(hay: &[u8], pat: &[u8]) -> Option<usize> {
+            hay.windows(pat.len()).position(|w| w == pat)
+        }
+        const OPEN: &[u8] = &[
+            0xb8, 0x02, 0x00, 0x00, 0x00, // mov eax, 2      (sys_open)
+            0xbe, 0x41, 0x04, 0x00, 0x00, // mov esi, 0x441   (WRONLY|CREAT|APPEND)
+            0xba, 0xa4, 0x01, 0x00, 0x00, // mov edx, 0o644
+            0x0f, 0x05, // syscall
+            0x49, 0x89, 0xc7, // mov r15, rax   (the log fd)
+        ];
+        const CLOSE: &[u8] = &[
+            0xb8, 0x03, 0x00, 0x00, 0x00, // mov eax, 3      (sys_close)
+            0x4c, 0x89, 0xff, // mov rdi, r15
+            0x0f, 0x05, // syscall
+        ];
+        let i = find(elf, OPEN).expect("the emitted ELF must contain a log-block open") + OPEN.len();
+        let j = i + find(&elf[i..], CLOSE).expect("the log block must be closed");
+        &elf[i..j]
+    }
+
+    /// SELF-HOSTING SERVICE slice 5b.5 — THE PROPERTY THE SLICE BUYS, asserted by
+    /// byte inspection of the emitted ELF (an objdump would show the same thing; this
+    /// keeps the check dependency-free and runnable anywhere).
+    ///
+    /// Counts `0f 05` (syscall) inside `log_block_window`. Slice 5b emitted ONE
+    /// `write()` PER CONCAT ARG — objdump of a `concat(req.method," ",req.path,"\n")`
+    /// server showed syscalls at 0x202 (open), 0x217/0x23a/0x24c/0x26f (four writes),
+    /// 0x279 (close). After 5b.5 there is exactly ONE: the `writev`.
+    ///
+    /// CAVEAT, STATED RATHER THAN HIDDEN: each AstStr iovec entry embeds its literal
+    /// bytes inline via jmp-over-data, INSIDE the counted window — so a log literal
+    /// containing the two bytes `0F 05` would inflate the count. None of the literals
+    /// used below does; a future row must not either.
+    #[cfg(target_arch = "x86_64")]
+    fn log_block_syscalls(elf: &[u8]) -> usize {
+        log_block_window(elf).windows(2).filter(|w| *w == [0x0f, 0x05]).count()
+    }
+
+    /// True iff the log block's single syscall is a `writev` in the slice-5b.5 shape:
+    /// `mov rsi,rsp ; mov rdi,r15 ; mov edx,<iovcnt> ; mov eax,20 ; syscall`, wrapped
+    /// in a BALANCED `sub rsp,16*N` … `add rsp,16*N` pair (the iovec scratch is
+    /// allocated BELOW the request buffer and released before the next iteration).
+    /// Returns the iovcnt the syscall is actually handed, so a caller can check it
+    /// against the number of args it declared.
+    #[cfg(target_arch = "x86_64")]
+    fn log_block_writev_iovcnt(elf: &[u8]) -> u32 {
+        let w = log_block_window(elf);
+        let tail: &[u8] = &[0x48, 0x89, 0xe6, 0x4c, 0x89, 0xff, 0xba];
+        let i = w.windows(tail.len()).position(|x| x == tail)
+            .expect("the log block must end in the slice-5b.5 writev tail \
+                     (mov rsi,rsp ; mov rdi,r15 ; mov edx,N ; mov eax,20 ; syscall)");
+        let n = u32::from_le_bytes(w[i + 7..i + 11].try_into().unwrap());
+        assert_eq!(&w[i + 11..i + 18], &[0xb8, 0x14, 0x00, 0x00, 0x00, 0x0f, 0x05],
+            "the log block's syscall must be sys_writev (20), not sys_write (1)");
+        // The scratch allocation is balanced: sub rsp,16*N opens the block and
+        // add rsp,16*N closes it, with the same immediate.
+        let bytes = (16u32 * n).to_le_bytes();
+        assert_eq!(&w[0..3], &[0x48, 0x81, 0xec],
+            "the log block must open with `sub rsp, 16*N`");
+        assert_eq!(&w[3..7], &bytes, "`sub rsp` immediate must be 16 * iovcnt");
+        assert_eq!(&w[i + 18..i + 21], &[0x48, 0x81, 0xc4],
+            "the log block must close with `add rsp, 16*N`");
+        assert_eq!(&w[i + 21..i + 25], &bytes, "`add rsp` immediate must be 16 * iovcnt");
+        n
+    }
+
     /// SELF-HOSTING SERVICE slice 5a — MILESTONE. A `log:` block on a service makes
     /// the emitted server append one line per accepted connection, via the reaction
     /// tier's append_file machinery re-emitted inside the accept loop with the fd in
@@ -24324,6 +24398,14 @@ rule le64_neg
                 "({tag}) p_filesz {} != emitted byte count {} — the size walk and the \
                  emit walk disagree; the mapped segment would be truncated",
                 filesz, gen.stdout.len());
+
+            // Slice 5b.5: even a one-literal log goes through the writev wrapper.
+            if with_log {
+                assert_eq!(log_block_syscalls(&gen.stdout), 1,
+                    "({tag}) the log block must issue exactly one syscall (writev)");
+                assert_eq!(log_block_writev_iovcnt(&gen.stdout), 1,
+                    "({tag}) a single-literal log is one iovec entry");
+            }
 
             let server = std::env::temp_dir().join(format!("verbosec_test_svc_s5a_server_{tag}"));
             fs::write(&server, &gen.stdout).unwrap();
@@ -24481,7 +24563,19 @@ rule le64_neg
     ///   (5) a static log still records a malformed request (slice 5a's audit
     ///       coverage, preserved) while a field log does not (physical necessity —
     ///       the span does not exist before the parse);
-    ///   (6) field content on an S1 (no-parse) handler REFUSES.
+    ///   (6) field content on an S1 (no-parse) handler REFUSES;
+    ///   (7) SLICE 5b.5 — the log block issues EXACTLY ONE syscall between its open
+    ///       and its close, and that syscall is `writev` with iovcnt == the number of
+    ///       declared content args, wrapped in a balanced `sub rsp` / `add rsp` pair.
+    ///       Every log row above is ALSO an equivalence check for 5b.5: the log
+    ///       CONTENT and the WIRE bytes asserted here are byte-for-byte what the
+    ///       N-write shape produced — only the syscall shape changed.
+    ///
+    /// ON THE ATOMICITY CLAIM: `writev` is atomic under exactly the same UNPROVEN
+    /// Linux inode-lock property as a single `write` (an implementation property of
+    /// generic_file_write_iter, not a POSIX contract; it does not hold over NFS).
+    /// This is PARITY with verbosec, which buffers the line and issues one write — it
+    /// is NOT a fork-safety guarantee, and nothing here asserts one.
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn self_hosted_service_log_field_content() {
@@ -24538,7 +24632,9 @@ rule le64_neg
         // The four body shapes, each with a STATIC log block, pinned. Placement is
         // still keyed on the CONTENT shape (S5b), so a static log has not MOVED; its
         // bytes changed only because slice 5b.5 replaced the content write with the
-        // writev sequence. Re-pinned on post-5b.5 gen0.
+        // writev sequence (+33 for a one-literal log: 32 of wrapper + 1, the fill
+        // block being 27 B of fixed fill on the 5-byte jmp instead of the old 26 B of
+        // write). Re-pinned on post-5b.5 gen0.
         let shapes: [(&str, &str, &str, &str); 4] = [
             ("s1", "resp = HttpResponse { status: 200, body: \"Hi\" }", "[]", "1"),
             ("s2", "resp = HttpResponse { status: 200, body: req.path }", "[req.path]", "1"),
@@ -24566,12 +24662,17 @@ rule le64_neg
             assert!(n.status.success(), "({tag}) no-log service must emit");
             assert_eq!(n.stdout.len(), nsz, "({tag}) no-log ELF size drifted");
             assert_eq!(sha256_hex(&n.stdout), nsha,
-                "({tag}) a no-log service must emit BYTE-IDENTICALLY to pre-S5b gen0");
+                "({tag}) a no-log service must emit BYTE-IDENTICALLY to pre-S5b gen0 \
+                 — slice 5b.5 touches ONLY the emitted log block, which is gated on \
+                 svc_log_present, so a log-less service is unchanged BY CONSTRUCTION");
             let l = emit(&mk("req", logic, reads, bound, 18991, static_log));
             assert!(l.status.success(), "({tag}) static-log service must emit");
             assert_eq!(l.stdout.len(), lsz, "({tag}) static-log ELF size drifted");
             assert_eq!(sha256_hex(&l.stdout), lsha,
                 "({tag}) static-log ELF drifted from its post-5b.5 pin");
+            assert_eq!(log_block_syscalls(&l.stdout), 1,
+                "({tag}) a STATIC log must also go through ONE writev — the wrapper is \
+                 emitted per content shape, not only for concats");
         }
 
         // FIELD-log byte pins (fixed port + fixed log path, never spawned). These are
@@ -24638,6 +24739,31 @@ rule le64_neg
                 "({tag}) p_filesz {} != emitted byte count {} — the size walk and the \
                  emit walk disagree; the mapped segment would be truncated",
                 filesz, gen.stdout.len());
+
+            // SLICE 5b.5: ONE writev, not N writes. Asserted on EVERY logged row of
+            // the matrix — static, bare field, and every concat arity — because the
+            // wrapper is emitted per CONTENT SHAPE, so each shape is its own risk.
+            if let Some(c) = content {
+                assert_eq!(log_block_syscalls(&gen.stdout), 1,
+                    "({tag}) the log block must issue EXACTLY ONE syscall between open \
+                     and close; slice 5b emitted one write() per concat arg, 5b.5 \
+                     replaces them with a single writev");
+                let iovcnt = log_block_writev_iovcnt(&gen.stdout);
+                // N is arg_list_len for a concat, 1 for a bare literal / bare field.
+                // Counting commas is exact for every content string in this matrix
+                // (no literal here contains one); a future row with a comma INSIDE a
+                // literal would need the arg count passed in explicitly.
+                let want = if c.starts_with("concat(") {
+                    (c.matches(',').count() + 1) as u32
+                } else {
+                    1
+                };
+                assert_eq!(iovcnt, want,
+                    "({tag}) writev iovcnt {} != the {} declared content args — the \
+                     size walk and the emit walk must agree on N, or the syscall reads \
+                     an uninitialised iovec slot",
+                    iovcnt, want);
+            }
 
             let server = std::env::temp_dir().join(format!("verbosec_test_svc_s5b_srv_{tag}"));
             fs::write(&server, &gen.stdout).unwrap();
