@@ -103,11 +103,6 @@ is the closed-form `cap`.
 reference method, path, both, or repeat — independently of the handler. Rejecting
 "log field must equal the handler's field": it cannot express the two-field access
 log (the canonical case) and couples the log to an unrelated part of the source.
-**rbp CLAIM — flag it**: this extends the "tramp never transfers control to an
-emitted proc" invariant to a FOURTH register (after r14, r15). Every emitted rule
-proc uses rbp as a frame register (s1.elf 0x1c2 `push %rbp`), so the invariant is
-load-bearing here. Record it in CLAUDE.md beside the r15 note.
-
 ## Naming — `req`, not the handler's param name
 verbosec's log scope uses HARDCODED synthetic `req`/`resp` (verifier.rs:1128/1144;
 scope map NR:19365-19392, rewrite NR:18547-18576) — NOT the handler's param name.
