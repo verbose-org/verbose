@@ -24448,6 +24448,354 @@ rule le64_neg
         let _ = fs::remove_file(&elf);
     }
 
+    /// SELF-HOSTING SERVICE slice 5b — MILESTONE. The `log:` block's CONTENT may now
+    /// name request fields, so the emitted server writes a real ACCESS LOG:
+    /// `log: append_file "/tmp/x.log" concat(req.method, " ", req.path, "\n")`.
+    ///
+    /// WHAT THIS TEST EXISTS TO CATCH — the span capture. At the handler's
+    /// field-select all four parse endpoints are live in distinct registers
+    /// (rsi=method_start, rdx=method_end, rdi=path_start, rbx=path_end) and the
+    /// select COLLAPSES one pair ASYMMETRICALLY: the method variant destroys rbx
+    /// (path_end). S5b therefore splices a 9-byte capture per referenced field at
+    /// tramp+258, immediately after the parse and BEFORE the select. A matrix that
+    /// only ever logs the SAME field the handler echoes cannot fail if that capture
+    /// is dropped or mis-ordered — so the rows below deliberately include
+    /// log-field != handler-field on S2 / S3 / S4, both fields at once (cap = 18), a
+    /// repeated field, a bare (non-concat) field, and a handler whose input param is
+    /// NOT named `req`.
+    ///
+    /// Per spawned server, N = 5 requests with DISTINCT paths over the SAME process,
+    /// asserting:
+    ///   (1) the log has exactly 5 lines AND the logged BYTES equal the requested
+    ///       method/path — a wrong-register capture produces plausible-looking bytes,
+    ///       so counting lines is not enough;
+    ///   (2) each wire response is byte-identical to that branch's no-log oracle
+    ///       (the rax / parse-perturbation class — the S5a scar);
+    ///   (3) p_filesz == the emitted byte count, asserted on FIELD-log rows: after
+    ///       S5b, svc_carg_size is the single size truth for TWO emitters (the body
+    ///       write and the log write), so a later change to the body write would
+    ///       silently desync the log;
+    ///   (4) byte-identity — the no-log S1 pin AND every static-log ELF for all four
+    ///       branches (placement is keyed on CONTENT shape, so static logs do not
+    ///       move);
+    ///   (5) a static log still records a malformed request (slice 5a's audit
+    ///       coverage, preserved) while a field log does not (physical necessity —
+    ///       the span does not exist before the parse);
+    ///   (6) field content on an S1 (no-parse) handler REFUSES.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn self_hosted_service_log_field_content() {
+        use std::fs;
+        use std::io::{Read, Write};
+        use std::net::{TcpListener, TcpStream};
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+        use std::time::Duration;
+
+        let src = fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        // gen0: the self-hosted emitter (source on argv[1], pos on argv[2]).
+        let elf = std::env::temp_dir().join("verbosec_test_svc_s5b_elf_program_src");
+        compile_native(&program, "elf_program_src", elf.to_str().unwrap(), false, false)
+            .expect("elf_program_src must compile natively");
+
+        let emit = |source: &str| -> std::process::Output {
+            Command::new(&elf).args([source, "0"]).output().expect("spawn gen0")
+        };
+
+        // A fixed-port, fixed-log-path service source. `param` is the handler's INPUT
+        // param name — deliberately parameterized, because the log scope's base is the
+        // hardcoded synthetic `req`, NOT the handler's param.
+        let mk = |param: &str, logic: &str, reads: &str, bound: &str, port: u16,
+                  logblock: &str| -> String {
+            format!(
+                "rule h5b\n  input:\n    {pm} : HttpRequest\n  output:\n    resp : HttpResponse\n  logic:\n    {lg}\n  proofs:\n    purity:\n      reads : {rd}\n      calls : []\n    termination:\n      bound : {bd}\nservice s5b\n  listen:\n    protocol : http_1_0\n    port : {p}\n    max_request : 4096\n  handler: h5b{lb}",
+                pm = param, lg = logic, rd = reads, bd = bound, p = port, lb = logblock)
+        };
+
+        // ---------------------------------------------------------------------
+        // (4) BYTE-IDENTITY. Placement is keyed on the log CONTENT's shape, so a
+        // STATIC log stays exactly where slice 5a put it (pre-read, tramp+158) in
+        // ALL FOUR branches — and a service with no log at all is untouched. Both
+        // sets are pinned by SHA-256 against pre-S5b gen0. Fixed port + fixed log
+        // path keep the hashes reproducible; these servers are never spawned.
+        // ---------------------------------------------------------------------
+        let nolog_hello = "rule hello_handler\n  input:\n    req : HttpRequest\n  output:\n    resp : HttpResponse\n  logic:\n    resp = HttpResponse { status: 200, body: \"Hello from Verbose over HTTP!\" }\n  proofs:\n    purity:\n      reads : []\n      calls : []\n    termination:\n      bound : 1\nservice hello_server\n  listen:\n    protocol : http_1_0\n    port : 18991\n    max_request : 4096\n  handler: hello_handler";
+        let h = emit(nolog_hello);
+        assert!(h.status.success(), "gen0 must emit the no-log hello service");
+        assert_eq!(h.stdout.len(), 931, "no-log service ELF size drifted");
+        assert_eq!(
+            sha256_hex(&h.stdout),
+            "ff8f967405f490dd22318f019d500ac1fe104d93ba46de21eead3418ea1566e8",
+            "a service WITHOUT a log block must STILL emit byte-identically \
+             (the S5a pin, NR:24283, must survive S5b's de-baking of S2's two \
+              hardcoded je targets — le32(399) reproduces \\x8f\\x01\\x00\\x00 exactly)"
+        );
+
+        // The four body shapes, each with a STATIC log block, pinned. If S5b had keyed
+        // placement on the BRANCH instead of on the CONTENT shape, every one of these
+        // would have moved.
+        let shapes: [(&str, &str, &str, &str); 4] = [
+            ("s1", "resp = HttpResponse { status: 200, body: \"Hi\" }", "[]", "1"),
+            ("s2", "resp = HttpResponse { status: 200, body: req.path }", "[req.path]", "1"),
+            ("s3", "resp = if req.path == \"/\" then HttpResponse { status: 200, body: \"home\" } else HttpResponse { status: 404, body: \"nope\" }", "[req.path]", "8"),
+            ("s4", "resp = HttpResponse { status: 200, body: concat(\"you asked for \", req.path) }", "[req.path]", "8"),
+        ];
+        // (tag, no-log size + sha, static-log size + sha) — all measured on pre-S5b gen0.
+        let pins: [(usize, &str, usize, &str); 4] = [
+            (847,  "d561c6ff84133a80065cdee16aa069ff671c9be858029043fe7f3cdcd87bf350",
+             992,  "a9d231384e9b96d711bbebf53888acfbb51a3d433ef1ca007d09d9d58c5a94cf"),
+            (880,  "1ccf2f3584b02a673aa67a632fa6b4199c088d2c2e4897e07453f5732a9b421e",
+             973,  "f9f4a742c9da8ed2d4b978d2f7d6d9e50b2532823a74a12002a101e5207144ca"),
+            (1280, "dcf91b84a089c2d237bd5829b3cd4cb31aa6d74f9bd749fa5dbbda5e0be3b796",
+             1421, "e7d5e4b1b93fe0ec4d5459d5ba498b6d2f577fbedd7b38c9de8aa84beda890f8"),
+            (1274, "89b6b2752bc9f8665feee9f8ef43e39677d71400292ee0a99cf243e9a3584fa5",
+             1415, "fef5ea6bc483a391985df3b5bcc6b07ab70316f4a8e4666d2983e4140dadd7e1"),
+        ];
+        let static_log = "\n  log:\n    append_file \"/tmp/vx_ref.log\" \"hit\\n\"";
+        for (i, (tag, logic, reads, bound)) in shapes.iter().enumerate() {
+            let (nsz, nsha, lsz, lsha) = pins[i];
+            let n = emit(&mk("req", logic, reads, bound, 18991, ""));
+            assert!(n.status.success(), "({tag}) no-log service must emit");
+            assert_eq!(n.stdout.len(), nsz, "({tag}) no-log ELF size drifted");
+            assert_eq!(sha256_hex(&n.stdout), nsha,
+                "({tag}) a no-log service must emit BYTE-IDENTICALLY to pre-S5b gen0");
+            let l = emit(&mk("req", logic, reads, bound, 18991, static_log));
+            assert!(l.status.success(), "({tag}) static-log service must emit");
+            assert_eq!(l.stdout.len(), lsz, "({tag}) static-log ELF size drifted");
+            assert_eq!(sha256_hex(&l.stdout), lsha,
+                "({tag}) a STATIC-content log must stay BYTE-IDENTICAL to pre-S5b gen0 \
+                 — S5b keys placement on the CONTENT shape precisely so that no \
+                 existing static-log service moves or changes behavior");
+        }
+
+        // (6) FIELD content on an S1 (constant-response) handler: REFUSED. S1 emits
+        // the read but no parse loop, so there is no span to capture. S5b.2 lifts it
+        // by giving S1 a conditional parse.
+        for content in [
+            "concat(req.path, \"\\n\")",
+            "req.path",
+            "concat(req.method, \" \", req.path, \"\\n\")",
+        ] {
+            let s1_field = mk("req", shapes[0].1, shapes[0].2, shapes[0].3, 18991,
+                &format!("\n  log:\n    append_file \"/tmp/vx_ref.log\" {}", content));
+            let o = emit(&s1_field);
+            assert!(!o.status.success() && o.stdout.is_empty(),
+                "field log content on an S1 handler must REFUSE (exit 1, empty stdout) \
+                 — S1 has no parse, so req.method/req.path do not exist; got {:?}",
+                o.status);
+        }
+
+        // ---------------------------------------------------------------------
+        // The matrix driver. Emits, asserts p_filesz == the emitted byte count,
+        // spawns, issues the requests over ONE process, returns (wire, log).
+        // ---------------------------------------------------------------------
+        let run = |tag: &str, param: &str, logic: &str, reads: &str, bound: &str,
+                   content: Option<&str>, reqs: &[&[u8]]| -> (Vec<Vec<u8>>, String) {
+            let port = {
+                let l = TcpListener::bind(("127.0.0.1", 0)).expect("bind ephemeral");
+                l.local_addr().unwrap().port()
+            };
+            let logfile = std::env::temp_dir().join(format!("verbosec_test_svc_s5b_{tag}.log"));
+            let _ = fs::remove_file(&logfile);
+            let logblock = match content {
+                Some(c) => format!("\n  log:\n    append_file \"{}\" {}", logfile.display(), c),
+                None => String::new(),
+            };
+            let source = mk(param, logic, reads, bound, port, &logblock);
+            let gen = emit(&source);
+            assert!(gen.status.success() && gen.stdout.len() >= 4 && &gen.stdout[0..4] == b"\x7fELF",
+                "gen0 must emit the S5b server ({tag}); got {:?} stderr={:?}",
+                gen.status, String::from_utf8_lossy(&gen.stderr));
+
+            // (3) p_filesz (offset 96 = e_phoff 64 + 32) comes from the SIZE walk; the
+            // file length is what the EMIT walk produced. This runs on FIELD-log rows,
+            // where svc_carg_size now feeds two different emitters.
+            let filesz = u64::from_le_bytes(gen.stdout[96..104].try_into().unwrap());
+            assert_eq!(filesz as usize, gen.stdout.len(),
+                "({tag}) p_filesz {} != emitted byte count {} — the size walk and the \
+                 emit walk disagree; the mapped segment would be truncated",
+                filesz, gen.stdout.len());
+
+            let server = std::env::temp_dir().join(format!("verbosec_test_svc_s5b_srv_{tag}"));
+            fs::write(&server, &gen.stdout).unwrap();
+            let mut perm = fs::metadata(&server).unwrap().permissions();
+            perm.set_mode(0o755);
+            fs::set_permissions(&server, perm).unwrap();
+
+            let mut child = Command::new(&server).spawn().expect("spawn server");
+            let addr: std::net::SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
+
+            // No bare readiness probe: a static log fires per ACCEPTED CONNECTION, so a
+            // throwaway connect would add a log line. Readiness is folded into the
+            // first request (retry the CONNECT only, and only before request 0).
+            let mut out = Vec::new();
+            for (i, req) in reqs.iter().enumerate() {
+                let mut sock = None;
+                for _ in 0..100 {
+                    match TcpStream::connect_timeout(&addr, Duration::from_millis(200)) {
+                        Ok(c) => {
+                            sock = Some(c);
+                            break;
+                        }
+                        Err(_) => {
+                            if i > 0 {
+                                break;
+                            }
+                            std::thread::sleep(Duration::from_millis(20));
+                        }
+                    }
+                }
+                let mut s = sock.unwrap_or_else(|| {
+                    panic!("S5b server ({tag}) never accepted request {} on port {}", i, port)
+                });
+                s.set_read_timeout(Some(Duration::from_secs(2))).ok();
+                s.write_all(req).expect("write request");
+                let mut buf = Vec::new();
+                let _ = s.read_to_end(&mut buf);
+                drop(s);
+                out.push(buf);
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = fs::remove_file(&server);
+            let log = fs::read_to_string(&logfile).unwrap_or_default();
+            let _ = fs::remove_file(&logfile);
+            (out, log)
+        };
+
+        // FIVE DISTINCT paths: the logged bytes must TRACK the request, which a
+        // constant-looking capture (or a capture of the wrong register) cannot fake.
+        let paths = ["/p1", "/p22", "/p333", "/p4444", "/p55555"];
+        let reqs: Vec<Vec<u8>> = paths.iter()
+            .map(|p| format!("GET {} HTTP/1.0\r\n\r\n", p).into_bytes())
+            .collect();
+        let reqs_ref: Vec<&[u8]> = reqs.iter().map(|v| v.as_slice()).collect();
+        let echo_path_wire: Vec<Vec<u8>> = paths.iter()
+            .map(|p| format!("HTTP/1.0 200 OK\r\nContent-Length: {}\r\n\r\n{}", p.len(), p).into_bytes())
+            .collect();
+
+        let s2_path = "resp = HttpResponse { status: 200, body: req.path }";
+        let s2_method = "resp = HttpResponse { status: 200, body: req.method }";
+
+        // --- Row 1: the canonical two-field ACCESS LOG (cap = 18). -------------
+        let (wire, log) = run("both", "req", s2_path, "[req.path]", "1",
+            Some("concat(req.method, \" \", req.path, \"\\n\")"), &reqs_ref);
+        assert_eq!(log.lines().collect::<Vec<_>>(),
+            paths.iter().map(|p| format!("GET {}", p)).collect::<Vec<_>>(),
+            "the two-field access log must record the ACTUAL method and path of each \
+             request, in order — got {:?}", log);
+        assert_eq!(wire, echo_path_wire, "two-field log perturbed the S2 wire response");
+
+        // --- Row 2: log field != handler field. THE row the capture exists for. --
+        // The handler echoes req.method, whose field-select is `mov r14,rdx ;
+        // sub r14,rsi ; mov rbx,rsi` — it DESTROYS rbx, which held path_end. Without
+        // the capture (or with it emitted after the select) the logged path is empty.
+        let (wire, log) = run("cross", "req", s2_method, "[req.method]", "1",
+            Some("concat(req.path, \"\\n\")"), &reqs_ref);
+        assert_eq!(log.lines().collect::<Vec<_>>(), paths,
+            "log field != handler field: the handler's method-select destroys \
+             path_end (rbx), so the path can only come from the capture spliced \
+             BEFORE the select — got {:?}", log);
+        for got in &wire {
+            assert_eq!(got.as_slice(), b"HTTP/1.0 200 OK\r\nContent-Length: 3\r\n\r\nGET",
+                "cross-field log perturbed the method-echo wire response; got {:?}",
+                String::from_utf8_lossy(got));
+        }
+
+        // --- Row 3: a BARE field (no concat) — one write, no literal blocks. -----
+        let (wire, log) = run("bare", "req", s2_path, "[req.path]", "1",
+            Some("req.path"), &reqs_ref);
+        assert_eq!(log, paths.concat(),
+            "a bare-field log writes exactly the path bytes, no separator; got {:?}", log);
+        assert_eq!(wire, echo_path_wire, "bare-field log perturbed the wire response");
+
+        // --- Row 4: a REPEATED field — two reads of ONE captured (ptr, len). -----
+        let (wire, log) = run("repeat", "req", s2_path, "[req.path]", "1",
+            Some("concat(req.path, req.path, \"\\n\")"), &reqs_ref);
+        assert_eq!(log.lines().collect::<Vec<_>>(),
+            paths.iter().map(|p| format!("{}{}", p, p)).collect::<Vec<_>>(),
+            "a repeated field must capture ONCE and read twice; got {:?}", log);
+        assert_eq!(wire, echo_path_wire, "repeated-field log perturbed the wire response");
+
+        // --- Row 5: the handler's param is NOT named `req`. ---------------------
+        // The log scope's base is the HARDCODED synthetic `req` (verbosec's own
+        // convention, verifier.rs:1127) and the emitted read comes from the CAPTURED
+        // spans, so it is param-name-independent. Accepted, and correct. This is a
+        // documented self-hosted-ahead-of-verbosec divergence: verbosec's verifier
+        // accepts the same source but its native emitter fails on it.
+        let (wire, log) = run("param_r", "r",
+            "resp = HttpResponse { status: 200, body: r.path }", "[r.path]", "1",
+            Some("concat(req.path, \"\\n\")"), &reqs_ref);
+        assert_eq!(log.lines().collect::<Vec<_>>(), paths,
+            "a handler param named `r` with a log naming `req.path` must still log \
+             the real path — the log scope's base is the synthetic `req`, and the \
+             emitted read comes from the captured spans; got {:?}", log);
+        assert_eq!(wire, echo_path_wire, "param-name divergence perturbed the wire response");
+
+        // --- Row 6: S3 (router) with log field != COND field. -------------------
+        // The router's field-select is driven by the cond LHS (req.path); the log
+        // names req.method. Also pins that jump3/jump4/jump5 stay correct with the
+        // log block spliced between the select and the compare glue.
+        let s3 = "resp = if req.path == \"/p1\" then HttpResponse { status: 200, body: \"home\" } else HttpResponse { status: 404, body: \"nope\" }";
+        let (wire, log) = run("s3_cross", "req", s3, "[req.path]", "8",
+            Some("concat(req.method, \" \", req.path, \"\\n\")"), &reqs_ref);
+        assert_eq!(log.lines().collect::<Vec<_>>(),
+            paths.iter().map(|p| format!("GET {}", p)).collect::<Vec<_>>(),
+            "S3 access log; got {:?}", log);
+        assert_eq!(wire[0].as_slice(), b"HTTP/1.0 200 OK\r\nContent-Length: 4\r\n\r\nhome",
+            "S3 THEN arm broke with a field log; got {:?}", String::from_utf8_lossy(&wire[0]));
+        for got in &wire[1..] {
+            assert_eq!(got.as_slice(), b"HTTP/1.0 404 OK\r\nContent-Length: 4\r\n\r\nnope",
+                "S3 ELSE arm broke with a field log (jump3/4/5 must be UNCHANGED by \
+                 the insertion); got {:?}", String::from_utf8_lossy(got));
+        }
+
+        // --- Row 7: S4 (concat body) with log field != the concat's field arg. ---
+        let s4 = "resp = HttpResponse { status: 200, body: concat(\"you asked for \", req.path) }";
+        let (wire, log) = run("s4_cross", "req", s4, "[req.path]", "8",
+            Some("concat(req.method, \"\\n\")"), &reqs_ref);
+        assert_eq!(log.lines().collect::<Vec<_>>(), vec!["GET"; 5],
+            "S4 with a method log; got {:?}", log);
+        for (i, got) in wire.iter().enumerate() {
+            let want = format!("HTTP/1.0 200 OK\r\nContent-Length: {}\r\n\r\nyou asked for {}",
+                14 + paths[i].len(), paths[i]);
+            assert_eq!(got.as_slice(), want.as_bytes(),
+                "S4 concat body broke with a field log — r14 (the body field's length) \
+                 must survive the log block; got {:?}", String::from_utf8_lossy(got));
+        }
+
+        // --- (5) PARSE-FAIL SEMANTICS: the two placements, side by side. --------
+        // A malformed request never reaches the field-select, so both parse-fail je's
+        // jump OVER a post-select field log -> no line. A STATIC log sits pre-read and
+        // still records it — slice 5a's "log every accepted connection" audit posture,
+        // deliberately preserved.
+        let mixed: Vec<&[u8]> = vec![
+            b"GET /p1 HTTP/1.0\r\n\r\n",
+            b"ZZZZ\r\n\r\n",
+            b"GET /p22 HTTP/1.0\r\n\r\n",
+        ];
+        let (wire, log) = run("field_malformed", "req", s2_path, "[req.path]", "1",
+            Some("concat(req.path, \"\\n\")"), &mixed);
+        assert!(wire[1].is_empty(), "a malformed request must still be dropped");
+        assert_eq!(log.lines().collect::<Vec<_>>(), vec!["/p1", "/p22"],
+            "a FIELD log must NOT record a request that never parsed — the field does \
+             not exist before the parse, so the block is post-select and the \
+             parse-fail jumps skip it; got {:?}", log);
+        let (wire, log) = run("static_malformed", "req", s2_path, "[req.path]", "1",
+            Some("\"hit\\n\""), &mixed);
+        assert!(wire[1].is_empty(), "a malformed request must still be dropped");
+        assert_eq!(log.lines().count(), 3,
+            "a STATIC log must STILL record the malformed request — slice 5a's \
+             log-per-ACCEPTED-CONNECTION coverage is preserved by keying placement on \
+             the content shape, not on the branch; got {:?}", log);
+
+        let _ = fs::remove_file(&elf);
+    }
+
     /// SELF-HOSTING SERVICE slice 1 — verify gate pins. The self-hosted emitter's
     /// leading abort_if(verrs) refuses (exit 1, empty stdout) every service audit
     /// violation; a clean hello_http emits an ELF.
@@ -24629,16 +24977,19 @@ rule le64_neg
         let k3 = run(&clean);
         assert!(k3.status.success() && k3.stdout.len() >= 4 && &k3.stdout[0..4] == b"\x7fELF",
             "a service with no log block must still emit; got {:?}", k3.status);
-        // (k4) CONCAT content -> refused (S5b: it needs the post-field-select placement
-        // and the per-arg write shape).
+        // (k4) SLICE 5B: CONCAT content naming req fields is REFUSED **here** because
+        // `clean`'s handler is the S1 constant-response shape, which has no parse loop
+        // — there is no span to capture. Deferred to S5b.2 (give S1 a conditional
+        // parse). The k11+ rows below pin that the SAME content EMITS on S2/S3/S4.
         refuse(&withlog("  log:\n    append_file \"/tmp/vx_svc_s5a.log\" concat(\"hit \", req.path)"),
-            "concat log content -> S5b");
-        // (k5) FIELD content -> refused (S5b).
+            "field log content on an S1 handler -> S5b.2");
+        // (k5) FIELD content on S1 -> same refusal, same reason.
         refuse(&withlog("  log:\n    append_file \"/tmp/vx_svc_s5a.log\" req.path"),
-            "req field log content -> S5b");
-        // (k6) NUMBER content -> refused (an AstNum needs an itoa arm — S5b).
+            "bare field log content on an S1 handler -> S5b.2");
+        // (k6) NUMBER content -> refused (an AstNum needs an itoa arm the log block
+        // does not have; resp.status is the motivating case).
         refuse(&withlog("  log:\n    append_file \"/tmp/vx_svc_s5a.log\" 42"),
-            "number log content -> S5b");
+            "number log content");
         // (k7) `on_error: abort` -> refused (S5c: the accept loop has no sys_exit(1)
         // tail). CRITICAL that this REFUSES rather than being ignored: the line is
         // PARSED, so a declared abort can never be silently downgraded to drop.
@@ -24654,6 +25005,74 @@ rule le64_neg
         // (k10) MALFORMED log decl — a misspelled effect head.
         refuse(&withlog("  log:\n    print_file \"/tmp/vx_svc_s5a.log\" \"hit\\n\""),
             "misspelled log effect head");
+
+        // ------------------------------------------------------------------
+        // SLICE 5b — log CONTENT from request fields. The gate widens to
+        // AstField(AstVar("req"), method|path) and a concat of those, on the
+        // three body shapes that HAVE a parse (S2/S3/S4).
+        // ------------------------------------------------------------------
+        // A log block appended to an S2 (field-echo) service — the shape whose
+        // handler parses, so the spans the log needs actually exist.
+        let s2_svc = mkr("resp = HttpResponse { status: 200, body: req.path }",
+            "[req.path]", &svc("http_1_0", "18888", "4096", "hello_handler"));
+        let with_s2_log = |block: &str| -> String { format!("{}\n{}", s2_svc, block) };
+        let emits = |prog: &str, why: &str| {
+            let o = run(prog);
+            assert!(o.status.success() && o.stdout.len() >= 4 && &o.stdout[0..4] == b"\x7fELF",
+                "gate must EMIT ({}); got {:?} stderr={:?}",
+                why, o.status, String::from_utf8_lossy(&o.stderr));
+        };
+        // (k11) a bare req field as content.
+        emits(&with_s2_log("  log:\n    append_file \"/tmp/vx_svc_s5b.log\" req.path"),
+            "S5b bare req.path log content");
+        // (k12) req.method too (the other capture arm).
+        emits(&with_s2_log("  log:\n    append_file \"/tmp/vx_svc_s5b.log\" req.method"),
+            "S5b bare req.method log content");
+        // (k13) the canonical two-field access log (cap = 18).
+        emits(&with_s2_log("  log:\n    append_file \"/tmp/vx_svc_s5b.log\" concat(req.method, \" \", req.path, \"\\n\")"),
+            "S5b two-field access log");
+        // (k14) a repeated field.
+        emits(&with_s2_log("  log:\n    append_file \"/tmp/vx_svc_s5b.log\" concat(req.path, req.path)"),
+            "S5b repeated field");
+        // (k15) a NON-`req` base -> refused. The log scope's base is the HARDCODED
+        // synthetic `req` (span_is_req), never the handler's param name — so this is
+        // refused even though the handler's param IS named `req`.
+        refuse(&with_s2_log("  log:\n    append_file \"/tmp/vx_svc_s5b.log\" concat(bogus.path, \"\\n\")"),
+            "non-`req` base in log content");
+        // (k16) an unsupported req field (req.body / req.timestamp) -> refused: no
+        // parsed span exists for either.
+        refuse(&with_s2_log("  log:\n    append_file \"/tmp/vx_svc_s5b.log\" req.body"),
+            "req.body log content");
+        refuse(&with_s2_log("  log:\n    append_file \"/tmp/vx_svc_s5b.log\" concat(req.timestamp, \"\\n\")"),
+            "req.timestamp log content");
+        // (k17) resp.* -> refused (the server STREAMS its response; there is no buffer
+        // to re-read, and the status is an itoa arm the log block lacks).
+        refuse(&with_s2_log("  log:\n    append_file \"/tmp/vx_svc_s5b.log\" concat(resp.status, \"\\n\")"),
+            "resp.status log content");
+        refuse(&with_s2_log("  log:\n    append_file \"/tmp/vx_svc_s5b.log\" resp.body"),
+            "resp.body log content");
+        // (k18) a nested concat inside the log content -> refused (an arg must be an
+        // AstStr or a req field).
+        refuse(&with_s2_log("  log:\n    append_file \"/tmp/vx_svc_s5b.log\" concat(\"a\", concat(req.path, \"\\n\"))"),
+            "nested concat in log content");
+        // (k19) a non-concat call as content -> refused (span_is_concat callee check).
+        refuse(&with_s2_log("  log:\n    append_file \"/tmp/vx_svc_s5b.log\" somecall(req.path)"),
+            "non-concat call as log content");
+        // (k20) a NUMBER arg inside the concat -> refused (no itoa arm).
+        refuse(&with_s2_log("  log:\n    append_file \"/tmp/vx_svc_s5b.log\" concat(req.path, 42)"),
+            "number arg in log concat");
+        // (k21) `on_error: abort` stays refused even with field content (S5c).
+        refuse(&with_s2_log("  log:\n    append_file \"/tmp/vx_svc_s5b.log\" concat(req.path, \"\\n\")\n    on_error: abort"),
+            "on_error: abort with field content -> S5c");
+        // (k22) THE ACCEPTED DIVERGENCE: a handler whose input param is NOT `req`,
+        // with a log naming `req.path`. ACCEPTED — the log scope's base is the
+        // synthetic `req` and the emitted read comes from the CAPTURED parse spans,
+        // so it is genuinely param-name-independent. verbosec's verifier accepts the
+        // same source but its native emitter fails on it; documented in
+        // docs/self-hosting-service-slice5b-design.md.
+        let param_r = format!("rule hello_handler\n  input:\n    r : HttpRequest\n  output:\n    resp : HttpResponse\n  logic:\n    resp = HttpResponse {{ status: 200, body: r.path }}\n  proofs:\n    purity:\n      reads : [r.path]\n      calls : []\n    termination:\n      bound : 1\n{}\n  log:\n    append_file \"/tmp/vx_svc_s5b.log\" concat(req.path, \"\\n\")",
+            svc("http_1_0", "18888", "4096", "hello_handler"));
+        emits(&param_r, "S5b log naming `req` while the handler param is `r`");
 
         let _ = fs::remove_file(&gate);
     }
