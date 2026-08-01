@@ -131,8 +131,9 @@ pre-read placement and KEEP that coverage.
 Field logs are post-parse **by physical necessity, not by policy** — the field
 does not exist before the parse. That is a CONSEQUENCE of what you asked to log,
 not a downgrade of judgment. Say it that way in the release note.
-COST of keying on content shape: 8 log splice sites (4 branches × 2 content
-shapes) + 3 capture sites = 11, vs 7 for branch-keying. Accepted: it preserves
+COST of keying on content shape: **7 log splice sites** (S1 keeps ONE unconditional
+pre-read site — a field log on S1 is refused, so its second site would be dead
+code) + 3 capture sites = **10**, vs 7 for branch-keying. Accepted: it preserves
 **byte-identity for ALL existing static-log services** (not just S1), causes ZERO
 behavior change for existing S5a users, and keeps the audit signal where it can be
 kept. Drift across splices is about PLACEMENT, not content; the expanded matrix +
@@ -163,6 +164,16 @@ loop's `74 14`@0xec, `74 0e`@0xf2, `74 08`@0xf8 ALL target **0x102 exactly** (th
 select). The capture must be spliced at that precise address with NOTHING between
 the je targets and it — then their displacements are unchanged for free. That is
 why no rel8 appears in the 9-constant table.
+**A BUG IN THIS TABLE, CAUGHT AT RUNTIME (recorded — the lesson outlives the
+slice).** The row "S2 back `+cap`" is right in intent but S2's back-jump is
+**inline** (`le32(0 - (470 + logsz))`), not a named `jump6`-style let like S3/S4 —
+so it is easy to miss when applying `+cap`. Missing it made the server answer
+request 1 correctly, then jump 9 bytes past `accept_top` into mid-instruction and
+SIGSEGV on request 2. **`p_filesz` was CORRECT throughout** (the size walk already
+had `cap`), so the size/emit assertion could never have caught it — only a SECOND
+request could. TAKEAWAY: byte-count asserts prove the size walk agrees with the
+emit walk; they say NOTHING about whether a jump lands where you meant. Any slice
+touching loop-back edges must issue ≥2 requests per server in its milestone.
 **SIZING PLACEMENT (review MUST-FIX 9 — I stated this wrong):** `logsz` ALREADY
 sits OUTSIDE the fork in `service_tramp_size` (VP:28519: `out = logsz + (if
 ast_is_str … )`) and **must NOT move** — the size is position-independent;
@@ -175,13 +186,14 @@ changes.
 Post-select, both parse-fail `je`s (s2.elf 0x173/0x199 → 0x308, the close tail)
 jump OVER the log block → malformed requests stop being logged. That is exactly
 verbosec (all fail patches resolve to close_label at NR:19445, taken AFTER the log
-emit NR:19397). **This IS a behavior change for existing S5a users on S2/S3/S4**
-(today they log every accepted connection) and the current S5a test would NOT
-catch it (5 well-formed requests, NR:24256). Accept it deliberately: it moves
-TOWARD verbosec, gives one semantics per handler shape instead of two, and is the
-more defensible audit posture (a logged line implies a parsed request). Document
-as an S5a→S5b correction and **pin it explicitly** (a malformed request produces
-NO log line on S2/S3/S4 — it's the whole point of the move).
+emit NR:19397). **This applies ONLY to FIELD logs** — a stale earlier draft of
+this doc claimed it was "a behavior change for existing S5a users on S2/S3/S4";
+that is NOT what shipped. Under the content-shape keying above, STATIC logs stay
+pre-read and keep logging every accepted connection (S5a's coverage, byte-identical
+binaries, zero user-visible change). A FIELD log necessarily sits post-parse — the
+field does not exist earlier — so it logs only parsed requests. **Pin BOTH sides**:
+a malformed request produces NO line for a field log, and DOES produce a line for a
+static log on the same branch.
 
 ## Verify
 `svc_log_content_ok` (VP:13727) widens from `AstStr => 1` to: AstStr → 1;
@@ -272,8 +284,11 @@ Hand-run: spawn a logged ROUTER with `concat(req.method, " ", req.path, "\n")`,
 curl 3×, verify routing still correct, `cat` the log.
 
 ## Risks
-(a) byte-identity: preserved for all no-log services and S1+static-log; LOST for
-S2/S3/S4 static-log by design (§parse-fail parity) — re-pin. (b) sizing: the
+(a) byte-identity: **preserved for ALL no-log AND ALL static-log services** (the
+static placement is unchanged) — an earlier draft said it was "LOST for S2/S3/S4
+static-log"; that was the branch-keyed design and is NOT what shipped. Measured:
+all 8 `{S1,S2,S3,S4} × {no-log, static-log}` ELFs bit-identical pre/post, plus the
+canonical 931 B / `ff8f9674…` pin. (b) sizing: the
 smallest yet (content sizing reused verbatim; only `cap` is new). (c) eager-let /
 sentinel tolerance: svc_log_uses_* and cap run on SvNil and on log-less services —
 all walk an Ast, AstErr → 0 (VP:26240-26241 discipline). (d) 7 splice sites — drift
