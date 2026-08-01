@@ -24535,25 +24535,29 @@ rule le64_neg
               hardcoded je targets — le32(399) reproduces \\x8f\\x01\\x00\\x00 exactly)"
         );
 
-        // The four body shapes, each with a STATIC log block, pinned. If S5b had keyed
-        // placement on the BRANCH instead of on the CONTENT shape, every one of these
-        // would have moved.
+        // The four body shapes, each with a STATIC log block, pinned. Placement is
+        // still keyed on the CONTENT shape (S5b), so a static log has not MOVED; its
+        // bytes changed only because slice 5b.5 replaced the content write with the
+        // writev sequence. Re-pinned on post-5b.5 gen0.
         let shapes: [(&str, &str, &str, &str); 4] = [
             ("s1", "resp = HttpResponse { status: 200, body: \"Hi\" }", "[]", "1"),
             ("s2", "resp = HttpResponse { status: 200, body: req.path }", "[req.path]", "1"),
             ("s3", "resp = if req.path == \"/\" then HttpResponse { status: 200, body: \"home\" } else HttpResponse { status: 404, body: \"nope\" }", "[req.path]", "8"),
             ("s4", "resp = HttpResponse { status: 200, body: concat(\"you asked for \", req.path) }", "[req.path]", "8"),
         ];
-        // (tag, no-log size + sha, static-log size + sha) — all measured on pre-S5b gen0.
+        // (tag, no-log size + sha, static-log size + sha). The NO-LOG column is the
+        // pre-S5a value and must NEVER move (the whole log term is gated on
+        // svc_log_present); the static-log column is re-pinned per slice that changes
+        // the emitted block — 5b.5 is such a slice.
         let pins: [(usize, &str, usize, &str); 4] = [
             (847,  "d561c6ff84133a80065cdee16aa069ff671c9be858029043fe7f3cdcd87bf350",
-             992,  "a9d231384e9b96d711bbebf53888acfbb51a3d433ef1ca007d09d9d58c5a94cf"),
+             1025, "8398da38d096f3aa6470f9ce94cd64c3e7d0a1a1c3976655041972fa389aac53"),
             (880,  "1ccf2f3584b02a673aa67a632fa6b4199c088d2c2e4897e07453f5732a9b421e",
-             973,  "f9f4a742c9da8ed2d4b978d2f7d6d9e50b2532823a74a12002a101e5207144ca"),
+             1006, "97910d98772c6e1af7c95aa72da8c3c5e3689f5718a44575fd713a9960dfbda8"),
             (1280, "dcf91b84a089c2d237bd5829b3cd4cb31aa6d74f9bd749fa5dbbda5e0be3b796",
-             1421, "e7d5e4b1b93fe0ec4d5459d5ba498b6d2f577fbedd7b38c9de8aa84beda890f8"),
+             1454, "694a3a505fdd90abf4c189518ee24ab80f324b234a0a272c4296aa77b0f861ab"),
             (1274, "89b6b2752bc9f8665feee9f8ef43e39677d71400292ee0a99cf243e9a3584fa5",
-             1415, "fef5ea6bc483a391985df3b5bcc6b07ab70316f4a8e4666d2983e4140dadd7e1"),
+             1448, "97ebed0955e727a247518c986ef6f22283d75d9d79d8336b18564fd58c055483"),
         ];
         let static_log = "\n  log:\n    append_file \"/tmp/vx_ref.log\" \"hit\\n\"";
         for (i, (tag, logic, reads, bound)) in shapes.iter().enumerate() {
@@ -24567,9 +24571,24 @@ rule le64_neg
             assert!(l.status.success(), "({tag}) static-log service must emit");
             assert_eq!(l.stdout.len(), lsz, "({tag}) static-log ELF size drifted");
             assert_eq!(sha256_hex(&l.stdout), lsha,
-                "({tag}) a STATIC-content log must stay BYTE-IDENTICAL to pre-S5b gen0 \
-                 — S5b keys placement on the CONTENT shape precisely so that no \
-                 existing static-log service moves or changes behavior");
+                "({tag}) static-log ELF drifted from its post-5b.5 pin");
+        }
+
+        // FIELD-log byte pins (fixed port + fixed log path, never spawned). These are
+        // the rows the slice exists for: a 4-entry concat and a bare single field.
+        let s2_echo = shapes[1].1;
+        for (tag, content, size, sha) in [
+            ("both", "concat(req.method, \" \", req.path, \"\\n\")", 1092usize,
+             "f90d706fa496a725c0c530b020e83a0b3addfce986c17326f6c46ea253a60b64"),
+            ("bare", "req.path", 995,
+             "1da04fbd253b881e0890aa020e64e821a9a01a15b627c0512ef26b26dc6055b1"),
+        ] {
+            let f = emit(&mk("req", s2_echo, "[req.path]", "1", 18991,
+                &format!("\n  log:\n    append_file \"/tmp/vx_ref.log\" {}", content)));
+            assert!(f.status.success(), "({tag}) field-log service must emit");
+            assert_eq!(f.stdout.len(), size, "({tag}) field-log ELF size drifted");
+            assert_eq!(sha256_hex(&f.stdout), sha,
+                "({tag}) field-log ELF drifted from its post-5b.5 pin");
         }
 
         // (6) FIELD content on an S1 (constant-response) handler: REFUSED. S1 emits

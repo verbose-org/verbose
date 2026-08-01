@@ -28617,30 +28617,152 @@ rule x86_svc_log_capture
       bound : 64
 
 
--- svc_log_content_size: the byte length of a log block's CONTENT blocks. Slice 5a
--- lowers exactly ONE shape — an AstStr literal, as the 31 + 4-padded literal block
--- (rx_lit_block_size, the shared closed form: x86_svc_log_lit_block is byte-length
--- identical to x86_rx_lit_block, only the fd register differs and both encodings are
--- 3 B). Every other arm is 0, MIRRORING x86_svc_log_content ARM-FOR-ARM so size and
+-- ============================================================================
+-- SELF-HOSTING SERVICE slice 5b.5 — ONE `writev` per log line. Slice 5b emitted
+-- one `write()` per concat arg; this slice replaces the N writes with a single
+-- `writev(fd, iov, N)` (syscall 20) over an iovec array built on the stack. The
+-- args' (ptr, len) pairs are ALREADY in registers (the S5b capture) or are inline
+-- literals, so no buffering and no compile-time max length is needed — which is
+-- why this route does not require widening FieldList (which carries no range slot).
+-- SHAPE (all fixed-length, so N is the only arity term):
+--   sub rsp, 16*N                     48 81 ec le32(16*N)      7 B
+--   <fill entry i, in source order>   x86_svc_log_iov          per-arg
+--   mov rsi, rsp                      48 89 e6                 3 B
+--   mov rdi, r15                      4c 89 ff                 3 B   (the log fd)
+--   mov edx, N                        ba le32(N)               5 B   (iovcnt)
+--   mov eax, 20                       b8 14 00 00 00           5 B   (sys_writev)
+--   syscall                           0f 05                    2 B
+--   add rsp, 16*N                     48 81 c4 le32(16*N)      7 B
+-- The iovec scratch is allocated BELOW the request buffer (which lives at
+-- [rsp, rsp + max_request) and is therefore at HIGHER addresses, untouched) and is
+-- balanced immediately — the same pattern as the itoa's `sub rsp,0x20`. The S5b
+-- captured (ptr, len) pairs point INTO the request buffer and are unaffected.
+-- ATOMICITY IS NOT UPGRADED BY THIS SLICE. `writev` is atomic under exactly the
+-- same UNPROVEN Linux inode-lock property as a single `write` (an implementation
+-- property of generic_file_write_iter, not a POSIX contract; it does not hold over
+-- NFS). This is PARITY WITH VERBOSEC, which buffers the line and issues one write
+-- (NR:7877-7896) — it is NOT a "fork-safe" guarantee.
+-- ============================================================================
+
+concept SvcLogIovState
+  @intention: "One log content arg + the source + its zero-based iovec entry index"
+  @source: vexprparse.intent:74
+  fields:
+    node : Ast
+    src : text [..256]
+    idx : number [0, 4000000]
+
+
+concept SvcLogIovsState
+  @intention: "The remaining log content concat args + the source + the next iovec entry index"
+  @source: vexprparse.intent:74
+  fields:
+    args : ArgList
+    src : text [..256]
+    idx : number [0, 4000000]
+
+
+-- svc_log_iov_size: the byte length of the iovec FILL block for ONE log content arg
+-- — the hand-synced sibling of x86_svc_log_iov, mirrored ARM-FOR-ARM.
+--   AstStr  -> 32 + 4*((declen+3)/4). The inline data block is UNCHANGED from the
+--              pre-writev literal block (`e9` jmp over the 4-padded decoded bytes,
+--              5 B + block); only the WRITE is replaced by a fill:
+--              lea rax,[rip-(block+7)] (7) + mov [rsp+16i],rax (8) +
+--              mov qword [rsp+16i+8],declen (12) = 27.
+--   AstField -> 16: two 8-byte `mov [rsp+disp32], <reg>` stores of the S5b captured
+--              (ptr, len) pair. No strlen, no copy — the registers already hold it.
+--   every other shape -> 16, the DEFINED REFUSED-SHAPE FALLBACK (x86_svc_log_iov's
+--              fallback arm emits the path-register fill). It is 16 and not 0 because
+--              N — the iovcnt handed to writev — is arg_list_len, so EVERY arg must
+--              fill exactly one entry or the syscall would read an uninitialised
+--              slot. Those shapes are refused by svc_log_ok and never reach the
+--              emitted output, but eager lets still evaluate this walk
+--              (VP:26276-26278) and it must agree with the emit walk on them too.
+-- WHAT THIS SLICE GIVES UP: svc_carg_size's VERBATIM reuse (S5b's headline win).
+-- The iovec-fill block length differs from the body-write block length, so a
+-- log-specific size walk is needed either way — writev avoids the ARITY-DEPENDENT
+-- CHECK COUNT that S5c would otherwise need, not the walk itself.
+rule svc_log_iov_size
+  @intention: "Byte length of one log content arg's iovec fill block: 32 + padded literal for AstStr, 16 otherwise"
+  @source: vexprparse.intent:74
+  input:
+    rc : RxContentState
+  output:
+    out : number
+  logic:
+    out = match rc.node:
+      AstNum(value) => 16
+      AstBin(op, lhs, rhs) => 16
+      AstNeg(inner) => 16
+      AstNot(inner) => 16
+      AstVar(start, len) => 16
+      AstField(base, fstart, flen) => 16
+      AstCall(callee_start, callee_len, args) => 16
+      AstStr(start, len) => 32 + 4 * ((bytelit_decoded_len(DecodeState { src: rc.src, start: start + 1, len: (if len >= 2 then len - 2 else 0), i: 0 }) + 3) / 4)
+      AstBytes(start, len) => 16
+      AstBool(value) => 16
+      AstIf(cond, thn, els) => 16
+      AstErr => 16
+      AstVariant(cstart, clen, vstart, vlen, fields) => 16
+      AstMatch(scrut, arms) => 16
+      AstOk(inner) => 16
+      AstResErr(inner) => 16
+      AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => 16
+      AstSum(coll, item_start, item_len, body) => 16
+      AstCount(coll, item_start, item_len, body) => 16
+      AstFold(coll, init, acc_start, acc_len, item_start, item_len, body) => 16
+      AstAll(coll, item_start, item_len, body) => 16
+      AstAny(coll, item_start, item_len, body) => 16
+      AstMap(coll, item_start, item_len, body) => 16
+      AstFilter(coll, item_start, item_len, body) => 16
+      AstMinFold(coll, item_start, item_len, body) => 16
+      AstMaxFold(coll, item_start, item_len, body) => 16
+  proofs:
+    purity:
+      reads : [rc.node, rc.src]
+      calls : [bytelit_decoded_len]
+    termination:
+      bound : 64
+
+
+-- svc_log_iovs_size: the total iovec fill length for a log concat's args, in order.
+-- Mentions its recursion ONCE; ArgNil -> 0 (tolerant base — the SvNil sentinel and
+-- every non-concat content reach this with ArgNil under eager lets).
+rule svc_log_iovs_size
+  @intention: "Total iovec fill byte length of a log content concat's args, in order"
+  @source: vexprparse.intent:74
+  input:
+    ra : RxCArgsState
+  output:
+    out : number
+  logic:
+    out = match ra.args:
+      ArgCons(head, tail) => svc_log_iov_size(RxContentState { node: head, src: ra.src }) + svc_log_iovs_size(RxCArgsState { args: tail, src: ra.src })
+      ArgNil => 0
+  proofs:
+    purity:
+      reads : [ra.args, ra.src]
+      calls : [svc_log_iov_size, svc_log_iovs_size]
+    termination:
+      bound : 512
+
+
+-- svc_log_content_size: the byte length of a log block's CONTENT — now the whole
+-- writev sequence: the 32 fixed bytes of wrapper (sub rsp 7 + mov rsi,rsp 3 +
+-- mov rdi,r15 3 + mov edx,N 5 + mov eax,20 5 + syscall 2 + add rsp 7) plus the
+-- per-arg iovec fills. Every arm MIRRORS x86_svc_log_content ARM-FOR-ARM so size and
 -- emit cannot drift even on refused shapes evaluated under eager lets.
+--   AstStr / AstField -> one entry  (N = 1)
+--   AstCall           -> one entry per arg (N = arg_list_len)
+--   everything else   -> 0: no entries, so NO writev sequence at all (not a
+--                        zero-count writev) — the same b"" x86_svc_log_content emits.
 -- DELIBERATELY NOT rx_content_blocks_size: its concat arm walks per-arg with an
 -- AstField block that loads from an ARENA RECORD ([rsp] -> index -> imul -> add r15
 -- -> slot). A service has NO input marshal (has_input is forced 0) — no pushed index,
 -- no record — so importing that arm would bake a KNOWN-WRONG shape into the service
 -- emitter for the sake of dead code svc_log_ok already refuses.
--- SLICE 5b WIDENING: AstField -> the fixed 18-byte write(r15, <captured span>), and
--- AstCall -> svc_cargs_size REUSED VERBATIM. The reuse is exact because the log's
--- field write is byte-length-IDENTICAL to the response body's field write (both are
--- `mov rax,1 ; mov rdi,<fd> ; mov rsi,<ptr> ; mov rdx,<len> ; syscall` = 18 B; only
--- the register operands differ, and every one of those movs is 3 B). So slice 5b
--- adds ZERO new hand-synced number/bytes pairs for content — the only new number
--- term in this slice is svc_log_capture_size.
--- THE COUPLING THIS CREATES: svc_carg_size is now the single size truth for TWO
--- emitters (the body write and the log write) — a 1-size -> 2-emit fan-out. A later
--- change to the body write silently desyncs the log, so the p_filesz assertion must
--- run on a FIELD-LOG row, not only on static-log rows.
 rule svc_log_content_size
-  @intention: "Byte length of a service log block's content blocks: one literal block for AstStr, 18 for a req field, the per-arg total for a concat"
+  @intention: "Byte length of a service log block's content: the 32-byte writev wrapper plus one iovec fill per arg"
   @source: vexprparse.intent:74
   input:
     rc : RxContentState
@@ -28653,9 +28775,9 @@ rule svc_log_content_size
       AstNeg(inner) => 0
       AstNot(inner) => 0
       AstVar(start, len) => 0
-      AstField(base, fstart, flen) => 18
-      AstCall(callee_start, callee_len, args) => svc_cargs_size(RxCArgsState { args: args, src: rc.src })
-      AstStr(start, len) => rx_lit_block_size(SpanCheck { src: rc.src, start: start, len: len })
+      AstField(base, fstart, flen) => 32 + svc_log_iov_size(rc)
+      AstCall(callee_start, callee_len, args) => 32 + svc_log_iovs_size(RxCArgsState { args: args, src: rc.src })
+      AstStr(start, len) => 32 + svc_log_iov_size(rc)
       AstBytes(start, len) => 0
       AstBool(value) => 0
       AstIf(cond, thn, els) => 0
@@ -28676,8 +28798,8 @@ rule svc_log_content_size
       AstMaxFold(coll, item_start, item_len, body) => 0
   proofs:
     purity:
-      reads : [rc.node, rc.src]
-      calls : [rx_lit_block_size, svc_cargs_size]
+      reads : [rc.node, rc.src, rc]
+      calls : [svc_log_iov_size, svc_log_iovs_size]
     termination:
       bound : 64
 
@@ -28715,68 +28837,146 @@ rule svc_log_block_size
       bound : 64
 
 
--- x86_svc_log_lit_block: emit ONE inline literal content block to the LOG fd — the
--- fd=r15 mirror of x86_rx_lit_block (`4c 89 ff` mov rdi,r15 in place of `48 89 df`
--- mov rdi,rbx — 3 B either way, size-stable, which is why rx_lit_block_size sizes
--- BOTH). `e9` jmp over the 4-padded decoded data, then mov rax,1 (the 7-BYTE
--- 48 c7 c0 form, NOT the 5-byte b8 form — the disp arithmetic only holds for these),
--- mov rdi,r15 (3), lea rsi rip-rel (7, disp -(block + 17) where 17 = 7+3+7), mov rdx
--- = dlen (7), syscall (2). The write length is dlen (decoded), skipping the 4-byte
--- padding; no NUL (that is path-only). Input span = the AstStr TOKEN span (quotes
--- included). Size = 31 + block.
-rule x86_svc_log_lit_block
-  @intention: "Emit one inline literal log block: jmp-over-data + write(r15, data, dlen)"
+-- x86_svc_log_iov (self-hosting-service-slice-5b.5): emit the iovec FILL for ONE log
+-- content arg at entry `iv.idx`. The hand-synced sibling of svc_log_iov_size,
+-- mirrored ARM-FOR-ARM. Both stores use the disp32 form (`mov [rsp+disp32], reg` =
+-- 8 B: REX 89 /r ModRM(mod=10) SIB(0x24) disp32) so EVERY fill is fixed-length and N
+-- is the only arity term.
+--   AstStr  -> e9 le32(block) ; <4-padded decoded bytes> ;      (5 + block, unchanged)
+--              48 8d 05 le32(-(block+7))   lea rax,[rip-…]      (7)
+--              48 89 84 24 le32(16i)       mov [rsp+16i], rax   (8)
+--              48 c7 84 24 le32(16i+8) le32(declen)             (12)
+--                                          mov qword [rsp+16i+8], declen
+--   AstField -> 4c 89 94 24 le32(16i)      mov [rsp+16i], r10   (method ptr)
+--            |  48 89 ac 24 le32(16i)      mov [rsp+16i], rbp   (path ptr)
+--               4c 89 84 24 le32(16i+8)    mov [rsp+16i+8], r8  (method len)
+--            |  4c 89 8c 24 le32(16i+8)    mov [rsp+16i+8], r9  (path len)
+--              — the S5b capture registers read DIRECTLY: no strlen, no copy.
+-- THE AstField ARM EMITS 16 BYTES UNCONDITIONALLY, arm-for-arm with
+-- svc_log_iov_size's unconditional 16. The internal span_is_method fork picks the
+-- register pair; every OTHER arm is the SAME 16-byte fill in the path shape — a
+-- DEFINED REFUSED-SHAPE FALLBACK for the nodes the gate refuses but eager lets still
+-- evaluate (`resp.status`, `req.body`, a non-`req` base, a nested concat). They never
+-- reach the emitted output (abort_if fires first), but the walk must still produce
+-- the byte count the size walk promised — AND fill the entry, because N counts every
+-- arg and writev would otherwise read an uninitialised slot.
+-- EAGER-LET SAFETY: the decode lets run on every shape. ast_str_start / ast_str_len
+-- return 0 for a non-AstStr node, so l0 = 0 -> dlen = 0 -> block = 0 and
+-- emit_bytes_data returns b"" immediately; ast_field_fstart / ast_field_flen return 0
+-- for a non-AstField node and span_is_method(src, 0, 0) is 0.
+rule x86_svc_log_iov
+  @intention: "Emit one log content arg's iovec entry fill: inline literal + lea for AstStr, captured (ptr, len) stores for a req field"
   @source: vexprparse.intent:74
   input:
-    sc : SpanCheck
+    iv : SvcLogIovState
   output:
     out : bytes
   logic:
-    let dlen = bytelit_decoded_len(DecodeState { src: sc.src, start: sc.start + 1, len: (if sc.len >= 2 then sc.len - 2 else 0), i: 0 })
+    let s0 = ast_str_start(iv.node) + 1
+    let l0 = if ast_str_len(iv.node) >= 2 then ast_str_len(iv.node) - 2 else 0
+    let dlen = bytelit_decoded_len(DecodeState { src: iv.src, start: s0, len: l0, i: 0 })
     let block = 4 * ((dlen + 3) / 4)
-    out = concat(b"\xe9", le32(block), emit_bytes_data(BytesEmitState { src: sc.src, start: sc.start + 1, len: (if sc.len >= 2 then sc.len - 2 else 0), i: 0, dlen: dlen }), b"\x48\xc7\xc0\x01\x00\x00\x00\x4c\x89\xff\x48\x8d\x35", le32(0 - (block + 17)), b"\x48\xc7\xc2", le32(dlen), b"\x0f\x05")
+    let d0 = 16 * iv.idx
+    let d8 = 16 * iv.idx + 8
+    let ism = span_is_method(SpanCheck { src: iv.src, start: ast_field_fstart(iv.node), len: ast_field_flen(iv.node) })
+    out = match iv.node:
+      AstNum(value) => concat(b"\x48\x89\xac\x24", le32(d0), b"\x4c\x89\x8c\x24", le32(d8))
+      AstBin(op, lhs, rhs) => concat(b"\x48\x89\xac\x24", le32(d0), b"\x4c\x89\x8c\x24", le32(d8))
+      AstNeg(inner) => concat(b"\x48\x89\xac\x24", le32(d0), b"\x4c\x89\x8c\x24", le32(d8))
+      AstNot(inner) => concat(b"\x48\x89\xac\x24", le32(d0), b"\x4c\x89\x8c\x24", le32(d8))
+      AstVar(start, len) => concat(b"\x48\x89\xac\x24", le32(d0), b"\x4c\x89\x8c\x24", le32(d8))
+      AstField(base, fstart, flen) => concat((if ism == 1 then b"\x4c\x89\x94\x24" else b"\x48\x89\xac\x24"), le32(d0), (if ism == 1 then b"\x4c\x89\x84\x24" else b"\x4c\x89\x8c\x24"), le32(d8))
+      AstCall(callee_start, callee_len, args) => concat(b"\x48\x89\xac\x24", le32(d0), b"\x4c\x89\x8c\x24", le32(d8))
+      AstStr(start, len) => concat(b"\xe9", le32(block), emit_bytes_data(BytesEmitState { src: iv.src, start: s0, len: l0, i: 0, dlen: dlen }), b"\x48\x8d\x05", le32(0 - (block + 7)), b"\x48\x89\x84\x24", le32(d0), b"\x48\xc7\x84\x24", le32(d8), le32(dlen))
+      AstBytes(start, len) => concat(b"\x48\x89\xac\x24", le32(d0), b"\x4c\x89\x8c\x24", le32(d8))
+      AstBool(value) => concat(b"\x48\x89\xac\x24", le32(d0), b"\x4c\x89\x8c\x24", le32(d8))
+      AstIf(cond, thn, els) => concat(b"\x48\x89\xac\x24", le32(d0), b"\x4c\x89\x8c\x24", le32(d8))
+      AstErr => concat(b"\x48\x89\xac\x24", le32(d0), b"\x4c\x89\x8c\x24", le32(d8))
+      AstVariant(cstart, clen, vstart, vlen, fields) => concat(b"\x48\x89\xac\x24", le32(d0), b"\x4c\x89\x8c\x24", le32(d8))
+      AstMatch(scrut, arms) => concat(b"\x48\x89\xac\x24", le32(d0), b"\x4c\x89\x8c\x24", le32(d8))
+      AstOk(inner) => concat(b"\x48\x89\xac\x24", le32(d0), b"\x4c\x89\x8c\x24", le32(d8))
+      AstResErr(inner) => concat(b"\x48\x89\xac\x24", le32(d0), b"\x4c\x89\x8c\x24", le32(d8))
+      AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => concat(b"\x48\x89\xac\x24", le32(d0), b"\x4c\x89\x8c\x24", le32(d8))
+      AstSum(coll, item_start, item_len, body) => concat(b"\x48\x89\xac\x24", le32(d0), b"\x4c\x89\x8c\x24", le32(d8))
+      AstCount(coll, item_start, item_len, body) => concat(b"\x48\x89\xac\x24", le32(d0), b"\x4c\x89\x8c\x24", le32(d8))
+      AstFold(coll, init, acc_start, acc_len, item_start, item_len, body) => concat(b"\x48\x89\xac\x24", le32(d0), b"\x4c\x89\x8c\x24", le32(d8))
+      AstAll(coll, item_start, item_len, body) => concat(b"\x48\x89\xac\x24", le32(d0), b"\x4c\x89\x8c\x24", le32(d8))
+      AstAny(coll, item_start, item_len, body) => concat(b"\x48\x89\xac\x24", le32(d0), b"\x4c\x89\x8c\x24", le32(d8))
+      AstMap(coll, item_start, item_len, body) => concat(b"\x48\x89\xac\x24", le32(d0), b"\x4c\x89\x8c\x24", le32(d8))
+      AstFilter(coll, item_start, item_len, body) => concat(b"\x48\x89\xac\x24", le32(d0), b"\x4c\x89\x8c\x24", le32(d8))
+      AstMinFold(coll, item_start, item_len, body) => concat(b"\x48\x89\xac\x24", le32(d0), b"\x4c\x89\x8c\x24", le32(d8))
+      AstMaxFold(coll, item_start, item_len, body) => concat(b"\x48\x89\xac\x24", le32(d0), b"\x4c\x89\x8c\x24", le32(d8))
   proofs:
     purity:
-      reads : [sc.src, sc.start, sc.len]
-      calls : [bytelit_decoded_len, emit_bytes_data]
+      reads : [iv.node, iv.src, iv.idx]
+      calls : [ast_str_start, ast_str_len, bytelit_decoded_len, emit_bytes_data, ast_field_fstart, ast_field_flen, span_is_method]
     termination:
-      bound : 64
+      bound : 256
 
 
--- x86_svc_log_carg (self-hosting-service-slice-5b): emit the block for ONE log
--- content arg. AstStr -> the literal block (x86_svc_log_lit_block); AstField -> the
--- 18-byte write(r15, <captured span>) — the r15/captured-register flavor of
--- x86_svc_carg's write(r13, rbx, r14):
---   48 c7 c0 01 00 00 00   mov rax, 1
---   4c 89 ff               mov rdi, r15          (the log fd)
---   4c 89 d6 | 48 89 ee    mov rsi, r10 | rbp    (method ptr | path ptr)
---   4c 89 c2 | 4c 89 ca    mov rdx, r8  | r9     (method len | path len)
---   0f 05                  syscall
--- THE AstField ARM EMITS 18 BYTES UNCONDITIONALLY, arm-for-arm with
--- svc_carg_size's unconditional 18. The internal span_is_method fork picks the
--- register pair, and the else-branch is a DEFINED FALLBACK (the path shape) for the
--- fields the gate refuses but eager lets still evaluate — `resp.status`,
--- `req.body`, a non-`req` base. Those never reach the emitted output (abort_if
--- fires first), but the walk must still produce the SAME byte count the size walk
--- promised, on every shape.
--- Every other shape -> b"" (mirrors svc_carg_size's 0 arm-for-arm).
-rule x86_svc_log_carg
-  @intention: "Emit one log content arg block: literal block for AstStr, write(r15, captured span) for AstField, empty otherwise"
+-- x86_svc_log_iovs (self-hosting-service-slice-5b.5): emit each log content arg's
+-- iovec fill, in source order, entry index advancing by one per arg. Mentions its
+-- recursion ONCE; ArgNil -> b"" (tolerant base). The hand-synced sibling of
+-- svc_log_iovs_size — which walks the SAME list with the SAME per-arg rule, so the
+-- number of entries the size walk pays for and the number the emit walk fills are the
+-- same by construction, and both equal the N the writev is handed.
+rule x86_svc_log_iovs
+  @intention: "Emit the iovec entry fills for a log content concat's args, in source order"
+  @source: vexprparse.intent:74
+  input:
+    ia : SvcLogIovsState
+  output:
+    out : bytes
+  logic:
+    out = match ia.args:
+      ArgCons(head, tail) => concat(x86_svc_log_iov(SvcLogIovState { node: head, src: ia.src, idx: ia.idx }), x86_svc_log_iovs(SvcLogIovsState { args: tail, src: ia.src, idx: ia.idx + 1 }))
+      ArgNil => b""
+  proofs:
+    purity:
+      reads : [ia.args, ia.src, ia.idx]
+      calls : [x86_svc_log_iov, x86_svc_log_iovs]
+    termination:
+      bound : 512
+
+
+-- x86_svc_log_content: emit a log block's CONTENT — ONE writev over an iovec array
+-- built on the stack. AstStr / AstField -> a single entry (N = 1, so the wrapper's
+-- three arity constants are inline literals); AstCall -> one entry per arg, in source
+-- order (N = arg_list_len); everything else -> b"", i.e. NO writev sequence at all
+-- (mirrors svc_log_content_size ARM-FOR-ARM so size and emit cannot drift; every
+-- 0-sized shape is refused by svc_log_ok and is unreachable under the abort_if gate).
+-- The wrapper, identical in every arm (32 B):
+--   48 81 ec le32(16*N)                     sub rsp, 16*N   (scratch BELOW the
+--                                                            request buffer, which
+--                                                            sits at higher addresses
+--                                                            and is untouched)
+--   <per-arg fills — x86_svc_log_iov>
+--   48 89 e6                                mov rsi, rsp    (iov)
+--   4c 89 ff                                mov rdi, r15    (the log fd)
+--   ba le32(N)                              mov edx, N      (iovcnt)
+--   b8 14 00 00 00                          mov eax, 20     (sys_writev)
+--   0f 05                                   syscall
+--   48 81 c4 le32(16*N)                     add rsp, 16*N
+-- `n` is hoisted as an eager let over the DEFENSIVE ast_call_args (ArgNil for every
+-- non-call node -> 0), so the AstCall arm and the size walk read the same count.
+rule x86_svc_log_content
+  @intention: "Emit a service log block's content as ONE writev: sub rsp, per-arg iovec fills, writev(r15, rsp, N), add rsp"
   @source: vexprparse.intent:74
   input:
     rc : RxContentState
   output:
     out : bytes
   logic:
+    let n = arg_list_len(ast_call_args(rc.node))
     out = match rc.node:
       AstNum(value) => b""
       AstBin(op, lhs, rhs) => b""
       AstNeg(inner) => b""
       AstNot(inner) => b""
       AstVar(start, len) => b""
-      AstField(base, fstart, flen) => concat(b"\x48\xc7\xc0\x01\x00\x00\x00\x4c\x89\xff", (if span_is_method(SpanCheck { src: rc.src, start: fstart, len: flen }) == 1 then b"\x4c\x89\xd6\x4c\x89\xc2" else b"\x48\x89\xee\x4c\x89\xca"), b"\x0f\x05")
-      AstCall(callee_start, callee_len, args) => b""
-      AstStr(start, len) => x86_svc_log_lit_block(SpanCheck { src: rc.src, start: start, len: len })
+      AstField(base, fstart, flen) => concat(b"\x48\x81\xec\x10\x00\x00\x00", x86_svc_log_iov(SvcLogIovState { node: rc.node, src: rc.src, idx: 0 }), b"\x48\x89\xe6\x4c\x89\xff\xba\x01\x00\x00\x00\xb8\x14\x00\x00\x00\x0f\x05\x48\x81\xc4\x10\x00\x00\x00")
+      AstCall(callee_start, callee_len, args) => concat(b"\x48\x81\xec", le32(16 * n), x86_svc_log_iovs(SvcLogIovsState { args: args, src: rc.src, idx: 0 }), b"\x48\x89\xe6\x4c\x89\xff\xba", le32(n), b"\xb8\x14\x00\x00\x00\x0f\x05\x48\x81\xc4", le32(16 * n))
+      AstStr(start, len) => concat(b"\x48\x81\xec\x10\x00\x00\x00", x86_svc_log_iov(SvcLogIovState { node: rc.node, src: rc.src, idx: 0 }), b"\x48\x89\xe6\x4c\x89\xff\xba\x01\x00\x00\x00\xb8\x14\x00\x00\x00\x0f\x05\x48\x81\xc4\x10\x00\x00\x00")
       AstBytes(start, len) => b""
       AstBool(value) => b""
       AstIf(cond, thn, els) => b""
@@ -28798,83 +28998,7 @@ rule x86_svc_log_carg
   proofs:
     purity:
       reads : [rc.node, rc.src]
-      calls : [x86_svc_log_lit_block, span_is_method]
-    termination:
-      bound : 64
-
-
--- x86_svc_log_cargs (self-hosting-service-slice-5b): emit each log content arg's
--- block, in source order (one write per arg to the log fd; verbosec buffers the whole
--- line and issues ONE write — identical FILE bytes single-process, the S1 precedent
--- that only the observable output must match). Mentions its recursion ONCE; ArgNil ->
--- b"" (tolerant base). The hand-synced sibling of svc_cargs_size.
--- NOTE for the S8 (forked) slice: per-arg writes are not interleave-safe across
--- children. The fix is `writev` (syscall 20) over an iovec array built on the stack —
--- the args' (ptr, len) pairs are already in registers — NOT a compile-time-max-length
--- buffer (which would mean widening FieldList, since it carries no range slot).
-rule x86_svc_log_cargs
-  @intention: "Emit the log content blocks for a concat's args, in source order"
-  @source: vexprparse.intent:74
-  input:
-    ra : RxCArgsState
-  output:
-    out : bytes
-  logic:
-    out = match ra.args:
-      ArgCons(head, tail) => concat(x86_svc_log_carg(RxContentState { node: head, src: ra.src }), x86_svc_log_cargs(RxCArgsState { args: tail, src: ra.src }))
-      ArgNil => b""
-  proofs:
-    purity:
-      reads : [ra.args, ra.src]
-      calls : [x86_svc_log_carg, x86_svc_log_cargs]
-    termination:
-      bound : 512
-
-
--- x86_svc_log_content: emit a log block's CONTENT blocks. AstStr -> ONE literal
--- block; AstField -> the 18-byte captured-span write; AstCall -> one block per arg in
--- source order; everything else -> b"" (mirrors svc_log_content_size ARM-FOR-ARM so
--- size and emit cannot drift; every 0-sized shape is refused by svc_log_ok and is
--- unreachable under the abort_if gate).
-rule x86_svc_log_content
-  @intention: "Emit a service log block's content blocks: literal block for AstStr, captured-span write for a req field, per-arg blocks for a concat"
-  @source: vexprparse.intent:74
-  input:
-    rc : RxContentState
-  output:
-    out : bytes
-  logic:
-    out = match rc.node:
-      AstNum(value) => b""
-      AstBin(op, lhs, rhs) => b""
-      AstNeg(inner) => b""
-      AstNot(inner) => b""
-      AstVar(start, len) => b""
-      AstField(base, fstart, flen) => x86_svc_log_carg(rc)
-      AstCall(callee_start, callee_len, args) => x86_svc_log_cargs(RxCArgsState { args: args, src: rc.src })
-      AstStr(start, len) => x86_svc_log_lit_block(SpanCheck { src: rc.src, start: start, len: len })
-      AstBytes(start, len) => b""
-      AstBool(value) => b""
-      AstIf(cond, thn, els) => b""
-      AstErr => b""
-      AstVariant(cstart, clen, vstart, vlen, fields) => b""
-      AstMatch(scrut, arms) => b""
-      AstOk(inner) => b""
-      AstResErr(inner) => b""
-      AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => b""
-      AstSum(coll, item_start, item_len, body) => b""
-      AstCount(coll, item_start, item_len, body) => b""
-      AstFold(coll, init, acc_start, acc_len, item_start, item_len, body) => b""
-      AstAll(coll, item_start, item_len, body) => b""
-      AstAny(coll, item_start, item_len, body) => b""
-      AstMap(coll, item_start, item_len, body) => b""
-      AstFilter(coll, item_start, item_len, body) => b""
-      AstMinFold(coll, item_start, item_len, body) => b""
-      AstMaxFold(coll, item_start, item_len, body) => b""
-  proofs:
-    purity:
-      reads : [rc.node, rc.src, rc]
-      calls : [x86_svc_log_lit_block, x86_svc_log_carg, x86_svc_log_cargs]
+      calls : [ast_call_args, arg_list_len, x86_svc_log_iov, x86_svc_log_iovs]
     termination:
       bound : 64
 
@@ -28885,10 +29009,17 @@ rule x86_svc_log_content
 --   lea rdi,[rip-(path_block+7)] ;
 --   mov eax,2 ; mov esi,0x441 ; mov edx,0x1A4 ; syscall   ; open(WRONLY|CREAT|APPEND)
 --   mov r15,rax                                           ; the fd
---   <content literal block: write(r15, lit, dlen)>
+--   <content: ONE writev(r15, iov, N) — slice 5b.5>
 --   mov eax,3 ; mov rdi,r15 ; syscall                     ; close
+-- Slice 5b.5: the content is now exactly TWO syscalls' worth of surface between the
+-- open and the close — the writev and nothing else. That makes the line ALL-OR-
+-- NOTHING per request under the same (unproven, Linux-implementation) inode-lock
+-- property a single `write` relies on: PARITY with verbosec, which buffers the line
+-- and issues one write. It is NOT a fork-safety guarantee, and it does not hold over
+-- NFS. It also makes S5c's `on_error: abort` a flat +34 (two 17-byte check stubs,
+-- after the open and after the writev) instead of an arity-dependent check count.
 -- NO syscall return checks — DROP policy, the reaction default: on an unwritable path
--- open returns -1 and write(-1)/close(-1) fail silently, the request is still served.
+-- open returns -1 and writev(-1)/close(-1) fail silently, the request is still served.
 -- `on_error: abort` needs a sys_exit(1) tail the accept loop does not have and is
 -- REFUSED by svc_log_ok (S5c), so the emitted policy can never contradict the
 -- declared one.
