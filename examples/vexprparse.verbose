@@ -979,23 +979,40 @@ concept_group VExpr [max_depth: 4096, max_nodes: 6000000]
   -- concept, exactly like Resource / Connection.
   --
   -- Slice 5a widens 7 -> 12 fields for the OPTIONAL per-request `log:` block:
-  -- `log_present` (0 = no log block, 1 = one declared), `log_path_start` /
-  -- `log_path_len` (the append_file path INNER span, quotes stripped; -1 = the
-  -- MALFORMED-LOG sentinel), `log_content` (the content Ast — AstStr for slice 5a,
-  -- anything else refused with an S5b breadcrumb) and `log_on_error` (0 = the line is
-  -- absent, 1 = `drop`, 2 = `abort`, 3 = present-but-unrecognized).
-  -- WHY `log_present` IS MANDATORY: a single -1 path sentinel cannot distinguish
+  -- `log_code` (the PACKED presence flag + on_error policy — see below),
+  -- `log_path_start` / `log_path_len` (the append_file path INNER span, quotes
+  -- stripped; -1 = the MALFORMED-LOG sentinel) and `log_content` (the content Ast —
+  -- AstStr for slice 5a, anything else refused with an S5b breadcrumb).
+  -- WHY A PRESENCE FLAG IS MANDATORY: a single -1 path sentinel cannot distinguish
   -- "absent" (legal — every service before this slice) from "malformed" (must be
   -- refused). parse_reaction_decl collapses the two because a reaction block is never
   -- optional; a `log:` block IS. Without the flag a malformed log decl would be
   -- SILENTLY IGNORED — the worst failure mode for a fail-closed audit feature.
-  -- Arena cost is ZERO: max_payload_fields is a MAX over all concepts and the
-  -- program-wide maximum is already >= 12 (MkRule), so entry_size is unchanged.
+  --
+  -- SLICE 8 PACKING. `log_present` (0/1) and `log_on_error` (0..3) now live in ONE
+  -- field as `log_code = log_present + 4 * log_on_error`. `svc_log_present` recovers
+  -- it with `% 4`, `svc_log_on_error` with `/ 4`; both accessor SIGNATURES are
+  -- unchanged, so no call site moves. WHY PACK RATHER THAN WIDEN: MkService is at 12
+  -- fields, TIED with MkRule for the program-wide max_payload_fields, so
+  -- entry_size = (1 + 8*12 + 7) & ~7 = 104 and gen0's arena mmap immediate is
+  -- 6,000,000 * 104 = 624,000,000. A 13th field pushes entry_size to 112 — +48 MB of
+  -- reservation and roughly +1.2 GiB on the ~16 GiB self-compile, at which point
+  -- slice 5a's "arena cost is ZERO" note stops being true. Packing keeps the count at
+  -- 12 and frees the 12th slot for slice 8's `concurrency`. Both halves were already
+  -- codes (`proto_code`, `oe_code`), so this is house style. (Rejected: packing into
+  -- `protocol` — that conflates orthogonal axes and forces a `% 10` at every
+  -- `svc_protocol(h) == 1` consumer.)
+  --
+  -- `concurrency` (slice 8) is the freed 12th slot: 0 = absent (-> sequential),
+  -- 1 = explicit `sequential`, 2 = `forked`, 3 = present-but-unrecognized (refused by
+  -- service_errors). NO `_present` companion is needed — the field carries no span, so
+  -- one code covers every state (the `log_present` flag existed only because a
+  -- (start, len) pair's single -1 cannot carry three states).
   concept Service
-    @intention: "A parsed top-level service declaration: name span + port + max_request + handler name span + protocol code + optional log block"
+    @intention: "A parsed top-level service declaration: name span + port + max_request + handler name span + protocol code + packed log code + log block + concurrency code"
     @source: vexprparse.intent:74
     variants:
-      MkService of (name_start : number, name_len : number, port : number, max_request : number, handler_start : number, handler_len : number, protocol : number, log_present : number, log_path_start : number, log_path_len : number, log_content : Ast, log_on_error : number)
+      MkService of (name_start : number, name_len : number, port : number, max_request : number, handler_start : number, handler_len : number, protocol : number, log_code : number, log_path_start : number, log_path_len : number, log_content : Ast, concurrency : number)
 
   -- Self-hosting service slice 1: a cons-list of top-level service declarations in
   -- source order. Same cons shape as ConnectionList (CnCons/CnNil).
@@ -11098,7 +11115,7 @@ rule svc_name_start
     out : number
   logic:
     out = match s:
-      MkService(name_start, name_len, port, max_request, handler_start, handler_len, protocol, log_present, log_path_start, log_path_len, log_content, log_on_error) => name_start
+      MkService(name_start, name_len, port, max_request, handler_start, handler_len, protocol, log_code, log_path_start, log_path_len, log_content, concurrency) => name_start
   proofs:
     purity:
       reads : [s]
@@ -11116,7 +11133,7 @@ rule svc_name_len
     out : number
   logic:
     out = match s:
-      MkService(name_start, name_len, port, max_request, handler_start, handler_len, protocol, log_present, log_path_start, log_path_len, log_content, log_on_error) => name_len
+      MkService(name_start, name_len, port, max_request, handler_start, handler_len, protocol, log_code, log_path_start, log_path_len, log_content, concurrency) => name_len
   proofs:
     purity:
       reads : [s]
@@ -11134,7 +11151,7 @@ rule svc_port
     out : number
   logic:
     out = match s:
-      MkService(name_start, name_len, port, max_request, handler_start, handler_len, protocol, log_present, log_path_start, log_path_len, log_content, log_on_error) => port
+      MkService(name_start, name_len, port, max_request, handler_start, handler_len, protocol, log_code, log_path_start, log_path_len, log_content, concurrency) => port
   proofs:
     purity:
       reads : [s]
@@ -11152,7 +11169,7 @@ rule svc_max_request
     out : number
   logic:
     out = match s:
-      MkService(name_start, name_len, port, max_request, handler_start, handler_len, protocol, log_present, log_path_start, log_path_len, log_content, log_on_error) => max_request
+      MkService(name_start, name_len, port, max_request, handler_start, handler_len, protocol, log_code, log_path_start, log_path_len, log_content, concurrency) => max_request
   proofs:
     purity:
       reads : [s]
@@ -11170,7 +11187,7 @@ rule svc_handler_start
     out : number
   logic:
     out = match s:
-      MkService(name_start, name_len, port, max_request, handler_start, handler_len, protocol, log_present, log_path_start, log_path_len, log_content, log_on_error) => handler_start
+      MkService(name_start, name_len, port, max_request, handler_start, handler_len, protocol, log_code, log_path_start, log_path_len, log_content, concurrency) => handler_start
   proofs:
     purity:
       reads : [s]
@@ -11188,7 +11205,7 @@ rule svc_handler_len
     out : number
   logic:
     out = match s:
-      MkService(name_start, name_len, port, max_request, handler_start, handler_len, protocol, log_present, log_path_start, log_path_len, log_content, log_on_error) => handler_len
+      MkService(name_start, name_len, port, max_request, handler_start, handler_len, protocol, log_code, log_path_start, log_path_len, log_content, concurrency) => handler_len
   proofs:
     purity:
       reads : [s]
@@ -11206,7 +11223,7 @@ rule svc_protocol
     out : number
   logic:
     out = match s:
-      MkService(name_start, name_len, port, max_request, handler_start, handler_len, protocol, log_present, log_path_start, log_path_len, log_content, log_on_error) => protocol
+      MkService(name_start, name_len, port, max_request, handler_start, handler_len, protocol, log_code, log_path_start, log_path_len, log_content, concurrency) => protocol
   proofs:
     purity:
       reads : [s]
@@ -11218,8 +11235,14 @@ rule svc_protocol
 -- Slice 5a accessors for the OPTIONAL `log:` block. Same bare-group idiom as the
 -- seven above; every one of them runs on the SvNil sentinel under eager lets, so the
 -- sentinel carries well-defined values (present 0, path_len -1, content AstErr).
+-- SLICE 8: `log_present` and `log_on_error` are PACKED into the single `log_code`
+-- field (`log_present + 4 * log_on_error`) so the 12th slot could be freed for
+-- `concurrency` without growing the arena entry — see the Service concept comment.
+-- This accessor recovers the presence bit with `% 4` (log_present is 0 or 1, strictly
+-- below the radix); svc_log_on_error recovers the policy with `/ 4`. The SIGNATURE is
+-- unchanged, so every existing call site reads exactly what it read before.
 rule svc_log_present
-  @intention: "1 if the service declares a `log:` block, 0 otherwise"
+  @intention: "1 if the service declares a `log:` block, 0 otherwise (the low half of the packed log_code)"
   @source: vexprparse.intent:74
   input:
     s : Service
@@ -11227,7 +11250,7 @@ rule svc_log_present
     out : number
   logic:
     out = match s:
-      MkService(name_start, name_len, port, max_request, handler_start, handler_len, protocol, log_present, log_path_start, log_path_len, log_content, log_on_error) => log_present
+      MkService(name_start, name_len, port, max_request, handler_start, handler_len, protocol, log_code, log_path_start, log_path_len, log_content, concurrency) => log_code % 4
   proofs:
     purity:
       reads : [s]
@@ -11245,7 +11268,7 @@ rule svc_log_path_start
     out : number
   logic:
     out = match s:
-      MkService(name_start, name_len, port, max_request, handler_start, handler_len, protocol, log_present, log_path_start, log_path_len, log_content, log_on_error) => log_path_start
+      MkService(name_start, name_len, port, max_request, handler_start, handler_len, protocol, log_code, log_path_start, log_path_len, log_content, concurrency) => log_path_start
   proofs:
     purity:
       reads : [s]
@@ -11263,7 +11286,7 @@ rule svc_log_path_len
     out : number
   logic:
     out = match s:
-      MkService(name_start, name_len, port, max_request, handler_start, handler_len, protocol, log_present, log_path_start, log_path_len, log_content, log_on_error) => log_path_len
+      MkService(name_start, name_len, port, max_request, handler_start, handler_len, protocol, log_code, log_path_start, log_path_len, log_content, concurrency) => log_path_len
   proofs:
     purity:
       reads : [s]
@@ -11281,7 +11304,7 @@ rule svc_log_content
     out : Ast
   logic:
     out = match s:
-      MkService(name_start, name_len, port, max_request, handler_start, handler_len, protocol, log_present, log_path_start, log_path_len, log_content, log_on_error) => log_content
+      MkService(name_start, name_len, port, max_request, handler_start, handler_len, protocol, log_code, log_path_start, log_path_len, log_content, concurrency) => log_content
   proofs:
     purity:
       reads : [s]
@@ -11290,8 +11313,10 @@ rule svc_log_content
       bound : 16
 
 
+-- SLICE 8: the high half of the packed `log_code` (see svc_log_present). `/ 4`
+-- recovers the policy exactly because the low half is 0 or 1.
 rule svc_log_on_error
-  @intention: "The log on_error policy code of a service declaration (0 = absent, 1 = drop, 2 = abort, 3 = unrecognized)"
+  @intention: "The log on_error policy code of a service declaration (0 = absent, 1 = drop, 2 = abort, 3 = unrecognized) — the high half of the packed log_code"
   @source: vexprparse.intent:74
   input:
     s : Service
@@ -11299,7 +11324,7 @@ rule svc_log_on_error
     out : number
   logic:
     out = match s:
-      MkService(name_start, name_len, port, max_request, handler_start, handler_len, protocol, log_present, log_path_start, log_path_len, log_content, log_on_error) => log_on_error
+      MkService(name_start, name_len, port, max_request, handler_start, handler_len, protocol, log_code, log_path_start, log_path_len, log_content, concurrency) => log_code / 4
   proofs:
     purity:
       reads : [s]
@@ -11343,7 +11368,7 @@ rule svc_head
   logic:
     out = match sl:
       SvCons(head, tail) => head
-      SvNil => Service::MkService { name_start: 0, name_len: 0, port: 0, max_request: 0, handler_start: 0, handler_len: 0 - 1, protocol: 0, log_present: 0, log_path_start: 0, log_path_len: 0 - 1, log_content: Ast::AstErr, log_on_error: 0 }
+      SvNil => Service::MkService { name_start: 0, name_len: 0, port: 0, max_request: 0, handler_start: 0, handler_len: 0 - 1, protocol: 0, log_code: 0, log_path_start: 0, log_path_len: 0 - 1, log_content: Ast::AstErr, concurrency: 0 }
   proofs:
     purity:
       reads : [sl]
@@ -11403,13 +11428,17 @@ rule parse_service_decl
     -- skip_seps from +2 (past the Newline + the inner Indent) lands on `append_file`,
     -- its path Str at +1, the content at +2 via parse_or. The OPTIONAL `on_error:` line
     -- sits after the content (skip_seps from parse_or's `next`).
-    -- ABSENT != MALFORMED: with no `log:` line log_present is 0 and log_path_len is the
-    -- -1 sentinel, which svc_log_ok reads as "no log, no error" — get this wrong and
+    -- ABSENT != MALFORMED: with no `log:` line the presence bit is 0 and log_path_len is
+    -- the -1 sentinel, which svc_log_ok reads as "no log, no error" — get this wrong and
     -- EVERY existing service refuses.
     -- The eager parse_or below runs even for a log-less service (and for every
     -- non-service top-level item, since parse_services binds parse_service_decl in an
-    -- eager let). It is INERT — gated by log_present at both verify and emit — and
+    -- eager let). It is INERT — gated by svc_log_present at both verify and emit — and
     -- bounded, because skip_seps parks the cursor on a Dedent rather than running away.
+    -- SLICE 8: the presence bit and oe_code are stored PACKED as
+    -- `log_code = is_log + 4 * oe_code` (is_log is 0/1, oe_code is 0..3, so the two
+    -- halves cannot collide). svc_log_present / svc_log_on_error unpack them with
+    -- `% 4` / `/ 4`; nothing else in the file reads the raw field.
     let gp = skip_seps(ParseState { cell: advance(Advance { lst: hp, k: 3 }) })
     let is_log = span_is_log(SpanCheck { src: ps.src, start: peek_kw_start(gp), len: peek_kw_len(gp) })
     let lap = skip_seps(ParseState { cell: advance(Advance { lst: gp, k: 2 }) })
@@ -11424,7 +11453,7 @@ rule parse_service_decl
     let oe_drop = span_is_drop_word(SpanCheck { src: ps.src, start: peek_kw_start(advance(Advance { lst: oep, k: 2 })), len: peek_kw_len(advance(Advance { lst: oep, k: 2 })) })
     let oe_code = if is_oe == 0 then 0 else if oe_abort == 1 then 2 else if oe_drop == 1 then 1 else 3
     let log_shape_ok = if is_lappend == 1 then is_lpstr else 0
-    out = Service::MkService { name_start: name_start, name_len: name_len, port: pval, max_request: mval, handler_start: hnstart, handler_len: if shape_ok == 1 then hnlen else 0 - 1, protocol: proto_code, log_present: is_log, log_path_start: lpstart + 1, log_path_len: if is_log == 1 then (if log_shape_ok == 1 then (if lplen >= 2 then lplen - 2 else 0 - 1) else 0 - 1) else 0 - 1, log_content: parsed_node(lcp), log_on_error: oe_code }
+    out = Service::MkService { name_start: name_start, name_len: name_len, port: pval, max_request: mval, handler_start: hnstart, handler_len: if shape_ok == 1 then hnlen else 0 - 1, protocol: proto_code, log_code: is_log + 4 * oe_code, log_path_start: lpstart + 1, log_path_len: if is_log == 1 then (if log_shape_ok == 1 then (if lplen >= 2 then lplen - 2 else 0 - 1) else 0 - 1) else 0 - 1, log_content: parsed_node(lcp), concurrency: 0 }
   proofs:
     purity:
       reads : [ps.cell, ps.src]
