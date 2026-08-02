@@ -7331,6 +7331,69 @@ rule span_is_drop_word
       bound : 64
 
 
+-- span_is_concurrency (self-hosting service slice 8): 1 iff an Ident span spells
+-- exactly the 11 bytes "concurrency" (c=99 o=111 n=110 c=99 u=117 r=114 r=114 e=101
+-- n=110 c=99 y=121) — the OPTIONAL concurrency line, a SIBLING of `handler:` / `log:`
+-- and the LAST line of a service block. Clone of span_is_on_error.
+rule span_is_concurrency
+  @intention: "1 if an Ident span spells exactly \"concurrency\", 0 otherwise"
+  @source: vexprparse.intent:74
+  input:
+    sc : SpanCheck
+  output:
+    out : number
+  logic:
+    out = if sc.len == 11 and (byte_at(sc.src, sc.start) == 99 and (byte_at(sc.src, sc.start + 1) == 111 and (byte_at(sc.src, sc.start + 2) == 110 and (byte_at(sc.src, sc.start + 3) == 99 and (byte_at(sc.src, sc.start + 4) == 117 and (byte_at(sc.src, sc.start + 5) == 114 and (byte_at(sc.src, sc.start + 6) == 114 and (byte_at(sc.src, sc.start + 7) == 101 and (byte_at(sc.src, sc.start + 8) == 110 and (byte_at(sc.src, sc.start + 9) == 99 and byte_at(sc.src, sc.start + 10) == 121)))))))))) then 1 else 0
+  proofs:
+    purity:
+      reads : [sc.src, sc.start, sc.len]
+      calls : []
+    termination:
+      bound : 64
+
+
+-- span_is_forked (self-hosting service slice 8): 1 iff an Ident span spells exactly
+-- "forked" (f=102 o=111 r=114 k=107 e=101 d=100) — the one concurrency mode that
+-- changes the emitted accept loop (one child per accepted connection, kernel
+-- auto-reaped). Sibling of span_is_abort_word.
+rule span_is_forked
+  @intention: "1 if an Ident span spells exactly \"forked\", 0 otherwise"
+  @source: vexprparse.intent:74
+  input:
+    sc : SpanCheck
+  output:
+    out : number
+  logic:
+    out = if sc.len == 6 and (byte_at(sc.src, sc.start) == 102 and (byte_at(sc.src, sc.start + 1) == 111 and (byte_at(sc.src, sc.start + 2) == 114 and (byte_at(sc.src, sc.start + 3) == 107 and (byte_at(sc.src, sc.start + 4) == 101 and byte_at(sc.src, sc.start + 5) == 100))))) then 1 else 0
+  proofs:
+    purity:
+      reads : [sc.src, sc.start, sc.len]
+      calls : []
+    termination:
+      bound : 64
+
+
+-- span_is_sequential (self-hosting service slice 8): 1 iff an Ident span spells exactly
+-- the 10 bytes "sequential" (s=115 e=101 q=113 u=117 e=101 n=110 t=116 i=105 a=97
+-- l=108) — the DEFAULT mode, recognized explicitly so an operator can write it down
+-- and still get a byte-identical binary. Sibling of span_is_drop_word.
+rule span_is_sequential
+  @intention: "1 if an Ident span spells exactly \"sequential\", 0 otherwise"
+  @source: vexprparse.intent:74
+  input:
+    sc : SpanCheck
+  output:
+    out : number
+  logic:
+    out = if sc.len == 10 and (byte_at(sc.src, sc.start) == 115 and (byte_at(sc.src, sc.start + 1) == 101 and (byte_at(sc.src, sc.start + 2) == 113 and (byte_at(sc.src, sc.start + 3) == 117 and (byte_at(sc.src, sc.start + 4) == 101 and (byte_at(sc.src, sc.start + 5) == 110 and (byte_at(sc.src, sc.start + 6) == 116 and (byte_at(sc.src, sc.start + 7) == 105 and (byte_at(sc.src, sc.start + 8) == 97 and byte_at(sc.src, sc.start + 9) == 108))))))))) then 1 else 0
+  proofs:
+    purity:
+      reads : [sc.src, sc.start, sc.len]
+      calls : []
+    termination:
+      bound : 64
+
+
 rule span_is_http_1_0
   @intention: "1 if a callee/ident span spells exactly \"http_1_0\", 0 otherwise"
   @source: vexprparse.intent:74
@@ -11333,6 +11396,32 @@ rule svc_log_on_error
       bound : 16
 
 
+-- svc_concurrency (self-hosting service slice 8): the concurrency mode code.
+--   0 = the line is ABSENT          -> sequential (every service before this slice)
+--   1 = explicit `sequential`       -> sequential (byte-identical to 0)
+--   2 = `forked`                    -> one child per accepted connection
+--   3 = present-but-unrecognized    -> REFUSED by service_errors
+-- Four-valued rather than boolean precisely so 0 and 1 both mean "emit exactly what
+-- was emitted before" while an unknown policy word can never be silently read as one
+-- of the two real modes. Runs on the SvNil sentinel under eager lets (which carries 0).
+rule svc_concurrency
+  @intention: "The concurrency mode code of a service declaration (0 = absent, 1 = sequential, 2 = forked, 3 = unrecognized)"
+  @source: vexprparse.intent:74
+  input:
+    s : Service
+  output:
+    out : number
+  logic:
+    out = match s:
+      MkService(name_start, name_len, port, max_request, handler_start, handler_len, protocol, log_code, log_path_start, log_path_len, log_content, concurrency) => concurrency
+  proofs:
+    purity:
+      reads : [s]
+      calls : []
+    termination:
+      bound : 16
+
+
 -- service_list_len: the number of service declarations. Structural recursion on the
 -- SvCons tail, like connection_list_len.
 rule service_list_len
@@ -11453,11 +11542,46 @@ rule parse_service_decl
     let oe_drop = span_is_drop_word(SpanCheck { src: ps.src, start: peek_kw_start(advance(Advance { lst: oep, k: 2 })), len: peek_kw_len(advance(Advance { lst: oep, k: 2 })) })
     let oe_code = if is_oe == 0 then 0 else if oe_abort == 1 then 2 else if oe_drop == 1 then 1 else 3
     let log_shape_ok = if is_lappend == 1 then is_lpstr else 0
-    out = Service::MkService { name_start: name_start, name_len: name_len, port: pval, max_request: mval, handler_start: hnstart, handler_len: if shape_ok == 1 then hnlen else 0 - 1, protocol: proto_code, log_code: is_log + 4 * oe_code, log_path_start: lpstart + 1, log_path_len: if is_log == 1 then (if log_shape_ok == 1 then (if lplen >= 2 then lplen - 2 else 0 - 1) else 0 - 1) else 0 - 1, log_content: parsed_node(lcp), concurrency: 0 }
+    -- Slice 8: the OPTIONAL `concurrency:` line. POSITION IS LOAD-BEARING — it is the
+    -- LAST line of the service block, after `handler:` and after the whole `log:`
+    -- sub-block, because that is the only position that perturbs NO existing cursor:
+    -- every step above keeps the offsets it had in slice 5c and one new conditional
+    -- cursor is appended. (The verbosec oracles disagree on placement —
+    -- static_file_server / body_content_gate / audit_gateway put it last, policy_proxy
+    -- puts it early — so "last" is a choice, and it is the cheap one.)
+    --
+    -- THE SUBTLETY THAT BITES: `on_error` reaches its keyword with plain `skip_seps`
+    -- because it sits INSIDE the `log:` sub-block (only a Newline separates it from the
+    -- content). `concurrency:` is a SIBLING of `handler:` / `log:`, one indent OUT, so
+    -- after a log block there is a Dedent between the two and only `skip_seps_dedent`
+    -- crosses it. With no log block at all there is no Dedent to cross — `gp` (plain
+    -- skip_seps from handler+3) already IS the concurrency keyword — which is why the
+    -- cursor forks on `is_log` instead of always dedenting.
+    --   is_log == 0 -> cp = gp                      (handler: then concurrency:)
+    --   is_log == 1 -> cp = skip_seps_dedent(lend)  (lend = past the log block: past the
+    --                                                on_error line when present, else
+    --                                                past the content expression)
+    -- EAGER-LET SAFETY, and the S5a hazard restated: when neither line is present the
+    -- cursor parks on the block-closing Dedent (span_is_concurrency of a Dedent's 0/0
+    -- span is 0); when a log block is present but no concurrency line follows,
+    -- skip_seps_dedent DOES walk into the next top-level declaration — harmless because
+    -- we only byte-compare its keyword against "concurrency" and never advance the outer
+    -- walk (parse_services resumes from skip_indented_block(hp), untouched). No
+    -- top-level keyword spells "concurrency".
+    let lend = if is_oe == 1 then advance(Advance { lst: oep, k: 3 }) else parsed_next(lcp)
+    let cp = if is_log == 0 then gp else skip_seps_dedent(ParseState { cell: lend })
+    let is_conc = span_is_concurrency(SpanCheck { src: ps.src, start: peek_kw_start(cp), len: peek_kw_len(cp) })
+    let cw_forked = span_is_forked(SpanCheck { src: ps.src, start: peek_kw_start(advance(Advance { lst: cp, k: 2 })), len: peek_kw_len(advance(Advance { lst: cp, k: 2 })) })
+    let cw_seq = span_is_sequential(SpanCheck { src: ps.src, start: peek_kw_start(advance(Advance { lst: cp, k: 2 })), len: peek_kw_len(advance(Advance { lst: cp, k: 2 })) })
+    -- Mirror of oe_code, and 4-valued for the same reason: an unrecognized policy word
+    -- must be DISTINGUISHABLE from absent so service_errors can refuse it instead of
+    -- silently reading it as one of the two real modes.
+    let conc_code = if is_conc == 0 then 0 else if cw_forked == 1 then 2 else if cw_seq == 1 then 1 else 3
+    out = Service::MkService { name_start: name_start, name_len: name_len, port: pval, max_request: mval, handler_start: hnstart, handler_len: if shape_ok == 1 then hnlen else 0 - 1, protocol: proto_code, log_code: is_log + 4 * oe_code, log_path_start: lpstart + 1, log_path_len: if is_log == 1 then (if log_shape_ok == 1 then (if lplen >= 2 then lplen - 2 else 0 - 1) else 0 - 1) else 0 - 1, log_content: parsed_node(lcp), concurrency: conc_code }
   proofs:
     purity:
       reads : [ps.cell, ps.src]
-      calls : [peek_kw_start, peek_kw_len, skip_seps, skip_seps_dedent, span_is_listen, span_is_protocol, span_is_http_1_0, span_is_raw_tcp, span_is_port, peek_is_num, peek_value, span_is_max_request, span_is_handler, span_is_log, span_is_append_file, span_is_on_error, span_is_abort_word, span_is_drop_word, peek_is_str, peek_str_start, peek_str_len, parse_or, parsed_node, parsed_next, advance]
+      calls : [peek_kw_start, peek_kw_len, skip_seps, skip_seps_dedent, span_is_listen, span_is_protocol, span_is_http_1_0, span_is_raw_tcp, span_is_port, peek_is_num, peek_value, span_is_max_request, span_is_handler, span_is_log, span_is_append_file, span_is_on_error, span_is_abort_word, span_is_drop_word, span_is_concurrency, span_is_forked, span_is_sequential, peek_is_str, peek_str_start, peek_str_len, parse_or, parsed_node, parsed_next, advance]
     termination:
       bound : 256
 
@@ -14022,11 +14146,16 @@ rule service_errors
     -- non-canonical case.) The gate forks on `ast_is_str(body_ast)` — literally the
     -- expression the two emitter walks fork on.
     let log_field_on_s1_bad = if svc_log_has_field(SvcLogState { svcs: se.svcs, src: se.src }) == 1 and ast_is_str(body_ast) == 1 then 1 else 0
-    out = if has_svc == 0 then 0 else (malformed + proto_bad + port_bad + maxreq_bad + (if hexists == 1 then 0 else 1) + (if shape_ok == 1 then 0 else 1) + (if n == 1 then 0 else 1) + reserved + effects + log_bad + log_field_on_s1_bad)
+    -- Slice 8: an UNRECOGNIZED concurrency word (code 3) is refused. The closed set is
+    -- `sequential` (1) and `forked` (2); absent (0) means sequential. Mirror of
+    -- svc_log_ok's `on_error > 2` rule — an unknown word must never be silently read as
+    -- one of the two real modes, least of all as the DEFAULT.
+    let conc_bad = if svc_concurrency(h) == 3 then 1 else 0
+    out = if has_svc == 0 then 0 else (malformed + proto_bad + port_bad + maxreq_bad + (if hexists == 1 then 0 else 1) + (if shape_ok == 1 then 0 else 1) + (if n == 1 then 0 else 1) + reserved + effects + log_bad + log_field_on_s1_bad + conc_bad)
   proofs:
     purity:
       reads : [se.prog, se.svcs, se.concepts, se.ress, se.conns, se.rxs, se.src]
-      calls : [service_list_len, svc_head, svc_handler_len, svc_protocol, svc_port, svc_max_request, svc_handler_start, rule_named, find_rule, rd_body, count_binds, block_binds, block_result, ast_variant_fields, ast_is_variant, vfield_len, ast_is_num, vf_head_val, vf_tail, svc_body_ok, svc_if_shape_ok, fl_head_start, fl_head_len, find_concept_index, fl_head_ty_start, fl_head_ty_len, rd_input, rd_out_ty_start, rd_out_ty_len, reaction_list_len, connection_list_len, resource_list_len, svc_log_ok, svc_log_present, svc_log_path_len, svc_log_on_error, svc_log_content, svc_log_has_field, ast_is_str]
+      calls : [service_list_len, svc_head, svc_handler_len, svc_protocol, svc_port, svc_max_request, svc_handler_start, rule_named, find_rule, rd_body, count_binds, block_binds, block_result, ast_variant_fields, ast_is_variant, vfield_len, ast_is_num, vf_head_val, vf_tail, svc_body_ok, svc_if_shape_ok, fl_head_start, fl_head_len, find_concept_index, fl_head_ty_start, fl_head_ty_len, rd_input, rd_out_ty_start, rd_out_ty_len, reaction_list_len, connection_list_len, resource_list_len, svc_log_ok, svc_log_present, svc_log_path_len, svc_log_on_error, svc_log_content, svc_log_has_field, ast_is_str, svc_concurrency]
     termination:
       bound : 128
 
