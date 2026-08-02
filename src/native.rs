@@ -25287,6 +25287,569 @@ rule le64_neg
         let _ = fs::remove_file(&elf);
     }
 
+    /// The PIDs and process states of a process's direct children, read from /proc.
+    /// `/proc/<pid>/stat`'s `comm` field can contain spaces and parentheses, so the
+    /// fields after it are found by splitting past the LAST `)`.
+    #[cfg(target_arch = "x86_64")]
+    fn proc_children(pid: u32) -> Vec<(u32, char)> {
+        let mut out = Vec::new();
+        let Ok(rd) = std::fs::read_dir("/proc") else { return out };
+        for e in rd.flatten() {
+            let name = e.file_name();
+            let Some(s) = name.to_str() else { continue };
+            let Ok(p) = s.parse::<u32>() else { continue };
+            let Ok(stat) = std::fs::read_to_string(format!("/proc/{}/stat", p)) else { continue };
+            let Some(k) = stat.rfind(')') else { continue };
+            let rest: Vec<&str> = stat[k + 1..].split_whitespace().collect();
+            if rest.len() < 2 { continue }
+            let st = rest[0].chars().next().unwrap_or('?');
+            let ppid: u32 = rest[1].parse().unwrap_or(0);
+            if ppid == pid { out.push((p, st)) }
+        }
+        out
+    }
+
+    /// SELF-HOSTING SERVICE slice 8 — `concurrency: forked`. THE MILESTONE is the
+    /// OVERLAP row: a sequential server CANNOT pass it by construction.
+    ///
+    /// The emitted accept loop stops head-of-line-blocking on one silent client. Three
+    /// gated splices, all emitted by the self-hosted compiler
+    /// (examples/vexprparse.verbose), all pinned here both structurally and at runtime:
+    ///
+    ///   x86_svc_conc_pre  (71 B)  rt_sigaction(SIGCHLD, SIG_IGN, NULL, 8), between
+    ///                             `bind` and `listen`. PRE-accept_top, so both
+    ///                             endpoints of every back-jump shift equally.
+    ///   x86_svc_conc_fork (82 B)  at tramp+158, right after `mov %rax,%r13` and BEFORE
+    ///                             the static log block. Child falls through; parent
+    ///                             closes the client fd and loops.
+    ///   x86_svc_conc_tail         the 5-byte `jmp accept_top` becomes a 12-byte
+    ///                             exit(0). Net +7. concsz = 160.
+    ///
+    /// WHAT EACH ASSERTION BUYS (every one of them was confirmed to FAIL under a
+    /// deliberate mutation — see the NEGATIVE CONTROLS section at the bottom):
+    ///   (1) OVERLAP  — connection A connects and sends NOTHING (its handler blocks in
+    ///       `read`), then B sends a full request. Sequential: TIMEOUT. Forked: served.
+    ///       No amount of byte inspection substitutes for this row.
+    ///   (2) PARALLEL — 16 concurrent requests all answered, and the log has EXACTLY 16
+    ///       lines each matching a strict regex. The line count catches lost writes;
+    ///       the per-line match catches TORN ones, which is where slice 5b.5's single
+    ///       `writev` pays off (the pre-5b.5 N-write shape tore 387/640 under load).
+    ///   (3) ZOMBIES  — 0 children and 0 zombies after 12 requests, i.e. the kernel is
+    ///       really auto-reaping. NOT hygiene: without the sigaction the server leaks a
+    ///       process per request forever.
+    ///   (4) FD LEAK  — /proc/<pid>/fd is back to 4 (0, 1, 2 + the listen socket) after
+    ///       the parallel run: the parent closes every client fd it hands to a child.
+    ///   (5) BYTE-IDENTITY — an ABSENT `concurrency:` line emits bit-for-bit what
+    ///       pre-S8 gen0 emitted (11 SHAs), and with length-normalised sources `forked`
+    ///       is EXACTLY +160 with p_filesz == p_memsz == the emitted byte count.
+    ///
+    /// ON SOURCE-LENGTH NORMALISATION: the emitted server for the S1/S3/S4 shapes
+    /// EMBEDS ITS OWN SOURCE (the src_blob), so a longer `.verbose` means a longer ELF.
+    /// `"\n  concurrency: sequential"` is 26 bytes and `"\n  concurrency: forked"` is
+    /// 22, so the forked source is padded with 4 inert newlines (and the absent one
+    /// with 26) to make the three sources the same LENGTH. Without that the delta is
+    /// 156 or 160 depending on which 4-byte blob-padding bucket each source lands in,
+    /// and the comparison measures the wrong thing. (The S2 shape carries no src_blob
+    /// at all, which is why its absent/sequential rows can be compared by SHA.)
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn self_hosted_service_concurrency_forked() {
+        use std::fs;
+        use std::io::{Read, Write};
+        use std::net::{SocketAddr, TcpListener, TcpStream};
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+        use std::time::Duration;
+
+        let src = fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let elf = std::env::temp_dir().join("verbosec_test_svc_s8_elf_program_src");
+        compile_native(&program, "elf_program_src", elf.to_str().unwrap(), false, false)
+            .expect("elf_program_src must compile natively");
+        let emit = |source: &str| -> std::process::Output {
+            Command::new(&elf).args([source, "0"]).output().expect("spawn gen0")
+        };
+
+        // The service-source template. Kept character-for-character stable because the
+        // pre-S8 SHA column below was captured from origin/main's gen0 with EXACTLY
+        // this text — changing a space invalidates the whole backward-compat pin.
+        let mk = |logic: &str, reads: &str, bound: &str, port: u16, logblock: &str,
+                  conc: &str| -> String {
+            format!(
+                "rule h8\n  input:\n    req : HttpRequest\n  output:\n    resp : HttpResponse\n  logic:\n    {lg}\n  proofs:\n    purity:\n      reads : {rd}\n      calls : []\n    termination:\n      bound : {bd}\nservice s8\n  listen:\n    protocol : http_1_0\n    port : {p}\n    max_request : 4096\n  handler: h8{lb}{cc}",
+                lg = logic, rd = reads, bd = bound, p = port, lb = logblock, cc = conc)
+        };
+
+        // ── the three emitted blocks, byte-for-byte ────────────────────────────────
+        // 71 B. The 32-byte payload is the KERNEL x86-64 `struct sigaction` (not
+        // libc's): sa_handler = 1 (SIG_IGN), sa_flags = 0, sa_restorer = 0,
+        // sa_mask = 0. `lea rsi, [rip-53]` points back at it across the 5 movs.
+        const SIGACTION: &[u8] = &[
+            0xeb, 0x20, // jmp short +32 (over the data)
+            0x01, 0, 0, 0, 0, 0, 0, 0, // sa_handler = SIG_IGN
+            0, 0, 0, 0, 0, 0, 0, 0, // sa_flags
+            0, 0, 0, 0, 0, 0, 0, 0, // sa_restorer
+            0, 0, 0, 0, 0, 0, 0, 0, // sa_mask
+            0x48, 0xc7, 0xc0, 0x0d, 0, 0, 0, // mov rax, 13 (rt_sigaction)
+            0x48, 0xc7, 0xc7, 0x11, 0, 0, 0, // mov rdi, 17 (SIGCHLD)
+            0x48, 0x8d, 0x35, 0xcb, 0xff, 0xff, 0xff, // lea rsi, [rip-53]
+            0x48, 0xc7, 0xc2, 0, 0, 0, 0, // mov rdx, 0  (oldact = NULL)
+            0x49, 0xc7, 0xc2, 0x08, 0, 0, 0, // mov r10, 8 (sigsetsize)
+            0x0f, 0x05, // syscall
+        ];
+        // 82 B. THE constant that gets got wrong: the `jz` to the child is rel8 **68**
+        // (0x44), measured from the END of the two-byte jz at block offset +14 — NOT
+        // 66 from the end of the `js` at +16. And the parent's `jmp accept_top` is a
+        // HARD -54 (0xffffffca), which only holds because the fork is spliced BEFORE
+        // the log block.
+        const FORK: &[u8] = &[
+            0x48, 0xc7, 0xc0, 0x39, 0, 0, 0, // mov rax, 57 (sys_fork)
+            0x0f, 0x05, // syscall
+            0x48, 0x85, 0xc0, // test rax, rax
+            0x74, 0x44, // jz  +68 -> child (fall-through)
+            0x78, 0x11, // js  +17 -> fork_error
+            0x48, 0xc7, 0xc0, 0x03, 0, 0, 0, // parent_close: mov rax, 3
+            0x4c, 0x89, 0xef, // mov rdi, r13 (client fd)
+            0x0f, 0x05, // syscall
+            0xe9, 0xca, 0xff, 0xff, 0xff, // jmp -54 -> accept_top
+            0xeb, 0x0c, // fork_error: jmp +12 over the message
+            b'f', b'o', b'r', b'k', b' ', b'f', b'a', b'i', b'l', b'e', b'd', b'\n',
+            0x48, 0xc7, 0xc0, 0x01, 0, 0, 0, // mov rax, 1 (write)
+            0x48, 0xc7, 0xc7, 0x02, 0, 0, 0, // mov rdi, 2 (stderr)
+            0x48, 0x8d, 0x35, 0xdf, 0xff, 0xff, 0xff, // lea rsi, [rip-33] -> the msg
+            0x48, 0xc7, 0xc2, 0x0c, 0, 0, 0, // mov rdx, 12
+            0x0f, 0x05, // syscall
+            0xe9, 0xbe, 0xff, 0xff, 0xff, // jmp -66 -> parent_close
+        ];
+        // 12 B, replacing the sequential tail's 5-byte `jmp accept_top`.
+        const EXIT0: &[u8] = &[
+            0xbf, 0, 0, 0, 0, // mov edi, 0
+            0xb8, 0x3c, 0, 0, 0, // mov eax, 60 (sys_exit)
+            0x0f, 0x05, // syscall
+        ];
+        const BIND: &[u8] = &[
+            0x4c, 0x89, 0xe7, 0x48, 0xc7, 0xc2, 0x10, 0, 0, 0,
+            0x48, 0xc7, 0xc0, 0x31, 0, 0, 0, 0x0f, 0x05,
+        ];
+        const LISTEN: &[u8] = &[
+            0x4c, 0x89, 0xe7, 0x48, 0xc7, 0xc6, 0x80, 0, 0, 0,
+            0x48, 0xc7, 0xc0, 0x32, 0, 0, 0, 0x0f, 0x05,
+        ];
+        const ACCEPT: &[u8] = &[
+            0x48, 0xc7, 0xc0, 0x2b, 0, 0, 0, // mov rax, 43 (accept)
+            0x4c, 0x89, 0xe7, 0x48, 0x31, 0xf6, 0x48, 0x31, 0xd2, 0x0f, 0x05,
+            0x49, 0x89, 0xc5, // mov r13, rax
+        ];
+        const LOG_OPEN: &[u8] = &[
+            0xb8, 0x02, 0, 0, 0, 0xbe, 0x41, 0x04, 0, 0,
+            0xba, 0xa4, 0x01, 0, 0, 0x0f, 0x05, 0x49, 0x89, 0xc7,
+        ];
+        const LOG_CLOSE: &[u8] = &[0xb8, 0x03, 0, 0, 0, 0x4c, 0x89, 0xff, 0x0f, 0x05];
+        fn find(hay: &[u8], pat: &[u8]) -> Option<usize> {
+            hay.windows(pat.len()).position(|w| w == pat)
+        }
+        fn find_from(hay: &[u8], pat: &[u8], from: usize) -> Option<usize> {
+            find(&hay[from..], pat).map(|i| i + from)
+        }
+        fn count(hay: &[u8], pat: &[u8]) -> usize {
+            hay.windows(pat.len()).filter(|w| *w == pat).count()
+        }
+        assert_eq!(SIGACTION.len(), 71);
+        assert_eq!(FORK.len(), 82);
+        assert_eq!(EXIT0.len() - 5, 7, "the tail swap is net +7");
+        assert_eq!(SIGACTION.len() + FORK.len() + (EXIT0.len() - 5), 160,
+            "concsz must be 71 + 82 + 7");
+
+        // ── (5a) BYTE-IDENTITY: an ABSENT `concurrency:` line is bit-for-bit pre-S8 ──
+        // Captured from origin/main (5ffcb38) gen0 with the template above. This is the
+        // real backward-compat pin: identical SOURCE in, identical BYTES out.
+        let shapes: [(&str, &str, &str, &str, bool); 4] = [
+            ("s1", "resp = HttpResponse { status: 200, body: \"Hi\" }", "[]", "1", false),
+            ("s2", "resp = HttpResponse { status: 200, body: req.path }", "[req.path]", "1", true),
+            ("s3", "resp = if req.path == \"/\" then HttpResponse { status: 200, body: \"home\" } else HttpResponse { status: 404, body: \"nope\" }", "[req.path]", "8", true),
+            ("s4", "resp = HttpResponse { status: 200, body: concat(\"you asked for \", req.path) }", "[req.path]", "8", true),
+        ];
+        let static_log = "\n  log:\n    append_file \"/tmp/vx_ref.log\" \"hit\\n\"";
+        let field_log = "\n  log:\n    append_file \"/tmp/vx_ref.log\" concat(req.method, \" \", req.path, \"\\n\")";
+        // (shape, log variant, size, pre-S8 sha256)
+        let pins: [(&str, &str, usize, &str); 11] = [
+            ("s1", "", 847, "c20fc86f413cb1c49054e040a33c17a4ec5e77daed47f5a031d446378f906724"),
+            ("s1", "static", 1021, "324ba08d390cdf08d6b1896e3fc1dc16fbd2f350e207d417423bc779cd1352fa"),
+            ("s2", "", 880, "1ccf2f3584b02a673aa67a632fa6b4199c088d2c2e4897e07453f5732a9b421e"),
+            ("s2", "static", 1006, "97910d98772c6e1af7c95aa72da8c3c5e3689f5718a44575fd713a9960dfbda8"),
+            ("s2", "field", 1092, "f90d706fa496a725c0c530b020e83a0b3addfce986c17326f6c46ea253a60b64"),
+            ("s3", "", 1276, "5d462b7aa590bcbd05ab16147e74196f346dbe29b9123c1cc2a96074ef12c055"),
+            ("s3", "static", 1450, "b3bf58d6f2b8506bc119506591f3b44a7328094c3cbe3321b0be793bb03090ac"),
+            ("s3", "field", 1568, "0b0c913b57220e0ae0d0136cc3a92649cef37c7485ec1cd17b0e12cafc282142"),
+            ("s4", "", 1270, "e02614cca202fc60bf1c673b6937069be4f66207fa6c85bbc7389532312d4e03"),
+            ("s4", "static", 1444, "da30301a688b6b0d49207e3a2e0d1e11b314d5702882c0dc47f95bf3eac85180"),
+            ("s4", "field", 1562, "9291eef4fe9d6555759fb667a5c316a3bdb47346c60c05a40de557a754e36969"),
+        ];
+        let logblock = |v: &str| -> &str {
+            match v { "static" => static_log, "field" => field_log, _ => "" }
+        };
+        for (tag, variant, size, sha) in pins {
+            let (_, logic, reads, bound, _) =
+                shapes.iter().find(|s| s.0 == tag).copied().unwrap();
+            let o = emit(&mk(logic, reads, bound, 18991, logblock(variant), ""));
+            assert!(o.status.success(), "({tag}/{variant}) must emit with no concurrency line");
+            assert_eq!(o.stdout.len(), size, "({tag}/{variant}) ELF size drifted");
+            assert_eq!(sha256_hex(&o.stdout), sha,
+                "({tag}/{variant}) a service with NO `concurrency:` line must emit \
+                 BYTE-IDENTICALLY to pre-S8 gen0 — every S8 term is gated on \
+                 `svc_concurrency == 2`, so code 0 is unchanged BY CONSTRUCTION");
+            // No S8 bytes anywhere in a sequential-mode binary.
+            assert_eq!(count(&o.stdout, SIGACTION), 0,
+                "({tag}/{variant}) a non-forked server must contain NO rt_sigaction block");
+            assert_eq!(count(&o.stdout, FORK), 0,
+                "({tag}/{variant}) a non-forked server must contain NO fork dispatch");
+        }
+
+        // ── (5b) +160 EXACTLY, with the three sources normalised to the same length ──
+        let abs_pad = "\n".repeat(26);
+        let seq = "\n  concurrency: sequential".to_string();
+        let frk_pad = format!("\n  concurrency: forked{}", "\n".repeat(4));
+        assert_eq!(abs_pad.len(), seq.len());
+        assert_eq!(frk_pad.len(), seq.len());
+        for (tag, logic, reads, bound, hasf) in shapes {
+            let variants: &[&str] = if hasf { &["", "static", "field"] } else { &["", "static"] };
+            for v in variants {
+                let a = emit(&mk(logic, reads, bound, 18991, logblock(v), &abs_pad));
+                let s = emit(&mk(logic, reads, bound, 18991, logblock(v), &seq));
+                let f = emit(&mk(logic, reads, bound, 18991, logblock(v), &frk_pad));
+                assert!(a.status.success() && s.status.success() && f.status.success(),
+                    "({tag}/{v}) absent, sequential and forked must all emit");
+                assert_eq!(a.stdout.len(), s.stdout.len(),
+                    "({tag}/{v}) an explicit `sequential` must cost the same as an \
+                     absent line — the emit terms gate on `== 2`, so codes 0 and 1 are \
+                     the SAME machine code (sources are length-normalised above)");
+                assert_eq!(f.stdout.len(), s.stdout.len() + 160,
+                    "({tag}/{v}) forked must cost EXACTLY 160 bytes more than \
+                     sequential (71 sigaction + 82 fork + 7 tail); got {} vs {}",
+                    f.stdout.len(), s.stdout.len());
+                // p_filesz (e_phoff 64 + 32) and p_memsz (+40) come from the SIZE walk;
+                // the file length is what the EMIT walk produced. A one-byte drift
+                // truncates the mapped segment and the server SIGSEGVs on spawn.
+                let filesz = u64::from_le_bytes(f.stdout[96..104].try_into().unwrap());
+                let memsz = u64::from_le_bytes(f.stdout[104..112].try_into().unwrap());
+                assert_eq!(filesz as usize, f.stdout.len(),
+                    "({tag}/{v}) p_filesz {} != emitted byte count {} on a FORKED row — \
+                     service_tramp_size's concsz and the three splices disagree",
+                    filesz, f.stdout.len());
+                assert_eq!(memsz as usize, f.stdout.len(),
+                    "({tag}/{v}) p_memsz {} != emitted byte count {}", memsz, f.stdout.len());
+
+                // ── STRUCTURE. Each block appears exactly once, in the right place. ──
+                assert_eq!(count(&f.stdout, SIGACTION), 1,
+                    "({tag}/{v}) exactly one rt_sigaction block");
+                assert_eq!(count(&f.stdout, FORK), 1,
+                    "({tag}/{v}) exactly one fork dispatch");
+                let b = find(&f.stdout, BIND).expect("bind");
+                let sg = find(&f.stdout, SIGACTION).expect("sigaction");
+                let li = find(&f.stdout, LISTEN).expect("listen");
+                assert_eq!(b + BIND.len(), sg,
+                    "({tag}/{v}) the sigaction must sit immediately after `bind`");
+                assert_eq!(sg + SIGACTION.len(), li,
+                    "({tag}/{v}) …and immediately before `listen`. Placing it \
+                     PRE-accept_top is what makes every back-jump's two endpoints \
+                     shift equally, so no jump constant changes");
+                let ac = find(&f.stdout, ACCEPT).expect("accept");
+                let fk = find(&f.stdout, FORK).expect("fork");
+                assert_eq!(ac + ACCEPT.len(), fk,
+                    "({tag}/{v}) the fork dispatch must sit immediately after \
+                     `mov r13, rax` (tramp+158)");
+                if *v != "" {
+                    let lo = find_from(&f.stdout, LOG_OPEN, fk).expect("log open after fork");
+                    assert!(lo > fk,
+                        "({tag}/{v}) the fork must come BEFORE the log block — that is \
+                         what makes the parent's `jmp accept_top` a hard -54 instead of \
+                         -(54 + logsz), and it is the only UNIFORM placement (a FIELD \
+                         log is unavoidably post-fork)");
+                }
+                // The child's tail is exit(0), and the sequential back-jump it replaced
+                // is gone: the forked binary has one FEWER 5-byte `e9` tail than the
+                // sequential one, and one exit(0) more.
+                assert_eq!(count(&f.stdout, EXIT0), 1,
+                    "({tag}/{v}) forked must end its iteration with exactly one exit(0)");
+                assert_eq!(count(&s.stdout, EXIT0), 0,
+                    "({tag}/{v}) a sequential server must contain NO exit(0) tail");
+            }
+        }
+
+        // ── the spawn driver ───────────────────────────────────────────────────────
+        let freeport = || -> u16 {
+            TcpListener::bind(("127.0.0.1", 0)).expect("bind ephemeral")
+                .local_addr().unwrap().port()
+        };
+        let install = |bytes: &[u8], name: &str| -> std::path::PathBuf {
+            let p = std::env::temp_dir().join(format!("verbosec_test_svc_s8_srv_{name}"));
+            fs::write(&p, bytes).unwrap();
+            let mut perm = fs::metadata(&p).unwrap().permissions();
+            perm.set_mode(0o755);
+            fs::set_permissions(&p, perm).unwrap();
+            p
+        };
+        let wait_up = |addr: &SocketAddr| -> bool {
+            for _ in 0..200 {
+                if TcpStream::connect_timeout(addr, Duration::from_millis(200)).is_ok() {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            false
+        };
+        let request = |addr: &SocketAddr, path: &str, ms: u64| -> Vec<u8> {
+            let Ok(mut s) = TcpStream::connect_timeout(addr, Duration::from_millis(ms))
+            else { return Vec::new() };
+            s.set_read_timeout(Some(Duration::from_millis(ms))).ok();
+            if s.write_all(format!("GET {} HTTP/1.0\r\n\r\n", path).as_bytes()).is_err() {
+                return Vec::new();
+            }
+            let mut buf = Vec::new();
+            let _ = s.read_to_end(&mut buf);
+            buf
+        };
+
+        // ══════════════════════════════════════════════════════════════════════════
+        // (1) THE MILESTONE — OVERLAP. Connection A connects and sends NOTHING, so its
+        // handler is parked in `read`. A sequential server can never answer B; a
+        // forked one answers immediately because A is a different process.
+        // ══════════════════════════════════════════════════════════════════════════
+        let s2 = shapes[1];
+        let overlap = |conc: &str, tag: &str| -> Vec<Vec<u8>> {
+            let port = freeport();
+            let g = emit(&mk(s2.1, s2.2, s2.3, port, "", conc));
+            assert!(g.status.success(), "({tag}) overlap server must emit");
+            let bin = install(&g.stdout, tag);
+            let mut child = Command::new(&bin).spawn().expect("spawn server");
+            let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
+            assert!(wait_up(&addr), "({tag}) server never listened");
+            // A: connect, send nothing, HOLD the socket open for the whole window.
+            let hung = TcpStream::connect_timeout(&addr, Duration::from_secs(2))
+                .expect("silent client must connect");
+            std::thread::sleep(Duration::from_millis(200));
+            // >= 2 requests per spawned server (the S5b back-jump scar).
+            let out = vec![request(&addr, "/ov0", 1500), request(&addr, "/ov1", 1500)];
+            drop(hung);
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = fs::remove_file(&bin);
+            out
+        };
+        let seq_wire = overlap("\n  concurrency: sequential", "ov_seq");
+        assert!(seq_wire.iter().all(|w| w.is_empty()),
+            "CONTROL FAILED: a SEQUENTIAL server answered while an earlier connection \
+             was still parked in read() — then the overlap row proves nothing about \
+             forked. got {:?}", seq_wire);
+        let frk_wire = overlap("\n  concurrency: forked", "ov_frk");
+        for (i, w) in frk_wire.iter().enumerate() {
+            assert_eq!(w.as_slice(),
+                format!("HTTP/1.0 200 OK\r\nContent-Length: 4\r\n\r\n/ov{}", i).as_bytes(),
+                "THE MILESTONE: a FORKED server must serve request {i} while an earlier \
+                 connection is still blocked in read() — this is the assertion a \
+                 sequential server cannot pass; got {:?}", String::from_utf8_lossy(w));
+        }
+
+        // ══════════════════════════════════════════════════════════════════════════
+        // (2) PARALLEL + (3) ZOMBIES + (4) FD LEAK, on one spawned server.
+        // ══════════════════════════════════════════════════════════════════════════
+        const N: usize = 16;
+        let logfile = std::env::temp_dir().join("verbosec_test_svc_s8_parallel.log");
+        let _ = fs::remove_file(&logfile);
+        let port = freeport();
+        let lb = format!(
+            "\n  log:\n    append_file \"{}\" concat(req.method, \" \", req.path, \"\\n\")",
+            logfile.display());
+        let g = emit(&mk(s2.1, s2.2, s2.3, port, &lb, "\n  concurrency: forked"));
+        assert!(g.status.success(), "the parallel server must emit");
+        let bin = install(&g.stdout, "par");
+        let mut child = Command::new(&bin).spawn().expect("spawn server");
+        let pid = child.id();
+        let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
+        assert!(wait_up(&addr), "parallel server never listened");
+        // The fd BASELINE: sampled after the server is listening but BEFORE it has
+        // served a request. Whatever it inherited from the harness is already in here.
+        let fd_baseline = fs::read_dir(format!("/proc/{}/fd", pid))
+            .map(|d| d.count()).unwrap_or(0);
+        let handles: Vec<_> = (0..N).map(|i| {
+            std::thread::spawn(move || {
+                let a: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
+                let Ok(mut s) = TcpStream::connect_timeout(&a, Duration::from_secs(8))
+                else { return Vec::new() };
+                s.set_read_timeout(Some(Duration::from_secs(8))).ok();
+                if s.write_all(format!("GET /p{:02} HTTP/1.0\r\n\r\n", i).as_bytes()).is_err() {
+                    return Vec::new();
+                }
+                let mut buf = Vec::new();
+                let _ = s.read_to_end(&mut buf);
+                buf
+            })
+        }).collect();
+        let replies: Vec<Vec<u8>> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        std::thread::sleep(Duration::from_millis(400));
+        // Sampled BEFORE the kill, while the server is still the live parent.
+        //
+        // The fd count is POLLED, not sampled once. A client's `read_to_end` returns
+        // when the CHILD closes; the PARENT's close of that same fd happens
+        // independently in the fork block, so on a loaded runner the parent can still
+        // be working through the backlog's accept/fork/close when we look. CI caught
+        // exactly that: 6 = 4 + 2 in flight, where a local run showed 4.
+        // Polling does NOT weaken the assertion, because the two cases it must
+        // separate behave differently over time: an in-flight fd is transient and
+        // settles, a LEAK never does (measured: 96 requests in 3 bursts hold at 4 and
+        // never grow). A leak therefore still fails this, just after the timeout.
+        let fds_now = || fs::read_dir(format!("/proc/{}/fd", pid)).map(|d| d.count()).unwrap_or(0);
+        let mut fds = fds_now();
+        for _ in 0..40 {
+            if fds <= fd_baseline { break; }
+            std::thread::sleep(Duration::from_millis(100));
+            fds = fds_now();
+        }
+        let kids = proc_children(pid);
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = fs::remove_file(&bin);
+
+        for (i, w) in replies.iter().enumerate() {
+            assert_eq!(w.as_slice(),
+                format!("HTTP/1.0 200 OK\r\nContent-Length: 4\r\n\r\n/p{:02}", i).as_bytes(),
+                "concurrent request {i} of {N} was not served correctly; got {:?}",
+                String::from_utf8_lossy(w));
+        }
+        // (2) LOG INTEGRITY: exactly N lines, each an exact `GET /pNN`. The COUNT
+        // catches a lost write; the strict per-line match catches a TORN one — which
+        // is the failure mode slice 5b.5's single `writev` exists to prevent and that
+        // only a concurrent server can actually provoke.
+        let log = fs::read_to_string(&logfile).unwrap_or_default();
+        let lines: Vec<&str> = log.lines().collect();
+        assert_eq!(lines.len(), N,
+            "{N} concurrent requests must produce EXACTLY {N} log lines; got {} \
+             (log = {:?})", lines.len(), log);
+        let mut seen: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
+        seen.sort();
+        let mut want: Vec<String> = (0..N).map(|i| format!("GET /p{:02}", i)).collect();
+        want.sort();
+        assert_eq!(seen, want,
+            "every log line must be an INTACT `GET /pNN` and all {N} must be present — \
+             a torn writev would show up here as a spliced or truncated line");
+        let _ = fs::remove_file(&logfile);
+        // (3) ZOMBIES: rt_sigaction(SIGCHLD, SIG_IGN) makes the kernel auto-reap.
+        assert_eq!(kids.len(), 0,
+            "after {N} served requests the forked server must have NO remaining \
+             children (SIGCHLD = SIG_IGN auto-reaps); got {:?}", kids);
+        // (4) FD LEAK: 0, 1, 2 + the listen socket.
+        assert!(fds <= fd_baseline,
+            "the parent must close every client fd it hands to a child — after {N} \
+             served connections /proc/{}/fd must not exceed its pre-request baseline \
+             of {} entries; got {}. A LEAK shows up as baseline + connections-served; \
+             an ABSOLUTE count would instead measure whatever fds the harness handed \
+             the server at spawn (CI: 6, local: 4 — neither is a property of the \
+             emitted code).", pid, fd_baseline, fds);
+
+        // A dedicated 12-request zombie row on a LOG-LESS server, so the count is not
+        // entangled with the log block, and so the negative control below has an
+        // identical positive twin.
+        let zombie_run = |bytes: &[u8], port: u16, tag: &str| -> (usize, usize) {
+            let bin = install(bytes, tag);
+            let mut ch = Command::new(&bin).spawn().expect("spawn server");
+            let a: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
+            assert!(wait_up(&a), "({tag}) server never listened");
+            for i in 0..12 { let _ = request(&a, &format!("/z{}", i), 2000); }
+            std::thread::sleep(Duration::from_millis(500));
+            let k = proc_children(ch.id());
+            let z = k.iter().filter(|(_, s)| *s == 'Z').count();
+            let _ = ch.kill();
+            let _ = ch.wait();
+            let _ = fs::remove_file(&bin);
+            (k.len(), z)
+        };
+        let zport = freeport();
+        let zg = emit(&mk(s2.1, s2.2, s2.3, zport, "", "\n  concurrency: forked"));
+        assert!(zg.status.success());
+        let (nkids, nzomb) = zombie_run(&zg.stdout, zport, "zomb_ok");
+        assert_eq!((nkids, nzomb), (0, 0),
+            "12 requests, 0 children, 0 zombies — the kernel is auto-reaping; \
+             got children={} zombies={}", nkids, nzomb);
+
+        // ══════════════════════════════════════════════════════════════════════════
+        // NEGATIVE CONTROLS. Each mutates the EMITTED bytes (not the source, so the
+        // mutation is surgical and the rest of the binary is provably unchanged) and
+        // asserts a specific assertion above goes RED. A slice whose tests never fail
+        // for the right reason is not verified.
+        // ══════════════════════════════════════════════════════════════════════════
+
+        // (a) Drop ONLY the rt_sigaction syscall (its two `0f 05` bytes -> two NOPs,
+        //     so every offset in the binary is untouched). Trips the ZOMBIES row.
+        let aport = freeport();
+        let ag = emit(&mk(s2.1, s2.2, s2.3, aport, "", "\n  concurrency: forked"));
+        let mut patched = ag.stdout.clone();
+        let sg = find(&patched, SIGACTION).expect("sigaction present");
+        assert_eq!(&patched[sg + 69..sg + 71], &[0x0f, 0x05]);
+        patched[sg + 69] = 0x90;
+        patched[sg + 70] = 0x90;
+        let (bkids, bzomb) = zombie_run(&patched, aport, "zomb_nosig");
+        assert!(bzomb >= 12 && bkids >= 12,
+            "NEGATIVE CONTROL (a) DID NOT BREAK ANYTHING: with rt_sigaction NOPped out \
+             the server must accumulate one zombie per request (>= 12 after 12 \
+             requests) — if it does not, the zombie assertion above is vacuous and the \
+             71-byte block is not actually load-bearing. got children={} zombies={}",
+            bkids, bzomb);
+
+        // (b) The `jz` to the child: rel8 68 -> 66. Two bytes early lands inside the
+        //     `js`'s operand. Trips the OVERLAP / PARALLEL wire assertions.
+        let cport = freeport();
+        let cg = emit(&mk(s2.1, s2.2, s2.3, cport, "", "\n  concurrency: forked"));
+        let mut patched = cg.stdout.clone();
+        let fk = find(&patched, FORK).expect("fork present");
+        assert_eq!(patched[fk + 13], 0x44, "the jz rel8 must be 68 before we break it");
+        patched[fk + 13] = 0x42; // 66 — the plausible-looking wrong answer
+        let bin = install(&patched, "jz66");
+        let mut ch = Command::new(&bin).spawn().expect("spawn");
+        let a: SocketAddr = format!("127.0.0.1:{}", cport).parse().unwrap();
+        let up = wait_up(&a);
+        let broken: Vec<Vec<u8>> = (0..3).map(|i| request(&a, &format!("/b{}", i), 1500)).collect();
+        let _ = ch.kill();
+        let _ = ch.wait();
+        let _ = fs::remove_file(&bin);
+        assert!(!up || broken.iter().all(|w| !w.starts_with(b"HTTP/1.0 200 OK")),
+            "NEGATIVE CONTROL (b) DID NOT BREAK ANYTHING: a `jz` of 66 instead of 68 \
+             must reset every connection — if the server still serves, the rel8 is not \
+             actually load-bearing and the wire assertions are vacuous. got {:?}",
+            broken);
+
+        // (c) Move the fork dispatch to AFTER the static log block while leaving its
+        //     hardcoded -54 alone. That is the placement the design rejected; the
+        //     displacement is then short by logsz and lands mid-block.
+        let dport = freeport();
+        let dg = emit(&mk(s2.1, s2.2, s2.3, dport, static_log, "\n  concurrency: forked"));
+        let mut patched = dg.stdout.clone();
+        let fk = find(&patched, FORK).expect("fork present");
+        let lend = find_from(&patched, LOG_CLOSE, fk + FORK.len()).expect("log close")
+            + LOG_CLOSE.len();
+        let block: Vec<u8> = patched[fk + FORK.len()..lend].to_vec();
+        patched.splice(fk..lend, block.iter().copied().chain(FORK.iter().copied()));
+        assert_eq!(patched.len(), dg.stdout.len(), "the reorder must not change the size");
+        let bin = install(&patched, "forklast");
+        let mut ch = Command::new(&bin).spawn().expect("spawn");
+        let a: SocketAddr = format!("127.0.0.1:{}", dport).parse().unwrap();
+        let up = wait_up(&a);
+        let broken: Vec<Vec<u8>> = (0..3).map(|i| request(&a, &format!("/c{}", i), 1500)).collect();
+        std::thread::sleep(Duration::from_millis(300));
+        let rc = ch.try_wait().expect("try_wait");
+        if rc.is_none() { let _ = ch.kill(); let _ = ch.wait(); }
+        let _ = fs::remove_file(&bin);
+        assert!(!up || broken.iter().all(|w| !w.starts_with(b"HTTP/1.0 200 OK")),
+            "NEGATIVE CONTROL (c) DID NOT BREAK ANYTHING: placing the fork AFTER the \
+             log block while keeping the hardcoded -54 must crash the server — if it \
+             still serves, the 'fork FIRST' placement is not load-bearing. got {:?}",
+            broken);
+
+        let _ = fs::remove_file(&elf);
+    }
+
     /// SELF-HOSTING SERVICE slice 1 — verify gate pins. The self-hosted emitter's
     /// leading abort_if(verrs) refuses (exit 1, empty stdout) every service audit
     /// violation; a clean hello_http emits an ELF.
@@ -25578,6 +26141,56 @@ rule le64_neg
         let param_r = format!("rule hello_handler\n  input:\n    r : HttpRequest\n  output:\n    resp : HttpResponse\n  logic:\n    resp = HttpResponse {{ status: 200, body: r.path }}\n  proofs:\n    purity:\n      reads : [r.path]\n      calls : []\n    termination:\n      bound : 1\n{}\n  log:\n    append_file \"/tmp/vx_svc_s5b.log\" concat(req.path, \"\\n\")",
             svc("http_1_0", "18888", "4096", "hello_handler"));
         emits(&param_r, "S5b log naming `req` while the handler param is `r`");
+
+        // ------------------------------------------------------------------
+        // SLICE 8 — `concurrency:`. A 4-valued code (0 absent, 1 sequential,
+        // 2 forked, 3 unrecognized) declared LAST in the service block, after
+        // `handler:` and after the whole `log:` sub-block.
+        // ------------------------------------------------------------------
+        let plain_svc = mk(good_logic, &svc("http_1_0", "18888", "4096", "hello_handler"));
+        // (k23) both real modes emit, with and without a log block.
+        emits(&format!("{}\n  concurrency: forked", plain_svc), "S8 forked, no log");
+        emits(&format!("{}\n  concurrency: sequential", plain_svc), "S8 explicit sequential");
+        emits(&with_s2_log(
+            "  log:\n    append_file \"/tmp/vx_svc_s8.log\" \"hit\\n\"\n  concurrency: forked"),
+            "S8 forked after a static log block");
+        emits(&with_s2_log(
+            "  log:\n    append_file \"/tmp/vx_svc_s8.log\" concat(req.method, \" \", req.path, \"\\n\")\n  concurrency: forked"),
+            "S8 forked after a field log block");
+        // (k24) an UNRECOGNIZED mode word is refused (code 3) — the closed set is
+        // {sequential, forked}, and an unknown word must never be silently read as one
+        // of them, least of all as the DEFAULT. Mirror of the on_error `> 2` rule.
+        refuse(&format!("{}\n  concurrency: yolo", plain_svc), "unknown concurrency mode");
+        refuse(&format!("{}\n  concurrency: parallel", plain_svc), "unknown concurrency mode");
+        refuse(&format!("{}\n  concurrency:", plain_svc), "concurrency with no mode word");
+        // (k24b) …and the refusal is reachable through BOTH cursor branches: after a
+        // log block the walk needs `skip_seps_dedent` (concurrency is a SIBLING of
+        // handler:/log:, one indent out), and after an `on_error:` line it starts from
+        // past the policy word rather than past the content.
+        refuse(&with_s2_log(
+            "  log:\n    append_file \"/tmp/vx_svc_s8.log\" \"hit\\n\"\n  concurrency: yolo"),
+            "unknown concurrency mode after a log block");
+        refuse(&with_s2_log(
+            "  log:\n    append_file \"/tmp/vx_svc_s8.log\" \"hit\\n\"\n    on_error: drop\n  concurrency: yolo"),
+            "unknown concurrency mode after an on_error line");
+        // (k25) THE SECURITY REFUSAL: `forked` + `on_error: abort`. Under fork only the
+        // CHILD exits(1), so the port stays open and a liveness probe passes while 100%
+        // of requests silently fail — where the sequential loop hands systemd a loud
+        // exit 1. S5c's fail-closed contract is written in terms of that sequential
+        // loop, so the pair would silently weaken a DECLARED safety property.
+        refuse(&with_s2_log(
+            "  log:\n    append_file \"/tmp/vx_svc_s8.log\" \"hit\\n\"\n    on_error: abort\n  concurrency: forked"),
+            "forked + on_error: abort");
+        // …and each half ALONE is still fine, so the refusal is about the PAIR.
+        emits(&with_s2_log(
+            "  log:\n    append_file \"/tmp/vx_svc_s8.log\" \"hit\\n\"\n    on_error: abort\n  concurrency: sequential"),
+            "abort + explicit sequential");
+        emits(&with_s2_log(
+            "  log:\n    append_file \"/tmp/vx_svc_s8.log\" \"hit\\n\"\n    on_error: abort"),
+            "abort with no concurrency line");
+        emits(&with_s2_log(
+            "  log:\n    append_file \"/tmp/vx_svc_s8.log\" \"hit\\n\"\n    on_error: drop\n  concurrency: forked"),
+            "forked + on_error: drop — the supported concurrent-audit combination");
 
         let _ = fs::remove_file(&gate);
     }

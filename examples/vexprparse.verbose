@@ -979,23 +979,40 @@ concept_group VExpr [max_depth: 4096, max_nodes: 6000000]
   -- concept, exactly like Resource / Connection.
   --
   -- Slice 5a widens 7 -> 12 fields for the OPTIONAL per-request `log:` block:
-  -- `log_present` (0 = no log block, 1 = one declared), `log_path_start` /
-  -- `log_path_len` (the append_file path INNER span, quotes stripped; -1 = the
-  -- MALFORMED-LOG sentinel), `log_content` (the content Ast — AstStr for slice 5a,
-  -- anything else refused with an S5b breadcrumb) and `log_on_error` (0 = the line is
-  -- absent, 1 = `drop`, 2 = `abort`, 3 = present-but-unrecognized).
-  -- WHY `log_present` IS MANDATORY: a single -1 path sentinel cannot distinguish
+  -- `log_code` (the PACKED presence flag + on_error policy — see below),
+  -- `log_path_start` / `log_path_len` (the append_file path INNER span, quotes
+  -- stripped; -1 = the MALFORMED-LOG sentinel) and `log_content` (the content Ast —
+  -- AstStr for slice 5a, anything else refused with an S5b breadcrumb).
+  -- WHY A PRESENCE FLAG IS MANDATORY: a single -1 path sentinel cannot distinguish
   -- "absent" (legal — every service before this slice) from "malformed" (must be
   -- refused). parse_reaction_decl collapses the two because a reaction block is never
   -- optional; a `log:` block IS. Without the flag a malformed log decl would be
   -- SILENTLY IGNORED — the worst failure mode for a fail-closed audit feature.
-  -- Arena cost is ZERO: max_payload_fields is a MAX over all concepts and the
-  -- program-wide maximum is already >= 12 (MkRule), so entry_size is unchanged.
+  --
+  -- SLICE 8 PACKING. `log_present` (0/1) and `log_on_error` (0..3) now live in ONE
+  -- field as `log_code = log_present + 4 * log_on_error`. `svc_log_present` recovers
+  -- it with `% 4`, `svc_log_on_error` with `/ 4`; both accessor SIGNATURES are
+  -- unchanged, so no call site moves. WHY PACK RATHER THAN WIDEN: MkService is at 12
+  -- fields, TIED with MkRule for the program-wide max_payload_fields, so
+  -- entry_size = (1 + 8*12 + 7) & ~7 = 104 and gen0's arena mmap immediate is
+  -- 6,000,000 * 104 = 624,000,000. A 13th field pushes entry_size to 112 — +48 MB of
+  -- reservation and roughly +1.2 GiB on the ~16 GiB self-compile, at which point
+  -- slice 5a's "arena cost is ZERO" note stops being true. Packing keeps the count at
+  -- 12 and frees the 12th slot for slice 8's `concurrency`. Both halves were already
+  -- codes (`proto_code`, `oe_code`), so this is house style. (Rejected: packing into
+  -- `protocol` — that conflates orthogonal axes and forces a `% 10` at every
+  -- `svc_protocol(h) == 1` consumer.)
+  --
+  -- `concurrency` (slice 8) is the freed 12th slot: 0 = absent (-> sequential),
+  -- 1 = explicit `sequential`, 2 = `forked`, 3 = present-but-unrecognized (refused by
+  -- service_errors). NO `_present` companion is needed — the field carries no span, so
+  -- one code covers every state (the `log_present` flag existed only because a
+  -- (start, len) pair's single -1 cannot carry three states).
   concept Service
-    @intention: "A parsed top-level service declaration: name span + port + max_request + handler name span + protocol code + optional log block"
+    @intention: "A parsed top-level service declaration: name span + port + max_request + handler name span + protocol code + packed log code + log block + concurrency code"
     @source: vexprparse.intent:74
     variants:
-      MkService of (name_start : number, name_len : number, port : number, max_request : number, handler_start : number, handler_len : number, protocol : number, log_present : number, log_path_start : number, log_path_len : number, log_content : Ast, log_on_error : number)
+      MkService of (name_start : number, name_len : number, port : number, max_request : number, handler_start : number, handler_len : number, protocol : number, log_code : number, log_path_start : number, log_path_len : number, log_content : Ast, concurrency : number)
 
   -- Self-hosting service slice 1: a cons-list of top-level service declarations in
   -- source order. Same cons shape as ConnectionList (CnCons/CnNil).
@@ -7314,6 +7331,69 @@ rule span_is_drop_word
       bound : 64
 
 
+-- span_is_concurrency (self-hosting service slice 8): 1 iff an Ident span spells
+-- exactly the 11 bytes "concurrency" (c=99 o=111 n=110 c=99 u=117 r=114 r=114 e=101
+-- n=110 c=99 y=121) — the OPTIONAL concurrency line, a SIBLING of `handler:` / `log:`
+-- and the LAST line of a service block. Clone of span_is_on_error.
+rule span_is_concurrency
+  @intention: "1 if an Ident span spells exactly \"concurrency\", 0 otherwise"
+  @source: vexprparse.intent:74
+  input:
+    sc : SpanCheck
+  output:
+    out : number
+  logic:
+    out = if sc.len == 11 and (byte_at(sc.src, sc.start) == 99 and (byte_at(sc.src, sc.start + 1) == 111 and (byte_at(sc.src, sc.start + 2) == 110 and (byte_at(sc.src, sc.start + 3) == 99 and (byte_at(sc.src, sc.start + 4) == 117 and (byte_at(sc.src, sc.start + 5) == 114 and (byte_at(sc.src, sc.start + 6) == 114 and (byte_at(sc.src, sc.start + 7) == 101 and (byte_at(sc.src, sc.start + 8) == 110 and (byte_at(sc.src, sc.start + 9) == 99 and byte_at(sc.src, sc.start + 10) == 121)))))))))) then 1 else 0
+  proofs:
+    purity:
+      reads : [sc.src, sc.start, sc.len]
+      calls : []
+    termination:
+      bound : 64
+
+
+-- span_is_forked (self-hosting service slice 8): 1 iff an Ident span spells exactly
+-- "forked" (f=102 o=111 r=114 k=107 e=101 d=100) — the one concurrency mode that
+-- changes the emitted accept loop (one child per accepted connection, kernel
+-- auto-reaped). Sibling of span_is_abort_word.
+rule span_is_forked
+  @intention: "1 if an Ident span spells exactly \"forked\", 0 otherwise"
+  @source: vexprparse.intent:74
+  input:
+    sc : SpanCheck
+  output:
+    out : number
+  logic:
+    out = if sc.len == 6 and (byte_at(sc.src, sc.start) == 102 and (byte_at(sc.src, sc.start + 1) == 111 and (byte_at(sc.src, sc.start + 2) == 114 and (byte_at(sc.src, sc.start + 3) == 107 and (byte_at(sc.src, sc.start + 4) == 101 and byte_at(sc.src, sc.start + 5) == 100))))) then 1 else 0
+  proofs:
+    purity:
+      reads : [sc.src, sc.start, sc.len]
+      calls : []
+    termination:
+      bound : 64
+
+
+-- span_is_sequential (self-hosting service slice 8): 1 iff an Ident span spells exactly
+-- the 10 bytes "sequential" (s=115 e=101 q=113 u=117 e=101 n=110 t=116 i=105 a=97
+-- l=108) — the DEFAULT mode, recognized explicitly so an operator can write it down
+-- and still get a byte-identical binary. Sibling of span_is_drop_word.
+rule span_is_sequential
+  @intention: "1 if an Ident span spells exactly \"sequential\", 0 otherwise"
+  @source: vexprparse.intent:74
+  input:
+    sc : SpanCheck
+  output:
+    out : number
+  logic:
+    out = if sc.len == 10 and (byte_at(sc.src, sc.start) == 115 and (byte_at(sc.src, sc.start + 1) == 101 and (byte_at(sc.src, sc.start + 2) == 113 and (byte_at(sc.src, sc.start + 3) == 117 and (byte_at(sc.src, sc.start + 4) == 101 and (byte_at(sc.src, sc.start + 5) == 110 and (byte_at(sc.src, sc.start + 6) == 116 and (byte_at(sc.src, sc.start + 7) == 105 and (byte_at(sc.src, sc.start + 8) == 97 and byte_at(sc.src, sc.start + 9) == 108))))))))) then 1 else 0
+  proofs:
+    purity:
+      reads : [sc.src, sc.start, sc.len]
+      calls : []
+    termination:
+      bound : 64
+
+
 rule span_is_http_1_0
   @intention: "1 if a callee/ident span spells exactly \"http_1_0\", 0 otherwise"
   @source: vexprparse.intent:74
@@ -11098,7 +11178,7 @@ rule svc_name_start
     out : number
   logic:
     out = match s:
-      MkService(name_start, name_len, port, max_request, handler_start, handler_len, protocol, log_present, log_path_start, log_path_len, log_content, log_on_error) => name_start
+      MkService(name_start, name_len, port, max_request, handler_start, handler_len, protocol, log_code, log_path_start, log_path_len, log_content, concurrency) => name_start
   proofs:
     purity:
       reads : [s]
@@ -11116,7 +11196,7 @@ rule svc_name_len
     out : number
   logic:
     out = match s:
-      MkService(name_start, name_len, port, max_request, handler_start, handler_len, protocol, log_present, log_path_start, log_path_len, log_content, log_on_error) => name_len
+      MkService(name_start, name_len, port, max_request, handler_start, handler_len, protocol, log_code, log_path_start, log_path_len, log_content, concurrency) => name_len
   proofs:
     purity:
       reads : [s]
@@ -11134,7 +11214,7 @@ rule svc_port
     out : number
   logic:
     out = match s:
-      MkService(name_start, name_len, port, max_request, handler_start, handler_len, protocol, log_present, log_path_start, log_path_len, log_content, log_on_error) => port
+      MkService(name_start, name_len, port, max_request, handler_start, handler_len, protocol, log_code, log_path_start, log_path_len, log_content, concurrency) => port
   proofs:
     purity:
       reads : [s]
@@ -11152,7 +11232,7 @@ rule svc_max_request
     out : number
   logic:
     out = match s:
-      MkService(name_start, name_len, port, max_request, handler_start, handler_len, protocol, log_present, log_path_start, log_path_len, log_content, log_on_error) => max_request
+      MkService(name_start, name_len, port, max_request, handler_start, handler_len, protocol, log_code, log_path_start, log_path_len, log_content, concurrency) => max_request
   proofs:
     purity:
       reads : [s]
@@ -11170,7 +11250,7 @@ rule svc_handler_start
     out : number
   logic:
     out = match s:
-      MkService(name_start, name_len, port, max_request, handler_start, handler_len, protocol, log_present, log_path_start, log_path_len, log_content, log_on_error) => handler_start
+      MkService(name_start, name_len, port, max_request, handler_start, handler_len, protocol, log_code, log_path_start, log_path_len, log_content, concurrency) => handler_start
   proofs:
     purity:
       reads : [s]
@@ -11188,7 +11268,7 @@ rule svc_handler_len
     out : number
   logic:
     out = match s:
-      MkService(name_start, name_len, port, max_request, handler_start, handler_len, protocol, log_present, log_path_start, log_path_len, log_content, log_on_error) => handler_len
+      MkService(name_start, name_len, port, max_request, handler_start, handler_len, protocol, log_code, log_path_start, log_path_len, log_content, concurrency) => handler_len
   proofs:
     purity:
       reads : [s]
@@ -11206,7 +11286,7 @@ rule svc_protocol
     out : number
   logic:
     out = match s:
-      MkService(name_start, name_len, port, max_request, handler_start, handler_len, protocol, log_present, log_path_start, log_path_len, log_content, log_on_error) => protocol
+      MkService(name_start, name_len, port, max_request, handler_start, handler_len, protocol, log_code, log_path_start, log_path_len, log_content, concurrency) => protocol
   proofs:
     purity:
       reads : [s]
@@ -11218,8 +11298,14 @@ rule svc_protocol
 -- Slice 5a accessors for the OPTIONAL `log:` block. Same bare-group idiom as the
 -- seven above; every one of them runs on the SvNil sentinel under eager lets, so the
 -- sentinel carries well-defined values (present 0, path_len -1, content AstErr).
+-- SLICE 8: `log_present` and `log_on_error` are PACKED into the single `log_code`
+-- field (`log_present + 4 * log_on_error`) so the 12th slot could be freed for
+-- `concurrency` without growing the arena entry — see the Service concept comment.
+-- This accessor recovers the presence bit with `% 4` (log_present is 0 or 1, strictly
+-- below the radix); svc_log_on_error recovers the policy with `/ 4`. The SIGNATURE is
+-- unchanged, so every existing call site reads exactly what it read before.
 rule svc_log_present
-  @intention: "1 if the service declares a `log:` block, 0 otherwise"
+  @intention: "1 if the service declares a `log:` block, 0 otherwise (the low half of the packed log_code)"
   @source: vexprparse.intent:74
   input:
     s : Service
@@ -11227,7 +11313,7 @@ rule svc_log_present
     out : number
   logic:
     out = match s:
-      MkService(name_start, name_len, port, max_request, handler_start, handler_len, protocol, log_present, log_path_start, log_path_len, log_content, log_on_error) => log_present
+      MkService(name_start, name_len, port, max_request, handler_start, handler_len, protocol, log_code, log_path_start, log_path_len, log_content, concurrency) => log_code % 4
   proofs:
     purity:
       reads : [s]
@@ -11245,7 +11331,7 @@ rule svc_log_path_start
     out : number
   logic:
     out = match s:
-      MkService(name_start, name_len, port, max_request, handler_start, handler_len, protocol, log_present, log_path_start, log_path_len, log_content, log_on_error) => log_path_start
+      MkService(name_start, name_len, port, max_request, handler_start, handler_len, protocol, log_code, log_path_start, log_path_len, log_content, concurrency) => log_path_start
   proofs:
     purity:
       reads : [s]
@@ -11263,7 +11349,7 @@ rule svc_log_path_len
     out : number
   logic:
     out = match s:
-      MkService(name_start, name_len, port, max_request, handler_start, handler_len, protocol, log_present, log_path_start, log_path_len, log_content, log_on_error) => log_path_len
+      MkService(name_start, name_len, port, max_request, handler_start, handler_len, protocol, log_code, log_path_start, log_path_len, log_content, concurrency) => log_path_len
   proofs:
     purity:
       reads : [s]
@@ -11281,7 +11367,7 @@ rule svc_log_content
     out : Ast
   logic:
     out = match s:
-      MkService(name_start, name_len, port, max_request, handler_start, handler_len, protocol, log_present, log_path_start, log_path_len, log_content, log_on_error) => log_content
+      MkService(name_start, name_len, port, max_request, handler_start, handler_len, protocol, log_code, log_path_start, log_path_len, log_content, concurrency) => log_content
   proofs:
     purity:
       reads : [s]
@@ -11290,8 +11376,10 @@ rule svc_log_content
       bound : 16
 
 
+-- SLICE 8: the high half of the packed `log_code` (see svc_log_present). `/ 4`
+-- recovers the policy exactly because the low half is 0 or 1.
 rule svc_log_on_error
-  @intention: "The log on_error policy code of a service declaration (0 = absent, 1 = drop, 2 = abort, 3 = unrecognized)"
+  @intention: "The log on_error policy code of a service declaration (0 = absent, 1 = drop, 2 = abort, 3 = unrecognized) — the high half of the packed log_code"
   @source: vexprparse.intent:74
   input:
     s : Service
@@ -11299,7 +11387,33 @@ rule svc_log_on_error
     out : number
   logic:
     out = match s:
-      MkService(name_start, name_len, port, max_request, handler_start, handler_len, protocol, log_present, log_path_start, log_path_len, log_content, log_on_error) => log_on_error
+      MkService(name_start, name_len, port, max_request, handler_start, handler_len, protocol, log_code, log_path_start, log_path_len, log_content, concurrency) => log_code / 4
+  proofs:
+    purity:
+      reads : [s]
+      calls : []
+    termination:
+      bound : 16
+
+
+-- svc_concurrency (self-hosting service slice 8): the concurrency mode code.
+--   0 = the line is ABSENT          -> sequential (every service before this slice)
+--   1 = explicit `sequential`       -> sequential (byte-identical to 0)
+--   2 = `forked`                    -> one child per accepted connection
+--   3 = present-but-unrecognized    -> REFUSED by service_errors
+-- Four-valued rather than boolean precisely so 0 and 1 both mean "emit exactly what
+-- was emitted before" while an unknown policy word can never be silently read as one
+-- of the two real modes. Runs on the SvNil sentinel under eager lets (which carries 0).
+rule svc_concurrency
+  @intention: "The concurrency mode code of a service declaration (0 = absent, 1 = sequential, 2 = forked, 3 = unrecognized)"
+  @source: vexprparse.intent:74
+  input:
+    s : Service
+  output:
+    out : number
+  logic:
+    out = match s:
+      MkService(name_start, name_len, port, max_request, handler_start, handler_len, protocol, log_code, log_path_start, log_path_len, log_content, concurrency) => concurrency
   proofs:
     purity:
       reads : [s]
@@ -11343,7 +11457,7 @@ rule svc_head
   logic:
     out = match sl:
       SvCons(head, tail) => head
-      SvNil => Service::MkService { name_start: 0, name_len: 0, port: 0, max_request: 0, handler_start: 0, handler_len: 0 - 1, protocol: 0, log_present: 0, log_path_start: 0, log_path_len: 0 - 1, log_content: Ast::AstErr, log_on_error: 0 }
+      SvNil => Service::MkService { name_start: 0, name_len: 0, port: 0, max_request: 0, handler_start: 0, handler_len: 0 - 1, protocol: 0, log_code: 0, log_path_start: 0, log_path_len: 0 - 1, log_content: Ast::AstErr, concurrency: 0 }
   proofs:
     purity:
       reads : [sl]
@@ -11403,13 +11517,17 @@ rule parse_service_decl
     -- skip_seps from +2 (past the Newline + the inner Indent) lands on `append_file`,
     -- its path Str at +1, the content at +2 via parse_or. The OPTIONAL `on_error:` line
     -- sits after the content (skip_seps from parse_or's `next`).
-    -- ABSENT != MALFORMED: with no `log:` line log_present is 0 and log_path_len is the
-    -- -1 sentinel, which svc_log_ok reads as "no log, no error" — get this wrong and
+    -- ABSENT != MALFORMED: with no `log:` line the presence bit is 0 and log_path_len is
+    -- the -1 sentinel, which svc_log_ok reads as "no log, no error" — get this wrong and
     -- EVERY existing service refuses.
     -- The eager parse_or below runs even for a log-less service (and for every
     -- non-service top-level item, since parse_services binds parse_service_decl in an
-    -- eager let). It is INERT — gated by log_present at both verify and emit — and
+    -- eager let). It is INERT — gated by svc_log_present at both verify and emit — and
     -- bounded, because skip_seps parks the cursor on a Dedent rather than running away.
+    -- SLICE 8: the presence bit and oe_code are stored PACKED as
+    -- `log_code = is_log + 4 * oe_code` (is_log is 0/1, oe_code is 0..3, so the two
+    -- halves cannot collide). svc_log_present / svc_log_on_error unpack them with
+    -- `% 4` / `/ 4`; nothing else in the file reads the raw field.
     let gp = skip_seps(ParseState { cell: advance(Advance { lst: hp, k: 3 }) })
     let is_log = span_is_log(SpanCheck { src: ps.src, start: peek_kw_start(gp), len: peek_kw_len(gp) })
     let lap = skip_seps(ParseState { cell: advance(Advance { lst: gp, k: 2 }) })
@@ -11424,11 +11542,46 @@ rule parse_service_decl
     let oe_drop = span_is_drop_word(SpanCheck { src: ps.src, start: peek_kw_start(advance(Advance { lst: oep, k: 2 })), len: peek_kw_len(advance(Advance { lst: oep, k: 2 })) })
     let oe_code = if is_oe == 0 then 0 else if oe_abort == 1 then 2 else if oe_drop == 1 then 1 else 3
     let log_shape_ok = if is_lappend == 1 then is_lpstr else 0
-    out = Service::MkService { name_start: name_start, name_len: name_len, port: pval, max_request: mval, handler_start: hnstart, handler_len: if shape_ok == 1 then hnlen else 0 - 1, protocol: proto_code, log_present: is_log, log_path_start: lpstart + 1, log_path_len: if is_log == 1 then (if log_shape_ok == 1 then (if lplen >= 2 then lplen - 2 else 0 - 1) else 0 - 1) else 0 - 1, log_content: parsed_node(lcp), log_on_error: oe_code }
+    -- Slice 8: the OPTIONAL `concurrency:` line. POSITION IS LOAD-BEARING — it is the
+    -- LAST line of the service block, after `handler:` and after the whole `log:`
+    -- sub-block, because that is the only position that perturbs NO existing cursor:
+    -- every step above keeps the offsets it had in slice 5c and one new conditional
+    -- cursor is appended. (The verbosec oracles disagree on placement —
+    -- static_file_server / body_content_gate / audit_gateway put it last, policy_proxy
+    -- puts it early — so "last" is a choice, and it is the cheap one.)
+    --
+    -- THE SUBTLETY THAT BITES: `on_error` reaches its keyword with plain `skip_seps`
+    -- because it sits INSIDE the `log:` sub-block (only a Newline separates it from the
+    -- content). `concurrency:` is a SIBLING of `handler:` / `log:`, one indent OUT, so
+    -- after a log block there is a Dedent between the two and only `skip_seps_dedent`
+    -- crosses it. With no log block at all there is no Dedent to cross — `gp` (plain
+    -- skip_seps from handler+3) already IS the concurrency keyword — which is why the
+    -- cursor forks on `is_log` instead of always dedenting.
+    --   is_log == 0 -> cp = gp                      (handler: then concurrency:)
+    --   is_log == 1 -> cp = skip_seps_dedent(lend)  (lend = past the log block: past the
+    --                                                on_error line when present, else
+    --                                                past the content expression)
+    -- EAGER-LET SAFETY, and the S5a hazard restated: when neither line is present the
+    -- cursor parks on the block-closing Dedent (span_is_concurrency of a Dedent's 0/0
+    -- span is 0); when a log block is present but no concurrency line follows,
+    -- skip_seps_dedent DOES walk into the next top-level declaration — harmless because
+    -- we only byte-compare its keyword against "concurrency" and never advance the outer
+    -- walk (parse_services resumes from skip_indented_block(hp), untouched). No
+    -- top-level keyword spells "concurrency".
+    let lend = if is_oe == 1 then advance(Advance { lst: oep, k: 3 }) else parsed_next(lcp)
+    let cp = if is_log == 0 then gp else skip_seps_dedent(ParseState { cell: lend })
+    let is_conc = span_is_concurrency(SpanCheck { src: ps.src, start: peek_kw_start(cp), len: peek_kw_len(cp) })
+    let cw_forked = span_is_forked(SpanCheck { src: ps.src, start: peek_kw_start(advance(Advance { lst: cp, k: 2 })), len: peek_kw_len(advance(Advance { lst: cp, k: 2 })) })
+    let cw_seq = span_is_sequential(SpanCheck { src: ps.src, start: peek_kw_start(advance(Advance { lst: cp, k: 2 })), len: peek_kw_len(advance(Advance { lst: cp, k: 2 })) })
+    -- Mirror of oe_code, and 4-valued for the same reason: an unrecognized policy word
+    -- must be DISTINGUISHABLE from absent so service_errors can refuse it instead of
+    -- silently reading it as one of the two real modes.
+    let conc_code = if is_conc == 0 then 0 else if cw_forked == 1 then 2 else if cw_seq == 1 then 1 else 3
+    out = Service::MkService { name_start: name_start, name_len: name_len, port: pval, max_request: mval, handler_start: hnstart, handler_len: if shape_ok == 1 then hnlen else 0 - 1, protocol: proto_code, log_code: is_log + 4 * oe_code, log_path_start: lpstart + 1, log_path_len: if is_log == 1 then (if log_shape_ok == 1 then (if lplen >= 2 then lplen - 2 else 0 - 1) else 0 - 1) else 0 - 1, log_content: parsed_node(lcp), concurrency: conc_code }
   proofs:
     purity:
       reads : [ps.cell, ps.src]
-      calls : [peek_kw_start, peek_kw_len, skip_seps, skip_seps_dedent, span_is_listen, span_is_protocol, span_is_http_1_0, span_is_raw_tcp, span_is_port, peek_is_num, peek_value, span_is_max_request, span_is_handler, span_is_log, span_is_append_file, span_is_on_error, span_is_abort_word, span_is_drop_word, peek_is_str, peek_str_start, peek_str_len, parse_or, parsed_node, parsed_next, advance]
+      calls : [peek_kw_start, peek_kw_len, skip_seps, skip_seps_dedent, span_is_listen, span_is_protocol, span_is_http_1_0, span_is_raw_tcp, span_is_port, peek_is_num, peek_value, span_is_max_request, span_is_handler, span_is_log, span_is_append_file, span_is_on_error, span_is_abort_word, span_is_drop_word, span_is_concurrency, span_is_forked, span_is_sequential, peek_is_str, peek_str_start, peek_str_len, parse_or, parsed_node, parsed_next, advance]
     termination:
       bound : 256
 
@@ -13993,11 +14146,34 @@ rule service_errors
     -- non-canonical case.) The gate forks on `ast_is_str(body_ast)` — literally the
     -- expression the two emitter walks fork on.
     let log_field_on_s1_bad = if svc_log_has_field(SvcLogState { svcs: se.svcs, src: se.src }) == 1 and ast_is_str(body_ast) == 1 then 1 else 0
-    out = if has_svc == 0 then 0 else (malformed + proto_bad + port_bad + maxreq_bad + (if hexists == 1 then 0 else 1) + (if shape_ok == 1 then 0 else 1) + (if n == 1 then 0 else 1) + reserved + effects + log_bad + log_field_on_s1_bad)
+    -- Slice 8: an UNRECOGNIZED concurrency word (code 3) is refused. The closed set is
+    -- `sequential` (1) and `forked` (2); absent (0) means sequential. Mirror of
+    -- svc_log_ok's `on_error > 2` rule — an unknown word must never be silently read as
+    -- one of the two real modes, least of all as the DEFAULT.
+    let conc_bad = if svc_concurrency(h) == 3 then 1 else 0
+    -- Slice 8: `forked` + `on_error: abort` is REFUSED. This is a SECURITY call, not a
+    -- documentation note, and it is the one thing no byte / size / SHA gate can see.
+    -- Measured, with the log path pointing at a DIRECTORY (-EISDIR):
+    --                sequential                       forked
+    --   req 1        empty reply, server EXIT 1       empty reply, server ALIVE
+    --   req 2/3      ECONNREFUSED (dead)              empty reply, still alive
+    -- The per-request half of the fail-closed contract survives (no log => no response
+    -- bytes), but the SYSTEMIC ESCALATION is lost: only the child exits, so the port
+    -- stays open and an "is it listening" health check passes while 100% of requests
+    -- silently fail — where the sequential loop hands systemd/k8s a loud exit 1. S5c's
+    -- contract is written in terms of that sequential loop, so allowing the pair would
+    -- SILENTLY WEAKEN A DECLARED SAFETY PROPERTY, which is exactly what the compiler
+    -- axiom forbids. `forked` + `drop` (a best-effort access log on a concurrent
+    -- server) stays fully sound and is the supported combination. Lifting this needs a
+    -- real escalation mechanism (child signals parent); that is its own slice.
+    -- The svc_log_present guard keeps this precise: it fires only on a DECLARED abort
+    -- log, never on the eager on_error parse of a log-less service.
+    let conc_abort_bad = if svc_concurrency(h) == 2 and (svc_log_present(h) == 1 and svc_log_on_error(h) == 2) then 1 else 0
+    out = if has_svc == 0 then 0 else (malformed + proto_bad + port_bad + maxreq_bad + (if hexists == 1 then 0 else 1) + (if shape_ok == 1 then 0 else 1) + (if n == 1 then 0 else 1) + reserved + effects + log_bad + log_field_on_s1_bad + conc_bad + conc_abort_bad)
   proofs:
     purity:
       reads : [se.prog, se.svcs, se.concepts, se.ress, se.conns, se.rxs, se.src]
-      calls : [service_list_len, svc_head, svc_handler_len, svc_protocol, svc_port, svc_max_request, svc_handler_start, rule_named, find_rule, rd_body, count_binds, block_binds, block_result, ast_variant_fields, ast_is_variant, vfield_len, ast_is_num, vf_head_val, vf_tail, svc_body_ok, svc_if_shape_ok, fl_head_start, fl_head_len, find_concept_index, fl_head_ty_start, fl_head_ty_len, rd_input, rd_out_ty_start, rd_out_ty_len, reaction_list_len, connection_list_len, resource_list_len, svc_log_ok, svc_log_present, svc_log_path_len, svc_log_on_error, svc_log_content, svc_log_has_field, ast_is_str]
+      calls : [service_list_len, svc_head, svc_handler_len, svc_protocol, svc_port, svc_max_request, svc_handler_start, rule_named, find_rule, rd_body, count_binds, block_binds, block_result, ast_variant_fields, ast_is_variant, vfield_len, ast_is_num, vf_head_val, vf_tail, svc_body_ok, svc_if_shape_ok, fl_head_start, fl_head_len, find_concept_index, fl_head_ty_start, fl_head_ty_len, rd_input, rd_out_ty_start, rd_out_ty_len, reaction_list_len, connection_list_len, resource_list_len, svc_log_ok, svc_log_present, svc_log_path_len, svc_log_on_error, svc_log_content, svc_log_has_field, ast_is_str, svc_concurrency]
     termination:
       bound : 128
 
@@ -29089,6 +29265,182 @@ rule x86_svc_log_block
       bound : 64
 
 
+-- ============================================================================
+-- SELF-HOSTING SERVICE slice 8 — `concurrency: forked`. The emitted server stops
+-- head-of-line-blocking on one silent client: it forks a child per accepted
+-- connection and the kernel auto-reaps it.
+--
+-- THREE gated splices, and ZERO jump-constant edits. They are three SEPARATE rules
+-- (a concat-valued `let` is refused inside this recursive SCC, see the note above
+-- x86_service_tramp's `out`), each spliced identically into all four branches so the
+-- four insertions cannot drift.
+--
+-- Layout of the accept loop, objdump-verified in every shape: tramp base 186,
+-- accept_top = tramp+137, the accept block is 21 B, so `mov %rax,%r13` ends at
+-- tramp+158 — the same insertion point slice 5a's static log uses.
+--
+--   1. x86_svc_conc_pre  (71 B) sits in the STARTUP, between `bind` and `listen`.
+--      It is PRE-accept_top, so both endpoints of every back-jump shift equally and
+--      no constant moves.
+--   2. x86_svc_conc_fork (82 B) sits at tramp+158, BEFORE the static log block.
+--   3. x86_svc_conc_tail swaps the 5-byte `jmp accept_top` for a 12-byte exit(0).
+--
+--   concsz = 71 + 82 + 7 = 160, a sibling of `logsz` in service_tramp_size.
+--
+-- JUMP ARITHMETIC, verified by enumerating every transfer in all four shapes:
+-- EXACTLY ONE crosses tramp+158 — the tail back-jump to accept_top — and ZERO forward
+-- jumps do. So jump1/2/6, jump1_4/2_4/6_4, jump1_2/2_2 and jump3/4/5 absorb NO concsz
+-- term, and the one transfer that would is REPLACED by the exit(0). That is why this
+-- slice needs no de-baking and touches no constant: splice 1 is before accept_top
+-- (both endpoints shift), splice 2 is after every back-jump TARGET but before every
+-- back-jump SOURCE (and the only such source is the tail, which forked mode deletes),
+-- and splice 3 is the tail itself.
+--
+-- PLACEMENT: the fork goes FIRST, before the static log block. It matches verbosec
+-- (which always logs in the child), and it is the only UNIFORM rule — a FIELD log is
+-- unavoidably post-fork, so splitting on `hasf` would give the two placements
+-- inconsistent abort semantics. It also makes the parent's `jmp accept_top` a HARD
+-- -54 instead of -(54 + logsz); the alternative was measured and SIGSEGV'd when the
+-- hardcoded displacement ignored logsz.
+--
+-- LOG ATOMICITY IS NOT AT RISK, and not for a lucky reason: the log block's
+-- `open(path, 0x441 = O_WRONLY|O_CREAT|O_APPEND, 0644)` is INSIDE the accept loop, so
+-- each child opens its OWN `struct file` with its own offset — there is no shared
+-- offset to race on. If a future slice ever hoists that open to startup, the
+-- inherited-fd case stays safe ONLY because of O_APPEND; without it children would
+-- overwrite each other.
+--
+-- HONEST SCOPE: forked is a HEAD-OF-LINE-BLOCKING fix, not a throughput feature —
+-- measured ~10% SLOWER on a trivial handler (2381 -> 2101 req/s single-worker). And
+-- `writev`'s atomicity remains the same unproven Linux inode-lock property slice 5b.5
+-- relies on: S8 exercises it, it does not upgrade it.
+--
+-- x86_svc_conc_pre: rt_sigaction(SIGCHLD, SIG_IGN, NULL, 8), 71 B, emitted between
+-- `bind` and `listen` so it covers the very first connection. This is LOAD-BEARING,
+-- not hygiene: a fork-without-sigaction variant was measured at children=12
+-- zombies=12. With it the kernel auto-reaps — no wait/waitpid, no zombies, zero
+-- per-request bookkeeping.
+--   eb 20                     jmp short +32       (over the data block)
+--   <32 B struct sigaction, KERNEL x86-64 ABI, not libc:
+--      +0  sa_handler  = 1 (SIG_IGN)
+--      +8  sa_flags    = 0
+--      +16 sa_restorer = 0   (unused without SA_RESTORER)
+--      +24 sa_mask     = 0   (one longword; sigsetsize = 8)>
+--   48 c7 c0 0d 00 00 00      mov rax, 13         (rt_sigaction)
+--   48 c7 c7 11 00 00 00      mov rdi, 17         (SIGCHLD)
+--   48 8d 35 le32(-53)        lea rsi, [rip-53]   (-> the data block)
+--   48 c7 c2 00 00 00 00      mov rdx, 0          (oldact = NULL)
+--   49 c7 c2 08 00 00 00      mov r10, 8          (sigsetsize)
+--   0f 05                     syscall
+-- Emits NOTHING unless `concurrency: forked` is declared, so an absent line (code 0)
+-- AND an explicit `sequential` (code 1) both stay byte-identical to slice 5c.
+rule x86_svc_conc_pre
+  @intention: "Emit rt_sigaction(SIGCHLD, SIG_IGN) between bind and listen when the service declares concurrency: forked (71 B, else nothing)"
+  @source: vexprparse.intent:74
+  input:
+    ls : SvcLogState
+  output:
+    out : bytes
+  logic:
+    out = if svc_concurrency(svc_head(ls.svcs)) == 2 then concat(b"\xeb\x20", le64(1), le64(0), le64(0), le64(0), b"\x48\xc7\xc0\x0d\x00\x00\x00", b"\x48\xc7\xc7\x11\x00\x00\x00", b"\x48\x8d\x35", le32(0 - 53), b"\x48\xc7\xc2\x00\x00\x00\x00", b"\x49\xc7\xc2\x08\x00\x00\x00", b"\x0f\x05") else b""
+  proofs:
+    purity:
+      reads : [ls.svcs]
+      calls : [svc_head, svc_concurrency]
+    termination:
+      bound : 16
+
+
+-- x86_svc_conc_fork: the fork dispatch, 82 B at tramp+158 (3 B less than verbosec's
+-- 83 — `mov rdi,r13` is 3 bytes where verbosec's `mov rdi,[rbp-48]` is 4). The CHILD
+-- is the natural fall-through, so the entire existing iteration body is shared:
+--
+--   offset  bytes                          meaning
+--   +0      48 c7 c0 39 00 00 00           mov rax, 57      (sys_fork)
+--   +7      0f 05                          syscall
+--   +9      48 85 c0                       test rax, rax
+--   +12     74 44                          jz  +68   -> child
+--   +14     78 11                          js  +17   -> fork_error
+--   +16     48 c7 c0 03 00 00 00           mov rax, 3       (parent_close: close)
+--   +23     4c 89 ef                       mov rdi, r13     (the client fd)
+--   +26     0f 05                          syscall
+--   +28     e9 ca ff ff ff                 jmp -54   -> accept_top
+--   +33     eb 0c                          jmp +12          (fork_error: over the msg)
+--   +35     "fork failed\n"                12 bytes
+--   +47     48 c7 c0 01 00 00 00           mov rax, 1       (write)
+--   +54     48 c7 c7 02 00 00 00           mov rdi, 2       (stderr)
+--   +61     48 8d 35 df ff ff ff           lea rsi, [rip-33] -> the msg
+--   +68     48 c7 c2 0c 00 00 00           mov rdx, 12
+--   +75     0f 05                          syscall
+--   +77     e9 be ff ff ff                 jmp -66   -> parent_close
+--   +82     <child: the existing read falls through here>
+--
+-- THE ONE CONSTANT THAT WILL BE GOT WRONG: the `jz` rel8 is 68, NOT 66. It is
+-- measured from the END of the two-byte `jz` — offset +14 — to the child label at
+-- +82, not from the end of the `js` at +16. A 66 lands two bytes early, inside the
+-- `js`'s operand, and every connection is reset.
+-- The parent's -54 is a HARD constant, which is exactly why the fork is placed BEFORE
+-- the log block: accept_top is at tramp+137, the block starts at tramp+158, and this
+-- `e9`'s rel32 ends at 158+33 = 191, so 137 - 191 = -54 with NO logsz term. Placing
+-- the fork after the log block with this displacement was measured and SIGSEGV'd.
+-- The -66 back to parent_close and the -33 lea are internal to the block.
+-- On fork failure the connection is DROPPED and the server keeps serving (parent
+-- path), which is the same posture as every other unchecked syscall in the loop.
+rule x86_svc_conc_fork
+  @intention: "Emit the per-accept fork dispatch (child falls through, parent closes and loops, failure logs to stderr and drops the connection) when concurrency is forked (82 B, else nothing)"
+  @source: vexprparse.intent:74
+  input:
+    ls : SvcLogState
+  output:
+    out : bytes
+  logic:
+    out = if svc_concurrency(svc_head(ls.svcs)) == 2 then concat(b"\x48\xc7\xc0\x39\x00\x00\x00\x0f\x05\x48\x85\xc0", b"\x74\x44", b"\x78\x11", b"\x48\xc7\xc0\x03\x00\x00\x00\x4c\x89\xef\x0f\x05", b"\xe9\xca\xff\xff\xff", b"\xeb\x0c", b"\x66\x6f\x72\x6b\x20\x66\x61\x69\x6c\x65\x64\x0a", b"\x48\xc7\xc0\x01\x00\x00\x00", b"\x48\xc7\xc7\x02\x00\x00\x00", b"\x48\x8d\x35\xdf\xff\xff\xff", b"\x48\xc7\xc2\x0c\x00\x00\x00", b"\x0f\x05", b"\xe9\xbe\xff\xff\xff") else b""
+  proofs:
+    purity:
+      reads : [ls.svcs]
+      calls : [svc_head, svc_concurrency]
+    termination:
+      bound : 16
+
+
+-- SvcConcTailState / x86_svc_conc_tail: the iteration TAIL. In sequential mode it is
+-- the 5-byte `e9 le32(disp)` back-jump to accept_top that every branch already
+-- emitted; in forked mode the child must NOT loop, so it becomes the 12-byte
+-- `mov edi,0 ; mov eax,60 ; syscall` — the mirror of slice 5c's abort stub, house
+-- form. Net +7.
+-- This is the reason the slice needs no de-baking: `disp` is the ONLY transfer in the
+-- whole accept loop whose two endpoints straddle tramp+158, and forked mode does not
+-- emit it at all. The four callers still pass their closed forms
+-- (-(87 + block + logsz), jump6, jump6_4, -(470 + cap + logsz)) so the sequential
+-- bytes are unchanged to the bit; forked simply discards them.
+-- `disp` MUST declare a NEGATIVE-CAPABLE range: a range-less `number` field defaults
+-- to [0, i32::MAX] and the optimizer's interval arithmetic would mangle a back-jump
+-- (the SvcLogCkState.path_len scar).
+concept SvcConcTailState
+  @intention: "The service list + the sequential-mode back-jump displacement, to select the accept-loop tail"
+  @source: vexprparse.intent:74
+  fields:
+    svcs : ServiceList
+    disp : number [-4000000, 4000000]
+
+
+rule x86_svc_conc_tail
+  @intention: "Emit the accept-loop tail: exit(0) in forked mode (the child must not loop), else the sequential back-jump to accept_top"
+  @source: vexprparse.intent:74
+  input:
+    ct : SvcConcTailState
+  output:
+    out : bytes
+  logic:
+    out = if svc_concurrency(svc_head(ct.svcs)) == 2 then b"\xbf\x00\x00\x00\x00\xb8\x3c\x00\x00\x00\x0f\x05" else concat(b"\xe9", le32(ct.disp))
+  proofs:
+    purity:
+      reads : [ct.svcs, ct.disp]
+      calls : [svc_head, svc_concurrency]
+    termination:
+      bound : 16
+
+
 -- ServiceTrampSizeState / service_tramp_size: the EXACT byte length of the accept
 -- loop = 224 fixed (startup 137 + accept 21 + read 18 + jmp-over 5 + write 26 +
 -- close 12 + back-jmp 5) + the 4-padded response block. The ONE sizing truth
@@ -29180,14 +29532,21 @@ rule service_tramp_size
     -- evaluate this expression on refused shapes, so the S1 arm must contribute 0
     -- rather than rely on the refusal.
     let cap = svc_log_capture_size(SvcLogState { svcs: ss.svcs, src: ss.src })
+    -- Slice 8 sizing: `concsz` is a sibling of `logsz` — OUTSIDE the fork, because all
+    -- three splices land in bytes that are inlined verbatim in every branch (the
+    -- startup between bind and listen, the point just after `mov r13, rax`, and the
+    -- iteration tail). FLAT 160 = 71 (rt_sigaction) + 82 (fork dispatch) + 7 (the tail
+    -- growing from a 5-byte jmp to a 12-byte exit(0)). 0 unless `forked` is declared,
+    -- which is what makes an absent line AND an explicit `sequential` byte-identical.
+    let concsz = if svc_concurrency(h) == 2 then 160 else 0
     -- AstStr body -> S1 (224 + response). AstIf result -> S3 (395 + L4 + blockA + blockB).
     -- Concat body -> S4 (596 + per-arg blocks). Otherwise (AstField body) -> S2 (607).
     -- Both copies fork identically.
-    out = logsz + (if ast_is_str(body_ast) == 1 then (224 + 4 * ((rlen + 3) / 4)) else if ast_is_if(hresult) == 1 then (395 + l4 + blockA + blockB + cap) else if arg_list_len(cargs4) > 0 then (596 + csize4 + cap) else (607 + cap))
+    out = logsz + concsz + (if ast_is_str(body_ast) == 1 then (224 + 4 * ((rlen + 3) / 4)) else if ast_is_if(hresult) == 1 then (395 + l4 + blockA + blockB + cap) else if arg_list_len(cargs4) > 0 then (596 + csize4 + cap) else (607 + cap))
   proofs:
     purity:
       reads : [ss.svcs, ss.prog, ss.src]
-      calls : [svc_head, find_rule, svc_handler_start, svc_handler_len, ast_variant_fields, block_result, rd_body, ast_num_value, vf_head_val, vf_tail, ast_str_start, ast_str_len, response_len, ast_is_str, ast_is_if, ast_if_cond, ast_bin_rhs, bytelit_decoded_len, ast_if_then, ast_if_else, ast_call_args, arg_list_len, svc_cargs_size, svc_log_block_size, svc_log_capture_size]
+      calls : [svc_head, find_rule, svc_handler_start, svc_handler_len, ast_variant_fields, block_result, rd_body, ast_num_value, vf_head_val, vf_tail, ast_str_start, ast_str_len, response_len, ast_is_str, ast_is_if, ast_if_cond, ast_bin_rhs, bytelit_decoded_len, ast_if_then, ast_if_else, ast_call_args, arg_list_len, svc_cargs_size, svc_log_block_size, svc_log_capture_size, svc_concurrency]
     termination:
       bound : 64
 
@@ -29334,17 +29693,28 @@ rule x86_service_tramp
     -- construction.
     let jump1_2 = 399 + cap + jlog
     let jump2_2 = 361 + cap + jlog
+    -- Slice 8: NOT ONE of the constants above changes. The three concurrency splices
+    -- are placed so that exactly one transfer in the whole loop straddles an insertion
+    -- point — the tail back-jump to accept_top — and forked mode replaces that tail
+    -- with exit(0) rather than re-aiming it. x86_svc_conc_pre lands PRE-accept_top so
+    -- both endpoints of every back-jump shift by its 71 bytes; x86_svc_conc_fork lands
+    -- after every back-jump TARGET and before the only back-jump SOURCE; and every
+    -- forward jump (jump1/2, jump1_4/2_4, jump1_2/2_2, jump3/4/5, and the local
+    -- eb/e9 hops inside the parse loop and the response blobs) has BOTH endpoints
+    -- downstream of both insertions. So the four closed-form negatives are still
+    -- computed and still passed to x86_svc_conc_tail — which uses them verbatim in
+    -- sequential mode and discards them in forked mode.
     -- The startup (socket/setsockopt/bind/listen/sub-rsp) + accept + read bytes are
     -- IDENTICAL in both branches; they are inlined verbatim in each `concat` (no
     -- shared bytes-let — a concat-valued let is refused inside this recursive SCC).
     -- r12 = listen fd, r13 = client fd (both callee-saved). Only the iteration tail
     -- forks: AstStr -> S1 precomputed blob; AstIf -> S3 router; concat -> S4
     -- streaming serializer; AstField -> S2 parse + itoa serializer.
-    out = if ast_is_str(body_ast) == 1 then concat(b"\xbf\x02\x00\x00\x00\xbe\x01\x00\x00\x00\x31\xd2\xb8\x29\x00\x00\x00\x0f\x05\x49\x89\xc4", b"\x6a\x01\x48\xc7\xc0\x36\x00\x00\x00\x4c\x89\xe7\x48\xc7\xc6\x01\x00\x00\x00\x48\xc7\xc2\x02\x00\x00\x00\x49\x89\xe2\x49\xc7\xc0\x04\x00\x00\x00\x0f\x05\x48\x83\xc4\x08", b"\xe9", le32(16), le32(2 + hv * 65536), le32(0), le64(0), b"\x48\x8d\x35", le32(0 - (16 + 7)), b"\x4c\x89\xe7\x48\xc7\xc2\x10\x00\x00\x00\x48\xc7\xc0\x31\x00\x00\x00\x0f\x05", b"\x4c\x89\xe7\x48\xc7\xc6\x80\x00\x00\x00\x48\xc7\xc0\x32\x00\x00\x00\x0f\x05", b"\x48\x81\xec", le32(max_req), b"\x48\xc7\xc0\x2b\x00\x00\x00\x4c\x89\xe7\x48\x31\xf6\x48\x31\xd2\x0f\x05\x49\x89\xc5", x86_svc_log_block(SvcLogState { svcs: st.svcs, src: st.src }), b"\x48\x31\xc0\x4c\x89\xef\x48\x89\xe6\x48\xc7\xc2", le32(max_req), b"\x0f\x05", b"\xe9", le32(block), service_response_blob(ServiceRespBlobState { status: status, body_start: body_start, body_len: body_len, src: st.src, pos: 0 }), b"\x48\xc7\xc0\x01\x00\x00\x00\x4c\x89\xef\x48\x8d\x35", le32(0 - (block + 17)), b"\x48\xc7\xc2", le32(rlen), b"\x0f\x05", b"\x48\xc7\xc0\x03\x00\x00\x00\x4c\x89\xef\x0f\x05", b"\xe9", le32(0 - (87 + block + logsz))) else if ast_is_if(hresult) == 1 then concat(b"\xbf\x02\x00\x00\x00\xbe\x01\x00\x00\x00\x31\xd2\xb8\x29\x00\x00\x00\x0f\x05\x49\x89\xc4", b"\x6a\x01\x48\xc7\xc0\x36\x00\x00\x00\x4c\x89\xe7\x48\xc7\xc6\x01\x00\x00\x00\x48\xc7\xc2\x02\x00\x00\x00\x49\x89\xe2\x49\xc7\xc0\x04\x00\x00\x00\x0f\x05\x48\x83\xc4\x08", b"\xe9", le32(16), le32(2 + hv * 65536), le32(0), le64(0), b"\x48\x8d\x35", le32(0 - (16 + 7)), b"\x4c\x89\xe7\x48\xc7\xc2\x10\x00\x00\x00\x48\xc7\xc0\x31\x00\x00\x00\x0f\x05", b"\x4c\x89\xe7\x48\xc7\xc6\x80\x00\x00\x00\x48\xc7\xc0\x32\x00\x00\x00\x0f\x05", b"\x48\x81\xec", le32(max_req), b"\x48\xc7\xc0\x2b\x00\x00\x00\x4c\x89\xe7\x48\x31\xf6\x48\x31\xd2\x0f\x05\x49\x89\xc5", (if hasf == 1 then b"" else x86_svc_log_block(SvcLogState { svcs: st.svcs, src: st.src })), b"\x48\x31\xc0\x4c\x89\xef\x48\x89\xe6\x48\xc7\xc2", le32(max_req), b"\x0f\x05", b"\x48\x89\xe3\x48\x89\xe6\x48\x85\xc0\x0f\x84", le32(jump1), b"\x44\x8a\x03\x41\x80\xf8\x20\x74\x08\x48\xff\xc3\x48\xff\xc8\xeb\xe6\x48\x89\xda\x48\xff\xc3\x48\xff\xc8\x48\x89\xdf\x48\x85\xc0\x0f\x84", le32(jump2), b"\x44\x8a\x03\x41\x80\xf8\x20\x74\x14\x41\x80\xf8\x0d\x74\x0e\x41\x80\xf8\x0a\x74\x08\x48\xff\xc3\x48\xff\xc8\xeb\xda", x86_svc_log_capture(SvcLogState { svcs: st.svcs, src: st.src }), (if is_method3 == 1 then b"\x49\x89\xd6\x49\x29\xf6\x48\x89\xf3" else b"\x49\x89\xde\x49\x29\xfe\x48\x89\xfb"), (if hasf == 1 then x86_svc_log_block(SvcLogState { svcs: st.svcs, src: st.src }) else b""), b"\x49\x81\xfe", le32(declen3), b"\x0f\x85", le32(jump3), b"\xfc\x48\x89\xde\xe9", le32(l4), emit_bytes_data(BytesEmitState { src: st.src, start: lit_start3, len: lit_len3, i: 0, dlen: declen3 }), b"\x48\x8d\x3d", le32(0 - (l4 + 7)), b"\x48\xc7\xc1", le32(declen3), b"\xf3\xa6\x0f\x85", le32(jump4), b"\xe9", le32(blockA), service_response_blob(ServiceRespBlobState { status: statusA, body_start: bodyA_start, body_len: bodyA_len, src: st.src, pos: 0 }), b"\x48\xc7\xc0\x01\x00\x00\x00\x4c\x89\xef\x48\x8d\x35", le32(0 - (blockA + 17)), b"\x48\xc7\xc2", le32(rlenA), b"\x0f\x05", b"\xe9", le32(jump5), b"\xe9", le32(blockB), service_response_blob(ServiceRespBlobState { status: statusB, body_start: bodyB_start, body_len: bodyB_len, src: st.src, pos: 0 }), b"\x48\xc7\xc0\x01\x00\x00\x00\x4c\x89\xef\x48\x8d\x35", le32(0 - (blockB + 17)), b"\x48\xc7\xc2", le32(rlenB), b"\x0f\x05", b"\x48\xc7\xc0\x03\x00\x00\x00\x4c\x89\xef\x0f\x05", b"\xe9", le32(jump6)) else if arg_list_len(cargs4) > 0 then concat(b"\xbf\x02\x00\x00\x00\xbe\x01\x00\x00\x00\x31\xd2\xb8\x29\x00\x00\x00\x0f\x05\x49\x89\xc4", b"\x6a\x01\x48\xc7\xc0\x36\x00\x00\x00\x4c\x89\xe7\x48\xc7\xc6\x01\x00\x00\x00\x48\xc7\xc2\x02\x00\x00\x00\x49\x89\xe2\x49\xc7\xc0\x04\x00\x00\x00\x0f\x05\x48\x83\xc4\x08", b"\xe9", le32(16), le32(2 + hv * 65536), le32(0), le64(0), b"\x48\x8d\x35", le32(0 - (16 + 7)), b"\x4c\x89\xe7\x48\xc7\xc2\x10\x00\x00\x00\x48\xc7\xc0\x31\x00\x00\x00\x0f\x05", b"\x4c\x89\xe7\x48\xc7\xc6\x80\x00\x00\x00\x48\xc7\xc0\x32\x00\x00\x00\x0f\x05", b"\x48\x81\xec", le32(max_req), b"\x48\xc7\xc0\x2b\x00\x00\x00\x4c\x89\xe7\x48\x31\xf6\x48\x31\xd2\x0f\x05\x49\x89\xc5", (if hasf == 1 then b"" else x86_svc_log_block(SvcLogState { svcs: st.svcs, src: st.src })), b"\x48\x31\xc0\x4c\x89\xef\x48\x89\xe6\x48\xc7\xc2", le32(max_req), b"\x0f\x05", b"\x48\x89\xe3\x48\x89\xe6\x48\x85\xc0\x0f\x84", le32(jump1_4), b"\x44\x8a\x03\x41\x80\xf8\x20\x74\x08\x48\xff\xc3\x48\xff\xc8\xeb\xe6\x48\x89\xda\x48\xff\xc3\x48\xff\xc8\x48\x89\xdf\x48\x85\xc0\x0f\x84", le32(jump2_4), b"\x44\x8a\x03\x41\x80\xf8\x20\x74\x14\x41\x80\xf8\x0d\x74\x0e\x41\x80\xf8\x0a\x74\x08\x48\xff\xc3\x48\xff\xc8\xeb\xda", x86_svc_log_capture(SvcLogState { svcs: st.svcs, src: st.src }), (if is_method4 == 1 then b"\x49\x89\xd6\x49\x29\xf6\x48\x89\xf3" else b"\x49\x89\xde\x49\x29\xfe\x48\x89\xfb"), (if hasf == 1 then x86_svc_log_block(SvcLogState { svcs: st.svcs, src: st.src }) else b""), b"\xe9\x0c\x00\x00\x00\x48\x54\x54\x50\x2f\x31\x2e\x30\x20\x00\x00\x00\x48\xc7\xc0\x01\x00\x00\x00\x4c\x89\xef\x48\x8d\x35\xe3\xff\xff\xff\x48\xc7\xc2\x09\x00\x00\x00\x0f\x05", b"\x48\xc7\xc0", le32(status), b"\x48\x83\xec\x20\x49\x89\xc1\x48\x8d\x74\x24\x20\x48\x85\xc0\x79\x03\x48\xf7\xd8\x48\xc7\xc1\x0a\x00\x00\x00\x48\x31\xd2\x48\xf7\xf1\x80\xc2\x30\x48\xff\xce\x88\x16\x48\x85\xc0\x75\xed\x4d\x85\xc9\x79\x06\x48\xff\xce\xc6\x06\x2d\x48\x8d\x54\x24\x20\x48\x29\xf2\x48\xc7\xc0\x01\x00\x00\x00\x4c\x89\xef\x0f\x05\x48\x83\xc4\x20", b"\xe9\x18\x00\x00\x00\x20\x4f\x4b\x0d\x0a\x43\x6f\x6e\x74\x65\x6e\x74\x2d\x4c\x65\x6e\x67\x74\x68\x3a\x20\x00\x00\x00\x48\xc7\xc0\x01\x00\x00\x00\x4c\x89\xef\x48\x8d\x35\xd7\xff\xff\xff\x48\xc7\xc2\x15\x00\x00\x00\x0f\x05", b"\x48\xc7\xc0", le32(csum4), b"\x4c\x01\xf0", b"\x48\x83\xec\x20\x49\x89\xc1\x48\x8d\x74\x24\x20\x48\x85\xc0\x79\x03\x48\xf7\xd8\x48\xc7\xc1\x0a\x00\x00\x00\x48\x31\xd2\x48\xf7\xf1\x80\xc2\x30\x48\xff\xce\x88\x16\x48\x85\xc0\x75\xed\x4d\x85\xc9\x79\x06\x48\xff\xce\xc6\x06\x2d\x48\x8d\x54\x24\x20\x48\x29\xf2\x48\xc7\xc0\x01\x00\x00\x00\x4c\x89\xef\x0f\x05\x48\x83\xc4\x20", b"\xe9\x04\x00\x00\x00\x0d\x0a\x0d\x0a\x48\xc7\xc0\x01\x00\x00\x00\x4c\x89\xef\x48\x8d\x35\xeb\xff\xff\xff\x48\xc7\xc2\x04\x00\x00\x00\x0f\x05", x86_svc_cargs(RxCArgsState { args: cargs4, src: st.src }), b"\x48\xc7\xc0\x03\x00\x00\x00\x4c\x89\xef\x0f\x05", b"\xe9", le32(jump6_4)) else concat(b"\xbf\x02\x00\x00\x00\xbe\x01\x00\x00\x00\x31\xd2\xb8\x29\x00\x00\x00\x0f\x05\x49\x89\xc4", b"\x6a\x01\x48\xc7\xc0\x36\x00\x00\x00\x4c\x89\xe7\x48\xc7\xc6\x01\x00\x00\x00\x48\xc7\xc2\x02\x00\x00\x00\x49\x89\xe2\x49\xc7\xc0\x04\x00\x00\x00\x0f\x05\x48\x83\xc4\x08", b"\xe9", le32(16), le32(2 + hv * 65536), le32(0), le64(0), b"\x48\x8d\x35", le32(0 - (16 + 7)), b"\x4c\x89\xe7\x48\xc7\xc2\x10\x00\x00\x00\x48\xc7\xc0\x31\x00\x00\x00\x0f\x05", b"\x4c\x89\xe7\x48\xc7\xc6\x80\x00\x00\x00\x48\xc7\xc0\x32\x00\x00\x00\x0f\x05", b"\x48\x81\xec", le32(max_req), b"\x48\xc7\xc0\x2b\x00\x00\x00\x4c\x89\xe7\x48\x31\xf6\x48\x31\xd2\x0f\x05\x49\x89\xc5", (if hasf == 1 then b"" else x86_svc_log_block(SvcLogState { svcs: st.svcs, src: st.src })), b"\x48\x31\xc0\x4c\x89\xef\x48\x89\xe6\x48\xc7\xc2", le32(max_req), b"\x0f\x05", b"\x48\x89\xe3\x48\x89\xe6\x48\x85\xc0\x0f\x84", le32(jump1_2), b"\x44\x8a\x03\x41\x80\xf8\x20\x74\x08\x48\xff\xc3\x48\xff\xc8\xeb\xe6\x48\x89\xda\x48\xff\xc3\x48\xff\xc8\x48\x89\xdf\x48\x85\xc0\x0f\x84", le32(jump2_2), b"\x44\x8a\x03\x41\x80\xf8\x20\x74\x14\x41\x80\xf8\x0d\x74\x0e\x41\x80\xf8\x0a\x74\x08\x48\xff\xc3\x48\xff\xc8\xeb\xda", x86_svc_log_capture(SvcLogState { svcs: st.svcs, src: st.src }), (if is_method == 1 then b"\x49\x89\xd6\x49\x29\xf6\x48\x89\xf3" else b"\x49\x89\xde\x49\x29\xfe\x48\x89\xfb"), (if hasf == 1 then x86_svc_log_block(SvcLogState { svcs: st.svcs, src: st.src }) else b""), b"\xe9\x0c\x00\x00\x00\x48\x54\x54\x50\x2f\x31\x2e\x30\x20\x00\x00\x00\x48\xc7\xc0\x01\x00\x00\x00\x4c\x89\xef\x48\x8d\x35\xe3\xff\xff\xff\x48\xc7\xc2\x09\x00\x00\x00\x0f\x05", b"\x48\xc7\xc0", le32(status), b"\x48\x83\xec\x20\x49\x89\xc1\x48\x8d\x74\x24\x20\x48\x85\xc0\x79\x03\x48\xf7\xd8\x48\xc7\xc1\x0a\x00\x00\x00\x48\x31\xd2\x48\xf7\xf1\x80\xc2\x30\x48\xff\xce\x88\x16\x48\x85\xc0\x75\xed\x4d\x85\xc9\x79\x06\x48\xff\xce\xc6\x06\x2d\x48\x8d\x54\x24\x20\x48\x29\xf2\x48\xc7\xc0\x01\x00\x00\x00\x4c\x89\xef\x0f\x05\x48\x83\xc4\x20", b"\xe9\x18\x00\x00\x00\x20\x4f\x4b\x0d\x0a\x43\x6f\x6e\x74\x65\x6e\x74\x2d\x4c\x65\x6e\x67\x74\x68\x3a\x20\x00\x00\x00\x48\xc7\xc0\x01\x00\x00\x00\x4c\x89\xef\x48\x8d\x35\xd7\xff\xff\xff\x48\xc7\xc2\x15\x00\x00\x00\x0f\x05", b"\x4c\x89\xf0", b"\x48\x83\xec\x20\x49\x89\xc1\x48\x8d\x74\x24\x20\x48\x85\xc0\x79\x03\x48\xf7\xd8\x48\xc7\xc1\x0a\x00\x00\x00\x48\x31\xd2\x48\xf7\xf1\x80\xc2\x30\x48\xff\xce\x88\x16\x48\x85\xc0\x75\xed\x4d\x85\xc9\x79\x06\x48\xff\xce\xc6\x06\x2d\x48\x8d\x54\x24\x20\x48\x29\xf2\x48\xc7\xc0\x01\x00\x00\x00\x4c\x89\xef\x0f\x05\x48\x83\xc4\x20", b"\xe9\x04\x00\x00\x00\x0d\x0a\x0d\x0a\x48\xc7\xc0\x01\x00\x00\x00\x4c\x89\xef\x48\x8d\x35\xeb\xff\xff\xff\x48\xc7\xc2\x04\x00\x00\x00\x0f\x05", b"\x48\xc7\xc0\x01\x00\x00\x00\x4c\x89\xef\x48\x89\xde\x4c\x89\xf2\x0f\x05", b"\x48\xc7\xc0\x03\x00\x00\x00\x4c\x89\xef\x0f\x05", b"\xe9", le32(0 - (470 + cap + logsz)))
+    out = if ast_is_str(body_ast) == 1 then concat(b"\xbf\x02\x00\x00\x00\xbe\x01\x00\x00\x00\x31\xd2\xb8\x29\x00\x00\x00\x0f\x05\x49\x89\xc4", b"\x6a\x01\x48\xc7\xc0\x36\x00\x00\x00\x4c\x89\xe7\x48\xc7\xc6\x01\x00\x00\x00\x48\xc7\xc2\x02\x00\x00\x00\x49\x89\xe2\x49\xc7\xc0\x04\x00\x00\x00\x0f\x05\x48\x83\xc4\x08", b"\xe9", le32(16), le32(2 + hv * 65536), le32(0), le64(0), b"\x48\x8d\x35", le32(0 - (16 + 7)), b"\x4c\x89\xe7\x48\xc7\xc2\x10\x00\x00\x00\x48\xc7\xc0\x31\x00\x00\x00\x0f\x05", x86_svc_conc_pre(SvcLogState { svcs: st.svcs, src: st.src }), b"\x4c\x89\xe7\x48\xc7\xc6\x80\x00\x00\x00\x48\xc7\xc0\x32\x00\x00\x00\x0f\x05", b"\x48\x81\xec", le32(max_req), b"\x48\xc7\xc0\x2b\x00\x00\x00\x4c\x89\xe7\x48\x31\xf6\x48\x31\xd2\x0f\x05\x49\x89\xc5", x86_svc_conc_fork(SvcLogState { svcs: st.svcs, src: st.src }),x86_svc_log_block(SvcLogState { svcs: st.svcs, src: st.src }), b"\x48\x31\xc0\x4c\x89\xef\x48\x89\xe6\x48\xc7\xc2", le32(max_req), b"\x0f\x05", b"\xe9", le32(block), service_response_blob(ServiceRespBlobState { status: status, body_start: body_start, body_len: body_len, src: st.src, pos: 0 }), b"\x48\xc7\xc0\x01\x00\x00\x00\x4c\x89\xef\x48\x8d\x35", le32(0 - (block + 17)), b"\x48\xc7\xc2", le32(rlen), b"\x0f\x05", b"\x48\xc7\xc0\x03\x00\x00\x00\x4c\x89\xef\x0f\x05", x86_svc_conc_tail(SvcConcTailState { svcs: st.svcs, disp: 0 - (87 + block + logsz) })) else if ast_is_if(hresult) == 1 then concat(b"\xbf\x02\x00\x00\x00\xbe\x01\x00\x00\x00\x31\xd2\xb8\x29\x00\x00\x00\x0f\x05\x49\x89\xc4", b"\x6a\x01\x48\xc7\xc0\x36\x00\x00\x00\x4c\x89\xe7\x48\xc7\xc6\x01\x00\x00\x00\x48\xc7\xc2\x02\x00\x00\x00\x49\x89\xe2\x49\xc7\xc0\x04\x00\x00\x00\x0f\x05\x48\x83\xc4\x08", b"\xe9", le32(16), le32(2 + hv * 65536), le32(0), le64(0), b"\x48\x8d\x35", le32(0 - (16 + 7)), b"\x4c\x89\xe7\x48\xc7\xc2\x10\x00\x00\x00\x48\xc7\xc0\x31\x00\x00\x00\x0f\x05", x86_svc_conc_pre(SvcLogState { svcs: st.svcs, src: st.src }), b"\x4c\x89\xe7\x48\xc7\xc6\x80\x00\x00\x00\x48\xc7\xc0\x32\x00\x00\x00\x0f\x05", b"\x48\x81\xec", le32(max_req), b"\x48\xc7\xc0\x2b\x00\x00\x00\x4c\x89\xe7\x48\x31\xf6\x48\x31\xd2\x0f\x05\x49\x89\xc5", x86_svc_conc_fork(SvcLogState { svcs: st.svcs, src: st.src }),(if hasf == 1 then b"" else x86_svc_log_block(SvcLogState { svcs: st.svcs, src: st.src })), b"\x48\x31\xc0\x4c\x89\xef\x48\x89\xe6\x48\xc7\xc2", le32(max_req), b"\x0f\x05", b"\x48\x89\xe3\x48\x89\xe6\x48\x85\xc0\x0f\x84", le32(jump1), b"\x44\x8a\x03\x41\x80\xf8\x20\x74\x08\x48\xff\xc3\x48\xff\xc8\xeb\xe6\x48\x89\xda\x48\xff\xc3\x48\xff\xc8\x48\x89\xdf\x48\x85\xc0\x0f\x84", le32(jump2), b"\x44\x8a\x03\x41\x80\xf8\x20\x74\x14\x41\x80\xf8\x0d\x74\x0e\x41\x80\xf8\x0a\x74\x08\x48\xff\xc3\x48\xff\xc8\xeb\xda", x86_svc_log_capture(SvcLogState { svcs: st.svcs, src: st.src }), (if is_method3 == 1 then b"\x49\x89\xd6\x49\x29\xf6\x48\x89\xf3" else b"\x49\x89\xde\x49\x29\xfe\x48\x89\xfb"), (if hasf == 1 then x86_svc_log_block(SvcLogState { svcs: st.svcs, src: st.src }) else b""), b"\x49\x81\xfe", le32(declen3), b"\x0f\x85", le32(jump3), b"\xfc\x48\x89\xde\xe9", le32(l4), emit_bytes_data(BytesEmitState { src: st.src, start: lit_start3, len: lit_len3, i: 0, dlen: declen3 }), b"\x48\x8d\x3d", le32(0 - (l4 + 7)), b"\x48\xc7\xc1", le32(declen3), b"\xf3\xa6\x0f\x85", le32(jump4), b"\xe9", le32(blockA), service_response_blob(ServiceRespBlobState { status: statusA, body_start: bodyA_start, body_len: bodyA_len, src: st.src, pos: 0 }), b"\x48\xc7\xc0\x01\x00\x00\x00\x4c\x89\xef\x48\x8d\x35", le32(0 - (blockA + 17)), b"\x48\xc7\xc2", le32(rlenA), b"\x0f\x05", b"\xe9", le32(jump5), b"\xe9", le32(blockB), service_response_blob(ServiceRespBlobState { status: statusB, body_start: bodyB_start, body_len: bodyB_len, src: st.src, pos: 0 }), b"\x48\xc7\xc0\x01\x00\x00\x00\x4c\x89\xef\x48\x8d\x35", le32(0 - (blockB + 17)), b"\x48\xc7\xc2", le32(rlenB), b"\x0f\x05", b"\x48\xc7\xc0\x03\x00\x00\x00\x4c\x89\xef\x0f\x05", x86_svc_conc_tail(SvcConcTailState { svcs: st.svcs, disp: jump6 })) else if arg_list_len(cargs4) > 0 then concat(b"\xbf\x02\x00\x00\x00\xbe\x01\x00\x00\x00\x31\xd2\xb8\x29\x00\x00\x00\x0f\x05\x49\x89\xc4", b"\x6a\x01\x48\xc7\xc0\x36\x00\x00\x00\x4c\x89\xe7\x48\xc7\xc6\x01\x00\x00\x00\x48\xc7\xc2\x02\x00\x00\x00\x49\x89\xe2\x49\xc7\xc0\x04\x00\x00\x00\x0f\x05\x48\x83\xc4\x08", b"\xe9", le32(16), le32(2 + hv * 65536), le32(0), le64(0), b"\x48\x8d\x35", le32(0 - (16 + 7)), b"\x4c\x89\xe7\x48\xc7\xc2\x10\x00\x00\x00\x48\xc7\xc0\x31\x00\x00\x00\x0f\x05", x86_svc_conc_pre(SvcLogState { svcs: st.svcs, src: st.src }), b"\x4c\x89\xe7\x48\xc7\xc6\x80\x00\x00\x00\x48\xc7\xc0\x32\x00\x00\x00\x0f\x05", b"\x48\x81\xec", le32(max_req), b"\x48\xc7\xc0\x2b\x00\x00\x00\x4c\x89\xe7\x48\x31\xf6\x48\x31\xd2\x0f\x05\x49\x89\xc5", x86_svc_conc_fork(SvcLogState { svcs: st.svcs, src: st.src }),(if hasf == 1 then b"" else x86_svc_log_block(SvcLogState { svcs: st.svcs, src: st.src })), b"\x48\x31\xc0\x4c\x89\xef\x48\x89\xe6\x48\xc7\xc2", le32(max_req), b"\x0f\x05", b"\x48\x89\xe3\x48\x89\xe6\x48\x85\xc0\x0f\x84", le32(jump1_4), b"\x44\x8a\x03\x41\x80\xf8\x20\x74\x08\x48\xff\xc3\x48\xff\xc8\xeb\xe6\x48\x89\xda\x48\xff\xc3\x48\xff\xc8\x48\x89\xdf\x48\x85\xc0\x0f\x84", le32(jump2_4), b"\x44\x8a\x03\x41\x80\xf8\x20\x74\x14\x41\x80\xf8\x0d\x74\x0e\x41\x80\xf8\x0a\x74\x08\x48\xff\xc3\x48\xff\xc8\xeb\xda", x86_svc_log_capture(SvcLogState { svcs: st.svcs, src: st.src }), (if is_method4 == 1 then b"\x49\x89\xd6\x49\x29\xf6\x48\x89\xf3" else b"\x49\x89\xde\x49\x29\xfe\x48\x89\xfb"), (if hasf == 1 then x86_svc_log_block(SvcLogState { svcs: st.svcs, src: st.src }) else b""), b"\xe9\x0c\x00\x00\x00\x48\x54\x54\x50\x2f\x31\x2e\x30\x20\x00\x00\x00\x48\xc7\xc0\x01\x00\x00\x00\x4c\x89\xef\x48\x8d\x35\xe3\xff\xff\xff\x48\xc7\xc2\x09\x00\x00\x00\x0f\x05", b"\x48\xc7\xc0", le32(status), b"\x48\x83\xec\x20\x49\x89\xc1\x48\x8d\x74\x24\x20\x48\x85\xc0\x79\x03\x48\xf7\xd8\x48\xc7\xc1\x0a\x00\x00\x00\x48\x31\xd2\x48\xf7\xf1\x80\xc2\x30\x48\xff\xce\x88\x16\x48\x85\xc0\x75\xed\x4d\x85\xc9\x79\x06\x48\xff\xce\xc6\x06\x2d\x48\x8d\x54\x24\x20\x48\x29\xf2\x48\xc7\xc0\x01\x00\x00\x00\x4c\x89\xef\x0f\x05\x48\x83\xc4\x20", b"\xe9\x18\x00\x00\x00\x20\x4f\x4b\x0d\x0a\x43\x6f\x6e\x74\x65\x6e\x74\x2d\x4c\x65\x6e\x67\x74\x68\x3a\x20\x00\x00\x00\x48\xc7\xc0\x01\x00\x00\x00\x4c\x89\xef\x48\x8d\x35\xd7\xff\xff\xff\x48\xc7\xc2\x15\x00\x00\x00\x0f\x05", b"\x48\xc7\xc0", le32(csum4), b"\x4c\x01\xf0", b"\x48\x83\xec\x20\x49\x89\xc1\x48\x8d\x74\x24\x20\x48\x85\xc0\x79\x03\x48\xf7\xd8\x48\xc7\xc1\x0a\x00\x00\x00\x48\x31\xd2\x48\xf7\xf1\x80\xc2\x30\x48\xff\xce\x88\x16\x48\x85\xc0\x75\xed\x4d\x85\xc9\x79\x06\x48\xff\xce\xc6\x06\x2d\x48\x8d\x54\x24\x20\x48\x29\xf2\x48\xc7\xc0\x01\x00\x00\x00\x4c\x89\xef\x0f\x05\x48\x83\xc4\x20", b"\xe9\x04\x00\x00\x00\x0d\x0a\x0d\x0a\x48\xc7\xc0\x01\x00\x00\x00\x4c\x89\xef\x48\x8d\x35\xeb\xff\xff\xff\x48\xc7\xc2\x04\x00\x00\x00\x0f\x05", x86_svc_cargs(RxCArgsState { args: cargs4, src: st.src }), b"\x48\xc7\xc0\x03\x00\x00\x00\x4c\x89\xef\x0f\x05", x86_svc_conc_tail(SvcConcTailState { svcs: st.svcs, disp: jump6_4 })) else concat(b"\xbf\x02\x00\x00\x00\xbe\x01\x00\x00\x00\x31\xd2\xb8\x29\x00\x00\x00\x0f\x05\x49\x89\xc4", b"\x6a\x01\x48\xc7\xc0\x36\x00\x00\x00\x4c\x89\xe7\x48\xc7\xc6\x01\x00\x00\x00\x48\xc7\xc2\x02\x00\x00\x00\x49\x89\xe2\x49\xc7\xc0\x04\x00\x00\x00\x0f\x05\x48\x83\xc4\x08", b"\xe9", le32(16), le32(2 + hv * 65536), le32(0), le64(0), b"\x48\x8d\x35", le32(0 - (16 + 7)), b"\x4c\x89\xe7\x48\xc7\xc2\x10\x00\x00\x00\x48\xc7\xc0\x31\x00\x00\x00\x0f\x05", x86_svc_conc_pre(SvcLogState { svcs: st.svcs, src: st.src }), b"\x4c\x89\xe7\x48\xc7\xc6\x80\x00\x00\x00\x48\xc7\xc0\x32\x00\x00\x00\x0f\x05", b"\x48\x81\xec", le32(max_req), b"\x48\xc7\xc0\x2b\x00\x00\x00\x4c\x89\xe7\x48\x31\xf6\x48\x31\xd2\x0f\x05\x49\x89\xc5", x86_svc_conc_fork(SvcLogState { svcs: st.svcs, src: st.src }),(if hasf == 1 then b"" else x86_svc_log_block(SvcLogState { svcs: st.svcs, src: st.src })), b"\x48\x31\xc0\x4c\x89\xef\x48\x89\xe6\x48\xc7\xc2", le32(max_req), b"\x0f\x05", b"\x48\x89\xe3\x48\x89\xe6\x48\x85\xc0\x0f\x84", le32(jump1_2), b"\x44\x8a\x03\x41\x80\xf8\x20\x74\x08\x48\xff\xc3\x48\xff\xc8\xeb\xe6\x48\x89\xda\x48\xff\xc3\x48\xff\xc8\x48\x89\xdf\x48\x85\xc0\x0f\x84", le32(jump2_2), b"\x44\x8a\x03\x41\x80\xf8\x20\x74\x14\x41\x80\xf8\x0d\x74\x0e\x41\x80\xf8\x0a\x74\x08\x48\xff\xc3\x48\xff\xc8\xeb\xda", x86_svc_log_capture(SvcLogState { svcs: st.svcs, src: st.src }), (if is_method == 1 then b"\x49\x89\xd6\x49\x29\xf6\x48\x89\xf3" else b"\x49\x89\xde\x49\x29\xfe\x48\x89\xfb"), (if hasf == 1 then x86_svc_log_block(SvcLogState { svcs: st.svcs, src: st.src }) else b""), b"\xe9\x0c\x00\x00\x00\x48\x54\x54\x50\x2f\x31\x2e\x30\x20\x00\x00\x00\x48\xc7\xc0\x01\x00\x00\x00\x4c\x89\xef\x48\x8d\x35\xe3\xff\xff\xff\x48\xc7\xc2\x09\x00\x00\x00\x0f\x05", b"\x48\xc7\xc0", le32(status), b"\x48\x83\xec\x20\x49\x89\xc1\x48\x8d\x74\x24\x20\x48\x85\xc0\x79\x03\x48\xf7\xd8\x48\xc7\xc1\x0a\x00\x00\x00\x48\x31\xd2\x48\xf7\xf1\x80\xc2\x30\x48\xff\xce\x88\x16\x48\x85\xc0\x75\xed\x4d\x85\xc9\x79\x06\x48\xff\xce\xc6\x06\x2d\x48\x8d\x54\x24\x20\x48\x29\xf2\x48\xc7\xc0\x01\x00\x00\x00\x4c\x89\xef\x0f\x05\x48\x83\xc4\x20", b"\xe9\x18\x00\x00\x00\x20\x4f\x4b\x0d\x0a\x43\x6f\x6e\x74\x65\x6e\x74\x2d\x4c\x65\x6e\x67\x74\x68\x3a\x20\x00\x00\x00\x48\xc7\xc0\x01\x00\x00\x00\x4c\x89\xef\x48\x8d\x35\xd7\xff\xff\xff\x48\xc7\xc2\x15\x00\x00\x00\x0f\x05", b"\x4c\x89\xf0", b"\x48\x83\xec\x20\x49\x89\xc1\x48\x8d\x74\x24\x20\x48\x85\xc0\x79\x03\x48\xf7\xd8\x48\xc7\xc1\x0a\x00\x00\x00\x48\x31\xd2\x48\xf7\xf1\x80\xc2\x30\x48\xff\xce\x88\x16\x48\x85\xc0\x75\xed\x4d\x85\xc9\x79\x06\x48\xff\xce\xc6\x06\x2d\x48\x8d\x54\x24\x20\x48\x29\xf2\x48\xc7\xc0\x01\x00\x00\x00\x4c\x89\xef\x0f\x05\x48\x83\xc4\x20", b"\xe9\x04\x00\x00\x00\x0d\x0a\x0d\x0a\x48\xc7\xc0\x01\x00\x00\x00\x4c\x89\xef\x48\x8d\x35\xeb\xff\xff\xff\x48\xc7\xc2\x04\x00\x00\x00\x0f\x05", b"\x48\xc7\xc0\x01\x00\x00\x00\x4c\x89\xef\x48\x89\xde\x4c\x89\xf2\x0f\x05", b"\x48\xc7\xc0\x03\x00\x00\x00\x4c\x89\xef\x0f\x05", x86_svc_conc_tail(SvcConcTailState { svcs: st.svcs, disp: 0 - (470 + cap + logsz) }))
   proofs:
     purity:
       reads : [st.svcs, st.prog, st.src]
-      calls : [svc_head, find_rule, svc_handler_start, svc_handler_len, ast_variant_fields, block_result, rd_body, ast_num_value, vf_head_val, vf_tail, ast_str_start, ast_str_len, svc_port, svc_max_request, response_len, service_response_blob, ast_is_str, span_is_method, ast_field_fstart, ast_field_flen, ast_is_if, ast_if_cond, ast_bin_lhs, ast_bin_rhs, bytelit_decoded_len, ast_if_then, ast_if_else, emit_bytes_data, ast_call_args, arg_list_len, svc_field_arg, svc_cargs_lit_len, svc_cargs_size, x86_svc_cargs, svc_log_block_size, x86_svc_log_block, svc_log_has_field, svc_log_capture_size, x86_svc_log_capture]
+      calls : [svc_head, find_rule, svc_handler_start, svc_handler_len, ast_variant_fields, block_result, rd_body, ast_num_value, vf_head_val, vf_tail, ast_str_start, ast_str_len, svc_port, svc_max_request, response_len, service_response_blob, ast_is_str, span_is_method, ast_field_fstart, ast_field_flen, ast_is_if, ast_if_cond, ast_bin_lhs, ast_bin_rhs, bytelit_decoded_len, ast_if_then, ast_if_else, emit_bytes_data, ast_call_args, arg_list_len, svc_field_arg, svc_cargs_lit_len, svc_cargs_size, x86_svc_cargs, svc_log_block_size, x86_svc_log_block, svc_log_has_field, svc_log_capture_size, x86_svc_log_capture, x86_svc_conc_pre, x86_svc_conc_fork, x86_svc_conc_tail]
     termination:
       bound : 256
 
