@@ -24941,6 +24941,352 @@ rule le64_neg
         let _ = fs::remove_file(&elf);
     }
 
+    /// SELF-HOSTING SERVICE slice 5c — MILESTONE. `on_error: abort` makes the emitted
+    /// server FAIL CLOSED: when a log syscall fails, the process exits(1) instead of
+    /// silently serving a request it could not record. This is the Article-12 posture
+    /// — no log persisted => no claim of having served the request.
+    ///
+    /// THREE ROWS, all with >= 2 requests per spawned server (the S5b back-jump scar:
+    /// a wrong loop edge answers request 1 and SIGSEGVs on request 2):
+    ///   (1) `abort` + an unwritable log path -> server exit status 1, EMPTY client
+    ///       reply, no log file. This is the row the slice exists for.
+    ///   (2) THE SAME service with `on_error: drop` -> serves normally, STAYS ALIVE
+    ///       across every request, no log file. The control: it proves row 1's exit
+    ///       comes from the declared policy and not from the unwritable path itself.
+    ///   (3) `abort` + a WRITABLE path -> serves normally, stays alive, log correct.
+    ///       The other control: the stubs must be inert on the success path.
+    ///
+    /// Plus the structural pins: exactly TWO byte-identical 17-byte stubs inside the
+    /// log-block window (the hand-synced inline pair — the native emitter refuses a
+    /// bytes literal in a scalar position, so the stub cannot be hoisted into a `let`,
+    /// and a one-sided edit must fail here rather than ship); the flat +34 size delta
+    /// on every body shape and both log placements; and `p_filesz == emitted byte
+    /// count` on an abort row (the size walk and the emit walk must agree, or the
+    /// mapped segment is truncated and the server SIGSEGVs on spawn).
+    ///
+    /// THE UNWRITABLE PATH IS `/tmp`, A DIRECTORY. `open(O_WRONLY|O_CREAT|O_APPEND)`
+    /// on a directory returns -EISDIR unconditionally — no privileges needed, stable
+    /// across environments, and it fails at the FIRST of the two checks (`/proc/1/mem`
+    /// would depend on the container's privilege model).
+    ///
+    /// TWO BEHAVIORAL FACTS, both verbosec parity rather than divergences:
+    ///   - PLACEMENT DECIDES WHEN ABORT FIRES. A static log sits pre-read, so abort
+    ///     fires after `accept` but before the request is even read; a field log fires
+    ///     post-parse. Either way the client gets an empty reply, which is why row 1
+    ///     asserts on emptiness and not on a particular byte prefix.
+    ///   - `abort` CONVERTS A LOG FAILURE INTO A FULL SERVICE OUTAGE. The accept loop
+    ///     is sequential and un-forked, so exit(1) kills the server, not just the
+    ///     request. That IS the fail-closed contract — and it is also a DoS surface if
+    ///     an attacker can exhaust the log filesystem. Both halves are the contract.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn self_hosted_service_log_on_error_abort() {
+        use std::fs;
+        use std::io::{Read, Write};
+        use std::net::{TcpListener, TcpStream};
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+        use std::time::Duration;
+
+        let src = fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let elf = std::env::temp_dir().join("verbosec_test_svc_s5c_elf_program_src");
+        compile_native(&program, "elf_program_src", elf.to_str().unwrap(), false, false)
+            .expect("elf_program_src must compile natively");
+        let emit = |source: &str| -> std::process::Output {
+            Command::new(&elf).args([source, "0"]).output().expect("spawn gen0")
+        };
+
+        // The four body shapes, so the +34 is checked on every branch AND on both log
+        // placements (static content -> pre-read; field content -> post-select).
+        // (tag, handler logic, reads, bound, supports-field-content)
+        let shapes: [(&str, &str, &str, &str, bool); 4] = [
+            ("s1", "resp = HttpResponse { status: 200, body: \"Hi\" }", "[]", "1", false),
+            ("s2", "resp = HttpResponse { status: 200, body: req.path }", "[req.path]", "1", true),
+            ("s3", "resp = if req.path == \"/p0\" then HttpResponse { status: 200, body: \"home\" } else HttpResponse { status: 404, body: \"nope\" }", "[req.path]", "8", true),
+            ("s4", "resp = HttpResponse { status: 200, body: concat(\"you asked for \", req.path) }", "[req.path]", "8", true),
+        ];
+        let mk = |logic: &str, reads: &str, bound: &str, port: u16, path: &str,
+                  content: &str, policy: &str| -> String {
+            let pol = if policy.is_empty() {
+                String::new()
+            } else {
+                format!("\n    on_error: {}", policy)
+            };
+            format!(
+                "rule h5c\n  input:\n    req : HttpRequest\n  output:\n    resp : HttpResponse\n  logic:\n    {lg}\n  proofs:\n    purity:\n      reads : {rd}\n      calls : []\n    termination:\n      bound : {bd}\nservice s5c\n  listen:\n    protocol : http_1_0\n    port : {p}\n    max_request : 4096\n  handler: h5c\n  log:\n    append_file \"{pa}\" {ct}{po}",
+                lg = logic, rd = reads, bd = bound, p = port, pa = path, ct = content,
+                po = pol)
+        };
+
+        // The 17-byte fail-closed stub, exactly as x86_svc_log_block emits it. `jns`
+        // skips the LITERAL 12 bytes of the exit(1) — that constant is the whole
+        // reason this is an inline stub and not a shared end-of-tramp tail (the
+        // self-hosted emitter has no patch list; every displacement must be
+        // closed-form, and a shared tail would need one per splice site).
+        const STUB: &[u8] = &[
+            0x48, 0x85, 0xc0, // test rax, rax
+            0x79, 0x0c, // jns +12
+            0xbf, 0x01, 0x00, 0x00, 0x00, // mov edi, 1
+            0xb8, 0x3c, 0x00, 0x00, 0x00, // mov eax, 60 (sys_exit)
+            0x0f, 0x05, // syscall
+        ];
+        let count_stubs = |elf: &[u8]| -> usize {
+            let w = log_block_window(elf);
+            w.windows(STUB.len()).filter(|x| *x == STUB).count()
+        };
+
+        // ---------------------------------------------------------------------
+        // (A) STRUCTURE + FLAT +34, every body shape, both log placements. These
+        // never spawn — fixed port + fixed path keep them cheap and deterministic.
+        // ---------------------------------------------------------------------
+        for (tag, logic, reads, bound, has_field) in shapes {
+            let contents: &[(&str, &str)] = if has_field {
+                &[("static", "\"hit\\n\""),
+                  ("field", "concat(req.method, \" \", req.path, \"\\n\")")]
+            } else {
+                // S1 has no parse loop, so field content is refused (S5b.2) — the
+                // policy widening must NOT have loosened that.
+                &[("static", "\"hit\\n\"")]
+            };
+            for (cname, content) in contents {
+                // The emitted server EMBEDS ITS OWN SOURCE (the src_blob), so its total
+                // size tracks the source length. `drop` is one character shorter than
+                // `abort`, so the drop source gets ONE trailing newline — inert
+                // everywhere else — to make the two sources exactly the same length.
+                // Without that normalisation the ELF delta is 34 or 38 depending on
+                // which 4-byte blob-padding bucket each source lands in, and the
+                // comparison measures the wrong thing.
+                let d = emit(&format!("{}\n",
+                    mk(logic, reads, bound, 18990, "/tmp/vx_ref.log", content, "drop")));
+                let a = emit(&mk(logic, reads, bound, 18990, "/tmp/vx_ref.log", content, "abort"));
+                let n = emit(&mk(logic, reads, bound, 18990, "/tmp/vx_ref.log", content, ""));
+                assert!(d.status.success() && a.status.success() && n.status.success(),
+                    "({tag}/{cname}) drop, abort and policy-less log blocks must all emit");
+
+                // The flat +34: two 17-byte stubs, arity-independent (that is exactly
+                // what S5b.5's single writev bought — the N-write shape would have
+                // needed 17 * (1 + nargs) and a new counting walk). Checked at BOTH
+                // levels: the log block itself, and the whole ELF (which also catches
+                // a jump constant that failed to absorb the growth).
+                assert_eq!(log_block_window(&a.stdout).len(),
+                           log_block_window(&d.stdout).len() + 34,
+                    "({tag}/{cname}) the abort log BLOCK must be exactly 34 bytes longer \
+                     than the drop block (two 17-byte stubs, FLAT)");
+                assert_eq!(a.stdout.len(), d.stdout.len() + 34,
+                    "({tag}/{cname}) abort must cost EXACTLY 34 bytes more than drop \
+                     across the WHOLE ELF (source lengths normalised above); got {} vs {}",
+                    a.stdout.len(), d.stdout.len());
+                // An ABSENT on_error contributes zero too — the size term is gated on
+                // `== 2`, not `> 0`. (It cannot be SHA-compared against `drop`: the two
+                // sources differ textually and each server carries its own source
+                // blob. What IS pinned bit-for-bit is same-source-before-vs-after,
+                // which lives in self_hosted_service_log_field_content's SHA table.)
+                assert_eq!(log_block_window(&n.stdout).len(),
+                           log_block_window(&d.stdout).len(),
+                    "({tag}/{cname}) an ABSENT on_error and an explicit `drop` must emit \
+                     the SAME log block — S5c's term is gated on `== 2`, so neither \
+                     contributes a byte");
+
+                // p_filesz (offset 96 = e_phoff 64 + 32) comes from the SIZE walk; the
+                // file length is what the EMIT walk produced. A one-byte drift
+                // truncates the mapped segment and the server SIGSEGVs on spawn.
+                let filesz = u64::from_le_bytes(a.stdout[96..104].try_into().unwrap());
+                assert_eq!(filesz as usize, a.stdout.len(),
+                    "({tag}/{cname}) p_filesz {} != emitted byte count {} on an ABORT \
+                     row — svc_log_block_size's +34 and x86_svc_log_block's two stubs \
+                     disagree", filesz, a.stdout.len());
+
+                // EXACTLY TWO stubs, byte-identical, inside the log-block window: one
+                // after the open, one after the writev. NO third check on the close
+                // (verbosec parity, NR:7816-7824). This is what pins the hand-synced
+                // inline pair — the stub bytes appear twice in the source because the
+                // native emitter refuses a bytes literal in a scalar position, so a
+                // one-sided edit has to fail HERE.
+                assert_eq!(count_stubs(&a.stdout), 2,
+                    "({tag}/{cname}) the abort log block must contain EXACTLY TWO \
+                     byte-identical 17-byte check stubs (after open, after writev) — \
+                     no close check, and the two inline copies must not have drifted");
+                assert_eq!(count_stubs(&d.stdout), 0,
+                    "({tag}/{cname}) a DROP log block must contain NO check stub");
+                // Open check, writev check, and the writev itself = 3 syscalls in the
+                // window (drop rows keep the S5b.5 count of 1, pinned in the sibling
+                // test).
+                assert_eq!(log_block_syscalls(&a.stdout), 3,
+                    "({tag}/{cname}) an abort log block's window must hold exactly 3 \
+                     syscalls: the two stub exit(1)s and the writev");
+            }
+        }
+
+        // ---------------------------------------------------------------------
+        // The spawn driver. Returns (server exit status, replies, log contents).
+        // ---------------------------------------------------------------------
+        let run = |tag: &str, logic: &str, reads: &str, bound: &str, content: &str,
+                   policy: &str, writable: bool, nreq: usize|
+         -> (Option<i32>, Vec<Vec<u8>>, String) {
+            let port = {
+                let l = TcpListener::bind(("127.0.0.1", 0)).expect("bind ephemeral");
+                l.local_addr().unwrap().port()
+            };
+            let logfile = std::env::temp_dir().join(format!("verbosec_test_svc_s5c_{tag}.log"));
+            let _ = fs::remove_file(&logfile);
+            // An unwritable path that needs no privileges and no setup: /tmp is a
+            // DIRECTORY, and open(O_WRONLY|O_CREAT|O_APPEND) on one is -EISDIR
+            // unconditionally.
+            let path = if writable {
+                logfile.display().to_string()
+            } else {
+                std::env::temp_dir().display().to_string()
+            };
+            let gen = emit(&mk(logic, reads, bound, port, &path, content, policy));
+            assert!(gen.status.success() && gen.stdout.len() >= 4
+                    && &gen.stdout[0..4] == b"\x7fELF",
+                "gen0 must emit the S5c server ({tag}); got {:?} stderr={:?}",
+                gen.status, String::from_utf8_lossy(&gen.stderr));
+
+            let server = std::env::temp_dir().join(format!("verbosec_test_svc_s5c_srv_{tag}"));
+            fs::write(&server, &gen.stdout).unwrap();
+            let mut perm = fs::metadata(&server).unwrap().permissions();
+            perm.set_mode(0o755);
+            fs::set_permissions(&server, perm).unwrap();
+
+            let mut child = Command::new(&server).spawn().expect("spawn server");
+            let addr: std::net::SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
+            let mut out = Vec::new();
+            for i in 0..nreq {
+                let mut sock = None;
+                for _ in 0..100 {
+                    match TcpStream::connect_timeout(&addr, Duration::from_millis(200)) {
+                        Ok(c) => {
+                            sock = Some(c);
+                            break;
+                        }
+                        Err(_) => {
+                            if i > 0 {
+                                break;
+                            }
+                            std::thread::sleep(Duration::from_millis(20));
+                        }
+                    }
+                }
+                // A dead abort server refuses the connection outright from request 2
+                // on; that is an empty reply, not a test failure.
+                let Some(mut s) = sock else {
+                    out.push(Vec::new());
+                    continue;
+                };
+                s.set_read_timeout(Some(Duration::from_secs(2))).ok();
+                let _ = s.write_all(format!("GET /p{} HTTP/1.0\r\n\r\n", i).as_bytes());
+                let mut buf = Vec::new();
+                // An abort server exits mid-connection, so the read is allowed to fail
+                // (ECONNRESET) — what matters is that no response bytes arrived.
+                let _ = s.read_to_end(&mut buf);
+                drop(s);
+                out.push(buf);
+            }
+            std::thread::sleep(Duration::from_millis(150));
+            let status = match child.try_wait().expect("try_wait") {
+                Some(st) => st.code(),
+                None => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    None // still running when we came to collect it
+                }
+            };
+            let _ = fs::remove_file(&server);
+            let log = fs::read_to_string(&logfile).unwrap_or_default();
+            let _ = fs::remove_file(&logfile);
+            (status, out, log)
+        };
+
+        let s2 = shapes[1];
+        let content = "\"hit\\n\"";
+
+        // --- ROW 1: abort + UNWRITABLE path. THE row the slice exists for. -------
+        // open() returns -EISDIR, the first stub's `jns` is not taken, and the server
+        // exits(1) BEFORE reading the request — so the client gets nothing at all.
+        let (status, wire, log) = run("abort_bad", s2.1, s2.2, s2.3, content,
+            "abort", false, 2);
+        assert_eq!(status, Some(1),
+            "on_error: abort must FAIL CLOSED — an unwritable log path has to exit the \
+             server with status 1, not serve an unlogged request; got {:?}", status);
+        for (i, got) in wire.iter().enumerate() {
+            assert!(got.is_empty(),
+                "a fail-closed server must send NOTHING (request {i}); got {:?}",
+                String::from_utf8_lossy(got));
+        }
+        assert!(log.is_empty(), "no log line can exist when the open failed");
+
+        // --- ROW 2: THE SAME SERVICE with `on_error: drop`. The control. ---------
+        // Same unwritable path, same handler, same content — only the policy differs.
+        // Proves row 1's exit(1) comes from the DECLARED POLICY, not from the path.
+        // >= 2 requests: a drop server must survive the failed log every iteration.
+        let (status, wire, log) = run("drop_bad", s2.1, s2.2, s2.3, content,
+            "drop", false, 3);
+        assert_eq!(status, None,
+            "on_error: drop must keep serving on an unwritable log path — it must \
+             still be RUNNING when the requests are done; got exit {:?}", status);
+        for (i, got) in wire.iter().enumerate() {
+            assert_eq!(got.as_slice(),
+                format!("HTTP/1.0 200 OK\r\nContent-Length: 3\r\n\r\n/p{}", i).as_bytes(),
+                "a drop server must answer request {i} normally despite the failed log; \
+                 got {:?}", String::from_utf8_lossy(got));
+        }
+        assert!(log.is_empty(), "drop wrote no log line (the open failed), as expected");
+
+        // --- ROW 3: abort + a WRITABLE path. The other control. ------------------
+        // The stubs must be INERT on the success path: the server serves every request
+        // and stays alive, and the log is byte-for-byte what the drop shape produced.
+        let (status, wire, log) = run("abort_good", s2.1, s2.2, s2.3, content,
+            "abort", true, 3);
+        assert_eq!(status, None,
+            "an abort server whose log path IS writable must keep serving — the check \
+             stubs are inert when the syscalls succeed; got exit {:?}", status);
+        for (i, got) in wire.iter().enumerate() {
+            assert_eq!(got.as_slice(),
+                format!("HTTP/1.0 200 OK\r\nContent-Length: 3\r\n\r\n/p{}", i).as_bytes(),
+                "abort perturbed the wire response on request {i}; got {:?}",
+                String::from_utf8_lossy(got));
+        }
+        assert_eq!(log, "hit\nhit\nhit\n",
+            "the abort server must write one log line per accepted connection, \
+             identical to the drop shape; got {:?}", log);
+
+        // --- ROW 3b: abort + writable + FIELD content (the post-select placement). --
+        // The stub travels WITH the log block, so it has to work at both placements.
+        // This also exercises the jump arithmetic: with field content jlog == logsz,
+        // so the +34 flows into jump1/jump2 as well as the back-jump.
+        let (status, wire, log) = run("abort_field_good", s2.1, s2.2, s2.3,
+            "concat(req.method, \" \", req.path, \"\\n\")", "abort", true, 3);
+        assert_eq!(status, None, "abort + field content must keep serving; got {:?}", status);
+        for (i, got) in wire.iter().enumerate() {
+            assert_eq!(got.as_slice(),
+                format!("HTTP/1.0 200 OK\r\nContent-Length: 3\r\n\r\n/p{}", i).as_bytes(),
+                "abort + field content perturbed the wire response on request {i} — the \
+                 +34 must flow into jump1/jump2 via jlog; got {:?}",
+                String::from_utf8_lossy(got));
+        }
+        assert_eq!(log, "GET /p0\nGET /p1\nGET /p2\n",
+            "abort + field content must still record the real method and path; got {:?}",
+            log);
+
+        // --- ROW 3c: abort + field content + UNWRITABLE, at the post-select
+        // placement. The abort fires AFTER the parse here, so the failure point moves
+        // — the exit status must not.
+        let (status, wire, _) = run("abort_field_bad", s2.1, s2.2, s2.3,
+            "concat(req.method, \" \", req.path, \"\\n\")", "abort", false, 2);
+        assert_eq!(status, Some(1),
+            "abort must fail closed at the POST-SELECT placement too; got {:?}", status);
+        assert!(wire.iter().all(|w| w.is_empty()),
+            "a fail-closed server must send nothing even when the log block sits after \
+             the parse; got {:?}", wire);
+
+        let _ = fs::remove_file(&elf);
+    }
+
     /// SELF-HOSTING SERVICE slice 1 — verify gate pins. The self-hosted emitter's
     /// leading abort_if(verrs) refuses (exit 1, empty stdout) every service audit
     /// violation; a clean hello_http emits an ELF.
@@ -25135,11 +25481,20 @@ rule le64_neg
         // does not have; resp.status is the motivating case).
         refuse(&withlog("  log:\n    append_file \"/tmp/vx_svc_s5a.log\" 42"),
             "number log content");
-        // (k7) `on_error: abort` -> refused (S5c: the accept loop has no sys_exit(1)
-        // tail). CRITICAL that this REFUSES rather than being ignored: the line is
-        // PARSED, so a declared abort can never be silently downgraded to drop.
-        refuse(&withlog("  log:\n    append_file \"/tmp/vx_svc_s5a.log\" \"hit\\n\"\n    on_error: abort"),
-            "on_error: abort -> S5c");
+        // (k7) SLICE 5C: `on_error: abort` now EMITS. Before S5c it was refused (the
+        // accept loop had no sys_exit(1) tail) — CRITICAL that it refused rather than
+        // being ignored, because the line is PARSED and a declared abort must never be
+        // silently downgraded to drop. S5c gives it the two 17-byte inline check stubs,
+        // so the emitted policy matches the declared one.
+        let k7 = run(&withlog("  log:\n    append_file \"/tmp/vx_svc_s5a.log\" \"hit\\n\"\n    on_error: abort"));
+        assert!(k7.status.success() && k7.stdout.len() >= 4 && &k7.stdout[0..4] == b"\x7fELF",
+            "S5c `on_error: abort` must EMIT; got {:?} stderr={:?}",
+            k7.status, String::from_utf8_lossy(&k7.stderr));
+        // …and it must cost EXACTLY 34 bytes more than the byte-identical drop sibling
+        // (two 17-byte stubs, flat — the whole point of doing 5b.5 first).
+        assert_eq!(k7.stdout.len(), k2.stdout.len() + 34,
+            "an abort log block must be exactly its drop sibling + 34 (two 17-byte \
+             check stubs); the size walk and the emit walk disagree otherwise");
         // (k8) an UNRECOGNIZED on_error policy word -> refused (closed set).
         refuse(&withlog("  log:\n    append_file \"/tmp/vx_svc_s5a.log\" \"hit\\n\"\n    on_error: yolo"),
             "unknown on_error policy");
@@ -25206,9 +25561,14 @@ rule le64_neg
         // (k20) a NUMBER arg inside the concat -> refused (no itoa arm).
         refuse(&with_s2_log("  log:\n    append_file \"/tmp/vx_svc_s5b.log\" concat(req.path, 42)"),
             "number arg in log concat");
-        // (k21) `on_error: abort` stays refused even with field content (S5c).
-        refuse(&with_s2_log("  log:\n    append_file \"/tmp/vx_svc_s5b.log\" concat(req.path, \"\\n\")\n    on_error: abort"),
-            "on_error: abort with field content -> S5c");
+        // (k21) SLICE 5C: `on_error: abort` also emits with FIELD content — the stub
+        // travels with the log block, so it works at the post-select placement too.
+        emits(&with_s2_log("  log:\n    append_file \"/tmp/vx_svc_s5b.log\" concat(req.path, \"\\n\")\n    on_error: abort"),
+            "S5c on_error: abort with field content");
+        // (k21b) an unrecognized policy word stays refused even with field content —
+        // S5c widened the gate from `> 1` to `> 2`, not to "anything parses".
+        refuse(&with_s2_log("  log:\n    append_file \"/tmp/vx_svc_s5b.log\" concat(req.path, \"\\n\")\n    on_error: yolo"),
+            "unknown on_error policy with field content");
         // (k22) THE ACCEPTED DIVERGENCE: a handler whose input param is NOT `req`,
         // with a log naming `req.path`. ACCEPTED — the log scope's base is the
         // synthetic `req` and the emitted read comes from the CAPTURED parse spans,
