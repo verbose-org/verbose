@@ -25670,6 +25670,10 @@ rule le64_neg
         let pid = child.id();
         let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
         assert!(wait_up(&addr), "parallel server never listened");
+        // The fd BASELINE: sampled after the server is listening but BEFORE it has
+        // served a request. Whatever it inherited from the harness is already in here.
+        let fd_baseline = fs::read_dir(format!("/proc/{}/fd", pid))
+            .map(|d| d.count()).unwrap_or(0);
         let handles: Vec<_> = (0..N).map(|i| {
             std::thread::spawn(move || {
                 let a: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
@@ -25697,11 +25701,12 @@ rule le64_neg
         // separate behave differently over time: an in-flight fd is transient and
         // settles, a LEAK never does (measured: 96 requests in 3 bursts hold at 4 and
         // never grow). A leak therefore still fails this, just after the timeout.
-        let mut fds = 0;
+        let fds_now = || fs::read_dir(format!("/proc/{}/fd", pid)).map(|d| d.count()).unwrap_or(0);
+        let mut fds = fds_now();
         for _ in 0..40 {
-            fds = fs::read_dir(format!("/proc/{}/fd", pid)).map(|d| d.count()).unwrap_or(0);
-            if fds == 4 { break; }
+            if fds <= fd_baseline { break; }
             std::thread::sleep(Duration::from_millis(100));
+            fds = fds_now();
         }
         let kids = proc_children(pid);
         let _ = child.kill();
@@ -25736,10 +25741,13 @@ rule le64_neg
             "after {N} served requests the forked server must have NO remaining \
              children (SIGCHLD = SIG_IGN auto-reaps); got {:?}", kids);
         // (4) FD LEAK: 0, 1, 2 + the listen socket.
-        assert_eq!(fds, 4,
-            "the parent must close every client fd it hands to a child — \
-             /proc/{}/fd should hold exactly 4 entries (stdin, stdout, stderr, \
-             listen); got {}", pid, fds);
+        assert!(fds <= fd_baseline,
+            "the parent must close every client fd it hands to a child — after {N} \
+             served connections /proc/{}/fd must not exceed its pre-request baseline \
+             of {} entries; got {}. A LEAK shows up as baseline + connections-served; \
+             an ABSOLUTE count would instead measure whatever fds the harness handed \
+             the server at spawn (CI: 6, local: 4 — neither is a property of the \
+             emitted code).", pid, fd_baseline, fds);
 
         // A dedicated 12-request zombie row on a LOG-LESS server, so the count is not
         // entangled with the log block, and so the negative control below has an
