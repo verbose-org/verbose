@@ -25687,8 +25687,23 @@ rule le64_neg
         let replies: Vec<Vec<u8>> = handles.into_iter().map(|h| h.join().unwrap()).collect();
         std::thread::sleep(Duration::from_millis(400));
         // Sampled BEFORE the kill, while the server is still the live parent.
+        //
+        // The fd count is POLLED, not sampled once. A client's `read_to_end` returns
+        // when the CHILD closes; the PARENT's close of that same fd happens
+        // independently in the fork block, so on a loaded runner the parent can still
+        // be working through the backlog's accept/fork/close when we look. CI caught
+        // exactly that: 6 = 4 + 2 in flight, where a local run showed 4.
+        // Polling does NOT weaken the assertion, because the two cases it must
+        // separate behave differently over time: an in-flight fd is transient and
+        // settles, a LEAK never does (measured: 96 requests in 3 bursts hold at 4 and
+        // never grow). A leak therefore still fails this, just after the timeout.
+        let mut fds = 0;
+        for _ in 0..40 {
+            fds = fs::read_dir(format!("/proc/{}/fd", pid)).map(|d| d.count()).unwrap_or(0);
+            if fds == 4 { break; }
+            std::thread::sleep(Duration::from_millis(100));
+        }
         let kids = proc_children(pid);
-        let fds = fs::read_dir(format!("/proc/{}/fd", pid)).map(|d| d.count()).unwrap_or(0);
         let _ = child.kill();
         let _ = child.wait();
         let _ = fs::remove_file(&bin);
