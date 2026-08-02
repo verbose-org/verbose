@@ -13888,15 +13888,17 @@ concept SvcLogCkState
 --                                       those; resp.* / req.timestamp / req.body /
 --                                       AstNum still need machinery this slice does
 --                                       not have)
---   on_error > 1                  -> 0 (S5c: `abort` needs a sys_exit(1) tail the
---                                       accept loop does not have, and code 3 is an
---                                       unrecognized policy word. Slice 5a emits DROP
---                                       — best-effort, no syscall return checks — so
---                                       accepting `abort` would silently downgrade the
---                                       declared policy.)
+--   on_error > 2                  -> 0 (code 3 is an UNRECOGNIZED policy word — the
+--                                       closed set is `drop` (1) and `abort` (2), and
+--                                       an unknown word must never be silently read as
+--                                       one of them. S5c lifted the old `> 1`: `abort`
+--                                       now emits the two 17-byte fail-closed check
+--                                       stubs after the log block's open and writev,
+--                                       so the emitted policy matches the declared one
+--                                       instead of silently downgrading to drop.)
 --   otherwise                     -> 1
 rule svc_log_ok
-  @intention: "1 if a service's optional log block is absent or is the slice-5a static-literal drop shape, 0 otherwise"
+  @intention: "1 if a service's optional log block is absent or is a lowerable drop/abort shape, 0 otherwise"
   @source: vexprparse.intent:74
   input:
     sk : SvcLogCkState
@@ -13904,7 +13906,7 @@ rule svc_log_ok
     out : number
   logic:
     let cok = svc_log_content_ok(RxContentState { node: sk.node, src: sk.src })
-    out = if sk.present == 0 then 1 else (if sk.path_len < 0 then 0 else (if cok == 1 then (if sk.on_error > 1 then 0 else 1) else 0))
+    out = if sk.present == 0 then 1 else (if sk.path_len < 0 then 0 else (if cok == 1 then (if sk.on_error > 2 then 0 else 1) else 0))
   proofs:
     purity:
       reads : [sk.present, sk.path_len, sk.on_error, sk.node, sk.src]
@@ -28812,12 +28814,18 @@ rule svc_log_content_size
 --   path_block = 4*((plen + 4)/4) — the emit_bytes_data(dlen = plen + 1) block,
 --        always NUL-terminated because open() needs a C string
 --   cblocks    = svc_log_content_size
+--   abortsz    = 34 when on_error is `abort` (code 2), else 0 — S5c's two 17-byte
+--        fail-closed check stubs (`test rax,rax ; jns +12 ; mov edi,1 ; mov eax,60 ;
+--        syscall`), one after the open and one after the writev. FLAT, not
+--        arity-dependent, because slice 5b.5 collapsed the content to ONE writev.
+--        Gated on `== 2`, NOT `> 0`: absent (0) and an explicit `drop` (1) must both
+--        contribute 0 so every pre-S5c service stays byte-identical.
 -- 0 when no log block is declared -> S1-S4 servers stay byte-identical BY
 -- CONSTRUCTION. Tolerant on the SvNil sentinel and on a malformed decl (path_len -1
 -- floors bytelit_decoded_len at 0), and size/emit agree on those shapes too since
 -- both gate on the same svc_log_present and derive path_block from the same plen.
 rule svc_log_block_size
-  @intention: "Byte length of the per-request service log block: 42 + path block + content blocks (0 if no log block)"
+  @intention: "Byte length of the per-request service log block: 42 + path block + content blocks + the abort stubs (0 if no log block)"
   @source: vexprparse.intent:74
   input:
     ls : SvcLogState
@@ -28828,11 +28836,12 @@ rule svc_log_block_size
     let plen = bytelit_decoded_len(DecodeState { src: ls.src, start: svc_log_path_start(h), len: svc_log_path_len(h), i: 0 })
     let path_block = 4 * ((plen + 4) / 4)
     let cblocks = svc_log_content_size(RxContentState { node: svc_log_content(h), src: ls.src })
-    out = if svc_log_present(h) == 1 then 42 + path_block + cblocks else 0
+    let abortsz = if svc_log_on_error(h) == 2 then 34 else 0
+    out = if svc_log_present(h) == 1 then 42 + path_block + cblocks + abortsz else 0
   proofs:
     purity:
       reads : [ls.svcs, ls.src]
-      calls : [svc_head, svc_log_present, svc_log_path_start, svc_log_path_len, svc_log_content, svc_log_content_size, bytelit_decoded_len]
+      calls : [svc_head, svc_log_present, svc_log_path_start, svc_log_path_len, svc_log_content, svc_log_content_size, svc_log_on_error, bytelit_decoded_len]
     termination:
       bound : 64
 
@@ -29009,7 +29018,9 @@ rule x86_svc_log_content
 --   lea rdi,[rip-(path_block+7)] ;
 --   mov eax,2 ; mov esi,0x441 ; mov edx,0x1A4 ; syscall   ; open(WRONLY|CREAT|APPEND)
 --   mov r15,rax                                           ; the fd
+--   [S5c, on_error: abort only] the 17-byte check stub
 --   <content: ONE writev(r15, iov, N) — slice 5b.5>
+--   [S5c, on_error: abort only] the 17-byte check stub
 --   mov eax,3 ; mov rdi,r15 ; syscall                     ; close
 -- Slice 5b.5: the content is now exactly TWO syscalls' worth of surface between the
 -- open and the close — the writev and nothing else. That makes the line ALL-OR-
@@ -29018,16 +29029,47 @@ rule x86_svc_log_content
 -- and issues one write. It is NOT a fork-safety guarantee, and it does not hold over
 -- NFS. It also makes S5c's `on_error: abort` a flat +34 (two 17-byte check stubs,
 -- after the open and after the writev) instead of an arity-dependent check count.
--- NO syscall return checks — DROP policy, the reaction default: on an unwritable path
--- open returns -1 and writev(-1)/close(-1) fail silently, the request is still served.
--- `on_error: abort` needs a sys_exit(1) tail the accept loop does not have and is
--- REFUSED by svc_log_ok (S5c), so the emitted policy can never contradict the
--- declared one.
+--
+-- S5c — the on_error POLICY. `drop` (the default, and code 0 = absent) emits NO
+-- syscall return checks: on an unwritable path open returns -1 and writev(-1)/
+-- close(-1) fail silently, and the request is still served. `abort` (code 2) splices
+-- a 17-byte INLINE stub after the open and after the writev:
+--   48 85 c0        test rax, rax
+--   79 0c           jns  +12          ; ALWAYS the literal 12 — every site, every
+--                                     ;  branch — so ZERO new jump constants and
+--                                     ;  nothing needs de-baking
+--   bf 01 00 00 00  mov  edi, 1
+--   b8 3c 00 00 00  mov  eax, 60
+--   0f 05           syscall           ; exit(1)
+-- The 12-byte exit(1) is the house form (byte-for-byte the mmap-failure path in every
+-- emitted binary). A SHARED end-of-tramp tail was REJECTED: there is no dead space
+-- after the back-jump (the next rule proc's `push %rbp` starts immediately), and the
+-- distance from each of the 7 splice sites to such a tail differs per branch AND per
+-- placement, so it would need 7 distinct closed forms. The self-hosted emitter has no
+-- patch list — every displacement must be closed-form — which is exactly why the
+-- inline stub wins.
+-- Placement is FREE: the stub reads nothing but rax and re-establishes the flags with
+-- its own `test`, so `mov r15,rax` (which preserves flags) may sit on either side of
+-- the open stub, and the writev stub sits after `add rsp,16*N` (which touches neither
+-- rax nor the outcome). The S5b liveness constraint does NOT bind it — that rule
+-- exists because the log block READS r10/r8/rbp/r9; the stub is `exit(1)` and reads
+-- nothing. NO close check: verbosec parity (NR:7816-7824).
+-- The 17 stub bytes appear TWICE INLINE in the concat below, not once behind a
+-- bytes-typed `let`: the native emitter refuses a bytes literal in any scalar
+-- position ("bytes literal cannot be used as a scalar expression", brick b1), so a
+-- `let ck = b"..."` does not compile. The duplication is a HAND-SYNCED PAIR in the
+-- same sense as svc_log_iov_size / x86_svc_log_iov, and it is pinned mechanically:
+-- the S5c test asserts the log-block window contains EXACTLY TWO occurrences of the
+-- byte-identical stub, so a one-sided edit fails the suite rather than shipping.
+-- HONEST SCOPE: `abort` turns a log failure into a FULL SERVICE OUTAGE. The accept
+-- loop is sequential and un-forked, so exit(1) kills the server, not just the request.
+-- That IS the fail-closed contract (no log => no service), and it is also a DoS
+-- surface if an attacker can exhaust the log filesystem. verbosec behaves identically.
 -- Emits NOTHING when no log block is declared -> the four existing service branches
 -- stay byte-identical. ONE rule spliced into all FOUR branches of x86_service_tramp,
 -- so the four insertions cannot drift from each other.
 rule x86_svc_log_block
-  @intention: "Emit the per-request service log block: open(append) with the fd in r15, one literal write, close (drop policy)"
+  @intention: "Emit the per-request service log block: open(append) with the fd in r15, one writev, close, plus the two fail-closed check stubs when on_error is abort"
   @source: vexprparse.intent:74
   input:
     ls : SvcLogState
@@ -29037,11 +29079,12 @@ rule x86_svc_log_block
     let h = svc_head(ls.svcs)
     let plen = bytelit_decoded_len(DecodeState { src: ls.src, start: svc_log_path_start(h), len: svc_log_path_len(h), i: 0 })
     let path_block = 4 * ((plen + 4) / 4)
-    out = if svc_log_present(h) == 1 then concat(b"\xe9", le32(path_block), emit_bytes_data(BytesEmitState { src: ls.src, start: svc_log_path_start(h), len: svc_log_path_len(h), i: 0, dlen: plen + 1 }), b"\x48\x8d\x3d", le32(0 - (path_block + 7)), b"\xb8\x02\x00\x00\x00\xbe\x41\x04\x00\x00\xba\xa4\x01\x00\x00\x0f\x05\x49\x89\xc7", x86_svc_log_content(RxContentState { node: svc_log_content(h), src: ls.src }), b"\xb8\x03\x00\x00\x00\x4c\x89\xff\x0f\x05") else b""
+    let ab = svc_log_on_error(h)
+    out = if svc_log_present(h) == 1 then concat(b"\xe9", le32(path_block), emit_bytes_data(BytesEmitState { src: ls.src, start: svc_log_path_start(h), len: svc_log_path_len(h), i: 0, dlen: plen + 1 }), b"\x48\x8d\x3d", le32(0 - (path_block + 7)), b"\xb8\x02\x00\x00\x00\xbe\x41\x04\x00\x00\xba\xa4\x01\x00\x00\x0f\x05\x49\x89\xc7", (if ab == 2 then b"\x48\x85\xc0\x79\x0c\xbf\x01\x00\x00\x00\xb8\x3c\x00\x00\x00\x0f\x05" else b""), x86_svc_log_content(RxContentState { node: svc_log_content(h), src: ls.src }), (if ab == 2 then b"\x48\x85\xc0\x79\x0c\xbf\x01\x00\x00\x00\xb8\x3c\x00\x00\x00\x0f\x05" else b""), b"\xb8\x03\x00\x00\x00\x4c\x89\xff\x0f\x05") else b""
   proofs:
     purity:
       reads : [ls.svcs, ls.src]
-      calls : [svc_head, svc_log_present, svc_log_path_start, svc_log_path_len, svc_log_content, x86_svc_log_content, bytelit_decoded_len, emit_bytes_data]
+      calls : [svc_head, svc_log_present, svc_log_path_start, svc_log_path_len, svc_log_content, svc_log_on_error, x86_svc_log_content, bytelit_decoded_len, emit_bytes_data]
     termination:
       bound : 64
 
