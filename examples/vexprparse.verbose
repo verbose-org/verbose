@@ -6946,6 +6946,28 @@ rule span_is_bxor
       bound : 64
 
 
+-- span_is_bnot: 1 iff the span is exactly the 4 bytes "bnot" (b=98 n=110
+-- o=111 t=116). The ONLY UNARY member of the family, which is why it gets its
+-- own recognizer rather than riding span_is_bitwise everywhere: arity is what
+-- the verifier's check and the emitter's guard both key on, so "which one is
+-- bnot" has to be answerable on its own.
+rule span_is_bnot
+  @intention: "1 if a callee span spells exactly \"bnot\", 0 otherwise"
+  @source: vexprparse.intent:68
+  input:
+    sc : SpanCheck
+  output:
+    out : number
+  logic:
+    out = if sc.len == 4 and (byte_at(sc.src, sc.start) == 98 and (byte_at(sc.src, sc.start + 1) == 110 and (byte_at(sc.src, sc.start + 2) == 111 and byte_at(sc.src, sc.start + 3) == 116))) then 1 else 0
+  proofs:
+    purity:
+      reads : [sc.src, sc.start, sc.len]
+      calls : []
+    termination:
+      bound : 64
+
+
 -- span_is_shl: 1 iff the span is exactly the 3 bytes "shl" (s=115 h=104
 -- l=108). Sibling of span_is_bor at 3 bytes.
 rule span_is_shl
@@ -7008,11 +7030,11 @@ rule span_is_bitwise
   output:
     out : number
   logic:
-    out = if sc.len == 4 then (if span_is_band(sc) == 1 then 1 else span_is_bxor(sc)) else if sc.len == 3 then (if span_is_bor(sc) == 1 then 1 else if span_is_shl(sc) == 1 then 1 else span_is_shr(sc)) else 0
+    out = if sc.len == 4 then (if span_is_band(sc) == 1 then 1 else if span_is_bxor(sc) == 1 then 1 else span_is_bnot(sc)) else if sc.len == 3 then (if span_is_bor(sc) == 1 then 1 else if span_is_shl(sc) == 1 then 1 else span_is_shr(sc)) else 0
   proofs:
     purity:
       reads : [sc, sc.len]
-      calls : [span_is_band, span_is_bxor, span_is_bor, span_is_shl, span_is_shr]
+      calls : [span_is_band, span_is_bxor, span_is_bnot, span_is_bor, span_is_shl, span_is_shr]
     termination:
       bound : 64
 
@@ -7032,11 +7054,11 @@ rule bitwise_arity
   output:
     out : number
   logic:
-    out = if span_is_bitwise(sc) == 1 then 2 else 0
+    out = if span_is_bnot(sc) == 1 then 1 else if span_is_bitwise(sc) == 1 then 2 else 0
   proofs:
     purity:
       reads : [sc]
-      calls : [span_is_bitwise]
+      calls : [span_is_bnot, span_is_bitwise]
     termination:
       bound : 64
 
@@ -25309,59 +25331,26 @@ rule x86_arms
       bound : 8000
 
 
--- ============================================================================
--- BITWISE tier — the size/emit LOCKSTEP PAIR.
+-- WHY THE BITWISE LOWERING LIVES IN ITS OWN PAIR OF RULES, and not as two more
+-- branches inline in code_size_node / x86_node's AstCall arms.
 --
--- bitwise_op_size and x86_bitwise_op below are the two halves of one decision,
--- deliberately written as ADJACENT sibling rules over the SAME dispatch chain
--- rather than as two more branches buried inside code_size_node / x86_node's
--- thousand-character AstCall arms. In those arms a size/emit drift of ONE byte
--- desyncs every downstream rel32, which lands as a wrong p_filesz, a truncated
--- segment and a SIGSEGV at spawn — this project's signature failure. Here the
--- correspondence is checkable by eye: every arm of one has an arm of the other
--- at the same position, and the number is the literal's length.
+-- The honest history, because the first answer written here was wrong and the
+-- wrong answer is the instructive part. Growing x86_node's AstCall arm made
+-- gen0 ABORT MID-EMIT on its own source: exit 1 after streaming ~750 KB of the
+-- 2.6 MB ELF it owed. Bisecting the SHAPE of the addition produced a coherent
+-- and completely false story — one extra branch was fine, three were not; a
+-- 3200-byte dead literal was fine, a second record-marshalled call was not —
+-- which reads exactly like a register or frame bug in the lowering. It is not.
+-- The real cause is that gen0's node arena was at 100% of its 6M cap before
+-- this slice (see the max_nodes banner at the top of this file), and every
+-- "shape" in that bisect was really a proxy for how many AST NODES the
+-- addition cost. Raising the cap made every one of those shapes compile.
 --
---   band  59 58 48 21 c8 50   pop rcx ; pop rax ; and rax, rcx ; push rax   6
---   bor   59 58 48 09 c8 50   pop rcx ; pop rax ; or  rax, rcx ; push rax   6
---   bxor  59 58 48 31 c8 50   pop rcx ; pop rax ; xor rax, rcx ; push rax   6
---   (fallthrough)  cc         int3, unreachable behind span_is_bitwise       1
---
--- x86_args has already pushed the operands in source order, so the stack top
--- is the SECOND argument: `pop rcx` takes b, `pop rax` takes a, and the op
--- computes a OP b into rax. Identical operand order to the neighbouring
--- min/max arms (which pop the same way before their cmp/cmov).
---
--- REGISTER DISCIPLINE. Only rax and rcx are touched, both ephemeral in this
--- emitter — the same two the min/max, byte_at and substring arms already
--- scratch. r14/r15 (the arena base and node counter) are untouched, and there
--- is no syscall anywhere between the pops and the op, so the "syscalls clobber
--- rcx and r11" rule never comes into play: rcx is written and consumed inside
--- one straight-line 6-byte window.
--- WHY THESE ARE SEPARATE RULES, and not two more branches inline in
--- code_size_node / x86_node's AstCall arms.
---
--- Measured, not stylistic. Growing x86_node's AstCall arm with an inline
--- bitwise branch makes gen0 ABORT MID-EMIT on its own source (exit 1 after a
--- partial ~750 KB of a 2.6 MB ELF), and the trigger is NOT bitwise-specific:
--- a branch built only from PRE-EXISTING constructs reproduces it exactly.
--- Bisected shapes, all with the same outer `span_is_*(SpanCheck{..}) == 1`
--- guard the existing branches use:
---
---   if arg_list_len(args) == 2 then concat(x86_args(..), <lit>) else <lit>   OK
---   if arg_list_len(args) == <call taking a RECORD> then concat(x86_args(..),
---       <lit>) else <lit>                                                  ABORT
---   ... then concat(x86_args(..), <call taking a RECORD>) else <lit>       ABORT
---   the first (OK) shape, repeated three times                            ABORT
---   a 3200-byte dead literal in the same position                          OK
---
--- So it is neither proc size (3200 dead bytes are fine) nor the bitwise code:
--- it is a second record-marshalled call reaching an if-branch that streams a
--- concat containing a texty call. One such call per branch is the ceiling
--- x86_node is already sitting at. Delegating to a rule with its OWN frame
--- keeps x86_node's arm at exactly `<guard> then <bare call>` — the shape the
--- bisect showed safe — and the bitwise lowering gets a clean frame to work in.
--- The limit is upstream of this slice and stays unfixed here; it is written
--- down so the next person to grow that arm does not rediscover it by SIGSEGV.
+-- The split is KEPT anyway, on its merits: the two halves of a size/emit
+-- decision belong side by side where a reader can check them against each
+-- other, not buried a thousand characters into two different monster lines.
+-- What is NOT true is that the inline form is unsafe — it is merely worse to
+-- audit.
 --
 -- ============================================================================
 -- BITWISE tier — the size/emit LOCKSTEP PAIR.
@@ -25376,15 +25365,19 @@ rule x86_arms
 --   band  59 58 48 21 c8 50   pop rcx ; pop rax ; and rax, rcx ; push rax   6
 --   bor   59 58 48 09 c8 50   pop rcx ; pop rax ; or  rax, rcx ; push rax   6
 --   bxor  59 58 48 31 c8 50   pop rcx ; pop rax ; xor rax, rcx ; push rax   6
+--   bnot     58 48 f7 d0 50   pop rax ; not rax             ; push rax     5
 --   shl   59 58 48 d3 e0 50   pop rcx ; pop rax ; shl rax, cl  ; push rax   6
 --   shr   59 58 48 d3 e8 50   pop rcx ; pop rax ; shr rax, cl  ; push rax   6
 --   wrong arity        6a 00  push 0 — the same defensive shape byte_at /
 --                             substring / min / max use                     2
 --   non-AstCall node      cc  int3, unreachable behind span_is_bitwise       1
 --
--- Every op is six bytes, so code_size_bitwise_call needs no per-op dispatch —
--- the one number 6 covers the whole table, and the drift risk collapses to
--- "is every literal here six bytes long".
+-- Every BINARY op is six bytes, so the size side needs no per-op dispatch for
+-- them: one constant 6 covers those five, and the drift risk collapses to "is
+-- every literal in that group six bytes long". bnot is the exception on both
+-- counts — one operand and five bytes — so it dispatches FIRST on both sides,
+-- in the same position, with the same span_is_bnot test. That symmetry is the
+-- point: the two rules read as one decision written twice.
 --
 -- x86_args has already pushed the operands in source order, so the stack top
 -- is the SECOND argument: `pop rcx` takes b, `pop rax` takes a, and the op
@@ -25427,7 +25420,7 @@ rule code_size_bitwise_call
     out : number
   logic:
     out = match bg.node:
-      AstCall(callee_start, callee_len, args) => if arg_list_len(args) == 2 then code_size_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}) + 6 else 2
+      AstCall(callee_start, callee_len, args) => if span_is_bnot(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then (if arg_list_len(args) == 1 then code_size_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}) + 5 else 2) else if arg_list_len(args) == 2 then code_size_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}) + 6 else 2
       AstNum(value) => 1
       AstBin(op, lhs, rhs) => 1
       AstNeg(inner) => 1
@@ -25456,7 +25449,7 @@ rule code_size_bitwise_call
   proofs:
     purity:
       reads : [bg.node, bg.src, bg.off, bg.params, bg.lets, bg.prog, bg.concepts, bg.sizes, bg.ress, bg.conns]
-      calls : [arg_list_len, code_size_args]
+      calls : [span_is_bnot, arg_list_len, code_size_args]
     termination:
       bound : 4000
 
@@ -25477,7 +25470,7 @@ rule x86_bitwise_call
     out : bytes
   logic:
     out = match bg.node:
-      AstCall(callee_start, callee_len, args) => if arg_list_len(args) == 2 then concat(x86_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}), (if span_is_band(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then b"\x59\x58\x48\x21\xc8\x50" else if span_is_bor(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then b"\x59\x58\x48\x09\xc8\x50" else if span_is_bxor(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then b"\x59\x58\x48\x31\xc8\x50" else if span_is_shl(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then b"\x59\x58\x48\xd3\xe0\x50" else b"\x59\x58\x48\xd3\xe8\x50")) else b"\x6a\x00"
+      AstCall(callee_start, callee_len, args) => if span_is_bnot(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then (if arg_list_len(args) == 1 then concat(x86_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}), b"\x58\x48\xf7\xd0\x50") else b"\x6a\x00") else if arg_list_len(args) == 2 then concat(x86_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}), (if span_is_band(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then b"\x59\x58\x48\x21\xc8\x50" else if span_is_bor(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then b"\x59\x58\x48\x09\xc8\x50" else if span_is_bxor(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then b"\x59\x58\x48\x31\xc8\x50" else if span_is_shl(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then b"\x59\x58\x48\xd3\xe0\x50" else b"\x59\x58\x48\xd3\xe8\x50")) else b"\x6a\x00"
       AstNum(value) => b"\xcc"
       AstBin(op, lhs, rhs) => b"\xcc"
       AstNeg(inner) => b"\xcc"
@@ -25506,7 +25499,7 @@ rule x86_bitwise_call
   proofs:
     purity:
       reads : [bg.node, bg.src, bg.off, bg.params, bg.lets, bg.prog, bg.concepts, bg.sizes, bg.ress, bg.conns]
-      calls : [arg_list_len, x86_args, span_is_band, span_is_bor, span_is_bxor, span_is_shl]
+      calls : [span_is_bnot, arg_list_len, x86_args, span_is_band, span_is_bor, span_is_bxor, span_is_shl]
     termination:
       bound : 4000
 
