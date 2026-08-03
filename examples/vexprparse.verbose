@@ -6946,6 +6946,52 @@ rule span_is_bxor
       bound : 64
 
 
+-- span_is_shl: 1 iff the span is exactly the 3 bytes "shl" (s=115 h=104
+-- l=108). Sibling of span_is_bor at 3 bytes.
+rule span_is_shl
+  @intention: "1 if a callee span spells exactly \"shl\", 0 otherwise"
+  @source: vexprparse.intent:68
+  input:
+    sc : SpanCheck
+  output:
+    out : number
+  logic:
+    out = if sc.len == 3 and (byte_at(sc.src, sc.start) == 115 and (byte_at(sc.src, sc.start + 1) == 104 and byte_at(sc.src, sc.start + 2) == 108)) then 1 else 0
+  proofs:
+    purity:
+      reads : [sc.src, sc.start, sc.len]
+      calls : []
+    termination:
+      bound : 64
+
+
+-- span_is_shr: 1 iff the span is exactly the 3 bytes "shr" (s=115 h=104
+-- r=114). Sibling of span_is_shl.
+--
+-- `shr` is a LOGICAL shift in every Verbose backend — it zero-fills, it does
+-- NOT replicate the sign bit. That is not an incidental encoding choice: it
+-- was a live cross-backend bug until PR #143, and getting it wrong is silent
+-- rather than loud. Every hash in the crypto corpus would still compile and
+-- still produce a number; only the number would be wrong. sha512_fold's first
+-- output byte is 207 when shr is logical and 111 when it is arithmetic, which
+-- is the cheapest available oracle for this one bit of encoding.
+rule span_is_shr
+  @intention: "1 if a callee span spells exactly \"shr\", 0 otherwise"
+  @source: vexprparse.intent:68
+  input:
+    sc : SpanCheck
+  output:
+    out : number
+  logic:
+    out = if sc.len == 3 and (byte_at(sc.src, sc.start) == 115 and (byte_at(sc.src, sc.start + 1) == 104 and byte_at(sc.src, sc.start + 2) == 114)) then 1 else 0
+  proofs:
+    purity:
+      reads : [sc.src, sc.start, sc.len]
+      calls : []
+    termination:
+      bound : 64
+
+
 -- span_is_bitwise: 1 iff the span spells ANY of the bitwise primitives. The
 -- LENGTH GUARD LEADS deliberately: this rule sits on the hot path (every
 -- AstCall in code_size_node / x86_node / arity_mismatch consults it, and
@@ -6962,11 +7008,11 @@ rule span_is_bitwise
   output:
     out : number
   logic:
-    out = if sc.len == 4 then (if span_is_band(sc) == 1 then 1 else span_is_bxor(sc)) else if sc.len == 3 then span_is_bor(sc) else 0
+    out = if sc.len == 4 then (if span_is_band(sc) == 1 then 1 else span_is_bxor(sc)) else if sc.len == 3 then (if span_is_bor(sc) == 1 then 1 else if span_is_shl(sc) == 1 then 1 else span_is_shr(sc)) else 0
   proofs:
     purity:
       reads : [sc, sc.len]
-      calls : [span_is_band, span_is_bxor, span_is_bor]
+      calls : [span_is_band, span_is_bxor, span_is_bor, span_is_shl, span_is_shr]
     termination:
       bound : 64
 
@@ -25330,21 +25376,41 @@ rule x86_arms
 --   band  59 58 48 21 c8 50   pop rcx ; pop rax ; and rax, rcx ; push rax   6
 --   bor   59 58 48 09 c8 50   pop rcx ; pop rax ; or  rax, rcx ; push rax   6
 --   bxor  59 58 48 31 c8 50   pop rcx ; pop rax ; xor rax, rcx ; push rax   6
+--   shl   59 58 48 d3 e0 50   pop rcx ; pop rax ; shl rax, cl  ; push rax   6
+--   shr   59 58 48 d3 e8 50   pop rcx ; pop rax ; shr rax, cl  ; push rax   6
 --   wrong arity        6a 00  push 0 — the same defensive shape byte_at /
 --                             substring / min / max use                     2
 --   non-AstCall node      cc  int3, unreachable behind span_is_bitwise       1
+--
+-- Every op is six bytes, so code_size_bitwise_call needs no per-op dispatch —
+-- the one number 6 covers the whole table, and the drift risk collapses to
+-- "is every literal here six bytes long".
 --
 -- x86_args has already pushed the operands in source order, so the stack top
 -- is the SECOND argument: `pop rcx` takes b, `pop rax` takes a, and the op
 -- computes a OP b into rax. Identical operand order to the min/max branches,
 -- which pop the same way before their cmp/cmov.
 --
--- REGISTER DISCIPLINE. Only rax and rcx are touched, both ephemeral in this
--- emitter — the same two the min/max, byte_at and substring lowerings already
--- scratch. r14/r15 (the arena base and node counter) are untouched, and no
--- syscall occurs between the pops and the op, so the "syscalls clobber rcx and
--- r11" rule never applies: rcx is written and consumed inside one
--- straight-line six-byte window.
+-- REGISTER DISCIPLINE, and the shift count in particular. x86 `shl`/`shr` are
+-- the only ops here that are NOT register-flexible: a variable shift count
+-- must be in CL, nowhere else. That costs nothing, because the operand order
+-- above already delivers it — the second argument pops straight into rcx, and
+-- cl IS rcx's low byte. No `mov` and no scratch register: the same six-byte
+-- shape as the three logical ops. Beyond rax and rcx nothing is touched, and
+-- both are ephemeral in this emitter (the min/max, byte_at and substring
+-- lowerings already scratch them). r14/r15 — the arena base and node counter —
+-- are untouched, and no syscall falls between the pops and the op, so the
+-- "syscalls clobber rcx and r11" rule never comes into play: rcx is written
+-- and consumed inside one straight-line six-byte window.
+--
+-- BOTH SHIFTS ARE LOGICAL. `48 d3 e8` is `shr`, not `sar` — it zero-fills. An
+-- arithmetic shift would still compile and still produce a number; it would
+-- just be the wrong number, silently, in every hash in the crypto corpus. See
+-- span_is_shr for the 207-vs-111 oracle. The count is masked to 6 bits by the
+-- hardware for 64-bit operands, which is exactly what every other backend
+-- promises (the interpreter's wrapping_shr, the transpiler's
+-- `(x as u64).wrapping_shr(n)`), so this needs no clamp of its own: adding one
+-- would DIVERGE from the other backends rather than protect anything.
 --
 -- The arity guard is a LITERAL 2 rather than a call to bitwise_arity for the
 -- reason in the banner above (a record-marshalled call in this cond is what
@@ -25411,7 +25477,7 @@ rule x86_bitwise_call
     out : bytes
   logic:
     out = match bg.node:
-      AstCall(callee_start, callee_len, args) => if arg_list_len(args) == 2 then concat(x86_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}), (if span_is_band(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then b"\x59\x58\x48\x21\xc8\x50" else if span_is_bor(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then b"\x59\x58\x48\x09\xc8\x50" else b"\x59\x58\x48\x31\xc8\x50")) else b"\x6a\x00"
+      AstCall(callee_start, callee_len, args) => if arg_list_len(args) == 2 then concat(x86_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}), (if span_is_band(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then b"\x59\x58\x48\x21\xc8\x50" else if span_is_bor(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then b"\x59\x58\x48\x09\xc8\x50" else if span_is_bxor(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then b"\x59\x58\x48\x31\xc8\x50" else if span_is_shl(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then b"\x59\x58\x48\xd3\xe0\x50" else b"\x59\x58\x48\xd3\xe8\x50")) else b"\x6a\x00"
       AstNum(value) => b"\xcc"
       AstBin(op, lhs, rhs) => b"\xcc"
       AstNeg(inner) => b"\xcc"
@@ -25440,7 +25506,7 @@ rule x86_bitwise_call
   proofs:
     purity:
       reads : [bg.node, bg.src, bg.off, bg.params, bg.lets, bg.prog, bg.concepts, bg.sizes, bg.ress, bg.conns]
-      calls : [arg_list_len, x86_args, span_is_band, span_is_bor]
+      calls : [arg_list_len, x86_args, span_is_band, span_is_bor, span_is_bxor, span_is_shl]
     termination:
       bound : 4000
 
