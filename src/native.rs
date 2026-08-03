@@ -44045,6 +44045,162 @@ rule two
         let _ = fs::remove_file(&bin);
     }
 
+    /// REGRESSION PIN — recurrence #3 of the silent-truncation defect class.
+    ///
+    /// THE CLASS: `parse_program` (examples/vexprparse.verbose) advances by
+    /// `parse_rule_decl_pos`'s `next`, and ends its RuleList the moment that
+    /// cursor lands on a token it does not recognize as a top-level item. When
+    /// the cursor's halt point is WRONG, rules after it vanish. Three
+    /// recurrences to date:
+    ///   1. `concept` — records-arc brick R1 ("a `concept` declaration silently
+    ///      dropped every rule after it");
+    ///   2. `use` / EOF conflation — PR #141, which added `toplevel_junk` +
+    ///      `rule_list_len(prog) == 0` so an unrecognized item REFUSES instead
+    ///      of truncating;
+    ///   3. `hints:` — THIS pin. `hints:` is a rule SUB-BLOCK at the same
+    ///      2-space column as `proofs:` (examples/invoices.verbose:36).
+    ///      `parse_rule_decl_pos` stopped after `proofs:`, leaving the cursor on
+    ///      the `hints` token, which `parse_program` then read as an
+    ///      unrecognized TOP-LEVEL item.
+    ///
+    /// MEASURED before the fix (these files were counted as corpus PASSES while
+    /// emitting incomplete programs — the corpus number alone did not catch it):
+    /// showcase parsed 1 rule of 6, business 1 of 4, generated 1 of 3, pricing
+    /// 1 of 2. invoices and deadcode carry `hints:` on their LAST rule, so
+    /// nothing was lost there — correct by luck, not by construction, which is
+    /// precisely why a corpus count is not a sufficient guard for this class.
+    ///
+    /// WHAT THIS PIN ASSERTS, and why it is a rule COUNT and not a pass/fail:
+    /// after #141 the truncating files stopped compiling entirely, so a
+    /// pass/fail corpus check would go green the moment `hints:` merely stops
+    /// REFUSING — even if the parse were still dropping rules. The count is the
+    /// property that actually matters, so `count_rules` (vexprparse's own
+    /// RuleList-length oracle) is the instrument here.
+    ///
+    /// NOTE this is a PARSE pin, not a verification one: gen0 CONSUMES the
+    /// `hints:` block without checking anything it declares (verbosec checks
+    /// `overflow:` bounds by interval arithmetic and requires a justification
+    /// string on `vectorizable`/`parallel`/`cache_result`; gen0 does neither).
+    /// That gap is deliberate and documented — see the `span_is_hints` banner
+    /// in examples/vexprparse.verbose and CLAUDE.md's known-gaps note.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn self_hosted_parses_all_rules_past_a_trailing_hints_block() {
+        use std::fs;
+        use std::process::Command;
+
+        let src = fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let tmp = std::env::temp_dir();
+        let counter = tmp.join("verbosec_test_hints_count_rules");
+        let emitter = tmp.join("verbosec_test_hints_gen0");
+        compile_native_stdin_raw(&program, "count_rules", counter.to_str().unwrap())
+            .expect("count_rules must compile --stdin-raw");
+        compile_native_stdin_raw(&program, "elf_program_src", emitter.to_str().unwrap())
+            .expect("elf_program_src must compile --stdin-raw");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for b in [&counter, &emitter] {
+                let mut perms = fs::metadata(b).unwrap().permissions();
+                perms.set_mode(0o755);
+                fs::set_permissions(b, perms).unwrap();
+            }
+        }
+
+        // `ulimit -s unlimited` is mandatory: the self-hosted tokenizer is
+        // recursive and blows the default 8 MB stack on real source.
+        let run = |bin: &std::path::Path, path: &str| -> (i32, Vec<u8>) {
+            let out = Command::new("sh")
+                .arg("-c")
+                .arg(format!("ulimit -s unlimited; '{}' 0 < '{}'", bin.display(), path))
+                .output()
+                .expect("run the self-hosted binary");
+            (out.status.code().unwrap_or(-1), out.stdout)
+        };
+        let count = |path: &str| -> i64 {
+            let (rc, stdout) = run(&counter, path);
+            assert_eq!(rc, 0, "count_rules must succeed on {path}");
+            String::from_utf8_lossy(&stdout).trim().parse::<i64>()
+                .unwrap_or_else(|_| panic!("count_rules emitted a non-number on {path}"))
+        };
+
+        // 1. SYNTHETIC minimal witness: `hints:` on the FIRST of two rules.
+        //    Pre-fix count: 1 (rule b silently dropped). Post-fix: 2.
+        let synth = tmp.join("hints_two_rules.verbose");
+        fs::write(&synth,
+            "@verbose 0.1.0\n\nrule a\n  logic:\n    out = 7\n  hints:\n    vectorizable : \"scalar\"\n\nrule b\n  logic:\n    out = 9\n").unwrap();
+        assert_eq!(count(synth.to_str().unwrap()), 2,
+            "a `hints:` block on rule a must not swallow rule b");
+
+        // 2. THE SAME PROGRAM WITHOUT `hints:` — the control. If this ever
+        //    diverges from 2 the instrument itself is broken, not the fix.
+        let ctrl = tmp.join("hints_two_rules_ctrl.verbose");
+        fs::write(&ctrl,
+            "@verbose 0.1.0\n\nrule a\n  logic:\n    out = 7\n\nrule b\n  logic:\n    out = 9\n").unwrap();
+        assert_eq!(count(ctrl.to_str().unwrap()), 2,
+            "control: two plain rules must parse as two rules");
+
+        // 3. REAL CORPUS FILES, with their measured pre-fix counts in the
+        //    message so a future regression reads as the same defect.
+        //    showcase carries `hints:` on rules 1 and 5 of 6; business on
+        //    rule 1 of 4; pricing on rule 1 of 2.
+        for (file, want, pre_fix) in [
+            ("examples/showcase.verbose", 6, 1),
+            ("examples/business.verbose", 4, 1),
+            ("examples/pricing.verbose", 2, 1),
+            ("examples/generated.verbose", 3, 1),
+        ] {
+            let got = count(file);
+            assert_eq!(got, want,
+                "{file} must parse as {want} rules, got {got} \
+                 (pre-fix this was {pre_fix} — the `hints:` truncation)");
+        }
+
+        // 4. END TO END: the restored files must actually EMIT again. Post-#141
+        //    they were refused outright (the truncation guard firing), so this
+        //    is the corpus-level statement of the same fix.
+        for file in ["examples/showcase.verbose", "examples/invoices.verbose"] {
+            let (rc, stdout) = run(&emitter, file);
+            assert_eq!(rc, 0, "{file} must emit (exit 0) once `hints:` is consumed");
+            assert!(!stdout.is_empty(), "{file} must emit a non-empty ELF");
+        }
+
+        // 5. NO BLANKET SKIP — the DEDENT discriminator. A STRAY COLUMN-0
+        //    `hints:` block is NOT a rule sub-block and must still be refused by
+        //    #141's guard. `hints` at col 2 and `hints` at col 0 spell the same
+        //    five bytes, so the byte-check alone cannot separate them: the probe
+        //    has to stop at the Dedent that marks the column change. The first
+        //    shape of this fix used `skip_seps_dedent` (which swallows that
+        //    Dedent) and MEASURABLY re-opened #141's hole for this keyword —
+        //    the case below emitted a 263-byte ELF at exit 0. Both rule shapes
+        //    are covered because they take different probe paths in
+        //    `parse_rule_decl_pos`: WITH `proofs:` the probe starts past the
+        //    proofs block, WITHOUT it the probe starts at the raw `logic_end`
+        //    (using `after_logic` there would have lost the Dedents too).
+        let stray_no_proofs = tmp.join("hints_stray_toplevel.verbose");
+        fs::write(&stray_no_proofs,
+            "@verbose 0.1.0\n\nrule a\n  logic:\n    out = 7\n\nhints:\n  vectorizable : \"stray\"\n\nrule b\n  logic:\n    out = 9\n").unwrap();
+        let stray_proofs = tmp.join("hints_stray_toplevel_proofs.verbose");
+        fs::write(&stray_proofs,
+            "@verbose 0.1.0\n\nrule a\n  logic:\n    out = 7\n  proofs:\n    purity:\n      reads : []\n      calls : []\n    termination:\n      bound : 1\n\nhints:\n  vectorizable : \"stray\"\n\nrule b\n  logic:\n    out = 9\n").unwrap();
+        for (label, p) in [
+            ("without a proofs: block", &stray_no_proofs),
+            ("with a proofs: block", &stray_proofs),
+        ] {
+            let (rc, stdout) = run(&emitter, p.to_str().unwrap());
+            assert_eq!((rc, stdout.len()), (1, 0),
+                "a STRAY column-0 `hints:` after a rule {label} must stay refused \
+                 — it is not a rule sub-block");
+        }
+
+        for p in [&synth, &ctrl, &stray_no_proofs, &stray_proofs, &counter, &emitter] {
+            let _ = fs::remove_file(p);
+        }
+    }
+
     /// Self-verify arc V3 (2026-07): THE FINALE — the SELF-COMPILED compiler
     /// verifies before it emits. `elf_program_src` computes the V2 aggregate
     /// (`verrs` = R6a/R6B lint+type diags + R6d purity + termination) over
