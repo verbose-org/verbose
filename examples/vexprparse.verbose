@@ -8615,6 +8615,58 @@ rule span_is_proofs
       bound : 64
 
 
+-- span_is_hints: 1 iff the span src[start..start+len] is exactly the 5 bytes
+-- "hints" (h=104 i=105 n=110 t=116 s=115). Same flat fixed-width shape as
+-- span_is_proofs, length-guarded first. Recognizes the `hints:` block header —
+-- a RULE SUB-BLOCK at the same 2-space column as `proofs:` — so
+-- parse_rule_decl_pos can CONSUME it and land its `next` on the following
+-- TOP-LEVEL item instead of on `hints` (which parse_program would then read as
+-- an unrecognized top-level item and truncate the whole program at).
+--
+-- ==================== SKIPPING IS NOT VERIFYING ====================
+-- This predicate exists so the block can be SKIPPED. gen0 therefore does NOT
+-- verify anything a `hints:` block declares. verbosec (src/verifier.rs +
+-- src/parser.rs) performs at least these checks that gen0 does not:
+--   * `overflow : [min, max]` — the declared bounds are MECHANICALLY CHECKED
+--     against the rule's logic by interval arithmetic (src/verifier.rs, the
+--     `hints.overflow` context). A rule whose arithmetic can leave the declared
+--     range is REJECTED by verbosec; so is `min > max`. gen0 accepts both.
+--   * `vectorizable` / `parallel` / `cache_result` — the justification string
+--     is MANDATORY and must be non-empty; verbosec's parser rejects the bare
+--     keyword form (src/parser.rs). gen0 accepts a bare hint.
+--   * the hint NAME is a CLOSED SET (vectorizable, parallel, cache_result,
+--     overflow) — verbosec rejects anything else, per the project's
+--     closed-attributes rule. gen0 accepts an arbitrary name.
+-- So after this slice gen0 will accept a rule whose `overflow:` bound verbosec
+-- would refuse. That is a real, KNOWN divergence between the two compilers, and
+-- it is accepted deliberately here because the alternative it replaces is
+-- worse: before this slice the same files were SILENTLY TRUNCATED (a rule
+-- carrying `hints:` ended the program walk, and every rule after it vanished
+-- from the emitted binary with exit 0 and no diagnostic). A documented
+-- verification gap is auditable; a silent truncation is not.
+-- Verifying hint contents in gen0 is a SEPARATE LATER SLICE (it needs interval
+-- arithmetic over the parsed logic, which the self-hosted verifier does not yet
+-- have). Until it lands, `hints:` joins `@layer` on the list of declarations
+-- gen0 parses past without checking — see CLAUDE.md, "self-hosted compiler:
+-- known verification gaps".
+-- ===================================================================
+rule span_is_hints
+  @intention: "1 if an Ident span spells exactly \"hints\", 0 otherwise"
+  @source: vexprparse.intent:63
+  input:
+    sc : SpanCheck
+  output:
+    out : number
+  logic:
+    out = if sc.len == 5 and (byte_at(sc.src, sc.start) == 104 and (byte_at(sc.src, sc.start + 1) == 105 and (byte_at(sc.src, sc.start + 2) == 110 and (byte_at(sc.src, sc.start + 3) == 116 and byte_at(sc.src, sc.start + 4) == 115)))) then 1 else 0
+  proofs:
+    purity:
+      reads : [sc.src, sc.start, sc.len]
+      calls : []
+    termination:
+      bound : 64
+
+
 -- Accessors for a RuleDecl (a block-form match is only legal in final position,
 -- so destructuring is factored into tiny rules — like block_binds / pb_block).
 rule rd_name_start
@@ -9627,6 +9679,58 @@ rule pr_next
 -- block, else an empty block (BNil result AstErr). `next` is always the body's
 -- pb_next, so the program loop advances even on a malformed header. One-shot
 -- (delegates body recursion to parse_stmts); bound-only termination.
+--
+-- TRAILING `hints:` (this slice). After the `proofs:` block is skipped, the
+-- cursor can still be sitting on a rule SUB-BLOCK: `hints:` lives at the same
+-- 2-space column as `proofs:` (see examples/invoices.verbose:36). Left
+-- unconsumed, parse_program reads that `hints` token as an unrecognized
+-- TOP-LEVEL item and — pre-#141 — silently truncated the program there; post-#141
+-- it correctly REFUSES the file. Measured truncation before #141: showcase
+-- emitted 1 rule of 6, business 1 of 4, generated 1 of 3, pricing 1 of 2.
+-- (invoices and deadcode carry `hints:` on their LAST rule, so nothing was lost —
+-- correct by luck, not by construction.) So `endp` now runs one more probe: skip
+-- separators, byte-check the lexeme against "hints" (span_is_hints), and if it
+-- matches consume that block with the SAME skip_indented_block used for
+-- `proofs:`. When it does not match, `endp` is the un-advanced `after_proofs` —
+-- so a program with no `hints:` block produces a BYTE-IDENTICAL walk.
+--
+-- WHY THE FIX LIVES HERE AND NOT IN parse_program's `is_skip` FOLD. Two reasons,
+-- both load-bearing:
+--   1. parse_program AND toplevel_junk are a HAND-SYNCED walk pair (see the
+--      banner on toplevel_junk). Both call parse_rule_decl_pos and both advance
+--      by its `next`, so correcting the halt point HERE fixes both BY
+--      CONSTRUCTION — no second edit that a future change could forget.
+--   2. `hints:` is a rule sub-block, not a top-level item. Adding it to
+--      parse_program's is_skip fold would make a STRAY top-level `hints:` block
+--      parse as a legitimate skippable item — re-opening the exact fail-open
+--      hole #141 closed, one level up.
+--
+-- THE DEDENT DISCRIMINATOR — why `skip_seps` and not `skip_seps_dedent`, and
+-- why the probe starts at `h_probe` rather than at `after_logic`. This is the
+-- load-bearing detail of the slice, and the first shape written here got it
+-- WRONG (measured: a stray COLUMN-0 `hints:` block between two rules compiled
+-- to a 263-byte ELF, exit 0 — i.e. the fix had re-opened #141's hole for one
+-- keyword). `hints` the rule sub-block and `hints` the stray top-level item
+-- spell the same five bytes; the ONLY thing that separates them is the column,
+-- and the column survives in the token stream as DEDENT tokens:
+--   * a col-2 `hints:` sits IMMEDIATELY after the DEDENT that balanced the
+--     `proofs:` (or `logic:`) block — there is no further Dedent between them;
+--   * a col-0 item sits behind an EXTRA Dedent (col 2 -> col 0).
+-- So the probe must stop at a Dedent instead of swallowing it:
+--   * `skip_seps` skips Newline (600) + Indent (700) and STOPS at Dedent (800),
+--     so the col-0 case lands on a Dedent, whose peek_start/peek_len are 0/0
+--     and whose span therefore cannot spell "hints" — refused, correctly, by
+--     #141's guard. `skip_seps_dedent` would swallow that Dedent and make the
+--     two cases indistinguishable.
+--   * `h_probe` picks the PRE-dedent cursor for the no-`proofs:` rule shape:
+--     `after_logic` is already `skip_seps_dedent(logic_end)`, so its Dedents
+--     are gone and the discriminator with it — `logic_end` is the raw cell just
+--     past the logic block's balanced close, which still carries them.
+-- Both halves are pinned by the STRAY case in
+-- `self_hosted_parses_all_rules_past_a_trailing_hints_block` (src/native.rs).
+--
+-- KNOWN VERIFICATION GAP: consuming the block is not checking it. See the
+-- banner on span_is_hints for exactly which verbosec checks gen0 forgoes.
 rule parse_rule_decl_pos
   @intention: "Parse a `rule NAME` + `logic:` block starting at ps.pos into a RuleDecl + end index"
   @source: vexprparse.intent:31
@@ -9682,12 +9786,18 @@ rule parse_rule_decl_pos
     let p2len = peek_len(after_logic)
     let is_proofs = span_is_proofs(SpanCheck { src: ps.src, start: p2start, len: p2len })
     let proofs_parsed = if is_proofs == 1 then parse_proofs(ProgramState { cell: after_logic, src: ps.src }) else Proofs::MkProofs { reads: NameList::NmNil, calls: NameList::NmNil, term_kind: 0, term_bound: 0, term_field_start: 0, term_field_len: 0 }
-    let endp = if is_proofs == 1 then skip_indented_block(SkipBlockState { cell: after_logic, depth: 0, seen: 0 }) else after_logic
+    let after_proofs = if is_proofs == 1 then skip_indented_block(SkipBlockState { cell: after_logic, depth: 0, seen: 0 }) else after_logic
+    let h_probe = if is_proofs == 1 then after_proofs else logic_end
+    let h_scan = skip_seps(ParseState { cell: h_probe })
+    let h_start = peek_start(h_scan)
+    let h_len = peek_len(h_scan)
+    let is_hints = span_is_hints(SpanCheck { src: ps.src, start: h_start, len: h_len })
+    let endp = if is_hints == 1 then skip_indented_block(SkipBlockState { cell: h_scan, depth: 0, seen: 0 }) else after_proofs
     out = ParsedRule::MkPR { rule: RuleDecl::MkRule { name_start: name_start, name_len: name_len, params: params, return_type: return_type, body: if hdr_ok == 1 then goodblk else Block::MkBlock { binds: Binding::BNil, result: Ast::AstErr }, input: input_fl, out_name_start: out_name_start, out_name_len: out_name_len, out_ty: out_ty, out_ty_start: out_ty_start, out_ty_len: out_ty_len, proofs: proofs_parsed }, next: endp }
   proofs:
     purity:
       reads : [ps.cell, ps.src]
-      calls : [peek_start, peek_len, span_is_rule, parse_params, pp_params, pp_next, peek_op_code, type_code_of_span, span_is_input, span_is_output, parse_fields, pf_fields, pf_next, fl_head_start, fl_head_len, fl_head_ty, fl_head_ty_start, fl_head_ty_len, span_is_logic, skip_seps, seek_logic, parse_stmts, pb_block, pb_next, skip_indented_block, skip_seps_dedent, span_is_proofs, parse_proofs, advance]
+      calls : [peek_start, peek_len, span_is_rule, parse_params, pp_params, pp_next, peek_op_code, type_code_of_span, span_is_input, span_is_output, parse_fields, pf_fields, pf_next, fl_head_start, fl_head_len, fl_head_ty, fl_head_ty_start, fl_head_ty_len, span_is_logic, skip_seps, seek_logic, parse_stmts, pb_block, pb_next, skip_indented_block, skip_seps_dedent, span_is_proofs, span_is_hints, parse_proofs, advance]
     termination:
       bound : 64
 
