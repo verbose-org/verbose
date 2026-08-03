@@ -38265,6 +38265,164 @@ rule extract_word
         }
     }
 
+    /// `shr` is a LOGICAL shift in every backend — the two-backends-same-AST
+    /// guarantee (CLAUDE.md: "a rule accepted by the compiler is safe under
+    /// both modes; only the execution profile differs") applied to shifts.
+    ///
+    /// This pins a live correctness bug that shipped: native emitted
+    /// `48 D3 E8` (x86 `shr rax, cl`, a LOGICAL shift) while the interpreter
+    /// evaluated `i64::wrapping_shr` (an ARITHMETIC shift), and the optimizer
+    /// folds neither — so `shr(-8, 1)` had two answers, 9223372036854775804
+    /// natively and -4 under `--run`. The external oracle that settles which
+    /// backend is right is Python's `hashlib`: `examples/sha512_fold.verbose`
+    /// on the empty message yields digest byte 0 = 207 natively and under
+    /// `hashlib.sha512(b"").digest()[0]`, but 111 under `--run`. Native (and
+    /// therefore logical) is correct; the interpreter and the Rust
+    /// transpiler were fixed to match, not the other way round.
+    ///
+    /// Three properties are pinned, each of which failed or could silently
+    /// regress on its own:
+    ///   (a) NEGATIVE operands: the sign bit must NOT be replicated.
+    ///   (b) `shl` agrees too (same bit pattern signed or unsigned, but the
+    ///       transpiler's `<<` panicked on out-of-range counts where the
+    ///       interpreter and x86 both masked).
+    ///   (c) count >= 64: x86 masks `cl` to 6 bits for 64-bit operands and
+    ///       Rust's `wrapping_sh*` masks to the same 6 bits — they already
+    ///       agreed, and the fix must not break that.
+    ///
+    /// Explicit expected values are asserted alongside the interpreter
+    /// oracle so a simultaneous interpreter+native regression cannot cancel
+    /// out (same discipline as `streaming_print_chain_native_matches_interpreter`).
+    #[test]
+    fn shift_semantics_logical_and_identical_across_backends() {
+        // Explicit `[-1000000, 1000000]` on `v`: without a declared range the
+        // optimizer assumes `[0, i32::MAX]` and would reason about the shift
+        // under an interval that excludes every negative case this pins.
+        let src = "\
+@verbose 0.1.0
+
+concept Sh
+  @intention: \"a value and a shift count\"
+  @source: bit_ops.intent:1
+  fields:
+    v : number [-1000000, 1000000]
+    n : number [0, 128]
+
+rule do_shr
+  @intention: \"logical right shift\"
+  @source: bit_ops.intent:1
+  input:
+    s : Sh
+  output:
+    out : number
+  logic:
+    out = shr(s.v, s.n)
+  proofs:
+    purity:
+      reads : [s.v, s.n]
+      calls : []
+    termination:
+      bound : 1
+
+rule do_shl
+  @intention: \"left shift\"
+  @source: bit_ops.intent:1
+  input:
+    s : Sh
+  output:
+    out : number
+  logic:
+    out = shl(s.v, s.n)
+  proofs:
+    purity:
+      reads : [s.v, s.n]
+      calls : []
+    termination:
+      bound : 1
+";
+        let tokens = crate::lexer::Lexer::new(src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+        let all_rules: Vec<&crate::ast::Rule> = program.items.iter().filter_map(|i| match i {
+            crate::ast::Item::Rule(r) => Some(r),
+            _ => None,
+        }).collect();
+        let concepts: Vec<&crate::ast::Concept> =
+            crate::ast::iter_all_concepts(&program.items).collect();
+
+        // (rule, v, n, expected) — expected computed INDEPENDENTLY in Python
+        // as the LOGICAL shift on the 64-bit two's-complement bit pattern with
+        // the count masked to 6 bits:
+        //   M = (1<<64)-1
+        //   shr(v, n) = sign(((v & M) >> (n & 63)) & M)
+        //   shl(v, n) = sign(((v & M) << (n & 63)) & M)
+        // so the table is not a transcription of whatever this compiler does.
+        let cases: &[(&str, i64, i64, i64)] = &[
+            // (a) negative operand: `shr` must zero-fill, not sign-fill.
+            ("do_shr", -8, 1, 9223372036854775804),
+            ("do_shr", -1, 63, 1),
+            ("do_shr", -1000000, 4, 1152921504606784476),
+            // positive operands: logical and arithmetic agree, kept as a
+            // control so a "make everything zero" regression is visible.
+            ("do_shr", 8, 1, 4),
+            ("do_shr", 1000000, 10, 976),
+            // (c) count >= 64 masks to 6 bits — 64 is a no-op, 65 shifts by 1.
+            ("do_shr", -8, 64, -8),
+            ("do_shr", -8, 65, 9223372036854775804),
+            ("do_shr", 100, 64, 100),
+            // (b) shl, including negative operands and the masking edge.
+            ("do_shl", -8, 1, -16),
+            ("do_shl", 1, 63, i64::MIN),
+            ("do_shl", -1, 63, i64::MIN),
+            ("do_shl", 5, 64, 5),
+            ("do_shl", 5, 65, 10),
+            ("do_shl", 1000000, 3, 8000000),
+        ];
+
+        for rule_name in ["do_shr", "do_shl"] {
+            let rule = *all_rules.iter().find(|r| r.name == rule_name).unwrap();
+            let out = std::env::temp_dir().join(format!("verbosec_test_shift_{}", rule_name));
+            compile_native(&program, rule_name, out.to_str().unwrap(), false, false)
+                .expect("shift rule must compile natively");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o755));
+            }
+            for (r, v, n, expected) in cases.iter().filter(|c| c.0 == rule_name) {
+                // Interpreter.
+                let mut input = std::collections::HashMap::new();
+                input.insert("v".to_string(), crate::interpreter::Value::Number(*v));
+                input.insert("n".to_string(), crate::interpreter::Value::Number(*n));
+                let interp = match crate::interpreter::eval_rule(rule, &all_rules, &concepts, &input) {
+                    Ok(crate::interpreter::Value::Number(x)) => x,
+                    other => panic!("{}({}, {}) interpreter must return a number; got {:?}", r, v, n, other),
+                };
+                // Native: two argv slots = one record (v, n).
+                let run = std::process::Command::new(&out)
+                    .args([v.to_string(), n.to_string()])
+                    .output()
+                    .expect("native shift binary must run");
+                assert!(run.status.success(), "{}({}, {}) must exit 0; got {:?}", r, v, n, run.status);
+                let native: i64 = String::from_utf8_lossy(&run.stdout).trim().parse()
+                    .unwrap_or_else(|e| panic!("{}({}, {}) native stdout parse: {e} (raw {:?})",
+                        r, v, n, String::from_utf8_lossy(&run.stdout)));
+
+                assert_eq!(
+                    interp, native,
+                    "{}({}, {}): interpreter and native must agree — `shr`/`shl` are \
+                     LOGICAL shifts in every backend (interpreter={}, native={})",
+                    r, v, n, interp, native
+                );
+                assert_eq!(
+                    native, *expected,
+                    "{}({}, {}): expected the logical-shift value {} (got {})",
+                    r, v, n, expected, native
+                );
+            }
+            let _ = std::fs::remove_file(&out);
+        }
+    }
+
     #[test]
     fn sha256_primitives_match_python_reference() {
         let src = std::fs::read_to_string("examples/sha256_prims.verbose")
@@ -44593,6 +44751,122 @@ rule two
         for f in [&gen0, &reordered, &gen1, &gen2, &r1_o0, &r1_o1, &cp, &c0, &c1] {
             let _ = fs::remove_file(f);
         }
+    }
+
+    /// THE CORPUS SWEEP — how much of `examples/` the self-hosted compiler
+    /// accepts, as a NUMBER THIS REPO PRODUCES rather than a claim in a commit
+    /// message.
+    ///
+    /// Why this test exists: the "N/151" figure has been the headline evidence
+    /// for several self-hosting slices (PR #141: 70 -> 63; PR #142: 63 -> 69)
+    /// and until now it lived ONLY in prose. Nothing in the repo computed it,
+    /// so nothing could contradict it, and a slice could claim a jump nobody
+    /// could re-derive. Worse, the failure mode PR #141 fixed — gen0 halting
+    /// mid-file and emitting a TRUNCATED binary at exit 0 — was invisible to a
+    /// pass/fail count for as long as it existed. This test makes the number
+    /// mechanical: it fails loudly the moment acceptance moves in either
+    /// direction, and the message tells you how to move it deliberately.
+    ///
+    /// What "accepted" means here, precisely: gen0 (verbosec's own native
+    /// emission of `examples/vexprparse.verbose`, entry `elf_program_src`,
+    /// `--stdin-raw`) reads the file on stdin and exits 0 having written an
+    /// ELF to stdout. It does NOT mean the emitted binary is correct, and it
+    /// does NOT mean gen0 verified everything verbosec would — the gaps are
+    /// catalogued in CLAUDE.md ("Self-hosted compiler (gen0): known
+    /// verification gaps"). Byte-identity and run-correctness of gen0's output
+    /// are the fixed-point test's job (R0/R1/R2 above); this test measures
+    /// BREADTH only.
+    ///
+    /// `ulimit -s unlimited` is mandatory: the emit recurses over the source
+    /// blob and the ~1.3 MB self-source overflows the 8 MB default stack. The
+    /// shell-out raises it, so callers do not have to.
+    ///
+    /// Named with the `two_generation` prefix so the existing CI
+    /// `self-hosting-bootstrap` job (filter `two_generation`) picks it up with
+    /// no workflow change. `#[ignore]` for the same reason as its neighbours:
+    /// it builds gen0 and then runs it 151 times.
+    ///
+    ///   cargo test --release -- --ignored --test-threads=1 two_generation_corpus
+    #[test]
+    #[ignore = "builds gen0 then emits all 151 examples + needs `ulimit -s unlimited`; ~1 min; run with --ignored"]
+    #[cfg(target_arch = "x86_64")]
+    fn two_generation_corpus_acceptance_sweep() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        // The asserted figure. Bump it — in the same commit as the slice that
+        // moves it — only after reading the refused list this test prints.
+        const EXPECTED_ACCEPTED: usize = 69;
+        const EXPECTED_TOTAL: usize = 151;
+
+        let src = fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let gen0 = std::env::temp_dir().join("verbosec_test_corpus_gen0");
+        compile_native_stdin_raw(&program, "elf_program_src", gen0.to_str().unwrap())
+            .expect("elf_program_src must compile --stdin-raw");
+        let mut perms = fs::metadata(&gen0).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&gen0, perms).unwrap();
+
+        // Deterministic order so the refused list is diffable run to run.
+        let mut examples: Vec<std::path::PathBuf> = fs::read_dir("examples")
+            .expect("examples/ must exist")
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().map(|x| x == "verbose").unwrap_or(false))
+            .collect();
+        examples.sort();
+
+        let out_elf = std::env::temp_dir().join("verbosec_test_corpus_out.elf");
+        let mut accepted: Vec<String> = Vec::new();
+        let mut refused: Vec<String> = Vec::new();
+        for path in &examples {
+            let name = path.file_name().unwrap().to_string_lossy().to_string();
+            let status = Command::new("sh")
+                .arg("-c")
+                .arg(format!(
+                    "ulimit -s unlimited; '{}' 0 < '{}' > '{}' 2>/dev/null",
+                    gen0.display(), path.display(), out_elf.display()
+                ))
+                .status()
+                .expect("run gen0 over a corpus file");
+            if status.success() { accepted.push(name); } else { refused.push(name); }
+        }
+
+        assert_eq!(
+            examples.len(), EXPECTED_TOTAL,
+            "corpus size changed: examples/ now holds {} .verbose files, not {}. \
+             Adding or removing an example moves this denominator — update \
+             EXPECTED_TOTAL (and almost certainly EXPECTED_ACCEPTED) in the \
+             same commit.",
+            examples.len(), EXPECTED_TOTAL
+        );
+
+        assert_eq!(
+            accepted.len(), EXPECTED_ACCEPTED,
+            "SELF-HOSTED CORPUS ACCEPTANCE MOVED: {}/{} accepted, expected {}/{}.\n\
+             \n\
+             This is the scoreboard, not a flaky check. Read the direction before touching it:\n\
+             \n\
+               * WENT UP — a slice widened what gen0 accepts. Confirm the newly\n\
+                 accepted files are accepted for the RIGHT reason (a real parse +\n\
+                 emit, not a halt that silently truncates the program — that is\n\
+                 exactly the defect PR #141 fixed and PR #142 hit again), then\n\
+                 bump EXPECTED_ACCEPTED in the same commit and say so in the body.\n\
+               * WENT DOWN — a regression, unless the slice deliberately converted\n\
+                 a silent mis-acceptance into an honest refusal. If deliberate,\n\
+                 lower EXPECTED_ACCEPTED and name the files in the commit body.\n\
+             \n\
+             Refused ({} files):\n  {}\n",
+            accepted.len(), examples.len(), EXPECTED_ACCEPTED, EXPECTED_TOTAL,
+            refused.len(), refused.join("\n  ")
+        );
+
+        let _ = fs::remove_file(&gen0);
+        let _ = fs::remove_file(&out_elf);
     }
 
     /// THE COMPOSITE DEMO (2026-07): examples/expense_audit.verbose — a

@@ -2058,6 +2058,42 @@ fn check_expr_against(
                 ),
             });
         }
+        // The bitwise primitives — `band` / `bor` / `bxor` / `shl` / `shr`
+        // (two number children) and `bnot` (one). All produce number.
+        //
+        // These arms exist for the OPERANDS, not the result: `infer_expr_type`
+        // already reports Number for every bitwise node, so the catch-all was
+        // checking the outer type. What it never did was RECURSE, so
+        // `band(p.name, p.n)` on a text field passed verification while the
+        // structurally identical `min(p.name, p.n)` was rejected. Recursing
+        // with expected=Number closes that asymmetry — same shape as the
+        // Min/Max arms directly above.
+        (Expr::BitAnd(l, r), Type::Number)
+        | (Expr::BitOr(l, r), Type::Number)
+        | (Expr::BitXor(l, r), Type::Number)
+        | (Expr::Shl(l, r), Type::Number)
+        | (Expr::Shr(l, r), Type::Number) => {
+            check_expr_against(l, &Type::Number, rule, all_rules, input_concept, all_concepts, errors);
+            check_expr_against(r, &Type::Number, rule, all_rules, input_concept, all_concepts, errors);
+        }
+        (Expr::BitNot(inner), Type::Number) => {
+            check_expr_against(inner, &Type::Number, rule, all_rules, input_concept, all_concepts, errors);
+        }
+        (Expr::BitAnd(_, _), other)
+        | (Expr::BitOr(_, _), other)
+        | (Expr::BitXor(_, _), other)
+        | (Expr::BitNot(_), other)
+        | (Expr::Shl(_, _), other)
+        | (Expr::Shr(_, _), other) => {
+            errors.push(VerifyError {
+                context: format!("rule '{}' / logic", rule.name),
+                message: format!(
+                    "{} produces number but the expected type is '{}'",
+                    describe_expr_kind(expr),
+                    type_display(other),
+                ),
+            });
+        }
         // `substring(<text>, <start>, <end>)` produces text. When the context
         // expects text, recurse into the first child with expected=Text and
         // into start/end with expected=Number so non-conforming argument types
@@ -4203,6 +4239,112 @@ rule important_invoice
     fn happy_path() {
         let errs = verify_str(VALID);
         assert!(errs.is_empty(), "expected no errors, got {:#?}", errs);
+    }
+
+    /// `check_expr_against` must type-check bitwise OPERANDS, not just the
+    /// bitwise result. `infer_expr_type` has always reported Number for every
+    /// bitwise node, so the catch-all arm covered the result — but with no
+    /// dedicated arm there was no recursion into the children, and
+    /// `band(p.name, p.n)` on a text field verified clean while the
+    /// structurally identical `min(p.name, p.n)` was rejected.
+    ///
+    /// All six ops are swept: a missing arm on any one of them silently
+    /// reopens the hole for that op alone.
+    #[test]
+    fn bitwise_operands_are_type_checked() {
+        // `reads:` is derived from the logic so the purity check never fires
+        // and the only error a case can produce is the type error under test.
+        let program = |logic: &str| -> String {
+            let mut reads: Vec<&str> = Vec::new();
+            if logic.contains("p.name") { reads.push("p.name"); }
+            if logic.contains("p.n)") || logic.contains("p.n,") { reads.push("p.n"); }
+            format!(
+                r#"@verbose 0.1.0
+
+concept P
+  @intention: "x"
+  @source: invoices.intent:1
+  fields:
+    name : text
+    n : number [0, 100]
+
+rule r
+  @intention: "y"
+  @source: invoices.intent:1
+  input:
+    p : P
+  output:
+    out : number
+  logic:
+    out = {logic}
+  proofs:
+    purity:
+      reads   : [{}]
+      calls   : []
+    termination:
+      bound : 10
+"#,
+                reads.join(", ")
+            )
+        };
+
+        // A text operand in any position of any bitwise op is a type error.
+        for bad in [
+            "band(p.name, p.n)", "band(p.n, p.name)",
+            "bor(p.name, p.n)",  "bor(p.n, p.name)",
+            "bxor(p.name, p.n)", "bxor(p.n, p.name)",
+            "shl(p.name, p.n)",  "shl(p.n, p.name)",
+            "shr(p.name, p.n)",  "shr(p.n, p.name)",
+            "bnot(p.name)",
+        ] {
+            let errs = verify_str(&program(bad));
+            assert!(
+                errs.iter().any(|e| e.message.contains("has type 'text' but context expects 'number'")),
+                "`{bad}` must be rejected for its text operand; got {errs:#?}"
+            );
+        }
+
+        // Number operands stay clean — the arms must not false-positive.
+        for good in [
+            "band(p.n, 15)", "bor(p.n, 1)", "bxor(p.n, p.n)",
+            "shl(p.n, 4)", "shr(p.n, 4)", "bnot(p.n)",
+            "bor(shl(p.n, 4), band(p.n, 15))",
+        ] {
+            let errs = verify_str(&program(good));
+            assert!(errs.is_empty(), "`{good}` must verify clean; got {errs:#?}");
+        }
+
+        // A bitwise expression in a non-number context is still a mismatch,
+        // and the message names the op (not a generic "expression").
+        let text_out = r#"@verbose 0.1.0
+
+concept P
+  @intention: "x"
+  @source: invoices.intent:1
+  fields:
+    n : number [0, 100]
+
+rule r
+  @intention: "y"
+  @source: invoices.intent:1
+  input:
+    p : P
+  output:
+    out : text
+  logic:
+    out = bxor(p.n, 1)
+  proofs:
+    purity:
+      reads   : [p.n]
+      calls   : []
+    termination:
+      bound : 1
+"#;
+        let errs = verify_str(text_out);
+        assert!(
+            errs.iter().any(|e| e.message.contains("bxor produces number but the expected type is 'text'")),
+            "bitwise in a text context must be rejected by name; got {errs:#?}"
+        );
     }
 
     #[test]

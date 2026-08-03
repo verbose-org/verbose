@@ -1074,6 +1074,19 @@ fn eval_expr(
                 _ => Err(RuntimeError { message: "bnot: number arg required".into() }),
             }
         }
+        // `shl` / `shr` are LOGICAL shifts on the 64-bit two's-complement bit
+        // pattern, matching what native emits (`shl rax, cl` / `shr rax, cl`).
+        // `wrapping_sh*` masks the count to 6 bits, exactly as x86 masks `cl`
+        // for 64-bit operands, so the count>=64 edge agrees across backends.
+        //
+        // For `shl` the signed and unsigned bit patterns are identical, so
+        // `i64::wrapping_shl` is already the logical shift. For `shr` they are
+        // NOT: `i64::wrapping_shr` is an ARITHMETIC shift that replicates the
+        // sign bit, which is why the cast through u64 is load-bearing here.
+        // (This divergence shipped: `shr(-8, 1)` used to be -4 under `--run`
+        // and 9223372036854775804 natively. The oracle that settled it was
+        // Python's hashlib on examples/sha512_fold.verbose — see
+        // `shift_semantics_logical_and_identical_across_backends`.)
         Expr::Shl(a, b) => {
             let av = eval_expr(a, env, all_rules, concepts)?;
             let bv = eval_expr(b, env, all_rules, concepts)?;
@@ -1086,7 +1099,9 @@ fn eval_expr(
             let av = eval_expr(a, env, all_rules, concepts)?;
             let bv = eval_expr(b, env, all_rules, concepts)?;
             match (av, bv) {
-                (Value::Number(x), Value::Number(y)) => Ok(Value::Number(x.wrapping_shr(y as u32))),
+                (Value::Number(x), Value::Number(y)) => {
+                    Ok(Value::Number((x as u64).wrapping_shr(y as u32) as i64))
+                }
                 _ => Err(RuntimeError { message: "shr: number args required".into() }),
             }
         }
