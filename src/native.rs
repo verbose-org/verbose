@@ -43949,6 +43949,102 @@ rule two
         let _ = fs::remove_file(&bin);
     }
 
+    /// FAIL-OPEN REGRESSION PIN: the self-hosted emitter must never silently
+    /// truncate a program at a top-level item it does not recognize.
+    ///
+    /// `parse_program` (examples/vexprparse.verbose) ends its RuleList with
+    /// `RNil` BOTH at a legitimate Eof AND at any unrecognized top-level item.
+    /// The two were therefore indistinguishable, so everything after such an
+    /// item was silently dropped while the emitter still exited 0 with a bogus
+    /// ELF. This ALREADY RECURRED ONCE: records-arc brick R1 patched exactly
+    /// this silent stop for `concept` ("a `concept` declaration silently
+    /// dropped every rule after it") but left the general case open — which is
+    /// why the fix carries a pin instead of only a corpus number.
+    ///
+    /// Two orthogonal manifestations, both gated in `verrs`:
+    ///   * the walk halts at a NON-Eof token (`toplevel_junk`) — mid-file
+    ///     truncation, e.g. a `use "..."` line or an unsupported `hints:` block;
+    ///   * the walk halts at a legitimate Eof having consed ZERO rules
+    ///     (`rule_list_len(prog) == 0`) — an empty/rule-less source, which
+    ///     produced a 221-byte ELF whose _start jumped into an absent proc and
+    ///     SIGSEGV'd. An empty file tokenizes to exactly [Eof], so it halts at a
+    ///     REAL end-of-input and `toplevel_junk` correctly reports 0 there — the
+    ///     second conjunct is genuinely a separate defect, not the same one.
+    ///
+    /// Every assertion below was a measured fail-open BEFORE the fix.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn self_hosted_refuses_truncation_at_unrecognized_toplevel_item() {
+        use std::fs;
+        use std::process::Command;
+
+        let src = fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let bin = std::env::temp_dir().join("verbosec_test_toplevel_junk_gen0");
+        compile_native_stdin_raw(&program, "elf_program_src", bin.to_str().unwrap())
+            .expect("elf_program_src must compile --stdin-raw");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&bin).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&bin, perms).unwrap();
+        }
+
+        let tmp = std::env::temp_dir();
+        // Returns (exit_code, emitted_byte_count).
+        let emit = |name: &str, body: &str| -> (i32, usize) {
+            let p = tmp.join(name);
+            fs::write(&p, body).unwrap();
+            let out = Command::new("sh")
+                .arg("-c")
+                .arg(format!("ulimit -s unlimited; '{}' 0 < '{}'", bin.display(), p.display()))
+                .output()
+                .expect("run the self-hosted emitter");
+            (out.status.code().unwrap_or(-1), out.stdout.len())
+        };
+
+        // 1. EMPTY source: zero rules, so there is no entry proc to emit.
+        //    Pre-fix: exit 0 + a 221-byte ELF that SIGSEGVs when run.
+        let (rc, n) = emit("tj_empty.verbose", "");
+        assert_eq!((rc, n), (1, 0),
+            "an EMPTY program must be refused (exit 1, zero bytes), not emitted as a bogus ELF");
+
+        // 2. A `use` line BETWEEN two rules: the classic mid-file truncation.
+        //    Pre-fix: exit 0, and `rule b` was silently dropped from the binary.
+        let (rc, n) = emit("tj_mid_use.verbose",
+            "@verbose 0.1.0\n\nrule a\n  logic:\n    out = 7\n\nuse \"stdlib/finance.verbose\"\n\nrule b\n  logic:\n    out = 9\n");
+        assert_eq!((rc, n), (1, 0),
+            "an unrecognized top-level item BETWEEN rules must be refused, not silently truncated");
+
+        // 3. The same program WITHOUT the `use` line still emits — the guard
+        //    must reject junk, not every program (no blanket refusal).
+        let (rc, n) = emit("tj_clean.verbose",
+            "@verbose 0.1.0\n\nrule a\n  logic:\n    out = 7\n\nrule b\n  logic:\n    out = 9\n");
+        assert_eq!(rc, 0, "a clean two-rule program must still emit");
+        assert!(n > 0, "a clean two-rule program must emit a non-empty ELF");
+
+        // 4. The walk must reach EOF on the FULL self-source — the go/no-go
+        //    invariant behind the whole fix. If this ever fails, the guard is
+        //    refusing the compiler's own source and the bootstrap is broken.
+        let out = Command::new("sh")
+            .arg("-c")
+            .arg(format!(
+                "ulimit -s unlimited; '{}' 0 < examples/vexprparse.verbose", bin.display()))
+            .output()
+            .expect("self-compile");
+        assert!(out.status.success() && !out.stdout.is_empty(),
+            "the self-source must still pass the guard and emit (status {:?}, {} bytes)",
+            out.status, out.stdout.len());
+
+        for f in ["tj_empty.verbose", "tj_mid_use.verbose", "tj_clean.verbose"] {
+            let _ = fs::remove_file(tmp.join(f));
+        }
+        let _ = fs::remove_file(&bin);
+    }
+
     /// Self-verify arc V3 (2026-07): THE FINALE — the SELF-COMPILED compiler
     /// verifies before it emits. `elf_program_src` computes the V2 aggregate
     /// (`verrs` = R6a/R6B lint+type diags + R6d purity + termination) over

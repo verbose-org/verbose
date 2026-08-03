@@ -9758,6 +9758,102 @@ rule parse_program
       bound : 512
 
 
+-- ============================================================================
+-- toplevel_junk: THE HALT-POINT GUARD for parse_program. Hand-synced walk pair.
+--
+-- THE DEFECT IT CLOSES (fail-open, a RECURRENCE of the bug R1 patched for
+-- `concept` only). parse_program's third arm is `else RuleList::RNil` — and RNil
+-- is ALSO how a legitimate end-of-input terminates the list. The two are
+-- therefore INDISTINGUISHABLE to every caller: an unrecognized top-level item
+-- (`use "..."`, a typo'd keyword, a stray lexeme) ends the RuleList exactly like
+-- Eof does, and every rule after it is SILENTLY DROPPED. Measured before this
+-- rule existed, with gen0 = the self-hosted emitter:
+--   * an EMPTY program emitted a 221-byte ELF, exit 0, that SIGSEGVs when run
+--     (verbosec correctly refuses it: "expected '@verbose', got EOF");
+--   * examples/app.verbose (whose 3rd line is `use "stdlib/finance.verbose"`)
+--     emitted the same bogus 221-byte ELF, exit 0 — delete the `use` line and
+--     the same file correctly refuses;
+--   * `rule a` / `use ...` / `rule b` emitted 242 B instead of 263 B — rule b
+--     silently gone, no diagnostic, exit 0.
+--
+-- WHY THE GUARD LIVES HERE AND NOT IN THE AGGREGATE. The tempting cheap check is
+-- `count_rules(prog) == 0` inside verrs. That catches ONLY the empty-program
+-- manifestation and leaves mid-file truncation just as silent (the `rule a` /
+-- `use` / `rule b` case has count 1, not 0 — it passes). The DISCRIMINATION
+-- POINT is parse_program's third arm, and that is the single place all three
+-- manifestations route through: stopping at a non-Eof token is an error,
+-- stopping at Eof is not. Guarding the cause catches every manifestation.
+--
+-- THE EOF PREDICATE is `peek_kind(hp) == 0`, and it is a REAL end-of-stream test,
+-- not a proxy:
+--   * peek_kind(cell) = tok_kind(head_tok(cell)), and head_tok(Nil) = Token::Eof
+--     (so an exhausted cons-list reads as Eof, no separate Nil case needed);
+--   * tok_kind maps EVERY non-Eof variant into a nonzero band — Ident=100,
+--     Keyword=200+kw, Num=300, Op=400+code, Str=500, Newline=600, Indent=700,
+--     Dedent=800, IndentErr=900, ByteLit=1000 — and `Eof => 0` alone yields 0.
+--     (Keyword's kw and Op's code are both >= 1: a zero classification is what
+--     makes the lexer emit an Ident / not-an-Op instead, so neither band can
+--     alias down onto 0.)
+--   Hence peek_kind == 0 <=> the cursor is at Eof or past the end. This is the
+--   SAME predicate skip_indented_block already uses as its hard backstop
+--   (`let is_eof = if knd == 0 then 1 else 0`) — established convention, not a
+--   new invention. NOTE `peek_len == 0` is NOT an EOF test: peek_len returns 0
+--   on a Keyword, an Op, a Newline, an Indent and a Dedent too.
+--
+-- THE MIRROR. Arm-for-arm identical to parse_program: same skip_seps_dedent,
+-- same seven span_is_* probes, same is_skip fold, same `endp` from
+-- parse_rule_decl_pos's structural `next`, same skip_end from
+-- skip_indented_block. Only the ARM BODIES differ — parse_program conses a
+-- RuleDecl where this counts nothing, and where parse_program returns RNil this
+-- classifies the halt. Because the cursor advances identically, this rule halts
+-- at EXACTLY the cell parse_program halts at, by construction rather than by
+-- testing. The pair MUST be edited together: a new recognized top-level item
+-- added to parse_program's is_skip fold and not to this one turns into a false
+-- refusal of every program using it.
+--
+-- TOTALITY (the eager-let trap: a refused shape is still evaluated before
+-- abort_if fires, so this walk must not diverge on garbage). It is a pure
+-- token-level scan — no `match` on Ast, so no missing-arm hole. `pr` is eager
+-- exactly as in parse_program, so it costs one extra rule-decl parse per rule;
+-- the whole term sits inside verrs' arena_scope, whose bump-pointer restore
+-- reclaims every node it allocates. parse_rule_decl_pos only runs where the
+-- cursor literally spells `rule`, so this walk cannot recurse anywhere
+-- parse_program would not: if parse_program terminates on an input, so does
+-- this. Forward-index recursion toward the finite token end; bound + the
+-- mandatory recursion breadcrumb, same backstop as parse_program's.
+-- ============================================================================
+rule toplevel_junk
+  @intention: "1 if the top-level walk halts at a token that is not end-of-input (an unrecognized top-level item silently truncating the program), 0 if it halts at Eof"
+  @source: vexprparse.intent:31
+  input:
+    ps : ProgramState
+  output:
+    out : number
+  logic:
+    let hp = skip_seps_dedent(ParseState { cell: ps.cell })
+    let kw_start = peek_start(hp)
+    let kw_len = peek_len(hp)
+    let is_rule = span_is_rule(SpanCheck { src: ps.src, start: kw_start, len: kw_len })
+    let is_concept = span_is_concept(SpanCheck { src: ps.src, start: kw_start, len: kw_len })
+    let is_concept_group = span_is_concept_group(SpanCheck { src: ps.src, start: kw_start, len: kw_len })
+    let is_resource = span_is_resource(SpanCheck { src: ps.src, start: kw_start, len: kw_len })
+    let is_reaction = span_is_reaction(SpanCheck { src: ps.src, start: kw_start, len: kw_len })
+    let is_connection = span_is_connection(SpanCheck { src: ps.src, start: kw_start, len: kw_len })
+    let is_service = span_is_service(SpanCheck { src: ps.src, start: kw_start, len: kw_len })
+    let is_skip = if is_concept == 1 then 1 else if is_concept_group == 1 then 1 else if is_resource == 1 then 1 else if is_reaction == 1 then 1 else if is_connection == 1 then 1 else is_service
+    let pr = parse_rule_decl_pos(ProgramState { cell: hp, src: ps.src })
+    let endp = pr_next(pr)
+    let skip_end = if is_skip == 1 then skip_indented_block(SkipBlockState { cell: hp, depth: 0, seen: 0 }) else hp
+    let knd = peek_kind(hp)
+    out = if is_rule == 1 then toplevel_junk(ProgramState { cell: endp, src: ps.src }) else (if is_skip == 1 then toplevel_junk(ProgramState { cell: skip_end, src: ps.src }) else (if knd == 0 then 0 else 1))
+  proofs:
+    purity:
+      reads : [ps.cell, ps.src]
+      calls : [skip_seps_dedent, peek_start, peek_len, peek_kind, span_is_rule, span_is_concept, span_is_concept_group, span_is_resource, span_is_reaction, span_is_connection, span_is_service, parse_rule_decl_pos, pr_next, skip_indented_block, toplevel_junk]
+    termination:
+      bound : 512
+
+
 -- rule_list_len: the number of rule declarations in a parsed program. Structural
 -- recursion on the RuleList tail (Phase C), like count_binds on a Binding list.
 rule rule_list_len
@@ -30027,12 +30123,32 @@ rule elf_program_src
     -- Effects tier slice 1: resource_errors joins the aggregate — declaration
     -- shape violations, the resource/text-field caps, malformed or undeclared
     -- read( sites, and the input-less-entry refusal all refuse emission.
+    -- FAIL-OPEN FIX: toplevel_junk leads the aggregate. parse_program ends its
+    -- RuleList with RNil BOTH at a legitimate Eof AND at any top-level item it
+    -- does not recognize (`use "..."`, a typo'd keyword) — indistinguishable, so
+    -- everything after such an item was silently truncated and the emitter still
+    -- exited 0 with a bogus ELF. toplevel_junk re-walks the same cursor with the
+    -- same arms and returns 1 when the walk halts at a non-Eof token, so this
+    -- aggregate refuses instead. It guards the DISCRIMINATION POINT, which is why
+    -- it catches mid-file truncation too — a `count_rules(prog) == 0` check here
+    -- would only ever have caught the empty-program case.
+    -- The second conjunct is the ORTHOGONAL manifestation, and it is genuinely a
+    -- SEPARATE defect rather than the same one seen twice: an EMPTY (or rule-less)
+    -- source tokenizes to exactly [Eof], so parse_program halts at a LEGITIMATE
+    -- end-of-input and toplevel_junk correctly reports 0 — there is no junk token
+    -- to find. What is wrong there is not where the walk stopped but WHAT IT
+    -- PRODUCED: an empty RuleList has no entry rule, and the emitter used to
+    -- happily wrap that in a 221-byte ELF (exit 0) whose _start jumps into an
+    -- absent proc and SIGSEGVs. Measured on examples/app.verbose, both defects
+    -- fire at once — the `use` line truncates it to zero rules — which is exactly
+    -- how one guard could look sufficient while leaving the other hole open.
+    -- Emitting a program with no rule to enter is refused here.
     let ress = parse_resources(ProgramState { cell: toks, src: s.source })
     let conns = parse_connections(ProgramState { cell: toks, src: s.source })
     -- Effects tier slice 2a: the reaction list — used by reaction_errors (verify)
     -- AND by the has_reaction emit branch + blob_end_off sizing (emit).
     let rxs = parse_reactions(ProgramState { cell: toks, src: s.source })
-    let verrs = arena_scope(diag_count(prog_diags(ProgDiagsState { iter: prog, full: prog, src: s.source, idx: 0, concepts: if has_service == 1 then http_concepts else concepts0 })) + purity_list(PurityListState { iter: prog, full: prog, src: s.source }) + term_list(TermListState { iter: prog, src: s.source }) + resource_errors(ResErrState { prog: prog, ress: ress, concepts: concepts0, src: s.source }) + reaction_errors(RxErrState { prog: prog, rxs: rxs, src: s.source, concepts: concepts0 }) + connection_errors(ConnErrState { prog: prog, ress: ress, conns: conns, src: s.source }) + service_errors(ServiceErrState { prog: prog, svcs: svcs, concepts: concepts0, ress: ress, conns: conns, rxs: rxs, src: s.source }))
+    let verrs = arena_scope(toplevel_junk(ProgramState { cell: toks, src: s.source }) + (if rule_list_len(prog) == 0 then 1 else 0) + diag_count(prog_diags(ProgDiagsState { iter: prog, full: prog, src: s.source, idx: 0, concepts: if has_service == 1 then http_concepts else concepts0 })) + purity_list(PurityListState { iter: prog, full: prog, src: s.source }) + term_list(TermListState { iter: prog, src: s.source }) + resource_errors(ResErrState { prog: prog, ress: ress, concepts: concepts0, src: s.source }) + reaction_errors(RxErrState { prog: prog, rxs: rxs, src: s.source, concepts: concepts0 }) + connection_errors(ConnErrState { prog: prog, ress: ress, conns: conns, src: s.source }) + service_errors(ServiceErrState { prog: prog, svcs: svcs, concepts: concepts0, ress: ress, conns: conns, rxs: rxs, src: s.source }))
     let sizes = proc_sizes(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: ProcSizeList::PSNil, ress: ress, conns: conns, rxs: rxs, svcs: svcs })
     let uses_var = program_uses_arena(concepts)
     let anytx = prog_any_texty(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: sizes, ress: ress, conns: conns, rxs: rxs, svcs: svcs })
@@ -30076,7 +30192,7 @@ rule elf_program_src
   proofs:
     purity:
       reads : [s.source]
-      calls : [begin_tokenize, parse_program, parse_concepts, parse_resources, parse_reactions, parse_connections, parse_services, resource_errors, reaction_errors, reaction_list_len, x86_reaction_tramp, resource_marshal_size, x86_resource_marshal, program_uses_result, concepts_append_result, concepts_append_http, service_list_len, svc_head, svc_handler_start, svc_handler_len, find_rule, rd_input, rd_out_ty_start, rd_out_ty_len, service_errors, x86_service_tramp, diag_count, prog_diags, purity_list, term_list, proc_sizes, program_uses_arena, prog_any_texty, entry_rule_texty, entry_rule_bytes, entry_rule_result, entry_rule_collection, max_payload_fields, program_uses_text, blob_end_off, x86_program, src_blob, param_list_len, rl_head_params, fields_to_params, rl_head_input, params_to_fields, find_concept_index, fl_head_ty_start, fl_head_ty_len, x86_argv_marshal, x86_stdin_marshal, field_list_has_text, cd_fields, concept_at_index, connection_errors, connection_marshal_size, x86_connection_marshal]
+      calls : [begin_tokenize, parse_program, toplevel_junk, rule_list_len, parse_concepts, parse_resources, parse_reactions, parse_connections, parse_services, resource_errors, reaction_errors, reaction_list_len, x86_reaction_tramp, resource_marshal_size, x86_resource_marshal, program_uses_result, concepts_append_result, concepts_append_http, service_list_len, svc_head, svc_handler_start, svc_handler_len, find_rule, rd_input, rd_out_ty_start, rd_out_ty_len, service_errors, x86_service_tramp, diag_count, prog_diags, purity_list, term_list, proc_sizes, program_uses_arena, prog_any_texty, entry_rule_texty, entry_rule_bytes, entry_rule_result, entry_rule_collection, max_payload_fields, program_uses_text, blob_end_off, x86_program, src_blob, param_list_len, rl_head_params, fields_to_params, rl_head_input, params_to_fields, find_concept_index, fl_head_ty_start, fl_head_ty_len, x86_argv_marshal, x86_stdin_marshal, field_list_has_text, cd_fields, concept_at_index, connection_errors, connection_marshal_size, x86_connection_marshal]
     termination:
       bound : 256
 
