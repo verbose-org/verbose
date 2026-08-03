@@ -260,8 +260,24 @@ fn emit_expr(expr: &Expr, input_name: &str, concept: Option<&Concept>) -> String
         Expr::BitOr(a, b) => format!("({} | {})", emit_expr(a, input_name, concept), emit_expr(b, input_name, concept)),
         Expr::BitXor(a, b) => format!("({} ^ {})", emit_expr(a, input_name, concept), emit_expr(b, input_name, concept)),
         Expr::BitNot(i) => format!("!({})", emit_expr(i, input_name, concept)),
-        Expr::Shl(a, b) => format!("({} << ({} as u32))", emit_expr(a, input_name, concept), emit_expr(b, input_name, concept)),
-        Expr::Shr(a, b) => format!("({} >> ({} as u32))", emit_expr(a, input_name, concept), emit_expr(b, input_name, concept)),
+        // `shl` / `shr` are LOGICAL shifts on the 64-bit two's-complement bit
+        // pattern, matching what native emits and what the interpreter
+        // evaluates. Every number in the transpiled Rust is an `i64`, so:
+        //   - `<<` on i64 already gives the logical bit pattern, but the bare
+        //     operator PANICS (debug) / is UB-shaped (release) once the count
+        //     reaches 64, where native and the interpreter both mask to 6
+        //     bits. `wrapping_shl` masks, so all three agree.
+        //   - `>>` on i64 is an ARITHMETIC shift (sign-replicating), which is
+        //     the wrong answer: the cast through u64 is load-bearing.
+        // See `shift_semantics_logical_and_identical_across_backends`.
+        Expr::Shl(a, b) => format!(
+            "({}).wrapping_shl(({}) as u32)",
+            emit_expr(a, input_name, concept), emit_expr(b, input_name, concept)
+        ),
+        Expr::Shr(a, b) => format!(
+            "((({}) as u64).wrapping_shr(({}) as u32) as i64)",
+            emit_expr(a, input_name, concept), emit_expr(b, input_name, concept)
+        ),
         Expr::Call(name, _args) => {
             if let Some(c) = concept {
                 let fields: Vec<&str> = c.fields.iter().map(|f| f.name.as_str()).collect();
