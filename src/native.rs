@@ -2397,6 +2397,76 @@ fn emit_bounds_check(code: &mut Vec<u8>, min: i64, max: i64, abort_patches: &mut
     code.extend_from_slice(&[0, 0, 0, 0]);
 }
 
+/// Runtime input bounds-check for TEXT fields — the missing half of
+/// `emit_bounds_check` (2026-08-05, security fix).
+///
+/// A field declared `name : text [..N]` carries `range = Some((0, N))`,
+/// where N is a MAX BYTE LENGTH. Several emitters EXPLOIT that declaration
+/// to size a stack buffer at compile time (`emit_concat_to_buffer_impl`'s
+/// `static_total += max_len`, its `2 * max_len` json_escape sibling, and
+/// `emit_text_fold_program`'s `static_per_element += max_len`). Nothing
+/// enforced the bound at runtime, so the FILL pass wrote the ACTUAL bytes
+/// into a buffer sized from the DECLARED bound: an argv-controlled stack
+/// overflow whose payload is fully attacker-chosen. Declaring `[..N]` —
+/// the thing that is supposed to add rigor — was what opted a program into
+/// the unchecked static path; an UNBOUNDED field took the runtime-strlen
+/// path and was safe.
+///
+/// This closes it at the source: the declaration becomes true, so every
+/// downstream consumer that trusts it is trusting something enforced.
+///
+/// On entry: rdi = pointer to a NUL-terminated text value (as delivered by
+/// argv, by `--stdin`'s token reader, or by `--stdin-raw`'s NUL-terminated
+/// mmap blob). rdi is PRESERVED — the caller still has to store it.
+/// On out-of-bound input, jump to the shared sys_exit(1) abort tail.
+///
+/// The scan is BOUNDED at `max + 1` bytes rather than a full `strlen`:
+/// we only need to know whether a NUL appears within the declared budget,
+/// and an unbounded scan over an adversarial multi-megabyte argument would
+/// be work the declaration says we never have to do. `repne scasb` stops
+/// on the first NUL (ZF=1, length ≤ max ⇒ accept) or on rcx hitting zero
+/// without a match (ZF=0, length > max ⇒ abort). `pop` does not touch
+/// flags, so the `jne` after it reads the scan's result.
+///
+/// Size: push(1) + mov rcx,imm64(10) + xor eax,eax(2) + cld(1) +
+/// repne scasb(2) + pop(1) + jne rel32(6) = 23 bytes per bounded Text
+/// field. Fields without an explicit `[..N]` stay unchecked and take the
+/// existing runtime-sized path, so this slice is purely additive: a
+/// program with no bounded text input field compiles byte-for-byte
+/// identically.
+fn emit_text_bound_check(code: &mut Vec<u8>, max: i64, abort_patches: &mut Vec<usize>) {
+    // push rdi — preserve the pointer across the scan (scasb advances rdi)
+    code.push(0x57);
+    // mov rcx, max + 1  — scan budget: a NUL at index `max` is still legal
+    code.push(0x48);
+    code.push(0xB9);
+    code.extend_from_slice(&max.saturating_add(1).to_le_bytes());
+    // xor eax, eax — scan target is the NUL byte
+    code.extend_from_slice(&[0x31, 0xC0]);
+    // cld — clear DF so scasb increments rdi
+    code.push(0xFC);
+    // repne scasb
+    code.extend_from_slice(&[0xF2, 0xAE]);
+    // pop rdi — restore the pointer (does not affect flags)
+    code.push(0x5F);
+    // jne rel32 — ZF=0 means no NUL within max+1 bytes ⇒ length > max
+    code.extend_from_slice(&[0x0F, 0x85]);
+    abort_patches.push(code.len());
+    code.extend_from_slice(&[0, 0, 0, 0]);
+}
+
+/// Return the declared max byte length of a text-typed input field, or
+/// `None` when the field is not text or carries no `[..N]` bound. The
+/// single place that decides "this field's declared bound is load-bearing
+/// and must be enforced" — every field-load emitter calls it so the six
+/// prologues cannot drift apart.
+fn text_field_declared_max(field: &Field) -> Option<i64> {
+    match field.ty {
+        Type::Text => field.range.map(|(_, max)| max),
+        _ => None,
+    }
+}
+
 fn emit_resource_abort_tail(code: &mut Vec<u8>, abort_patches: &[usize]) {
     if abort_patches.is_empty() {
         return;
@@ -3427,6 +3497,12 @@ fn emit_record_loop_prologue<'a>(
 
     // ─── Read context fields (if any) ONCE before the record loop ──
     // Context fields go to rbp slots at the top of the frame (before input slots).
+    // `resource_abort_patches` is declared HERE (rather than just above the
+    // resource loop, where it used to live) because the text-bound checks in
+    // this loop and in the input-field loop below both patch into the same
+    // end-of-binary sys_exit(1) tail. One abort mechanism, three failure
+    // modes: resource I/O, out-of-range Number input, over-long Text input.
+    let mut resource_abort_patches: Vec<usize> = Vec::new();
     let mut ctx_offsets: HashMap<&str, i32> = HashMap::new();
     if let Some(ctx) = context_concept {
         for (i, f) in ctx.fields.iter().enumerate() {
@@ -3438,7 +3514,12 @@ fn emit_record_loop_prologue<'a>(
                     emit_atoi_inline(code);
                     store_rax_at_rbp(code, offset);
                 }
-                Type::Text => store_rdi_at_rbp(code, offset),
+                Type::Text => {
+                    if let Some(max) = text_field_declared_max(f) {
+                        emit_text_bound_check(code, max, &mut resource_abort_patches);
+                    }
+                    store_rdi_at_rbp(code, offset)
+                }
                 _ => {
                     return Err(NativeError {
                         message: format!("context field '{}' has unsupported type", f.name),
@@ -3458,7 +3539,6 @@ fn emit_record_loop_prologue<'a>(
     // freed by `mov rsp, rbp; pop rbp` in the epilogue). open/read failure
     // patches into the shared abort label emitted by emit_record_loop_epilogue.
     let mut text_bindings: TextBindings<'a> = HashMap::new();
-    let mut resource_abort_patches: Vec<usize> = Vec::new();
     let mut resource_next_slot: i32 = -((base + n_reserved as i32 + 1) * 8);
     for r in &referenced_resources {
         let (ptr_slot, len_slot, _buf_slot, new_next) = emit_resource_read_sequence(
@@ -3732,6 +3812,14 @@ fn emit_record_loop_prologue<'a>(
                 }
             }
             Type::Text => {
+                // Runtime input bounds-check for text (2026-08-05). Symmetric
+                // with the Number arm above: a declared `[..N]` is enforced
+                // before the rule body can read the field, so the emitters
+                // that SIZE buffers from that declaration are trusting a
+                // fact rather than an assertion.
+                if let Some(max) = text_field_declared_max(field) {
+                    emit_text_bound_check(code, max, &mut resource_abort_patches);
+                }
                 // The pointer is already in rdi — stash it directly.
                 // mov [rbp + offset], rdi
                 if offset >= -128 {
@@ -10017,7 +10105,16 @@ fn emit_collection_program(
                 emit_atoi_inline(&mut code);
                 store_rax_at_rbp(&mut code, offset);
             }
-            Type::Text => store_rdi_at_rbp(&mut code, offset),
+            Type::Text => {
+                // Runtime text-bound enforcement (2026-08-05) — see
+                // `emit_text_bound_check`. Declared `[..N]` is what lets
+                // the sizing passes reserve a compile-time buffer, so it
+                // has to be true before the body reads the field.
+                if let Some(max) = text_field_declared_max(f) {
+                    emit_text_bound_check(&mut code, max, &mut resource_abort_patches);
+                }
+                store_rdi_at_rbp(&mut code, offset)
+            }
             _ => unreachable!(),
         }
         code.extend_from_slice(&[0x49, 0xFF, 0xC6]); // inc r14
@@ -10068,7 +10165,17 @@ fn emit_collection_program(
                         emit_atoi_inline(&mut code);
                         store_rax_at_rbp(&mut code, offset);
                     }
-                    Type::Text => store_rdi_at_rbp(&mut code, offset),
+                    Type::Text => {
+                        // Runtime text-bound enforcement (2026-08-05) — see
+                        // `emit_text_bound_check`. Per-element text fields
+                        // feed `emit_text_fold_program`'s
+                        // `static_per_element += max_len`, where an
+                        // over-long element overflows once PER ELEMENT.
+                        if let Some(max) = text_field_declared_max(f) {
+                            emit_text_bound_check(&mut code, max, &mut resource_abort_patches);
+                        }
+                        store_rdi_at_rbp(&mut code, offset)
+                    }
                     _ => unreachable!(),
                 }
                 code.extend_from_slice(&[0x49, 0xFF, 0xC6]); // inc r14
@@ -10457,7 +10564,16 @@ fn emit_fold_program(
                 emit_atoi_inline(&mut code);
                 store_rax_at_rbp(&mut code, offset);
             }
-            Type::Text => store_rdi_at_rbp(&mut code, offset),
+            Type::Text => {
+                // Runtime text-bound enforcement (2026-08-05) — see
+                // `emit_text_bound_check`. Declared `[..N]` is what lets
+                // the sizing passes reserve a compile-time buffer, so it
+                // has to be true before the body reads the field.
+                if let Some(max) = text_field_declared_max(f) {
+                    emit_text_bound_check(&mut code, max, &mut resource_abort_patches);
+                }
+                store_rdi_at_rbp(&mut code, offset)
+            }
             _ => unreachable!(),
         }
         code.extend_from_slice(&[0x49, 0xFF, 0xC6]); // inc r14
@@ -10511,7 +10627,16 @@ fn emit_fold_program(
                 emit_atoi_inline(&mut code);
                 store_rax_at_rbp(&mut code, offset);
             }
-            Type::Text => store_rdi_at_rbp(&mut code, offset),
+            Type::Text => {
+                // Runtime text-bound enforcement (2026-08-05) — see
+                // `emit_text_bound_check`. Declared `[..N]` is what lets
+                // the sizing passes reserve a compile-time buffer, so it
+                // has to be true before the body reads the field.
+                if let Some(max) = text_field_declared_max(f) {
+                    emit_text_bound_check(&mut code, max, &mut resource_abort_patches);
+                }
+                store_rdi_at_rbp(&mut code, offset)
+            }
             _ => unreachable!(),
         }
         code.extend_from_slice(&[0x49, 0xFF, 0xC6]); // inc r14
@@ -10735,6 +10860,11 @@ fn emit_fold_bytes_program(
                 }
             }
             Type::Text => {
+                // Runtime text-bound enforcement (2026-08-05) — see
+                // `emit_text_bound_check`.
+                if let Some(max) = text_field_declared_max(f) {
+                    emit_text_bound_check(&mut code, max, &mut resource_abort_patches);
+                }
                 // store argv pointer at the field slot
                 if offset >= -128 {
                     code.extend_from_slice(&[0x48, 0x89, 0x7D]);
@@ -11139,7 +11269,16 @@ fn emit_multi_fold_program(
         code.extend_from_slice(&[0x4B, 0x8B, 0x7C, 0xF5, 0x00]); // mov rdi, [r13+r14*8]
         match f.ty {
             Type::Number => { emit_atoi_inline(&mut code); store_rax_at_rbp(&mut code, offset); }
-            Type::Text => store_rdi_at_rbp(&mut code, offset),
+            Type::Text => {
+                // Runtime text-bound enforcement (2026-08-05) — see
+                // `emit_text_bound_check`. Declared `[..N]` is what lets
+                // the sizing passes reserve a compile-time buffer, so it
+                // has to be true before the body reads the field.
+                if let Some(max) = text_field_declared_max(f) {
+                    emit_text_bound_check(&mut code, max, &mut resource_abort_patches);
+                }
+                store_rdi_at_rbp(&mut code, offset)
+            }
             _ => unreachable!(),
         }
         code.extend_from_slice(&[0x49, 0xFF, 0xC6]); // inc r14
@@ -11190,7 +11329,16 @@ fn emit_multi_fold_program(
         code.extend_from_slice(&[0x4B, 0x8B, 0x7C, 0xF5, 0x00]); // mov rdi, [r13+r14*8]
         match f.ty {
             Type::Number => { emit_atoi_inline(&mut code); store_rax_at_rbp(&mut code, offset); }
-            Type::Text => store_rdi_at_rbp(&mut code, offset),
+            Type::Text => {
+                // Runtime text-bound enforcement (2026-08-05) — see
+                // `emit_text_bound_check`. Declared `[..N]` is what lets
+                // the sizing passes reserve a compile-time buffer, so it
+                // has to be true before the body reads the field.
+                if let Some(max) = text_field_declared_max(f) {
+                    emit_text_bound_check(&mut code, max, &mut resource_abort_patches);
+                }
+                store_rdi_at_rbp(&mut code, offset)
+            }
             _ => unreachable!(),
         }
         code.extend_from_slice(&[0x49, 0xFF, 0xC6]); // inc r14
@@ -11691,7 +11839,16 @@ fn emit_text_fold_program(
                 emit_atoi_inline(&mut code);
                 store_rax_at_rbp(&mut code, offset);
             }
-            Type::Text => store_rdi_at_rbp(&mut code, offset),
+            Type::Text => {
+                // Runtime text-bound enforcement (2026-08-05) — see
+                // `emit_text_bound_check`. Declared `[..N]` is what lets
+                // the sizing passes reserve a compile-time buffer, so it
+                // has to be true before the body reads the field.
+                if let Some(max) = text_field_declared_max(f) {
+                    emit_text_bound_check(&mut code, max, &mut resource_abort_patches);
+                }
+                store_rdi_at_rbp(&mut code, offset)
+            }
             _ => unreachable!(),
         }
         code.extend_from_slice(&[0x49, 0xFF, 0xC6]); // inc r14
@@ -11954,7 +12111,16 @@ fn emit_text_fold_program(
                 emit_atoi_inline(&mut code);
                 store_rax_at_rbp(&mut code, offset);
             }
-            Type::Text => store_rdi_at_rbp(&mut code, offset),
+            Type::Text => {
+                // Runtime text-bound enforcement (2026-08-05) — see
+                // `emit_text_bound_check`. Declared `[..N]` is what lets
+                // the sizing passes reserve a compile-time buffer, so it
+                // has to be true before the body reads the field.
+                if let Some(max) = text_field_declared_max(f) {
+                    emit_text_bound_check(&mut code, max, &mut resource_abort_patches);
+                }
+                store_rdi_at_rbp(&mut code, offset)
+            }
             _ => unreachable!(),
         }
         code.extend_from_slice(&[0x49, 0xFF, 0xC6]); // inc r14
@@ -19517,6 +19683,60 @@ fn emit_http10_dynamic_bytes(
 fn emit_http_parse_method_path(code: &mut Vec<u8>, buf_offset_from_rbp: i32) -> Vec<usize> {
     let mut fail_patches = Vec::new();
 
+    // Declared bounds of the built-in HttpRequest concept, read from the
+    // concept itself so the parser and the sizer can never disagree about
+    // what `method : text [..8]` / `path : text [..256]` mean.
+    //
+    // These two bounds are EXPLOITED for compile-time buffer sizing — a
+    // handler body or `log:` content containing `concat(..., req.path)` or
+    // `json_escape(req.path)` reserves `256` / `2*256` bytes on the accept
+    // frame and then fills with the ACTUAL bytes. Until this check existed
+    // the wire could deliver a path of up to `max_request` bytes, so
+    // `GET /AAAA…(3000 bytes) HTTP/1.0` overflowed the reserved buffer by
+    // thousands of attacker-chosen bytes — remotely, unauthenticated, on
+    // every service using those (very common) shapes.
+    //
+    // A request whose method or path exceeds its declared bound is treated
+    // as MALFORMED: it joins the existing `fail_patches` list, which the
+    // caller wires to the close-connection label. Per-request fail-closed,
+    // no response, no process exit — an over-long path must not be a way
+    // to take the listener down.
+    let builtin = http_request_builtin_concept_native();
+    let declared_max = |name: &str| -> i32 {
+        builtin
+            .fields
+            .iter()
+            .find(|f| f.name == name)
+            .and_then(|f| f.range)
+            .map(|(_, max)| max as i32)
+            .expect("built-in HttpRequest method/path carry a declared [..N] bound")
+    };
+    let method_max = declared_max("method");
+    let path_max = declared_max("path");
+
+    // Emit `len = rbx - [rbp + start_slot]; if len > max { goto fail }`.
+    // r8 is free at both call sites: the method check runs before the path
+    // scan loop's first write to r8b, and the path check runs after that
+    // loop has exited (r8b holds the already-tested delimiter byte).
+    fn emit_token_len_guard(
+        code: &mut Vec<u8>,
+        start_slot_disp8: u8,
+        max: i32,
+        fail_patches: &mut Vec<usize>,
+    ) {
+        // mov r8, rbx
+        code.extend_from_slice(&[0x49, 0x89, 0xD8]);
+        // sub r8, [rbp + start_slot]
+        code.extend_from_slice(&[0x4C, 0x2B, 0x45, start_slot_disp8]);
+        // cmp r8, max
+        code.extend_from_slice(&[0x49, 0x81, 0xF8]);
+        code.extend_from_slice(&max.to_le_bytes());
+        // jg fail (rel32) — signed: len is a non-negative byte count
+        code.extend_from_slice(&[0x0F, 0x8F]);
+        fail_patches.push(code.len());
+        code.extend_from_slice(&[0, 0, 0, 0]);
+    }
+
     // rbx = buf start = rbp + buf_offset
     code.extend_from_slice(&[0x48, 0x8D, 0x9D]);                         // lea rbx, [rbp + disp32]
     code.extend_from_slice(&buf_offset_from_rbp.to_le_bytes());
@@ -19548,6 +19768,9 @@ fn emit_http_parse_method_path(code: &mut Vec<u8>, buf_offset_from_rbp: i32) -> 
     // method_end:
     let method_end = code.len();
     code[patch_method_end] = (method_end - patch_method_end - 1) as u8;
+    // Enforce `method : text [..8]` — rbx points at the delimiting space,
+    // [rbp-8] at the token start, so their difference is the byte length.
+    emit_token_len_guard(code, 0xF8 /* rbp-8 */, method_max, &mut fail_patches);
     // mov byte [rbx], 0
     code.extend_from_slice(&[0xC6, 0x03, 0x00]);
     // inc rbx; dec rax
@@ -19595,6 +19818,9 @@ fn emit_http_parse_method_path(code: &mut Vec<u8>, buf_offset_from_rbp: i32) -> 
     for patch in &[patch_path_end_space, patch_path_end_cr, patch_path_end_lf] {
         code[*patch] = (path_end - patch - 1) as u8;
     }
+    // Enforce `path : text [..256]` — same shape as the method guard, with
+    // the token start at [rbp-16].
+    emit_token_len_guard(code, 0xF0 /* rbp-16 */, path_max, &mut fail_patches);
     // mov byte [rbx], 0
     code.extend_from_slice(&[0xC6, 0x03, 0x00]);
 
@@ -36331,6 +36557,378 @@ rule echo
         assert!(r.status.success(), "unbounded field must accept large value");
         assert_eq!(String::from_utf8_lossy(&r.stdout).trim(), "123456789");
         let _ = std::fs::remove_file(&out);
+    }
+
+    /// SECURITY REGRESSION (2026-08-05) — argv-controlled stack buffer
+    /// overflow via an unenforced declared TEXT bound.
+    ///
+    /// `emit_concat_to_buffer_impl` sizes a stack buffer from a text
+    /// field's declared `[..N]` (`static_total += max_len`) and then
+    /// FILLS it with the actual bytes recovered by a runtime `strlen`.
+    /// Nothing enforced `N`, so `tag : text [..8]` with
+    /// `out = concat("[", b.tag, "]")` reserved 16 bytes and copied
+    /// however many bytes the caller supplied.
+    ///
+    /// The overflow was CONTROLLED, not merely a crash: the fill byte
+    /// became the process exit code, because the copy runs up over the
+    /// frame slots the exit path reads.
+    ///
+    ///     8 bytes of 'A' -> exit 0 (correct output)
+    ///    64 bytes of 'A' -> exit 65   (0x41 == 'A')
+    ///    64 bytes of 'B' -> exit 66   (0x42 == 'B')
+    ///    64 bytes of 'Z' -> exit 90   (0x5A == 'Z')
+    ///    64 bytes of '0' -> exit 48   (0x30 == '0')
+    ///   512 bytes of 'A' -> exit 65
+    ///
+    /// Perversely, an UNBOUNDED field was SAFE — it takes the runtime-
+    /// strlen sizing path. Declaring the bound is what opted the program
+    /// into the unchecked static path.
+    ///
+    /// This test asserts the exit code is exactly 1 (the shared
+    /// sys_exit(1) abort) and explicitly NOT the attacker's fill byte,
+    /// on every input channel that reaches the field-load prologues:
+    /// argv, `--stdin` (token reader) and `--stdin-raw` (mmap blob).
+    /// All three converge on the same `mov rdi, [r13+r14*8]` loops, so
+    /// one check per loop covers all of them.
+    ///
+    /// Pre-fix this test FAILS on the very first over-long case.
+    #[test]
+    fn runtime_text_bound_check_rejects_overlong_input_on_every_channel() {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+
+        let src = |bound: &str| {
+            format!(
+                r#"@verbose 0.1.0
+
+concept Bounded
+  @intention: "b"
+  @source: invoices.intent:1
+  fields:
+    tag : text{bound}
+
+rule tag_line
+  @intention: "t"
+  @source: invoices.intent:1
+  input:
+    b : Bounded
+  output:
+    line : text
+  logic:
+    line = concat("[", b.tag, "]")
+  proofs:
+    purity:
+      reads : [b.tag]
+      calls : []
+    termination:
+      bound : 1
+"#
+            )
+        };
+        let build = |text: &str, name: &str, stdin: bool| -> std::path::PathBuf {
+            let tokens = crate::lexer::Lexer::new(text).tokenize().unwrap();
+            let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+            let out = std::env::temp_dir().join(name);
+            compile_native(&program, "tag_line", out.to_str().unwrap(), stdin, false)
+                .expect("bounded text rule must compile");
+            out
+        };
+
+        // ── channel 1: argv ───────────────────────────────────────────
+        let argv_bin = build(&src(" [..8]"), "verbosec_test_textbound_argv", false);
+        let run_argv = |arg: &str| -> std::process::Output {
+            Command::new(&argv_bin).arg(arg).output().expect("spawn argv probe")
+        };
+
+        // In-bound input still works, byte-for-byte.
+        let ok = run_argv("AAAAAAAA"); // exactly 8 == the declared max
+        assert!(ok.status.success(), "8 bytes is within [..8]; got {:?}", ok.status);
+        assert_eq!(
+            String::from_utf8_lossy(&ok.stdout).trim(),
+            "[AAAAAAAA]",
+            "in-bound input must still produce the correct output"
+        );
+        let ok = run_argv("A");
+        assert!(ok.status.success(), "1 byte is within [..8]");
+        assert_eq!(String::from_utf8_lossy(&ok.stdout).trim(), "[A]");
+
+        // Over-long input: exit 1, and NOT the attacker's fill byte.
+        for (len, fill) in [(64usize, 'A'), (64, 'B'), (64, 'Z'), (64, '0'), (512, 'A'), (9, 'A')] {
+            let arg: String = std::iter::repeat(fill).take(len).collect();
+            let r = run_argv(&arg);
+            let code = r.status.code();
+            assert_eq!(
+                code,
+                Some(1),
+                "argv: {} bytes of '{}' must sys_exit(1); got {:?}. \
+                 An exit code of {} would be the attacker's fill byte — \
+                 the declared [..8] bound is not being enforced.",
+                len,
+                fill,
+                code,
+                fill as u32
+            );
+            assert_ne!(
+                code,
+                Some(fill as i32),
+                "argv: exit code equals the attacker's fill byte '{}' ({}) — \
+                 this is the controlled stack overflow, not a clean refusal",
+                fill,
+                fill as u32
+            );
+            assert!(
+                r.stdout.is_empty(),
+                "argv: an over-long input must produce NO output (the rule body \
+                 must not run); got {:?}",
+                String::from_utf8_lossy(&r.stdout)
+            );
+        }
+        let _ = std::fs::remove_file(&argv_bin);
+
+        // ── channel 2: --stdin (whitespace token reader) ──────────────
+        let stdin_bin = build(&src(" [..8]"), "verbosec_test_textbound_stdin", true);
+        let run_stdin = |input: &str| -> std::process::Output {
+            let mut child = Command::new(&stdin_bin)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("spawn stdin probe");
+            child.stdin.as_mut().unwrap().write_all(input.as_bytes()).unwrap();
+            drop(child.stdin.take());
+            child.wait_with_output().expect("wait stdin probe")
+        };
+        let ok = run_stdin("AAAAAAAA\n");
+        assert!(ok.status.success(), "--stdin: 8 bytes is within [..8]");
+        assert_eq!(String::from_utf8_lossy(&ok.stdout).trim(), "[AAAAAAAA]");
+        let over: String = std::iter::repeat('A').take(64).collect();
+        let r = run_stdin(&format!("{}\n", over));
+        assert_eq!(
+            r.status.code(),
+            Some(1),
+            "--stdin channel must enforce the same [..8] bound as argv; got {:?}",
+            r.status
+        );
+        let _ = std::fs::remove_file(&stdin_bin);
+
+        // ── channel 3: --stdin-raw (verbatim mmap blob) ───────────────
+        // The raw channel explicitly reuses the argv text-field ABI (a
+        // NUL-terminated pointer in one slot), so it flows through the
+        // same prologue check. This is the channel with the widest gap
+        // between a small declared bound and the deliverable size: the
+        // blob can be up to 4 MiB.
+        {
+            let text = src(" [..8]");
+            let tokens = crate::lexer::Lexer::new(&text).tokenize().unwrap();
+            let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+            let out = std::env::temp_dir().join("verbosec_test_textbound_stdinraw");
+            compile_native_stdin_raw(&program, "tag_line", out.to_str().unwrap())
+                .expect("bounded text rule must compile with --stdin-raw");
+            let run_raw = |input: &str| -> std::process::Output {
+                let mut child = Command::new(&out)
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .expect("spawn stdin-raw probe");
+                child.stdin.as_mut().unwrap().write_all(input.as_bytes()).unwrap();
+                drop(child.stdin.take());
+                child.wait_with_output().expect("wait stdin-raw probe")
+            };
+            let ok = run_raw("AAAAAAAA");
+            assert!(ok.status.success(), "--stdin-raw: 8 bytes is within [..8]");
+            assert_eq!(String::from_utf8_lossy(&ok.stdout).trim(), "[AAAAAAAA]");
+            let blob: String = std::iter::repeat('A').take(100_000).collect();
+            let r = run_raw(&blob);
+            assert_eq!(
+                r.status.code(),
+                Some(1),
+                "--stdin-raw: a 100 KB blob into a [..8] field must sys_exit(1); got {:?}",
+                r.status
+            );
+            let _ = std::fs::remove_file(&out);
+        }
+
+        // ── control: an UNBOUNDED text field is unchanged ─────────────
+        // No `[..N]` means no check is emitted and the concat sizes at
+        // runtime (the path that was always safe). Purely-additive proof.
+        let unbounded_bin = build(&src(""), "verbosec_test_textbound_unbounded", false);
+        let long: String = std::iter::repeat('A').take(512).collect();
+        let r = Command::new(&unbounded_bin).arg(&long).output().expect("spawn unbounded");
+        assert!(
+            r.status.success(),
+            "an UNBOUNDED text field must keep accepting long input (runtime-sized \
+             path, unchanged by this slice); got {:?}",
+            r.status
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&r.stdout).trim().len(),
+            514,
+            "unbounded field output must be the full [ + 512 + ]"
+        );
+        let _ = std::fs::remove_file(&unbounded_bin);
+    }
+
+    /// SECURITY REGRESSION (2026-08-05) — the REMOTE instance of the same
+    /// unenforced-text-bound defect.
+    ///
+    /// The compiler-owned `HttpRequest` concept declares
+    /// `method : text [..8]` and `path : text [..256]`, and the emitter
+    /// EXPLOITS those bounds for compile-time buffer sizing whenever a
+    /// handler body or `log:` content contains `concat(..., req.path)` or
+    /// `json_escape(req.path)` — shapes used by essentially every
+    /// production-shaped example in this repo (`audit_gateway`,
+    /// `policy_proxy`, `body_content_gate`, `echo_path`, …).
+    ///
+    /// `emit_http_parse_method_path` never compared either token against
+    /// its declared bound, so the wire could deliver up to `max_request`
+    /// bytes. Measured pre-fix against `examples/echo_path.verbose`
+    /// (`concat("got GET on ", req.path)`, buffer reserved at
+    /// 11 + 256 -> 272 bytes): a 3001-byte path was echoed back in full,
+    /// i.e. ~2740 attacker-chosen bytes written past the buffer, over the
+    /// network, unauthenticated.
+    ///
+    /// After the fix an over-long method or path is treated as a
+    /// MALFORMED request: the connection closes with no response and the
+    /// listener keeps serving. Deliberately NOT sys_exit(1) — an
+    /// over-long path must not be a remote kill switch.
+    ///
+    /// Pre-fix this test FAILS: the 257-byte path gets a 200 response.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn http_request_declared_text_bounds_enforced_at_parse() {
+        use std::fs;
+        use std::io::{Read, Write};
+        use std::net::{TcpListener, TcpStream};
+        use std::process::Command;
+        use std::time::Duration;
+
+        let port = {
+            let l = TcpListener::bind(("127.0.0.1", 0)).expect("bind ephemeral");
+            l.local_addr().unwrap().port()
+        };
+        // Handler echoes req.path through concat — the exact shape whose
+        // buffer is sized from the declared [..256].
+        let src = format!(
+            r#"@verbose 0.1.0
+
+rule echo_handler
+  @intention: "h"
+  @source: invoices.intent:1
+  input:
+    req : HttpRequest
+  output:
+    resp : HttpResponse
+  logic:
+    resp = HttpResponse {{ status: 200, body: concat("got ", req.path) }}
+  proofs:
+    purity:
+      reads : [req.path]
+      calls : []
+    termination:
+      bound : 1
+
+service echo_server
+  @intention: "s"
+  @source: invoices.intent:1
+  listen:
+    protocol : http_1_0
+    port : {}
+    max_request : 4096
+  handler: echo_handler
+"#,
+            port
+        );
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+        let out = std::env::temp_dir().join("verbosec_test_http_text_bound");
+        compile_service(&program, "echo_server", out.to_str().unwrap())
+            .expect("echo service must compile");
+
+        let mut child = Command::new(&out).spawn().expect("spawn echo service");
+        let addr: std::net::SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
+        let mut bound = false;
+        for _ in 0..50 {
+            if TcpStream::connect_timeout(&addr, Duration::from_millis(100)).is_ok() {
+                bound = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(bound, "service never bound on port {}", port);
+
+        let request = |raw: &[u8]| -> Vec<u8> {
+            let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).expect("connect");
+            s.set_read_timeout(Some(Duration::from_secs(2))).ok();
+            s.write_all(raw).expect("write request");
+            let mut buf = Vec::new();
+            let _ = s.read_to_end(&mut buf);
+            buf
+        };
+        let get_path = |n: usize| -> Vec<u8> {
+            let p: String = std::iter::repeat('A').take(n).collect();
+            request(format!("GET /{} HTTP/1.0\r\n\r\n", p).as_bytes())
+        };
+
+        // Collect EVERY response before asserting, then kill the server.
+        // A panic between spawn and kill would leave the child holding the
+        // test harness's inherited stdout, and cargo would hang waiting for
+        // EOF rather than reporting the failure.
+        //
+        // path length INCLUDES the leading '/', so n chars of 'A' is n+1.
+        // 255 'A's -> 256 bytes, exactly the declared max.
+        let at_max = get_path(255);
+        // 256 'A's -> 257 bytes, one over.
+        let over = get_path(256);
+        // The original attack size.
+        let attack = get_path(3000);
+        // Method bound: `method : text [..8]`.
+        let m_ok = request(b"OPTIONSX /x HTTP/1.0\r\n\r\n"); // 8 bytes
+        let m_over = request(b"OPTIONSXY /x HTTP/1.0\r\n\r\n"); // 9 bytes
+        // The listener must SURVIVE every refusal — an over-long path is
+        // not allowed to be a remote kill switch.
+        let after = get_path(3);
+
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = fs::remove_file(&out);
+
+        assert!(
+            at_max.starts_with(b"HTTP/1.0 200 OK"),
+            "a path of exactly 256 bytes (the declared max) must still be served; got {:?}",
+            String::from_utf8_lossy(&at_max[..at_max.len().min(60)])
+        );
+
+        assert!(
+            over.is_empty(),
+            "a 257-byte path exceeds the declared [..256] and must close the \
+             connection with NO response; got {} bytes: {:?}",
+            over.len(),
+            String::from_utf8_lossy(&over[..over.len().min(80)])
+        );
+
+        assert!(
+            attack.is_empty(),
+            "a 3001-byte path must be refused (pre-fix this echoed ~2740 bytes \
+             past the reserved buffer); got {} bytes",
+            attack.len()
+        );
+
+        assert!(
+            m_ok.starts_with(b"HTTP/1.0 200 OK"),
+            "an 8-byte method (the declared max) must still be served"
+        );
+        assert!(
+            m_over.is_empty(),
+            "a 9-byte method exceeds the declared [..8] and must be refused; got {:?}",
+            String::from_utf8_lossy(&m_over)
+        );
+
+        assert!(
+            after.starts_with(b"HTTP/1.0 200 OK"),
+            "server must keep serving after refusing over-long requests; got {:?}",
+            String::from_utf8_lossy(&after)
+        );
     }
 
     /// Phase B slice 4a.1 — a program that declares a `concept_group`
