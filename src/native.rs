@@ -44797,7 +44797,26 @@ rule two
 
         // The asserted figure. Bump it — in the same commit as the slice that
         // moves it — only after reading the refused list this test prints.
-        const EXPECTED_ACCEPTED: usize = 69;
+        //
+        // 69 -> 80 (bitwise arc): gen0 learned band / bor / bxor / shl / shr /
+        // bnot, so the 11 corpus files that use them WITHOUT also needing
+        // multi-line if/else stopped failing the undefined-callee lint —
+        // bit_ops, ed_scalarmult, ghash_nblocks, ladder_recursive,
+        // p256_ninv_rec, p256_scalarmult, sha256_fold, sha256_prims,
+        // sha256_round, sha512_fold, x25519_rec. The other ~33 bitwise files
+        // also need multi-line `if/else`, which this tokenizer has no
+        // INDENT/DEDENT for; that is a separate slice.
+        //
+        // READ THIS BEFORE TREATING THE JUMP AS A WIN. Acceptance is breadth,
+        // not correctness (see the doc comment above), and 7 of those 11 read
+        // an argv `text` field, which gen0 currently reads as EMPTY. They
+        // compile, they run, and they produce WRONG digests — sha512_fold
+        // returns 106 where verbosec and Python's hashlib both return 207.
+        // The bitwise lowering itself is validated separately and agrees with
+        // verbosec on all 33 differential probes; the text-argv gap is
+        // pre-existing and independent, and is listed in CLAUDE.md's
+        // "known verification gaps" table.
+        const EXPECTED_ACCEPTED: usize = 80;
         const EXPECTED_TOTAL: usize = 151;
 
         let src = fs::read_to_string("examples/vexprparse.verbose")
