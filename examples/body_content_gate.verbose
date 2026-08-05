@@ -43,7 +43,13 @@ resource banned
 
 -- ── Handler logic ───────────────────────────────────────────────
 
-rule filter
+-- Named `body_gate`, not `filter`: `filter` is a built-in expression primitive
+-- (`filter(coll, x => pred)`), so the parser resolves `filter(...)` to the
+-- primitive and a rule of that name could never be called. The verifier now
+-- refuses the collision outright instead of letting the name silently mean two
+-- things. Nothing else changed — the rule is only ever reached as the service
+-- handler below, so the emitted binary is byte-for-byte identical.
+rule body_gate
   @intention: "Three-gate body filter: size, then content, then allow"
   @source: body_content_gate.intent:1
 
@@ -76,7 +82,7 @@ service waf
     port        : 18939
     max_request : 4096
 
-  handler: filter
+  handler: body_gate
 
   log:
     append_file "/tmp/verbose_waf_audit.jsonl" concat("{\"ts\":", req.timestamp, ",\"method\":\"", json_escape(req.method), "\",\"path\":\"", json_escape(req.path), "\",\"status\":", resp.status, ",\"body_bytes\":", length(req.body), "}\n")

@@ -26294,10 +26294,20 @@ rule le64_neg
             ("rule main\n  logic:\n    out = q(20, 6)\nrule q(a, b)\n  logic:\n    out = a / b", 3),
             // r(17, 5) -> 17 % 5 -> 2 (mod across a call)
             ("rule main\n  logic:\n    out = r(17, 5)\nrule r(a, b)\n  logic:\n    out = a % b", 2),
-            // band(6, 0) -> (6 != 0) and (0 != 0) -> 0 (logical and across a call)
-            ("rule main\n  logic:\n    out = band(6, 0)\nrule band(a, b)\n  logic:\n    out = a and b", 0),
-            // band(6, 9) -> 1
-            ("rule main\n  logic:\n    out = band(6, 9)\nrule band(a, b)\n  logic:\n    out = a and b", 1),
+            // NOTE: this rule was called `band` until the bitwise arc taught the
+            // compiler the `band(a, b)` primitive. At that point `band(6, 9)`
+            // stopped resolving to the rule below and started meaning bitwise
+            // AND — `6 & 9` is 0, so the second case silently returned 0 where
+            // it asserts 1, with no diagnostic from any layer. That collision
+            // is now a verify-time refusal (see verifier.rs's
+            // `rule name '…' collides with the built-in primitive`), so the
+            // rule is renamed to a non-colliding `bool_and` and this test is
+            // back to testing what it meant to: LOGICAL `and` across a call.
+            //
+            // bool_and(6, 0) -> (6 != 0) and (0 != 0) -> 0 (logical and across a call)
+            ("rule main\n  logic:\n    out = bool_and(6, 0)\nrule bool_and(a, b)\n  logic:\n    out = a and b", 0),
+            // bool_and(6, 9) -> 1
+            ("rule main\n  logic:\n    out = bool_and(6, 9)\nrule bool_and(a, b)\n  logic:\n    out = a and b", 1),
         ];
 
         for &(prog_src, expected) in prog_cases {
@@ -44101,7 +44111,27 @@ rule two
         // positive; the count is now exactly the seeded violation.
         assert_eq!(run_on(&term_seed), 1, "a non-decreasing arg under `decreasing :` must flag (termination surface)");
 
-        for f in ["v2_clean.verbose", "v2_lint.verbose", "v2_pur.verbose", "v2_term.verbose"] {
+        // Primitive-name collision surface (`prim_named_rules`). A rule named
+        // after an expression primitive is UNREACHABLE: every dispatcher in
+        // vexprparse — eval_ast_env, code_size_node, x86_node and the two
+        // streaming variants — tests span_is_* before it ever reaches
+        // proc_offset, so the emitter emits the primitive and never looks at
+        // the rule body. Worse, count_badcall_ast deliberately EXEMPTS
+        // primitive spans from the undefined-callee lint, so nothing flagged it.
+        //
+        // The two programs below are byte-identical apart from the rule NAME,
+        // which is what makes this a real differential: `helper` scores 0,
+        // `band` scores 1, and the delta is attributable to nothing else.
+        let prim_body = "  logic:\n    out = x * 2\n  proofs:\n    purity:\n      reads : [x]\n      calls : []\n    termination:\n      bound : 8\n";
+        let prim_ok = write("v2_prim_ok.verbose", &format!("rule helper(x)\n{}", prim_body));
+        assert_eq!(run_on(&prim_ok), 0,
+            "the control program (same body, non-colliding name) must score 0");
+        let prim_seed = write("v2_prim.verbose", &format!("rule band(x)\n{}", prim_body));
+        assert_eq!(run_on(&prim_seed), 1,
+            "a rule named after a primitive must flag (primitive-collision surface)");
+
+        for f in ["v2_clean.verbose", "v2_lint.verbose", "v2_pur.verbose", "v2_term.verbose",
+                  "v2_prim_ok.verbose", "v2_prim.verbose"] {
             let _ = fs::remove_file(tmp.join(f));
         }
         let _ = fs::remove_file(&bin);
@@ -44797,7 +44827,26 @@ rule two
 
         // The asserted figure. Bump it — in the same commit as the slice that
         // moves it — only after reading the refused list this test prints.
-        const EXPECTED_ACCEPTED: usize = 69;
+        //
+        // 69 -> 80 (bitwise arc): gen0 learned band / bor / bxor / shl / shr /
+        // bnot, so the 11 corpus files that use them WITHOUT also needing
+        // multi-line if/else stopped failing the undefined-callee lint —
+        // bit_ops, ed_scalarmult, ghash_nblocks, ladder_recursive,
+        // p256_ninv_rec, p256_scalarmult, sha256_fold, sha256_prims,
+        // sha256_round, sha512_fold, x25519_rec. The other ~33 bitwise files
+        // also need multi-line `if/else`, which this tokenizer has no
+        // INDENT/DEDENT for; that is a separate slice.
+        //
+        // READ THIS BEFORE TREATING THE JUMP AS A WIN. Acceptance is breadth,
+        // not correctness (see the doc comment above), and 7 of those 11 read
+        // an argv `text` field, which gen0 currently reads as EMPTY. They
+        // compile, they run, and they produce WRONG digests — sha512_fold
+        // returns 106 where verbosec and Python's hashlib both return 207.
+        // The bitwise lowering itself is validated separately and agrees with
+        // verbosec on all 33 differential probes; the text-argv gap is
+        // pre-existing and independent, and is listed in CLAUDE.md's
+        // "known verification gaps" table.
+        const EXPECTED_ACCEPTED: usize = 80;
         const EXPECTED_TOTAL: usize = 151;
 
         let src = fs::read_to_string("examples/vexprparse.verbose")

@@ -112,11 +112,33 @@
 -- Raised to the verifier's hard ceiling (4 000 000, see
 -- docs/arena-allocation-design.md) -- ~63% headroom over the current largest
 -- self-host target.
--- ponytail: 6 000 000 is the RUST-backend (gen0) arena bound — the max_nodes
--- the verifier carries and the Rust native emitter mmaps (6M * entry_size).
--- gen0 STACK-passes plain-concept records (ByteGenState / ProgGenState / ...),
--- so it never arena-allocates the codegen walk's transients; its peak for the
--- FULL self-compile is ~1.5M nodes, well under 6M.
+-- 8 000 000 is the RUST-backend (gen0) arena bound — the max_nodes the verifier
+-- carries and the Rust native emitter mmaps (8M * entry_size = 832 MB of
+-- MAP_NORESERVE virtual, so only TOUCHED pages cost physical RAM).
+--
+-- RAISED FROM 6 000 000 by the bitwise slice, and the reason is worth writing
+-- down because the old note here was measurably wrong. It claimed gen0's peak
+-- for the full self-compile was "~1.5M nodes, well under 6M" on the reasoning
+-- that gen0 STACK-passes plain-concept records (ByteGenState / ProgGenState /
+-- ...) and so never arena-allocates the codegen walk's transients. The
+-- stack-passing is real; the conclusion was not. MEASURED at the 6M cap, on the
+-- source as it stood BEFORE this slice: peak RSS 633 440 KiB against a 624 MB
+-- arena — i.e. gen0 was touching essentially the WHOLE 6M-node arena already,
+-- with no headroom left at all.
+--
+-- The failure mode that surfaced it is nasty and worth recognising on sight:
+-- gen0 does not report an arena exhaustion. It exits 1 having ALREADY streamed
+-- a partial ELF to stdout (~750 KB of the 2.6 MB it owed), because the emit is
+-- streaming and the arena bounds-check fires mid-walk. That reads exactly like
+-- a verify refusal or a mid-emit codegen bug, and it moves with the SHAPE of
+-- whatever you just added — a branch here is fine, three branches there is not
+-- — because what actually varies is how many AST nodes the addition costs. Any
+-- slice that adds rules to this file spends arena; when the ceiling is the
+-- binding constraint, the symptom looks like everything except the ceiling.
+--
+-- Current headroom after the raise: the self-compile succeeds and peaks at
+-- 639 136 KiB, so ~2M nodes (~25%) spare. The next slice to exhaust it gets
+-- the same misleading symptom, so check `max_nodes` FIRST.
 --
 -- The SELF-HOSTED emitter (elf_program_src) uses ONE unified arena for every
 -- record AND variant (a record `Foo { .. }` parses to AstVariant(Foo, Foo, ..)
@@ -159,7 +181,7 @@
 -- proc_offset through ByteGenState so those walks stop happening at all. Neither
 -- changes the byte-identical output.
 -- ============================================================================
-concept_group VExpr [max_depth: 4096, max_nodes: 6000000]
+concept_group VExpr [max_depth: 4096, max_nodes: 8000000]
   @intention: "Tokens, a token cons-list, an arithmetic AST, and a parse result"
   @source: vexprparse.intent:1
 
@@ -6853,6 +6875,194 @@ rule span_is_min
       bound : 64
 
 
+-- ============================================================================
+-- BITWISE tier — the six primitives verbosec's parser has recognized since the
+-- crypto arc: band / bor / bxor (binary), shl / shr (binary), bnot (unary).
+-- All are number -> number and lower to ONE x86 instruction on the operand
+-- already sitting in rax, so they cost 5-6 bytes at a call site — cheaper than
+-- min/max (10 B, which need a cmp + cmov pair).
+--
+-- Why the self-hosted compiler needs them: 44 of the corpus's crypto files
+-- (sha256_*, sha512_*, ghash_*, x25519_*, p256_*, ed_*) are built out of these
+-- six and NOTHING else exotic. Without recognition, gen0 refuses every one of
+-- them at the undefined-callee lint (category 2) — `band` resolves to no rule,
+-- so badcall counts it and the fail-closed emit gate exits 1.
+--
+-- span_is_band: 1 iff the span is exactly the 4 bytes "band" (b=98 a=97 n=110
+-- d=100). Flat fixed-width check, length-guarded first — the same shape as
+-- span_is_le32 / span_is_min.
+rule span_is_band
+  @intention: "1 if a callee span spells exactly \"band\", 0 otherwise"
+  @source: vexprparse.intent:68
+  input:
+    sc : SpanCheck
+  output:
+    out : number
+  logic:
+    out = if sc.len == 4 and (byte_at(sc.src, sc.start) == 98 and (byte_at(sc.src, sc.start + 1) == 97 and (byte_at(sc.src, sc.start + 2) == 110 and byte_at(sc.src, sc.start + 3) == 100))) then 1 else 0
+  proofs:
+    purity:
+      reads : [sc.src, sc.start, sc.len]
+      calls : []
+    termination:
+      bound : 64
+
+
+-- span_is_bor: 1 iff the span is exactly the 3 bytes "bor" (b=98 o=111 r=114).
+-- Sibling of span_is_band at 3 bytes.
+rule span_is_bor
+  @intention: "1 if a callee span spells exactly \"bor\", 0 otherwise"
+  @source: vexprparse.intent:68
+  input:
+    sc : SpanCheck
+  output:
+    out : number
+  logic:
+    out = if sc.len == 3 and (byte_at(sc.src, sc.start) == 98 and (byte_at(sc.src, sc.start + 1) == 111 and byte_at(sc.src, sc.start + 2) == 114)) then 1 else 0
+  proofs:
+    purity:
+      reads : [sc.src, sc.start, sc.len]
+      calls : []
+    termination:
+      bound : 64
+
+
+-- span_is_bxor: 1 iff the span is exactly the 4 bytes "bxor" (b=98 x=120 o=111
+-- r=114). Sibling of span_is_band.
+rule span_is_bxor
+  @intention: "1 if a callee span spells exactly \"bxor\", 0 otherwise"
+  @source: vexprparse.intent:68
+  input:
+    sc : SpanCheck
+  output:
+    out : number
+  logic:
+    out = if sc.len == 4 and (byte_at(sc.src, sc.start) == 98 and (byte_at(sc.src, sc.start + 1) == 120 and (byte_at(sc.src, sc.start + 2) == 111 and byte_at(sc.src, sc.start + 3) == 114))) then 1 else 0
+  proofs:
+    purity:
+      reads : [sc.src, sc.start, sc.len]
+      calls : []
+    termination:
+      bound : 64
+
+
+-- span_is_bnot: 1 iff the span is exactly the 4 bytes "bnot" (b=98 n=110
+-- o=111 t=116). The ONLY UNARY member of the family, which is why it gets its
+-- own recognizer rather than riding span_is_bitwise everywhere: arity is what
+-- the verifier's check and the emitter's guard both key on, so "which one is
+-- bnot" has to be answerable on its own.
+rule span_is_bnot
+  @intention: "1 if a callee span spells exactly \"bnot\", 0 otherwise"
+  @source: vexprparse.intent:68
+  input:
+    sc : SpanCheck
+  output:
+    out : number
+  logic:
+    out = if sc.len == 4 and (byte_at(sc.src, sc.start) == 98 and (byte_at(sc.src, sc.start + 1) == 110 and (byte_at(sc.src, sc.start + 2) == 111 and byte_at(sc.src, sc.start + 3) == 116))) then 1 else 0
+  proofs:
+    purity:
+      reads : [sc.src, sc.start, sc.len]
+      calls : []
+    termination:
+      bound : 64
+
+
+-- span_is_shl: 1 iff the span is exactly the 3 bytes "shl" (s=115 h=104
+-- l=108). Sibling of span_is_bor at 3 bytes.
+rule span_is_shl
+  @intention: "1 if a callee span spells exactly \"shl\", 0 otherwise"
+  @source: vexprparse.intent:68
+  input:
+    sc : SpanCheck
+  output:
+    out : number
+  logic:
+    out = if sc.len == 3 and (byte_at(sc.src, sc.start) == 115 and (byte_at(sc.src, sc.start + 1) == 104 and byte_at(sc.src, sc.start + 2) == 108)) then 1 else 0
+  proofs:
+    purity:
+      reads : [sc.src, sc.start, sc.len]
+      calls : []
+    termination:
+      bound : 64
+
+
+-- span_is_shr: 1 iff the span is exactly the 3 bytes "shr" (s=115 h=104
+-- r=114). Sibling of span_is_shl.
+--
+-- `shr` is a LOGICAL shift in every Verbose backend — it zero-fills, it does
+-- NOT replicate the sign bit. That is not an incidental encoding choice: it
+-- was a live cross-backend bug until PR #143, and getting it wrong is silent
+-- rather than loud. Every hash in the crypto corpus would still compile and
+-- still produce a number; only the number would be wrong. sha512_fold's first
+-- output byte is 207 when shr is logical and 111 when it is arithmetic, which
+-- is the cheapest available oracle for this one bit of encoding.
+rule span_is_shr
+  @intention: "1 if a callee span spells exactly \"shr\", 0 otherwise"
+  @source: vexprparse.intent:68
+  input:
+    sc : SpanCheck
+  output:
+    out : number
+  logic:
+    out = if sc.len == 3 and (byte_at(sc.src, sc.start) == 115 and (byte_at(sc.src, sc.start + 1) == 104 and byte_at(sc.src, sc.start + 2) == 114)) then 1 else 0
+  proofs:
+    purity:
+      reads : [sc.src, sc.start, sc.len]
+      calls : []
+    termination:
+      bound : 64
+
+
+-- span_is_bitwise: 1 iff the span spells ANY of the bitwise primitives. The
+-- LENGTH GUARD LEADS deliberately: this rule sits on the hot path (every
+-- AstCall in code_size_node / x86_node / arity_mismatch consults it, and
+-- code_size_node runs once per node per offset pass), so a callee whose name
+-- is neither 3 nor 4 bytes — which is nearly every real rule name in a Verbose
+-- program — costs exactly ONE proc call and no byte compares at all. Only
+-- 3/4-byte names pay for the inner chain, and each of those recognizers
+-- length-guards again before touching a byte.
+rule span_is_bitwise
+  @intention: "1 if a callee span spells one of the bitwise primitives, 0 otherwise"
+  @source: vexprparse.intent:68
+  input:
+    sc : SpanCheck
+  output:
+    out : number
+  logic:
+    out = if sc.len == 4 then (if span_is_band(sc) == 1 then 1 else if span_is_bxor(sc) == 1 then 1 else span_is_bnot(sc)) else if sc.len == 3 then (if span_is_bor(sc) == 1 then 1 else if span_is_shl(sc) == 1 then 1 else span_is_shr(sc)) else 0
+  proofs:
+    purity:
+      reads : [sc, sc.len]
+      calls : [span_is_band, span_is_bxor, span_is_bnot, span_is_bor, span_is_shl, span_is_shr]
+    termination:
+      bound : 64
+
+
+-- bitwise_arity: the number of arguments a bitwise primitive takes — 2 for
+-- every binary form. 0 means "not a bitwise primitive", which is what makes
+-- this usable as a GATE in arity_mismatch (the sentinel is out of band because
+-- no primitive takes zero arguments). Kept separate from span_is_bitwise so
+-- the arity contract lives in exactly one place: the verifier's arity check,
+-- code_size_node's guard and x86_node's guard all read the same number, so a
+-- wrong-arity call cannot size one way and emit another.
+rule bitwise_arity
+  @intention: "Argument count of a bitwise primitive (0 if the span is not one)"
+  @source: vexprparse.intent:68
+  input:
+    sc : SpanCheck
+  output:
+    out : number
+  logic:
+    out = if span_is_bnot(sc) == 1 then 1 else if span_is_bitwise(sc) == 1 then 2 else 0
+  proofs:
+    purity:
+      reads : [sc]
+      calls : [span_is_bnot, span_is_bitwise]
+    termination:
+      bound : 64
+
+
 -- span_is_arena_scope: 1 iff the callee span is exactly the 11 bytes "arena_scope"
 -- (a=97 r=114 e=101 n=110 a=97 _=95 s=115 c=99 o=111 p=112 e=101). arena_scope is
 -- a recognized bytes primitive (like le32 / max): in a streaming-bytes position it
@@ -7509,11 +7719,11 @@ rule span_is_primitive
   output:
     out : number
   logic:
-    out = if span_is_byte_at(sc) == 1 then 1 else if span_is_length(sc) == 1 then 1 else if span_is_substring(sc) == 1 then 1 else if span_is_concat(sc) == 1 then 1 else if span_is_le32(sc) == 1 then 1 else if span_is_le64(sc) == 1 then 1 else if span_is_max(sc) == 1 then 1 else if span_is_min(sc) == 1 then 1 else if span_is_arena_scope(sc) == 1 then 1 else if span_is_abort_if(sc) == 1 then 1 else if span_is_read(sc) == 1 then 1 else span_is_fetch(sc)
+    out = if span_is_byte_at(sc) == 1 then 1 else if span_is_length(sc) == 1 then 1 else if span_is_substring(sc) == 1 then 1 else if span_is_concat(sc) == 1 then 1 else if span_is_le32(sc) == 1 then 1 else if span_is_le64(sc) == 1 then 1 else if span_is_max(sc) == 1 then 1 else if span_is_min(sc) == 1 then 1 else if span_is_arena_scope(sc) == 1 then 1 else if span_is_abort_if(sc) == 1 then 1 else if span_is_read(sc) == 1 then 1 else if span_is_bitwise(sc) == 1 then 1 else span_is_fetch(sc)
   proofs:
     purity:
       reads : [sc]
-      calls : [span_is_byte_at, span_is_length, span_is_substring, span_is_concat, span_is_le32, span_is_le64, span_is_max, span_is_min, span_is_arena_scope, span_is_abort_if, span_is_read, span_is_fetch]
+      calls : [span_is_byte_at, span_is_length, span_is_substring, span_is_concat, span_is_le32, span_is_le64, span_is_max, span_is_min, span_is_arena_scope, span_is_abort_if, span_is_read, span_is_bitwise, span_is_fetch]
     termination:
       bound : 128
 
@@ -16108,6 +16318,58 @@ rule rule_named
       bound : 4000
 
 
+-- PrimNameState: the program's RuleList to walk + the source text. The probe for
+-- prim_named_rules below — the mirror image of RuleNamedState, which asks "is this
+-- CALLEE the name of some rule?"; this one asks "is this RULE the name of some
+-- primitive?".
+concept PrimNameState
+  @intention: "A rule list to walk + the source text, for finding rule names that spell a primitive"
+  @source: vexprparse.intent:33
+  fields:
+    rules : RuleList
+    src : text [..256]
+
+
+-- prim_named_rules: how many rules in the program are NAMED after an expression
+-- primitive. Nonzero refuses emission through the verrs gate.
+--
+-- Why this is a verification error and not a style nit: every dispatcher in this
+-- compiler — eval_ast_env, code_size_node, x86_node, code_size_stream_node,
+-- x86_stream_node — tests span_is_* BEFORE falling through to eval_call /
+-- proc_offset. So a rule named `concat` is not "ambiguous", it is UNREACHABLE:
+-- the emitter sizes and emits the primitive and never looks at the rule body, and
+-- the program runs to completion with a different answer than its source reads.
+-- The silence was doubly locked in, because count_badcall_ast EXEMPTS primitive
+-- spans from the undefined-callee lint (that exemption is what span_is_primitive
+-- was written for) — so neither the lint nor the emitter had anything to say.
+--
+-- The compiler verifies, it does not guess. A name whose meaning silently changes
+-- is refused at the DECLARATION, where the name is, rather than mis-resolved at
+-- every call site. Reuses span_is_primitive so this check can never recognise a
+-- different set than the dispatchers do.
+--
+-- Zero on the self-source by construction (no rule here is named after a
+-- primitive), the same precondition resource_errors states for itself. Recurses
+-- over `rules`, a FIELD of the input, so bound + breadcrumb like rule_named.
+rule prim_named_rules
+  @intention: "Count of rules whose own name spells an expression primitive, and which are therefore unreachable"
+  @source: vexprparse.intent:33
+  input:
+    st : PrimNameState
+  output:
+    out : number
+  logic:
+    out = match st.rules:
+      RCons(head, tail) => (if span_is_primitive(SpanCheck { src: st.src, start: rd_name_start(head), len: rd_name_len(head) }) == 1 then 1 else 0) + prim_named_rules(PrimNameState { rules: tail, src: st.src })
+      RNil => 0
+  proofs:
+    purity:
+      reads : [st.rules, st.src]
+      calls : [span_is_primitive, rd_name_start, rd_name_len, prim_named_rules]
+    termination:
+      bound : 4000
+
+
 -- count_badcall_args's input: the argument list to walk + the program's RuleList
 -- (the scope every AstCall callee is resolved against) + the source text. Mirrors
 -- UndefArgsState but carries `rules` instead of `binds`.
@@ -16589,11 +16851,20 @@ rule arity_mismatch
     out : number
   logic:
     let found = rule_arity(RuleArityState { rules: m.rules, src: m.src, q_start: m.callee_start, q_len: m.callee_len })
-    out = if found == 1000000 then 0 else (if arg_list_len(m.args) == found then 0 else 1)
+    -- BITWISE tier: a bitwise primitive resolves to NO rule, so `found` is the
+    -- 1000000 sentinel and the rule-based branch would wave it through. `want`
+    -- carries the primitive's declared arity instead (0 = not a primitive), and
+    -- takes precedence. Both `want` and `n` are hoisted into lets so each is
+    -- evaluated exactly once — arg_list_len is recursive, and mentioning it
+    -- twice inside one expression is the doubling trap this file avoids
+    -- everywhere else.
+    let want = bitwise_arity(SpanCheck { src: m.src, start: m.callee_start, len: m.callee_len })
+    let n = arg_list_len(m.args)
+    out = if want > 0 then (if n == want then 0 else 1) else (if found == 1000000 then 0 else (if n == found then 0 else 1))
   proofs:
     purity:
       reads : [m.rules, m.src, m.callee_start, m.callee_len, m.args]
-      calls : [rule_arity, arg_list_len]
+      calls : [rule_arity, arg_list_len, bitwise_arity]
     termination:
       bound : 16
 
@@ -17091,7 +17362,7 @@ rule call_result_type
   logic:
     let isb = if span_is_le32(SpanCheck { src: c.src, start: c.callee_start, len: c.callee_len }) == 1 then 1 else if span_is_le64(SpanCheck { src: c.src, start: c.callee_start, len: c.callee_len }) == 1 then 1 else if span_is_arena_scope(SpanCheck { src: c.src, start: c.callee_start, len: c.callee_len }) == 1 then 1 else if span_is_abort_if(SpanCheck { src: c.src, start: c.callee_start, len: c.callee_len }) == 1 then 1 else 0
     let ist = if span_is_substring(SpanCheck { src: c.src, start: c.callee_start, len: c.callee_len }) == 1 then 1 else if span_is_read(SpanCheck { src: c.src, start: c.callee_start, len: c.callee_len }) == 1 then 1 else span_is_fetch(SpanCheck { src: c.src, start: c.callee_start, len: c.callee_len })
-    let isn = if span_is_byte_at(SpanCheck { src: c.src, start: c.callee_start, len: c.callee_len }) == 1 then 1 else if span_is_length(SpanCheck { src: c.src, start: c.callee_start, len: c.callee_len }) == 1 then 1 else if span_is_max(SpanCheck { src: c.src, start: c.callee_start, len: c.callee_len }) == 1 then 1 else if span_is_min(SpanCheck { src: c.src, start: c.callee_start, len: c.callee_len }) == 1 then 1 else 0
+    let isn = if span_is_byte_at(SpanCheck { src: c.src, start: c.callee_start, len: c.callee_len }) == 1 then 1 else if span_is_length(SpanCheck { src: c.src, start: c.callee_start, len: c.callee_len }) == 1 then 1 else if span_is_max(SpanCheck { src: c.src, start: c.callee_start, len: c.callee_len }) == 1 then 1 else if span_is_min(SpanCheck { src: c.src, start: c.callee_start, len: c.callee_len }) == 1 then 1 else span_is_bitwise(SpanCheck { src: c.src, start: c.callee_start, len: c.callee_len })
     let callee = find_rule(FindRuleState { rules: c.prog, src: c.src, q_start: c.callee_start, q_len: c.callee_len })
     let rt = rd_return_type(callee)
     let ot = resolve_type(ResolveTypeState { concepts: c.concepts, src: c.src, ty_start: rd_out_ty_start(callee), ty_len: rd_out_ty_len(callee) })
@@ -17099,7 +17370,7 @@ rule call_result_type
   proofs:
     purity:
       reads : [c.prog, c.src, c.callee_start, c.callee_len, c.concepts]
-      calls : [span_is_le32, span_is_le64, span_is_arena_scope, span_is_abort_if, span_is_substring, span_is_read, span_is_byte_at, span_is_length, span_is_max, span_is_min, rd_return_type, find_rule, resolve_type, rd_out_ty_start, rd_out_ty_len, span_is_fetch]
+      calls : [span_is_le32, span_is_le64, span_is_arena_scope, span_is_abort_if, span_is_substring, span_is_read, span_is_byte_at, span_is_length, span_is_max, span_is_min, span_is_bitwise, rd_return_type, find_rule, resolve_type, rd_out_ty_start, rd_out_ty_len, span_is_fetch]
     termination:
       bound : 64
 
@@ -18350,6 +18621,50 @@ rule argtype_args
       bound : 4000
 
 
+-- bitwise_args_bad: count the arguments of a BITWISE call whose type is not
+-- number. argtype_args cannot do this job: it pairs arguments against the
+-- CALLEE'S DECLARED PARAMETERS, and a primitive has no declaration to pair
+-- with (find_rule returns the sentinel, whose PNil params yield zero pairs and
+-- therefore zero errors). That gap is not hypothetical — verbosec had the
+-- mirror-image hole until PR #143, where `band(p.name, p.n)` on a TEXT field
+-- verified clean because the bitwise arms never recursed into their operands
+-- while the structurally identical `min(p.name, p.n)` was rejected. This rule
+-- is the self-hosted half of that fix, so the hole does not reopen on the
+-- other side of the bootstrap.
+--
+-- Type code 3 is the lattice's ILL-TYPED marker, and it is deliberately NOT
+-- counted here: an expression that already fails the type checker is reported
+-- once, by tcheck (category 4). Counting it again would double-report, and —
+-- more importantly — 3 is also what type_of_env returns for shapes this
+-- lattice does not model, so treating it as "not a number" would refuse valid
+-- programs. Same escape argtype_args uses, for the same reason.
+--
+-- Cost note: type_of_env is mentioned twice in the arm, but the second mention
+-- only runs when the first did not match, and BOTH are sub-walks of `head`.
+-- The list recursion (bitwise_args_bad over `tail`) is mentioned exactly ONCE,
+-- which is the invariant that keeps the walk linear rather than exponential.
+-- `params` rides along unused so the rule can reuse ArgTypeArgsState verbatim
+-- (callers pass PNil); introducing a near-duplicate concept for one dead field
+-- would buy nothing.
+rule bitwise_args_bad
+  @intention: "Count of a bitwise call's arguments whose type is neither number nor already-ill-typed"
+  @source: vexprparse.intent:39
+  input:
+    a : ArgTypeArgsState
+  output:
+    out : number
+  logic:
+    out = match a.args:
+      ArgCons(head, tail) => (if type_of_env(TypeArg { node: head, tenv: a.tenv, src: a.src, prog: a.prog, concepts: ConceptList::CNil }) == 0 then 0 else if type_of_env(TypeArg { node: head, tenv: a.tenv, src: a.src, prog: a.prog, concepts: ConceptList::CNil }) == 3 then 0 else 1) + bitwise_args_bad(ArgTypeArgsState { args: tail, params: a.params, tenv: a.tenv, src: a.src, prog: a.prog })
+      ArgNil => 0
+  proofs:
+    purity:
+      reads : [a.args, a.params, a.tenv, a.src, a.prog]
+      calls : [type_of_env, bitwise_args_bad]
+    termination:
+      bound : 4000
+
+
 -- argtype_ast: walk an Ast and count, at EVERY call site, the arguments whose type
 -- mismatches the callee's declared parameter type. Mirrors count_badcall_ast's
 -- structural walk, but the load-bearing arm is AstCall:
@@ -18399,11 +18714,11 @@ rule argtype_ast
       AstNot(inner) => argtype_ast(ArgTypeState { node: inner, tenv: a.tenv, src: a.src, prog: a.prog })
       AstField(base, fstart, flen) => argtype_ast(ArgTypeState { node: base, tenv: a.tenv, src: a.src, prog: a.prog })
       AstIf(cond, thn, els) => argtype_ast(ArgTypeState { node: cond, tenv: a.tenv, src: a.src, prog: a.prog }) + argtype_ast(ArgTypeState { node: thn, tenv: a.tenv, src: a.src, prog: a.prog }) + argtype_ast(ArgTypeState { node: els, tenv: a.tenv, src: a.src, prog: a.prog })
-      AstCall(callee_start, callee_len, args) => argtype_args(ArgTypeArgsState { args: args, params: rd_params(find_rule(FindRuleState { rules: a.prog, src: a.src, q_start: callee_start, q_len: callee_len })), tenv: a.tenv, src: a.src, prog: a.prog })
+      AstCall(callee_start, callee_len, args) => argtype_args(ArgTypeArgsState { args: args, params: rd_params(find_rule(FindRuleState { rules: a.prog, src: a.src, q_start: callee_start, q_len: callee_len })), tenv: a.tenv, src: a.src, prog: a.prog }) + (if span_is_bitwise(SpanCheck { src: a.src, start: callee_start, len: callee_len }) == 1 then bitwise_args_bad(ArgTypeArgsState { args: args, params: ParamList::PNil, tenv: a.tenv, src: a.src, prog: a.prog }) else 0)
   proofs:
     purity:
       reads : [a.node, a.tenv, a.src, a.prog]
-      calls : [argtype_ast, argtype_args, rd_params, find_rule]
+      calls : [argtype_ast, argtype_args, rd_params, find_rule, span_is_bitwise, bitwise_args_bad]
     termination:
       bound : 4000
 
@@ -20576,11 +20891,11 @@ rule verify_errors
     let toks = begin_tokenize(ScanState { source: s.source, pos: 0 })
     let prog = parse_program(ProgramState { cell: toks, src: s.source })
     let concepts = parse_concepts(ProgramState { cell: toks, src: s.source })
-    out = diag_count(prog_diags(ProgDiagsState { iter: prog, full: prog, src: s.source, idx: 0, concepts: concepts })) + purity_list(PurityListState { iter: prog, full: prog, src: s.source }) + term_list(TermListState { iter: prog, src: s.source })
+    out = diag_count(prog_diags(ProgDiagsState { iter: prog, full: prog, src: s.source, idx: 0, concepts: concepts })) + purity_list(PurityListState { iter: prog, full: prog, src: s.source }) + term_list(TermListState { iter: prog, src: s.source }) + prim_named_rules(PrimNameState { rules: prog, src: s.source })
   proofs:
     purity:
       reads : [s.source]
-      calls : [begin_tokenize, parse_program, parse_concepts, diag_count, prog_diags, purity_list, term_list]
+      calls : [begin_tokenize, parse_program, parse_concepts, diag_count, prog_diags, purity_list, term_list, prim_named_rules]
     termination:
       bound : 256
 
@@ -25068,6 +25383,179 @@ rule x86_arms
       bound : 8000
 
 
+-- WHY THE BITWISE LOWERING LIVES IN ITS OWN PAIR OF RULES, and not as two more
+-- branches inline in code_size_node / x86_node's AstCall arms.
+--
+-- The honest history, because the first answer written here was wrong and the
+-- wrong answer is the instructive part. Growing x86_node's AstCall arm made
+-- gen0 ABORT MID-EMIT on its own source: exit 1 after streaming ~750 KB of the
+-- 2.6 MB ELF it owed. Bisecting the SHAPE of the addition produced a coherent
+-- and completely false story — one extra branch was fine, three were not; a
+-- 3200-byte dead literal was fine, a second record-marshalled call was not —
+-- which reads exactly like a register or frame bug in the lowering. It is not.
+-- The real cause is that gen0's node arena was at 100% of its 6M cap before
+-- this slice (see the max_nodes banner at the top of this file), and every
+-- "shape" in that bisect was really a proxy for how many AST NODES the
+-- addition cost. Raising the cap made every one of those shapes compile.
+--
+-- The split is KEPT anyway, on its merits: the two halves of a size/emit
+-- decision belong side by side where a reader can check them against each
+-- other, not buried a thousand characters into two different monster lines.
+-- What is NOT true is that the inline form is unsafe — it is merely worse to
+-- audit.
+--
+-- ============================================================================
+-- BITWISE tier — the size/emit LOCKSTEP PAIR.
+--
+-- code_size_bitwise_call and x86_bitwise_call are the two halves of ONE
+-- decision and MUST track each other arm for arm. A size/emit drift of one
+-- byte desyncs every downstream rel32, which lands as a wrong p_filesz, a
+-- truncated segment and a SIGSEGV at spawn — this project's signature failure.
+-- Written as adjacent siblings over the same match so the correspondence is
+-- checkable by eye.
+--
+--   band  59 58 48 21 c8 50   pop rcx ; pop rax ; and rax, rcx ; push rax   6
+--   bor   59 58 48 09 c8 50   pop rcx ; pop rax ; or  rax, rcx ; push rax   6
+--   bxor  59 58 48 31 c8 50   pop rcx ; pop rax ; xor rax, rcx ; push rax   6
+--   bnot     58 48 f7 d0 50   pop rax ; not rax             ; push rax     5
+--   shl   59 58 48 d3 e0 50   pop rcx ; pop rax ; shl rax, cl  ; push rax   6
+--   shr   59 58 48 d3 e8 50   pop rcx ; pop rax ; shr rax, cl  ; push rax   6
+--   wrong arity        6a 00  push 0 — the same defensive shape byte_at /
+--                             substring / min / max use                     2
+--   non-AstCall node      cc  int3, unreachable behind span_is_bitwise       1
+--
+-- Every BINARY op is six bytes, so the size side needs no per-op dispatch for
+-- them: one constant 6 covers those five, and the drift risk collapses to "is
+-- every literal in that group six bytes long". bnot is the exception on both
+-- counts — one operand and five bytes — so it dispatches FIRST on both sides,
+-- in the same position, with the same span_is_bnot test. That symmetry is the
+-- point: the two rules read as one decision written twice.
+--
+-- x86_args has already pushed the operands in source order, so the stack top
+-- is the SECOND argument: `pop rcx` takes b, `pop rax` takes a, and the op
+-- computes a OP b into rax. Identical operand order to the min/max branches,
+-- which pop the same way before their cmp/cmov.
+--
+-- REGISTER DISCIPLINE, and the shift count in particular. x86 `shl`/`shr` are
+-- the only ops here that are NOT register-flexible: a variable shift count
+-- must be in CL, nowhere else. That costs nothing, because the operand order
+-- above already delivers it — the second argument pops straight into rcx, and
+-- cl IS rcx's low byte. No `mov` and no scratch register: the same six-byte
+-- shape as the three logical ops. Beyond rax and rcx nothing is touched, and
+-- both are ephemeral in this emitter (the min/max, byte_at and substring
+-- lowerings already scratch them). r14/r15 — the arena base and node counter —
+-- are untouched, and no syscall falls between the pops and the op, so the
+-- "syscalls clobber rcx and r11" rule never comes into play: rcx is written
+-- and consumed inside one straight-line six-byte window.
+--
+-- BOTH SHIFTS ARE LOGICAL. `48 d3 e8` is `shr`, not `sar` — it zero-fills. An
+-- arithmetic shift would still compile and still produce a number; it would
+-- just be the wrong number, silently, in every hash in the crypto corpus. See
+-- span_is_shr for the 207-vs-111 oracle. The count is masked to 6 bits by the
+-- hardware for 64-bit operands, which is exactly what every other backend
+-- promises (the interpreter's wrapping_shr, the transpiler's
+-- `(x as u64).wrapping_shr(n)`), so this needs no clamp of its own: adding one
+-- would DIVERGE from the other backends rather than protect anything.
+--
+-- The arity guard is a LITERAL 2 rather than a call to bitwise_arity for the
+-- reason in the banner above (a record-marshalled call in this cond is what
+-- aborts the self-compile). bitwise_arity remains the single source of truth
+-- where it matters — arity_mismatch, the VERIFIER's check — and a wrong-arity
+-- bitwise call is refused there before emission is ever reached. This guard is
+-- the belt to that suspenders, for the ungated x86_program_src driver.
+rule code_size_bitwise_call
+  @intention: "Exact byte count x86_bitwise_call emits for a bitwise primitive call (mirrors it arm-for-arm)"
+  @source: vexprparse.intent:68
+  input:
+    bg : ByteGenState
+  output:
+    out : number
+  logic:
+    out = match bg.node:
+      AstCall(callee_start, callee_len, args) => if span_is_bnot(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then (if arg_list_len(args) == 1 then code_size_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}) + 5 else 2) else if arg_list_len(args) == 2 then code_size_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}) + 6 else 2
+      AstNum(value) => 1
+      AstBin(op, lhs, rhs) => 1
+      AstNeg(inner) => 1
+      AstNot(inner) => 1
+      AstVar(start, len) => 1
+      AstField(base, fstart, flen) => 1
+      AstStr(start, len) => 1
+      AstBytes(start, len) => 1
+      AstBool(value) => 1
+      AstErr => 1
+      AstVariant(cstart, clen, vstart, vlen, fields) => 1
+      AstIf(cond, thn, els) => 1
+      AstMatch(scrut, arms) => 1
+      AstOk(inner) => 1
+      AstResErr(inner) => 1
+      AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => 1
+      AstSum(coll, item_start, item_len, body) => 1
+      AstCount(coll, item_start, item_len, body) => 1
+      AstFold(coll, init, acc_start, acc_len, item_start, item_len, body) => 1
+      AstAll(coll, item_start, item_len, body) => 1
+      AstAny(coll, item_start, item_len, body) => 1
+      AstMap(coll, item_start, item_len, body) => 1
+      AstFilter(coll, item_start, item_len, body) => 1
+      AstMinFold(coll, item_start, item_len, body) => 1
+      AstMaxFold(coll, item_start, item_len, body) => 1
+  proofs:
+    purity:
+      reads : [bg.node, bg.src, bg.off, bg.params, bg.lets, bg.prog, bg.concepts, bg.sizes, bg.ress, bg.conns]
+      calls : [span_is_bnot, arg_list_len, code_size_args]
+    termination:
+      bound : 4000
+
+
+-- x86_bitwise_call: the machine code for one bitwise primitive call — evaluate
+-- both operands onto the stack via x86_args, then apply the op. Sibling of
+-- code_size_bitwise_call; see the banner above for the byte table, the operand
+-- order and the register discipline. Every non-AstCall arm is int3: they are
+-- unreachable behind span_is_bitwise, but this emitter evaluates eagerly, so a
+-- walk with no fallback arm is a walk that can be entered before its guard has
+-- fired.
+rule x86_bitwise_call
+  @intention: "Machine code for a bitwise primitive call: push both operands, pop them, apply the op, push the result"
+  @source: vexprparse.intent:68
+  input:
+    bg : ByteGenState
+  output:
+    out : bytes
+  logic:
+    out = match bg.node:
+      AstCall(callee_start, callee_len, args) => if span_is_bnot(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then (if arg_list_len(args) == 1 then concat(x86_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}), b"\x58\x48\xf7\xd0\x50") else b"\x6a\x00") else if arg_list_len(args) == 2 then concat(x86_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}), (if span_is_band(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then b"\x59\x58\x48\x21\xc8\x50" else if span_is_bor(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then b"\x59\x58\x48\x09\xc8\x50" else if span_is_bxor(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then b"\x59\x58\x48\x31\xc8\x50" else if span_is_shl(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then b"\x59\x58\x48\xd3\xe0\x50" else b"\x59\x58\x48\xd3\xe8\x50")) else b"\x6a\x00"
+      AstNum(value) => b"\xcc"
+      AstBin(op, lhs, rhs) => b"\xcc"
+      AstNeg(inner) => b"\xcc"
+      AstNot(inner) => b"\xcc"
+      AstVar(start, len) => b"\xcc"
+      AstField(base, fstart, flen) => b"\xcc"
+      AstStr(start, len) => b"\xcc"
+      AstBytes(start, len) => b"\xcc"
+      AstBool(value) => b"\xcc"
+      AstErr => b"\xcc"
+      AstVariant(cstart, clen, vstart, vlen, fields) => b"\xcc"
+      AstIf(cond, thn, els) => b"\xcc"
+      AstMatch(scrut, arms) => b"\xcc"
+      AstOk(inner) => b"\xcc"
+      AstResErr(inner) => b"\xcc"
+      AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => b"\xcc"
+      AstSum(coll, item_start, item_len, body) => b"\xcc"
+      AstCount(coll, item_start, item_len, body) => b"\xcc"
+      AstFold(coll, init, acc_start, acc_len, item_start, item_len, body) => b"\xcc"
+      AstAll(coll, item_start, item_len, body) => b"\xcc"
+      AstAny(coll, item_start, item_len, body) => b"\xcc"
+      AstMap(coll, item_start, item_len, body) => b"\xcc"
+      AstFilter(coll, item_start, item_len, body) => b"\xcc"
+      AstMinFold(coll, item_start, item_len, body) => b"\xcc"
+      AstMaxFold(coll, item_start, item_len, body) => b"\xcc"
+  proofs:
+    purity:
+      reads : [bg.node, bg.src, bg.off, bg.params, bg.lets, bg.prog, bg.concepts, bg.sizes, bg.ress, bg.conns]
+      calls : [span_is_bnot, arg_list_len, x86_args, span_is_band, span_is_bor, span_is_bxor, span_is_shl]
+    termination:
+      bound : 4000
+
+
 -- code_size_node: the EXACT byte count x86_node(bg) emits for a subtree, the
 -- program-aware sibling of code_size_expr. Must match x86_node arm-for-arm so
 -- the `if` rel32 offsets and call rel32 offsets are correct. New arms vs b4a:
@@ -25104,7 +25592,7 @@ rule code_size_node
       -- push), substring = 38 (pops + split + two bounds checks + repack + OOB block).
       -- A wrong arity emits ONLY `push 0` (2 bytes) — oracle parity with eval's
       -- defensive VNum 0, no argument code at all.
-      AstCall(callee_start, callee_len, args) => if span_is_byte_at(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then (if arg_list_len(args) == 2 then code_size_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}) + 36 else 2) else if span_is_length(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then (if arg_list_len(args) == 1 then code_size_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}) + 4 else 2) else if span_is_substring(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then (if arg_list_len(args) == 3 then code_size_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}) + 38 else 2) else if span_is_max(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then (if arg_list_len(args) == 2 then code_size_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}) + 10 else 2) else if span_is_min(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then (if arg_list_len(args) == 2 then code_size_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}) + 10 else 2) else if span_is_arena_scope(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then 6 + code_size_node(ByteGenState { node: arg_first(args), src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}) else if span_is_abort_if(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then 1 else if span_is_concat(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then 1 else if span_is_read(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then (if arg_list_len(args) == 1 then (if resource_index_of(ResIdxState { ress: bg.ress, src: bg.src, q_start: ast_var_start(arg_first(args)), q_len: ast_var_len(arg_first(args)), idx: 0 }) >= 0 then 14 else 1) else 2) else if span_is_fetch(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then (if arg_list_len(args) == 2 then (if connection_index_of(ConnIdxState { conns: bg.conns, src: bg.src, q_start: ast_var_start(arg_first(args)), q_len: ast_var_len(arg_first(args)), idx: 0 }) >= 0 then 14 else 1) else 2) else if callee_is_texty(FindRuleState { rules: bg.prog, src: bg.src, q_start: callee_start, q_len: callee_len }) == 1 then 1 else code_size_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}) + 13
+      AstCall(callee_start, callee_len, args) => if span_is_byte_at(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then (if arg_list_len(args) == 2 then code_size_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}) + 36 else 2) else if span_is_length(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then (if arg_list_len(args) == 1 then code_size_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}) + 4 else 2) else if span_is_substring(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then (if arg_list_len(args) == 3 then code_size_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}) + 38 else 2) else if span_is_max(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then (if arg_list_len(args) == 2 then code_size_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}) + 10 else 2) else if span_is_min(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then (if arg_list_len(args) == 2 then code_size_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}) + 10 else 2) else if span_is_bitwise(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then code_size_bitwise_call(bg) else if span_is_arena_scope(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then 6 + code_size_node(ByteGenState { node: arg_first(args), src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}) else if span_is_abort_if(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then 1 else if span_is_concat(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then 1 else if span_is_read(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then (if arg_list_len(args) == 1 then (if resource_index_of(ResIdxState { ress: bg.ress, src: bg.src, q_start: ast_var_start(arg_first(args)), q_len: ast_var_len(arg_first(args)), idx: 0 }) >= 0 then 14 else 1) else 2) else if span_is_fetch(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then (if arg_list_len(args) == 2 then (if connection_index_of(ConnIdxState { conns: bg.conns, src: bg.src, q_start: ast_var_start(arg_first(args)), q_len: ast_var_len(arg_first(args)), idx: 0 }) >= 0 then 14 else 1) else 2) else if callee_is_texty(FindRuleState { rules: bg.prog, src: bg.src, q_start: callee_start, q_len: callee_len }) == 1 then 1 else code_size_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}) + 13
       -- Text values slice 2: a string literal is one packed-span push —
       -- mov rax, imm64 (10) + push rax (1) = 11, same shape as AstNum.
       AstStr(start, len) => 11
@@ -25156,8 +25644,8 @@ rule code_size_node
       AstMaxFold(coll, item_start, item_len, body) => if coll_elem_nfields(StaticConceptState { node: coll, src: bg.src, params: bg.params, lets: bg.lets, concepts: bg.concepts }) > 0 then code_size_node(ByteGenState { node: coll, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}) + code_size_node(ByteGenState { node: body, src: bg.src, off: 0, params: bg.params, lets: lets_append_elem_binders(AppendElemBindersState { lets: bg.lets, item_start: item_start, item_len: item_len, second_start: 0, second_len: 0, cstart: cd_name_start(concept_at_index(ConceptAtState { concepts: bg.concepts, idx: static_concept_of(StaticConceptState { node: coll, src: bg.src, params: bg.params, lets: bg.lets, concepts: bg.concepts }) })), clen: cd_name_len(concept_at_index(ConceptAtState { concepts: bg.concepts, idx: static_concept_of(StaticConceptState { node: coll, src: bg.src, params: bg.params, lets: bg.lets, concepts: bg.concepts }) })) }), prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}) + 72 * coll_elem_nfields(StaticConceptState { node: coll, src: bg.src, params: bg.params, lets: bg.lets, concepts: bg.concepts }) + 160 else (code_size_node(ByteGenState { node: coll, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}) + code_size_node(ByteGenState { node: body, src: bg.src, off: 0, params: bg.params, lets: lets_append_binders(AppendBindersState { lets: bg.lets, bs: BinderList::BindCons { start: item_start, len: item_len, rest: BinderList::BindCons { start: 0, len: 0, rest: BinderList::BindNil } } }), prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}) + 200)
   proofs:
     purity:
-      reads : [bg.node, bg.src, bg.off, bg.params, bg.lets, bg.prog, bg.concepts, bg.sizes, bg.ress, bg.conns]
-      calls : [code_size_node, code_size_args, code_size_vfields, vfield_len, arm_list_len, code_size_arms, static_concept_of, span_is_byte_at, span_is_length, span_is_substring, span_is_max, span_is_min, span_is_arena_scope, span_is_abort_if, span_is_concat, span_is_read, resource_index_of, ast_var_start, ast_var_len, arg_first, callee_is_texty, arg_list_len, lets_append_binders, coll_elem_nfields, lets_append_elem_binders, cd_name_start, cd_name_len, concept_at_index, span_is_fetch, connection_index_of]
+      reads : [bg, bg.node, bg.src, bg.off, bg.params, bg.lets, bg.prog, bg.concepts, bg.sizes, bg.ress, bg.conns]
+      calls : [code_size_node, code_size_args, code_size_vfields, vfield_len, arm_list_len, code_size_arms, static_concept_of, span_is_byte_at, span_is_length, span_is_substring, span_is_max, span_is_min, span_is_bitwise, code_size_bitwise_call, span_is_arena_scope, span_is_abort_if, span_is_concat, span_is_read, resource_index_of, ast_var_start, ast_var_len, arg_first, callee_is_texty, arg_list_len, lets_append_binders, coll_elem_nfields, lets_append_elem_binders, cd_name_start, cd_name_len, concept_at_index, span_is_fetch, connection_index_of]
     termination:
       bound : 8000
 
@@ -25452,7 +25940,7 @@ rule x86_node
       --     32 ; sub rcx, rdx ; or rax, rcx ; push rax ; jmp +3 ; OOB: xor eax,
       --     eax ; push rax. Pure span arithmetic — no memory touch, no src_base.
       -- A wrong arity emits ONLY push 0 (6a 00, 2 bytes) — eval's defensive VNum 0.
-      AstCall(callee_start, callee_len, args) => if span_is_byte_at(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then (if arg_list_len(args) == 2 then concat(x86_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}), b"\x59\x58\x89\xc2\x48\xc1\xe8\x20\x48\x39\xd1\x73\x14\x48\x01\xc8\x48\xba", le64(4194304 + blob_end_off(ProgGenState { rules: bg.prog, src: bg.src, off: 0, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress, conns: bg.conns, rxs: ReactionList::RxNil, svcs: ServiceList::SvNil })), b"\x0f\xb6\x04\x02\x50\xeb\x03\x31\xc0\x50") else b"\x6a\x00") else if span_is_length(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then (if arg_list_len(args) == 1 then concat(x86_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}), b"\x58\x89\xc0\x50") else b"\x6a\x00") else if span_is_substring(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then (if arg_list_len(args) == 3 then concat(x86_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}), b"\x59\x5a\x58\x89\xc6\x48\xc1\xe8\x20\x48\x39\xca\x77\x15\x48\x39\xf1\x77\x10\x48\x01\xd0\x48\xc1\xe0\x20\x48\x29\xd1\x48\x09\xc8\x50\xeb\x03\x31\xc0\x50") else b"\x6a\x00") else if span_is_max(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then (if arg_list_len(args) == 2 then concat(x86_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}), b"\x59\x58\x48\x39\xc8\x48\x0f\x4c\xc1\x50") else b"\x6a\x00") else if span_is_min(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then (if arg_list_len(args) == 2 then concat(x86_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}), b"\x59\x58\x48\x39\xc8\x48\x0f\x4f\xc1\x50") else b"\x6a\x00") else if span_is_arena_scope(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then concat(b"\x41\x56", x86_node(ByteGenState { node: arg_first(args), src: bg.src, off: bg.off + 2, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}), b"\x58\x41\x5e\x50") else if span_is_abort_if(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then b"\xcc" else if span_is_concat(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then b"\xcc" else if span_is_read(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then (if arg_list_len(args) == 1 then (if resource_index_of(ResIdxState { ress: bg.ress, src: bg.src, q_start: ast_var_start(arg_first(args)), q_len: ast_var_len(arg_first(args)), idx: 0 }) >= 0 then concat(b"\x48\xb8", le64(541065216 + 65536 * resource_index_of(ResIdxState { ress: bg.ress, src: bg.src, q_start: ast_var_start(arg_first(args)), q_len: ast_var_len(arg_first(args)), idx: 0 })), b"\x48\x8b\x00\x50") else b"\xcc") else b"\x6a\x00") else if span_is_fetch(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then (if arg_list_len(args) == 2 then (if connection_index_of(ConnIdxState { conns: bg.conns, src: bg.src, q_start: ast_var_start(arg_first(args)), q_len: ast_var_len(arg_first(args)), idx: 0 }) >= 0 then concat(b"\x48\xb8", le64(542113792 + 65536 * connection_index_of(ConnIdxState { conns: bg.conns, src: bg.src, q_start: ast_var_start(arg_first(args)), q_len: ast_var_len(arg_first(args)), idx: 0 })), b"\x48\x8b\x00\x50") else b"\xcc") else b"\x6a\x00") else if callee_is_texty(FindRuleState { rules: bg.prog, src: bg.src, q_start: callee_start, q_len: callee_len }) == 1 then b"\xcc" else concat(x86_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}), b"\xe8", le32(proc_offset(ProcOffState { rules: bg.prog, src: bg.src, acc: 0, q_start: callee_start, q_len: callee_len, concepts: bg.concepts, sizes: bg.sizes }) - (bg.off + arena_scope(code_size_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns})) + 5)), b"\x48\x81\xc4", le32(8 * arg_list_len(args)), b"\x50")
+      AstCall(callee_start, callee_len, args) => if span_is_byte_at(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then (if arg_list_len(args) == 2 then concat(x86_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}), b"\x59\x58\x89\xc2\x48\xc1\xe8\x20\x48\x39\xd1\x73\x14\x48\x01\xc8\x48\xba", le64(4194304 + blob_end_off(ProgGenState { rules: bg.prog, src: bg.src, off: 0, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress, conns: bg.conns, rxs: ReactionList::RxNil, svcs: ServiceList::SvNil })), b"\x0f\xb6\x04\x02\x50\xeb\x03\x31\xc0\x50") else b"\x6a\x00") else if span_is_length(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then (if arg_list_len(args) == 1 then concat(x86_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}), b"\x58\x89\xc0\x50") else b"\x6a\x00") else if span_is_substring(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then (if arg_list_len(args) == 3 then concat(x86_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}), b"\x59\x5a\x58\x89\xc6\x48\xc1\xe8\x20\x48\x39\xca\x77\x15\x48\x39\xf1\x77\x10\x48\x01\xd0\x48\xc1\xe0\x20\x48\x29\xd1\x48\x09\xc8\x50\xeb\x03\x31\xc0\x50") else b"\x6a\x00") else if span_is_max(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then (if arg_list_len(args) == 2 then concat(x86_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}), b"\x59\x58\x48\x39\xc8\x48\x0f\x4c\xc1\x50") else b"\x6a\x00") else if span_is_min(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then (if arg_list_len(args) == 2 then concat(x86_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}), b"\x59\x58\x48\x39\xc8\x48\x0f\x4f\xc1\x50") else b"\x6a\x00") else if span_is_bitwise(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then x86_bitwise_call(bg) else if span_is_arena_scope(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then concat(b"\x41\x56", x86_node(ByteGenState { node: arg_first(args), src: bg.src, off: bg.off + 2, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}), b"\x58\x41\x5e\x50") else if span_is_abort_if(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then b"\xcc" else if span_is_concat(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then b"\xcc" else if span_is_read(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then (if arg_list_len(args) == 1 then (if resource_index_of(ResIdxState { ress: bg.ress, src: bg.src, q_start: ast_var_start(arg_first(args)), q_len: ast_var_len(arg_first(args)), idx: 0 }) >= 0 then concat(b"\x48\xb8", le64(541065216 + 65536 * resource_index_of(ResIdxState { ress: bg.ress, src: bg.src, q_start: ast_var_start(arg_first(args)), q_len: ast_var_len(arg_first(args)), idx: 0 })), b"\x48\x8b\x00\x50") else b"\xcc") else b"\x6a\x00") else if span_is_fetch(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then (if arg_list_len(args) == 2 then (if connection_index_of(ConnIdxState { conns: bg.conns, src: bg.src, q_start: ast_var_start(arg_first(args)), q_len: ast_var_len(arg_first(args)), idx: 0 }) >= 0 then concat(b"\x48\xb8", le64(542113792 + 65536 * connection_index_of(ConnIdxState { conns: bg.conns, src: bg.src, q_start: ast_var_start(arg_first(args)), q_len: ast_var_len(arg_first(args)), idx: 0 })), b"\x48\x8b\x00\x50") else b"\xcc") else b"\x6a\x00") else if callee_is_texty(FindRuleState { rules: bg.prog, src: bg.src, q_start: callee_start, q_len: callee_len }) == 1 then b"\xcc" else concat(x86_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}), b"\xe8", le32(proc_offset(ProcOffState { rules: bg.prog, src: bg.src, acc: 0, q_start: callee_start, q_len: callee_len, concepts: bg.concepts, sizes: bg.sizes }) - (bg.off + arena_scope(code_size_args(ByteGenArgs { args: args, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns})) + 5)), b"\x48\x81\xc4", le32(8 * arg_list_len(args)), b"\x50")
       -- Text values slice 2: a string literal compiles to ONE packed i64 —
       -- (start+1) * 2^32 + (len-2), quotes stripped, the SAME numbers as eval's
       -- VText (the token span includes both quotes; a lone-quote token packs len
@@ -25550,8 +26038,8 @@ rule x86_node
       AstMaxFold(coll, item_start, item_len, body) => if coll_elem_nfields(StaticConceptState { node: coll, src: bg.src, params: bg.params, lets: bg.lets, concepts: bg.concepts }) > 0 then concat(x86_node(ByteGenState { node: coll, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}), b"\x41\x59\x49\x8b\x31", b"\x48\x31\xc0\x45\x31\xdb\x8a\x0e\x80\xf9\x2d\x75\x06\x41\xb3\x01\x48\xff\xc6\x0f\xb6\x0e\x80\xf9\x30\x72\x15\x80\xf9\x39\x77\x10\x48\x6b\xc0\x0a\x48\x83\xe9\x30\x48\x01\xc8\x48\xff\xc6\xeb\xe3\x4d\x85\xdb\x74\x03\x48\xf7\xd8", b"\x49\x89\xc0\x49\x83\xc1\x08", b"\x48\xb8", le64(0 - 9223372036854775807 - 1), b"\x48\x89\x85", le32(0 - 8 * (count_binds(bg.lets) + 2)), b"\x4d\x85\xc0\x0f\x84", le32((72 * coll_elem_nfields(StaticConceptState { node: coll, src: bg.src, params: bg.params, lets: bg.lets, concepts: bg.concepts }) + 60 + arena_scope(code_size_node(ByteGenState { node: body, src: bg.src, off: 0, params: bg.params, lets: lets_append_elem_binders(AppendElemBindersState { lets: bg.lets, item_start: item_start, item_len: item_len, second_start: 0, second_len: 0, cstart: cd_name_start(concept_at_index(ConceptAtState { concepts: bg.concepts, idx: static_concept_of(StaticConceptState { node: coll, src: bg.src, params: bg.params, lets: bg.lets, concepts: bg.concepts }) })), clen: cd_name_len(concept_at_index(ConceptAtState { concepts: bg.concepts, idx: static_concept_of(StaticConceptState { node: coll, src: bg.src, params: bg.params, lets: bg.lets, concepts: bg.concepts }) })) }), prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns})))), x86_elem_load(ElemLoadState { nf: coll_elem_nfields(StaticConceptState { node: coll, src: bg.src, params: bg.params, lets: bg.lets, concepts: bg.concepts }), tag: static_concept_of(StaticConceptState { node: coll, src: bg.src, params: bg.params, lets: bg.lets, concepts: bg.concepts }) * 256, esize: 8 * (max_payload_fields(bg.concepts) + 1), x_disp: 0 - 8 * (count_binds(bg.lets) + 1), efields: cd_fields(concept_at_index(ConceptAtState { concepts: bg.concepts, idx: static_concept_of(StaticConceptState { node: coll, src: bg.src, params: bg.params, lets: bg.lets, concepts: bg.concepts }) })), src_base: 4194304 + blob_end_off(ProgGenState { rules: bg.prog, src: bg.src, off: 0, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress, conns: bg.conns, rxs: ReactionList::RxNil, svcs: ServiceList::SvNil }) }), x86_node(ByteGenState { node: body, src: bg.src, off: bg.off + arena_scope(code_size_node(ByteGenState { node: coll, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns})) + 72 * coll_elem_nfields(StaticConceptState { node: coll, src: bg.src, params: bg.params, lets: bg.lets, concepts: bg.concepts }) + 120, params: bg.params, lets: lets_append_elem_binders(AppendElemBindersState { lets: bg.lets, item_start: item_start, item_len: item_len, second_start: 0, second_len: 0, cstart: cd_name_start(concept_at_index(ConceptAtState { concepts: bg.concepts, idx: static_concept_of(StaticConceptState { node: coll, src: bg.src, params: bg.params, lets: bg.lets, concepts: bg.concepts }) })), clen: cd_name_len(concept_at_index(ConceptAtState { concepts: bg.concepts, idx: static_concept_of(StaticConceptState { node: coll, src: bg.src, params: bg.params, lets: bg.lets, concepts: bg.concepts }) })) }), prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}), b"\x58\x48\x8b\x8d", le32(0 - 8 * (count_binds(bg.lets) + 2)), b"\x48\x39\xc8\x48\x0f\x4c\xc1\x48\x89\x85", le32(0 - 8 * (count_binds(bg.lets) + 2)), b"\x49\x83\xc1\x08\x49\xff\xc8\xe9", le32((0 - (72 * coll_elem_nfields(StaticConceptState { node: coll, src: bg.src, params: bg.params, lets: bg.lets, concepts: bg.concepts }) + 69 + arena_scope(code_size_node(ByteGenState { node: body, src: bg.src, off: 0, params: bg.params, lets: lets_append_elem_binders(AppendElemBindersState { lets: bg.lets, item_start: item_start, item_len: item_len, second_start: 0, second_len: 0, cstart: cd_name_start(concept_at_index(ConceptAtState { concepts: bg.concepts, idx: static_concept_of(StaticConceptState { node: coll, src: bg.src, params: bg.params, lets: bg.lets, concepts: bg.concepts }) })), clen: cd_name_len(concept_at_index(ConceptAtState { concepts: bg.concepts, idx: static_concept_of(StaticConceptState { node: coll, src: bg.src, params: bg.params, lets: bg.lets, concepts: bg.concepts }) })) }), prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}))))), b"\xff\xb5", le32(0 - 8 * (count_binds(bg.lets) + 2))) else (concat(x86_node(ByteGenState { node: coll, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}), b"\x41\x59\x49\x8b\x31", b"\x48\x31\xc0\x45\x31\xdb\x8a\x0e\x80\xf9\x2d\x75\x06\x41\xb3\x01\x48\xff\xc6\x0f\xb6\x0e\x80\xf9\x30\x72\x15\x80\xf9\x39\x77\x10\x48\x6b\xc0\x0a\x48\x83\xe9\x30\x48\x01\xc8\x48\xff\xc6\xeb\xe3\x4d\x85\xdb\x74\x03\x48\xf7\xd8", b"\x49\x89\xc0\x49\x83\xc1\x08", b"\x48\xb8", le64(0 - 9223372036854775807 - 1), b"\x48\x89\x85", le32(0 - 8 * (count_binds(bg.lets) + 2)), b"\x4d\x85\xc0\x0f\x84", le32((100 + arena_scope(code_size_node(ByteGenState { node: body, src: bg.src, off: 0, params: bg.params, lets: lets_append_binders(AppendBindersState { lets: bg.lets, bs: BinderList::BindCons { start: item_start, len: item_len, rest: BinderList::BindCons { start: 0, len: 0, rest: BinderList::BindNil } } }), prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns})))), b"\x49\x8b\x31", b"\x48\x31\xc0\x45\x31\xdb\x8a\x0e\x80\xf9\x2d\x75\x06\x41\xb3\x01\x48\xff\xc6\x0f\xb6\x0e\x80\xf9\x30\x72\x15\x80\xf9\x39\x77\x10\x48\x6b\xc0\x0a\x48\x83\xe9\x30\x48\x01\xc8\x48\xff\xc6\xeb\xe3\x4d\x85\xdb\x74\x03\x48\xf7\xd8", b"\x48\x89\x85", le32(0 - 8 * (count_binds(bg.lets) + 1)), x86_node(ByteGenState { node: body, src: bg.src, off: bg.off + arena_scope(code_size_node(ByteGenState { node: coll, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns})) + 160, params: bg.params, lets: lets_append_binders(AppendBindersState { lets: bg.lets, bs: BinderList::BindCons { start: item_start, len: item_len, rest: BinderList::BindCons { start: 0, len: 0, rest: BinderList::BindNil } } }), prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}), b"\x58\x48\x8b\x8d", le32(0 - 8 * (count_binds(bg.lets) + 2)), b"\x48\x39\xc8\x48\x0f\x4c\xc1\x48\x89\x85", le32(0 - 8 * (count_binds(bg.lets) + 2)), b"\x49\x83\xc1\x08\x49\xff\xc8\xe9", le32((0 - (109 + arena_scope(code_size_node(ByteGenState { node: body, src: bg.src, off: 0, params: bg.params, lets: lets_append_binders(AppendBindersState { lets: bg.lets, bs: BinderList::BindCons { start: item_start, len: item_len, rest: BinderList::BindCons { start: 0, len: 0, rest: BinderList::BindNil } } }), prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}))))), b"\xff\xb5", le32(0 - 8 * (count_binds(bg.lets) + 2))))
   proofs:
     purity:
-      reads : [bg.node, bg.src, bg.off, bg.params, bg.lets, bg.prog, bg.concepts, bg.sizes, bg.ress, bg.conns]
-      calls : [x86_node, code_size_node, x86_args, code_size_args, param_index, let_index, param_list_len, proc_offset, arg_list_len, x86_vfields, x86_vpops, vfield_len, max_payload_fields, variant_tag, x86_dispatch, x86_arms, code_size_arms, arm_list_len, static_concept_of, field_index_of, cd_fields, concept_at_index, span_is_byte_at, span_is_length, span_is_substring, span_is_max, span_is_min, span_is_arena_scope, span_is_abort_if, span_is_concat, span_is_read, resource_index_of, ast_var_start, ast_var_len, arg_first, callee_is_texty, blob_end_off, lets_append_binders, x86_binder_loads, count_binds, coll_elem_nfields, lets_append_elem_binders, cd_name_start, cd_name_len, x86_elem_load, span_is_fetch, connection_index_of]
+      reads : [bg, bg.node, bg.src, bg.off, bg.params, bg.lets, bg.prog, bg.concepts, bg.sizes, bg.ress, bg.conns]
+      calls : [x86_node, code_size_node, x86_args, code_size_args, param_index, let_index, param_list_len, proc_offset, arg_list_len, x86_vfields, x86_vpops, vfield_len, max_payload_fields, variant_tag, x86_dispatch, x86_arms, code_size_arms, arm_list_len, static_concept_of, field_index_of, cd_fields, concept_at_index, span_is_byte_at, span_is_length, span_is_substring, span_is_max, span_is_min, span_is_bitwise, x86_bitwise_call, span_is_arena_scope, span_is_abort_if, span_is_concat, span_is_read, resource_index_of, ast_var_start, ast_var_len, arg_first, callee_is_texty, blob_end_off, lets_append_binders, x86_binder_loads, count_binds, coll_elem_nfields, lets_append_elem_binders, cd_name_start, cd_name_len, x86_elem_load, span_is_fetch, connection_index_of]
     termination:
       bound : 8000
 
@@ -30258,7 +30746,7 @@ rule elf_program_src
     -- Effects tier slice 2a: the reaction list — used by reaction_errors (verify)
     -- AND by the has_reaction emit branch + blob_end_off sizing (emit).
     let rxs = parse_reactions(ProgramState { cell: toks, src: s.source })
-    let verrs = arena_scope(toplevel_junk(ProgramState { cell: toks, src: s.source }) + (if rule_list_len(prog) == 0 then 1 else 0) + diag_count(prog_diags(ProgDiagsState { iter: prog, full: prog, src: s.source, idx: 0, concepts: if has_service == 1 then http_concepts else concepts0 })) + purity_list(PurityListState { iter: prog, full: prog, src: s.source }) + term_list(TermListState { iter: prog, src: s.source }) + resource_errors(ResErrState { prog: prog, ress: ress, concepts: concepts0, src: s.source }) + reaction_errors(RxErrState { prog: prog, rxs: rxs, src: s.source, concepts: concepts0 }) + connection_errors(ConnErrState { prog: prog, ress: ress, conns: conns, src: s.source }) + service_errors(ServiceErrState { prog: prog, svcs: svcs, concepts: concepts0, ress: ress, conns: conns, rxs: rxs, src: s.source }))
+    let verrs = arena_scope(toplevel_junk(ProgramState { cell: toks, src: s.source }) + (if rule_list_len(prog) == 0 then 1 else 0) + diag_count(prog_diags(ProgDiagsState { iter: prog, full: prog, src: s.source, idx: 0, concepts: if has_service == 1 then http_concepts else concepts0 })) + purity_list(PurityListState { iter: prog, full: prog, src: s.source }) + term_list(TermListState { iter: prog, src: s.source }) + resource_errors(ResErrState { prog: prog, ress: ress, concepts: concepts0, src: s.source }) + reaction_errors(RxErrState { prog: prog, rxs: rxs, src: s.source, concepts: concepts0 }) + connection_errors(ConnErrState { prog: prog, ress: ress, conns: conns, src: s.source }) + service_errors(ServiceErrState { prog: prog, svcs: svcs, concepts: concepts0, ress: ress, conns: conns, rxs: rxs, src: s.source }) + prim_named_rules(PrimNameState { rules: prog, src: s.source }))
     let sizes = proc_sizes(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: ProcSizeList::PSNil, ress: ress, conns: conns, rxs: rxs, svcs: svcs })
     let uses_var = program_uses_arena(concepts)
     let anytx = prog_any_texty(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: sizes, ress: ress, conns: conns, rxs: rxs, svcs: svcs })
@@ -30302,7 +30790,7 @@ rule elf_program_src
   proofs:
     purity:
       reads : [s.source]
-      calls : [begin_tokenize, parse_program, toplevel_junk, rule_list_len, parse_concepts, parse_resources, parse_reactions, parse_connections, parse_services, resource_errors, reaction_errors, reaction_list_len, x86_reaction_tramp, resource_marshal_size, x86_resource_marshal, program_uses_result, concepts_append_result, concepts_append_http, service_list_len, svc_head, svc_handler_start, svc_handler_len, find_rule, rd_input, rd_out_ty_start, rd_out_ty_len, service_errors, x86_service_tramp, diag_count, prog_diags, purity_list, term_list, proc_sizes, program_uses_arena, prog_any_texty, entry_rule_texty, entry_rule_bytes, entry_rule_result, entry_rule_collection, max_payload_fields, program_uses_text, blob_end_off, x86_program, src_blob, param_list_len, rl_head_params, fields_to_params, rl_head_input, params_to_fields, find_concept_index, fl_head_ty_start, fl_head_ty_len, x86_argv_marshal, x86_stdin_marshal, field_list_has_text, cd_fields, concept_at_index, connection_errors, connection_marshal_size, x86_connection_marshal]
+      calls : [begin_tokenize, parse_program, toplevel_junk, rule_list_len, parse_concepts, parse_resources, parse_reactions, parse_connections, parse_services, resource_errors, reaction_errors, reaction_list_len, x86_reaction_tramp, resource_marshal_size, x86_resource_marshal, program_uses_result, concepts_append_result, concepts_append_http, service_list_len, svc_head, svc_handler_start, svc_handler_len, find_rule, rd_input, rd_out_ty_start, rd_out_ty_len, service_errors, x86_service_tramp, diag_count, prog_diags, purity_list, term_list, proc_sizes, program_uses_arena, prog_any_texty, entry_rule_texty, entry_rule_bytes, entry_rule_result, entry_rule_collection, max_payload_fields, program_uses_text, blob_end_off, x86_program, src_blob, param_list_len, rl_head_params, fields_to_params, rl_head_input, params_to_fields, find_concept_index, fl_head_ty_start, fl_head_ty_len, x86_argv_marshal, x86_stdin_marshal, field_list_has_text, cd_fields, concept_at_index, connection_errors, connection_marshal_size, x86_connection_marshal, prim_named_rules]
     termination:
       bound : 256
 
