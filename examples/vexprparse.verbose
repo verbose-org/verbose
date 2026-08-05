@@ -16318,6 +16318,58 @@ rule rule_named
       bound : 4000
 
 
+-- PrimNameState: the program's RuleList to walk + the source text. The probe for
+-- prim_named_rules below — the mirror image of RuleNamedState, which asks "is this
+-- CALLEE the name of some rule?"; this one asks "is this RULE the name of some
+-- primitive?".
+concept PrimNameState
+  @intention: "A rule list to walk + the source text, for finding rule names that spell a primitive"
+  @source: vexprparse.intent:33
+  fields:
+    rules : RuleList
+    src : text [..256]
+
+
+-- prim_named_rules: how many rules in the program are NAMED after an expression
+-- primitive. Nonzero refuses emission through the verrs gate.
+--
+-- Why this is a verification error and not a style nit: every dispatcher in this
+-- compiler — eval_ast_env, code_size_node, x86_node, code_size_stream_node,
+-- x86_stream_node — tests span_is_* BEFORE falling through to eval_call /
+-- proc_offset. So a rule named `concat` is not "ambiguous", it is UNREACHABLE:
+-- the emitter sizes and emits the primitive and never looks at the rule body, and
+-- the program runs to completion with a different answer than its source reads.
+-- The silence was doubly locked in, because count_badcall_ast EXEMPTS primitive
+-- spans from the undefined-callee lint (that exemption is what span_is_primitive
+-- was written for) — so neither the lint nor the emitter had anything to say.
+--
+-- The compiler verifies, it does not guess. A name whose meaning silently changes
+-- is refused at the DECLARATION, where the name is, rather than mis-resolved at
+-- every call site. Reuses span_is_primitive so this check can never recognise a
+-- different set than the dispatchers do.
+--
+-- Zero on the self-source by construction (no rule here is named after a
+-- primitive), the same precondition resource_errors states for itself. Recurses
+-- over `rules`, a FIELD of the input, so bound + breadcrumb like rule_named.
+rule prim_named_rules
+  @intention: "Count of rules whose own name spells an expression primitive, and which are therefore unreachable"
+  @source: vexprparse.intent:33
+  input:
+    st : PrimNameState
+  output:
+    out : number
+  logic:
+    out = match st.rules:
+      RCons(head, tail) => (if span_is_primitive(SpanCheck { src: st.src, start: rd_name_start(head), len: rd_name_len(head) }) == 1 then 1 else 0) + prim_named_rules(PrimNameState { rules: tail, src: st.src })
+      RNil => 0
+  proofs:
+    purity:
+      reads : [st.rules, st.src]
+      calls : [span_is_primitive, rd_name_start, rd_name_len, prim_named_rules]
+    termination:
+      bound : 4000
+
+
 -- count_badcall_args's input: the argument list to walk + the program's RuleList
 -- (the scope every AstCall callee is resolved against) + the source text. Mirrors
 -- UndefArgsState but carries `rules` instead of `binds`.
@@ -20839,11 +20891,11 @@ rule verify_errors
     let toks = begin_tokenize(ScanState { source: s.source, pos: 0 })
     let prog = parse_program(ProgramState { cell: toks, src: s.source })
     let concepts = parse_concepts(ProgramState { cell: toks, src: s.source })
-    out = diag_count(prog_diags(ProgDiagsState { iter: prog, full: prog, src: s.source, idx: 0, concepts: concepts })) + purity_list(PurityListState { iter: prog, full: prog, src: s.source }) + term_list(TermListState { iter: prog, src: s.source })
+    out = diag_count(prog_diags(ProgDiagsState { iter: prog, full: prog, src: s.source, idx: 0, concepts: concepts })) + purity_list(PurityListState { iter: prog, full: prog, src: s.source }) + term_list(TermListState { iter: prog, src: s.source }) + prim_named_rules(PrimNameState { rules: prog, src: s.source })
   proofs:
     purity:
       reads : [s.source]
-      calls : [begin_tokenize, parse_program, parse_concepts, diag_count, prog_diags, purity_list, term_list]
+      calls : [begin_tokenize, parse_program, parse_concepts, diag_count, prog_diags, purity_list, term_list, prim_named_rules]
     termination:
       bound : 256
 
@@ -30694,7 +30746,7 @@ rule elf_program_src
     -- Effects tier slice 2a: the reaction list — used by reaction_errors (verify)
     -- AND by the has_reaction emit branch + blob_end_off sizing (emit).
     let rxs = parse_reactions(ProgramState { cell: toks, src: s.source })
-    let verrs = arena_scope(toplevel_junk(ProgramState { cell: toks, src: s.source }) + (if rule_list_len(prog) == 0 then 1 else 0) + diag_count(prog_diags(ProgDiagsState { iter: prog, full: prog, src: s.source, idx: 0, concepts: if has_service == 1 then http_concepts else concepts0 })) + purity_list(PurityListState { iter: prog, full: prog, src: s.source }) + term_list(TermListState { iter: prog, src: s.source }) + resource_errors(ResErrState { prog: prog, ress: ress, concepts: concepts0, src: s.source }) + reaction_errors(RxErrState { prog: prog, rxs: rxs, src: s.source, concepts: concepts0 }) + connection_errors(ConnErrState { prog: prog, ress: ress, conns: conns, src: s.source }) + service_errors(ServiceErrState { prog: prog, svcs: svcs, concepts: concepts0, ress: ress, conns: conns, rxs: rxs, src: s.source }))
+    let verrs = arena_scope(toplevel_junk(ProgramState { cell: toks, src: s.source }) + (if rule_list_len(prog) == 0 then 1 else 0) + diag_count(prog_diags(ProgDiagsState { iter: prog, full: prog, src: s.source, idx: 0, concepts: if has_service == 1 then http_concepts else concepts0 })) + purity_list(PurityListState { iter: prog, full: prog, src: s.source }) + term_list(TermListState { iter: prog, src: s.source }) + resource_errors(ResErrState { prog: prog, ress: ress, concepts: concepts0, src: s.source }) + reaction_errors(RxErrState { prog: prog, rxs: rxs, src: s.source, concepts: concepts0 }) + connection_errors(ConnErrState { prog: prog, ress: ress, conns: conns, src: s.source }) + service_errors(ServiceErrState { prog: prog, svcs: svcs, concepts: concepts0, ress: ress, conns: conns, rxs: rxs, src: s.source }) + prim_named_rules(PrimNameState { rules: prog, src: s.source }))
     let sizes = proc_sizes(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: ProcSizeList::PSNil, ress: ress, conns: conns, rxs: rxs, svcs: svcs })
     let uses_var = program_uses_arena(concepts)
     let anytx = prog_any_texty(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: sizes, ress: ress, conns: conns, rxs: rxs, svcs: svcs })
@@ -30738,7 +30790,7 @@ rule elf_program_src
   proofs:
     purity:
       reads : [s.source]
-      calls : [begin_tokenize, parse_program, toplevel_junk, rule_list_len, parse_concepts, parse_resources, parse_reactions, parse_connections, parse_services, resource_errors, reaction_errors, reaction_list_len, x86_reaction_tramp, resource_marshal_size, x86_resource_marshal, program_uses_result, concepts_append_result, concepts_append_http, service_list_len, svc_head, svc_handler_start, svc_handler_len, find_rule, rd_input, rd_out_ty_start, rd_out_ty_len, service_errors, x86_service_tramp, diag_count, prog_diags, purity_list, term_list, proc_sizes, program_uses_arena, prog_any_texty, entry_rule_texty, entry_rule_bytes, entry_rule_result, entry_rule_collection, max_payload_fields, program_uses_text, blob_end_off, x86_program, src_blob, param_list_len, rl_head_params, fields_to_params, rl_head_input, params_to_fields, find_concept_index, fl_head_ty_start, fl_head_ty_len, x86_argv_marshal, x86_stdin_marshal, field_list_has_text, cd_fields, concept_at_index, connection_errors, connection_marshal_size, x86_connection_marshal]
+      calls : [begin_tokenize, parse_program, toplevel_junk, rule_list_len, parse_concepts, parse_resources, parse_reactions, parse_connections, parse_services, resource_errors, reaction_errors, reaction_list_len, x86_reaction_tramp, resource_marshal_size, x86_resource_marshal, program_uses_result, concepts_append_result, concepts_append_http, service_list_len, svc_head, svc_handler_start, svc_handler_len, find_rule, rd_input, rd_out_ty_start, rd_out_ty_len, service_errors, x86_service_tramp, diag_count, prog_diags, purity_list, term_list, proc_sizes, program_uses_arena, prog_any_texty, entry_rule_texty, entry_rule_bytes, entry_rule_result, entry_rule_collection, max_payload_fields, program_uses_text, blob_end_off, x86_program, src_blob, param_list_len, rl_head_params, fields_to_params, rl_head_input, params_to_fields, find_concept_index, fl_head_ty_start, fl_head_ty_len, x86_argv_marshal, x86_stdin_marshal, field_list_has_text, cd_fields, concept_at_index, connection_errors, connection_marshal_size, x86_connection_marshal, prim_named_rules]
     termination:
       bound : 256
 

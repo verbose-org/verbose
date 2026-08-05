@@ -4,6 +4,7 @@ use std::fs;
 use std::path::Path as StdPath;
 
 use crate::ast::*;
+use crate::parser::PRIMITIVE_CALL_NAMES;
 
 #[derive(Debug)]
 pub struct VerifyError {
@@ -102,6 +103,38 @@ pub fn verify_program(program: &Program, base_dir: &StdPath) -> Vec<VerifyError>
             _ => None,
         })
         .collect();
+
+    // A rule may not be named after a built-in expression primitive.
+    //
+    // `parse_primary` special-cases every name in `PRIMITIVE_CALL_NAMES` when
+    // it appears in call position, BEFORE the generic `Expr::Call` fallback. So
+    // a rule named `band` can never be reached: `band(6, 9)` parses as bitwise
+    // AND and evaluates to 0, not as a call to the user's rule. Nothing in the
+    // pipeline noticed — the program compiled, ran, and returned a different
+    // answer than the source reads. The arity-1 form is barely better: it
+    // reports "band requires exactly two arguments", an error about a primitive
+    // the author never mentioned.
+    //
+    // Both shapes are the same defect — a name that silently changes meaning —
+    // and this is the axiom the compiler exists to uphold: it verifies, it does
+    // not guess. So the collision is refused at declaration, where the name is,
+    // rather than mis-resolved at every call site. Same discipline as the
+    // reserved `HttpRequest` / `HttpResponse` concept names above.
+    for item in &program.items {
+        if let Item::Rule(r) = item {
+            if PRIMITIVE_CALL_NAMES.contains(&r.name.as_str()) {
+                errors.push(VerifyError {
+                    context: format!("rule '{}'", r.name),
+                    message: format!(
+                        "rule name '{}' collides with the built-in primitive '{}(...)'; \
+                         the parser resolves '{}(...)' to the primitive, so this rule \
+                         could never be called — rename it",
+                        r.name, r.name, r.name
+                    ),
+                });
+            }
+        }
+    }
 
     // Phase 9 slice 1: collect declared resource names for cross-checking
     // every `read(name)` reference. Duplicate resource names also rejected
@@ -4239,6 +4272,88 @@ rule important_invoice
     fn happy_path() {
         let errs = verify_str(VALID);
         assert!(errs.is_empty(), "expected no errors, got {:#?}", errs);
+    }
+
+    /// A rule named after a built-in primitive is REFUSED, not shadowed.
+    ///
+    /// Before this check, `rule band` verified clean ("all proofs check out")
+    /// and then every `band(a, b)` call site resolved to bitwise AND instead
+    /// of the rule — a silently wrong answer with no diagnostic anywhere in
+    /// the pipeline. `native::tests::streaming_x86_divmod_logic` was the
+    /// casualty that surfaced it: its `rule band(a, b) logic: out = a and b`
+    /// started returning `6 & 9 == 0` instead of `1` the moment the bitwise
+    /// arc taught the compiler `band`.
+    /// A minimal, otherwise-valid one-rule program named `name`. Used by the
+    /// collision tests below so the ONLY thing under test is the rule name.
+    fn one_rule_named(name: &str) -> String {
+        format!(
+            r#"@verbose 0.1.0
+
+concept Invoice
+  @intention: "x"
+  @source: invoices.intent:1
+  fields:
+    amount : number
+
+rule {}
+  @intention: "x"
+  @source: invoices.intent:1
+  input:
+    i : Invoice
+  output:
+    out : number
+  logic:
+    out = i.amount
+  proofs:
+    purity:
+      reads   : [i.amount]
+      calls   : []
+    termination:
+      bound : 1
+"#,
+            name
+        )
+    }
+
+    #[test]
+    fn rule_named_after_a_primitive_is_refused() {
+        let errs = verify_str(&one_rule_named("band"));
+        assert!(
+            errs.iter().any(|e| e.context == "rule 'band'"
+                && e.message.contains("collides with the built-in primitive")),
+            "expected a primitive-collision refusal for `rule band`, got {:#?}",
+            errs
+        );
+    }
+
+    /// The refusal covers the WHOLE closed set, not just the bitwise names
+    /// that surfaced it. Every entry of `PRIMITIVE_CALL_NAMES` is intercepted
+    /// by `parse_primary` in call position, so every entry is equally
+    /// unreachable as a rule name.
+    #[test]
+    fn every_primitive_name_is_refused_as_a_rule_name() {
+        for prim in PRIMITIVE_CALL_NAMES {
+            let errs = verify_str(&one_rule_named(prim));
+            assert!(
+                errs.iter().any(|e| e.message.contains("collides with the built-in primitive")),
+                "`rule {}` must be refused as a primitive collision, got {:#?}",
+                prim, errs
+            );
+        }
+    }
+
+    /// The refusal must not over-reach: a name that merely CONTAINS a
+    /// primitive, or differs in case, is a perfectly ordinary rule name.
+    #[test]
+    fn primitive_lookalike_rule_names_stay_legal() {
+        for ok_name in ["bool_and", "band_of", "my_band", "Band", "lengths", "readx"] {
+            let errs = verify_str(&one_rule_named(ok_name));
+            assert!(
+                !errs.iter().any(|e| e.message.contains("collides with the built-in primitive")),
+                "`rule {}` must NOT be refused as a primitive collision, got {:#?}",
+                ok_name, errs
+            );
+        }
     }
 
     /// `check_expr_against` must type-check bitwise OPERANDS, not just the

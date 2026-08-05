@@ -16,6 +16,63 @@ impl fmt::Display for ParseError {
     }
 }
 
+/// The CLOSED set of names `parse_primary` special-cases in **call position**
+/// — i.e. every `name` for which `name(...)` does NOT parse to
+/// `Expr::Call(name, args)` but to a dedicated `Expr` node.
+///
+/// Why this constant exists: a rule declared with one of these names can never
+/// be called. The parser intercepts the call site before the generic
+/// `Expr::Call` fallback, so `rule band(a, b)` followed by `out = band(6, 9)`
+/// silently means *bitwise and* — a different function, a different answer, no
+/// diagnostic. That is exactly the failure mode the project forbids ("the
+/// compiler verifies, never guesses"): a name whose meaning silently changes.
+/// `verify_program` refuses the collision outright; see the
+/// `rule name collides with a built-in primitive` check in `src/verifier.rs`.
+///
+/// This list is mechanically pinned to the parser by
+/// `primitive_call_names_matches_the_parser_chain` below, which scrapes every
+/// `name == "…"` guard out of this very file and asserts set equality. Adding a
+/// primitive to `parse_primary` without adding it here fails that test, so the
+/// refusal can never drift behind the parser.
+pub const PRIMITIVE_CALL_NAMES: &[&str] = &[
+    "Err",
+    "Ok",
+    "abort_if",
+    "abs",
+    "all",
+    "any",
+    "arena_scope",
+    "band",
+    "bnot",
+    "bor",
+    "bxor",
+    "byte_at",
+    "concat",
+    "contains",
+    "count",
+    "ends_with",
+    "fetch",
+    "filter",
+    "fold",
+    "fold_bytes",
+    "json_escape",
+    "le32",
+    "le64",
+    "length",
+    "map",
+    "match_result",
+    "max",
+    "min",
+    "now_unix",
+    "parse_int",
+    "read",
+    "shl",
+    "shr",
+    "starts_with",
+    "substring",
+    "sum",
+];
+
 pub struct Parser {
     tokens: Vec<Token>,
     pos: usize,
@@ -3278,6 +3335,104 @@ service s
             format!("{:?}", err).contains("requires a 'state:' block"),
             "expected state-required error, got {:?}",
             err
+        );
+    }
+
+    /// Anti-drift gate for `PRIMITIVE_CALL_NAMES`.
+    ///
+    /// The list is consumed by the verifier's collision refusal, but the
+    /// authority on "which names are special-cased in call position" is
+    /// `parse_primary`'s if/else chain — a hand-written dispatch that cannot
+    /// itself be driven off the constant. So the two are tied mechanically
+    /// here instead: scrape every `name == "…"` guard out of this file's own
+    /// source and assert set equality with the constant.
+    ///
+    /// The `(?:^|[^.\w])` equivalent below (the `is_bare_name` filter) excludes
+    /// qualified comparisons such as `c.name == "TokenKind"`, which are concept
+    /// checks elsewhere in the parser, not call-position primitives.
+    ///
+    /// Failure means one of two things, both of which must be fixed in the
+    /// commit that caused them:
+    ///   * a primitive was added to the chain but not to the constant — the
+    ///     verifier would then let a user rule shadow it silently;
+    ///   * a name was removed from the chain but left in the constant — the
+    ///     verifier would then refuse a rule name that is perfectly legal.
+    #[test]
+    fn primitive_call_names_matches_the_parser_chain() {
+        let src = include_str!("parser.rs");
+
+        let bytes = src.as_bytes();
+        let needle = b"name == \"";
+        let mut scraped: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let mut i = 0usize;
+        while i + needle.len() < bytes.len() {
+            if &bytes[i..i + needle.len()] != needle {
+                i += 1;
+                continue;
+            }
+            // Reject qualified forms (`c.name == "…"`, `foo_name == "…"`):
+            // only a bare `name` token counts.
+            let is_bare_name = i == 0 || {
+                let prev = bytes[i - 1];
+                !(prev == b'.' || prev == b'_' || prev.is_ascii_alphanumeric())
+            };
+            if is_bare_name {
+                let start = i + needle.len();
+                if let Some(end_rel) = bytes[start..].iter().position(|&b| b == b'"') {
+                    let name = &src[start..start + end_rel];
+                    if !name.is_empty()
+                        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                    {
+                        scraped.insert(name.to_string());
+                    }
+                }
+            }
+            i += needle.len();
+        }
+
+        // The scrape must not silently find nothing (e.g. if the guard style
+        // is ever refactored to a `match`): that would turn this test into a
+        // no-op that passes forever.
+        assert!(
+            scraped.len() > 20,
+            "the `name == \"…\"` scrape found only {} names — parse_primary's \
+             dispatch style probably changed, and this anti-drift test has \
+             silently stopped checking anything. Rewrite the scrape against \
+             the new style; do NOT delete this test.",
+            scraped.len()
+        );
+
+        let declared: std::collections::BTreeSet<String> =
+            PRIMITIVE_CALL_NAMES.iter().map(|s| s.to_string()).collect();
+
+        let missing: Vec<&String> = scraped.difference(&declared).collect();
+        let extra: Vec<&String> = declared.difference(&scraped).collect();
+
+        assert!(
+            missing.is_empty() && extra.is_empty(),
+            "PRIMITIVE_CALL_NAMES has drifted from parse_primary's dispatch chain.\n\
+             \n\
+             In the parser but NOT in the constant (a user rule with one of these \
+             names would be silently shadowed — add them): {:?}\n\
+             In the constant but NOT in the parser (the verifier refuses a rule \
+             name that is actually legal — remove them): {:?}\n",
+            missing, extra
+        );
+    }
+
+    /// Documents the parse-time symptom the verifier's collision refusal
+    /// replaces. `band(x)` with one argument does not report "you named a rule
+    /// after a primitive" — it reports an arity error for a primitive the
+    /// author never meant to call. Pinned so that if the parse-time message is
+    /// ever improved, whoever does it sees the collision check is the real fix.
+    #[test]
+    fn primitive_name_in_call_position_never_reaches_expr_call() {
+        let src = "@verbose 0.1.0\n\nrule main\n  logic:\n    out = band(1)\n";
+        let err = parse(src).expect_err("band(1) must not parse as a user call");
+        assert!(
+            err.message.contains("band requires exactly two arguments"),
+            "unexpected message: {}",
+            err.message
         );
     }
 
