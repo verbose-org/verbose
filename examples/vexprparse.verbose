@@ -1052,11 +1052,23 @@ concept_group VExpr [max_depth: 4096, max_nodes: 8000000]
 -- this program's single concept_group as the native one-group cap requires.)
 -- ============================================================================
 
+-- ScanState is THE entry concept of the self-hosted front end (elf_program_src
+-- and every fragment driver take it), so its `source` bound is the one the
+-- INPUT-CHANNEL rule reads — see `entry_uses_stdin` in the stdin-channel
+-- section. `[..256]` was a false declaration: this field carries the whole
+-- program source, 1.3 MB of it when the front end compiles itself, and nothing
+-- ever checked the 256. It now declares the real ceiling — 4194304, exactly the
+-- `cmp r13, 0x400000` fail-closed guard the stdin trampoline emits — and that
+-- declaration is EXPLOITED: a text field whose declared bound exceeds Linux's
+-- MAX_ARG_STRLEN (131072) provably cannot be delivered through argv, so the
+-- emitter routes it through stdin instead. Shrink this number below 131072 and
+-- the self-compile switches to the argv channel and stops working; that is the
+-- declaration doing load-bearing work rather than decorating.
 concept ScanState
   @intention: "Scanner position in source text"
   @source: vexprparse.intent:2
   fields:
-    source : text [..256]
+    source : text [..4194304]
     pos : number [0, 4000000]
 
 
@@ -27996,7 +28008,14 @@ rule blob_end_off
     let has_input = if has_svc == 1 then 0 else (if param_list_len(entry_params) > 0 then 1 else 0)
     let efields = params_to_fields(entry_params)
     let ecfields = cd_fields(concept_at_index(ConceptAtState { concepts: pg.concepts, idx: find_concept_index(FindConceptIdxState { concepts: pg.concepts, src: pg.src, q_start: fl_head_ty_start(efields), q_len: fl_head_ty_len(efields), idx: 0 }) }))
-    let msize = if has_input == 1 then (if field_list_has_text(ecfields) == 1 then stdin_marshal_size(ecfields) else argv_marshal_size(ecfields)) else 0
+    -- SIZE half of the channel walk-pair. `entry_uses_stdin` is the SAME rule
+    -- the emit dispatch in elf_program_src calls, on the same (fields, src) —
+    -- one decision, two walks, so the marshal counted here is always the marshal
+    -- emitted there. The two trampolines differ by 55 - 39*k bytes for k text
+    -- fields (stdin's read loop costs 55, and each text field costs 52 on argv
+    -- against 13 on stdin), so splitting the decision drifts p_filesz by that
+    -- much and points src_base into the middle of the source blob.
+    let msize = if has_input == 1 then (if entry_uses_stdin(ChannelState { fields: ecfields, src: pg.src }) == 1 then stdin_marshal_size(ecfields) else argv_marshal_size(ecfields)) else 0
     -- COLLECTIONS tier slice 4b: the collection branch (17 — the bytes-entry
     -- trampoline shape) MUST precede entry_rule_texty here EXACTLY as the
     -- emit-side dispatch in elf_program_src orders it (a map/filter body IS
@@ -28005,7 +28024,7 @@ rule blob_end_off
   proofs:
     purity:
       reads : [pg, pg.rules, pg.src, pg.concepts, pg.sizes, pg.ress, pg.conns, pg.prog, pg.rxs, pg.svcs]
-      calls : [program_uses_arena, reaction_list_len, reaction_tramp_size, service_list_len, service_tramp_size, entry_rule_result, entry_rule_texty, entry_rule_bytes, entry_rule_collection, prog_any_texty, ps_total, resource_marshal_size, param_list_len, rl_head_params, fields_to_params, rl_head_input, params_to_fields, argv_marshal_size, stdin_marshal_size, field_list_has_text, cd_fields, concept_at_index, find_concept_index, fl_head_ty_start, fl_head_ty_len, connection_marshal_size]
+      calls : [program_uses_arena, reaction_list_len, reaction_tramp_size, service_list_len, service_tramp_size, entry_rule_result, entry_rule_texty, entry_rule_bytes, entry_rule_collection, prog_any_texty, ps_total, resource_marshal_size, param_list_len, rl_head_params, fields_to_params, rl_head_input, params_to_fields, argv_marshal_size, stdin_marshal_size, entry_uses_stdin, cd_fields, concept_at_index, find_concept_index, fl_head_ty_start, fl_head_ty_len, connection_marshal_size]
     termination:
       bound : 8000
 
@@ -30503,19 +30522,128 @@ rule x86_argv_marshal
 
 
 -- ============================================================================
--- STDIN INPUT CHANNEL — when the entry rule's record has a TEXT field, the
--- emitted ELF reads its source from fd 0 (stdin) instead of argv, so it can
--- process inputs larger than argv's 128 KiB cap (the self-hosted front end's
--- own 846 KB source). The one text field is read to EOF into the MAP_FIXED
--- region at 0x20000000, packed as (region_off, total_bytes). Number fields keep
--- coming from argv, in declaration order among the number fields (argv[1],
--- argv[2], ... — the text field is NOT in argv). Same arena node-build as the
--- argv trampoline. Deterministic channel choice at emit time: entry has a text
--- field -> stdin; otherwise -> argv. See docs/self-hosting-stdin-channel-design.md
+-- STDIN INPUT CHANNEL — an entry rule whose record has a TEXT field can read
+-- that field from fd 0 (stdin) instead of argv, so it can process inputs larger
+-- than argv's 128 KiB cap (the self-hosted front end's own 1.3 MB source). The
+-- one text field is read to EOF into the MAP_FIXED region at 0x20000000, packed
+-- as (region_off, total_bytes). Number fields keep coming from argv, in
+-- declaration order among the number fields (argv[1], argv[2], ... — the text
+-- field is NOT in argv). Same arena node-build as the argv trampoline.
+--
+-- CHANNEL CHOICE — read this before changing it. The original rule was "entry
+-- has a text field -> stdin, always" (docs/self-hosting-stdin-channel-design.md
+-- picked it as "the simplest deterministic rule" to unblock the self-compile).
+-- It was WRONG for every program that is not the self-compile, and wrong in the
+-- worst way: verbosec's default channel is argv, so a program whose text field
+-- was meant to arrive on argv compiled, ran, exited 0 and returned a wrong
+-- number, because the emitted binary read an empty stdin instead. Measured:
+-- `sha512_fold` returned digest byte 0 = 106 where verbosec and Python
+-- `hashlib` both return 207, and `length(h.data)` over an argv string returned
+-- 0 instead of its length.
+--
+-- The choice is now DERIVED from a declaration instead of assumed. Linux caps a
+-- single argv string at MAX_ARG_STRLEN = 131072 bytes; a text field that
+-- DECLARES a larger maximum (`source : text [..4194304]`) therefore provably
+-- cannot be delivered through argv, and only then does the emitter route it
+-- through stdin. Every other text field — bounded at or below 131072, or with
+-- no declared bound at all — keeps verbosec's default argv channel. So the
+-- channel is visible in the source, at the field, and no program silently
+-- changes its input source. `entry_uses_stdin` is that derivation.
 -- ============================================================================
 
--- field_list_has_text: 1 if any field is text (ty == 2), else 0 — the emit-time
--- switch between the stdin trampoline and the argv one.
+-- fl_text_ty_end: the byte offset just past the FIRST text field's type token
+-- (`ty_start + ty_len`), 0 when the list has no text field. That offset is where
+-- an optional `[..N]` bound starts, so field_text_bound scans from there. Same
+-- shape as field_list_has_text (first-text-field wins; the stdin trampoline
+-- already packs only one text field).
+rule fl_text_ty_end
+  @intention: "Byte offset just past the first text field's type token, 0 if the list has no text field"
+  @source: vexprparse.intent:66
+  input:
+    fl : FieldList
+  output:
+    out : number
+  logic:
+    out = match fl:
+      FCons(name_start, name_len, ty, ty_start, ty_len, rest) => if ty == 2 then ty_start + ty_len else fl_text_ty_end(rest)
+      FNil => 0
+  proofs:
+    purity:
+      reads : [fl]
+      calls : [fl_text_ty_end]
+    termination:
+      bound : 512
+      structural : fl
+
+
+-- field_text_bound: the declared max byte length of a text field, read straight
+-- out of the source at the offset its type token ends. Accepts exactly the
+-- `[..N]` shape the grammar writes (91 = '[', 46 = '.'), after any spaces;
+-- anything else — no bracket, a two-sided `[a, b]` range, EOF — is 0, meaning
+-- "no bound declared". The parser SKIPS the range (skip_field_range), so this
+-- reads the raw bytes rather than the token stream: no FieldList arity change,
+-- and the offset it starts from is the one the parser already recorded.
+-- Total: the `p + 3 >= len` guard covers all three byte_at reads, and
+-- num_value's own digit_run guard covers the digits.
+rule field_text_bound
+  @intention: "Declared [..N] byte bound of a text field whose type token ends at pos, 0 when none is declared"
+  @source: vexprparse.intent:66
+  input:
+    s : ScanState
+  output:
+    out : number
+  logic:
+    let p = skip_spaces(s)
+    let len = length(s.source)
+    out = if p + 3 >= len then 0 else if byte_at(s.source, p) == 91 and byte_at(s.source, p + 1) == 46 and byte_at(s.source, p + 2) == 46 then num_value(ScanState { source: s.source, pos: p + 3 }) else 0
+  proofs:
+    purity:
+      reads : [s.source, s]
+      calls : [skip_spaces, num_value]
+    termination:
+      bound : 256
+
+
+-- The entry concept's field list plus the source those fields' spans index into
+-- — everything entry_uses_stdin needs to decide the input channel.
+concept ChannelState
+  @intention: "The entry concept's field list + the source text its spans index into"
+  @source: vexprparse.intent:66
+  fields:
+    fields : FieldList
+    src : text [..4194304]
+
+
+-- entry_uses_stdin: 1 when the emitted trampoline must read the entry's text
+-- field from stdin, 0 when it reads it from argv (verbosec's default).
+--
+-- The ONLY thing that flips it is a declared bound argv provably cannot carry:
+-- MAX_ARG_STRLEN is 131072 bytes on Linux, so `text [..4194304]` cannot arrive
+-- on argv and `text [..128]` (or an undeclared bound, which reads as 0) can.
+-- Both the SIZE walk (blob_end_off's msize) and the EMIT walk
+-- (elf_program_src's marshal dispatch) call this one rule, so the trampoline
+-- they agree on can never diverge — a mismatch there desyncs p_filesz and
+-- src_base, and every byte_at in the emitted binary then reads garbage.
+rule entry_uses_stdin
+  @intention: "1 if the entry's text field must come from stdin (declared bound > MAX_ARG_STRLEN), 0 for the argv channel"
+  @source: vexprparse.intent:66
+  input:
+    c : ChannelState
+  output:
+    out : number
+  logic:
+    out = if field_list_has_text(c.fields) == 0 then 0 else if field_text_bound(ScanState { source: c.src, pos: fl_text_ty_end(c.fields) }) > 131072 then 1 else 0
+  proofs:
+    purity:
+      reads : [c.fields, c.src]
+      calls : [field_list_has_text, fl_text_ty_end, field_text_bound]
+    termination:
+      bound : 16
+
+
+-- field_list_has_text: 1 if any field is text (ty == 2), else 0. It used to BE
+-- the channel switch on its own; it is now entry_uses_stdin's cheap first test
+-- — no text field means there is no bound to read and nothing to route.
 rule field_list_has_text
   @intention: "1 if the field list contains a text field (ty == 2), 0 otherwise"
   @source: vexprparse.intent:66
@@ -30786,11 +30914,11 @@ rule elf_program_src
     -- trampoline REPLACES the entry_rule_* trampoline cascade (the trigger IS the
     -- head/entry proc, gated + open/write/close instead of itoa+print).
     let has_reaction = if reaction_list_len(rxs) > 0 then 1 else 0
-    out = concat(abort_if(verrs), b"\x7f\x45\x4c\x46\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\x3e\x00\x01\x00\x00\x00\x78\x00\x40\x00\x00\x00\x00\x00\x40\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x40\x00\x38\x00\x01\x00\x00\x00\x00\x00\x00\x00", b"\x01\x00\x00\x00\x05\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x40\x00\x00\x00\x00\x00\x00\x00\x40\x00\x00\x00\x00\x00", le64(fsz), le64(fsz), b"\x00\x10\x00\x00\x00\x00\x00\x00", (if uses_var == 1 then b"\xb8\x09\x00\x00\x00\x31\xff\x48\xbe\x00\x00\x00\x00\x06\x00\x00\x00\xba\x03\x00\x00\x00\x41\xba\x22\x40\x00\x00\x49\xc7\xc0\xff\xff\xff\xff\x45\x31\xc9\x0f\x05\x48\x3d\x01\xf0\xff\xff\x72\x0c\xbf\x01\x00\x00\x00\xb8\x3c\x00\x00\x00\x0f\x05\x49\x89\xc7\x45\x31\xf6" else b""), (if has_input == 1 then (if field_list_has_text(cd_fields(concept_at_index(ConceptAtState { concepts: concepts, idx: ecidx }))) == 1 then x86_stdin_marshal(ArgvTrampState { fields: cd_fields(concept_at_index(ConceptAtState { concepts: concepts, idx: ecidx })), src: s.source, prog: prog, concepts: concepts, sizes: sizes, cidx: ecidx, ress: ress, conns: conns, rxs: rxs, svcs: svcs }) else x86_argv_marshal(ArgvTrampState { fields: cd_fields(concept_at_index(ConceptAtState { concepts: concepts, idx: ecidx })), src: s.source, prog: prog, concepts: concepts, sizes: sizes, cidx: ecidx, ress: ress, conns: conns, rxs: rxs, svcs: svcs })) else b""), x86_resource_marshal(RMarshalState { rem: ress, idx: 0, src: s.source, prog: prog, src_base: 4194304 + fsz0 }), x86_connection_marshal(CMarshalState { rem: conns, idx: 0, src: s.source, prog: prog, src_base: 4194304 + fsz0 }), (if has_service == 1 then x86_service_tramp(ServiceTrampState { svcs: svcs, prog: prog, src: s.source }) else (if has_reaction == 1 then x86_reaction_tramp(RxTrampState { rxs: rxs, src: s.source, anytx: anytx, concepts: concepts, ecidx: ecidx }) else (if entryresult == 1 then concat(b"\xe8", le32(205 + (if anytx == 1 then 86 else 0)), b"\x48\x69\xc0", le32(8 * (max_payload_fields(concepts) + 1)), b"\x4c\x01\xf8\x48\x8b\x08\x48\x8b\x40\x08\x48\x81\xf9", le32(15360000), b"\x0f\x85", le32(96), b"\x48\x83\xec\x20\x49\x89\xc1\x48\x8d\x74\x24\x1f\xc6\x06\x0a\x48\x85\xc0\x79\x03\x48\xf7\xd8\x48\xc7\xc1\x0a\x00\x00\x00\x48\x31\xd2\x48\xf7\xf1\x80\xc2\x30\x48\xff\xce\x88\x16\x48\x85\xc0\x75\xed\x4d\x85\xc9\x79\x06\x48\xff\xce\xc6\x06\x2d\x48\x8d\x54\x24\x20\x48\x29\xf2\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05", b"\x89\xc2\x48\xc1\xe8\x20\x48\xbe", le64(4194304 + blob_end_off(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: sizes, ress: ress, conns: conns, rxs: rxs, svcs: svcs })), b"\x48\x01\xc6\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x02\x00\x00\x00\x0f\x05\x6a\x0a\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x02\x00\x00\x00\x48\x89\xe6\x48\xc7\xc2\x01\x00\x00\x00\x0f\x05\x48\xc7\xc0\x3c\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05") else if entrybytes == 1 then concat(b"\xe8", le32(12 + (if anytx == 1 then 86 else 0)), b"\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05") else if entrycoll == 1 then concat(b"\xe8", le32(12 + (if anytx == 1 then 86 else 0)), b"\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05") else if entrytx == 1 then b"\xe8\x7e\x00\x00\x00\x6a\x0a\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x48\x89\xe6\x48\xc7\xc2\x01\x00\x00\x00\x0f\x05\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05" else concat(b"\xe8", le32(96 + (if anytx == 1 then 86 else 0)), b"\x48\x83\xec\x20\x49\x89\xc1\x48\x8d\x74\x24\x1f\xc6\x06\x0a\x48\x85\xc0\x79\x03\x48\xf7\xd8\x48\xc7\xc1\x0a\x00\x00\x00\x48\x31\xd2\x48\xf7\xf1\x80\xc2\x30\x48\xff\xce\x88\x16\x48\x85\xc0\x75\xed\x4d\x85\xc9\x79\x06\x48\xff\xce\xc6\x06\x2d\x48\x8d\x54\x24\x20\x48\x29\xf2\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05")))), (if anytx == 1 then b"\x48\x83\xec\x28\x49\x89\xc1\x48\x8d\x74\x24\x20\x48\x85\xc0\x79\x03\x48\xf7\xd8\x48\xc7\xc1\x0a\x00\x00\x00\x48\x31\xd2\x48\xf7\xf1\x80\xc2\x30\x48\xff\xce\x88\x16\x48\x85\xc0\x75\xed\x4d\x85\xc9\x79\x06\x48\xff\xce\xc6\x06\x2d\x48\x8d\x54\x24\x20\x48\x29\xf2\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05\x48\x83\xc4\x28\xc3" else b""), x86_program(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: sizes, ress: ress, conns: conns, rxs: rxs, svcs: svcs }), (if uses_text == 1 then src_blob(SrcBlobState { src: s.source, pos: 0 }) else b""))
+    out = concat(abort_if(verrs), b"\x7f\x45\x4c\x46\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\x3e\x00\x01\x00\x00\x00\x78\x00\x40\x00\x00\x00\x00\x00\x40\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x40\x00\x38\x00\x01\x00\x00\x00\x00\x00\x00\x00", b"\x01\x00\x00\x00\x05\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x40\x00\x00\x00\x00\x00\x00\x00\x40\x00\x00\x00\x00\x00", le64(fsz), le64(fsz), b"\x00\x10\x00\x00\x00\x00\x00\x00", (if uses_var == 1 then b"\xb8\x09\x00\x00\x00\x31\xff\x48\xbe\x00\x00\x00\x00\x06\x00\x00\x00\xba\x03\x00\x00\x00\x41\xba\x22\x40\x00\x00\x49\xc7\xc0\xff\xff\xff\xff\x45\x31\xc9\x0f\x05\x48\x3d\x01\xf0\xff\xff\x72\x0c\xbf\x01\x00\x00\x00\xb8\x3c\x00\x00\x00\x0f\x05\x49\x89\xc7\x45\x31\xf6" else b""), (if has_input == 1 then (if entry_uses_stdin(ChannelState { fields: cd_fields(concept_at_index(ConceptAtState { concepts: concepts, idx: ecidx })), src: s.source }) == 1 then x86_stdin_marshal(ArgvTrampState { fields: cd_fields(concept_at_index(ConceptAtState { concepts: concepts, idx: ecidx })), src: s.source, prog: prog, concepts: concepts, sizes: sizes, cidx: ecidx, ress: ress, conns: conns, rxs: rxs, svcs: svcs }) else x86_argv_marshal(ArgvTrampState { fields: cd_fields(concept_at_index(ConceptAtState { concepts: concepts, idx: ecidx })), src: s.source, prog: prog, concepts: concepts, sizes: sizes, cidx: ecidx, ress: ress, conns: conns, rxs: rxs, svcs: svcs })) else b""), x86_resource_marshal(RMarshalState { rem: ress, idx: 0, src: s.source, prog: prog, src_base: 4194304 + fsz0 }), x86_connection_marshal(CMarshalState { rem: conns, idx: 0, src: s.source, prog: prog, src_base: 4194304 + fsz0 }), (if has_service == 1 then x86_service_tramp(ServiceTrampState { svcs: svcs, prog: prog, src: s.source }) else (if has_reaction == 1 then x86_reaction_tramp(RxTrampState { rxs: rxs, src: s.source, anytx: anytx, concepts: concepts, ecidx: ecidx }) else (if entryresult == 1 then concat(b"\xe8", le32(205 + (if anytx == 1 then 86 else 0)), b"\x48\x69\xc0", le32(8 * (max_payload_fields(concepts) + 1)), b"\x4c\x01\xf8\x48\x8b\x08\x48\x8b\x40\x08\x48\x81\xf9", le32(15360000), b"\x0f\x85", le32(96), b"\x48\x83\xec\x20\x49\x89\xc1\x48\x8d\x74\x24\x1f\xc6\x06\x0a\x48\x85\xc0\x79\x03\x48\xf7\xd8\x48\xc7\xc1\x0a\x00\x00\x00\x48\x31\xd2\x48\xf7\xf1\x80\xc2\x30\x48\xff\xce\x88\x16\x48\x85\xc0\x75\xed\x4d\x85\xc9\x79\x06\x48\xff\xce\xc6\x06\x2d\x48\x8d\x54\x24\x20\x48\x29\xf2\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05", b"\x89\xc2\x48\xc1\xe8\x20\x48\xbe", le64(4194304 + blob_end_off(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: sizes, ress: ress, conns: conns, rxs: rxs, svcs: svcs })), b"\x48\x01\xc6\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x02\x00\x00\x00\x0f\x05\x6a\x0a\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x02\x00\x00\x00\x48\x89\xe6\x48\xc7\xc2\x01\x00\x00\x00\x0f\x05\x48\xc7\xc0\x3c\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05") else if entrybytes == 1 then concat(b"\xe8", le32(12 + (if anytx == 1 then 86 else 0)), b"\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05") else if entrycoll == 1 then concat(b"\xe8", le32(12 + (if anytx == 1 then 86 else 0)), b"\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05") else if entrytx == 1 then b"\xe8\x7e\x00\x00\x00\x6a\x0a\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x48\x89\xe6\x48\xc7\xc2\x01\x00\x00\x00\x0f\x05\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05" else concat(b"\xe8", le32(96 + (if anytx == 1 then 86 else 0)), b"\x48\x83\xec\x20\x49\x89\xc1\x48\x8d\x74\x24\x1f\xc6\x06\x0a\x48\x85\xc0\x79\x03\x48\xf7\xd8\x48\xc7\xc1\x0a\x00\x00\x00\x48\x31\xd2\x48\xf7\xf1\x80\xc2\x30\x48\xff\xce\x88\x16\x48\x85\xc0\x75\xed\x4d\x85\xc9\x79\x06\x48\xff\xce\xc6\x06\x2d\x48\x8d\x54\x24\x20\x48\x29\xf2\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05")))), (if anytx == 1 then b"\x48\x83\xec\x28\x49\x89\xc1\x48\x8d\x74\x24\x20\x48\x85\xc0\x79\x03\x48\xf7\xd8\x48\xc7\xc1\x0a\x00\x00\x00\x48\x31\xd2\x48\xf7\xf1\x80\xc2\x30\x48\xff\xce\x88\x16\x48\x85\xc0\x75\xed\x4d\x85\xc9\x79\x06\x48\xff\xce\xc6\x06\x2d\x48\x8d\x54\x24\x20\x48\x29\xf2\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05\x48\x83\xc4\x28\xc3" else b""), x86_program(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: sizes, ress: ress, conns: conns, rxs: rxs, svcs: svcs }), (if uses_text == 1 then src_blob(SrcBlobState { src: s.source, pos: 0 }) else b""))
   proofs:
     purity:
       reads : [s.source]
-      calls : [begin_tokenize, parse_program, toplevel_junk, rule_list_len, parse_concepts, parse_resources, parse_reactions, parse_connections, parse_services, resource_errors, reaction_errors, reaction_list_len, x86_reaction_tramp, resource_marshal_size, x86_resource_marshal, program_uses_result, concepts_append_result, concepts_append_http, service_list_len, svc_head, svc_handler_start, svc_handler_len, find_rule, rd_input, rd_out_ty_start, rd_out_ty_len, service_errors, x86_service_tramp, diag_count, prog_diags, purity_list, term_list, proc_sizes, program_uses_arena, prog_any_texty, entry_rule_texty, entry_rule_bytes, entry_rule_result, entry_rule_collection, max_payload_fields, program_uses_text, blob_end_off, x86_program, src_blob, param_list_len, rl_head_params, fields_to_params, rl_head_input, params_to_fields, find_concept_index, fl_head_ty_start, fl_head_ty_len, x86_argv_marshal, x86_stdin_marshal, field_list_has_text, cd_fields, concept_at_index, connection_errors, connection_marshal_size, x86_connection_marshal, prim_named_rules]
+      calls : [begin_tokenize, parse_program, toplevel_junk, rule_list_len, parse_concepts, parse_resources, parse_reactions, parse_connections, parse_services, resource_errors, reaction_errors, reaction_list_len, x86_reaction_tramp, resource_marshal_size, x86_resource_marshal, program_uses_result, concepts_append_result, concepts_append_http, service_list_len, svc_head, svc_handler_start, svc_handler_len, find_rule, rd_input, rd_out_ty_start, rd_out_ty_len, service_errors, x86_service_tramp, diag_count, prog_diags, purity_list, term_list, proc_sizes, program_uses_arena, prog_any_texty, entry_rule_texty, entry_rule_bytes, entry_rule_result, entry_rule_collection, max_payload_fields, program_uses_text, blob_end_off, x86_program, src_blob, param_list_len, rl_head_params, fields_to_params, rl_head_input, params_to_fields, find_concept_index, fl_head_ty_start, fl_head_ty_len, x86_argv_marshal, x86_stdin_marshal, entry_uses_stdin, cd_fields, concept_at_index, connection_errors, connection_marshal_size, x86_connection_marshal, prim_named_rules]
     termination:
       bound : 256
 

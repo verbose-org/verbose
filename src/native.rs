@@ -22952,18 +22952,22 @@ rule le64_neg
         let fixture = std::env::temp_dir().join("verbosec_test_eff_s1_stdin_fixture.txt");
         let fpath = fixture.to_str().unwrap();
 
-        // Entry rule takes a TEXT field `data` -> the self-hosted emitter routes
-        // the target to the STDIN channel, which reads ALL of stdin into the
-        // region area [0, 0x400000). The resource slots live at 0x400000+, so a
-        // collision would corrupt read(cfg). `data` is present only to force the
-        // stdin channel (it is intentionally unread — a text field in a concat
-        // would itoa, a separate pre-existing self-hosted limitation); the probe
-        // is that read(cfg) survives a fully-occupied source region.
+        // Entry rule takes a TEXT field `data` DECLARED `[..4194304]` — a bound
+        // beyond Linux's MAX_ARG_STRLEN (131072), so argv provably cannot carry
+        // it and the self-hosted emitter routes the target to the STDIN channel,
+        // which reads ALL of stdin into the region area [0, 0x400000). (Drop the
+        // bound and the field rides argv instead — that derivation is pinned by
+        // two_generation_gen0_reads_argv_text_input_field.) The resource slots
+        // live at 0x400000+, so a collision would corrupt read(cfg). `data` is
+        // present only to select the stdin channel (it is intentionally unread —
+        // a text field in a concat would itoa, a separate pre-existing
+        // self-hosted limitation); the probe is that read(cfg) survives a
+        // fully-occupied source region.
         let self_src = format!(
-            "concept Src\n  fields:\n    data : text\nresource cfg\n  path: \"{}\"\n  max: 256\n  on_read_error: abort\nrule main\n  input:\n    s : Src\n  output:\n    out : text\n  logic:\n    out = concat(\"cfg=\", read(cfg))\n  proofs:\n    purity:\n      reads : [cfg]\n      calls : []\n    termination:\n      bound : 8",
+            "concept Src\n  fields:\n    data : text [..4194304]\nresource cfg\n  path: \"{}\"\n  max: 256\n  on_read_error: abort\nrule main\n  input:\n    s : Src\n  output:\n    out : text\n  logic:\n    out = concat(\"cfg=\", read(cfg))\n  proofs:\n    purity:\n      reads : [cfg]\n      calls : []\n    termination:\n      bound : 8",
             fpath);
         let oracle_src = format!(
-            "@verbose 0.1.0\n\nresource cfg\n  @intention: \"c\"\n  @source: e.intent:1\n  path: \"{}\"\n  max: 256\n  on_read_error: abort\n\nconcept Src\n  @intention: \"s\"\n  @source: e.intent:1\n  fields:\n    data : text\n\nrule main\n  @intention: \"m\"\n  @source: e.intent:1\n  input:\n    s : Src\n  output:\n    out : text\n  logic:\n    out = concat(\"cfg=\", read(cfg))\n  proofs:\n    purity:\n      reads : [cfg]\n      calls : []\n    termination:\n      bound : 8",
+            "@verbose 0.1.0\n\nresource cfg\n  @intention: \"c\"\n  @source: e.intent:1\n  path: \"{}\"\n  max: 256\n  on_read_error: abort\n\nconcept Src\n  @intention: \"s\"\n  @source: e.intent:1\n  fields:\n    data : text [..4194304]\n\nrule main\n  @intention: \"m\"\n  @source: e.intent:1\n  input:\n    s : Src\n  output:\n    out : text\n  logic:\n    out = concat(\"cfg=\", read(cfg))\n  proofs:\n    purity:\n      reads : [cfg]\n      calls : []\n    termination:\n      bound : 8",
             fpath);
 
         let mc = Command::new(&elf).args([self_src.as_str(), "0"]).output()
@@ -42840,13 +42844,16 @@ rule two
 
     /// RUNTIME TEXT INPUT — the self-hosted emitter's input trampoline. The ELF that
     /// elf_program_src emits reads the entry rule's record input, builds the record
-    /// in the node arena at a MAP_FIXED region, and calls the entry proc. When the
-    /// entry concept has a TEXT field (word_length / count_rules take a ScanState
-    /// whose `source` is text), that field is read from STDIN to EOF (the stdin
-    /// channel — argv's 128 KiB cap can't carry a real source); number fields keep
-    /// coming from argv in declaration order. This lets self-fragments run on REAL
-    /// input with NO wrapper `main` — the front-end (count_rules) can finally be
-    /// driven on its multi-line-program input, at any size.
+    /// in the node arena at a MAP_FIXED region, and calls the entry proc. A TEXT
+    /// field comes from argv (verbosec's default channel) unless the field DECLARES
+    /// a bound larger than Linux's MAX_ARG_STRLEN (131072), in which case argv
+    /// provably cannot carry it and the stdin channel is emitted instead. Both
+    /// halves are exercised here on the same emitter: `examples/scan_word.verbose`
+    /// declares `source : text [..256]` and runs on argv; the count_rules closure
+    /// carries vexprparse's own `source : text [..4194304]` and runs on stdin.
+    /// Number fields always come from argv in declaration order. This lets
+    /// self-fragments run on REAL input with NO wrapper `main` — the front-end
+    /// (count_rules) can be driven on its multi-line-program input, at any size.
     ///
     /// Gates (all against the REAL verbosec-compiled binary as oracle):
     ///   * Scanner on argv: verbatim examples/scan_word.verbose (entry word_length,
@@ -42894,12 +42901,13 @@ rule two
             let r = Command::new(bin).arg(a1).arg(a2).output().expect("spawn");
             (String::from_utf8_lossy(&r.stdout).trim().to_string(), r.status)
         };
-        // Emit an ELF for `source` via elf_program_src, then run it. The entry
-        // rules here (word_length / count_rules) take a ScanState whose `source`
-        // field is TEXT, so the emitted ELF now reads that text from STDIN (the
-        // stdin channel — argv can't carry >128 KiB); a1 is piped to stdin and
-        // the number field (pos) arrives on argv as a2.
-        let emit_then_run = |source: &str, a1: &str, a2: &str, tag: &str| -> (String, std::process::ExitStatus) {
+        // Emit an ELF for `source` via elf_program_src, then run it. `via_stdin`
+        // says which channel the emitted binary uses for its text field — it is
+        // NOT a free choice, it must match what the field DECLARES (bound above
+        // MAX_ARG_STRLEN -> stdin, otherwise argv). The number field (pos)
+        // always arrives on argv as a2.
+        let emit_then_run = |source: &str, a1: &str, a2: &str, tag: &str, via_stdin: bool|
+                -> (String, std::process::ExitStatus) {
             use std::io::Write;
             let mc = Command::new(&elf).args([source, "0"]).output().expect("spawn emitter");
             assert!(mc.status.success(), "elf_program_src must exit 0 for {}", tag);
@@ -42909,20 +42917,27 @@ rule two
             let mut perms = fs::metadata(&p).unwrap().permissions();
             perms.set_mode(0o755);
             fs::set_permissions(&p, perms).expect("chmod");
-            let mut child = Command::new(&p).arg(a2)
+            let mut cmd = Command::new(&p);
+            if via_stdin { cmd.arg(a2); } else { cmd.arg(a1).arg(a2); }
+            let mut child = cmd
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())
                 .spawn().expect("run emitted ELF");
-            child.stdin.take().unwrap().write_all(a1.as_bytes()).expect("write stdin");
+            {
+                let mut si = child.stdin.take().unwrap();
+                if via_stdin { si.write_all(a1.as_bytes()).expect("write stdin"); }
+            }
             let r = child.wait_with_output().expect("wait emitted ELF");
             let _ = fs::remove_file(&p);
             (String::from_utf8_lossy(&r.stdout).trim().to_string(), r.status)
         };
 
-        // (1) Scanner via stdin: verbatim scan_word (entry word_length, NO wrapper main);
-        //     source text piped to stdin, pos on argv.
+        // (1) Scanner via ARGV: verbatim scan_word (entry word_length, NO wrapper
+        //     main). Its `source : text [..256]` fits in an argv string, so the
+        //     emitted ELF takes source and pos on argv — the SAME invocation the
+        //     verbosec-compiled oracle below takes.
         for input in ["hello world", "abc", "  x"] {
-            let (got, st) = emit_then_run(&sw_src, input, "0", "sw");
+            let (got, st) = emit_then_run(&sw_src, input, "0", "sw", false);
             assert!(st.success(), "scanner ELF must exit 0 for {:?}", input);
             let (oracle, _) = run_bin(&sw_oracle, input, "0");
             assert_eq!(got, oracle,
@@ -43001,8 +43016,12 @@ rule two
 
         let two_rule = "rule a\n  logic:\n    out = 1\nrule b\n  logic:\n    out = 2";
         let one_rule = "rule a\n  logic:\n    out = 1";
+        // The closure carries vexprparse's OWN ScanState — `source : text
+        // [..4194304]`, a bound argv cannot carry — so this half runs on the
+        // stdin channel. Same emitter, same run, opposite channel: the two
+        // halves of this loop are what pins the derivation both ways.
         for (prog, expect) in [(two_rule, "2"), (one_rule, "1"), ("1 + 2", "0")] {
-            let (got, st) = emit_then_run(&frag, prog, "0", "cr");
+            let (got, st) = emit_then_run(&frag, prog, "0", "cr", true);
             assert!(st.success(), "count_rules ELF must exit 0 for {:?}", prog);
             let (oracle, _) = run_bin(&cr_oracle, prog, "0");
             assert_eq!(oracle, expect, "oracle sanity: count_rules({:?})", prog);
@@ -44916,6 +44935,183 @@ rule two
 
         let _ = fs::remove_file(&gen0);
         let _ = fs::remove_file(&out_elf);
+    }
+
+    /// gen0 reads an argv `text` input field — pinned against an EXTERNAL
+    /// oracle, not against gen0 itself.
+    ///
+    /// The defect this pins was a SILENT WRONG ANSWER, the third of its kind
+    /// from the self-hosted emitter and the worst: the emitted binary compiled,
+    /// ran, exited 0 and returned a number that was simply not the answer. The
+    /// corpus-acceptance sweep above cannot see it — acceptance is "gen0 exited
+    /// 0 having written an ELF", and this binary did exactly that.
+    ///
+    /// Cause: gen0 has two input trampolines (`x86_argv_marshal` and
+    /// `x86_stdin_marshal`) and its channel rule was "the entry concept has a
+    /// text field -> stdin, always" (docs/self-hosting-stdin-channel-design.md
+    /// chose it as "the simplest deterministic rule" to unblock the
+    /// self-compile). verbosec's default channel is argv. So every program
+    /// whose text field was meant to arrive on argv got a binary that read an
+    /// EMPTY stdin instead, and the 52-byte text arm of `x86_marshal_fields`
+    /// was unreachable dead code the whole time. The channel is now derived
+    /// from the field's declared bound: > MAX_ARG_STRLEN (131072) means argv
+    /// provably cannot carry it, so stdin; anything else keeps argv.
+    ///
+    /// Three properties, each of which failed or could silently regress alone:
+    ///   (a) the argv POINTER is right — `byte_at(h.data, 1)` picks the second
+    ///       byte of the argv string (a length-only assertion would still pass
+    ///       with a pointer into the wrong region);
+    ///   (b) the argv LENGTH is right — `length(h.data)` over two different
+    ///       strings, so a constant is not mistaken for a correct answer;
+    ///   (c) a text field declaring a bound argv cannot carry STILL routes to
+    ///       stdin — without this the fix would break the self-compile, whose
+    ///       entry field is `source : text [..4194304]`.
+    ///
+    /// Then the external oracle: `examples/sha512_fold.verbose` on the empty
+    /// message. Python `hashlib.sha512(b"").digest()[0]` is 207 (the digest is
+    /// the well-known cf83e135…, and 0xcf == 207); verbosec's own backend
+    /// returns 207; gen0 returned 106 before this fix, because `byte_at` was
+    /// reading the zeroed mmap region instead of the argv hex blob. Nothing in
+    /// this test derives its expected values from the compiler under test.
+    #[test]
+    #[ignore = "builds gen0 from the full self-source (~10 s) + emits a 230 KB crypto binary; run with --ignored"]
+    #[cfg(target_arch = "x86_64")]
+    fn two_generation_gen0_reads_argv_text_input_field() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        let src = fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let tmp = std::env::temp_dir();
+        let gen0 = tmp.join("verbosec_test_argvtext_gen0");
+        compile_native_stdin_raw(&program, "elf_program_src", gen0.to_str().unwrap())
+            .expect("elf_program_src must compile --stdin-raw");
+        let chmod = |p: &std::path::Path| {
+            let mut perms = fs::metadata(p).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(p, perms).unwrap();
+        };
+        chmod(&gen0);
+
+        // gen0-compile `prog_src` and return the emitted ELF's path.
+        let emit = |tag: &str, prog_src: &str| -> std::path::PathBuf {
+            let sp = tmp.join(format!("verbosec_test_argvtext_{tag}.verbose"));
+            fs::write(&sp, prog_src).unwrap();
+            let bp = tmp.join(format!("verbosec_test_argvtext_{tag}.elf"));
+            let st = Command::new("sh")
+                .arg("-c")
+                .arg(format!(
+                    "ulimit -s unlimited; '{}' 0 < '{}' > '{}'",
+                    gen0.display(), sp.display(), bp.display()
+                ))
+                .status()
+                .expect("run gen0");
+            assert!(st.success(), "gen0 must accept + emit {tag}");
+            assert!(fs::metadata(&bp).unwrap().len() > 0, "gen0 emitted no bytes for {tag}");
+            chmod(&bp);
+            let _ = fs::remove_file(&sp);
+            bp
+        };
+
+        // `[..128]` — a bound argv can carry, so the argv channel.
+        let argv_prog = "\
+@verbose 0.1.0
+
+concept H
+  @intention: \"one text field delivered on argv\"
+  @source: invoices.intent:1
+  fields:
+    data : text [..128]
+
+rule probe
+  @intention: \"second byte and byte length of the argv text field\"
+  @source: invoices.intent:1
+  input:
+    h : H
+  output:
+    out : number
+  logic:
+    out = byte_at(h.data, 1) * 1000 + length(h.data)
+  proofs:
+    purity:
+      reads : [h.data]
+      calls : []
+    termination:
+      bound : 1
+";
+        let argv_bin = emit("argv", argv_prog);
+        let run = |bin: &std::path::Path, args: &[&str], stdin_bytes: &str| -> String {
+            // Feed stdin explicitly so an empty pipe (not an inherited tty)
+            // is what the binary would see if it read the wrong channel.
+            let sh = format!(
+                "printf '%s' '{}' | '{}' {}",
+                stdin_bytes, bin.display(),
+                args.iter().map(|a| format!("'{a}'")).collect::<Vec<_>>().join(" ")
+            );
+            let o = Command::new("sh").arg("-c").arg(sh).output().expect("run emitted binary");
+            assert!(o.status.success(), "emitted binary must exit 0, got {:?}", o.status);
+            String::from_utf8_lossy(&o.stdout).trim().to_string()
+        };
+
+        // (a) + (b): "hello" -> byte_at 1 == 'e' == 101, length == 5.
+        // Pre-fix this was "0": the binary read an empty stdin, so the packed
+        // (ptr, len) was (region, 0) and every read landed on zeroed pages.
+        assert_eq!(
+            run(&argv_bin, &["hello"], ""), "101005",
+            "gen0 must read the argv text field: byte_at(data,1)=101 ('e'), length=5"
+        );
+        // A different string, so a constant cannot pass: "Zx23456789" ->
+        // byte_at 1 == 'x' == 120, length == 10.
+        assert_eq!(
+            run(&argv_bin, &["Zx23456789"], ""), "120010",
+            "gen0 must read a SECOND argv text field correctly (not a constant)"
+        );
+        // And stdin must be IGNORED on the argv channel — same argv, a stdin
+        // blob that would produce a different answer if it were read.
+        assert_eq!(
+            run(&argv_bin, &["hello"], "wwwwwwwwwwwwwwwwwwww"), "101005",
+            "argv-channel binary must ignore stdin entirely"
+        );
+
+        // (c) `[..4194304]` — larger than MAX_ARG_STRLEN, so argv provably
+        // cannot carry it and the stdin channel must still be selected. This
+        // is the property the self-compile depends on (ScanState.source).
+        let stdin_prog = argv_prog.replace("data : text [..128]", "data : text [..4194304]");
+        assert_ne!(stdin_prog, argv_prog, "the bound edit must apply");
+        let stdin_bin = emit("stdin", &stdin_prog);
+        assert_eq!(
+            run(&stdin_bin, &[], "hello"), "101005",
+            "a text field declaring a bound argv cannot carry must still read stdin"
+        );
+
+        // THE EXTERNAL ORACLE. SHA-512 of the empty message, one pre-padded
+        // 128-byte block as hex on argv; digest byte 0 must be 207.
+        //   python3 -c "import hashlib; print(hashlib.sha512(b'').digest()[0])"
+        //   -> 207        (digest = cf83e1357eefb8bd…, 0xcf == 207)
+        // The 8 IV words are FIPS 180-4's, written as signed i64.
+        let sha512 = fs::read_to_string("examples/sha512_fold.verbose")
+            .expect("examples/sha512_fold.verbose must exist");
+        let sha_bin = emit("sha512", &sha512);
+        let block: String = format!("80{}", "00".repeat(127));
+        let args: Vec<&str> = vec![
+            "7640891576956012808", "-4942790177534073029", "4354685564936845355",
+            "-6534734903238641935", "5840696475078001361", "-7276294671716946913",
+            "2270897969802886507", "6620516959819538809",
+            "1", "1", "0", &block,
+        ];
+        assert_eq!(
+            run(&sha_bin, &args, ""), "207",
+            "gen0-compiled sha512_fold must agree with hashlib.sha512(b\"\").digest()[0] == 207 \
+             (it returned 106 while the text field was read from an empty stdin)"
+        );
+
+        for p in [&gen0, &argv_bin, &stdin_bin, &sha_bin] {
+            let _ = fs::remove_file(p);
+        }
     }
 
     /// THE COMPOSITE DEMO (2026-07): examples/expense_audit.verbose — a

@@ -1,5 +1,21 @@
 # stdin input channel — the self-hosted front end reads its own full source
 
+> **AMENDED — the channel rule below is superseded.** This document is kept as
+> the record of why the stdin channel exists; §"Choice of channel" is no longer
+> what the emitter does. The rule it proposed — "text field ALWAYS from stdin
+> when present" — was right for the self-compile and a **silent wrong answer**
+> for every other program: verbosec's default channel is argv, so any program
+> whose text field was meant to arrive on argv got a binary that compiled, ran,
+> exited 0, and read an EMPTY stdin. Measured: `length(h.data)` over an argv
+> string returned 0, and `sha512_fold` returned digest byte 0 = 106 where
+> verbosec and Python `hashlib` both return 207. It is now derived instead of
+> assumed: **stdin iff the text field DECLARES a bound above Linux's
+> `MAX_ARG_STRLEN` (131072)** — i.e. only when argv provably cannot carry the
+> value. `ScanState.source` therefore declares its real ceiling,
+> `text [..4194304]`, which is what keeps the self-compile on stdin. See
+> `entry_uses_stdin` in `examples/vexprparse.verbose` and the CLAUDE.md section
+> "gen0's input channel is DERIVED from the field's declared bound".
+
 ## Why (profiled, not assumed)
 The runtime-input trampoline (PR #91) marshals argv. But `MAX_ARG_STRLEN` = 128 KiB,
 and vexprparse's own source is **846 KB** — argv cannot carry it. Measured. So the
