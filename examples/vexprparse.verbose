@@ -20,9 +20,15 @@
 -- ladder to the FULL expression precedence: logical or/and, comparisons, and
 -- prefix unary (not / negation). Brick 5 grew `primary` to identifiers, function
 -- calls, and field access. Brick 6 adds a CONDITIONAL EXPRESSION as the highest-
--- level alternative in `primary`: `if cond then thn else els`, the single-line
--- form (there is no INDENT/DEDENT in this tokenizer, so the multi-line block is a
--- later brick). The grammar (mirroring src/parser.rs, lowest to highest):
+-- level alternative in `primary`: `if cond then thn else els`. Both the
+-- single-line and the MULTI-LINE forms parse: brick 8b gave this tokenizer real
+-- Python-style INDENT/DEDENT (`line_width` / `tokenize_indent` / the ColStack;
+-- `tok_kind` emits Newline=600 / Indent=700 / Dedent=800), and the if-chain
+-- peeks for `then` / `else` through `skip_seps`, so separators between the parts
+-- of an if-expression are transparent. (This banner claimed "there is no
+-- INDENT/DEDENT in this tokenizer" for far longer than it was true — long enough
+-- to get multi-line if/else mis-scoped as a column-stack project when it was a
+-- six-line separator-skip.) The grammar (mirroring src/parser.rs, lowest to highest):
 --
 --   parse_expr = or_expr
 --   or_expr    = and_expr ('or'  and_expr)*                 -- left-assoc, kw 'or'
@@ -281,8 +287,9 @@ concept_group VExpr [max_depth: 4096, max_nodes: 8000000]
       -- A conditional expression: if cond then thn else els. All three are
       -- sub-expressions (each a full parse_or). eval_ast evaluates cond, then
       -- the SELECTED branch only (the language's lazy if, so the dead branch's
-      -- eval_ast never runs). Brick 6: single-line form only — there is no
-      -- INDENT/DEDENT in this tokenizer, so the multi-line form is a later brick.
+      -- eval_ast never runs). Brick 6 shipped the single-line form; the
+      -- multi-line form parses too, since the if-chain peeks for `then` / `else`
+      -- through `skip_seps` over brick 8b's Newline / Indent tokens.
       AstIf of (cond : Ast, thn : Ast, els : Ast)
       -- A boolean literal leaf: value is 1 for `true`, 0 for `false`. Brick 7.
       -- Unlike AstStr/AstVar, a boolean DOES carry an arithmetic value, so
@@ -2612,8 +2619,10 @@ concept FieldState
 
 
 -- ============================================================================
--- BRICK 6: `if cond then thn else els` as an expression. The single-line form
--- only — there is no INDENT/DEDENT in this tokenizer. parse_primary detects the
+-- BRICK 6: `if cond then thn else els` as an expression. Single-line AND
+-- multi-line: the three keyword peeks go through `skip_seps`, so brick 8b's
+-- Newline (600) / Indent (700) tokens are transparent between the parts of an
+-- if-expression (and ONLY there — see the if_then banner). parse_primary detects the
 -- `if` keyword (kind 201) and threads three sub-parses (cond / thn / els, each a
 -- full parse_or) through a chain of continuation rules, because a Verbose rule
 -- has ONE input and `let` is EAGER (a let-bound parse_or would fire on every
@@ -3812,6 +3821,37 @@ rule field_rest
 -- Parse the then-branch (a full parse_or) from then_pos and hand it, with the
 -- cond node, to if_else. The parse_or is unconditional (a then-branch is always
 -- required once we are in an if-expression) and strictly advances position.
+--
+-- MULTI-LINE if/else. Both peeks below go through `skip_seps`, so a Newline
+-- (600) or Indent (700) sitting between the condition and `then` is transparent.
+-- Without it the raw cursor sees kind 600/700 instead of 207, the "tolerate the
+-- absence" arm fires, parse_or is handed a separator and returns AstErr
+-- consuming nothing — the whole parse collapses. Newline is the band that
+-- matters most: a `then` / `else` continuation at the SAME column emits only
+-- Newlines, no Indent. This mirrors verbosec's `skip_if_separators`
+-- (src/parser.rs), which parse_primary's if-branch calls at six points.
+--
+-- Separators are transparent ONLY in the three if-keyword positions (before
+-- `then`, after `then`, before/after `else`). This is deliberately NOT a general
+-- line-continuation rule: verbosec REJECTS `r = n.v +` newline `1`, so making
+-- separators transparent everywhere would let gen0 accept programs verbosec
+-- refuses — a new divergence row, in the wrong direction.
+--
+-- KNOWN LATENT DIVERGENCE (documented, measured benign, not fixed here).
+-- verbosec's `skip_if_separators` carries a `depth` counter: it increments on
+-- each Indent it eats and only consumes a Dedent while depth > 0, so the
+-- if-expression leaves the indent state exactly where it found it. gen0's
+-- `skip_seps` has no counter — it eats an Indent WITHOUT ever pairing the
+-- matching Dedent. Measured across all 151 corpus files that is harmless:
+-- `parse_stmts` re-skips separators at every statement head and the item-level
+-- walk ends on `skip_seps_dedent`, which absorbs strays. But a future shape that
+-- OPENS a block inside an if-expression and needs the closing Dedent to be seen
+-- by the enclosing parser would silently mis-nest, and the failure mode is the
+-- worst one this compiler has: a truncated emit at exit 0 (the class PR #141
+-- fixed). REMEDY when that day comes: give skip_seps a `DedentResult`-shaped
+-- `(cell, depth)` return so the if-chain can thread the count through if_then ->
+-- if_else -> if_build and rebalance after the else-branch, exactly as verbosec's
+-- trailing `while depth > 0` loop does.
 rule if_then
   @intention: "Consume 'then' after the condition, parse the then-branch, continue to if_else"
   @source: vexprparse.intent:25
@@ -3821,14 +3861,14 @@ rule if_then
     out : Parsed
   logic:
     let cond_node = parsed_node(cs.cond)
-    let cond_next = parsed_next(cs.cond)
+    let cond_next = skip_seps(ParseState { cell: parsed_next(cs.cond) })
     let knd = peek_kind(cond_next)
-    let then_pos = if knd == 207 then advance(Advance { lst: cond_next, k: 1 }) else cond_next
+    let then_pos = if knd == 207 then skip_seps(ParseState { cell: advance(Advance { lst: cond_next, k: 1 }) }) else cond_next
     out = if_else(IfElseState { cond_node: cond_node, thn: parse_or(ParseState { cell: then_pos }) })
   proofs:
     purity:
       reads : [cs.cond]
-      calls : [parsed_node, parsed_next, peek_kind, if_else, parse_or, advance]
+      calls : [parsed_node, parsed_next, peek_kind, if_else, parse_or, advance, skip_seps]
     termination:
       bound : 512
 
@@ -3838,6 +3878,12 @@ rule if_then
 -- should sit at thn_next; step over it if present (else_pos = thn_next + 1),
 -- tolerate its absence otherwise. Parse the else-branch from else_pos and hand
 -- it, with the cond + thn nodes, to if_build.
+--
+-- Both peeks go through `skip_seps` for multi-line if/else — see the banner on
+-- if_then for the full rationale and the documented depth-counter divergence.
+-- Note that if_build (the else-branch continuation) deliberately does NOT skip:
+-- the separator AFTER the else-branch belongs to the enclosing parse_stmts,
+-- which needs the Newline to find the next statement.
 rule if_else
   @intention: "Consume 'else' after the then-branch, parse the else-branch, continue to if_build"
   @source: vexprparse.intent:25
@@ -3847,14 +3893,14 @@ rule if_else
     out : Parsed
   logic:
     let thn_node = parsed_node(cs.thn)
-    let thn_next = parsed_next(cs.thn)
+    let thn_next = skip_seps(ParseState { cell: parsed_next(cs.thn) })
     let knd = peek_kind(thn_next)
-    let else_pos = if knd == 208 then advance(Advance { lst: thn_next, k: 1 }) else thn_next
+    let else_pos = if knd == 208 then skip_seps(ParseState { cell: advance(Advance { lst: thn_next, k: 1 }) }) else thn_next
     out = if_build(IfBuildState { cond_node: cs.cond_node, thn_node: thn_node, els: parse_or(ParseState { cell: else_pos }) })
   proofs:
     purity:
       reads : [cs.cond_node, cs.thn]
-      calls : [parsed_node, parsed_next, peek_kind, if_build, parse_or, advance]
+      calls : [parsed_node, parsed_next, peek_kind, if_build, parse_or, advance, skip_seps]
     termination:
       bound : 512
 
@@ -3972,11 +4018,11 @@ rule parse_primary
     let vlen = peek_len(advance(Advance { lst: st.cell, k: 2 }))
     let has_braces = if peek_op_code(advance(Advance { lst: st.cell, k: 3 })) == 23 then 1 else 0
     let isrecord = if next_opc == 23 then 1 else 0
-    out = if ismatch == 1 then parse_match(st) else if ismatchresult == 1 then parse_match_result(st) else if issum == 1 then parse_reduce(ReduceState { cell: st.cell, kind: 0 }) else if iscount == 1 then parse_reduce(ReduceState { cell: st.cell, kind: 1 }) else if isall == 1 then parse_reduce(ReduceState { cell: st.cell, kind: 2 }) else if isany == 1 then parse_reduce(ReduceState { cell: st.cell, kind: 3 }) else if ismap == 1 then parse_reduce(ReduceState { cell: st.cell, kind: 4 }) else if isfilter == 1 then parse_reduce(ReduceState { cell: st.cell, kind: 5 }) else if isfold == 1 then parse_fold(st) else if ismin == 1 then parse_minmax(MinMaxState { cell: st.cell, kind: 0, cstart: peek_kw_start(st.cell), clen: peek_kw_len(st.cell) }) else if ismax == 1 then parse_minmax(MinMaxState { cell: st.cell, kind: 1, cstart: peek_kw_start(st.cell), clen: peek_kw_len(st.cell) }) else if isok == 1 then ok_close(ParenState { inner: parse_or(ParseState { cell: advance(Advance { lst: st.cell, k: 2 }) }) }) else if iserr == 1 then err_close(ParenState { inner: parse_or(ParseState { cell: advance(Advance { lst: st.cell, k: 2 }) }) }) else if isif == 1 then if_then(IfThenState { cond: parse_or(ParseState { cell: advance(Advance { lst: st.cell, k: 1 }) }) }) else if istrue == 1 then Parsed::Mk { node: Ast::AstBool { value: 1 }, next: advance(Advance { lst: st.cell, k: 1 }) } else if isfalse == 1 then Parsed::Mk { node: Ast::AstBool { value: 0 }, next: advance(Advance { lst: st.cell, k: 1 }) } else if isnum == 1 then Parsed::Mk { node: Ast::AstNum { value: numval }, next: advance(Advance { lst: st.cell, k: 1 }) } else if isstr == 1 then Parsed::Mk { node: Ast::AstStr { start: sstart, len: slen }, next: advance(Advance { lst: st.cell, k: 1 }) } else if isbytelit == 1 then Parsed::Mk { node: Ast::AstBytes { start: bstart + 2, len: if blen >= 3 then blen - 3 else 0 }, next: advance(Advance { lst: st.cell, k: 1 }) } else if isparen == 1 then paren_close(ParenState { inner: parse_or(ParseState { cell: advance(Advance { lst: st.cell, k: 1 }) }) }) else if isident == 1 then (if isvariant == 1 then (if has_braces == 1 then variant_build(VariantState { cstart: idstart, clen: idlen, vstart: vstart, vlen: vlen, pfields: parse_vfields(ParseState { cell: advance(Advance { lst: st.cell, k: 4 }) }) }) else variant_build(VariantState { cstart: idstart, clen: idlen, vstart: vstart, vlen: vlen, pfields: ParsedVFields::MkVF { fields: VFieldList::VFNil, next: advance(Advance { lst: st.cell, k: 3 }) } })) else if iscall == 1 then call_build(CallState { cstart: idstart, clen: idlen, pargs: parse_args(ParseState { cell: advance(Advance { lst: st.cell, k: 2 }) }) }) else if isrecord == 1 then variant_build(VariantState { cstart: idstart, clen: idlen, vstart: idstart, vlen: idlen, pfields: parse_vfields(ParseState { cell: advance(Advance { lst: st.cell, k: 2 }) }) }) else field_rest(FieldState { cell: advance(Advance { lst: st.cell, k: 1 }), base: Ast::AstVar { start: idstart, len: idlen } })) else Parsed::Mk { node: Ast::AstErr, next: st.cell }
+    out = if ismatch == 1 then parse_match(st) else if ismatchresult == 1 then parse_match_result(st) else if issum == 1 then parse_reduce(ReduceState { cell: st.cell, kind: 0 }) else if iscount == 1 then parse_reduce(ReduceState { cell: st.cell, kind: 1 }) else if isall == 1 then parse_reduce(ReduceState { cell: st.cell, kind: 2 }) else if isany == 1 then parse_reduce(ReduceState { cell: st.cell, kind: 3 }) else if ismap == 1 then parse_reduce(ReduceState { cell: st.cell, kind: 4 }) else if isfilter == 1 then parse_reduce(ReduceState { cell: st.cell, kind: 5 }) else if isfold == 1 then parse_fold(st) else if ismin == 1 then parse_minmax(MinMaxState { cell: st.cell, kind: 0, cstart: peek_kw_start(st.cell), clen: peek_kw_len(st.cell) }) else if ismax == 1 then parse_minmax(MinMaxState { cell: st.cell, kind: 1, cstart: peek_kw_start(st.cell), clen: peek_kw_len(st.cell) }) else if isok == 1 then ok_close(ParenState { inner: parse_or(ParseState { cell: advance(Advance { lst: st.cell, k: 2 }) }) }) else if iserr == 1 then err_close(ParenState { inner: parse_or(ParseState { cell: advance(Advance { lst: st.cell, k: 2 }) }) }) else if isif == 1 then if_then(IfThenState { cond: parse_or(ParseState { cell: skip_seps(ParseState { cell: advance(Advance { lst: st.cell, k: 1 }) }) }) }) else if istrue == 1 then Parsed::Mk { node: Ast::AstBool { value: 1 }, next: advance(Advance { lst: st.cell, k: 1 }) } else if isfalse == 1 then Parsed::Mk { node: Ast::AstBool { value: 0 }, next: advance(Advance { lst: st.cell, k: 1 }) } else if isnum == 1 then Parsed::Mk { node: Ast::AstNum { value: numval }, next: advance(Advance { lst: st.cell, k: 1 }) } else if isstr == 1 then Parsed::Mk { node: Ast::AstStr { start: sstart, len: slen }, next: advance(Advance { lst: st.cell, k: 1 }) } else if isbytelit == 1 then Parsed::Mk { node: Ast::AstBytes { start: bstart + 2, len: if blen >= 3 then blen - 3 else 0 }, next: advance(Advance { lst: st.cell, k: 1 }) } else if isparen == 1 then paren_close(ParenState { inner: parse_or(ParseState { cell: advance(Advance { lst: st.cell, k: 1 }) }) }) else if isident == 1 then (if isvariant == 1 then (if has_braces == 1 then variant_build(VariantState { cstart: idstart, clen: idlen, vstart: vstart, vlen: vlen, pfields: parse_vfields(ParseState { cell: advance(Advance { lst: st.cell, k: 4 }) }) }) else variant_build(VariantState { cstart: idstart, clen: idlen, vstart: vstart, vlen: vlen, pfields: ParsedVFields::MkVF { fields: VFieldList::VFNil, next: advance(Advance { lst: st.cell, k: 3 }) } })) else if iscall == 1 then call_build(CallState { cstart: idstart, clen: idlen, pargs: parse_args(ParseState { cell: advance(Advance { lst: st.cell, k: 2 }) }) }) else if isrecord == 1 then variant_build(VariantState { cstart: idstart, clen: idlen, vstart: idstart, vlen: idlen, pfields: parse_vfields(ParseState { cell: advance(Advance { lst: st.cell, k: 2 }) }) }) else field_rest(FieldState { cell: advance(Advance { lst: st.cell, k: 1 }), base: Ast::AstVar { start: idstart, len: idlen } })) else Parsed::Mk { node: Ast::AstErr, next: st.cell }
   proofs:
     purity:
       reads : [st.cell, st]
-      calls : [peek_kind, peek_is_num, peek_is_str, peek_is_bytelit, peek_bytelit_start, peek_bytelit_len, peek_op_code, peek_is_ident, peek_value, peek_str_start, peek_str_len, peek_start, peek_len, peek_kw_start, peek_kw_len, if_then, paren_close, parse_or, call_build, parse_args, field_rest, parse_match, parse_match_result, parse_reduce, parse_fold, parse_minmax, ok_close, err_close, variant_build, parse_vfields, advance]
+      calls : [peek_kind, peek_is_num, peek_is_str, peek_is_bytelit, peek_bytelit_start, peek_bytelit_len, peek_op_code, peek_is_ident, peek_value, peek_str_start, peek_str_len, peek_start, peek_len, peek_kw_start, peek_kw_len, if_then, paren_close, parse_or, call_build, parse_args, field_rest, parse_match, parse_match_result, parse_reduce, parse_fold, parse_minmax, ok_close, err_close, variant_build, parse_vfields, advance, skip_seps]
     termination:
       bound : 512
 
