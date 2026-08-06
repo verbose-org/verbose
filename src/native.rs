@@ -45006,6 +45006,220 @@ rule two
         }
     }
 
+    /// REGRESSION PIN — gen0 parses a MULTI-LINE `if / then / else`.
+    ///
+    /// The construct verbosec has always accepted:
+    ///
+    ///     out = if n.v > 10
+    ///           then 1
+    ///           else 0
+    ///
+    /// gen0 refused it until the `skip_seps` slice. NOT for the reason three
+    /// separate banners in examples/vexprparse.verbose claimed ("there is no
+    /// INDENT/DEDENT in this tokenizer") — that sentence was false from brick 8b
+    /// onward, and believing it got this work mis-scoped as a column-stack
+    /// project. The tokenizer emits Newline=600 / Indent=700 / Dedent=800 and has
+    /// a real ColStack. The actual blocker was six lines: the if-chain
+    /// (`parse_primary`'s isif branch -> `if_then` -> `if_else`) peeked for
+    /// `then` (207) and `else` (208) at the RAW cursor. With a separator sitting
+    /// there the peek saw 600/700, both rules took their "tolerate the keyword's
+    /// absence" arm, and `parse_or` was handed a separator — it returns AstErr
+    /// consuming nothing, so the parse collapsed. Newline is the band that
+    /// mattered most: a same-column `then`/`else` continuation emits only
+    /// Newlines, never an Indent.
+    ///
+    /// FIVE properties, in the order they can break:
+    ///   (a) gen0 ACCEPTS the multi-line form (it refused before);
+    ///   (b) the emitted binary COMPUTES the same answers as the single-line
+    ///       form — acceptance alone is worthless here, since "accepted" only
+    ///       means gen0 exited 0 having written an ELF;
+    ///   (c) a CHAINED multi-line `else if` works, not just one level;
+    ///   (d) THE CONTROL, and the reason this is not a general line-continuation
+    ///       rule: verbosec REJECTS a newline inside a binary expression
+    ///       (`out = n.v +` NL `1`), and gen0 must keep refusing it too. If this
+    ///       assertion ever flips, separators have leaked outside the three
+    ///       if-keyword positions and gen0 now accepts programs verbosec does
+    ///       not — a divergence in the wrong direction.
+    ///   (e) THE SLICE BOUNDARY, pinned so it cannot drift silently. gen0's
+    ///       `skip_seps` has no `depth` counter, so it eats an Indent but can
+    ///       never cross the matching Dedent (verbosec's `skip_if_separators`
+    ///       counts and therefore can). A layout that INDENTS between `if` and
+    ///       its condition puts a Dedent immediately before `then`:
+    ///
+    ///           out = if
+    ///             n.v > 10        <- Indent (col 4 -> 6)
+    ///           then 1            <- DEDENT (col 6 -> 4), then the keyword
+    ///
+    ///       verbosec parses this; gen0 REFUSES it. That direction is the safe
+    ///       one — gen0 accepting what verbosec rejects is the dangerous
+    ///       divergence, and this is its mirror image — so the slice stops here
+    ///       rather than reach for `skip_seps_dedent`, which would swallow
+    ///       block-closing Dedents and re-open PR #141's silent-truncation hole.
+    ///       REMEDY when a real program needs it: a `(cell, depth)` return from
+    ///       skip_seps, threaded if_then -> if_else -> if_build and rebalanced
+    ///       after the else-branch, mirroring verbosec's trailing
+    ///       `while depth > 0` loop.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn self_hosted_parses_multi_line_if_then_else() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        let src = fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let tmp = std::env::temp_dir();
+        let gen0 = tmp.join("verbosec_test_mlif_gen0");
+        compile_native_stdin_raw(&program, "elf_program_src", gen0.to_str().unwrap())
+            .expect("elf_program_src must compile --stdin-raw");
+        let chmod = |p: &std::path::Path| {
+            let mut perms = fs::metadata(p).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(p, perms).unwrap();
+        };
+        chmod(&gen0);
+
+        // Same rule every time; only the LOGIC line(s) differ. The `[0, 100]`
+        // bound is explicit because the optimizer's default field range would
+        // let interval arithmetic fold a live branch away.
+        let prog = |logic: &str| format!("\
+@verbose 0.1.0
+
+concept N
+  @intention: \"one bounded number field\"
+  @source: invoices.intent:1
+  fields:
+    v : number [0, 100]
+
+rule pick
+  @intention: \"classify v against two thresholds\"
+  @source: invoices.intent:1
+  input:
+    n : N
+  output:
+    out : number
+  logic:
+{logic}
+  proofs:
+    purity:
+      reads : [n.v]
+      calls : []
+    termination:
+      bound : 8
+");
+
+        // gen0-compile a source; Some(path to the emitted ELF) or None if gen0
+        // refused. Refusal is a legitimate outcome for cases (d) and (e).
+        let emit = |tag: &str, logic: &str| -> Option<std::path::PathBuf> {
+            let sp = tmp.join(format!("verbosec_test_mlif_{tag}.verbose"));
+            fs::write(&sp, prog(logic)).unwrap();
+            let bp = tmp.join(format!("verbosec_test_mlif_{tag}.elf"));
+            let st = Command::new("sh")
+                .arg("-c")
+                .arg(format!(
+                    "ulimit -s unlimited; '{}' 0 < '{}' > '{}' 2>/dev/null",
+                    gen0.display(), sp.display(), bp.display()
+                ))
+                .status()
+                .expect("run gen0");
+            let _ = fs::remove_file(&sp);
+            if !st.success() || fs::metadata(&bp).map(|m| m.len()).unwrap_or(0) == 0 {
+                let _ = fs::remove_file(&bp);
+                return None;
+            }
+            chmod(&bp);
+            Some(bp)
+        };
+        let run = |bin: &std::path::Path, arg: &str| -> String {
+            let o = Command::new(bin).arg(arg).output().expect("run emitted binary");
+            assert!(o.status.success(), "emitted binary must exit 0 on {arg}, got {:?}", o.status);
+            String::from_utf8_lossy(&o.stdout).trim().to_string()
+        };
+
+        let inputs = ["0", "5", "10", "11", "50", "100"];
+
+        // The reference: the single-line form gen0 has always accepted.
+        let flat = emit("flat", "    out = if n.v > 10 then 1 else 0")
+            .expect("gen0 must accept the single-line if (it always has)");
+        let want: Vec<String> = inputs.iter().map(|i| run(&flat, i)).collect();
+        assert_eq!(want, vec!["0", "0", "0", "1", "1", "1"],
+            "the single-line reference itself must be right before it can be an oracle");
+
+        // (a) + (b). Two multi-line layouts: continuation indented deeper
+        // (Newline + Indent), and continuation at the SAME column as `out`
+        // (Newlines only, no Indent — the band that matters most, and the one a
+        // column-stack-shaped diagnosis would never have reached).
+        for (tag, logic) in [
+            ("indented", "    out = if n.v > 10\n           then 1\n           else 0"),
+            ("samecol",  "    out = if n.v > 10\n    then 1\n    else 0"),
+        ] {
+            let bin = emit(tag, logic)
+                .unwrap_or_else(|| panic!("gen0 must ACCEPT the multi-line if ({tag})"));
+            let got: Vec<String> = inputs.iter().map(|i| run(&bin, i)).collect();
+            assert_eq!(got, want,
+                "multi-line if ({tag}) must compute exactly what the single-line form does");
+            let _ = fs::remove_file(&bin);
+        }
+
+        // (c) CHAINED `else if` across lines — the shape the 33 newly-accepted
+        // crypto files are built out of (aes_sbox is a 256-way chain).
+        let chain_flat = emit("chain_flat",
+            "    out = if n.v > 50 then 3 else if n.v > 10 then 2 else 1")
+            .expect("gen0 must accept the single-line chain");
+        let chain_ml = emit("chain_ml",
+            "    out = if n.v > 50\n           then 3\n           else if n.v > 10\n                then 2\n                else 1")
+            .expect("gen0 must ACCEPT the multi-line chained else-if");
+        let cw: Vec<String> = inputs.iter().map(|i| run(&chain_flat, i)).collect();
+        let cg: Vec<String> = inputs.iter().map(|i| run(&chain_ml, i)).collect();
+        assert_eq!(cw, vec!["1", "1", "1", "2", "2", "3"],
+            "the chained single-line reference must be right");
+        assert_eq!(cg, cw, "the multi-line chain must compute what the single-line chain does");
+
+        // (d) THE CONTROL. verbosec rejects a newline inside a binary
+        // expression; assert that first from the reference parser, then assert
+        // gen0 agrees. Separators are transparent ONLY at the three if-keyword
+        // positions — this is not a line-continuation rule.
+        let broken = prog("    out = n.v +\n      1");
+        let verbosec_verdict = crate::lexer::Lexer::new(&broken)
+            .tokenize()
+            .map_err(|e| format!("{e:?}"))
+            .and_then(|t| crate::parser::Parser::new(t).parse_program().map_err(|e| format!("{e:?}")));
+        assert!(verbosec_verdict.is_err(),
+            "premise check: verbosec must still REJECT a newline inside a binary expression");
+        assert!(emit("nocont", "    out = n.v +\n      1").is_none(),
+            "gen0 must keep refusing a newline inside a binary expression — accepting it \
+             would make gen0 accept a program verbosec rejects");
+
+        // (e) THE SLICE BOUNDARY. An Indent between `if` and its condition puts
+        // a Dedent immediately before `then`, and gen0's depth-less `skip_seps`
+        // cannot cross it. verbosec PARSES this layout (assert that first, so
+        // the divergence is measured rather than assumed); gen0 refuses it.
+        // Refusing what verbosec accepts is the safe direction. If this ever
+        // starts passing, the depth counter landed — delete this block and move
+        // the layout up into the (a)+(b) loop.
+        let indented_cond = "    out = if\n      n.v > 10\n    then 1\n    else 0";
+        let vb = crate::lexer::Lexer::new(&prog(indented_cond))
+            .tokenize()
+            .map_err(|e| format!("{e:?}"))
+            .and_then(|t| crate::parser::Parser::new(t).parse_program().map_err(|e| format!("{e:?}")));
+        assert!(vb.is_ok(),
+            "premise check: verbosec's depth-counted skip_if_separators must PARSE an \
+             indented condition (that is what makes gen0's refusal a divergence)");
+        assert!(emit("aftercond", indented_cond).is_none(),
+            "documented slice boundary: gen0's skip_seps has no depth counter, so it eats \
+             the Indent after `if` and cannot cross the Dedent before `then`. If this now \
+             PASSES, the depth counter landed — move this layout into the (a)+(b) loop and \
+             update the if_then banner in examples/vexprparse.verbose");
+
+        let _ = fs::remove_file(&flat);
+        let _ = fs::remove_file(&chain_flat);
+        let _ = fs::remove_file(&chain_ml);
+        let _ = fs::remove_file(&gen0);
+    }
+
     /// Self-verify arc V3 (2026-07): THE FINALE — the SELF-COMPILED compiler
     /// verifies before it emits. `elf_program_src` computes the V2 aggregate
     /// (`verrs` = R6a/R6B lint+type diags + R6d purity + termination) over
@@ -45198,15 +45412,25 @@ rule two
     /// gen0 grew 250,558 -> 323,806 B (+29%: the checker closure joins the
     /// Rust-native callable set).
     ///
-    /// This test pins THREE independent self-hosting properties (measured
-    /// 2026-07 on WSL2, isolated single gen1 emit of the reordered 1.32 MB
-    /// self-source via `/usr/bin/time -v`; gen0 — Rust, stack-passing records —
-    /// peaks ~140 MB; gen1 — the self-hosted emitter — peaks ~5.5 GiB / ~29 s
-    /// since scalar `arena_scope` slice 2 wrapped the 119 `code_size_*` call
-    /// sites in the emit rules, was ~12.8 GiB / ~42 s with only the slice-1
-    /// `verrs` wrap, ~16.1 GiB / ~78 s before that — and was ~2.55 GB / ~3.7 s
-    /// back on the older 855 KB source with only the streaming `arena_scope`;
-    /// see the V3 paragraph above for the gate-landing numbers):
+    /// This test pins THREE independent self-hosting properties.
+    ///
+    /// COST, RE-MEASURED 2026-08-06 on WSL2 (31 GB box), isolated single
+    /// emit of the reordered 1.68 MB self-source via `/usr/bin/time -v`:
+    ///
+    ///   gen0 (Rust, stack-passing records):  643,264 KiB  =  ~628 MiB /  ~9 s
+    ///   gen1 (the self-hosted emitter):   10,985,372 KiB  = ~10.5 GiB / ~35 s
+    ///
+    /// **The `~5.5 GiB / ~29 s` figure these comments carried is STALE — the
+    /// real cost is ~2x that, and anything sized from 5.5 GiB will OOM.** The
+    /// 5.5 GiB was measured in 2026-07 against a 1.32 MB source; the source is
+    /// now 1.68 MB and the peak tracks it superlinearly (the Verbose runtime
+    /// arena-allocates every record the checker + emit walks build). Historical
+    /// trail for the arena-scope work, all against the older 1.32 MB source:
+    /// ~5.5 GiB / ~29 s after scalar `arena_scope` slice 2 wrapped the 119
+    /// `code_size_*` call sites, ~12.8 GiB / ~42 s with only the slice-1 `verrs`
+    /// wrap, ~16.1 GiB / ~78 s before that, ~2.55 GB / ~3.7 s back on the
+    /// 855 KB source with only the streaming `arena_scope`. See the V3
+    /// paragraph above for the gate-landing numbers. The three properties:
     ///
     ///   R0 — fixed point:   gen1(reordered) == gen2(reordered) byte-for-byte.
     ///   R1 — whole source:  gen0(ORIGINAL) == gen1(ORIGINAL) byte-for-byte —
@@ -45227,8 +45451,8 @@ rule two
     /// self-hosted emitter is a byte-identical, semantically-verified fixed
     /// point of the trusted reference.
     ///
-    /// IGNORED by default: gen1 (the self-hosted emitter) peaks ~5.5 GiB
-    /// emitting the full 1.32 MB source (the Verbose runtime arena-allocates
+    /// IGNORED by default: gen1 (the self-hosted emitter) peaks ~10.5 GiB
+    /// emitting the full 1.68 MB source (the Verbose runtime arena-allocates
     /// every record/variant; three reclaim layers are now in place: the
     /// streaming `arena_scope` reclaims each proc's walk transients at the proc
     /// boundary — see docs/self-hosting-arena-scope-design.md — the scalar
@@ -45236,8 +45460,10 @@ rule two
     /// scalar `arena_scope` slice 2 wraps the 119 `code_size_*` call sites in
     /// the emit rules, which reclaims both the within-proc size re-walk AND —
     /// the dominant term, measured — `proc_size`'s per-rule body walk under the
-    /// unscoped `sizes` let: 12.8 -> 5.5 GiB, and ~32% FASTER because the
-    /// reclaim reuses hot arena pages. The residual ~5.5 GiB is LIVE
+    /// unscoped `sizes` let: 12.8 -> 5.5 GiB on the 1.32 MB source of the day,
+    /// and ~32% FASTER because the
+    /// reclaim reuses hot arena pages. The residual (5.5 GiB then, 10.5 GiB now
+    /// at 1.68 MB of source) is LIVE
     /// arena-resident data (the parse tree and the lists derived from it),
     /// interleaved with the parser's own transients, so no further bump-mark
     /// scoping reaches it — three measured probes confirmed this: wrapping
@@ -45245,14 +45471,18 @@ rule two
     /// helper walks, and wrapping the 96 emit-recursion sites each moved the
     /// peak by less than 4%, all in the wrong direction. The next lever is
     /// REPRESENTATION (arena entry width / node count), not scoping).
-    /// gen0 (Rust, stack-passing records) peaks ~140 MB. The test
-    /// also needs an unbounded stack (the src_blob recursion over the ~1.32 MB
+    /// gen0 (Rust, stack-passing records) peaks ~628 MiB — the "~140 MB" this
+    /// line used to claim predates the node-arena growth to 8M entries. The test
+    /// also needs an unbounded stack (the src_blob recursion over the ~1.68 MB
     /// source) — the emit shell-outs raise it via `ulimit -s unlimited`. Kept
-    /// ignored for the default parallel dev suite (~5.5 GiB × parallel tests); the
-    /// dedicated `self-hosting-bootstrap` CI job runs it serially. Run explicitly:
+    /// ignored for the default parallel dev suite (~10.5 GiB × parallel tests would
+    /// OOM anything short of a very large box); the
+    /// dedicated `self-hosting-bootstrap` CI job runs it serially, and that
+    /// runner must be sized for ~11 GiB, NOT the 5.5 GiB these comments used to
+    /// state. Run explicitly:
     ///   cargo test --release -- --ignored --test-threads=1 two_generation
     #[test]
-    #[ignore = "gen1 peaks ~5.5 GiB RAM (verify pass + emit; the verrs baseline, the within-proc size re-walk and proc_size's per-rule walk are all reclaimed via scalar arena_scope) + needs `ulimit -s unlimited` + ~1-2 min; run with --ignored"]
+    #[ignore = "gen1 peaks ~10.5 GiB RAM (re-measured 2026-08-06 on the 1.68 MB source; the older ~5.5 GiB figure was against 1.32 MB) + needs `ulimit -s unlimited` + ~1-2 min; run with --ignored"]
     #[cfg(target_arch = "x86_64")]
     fn two_generation_bootstrap_fixed_point() {
         use std::fs;
@@ -45450,20 +45680,35 @@ rule two
         // multi-line if/else stopped failing the undefined-callee lint —
         // bit_ops, ed_scalarmult, ghash_nblocks, ladder_recursive,
         // p256_ninv_rec, p256_scalarmult, sha256_fold, sha256_prims,
-        // sha256_round, sha512_fold, x25519_rec. The other ~33 bitwise files
-        // also need multi-line `if/else`, which this tokenizer has no
-        // INDENT/DEDENT for; that is a separate slice.
+        // sha256_round, sha512_fold, x25519_rec.
+        //
+        // 80 -> 113 (multi-line if/else): the other 33 files were blocked on a
+        // MULTI-LINE `if / then / else`, and the reason stated here — "this
+        // tokenizer has no INDENT/DEDENT for it" — was FALSE and had been since
+        // brick 8b. The tokenizer has `line_width`, `tokenize_indent`, a real
+        // ColStack, and `tok_kind` emits Newline=600 / Indent=700 / Dedent=800.
+        // The actual blocker was that the if-chain peeked for `then`/`else` at
+        // the RAW cursor, so a separator made the peek miss. Six lines of
+        // `skip_seps` in `parse_primary` / `if_then` / `if_else` closed it. The
+        // 33: aes_ctr aes_encrypt aes_gcm aes_gctr aes_key_expansion aes_sbox
+        // aes_transforms derive_secret ed_add ed_affine field_codec field_mul
+        // ghash ghash_mul handshake_secret hkdf_expand_label hkdf_extract
+        // hmac_sha256 iso_date ladder_step p256_double p256_fmul p256_nmul
+        // psk_schedule sc_muladd sc_reduce sha256_abc sha256_big sha256_full
+        // sha256_multi sha256_nblocks sha256_text x25519. Zero files were lost,
+        // and 79 of the 80 previously-accepted binaries are byte-identical (the
+        // 80th is vexprparse itself, whose source these six edits changed).
         //
         // READ THIS BEFORE TREATING THE JUMP AS A WIN. Acceptance is breadth,
-        // not correctness (see the doc comment above), and 7 of those 11 read
-        // an argv `text` field, which gen0 currently reads as EMPTY. They
-        // compile, they run, and they produce WRONG digests — sha512_fold
-        // returns 106 where verbosec and Python's hashlib both return 207.
-        // The bitwise lowering itself is validated separately and agrees with
-        // verbosec on all 33 differential probes; the text-argv gap is
-        // pre-existing and independent, and is listed in CLAUDE.md's
-        // "known verification gaps" table.
-        const EXPECTED_ACCEPTED: usize = 80;
+        // not correctness (see the doc comment above). The 33 were differentially
+        // tested against verbosec-emitted binaries on identical inputs, and 8 of
+        // them against independent oracles (Python hashlib for the sha256_*
+        // family, FIPS-197 for aes_sbox); results are in the PR body. But gen0
+        // does NOT emit PR #146's runtime input bounds-check, so any of these
+        // given an out-of-range input returns a value at rc=0 where verbosec's
+        // binary sys_exit(1)s. That gap is pre-existing, independent of this
+        // slice, and listed in CLAUDE.md's "known verification gaps" table.
+        const EXPECTED_ACCEPTED: usize = 113;
         const EXPECTED_TOTAL: usize = 151;
 
         let src = fs::read_to_string("examples/vexprparse.verbose")

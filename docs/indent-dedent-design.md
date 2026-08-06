@@ -1,10 +1,31 @@
 # INDENT/DEDENT tokenization in pure Verbose — design note
 
-**Status:** design note, NO implementation. Written 2026-06-03. Companion to
+**Status: IMPLEMENTED (brick 8b) — design (a), the ColStack, was the one built.**
+Written 2026-06-03 as a decision aid; marked done 2026-08-06. `examples/vexprparse.verbose`
+now carries `line_width`, `tokenize_indent`, a real column stack, and `tok_kind`
+emitting `Newline = 600` / `Indent = 700` / `Dedent = 800` / `IndentErr = 900`,
+plus the `skip_seps` (Newline + Indent) and `skip_seps_dedent` (also Dedent)
+consumers the parser bricks use.
+
+**This note is now HISTORY, not current state.** Read it for the rationale
+behind the chosen design, not to learn what the tokenizer does — several of its
+"the tokenizer today…" passages describe the pre-brick-8b flat tokenizer and are
+marked obsolete inline below. Companion to
 [group-field-abi-design.md](group-field-abi-design.md) (the single-group-field
 recursive ABI this brick depends on and extends) and
 [composition-abi-design.md](composition-abi-design.md) (the "an arena index is
-just a number" insight). Decision aid for the author, not a commitment.
+just a number" insight).
+
+**A note on how stale docs cost real time.** The banner this note quotes below
+("there is no INDENT/DEDENT in this tokenizer") stayed in
+`examples/vexprparse.verbose` — in three places — long after brick 8b made it
+false, and this note's own `Status:` line stayed at "NO implementation". On
+2026-08-06 that pair got multi-line `if/else` support scoped as a column-stack
+project. It was six lines: the if-chain peeked for `then` / `else` at the raw
+cursor, so a Newline or Indent sitting there made the peek miss; routing those
+three peeks through the ALREADY-EXISTING `skip_seps` closed it, and gen0's
+corpus acceptance went 80 → 113. Both the banners and this header are corrected
+as part of that slice.
 
 **Scope:** ONE self-hosting brick — turning Python-style significant
 indentation into structural `INDENT` / `DEDENT` tokens, written in `.verbose`,
@@ -15,6 +36,14 @@ parsing real multi-line `.verbose` files.
 ---
 
 ## 0. The need, reproduced
+
+> **OBSOLETE AS OF BRICK 8b.** Everything in this section describes the tokenizer
+> *before* this design landed. It is kept because it states the problem the
+> implementation solved, but every present-tense claim about the tokenizer here
+> — "emits only Ident / Keyword / …", "no notion of lines or columns",
+> "terminates at the first newline" — is now **false**. `tokenize_indent` walks
+> whole files, tracks columns on a `ColStack`, and emits Newline / Indent /
+> Dedent. Do not cite this section as current behaviour.
 
 `.verbose` source is indentation-significant: `concept` / `rule` bodies, and
 the `logic:` / `proofs:` / `purity:` sub-blocks, are delimited by leading-space
