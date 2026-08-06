@@ -42629,8 +42629,8 @@ rule two
     /// AstCall arm BEFORE the real-call path (VERBATIM the same span_is_* +
     /// arg_list_len conditions in code_size_node): length = pop ; mov eax, eax ;
     /// push (K=4); byte_at = split span, unsigned bounds, movabs src_base, movzx
-    /// load, OOB → push 0 (K=36); substring = split, a<=b && b<=len unsigned,
-    /// repack (start+a, b-a), OOB → push 0 (K=38). `src_base = 0x400000 +
+    /// load, OOB → exit(1) (K=45); substring = split, a<=b && b<=len unsigned,
+    /// repack (start+a, b-a), OOB → exit(1) (K=47). `src_base = 0x400000 +
     /// blob_end_off` because elf_program_src APPENDS the interpreted source at the
     /// file end (4 bytes per le32 word via src_blob, zero-padded to 4), extending
     /// p_filesz — so compiled spans index the same bytes eval's spans do, and the
@@ -42653,10 +42653,19 @@ rule two
     ///   * length("hello") → 5; byte_at("abc", 1) → 98;
     ///     length(substring("hello world", 6, 11)) → 5;
     ///     byte_at(substring("hello world", 6, 11), 0) → 119 ('w').
-    ///   * OOB byte_at("abc", 99) → 0, exit 0 (oracle parity, no abort).
     ///   * The scanner ELF EMBEDS its program source (byte-searchable in the
     ///     file); a text-free program's ELF does NOT grow (p_filesz == file size,
     ///     no appended source).
+    ///
+    /// OOB is deliberately NOT in the oracle loop (changed 2026-08-06). It used
+    /// to be — `byte_at("abc", 99)` was asserted to print 0 and exit 0, "oracle
+    /// parity, no abort". The emitted binary is now FAIL-CLOSED (exit 1, no
+    /// output), matching verbosec's own `byte_at` / `substring`, while the
+    /// interpreter (`eval_main`) stays defensive-0 because a Verbose rule is a
+    /// total function that cannot abort its host. Emitter and interpreter now
+    /// disagree on this one input BY DESIGN; the split is pinned by
+    /// `self_hosted_byte_at_oob_is_fail_closed` and
+    /// `self_hosted_substring_oob_is_fail_closed`.
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn text_values_slice2_compiled_scanner_matches_oracle() {
@@ -42693,8 +42702,6 @@ rule two
             ("rule main\n  logic:\n    out = byte_at(\"abc\", 1)".to_string(), 98),
             ("rule main\n  logic:\n    out = length(substring(\"hello world\", 6, 11))".to_string(), 5),
             ("rule main\n  logic:\n    out = byte_at(substring(\"hello world\", 6, 11), 0)".to_string(), 119),
-            // OOB: defensive 0 with exit 0 — parity with eval's VNum 0, no abort.
-            ("rule main\n  logic:\n    out = byte_at(\"abc\", 99)".to_string(), 0),
         ];
 
         for (i, (prog_src, expected)) in cases.iter().enumerate() {
@@ -42745,6 +42752,228 @@ rule two
 
         let _ = fs::remove_file(elf);
         let _ = fs::remove_file(em);
+    }
+
+    /// Build gen0 (the Rust-compiled self-hosted emitter, argv channel), hand it a
+    /// one-rule program source, run the ELF it emits, and return
+    /// `(exit_code, stdout_trimmed)`. Shared by the two fail-closed pins below.
+    #[cfg(target_arch = "x86_64")]
+    fn run_gen0_emitted(tag: &str, prog_src: &str, argv: &[&str]) -> (i32, String) {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        let src = fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let elf = std::env::temp_dir().join(format!("verbosec_test_failclosed_gen0_{}", tag));
+        compile_native(&program, "elf_program_src", elf.to_str().unwrap(), false, false)
+            .expect("elf_program_src must compile natively");
+
+        let mc = Command::new(&elf).args([prog_src, "0"]).output().expect("spawn gen0");
+        assert!(mc.status.success(), "gen0 must exit 0 emitting {:?}", prog_src);
+        assert_eq!(&mc.stdout[0..4], &[0x7f, 0x45, 0x4c, 0x46], "gen0 must emit an ELF");
+
+        let out_path = std::env::temp_dir().join(format!("verbosec_test_failclosed_a_out_{}", tag));
+        fs::write(&out_path, &mc.stdout).expect("write a.out");
+        let mut perms = fs::metadata(&out_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&out_path, perms).expect("chmod +x");
+
+        let child = Command::new(&out_path).args(argv).output().expect("run emitted ELF");
+        let code = child.status.code().unwrap_or(-1);
+        let out = String::from_utf8_lossy(&child.stdout).trim().to_string();
+
+        let _ = fs::remove_file(&out_path);
+        let _ = fs::remove_file(&elf);
+        (code, out)
+    }
+
+    /// Fail-closed bounds, gap 1 of 2 (2026-08-06): a gen0-emitted binary must
+    /// `exit(1)` on an out-of-bounds `byte_at`, exactly as a verbosec-emitted one
+    /// does. Before this slice it printed `0` and exited 0 — the same source
+    /// program giving two different answers depending on WHICH compiler built it.
+    ///
+    /// The x86 the emitter writes ALREADY had the right predicate: `cmp rcx, rdx ;
+    /// jae`, an unsigned compare so a negative index folds into the same branch.
+    /// Only the ACTION on the taken branch was wrong (`xor eax, eax ; push rax`
+    /// instead of `exit(1)`), which is why this was a silent wrong answer and NOT
+    /// a memory-safety bug — the `movzx eax, byte [rdx + rax]` load was never
+    /// reached with an out-of-range index. Probed for disclosure and found none:
+    /// a second text field in the same entry concept was unreachable at every
+    /// index from 0 through 4 GiB, all returning 0 at rc 0 with no crash.
+    ///
+    /// Pinned here at the level that matters — the behaviour of the binary gen0
+    /// EMITS, not the bytes it writes. Cost: +9 B per byte_at call site (K 36→45).
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn self_hosted_byte_at_oob_is_fail_closed() {
+        // In-bounds is unchanged: byte_at("abc", 1) == 'b' == 98, exit 0.
+        let (code, out) = run_gen0_emitted(
+            "ba_ok", "rule main\n  logic:\n    out = byte_at(\"abc\", 1)", &[]);
+        assert_eq!((code, out.as_str()), (0, "98"),
+            "in-bounds byte_at must be unaffected by the fail-closed tail");
+
+        // index == length: the first OOB index. Was `0` / rc 0, must now be rc 1.
+        let (code, out) = run_gen0_emitted(
+            "ba_eq", "rule main\n  logic:\n    out = byte_at(\"abc\", 3)", &[]);
+        assert_eq!(code, 1, "byte_at at index == length must exit 1, got {} / {:?}", code, out);
+        assert!(out.is_empty(), "aborting byte_at must print nothing, got {:?}", out);
+
+        // Far past the end.
+        let (code, out) = run_gen0_emitted(
+            "ba_far", "rule main\n  logic:\n    out = byte_at(\"abc\", 99)", &[]);
+        assert_eq!(code, 1, "byte_at far past the end must exit 1, got {} / {:?}", code, out);
+        assert!(out.is_empty(), "aborting byte_at must print nothing, got {:?}", out);
+
+        // Negative index — caught by the SAME unsigned `jae`, no second compare.
+        let (code, out) = run_gen0_emitted(
+            "ba_neg", "rule main\n  logic:\n    out = byte_at(\"abc\", 0 - 1)", &[]);
+        assert_eq!(code, 1, "negative byte_at index must exit 1, got {} / {:?}", code, out);
+
+        // The interpreter deliberately does NOT follow: a Verbose rule is a total
+        // function with no exception mechanism, so gen0's interpreter of an
+        // untrusted target program stays defensive-0 rather than abort its host.
+        let src = std::fs::read_to_string("examples/vexprparse.verbose").unwrap();
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+        let em = std::env::temp_dir().join("verbosec_test_failclosed_eval_main");
+        compile_native(&program, "eval_main", em.to_str().unwrap(), false, false).unwrap();
+        let r = std::process::Command::new(&em)
+            .args(["rule main\n  logic:\n    out = byte_at(\"abc\", 99)", "0"])
+            .output().expect("spawn eval_main");
+        assert!(r.status.success(), "the INTERPRETER must not abort on OOB");
+        assert_eq!(String::from_utf8_lossy(&r.stdout).trim(), "0",
+            "the INTERPRETER stays defensive-0 — the emitter/interpreter split is deliberate");
+        let _ = std::fs::remove_file(&em);
+    }
+
+    /// Fail-closed bounds, gap 2 of 2 (2026-08-06): the `substring` sibling of the
+    /// pin above. verbosec's contract is `end > length(text)` → sys_exit(1) and
+    /// `start > end` → sys_exit(1) (the latter also catching negative start/end
+    /// through the unsigned reinterpretation). gen0 emitted both compares already
+    /// — `cmp rdx, rcx ; ja` and `cmp rcx, rsi ; ja`, the same predicates — but
+    /// took a defensive `push 0` on either, so an out-of-range slice silently
+    /// became the EMPTY text. Measured before the change on `length(substring(
+    /// s.data, s.a, s.b))` over "hello": (0,6) (0,500) (3,1) (-5,3) (6,6) all
+    /// printed 0 at rc 0 where verbosec exits 1. Cost: +9 B per substring call
+    /// site (K 38→47). Boundary case (5,5) — the empty slice at the very end —
+    /// is legal in BOTH and must stay legal.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn self_hosted_substring_oob_is_fail_closed() {
+        // In-bounds is unchanged.
+        let (code, out) = run_gen0_emitted(
+            "ss_ok", "rule main\n  logic:\n    out = length(substring(\"hello\", 1, 3))", &[]);
+        assert_eq!((code, out.as_str()), (0, "2"), "in-bounds substring must be unaffected");
+
+        // The empty slice at the exact end is LEGAL (start == end == length).
+        let (code, out) = run_gen0_emitted(
+            "ss_end", "rule main\n  logic:\n    out = length(substring(\"hello\", 5, 5))", &[]);
+        assert_eq!((code, out.as_str()), (0, "0"), "substring(s, len, len) must stay legal");
+
+        // end > length.
+        let (code, out) = run_gen0_emitted(
+            "ss_over", "rule main\n  logic:\n    out = length(substring(\"hello\", 0, 6))", &[]);
+        assert_eq!(code, 1, "substring with end > length must exit 1, got {} / {:?}", code, out);
+        assert!(out.is_empty(), "aborting substring must print nothing, got {:?}", out);
+
+        // start > end.
+        let (code, out) = run_gen0_emitted(
+            "ss_inv", "rule main\n  logic:\n    out = length(substring(\"hello\", 3, 1))", &[]);
+        assert_eq!(code, 1, "substring with start > end must exit 1, got {} / {:?}", code, out);
+
+        // Negative start — caught by the start > end compare after unsigned
+        // reinterpretation, no third branch.
+        let (code, out) = run_gen0_emitted(
+            "ss_neg", "rule main\n  logic:\n    out = length(substring(\"hello\", 0 - 5, 3))", &[]);
+        assert_eq!(code, 1, "negative substring start must exit 1, got {} / {:?}", code, out);
+    }
+
+    /// Fail-closed bounds, THE PREREQUISITE (2026-08-06): gen0's `and` / `or` must
+    /// SHORT-CIRCUIT, as verbosec's do.
+    ///
+    /// This is not a bonus — it is what makes the two pins above shippable. gen0's
+    /// AstBin arm emitted `<lhs code> <rhs code> pop;pop;normalise;and/or` — a
+    /// stack-machine shape that evaluates BOTH operands, always. That was
+    /// observationally INVISIBLE while `byte_at` / `substring` returned a defensive
+    /// 0 out of bounds, because eager-plus-defensive computes the same boolean as
+    /// short-circuit in every case: `false and (0 == 45)` is `false` either way.
+    /// The instant the bounds checks became fail-closed, the same eagerness turned
+    /// every guarded probe into a spurious abort — the idiom CLAUDE.md documents as
+    /// safe, `length(s) > N and byte_at(s, N) == c`, aborts under eager evaluation
+    /// on a short string. Measured before the fix, `if s.n == 1 or byte_at(s.data,
+    /// 99) == 65 then 7 else 9` with n=1 over "short": verbosec prints 7 at rc 0,
+    /// gen0 printed nothing at rc 1. Three tests caught it —
+    /// `self_hosted_argv_trampoline_runs_entry_on_real_input` (gen0's own front end,
+    /// count_rules, on "1 + 2"), `self_hosted_emitter_embeds_large_checker_source_
+    /// without_truncation`, and `b4b_semantic_self_reproduction_record_variant_match`
+    /// — all of them the keyword matchers in gen0's tokenizer, which chain up to
+    /// twelve unguarded `byte_at(s.source, s.pos + k)` behind `and`.
+    ///
+    /// Shape (op 30 = and, op 31 = or), K = 26 / 25 against the old 20:
+    ///   <lhs> ; pop rax ; test rax,rax ; jz/jnz .short (rel32 = |rhs| + 13) ;
+    ///   <rhs> ; pop rax ; test rax,rax ; setne al ; movzx eax,al ; push rax ;
+    ///   jmp .end ; .short: (and) xor eax,eax ; push rax  /  (or) push 1 ; .end:
+    /// The `off` handed to <rhs> advances by |lhs| + 10 (the pop/test/jcc prologue)
+    /// — the two-pass drift edge, and the reason `code_size_node` carries the
+    /// matching 26 / 25. Same lowering an `if` already used, so no new machinery.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn self_hosted_and_or_short_circuit() {
+        // `or`: a true LHS must skip an RHS that would abort.
+        let (code, out) = run_gen0_emitted(
+            "sc_or",
+            "rule main\n  logic:\n    out = if 1 == 1 or byte_at(\"abc\", 99) == 65 then 7 else 9",
+            &[]);
+        assert_eq!((code, out.as_str()), (0, "7"),
+            "`or` must short-circuit: a true LHS skips an out-of-bounds RHS");
+
+        // `and`: a false LHS must skip an RHS that would abort.
+        let (code, out) = run_gen0_emitted(
+            "sc_and",
+            "rule main\n  logic:\n    out = if 1 == 2 and byte_at(\"abc\", 99) == 65 then 7 else 9",
+            &[]);
+        assert_eq!((code, out.as_str()), (0, "9"),
+            "`and` must short-circuit: a false LHS skips an out-of-bounds RHS");
+
+        // The documented guard idiom, on a string too short for the probe.
+        let (code, out) = run_gen0_emitted(
+            "sc_guard",
+            "rule main\n  logic:\n    out = if length(\"ab\") > 4 and byte_at(\"ab\", 4) == 45 then 1 else 0",
+            &[]);
+        assert_eq!((code, out.as_str()), (0, "0"),
+            "`length(s) > N and byte_at(s, N)` must stay safe on a short string");
+
+        // Truth tables must be unchanged — short-circuiting is not a licence to
+        // get the answer wrong when both operands DO get evaluated.
+        for (expr, want) in [
+            ("1 == 1 and 2 == 2", "1"), ("1 == 1 and 2 == 3", "0"),
+            ("1 == 2 and 2 == 2", "0"), ("1 == 2 and 2 == 3", "0"),
+            ("1 == 1 or 2 == 2", "1"),  ("1 == 1 or 2 == 3", "1"),
+            ("1 == 2 or 2 == 2", "1"),  ("1 == 2 or 2 == 3", "0"),
+        ] {
+            let src = format!("rule main\n  logic:\n    out = if {} then 1 else 0", expr);
+            let (code, out) = run_gen0_emitted("sc_tt", &src, &[]);
+            assert_eq!((code, out.as_str()), (0, want),
+                "truth table for {:?}", expr);
+        }
+
+        // Nested / chained, where the rel32 threading is easiest to get wrong:
+        // the RHS of the outer `and` is itself a short-circuit block, so its
+        // internal jump targets must be computed at the shifted `off`.
+        let (code, out) = run_gen0_emitted(
+            "sc_nest",
+            "rule main\n  logic:\n    out = if 1 == 1 and (2 == 2 and 3 == 3) then 5 else 6",
+            &[]);
+        assert_eq!((code, out.as_str()), (0, "5"), "nested short-circuit and");
+        let (code, out) = run_gen0_emitted(
+            "sc_nest2",
+            "rule main\n  logic:\n    out = if 1 == 2 or (2 == 3 or 3 == 3) then 5 else 6",
+            &[]);
+        assert_eq!((code, out.as_str()), (0, "5"), "nested short-circuit or");
     }
 
     /// Records-arc slice 2: the self-hosted interpreter now RESOLVES record/variant
@@ -43357,6 +43586,18 @@ rule two
         // name_eq) + name_eq, over the full group. The driver's spans index the
         // program's OWN source text — which works compiled precisely because the
         // text-codegen slice embeds the source in the ELF.
+        //
+        // `src` was `"xx"` until 2026-08-06, and that fixture was BROKEN: the
+        // bindings name spans (0,2) and (3,2) and the query is (3,2), so on a
+        // 2-byte source every comparison read bytes 3 and 4 — out of bounds. It
+        // "passed" only because byte_at returned a defensive 0 on both sides, so
+        // name_eq compared 0 to 0 and reported a match. The assertion was
+        // therefore not testing a byte comparison at all. `"ab cd"` is the
+        // fixture it meant to be: binding 0 is "ab", binding 1 is "cd", the query
+        // is "cd" — so the answer is still 1, but now BECAUSE the bytes differ at
+        // binding 0 and match at binding 1, with every index in range. Repairing
+        // it was forced by the fail-closed byte_at slice (an OOB read now exits 1
+        // instead of yielding 0) and the test is strictly stronger for it.
         let li_concept = block(
             &|l| l.starts_with("concept LetIndexState"),
             &|l| l.starts_with("rule ") || l.starts_with("concept ") || l.starts_with("-- "),
@@ -43366,7 +43607,7 @@ rule two
             &|l| l.starts_with("rule ") || l.starts_with("concept ") || l.starts_with("-- "),
         );
         let li = format!(
-            "rule main\n  logic:\n    let binds = Binding::BCons {{ name_start: 0, name_len: 2, value: Ast::AstNum {{ value: 1 }}, rest: Binding::BCons {{ name_start: 3, name_len: 2, value: Ast::AstNum {{ value: 2 }}, rest: Binding::BNil }} }}\n    out = let_index(LetIndexState {{ binds: binds, src: \"xx\", q_start: 3, q_len: 2, idx: 0 }})\n  proofs:\n    purity:\n      reads : []\n      calls : [let_index]\n    termination:\n      bound : 8\n\n{}\n\n{}\n\n{}\n\n{}\n\n{}",
+            "rule main\n  logic:\n    let binds = Binding::BCons {{ name_start: 0, name_len: 2, value: Ast::AstNum {{ value: 1 }}, rest: Binding::BCons {{ name_start: 3, name_len: 2, value: Ast::AstNum {{ value: 2 }}, rest: Binding::BNil }} }}\n    out = let_index(LetIndexState {{ binds: binds, src: \"ab cd\", q_start: 3, q_len: 2, idx: 0 }})\n  proofs:\n    purity:\n      reads : []\n      calls : [let_index]\n    termination:\n      bound : 8\n\n{}\n\n{}\n\n{}\n\n{}\n\n{}",
             group, name_eq_concept, name_eq_rule, li_concept, li_rule);
         assert_eq!(run(&em, &li), 1, "verbatim let_index+name_eq: second binding matches (eval)");
         assert_eq!(run_compiled(&li, "let_index"), 1,
@@ -43620,7 +43861,7 @@ rule two
         // halves of this loop are what pins the derivation both ways.
         for (prog, expect) in [(two_rule, "2"), (one_rule, "1"), ("1 + 2", "0")] {
             let (got, st) = emit_then_run(&frag, prog, "0", "cr", true);
-            assert!(st.success(), "count_rules ELF must exit 0 for {:?}", prog);
+            assert!(st.success(), "count_rules ELF must exit 0 for {:?}; got {:?}", prog, st);
             let (oracle, _) = run_bin(&cr_oracle, prog, "0");
             assert_eq!(oracle, expect, "oracle sanity: count_rules({:?})", prog);
             assert_eq!(got, expect,
