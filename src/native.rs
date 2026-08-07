@@ -45991,7 +45991,26 @@ rule pick
         // 105 binaries are byte-identical except vexprparse itself. Fresh-text
         // payloads need a materialization arc (runtime buffer, itoa-to-memory,
         // span rebasing) — until it lands, refusal is the only honest verdict.
-        const EXPECTED_ACCEPTED: usize = 105;
+        //
+        // 105 -> 100 (record-output entry path): the RECORD sibling of the
+        // Result slice above, and the same accounting — two files FIXED in
+        // place (they stay accepted, they just stop lying) and five DELIBERATELY
+        // dropped. A rule whose declared `output:` is a user concept returns an
+        // ARENA NODE INDEX in rax, and no entry_rule_* branch claimed it, so the
+        // 101-byte number trampoline itoa'd the index: greeting::make_report
+        // printed `1` at rc 0 where verbosec prints
+        // {"name":"Alice","bonus":5000}. IMPLEMENTED for a bare all-number-or-
+        // text record — the entry trampoline becomes `call ; push rax ;
+        // x86_json_record ; exit(0)` (67 + json_fields_size bytes), reusing the
+        // serializer already written for the map/filter record loops, so
+        // greeting and classify now produce verbosec's exact bytes. REFUSED for
+        // a SUM TYPE entry or a record with a non-scalar field: label_tree,
+        // print_chain, sum_chain, token_classify, token_label — all five were
+        // measured printing an index at rc 0, three of them a DIFFERENT index
+        // from verbosec's own binary (10 vs 6 at seed 3) and two of them where
+        // verbosec refuses to emit at all. The other 98 binaries are
+        // byte-identical (size + sha256) except vexprparse itself.
+        const EXPECTED_ACCEPTED: usize = 100;
         const EXPECTED_TOTAL: usize = 151;
 
         let src = fs::read_to_string("examples/vexprparse.verbose")
@@ -46815,6 +46834,150 @@ rule pick
         assert!(ok && len > 0,
             "config.verbose (Result(number, text), literal Err) must stay accepted — \
              the number-Ok trampoline variant is byte-for-byte untouched");
+
+        let _ = fs::remove_file(&gen0);
+        let _ = fs::remove_file(&out_elf);
+    }
+
+    /// gen0 SERIALIZES a record-output entry, or REFUSES it — it never itoa's
+    /// the arena node index. The RECORD sibling of the text-Result defect
+    /// above, and the same class: a pointer-ish value rendered as a number at
+    /// rc 0.
+    ///
+    /// A rule whose declared `output:` is a user concept returns an ARENA NODE
+    /// INDEX in rax (x86_node's AstVariant arm stores the record at
+    /// r15 + r14*esize and hands back r14), and none of the entry_rule_*
+    /// branches claimed it — so the 101-byte number trampoline itoa'd the
+    /// INDEX. Measured on examples/greeting.verbose (make_report, argv
+    /// "Alice" 50000): gen0 printed `1` at rc 0 where verbosec prints
+    /// {"name":"Alice","bonus":5000}. rc 0, plausible-looking output, no
+    /// diagnostic anywhere — a caller checking exit codes sees success.
+    ///
+    /// The fix, in examples/vexprparse.verbose, split at the representation
+    /// boundary exactly as the Result slice did:
+    ///  * IMPLEMENTED — a bare RECORD (no variants, >0 fields, every field
+    ///    number or text). gen0 ALREADY owned the serializer: x86_json_record /
+    ///    x86_json_fields, written for the map/filter record loops. The entry
+    ///    trampoline becomes `call entry ; push rax ; <that serializer> ;
+    ///    exit(0)` = 67 + json_fields_size bytes, the first trampoline variant
+    ///    whose size is not a constant. Its NUMBER field blocks call the shared
+    ///    itoa proc at blob-origin -86, which a record body (an AstVariant, so
+    ///    NOT texty) would not otherwise order — hence prog_needs_itoa, called
+    ///    by BOTH blob_end_off's size chain and elf_program_src's emit.
+    ///  * REFUSED — a SUM TYPE entry (the concept declares variants) or a record
+    ///    with a field that is neither number nor text. Those need tag dispatch
+    ///    / nested-node recursion no gen0 emitter has, and they were the same
+    ///    silent wrong answer: sum_chain / print_chain / label_tree printed a
+    ///    DIFFERENT index from verbosec's own binary (10 vs 6 at seed 3), and
+    ///    token_classify / token_label printed one where verbosec REFUSES to
+    ///    emit at all.
+    ///
+    /// Verified to FAIL pre-change: greeting printed `1` at rc 0.
+    #[test]
+    #[ignore = "builds gen0 from the full self-source (~20 s) + needs `ulimit -s unlimited`; run with --ignored"]
+    #[cfg(target_arch = "x86_64")]
+    fn two_generation_gen0_emits_record_output_entries_or_refuses() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        let src = fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+        let gen0 = std::env::temp_dir().join("verbosec_test_rec_gen0");
+        compile_native_stdin_raw(&program, "elf_program_src", gen0.to_str().unwrap())
+            .expect("elf_program_src must compile --stdin-raw");
+        let mut perms = fs::metadata(&gen0).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&gen0, perms).unwrap();
+
+        let out_elf = std::env::temp_dir().join("verbosec_test_rec_out.elf");
+        let gen0_compile = |source_path: &std::path::Path| -> (bool, u64) {
+            let status = Command::new("sh").arg("-c").arg(format!(
+                "ulimit -s unlimited; '{}' 0 < '{}' > '{}' 2>/dev/null",
+                gen0.display(), source_path.display(), out_elf.display()))
+                .status().expect("run gen0");
+            (status.success(), fs::metadata(&out_elf).unwrap().len())
+        };
+
+        // ---- Half 1: real corpus record entries produce verbosec's EXACT
+        // bytes. greeting exercises a TEXT field (packed span, written from
+        // src_base + start) followed by a NUMBER field (the shared itoa);
+        // classify exercises both branches of an if/else between two record
+        // arms, so the field ORDER and the {"…":…,"…":…} separators are both
+        // pinned on two different runtime paths.
+        let cases: &[(&str, &str, &[&[&str]])] = &[
+            ("greeting", "make_report", &[&["Alice", "50000"], &["Bo", "0"]]),
+            ("classify", "classify_invoice", &[&["100", "40"], &["100", "10"]]),
+        ];
+        for (name, rule, argvs) in cases {
+            let path = std::path::PathBuf::from(format!("examples/{name}.verbose"));
+            let (ok, len) = gen0_compile(&path);
+            assert!(ok && len > 0,
+                "{name}.verbose: gen0 must ACCEPT a bare all-number-or-text record entry \
+                 and serialize it — that is the implemented half of this slice");
+            let gen0_bin = std::env::temp_dir().join(format!("verbosec_test_rec_{name}_gen0"));
+            fs::copy(&out_elf, &gen0_bin).unwrap();
+            let mut perms = fs::metadata(&gen0_bin).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&gen0_bin, perms).unwrap();
+
+            let psrc = fs::read_to_string(&path).unwrap();
+            let ptok = crate::lexer::Lexer::new(&psrc).tokenize().unwrap();
+            let pprog = crate::parser::Parser::new(ptok).parse_program().unwrap();
+            let vref = std::env::temp_dir().join(format!("verbosec_test_rec_{name}_ref"));
+            compile_native(&pprog, rule, vref.to_str().unwrap(), false, false)
+                .expect("verbosec must compile the record entry");
+            let mut perms = fs::metadata(&vref).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&vref, perms).unwrap();
+
+            for argv in *argvs {
+                let got = Command::new(&gen0_bin).args(*argv).output().unwrap();
+                let want = Command::new(&vref).args(*argv).output().unwrap();
+                assert!(got.status.code().is_some(),
+                    "{name} {argv:?}: gen0-emitted binary died on a SIGNAL ({:?})",
+                    got.status);
+                // The load-bearing assertion. Pre-change this was the ASCII of
+                // an arena node index (`1\n`) instead of a JSON object.
+                assert_eq!(
+                    String::from_utf8_lossy(&got.stdout),
+                    String::from_utf8_lossy(&want.stdout),
+                    "{name} {argv:?}: gen0's stdout must be verbosec's exact bytes \
+                     (pre-fix this printed the arena NODE INDEX as a decimal)");
+                assert_eq!(got.status.code(), want.status.code(),
+                    "{name} {argv:?}: exit code must match");
+            }
+            let _ = fs::remove_file(&gen0_bin);
+            let _ = fs::remove_file(&vref);
+        }
+
+        // ---- Half 2: sum-type entries REFUSE with zero bytes. Same
+        // future-proof invariant shape as the iso_date / text-result pins: the
+        // slice that teaches gen0 to serialize a tagged node flips these to the
+        // agreement arm rather than deleting the case.
+        for name in ["sum_chain", "print_chain", "label_tree", "token_classify", "token_label"] {
+            let path = std::path::PathBuf::from(format!("examples/{name}.verbose"));
+            let (ok, len) = gen0_compile(&path);
+            if ok {
+                panic!("gen0 accepted {name}.verbose, whose entry returns a SUM-TYPE arena \
+                        node it cannot serialize. If a slice taught gen0 tag dispatch, \
+                        extend this case to run the binary and diff it against verbosec — \
+                        do not just delete it.");
+            }
+            assert_eq!(len, 0,
+                "{name}: a refusing gen0 must write ZERO bytes, not a partial ELF");
+        }
+
+        // ---- Guard: the scalar number trampoline is untouched. invoices
+        // (entry `important_invoice`, `out : bool` from a comparison) has no
+        // declared concept output, so entry_out_named must fall out before the
+        // concept walk and the 101-byte variant must still be chosen.
+        let (ok, len) = gen0_compile(std::path::Path::new("examples/invoices.verbose"));
+        assert!(ok && len > 0,
+            "invoices.verbose (scalar entry) must stay accepted — the 101-byte number \
+             trampoline is byte-for-byte untouched by the record branch");
 
         let _ = fs::remove_file(&gen0);
         let _ = fs::remove_file(&out_elf);
