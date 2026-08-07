@@ -44273,9 +44273,11 @@ rule two
     ///   * Basics: concat("ab","cd") → abcd; concat("n=", 42) → n=42 (itoa);
     ///     concat("t=", 0 - 7) → t=-7 (negative itoa); bare literal → lit;
     ///     a texty rule streaming a TEXT param → hey!.
-    ///   * Refusal (v1, documented): a TEXTY callee in VALUE position
-    ///     (length(print_expr(...))) compiles to int3 — the binary traps CLEANLY
-    ///     with SIGTRAP; the SAME program still EVALS to 7 (the probe/print split).
+    ///   * Refusal (v2, 2026-08-07): a TEXTY callee in VALUE position
+    ///     (length(print_expr(...))) is refused at VERIFY time — exit 1, zero
+    ///     bytes — via the entry_freshtext gate (was v1: compile to int3 +
+    ///     SIGTRAP at runtime); the SAME program still EVALS to 7 (the
+    ///     probe/print split).
     ///   * Number-path pin: fact(5) still prints 120 and its ELF carries the
     ///     original 101-byte b8 itoa trampoline byte-for-byte at offset 120 (the
     ///     texty trampoline + itoa_proc only appear when a texty rule exists;
@@ -44286,7 +44288,6 @@ rule two
     fn streaming_text_codegen_elf_prints_bytes() {
         use std::fs;
         use std::os::unix::fs::PermissionsExt;
-        use std::os::unix::process::ExitStatusExt;
         use std::process::Command;
 
         let src = fs::read_to_string("examples/vexprparse.verbose")
@@ -44347,17 +44348,28 @@ rule two
             "hey!\n", "textparam"
         );
 
-        // Refusal (v1): a texty callee in VALUE position compiles to int3 — the
-        // binary traps with SIGTRAP, never emits garbage. The SAME program still
-        // EVALS to 7 via eval_main (the probe/print split holds).
+        // Refusal (v2, 2026-08-07): a texty callee in VALUE position is now
+        // refused at VERIFY time — exit 1, ZERO bytes — through the
+        // entry_freshtext verrs gate (the text-producing Result slice). The v1
+        // posture this case used to pin (compile to int3, SIGTRAP at runtime)
+        // was measured as the exact defect class that made tier/purchase/
+        // gate_result/fullname/ledger_line trap: compile-and-trap became
+        // compile-refusal. The SAME program still EVALS to 7 via eval_main
+        // (the probe/print split holds).
         let refusal = print_chain(3).replace(
             "out = print_expr(build_chain(Seed { n: 3 }))",
             "out = length(print_expr(build_chain(Seed { n: 3 })))",
         );
-        let (_, status, _) = emit_and_run(&refusal, "refusal");
-        assert_eq!(
-            status.signal(), Some(5),
-            "texty callee in value position must trap with SIGTRAP (int3); got {:?}", status
+        let mc = Command::new(&elf).args([refusal.as_str(), "0"]).output().expect("spawn elf_program_src");
+        assert!(
+            !mc.status.success(),
+            "a texty callee in value position must be REFUSED at verify time \
+             (exit 1, zero bytes), not compiled to a trapping int3; got {:?}", mc.status
+        );
+        assert!(
+            mc.stdout.is_empty(),
+            "a refusing gen0 must write ZERO bytes, not a partial ELF ({} bytes)",
+            mc.stdout.len()
         );
         let ev = Command::new(&em).args([refusal.as_str(), "0"]).output().expect("spawn eval_main");
         assert!(ev.status.success(), "eval_main must exit 0 for the refusal program");
@@ -45962,7 +45974,24 @@ rule pick
         // `outsd`. Compile-and-crash is now compile-refusal: rc 1, zero bytes.
         // The other 110 binaries are byte-identical except vexprparse itself
         // (its own source carries the fix). See CLAUDE.md's gaps table.
-        const EXPECTED_ACCEPTED: usize = 110;
+        //
+        // 110 -> 105 (text-producing Result path): another DELIBERATE drop of
+        // exactly five files — fullname, gate_result, ledger_line, purchase,
+        // tier — the five whose ENTRY rule builds FRESH text (concat /
+        // texty-rule call) in a position x86_node value-lowers, where the only
+        // lowering was a bare int3 placeholder. All five were measured broken
+        // at runtime: four SIGTRAP'd (kernel trap ip == int3_site + 1), and
+        // tier's Ok arm was worse — a SILENT WRONG ANSWER, the packed
+        // (start, len) span printed as the decimal 2864743186439 at rc 0 where
+        // verbosec prints `premium`. The same slice IMPLEMENTS the
+        // span-payload half: a Result(text, ...) entry now gets a text-Ok
+        // trampoline (span write to stdout + exit 0; 189 B vs the number
+        // variant's 210 B), pinned differentially by
+        // two_generation_gen0_emits_text_result_values_or_refuses. The other
+        // 105 binaries are byte-identical except vexprparse itself. Fresh-text
+        // payloads need a materialization arc (runtime buffer, itoa-to-memory,
+        // span rebasing) — until it lands, refusal is the only honest verdict.
+        const EXPECTED_ACCEPTED: usize = 105;
         const EXPECTED_TOTAL: usize = 151;
 
         let src = fs::read_to_string("examples/vexprparse.verbose")
@@ -46639,6 +46668,153 @@ rule pick
             assert_eq!(fs::metadata(&out_elf).unwrap().len(), 0,
                 "{name}: a refusing gen0 must write ZERO bytes, not a partial ELF");
         }
+
+        let _ = fs::remove_file(&gen0);
+        let _ = fs::remove_file(&out_elf);
+    }
+
+    /// gen0's TEXT-producing Result path (2026-08-07). Two halves, one defect.
+    ///
+    /// The defect: gen0's Result trampoline had exactly ONE finished payload
+    /// printer — the Ok arm ALWAYS itoa'd. For a `Result(text, text)` entry the
+    /// Ok payload is a packed (start, len) span into the embedded source, so
+    /// `examples/tier.verbose` at balance=200000 printed `2864743186439` at
+    /// rc 0 — decode it: 0x29b00000007 = offset 667, len 7, and byte 667 of
+    /// tier.verbose is literally b"premium". A SILENT WRONG ANSWER. The Err
+    /// arm's `concat(...)` payload hit x86_node's fresh-text int3 placeholder
+    /// instead: SIGTRAP (rc 133), kernel ip == int3_site + 1. Four more corpus
+    /// entries carried the same reachable int3 (purchase's Err(concat...),
+    /// gate_result's + ledger_line's concat lets, fullname's concat record
+    /// field).
+    ///
+    /// The fix, in examples/vexprparse.verbose:
+    ///  * IMPLEMENTED — the trampoline dispatches on the DECLARED Ok type via
+    ///    `entry_result_ok_texty` (re-scans the source after the "Result"
+    ///    token, the field_text_bound road): `Result(text, ...)` entries get a
+    ///    189-byte variant whose Ok block mirrors the already-span-aware Err
+    ///    block (write(1, src_base+off, len) ; '\n' ; exit 0). blob_end_off's
+    ///    size chain dispatches on the SAME rule (the two-walk discipline).
+    ///  * REFUSED — fresh text (concat / texty-rule call) in a VALUE-lowered
+    ///    position of the ENTRY rule (let RHSes + body, stream/value dispatch
+    ///    mirrored from x86_proc) joins the verrs gate: exit 1, ZERO bytes.
+    ///    Materializing fresh text in the packed-span value model is a real
+    ///    emit arc (runtime buffer + itoa-to-memory + span rebasing), not this
+    ///    slice. Entry-scoped deliberately: presence is not the defect,
+    ///    reachability is — enrich/order_intake-style dead-rule concat must
+    ///    not refuse (both were already refused for unrelated reasons, but the
+    ///    principle is load-bearing for service files, which are exempt
+    ///    wholesale because the service trampoline never calls a proc).
+    ///
+    /// Verified to FAIL pre-change: tier printed `2864743186439` at rc 0.
+    #[test]
+    #[ignore = "builds gen0 from the full self-source (~10 s) + needs `ulimit -s unlimited`; run with --ignored"]
+    #[cfg(target_arch = "x86_64")]
+    fn two_generation_gen0_emits_text_result_values_or_refuses() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        let src = fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+        let gen0 = std::env::temp_dir().join("verbosec_test_txtres_gen0");
+        compile_native_stdin_raw(&program, "elf_program_src", gen0.to_str().unwrap())
+            .expect("elf_program_src must compile --stdin-raw");
+        let mut perms = fs::metadata(&gen0).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&gen0, perms).unwrap();
+
+        let out_elf = std::env::temp_dir().join("verbosec_test_txtres_out.elf");
+        let gen0_compile = |source_path: &std::path::Path| -> (bool, u64) {
+            let status = Command::new("sh").arg("-c").arg(format!(
+                "ulimit -s unlimited; '{}' 0 < '{}' > '{}' 2>/dev/null",
+                gen0.display(), source_path.display(), out_elf.display()))
+                .status().expect("run gen0");
+            (status.success(), fs::metadata(&out_elf).unwrap().len())
+        };
+
+        // ---- Half 1: the five fresh-text entries REFUSE with zero bytes.
+        // The invariant is the iso_date shape (refuse-with-zero-bytes OR
+        // run-and-agree) so the slice that ships fresh-text materialization
+        // flips these to the agreement arm instead of rewriting the test.
+        for name in ["tier", "purchase", "gate_result", "fullname", "ledger_line"] {
+            let path = std::path::PathBuf::from(format!("examples/{name}.verbose"));
+            let (ok, len) = gen0_compile(&path);
+            if ok {
+                panic!("gen0 accepted {name}.verbose, whose entry builds fresh text in a \
+                        value-lowered position. If a slice taught gen0 to materialize \
+                        fresh text, extend this case to run the binary and diff it \
+                        against verbosec on BOTH arms — do not just delete it.");
+            }
+            assert_eq!(len, 0,
+                "{name}: a refusing gen0 must write ZERO bytes, not a partial ELF");
+        }
+
+        // ---- Half 2: span-representable payloads now WORK, differentially
+        // against verbosec. Probe A: literal payloads on both arms (the tier
+        // shape minus the concat). Probe B: Ok(text input field) — the
+        // pass-through span. Each runs one Ok input and one Err input; stdout,
+        // stderr and exit code must all match verbosec's binary exactly
+        // (Ok -> stdout rc 0, Err -> stderr rc 1).
+        let probes: &[(&str, &str, &str, &[&str], &[&str])] = &[
+            ("txtres_probe_lit",
+             "@verbose 0.1.0\n\nconcept Customer\n  @intention: \"A customer has a balance\"\n  @source: probe.intent:1\n\n  fields:\n    balance : number [0, 10000000]\n\n\nrule classify_tier\n  @intention: \"premium if balance >= 100000, else a fixed rejection\"\n  @source: probe.intent:2\n\n  input:\n    c : Customer\n\n  output:\n    r : Result(text, text)\n\n  logic:\n    r = if c.balance >= 100000 then Ok(\"premium\") else Err(\"below the 100000 threshold\")\n\n  proofs:\n    purity:\n      reads   : [c.balance]\n      calls   : []\n    termination:\n      bound : 8\n",
+             "classify_tier", &["200000"], &["500"]),
+            ("txtres_probe_field",
+             "@verbose 0.1.0\n\nconcept Visitor\n  @intention: \"A visitor has a name and an age\"\n  @source: probe.intent:1\n\n  fields:\n    name : text [..32]\n    age : number [0, 150]\n\n\nrule gate_visitor\n  @intention: \"Admit adults by name, refuse minors\"\n  @source: probe.intent:2\n\n  input:\n    v : Visitor\n\n  output:\n    r : Result(text, text)\n\n  logic:\n    r = if v.age >= 18 then Ok(v.name) else Err(\"minors are not admitted\")\n\n  proofs:\n    purity:\n      reads   : [v.age, v.name]\n      calls   : []\n    termination:\n      bound : 8\n",
+             "gate_visitor", &["ada", "36"], &["bob", "12"]),
+        ];
+        for (name, probe_src, rule, ok_argv, err_argv) in probes {
+            let probe_path = std::env::temp_dir().join(format!("verbosec_test_{name}.verbose"));
+            fs::write(&probe_path, probe_src).unwrap();
+
+            let (ok, len) = gen0_compile(&probe_path);
+            assert!(ok && len > 0,
+                "{name}: gen0 must ACCEPT a Result(text, text) entry whose payloads are \
+                 packed spans (literal / text input field) — that is the implemented half \
+                 of the text-result slice");
+            let gen0_bin = std::env::temp_dir().join(format!("verbosec_test_{name}_gen0"));
+            fs::copy(&out_elf, &gen0_bin).unwrap();
+            let mut perms = fs::metadata(&gen0_bin).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&gen0_bin, perms).unwrap();
+
+            let ptok = crate::lexer::Lexer::new(probe_src).tokenize().unwrap();
+            let pprog = crate::parser::Parser::new(ptok).parse_program().unwrap();
+            let vref = std::env::temp_dir().join(format!("verbosec_test_{name}_ref"));
+            compile_native(&pprog, rule, vref.to_str().unwrap(), false, false)
+                .expect("verbosec must compile the probe");
+            let mut perms = fs::metadata(&vref).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&vref, perms).unwrap();
+
+            for argv in [ok_argv, err_argv] {
+                let got = Command::new(&gen0_bin).args(*argv).output().unwrap();
+                let want = Command::new(&vref).args(*argv).output().unwrap();
+                assert!(got.status.code().is_some(),
+                    "{name} {argv:?}: gen0-emitted binary died on a SIGNAL ({:?})",
+                    got.status);
+                assert_eq!(got.stdout, want.stdout,
+                    "{name} {argv:?}: gen0's stdout must be verbosec's exact bytes \
+                     (pre-fix this printed the packed span as a decimal integer)");
+                assert_eq!(got.stderr, want.stderr,
+                    "{name} {argv:?}: gen0's stderr must be verbosec's exact bytes");
+                assert_eq!(got.status.code(), want.status.code(),
+                    "{name} {argv:?}: exit code must match (Ok -> 0, Err -> 1)");
+            }
+            let _ = fs::remove_file(&probe_path);
+            let _ = fs::remove_file(&gen0_bin);
+            let _ = fs::remove_file(&vref);
+        }
+
+        // ---- Guard: the NUMBER Result path is untouched. config.verbose
+        // (entry `valid_connections`, Result(number, text), literal Err) must
+        // still be accepted — its trampoline keeps the 210-byte itoa variant.
+        let (ok, len) = gen0_compile(std::path::Path::new("examples/config.verbose"));
+        assert!(ok && len > 0,
+            "config.verbose (Result(number, text), literal Err) must stay accepted — \
+             the number-Ok trampoline variant is byte-for-byte untouched");
 
         let _ = fs::remove_file(&gen0);
         let _ = fs::remove_file(&out_elf);
