@@ -25003,6 +25003,232 @@ rule entry_rule_collection
       bound : 8000
 
 
+-- ============ RECORD-OUTPUT ENTRY PATH (2026-08-07) ============
+-- The RECORD sibling of the text-Result defect above, and the same class: a
+-- pointer-ish value rendered as a number at rc 0. A rule whose declared
+-- `output:` is a user concept RETURNS AN ARENA NODE INDEX in rax (x86_node's
+-- AstVariant arm stores the record at r15 + r14*esize and hands back r14), and
+-- none of the entry_rule_* branches above claimed it — so the 101-byte number
+-- trampoline itoa'd the INDEX. Measured on examples/greeting.verbose
+-- (make_report, argv "Alice" 50000): gen0 printed `1` at rc 0 where verbosec
+-- prints {"name":"Alice","bonus":5000}. Same on examples/classify.verbose.
+--
+-- The representation split (the tier lesson: implement what gen0 can already
+-- represent, refuse the rest):
+--
+--   IMPLEMENTED — a bare RECORD (zero variants, >0 fields, every field number
+--   or text). gen0 ALREADY has the serializer: x86_json_record / x86_json_fields,
+--   written for the map/filter record loops, emits `{"f":v,...}\n` on fd 1 from
+--   a node index on the CPU stack, numbers through the shared itoa proc and text
+--   through the packed-span write. The entry trampoline just needs `call entry ;
+--   push rax ; <that serializer> ; exit(0)` = 67 + json_fields_size bytes.
+--
+--   REFUSED — a SUM TYPE (the concept declares variants) or a record carrying a
+--   field that is neither number nor text. Serializing those needs tag dispatch
+--   / nested-node recursion that no gen0 emitter has. They were the same silent
+--   wrong answer: sum_chain / print_chain / label_tree printed a DIFFERENT index
+--   from verbosec's own binary (10 vs 6 at seed 3), and token_classify /
+--   token_label printed one where verbosec REFUSES to emit at all.
+--
+-- The number-field block needs the shared itoa proc at blob-origin offset -86,
+-- which is emitted iff `anytx`. A record body is an AstVariant, hence NOT texty,
+-- so anytx would be 0 — prog_needs_itoa ORs the record entry in, and BOTH walks
+-- (blob_end_off's constant chain and elf_program_src's emit) call that ONE rule.
+-- Splitting that decision is the p_filesz/src_base desync the entry_uses_stdin
+-- banner warns about, 86 bytes wide.
+
+-- entry_out_concept: the CONCEPT the entry rule's declared output type name
+-- resolves to, or the sentinel empty concept (0 fields, 0 variants) when the
+-- name is a built-in (`number`, `text`, `bytes`, ...) or otherwise undeclared —
+-- find_concept_index returns 999999 and concept_at_index walks off the end.
+-- That sentinel is what makes "is the entry output a record?" a total function.
+-- entry_out_ty_len: the byte length of the entry rule's declared output TYPE
+-- NAME span. Zero means the rule declared no `output:` block at all — the
+-- disambiguator entry_out_named leads with (see its banner).
+rule entry_out_ty_len
+  @intention: "The byte length of the entry rule's declared output type name span (0 = no output block)"
+  @source: vexprparse.intent:70
+  input:
+    pg : ProgGenState
+  output:
+    out : number
+  logic:
+    out = match pg.rules:
+      RCons(head, tail) => rd_out_ty_len(head)
+      RNil => 0
+  proofs:
+    purity:
+      reads : [pg.rules]
+      calls : [rd_out_ty_len]
+    termination:
+      bound : 8000
+
+
+rule entry_out_concept
+  @intention: "The concept the entry rule's declared output type name resolves to, or the sentinel empty concept"
+  @source: vexprparse.intent:70
+  input:
+    pg : ProgGenState
+  output:
+    out : Concept
+  logic:
+    out = match pg.rules:
+      RCons(head, tail) => concept_at_index(ConceptAtState { concepts: pg.concepts, idx: find_concept_index(FindConceptIdxState { concepts: pg.concepts, src: pg.src, q_start: rd_out_ty_start(head), q_len: rd_out_ty_len(head), idx: 0 }) })
+      RNil => Concept::MkConcept { name_start: 0, name_len: 0, fields: FieldList::FNil, variants: VariantList::VarNil }
+  proofs:
+    purity:
+      reads : [pg.rules, pg.src, pg.concepts]
+      calls : [concept_at_index, find_concept_index, rd_out_ty_start, rd_out_ty_len]
+    termination:
+      bound : 8000
+
+
+-- entry_out_named: 1 iff the entry rule returns an ARENA NODE INDEX that no
+-- earlier trampoline branch claims — i.e. its declared output type resolves to
+-- a declared concept (record OR sum type) and the program is not a service /
+-- reaction / Result / bytes / collection / texty entry. The guard order MIRRORS
+-- elf_program_src's dispatch cascade exactly, cheapest first: a service or
+-- reaction is a list length, and every other branch short-circuits before the
+-- two concept-list walks. That ordering is load-bearing for compile time —
+-- blob_end_off calls this at every src_base site, and gen0's own entry
+-- (`elf_program_src`, `out : bytes`) must fall out at the entry_rule_bytes step
+-- rather than walking 361 concepts each time.
+--
+-- The `rd_out_ty_len == 0` guard leads and is NOT decoration. A rule declared
+-- with no `output:` block at all (`rule main` + a bare `logic:`, the shape half
+-- the streaming_* unit tests use) has an EMPTY out_ty span, and
+-- concepts_append_result appends a synthetic concept whose `name_len` is
+-- ALSO 0 — so find_concept_index byte-matched the empty query against the
+-- synthetic concept and its one nameless field, and the record trampoline
+-- printed `{"":0}` for a `match_result` rule. Measured: it broke
+-- result_tier_slice2_compiles_match_result_to_machine_code. An undeclared
+-- output type is not a concept name.
+rule entry_out_named
+  @intention: "1 if the entry rule returns an arena node index that no earlier trampoline branch claims, 0 otherwise"
+  @source: vexprparse.intent:70
+  input:
+    pg : ProgGenState
+  output:
+    out : number
+  logic:
+    out = if entry_out_ty_len(pg) == 0 then 0 else if service_list_len(pg.svcs) > 0 then 0 else if reaction_list_len(pg.rxs) > 0 then 0 else if entry_rule_result(pg) == 1 then 0 else if entry_rule_bytes(pg) == 1 then 0 else if entry_rule_collection(pg) == 1 then 0 else if entry_rule_texty(pg) == 1 then 0 else if field_list_len(cd_fields(entry_out_concept(pg))) > 0 then 1 else if variant_list_len(cd_variants(entry_out_concept(pg))) > 0 then 1 else 0
+  proofs:
+    purity:
+      reads : [pg, pg.rxs, pg.svcs]
+      calls : [entry_out_ty_len, service_list_len, reaction_list_len, entry_rule_result, entry_rule_bytes, entry_rule_collection, entry_rule_texty, field_list_len, cd_fields, variant_list_len, cd_variants, entry_out_concept]
+    termination:
+      bound : 8000
+
+
+-- entry_record_ok: 1 iff the entry's output concept is a shape x86_json_record
+-- can serialize — a bare record (no variants), at least one field, every field
+-- number (ty 0) or text (ty 2). Exactly the subset the map/filter record loops
+-- already emit, reused verbatim so the two paths can never drift.
+rule entry_record_ok
+  @intention: "1 if the entry rule's output concept is a bare all-number-or-text record, 0 otherwise"
+  @source: vexprparse.intent:70
+  input:
+    pg : ProgGenState
+  output:
+    out : number
+  logic:
+    out = if variant_list_len(cd_variants(entry_out_concept(pg))) > 0 then 0 else if field_list_len(cd_fields(entry_out_concept(pg))) == 0 then 0 else field_list_number_or_text(cd_fields(entry_out_concept(pg)))
+  proofs:
+    purity:
+      reads : [pg]
+      calls : [variant_list_len, cd_variants, field_list_len, cd_fields, field_list_number_or_text, entry_out_concept]
+    termination:
+      bound : 8000
+
+
+-- entry_rule_record: the EMIT-side predicate — 1 iff the entry trampoline must
+-- be the JSON record serializer. Selects the (67 + json_fields_size)-byte
+-- variant in elf_program_src's dispatch AND the same constant in blob_end_off's
+-- chain AND the itoa proc through prog_needs_itoa. ONE rule, three walks.
+rule entry_rule_record
+  @intention: "1 if the program's entry rule returns a serializable record node, 0 otherwise"
+  @source: vexprparse.intent:70
+  input:
+    pg : ProgGenState
+  output:
+    out : number
+  logic:
+    out = if entry_out_named(pg) == 1 then entry_record_ok(pg) else 0
+  proofs:
+    purity:
+      reads : [pg]
+      calls : [entry_out_named, entry_record_ok]
+    termination:
+      bound : 8000
+
+
+-- entry_badrecord: the VERIFY-side complement — nonzero refuses emission
+-- (exit 1, zero bytes) through the verrs gate. Fires when the entry returns an
+-- arena node index gen0 cannot serialize: a sum type, or a record with a field
+-- that is neither number nor text. Entry-SCOPED like entry_freshtext: a sum-type
+-- concept declared anywhere else in the program is fine, only the value the
+-- trampoline is about to print matters.
+rule entry_badrecord
+  @intention: "1 if the entry rule returns an arena node index gen0 cannot serialize (refuses emission), 0 otherwise"
+  @source: vexprparse.intent:70
+  input:
+    pg : ProgGenState
+  output:
+    out : number
+  logic:
+    out = if entry_out_named(pg) == 1 then (if entry_record_ok(pg) == 1 then 0 else 1) else 0
+  proofs:
+    purity:
+      reads : [pg]
+      calls : [entry_out_named, entry_record_ok]
+    termination:
+      bound : 8000
+
+
+-- entry_record_tramp_size: the EXACT byte count of the record trampoline —
+-- call 5 + push rax 1 + x86_json_record (14 preamble + json_fields_size +
+-- 35 trailer) + exit 12 = 67 + json_fields_size. The size/emit mirror pair;
+-- a drift here moves p_filesz and points src_base into the source blob.
+rule entry_record_tramp_size
+  @intention: "Exact byte count of the record-entry trampoline (call + push + JSON record serializer + exit)"
+  @source: vexprparse.intent:70
+  input:
+    pg : ProgGenState
+  output:
+    out : number
+  logic:
+    out = 67 + json_fields_size(cd_fields(entry_out_concept(pg)))
+  proofs:
+    purity:
+      reads : [pg]
+      calls : [json_fields_size, cd_fields, entry_out_concept]
+    termination:
+      bound : 8000
+
+
+-- prog_needs_itoa: the shared itoa proc's emission gate. Was prog_any_texty
+-- alone; a record entry ORs in because x86_json_fields' NUMBER block calls
+-- itoa at blob-origin -86 while a record body (AstVariant) is not texty. Both
+-- the size walk (blob_end_off) and the emit walk (elf_program_src's `anytx`)
+-- consult this ONE rule — forcing the 86 bytes in one and not the other is the
+-- p_filesz corruption prog_any_texty's own banner names.
+rule prog_needs_itoa
+  @intention: "1 if the program needs the shared itoa proc (any texty rule, or a record-serializing entry), 0 otherwise"
+  @source: vexprparse.intent:70
+  input:
+    pg : ProgGenState
+  output:
+    out : number
+  logic:
+    out = if entry_rule_record(pg) == 1 then 1 else prog_any_texty(pg)
+  proofs:
+    purity:
+      reads : [pg]
+      calls : [entry_rule_record, prog_any_texty]
+    termination:
+      bound : 8000
+
+
 -- ast_is_collection_node (COLLECTIONS tier slice 4b): 1 iff the node is a
 -- top-level collection producer (AstMap / AstFilter). x86_proc / proc_size use
 -- it for the declared-type/body-shape MISMATCH guard: a rule whose out_ty CODE
@@ -28546,11 +28772,18 @@ rule blob_end_off
     -- trampoline shape) MUST precede entry_rule_texty here EXACTLY as the
     -- emit-side dispatch in elf_program_src orders it (a map/filter body IS
     -- texty, so the 45 branch would otherwise win and desync p_filesz).
-    out = 120 + (if program_uses_arena(pg.concepts) == 1 then 66 else 0) + (if has_svc == 1 then service_tramp_size(ServiceTrampSizeState { svcs: pg.svcs, prog: pg.prog, src: pg.src }) else (if reaction_list_len(pg.rxs) > 0 then reaction_tramp_size(RxSizeState { rxs: pg.rxs, src: pg.src }) else (if entry_rule_result(pg) == 1 then (if entry_result_ok_texty(pg) == 1 then 189 else 210) else if entry_rule_bytes(pg) == 1 then 17 else if entry_rule_collection(pg) == 1 then 17 else if entry_rule_texty(pg) == 1 then 45 else 101))) + (if prog_any_texty(pg) == 1 then 86 else 0) + msize + resource_marshal_size(RMarshSizeState { rem: pg.ress, src: pg.src, prog: pg.prog }) + connection_marshal_size(CMarshSizeState { rem: pg.conns, src: pg.src, prog: pg.prog }) + ps_total(pg.sizes)
+    -- RECORD-OUTPUT ENTRY (2026-08-07): the record branch sits LAST in the
+    -- cascade — after texty, exactly as elf_program_src's emit dispatch orders
+    -- it — and replaces what used to be the unconditional 101. Its size is
+    -- variable (67 + json_fields_size), the first trampoline variant that is.
+    -- The itoa term below switches from prog_any_texty to prog_needs_itoa for
+    -- the same reason: a record body is an AstVariant, so nothing else here
+    -- would order the itoa proc the number-field blocks call.
+    out = 120 + (if program_uses_arena(pg.concepts) == 1 then 66 else 0) + (if has_svc == 1 then service_tramp_size(ServiceTrampSizeState { svcs: pg.svcs, prog: pg.prog, src: pg.src }) else (if reaction_list_len(pg.rxs) > 0 then reaction_tramp_size(RxSizeState { rxs: pg.rxs, src: pg.src }) else (if entry_rule_result(pg) == 1 then (if entry_result_ok_texty(pg) == 1 then 189 else 210) else if entry_rule_bytes(pg) == 1 then 17 else if entry_rule_collection(pg) == 1 then 17 else if entry_rule_texty(pg) == 1 then 45 else if entry_rule_record(pg) == 1 then entry_record_tramp_size(pg) else 101))) + (if prog_needs_itoa(pg) == 1 then 86 else 0) + msize + resource_marshal_size(RMarshSizeState { rem: pg.ress, src: pg.src, prog: pg.prog }) + connection_marshal_size(CMarshSizeState { rem: pg.conns, src: pg.src, prog: pg.prog }) + ps_total(pg.sizes)
   proofs:
     purity:
       reads : [pg, pg.rules, pg.src, pg.concepts, pg.sizes, pg.ress, pg.conns, pg.prog, pg.rxs, pg.svcs]
-      calls : [program_uses_arena, reaction_list_len, reaction_tramp_size, service_list_len, service_tramp_size, entry_rule_result, entry_result_ok_texty, entry_rule_texty, entry_rule_bytes, entry_rule_collection, prog_any_texty, ps_total, resource_marshal_size, param_list_len, rl_head_params, fields_to_params, rl_head_input, params_to_fields, argv_marshal_size, stdin_marshal_size, entry_uses_stdin, cd_fields, concept_at_index, find_concept_index, fl_head_ty_start, fl_head_ty_len, connection_marshal_size]
+      calls : [program_uses_arena, reaction_list_len, reaction_tramp_size, service_list_len, service_tramp_size, entry_rule_result, entry_result_ok_texty, entry_rule_texty, entry_rule_bytes, entry_rule_collection, entry_rule_record, entry_record_tramp_size, prog_needs_itoa, ps_total, resource_marshal_size, param_list_len, rl_head_params, fields_to_params, rl_head_input, params_to_fields, argv_marshal_size, stdin_marshal_size, entry_uses_stdin, cd_fields, concept_at_index, find_concept_index, fl_head_ty_start, fl_head_ty_len, connection_marshal_size]
     termination:
       bound : 8000
 
@@ -31714,10 +31947,15 @@ rule elf_program_src
     -- Effects tier slice 2a: the reaction list — used by reaction_errors (verify)
     -- AND by the has_reaction emit branch + blob_end_off sizing (emit).
     let rxs = parse_reactions(ProgramState { cell: toks, src: s.source })
-    let verrs = arena_scope(toplevel_junk(ProgramState { cell: toks, src: s.source }) + (if rule_list_len(prog) == 0 then 1 else 0) + diag_count(prog_diags(ProgDiagsState { iter: prog, full: prog, src: s.source, idx: 0, concepts: if has_service == 1 then http_concepts else concepts0 })) + purity_list(PurityListState { iter: prog, full: prog, src: s.source }) + term_list(TermListState { iter: prog, src: s.source }) + resource_errors(ResErrState { prog: prog, ress: ress, concepts: concepts0, src: s.source }) + reaction_errors(RxErrState { prog: prog, rxs: rxs, src: s.source, concepts: concepts0 }) + connection_errors(ConnErrState { prog: prog, ress: ress, conns: conns, src: s.source }) + service_errors(ServiceErrState { prog: prog, svcs: svcs, concepts: concepts0, ress: ress, conns: conns, rxs: rxs, src: s.source }) + prim_named_rules(PrimNameState { rules: prog, src: s.source }) + (if has_service == 1 then 0 else arena_scope(entry_freshtext(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts0, sizes: ProcSizeList::PSNil, ress: ress, conns: conns, rxs: rxs, svcs: svcs }))))
+    let verrs = arena_scope(toplevel_junk(ProgramState { cell: toks, src: s.source }) + (if rule_list_len(prog) == 0 then 1 else 0) + diag_count(prog_diags(ProgDiagsState { iter: prog, full: prog, src: s.source, idx: 0, concepts: if has_service == 1 then http_concepts else concepts0 })) + purity_list(PurityListState { iter: prog, full: prog, src: s.source }) + term_list(TermListState { iter: prog, src: s.source }) + resource_errors(ResErrState { prog: prog, ress: ress, concepts: concepts0, src: s.source }) + reaction_errors(RxErrState { prog: prog, rxs: rxs, src: s.source, concepts: concepts0 }) + connection_errors(ConnErrState { prog: prog, ress: ress, conns: conns, src: s.source }) + service_errors(ServiceErrState { prog: prog, svcs: svcs, concepts: concepts0, ress: ress, conns: conns, rxs: rxs, src: s.source }) + prim_named_rules(PrimNameState { rules: prog, src: s.source }) + (if has_service == 1 then 0 else arena_scope(entry_freshtext(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts0, sizes: ProcSizeList::PSNil, ress: ress, conns: conns, rxs: rxs, svcs: svcs }))) + arena_scope(entry_badrecord(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts0, sizes: ProcSizeList::PSNil, ress: ress, conns: conns, rxs: rxs, svcs: svcs })))
     let sizes = proc_sizes(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: ProcSizeList::PSNil, ress: ress, conns: conns, rxs: rxs, svcs: svcs })
     let uses_var = program_uses_arena(concepts)
-    let anytx = prog_any_texty(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: sizes, ress: ress, conns: conns, rxs: rxs, svcs: svcs })
+    -- RECORD-OUTPUT ENTRY (2026-08-07): prog_needs_itoa, not prog_any_texty.
+    -- The record trampoline's NUMBER field blocks call the shared itoa proc at
+    -- blob-origin -86, and a record body (AstVariant) is not texty, so this is
+    -- the only thing that orders those 86 bytes. blob_end_off's constant chain
+    -- calls the SAME rule — one decision, two walks.
+    let anytx = prog_needs_itoa(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: sizes, ress: ress, conns: conns, rxs: rxs, svcs: svcs })
     let entrytx = entry_rule_texty(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: sizes, ress: ress, conns: conns, rxs: rxs, svcs: svcs })
     let entrybytes = entry_rule_bytes(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: sizes, ress: ress, conns: conns, rxs: rxs, svcs: svcs })
     let entryresult = entry_rule_result(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: sizes, ress: ress, conns: conns, rxs: rxs, svcs: svcs })
@@ -31737,6 +31975,14 @@ rule elf_program_src
     -- entry always has anytx == 1 (its own body is texty), so it is always
     -- 12 + 86 = 98 in practice.
     let entrycoll = entry_rule_collection(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: sizes, ress: ress, conns: conns, rxs: rxs, svcs: svcs })
+    -- RECORD-OUTPUT ENTRY (2026-08-07): the entry returns an arena node index
+    -- for a bare all-number-or-text record, so the trampoline serializes it to
+    -- `{"f":v,...}\n` instead of itoa-ing the index. LAST in the cascade — every
+    -- earlier branch owns its own return shape. entryrfields is the concept's
+    -- FieldList in DECLARATION order, which is also verbosec's JSON field order.
+    let entryrec = entry_rule_record(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: sizes, ress: ress, conns: conns, rxs: rxs, svcs: svcs })
+    let entryrfields = cd_fields(entry_out_concept(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: sizes, ress: ress, conns: conns, rxs: rxs, svcs: svcs }))
+    let entryrjfs = json_fields_size(entryrfields)
     -- Effects tier slice 1: resource path bytes are SPANS into the embedded
     -- source, but blob inclusion is gated on uses_text, which does not see
     -- read( — so program-uses-resources ORs into the gate BY CONSTRUCTION (the
@@ -31759,11 +32005,11 @@ rule elf_program_src
     -- trampoline REPLACES the entry_rule_* trampoline cascade (the trigger IS the
     -- head/entry proc, gated + open/write/close instead of itoa+print).
     let has_reaction = if reaction_list_len(rxs) > 0 then 1 else 0
-    out = concat(abort_if(verrs), b"\x7f\x45\x4c\x46\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\x3e\x00\x01\x00\x00\x00\x78\x00\x40\x00\x00\x00\x00\x00\x40\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x40\x00\x38\x00\x01\x00\x00\x00\x00\x00\x00\x00", b"\x01\x00\x00\x00\x05\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x40\x00\x00\x00\x00\x00\x00\x00\x40\x00\x00\x00\x00\x00", le64(fsz), le64(fsz), b"\x00\x10\x00\x00\x00\x00\x00\x00", (if uses_var == 1 then b"\xb8\x09\x00\x00\x00\x31\xff\x48\xbe\x00\x00\x00\x00\x06\x00\x00\x00\xba\x03\x00\x00\x00\x41\xba\x22\x40\x00\x00\x49\xc7\xc0\xff\xff\xff\xff\x45\x31\xc9\x0f\x05\x48\x3d\x01\xf0\xff\xff\x72\x0c\xbf\x01\x00\x00\x00\xb8\x3c\x00\x00\x00\x0f\x05\x49\x89\xc7\x45\x31\xf6" else b""), (if has_input == 1 then (if entry_uses_stdin(ChannelState { fields: cd_fields(concept_at_index(ConceptAtState { concepts: concepts, idx: ecidx })), src: s.source }) == 1 then x86_stdin_marshal(ArgvTrampState { fields: cd_fields(concept_at_index(ConceptAtState { concepts: concepts, idx: ecidx })), src: s.source, prog: prog, concepts: concepts, sizes: sizes, cidx: ecidx, ress: ress, conns: conns, rxs: rxs, svcs: svcs }) else x86_argv_marshal(ArgvTrampState { fields: cd_fields(concept_at_index(ConceptAtState { concepts: concepts, idx: ecidx })), src: s.source, prog: prog, concepts: concepts, sizes: sizes, cidx: ecidx, ress: ress, conns: conns, rxs: rxs, svcs: svcs })) else b""), x86_resource_marshal(RMarshalState { rem: ress, idx: 0, src: s.source, prog: prog, src_base: 4194304 + fsz0 }), x86_connection_marshal(CMarshalState { rem: conns, idx: 0, src: s.source, prog: prog, src_base: 4194304 + fsz0 }), (if has_service == 1 then x86_service_tramp(ServiceTrampState { svcs: svcs, prog: prog, src: s.source }) else (if has_reaction == 1 then x86_reaction_tramp(RxTrampState { rxs: rxs, src: s.source, anytx: anytx, concepts: concepts, ecidx: ecidx }) else (if entryresult == 1 then (if entryresok == 1 then concat(b"\xe8", le32(184 + (if anytx == 1 then 86 else 0)), b"\x48\x69\xc0", le32(8 * (max_payload_fields(concepts) + 1)), b"\x4c\x01\xf8\x48\x8b\x08\x48\x8b\x40\x08\x48\x81\xf9", le32(15360000), b"\x0f\x85", le32(75), b"\x89\xc2\x48\xc1\xe8\x20\x48\xbe", le64(4194304 + blob_end_off(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: sizes, ress: ress, conns: conns, rxs: rxs, svcs: svcs })), b"\x48\x01\xc6\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05\x6a\x0a\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x48\x89\xe6\x48\xc7\xc2\x01\x00\x00\x00\x0f\x05\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05", b"\x89\xc2\x48\xc1\xe8\x20\x48\xbe", le64(4194304 + blob_end_off(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: sizes, ress: ress, conns: conns, rxs: rxs, svcs: svcs })), b"\x48\x01\xc6\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x02\x00\x00\x00\x0f\x05\x6a\x0a\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x02\x00\x00\x00\x48\x89\xe6\x48\xc7\xc2\x01\x00\x00\x00\x0f\x05\x48\xc7\xc0\x3c\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05") else concat(b"\xe8", le32(205 + (if anytx == 1 then 86 else 0)), b"\x48\x69\xc0", le32(8 * (max_payload_fields(concepts) + 1)), b"\x4c\x01\xf8\x48\x8b\x08\x48\x8b\x40\x08\x48\x81\xf9", le32(15360000), b"\x0f\x85", le32(96), b"\x48\x83\xec\x20\x49\x89\xc1\x48\x8d\x74\x24\x1f\xc6\x06\x0a\x48\x85\xc0\x79\x03\x48\xf7\xd8\x48\xc7\xc1\x0a\x00\x00\x00\x48\x31\xd2\x48\xf7\xf1\x80\xc2\x30\x48\xff\xce\x88\x16\x48\x85\xc0\x75\xed\x4d\x85\xc9\x79\x06\x48\xff\xce\xc6\x06\x2d\x48\x8d\x54\x24\x20\x48\x29\xf2\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05", b"\x89\xc2\x48\xc1\xe8\x20\x48\xbe", le64(4194304 + blob_end_off(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: sizes, ress: ress, conns: conns, rxs: rxs, svcs: svcs })), b"\x48\x01\xc6\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x02\x00\x00\x00\x0f\x05\x6a\x0a\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x02\x00\x00\x00\x48\x89\xe6\x48\xc7\xc2\x01\x00\x00\x00\x0f\x05\x48\xc7\xc0\x3c\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05")) else if entrybytes == 1 then concat(b"\xe8", le32(12 + (if anytx == 1 then 86 else 0)), b"\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05") else if entrycoll == 1 then concat(b"\xe8", le32(12 + (if anytx == 1 then 86 else 0)), b"\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05") else if entrytx == 1 then b"\xe8\x7e\x00\x00\x00\x6a\x0a\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x48\x89\xe6\x48\xc7\xc2\x01\x00\x00\x00\x0f\x05\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05" else concat(b"\xe8", le32(96 + (if anytx == 1 then 86 else 0)), b"\x48\x83\xec\x20\x49\x89\xc1\x48\x8d\x74\x24\x1f\xc6\x06\x0a\x48\x85\xc0\x79\x03\x48\xf7\xd8\x48\xc7\xc1\x0a\x00\x00\x00\x48\x31\xd2\x48\xf7\xf1\x80\xc2\x30\x48\xff\xce\x88\x16\x48\x85\xc0\x75\xed\x4d\x85\xc9\x79\x06\x48\xff\xce\xc6\x06\x2d\x48\x8d\x54\x24\x20\x48\x29\xf2\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05")))), (if anytx == 1 then b"\x48\x83\xec\x28\x49\x89\xc1\x48\x8d\x74\x24\x20\x48\x85\xc0\x79\x03\x48\xf7\xd8\x48\xc7\xc1\x0a\x00\x00\x00\x48\x31\xd2\x48\xf7\xf1\x80\xc2\x30\x48\xff\xce\x88\x16\x48\x85\xc0\x75\xed\x4d\x85\xc9\x79\x06\x48\xff\xce\xc6\x06\x2d\x48\x8d\x54\x24\x20\x48\x29\xf2\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05\x48\x83\xc4\x28\xc3" else b""), x86_program(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: sizes, ress: ress, conns: conns, rxs: rxs, svcs: svcs }), (if uses_text == 1 then src_blob(SrcBlobState { src: s.source, pos: 0 }) else b""))
+    out = concat(abort_if(verrs), b"\x7f\x45\x4c\x46\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\x3e\x00\x01\x00\x00\x00\x78\x00\x40\x00\x00\x00\x00\x00\x40\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x40\x00\x38\x00\x01\x00\x00\x00\x00\x00\x00\x00", b"\x01\x00\x00\x00\x05\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x40\x00\x00\x00\x00\x00\x00\x00\x40\x00\x00\x00\x00\x00", le64(fsz), le64(fsz), b"\x00\x10\x00\x00\x00\x00\x00\x00", (if uses_var == 1 then b"\xb8\x09\x00\x00\x00\x31\xff\x48\xbe\x00\x00\x00\x00\x06\x00\x00\x00\xba\x03\x00\x00\x00\x41\xba\x22\x40\x00\x00\x49\xc7\xc0\xff\xff\xff\xff\x45\x31\xc9\x0f\x05\x48\x3d\x01\xf0\xff\xff\x72\x0c\xbf\x01\x00\x00\x00\xb8\x3c\x00\x00\x00\x0f\x05\x49\x89\xc7\x45\x31\xf6" else b""), (if has_input == 1 then (if entry_uses_stdin(ChannelState { fields: cd_fields(concept_at_index(ConceptAtState { concepts: concepts, idx: ecidx })), src: s.source }) == 1 then x86_stdin_marshal(ArgvTrampState { fields: cd_fields(concept_at_index(ConceptAtState { concepts: concepts, idx: ecidx })), src: s.source, prog: prog, concepts: concepts, sizes: sizes, cidx: ecidx, ress: ress, conns: conns, rxs: rxs, svcs: svcs }) else x86_argv_marshal(ArgvTrampState { fields: cd_fields(concept_at_index(ConceptAtState { concepts: concepts, idx: ecidx })), src: s.source, prog: prog, concepts: concepts, sizes: sizes, cidx: ecidx, ress: ress, conns: conns, rxs: rxs, svcs: svcs })) else b""), x86_resource_marshal(RMarshalState { rem: ress, idx: 0, src: s.source, prog: prog, src_base: 4194304 + fsz0 }), x86_connection_marshal(CMarshalState { rem: conns, idx: 0, src: s.source, prog: prog, src_base: 4194304 + fsz0 }), (if has_service == 1 then x86_service_tramp(ServiceTrampState { svcs: svcs, prog: prog, src: s.source }) else (if has_reaction == 1 then x86_reaction_tramp(RxTrampState { rxs: rxs, src: s.source, anytx: anytx, concepts: concepts, ecidx: ecidx }) else (if entryresult == 1 then (if entryresok == 1 then concat(b"\xe8", le32(184 + (if anytx == 1 then 86 else 0)), b"\x48\x69\xc0", le32(8 * (max_payload_fields(concepts) + 1)), b"\x4c\x01\xf8\x48\x8b\x08\x48\x8b\x40\x08\x48\x81\xf9", le32(15360000), b"\x0f\x85", le32(75), b"\x89\xc2\x48\xc1\xe8\x20\x48\xbe", le64(4194304 + blob_end_off(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: sizes, ress: ress, conns: conns, rxs: rxs, svcs: svcs })), b"\x48\x01\xc6\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05\x6a\x0a\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x48\x89\xe6\x48\xc7\xc2\x01\x00\x00\x00\x0f\x05\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05", b"\x89\xc2\x48\xc1\xe8\x20\x48\xbe", le64(4194304 + blob_end_off(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: sizes, ress: ress, conns: conns, rxs: rxs, svcs: svcs })), b"\x48\x01\xc6\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x02\x00\x00\x00\x0f\x05\x6a\x0a\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x02\x00\x00\x00\x48\x89\xe6\x48\xc7\xc2\x01\x00\x00\x00\x0f\x05\x48\xc7\xc0\x3c\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05") else concat(b"\xe8", le32(205 + (if anytx == 1 then 86 else 0)), b"\x48\x69\xc0", le32(8 * (max_payload_fields(concepts) + 1)), b"\x4c\x01\xf8\x48\x8b\x08\x48\x8b\x40\x08\x48\x81\xf9", le32(15360000), b"\x0f\x85", le32(96), b"\x48\x83\xec\x20\x49\x89\xc1\x48\x8d\x74\x24\x1f\xc6\x06\x0a\x48\x85\xc0\x79\x03\x48\xf7\xd8\x48\xc7\xc1\x0a\x00\x00\x00\x48\x31\xd2\x48\xf7\xf1\x80\xc2\x30\x48\xff\xce\x88\x16\x48\x85\xc0\x75\xed\x4d\x85\xc9\x79\x06\x48\xff\xce\xc6\x06\x2d\x48\x8d\x54\x24\x20\x48\x29\xf2\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05", b"\x89\xc2\x48\xc1\xe8\x20\x48\xbe", le64(4194304 + blob_end_off(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: sizes, ress: ress, conns: conns, rxs: rxs, svcs: svcs })), b"\x48\x01\xc6\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x02\x00\x00\x00\x0f\x05\x6a\x0a\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x02\x00\x00\x00\x48\x89\xe6\x48\xc7\xc2\x01\x00\x00\x00\x0f\x05\x48\xc7\xc0\x3c\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05")) else if entrybytes == 1 then concat(b"\xe8", le32(12 + (if anytx == 1 then 86 else 0)), b"\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05") else if entrycoll == 1 then concat(b"\xe8", le32(12 + (if anytx == 1 then 86 else 0)), b"\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05") else if entrytx == 1 then b"\xe8\x7e\x00\x00\x00\x6a\x0a\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x48\x89\xe6\x48\xc7\xc2\x01\x00\x00\x00\x0f\x05\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05" else if entryrec == 1 then concat(b"\xe8", le32(62 + entryrjfs + (if anytx == 1 then 86 else 0)), b"\x50", x86_json_record(JsonRecState { fields: entryrfields, esize: 8 * (max_payload_fields(concepts) + 1), off: 0 - (61 + entryrjfs + (if anytx == 1 then 86 else 0)), src: s.source, prog: prog, concepts: concepts, sizes: sizes, ress: ress, conns: conns }), b"\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05") else concat(b"\xe8", le32(96 + (if anytx == 1 then 86 else 0)), b"\x48\x83\xec\x20\x49\x89\xc1\x48\x8d\x74\x24\x1f\xc6\x06\x0a\x48\x85\xc0\x79\x03\x48\xf7\xd8\x48\xc7\xc1\x0a\x00\x00\x00\x48\x31\xd2\x48\xf7\xf1\x80\xc2\x30\x48\xff\xce\x88\x16\x48\x85\xc0\x75\xed\x4d\x85\xc9\x79\x06\x48\xff\xce\xc6\x06\x2d\x48\x8d\x54\x24\x20\x48\x29\xf2\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05\x48\xc7\xc0\x3c\x00\x00\x00\x48\x31\xff\x0f\x05")))), (if anytx == 1 then b"\x48\x83\xec\x28\x49\x89\xc1\x48\x8d\x74\x24\x20\x48\x85\xc0\x79\x03\x48\xf7\xd8\x48\xc7\xc1\x0a\x00\x00\x00\x48\x31\xd2\x48\xf7\xf1\x80\xc2\x30\x48\xff\xce\x88\x16\x48\x85\xc0\x75\xed\x4d\x85\xc9\x79\x06\x48\xff\xce\xc6\x06\x2d\x48\x8d\x54\x24\x20\x48\x29\xf2\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05\x48\x83\xc4\x28\xc3" else b""), x86_program(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: sizes, ress: ress, conns: conns, rxs: rxs, svcs: svcs }), (if uses_text == 1 then src_blob(SrcBlobState { src: s.source, pos: 0 }) else b""))
   proofs:
     purity:
       reads : [s.source]
-      calls : [begin_tokenize, parse_program, toplevel_junk, rule_list_len, parse_concepts, parse_resources, parse_reactions, parse_connections, parse_services, resource_errors, reaction_errors, reaction_list_len, x86_reaction_tramp, resource_marshal_size, x86_resource_marshal, program_uses_result, concepts_append_result, concepts_append_http, service_list_len, svc_head, svc_handler_start, svc_handler_len, find_rule, rd_input, rd_out_ty_start, rd_out_ty_len, service_errors, x86_service_tramp, diag_count, prog_diags, purity_list, term_list, proc_sizes, program_uses_arena, prog_any_texty, entry_rule_texty, entry_rule_bytes, entry_rule_result, entry_result_ok_texty, entry_rule_collection, max_payload_fields, program_uses_text, blob_end_off, x86_program, src_blob, param_list_len, rl_head_params, fields_to_params, rl_head_input, params_to_fields, find_concept_index, fl_head_ty_start, fl_head_ty_len, x86_argv_marshal, x86_stdin_marshal, entry_uses_stdin, cd_fields, concept_at_index, connection_errors, connection_marshal_size, x86_connection_marshal, prim_named_rules, entry_freshtext]
+      calls : [begin_tokenize, parse_program, toplevel_junk, rule_list_len, parse_concepts, parse_resources, parse_reactions, parse_connections, parse_services, resource_errors, reaction_errors, reaction_list_len, x86_reaction_tramp, resource_marshal_size, x86_resource_marshal, program_uses_result, concepts_append_result, concepts_append_http, service_list_len, svc_head, svc_handler_start, svc_handler_len, find_rule, rd_input, rd_out_ty_start, rd_out_ty_len, service_errors, x86_service_tramp, diag_count, prog_diags, purity_list, term_list, proc_sizes, program_uses_arena, prog_needs_itoa, entry_rule_texty, entry_rule_bytes, entry_rule_result, entry_result_ok_texty, entry_rule_collection, entry_rule_record, entry_badrecord, entry_out_concept, json_fields_size, x86_json_record, max_payload_fields, program_uses_text, blob_end_off, x86_program, src_blob, param_list_len, rl_head_params, fields_to_params, rl_head_input, params_to_fields, find_concept_index, fl_head_ty_start, fl_head_ty_len, x86_argv_marshal, x86_stdin_marshal, entry_uses_stdin, cd_fields, concept_at_index, connection_errors, connection_marshal_size, x86_connection_marshal, prim_named_rules, entry_freshtext]
     termination:
       bound : 256
 
