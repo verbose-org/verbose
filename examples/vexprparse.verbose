@@ -28135,7 +28135,7 @@ rule blob_end_off
     -- fields (stdin's read loop costs 55, and each text field costs 52 on argv
     -- against 13 on stdin), so splitting the decision drifts p_filesz by that
     -- much and points src_base into the middle of the source blob.
-    let msize = if has_input == 1 then (if entry_uses_stdin(ChannelState { fields: ecfields, src: pg.src }) == 1 then stdin_marshal_size(ecfields) else argv_marshal_size(ecfields)) else 0
+    let msize = if has_input == 1 then (if entry_uses_stdin(ChannelState { fields: ecfields, src: pg.src }) == 1 then stdin_marshal_size(ChannelState { fields: ecfields, src: pg.src }) else argv_marshal_size(ChannelState { fields: ecfields, src: pg.src })) else 0
     -- COLLECTIONS tier slice 4b: the collection branch (17 — the bytes-entry
     -- trampoline shape) MUST precede entry_rule_texty here EXACTLY as the
     -- emit-side dispatch in elf_program_src orders it (a map/filter body IS
@@ -28241,13 +28241,14 @@ rule src_blob
 -- ============================================================================
 
 concept ArgvMarshalState
-  @intention: "A concept field list to marshal from argv + the current arg index + the fixed-region offsets"
+  @intention: "A concept field list to marshal from argv + the current arg index + the fixed-region offsets + the source its field spans index into"
   @source: vexprparse.intent:66
   fields:
     fields : FieldList
     idx : number
     region_off : number
     region_base : number
+    src : text [..4194304]
 
 
 concept FieldPopState
@@ -28283,23 +28284,22 @@ concept ArgvTrampState
 -- used by both the emit (via argv_marshal_size in blob_end_off) and the byte pass,
 -- so the trampoline size can never drift from the source-blob base.
 rule marshal_fields_size
-  @intention: "Byte length of the per-field argv marshalling (text field 52 B, number field 65 B)"
+  @intention: "Byte length of the per-field argv marshalling (text field 52 B, number field 65 B) plus any declared-bound check"
   @source: vexprparse.intent:66
   input:
-    fl : FieldList
+    cs : ChannelState
   output:
     out : number
   logic:
-    out = match fl:
-      FCons(name_start, name_len, ty, ty_start, ty_len, rest) => (if ty == 2 then 52 else if ty == 3 then 9 else 65) + marshal_fields_size(rest)
+    out = match cs.fields:
+      FCons(name_start, name_len, ty, ty_start, ty_len, rest) => (if ty == 2 then (52 + text_bound_check_size(FieldBoundState { ty: ty, src: cs.src, pos: ty_start + ty_len })) else if ty == 3 then 9 else (65 + num_bound_check_size(FieldBoundState { ty: ty, src: cs.src, pos: ty_start + ty_len }))) + marshal_fields_size(ChannelState { fields: rest, src: cs.src })
       FNil => 0
   proofs:
     purity:
-      reads : [fl]
-      calls : [marshal_fields_size]
+      reads : [cs.fields, cs.src]
+      calls : [marshal_fields_size, text_bound_check_size, num_bound_check_size]
     termination:
       bound : 512
-      structural : fl
 
 
 -- argv_marshal_size: the TOTAL trampoline-marshalling byte length = prologue 88
@@ -28312,14 +28312,14 @@ rule argv_marshal_size
   @intention: "Total byte length of the argv trampoline marshalling: prologue 88 + per-field + arena suffix 25 + 8*nfields"
   @source: vexprparse.intent:66
   input:
-    fl : FieldList
+    cs : ChannelState
   output:
     out : number
   logic:
-    out = 88 + marshal_fields_size(fl) + 25 + 8 * field_list_len(fl)
+    out = 88 + marshal_fields_size(cs) + 25 + 8 * field_list_len(cs.fields)
   proofs:
     purity:
-      reads : [fl]
+      reads : [cs.fields, cs]
       calls : [marshal_fields_size, field_list_len]
     termination:
       bound : 64
@@ -30567,12 +30567,12 @@ rule x86_marshal_fields
     out : bytes
   logic:
     out = match ms.fields:
-      FCons(name_start, name_len, ty, ty_start, ty_len, rest) => concat((if ty == 2 then concat(b"\x49\x8b\xb4\x24", le32(8 * (ms.idx + 2)), b"\x31\xc9\x80\x3c\x0e\x00\x74\x05\x48\xff\xc1\xeb\xf5\x49\x8d\xbd", le32(ms.region_base), b"\x51\xf3\xa4\x59\x4c\x89\xe8\x48\x05", le32(ms.region_off), b"\x48\xc1\xe0\x20\x48\x09\xc8\x50\x49\x01\xcd") else if ty == 3 then concat(b"\x49\x8d\x84\x24", le32(8 * (ms.idx + 2)), b"\x50") else concat(b"\x49\x8b\xb4\x24", le32(8 * (ms.idx + 2)), b"\x48\x31\xc0\x45\x31\xdb\x8a\x0e\x80\xf9\x2d\x75\x06\x41\xb3\x01\x48\xff\xc6\x0f\xb6\x0e\x80\xf9\x30\x72\x15\x80\xf9\x39\x77\x10\x48\x6b\xc0\x0a\x48\x83\xe9\x30\x48\x01\xc8\x48\xff\xc6\xeb\xe3\x4d\x85\xdb\x74\x03\x48\xf7\xd8\x50")), x86_marshal_fields(ArgvMarshalState { fields: rest, idx: ms.idx + 1, region_off: ms.region_off, region_base: ms.region_base }))
+      FCons(name_start, name_len, ty, ty_start, ty_len, rest) => concat((if ty == 2 then concat(b"\x49\x8b\xb4\x24", le32(8 * (ms.idx + 2)), b"\x31\xc9\x80\x3c\x0e\x00\x74\x05\x48\xff\xc1\xeb\xf5", x86_text_bound_argv(FieldBoundState { ty: ty, src: ms.src, pos: ty_start + ty_len }), b"\x49\x8d\xbd", le32(ms.region_base), b"\x51\xf3\xa4\x59\x4c\x89\xe8\x48\x05", le32(ms.region_off), b"\x48\xc1\xe0\x20\x48\x09\xc8\x50\x49\x01\xcd") else if ty == 3 then concat(b"\x49\x8d\x84\x24", le32(8 * (ms.idx + 2)), b"\x50") else concat(b"\x49\x8b\xb4\x24", le32(8 * (ms.idx + 2)), b"\x48\x31\xc0\x45\x31\xdb\x8a\x0e\x80\xf9\x2d\x75\x06\x41\xb3\x01\x48\xff\xc6\x0f\xb6\x0e\x80\xf9\x30\x72\x15\x80\xf9\x39\x77\x10\x48\x6b\xc0\x0a\x48\x83\xe9\x30\x48\x01\xc8\x48\xff\xc6\xeb\xe3\x4d\x85\xdb\x74\x03\x48\xf7\xd8", x86_num_bound_check(FieldBoundState { ty: ty, src: ms.src, pos: ty_start + ty_len }), b"\x50")), x86_marshal_fields(ArgvMarshalState { fields: rest, idx: ms.idx + 1, region_off: ms.region_off, region_base: ms.region_base, src: ms.src }))
       FNil => b""
   proofs:
     purity:
-      reads : [ms.fields, ms.idx, ms.region_off, ms.region_base]
-      calls : [x86_marshal_fields]
+      reads : [ms.fields, ms.idx, ms.region_off, ms.region_base, ms.src]
+      calls : [x86_marshal_fields, x86_text_bound_argv, x86_num_bound_check]
     termination:
       bound : 512
 
@@ -30632,7 +30632,7 @@ rule x86_argv_marshal
     let rms = resource_marshal_size(RMarshSizeState { rem: at.ress, src: at.src, prog: at.prog })
     let cms = connection_marshal_size(CMarshSizeState { rem: at.conns, src: at.src, prog: at.prog })
     let region_len = if cms > 0 then 5242880 + 65536 * connection_list_len(at.conns) else (if rms > 0 then 4194304 + 65536 * resource_list_len(at.ress) else 1048576)
-    out = concat(b"\x49\x89\xe4\x49\x8b\x04\x24\x48\x3d", le32(1 + nfields), b"\x7d\x0c\xbf\x01\x00\x00\x00\xb8\x3c\x00\x00\x00\x0f\x05\xb8\x09\x00\x00\x00\xbf\x00\x00\x00\x20\xbe", le32(region_len), b"\xba\x03\x00\x00\x00\x41\xba\x32\x00\x00\x00\x49\xc7\xc0\xff\xff\xff\xff\x45\x31\xc9\x0f\x05\x48\x3d\x01\xf0\xff\xff\x72\x0c\xbf\x01\x00\x00\x00\xb8\x3c\x00\x00\x00\x0f\x05\x45\x31\xed", x86_marshal_fields(ArgvMarshalState { fields: at.fields, idx: 0, region_off: region_off, region_base: region_base }), b"\x4c\x89\xf0\x48\x69\xc0", le32(entry_size), b"\x4c\x01\xf8\x48\xc7\x00", le32(tag), x86_field_pops(FieldPopState { fields: at.fields, slot: nfields - 1 }), b"\x41\x56\x49\xff\xc6")
+    out = concat(b"\x49\x89\xe4\x49\x8b\x04\x24\x48\x3d", le32(1 + nfields), b"\x7d\x0c\xbf\x01\x00\x00\x00\xb8\x3c\x00\x00\x00\x0f\x05\xb8\x09\x00\x00\x00\xbf\x00\x00\x00\x20\xbe", le32(region_len), b"\xba\x03\x00\x00\x00\x41\xba\x32\x00\x00\x00\x49\xc7\xc0\xff\xff\xff\xff\x45\x31\xc9\x0f\x05\x48\x3d\x01\xf0\xff\xff\x72\x0c\xbf\x01\x00\x00\x00\xb8\x3c\x00\x00\x00\x0f\x05\x45\x31\xed", x86_marshal_fields(ArgvMarshalState { fields: at.fields, idx: 0, region_off: region_off, region_base: region_base, src: at.src }), b"\x4c\x89\xf0\x48\x69\xc0", le32(entry_size), b"\x4c\x01\xf8\x48\xc7\x00", le32(tag), x86_field_pops(FieldPopState { fields: at.fields, slot: nfields - 1 }), b"\x41\x56\x49\xff\xc6")
   proofs:
     purity:
       reads : [at.fields, at.src, at.prog, at.concepts, at.sizes, at.cidx, at.ress, at.conns, at.rxs]
@@ -30724,8 +30724,322 @@ rule field_text_bound
       bound : 256
 
 
+-- ============================================================================
+-- DECLARED INPUT BOUNDS — the numeric sibling of field_text_bound.
+--
+-- verbosec's emitted binaries enforce a field's declared range at FIELD-LOAD:
+-- a Number outside `[min, max]` (emit_bounds_check) and a Text longer than
+-- `[..N]` (emit_text_bound_check) both sys_exit(1) BEFORE the rule body runs.
+-- gen0 emitted neither, so the same source compiled by the two compilers gave
+-- two different answers on out-of-range input — measured on
+-- `examples/aes_sbox.verbose` (`b : number [0, 255]`): inputs 256 / 300 / -5
+-- returned 22 at rc 0 under gen0 where verbosec's binary exits 1. A silent
+-- wrong answer, the same class of defect as the byte_at / substring gap.
+--
+-- The obstacle is that gen0 does not RETAIN the range: skip_field_range
+-- consumes it as tokens and FCons carries no min/max slots. Threading it
+-- through would touch every FCons construction site and both grammars. These
+-- rules take the road field_text_bound already established for the channel
+-- decision instead — read the range back out of the RAW SOURCE at the offset
+-- the parser already recorded (`ty_start + ty_len`, which every FCons carries
+-- for every field, not just text ones). No FieldList arity change, and the
+-- size walk and the emit walk read the same bytes, so they cannot drift.
+--
+-- The two shapes are distinguished at the first byte INSIDE the bracket: `.`
+-- is the text form `[..N]` (field_text_bound's business), a digit or `-` is
+-- the numeric form `[min, max]`. That discriminator is load-bearing: gen0's
+-- type_code_of_span maps `bytes` to 0, the SAME code as `number`, so without
+-- it a `bytes [..N]` field would be read as a numeric range and checked
+-- against a bound that is not the one declared. Anything else is "no range",
+-- and an unrecognised shape emits NO check rather than a wrong one.
+-- ============================================================================
+
+-- signed_end: offset just past the signed decimal integer at pos (an optional
+-- leading `-` then a digit run). Guarded on EOF; a non-numeric position
+-- returns pos unchanged, so a caller lands where it started rather than
+-- running off the end.
+rule signed_end
+  @intention: "Offset just past the optionally-negative decimal integer at pos"
+  @source: vexprparse.intent:66
+  input:
+    s : ScanState
+  output:
+    out : number
+  logic:
+    let len = length(s.source)
+    out = if s.pos >= len then s.pos else if byte_at(s.source, s.pos) == 45 then s.pos + 1 + digit_run(ScanState { source: s.source, pos: s.pos + 1 }) else s.pos + digit_run(s)
+  proofs:
+    purity:
+      reads : [s.source, s.pos, s]
+      calls : [digit_run]
+    termination:
+      bound : 256
+
+
+-- signed_at: value of the signed decimal integer at pos. num_value handles the
+-- digit run; this adds the `-` a `[min, max]` lower bound may carry (verbosec's
+-- parser accepts `[-50, 50]`, and parser.rs::field_ranges_parsed pins it).
+rule signed_at
+  @intention: "Value of the optionally-negative decimal integer at pos"
+  @source: vexprparse.intent:66
+  input:
+    s : ScanState
+  output:
+    out : number
+  logic:
+    let len = length(s.source)
+    out = if s.pos >= len then 0 else if byte_at(s.source, s.pos) == 45 then 0 - num_value(ScanState { source: s.source, pos: s.pos + 1 }) else num_value(s)
+  proofs:
+    purity:
+      reads : [s.source, s.pos, s]
+      calls : [num_value]
+    termination:
+      bound : 256
+
+
+-- field_range_open: offset of the first non-space byte INSIDE the `[` that
+-- opens a field range at pos, 0 when no `[` is there. 0 is a safe "none"
+-- marker because a field's range can never sit at byte 0 of a source (the
+-- `@verbose` banner precedes every declaration).
+rule field_range_open
+  @intention: "Offset of the first byte inside a field's bracketed range, 0 when the field carries none"
+  @source: vexprparse.intent:66
+  input:
+    s : ScanState
+  output:
+    out : number
+  logic:
+    let p = skip_spaces(s)
+    let len = length(s.source)
+    out = if p + 1 >= len then 0 else if byte_at(s.source, p) == 91 then skip_spaces(ScanState { source: s.source, pos: p + 1 }) else 0
+  proofs:
+    purity:
+      reads : [s.source, s]
+      calls : [skip_spaces]
+    termination:
+      bound : 256
+
+
+-- field_has_num_range: 1 iff the field at pos declares the two-sided numeric
+-- form `[min, max]`. See the banner above for why the first byte inside the
+-- bracket is the discriminator and why that matters for `bytes [..N]`.
+rule field_has_num_range
+  @intention: "1 iff the field at pos declares a two-sided numeric range [min, max]"
+  @source: vexprparse.intent:66
+  input:
+    s : ScanState
+  output:
+    out : number
+  logic:
+    let q = field_range_open(s)
+    let len = length(s.source)
+    out = if q == 0 then 0 else if q >= len then 0 else if byte_at(s.source, q) == 45 then 1 else if byte_at(s.source, q) >= 48 and byte_at(s.source, q) <= 57 then 1 else 0
+  proofs:
+    purity:
+      reads : [s.source, s]
+      calls : [field_range_open]
+    termination:
+      bound : 256
+
+
+-- field_num_min: the lower bound of `[min, max]`, 0 when the field declares no
+-- numeric range. Callers gate on field_has_num_range first, so that 0 is never
+-- emitted as a real bound.
+rule field_num_min
+  @intention: "Lower bound of a field's [min, max] declaration, 0 when it declares none"
+  @source: vexprparse.intent:66
+  input:
+    s : ScanState
+  output:
+    out : number
+  logic:
+    let q = field_range_open(s)
+    out = if field_has_num_range(s) == 0 then 0 else signed_at(ScanState { source: s.source, pos: q })
+  proofs:
+    purity:
+      reads : [s.source, s]
+      calls : [field_range_open, field_has_num_range, signed_at]
+    termination:
+      bound : 256
+
+
+-- field_num_max: the upper bound of `[min, max]`, 0 when the field declares no
+-- numeric range. Scans past the lower bound (signed_end) and the separating
+-- comma; a missing comma reads as "no bound", which pairs with
+-- field_has_num_range's fail-closed posture of emitting no check at all.
+rule field_num_max
+  @intention: "Upper bound of a field's [min, max] declaration, 0 when it declares none"
+  @source: vexprparse.intent:66
+  input:
+    s : ScanState
+  output:
+    out : number
+  logic:
+    let q = field_range_open(s)
+    let c = skip_spaces(ScanState { source: s.source, pos: signed_end(ScanState { source: s.source, pos: q }) })
+    let len = length(s.source)
+    out = if field_has_num_range(s) == 0 then 0 else if c + 1 >= len then 0 else if byte_at(s.source, c) == 44 then signed_at(ScanState { source: s.source, pos: skip_spaces(ScanState { source: s.source, pos: c + 1 }) }) else 0
+  proofs:
+    purity:
+      reads : [s.source, s]
+      calls : [field_range_open, field_has_num_range, signed_end, signed_at, skip_spaces]
+    termination:
+      bound : 256
+
+
+-- One input field's type code plus the source and offset at which its optional
+-- declared range begins (`ty_start + ty_len`, which every FCons carries).
+concept FieldBoundState
+  @intention: "An input field's type code + the source and offset where its optional declared range starts"
+  @source: vexprparse.intent:66
+  fields:
+    ty : number
+    src : text [..4194304]
+    pos : number
+
+
+-- num_bound_check_size / text_bound_check_size: 54 and 27, or 0 when the field
+-- declares no enforceable bound. These are the SINGLE place that decides "this
+-- field gets a runtime check", and the emit rules below gate on them rather
+-- than re-deriving the predicate — so the size walk and the emit walk cannot
+-- disagree about whether a check is present. A disagreement there shifts every
+-- downstream offset (the `call entry` rel32, src_base, and so every byte_at in
+-- the emitted binary), which is exactly the failure mode entry_uses_stdin's
+-- comment warns about for the channel choice.
+--
+-- The `ty` gate mirrors verbosec: emit_bounds_check fires for Type::Number
+-- only and emit_text_bound_check for Type::Text only, so a `bool` field —
+-- which gen0 codes as ty 1 and marshals through the same atoi path as a number
+-- — is deliberately NOT checked, matching verbosec's silence on it.
+rule num_bound_check_size
+  @intention: "Byte length of a number field's runtime range check (54), 0 when it declares none"
+  @source: vexprparse.intent:66
+  input:
+    fb : FieldBoundState
+  output:
+    out : number
+  logic:
+    out = if fb.ty == 0 and field_has_num_range(ScanState { source: fb.src, pos: fb.pos }) == 1 then 54 else 0
+  proofs:
+    purity:
+      reads : [fb.ty, fb.src, fb.pos]
+      calls : [field_has_num_range]
+    termination:
+      bound : 256
+
+
+rule text_bound_check_size
+  @intention: "Byte length of a text field's runtime length check (27), 0 when it declares none"
+  @source: vexprparse.intent:66
+  input:
+    fb : FieldBoundState
+  output:
+    out : number
+  logic:
+    out = if fb.ty == 2 and field_text_bound(ScanState { source: fb.src, pos: fb.pos }) > 0 then 27 else 0
+  proofs:
+    purity:
+      reads : [fb.ty, fb.src, fb.pos]
+      calls : [field_text_bound]
+    termination:
+      bound : 256
+
+
+-- x86_num_bound_check: the 54-byte fail-closed range check for a number field,
+-- emitted with the marshalled value already in rax and BEFORE the push that
+-- hands it to the arena node. Two compares against r10 (free here — the
+-- trampoline's live registers are r12 argv-base, r13 bump, r14 node counter,
+-- r15 arena base, and the mmap that used r10 for its flags is long past):
+--
+--   mov r10, min ; cmp rax, r10 ; jge +12 ; <exit(1)>
+--   mov r10, max ; cmp rax, r10 ; jle +12 ; <exit(1)>
+--
+-- The exit(1) is gen0's 12-byte house tail (mov edi,1 ; mov eax,60 ; syscall),
+-- inlined at the site rather than routed to a shared end-of-binary label the
+-- way verbosec's emit_bounds_check does. Same observable behaviour — the
+-- binaries are not byte-compared to verbosec's, only gen1 to gen0 — and it
+-- keeps the trampoline free of a patch list.
+rule x86_num_bound_check
+  @intention: "Emit the fail-closed [min, max] check for a marshalled number field (value in rax)"
+  @source: vexprparse.intent:66
+  input:
+    fb : FieldBoundState
+  output:
+    out : bytes
+  logic:
+    out = if num_bound_check_size(fb) == 0 then b"" else concat(b"\x49\xba", le64(field_num_min(ScanState { source: fb.src, pos: fb.pos })), b"\x4c\x39\xd0\x7d\x0c\xbf\x01\x00\x00\x00\xb8\x3c\x00\x00\x00\x0f\x05\x49\xba", le64(field_num_max(ScanState { source: fb.src, pos: fb.pos })), b"\x4c\x39\xd0\x7e\x0c\xbf\x01\x00\x00\x00\xb8\x3c\x00\x00\x00\x0f\x05")
+  proofs:
+    purity:
+      reads : [fb.src, fb.pos, fb]
+      calls : [num_bound_check_size, field_num_min, field_num_max]
+    termination:
+      bound : 256
+
+
+-- x86_text_bound_argv: the 27-byte `[..N]` length check for a text field on the
+-- ARGV channel, emitted with the strlen result in rcx and BEFORE the rep movsb
+-- that copies the bytes into the fixed region — so an over-long argument aborts
+-- without ever being copied.
+--
+--   mov r10, max ; cmp rcx, r10 ; jbe +12 ; <exit(1)>
+--
+-- Unsigned compare because a byte count is never negative. `length == max` is
+-- legal (verbosec's max+1 scan budget accepts a NUL at index max), so the
+-- branch is jbe, not jb.
+--
+-- One divergence from verbosec worth naming: verbosec BOUNDS its scan at
+-- max + 1 bytes, on the principle that the declaration says it never has to
+-- read further. gen0's strlen is unbounded because the copy needs the true
+-- length anyway; the kernel's MAX_ARG_STRLEN caps it at 131072 either way.
+-- Same accept/reject verdict, different work on the rejecting path.
+rule x86_text_bound_argv
+  @intention: "Emit the fail-closed [..N] length check for an argv text field (length in rcx)"
+  @source: vexprparse.intent:66
+  input:
+    fb : FieldBoundState
+  output:
+    out : bytes
+  logic:
+    out = if text_bound_check_size(fb) == 0 then b"" else concat(b"\x49\xba", le64(field_text_bound(ScanState { source: fb.src, pos: fb.pos })), b"\x4c\x39\xd1\x76\x0c\xbf\x01\x00\x00\x00\xb8\x3c\x00\x00\x00\x0f\x05")
+  proofs:
+    purity:
+      reads : [fb.src, fb.pos, fb]
+      calls : [text_bound_check_size, field_text_bound]
+    termination:
+      bound : 256
+
+
+-- x86_text_bound_stdin: the same check on the STDIN channel, where the field's
+-- length is the read-to-EOF total in r13 rather than a strlen result — so the
+-- only difference from the argv form is the compared register (4d 39 d5 vs
+-- 4c 39 d1) and the check costs the same 27 bytes. Emitted before the packed
+-- (region_off, r13) span is pushed.
+--
+-- Note this is STRICTLY TIGHTER than the pre-existing region guard next to it:
+-- the read loop already fail-closes at r13 >= 4 MiB (region full), which only
+-- catches a field whose declared bound happens to be the region size. A field
+-- declared `[..200000]` was unchecked until this slice.
+rule x86_text_bound_stdin
+  @intention: "Emit the fail-closed [..N] length check for a stdin text field (length in r13)"
+  @source: vexprparse.intent:66
+  input:
+    fb : FieldBoundState
+  output:
+    out : bytes
+  logic:
+    out = if text_bound_check_size(fb) == 0 then b"" else concat(b"\x49\xba", le64(field_text_bound(ScanState { source: fb.src, pos: fb.pos })), b"\x4d\x39\xd5\x76\x0c\xbf\x01\x00\x00\x00\xb8\x3c\x00\x00\x00\x0f\x05")
+  proofs:
+    purity:
+      reads : [fb.src, fb.pos, fb]
+      calls : [text_bound_check_size, field_text_bound]
+    termination:
+      bound : 256
+
+
 -- The entry concept's field list plus the source those fields' spans index into
--- — everything entry_uses_stdin needs to decide the input channel.
+-- — everything entry_uses_stdin needs to decide the input channel, and (since
+-- the input-bounds slice) everything the marshal SIZE walks need to re-scan a
+-- field's declared range out of the raw source.
 concept ChannelState
   @intention: "The entry concept's field list + the source text its spans index into"
   @source: vexprparse.intent:66
@@ -30807,35 +31121,35 @@ rule number_fields_count
 
 
 concept StdinMarshalState
-  @intention: "The remaining concept fields to marshal + the argv index of the next number field + the fixed-region offset"
+  @intention: "The remaining concept fields to marshal + the argv index of the next number field + the fixed-region offset + the source its field spans index into"
   @source: vexprparse.intent:66
   fields:
     fields : FieldList
     num_idx : number
     region_off : number
+    src : text [..4194304]
 
 
 -- stdin_fields_size: byte length of the per-field stdin marshalling. A text
 -- field is 13 B (mov eax,region_off 5 + shl rax,32 4 + or rax,r13 3 + push 1);
 -- a number field is 65 B (mov rsi,[r12+disp] 8 + inline atoi 57), same as argv.
 rule stdin_fields_size
-  @intention: "Byte length of per-field stdin marshalling (text field 13 B, number field 65 B)"
+  @intention: "Byte length of per-field stdin marshalling (text field 13 B, number field 65 B) plus any declared-bound check"
   @source: vexprparse.intent:66
   input:
-    fl : FieldList
+    cs : ChannelState
   output:
     out : number
   logic:
-    out = match fl:
-      FCons(name_start, name_len, ty, ty_start, ty_len, rest) => (if ty == 2 then 13 else 65) + stdin_fields_size(rest)
+    out = match cs.fields:
+      FCons(name_start, name_len, ty, ty_start, ty_len, rest) => (if ty == 2 then (13 + text_bound_check_size(FieldBoundState { ty: ty, src: cs.src, pos: ty_start + ty_len })) else (65 + num_bound_check_size(FieldBoundState { ty: ty, src: cs.src, pos: ty_start + ty_len }))) + stdin_fields_size(ChannelState { fields: rest, src: cs.src })
       FNil => 0
   proofs:
     purity:
-      reads : [fl]
-      calls : [stdin_fields_size]
+      reads : [cs.fields, cs.src]
+      calls : [stdin_fields_size, text_bound_check_size, num_bound_check_size]
     termination:
       bound : 512
-      structural : fl
 
 
 -- stdin_marshal_size: total byte length of the stdin trampoline = prologue 88
@@ -30847,14 +31161,14 @@ rule stdin_marshal_size
   @intention: "Total byte length of the stdin trampoline: prologue 88 + read loop 55 + per-field + arena suffix 25 + 8*nfields"
   @source: vexprparse.intent:66
   input:
-    fl : FieldList
+    cs : ChannelState
   output:
     out : number
   logic:
-    out = 88 + 55 + stdin_fields_size(fl) + 25 + 8 * field_list_len(fl)
+    out = 88 + 55 + stdin_fields_size(cs) + 25 + 8 * field_list_len(cs.fields)
   proofs:
     purity:
-      reads : [fl]
+      reads : [cs.fields, cs]
       calls : [stdin_fields_size, field_list_len]
     termination:
       bound : 64
@@ -30875,12 +31189,12 @@ rule x86_stdin_fields
     out : bytes
   logic:
     out = match ms.fields:
-      FCons(name_start, name_len, ty, ty_start, ty_len, rest) => (if ty == 2 then concat(concat(b"\xb8", le32(ms.region_off), b"\x48\xc1\xe0\x20\x4c\x09\xe8\x50"), x86_stdin_fields(StdinMarshalState { fields: rest, num_idx: ms.num_idx, region_off: ms.region_off })) else concat(concat(b"\x49\x8b\xb4\x24", le32(8 * (ms.num_idx + 2)), b"\x48\x31\xc0\x45\x31\xdb\x8a\x0e\x80\xf9\x2d\x75\x06\x41\xb3\x01\x48\xff\xc6\x0f\xb6\x0e\x80\xf9\x30\x72\x15\x80\xf9\x39\x77\x10\x48\x6b\xc0\x0a\x48\x83\xe9\x30\x48\x01\xc8\x48\xff\xc6\xeb\xe3\x4d\x85\xdb\x74\x03\x48\xf7\xd8\x50"), x86_stdin_fields(StdinMarshalState { fields: rest, num_idx: ms.num_idx + 1, region_off: ms.region_off })))
+      FCons(name_start, name_len, ty, ty_start, ty_len, rest) => (if ty == 2 then concat(concat(x86_text_bound_stdin(FieldBoundState { ty: ty, src: ms.src, pos: ty_start + ty_len }), b"\xb8", le32(ms.region_off), b"\x48\xc1\xe0\x20\x4c\x09\xe8\x50"), x86_stdin_fields(StdinMarshalState { fields: rest, num_idx: ms.num_idx, region_off: ms.region_off, src: ms.src })) else concat(concat(b"\x49\x8b\xb4\x24", le32(8 * (ms.num_idx + 2)), b"\x48\x31\xc0\x45\x31\xdb\x8a\x0e\x80\xf9\x2d\x75\x06\x41\xb3\x01\x48\xff\xc6\x0f\xb6\x0e\x80\xf9\x30\x72\x15\x80\xf9\x39\x77\x10\x48\x6b\xc0\x0a\x48\x83\xe9\x30\x48\x01\xc8\x48\xff\xc6\xeb\xe3\x4d\x85\xdb\x74\x03\x48\xf7\xd8", x86_num_bound_check(FieldBoundState { ty: ty, src: ms.src, pos: ty_start + ty_len }), b"\x50"), x86_stdin_fields(StdinMarshalState { fields: rest, num_idx: ms.num_idx + 1, region_off: ms.region_off, src: ms.src })))
       FNil => b""
   proofs:
     purity:
-      reads : [ms.fields, ms.num_idx, ms.region_off]
-      calls : [x86_stdin_fields]
+      reads : [ms.fields, ms.num_idx, ms.region_off, ms.src]
+      calls : [x86_stdin_fields, x86_text_bound_stdin, x86_num_bound_check]
     termination:
       bound : 512
 
@@ -30920,7 +31234,7 @@ rule x86_stdin_marshal
     let rms = resource_marshal_size(RMarshSizeState { rem: at.ress, src: at.src, prog: at.prog })
     let cms = connection_marshal_size(CMarshSizeState { rem: at.conns, src: at.src, prog: at.prog })
     let region_len = if cms > 0 then 5242880 + 65536 * connection_list_len(at.conns) else (4194304 + (if rms > 0 then 65536 * resource_list_len(at.ress) else 0))
-    out = concat(concat(b"\x49\x89\xe4\x49\x8b\x04\x24\x48\x3d", le32(1 + nnum), b"\x7d\x0c\xbf\x01\x00\x00\x00\xb8\x3c\x00\x00\x00\x0f\x05\xb8\x09\x00\x00\x00\xbf\x00\x00\x00\x20\xbe", le32(region_len), b"\xba\x03\x00\x00\x00\x41\xba\x32\x00\x00\x00\x49\xc7\xc0\xff\xff\xff\xff\x45\x31\xc9\x0f\x05\x48\x3d\x01\xf0\xff\xff\x72\x0c\xbf\x01\x00\x00\x00\xb8\x3c\x00\x00\x00\x0f\x05\x45\x31\xed\x31\xc0\x31\xff\xbe\x00\x00\x00\x20\x4c\x01\xee\xba\x00\x00\x40\x00\x4c\x29\xea\x0f\x05\x48\x85\xc0\x74\x1c\x78\x0e\x49\x01\xc5\x49\x81\xfd\x00\x00\x40\x00\x73\x02\xeb\xd5\xbf\x01\x00\x00\x00\xb8\x3c\x00\x00\x00\x0f\x05"), x86_stdin_fields(StdinMarshalState { fields: at.fields, num_idx: 0, region_off: region_off }), concat(b"\x4c\x89\xf0\x48\x69\xc0", le32(entry_size), b"\x4c\x01\xf8\x48\xc7\x00", le32(tag)), x86_field_pops(FieldPopState { fields: at.fields, slot: nfields - 1 }), b"\x41\x56\x49\xff\xc6")
+    out = concat(concat(b"\x49\x89\xe4\x49\x8b\x04\x24\x48\x3d", le32(1 + nnum), b"\x7d\x0c\xbf\x01\x00\x00\x00\xb8\x3c\x00\x00\x00\x0f\x05\xb8\x09\x00\x00\x00\xbf\x00\x00\x00\x20\xbe", le32(region_len), b"\xba\x03\x00\x00\x00\x41\xba\x32\x00\x00\x00\x49\xc7\xc0\xff\xff\xff\xff\x45\x31\xc9\x0f\x05\x48\x3d\x01\xf0\xff\xff\x72\x0c\xbf\x01\x00\x00\x00\xb8\x3c\x00\x00\x00\x0f\x05\x45\x31\xed\x31\xc0\x31\xff\xbe\x00\x00\x00\x20\x4c\x01\xee\xba\x00\x00\x40\x00\x4c\x29\xea\x0f\x05\x48\x85\xc0\x74\x1c\x78\x0e\x49\x01\xc5\x49\x81\xfd\x00\x00\x40\x00\x73\x02\xeb\xd5\xbf\x01\x00\x00\x00\xb8\x3c\x00\x00\x00\x0f\x05"), x86_stdin_fields(StdinMarshalState { fields: at.fields, num_idx: 0, region_off: region_off, src: at.src }), concat(b"\x4c\x89\xf0\x48\x69\xc0", le32(entry_size), b"\x4c\x01\xf8\x48\xc7\x00", le32(tag)), x86_field_pops(FieldPopState { fields: at.fields, slot: nfields - 1 }), b"\x41\x56\x49\xff\xc6")
   proofs:
     purity:
       reads : [at.fields, at.src, at.prog, at.concepts, at.sizes, at.cidx, at.ress, at.conns, at.rxs]

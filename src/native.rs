@@ -46198,6 +46198,308 @@ rule probe
         }
     }
 
+    /// gen0 must ENFORCE a field's declared input bounds, on BOTH kinds
+    /// (`number [min, max]`, `text [..N]`) and BOTH of its input channels
+    /// (argv marshal, stdin marshal) — the last member of the fail-closed
+    /// family, closed after PR #148 did `byte_at` / `substring` / short-circuit
+    /// `and`/`or`.
+    ///
+    /// verbosec's emitted binaries `sys_exit(1)` at FIELD-LOAD, before the rule
+    /// body runs (`emit_bounds_check` for numbers since PR #35,
+    /// `emit_text_bound_check` for text since PR #146 — where the missing text
+    /// half was an argv-controlled stack overflow). gen0 emitted neither, so
+    /// the SAME source compiled by the two compilers gave two different answers
+    /// on out-of-range input. Measured before this slice:
+    ///
+    ///   examples/aes_sbox.verbose, `b : number [0, 255]`
+    ///                  0     255    256      300      -5
+    ///     verbosec     99    22     exit 1   exit 1   exit 1
+    ///     gen0         99    22     22 rc=0  22 rc=0  22 rc=0
+    ///
+    /// A silent wrong answer, the same class as the byte_at gap — and worse in
+    /// one respect, because the declaration is what several emitters SIZE
+    /// buffers from.
+    ///
+    /// Road taken: gen0 does not RETAIN the range (`skip_field_range` discards
+    /// it; `FCons` has no min/max slots), so rather than widen the AST across
+    /// ~77 construction sites, these checks re-scan the range out of the RAW
+    /// SOURCE at `ty_start + ty_len` — the offset every FCons already carries —
+    /// exactly as `entry_uses_stdin` already recovers a text bound via
+    /// `field_text_bound`. The size walk and the emit walk gate on the SAME
+    /// rule (`num_bound_check_size` / `text_bound_check_size`), so they cannot
+    /// disagree about whether a check is present; a disagreement there would
+    /// desync `src_base` and corrupt every `byte_at` in the emitted binary.
+    ///
+    /// Six properties, each of which could regress alone:
+    ///   (a) NUMBER upper bound, argv channel — the aes_sbox case above, with
+    ///       FIPS-197 as the oracle for the in-range answers (S-box[0] = 0x63
+    ///       = 99, S-box[255] = 0x16 = 22), so the accepting path is pinned to
+    ///       something outside the compiler under test;
+    ///   (b) NUMBER lower bound including a NEGATIVE min — `[-50, 50]` accepts
+    ///       -50 and rejects -51, which a min-is-always-zero implementation
+    ///       (or a `le64` that mangled the sign) would fail;
+    ///   (c) TEXT bound, argv channel — `[..8]` accepts 8 bytes, rejects 9;
+    ///   (d) TEXT bound, stdin channel — a `[..200000]` field routes to stdin
+    ///       (> MAX_ARG_STRLEN) and must be checked THERE too, where the length
+    ///       is the read-to-EOF total in r13 rather than a strlen result. The
+    ///       pre-existing region guard only fail-closes at 4 MiB, so a field
+    ///       declared smaller was unchecked;
+    ///   (e) UNBOUNDED fields stay unchecked — the slice is purely additive,
+    ///       and an undeclared field must not acquire a phantom bound;
+    ///   (f) `bytes [..N]` must NOT be read as a numeric range. gen0's
+    ///       `type_code_of_span` maps `bytes` to 0, the SAME code as `number`,
+    ///       so the `.`-vs-digit discriminator inside the bracket is
+    ///       load-bearing; without it a bytes field would be checked against
+    ///       a bound that is not the one declared.
+    #[test]
+    #[ignore = "builds gen0 from the full self-source (~10 s) + emits several probes; run with --ignored"]
+    #[cfg(target_arch = "x86_64")]
+    fn two_generation_gen0_enforces_declared_input_field_bounds() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        let src = fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let tmp = std::env::temp_dir();
+        let gen0 = tmp.join("verbosec_test_inbounds_gen0");
+        compile_native_stdin_raw(&program, "elf_program_src", gen0.to_str().unwrap())
+            .expect("elf_program_src must compile --stdin-raw");
+        let chmod = |p: &std::path::Path| {
+            let mut perms = fs::metadata(p).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(p, perms).unwrap();
+        };
+        chmod(&gen0);
+
+        let emit = |tag: &str, prog_src: &str| -> std::path::PathBuf {
+            let sp = tmp.join(format!("verbosec_test_inbounds_{tag}.verbose"));
+            fs::write(&sp, prog_src).unwrap();
+            let bp = tmp.join(format!("verbosec_test_inbounds_{tag}.elf"));
+            let st = Command::new("sh")
+                .arg("-c")
+                .arg(format!(
+                    "ulimit -s unlimited; '{}' 0 < '{}' > '{}'",
+                    gen0.display(), sp.display(), bp.display()
+                ))
+                .status()
+                .expect("run gen0");
+            assert!(st.success(), "gen0 must accept + emit {tag}");
+            chmod(&bp);
+            let _ = fs::remove_file(&sp);
+            bp
+        };
+
+        // Run with argv args; return (exit_code, trimmed stdout). stdin is an
+        // explicitly empty pipe so an argv-channel binary cannot read a tty.
+        let run = |bin: &std::path::Path, args: &[&str]| -> (i32, String) {
+            let sh = format!(
+                "'{}' {} < /dev/null",
+                bin.display(),
+                args.iter().map(|a| format!("'{a}'")).collect::<Vec<_>>().join(" ")
+            );
+            let o = Command::new("sh").arg("-c").arg(sh).output().expect("run emitted binary");
+            (o.status.code().unwrap_or(-1), String::from_utf8_lossy(&o.stdout).trim().to_string())
+        };
+
+        // ── (a) NUMBER upper/lower bound on the argv channel, FIPS-197 oracle ──
+        let sbox_src = fs::read_to_string("examples/aes_sbox.verbose")
+            .expect("examples/aes_sbox.verbose must exist");
+        assert!(sbox_src.contains("b : number [0, 255]"),
+            "this pin assumes aes_sbox's entry field is `b : number [0, 255]`");
+        let sbox = emit("sbox", &sbox_src);
+        // In range: the answers are FIPS-197's forward S-box, not the
+        // compiler's opinion.
+        assert_eq!(run(&sbox, &["0"]), (0, "99".to_string()),
+            "aes_sbox(0) must be S-box[0] = 0x63 = 99 at rc 0");
+        assert_eq!(run(&sbox, &["255"]), (0, "22".to_string()),
+            "aes_sbox(255) must be S-box[255] = 0x16 = 22 at rc 0");
+        // Out of range: fail closed. Pre-slice ALL of these returned 22 at rc 0.
+        for bad in ["256", "300", "-5", "99999"] {
+            let (code, out) = run(&sbox, &[bad]);
+            assert_eq!(code, 1,
+                "gen0-emitted aes_sbox must exit 1 on out-of-range b={bad} (got rc {code}, stdout {out:?})");
+            assert!(out.is_empty(),
+                "an out-of-range input must produce NO output, got {out:?} for b={bad}");
+        }
+
+        // ── (b) NEGATIVE min, and (e) an unbounded companion stays unchecked ──
+        let neg_src = "\
+@verbose 0.1.0
+
+concept S
+  @intention: \"a signed-range field beside an unbounded one\"
+  @source: invoices.intent:1
+  fields:
+    v : number [-50, 50]
+    w : number
+
+rule pass_v
+  @intention: \"sum of the two fields\"
+  @source: invoices.intent:1
+  input:
+    s : S
+  output:
+    out : number
+  logic:
+    out = s.v + s.w
+  proofs:
+    purity:
+      reads : [s.v, s.w]
+      calls : []
+    termination:
+      bound : 8
+";
+        let neg = emit("neg", neg_src);
+        assert_eq!(run(&neg, &["-50", "1"]), (0, "-49".to_string()),
+            "min is INCLUSIVE: v = -50 must be accepted");
+        assert_eq!(run(&neg, &["50", "1"]), (0, "51".to_string()),
+            "max is INCLUSIVE: v = 50 must be accepted");
+        assert_eq!(run(&neg, &["-51", "1"]).0, 1, "v = -51 must exit 1 (negative min honoured)");
+        assert_eq!(run(&neg, &["51", "1"]).0, 1, "v = 51 must exit 1");
+        // (e) `w` declares no range, so nothing may constrain it.
+        assert_eq!(run(&neg, &["0", "999999999"]), (0, "999999999".to_string()),
+            "an UNBOUNDED number field must stay unchecked (purely additive slice)");
+        assert_eq!(run(&neg, &["0", "-999999999"]), (0, "-999999999".to_string()),
+            "an unbounded field must accept negatives too");
+
+        // ── (c) TEXT bound on the argv channel + (e) unbounded text ──
+        let txt_src = "\
+@verbose 0.1.0
+
+concept T
+  @intention: \"a bounded tag beside an unbounded note\"
+  @source: invoices.intent:1
+  fields:
+    tag : text [..8]
+    note : text
+
+rule tag_len
+  @intention: \"byte length of both text fields combined\"
+  @source: invoices.intent:1
+  input:
+    t : T
+  output:
+    out : number
+  logic:
+    out = length(t.tag) * 1000000 + length(t.note)
+  proofs:
+    purity:
+      reads : [t.tag, t.note]
+      calls : []
+    termination:
+      bound : 8
+";
+        let txt = emit("txt", txt_src);
+        assert_eq!(run(&txt, &["12345678", "xx"]), (0, "8000002".to_string()),
+            "a text field exactly AT its `[..8]` bound must be accepted");
+        assert_eq!(run(&txt, &["", "xx"]), (0, "2".to_string()),
+            "an empty bounded text field must be accepted");
+        assert_eq!(run(&txt, &["123456789", "xx"]).0, 1,
+            "9 bytes in a `[..8]` field must exit 1");
+        assert_eq!(run(&txt, &[&"A".repeat(64), "xx"]).0, 1,
+            "64 bytes in a `[..8]` field must exit 1");
+        // (e) `note` is unbounded — a long value must still be fine.
+        let long = "B".repeat(4000);
+        assert_eq!(run(&txt, &["ok", &long]), (0, "2004000".to_string()),
+            "an UNBOUNDED text field must stay unchecked");
+
+        // ── (d) TEXT bound on the STDIN channel ──
+        // `[..200000]` > MAX_ARG_STRLEN (131072), so entry_uses_stdin routes
+        // this to the stdin trampoline, where the length is r13 (read total).
+        let big_src = "\
+@verbose 0.1.0
+
+concept B
+  @intention: \"a text field too large for argv\"
+  @source: invoices.intent:1
+  fields:
+    data : text [..200000]
+
+rule dlen
+  @intention: \"byte length of the blob\"
+  @source: invoices.intent:1
+  input:
+    b : B
+  output:
+    out : number
+  logic:
+    out = length(b.data)
+  proofs:
+    purity:
+      reads : [b.data]
+      calls : []
+    termination:
+      bound : 8
+";
+        let big = emit("big", big_src);
+        // Feed exactly n bytes on stdin; return (exit_code, stdout).
+        let feed = |bin: &std::path::Path, n: usize| -> (i32, String) {
+            let sh = format!(
+                "head -c {n} /dev/zero | tr '\\0' 'a' | '{}' 0",
+                bin.display()
+            );
+            let o = Command::new("sh").arg("-c").arg(sh).output().expect("run stdin binary");
+            (o.status.code().unwrap_or(-1), String::from_utf8_lossy(&o.stdout).trim().to_string())
+        };
+        assert_eq!(feed(&big, 10), (0, "10".to_string()),
+            "the stdin channel must still deliver a short blob");
+        assert_eq!(feed(&big, 200000), (0, "200000".to_string()),
+            "exactly AT the `[..200000]` bound must be accepted on the stdin channel");
+        assert_eq!(feed(&big, 200001).0, 1,
+            "200001 bytes in a `[..200000]` stdin field must exit 1 — the pre-existing \
+             region guard only fires at 4 MiB, so this field was unchecked before the slice");
+        assert_eq!(feed(&big, 250000).0, 1,
+            "250000 bytes in a `[..200000]` stdin field must exit 1");
+
+        // ── (f) `bytes [..N]` must not be read as a numeric range ──
+        // gen0 codes `bytes` as ty 0, the same code as `number`. If the
+        // `.`-vs-digit discriminator inside the bracket broke, this program
+        // would carry a SECOND check (+54 B) built from a misparsed range.
+        // Compare emitted sizes: the bytes field must contribute nothing, so
+        // the two programs differ by exactly the one number check (54 B).
+        let bytes_src = "\
+@verbose 0.1.0
+
+concept Bf
+  @intention: \"a bytes field carrying a [..N] bound beside a bounded number\"
+  @source: invoices.intent:1
+  fields:
+    code : bytes [..16]
+    n : number [0, 5]
+
+rule pick
+  @intention: \"echo the number\"
+  @source: invoices.intent:1
+  input:
+    b : Bf
+  output:
+    out : number
+  logic:
+    out = b.n
+  proofs:
+    purity:
+      reads : [b.n]
+      calls : []
+    termination:
+      bound : 8
+";
+        let with_num = emit("bytesnum", bytes_src);
+        let no_num = emit("bytesonly", &bytes_src.replace("n : number [0, 5]", "n : number"));
+        let d = fs::metadata(&with_num).unwrap().len() as i64
+            - fs::metadata(&no_num).unwrap().len() as i64;
+        assert_eq!(d, 54,
+            "exactly ONE 54-byte number check must separate the two programs; a `bytes [..16]` \
+             field must contribute no check at all (got a {d}-byte difference)");
+
+        for p in [&gen0, &sbox, &neg, &txt, &big, &with_num, &no_num] {
+            let _ = fs::remove_file(p);
+        }
+    }
+
     /// THE COMPOSITE DEMO (2026-07): examples/expense_audit.verbose — a
     /// production-shaped program (record collection + reductions + a text-fold
     /// report + a Result validator + match_result composition, FULL
