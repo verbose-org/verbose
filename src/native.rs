@@ -45949,7 +45949,20 @@ rule pick
         // given an out-of-range input returns a value at rc=0 where verbosec's
         // binary sys_exit(1)s. That gap is pre-existing, independent of this
         // slice, and listed in CLAUDE.md's "known verification gaps" table.
-        const EXPECTED_ACCEPTED: usize = 113;
+        //
+        // 113 -> 110 (undefined-callee lint descends into Ok / Err /
+        // match_result and the nine collection nodes): a DELIBERATE drop of
+        // exactly three files — iso_date, sliding_count, threshold_sum — and
+        // the good kind. All three called a verbosec primitive gen0 has not
+        // learned (`parse_int`, `now_unix`) from a position count_badcall_ast
+        // stubbed to 0, so the lint never saw it, gen0 accepted, and the
+        // emitter — with no address to call — emitted `call <end-of-code>`,
+        // i.e. into the embedded SOURCE BLOB. iso_date's binary took a general
+        // protection fault at 0x4005ab executing the 'o' of "@verbose" as an
+        // `outsd`. Compile-and-crash is now compile-refusal: rc 1, zero bytes.
+        // The other 110 binaries are byte-identical except vexprparse itself
+        // (its own source carries the fix). See CLAUDE.md's gaps table.
+        const EXPECTED_ACCEPTED: usize = 110;
         const EXPECTED_TOTAL: usize = 151;
 
         let src = fs::read_to_string("examples/vexprparse.verbose")
@@ -46498,6 +46511,137 @@ rule pick
         for p in [&gen0, &sbox, &neg, &txt, &big, &with_num, &no_num] {
             let _ = fs::remove_file(p);
         }
+    }
+
+    /// gen0 must never hand back a binary it has already pointed at its own
+    /// data section.
+    ///
+    /// The defect: `count_badcall_ast` — gen0's undefined-callee lint — walked
+    /// most of the Ast but returned a flat 0 for twelve node families
+    /// (`AstOk`, `AstResErr`, `AstMatchResult` and the nine collection nodes),
+    /// carrying the comment "Result tier slice 1 stub". It was not a stub, it
+    /// was a hole with teeth, and the reason it had teeth is an ASYMMETRY:
+    /// gen0's `span_is_primitive` recognises 18 names, verbosec's
+    /// PRIMITIVE_CALL_NAMES has 36. A call to `parse_int` or `now_unix` is a
+    /// legal primitive to verbosec and an UNDEFINED CALLEE to gen0 — so these
+    /// are programs verbosec ACCEPTS that gen0 must refuse. Under one of the
+    /// twelve stubbed nodes the lint could not see it, gen0 accepted, and the
+    /// emitter — having no proc address to call — emitted `call <end-of-code>`,
+    /// which is the first byte of the embedded source blob.
+    ///
+    /// `examples/iso_date.verbose` is the witness: three
+    /// `parse_int(substring(i.s, ...))` calls inside `Ok(DateParts { ... })`
+    /// became three `call 0x4005a6`, and the emitted binary took a general
+    /// protection fault at 0x4005ab — executing the 'o' of "@verbose" as an
+    /// `outsd`, a privileged I/O instruction. `sliding_count` (`now_unix()`
+    /// under `count(...)`) and `threshold_sum` (`parse_int(...)` under
+    /// `sum(...)`) carried the identical `call <blob>` signature.
+    ///
+    /// The invariant asserted here is deliberately WEAKER than "gen0 refuses":
+    /// either gen0 refuses (exit non-zero, ZERO bytes written) or the binary it
+    /// produced runs and agrees with verbosec byte-for-byte. That way the
+    /// assertion survives the slice that teaches gen0 `parse_int` plus a
+    /// `Result(Record, text)` trampoline — it will flip from the refusal arm to
+    /// the agreement arm without anyone having to rewrite it. What it forbids
+    /// is the third outcome, the one that shipped: exit 0, a 2210/2546-byte
+    /// ELF, and a crash on the first plausible input.
+    ///
+    /// Verified to FAIL before the fix (gen0 exited 0, wrote 2546 bytes, and
+    /// the binary died on SIGSEGV / rc 139).
+    #[test]
+    #[ignore = "builds gen0 from the full self-source (~10 s) + needs `ulimit -s unlimited`; run with --ignored"]
+    #[cfg(target_arch = "x86_64")]
+    fn two_generation_gen0_never_emits_a_binary_that_crashes_on_iso_date() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        let src = fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+        let gen0 = std::env::temp_dir().join("verbosec_test_isodate_gen0");
+        compile_native_stdin_raw(&program, "elf_program_src", gen0.to_str().unwrap())
+            .expect("elf_program_src must compile --stdin-raw");
+        let mut perms = fs::metadata(&gen0).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&gen0, perms).unwrap();
+
+        // The three witnesses, all one defect: a verbosec primitive gen0 has
+        // not learned, reached from a node the badcall lint used to skip.
+        //   iso_date       parse_int  under Ok(Record { ... })
+        //   sliding_count  now_unix   under count(coll, e => ...)
+        //   threshold_sum  parse_int  under sum(coll, o => ...)
+        // iso_date goes FIRST and deliberately so: it is the only one with an
+        // argv-shaped entry, so it is the only one that can carry the RUN half,
+        // and running it is what turns "gen0 accepted something odd" into the
+        // actual evidence — a process killed by a signal. Pre-fix this test
+        // fails on the assert below with `died on a SIGNAL`, which is the
+        // finding; putting a refusal-only case first would have reported a
+        // weaker symptom for the same bug.
+        let out_elf = std::env::temp_dir().join("verbosec_test_isodate_out.elf");
+        let status = Command::new("sh").arg("-c").arg(format!(
+            "ulimit -s unlimited; '{}' 0 < 'examples/iso_date.verbose' > '{}' 2>/dev/null",
+            gen0.display(), out_elf.display()))
+            .status().expect("run gen0 on iso_date");
+
+        if !status.success() {
+            // Arm 1: honest refusal. Nothing was handed back.
+            assert_eq!(fs::metadata(&out_elf).unwrap().len(), 0,
+                "a refusing gen0 must write ZERO bytes, not a partial ELF");
+        } else {
+            // Arm 2: gen0 emitted. Then it must AGREE with verbosec, and in
+            // particular must not die on a signal.
+            let mut perms = fs::metadata(&out_elf).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&out_elf, perms).unwrap();
+            let got = Command::new(&out_elf).arg("2026-08-06").output()
+                .expect("run the gen0-emitted iso_date binary");
+            assert!(got.status.code().is_some(),
+                "gen0 emitted an iso_date binary that died on a SIGNAL ({:?}) — a compiler \
+                 must not hand back a binary it has already decided to point at its own \
+                 data section. This is the exact regression the badcall-lint descent fixed.",
+                got.status);
+
+            let vsrc = fs::read_to_string("examples/iso_date.verbose").unwrap();
+            let vtok = crate::lexer::Lexer::new(&vsrc).tokenize().unwrap();
+            let vprog = crate::parser::Parser::new(vtok).parse_program().unwrap();
+            let vref = std::env::temp_dir().join("verbosec_test_isodate_ref");
+            compile_native(&vprog, "parse_date", vref.to_str().unwrap(), false, false)
+                .expect("verbosec must compile parse_date");
+            let mut perms = fs::metadata(&vref).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&vref, perms).unwrap();
+            let want = Command::new(&vref).arg("2026-08-06").output().unwrap();
+            assert_eq!(got.stdout, want.stdout,
+                "gen0-emitted iso_date must produce verbosec's exact output");
+            assert_eq!(got.status.code(), want.status.code(),
+                "gen0-emitted iso_date must produce verbosec's exit code");
+            let _ = fs::remove_file(&vref);
+        }
+
+        // The two collateral witnesses. Neither has an argv-shaped entry (both
+        // take a collection), so they assert the refusal half only — which is
+        // exactly what the `call <blob>` signature reduces to once the lint can
+        // see through the collection node.
+        for name in ["sliding_count", "threshold_sum"] {
+            let path = format!("examples/{name}.verbose");
+            let status = Command::new("sh").arg("-c").arg(format!(
+                "ulimit -s unlimited; '{}' 0 < '{}' > '{}' 2>/dev/null",
+                gen0.display(), path, out_elf.display()))
+                .status().expect("run gen0");
+            if status.success() {
+                panic!("gen0 accepted {name}.verbose, which calls a primitive gen0 does not \
+                        know from inside a collection node. If a slice taught gen0 that \
+                        primitive, extend this case to run the binary and diff it against \
+                        verbosec — do not just delete it.");
+            }
+            assert_eq!(fs::metadata(&out_elf).unwrap().len(), 0,
+                "{name}: a refusing gen0 must write ZERO bytes, not a partial ELF");
+        }
+
+        let _ = fs::remove_file(&gen0);
+        let _ = fs::remove_file(&out_elf);
     }
 
     /// THE COMPOSITE DEMO (2026-07): examples/expense_audit.verbose — a

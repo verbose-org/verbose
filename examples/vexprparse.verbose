@@ -7762,16 +7762,33 @@ rule span_is_append_file
 
 
 -- span_is_primitive (V1b, self-verify arc): 1 iff a callee span spells one of the
--- language's expression PRIMITIVES — the exact set the span_is_* recognizers
--- define: byte_at, length, substring, concat, le32, le64, max, min, arena_scope,
--- abort_if.
--- The undefined-CALLEE lint (count_badcall_ast / badcall_span_ast) exempts these
+-- expression PRIMITIVES GEN0 HAS LEARNED — the exact set the span_is_* recognizers
+-- below define, currently 18: byte_at, length, substring, concat, le32, le64, max,
+-- min, arena_scope, abort_if, read, fetch, and the six bitwise (band, bor, bxor,
+-- bnot, shl, shr).
+-- THIS SET IS A STRICT SUBSET OF THE LANGUAGE'S, and that asymmetry is load-bearing
+-- in two opposite directions. verbosec's PRIMITIVE_CALL_NAMES has 36; the 18 missing
+-- here (parse_int, now_unix, starts_with, ends_with, contains, json_escape, abs,
+-- sum, count, fold, all, any, map, filter, Ok, Err, match_result, fold_bytes) are
+-- names verbosec resolves to a primitive and gen0 cannot resolve at all.
+--   * For prim_named_rules (the "a rule may not be NAMED after a primitive" refusal)
+--     the subset is CORRECT and deliberate: gen0 only shadows what its own
+--     dispatchers special-case, so `rule map` is genuinely callable here.
+--   * For the undefined-CALLEE lint below the subset is what makes the lint LOAD-
+--     BEARING rather than cosmetic: a call this rule does not recognise and
+--     rule_named does not find has NO ADDRESS, and the emitter will happily write
+--     `call <end-of-code>` — straight into the embedded source blob. That is not
+--     hypothetical: examples/iso_date.verbose shipped exactly that (three
+--     `call 0x4005a6`, general protection fault at 0x4005ab). Widening this set is
+--     therefore never a pure win; every name added here must come WITH its emit
+--     path, or it converts an honest refusal into a jump into data.
+-- The lint (count_badcall_ast / badcall_span_ast) exempts these
 -- the same way the R6d purity checker does implicitly (primitives fail rule_named,
 -- so the purity pass never flags them); before this rule the badcall lint flagged
 -- every primitive call as an undefined callee. Chained if-else so each recognizer
 -- is mentioned (and evaluated) at most once — the single-evaluation discipline.
 rule span_is_primitive
-  @intention: "1 if a callee span spells one of the expression primitives (byte_at/length/substring/concat/le32/le64/max/min/arena_scope/abort_if), 0 otherwise"
+  @intention: "1 if a callee span spells one of the 18 expression primitives gen0 has learned (byte_at/length/substring/concat/le32/le64/max/min/arena_scope/abort_if/read/fetch/band/bor/bxor/bnot/shl/shr), 0 otherwise"
   @source: vexprparse.intent:33
   input:
     sc : SpanCheck
@@ -16524,19 +16541,44 @@ rule count_badcall_ast
       -- body. Arm binders don't affect callee resolution (callees are program-wide),
       -- so count_badcall_arms just threads the same rules into each arm body.
       AstMatch(scrut, arms) => count_badcall_ast(BadCallState { node: scrut, rules: a.rules, src: a.src }) + count_badcall_arms(BadCallArmsState { arms: arms, rules: a.rules, src: a.src })
-      -- Result tier slice 1 stub (parse + eval only; real handling in a later slice).
-      AstOk(inner) => 0
-      AstResErr(inner) => 0
-      AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => 0
-      AstSum(coll, item_start, item_len, body) => 0
-      AstCount(coll, item_start, item_len, body) => 0
-      AstFold(coll, init, acc_start, acc_len, item_start, item_len, body) => 0
-      AstAll(coll, item_start, item_len, body) => 0
-      AstAny(coll, item_start, item_len, body) => 0
-      AstMap(coll, item_start, item_len, body) => 0
-      AstFilter(coll, item_start, item_len, body) => 0
-      AstMinFold(coll, item_start, item_len, body) => 0
-      AstMaxFold(coll, item_start, item_len, body) => 0
+      -- These twelve arms USED TO return 0 ("Result tier slice 1 stub"), and that
+      -- was not a stub, it was a HOLE with teeth. An undefined callee sitting
+      -- under any of them was invisible to this lint, so gen0 accepted the
+      -- program and the emitter, having no address to call, emitted
+      -- `call <end-of-code>` -- which is the first byte of the embedded SOURCE
+      -- BLOB. Measured on examples/iso_date.verbose: three `call 0x4005a6`
+      -- sites (the three `parse_int(substring(...))` calls under `Ok(...)`),
+      -- and the binary took a general protection fault at 0x4005ab executing
+      -- the 'o' of "@verbose" as an `outsd`. Same signature, same cause, two
+      -- more files: sliding_count (`now_unix()` under `count(...)`) and
+      -- threshold_sum (`parse_int(...)` under `sum(...)`).
+      -- The callee is undefined because gen0's `span_is_primitive` set is
+      -- NARROWER than verbosec's 36 PRIMITIVE_CALL_NAMES -- `parse_int` and
+      -- `now_unix` are real primitives gen0 has not learned. Refusing is
+      -- therefore the right answer AND the project's documented safe
+      -- direction (gen0 refusing what verbosec accepts), not a workaround:
+      -- a compiler must not hand back a binary it has already decided to
+      -- point at its own data section.
+      -- SCOPE, deliberately: count_undef_ast (undefined VARIABLE) and
+      -- count_badarity_ast (arity), plus their span twins, still stub these
+      -- same twelve arms. That is not the same risk. Those two lints only fire
+      -- on programs verbosec ITSELF rejects, so no corpus file can reach them;
+      -- this one fires on programs verbosec ACCEPTS, because gen0's primitive
+      -- set is a strict subset of verbosec's. The asymmetry is the whole reason
+      -- this hole had teeth and those two do not -- yet. Close them when a
+      -- measured case says to, not before.
+      AstOk(inner) => count_badcall_ast(BadCallState { node: inner, rules: a.rules, src: a.src })
+      AstResErr(inner) => count_badcall_ast(BadCallState { node: inner, rules: a.rules, src: a.src })
+      AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => count_badcall_ast(BadCallState { node: scrut, rules: a.rules, src: a.src }) + count_badcall_ast(BadCallState { node: ok_body, rules: a.rules, src: a.src }) + count_badcall_ast(BadCallState { node: err_body, rules: a.rules, src: a.src })
+      AstSum(coll, item_start, item_len, body) => count_badcall_ast(BadCallState { node: coll, rules: a.rules, src: a.src }) + count_badcall_ast(BadCallState { node: body, rules: a.rules, src: a.src })
+      AstCount(coll, item_start, item_len, body) => count_badcall_ast(BadCallState { node: coll, rules: a.rules, src: a.src }) + count_badcall_ast(BadCallState { node: body, rules: a.rules, src: a.src })
+      AstFold(coll, init, acc_start, acc_len, item_start, item_len, body) => count_badcall_ast(BadCallState { node: coll, rules: a.rules, src: a.src }) + count_badcall_ast(BadCallState { node: init, rules: a.rules, src: a.src }) + count_badcall_ast(BadCallState { node: body, rules: a.rules, src: a.src })
+      AstAll(coll, item_start, item_len, body) => count_badcall_ast(BadCallState { node: coll, rules: a.rules, src: a.src }) + count_badcall_ast(BadCallState { node: body, rules: a.rules, src: a.src })
+      AstAny(coll, item_start, item_len, body) => count_badcall_ast(BadCallState { node: coll, rules: a.rules, src: a.src }) + count_badcall_ast(BadCallState { node: body, rules: a.rules, src: a.src })
+      AstMap(coll, item_start, item_len, body) => count_badcall_ast(BadCallState { node: coll, rules: a.rules, src: a.src }) + count_badcall_ast(BadCallState { node: body, rules: a.rules, src: a.src })
+      AstFilter(coll, item_start, item_len, body) => count_badcall_ast(BadCallState { node: coll, rules: a.rules, src: a.src }) + count_badcall_ast(BadCallState { node: body, rules: a.rules, src: a.src })
+      AstMinFold(coll, item_start, item_len, body) => count_badcall_ast(BadCallState { node: coll, rules: a.rules, src: a.src }) + count_badcall_ast(BadCallState { node: body, rules: a.rules, src: a.src })
+      AstMaxFold(coll, item_start, item_len, body) => count_badcall_ast(BadCallState { node: coll, rules: a.rules, src: a.src }) + count_badcall_ast(BadCallState { node: body, rules: a.rules, src: a.src })
   proofs:
     purity:
       reads : [a.node, a.rules, a.src]
@@ -21554,19 +21596,26 @@ rule badcall_span_ast
       AstVariant(cstart, clen, vstart, vlen, fields) => badcall_span_vfields(BadCallSpanVFieldsState { fields: fields, rules: a.rules, src: a.src })
       -- R6a: scrutinee first, then arm bodies (binders don't affect callee scope).
       AstMatch(scrut, arms) => span_or(SpanOrState { a: badcall_span_ast(BadCallSpanState { node: scrut, rules: a.rules, src: a.src }), b: badcall_span_arms(BadCallSpanArmsState { arms: arms, rules: a.rules, src: a.src }) })
-      -- Result tier slice 1 stub (parse + eval only; real handling in a later slice).
-      AstOk(inner) => Span::MkSpan { start: 9999, len: 0 }
-      AstResErr(inner) => Span::MkSpan { start: 9999, len: 0 }
-      AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => Span::MkSpan { start: 9999, len: 0 }
-      AstSum(coll, item_start, item_len, body) => Span::MkSpan { start: 9999, len: 0 }
-      AstCount(coll, item_start, item_len, body) => Span::MkSpan { start: 9999, len: 0 }
-      AstFold(coll, init, acc_start, acc_len, item_start, item_len, body) => Span::MkSpan { start: 9999, len: 0 }
-      AstAll(coll, item_start, item_len, body) => Span::MkSpan { start: 9999, len: 0 }
-      AstAny(coll, item_start, item_len, body) => Span::MkSpan { start: 9999, len: 0 }
-      AstMap(coll, item_start, item_len, body) => Span::MkSpan { start: 9999, len: 0 }
-      AstFilter(coll, item_start, item_len, body) => Span::MkSpan { start: 9999, len: 0 }
-      AstMinFold(coll, item_start, item_len, body) => Span::MkSpan { start: 9999, len: 0 }
-      AstMaxFold(coll, item_start, item_len, body) => Span::MkSpan { start: 9999, len: 0 }
+      -- Same twelve arms as count_badcall_ast, and they stopped being sentinels
+      -- for the same reason: the COUNT walk decides whether to refuse, this SPAN
+      -- walk decides which name the diagnostic prints. If only the count
+      -- descended, gen0 would refuse iso_date.verbose and then report a blank
+      -- callee -- the two walks must agree node-for-node or the message points
+      -- nowhere. Note that undef_span_ast and badarity_span_ast still carry the
+      -- sentinel form below; that is deliberate, see the banner over
+      -- count_badcall_ast.
+      AstOk(inner) => badcall_span_ast(BadCallSpanState { node: inner, rules: a.rules, src: a.src })
+      AstResErr(inner) => badcall_span_ast(BadCallSpanState { node: inner, rules: a.rules, src: a.src })
+      AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => span_or(SpanOrState { a: span_or(SpanOrState { a: badcall_span_ast(BadCallSpanState { node: scrut, rules: a.rules, src: a.src }), b: badcall_span_ast(BadCallSpanState { node: ok_body, rules: a.rules, src: a.src }) }), b: badcall_span_ast(BadCallSpanState { node: err_body, rules: a.rules, src: a.src }) })
+      AstSum(coll, item_start, item_len, body) => span_or(SpanOrState { a: badcall_span_ast(BadCallSpanState { node: coll, rules: a.rules, src: a.src }), b: badcall_span_ast(BadCallSpanState { node: body, rules: a.rules, src: a.src }) })
+      AstCount(coll, item_start, item_len, body) => span_or(SpanOrState { a: badcall_span_ast(BadCallSpanState { node: coll, rules: a.rules, src: a.src }), b: badcall_span_ast(BadCallSpanState { node: body, rules: a.rules, src: a.src }) })
+      AstFold(coll, init, acc_start, acc_len, item_start, item_len, body) => span_or(SpanOrState { a: span_or(SpanOrState { a: badcall_span_ast(BadCallSpanState { node: coll, rules: a.rules, src: a.src }), b: badcall_span_ast(BadCallSpanState { node: init, rules: a.rules, src: a.src }) }), b: badcall_span_ast(BadCallSpanState { node: body, rules: a.rules, src: a.src }) })
+      AstAll(coll, item_start, item_len, body) => span_or(SpanOrState { a: badcall_span_ast(BadCallSpanState { node: coll, rules: a.rules, src: a.src }), b: badcall_span_ast(BadCallSpanState { node: body, rules: a.rules, src: a.src }) })
+      AstAny(coll, item_start, item_len, body) => span_or(SpanOrState { a: badcall_span_ast(BadCallSpanState { node: coll, rules: a.rules, src: a.src }), b: badcall_span_ast(BadCallSpanState { node: body, rules: a.rules, src: a.src }) })
+      AstMap(coll, item_start, item_len, body) => span_or(SpanOrState { a: badcall_span_ast(BadCallSpanState { node: coll, rules: a.rules, src: a.src }), b: badcall_span_ast(BadCallSpanState { node: body, rules: a.rules, src: a.src }) })
+      AstFilter(coll, item_start, item_len, body) => span_or(SpanOrState { a: badcall_span_ast(BadCallSpanState { node: coll, rules: a.rules, src: a.src }), b: badcall_span_ast(BadCallSpanState { node: body, rules: a.rules, src: a.src }) })
+      AstMinFold(coll, item_start, item_len, body) => span_or(SpanOrState { a: badcall_span_ast(BadCallSpanState { node: coll, rules: a.rules, src: a.src }), b: badcall_span_ast(BadCallSpanState { node: body, rules: a.rules, src: a.src }) })
+      AstMaxFold(coll, item_start, item_len, body) => span_or(SpanOrState { a: badcall_span_ast(BadCallSpanState { node: coll, rules: a.rules, src: a.src }), b: badcall_span_ast(BadCallSpanState { node: body, rules: a.rules, src: a.src }) })
       AstBin(op, lhs, rhs) => span_or(SpanOrState { a: badcall_span_ast(BadCallSpanState { node: lhs, rules: a.rules, src: a.src }), b: badcall_span_ast(BadCallSpanState { node: rhs, rules: a.rules, src: a.src }) })
       AstNeg(inner) => badcall_span_ast(BadCallSpanState { node: inner, rules: a.rules, src: a.src })
       AstNot(inner) => badcall_span_ast(BadCallSpanState { node: inner, rules: a.rules, src: a.src })
