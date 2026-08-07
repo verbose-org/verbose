@@ -3034,15 +3034,16 @@ rule parse_vfields
   output:
     out : ParsedVFields
   logic:
-    let opc = peek_op_code(st.cell)
+    let sp = skip_seps(ParseState { cell: st.cell })
+    let opc = peek_op_code(sp)
     let isclose = if opc == 24 then 1 else 0
-    let name_start = peek_start(st.cell)
-    let name_len = peek_len(st.cell)
-    out = if isclose == 1 then ParsedVFields::MkVF { fields: VFieldList::VFNil, next: advance(Advance { lst: st.cell, k: 1 }) } else vfields_cons(VFieldConsState { name_start: name_start, name_len: name_len, value: parse_or(ParseState { cell: advance(Advance { lst: st.cell, k: 2 }) }) })
+    let name_start = peek_start(sp)
+    let name_len = peek_len(sp)
+    out = if isclose == 1 then ParsedVFields::MkVF { fields: VFieldList::VFNil, next: advance(Advance { lst: sp, k: 1 }) } else vfields_cons(VFieldConsState { name_start: name_start, name_len: name_len, value: parse_or(ParseState { cell: advance(Advance { lst: sp, k: 2 }) }) })
   proofs:
     purity:
       reads : [st.cell]
-      calls : [peek_op_code, peek_start, peek_len, parse_or, vfields_cons, advance]
+      calls : [skip_seps, peek_op_code, peek_start, peek_len, parse_or, vfields_cons, advance]
     termination:
       bound : 512
 
@@ -3060,7 +3061,7 @@ rule vfields_cons
     out : ParsedVFields
   logic:
     let val_node = parsed_node(cs.value)
-    let val_next = parsed_next(cs.value)
+    let val_next = skip_seps(ParseState { cell: parsed_next(cs.value) })
     let opc = peek_op_code(val_next)
     let iscomma = if opc == 11 then 1 else 0
     let close_next = if opc == 24 then advance(Advance { lst: val_next, k: 1 }) else val_next
@@ -3068,7 +3069,7 @@ rule vfields_cons
   proofs:
     purity:
       reads : [cs.name_start, cs.name_len, cs.value]
-      calls : [parsed_node, parsed_next, peek_op_code, vfields_prepend, parse_vfields, advance]
+      calls : [parsed_node, parsed_next, skip_seps, peek_op_code, vfields_prepend, parse_vfields, advance]
     termination:
       bound : 512
 
