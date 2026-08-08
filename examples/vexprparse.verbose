@@ -26334,7 +26334,7 @@ rule code_size_node
   logic:
     out = match bg.node:
       AstNum(value) => 11
-      AstBin(op, lhs, rhs) => code_size_node(ByteGenState { node: lhs, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}) + code_size_node(ByteGenState { node: rhs, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}) + (if op == 13 then 6 else if op == 14 then 6 else if op == 15 then 7 else if op == 16 then 8 else if op == 17 then 11 else if op == 30 then 26 else if op == 31 then 25 else if op == 1 then 12 else if op == 6 then 12 else if op == 19 then 12 else if op == 20 then 12 else if op == 5 then 12 else if op == 4 then 12 else 1)
+      AstBin(op, lhs, rhs) => code_size_node(ByteGenState { node: lhs, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}) + code_size_node(ByteGenState { node: rhs, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}) + (if op == 13 then 6 else if op == 14 then 6 else if op == 15 then 7 else if op == 16 then 8 else if op == 17 then 11 else if op == 30 then 26 else if op == 31 then 25 else if (op == 1 or op == 6) and bin_text_mode(bg) == 1 then 65 else if (op == 1 or op == 6) and bin_text_mode(bg) == 2 then 1 else if op == 1 then 12 else if op == 6 then 12 else if op == 19 then 12 else if op == 20 then 12 else if op == 5 then 12 else if op == 4 then 12 else 1)
       AstNeg(inner) => code_size_node(ByteGenState { node: inner, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}) + 5
       AstNot(inner) => 1
       AstVar(start, len) => 6
@@ -26410,7 +26410,7 @@ rule code_size_node
   proofs:
     purity:
       reads : [bg, bg.node, bg.src, bg.off, bg.params, bg.lets, bg.prog, bg.concepts, bg.sizes, bg.ress, bg.conns]
-      calls : [code_size_node, code_size_args, code_size_vfields, vfield_len, arm_list_len, code_size_arms, static_concept_of, span_is_byte_at, span_is_length, span_is_substring, span_is_max, span_is_min, span_is_bitwise, code_size_bitwise_call, span_is_arena_scope, span_is_abort_if, span_is_concat, span_is_read, resource_index_of, ast_var_start, ast_var_len, arg_first, callee_is_texty, arg_list_len, lets_append_binders, coll_elem_nfields, lets_append_elem_binders, cd_name_start, cd_name_len, concept_at_index, span_is_fetch, connection_index_of]
+      calls : [code_size_node, code_size_args, code_size_vfields, vfield_len, arm_list_len, code_size_arms, static_concept_of, bin_text_mode, span_is_byte_at, span_is_length, span_is_substring, span_is_max, span_is_min, span_is_bitwise, code_size_bitwise_call, span_is_arena_scope, span_is_abort_if, span_is_concat, span_is_read, resource_index_of, ast_var_start, ast_var_len, arg_first, callee_is_texty, arg_list_len, lets_append_binders, coll_elem_nfields, lets_append_elem_binders, cd_name_start, cd_name_len, concept_at_index, span_is_fetch, connection_index_of]
     termination:
       bound : 8000
 
@@ -26713,7 +26713,7 @@ rule x86_node
       -- are kept, matched by the same two entries in code_size_node's constant
       -- chain, so the two chains stay structurally identical arm-for-arm; deleting
       -- them from one side only is how that pair desyncs.
-      AstBin(op, lhs, rhs) => if op == 30 or op == 31 then concat(x86_node(ByteGenState { node: lhs, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}), b"\x58\x48\x85\xc0", (if op == 30 then b"\x0f\x84" else b"\x0f\x85"), le32(arena_scope(code_size_node(ByteGenState { node: rhs, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns})) + 13), x86_node(ByteGenState { node: rhs, src: bg.src, off: bg.off + arena_scope(code_size_node(ByteGenState { node: lhs, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns})) + 10, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}), b"\x58\x48\x85\xc0\x0f\x95\xc0\x0f\xb6\xc0\x50", (if op == 30 then b"\xeb\x03\x31\xc0\x50" else b"\xeb\x02\x6a\x01")) else concat(x86_node(ByteGenState { node: lhs, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}), x86_node(ByteGenState { node: rhs, src: bg.src, off: bg.off + arena_scope(code_size_node(ByteGenState { node: lhs, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns})), params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}), if op == 13 then b"\x59\x58\x48\x01\xc8\x50" else if op == 14 then b"\x59\x58\x48\x29\xc8\x50" else if op == 15 then b"\x59\x58\x48\x0f\xaf\xc1\x50" else if op == 16 then b"\x59\x58\x48\x99\x48\xf7\xf9\x50" else if op == 17 then b"\x59\x58\x48\x99\x48\xf7\xf9\x48\x89\xd0\x50" else if op == 30 then b"\x59\x58\x48\x85\xc0\x0f\x95\xc0\x48\x85\xc9\x0f\x95\xc1\x20\xc8\x0f\xb6\xc0\x50" else if op == 31 then b"\x59\x58\x48\x85\xc0\x0f\x95\xc0\x48\x85\xc9\x0f\x95\xc1\x08\xc8\x0f\xb6\xc0\x50" else if op == 1 then b"\x59\x58\x48\x39\xc8\x0f\x94\xc0\x0f\xb6\xc0\x50" else if op == 6 then b"\x59\x58\x48\x39\xc8\x0f\x95\xc0\x0f\xb6\xc0\x50" else if op == 19 then b"\x59\x58\x48\x39\xc8\x0f\x9c\xc0\x0f\xb6\xc0\x50" else if op == 20 then b"\x59\x58\x48\x39\xc8\x0f\x9f\xc0\x0f\xb6\xc0\x50" else if op == 5 then b"\x59\x58\x48\x39\xc8\x0f\x9e\xc0\x0f\xb6\xc0\x50" else if op == 4 then b"\x59\x58\x48\x39\xc8\x0f\x9d\xc0\x0f\xb6\xc0\x50" else b"\xcc")
+      AstBin(op, lhs, rhs) => if op == 30 or op == 31 then concat(x86_node(ByteGenState { node: lhs, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}), b"\x58\x48\x85\xc0", (if op == 30 then b"\x0f\x84" else b"\x0f\x85"), le32(arena_scope(code_size_node(ByteGenState { node: rhs, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns})) + 13), x86_node(ByteGenState { node: rhs, src: bg.src, off: bg.off + arena_scope(code_size_node(ByteGenState { node: lhs, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns})) + 10, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}), b"\x58\x48\x85\xc0\x0f\x95\xc0\x0f\xb6\xc0\x50", (if op == 30 then b"\xeb\x03\x31\xc0\x50" else b"\xeb\x02\x6a\x01")) else concat(x86_node(ByteGenState { node: lhs, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}), x86_node(ByteGenState { node: rhs, src: bg.src, off: bg.off + arena_scope(code_size_node(ByteGenState { node: lhs, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns})), params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}), if op == 13 then b"\x59\x58\x48\x01\xc8\x50" else if op == 14 then b"\x59\x58\x48\x29\xc8\x50" else if op == 15 then b"\x59\x58\x48\x0f\xaf\xc1\x50" else if op == 16 then b"\x59\x58\x48\x99\x48\xf7\xf9\x50" else if op == 17 then b"\x59\x58\x48\x99\x48\xf7\xf9\x48\x89\xd0\x50" else if op == 30 then b"\x59\x58\x48\x85\xc0\x0f\x95\xc0\x48\x85\xc9\x0f\x95\xc1\x20\xc8\x0f\xb6\xc0\x50" else if op == 31 then b"\x59\x58\x48\x85\xc0\x0f\x95\xc0\x48\x85\xc9\x0f\x95\xc1\x08\xc8\x0f\xb6\xc0\x50" else if (op == 1 or op == 6) and bin_text_mode(bg) == 1 then concat(b"\x59\x58\x89\xc2\x89\xce\x48\x39\xf2\x75\x34\x48\xc1\xe8\x20\x48\xc1\xe9\x20\x48\xbf", le64(4194304 + blob_end_off(ProgGenState { rules: bg.prog, src: bg.src, off: 0, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress, conns: bg.conns, rxs: ReactionList::RxNil, svcs: ServiceList::SvNil })), b"\x48\x01\xf8\x48\x01\xf9\x48\x85\xd2\x74\x13\x40\x8a\x30\x40\x3a\x31\x75\x0f\x48\xff\xc0\x48\xff\xc1\x48\xff\xca\xeb\xe8", (if op == 1 then b"\x6a\x01\xeb\x02\x6a\x00" else b"\x6a\x00\xeb\x02\x6a\x01")) else if (op == 1 or op == 6) and bin_text_mode(bg) == 2 then b"\xcc" else if op == 1 then b"\x59\x58\x48\x39\xc8\x0f\x94\xc0\x0f\xb6\xc0\x50" else if op == 6 then b"\x59\x58\x48\x39\xc8\x0f\x95\xc0\x0f\xb6\xc0\x50" else if op == 19 then b"\x59\x58\x48\x39\xc8\x0f\x9c\xc0\x0f\xb6\xc0\x50" else if op == 20 then b"\x59\x58\x48\x39\xc8\x0f\x9f\xc0\x0f\xb6\xc0\x50" else if op == 5 then b"\x59\x58\x48\x39\xc8\x0f\x9e\xc0\x0f\xb6\xc0\x50" else if op == 4 then b"\x59\x58\x48\x39\xc8\x0f\x9d\xc0\x0f\xb6\xc0\x50" else b"\xcc")
       AstNeg(inner) => concat(x86_node(ByteGenState { node: inner, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress , conns: bg.conns}), b"\x58\x48\xf7\xd8\x50")
       AstNot(inner) => b"\xcc"
       AstVar(start, len) => (if param_index(ParamIndexState { params: bg.params, src: bg.src, q_start: start, q_len: len, idx: 0 }) >= 0 then concat(b"\xff\xb5", le32(16 + 8 * (param_list_len(bg.params) - 1 - param_index(ParamIndexState { params: bg.params, src: bg.src, q_start: start, q_len: len, idx: 0 })))) else if let_index(LetIndexState { binds: bg.lets, src: bg.src, q_start: start, q_len: len, idx: 0 }) >= 0 then concat(b"\xff\xb5", le32(0 - 8 * (let_index(LetIndexState { binds: bg.lets, src: bg.src, q_start: start, q_len: len, idx: 0 }) + 1))) else b"\xcc")
@@ -26875,7 +26875,7 @@ rule x86_node
   proofs:
     purity:
       reads : [bg, bg.node, bg.src, bg.off, bg.params, bg.lets, bg.prog, bg.concepts, bg.sizes, bg.ress, bg.conns]
-      calls : [x86_node, code_size_node, x86_args, code_size_args, param_index, let_index, param_list_len, proc_offset, arg_list_len, x86_vfields, x86_vpops, vfield_len, max_payload_fields, variant_tag, x86_dispatch, x86_arms, code_size_arms, arm_list_len, static_concept_of, field_index_of, cd_fields, concept_at_index, span_is_byte_at, span_is_length, span_is_substring, span_is_max, span_is_min, span_is_bitwise, x86_bitwise_call, span_is_arena_scope, span_is_abort_if, span_is_concat, span_is_read, resource_index_of, ast_var_start, ast_var_len, arg_first, callee_is_texty, blob_end_off, lets_append_binders, x86_binder_loads, count_binds, coll_elem_nfields, lets_append_elem_binders, cd_name_start, cd_name_len, x86_elem_load, span_is_fetch, connection_index_of]
+      calls : [x86_node, code_size_node, x86_args, code_size_args, param_index, let_index, param_list_len, proc_offset, arg_list_len, x86_vfields, x86_vpops, vfield_len, max_payload_fields, variant_tag, x86_dispatch, x86_arms, code_size_arms, arm_list_len, static_concept_of, bin_text_mode, field_index_of, cd_fields, concept_at_index, span_is_byte_at, span_is_length, span_is_substring, span_is_max, span_is_min, span_is_bitwise, x86_bitwise_call, span_is_arena_scope, span_is_abort_if, span_is_concat, span_is_read, resource_index_of, ast_var_start, ast_var_len, arg_first, callee_is_texty, blob_end_off, lets_append_binders, x86_binder_loads, count_binds, coll_elem_nfields, lets_append_elem_binders, cd_name_start, cd_name_len, x86_elem_load, span_is_fetch, connection_index_of]
     termination:
       bound : 8000
 
@@ -28144,6 +28144,124 @@ rule ast_field_is_text
       calls : [static_concept_of, field_ty_of, cd_fields, concept_at_index]
     termination:
       bound : 16
+
+
+-- ============ TEXT EQUALITY (2026-08-08) ============
+-- ast_span_text: 1 iff the node's VALUE is a resolvable packed text SPAN — the
+-- (start * 2^32 + len) Number every text value in gen0 carries, whose bytes live
+-- at src_base + start. Four shapes qualify:
+--   * AstStr           — a literal, spanning into the embedded source blob;
+--   * a text-typed AstField — argv / stdin bytes copied into the fixed region by
+--     x86_argv_marshal / x86_elem_field_loads, PRE-BIASED by (0x20000000 -
+--     src_base) so the one src_base dereferences both origins;
+--   * a text-typed param (AstVar with declared ty 2);
+--   * read(<resource>) and substring(...) — both spans under the same base.
+-- Everything else is 0. In particular FRESH text (concat, a texty rule call) has
+-- NO span, which is exactly why bin_text_mode traps on it rather than guessing.
+rule ast_span_text
+  @intention: "1 if the node evaluates to a packed text span (literal / text field / text param / read / substring), 0 otherwise"
+  @source: vexprparse.intent:70
+  input:
+    bg : ByteGenState
+  output:
+    out : number
+  logic:
+    out = match bg.node:
+      AstNum(value) => 0
+      AstBin(op, lhs, rhs) => 0
+      AstNeg(inner) => 0
+      AstNot(inner) => 0
+      AstVar(start, len) => if param_ty(ParamIndexState { params: bg.params, src: bg.src, q_start: start, q_len: len, idx: 0 }) == 2 then 1 else 0
+      AstField(base, fstart, flen) => ast_field_is_text(StaticConceptState { node: bg.node, src: bg.src, params: bg.params, lets: bg.lets, concepts: bg.concepts })
+      AstCall(callee_start, callee_len, args) => if span_is_read(SpanCheck { src: bg.src, start: callee_start, len: callee_len }) == 1 then 1 else span_is_substring(SpanCheck { src: bg.src, start: callee_start, len: callee_len })
+      AstStr(start, len) => 1
+      AstBytes(start, len) => 0
+      AstBool(value) => 0
+      AstIf(cond, thn, els) => 0
+      AstErr => 0
+      AstVariant(cstart, clen, vstart, vlen, fields) => 0
+      AstMatch(scrut, arms) => 0
+      AstOk(inner) => 0
+      AstResErr(inner) => 0
+      AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => 0
+      AstSum(coll, item_start, item_len, body) => 0
+      AstCount(coll, item_start, item_len, body) => 0
+      AstFold(coll, init, acc_start, acc_len, item_start, item_len, body) => 0
+      AstAll(coll, item_start, item_len, body) => 0
+      AstAny(coll, item_start, item_len, body) => 0
+      AstMap(coll, item_start, item_len, body) => 0
+      AstFilter(coll, item_start, item_len, body) => 0
+      AstMinFold(coll, item_start, item_len, body) => 0
+      AstMaxFold(coll, item_start, item_len, body) => 0
+  proofs:
+    purity:
+      reads : [bg.node, bg.src, bg.params, bg.lets, bg.concepts]
+      calls : [param_ty, ast_field_is_text, span_is_read, span_is_substring]
+    termination:
+      bound : 32
+
+
+-- bin_text_mode: the ONE rule that decides how an AstBin `==` / `!=` lowers.
+-- Both walks call it — code_size_node for the byte count, x86_node for the
+-- bytes — so the size/emit pair can never disagree about which sequence is
+-- there (the two-pass drift edge every gen0 slice has to respect).
+--   0 = the integer compare (cmp rax, rcx ; sete) — correct for Numbers/Bools.
+--   1 = the 65-byte packed-span byte compare — both operands are spans.
+--   2 = a TEXT comparison with no span lowering (a concat / texty-call operand,
+--       or one text operand against a non-span one) — emit int3 rather than an
+--       answer we cannot justify.
+--
+-- WHY THIS RULE EXISTS. Until this slice every `==` took the integer path, and
+-- for TEXT operands that compares two packed (start, len) spans as i64. Two
+-- spans are integer-equal only when they name the same bytes at the same
+-- offset, so `r.tag == "ab"` — an argv span against a source-blob span — was
+-- ALWAYS false, even for input "ab". It evaded every differential sweep because
+-- it is correct on HALF the input space: non-matching strings genuinely are
+-- false, and a sweep over arbitrary inputs practically never generates a
+-- matching pair. gen0's own front end never noticed because vexprparse compares
+-- text through byte_at loops (name_eq, the span_is_* family), which are NUMBER
+-- equalities on individual bytes — it has not one text `==` in its own source.
+rule bin_text_mode
+  @intention: "For an AstBin == / !=: 0 = integer compare, 1 = packed-span byte compare, 2 = unlowerable text compare (trap)"
+  @source: vexprparse.intent:70
+  input:
+    bg : ByteGenState
+  output:
+    out : number
+  logic:
+    out = match bg.node:
+      AstNum(value) => 0
+      AstBin(op, lhs, rhs) => if op == 1 or op == 6 then (if ast_span_text(ByteGenState { node: lhs, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress, conns: bg.conns }) == 1 and ast_span_text(ByteGenState { node: rhs, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress, conns: bg.conns }) == 1 then 1 else if ast_span_text(ByteGenState { node: lhs, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress, conns: bg.conns }) == 1 then 2 else if ast_span_text(ByteGenState { node: rhs, src: bg.src, off: bg.off, params: bg.params, lets: bg.lets, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress, conns: bg.conns }) == 1 then 2 else if ast_is_texty(TextyState { node: lhs, src: bg.src, prog: bg.prog }) == 1 then 2 else if ast_is_texty(TextyState { node: rhs, src: bg.src, prog: bg.prog }) == 1 then 2 else 0) else 0
+      AstNeg(inner) => 0
+      AstNot(inner) => 0
+      AstVar(start, len) => 0
+      AstField(base, fstart, flen) => 0
+      AstCall(callee_start, callee_len, args) => 0
+      AstStr(start, len) => 0
+      AstBytes(start, len) => 0
+      AstBool(value) => 0
+      AstIf(cond, thn, els) => 0
+      AstErr => 0
+      AstVariant(cstart, clen, vstart, vlen, fields) => 0
+      AstMatch(scrut, arms) => 0
+      AstOk(inner) => 0
+      AstResErr(inner) => 0
+      AstMatchResult(scrut, ok_bstart, ok_blen, ok_body, err_bstart, err_blen, err_body) => 0
+      AstSum(coll, item_start, item_len, body) => 0
+      AstCount(coll, item_start, item_len, body) => 0
+      AstFold(coll, init, acc_start, acc_len, item_start, item_len, body) => 0
+      AstAll(coll, item_start, item_len, body) => 0
+      AstAny(coll, item_start, item_len, body) => 0
+      AstMap(coll, item_start, item_len, body) => 0
+      AstFilter(coll, item_start, item_len, body) => 0
+      AstMinFold(coll, item_start, item_len, body) => 0
+      AstMaxFold(coll, item_start, item_len, body) => 0
+  proofs:
+    purity:
+      reads : [bg.node, bg.src, bg.off, bg.params, bg.lets, bg.prog, bg.concepts, bg.sizes, bg.ress, bg.conns]
+      calls : [ast_span_text, ast_is_texty]
+    termination:
+      bound : 8000
 
 
 -- fold_size_arg: the EXACT byte count x86_fold_arg emits for ONE fold-body
