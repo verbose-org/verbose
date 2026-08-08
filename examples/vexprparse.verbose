@@ -26934,7 +26934,7 @@ rule code_size_stream_node
       AstNeg(inner) => code_size_node(bg) + 6
       AstNot(inner) => 1
       AstVar(start, len) => (if param_index(ParamIndexState { params: bg.params, src: bg.src, q_start: start, q_len: len, idx: 0 }) >= 0 then (if param_ty(ParamIndexState { params: bg.params, src: bg.src, q_start: start, q_len: len, idx: 0 }) == 2 then 42 else code_size_node(bg) + 6) else if let_index(LetIndexState { binds: bg.lets, src: bg.src, q_start: start, q_len: len, idx: 0 }) >= 0 then code_size_node(bg) + 6 else 1)
-      AstField(base, fstart, flen) => code_size_node(bg) + 6
+      AstField(base, fstart, flen) => if ast_field_is_text(StaticConceptState { node: bg.node, src: bg.src, params: bg.params, lets: bg.lets, concepts: bg.concepts }) == 1 then code_size_node(bg) + 36 else code_size_node(bg) + 6
       AstStr(start, len) => 33
       AstBytes(start, len) => if bytelit_decoded_len(DecodeState { src: bg.src, start: start, len: len, i: 0 }) <= 0 then 0 else 35 + 4 * ((bytelit_decoded_len(DecodeState { src: bg.src, start: start, len: len, i: 0 }) + 3) / 4)
       AstBool(value) => 1
@@ -26987,7 +26987,7 @@ rule code_size_stream_node
   proofs:
     purity:
       reads : [bg, bg.node, bg.src, bg.off, bg.params, bg.lets, bg.prog, bg.concepts, bg.sizes, bg.ress, bg.conns]
-      calls : [code_size_node, code_size_stream_node, stream_size_cargs, stream_size_arms, code_size_args, param_index, param_ty, let_index, arm_list_len, span_is_concat, span_is_arena_scope, span_is_abort_if, arg_first, span_is_le32, span_is_le64, span_is_substring, span_is_byte_at, span_is_length, span_is_read, resource_index_of, ast_var_start, ast_var_len, arg_list_len, callee_is_texty, bytelit_decoded_len, coll_elem_nfields, lets_append_binders, fold_stream_ok, ast_call_args, arg_rest, fold_size_cargs, lets_append_elem_binders, static_concept_of, cd_name_start, cd_name_len, concept_at_index, map_out_nf, code_size_map_record, code_size_filter_record, span_is_fetch, connection_index_of]
+      calls : [code_size_node, code_size_stream_node, ast_field_is_text, stream_size_cargs, stream_size_arms, code_size_args, param_index, param_ty, let_index, arm_list_len, span_is_concat, span_is_arena_scope, span_is_abort_if, arg_first, span_is_le32, span_is_le64, span_is_substring, span_is_byte_at, span_is_length, span_is_read, resource_index_of, ast_var_start, ast_var_len, arg_list_len, callee_is_texty, bytelit_decoded_len, coll_elem_nfields, lets_append_binders, fold_stream_ok, ast_call_args, arg_rest, fold_size_cargs, lets_append_elem_binders, static_concept_of, cd_name_start, cd_name_len, concept_at_index, map_out_nf, code_size_map_record, code_size_filter_record, span_is_fetch, connection_index_of]
     termination:
       bound : 8000
 
@@ -27411,6 +27411,24 @@ rule code_size_filter_record
 -- with the call at off + node_size + 1 (after the value ops and the pop).
 -- src_base for AstStr / text-param writes is the SAME 0x400000 + blob_end_off
 -- imm64 the byte_at emit loads — one definition, no drift.
+--
+-- AstField dispatches on ast_field_is_text, and that dispatch is load-bearing:
+-- before it existed, EVERY field streamed through the itoa call, so a TEXT
+-- field printed its packed (start, len) pair as a decimal integer at rc 0 —
+-- `concat("Hello ", p.name, ", age ", p.age)` gave `Hello 2287825359413968899,
+-- age 36`, a silent wrong answer, not a trap. The text branch is x86_fold_arg's
+-- element-field write verbatim (code_size_node + 36): <value ops> ; pop rax ;
+-- mov edx, eax (len = low 32) ; shr rax, 32 (start = high 32) ; movabs rsi,
+-- src_base ; add rsi, rax ; write(1, rsi, len).
+--
+-- ONE base serves both text origins. A source-blob span (literal, `read`) is
+-- an offset into the embedded source, and src_base + start lands in the blob.
+-- An ARGV span looks like it needs a different base — the argv bytes live in
+-- the MAP_FIXED region at 0x20000000, nowhere near the blob — but the argv
+-- marshal packs `(0x20000000 - src_base) + bump`, pre-biasing the offset by
+-- -src_base at emit time, so src_base + start lands in the region. Measured on
+-- greeting_line: packed start 0x1fbffd0b, src_base 0x4002f5, sum exactly
+-- 0x20000000. So this arm needs no origin test, and adding one would be wrong.
 rule x86_stream_node
   @intention: "Stream a texty subtree: write its text reading to fd 1 in order during the walk"
   @source: vexprparse.intent:69
@@ -27425,7 +27443,7 @@ rule x86_stream_node
       AstNeg(inner) => concat(x86_node(bg), b"\x58\xe8", le32(0 - (bg.off + arena_scope(code_size_node(bg)) + 92)))
       AstNot(inner) => b"\xcc"
       AstVar(start, len) => (if param_index(ParamIndexState { params: bg.params, src: bg.src, q_start: start, q_len: len, idx: 0 }) >= 0 then (if param_ty(ParamIndexState { params: bg.params, src: bg.src, q_start: start, q_len: len, idx: 0 }) == 2 then concat(b"\xff\xb5", le32(16 + 8 * (param_list_len(bg.params) - 1 - param_index(ParamIndexState { params: bg.params, src: bg.src, q_start: start, q_len: len, idx: 0 }))), b"\x58\x89\xc2\x48\xc1\xe8\x20\x48\xbe", le64(4194304 + blob_end_off(ProgGenState { rules: bg.prog, src: bg.src, off: 0, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress, conns: bg.conns, rxs: ReactionList::RxNil, svcs: ServiceList::SvNil })), b"\x48\x01\xc6\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05") else concat(x86_node(bg), b"\x58\xe8", le32(0 - (bg.off + arena_scope(code_size_node(bg)) + 92)))) else if let_index(LetIndexState { binds: bg.lets, src: bg.src, q_start: start, q_len: len, idx: 0 }) >= 0 then concat(x86_node(bg), b"\x58\xe8", le32(0 - (bg.off + arena_scope(code_size_node(bg)) + 92))) else b"\xcc")
-      AstField(base, fstart, flen) => concat(x86_node(bg), b"\x58\xe8", le32(0 - (bg.off + arena_scope(code_size_node(bg)) + 92)))
+      AstField(base, fstart, flen) => if ast_field_is_text(StaticConceptState { node: bg.node, src: bg.src, params: bg.params, lets: bg.lets, concepts: bg.concepts }) == 1 then concat(x86_node(bg), b"\x58\x89\xc2\x48\xc1\xe8\x20\x48\xbe", le64(4194304 + blob_end_off(ProgGenState { rules: bg.prog, src: bg.src, off: 0, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress, conns: bg.conns, rxs: ReactionList::RxNil, svcs: ServiceList::SvNil })), b"\x48\x01\xc6\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x0f\x05") else concat(x86_node(bg), b"\x58\xe8", le32(0 - (bg.off + arena_scope(code_size_node(bg)) + 92)))
       AstStr(start, len) => concat(b"\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x48\xbe", le64(4194304 + blob_end_off(ProgGenState { rules: bg.prog, src: bg.src, off: 0, prog: bg.prog, concepts: bg.concepts, sizes: bg.sizes, ress: bg.ress, conns: bg.conns, rxs: ReactionList::RxNil, svcs: ServiceList::SvNil }) + start + 1), b"\x48\xc7\xc2", le32(if len >= 2 then len - 2 else 0), b"\x0f\x05")
       AstBytes(start, len) => if bytelit_decoded_len(DecodeState { src: bg.src, start: start, len: len, i: 0 }) <= 0 then b"" else concat(b"\xe9", le32(4 * ((bytelit_decoded_len(DecodeState { src: bg.src, start: start, len: len, i: 0 }) + 3) / 4)), emit_bytes_data(BytesEmitState { src: bg.src, start: start, len: len, i: 0, dlen: bytelit_decoded_len(DecodeState { src: bg.src, start: start, len: len, i: 0 }) }), b"\x48\xc7\xc0\x01\x00\x00\x00\x48\xc7\xc7\x01\x00\x00\x00\x48\x8d\x35", le32(0 - (21 + 4 * ((bytelit_decoded_len(DecodeState { src: bg.src, start: start, len: len, i: 0 }) + 3) / 4))), b"\x48\xc7\xc2", le32(bytelit_decoded_len(DecodeState { src: bg.src, start: start, len: len, i: 0 })), b"\x0f\x05")
       AstBool(value) => b"\xcc"
@@ -27492,7 +27510,7 @@ rule x86_stream_node
   proofs:
     purity:
       reads : [bg, bg.node, bg.src, bg.off, bg.params, bg.lets, bg.prog, bg.concepts, bg.sizes, bg.ress, bg.conns]
-      calls : [x86_node, code_size_node, x86_stream_node, code_size_stream_node, x86_stream_cargs, x86_stream_dispatch, x86_stream_arms, stream_size_arms, x86_args, code_size_args, param_index, param_ty, param_list_len, let_index, arm_list_len, max_payload_fields, proc_offset, arg_list_len, blob_end_off, span_is_concat, span_is_arena_scope, span_is_abort_if, arg_first, span_is_le32, span_is_le64, span_is_substring, span_is_byte_at, span_is_length, span_is_read, resource_index_of, ast_var_start, ast_var_len, callee_is_texty, bytelit_decoded_len, emit_bytes_data, coll_elem_nfields, lets_append_binders, count_binds, fold_stream_ok, ast_call_args, arg_rest, x86_fold_cargs, fold_size_cargs, x86_elem_load, lets_append_elem_binders, static_concept_of, cd_fields, cd_name_start, cd_name_len, concept_at_index, map_out_nf, x86_map_record, x86_filter_record, span_is_fetch, connection_index_of]
+      calls : [x86_node, code_size_node, x86_stream_node, code_size_stream_node, ast_field_is_text, x86_stream_cargs, x86_stream_dispatch, x86_stream_arms, stream_size_arms, x86_args, code_size_args, param_index, param_ty, param_list_len, let_index, arm_list_len, max_payload_fields, proc_offset, arg_list_len, blob_end_off, span_is_concat, span_is_arena_scope, span_is_abort_if, arg_first, span_is_le32, span_is_le64, span_is_substring, span_is_byte_at, span_is_length, span_is_read, resource_index_of, ast_var_start, ast_var_len, callee_is_texty, bytelit_decoded_len, emit_bytes_data, coll_elem_nfields, lets_append_binders, count_binds, fold_stream_ok, ast_call_args, arg_rest, x86_fold_cargs, fold_size_cargs, x86_elem_load, lets_append_elem_binders, static_concept_of, cd_fields, cd_name_start, cd_name_len, concept_at_index, map_out_nf, x86_map_record, x86_filter_record, span_is_fetch, connection_index_of]
     termination:
       bound : 8000
 

@@ -46010,6 +46010,17 @@ rule pick
         // from verbosec's own binary (10 vs 6 at seed 3) and two of them where
         // verbosec refuses to emit at all. The other 98 binaries are
         // byte-identical (size + sha256) except vexprparse itself.
+        //
+        // 100 -> 100 (streamed text fields): DELIBERATELY NO MOVE, recorded
+        // because the two preceding slices in the same family each cost five
+        // files and the absence of a drop here is the interesting part. Those
+        // two had to refuse something — fresh text has no packed-span
+        // representation, a sum-type node has no serializer. A streamed TEXT
+        // FIELD always has a representation (it is a packed span whatever its
+        // origin, argv region or source blob), so the arm is implementable
+        // with no refusal half. Exactly two binaries changed and both grew by
+        // the predicted (36 - 6) B per streamed text field: greeting_line
+        // 1537 -> 1567, compose 2674 -> 2734. The other 98 are byte-identical.
         const EXPECTED_ACCEPTED: usize = 100;
         const EXPECTED_TOTAL: usize = 151;
 
@@ -46978,6 +46989,154 @@ rule pick
         assert!(ok && len > 0,
             "invoices.verbose (scalar entry) must stay accepted — the 101-byte number \
              trampoline is byte-for-byte untouched by the record branch");
+
+        let _ = fs::remove_file(&gen0);
+        let _ = fs::remove_file(&out_elf);
+    }
+
+    /// The LAST member of the "pointer-ish value rendered as a number at rc 0"
+    /// family, after the Result-payload span (PR #151) and the record-entry
+    /// arena index (PR #152).
+    ///
+    /// x86_stream_node is the WRITER-mode walk: every arm writes its bytes to
+    /// fd 1 in order. Its AstField arm routed EVERY field through the shared
+    /// itoa proc, with no test for the field's declared type — so a TEXT field
+    /// in a streamed position printed its packed (start, len) pair as a
+    /// decimal integer. Measured on examples/greeting_line.verbose
+    /// (greeting_line, argv "Ada" 36):
+    ///
+    ///     verbosec:  Hello Ada, age 36
+    ///     gen0:      Hello 2287825359413968899, age 36     rc 0
+    ///
+    /// 2287825359413968899 == 0x1fbffd0b_00000003: start 0x1fbffd0b, len 3 ==
+    /// len("Ada"). No trap, no diagnostic, exit 0 — the dangerous shape.
+    ///
+    /// The fix mirrors x86_fold_arg's element-field write, which already had
+    /// the exact lowering (a sibling emitter, so this is wiring, not new
+    /// machinery — the same shape PR #152 turned out to have): dispatch the
+    /// arm on ast_field_is_text and emit code_size_node + 36 bytes of
+    /// `pop rax ; mov edx,eax ; shr rax,32 ; movabs rsi, src_base ;
+    /// add rsi,rax ; write(1, rsi, len)` instead of the 6-byte itoa call.
+    /// code_size_stream_node's AstField arm moves identically — that pair is
+    /// the two-walk drift edge, and a split desyncs every downstream offset.
+    ///
+    /// ONE BASE SERVES BOTH TEXT ORIGINS, which is the part worth writing down
+    /// because it looks false. PR #151's spans pointed into the embedded
+    /// SOURCE BLOB; these point into the argv MAP_FIXED region at 0x20000000,
+    /// nowhere near the blob. But the argv marshal packs
+    /// `(0x20000000 - src_base) + bump`, pre-biasing by -src_base at emit
+    /// time, so `src_base + start` resolves BOTH. Measured on the greeting_line
+    /// binary: src_base 0x4002f5 (the blob begins at file offset 0x2f5 with
+    /// "@verbose 0.1.0", and the emitted `movabs rsi, 0x400574` for the
+    /// "Hello " literal is src_base + 639 == its byte offset in the source),
+    /// and 0x4002f5 + 0x1fbffd0b == 0x20000000 exactly. So this arm needs no
+    /// origin test, and adding one would be a bug.
+    ///
+    /// No refusal half: unlike the Result and record slices, there is no
+    /// representation this arm cannot serve — a text field is always a packed
+    /// span, whatever its origin. The family closes here.
+    ///
+    /// Verified to FAIL pre-change on both cases (greeting_line printed one
+    /// decimal span, compose printed two).
+    #[test]
+    #[ignore = "builds gen0 from the full self-source (~20 s) + needs `ulimit -s unlimited`; run with --ignored"]
+    #[cfg(target_arch = "x86_64")]
+    fn two_generation_gen0_emits_streamed_text_fields_correctly() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        let src = fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+        let gen0 = std::env::temp_dir().join("verbosec_test_stx_gen0");
+        compile_native_stdin_raw(&program, "elf_program_src", gen0.to_str().unwrap())
+            .expect("elf_program_src must compile --stdin-raw");
+        let mut perms = fs::metadata(&gen0).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&gen0, perms).unwrap();
+
+        let out_elf = std::env::temp_dir().join("verbosec_test_stx_out.elf");
+
+        // greeting_line: ONE text field between two literals and a number, so
+        // the arm is pinned adjacent to both neighbouring lowerings (AstStr's
+        // write and the itoa call) — a wrong byte count in the new arm shifts
+        // them and the line comes out garbled rather than merely wrong.
+        //
+        // compose::display_name: TWO text fields in one concat, which pins the
+        // walk's offset accounting across a repeat of the arm. Its argv is
+        // THREE values, not two: the trampoline reads one argv per field of the
+        // input CONCEPT (Person = first, last, age), not per field the rule
+        // reads — display_name never touches `age` but must still be given it.
+        let cases: &[(&str, &str, &[&[&str]])] = &[
+            ("greeting_line", "greeting_line", &[&["Ada", "36"], &["Bo", "0"]]),
+            ("compose", "display_name", &[&["Ada", "Lovelace", "36"]]),
+        ];
+
+        for (name, rule, argvs) in cases {
+            let path = std::path::PathBuf::from(format!("examples/{name}.verbose"));
+            let status = Command::new("sh").arg("-c").arg(format!(
+                "ulimit -s unlimited; '{}' 0 < '{}' > '{}' 2>/dev/null",
+                gen0.display(), path.display(), out_elf.display()))
+                .status().expect("run gen0");
+            assert!(status.success() && fs::metadata(&out_elf).unwrap().len() > 0,
+                "{name}.verbose: gen0 must ACCEPT a streamed text field — there is no \
+                 refusal half in this slice, a text field is always a packed span");
+
+            let gen0_bin = std::env::temp_dir().join(format!("verbosec_test_stx_{name}"));
+            fs::copy(&out_elf, &gen0_bin).unwrap();
+            let mut perms = fs::metadata(&gen0_bin).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&gen0_bin, perms).unwrap();
+
+            let psrc = fs::read_to_string(&path).unwrap();
+            let ptok = crate::lexer::Lexer::new(&psrc).tokenize().unwrap();
+            let pprog = crate::parser::Parser::new(ptok).parse_program().unwrap();
+            let vref = std::env::temp_dir().join(format!("verbosec_test_stx_{name}_ref"));
+            compile_native(&pprog, rule, vref.to_str().unwrap(), false, false)
+                .expect("verbosec must compile the text-output entry");
+            let mut perms = fs::metadata(&vref).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&vref, perms).unwrap();
+
+            for argv in *argvs {
+                let got = Command::new(&gen0_bin).args(*argv).output().unwrap();
+                let want = Command::new(&vref).args(*argv).output().unwrap();
+                assert!(got.status.code().is_some(),
+                    "{name} {argv:?}: gen0-emitted binary died on a SIGNAL ({:?})",
+                    got.status);
+                let got_out = String::from_utf8_lossy(&got.stdout).to_string();
+
+                // The load-bearing assertion. Pre-change this was a decimal
+                // packed span. Stated as an explicit anti-assertion first so a
+                // future regression names the defect rather than showing a diff.
+                assert!(
+                    !got_out.split(|c: char| !c.is_ascii_digit())
+                        .any(|t| t.len() >= 18 && t.parse::<u64>().map(|v| (v >> 32) > 0x1000).unwrap_or(false)),
+                    "{name} {argv:?}: gen0 printed what looks like a PACKED SPAN as a \
+                     decimal ({got_out:?}). A text field must be dereferenced through \
+                     src_base + start and written, never itoa'd.");
+                assert_eq!(got_out, String::from_utf8_lossy(&want.stdout),
+                    "{name} {argv:?}: gen0's stdout must be verbosec's exact bytes");
+                assert_eq!(got.status.code(), want.status.code(),
+                    "{name} {argv:?}: exit code must match");
+            }
+            let _ = fs::remove_file(&gen0_bin);
+            let _ = fs::remove_file(&vref);
+        }
+
+        // Guard: a NUMBER field in the same streamed position still takes the
+        // itoa call. greeting_line's `p.age` covers it inline above, but
+        // roster_line is the fold-shaped sibling — it streams number fields
+        // through x86_fold_arg, whose text branch this arm was copied from, so
+        // a mistake that widened the predicate would show up here.
+        let status = Command::new("sh").arg("-c").arg(format!(
+            "ulimit -s unlimited; '{}' 0 < 'examples/roster.verbose' > '{}' 2>/dev/null",
+            gen0.display(), out_elf.display()))
+            .status().expect("run gen0");
+        assert!(status.success() && fs::metadata(&out_elf).unwrap().len() > 0,
+            "roster.verbose must stay accepted — the number path is untouched");
 
         let _ = fs::remove_file(&gen0);
         let _ = fs::remove_file(&out_elf);
