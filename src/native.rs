@@ -24880,8 +24880,14 @@ rule le64_neg
              1025, "8398da38d096f3aa6470f9ce94cd64c3e7d0a1a1c3976655041972fa389aac53"),
             (880,  "1ccf2f3584b02a673aa67a632fa6b4199c088d2c2e4897e07453f5732a9b421e",
              1006, "97910d98772c6e1af7c95aa72da8c3c5e3689f5718a44575fd713a9960dfbda8"),
-            (1280, "dcf91b84a089c2d237bd5829b3cd4cb31aa6d74f9bd749fa5dbbda5e0be3b796",
-             1454, "694a3a505fdd90abf4c189518ee24ab80f324b234a0a272c4296aa77b0f861ab"),
+            // s3 re-pinned +53 by the text-equality slice (2026-08-08): its handler
+            // rule body carries `req.path == "/"`, and every rule is ALSO emitted as
+            // a proc (the service trampoline is closed, so that proc is unreachable —
+            // but it is present and it grew). 65 B for the packed-span byte compare
+            // in place of the 12 B integer compare. s1/s2/s4 have no `==` and are
+            // byte-identical, which is what localises the change to this one shape.
+            (1333, "a7fbcbc17588fdc5b43fbe3c3b40d95bbb847a8ce5d582a223781b0ff32dcbb3",
+             1507, "4f44de23eda08529485a9e4f6a1665e3427c43d46ad0c9bf585d815d3a6553f9"),
             (1274, "89b6b2752bc9f8665feee9f8ef43e39677d71400292ee0a99cf243e9a3584fa5",
              1448, "97ebed0955e727a247518c986ef6f22283d75d9d79d8336b18564fd58c055483"),
         ];
@@ -25711,9 +25717,15 @@ rule le64_neg
             ("s2", "", 880, "1ccf2f3584b02a673aa67a632fa6b4199c088d2c2e4897e07453f5732a9b421e"),
             ("s2", "static", 1006, "97910d98772c6e1af7c95aa72da8c3c5e3689f5718a44575fd713a9960dfbda8"),
             ("s2", "field", 1092, "f90d706fa496a725c0c530b020e83a0b3addfce986c17326f6c46ea253a60b64"),
-            ("s3", "", 1276, "5d462b7aa590bcbd05ab16147e74196f346dbe29b9123c1cc2a96074ef12c055"),
-            ("s3", "static", 1450, "b3bf58d6f2b8506bc119506591f3b44a7328094c3cbe3321b0be793bb03090ac"),
-            ("s3", "field", 1568, "0b0c913b57220e0ae0d0136cc3a92649cef37c7485ec1cd17b0e12cafc282142"),
+            // The three s3 rows are re-pinned +53 each by the text-equality slice
+            // (2026-08-08): s3's handler body is the only shape here carrying a
+            // `req.path == "/"`, and its emitted proc now uses the 65-byte
+            // packed-span byte compare instead of the 12-byte integer compare. The
+            // eight non-s3 rows are byte-identical to the pre-S8 capture, which is
+            // what keeps this table a backward-compat pin rather than a snapshot.
+            ("s3", "", 1329, "428fd712cdba0ee8557fae9153d65df3c397fc79d934497e07f37e1c264f0df7"),
+            ("s3", "static", 1503, "7a05324e373a1bc452fc1dabf6d2924c25ff2c49178ad859e42669f726f2459b"),
+            ("s3", "field", 1621, "87799a2ca23dfe34eee240015955f64cfaaf1649cb6b2eb17026c419d5e6d065"),
             ("s4", "", 1270, "e02614cca202fc60bf1c673b6937069be4f66207fa6c85bbc7389532312d4e03"),
             ("s4", "static", 1444, "da30301a688b6b0d49207e3a2e0d1e11b314d5702882c0dc47f95bf3eac85180"),
             ("s4", "field", 1562, "9291eef4fe9d6555759fb667a5c316a3bdb47346c60c05a40de557a754e36969"),
@@ -47333,6 +47345,142 @@ rule pick
         assert_eq!(run(&fact_g0, &["5"]).0, b"120\n", "factorial 5 == 120");
 
         for p in [&gen0, &out_elf, &inv_g0, &inv_vb, &lay_g0, &lay_vb, &fact_g0, &fact_vb] {
+            let _ = fs::remove_file(p);
+        }
+    }
+
+    /// gen0's TEXT EQUALITY (2026-08-08). `<text> == <text>` used to take the
+    /// integer compare — `cmp rax, rcx ; sete al` over two packed (start, len)
+    /// spans. Two spans are integer-equal only when they name the SAME bytes at
+    /// the same offset, so a field span (argv, marshalled into the fixed region)
+    /// against a literal span (the embedded source blob) was ALWAYS unequal:
+    /// `c.status == "active"` returned false for input "active", at rc 0, with
+    /// no diagnostic.
+    ///
+    /// THE DETECTION LESSON, and the reason this test asserts BOTH arms: the
+    /// defect is CORRECT ON HALF THE INPUT SPACE. Non-matching strings genuinely
+    /// are false, and a differential sweep over arbitrary inputs practically
+    /// never generates a matching pair — every sweep scored these files as
+    /// agreeing. A false-only assertion passes against a stuck-false emitter, so
+    /// each case below runs a MATCHING and a NON-MATCHING input.
+    ///
+    /// What is pinned:
+    ///   (a) `clients::active_client` — `c.status == "active"`, the literal-RHS
+    ///       form, differentially against verbosec on both arms.
+    ///   (b) `allowlist::is_authorized` — `req.tag == read(allowed_tag)`, the
+    ///       runtime-loaded-RHS form (the resource fixture is written here, so
+    ///       the read() path is actually exercised rather than failing closed
+    ///       on a missing file and matching verbosec trivially).
+    ///   (c) the guard: `factorial::fact`, a NUMBER `==` (`n.v == 0`), must keep
+    ///       the 12-byte integer compare. The text branch sits immediately
+    ///       before it in both the size and emit chains, so a predicate that
+    ///       widened by one shape would capture it.
+    ///
+    /// Verified to FAIL pre-change on (a) and (b): gen0 printed `false` for the
+    /// matching input in both.
+    #[test]
+    #[ignore = "builds gen0 from the full self-source (~20 s) + needs `ulimit -s unlimited`; run with --ignored"]
+    #[cfg(target_arch = "x86_64")]
+    fn two_generation_gen0_evaluates_text_equality() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        let src = fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+        let gen0 = std::env::temp_dir().join("verbosec_test_texteq_gen0");
+        compile_native_stdin_raw(&program, "elf_program_src", gen0.to_str().unwrap())
+            .expect("elf_program_src must compile --stdin-raw");
+        let chmod = |p: &std::path::Path| {
+            let mut perms = fs::metadata(p).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(p, perms).unwrap();
+        };
+        chmod(&gen0);
+        let out_elf = std::env::temp_dir().join("verbosec_test_texteq_out.elf");
+
+        let emit = |name: &str| -> std::path::PathBuf {
+            let status = Command::new("sh").arg("-c").arg(format!(
+                "ulimit -s unlimited; '{}' 0 < 'examples/{name}.verbose' > '{}' 2>/dev/null",
+                gen0.display(), out_elf.display()))
+                .status().expect("run gen0");
+            assert!(status.success() && fs::metadata(&out_elf).unwrap().len() > 0,
+                "{name}.verbose: gen0 must ACCEPT it — this slice is a codegen \
+                 change, it must not move corpus acceptance");
+            let bin = std::env::temp_dir().join(format!("verbosec_test_texteq_{name}"));
+            fs::copy(&out_elf, &bin).unwrap();
+            chmod(&bin);
+            bin
+        };
+        let reference = |name: &str, rule: &str| -> std::path::PathBuf {
+            let psrc = fs::read_to_string(format!("examples/{name}.verbose")).unwrap();
+            let ptok = crate::lexer::Lexer::new(&psrc).tokenize().unwrap();
+            let pprog = crate::parser::Parser::new(ptok).parse_program().unwrap();
+            let bin = std::env::temp_dir().join(format!("verbosec_test_texteq_{name}_ref"));
+            compile_native(&pprog, rule, bin.to_str().unwrap(), false, false)
+                .expect("verbosec must compile the entry");
+            chmod(&bin);
+            bin
+        };
+        let run = |bin: &std::path::Path, argv: &[&str]| -> (Vec<u8>, Option<i32>) {
+            let o = Command::new(bin).args(argv).output().expect("run emitted binary");
+            assert!(o.status.code().is_some(),
+                "{bin:?} {argv:?}: binary died on a SIGNAL ({:?})", o.status);
+            (o.stdout, o.status.code())
+        };
+
+        // ---- (a) literal RHS. `active` MATCHES; `frozen` does not. The
+        // matching arm is the one that was wrong — assert it FIRST so a
+        // regression reports the real defect, not a downstream symptom.
+        let cli_g0 = emit("clients");
+        let cli_vb = reference("clients", "active_client");
+        let (got, _) = run(&cli_g0, &["C1", "active", "5"]);
+        assert_eq!(got, b"true\n",
+            "clients `c.status == \"active\"` with status=active must be TRUE. \
+             gen0 printing `false` here is the packed-span integer compare: two \
+             spans naming the same BYTES at different OFFSETS are never i64-equal.");
+        let (got, _) = run(&cli_g0, &["C1", "frozen", "5"]);
+        assert_eq!(got, b"false\n",
+            "clients status=frozen must be FALSE — a byte compare that always \
+             says `true` is the mirror defect of the one this slice fixes");
+        // Differential on stdout for both arms (the exit code carries the known
+        // bool-rc divergence, pinned by two_generation_gen0_formats_bool_outputs).
+        for argv in [["C1", "active", "5"], ["C1", "frozen", "5"]] {
+            assert_eq!(run(&cli_g0, &argv).0, run(&cli_vb, &argv).0,
+                "clients {argv:?}: gen0's stdout must be verbosec's exact bytes");
+        }
+
+        // ---- (b) read() RHS. Write the fixture so the read path is EXERCISED:
+        // with the file missing both binaries fail closed and match trivially,
+        // which is precisely how the sweep scored this file as agreeing.
+        fs::write("/tmp/verbose_allowed_tag.txt", b"internal")
+            .expect("write the allowlist resource fixture");
+        let alw_g0 = emit("allowlist");
+        let alw_vb = reference("allowlist", "is_authorized");
+        let (got, _) = run(&alw_g0, &["internal"]);
+        assert_eq!(got, b"true\n",
+            "allowlist `req.tag == read(allowed_tag)` with tag == the file's \
+             contents must be TRUE");
+        let (got, _) = run(&alw_g0, &["external"]);
+        assert_eq!(got, b"false\n", "allowlist tag != the file's contents must be FALSE");
+        for argv in [["internal"], ["external"]] {
+            assert_eq!(run(&alw_g0, &argv).0, run(&alw_vb, &argv).0,
+                "allowlist {argv:?}: gen0's stdout must be verbosec's exact bytes");
+        }
+
+        // ---- (c) the guard: a NUMBER `==` keeps the integer compare.
+        let fact_g0 = emit("factorial");
+        let fact_vb = reference("factorial", "fact");
+        for argv in [["0"], ["5"], ["10"]] {
+            assert_eq!(run(&fact_g0, &argv), run(&fact_vb, &argv),
+                "factorial {argv:?}: `n.v == 0` is a NUMBER equality and must stay \
+                 on the 12-byte integer compare");
+        }
+        assert_eq!(run(&fact_g0, &["5"]).0, b"120\n", "factorial 5 == 120");
+
+        for p in [&gen0, &out_elf, &cli_g0, &cli_vb, &alw_g0, &alw_vb, &fact_g0, &fact_vb] {
             let _ = fs::remove_file(p);
         }
     }
