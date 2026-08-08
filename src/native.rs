@@ -46021,6 +46021,22 @@ rule pick
         // with no refusal half. Exactly two binaries changed and both grew by
         // the predicted (36 - 6) B per streamed text field: greeting_line
         // 1537 -> 1567, compose 2674 -> 2734. The other 98 are byte-identical.
+        //
+        // 100 -> 100 (bool-output formatting): NO MOVE, and for a stronger
+        // reason than last time — this slice changes only which TRAMPOLINE a
+        // bool entry gets, never whether gen0 accepts. A bool-declared entry
+        // was falling through to the 101-byte NUMBER trampoline and being
+        // itoa'd (invoices::important_invoice printed `1`/`0` where verbosec
+        // prints `true`/`false`); entry_rule_bool now selects a 79-byte
+        // two-arm write. Unlike the Result/record slices there is nothing to
+        // refuse: 0/1 in rax is always renderable. Exactly TEN binaries moved,
+        // each by exactly 101 - 79 = -22 B (access_check alert allowlist bonus
+        // clients collections invoices layers logs priv_failure); the other 89
+        // are byte-identical by sha256, and none changed bytes while keeping
+        // its size. audit_log / audit_simple have bool entries too but take
+        // the REACTION trampoline, which precedes the entry cascade, so they
+        // correctly did not move. The exit code is deliberately NOT part of
+        // the slice — see the note under CLAUDE.md's gaps table.
         const EXPECTED_ACCEPTED: usize = 100;
         const EXPECTED_TOTAL: usize = 151;
 
@@ -47140,6 +47156,185 @@ rule pick
 
         let _ = fs::remove_file(&gen0);
         let _ = fs::remove_file(&out_elf);
+    }
+
+    /// gen0 must FORMAT a `bool` output as `true` / `false`, not as `1` / `0`.
+    ///
+    /// The last-identified divergence family from the post-#153 differential,
+    /// and — unlike the three silent-wrong-answer slices before it — a
+    /// FIDELITY bug, not a safety one. Nothing crashes and nothing lies about
+    /// success; `1` is a truthful rendering of the value in rax. But a program
+    /// compiled by gen0 must behave identically to one compiled by verbosec,
+    /// and ten corpus binaries did not:
+    ///
+    ///   examples/invoices.verbose::important_invoice
+    ///     amount=15000   verbosec `true`  rc 0    gen0 `1` rc 0
+    ///     amount=500     verbosec `false` rc 0    gen0 `0` rc 0
+    ///
+    /// Cause: a bool-declared entry returns 0/1 in rax and no `entry_rule_*`
+    /// branch claimed it, so it fell through to the 101-byte NUMBER trampoline
+    /// and got itoa'd. Fix: `entry_rule_bool` (declared type, `rd_out_ty == 1`
+    /// — parse_fields already ran `type_code_of_span`, which maps "bool" and
+    /// only "bool" to 1) selects a 79-byte two-arm write instead.
+    ///
+    /// EXIT CODES ARE DELIBERATELY OUT OF SCOPE, and the last case below PINS
+    /// the divergence that leaves rather than papering over it. verbosec is
+    /// internally inconsistent here: `emit_full_program` and
+    /// `emit_self_recursive_program` set exit_flag=1 on a false result, while
+    /// `emit_vectorized_program` / `emit_fold_program` /
+    /// `emit_multi_fold_program` / `emit_parallel_program` /
+    /// `emit_collection_program` all exit 0. Which one claims a rule depends on
+    /// the `vectorizable` hint — a block gen0 SKIPS WHOLESALE (see CLAUDE.md's
+    /// gaps table) — so gen0 cannot match both and cannot reliably match
+    /// either. It keeps the number trampoline's exit 0. `invoices` carries the
+    /// hint, so it routes to the SIMD emitter and agrees on BOTH stdout and rc;
+    /// `layers` does not, so it agrees on stdout and differs on rc when false.
+    /// Closing that gap means teaching gen0 the hint or making verbosec
+    /// consistent — a decision about verbosec's semantics, not about gen0's
+    /// fidelity to them.
+    ///
+    /// Four properties, each of which could regress alone:
+    ///   (a) TRUE renders as exactly `true\n` — byte-compared, so a missing or
+    ///       doubled newline fails (the two arms write different lengths, 5 and
+    ///       6, from one shared write, which is where an off-by-one would sit);
+    ///   (b) FALSE renders as exactly `false\n` — the longer arm, and the one
+    ///       reached by falling through the `jz`, so a wrong rel8 lands here;
+    ///   (c) an explicit ANTI-assertion that the output is not a bare integer,
+    ///       so a future regression names the defect instead of showing a diff;
+    ///   (d) a NUMBER-output entry still itoa's. `factorial::fact` is the guard:
+    ///       the new branch sits immediately before the 101 fallback, so a
+    ///       predicate that widened by one type code would swallow it.
+    ///
+    /// Verified to FAIL pre-change on (a), (b) and (c) — gen0 printed `1`/`0`.
+    #[test]
+    #[ignore = "builds gen0 from the full self-source (~20 s) + needs `ulimit -s unlimited`; run with --ignored"]
+    #[cfg(target_arch = "x86_64")]
+    fn two_generation_gen0_formats_bool_outputs_as_true_false() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        let src = fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+        let gen0 = std::env::temp_dir().join("verbosec_test_bool_gen0");
+        compile_native_stdin_raw(&program, "elf_program_src", gen0.to_str().unwrap())
+            .expect("elf_program_src must compile --stdin-raw");
+        let chmod = |p: &std::path::Path| {
+            let mut perms = fs::metadata(p).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(p, perms).unwrap();
+        };
+        chmod(&gen0);
+        let out_elf = std::env::temp_dir().join("verbosec_test_bool_out.elf");
+
+        // gen0-compile `examples/<name>.verbose` and hand back the binary.
+        let emit = |name: &str| -> std::path::PathBuf {
+            let status = Command::new("sh").arg("-c").arg(format!(
+                "ulimit -s unlimited; '{}' 0 < 'examples/{name}.verbose' > '{}' 2>/dev/null",
+                gen0.display(), out_elf.display()))
+                .status().expect("run gen0");
+            assert!(status.success() && fs::metadata(&out_elf).unwrap().len() > 0,
+                "{name}.verbose: gen0 must ACCEPT it — this slice is a formatting \
+                 change, it must not move corpus acceptance");
+            let bin = std::env::temp_dir().join(format!("verbosec_test_bool_{name}"));
+            fs::copy(&out_elf, &bin).unwrap();
+            chmod(&bin);
+            bin
+        };
+        // verbosec-compile the same entry, for the differential.
+        let reference = |name: &str, rule: &str| -> std::path::PathBuf {
+            let psrc = fs::read_to_string(format!("examples/{name}.verbose")).unwrap();
+            let ptok = crate::lexer::Lexer::new(&psrc).tokenize().unwrap();
+            let pprog = crate::parser::Parser::new(ptok).parse_program().unwrap();
+            let bin = std::env::temp_dir().join(format!("verbosec_test_bool_{name}_ref"));
+            compile_native(&pprog, rule, bin.to_str().unwrap(), false, false)
+                .expect("verbosec must compile the entry");
+            chmod(&bin);
+            bin
+        };
+        let run = |bin: &std::path::Path, argv: &[&str]| -> (Vec<u8>, Option<i32>) {
+            let o = Command::new(bin).args(argv).output().expect("run emitted binary");
+            assert!(o.status.code().is_some(),
+                "{bin:?} {argv:?}: binary died on a SIGNAL ({:?})", o.status);
+            (o.stdout, o.status.code())
+        };
+
+        // ---- invoices: the pin. Both stdout AND rc must match, on both arms.
+        // `vectorizable` routes verbosec to the SIMD emitter, which exits 0
+        // regardless of the result, so this file agrees completely.
+        let inv_g0 = emit("invoices");
+        let inv_vb = reference("invoices", "important_invoice");
+        for (argv, want) in [(["15000"], &b"true\n"[..]), (["500"], &b"false\n"[..])] {
+            let (got_out, got_rc) = run(&inv_g0, &argv);
+            let (ref_out, ref_rc) = run(&inv_vb, &argv);
+
+            // (c) the anti-assertion, stated before the diff so a regression
+            // names the defect: a bool must never come out as a bare integer.
+            let trimmed = String::from_utf8_lossy(&got_out).trim().to_string();
+            assert!(trimmed.parse::<i64>().is_err(),
+                "invoices {argv:?}: gen0 printed a bare integer ({trimmed:?}) for a \
+                 `bool` output. A declared bool must render as `true` / `false`, \
+                 never as the 0/1 sitting in rax.");
+
+            // (a) + (b) byte-exact, including the trailing newline.
+            assert_eq!(got_out, want,
+                "invoices {argv:?}: gen0 must emit exactly {:?}", String::from_utf8_lossy(want));
+            assert_eq!(got_out, ref_out,
+                "invoices {argv:?}: gen0's stdout must be verbosec's exact bytes");
+            assert_eq!(got_rc, ref_rc,
+                "invoices {argv:?}: exit code must match (this file routes verbosec \
+                 to the SIMD emitter, which exits 0 on both arms)");
+        }
+
+        // ---- layers: a SECOND program, so the arm is not pinned to one
+        // binary's layout, and a two-field concept (number + text) so the
+        // trampoline runs after a marshal that pushed more than one slot.
+        let lay_g0 = emit("layers");
+        let lay_vb = reference("layers", "is_bulk");
+
+        // TRUE: full agreement, same as invoices.
+        let (got_out, got_rc) = run(&lay_g0, &["5000", "gold"]);
+        let (ref_out, ref_rc) = run(&lay_vb, &["5000", "gold"]);
+        assert_eq!(got_out, b"true\n", "layers true-arm bytes");
+        assert_eq!((got_out, got_rc), (ref_out, ref_rc), "layers true-arm must fully agree");
+
+        // FALSE: stdout must agree; the EXIT CODE is the KNOWN, DELIBERATE
+        // divergence documented above. Pinned in both directions so neither
+        // side can drift silently — if this assert ever fails, verbosec's
+        // emitter choice or gen0's exit posture changed, and the banner on
+        // `entry_rule_bool` in examples/vexprparse.verbose needs revisiting.
+        let (got_out, got_rc) = run(&lay_g0, &["7", "gold"]);
+        let (ref_out, ref_rc) = run(&lay_vb, &["7", "gold"]);
+        assert_eq!(got_out, b"false\n", "layers false-arm bytes");
+        assert_eq!(got_out, ref_out,
+            "layers false-arm: stdout must be verbosec's exact bytes — the FORMAT \
+             is what this slice fixes");
+        assert_eq!((got_rc, ref_rc), (Some(0), Some(1)),
+            "layers false-arm: the KNOWN exit-code divergence. verbosec's \
+             emit_full_program sets exit_flag=1 on false; gen0 keeps the number \
+             trampoline's exit 0 because the emitter verbosec picks is chosen by \
+             the `vectorizable` hint, which gen0 skips wholesale. If this changed, \
+             update the entry_rule_bool banner in examples/vexprparse.verbose.");
+
+        // ---- (d) the guard: a NUMBER output still itoa's. The bool branch
+        // sits immediately before the 101 fallback, so a predicate that
+        // widened by one type code would capture this and print `true`.
+        let fact_g0 = emit("factorial");
+        let fact_vb = reference("factorial", "fact");
+        for argv in [["0"], ["5"], ["10"]] {
+            let (got_out, got_rc) = run(&fact_g0, &argv);
+            let (ref_out, ref_rc) = run(&fact_vb, &argv);
+            assert_eq!((got_out.clone(), got_rc), (ref_out, ref_rc),
+                "factorial {argv:?}: a NUMBER-output entry must still take the itoa \
+                 trampoline — got {:?}", String::from_utf8_lossy(&got_out));
+        }
+        assert_eq!(run(&fact_g0, &["5"]).0, b"120\n", "factorial 5 == 120");
+
+        for p in [&gen0, &out_elf, &inv_g0, &inv_vb, &lay_g0, &lay_vb, &fact_g0, &fact_vb] {
+            let _ = fs::remove_file(p);
+        }
     }
 
     /// THE COMPOSITE DEMO (2026-07): examples/expense_audit.verbose — a
