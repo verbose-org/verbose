@@ -4022,6 +4022,111 @@ fn emit_record_loop_epilogue(code: &mut Vec<u8>, ctx: &RecordLoopCtx<'_>) {
     }
 }
 
+/// Where a bool-producing program keeps its sticky exit flag.
+///
+/// See `emit_bool_arms` for the contract. Two shapes exist because
+/// `emit_vectorized_program` is the one bool emitter with no rbp frame at
+/// all — it never executes `push rbp`, so it has no slot to write to.
+#[derive(Clone, Copy)]
+enum BoolExitFlag {
+    /// An rbp-relative slot, initialised to 0 by the prologue. Every emitter
+    /// with a standard `push rbp ; mov rbp, rsp ; sub rsp, frame` prologue.
+    Slot(i32),
+    /// `r10`. `emit_vectorized_program` has no rbp frame; r10 is the one
+    /// register that emitter never touches (it uses r12/r13/r14/r15/rbx/r8
+    /// plus the ephemerals), and Linux syscalls preserve it — `write` only
+    /// clobbers rax, rcx and r11. Zeroed at setup, set to 1 on a false arm.
+    R10,
+}
+
+/// **THE BOOL EXIT-CODE CONTRACT (language semantics, not an emitter detail).**
+///
+/// A program whose rule produces `bool` values exits **1 if it printed at
+/// least one `false`**, and **0 otherwise**. The flag is *sticky*: a
+/// multi-record run that prints `true false true` exits 1, because at least
+/// one answer was false. That makes a bool binary directly usable as a shell
+/// predicate — `if ./check "$x"; then …` — which is the whole point of
+/// giving it an exit code at all.
+///
+/// This helper is the SINGLE implementation of the two-arm printer. Every
+/// bool-writing emitter calls it, so "all bool sites agree" is mechanically
+/// true rather than a coincidence of seven hand-copied blocks. It used to be
+/// exactly that coincidence, and it had drifted: only `emit_full_program` and
+/// `emit_self_recursive_program` set the flag, so on the same `false` result
+/// `examples/invoices.verbose` (the `vectorizable` hint routes it to
+/// `emit_vectorized_program`) exited 0 while `examples/alert.verbose`
+/// (unhinted, `emit_full_program`) exited 1. An optimization hint decided
+/// observable behaviour, which the project's own rules forbid.
+///
+/// The caller must have just emitted a `test`/`cmp` whose ZF selects the arm:
+/// **ZF=1 → false, ZF=0 → true** (i.e. the usual `test al, al` after a
+/// predicate leaves 0/1 in rax, or `test r8b, imm` over a SIMD mask).
+///
+/// Emitted shape — byte-for-byte what `emit_full_program` emitted before this
+/// helper existed, so the two already-correct emitters stay bit-identical:
+/// ```text
+///   jz  .false            ; rel8
+///   <write "true\n">
+///   jmp .after            ; rel8
+/// .false:
+///   <write "false\n">
+///   <set the exit flag>   ; Slot: mov qword [rbp+disp32], 1  |  R10: mov r10b, 1
+/// .after:
+/// ```
+/// Both jumps stay rel8: the widest arm is 31 bytes of write plus an 11-byte
+/// flag store, well inside ±127.
+fn emit_bool_arms(code: &mut Vec<u8>, flag: BoolExitFlag) {
+    code.push(0x74); // jz .false
+    let false_patch = code.len();
+    code.push(0x00);
+    emit_write_string(code, b"true\n");
+    code.push(0xEB); // jmp .after
+    let after_patch = code.len();
+    code.push(0x00);
+    let false_pos = code.len();
+    code[false_patch] = (false_pos - false_patch - 1) as u8;
+    emit_write_string(code, b"false\n");
+    match flag {
+        // mov qword [rbp + disp32], 1 — always disp32, matching the encoding
+        // `emit_full_program` has emitted since Phase 0.
+        BoolExitFlag::Slot(off) => {
+            code.extend_from_slice(&[0x48, 0xC7, 0x85]);
+            code.extend_from_slice(&off.to_le_bytes());
+            code.extend_from_slice(&[0x01, 0x00, 0x00, 0x00]);
+        }
+        // mov r10b, 1 — r10 was zeroed at setup, so the low-byte store
+        // leaves the full register at exactly 1.
+        BoolExitFlag::R10 => code.extend_from_slice(&[0x41, 0xB2, 0x01]),
+    }
+    let after_pos = code.len();
+    code[after_patch] = (after_pos - after_patch - 1) as u8;
+}
+
+/// `mov qword [rbp + disp32], 0` — the exit flag's initial state, emitted by
+/// the prologue of every rbp-framed bool emitter (before any `fork`, so a
+/// forked child inherits a cleared flag).
+fn emit_bool_exit_flag_init(code: &mut Vec<u8>, slot: i32) {
+    code.extend_from_slice(&[0x48, 0xC7, 0x85]);
+    code.extend_from_slice(&slot.to_le_bytes());
+    code.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+}
+
+/// `mov qword [rbp + disp32], 1` — 11 bytes, the same store `emit_bool_arms`
+/// puts on its false arm. Used by `emit_parallel_program` to raise the flag
+/// after folding in a forked child's wait status.
+fn emit_bool_exit_flag_set_one(code: &mut Vec<u8>, slot: i32) {
+    code.extend_from_slice(&[0x48, 0xC7, 0x85]);
+    code.extend_from_slice(&slot.to_le_bytes());
+    code.extend_from_slice(&[0x01, 0x00, 0x00, 0x00]);
+}
+
+/// `mov rdi, [rbp + disp32]` — load the exit flag as `sys_exit`'s status,
+/// replacing the `xor rdi, rdi` (a hard-coded 0) that non-bool programs keep.
+fn emit_bool_exit_flag_to_rdi(code: &mut Vec<u8>, slot: i32) {
+    code.extend_from_slice(&[0x48, 0x8B, 0xBD]);
+    code.extend_from_slice(&slot.to_le_bytes());
+}
+
 fn emit_full_program<'a>(
     rule: &'a Rule,
     concept: &'a Concept,
@@ -4068,24 +4173,10 @@ fn emit_full_program<'a>(
 
     // Print result per record
     if is_bool {
-        // rax = 0 or 1
+        // rax = 0 or 1 — the shared two-arm printer sets the sticky exit
+        // flag on the false arm (see `emit_bool_arms` for the contract).
         code.extend_from_slice(&[0x84, 0xC0]); // test al, al
-        code.push(0x74); // jz .print_false
-        let pf_patch = code.len();
-        code.push(0x00);
-        emit_write_string(&mut code, b"true\n");
-        code.push(0xEB); // jmp .after_print
-        let ap_patch = code.len();
-        code.push(0x00);
-        let pf_pos = code.len();
-        code[pf_patch] = (pf_pos - pf_patch - 1) as u8;
-        emit_write_string(&mut code, b"false\n");
-        // Set exit flag to 1 on false
-        code.extend_from_slice(&[0x48, 0xC7, 0x85]); // mov qword [rbp + exit_flag_slot], 1
-        code.extend_from_slice(&ctx.exit_flag_slot.to_le_bytes());
-        code.extend_from_slice(&[0x01, 0x00, 0x00, 0x00]);
-        let ap_pos = code.len();
-        code[ap_patch] = (ap_pos - ap_patch - 1) as u8;
+        emit_bool_arms(&mut code, BoolExitFlag::Slot(ctx.exit_flag_slot));
     } else {
         emit_itoa_inline(&mut code);
     }
@@ -4339,22 +4430,8 @@ fn emit_self_recursive_program<'a>(
 
     // Print result — mirrors emit_full_program / emit_text_program.
     if is_bool {
-        code.extend_from_slice(&[0x84, 0xC0]);
-        code.push(0x74);
-        let pf_patch = code.len();
-        code.push(0x00);
-        emit_write_string(&mut code, b"true\n");
-        code.push(0xEB);
-        let ap_patch = code.len();
-        code.push(0x00);
-        let pf_pos = code.len();
-        code[pf_patch] = (pf_pos - pf_patch - 1) as u8;
-        emit_write_string(&mut code, b"false\n");
-        code.extend_from_slice(&[0x48, 0xC7, 0x85]);
-        code.extend_from_slice(&ctx.exit_flag_slot.to_le_bytes());
-        code.extend_from_slice(&[0x01, 0x00, 0x00, 0x00]);
-        let ap_pos = code.len();
-        code[ap_patch] = (ap_pos - ap_patch - 1) as u8;
+        code.extend_from_slice(&[0x84, 0xC0]); // test al, al
+        emit_bool_arms(&mut code, BoolExitFlag::Slot(ctx.exit_flag_slot));
     } else if is_bytes {
         // Brick b3-native: streaming bytes. The callable already wrote
         // every machine-code byte to fd 1 IN ORDER during the walk; the
@@ -10019,7 +10096,17 @@ fn emit_collection_program(
     // with the same captured `now`).
     let uses_now = rule_uses_now_unix(rule);
     let now_extra_bytes: i32 = if uses_now { 16 } else { 0 };
-    let frame_size = (frame_slots as i32) * 8 + resource_extra_bytes + now_extra_bytes;
+    let frame_base = (frame_slots as i32) * 8 + resource_extra_bytes + now_extra_bytes;
+    // Bool exit-code contract: `output: collection(bool)` needs the same
+    // sticky flag every other bool emitter carries — the program exits 1 if
+    // ANY emitted element was false, which is exactly the multi-record
+    // semantics `emit_full_program` has always had. One extra qword at the
+    // very BOTTOM of the frame, so every existing slot offset (scalars,
+    // element fields, lets, the resource block, now_unix) is untouched and
+    // non-bool collection rules compile byte-for-byte identically.
+    let bool_elem_output = matches!(output_kind, OutputElemKind::Bool);
+    let exit_flag_slot: i32 = -(frame_base + 8);
+    let frame_size = if bool_elem_output { frame_base + 8 } else { frame_base };
 
     let mut code = Vec::new();
     // Patches into the resource open/read failure jumps (filled at the end).
@@ -10037,6 +10124,9 @@ fn emit_collection_program(
     code.extend_from_slice(&[0x48, 0x89, 0xE5]); // mov rbp, rsp
     code.extend_from_slice(&[0x48, 0x81, 0xEC]);
     code.extend_from_slice(&frame_size.to_le_bytes());
+    if bool_elem_output {
+        emit_bool_exit_flag_init(&mut code, exit_flag_slot);
+    }
     code.extend_from_slice(&[0x49, 0xC7, 0xC6, 0x01, 0x00, 0x00, 0x00]); // mov r14, 1
 
     // Slice 9.5c: emit each resource read sequence ABOVE the outer loop —
@@ -10249,20 +10339,10 @@ fn emit_collection_program(
                     None,
                 )?;
                 if matches!(output_kind, OutputElemKind::Bool) {
-                    // Bool: rax = 0/1 → "true"/"false" + newline.
+                    // Bool: rax = 0/1 → "true"/"false" + newline, and the
+                    // sticky exit flag on the false arm.
                     code.extend_from_slice(&[0x84, 0xC0]); // test al, al
-                    code.push(0x74); // jz .print_false
-                    let pf_patch = code.len();
-                    code.push(0x00);
-                    emit_write_string(&mut code, b"true\n");
-                    code.push(0xEB); // jmp .after
-                    let ap_patch = code.len();
-                    code.push(0x00);
-                    let pf_pos = code.len();
-                    code[pf_patch] = (pf_pos - pf_patch - 1) as u8;
-                    emit_write_string(&mut code, b"false\n");
-                    let ap_pos = code.len();
-                    code[ap_patch] = (ap_pos - ap_patch - 1) as u8;
+                    emit_bool_arms(&mut code, BoolExitFlag::Slot(exit_flag_slot));
                 } else {
                     emit_itoa_inline(&mut code);
                 }
@@ -10351,7 +10431,11 @@ fn emit_collection_program(
     let exit_off = exit_pos as i32 - (exit_patch as i32 + 4);
     code[exit_patch..exit_patch + 4].copy_from_slice(&exit_off.to_le_bytes());
     code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x3C, 0x00, 0x00, 0x00]); // mov rax, 60
-    code.extend_from_slice(&[0x48, 0x31, 0xFF]); // xor rdi, rdi
+    if bool_elem_output {
+        emit_bool_exit_flag_to_rdi(&mut code, exit_flag_slot);
+    } else {
+        code.extend_from_slice(&[0x48, 0x31, 0xFF]); // xor rdi, rdi
+    }
     code.extend_from_slice(&[0x0F, 0x05]); // syscall
 
     // Slice 9.5c: shared abort label for resource open/read failures.
@@ -10475,7 +10559,14 @@ fn emit_fold_program(
     // rules without `now_unix()`.
     let uses_now = rule_uses_now_unix(rule);
     let now_extra_bytes: i32 = if uses_now { 16 } else { 0 };
-    let frame_size = (frame_slots as i32) * 8 + resource_extra_bytes + now_extra_bytes;
+    let frame_base = (frame_slots as i32) * 8 + resource_extra_bytes + now_extra_bytes;
+    // Bool exit-code contract (see `emit_bool_arms`): a `output: bool` fold
+    // — i.e. `all(...)` / `any(...)` desugared — exits 1 when it printed a
+    // false. One extra qword BELOW everything else, so the acc slot, the
+    // resource block and now_unix keep their offsets and number-output folds
+    // compile byte-for-byte identically.
+    let exit_flag_slot: i32 = -(frame_base + 8);
+    let frame_size = if is_bool_output { frame_base + 8 } else { frame_base };
     let acc_offset: i32 = -((frame_slots as i32) * 8);
 
     let mut code = Vec::new();
@@ -10494,6 +10585,9 @@ fn emit_fold_program(
     code.extend_from_slice(&[0x48, 0x89, 0xE5]); // mov rbp, rsp
     code.extend_from_slice(&[0x48, 0x81, 0xEC]);
     code.extend_from_slice(&frame_size.to_le_bytes());
+    if is_bool_output {
+        emit_bool_exit_flag_init(&mut code, exit_flag_slot);
+    }
     code.extend_from_slice(&[0x49, 0xC7, 0xC6, 0x01, 0x00, 0x00, 0x00]); // mov r14, 1
 
     // Slice 9.5d: emit each resource read sequence ABOVE the outer loop —
@@ -10662,20 +10756,10 @@ fn emit_fold_program(
     // Emit the final accumulator.
     load_rax_from_rbp(&mut code, acc_offset);
     if is_bool_output {
-        // Bool fold (all/any): rax is 0 or 1 → print "true"/"false" + newline.
+        // Bool fold (all/any): rax is 0 or 1 → print "true"/"false" + newline,
+        // and set the sticky exit flag on the false arm.
         code.extend_from_slice(&[0x84, 0xC0]); // test al, al
-        code.push(0x74); // jz .print_false
-        let pf_patch = code.len();
-        code.push(0x00);
-        emit_write_string(&mut code, b"true\n");
-        code.push(0xEB); // jmp .after_print
-        let ap_patch = code.len();
-        code.push(0x00);
-        let pf_pos = code.len();
-        code[pf_patch] = (pf_pos - pf_patch - 1) as u8;
-        emit_write_string(&mut code, b"false\n");
-        let ap_pos = code.len();
-        code[ap_patch] = (ap_pos - ap_patch - 1) as u8;
+        emit_bool_arms(&mut code, BoolExitFlag::Slot(exit_flag_slot));
     } else {
         emit_itoa_inline(&mut code);
     }
@@ -10685,12 +10769,16 @@ fn emit_fold_program(
     let outer_off = outer_loop_top as i32 - (code.len() + 4) as i32;
     code.extend_from_slice(&outer_off.to_le_bytes());
 
-    // exit: sys_exit(0)
+    // exit: sys_exit(<bool exit flag> | 0)
     let exit_pos = code.len();
     let exit_off = exit_pos as i32 - (exit_patch as i32 + 4);
     code[exit_patch..exit_patch + 4].copy_from_slice(&exit_off.to_le_bytes());
     code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x3C, 0x00, 0x00, 0x00]); // mov rax, 60
-    code.extend_from_slice(&[0x48, 0x31, 0xFF]); // xor rdi, rdi
+    if is_bool_output {
+        emit_bool_exit_flag_to_rdi(&mut code, exit_flag_slot);
+    } else {
+        code.extend_from_slice(&[0x48, 0x31, 0xFF]); // xor rdi, rdi
+    }
     code.extend_from_slice(&[0x0F, 0x05]); // syscall
 
     // Slice 9.5d: shared abort label for resource open/read failures.
@@ -11185,7 +11273,13 @@ fn emit_multi_fold_program(
     // touches the clock. Same shape as Phase 4 / record-loop prologue.
     let uses_now = rule_uses_now_unix(rule);
     let now_extra_bytes: i32 = if uses_now { 16 } else { 0 };
-    let frame_size = (frame_slots as i32) * 8 + resource_extra_bytes + now_extra_bytes;
+    let frame_base = (frame_slots as i32) * 8 + resource_extra_bytes + now_extra_bytes;
+    // Bool exit-code contract (see `emit_bool_arms`): a Phase 6 scalar rule
+    // declared `output: bool` exits 1 when it printed a false. One extra
+    // qword below the resource / now_unix block; number-output Phase 6 rules
+    // (the only shape in the corpus today) compile byte-for-byte identically.
+    let exit_flag_slot: i32 = -(frame_base + 8);
+    let frame_size = if is_bool_output { frame_base + 8 } else { frame_base };
 
     // Accumulator slot offsets (at the bottom of the original frame —
     // i.e. above the resource block, since acc slots get reused inside
@@ -11207,6 +11301,9 @@ fn emit_multi_fold_program(
     code.extend_from_slice(&[0x48, 0x89, 0xE5]); // mov rbp, rsp
     code.extend_from_slice(&[0x48, 0x81, 0xEC]);
     code.extend_from_slice(&frame_size.to_le_bytes());
+    if is_bool_output {
+        emit_bool_exit_flag_init(&mut code, exit_flag_slot);
+    }
     code.extend_from_slice(&[0x49, 0xC7, 0xC6, 0x01, 0x00, 0x00, 0x00]); // mov r14, 1
 
     // Slice 9.5e: emit each resource read sequence ABOVE the outer loop.
@@ -11383,18 +11480,7 @@ fn emit_multi_fold_program(
     // Print result.
     if is_bool_output {
         code.extend_from_slice(&[0x84, 0xC0]); // test al, al
-        code.push(0x74);
-        let pf_patch = code.len();
-        code.push(0x00);
-        emit_write_string(&mut code, b"true\n");
-        code.push(0xEB);
-        let ap_patch = code.len();
-        code.push(0x00);
-        let pf_pos = code.len();
-        code[pf_patch] = (pf_pos - pf_patch - 1) as u8;
-        emit_write_string(&mut code, b"false\n");
-        let ap_pos = code.len();
-        code[ap_patch] = (ap_pos - ap_patch - 1) as u8;
+        emit_bool_arms(&mut code, BoolExitFlag::Slot(exit_flag_slot));
     } else {
         emit_itoa_inline(&mut code);
     }
@@ -11404,12 +11490,16 @@ fn emit_multi_fold_program(
     let outer_off = outer_loop_top as i32 - (code.len() + 4) as i32;
     code.extend_from_slice(&outer_off.to_le_bytes());
 
-    // exit: sys_exit(0)
+    // exit: sys_exit(<bool exit flag> | 0)
     let exit_pos = code.len();
     let exit_off = exit_pos as i32 - (exit_patch as i32 + 4);
     code[exit_patch..exit_patch + 4].copy_from_slice(&exit_off.to_le_bytes());
     code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x3C, 0x00, 0x00, 0x00]);
-    code.extend_from_slice(&[0x48, 0x31, 0xFF]);
+    if is_bool_output {
+        emit_bool_exit_flag_to_rdi(&mut code, exit_flag_slot);
+    } else {
+        code.extend_from_slice(&[0x48, 0x31, 0xFF]);
+    }
     code.extend_from_slice(&[0x0F, 0x05]);
 
     // Slice 9.5e: shared abort label for resource open/read failures.
@@ -16925,13 +17015,20 @@ fn emit_parallel_program(
     // slice 10 + 9.4's forked+cached pattern.
     code.push(0x55); // push rbp
     code.extend_from_slice(&[0x48, 0x89, 0xE5]); // mov rbp, rsp
-    let frame = ((nfields * 8
-        + resource_extra_bytes as usize
-        + now_extra_bytes as usize
-        + 15)
-        & !15) as i32;
+    // Bool exit-code contract (see `emit_bool_arms`). The flag sits BELOW
+    // the field / resource / now_unix block so every existing offset is
+    // untouched, and it is initialised BEFORE the fork so the child starts
+    // from a cleared flag. Non-bool parallel rules keep the old frame and
+    // compile byte-for-byte identically.
+    let frame_raw = nfields * 8 + resource_extra_bytes as usize + now_extra_bytes as usize;
+    let exit_flag_slot: i32 = -((frame_raw + 8) as i32);
+    let frame_wanted = if is_bool { frame_raw + 8 } else { frame_raw };
+    let frame = ((frame_wanted + 15) & !15) as i32;
     code.extend_from_slice(&[0x48, 0x81, 0xEC]);
     code.extend_from_slice(&frame.to_le_bytes());
+    if is_bool {
+        emit_bool_exit_flag_init(&mut code, exit_flag_slot);
+    }
 
     // Slice 9.5f: emit each resource read sequence ONCE, BEFORE the
     // parse loop and BEFORE the fork. emit_resource_read_sequence
@@ -17032,13 +17129,36 @@ fn emit_parallel_program(
     let po = parent_pos as i32 - (parent_patch as i32 + 4);
     code[parent_patch..parent_patch + 4].copy_from_slice(&po.to_le_bytes());
 
-    // wait4(-1, NULL, 0, NULL)
+    // wait4(-1, <status>, 0, NULL). For a bool rule the status pointer is the
+    // exit-flag slot itself: the child ran records [0, midpoint) and its own
+    // flag became its exit code, so folding that status back in is the ONLY
+    // way the parent's exit code can account for a `false` printed in the
+    // child's half. The parent has not processed any record yet, so its flag
+    // is still the init 0 and clobbering it is safe. The upper 4 bytes of the
+    // slot stay 0 (wait4 writes an `int`), so the whole qword is nonzero iff
+    // the child reported something — exit(1), or a signal death.
     code.extend_from_slice(&[0x48, 0xC7, 0xC7, 0xFF, 0xFF, 0xFF, 0xFF]); // mov rdi, -1
-    code.extend_from_slice(&[0x48, 0x31, 0xF6]); // xor rsi, rsi
+    if is_bool {
+        code.extend_from_slice(&[0x48, 0x8D, 0xB5]); // lea rsi, [rbp + exit_flag_slot]
+        code.extend_from_slice(&exit_flag_slot.to_le_bytes());
+    } else {
+        code.extend_from_slice(&[0x48, 0x31, 0xF6]); // xor rsi, rsi
+    }
     code.extend_from_slice(&[0x48, 0x31, 0xD2]); // xor rdx, rdx
     code.extend_from_slice(&[0x4D, 0x31, 0xD2]); // xor r10, r10
     code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x3D, 0x00, 0x00, 0x00]); // mov rax, 61 (wait4)
     code.extend_from_slice(&[0x0F, 0x05]); // syscall
+
+    if is_bool {
+        // Normalise the raw wait status to the flag's 0/1 domain: any nonzero
+        // status means the child's half contained a false (or died), so the
+        // whole program must exit 1.
+        code.extend_from_slice(&[0x48, 0x8B, 0x85]); // mov rax, [rbp + exit_flag_slot]
+        code.extend_from_slice(&exit_flag_slot.to_le_bytes());
+        code.extend_from_slice(&[0x48, 0x85, 0xC0]); // test rax, rax
+        code.extend_from_slice(&[0x74, 0x0B]); // jz .after (over the 11-byte store)
+        emit_bool_exit_flag_set_one(&mut code, exit_flag_slot);
+    }
 
     code.extend_from_slice(&[0x48, 0x89, 0xD9]); // mov rcx, rbx (start=midpoint)
     code.extend_from_slice(&[0x4D, 0x89, 0xF0]); // mov r8, r14 (end=num_records)
@@ -17094,18 +17214,7 @@ fn emit_parallel_program(
     // Print result
     if is_bool {
         code.extend_from_slice(&[0x84, 0xC0]); // test al, al
-        code.push(0x74);
-        let fp = code.len();
-        code.push(0x00);
-        emit_write_string(&mut code, b"true\n");
-        code.push(0xEB);
-        let dp = code.len();
-        code.push(0x00);
-        let fpos = code.len();
-        code[fp] = (fpos - fp - 1) as u8;
-        emit_write_string(&mut code, b"false\n");
-        let dpos = code.len();
-        code[dp] = (dpos - dp - 1) as u8;
+        emit_bool_arms(&mut code, BoolExitFlag::Slot(exit_flag_slot));
     } else {
         emit_itoa_inline(&mut code);
     }
@@ -17119,11 +17228,17 @@ fn emit_parallel_program(
     code.extend_from_slice(&lj.to_le_bytes());
 
     // === Exit ===
+    // Reached by BOTH halves: the child exits with its own flag (which the
+    // parent then folds in via wait4), the parent with the merged one.
     let exit_pos = code.len();
     let eo = exit_pos as i32 - (exit_patch as i32 + 4);
     code[exit_patch..exit_patch + 4].copy_from_slice(&eo.to_le_bytes());
     code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x3C, 0x00, 0x00, 0x00]);
-    code.extend_from_slice(&[0x48, 0x31, 0xFF]);
+    if is_bool {
+        emit_bool_exit_flag_to_rdi(&mut code, exit_flag_slot);
+    } else {
+        code.extend_from_slice(&[0x48, 0x31, 0xFF]);
+    }
     code.extend_from_slice(&[0x0F, 0x05]);
 
     // Slice 9.5f: shared abort label for resource open/read failures.
@@ -17361,6 +17476,16 @@ fn emit_vectorized_program(threshold: i64) -> Result<Vec<u8>, NativeError> {
     emit_argc_guard(&mut code, 2); // vectorized: need at least 1 value
     // lea r13, [rsp+8]
     code.extend_from_slice(&[0x4C, 0x8D, 0x6C, 0x24, 0x08]);
+    // Bool exit-code contract (see `emit_bool_arms`). This emitter is the
+    // only bool path with NO rbp frame, so the sticky flag lives in r10 —
+    // untouched by the rest of this emitter and preserved across `write`
+    // (Linux syscalls clobber only rax, rcx, r11).
+    //
+    // This is the site that made the contract a real defect rather than a
+    // curiosity: `vectorizable` is an OPTIMIZATION HINT, and until now it
+    // silently swapped a rule's exit code from 1 to 0 on a false result.
+    // xor r10d, r10d  (zeroes all 64 bits)
+    code.extend_from_slice(&[0x45, 0x31, 0xD2]);
 
     // r14 = count = argc - 1
     code.extend_from_slice(&[0x4D, 0x89, 0xE6]); // mov r14, r12
@@ -17431,33 +17556,11 @@ fn emit_vectorized_program(threshold: i64) -> Result<Vec<u8>, NativeError> {
 
     // Print result for element [rbx]
     code.extend_from_slice(&[0x41, 0xF6, 0xC0, 0x01]); // test r8b, 1
-    code.push(0x74);
-    let f0_patch = code.len();
-    code.push(0x00);
-    emit_write_string(&mut code, b"true\n");
-    code.push(0xEB);
-    let d0_patch = code.len();
-    code.push(0x00);
-    let f0_pos = code.len();
-    code[f0_patch] = (f0_pos - f0_patch - 1) as u8;
-    emit_write_string(&mut code, b"false\n");
-    let d0_pos = code.len();
-    code[d0_patch] = (d0_pos - d0_patch - 1) as u8;
+    emit_bool_arms(&mut code, BoolExitFlag::R10);
 
     // Print result for element [rbx+1]
     code.extend_from_slice(&[0x41, 0xF6, 0xC0, 0x02]); // test r8b, 2
-    code.push(0x74);
-    let f1_patch = code.len();
-    code.push(0x00);
-    emit_write_string(&mut code, b"true\n");
-    code.push(0xEB);
-    let d1_patch = code.len();
-    code.push(0x00);
-    let f1_pos = code.len();
-    code[f1_patch] = (f1_pos - f1_patch - 1) as u8;
-    emit_write_string(&mut code, b"false\n");
-    let d1_pos = code.len();
-    code[d1_patch] = (d1_pos - d1_patch - 1) as u8;
+    emit_bool_arms(&mut code, BoolExitFlag::R10);
 
     code.extend_from_slice(&[0x48, 0x83, 0xC3, 0x02]); // add rbx, 2
     code.push(0xE9);
@@ -17481,18 +17584,7 @@ fn emit_vectorized_program(threshold: i64) -> Result<Vec<u8>, NativeError> {
     emit_cmp_rax_imm(&mut code, threshold);
     code.extend_from_slice(&[0x0F, 0x9F, 0xC0]); // setg al
     code.extend_from_slice(&[0x84, 0xC0]); // test al, al
-    code.push(0x74);
-    let sf_patch = code.len();
-    code.push(0x00);
-    emit_write_string(&mut code, b"true\n");
-    code.push(0xEB);
-    let sd_patch = code.len();
-    code.push(0x00);
-    let sf_pos = code.len();
-    code[sf_patch] = (sf_pos - sf_patch - 1) as u8;
-    emit_write_string(&mut code, b"false\n");
-    let sd_pos = code.len();
-    code[sd_patch] = (sd_pos - sd_patch - 1) as u8;
+    emit_bool_arms(&mut code, BoolExitFlag::R10);
 
     code.extend_from_slice(&[0x48, 0xFF, 0xC3]); // inc rbx
     code.push(0xE9);
@@ -17504,8 +17596,8 @@ fn emit_vectorized_program(threshold: i64) -> Result<Vec<u8>, NativeError> {
     let exit_offset = exit_pos as i32 - (exit_patch as i32 + 4);
     code[exit_patch..exit_patch + 4].copy_from_slice(&exit_offset.to_le_bytes());
 
-    code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x3C, 0x00, 0x00, 0x00]);
-    code.extend_from_slice(&[0x48, 0x31, 0xFF]);
+    code.extend_from_slice(&[0x48, 0xC7, 0xC0, 0x3C, 0x00, 0x00, 0x00]); // mov rax, 60
+    code.extend_from_slice(&[0x4C, 0x89, 0xD7]); // mov rdi, r10 (the sticky bool exit flag)
     code.extend_from_slice(&[0x0F, 0x05]);
 
     Ok(code)
@@ -29810,6 +29902,264 @@ rule lit
         let _ = std::fs::remove_file(&out);
     }
 
+    /// THE BOOL EXIT-CODE CONTRACT, on the emitter that used to break it.
+    ///
+    /// `examples/invoices.verbose::important_invoice` carries a
+    /// `vectorizable` hint, so `compile_native_code` routes it to
+    /// `emit_vectorized_program` (SSE4.2 `pcmpgtq`, two lanes per iteration
+    /// plus a scalar remainder — three separate `false` arms). That emitter
+    /// exited 0 unconditionally, while the unhinted path
+    /// (`emit_full_program`) exited 1 on a false. Same construct, same value,
+    /// different observable behaviour, selected by an OPTIMIZATION HINT.
+    ///
+    /// Verified to FAIL pre-change on the `500` case (rc was 0, want 1).
+    ///
+    /// Three properties:
+    ///   (a) false → exit 1, true → exit 0, on the SIMD emitter;
+    ///   (b) the flag is STICKY across records — a batch containing one false
+    ///       exits 1 even though later records are true. This also exercises
+    ///       all three arms: with 3 args, two go through the SIMD lanes and
+    ///       one through the scalar remainder, and each has its own `false`
+    ///       site that must set the flag;
+    ///   (c) stdout is unchanged — this is an exit-code fix, not a formatting
+    ///       one, so the printed bytes must be exactly as before.
+    #[test]
+    fn bool_exit_code_is_one_on_false_in_the_vectorized_emitter() {
+        use std::process::Command;
+
+        let src = std::fs::read_to_string("examples/invoices.verbose")
+            .expect("examples/invoices.verbose");
+        assert!(src.contains("vectorizable"),
+            "this pin is about the hinted path — invoices.verbose must still carry \
+             the `vectorizable` hint, otherwise it no longer reaches \
+             emit_vectorized_program and the test proves nothing");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+        let out = std::env::temp_dir().join("verbosec_test_bool_rc_simd");
+        compile_native(&program, "important_invoice", out.to_str().unwrap(), false, false)
+            .expect("invoices must compile natively");
+
+        // Confirm we really are on the SIMD emitter: `pcmpgtq xmm0, xmm1`.
+        // If a future dispatch change reroutes this rule, (a)/(b) would still
+        // pass via emit_full_program and silently stop testing what they name.
+        let bytes = std::fs::read(&out).expect("read emitted binary");
+        assert_eq!(bytes.windows(5).filter(|w| *w == [0x66, 0x0F, 0x38, 0x37, 0xC1]).count(), 1,
+            "expected exactly one `pcmpgtq xmm0, xmm1` — this rule must still route \
+             to emit_vectorized_program for this pin to mean anything");
+
+        let run = |argv: &[&str]| -> (String, Option<i32>) {
+            let r = Command::new(&out).args(argv).output().expect("spawn");
+            (String::from_utf8_lossy(&r.stdout).into_owned(), r.status.code())
+        };
+
+        // (a) both arms, single record.
+        assert_eq!(run(&["15000"]), ("true\n".into(), Some(0)),
+            "a true result must print `true` and exit 0");
+        assert_eq!(run(&["500"]), ("false\n".into(), Some(1)),
+            "a false result must exit 1 — a bool rule is a shell predicate. \
+             This is the assertion that fails before the fix (rc was 0 because \
+             emit_vectorized_program never set the exit flag).");
+
+        // (b) sticky across records, and all three false-arms exercised.
+        //     3 args → SIMD handles [0] and [1], the remainder loop handles [2].
+        assert_eq!(run(&["15000", "500", "20000"]), ("true\nfalse\ntrue\n".into(), Some(1)),
+            "the flag is sticky: one false anywhere in the batch → exit 1");
+        assert_eq!(run(&["500", "400", "300"]), ("false\nfalse\nfalse\n".into(), Some(1)),
+            "false in the scalar remainder arm must set the flag too");
+        assert_eq!(run(&["15000", "20000", "30000"]), ("true\ntrue\ntrue\n".into(), Some(0)),
+            "no false anywhere → exit 0, so the flag is not simply hard-coded");
+
+        let _ = std::fs::remove_file(&out);
+    }
+
+    /// THE PROPERTY THE FIX ACTUALLY BUYS: **a hint changes speed, never
+    /// behaviour.**
+    ///
+    /// The previous test pins one emitter's exit codes. This one pins the
+    /// INVARIANT that motivated the change, and it is the assertion that would
+    /// catch the defect coming back through a *different* door — a sixth
+    /// emitter, a new hint, a dispatch reshuffle.
+    ///
+    /// Compile `important_invoice` twice from the same source: once as
+    /// written (hinted → SIMD) and once with the `hints:` block stripped
+    /// (→ `emit_full_program`). The two binaries must be observationally
+    /// identical on every input — same stdout, same exit code — while still
+    /// being genuinely different code (asserted: SIMD bytes present in one and
+    /// absent in the other, so the hint is still doing its job).
+    ///
+    /// Verified to FAIL pre-change: hinted `500` gave rc 0, unhinted gave rc 1.
+    #[test]
+    fn optimization_hints_do_not_change_observable_behaviour() {
+        use std::process::Command;
+
+        let src = std::fs::read_to_string("examples/invoices.verbose")
+            .expect("examples/invoices.verbose");
+        // The hints block is the last block of this file; drop it and
+        // everything after it. Assert the strip actually happened rather than
+        // trusting the file's shape.
+        let hint_at = src.find("\n  hints:").expect("invoices.verbose must have a hints block");
+        let unhinted = &src[..hint_at];
+        assert!(!unhinted.contains("vectorizable"),
+            "strip failed — the unhinted variant still mentions `vectorizable`");
+
+        let build = |text: &str, tag: &str| -> std::path::PathBuf {
+            let tokens = crate::lexer::Lexer::new(text).tokenize().expect("tokenize");
+            let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+            let p = std::env::temp_dir().join(format!("verbosec_test_hint_inert_{tag}"));
+            compile_native(&program, "important_invoice", p.to_str().unwrap(), false, false)
+                .expect("both variants must compile natively");
+            p
+        };
+        let hinted = build(&src, "hinted");
+        let plain = build(unhinted, "plain");
+
+        // The two really are different lowerings — otherwise this test would
+        // pass vacuously by comparing a binary with itself.
+        let simd = |p: &std::path::Path| -> usize {
+            std::fs::read(p).unwrap().windows(5)
+                .filter(|w| *w == [0x66, 0x0F, 0x38, 0x37, 0xC1]).count()
+        };
+        assert_eq!(simd(&hinted), 1, "the hinted build must vectorize");
+        assert_eq!(simd(&plain), 0, "the unhinted build must NOT vectorize");
+
+        for argv in [vec!["15000"], vec!["500"], vec!["15000", "500"], vec!["500", "15000"]] {
+            let a = Command::new(&hinted).args(&argv).output().expect("spawn hinted");
+            let b = Command::new(&plain).args(&argv).output().expect("spawn plain");
+            assert_eq!(
+                (String::from_utf8_lossy(&a.stdout), a.status.code()),
+                (String::from_utf8_lossy(&b.stdout), b.status.code()),
+                "argv={argv:?}: the `vectorizable` hint changed OBSERVABLE behaviour. \
+                 A hint may change speed and code size; it may never change what the \
+                 program does. (Pre-fix this diverged on rc for any false result.)");
+        }
+
+        let _ = std::fs::remove_file(&hinted);
+        let _ = std::fs::remove_file(&plain);
+    }
+
+    /// The bool exit-code contract on the remaining two emitters that used to
+    /// exit 0 unconditionally and are reachable from the corpus:
+    /// `emit_fold_program` (a top-level `all(...)`/`any(...)`, i.e.
+    /// `output: bool` via a fold) and `emit_collection_program`
+    /// (`output: collection(bool)`).
+    ///
+    /// For the collection case the contract reads: exit 1 iff AT LEAST ONE
+    /// emitted element was false. That is the same sticky semantics
+    /// `emit_full_program` has always had for a multi-record run, so the two
+    /// agree rather than inventing a second rule for streams.
+    #[test]
+    fn bool_exit_code_is_one_on_false_in_fold_and_collection_emitters() {
+        use std::process::Command;
+
+        let build = |file: &str, rule: &str, tag: &str| -> std::path::PathBuf {
+            let src = std::fs::read_to_string(format!("examples/{file}"))
+                .unwrap_or_else(|_| panic!("examples/{file}"));
+            let tokens = crate::lexer::Lexer::new(&src).tokenize().expect("tokenize");
+            let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+            let p = std::env::temp_dir().join(format!("verbosec_test_bool_rc_{tag}"));
+            compile_native(&program, rule, p.to_str().unwrap(), false, false)
+                .expect("must compile natively");
+            p
+        };
+        let run = |p: &std::path::Path, argv: &[&str]| -> (String, Option<i32>) {
+            let r = Command::new(p).args(argv).output().expect("spawn");
+            (String::from_utf8_lossy(&r.stdout).into_owned(), r.status.code())
+        };
+
+        // --- emit_fold_program: `ok = all(s.events, e => e.role == read(role))`
+        // The resource must exist, or BOTH arms fail closed and the test
+        // passes without ever reaching the code it names.
+        std::fs::write("/tmp/verbose_allowed_role.txt", b"admin").expect("write role fixture");
+        let fold = build("access_check.verbose", "all_authorized", "fold");
+        assert_eq!(run(&fold, &["2", "admin", "admin"]), ("true\n".into(), Some(0)),
+            "all() true → exit 0");
+        assert_eq!(run(&fold, &["2", "admin", "guest"]), ("false\n".into(), Some(1)),
+            "all() false → exit 1 (emit_fold_program used to exit 0 here)");
+
+        // --- emit_collection_program: `status = map(w.employees, e => e.age >= 65)`
+        let coll = build("retirement.verbose", "retirement_status", "coll");
+        assert_eq!(run(&coll, &["2", "ada", "70", "bob", "80"]), ("true\ntrue\n".into(), Some(0)),
+            "collection(bool) with no false element → exit 0");
+        assert_eq!(run(&coll, &["2", "ada", "70", "bob", "30"]), ("true\nfalse\n".into(), Some(1)),
+            "collection(bool) with one false element → exit 1 \
+             (emit_collection_program used to exit 0 here)");
+
+        for p in [&fold, &coll] { let _ = std::fs::remove_file(p); }
+    }
+
+    /// The bool exit-code contract on `emit_multi_fold_program` (Phase 6:
+    /// scalar output with quantifiers embedded in a larger expression).
+    ///
+    /// This emitter is the one changed path with NO bool rule anywhere in
+    /// `examples/` — every corpus Phase 6 rule is `output: number`. So the
+    /// corpus sweep cannot cover it and it gets a synthetic program instead.
+    /// Written out rather than skipped precisely because an uncovered emitter
+    /// is how the original inconsistency survived: five copies of the same
+    /// block, only two of them exercised by a test that looked at exit codes.
+    #[test]
+    fn bool_exit_code_is_one_on_false_in_the_multi_fold_emitter() {
+        use std::process::Command;
+        let src = r#"@verbose 0.1.0
+
+concept Event
+  @intention: "An event has a severity"
+  @source: invoices.intent:1
+
+  fields:
+    severity : number [0, 4]
+
+
+concept Stream
+  @intention: "A stream of events"
+  @source: invoices.intent:1
+
+  fields:
+    events : collection(Event)
+
+
+rule healthy
+  @intention: "Every event is positive AND at least one is severe"
+  @source: invoices.intent:1
+
+  input:
+    s : Stream
+
+  output:
+    ok : bool
+
+  logic:
+    ok = all(s.events, e => e.severity > 0) and any(s.events, e => e.severity > 3)
+
+  proofs:
+    purity:
+      reads   : [s.events]
+      calls   : []
+    termination:
+      bound : 8
+"#;
+        let tokens = crate::lexer::Lexer::new(src).tokenize().expect("tokenize");
+        let program = crate::parser::Parser::new(tokens).parse_program().expect("parse");
+        let out = std::env::temp_dir().join("verbosec_test_bool_rc_multifold");
+        compile_native(&program, "healthy", out.to_str().unwrap(), false, false)
+            .expect("Phase 6 bool rule must compile natively");
+
+        let run = |argv: &[&str]| -> (String, Option<i32>) {
+            let r = Command::new(&out).args(argv).output().expect("spawn");
+            (String::from_utf8_lossy(&r.stdout).into_owned(), r.status.code())
+        };
+        // Two quantifiers over one pass — both accumulators feed the final
+        // scalar expression, so this also confirms the extra exit-flag slot
+        // did not collide with the acc slots.
+        assert_eq!(run(&["2", "1", "4"]), ("true\n".into(), Some(0)),
+            "all(>0) && any(>3) → true → exit 0");
+        assert_eq!(run(&["2", "1", "2"]), ("false\n".into(), Some(1)),
+            "any(>3) fails → false → exit 1");
+        assert_eq!(run(&["2", "0", "4"]), ("false\n".into(), Some(1)),
+            "all(>0) fails → false → exit 1");
+
+        let _ = std::fs::remove_file(&out);
+    }
+
     /// Slice 9.5f (2026-04-29): closes the resource-aware emitter sweep.
     /// `read(<resource>)` is now allowed in `emit_parallel_program`. The
     /// parent reads the threshold file ONCE before the fork; both
@@ -29824,6 +30174,21 @@ rule lit
     ///   (c) editing the file between invocations changes the result
     ///   (d) abort on invalid threshold (parse_int) — fail-closed
     ///   (e) abort on missing file (read) — fail-closed
+    ///
+    /// Updated for the BOOL EXIT-CODE CONTRACT (see `emit_bool_arms`): this
+    /// rule is `output: bool`, so a run that prints any `false` now exits 1.
+    /// (a)–(c) previously used `status.success()` as a proxy for "did not hit
+    /// the fail-closed abort path", and that proxy became ambiguous the moment
+    /// exit 1 acquired a second meaning. The pins are rewritten to be STRICTLY
+    /// STRONGER rather than merely re-baselined:
+    ///   * the abort cases (d)/(e) now also require EMPTY stdout — an abort
+    ///     writes nothing, whereas a completed run that merely contained a
+    ///     false writes its lines and then exits 1. Without this the two are
+    ///     indistinguishable and the fail-closed pins would be satisfiable by
+    ///     the new exit code, which would be a genuine weakening.
+    ///   * the happy runs now assert the exit code EXACTLY (1 when a false was
+    ///     printed) instead of only "success", and a new all-true batch pins
+    ///     the 0 arm — so both arms of the contract are covered here.
     #[test]
     fn slice_9_5f_parallel_with_read_threshold() {
         use std::process::Command;
@@ -29847,12 +30212,28 @@ rule lit
             .args(["50", "150", "200", "75", "99", "101"])
             .output()
             .expect("spawn");
-        assert!(r.status.success(), "happy run exit: {:?}", r.status);
         let out_text = String::from_utf8_lossy(&r.stdout);
         let trues = out_text.lines().filter(|l| l.trim() == "true").count();
         let falses = out_text.lines().filter(|l| l.trim() == "false").count();
         assert_eq!(trues, 3, "threshold=100, expected 3 true (150/200/101); stdout={:?}", out_text);
         assert_eq!(falses, 3, "threshold=100, expected 3 false (50/75/99); stdout={:?}", out_text);
+        // Bool exit-code contract: 3 falses were printed, so exit 1. The
+        // sticky flag has to survive the fork — records [0,3) run in the
+        // CHILD, whose status the parent folds in through wait4.
+        assert_eq!(r.status.code(), Some(1),
+            "printed {falses} false(s) → the bool contract requires exit 1; stdout={out_text:?}");
+
+        // (b2) all-true batch pins the OTHER arm: no false printed → exit 0.
+        // Without this the emitter could hard-code 1 and still pass above.
+        let r = Command::new(&out)
+            .args(["150", "200", "300", "400"])
+            .output()
+            .expect("spawn");
+        let out_text = String::from_utf8_lossy(&r.stdout);
+        assert_eq!(out_text.lines().filter(|l| l.trim() == "true").count(), 4,
+            "threshold=100, expected 4 true; stdout={out_text:?}");
+        assert_eq!(r.status.code(), Some(0),
+            "no false printed → exit 0; stdout={out_text:?}");
 
         // (c) edit file → recount with threshold=50
         std::fs::write(path, b"50").expect("update");
@@ -29865,22 +30246,32 @@ rule lit
         let falses = out_text.lines().filter(|l| l.trim() == "false").count();
         assert_eq!(trues, 5, "threshold=50, expected 5 true; stdout={:?}", out_text);
         assert_eq!(falses, 1, "threshold=50, expected 1 false (50); stdout={:?}", out_text);
+        assert_eq!(r.status.code(), Some(1),
+            "one false printed → exit 1; stdout={out_text:?}");
 
-        // (d) Invalid threshold → parse_int abort
+        // (d) Invalid threshold → parse_int abort.
+        // EMPTY stdout is what separates "aborted" from "ran and printed a
+        // false"; both exit nonzero now, so the exit code alone proves nothing.
         std::fs::write(path, b"abc").expect("invalid");
         let r = Command::new(&out)
             .args(["50", "150"])
             .output()
             .expect("spawn");
         assert!(!r.status.success(), "invalid threshold must abort");
+        assert!(r.stdout.is_empty(),
+            "invalid threshold must abort BEFORE emitting anything — got {:?}",
+            String::from_utf8_lossy(&r.stdout));
 
-        // (e) Missing file → resource read abort
+        // (e) Missing file → resource read abort (same empty-stdout argument).
         let _ = std::fs::remove_file(path);
         let r = Command::new(&out)
             .args(["50", "150"])
             .output()
             .expect("spawn");
         assert!(!r.status.success(), "missing file must abort");
+        assert!(r.stdout.is_empty(),
+            "missing file must abort BEFORE emitting anything — got {:?}",
+            String::from_utf8_lossy(&r.stdout));
 
         let _ = std::fs::remove_file(&out);
         let _ = std::fs::remove_file(path);
@@ -47189,21 +47580,20 @@ rule pick
     /// — parse_fields already ran `type_code_of_span`, which maps "bool" and
     /// only "bool" to 1) selects a 79-byte two-arm write instead.
     ///
-    /// EXIT CODES ARE DELIBERATELY OUT OF SCOPE, and the last case below PINS
-    /// the divergence that leaves rather than papering over it. verbosec is
-    /// internally inconsistent here: `emit_full_program` and
-    /// `emit_self_recursive_program` set exit_flag=1 on a false result, while
-    /// `emit_vectorized_program` / `emit_fold_program` /
-    /// `emit_multi_fold_program` / `emit_parallel_program` /
-    /// `emit_collection_program` all exit 0. Which one claims a rule depends on
-    /// the `vectorizable` hint — a block gen0 SKIPS WHOLESALE (see CLAUDE.md's
-    /// gaps table) — so gen0 cannot match both and cannot reliably match
-    /// either. It keeps the number trampoline's exit 0. `invoices` carries the
-    /// hint, so it routes to the SIMD emitter and agrees on BOTH stdout and rc;
-    /// `layers` does not, so it agrees on stdout and differs on rc when false.
-    /// Closing that gap means teaching gen0 the hint or making verbosec
-    /// consistent — a decision about verbosec's semantics, not about gen0's
-    /// fidelity to them.
+    /// EXIT CODES ARE NOW IN SCOPE (2026-08-09). When this test was written
+    /// they were not, and the `layers` case below pinned a KNOWN divergence:
+    /// gen0 exited 0 on a false where verbosec's `emit_full_program` exited 1.
+    /// The stated reason was that verbosec could not be matched because its
+    /// seven bool sites disagreed with each other and the `vectorizable` hint
+    /// picked between them — a block gen0 skips wholesale. That was a defect in
+    /// VERBOSEC, and it has since been fixed: every bool site routes through the
+    /// shared `emit_bool_arms`, and the contract is "a bool rule exits 1 if it
+    /// printed at least one false". gen0's `entry_rule_bool` trampoline now
+    /// carries the same flag in rbx, so the `layers` false arm agrees on rc too
+    /// and the assertion below flipped from `(Some(0), Some(1))` to full
+    /// equality. `invoices` (which the hint routes to the SIMD emitter) also
+    /// still agrees on both — but for the opposite reason from before: that
+    /// emitter used to exit 0 on false and now exits 1, matching gen0's new 1.
     ///
     /// Four properties, each of which could regress alone:
     ///   (a) TRUE renders as exactly `true\n` — byte-compared, so a missing or
@@ -47274,8 +47664,10 @@ rule pick
         };
 
         // ---- invoices: the pin. Both stdout AND rc must match, on both arms.
-        // `vectorizable` routes verbosec to the SIMD emitter, which exits 0
-        // regardless of the result, so this file agrees completely.
+        // `vectorizable` routes verbosec to the SIMD emitter. That emitter used
+        // to exit 0 on a false; since the bool exit-code contract landed it
+        // exits 1, which is also what gen0 now does — so this file still agrees
+        // completely, at the other value.
         let inv_g0 = emit("invoices");
         let inv_vb = reference("invoices", "important_invoice");
         for (argv, want) in [(["15000"], &b"true\n"[..]), (["500"], &b"false\n"[..])] {
@@ -47296,8 +47688,9 @@ rule pick
             assert_eq!(got_out, ref_out,
                 "invoices {argv:?}: gen0's stdout must be verbosec's exact bytes");
             assert_eq!(got_rc, ref_rc,
-                "invoices {argv:?}: exit code must match (this file routes verbosec \
-                 to the SIMD emitter, which exits 0 on both arms)");
+                "invoices {argv:?}: exit code must match. Under the bool exit-code \
+                 contract both compilers exit 1 on a false and 0 on a true — the \
+                 SIMD emitter no longer exits 0 unconditionally.");
         }
 
         // ---- layers: a SECOND program, so the arm is not pinned to one
@@ -47312,23 +47705,24 @@ rule pick
         assert_eq!(got_out, b"true\n", "layers true-arm bytes");
         assert_eq!((got_out, got_rc), (ref_out, ref_rc), "layers true-arm must fully agree");
 
-        // FALSE: stdout must agree; the EXIT CODE is the KNOWN, DELIBERATE
-        // divergence documented above. Pinned in both directions so neither
-        // side can drift silently — if this assert ever fails, verbosec's
-        // emitter choice or gen0's exit posture changed, and the banner on
-        // `entry_rule_bool` in examples/vexprparse.verbose needs revisiting.
+        // FALSE: stdout AND rc must now both agree. This assertion used to read
+        // `(Some(0), Some(1))` — a pinned divergence — and flipped to equality
+        // when the bool exit-code contract made verbosec self-consistent and
+        // gen0's trampoline matched it. Asserting the CONCRETE pair (not just
+        // `got_rc == ref_rc`) so that a regression where BOTH sides drift back
+        // to 0 together still fails here.
         let (got_out, got_rc) = run(&lay_g0, &["7", "gold"]);
         let (ref_out, ref_rc) = run(&lay_vb, &["7", "gold"]);
         assert_eq!(got_out, b"false\n", "layers false-arm bytes");
         assert_eq!(got_out, ref_out,
-            "layers false-arm: stdout must be verbosec's exact bytes — the FORMAT \
-             is what this slice fixes");
-        assert_eq!((got_rc, ref_rc), (Some(0), Some(1)),
-            "layers false-arm: the KNOWN exit-code divergence. verbosec's \
-             emit_full_program sets exit_flag=1 on false; gen0 keeps the number \
-             trampoline's exit 0 because the emitter verbosec picks is chosen by \
-             the `vectorizable` hint, which gen0 skips wholesale. If this changed, \
-             update the entry_rule_bool banner in examples/vexprparse.verbose.");
+            "layers false-arm: stdout must be verbosec's exact bytes");
+        assert_eq!((got_rc, ref_rc), (Some(1), Some(1)),
+            "layers false-arm: a bool rule that printed `false` must exit 1 in \
+             BOTH compilers. verbosec routes this rule to emit_full_program; gen0 \
+             uses entry_rule_bool's rbx flag. If this fails, either verbosec's \
+             bool contract regressed or gen0's trampoline drifted — check \
+             `emit_bool_arms` and the entry_rule_bool banner in \
+             examples/vexprparse.verbose.");
 
         // ---- (d) the guard: a NUMBER output still itoa's. The bool branch
         // sits immediately before the 101 fallback, so a predicate that
