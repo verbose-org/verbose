@@ -5034,11 +5034,20 @@ rule layered_caller
         use crate::interpreter::{eval_rule, load_json_input};
         use std::fs;
 
+        // `examples/negative/` is excluded for the same reason as in
+        // all_example_verbose_files_parse_and_verify: those fixtures are
+        // deliberately invalid. Today they carry no paired `.json` so the
+        // filter below would skip them anyway — the exclusion is here so that
+        // adding one cannot silently turn a negative fixture into a
+        // must-not-panic obligation.
         fn collect(dir: &StdPath, out: &mut Vec<std::path::PathBuf>) {
             if let Ok(entries) = fs::read_dir(dir) {
                 for entry in entries.flatten() {
                     let path = entry.path();
                     if path.is_dir() {
+                        if path.file_name().and_then(|s| s.to_str()) == Some("negative") {
+                            continue;
+                        }
                         collect(&path, out);
                     } else if path.extension().and_then(|s| s.to_str()) == Some("verbose") {
                         out.push(path);
@@ -5133,6 +5142,15 @@ rule layered_caller
         // must parse cleanly and verify with zero errors. If this test goes
         // red, an example or the language has drifted — the failing file name
         // and the verifier output point straight at the cause.
+        //
+        // ONE DIRECTORY IS EXCLUDED, and it is excluded by INTENT rather than
+        // by accident: `examples/negative/` holds the NEGATIVE corpus, whose
+        // whole job is to be refused (see examples/negative/README.md). Every
+        // fixture there is deliberately invalid, so "verifies with zero errors"
+        // is exactly the wrong assertion for it. Its own guard —
+        // `two_generation_negative_corpus_sweep` in src/native.rs — asserts the
+        // opposite: that verbosec refuses each one, and records whether the
+        // self-hosted compiler refuses it too.
         use std::fs;
 
         fn collect(dir: &StdPath, out: &mut Vec<std::path::PathBuf>) {
@@ -5140,6 +5158,9 @@ rule layered_caller
                 for entry in entries.flatten() {
                     let path = entry.path();
                     if path.is_dir() {
+                        if path.file_name().and_then(|s| s.to_str()) == Some("negative") {
+                            continue;
+                        }
                         collect(&path, out);
                     } else if path.extension().and_then(|s| s.to_str()) == Some("verbose") {
                         out.push(path);

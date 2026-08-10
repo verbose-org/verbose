@@ -1,0 +1,55 @@
+@verbose 0.1.0
+
+-- NEGATIVE: a `domain` rule calls an `application` rule. verbosec's
+-- sealed-subgraph discipline forbids it (domain may only call domain).
+concept Invoice
+  @intention: "An invoice has an amount"
+  @source: negative.intent:1
+
+  fields:
+    amount : number [0, 1000000]
+
+rule is_app
+  @intention: "doc"
+  @source: negative.intent:2
+  @layer: application
+
+  input:
+    i : Invoice
+
+  output:
+    ok : bool
+
+  logic:
+    ok = i.amount > 1000
+
+  proofs:
+    purity:
+      reads   : [i.amount]
+      calls   : []
+    termination:
+      bound : 1
+
+
+rule is_dom
+  @intention: "doc"
+  @source: negative.intent:3
+  @layer: domain
+
+  input:
+    i : Invoice
+
+  output:
+    ok : bool
+
+  logic:
+    ok = is_app(i)
+
+  proofs:
+    purity:
+      reads   : [i]
+      calls   : [is_app]
+    termination:
+      bound : 3
+
+

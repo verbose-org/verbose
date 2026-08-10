@@ -8953,6 +8953,300 @@ rule span_is_hints
       bound : 64
 
 
+-- ==================== ATTRIBUTE-NAME CLOSED-SET CHECK ====================
+-- gen0's TOKENIZER DISCARDS ATTRIBUTE LINES. `tokenize_indent`'s `isattr`
+-- (`c0b == 64`, i.e. a line whose first non-space byte is `@`) folds the line
+-- into `isblank`, so it emits NO tokens at all -- `@intention`, `@source` and
+-- `@layer` never reach the parser. That is why every attribute-shaped
+-- divergence in CLAUDE.md's gaps table shares ONE cause: nothing downstream
+-- can check what the token stream does not contain.
+--
+-- Rather than teach the tokenizer to emit attribute tokens (which would ripple
+-- through every parse position that currently steps over a blank line), the
+-- two CLOSED-SET checks are done where the information still exists: on the
+-- RAW SOURCE, walked LINE BY LINE with the same `line_width` /
+-- `next_line_start` pair `tokenize_indent` itself uses. A line walk -- not a
+-- byte walk -- is both cheaper (33k frames, the same order as the tokenizer's
+-- own recursion, instead of 1.6M) and MORE precise: an attribute must begin a
+-- line, so a `@` anywhere else cannot be mistaken for one.
+--
+-- WHAT IS CHECKED (both are pure closed sets, needing no context):
+--   * the attribute NAME is one of { verbose, intention, source, layer }
+--   * when the name is `layer`, the VALUE is one of
+--     { domain, application, interface }
+--
+-- WHAT IS NOT, AND WHY THIS CANNOT FALSE-POSITIVE. The name set is the UNION
+-- over every declaration kind, so it is deliberately WEAKER than verbosec's
+-- context-sensitive rule (verbosec allows @layer on a rule and refuses it on a
+-- concept; this walk accepts both). Weaker in that direction is the SAFE
+-- direction: it can only ever miss a violation, never invent one. Measured
+-- over all 151 files in examples/: the only line-leading attribute names that
+-- occur are exactly those four, and the only `@layer` values are `domain` and
+-- `application` -- so no accepted program moves. Comment lines start with `--`
+-- and Verbose has no multi-line string, so no line inside a comment or a
+-- literal can begin with `@`.
+--
+-- STILL NOT CHECKED, and each needs its own slice:
+--   * @source / @intention PRESENCE (per declaration) -- a presence check has
+--     to associate an attribute with the declaration it belongs to, i.e. carry
+--     "which declaration am I inside" through the walk and decide where a
+--     declaration ENDS. That is a stateful walk, not a closed set, and
+--     concept_group's nesting makes "ends" genuinely ambiguous.
+--   * @source file:line RESOLUTION -- needs to open the referenced file.
+--   * @layer STRATIFICATION -- needs the call graph, not the source text.
+-- All three are recorded in CLAUDE.md's gaps table and pinned as known-FAIL
+-- rows by `two_generation_negative_corpus_sweep` (src/native.rs).
+-- =========================================================================
+
+
+rule span_is_verbose_kw
+  @intention: "1 if an attribute-name span spells exactly \"verbose\", 0 otherwise"
+  @source: vexprparse.intent:63
+  input:
+    sc : SpanCheck
+  output:
+    out : number
+  logic:
+    out = if sc.len == 7 and (byte_at(sc.src, sc.start) == 118 and (byte_at(sc.src, sc.start + 1) == 101 and (byte_at(sc.src, sc.start + 2) == 114 and (byte_at(sc.src, sc.start + 3) == 98 and (byte_at(sc.src, sc.start + 4) == 111 and (byte_at(sc.src, sc.start + 5) == 115 and (byte_at(sc.src, sc.start + 6) == 101))))))) then 1 else 0
+  proofs:
+    purity:
+      reads : [sc.src, sc.start, sc.len]
+      calls : []
+    termination:
+      bound : 64
+
+
+rule span_is_intention_kw
+  @intention: "1 if an attribute-name span spells exactly \"intention\", 0 otherwise"
+  @source: vexprparse.intent:63
+  input:
+    sc : SpanCheck
+  output:
+    out : number
+  logic:
+    out = if sc.len == 9 and (byte_at(sc.src, sc.start) == 105 and (byte_at(sc.src, sc.start + 1) == 110 and (byte_at(sc.src, sc.start + 2) == 116 and (byte_at(sc.src, sc.start + 3) == 101 and (byte_at(sc.src, sc.start + 4) == 110 and (byte_at(sc.src, sc.start + 5) == 116 and (byte_at(sc.src, sc.start + 6) == 105 and (byte_at(sc.src, sc.start + 7) == 111 and (byte_at(sc.src, sc.start + 8) == 110))))))))) then 1 else 0
+  proofs:
+    purity:
+      reads : [sc.src, sc.start, sc.len]
+      calls : []
+    termination:
+      bound : 64
+
+
+rule span_is_source_kw
+  @intention: "1 if an attribute-name span spells exactly \"source\", 0 otherwise"
+  @source: vexprparse.intent:63
+  input:
+    sc : SpanCheck
+  output:
+    out : number
+  logic:
+    out = if sc.len == 6 and (byte_at(sc.src, sc.start) == 115 and (byte_at(sc.src, sc.start + 1) == 111 and (byte_at(sc.src, sc.start + 2) == 117 and (byte_at(sc.src, sc.start + 3) == 114 and (byte_at(sc.src, sc.start + 4) == 99 and (byte_at(sc.src, sc.start + 5) == 101)))))) then 1 else 0
+  proofs:
+    purity:
+      reads : [sc.src, sc.start, sc.len]
+      calls : []
+    termination:
+      bound : 64
+
+
+rule span_is_layer_kw
+  @intention: "1 if an attribute-name span spells exactly \"layer\", 0 otherwise"
+  @source: vexprparse.intent:63
+  input:
+    sc : SpanCheck
+  output:
+    out : number
+  logic:
+    out = if sc.len == 5 and (byte_at(sc.src, sc.start) == 108 and (byte_at(sc.src, sc.start + 1) == 97 and (byte_at(sc.src, sc.start + 2) == 121 and (byte_at(sc.src, sc.start + 3) == 101 and (byte_at(sc.src, sc.start + 4) == 114))))) then 1 else 0
+  proofs:
+    purity:
+      reads : [sc.src, sc.start, sc.len]
+      calls : []
+    termination:
+      bound : 64
+
+
+rule span_is_domain
+  @intention: "1 if an @layer value span spells exactly \"domain\", 0 otherwise"
+  @source: vexprparse.intent:63
+  input:
+    sc : SpanCheck
+  output:
+    out : number
+  logic:
+    out = if sc.len == 6 and (byte_at(sc.src, sc.start) == 100 and (byte_at(sc.src, sc.start + 1) == 111 and (byte_at(sc.src, sc.start + 2) == 109 and (byte_at(sc.src, sc.start + 3) == 97 and (byte_at(sc.src, sc.start + 4) == 105 and (byte_at(sc.src, sc.start + 5) == 110)))))) then 1 else 0
+  proofs:
+    purity:
+      reads : [sc.src, sc.start, sc.len]
+      calls : []
+    termination:
+      bound : 64
+
+
+rule span_is_application
+  @intention: "1 if an @layer value span spells exactly \"application\", 0 otherwise"
+  @source: vexprparse.intent:63
+  input:
+    sc : SpanCheck
+  output:
+    out : number
+  logic:
+    out = if sc.len == 11 and (byte_at(sc.src, sc.start) == 97 and (byte_at(sc.src, sc.start + 1) == 112 and (byte_at(sc.src, sc.start + 2) == 112 and (byte_at(sc.src, sc.start + 3) == 108 and (byte_at(sc.src, sc.start + 4) == 105 and (byte_at(sc.src, sc.start + 5) == 99 and (byte_at(sc.src, sc.start + 6) == 97 and (byte_at(sc.src, sc.start + 7) == 116 and (byte_at(sc.src, sc.start + 8) == 105 and (byte_at(sc.src, sc.start + 9) == 111 and (byte_at(sc.src, sc.start + 10) == 110))))))))))) then 1 else 0
+  proofs:
+    purity:
+      reads : [sc.src, sc.start, sc.len]
+      calls : []
+    termination:
+      bound : 64
+
+
+rule span_is_interface
+  @intention: "1 if an @layer value span spells exactly \"interface\", 0 otherwise"
+  @source: vexprparse.intent:63
+  input:
+    sc : SpanCheck
+  output:
+    out : number
+  logic:
+    out = if sc.len == 9 and (byte_at(sc.src, sc.start) == 105 and (byte_at(sc.src, sc.start + 1) == 110 and (byte_at(sc.src, sc.start + 2) == 116 and (byte_at(sc.src, sc.start + 3) == 101 and (byte_at(sc.src, sc.start + 4) == 114 and (byte_at(sc.src, sc.start + 5) == 102 and (byte_at(sc.src, sc.start + 6) == 97 and (byte_at(sc.src, sc.start + 7) == 99 and (byte_at(sc.src, sc.start + 8) == 101))))))))) then 1 else 0
+  proofs:
+    purity:
+      reads : [sc.src, sc.start, sc.len]
+      calls : []
+    termination:
+      bound : 64
+
+
+-- attr_name_ok: the closed set of attribute names, as the UNION over every
+-- declaration kind. See the banner above for why the union (and not a
+-- per-context set) is the right shape for a source-level walk.
+rule attr_name_ok
+  @intention: "1 if an attribute-name span is one of verbose / intention / source / layer"
+  @source: vexprparse.intent:63
+  input:
+    sc : SpanCheck
+  output:
+    out : number
+  logic:
+    out = if span_is_verbose_kw(sc) == 1 then 1 else if span_is_intention_kw(sc) == 1 then 1 else if span_is_source_kw(sc) == 1 then 1 else span_is_layer_kw(sc)
+  proofs:
+    purity:
+      reads : [sc]
+      calls : [span_is_verbose_kw, span_is_intention_kw, span_is_source_kw, span_is_layer_kw]
+    termination:
+      bound : 64
+
+
+-- layer_value_ok: the closed set of @layer values. Mirrors src/parser.rs's
+-- `"domain" | "application" | "interface"` match arm exactly; anything else is
+-- the `unknown layer '...'` parse error there.
+rule layer_value_ok
+  @intention: "1 if an @layer value span is one of domain / application / interface"
+  @source: vexprparse.intent:63
+  input:
+    sc : SpanCheck
+  output:
+    out : number
+  logic:
+    out = if span_is_domain(sc) == 1 then 1 else if span_is_application(sc) == 1 then 1 else span_is_interface(sc)
+  proofs:
+    purity:
+      reads : [sc]
+      calls : [span_is_domain, span_is_application, span_is_interface]
+    termination:
+      bound : 64
+
+
+-- attr_value_start: from the byte just past an attribute NAME, skip the `:`
+-- (58) and any spaces (32) to land on the value's first byte. Stops at
+-- anything else, so a value-less attribute cannot walk into the next line.
+-- `@verbose 0.1.0` has no colon at all, which this handles for free -- only
+-- the space is skipped -- though `@verbose`'s value is never checked.
+rule attr_value_start
+  @intention: "Index of an attribute value's first byte, past the ':' and any spaces"
+  @source: vexprparse.intent:63
+  input:
+    s : ScanState
+  output:
+    out : number
+  logic:
+    let len = length(s.source)
+    out = if s.pos >= len then s.pos else if byte_at(s.source, s.pos) == 58 then attr_value_start(ScanState { source: s.source, pos: s.pos + 1 }) else if byte_at(s.source, s.pos) == 32 then attr_value_start(ScanState { source: s.source, pos: s.pos + 1 }) else s.pos
+  proofs:
+    purity:
+      reads : [s.source, s.pos]
+      calls : [attr_value_start]
+    termination:
+      bound : 256
+      increasing : pos
+
+
+-- attr_line_errors: 0 or 1 for ONE attribute line, whose `@` sits at s.pos.
+-- The name is the identifier run just past the `@`; `ident_run` is the same
+-- [a-zA-Z0-9_]* scanner the tokenizer uses, so `@sources` reads as the 7-byte
+-- name "sources" and is refused, rather than matching the 6-byte "source" as
+-- a prefix test would.
+rule attr_line_errors
+  @intention: "1 if this attribute line names an unknown attribute or an unknown @layer value"
+  @source: vexprparse.intent:63
+  input:
+    s : ScanState
+  output:
+    out : number
+  logic:
+    let nstart = s.pos + 1
+    let nlen = ident_run(ScanState { source: s.source, pos: nstart })
+    let name_ok = attr_name_ok(SpanCheck { src: s.source, start: nstart, len: nlen })
+    let is_layer = span_is_layer_kw(SpanCheck { src: s.source, start: nstart, len: nlen })
+    let vstart = attr_value_start(ScanState { source: s.source, pos: nstart + nlen })
+    let vlen = ident_run(ScanState { source: s.source, pos: vstart })
+    let value_ok = layer_value_ok(SpanCheck { src: s.source, start: vstart, len: vlen })
+    out = if name_ok == 0 then 1 else if is_layer == 1 and value_ok == 0 then 1 else 0
+  proofs:
+    purity:
+      reads : [s.source, s.pos]
+      calls : [ident_run, attr_name_ok, span_is_layer_kw, attr_value_start, layer_value_ok]
+    termination:
+      bound : 256
+
+
+-- attr_errors: the verrs contribution. Walks the source LINE BY LINE with the
+-- tokenizer's own `line_width` / `next_line_start` pair, and for every line
+-- whose first non-space byte is `@` (64) adds that line's verdict. The
+-- eager-let shape is deliberate and matches `tokenize_indent`: `width` and
+-- `nls` are computed unconditionally, and both guard `s.pos >= len`
+-- internally, so the base case is reached without a stray read. A TAB-indented
+-- line yields width 99999, pushing `cstart` past `len`, so `c0` is 0 and the
+-- line is skipped -- the tokenizer already reports that condition as an
+-- IndentErr, and reporting it twice would be noise.
+-- Termination: bound-only plus the mandatory recursion breadcrumb. `pos`
+-- advances to `next_line_start(pos)`, strictly greater whenever the base case
+-- has not fired, but not the literal `pos + k` shape `increasing` verifies --
+-- the same reason `tokenize_indent` carries a bare bound. The backstop is the
+-- finite source length.
+rule attr_errors
+  @intention: "Number of source attribute lines naming an unknown attribute or an unknown @layer value"
+  @source: vexprparse.intent:63
+  input:
+    s : ScanState
+  output:
+    out : number
+  logic:
+    let len = length(s.source)
+    let width = line_width(ScanState { source: s.source, pos: s.pos })
+    let cstart = s.pos + width
+    let nls = next_line_start(ScanState { source: s.source, pos: s.pos })
+    let c0 = if cstart >= len then 0 else byte_at(s.source, cstart)
+    out = if s.pos >= len then 0 else if c0 == 64 then attr_line_errors(ScanState { source: s.source, pos: cstart }) + attr_errors(ScanState { source: s.source, pos: nls }) else attr_errors(ScanState { source: s.source, pos: nls })
+  proofs:
+    purity:
+      reads : [s.source, s.pos]
+      calls : [line_width, next_line_start, attr_line_errors, attr_errors]
+    termination:
+      bound : 65535
+
+
 -- Accessors for a RuleDecl (a block-form match is only legal in final position,
 -- so destructuring is factored into tiny rules — like block_binds / pb_block).
 rule rd_name_start
@@ -20992,11 +21286,11 @@ rule verify_errors
     let toks = begin_tokenize(ScanState { source: s.source, pos: 0 })
     let prog = parse_program(ProgramState { cell: toks, src: s.source })
     let concepts = parse_concepts(ProgramState { cell: toks, src: s.source })
-    out = diag_count(prog_diags(ProgDiagsState { iter: prog, full: prog, src: s.source, idx: 0, concepts: concepts })) + purity_list(PurityListState { iter: prog, full: prog, src: s.source }) + term_list(TermListState { iter: prog, src: s.source }) + prim_named_rules(PrimNameState { rules: prog, src: s.source })
+    out = diag_count(prog_diags(ProgDiagsState { iter: prog, full: prog, src: s.source, idx: 0, concepts: concepts })) + purity_list(PurityListState { iter: prog, full: prog, src: s.source }) + term_list(TermListState { iter: prog, src: s.source }) + prim_named_rules(PrimNameState { rules: prog, src: s.source }) + attr_errors(ScanState { source: s.source, pos: 0 })
   proofs:
     purity:
       reads : [s.source]
-      calls : [begin_tokenize, parse_program, parse_concepts, diag_count, prog_diags, purity_list, term_list, prim_named_rules]
+      calls : [begin_tokenize, parse_program, parse_concepts, diag_count, prog_diags, purity_list, term_list, prim_named_rules, attr_errors]
     termination:
       bound : 256
 
@@ -32249,7 +32543,7 @@ rule elf_program_src
     -- Effects tier slice 2a: the reaction list — used by reaction_errors (verify)
     -- AND by the has_reaction emit branch + blob_end_off sizing (emit).
     let rxs = parse_reactions(ProgramState { cell: toks, src: s.source })
-    let verrs = arena_scope(toplevel_junk(ProgramState { cell: toks, src: s.source }) + (if rule_list_len(prog) == 0 then 1 else 0) + diag_count(prog_diags(ProgDiagsState { iter: prog, full: prog, src: s.source, idx: 0, concepts: if has_service == 1 then http_concepts else concepts0 })) + purity_list(PurityListState { iter: prog, full: prog, src: s.source }) + term_list(TermListState { iter: prog, src: s.source }) + resource_errors(ResErrState { prog: prog, ress: ress, concepts: concepts0, src: s.source }) + reaction_errors(RxErrState { prog: prog, rxs: rxs, src: s.source, concepts: concepts0 }) + connection_errors(ConnErrState { prog: prog, ress: ress, conns: conns, src: s.source }) + service_errors(ServiceErrState { prog: prog, svcs: svcs, concepts: concepts0, ress: ress, conns: conns, rxs: rxs, src: s.source }) + prim_named_rules(PrimNameState { rules: prog, src: s.source }) + (if has_service == 1 then 0 else arena_scope(entry_freshtext(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts0, sizes: ProcSizeList::PSNil, ress: ress, conns: conns, rxs: rxs, svcs: svcs }))) + arena_scope(entry_badrecord(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts0, sizes: ProcSizeList::PSNil, ress: ress, conns: conns, rxs: rxs, svcs: svcs })))
+    let verrs = arena_scope(toplevel_junk(ProgramState { cell: toks, src: s.source }) + (if rule_list_len(prog) == 0 then 1 else 0) + diag_count(prog_diags(ProgDiagsState { iter: prog, full: prog, src: s.source, idx: 0, concepts: if has_service == 1 then http_concepts else concepts0 })) + purity_list(PurityListState { iter: prog, full: prog, src: s.source }) + term_list(TermListState { iter: prog, src: s.source }) + resource_errors(ResErrState { prog: prog, ress: ress, concepts: concepts0, src: s.source }) + reaction_errors(RxErrState { prog: prog, rxs: rxs, src: s.source, concepts: concepts0 }) + connection_errors(ConnErrState { prog: prog, ress: ress, conns: conns, src: s.source }) + service_errors(ServiceErrState { prog: prog, svcs: svcs, concepts: concepts0, ress: ress, conns: conns, rxs: rxs, src: s.source }) + prim_named_rules(PrimNameState { rules: prog, src: s.source }) + attr_errors(ScanState { source: s.source, pos: 0 }) + (if has_service == 1 then 0 else arena_scope(entry_freshtext(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts0, sizes: ProcSizeList::PSNil, ress: ress, conns: conns, rxs: rxs, svcs: svcs }))) + arena_scope(entry_badrecord(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts0, sizes: ProcSizeList::PSNil, ress: ress, conns: conns, rxs: rxs, svcs: svcs })))
     let sizes = proc_sizes(ProgGenState { rules: prog, src: s.source, off: 0, prog: prog, concepts: concepts, sizes: ProcSizeList::PSNil, ress: ress, conns: conns, rxs: rxs, svcs: svcs })
     let uses_var = program_uses_arena(concepts)
     -- RECORD-OUTPUT ENTRY (2026-08-07): prog_needs_itoa, not prog_any_texty.
@@ -32321,7 +32615,7 @@ rule elf_program_src
   proofs:
     purity:
       reads : [s.source]
-      calls : [begin_tokenize, parse_program, toplevel_junk, rule_list_len, parse_concepts, parse_resources, parse_reactions, parse_connections, parse_services, resource_errors, reaction_errors, reaction_list_len, x86_reaction_tramp, resource_marshal_size, x86_resource_marshal, program_uses_result, concepts_append_result, concepts_append_http, service_list_len, svc_head, svc_handler_start, svc_handler_len, find_rule, rd_input, rd_out_ty_start, rd_out_ty_len, service_errors, x86_service_tramp, diag_count, prog_diags, purity_list, term_list, proc_sizes, program_uses_arena, prog_needs_itoa, entry_rule_texty, entry_rule_bytes, entry_rule_result, entry_result_ok_texty, entry_rule_collection, entry_rule_record, entry_rule_bool, entry_rule_textspan, entry_badrecord, entry_out_concept, json_fields_size, x86_json_record, max_payload_fields, program_uses_text, blob_end_off, x86_program, src_blob, param_list_len, rl_head_params, fields_to_params, rl_head_input, params_to_fields, find_concept_index, fl_head_ty_start, fl_head_ty_len, x86_argv_marshal, x86_stdin_marshal, entry_uses_stdin, cd_fields, concept_at_index, connection_errors, connection_marshal_size, x86_connection_marshal, prim_named_rules, entry_freshtext]
+      calls : [begin_tokenize, parse_program, toplevel_junk, rule_list_len, parse_concepts, parse_resources, parse_reactions, parse_connections, parse_services, resource_errors, reaction_errors, reaction_list_len, x86_reaction_tramp, resource_marshal_size, x86_resource_marshal, program_uses_result, concepts_append_result, concepts_append_http, service_list_len, svc_head, svc_handler_start, svc_handler_len, find_rule, rd_input, rd_out_ty_start, rd_out_ty_len, service_errors, x86_service_tramp, diag_count, prog_diags, purity_list, term_list, proc_sizes, program_uses_arena, prog_needs_itoa, entry_rule_texty, entry_rule_bytes, entry_rule_result, entry_result_ok_texty, entry_rule_collection, entry_rule_record, entry_rule_bool, entry_rule_textspan, entry_badrecord, entry_out_concept, json_fields_size, x86_json_record, max_payload_fields, program_uses_text, blob_end_off, x86_program, src_blob, param_list_len, rl_head_params, fields_to_params, rl_head_input, params_to_fields, find_concept_index, fl_head_ty_start, fl_head_ty_len, x86_argv_marshal, x86_stdin_marshal, entry_uses_stdin, cd_fields, concept_at_index, connection_errors, connection_marshal_size, x86_connection_marshal, prim_named_rules, entry_freshtext, attr_errors]
     termination:
       bound : 256
 

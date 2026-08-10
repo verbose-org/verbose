@@ -1,0 +1,57 @@
+@verbose 0.1.0
+
+-- INVERSE CASE (measured 2026-08-10): `helper` takes one argument and is
+-- called with two. verbosec ACCEPTS this — it has no arity check on rule
+-- calls at all. gen0 DOES check (rule_diags category 3, `badarity_rule`),
+-- so this fixture measures a gap in the OTHER direction: gen0 is stricter.
+-- Kept in the corpus so the sweep records both verdicts rather than
+-- silently omitting the case.
+concept Invoice
+  @intention: "An invoice has an amount"
+  @source: negative.intent:1
+
+  fields:
+    amount : number [0, 1000000]
+
+rule helper
+  @intention: "doc"
+  @source: negative.intent:2
+
+  input:
+    i : Invoice
+
+  output:
+    ok : bool
+
+  logic:
+    ok = i.amount > 1000
+
+  proofs:
+    purity:
+      reads   : [i.amount]
+      calls   : []
+    termination:
+      bound : 1
+
+
+rule caller
+  @intention: "doc"
+  @source: negative.intent:3
+
+  input:
+    i : Invoice
+
+  output:
+    ok : bool
+
+  logic:
+    ok = helper(i, i)
+
+  proofs:
+    purity:
+      reads   : [i]
+      calls   : [helper]
+    termination:
+      bound : 3
+
+

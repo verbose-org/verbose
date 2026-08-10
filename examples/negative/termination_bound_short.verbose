@@ -1,0 +1,31 @@
+@verbose 0.1.0
+
+-- NEGATIVE: `bound : 1` under-counts a logic chain of many operations.
+concept Invoice
+  @intention: "An invoice has an amount"
+  @source: negative.intent:1
+
+  fields:
+    amount : number [0, 1000000]
+
+rule gate
+  @intention: "doc"
+  @source: negative.intent:2
+
+  input:
+    i : Invoice
+
+  output:
+    ok : bool
+
+  logic:
+    ok = i.amount + 1 + 2 + 3 + 4 + 5 + 6 + 7 + 8 + 9 + 10 + 11 + 12 > 1000
+
+  proofs:
+    purity:
+      reads   : [i.amount]
+      calls   : []
+    termination:
+      bound : 1
+
+

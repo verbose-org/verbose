@@ -1,0 +1,46 @@
+@verbose 0.1.0
+
+-- NEGATIVE: a native input field whose type is neither number nor text.
+-- verbosec's native emitter refuses; the interpreter accepts.
+concept_group Tree [max_depth: 8, max_nodes: 64]
+  @intention: "A tree is a leaf or a pair of trees"
+  @source: negative.intent:1
+
+  concept Node
+    @intention: "A node is a leaf or a pair"
+    @source: negative.intent:1
+
+    variants:
+      Leaf of (v: number)
+      Pair of (l: Node, r: Node)
+
+
+concept Holder
+  @intention: "Holds a node"
+  @source: negative.intent:2
+
+  fields:
+    node : Node
+
+
+rule depth_of
+  @intention: "doc"
+  @source: negative.intent:3
+
+  input:
+    h : Holder
+
+  output:
+    d : number
+
+  logic:
+    d = match h.node:
+      Leaf(v) => v
+      Pair(l, r) => 1
+
+  proofs:
+    purity:
+      reads   : [h.node]
+      calls   : []
+    termination:
+      bound : 8

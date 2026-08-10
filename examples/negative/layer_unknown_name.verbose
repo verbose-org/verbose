@@ -1,0 +1,33 @@
+@verbose 0.1.0
+
+-- NEGATIVE: `@layer: architectural` is not in the closed set
+-- {domain, application, interface}.
+concept Invoice
+  @intention: "An invoice has an amount"
+  @source: negative.intent:1
+
+  fields:
+    amount : number [0, 1000000]
+
+rule gate
+  @intention: "doc"
+  @source: negative.intent:2
+  @layer: architectural
+
+  input:
+    i : Invoice
+
+  output:
+    ok : bool
+
+  logic:
+    ok = i.amount > 1000
+
+  proofs:
+    purity:
+      reads   : [i.amount]
+      calls   : []
+    termination:
+      bound : 1
+
+
