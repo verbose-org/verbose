@@ -1,0 +1,52 @@
+@verbose 0.1.0
+
+-- NEGATIVE: the logic calls `helper` but `calls:` is empty.
+concept Invoice
+  @intention: "An invoice has an amount"
+  @source: negative.intent:1
+
+  fields:
+    amount : number [0, 1000000]
+
+rule helper
+  @intention: "doc"
+  @source: negative.intent:2
+
+  input:
+    i : Invoice
+
+  output:
+    ok : bool
+
+  logic:
+    ok = i.amount > 1000
+
+  proofs:
+    purity:
+      reads   : [i.amount]
+      calls   : []
+    termination:
+      bound : 1
+
+
+rule caller
+  @intention: "doc"
+  @source: negative.intent:3
+
+  input:
+    i : Invoice
+
+  output:
+    ok : bool
+
+  logic:
+    ok = helper(i)
+
+  proofs:
+    purity:
+      reads   : [i]
+      calls   : []
+    termination:
+      bound : 3
+
+

@@ -1,0 +1,35 @@
+@verbose 0.1.0
+
+-- NEGATIVE: `overflow : [0, 2]` on a rule whose arithmetic can reach
+-- 1000000 * 2. verbosec checks the declared bound by interval arithmetic.
+concept Invoice
+  @intention: "An invoice has an amount"
+  @source: negative.intent:1
+
+  fields:
+    amount : number [0, 1000000]
+
+rule doubled
+  @intention: "doc"
+  @source: negative.intent:2
+
+  input:
+    i : Invoice
+
+  output:
+    total : number
+
+  logic:
+    total = i.amount * 2
+
+  proofs:
+    purity:
+      reads   : [i.amount]
+      calls   : []
+    termination:
+      bound : 1
+
+  hints:
+    overflow : [0, 2]
+
+

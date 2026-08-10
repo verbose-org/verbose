@@ -1,0 +1,15 @@
+Intent backing file for the NEGATIVE corpus.
+
+Every fixture in this directory points its @source lines here so that the
+@source existence check resolves and cannot mask the ONE defect the fixture
+is meant to isolate. Line 1 is the title above; lines 2..N below are the
+targets the fixtures reference.
+
+1. An invoice has an amount.
+2. A rule decides something about an invoice.
+3. A second rule composes with the first.
+4. A third rule, when a fixture needs one.
+5. Spare.
+6. Spare.
+7. Spare.
+8. Spare.

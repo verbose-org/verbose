@@ -1,0 +1,31 @@
+@verbose 0.1.0
+
+-- NEGATIVE: the logic reads i.amount but `reads:` is empty.
+concept Invoice
+  @intention: "An invoice has an amount"
+  @source: negative.intent:1
+
+  fields:
+    amount : number [0, 1000000]
+
+rule gate
+  @intention: "doc"
+  @source: negative.intent:2
+
+  input:
+    i : Invoice
+
+  output:
+    ok : bool
+
+  logic:
+    ok = i.amount > 1000
+
+  proofs:
+    purity:
+      reads   : []
+      calls   : []
+    termination:
+      bound : 1
+
+

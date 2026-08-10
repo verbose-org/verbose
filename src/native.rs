@@ -46743,6 +46743,355 @@ rule pick
         let _ = fs::remove_file(&out_elf);
     }
 
+    /// THE NEGATIVE CORPUS: does gen0 REFUSE what verbosec refuses?
+    ///
+    /// Every other gen0 measurement in this file feeds VALID programs. The
+    /// corpus-acceptance sweep counts how many gen0 accepts; the differential
+    /// harness compares output for programs BOTH compilers accept; the fixed
+    /// point proves gen0 reproduces itself. **None of them can see a verifier
+    /// that is too permissive** — a check gen0 simply does not perform is
+    /// invisible to a suite made entirely of programs that pass it. The only
+    /// way to measure that surface is to feed programs verbosec REFUSES and
+    /// assert gen0 refuses them too, which is what this test does.
+    ///
+    /// Each fixture in `examples/negative/` isolates ONE thing verbosec
+    /// refuses. They all share `examples/negative/negative.intent` so the
+    /// `@source` existence check resolves — without it every fixture would
+    /// "fail" for a reason unrelated to the defect it is meant to isolate,
+    /// and the measurement would be worthless.
+    ///
+    /// verbosec's verdict is taken over its FULL pipeline (lex -> parse ->
+    /// verify -> native emit of the first rule), because that is the pipeline
+    /// gen0 implements: gen0 has no verify-only mode, it verifies and emits in
+    /// one shot. One fixture (`input_type_unsupported`) is refused at NATIVE
+    /// rather than at verify, and it belongs in the corpus for exactly that
+    /// reason — the refusal surface gen0 must mirror is the whole pipeline's.
+    ///
+    /// THE ASSERTIONS ARE EXACT SETS, NOT COUNTS. A gap closing must delete
+    /// its name from `KNOWN_GAPS` in the same commit, and a gap re-opening
+    /// (or a new fixture landing un-triaged) fails loudly with the names.
+    /// Counting alone would let one fix and one regression cancel out.
+    ///
+    /// First measured 2026-08-10 on ba2b6ff: 21 fixtures, **5 PASS, 15 KNOWN
+    /// GAP, 1 INVERSE**. Two of the 15 were closed in the same commit that
+    /// added this test (see `KNOWN_GAPS` group 1), leaving 7 / 13 / 1. The 13
+    /// are not thirteen surprises — they are three STRUCTURAL causes wearing
+    /// thirteen faces, and reading them that way is the point of the sweep:
+    ///
+    ///   1. **gen0's tokenizer discards attribute lines entirely.**
+    ///      `tokenize_indent`'s `isattr` (`c0b == 64`) folds an `@`-leading
+    ///      line into `isblank`, so `@intention` / `@source` / `@layer` never
+    ///      reach the parser at all. Nothing downstream can check what the
+    ///      token stream does not contain — which is why the two checks that
+    ///      COULD be closed cheaply were closed on the RAW SOURCE instead
+    ///      (`attr_errors`), and why the rest cannot: presence has to know
+    ///      which declaration an attribute belongs to, and stratification
+    ///      needs the call graph. 5 fixtures remain.
+    ///   2. **gen0 SKIPS the `hints:` block structurally.**
+    ///      `parse_rule_decl_pos` consumes it with `skip_indented_block` so
+    ///      the program is not truncated (PR #141/#142), but consuming is not
+    ///      checking. That is 4 fixtures. Two of them (`hint_unknown_name`,
+    ///      `hint_bare_no_justification`) are closed-set/shape checks that a
+    ///      later slice can do by walking the block's tokens; the two
+    ///      `overflow` ones need interval arithmetic over the parsed logic,
+    ///      which is a real arc, not a slice.
+    ///   3. **gen0's purity/termination analyses are one-directional or
+    ///      absent.** `purity_list` catches a DECLARED set that is MISSING an
+    ///      entry the logic performs, and does NOT catch a declared entry the
+    ///      logic never performs; `term_list` does not count operations. That
+    ///      is 3 fixtures — and the missing/extra asymmetry is the sharpest
+    ///      single finding here, because "gen0 checks purity" reads as true
+    ///      right up until you feed it an EXTRA declared read.
+    ///
+    /// The 14th, `input_type_unsupported`, is its own thing: verbosec refuses
+    /// it at NATIVE rather than at verify, and gen0 mirrors none of verbosec's
+    /// emit-time refusal surface. It is the same class as `recursive_text_eval`
+    /// in CLAUDE.md's gaps table (accept-what-verbosec-refuses), reproduced
+    /// here in a fixture small enough to reason about.
+    ///
+    /// THE INVERSE ROW IS NOT DECORATION. `bad_arity` calls a one-input rule
+    /// with two arguments; **verbosec ACCEPTS it** (it has no arity check on
+    /// rule calls at all) while gen0 REFUSES via `badarity_rule`. It is
+    /// asserted explicitly so that the day verbosec grows the check, this test
+    /// says so instead of quietly reclassifying the row as a PASS.
+    #[test]
+    #[ignore = "builds gen0 from the full self-source then runs it over the negative corpus; run with --ignored"]
+    #[cfg(target_arch = "x86_64")]
+    fn two_generation_negative_corpus_sweep() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        // Fixtures verbosec refuses and gen0 does NOT. Delete a name here in
+        // the same commit as the slice that closes it; the assertion below
+        // prints the full diff either way. Grouped by the structural cause
+        // named in the doc comment above.
+        const KNOWN_GAPS: &[&str] = &[
+            // (1) attribute lines are lexed away as blank — 5 of the original 7.
+            //     `attr_unknown_on_rule` and `layer_unknown_name` were CLOSED by
+            //     gen0's `attr_errors` source-line walk (see the `span_is_hints`
+            //     neighbourhood in examples/vexprparse.verbose). The five left
+            //     are not closed-set checks: three need to associate an
+            //     attribute with the declaration it belongs to (presence), and
+            //     two need the call graph (stratification).
+            "attr_missing_intention_rule",
+            "attr_missing_source_concept",
+            "attr_missing_source_rule",
+            "layer_calls_unlayered",
+            "layer_violation",
+            // (2) the `hints:` block is skipped, not checked — 4
+            "hint_bare_no_justification",
+            "hint_overflow_bad",
+            "hint_overflow_inverted",
+            "hint_unknown_name",
+            // (3) purity / termination analyses one-directional or absent — 3
+            "purity_calls_extra",
+            "purity_reads_extra",
+            "termination_bound_short",
+            // (4) native-emit refusal surface not mirrored — 1
+            "input_type_unsupported",
+        ];
+
+        // verbosec ACCEPTS these; gen0 refuses. The reverse direction.
+        const INVERSE: &[&str] = &["bad_arity"];
+
+        let src = fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let gen0 = std::env::temp_dir().join("verbosec_test_negative_gen0");
+        compile_native_stdin_raw(&program, "elf_program_src", gen0.to_str().unwrap())
+            .expect("elf_program_src must compile --stdin-raw");
+        let mut perms = fs::metadata(&gen0).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&gen0, perms).unwrap();
+
+        let dir = std::path::Path::new("examples/negative");
+        let mut fixtures: Vec<std::path::PathBuf> = fs::read_dir(dir)
+            .expect("examples/negative/ must exist")
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().map(|x| x == "verbose").unwrap_or(false))
+            .collect();
+        fixtures.sort();
+        assert!(!fixtures.is_empty(), "the negative corpus is empty");
+
+        // verbosec's verdict over the SAME pipeline gen0 implements:
+        // lex -> parse -> verify -> native emit of the first rule.
+        // `true` == refused.
+        let verbosec_refuses = |path: &std::path::Path| -> bool {
+            let s = match fs::read_to_string(path) { Ok(s) => s, Err(_) => return true };
+            let toks = match crate::lexer::Lexer::new(&s).tokenize() { Ok(t) => t, Err(_) => return true };
+            let prog = match crate::parser::Parser::new(toks).parse_program() { Ok(p) => p, Err(_) => return true };
+            if !crate::verifier::verify_program(&prog, dir).is_empty() { return true; }
+            let entry = prog.items.iter().find_map(|i| match i {
+                crate::ast::Item::Rule(r) => Some(r.name.clone()),
+                _ => None,
+            });
+            let entry = match entry { Some(e) => e, None => return true };
+            let out = std::env::temp_dir().join("verbosec_test_negative_vc.elf");
+            compile_native(&prog, &entry, out.to_str().unwrap(), false, false).is_err()
+        };
+
+        let out_elf = std::env::temp_dir().join("verbosec_test_negative_out.elf");
+        let mut gaps: Vec<String> = Vec::new();     // vc refuses, gen0 accepts
+        let mut mirrored: Vec<String> = Vec::new(); // vc refuses, gen0 refuses
+        let mut inverse: Vec<String> = Vec::new();  // vc accepts, gen0 refuses
+        let mut both_ok: Vec<String> = Vec::new();  // neither refuses
+        for path in &fixtures {
+            let name = path.file_stem().unwrap().to_string_lossy().to_string();
+            let _ = fs::remove_file(&out_elf);
+            let status = Command::new("sh")
+                .arg("-c")
+                .arg(format!(
+                    "ulimit -s unlimited; '{}' 0 < '{}' > '{}' 2>/dev/null",
+                    gen0.display(), path.display(), out_elf.display()
+                ))
+                .status()
+                .expect("run gen0 over a negative fixture");
+            let gen0_refuses = !status.success();
+            match (verbosec_refuses(path), gen0_refuses) {
+                (true, false) => gaps.push(name),
+                (true, true) => mirrored.push(name),
+                (false, true) => inverse.push(name),
+                (false, false) => both_ok.push(name),
+            }
+        }
+
+        assert!(
+            both_ok.is_empty(),
+            "NEGATIVE CORPUS FIXTURE IS NOT NEGATIVE: {:?} are accepted by BOTH \
+             compilers, so they measure nothing. Either the fixture stopped \
+             isolating its defect (a common cause: `@source` no longer resolves \
+             against examples/negative/negative.intent, or a rewrite made the \
+             program valid), or verbosec lost a check. Investigate before \
+             deleting the fixture.",
+            both_ok
+        );
+
+        // Compared as SETS: `gaps` comes out in directory order, KNOWN_GAPS is
+        // grouped by structural cause so it reads as an explanation rather
+        // than as a list. Sorting both keeps the grouping free.
+        let mut known_sorted: Vec<String> = KNOWN_GAPS.iter().map(|s| s.to_string()).collect();
+        known_sorted.sort();
+        gaps.sort();
+        assert_eq!(
+            gaps, known_sorted,
+            "GEN0'S VERIFICATION GAP SET MOVED.\n\
+             \n\
+             Left = measured (verbosec refuses, gen0 accepts). Right = KNOWN_GAPS.\n\
+             \n\
+               * A NAME DISAPPEARED — a slice closed that gap. Delete it from\n\
+                 KNOWN_GAPS in the same commit and say so in the body.\n\
+               * A NAME APPEARED — either a new fixture landed (triage it: add\n\
+                 it here only after confirming gen0 genuinely cannot check it,\n\
+                 and record the structural cause in the doc comment), or a\n\
+                 check REGRESSED, which is a bug, not a baseline to update.\n\
+             \n\
+             Mirrored correctly ({}): {:?}\n",
+            mirrored.len(), mirrored
+        );
+
+        assert_eq!(
+            inverse, INVERSE,
+            "THE INVERSE SET MOVED (verbosec accepts, gen0 refuses). gen0 being \
+             STRICTER is not automatically wrong, but it means a program \
+             verbosec blesses will not build under the self-hosted compiler — \
+             so each entry needs a deliberate verdict, not a silent baseline."
+        );
+
+        let _ = fs::remove_file(&gen0);
+        let _ = fs::remove_file(&out_elf);
+        let _ = fs::remove_file(std::env::temp_dir().join("verbosec_test_negative_vc.elf"));
+    }
+
+    /// gen0's attribute-name / `@layer`-value closed-set check (`attr_errors`).
+    ///
+    /// The corpus sweep cannot cover this, and the reason is the point of the
+    /// test. `attr_errors` accepts three `@layer` values, but `examples/` only
+    /// ever uses TWO — `interface` appears in no file in the repo. A one-byte
+    /// typo in `span_is_interface` would therefore pass every corpus gate,
+    /// every fixed-point gate and the negative sweep, and would surface only
+    /// the day someone wrote a valid `@layer: interface` and had it refused.
+    /// A check whose ACCEPTING arm is untested is half a check.
+    ///
+    /// So the acceptance side is pinned explicitly, alongside the refusal
+    /// side, and both are asserted AGAINST VERBOSEC rather than against a
+    /// hardcoded expectation — the property is agreement, not a magic rc.
+    ///
+    /// The `@sources` / `@intentions` cases pin the reason the name is read
+    /// with `ident_run` rather than compared as a prefix: `@sources` is the
+    /// 7-byte name "sources", NOT a match for the 6-byte "source". A prefix
+    /// test would silently accept both, which is exactly the class of
+    /// "accepts what verbosec refuses" this whole slice exists to shrink.
+    ///
+    /// `@layer:interface` (no space) is included because `attr_value_start`
+    /// skips `:` and spaces independently — a value can legally abut the
+    /// colon, and getting that wrong would refuse a valid program.
+    #[test]
+    #[ignore = "builds gen0 from the full self-source; run with --ignored"]
+    #[cfg(target_arch = "x86_64")]
+    fn two_generation_gen0_checks_attribute_and_layer_closed_sets() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        let src = fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        let tmp = std::env::temp_dir().join("verbosec_test_attrsets");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        // The fixtures @source into this file; without it verbosec's @source
+        // existence check fires first and every case "refuses" for the wrong
+        // reason — the agreement below would then be vacuous.
+        fs::write(tmp.join("attrs.intent"), "line one\nline two\nline three\n").unwrap();
+
+        let gen0 = tmp.join("gen0");
+        compile_native_stdin_raw(&program, "elf_program_src", gen0.to_str().unwrap())
+            .expect("elf_program_src must compile --stdin-raw");
+        let mut perms = fs::metadata(&gen0).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&gen0, perms).unwrap();
+
+        // (case name, the attribute line under test, must verbosec accept it?)
+        let cases: &[(&str, &str, bool)] = &[
+            // ACCEPTING arm — the half no corpus file exercises.
+            ("layer_interface", "  @layer: interface", true),
+            ("layer_domain", "  @layer: domain", true),
+            ("layer_application", "  @layer: application", true),
+            ("layer_no_space", "  @layer:interface", true),
+            ("no_attribute", "", true),
+            // REFUSING arm.
+            ("layer_bogus", "  @layer: architectural", false),
+            ("layer_empty_value", "  @layer:", false),
+            ("attr_author", "  @author: \"someone\"", false),
+            ("attr_sources", "  @sources: \"x\"", false),
+            ("attr_intentions", "  @intentions: \"x\"", false),
+        ];
+
+        for (name, attr_line, vc_accepts) in cases {
+            let prog_src = format!(
+                "@verbose 0.1.0\n\n\
+                 concept Invoice\n  @intention: \"doc\"\n  @source: attrs.intent:1\n\n\
+                 \x20 fields:\n    amount : number [0, 1000000]\n\n\n\
+                 rule gate\n  @intention: \"doc\"\n  @source: attrs.intent:2\n{attr_line}\n\n\
+                 \x20 input:\n    i : Invoice\n\n\
+                 \x20 output:\n    ok : bool\n\n\
+                 \x20 logic:\n    ok = i.amount > 1000\n\n\
+                 \x20 proofs:\n    purity:\n      reads   : [i.amount]\n      calls   : []\n\
+                 \x20   termination:\n      bound : 1\n"
+            );
+            let path = tmp.join(format!("{name}.verbose"));
+            fs::write(&path, &prog_src).unwrap();
+
+            // verbosec's verdict, over the same lex -> parse -> verify pipeline.
+            let vc_ok = (|| {
+                let t = match crate::lexer::Lexer::new(&prog_src).tokenize() { Ok(t) => t, Err(_) => return false };
+                let p = match crate::parser::Parser::new(t).parse_program() { Ok(p) => p, Err(_) => return false };
+                crate::verifier::verify_program(&p, &tmp).is_empty()
+            })();
+            assert_eq!(
+                vc_ok, *vc_accepts,
+                "case '{name}': the FIXTURE is wrong, not the compiler — verbosec \
+                 {} it, and the case says it should be {}. Fix the fixture before \
+                 reading anything into gen0's answer.",
+                if vc_ok { "accepts" } else { "refuses" },
+                if *vc_accepts { "accepted" } else { "refused" }
+            );
+
+            let out = tmp.join(format!("{name}.elf"));
+            let _ = fs::remove_file(&out);
+            let st = Command::new("sh")
+                .arg("-c")
+                .arg(format!(
+                    "ulimit -s unlimited; '{}' 0 < '{}' > '{}' 2>/dev/null",
+                    gen0.display(), path.display(), out.display()
+                ))
+                .status()
+                .expect("run gen0");
+            let gen0_ok = st.success();
+
+            assert_eq!(
+                gen0_ok, vc_ok,
+                "case '{name}' ({attr_line:?}): gen0 {} it, verbosec {} it.\n\
+                 \n\
+                 If gen0 REFUSED a case verbosec accepts, `attr_errors` has a \
+                 false positive — check the byte values in the span_is_* \
+                 predicate for that word, and remember `interface` has no \
+                 coverage anywhere in examples/.\n\
+                 If gen0 ACCEPTED a case verbosec refuses, the closed set or \
+                 the ident_run-based name read has regressed.",
+                if gen0_ok { "accepted" } else { "refused" },
+                if vc_ok { "accepts" } else { "refuses" }
+            );
+        }
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
     /// gen0 reads an argv `text` input field — pinned against an EXTERNAL
     /// oracle, not against gen0 itself.
     ///
