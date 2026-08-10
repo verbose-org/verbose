@@ -24863,9 +24863,11 @@ rule le64_neg
 
         // Extra: the S3 ELSE arm still routes correctly with a log block (jump3/4/5 are
         // forward jumps and must be UNCHANGED by the insertion), and a malformed request
-        // is still dropped — while STILL being logged, which is this slice's documented
-        // divergence from verbosec (we log per ACCEPTED CONNECTION, verbosec logs only
-        // requests that reached the handler).
+        // is dropped AND unlogged. That last clause is SLICE 5d: until 2026-08-10 this
+        // assertion read `3`, pinning "we log per ACCEPTED CONNECTION" as a documented
+        // divergence from verbosec — i.e. an audit line for a request the same loop
+        // then refused to answer. Moving the static block to the post-parse slot (the
+        // one a FIELD log already used) makes it `2`, matching verbosec exactly.
         let (wire, log) = run("s3_else", "resp = if req.path == \"/\" then HttpResponse { status: 200, body: \"home\" } else HttpResponse { status: 404, body: \"nope\" }",
             "[req.path]", "8", true,
             &[b"GET /other HTTP/1.0\r\n\r\n", b"ZZZZ\r\n\r\n", b"GET / HTTP/1.0\r\n\r\n"]);
@@ -24875,9 +24877,11 @@ rule le64_neg
         assert_eq!(wire[2].as_slice(), b"HTTP/1.0 200 OK\r\nContent-Length: 4\r\n\r\nhome",
             "the server must keep serving after a malformed request; got {:?}",
             String::from_utf8_lossy(&wire[2]));
-        assert_eq!(log.lines().count(), 3,
-            "slice 5a logs per ACCEPTED CONNECTION — the dropped request is logged too \
-             (documented divergence from verbosec); log was {:?}", log);
+        assert_eq!(log.lines().count(), 2,
+            "slice 5d: the log block sits AFTER the parse, so a DROPPED request must \
+             leave NO audit line — exactly 2 lines for the 2 served requests. A `3` \
+             here is the pre-5d placement back: an audit record claiming a request \
+             the server answered with nothing; log was {:?}", log);
 
         let _ = fs::remove_file(&elf);
     }
@@ -25001,7 +25005,7 @@ rule le64_neg
             (847,  "d561c6ff84133a80065cdee16aa069ff671c9be858029043fe7f3cdcd87bf350",
              1025, "8398da38d096f3aa6470f9ce94cd64c3e7d0a1a1c3976655041972fa389aac53"),
             (880,  "1ccf2f3584b02a673aa67a632fa6b4199c088d2c2e4897e07453f5732a9b421e",
-             1006, "97910d98772c6e1af7c95aa72da8c3c5e3689f5718a44575fd713a9960dfbda8"),
+             1006, "6e52e040bd828b21c8dc5548234df4d7c7ced1cafeb51d5a731d46551327a9c2"),
             // s3 re-pinned +53 by the text-equality slice (2026-08-08): its handler
             // rule body carries `req.path == "/"`, and every rule is ALSO emitted as
             // a proc (the service trampoline is closed, so that proc is unreachable —
@@ -25009,10 +25013,24 @@ rule le64_neg
             // in place of the 12 B integer compare. s1/s2/s4 have no `==` and are
             // byte-identical, which is what localises the change to this one shape.
             (1333, "a7fbcbc17588fdc5b43fbe3c3b40d95bbb847a8ce5d582a223781b0ff32dcbb3",
-             1507, "4f44de23eda08529485a9e4f6a1665e3427c43d46ad0c9bf585d815d3a6553f9"),
+             1507, "e4b72a8815b3e5b92721a454d0ffd97e2632f7099205ff1ee120a13f3e61e812"),
             (1274, "89b6b2752bc9f8665feee9f8ef43e39677d71400292ee0a99cf243e9a3584fa5",
-             1448, "97ebed0955e727a247518c986ef6f22283d75d9d79d8336b18564fd58c055483"),
+             1448, "8be9c89ed63ababd8a8c5c84735e774557e014a5955088ef0ed583acef1381c0"),
         ];
+        // STATIC-LOG columns re-pinned by SLICE 5d (2026-08-10), which moved a static
+        // log block from the pre-read slot to the post-parse one so a dropped request
+        // stops earning an audit line. The signature is exactly what a pure PLACEMENT
+        // change should look like, and is worth reading as the change's own proof:
+        //   * all four NO-LOG columns byte-identical (the whole term is gated on
+        //     svc_log_present);
+        //   * s1's static-log column byte-identical TOO — the S1 constant-response
+        //     branch has no parse, so it has no post-parse slot and did not move;
+        //   * s2 / s3 / s4 static-log SIZES unchanged (1006 / 1507 / 1448) with new
+        //     bytes — the block is the same length wherever it sits, and only the two
+        //     parse-fail je rel32s (jump1/jump2, now carrying `jlog = logsz`
+        //     unconditionally) actually changed value;
+        //   * both FIELD-log pins below byte-identical — that placement is where the
+        //     static one just moved TO, so it could not shift.
         let static_log = "\n  log:\n    append_file \"/tmp/vx_ref.log\" \"hit\\n\"";
         for (i, (tag, logic, reads, bound)) in shapes.iter().enumerate() {
             let (nsz, nsha, lsz, lsha) = pins[i];
@@ -25271,11 +25289,12 @@ rule le64_neg
                  must survive the log block; got {:?}", String::from_utf8_lossy(got));
         }
 
-        // --- (5) PARSE-FAIL SEMANTICS: the two placements, side by side. --------
-        // A malformed request never reaches the field-select, so both parse-fail je's
-        // jump OVER a post-select field log -> no line. A STATIC log sits pre-read and
-        // still records it — slice 5a's "log every accepted connection" audit posture,
-        // deliberately preserved.
+        // --- (5) PARSE-FAIL SEMANTICS: ONE placement, both content shapes. ------
+        // A malformed request never reaches the field-select, and since slice 5d the
+        // log block sits there for STATIC content too — so both parse-fail je's jump
+        // over it and neither shape records the dropped request. Until 5d the static
+        // row below asserted 3 (a line for a connection the same loop answered with
+        // nothing); verbosec writes 2, and that mismatch is the defect 5d closed.
         let mixed: Vec<&[u8]> = vec![
             b"GET /p1 HTTP/1.0\r\n\r\n",
             b"ZZZZ\r\n\r\n",
@@ -25291,10 +25310,11 @@ rule le64_neg
         let (wire, log) = run("static_malformed", "req", s2_path, "[req.path]", "1",
             Some("\"hit\\n\""), &mixed);
         assert!(wire[1].is_empty(), "a malformed request must still be dropped");
-        assert_eq!(log.lines().count(), 3,
-            "a STATIC log must STILL record the malformed request — slice 5a's \
-             log-per-ACCEPTED-CONNECTION coverage is preserved by keying placement on \
-             the content shape, not on the branch; got {:?}", log);
+        assert_eq!(log.lines().count(), 2,
+            "slice 5d: a STATIC log must NOT record the malformed request either. The \
+             placement is no longer keyed on the content shape — one post-parse slot \
+             serves both, so the audit file contains exactly the requests that were \
+             served; got {:?}", log);
 
         let _ = fs::remove_file(&elf);
     }
@@ -25837,7 +25857,7 @@ rule le64_neg
             ("s1", "", 847, "c20fc86f413cb1c49054e040a33c17a4ec5e77daed47f5a031d446378f906724"),
             ("s1", "static", 1021, "324ba08d390cdf08d6b1896e3fc1dc16fbd2f350e207d417423bc779cd1352fa"),
             ("s2", "", 880, "1ccf2f3584b02a673aa67a632fa6b4199c088d2c2e4897e07453f5732a9b421e"),
-            ("s2", "static", 1006, "97910d98772c6e1af7c95aa72da8c3c5e3689f5718a44575fd713a9960dfbda8"),
+            ("s2", "static", 1006, "6e52e040bd828b21c8dc5548234df4d7c7ced1cafeb51d5a731d46551327a9c2"),
             ("s2", "field", 1092, "f90d706fa496a725c0c530b020e83a0b3addfce986c17326f6c46ea253a60b64"),
             // The three s3 rows are re-pinned +53 each by the text-equality slice
             // (2026-08-08): s3's handler body is the only shape here carrying a
@@ -25845,11 +25865,18 @@ rule le64_neg
             // packed-span byte compare instead of the 12-byte integer compare. The
             // eight non-s3 rows are byte-identical to the pre-S8 capture, which is
             // what keeps this table a backward-compat pin rather than a snapshot.
+            //
+            // The three `static` rows on the PARSING shapes (s2/s4 below, s3 here) are
+            // re-pinned AT THE SAME SIZE by slice 5d (2026-08-10), which moved a static
+            // log block to the post-parse slot. Sizes 1006 / 1503 / 1444 are unchanged;
+            // only the two parse-fail je rel32s moved. `s1/static` is byte-identical
+            // (the constant-response branch has no parse and so no post-parse slot),
+            // as are all four no-log rows and both `field` rows.
             ("s3", "", 1329, "428fd712cdba0ee8557fae9153d65df3c397fc79d934497e07f37e1c264f0df7"),
-            ("s3", "static", 1503, "7a05324e373a1bc452fc1dabf6d2924c25ff2c49178ad859e42669f726f2459b"),
+            ("s3", "static", 1503, "dfcbb68ff02b38093bf5123872daecc946e2e674cbbc5e2277beb01b96e458e5"),
             ("s3", "field", 1621, "87799a2ca23dfe34eee240015955f64cfaaf1649cb6b2eb17026c419d5e6d065"),
             ("s4", "", 1270, "e02614cca202fc60bf1c673b6937069be4f66207fa6c85bbc7389532312d4e03"),
-            ("s4", "static", 1444, "da30301a688b6b0d49207e3a2e0d1e11b314d5702882c0dc47f95bf3eac85180"),
+            ("s4", "static", 1444, "8fe2d3cc8cc476c2bf0497dad52afd08ec39ec8e3ceaa23d68131727d47a2a5f"),
             ("s4", "field", 1562, "9291eef4fe9d6555759fb667a5c316a3bdb47346c60c05a40de557a754e36969"),
         ];
         let logblock = |v: &str| -> &str {
@@ -48289,6 +48316,284 @@ rule probe
                   &pb_g0, &pb_vb, &ft_g0, &ft_vb] {
             let _ = fs::remove_file(p);
         }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// THE EFFECT-POSITION DIFFERENTIAL (2026-08-10). The text-position matrix that
+    /// closed the itoa-a-pointer family covered every position a CLI differential can
+    /// reach, and explicitly listed the three it cannot: a reaction's `append_file`
+    /// content, a service's response body, and a service's `log:` block content. Those
+    /// need a file-content comparison or a live TCP conversation, so they were recorded
+    /// as UNTESTED. This test is that comparison.
+    ///
+    /// WHAT IT FOUND — and the reason the malformed request is in every request list
+    /// below. gen0 spliced a STATIC-content log block PRE-READ (tramp+158, where slice
+    /// 5a put it) and only a FIELD-content one post-parse. A pre-read block writes its
+    /// line for every ACCEPTED CONNECTION — including one whose request never parses
+    /// and which the very same accept loop then DROPS with no response. verbosec logs
+    /// after the handler, so it writes nothing for that connection. The audit file gen0
+    /// produced therefore carried a line for a request the server had refused to serve:
+    /// not a wrong VALUE, but a false RECORD, in the one artifact an Article 12 chain
+    /// rests on. Slice 5d moves the static block to the post-parse slot the field one
+    /// already used; both parse-fail je's jump over it, so neither shape logs a drop.
+    ///
+    /// Two things this asserts that a good-request-only harness cannot:
+    ///   * the log file's LINE COUNT against verbosec's, over a good/bad/good sequence
+    ///     (the wire bytes agreed all along — only the log diverged);
+    ///   * a REACTION compiled the comparable way. The corpus differential fed verbosec
+    ///     `--run <bool rule>` while gen0 emits the reaction trampoline, i.e. two
+    ///     different programs, and scored the mismatch as a divergence. `--run
+    ///     <reaction name>` (main.rs accepts a reaction there) makes them comparable,
+    ///     and they then agree byte-for-byte on the written file.
+    ///
+    /// The S1 (constant-response) residual is asserted AS IS, deliberately: that branch
+    /// emits no parse at all, so its log slot has nowhere post-parse to move to and it
+    /// still fires per accepted connection — while verbosec's `log:` block routes the
+    /// same source to its PARSING emitter, which drops the malformed request. Closing
+    /// that means giving S1 a conditional parse, its own slice. When it lands, the
+    /// `S1 residual` block below flips and this doc-comment goes with it.
+    #[test]
+    #[ignore = "builds gen0 + spawns servers on ephemeral ports; ~30s; run with --ignored"]
+    #[cfg(target_arch = "x86_64")]
+    fn two_generation_gen0_service_and_reaction_output_positions() {
+        use std::fs;
+        use std::io::{Read, Write};
+        use std::net::{TcpListener, TcpStream};
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+        use std::time::Duration;
+
+        let src = fs::read_to_string("examples/vexprparse.verbose")
+            .expect("examples/vexprparse.verbose must exist");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+        let gen0 = std::env::temp_dir().join("verbosec_test_effpos_gen0");
+        compile_native(&program, "elf_program_src", gen0.to_str().unwrap(), false, false)
+            .expect("elf_program_src must compile natively");
+
+        let dir = std::env::temp_dir().join("verbosec_test_effpos");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        // gen0 emit: source on argv[1], pos on argv[2]. Returns None on refusal.
+        let g0 = |tag: &str, source: &str| -> Option<std::path::PathBuf> {
+            let o = Command::new(&gen0).args([source, "0"]).output().expect("spawn gen0");
+            if !o.status.success() || o.stdout.is_empty() {
+                return None;
+            }
+            let p = dir.join(format!("{tag}_g0"));
+            fs::write(&p, &o.stdout).unwrap();
+            let mut m = fs::metadata(&p).unwrap().permissions();
+            m.set_mode(0o755);
+            fs::set_permissions(&p, m).unwrap();
+            Some(p)
+        };
+        // verbosec reference. `run` names a rule, a REACTION, or a service.
+        let vb = |tag: &str, source: &str, run: &str| -> std::path::PathBuf {
+            let ptok = crate::lexer::Lexer::new(source).tokenize().unwrap();
+            let pprog = crate::parser::Parser::new(ptok).parse_program().unwrap();
+            let p = dir.join(format!("{tag}_vb"));
+            let is_service = pprog.items.iter()
+                .any(|i| matches!(i, crate::ast::Item::Service(s) if s.name == run));
+            if is_service {
+                compile_service(&pprog, run, p.to_str().unwrap())
+                    .expect("verbosec must compile the service");
+            } else {
+                compile_native(&pprog, run, p.to_str().unwrap(), false, false)
+                    .expect("verbosec must compile the reference");
+            }
+            let mut m = fs::metadata(&p).unwrap().permissions();
+            m.set_mode(0o755);
+            fs::set_permissions(&p, m).unwrap();
+            p
+        };
+
+        // ================================================================
+        // POSITION 1 — reaction `append_file` content.
+        // ================================================================
+        let rx_src = |fields: &str, content: &str, path: &std::path::Path| -> String {
+            format!(
+                "@verbose 0.1.0\nconcept P\n  @intention: \"probe input\"\n  \
+                 @source: p.intent:1\n  fields:\n{fields}\nrule fires\n  \
+                 @intention: \"probe trigger\"\n  @source: p.intent:2\n  input:\n    p : P\n  \
+                 output:\n    yes : bool\n  logic:\n    yes = p.n > 0\n  proofs:\n    \
+                 purity:\n      reads : [p.n]\n      calls : []\n    termination:\n      \
+                 bound : 4\nreaction log_it\n  @intention: \"probe reaction\"\n  \
+                 @source: p.intent:3\n  trigger: fires\n  effects:\n    \
+                 append_file \"{}\" {content}\n", path.display())
+        };
+        let rx_file = dir.join("rx.log");
+        let rx_run = |exe: &std::path::Path, argv: &[&str]| -> Option<Vec<u8>> {
+            let _ = fs::remove_file(&rx_file);
+            let o = Command::new(exe).args(argv).output().expect("run reaction binary");
+            assert!(o.status.success(), "reaction binary must exit 0; got {:?}", o.status);
+            fs::read(&rx_file).ok()
+        };
+        let nf = "    n : number [0, 100]\n    amount : number [0, 1000000]\n";
+        for (tag, fields, content, argv, want) in [
+            ("rxlit", nf, "\"static line\\n\"", ["1", "500"], "static line\n"),
+            ("rxnum", nf, "concat(\"amt=\", p.amount, \"\\n\")", ["1", "500"], "amt=500\n"),
+        ] {
+            let source = rx_src(fields, content, &rx_file);
+            let a = g0(tag, &source).unwrap_or_else(|| panic!("({tag}) gen0 must emit"));
+            let b = vb(tag, &source, "log_it");
+            let got = rx_run(&a, &argv);
+            let ref_ = rx_run(&b, &argv);
+            assert_eq!(got.as_deref(), Some(want.as_bytes()),
+                "({tag}) gen0's reaction must write the declared bytes");
+            assert_eq!(got, ref_,
+                "({tag}) gen0's appended file must be verbosec's EXACT bytes — this is \
+                 the position the corpus differential could not reach, because it \
+                 compares stdout and a reaction writes none");
+        }
+        // A TEXT field in the content: verbosec emits it (Phase 1B, runtime strlen),
+        // gen0 REFUSES. `rx_carg_ok` accepts AstStr and a NUMBER field only, in
+        // acceptance parity with `x86_rx_carg` — the safe direction, and a refusal
+        // rather than the packed span an unguarded itoa would have printed.
+        let tf = "    n : number [0, 100]\n    who : text\n";
+        let src_txt = rx_src(tf, "concat(\"who=\", p.who, \"\\n\")", &rx_file);
+        assert!(g0("rxtext", &src_txt).is_none(),
+            "a TEXT field in reaction content must be REFUSED by gen0 (zero bytes), not \
+             emitted — the itoa arm would print its packed (start, len) span");
+        let _ = vb("rxtext", &src_txt, "log_it"); // verbosec accepts it; asserts that.
+
+        // ================================================================
+        // POSITIONS 2 + 3 — service response body and `log:` block content.
+        // ================================================================
+        let svc_src = |body: &str, reads: &str, port: u16, log: Option<&str>,
+                       logpath: &std::path::Path| -> String {
+            let lb = match log {
+                Some(c) => format!("\n  log:\n    append_file \"{}\" {c}", logpath.display()),
+                None => String::new(),
+            };
+            format!(
+                "@verbose 0.1.0\nrule handle\n  @intention: \"probe handler\"\n  \
+                 @source: p.intent:1\n  input:\n    req : HttpRequest\n  output:\n    \
+                 resp : HttpResponse\n  logic:\n    resp = {body}\n  proofs:\n    \
+                 purity:\n      reads : {reads}\n      calls : []\n    termination:\n      \
+                 bound : 16\nservice probe\n  @intention: \"probe service\"\n  \
+                 @source: p.intent:2\n  listen:\n    protocol : http_1_0\n    \
+                 port : {port}\n    max_request : 4096\n  handler: handle{lb}")
+        };
+        // good / MALFORMED / good. The malformed one is the whole point: the wire
+        // bytes agreed before slice 5d and only the log file diverged, so a
+        // well-formed-only conversation cannot see this class.
+        let reqs: [&[u8]; 3] = [
+            b"GET /alpha HTTP/1.0\r\n\r\n",
+            b"ZZZZ\r\n\r\n",
+            b"GET /beta HTTP/1.0\r\n\r\n",
+        ];
+        let talk = |exe: &std::path::Path, port: u16, logpath: Option<&std::path::Path>|
+              -> (Vec<Vec<u8>>, Option<Vec<u8>>) {
+            if let Some(p) = logpath {
+                let _ = fs::remove_file(p);
+            }
+            let mut child = Command::new(exe).spawn().expect("spawn server");
+            let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+            let mut out = Vec::new();
+            // NO throwaway readiness connect: a bare accept() is exactly what this
+            // test measures. Readiness folds into the first request's CONNECT retry.
+            for (i, req) in reqs.iter().enumerate() {
+                let mut sock = None;
+                for _ in 0..100 {
+                    match TcpStream::connect_timeout(&addr, Duration::from_millis(200)) {
+                        Ok(c) => { sock = Some(c); break; }
+                        Err(_) => {
+                            if i > 0 { break; }
+                            std::thread::sleep(Duration::from_millis(20));
+                        }
+                    }
+                }
+                let mut s = sock.unwrap_or_else(|| panic!("server never accepted request {i}"));
+                s.set_read_timeout(Some(Duration::from_secs(2))).ok();
+                s.write_all(req).expect("write request");
+                let mut buf = Vec::new();
+                let _ = s.read_to_end(&mut buf);
+                drop(s);
+                out.push(buf);
+            }
+            std::thread::sleep(Duration::from_millis(150));
+            let _ = child.kill();
+            let _ = child.wait();
+            (out, logpath.and_then(|p| fs::read(p).ok()))
+        };
+        let port_of = |t: &str| -> u16 {
+            let l = TcpListener::bind(("127.0.0.1", 0))
+                .unwrap_or_else(|e| panic!("bind ephemeral for {t}: {e}"));
+            l.local_addr().unwrap().port()
+        };
+
+        // Every cell gen0 accepts, differentially. Body positions: literal, req field,
+        // concat(literal, req field). Log positions: literal (the FIXED one), and a
+        // concat naming both req fields. The handler body stays a parsing shape (S2/S4)
+        // for the log rows so the log question is not conflated with the S1 residual.
+        let logf = dir.join("svc.log");
+        for (tag, body, reads, log) in [
+            ("blit",    "HttpResponse { status: 200, body: \"hello body\" }", "[]", None),
+            ("bfield",  "HttpResponse { status: 200, body: req.path }", "[req.path]", None),
+            ("bconcat", "HttpResponse { status: 200, body: concat(\"saw \", req.path) }",
+                        "[req.path]", None),
+            ("llit",    "HttpResponse { status: 200, body: req.path }", "[req.path]",
+                        Some("\"hit\\n\"")),
+            ("lconcat", "HttpResponse { status: 200, body: req.path }", "[req.path]",
+                        Some("concat(req.method, \" \", req.path, \"\\n\")")),
+            ("l4",      "HttpResponse { status: 200, body: concat(\"saw \", req.path) }",
+                        "[req.path]", Some("\"hit\\n\"")),
+        ] {
+            let port = port_of(tag);
+            let source = svc_src(body, reads, port, log, &logf);
+            let a = g0(tag, &source).unwrap_or_else(|| panic!("({tag}) gen0 must emit"));
+            let b = vb(tag, &source, "probe");
+            let lp = log.map(|_| logf.as_path());
+            let (gw, gl) = talk(&a, port, lp);
+            let (vw, vl) = talk(&b, port, lp);
+            assert_eq!(gw, vw,
+                "({tag}) gen0's WIRE bytes must be verbosec's, request for request — \
+                 including the empty response to the malformed one");
+            // Only the PARSING shapes drop it. A literal body with no log is S1 in
+            // both compilers: no parse, so the malformed request is answered — and
+            // they agree on that, which the `gw == vw` above already proved.
+            if tag != "blit" {
+                assert!(gw[1].is_empty(),
+                    "({tag}) a malformed request must be dropped with no response");
+            }
+            assert_eq!(gl, vl,
+                "({tag}) gen0's AUDIT FILE must be verbosec's exact bytes. Pre-slice-5d \
+                 a static-content log sat PRE-READ and wrote a line for the malformed \
+                 request too, so this was {:?} against verbosec's {:?} — an audit record \
+                 for a request the server answered with nothing", gl, vl);
+            if log.is_some() {
+                assert_eq!(gl.as_ref().map(|v| v.iter().filter(|&&c| c == b'\n').count()),
+                    Some(2),
+                    "({tag}) exactly one line per SERVED request — 2, not 3");
+            }
+        }
+
+        // The S1 residual, asserted as it stands. gen0's constant-response branch has
+        // no parse: it answers every connection and logs every connection. verbosec's
+        // `log:` block routes the same source to its parsing emitter, which drops the
+        // malformed request unlogged. Flip this block the day S1 grows a parse.
+        {
+            let port = port_of("s1res");
+            let source = svc_src("HttpResponse { status: 200, body: \"Hi\" }", "[]",
+                                 port, Some("\"hit\\n\""), &logf);
+            let a = g0("s1res", &source).expect("gen0 must emit the S1+log service");
+            let b = vb("s1res", &source, "probe");
+            let (gw, gl) = talk(&a, port, Some(logf.as_path()));
+            let (vw, vl) = talk(&b, port, Some(logf.as_path()));
+            assert_eq!(gw[1], b"HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nHi".to_vec(),
+                "S1 residual: gen0's constant branch answers even a malformed request \
+                 (it never parses), matching its own no-log behaviour");
+            assert!(vw[1].is_empty(),
+                "S1 residual: verbosec's log block routes S1 to the PARSING emitter, \
+                 which drops the malformed request");
+            assert_eq!(gl.as_deref(), Some(&b"hit\nhit\nhit\n"[..]),
+                "S1 residual: 3 lines — gen0 logs each of the 3 accepted connections");
+            assert_eq!(vl.as_deref(), Some(&b"hit\nhit\n"[..]),
+                "S1 residual: verbosec logs only the 2 it served");
+        }
+
+        let _ = fs::remove_file(&gen0);
         let _ = fs::remove_dir_all(&dir);
     }
 
