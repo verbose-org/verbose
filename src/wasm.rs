@@ -910,8 +910,18 @@ pub fn compile_wasm(
         // Sort by offset so the section bytes are deterministic — a
         // HashMap iteration order would otherwise reshuffle modules
         // between builds.
+        //
+        // The literal itself is the TIE-BREAKER, and it is load-bearing:
+        // offsets are handed out with `literal_cursor += s.len()`, so an
+        // EMPTY literal ("") does not advance the cursor and the next
+        // distinct literal receives the SAME offset. `sort_by_key` is
+        // stable, so on a tie the entries kept their input order — which
+        // is HashMap order, i.e. random per process. Measured before this
+        // tie-break: `out = concat("", w.v, "alpha")` produced 2 distinct
+        // module hashes over 20 builds at an identical 304 bytes. The
+        // empty segment writes no memory, so only the module BYTES moved.
         let mut sorted: Vec<(&String, &u32)> = text_literals.iter().collect();
-        sorted.sort_by_key(|(_, &off)| off);
+        sorted.sort_by(|(sa, &oa), (sb, &ob)| oa.cmp(&ob).then_with(|| sa.cmp(sb)));
 
         let mut data_section = Vec::new();
         emit_leb128(&mut data_section, sorted.len() as u64);
