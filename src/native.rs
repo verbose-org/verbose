@@ -1650,7 +1650,23 @@ fn collect_scc_containing(
         }
     }
     // SCC = forward ∩ backward.
-    forward.intersection(&backward).cloned().collect()
+    //
+    // DETERMINISM: `intersection` iterates a `HashSet`, and Rust's default
+    // hasher is randomly seeded PER PROCESS — so the raw order varies run to
+    // run. This Vec is the order `emit_self_recursive_program` lays its
+    // callables out in, so an unsorted return means a rule whose SCC has >= 2
+    // members gets a different byte layout on every compile: same size,
+    // different bytes, which is exactly the signature of a real codegen
+    // regression and pollutes every byte-identity sweep. Sorting makes the
+    // emitted binary reproducible, which the project's audit story requires.
+    // Same discipline as `collect_transitive_recursive_callees`, which sorts
+    // for the same reason. The entry rule is pushed first by the caller
+    // (`compile_native_code`), so the resulting layout is entry-then-
+    // alphabetical; `emit_self_recursive_program` resolves the entry by NAME
+    // (`labels[entry_rule.name]`), so no position here is load-bearing.
+    let mut out: Vec<String> = forward.intersection(&backward).cloned().collect();
+    out.sort();
+    out
 }
 
 /// DFS helper for `collect_scc_containing`: true iff `target` is
@@ -14029,7 +14045,21 @@ fn emit_eval_expr(
                                         }
                                     }
                                 } else {
-                                    for (_, &rbp_off) in offsets.iter() {
+                                    // DETERMINISM: `offsets` is a HashMap, and its
+                                    // iteration order varies per process — emitting
+                                    // one copy per entry in raw map order would give
+                                    // this call site a different byte sequence on
+                                    // every compile. The copies are commutative and
+                                    // the total size is order-invariant, so only the
+                                    // BYTES move; that is precisely the same-size-
+                                    // different-bytes signature that makes a real
+                                    // codegen regression unreadable. Sort descending
+                                    // by rbp offset, i.e. field declaration order
+                                    // (field i lives at rbp - 8*(i+1)), matching the
+                                    // `layout` branch above.
+                                    let mut slots: Vec<i32> = offsets.values().copied().collect();
+                                    slots.sort_by(|a, b| b.cmp(a));
+                                    for rbp_off in slots {
                                         let struct_off = -rbp_off - 8;
                                         emit_copy_rbp_to_rsp(code, rbp_off, struct_off);
                                     }
@@ -35866,6 +35896,180 @@ rule pick_max
             );
         }
         let _ = fs::remove_file(out);
+    }
+
+    /// DETERMINISM — a multi-member SCC must lay its callables out in the
+    /// SAME order on every compile.
+    ///
+    /// `collect_scc_containing` computes the SCC as `forward ∩ backward`
+    /// over two `HashSet<String>`s. Rust's default hasher is randomly
+    /// seeded, so an unsorted return gives the resulting `Vec<String>` a
+    /// different order per compile — and that Vec is exactly the order
+    /// `emit_self_recursive_program` emits its callables in. The symptom
+    /// is SAME SIZE, DIFFERENT BYTES, which is indistinguishable at a
+    /// glance from a real codegen regression and pollutes every
+    /// byte-identity sweep the project runs.
+    ///
+    /// Measured before the sort landed: this exact 4-rule cycle produced
+    /// multiple distinct binaries across repeated compiles, and the
+    /// corpus showed it on 8 `examples/vexprparse.verbose` rules.
+    ///
+    /// Two assertions, deliberately belt-and-braces:
+    ///   (a) `collect_scc_containing` itself returns a sorted Vec, every
+    ///       call. This is the direct pin on the fix.
+    ///   (b) N end-to-end compiles of the same source are byte-identical.
+    ///       This is the property that actually matters, and it also
+    ///       covers any OTHER order-dependence in the multi-callable
+    ///       path (e.g. a HashMap-driven emit loop) that (a) would miss.
+    ///
+    /// N = 40. Each `RandomState` in a process draws a fresh key, so
+    /// separate calls really do re-roll the order rather than share one
+    /// per-process seed. With 4 SCC members the entry is pinned first by
+    /// the caller and the other 3 permute (6 orders), so a pre-fix build
+    /// passing 40 consecutive draws is implausible — empirically the
+    /// unsorted build fails this test immediately.
+    #[test]
+    fn scc_callable_order_is_deterministic_across_compiles() {
+        // 4-member cycle: ra -> rb -> rc -> rd -> ra. Every rule shares
+        // the input concept and output type (the slice-5.4 constraint),
+        // and each recursive call passes a freshly built record so the
+        // cycle is real rather than a pass-through.
+        let src = r#"@verbose 0.1.0
+
+concept N
+  @intention: "n"
+  @source: invoices.intent:1
+  fields:
+    v : number [0, 10]
+
+rule ra
+  @intention: "cycle member a"
+  @source: invoices.intent:1
+  input:
+    n : N
+  output:
+    out : number
+  logic:
+    out = if n.v == 0 then 1 else rb(N { v: n.v - 1 })
+  proofs:
+    purity:
+      reads : [n.v]
+      calls : [rb]
+    termination:
+      bound : 100
+
+rule rb
+  @intention: "cycle member b"
+  @source: invoices.intent:1
+  input:
+    n : N
+  output:
+    out : number
+  logic:
+    out = if n.v == 0 then 2 else rc(N { v: n.v - 1 })
+  proofs:
+    purity:
+      reads : [n.v]
+      calls : [rc]
+    termination:
+      bound : 100
+
+rule rc
+  @intention: "cycle member c"
+  @source: invoices.intent:1
+  input:
+    n : N
+  output:
+    out : number
+  logic:
+    out = if n.v == 0 then 3 else rd(N { v: n.v - 1 })
+  proofs:
+    purity:
+      reads : [n.v]
+      calls : [rd]
+    termination:
+      bound : 100
+
+rule rd
+  @intention: "cycle member d"
+  @source: invoices.intent:1
+  input:
+    n : N
+  output:
+    out : number
+  logic:
+    out = if n.v == 0 then 4 else ra(N { v: n.v - 1 })
+  proofs:
+    purity:
+      reads : [n.v]
+      calls : [ra]
+    termination:
+      bound : 100
+"#;
+        let tokens = crate::lexer::Lexer::new(src).tokenize().unwrap();
+        let program = crate::parser::Parser::new(tokens).parse_program().unwrap();
+
+        // (a) The SCC helper itself. Re-derive the rules map the same way
+        // `compile_native_code` does, then hammer it.
+        let rules: HashMap<&str, &Rule> = program
+            .items
+            .iter()
+            .filter_map(|i| match i {
+                Item::Rule(r) => Some((r.name.as_str(), r)),
+                _ => None,
+            })
+            .collect();
+        let entry = rules["ra"];
+        let expected = vec![
+            "ra".to_string(),
+            "rb".to_string(),
+            "rc".to_string(),
+            "rd".to_string(),
+        ];
+        for i in 0..40 {
+            let scc = collect_scc_containing(entry, &rules);
+            // Anti-vacuity: if a future routing change stops treating this
+            // as a 4-member cycle, the byte-identity half below would pass
+            // trivially. Fail loudly instead.
+            assert_eq!(
+                scc.len(),
+                4,
+                "test premise broken: expected a 4-member SCC, got {:?}",
+                scc
+            );
+            assert_eq!(
+                scc, expected,
+                "collect_scc_containing must return a deterministic (sorted) order; \
+                 call {} returned {:?}. An unsorted HashSet intersection here \
+                 renumbers callables on every compile.",
+                i, scc
+            );
+        }
+
+        // (b) End-to-end: N compiles of the same program, byte-identical.
+        let first = compile_native_code(&program, "ra", false, false, false)
+            .expect("4-member SCC must compile");
+        for i in 1..40 {
+            let again = compile_native_code(&program, "ra", false, false, false)
+                .expect("4-member SCC must compile");
+            assert_eq!(
+                again.len(),
+                first.len(),
+                "compile {} changed binary SIZE ({} -> {}) — not the ordering bug, \
+                 something else is wrong",
+                i,
+                first.len(),
+                again.len()
+            );
+            assert!(
+                again == first,
+                "compile {} produced DIFFERENT BYTES at the SAME size ({} B). \
+                 That is the multi-member-SCC ordering nondeterminism: the emitter \
+                 must be reproducible for the same input.",
+                i,
+                first.len()
+            );
+        }
     }
 
     /// Phase A slice 5.0 + 5.1a — recursive rule handling.
